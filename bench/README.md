@@ -25,45 +25,18 @@ absolute reference.
 | `arrays` | primitive `double-array` throughput (unboxed `aget`/`aset`, no boxing/collections) | unboxed primitive-array codegen (flvector read/write) | CLBG-style |
 | `mathfns` | transcendental math (`java.lang.Math` sqrt/sin/cos/log/pow/atan2 over doubles) | native `Math` op lowering (`flsqrt`/`flsin`/… vs generic host-static dispatch) | CLBG-style |
 | `fib` | recursion: function-call + integer-arith overhead | native arith, small-fn inlining | CLBG |
-| `tak` | deep three-way self-recursion (denser call overhead than `fib`) | native arith, small-fn inlining, self-call direct-link | Gabriel |
-| `loop-recur` | tight loop/recur iteration, no seq/collection alloc (single, nested, branchy) | native arith, loop codegen | AWFY-style |
-| `seqs` | **lazy-seq + HOF pipelines** (range/map/filter/reduce, every?, iterate/take, mapcat) | lazy-seq allocation, per-element call overhead | AWFY-style |
-| `transducers` | transducer pipelines (comp of map/filter/take via transduce/into/eduction) | reducing-fn composition, no lazy-seq cells | AWFY-style |
-
-What the ray tracer does **not** capture and these do: allocation as the
-bottleneck (~7% there), megamorphic *and* monomorphic dispatch (its dispatch is
-monomorphic and cheap), persistent-collection throughput (it uses fixed records,
-no collections in the hot loop), and isolated compute/call overhead.
-
-Planned additions: Richards / DeltaBlue (heavier OO dispatch), NBody (float
-control with record state), k-nucleotide proper.
-
-## Holistic scorecard
-
-`bench/run.sh` compiles each benchmark to an **optimized AOT binary** (`jolt build
---direct-link --opt`) and times it against JVM Clojure running the same portable
-source — the jolt/JVM scorecard. jolt's optimizing passes fire only in a build;
-`jolt run -m` is unoptimized, so the harness always builds.
-
-Indicative ratios (M-series, one isolated run — numbers are machine-specific,
-regenerate locally), ascending. **opt** = `--direct-link --opt`; **release** =
-a plain `jolt build` (`MODE_A=1` adds this column). The `opt ms` / `jvm ms`
-columns are the raw per-bench means from the same run, for absolute scale:
-
-| benchmark | opt | release | opt ms | jvm ms | axis |
-|---|---|---|---|---|---|
-| `tak` | ~0.4× | ~0.3× | 7.0 | 19.9 | deep three-way self-recursion + integer arith (beats the JVM) |
-| `dispatch` | ~1.1× | ~1.1× | 68.7 | 62.2 | megamorphic protocol dispatch |
-| `fib` | ~1.2× | ~1.1× | 8.0 | 6.9 | recursion: call + integer arith |
-| `mathfns` | ~1.5× | ~1.5× | 24.7 | 16.6 | transcendental math (`Math` sqrt/sin/cos/log/pow/atan2 over doubles) |
-| `loop-recur` | ~1.6× | ~1.6× | 30.0 | 18.6 | tight loop/recur + per-iteration integer arith (`mod`, `quot`, `bit-xor`) |
-| `mandelbrot` | ~1.6× | ~1.6× | 23.3 | 14.5 | pure float compute |
-| `collections` | ~1.9× | ~1.9× | 22.0 | 11.4 | persistent map/vector churn |
-| `mono-dispatch` | ~2.7× | ~2.7× | 37.7 | 14.0 | monomorphic protocol dispatch |
-| `seqs` | ~6.1× | ~5.7× | 893.0 | 147.6 | lazy-seq + HOF pipelines (allocation + per-element calls) |
-| `transducers` | ~6.9× | ~6.9× | 231.0 | 33.6 | transducer pipelines (comp of map/filter/take) |
-| `binary-trees` | ~7.2× | ~7.2× | 283.0 | 39.1 | escaping short-lived records (allocation/GC) |
-| `arrays` | ~9.5× | ~9.5× | 342.3 | 36.2 | primitive `double-array` throughput (unboxed `aget`/`aset`) |
+| `tak` | ~0.3× | ~0.4× | 7.0 | 20.1 | deep three-way self-recursion + integer arith (beats the JVM) |
+| `fib` | ~1.1× | ~1.0× | 7.7 | 7.1 | recursion: call + integer arith |
+| `dispatch` | ~1.2× | ~1.2× | 70.0 | 60.6 | megamorphic protocol dispatch |
+| `mathfns` | ~1.5× | ~1.5× | 25.3 | 16.7 | transcendental math (`Math` sqrt/sin/cos/log/pow/atan2 over doubles) |
+| `mandelbrot` | ~1.7× | ~1.7× | 23.7 | 14.3 | pure float compute |
+| `collections` | ~1.8× | ~1.8× | 23.3 | 12.9 | persistent map/vector churn |
+| `loop-recur` | ~1.8× | ~1.8× | 30.7 | 17.5 | tight loop/recur + per-iteration integer arith (`mod`, `quot`, `bit-xor`) |
+| `mono-dispatch` | ~2.6× | ~2.6× | 38.7 | 14.7 | monomorphic protocol dispatch |
+| `arrays` | ~6.4× | ~6.2× | 235.0 | 37.0 | primitive `double-array` throughput (unboxed `aget`/`aset`) |
+| `seqs` | ~6.3× | ~6.1× | 921.3 | 147.2 | lazy-seq + HOF pipelines (allocation + per-element calls) |
+| `binary-trees` | ~7.0× | ~7.0× | 277.7 | 39.8 | escaping short-lived records (allocation/GC) |
+| `transducers` | ~7.2× | ~7.3× | 236.0 | 32.7 | transducer pipelines (comp of map/filter/take) |
 
 `opt` and `release` track each other closely across the suite — the plain
 `jolt build` picks up most of the win.
@@ -78,22 +51,27 @@ is a primitive long, so its `inc`/compare/`mod`/`quot` run as fixnum ops —
 `tak` beats the JVM outright (direct-linked self-calls + proven fixnum arith);
 `fib` sits at ~1.1–1.2×.
 
-The remaining gaps are the allocation-bound axes (~6–9.5×):
+The remaining gaps are the allocation-bound axes (~6–7×):
 
-- **`arrays` ~9.5×** (was ~18.6×): the fixnum-first index path in
-  `jolt-flaget`/`jolt-flaset` removed the per-access index coercion; the
-  residual is the checked `flvector-ref` + record-accessor at O2, the flonum
-  boxed at the wrapper's return, and the JVM SIMD-vectorizing the dot loop.
-  Emit-side inlining of proven `aget` sites is the queued next lever; the
-  loop-carried-flonum boxing floor puts the realistic target near ~4×.
+- **`arrays` ~6.4×** (was ~18.6×): two rounds took it there. The fixnum-first
+  index path in `jolt-flaget`/`jolt-flaset` removed the per-access index
+  coercion (~18.6×→~9.5×), then emit-side inlining removed the procedure
+  boundary itself — on a site where the pass has proven a `^doubles` array and
+  a `:long` index, the back end now emits `(flvector-ref (jolt-array-vec a) i)`
+  directly, so the flonum stays unboxed through the surrounding `fl+` chain
+  instead of being boxed at the wrapper's return (~9.5×→~6.4×). The residual is
+  the checked `flvector-ref` + record accessor at O2, Chez boxing the
+  loop-carried flonum accumulator (~145ms of the 235ms on a 40M-iteration
+  loop), and the JVM SIMD-vectorizing the dot loop. Hoisting the loop-invariant
+  `jolt-array-vec` accessor out of the loop is the queued next lever.
 - **`seqs` ~6×**: the allocation axis idiomatic Clojure hits most —
   range/map/filter/reduce chains, short-circuiting `every?`, `iterate`/`take`,
   and `mapcat` all build lazy-seq cells and call a closure per element. The
   lazy-seq work (lock elision, chunk fusion, transducer arities) brought it
   down from ~10.9×; it stays the dominant cost of script-style workloads.
-- **`transducers` ~6.9×, `mono-dispatch` ~2.7×, `binary-trees` ~7.2×**:
+- **`transducers` ~7.2×, `mono-dispatch` ~2.6×, `binary-trees` ~7.0×**:
   collapsed from two orders of magnitude by the type-proving / inline-field /
-  bare-read work (`binary-trees` ~140×→~7×, `mono-dispatch` ~330×→~2.7×). On a
+  bare-read work (`binary-trees` ~140×→~7×, `mono-dispatch` ~330×→~2.6×). On a
   statically proven monomorphic receiver, devirt resolves the impl and a
   per-site inline cache holds it; `binary-trees` nodes escape into the tree,
   so scalar-replace can't remove them — residual GC pressure over generic
