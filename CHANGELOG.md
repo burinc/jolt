@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-25
+
+The CLI is `jolt` now, not `joltc` — a rename worth a minor version even
+though `bin/joltc` still works as a shim. Alongside it: `deps.edn` handling
+that follows tools.deps rather than approximating it, Linux binaries that run
+on distributions back to CentOS 7, and another round of numeric performance
+work.
+
 ### Added
 
 - **Dependency resolution matches tools.deps.** The expansion engine is now the
