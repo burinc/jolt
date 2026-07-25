@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dependency resolution matches tools.deps.** The expansion engine is now the
+  one from `clojure.tools.deps` — version map, exclusion tree, and orphan
+  cutting ported directly — so `:exclusions` are honored, a library pulled at
+  two versions resolves to the newest (a top-level coordinate still pins), and
+  children orphaned by that choice are dropped. Maven versions order by
+  ComparableVersion semantics without a JVM; git coordinates compare by commit
+  ancestry. New coordinate handling: `:local/root` may point at a `.jar` (it is
+  extracted and its pom supplies transitive deps), and `:git/tag` with a short
+  `:git/sha` resolves the tag to its commit and verifies the prefix. Custom
+  `:mvn/repos` are consulted after Clojars and Central.
+- **The deps.edn chain and the tools.deps CLI surface.** A user `deps.edn`
+  ($CLJ_CONFIG, else $XDG_CONFIG_HOME/clojure, else ~/.clojure) merges under
+  the project's; `-Sdeps '<edn>'` merges an extra map last; `JOLT_NO_USER_DEPS`
+  opts out of the user file. `-X:alias [ns/fn] [k v …]` invokes `:exec-fn` with
+  `:exec-args` (k v pairs and a trailing map merge over it, `:ns-default` /
+  `:ns-aliases` qualify the symbol), and `-T:alias` does the same with the
+  project's own paths and deps replaced by the tool's. Libraries declaring
+  `:deps/prep-lib` are named in a warning, since jolt runs no prep step.
 - **deps.edn aliases follow tools.deps semantics** (#453). Alias maps combine
   with the reference merge rules — lifted directly from
   `clojure.tools.deps.edn` into `jolt.deps.edn` — and the full args-map key set
@@ -34,6 +52,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for releases up to 0.4.15; the Homebrew formula switches to the new name
   automatically on the next release bump. The cross-compile variable
   `JOLTC_TARGET` is now `JOLT_CROSS_TARGET`.
+- **Linux release binaries run on much older systems** (#455, fixes #452). The
+  Linux build now happens inside manylinux2014 with ncurses/tinfo/zlib linked
+  statically, dropping the glibc requirement from 2.35 to 2.17 — so the
+  published binary runs on CentOS 7+, Ubuntu 14.04+, Debian 8+, and Amazon
+  Linux 2+ instead of demanding a 2023-or-newer distribution.
+- **Out-of-range `aget`/`aset` on a primitive array throws
+  `ArrayIndexOutOfBoundsException`** with the JVM's message (#458). It
+  previously surfaced as an untyped host condition that `(class e)` reported as
+  `:object` and that a `catch` of an unrelated exception class could swallow.
+
+### Performance
+
+- **Mixed `long`/`double` arithmetic no longer falls off the fast path** (#454).
+  An integer operand in an otherwise-flonum expression now coerces instead of
+  forcing generic dispatch, and integer-literal loop counters take JVM `long`
+  semantics. `mathfns` went from ~22.7× the JVM to ~1.5×, `loop-recur` from
+  ~8.3× to ~1.6×, `mandelbrot` to ~1.6×.
+- **Primitive `double` array access is roughly 3× faster** (#457, #461). The
+  index takes a fixnum-first path, and — where the pass has proven the array
+  and index types — the backend now emits the flvector read/write inline
+  instead of calling a wrapper whose flonum return had to be re-boxed on every
+  element. The `arrays` benchmark went from ~18.6× the JVM to ~6×.
+- **Generic `inc`/`dec` open-code their numeric fast path** (#458) rather than
+  calling through a procedure, matching how `+`/`-`/`*` already worked.
 
 ## [0.4.15] - 2026-07-22
 
