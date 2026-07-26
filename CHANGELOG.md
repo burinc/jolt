@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-26
+
+Optimized builds type recursive walks over record trees, and a
+devirtualization bug that could return a wrong value is fixed.
+
 ### Fixed
 
 - **A protocol call on a record-or-nil receiver no longer devirtualizes.** In an
