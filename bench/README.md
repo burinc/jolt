@@ -25,18 +25,18 @@ absolute reference.
 | `arrays` | primitive `double-array` throughput (unboxed `aget`/`aset`, no boxing/collections) | unboxed primitive-array codegen (flvector read/write) | CLBG-style |
 | `mathfns` | transcendental math (`java.lang.Math` sqrt/sin/cos/log/pow/atan2 over doubles) | native `Math` op lowering (`flsqrt`/`flsin`/… vs generic host-static dispatch) | CLBG-style |
 | `fib` | recursion: function-call + integer-arith overhead | native arith, small-fn inlining | CLBG |
-| `tak` | ~0.3× | ~0.3× | 6.7 | 20.5 | deep three-way self-recursion + integer arith (beats the JVM) |
-| `fib` | ~1.1× | ~1.1× | 7.3 | 6.9 | recursion: call + integer arith |
-| `dispatch` | ~1.3× | ~1.2× | 69.7 | 55.5 | megamorphic protocol dispatch |
-| `mathfns` | ~1.5× | ~1.5× | 24.7 | 16.6 | transcendental math (`Math` sqrt/sin/cos/log/pow/atan2 over doubles) |
-| `loop-recur` | ~1.6× | ~1.6× | 30.3 | 18.8 | tight loop/recur + per-iteration integer arith (`mod`, `quot`, `bit-xor`) |
-| `mandelbrot` | ~1.6× | ~1.6× | 23.3 | 14.3 | pure float compute |
-| `collections` | ~1.9× | ~1.9× | 22.0 | 11.7 | persistent map/vector churn |
-| `mono-dispatch` | ~2.6× | ~2.6× | 38.0 | 14.4 | monomorphic protocol dispatch |
-| `seqs` | ~2.7× | ~2.7× | 388.3 | 144.6 | lazy-seq + HOF pipelines (allocation + per-element calls) |
-| `arrays` | ~6.3× | ~6.3× | 229.0 | 36.5 | primitive `double-array` throughput (unboxed `aget`/`aset`) |
-| `transducers` | ~7.0× | ~7.1× | 232.0 | 33.1 | transducer pipelines (comp of map/filter/take) |
-| `binary-trees` | ~7.2× | ~7.2× | 274.0 | 38.3 | escaping short-lived records (allocation/GC) |
+| `tak` | ~0.3× | ~0.3× | 6.7 | 19.3 | deep three-way self-recursion + integer arith (beats the JVM) |
+| `fib` | ~1.1× | ~1.0× | 7.3 | 6.7 | recursion: call + integer arith |
+| `dispatch` | ~1.2× | ~1.2× | 66.3 | 55.5 | megamorphic protocol dispatch |
+| `mathfns` | ~1.5× | ~1.5× | 24.3 | 16.1 | transcendental math (`Math` sqrt/sin/cos/log/pow/atan2 over doubles) |
+| `loop-recur` | ~1.6× | ~1.6× | 29.3 | 18.8 | tight loop/recur + per-iteration integer arith (`mod`, `quot`, `bit-xor`) |
+| `mandelbrot` | ~1.6× | ~1.6× | 23.0 | 14.0 | pure float compute |
+| `collections` | ~1.9× | ~1.9× | 21.0 | 10.8 | persistent map/vector churn |
+| `seqs` | ~2.6× | ~2.6× | 367.0 | 143.8 | lazy-seq + HOF pipelines (allocation + per-element calls) |
+| `mono-dispatch` | ~2.7× | ~2.7× | 37.3 | 13.8 | monomorphic protocol dispatch |
+| `transducers` | ~4.2× | ~4.0× | 133.0 | 32.0 | transducer pipelines (comp of map/filter/take) |
+| `binary-trees` | ~4.4× | ~4.4× | 164.7 | 37.6 | escaping short-lived records (allocation/GC) |
+| `arrays` | ~6.2× | ~6.2× | 221.7 | 35.8 | primitive `double-array` throughput (unboxed `aget`/`aset`) |
 
 `opt` and `release` track each other closely across the suite — the plain
 `jolt build` picks up most of the win.
@@ -51,11 +51,12 @@ is a primitive long, so its `inc`/compare/`mod`/`quot` run as fixnum ops —
 `tak` beats the JVM outright (direct-linked self-calls + proven fixnum arith);
 `fib` sits at ~1.1–1.2×.
 
-The remaining gaps are the allocation-bound axes. Three sit at ~6–7×
-(`arrays`, `transducers`, `binary-trees`); `seqs` used to lead that group and
-is now ~2.7× after the 2026-07 lazy-cell rounds.
+The remaining gaps are the allocation-bound axes, and after the 2026-07 rounds
+only `arrays` is still above ~5×. `seqs` (was ~10.9×), `binary-trees` (~140×)
+and `transducers` all came down through the same kind of fix: find the per-item
+work that a composed abstraction was repeating, and do it once.
 
-- **`arrays` ~6.3×** (was ~18.6×): two rounds took it there. The fixnum-first
+- **`arrays` ~6.2×** (was ~18.6×): two rounds took it there. The fixnum-first
   index path in `jolt-flaget`/`jolt-flaset` removed the per-access index
   coercion (~18.6×→~9.5×), then emit-side inlining removed the procedure
   boundary itself — on a site where the pass has proven a `^doubles` array and
@@ -66,7 +67,7 @@ is now ~2.7× after the 2026-07 lazy-cell rounds.
   loop-carried flonum accumulator (~145ms of the 229ms on a 40M-iteration
   loop), and the JVM SIMD-vectorizing the dot loop. Hoisting the loop-invariant
   `jolt-array-vec` accessor out of the loop is the queued next lever.
-- **`seqs` ~2.7×** (was ~6.3×): the allocation axis idiomatic Clojure hits most
+- **`seqs` ~2.6×** (was ~6.3×): the allocation axis idiomatic Clojure hits most
   — range/map/filter/reduce chains, short-circuiting `every?`, `iterate`/`take`,
   and `mapcat` all build lazy-seq cells and call a closure per element. Two
   rounds took it here, both the same bug in different clothing: a lazy seq
@@ -78,9 +79,20 @@ is now ~2.7× after the 2026-07 lazy-cell rounds.
   collection via variadic `jolt-concat`: ~3 lazy nodes and ~5 closures per
   boundary, which swamps the per-element work when inner colls are small
   (302ms → 122ms). Both now emit exactly one cell per element.
-- **`transducers` ~7.0×, `mono-dispatch` ~2.6×, `binary-trees` ~7.2×**:
+- **`transducers` ~4.2×** (was ~7.0×): `eduction` was a plain lazy seq, so
+  reducing one allocated a cell per element instead of driving the transducer
+  into the accumulator. It is now a real `Eduction` implementing `IReduceInit`,
+  as on the JVM — 152ms→61ms, in line with `transduce`. The remainder is the
+  per-element reducing-fn call chain, not the pipeline shape.
+- **`binary-trees` ~4.4×** (was ~7.2×): each node walk read a field through a
+  keyword that was RE-INTERNED at every use site; keyword literals are now
+  hoisted to a per-def constant (277ms→171ms). What is left is the field read
+  itself, still generic `jolt-get` rather than the `jrec-field-at` bare index,
+  because proving the receiver's type means tracking a record through a nilable
+  recursive position.
+- **`mono-dispatch` ~2.7×**:
   collapsed from two orders of magnitude by the type-proving / inline-field /
-  bare-read work (`binary-trees` ~140×→~7×, `mono-dispatch` ~330×→~2.6×). On a
+  bare-read work (`binary-trees` ~140×→~4.4×, `mono-dispatch` ~330×→~2.7×). On a
   statically proven monomorphic receiver, devirt resolves the impl and a
   per-site inline cache holds it; `binary-trees` nodes escape into the tree,
   so scalar-replace can't remove them — residual GC pressure over generic
