@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-26
+
+Compiler-flag and `^long` arithmetic fixes that let clojure/test.check load,
+a dropped-argument bug in optimized builds of multi-collection `map`, and three
+correctness fixes in the per-namespace compile cache.
+
+### Fixed
+
+- **`map`, `mapv` and `mapcat` over more than one collection work in an
+  optimized build.** The inference pass rebuilt such a call as the function plus
+  a single collection, so `(map f c1 c2)` compiled to `(map f c1)` and the
+  two-argument function was then applied to one element. The runtime compile
+  path does not run that pass, so the same source worked under `jolt run` and
+  failed only once built. Sibling patterns for `get` and `reduce` truncated an
+  over-arity call the same way instead of leaving it for the runtime to report.
+- **The compile cache distinguishes the runtime that filled it.** Cached
+  namespaces were keyed on the jolt version, which does not identify a build:
+  `git describe` reports the same `…-dirty` for every edit in a working tree, so
+  successive builds out of one checkout shared a key and each loaded the
+  previous runtime's compiled output. Application binaries carry no version at
+  all and so shared one key across unrelated programs. Each build now carries a
+  fingerprint of its own runtime, and a runtime that cannot be identified does
+  not use the cache.
+- **Editing a namespace invalidates the ones that depend on it.** A cached
+  namespace was keyed on its own source alone, but what it compiled to also
+  depends on what its dependencies contributed — macro expansions above all — so
+  editing a macro left every consumer running expansions of a definition that no
+  longer existed. The key now folds in the key of each namespace required, which
+  makes it transitive: a change three namespaces down invalidates the whole
+  path.
+- **The dev boot cache no longer halves the speed of the code it runs.** The
+  image `make devboot` builds loads the build subsystem eagerly, and that turns
+  per-site var-cell caching off so the seed mint and `jolt build` stay
+  byte-deterministic. Since the image saved that setting, every namespace
+  compiled at runtime under the cache resolved each var by name on every access
+  — about half speed on var-reference-heavy code, in a cache whose purpose is
+  faster iteration. It restores the runtime setting after loading the build
+  driver. Released binaries were never affected; they load that subsystem
+  lazily.
+- **A file's top-level `(set! *unchecked-math* true)` works.** It threw "Can't
+  change/establish root binding"; the reference binds the var around every file
+  load, so the form is legal and its effect ends with the file. The loader bound
+  `*warn-on-reflection*` and `*assert*` but not this one, and the AOT path lost the
+  effect separately — an optimized build decides whether `+`/`-`/`*` lower to their
+  wrapping forms while it emits, which happens before the boot-time `set!` runs, so
+  the flag is now applied as emission walks past it. clojure/test.check sets the
+  flag at the top of `random.clj` and so could not be loaded at all.
+- **`^long` arithmetic covers all 64 bits.** `+`, `-`, `*`, `inc` and `dec` on
+  `^long` values raised once a value passed the Chez fixnum boundary at 2^60 —
+  `(- x 1)` on an ordinary long threw instead of computing. They now compute
+  generically and throw `ArithmeticException` at the 2^63 edge the hint actually
+  promises, matching the reference on both the value and the message. The other
+  long ops already did this; `+ - *` were left on the raw fixnum ops on the
+  assumption that `*unchecked-math*` rewrote them first, which only holds when the
+  flag is on.
+
+### Changed
+
+- **Superseded compile-cache generations are collected.** Keying on the runtime
+  means the cache moves whenever jolt is rebuilt, so a build loop would leave a
+  full generation behind each time. A run now keeps the three most recently used
+  and drops the rest. `JOLT_CACHE_DIR` still selects the location, and
+  `JOLT_AOT_CACHE=0` still opts out.
+
 ## [0.5.1] - 2026-07-26
 
 Optimized builds type recursive walks over record trees, and a
@@ -283,6 +347,8 @@ inference-driven.
   as source and loaded lazily on the first `jolt build`, so `run`, `-e`, and every
   other command skip them. No behavior change to `jolt build`; the standalone binary
   is also slightly smaller.
+
+## [0.4.11] - 2026-07-20
 
 A base java.time API in core that works with no dependency, as a single
 implementation rather than two (RFC 0008). Core previously registered a partial
@@ -1585,7 +1651,34 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/jolt-lang/jolt/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/jolt-lang/jolt/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/jolt-lang/jolt/compare/v0.4.15...v0.5.0
+[0.4.15]: https://github.com/jolt-lang/jolt/compare/v0.4.14...v0.4.15
+[0.4.14]: https://github.com/jolt-lang/jolt/compare/v0.4.13...v0.4.14
+[0.4.13]: https://github.com/jolt-lang/jolt/compare/v0.4.12...v0.4.13
+[0.4.12]: https://github.com/jolt-lang/jolt/compare/v0.4.11...v0.4.12
+[0.4.11]: https://github.com/jolt-lang/jolt/compare/v0.4.10...v0.4.11
+[0.4.10]: https://github.com/jolt-lang/jolt/compare/v0.4.9...v0.4.10
+[0.4.9]: https://github.com/jolt-lang/jolt/compare/v0.4.8...v0.4.9
+[0.4.8]: https://github.com/jolt-lang/jolt/compare/v0.4.7...v0.4.8
+[0.4.7]: https://github.com/jolt-lang/jolt/compare/v0.4.6...v0.4.7
+[0.4.6]: https://github.com/jolt-lang/jolt/compare/v0.4.5...v0.4.6
+[0.4.5]: https://github.com/jolt-lang/jolt/compare/v0.4.4...v0.4.5
+[0.4.4]: https://github.com/jolt-lang/jolt/compare/v0.4.3...v0.4.4
+[0.4.3]: https://github.com/jolt-lang/jolt/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/jolt-lang/jolt/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/jolt-lang/jolt/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/jolt-lang/jolt/compare/v0.3.3...v0.4.0
+[0.3.3]: https://github.com/jolt-lang/jolt/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/jolt-lang/jolt/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/jolt-lang/jolt/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/jolt-lang/jolt/compare/v0.2.8...v0.3.0
+[0.2.8]: https://github.com/jolt-lang/jolt/compare/v0.2.7...v0.2.8
+[0.2.7]: https://github.com/jolt-lang/jolt/compare/v0.2.6...v0.2.7
+[0.2.6]: https://github.com/jolt-lang/jolt/compare/v0.2.5...v0.2.6
+[0.2.5]: https://github.com/jolt-lang/jolt/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/jolt-lang/jolt/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/jolt-lang/jolt/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/jolt-lang/jolt/compare/v0.2.1...v0.2.2

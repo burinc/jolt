@@ -348,10 +348,20 @@
       (lambda (nf)
         (set-chez-ns! (car nf))
         (let ((src (ldr-read-source (cdr nf))) (per-ns '()))
+          ;; This walk, not the emit walk, is where an --opt build's IR is
+          ;; produced, so a file's top-level (set! *unchecked-math* …) has to be
+          ;; in effect HERE for the analyzer to lower the following forms'
+          ;; arithmetic to its wrapping variants. Bracketed per namespace, like
+          ;; the loader does per file, so the flag doesn't leak into the next one.
+          (dynamic-wind
+            jolt-ns-load-vars-push!
+            (lambda ()
           (parameterize ((rdr-source-file (cdr nf)))
             (for-each
               (lambda (f)
                 (ce-scan-requires! f (car nf))
+                (when (ei-flag-set-form? f)
+                  (jolt-compile-eval-form f (car nf)))
                 ;; per-ns is consumed POSITIONALLY by the emit walk
                 ;; (ei-next-cached, one pop per form ei-for-each-form
                 ;; dispatches). The emit walk compiles MACRO forms too, and
@@ -377,7 +387,8 @@
                         (let ((n (jolt-ce-analyze (make-analyze-ctx (car nf)) f)))
                           (set! nodes (cons n nodes))
                           (set! per-ns (cons n per-ns)))))))
-              (ei-read-all src)))
+              (ei-read-all src))))
+            jolt-ns-load-vars-pop!)
           (set! ns-nodes (cons (cons (car nf) (reverse per-ns)) ns-nodes))))
       ordered)
     (jolt-wp-infer! (ei-unit) (apply jolt-vector (reverse nodes)))
@@ -1064,7 +1075,11 @@
                     (string-append "(define " s " (eval '" s " (scheme-environment)))\n")))
                 (reverse names)))))
 
-;; prepend the prologue to the flat file in place.
+;; prepend the prologue to the flat file in place, then bake the runtime
+;; fingerprint the AOT namespace cache keys on (loader.ss). An app binary carries
+;; no version string, so without this every one of them would key its cached
+;; fasls under the same "dev" and load namespaces another binary's runtime had
+;; emitted. This file is the binary's runtime, so its content hash names it.
 (define (bld-prepend-prologue! flat-ss)
   (let ((prologue (bld-kernel-prologue flat-ss))
         (body (read-file-string flat-ss)))
@@ -1072,7 +1087,15 @@
       (put-string out ";; kernel-name cells pre-bound so early reads match the kernel primitives\n")
       (put-string out prologue)
       (put-string out body)
-      (close-port out))))
+      (close-port out)))
+  (let* ((src (read-file-string flat-ss))
+         (fp (string-append (number->string (string-length src) 16) "-"
+                            (number->string (equal-hash src) 16)))
+         (out (open-output-file flat-ss 'append)))
+    (put-string out (string-append
+                      "\n;; === runtime fingerprint (AOT cache key) ===\n"
+                      "(define jolt-baked-runtime-fingerprint " (ei-str-lit fp) ")\n"))
+    (close-port out)))
 
 ;; Per-mode Chez compile parameters for app binaries. Mirrors the pattern in
 ;; build-jolt.ss (optimize-level 2, fasl-compressed #t for release/optimized).
