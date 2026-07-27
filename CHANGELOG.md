@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-07-27
+
+A `.jolt` source extension, `-e` and `:main-opts` fixes across the CLI entry
+points, and the arity gate that the 0.5.6 regression would not have survived.
+
 ### Added
 
 - **`.jolt` is a source extension alongside `.clj` and `.cljc`.** A namespace can
@@ -18,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over `.cljc` on the JVM. Everything a `.clj` works with works here: `require`,
   a bare `jolt foo.jolt` script argument, `clojure.core/load`, `data_readers.jolt`,
   the AOT cache, and `jolt build`.
+- **`make oparity`** (added to `ci`) — every numeric fast-path op at every arity
+  it admits, derived from `op-registry` rather than hand-listed, so a
+  specialization added later is covered the moment it lands. Each case asserts
+  that the specialized form compiles, that it agrees with the generic `apply`
+  path, and that the emitted code actually contains the specialization — the last
+  one being what the hand-written probes kept missing, since a case that silently
+  fails to specialize otherwise passes for the wrong reason. Reverting 0.5.6's
+  n-ary fold turns it red on the original symptom.
 
 ### Fixed
 
@@ -29,9 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the project's own files was silently ignored. `:extra-paths` also precede an
   alias's `:replace-paths`, and combine in alias-selection order, both matching
   clj. Dependency roots still come last.
-
-### Added
-
 - **`-e` composes with `-Sdeps`, `-A`, `-M`, and a project's `deps.edn`.** `-e` was
   handled entirely in the launcher, before `jolt.main` was loaded, so it never
   resolved a project and anything that re-dispatched into `jolt.main` first —
@@ -52,6 +62,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:main-opts` now precede the ones given on the command line, matching the clj
   CLI, and when no alias declares any the command line supplies them on its own.
   Only an empty command line with no `:main-opts` is still an error.
+- **`(unchecked-add x)`, `(unchecked-multiply x)` and `(unchecked-subtract x)` on
+  a `^long` operand no longer crash.** They raised a runtime arity error against
+  the two-operand primitive. jolt's own overlay has always taken one operand —
+  `(apply unchecked-add [8])` is `8` and `unchecked-subtract` is `-8` — so the
+  inline path contradicted the rest of jolt rather than only the JVM, which
+  rejects these at one operand outright. Found by the new arity gate.
+- **`op-registry` named a bigdec primitive that does not exist.** `"mod"` carried
+  `:bd "jbd-mod"`, and nothing anywhere defines `jbd-mod`. It never reached
+  emission, since only `quot`/`rem` are assigned the bigdec kind — but the `^long`
+  set beside it does list `mod`, so making the two symmetric would have emitted an
+  unbound identifier and broken every bigdec `mod` at load. It also reserved the
+  name against user shadowing for nothing. Dropped; bigdec `mod` goes through the
+  generic path, which was already correct and now has a corpus row.
 
 ## [0.5.6] - 2026-07-27
 
@@ -1814,7 +1837,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.6...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.7...HEAD
+[0.5.7]: https://github.com/jolt-lang/jolt/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/jolt-lang/jolt/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/jolt-lang/jolt/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/jolt-lang/jolt/compare/v0.5.3...v0.5.4
