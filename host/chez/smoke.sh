@@ -247,6 +247,52 @@ else
 fi
 rm -rf "$tr_proj"
 
+# .jolt is a source extension alongside .clj/.cljc — the same language, marking a
+# file that uses jolt-specific interop instead of portable Clojure. It resolves
+# first, so a .jolt shadows a .clj of the same namespace, and it works everywhere
+# a .clj does: require, a bare FILE argument, clojure.core/load, data_readers.
+jx="$(mktemp -d)"
+mkdir -p "$jx/src/jx"
+printf '{:paths ["src"]}\n' > "$jx/deps.edn"
+printf '(ns jx.util)\n(defn greet [n] (str "jolt " n))\n' > "$jx/src/jx/util.jolt"
+printf '(ns jx.core (:require [jx.util :as u]))\n(defn -main [& _] (println (u/greet "ok")))\n' > "$jx/src/jx/core.jolt"
+jx_check() { # label expected actual
+  if [ "$2" = "$3" ]; then pass=$((pass + 1))
+  else echo "  FAIL: $1"; echo "    want \`$2\` got \`$3\`"; fails=$((fails + 1)); fi
+}
+jx_check "require resolves a .jolt namespace" "jolt ok" \
+         "$(JOLT_PWD="$jx" $jolt run -m jx.core 2>&1 | tail -1)"
+# a .clj of the same namespace loses to the .jolt
+printf '(ns jx.util)\n(defn greet [n] (str "clj " n))\n' > "$jx/src/jx/util.clj"
+jx_check ".jolt wins over a .clj of the same ns" "jolt ok" \
+         "$(JOLT_PWD="$jx" $jolt run -m jx.core 2>&1 | tail -1)"
+rm "$jx/src/jx/util.jolt"
+jx_check "falls back to .clj when there is no .jolt" "clj ok" \
+         "$(JOLT_PWD="$jx" $jolt run -m jx.core 2>&1 | tail -1)"
+# a bare FILE.jolt runs without `run`, like a bare FILE.clj
+printf '(println "script" (+ 1 2))\n' > "$jx/s.jolt"
+jx_check "a bare FILE.jolt runs as a script" "script 3" \
+         "$(JOLT_PWD="$jx" $jolt "$jx/s.jolt" 2>&1 | tail -1)"
+# clojure.core/load finds a .jolt sibling
+printf "(in-ns 'jx.ld)\n(def n 7)\n" > "$jx/src/jx/incl.jolt"
+printf '(ns jx.ld)\n(load "incl")\n(defn -main [& _] (println "loaded" n))\n' > "$jx/src/jx/ld.clj"
+jx_check "clojure.core/load finds a .jolt" "loaded 7" \
+         "$(JOLT_PWD="$jx" $jolt run -m jx.ld 2>&1 | tail -1)"
+# data_readers.jolt registers tags like data_readers.clj
+printf '(ns jx.rdrs (:require [clojure.string :as s]))\n(defn up [x] (s/upper-case x))\n' > "$jx/src/jx/rdrs.jolt"
+printf '{jx/up jx.rdrs/up}\n' > "$jx/src/data_readers.jolt"
+printf '(ns jx.rd (:require [jx.rdrs]))\n(defn -main [& _] (println #jx/up "shout"))\n' > "$jx/src/jx/rd.clj"
+jx_check "data_readers.jolt registers a tag" "SHOUT" \
+         "$(JOLT_PWD="$jx" $jolt run -m jx.rd 2>&1 | tail -1)"
+# a missing namespace names .jolt in the error, so the extension is discoverable
+miss="$(JOLT_PWD="$jx" $jolt -e "(require 'jx.nope)" 2>&1 | head -1)"
+case "$miss" in
+  *jx/nope.jolt*) pass=$((pass + 1)) ;;
+  *) echo "  FAIL: a missing ns should name .jolt in the error"
+     echo "    got \`$miss\`"; fails=$((fails + 1)) ;;
+esac
+rm -rf "$jx"
+
 # CLI trailing-args / POSIX end-of-options. After -e EXPR the remaining argv are
 # *command-line-args* (nil when empty); a leading "--" terminates option parsing
 # and is consumed, so everything after it is literal program data.

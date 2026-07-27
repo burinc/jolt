@@ -207,8 +207,8 @@
   (let ((roots (dce-reader-sym-roots (var-deref "clojure.core" "*data-readers*") '())))
     (for-each
       (lambda (root)
-        (let ((paths (list (string-append root "/data_readers.clj")
-                           (string-append root "/data_readers.cljc"))))
+        (let ((paths (map (lambda (e) (string-append root "/data_readers" e))
+                          ldr-source-exts)))
           (for-each (lambda (path)
             (when (file-exists? path)
               (let ((src (read-file-string path)))

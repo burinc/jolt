@@ -99,7 +99,7 @@
       (for-each
         (lambda (rp)
           (let ((rel (car rp)) (abs (cdr rp)))
-            (when (or (str-suffix? rel ".clj") (str-suffix? rel ".cljc"))
+            (when (ldr-source-path? rel)
               (put-string out (string-append
                 "(register-embedded-resource! " (ei-str-lit rel) " "
                 (ei-bytes-lit (read-file-string abs)) ")\n")))))

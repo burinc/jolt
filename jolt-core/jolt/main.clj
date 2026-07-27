@@ -120,10 +120,12 @@
 (defn- file-arg [x] (if (= "-" x) "/dev/stdin" x))
 
 ;; Does a bare argv token name a file to run (rather than a deps.edn task)? A "-"
-;; (stdin), an existing file, or a *.clj/*.cljc/*.cljs path.
+;; (stdin), an existing file, or a *.jolt/*.clj/*.cljc/*.cljs path. .jolt is the
+;; same language as .clj and only marks a file as using jolt-specific interop
+;; rather than portable Clojure.
 (defn- run-file-arg? [x]
   (or (= "-" x)
-      (some #(str/ends-with? x %) [".clj" ".cljc" ".cljs"])
+      (some #(str/ends-with? x %) [".jolt" ".clj" ".cljc" ".cljs"])
       (jolt.host/file-exists? x)))
 
 ;; run [-m NS args… | FILE]  — FILE may be "-" (stdin)

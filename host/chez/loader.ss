@@ -53,7 +53,7 @@
     ")"))
 
 ;; --- data readers (#tag literals) -------------------------------------------
-;; A project's data_readers.{clj,cljc} at a source root maps a tag symbol to a
+;; A project's data_readers.{jolt,clj,cljc} at a source root maps a tag symbol to a
 ;; qualified reader fn (e.g. {time/date time-literals.data-readers/date}). We
 ;; merge those into clojure.core/*data-readers* and require each reader's
 ;; namespace, then while loading source rewrite a registered #tag form into a
@@ -178,10 +178,14 @@
 (define (load-data-readers!)
   (for-each
     (lambda (root)
-      (let ((clj (string-append root "/data_readers.clj"))
-            (cljc (string-append root "/data_readers.cljc")))
-        (cond ((file-exists? clj) (merge-data-readers-file clj))
-              ((file-exists? cljc) (merge-data-readers-file cljc)))))
+      ;; data_readers.{jolt,clj,cljc}, in the same precedence as a namespace's
+      ;; source (ldr-source-exts below) — first one found on this root wins.
+      (let loop ((es ldr-source-exts))
+        (when (pair? es)
+          (let ((f (string-append root "/data_readers" (car es))))
+            (if (file-exists? f)
+                (merge-data-readers-file f)
+                (loop (cdr es)))))))
     source-roots))
 
 ;; --- namespace -> file path -------------------------------------------------
@@ -201,26 +205,41 @@
        (loop (cdr cs) '() (cons (list->string (reverse seg)) segs)))
       (else (loop (cdr cs) (cons (car cs) seg) segs)))))
 
-;; First existing <root>/rel.clj or <root>/rel.cljc on the search roots, else #f.
+;; The extensions a namespace's source can carry, in resolution order. .jolt is
+;; the same language as .clj — the reader, analyzer, and emitter never look at the
+;; extension — and only marks intent: the file uses jolt-specific interop and is
+;; not portable Clojure. It resolves FIRST so a library can ship a portable
+;; foo.cljc/foo.clj alongside a foo.jolt that wins here, the way .clj wins over
+;; .cljc on the JVM.
+(define ldr-source-exts '(".jolt" ".clj" ".cljc"))
+
+(define (ldr-source-path? p)
+  (let loop ((es ldr-source-exts))
+    (and (pair? es)
+         (let* ((suf (car es)) (n (string-length p)) (m (string-length suf)))
+           (or (and (>= n m) (string=? (substring p (- n m) n) suf))
+               (loop (cdr es)))))))
+
+;; First existing <root>/rel.<ext> on the search roots, else #f.
 ;; A self-contained jolt binary embeds jolt-core + stdlib source keyed by their
 ;; root-relative path ("clojure/string.clj"); those are checked first, so a
 ;; `require` resolves with no source on disk. The dev bin/jolt has an empty
-;; source store, so the two hashtable probes miss and it falls straight to disk.
+;; source store, so the hashtable probes miss and it falls straight to disk.
 (define (resolve-on-roots rel)
-  (let ((eclj (string-append rel ".clj")) (ecljc (string-append rel ".cljc")))
-    (cond
-      ((let ((v (hashtable-ref embedded-resources eclj #f)))
-         (or (string? v) (bytevector? v))) eclj)
-      ((let ((v (hashtable-ref embedded-resources ecljc #f)))
-         (or (string? v) (bytevector? v))) ecljc)
-      (else
-        (let loop ((roots source-roots))
-          (if (null? roots) #f
-              (let ((clj  (string-append (car roots) "/" rel ".clj"))
-                    (cljc (string-append (car roots) "/" rel ".cljc")))
-                (cond ((file-exists? clj) clj)
-                      ((file-exists? cljc) cljc)
-                      (else (loop (cdr roots)))))))))))
+  (define (embedded-key? k)
+    (let ((v (hashtable-ref embedded-resources k #f)))
+      (or (string? v) (bytevector? v))))
+  (or (let loop ((es ldr-source-exts))
+        (and (pair? es)
+             (let ((k (string-append rel (car es))))
+               (if (embedded-key? k) k (loop (cdr es))))))
+      (let loop ((roots source-roots))
+        (and (pair? roots)
+             (or (let ext ((es ldr-source-exts))
+                   (and (pair? es)
+                        (let ((f (string-append (car roots) "/" rel (car es))))
+                          (if (file-exists? f) f (ext (cdr es))))))
+                 (loop (cdr roots)))))))
 
 ;; Read a namespace source. An embedded key (resolve-on-roots above, or the
 ;; build driver's app-order entries) reads its baked string; everything else is
@@ -787,7 +806,7 @@
            (ldr-mark-loaded! name))
           (else
             (throw-jvm (quote java.io.FileNotFoundException) (string-append "Could not locate " (ns-name->rel name)
-                                     ".clj (or .cljc) on the source roots"))))))))
+                                     ".jolt (or .clj/.cljc) on the source roots"))))))))
 
 ;; load-file: load an explicit path (a `run FILE`), in the current ns.
 (define (jolt-load-file path)
@@ -902,7 +921,8 @@
 ;; load: an arg starting with "/" is a root-relative resource path ("/app/extra");
 ;; otherwise it is resolved against the CURRENT namespace's directory, matching
 ;; Clojure — (load "common_tests") from clojure.tools.reader-test loads
-;; clojure/tools/common_tests.clj. Strip the leading slash / try .clj/.cljc.
+;; clojure/tools/common_tests.clj. Strip the leading slash / try each of
+;; ldr-source-exts.
 (define (jolt-load . paths)
   (for-each
     (lambda (p)

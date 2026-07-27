@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`.jolt` is a source extension alongside `.clj` and `.cljc`.** A namespace can
+  live in `foo.jolt`, and it is the same language: the reader, analyzer, and
+  emitter never look at the extension. The point is to mark intent, so a reader
+  can tell at a glance that a file uses jolt-specific interop and is not portable
+  Clojure. It resolves first, ahead of `.clj` and `.cljc`, so a library can ship a
+  portable `foo.cljc` next to a `foo.jolt` that wins on jolt, the way `.clj` wins
+  over `.cljc` on the JVM. Everything a `.clj` works with works here: `require`,
+  a bare `jolt foo.jolt` script argument, `clojure.core/load`, `data_readers.jolt`,
+  the AOT cache, and `jolt build`.
+
 ### Fixed
 
 - **An alias's `:extra-paths` now precede the project's `:paths` on the source
