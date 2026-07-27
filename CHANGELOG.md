@@ -22,6 +22,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unconditional rebuilds were free under `make -j ci` but charged every
   single-gate run 18s, enough to make `make buildlibsmoke` slower with the new
   prerequisite than without it.
+- **`make gateboot` precompiles the gate boot preamble, taking a pass gate from
+  ~1.5s to ~0.14s.** The two dozen gate scripts spent nearly all of their runtime
+  loading the same six runtime files from Chez source. `make gateboot` compiles
+  exactly that preamble to `target/dev/gate.so`, and the gates use it when it is
+  present and newer than everything that went into it, falling back to the source
+  loads otherwise. Opt-in and unreferenced by any other target, the way `devboot`
+  is, so CI is unaffected unless someone builds it; the win is iterating on a
+  single gate. It needs its own image rather than reusing `target/dev/flat.so`
+  because that one also loads `loader.ss`, which the gates deliberately skip.
+  `JOLT_GATEBOOT=1` reports which path was taken.
+- **The runtime boot preamble lives in one file.** Eight gate scripts each
+  carried their own copy of the same eight `load` lines; they now load
+  `host/chez/gate-boot.ss`. `make-gateboot.ss` generates the image from
+  `bld-runtime-manifest`'s prefix rather than a hand-written list, and
+  `manifestcheck` pins `gate-boot.ss`'s literal fallback against that same
+  prefix, so the runtime, the fallback, and the image cannot drift apart.
 
 ## [0.5.7] - 2026-07-27
 

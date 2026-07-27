@@ -6,7 +6,7 @@
 
 CHEZ ?= $(shell command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null || command -v scheme 2>/dev/null)
 
-.PHONY: test ci testbin values corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot devbootsmoke aotcachesmoke aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit
+.PHONY: test ci testbin values corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit
 
 # Every target needs the vendored submodules; fail with the fix, not a load error.
 submodules:
@@ -22,7 +22,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values corpus unit mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke aotcachesmoke certify
+ci: submodules values corpus unit mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -317,6 +317,21 @@ remint:
 # (loads the .so instead of compiling ~50 .ss files from source every invocation).
 devboot: submodules
 	@$(CHEZ) --script host/chez/make-devboot.ss
+
+# Precompile the gate boot preamble to target/dev/gate.so so a pass gate boots in
+# ~0.2s instead of ~1.5s (it spends nearly all of that loading the same six
+# runtime files from Chez source). Opt-in like devboot: gate-boot.ss uses the
+# image when it is present and newer than every input, and loads from source
+# otherwise, so nothing depends on this target and CI is unaffected. Worth it
+# when iterating on one pass gate; `make ci` runs them in parallel anyway.
+gateboot: submodules
+	@$(CHEZ) --script host/chez/make-gateboot.ss
+
+# Smoke test: the gate boot image's staleness predicate. Drives
+# gate-boot-image-fresh? over synthetic input lists, so it boots no runtime,
+# touches nothing in the repo, and is safe under parallel make.
+gatebootsmoke: gateboot
+	@sh test/chez/gateboot-smoke.sh
 
 # Smoke test: the dev boot cache is used when fresh and invalidated correctly.
 devbootsmoke: devboot
