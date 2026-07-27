@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-07-27
+
+Fixes a 0.5.2 regression: long arithmetic with more than two operands did not
+compile at all.
+
+### Fixed
+
+- **`+`, `-`, `*`, `min` and `max` take any number of long operands again.**
+  `(+ (long a) (long b) (long c))` failed to compile with `invalid syntax
+  (jolt-l+ ...)`. 0.5.2 moved `^long` arithmetic off Chez's variadic `fx+` onto
+  jolt's own overflow-checking `jolt-l+`, which is binary, but the back end kept
+  splicing every operand into one call, so the expander rejected the form. Any
+  3-or-more-operand arithmetic over long-typed operands was affected — an integer
+  literal counts as one, so `(+ (long a) (long b) 5)` was enough — while a single
+  double operand hid it, the flonum ops being variadic. Under `*unchecked-math*`
+  the same splice produced a runtime arity error instead of a compile error.
+  N operands now lower as a left fold of the binary op, which is also the
+  reference semantics: `(+ a b c)` is `(+ (+ a b) c)`, so each step is
+  overflow-checked separately rather than the sum being checked once at the end.
+- **`(+ x)`, `(* x)`, `(min x)` and `(max x)` compile over a long operand.** The
+  other end of the same gap: a binary op has no one-operand form either, so these
+  hit the same syntax error. They emit the operand, which is already coerced and
+  needs no further check. `(- x)` and `(/ x)` are not identities and keep their
+  call.
+
 ## [0.5.5] - 2026-07-27
 
 Two diagnostic fixes: a stack frame now carries its own source location even when
@@ -1743,7 +1768,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.5...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.6...HEAD
+[0.5.6]: https://github.com/jolt-lang/jolt/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/jolt-lang/jolt/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/jolt-lang/jolt/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/jolt-lang/jolt/compare/v0.5.2...v0.5.3

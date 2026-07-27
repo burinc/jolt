@@ -157,6 +157,88 @@
     (eq? (ev "(try ((fn* ([^long i] (dec i))) -9223372036854775808) (catch ArithmeticException e :overflow))")
          (keyword #f "overflow")))
 
+;; --- n-ary (3+) operands over a BINARY fast-path op ---
+;; +/-/*/min/max are variadic in Clojure, but every fast-path op they lower to is
+;; binary: jolt-l+ is a 2-arg macro (3 operands is an expansion-time syntax error,
+;; not a runtime one) and jolt-uncadd2 a 2-arg proc. N operands therefore lower as
+;; a LEFT FOLD of the binary op, which is also the reference semantics: (+ a b c)
+;; is (+ (+ a b) c), so each step overflow-checks separately.
+(let ((e (emitf "u" "(fn* ([^long a ^long b ^long c] (+ a b c)))")))
+  (ok "3-arg long + folds into nested binary jolt-l+" (has? e "(jolt-l+ (jolt-l+ ")))
+(let ((e (emitf "u" "(fn* ([^long a ^long b ^long c] (- a b c)))")))
+  (ok "3-arg long - folds LEFT (not right)" (has? e "(jolt-l- (jolt-l- ")))
+(let ((e (emitf "u" "(fn* ([^long a ^long b ^long c ^long d] (* a b c d)))")))
+  (ok "4-arg long * folds into three nested jolt-l*" (has? e "(jolt-l* (jolt-l* (jolt-l* ")))
+(let ((e (emitf "u" "(fn* ([^long a ^long b ^long c] [(min a b c) (max a b c)]))")))
+  (ok "3-arg long min folds" (has? e "(jolt-l-min (jolt-l-min "))
+  (ok "3-arg long max folds" (has? e "(jolt-l-max (jolt-l-max ")))
+;; an integer literal is a long operand like any other — this is the shape that
+;; made a 2-operand call go n-ary without any extra hint.
+(let ((e (emitf "u" "(fn* ([^long a ^long b] (+ a b 5)))")))
+  (ok "^long params plus an int literal folds" (has? e "(jolt-l+ (jolt-l+ ")))
+;; the double specializations fold the same way (fl+ is variadic in Chez, but one
+;; lowering rule beats two).
+(let ((e (emitf "u" "(fn* ([^double a ^double b ^double c] (+ a b c)))")))
+  (ok "3-arg double + folds into nested binary fl+" (has? e "(#3%fl+ (#3%fl+ ")))
+;; the unchecked ops are 2-arg PROCEDURES, so an unfolded call was an arity error
+;; at run time rather than a syntax error at compile time.
+(let ((e (emitf "u" "(fn* ([^long a ^long b ^long c] (unchecked-add a b c)))")))
+  (ok "3-arg unchecked-add folds into nested jolt-uncadd2" (has? e "(jolt-uncadd2 (jolt-uncadd2 ")))
+;; comparisons keep their own expansion: (< a b c) is (and (< a b) (< b c)), which
+;; is a chain over the ORIGINAL operands, not a fold over the previous result.
+(let ((e (emitf "u" "(fn* ([^long a ^long b ^long c] (< a b c)))")))
+  (ok "3-arg long < still expands to an and-chain" (has? e "(and (jolt-l< "))
+  (ok "3-arg long < does NOT fold" (not (has? e "(jolt-l< (jolt-l< "))))
+;; runtime: values, left-associativity, and per-step overflow checking
+(ok "3-arg long + runtime: 1+2+3 = 6"
+    (= 6 (jnum->exact (ev "((fn* ([^long a ^long b ^long c] (+ a b c))) 1 2 3)"))))
+(ok "3-arg long - runtime: 7-2-3 = 2 (left-associative)"
+    (= 2 (jnum->exact (ev "((fn* ([^long a ^long b ^long c] (- a b c))) 7 2 3)"))))
+(ok "3-arg long * runtime: 7*2*3 = 42"
+    (= 42 (jnum->exact (ev "((fn* ([^long a ^long b ^long c] (* a b c))) 7 2 3)"))))
+(ok "3-arg long min/max runtime"
+    (and (= 2 (jnum->exact (ev "((fn* ([^long a ^long b ^long c] (min a b c))) 7 2 3)")))
+         (= 7 (jnum->exact (ev "((fn* ([^long a ^long b ^long c] (max a b c))) 7 2 3)")))))
+;; Long/MAX + 1 - 1 overflows at the FIRST step, exactly as on the JVM — a single
+;; check over the whole sum would have returned Long/MAX instead.
+(ok "n-ary long + overflow-checks each step, not just the result"
+    (eq? (ev "(try ((fn* ([^long a ^long b ^long c] (+ a b c))) 9223372036854775807 1 -1) (catch ArithmeticException e :overflow))")
+         (keyword #f "overflow")))
+(ok "3-arg unchecked-add runtime wraps at each step (no throw)"
+    (= -9223372036854775807
+       (jnum->exact (ev "((fn* ([^long a ^long b ^long c] (unchecked-add a b c))) 9223372036854775807 1 1)"))))
+;; the site this regressed on: a three-term long hash mix.
+(ok "three-term long hash mix runtime"
+    (= 902766131
+       (jnum->exact (ev "((fn* ([^long a ^long b ^long s] (+ (* a 73856093) (* b 19349663) (* s 83492791)))) 3 5 7)"))))
+
+;; the other end of the same gap: ONE operand. (+ x)/(* x)/(min x)/(max x) are the
+;; operand itself, and no fast-path op has a 1-operand form to splice it into (a
+;; ^long operand is already coerced, so there is nothing left to check either).
+;; - and / are NOT identities at arity 1 -- they negate and reciprocate -- and
+;; every fast-path op spells those out, so they keep their call.
+(let ((e (emitf "u" "(fn* ([^long a] (+ a)))")))
+  (ok "arity-1 long + emits the operand, not a jolt-l+ call" (not (has? e "(jolt-l+"))))
+(let ((e (emitf "u" "(fn* ([^long a] (* a)))")))
+  (ok "arity-1 long * emits the operand" (not (has? e "(jolt-l*"))))
+(let ((e (emitf "u" "(fn* ([^long a] (min a)))")))
+  (ok "arity-1 long min emits the operand" (not (has? e "(jolt-l-min"))))
+(let ((e (emitf "u" "(fn* ([^long a] (max a)))")))
+  (ok "arity-1 long max emits the operand" (not (has? e "(jolt-l-max"))))
+(let ((e (emitf "u" "(fn* ([^long a] (- a)))")))
+  (ok "arity-1 long - still calls jolt-l- (negate, not identity)" (has? e "(jolt-l-")))
+(ok "arity-1 long +/*/min/max runtime: all the operand"
+    (and (= 5 (jnum->exact (ev "((fn* ([^long a] (+ a))) 5)")))
+         (= 5 (jnum->exact (ev "((fn* ([^long a] (* a))) 5)")))
+         (= 5 (jnum->exact (ev "((fn* ([^long a] (min a))) 5)")))
+         (= 5 (jnum->exact (ev "((fn* ([^long a] (max a))) 5)")))))
+(ok "arity-1 long - runtime negates" (= -5 (jnum->exact (ev "((fn* ([^long a] (- a))) 5)"))))
+;; jnum->exact truncates, so the reciprocal is compared as a flonum.
+(ok "arity-1 double +/min runtime: the operand; / reciprocates"
+    (and (= 4 (jnum->exact (ev "((fn* ([^double a] (+ a))) 4.0)")))
+         (= 4 (jnum->exact (ev "((fn* ([^double a] (min a))) 4.0)")))
+         (= 0.25 (ev "((fn* ([^double a] (/ a))) 4.0)"))))
+
 ;; a ^long-seeded loop accumulator IS fx-typed (the hint is a fixnum promise, and
 ;; the value flows from a coerced ^long param).
 (let ((e (emitf "u" "(fn* ([^long start] (loop [acc start] (if (< acc 100) (recur (inc acc)) acc))))")))
