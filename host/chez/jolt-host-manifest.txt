@@ -94,6 +94,7 @@ map-entry
 park-until-interrupt
 protocol-methods
 rational-type?
+read-all-stdin
 record-ctor-key
 record-shapes
 record-type?
@@ -104,6 +105,7 @@ register-source!
 resolvable-names
 resolve-class-hint
 resolve-global
+run-expr-string
 run-interruptible
 run-main-pump
 set-field!

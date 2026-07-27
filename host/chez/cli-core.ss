@@ -2,7 +2,8 @@
 ;; (cli.ss under `chez --script`) and the standalone binary's launcher
 ;; (build-jolt.ss scheme-start). Both call jolt-cli-run so the -e handling,
 ;; end-of-options rule, and uncaught-throw reporting cannot drift apart — the
-;; binary once carried a stale copy of the -e arm.
+;; binary once carried a stale copy of the -e arm. jolt.main's own (project-aware)
+;; -e arm calls back into jolt-run-expr-string here for the same reason.
 
 ;; Flush stdout/stderr on EVERY exit path. Buffered stdout is otherwise lost
 ;; when the process ends while helper threads are winding down (the throwing
@@ -165,6 +166,27 @@
         (when (and print? (not (string=? s "")))
           (display s) (newline))))))
 
+;; Expose the evaluator (and the stdin reader it pairs with) to Clojure. jolt.main's
+;; -e arm — the project-aware path, reached from -Sdeps/-A/-M, an alias's
+;; :main-opts ["-e" …], or a project dir that has a deps.edn — evaluates through
+;; this same primitive, so the launcher's -e and jolt.main's -e cannot drift the
+;; way the binary's forked copy of the -e arm once did.
+(def-var! "jolt.host" "run-expr-string"
+  (lambda (expr app-args print?)
+    (jolt-run-expr-string expr (seq->list app-args) (jolt-truthy? print?))
+    jolt-nil))
+(def-var! "jolt.host" "read-all-stdin" (lambda () (jolt-read-all-stdin)))
+
+;; Does the project dir have a deps.edn? The launcher's -e / - arms below skip
+;; jolt.main entirely — no deps chain, no project source roots, no natives — which
+;; is only equivalent to the real thing when there is no project to resolve. With a
+;; deps.edn present the argv falls through to jolt.main instead, so `jolt -e
+;; "(require 'my.app)"` sees the project's paths and deps like every other command.
+(define (jolt-project-deps-edn?)
+  (let* ((pwd (getenv "JOLT_PWD"))
+         (dir (if (and pwd (string? pwd) (not (string=? pwd ""))) pwd ".")))
+    (file-exists? (string-append dir "/deps.edn"))))
+
 (define (jolt-cli-run cli-args prepare-build!)
   (guard (v (#t (jolt-report-uncaught v)))
     (jolt-cli-dispatch cli-args prepare-build!)
@@ -179,13 +201,16 @@
       ;; EXPR are *command-line-args* (nil when empty),
       ;; with the first standalone "--" consumed as POSIX end-of-options. `-e -`
       ;; reads the expression from stdin.
+      ;; Taken only when there is no project deps.edn to resolve — otherwise
+      ;; jolt.main's -e arm handles it, resolving the project first.
       ((and (pair? cli-args) (string=? (car cli-args) "-e")
-            (pair? (cdr cli-args)))
+            (pair? (cdr cli-args)) (not (jolt-project-deps-edn?)))
        (let ((expr (if (string=? (cadr cli-args) "-") (jolt-read-all-stdin) (cadr cli-args))))
          (jolt-run-expr-string expr (drop-end-of-options (cddr cli-args)) #t)))
       ;; `-` [args…] — read a PROGRAM from stdin and run it as a script (the final
       ;; value is not echoed, like `clojure -M -`); args after it are the argv.
-      ((and (pair? cli-args) (string=? (car cli-args) "-"))
+      ((and (pair? cli-args) (string=? (car cli-args) "-")
+            (not (jolt-project-deps-edn?)))
        (jolt-run-expr-string (jolt-read-all-stdin) (drop-end-of-options (cdr cli-args)) #f))
       ;; otherwise dispatch the argv through jolt.main/-main
       (else

@@ -88,6 +88,23 @@ out="$(run -A:dev:dev2 path)"
 n="$(printf '%s' "$out" | tr ':' '\n' | grep -c "^$APP/dev$")"
 check "multi-alias extra-paths distinct" "1" "$n"
 
+# Path order matches `clojure -Spath`: the aliases' :extra-paths (in selection
+# order), then the project's :paths — or an alias's :replace-paths, which
+# :extra-paths still precedes — then the dep roots. own_paths keeps only the
+# project's own directories; a :local/root dep root is under "$APP/../".
+own_paths() { run "$@" path | tr ':' '\n' | grep -E "^$APP/[a-z0-9]+\$" | tr '\n' ' ' | sed 's/ $//'; }
+check "extra-paths precede the project paths" "$APP/dev $APP/extra $APP/src" \
+      "$(own_paths -A:dev2)"
+check "extra-paths follow alias selection order" "$APP/shadow $APP/dev $APP/src" \
+      "$(own_paths -A:shadow:dev)"
+check "extra-paths precede replace-paths" "$APP/shadow $APP/dev" \
+      "$(own_paths -A:rp:shadow)"
+
+# and the order is load-bearing: shadow/appmain.clj and src/appmain.clj both
+# define `appmain`, and the loader takes the first root that has it.
+check "no alias => the project's own copy loads" "main1" "$(run run -m appmain)"
+check ":extra-paths shadow the project's paths" "shadowed" "$(run -A:shadow run -m appmain)"
+
 # :main-opts last-wins across aliases
 check "multi-alias main-opts last-wins" "main2" "$(run -M:m1:m2)"
 
@@ -119,6 +136,30 @@ check "-Sdeps adds a dep" "libc C" \
       "$(run -Sdeps '{:deps {local/libc {:local/root "../libc"}}}' run -m appc)"
 check "-Sdeps adds an alias" "libc C" \
       "$(run -Sdeps '{:aliases {:inj {:extra-deps {local/libc {:local/root "../libc"}}}}}' -A:inj run -m appc)"
+
+# -e in a project resolves deps.edn first, so the expression can require the
+# project's namespaces and its deps — and it composes with -Sdeps/-A/-M, which
+# used to fail with "unknown command or task: -e".
+check "-e sees the project's namespaces" "main1" "$(run -e "(require 'appmain) (appmain/-main)")"
+check "-Sdeps + -e" "libc C" \
+      "$(run -Sdeps '{:deps {local/libc {:local/root "../libc"}}}' -e "(require 'appc) (appc/-main)")"
+check "-A + -e" "devmain" "$(run -A:dev2 -e "(require 'devmain) (devmain/-main)")"
+check "bare -M -e uses the command line as main-opts" "main1" \
+      "$(run -M -e "(require 'appmain) (appmain/-main)")"
+check "bare -M -m uses the command line as main-opts" "main1" "$(run -M -m appmain)"
+check ":main-opts may be an -e expression" "main1" "$(run -M:e1)"
+check "-M:alias main-opts precede the command line" "main1" "$(run -M:m1 -m appmain2)"
+check "-e passes the rest as *command-line-args*" '(a b)' \
+      "$(run -e '(println *command-line-args*)' a b)"
+check "-e - reads the expression from stdin" "main1" \
+      "$(printf "(require 'appmain) (appmain/-main)" | JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" -e - 2>&1 | tail -1)"
+check "- runs a stdin program against the project" "main1" \
+      "$(printf "(require 'appmain) (appmain/-main)" | JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" - 2>&1 | tail -1)"
+out="$(runfull -M)"
+case "$out" in
+  *"have no :main-opts"*) check "bare -M with nothing to run errors" ok ok ;;
+  *) check "bare -M with nothing to run errors" "no-main-opts error" "$(printf '%s' "$out" | head -1)" ;;
+esac
 
 # -X: :exec-fn / :exec-args from the alias, k v overrides, a trailing map, an
 # explicit ns/fn argument, and :ns-aliases qualification
