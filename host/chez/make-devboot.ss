@@ -83,7 +83,7 @@
       (for-each
         (lambda (rp)
           (let ((rel (car rp)) (abs (cdr rp)))
-            (when (or (str-suffix? rel ".clj") (str-suffix? rel ".cljc"))
+            (when (ldr-source-path? rel)
               (put-string out
                 (string-append
                   "(register-embedded-resource! " (ei-str-lit rel) " "
@@ -101,13 +101,13 @@
 (let ((out (open-output-file db-input-file 'replace))
       (clj-files '()))
   (for-each (lambda (p) (put-string out p) (put-string out "\n")) db-paths)
-  ;; Also list all .clj/.cljc source files.
+  ;; Also list every source file (ldr-source-exts).
   (for-each
     (lambda (root)
       (for-each
         (lambda (rp)
           (let ((rel (car rp)))
-            (when (or (str-suffix? rel ".clj") (str-suffix? rel ".cljc"))
+            (when (ldr-source-path? rel)
               (put-string out (cdr rp)) (put-string out "\n"))))
         (bld-walk-files root "" '())))
     ldr-install-roots)

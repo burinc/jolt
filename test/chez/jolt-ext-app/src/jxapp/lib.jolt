@@ -1,0 +1,8 @@
+;; A .jolt source file: the same language as .clj, marking a namespace that uses
+;; jolt-specific interop rather than portable Clojure. Nothing here depends on the
+;; extension; the point of the fixture is that `build` finds and emits it.
+(ns jxapp.lib)
+
+(defmacro twice [x] `(list ~x ~x))
+
+(defn shout [s] (str (clojure.string/upper-case s) "!"))

@@ -354,6 +354,19 @@ if [ "$got_cc" != "CLJC-COND :before :after" ]; then
   echo "  FAIL: cljs-only conditional truncated emission — want 'CLJC-COND :before :after', got \`$got_cc\`"; exit 1
 fi
 
+# A .jolt namespace is ordinary source — the extension only marks jolt-specific
+# interop — so `build` has to resolve, emit, and macroexpand it exactly like a
+# .clj. The fixture's .clj main requires a .jolt lib and uses a macro from it.
+jxapp="$root/test/chez/jolt-ext-app"
+jxout="$(dirname "$out")/jolt-ext-bin"
+if ! JOLT_PWD="$jxapp" bin/jolt build -m jxapp.main -o "$jxout" >/dev/null 2>&1; then
+  echo "  FAIL: jolt build of an app with a .jolt namespace exited non-zero"; exit 1
+fi
+got_jx="$(cd / && "$jxout" 2>&1 | tail -1)"
+if [ "$got_jx" != "JOLT-EXT BUILT! (:x :x)" ]; then
+  echo "  FAIL: .jolt namespace in a built binary — want 'JOLT-EXT BUILT! (:x :x)', got \`$got_jx\`"; exit 1
+fi
+
 # A file's top-level (set! *unchecked-math* true) must load and take effect, and
 # must not escape that file. Both the loader and the AOT'd binary bracket a
 # namespace's forms with a thread binding for the var (RT.load parity), so this
@@ -460,4 +473,4 @@ if ! printf '%s' "$got_decl" | grep -q '^declared: true$' || ! printf '%s' "$got
   echo "--- got ----"; echo "$got_decl"; exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var)"
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var)"

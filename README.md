@@ -328,6 +328,13 @@ Clojure. The genuine divergences:
 - **Coverage.** `clojure.core` is implemented function by function against the
   JVM-sourced conformance corpus — broad but not total; a namespace can load with
   most functions working and a few not yet implemented.
+- **A `.jolt` extension.** A namespace's source can be `foo.jolt` as well as
+  `foo.clj` or `foo.cljc`, and the three are the same language: the reader,
+  analyzer, and emitter never look at the extension. `.jolt` is a marker for
+  readers and tooling, saying the file uses jolt-specific interop and is not
+  portable Clojure. It resolves first, so a library can ship a portable
+  `foo.cljc` next to a `foo.jolt` that wins on jolt, the way `.clj` wins over
+  `.cljc` on the JVM. `data_readers.jolt` works like `data_readers.clj` too.
 
 ## Test
 
