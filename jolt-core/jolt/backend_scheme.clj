@@ -761,13 +761,34 @@
     :else
     (let [op (case kind :double (dbl-ops nm) :long (lng-ops nm) :bigdec (bd-ops nm))
           op (if (= kind :double) (str "#3%" op) op)]
-      (if (and (contains? #{"<" "<=" ">" ">=" "==" "="} nm) (> (count args) 2))
+      (cond
+        (and (contains? #{"<" "<=" ">" ">=" "==" "="} nm) (> (count args) 2))
         ;; a chained comparison (<= a b c) means (and (<= a b) (<= b c)); the fast
         ;; binary op is 2-ary, so expand rather than pass 3+ args to it. order-args
         ;; binds each operand to a temp once, so reusing a temp across pairs is safe.
         (order-args (fn [as]
           (str "(and " (str/join " " (map (fn [pair] (str "(" op " " (first pair) " " (second pair) ")"))
                                           (partition 2 1 as))) ")")))
+        ;; Every fast-path op is BINARY — jolt-l+ and friends are 2-arg macros (3
+        ;; operands is a syntax error at expansion, not a runtime one) and the
+        ;; unchecked ops are 2-arg procs — while +/-/*/min/max are variadic. Lower N
+        ;; operands as a left fold of the binary op, which is also the reference
+        ;; semantics: (+ a b c) is (+ (+ a b) c), so each step overflow-checks
+        ;; separately rather than one check over the whole sum. Each operand still
+        ;; appears exactly once and in source order, so this is safe whether or not
+        ;; order-args bound them to temps.
+        (> (count args) 2)
+        (order-args (fn [as]
+          (reduce (fn [acc a] (str "(" op " " acc " " a ")")) (first as) (rest as))))
+        ;; The other end: ONE operand. (+ x)/(* x)/(min x)/(max x) ARE x, and a
+        ;; binary op has no 1-operand form to splice it into. A specialized operand
+        ;; is already coerced (^long -> fixnum, ^double -> flonum), so unlike the
+        ;; generic jolt-add there is nothing left to type-check either. `-` and `/`
+        ;; are NOT identities here — they negate and reciprocate — and every
+        ;; fast-path op spells those out, so they keep their call.
+        (and (= 1 (count args)) (contains? #{"+" "*" "min" "max"} nm))
+        (first args)
+        :else
         (order-args (fn [as] (str "(" op " " (str/join " " as) ")")))))))
 
 ;; slot of a declared field key in a record's field-order shape, or nil.
