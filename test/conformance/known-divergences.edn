@@ -119,6 +119,12 @@
    :jvm "throws (EOF while reading)"
    :jolt "nil"
    :note "Permissive."}
+  ;; unchecked-add/-subtract/-multiply accept any arity (the JVM's take exactly 2).
+  {:category :permissive
+   :behavior "(unchecked-add x) or (unchecked-add a b c), e.g. through apply"
+   :jvm "throws ArityException — these are arity-2 only"
+   :jolt "folds like +: no args => 0, one => the operand, N => a left fold"
+   :note "The overlay is variadic where the JVM's is fixed-arity. At arity 2 — every arity the JVM accepts — the wrapping result is identical, 64-bit edges included, so portable code is unaffected. Costs nothing on the hot path either: proven-long operands lower straight to jolt-uncadd2 (a left fold past 2 operands) and never reach the variadic overlay, which only serves value position."}
   ;; auto-gensym suffix differs by a trailing "__".
   {:category :reader-model
    :behavior "an auto-gensym x# expands to a symbol named"
