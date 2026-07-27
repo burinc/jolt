@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The gate runs about 2.7x faster.** `make -j8 ci` drops from 338s to 124s.
+  The build-driving gates (`buildsmoke`, `shakelocal`, `depssmoke`,
+  `staticnativesmoke`, `buildlibsmoke`) shelled out to source-mode `bin/jolt`,
+  where a `jolt build` costs ~12.5s against ~2.5s through a prebuilt binary, and
+  `buildsmoke` alone drives 26 of them. They now take `testbin` and default
+  `JOLT_BIN` to `target/release/jolt`, the way `smoke` and `cts` already did:
+  those five together go from 713s to 161s. `buildsmoke` keeps one explicit
+  `bin/jolt` build at the end so the source-mode driver stays gated, and
+  `JOLT_BIN=bin/jolt` puts any of them back in script mode. `testbin` itself is
+  now rebuilt only when something it bakes in is newer than the binary —
+  unconditional rebuilds were free under `make -j ci` but charged every
+  single-gate run 18s, enough to make `make buildlibsmoke` slower with the new
+  prerequisite than without it.
+
 ## [0.5.7] - 2026-07-27
 
 A `.jolt` source extension, `-e` and `:main-opts` fixes across the CLI entry

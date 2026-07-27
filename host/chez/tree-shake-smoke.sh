@@ -9,6 +9,14 @@
 # default gate — run with `make shakesmoke`.
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
+
+# JOLT_BIN overrides the jolt under test. The gate targets point it at the
+# freshly built target/release/jolt: a `jolt build` costs ~2.5s through the
+# prebuilt binary and ~12.5s through the source-mode driver, and this gate
+# drives two per app. JOLT_BIN=bin/jolt forces script mode.
+jolt="${JOLT_BIN:-bin/jolt}"
+# Absolute form, for the cases that cd into a fixture directory first.
+case "$jolt" in /*) joltabs="$jolt" ;; *) joltabs="$root/$jolt" ;; esac
 # SHAKESMOKE_SCOPE=local runs ONLY the no-git-dep correctness fixtures under
 # test/chez (ns-publics/defonce/data-reader apps) — these build in seconds and
 # don't need the examples repo, so they're wired into `make shakelocal` / ci. The
@@ -39,9 +47,9 @@ run_case() {
   app="$examples/$1"; ns="$2"; args="$3"
   [ -d "$app" ] || { echo "  - $1: skipped (not present)"; return; }
   b0="$tmp/$1-plain"; b1="$tmp/$1-shake"
-  if ! JOLT_PWD="$app" bin/jolt build -m "$ns" -o "$b0" >/dev/null 2>&1; then
+  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b0" >/dev/null 2>&1; then
     echo "  - $1: FAIL (default build)"; fail=1; return; fi
-  if ! JOLT_PWD="$app" bin/jolt build -m "$ns" -o "$b1" --tree-shake >/dev/null 2>&1; then
+  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b1" --tree-shake >/dev/null 2>&1; then
     echo "  - $1: FAIL (--tree-shake build)"; fail=1; return; fi
   o0="$(cd "$app" && "$b0" $args 2>&1)"
   o1="$(cd "$app" && "$b1" $args 2>&1)"
@@ -64,9 +72,9 @@ run_local_case() {
   [ -d "$app" ] || { echo "  - $1: skipped (not present)"; return; }
   b0="$tmp/$1-plain"; b1="$tmp/$1-shake"
   bdir="$tmp/$1-shake.build"
-  if ! JOLT_PWD="$app" bin/jolt build -m "$ns" -o "$b0" >/dev/null 2>&1; then
+  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b0" >/dev/null 2>&1; then
     echo "  - $1: FAIL (default build)"; fail=1; return; fi
-  if ! JOLT_PWD="$app" bin/jolt build -m "$ns" -o "$b1" --tree-shake 2>"$tmp/$1-shake-err"; then
+  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b1" --tree-shake 2>"$tmp/$1-shake-err"; then
     echo "  - $1: FAIL (--tree-shake build)"
     cat "$tmp/$1-shake-err" | head -5
     fail=1; return; fi
