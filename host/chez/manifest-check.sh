@@ -38,6 +38,21 @@ if ! diff -u "$tmp/cli" "$tmp/manifest" > "$tmp/diff"; then
   fail=1
 fi
 
+# gate-boot.ss: the gate scripts' boot preamble, and the prefix make-gateboot.ss
+# compiles into target/dev/gate.so. It is a THIRD hand-mirror of the manifest —
+# literal for the same reason cli.ss's loads are — so pin it as an exact prefix.
+# The gates stop before cli-core.ss deliberately (loader.ss would turn their
+# alias-only `require` into real file loading), so compare against the manifest
+# truncated at compile-eval.ss.
+sed -n '/(load "host\/chez\/rt.ss")/,/(load "host\/chez\/compile-eval.ss")/p' host/chez/gate-boot.ss \
+  | grep -oE 'host/chez/[a-zA-Z0-9_/.-]+\.ss' > "$tmp/gate"
+sed -n '1,/^host\/chez\/compile-eval\.ss$/p' "$tmp/manifest" > "$tmp/manifest-prefix"
+if ! diff -u "$tmp/gate" "$tmp/manifest-prefix" > "$tmp/gdiff"; then
+  echo "  FAIL: gate-boot.ss loads != bld-runtime-manifest prefix through compile-eval.ss"
+  sed 's/^/    /' "$tmp/gdiff"
+  fail=1
+fi
+
 # bootstrap.ss: a reduced set. Its prelude/image come from CLI args (bs-seed-*),
 # so each of its FIXED loads must appear in the manifest, except emit-image.ss
 # (bootstrap-only — it rebuilds the image from source, not a runtime load).

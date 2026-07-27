@@ -8,14 +8,9 @@
 ;;   (gate-summary "name")
 
 ;; --- boot preamble ---------------------------------------------------------------
-(load "host/chez/rt.ss")
-(set-chez-ns! "clojure.core")
-(load "host/chez/seed/prelude.ss")
-(load "host/chez/post-prelude.ss")
-(set-chez-ns! "user")
-(load "host/chez/host-contract.ss")
-(load "host/chez/seed/image.ss")
-(load "host/chez/compile-eval.ss")
+;; Shared with the test/chez gate scripts; uses target/dev/gate.so when `make
+;; gateboot` has built it and it is fresh, else loads the runtime from source.
+(load "host/chez/gate-boot.ss")
 
 ;; --- check counter ---------------------------------------------------------------
 (define gate-fails 0)
