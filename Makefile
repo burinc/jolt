@@ -6,7 +6,7 @@
 
 CHEZ ?= $(shell command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null || command -v scheme 2>/dev/null)
 
-.PHONY: test ci testbin values corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot devbootsmoke aotcachesmoke aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit
+.PHONY: test ci testbin values corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot devbootsmoke aotcachesmoke aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit
 
 # Every target needs the vendored submodules; fail with the fix, not a load error.
 submodules:
@@ -22,7 +22,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values corpus unit mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke aotcachesmoke certify
+ci: submodules values corpus unit mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke aotcachesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -232,6 +232,13 @@ directlink:
 # isolated (reentrant) and a flag set under one never leaks into another.
 unitcontext:
 	@$(CHEZ) --script test/chez/unit-context-test.ss
+
+# Every numeric fast-path op at every arity it admits, derived from op-registry:
+# the specialized form compiles, agrees with the generic path, and actually emits
+# its specialization. op-registry names a proc per kind without saying what arity
+# that proc takes, so this is what pins the two together.
+oparity:
+	@$(CHEZ) --script test/chez/op-arity-test.ss
 
 # Hint-directed fast arithmetic: ^double/^long param hints (and float literals)
 # lower arithmetic to Chez fl*/fx* ops; un-hinted integer code stays generic.

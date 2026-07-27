@@ -1392,6 +1392,7 @@
   {:suite "numbers / n-ary primitive arithmetic" :label "3-arg + over ^double params" :expected "7.0" :actual "(do (defn dmix [^double a ^double b ^double c] (+ a b c)) (dmix 1.5 2.5 3.0))" :portability :common}
   {:suite "numbers / n-ary primitive arithmetic" :label "1 operand: +/*/min/max are the operand, - negates (^long)" :expected "[5 5 5 5 -5]" :actual "(do (defn nary1 [^long a] [(+ a) (* a) (min a) (max a) (- a)]) (nary1 5))" :portability :common}
   {:suite "numbers / n-ary primitive arithmetic" :label "1 operand over ^double, and / reciprocates" :expected "[4.0 4.0 4.0 4.0 -4.0 0.25]" :actual "(do (defn dnary1 [^double a] [(+ a) (* a) (min a) (max a) (- a) (/ a)]) (dnary1 4.0))" :portability :common}
+  {:suite "numbers / arithmetic" :label "mod/rem/quot over BigDecimal operands" :expected "[2M 2M 2M 2M]" :actual "[(mod 8M 3M) (rem 8M 3M) (quot 8M 3M) (mod -1M 3M)]" :portability :common}
   {:suite "numbers / comparison" :label "less than" :expected "true" :actual "(< 1 2 3)" :portability :common}
   {:suite "numbers / comparison" :label "less than false" :expected "false" :actual "(< 1 3 2)" :portability :common}
   {:suite "numbers / comparison" :label "greater than" :expected "true" :actual "(> 3 2 1)" :portability :common}

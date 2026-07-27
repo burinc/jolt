@@ -786,8 +786,17 @@
         ;; generic jolt-add there is nothing left to type-check either. `-` and `/`
         ;; are NOT identities here — they negate and reciprocate — and every
         ;; fast-path op spells those out, so they keep their call.
-        (and (= 1 (count args)) (contains? #{"+" "*" "min" "max"} nm))
+        ;; unchecked-add/-multiply are identities the same way: jolt's overlay folds
+        ;; them over any arity ((apply unchecked-add [x]) => x), so the inline path
+        ;; has to agree with it — a 2-arg proc handed one operand is an arity error.
+        (and (= 1 (count args))
+             (contains? #{"+" "*" "min" "max" "unchecked-add" "unchecked-multiply"} nm))
         (first args)
+        ;; unchecked-subtract at one operand negates, matching both `-` and jolt's
+        ;; own overlay ((apply unchecked-subtract [x]) => -x). jolt-uncsub2 has no
+        ;; unary form, so subtract from zero — which wraps identically.
+        (and (= 1 (count args)) (= "unchecked-subtract" nm))
+        (order-args (fn [as] (str "(" op " 0 " (first as) ")")))
         :else
         (order-args (fn [as] (str "(" op " " (str/join " " as) ")")))))))
 
