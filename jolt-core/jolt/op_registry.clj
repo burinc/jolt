@@ -77,8 +77,13 @@
           :dbl "flmax" :lng "jolt-l-max" :bd "jbd-max"
           :num-result? true :num-args? true :pure? true}
    "abs" {:num-result? true :num-args? true :pure? true}  ; overlay fn, not a native op
+   ;; no :bd — there is no jbd-mod. The bigdec kind is only assigned to quot/rem
+   ;; (passes.numeric bd-result-kind), so a "jbd-mod" here never reached emission;
+   ;; it did reach registry-emitted-names, reserving a name nothing defines and
+   ;; arming the pass to emit an unbound identifier the day mod joined that set.
+   ;; Bigdec mod goes through the generic jolt-mod, which is already bigdec-aware.
    "mod"   {:call "jolt-mod"  :arity #(= % 2)
-            :lng "jolt-l-mod"  :bd "jbd-mod"
+            :lng "jolt-l-mod"
             :num-result? true :num-args? true :foldable? true}
    "rem"   {:call "jolt-rem"  :arity #(= % 2)
             :lng "jolt-l-rem"  :bd "jbd-rem"
