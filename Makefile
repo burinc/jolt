@@ -42,12 +42,24 @@ unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
 
 # Real-CLI smoke over bin/jolt.
-# smoke and cts spawn a jolt process per case; a prebuilt binary boots ~10x
-# faster than script mode (0.14s vs 1.5s), so both build one first (12s,
-# always rebuilt so it can't go stale against edited sources). JOLT_BIN=bin/jolt
-# forces script mode.
+# The CLI and build gates spawn a jolt process per case; a prebuilt binary boots
+# ~10x faster than script mode (0.14s vs 1.5s) and builds an app ~5x faster, so
+# they take this as a prerequisite. JOLT_BIN=bin/jolt forces script mode.
+#
+# Rebuilt only when something it bakes in is newer than the binary. It used to
+# rebuild unconditionally, which is free under `make -j ci` (one shared node in
+# the graph) but charged every single-gate run 18s — enough to make `make
+# buildlibsmoke` slower with the prerequisite than without it. The staleness
+# check covers the same inputs build-jolt.ss embeds: the runtime .ss files, the
+# install roots, and the launcher stub. JOLT_FORCE_TESTBIN=1 rebuilds anyway.
+TESTBIN_INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src vendor/irregex
 testbin:
-	@$(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt
+	@if [ -n "$${JOLT_FORCE_TESTBIN:-}" ] || [ ! -x target/release/jolt ] || \
+	   [ -n "$$(find $(TESTBIN_INPUTS) -type f -newer target/release/jolt -print -quit 2>/dev/null)" ]; then \
+	  $(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt; \
+	else \
+	  echo "testbin: target/release/jolt up to date"; \
+	fi
 
 smoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/smoke.sh
@@ -56,18 +68,26 @@ smoke: testbin
 irvalidate:
 	@sh host/chez/ir-validate-smoke.sh
 
+# The build-driving gates take testbin for the same reason smoke and cts do,
+# only more so: a `jolt build` costs ~2.5s through the prebuilt binary and
+# ~12.5s through the source-mode driver, and buildsmoke alone drives 26 of them
+# (343s -> 78s measured). Under `make -j ci` the one testbin build is shared
+# with smoke/cts/aotcachesmoke. buildsmoke keeps an explicit bin/jolt build at
+# the end so the source-mode driver stays gated; JOLT_BIN=bin/jolt forces the
+# whole gate back to script mode.
+
 # `jolt build` produces a working standalone binary.
-buildsmoke:
-	@sh host/chez/build-smoke.sh
+buildsmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/build-smoke.sh
 
 # `jolt build --library` produces a shared object callable from C/C++/Rust.
-buildlibsmoke:
-	@sh host/chez/build-lib-smoke.sh
+buildlibsmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/build-lib-smoke.sh
 
 # `jolt build` cc-links a :jolt/native :static archive into the binary (the
 # default), and --dynamic keeps the runtime load-shared-object path.
-staticnativesmoke:
-	@sh host/chez/static-native-smoke.sh
+staticnativesmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/static-native-smoke.sh
 
 # OPT-IN: jolt.mvn-http cert-verifying HTTPS fetch against Central + Clojars.
 # Not in `make test` — needs network + a working system OpenSSL.
@@ -82,8 +102,8 @@ mvnhttp:
 # deps.edn alias + CLI semantics (tools.deps args-map keys, -X/-T/-Sdeps, the
 # user deps.edn chain, jar/git coordinates) through the real CLI, over local
 # fixture projects in test/chez/deps-alias/. Offline.
-depssmoke:
-	@sh host/chez/deps-alias-smoke.sh
+depssmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/deps-alias-smoke.sh
 
 # Dependency-expansion unit tests: exclusions, version selection, orphan
 # cutting, and the Maven version comparator, driven through a fake coordinate
@@ -266,14 +286,14 @@ inline:
 # Tree-shake soundness: build example apps (incl. deps.edn git-lib apps) default vs
 # --tree-shake and require identical output. Slow (two builds per app); not in the
 # default gate. Skips without the examples repo / Chez kernel dev files.
-shakesmoke:
-	@sh host/chez/tree-shake-smoke.sh
+shakesmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/tree-shake-smoke.sh
 
 # The no-git-dep tree-shake correctness fixtures only (ns-publics/defonce/
 # data-reader apps under test/chez) — build in seconds, no examples repo needed,
 # so they run in `make test`/ci. The git-dep apps stay in the manual shakesmoke.
-shakelocal:
-	@SHAKESMOKE_SCOPE=local sh host/chez/tree-shake-smoke.sh
+shakelocal: testbin
+	@SHAKESMOKE_SCOPE=local JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/tree-shake-smoke.sh
 
 # Runtime load-manifest drift guard: cli.ss (the live entry) and bootstrap.ss
 # (the seed rebuilder's reduced set) hand-mirror build.ss's bld-runtime-manifest;

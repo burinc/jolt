@@ -5,6 +5,14 @@
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 
+# JOLT_BIN overrides the jolt under test. The gate targets point it at the
+# freshly built target/release/jolt: a `jolt build` costs ~2.5s through the
+# prebuilt binary and ~12.5s through the source-mode driver, and this gate
+# drives one. JOLT_BIN=bin/jolt forces script mode.
+jolt="${JOLT_BIN:-bin/jolt}"
+# Absolute form, for the cases that cd into a fixture directory first.
+case "$jolt" in /*) joltabs="$jolt" ;; *) joltabs="$root/$jolt" ;; esac
+
 # Preflight: same as build-smoke — a library build needs Chez's kernel dev files
 # (libkernel.a + scheme.h) and a C compiler. Skip cleanly where absent.
 csv="$JOLT_CHEZ_CSV"
@@ -33,7 +41,7 @@ case "$(uname -s)" in
 esac
 
 echo "build-lib smoke: compiling libadd.core -> $lib"
-build_out="$(JOLT_PWD="$app" bin/jolt build --library -m libadd.core -o "$lib" 2>&1)"
+build_out="$(JOLT_PWD="$app" "$jolt" build --library -m libadd.core -o "$lib" 2>&1)"
 if [ ! -f "$lib" ]; then
   # A shared object folds Chez's libkernel.a in, so that archive must be PIC. A
   # kernel built without -fPIC (the common default, incl. a stock source build)
