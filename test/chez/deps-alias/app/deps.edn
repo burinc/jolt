@@ -5,6 +5,8 @@
            :extra-deps {local/libc {:local/root "../libc"}}}
   :dev2   {:extra-paths ["dev" "extra"]}
   :vb     {:override-deps {local/liba {:local/root "../libb"}}}
+  ;; shadow/appmain.clj also defines `appmain`; :extra-paths order decides which wins
+  :shadow {:extra-paths ["shadow"]}
   :defd   {:default-deps {local/libc {:local/root "../libc"}}
            :extra-deps {local/libc nil}}
   :bare   {:replace-deps {local/libc {:local/root "../libc"}}}

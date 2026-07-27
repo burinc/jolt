@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An alias's `:extra-paths` now precede the project's `:paths` on the source
+  roots.** jolt appended them instead, which is the opposite of the clj CLI:
+  `clojure -A:t -Spath` prints `test src`, jolt's `path` printed `src test`. The
+  order decides which copy of a namespace loads, since the loader takes the first
+  root that has it, so a `:extra-paths` directory that deliberately shadows one of
+  the project's own files was silently ignored. `:extra-paths` also precede an
+  alias's `:replace-paths`, and combine in alias-selection order, both matching
+  clj. Dependency roots still come last.
+
 ### Added
 
 - **`-e` composes with `-Sdeps`, `-A`, `-M`, and a project's `deps.edn`.** `-e` was

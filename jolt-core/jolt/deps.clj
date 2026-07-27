@@ -806,8 +806,12 @@
   (legacy :deps) replaces the project deps map, :extra-deps merges into it,
   :override-deps / :default-deps adjust coordinates at every node of the walk;
   :replace-paths (legacy :paths) replaces the project paths, :extra-paths
-  appends; :main-opts is last-wins across the selected aliases. Custom Maven
-  repositories come from the merged :mvn/repos."
+  precede them; :main-opts is last-wins across the selected aliases. Custom
+  Maven repositories come from the merged :mvn/repos.
+
+  :roots is ordered like the clj CLI's classpath — the aliases' :extra-paths,
+  then the project's :paths, then the dependency roots — and the loader takes
+  the first root that has a namespace, so the order decides which copy wins."
   ([project-dir] (resolve-project project-dir []))
   ([project-dir alias-kws] (resolve-project project-dir alias-kws nil))
   ([project-dir alias-kws extra-edn] (resolve-project project-dir alias-kws extra-edn nil))
@@ -826,12 +830,19 @@
                (throw (ex-info (str "Specified aliases are undeclared: " (vec missing))
                                {:aliases (vec missing)}))))
          main-opts (:main-opts argmap)
+         ;; Path order matches the clj CLI: the selected aliases' :extra-paths
+         ;; come FIRST (in alias-selection order), then the project's :paths —
+         ;; or an alias's :replace-paths, which :extra-paths still precedes.
+         ;; `clojure -A:t -Spath` prints `test src`, not `src test`, and the
+         ;; order is load-bearing: the loader takes the first root that has the
+         ;; namespace, so a -A:dev extra path shadows the project's own copy
+         ;; rather than being shadowed by it.
          ;; tool mode (-T): the project's own paths and deps are replaced —
          ;; the tool's alias supplies its own (clj CLI tool-basis defaults
          ;; :replace-paths ["."] :replace-deps {}).
-         project-paths (concat (or (:replace-paths argmap) (:paths argmap)
-                                   (if tool? ["."] (or (:paths edn) ["src"])))
-                               (:extra-paths argmap))
+         project-paths (concat (:extra-paths argmap)
+                               (or (:replace-paths argmap) (:paths argmap)
+                                   (if tool? ["."] (or (:paths edn) ["src"]))))
          project-roots (map #(abspath project-dir %) project-paths)
          all-deps (merge (or (:replace-deps argmap) (:deps argmap)
                              (if tool? {} (:deps edn)))
