@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-07-27
+
+Two diagnostic fixes: a stack frame now carries its own source location even when
+another namespace defines the same function name, and `satisfies?` says what went
+wrong instead of throwing an empty message.
+
+### Fixed
+
+- **A trace frame resolves to its own `ns/name (file:line)` when another namespace
+  defines the same short name.** The host names a frame after the function's short
+  name, so two namespaces defining one name collided in the source registry, which
+  dropped the location rather than risk attributing the frame to the wrong file.
+  The fallback was right but the collision was constant: every project defines
+  `-main` and so does jolt, so the outermost frame of a typical trace never had a
+  location. A function that registers a source map now gets a per-var frame name.
+  Core keeps its short names — the seed and `jolt build` are unaffected.
+- **`satisfies?` on something that is not a protocol names what it was given.** It
+  threw with an empty message, so a caller had nothing to go on. Passing a host
+  interface still throws, as it does on the JVM; the message now reads
+  `satisfies? expects a protocol, got: java.lang.CharSequence`.
+
 ## [0.5.4] - 2026-07-26
 
 Ten host-interop fixes, found by running a real library's test suite end to
@@ -1722,7 +1743,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.4...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.5...HEAD
+[0.5.5]: https://github.com/jolt-lang/jolt/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/jolt-lang/jolt/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/jolt-lang/jolt/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/jolt-lang/jolt/compare/v0.5.1...v0.5.2
