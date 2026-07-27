@@ -120,6 +120,30 @@ check "-Sdeps adds a dep" "libc C" \
 check "-Sdeps adds an alias" "libc C" \
       "$(run -Sdeps '{:aliases {:inj {:extra-deps {local/libc {:local/root "../libc"}}}}}' -A:inj run -m appc)"
 
+# -e in a project resolves deps.edn first, so the expression can require the
+# project's namespaces and its deps — and it composes with -Sdeps/-A/-M, which
+# used to fail with "unknown command or task: -e".
+check "-e sees the project's namespaces" "main1" "$(run -e "(require 'appmain) (appmain/-main)")"
+check "-Sdeps + -e" "libc C" \
+      "$(run -Sdeps '{:deps {local/libc {:local/root "../libc"}}}' -e "(require 'appc) (appc/-main)")"
+check "-A + -e" "devmain" "$(run -A:dev2 -e "(require 'devmain) (devmain/-main)")"
+check "bare -M -e uses the command line as main-opts" "main1" \
+      "$(run -M -e "(require 'appmain) (appmain/-main)")"
+check "bare -M -m uses the command line as main-opts" "main1" "$(run -M -m appmain)"
+check ":main-opts may be an -e expression" "main1" "$(run -M:e1)"
+check "-M:alias main-opts precede the command line" "main1" "$(run -M:m1 -m appmain2)"
+check "-e passes the rest as *command-line-args*" '(a b)' \
+      "$(run -e '(println *command-line-args*)' a b)"
+check "-e - reads the expression from stdin" "main1" \
+      "$(printf "(require 'appmain) (appmain/-main)" | JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" -e - 2>&1 | tail -1)"
+check "- runs a stdin program against the project" "main1" \
+      "$(printf "(require 'appmain) (appmain/-main)" | JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" - 2>&1 | tail -1)"
+out="$(runfull -M)"
+case "$out" in
+  *"have no :main-opts"*) check "bare -M with nothing to run errors" ok ok ;;
+  *) check "bare -M with nothing to run errors" "no-main-opts error" "$(printf '%s' "$out" | head -1)" ;;
+esac
+
 # -X: :exec-fn / :exec-args from the alias, k v overrides, a trailing map, an
 # explicit ns/fn argument, and :ns-aliases qualification
 check "-X runs :exec-fn with :exec-args" 'exec: {:greeting "hi"}' "$(run -X:xbuild)"

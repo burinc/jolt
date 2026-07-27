@@ -32,6 +32,11 @@
 (load "host/chez/host-contract.ss")
 (load "host/chez/seed/image.ss")
 (load "host/chez/compile-eval.ss")
+;; cli-core.ss is inlined into the emitted image below, but it also has to be
+;; loaded HERE: it defines jolt.host/run-expr-string, and jb-emit-cli-ns emits
+;; jolt.main in this process — an unresolved jolt.host var would emit as a class
+;; reference and the binary's -e arm would die with "Unknown class jolt.host".
+(load "host/chez/cli-core.ss")
 (load "host/chez/png.ss")
 (load "host/chez/loader.ss")
 (load "host/chez/java/ffi.ss")

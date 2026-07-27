@@ -117,6 +117,17 @@ $ bin/jolt -e '(/ 1 2)'
 1/2
 ```
 
+When the current directory has a `deps.edn`, `-e` resolves it first, so the
+expression can require the project's own namespaces and its dependencies.
+`-Sdeps` and `-A` compose with it for a one-off evaluation, and `-M` takes the
+same main options on the command line when the selected aliases declare none:
+
+```bash
+bin/jolt -Sdeps '{:paths ["src" "test"]}' -e "(require 'my.app-test 'clojure.test)
+                                              (clojure.test/run-tests 'my.app-test)"
+bin/jolt -A:test -M -e "(println :hi)"
+```
+
 ## Diagnostics
 
 - **"Did you mean?"** — when a bare symbol doesn't resolve, the compile error lists

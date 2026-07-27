@@ -88,14 +88,28 @@
       (apply (deref mainv) app-args)
       (throw (ex-info (str "namespace " ns-name " has no -main") {:ns ns-name})))))
 
-;; main-opts is a vector like ["-m" "app.core"] (optionally trailing args). Apply
-;; it with the user-supplied extra args appended.
+;; Evaluate a string of forms through the launcher's evaluator (cli-core.ss), the
+;; same primitive a bare `jolt -e` runs — so the fast path and the project-aware
+;; path share their read/compile/eval loop, their require auto-quoting, and their
+;; final-value printing. EXPR of "-" reads the expression from stdin. Assumes the
+;; project has already been resolved by the caller.
+(defn- eval-expr-string [expr app-args print?]
+  (when (nil? expr)
+    (throw (ex-info "-e needs an expression (or - to read it from stdin)" {})))
+  (jolt.host/run-expr-string (if (= "-" expr) (jolt.host/read-all-stdin) expr)
+                             (vec (drop-end-of-options app-args))
+                             print?))
+
+;; main-opts is a vector like ["-m" "app.core"] or ["-e" "(prn :hi)"] (optionally
+;; with trailing args). The user-supplied extra args are appended, so an alias's
+;; :main-opts and the command line combine exactly like the clj CLI, which
+;; prepends the alias's :main-opts to the argv.
 (defn- apply-main-opts [main-opts extra-args]
-  (cond
-    (and (seq main-opts) (= "-m" (first main-opts)))
-    (run-ns (second main-opts) (concat (drop 2 main-opts) extra-args))
-    :else
-    (throw (ex-info (str "unsupported :main-opts " (pr-str main-opts)) {}))))
+  (let [opts (concat main-opts extra-args)]
+    (cond
+      (= "-m" (first opts)) (run-ns (second opts) (drop 2 opts))
+      (= "-e" (first opts)) (eval-expr-string (second opts) (drop 2 opts) true)
+      :else (throw (ex-info (str "unsupported :main-opts " (pr-str (vec opts))) {})))))
 
 (defn- parse-aliases [s]            ; "-M:a:b" / ":a:b" -> [:a :b]
   (let [s (if (str/starts-with? s "-") (subs s 2) s)]
@@ -122,13 +136,16 @@
                               (load-file (file-arg (first more))) nil)
     :else (throw (ex-info "run needs -m NS or a FILE" {}))))
 
-;; -M:alias…  — resolve with the aliases (plus any bound by a leading -A),
-;; run their :main-opts
+;; -M[:alias…] [main-opts…] — resolve with the aliases (plus any bound by a
+;; leading -A), then run their :main-opts followed by the command-line ones. With
+;; no :main-opts anywhere in the selected aliases the command line supplies them
+;; on its own, so a bare `jolt -M -e EXPR` (or `-M -m NS`) works like clj — only
+;; an empty command line with no :main-opts is an error.
 (defn- cmd-M [arg more]
   (let [aliases (parse-aliases arg)
         {:keys [main-opts] :as resolved} (resolve-current aliases)]
     (apply-project! resolved)
-    (if main-opts
+    (if (or (seq main-opts) (seq more))
       (apply-main-opts main-opts more)
       (throw (ex-info (str "alias(es) " (pr-str aliases) " have no :main-opts") {})))))
 
@@ -484,14 +501,20 @@
   (println "  -e - [args]            evaluate an EXPR read from stdin")
   (println "  - [args]               run a program read from stdin (as a script)")
   (println "  -m NS [args]           shorthand for run -m")
-  (println "  -M:alias [args]        run the alias's :main-opts")
+  (println "  -M[:alias] [main-opts] run the alias's :main-opts, then the ones given")
+  (println "                         here (-m NS [args] or -e EXPR [args]); with no")
+  (println "                         :main-opts the command line supplies them")
   (println "  -A:alias [args]        add the alias's paths/deps, run the rest")
   (println "  -X:alias [ns/fn] [k v …]  invoke :exec-fn (or ns/fn) with :exec-args")
   (println "  -T:alias [ns/fn] [k v …]  like -X, with the project paths/deps replaced")
   (println "  -Sdeps '<edn>' …       merge an extra deps.edn map, run the rest")
   (println)
   (println "The first standalone -- ends option parsing; everything after it is")
-  (println "passed to the program as *command-line-args*."))
+  (println "passed to the program as *command-line-args*.")
+  (println)
+  (println "-e and - resolve deps.edn when the project has one, so the expression")
+  (println "can require the project's namespaces and its dependencies. Combine them")
+  (println "with -Sdeps/-A to add paths or deps for a one-off evaluation."))
 
 (defn -main [& args]
   (let [[cmd & more] args]
@@ -511,6 +534,18 @@
         (when (nil? edn-str) (throw (ex-info "-Sdeps needs an edn map argument" {})))
         (binding [*cli-extra-edn* (clojure.core/read-string edn-str)]
           (apply -main rest-args)))
+      ;; -e EXPR [args] / - [args] — evaluate with the project resolved. The
+      ;; launcher (cli-core.ss) short-circuits these when the project dir has no
+      ;; deps.edn (nothing to resolve, and it skips loading jolt.main); a project,
+      ;; or a leading -Sdeps/-A, lands here instead so the expression sees the
+      ;; project's paths, deps, and native libs. Both paths evaluate through the
+      ;; same jolt.host/run-expr-string.
+      (= cmd "-e")
+      (do (apply-project! (resolve-current))
+          (eval-expr-string (first more) (rest more) true))
+      (= cmd "-")
+      (do (apply-project! (resolve-current))
+          (eval-expr-string "-" more false))
       (str/starts-with? cmd "-M")        (cmd-M cmd more)
       (str/starts-with? cmd "-A")        (cmd-A cmd more)
       (str/starts-with? cmd "-X")        (cmd-X cmd more)

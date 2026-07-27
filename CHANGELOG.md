@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`-e` composes with `-Sdeps`, `-A`, `-M`, and a project's `deps.edn`.** `-e` was
+  handled entirely in the launcher, before `jolt.main` was loaded, so it never
+  resolved a project and anything that re-dispatched into `jolt.main` first —
+  `jolt -Sdeps '{...}' -e EXPR`, `jolt -A:test -e EXPR` — died with `unknown
+  command or task: -e`. `jolt.main` now has its own `-e` arm that resolves the
+  project (paths, deps, native libraries) and then evaluates through the same
+  launcher primitive, so the two paths cannot drift. A bare `jolt -e EXPR` still
+  takes the launcher's fast path when the project directory has no `deps.edn`
+  (nothing to resolve, and it skips loading `jolt.main`); with a `deps.edn`
+  present it resolves the project, so `jolt -e "(require 'my.app)"` now works
+  from a project directory. The stdin forms (`-e -` and a bare `-`) follow the
+  same rule.
+- **`:main-opts` may be an `-e` expression.** `apply-main-opts` understood only
+  `["-m" NS]`, so a `deps.edn` alias or task declaring `:main-opts ["-e" "..."]`
+  failed with `unsupported :main-opts`.
+- **`-M` takes main options from the command line.** `jolt -M -e EXPR` and `jolt
+  -M -m NS` threw `alias(es) [] have no :main-opts`. The selected aliases'
+  `:main-opts` now precede the ones given on the command line, matching the clj
+  CLI, and when no alias declares any the command line supplies them on its own.
+  Only an empty command line with no `:main-opts` is still an error.
+
 ## [0.5.6] - 2026-07-27
 
 Fixes a 0.5.2 regression: long arithmetic with more than two operands did not
