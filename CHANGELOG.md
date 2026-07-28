@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.9] - 2026-07-28
+
+An interrupted git fetch no longer leaves a dependency unresolvable on every run
+that follows.
+
 ### Fixed
 
 - **An interrupted git fetch no longer poisons the dependency cache.**
@@ -1927,7 +1932,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.8...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.9...HEAD
+[0.5.9]: https://github.com/jolt-lang/jolt/compare/v0.5.8...v0.5.9
 [0.5.8]: https://github.com/jolt-lang/jolt/compare/v0.5.7...v0.5.8
 [0.5.7]: https://github.com/jolt-lang/jolt/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/jolt-lang/jolt/compare/v0.5.5...v0.5.6
