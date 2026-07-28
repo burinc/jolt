@@ -670,7 +670,8 @@
 ;; shared). A Thread runs its Runnable thunk; start forks, join waits on a
 ;; condition latched at completion. CountDownLatch is a counting barrier.
 (define (make-jthread thunk) (make-jhost "user-thread" (vector thunk #f (make-mutex) (make-condition) (box #f) #f)))
-(for-each (lambda (nm) (register-class-ctor! nm (lambda (thunk . _) (make-jthread thunk))))
+;; JVM Thread() is legal: the target is null and run/start are no-ops.
+(for-each (lambda (nm) (register-class-ctor! nm (lambda args (make-jthread (if (null? args) #f (car args))))))
           '("Thread" "java.lang.Thread"))
 (register-host-methods! "user-thread"
   (list (cons "start" (lambda (self)
@@ -685,12 +686,12 @@
               (guard (e (#t (guard (_ (#t #f))
                               (display "Exception in Thread body:\n" (current-error-port))
                               (jolt-report-throwable e (current-error-port)))))
-                (jolt-invoke (vector-ref st 0)))
+                (let ((th (vector-ref st 0))) (when th (jolt-invoke th))))
               (with-mutex (vector-ref st 2)
-                (vector-set! st 1 #t)
-                (condition-broadcast (vector-ref st 3)))))
+                 (vector-set! st 1 #t)
+                 (condition-broadcast (vector-ref st 3)))))
             jolt-nil)))
-        (cons "run" (lambda (self) (jolt-invoke (vector-ref (jhost-state self) 0)) jolt-nil))
+        (cons "run" (lambda (self) (let ((th (vector-ref (jhost-state self) 0))) (when th (jolt-invoke th))) jolt-nil))
         (cons "join" (lambda (self . _)
           (let ((st (jhost-state self)))
             (with-mutex (vector-ref st 2)
@@ -1146,6 +1147,7 @@
 (register-class-arm! jolt-delay? (lambda (x) "clojure.lang.Delay"))
 (register-class-arm! (lambda (x) (jvol? x)) (lambda (x) "clojure.lang.Volatile"))
 (register-class-arm! (lambda (x) (var-cell? x)) (lambda (x) "clojure.lang.Var"))
+(register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "user-thread"))) (lambda (x) "java.lang.Thread"))
 (register-instance-check-arm!
   (lambda (type-sym val)
     (if (symbol-t? type-sym)

@@ -405,6 +405,21 @@
   (jsq-resolve-symbol (chez-actx-cns ctx) form gsmap hc-sq-gensym))
 
 (define (hc-sq-lower ctx form gsmap)
+  ;; Non-nil metadata wraps the lowered form in with-meta, with the meta map
+  ;; itself lowered as a template (so a ^Thread tag qualifies to its FQN) —
+  ;; matches what the JVM emits for `^Thread [] and `^:foo a alike. Reader
+  ;; position keys (:line/:column/:file) are reader artifacts, not user meta:
+  ;; they are stripped, or every macro template form would carry its
+  ;; definition-site position into the expansion and shadow the reader
+  ;; position of the macro's input form.
+  (let* ((out (hc-sq-lower-bare ctx form gsmap))
+         (m (jolt-meta form))
+         (m (if (jolt-nil? m) m (jolt-dissoc m rdr-kw-line rdr-kw-column rdr-kw-file))))
+    (if (or (jolt-nil? m) (zero? (jolt-count m)))
+        out
+        (jolt-list (hc-sym "with-meta") out (hc-sq-lower ctx m gsmap)))))
+
+(define (hc-sq-lower-bare ctx form gsmap)
   (cond
     ((hc-head-is? form "unquote") (hc-second form))
     ((hc-head-is? form "unquote-splicing")

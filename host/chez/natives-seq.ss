@@ -172,9 +172,13 @@
 
 ;; sort: (sort coll) uses compare; (sort cmp coll) uses cmp, whose result may be
 ;; a 3-way number (<0 / 0 / >0) OR a boolean (a Clojure-style less-than pred).
+;; A reify/deftype Comparator is not IFn on the JVM — sort calls its .compare
+;; method; only fns and fn-like values are invoked.
 (define (cmp->less cmp)
   (lambda (a b)
-    (let ((r (jolt-invoke cmp a b)))
+    (let ((r (if (jreify? cmp)
+                 (record-method-dispatch cmp "compare" (jolt-list a b))
+                 (jolt-invoke cmp a b))))
       (if (number? r) (< r 0) (jolt-truthy? r)))))
 (define jolt-sort
   (case-lambda

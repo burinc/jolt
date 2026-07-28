@@ -85,7 +85,7 @@
     (and (>= slen slen2)
          (= (subs s (- slen slen2)) substr))))
 
-(defn trim
+(defn ^String trim
   
   [s]
   (str-trim s))

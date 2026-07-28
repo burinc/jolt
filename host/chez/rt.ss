@@ -285,6 +285,7 @@
       ((NumberFormatException) "java.lang.NumberFormatException")
       ((UnsupportedOperationException) "java.lang.UnsupportedOperationException")
       ((NoSuchElementException) "java.util.NoSuchElementException")
+      ((NoSuchFieldException) "java.lang.NoSuchFieldException")
       ((IndexOutOfBoundsException) "java.lang.IndexOutOfBoundsException")
       ((ClassCastException) "java.lang.ClassCastException")
       ((NullPointerException) "java.lang.NullPointerException")

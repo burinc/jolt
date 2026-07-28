@@ -47,6 +47,31 @@
   {:suite "fn / pre-post" :label ":pre failure throws AssertionError" :expected ":caught" :actual "(do (defn pp [x] {:pre [(pos? x)]} x) (try (pp -1) (catch AssertionError _ :caught)))" :portability :common}
   {:suite "interop / Seqable" :label "a vector is Seqable but not an ISeq" :expected "[true false]" :actual "[(instance? clojure.lang.Seqable [1 2 3]) (instance? clojure.lang.ISeq [1 2 3])]" :portability :jvm}
   {:suite "interop / Seqable" :label "a map is Seqable" :expected "true" :actual "(instance? clojure.lang.Seqable {:a 1})" :portability :jvm}
+  {:suite "interop / Fn vs IFn" :label "a fn is Fn and IFn" :expected "[true true]" :actual "[(instance? clojure.lang.Fn map) (instance? clojure.lang.IFn map)]" :portability :jvm}
+  {:suite "interop / Fn vs IFn" :label "a symbol is IFn but not Fn" :expected "[true false]" :actual "[(instance? clojure.lang.IFn (quote a)) (instance? clojure.lang.Fn (quote a))]" :portability :jvm}
+  {:suite "interop / Fn vs IFn" :label "a keyword is IFn but not Fn" :expected "[true false]" :actual "[(instance? clojure.lang.IFn :a) (instance? clojure.lang.Fn :a)]" :portability :jvm}
+  {:suite "interop / Fn vs IFn" :label "a var is IFn but not Fn" :expected "[true false]" :actual "[(instance? clojure.lang.IFn (var map)) (instance? clojure.lang.Fn (var map))]" :portability :jvm}
+  {:suite "interop / Fn vs IFn" :label "a string is neither Fn nor IFn" :expected "[false false]" :actual "[(instance? clojure.lang.Fn \"s\") (instance? clojure.lang.IFn \"s\")]" :portability :jvm}
+  {:suite "interop / MapEntry" :label "MapEntry/create makes an entry" :expected "[:a 1]" :actual "(clojure.lang.MapEntry/create :a 1)" :portability :jvm}
+  {:suite "interop / Thread" :label "Thread with no target" :expected "[false nil nil]" :actual "(let [t (Thread.)] [(.isAlive t) (.run t) (do (.start t) (.join t) nil)])" :portability :jvm}
+  {:suite "interop / Thread" :label "class of a Thread instance" :expected "java.lang.Thread" :actual "(class (Thread.))" :portability :jvm}
+  {:suite "interop / Thread" :label "a Thread is a Runnable" :expected "true" :actual "(instance? java.lang.Runnable (Thread.))" :portability :jvm}
+  {:suite "syntax-quote / classes" :label "imported class qualifies to its FQN" :expected "(quote java.lang.Thread)" :actual "(syntax-quote Thread)" :portability :jvm}
+  {:suite "syntax-quote / classes" :label "String qualifies to java.lang.String" :expected "(quote java.lang.String)" :actual "(syntax-quote String)" :portability :jvm}
+  {:suite "syntax-quote / classes" :label "class tag in metadata qualifies" :expected "(quote java.lang.Thread)" :actual "(-> (syntax-quote ^Thread []) meta :tag)" :portability :jvm}
+  {:suite "defmacro / metadata" :label "name metadata lands on the macro var" :expected "true" :actual "(do (defmacro ^:foo mdm1 [x] (list x)) (:foo (meta (var mdm1))))" :portability :jvm}
+  {:suite "defmacro / metadata" :label "docstring lands on the macro var" :expected "\"the doc\"" :actual "(do (defmacro mdm2 \"the doc\" [x] (list x)) (:doc (meta (var mdm2))))" :portability :jvm}
+  {:suite "defmacro / metadata" :label "attr-map lands on the macro var" :expected "42" :actual "(do (defmacro mdm3 {:attr 42} [x] (list x)) (:attr (meta (var mdm3))))" :portability :jvm}
+  {:suite "defmacro / metadata" :label "arglists land on the macro var" :expected "(quote ([x]))" :actual "(do (defmacro mdm4 [x] (list x)) (:arglists (meta (var mdm4))))" :portability :jvm}
+  {:suite "defmacro / metadata" :label "multi-arity arglists land on the macro var" :expected "(quote ([x] [x y]))" :actual "(do (defmacro mdm5 ([x] (list x)) ([x y] (list x y))) (:arglists (meta (var mdm5))))" :portability :jvm}
+  {:suite "def / metadata" :label "a class tag lands on the var as a Class" :expected "[true \"java.lang.Thread\"]" :actual "(do (def ^Thread tdm1 nil) [(class? (:tag (meta (var tdm1)))) (.getName (:tag (meta (var tdm1))))])" :portability :jvm}
+  {:suite "def / metadata" :label "clojure.string/trim carries its ^String tag" :expected "java.lang.String" :actual "(do (require (quote clojure.string)) (:tag (meta (var clojure.string/trim))))" :portability :jvm}
+  {:suite "sort / comparator" :label "sort accepts a reify Comparator" :expected "(quote (1 2 3))" :actual "(sort (reify java.util.Comparator (compare [_ a b] (compare a b))) (quote (3 1 2)))" :portability :jvm}
+  {:suite "io / *out*" :label "println honors a rebound *out*" :expected "\"hi\\n\"" :actual "(binding [*out* (java.io.StringWriter.)] (println \"hi\") (str *out*))" :portability :jvm}
+  {:suite "interop / Integer" :label "Integer/compare is a 3-way int comparison" :expected "[-1 0 1]" :actual "[(Integer/compare 2 3) (Integer/compare 3 3) (Integer/compare 4 3)]" :portability :jvm}
+  {:suite "interop / Keyword table" :label "the keyword intern table is reflectively visible" :expected "[true \"tt\"]" :actual "(do (keyword \"tt\" \"tt-kw\") (let [f (doto (.getDeclaredField clojure.lang.Keyword \"table\") (.setAccessible true))] [(contains? (.get f nil) (quote tt/tt-kw)) (namespace (some (fn [s] (and (= (name s) \"tt-kw\") s)) (keys (.get f nil))))]))" :portability :jvm}
+  {:suite "clojure.repl" :label "special-doc knows if" :expected "[(quote (if test then else?))]" :actual "(do (require (quote clojure.repl)) (:forms ((var clojure.repl/special-doc) (quote if))))" :portability :jvm}
+  {:suite "clojure.repl" :label "special-doc flags special forms" :expected "true" :actual "(do (require (quote clojure.repl)) (:special-form ((var clojure.repl/special-doc) (quote let))))" :portability :jvm}
   {:suite "extend-protocol / class value" :label "extend to (Class/forName \"[B\") dispatches a byte-array" :expected "[:ba :str]" :actual "(do (defprotocol P (m [x])) (extend-protocol P (Class/forName \"[B\") (m [bs] :ba) String (m [s] :str)) [(m (byte-array 1)) (m \"x\")])" :portability :jvm}
   {:suite "interop / ByteBuffer" :label "wrap then remaining + array" :expected "[3 [1 2 3]]" :actual "(let [bb (java.nio.ByteBuffer/wrap (byte-array [1 2 3]))] [(.remaining bb) (vec (.array bb))])" :portability :jvm}
   {:suite "interop / ByteBuffer" :label "get drains into a byte-array" :expected "[1 2]" :actual "(let [bb (java.nio.ByteBuffer/wrap (byte-array [1 2])) d (byte-array 2)] (.get bb d) (vec d))" :portability :jvm}
@@ -1244,7 +1269,7 @@
   {:suite "metadata / collection ops preserve meta" :label "empty vector literal unaffected" :expected "nil" :actual "(do (with-meta [] {:leak 1}) (meta []))" :portability :common}
   {:suite "metadata / def metadata" :label "^:dynamic var binds" :expected "9" :actual "(do (def ^:dynamic *d* 1) (binding [*d* 9] *d*))" :portability :common}
   {:suite "metadata / def metadata" :label "^:private on var" :expected "true" :actual "(do (def ^:private pv 1) (:private (meta (var pv))))" :portability :common}
-  {:suite "metadata / def metadata" :label "^Type tag on var" :expected "\"java.lang.String\"" :actual "(do (def ^String tv \"a\") (:tag (meta (var tv))))" :portability :common}
+  {:suite "metadata / def metadata" :label "^Type tag on var" :expected "java.lang.String" :actual "(do (def ^String tv \"a\") (:tag (meta (var tv))))" :portability :jvm}
   {:suite "metadata / def metadata" :label "^{:doc} on var" :expected "\"hi\"" :actual "(do (def ^{:doc \"hi\"} dv 1) (:doc (meta (var dv))))" :portability :common}
   {:suite "metadata / def metadata" :label "(def name doc val) doc" :expected "\"d\"" :actual "(do (def dd \"d\" 5) (:doc (meta (var dd))))" :portability :common}
   {:suite "core / find-keyword + inst-ms*" :label "find-keyword" :expected ":a" :actual "(find-keyword \"a\")" :portability :common}

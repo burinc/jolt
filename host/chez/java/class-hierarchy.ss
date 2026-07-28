@@ -202,7 +202,10 @@
 (jch-register-supers! "clojure.lang.IPersistentSet" '("clojure.lang.IPersistentCollection" "clojure.lang.Counted"))
 (jch-register-supers! "clojure.lang.IPersistentList" '("clojure.lang.Sequential" "clojure.lang.IPersistentStack"))
 (jch-register-supers! "clojure.lang.IObj" '("clojure.lang.IMeta"))
-(jch-register-supers! "clojure.lang.IFn" '("clojure.lang.Fn" "java.lang.Runnable" "java.util.concurrent.Callable"))
+;; IFn extends Runnable + Callable only; Fn is NOT a super of IFn. Symbols,
+;; keywords and vars are IFn (callable) but must not satisfy Fn — only real
+;; fns do, via AFunction's direct Fn row below.
+(jch-register-supers! "clojure.lang.IFn" '("java.lang.Runnable" "java.util.concurrent.Callable"))
 ;; Fn is a marker interface (no supers).
 (jch-register-supers! "clojure.lang.AFn" '("clojure.lang.IFn"))
 (jch-register-supers! "clojure.lang.AFunction" '("clojure.lang.AFn" "clojure.lang.Fn"))
@@ -286,6 +289,7 @@
 (jch-register-supers! "java.lang.ReflectiveOperationException" '("java.lang.Exception"))
 (jch-register-supers! "java.lang.ClassNotFoundException" '("java.lang.ReflectiveOperationException"))
 (jch-register-supers! "java.lang.NoSuchMethodException" '("java.lang.ReflectiveOperationException"))
+(jch-register-supers! "java.lang.NoSuchFieldException" '("java.lang.ReflectiveOperationException"))
 (jch-register-supers! "java.lang.IllegalAccessException" '("java.lang.ReflectiveOperationException"))
 (jch-register-supers! "java.lang.CloneNotSupportedException" '("java.lang.Exception"))
 (jch-register-supers! "java.util.concurrent.CancellationException" '("java.lang.IllegalStateException"))
@@ -302,6 +306,7 @@
 (jch-register-supers! "java.lang.OutOfMemoryError" '("java.lang.VirtualMachineError"))
 (jch-register-supers! "java.lang.StackOverflowError" '("java.lang.VirtualMachineError"))
 (jch-register-supers! "java.lang.ThreadDeath" '("java.lang.Error"))
+(jch-register-supers! "java.lang.Thread" '("java.lang.Runnable"))
 (jch-register-supers! "java.io.IOError" '("java.lang.Error"))
 ;; leaf/root classes with only Object as super
 (jch-register-supers! "java.lang.Object" '())
@@ -404,7 +409,8 @@
 ;; is a Temporal, a StringWriter is a Writer). Add a row here, not in three places.
 (define jhost-tag->fqn (make-hashtable string-hash string=?))
 (for-each (lambda (p) (hashtable-set! jhost-tag->fqn (car p) (cdr p)))
-  '(("instant" . "java.time.Instant")
+  '(("user-thread" . "java.lang.Thread")
+    ("instant" . "java.time.Instant")
     ("local-date" . "java.time.LocalDate")
     ("local-time" . "java.time.LocalTime")
     ("local-date-time" . "java.time.LocalDateTime")

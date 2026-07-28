@@ -34,7 +34,7 @@
                                form-macro? form-expand-1 resolve-global resolvable-names
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
                                record-type? record-ctor-key deftype-ctor-class form-position late-bind?
-                               resolve-class-hint host-class-name?]]))
+                               resolve-class-hint host-class-name? jolt-class-for]]))
 
 (declare analyze)
 
@@ -360,21 +360,23 @@
 
 ;; Clojure evaluates def metadata values as expressions: ^{:k (f)} stores the
 ;; result of (f), ^{:a some-fn} stores the fn value. Build an IR map that evaluates
-;; each value at def time. :tag keeps the resolved class-name string (jolt models a
-;; type hint as its class name, not a runtime expression). nil when there's no
+;; each value at def time. A resolved :tag class name becomes the Class object
+;; (jolt.host/jolt-class-for), as the JVM stores the Class itself in var meta;
+;; primitive hints like `double` stay quoted symbols. nil when there's no
 ;; metadata, so a plain def keeps the cheap static path.
 (defn- def-meta-expr [ctx base env]
   (when (pos? (count base))
     (map-node (mapv (fn [p]
                       (let [k (first p) v (second p)]
-                        ;; :tag stays a literal (a resolved class-name string or a
-                        ;; primitive-hint symbol like `double`) and :arglists is the
-                        ;; parameter-vector data defn attaches — quote both rather
-                        ;; than evaluate. Everything else is evaluated.
+                        ;; :arglists is the parameter-vector data defn attaches —
+                        ;; quote it rather than evaluate. Everything else is
+                        ;; evaluated.
                         [(const k)
-                         (if (or (= k :tag) (= k :arglists))
-                           (quote-node v)
-                           (analyze ctx v env))]))
+                         (cond (= k :arglists) (quote-node v)
+                               (and (= k :tag) (string? v))
+                               (invoke (var-ref "jolt.host" "jolt-class-for") [(const v)])
+                               (= k :tag) (quote-node v)
+                               :else (analyze ctx v env))]))
                     (seq base)))))
 
 ;; Stamp a top-level def's source position onto both the node (:pos, for the
@@ -418,6 +420,8 @@
             base0 (or (form-sym-meta name-sym) {})
             ;; resolve a ^Type hint to its canonical class name at def time, as the
             ;; JVM compiler does (^String -> java.lang.String); unknown hints pass.
+            ;; def-meta-expr turns the resolved name into the Class object at
+            ;; runtime (the JVM stores the Class itself in var meta).
             tag (get base0 :tag)
             tag-name (cond (form-sym? tag) (form-sym-name tag)
                            (string? tag) tag
@@ -530,18 +534,28 @@
                      nm (form-sym-name name-sym)
                      cur (compile-ns ctx)
                      after (drop 2 items)
-                     after (if (string? (first after)) (rest after) after)
-                     after (if (form-map? (first after)) (rest after) after)
+                     [after doc] (if (string? (first after)) [(rest after) (first after)] [after nil])
+                     [after attr] (if (form-map? (first after)) [(rest after) (first after)] [after nil])
                      ;; build (fn params body…) and analyze it through the fn MACRO
                      ;; so a destructuring macro arglist desugars (the fn* primitive
                      ;; would not), then def it and mark the var a macro. Head with
                      ;; the QUALIFIED clojure.core/fn so it resolves to the real fn
                      ;; macro even when the macro being defined is `fn` (schema/s/fn)
                      ;; or the ns excluded it.
-                     fn-form (cons (symbol "clojure.core" "fn") after)]
+                     fn-form (cons (symbol "clojure.core" "fn") after)
+                     ;; var meta like defn: ^meta on the name, docstring, attr-map, arglists
+                     arglists (if (form-list? (first after))
+                                (map first after)
+                                (list (first after)))
+                     base (merge (or (form-sym-meta name-sym) {})
+                                 (or attr {})
+                                 (if doc {:doc doc} {})
+                                 {:arglists arglists})
+                     meta-expr (def-meta-expr ctx base env)]
                  (host-intern! ctx cur nm)
-                 {:op :defmacro :ns cur :name nm
-                  :fn (analyze ctx fn-form env)})
+                 (merge {:op :defmacro :ns cur :name nm
+                         :fn (analyze ctx fn-form env)}
+                        (if meta-expr {:meta-expr meta-expr} {:meta base})))
     "set!" (analyze-set! ctx items env)
     (uncompilable (str "special form " op))))
 

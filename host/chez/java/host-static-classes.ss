@@ -671,6 +671,9 @@
 (register-class-ctor! "java.math.BigInteger"
   (lambda (v . r) (parse-int-or-throw v (if (null? r) 10 (jnum->exact (car r))) "BigInteger")))
 (register-class-ctor! "MapEntry" (lambda (k v) (make-map-entry k v)))
+;; clojure.lang.MapEntry/create — the static factory clojure.walk and kin use
+;; when rebuilding map entries.
+(register-class-statics! "MapEntry" (list (cons "create" (lambda (k v) (make-map-entry k v)))))
 ;; JVM exception ctors -> a typed host throwable carrying the canonical :jolt/class
 ;; (so class / instance? / getMessage / ex-message reflect the real type) and the
 ;; message. Supports (E. msg), (E. msg cause), (E. cause), and (E.).

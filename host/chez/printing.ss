@@ -146,11 +146,20 @@
 ;; redirect, not *out*, defines where text goes (pr-str / print-str rely on it).
 (define jolt-pprint-hook-suppressed (make-thread-parameter #f))
 (define (jolt-write s)
-  (if (and (not (jolt-nil? jolt-pprint-write-hook))
-           (not (jolt-pprint-hook-suppressed))
-           (jolt-truthy? (jolt-invoke jolt-pprint-write-hook s)))
-      jolt-nil
-      (begin (display s) jolt-nil)))
+  (cond ((and (not (jolt-nil? jolt-pprint-write-hook))
+              (not (jolt-pprint-hook-suppressed))
+              (jolt-truthy? (jolt-invoke jolt-pprint-write-hook s)))
+         jolt-nil)
+        ;; *out* rebound to a real writer (StringWriter, PrintWriter, a reify
+        ;; Writer): write through it, like the JVM's (.write *out* s). The
+        ;; default port-writer over stdout keeps the fast port path.
+        ((let ((w (var-deref "clojure.core" "*out*")))
+           (and (jhost? w)
+                (not (and (string=? (jhost-tag w) "port-writer")
+                          (eq? (vector-ref (jhost-state w) 0) 'out)))
+                w))
+         => (lambda (w) (record-method-dispatch w "write" (jolt-list s)) jolt-nil))
+        (else (display s) jolt-nil)))
 (def-var! "clojure.core" "__set-pprint-write-hook!"
   (lambda (f) (set! jolt-pprint-write-hook f) jolt-nil))
 ;; clojure.pprint wraps its writing in this so core print routes into the active
