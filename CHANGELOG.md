@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.10] - 2026-07-28
+
+An optimized build no longer discards a `throw` written in a map value that the
+map's only reader never looks at.
+
+### Fixed
+
+- **An optimized build could swallow a `throw`.** The inline pass admitted
+  `:throw` to `safe-op?`, the predicate that marks an IR node as safe to move.
+  `pure?` and `total?` both fall through to `safe-op?` for anything that isn't an
+  `:invoke`, so both accepted a throw, and `total?` is what `elim-let-structs`
+  consults before dropping a scalar-replaced map binding whose values are never
+  read. The result was that `(let [m {:a 1 :b (throw "boom")}] (:a m))` folded to
+  `1` under `--opt --direct-link`: the binding disappeared and took the throw with
+  it, so a release binary returned a value where the interpreter and the JVM both
+  raise. `:throw` stays in `safe-op?`, because an inlined body may contain one and
+  splicing it preserves it, but `pure?` and `total?` now reject it explicitly. A
+  throw is relocatable and never discardable. `test/chez/inline-throw-app` covers
+  it end to end through a `--opt --direct-link` build, next to the existing case
+  for a throwing sibling behind a non-pure operator like `/`.
+
+### Changed
+
+- **A numeric shim extends the tower through `register-num-arm!` instead of
+  assigning core vars.** `java/bigdec.ss` reached into nineteen runtime vars with
+  `set!` at load time, which put the core's arithmetic, predicate, cast and
+  comparison entry points in a shim's hands and left `predicates.ss` holding the
+  jbigdec representation for `==`. `seq.ss` now owns the extension point, in the
+  same shape as `register-eq-arm!` and `register-compare-arm!`: a shim hands over
+  `(lambda (prev) handler)` and a handler declines what it cannot take by calling
+  `prev`. An op name is the runtime var it extends with the `jolt-` prefix
+  stripped, so nothing has to be memorized and a name that doesn't follow the rule
+  raises when the shim loads. bigdec registers its arithmetic, predicate, cast and
+  `==` arms this way and its ordering through the existing `register-compare-arm!`,
+  and the core no longer names jbigdec in `==`.
+- **The `seqable?` shim check lives with the class table.** `post-prelude.ss`
+  carried its own list of `jhost` tags that are `Iterable` on the JVM, duplicating
+  knowledge that belongs to `java/host-static-classes.ss`. It now calls
+  `jhost-seqable-shim?`, defined next to the `ArrayList`/`HashSet`/`HashMap` arms
+  that own it.
+- **The Chez compatibility preamble moved to the top of `rt.ss`.** The global
+  `error` shadow and the expression-position `cond-expand` shim were defined in
+  `regex.ss`, partway through runtime bring-up, so everything loaded before it saw
+  an un-normalized `error`. They now sit at the top of `rt.ss`, which every load
+  path enters first.
+
 ## [0.5.9] - 2026-07-28
 
 An interrupted git fetch no longer leaves a dependency unresolvable on every run
@@ -1932,7 +1978,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.9...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.10...HEAD
+[0.5.10]: https://github.com/jolt-lang/jolt/compare/v0.5.9...v0.5.10
 [0.5.9]: https://github.com/jolt-lang/jolt/compare/v0.5.8...v0.5.9
 [0.5.8]: https://github.com/jolt-lang/jolt/compare/v0.5.7...v0.5.8
 [0.5.7]: https://github.com/jolt-lang/jolt/compare/v0.5.6...v0.5.7
