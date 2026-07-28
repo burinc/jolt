@@ -313,30 +313,41 @@
 ;; contract, the shim hands over (lambda (prev) handler) and never touches a
 ;; core var directly. Same convention as register-eq-arm!/register-compare-arm!.
 ;; `handler` must decline operands it can't handle by calling prev.
+;;
+;; OP NAMING RULE: an op is the runtime var it extends with the `jolt-` prefix
+;; stripped, no abbreviating and no dropping the `-slow` suffix — 'add-slow is
+;; jolt-add-slow, 'num-cmp-slow is jolt-num-cmp-slow. Nothing here has to be
+;; memorized: read off the var name. Registrations are top level, so a name that
+;; doesn't follow the rule hits the else below when the shim loads, not later.
+;; The vars live in three files; the comments mark where each group is defined.
 (define (register-num-arm! op extend)
   (case op
-    ((add)      (set! jolt-add-slow  (extend jolt-add-slow)))
-    ((sub)      (set! jolt-sub-slow  (extend jolt-sub-slow)))
-    ((mul)      (set! jolt-mul-slow  (extend jolt-mul-slow)))
-    ((div)      (set! jolt-div-slow  (extend jolt-div-slow)))
-    ((quot)     (set! jolt-quot-slow (extend jolt-quot-slow)))
-    ((rem)      (set! jolt-rem-slow  (extend jolt-rem-slow)))
-    ((mod)      (set! jolt-mod-slow  (extend jolt-mod-slow)))
-    ((cmp)      (set! jolt-num-cmp-slow (extend jolt-num-cmp-slow)))
-    ((num-slow?) (set! jolt-num-slow? (extend jolt-num-slow?)))
-    ((inc)      (set! jolt-inc  (extend jolt-inc)))
-    ((dec)      (set! jolt-dec  (extend jolt-dec)))
-    ((zero?)    (set! jolt-zero? (extend jolt-zero?)))
-    ((pos?)     (set! jolt-pos? (extend jolt-pos?)))
-    ((neg?)     (set! jolt-neg? (extend jolt-neg?)))
+    ;; seq.ss (this file)
+    ((add-slow)      (set! jolt-add-slow      (extend jolt-add-slow)))
+    ((sub-slow)      (set! jolt-sub-slow      (extend jolt-sub-slow)))
+    ((mul-slow)      (set! jolt-mul-slow      (extend jolt-mul-slow)))
+    ((div-slow)      (set! jolt-div-slow      (extend jolt-div-slow)))
+    ((quot-slow)     (set! jolt-quot-slow     (extend jolt-quot-slow)))
+    ((rem-slow)      (set! jolt-rem-slow      (extend jolt-rem-slow)))
+    ((mod-slow)      (set! jolt-mod-slow      (extend jolt-mod-slow)))
+    ((num-cmp-slow)  (set! jolt-num-cmp-slow  (extend jolt-num-cmp-slow)))
+    ((num-slow?)     (set! jolt-num-slow?     (extend jolt-num-slow?)))
+    ((zero?)         (set! jolt-zero?         (extend jolt-zero?)))
+    ((pos?)          (set! jolt-pos?          (extend jolt-pos?)))
+    ((neg?)          (set! jolt-neg?          (extend jolt-neg?)))
+    ;; rt.ss
+    ((inc)           (set! jolt-inc           (extend jolt-inc)))
+    ((dec)           (set! jolt-dec           (extend jolt-dec)))
     ;; predicates.ss
-    ((number?)  (set! jolt-number? (extend jolt-number?)))
-    ((decimal?) (set! jolt-decimal? (extend jolt-decimal?)))
+    ((number?)       (set! jolt-number?       (extend jolt-number?)))
+    ((decimal?)      (set! jolt-decimal?      (extend jolt-decimal?)))
     ((num-equiv-slow) (set! jolt-num-equiv-slow (extend jolt-num-equiv-slow)))
     ;; converters.ss
-    ((double-slow) (set! jolt-double-slow (extend jolt-double-slow)))
+    ((double-slow)   (set! jolt-double-slow   (extend jolt-double-slow)))
     ((cast-truncate-slow) (set! jolt-cast-truncate-slow (extend jolt-cast-truncate-slow)))
-    (else (error 'register-num-arm! "unknown numeric extension point" op))))
+    (else (error 'register-num-arm!
+                 "unknown numeric extension point (an op is its jolt- var minus the prefix)"
+                 op))))
 (define (jolt-num-check1 x)   ; (+ x)/(* x) return x but still type-check it
   (if (or (number? x) (jolt-num-slow? x)) x (jolt-num-cast-throw x)))
 (define (jolt-add . xs)

@@ -352,11 +352,11 @@
     (lambda (prev)
       (lambda (a b)
         (if (or (jbigdec? a) (jbigdec? b)) (handler a b) (prev a b))))))
-(jbd-num-arm 'add (lambda (a b) (jbd-binop + jbd2+ a b)))
-(jbd-num-arm 'sub (lambda (a b) (jbd-binop - jbd2- a b)))
-(jbd-num-arm 'mul (lambda (a b) (jbd-binop * jbd2* a b)))
-(jbd-num-arm 'div (lambda (a b) (jbd-binop / jbd2-div a b)))
-(register-num-arm! 'cmp
+(jbd-num-arm 'add-slow (lambda (a b) (jbd-binop + jbd2+ a b)))
+(jbd-num-arm 'sub-slow (lambda (a b) (jbd-binop - jbd2- a b)))
+(jbd-num-arm 'mul-slow (lambda (a b) (jbd-binop * jbd2* a b)))
+(jbd-num-arm 'div-slow (lambda (a b) (jbd-binop / jbd2-div a b)))
+(register-num-arm! 'num-cmp-slow
   (lambda (prev)
     (lambda (a b)
       (if (and (or (jbigdec? a) (jbigdec? b)) (jbd-numberish? a) (jbd-numberish? b))
@@ -365,15 +365,15 @@
 ;; quot/rem/mod: a double operand demotes to the double path; exact operands use
 ;; the integer-division bigdec ops (mod = rem, floor-adjusted to the divisor's sign).
 (define (jbd->num x) (if (jbigdec? x) (jbigdec->flonum x) x))
-(jbd-num-arm 'quot
+(jbd-num-arm 'quot-slow
   (lambda (a b) (if (or (flonum? a) (flonum? b))
                     (jolt-quot (jbd->num a) (jbd->num b))
                     (jbd-int-quot (jbd-coerce a) (jbd-coerce b)))))
-(jbd-num-arm 'rem
+(jbd-num-arm 'rem-slow
   (lambda (a b) (if (or (flonum? a) (flonum? b))
                     (jolt-rem (jbd->num a) (jbd->num b))
                     (jbd-int-rem (jbd-coerce a) (jbd-coerce b)))))
-(jbd-num-arm 'mod
+(jbd-num-arm 'mod-slow
   (lambda (a b)
     (if (or (flonum? a) (flonum? b))
         (jolt-mod (jbd->num a) (jbd->num b))
