@@ -77,20 +77,26 @@ fi
 # code. The fixture is ~4 KB with the value in the middle — far from the small
 # test above where the edit happens to land in a sampled byte. 42 -> 99.
 c2="$tmp/c2"; mkdir -p "$c2/src/mylib"
-{
-  # pad: ~2 KB of comment lines above the value
-  i=0; while [ "$i" -lt 32 ]; do
-    printf ';; padding line %s for cache key size ---------------------------------------\n' "$i"
-    i=$((i + 1))
-  done
-  echo '(ns mylib.core)'
-  echo '(defn answer [] 42)'
-  # pad: ~2 KB of comment lines below the value
-  i=0; while [ "$i" -lt 32 ]; do
-    printf ';; padding line %s for cache key size ---------------------------------------\n' "$i"
-    i=$((i + 1))
-  done
-} > "$c2/src/mylib/core.clj"
+# Regenerated rather than sed-edited: `sed -i ''` is BSD-only (GNU sed reads the
+# '' as the script and the s/// as a filename, exits 2, and set -e kills the run),
+# and both values are two digits so rewriting the file is length-preserving anyway.
+gen_c2() {
+  {
+    # pad: ~2 KB of comment lines above the value
+    i=0; while [ "$i" -lt 32 ]; do
+      printf ';; padding line %s for cache key size ---------------------------------------\n' "$i"
+      i=$((i + 1))
+    done
+    echo '(ns mylib.core)'
+    printf '(defn answer [] %s)\n' "$1"
+    # pad: ~2 KB of comment lines below the value
+    i=0; while [ "$i" -lt 32 ]; do
+      printf ';; padding line %s for cache key size ---------------------------------------\n' "$i"
+      i=$((i + 1))
+    done
+  } > "$c2/src/mylib/core.clj"
+}
+gen_c2 42
 c2_len=$(wc -c < "$c2/src/mylib/core.clj")
 if [ "$c2_len" -lt 4096 ]; then
   echo "FAIL: (c2) fixture too small: $c2_len bytes (need >=4096)"; fails=$((fails+1))
@@ -102,7 +108,7 @@ else
   else
     # length-preserving edit: 42 -> 99
     c2_orig_len=$(wc -c < "$c2/src/mylib/core.clj")
-    sed -i '' 's/(defn answer \[\] 42)/(defn answer [] 99)/' "$c2/src/mylib/core.clj"
+    gen_c2 99
     c2_new_len=$(wc -c < "$c2/src/mylib/core.clj")
     if [ "$c2_orig_len" != "$c2_new_len" ]; then
       echo "FAIL: (c2) edit changed length: $c2_orig_len -> $c2_new_len (expected equal)"; fails=$((fails+1))

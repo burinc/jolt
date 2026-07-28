@@ -168,3 +168,32 @@ shared helper is safe.
 
 - `host/chez/java/io.ss:27` uses `equal-hash` as a hash function for a
   hashtable constructor, not for cache fingerprinting.
+
+---
+
+## Review addendum
+
+Reviewed on top of the three commits above.
+
+**Fixed — CI-breaking.** The (c2) fixture edited with `sed -i ''`, which is BSD-only.
+Verified under GNU sed 4.9 (debian:stable-slim): the `''` is taken as the script and
+the `s///` as a filename, sed exits 2, the file is left unedited, and `set -e` aborts
+the whole smoke run. `.github/workflows/tests.yml` runs `ubuntu-latest`, so this would
+have broken the gate on CI while passing locally on macOS. Replaced with a `gen_c2
+<value>` regenerator — no sed, and length-preserving for the same reason the edit was.
+Syntax-checked under both BSD sh and dash.
+
+**Fixed — comment overclaim.** The rewritten `aot-cache-key` block ended "FNV-1a and
+the length prefix together make that impossible." A 32-bit hash collision between
+equal-length sources is remote, not impossible. Restated, since this bug existed
+precisely because a comment asserted a safety property that did not hold.
+
+**Verified independently** (not taken from the report above):
+- Negative test re-run by the reviewer: reverting only `aot-cache-key` puts (c2) red
+  with stale `42`, other 14 green. Confirms the fixture is live *after* the sed rewrite.
+- `make test` re-run on the amended tree: OK, 4031 corpus rows, 0 NEW divergences.
+- `make aotcacheperf`: cold=1.39s warm=1.08s (22% faster) — cache still hits.
+- Section 6's `aot-ns-digest` claim holds, though the margin is narrower than stated:
+  it hashes the KEY STRING (12–17 chars for source sizes up to 256MB), and equal-hash
+  has full byte coverage through at least 24 chars. Fine, but it is a residual
+  dependence on a property of equal-hash — if key formats ever widen, revisit it.

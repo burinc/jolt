@@ -529,13 +529,19 @@
                      (char=? c #\-) (char=? c #\.) (char=? c #\_))
                  c #\_)))
          (string->list s))))
-;; length (hex) + full-content FNV-1a 32-bit hash (hex). The length prefix is a
-;; cheap collision guard: two sources must share BOTH byte length AND the 32-bit
-;; hash to collide and falsely share a fasl — astronomically unlikely for distinct
-;; library sources.  FNV-1a is reproducible and every byte contributes, unlike
-;; equal-hash which is a bounded-sample hash (~26 bytes regardless of length).
-;; A same-length edit away from those sampling points would silently serve stale
-;; cached code; FNV-1a and the length prefix together make that impossible.
+;; length (hex) + full-content FNV-1a 32-bit hash (hex). FNV-1a is process-STABLE
+;; (no randomized seed), so the key is reproducible across runs and machines —
+;; required for the cache to hit at all. The length prefix stays as a cheap second
+;; factor: a false share needs a genuine 32-bit collision BETWEEN SOURCES OF EQUAL
+;; LENGTH, which is remote enough to sit below other failure modes here.
+;;
+;; This was equal-hash, which is NOT a content hash: Chez samples a bounded ~26
+;; characters (first 6, ~15 strided, last 5) no matter how long the string is, so
+;; for any real source ~99% of the bytes were invisible to the key. Length was
+;; doing all the invalidation work, and any length-preserving edit — 42→99, <→>,
+;; inc→dec, a rename to an equal-length name — kept the key and silently served
+;; the previous fasl. Do not "optimize" this back to a sampling hash: the whole
+;; cost is one linear pass over source jolt is about to compile anyway.
 (define (aot-cache-key src)
   (string-append (number->string (string-length src) 16) "-"
                  (number->string (aot-content-hash src) 16)))
