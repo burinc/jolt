@@ -6,7 +6,7 @@
 
 CHEZ ?= $(shell command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null || command -v scheme 2>/dev/null)
 
-.PHONY: test ci testbin values corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit
+.PHONY: test ci testbin values corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit
 
 # Every target needs the vendored submodules; fail with the fix, not a load error.
 submodules:
@@ -22,7 +22,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values corpus unit mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke certify
+ci: submodules values corpus unit mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -343,6 +343,14 @@ devbootsmoke: devboot
 # check that two runtimes sharing a version string still key separately.
 aotcachesmoke: testbin
 	@sh test/chez/aot-cache-smoke.sh
+
+# The content hash under the cache, and the two runtime fingerprints built on it
+# (source-tree and baked). Covers what the smoke test can't reach without a full
+# jolt rebuild: that a ONE-CHARACTER, length-preserving edit moves the namespace
+# key, the source-tree fingerprint, and a built binary's baked fingerprint.
+# equal-hash saw ~26 bytes of a source and served stale fasls for everything else.
+aotfingerprint:
+	@$(CHEZ) --script test/chez/aot-fingerprint-test.ss
 
 # Perf measurement: cold (recompile) vs warm (cache hit) for a multi-library
 # require. Needs Maven jars locally; NOT in the default ci gate (timing budget).
