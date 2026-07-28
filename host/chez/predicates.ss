@@ -77,28 +77,26 @@
 ;; (Numbers.equiv throws otherwise). A BigDecimal operand compares by value across
 ;; the tower — mirroring compare: when a double is present both sides compare as
 ;; doubles, otherwise as bigdec — so (== 3M 3) is true while (= 3M 3) stays false.
-(define (jbd-equiv2 a b)
-  ;; a, b numeric (number or jbigdec); value-equal? Mirrors jolt-compare's dispatch.
-  (cond
-    ((or (flonum? a) (flonum? b))
-     (let ((fa (if (jbigdec? a) (jbigdec->flonum a) (if (flonum? a) a (exact->inexact a))))
-           (fb (if (jbigdec? b) (jbigdec->flonum b) (if (flonum? b) b (exact->inexact b)))))
-       (= fa fb)))
-    (else (jbigdec=? (jbd-coerce a) (jbd-coerce b)))))
+;; That value-equality lives with the shim (jbd-equiv2 in java/bigdec.ss),
+;; registered through this hook (register-num-arm! 'num-equiv-slow); the base
+;; throws because every operand reaching here failed number?.
+(define (jolt-num-equiv-slow a b)
+  (throw-jvm (quote ClassCastException) "== requires numbers"))
 (define (jolt-num-equiv . xs)
   ;; 1-arity short-circuits to true for ANY value (Clojure's == 1-arg returns true
   ;; before the number check); 2+ args must all be numbers.
-  (define (numeric? x) (or (number? x) (jbigdec? x)))
+  (define (numeric? x) (or (number? x) (jolt-num-slow? x)))
   (if (and (pair? xs) (null? (cdr xs)))
       #t
       (let all-num? ((ys xs))
         (cond
           ((null? ys)
-           (if (exists (lambda (x) (jbigdec? x)) xs)
-               ;; a BigDecimal operand: compare consecutive pairs by value
+           (if (exists jolt-num-slow? xs)
+               ;; a shim-number operand (BigDecimal): compare consecutive pairs
+               ;; by value through the shim's num-equiv-slow arm
                (let loop ((a (car xs)) (zs (cdr xs)))
                  (cond ((null? zs) #t)
-                       ((jbd-equiv2 a (car zs)) (loop (car zs) (cdr zs)))
+                       ((jolt-num-equiv-slow a (car zs)) (loop (car zs) (cdr zs)))
                        (else #f)))
                ;; JVM == on a mixed long/double set compares as doubles (the
                ;; category ops promote), so it agrees with the fl=? the numeric
