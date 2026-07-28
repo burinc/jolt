@@ -220,11 +220,12 @@
 ;; Throwable->map: the seed prelude version reads ex-data/ex-message/ex-cause
 ;; through the old var-deref chain; re-assert with the native versions.
 ;; seqable? additionally covers the iterable java.util shims (Iterable on the JVM).
+;; The shim set lives in java/host-static-classes.ss (jhost-seqable-shim?) — do
+;; not duplicate the tag list here.
 (let ((prev (var-deref "clojure.core" "seqable?")))
   (def-var! "clojure.core" "seqable?"
     (lambda (x)
-      (if (and (jhost? x)
-               (member (jhost-tag x) '("arraylist" "linkedlist" "arraydeque" "hashset" "hashmap")))
+      (if (jhost-seqable-shim? x)
           #t
           (jolt-invoke1 prev x)))))
 ;; transients are IFn on the JVM (invoke = lookup); the queue is a full
