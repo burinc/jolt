@@ -1,7 +1,8 @@
 ;; bit ops + string->number parsers — host-coupled natives (bit family,
-;; parse-long/double). jolt models every number as a double, so bit ops coerce
-;; to an exact integer, operate, and return a flonum. parse-* use strict shapes
-;; (Clojure 1.11: nil on malformed, throw on a non-string).
+;; parse-long/double). Bit ops coerce to an exact integer, operate with 64-bit
+;; wrapping, and return an exact integer (jolt's fixnum/bignum integer model,
+;; per seq.ss). parse-* use strict shapes (Clojure 1.11: nil on malformed,
+;; throw on a non-string).
 
 ;; bit ops require a long operand. The JVM throws IllegalArgumentException for a
 ;; double, ratio, or an integer outside signed 64-bit range (a BigInt); ->int
