@@ -10,6 +10,24 @@
 ;;
 ;; Emitted programs do `(load "host/chez/rt.ss")`; this loads values.ss in turn.
 
+;; Chez-compat preamble — must precede EVERYTHING else in the runtime bring-up
+;; (every load path enters through this file). Two adaptations for vendored
+;; portable R[457]RS code (vendor/irregex) and for host code generally:
+;; a cond-expand at expression position (Chez's is library-only), and `error`
+;; called with a lone string (Chez's error wants who+msg). Both are normalized
+;; without changing behavior for standard-shape calls.
+(define-syntax cond-expand
+  (syntax-rules (else)
+    ((_ (else e ...)) (begin e ...))
+    ((_ (else e ...) c ...) (begin e ...))
+    ((_ (req e ...) c ...) (cond-expand c ...))
+    ((_) (if #f #f))))
+(define %chez-error error)
+(define (error . args)
+  (if (and (pair? args) (string? (car args)))
+      (apply %chez-error #f args)
+      (apply %chez-error args)))
+
 (load "host/chez/values.ss")
 (load "host/chez/hasheq.ss")
 ;; Resolve a libc entry point at RUN time; #f when the entry doesn't exist

@@ -16,21 +16,9 @@
 ;; class semantics keep them out
 ;; of the subset-parity corpus). Loaded from rt.ss after def-var! is defined.
 
-;; irregex.scm is portable R[457]RS; two small adaptations for Chez's top level:
-;; a cond-expand at expression position (Chez's is library-only), and `error`
-;; called with a lone string (Chez's error wants who+msg). The wrapper normalizes
-;; both without changing behavior for valid patterns.
-(define-syntax cond-expand
-  (syntax-rules (else)
-    ((_ (else e ...)) (begin e ...))
-    ((_ (else e ...) c ...) (begin e ...))
-    ((_ (req e ...) c ...) (cond-expand c ...))
-    ((_) (if #f #f))))
-(define %chez-error error)
-(define (error . args)
-  (if (and (pair? args) (string? (car args)))
-      (apply %chez-error #f args)
-      (apply %chez-error args)))
+;; irregex.scm is portable R[457]RS; it relies on the Chez-compat preamble at
+;; the top of rt.ss (expression-position cond-expand, lone-string `error`),
+;; which every load path runs before this file.
 (load "vendor/irregex/irregex.scm")
 
 

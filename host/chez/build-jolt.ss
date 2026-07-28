@@ -17,7 +17,7 @@
 ;;      build.ss + every jolt-core/stdlib file as a baked string literal + the
 ;;      jolt launcher.
 ;;   2. in-process compile-file + make-boot-file (profile Chez settings), error
-;;      restored around the call (the runtime shadows it; regex.ss/%chez-error).
+;;      restored around the call (the runtime shadows it; rt.ss/%chez-error).
 ;;   3. xxd the jolt boot + petite/scheme boots + stub into C arrays, generate
 ;;      main.c, cc-link -> out-path. The launcher reads the petite/scheme/stub
 ;;      arrays via FFI on `build` (jolt-materialize-bundles!).
