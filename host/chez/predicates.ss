@@ -78,10 +78,19 @@
 ;; the tower — mirroring compare: when a double is present both sides compare as
 ;; doubles, otherwise as bigdec — so (== 3M 3) is true while (= 3M 3) stays false.
 ;; That value-equality lives with the shim (jbd-equiv2 in java/bigdec.ss),
-;; registered through this hook (register-num-arm! 'num-equiv-slow); the base
-;; throws because every operand reaching here failed number?.
+;; registered through this hook (register-num-arm! 'num-equiv-slow). The pairwise
+;; loop below runs once ANY operand is a shim number, so individual pairs can
+;; still be two plain numbers ((== 1 1 1M) compares 1 vs 1 first) and the shim's
+;; arm declines those to this base — it handles them with the same
+;; inexact-contaminates rule the all-plain branch uses, and throws only when an
+;; operand is neither a number nor a shim number.
 (define (jolt-num-equiv-slow a b)
-  (throw-jvm (quote ClassCastException) "== requires numbers"))
+  (cond
+    ((and (number? a) (number? b))
+     (if (or (inexact? a) (inexact? b))
+         (= (exact->inexact a) (exact->inexact b))
+         (= a b)))
+    (else (throw-jvm (quote ClassCastException) "== requires numbers"))))
 (define (jolt-num-equiv . xs)
   ;; 1-arity short-circuits to true for ANY value (Clojure's == 1-arg returns true
   ;; before the number check); 2+ args must all be numbers.
