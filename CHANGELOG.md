@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An interrupted git fetch no longer poisons the dependency cache.**
+  `ensure-git` created the cache directory with `mkdir -p` and then cloned into
+  it, so the directory existed before the clone had produced anything. Interrupt
+  the fetch (a `^C` while `jolt serve` resolves deps is enough, since the
+  `SIGINT` reaches the child `git`) and the empty directory stayed behind: `git`
+  cleans up a clone directory only when it created that directory itself. Every
+  later run found the path and took it for a finished checkout, so the dependency
+  contributed no source root and the run failed far from the cause, with `Could
+  not locate ring_chez/adapter.jolt (or .clj/.cljc) on the source roots` for a
+  dep deps.edn plainly declared. Deleting the directory by hand was the only way
+  out. A fetch now clones, checks out, and updates submodules in a staging
+  directory beside its destination, and moves it into place only once all three
+  succeed, so the cache holds nothing but finished checkouts and a failure at any
+  step removes the staging directory instead of leaving a trap. Completeness is
+  recorded by a `.jolt-git-ok` marker, with `.git` accepted for a checkout an
+  earlier jolt cloned in place, so an already-poisoned cache also heals itself on
+  the next run.
+
 ## [0.5.8] - 2026-07-27
 
 The AOT cache no longer serves stale code after a length-preserving source edit,

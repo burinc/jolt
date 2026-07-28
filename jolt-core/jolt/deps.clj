@@ -134,26 +134,62 @@
                   (when (and tag (not sha)) " (a :git/tag alone doesn't pin a commit)") ".")
              {:coord coord :spec spec}))))
 
+(defn- checkout-complete?
+  "Does `dir` hold a finished checkout? jolt publishes a checkout by moving a
+  fully populated staging dir into place and marks it with `.jolt-git-ok`, so
+  anything jolt wrote there is complete. A checkout an older jolt cloned in
+  place carries no marker, and its `.git` stands in — which still rejects the
+  empty directory an interrupted in-place clone left behind. That leftover is
+  why this check exists: git only cleans up a clone directory it created itself,
+  the in-place clone pre-created it with mkdir -p, and a plain existence test
+  then read the empty remains as a valid checkout. The dep resolved to nothing
+  on every later run, and the failure surfaced much later as `Could not locate`
+  on one of its namespaces."
+  [dir]
+  (or (file-exists? (str dir "/.jolt-git-ok"))
+      (file-exists? (str dir "/.git"))))
+
+(defn- fetch-git!
+  "Clone url@sha under `repo-dir` and return the checkout dir. The work happens
+  in a staging dir beside it (same filesystem, so publishing is a rename) and
+  any failure removes it: the cache only ever holds finished checkouts. The
+  staging name carries a nonce so two jolt processes fetching the same dep at
+  once don't clone over each other."
+  [url sha repo-dir]
+  (let [dir (str repo-dir "/" sha)
+        stage (str repo-dir "/.part-" sha "-" (System/currentTimeMillis) "-" (rand-int 100000))
+        scrub #(sh (str "rm -rf " (pr-str stage)))
+        fail (fn [msg data] (scrub) (throw (ex-info msg (merge {:url url :sha sha} data))))]
+    (info "fetching " url " @ " (subs sha 0 (min 12 (count sha))))
+    (sh (str "mkdir -p " (pr-str repo-dir)))
+    (when-not (zero? (sh (str "git clone --quiet " (pr-str url) " " (pr-str stage))))
+      (fail (str "git clone failed: " url) nil))
+    (when-not (zero? (sh (str "git -C " (pr-str stage) " checkout --quiet " (pr-str sha))))
+      (fail (str "git checkout failed: " sha " in " url) nil))
+    ;; submodules are pinned in the checkout; pull them if the dep uses any.
+    (when-not (zero? (sh (str "git -C " (pr-str stage) " submodule update --init --recursive --quiet")))
+      (fail (str "git submodule update failed for " url) nil))
+    (sh (str "touch " (pr-str (str stage "/.jolt-git-ok"))))
+    (if (checkout-complete? dir)
+      (do (scrub) dir)                    ; another process published it first
+      (do
+        ;; clears the incomplete remains of an interrupted in-place clone
+        (sh (str "rm -rf " (pr-str dir)))
+        (when-not (zero? (sh (str "mv " (pr-str stage) " " (pr-str dir))))
+          (fail (str "git checkout could not be moved into the cache: " dir) {:dir dir}))
+        dir))))
+
 (defn- ensure-git
-  "Return a checkout dir for url@sha: an existing tools.gitlibs checkout for
-  `lib` when present, else clone into jolt's cache (once)."
+  "Return a checkout dir for url@sha: jolt's cached checkout when complete, else
+  an existing tools.gitlibs checkout for `lib`, else a fresh clone into jolt's
+  cache."
   [lib url sha]
-  (let [dir (str (gitlibs-dir) "/" (sanitize url) "/" sha)]
-    (if-let [shared (and (not (file-exists? dir)) (gitlibs-shared-checkout lib sha))]
-      shared
-      (if (file-exists? dir)
-        dir
-        (do
-          (info "fetching " url " @ " (subs sha 0 (min 12 (count sha))))
-          (sh (str "mkdir -p " (pr-str dir)))
-          (when-not (zero? (sh (str "git clone --quiet " (pr-str url) " " (pr-str dir))))
-            (throw (ex-info (str "git clone failed: " url) {:url url})))
-          (when-not (zero? (sh (str "git -C " (pr-str dir) " checkout --quiet " (pr-str sha))))
-            (throw (ex-info (str "git checkout failed: " sha " in " url) {:url url :sha sha})))
-          ;; submodules are pinned in the checkout; pull them if the dep uses any.
-          (when-not (zero? (sh (str "git -C " (pr-str dir) " submodule update --init --recursive --quiet")))
-            (throw (ex-info (str "git submodule update failed for " url) {:url url})))
-          dir)))))
+  (let [repo-dir (str (gitlibs-dir) "/" (sanitize url))
+        dir (str repo-dir "/" sha)]
+    (if (checkout-complete? dir)
+      dir
+      (or (gitlibs-shared-checkout lib sha)
+          (fetch-git! url sha repo-dir)))))
 
 ;; --- maven cache ------------------------------------------------------------
 ;; jolt has no JVM, but a Clojure library's Maven JAR carries its .clj/.cljc/.cljs
