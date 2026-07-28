@@ -307,6 +307,36 @@
 ;; the inlined native ops, not these.
 ;; recognizer for slow-path numeric types; numeric shims extend it.
 (define (jolt-num-slow? x) #f)
+
+;; The one sanctioned way for a numeric shim outside the core (java/bigdec.ss)
+;; to extend these hooks — the core owns the hook storage and the op-name
+;; contract, the shim hands over (lambda (prev) handler) and never touches a
+;; core var directly. Same convention as register-eq-arm!/register-compare-arm!.
+;; `handler` must decline operands it can't handle by calling prev.
+(define (register-num-arm! op extend)
+  (case op
+    ((add)      (set! jolt-add-slow  (extend jolt-add-slow)))
+    ((sub)      (set! jolt-sub-slow  (extend jolt-sub-slow)))
+    ((mul)      (set! jolt-mul-slow  (extend jolt-mul-slow)))
+    ((div)      (set! jolt-div-slow  (extend jolt-div-slow)))
+    ((quot)     (set! jolt-quot-slow (extend jolt-quot-slow)))
+    ((rem)      (set! jolt-rem-slow  (extend jolt-rem-slow)))
+    ((mod)      (set! jolt-mod-slow  (extend jolt-mod-slow)))
+    ((cmp)      (set! jolt-num-cmp-slow (extend jolt-num-cmp-slow)))
+    ((num-slow?) (set! jolt-num-slow? (extend jolt-num-slow?)))
+    ((inc)      (set! jolt-inc  (extend jolt-inc)))
+    ((dec)      (set! jolt-dec  (extend jolt-dec)))
+    ((zero?)    (set! jolt-zero? (extend jolt-zero?)))
+    ((pos?)     (set! jolt-pos? (extend jolt-pos?)))
+    ((neg?)     (set! jolt-neg? (extend jolt-neg?)))
+    ;; predicates.ss
+    ((number?)  (set! jolt-number? (extend jolt-number?)))
+    ((decimal?) (set! jolt-decimal? (extend jolt-decimal?)))
+    ((num-equiv-slow) (set! jolt-num-equiv-slow (extend jolt-num-equiv-slow)))
+    ;; converters.ss
+    ((double-slow) (set! jolt-double-slow (extend jolt-double-slow)))
+    ((cast-truncate-slow) (set! jolt-cast-truncate-slow (extend jolt-cast-truncate-slow)))
+    (else (error 'register-num-arm! "unknown numeric extension point" op))))
 (define (jolt-num-check1 x)   ; (+ x)/(* x) return x but still type-check it
   (if (or (number? x) (jolt-num-slow? x)) x (jolt-num-cast-throw x)))
 (define (jolt-add . xs)

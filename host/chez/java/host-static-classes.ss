@@ -1421,6 +1421,12 @@
         'pass)))
 ;; (seq a-HashMap) walks its entries, like RT.seqFrom over a java.util.Map.
 (register-seq-arm! hm-hashmap? (lambda (x) (jolt-seq (hm->pmap x))))
+;; The single place that knows which java.util shims are Iterable/seqable on the
+;; JVM (ArrayList/LinkedList/ArrayDeque via al-family?, HashSet, HashMap);
+;; post-prelude's clojure.core/seqable? patch consults this instead of carrying
+;; its own tag list.
+(define (jhost-seqable-shim? x)
+  (or (al-family? x) (hs-hashset? x) (hm-hashmap? x)))
 ;; a MapEntry does not carry meta on the JVM (AMapEntry); deny IObj/IMeta so the
 ;; pvec backing doesn't claim it.
 (register-instance-check-arm!

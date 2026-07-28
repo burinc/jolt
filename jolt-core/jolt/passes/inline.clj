@@ -249,7 +249,10 @@
       (= op :invoke) (and (or (pure-fn? (get node :fn)) (ctor-shape node))
                           (every? pure? (get node :args)))
       ;; leaves (:const/:local/:var/:host/:the-var/:quote) fold to true; :if/:do/
-      ;; :let/:vector/:set/:map AND their children's purity.
+      ;; :let/:vector/:set/:map AND their children's purity. :throw is safe-op? (an
+      ;; inline body may contain one — splicing preserves it) but is NOT pure: it
+      ;; must not be duplicated, relocated across effects, or reach total?.
+      (= op :throw) false
       (safe-op? op) (reduce-ir-children (fn [ok c] (and ok (pure? c))) true node)
       :else false)))
 
@@ -278,6 +281,8 @@
   [node]
   (let [op (get node :op)]
     (cond
+      ;; :throw always throws — discarding it swallows the exception.
+      (= op :throw) false
       (= op :invoke) (and (or (total-fn? (get node :fn)) (ctor-shape node))
                           (every? total? (get node :args)))
       (safe-op? op) (reduce-ir-children (fn [ok c] (and ok (total? c))) true node)
@@ -288,8 +293,6 @@
     (and (> (count prs) 0)
          (every? (fn [pr] (scalar-const? (nth pr 0))) prs))))
 
-(defn- all-vals-pure? [node]
-  (every? (fn [pr] (pure? (nth pr 1))) (get node :pairs)))
 ;; total variant — for a map whose unread values would be DISCARDED when the map
 ;; binding is dropped, so they must not throw.
 (defn- all-vals-total? [node]

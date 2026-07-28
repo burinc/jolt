@@ -341,17 +341,23 @@
 ;; funnels through these, so contagion and *math-context* rounding apply
 ;; uniformly. min/max need no arm: the generic jolt-min2 compares through
 ;; jolt-num-cmp-slow and returns the original operand.
-(set! jolt-num-slow?
-  (let ((prev jolt-num-slow?)) (lambda (x) (or (jbigdec? x) (prev x)))))
-(define (jbd-extend-hook prev bd-op)
-  (lambda (a b)
-    (if (or (jbigdec? a) (jbigdec? b)) (bd-op a b) (prev a b))))
-(set! jolt-add-slow (jbd-extend-hook jolt-add-slow (lambda (a b) (jbd-binop + jbd2+ a b))))
-(set! jolt-sub-slow (jbd-extend-hook jolt-sub-slow (lambda (a b) (jbd-binop - jbd2- a b))))
-(set! jolt-mul-slow (jbd-extend-hook jolt-mul-slow (lambda (a b) (jbd-binop * jbd2* a b))))
-(set! jolt-div-slow (jbd-extend-hook jolt-div-slow (lambda (a b) (jbd-binop / jbd2-div a b))))
-(set! jolt-num-cmp-slow
-  (let ((prev jolt-num-cmp-slow))
+;; Slow-hook arms are registered through the core's register-num-arm! (seq.ss) —
+;; bigdec never mutates a core var directly. jbd-num-arm registers a binary arm:
+;; handler runs when either operand is a BigDecimal, otherwise the chain
+;; declines to prev.
+(register-num-arm! 'num-slow?
+  (lambda (prev) (lambda (x) (or (jbigdec? x) (prev x)))))
+(define (jbd-num-arm op handler)
+  (register-num-arm! op
+    (lambda (prev)
+      (lambda (a b)
+        (if (or (jbigdec? a) (jbigdec? b)) (handler a b) (prev a b))))))
+(jbd-num-arm 'add (lambda (a b) (jbd-binop + jbd2+ a b)))
+(jbd-num-arm 'sub (lambda (a b) (jbd-binop - jbd2- a b)))
+(jbd-num-arm 'mul (lambda (a b) (jbd-binop * jbd2* a b)))
+(jbd-num-arm 'div (lambda (a b) (jbd-binop / jbd2-div a b)))
+(register-num-arm! 'cmp
+  (lambda (prev)
     (lambda (a b)
       (if (and (or (jbigdec? a) (jbigdec? b)) (jbd-numberish? a) (jbd-numberish? b))
           (jbd-value-compare a b)
@@ -359,38 +365,36 @@
 ;; quot/rem/mod: a double operand demotes to the double path; exact operands use
 ;; the integer-division bigdec ops (mod = rem, floor-adjusted to the divisor's sign).
 (define (jbd->num x) (if (jbigdec? x) (jbigdec->flonum x) x))
-(set! jolt-quot-slow
-  (jbd-extend-hook jolt-quot-slow
-    (lambda (a b) (if (or (flonum? a) (flonum? b))
-                      (jolt-quot (jbd->num a) (jbd->num b))
-                      (jbd-int-quot (jbd-coerce a) (jbd-coerce b))))))
-(set! jolt-rem-slow
-  (jbd-extend-hook jolt-rem-slow
-    (lambda (a b) (if (or (flonum? a) (flonum? b))
-                      (jolt-rem (jbd->num a) (jbd->num b))
-                      (jbd-int-rem (jbd-coerce a) (jbd-coerce b))))))
-(set! jolt-mod-slow
-  (jbd-extend-hook jolt-mod-slow
-    (lambda (a b)
-      (if (or (flonum? a) (flonum? b))
-          (jolt-mod (jbd->num a) (jbd->num b))
-          (let* ((bb (jbd-coerce b))
-                 (m (jbd-int-rem (jbd-coerce a) bb)))
-            (if (or (jbd-zero? m) (eq? (jbd-neg? m) (jbd-neg? bb))) m (jbd2+ m bb)))))))
-;; unary shims: inc/dec and the sign predicates take a bigdec arm. set! updates
-;; call-position references; the re-def-var! updates the var cell AND claims the
-;; wrapped proc's class name before the prelude's inc'/dec' aliases are defined
-;; ((type inc) stays clojure.core$inc — first def wins in the class registry).
+(jbd-num-arm 'quot
+  (lambda (a b) (if (or (flonum? a) (flonum? b))
+                    (jolt-quot (jbd->num a) (jbd->num b))
+                    (jbd-int-quot (jbd-coerce a) (jbd-coerce b)))))
+(jbd-num-arm 'rem
+  (lambda (a b) (if (or (flonum? a) (flonum? b))
+                    (jolt-rem (jbd->num a) (jbd->num b))
+                    (jbd-int-rem (jbd-coerce a) (jbd-coerce b)))))
+(jbd-num-arm 'mod
+  (lambda (a b)
+    (if (or (flonum? a) (flonum? b))
+        (jolt-mod (jbd->num a) (jbd->num b))
+        (let* ((bb (jbd-coerce b))
+               (m (jbd-int-rem (jbd-coerce a) bb)))
+          (if (or (jbd-zero? m) (eq? (jbd-neg? m) (jbd-neg? bb))) m (jbd2+ m bb))))))
+;; unary shims: inc/dec and the sign predicates take a bigdec arm. Registration
+;; updates call-position references; the re-def-var! updates the var cell AND
+;; claims the wrapped proc's class name before the prelude's inc'/dec' aliases
+;; are defined ((type inc) stays clojure.core$inc — first def wins in the class
+;; registry).
 (define jbd-one (make-jbigdec 1 0))
-(set! jolt-inc (let ((prev jolt-inc)) (lambda (x) (if (jbigdec? x) (jbd-mc-round (jbd2+ x jbd-one)) (prev x)))))
-(set! jolt-dec (let ((prev jolt-dec)) (lambda (x) (if (jbigdec? x) (jbd-mc-round (jbd2- x jbd-one)) (prev x)))))
-(set! jolt-zero? (let ((prev jolt-zero?)) (lambda (x) (if (jbigdec? x) (jbd-zero? x) (prev x)))))
-(set! jolt-pos? (let ((prev jolt-pos?)) (lambda (x) (if (jbigdec? x) (jbd-pos? x) (prev x)))))
-(set! jolt-neg? (let ((prev jolt-neg?)) (lambda (x) (if (jbigdec? x) (jbd-neg? x) (prev x)))))
+(register-num-arm! 'inc (lambda (prev) (lambda (x) (if (jbigdec? x) (jbd-mc-round (jbd2+ x jbd-one)) (prev x)))))
+(register-num-arm! 'dec (lambda (prev) (lambda (x) (if (jbigdec? x) (jbd-mc-round (jbd2- x jbd-one)) (prev x)))))
+(register-num-arm! 'zero? (lambda (prev) (lambda (x) (if (jbigdec? x) (jbd-zero? x) (prev x)))))
+(register-num-arm! 'pos? (lambda (prev) (lambda (x) (if (jbigdec? x) (jbd-pos? x) (prev x)))))
+(register-num-arm! 'neg? (lambda (prev) (lambda (x) (if (jbigdec? x) (jbd-neg? x) (prev x)))))
 ;; a BigDecimal IS a number (java.lang.Number): extend the number? native so the
 ;; predicate — and everything defined over it (num, =='s guard) — accepts it.
 ;; The compiled fast paths test Chez number? directly and are unaffected.
-(set! jolt-number? (let ((prev jolt-number?)) (lambda (x) (if (jbigdec? x) #t (prev x)))))
+(register-num-arm! 'number? (lambda (prev) (lambda (x) (if (jbigdec? x) #t (prev x)))))
 (def-var! "clojure.core" "number?" jolt-number?)
 (def-var! "clojure.core" "inc" jolt-inc)
 (def-var! "clojure.core" "dec" jolt-dec)
@@ -414,36 +418,48 @@
 (def-var! "clojure.core" "rationalize" jolt-rationalize)
 
 ;; double/float of a bigdec is its flonum value.
-(set! jolt-double-slow
-  (let ((prev jolt-double-slow))
+(register-num-arm! 'double-slow
+  (lambda (prev)
     (lambda (x) (if (jbigdec? x) (jbigdec->flonum x) (prev x)))))
 
 ;; narrow casts truncate a bigdec like Number.longValue.
-(set! jolt-cast-truncate-slow
-  (let ((prev jolt-cast-truncate-slow))
+(register-num-arm! 'cast-truncate-slow
+  (lambda (prev)
     (lambda (x)
       (if (jbigdec? x)
           (truncate (/ (jbigdec-unscaled x) (expt 10 (jbigdec-scale x))))
           (prev x)))))
 
-;; compare: add a bigdec arm (enables compare / sort / sorted collections). A
-;; bigdec vs a plain number compares by value; bigdec vs bigdec is scale-independent.
-(define jbd-prev-compare jolt-compare)
+;; compare: a bigdec arm on the core's arm list (enables compare / sort /
+;; sorted collections). A bigdec vs a plain number compares by value; bigdec vs
+;; bigdec is scale-independent.
 (define (jbd-numberish? x) (or (jbigdec? x) (number? x)))
-(set! jolt-compare
+(register-compare-arm!
+  (lambda (a b) (and (or (jbigdec? a) (jbigdec? b)) (jbd-numberish? a) (jbd-numberish? b)))
   (lambda (a b)
-    (if (and (or (jbigdec? a) (jbigdec? b)) (jbd-numberish? a) (jbd-numberish? b))
-        (if (or (flonum? a) (flonum? b))
-            (let ((fa (if (jbigdec? a) (jbigdec->flonum a) a))
-                  (fb (if (jbigdec? b) (jbigdec->flonum b) b)))
-              (cond ((< fa fb) -1) ((> fa fb) 1) (else 0)))
-            (jbd-compare2 (jbd-coerce a) (jbd-coerce b)))
-        (jbd-prev-compare a b))))
-(def-var! "clojure.core" "compare" jolt-compare)
+    (if (or (flonum? a) (flonum? b))
+        (let ((fa (if (jbigdec? a) (jbigdec->flonum a) a))
+              (fb (if (jbigdec? b) (jbigdec->flonum b) b)))
+          (cond ((< fa fb) -1) ((> fa fb) 1) (else 0)))
+        (jbd-compare2 (jbd-coerce a) (jbd-coerce b)))))
 
 ;; equality: a bigdec equals only another bigdec, by value (matching (= 3M 3) = false).
 (register-eq-arm! (lambda (a b) (or (jbigdec? a) (jbigdec? b)))
                   (lambda (a b) (and (jbigdec? a) (jbigdec? b) (jbigdec=? a b))))
+
+;; == value-equality across the tower — with a double both sides compare as
+;; doubles, otherwise as bigdec ((== 3M 3) is true while (= 3M 3) stays false).
+(define (jbd-equiv2 a b)
+  (cond
+    ((or (flonum? a) (flonum? b))
+     (let ((fa (if (jbigdec? a) (jbigdec->flonum a) (if (flonum? a) a (exact->inexact a))))
+           (fb (if (jbigdec? b) (jbigdec->flonum b) (if (flonum? b) b (exact->inexact b)))))
+       (= fa fb)))
+    (else (jbigdec=? (jbd-coerce a) (jbd-coerce b)))))
+(register-num-arm! 'num-equiv-slow
+  (lambda (prev)
+    (lambda (a b)
+      (if (or (jbigdec? a) (jbigdec? b)) (jbd-equiv2 a b) (prev a b)))))
 
 ;; str drops the M; pr/pr-str keep it.
 (register-str-render! jbigdec? jbigdec->string)
@@ -461,5 +477,5 @@
 
 ;; class / decimal?
 (register-class-arm! jbigdec? (lambda (x) "java.math.BigDecimal"))
-(set! jolt-decimal? (lambda (x) (jbigdec? x)))
+(register-num-arm! 'decimal? (lambda (prev) (lambda (x) (or (jbigdec? x) (prev x)))))
 (def-var! "clojure.core" "decimal?" jolt-decimal?)
