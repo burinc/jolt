@@ -477,5 +477,5 @@
 
 ;; class / decimal?
 (register-class-arm! jbigdec? (lambda (x) "java.math.BigDecimal"))
-(register-num-arm! 'decimal? (lambda (prev) (lambda (x) (jbigdec? x))))
+(register-num-arm! 'decimal? (lambda (prev) (lambda (x) (or (jbigdec? x) (prev x)))))
 (def-var! "clojure.core" "decimal?" jolt-decimal?)
