@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.9] - 2026-07-28
+
+An interrupted git fetch no longer leaves a dependency unresolvable on every run
+that follows.
+
+### Fixed
+
+- **An interrupted git fetch no longer poisons the dependency cache.**
+  `ensure-git` created the cache directory with `mkdir -p` and then cloned into
+  it, so the directory existed before the clone had produced anything. Interrupt
+  the fetch (a `^C` while `jolt serve` resolves deps is enough, since the
+  `SIGINT` reaches the child `git`) and the empty directory stayed behind: `git`
+  cleans up a clone directory only when it created that directory itself. Every
+  later run found the path and took it for a finished checkout, so the dependency
+  contributed no source root and the run failed far from the cause, with `Could
+  not locate ring_chez/adapter.jolt (or .clj/.cljc) on the source roots` for a
+  dep deps.edn plainly declared. Deleting the directory by hand was the only way
+  out. A fetch now clones, checks out, and updates submodules in a staging
+  directory beside its destination, and moves it into place only once all three
+  succeed, so the cache holds nothing but finished checkouts and a failure at any
+  step removes the staging directory instead of leaving a trap. Completeness is
+  recorded by a `.jolt-git-ok` marker, with `.git` accepted for a checkout an
+  earlier jolt cloned in place, so an already-poisoned cache also heals itself on
+  the next run.
+
+## [0.5.8] - 2026-07-27
+
+The AOT cache no longer serves stale code after a length-preserving source edit,
+and the gate runs about 2.7x faster.
+
 ### Changed
 
 - **The gate runs about 2.7x faster.** `make -j8 ci` drops from 338s to 124s.
@@ -38,6 +68,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bld-runtime-manifest`'s prefix rather than a hand-written list, and
   `manifestcheck` pins `gate-boot.ss`'s literal fallback against that same
   prefix, so the runtime, the fallback, and the image cannot drift apart.
+
+### Fixed
+
+- **The AOT cache served stale code after a source edit that did not change the
+  file's length.** The cache keys a namespace's compiled fasl on the source's
+  byte length plus `equal-hash` of its content, on the assumption that a false
+  share needs a collision in both. But Chez's `equal-hash` on a string is not a
+  content hash: it samples about 26 characters no matter how long the string is
+  (the first 6, roughly 15 strided, the last 5), so for any real source ~99% of
+  the bytes never reached the key. Length was doing all the invalidation work,
+  and any length-preserving edit — `42` to `99`, `<` to `>`, `inc` to `dec`, a
+  rename to an equal-length name — produced a byte-identical key and quietly
+  loaded the previous compile. Nothing else catches it: there is no mtime or
+  size check behind the filename, so an existing `.so` is treated as valid.
+  The cache now keys on a full-content FNV-1a hash, which reads every byte, at
+  a cost of one linear pass over source that is about to be compiled anyway
+  (6.4ms for all 3MB of runtime source, once per process). The length prefix
+  stays on as a second factor.
+- **Two jolt builds reporting the same version no longer share a cache
+  generation.** The generation directory folds in a fingerprint of the runtime
+  itself, precisely because `git describe` reports the same `…-dirty` for every
+  build out of one working tree. That fingerprint used `equal-hash` too, so a
+  length-preserving change to the runtime left both builds in one generation,
+  each loading the other's fasls — the exact failure the fingerprint exists to
+  prevent. Both the source-tree fingerprint and the one a binary bakes in now
+  use the content hash.
+- **`make aotfingerprint`** (added to `ci`) — pins that every byte of a source
+  affects the hash, that the hash is reproducible across processes, and that a
+  one-character length-preserving edit moves the namespace key, the source-tree
+  fingerprint, and the fingerprint a built binary bakes. `aot-cache-smoke`'s
+  existing invalidation case did this same `42`→`99` edit and passed throughout,
+  because its 36-byte fixture put the change inside the sampled window; it now
+  also drives a multi-kilobyte source with the value mid-file.
 
 ## [0.5.7] - 2026-07-27
 
@@ -1869,7 +1932,9 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.7...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.9...HEAD
+[0.5.9]: https://github.com/jolt-lang/jolt/compare/v0.5.8...v0.5.9
+[0.5.8]: https://github.com/jolt-lang/jolt/compare/v0.5.7...v0.5.8
 [0.5.7]: https://github.com/jolt-lang/jolt/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/jolt-lang/jolt/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/jolt-lang/jolt/compare/v0.5.4...v0.5.5

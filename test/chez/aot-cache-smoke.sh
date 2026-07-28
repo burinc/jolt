@@ -71,6 +71,59 @@ else
   echo "FAIL: (c) after edit output='$out_c' (expected 99 — cache did not invalidate)"; fails=$((fails+1))
 fi
 
+# --- (c2) same-length edit on a realistically-sized source --------------------
+# equal-hash samples at most ~26 bytes regardless of length, so a same-length
+# edit away from those sampling points produces a collision and serves stale
+# code. The fixture is ~4 KB with the value in the middle — far from the small
+# test above where the edit happens to land in a sampled byte. 42 -> 99.
+c2="$tmp/c2"; mkdir -p "$c2/src/mylib"
+# Regenerated rather than sed-edited: `sed -i ''` is BSD-only (GNU sed reads the
+# '' as the script and the s/// as a filename, exits 2, and set -e kills the run),
+# and both values are two digits so rewriting the file is length-preserving anyway.
+gen_c2() {
+  {
+    # pad: ~2 KB of comment lines above the value
+    i=0; while [ "$i" -lt 32 ]; do
+      printf ';; padding line %s for cache key size ---------------------------------------\n' "$i"
+      i=$((i + 1))
+    done
+    echo '(ns mylib.core)'
+    printf '(defn answer [] %s)\n' "$1"
+    # pad: ~2 KB of comment lines below the value
+    i=0; while [ "$i" -lt 32 ]; do
+      printf ';; padding line %s for cache key size ---------------------------------------\n' "$i"
+      i=$((i + 1))
+    done
+  } > "$c2/src/mylib/core.clj"
+}
+gen_c2 42
+c2_len=$(wc -c < "$c2/src/mylib/core.clj")
+if [ "$c2_len" -lt 4096 ]; then
+  echo "FAIL: (c2) fixture too small: $c2_len bytes (need >=4096)"; fails=$((fails+1))
+else
+  sleep 1  # ensure mtime advances
+  c2_cold="$(run_prog "$c2")"
+  if [ "$c2_cold" != "42" ]; then
+    echo "FAIL: (c2) cold output='$c2_cold' (expected 42)"; fails=$((fails+1))
+  else
+    # length-preserving edit: 42 -> 99
+    c2_orig_len=$(wc -c < "$c2/src/mylib/core.clj")
+    gen_c2 99
+    c2_new_len=$(wc -c < "$c2/src/mylib/core.clj")
+    if [ "$c2_orig_len" != "$c2_new_len" ]; then
+      echo "FAIL: (c2) edit changed length: $c2_orig_len -> $c2_new_len (expected equal)"; fails=$((fails+1))
+    else
+      sleep 1
+      c2_edit="$(run_prog "$c2")"
+      if [ "$c2_edit" = "99" ]; then
+        echo "PASS: (c2) large-fixture edit invalidated, output=99"; pass=$((pass+1))
+      else
+        echo "FAIL: (c2) after edit output='$c2_edit' (expected 99 — equal-hash sampled stale)"; fails=$((fails+1))
+      fi
+    fi
+  fi
+fi
+
 # --- Phase 2: correctness the tee must preserve (cold == warm == expected) ----
 # case_cold_warm <label> <projdir> <expr-after-add-deps> <expected>
 # projdir has src/proj/core.clj (+ siblings); expr requires proj.core and prints

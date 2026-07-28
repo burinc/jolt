@@ -305,7 +305,7 @@
 ;; for it on the first cached require), so the position doesn't matter.
 (let* ((src (read-file-string jb-flat-ss))
        (fp (string-append (number->string (string-length src) 16) "-"
-                          (number->string (equal-hash src) 16)))
+                          (number->string (aot-content-hash src) 16)))
        (out (open-output-file jb-flat-ss 'append)))
   (put-string out (string-append
                     "\n;; === runtime fingerprint (AOT cache key) ===\n"
