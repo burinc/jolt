@@ -411,6 +411,18 @@
 ;; 32-bit multiply-accumulate over each file's length and content hash, folded in
 ;; sorted path order so the result is reproducible across runs and machines.
 (define (aot-hash-mix a b) (bitwise-and (+ (* a 1000003) b) #xFFFFFFFF))
+;; FNV-1a 32-bit — every byte contributes. equal-hash on a string is a
+;; bounded-sample hash (~26 bytes regardless of length), so a same-length edit
+;; away from the sampled offsets produces a cache collision.  This replaces it.
+(define (aot-content-hash s)
+  (let ((n (string-length s)))
+    (let loop ((i 0) (h 2166136261))
+      (if (fx=? i n)
+          h
+          (loop (fx+ i 1)
+                (fxlogand (fx* (fxlogxor h (char->integer (string-ref s i)))
+                               16777619)
+                          #xFFFFFFFF))))))
 (define (aot-source-fingerprint)
   (let loop ((dirs aot-runtime-source-dirs) (h 17) (n 0))
     (if (null? dirs)
@@ -429,7 +441,7 @@
                        (s (guard (e (else #f)) (read-file-string p))))
                   (if s
                       (inner (cdr fs)
-                             (aot-hash-mix (aot-hash-mix h (string-length s)) (equal-hash s))
+                             (aot-hash-mix (aot-hash-mix h (string-length s)) (aot-content-hash s))
                              (fx+ n 1))
                       (inner (cdr fs) h n)))))))))
 ;; Computed at most once per process, and only when the cache is consulted, so
@@ -517,17 +529,16 @@
                      (char=? c #\-) (char=? c #\.) (char=? c #\_))
                  c #\_)))
          (string->list s))))
-;; length (hex) + content hash (equal-hash, 32-bit, hex). The length prefix is a
+;; length (hex) + full-content FNV-1a 32-bit hash (hex). The length prefix is a
 ;; cheap collision guard: two sources must share BOTH byte length AND the 32-bit
 ;; hash to collide and falsely share a fasl — astronomically unlikely for distinct
-;; library sources. equal-hash is process-STABLE (not randomized), so the key is
-;; reproducible across runs (required for the cache to hit). A full content digest
-;; would need a bytevector hash jolt doesn't expose cheaply; this is the accepted
-;; tradeoff. (A collision would load wrong compiled code — the worst case — but
-;; the length guard + 32-bit hash put it far below other realistic failure rates.)
+;; library sources.  FNV-1a is reproducible and every byte contributes, unlike
+;; equal-hash which is a bounded-sample hash (~26 bytes regardless of length).
+;; A same-length edit away from those sampling points would silently serve stale
+;; cached code; FNV-1a and the length prefix together make that impossible.
 (define (aot-cache-key src)
   (string-append (number->string (string-length src) 16) "-"
-                 (number->string (equal-hash src) 16)))
+                 (number->string (aot-content-hash src) 16)))
 (define (aot-info msg)
   (when (getenv "JOLT_DEBUG")
     (display (string-append "[jolt.aot] " msg "\n") (current-error-port))))
