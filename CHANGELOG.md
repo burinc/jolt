@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An open-world build's stack traces had no namespace, file or line.** A
+  direct-linked build registers each fn def's source, so an uncaught error maps its
+  frames to `app.util/deep-boom (…/util.clj:24)`. The registration was gated on
+  direct-link, so `jolt build --no-direct-link` printed a bare `deep-boom` with
+  nothing to locate it. The build turns `source-reg` on when it is not
+  direct-linking — the same switch the runtime eval path already sets, so an
+  open-world binary now reads like a `jolt run` trace. A direct-link build is
+  unchanged and nothing registers twice.
+
+- **`#{1 1}` compiled to `#{1}` instead of being a read error.** The JVM rejects a
+  duplicate element when the reader builds a set literal
+  (`PersistentHashSet/createWithCheck`); jolt only checked on the DATA path, so
+  `(read-string "#{1 1}")` threw while the same literal in a source file quietly
+  became a one-element set. Map literals were already checked. Elements compare as
+  read, like the JVM: two symbols are distinct, two equal lists are not, and the
+  runtime builders (`set`, `hash-set`) still dedupe silently.
+
+  Neither check runs in the build's scan mode, which is a fix in its own right: an
+  auto keyword whose alias is not registered yet keeps the ALIAS TEXT as its
+  namespace there, so `#{::o/x :o/x}` read as two copies of `:o/x` and the
+  duplicate check rejected it — failing the build of a namespace that loaded fine.
+
+- **`:as-alias` loaded the namespace, and did not alias it.** Clojure 1.11's
+  `:as-alias` establishes the alias without loading the target, for a namespace that
+  may not exist yet or exists only to qualify keywords; `load-lib` picks its loader
+  with `need-ns (or as use)` and falls to `(create-ns lib)`. jolt loaded the target
+  and then dropped the alias on the floor, so the namespace's side effects ran and
+  `::o/x` was still an invalid token. A spec that also carries `:as`, or that
+  arrives through `use`, still loads.
+
 - **A `jolt build` failure reported no location.** The build has three walks that
   process a source file without evaluating its forms — the require scan, the
   whole-program inference walk, the emit walk — and none reaches

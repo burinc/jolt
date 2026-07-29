@@ -840,6 +840,18 @@
                   ((var-deref "jolt.backend-scheme" "set-direct-link!") #t)
                   ((var-deref "jolt.backend-scheme" "direct-link-reset!"))
                   (set-direct-link-flag! #t))
+                ;; Register each fn def's source, so an uncaught error in the built
+                ;; binary maps its frames to "ns/name (file:line)" instead of a bare
+                ;; procedure name. A direct-link build already emits these from
+                ;; emit-def-cached, which gates on direct-link — so WITHOUT it a
+                ;; built binary printed `deep-boom` where the direct-linked one
+                ;; printed `app.util/deep-boom (…/util.clj:24)`. On only for the
+                ;; open-world build, so a direct-link build's emitted bytes are
+                ;; unchanged and nothing registers twice. The runtime eval path
+                ;; turns this on for the same reason (compile-eval.ss); the seed
+                ;; mint keeps it off, since its output must not carry this machine's
+                ;; absolute paths (emit-image.ss).
+                ((var-deref "jolt.backend-scheme" "set-source-reg!") (not direct-link?))
                 ;; Cache resolved var cells per reference site in the APP forms
                 ;; (bld-emit-ns / ei-emit-ns-records). A user build is a single
                 ;; compile of fixed source, so the gensym-numbered cell names are
@@ -903,6 +915,7 @@
                 (set-release! #f)
                 (set-direct-link-flag! #f)
                 ((var-deref "jolt.backend-scheme" "set-direct-link!") #f)
+                ((var-deref "jolt.backend-scheme" "set-source-reg!") #f)
                 ;; drop the accumulated direct-link fqn set too — a later
                 ;; in-process build would otherwise bind calls against defs
                 ;; recorded for THIS one. (bld-wp-infer!'s record/protocol

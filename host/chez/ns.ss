@@ -104,7 +104,10 @@
           (lambda (opt)
             (let ((k (car opt)) (v (cdr opt)))
               (cond
-                ((string=? k "as")
+                ;; :as-alias aliases exactly like :as (clojure.core load-lib does
+                ;; the same `alias` call for both); what differs is that it does not
+                ;; load the target — see ldr-load+register.
+                ((or (string=? k "as") (string=? k "as-alias"))
                  (when (symbol-t? v) (chez-register-alias! cns (symbol-t-name v) target)))
                 ;; :refer (require) and :only (use) both bring unqualified names
                 ;; into cns resolving to target/name.

@@ -1143,12 +1143,26 @@
         (lambda (s)
           (let* ((parsed (parse-libspec s))
                  (target (and parsed (car parsed)))
-                 (opt-names (if parsed (map car (cdr parsed)) '())))
+                 (opt-names (if parsed (map car (cdr parsed)) '()))
+                 ;; :as-alias establishes the alias WITHOUT loading the target — for
+                 ;; a namespace that may not exist yet, or exists only to qualify
+                 ;; keywords. clojure.core's load-lib picks the loader with
+                 ;; `need-ns (or as use)`, falling to (create-ns lib) when the spec
+                 ;; is :as-alias and neither — so a spec that also carries :as, or
+                 ;; that arrives through `use`, still loads.
+                 (alias-only? (and target
+                                   (member "as-alias" opt-names)
+                                   (not (member "as" opt-names))
+                                   (not use?))))
             ;; record BEFORE loading: a target already loaded is still a
             ;; dependency of whoever is being compiled, and load-namespace*
-            ;; would dedup it away.
-            (when target (aot-record-dep! target))
-            (when target (load-namespace* target force-named?))
+            ;; would dedup it away. An alias-only spec loads nothing, so it is
+            ;; a dependency of nothing.
+            (when (and target (not alias-only?)) (aot-record-dep! target))
+            (cond
+              ((not target) #f)
+              (alias-only? (intern-ns! target))   ; create-ns, without loading
+              (else (load-namespace* target force-named?)))
             (chez-register-spec! (chez-current-ns) s)
             (when (and use? target
                        (not (or (member "only" opt-names) (member "refer" opt-names))))
