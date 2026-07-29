@@ -1661,6 +1661,33 @@
   ;; as at the top level — reported where the unknown name is written.
   {:suite "vars / cached reference stays correct" :label "undeclared forward reference in a fn body throws" :expected :throws :actual "(do (defn a [] (b)) (defn b [] 42) (a))" :portability :common}
   {:suite "vars / cached reference stays correct" :label "unknown symbol nested in a let body throws" :expected :throws :actual "(let [a 1] (bogus-head a))" :portability :common}
+  ;; The shape that reaches for the late-bind hardest: the reference sits in a
+  ;; closure inside a data literal, so nothing calls it until long after the file
+  ;; has finished loading. It is still a compile error where it is written — the
+  ;; enclosing defn is analyzed now, not when the closure is eventually invoked.
+  ;; glimmer.widget hit exactly this (a :apply closure in a widget-spec map calling
+  ;; a setter defined 90 lines below it), and a declare is the fix.
+  {:suite "vars / cached reference stays correct" :label "undeclared forward reference in a closure inside a data literal throws" :expected :throws :actual "(do (defn wspec [] {:apply (fn [w] (wsetter w))}) (defn wsetter [w] (* 2 w)) ((:apply (wspec)) 21))" :portability :common}
+  {:suite "vars / cached reference stays correct" :label "declared forward reference in a closure inside a data literal resolves" :expected "42" :actual "(do (declare wsetter2) (defn wspec2 [] {:apply (fn [w] (wsetter2 w))}) (defn wsetter2 [w] (* 2 w)) ((:apply (wspec2)) 21))" :portability :common}
+  ;; Charset/forName takes the JVM's aliases, not just the canonical names —
+  ;; clj-http-lite passes whatever the caller spelled, and "ASCII" threw
+  ;; UnsupportedCharsetException. A Charset OBJECT also has to thread into
+  ;; (String. bytes cs); its jhost state is a vector, and reading it with assq
+  ;; raised "improperly formed alist".
+  {:suite "host-interop / Charset aliases" :label "forName canonicalizes the JVM's aliases" :expected "[\"US-ASCII\" \"ISO-8859-1\" \"UTF-8\" \"UTF-16\" \"UTF-16LE\"]" :actual "(mapv #(.name (java.nio.charset.Charset/forName %)) [\"ASCII\" \"l1\" \"UTF8\" \"unicode\" \"X-UTF-16LE\"])" :portability :jvm}
+  {:suite "host-interop / Charset aliases" :label "forName resolves the UTF-32 family" :expected "[\"UTF-32\" \"UTF-32BE\" \"UTF-32LE\"]" :actual "(mapv #(.name (java.nio.charset.Charset/forName %)) [\"UTF-32\" \"UTF-32BE\" \"UTF-32LE\"])" :portability :jvm}
+  {:suite "host-interop / Charset aliases" :label "a Charset object decodes through (String. bytes cs)" :expected "\"sõme\"" :actual "(String. (.getBytes \"sõme\" \"ISO-8859-1\") (java.nio.charset.Charset/forName \"ISO-8859-1\"))" :portability :jvm}
+  {:suite "host-interop / Charset aliases" :label "an alias name round-trips through getBytes/String., not silently UTF-8" :expected "\"sõme\"" :actual "(String. (.getBytes \"sõme\" \"l1\") \"l1\")" :portability :jvm}
+  ;; A Charset OBJECT has to reach the encoder as a charset, not as its printed
+  ;; form: .getBytes rendered it to "#object[java.nio.charset.Charset]", matched
+  ;; no arm, and silently encoded UTF-8. ASCII-only text and an explicit UTF-8
+  ;; request both hide that, so these assert a non-ASCII round-trip. Byte values
+  ;; are deliberately not asserted — jolt's byte arrays are unsigned where the
+  ;; JVM's are signed, which is a separate divergence.
+  {:suite "host-interop / Charset aliases" :label "getBytes/String. round-trip through a Charset object" :expected "\"sõme ßÒññÝ\"" :actual "(let [cs (java.nio.charset.Charset/forName \"ISO-8859-1\")] (String. (.getBytes \"sõme ßÒññÝ\" cs) cs))" :portability :jvm}
+  {:suite "host-interop / Charset aliases" :label "a Charset object encodes one byte per char, not UTF-8" :expected "1" :actual "(alength (.getBytes \"õ\" (java.nio.charset.Charset/forName \"ISO-8859-1\")))" :portability :jvm}
+  {:suite "host-interop / Charset aliases" :label "an aliased Charset object still selects its canonical encoding" :expected "1" :actual "(alength (.getBytes \"õ\" (java.nio.charset.Charset/forName \"l1\")))" :portability :jvm}
+  {:suite "host-interop / Charset aliases" :label "unknown vs malformed charset names throw different exceptions" :expected "[\"java.nio.charset.UnsupportedCharsetException\" \"java.nio.charset.IllegalCharsetNameException\"]" :actual "[(try (java.nio.charset.Charset/forName \"NOPE-9\") (catch Throwable e (.getName (class e)))) (try (java.nio.charset.Charset/forName \"bad name\") (catch Throwable e (.getName (class e))))]" :portability :jvm}
   {:suite "predicates / nil & boolean" :label "nil? true" :expected "true" :actual "(nil? nil)" :portability :common}
   {:suite "predicates / nil & boolean" :label "nil? false" :expected "false" :actual "(nil? 0)" :portability :common}
   {:suite "predicates / nil & boolean" :label "some? true" :expected "true" :actual "(some? 0)" :portability :common}

@@ -620,22 +620,24 @@
 (define (string-charset-name rest)
   (if (pair? rest)
       (let ((c (car rest)))
-        (cond ((string? c) c)
-              ((and (jhost? c) (string=? (jhost-tag c) "charset"))
-               (let ((p (assq 'name (jhost-state c)))) (if p (jolt-str-render-one (cdr p)) "UTF-8")))
+        ;; via charset-arg-name: a "charset" jhost's state is the
+        ;; #(canonical-name encode-max) vector charset-for-name builds, not an
+        ;; alist, and assq on it raised "improperly formed alist" — so
+        ;; (String. bytes (Charset/forName …)) threw where the JVM decodes.
+        (cond ((or (string? c) (and (jhost? c) (string=? (jhost-tag c) "charset")))
+               (charset-arg-name c))
               (else "UTF-8")))
       "UTF-8"))
 (define (decode-bytevector bv rest)
-  (let ((cs (ascii-string-down (string-charset-name rest))))
+  (let ((cs (charset-canonical-down (string-charset-name rest))))
     (cond
-      ((or (string=? cs "utf-8") (string=? cs "utf8")) (utf8->string bv))
-      ((or (string=? cs "iso-8859-1") (string=? cs "latin1") (string=? cs "iso8859-1")
-           (string=? cs "us-ascii") (string=? cs "ascii"))
+      ((string=? cs "utf-8") (utf8->string bv))
+      ((or (string=? cs "iso-8859-1") (string=? cs "us-ascii"))
        (list->string (map integer->char (bytevector->u8-list bv))))
-      ((or (string=? cs "utf-16") (string=? cs "utf16") (string=? cs "utf-16be") (string=? cs "unicode"))
+      ((or (string=? cs "utf-16") (string=? cs "utf-16be"))
        (utf16->string bv (endianness big)))   ; respects a leading BOM
       ((string=? cs "utf-16le") (utf16->string bv (endianness little)))
-      ((or (string=? cs "utf-32") (string=? cs "utf32") (string=? cs "utf-32be"))
+      ((or (string=? cs "utf-32") (string=? cs "utf-32be"))
        (utf32->string bv (endianness big)))
       ((string=? cs "utf-32le") (utf32->string bv (endianness little)))
       (else (guard (e (#t (list->string (map integer->char (bytevector->u8-list bv))))) (utf8->string bv))))))
@@ -1553,14 +1555,50 @@
                       (memv c '(#\- #\_ #\. #\:))))
                 (loop (+ i 1)))
                (else #f)))))
+;; (canonical-name encode-max alias …). The alias lists are the JVM's own —
+;; java.nio.charset.Charset/aliases, read off OpenJDK 21 — because that is what
+;; libraries pass: clj-http-lite hands (Charset/forName body-encoding) whatever
+;; the caller wrote, and "ASCII" is how everyone spells US-ASCII. Matching only
+;; the canonical names threw UnsupportedCharsetException on names the JVM
+;; resolves. The UTF-32 family is here too; the encode/decode paths below
+;; already handled it, but forName rejected it.
+(define charset-table
+  '(("US-ASCII" 127
+     "ASCII" "ascii7" "646" "ANSI_X3.4-1968" "ANSI_X3.4-1986" "IBM367"
+     "ISO646-US" "ISO_646.irv:1991" "iso_646.irv:1983" "cp367" "csASCII"
+     "iso-ir-6" "us")
+    ("ISO-8859-1" 255
+     "latin1" "l1" "819" "8859_1" "IBM-819" "IBM819" "ISO8859-1" "ISO8859_1"
+     "ISO_8859-1" "ISO_8859-1:1987" "ISO_8859_1" "cp819" "csISOLatin1"
+     "iso-ir-100")
+    ("UTF-8"    #x10FFFF "UTF8" "unicode-1-1-utf-8")
+    ("UTF-16"   #x10FFFF "UTF_16" "UnicodeBig" "unicode" "utf16")
+    ("UTF-16BE" #x10FFFF "UTF_16BE" "ISO-10646-UCS-2" "UnicodeBigUnmarked" "X-UTF-16BE")
+    ("UTF-16LE" #x10FFFF "UTF_16LE" "UnicodeLittleUnmarked" "X-UTF-16LE")
+    ("UTF-32"   #x10FFFF "UTF32" "UTF_32")
+    ("UTF-32BE" #x10FFFF "UTF_32BE" "X-UTF-32BE")
+    ("UTF-32LE" #x10FFFF "UTF_32LE" "X-UTF-32LE")))
+
 (define (charset-lookup s)
-  (cond ((string-ci=? s "us-ascii") (cons "US-ASCII" 127))
-        ((string-ci=? s "iso-8859-1") (cons "ISO-8859-1" 255))
-        ((string-ci=? s "utf-8") (cons "UTF-8" #x10FFFF))
-        ((string-ci=? s "utf-16") (cons "UTF-16" #x10FFFF))
-        ((string-ci=? s "utf-16be") (cons "UTF-16BE" #x10FFFF))
-        ((string-ci=? s "utf-16le") (cons "UTF-16LE" #x10FFFF))
-        (else #f)))
+  (let loop ((t charset-table))
+    (cond ((null? t) #f)
+          ;; the canonical name and every alias, case-insensitively (the JVM's
+          ;; forName is case-insensitive over both).
+          ((let names ((ns (cons (caar t) (cddar t))))
+             (cond ((null? ns) #f)
+                   ((string-ci=? s (car ns)) #t)
+                   (else (names (cdr ns)))))
+           (cons (caar t) (cadar t)))
+          (else (loop (cdr t))))))
+
+;; A charset name (canonical or alias) lowercased to its CANONICAL form, so the
+;; encode/decode dispatches below match one spelling each instead of carrying
+;; their own partial alias lists — which is how (.getBytes s "l1") used to
+;; silently produce UTF-8 bytes. An unknown name passes through unchanged and
+;; still hits each dispatch's UTF-8 fallback.
+(define (charset-canonical-down s)
+  (let ((hit (charset-lookup s)))
+    (ascii-string-down (if hit (car hit) s))))
 (define (charset-for-name s)
   (let ((s (jolt-str-render-one s)))
     (if (not (charset-legal-name? s))
@@ -1571,6 +1609,16 @@
               (throw-jvm 'java.nio.charset.UnsupportedCharsetException s))))))
 (define (charset-name c) (vector-ref (jhost-state c) 0))
 (define (charset-encode-max c) (vector-ref (jhost-state c) 1))
+;; One charset ARGUMENT — a name string or a Charset object — as its name string.
+;; A Charset jhost does not render to its name (jolt-str-render-one gives
+;; "#object[java.nio.charset.Charset]"), so encoding through an object used to
+;; match no arm and fall through to the UTF-8 default: (.getBytes "õ" (Charset/
+;; forName "ISO-8859-1")) returned the UTF-8 bytes [195 181] instead of [245].
+;; ASCII-only text and an explicit UTF-8 request both hid it.
+(define (charset-arg-name c)
+  (cond ((string? c) c)
+        ((and (jhost? c) (string=? (jhost-tag c) "charset")) (charset-name c))
+        (else (jolt-str-render-one c))))
 (register-class-statics! "java.nio.charset.Charset"
   (list (cons "forName" charset-for-name)
         (cons "defaultCharset" (lambda () (make-jhost "charset" (vector "UTF-8" #x10FFFF))))

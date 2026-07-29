@@ -118,25 +118,29 @@
     (if (and (pair? p) (string=? (car p) "")) (loop (cdr p)) (reverse p))))
 
 ;; Encode a string to bytes (a bytevector) under a named charset. UTF-8 default;
-;; ISO-8859-1/latin1/ascii are one byte per char; UTF-16/UTF-32 via Chez's codecs
-;; (plain "UTF-16" emits a big-endian BOM then BE, matching the JVM). Shared by
-;; .getBytes and decode-bytevector (String.).
+;; ISO-8859-1/US-ASCII are one byte per char; UTF-16/UTF-32 via Chez's codecs
+;; (plain "UTF-16" emits a big-endian BOM then BE, matching the JVM). Names are
+;; canonicalized first, so any JVM alias works. Shared by .getBytes and
+;; decode-bytevector (String.).
 (define (charset-encode-bv s csname)
-  (let ((cs (ascii-string-down (if (string? csname) csname (jolt-str-render-one csname)))))
+  ;; through charset-canonical-down (host-static-classes.ss), so every JVM alias
+  ;; the Charset table knows resolves here too — (.getBytes s "l1") used to fall
+  ;; past this cond's partial list and silently return UTF-8 bytes.
+  (let ((cs (charset-canonical-down (charset-arg-name csname))))
     (cond
-      ((or (string=? cs "utf-8") (string=? cs "utf8")) (string->utf8 s))
-      ((member cs '("iso-8859-1" "latin1" "iso8859-1" "us-ascii" "ascii"))
+      ((string=? cs "utf-8") (string->utf8 s))
+      ((member cs '("iso-8859-1" "us-ascii"))
        (let* ((n (string-length s)) (bv (make-bytevector n)))
          (do ((i 0 (+ i 1))) ((= i n) bv)
            (bytevector-u8-set! bv i (bitwise-and (char->integer (string-ref s i)) #xff)))))
       ((string=? cs "utf-16be") (string->utf16 s (endianness big)))
       ((string=? cs "utf-16le") (string->utf16 s (endianness little)))
-      ((or (string=? cs "utf-16") (string=? cs "utf16") (string=? cs "unicode"))
+      ((string=? cs "utf-16")
        (let ((be (string->utf16 s (endianness big))))
          (let* ((n (bytevector-length be)) (bv (make-bytevector (+ n 2))))
            (bytevector-u8-set! bv 0 #xfe) (bytevector-u8-set! bv 1 #xff)
            (bytevector-copy! be 0 bv 2 n) bv)))
-      ((or (string=? cs "utf-32be") (string=? cs "utf-32") (string=? cs "utf32"))
+      ((or (string=? cs "utf-32be") (string=? cs "utf-32"))
        (string->utf32 s (endianness big)))
       ((string=? cs "utf-32le") (string->utf32 s (endianness little)))
       (else (string->utf8 s)))))
@@ -208,10 +212,12 @@
     ((string=? method "getBytes")
      ;; (.getBytes s) / (.getBytes s charset) -> a jolt byte-array (seqable /
      ;; countable / alength-able, like (byte-array …)); the JVM returns byte[].
+     ;; hand the charset argument over UNRENDERED: charset-encode-bv resolves a
+     ;; name string or a Charset object through charset-arg-name. Rendering a
+     ;; Charset here produced "#object[java.nio.charset.Charset]", which matched
+     ;; no arm and silently encoded as UTF-8.
      (na-byte-array
-      (charset-encode-bv s (if (null? rest)
-                               "utf-8"
-                               (if (string? (arg 0)) (arg 0) (jolt-str-render-one (arg 0)))))))
+      (charset-encode-bv s (if (null? rest) "utf-8" (arg 0)))))
     ((string=? method "matches") (if (irregex-match (str-irx (arg 0)) s) #t #f))
     ((string=? method "replaceAll") (irregex-replace/all (str-irx (arg 0)) s (arg 1)))
     ((string=? method "replaceFirst") (irregex-replace (str-irx (arg 0)) s (arg 1)))
