@@ -776,16 +776,23 @@
                        (not (or (assoc (car p) graph-rest)
                                 (assoc (car p) walked))))
                      reader-pairs))
-           ;; merge: reader pairs + graph-rest + walked novelties (preserving
-           ;; walked order for dynamic requires the scan missed)
-           (merged (append reader-pairs graph-rest))
-           (merged
-             (let loop ((w walked) (m merged))
-               (if (null? w)
-                   m
-                   (if (assoc (caar w) m)
-                       (loop (cdr w) m)
-                       (loop (cdr w) (append m (list (car w))))))))
+           ;; merge: reader pairs, then the static-graph namespaces the hook never
+           ;; saw, then the hook's own order.
+           ;;
+           ;; walked is authoritative. The hook fires AFTER a namespace finishes
+           ;; loading, so every dependency is already in the list — including the
+           ;; ones bld-require-closure drops for being install-owned (jolt's own
+           ;; stdlib: jolt/time/impl.clj, util.clj, …). Appending walked LAST put
+           ;; those behind the library namespaces whose top level calls them, so a
+           ;; built binary died at startup on (impl/register-type! …) with
+           ;; "Attempting to call unbound fn".
+           ;;
+           ;; A graph-rest entry missing from walked was already loaded before this
+           ;; load-namespace (dep resolution, boot), and so was everything it
+           ;; requires — nothing in walked can be its dependency. Those go in front,
+           ;; keeping bld-require-closure's post-order among themselves.
+           (pre (remp (lambda (p) (assoc (car p) walked)) graph-rest))
+           (merged (append reader-pairs pre walked))
            ;; ensure entry-ns is last
            (entry-pair (or (assoc entry-ns merged)
                            (assoc entry-ns walked)
