@@ -358,7 +358,23 @@
          (saved-source (jolt-current-source)))
     ;; parameterize (not a bare set!) so a require nested in this file's ns form
     ;; restores path when control returns to the rest of this file.
-    (parameterize ((rdr-source-file path))   ; list forms read here carry :file = path
+    (parameterize ((rdr-source-file path)    ; list forms read here carry :file = path
+                   ;; Tee into the AOT capture only while loading the file that
+                   ;; capture was opened for. A nested load must not append its
+                   ;; forms to the requiring namespace's artifact: that artifact
+                   ;; already re-runs the require which loads the nested namespace,
+                   ;; so the copy is a SECOND definition of it, replayed after the
+                   ;; require — and a top-level registration in it then lands on
+                   ;; top of whatever the requiring namespace layered over it.
+                   ;; jolt.time (a 14-line ns form) baked in eight install-owned
+                   ;; jolt/time/*.clj namespaces this way; on a cache hit
+                   ;; jolt.time.local's ISO-only java.time.LocalDate/parse replayed
+                   ;; after jolt.time.fmt's pattern-aware override and undid it, so
+                   ;; a warm cache silently ignored a DateTimeFormatter. Only
+                   ;; install-owned namespaces leaked: a cacheable one opens its own
+                   ;; capture (aot-capture-load) and so already redirected.
+                   (jolt-aot-capture (and (equal? path (jolt-aot-capture-file))
+                                          (jolt-aot-capture))))
       (ldr-with-file-vars path
         (lambda ()
           (let loop ((i 0))
@@ -653,7 +669,7 @@
 ;; target would cache, but the requiring ns's own defs would vanish from its .so).
 (define (aot-capture-load file src)
   (let ((cap (open-output-string)))
-    (parameterize ((jolt-aot-capture cap))
+    (parameterize ((jolt-aot-capture cap) (jolt-aot-capture-file file))
       (load-jolt-file* file src)
       (get-output-string cap))))
 ;; On a miss: run the capture load (which also evals the ns into the running

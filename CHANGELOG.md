@@ -32,6 +32,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A cached namespace swallowed the install-owned namespaces it required, and
+  replaying them undid what its siblings registered.** The AOT capture teed every
+  form compiled while a namespace loaded. A cacheable require redirected that — the
+  nested `aot-capture-load` opens its own port — but an install-owned require
+  bypasses the cache entirely and so never did, and its forms landed in the
+  *requiring* namespace's artifact. `jolt.time` is a 14-line `ns` form; it cached as
+  412 KB carrying whole second copies of eight `jolt/time/*` stdlib namespaces.
+
+  On a cache hit those copies replay after the require that already loaded them
+  properly, so any top-level registration a sibling namespace layered on top gets
+  undone. `jolt.time.local` registers an ISO-only `java.time.LocalDate/parse` that
+  ignores a formatter; `jolt.time.fmt` overrides it with the pattern-aware one. Cold,
+  the override held. Warm, `local`'s baked copy landed back on top of it, and
+  `(t/parse-date "2020/02/02" (t/formatter "yyyy/MM/dd"))` silently parsed as ISO —
+  `substring: 11 and 11 are not valid start/end indices`. Deterministic: cold green,
+  warm red, `JOLT_AOT_CACHE=0` green.
+
+  The capture is now bound to the file it was opened for, so no nested load can
+  append to it, whether the cache handles that namespace or bypasses it. `jolt.time`
+  caches as 582 bytes — its `ns` form, which is all it has. `clojure.core/compile`
+  shares the capture and had inherited the same bug.
+
 - **`*allow-unresolved-vars*` affects resolution.** `clojure.core/*allow-unresolved-vars*`
   read `false` and did nothing; the analyzer consulted a separate
   `jolt.analyzer/*allow-unresolved-vars*` that only jolt's own nREPL knew to bind.

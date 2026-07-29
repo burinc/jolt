@@ -357,6 +357,50 @@ else
   echo "FAIL: (n) generations $n_before -> $n_after (want <=3), live .so=$n_live, output='$out_n'"; fails=$((fails+1))
 fi
 
+# --- (o) an artifact holds its OWN namespace, not the ones it requires --------
+# The capture teed every form compiled while a namespace loaded. A cacheable
+# require redirected it (the nested aot-capture-load opens its own port), but an
+# install-owned one bypasses the cache entirely and so never did — the requiring
+# namespace's artifact ended up carrying a whole second copy of the stdlib
+# namespace, replayed AFTER the require that already loaded it properly.
+#
+# That is only bloat until a sibling require layers something on top of what the
+# stdlib namespace registered: the baked copy replays last and undoes it. Which is
+# what jolt.time did — its 14-line ns form cached as 412 KB of eight jolt/time/*
+# namespaces, and on a hit jolt.time.local's ISO-only java.time.LocalDate/parse
+# landed back on top of jolt.time.fmt's pattern-aware override, so a warm cache
+# silently ignored a DateTimeFormatter. Same shape here with clojure.zip:
+# top requires the install-owned namespace and then the sibling that overrides it.
+o="$tmp/o"; mkdir -p "$o/src/olib"
+printf '{}' > "$o/deps.edn"
+cat > "$o/src/olib/over.clj" <<'CLJ'
+(ns olib.over (:require [clojure.zip :as z]))
+(alter-var-root #'clojure.zip/root (constantly (fn [_] :overridden)))
+(defn probe [] (z/root nil))
+CLJ
+cat > "$o/src/olib/top.clj" <<'CLJ'
+(ns olib.top (:require [clojure.zip] [olib.over]))
+(defn probe [] (olib.over/probe))
+CLJ
+cache_o="$(mktemp -d)"
+run_o() {
+  JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_o" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'olib/olib {:local/root \"$o\"}}})
+    (require 'olib.top) (println (olib.top/probe))" 2>/dev/null | tail -1
+}
+o_cold="$(run_o)"
+o_warm="$(run_o)"
+o_scm="$(find "$cache_o" -name 'olib.top-*.scm' | head -1)"
+o_defines="$(grep -o '"in-ns") (jolt-symbol #f "[^"]*"' "$o_scm" 2>/dev/null \
+             | sed 's/.*#f "//;s/"//' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+rm -rf "$cache_o"
+if [ "$o_cold" = ":overridden" ] && [ "$o_warm" = ":overridden" ] && [ "$o_defines" = "olib.top" ]; then
+  echo "PASS: (o) artifact defines only olib.top; override survives the hit"; pass=$((pass+1))
+else
+  echo "FAIL: (o) cold='$o_cold' warm='$o_warm' (both want :overridden), artifact defines '$o_defines' (want 'olib.top')"
+  fails=$((fails+1))
+fi
+
 # Phase 4 (cold-vs-warm speedup) lives in aot-cache-perf.sh — a timing
 # measurement doesn't belong in this deterministic correctness gate.
 
