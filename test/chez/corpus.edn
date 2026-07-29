@@ -2088,6 +2088,18 @@
   {:suite "seq / lazy over infinite" :label "mapcat single coll lazy" :expected "[0 1 2]" :actual "(take 3 (mapcat vector (range)))" :portability :common}
   {:suite "seq / lazy over infinite" :label "apply concat lazy over infinite" :expected "[1 1 1]" :actual "(take 3 (apply concat (repeat [1])))" :portability :common}
   {:suite "seq / lazy over infinite" :label "apply concat fixed + infinite tail" :expected "[9 0 0 0 0]" :actual "(take 5 (apply concat [9] (repeat [0])))" :portability :common}
+  {:suite "seq / apply variadic rest is lazy" :label "rest of an infinite tail is not realized" :expected "[0 1 2]" :actual "(take 3 (apply (fn [& xs] xs) (range)))" :portability :common}
+  {:suite "seq / apply variadic rest is lazy" :label "infinite tail with a leading fixed arg" :expected "[100 0 [1 2]]" :actual "(apply (fn [a b & r] [a b (vec (take 2 r))]) 100 (range))" :portability :common}
+  {:suite "seq / apply variadic rest is lazy" :label "infinite tail through a lower fixed arity" :expected "[0 1 [2 3]]" :actual "(apply (fn ([a] :f1) ([a b & r] [a b (vec (take 2 r))])) (range))" :portability :common}
+  {:suite "seq / apply variadic rest is lazy" :label "several leading fixed args then an infinite tail" :expected "[1 [2 3]]" :actual "(apply (fn [a & r] [a (vec (take 2 r))]) 1 2 3 (range))" :portability :common}
+  {:suite "seq / apply variadic rest is lazy" :label "a fixed arity equal to the variadic threshold still wins" :expected ":fixed2" :actual "(apply (fn ([a b] :fixed2) ([a b & r] :var2)) [1 2])" :portability :common}
+  {:suite "seq / apply variadic rest is lazy" :label "one past that threshold takes the variadic arity" :expected ":var2" :actual "(apply (fn ([a b] :fixed2) ([a b & r] :var2)) [1 2 3])" :portability :common}
+  {:suite "seq / apply variadic rest is lazy" :label "rest is nil when the tail stops exactly at the threshold" :expected "nil" :actual "(apply (fn [a b & r] r) [1 2])" :portability :common}
+  {:suite "seq / apply variadic rest is lazy" :label "too few args still throws ArityException" :expected ":caught" :actual "(try (apply (fn [a b & r] r) [1]) (catch clojure.lang.ArityException _ :caught))" :portability :common}
+  {:suite "seq / apply variadic rest is lazy" :label "a defn is lazy in its rest" :expected "[0 1]" :actual "(do (defn lzr1 [& xs] (vec (take 2 xs))) (apply lzr1 (range)))" :portability :common}
+  {:suite "seq / apply variadic rest is lazy" :label "an anonymous fn def is lazy in its rest" :expected "[0 1]" :actual "(do (def lzr2 (fn [& xs] (vec (take 2 xs)))) (apply lzr2 (range)))" :portability :common}
+  {:suite "seq / apply variadic rest is lazy" :label "a let-bound fn is lazy in its rest" :expected "[0 1]" :actual "(let [f (fn [& xs] (vec (take 2 xs)))] (apply f (range)))" :portability :common}
+  {:suite "seq / apply variadic rest is lazy" :label "a returned fn is lazy in its rest" :expected "[0 1]" :actual "(do (defn lzr3 [] (fn [& xs] (vec (take 2 xs)))) (apply (lzr3) (range)))" :portability :common}
   {:suite "seq / lazy over infinite" :label "sequence is lazy over an infinite source" :expected "[1 2 3]" :actual "(take 3 (sequence (map inc) (range)))" :portability :common}
   {:suite "seq / lazy over infinite" :label "sequence first of infinite" :expected "2" :actual "(first (sequence (map inc) (range 1 100000000000)))" :portability :common}
   {:suite "seq / lazy over infinite" :label "sequence stateful xform lazy" :expected "[[0 1] [2 3]]" :actual "(take 2 (sequence (partition-all 2) (range)))" :portability :common}

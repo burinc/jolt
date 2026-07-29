@@ -184,6 +184,12 @@
 ;; binding (ns/name) so Chez reports a unique per-var frame name — no collisions
 ;; across namespaces. Nested/anonymous fns ignore it (they never register).
 (def ^:dynamic *qualifying-ns* nil)
+;; Set while emitting the init of a def whose value is an ANONYMOUS fn. Such a fn
+;; is emitted bare so the enclosing (define jv$ns$name …) names the procedure and
+;; its backtrace frame resolves; wrapping or re-binding it would drop that name.
+;; emit-fn therefore skips its own variadic registration and emit-def-cached emits
+;; the sibling (jolt-register-variadic! …) against the define's own binding.
+(def ^:dynamic *variadic-reg-suppressed?* false)
 ;; True while emitting a node in TAIL position. Only used, in trace mode, to mark a
 ;; tail call so the runtime routes its callee into the current history rib instead
 ;; of a new one (rt.ss). It never affects semantics — a wrong value only mislabels
@@ -287,6 +293,7 @@
         helpers #{"jolt-nil" "jolt-invoke" "jolt-invoke0" "jolt-invoke1"
                   "jolt-invoke2" "jolt-invoke3" "jolt-invoke4"
                   "var-deref" "list->cseq" "cseq->list"
+                  "jolt-rest-seq" "jolt-register-variadic!"
                   "make-jrec" "jrec-field-at" "jrec-field-set!"
                   "devirt-resolve" "devirt-resolve-fl"
                   "register-clone*" "protocol-resolve"
@@ -640,8 +647,11 @@
                     restp (str "(" (str/join " " params) " . " restp ")")
                     :else (str "(" (str/join " " params) ")"))
         pbind (map (fn [o p] (str "(" p " " (nhint-init nh o p) ")")) orig params)
+        ;; jolt-rest-seq, not list->cseq: it also unwraps the lazy-rest box that
+        ;; jolt-apply hands a registered variadic fn, so (apply f infinite-seq)
+        ;; binds the rest to the seq instead of realizing it (seq.ss).
         binds (if restp
-                (concat pbind [(str "(" restp " (list->cseq " restp "))")])
+                (concat pbind [(str "(" restp " (jolt-rest-seq " restp "))")])
                 pbind)
         lett (str "(let " label " (" (str/join " " binds) ") " body ")")
         ;; a ^double/^long return hint coerces the arity's value on the way out
@@ -678,7 +688,30 @@
                  (let [c (first clauses)] (str "(lambda " (nth c 0) " " (nth c 1) ")"))
                  (str "(case-lambda "
                       (str/join " " (map (fn [c] (str "(" (nth c 0) " " (nth c 1) ")")) clauses))
-                      ")"))]
+                      ")"))
+        ;; A fn with a variadic arity records that arity's FIXED param count, so
+        ;; jolt-apply can hand it a lazy rest instead of realizing the tail. The
+        ;; count is recorded rather than read back from procedure-arity-mask,
+        ;; which cannot recover it: (fn ([a] …) ([a b & r] …)) accepts {1,2,3,…},
+        ;; so the mask says 1 where the variadic arity's fixed count is 2.
+        ;;
+        ;; The registration must NOT wrap the lambda expression: Chez names a
+        ;; procedure after the variable it is bound to, and only when the lambda
+        ;; sits directly in the binding position. Moving it into argument position
+        ;; leaves the procedure unnamed, which silently unmaps its native backtrace
+        ;; frame from the source registry (build-smoke's app.core/-main frame). So
+        ;; register AFTER the binding, in the letrec body, where the name survives:
+        ;;   (letrec ((m (lambda …))) (jolt-register-variadic! N m))   name = m
+        ;;   (letrec ((m (jolt-register-variadic! N (lambda …)))) m)   name = #f
+        ;; An ANONYMOUS fn has no binding of its own — it is emitted bare so the
+        ;; enclosing (define jv$ns$name …) names it — so its def registers the
+        ;; sibling call instead (emit-def-cached), and *variadic-reg-suppressed?*
+        ;; tells this fn to leave it alone.
+        variadic-fixed (some (fn [a] (when (:rest a) (count (:params a)))) arities)
+        reg-here? (and variadic-fixed (not *variadic-reg-suppressed?*))
+        ;; a bare anonymous variadic fn still needs a binding to register through;
+        ;; nothing maps its frame, so a fresh label costs no backtrace fidelity.
+        anon-label (when (and reg-here? (not self)) (fresh-label "fnvar"))]
     ;; A named fn references itself by name — the analyzer binds that name as a
     ;; :local in the body. letrec makes the name visible to the lambda.
     (if-let [nm (:name node)]
@@ -689,10 +722,16 @@
         ;; alias bound by an enclosing `let` is not, and a self-recursive body then
         ;; references an unbound name. letrec* also fixes the order: the alias is
         ;; initialised right after the lambda exists and long before any call.
-        (if qname
-          (str "(letrec* ((" qname " " lambda ") (" m " " qname ")) " m ")")
-          (str "(letrec ((" m " " lambda ")) " m ")")))
-      lambda)))
+        ;; the letrec BODY is where a variadic fn registers, so the binding still
+        ;; holds the bare lambda and Chez keeps the frame name.
+        (let [ret (if reg-here? (str "(jolt-register-variadic! " variadic-fixed " " m ")") m)]
+          (if qname
+            (str "(letrec* ((" qname " " lambda ") (" m " " qname ")) " ret ")")
+            (str "(letrec ((" m " " lambda ")) " ret ")"))))
+      (if anon-label
+        (str "(let ((" anon-label " " lambda ")) "
+             "(jolt-register-variadic! " variadic-fixed " " anon-label "))")
+        lambda))))
 
 ;; If fnode is a clojure.core (or host) ref to a native-op primitive, return the
 ;; Scheme op string — only at an arity where the Scheme op and the jolt fn agree.
@@ -1352,14 +1391,25 @@
         ;; register before emitting the init so a self-referential body direct-links.
         _ (when dl? (swap! (:direct-link-defined (cur)) conj (dl-fqn ns nm))
                     (when fn? (swap! (:direct-link-fns (cur)) conj (dl-fqn ns nm))))
-        init (emit-with-cells #(emit (:init node)))]
+        ;; An anonymous variadic fn under a direct-link define is the one shape whose
+        ;; frame name comes from the define itself, so it must stay a bare lambda in
+        ;; that position: emit-fn skips its registration and we emit it here against
+        ;; b. Everywhere else emit-fn registers through its own binding.
+        anon-variadic (when (and dl? fn? (not (:name (:init node))))
+                        (some (fn [a] (when (:rest a) (count (:params a))))
+                              (:arities (:init node))))
+        vreg (when anon-variadic
+               (str " (jolt-register-variadic! " anon-variadic " " b ")"))
+        init (binding [*variadic-reg-suppressed?* (boolean anon-variadic)]
+               (emit-with-cells #(emit (:init node))))]
     (cond
       dl?
       (if (jmeta-nonempty? (:meta node))
         (str "(begin (define " b " " init ") (def-var-with-meta! "
-             (chez-str-lit ns) " " (chez-str-lit nm) " " b " " (emit-def-meta node) ")" (or reg "") ")")
+             (chez-str-lit ns) " " (chez-str-lit nm) " " b " " (emit-def-meta node) ")"
+             (or reg "") (or vreg "") ")")
         (str "(begin (define " b " " init ") (def-var! "
-             (chez-str-lit ns) " " (chez-str-lit nm) " " b ")" (or reg "") ")"))
+             (chez-str-lit ns) " " (chez-str-lit nm) " " b ")" (or reg "") (or vreg "") ")"))
       (jmeta-nonempty? (:meta node))
       (str "(def-var-with-meta! " (chez-str-lit ns) " " (chez-str-lit nm) " " init " " (emit-def-meta node) ")")
       :else

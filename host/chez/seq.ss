@@ -98,6 +98,39 @@
 ;; ============================================================================
 (define (list->cseq xs)               ; Scheme list -> realized cseq chain (jolt-nil if empty)
   (if (null? xs) jolt-nil (cseq-realized (car xs) (list->cseq (cdr xs)))))
+
+;; ---- variadic rest: passing a LAZY tail through a Chez rest parameter --------
+;; A Chez rest parameter must be a proper list, so `apply` would have to realize
+;; its trailing seqable to call a variadic fn — and an infinite tail then never
+;; terminates. The JVM does not realize: RestFn.applyTo hands the seq straight to
+;; the variadic arity. jolt gets the same behaviour by letting jolt-apply pass a
+;; ONE-element rest list holding a lazy-rest box, which the arity's rest binding
+;; (jolt-rest-seq, emitted by the back end) unwraps back into the seq.
+;;
+;; Only a jolt-EMITTED variadic arity binds its rest through jolt-rest-seq, so
+;; only those may be handed a box: the ~100 hand-written Scheme variadics in the
+;; runtime read their rest list directly and would see the box as a value. The
+;; back end registers each emitted variadic closure here as it is created, which
+;; is what makes the box safe — and gives a runtime variadic that IS lazy in its
+;; rest (jolt-concat) one general way to opt in instead of a special case in
+;; jolt-apply.
+;;
+;; The registered value is V, the variadic arity's fixed-parameter count. It is
+;; recorded rather than derived from procedure-arity-mask because the mask cannot
+;; recover it: (fn ([a] …) ([a b & r] …)) accepts {1,2,3,…}, from which V reads as
+;; 1, while the variadic arity's real fixed count is 2 — and calling it with one
+;; real argument plus a box would bind b to the box and r to nil.
+(define-record-type lazy-rest (fields seq) (nongenerative jolt-lazy-rest-v1))
+(define variadic-fixed-arity-tbl (make-weak-eq-hashtable))
+(define (jolt-register-variadic! v proc)
+  (hashtable-set! variadic-fixed-arity-tbl proc v)
+  proc)
+;; The rest binding emitted for every variadic arity. A boxed rest is the seq
+;; itself; anything else is the ordinary Chez rest list.
+(define (jolt-rest-seq xs)
+  (if (and (pair? xs) (null? (cdr xs)) (lazy-rest? (car xs)))
+      (lazy-rest-seq (car xs))
+      (list->cseq xs)))
 (define (vec->seq v i)                 ; chunked index seq over a persistent vector
   (if (fx>=? i (pvec-count v)) jolt-nil
       (cseq-vec (pvec-nth-d v i jolt-nil) (lambda () (vec->seq v (fx+ i 1))) v i)))
@@ -1050,15 +1083,51 @@
                                  (outer (jolt-seq (seq-more s)))   ; boundary
                                  (inner nx))))))))))
 
-;; (apply f a b ... coll): spread the trailing seqable into the call. concat is
-;; special-cased: it produces a LAZY result, so spreading an infinite tail through
-;; a Scheme variadic (which must realize it) would hang — route to lazy-concat-seq,
-;; prepending any fixed leading colls.
+;; (apply f a b ... coll): spread the trailing seqable into the call.
+;;
+;; A registered variadic callee (see jolt-register-variadic!) takes its rest as a
+;; seq, so the tail is NOT realized: peel exactly V+1 elements off fixed++tail and
+;; call with the first V plus a lazy-rest box holding the remainder. That is the
+;; JVM's RestFn.applyTo, and it makes (apply f (range)) over a variadic f return
+;; instead of allocating until the process dies.
+;;
+;; V+1, not V, because Clojure ACCEPTS a fixed arity equal to the variadic
+;; threshold and the fixed arity wins there:
+;;   (apply (fn ([a b] :fixed2) ([a b & r] :var2)) [1 2])  =>  :fixed2
+;; Calling with V args plus a box would be V+1 args and would wrongly select the
+;; variadic arity. At V+1 real elements the variadic arity is unambiguous, because
+;; a fixed arity with MORE params than the variadic one is a compile error.
+;; Fewer than V+1 available means the call is one of the small fixed arities:
+;; fall through to the eager path, which is finite and settles arity selection
+;; and any ArityException exactly as before.
+;;
+;; jolt-concat keeps its own arm rather than registering: it is lazy in its rest
+;; but hand-written, and lazy-concat-seq is a better lowering than a boxed rest
+;; would be (it walks the colls lazily as well as the tail).
+;;
+;; Peel exactly n elements off a seq: (peeled-list . rest-seq), or #f if the seq
+;; is shorter than n. Only n elements are ever forced.
+(define (jolt-peel n s)
+  (let loop ((i 0) (s (jolt-seq s)) (acc '()))
+    (cond ((fx=? i n) (cons (reverse acc) s))
+          ((jolt-nil? s) #f)
+          (else (loop (fx+ i 1) (jolt-seq (seq-more s)) (cons (seq-first s) acc))))))
 (define (jolt-apply f . args)
-  (let* ((r (reverse args)) (tail (car r)) (fixed (reverse (cdr r))))
-    (if (eq? f jolt-concat)
-        (lazy-concat-seq (fold-right jolt-cons (jolt-seq tail) fixed))
-        (apply jolt-invoke f (append fixed (seq->list (jolt-seq tail)))))))
+  (let* ((r (reverse args)) (tail (car r)) (fixed (reverse (cdr r)))
+         (v (and (procedure? f) (hashtable-ref variadic-fixed-arity-tbl f #f))))
+    (cond
+      ((eq? f jolt-concat)
+       (lazy-concat-seq (fold-right jolt-cons (jolt-seq tail) fixed)))
+      ;; registered variadic: peel V+1 off fixed++tail, pass V + a boxed rest
+      ((and v (jolt-peel (fx+ v 1) (fold-right cseq-realized (jolt-seq tail) fixed)))
+       => (lambda (peeled)
+            (let ((head (list-head (car peeled) v))
+                  (spill (list-tail (car peeled) v)))   ; exactly one element
+              (apply jolt-invoke f
+                     (append head
+                             (list (make-lazy-rest
+                                    (fold-right cseq-realized (cdr peeled) spill))))))))
+      (else (apply jolt-invoke f (append fixed (seq->list (jolt-seq tail))))))))
 
 ;; ============================================================================
 ;; numeric predicates / identity — usable in fn AND value position (map/filter).
