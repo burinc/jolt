@@ -111,17 +111,36 @@
         (jolt-atom-val-set! compiler-line-cell (if (jolt-nil? line) 0 line))
         (jolt-atom-val-set! compiler-column-cell (if (jolt-nil? col) 0 col))))))
 
-;; "file:line:col" / "line:col" for the current form, or #f when none is set.
+;; Record that we are working on `path`, for a phase that walks a file WITHOUT
+;; evaluating its forms — `jolt build`'s require scan, its whole-program inference
+;; walk, its emit walk. Those never reach jolt-enter-form!, so an error in one used
+;; to be reported with no location at all: just "Unhandled exception" over a trace
+;; of runtime procedure names, with nothing saying which file was being read.
+;;
+;; A bare set, not a parameterize, because the reporter runs from the CLI's guard —
+;; OUTSIDE every dynamic binding the failing phase had established. A parameterized
+;; value is long gone by then; only a sticky one survives the unwind, which is the
+;; same reason jolt-enter-form! sets rather than binds and load-jolt-file* restores
+;; on normal return only. Clears any leftover line/column: they belong to whatever
+;; was last evaluated, in some other file entirely.
+(define (jolt-enter-file! path)
+  (when (string? path)
+    (jolt-current-source (jolt-hash-map hc-kw-file path))))
+
+;; "file:line:col" for a form position, bare "file" for a file-only one (above), or
+;; #f when nothing is set.
 (define (jolt-current-source-string)
   (let ((p (jolt-current-source)))
     (and (pmap? p)
          (let ((line (jolt-get p hc-kw-line jolt-nil))
                (col  (jolt-get p hc-kw-column jolt-nil))
                (file (jolt-get p hc-kw-file jolt-nil)))
-           (string-append
-             (if (jolt-nil? file) "" (string-append file ":"))
-             (if (jolt-nil? line) "?" (number->string line)) ":"
-             (if (jolt-nil? col) "?" (number->string col)))))))
+           (if (jolt-nil? line)
+               (and (string? file) file)
+               (string-append
+                 (if (jolt-nil? file) "" (string-append file ":"))
+                 (number->string line) ":"
+                 (if (jolt-nil? col) "?" (number->string col))))))))
 
 ;; The spine ALWAYS runs with the full clojure.core prelude loaded, so a clojure.*
 ;; ref must lower to var-deref (resolved from the prelude), not trip the emitter's

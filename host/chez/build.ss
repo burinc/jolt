@@ -357,6 +357,7 @@
             jolt-ns-load-vars-push!
             (lambda ()
           (parameterize ((rdr-source-file (cdr nf)))
+            (jolt-enter-file! (cdr nf))   ; so a failure here names the file
             (for-each
               (lambda (f)
                 (ce-scan-requires! f (car nf))
@@ -678,7 +679,13 @@
       ;; scan mode: this read happens BEFORE any namespace is loaded, so
       ;; alias-resolved auto keywords (::alias/kw) can't resolve yet — read
       ;; them leniently; only require clauses are extracted from these forms.
-      (parameterize ((rdr-scan-mode #t))
+      ;; rdr-source-file scopes the file the way the inference and emit walks below
+      ;; already do, so a reader error carries it in the message; jolt-enter-file!
+      ;; records it for the uncaught reporter, which runs after every dynamic
+      ;; binding here has unwound. This walk evaluates nothing, so the two of them
+      ;; are the only record of which file a failure came from.
+      (parameterize ((rdr-scan-mode #t) (rdr-source-file file))
+        (jolt-enter-file! file)
         (map rdr-form->data (ei-read-all src))))
     (reverse reqs)))
 
@@ -864,6 +871,7 @@
                                ;; ns + register aliases before this ns's forms; dce
                                ;; keeps original order.
                                (let ((src (ldr-read-source (cdr nf))))
+                                 (jolt-enter-file! (cdr nf))   ; name the file on a failure
                                  (parameterize ((rdr-source-file (cdr nf)))
                                    ;; RT.load-parity bracket (dyn-binding.ss): the
                                    ;; ns's replayed forms run under fresh
@@ -880,6 +888,7 @@
                             (apply append
                               (map (lambda (nf)
                                      (let ((src (ldr-read-source (cdr nf))))
+                                       (jolt-enter-file! (cdr nf))   ; name the file on a failure
                                        (parameterize ((rdr-source-file (cdr nf)))
                                          ;; RT.load-parity bracket, matching the
                                          ;; tree-shake path above.

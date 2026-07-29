@@ -542,4 +542,32 @@ if [ "$jolt" != "bin/jolt" ]; then
   fi
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver)"
+# A build failure names the file it was reading.
+#
+# The build has three walks that process a file WITHOUT evaluating its forms —
+# the require scan, the whole-program inference walk, the emit walk — and none of
+# them reaches jolt-enter-form!, which is what records a location. So a failure in
+# one printed "Unhandled exception: …" over a trace of runtime procedure names
+# (rdr-form->data, bld-ns-requires, dfs) and nothing about which source file was
+# being read. They record the file with jolt-enter-file! now, which is a bare set
+# rather than a parameterize because the reporter runs from the CLI's guard, after
+# every dynamic binding the failing walk held has already unwound.
+#
+# The trigger is a duplicate set literal, which reaches the scan because jolt's
+# LOAD path accepts it (the analyzer lowers a set form without a duplicate check)
+# while the data path rejects it. If that inconsistency is ever tightened this
+# fixture stops failing and needs a different scan-phase fault.
+echo "build smoke: build failure names the source file"
+scan_err="$(JOLT_PWD="$root/test/chez/scan-error-app" "$joltabs" build -m app.core \
+             -o "$(dirname "$out")/scan-bin" 2>&1 || true)"
+case "$scan_err" in
+  *"Duplicate key"*) : ;;
+  *) echo "  FAIL: scan-error-app built or failed differently — got \`$scan_err\`"; exit 1 ;;
+esac
+if ! printf '%s' "$scan_err" | grep -q '^  at .*app/dup\.clj'; then
+  echo "  FAIL: build failure did not name src/app/dup.clj"
+  echo "--- got ---"; echo "$scan_err"
+  exit 1
+fi
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + scan-error-location)"

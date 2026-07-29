@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `jolt build` failure reported no location.** The build has three walks that
+  process a source file without evaluating its forms — the require scan, the
+  whole-program inference walk, the emit walk — and none reaches
+  `jolt-enter-form!`, which is what records where we are. So a failure in any of
+  them printed `Unhandled exception: …` over a trace of runtime procedure names
+  (`rdr-form->data`, `bld-ns-requires`, `dfs`) and said nothing about which file it
+  was reading. They record it with `jolt-enter-file!` now.
+
+  That is a bare set rather than a `parameterize` on purpose: the uncaught reporter
+  runs from the CLI's guard, outside every dynamic binding the failing walk held,
+  so a parameterized value has already unwound by the time it is read. It is the
+  same reason `jolt-enter-form!` sets rather than binds, and why `load-jolt-file*`
+  restores on normal return only. Entering a file also clears any leftover
+  line/column, which belonged to whatever was last evaluated somewhere else — a
+  build error pointing into `jolt/main.clj` would be worse than one pointing
+  nowhere.
+
+  The frame names themselves are unchanged. Only a direct-link or AOT build
+  registers procedure sources, so on the open-world path a frame maps to a bare
+  name; that is the documented trade-off in `source-registry.ss`, and the location
+  line is what carries the actionable part.
+
 ## [0.5.11] - 2026-07-29
 
 A warm AOT cache no longer replays a second copy of the stdlib namespaces a
