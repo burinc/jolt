@@ -171,6 +171,15 @@
               (jolt-hash-map hc-kw-line line hc-kw-column col hc-kw-file file)))
         jolt-nil)))
 
+;; Just the :line of a form's reader metadata, or nil — the non-allocating half of
+;; hc-form-position, which builds a fresh position map every call. analyze-list
+;; asks this of EVERY list form (to decide whether the form can name a location
+;; while it descends), so it must not allocate; hc-form-position is then called
+;; once, on the error path.
+(define (hc-form-line x)
+  (let ((m (jolt-meta x)))
+    (if (pmap? m) (jolt-get m hc-kw-line) jolt-nil)))
+
 ;; --- special forms ----------------------------------------------------------
 ;; Mirrors host_iface special-names + interop-head? — forms the analyzer marks
 ;; uncompilable (the handled specials are dispatched in analyze-list BEFORE this).
@@ -587,6 +596,7 @@
   (def-var! "jolt.host" "form-inst-source" hc-inst-source)
   (def-var! "jolt.host" "form-uuid-source" hc-uuid-source)
   (def-var! "jolt.host" "form-position" hc-form-position)
+  (def-var! "jolt.host" "form-line" hc-form-line)
   ;; a number literal in CHEZ syntax for the backend's emitted source — jolt's
   ;; own str follows the reference printer (bigint N suffix, E exponents),
   ;; which Chez's reader rejects

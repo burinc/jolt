@@ -50,14 +50,44 @@
          (pos (jolt-current-source))
          (m (jolt-assoc base diag-kw-message msg)))
     (if (pmap? pos)
+        ;; The loader's per-top-level-form position FILLS IN only what the
+        ;; diagnostic did not already carry. An analyzer diagnostic knows the
+        ;; innermost enclosing form it failed in, which is more precise; letting
+        ;; the coarser position overwrite it is what reported a defn's opening
+        ;; line for a symbol hundreds of lines inside it.
         (let ((line (jolt-get pos diag-kw-line jolt-nil))
               (col (jolt-get pos diag-kw-column jolt-nil))
               (file (jolt-get pos diag-kw-file jolt-nil)))
-          (let* ((m (if (jolt-nil? line) m (jolt-assoc m diag-kw-line line)))
-                 (m (if (jolt-nil? col) m (jolt-assoc m diag-kw-column col)))
-                 (m (if (jolt-nil? file) m (jolt-assoc m diag-kw-file file))))
+          (let* ((m (if (or (jolt-nil? line) (not (jolt-nil? (jolt-get m diag-kw-line jolt-nil))))
+                        m (jolt-assoc m diag-kw-line line)))
+                 (m (if (or (jolt-nil? col) (not (jolt-nil? (jolt-get m diag-kw-column jolt-nil))))
+                        m (jolt-assoc m diag-kw-column col)))
+                 (m (if (or (jolt-nil? file) (not (jolt-nil? (jolt-get m diag-kw-file jolt-nil))))
+                        m (jolt-assoc m diag-kw-file file))))
             m))
         m)))
+
+;; The ":jolt/error" map an analyzer diagnostic carries, or #f. Its presence marks
+;; a COMPILE-time diagnostic: raised while analyzing a form, so the live Chez stack
+;; is the analyzer recursing into it, never the user's program.
+(define (jolt-analyzer-diagnostic v)
+  (let* ((data (and (jolt-ex-info-record? v) (jolt-ex-info-record-data v)))
+         (err (and data (pmap? data) (jolt-get data diag-kw-jolt-error jolt-nil))))
+    (and (pmap? err) err)))
+
+;; "file:line:col" for a diagnostic that carries its own position, else #f — so the
+;; report can name the offending expression rather than the enclosing top-level
+;; form. Same shape jolt-current-source-string renders, so the two are
+;; indistinguishable in the report.
+(define (jolt-diagnostic-location-string err)
+  (let ((line (jolt-get err diag-kw-line jolt-nil))
+        (col (jolt-get err diag-kw-column jolt-nil))
+        (file (jolt-get err diag-kw-file jolt-nil)))
+    (and (not (jolt-nil? line))
+         (string-append
+           (if (jolt-nil? file) "" (string-append (jolt-str-render-one file) ":"))
+           (number->string (jnum->exact line)) ":"
+           (if (jolt-nil? col) "?" (number->string (jnum->exact col)))))))
 
 ;; Render an uncaught jolt throw (any value, not just a Chez condition) to stderr
 ;; and exit non-zero, instead of Chez's opaque "non-condition value" dump. The
@@ -71,13 +101,22 @@
         ;; jolt-pr-readable, not jolt-pr-str: strings must be quoted so the line
         ;; is valid EDN a tool can read back.
         (begin (display (jolt-pr-readable (jolt-diagnostic-map v)) port) (newline port))
-        (begin
+        (let ((diag (jolt-analyzer-diagnostic v)))
           (jolt-render-throwable v port)
-          ;; The top-level form that was evaluating when this propagated (file:line:col).
-          (let ((loc (jolt-current-source-string)))
+          ;; Where it failed: the diagnostic's own position when it has one (the
+          ;; innermost form the analyzer was in), else the top-level form that was
+          ;; evaluating when this propagated.
+          (let ((loc (or (and diag (jolt-diagnostic-location-string diag))
+                         (jolt-current-source-string))))
             (when loc (display "  at " port) (display loc port) (newline port)))
-          (let ((bt (jolt-backtrace-string v)))
-            (when bt (display "  trace:\n" port) (display bt port)))))
+          ;; No trace for a compile-time diagnostic. It is raised while ANALYZING,
+          ;; so the frames are jolt's own analyzer recursing into the form
+          ;; (analyze-list, analyze-seq, map-seq, …) — thirty lines of internals
+          ;; that bury the message and the location, and name nothing the reader
+          ;; can act on. A runtime error's trace is unchanged.
+          (unless diag
+            (let ((bt (jolt-backtrace-string v)))
+              (when bt (display "  trace:\n" port) (display bt port))))))
     (exit 1)))
 
 ;; POSIX end-of-options: drop the first standalone "--" in an argv list; any

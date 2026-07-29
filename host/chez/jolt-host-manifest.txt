@@ -46,6 +46,7 @@ form-inst-value-source
 form-inst-value?
 form-inst?
 form-keyword?
+form-line
 form-list?
 form-literal?
 form-macro?

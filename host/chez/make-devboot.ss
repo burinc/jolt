@@ -57,17 +57,26 @@
   ;; build.ss inlined (for `jolt build` from the cache).
   (put-string out "\n;; === embedded build driver ===\n")
   (bld-inline-line "(load \"host/chez/build.ss\")" out 0)
-  ;; emit-image.ss (inlined by build.ss above) turns per-site var-cell caching OFF
-  ;; at load time, because the seed mint and `jolt build` must emit byte-identical
-  ;; output. Here that runs AFTER compile-eval.ss turned it on for runtime eval, so
-  ;; the setting baked into the image is the build one and every namespace compiled
-  ;; at runtime resolves each var by name on every access — around half speed on
-  ;; var-reference-heavy code. The built jolt escapes this by loading the build
-  ;; subsystem lazily; this image loads it eagerly, so restore the runtime setting
-  ;; after it. A later `jolt build` from the cache sets it back off for itself.
+  ;; emit-image.ss (inlined by build.ss above) turns per-site var-cell caching AND
+  ;; source-map registration OFF at load time, because the seed mint and `jolt
+  ;; build` must emit byte-identical output that carries no absolute paths. Here
+  ;; that runs AFTER compile-eval.ss turned both on for runtime eval, so the
+  ;; settings baked into the image are the build ones. The built jolt escapes this
+  ;; by loading the build subsystem lazily; this image loads it eagerly, so restore
+  ;; both. A later `jolt build` from the cache sets them back off for itself.
+  ;;
+  ;; var-cache: every namespace compiled at runtime resolves each var by name on
+  ;; every access — around half speed on var-reference-heavy code.
+  ;; source-reg: no def records its source, so an uncaught error's frames print as
+  ;; bare names instead of "ns/name (file:line)". That is the documented trade-off
+  ;; for an open-world BUILD, not for `jolt run`, and it made the dev CLI's traces
+  ;; strictly worse than the released binary's — the source-mapped-trace smoke
+  ;; checks pass in source mode and failed only against a fresh cache.
   (put-string out "\n;; === restore runtime compile settings after the build driver ===\n")
   (put-string out "(let ((scv (var-deref \"jolt.backend-scheme\" \"set-var-cache!\")))\n")
   (put-string out "  (when (procedure? scv) (scv #t)))\n")
+  (put-string out "(let ((ssr (var-deref \"jolt.backend-scheme\" \"set-source-reg!\")))\n")
+  (put-string out "  (when (procedure? ssr) (ssr #t)))\n")
   ;; Runtime source embeds (bytevector values, 1B/char).
   (put-string out "\n;; === embedded runtime source ===\n")
   (for-each (lambda (path)

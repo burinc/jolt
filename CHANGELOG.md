@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A compile-time error pointed at the top of the enclosing form, not at the
+  expression that failed.** The only position available to the reporter was the one
+  the loader records per TOP-LEVEL form, so an unresolved symbol partway into a
+  long `defn` was reported at the `defn`'s opening line — 280 lines above the
+  offending name in the case that prompted this. The analyzer now tracks the
+  innermost enclosing form that carries reader metadata and attaches its
+  `:line`/`:column`/`:file` to the diagnostic, which the human report and the
+  `JOLT_DIAG=edn` map both prefer over the coarser one. The reference compiler
+  reports the same position for the same file, down to the column.
+
+  The form is tracked, not its position map, because building the map allocates and
+  this runs for every list form the analyzer walks; the map is built once, on the
+  error path. `analyze-list` saves and restores the cell around its children, so a
+  finished sibling subtree cannot leave a deeper position behind for a later
+  sibling's diagnostic — the same thing `Compiler.analyzeSeq` does by pushing
+  thread bindings of `LINE`/`COLUMN`, for the same reason. A release build of
+  `examples/ring-app` takes the same 43s it did before.
+
+- **A compile-time error printed the analyzer's own call stack as its "trace".**
+  Around thirty frames of `analyze-list` / `analyze-seq` / `map-seq` / `seq->list`,
+  which are jolt compiling the form rather than anything from the program, and they
+  pushed the message and the location off the top of the report. Such an error is
+  raised while ANALYZING, so there is no user call stack to show, and on the
+  open-world path a user frame would carry no location anyway. A diagnostic
+  carrying `:jolt/error` now reports message and location only. A runtime error's
+  trace is unchanged.
+
+- **`make devboot`'s cache turned source-map registration off**, so the dev CLI's
+  traces printed bare procedure names where the released binary prints
+  `ns/name (file:line)`. `emit-image.ss` disables both var-cell caching and source
+  registration at load time — a build must emit byte-identical output carrying no
+  absolute paths — and the image loads the build subsystem eagerly, so it baked the
+  build settings. The var-cache half of this was fixed in 0.5.11; source
+  registration was missed. Both are restored now. The symptom was that the
+  source-mapped-trace smoke checks passed in script mode and failed only against a
+  fresh cache.
+
 ## [0.5.12] - 2026-07-29
 
 Stack traces from a build, and from a binary built without direct-linking, now

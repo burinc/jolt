@@ -35,6 +35,19 @@ check_loc() {
   fi
 }
 
+# The complement of check_loc: stderr must NOT contain $2. For diagnostics whose
+# value is in what they leave out.
+check_no() {
+  err="$($jolt -e "$1" 2>&1 >/dev/null)"
+  if printf '%s' "$err" | grep -q "$2"; then
+    echo "  FAIL (no): $1"
+    echo "    want stderr NOT to contain \`$2\`, got \`$err\`"
+    fails=$((fails + 1))
+  else
+    pass=$((pass + 1))
+  fi
+}
+
 # An uncaught error's stack trace must name the runtime-eval'd fn frames that
 # survive TCO (the non-tail spine), even though the eval path registers no source
 # map — "print what is available". Asserts a substring appears under "  trace:".
@@ -123,6 +136,32 @@ check_loc '(prinltn 1)' 'did you mean'
 check_loc '(prinltn 1)' 'println'
 # A symbol with no close match gets the bare message, no spurious suggestion.
 check_loc '(zzzptqx 1)' 'Unable to resolve symbol: zzzptqx'
+
+# A compile-time diagnostic names the line of the OFFENDING EXPRESSION, not of the
+# enclosing top-level form. `bogusxyz` is on line 3; the defn opens on line 1, and
+# reporting 1:1 for it is useless in a long fn (a real case pointed 280 lines up).
+nested_unresolved='(defn nestedf []
+  (let [a 1]
+    (bogusxyz a)))'
+check_loc "$nested_unresolved" '  at 3:'
+# The position must reach the machine-readable diagnostic too, not just the text.
+diag_nested="$(JOLT_DIAG=edn $jolt -e "$nested_unresolved" 2>&1 >/dev/null)"
+if printf '%s' "$diag_nested" | grep -q ':line 3'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: JOLT_DIAG=edn carries the nested line"
+  echo "    got \`$diag_nested\`"
+  fails=$((fails + 1))
+fi
+
+# ...and it does not dump the analyzer's own recursion as a "stack trace". Those
+# frames are jolt compiling the form, never the user's program: the error is raised
+# while ANALYZING, so there is no user call stack to show.
+check_no "$nested_unresolved" '  trace:'
+check_no "$nested_unresolved" 'analyze-list'
+check_no '(prinltn 1)' '  trace:'
+# A RUNTIME error still keeps its trace — only compile-time diagnostics drop it.
+check_trace '(do (defn keepstrace [x] (inc (/ x 0))) (keepstrace 1))' 'keepstrace'
 
 # JOLT_DIAG=edn emits one machine-readable EDN diagnostic line (valid EDN with
 # quoted strings) carrying the structured :type/:suggestions plus source position.

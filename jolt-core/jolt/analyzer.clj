@@ -33,7 +33,7 @@
                                unchecked-math? allow-unresolved-vars?
                                form-macro? form-expand-1 resolve-global resolvable-names
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
-                               record-type? record-ctor-key deftype-ctor-class form-position late-bind?
+                               record-type? record-ctor-key deftype-ctor-class form-position form-line late-bind?
                                resolve-class-hint host-class-name? jolt-class-for]]))
 
 (declare analyze)
@@ -54,6 +54,31 @@
   (let [n @gensym-counter]
     (swap! gensym-counter inc)
     (str "_r$" prefix n)))
+
+;; The innermost list form currently being analyzed that carries reader position
+;; metadata — what a diagnostic raised anywhere below it should name. Without it
+;; the only position available to the reporter is the one the LOADER records per
+;; TOP-LEVEL form, so an unresolved symbol 280 lines inside a defn reported the
+;; defn's own first line.
+;;
+;; The form is stored, not its position map: hc-form-position allocates, and this
+;; is written for every positioned list form the analyzer walks, whereas the map is
+;; wanted only if something actually throws. analyze-list saves and restores it
+;; around its children so a completed sibling subtree cannot leave a deeper
+;; position behind; the reference compiler does the same thing by pushing thread
+;; bindings of LINE/COLUMN in analyzeSeq, which is strictly more expensive.
+;;
+;; Only forms that HAVE a line are recorded, so descending through a macro-built
+;; form (which carries none) keeps the nearest enclosing real position rather than
+;; erasing it.
+(def ^:private innermost-positioned-form (atom nil))
+
+;; The position a diagnostic should carry: the innermost positioned form's, or nil
+;; when nothing under analysis had reader metadata (a macro-built form, or a form
+;; handed straight to eval).
+(defn current-form-position []
+  (let [f @innermost-positioned-form]
+    (when (some? f) (form-position f))))
 
 (defn- empty-env [] {:locals #{} :hints {}})
 (defn- local? [env nm] (contains? (:locals env) nm))
@@ -784,16 +809,22 @@
 ;; keeps the JVM wording (with any suggestions appended); the ex-data carries a
 ;; machine-readable :jolt/error map the CLI reporter emits as EDN under
 ;; JOLT_DIAG=edn, so editors/tools get the symbol, suggestions, and ns as data.
+;; :line/:column/:file come from the innermost enclosing positioned form, so the
+;; report names where the unknown name is WRITTEN. The reporter otherwise falls
+;; back to the loader's per-top-level-form position, which in a long defn is its
+;; opening line and says nothing about the offending expression.
 (defn- resolve-error [ctx nm env]
   (let [sugg (suggestions-for nm (candidate-pool ctx env))
         base (str "Unable to resolve symbol: " nm " in this context")
         msg (if (seq sugg)
               (str base " (did you mean " (apply str (interpose ", " sugg)) "?)")
-              base)]
-    (throw (ex-info msg {:jolt/error {:type :unresolved-symbol
-                                      :symbol nm
-                                      :suggestions (vec sugg)
-                                      :ns (compile-ns ctx)}}))))
+              base)
+        err {:type :unresolved-symbol
+             :symbol nm
+             :suggestions (vec sugg)
+             :ns (compile-ns ctx)}
+        pos (current-form-position)]
+    (throw (ex-info msg {:jolt/error (if pos (merge err pos) err)}))))
 
 (defn- analyze-symbol [ctx form env]
   (let [nm (form-sym-name form) ns (form-sym-ns form)]
@@ -873,7 +904,7 @@
           (= hname "int")    {:kind :long   :cast-fn "jolt-int-cast"}
           (= hname "float")  {:kind :double :cast-fn "jolt-float"})))
 
-(defn- analyze-list [ctx form env]
+(defn- analyze-list* [ctx form env]
   (let [items (vec (form-elements form))]
     (if (zero? (count items))
       (quote-node form)
@@ -986,6 +1017,20 @@
                             (mapv #(analyze ctx % env) (rest items)))
                   p (form-position form)]
               (if p (assoc n :pos p) n)))))))
+
+;; Record `form` as the innermost positioned form while its children are analyzed,
+;; then put back whatever was there, so a completed sibling subtree cannot leave a
+;; deeper position behind for a later sibling's diagnostic. Restoring only on the
+;; normal return is deliberate: an escaping throw is on its way to the reporter,
+;; which wants the position of the form that failed.
+(defn- analyze-list [ctx form env]
+  (if (some? (form-line form))
+    (let [prev @innermost-positioned-form]
+      (reset! innermost-positioned-form form)
+      (let [node (analyze-list* ctx form env)]
+        (reset! innermost-positioned-form prev)
+        node))
+    (analyze-list* ctx form env)))
 
 ;; A vector/map/set literal carrying reader metadata (^:foo {…}, ^{:tag :int} [1])
 ;; keeps it as a runtime value: wrap the collection node in (with-meta coll meta).
