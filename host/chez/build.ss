@@ -422,7 +422,11 @@
             (let ((k (car xs)) (v (cadr xs)))
               (when (keyword? k)
                 (cond
-                  ((and (string=? (keyword-t-name k) "as") (symbol-t? v))
+                  ;; :as-alias registers the alias exactly like :as; what it does
+                  ;; NOT do is pull the target into the build (bld-ns-requires).
+                  ((and (or (string=? (keyword-t-name k) "as")
+                            (string=? (keyword-t-name k) "as-alias"))
+                        (symbol-t? v))
                    (emit! (string-append "(chez-register-alias! " (ei-str-lit ns-name)
                                          " " (ei-str-lit (symbol-t-name v))
                                          " " (ei-str-lit target) ")")))
@@ -636,6 +640,18 @@
 ;; subforms (the quoted-data bug ce-scan-requires! has). Specs are parsed through
 ;; the shared expand-spec + parse-libspec (loader.ss / ns.ss), matching the
 ;; loader's semantics exactly.
+;; A libspec that only establishes an alias pulls nothing into the build. At
+;; runtime `require` interns the namespace without loading it (loader.ss
+;; ldr-load+register), so counting it as a dependency would emit the target into
+;; the binary and run its top level — the opposite of what :as-alias asks for. The
+;; alias itself is still replayed, by bld-scan-spec!. Mirrors clojure.core's
+;; load-lib, which picks its loader with `need-ns (or as use)`.
+(define (bld-spec-alias-only? parsed use?)
+  (let ((opt-names (map car (cdr parsed))))
+    (and (member "as-alias" opt-names)
+         (not (member "as" opt-names))
+         (not use?))))
+
 (define (bld-ns-requires file)
   (let ((src (ldr-read-source file)) (reqs '()))
     (for-each
@@ -659,7 +675,10 @@
                              (for-each
                                (lambda (s)
                                  (let ((parsed (parse-libspec s)))
-                                   (when parsed
+                                   (when (and parsed
+                                              (not (bld-spec-alias-only?
+                                                     parsed
+                                                     (string=? (keyword-t-name (car cl)) "use"))))
                                      (set! reqs (cons (car parsed) reqs)))))
                                (expand-spec spec)))
                            (cdr cl))))))
@@ -672,7 +691,8 @@
                      (for-each
                        (lambda (s)
                          (let ((parsed (parse-libspec s)))
-                           (when parsed
+                           (when (and parsed
+                                      (not (bld-spec-alias-only? parsed (string=? hn "use"))))
                              (set! reqs (cons (car parsed) reqs)))))
                        (expand-spec unquoted))))
                   (cdr items)))))))
