@@ -171,6 +171,12 @@
 (register-class-statics! "RT" (list (cons "map" rt-map)))
 (register-class-statics! "clojure.lang.RT" (list (cons "map" rt-map)))
 
+;; clojure.lang.RT/iter: an Iterator over any seqable — the same jiterator
+;; (.iterator coll) dispatches to. orchard/inspect.analytics walks collections
+;; through it.
+(register-class-statics! "RT" (list (cons "iter" (lambda (coll) (make-jiterator (jolt-seq coll))))))
+(register-class-statics! "clojure.lang.RT" (list (cons "iter" (lambda (coll) (make-jiterator (jolt-seq coll))))))
+
 ;; clojure.lang.PersistentList/create: a list (in order) from a seq; empty -> ().
 ;; Build it the way clojure.core/list does — list->cseq alone yields plain seq
 ;; cells, and jolt marks the HEAD cell to record that a chain IS a list, so an
@@ -292,6 +298,9 @@
                           (if (number? x) (->num x)
                               (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "valueOf"))))
         (cons "parseInt" (lambda (x . r) (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "parseInt")))
+        ;; Integer.compare(int, int): -1/0/1 exactly, not an arbitrary sign value.
+        (cons "compare" (lambda (x y) (let ((a (jnum->exact x)) (b (jnum->exact y)))
+                                        (->num (cond ((< a b) -1) ((> a b) 1) (else 0))))))
         ;; lowercase, like the JVM; a negative int is the 32-bit unsigned form.
         (cons "toHexString" (lambda (x) (string-downcase (number->string (int->u32 (jnum->exact x)) 16))))
         (cons "toOctalString" (lambda (x) (number->string (int->u32 (jnum->exact x)) 8)))

@@ -273,7 +273,8 @@
           (cons "clojure.template" "stdlib/clojure/template.clj")
           (cons "clojure.edn" "stdlib/clojure/edn.clj")
           (cons "clojure.set" "stdlib/clojure/set.clj")
-          (cons "clojure.pprint" "stdlib/clojure/pprint.clj"))))
+          (cons "clojure.pprint" "stdlib/clojure/pprint.clj")
+          (cons "clojure.repl" "stdlib/clojure/repl.clj"))))
 
 ;; Join a list of form strings with "\n", no trailing newline.
 (define (ei-join forms)

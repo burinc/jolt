@@ -1054,6 +1054,13 @@
 ;; token; the ns's own interned var; a :refer'd name (SOURCE ns) — BEFORE the
 ;; implicit clojure.core, so an explicit :refer shadows core; then clojure.core
 ;; unless the name is :refer-clojure-excluded or ns-unmapped; else qualify to cns.
+(define (jsq-class-symbol cell)
+  ;; A var holding a Class object is jolt's model of an import — syntax-quote
+  ;; renders it as the class's FQN (ns=nil), like the JVM.
+  (and (var-cell? cell)
+       (let ((v (var-cell-root cell)))
+         (and (jclass? v) (jolt-symbol #f (vector-ref (jhost-state v) 0))))))
+
 (define (jsq-resolve-symbol cns sym gsmap gensym-fn)
   (let ((sns (symbol-t-ns sym)) (nm (symbol-t-name sym)))
     (if (or (jolt-nil? sns) (null? sns) (not sns))
@@ -1066,13 +1073,16 @@
           ((member nm jsq-specials) sym)
           ((hc-interop-head? nm) sym)         ; interop (.method / Class. / .-field)
           ((hc-fq-class-name? nm) sym)        ; a fully-qualified class token
-          ((var-cell-lookup cns nm) (jolt-symbol cns nm))          ; the ns's own var
+          ((var-cell-lookup cns nm)                              ; the ns's own var
+           => (lambda (cell) (or (jsq-class-symbol cell) (jolt-symbol cns nm))))
           ((chez-resolve-refer cns nm)                             ; a :refer'd name
-           => (lambda (target) (jolt-symbol target nm)))
+           => (lambda (target)
+                (let ((cell (var-cell-lookup target nm)))
+                  (or (jsq-class-symbol cell) (jolt-symbol target nm)))))
           ((and (not (chez-core-excluded? cns nm))                 ; else clojure.core,
                 (not (eq? (hashtable-ref ns-refer-table (cons cns nm) #f) 'unmapped))
                 (var-cell-lookup "clojure.core" nm))               ; unless excluded/unmapped
-           (jolt-symbol "clojure.core" nm))
+           => (lambda (cell) (or (jsq-class-symbol cell) (jolt-symbol "clojure.core" nm))))
           (else (jolt-symbol cns nm)))                             ; else the ns itself
         ;; qualified: resolve an :as alias in cns to the target ns, else leave as
         ;; written (a real ns or an interop class token).

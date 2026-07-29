@@ -1260,8 +1260,10 @@
                     " " (emit (:val node)) ")")
     ;; a non-top-level defmacro -> def the expander fn + mark the var a macro at
     ;; runtime (the spine does the same for top-level forms).
-    :defmacro (str "(begin (def-var! " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) " "
-                   (emit (:fn node)) ") (mark-macro! " (chez-str-lit (:ns node)) " "
+    :defmacro (str "(begin (def-var-with-meta! " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) " "
+                   (emit (:fn node)) " "
+                   (if (:meta-expr node) (emit (:meta-expr node)) (emit-quoted (:meta node)))
+                   ") (mark-macro! " (chez-str-lit (:ns node)) " "
                    (chez-str-lit (:name node)) ") jolt-nil)")
     :host (throw (ex-info (str "emit: unsupported host ref `" (:name node) "`") {}))
     :host-static (str "(host-static-ref " (chez-str-lit (:class node)) " "

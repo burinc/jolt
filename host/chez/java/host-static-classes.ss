@@ -671,6 +671,9 @@
 (register-class-ctor! "java.math.BigInteger"
   (lambda (v . r) (parse-int-or-throw v (if (null? r) 10 (jnum->exact (car r))) "BigInteger")))
 (register-class-ctor! "MapEntry" (lambda (k v) (make-map-entry k v)))
+;; clojure.lang.MapEntry/create — the static factory clojure.walk and kin use
+;; when rebuilding map entries.
+(register-class-statics! "MapEntry" (list (cons "create" (lambda (k v) (make-map-entry k v)))))
 ;; JVM exception ctors -> a typed host throwable carrying the canonical :jolt/class
 ;; (so class / instance? / getMessage / ex-message reflect the real type) and the
 ;; message. Supports (E. msg), (E. msg cause), (E. cause), and (E.).
@@ -1020,6 +1023,21 @@
                     (list (cons p (lambda (x) (jt-jolt-strs->list (jolt-invoke tags-fn x))))))))
     jolt-nil))
 
+;; Collection behavior for library-modeled host values: a shim that registers a
+;; Java collection class (an LRU map, a queue, …) also needs the value to take
+;; part in Clojure's seq / lookup / empty / count / contains protocols — the
+;; same arms the built-in host models register Scheme-side. pred is (fn [x]),
+;; handlers (fn [x]) except get's, which is (fn [x k not-found]).
+(define (hsc-public-arm pred handler register!)
+  (let ((p (lambda (x) (jolt-truthy? (jolt-invoke pred x)))))
+    (register! p (lambda args (apply jolt-invoke handler args)))
+    jolt-nil))
+(def-var! "clojure.core" "__register-seq!" (lambda (pred handler) (hsc-public-arm pred handler register-seq-arm!)))
+(def-var! "clojure.core" "__register-get!" (lambda (pred handler) (hsc-public-arm pred handler register-get-arm!)))
+(def-var! "clojure.core" "__register-empty!" (lambda (pred handler) (hsc-public-arm pred handler register-empty-arm!)))
+(def-var! "clojure.core" "__register-count!" (lambda (pred handler) (hsc-public-arm pred handler register-count-arm!)))
+(def-var! "clojure.core" "__register-contains!" (lambda (pred handler) (hsc-public-arm pred handler register-contains-arm!)))
+
 ;; (instance? clojure.lang.IFoo x) for the core clojure.lang interfaces libraries
 ;; branch on — jolt's value model satisfies them, so report it. Matched by the
 ;; interface's last dotted segment, so "clojure.lang.IObj" and "IObj" both hit.
@@ -1046,7 +1064,8 @@
                    ;; (cseq, empty-list, procedure, sorted-map/set)
                    ((or (string=? iface "IObj") (string=? iface "IMeta")) (hsc-imeta? val))
                    ((or (string=? iface "IMapEntry") (string=? iface "MapEntry")) (jolt-map-entry? val))
-                   ((string=? iface "IRecord") (jrec? val))
+                   ;; IRecord applies only to defrecord, not bare deftype (JVM contract).
+                   ((string=? iface "IRecord") (jrec-record? val))
                    ;; IFn — maps/sets/vectors are callable in jolt beyond the JVM
                    ;; class hierarchy, so jch-tags doesn't cover them for these types.
                    ((string=? iface "IFn")
@@ -1112,6 +1131,24 @@
         (cons "toString" (lambda (self) (string-append "class " (jclass-name self))))
         (cons "isArray" (lambda (self) (let ((n (jclass-name self)))
                                          (and (fx>? (string-length n) 0) (char=? (string-ref n 0) #\[)))))
+        ;; Class.getComponentType: for an array class returns the element class;
+        ;; for a non-array returns nil. JVM: [Ljava.lang.Long; → java.lang.Long.
+        (cons "getComponentType" (lambda (self)
+                                   (let ((n (jclass-name self)))
+                                     (cond ((and (fx>? (string-length n) 2) (char=? (string-ref n 0) #\[)
+                                                 (char=? (string-ref n 1) #\L) (char=? (string-ref n (- (string-length n) 1)) #\;))
+                                            (jolt-class-for (substring n 2 (- (string-length n) 1))))
+                                           ((and (fx>? (string-length n) 1) (char=? (string-ref n 0) #\[))
+                                            (cond ((char=? (string-ref n 1) #\B) (jolt-class-for "byte"))
+                                                  ((char=? (string-ref n 1) #\C) (jolt-class-for "char"))
+                                                  ((char=? (string-ref n 1) #\D) (jolt-class-for "double"))
+                                                  ((char=? (string-ref n 1) #\F) (jolt-class-for "float"))
+                                                  ((char=? (string-ref n 1) #\I) (jolt-class-for "int"))
+                                                  ((char=? (string-ref n 1) #\J) (jolt-class-for "long"))
+                                                  ((char=? (string-ref n 1) #\S) (jolt-class-for "short"))
+                                                  ((char=? (string-ref n 1) #\Z) (jolt-class-for "boolean"))
+                                                  (else jolt-nil)))
+                                           (else jolt-nil)))))
         ;; Class.isInstance(o) == (instance? class o); core.logic's deftype .equals
         ;; uses (.. this getClass (isInstance o)).
         (cons "isInstance" (lambda (self o) (if (instance-check self o) #t #f)))
@@ -1487,6 +1524,73 @@
     ((coll i) (if (al-family? coll) (%shim-nth (list->cseq (al->list coll)) i) (%shim-nth coll i)))
     ((coll i d) (if (al-family? coll) (%shim-nth (list->cseq (al->list coll)) i d) (%shim-nth coll i d)))))
 (def-var! "clojure.core" "nth" jolt-nth)
+
+;; --- java.nio.charset ---------------------------------------------------------
+;; Charset as a jhost "charset" over #(canonical-name encode-max): encode-max is
+;; the largest char code the charset encodes (#x10FFFF for UTF-*, i.e. every
+;; char — Chez strings are full Unicode). forName is case-insensitive and
+;; accepts the JVM's common aliases; unknown names throw
+;; UnsupportedCharsetException, malformed ones IllegalCharsetNameException (the
+;; JVM's distinction: IllegalCharsetNameException for names that can't be a
+;; charset name, UnsupportedCharsetException for well-formed but unknown).
+(define (charset-legal-name? s)
+  (and (> (string-length s) 0)
+       (let loop ((i 0))
+         (cond ((= i (string-length s)) #t)
+               ((let ((c (string-ref s i)))
+                  (or (char-alphabetic? c) (char-numeric? c)
+                      (memv c '(#\- #\_ #\. #\:))))
+                (loop (+ i 1)))
+               (else #f)))))
+(define (charset-lookup s)
+  (cond ((string-ci=? s "us-ascii") (cons "US-ASCII" 127))
+        ((string-ci=? s "iso-8859-1") (cons "ISO-8859-1" 255))
+        ((string-ci=? s "utf-8") (cons "UTF-8" #x10FFFF))
+        ((string-ci=? s "utf-16") (cons "UTF-16" #x10FFFF))
+        ((string-ci=? s "utf-16be") (cons "UTF-16BE" #x10FFFF))
+        ((string-ci=? s "utf-16le") (cons "UTF-16LE" #x10FFFF))
+        (else #f)))
+(define (charset-for-name s)
+  (let ((s (jolt-str-render-one s)))
+    (if (not (charset-legal-name? s))
+        (throw-jvm 'java.nio.charset.IllegalCharsetNameException s)
+        (let ((hit (charset-lookup s)))
+          (if hit
+              (make-jhost "charset" (vector (car hit) (cdr hit)))
+              (throw-jvm 'java.nio.charset.UnsupportedCharsetException s))))))
+(define (charset-name c) (vector-ref (jhost-state c) 0))
+(define (charset-encode-max c) (vector-ref (jhost-state c) 1))
+(register-class-statics! "java.nio.charset.Charset"
+  (list (cons "forName" charset-for-name)
+        (cons "defaultCharset" (lambda () (make-jhost "charset" (vector "UTF-8" #x10FFFF))))
+        (cons "isSupported" (lambda (s) (if (charset-lookup (jolt-str-render-one s)) #t #f)))))
+(register-host-methods! "charset"
+  (list (cons "name" (lambda (c) (charset-name c)))
+        (cons "displayName" (lambda (c) (charset-name c)))
+        (cons "toString" (lambda (c) (charset-name c)))
+        (cons "newEncoder" (lambda (c) (make-jhost "charset-encoder" (vector c))))
+        (cons "newDecoder" (lambda (c) (make-jhost "charset-decoder" (vector c))))
+        (cons "canEncode" (lambda (c) #t))
+        (cons "equals" (lambda (c o) (and (jhost? o) (string=? (jhost-tag o) "charset")
+                                          (string=? (charset-name c) (charset-name o)))))))
+;; CharsetEncoder.canEncode: over a string, every char must fit; over a char the
+;; char itself. A char is a Scheme char in jolt; a string a string.
+(register-host-methods! "charset-encoder"
+  (list (cons "canEncode"
+              (lambda (e x)
+                (let ((lim (charset-encode-max (vector-ref (jhost-state e) 0))))
+                  (cond ((char? x) (if (<= (char->integer x) lim) #t #f))
+                        ((string? x) (let loop ((i 0))
+                                       (cond ((= i (string-length x)) #t)
+                                             ((> (char->integer (string-ref x i)) lim) #f)
+                                             (else (loop (+ i 1))))))
+                        (else #f)))))
+        (cons "charset" (lambda (e) (vector-ref (jhost-state e) 0)))))
+(register-host-methods! "charset-decoder"
+  (list (cons "charset" (lambda (d) (vector-ref (jhost-state d) 0)))))
+(register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "charset"))) (lambda (x) "java.nio.charset.Charset"))
+(register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "charset-encoder"))) (lambda (x) "java.nio.charset.CharsetEncoder"))
+(register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "charset-decoder"))) (lambda (x) "java.nio.charset.CharsetDecoder"))
 
 ;; --- class-token def-vars as Class objects -----------------------------------
 ;; Short names (String, Long, HashMap) and FQN value-class names (java.lang.Long,

@@ -314,6 +314,24 @@
         (cons "get" (lambda (self obj)
                       (jolt-get obj (reflect-field-name self) jolt-nil)))
         (cons "toString" (lambda (self) (jolt-str-render-one (reflect-field-name self))))))
+;; Snapshot of the keyword intern tables as a jolt map of symbol -> keyword,
+;; the way the JVM's clojure.lang.Keyword.table reads (its Reference values are
+;; irrelevant to consumers, which only iterate the keys).
+(define (keyword-intern-table-map)
+  (let ((acc '()))
+    (let-values (((ks vs) (hashtable-entries keyword-table-bare)))
+      (vector-for-each (lambda (name kw) (set! acc (cons (jolt-symbol #f name) (cons kw acc)))) ks vs))
+    (let-values (((ks vs) (hashtable-entries keyword-table)))
+      (vector-for-each
+        (lambda (nk kw) (set! acc (cons (jolt-symbol (keyword-t-ns kw) (keyword-t-name kw)) (cons kw acc))))
+        ks vs))
+    (apply jolt-hash-map acc)))
+;; The reflective Field standing in for clojure.lang.Keyword.table.
+(register-host-methods! "keyword-table-field"
+  (list (cons "setAccessible" (lambda (self v) jolt-nil))
+        (cons "get" (lambda (self obj) (keyword-intern-table-map)))
+        (cons "getName" (lambda (self) "table"))
+        (cons "toString" (lambda (self) "static java.util.Map clojure.lang.Keyword.table"))))
 (register-host-methods! "class"
   (list (cons "getDeclaredFields"
               (lambda (self)
@@ -323,4 +341,15 @@
                        (vector-map (lambda (k) (make-jhost "reflect-field" (vector k)))
                                    (jrdesc-fkeys desc))
                        (vector))
-                   'objects))))))
+                   'objects))))
+        (cons "getDeclaredField"
+              (lambda (self name)
+                (cond ((and (string=? (jclass-name self) "clojure.lang.Keyword")
+                            (string=? name "table"))
+                       (make-jhost "keyword-table-field" (vector)))
+                      ((let ((desc (hashtable-ref chez-tag-desc (jclass-name self) #f)))
+                         (and desc
+                              (find (lambda (k) (string=? (jolt-str-render-one k) name))
+                                    (vector->list (jrdesc-fkeys desc)))))
+                       => (lambda (k) (make-jhost "reflect-field" (vector k))))
+                      (else (throw-jvm 'NoSuchFieldException name)))))))

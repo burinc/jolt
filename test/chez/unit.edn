@@ -229,7 +229,11 @@
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (slurp (io/reader (char-array \"xyz\"))))" :expected "xyz"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (string? (slurp (io/reader \"README.md\"))))" :expected "true"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toString (.toURL (io/file \"/tmp/x\"))))" :expected "file:/tmp/x"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toURI (io/file \"/tmp/x\")))" :expected "file:/tmp/x"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toURI (io/file \"/tmp/x\")))" :expected "#object[java.net.URI file:/tmp/x]"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (str (.toURI (io/file \"/tmp/x\"))))" :expected "file:/tmp/x"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (.toURI (io/file \"/tmp/x\"))))" :expected "#object[java.net.URI \"file:/tmp/x\"]"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (io/file \"/tmp/x\")))" :expected "#object[java.io.File \"/tmp/x\"]"}
+  {:suite "ioreader" :expr "(pr-str (atom 1))" :expected "#object[clojure.lang.Atom]"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getPath (.toURL (io/file \"/tmp/x\"))))" :expected "/tmp/x"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getAbsolutePath (io/file \"/a/b\")))" :expected "/a/b"}
   {:suite "ioreader" :expr "(slurp (StringReader. \"a=1\"))" :expected "a=1"}

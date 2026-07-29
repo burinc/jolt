@@ -105,7 +105,10 @@
     ((cseq? x) (if (jolt-print-hash?) "#"
                    (with-deeper-print
                      (string-append "(" (jolt-str-join (jolt-limited-seq-strs x jolt-pr-readable)) ")"))))
-    (else (jolt-pr-str x))))
+    ;; Defer to the str-side printer, whose arms and base cases these share —
+    ;; passing readable? so that if it reaches the #object[…] fallback the content
+    ;; is QUOTED, which is the (pr x) vs (print x) difference on the JVM.
+    (else (jolt-pr-str/readable x #t))))
 (define (jolt-pr-readable-dispatch x)
   (let loop ((as jolt-pr-readable-arms))
     (cond ((null? as) (jolt-pr-readable-base x))
@@ -146,11 +149,24 @@
 ;; redirect, not *out*, defines where text goes (pr-str / print-str rely on it).
 (define jolt-pprint-hook-suppressed (make-thread-parameter #f))
 (define (jolt-write s)
-  (if (and (not (jolt-nil? jolt-pprint-write-hook))
-           (not (jolt-pprint-hook-suppressed))
-           (jolt-truthy? (jolt-invoke jolt-pprint-write-hook s)))
-      jolt-nil
-      (begin (display s) jolt-nil)))
+  (cond ((and (not (jolt-nil? jolt-pprint-write-hook))
+              (not (jolt-pprint-hook-suppressed))
+              (jolt-truthy? (jolt-invoke jolt-pprint-write-hook s)))
+         jolt-nil)
+        ;; *out* rebound to a real writer: write through it, like the JVM's
+        ;; (.write *out* s). Any value that carries a write method qualifies — a
+        ;; host writer (StringWriter, PrintWriter) OR a deftype/reify/proxy one,
+        ;; which is why this tests for a write METHOD rather than for jhost:
+        ;; keying on the representation silently skipped every reify Writer.
+        ;; The default port-writer over stdout keeps the fast port path below.
+        ((let ((w (var-deref "clojure.core" "*out*")))
+           (and (or (iface-method w "write" #f)
+                    (and (jhost? w)
+                         (not (and (string=? (jhost-tag w) "port-writer")
+                                   (eq? (vector-ref (jhost-state w) 0) 'out)))))
+                w))
+         => (lambda (w) (record-method-dispatch w "write" (jolt-list s)) jolt-nil))
+        (else (display s) jolt-nil)))
 (def-var! "clojure.core" "__set-pprint-write-hook!"
   (lambda (f) (set! jolt-pprint-write-hook f) jolt-nil))
 ;; clojure.pprint wraps its writing in this so core print routes into the active
@@ -160,11 +176,33 @@
   (lambda (thunk)
     (parameterize ((jolt-pprint-hook-suppressed #f)) (jolt-invoke thunk))))
 
-;; __with-out-str: run a jolt thunk with *out* rebound to a string port, return
+;; __with-out-str: run a jolt thunk with output captured to a string, and return
 ;; the captured text.
+;;
+;; Two redirects have to agree here. with-output-to-string moves the CHEZ port,
+;; which catches everything that reaches `display`; jolt-write separately honours
+;; *out* when it holds a real writer. Redirecting only the port leaves an OUTER
+;; (binding [*out* some-writer] …) in force, and jolt-write then sends the text to
+;; that writer instead of the capture:
+;;   (binding [*out* sw] (with-out-str (print "x")))  ; JVM: "x", sw empty
+;; So push a *out* binding of our own, to the var's ROOT — the default stdout
+;; port-writer, whose port resolves live to (current-output-port) and therefore
+;; follows the redirect. Both mechanisms then point at the string port.
+;;
+;; Pushing a real binding rather than suppressing the *out* branch outright is
+;; what keeps an INNER rebinding working: (with-out-str (binding [*out* sw] …))
+;; pushes over this frame and still wins, exactly as on the JVM. The binding stack
+;; lives in dyn-binding.ss, loaded after this file — resolved at call time.
 (define (jolt-with-out-str thunk)
   (with-output-to-string
-    (lambda () (parameterize ((jolt-pprint-hook-suppressed #t)) (jolt-invoke thunk)))))
+    (lambda ()
+      (let ((cell (var-cell-lookup "clojure.core" "*out*")))
+        (dynamic-wind
+          (lambda ()
+            (when cell
+              (jolt-push-thread-bindings (jolt-hash-map cell (var-cell-root cell)))))
+          (lambda () (parameterize ((jolt-pprint-hook-suppressed #t)) (jolt-invoke thunk)))
+          (lambda () (when cell (jolt-pop-thread-bindings))))))))
 
 ;; __eprint / __eprintf: stderr seams. Flush each write — like the JVM's
 ;; auto-flushing System.err — so a long-running process (a server that never

@@ -694,6 +694,13 @@
                     (if (jolt-nil? ext) '()
                         (map (lambda (p) (make-map-entry (car p) (cdr p))) (jrec-ext-pairs ext)))))
           (loop (+ i 1) (cons (make-map-entry (vector-ref fkeys i) (jrec-field-ref r i)) acc))))))
+;; seq over a jrec stays METHOD-first: a declared seq wins, a defrecord seqs its
+;; entries, a deftype that declares a collection interface without implementing
+;; seq is an abstract-method error, and anything else falls through to jolt-seq's
+;; "Don't know how to create ISeq from" — the JVM answer for a type that is not
+;; Seqable, whatever its field count. Deciding emptiness from the jrec's own field
+;; count instead would answer for the WRAPPER rather than the collection: a
+;; deftype holding a backing map has one field, so it would never read as empty.
 (register-seq-arm! (lambda (x) (and (jrec? x) (jrec-declares-coll-iface? x)))
   (lambda (x) (jrec-abstract-method-error x "seq")))
 (register-seq-arm! jrec-record?
@@ -711,7 +718,8 @@
 ;; peek/pop on a deftype implementing IPersistentStack (data.priority-map, which
 ;; core.cache's LRU/LU caches lean on) dispatch to its methods.
 ;; empty? over a jrec: a map-like deftype is empty iff its entry seq is (data
-;; .priority-map's peek calls (.isEmpty this) -> empty?). jolt-seq is method-first.
+;; .priority-map's peek calls (.isEmpty this) -> empty?). jolt-seq is method-first,
+;; so this asks the type's own seq/count rather than counting the jrec's fields.
 (register-empty-arm! jrec-collection? (lambda (coll) (jolt-nil? (jolt-seq coll))))
 (define %r-jolt-peek jolt-peek)
 (set! jolt-peek (lambda (coll)
@@ -842,6 +850,10 @@
         ((char? obj) (jch-tags "java.lang.Character"))
         ((keyword? obj) (jch-tags "clojure.lang.Keyword"))
         ((jolt-symbol? obj) (jch-tags "clojure.lang.Symbol"))
+        ;; a map entry is a flagged pvec — check before plain vectors so its
+        ;; class tags are clojure.lang.MapEntry's (which include APersistentVector,
+        ;; so vector checks still hold) plus java.util.Map$Entry.
+        ((jolt-map-entry? obj) (jch-tags "clojure.lang.MapEntry"))
         ((pvec? obj) (jch-tags "clojure.lang.PersistentVector"))
         ((pmap? obj) (if (pmap-order obj)
                         (jch-tags "clojure.lang.PersistentArrayMap")
@@ -1469,6 +1481,18 @@
       ;; libraries that wrap protocol methods sync this cache (schema's fn
       ;; instrumentation) and a consistent nil makes that a safe no-op.
       ((string=? method-name "__methodImplCache") jolt-nil)
+      ;; Java interface default methods (isEmpty, size, contains, iterator, entrySet,
+      ;; seq, …) for a deftype that implements java.util.Map / java.util.Collection:
+      ;; dispatch through dot-coll-method, which delegates to the method-first
+      ;; jolt-empty?/jolt-count/jolt-seq — so the type answers from its OWN seq/count.
+      ;; A deftype that implements none of them still reaches the error below, via
+      ;; the throw those dispatchers raise. dot-coll-method BOXES its result (so a
+      ;; legitimate #f is distinguishable from "no such method"); unbox it, or every
+      ;; caller gets a one-element list instead of the value.
+      ((jrec? obj)
+       (let ((boxed (dot-coll-method obj method-name rest)))
+         (if boxed (car boxed) (error #f (string-append "No method " method-name " for value: "
+                                                        (jolt-pr-str obj))))))
       (else (error #f (string-append "No method " method-name " for value: "
                                      (jolt-pr-str obj)))))))
 
