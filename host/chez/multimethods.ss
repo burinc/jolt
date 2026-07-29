@@ -307,6 +307,9 @@
 (define (jolt-get-method-setup mf dval)
   (if (jolt-multifn? mf)
       (or (hashtable-ref (jolt-multifn-methods mf) dval #f)
+          ;; isa?-based lookup, exactly like the runtime mm-resolve path —
+          ;; so get-method and actual dispatch return the same method.
+          (mm-find-isa mf dval)
           (hashtable-ref (jolt-multifn-methods mf) (jolt-multifn-default mf) #f)
           jolt-nil)
       jolt-nil))

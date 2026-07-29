@@ -131,10 +131,15 @@
          (sort string<? (directory-list p)))))
 (define (jolt-dir? path) (if (file-directory? (project-relative (file-path-of path))) #t #f))
 
-;; absolute path string (cwd-relative paths resolved against current-directory).
+;; absolute path string: a relative path resolves against JOLT_PWD (user.dir) —
+;; the same base every filesystem touch uses (project-relative). Resolving
+;; against (current-directory) here instead reported paths under the jolt repo
+;; root the launcher cd'd into, diverging from the JVM where io/file and
+;; getAbsolutePath are user.dir-relative.
 (define (jfile-abs p)
-  (if (and (> (string-length p) 0) (char=? (string-ref p 0) #\/)) p
-      (string-append (current-directory) "/" p)))
+  (cond ((= (string-length p) 0) (or (getenv "JOLT_PWD") (getenv "PWD") "."))
+        ((char=? (string-ref p 0) #\/) p)
+        (else (project-relative p))))
 
 ;; --- file metadata over Chez filesystem ops ---------------------------------
 ;; byte size of a regular file (0 for a directory or a missing file).
@@ -224,7 +229,8 @@
       ((string=? name "toString")       (list p))
       ((string=? name "getAbsolutePath")(list (jfile-abs fp)))
       ((string=? name "getCanonicalPath")(list (jfile-abs fp)))
-      ((string=? name "toURI")          (list (string-append "file:" (jfile-abs fp))))
+      ;; File.toURI returns a java.net.URI (JVM), not a String.
+      ((string=? name "toURI")          (list (uri-parse (string-append "file:" (jfile-abs fp)))))
       ((string=? name "toURL")          (list (make-url (string-append "file:" (jfile-abs fp)))))
       ;; io/resource returns a File where the JVM returns a file: URL; answer the
       ;; two URL methods resource-serving middleware (ring) calls on the result, so
@@ -522,7 +528,17 @@
 
 ;; --- clojure.java.io ns -----------------------------------------------------
 (def-var! "clojure.java.io" "file" jolt-make-file)
-(def-var! "clojure.java.io" "as-file" (lambda (x) (if (jfile? x) x (make-jfile (file-path-of x)))))
+;; io/as-file of a file: URL yields the file it points at (JVM: new
+;; File(url.toURI())); a URL with any other protocol has no filesystem path —
+;; IllegalArgumentException, as the JVM's File(URI) throws.
+(define (url-file-coercion u)
+  (if (string=? (url-protocol (url-spec u)) "file")
+      (make-jfile (url-strip-scheme (url-spec u)))
+      (throw-jvm 'IllegalArgumentException (string-append "Not a file: " (url-spec u)))))
+(def-var! "clojure.java.io" "as-file"
+  (lambda (x) (cond ((jfile? x) x)
+                    ((and (jhost? x) (string=? (jhost-tag x) "url")) (url-file-coercion x))
+                    (else (make-jfile (file-path-of x))))))
 ;; "reader" is bound by natives-array.ss (loaded later) so a char[] argument is
 ;; handled; that binding delegates here via jolt-io-reader for everything else.
 (def-var! "clojure.java.io" "writer" jolt-io-writer)
@@ -543,12 +559,15 @@
 (def-var! "clojure.java.io" "resource" jolt-io-resource)
 ;; as-url honors a library-registered URL class (e.g. jolt-lang/http-client's full
 ;; java.net.URL shim) so io/as-url and (URL. spec) agree; else the file-only jhost.
+;; as-url of a File is File.toURL — a file: URL (JVM), so the spec carries the
+;; scheme; a bare string keeps its spec as given.
 (def-var! "clojure.java.io" "as-url"
   (lambda (x)
     (cond ((and (jhost? x) (string=? (jhost-tag x) "url")) x)
           ((htable? x) x)
-          (else (let ((ctor (lookup-class class-ctors-tbl "URL")))
-                  (if ctor (ctor (jolt-str-render-one x)) (make-url (jolt-str-render-one x))))))))
+          (else (let ((spec (if (jfile? x) (string-append "file:" (jfile-fs x)) (jolt-str-render-one x)))
+                      (ctor (lookup-class class-ctors-tbl "URL")))
+                  (if ctor (ctor spec) (make-url spec)))))))
 
 ;; --- java.lang.ClassLoader --------------------------------------------------
 ;; jolt has no classpath; a "classloader" resolves a named resource against the
@@ -585,6 +604,31 @@
 ;; clojure.lang.RT/baseLoader — the resource-resolving class loader (RT/baseLoader
 ;; is how libraries reach Clojure's base loader, e.g. aws-api's resources ns).
 (register-class-statics! "clojure.lang.RT" (list (cons "baseLoader" (lambda () the-classloader))))
+;; java.lang.Class's loader surface: jolt loads every class through the single
+;; source-root loader, so any Class reports it (on the JVM bootstrap classes
+;; return null; here the loader itself answers nil for resources it can't serve,
+;; which is the answer classpath-probing callers like orchard's source-file
+;; resolution need). Class.getResource resolves a relative name against the
+;; class's package before delegating — JVM semantics.
+(define (class-resource-name class-name name)
+  (if (and (> (string-length name) 0) (char=? (string-ref name 0) #\/))
+      (substring name 1 (string-length name))
+      (let loop ((i (- (string-length class-name) 1)))
+        (cond ((< i 0) name)
+              ((char=? (string-ref class-name i) #\.)
+               (string-append (ns-name->rel (substring class-name 0 i)) "/" name))
+              (else (loop (- i 1)))))))
+(register-host-methods! "class"
+  (list (cons "getClassLoader" (lambda (self) the-classloader))
+        (cons "getResource"
+              (lambda (self name)
+                (cl-get-resource the-classloader
+                                 (class-resource-name (jclass-name self) (jolt-str-render-one name)))))
+        (cons "getResourceAsStream"
+              (lambda (self name)
+                (let ((u (cl-get-resource the-classloader
+                                          (class-resource-name (jclass-name self) (jolt-str-render-one name)))))
+                  (if (jolt-nil? u) jolt-nil (host-new "StringReader" (jolt-slurp (url-strip-scheme (url-spec u))))))))))
 ;; clojure.lang.RT/nextID — process-unique increasing id (AtomicInteger(1)
 ;; getAndIncrement), used by id generators such as core.logic's lvar.
 (define rt-next-id-counter 1)
@@ -798,6 +842,11 @@
         (cons "getQuery" (lambda (u) (uri-field u 'query)))
         (cons "getRawQuery" (lambda (u) (uri-field u 'query)))
         (cons "getFragment" (lambda (u) (uri-field u 'fragment)))
+        ;; URI.toURL = new URL(toString()) (JVM); honors a library-registered
+        ;; URL shim like io/as-url does.
+        (cons "toURL" (lambda (u) (let ((ctor (lookup-class class-ctors-tbl "URL")))
+                                    (if ctor (ctor (uri-field u 'string))
+                                        (make-url (uri-field u 'string))))))
         (cons "isAbsolute" (lambda (u) (not (jolt-nil? (uri-field u 'scheme)))))
         (cons "hashCode" (lambda (u) (string-hash (uri-field u 'string))))
         (cons "equals" (lambda (u o) (and (jhost? o) (string=? (jhost-tag o) "uri")
@@ -817,5 +866,6 @@
                            (lambda (x) (string-append "#object[java.net.URI \"" (uri-field x 'string) "\"]")))
 ;; class of the host value types defined by now (uri/uuid/file).
 (register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "uri"))) (lambda (x) "java.net.URI"))
+(register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "url"))) (lambda (x) "java.net.URL"))
 (register-class-arm! juuid? (lambda (x) "java.util.UUID"))
 (register-class-arm! jfile? (lambda (x) "java.io.File"))

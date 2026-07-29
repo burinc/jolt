@@ -171,6 +171,12 @@
 (register-class-statics! "RT" (list (cons "map" rt-map)))
 (register-class-statics! "clojure.lang.RT" (list (cons "map" rt-map)))
 
+;; clojure.lang.RT/iter: an Iterator over any seqable — the same jiterator
+;; (.iterator coll) dispatches to. orchard/inspect.analytics walks collections
+;; through it.
+(register-class-statics! "RT" (list (cons "iter" (lambda (coll) (make-jiterator (jolt-seq coll))))))
+(register-class-statics! "clojure.lang.RT" (list (cons "iter" (lambda (coll) (make-jiterator (jolt-seq coll))))))
+
 ;; clojure.lang.PersistentList/create: a list (in order) from a seq; empty -> ().
 ;; Build it the way clojure.core/list does — list->cseq alone yields plain seq
 ;; cells, and jolt marks the HEAD cell to record that a chain IS a list, so an

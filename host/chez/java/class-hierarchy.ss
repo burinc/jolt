@@ -282,6 +282,8 @@
 (jch-register-supers! "java.net.SocketTimeoutException" '("java.io.InterruptedIOException"))
 (jch-register-supers! "java.net.MalformedURLException" '("java.io.IOException"))
 (jch-register-supers! "javax.net.ssl.SSLException" '("java.io.IOException"))
+(jch-register-supers! "java.nio.charset.UnsupportedCharsetException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.nio.charset.IllegalCharsetNameException" '("java.lang.IllegalArgumentException"))
 (jch-register-supers! "java.lang.Error" '("java.lang.Throwable"))
 (jch-register-supers! "java.lang.AssertionError" '("java.lang.Error"))
 (jch-register-supers! "java.lang.ArrayIndexOutOfBoundsException" '("java.lang.IndexOutOfBoundsException"))
@@ -331,7 +333,10 @@
 (jch-register-supers! "java.util.StringTokenizer" '())
 (jch-register-supers! "java.nio.charset.Charset" '())
 (jch-register-supers! "java.util.Base64" '())
-(jch-register-supers! "clojure.lang.MapEntry" '())
+;; MapEntry is an APersistentVector that also implements java.util.Map.Entry —
+;; libraries (orchard.print) dispatch entries via (instance? java.util.Map$Entry e).
+(jch-register-supers! "clojure.lang.MapEntry" '("clojure.lang.APersistentVector" "java.util.Map$Entry"))
+(jch-register-supers! "java.util.Map$Entry" '())
 (jch-register-supers! "clojure.lang.Namespace" '())
 (jch-register-supers! "java.util.regex.Pattern" '())
 (jch-register-supers! "java.net.URI" '())

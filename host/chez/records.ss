@@ -694,8 +694,15 @@
                     (if (jolt-nil? ext) '()
                         (map (lambda (p) (make-map-entry (car p) (cdr p))) (jrec-ext-pairs ext)))))
           (loop (+ i 1) (cons (make-map-entry (vector-ref fkeys i) (jrec-field-ref r i)) acc))))))
+(define (jrec-structurally-empty? x)
+  (and (fx=? 0 (jrec-nfields x))
+       (let ((ext (jrec-ext x))) (or (jolt-nil? ext) (fx=? 0 (jolt-count ext))))))
+(register-seq-arm! jrec?
+  (lambda (x) (if (jrec-structurally-empty? x) jolt-nil
+                  (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
+                                (string-append "Don't know how to create ISeq from: " (jrec-tag x)))))))
 (register-seq-arm! (lambda (x) (and (jrec? x) (jrec-declares-coll-iface? x)))
-  (lambda (x) (jrec-abstract-method-error x "seq")))
+  (lambda (x) (if (jrec-structurally-empty? x) jolt-nil (jrec-abstract-method-error x "seq"))))
 (register-seq-arm! jrec-record?
   (lambda (x) (list->cseq (jrec-entry-list x))))
 (register-seq-arm! (lambda (x) (jrec-cl x "seq"))
@@ -712,7 +719,7 @@
 ;; core.cache's LRU/LU caches lean on) dispatch to its methods.
 ;; empty? over a jrec: a map-like deftype is empty iff its entry seq is (data
 ;; .priority-map's peek calls (.isEmpty this) -> empty?). jolt-seq is method-first.
-(register-empty-arm! jrec-collection? (lambda (coll) (jolt-nil? (jolt-seq coll))))
+(register-empty-arm! jrec-collection? (lambda (coll) (jrec-structurally-empty? coll)))
 (define %r-jolt-peek jolt-peek)
 (set! jolt-peek (lambda (coll)
   (cond ((jrec-cl coll "peek") => (lambda (m) (jolt-invoke m coll)))
@@ -842,6 +849,10 @@
         ((char? obj) (jch-tags "java.lang.Character"))
         ((keyword? obj) (jch-tags "clojure.lang.Keyword"))
         ((jolt-symbol? obj) (jch-tags "clojure.lang.Symbol"))
+        ;; a map entry is a flagged pvec — check before plain vectors so its
+        ;; class tags are clojure.lang.MapEntry's (which include APersistentVector,
+        ;; so vector checks still hold) plus java.util.Map$Entry.
+        ((jolt-map-entry? obj) (jch-tags "clojure.lang.MapEntry"))
         ((pvec? obj) (jch-tags "clojure.lang.PersistentVector"))
         ((pmap? obj) (if (pmap-order obj)
                         (jch-tags "clojure.lang.PersistentArrayMap")
@@ -1469,6 +1480,14 @@
       ;; libraries that wrap protocol methods sync this cache (schema's fn
       ;; instrumentation) and a consistent nil makes that a safe no-op.
       ((string=? method-name "__methodImplCache") jolt-nil)
+      ;; Java interface default methods (isEmpty, size, contains, iterator, entrySet,
+      ;; seq, …) for deftypes that implement java.util.Map / java.util.Collection:
+      ;; dispatched through dot-coll-method which delegates to jolt-empty?/jolt-count/
+      ;; jolt-seq/… — all of which now have non-throwing jrec fallbacks.
+      ((jrec? obj)
+       (let ((boxed (dot-coll-method obj method-name rest)))
+         (if boxed boxed (error #f (string-append "No method " method-name " for value: "
+                                                  (jolt-pr-str obj))))))
       (else (error #f (string-append "No method " method-name " for value: "
                                      (jolt-pr-str obj)))))))
 
