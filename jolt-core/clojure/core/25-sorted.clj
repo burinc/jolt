@@ -28,13 +28,16 @@
 (defn- sfield [sc k] (jolt.host/ref-get sc k))
 
 ;; Clojure's fn->comparator: a comparator fn may return a number (3-way) or a
-;; boolean less-than predicate.
+;; boolean less-than predicate. The value may also be a reify/deftype Comparator,
+;; which is not IFn — __comparator-fn is the shared seam that turns either into a
+;; 2-arg compare fn.
 (defn- fn->cmp [f]
-  (fn [a b]
-    (let [r (f a b)]
-      (if (number? r)
-        r
-        (if r -1 (if (f b a) 1 0))))))
+  (let [f (__comparator-fn f)]
+    (fn [a b]
+      (let [r (f a b)]
+        (if (number? r)
+          r
+          (if r -1 (if (f b a) 1 0)))))))
 
 (defn- the-cmp [sc] (or (sfield sc :cmp) compare))
 

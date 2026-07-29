@@ -34,7 +34,10 @@
    ;; here beats silently "sorting" through coll-as-fn lookups
    (when (coll? comp)
      (throw (new ClassCastException (str (class comp) " cannot be cast to java.util.Comparator"))))
-   (sort (fn [x y] (comp (keyfn x) (keyfn y))) coll)))
+   ;; comp may be a reify/deftype Comparator, which is not IFn — route it through
+   ;; the shared comparator seam rather than invoking it directly.
+   (let [cf (__comparator-fn comp)]
+     (sort (fn [x y] (cf (keyfn x) (keyfn y))) coll))))
 
 ;; parse-uuid: nil unless s is a canonical 8-4-4-4-12 hex UUID string; throws
 ;; on a non-string (Clojure 1.11). __make-uuid is the host constructor for the
@@ -347,6 +350,29 @@
         target (reduce (fn [t k] (nth t k)) arr (take (- n 2) idxs+val))]
     (jolt.host/ref-put! target (nth idxs+val (- n 2)) val)
     val))
+
+;; areduce / amap: index-loop macros over an array, verbatim in shape from
+;; clojure.core. Both bind the array once (the expression may have side effects)
+;; and walk it by index, so they need nothing beyond alength/aget/aset/aclone.
+;; areduce threads an accumulator; amap writes into an aclone of the source and
+;; returns it, leaving the original untouched.
+(defmacro areduce [a idx ret init expr]
+  `(let [a# ~a
+         l# (alength a#)]
+     (loop [~idx 0 ~ret ~init]
+       (if (< ~idx l#)
+         (recur (unchecked-inc-int ~idx) ~expr)
+         ~ret))))
+
+(defmacro amap [a idx ret expr]
+  `(let [a# ~a
+         ~ret (aclone a#)
+         l# (alength a#)]
+     (loop [~idx 0]
+       (if (< ~idx l#)
+         (do (aset ~ret ~idx ~expr)
+             (recur (unchecked-inc-int ~idx)))
+         ~ret))))
 
 ;; --- fn combinators + host-free stubs ----------------------------------------
 
