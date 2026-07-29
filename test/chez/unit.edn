@@ -234,6 +234,14 @@
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (.toURI (io/file \"/tmp/x\"))))" :expected "#object[java.net.URI \"file:/tmp/x\"]"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (io/file \"/tmp/x\")))" :expected "#object[java.io.File \"/tmp/x\"]"}
   {:suite "ioreader" :expr "(pr-str (atom 1))" :expected "#object[clojure.lang.Atom]"}
+ ;; io/resource has two branches — a source root (a jfile) and an embedded resource
+ ;; baked into the image by make-devboot / jolt build. Which one serves a stdlib
+ ;; path depends on whether target/dev/flat.so is fresh, so these assert only what
+ ;; must hold for BOTH: the URL/File surface callers reach for. The embedded branch
+ ;; used to answer none of it, which made orchard.meta flap on .getPath.
+ {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getName (io/resource \"clojure/string.clj\")))" :expected "string.clj"}
+ {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io]) (quote [clojure.string :as s])) (s/ends-with? (.getPath (io/resource \"clojure/string.clj\")) \"clojure/string.clj\"))" :expected "true"}
+ {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (boolean (seq (str (io/resource \"clojure/string.clj\")))))" :expected "true"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getPath (.toURL (io/file \"/tmp/x\"))))" :expected "/tmp/x"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getAbsolutePath (io/file \"/a/b\")))" :expected "/a/b"}
   {:suite "ioreader" :expr "(slurp (StringReader. \"a=1\"))" :expected "a=1"}
