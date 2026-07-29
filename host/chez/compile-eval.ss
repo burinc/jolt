@@ -35,6 +35,11 @@
 ;; emitted Scheme here so a cache miss records exactly what was eval'd (preserving
 ;; the interleaved analyze→eval semantics the cache later replays via `load`).
 (define jolt-aot-capture (make-thread-parameter #f))
+;; The file that capture port was opened FOR. load-jolt-file* tees only while
+;; loading that file: a nested load must not append its forms to the requiring
+;; namespace's artifact, because the artifact already re-runs the require that
+;; pulls it in. See load-jolt-file* for what leaked before this existed.
+(define jolt-aot-capture-file (make-thread-parameter #f))
 
 ;; clojure.lang.Compiler/LINE and /COLUMN — derefable cells (Vars on the JVM)
 ;; holding the line/column of the form being compiled. Macros read @Compiler/LINE

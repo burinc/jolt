@@ -358,7 +358,23 @@
          (saved-source (jolt-current-source)))
     ;; parameterize (not a bare set!) so a require nested in this file's ns form
     ;; restores path when control returns to the rest of this file.
-    (parameterize ((rdr-source-file path))   ; list forms read here carry :file = path
+    (parameterize ((rdr-source-file path)    ; list forms read here carry :file = path
+                   ;; Tee into the AOT capture only while loading the file that
+                   ;; capture was opened for. A nested load must not append its
+                   ;; forms to the requiring namespace's artifact: that artifact
+                   ;; already re-runs the require which loads the nested namespace,
+                   ;; so the copy is a SECOND definition of it, replayed after the
+                   ;; require — and a top-level registration in it then lands on
+                   ;; top of whatever the requiring namespace layered over it.
+                   ;; jolt.time (a 14-line ns form) baked in eight install-owned
+                   ;; jolt/time/*.clj namespaces this way; on a cache hit
+                   ;; jolt.time.local's ISO-only java.time.LocalDate/parse replayed
+                   ;; after jolt.time.fmt's pattern-aware override and undid it, so
+                   ;; a warm cache silently ignored a DateTimeFormatter. Only
+                   ;; install-owned namespaces leaked: a cacheable one opens its own
+                   ;; capture (aot-capture-load) and so already redirected.
+                   (jolt-aot-capture (and (equal? path (jolt-aot-capture-file))
+                                          (jolt-aot-capture))))
       (ldr-with-file-vars path
         (lambda ()
           (let loop ((i 0))
@@ -653,7 +669,7 @@
 ;; target would cache, but the requiring ns's own defs would vanish from its .so).
 (define (aot-capture-load file src)
   (let ((cap (open-output-string)))
-    (parameterize ((jolt-aot-capture cap))
+    (parameterize ((jolt-aot-capture cap) (jolt-aot-capture-file file))
       (load-jolt-file* file src)
       (get-output-string cap))))
 ;; On a miss: run the capture load (which also evals the ns into the running
@@ -782,6 +798,223 @@
              (not (jolt-ref? libs-ref))
              (jolt-contains? (jolt-ref-val libs-ref) (jolt-symbol #f name))))))
 
+;; --- clojure.core/compile + *compile-path* -----------------------------------
+;; Clojure's `compile` writes a namespace's compiled form under *compile-path* so a
+;; later load takes that instead of re-reading the source, and that directory has to
+;; be on the classpath for the load side to find it (core.clj's docstring says so
+;; outright). jolt keeps the shape and swaps two substrate details: the artifact is
+;; a Chez fasl of the emitted Scheme — what the AOT cache above already produces —
+;; rather than .class files, and the load side searches the source roots, which are
+;; jolt's classpath.
+;;
+;;   <dir>/<ns-rel>.so     the fasl; published last, so its presence is the signal
+;;   <dir>/<ns-rel>.scm    the emitted Scheme it was compiled from
+;;   <dir>/<ns-rel>.meta   what it was compiled against (below)
+;;
+;; RT.load picks a .class over a .clj on mtime alone. A fasl is much less forgiving
+;; than a class file — one emitted by a different jolt calls runtime helpers that
+;; may not exist any more — so .meta pins the jolt version and the runtime
+;; fingerprint, and a mismatch means the artifact is ignored rather than loaded in
+;; hope. Staleness against the source is a content hash, not an mtime: same intent
+;; as the JVM's comparison, immune to a bare touch, and the same rule the AOT cache
+;; decides by. Like the JVM this does NOT walk the whole dependency graph — .meta
+;; records the direct requires and their source hashes, so editing a namespace this
+;; one requires invalidates it, but a change further down does not. Recompile
+;; dependents, the same discipline an edited macro namespace needs under JVM AOT.
+(define (cpath-so-file base) (string-append base ".so"))
+(define (cpath-scm-file base) (string-append base ".scm"))
+(define (cpath-meta-file base) (string-append base ".meta"))
+
+;; The source content key an artifact for `name` can go stale against, or "" when
+;; there is none to track: a namespace with no source file (only the artifact was
+;; shipped), and install-owned source, which is part of the runtime and already
+;; covered by the runtime fingerprint.
+(define (cpath-source-key name)
+  (let ((f (aot-cacheable-file name)))
+    (if f (aot-cache-key (ldr-read-source f)) "")))
+
+;; Does `name` still hash to what the artifact recorded for it? An empty key now
+;; means there is no source to be stale against — the artifact-only deploy, where
+;; RT.load takes the .class because there is no .clj beside it — so nothing to
+;; check. A key that appeared where none was recorded (source shadowing an
+;; install-owned namespace) does not match, and the artifact loses.
+(define (cpath-key-current? recorded name)
+  (let ((now (cpath-source-key name)))
+    (or (string=? now "") (string=? now recorded))))
+
+;; jolt version / runtime fingerprint / own source key, then one "name key" line
+;; per direct require that has a key worth tracking.
+(define (cpath-meta-lines name deps)
+  (cons* (jolt-version-string)
+         (or (aot-runtime-fingerprint) "")
+         (cpath-source-key name)
+         (map (lambda (d) (string-append d " " (cpath-source-key d)))
+              (sort string<? deps))))
+
+(define (cpath-write-meta! path lines)
+  (let ((out (open-output-file path 'replace)))
+    (for-each (lambda (l) (put-string out l) (put-string out "\n")) lines)
+    (close-port out)))
+
+;; "name key" -> ("name" . "key"); a dep with no key trails a bare space.
+(define (cpath-split-dep-line s)
+  (let ((n (string-length s)))
+    (let loop ((i 0))
+      (cond ((fx>=? i n) #f)
+            ((char=? (string-ref s i) #\space)
+             (cons (substring s 0 i) (substring s (fx+ i 1) n)))
+            (else (loop (fx+ i 1)))))))
+
+(define (cpath-meta-matches? name base)
+  (let ((mf (cpath-meta-file base))
+        (fp (aot-runtime-fingerprint)))
+    (and fp                        ; no fingerprint = can't tell this runtime apart
+         (file-exists? mf)
+         (let ((lines (guard (e (else '())) (bld-string-lines-like (read-file-string mf)))))
+           (and (fx>=? (length lines) 3)
+                (string=? (list-ref lines 0) (jolt-version-string))
+                (string=? (list-ref lines 1) fp)
+                (cpath-key-current? (list-ref lines 2) name)
+                (let loop ((ds (list-tail lines 3)))
+                  (or (null? ds)
+                      (let ((dep (cpath-split-dep-line (car ds))))
+                        (and dep
+                             (cpath-key-current? (cdr dep) (car dep))
+                             (loop (cdr ds)))))))))))
+
+(define (cpath-artifact-valid? name base)
+  (and (file-exists? (cpath-so-file base))
+       (cpath-meta-matches? name base)))
+
+;; Set while a build driver walks an app's namespaces. `jolt build` emits each
+;; namespace from its source, and it learns the load order (and the path to emit
+;; from) through ns-loaded-hook — so a compiled artifact standing in for the source
+;; would hand it a path with no source behind it. Compiled output is a load
+;; shortcut; a build wants the real thing.
+(define ldr-source-only? (make-thread-parameter #f))
+
+;; The base path of the first usable artifact for `name` on the source roots, or
+;; #f. This is the load side: the JVM finds compiled output through the classpath,
+;; never through *compile-path* itself, so a compile-path takes effect on load only
+;; once it is also a root.
+(define (cpath-find-artifact name)
+  (and (not (ldr-source-only?))
+       (let ((rel (ns-name->rel name)))
+         (let loop ((roots source-roots))
+           (and (pair? roots)
+                (let ((base (string-append (car roots) "/" rel)))
+                  (if (cpath-artifact-valid? name base) base (loop (cdr roots)))))))))
+
+;; The first artifact on the roots whatever its state, for the error path: an
+;; artifact-only deployment that a jolt upgrade invalidated otherwise reports only
+;; that the SOURCE is missing, which says nothing about the .so sitting right there.
+(define (cpath-any-artifact name)
+  (let ((rel (ns-name->rel name)))
+    (let loop ((roots source-roots))
+      (and (pair? roots)
+           (let ((base (string-append (car roots) "/" rel)))
+             (if (file-exists? (cpath-so-file base)) base (loop (cdr roots))))))))
+
+;; *compile-path* as a directory string, or #f when it is nil — the case
+;; Compiler.compile reports as "*compile-path* not set".
+(define (cpath-dir)
+  (let ((v (guard (e (#t jolt-nil)) (var-deref "clojure.core" "*compile-path*"))))
+    (and (string? v) v)))
+
+;; *compile-files* is true for the extent of a compile, as core.clj's compile binds
+;; it — both so library code can read it and because load-namespace* branches on it
+;; (cpath-compiling-dir) to carry the compile through the load closure.
+(define (cpath-with-compile-files thunk)
+  (let ((cell (var-cell-lookup "clojure.core" "*compile-files*")))
+    (if (not cell)
+        (thunk)
+        (dynamic-wind
+          (lambda () (dyn-binding-stack (cons (list (cons cell #t)) (dyn-binding-stack))))
+          thunk
+          (lambda () (dyn-binding-stack (cdr (dyn-binding-stack))))))))
+
+;; Publish under `dir`, borrowing the AOT cache's discipline: compile to a
+;; pid-unique temp and rename(2) each file into place, .so last, so a concurrent
+;; reader sees a complete artifact or none. The stale .so goes first for the same
+;; reason — until the new one lands there must be no signal pointing at old .meta.
+(define (cpath-publish! name dir captured deps)
+  (let* ((base (string-append dir "/" (ns-name->rel name)))
+         (pid (number->string (get-process-id)))
+         (tmp-scm (string-append base ".tmp" pid ".scm"))
+         (tmp-so  (string-append base ".tmp" pid ".so")))
+    (aot-mkdir-p (path-parent base))
+    (guard (e (else (delete-file tmp-scm #f) (delete-file tmp-so #f) (raise e)))
+      (let ((out (open-output-file tmp-scm 'replace)))
+        (put-string out captured) (close-output-port out))
+      ;; compile-file narrates to current-output-port by default — swallow it so a
+      ;; compile can't corrupt the running program's stdout.
+      (parameterize ((current-output-port (open-output-string)))
+        (compile-file tmp-scm tmp-so))
+      (delete-file (cpath-so-file base) #f)
+      (rename-file tmp-scm (cpath-scm-file base))
+      (cpath-write-meta! (cpath-meta-file base) (cpath-meta-lines name deps))
+      (rename-file tmp-so (cpath-so-file base)))
+    base))
+
+;; The compiling load: evaluate the namespace while capturing its emitted Scheme,
+;; then publish that under `dir`. Returns the artifact base, or #f when the file
+;; emitted nothing to compile.
+;;
+;; load-namespace* takes this branch instead of the plain load whenever
+;; *compile-files* is set, which is how the JVM's `(compile 'lib)` ends up emitting
+;; classes for lib's whole load closure rather than lib alone (RT.load: when
+;; COMPILE_FILES is true and the class wasn't already loaded, compile the .clj).
+;; Without it a compiled namespace is undeployable — its artifact still re-runs its
+;; requires, and those would find nothing.
+(define (cpath-compile-load name file dir)
+  (let* ((src (ldr-read-source file))
+         (sink (aot-new-dep-sink))
+         (captured (parameterize ((aot-dep-sink sink)) (aot-capture-load file src))))
+    (and (string? captured) (fx>? (string-length captured) 0)
+         (cpath-publish! name dir captured (filter aot-cacheable-file (vector-ref sink 0))))))
+
+;; Is a compile in progress and pointed somewhere? Install-owned source is exempt:
+;; it is part of the runtime (already covered by the runtime fingerprint), and
+;; emitting a copy of the stdlib into the user's output directory would shadow the
+;; runtime's own on every later load.
+(define (cpath-compiling-dir file)
+  (and (jolt-truthy? (guard (e (#t #f)) (var-deref "clojure.core" "*compile-files*")))
+       (not (ldr-install-file? file))
+       (cpath-dir)))
+
+;; clojure.core/compile — core.clj's (binding [*compile-files* true] (load-one lib
+;; true true)) wrapped in Compiler.compile's *compile-path* check. Like load-one it
+;; loads the namespace into the running image (ignoring the already-loaded dedup,
+;; so a compile always recompiles), verifies the file actually produced the
+;; namespace, marks it loaded, and returns the lib.
+(define (jolt-compile lib)
+  (let* ((name (cond ((symbol-t? lib) (symbol-t-name lib))
+                     ((string? lib) lib)
+                     (else (throw-jvm 'java.lang.IllegalArgumentException
+                                      (string-append "compile expects a namespace symbol, got "
+                                                     (jolt-pr-str lib))))))
+         (dir (or (cpath-dir)
+                  (throw-jvm 'java.lang.RuntimeException "*compile-path* not set")))
+         (file (or (find-ns-file name)
+                   (throw-jvm 'java.io.FileNotFoundException
+                              (string-append "Could not locate " (ns-name->rel name)
+                                             ".jolt (or .clj/.cljc) on the source roots"))))
+         (saved (chez-current-ns))
+         (base (guard (e (else (set-chez-ns! saved) (raise e)))
+                 (cpath-with-compile-files
+                   (lambda () (cpath-compile-load name file dir))))))
+    (set-chez-ns! saved)
+    (unless (or (ns-has-vars? name) (hashtable-ref ns-registry name #f))
+      (throw-jvm 'java.lang.Exception
+                 (string-append "namespace '" name "' not found after loading '" file "'")))
+    (unless base
+      (throw-jvm 'java.lang.RuntimeException
+                 (string-append "compile produced no code for " name)))
+    (ldr-mark-loaded! name)
+    (ns-loaded-hook name file)
+    lib))
+(def-var! "clojure.core" "compile" jolt-compile)
+
 ;; :reload-all forces the dedup off for the whole dynamic extent of a load (the
 ;; loader learns dependencies only as it loads them), so every namespace pulled in
 ;; reloads too — mirroring clojure.core. :verbose prints each load to stderr.
@@ -798,11 +1031,16 @@
 (define (load-namespace* name force?)
   (let ((was-loaded? (ns-dedup-loaded? name)))
     (unless (and (not force?) (not (ldr-reload-all?)) was-loaded?)
-      (let ((file (find-ns-file name)))
+      ;; A compiled artifact on the roots wins over the source, like RT.load
+      ;; preferring a .class to its .clj. :reload does NOT bypass it, also like the
+      ;; JVM: the artifact is only offered here when it still matches the source it
+      ;; was built from, so there is nothing stale for a reload to get past.
+      (let* ((file (find-ns-file name))
+             (art (cpath-find-artifact name)))
         (cond
-          (file
+          ((or art file)
            (when (ldr-verbose?)
-             (display (string-append "Loading " name " from " file "\n")
+             (display (string-append "Loading " name " from " (or art file) "\n")
                       (current-error-port)))
            (ldr-mark-loaded! name)            ; mark before load so a cycle terminates
            (let ((saved (chez-current-ns)))
@@ -810,9 +1048,18 @@
                          (set-chez-ns! saved)          ; restore ns, then roll the mark back
                          (unless was-loaded? (ldr-unmark-loaded! name))
                          (raise e)))
-                (aot-load-or-compile name file force?))
+                (cond
+                  (art (load (cpath-so-file art)))
+                  ;; inside a compile, loading from source also emits the artifact
+                  ;; — RT.load's COMPILE_FILES branch, which is what carries a
+                  ;; compile through to the whole load closure.
+                  ((cpath-compiling-dir file)
+                   => (lambda (dir) (cpath-compile-load name file dir)))
+                  (else (aot-load-or-compile name file force?))))
               (set-chez-ns! saved)             ; restore the current ns (thread-local)
-              (ns-loaded-hook name file)))
+              ;; the hook feeds `jolt build`, which needs the SOURCE path; an
+              ;; artifact-only namespace has none to give.
+              (ns-loaded-hook name (or file art))))
           ;; No source file but the namespace exists in memory (AOT'd into a built
           ;; binary): it's already defined — mark loaded and move on.
           ((ns-has-vars? name)
@@ -822,8 +1069,21 @@
           ((hashtable-ref ns-registry name #f)
            (ldr-mark-loaded! name))
           (else
-            (throw-jvm (quote java.io.FileNotFoundException) (string-append "Could not locate " (ns-name->rel name)
-                                     ".jolt (or .clj/.cljc) on the source roots"))))))))
+            (let ((art (cpath-any-artifact name)))
+              (throw-jvm (quote java.io.FileNotFoundException)
+                (string-append "Could not locate " (ns-name->rel name)
+                               ".jolt (or .clj/.cljc) on the source roots"
+                               (cond
+                                 ((not art) "")
+                                 ;; a build asked for source and there is only an
+                                 ;; artifact — say that, rather than blame the artifact
+                                 ((ldr-source-only?)
+                                  (string-append "; only the compiled " (cpath-so-file art)
+                                                 " is there, and a build emits from source"))
+                                 (else
+                                   (string-append "; " (cpath-so-file art)
+                                                  " was compiled by a different jolt build, or"
+                                                  " a namespace it requires has changed — recompile it"))))))))))))
 
 ;; load-file: load an explicit path (a `run FILE`), in the current ns.
 (define (jolt-load-file path)

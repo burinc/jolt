@@ -68,6 +68,20 @@
    :jvm "throws ArithmeticException (primitive long add overflows at 2^63)"
    :jolt "returns 9223372036854775812 (bignum-literal operand demotes the loop var to generic; exact result)"
    :note "Corpus row 3754. The bignum literal (2^63-1) exceeds jolt's 2^60-1 fixnum max, so it blocks :long and jolt stays exact; the JVM keeps primitive-long arithmetic and throws."}
+  ;; *allow-unresolved-vars* true. Both sides stop throwing "Unable to resolve
+  ;; symbol" at resolve time; what they build from the unresolved name differs.
+  ;; Compiler.resolveIn hands the symbol back and analyzeSymbol wraps it in an
+  ;; UnresolvedVarExpr, whose emit() writes no bytecode and whose eval() throws —
+  ;; so the form either fails later with "UnresolvedVarExpr cannot be evalled" or
+  ;; produces a method that fails verification (VerifyError: operand stack
+  ;; underflow). jolt emits a late-bound var-ref in the compiling namespace, so
+  ;; the name works once a later eval defines it. That is what nREPL binds the
+  ;; var for, and it is the only reading under which the flag is useful.
+  {:category :namespace-model
+   :behavior "(binding [*allow-unresolved-vars* true] (eval '(defn f [] later))) then (def later 42), (f)"
+   :jvm "VerifyError at the defn (UnresolvedVarExpr emits nothing)"
+   :jolt "42 — the unresolved name compiles to a late-bound var-ref"
+   :note "Deliberate. The JVM's UnresolvedVarExpr is unusable in every position; jolt implements the flag's intent."}
   ;; subvec copies its slice (O(n)) instead of sharing the source vector's tail (JVM O(1)).
   {:category :impl-detail
    :behavior "subvec allocates an O(n) copy"

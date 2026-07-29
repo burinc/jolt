@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`clojure.core/compile` and a working `*compile-path*`.** `*compile-path*` was
+  a var jolt exposed with the JVM's default and nothing behind it, and `compile`
+  did not exist at all. Both now work the way core.clj and `Compiler.compile`
+  describe: `(compile 'my.lib)` binds `*compile-files*`, loads the lib, and writes
+  its compiled form under `*compile-path*`; a nil `*compile-path*` raises
+  `*compile-path* not set`. The artifact is a Chez fasl of the emitted Scheme —
+  the same thing the AOT cache produces — beside the `.scm` it was built from and
+  a `.meta` describing what it was built against, in place of the JVM's `.class`
+  files. Like the JVM, the compile carries through the lib's whole load closure,
+  and the output directory has to be a source root (jolt's classpath) before a
+  later load will pick it up, so `(compile 'app)` into a directory you then put on
+  the roots gives you a project that runs with no source present.
+
+  `RT.load` prefers a `.class` to its `.clj` on mtime. jolt compares a content
+  hash instead — the rule the AOT cache already decides by, and immune to a bare
+  `touch` — and refuses an artifact outright unless the jolt version and runtime
+  fingerprint in `.meta` match, since a fasl from another build calls runtime
+  helpers that may be gone. `.meta` also records the direct requires and their
+  hashes, so editing a namespace this one requires invalidates it; a change
+  further down the graph does not, the same discipline JVM AOT needs.
+
+### Fixed
+
+- **A cached namespace swallowed the install-owned namespaces it required, and
+  replaying them undid what its siblings registered.** The AOT capture teed every
+  form compiled while a namespace loaded. A cacheable require redirected that — the
+  nested `aot-capture-load` opens its own port — but an install-owned require
+  bypasses the cache entirely and so never did, and its forms landed in the
+  *requiring* namespace's artifact. `jolt.time` is a 14-line `ns` form; it cached as
+  412 KB carrying whole second copies of eight `jolt/time/*` stdlib namespaces.
+
+  On a cache hit those copies replay after the require that already loaded them
+  properly, so any top-level registration a sibling namespace layered on top gets
+  undone. `jolt.time.local` registers an ISO-only `java.time.LocalDate/parse` that
+  ignores a formatter; `jolt.time.fmt` overrides it with the pattern-aware one. Cold,
+  the override held. Warm, `local`'s baked copy landed back on top of it, and
+  `(t/parse-date "2020/02/02" (t/formatter "yyyy/MM/dd"))` silently parsed as ISO —
+  `substring: 11 and 11 are not valid start/end indices`. Deterministic: cold green,
+  warm red, `JOLT_AOT_CACHE=0` green.
+
+  The capture is now bound to the file it was opened for, so no nested load can
+  append to it, whether the cache handles that namespace or bypasses it. `jolt.time`
+  caches as 582 bytes — its `ns` form, which is all it has. `clojure.core/compile`
+  shares the capture and had inherited the same bug.
+
+- **`*allow-unresolved-vars*` affects resolution.** `clojure.core/*allow-unresolved-vars*`
+  read `false` and did nothing; the analyzer consulted a separate
+  `jolt.analyzer/*allow-unresolved-vars*` that only jolt's own nREPL knew to bind.
+  There is now one var, clojure.core's, read through `jolt.host/allow-unresolved-vars?`
+  the way `Compiler.resolveIn` reads `RT.ALLOW_UNRESOLVED_VARS` — and like the JVM
+  only for an unqualified symbol with no mapping, so `resolve`/`ns-resolve` still
+  answer `nil` and a qualified symbol still throws. Bound true, jolt emits a
+  late-bound var-ref in the compiling namespace, so a name defined by a later eval
+  resolves; the JVM's `UnresolvedVarExpr` emits no bytecode and fails later with a
+  `VerifyError`, which is tracked in `known-divergences.edn`.
+
 ## [0.5.10] - 2026-07-28
 
 An optimized build no longer discards a `throw` written in a map value that the

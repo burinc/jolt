@@ -188,7 +188,7 @@
         out (with-out-str
               (try (when (and ns-str (not (str/blank? ns-str)) (find-ns (symbol ns-str)))
                      (in-ns (symbol ns-str)))
-                   (reset! result (binding [ana/*allow-unresolved-vars* true]
+                   (reset! result (binding [*allow-unresolved-vars* true]
                                     (load-string code)))
                    (catch :default e
                      (reset! err (str (err-msg e)

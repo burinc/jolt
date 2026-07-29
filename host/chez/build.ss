@@ -755,7 +755,8 @@
   (let ((app-order '()))
     (set-ns-loaded-hook!
       (lambda (name file) (set! app-order (cons (cons name file) app-order))))
-    (load-namespace entry-ns)
+    (parameterize ((ldr-source-only? #t))    ; emit from source, never a compiled artifact
+      (load-namespace entry-ns))
     (set-ns-loaded-hook! (lambda (name file) #f))
     ;; Build ordered ns list from the require graph (static scan of source files)
     ;; merged with the hook's load order. The graph gives post-order deps; the

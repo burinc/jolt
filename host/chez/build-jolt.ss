@@ -200,8 +200,9 @@
 (define (jb-emit-cli-ns out)
   (let ((order '()))
     (set-ns-loaded-hook! (lambda (name file) (set! order (cons (cons name file) order))))
-    (load-namespace "jolt.main")
-    (load-namespace "jolt.deps")
+    (parameterize ((ldr-source-only? #t))    ; emit from source, never a compiled artifact
+      (load-namespace "jolt.main")
+      (load-namespace "jolt.deps"))
     (set-ns-loaded-hook! (lambda (name file) #f))
     (let ((ordered (reverse order)))   ; deps complete loading before requirers -> deps-first
       (when (null? ordered)

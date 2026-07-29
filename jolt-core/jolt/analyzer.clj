@@ -30,7 +30,7 @@
                                form-uuid-value? form-uuid-value-source
                                form-ns-value? form-ns-value-name
                                form-var-value? form-var-value-ns form-var-value-name
-                               unchecked-math?
+                               unchecked-math? allow-unresolved-vars?
                                form-macro? form-expand-1 resolve-global resolvable-names
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
                                record-type? record-ctor-key deftype-ctor-class form-position late-bind?
@@ -48,12 +48,6 @@
 
 (defn- uncompilable [why]
   (throw (str "jolt/uncompilable: " why)))
-
-;; Default false: an unresolved symbol throws "Unable to resolve symbol" wherever
-;; it appears — top level or nested body — matching JVM Clojure. nREPL binds this
-;; to true for interactive development, where a name may be defined by a later
-;; eval and a late-bound var is the more useful behavior.
-(def ^:dynamic *allow-unresolved-vars* false)
 
 (def ^:private gensym-counter (atom 0))
 (defn- gen-name [prefix]
@@ -844,9 +838,11 @@
                 ;; Legitimate forward references are unaffected: declare and
                 ;; (def name) intern a resolvable cell, so they resolve as :var,
                 ;; as do the clojure.core primitives the host declares up front.
-                ;; *allow-unresolved-vars* keeps nREPL permissive, where a name
-                ;; may legitimately arrive in a later eval.
-                (if *allow-unresolved-vars*
+                ;; clojure.core/*allow-unresolved-vars* — the JVM's
+                ;; RT.ALLOW_UNRESOLVED_VARS, read here the way Compiler.resolveIn
+                ;; reads it — keeps nREPL permissive, where a name may
+                ;; legitimately arrive in a later eval.
+                (if (allow-unresolved-vars?)
                   (var-ref (compile-ns ctx) nm)
                   (resolve-error ctx nm env)))))))
 

@@ -880,7 +880,33 @@
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44* 0) (set! *set-u44* 9))" :expected :throws}
   {:suite "vars / set! binding" :expr "(do (def ^:dynamic *set-u44b* 0) [(binding [*set-u44b* 99] (set! *set-u44b* 42) *set-u44b*) *set-u44b*])" :expected "[42 0]"}
   {:suite "vars / binding dynamic" :expr "(do (def not-dyn-u44 0) (binding [not-dyn-u44 1] not-dyn-u44))" :expected :throws}
-  {:suite "resolution / strict default" :expr "(binding [jolt.analyzer/*allow-unresolved-vars* false] jolt.analyzer/*allow-unresolved-vars*)" :expected "false"}
+  {:suite "resolution / strict default" :expr "(binding [*allow-unresolved-vars* false] *allow-unresolved-vars*)" :expected "false"}
+  ;; clojure.core/*allow-unresolved-vars* is the var the analyzer reads, like
+  ;; RT.ALLOW_UNRESOLVED_VARS on the JVM: bound true, an unqualified symbol with
+  ;; no mapping resolves late instead of throwing at compile time.
+  {:suite "resolution / allow-unresolved-vars" :label "true late-binds an unresolved name" :expected "42"
+   :expr "(binding [*allow-unresolved-vars* true] (eval '(defn auv-late [] auv-answer))) (eval '(def auv-answer 42)) ((resolve 'auv-late))"}
+  {:suite "resolution / allow-unresolved-vars" :label "default throws on the same form" :expected :throws
+   :expr "(eval '(defn auv-strict [] auv-missing))"}
+  {:suite "resolution / allow-unresolved-vars" :label "a qualified symbol is unaffected" :expected :throws
+   :expr "(binding [*allow-unresolved-vars* true] (eval 'no.such.ns/auv-q))"}
+  ;; clojure.core/compile writes the namespace's compiled artifact under
+  ;; *compile-path* and returns the lib, like core.clj's compile; a nil
+  ;; *compile-path* raises "*compile-path* not set", like Compiler.compile.
+  ;; The artifact is only picked up once its directory is also a source root —
+  ;; jolt's classpath — which is the JVM's "that directory too must be in the
+  ;; classpath" caveat. `out` is a second :local/root project so add-deps puts
+  ;; out/src on the roots.
+  {:suite "compile / compile-path" :label "nil *compile-path* is an error" :expected :throws
+   :expr "(binding [*compile-path* nil] (compile 'clojure.string))"}
+  {:suite "compile / compile-path" :label "unknown namespace is an error" :expected :throws
+   :expr "(compile 'no.such.namespace.at.all)"}
+  {:suite "compile / compile-path" :label "writes an artifact and returns the lib" :expected "[cpath.core true :compiled]"
+   :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-compilepath-unit\")] (jolt.host/sh (str \"rm -rf \" d)) (jolt.host/sh (str \"mkdir -p \" d \"/src/cpath \" d \"/out\")) (spit (str d \"/deps.edn\") \"{}\") (spit (str d \"/out/deps.edn\") \"{}\") (spit (str d \"/src/cpath/core.clj\") \"(ns cpath.core) (defn v [] :compiled)\") (jolt.deps/add-deps {:deps {'cpath/cpath {:local/root d}}}) [(binding [*compile-path* (str d \"/out/src\")] (compile 'cpath.core)) (.exists (java.io.File. (str d \"/out/src/cpath/core.so\"))) ((resolve 'cpath.core/v))]))"}
+  {:suite "compile / compile-path" :label "a compiled namespace loads with no source present" :expected ":compiled"
+   :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-compilepath-unit2\")] (jolt.host/sh (str \"rm -rf \" d)) (jolt.host/sh (str \"mkdir -p \" d \"/src/cpath2 \" d \"/out\")) (spit (str d \"/deps.edn\") \"{}\") (spit (str d \"/out/deps.edn\") \"{}\") (spit (str d \"/src/cpath2/core.clj\") \"(ns cpath2.core) (defn v [] :compiled)\") (jolt.deps/add-deps {:deps {'cpath/cpath {:local/root d}}}) (binding [*compile-path* (str d \"/out/src\")] (compile 'cpath2.core)) (jolt.deps/add-deps {:deps {'cpathout/cpathout {:local/root (str d \"/out\")}}}) (jolt.host/sh (str \"rm -rf \" d \"/src\")) (require 'cpath2.core :reload) ((resolve 'cpath2.core/v))))"}
+  {:suite "compile / compile-path" :label "an edited source beats a stale artifact" :expected ":edited"
+   :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-compilepath-unit3\")] (jolt.host/sh (str \"rm -rf \" d)) (jolt.host/sh (str \"mkdir -p \" d \"/src/cpath3 \" d \"/out\")) (spit (str d \"/deps.edn\") \"{}\") (spit (str d \"/out/deps.edn\") \"{}\") (spit (str d \"/src/cpath3/core.clj\") \"(ns cpath3.core) (defn v [] :compiled)\") (jolt.deps/add-deps {:deps {'cpath/cpath {:local/root d}}}) (binding [*compile-path* (str d \"/out/src\")] (compile 'cpath3.core)) (jolt.deps/add-deps {:deps {'cpathout/cpathout {:local/root (str d \"/out\")}}}) (spit (str d \"/src/cpath3/core.clj\") \"(ns cpath3.core) (defn v [] :edited)\") (require 'cpath3.core :reload) ((resolve 'cpath3.core/v))))"}
   {:suite "jolt-version" :label "*jolt-version* is a non-blank string" :expected "true" :expr "(and (string? *jolt-version*) (pos? (count *jolt-version*)))"}
   {:suite "jolt-version" :label "property and host fn match the var" :expected "true" :expr "(= *jolt-version* (System/getProperty \"jolt.version\") (jolt.host/jolt-version))"}
   {:suite "add-deps" :label "inline :local/root dep becomes requirable" :expected ":pong" :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-adddep-unit\")] (jolt.host/sh (str \"rm -rf \" d)) (jolt.host/sh (str \"mkdir -p \" d \"/src/adddep\")) (spit (str d \"/deps.edn\") \"{}\") (spit (str d \"/src/adddep/core.clj\") \"(ns adddep.core) (defn ping [] :pong)\") (jolt.deps/add-deps {:deps {'adddep/adddep {:local/root d}}}) (require 'adddep.core) ((resolve 'adddep.core/ping))))"}
