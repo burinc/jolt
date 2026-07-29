@@ -187,6 +187,21 @@
          (dir (if (and pwd (string? pwd) (not (string=? pwd ""))) pwd ".")))
     (file-exists? (string-append dir "/deps.edn"))))
 
+;; Is this argv a `build`? The build driver has to be loaded before jolt.main
+;; runs, and the command can sit behind the global options that re-dispatch the
+;; rest of the argv through -main (-Sdeps '<edn>', -A:aliases), so peel those off
+;; the same way -main does instead of only testing the head — `jolt -Sdeps '…'
+;; build -m app.core` used to reach cmd-build with jolt.host/build-binary unbound.
+(define (jolt-cli-build-cmd? args)
+  (cond
+    ((null? args) #f)
+    ((string=? (car args) "build") #t)
+    ((string=? (car args) "-Sdeps")
+     (and (pair? (cdr args)) (jolt-cli-build-cmd? (cddr args))))
+    ((and (>= (string-length (car args)) 2) (string=? (substring (car args) 0 2) "-A"))
+     (jolt-cli-build-cmd? (cdr args)))
+    (else #f)))
+
 (define (jolt-cli-run cli-args prepare-build!)
   (guard (v (#t (jolt-report-uncaught v)))
     (jolt-cli-dispatch cli-args prepare-build!)
@@ -214,7 +229,7 @@
        (jolt-run-expr-string (jolt-read-all-stdin) (drop-end-of-options (cdr cli-args)) #f))
       ;; otherwise dispatch the argv through jolt.main/-main
       (else
-       (when (and (pair? cli-args) (string=? (car cli-args) "build"))
+       (when (jolt-cli-build-cmd? cli-args)
          (prepare-build!))
        (load-namespace "jolt.main")
        (let ((mainv (var-deref "jolt.main" "-main")))
