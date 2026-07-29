@@ -4039,6 +4039,8 @@
   {:suite "reader / top-level splice" :label "#?@ at top level throws" :expected "throws" :actual "(read-string \"#?@(:clj [1])\")" :portability :common}
   {:suite "reader / record literal" :label "#ns.Type{} constructs record in read-string" :expected "42" :actual "(do (defrecord Rdlit [a]) (:a (read-string \"#user.Rdlit{:a 42}\")))" :portability :common}
   {:suite "reader / record vector ctor" :label "#ns.Type[] constructs record from vector" :expected "\"a\"" :actual "(do (defrecord Rdlvec [x y]) (:x (read-string \"#user.Rdlvec[\\\"a\\\" 2]\")))" :portability :common}
+  {:suite "reader / qualified arrow call" :label "a qualified ->name call is a list, not a record ctor to apply" :expected "true" :actual "(= (list 'u/->long 1) (read-string \"(u/->long 1)\"))" :portability :common}
+  {:suite "reader / qualified arrow call" :label "a qualified map->name call is a list too" :expected "true" :actual "(= (list 'u/map->Foo {:a 1}) (read-string \"(u/map->Foo {:a 1})\"))" :portability :common}
   {:suite "reader / EOF in unicode escape" :label "\\\\u with <4 hex digits throws" :expected "throws" :actual "(read-string \"\\\"\\\\uD\\\"\")" :portability :common}
   {:suite "reader / EOF in regex backslash" :label "trailing backslash in regex throws" :expected "throws" :actual "(read-string \"#\\\"a\\\\\")" :portability :common}
   {:suite "syntax-quote / defmacro qualified" :label "`defmacro qualifies to ns, not bare" :expected "true" :actual "(not= 'defmacro (second (read-string \"`defmacro\")))" :portability :common}

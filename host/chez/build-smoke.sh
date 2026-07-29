@@ -485,6 +485,46 @@ if ! printf '%s' "$got_decl" | grep -q '^declared: true$' || ! printf '%s' "$got
   echo "--- got ----"; echo "$got_decl"; exit 1
 fi
 
+# An install-owned namespace (jolt's own stdlib) that a non-entry app namespace
+# calls AT LOAD TIME has to be emitted BEFORE that namespace. bld-require-closure
+# drops install-owned files, so jolt.time.util reaches the app list only through
+# the loader hook's walked order; appending that order last put it behind oa.lib
+# and the binary died at startup with "Attempting to call unbound fn:
+# #'jolt.time.util/->long". Two levels deep on purpose — the entry namespace is
+# forced last either way, so a one-namespace app hides the bug.
+echo "build smoke: install-owned dep ordering"
+ord_app="$(mktemp -d)/ord-app"
+mkdir -p "$ord_app/src/oa"
+printf '{:paths ["src"]}\n' > "$ord_app/deps.edn"
+cat > "$ord_app/src/oa/lib.clj" <<'ORD_LIB_EOF'
+(ns oa.lib (:require [jolt.time.util :as u]))
+(def n (u/->long 41))
+ORD_LIB_EOF
+cat > "$ord_app/src/oa/core.clj" <<'ORD_EOF'
+(ns oa.core (:require [oa.lib :as lib]))
+(defn -main [& _] (println "ord:" (inc lib/n)))
+ORD_EOF
+ord_out="$(dirname "$out")/ord-bin"
+if ! JOLT_PWD="$ord_app" "$jolt" build -m oa.core -o "$ord_out" >/dev/null 2>&1; then
+  echo "  FAIL: install-owned-dep app build exited non-zero"; exit 1
+fi
+got_ord="$(cd / && "$ord_out" 2>&1)"
+rm -rf "$(dirname "$ord_app")"
+if [ "$got_ord" != "ord: 42" ]; then
+  echo "  FAIL: install-owned dep emitted after its caller — want 'ord: 42', got \`$got_ord\`"; exit 1
+fi
+
+# `build` behind a global option that re-dispatches the rest of the argv through
+# -main (-Sdeps '<edn>', -A:alias). The launcher has to load the build driver
+# before jolt.main runs and used to look for "build" at argv[0] only, so this
+# form reached cmd-build with jolt.host/build-binary still unbound.
+echo "build smoke: -Sdeps before the build command"
+sdeps_out="$(dirname "$out")/sdeps-bin"
+if ! JOLT_PWD="$app" "$jolt" -Sdeps '{}' build -m app.core -o "$sdeps_out" >/dev/null 2>&1; then
+  echo "  FAIL: \`-Sdeps '{}' build\` exited non-zero"; exit 1
+fi
+[ -x "$sdeps_out" ] || { echo "  FAIL: \`-Sdeps '{}' build\` produced no executable"; exit 1; }
+
 # Everything above builds through $jolt, which the make target points at the
 # prebuilt binary. Build one app through the source-mode driver too, so the
 # bin/jolt path a developer actually runs stays gated here and not only as a
@@ -502,4 +542,4 @@ if [ "$jolt" != "bin/jolt" ]; then
   fi
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + source-mode-driver)"
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver)"
