@@ -28,6 +28,29 @@
 (define (register-embedded-resource! name content)
   (hashtable-set! embedded-resources name content))
 (define-record-type embedded-res (fields name content) (nongenerative jolt-embres-v1))
+;; io/resource must answer the SAME surface whichever branch served it. The other
+;; branch hands back a jfile, which carries a deliberate URL-compatibility surface
+;; (getPath / getFile / getProtocol / toURI / …) because the JVM returns a
+;; java.net.URL there. An embedded hit had none of it: .getPath threw and (class r)
+;; read :object, so a caller that resolves a resource to a path — orchard.namespace
+;; /canonical-source does (some-> (io/resource p) .getPath) — worked or failed
+;; depending only on whether the devboot cache had baked that file in.
+;; Registered below (after record-method-dispatch's arm registry exists) rather
+;; than inline, so both branches stay in one place.
+(define (embedded-res-method obj name args)
+  (let ((nm (embedded-res-name obj)))
+    (cond
+      ((string=? name "getPath")     (list nm))
+      ((string=? name "getFile")     (list nm))
+      ((string=? name "getName")     (list (path-last-segment nm)))
+      ((string=? name "toString")    (list nm))
+      ;; embedded content has no file on disk; the JVM would report a jar: URL for
+      ;; a resource inside an artifact, so "jar" is the honest protocol here.
+      ((string=? name "getProtocol") (list "jar"))
+      ((string=? name "exists")      (list #t))
+      ((string=? name "isDirectory") (list #f))
+      ((string=? name "isFile")      (list #t))
+      (else #f))))
 
 ;; --- self-contained build artifacts (jolt-eaj) ------------------------------
 ;; A toolchain-free `jolt build` (the distributed jolt) carries the Chez
@@ -292,6 +315,21 @@
                (r (jfile-method obj method-name rest)))
           (if r (car r) (throw-jvm (quote IllegalArgumentException) (string-append "No matching method for File: " method-name))))
         'pass)))
+;; An embedded resource shares the tier: io/resource returns one of these where a
+;; source root would have yielded a jfile, so it has to answer the same methods.
+(register-method-arm! arm-priority-file
+  (lambda (obj method-name rest-args)
+    (if (embedded-res? obj)
+        (let* ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args)))
+               (r (embedded-res-method obj method-name rest)))
+          (if r (car r)
+              (throw-jvm (quote IllegalArgumentException)
+                         (string-append "No matching method for an embedded resource: " method-name))))
+        'pass)))
+(register-class-arm! embedded-res? (lambda (x) "java.net.URL"))
+;; (str resource) is the resource name, like URL.toString — which also gives the
+;; printer's #object[…] fallback its content.
+(register-str-render! embedded-res? (lambda (x) (embedded-res-name x)))
 
 ;; File methods emitted via jolt-host-call (rt.ss) need jfile dispatch,
 ;; not the string-path shims in the base jolt-host-call. Route through

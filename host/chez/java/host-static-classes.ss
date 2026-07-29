@@ -1023,21 +1023,6 @@
                     (list (cons p (lambda (x) (jt-jolt-strs->list (jolt-invoke tags-fn x))))))))
     jolt-nil))
 
-;; Collection behavior for library-modeled host values: a shim that registers a
-;; Java collection class (an LRU map, a queue, …) also needs the value to take
-;; part in Clojure's seq / lookup / empty / count / contains protocols — the
-;; same arms the built-in host models register Scheme-side. pred is (fn [x]),
-;; handlers (fn [x]) except get's, which is (fn [x k not-found]).
-(define (hsc-public-arm pred handler register!)
-  (let ((p (lambda (x) (jolt-truthy? (jolt-invoke pred x)))))
-    (register! p (lambda args (apply jolt-invoke handler args)))
-    jolt-nil))
-(def-var! "clojure.core" "__register-seq!" (lambda (pred handler) (hsc-public-arm pred handler register-seq-arm!)))
-(def-var! "clojure.core" "__register-get!" (lambda (pred handler) (hsc-public-arm pred handler register-get-arm!)))
-(def-var! "clojure.core" "__register-empty!" (lambda (pred handler) (hsc-public-arm pred handler register-empty-arm!)))
-(def-var! "clojure.core" "__register-count!" (lambda (pred handler) (hsc-public-arm pred handler register-count-arm!)))
-(def-var! "clojure.core" "__register-contains!" (lambda (pred handler) (hsc-public-arm pred handler register-contains-arm!)))
-
 ;; (instance? clojure.lang.IFoo x) for the core clojure.lang interfaces libraries
 ;; branch on — jolt's value model satisfies them, so report it. Matched by the
 ;; interface's last dotted segment, so "clojure.lang.IObj" and "IObj" both hit.
@@ -1161,6 +1146,31 @@
 (def-var! "jolt.host" "table?" (lambda (x) (if (htable? x) #t #f)))
 
 ;; --- java.util.Arrays -------------------------------------------------------
+;; Arrays/sort sorts IN PLACE and returns void, so it writes back through the
+;; array's own backing (a Chez vector, or an flvector for the double/float element
+;; kinds) rather than building a new array — orchard.profile relies on
+;; (doto (Arrays/copyOfRange …) Arrays/sort). list-sort is a stable merge sort,
+;; matching Arrays.sort over objects. The comparator goes through cmp->less, the
+;; shared comparator seam, so a reify/deftype Comparator works here exactly as it
+;; does in sort / sort-by.
+;; JVM overloads: sort(a), sort(a, cmp), sort(a, from, to), sort(a, from, to, cmp).
+;; Two args means a comparator — sort(a, from) is not an overload.
+(define (arrays-sort! a from to cmp)
+  (let* ((bv (jolt-array-vec a))
+         (f (jnum->exact from))
+         (t (if to (jnum->exact to) (ja-len bv)))
+         (less? (cmp->less cmp))
+         (items (let loop ((i f) (acc '()))
+                  (if (fx>=? i t) (reverse acc) (loop (fx+ i 1) (cons (ja-ref bv i) acc))))))
+    (let loop ((i f) (xs (list-sort less? items)))
+      (if (null? xs) jolt-nil
+          (begin (ja-set! bv i (car xs)) (loop (fx+ i 1) (cdr xs)))))))
+(define arrays-sort
+  (case-lambda
+    ((a) (arrays-sort! a 0 #f jolt-compare))
+    ((a cmp) (arrays-sort! a 0 #f cmp))
+    ((a from to) (arrays-sort! a from to jolt-compare))
+    ((a from to cmp) (arrays-sort! a from to cmp))))
 (let ((arrays-statics
        (list
          (cons "equals" (lambda (a b)
@@ -1183,6 +1193,7 @@
                                  (do ((i 0 (fx+ i 1))) ((fx=? i len))
                                    (ja-set! out i (ja-ref src (+ f i))))
                                  (make-jolt-array out kind))))
+         (cons "sort" arrays-sort)
          (cons "toString" (lambda (a) (jolt-pr-str (apply jolt-vector (ja->list (jolt-array-vec a)))))))))
   (register-class-statics! "Arrays" arrays-statics)
   (register-class-statics! "java.util.Arrays" arrays-statics))

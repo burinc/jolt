@@ -1,11 +1,12 @@
 ;; run-sci.ss — SCI conformance: load borkdude/sci's own source (vendor/sci) through
 ;; jolt and require its forms to compile+eval. A real-world Clojure-compatibility
 ;; stress test. Floor-gated like the corpus: a regression below
-;; the floor (or the count today, 211/218) fails. Raise the floor as host gaps close
-;; (the tail is genuine gaps — set! on vars, some macro/def shapes).
+;; the floor (or the count today, 416/424) fails. Raise the floor as host gaps close
+;; (the tail is genuine gaps — the eight remaining failures all reference
+;; sci.impl.copy-vars, a namespace this gate's load-order doesn't cover).
 ;;
 ;;   chez --script host/chez/run-sci.ss
-;;   JOLT_SCI_FLOOR=N    override the floor (default 211)
+;;   JOLT_SCI_FLOOR=N    override the floor (default 416)
 ;;   SCI_VERBOSE=1       print each failing form's error
 (import (chezscheme))
 
@@ -29,32 +30,42 @@
 ;; host libs that don't exist here). Push thread bindings for *warn-on-reflection*
 ;; and *assert* so vendored SCI code that (set! *warn-on-reflection* true) finds a
 ;; thread-local slot instead of throwing "Can't change/establish root binding".
+;;
+;; A #_ discard or a reader conditional with no matching branch (SCI's .cljc has
+;; plenty of `#?(:cljs …)`) reads as rdr-eof with the position ADVANCED — "no
+;; form here", not end of input. Keying the loop on that marker alone stopped the
+;; read at the first one, silently dropping the rest of the file: utils.cljc gave
+;; up 13 forms in, so its allowed-loop/allowed-recur never got defined and every
+;; later file referring to them failed. Branch on `j` like load-jolt-file and
+;; ei-read-all do, and stop only when the position doesn't move.
 (define (load-forms path verbose)
   (let ((src (slurp path)) (ok 0) (fail 0)
         (warn-cell (guard (_ (#t #f)) (jolt-var "clojure.core" "*warn-on-reflection*")))
         (assert-cell (guard (_ (#t #f)) (jolt-var "clojure.core" "*assert*"))))
     (let ((end (string-length src)))
       (let loop ((i 0))
-        (call-with-values (lambda () (rdr-read-form src i end))
-          (lambda (form j)
-            (unless (rdr-eof? form)
-              (guard (e (#t (set! fail (+ fail 1))
-                            (when verbose
-                              (printf "    FAIL: ~a\n" (call-with-string-output-port
-                                (lambda (p) (display-condition (if (condition? e) e
-                                  (make-message-condition (jolt-final-str e))) p)))))))
-                (when warn-cell
-                  (jolt-push-thread-bindings
-                    (jolt-hash-map warn-cell (var-cell-root warn-cell)
-                                   assert-cell (var-cell-root assert-cell))))
-                (dynamic-wind
-                  (lambda () #f)
-                  (lambda ()
-                    (jolt-compile-eval-form form (chez-current-ns))
-                    (set! ok (+ ok 1)))
-                  (lambda ()
-                    (when warn-cell (jolt-pop-thread-bindings)))))
-              (loop j))))))
+        (when (< i end)
+          (call-with-values (lambda () (rdr-read-form src i end))
+            (lambda (form j)
+              (when (> j i)
+                (unless (rdr-eof? form)
+                  (guard (e (#t (set! fail (+ fail 1))
+                                (when verbose
+                                  (printf "    FAIL: ~a\n" (call-with-string-output-port
+                                    (lambda (p) (display-condition (if (condition? e) e
+                                      (make-message-condition (jolt-final-str e))) p)))))))
+                    (when warn-cell
+                      (jolt-push-thread-bindings
+                        (jolt-hash-map warn-cell (var-cell-root warn-cell)
+                                       assert-cell (var-cell-root assert-cell))))
+                    (dynamic-wind
+                      (lambda () #f)
+                      (lambda ()
+                        (jolt-compile-eval-form form (chez-current-ns))
+                        (set! ok (+ ok 1)))
+                      (lambda ()
+                        (when warn-cell (jolt-pop-thread-bindings))))))
+                (loop j)))))))
     (cons ok fail)))
 
 (define verbose (and (getenv "SCI_VERBOSE") #t))
@@ -80,7 +91,7 @@
   load-order)
 
 (printf "\nSCI load: ~a/~a forms ok (~a fail)\n" total-ok (+ total-ok total-fail) total-fail)
-(define floor (let ((s (getenv "JOLT_SCI_FLOOR"))) (if s (string->number s) 211)))
+(define floor (let ((s (getenv "JOLT_SCI_FLOOR"))) (if s (string->number s) 416)))
 (when (< total-ok floor)
   (printf "REGRESSION: ~a forms loaded < floor ~a\n" total-ok floor))
 (flush-output-port)

@@ -64,9 +64,34 @@
   {:suite "defmacro / metadata" :label "attr-map lands on the macro var" :expected "42" :actual "(do (defmacro mdm3 {:attr 42} [x] (list x)) (:attr (meta (var mdm3))))" :portability :jvm}
   {:suite "defmacro / metadata" :label "arglists land on the macro var" :expected "(quote ([x]))" :actual "(do (defmacro mdm4 [x] (list x)) (:arglists (meta (var mdm4))))" :portability :jvm}
   {:suite "defmacro / metadata" :label "multi-arity arglists land on the macro var" :expected "(quote ([x] [x y]))" :actual "(do (defmacro mdm5 ([x] (list x)) ([x y] (list x y))) (:arglists (meta (var mdm5))))" :portability :jvm}
+  {:suite "defmacro / metadata" :label "an explicit attr-map :arglists overrides the derived one" :expected "(quote ([custom]))" :actual "(do (defmacro mdm6 {:arglists (quote ([custom]))} [x] x) (:arglists (meta (var mdm6))))" :portability :jvm}
+  {:suite "defmacro / metadata" :label "name-meta :arglists does not override" :expected "(quote ([x]))" :actual "(do (defmacro ^{:arglists (quote ([onname]))} mdm7 [x] x) (:arglists (meta (var mdm7))))" :portability :jvm}
+  {:suite "defn / metadata" :label "an explicit attr-map :arglists overrides the derived one" :expected "(quote ([custom]))" :actual "(do (defn fdm1 {:arglists (quote ([custom]))} [x] x) (:arglists (meta (var fdm1))))" :portability :common}
+  {:suite "defn / metadata" :label "name-meta :arglists does not override" :expected "(quote ([x]))" :actual "(do (defn ^{:arglists (quote ([onname]))} fdm2 [x] x) (:arglists (meta (var fdm2))))" :portability :common}
+  {:suite "defn / metadata" :label "docstring and attr-map both land beside arglists" :expected "[\"d\" 42 (quote ([x]))]" :actual "(do (defn fdm3 \"d\" {:attr 42} [x] x) [(:doc (meta (var fdm3))) (:attr (meta (var fdm3))) (:arglists (meta (var fdm3)))])" :portability :common}
   {:suite "def / metadata" :label "a class tag lands on the var as a Class" :expected "[true \"java.lang.Thread\"]" :actual "(do (def ^Thread tdm1 nil) [(class? (:tag (meta (var tdm1)))) (.getName (:tag (meta (var tdm1))))])" :portability :jvm}
   {:suite "def / metadata" :label "clojure.string/trim carries its ^String tag" :expected "java.lang.String" :actual "(do (require (quote clojure.string)) (:tag (meta (var clojure.string/trim))))" :portability :jvm}
   {:suite "sort / comparator" :label "sort accepts a reify Comparator" :expected "(quote (1 2 3))" :actual "(sort (reify java.util.Comparator (compare [_ a b] (compare a b))) (quote (3 1 2)))" :portability :jvm}
+  {:suite "sort / comparator" :label "sort accepts a deftype Comparator" :expected "(quote (1 2 3))" :actual "(do (deftype DCmp1 [] java.util.Comparator (compare [_ a b] (compare a b))) (sort (DCmp1.) (quote (3 1 2))))" :portability :jvm}
+  {:suite "sort / comparator" :label "sort-by accepts a reify Comparator" :expected "(quote (1 2 3))" :actual "(sort-by identity (reify java.util.Comparator (compare [_ a b] (compare a b))) (quote (3 1 2)))" :portability :jvm}
+  {:suite "sort / comparator" :label "sort-by accepts a deftype Comparator" :expected "(quote (1 2 3))" :actual "(do (deftype DCmp2 [] java.util.Comparator (compare [_ a b] (compare a b))) (sort-by identity (DCmp2.) (quote (3 1 2))))" :portability :jvm}
+  {:suite "sort / comparator" :label "sorted-set-by accepts a reify Comparator" :expected "#{1 2 3}" :actual "(into (sorted-set-by (reify java.util.Comparator (compare [_ a b] (compare a b)))) [3 1 2])" :portability :jvm}
+  {:suite "sort / comparator" :label "sorted-map-by accepts a reify Comparator" :expected "{1 :a, 2 :b, 3 :c}" :actual "(into (sorted-map-by (reify java.util.Comparator (compare [_ a b] (compare a b)))) {3 :c 1 :a 2 :b})" :portability :jvm}
+  {:suite "sort / comparator" :label "a boolean less-than fn still works" :expected "(quote (1 2 3))" :actual "(sort < (quote (3 1 2)))" :portability :common}
+  {:suite "interop / Arrays sort" :label "sorts a long-array in place" :expected "[1 2 3]" :actual "(let [a (long-array [3 1 2])] (java.util.Arrays/sort a) (vec a))" :portability :jvm}
+  {:suite "interop / Arrays sort" :label "sorts a double-array in place" :expected "[1.5 2.5 3.5]" :actual "(let [a (double-array [3.5 1.5 2.5])] (java.util.Arrays/sort a) (vec a))" :portability :jvm}
+  {:suite "interop / Arrays sort" :label "sorts a char-array in place" :expected "[\\a \\b \\c]" :actual "(let [a (char-array [\\c \\a \\b])] (java.util.Arrays/sort a) (vec a))" :portability :jvm}
+  {:suite "interop / Arrays sort" :label "the range arity leaves the rest untouched" :expected "[9 1 2 3 8]" :actual "(let [a (long-array [9 3 1 2 8])] (java.util.Arrays/sort a 1 4) (vec a))" :portability :jvm}
+  {:suite "interop / Arrays sort" :label "the comparator arity takes a reify Comparator" :expected "[3 2 1]" :actual "(let [a (into-array Long [1 3 2])] (java.util.Arrays/sort a (reify java.util.Comparator (compare [_ x y] (compare y x)))) (vec a))" :portability :jvm}
+  {:suite "interop / Arrays sort" :label "returns nil, sorting for effect" :expected "nil" :actual "(let [a (long-array [2 1])] (java.util.Arrays/sort a))" :portability :jvm}
+  {:suite "interop / Arrays sort" :label "doto over copyOfRange" :expected "[1 2 3]" :actual "(vec (doto (java.util.Arrays/copyOfRange (long-array [9 3 1 2]) 1 4) java.util.Arrays/sort))" :portability :jvm}
+  {:suite "arrays / areduce + amap" :label "areduce sums an array" :expected "6" :actual "(let [a (long-array [1 2 3])] (areduce a i s 0 (+ s (aget a i))))" :portability :common}
+  {:suite "arrays / areduce + amap" :label "areduce over a double-array" :expected "4.0" :actual "(let [a (double-array [1.5 2.5])] (areduce a i s 0.0 (+ s (aget a i))))" :portability :common}
+  {:suite "arrays / areduce + amap" :label "areduce of an empty array is the init" :expected "42" :actual "(let [a (long-array [])] (areduce a i s 42 (+ s (aget a i))))" :portability :common}
+  {:suite "arrays / areduce + amap" :label "areduce sees enclosing locals" :expected "60" :actual "(let [a (long-array [3 1 2]) m 10] (areduce a i s 0 (+ s (* m (aget a i)))))" :portability :common}
+  {:suite "arrays / areduce + amap" :label "amap maps each element" :expected "[2 4 6]" :actual "(let [a (long-array [1 2 3])] (vec (amap a i r (* 2 (aget a i)))))" :portability :common}
+  {:suite "arrays / areduce + amap" :label "amap leaves the source untouched" :expected "[1 2 3]" :actual "(let [a (long-array [1 2 3])] (amap a i r (* 2 (aget a i))) (vec a))" :portability :common}
+  {:suite "arrays / areduce + amap" :label "amap over a double-array" :expected "[3.0 5.0]" :actual "(let [a (double-array [1.5 2.5])] (vec (amap a i r (* 2.0 (aget a i)))))" :portability :common}
   {:suite "io / *out*" :label "println honors a rebound *out*" :expected "\"hi\\n\"" :actual "(binding [*out* (java.io.StringWriter.)] (println \"hi\") (str *out*))" :portability :jvm}
   {:suite "interop / Integer" :label "Integer/compare is a 3-way int comparison" :expected "[-1 0 1]" :actual "[(Integer/compare 2 3) (Integer/compare 3 3) (Integer/compare 4 3)]" :portability :jvm}
   {:suite "interop / Keyword table" :label "the keyword intern table is reflectively visible" :expected "[true \"tt\"]" :actual "(do (keyword \"tt\" \"tt-kw\") (let [f (doto (.getDeclaredField clojure.lang.Keyword \"table\") (.setAccessible true))] [(contains? (.get f nil) (quote tt/tt-kw)) (namespace (some (fn [s] (and (= (name s) \"tt-kw\") s)) (keys (.get f nil))))]))" :portability :jvm}
@@ -1631,7 +1656,11 @@
   ;; place) and dynamic binding (read goes through the binding-aware path).
   {:suite "vars / cached reference stays correct" :label "redefinition is seen through a cached ref" :expected "2" :actual "(do (def x 1) (defn f [] x) (def x 2) (f))" :portability :common}
   {:suite "vars / cached reference stays correct" :label "dynamic binding is seen through a cached ref" :expected "[1 9 1]" :actual "(do (def ^:dynamic *d* 1) (defn g [] *d*) [(g) (binding [*d* 9] (g)) (g)])" :portability :common}
-  {:suite "vars / cached reference stays correct" :label "forward reference resolves once the var is defined" :expected "42" :actual "(do (defn a [] (b)) (defn b [] 42) (a))" :portability :common}
+  {:suite "vars / cached reference stays correct" :label "declared forward reference resolves once the var is defined" :expected "42" :actual "(do (declare b) (defn a [] (b)) (defn b [] 42) (a))" :portability :common}
+  ;; an UNDECLARED forward reference is a compile error, in a nested body as much
+  ;; as at the top level — reported where the unknown name is written.
+  {:suite "vars / cached reference stays correct" :label "undeclared forward reference in a fn body throws" :expected :throws :actual "(do (defn a [] (b)) (defn b [] 42) (a))" :portability :common}
+  {:suite "vars / cached reference stays correct" :label "unknown symbol nested in a let body throws" :expected :throws :actual "(let [a 1] (bogus-head a))" :portability :common}
   {:suite "predicates / nil & boolean" :label "nil? true" :expected "true" :actual "(nil? nil)" :portability :common}
   {:suite "predicates / nil & boolean" :label "nil? false" :expected "false" :actual "(nil? 0)" :portability :common}
   {:suite "predicates / nil & boolean" :label "some? true" :expected "true" :actual "(some? 0)" :portability :common}

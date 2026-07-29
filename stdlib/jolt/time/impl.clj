@@ -84,6 +84,27 @@
 
 ;; --- the seams (installed once) ----------------------------------------------
 
+;; The class name (class x)/(type x) reports per time type, and what protocol
+;; dispatch keys on. Defined before install-seams!, which closes over it.
+(def ^:private type->class
+  {:jolt.time/month "java.time.Month" :jolt.time/day-of-week "java.time.DayOfWeek"
+   :jolt.time/chrono-unit "java.time.temporal.ChronoUnit" :jolt.time/chrono-field "java.time.temporal.ChronoField"
+   :jolt.time/value-range "java.time.temporal.ValueRange"
+   :jolt.time/local-date "java.time.LocalDate" :jolt.time/local-time "java.time.LocalTime"
+   :jolt.time/local-date-time "java.time.LocalDateTime"
+   :jolt.time/duration "java.time.Duration" :jolt.time/period "java.time.Period"
+   :jolt.time/year "java.time.Year" :jolt.time/year-month "java.time.YearMonth" :jolt.time/month-day "java.time.MonthDay"
+   :jolt.time/instant "java.time.Instant"
+   :jolt.time/zone-offset "java.time.ZoneOffset" :jolt.time/zone-id "java.time.ZoneId"
+   :jolt.time/zone-rules "java.time.zone.ZoneRules"
+   :jolt.time/zoned-date-time "java.time.ZonedDateTime" :jolt.time/offset-date-time "java.time.OffsetDateTime"
+   :jolt.time/offset-time "java.time.OffsetTime"
+   :jolt.time/temporal-adjuster "java.time.temporal.TemporalAdjuster"
+   :jolt.time/dt-formatter "java.time.format.DateTimeFormatter"
+   :jolt.time/locale "java.util.Locale" :jolt.time/format-style "java.time.format.FormatStyle"
+   :jolt.time/dtf-builder "java.time.format.DateTimeFormatterBuilder"
+   :jolt.time/clock "java.time.Clock"})
+
 (defn- install-seams! []
   (__register-eq!
    (fn [a b] (or (jt? a) (jt? b)))
@@ -113,24 +134,5 @@
    jt?
    (fn [x] (get type->class (type-of x) "java.lang.Object"))
    (fn [x] (conj (vec (:classes (spec-of x))) "java.io.Serializable" "Serializable"))))
-
-(def ^:private type->class
-  {:jolt.time/month "java.time.Month" :jolt.time/day-of-week "java.time.DayOfWeek"
-   :jolt.time/chrono-unit "java.time.temporal.ChronoUnit" :jolt.time/chrono-field "java.time.temporal.ChronoField"
-   :jolt.time/value-range "java.time.temporal.ValueRange"
-   :jolt.time/local-date "java.time.LocalDate" :jolt.time/local-time "java.time.LocalTime"
-   :jolt.time/local-date-time "java.time.LocalDateTime"
-   :jolt.time/duration "java.time.Duration" :jolt.time/period "java.time.Period"
-   :jolt.time/year "java.time.Year" :jolt.time/year-month "java.time.YearMonth" :jolt.time/month-day "java.time.MonthDay"
-   :jolt.time/instant "java.time.Instant"
-   :jolt.time/zone-offset "java.time.ZoneOffset" :jolt.time/zone-id "java.time.ZoneId"
-   :jolt.time/zone-rules "java.time.zone.ZoneRules"
-   :jolt.time/zoned-date-time "java.time.ZonedDateTime" :jolt.time/offset-date-time "java.time.OffsetDateTime"
-   :jolt.time/offset-time "java.time.OffsetTime"
-   :jolt.time/temporal-adjuster "java.time.temporal.TemporalAdjuster"
-   :jolt.time/dt-formatter "java.time.format.DateTimeFormatter"
-   :jolt.time/locale "java.util.Locale" :jolt.time/format-style "java.time.format.FormatStyle"
-   :jolt.time/dtf-builder "java.time.format.DateTimeFormatterBuilder"
-   :jolt.time/clock "java.time.Clock"})
 
 (defonce ^:private installed (install-seams!))

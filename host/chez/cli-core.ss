@@ -107,9 +107,9 @@
 ;; `-` stdin PROGRAM runs as a script and suppresses it.
 ;; Reads, compiles, and evals each top-level form in sequence — NOT batch-wrapped
 ;; in (do …) — so each form is visible to the next, matching JVM and file-load
-;; semantics. *allow-unresolved-vars* defaults to false; unresolved bare symbols
-;; throw, matching JVM. Inside fn bodies the analyzer still late-binds so
-;; defmulti/defmethod forward references work.
+;; semantics. *allow-unresolved-vars* defaults to false; an unresolved bare symbol
+;; throws wherever it appears — top level or nested body — matching JVM. A forward
+;; reference needs a declare, as it does on the JVM.
 ;;
 ;; The CLI auto-quotes require/use vector/list args (but NOT symbols — a plain
 ;; (require sym) evaluates sym normally) so `(require [my.lib :as m])` works
@@ -162,7 +162,7 @@
                                             (chez-current-ns))))
                               result))))))
       (jolt-pop-thread-bindings)
-      (let ((s (jolt-final-str result)))
+      (let ((s (jolt-repl-str result)))
         (when (and print? (not (string=? s "")))
           (display s) (newline))))))
 

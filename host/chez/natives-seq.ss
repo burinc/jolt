@@ -170,16 +170,29 @@
     (if (or (fx<=? n 0) (jolt-nil? s)) (reverse acc)
         (loop (fx- n 1) (jolt-seq (seq-more s)) (cons (seq-first s) acc)))))
 
+;; A comparator VALUE -> a 2-arg compare procedure. A fn (or any IFn: keyword,
+;; var, map) is invoked; a deftype/reify/record implementing java.util.Comparator
+;; is NOT IFn on the JVM, so its `compare` METHOD is called instead. The test is
+;; whether the value HAS that method — through the shared iface-method lookup,
+;; which covers deftype and reify alike — rather than how the value was built:
+;; keying on jreify? silently left every deftype Comparator throwing
+;; ClassCastException. THE seam for comparators, so sort / sort-by /
+;; sorted-map-by / sorted-set-by cannot drift apart on which values they accept.
+;; iface-method + record-method-dispatch live in records.ss (loaded later);
+;; resolved at call time.
+(define (jolt-comparator-fn cmp)
+  (if (iface-method cmp "compare" #f)
+      (lambda (a b) (record-method-dispatch cmp "compare" (jolt-list a b)))
+      (lambda (a b) (jolt-invoke cmp a b))))
+(def-var! "clojure.core" "__comparator-fn" jolt-comparator-fn)
+
 ;; sort: (sort coll) uses compare; (sort cmp coll) uses cmp, whose result may be
 ;; a 3-way number (<0 / 0 / >0) OR a boolean (a Clojure-style less-than pred).
-;; A reify/deftype Comparator is not IFn on the JVM — sort calls its .compare
-;; method; only fns and fn-like values are invoked.
 (define (cmp->less cmp)
-  (lambda (a b)
-    (let ((r (if (jreify? cmp)
-                 (record-method-dispatch cmp "compare" (jolt-list a b))
-                 (jolt-invoke cmp a b))))
-      (if (number? r) (< r 0) (jolt-truthy? r)))))
+  (let ((f (jolt-comparator-fn cmp)))
+    (lambda (a b)
+      (let ((r (f a b)))
+        (if (number? r) (< r 0) (jolt-truthy? r))))))
 (define jolt-sort
   (case-lambda
     ((coll) (jolt-sort* (cmp->less jolt-compare) coll))

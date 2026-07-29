@@ -93,7 +93,7 @@ check '(defn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 15)' '
 check '(->> (range 10) (filter even?) (map (fn [x] (* x x))) (reduce +))' '120'
 check '(let [{:keys [a b] :or {b 99}} {:a 1}] [a b])' '[1 99]'
 check '(map inc [1 2 3])' '(2 3 4)'
-check '(require [clojure.string :as s]) (s/upper-case "hello")' 'HELLO'
+check '(require [clojure.string :as s]) (s/upper-case "hello")' '"HELLO"'
 check '(eval (quote (+ 1 2)))' '3'
 check '(load-string "(def y 5) (* y y)")' '25'
 check '(defmacro add1 [x] (list (quote +) x 1)) (add1 10)' '11'
@@ -112,8 +112,8 @@ check_loc '(throw (ex-info "boom" {}))' '  at 1:'
 # A throw that crosses the eval boundary (eval / load-string) must surface its
 # ex-info :message, not Chez's "attempt to apply non-procedure" noise from
 # re-wrapping a raw value raised through `eval`.
-check '(try (eval (read-string "(throw (ex-info \"boom\" {}))")) (catch :default e (ex-message e)))' 'boom'
-check '(try (load-string "(+") (catch :default e (ex-message e)))' 'EOF while reading'
+check '(try (eval (read-string "(throw (ex-info \"boom\" {}))")) (catch :default e (ex-message e)))' '"boom"'
+check '(try (load-string "(+") (catch :default e (ex-message e)))' '"EOF while reading"'
 # An uncaught throw prints the ex-info message alongside its source location.
 check_loc '(throw (ex-info "boom" {}))' 'boom'
 check_loc '(do (+ 1 1) (/ 1 0))' '  at 1:'

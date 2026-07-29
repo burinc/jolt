@@ -30,29 +30,29 @@
   {:suite "class" :expr "(do (defmulti cm (fn [x] (class x))) (defmethod cm String [x] :str) (cm \"a\"))" :expected ":str"}
   {:suite "class" :expr "(do (defmulti cn (fn [x] (class x))) (defmethod cn nil [x] :nil) (defmethod cn String [x] :str) (cn nil))" :expected ":nil"}
   {:suite "class" :expr "(do (defmulti cn (fn [x] (class x))) (defmethod cn nil [x] :nil) (defmethod cn String [x] :str) (cn \"z\"))" :expected ":str"}
-  {:suite "dotform" :expr "(. \"HI\" toLowerCase)" :expected "hi"}
+  {:suite "dotform" :expr "(. \"HI\" toLowerCase)" :expected "\"hi\""}
   {:suite "dotform" :expr "(. \"abc\" length)" :expected "3"}
-  {:suite "dotform" :expr "(. \"abc\" toUpperCase)" :expected "ABC"}
+  {:suite "dotform" :expr "(. \"abc\" toUpperCase)" :expected "\"ABC\""}
   {:suite "dotform" :expr "(. [1 2 3] count)" :expected "3"}
   {:suite "dotform" :expr "(. [10 20 30] nth 1)" :expected "20"}
   {:suite "dotform" :expr "(. {:a 1 :b 2} count)" :expected "2"}
   {:suite "dotform" :expr "(. {:a 1 :b 2} get :b)" :expected "2"}
   {:suite "dotform" :expr "(. {:a 1} containsKey :a)" :expected "true"}
   {:suite "dotform" :expr "(. {:count 99} count)" :expected "1"}
-  {:suite "dotform" :expr "(. {:value 41 :describe (fn [self] (str \"v=\" (:value self)))} describe)" :expected "v=41"}
-  {:suite "dotform" :expr "(. {:greet (fn [self n] (str \"Hello \" n))} greet \"Alice\")" :expected "Hello Alice"}
+  {:suite "dotform" :expr "(. {:value 41 :describe (fn [self] (str \"v=\" (:value self)))} describe)" :expected "\"v=41\""}
+  {:suite "dotform" :expr "(. {:greet (fn [self n] (str \"Hello \" n))} greet \"Alice\")" :expected "\"Hello Alice\""}
   {:suite "dotform" :expr "(. {:value 41} value)" :expected "41"}
   {:suite "dotform" :expr "(.-value {:value 41})" :expected "41"}
   {:suite "dotform" :expr "(.-x {:x 7 :y 9})" :expected "7"}
   {:suite "dotform" :expr "(. {:value 41} -value)" :expected "41"}
   {:suite "dotform" :expr "(do (defrecord Rf [x]) (.-x (->Rf 7)))" :expected "7"}
   {:suite "dotform" :expr "(do (defrecord Rg [a b]) (.-b (->Rg 1 2)))" :expected "2"}
-  {:suite "dotform" :expr "(do (defprotocol Greet (hi [_])) (defrecord Rh [nm] Greet (hi [_] (str \"hi \" nm))) (. (->Rh \"x\") hi))" :expected "hi x"}
-  {:suite "dotform" :expr "(try (throw (ex-info \"bad\" {})) (catch Throwable e (.getMessage e)))" :expected "bad"}
-  {:suite "dotform" :expr "(try (throw (ex-info \"bad\" {:k 1})) (catch Throwable e (.getMessage e)))" :expected "bad"}
-  {:suite "dotform" :expr "(try (throw \"boom\") (catch Throwable e (.getMessage e)))" :expected "boom"}
-  {:suite "dotform" :expr "(try (throw (Exception. \"boom\")) (catch Throwable e (.getMessage e)))" :expected "boom"}
-  {:suite "dotform" :expr "(try (throw (IllegalArgumentException. \"bad\")) (catch Exception e (.getMessage e)))" :expected "bad"}
+  {:suite "dotform" :expr "(do (defprotocol Greet (hi [_])) (defrecord Rh [nm] Greet (hi [_] (str \"hi \" nm))) (. (->Rh \"x\") hi))" :expected "\"hi x\""}
+  {:suite "dotform" :expr "(try (throw (ex-info \"bad\" {})) (catch Throwable e (.getMessage e)))" :expected "\"bad\""}
+  {:suite "dotform" :expr "(try (throw (ex-info \"bad\" {:k 1})) (catch Throwable e (.getMessage e)))" :expected "\"bad\""}
+  {:suite "dotform" :expr "(try (throw \"boom\") (catch Throwable e (.getMessage e)))" :expected "\"boom\""}
+  {:suite "dotform" :expr "(try (throw (Exception. \"boom\")) (catch Throwable e (.getMessage e)))" :expected "\"boom\""}
+  {:suite "dotform" :expr "(try (throw (IllegalArgumentException. \"bad\")) (catch Exception e (.getMessage e)))" :expected "\"bad\""}
   {:suite "exinfo" :expr "(instance? clojure.lang.ExceptionInfo (ex-info \"x\" {}))" :expected "true"}
   {:suite "exinfo" :expr "(instance? clojure.lang.IExceptionInfo (ex-info \"x\" {}))" :expected "true"}
   {:suite "exinfo" :expr "(instance? RuntimeException (ex-info \"x\" {}))" :expected "true"}
@@ -65,13 +65,13 @@
   {:suite "exinfo" :expr "(instance? Throwable (IllegalArgumentException. \"x\"))" :expected "true"}
   {:suite "exinfo" :expr "(instance? IllegalArgumentException (RuntimeException. \"x\"))" :expected "false"}
   {:suite "exinfo" :expr "(instance? RuntimeException (InterruptedException. \"x\"))" :expected "false"}
-  {:suite "exinfo" :expr "(.getMessage (RuntimeException. \"boom\"))" :expected "boom"}
-  {:suite "exinfo" :expr "(ex-message (RuntimeException. \"boom\"))" :expected "boom"}
+  {:suite "exinfo" :expr "(.getMessage (RuntimeException. \"boom\"))" :expected "\"boom\""}
+  {:suite "exinfo" :expr "(ex-message (RuntimeException. \"boom\"))" :expected "\"boom\""}
   {:suite "exinfo" :expr "(type (ex-info \"x\" {}))" :expected "clojure.lang.ExceptionInfo"}
-  {:suite "hostobj" :expr "(.getName (.getClass \"x\"))" :expected "java.lang.String"}
+  {:suite "hostobj" :expr "(.getName (.getClass \"x\"))" :expected "\"java.lang.String\""}
   {:suite "hostobj" :expr "(.getClass 5)" :expected "java.lang.Long"}
-  {:suite "hostobj" :expr "(.getSimpleName (.getClass :k))" :expected "Keyword"}
-  {:suite "hostobj" :expr "(.toString true)" :expected "true"}
+  {:suite "hostobj" :expr "(.getSimpleName (.getClass :k))" :expected "\"Keyword\""}
+  {:suite "hostobj" :expr "(.toString true)" :expected "\"true\""}
   {:suite "hostobj" :expr "(class (ex-info \"x\" {}))" :expected "clojure.lang.ExceptionInfo"}
   {:suite "hostobj" :expr "[(instance? Double 1.5) (Double. \"3.5\") (Double/parseDouble \"2.5\")]" :expected "[true 3.5 2.5]"}
   {:suite "hostobj" :expr "(instance? java.util.regex.Pattern #\"x\")" :expected "true"}
@@ -83,9 +83,9 @@
   {:suite "instance-value" :expr "(map (partial instance? java.lang.Number) [1 \"x\" 2.0])" :expected "(true false true)"}
   {:suite "instance-value" :expr "(let [f instance?] [(f java.util.Map {:a 1}) (f java.util.Map 5)])" :expected "[true false]"}
   {:suite "instance-value" :expr "(instance? String \"y\")" :expected "true"}
-  {:suite "hostobj" :expr "[(namespace (symbol \"foo/bar\")) (name (symbol \"foo/bar\"))]" :expected "[foo bar]"}
-  {:suite "hostobj" :expr "(str (symbol \"a/b/c\"))" :expected "a/b/c"}
-  {:suite "hostobj" :expr "(do (System/setProperty \"jolt.test.x\" \"z\") (System/getProperty \"jolt.test.x\"))" :expected "z"}
+  {:suite "hostobj" :expr "[(namespace (symbol \"foo/bar\")) (name (symbol \"foo/bar\"))]" :expected "[\"foo\" \"bar\"]"}
+  {:suite "hostobj" :expr "(str (symbol \"a/b/c\"))" :expected "\"a/b/c\""}
+  {:suite "hostobj" :expr "(do (System/setProperty \"jolt.test.x\" \"z\") (System/getProperty \"jolt.test.x\"))" :expected "\"z\""}
    {:suite "hostobj" :expr "(do (def ^:dynamic *x4422* true) (binding [*x4422* false] *x4422*))" :expected "false"}
   {:suite "hostobj" :expr "(binding [*print-readably* false] *print-readably*)" :expected "false"}
   {:suite "hostobj" :expr "(do (defprotocol P (m [_])) (extend-protocol P clojure.lang.Fn (m [_] :fn)) (m (fn [x] x)))" :expected ":fn"}
@@ -100,26 +100,26 @@
   {:suite "queue" :expr "(= [1 2 3] (into clojure.lang.PersistentQueue/EMPTY [1 2 3]))" :expected "true"}
   {:suite "queue" :expr "(first (into clojure.lang.PersistentQueue/EMPTY [1 2 3]))" :expected "1"}
   {:suite "destructure" :expr "(letfn [(up [s [k & ks]] (cons s ks))] (up 1 [2 3 4]))" :expected "(1 3 4)"}
-  {:suite "hostctor" :expr "(.getName (java.io.File. \"/tmp/abc.txt\"))" :expected "abc.txt"}
+  {:suite "hostctor" :expr "(.getName (java.io.File. \"/tmp/abc.txt\"))" :expected "\"abc.txt\""}
   {:suite "hostctor" :expr "(instance? java.io.File (java.io.File. \"/x\"))" :expected "true"}
   {:suite "hostctor" :expr "(uuid? (java.util.UUID/randomUUID))" :expected "true"}
   {:suite "hostctor" :expr "(instance? java.util.UUID (java.util.UUID/fromString \"12345678-1234-1234-1234-123456789abc\"))" :expected "true"}
-  {:suite "hostctor" :expr "(let [u (java.net.URI. \"http://h.com:81/p?q=1#f\")] [(.getScheme u) (.getHost u) (.getPort u) (.getPath u) (.getQuery u) (.getFragment u)])" :expected "[http h.com 81 /p q=1 f]"}
+  {:suite "hostctor" :expr "(let [u (java.net.URI. \"http://h.com:81/p?q=1#f\")] [(.getScheme u) (.getHost u) (.getPort u) (.getPath u) (.getQuery u) (.getFragment u)])" :expected "[\"http\" \"h.com\" 81 \"/p\" \"q=1\" \"f\"]"}
   {:suite "hostctor" :expr "(nil? (.getHost (java.net.URI. \"/rel/path\")))" :expected "true"}
-  {:suite "hostctor" :expr "(str (java.net.URI. \"http://x/y\"))" :expected "http://x/y"}
+  {:suite "hostctor" :expr "(str (java.net.URI. \"http://x/y\"))" :expected "\"http://x/y\""}
   {:suite "hostctor" :expr "(instance? java.net.URI (java.net.URI. \"/x\"))" :expected "true"}
   {:suite "hostctor" :expr "(let [a (java.util.ArrayList.)] (.add a 1) (.add a 2) (.add a 3) (.remove a 0) [(.size a) (vec (.toArray a))])" :expected "[2 [2 3]]"}
   {:suite "hostctor" :expr "[(.indexOf [:a :b :c] :b) (.indexOf (list :a :b) :b) (.indexOf [:a] :z) (.indexOf (range 0 10) 1)]" :expected "[1 1 -1 1]"}
-  {:suite "sdf" :expr "(.format (java.text.SimpleDateFormat. \"EEE, dd MMM yyyy HH:mm:ss zzz\") (java.util.Date. 1348401170000))" :expected "Sun, 23 Sep 2012 11:52:50 GMT"}
+  {:suite "sdf" :expr "(.format (java.text.SimpleDateFormat. \"EEE, dd MMM yyyy HH:mm:ss zzz\") (java.util.Date. 1348401170000))" :expected "\"Sun, 23 Sep 2012 11:52:50 GMT\""}
   {:suite "sdf" :expr "(.getTime (.parse (java.text.SimpleDateFormat. \"EEE, dd MMM yyyy HH:mm:ss zzz\") \"Sun, 23 Sep 2012 11:52:50 GMT\"))" :expected "1348401170000"}
   {:suite "sdf" :expr "(.getTime (.parse (java.text.SimpleDateFormat. \"EEEE, dd-MMM-yy HH:mm:ss zzz\") \"Sunday, 23-Sep-12 11:52:50 GMT\"))" :expected "1348401170000"}
   {:suite "sdf" :expr "(.getTime (.parse (java.text.SimpleDateFormat. \"EEE MMM d HH:mm:ss yyyy\") \"Sun Sep 23 11:52:50 2012\"))" :expected "1348401170000"}
-  {:suite "sdf" :expr "(let [f (java.text.SimpleDateFormat. \"yyyy-MM-dd\")] (.format f (.parse f \"2023-07-15\")))" :expected "2023-07-15"}
-  {:suite "reader" :expr "(let [r (-> \"foo bar baz\" java.io.StringReader. java.io.PushbackReader.)] [(read r) (slurp r)])" :expected "[foo  bar baz]"}
+  {:suite "sdf" :expr "(let [f (java.text.SimpleDateFormat. \"yyyy-MM-dd\")] (.format f (.parse f \"2023-07-15\")))" :expected "\"2023-07-15\""}
+  {:suite "reader" :expr "(let [r (-> \"foo bar baz\" java.io.StringReader. java.io.PushbackReader.)] [(read r) (slurp r)])" :expected "[foo \" bar baz\"]"}
   {:suite "reader" :expr "(let [r (-> \"(+ 1 2) 99\" java.io.StringReader. java.io.PushbackReader.)] [(read r) (read r)])" :expected "[(+ 1 2) 99]"}
-  {:suite "hostctor" :expr "(String/format \"%d-%s\" 5 \"x\")" :expected "5-x"}
-  {:suite "hostctor" :expr "[(.format (java.text.NumberFormat/getInstance) 1234567.5) (.format (java.text.NumberFormat/getIntegerInstance) 1234567)]" :expected "[1,234,567.5 1,234,567]"}
-  {:suite "hostctor" :expr "[(.getProtocol (java.net.URL. \"file:/tmp/x\")) (.getFile (java.net.URL. \"http://h/p\")) (.getProtocol (java.net.URL. \"http://h/p\"))]" :expected "[file http://h/p http]"}
+  {:suite "hostctor" :expr "(String/format \"%d-%s\" 5 \"x\")" :expected "\"5-x\""}
+  {:suite "hostctor" :expr "[(.format (java.text.NumberFormat/getInstance) 1234567.5) (.format (java.text.NumberFormat/getIntegerInstance) 1234567)]" :expected "[\"1,234,567.5\" \"1,234,567\"]"}
+  {:suite "hostctor" :expr "[(.getProtocol (java.net.URL. \"file:/tmp/x\")) (.getFile (java.net.URL. \"http://h/p\")) (.getProtocol (java.net.URL. \"http://h/p\"))]" :expected "[\"file\" \"http://h/p\" \"http\"]"}
   {:suite "hostobj" :expr "(try (throw (ex-info \"x\" {})) (catch Throwable e [(.getNextException e) (vec (.getStackTrace e))]))" :expected "[nil []]"}
   {:suite "hostobj" :expr "[(some? (ClassLoader/getSystemClassLoader)) (some? (.getContextClassLoader (Thread/currentThread)))]" :expected "[true true]"}
   {:suite "reify" :expr "(do (defprotocol P (pm [_])) (defprotocol Q (qm [_])) (extend-protocol Q java.lang.Object (qm [_] :q-default)) (qm (reify P (pm [_] :p))))" :expected ":q-default"}
@@ -134,13 +134,13 @@
   {:suite "interrupt" :expr "(let [t (Thread/currentThread)] (.interrupt t) [(Thread/interrupted) (Thread/interrupted)])" :expected "[true false]"}
   {:suite "interrupt" :expr "(do (.interrupt (Thread/currentThread)) (Thread/interrupted) (.isInterrupted (Thread/currentThread)))" :expected "false"}
   {:suite "interrupt" :expr "(let [t (atom nil) started (promise) go (promise) f (future (reset! t (Thread/currentThread)) (deliver started true) (deref go) (.isInterrupted (deref t)))] (deref started) (.interrupt (deref t)) (deliver go true) (deref f))" :expected "true"}
-  {:suite "ns-tl" :expr "(do (in-ns (quote foo.bar)) (str *ns*))" :expected "foo.bar"}
-  {:suite "ns-tl" :expr "(do (create-ns (quote my.ns)) (binding [*ns* (find-ns (quote my.ns))] (str *ns*)))" :expected "my.ns"}
+  {:suite "ns-tl" :expr "(do (in-ns (quote foo.bar)) (str *ns*))" :expected "\"foo.bar\""}
+  {:suite "ns-tl" :expr "(do (create-ns (quote my.ns)) (binding [*ns* (find-ns (quote my.ns))] (str *ns*)))" :expected "\"my.ns\""}
   {:suite "ns-tl" :expr "(do (in-ns (quote app.core)) (def sekret 42) (in-ns (quote user)) (binding [*ns* (find-ns (quote app.core))] (load-string \"sekret\")))" :expected "42"}
-  {:suite "ns-tl" :expr "(do (create-ns (quote a.x)) (create-ns (quote b.y)) (let [fa (future (in-ns (quote a.x)) (Thread/sleep 80) (str *ns*)) fb (future (in-ns (quote b.y)) (Thread/sleep 80) (str *ns*))] [(deref fa) (deref fb) (str *ns*)]))" :expected "[a.x b.y user]"}
+  {:suite "ns-tl" :expr "(do (create-ns (quote a.x)) (create-ns (quote b.y)) (let [fa (future (in-ns (quote a.x)) (Thread/sleep 80) (str *ns*)) fb (future (in-ns (quote b.y)) (Thread/sleep 80) (str *ns*))] [(deref fa) (deref fb) (str *ns*)]))" :expected "[\"a.x\" \"b.y\" \"user\"]"}
   {:suite "dotform" :expr "(.equals \"a\" \"a\")" :expected "true"}
   {:suite "dotform" :expr "(.equals \"a\" \"b\")" :expected "false"}
-  {:suite "dotform" :expr "(. {:value 41 :describe (fn [self] (str \"v=\" (:value self)))} describe)" :expected "v=41"}
+  {:suite "dotform" :expr "(. {:value 41 :describe (fn [self] (str \"v=\" (:value self)))} describe)" :expected "\"v=41\""}
   {:suite "dynbind" :expr "(do (def ^:dynamic *bx* 10) (binding [*bx* 99] *bx*))" :expected "99"}
   {:suite "dynbind" :expr "(do (def ^:dynamic *by* 10) (binding [*by* 99] *by*) *by*)" :expected "10"}
   {:suite "dynbind" :expr "(do (def ^:dynamic *bz* 0) (defn rdz [] *bz*) (binding [*bz* 7] (rdz)))" :expected "7"}
@@ -171,7 +171,7 @@
   {:suite "insttime" :expr "(inst-ms #inst \"2020-01-01T00:00:00Z\")" :expected "1577836800000"}
   {:suite "insttime" :expr "(inst-ms* #inst \"1970-01-01T00:00:00Z\")" :expected "0"}
   {:suite "insttime" :expr "(some? #inst \"2020-01-01T00:00:00Z\")" :expected "true"}
-  {:suite "insttime" :expr "(str (type #inst \"2020-01-01T00:00:00Z\"))" :expected "class java.util.Date"}
+  {:suite "insttime" :expr "(str (type #inst \"2020-01-01T00:00:00Z\"))" :expected "\"class java.util.Date\""}
   {:suite "insttime" :expr "(= #inst \"2020\" #inst \"2020-01-01T00:00:00.000Z\")" :expected "true"}
   {:suite "insttime" :expr "(= #inst \"2020-03\" #inst \"2020-03-01T00:00:00Z\")" :expected "true"}
   {:suite "insttime" :expr "(= #inst \"2020-03-15\" #inst \"2020-03-15T00:00:00Z\")" :expected "true"}
@@ -179,11 +179,11 @@
   {:suite "insttime" :expr "(= #inst \"2019-12-31T23:00:00-01:00\" #inst \"2020-01-01T00:00:00Z\")" :expected "true"}
   {:suite "insttime" :expr "(= #inst \"2020-01-01T00:00:00Z\" #inst \"2020-01-01T00:00:01Z\")" :expected "false"}
   {:suite "insttime" :expr "(get {#inst \"2020-01-01T00:00:00Z\" :v} #inst \"2020-01-01T00:00:00.000Z\")" :expected ":v"}
-  {:suite "insttime" :expr "(pr-str #inst \"2020-01-01T00:00:00Z\")" :expected "#inst \"2020-01-01T00:00:00.000-00:00\""}
-  {:suite "insttime" :expr "(str #inst \"2020-01-01T00:00:00Z\")" :expected "2020-01-01T00:00:00.000-00:00"}
+  {:suite "insttime" :expr "(pr-str #inst \"2020-01-01T00:00:00Z\")" :expected "\"#inst \\\"2020-01-01T00:00:00.000-00:00\\\"\""}
+  {:suite "insttime" :expr "(str #inst \"2020-01-01T00:00:00Z\")" :expected "\"2020-01-01T00:00:00.000-00:00\""}
   {:suite "insttime" :expr "(uuid? #uuid \"550e8400-e29b-41d4-a716-446655440000\")" :expected "true"}
   {:suite "insttime" :expr "(= #uuid \"550E8400-E29B-41D4-A716-446655440000\" #uuid \"550e8400-e29b-41d4-a716-446655440000\")" :expected "true"}
-  {:suite "insttime" :expr "(pr-str #uuid \"550e8400-e29b-41d4-a716-446655440000\")" :expected "#uuid \"550e8400-e29b-41d4-a716-446655440000\""}
+  {:suite "insttime" :expr "(pr-str #uuid \"550e8400-e29b-41d4-a716-446655440000\")" :expected "\"#uuid \\\"550e8400-e29b-41d4-a716-446655440000\\\"\""}
   {:suite "insttime" :expr "(.getTime #inst \"1970-01-01T00:00:00Z\")" :expected "0"}
   {:suite "insttime" :expr "(instance? java.util.Date #inst \"2020-01-01T00:00:00Z\")" :expected "true"}
   {:suite "insttime" :expr "(instance? java.sql.Timestamp #inst \"2020-01-01T00:00:00Z\")" :expected "false"}
@@ -191,21 +191,21 @@
   {:suite "insttime" :expr "(instance? java.time.Instant (Instant/ofEpochMilli 0))" :expected "true"}
   {:suite "insttime" :expr "(> (.toEpochMilli (Instant/now)) 1500000000000)" :expected "true"}
   {:suite "insttime" :expr "(instance? java.time.LocalDateTime (LocalDateTime/parse \"2020-03-05T13:45:30\"))" :expected "true"}
-  {:suite "insttime" :expr "(str (.toInstant #inst \"2020-03-05T13:45:30Z\"))" :expected "2020-03-05T13:45:30Z"}
-  {:suite "insttime" :expr "(str (LocalDate/of 2020 3 5))" :expected "2020-03-05"}
+  {:suite "insttime" :expr "(str (.toInstant #inst \"2020-03-05T13:45:30Z\"))" :expected "\"2020-03-05T13:45:30Z\""}
+  {:suite "insttime" :expr "(str (LocalDate/of 2020 3 5))" :expected "\"2020-03-05\""}
   {:suite "insttime" :expr "(.toMillis (Duration/between (Instant/ofEpochMilli 0) (Instant/ofEpochMilli 5000)))" :expected "5000"}
   {:suite "insttime" :expr "(.toEpochMilli (Instant/parse \"2020-01-01T00:00:00Z\"))" :expected "1577836800000"}
-  {:suite "insttime" :expr "(str (Duration/ofSeconds 90))" :expected "PT1M30S"}
+  {:suite "insttime" :expr "(str (Duration/ofSeconds 90))" :expected "\"PT1M30S\""}
   {:suite "insttime" :expr "(.getMonths (Period/of 1 2 3))" :expected "2"}
-  {:suite "insttime" :expr "(str (Year/of 2024))" :expected "2024"}
+  {:suite "insttime" :expr "(str (Year/of 2024))" :expected "\"2024\""}
   ;; DateTimeFormatter, ZoneOffset/ZoneId and Locale are the jolt-lang/time library,
   ;; not core (RFC 0008); with no dependency the error names the library.
   {:suite "insttime" :expr "(try (java.time.format.DateTimeFormatter/ofPattern \"yyyy\") (catch Exception e (boolean (re-find #\"jolt-lang/time\" (ex-message e)))))" :expected "true"}
   {:suite "insttime" :expr "(try (ZoneOffset/ofHours 5) (catch Exception e (boolean (re-find #\"jolt-lang/time\" (ex-message e)))))" :expected "true"}
-  {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (str (io/file \"/a/b\")))" :expected "/a/b"}
-  {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (str (io/file \"/a\" \"b\")))" :expected "/a/b"}
-  {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.getName (io/file \"/a/b/c.txt\")))" :expected "c.txt"}
-  {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.getPath (io/file \"/a\" \"b\")))" :expected "/a/b"}
+  {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (str (io/file \"/a/b\")))" :expected "\"/a/b\""}
+  {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (str (io/file \"/a\" \"b\")))" :expected "\"/a/b\""}
+  {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.getName (io/file \"/a/b/c.txt\")))" :expected "\"c.txt\""}
+  {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.getPath (io/file \"/a\" \"b\")))" :expected "\"/a/b\""}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.isDirectory (io/file \"stdlib\")))" :expected "true"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.isFile (io/file \"README.md\")))" :expected "true"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.isFile (io/file \"stdlib\")))" :expected "false"}
@@ -213,31 +213,39 @@
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.exists (io/file \"README.md\")))" :expected "true"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (instance? java.io.File (io/file \"/a/b\")))" :expected "true"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (instance? java.io.File \"/a/b\"))" :expected "false"}
-  {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (str (type (io/file \"/a\"))))" :expected "class java.io.File"}
+  {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (str (type (io/file \"/a\"))))" :expected "\"class java.io.File\""}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (every? (fn [f] (instance? java.io.File f)) (file-seq (io/file \"stdlib\"))))" :expected "true"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (pos? (count (filter (fn [f] (.isFile f)) (file-seq (io/file \"stdlib\"))))))" :expected "true"}
   {:suite "io" :expr "(do (require (quote [clojure.string :as s])) (boolean (some (fn [p] (s/ends-with? p \"README.md\")) (file-seq \".\"))))" :expected "true"}
   {:suite "io" :expr "(string? (slurp \"README.md\"))" :expected "true"}
-  {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"hello\") (slurp \"/tmp/jolt-io-test.txt\"))" :expected "hello"}
-  {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"a\") (spit \"/tmp/jolt-io-test.txt\" \"b\" :append true) (slurp \"/tmp/jolt-io-test.txt\"))" :expected "ab"}
+  {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"hello\") (slurp \"/tmp/jolt-io-test.txt\"))" :expected "\"hello\""}
+  {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"a\") (spit \"/tmp/jolt-io-test.txt\" \"b\" :append true) (slurp \"/tmp/jolt-io-test.txt\"))" :expected "\"ab\""}
   {:suite "io" :expr "(flush)" :expected ""}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (string? (slurp (io/file \"README.md\"))))" :expected "true"}
-  {:suite "ioreader" :expr "(apply str (char-array \"abc\"))" :expected "abc"}
+  {:suite "ioreader" :expr "(apply str (char-array \"abc\"))" :expected "\"abc\""}
   {:suite "ioreader" :expr "(.read (StringReader. (apply str (char-array \"Qz\"))))" :expected "81"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.read (io/reader (char-array \"abc\"))))" :expected "97"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.read (io/reader (StringReader. \"k\"))))" :expected "107"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (slurp (io/reader (char-array \"xyz\"))))" :expected "xyz"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (slurp (io/reader (char-array \"xyz\"))))" :expected "\"xyz\""}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (string? (slurp (io/reader \"README.md\"))))" :expected "true"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toString (.toURL (io/file \"/tmp/x\"))))" :expected "file:/tmp/x"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toURI (io/file \"/tmp/x\")))" :expected "#object[java.net.URI file:/tmp/x]"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (str (.toURI (io/file \"/tmp/x\"))))" :expected "file:/tmp/x"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (.toURI (io/file \"/tmp/x\"))))" :expected "#object[java.net.URI \"file:/tmp/x\"]"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (io/file \"/tmp/x\")))" :expected "#object[java.io.File \"/tmp/x\"]"}
-  {:suite "ioreader" :expr "(pr-str (atom 1))" :expected "#object[clojure.lang.Atom]"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getPath (.toURL (io/file \"/tmp/x\"))))" :expected "/tmp/x"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getAbsolutePath (io/file \"/a/b\")))" :expected "/a/b"}
-  {:suite "ioreader" :expr "(slurp (StringReader. \"a=1\"))" :expected "a=1"}
-  {:suite "ioreader" :expr "(slurp (StringReader. \"b\") :encoding \"UTF-8\")" :expected "b"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toString (.toURL (io/file \"/tmp/x\"))))" :expected "\"file:/tmp/x\""}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toURI (io/file \"/tmp/x\")))" :expected "#object[java.net.URI \"file:/tmp/x\"]"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (str (.toURI (io/file \"/tmp/x\"))))" :expected "\"file:/tmp/x\""}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (.toURI (io/file \"/tmp/x\"))))" :expected "\"#object[java.net.URI \\\"file:/tmp/x\\\"]\""}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (io/file \"/tmp/x\")))" :expected "\"#object[java.io.File \\\"/tmp/x\\\"]\""}
+  {:suite "ioreader" :expr "(pr-str (atom 1))" :expected "\"#object[clojure.lang.Atom]\""}
+ ;; io/resource has two branches — a source root (a jfile) and an embedded resource
+ ;; baked into the image by make-devboot / jolt build. Which one serves a stdlib
+ ;; path depends on whether target/dev/flat.so is fresh, so these assert only what
+ ;; must hold for BOTH: the URL/File surface callers reach for. The embedded branch
+ ;; used to answer none of it, which made orchard.meta flap on .getPath.
+ {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getName (io/resource \"clojure/string.clj\")))" :expected "\"string.clj\""}
+ {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io]) (quote [clojure.string :as s])) (s/ends-with? (.getPath (io/resource \"clojure/string.clj\")) \"clojure/string.clj\"))" :expected "true"}
+ {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (boolean (seq (str (io/resource \"clojure/string.clj\")))))" :expected "true"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getPath (.toURL (io/file \"/tmp/x\"))))" :expected "\"/tmp/x\""}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getAbsolutePath (io/file \"/a/b\")))" :expected "\"/a/b\""}
+  {:suite "ioreader" :expr "(slurp (StringReader. \"a=1\"))" :expected "\"a=1\""}
+  {:suite "ioreader" :expr "(slurp (StringReader. \"b\") :encoding \"UTF-8\")" :expected "\"b\""}
   {:suite "ioreader" :expr "(with-open [r (StringReader. \"a\")] (.read r))" :expected "97"}
   {:suite "ioreader" :expr "(let [log (atom [])] (with-open [c {:close (fn [] (swap! log conj :closed))}] :r) (deref log))" :expected "[:closed]"}
   {:suite "ioreader" :expr "(let [log (atom [])] (try (with-open [c {:close (fn [] (swap! log conj :closed))}] (throw (ex-info \"boom\" {}))) (catch Exception e nil)) (deref log))" :expected "[:closed]"}
@@ -248,10 +256,10 @@
   {:suite "javastatic" :expr "(Math/abs -3)" :expected "3"}
   {:suite "javastatic" :expr "(Math/max 2 7)" :expected "7"}
   {:suite "javastatic" :expr "(pos? Long/MAX_VALUE)" :expected "true"}
-  {:suite "javastatic" :expr "(String/valueOf 42)" :expected "42"}
-  {:suite "javastatic" :expr "(String/valueOf \"hi\")" :expected "hi"}
-  {:suite "javastatic" :expr "(String/valueOf :k)" :expected ":k"}
-  {:suite "javastatic" :expr "(String/valueOf nil)" :expected "null"}
+  {:suite "javastatic" :expr "(String/valueOf 42)" :expected "\"42\""}
+  {:suite "javastatic" :expr "(String/valueOf \"hi\")" :expected "\"hi\""}
+  {:suite "javastatic" :expr "(String/valueOf :k)" :expected "\":k\""}
+  {:suite "javastatic" :expr "(String/valueOf nil)" :expected "\"null\""}
   {:suite "javastatic" :expr "(Long/parseLong \"42\")" :expected "42"}
   {:suite "javastatic" :expr "(Long/valueOf \"42\")" :expected "42"}
   {:suite "javastatic" :expr "(Integer/parseInt \"ff\" 16)" :expected "255"}
@@ -269,11 +277,11 @@
   {:suite "javastatic" :expr "(string? (get (System/getProperties) \"os.name\"))" :expected "true"}
   {:suite "javastatic" :expr "(pos? (count (seq (System/getenv))))" :expected "true"}
   {:suite "javastatic" :expr "(let [es (map (fn [[k v]] [k v]) (System/getenv))] (and (pos? (count es)) (every? vector? es)))" :expected "true"}
-  {:suite "javastatic" :expr "(.toString (StringBuilder. \"x\"))" :expected "x"}
-  {:suite "javastatic" :expr "(.toString (-> (StringBuilder.) (.append \"a\") (.append \\b) (.append 1)))" :expected "ab1"}
-  {:suite "javastatic" :expr "(.toString (.append (StringBuilder. 16) \"x\"))" :expected "x"}
-  {:suite "javastatic" :expr "(let [sb (StringBuilder.)] (.append sb \"abcd\") (.setLength sb 2) (.toString sb))" :expected "ab"}
-  {:suite "javastatic" :expr "(let [w (StringWriter.)] (.write w \"a\") (.append w \\b) (.toString w))" :expected "ab"}
+  {:suite "javastatic" :expr "(.toString (StringBuilder. \"x\"))" :expected "\"x\""}
+  {:suite "javastatic" :expr "(.toString (-> (StringBuilder.) (.append \"a\") (.append \\b) (.append 1)))" :expected "\"ab1\""}
+  {:suite "javastatic" :expr "(.toString (.append (StringBuilder. 16) \"x\"))" :expected "\"x\""}
+  {:suite "javastatic" :expr "(let [sb (StringBuilder.)] (.append sb \"abcd\") (.setLength sb 2) (.toString sb))" :expected "\"ab\""}
+  {:suite "javastatic" :expr "(let [w (StringWriter.)] (.write w \"a\") (.append w \\b) (.toString w))" :expected "\"ab\""}
   {:suite "javastatic" :expr "(let [r (StringReader. \"ab\")] [(.read r) (.read r) (.read r)])" :expected "[97 98 -1]"}
   {:suite "javastatic" :expr "(let [r (StringReader. \"ab\")] (.mark r 1) [(.read r) (do (.reset r) (.read r))])" :expected "[97 97]"}
   {:suite "javastatic" :expr "(let [r (java.io.PushbackReader. (java.io.StringReader. \"ab\"))] [(.read r) (.read r)])" :expected "[97 98]"}
@@ -282,16 +290,16 @@
   {:suite "javastatic" :expr "(BigInteger. \"123\")" :expected "123"}
   {:suite "javastatic" :expr "(let [m (HashMap. {:a 1 :b 2})] (.get m :b))" :expected "2"}
   {:suite "javastatic" :expr "(let [m (HashMap. {})] (.put m :x 1) (.put m :y 2) (.size m))" :expected "2"}
-  {:suite "javastatic" :expr "(let [t (StringTokenizer. \"a=1&b=2\" \"&\")] [(.nextToken t) (.nextToken t)])" :expected "[a=1 b=2]"}
-  {:suite "javastatic" :expr "(.toString (StringBuilder. \"x\"))" :expected "x"}
-  {:suite "javastatic" :expr "(URLEncoder/encode \"a b=c\")" :expected "a+b%3Dc"}
-  {:suite "javastatic" :expr "(URLDecoder/decode (URLEncoder/encode \"x &=%?\"))" :expected "x &=%?"}
-  {:suite "javastatic" :expr "(String. (.encode (Base64/getEncoder) (.getBytes \"hello\")))" :expected "aGVsbG8="}
-  {:suite "javastatic" :expr "(String. (.decode (Base64/getDecoder) (String. (.encode (Base64/getEncoder) (.getBytes \"hello\")))))" :expected "hello"}
+  {:suite "javastatic" :expr "(let [t (StringTokenizer. \"a=1&b=2\" \"&\")] [(.nextToken t) (.nextToken t)])" :expected "[\"a=1\" \"b=2\"]"}
+  {:suite "javastatic" :expr "(.toString (StringBuilder. \"x\"))" :expected "\"x\""}
+  {:suite "javastatic" :expr "(URLEncoder/encode \"a b=c\")" :expected "\"a+b%3Dc\""}
+  {:suite "javastatic" :expr "(URLDecoder/decode (URLEncoder/encode \"x &=%?\"))" :expected "\"x &=%?\""}
+  {:suite "javastatic" :expr "(String. (.encode (Base64/getEncoder) (.getBytes \"hello\")))" :expected "\"aGVsbG8=\""}
+  {:suite "javastatic" :expr "(String. (.decode (Base64/getDecoder) (String. (.encode (Base64/getEncoder) (.getBytes \"hello\")))))" :expected "\"hello\""}
   {:suite "javastatic" :expr "(Integer/parseInt \"ff\" 16)" :expected "255"}
   {:suite "javastatic" :expr "(regex? (Pattern/compile \"a.c\"))" :expected "true"}
-  {:suite "javastatic" :expr "(.split (Pattern/compile \",\") \"a,b,c\")" :expected "(a b c)"}
-  {:suite "javastatic" :expr "(do (require '[clojure.string :as s]) (s/replace \"a1b2\" (Pattern/compile \"[0-9]\") \"\"))" :expected "ab"}
+  {:suite "javastatic" :expr "(.split (Pattern/compile \",\") \"a,b,c\")" :expected "(\"a\" \"b\" \"c\")"}
+  {:suite "javastatic" :expr "(do (require '[clojure.string :as s]) (s/replace \"a1b2\" (Pattern/compile \"[0-9]\") \"\"))" :expected "\"ab\""}
   {:suite "javastatic" :expr "(boolean (re-find (Pattern/compile \"^x\" Pattern/MULTILINE) \"y\\nx\"))" :expected "true"}
   {:suite "javastatic" :expr "(boolean (re-find (re-pattern (Pattern/quote \"a.c\")) \"za.cy\"))" :expected "true"}
   {:suite "javastatic" :expr "(boolean (re-find (re-pattern (Pattern/quote \"a.c\")) \"zabcy\"))" :expected "false"}
@@ -306,11 +314,11 @@
   {:suite "ns" :expr "(do (def q 1) (pos? (count (ns-interns 'user))))" :expected "true"}
   {:suite "ns" :expr "(pos? (count (all-ns)))" :expected "true"}
   {:suite "ns" :expr "(= (ns-name *ns*) (ns-name (find-ns 'user)))" :expected "true"}
-  {:suite "ns" :expr "(str (in-ns 'jolt.test-ns-b))" :expected "jolt.test-ns-b"}
-  {:suite "ns" :expr "(do (in-ns 'jolt.test-ns-a) (str *ns*))" :expected "jolt.test-ns-a"}
+  {:suite "ns" :expr "(str (in-ns 'jolt.test-ns-b))" :expected "\"jolt.test-ns-b\""}
+  {:suite "ns" :expr "(do (in-ns 'jolt.test-ns-a) (str *ns*))" :expected "\"jolt.test-ns-a\""}
   {:suite "ns" :expr "(do (def nuv 1) (ns-unmap 'user 'nuv) (nil? (resolve 'nuv)))" :expected "true"}
   {:suite "ns" :expr "(do (in-ns 'my.ns) (symbol? 'x))" :expected "true"}
-  {:suite "ns" :expr "(str (ns-name *ns*))" :expected "user"}
+  {:suite "ns" :expr "(str (ns-name *ns*))" :expected "\"user\""}
   {:suite "ns" :expr "(var? (find-var 'clojure.core/map))" :expected "true"}
   {:suite "ns" :expr "(= 'user (ns-name (the-ns 'user)))" :expected "true"}
   {:suite "ns" :expr "(= 'foo.bar (ns-name (create-ns 'foo.bar)))" :expected "true"}
@@ -381,7 +389,7 @@
   {:suite "reader" :expr "(do (require (quote clojure.edn)) (= {:a 1 :b 2} (clojure.edn/read-string \"{:a 1\\n :b 2}\")))" :expected "true"}
   ;; atomic spit: a throwing render (or failed write) leaves the original file
   ;; intact — deliberately STRONGER than the JVM, whose spit truncates first.
-  {:suite "atomic-spit" :expr "(let [f (java.io.File/createTempFile \"spt\" \".t\")] (spit f \"ok\") (try (spit f (reify Object (toString [_] (throw (ex-info \"b\" {}))))) (catch Exception _ nil)) (let [r (slurp f)] (.delete f) r))" :expected "ok"}
+  {:suite "atomic-spit" :expr "(let [f (java.io.File/createTempFile \"spt\" \".t\")] (spit f \"ok\") (try (spit f (reify Object (toString [_] (throw (ex-info \"b\" {}))))) (catch Exception _ nil)) (let [r (slurp f)] (.delete f) r))" :expected "\"ok\""}
   {:suite "reader-errors" :expr "(try (read-string \"\\\"unterminated\") (catch Exception e [(:line (ex-data e)) (:column (ex-data e))]))" :expected "[1 14]"}
   {:suite "reader-errors" :expr "(try (read-string \"[1 2 3\") (catch Exception e [(:line (ex-data e)) (:column (ex-data e))]))" :expected "[1 7]"}
   {:suite "reader-errors" :expr "(try (read-string \"#?\") (catch Exception e [(:line (ex-data e)) (:column (ex-data e))]))" :expected "[1 3]"}
@@ -435,9 +443,9 @@
   {:suite "stdlib" :expr "(do (require (quote [clojure.set :as s])) (= 2 (count (s/index #{{:k 1} {:k 2}} [:k]))))" :expected "true"}
   {:suite "stdlib" :expr "(do (require (quote [clojure.pprint :as pp])) (= \"[1 2 3]\\n\" (with-out-str (pp/pprint [1 2 3]))))" :expected "true"}
   {:suite "stdlib" :expr "(do (require (quote [clojure.pprint :as pp])) (pp/with-pprint-dispatch pp/code-dispatch 42))" :expected "42"}
-  {:suite "str" :expr "(.toLowerCase \"HI\")" :expected "hi"}
-  {:suite "str" :expr "(.toUpperCase \"hi\")" :expected "HI"}
-  {:suite "str" :expr "(.trim \"  x  \")" :expected "x"}
+  {:suite "str" :expr "(.toLowerCase \"HI\")" :expected "\"hi\""}
+  {:suite "str" :expr "(.toUpperCase \"hi\")" :expected "\"HI\""}
+  {:suite "str" :expr "(.trim \"  x  \")" :expected "\"x\""}
   {:suite "str" :expr "(.length \"abc\")" :expected "3"}
   {:suite "str" :expr "[(.isEmpty \"\") (.isEmpty \"a\")]" :expected "[true false]"}
   {:suite "str" :expr "(.indexOf \"abc\" \"b\")" :expected "1"}
@@ -445,27 +453,27 @@
   {:suite "str" :expr "(.indexOf \"abab\" \"a\" 1)" :expected "2"}
   {:suite "str" :expr "(.indexOf \"a=b\" 61)" :expected "1"}
   {:suite "str" :expr "(.lastIndexOf \"abab\" \"b\")" :expected "3"}
-  {:suite "str" :expr "(.substring \"abc\" 1)" :expected "bc"}
-  {:suite "str" :expr "(.substring \"abc\" 1 2)" :expected "b"}
+  {:suite "str" :expr "(.substring \"abc\" 1)" :expected "\"bc\""}
+  {:suite "str" :expr "(.substring \"abc\" 1 2)" :expected "\"b\""}
   {:suite "str" :expr "(.startsWith \"abc\" \"ab\")" :expected "true"}
   {:suite "str" :expr "(.endsWith \"abc\" \"bc\")" :expected "true"}
   {:suite "str" :expr "(.contains \"abc\" \"b\")" :expected "true"}
-  {:suite "str" :expr "(.replace \"abc\" \"b\" \"x\")" :expected "axc"}
-  {:suite "str" :expr "(.replace \"aaa\" \"a\" \"b\")" :expected "bbb"}
+  {:suite "str" :expr "(.replace \"abc\" \"b\" \"x\")" :expected "\"axc\""}
+  {:suite "str" :expr "(.replace \"aaa\" \"a\" \"b\")" :expected "\"bbb\""}
   {:suite "str" :expr "(.charAt \"abc\" 1)" :expected "\\b"}
   {:suite "str" :expr "(.equalsIgnoreCase \"AbC\" \"aBc\")" :expected "true"}
-  {:suite "str" :expr "(.toString \"hi\")" :expected "hi"}
-  {:suite "str" :expr "(.concat \"ab\" \"cd\")" :expected "abcd"}
+  {:suite "str" :expr "(.toString \"hi\")" :expected "\"hi\""}
+  {:suite "str" :expr "(.concat \"ab\" \"cd\")" :expected "\"abcd\""}
   {:suite "str" :expr "(.matches \"abc\" \"a.c\")" :expected "true"}
   {:suite "str" :expr "(.matches \"abcd\" \"a.c\")" :expected "false"}
-  {:suite "str" :expr "(.replaceAll \"a_b_c\" \"_\" \"-\")" :expected "a-b-c"}
-  {:suite "str" :expr "(.replaceFirst \"a_b_c\" \"_\" \"-\")" :expected "a-b_c"}
-  {:suite "str" :expr "(vec (.split \"a,b,c\" \",\"))" :expected "[a b c]"}
+  {:suite "str" :expr "(.replaceAll \"a_b_c\" \"_\" \"-\")" :expected "\"a-b-c\""}
+  {:suite "str" :expr "(.replaceFirst \"a_b_c\" \"_\" \"-\")" :expected "\"a-b_c\""}
+  {:suite "str" :expr "(vec (.split \"a,b,c\" \",\"))" :expected "[\"a\" \"b\" \"c\"]"}
   {:suite "str" :expr "(.frobnicate \"abc\")" :expected :throws}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/upper-case \"abc\"))" :expected "ABC"}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/lower-case \"ABC\"))" :expected "abc"}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/capitalize \"hello\"))" :expected "Hello"}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/trim \"  x  \"))" :expected "x"}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/upper-case \"abc\"))" :expected "\"ABC\""}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/lower-case \"ABC\"))" :expected "\"abc\""}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/capitalize \"hello\"))" :expected "\"Hello\""}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/trim \"  x  \"))" :expected "\"x\""}
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (= \"x  \" (s/triml \"  x  \")))" :expected "true"}
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (= \"  x\" (s/trimr \"  x  \")))" :expected "true"}
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/blank? \"\"))" :expected "true"}
@@ -477,19 +485,19 @@
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/starts-with? \"abc\" \"ab\"))" :expected "true"}
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/starts-with? \"abc\" \"bc\"))" :expected "false"}
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/ends-with? \"abc\" \"bc\"))" :expected "true"}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/join [\"a\" \"b\" \"c\"]))" :expected "abc"}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/join \",\" [\"a\" \"b\" \"c\"]))" :expected "a,b,c"}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/join \"-\" [1 2 3]))" :expected "1-2-3"}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/split \"a,b,c\" \",\"))" :expected "[a b c]"}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/split \"a1b2c\" #\"[0-9]\"))" :expected "[a b c]"}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/split-lines \"a\\nb\\nc\"))" :expected "[a b c]"}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/replace \"a_b_c\" \"_\" \"-\"))" :expected "a-b-c"}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/replace \"a1b2\" #\"[0-9]\" \"\"))" :expected "ab"}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/replace-first \"a_b_c\" \"_\" \"-\"))" :expected "a-b_c"}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/reverse \"abc\"))" :expected "cba"}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/join [\"a\" \"b\" \"c\"]))" :expected "\"abc\""}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/join \",\" [\"a\" \"b\" \"c\"]))" :expected "\"a,b,c\""}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/join \"-\" [1 2 3]))" :expected "\"1-2-3\""}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/split \"a,b,c\" \",\"))" :expected "[\"a\" \"b\" \"c\"]"}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/split \"a1b2c\" #\"[0-9]\"))" :expected "[\"a\" \"b\" \"c\"]"}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/split-lines \"a\\nb\\nc\"))" :expected "[\"a\" \"b\" \"c\"]"}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/replace \"a_b_c\" \"_\" \"-\"))" :expected "\"a-b-c\""}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/replace \"a1b2\" #\"[0-9]\" \"\"))" :expected "\"ab\""}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/replace-first \"a_b_c\" \"_\" \"-\"))" :expected "\"a-b_c\""}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/reverse \"abc\"))" :expected "\"cba\""}
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/index-of \"abc\" \"b\"))" :expected "1"}
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (nil? (s/index-of \"abc\" \"z\")))" :expected "true"}
-  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/trim-newline \"abc\\n\\n\"))" :expected "abc"}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/trim-newline \"abc\\n\\n\"))" :expected "\"abc\""}
   {:suite "type" :expr "(type 5)" :expected "java.lang.Long"}
   {:suite "type" :expr "(type 5.0)" :expected "java.lang.Double"}
   {:suite "type" :expr "(type (/ 10 2))" :expected "java.lang.Long"}
@@ -529,14 +537,14 @@
   {:suite "type" :expr "(type (ex-info \"x\" {}))" :expected "clojure.lang.ExceptionInfo"}
   {:suite "var_meta" :expr "(do (def ^:private pv 1) (:private (meta (var pv))))" :expected "true"}
   {:suite "var_meta" :expr "(do (def ^String tv \"a\") (:tag (meta (var tv))))" :expected "java.lang.String"}
-  {:suite "var_meta" :expr "(do (def dv2 \"hi\" 1) (:doc (meta (var dv2))))" :expected "hi"}
+  {:suite "var_meta" :expr "(do (def dv2 \"hi\" 1) (:doc (meta (var dv2))))" :expected "\"hi\""}
   {:suite "var_meta" :expr "(do (def mv 1) (:name (meta (var mv))))" :expected "mv"}
   {:suite "var_meta" :expr "(do (def nv 1) (:ns (meta (var nv))))" :expected "user"}
   {:suite "var_meta" :expr "(do (def pl 1) (nil? (:private (meta (var pl)))))" :expected "true"}
-  {:suite "var_meta" :expr "(do (defn af [a b] a) (str (:arglists (meta (var af)))))" :expected "([a b])"}
-  {:suite "var_meta" :expr "(do (defn am ([x] x) ([x y] x)) (str (:arglists (meta (var am)))))" :expected "([x] [x y])"}
-  {:suite "var_meta" :expr "(do (defn av [a & r] a) (str (:arglists (meta (var av)))))" :expected "([a & r])"}
-  {:suite "var_meta" :expr "(do (defn ad \"doc\" [x] x) [(str (:arglists (meta (var ad)))) (:doc (meta (var ad)))])" :expected "[([x]) doc]"}
+  {:suite "var_meta" :expr "(do (defn af [a b] a) (str (:arglists (meta (var af)))))" :expected "\"([a b])\""}
+  {:suite "var_meta" :expr "(do (defn am ([x] x) ([x y] x)) (str (:arglists (meta (var am)))))" :expected "\"([x] [x y])\""}
+  {:suite "var_meta" :expr "(do (defn av [a & r] a) (str (:arglists (meta (var av)))))" :expected "\"([a & r])\""}
+  {:suite "var_meta" :expr "(do (defn ad \"doc\" [x] x) [(str (:arglists (meta (var ad)))) (:doc (meta (var ad)))])" :expected "[\"([x])\" \"doc\"]"}
   {:suite "var_meta" :expr "(do (def nsx 1) (class (:ns (meta (var nsx)))))" :expected "clojure.lang.Namespace"}
   {:suite "var_meta" :expr "(do (def lp 1) (number? (:line (meta (var lp)))))" :expected "true"}
   {:suite "var_meta" :expr "(do (def cp 1) (number? (:column (meta (var cp)))))" :expected "true"}
@@ -600,10 +608,10 @@
   {:suite "bytes" :expr "(seq (byte-array \"hi\"))" :expected "(104 105)"}
   {:suite "bytes" :expr "(seq (byte-array (.getBytes \"AB\" \"UTF-8\")))" :expected "(65 66)"}
   {:suite "bytes" :expr "(alength (byte-array (.getBytes \"hello\" \"UTF-8\")))" :expected "5"}
-  {:suite "bytes" :expr "(String. (byte-array [104 105]))" :expected "hi"}
-  {:suite "bytes" :expr "(String. (byte-array [104 105]) \"UTF-8\")" :expected "hi"}
+  {:suite "bytes" :expr "(String. (byte-array [104 105]))" :expected "\"hi\""}
+  {:suite "bytes" :expr "(String. (byte-array [104 105]) \"UTF-8\")" :expected "\"hi\""}
   {:suite "bytes" :expr "(int (first (String. (byte-array [200]) \"ISO-8859-1\")))" :expected "200"}
-  {:suite "bytes" :expr "(String. (.getBytes \"round\" \"UTF-8\") \"UTF-8\")" :expected "round"}
+  {:suite "bytes" :expr "(String. (.getBytes \"round\" \"UTF-8\") \"UTF-8\")" :expected "\"round\""}
   {:suite "deftype-map" :expr "(do (deftype Mp [m] clojure.lang.IPersistentMap (without [_ k] m)) [(map? (->Mp 1)) (record? (->Mp 1))])" :expected "[true false]"}
   ;; contains? routes to a set-like deftype's own `contains` (not field presence);
   ;; the plain field-presence arm is guarded to skip a type declaring contains.
@@ -672,7 +680,7 @@
   ;; intern: symbol meta lands on the var; :macro true makes the var expand as a
   ;; macro (load-string compiles after the intern, so the use site sees it).
   {:suite "intern" :expr "(do (defmacro im-src [x] (list (quote +) x 1)) (intern 'user (with-meta 'im-macro {:macro true}) @#'im-src) (load-string \"(im-macro 5)\"))" :expected "6"}
-  {:suite "intern" :expr "(do (intern 'user (with-meta 'iv-doc {:doc \"d\"}) 42) [(:doc (meta #'iv-doc)) iv-doc])" :expected "[d 42]"}
+  {:suite "intern" :expr "(do (intern 'user (with-meta 'iv-doc {:doc \"d\"}) 42) [(:doc (meta #'iv-doc)) iv-doc])" :expected "[\"d\" 42]"}
   {:suite "intern" :expr "(do (intern 'user 'iv-plain 7) iv-plain)" :expected "7"}
   ;; a defmacro var reports :macro true in its meta (JVM parity), so re-export
   ;; idioms that copy (meta var) onto a new var carry macro-ness with it.
@@ -692,20 +700,20 @@
   {:suite "instance? / bound-class" :expr "(do (def icv-k clojure.lang.Keyword) (instance? icv-k :k))" :expected "true"}
   {:suite "maps / hash-map order" :expr "(seq (hash-map :xmap 1 :! 2))" :expected "([:xmap 1] [:! 2])"}
   {:suite "maps / hash-map order" :expr "(do (def sq-log (atom [])) (defmacro sq-m3 [] `{:a ~(list 'swap! 'sq-log 'conj 1) :b ~(list 'swap! 'sq-log 'conj 2)}) (sq-m3) (deref sq-log))" :expected "[1 2]"}
-  {:suite "core / dynamic-vars" :expr "*source-path*" :expected "NO_SOURCE_FILE"}
-  {:suite "core / PrintWriter-on" :expr "(let [sb (atom nil)] (let [w (PrintWriter-on (fn [s] (reset! sb s)) nil)] (.write w \"hi\") (.flush w)) @sb)" :expected "hi"}
-  {:suite "core / PrintWriter-on" :expr "(let [sb (atom nil)] (let [w (PrintWriter-on (fn [s] (reset! sb s)) nil)] (.write w \"a\") (.write w \"b\") (.flush w)) @sb)" :expected "ab"}
-  {:suite "core / print-simple" :expr "(with-out-str (print-simple {:a 1} *out*))" :expected "{:a 1}"}
+  {:suite "core / dynamic-vars" :expr "*source-path*" :expected "\"NO_SOURCE_FILE\""}
+  {:suite "core / PrintWriter-on" :expr "(let [sb (atom nil)] (let [w (PrintWriter-on (fn [s] (reset! sb s)) nil)] (.write w \"hi\") (.flush w)) @sb)" :expected "\"hi\""}
+  {:suite "core / PrintWriter-on" :expr "(let [sb (atom nil)] (let [w (PrintWriter-on (fn [s] (reset! sb s)) nil)] (.write w \"a\") (.write w \"b\") (.flush w)) @sb)" :expected "\"ab\""}
+  {:suite "core / print-simple" :expr "(with-out-str (print-simple {:a 1} *out*))" :expected "\"{:a 1}\""}
   {:suite "core / StackTraceElement->vec" :expr "(vec (map StackTraceElement->vec (.getStackTrace (Thread/currentThread))))" :expected "[]"}
   ;; an unbound var reads as a per-cell sentinel naming its var (JVM Var$Unbound
   ;; parity) on every read surface: a plain compiled read, var-get, and deref/@.
-  {:suite "vars / unbound" :expr "(do (declare uv-a) (pr-str uv-a))" :expected "#object[clojure.lang.Var$Unbound 0 \"Unbound: #'user/uv-a\"]"}
-  {:suite "vars / unbound" :expr "(do (declare uv-b) (pr-str (var-get (var uv-b))))" :expected "#object[clojure.lang.Var$Unbound 0 \"Unbound: #'user/uv-b\"]"}
-  {:suite "vars / unbound" :expr "(do (declare uv-c) (pr-str (deref (var uv-c))))" :expected "#object[clojure.lang.Var$Unbound 0 \"Unbound: #'user/uv-c\"]"}
+  {:suite "vars / unbound" :expr "(do (declare uv-a) (pr-str uv-a))" :expected "\"#object[clojure.lang.Var$Unbound 0 \\\"Unbound: #'user/uv-a\\\"]\""}
+  {:suite "vars / unbound" :expr "(do (declare uv-b) (pr-str (var-get (var uv-b))))" :expected "\"#object[clojure.lang.Var$Unbound 0 \\\"Unbound: #'user/uv-b\\\"]\""}
+  {:suite "vars / unbound" :expr "(do (declare uv-c) (pr-str (deref (var uv-c))))" :expected "\"#object[clojure.lang.Var$Unbound 0 \\\"Unbound: #'user/uv-c\\\"]\""}
   {:suite "vars / unbound" :expr "(do (declare uv-d) (bound? (var uv-d)))" :expected "false"}
   {:suite "vars / unbound" :expr "(do (declare uv-e) (identical? uv-e (var-get (var uv-e))))" :expected "true"}
-  {:suite "vars / unbound" :expr "(do (declare uv-f) (str uv-f))" :expected "Unbound: #'user/uv-f"}
-   {:suite "vars / unbound" :expr "(do (declare uv-late-undef-xyz) (pr-str uv-late-undef-xyz))" :expected "#object[clojure.lang.Var$Unbound 0 \"Unbound: #'user/uv-late-undef-xyz\"]"}
+  {:suite "vars / unbound" :expr "(do (declare uv-f) (str uv-f))" :expected "\"Unbound: #'user/uv-f\""}
+   {:suite "vars / unbound" :expr "(do (declare uv-late-undef-xyz) (pr-str uv-late-undef-xyz))" :expected "\"#object[clojure.lang.Var$Unbound 0 \\\"Unbound: #'user/uv-late-undef-xyz\\\"]\""}
   {:suite "vars / unbound" :expr "(do (declare ^:dynamic uv-g) (binding [uv-g 42] (deref (var uv-g))))" :expected "42"}
   ;; seq error semantics that guard the per-site unsafe-op work: a nil count
   ;; routes through a checked fx comparison in the take fast path, which must
@@ -713,16 +721,16 @@
   ;; out of the JVM-certified corpus.)
   {:suite "seq error semantics" :expr "(take nil [1 2 3])" :expected :throws}
   ;; sets are always hash-ordered (JVM PersistentHashSet behavior)
-  {:suite "sets" :expr "(seq #{1 \"three\" :2})" :expected "(1 three :2)"}
+  {:suite "sets" :expr "(seq #{1 \"three\" :2})" :expected "(1 \"three\" :2)"}
   {:suite "sets" :expr "(seq (conj #{} :a :b :c))" :expected "(:c :b :a)"}
   ;; #error form must be readable: strings inside the map are quoted.
   ;; Neither JVM nor Jolt can roundtrip #error via edn/read-string (no reader
   ;; function for tag error), so this pins the pr-str output shape directly.
-  {:suite "ex-info #error readable" :expr "(pr-str (ex-info \"boom\" {:a 1}))" :expected "#error {\n :cause \"boom\"\n :data {:a 1}\n :via [ {:type clojure.lang.ExceptionInfo :message \"boom\" :data {:a 1} :at nil}]\n :trace []}"}
+  {:suite "ex-info #error readable" :expr "(pr-str (ex-info \"boom\" {:a 1}))" :expected "\"#error {\\n :cause \\\"boom\\\"\\n :data {:a 1}\\n :via [ {:type clojure.lang.ExceptionInfo :message \\\"boom\\\" :data {:a 1} :at nil}]\\n :trace []}\""}
   {:suite "proxy over an interface" :expr "(.call (proxy [java.util.concurrent.Callable] [] (call [] (* 6 7))))" :expected "42"}
-  {:suite "reify class" :expr "(str (class (reify java.lang.Runnable (run [_] nil))))" :expected "class clojure.lang.IObj$reify__0"}
-  {:suite "promise class" :expr "(str (class (promise)))" :expected "class clojure.core$promise$reify__0"}
-  {:suite "future class" :expr "(str (class (future 1)))" :expected "class clojure.core$future_call$reify__0"}
+  {:suite "reify class" :expr "(str (class (reify java.lang.Runnable (run [_] nil))))" :expected "\"class clojure.lang.IObj$reify__0\""}
+  {:suite "promise class" :expr "(str (class (promise)))" :expected "\"class clojure.core$promise$reify__0\""}
+  {:suite "future class" :expr "(str (class (future 1)))" :expected "\"class clojure.core$future_call$reify__0\""}
   ;; two same-named records in different namespaces: suffix match has >1
   ;; candidate — inline-impl-receiver-type must return nil (no seeding) so
   ;; the protocol method body uses generic field access, not the wrong
@@ -730,7 +738,7 @@
   {:suite "record resolution / two ns same record name" :expr "(do (ns unit.rr.a) (defprotocol P1 (rr-foo [_])) (defrecord Circle [x y] P1 (rr-foo [this] [(:x this) (:y this)])) (ns unit.rr.b) (defrecord Circle [a b c]) (ns unit.rr.a) (rr-foo (->Circle 10 20)))" :expected "[10 20]"}
   ;; user fn named register-method must not be confused with
   ;; clojure.core/register-method — the ns check prevents the warp
-  {:suite "register-method user fn" :expr "(do (defn register-method [a b c d] (str a b c)) (register-method \"X\" \"Y\" \"Z\" (fn [x] x)))" :expected "XYZ"}
+  {:suite "register-method user fn" :expr "(do (defn register-method [a b c d] (str a b c)) (register-method \"X\" \"Y\" \"Z\" (fn [x] x)))" :expected "\"XYZ\""}
 
   ;; --- core.async alts -------------------------------------------------------
   ;; 1. alts-put vs alts-take rendezvous on unbuffered channel (the livelock fix)
@@ -803,11 +811,11 @@
  {:suite "records-ctor-arity" :expr "(do (defrecord ArC9b [x y]) (try (->ArC9b 1 2 3) (catch Exception e :arity-throw)))" :expected ":arity-throw"}
  {:suite "records-ctor-arity" :expr "(do (defrecord ArC9c [x y]) (->ArC9c 1 2))" :expected "#user.ArC9c{:x 1, :y 2}"}
  ;; Stage C — assoc applies ^double coercion on record fields
- {:suite "records-assoc-double" :expr "(do (deftype DblC10 [^double x]) (.getName (class (.-x (assoc (->DblC10 1) :x 2)))))" :expected "java.lang.Double"}
+ {:suite "records-assoc-double" :expr "(do (deftype DblC10 [^double x]) (.getName (class (.-x (assoc (->DblC10 1) :x 2)))))" :expected "\"java.lang.Double\""}
  ;; Stage D — range step 0 repeats start infinitely
  {:suite "seq-range-step-zero" :expr "(take 3 (range 5 10 0))" :expected "(5 5 5)"}
  ;; Stage D — binding does not auto-deref var-cell
- {:suite "binding-no-autoderef" :expr "(do (def ^:dynamic *bd11* 10) (def bd11v 20) (.getName (class (binding [*bd11* (var bd11v)] *bd11*))))" :expected "clojure.lang.Var"}
+ {:suite "binding-no-autoderef" :expr "(do (def ^:dynamic *bd11* 10) (def bd11v 20) (.getName (class (binding [*bd11* (var bd11v)] *bd11*))))" :expected "\"clojure.lang.Var\""}
  ;; naa9 — JVM-only macro vars absent on jolt
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'import))" :expected "true"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (:macro (meta (resolve 'import))))" :expected "true"}
@@ -819,21 +827,25 @@
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'with-loading-context))" :expected "false"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'add-doc-and-meta))" :expected "false"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'assert-args))" :expected "false"}
- {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'amap))" :expected "false"}
- {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'areduce))" :expected "false"}
+ ;; amap/areduce are NOT JVM-only: they are index loops over alength/aget/aset/
+ ;; aclone, all of which jolt has, so they are implemented in the overlay.
+ {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'amap))" :expected "true"}
+ {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'areduce))" :expected "true"}
+ {:suite "naa9-jvm-only-macros" :expr "(boolean (:macro (meta (resolve 'amap))))" :expected "true"}
+ {:suite "naa9-jvm-only-macros" :expr "(boolean (:macro (meta (resolve 'areduce))))" :expected "true"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'def-aset))" :expected "false"}
  ;; naa9 — vswap! is a fn on jolt, macro on JVM
  {:suite "naa9-vswap-fn" :expr "(boolean (:macro (meta (resolve 'vswap!))))" :expected "false"}
  {:suite "naa9-vswap-fn" :expr "(some? (resolve 'vswap!))" :expected "true"}
   ;; Stage D — binding does not auto-deref var-cell
-  {:suite "binding-no-autoderef" :expr "(do (def ^:dynamic *bd11* 10) (def bd11v 20) (.getName (class (binding [*bd11* (var bd11v)] *bd11*))))" :expected "clojure.lang.Var"}
+  {:suite "binding-no-autoderef" :expr "(do (def ^:dynamic *bd11* 10) (def bd11v 20) (.getName (class (binding [*bd11* (var bd11v)] *bd11*))))" :expected "\"clojure.lang.Var\""}
   ;; Stage B — getAbsoluteFile/getCanonicalFile share getAbsolutePath's JOLT_PWD base
   {:suite "io-file-base" :expr "(= (.getAbsolutePath (java.io.File. \"rel.txt\")) (.getPath (.getAbsoluteFile (java.io.File. \"rel.txt\"))))" :expected "true"}
   {:suite "io-file-base" :expr "(.exists (.getCanonicalFile (java.io.File. \".\")))" :expected "true"}
   ;; Stage C — getenv single-key matches map lookup
   {:suite "getenv" :expr "(= (get (System/getenv) \"HOME\") (System/getenv \"HOME\"))" :expected "true"}
   ;; Stage C — setProperty visible in getProperties
-  {:suite "sysprops" :expr "(do (System/setProperty \"zz.k\" \"v\") (get (System/getProperties) \"zz.k\"))" :expected "v"}
+  {:suite "sysprops" :expr "(do (System/setProperty \"zz.k\" \"v\") (get (System/getProperties) \"zz.k\"))" :expected "\"v\""}
   {:suite "sorted / subseq laziness" :expr "(first (subseq (into (sorted-map) (map (fn [i] [i i]) (range 100000))) > 50000))" :expected "[50001 50001]"}
   ;; Stage B — nio Files consolidation: members from 6 original blocks (files-statics,
   ;; files-nofollow-time, files-throwing-setters, files-create+move, files-final, files-nofollow)
@@ -869,11 +881,11 @@
   {:suite "add-deps" :label "inline :local/root dep becomes requirable" :expected ":pong" :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-adddep-unit\")] (jolt.host/sh (str \"rm -rf \" d)) (jolt.host/sh (str \"mkdir -p \" d \"/src/adddep\")) (spit (str d \"/deps.edn\") \"{}\") (spit (str d \"/src/adddep/core.clj\") \"(ns adddep.core) (defn ping [] :pong)\") (jolt.deps/add-deps {:deps {'adddep/adddep {:local/root d}}}) (require 'adddep.core) ((resolve 'adddep.core/ping))))"}
   {:suite "add-deps" :label "added roots append after existing roots" :expected "true" :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-adddep-unit\") before (vec (jolt.host/source-roots)) _ (jolt.deps/add-deps {:deps {'adddep/adddep {:local/root d}}}) after (vec (jolt.host/source-roots))] (= before (vec (take (count before) after)))))"}
   {:suite "m2-repo" :label "JOLT_LOCAL_REPO wins, then :mvn/local-repo, then HOME/.m2" :expected "true" :expr "(do (require 'jolt.deps) (let [m2 @#'jolt.deps/m2-repo-dir] (and (= \"/o\" (m2 \"/o\" \"/cfg\" \"/h\")) (= \"/cfg\" (m2 nil \"/cfg\" \"/h\")) (= \"/h/.m2/repository\" (m2 nil nil \"/h\")))))"}
-  {:suite "git-url-inference" :label "io.github.OWNER/REPO -> github https .git" :expected "https://github.com/paintparty/lasertag.git" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url 'io.github.paintparty/lasertag))"}
-  {:suite "git-url-inference" :label "com.github.OWNER/REPO -> github" :expected "https://github.com/seancorfield/next.jdbc.git" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url 'com.github.seancorfield/next.jdbc))"}
-  {:suite "git-url-inference" :label "io.gitlab.OWNER/REPO -> gitlab" :expected "https://gitlab.com/owner/repo.git" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url 'io.gitlab.owner/repo))"}
-  {:suite "git-url-inference" :label "org.bitbucket.OWNER/REPO -> bitbucket" :expected "https://bitbucket.org/owner/repo.git" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url 'org.bitbucket.owner/repo))"}
-  {:suite "git-url-inference" :label "ht.sr.~OWNER/REPO -> sourcehut, no .git suffix" :expected "https://git.sr.ht/~owner/repo" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url (symbol \"ht.sr.~owner\" \"repo\")))"}
+  {:suite "git-url-inference" :label "io.github.OWNER/REPO -> github https .git" :expected "\"https://github.com/paintparty/lasertag.git\"" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url 'io.github.paintparty/lasertag))"}
+  {:suite "git-url-inference" :label "com.github.OWNER/REPO -> github" :expected "\"https://github.com/seancorfield/next.jdbc.git\"" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url 'com.github.seancorfield/next.jdbc))"}
+  {:suite "git-url-inference" :label "io.gitlab.OWNER/REPO -> gitlab" :expected "\"https://gitlab.com/owner/repo.git\"" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url 'io.gitlab.owner/repo))"}
+  {:suite "git-url-inference" :label "org.bitbucket.OWNER/REPO -> bitbucket" :expected "\"https://bitbucket.org/owner/repo.git\"" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url 'org.bitbucket.owner/repo))"}
+  {:suite "git-url-inference" :label "ht.sr.~OWNER/REPO -> sourcehut, no .git suffix" :expected "\"https://git.sr.ht/~owner/repo\"" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url (symbol \"ht.sr.~owner\" \"repo\")))"}
   {:suite "git-url-inference" :label "unknown host namespace -> nil" :expected "" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url 'org.clojure/data.json))"}
   {:suite "git-url-inference" :label "non-namespaced coordinate -> nil" :expected "" :expr "(do (require 'jolt.deps) (@#'jolt.deps/infer-git-url 'lasertag))"}
   {:suite "git-url-inference" :label "io.github.* with :mvn/version is a Maven dep, not git" :expected ":mvn" :expr "(do (require 'jolt.deps) (require 'jolt.deps.ext) (jolt.deps.ext/coord-type {:mvn/version \"1.0.0\"}))"}
@@ -929,7 +941,7 @@
   {:suite "atomics" :label "reset-vals! returns [old new]" :expected "[5 9]" :expr "(let [a (atom 5)] (reset-vals! a 9))"}
   {:suite "atomics" :label "compare-and-set! true on match and sets" :expected "[true 6]" :expr "(let [a (atom 5)] [(compare-and-set! a 5 6) (deref a)])"}
   {:suite "atomics" :label "compare-and-set! false on mismatch and no set" :expected "[false 5]" :expr "(let [a (atom 5)] [(compare-and-set! a 0 6) (deref a)])"}
-  {:suite "atomics" :label "CAS-retry increments across futures lose no updates (atomic native)" :expected "true" :expr "(do (let [a (atom 0) done (atom 0) n 4 per 2000 target (* n per)] (dotimes [_ n] (future (dotimes [_ per] (loop [] (let [cur (deref a)] (when-not (compare-and-set! a cur (inc cur)) (recur))))) (swap! done inc))) (loop [w 0] (cond (== (deref done) n) :fin (> w 1000000) :timeout :else (do (Thread/yield) (recur (inc w))))) (str (== (deref a) target))))"}
+  {:suite "atomics" :label "CAS-retry increments across futures lose no updates (atomic native)" :expected "\"true\"" :expr "(do (let [a (atom 0) done (atom 0) n 4 per 2000 target (* n per)] (dotimes [_ n] (future (dotimes [_ per] (loop [] (let [cur (deref a)] (when-not (compare-and-set! a cur (inc cur)) (recur))))) (swap! done inc))) (loop [w 0] (cond (== (deref done) n) :fin (> w 1000000) :timeout :else (do (Thread/yield) (recur (inc w))))) (str (== (deref a) target))))"}
   ;; shadow-emitted (compiler-review R2 stage 1). Each row binds a local whose
   ;; name is a bare Scheme head the back end emits, in the scope of a construct
   ;; that emits that head, so the local would shadow the emitted form. Pre-remint
@@ -939,8 +951,8 @@
   {:suite "shadow-emitted" :expr "(let [case-lambda 5] ((fn ([x] x) ([x y] y)) 1))" :expected "1"}
   {:suite "shadow-emitted" :expr "(let [dynamic-wind 5] (binding [*print-length* 3] 1))" :expected "1"}
   {:suite "shadow-emitted" :expr "(let [host-new 5] (.size (java.util.ArrayList.)))" :expected "0"}
-  {:suite "shadow-emitted" :expr "(do (defrecord Rd [x]) (let [record-method-dispatch 5] (.toString (->Rd 1))))" :expected "user.Rd{:x 1}"}
-  {:suite "shadow-emitted" :expr "(let [host-static-call 5] (String/valueOf 42))" :expected "42"}
+  {:suite "shadow-emitted" :expr "(do (defrecord Rd [x]) (let [record-method-dispatch 5] (.toString (->Rd 1))))" :expected "\"user.Rd{:x 1}\""}
+  {:suite "shadow-emitted" :expr "(let [host-static-call 5] (String/valueOf 42))" :expected "\"42\""}
   {:suite "shadow-emitted" :expr "(let [host-static-ref 5] (pos? Long/MAX_VALUE))" :expected "true"}
   ;; hashtable-ref is emitted by the devirt ctor-inlining path; reproduces only
   ;; when ctor-shapes is populated (run-passes in compile-eval should set it).
@@ -971,12 +983,12 @@
   {:suite "r3-rt" :expr "(= (read-string (pr-str 4.9E-324)) 4.9E-324)" :expected "true"}
   {:suite "r3-rt" :expr "(= (read-string (pr-str 2.5E-323)) 2.5E-323)" :expected "true"}
   {:suite "r3-rt" :expr "(= (read-string (pr-str 1.0E-322)) 1.0E-322)" :expected "true"}
-  {:suite "r3-rt" :expr "(pr-str 4.9E-324)" :expected "5.0E-324"}
-  {:suite "r3-rt" :expr "(pr-str 2.5E-323)" :expected "2.5E-323"}
-  {:suite "r3-rt" :expr "(pr-str 1.0E-322)" :expected "1.0E-322"}
-  {:suite "r3-rt" :expr "(pr-str 1.0E7)" :expected "1.0E7"}
-  {:suite "r3-rt" :expr "(pr-str 0.001)" :expected "0.001"}
-  {:suite "r3-rt" :expr "(pr-str 1.0E-300)" :expected "1.0E-300"}
+  {:suite "r3-rt" :expr "(pr-str 4.9E-324)" :expected "\"5.0E-324\""}
+  {:suite "r3-rt" :expr "(pr-str 2.5E-323)" :expected "\"2.5E-323\""}
+  {:suite "r3-rt" :expr "(pr-str 1.0E-322)" :expected "\"1.0E-322\""}
+  {:suite "r3-rt" :expr "(pr-str 1.0E7)" :expected "\"1.0E7\""}
+  {:suite "r3-rt" :expr "(pr-str 0.001)" :expected "\"0.001\""}
+  {:suite "r3-rt" :expr "(pr-str 1.0E-300)" :expected "\"1.0E-300\""}
   ;; compiler-review R3 stage 2 — bigdec for ratios / sci-notation doubles / typed
   ;; errors (java/bigdec.ss). Ratio -> exact decimal (ArithmeticException if
   ;; non-terminating); flonum + exponent strings parse; Inf/NaN/garbage raise
@@ -1214,21 +1226,21 @@
   {:suite "r5-refer" :expr "(do (refer (quote clojure.set) :only (quote [union])) [(some? (resolve (quote union))) (resolve (quote difference))])" :expected "[true nil]"}
   {:suite "r5-refer" :expr "(do (refer (quote clojure.set) :exclude (quote [difference])) [(some? (resolve (quote union))) (resolve (quote difference))])" :expected "[true nil]"}
   {:suite "r5-refer" :expr "(do (refer (quote clojure.set) :only (quote [union])) (union #{1} #{2}))" :expected "#{1 2}"}
-  {:suite "r5-syntax-quote" :expr "(pr-str (eval (read-string \"(pr-str `())\")))" :expected "\"()\""}
-  {:suite "r5-syntax-quote" :expr "(pr-str (read-string \"`.foo\"))" :expected "(quote .foo)"}
-  {:suite "r5-syntax-quote" :expr "(pr-str (read-string \"`foo.\"))" :expected "(quote foo.)"}
-  {:suite "r5-syntax-quote" :expr "(pr-str `())" :expected "()"}
-  {:suite "r5-syntax-quote" :expr "(pr-str (eval (read-string \"`(a b)\")))" :expected "(user/a user/b)"}
+  {:suite "r5-syntax-quote" :expr "(pr-str (eval (read-string \"(pr-str `())\")))" :expected "\"\\\"()\\\"\""}
+  {:suite "r5-syntax-quote" :expr "(pr-str (read-string \"`.foo\"))" :expected "\"(quote .foo)\""}
+  {:suite "r5-syntax-quote" :expr "(pr-str (read-string \"`foo.\"))" :expected "\"(quote foo.)\""}
+  {:suite "r5-syntax-quote" :expr "(pr-str `())" :expected "\"()\""}
+  {:suite "r5-syntax-quote" :expr "(pr-str (eval (read-string \"`(a b)\")))" :expected "\"(user/a user/b)\""}
   {:suite "r5-eval-const" :expr "(eval (list (quote identity) 1M))" :expected "1M"}
   {:suite "r5-eval-const" :expr "(= 1M (eval (list (quote identity) 1M)))" :expected "true"}
   {:suite "r5-eval-const" :expr "(eval (list (quote class) 1M))" :expected "java.math.BigDecimal"}
-  {:suite "r5-eval-const" :expr "(str (eval (list (quote identity) (read-string \"#uuid \\\"00000000-0000-0000-0000-000000000000\\\"\"))))" :expected "00000000-0000-0000-0000-000000000000"}
+  {:suite "r5-eval-const" :expr "(str (eval (list (quote identity) (read-string \"#uuid \\\"00000000-0000-0000-0000-000000000000\\\"\"))))" :expected "\"00000000-0000-0000-0000-000000000000\""}
   {:suite "r5-eval-const" :expr "(eval (list (quote identity) (read-string \"#inst \\\"2020-01-01T00:00:00.000-00:00\\\"\")))" :expected "#inst \"2020-01-01T00:00:00.000-00:00\""}
   {:suite "r5-data-readers" :expr "(binding [*data-readers* {(quote t/tag) inc}] (read-string \"#t/tag 5\"))" :expected "6"}
   {:suite "r5-prefer" :expr "(do (defmulti pf1 identity) (prefer-method pf1 :a :b) (try (prefer-method pf1 :b :a) :no (catch IllegalStateException e :conflict)))" :expected ":conflict"}
   {:suite "r5-prefer" :expr "(do (derive ::pc ::pa) (derive ::pc ::pb) (derive ::pa ::pp) (defmulti pf2 identity) (defmethod pf2 ::pp [x] :pp) (defmethod pf2 ::pb [x] :pb) (prefer-method pf2 ::pp ::pb) (pf2 ::pc))" :expected ":pp"}
   {:suite "r5-prefer" :expr "(do (derive ::qc ::qa) (derive ::qc ::qb) (derive ::qa ::qp) (defmulti pf3 identity) (defmethod pf3 ::qp [x] :pp) (defmethod pf3 ::qb [x] :pb) (try (pf3 ::qc) (catch IllegalArgumentException e :ambiguous)))" :expected ":ambiguous"}
-  {:suite "r5-multifn" :expr "(do (defmulti mfp identity) (pr-str mfp))" :expected "#object[clojure.lang.MultiFn 0x0 \"mfp\"]"}
+  {:suite "r5-multifn" :expr "(do (defmulti mfp identity) (pr-str mfp))" :expected "\"#object[clojure.lang.MultiFn 0x0 \\\"mfp\\\"]\""}
   {:suite "r5-multifn" :expr "(var? (defmulti mfv identity))" :expected "true"}
   {:suite "r6-kernel-throws" :expr "(try (conj {} [1]) (catch IllegalArgumentException e :iae) (catch Throwable t :other))" :expected ":iae"}
   {:suite "r6-kernel-throws" :expr "(try (conj {} [1]) (catch NullPointerException e :npe) (catch Throwable t :t))" :expected ":t"}
@@ -1237,8 +1249,8 @@
   {:suite "r6-kernel-throws" :expr "(try (count :x) (catch UnsupportedOperationException e :uoe) (catch Throwable t :other))" :expected ":uoe"}
   {:suite "r6-kernel-throws" :expr "(try (hash-map 1) (catch IllegalArgumentException e :iae) (catch Throwable t :other))" :expected ":iae"}
   {:suite "r6-kernel-throws" :expr "(try (assoc {} :a) (catch IllegalArgumentException e :iae) (catch Throwable t :other))" :expected ":iae"}
-  {:suite "r6-throwable-fqn" :expr "(str (class (try (read-string \"#inst \\\"garbage\\\"\") (catch Throwable e e))))" :expected "class java.lang.RuntimeException"}
-  {:suite "r6-throwable-fqn" :expr "(str (class (try (the-ns (quote no.such.ns.zzz)) (catch Throwable e e))))" :expected "class java.lang.Exception"}
+  {:suite "r6-throwable-fqn" :expr "(str (class (try (read-string \"#inst \\\"garbage\\\"\") (catch Throwable e e))))" :expected "\"class java.lang.RuntimeException\""}
+  {:suite "r6-throwable-fqn" :expr "(str (class (try (the-ns (quote no.such.ns.zzz)) (catch Throwable e e))))" :expected "\"class java.lang.Exception\""}
   {:suite "r6-throwable-fqn" :expr "(try (the-ns (quote no.such.ns.zzz)) (catch RuntimeException e :re) (catch Exception e :ex))" :expected ":ex"}
   {:suite "r6-analyzer-strictness" :expr "(try (eval (read-string \"(try :ok (catch Throwable e :c) (prn :after))\")) (catch Throwable e :threw))" :expected ":threw"}
   {:suite "r6-analyzer-strictness" :expr "(try (eval (read-string \"(try 1 (finally 2) (finally 3))\")) (catch Throwable e :threw))" :expected ":threw"}
@@ -1246,19 +1258,33 @@
   {:suite "r6-analyzer-strictness" :expr "(try :ok (catch Throwable e :c) (finally 1))" :expected ":ok"}
   {:suite "r6-analyzer-strictness" :expr "(loop [x 3] (if (pos? x) (recur (dec x)) x))" :expected "0"}
   {:suite "r6-analyzer-strictness" :expr "((fn [a & b] (if (seq b) (recur a (rest b)) a)) 1 2 3)" :expected "1"}
-  {:suite "pmap-order" :expr "(str (keys {:a 1 :b 2 :c 3}))" :expected "(:a :b :c)"}
-  {:suite "pmap-order" :expr "(str (vals {:a 1 :b 2 :c 3}))" :expected "(1 2 3)"}
-  {:suite "pmap-order" :expr "(str (keys (assoc {:a 1 :b 2} :c 3)))" :expected "(:a :b :c)"}
+  {:suite "pmap-order" :expr "(str (keys {:a 1 :b 2 :c 3}))" :expected "\"(:a :b :c)\""}
+  {:suite "pmap-order" :expr "(str (vals {:a 1 :b 2 :c 3}))" :expected "\"(1 2 3)\""}
+  {:suite "pmap-order" :expr "(str (keys (assoc {:a 1 :b 2} :c 3)))" :expected "\"(:a :b :c)\""}
   {:suite "pmap-order" :expr "(get (assoc {:a 1} :a 9) :a)" :expected "9"}
-  {:suite "pmap-order" :expr "(str (vals (assoc {:a 1 :b 2} :a 9)))" :expected "(9 2)"}
-  {:suite "pmap-order" :expr "(str (keys (assoc {:a 1 :b 2 :c 3} :b 9)))" :expected "(:a :b :c)"}
+  {:suite "pmap-order" :expr "(str (vals (assoc {:a 1 :b 2} :a 9)))" :expected "\"(9 2)\""}
+  {:suite "pmap-order" :expr "(str (keys (assoc {:a 1 :b 2 :c 3} :b 9)))" :expected "\"(:a :b :c)\""}
   {:suite "pmap-order" :expr "(get (array-map :a 1 :a 2) :a)" :expected "2"}
-  {:suite "pmap-order" :expr "(str (keys (array-map :a 1 :b 2 :a 9)))" :expected "(:a :b)"}
-  {:suite "pmap-order" :expr "(str (into {} [[:a 1] [:b 2] [:a 9]]))" :expected "{:a 9, :b 2}"}
+  {:suite "pmap-order" :expr "(str (keys (array-map :a 1 :b 2 :a 9)))" :expected "\"(:a :b)\""}
+  {:suite "pmap-order" :expr "(str (into {} [[:a 1] [:b 2] [:a 9]]))" :expected "\"{:a 9, :b 2}\""}
   {:suite "pmap-order" :expr "(get (into {} [[:a 1] [:a 9]]) :a)" :expected "9"}
-  {:suite "pmap-order" :expr "(str (keys (array-map :k0 0 :k1 1 :k2 2 :k3 3 :k4 4 :k5 5 :k6 6 :k7 7 :k8 8 :k9 9)))" :expected "(:k0 :k1 :k2 :k3 :k4 :k5 :k6 :k7 :k8 :k9)"}
+  {:suite "pmap-order" :expr "(str (keys (array-map :k0 0 :k1 1 :k2 2 :k3 3 :k4 4 :k5 5 :k6 6 :k7 7 :k8 8 :k9 9)))" :expected "\"(:k0 :k1 :k2 :k3 :k4 :k5 :k6 :k7 :k8 :k9)\""}
   ;; satisfies? on a host interface (a Class, not a defprotocol) must throw — the
   ;; JVM errors too — but with a non-empty message naming the offending value.
   ;; Not JVM-certifiable (the JVM's own message differs), so a unit row.
   {:suite "satisfies" :expr "(do (deftype S [x] CharSequence (toString [_] \"x\")) (try (satisfies? CharSequence (S. 1)) (catch Throwable e (let [m (ex-message e)] [(boolean (and (string? m) (seq m))) (boolean (and m (.contains m \"CharSequence\")))]))))" :expected "[true true]"}
+  ;; The `-e` / REPL result printer is READABLE, like Clojure's REPL, which prints
+  ;; with pr: a nested string keeps its quotes and a char its \\c syntax, so the
+  ;; printed result reads back as the value it names. str/print/println are
+  ;; unaffected — they still render the bare text.
+  {:suite "repl-printer" :expr "[\"hi\" \\c 1]" :expected "[\"hi\" \\c 1]"}
+  {:suite "repl-printer" :expr "\"hi\"" :expected "\"hi\""}
+  {:suite "repl-printer" :expr "{:a \"x\" :b \\y}" :expected "{:a \"x\", :b \\y}"}
+  {:suite "repl-printer" :expr "(java.io.File. \"/tmp/x\")" :expected "#object[java.io.File \"/tmp/x\"]"}
+  {:suite "repl-printer" :expr "(str \"hi\" \\c)" :expected "\"hic\""}
+  {:suite "repl-printer" :expr "(with-out-str (print [\"hi\" 1]))" :expected "\"[hi 1]\""}
+  {:suite "repl-printer" :expr "(with-out-str (println \"hi\"))" :expected "\"hi\\n\""}
+  ;; nil prints as nothing at all, so `-e` of a side-effecting form stays quiet —
+  ;; `clojure -M -e nil` does the same.
+  {:suite "repl-printer" :expr "nil" :expected ""}
 ]

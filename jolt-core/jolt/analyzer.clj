@@ -49,10 +49,10 @@
 (defn- uncompilable [why]
   (throw (str "jolt/uncompilable: " why)))
 
-;; Default false: unresolved symbols at the top level throw "Unable to resolve
-;; symbol", matching JVM Clojure. Inside fn bodies the analyzer still late-binds
-;; so defmulti/defmethod forward references work. nREPL binds this to true for
-;; interactive development where forward references are legitimate.
+;; Default false: an unresolved symbol throws "Unable to resolve symbol" wherever
+;; it appears — top level or nested body — matching JVM Clojure. nREPL binds this
+;; to true for interactive development, where a name may be defined by a later
+;; eval and a late-bound var is the more useful behavior.
 (def ^:dynamic *allow-unresolved-vars* false)
 
 (def ^:private gensym-counter (atom 0))
@@ -364,15 +364,30 @@
 ;; (jolt.host/jolt-class-for), as the JVM stores the Class itself in var meta;
 ;; primitive hints like `double` stay quoted symbols. nil when there's no
 ;; metadata, so a plain def keeps the cheap static path.
+;; Strip ONE (quote x) layer if there is one, else return the form unchanged. Used
+;; for :arglists, which arrives either already-data (derived by defn/defmacro) or
+;; as the user's quoted literal.
+(defn- unquote-form [v]
+  (if (and (form-list? v)
+           (let [es (vec (form-elements v))]
+             (and (= 2 (count es)) (form-sym? (first es))
+                  (= "quote" (form-sym-name (first es))))))
+    (second (vec (form-elements v)))
+    v))
+
 (defn- def-meta-expr [ctx base env]
   (when (pos? (count base))
     (map-node (mapv (fn [p]
                       (let [k (first p) v (second p)]
-                        ;; :arglists is the parameter-vector data defn attaches —
-                        ;; quote it rather than evaluate. Everything else is
-                        ;; evaluated.
+                        ;; :arglists is DATA, so it is quoted rather than evaluated.
+                        ;; Two shapes reach here: the parameter vectors defn/defmacro
+                        ;; derive (a bare seq of vectors) and a user's explicit
+                        ;; {:arglists '([x])} (a (quote …) form, since attr-map values
+                        ;; are ordinarily evaluated). Quoting the latter as-is would
+                        ;; store the quote form itself, so unwrap it first — one
+                        ;; (quote …) layer either way.
                         [(const k)
-                         (cond (= k :arglists) (quote-node v)
+                         (cond (= k :arglists) (quote-node (unquote-form v))
                                (and (= k :tag) (string? v))
                                (invoke (var-ref "jolt.host" "jolt-class-for") [(const v)])
                                (= k :tag) (quote-node v)
@@ -547,10 +562,18 @@
                      arglists (if (form-list? (first after))
                                 (map first after)
                                 (list (first after)))
+                     ;; the derived arglists is a DEFAULT: an explicit :arglists in
+                     ;; the attr-map (or on the name) overrides it, as defn allows.
+                     ;; Merging it last instead silently discarded the user's value.
+                     ;; precedence, matching the JVM for both defn and defmacro:
+                     ;; name metadata < the derived arglists < attr-map < docstring.
+                     ;; So ^{:arglists …} on the NAME does not override (the JVM
+                     ;; ignores it there) but {:arglists …} in the attr-map does.
+                     ;; Merging the derived value last discarded the attr-map's.
                      base (merge (or (form-sym-meta name-sym) {})
+                                 {:arglists arglists}
                                  (or attr {})
-                                 (if doc {:doc doc} {})
-                                 {:arglists arglists})
+                                 (if doc {:doc doc} {}))
                      meta-expr (def-meta-expr ctx base env)]
                  (host-intern! ctx cur nm)
                  (merge {:op :defmacro :ns cur :name nm
@@ -811,14 +834,19 @@
                 ;; Class object via the runtime interner, so (= (class x) java.util.Date),
                 ;; identity, and defmethod dispatch keys are all stable.
                 :class (invoke (var-ref "jolt.host" "jolt-class-for") [(const (:name r))])
-                ;; :unresolved — throw "Unable to resolve symbol" at the
-                ;; compilation-unit top level, matching JVM Clojure. Inside a
-                ;; scope (fn / loop / let body — indicated by :recur or non-empty
-                ;; :locals), late-bind so defmulti/defmethod forward references
-                ;; still work. *allow-unresolved-vars* overrides for nREPL.
-                (if (or *allow-unresolved-vars*
-                        (:recur env)
-                        (seq (:locals env)))
+                ;; :unresolved — throw "Unable to resolve symbol", matching JVM
+                ;; Clojure, wherever the symbol appears: at the compilation-unit
+                ;; top level AND inside a scope (fn / loop / let body). The check
+                ;; used to stop at the first enclosing scope, which turned a typo
+                ;; in a nested body into a late-bound var whose unbound root then
+                ;; blew up at runtime on whichever reference was used first —
+                ;; naming a symbol that wasn't even the misspelled one.
+                ;; Legitimate forward references are unaffected: declare and
+                ;; (def name) intern a resolvable cell, so they resolve as :var,
+                ;; as do the clojure.core primitives the host declares up front.
+                ;; *allow-unresolved-vars* keeps nREPL permissive, where a name
+                ;; may legitimately arrive in a later eval.
+                (if *allow-unresolved-vars*
                   (var-ref (compile-ns ctx) nm)
                   (resolve-error ctx nm env)))))))
 
