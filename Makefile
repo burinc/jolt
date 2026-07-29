@@ -1,17 +1,67 @@
 # jolt — Clojure on Chez Scheme. Single substrate, no Janet.
 #
-# bin/jolt runs jolt directly off the checked-in seed (host/chez/seed/); there is no
-# build step. `make test` is the full gate. `make remint` rebuilds the seed after a
-# source change.
+# bin/jolt runs jolt directly off the checked-in seed (host/chez/seed/).
+# `make build` builds the standalone binary, `make test` is the full gate, and
+# `make remint` rebuilds the seed after a source change.
 
-CHEZ ?= $(shell command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null || command -v scheme 2>/dev/null)
+R := https://github.com/makeplus/makes
+M := .cache/makes
+$(shell [ -d '$M' ] || git clone -q $R '$M')
 
-.PHONY: test ci testbin values corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint compilepathsmoke aotcacheperf submodules httpsfetch libconformance mvnhttp depssmoke depsunit
+include $M/init.mk
+include $M/chezscheme.mk
+include $M/clean.mk
+include $M/shell.mk
 
-# Every target needs the vendored submodules; fail with the fix, not a load error.
+MAKES-CLEAN := \
+  build/ \
+  target/ \
+
+PREFIX ?= $(if $(IS-ROOT),/usr/local,$(HOME)/.local)
+CHEZ ?= $(CHEZSCHEME)
+
+# A locally built Chez links its kernel against the bundled lz4 and zlib. Their
+# static archives remain in the Makes build tree rather than the installed Chez
+# prefix, so expose them when linking Jolt's standalone launcher.
+ifneq (,$(CHEZSCHEME-LOCAL))
+CHEZSCHEME-LIB-DIRS := \
+  $(LOCAL-TMP)/$(CHEZSCHEME-DIR)/pb/lz4/lib \
+  $(LOCAL-TMP)/$(CHEZSCHEME-DIR)/pb/zlib
+export LIBRARY_PATH := $(subst $(space),:,$(strip $(CHEZSCHEME-LIB-DIRS)))$(if $(LIBRARY_PATH),:$(LIBRARY_PATH))
+endif
+
+JOLT-TARGETS-NEEDING-DEPS := \
+  aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
+  compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
+  devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr \
+  gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
+  jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
+  narrow numeric numwp oparity pic protoret remint sci selfhost shakelocal \
+  shakesmoke smoke staticnativesmoke test testbin transient unit unitcontext \
+  values wp ci
+
+# Only mark PHONY targets for names that have file system conflicts:
+.PHONY: build install test ci
+
+default:: build
+
+# Install the pinned Chez/C toolchain and initialize every vendored dependency.
+deps: submodules $(CHEZSCHEME)
+
 submodules:
-	@test -f vendor/irregex/irregex.scm -a -f vendor/fs/src/babashka/fs.cljc -a -f vendor/process/src/babashka/process.cljc || { \
-	  echo "vendor submodules missing; run: git submodule update --init --recursive"; exit 1; }
+	@if git submodule status --recursive | grep -q '^-'; then \
+	  git submodule update --init --recursive; \
+	fi
+
+# Every target that runs Chez directly or through bin/jolt waits until deps is
+# complete. This keeps direct targets and parallel aggregate gates race-free.
+$(JOLT-TARGETS-NEEDING-DEPS): | deps
+
+build: testbin
+
+install: build
+	install -d '$(PREFIX)/bin'
+	install -m 755 target/release/jolt '$(PREFIX)/bin/jolt'
 
 # Full gate (dev machine). Includes the self-host byte-fixpoint, which only holds
 # on the same Chez that minted the seed.
@@ -52,10 +102,10 @@ unit:
 # buildlibsmoke` slower with the prerequisite than without it. The staleness
 # check covers the same inputs build-jolt.ss embeds: the runtime .ss files, the
 # install roots, and the launcher stub. JOLT_FORCE_TESTBIN=1 rebuilds anyway.
-TESTBIN_INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src vendor/irregex
+TESTBIN-INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src vendor/irregex
 testbin:
 	@if [ -n "$${JOLT_FORCE_TESTBIN:-}" ] || [ ! -x target/release/jolt ] || \
-	   [ -n "$$(find $(TESTBIN_INPUTS) -type f -newer target/release/jolt -print -quit 2>/dev/null)" ]; then \
+	   [ -n "$$(find $(TESTBIN-INPUTS) -type f -newer target/release/jolt -print -quit 2>/dev/null)" ]; then \
 	  $(CHEZ) --script host/chez/build-jolt.ss release target/release/jolt; \
 	else \
 	  echo "testbin: target/release/jolt up to date"; \
