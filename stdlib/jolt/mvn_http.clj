@@ -51,6 +51,8 @@
 ;; Windows sockets live in ws2_32.dll and need WSAStartup(2.2) once before any
 ;; socket call; POSIX sockets are process symbols, so this is a no-op there.
 ;; UNTESTED on Windows — no Windows machine was available to validate against.
+(ffi/defcfn c-WSAStartup "WSAStartup" [:int :pointer] :int)       ; Windows Winsock init
+
 (defn- init-sockets! []
   (if-not windows?
     true
@@ -83,7 +85,6 @@
 (ffi/defcfn c-getaddrinfo "getaddrinfo" [:pointer :pointer :pointer :pointer] :int :blocking)
 (ffi/defcfn c-freeaddrinfo "freeaddrinfo" [:pointer] :void)
 (ffi/defcfn c-setsockopt  "setsockopt"  [:int :int :int :pointer :int] :int)
-(ffi/defcfn c-WSAStartup  "WSAStartup"  [:int :pointer] :int)     ; Windows Winsock init
 
 ;; SO_RCVTIMEO/SO_SNDTIMEO bound every blocking socket call so a stalled or
 ;; malicious repo can't wedge dependency resolution forever (a timed-out recv

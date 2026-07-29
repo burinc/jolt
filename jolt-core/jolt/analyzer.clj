@@ -49,10 +49,10 @@
 (defn- uncompilable [why]
   (throw (str "jolt/uncompilable: " why)))
 
-;; Default false: unresolved symbols at the top level throw "Unable to resolve
-;; symbol", matching JVM Clojure. Inside fn bodies the analyzer still late-binds
-;; so defmulti/defmethod forward references work. nREPL binds this to true for
-;; interactive development where forward references are legitimate.
+;; Default false: an unresolved symbol throws "Unable to resolve symbol" wherever
+;; it appears — top level or nested body — matching JVM Clojure. nREPL binds this
+;; to true for interactive development, where a name may be defined by a later
+;; eval and a late-bound var is the more useful behavior.
 (def ^:dynamic *allow-unresolved-vars* false)
 
 (def ^:private gensym-counter (atom 0))
@@ -834,14 +834,19 @@
                 ;; Class object via the runtime interner, so (= (class x) java.util.Date),
                 ;; identity, and defmethod dispatch keys are all stable.
                 :class (invoke (var-ref "jolt.host" "jolt-class-for") [(const (:name r))])
-                ;; :unresolved — throw "Unable to resolve symbol" at the
-                ;; compilation-unit top level, matching JVM Clojure. Inside a
-                ;; scope (fn / loop / let body — indicated by :recur or non-empty
-                ;; :locals), late-bind so defmulti/defmethod forward references
-                ;; still work. *allow-unresolved-vars* overrides for nREPL.
-                (if (or *allow-unresolved-vars*
-                        (:recur env)
-                        (seq (:locals env)))
+                ;; :unresolved — throw "Unable to resolve symbol", matching JVM
+                ;; Clojure, wherever the symbol appears: at the compilation-unit
+                ;; top level AND inside a scope (fn / loop / let body). The check
+                ;; used to stop at the first enclosing scope, which turned a typo
+                ;; in a nested body into a late-bound var whose unbound root then
+                ;; blew up at runtime on whichever reference was used first —
+                ;; naming a symbol that wasn't even the misspelled one.
+                ;; Legitimate forward references are unaffected: declare and
+                ;; (def name) intern a resolvable cell, so they resolve as :var,
+                ;; as do the clojure.core primitives the host declares up front.
+                ;; *allow-unresolved-vars* keeps nREPL permissive, where a name
+                ;; may legitimately arrive in a later eval.
+                (if *allow-unresolved-vars*
                   (var-ref (compile-ns ctx) nm)
                   (resolve-error ctx nm env)))))))
 

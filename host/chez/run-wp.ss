@@ -21,7 +21,11 @@
 
 (define (anode src) (analyze (make-analyze-ctx "user") (jolt-ce-read src)))
 
-;; Node record shape (left/right untagged), like binary-trees.
+;; Node record shape (left/right untagged), like binary-trees. A real defrecord
+;; interns its ->Node constructor var as well as registering the shape; these
+;; fixtures register only the shape, so intern the ctor by hand or the analyzer
+;; (rightly) reports it unresolved in the fixture bodies below.
+(declare-var! "user" "->Node")
 (set-record-shapes! U
   (jolt-hash-map "user/->Node"
                  (jolt-hash-map (keyword #f "fields") (jolt-vector (keyword #f "left") (keyword #f "right"))

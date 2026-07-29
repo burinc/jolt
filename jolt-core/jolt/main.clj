@@ -154,6 +154,10 @@
 ;; -A:alias… — add the aliases' paths/deps, then run the remaining argv as a
 ;; command with *cli-aliases* bound, so the command's own project resolution
 ;; (run/path/build/repl/task, or a following -M's) includes them.
+;; -A and -Sdeps re-dispatch the remaining argv through -main, the command
+;; dispatcher at the bottom of this file — declared here for the forward ref.
+(declare -main)
+
 (defn- cmd-A [arg more]
   (let [aliases (parse-aliases arg)]
     (binding [*cli-aliases* (into *cli-aliases* aliases)]

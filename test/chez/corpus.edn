@@ -1656,7 +1656,11 @@
   ;; place) and dynamic binding (read goes through the binding-aware path).
   {:suite "vars / cached reference stays correct" :label "redefinition is seen through a cached ref" :expected "2" :actual "(do (def x 1) (defn f [] x) (def x 2) (f))" :portability :common}
   {:suite "vars / cached reference stays correct" :label "dynamic binding is seen through a cached ref" :expected "[1 9 1]" :actual "(do (def ^:dynamic *d* 1) (defn g [] *d*) [(g) (binding [*d* 9] (g)) (g)])" :portability :common}
-  {:suite "vars / cached reference stays correct" :label "forward reference resolves once the var is defined" :expected "42" :actual "(do (defn a [] (b)) (defn b [] 42) (a))" :portability :common}
+  {:suite "vars / cached reference stays correct" :label "declared forward reference resolves once the var is defined" :expected "42" :actual "(do (declare b) (defn a [] (b)) (defn b [] 42) (a))" :portability :common}
+  ;; an UNDECLARED forward reference is a compile error, in a nested body as much
+  ;; as at the top level — reported where the unknown name is written.
+  {:suite "vars / cached reference stays correct" :label "undeclared forward reference in a fn body throws" :expected :throws :actual "(do (defn a [] (b)) (defn b [] 42) (a))" :portability :common}
+  {:suite "vars / cached reference stays correct" :label "unknown symbol nested in a let body throws" :expected :throws :actual "(let [a 1] (bogus-head a))" :portability :common}
   {:suite "predicates / nil & boolean" :label "nil? true" :expected "true" :actual "(nil? nil)" :portability :common}
   {:suite "predicates / nil & boolean" :label "nil? false" :expected "false" :actual "(nil? 0)" :portability :common}
   {:suite "predicates / nil & boolean" :label "some? true" :expected "true" :actual "(some? 0)" :portability :common}

@@ -39,25 +39,10 @@
    (let [cf (__comparator-fn comp)]
      (sort (fn [x y] (cf (keyfn x) (keyfn y))) coll))))
 
-;; parse-uuid: nil unless s is a canonical 8-4-4-4-12 hex UUID string; throws
-;; on a non-string (Clojure 1.11). __make-uuid is the host constructor for the
-;; tagged value (overlay source can't write :jolt/type map literals — the
-;; reader treats them as tagged forms).
-(defn parse-uuid [s]
-  (if (string? s)
-    (when (re-matches
-           #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" s)
-      (__make-uuid s))
-    (throw (str "parse-uuid requires a string, got: " s))))
-
-;; Version-4 UUID (RFC 4122): zero-padded hex groups 8-4-4-4-12, version
-;; nibble 4, variant 8-b — built over rand-int and validated by parse-uuid.
-(defn random-uuid []
-  (let [hx4 (fn [] (format "%04x" (rand-int 0x10000)))
-        hx3 (fn [] (format "%03x" (rand-int 0x1000)))]
-    (parse-uuid (str (hx4) (hx4) "-" (hx4) "-4" (hx3)
-                     "-" (format "%x" (+ 8 (rand-int 4))) (hx3)
-                     "-" (hx4) (hx4) (hx4)))))
+;; parse-uuid / random-uuid live in the host (natives-misc.ss) — a uuid is a Chez
+;; record, not a tagged map, so post-prelude.ss re-asserts the native versions
+;; over anything the overlay defines here. An overlay copy would be dead code
+;; (this one was, and it called a __make-uuid constructor the host never had).
 
 ;; The char escape/name tables, as char-keyed maps (Clojure's shape).
 (def ^:private char-escape-strings
