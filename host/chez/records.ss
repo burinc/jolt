@@ -694,15 +694,15 @@
                     (if (jolt-nil? ext) '()
                         (map (lambda (p) (make-map-entry (car p) (cdr p))) (jrec-ext-pairs ext)))))
           (loop (+ i 1) (cons (make-map-entry (vector-ref fkeys i) (jrec-field-ref r i)) acc))))))
-(define (jrec-structurally-empty? x)
-  (and (fx=? 0 (jrec-nfields x))
-       (let ((ext (jrec-ext x))) (or (jolt-nil? ext) (fx=? 0 (jolt-count ext))))))
-(register-seq-arm! jrec?
-  (lambda (x) (if (jrec-structurally-empty? x) jolt-nil
-                  (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
-                                (string-append "Don't know how to create ISeq from: " (jrec-tag x)))))))
+;; seq over a jrec stays METHOD-first: a declared seq wins, a defrecord seqs its
+;; entries, a deftype that declares a collection interface without implementing
+;; seq is an abstract-method error, and anything else falls through to jolt-seq's
+;; "Don't know how to create ISeq from" — the JVM answer for a type that is not
+;; Seqable, whatever its field count. Deciding emptiness from the jrec's own field
+;; count instead would answer for the WRAPPER rather than the collection: a
+;; deftype holding a backing map has one field, so it would never read as empty.
 (register-seq-arm! (lambda (x) (and (jrec? x) (jrec-declares-coll-iface? x)))
-  (lambda (x) (if (jrec-structurally-empty? x) jolt-nil (jrec-abstract-method-error x "seq"))))
+  (lambda (x) (jrec-abstract-method-error x "seq")))
 (register-seq-arm! jrec-record?
   (lambda (x) (list->cseq (jrec-entry-list x))))
 (register-seq-arm! (lambda (x) (jrec-cl x "seq"))
@@ -718,8 +718,9 @@
 ;; peek/pop on a deftype implementing IPersistentStack (data.priority-map, which
 ;; core.cache's LRU/LU caches lean on) dispatch to its methods.
 ;; empty? over a jrec: a map-like deftype is empty iff its entry seq is (data
-;; .priority-map's peek calls (.isEmpty this) -> empty?). jolt-seq is method-first.
-(register-empty-arm! jrec-collection? (lambda (coll) (jrec-structurally-empty? coll)))
+;; .priority-map's peek calls (.isEmpty this) -> empty?). jolt-seq is method-first,
+;; so this asks the type's own seq/count rather than counting the jrec's fields.
+(register-empty-arm! jrec-collection? (lambda (coll) (jolt-nil? (jolt-seq coll))))
 (define %r-jolt-peek jolt-peek)
 (set! jolt-peek (lambda (coll)
   (cond ((jrec-cl coll "peek") => (lambda (m) (jolt-invoke m coll)))
@@ -1481,13 +1482,17 @@
       ;; instrumentation) and a consistent nil makes that a safe no-op.
       ((string=? method-name "__methodImplCache") jolt-nil)
       ;; Java interface default methods (isEmpty, size, contains, iterator, entrySet,
-      ;; seq, …) for deftypes that implement java.util.Map / java.util.Collection:
-      ;; dispatched through dot-coll-method which delegates to jolt-empty?/jolt-count/
-      ;; jolt-seq/… — all of which now have non-throwing jrec fallbacks.
+      ;; seq, …) for a deftype that implements java.util.Map / java.util.Collection:
+      ;; dispatch through dot-coll-method, which delegates to the method-first
+      ;; jolt-empty?/jolt-count/jolt-seq — so the type answers from its OWN seq/count.
+      ;; A deftype that implements none of them still reaches the error below, via
+      ;; the throw those dispatchers raise. dot-coll-method BOXES its result (so a
+      ;; legitimate #f is distinguishable from "no such method"); unbox it, or every
+      ;; caller gets a one-element list instead of the value.
       ((jrec? obj)
        (let ((boxed (dot-coll-method obj method-name rest)))
-         (if boxed boxed (error #f (string-append "No method " method-name " for value: "
-                                                  (jolt-pr-str obj))))))
+         (if boxed (car boxed) (error #f (string-append "No method " method-name " for value: "
+                                                        (jolt-pr-str obj))))))
       (else (error #f (string-append "No method " method-name " for value: "
                                      (jolt-pr-str obj)))))))
 

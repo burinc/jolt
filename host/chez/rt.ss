@@ -593,7 +593,39 @@
 (define jolt-pr-str-arms '())
 (define (register-pr-str-arm! pred render)
   (set! jolt-pr-str-arms (cons (cons pred render) jolt-pr-str-arms)))
-(define (jolt-pr-str-base x)
+;; Fallback rendering for a value no printer branch claims. The JVM prints an
+;; unknown object as #object[<class> <hash> <toString>]; jolt used to hand the
+;; value to Chez's writer, which leaked the internal record layout into
+;; user-visible output — (pr-str (atom 1)) read #[jolt-atom-v3 1 () …] and
+;; (pr-str (io/file "/tmp/x")) read #[jolt-jfile-v1 /tmp/x]. Rendering the
+;; #object[…] shape here fixes every host type at once, so a per-type print arm
+;; becomes a refinement rather than the only thing standing between a value and
+;; Chez syntax.
+;;
+;; Content is the value's str rendering, taken STRAIGHT from the str registry
+;; rather than through jolt-str-render-one, whose own fallback is this function —
+;; going through it would recurse. Types with no str arm print bare, like the
+;; JVM's default Object.toString. readable? quotes the content, which is the
+;; (pr x) vs (print x) difference on the JVM. The identity hash is omitted, as
+;; jolt omits it in the print arms it already has.
+(define (jolt-object-content x)
+  (let loop ((rs str-render-registry))
+    (cond ((null? rs) #f)
+          (((caar rs) x) ((cdar rs) x))
+          (else (loop (cdr rs))))))
+(define (jolt-object-repr x readable?)
+  (let ((cls (guard (e (#t #f)) (jolt-class-name x)))
+        (content (guard (e (#t #f)) (jolt-object-content x))))
+    (cond ((not (string? cls)) (format "~a" x))
+          ((not (string? content)) (string-append "#object[" cls "]"))
+          (readable? (string-append "#object[" cls " \"" (jolt-str-escape content) "\"]"))
+          (else (string-append "#object[" cls " " content "]")))))
+
+;; readable? reaches only the #object[…] fallback: every other branch renders the
+;; same either way, and the readable printer handles the types that differ (string
+;; quoting, ##Inf) before it delegates here.
+(define (jolt-pr-str-base x) (jolt-pr-str-base/readable x #f))
+(define (jolt-pr-str-base/readable x readable?)
   (cond
     ((jolt-nil? x) "nil")
     ((eq? x #t) "true")
@@ -624,10 +656,11 @@
     ((cseq? x) (if (jolt-print-hash?) "#"
                    (with-deeper-print
                      (string-append "(" (jolt-str-join (jolt-limited-seq-strs x jolt-pr-str)) ")"))))
-    (else (format "~a" x))))
-(define (jolt-pr-str x)
+    (else (jolt-object-repr x readable?))))
+(define (jolt-pr-str x) (jolt-pr-str/readable x #f))
+(define (jolt-pr-str/readable x readable?)
   (let loop ((as jolt-pr-str-arms))
-    (cond ((null? as) (jolt-pr-str-base x))
+    (cond ((null? as) (jolt-pr-str-base/readable x readable?))
           (((caar as) x) ((cdar as) x))
           (else (loop (cdr as))))))
 
