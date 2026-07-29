@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.12] - 2026-07-29
+
+Stack traces from a build, and from a binary built without direct-linking, now
+carry the file and line they came from. `#{1 1}` is a read error, as on the JVM,
+and `:as-alias` aliases without loading — both at the REPL and through a build.
+
 ### Fixed
 
 - **An open-world build's stack traces had no namespace, file or line.** A
@@ -2219,7 +2225,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.11...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.12...HEAD
+[0.5.12]: https://github.com/jolt-lang/jolt/compare/v0.5.11...v0.5.12
 [0.5.11]: https://github.com/jolt-lang/jolt/compare/v0.5.10...v0.5.11
 [0.5.10]: https://github.com/jolt-lang/jolt/compare/v0.5.9...v0.5.10
 [0.5.9]: https://github.com/jolt-lang/jolt/compare/v0.5.8...v0.5.9
