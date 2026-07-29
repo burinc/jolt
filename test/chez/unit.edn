@@ -728,6 +728,10 @@
   ;; function for tag error), so this pins the pr-str output shape directly.
   {:suite "ex-info #error readable" :expr "(pr-str (ex-info \"boom\" {:a 1}))" :expected "\"#error {\\n :cause \\\"boom\\\"\\n :data {:a 1}\\n :via [ {:type clojure.lang.ExceptionInfo :message \\\"boom\\\" :data {:a 1} :at nil}]\\n :trace []}\""}
   {:suite "proxy over an interface" :expr "(.call (proxy [java.util.concurrent.Callable] [] (call [] (* 6 7))))" :expected "42"}
+  ;; proxy-super takes a method NAME, not an expression: a body calling a super
+  ;; method no var is named after (clojure.tools.logging's (proxy-super reset))
+  ;; has to COMPILE — there is no superclass here, so it throws only if it runs.
+  {:suite "proxy-super method name" :expr "(do (defn pxsup [] (proxy [java.io.ByteArrayOutputStream] [] (flush [] (proxy-super reset)))) (try (.flush (pxsup)) (catch Throwable t :threw)))" :expected ":threw"}
   {:suite "reify class" :expr "(str (class (reify java.lang.Runnable (run [_] nil))))" :expected "\"class clojure.lang.IObj$reify__0\""}
   {:suite "promise class" :expr "(str (class (promise)))" :expected "\"class clojure.core$promise$reify__0\""}
   {:suite "future class" :expr "(str (class (future 1)))" :expected "\"class clojure.core$future_call$reify__0\""}
@@ -822,7 +826,8 @@
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'gen-class))" :expected "false"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'gen-interface))" :expected "false"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'proxy-super))" :expected "true"}
- {:suite "naa9-jvm-only-macros" :expr "(boolean (:macro (meta (resolve 'proxy-super))))" :expected "false"}
+ ;; proxy-super is a macro here, like the JVM's — see the proxy-super case above.
+ {:suite "naa9-jvm-only-macros" :expr "(boolean (:macro (meta (resolve 'proxy-super))))" :expected "true"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'when-class))" :expected "false"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'with-loading-context))" :expected "false"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'add-doc-and-meta))" :expected "false"}

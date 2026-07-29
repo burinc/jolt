@@ -376,7 +376,14 @@
 (defn proxy-call-with-super [f p meth] (f))
 (defn init-proxy [p mappings] p)
 (defn update-proxy [p mappings] p)
-(defn proxy-super [& args] (throw "proxy-super: JVM proxies are not supported in Jolt"))
+;; proxy-super is a MACRO on the JVM, and has to be one here too: its first
+;; argument is a method NAME, not an expression, so analyzing it as one rejects
+;; every proxy body whose super call names something no var matches —
+;; (proxy-super reset) in clojure.tools.logging's log-stream. A proxy desugars to
+;; a reify with no superclass, so there is nothing to call; the expansion throws
+;; if the body ever runs, exactly as the fn did.
+(defmacro proxy-super [meth & args]
+  '(throw "proxy-super: JVM proxies are not supported in Jolt"))
 (defn construct-proxy [c & args] (throw "construct-proxy: not supported in Jolt"))
 (defn get-proxy-class [& interfaces] (throw "get-proxy-class: not supported in Jolt"))
 
