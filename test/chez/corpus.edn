@@ -3755,6 +3755,19 @@
   {:suite "core / dynamic-vars" :label "*agent* is the agent inside its action" :expected "true" :actual "(do (def dv-ag (agent 0)) (def dv-seen (atom nil)) (send dv-ag (fn [s] (reset! dv-seen (identical? *agent* dv-ag)) s)) (await dv-ag) (deref dv-seen))" :portability :common}
   {:suite "core / dynamic-vars" :label "*repl* is false outside a REPL" :expected "false" :actual "*repl*" :portability :common}
   {:suite "core / dynamic-vars" :label "*compile-path* default" :expected "\"classes\"" :actual "*compile-path*" :portability :common}
+  ;; A duplicate element in a SET LITERAL is a read error, like the JVM's
+  ;; PersistentHashSet/createWithCheck — jolt checked this on the data path
+  ;; (read-string) but not when compiling a literal, so `#{1 1}` quietly became
+  ;; #{1} in source while the same text read as data threw. Runtime set builders
+  ;; still dedupe silently, as on the JVM.
+  {:suite "reader / duplicate-literal" :label "duplicate set element" :expected :throws :actual "#{1 1}" :portability :common}
+  {:suite "reader / duplicate-literal" :label "duplicate set element by value, not identity" :expected :throws :actual "#{1 1N}" :portability :common}
+  {:suite "reader / duplicate-literal" :label "duplicate keyword element" :expected :throws :actual "#{:a :a}" :portability :common}
+  {:suite "reader / duplicate-literal" :label "equal quoted lists are one element" :expected :throws :actual "#{'(f 1) '(f 1)}" :portability :common}
+  {:suite "reader / duplicate-literal" :label "distinct symbols are fine" :expected "2" :actual "(count '#{a b})" :portability :common}
+  {:suite "reader / duplicate-literal" :label "duplicate map key" :expected :throws :actual "{:a 1 :a 2}" :portability :common}
+  {:suite "reader / duplicate-literal" :label "hash-set still dedupes at runtime" :expected "#{1}" :actual "(hash-set 1 1)" :portability :common}
+  {:suite "reader / duplicate-literal" :label "set still dedupes at runtime" :expected "#{1}" :actual "(set [1 1])" :portability :common}
   {:suite "core / dynamic-vars" :label "*allow-unresolved-vars* default" :expected "false" :actual "*allow-unresolved-vars*" :portability :common}
   ;; the flag gates compile-time resolution (Compiler.resolveIn) only; resolve and
   ;; ns-resolve go through maybeResolveIn and still answer nil.

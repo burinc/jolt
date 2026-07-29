@@ -387,7 +387,7 @@
   ;; the JVM reader rejects duplicate literal keys before building the map. Guard
   ;; the (cddr kvs) step so an odd-length literal ({:a}) stops here instead of
   ;; crashing in cddr; the collections.ss ctor then raises IllegalArgumentException.
-  (let dupchk ((kvs es) (seen empty-pset))
+  (let dupchk ((kvs (and (not (rdr-scan-mode)) es)) (seen empty-pset))
     (when (and (pair? kvs) (pair? (cdr kvs)))
       (let ((k (car kvs)))
         (when (jolt-truthy? (jolt-contains? seen k))
@@ -398,7 +398,28 @@
     (when (pair? es) (hashtable-set! rdr-map-order m es))
     m))
 
+;; Same guard as rdr-make-map, for the same reason: the JVM reader rejects a
+;; duplicate literal element before building the set (PersistentHashSet
+;; .createWithCheck), so `#{1 1}` is a read error, not a one-element set. Only the
+;; DATA path checked here, in rdr-form->data, so `#{1 1}` read as data threw while
+;; the same literal compiled in a source file quietly became #{1} — and a build,
+;; which re-reads every file as data to scan its requires, then failed on a file
+;; that had loaded fine. Elements are compared as read, like the JVM: two symbols
+;; are distinct, two equal lists are not.
+;;
+;; Never in scan mode. There an auto keyword whose alias can't resolve yet keeps
+;; the ALIAS TEXT as its namespace, so `#{::o/x :o/x}` reads as two copies of
+;; :o/x — a collision that exists only in the placeholder, since at load those are
+;; :app.other/x and :o/x. The scanner discards every form but the require clauses,
+;; so checking there rejects a program that is perfectly good; it is why a build
+;; of exactly that set literal failed while the namespace loaded fine.
 (define (rdr-make-set elems)
+  (let dupchk ((xs (and (not (rdr-scan-mode)) elems)) (seen empty-pset))
+    (when (pair? xs)
+      (when (jolt-truthy? (jolt-contains? seen (car xs)))
+        (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
+                                         (string-append "Duplicate key: " (jolt-pr-str (car xs))))))
+      (dupchk (cdr xs) (pset-conj seen (car xs)))))
   (jolt-hash-map rdr-kw-jolt-type rdr-kw-jolt-set
                  rdr-kw-value (apply jolt-vector elems)))
 
@@ -1223,7 +1244,10 @@
        (let loop ((i 0) (s empty-pset))
          (if (fx>=? i (pvec-count items)) s
              (let ((v (rdr-form->data (pvec-nth-d items i jolt-nil))))
-               (when (jolt-truthy? (jolt-contains? s v))
+               ;; not in scan mode — see rdr-make-set: an unresolvable auto keyword
+               ;; keeps its alias text there, so two placeholders can collide where
+               ;; the real values do not, and the scanner discards these forms anyway.
+               (when (and (not (rdr-scan-mode)) (jolt-truthy? (jolt-contains? s v)))
                  (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
                                                   (string-append "Duplicate key: " (jolt-pr-str v)))))
                (loop (fx+ i 1) (pset-conj s v)))))))

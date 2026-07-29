@@ -95,6 +95,19 @@ fi
 if grep -q '(jv\$app.util\$shout' "$out.nodl.build/flat.ss"; then
   echo "  FAIL: --no-direct-link still direct-linked the app->app call"; exit 1
 fi
+# An OPEN-WORLD build maps its frames too. emit-def-cached only emits a source
+# registration under direct-link, so without one a built binary printed a bare
+# `deep-boom` where the direct-linked build printed
+# `app.util/deep-boom (…/util.clj:24)`. The build turns source-reg on when it is
+# not direct-linking, the way the runtime eval path already does.
+nodl_boom="$(cd / && "$out.nodl" --boom 2>&1 >/dev/null)"
+for frame in 'app\.util/deep-boom .*util\.clj:[0-9]' 'app\.util/mid-boom .*util\.clj:[0-9]' 'app\.core/-main .*core\.clj:[0-9]'; do
+  if ! printf '%s' "$nodl_boom" | grep -Eq "$frame"; then
+    echo "  FAIL: --no-direct-link trace missing located frame $frame"
+    echo "--- got ----"; echo "$nodl_boom"
+    exit 1
+  fi
+done
 
 # ^:redef / ^:dynamic opt out of direct-linking, so runtime redef/binding still
 # take effect in the built binary even with direct-link the release default.
@@ -542,4 +555,42 @@ if [ "$jolt" != "bin/jolt" ]; then
   fi
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver)"
+# A build failure names the file it was reading.
+#
+# The build has three walks that process a file WITHOUT evaluating its forms — the
+# require scan, the whole-program inference walk, the emit walk — and none reaches
+# jolt-enter-form!, which is what records a location. A failure in one printed
+# "Unhandled exception: ..." over a trace of runtime procedure names and nothing
+# about which file was being read; they record it with jolt-enter-file! now.
+#
+# This case drives the load walk, which could always report a location — the
+# no-eval walks have no fault left to reach them with, now that the reader's
+# duplicate check no longer fires in scan mode, and that is the point of the fix
+# below. It gates the reporting path itself, which all four share.
+echo "build smoke: build failure names the source file"
+badsrc="$(dirname "$out")/badread"; mkdir -p "$badsrc/src/app"
+printf '{}\n' > "$badsrc/deps.edn"
+printf '(ns app.core (:require [app.broke]))\n(defn -main [& _] (println :x))\n' > "$badsrc/src/app/core.clj"
+printf '(ns app.broke)\n(defn f [] (+ 1 2)\n' > "$badsrc/src/app/broke.clj"
+read_err="$(JOLT_PWD="$badsrc" "$joltabs" build -m app.core -o "$(dirname "$out")/badread-bin" 2>&1 || true)"
+if ! printf '%s' "$read_err" | grep -q '^  at .*app/broke\.clj'; then
+  echo "  FAIL: build failure did not name src/app/broke.clj"
+  echo "--- got ---"; echo "$read_err"; exit 1
+fi
+
+# A set literal mixing an auto keyword with a plain one of the same alias text
+# must BUILD. ::o/x and :o/x are distinct, but the require scan reads in scan mode,
+# where an unresolved alias keeps its text, so both read as :o/x — and the
+# duplicate-literal check rejected the file. The namespace loaded fine, so this was
+# a build that failed on a program that ran.
+echo "build smoke: scan-mode alias placeholders do not collide"
+aliasout="$(dirname "$out")/alias-set-bin"
+if ! JOLT_PWD="$root/test/chez/alias-set-app" "$joltabs" build -m app.core -o "$aliasout" >/dev/null 2>&1; then
+  echo "  FAIL: alias-set-app build exited non-zero"; exit 1
+fi
+got_alias="$(cd / && "$aliasout" 2>&1 | tail -1)"
+if [ "$got_alias" != "2" ]; then
+  echo "  FAIL: alias-set-app — want 2, got \`$got_alias\`"; exit 1
+fi
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + scan-alias-set)"
