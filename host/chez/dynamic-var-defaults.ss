@@ -64,7 +64,10 @@
 (def-dynvar! "clojure.core" "*print-namespace-maps*" #t)
 ;; *flush-on-newline* — jolt flushes line output; default true.
 (def-dynvar! "clojure.core" "*flush-on-newline*" #t)
-;; *compile-files* — jolt has no separate compile phase that emits .class files.
+;; *compile-files* — true for the extent of a compile, like the JVM. The loader
+;; reads it: a namespace loaded from source while it is set is also written to
+;; *compile-path*, which is what carries (compile 'lib) through lib's whole load
+;; closure (loader.ss cpath-compiling-dir, RT.load's COMPILE_FILES branch).
 (def-dynvar! "clojure.core" "*compile-files*" #f)
 ;; *math-context* — BigDecimal rounding context; nil = unlimited, jolt's default.
 (def-dynvar! "clojure.core" "*math-context*" jolt-nil)
@@ -86,10 +89,18 @@
 ;; *repl* — true inside an interactive session; jolt's repl and the nREPL
 ;; eval path bind it. False in a plain run, like clojure.main.
 (def-dynvar! "clojure.core" "*repl*" #f)
+;; *allow-unresolved-vars* — read by the analyzer through jolt.host/allow-
+;; unresolved-vars?, the way Compiler.resolveIn reads RT.ALLOW_UNRESOLVED_VARS.
+;; Default false: an unqualified symbol with no mapping is a compile error
+;; wherever it appears. Bound true, it resolves late instead (nREPL binds it).
+(def-dynvar! "clojure.core" "*allow-unresolved-vars*" #f)
+;; *compile-path* — the directory clojure.core/compile writes a namespace's
+;; compiled artifact to (loader.ss). "classes" like the JVM, where clojure.main
+;; binds it from the clojure.compile.path property; nil raises "*compile-path*
+;; not set" from compile, as it does on the JVM.
+(def-dynvar! "clojure.core" "*compile-path*" "classes")
 ;; Compiler/loader flags with no separate machinery here — the defaults match
 ;; the JVM so reads and (binding …) behave; setting them has no further effect.
-(def-dynvar! "clojure.core" "*allow-unresolved-vars*" #f)
-(def-dynvar! "clojure.core" "*compile-path*" "classes")
 (def-dynvar! "clojure.core" "*compiler-options*" jolt-nil)
 (def-dynvar! "clojure.core" "*fn-loader*" jolt-nil)
 (def-dynvar! "clojure.core" "*reader-resolver*" jolt-nil)

@@ -8,6 +8,7 @@
 #   grep -rhoE --include='*.ss' 'def-var! "jolt.host" "[^"]+"' host/ \
 #     | sed -E 's/.*"jolt.host" "([^"]+)".*/\1/' | LC_ALL=C sort -u
 add-shutdown-hook
+allow-unresolved-vars?
 array-value?
 backtrace-string
 block-sigint

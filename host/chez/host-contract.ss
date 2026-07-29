@@ -87,6 +87,15 @@
 (define (hc-unchecked-math?)
   (jolt-truthy? (guard (e (#t #f)) (var-deref "clojure.core" "*unchecked-math*"))))
 
+;; *allow-unresolved-vars* read at compile time — clojure.core's var, the same one
+;; RT.ALLOW_UNRESOLVED_VARS is on the JVM. Default false: an unqualified symbol
+;; with no mapping is a compile error. Bound true, the analyzer emits a late-bound
+;; var-ref in the compiling namespace instead, so a name that arrives in a later
+;; eval still works (what nREPL binds it for). Only unqualified symbols consult it,
+;; like Compiler.resolveIn's else branch.
+(define (hc-allow-unresolved-vars?)
+  (jolt-truthy? (guard (e (#t #f)) (var-deref "clojure.core" "*allow-unresolved-vars*"))))
+
 ;; --- form accessors ---------------------------------------------------------
 (define (hc-char-code x) (char->integer x))  ; native Chez char -> codepoint
 (define (hc-sym-name x) (symbol-t-name x))
@@ -561,6 +570,7 @@
   (def-var! "jolt.host" "form-var-value-ns" hc-var-value-ns)
   (def-var! "jolt.host" "form-var-value-name" hc-var-value-name)
   (def-var! "jolt.host" "unchecked-math?" hc-unchecked-math?)
+  (def-var! "jolt.host" "allow-unresolved-vars?" hc-allow-unresolved-vars?)
   (def-var! "jolt.host" "form-bigdec?" hc-bigdec?)
   (def-var! "jolt.host" "form-bigdec-source" hc-bigdec-source)
   (def-var! "jolt.host" "form-bigdec-value?" hc-bigdec-value?)

@@ -3756,6 +3756,9 @@
   {:suite "core / dynamic-vars" :label "*repl* is false outside a REPL" :expected "false" :actual "*repl*" :portability :common}
   {:suite "core / dynamic-vars" :label "*compile-path* default" :expected "\"classes\"" :actual "*compile-path*" :portability :common}
   {:suite "core / dynamic-vars" :label "*allow-unresolved-vars* default" :expected "false" :actual "*allow-unresolved-vars*" :portability :common}
+  ;; the flag gates compile-time resolution (Compiler.resolveIn) only; resolve and
+  ;; ns-resolve go through maybeResolveIn and still answer nil.
+  {:suite "core / dynamic-vars" :label "*allow-unresolved-vars* does not affect resolve" :expected "[nil nil]" :actual "(binding [*allow-unresolved-vars* true] [(resolve 'auv-nope) (ns-resolve *ns* 'auv-nope)])" :portability :common}
   {:suite "core / dynamic-vars" :label "*verbose-defrecords* default" :expected "false" :actual "*verbose-defrecords*" :portability :common}
   {:suite "core / dynamic-vars" :label "*use-context-classloader* default" :expected "true" :actual "*use-context-classloader*" :portability :common}
   {:suite "core / dynamic-vars" :label "*suppress-read* default" :expected "nil" :actual "*suppress-read*" :portability :common}

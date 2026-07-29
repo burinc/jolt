@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`clojure.core/compile` and a working `*compile-path*`.** `*compile-path*` was
+  a var jolt exposed with the JVM's default and nothing behind it, and `compile`
+  did not exist at all. Both now work the way core.clj and `Compiler.compile`
+  describe: `(compile 'my.lib)` binds `*compile-files*`, loads the lib, and writes
+  its compiled form under `*compile-path*`; a nil `*compile-path*` raises
+  `*compile-path* not set`. The artifact is a Chez fasl of the emitted Scheme —
+  the same thing the AOT cache produces — beside the `.scm` it was built from and
+  a `.meta` describing what it was built against, in place of the JVM's `.class`
+  files. Like the JVM, the compile carries through the lib's whole load closure,
+  and the output directory has to be a source root (jolt's classpath) before a
+  later load will pick it up, so `(compile 'app)` into a directory you then put on
+  the roots gives you a project that runs with no source present.
+
+  `RT.load` prefers a `.class` to its `.clj` on mtime. jolt compares a content
+  hash instead — the rule the AOT cache already decides by, and immune to a bare
+  `touch` — and refuses an artifact outright unless the jolt version and runtime
+  fingerprint in `.meta` match, since a fasl from another build calls runtime
+  helpers that may be gone. `.meta` also records the direct requires and their
+  hashes, so editing a namespace this one requires invalidates it; a change
+  further down the graph does not, the same discipline JVM AOT needs.
+
+### Fixed
+
+- **`*allow-unresolved-vars*` affects resolution.** `clojure.core/*allow-unresolved-vars*`
+  read `false` and did nothing; the analyzer consulted a separate
+  `jolt.analyzer/*allow-unresolved-vars*` that only jolt's own nREPL knew to bind.
+  There is now one var, clojure.core's, read through `jolt.host/allow-unresolved-vars?`
+  the way `Compiler.resolveIn` reads `RT.ALLOW_UNRESOLVED_VARS` — and like the JVM
+  only for an unqualified symbol with no mapping, so `resolve`/`ns-resolve` still
+  answer `nil` and a qualified symbol still throws. Bound true, jolt emits a
+  late-bound var-ref in the compiling namespace, so a name defined by a later eval
+  resolves; the JVM's `UnresolvedVarExpr` emits no bytecode and fails later with a
+  `VerifyError`, which is tracked in `known-divergences.edn`.
+
 ## [0.5.10] - 2026-07-28
 
 An optimized build no longer discards a `throw` written in a map value that the
