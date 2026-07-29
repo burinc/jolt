@@ -162,7 +162,7 @@
                                             (chez-current-ns))))
                               result))))))
       (jolt-pop-thread-bindings)
-      (let ((s (jolt-final-str result)))
+      (let ((s (jolt-repl-str result)))
         (when (and print? (not (string=? s "")))
           (display s) (newline))))))
 

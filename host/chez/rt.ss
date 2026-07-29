@@ -530,9 +530,11 @@
                                   ((#\return) "return") ((#\backspace) "backspace") ((#\page) "formfeed")
                                   (else (string c))))
       (string c)))
-;; Program-final printer: jolt's `-e` is str-style at the top level, where a
-;; bare nil renders as the empty string (a nil ELEMENT inside a collection still
-;; prints "nil", which jolt-pr-str handles).
+;; Render a value for a MESSAGE — a host exception's text ("<x> cannot be cast
+;; to …"), a gate's divergence report. str-style at the top level, where a bare
+;; nil renders as the empty string (a nil ELEMENT inside a collection still prints
+;; "nil", which jolt-pr-str handles). The `-e` / REPL result printer is
+;; jolt-repl-str (printing.ss), which is readable instead.
 (define (jolt-final-str x) (if (jolt-nil? x) "" (jolt-pr-str x)))
 ;; --- *print-level* / *print-length* -----------------------------------------
 ;; Both vars default to nil (= unlimited). A non-nil number limits collection

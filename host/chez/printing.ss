@@ -137,6 +137,15 @@
 ;; __pr-str1: render ONE value readably (the overlay's pr-str joins these).
 (define (jolt-pr-str1 x) (jolt-pr-readable x))
 
+;; The value `jolt -e` echoes, and what the unit gate compares against. READABLE,
+;; like Clojure's REPL, which prints with pr: a result reads back as the value it
+;; names, so a nested string keeps its quotes, a char keeps its \c syntax, and a
+;; host object prints #object[cls "content"]. This used to go through
+;; jolt-final-str, the str-style renderer, which printed ["hi" \c 1] as [hi \c 1].
+;; nil still renders as the empty string, so `-e` of a side-effecting form prints
+;; nothing — which is what `clojure -M -e nil` does too.
+(define (jolt-repl-str x) (if (jolt-nil? x) "" (jolt-pr-readable x)))
+
 ;; __write: push a string to output. Normally this goes to the current Chez port
 ;; (so __with-out-str's redirect captures it). When clojure.pprint is active it
 ;; installs __pprint-write-hook; jolt-write then offers each string to the hook,

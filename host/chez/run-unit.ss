@@ -2,7 +2,9 @@
 ;;
 ;; Loads the checked-in seed + spine, reads test/chez/unit.edn, and for each case
 ;; evaluates :expr (wrapped in (do ...), as `jolt -e` does) and compares its PRINTED
-;; value (jolt-final-str) to the literal :expected string. :expected :throws asserts
+;; value (jolt-repl-str, the readable `-e` printer — an :expected string for a
+;; string result therefore carries its quotes) to the literal :expected string.
+;; :expected :throws asserts
 ;; the case raises. These cover host-specific behavior (dot-forms, java statics, io,
 ;; reader, walk, …) that isn't in the JVM-portable corpus. Global state is reset
 ;; between cases for per-case isolation.
@@ -93,7 +95,7 @@
       (guard (e (#t (if throws?
                         (begin (set! pass (+ pass 1)) (bump! suite-pass suite))
                         (set! fails (cons (list suite expr "raised") fails)))))
-        (let ((got (jolt-final-str
+        (let ((got (jolt-repl-str
                      (parameterize ((current-output-port sink))
                        (jolt-compile-eval (string-append "(do " expr ")") "user")))))
           (cond
