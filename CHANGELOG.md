@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.11] - 2026-07-29
+
+A warm AOT cache no longer replays a second copy of the stdlib namespaces a
+library requires, which had been silently undoing whatever that library
+registered over them. `*allow-unresolved-vars*` and `*compile-path*` now do what
+they do on the JVM.
+
 ### Added
 
 - **`clojure.core/compile` and a working `*compile-path*`.** `*compile-path*` was
@@ -2036,7 +2043,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.10...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.11...HEAD
+[0.5.11]: https://github.com/jolt-lang/jolt/compare/v0.5.10...v0.5.11
 [0.5.10]: https://github.com/jolt-lang/jolt/compare/v0.5.9...v0.5.10
 [0.5.9]: https://github.com/jolt-lang/jolt/compare/v0.5.8...v0.5.9
 [0.5.8]: https://github.com/jolt-lang/jolt/compare/v0.5.7...v0.5.8
