@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `::o/x` was still an invalid token. A spec that also carries `:as`, or that
   arrives through `use`, still loads.
 
+  `jolt build` got both halves wrong too, independently of the loader: its require
+  scan counted an alias-only spec as a dependency, so the target was emitted into
+  the binary and its top level ran there, and the emitted `ns` prelude replayed
+  `:as` but not `:as-alias`, so the alias was missing at runtime. Combining
+  `:refer` with `:as-alias` throws on both jolt and the JVM — the target is not
+  loaded, so there is nothing to refer — with different message text.
+
 - **A `jolt build` failure reported no location.** The build has three walks that
   process a source file without evaluating its forms — the require scan, the
   whole-program inference walk, the emit walk — and none reaches

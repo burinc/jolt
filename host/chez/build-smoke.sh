@@ -593,4 +593,23 @@ if [ "$got_alias" != "2" ]; then
   echo "  FAIL: alias-set-app — want 2, got \`$got_alias\`"; exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + scan-alias-set)"
+# :as-alias through a build. clojure.core's load-lib aliases the target WITHOUT
+# loading it (need-ns is `(or as use)`, falling to create-ns), for a namespace that
+# may not exist yet or exists only to qualify keywords. The build has to agree: the
+# require scan must not count an alias-only spec as a dependency (or the target is
+# emitted and its top level runs in the binary), and the emitted ns prelude must
+# still replay the alias. jolt used to get both halves wrong.
+echo "build smoke: :as-alias aliases without pulling the target in"
+aaout="$(dirname "$out")/as-alias-bin"
+if ! JOLT_PWD="$root/test/chez/as-alias-app" "$joltabs" build -m app.core -o "$aaout" >/dev/null 2>&1; then
+  echo "  FAIL: as-alias-app build exited non-zero"; exit 1
+fi
+if grep -q 'set-chez-ns! "app.other"' "$aaout.build/flat.ss"; then
+  echo "  FAIL: :as-alias pulled app.other into the binary"; exit 1
+fi
+got_aa="$(cd / && "$aaout" 2>&1)"
+if [ "$got_aa" != ":kw :app.other/x :aliased true" ]; then
+  echo "  FAIL: as-alias-app — want ':kw :app.other/x :aliased true', got \`$got_aa\`"; exit 1
+fi
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + scan-alias-set + as-alias)"
