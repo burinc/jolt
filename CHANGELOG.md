@@ -11,8 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 A warm AOT cache no longer replays a second copy of the stdlib namespaces a
 library requires, which had been silently undoing whatever that library
-registered over them. `*allow-unresolved-vars*` and `*compile-path*` now do what
-they do on the JVM.
+registered over them, and `apply` no longer realizes an infinite seq before
+handing it to a variadic fn. `examples/ring-app` builds. `*allow-unresolved-vars*`
+and `*compile-path*` now do what they do on the JVM, and a batch of conformance
+work from the compliment and orchard suites lands with them.
 
 ### Added
 
@@ -36,6 +38,21 @@ they do on the JVM.
   helpers that may be gone. `.meta` also records the direct requires and their
   hashes, so editing a namespace this one requires invalidates it; a change
   further down the graph does not, the same discipline JVM AOT needs.
+
+- **`areduce` and `amap`.** Index loops over `alength`/`aget`/`aset`/`aclone`,
+  all of which jolt already had, so they were never JVM-only — they had been
+  parked in the JVM-only macro suite beside `gen-class`. `orchard.profile` needs
+  them.
+
+- **`java.util.Arrays/sort`.** Sorts in place and returns void, so it writes back
+  through the array's own backing rather than building a new one, and its
+  comparator argument routes through the same seam `sort` uses. `list-sort` is a
+  stable merge sort, matching `Arrays.sort` over objects.
+
+- **`clojure.repl`, and a `java.lang.Thread` model.** `run`/`start`/`join`/
+  `isAlive` with `instance?` against `Runnable`, `Integer/compare` as a 3-way int
+  comparison, `Keyword/table` reflectively visible, and `NoSuchFieldException` in
+  the throwable hierarchy.
 
 ### Fixed
 
@@ -71,6 +88,104 @@ they do on the JVM.
   late-bound var-ref in the compiling namespace, so a name defined by a later eval
   resolves; the JVM's `UnresolvedVarExpr` emits no bytecode and fails later with a
   `VerifyError`, which is tracked in `known-divergences.edn`.
+
+- **`apply` realized a lazy rest before every variadic call.** `(apply (fn [& xs]
+  (take 3 xs)) (range))` returns on the JVM, where `RestFn.applyTo` hands the seq
+  to the variadic arity unrealized; here it allocated until the process died.
+  `orchard.profile-test` reaches it through `(apply baz (range))` and took a
+  machine down through swap exhaustion. The cause was the calling convention, not
+  `apply`: an emitted variadic arity is a plain Chez `(lambda (a b . rest) …)` and
+  a Chez rest parameter must be a proper list, so the tail had to be realized to
+  cross that boundary — `jolt-apply` had a hard-coded exception for `concat` and
+  nothing else. Variadic arities now bind their rest through `jolt-rest-seq`, each
+  emitted variadic closure registers its variadic arity's fixed-param count, and
+  `jolt-apply` peels that many plus one and passes the remainder as a box. Only
+  registered callees ever see a box, which keeps the ~115 hand-written Scheme
+  variadics that read their rest list directly working. Peak RSS on the repro goes
+  from unbounded past 2.6 GB to 69 MB.
+
+- **The reader took any qualified `->x`/`map->x` call for a record literal's
+  factory form.** Ordinary code calls those functions too — `(u/->long n)`
+  throughout jolt.time — and the data path applies a factory form, so reading such
+  a file as data applied an unbound var. A build reads every source file as data
+  to scan its requires, so nothing depending on jolt-lang/time could be built.
+  Reader-built factory forms are marked by identity in a weak side table now, like
+  `rdr-map-order`, and the name test is gone.
+
+- **`jolt build` emitted the app section with the loader's order appended last.**
+  The static require closure drops install-owned files, so a stdlib namespace an
+  app namespace requires arrived only through the loader hook and landed behind
+  its callers — the binary died at startup with `Attempting to call unbound fn:
+  #'jolt.time.impl/register-type!`. The hook's order is dependency-correct by
+  construction, so it leads now, with closure entries the hook never saw in front.
+
+- **`proxy-super` was a function**, so its method-name argument was analyzed as an
+  expression and `(proxy-super reset)` in `clojure.tools.logging/log-stream`
+  failed to resolve `reset`. It is a macro now, as on the JVM, still throwing when
+  the body runs since a proxy desugars to a reify with no superclass.
+
+- **`jolt -Sdeps '{…}' build` reached `cmd-build` with `jolt.host/build-binary`
+  unbound.** The launcher loads the build driver on demand and looked for `build`
+  at argv[0] only, but `-Sdeps` and `-A` re-dispatch the rest of the argv.
+
+- **An unresolved symbol in a nested body was late-bound instead of reported.**
+  The analyzer only raised "Unable to resolve symbol" for a symbol at the top
+  level of a compilation unit; inside any fn, loop or let body it bound the name
+  to a var in the compile ns whose root is an unbound sentinel, so a typo surfaced
+  much later as a type error on whichever unbound reference was used
+  arithmetically first — usually not the symbol that was misspelled. A missing
+  `areduce` presented as `'#[jolt-var-unbound-v1 "orchard.profile" "i"] is not a
+  number'. The check applies wherever the symbol appears now, matching the JVM.
+  Legitimate forward references are unaffected: `declare` and `(def name)` intern
+  a resolvable cell first. Four latent forward references fell out, all of which
+  JVM Clojure would reject too.
+
+- **`io/resource` returned two incompatible types.** A path on a source root came
+  back as a jfile, carrying a URL-compatibility surface; a path in the embedded-
+  resources table came back as a bare record with no methods and no class arm, so
+  `.getPath` threw and `(class r)` read `:object`. Which branch served a stdlib
+  path depended on whether `target/dev/flat.so` was fresh, which is why
+  `orchard.meta-test` kept moving between 63 and 67 passing assertions with no
+  relevant code change.
+
+- **`-e` printed its result with the `str`-style printer**, so a nested string
+  lost its quotes and a char its reader syntax: `["hi" \c 1]` printed as
+  `[hi \c 1]`. Clojure's REPL prints with `pr`, which is what makes a printed
+  result read back as the value it names. `nil` still prints as nothing, matching
+  `clojure -M -e nil`. `str`, `print` and `println` are untouched.
+
+- **Comparators were coerced in three unrelated places and only one knew about
+  Comparator objects.** `sort` tested how the value was built rather than what it
+  can do, so a `deftype` Comparator threw ClassCastException, and `sort-by` and
+  `sorted-map-by`/`sorted-set-by` invoked the value directly and threw for `reify`
+  and `deftype` alike. All four go through one `__comparator-fn` seam now, which
+  asks whether the value has a `compare` method. Plain fns, 3-way or boolean, are
+  unchanged.
+
+- **An explicit `{:arglists '([x])}` in a `defn`/`defmacro` attr-map was
+  discarded**, because both assembled the derived parameter vectors last. The
+  derived value is a default the attr-map overrides now, matching the JVM's order:
+  name metadata, then derived, then attr-map, then docstring. `^{:arglists …}` on
+  the *name* still does not win, because the JVM ignores it there.
+
+- **Conformance fixes from the compliment and orchard suites.** syntax-quote
+  lowers metadata as templates, qualifies class tags to FQNs and strips reader
+  position keys; `defmacro`/`def` land docstring, attr-map, arglists and
+  class-typed `:tag` metadata on the var; `get-method` dispatches through `isa?`;
+  jrec gains its collection methods; `jolt-write` goes through a rebound `*out*`
+  writer like the JVM; `empty?`/`with-out-str` regressions fixed and an unknown
+  object renders as `#object[…]`.
+
+### Changed
+
+- **Static fields are a registry keyed on class + field**, rather than a string
+  pair hard-coded inside `Class.getDeclaredField`'s cond. `Keyword/table` is its
+  first row.
+
+- **Dropped the unused `__register-seq!` seam** (`get!`/`empty!`/`count!`/
+  `contains!`). It had no caller anywhere — not the stdlib, jolt-core, the tests,
+  the vendored libraries or the conformance libraries — and never shipped in a
+  release, so nothing external can depend on it.
 
 ## [0.5.10] - 2026-07-28
 
