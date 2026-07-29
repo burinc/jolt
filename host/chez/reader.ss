@@ -446,6 +446,8 @@
        ;; carry the order entry over to the copy.
        (let ((order (and (pmap? target) (hashtable-ref rdr-map-order target #f))))
          (when order (hashtable-set! rdr-map-order c order)))
+       ;; same for the record-literal ctor mark (^:foo #ns.Type[1] copies the form).
+       (when (rdr-ctor-call? target) (rdr-mark-ctor-form c))
        c))))
 
 ;; --- source position --------------------------------------------------------
@@ -593,19 +595,14 @@
 ;; a dot — Clojure routes those to a constructor instead of a data reader.
 (define (rdr-record-tag? tok) (and (rdr-string-rindex-char tok #\.) #t))
 
-;; Is v a cseq whose head symbol names a record constructor — "map->" or "->"
-;; prefix WITH a namespace (produced by the reader for #ns.Type{...}/[...])?
-;; Unqualified "->" is the threading macro, not a record ctor.
-(define (rdr-ctor-call? v)
-  (and (cseq? v)
-       (let ((lst (seq->list v)))
-         (and (pair? lst)
-              (symbol-t? (car lst))
-              (symbol-t-ns (car lst))               ; must be qualified
-              (let* ((nm (symbol-t-name (car lst)))
-                     (len (string-length nm)))
-                (or (and (>= len 5) (string=? (substring nm 0 5) "map->"))
-                    (and (>= len 2) (string=? (substring nm 0 2) "->"))))))))
+;; Is v a factory-call form the reader itself built for a #ns.Type{...}/[...]
+;; literal? Recorded by identity in a weak side-table, NOT recognized by the head
+;; symbol's name: ordinary code calls a qualified ->name too ((u/->long n) in
+;; jolt.time), and the data path applies a ctor form, so a name test would try to
+;; apply an unbound var at read time.
+(define rdr-ctor-forms (make-weak-eq-hashtable))
+(define (rdr-mark-ctor-form v) (hashtable-set! rdr-ctor-forms v #t) v)
+(define (rdr-ctor-call? v) (and (cseq? v) (hashtable-ref rdr-ctor-forms v #f) #t))
 
 ;; Is v a tagged-literal pmap (#inst/#uuid/#regex/#bigdec at read time)?
 (define (rdr-tagged-form? v)
@@ -653,11 +650,13 @@
          (simple (substring tok (+ di 1) (string-length tok))))
     (cond
       ((pmap? form)
-       (jolt-list (jolt-symbol ns (string-append "map->" simple))
-                  (rdr-datafy form)))
+       (rdr-mark-ctor-form
+        (jolt-list (jolt-symbol ns (string-append "map->" simple))
+                   (rdr-datafy form))))
       ((pvec? form)
-       (apply jolt-list (jolt-symbol ns (string-append "->" simple))
-              (map rdr-datafy (vector->list (pvec-v form)))))
+       (rdr-mark-ctor-form
+        (apply jolt-list (jolt-symbol ns (string-append "->" simple))
+               (map rdr-datafy (vector->list (pvec-v form))))))
       (else (jolt-throw (jolt-ex-info
                          (string-append "Unreadable constructor form: #" tok)
                          empty-pmap))))))
