@@ -1023,21 +1023,6 @@
                     (list (cons p (lambda (x) (jt-jolt-strs->list (jolt-invoke tags-fn x))))))))
     jolt-nil))
 
-;; Collection behavior for library-modeled host values: a shim that registers a
-;; Java collection class (an LRU map, a queue, …) also needs the value to take
-;; part in Clojure's seq / lookup / empty / count / contains protocols — the
-;; same arms the built-in host models register Scheme-side. pred is (fn [x]),
-;; handlers (fn [x]) except get's, which is (fn [x k not-found]).
-(define (hsc-public-arm pred handler register!)
-  (let ((p (lambda (x) (jolt-truthy? (jolt-invoke pred x)))))
-    (register! p (lambda args (apply jolt-invoke handler args)))
-    jolt-nil))
-(def-var! "clojure.core" "__register-seq!" (lambda (pred handler) (hsc-public-arm pred handler register-seq-arm!)))
-(def-var! "clojure.core" "__register-get!" (lambda (pred handler) (hsc-public-arm pred handler register-get-arm!)))
-(def-var! "clojure.core" "__register-empty!" (lambda (pred handler) (hsc-public-arm pred handler register-empty-arm!)))
-(def-var! "clojure.core" "__register-count!" (lambda (pred handler) (hsc-public-arm pred handler register-count-arm!)))
-(def-var! "clojure.core" "__register-contains!" (lambda (pred handler) (hsc-public-arm pred handler register-contains-arm!)))
-
 ;; (instance? clojure.lang.IFoo x) for the core clojure.lang interfaces libraries
 ;; branch on — jolt's value model satisfies them, so report it. Matched by the
 ;; interface's last dotted segment, so "clojure.lang.IObj" and "IObj" both hit.

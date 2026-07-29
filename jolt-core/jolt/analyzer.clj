@@ -364,15 +364,30 @@
 ;; (jolt.host/jolt-class-for), as the JVM stores the Class itself in var meta;
 ;; primitive hints like `double` stay quoted symbols. nil when there's no
 ;; metadata, so a plain def keeps the cheap static path.
+;; Strip ONE (quote x) layer if there is one, else return the form unchanged. Used
+;; for :arglists, which arrives either already-data (derived by defn/defmacro) or
+;; as the user's quoted literal.
+(defn- unquote-form [v]
+  (if (and (form-list? v)
+           (let [es (vec (form-elements v))]
+             (and (= 2 (count es)) (form-sym? (first es))
+                  (= "quote" (form-sym-name (first es))))))
+    (second (vec (form-elements v)))
+    v))
+
 (defn- def-meta-expr [ctx base env]
   (when (pos? (count base))
     (map-node (mapv (fn [p]
                       (let [k (first p) v (second p)]
-                        ;; :arglists is the parameter-vector data defn attaches —
-                        ;; quote it rather than evaluate. Everything else is
-                        ;; evaluated.
+                        ;; :arglists is DATA, so it is quoted rather than evaluated.
+                        ;; Two shapes reach here: the parameter vectors defn/defmacro
+                        ;; derive (a bare seq of vectors) and a user's explicit
+                        ;; {:arglists '([x])} (a (quote …) form, since attr-map values
+                        ;; are ordinarily evaluated). Quoting the latter as-is would
+                        ;; store the quote form itself, so unwrap it first — one
+                        ;; (quote …) layer either way.
                         [(const k)
-                         (cond (= k :arglists) (quote-node v)
+                         (cond (= k :arglists) (quote-node (unquote-form v))
                                (and (= k :tag) (string? v))
                                (invoke (var-ref "jolt.host" "jolt-class-for") [(const v)])
                                (= k :tag) (quote-node v)
@@ -547,10 +562,18 @@
                      arglists (if (form-list? (first after))
                                 (map first after)
                                 (list (first after)))
+                     ;; the derived arglists is a DEFAULT: an explicit :arglists in
+                     ;; the attr-map (or on the name) overrides it, as defn allows.
+                     ;; Merging it last instead silently discarded the user's value.
+                     ;; precedence, matching the JVM for both defn and defmacro:
+                     ;; name metadata < the derived arglists < attr-map < docstring.
+                     ;; So ^{:arglists …} on the NAME does not override (the JVM
+                     ;; ignores it there) but {:arglists …} in the attr-map does.
+                     ;; Merging the derived value last discarded the attr-map's.
                      base (merge (or (form-sym-meta name-sym) {})
+                                 {:arglists arglists}
                                  (or attr {})
-                                 (if doc {:doc doc} {})
-                                 {:arglists arglists})
+                                 (if doc {:doc doc} {}))
                      meta-expr (def-meta-expr ctx base env)]
                  (host-intern! ctx cur nm)
                  (merge {:op :defmacro :ns cur :name nm

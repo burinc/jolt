@@ -528,8 +528,6 @@
         ;; the bare name + any ^{:map} metadata the reader attached to it.
         fn-only-name (if (symbol? fn-name) fn-name (first (rest fn-name)))
         name-meta (meta fn-only-name)
-        m1 (if attr-map (if name-meta (conj name-meta attr-map) attr-map) name-meta)
-        m2 (if docstring (assoc (if m1 m1 {}) :doc docstring) m1)
         ;; :arglists — the parameter vectors as written (single arity: the one
         ;; vector; multi-arity: each clause's), attached to the var like Clojure so
         ;; doc/spec/expound tools can read it. tier-0 primitives only (loop, not
@@ -540,7 +538,14 @@
                      (if (seq cs)
                        (recur (rest cs) (conj acc (first (first cs))))
                        (seq acc))))
-        meta-map (if arglists (assoc (if m2 m2 {}) :arglists arglists) m2)]
+        ;; precedence, matching the JVM: name metadata < the derived :arglists <
+        ;; attr-map < docstring. So an explicit {:arglists '([x])} in the attr-map
+        ;; wins, while ^{:arglists …} on the NAME does not — the JVM ignores it
+        ;; there. Assembling the derived value last discarded the attr-map's.
+        m1 name-meta
+        m2 (if arglists (assoc (if m1 m1 {}) :arglists arglists) m1)
+        m3 (if attr-map (conj (if m2 m2 {}) attr-map) m2)
+        meta-map (if docstring (assoc (if m3 m3 {}) :doc docstring) m3)]
     ;; pass the name through to fn: the compiled fn's host name carries it, so
     ;; stack traces read app.deep/level3 instead of a gensym. All metadata
     ;; (docstring + attr-map + the name's own + :arglists) is attached to the def

@@ -314,6 +314,28 @@
         (cons "get" (lambda (self obj)
                       (jolt-get obj (reflect-field-name self) jolt-nil)))
         (cons "toString" (lambda (self) (jolt-str-render-one (reflect-field-name self))))))
+;; --- reflective STATIC fields -------------------------------------------------
+;; class name + field name -> a thunk returning the field's value. Class.getDeclared
+;; Field consults this before the deftype/defrecord descriptor, so a host-modeled
+;; static field is registered as DATA rather than as another string comparison
+;; inside getDeclaredField. clojure.lang.Keyword/table (below) is the first entry;
+;; the next library that reads a static reflectively adds a row, not a branch.
+(define static-field-tbl (make-hashtable string-hash string=?))
+(define (static-field-key cls nm) (string-append cls "/" nm))
+(define (register-static-field! cls nm getter)
+  (hashtable-set! static-field-tbl (static-field-key cls nm) getter)
+  jolt-nil)
+(define (lookup-static-field cls nm) (hashtable-ref static-field-tbl (static-field-key cls nm) #f))
+;; One host type serves every registered static: it carries the class/field names
+;; (so getName / toString read correctly) plus the getter.
+(register-host-methods! "static-field"
+  (list (cons "setAccessible" (lambda (self v) jolt-nil))
+        (cons "get" (lambda (self obj) ((vector-ref (jhost-state self) 2))))
+        (cons "getName" (lambda (self) (vector-ref (jhost-state self) 1)))
+        (cons "toString" (lambda (self)
+                           (string-append "static field " (vector-ref (jhost-state self) 0)
+                                          "." (vector-ref (jhost-state self) 1))))))
+
 ;; Snapshot of the keyword intern tables as a jolt map of symbol -> keyword,
 ;; the way the JVM's clojure.lang.Keyword.table reads (its Reference values are
 ;; irrelevant to consumers, which only iterate the keys).
@@ -326,12 +348,8 @@
         (lambda (nk kw) (set! acc (cons (jolt-symbol (keyword-t-ns kw) (keyword-t-name kw)) (cons kw acc))))
         ks vs))
     (apply jolt-hash-map acc)))
-;; The reflective Field standing in for clojure.lang.Keyword.table.
-(register-host-methods! "keyword-table-field"
-  (list (cons "setAccessible" (lambda (self v) jolt-nil))
-        (cons "get" (lambda (self obj) (keyword-intern-table-map)))
-        (cons "getName" (lambda (self) "table"))
-        (cons "toString" (lambda (self) "static java.util.Map clojure.lang.Keyword.table"))))
+;; clojure.lang.Keyword.table — compliment's keyword source reads it reflectively.
+(register-static-field! "clojure.lang.Keyword" "table" keyword-intern-table-map)
 (register-host-methods! "class"
   (list (cons "getDeclaredFields"
               (lambda (self)
@@ -344,9 +362,10 @@
                    'objects))))
         (cons "getDeclaredField"
               (lambda (self name)
-                (cond ((and (string=? (jclass-name self) "clojure.lang.Keyword")
-                            (string=? name "table"))
-                       (make-jhost "keyword-table-field" (vector)))
+                (cond ((lookup-static-field (jclass-name self) name)
+                       => (lambda (getter)
+                            (make-jhost "static-field"
+                                        (vector (jclass-name self) name getter))))
                       ((let ((desc (hashtable-ref chez-tag-desc (jclass-name self) #f)))
                          (and desc
                               (find (lambda (k) (string=? (jolt-str-render-one k) name))
