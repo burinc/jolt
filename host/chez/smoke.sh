@@ -560,17 +560,26 @@ fi
 # behind if destroy does not take) therefore blocks the read forever, which is how
 # this case hung the gate for hours with nothing to show for it. Redirecting to a
 # file gives the children a file descriptor with no reader to wait on.
+# stderr goes INTO the log, not to /dev/null: if the run dies before it can print a
+# single check, "FAIL: jolt.process" with nothing under it is all the gate says, and
+# the reason — the exception — is exactly what was thrown away.
 process_log="$(mktemp)"
-$jolt run test/chez/process-test.clj >"$process_log" 2>/dev/null || true
+$jolt run test/chez/process-test.clj >"$process_log" 2>&1 || true
 process_out="$(cat "$process_log")"
-rm -f "$process_log"
 if printf '%s' "$process_out" | grep -q 'PROCESS-TEST OK'; then
   pass=$((pass + 1))
 else
   echo "  FAIL: jolt.process"
-  printf '%s\n' "$process_out" | grep FAIL | head -5 | sed 's/^/    /'
+  # the case's own FAILs if it got that far, else the last of whatever it did say
+  # (an exception, a missing shared library) — never nothing.
+  if printf '%s\n' "$process_out" | grep -q FAIL; then
+    printf '%s\n' "$process_out" | grep FAIL | head -5 | sed 's/^/    /'
+  else
+    printf '%s\n' "$process_out" | tail -12 | sed 's/^/    /'
+  fi
   fails=$((fails + 1))
 fi
+rm -f "$process_log"
 
 # jolt.parser — the general parser-combinator core, running rm-hull/jasentaa's
 # own suite for the adopted pieces plus jolt's added combinators. Self-checks.
