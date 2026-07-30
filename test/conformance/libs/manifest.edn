@@ -216,7 +216,7 @@
                 fipp/fipp {:mvn/version "0.6.29"}
                 mvxcvi/arrangement {:mvn/version "2.1.0"}}
    :timeout 900
-   :expect {:tests 28 :pass 118 :fail 7 :error 8 :load-fail 20}}
+   :expect {:tests 28 :pass 121 :fail 4 :error 8 :load-fail 20}}
 
   ;; ---------------------------------------------------------- web
   {:name "ring-codec"
@@ -284,7 +284,7 @@
    :test-paths ["src/test/clojure"]
    ;; test-impl pins the log4j2 backend, which needs the org.apache.logging.log4j jars
    :exclude-nses ["clojure.tools.logging.test-impl"]
-   :expect {:tests 67 :pass 217 :fail 2 :error 4}}
+   :expect {:tests 67 :pass 219 :fail 0 :error 4}}
 
   ;; ---------------------------------------------------------- time
   {:name "tick"

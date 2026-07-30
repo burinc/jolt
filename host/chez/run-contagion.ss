@@ -4,7 +4,7 @@
 ;; flonum arithmetic over it stays generic — the win Option B gave up to fix the
 ;; megamorphic regression. This gate pins the mechanism that recovers it, gated to
 ;; devirtualized call sites: contagion-specialize-arity builds a clone of an impl
-;; body whose :num field reads contagion-coerce (exact->inexact) beside a proven
+;; body whose :num field reads contagion-coerce (jolt->fl) beside a proven
 ;; :double operand, lowering to fl*. The invariant: contagion fires ONLY where at
 ;; least one operand is proven :double — a pure-:num expression stays generic.
 ;; Stage 1 pins the types API and the runtime specialized clone registry.
@@ -39,7 +39,7 @@
          (spec-def (jolt-assoc base-def (kw "init") spec-fn)))
     (emit (numeric-annotate spec-def))))
 
-;; === (1) :num field beside a :double operand -> contagion (fl* + exact->inexact) ==
+;; === (1) :num field beside a :double operand -> contagion (fl* + jolt->fl) =======
 (evals "(defrecord IBox [n])")
 (set-record-shapes! U (chez-record-shapes-map))
 (set-protocol-methods! U (chez-protocol-methods-map))
@@ -53,7 +53,7 @@
        (e (emit-spec src spar)))
   (gate-check "(1) :num beside :double is eligible" eligible? #t)
   (gate-check "(1) contagion lowers to fl*" (gate-sub? e "fl*") #t)
-  (gate-check "(1) contagion coerces :num operand via exact->inexact" (gate-sub? e "exact->inexact") #t))
+  (gate-check "(1) contagion coerces :num operand via jolt->fl" (gate-sub? e "jolt->fl") #t))
 
 ;; === (2) pure-:num (no :double operand) -> stays generic (the invariant) =========
 (let* ((src "(def _ (fn [a] (* (:n a) (:n a))))")
@@ -99,7 +99,7 @@
 ;; === (5) backend emits a contagion clone for an eligible impl ==================
 ;; A :num field beside a proven :double operand -> the register-inline-method call
 ;; for that impl is wrapped with a clone def + register-clone*, the clone body
-;; lowering to fl* with the :num operand coerced via exact->inexact.
+;; lowering to fl* with the :num operand coerced via jolt->fl.
 (define run-passes (var-deref "jolt.passes" "run-passes"))
 (define emit-top-form (var-deref "jolt.backend-scheme" "emit-top-form"))
 (define set-direct-link! (var-deref "jolt.backend-scheme" "set-direct-link!"))
@@ -115,7 +115,7 @@
 (let ((emitted (emit-top-form (run-passes bag-def (make-analyze-ctx "user") U))))
   (gate-check "(5) eligible impl emits a clone registration" (gate-sub? emitted "register-clone*") #t)
   (gate-check "(5) clone body lowers to fl*" (gate-sub? emitted "fl*") #t)
-  (gate-check "(5) clone coerces the :num operand via exact->inexact" (gate-sub? emitted "exact->inexact") #t))
+  (gate-check "(5) clone coerces the :num operand via jolt->fl" (gate-sub? emitted "jolt->fl") #t))
 
 ;; === (6) a pure-:num impl (no :double operand) emits NO clone ==================
 (evals "(defrecord IPlain [n] P (m [s] (* (:n s) (:n s))))")

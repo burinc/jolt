@@ -50,6 +50,12 @@
        (loop (cddr o) validator (cadr o)))
       (else (loop (cddr o) validator m)))))
 
+;; swap!/reset! reach into the atom record directly, so a non-atom receiver would
+;; raise a raw host error with no class for a catch to select. Name the class the
+;; JVM names (nil is its NullPointerException).
+(define (jolt-need-atom a)
+  (if (jolt-atom? a) a (jolt-cast-throw a "clojure.lang.IAtom")))
+
 ;; validate a candidate value: a non-nil validator that returns falsey rejects.
 (define (jolt-atom-validate a v)
   (let ((vf (jolt-atom-validator a)))
@@ -82,6 +88,7 @@
 ;; atomically compare-and-set; retry if another thread changed it. Validate the
 ;; new value before storing, notify watches after.
 (define (jolt-swap! a f . args)
+  (jolt-need-atom a)
   (let retry ()
     (let* ((old (jolt-atom-val a))
            (nv (apply jolt-invoke f old args)))
@@ -91,6 +98,7 @@
           (retry)))))
 
 (define (jolt-reset! a v)
+  (jolt-need-atom a)
   (jolt-atom-validate a v)
   (let ((old (with-mutex (jolt-atom-lock a)
                (let ((o (jolt-atom-val a))) (jolt-atom-val-set! a v) o))))

@@ -41,7 +41,7 @@
 (defn inject-wp-nhints
   "Merge the whole-program :double param seeds into a def's arity :nhints as
   synthetic ^double hints, so the numeric pass unboxes a hintless fn whose callers
-  all pass flonums (the entry coercion exact->inexact is a no-op on a proven
+  all pass flonums (the entry coercion jolt->fl is a no-op on a proven
   flonum). Only un-hinted params are added — an explicit hint wins. A no-op unless
   the closed-world fixpoint typed a param :double (param-num-seeds-for)."
   [unit node]

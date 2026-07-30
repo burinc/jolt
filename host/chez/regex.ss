@@ -91,7 +91,8 @@
                 (loop (- i 1) (cons (if s s jolt-nil) acc))))))))
 
 (define (jolt-re-matches re s)
-  (let ((m (irregex-match (regex-t-irx (jolt-re-pattern re)) s)))
+  (let* ((s (jolt-need-str s))
+         (m (irregex-match (regex-t-irx (jolt-re-pattern re)) s)))
     (if m (irx-result m) jolt-nil)))
 
 ;; A stateful matcher (java.util.regex.Matcher): the compiled pattern, the target
@@ -234,8 +235,9 @@
 ;; one on a zero-width match). nil when there are no matches (Clojure: seq-able as
 ;; nil, so (if-let [m (re-seq ...)] ...) works).
 (define (jolt-re-seq re s)
-  (let ((irx (regex-t-irx (jolt-re-pattern re)))
-        (len (string-length s)))
+  (let* ((s (jolt-need-str s))
+         (irx (regex-t-irx (jolt-re-pattern re)))
+         (len (string-length s)))
     (let loop ((start 0) (acc '()))
       (let ((m (and (<= start len) (irx-search-from irx s start))))
         (if m

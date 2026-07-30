@@ -48,7 +48,7 @@
 (define sq-opt (annotate (inject-wp-nhints U sq)))
 (gate-check "sq body unboxes to fl*" (gate-sub? (emit sq-opt) "fl*") #t)
 ;; and the param is coerced at entry like a ^double param (no-op on a real flonum).
-(gate-check "sq coerces param at entry" (gate-sub? (emit sq-opt) "exact->inexact") #t)
+(gate-check "sq coerces param at entry" (gate-sub? (emit sq-opt) "jolt->fl") #t)
 
 ;; a caller passing an INTEGER must NOT make the param :double — an untyped integer
 ;; can be a bignum, so fl-ops would diverge. The param stays generic.

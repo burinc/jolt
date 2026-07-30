@@ -80,11 +80,12 @@
                 (loop (cdr xs) (cons (jolt-str-one (car xs)) acc)))))))
 
 ;; jolt indices are flonums; substring etc. need exact ints.
-(define (jolt->idx n) (exact (truncate n)))
+(define (jolt->idx n) (exact (truncate (jolt-need-num n))))
 
 (define (jolt-subs s start . end)
-  (substring s (jolt->idx start)
-             (if (null? end) (string-length s) (jolt->idx (car end)))))
+  (let ((s (jolt-need-string s)))
+    (substring s (jolt->idx start)
+               (if (null? end) (string-length s) (jolt->idx (car end))))))
 
 ;; vec: a pvec from any seqable (already-pvec returns itself).
 (define (jolt-vec coll)
@@ -117,7 +118,8 @@
             (keyword (if (or (jolt-nil? ns) (not ns) (eq? ns '())) #f ns) (symbol-t-name a))))
          (else jolt-nil))))
     ((= (length args) 2)
-     (keyword (let ((ns (car args))) (if (jolt-nil? ns) #f ns)) (cadr args)))
+     (keyword (let ((ns (car args))) (if (jolt-nil? ns) #f ns))
+              (jolt-need-string (cadr args))))
     (else (throw-jvm (quote ArityException) "Wrong number of args passed to: keyword"))))
 
 (define (jolt-symbol-new . args)

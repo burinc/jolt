@@ -1491,10 +1491,20 @@
       ;; caller gets a one-element list instead of the value.
       ((jrec? obj)
        (let ((boxed (dot-coll-method obj method-name rest)))
-         (if boxed (car boxed) (error #f (string-append "No method " method-name " for value: "
-                                                        (jolt-pr-str obj))))))
-      (else (error #f (string-append "No method " method-name " for value: "
-                                     (jolt-pr-str obj)))))))
+         (if boxed (car boxed) (no-method-throw method-name obj))))
+      (else (no-method-throw method-name obj)))))
+
+;; The end of the dispatch chain. A method call on nil is the JVM's
+;; NullPointerException; anything else is its IllegalArgumentException ("No
+;; matching method"). Raising a raw host error here left the value classless, so
+;; a catch clause could not select it and (class e) read :object.
+(define (no-method-throw method-name obj)
+  (if (jolt-nil? obj)
+      (throw-jvm (quote NullPointerException)
+                 (string-append "Cannot invoke \"" method-name "\" because the target is null"))
+      (throw-jvm (quote IllegalArgumentException)
+                 (string-append "No matching method " method-name " found for "
+                                (guard (e (#t "?")) (jolt-class-name obj))))))
 
 ;; ---- method-dispatch arm registry ------------------------------------------
 ;; A .method call (record-method-dispatch) is resolved by an ordered list of arms

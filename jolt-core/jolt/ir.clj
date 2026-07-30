@@ -67,7 +67,7 @@
 (defn throw-node [expr] {:op :throw :expr expr})
 
 ;; Numeric coercion of a value to a primitive kind (:double / :long), the way a JVM
-;; ^double/^long parameter or return coerces. The back end lowers it (exact->inexact
+;; ^double/^long parameter or return coerces. The back end lowers it (jolt->fl
 ;; / jolt->fx) and jolt.passes.numeric reads its :kind as the value's numeric kind.
 ;; Carrying coercion as an IR node (rather than a back-end string wrap) lets it
 ;; travel with inlining and keeps the typed-arithmetic fast path sound.
@@ -75,7 +75,7 @@
 ;; The 3-arg form carries :cast-fn, the checked runtime helper a USER cast lowers to
 ;; (jolt-double / jolt-long-cast / jolt-int-cast / jolt-float): a (double x) cast must
 ;; preserve clojure.core/double's full JVM semantics (ClassCastException on non-number,
-;; (long ##NaN) => 0, out-of-range throw), so it can NOT use the bare exact->inexact a
+;; (long ##NaN) => 0, out-of-range throw), so it can NOT use the bare jolt->fl a
 ;; proven-typed param coercion uses. The 2-arg form (inline.clj typed params) stays bare.
 (defn coerce-node
   ([kind expr] {:op :coerce :kind kind :expr expr})

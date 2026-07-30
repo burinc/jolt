@@ -8,13 +8,25 @@
 ;; java.lang.Math: sqrt/pow/floor/ceil/trig/log/exp always return a DOUBLE on the
 ;; JVM (Chez's sqrt/expt return EXACT for exact args, e.g. (sqrt 9) -> 3), so coerce
 ;; to flonum. round -> long (exact); abs/max/min preserve the argument's type.
-(define (->dbl x) (exact->inexact x))
+(define (->dbl x) (exact->inexact (jolt-need-num x)))
 ;; a complex result (Chez extends sqrt/expt/log/asin/acos and log's kin onto the
 ;; complex plane for out-of-domain real inputs) becomes +nan.0, matching Java;
 ;; real results stay flonums, NaN/Inf pass through. real? is #f on a Chez complex.
 (define (real-or-nan x) (if (and (number? x) (real? x)) (exact->inexact x) +nan.0))
 (define math-pi (acos -1.0))
+;; Every Math method takes numbers (PI/E are values, not methods), and each one
+;; hands its argument to a Chez numeric primitive. Check at the boundary: the
+;; condition Chez raises for a wrong-typed operand carries no class, so it would
+;; escape as #object[:object] with no catch clause able to select it. The hot path
+;; does not come through here — a Math call over proven flonums lowers to a native
+;; Chez flonum op (jolt.passes.numeric).
+(define (math-checked entry)
+  (let ((f (cdr entry)))
+    (if (procedure? f)
+        (cons (car entry) (lambda args (apply f (map jolt-need-num args))))
+        entry)))
 (register-class-statics! "Math"
+  (map math-checked
   (list (cons "sqrt" (lambda (x) (real-or-nan (sqrt x))))
         ;; cbrt/log10 (and hypot/expm1/log1p below) share the clojure.math impls
         ;; in math.ss (loaded after; the lambda bodies resolve at call time) so
@@ -71,7 +83,7 @@
         (cons "max" (lambda (a b) (if (> a b) a b))) (cons "min" (lambda (a b) (if (< a b) a b)))
         (cons "signum" (lambda (x) (cond ((< x 0) -1.0) ((> x 0) 1.0) (else 0.0))))
         (cons "PI" (->dbl (* 4 (atan 1)))) (cons "E" (->dbl (exp 1)))
-        (cons "random" (lambda args (random 1.0)))))
+        (cons "random" (lambda args (random 1.0))))))
 
 ;; Thread: real OS threads back futures/promises.
 ;;  - sleep parks the calling thread for `ms` ms (a worker sleeping doesn't block
@@ -116,7 +128,7 @@
 
 (define thread-statics
   (list (cons "sleep" (lambda (ms . _)
-                        (let* ((ms* (exact (floor ms)))
+                        (let* ((ms* (exact (floor (jolt-need-num ms))))
                                (secs (quotient ms* 1000))
                                (nanos (* (remainder ms* 1000) 1000000)))
                           (sleep (make-time 'time-duration nanos secs)))
@@ -546,7 +558,8 @@
   (let ((prev (hashtable-ref sys-prop-table k jolt-nil)))
     (hashtable-delete! sys-prop-table k) prev))
 (define (sys-get-property k . dflt)
-  (let ((set-val (hashtable-ref sys-prop-table k #f)))
+  (let* ((k (jolt-need-string k))
+         (set-val (hashtable-ref sys-prop-table k #f)))
     (cond (set-val set-val)
           ((string=? k "os.name") sys-os-name)
           ((string=? k "jolt.version") (jolt-version-string))

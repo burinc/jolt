@@ -909,7 +909,7 @@
 ;; becomes a :coerce node carrying the checked runtime helper, so it feeds the
 ;; numeric lattice like a ^double/^long hint: (* (double x) 2.0) emits fl*. The
 ;; helper preserves clojure.core's full JVM semantics (checked, not bare
-;; exact->inexact). float -> double-kind (Jolt has no single-float); int ->
+;; jolt->fl). float -> double-kind (Jolt has no single-float); int ->
 ;; long-kind (Jolt's integer-box model), routing to jolt-int-cast so the JVM int
 ;; range is still enforced. Returns {:kind .. :cast-fn ..} or nil. n is the full
 ;; item count (head + args).

@@ -244,6 +244,21 @@
 (define (jolt-div0-throw)
   (jolt-throw (jolt-host-throwable "java.lang.ArithmeticException" "Divide by zero")))
 
+;; Checked coercions for host operations that would otherwise hand a wrong-typed
+;; value straight to a Chez primitive. The condition Chez raises carries no class,
+;; so it escapes as #object[:object] and no catch clause can select it; these name
+;; the class the JVM names instead. nil is the JVM's NullPointerException.
+(define (jolt-cast-throw x target)
+  (if (jolt-nil? x)
+      (jolt-throw (jolt-host-throwable "java.lang.NullPointerException" ""))
+      (jolt-throw (jolt-host-throwable
+                   "java.lang.ClassCastException"
+                   (string-append "class " (jolt-class-name x)
+                                  " cannot be cast to class " target)))))
+(define (jolt-need-num x) (if (number? x) x (jolt-num-cast-throw x)))
+(define (jolt-need-str x) (if (string? x) x (jolt-cast-throw x "java.lang.CharSequence")))
+(define (jolt-need-string x) (if (string? x) x (jolt-cast-throw x "java.lang.String")))
+
 ;; slow hooks: one per op, taking over when an operand is outside Chez's tower.
 ;; A numeric shim (java/bigdec.ss) set!-extends them; the base case is the JVM's:
 ;; not a number -> ClassCastException. The hooks are BINARY and never re-enter
@@ -988,9 +1003,10 @@
 (define jolt-range
   (case-lambda
     (() (range-from 0))
-    ((end) (range-chunked 0 end 1))
-    ((start end) (range-chunked start end 1))
-    ((start end step) (range-chunked start end step))))
+    ((end) (range-chunked 0 (jolt-need-num end) 1))
+    ((start end) (range-chunked (jolt-need-num start) (jolt-need-num end) 1))
+    ((start end step) (range-chunked (jolt-need-num start) (jolt-need-num end)
+                                     (jolt-need-num step)))))
 
 ;; An empty take result is () (jolt-empty-list), NOT nil — (take 0 coll) and
 ;; (take n []) are empty seqs in Clojure, so (= () (take 0 [:a])) and printing
@@ -1145,9 +1161,9 @@
                                 (guard (e (#t "?")) (jolt-str n)))))))
 (define (jolt-even? n) (jolt-parity-check n) (even? (parity-int n)))
 (define (jolt-odd? n) (jolt-parity-check n) (odd? (parity-int n)))
-(define (jolt-pos? n) (> n 0))
-(define (jolt-neg? n) (< n 0))
-(define (jolt-zero? n) (= n 0))
+(define (jolt-pos? n) (> (jolt-need-num n) 0))
+(define (jolt-neg? n) (< (jolt-need-num n) 0))
+(define (jolt-zero? n) (= (jolt-need-num n) 0))
 (define (jolt-identity x) x)
 
 ;; ============================================================================

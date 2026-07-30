@@ -151,21 +151,22 @@
    "nil?"     {:call "jolt-nil?"   :arity #(= % 1) :bool? true :pure? true}
    "some?"    {:call "jolt-some?"  :arity #(= % 1) :bool? true :pure? true}
    "ex-info"  {:call "jolt-ex-info" :arity #(or (= % 2) (= % 3))}
-   ;; bit ops: and/or/xor/not are Chez bitwise primitives (inlined to native
-   ;; code, no helper call); operands must be integers (a non-integer errors,
-   ;; like the JVM). The shifts keep their helpers (Java >>> masking /
-   ;; arithmetic shift) but emit a direct call instead of var-deref + the
-   ;; variadic overlay. and/or/xor get strict min-2 twins as their VALUE (the raw
-   ;; Chez prims accept arity 0/1, diverging from the JVM); bit-and-not is left to its overlay: its only Scheme impl is
-   ;; 2-arg, so a value-position arity-3 use (via the variadic overlay) would
-   ;; mis-emit.
-   "bit-and"                 {:call "bitwise-and"  :value "jolt-bit-and*" :arity #(= % 2)
+   ;; bit ops emit a direct call to their helper instead of var-deref + the
+   ;; variadic overlay. The helpers coerce through ->int, which rejects a
+   ;; non-integer operand with the JVM's IllegalArgumentException; the raw Chez
+   ;; bitwise primitives were inlined here instead, and their error escaped with
+   ;; no class, so the same call was catchable in value position and not in call
+   ;; position. and/or/xor get strict min-2 twins as their VALUE (the 2-arg
+   ;; helpers are exactly 2-arg); bit-and-not is left to its overlay: its only
+   ;; Scheme impl is 2-arg, so a value-position arity-3 use (via the variadic
+   ;; overlay) would mis-emit.
+   "bit-and"                 {:call "jolt-bit-and"  :value "jolt-bit-and*" :arity #(= % 2)
                               :num-result? true :num-args? true :pure? true :foldable? true}
-   "bit-or"                  {:call "bitwise-ior"  :value "jolt-bit-or*"  :arity #(= % 2)
+   "bit-or"                  {:call "jolt-bit-or"   :value "jolt-bit-or*"  :arity #(= % 2)
                               :num-result? true :num-args? true :pure? true :foldable? true}
-   "bit-xor"                 {:call "bitwise-xor"  :value "jolt-bit-xor*" :arity #(= % 2)
+   "bit-xor"                 {:call "jolt-bit-xor"  :value "jolt-bit-xor*" :arity #(= % 2)
                               :num-result? true :num-args? true :pure? true :foldable? true}
-   "bit-not"                 {:call "bitwise-not"  :arity #(= % 1) :num-args? true}
+   "bit-not"                 {:call "jolt-bit-not"  :arity #(= % 1) :num-args? true}
    "bit-shift-left"          {:call "jolt-bit-shift-left"          :arity #(= % 2) :num-args? true}
    "bit-shift-right"         {:call "jolt-bit-shift-right"         :arity #(= % 2) :num-args? true}
    "unsigned-bit-shift-right" {:call "jolt-unsigned-bit-shift-right" :arity #(= % 2)}

@@ -348,7 +348,7 @@
 ;; ---- coercion helpers -------------------------------------------------------
 ;; numeric tower: currentTimeMillis/nanoTime are exact longs (JVM).
 (define (->num x) x)
-(define (jnum->exact n) (exact (truncate n)))
+(define (jnum->exact n) (exact (truncate (jolt-need-num n))))
 ;; parse an integer string in radix; #f on failure
 (define (parse-int-str s radix)
   (let ((n (string->number (str-trim (if (string? s) s (jolt-str-render-one s))) radix)))

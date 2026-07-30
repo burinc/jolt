@@ -260,7 +260,7 @@
 
 ;; (string/split sep s) -> parts, splitting on each non-overlapping sep.
 (define (str-literal-split s sep)
-  (let ((slen (string-length s)) (plen (string-length sep)))
+  (let ((slen (string-length (jolt-need-str s))) (plen (string-length sep)))
     (if (fx=? plen 0)
         (map string (string->list s))
         (let loop ((i 0) (start 0) (acc '()))
@@ -291,7 +291,8 @@
 ;; The clojure.string.clj split wrapper
 ;; layers the trailing-empty trim on top.
 (define (re-split irx s limit)
-  (let ((len (string-length s)))
+  (let* ((s (jolt-need-str s))
+         (len (string-length s)))
     (let loop ((start 0) (last 0) (out '()))
       (if (and limit (fx>=? (length out) (fx- limit 1)))
           (reverse (cons (substring s last len) out))
