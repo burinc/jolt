@@ -101,7 +101,7 @@
       {:tests (parse-long t) :pass (parse-long pa)
        :fail (parse-long f) :error (parse-long e) :load-fail (parse-long lf)})))
 
-(defn- run-lib [{:keys [name root paths deps local-deps extra-deps nses exclude-nses timeout]
+(defn- run-lib [{:keys [name root dir paths deps local-deps extra-deps nses exclude-nses timeout]
                  :as entry}]
   (let [lib-root (str libs-root "/" (or root name))
         srcs (map #(resolve-path lib-root %) (or paths ["src" "test"]))
@@ -130,8 +130,12 @@
             cmd (vec (concat [jolt-bin "-Sdeps" (pr-str sdeps)
                               "-m" "lib-conformance-run" (str timeout-ms)]
                              nses))
+            ;; A suite that opens a file by a project-relative path needs the
+            ;; working directory its own build uses — in a multi-module repo that
+            ;; is the MODULE root, not the repo root (ring-core reads
+            ;; test/ring/assets/…, which only resolves from ring/ring-core).
             r (apply p/sh {:out :string :err :string
-                           :dir lib-root
+                           :dir (if dir (resolve-path lib-root dir) lib-root)
                            :extra-env {"JOLT_NO_USER_DEPS" "1"}}
                      cmd)
             out (str (:out r) (:err r))]

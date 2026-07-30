@@ -225,10 +225,20 @@
 
   {:name "ring-core"
    :root "ring"
-   :paths ["ring-core/src" "ring-core-protocols/src" "ring-core/test"]
+   ;; the suite reads test/ring/assets/… relative to the module, not the repo root
+   :dir "ring-core"
+   :paths ["ring-core/src" "ring-core-protocols/src" "ring-websocket-protocols/src"
+           "ring-core/test"]
    :test-paths ["ring-core/test"]
-   :deps ["@ring-codec/src" "~time/src" "~jolt-crypto/src"]
-   :expect {:tests 126 :pass 326 :fail 12 :error 28 :load-fail 5}}
+   :deps ["@ring-codec/src" "~time/src"]
+   :local-deps ["~jolt-crypto"]
+   :extra-deps {crypto-random/crypto-random {:mvn/version "1.2.1"}
+                crypto-equality/crypto-equality {:mvn/version "1.0.1"}}
+   ;; The two session/cookie suites are written against clj-time, which is Joda —
+   ;; a JVM library with no jolt equivalent. The multipart suites need Apache
+   ;; commons-fileupload and commons-io; both are JVM-only too.
+   :note "clj-time (Joda) + commons-fileupload/commons-io are JVM-only"
+   :expect {:tests 151 :pass 397 :fail 15 :error 23 :load-fail 2}}
 
   {:name "ring-spec"
    :paths ["src" "test"]
