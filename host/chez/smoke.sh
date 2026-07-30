@@ -16,18 +16,28 @@ jolt="${JOLT_BIN:-bin/jolt}"
 # clue which case it was. Cap each invocation instead: the case then FAILS and names
 # itself. JOLT_SMOKE_TIMEOUT=0 disables the cap (for a debugger on a live case).
 #
-# coreutils' timeout is not on a stock macOS, so fall back to running uncapped
-# rather than skipping the case or hard-failing the gate on a missing tool.
+# --foreground matters, it is not a detail: without it GNU timeout runs the command
+# in its OWN PROCESS GROUP so it can signal the whole group. The jolt.process case
+# spawns children and asserts on destroy / alive? / a 143 SIGTERM exit, all of which
+# read the process group — under a plain `timeout` that case dies with no output on
+# Linux while still passing on macOS. --foreground leaves the group alone.
+#
+# coreutils' timeout is not on a stock macOS, so fall back to running uncapped rather
+# than skipping the case or hard-failing the gate on a missing tool.
 smoke_timeout="${JOLT_SMOKE_TIMEOUT:-120}"
 if [ "$smoke_timeout" = "0" ]; then
   jolt_timeout=""
-elif command -v timeout >/dev/null 2>&1; then
-  jolt_timeout="timeout $smoke_timeout"
-elif command -v gtimeout >/dev/null 2>&1; then
-  jolt_timeout="gtimeout $smoke_timeout"
 else
-  jolt_timeout=""
-  echo "  note: no timeout(1) — a hung case will block instead of failing"
+  for t in timeout gtimeout; do
+    if command -v "$t" >/dev/null 2>&1 && "$t" --foreground 1 true >/dev/null 2>&1; then
+      jolt_timeout="$t --foreground $smoke_timeout"
+      break
+    fi
+  done
+  if [ -z "${jolt_timeout:-}" ]; then
+    jolt_timeout=""
+    echo "  note: no timeout(1) with --foreground — a hung case will block instead of failing"
+  fi
 fi
 jolt="$jolt_timeout $jolt"
 

@@ -57,6 +57,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ring-codec's `percent-decode` came apart. `{n,}` and `{n,m}` were always right;
   only the comma-less form was wrong.
 
+- **`jolt <task>` lost to a same-named directory.** A bare argv token is dispatched
+  as a file to run before a `:tasks` lookup, and the "is this a file" test was
+  `file-exists?`, which is true for a directory too. `test` is a `:tasks` entry AND a
+  `test/` directory in every jolt project, so `jolt test` was dispatched as a path
+  and died in `load-file`'s decoder — `failed on #<binary input port test>: is a
+  directory` — instead of running the task. That is why every library's CI spells out
+  `jolt -M:test`.
+
 - **`Base64` handed back an opaque host buffer instead of a `byte[]`.**
   `.decode` / `.encode` return `byte[]` on the JVM, so `(vec (.decode dec s))` is
   ordinary Clojure; here they returned a raw Chez bytevector that no collection
