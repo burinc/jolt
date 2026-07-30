@@ -570,12 +570,16 @@ if printf '%s' "$process_out" | grep -q 'PROCESS-TEST OK'; then
   pass=$((pass + 1))
 else
   echo "  FAIL: jolt.process"
-  # the case's own FAILs if it got that far, else the last of whatever it did say
-  # (an exception, a missing shared library) — never nothing.
-  if printf '%s\n' "$process_out" | grep -q FAIL; then
-    printf '%s\n' "$process_out" | grep FAIL | head -5 | sed 's/^/    /'
+  # the case's own FAILs if it got that far, else the last of whatever it did say —
+  # an exception, or the "  .. <label>" the test prints before each check, whose LAST
+  # line then names the check that blocked. Never nothing.
+  if printf '%s\n' "$process_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$process_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$process_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$process_out" | tail -6 | sed 's/^/    /'
   else
-    printf '%s\n' "$process_out" | tail -12 | sed 's/^/    /'
+    echo "    (no output at all — died or was killed before its first check)"
   fi
   fails=$((fails + 1))
 fi
