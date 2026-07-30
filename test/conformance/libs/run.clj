@@ -101,13 +101,20 @@
       {:tests (parse-long t) :pass (parse-long pa)
        :fail (parse-long f) :error (parse-long e) :load-fail (parse-long lf)})))
 
-(defn- run-lib [{:keys [name root paths deps extra-deps nses exclude-nses timeout] :as entry}]
+(defn- run-lib [{:keys [name root paths deps local-deps extra-deps nses exclude-nses timeout]
+                 :as entry}]
   (let [lib-root (str libs-root "/" (or root name))
         srcs (map #(resolve-path lib-root %) (or paths ["src" "test"]))
         deps (map #(resolve-path lib-root %) (or deps []))
+        ;; A first-party jolt library must go on as a real :local/root dependency,
+        ;; not a bare source path: its deps.edn is what declares :jolt/native, and
+        ;; without that the shared library it binds is never loaded. jolt-crypto on
+        ;; :paths alone found whatever libcrypto the dynamic loader had — on macOS
+        ;; that is Apple's BoringSSL, which aborts the process inside EVP_Digest.
+        local-deps (map #(resolve-path lib-root %) (or local-deps []))
         test-dirs (map #(resolve-path lib-root %) (:test-paths entry ["test"]))
         cp (vec (concat [(str here "/runner")] srcs deps))
-        missing (remove exists? cp)
+        missing (remove exists? (concat cp local-deps))
         nses (remove (set (or exclude-nses []))
                      (or nses (discover-nses test-dirs)))
         timeout-ms (* 1000 (or timeout 300))]
@@ -115,7 +122,11 @@
       (seq missing) {:status :missing-paths :detail (vec missing)}
       (empty? nses) {:status :no-tests}
       :else
-      (let [sdeps (cond-> {:paths cp} extra-deps (assoc :deps extra-deps))
+      (let [locals (into {} (map (fn [p] [(symbol "jolt-lang" (.getName (java.io.File. p)))
+                                          {:local/root p}])
+                                 local-deps))
+            all-deps (merge (or extra-deps {}) locals)
+            sdeps (cond-> {:paths cp} (seq all-deps) (assoc :deps all-deps))
             cmd (vec (concat [jolt-bin "-Sdeps" (pr-str sdeps)
                               "-m" "lib-conformance-run" (str timeout-ms)]
                              nses))

@@ -688,10 +688,25 @@
           (else (jolt-str-render-one x)))))
 ;; (BigInteger. s) | (BigInteger. s radix) — parse a string in the given radix
 ;; (default 10). tools.reader's integer parser builds (BigInteger. digits radix).
-(register-class-ctor! "BigInteger"
-  (lambda (v . r) (parse-int-or-throw v (if (null? r) 10 (jnum->exact (car r))) "BigInteger")))
-(register-class-ctor! "java.math.BigInteger"
-  (lambda (v . r) (parse-int-or-throw v (if (null? r) 10 (jnum->exact (car r))) "BigInteger")))
+;; (BigInteger. signum magnitude-bytes) is the other JVM constructor: an unsigned
+;; big-endian magnitude with an explicit sign, which is how a digest is turned into
+;; a number before hex-formatting it (Selmer's {{ x|hash:"md5" }} filter does
+;; (format "%032x" (BigInteger. 1 bs))). Each byte contributes its UNSIGNED value,
+;; so the sign of jolt's signed byte array does not leak into the result.
+(define (bigint-from-magnitude signum bytes)
+  (let* ((v (jolt-array-vec bytes))
+         (n (ja-len v)))
+    (let loop ((i 0) (acc 0))
+      (if (fx>=? i n)
+          (* (jnum->exact signum) acc)
+          (loop (fx+ i 1)
+                (+ (* acc 256) (bitwise-and (jnum->exact (ja-ref v i)) #xFF)))))))
+(define (bigint-ctor v . r)
+  (if (and (pair? r) (jolt-array? (car r)))
+      (bigint-from-magnitude v (car r))
+      (parse-int-or-throw v (if (null? r) 10 (jnum->exact (car r))) "BigInteger")))
+(register-class-ctor! "BigInteger" bigint-ctor)
+(register-class-ctor! "java.math.BigInteger" bigint-ctor)
 (register-class-ctor! "MapEntry" (lambda (k v) (make-map-entry k v)))
 ;; clojure.lang.MapEntry/create — the static factory clojure.walk and kin use
 ;; when rebuilding map entries.

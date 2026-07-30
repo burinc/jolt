@@ -341,17 +341,25 @@
                            (cond ((< i 0) tn) ((char=? (string-ref tn i) #\.) (substring tn (+ i 1) (string-length tn))) (else (loop (- i 1))))))
 (register-instance-check-arm!
   (lambda (type-sym val)
-    (let ((tn (class-short (symbol-t-name type-sym))))
+    (let* ((full (symbol-t-name type-sym))
+           (tn (class-short full)))
       (cond
-        ;; a #inst / (Date.) is a java.util.Date; it is NOT a java.sql.Timestamp
-        ;; (on the JVM a Date is not a Timestamp), so answer Timestamp explicitly #f.
-        ((jinst? val) (cond ((string=? tn "Date") #t)
-                            ((string=? tn "Timestamp") #f)
+        ;; a #inst / (Date.) is a java.util.Date. It is NOT a java.sql.Date or a
+        ;; java.sql.Timestamp — both are SUBCLASSES on the JVM, so a plain Date is
+        ;; an instance of neither. Comparing only the SHORT name made (instance?
+        ;; java.sql.Date (java.util.Date. 0)) true, and Selmer's date filter tests
+        ;; java.sql.Date before java.util.Date, so every date went down the
+        ;; .toLocalDate branch and blew up.
+        ((jinst? val) (cond ((or (string=? full "java.util.Date") (string=? full "Date")) #t)
+                            ((or (string=? tn "Timestamp") (string=? full "java.sql.Date")) #f)
                             (else 'pass)))
         ;; java.time.Instant is the base library's own type (instance? handled there).
-        ;; java.sql.Date is a java.util.Date subclass (but not a Timestamp).
+        ;; A java.sql.Date IS a java.util.Date (its superclass), but not a Timestamp.
         ((and (jhost? val) (string=? (jhost-tag val) "sql-date"))
-         (cond ((or (string=? tn "Date")) #t) ((string=? tn "Timestamp") #f) (else 'pass)))
+         (cond ((or (string=? full "java.sql.Date") (string=? full "java.util.Date")
+                    (string=? full "Date")) #t)
+               ((string=? tn "Timestamp") #f)
+               (else 'pass)))
         (else 'pass)))))
 
 ;; inst-ms* is a seed native (the overlay inst-ms reads (get x :ms), now answered).

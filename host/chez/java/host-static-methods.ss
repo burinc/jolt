@@ -432,8 +432,14 @@
         ;; JVM's varargs actually compiles to, and what Selmer writes). Splat a lone
         ;; array argument so both reach the same format engine. A leading Locale is
         ;; accepted and ignored — formatting here is locale-independent.
+        ;; The leading argument is a Locale when it is not the format string —
+        ;; String.format(Locale, String, Object...) vs String.format(String,
+        ;; Object...). Testing for the core "locale" jhost tag alone missed the
+        ;; Locale jolt-lang/time installs (a tagged table), so (String/format
+        ;; (Locale/getDefault) "%.3f" args) took the table as the format string.
+        ;; Formatting here is locale-independent, so the locale is dropped either way.
         (cons "format" (lambda (a . rest)
-                         (let* ((locale? (and (jhost? a) (string=? (jhost-tag a) "locale")))
+                         (let* ((locale? (and (pair? rest) (not (string? a))))
                                 (fmt (if locale? (car rest) a))
                                 (args (if locale? (cdr rest) rest))
                                 ;; jolt-array? / ja->list live in natives-array.ss,

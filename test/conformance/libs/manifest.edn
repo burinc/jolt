@@ -174,9 +174,16 @@
 
   {:name "Selmer"
    :paths ["src" "test" "resources"]
+   ;; jolt-crypto supplies java.security.MessageDigest, which the hash: filter
+   ;; calls — the JVM has it built in, jolt gets it from the library. It goes on as
+   ;; a real dependency, not a source path, so its :jolt/native libcrypto is loaded.
    :deps ["@data.json/src/main/clojure" "~time/src"]
+   :local-deps ["~jolt-crypto"]
    :exclude-nses ["selmer.benchmark"]
-   :expect {:tests 131 :pass 484 :fail 13 :error 24}}
+   ;; The remaining failures are the date filter's LOCALE-dependent styles
+   ;; ({{d|date:shortDate:zh}}, :fr month names): jolt-lang/time formats in one
+   ;; fixed locale, so those render US-style. A jolt-lang/time gap, not core.
+   :expect {:tests 131 :pass 492 :fail 24 :error 7}}
 
   {:name "html"
    :paths ["src" "test"]
