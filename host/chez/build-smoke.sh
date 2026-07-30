@@ -612,4 +612,57 @@ if [ "$got_aa" != ":kw :app.other/x :aliased true" ]; then
   echo "  FAIL: as-alias-app — want ':kw :app.other/x :aliased true', got \`$got_aa\`"; exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + scan-alias-set + as-alias)"
+# --- split flat source + cached runtime fasl ---------------------------------
+# The runtime half of the flat source is app-independent, so it is emitted to its
+# own runtime.ss, compiled once per (content, mode), and the fasl kept — most of a
+# small app's build is that one compile. Three things have to hold: the split
+# really happened (the runtime's defines are NOT in flat.ss), a second build reuses
+# the cached fasl, and a binary from the cached fasl behaves exactly like one built
+# without splitting at all. The last is the point: a stale or mismatched cached
+# runtime would produce a subtly wrong binary rather than a failed build.
+echo "build smoke: split flat source + runtime fasl cache"
+splitout="$(dirname "$out")/split-bin"
+cachedir="$(dirname "$out")/rtcache"
+if ! JOLT_PWD="$app" JOLT_RUNTIME_CACHE_DIR="$cachedir" "$joltabs" build -m app.core -o "$splitout" >/dev/null 2>&1; then
+  echo "  FAIL: split build exited non-zero"; exit 1
+fi
+[ -f "$splitout.build/runtime.ss" ] || { echo "  FAIL: no runtime.ss — the split did not happen"; exit 1; }
+# clojure.core lives in the runtime half only; finding it in flat.ss means the app
+# half still carries the runtime and nothing was actually separated.
+if grep -q 'def-var! "clojure.core" "group-by"' "$splitout.build/flat.ss"; then
+  echo "  FAIL: runtime defs still in flat.ss after the split"; exit 1
+fi
+if [ "$(ls "$cachedir"/*.so 2>/dev/null | wc -l | tr -d ' ')" != "1" ]; then
+  echo "  FAIL: the first build cached no runtime fasl"; exit 1
+fi
+# second build: same cache dir, so the runtime compile must be skipped entirely
+rtmtime_before="$(ls -l "$cachedir"/*.so | awk '{print $6, $7, $8}')"
+splitout2="$(dirname "$out")/split-bin2"
+if ! JOLT_PWD="$app" JOLT_RUNTIME_CACHE_DIR="$cachedir" JOLT_BUILD_PROFILE=1 "$joltabs" build -m app.core -o "$splitout2" 2>"$cachedir/prof.log" >/dev/null; then
+  echo "  FAIL: second (cached) split build exited non-zero"; exit 1
+fi
+if ! grep -q 'runtime fasl (cached)' "$cachedir/prof.log"; then
+  echo "  FAIL: second build did not reuse the cached runtime fasl"
+  sed -n 's/^jolt build: \[profile\]/    /p' "$cachedir/prof.log"
+  exit 1
+fi
+# JOLT_NO_FLAT_SPLIT builds the one-file form: the escape hatch has to still work,
+# and its binary is the reference the split one is compared against.
+nosplitout="$(dirname "$out")/nosplit-bin"
+if ! JOLT_PWD="$app" JOLT_NO_FLAT_SPLIT=1 "$joltabs" build -m app.core -o "$nosplitout" >/dev/null 2>&1; then
+  echo "  FAIL: JOLT_NO_FLAT_SPLIT build exited non-zero"; exit 1
+fi
+[ -f "$nosplitout.build/runtime.ss" ] && { echo "  FAIL: JOLT_NO_FLAT_SPLIT still split the source"; exit 1; }
+got_split="$(cd / && "$splitout" alpha bb ccc 2>&1)"
+got_split2="$(cd / && "$splitout2" alpha bb ccc 2>&1)"
+got_nosplit="$(cd / && "$nosplitout" alpha bb ccc 2>&1)"
+if [ "$got_split" != "$want" ] || [ "$got_split2" != "$want" ] || [ "$got_nosplit" != "$want" ]; then
+  echo "  FAIL: split/cached/unsplit binaries disagree with the reference output"
+  echo "--- want ---";        echo "$want"
+  echo "--- split ---";       echo "$got_split"
+  echo "--- split cached ---";echo "$got_split2"
+  echo "--- unsplit ---";     echo "$got_nosplit"
+  exit 1
+fi
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + scan-alias-set + as-alias + flat-split + runtime-cache)"

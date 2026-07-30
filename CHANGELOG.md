@@ -46,6 +46,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entered in `known-divergences.edn` under `:integer-box-model`. `(bit-and b 0xff)`
   pins the width explicitly and is identical on both.
 
+### Added
+
+- **`jolt build` compiles the runtime half of its flat source once and keeps the
+  fasl.** A build emits one flat Scheme file — jolt's runtime (`rt.ss`, the
+  `clojure.core` prelude, the compiler image, the loader) followed by the app — and
+  handed the whole thing to Chez every time. The runtime half is byte-identical for
+  every app a given jolt builds in a given mode (verified: two unrelated apps
+  produce the same 3.0 MB to the byte), and compiling it is ~2.6s. It is now emitted
+  to its own `runtime.ss`, compiled once per (content, mode), and the fasl reused;
+  the two units are loaded into the boot in order, so the runtime's defines still
+  precede the app's reads.
+
+  A small app's build is mostly that one compile, so this is most of its build time:
+  `examples/hiccup-app` goes from 3.13s to 0.50s. A large app amortizes it against
+  its own work (`examples/ring-app` loses ~2.6s of ~42s). Cached under
+  `~/.jolt/runtime-cache` (`JOLT_RUNTIME_CACHE_DIR`), newest 8 entries kept;
+  `JOLT_RUNTIME_CACHE=0` opts out and `JOLT_NO_FLAT_SPLIT=1` restores the one-file
+  build. Skipped for `--tree-shake` (which rewrites the prelude per app), for
+  `--library`, and for cross builds.
+
+- **`JOLT_BUILD_PROFILE=1` reports each build phase's wall-clock time**, including a
+  breakdown inside the two expensive ones (the whole-program fixpoint and the emit
+  walk). `bench/build-phases.sh` drives it across build modes and prints the split
+  between jolt's own passes and Chez's compile. A build's cost divides between those
+  two and they want unrelated fixes, so which one dominates is worth being able to
+  see rather than assume — it is not the same for a small app as for a large one.
+
 ### Fixed
 
 - **A sub-process that could not be waited on hung the caller forever.** The reap
