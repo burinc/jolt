@@ -304,6 +304,17 @@
                               #t))))))
 
 ;; ---- emit entry points ------------------------------------------------------
+;; A qualified reference whose namespace segment names a live namespace — directly
+;; or through a require :as alias — is a missing VAR, not a missing class. The
+;; analyzer reads any unresolved ns/name as a host static, so a typo in a
+;; clojure.string call used to report "Unknown class s", naming the alias as a
+;; class and sending the reader looking in the wrong place.
+(define (static-miss-message class member)
+  (let ((target (or (chez-resolve-alias (chez-current-ns) class) class)))
+    (if (chez-ns-exists? target)
+        (string-append "No such var: " class "/" member)
+        (unknown-class-message class))))
+
 (define (host-static-ref class member)
   (let ((cell (mutable-static-cell class member #f)))
     (if cell
@@ -316,7 +327,7 @@
               ;; first-party library that installs the class) and retry once
               (if (or (jt-try-autoload! class) (lib-try-autoload! class))
                   (host-static-ref class member)
-                  (throw-jvm (quote IllegalArgumentException) (unknown-class-message class))))))))
+                  (throw-jvm (quote IllegalArgumentException) (static-miss-message class member))))))))
 
 (define (host-static-call class member . args)
   (apply (host-static-ref class member) args))

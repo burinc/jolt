@@ -67,6 +67,9 @@
   {:suite "exinfo" :expr "(instance? RuntimeException (InterruptedException. \"x\"))" :expected "false"}
   {:suite "exinfo" :expr "(.getMessage (RuntimeException. \"boom\"))" :expected "\"boom\""}
   {:suite "exinfo" :expr "(ex-message (RuntimeException. \"boom\"))" :expected "\"boom\""}
+  {:suite "errors" :expr "(try (clojure.string/no-such-fn 1) (catch Throwable e (ex-message e)))" :expected "\"No such var: clojure.string/no-such-fn\""}
+  {:suite "errors" :expr "(do (require (quote [clojure.string :as s])) (try (s/no-such-fn 1) (catch Throwable e (ex-message e))))" :expected "\"No such var: s/no-such-fn\""}
+  {:suite "errors" :expr "(try (Nope/whatever 1) (catch Throwable e (ex-message e)))" :expected "\"Unknown class Nope\""}
   {:suite "exinfo" :expr "(type (ex-info \"x\" {}))" :expected "clojure.lang.ExceptionInfo"}
   {:suite "hostobj" :expr "(.getName (.getClass \"x\"))" :expected "\"java.lang.String\""}
   {:suite "hostobj" :expr "(.getClass 5)" :expected "java.lang.Long"}
