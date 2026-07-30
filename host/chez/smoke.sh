@@ -10,6 +10,27 @@ cd "$root"
 # script-mode case below keeps the source-load path covered).
 jolt="${JOLT_BIN:-bin/jolt}"
 
+# Every case here is a sub-second jolt invocation, so a case that does not finish
+# has hung — and a hung case is invisible: `make -Oline` shows nothing for a target
+# until it completes, so a CI gate sits silent until the 6-hour job limit with no
+# clue which case it was. Cap each invocation instead: the case then FAILS and names
+# itself. JOLT_SMOKE_TIMEOUT=0 disables the cap (for a debugger on a live case).
+#
+# coreutils' timeout is not on a stock macOS, so fall back to running uncapped
+# rather than skipping the case or hard-failing the gate on a missing tool.
+smoke_timeout="${JOLT_SMOKE_TIMEOUT:-120}"
+if [ "$smoke_timeout" = "0" ]; then
+  jolt_timeout=""
+elif command -v timeout >/dev/null 2>&1; then
+  jolt_timeout="timeout $smoke_timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+  jolt_timeout="gtimeout $smoke_timeout"
+else
+  jolt_timeout=""
+  echo "  note: no timeout(1) — a hung case will block instead of failing"
+fi
+jolt="$jolt_timeout $jolt"
+
 fails=0
 check() {
   got="$($jolt -e "$1" 2>/dev/null | tail -1)"

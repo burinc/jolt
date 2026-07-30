@@ -28,6 +28,7 @@ compile-ns
 condition-message
 deftype-ctor-class
 delete-file
+directory?
 enable-trace!
 exact?
 file-exists?
