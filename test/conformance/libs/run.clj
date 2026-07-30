@@ -11,7 +11,7 @@
 ;;
 ;; Usage:
 ;;   jolt run test/conformance/libs/run.clj [lib ...]      ; all, or the named ones
-;;   JOLT_LIBCONF_UPDATE=1 jolt run ... > /dev/null        ; rewrite :expect tallies
+;;   JOLT_LIBCONF_REPORT=<file> jolt run ...               ; dump {name tally} edn
 (ns lib-conformance-driver
   (:require [clojure.edn :as edn]
             [clojure.string :as str]
@@ -129,9 +129,12 @@
 
 ;; ---------------------------------------------------------------- reporting
 
-(defn- worse? [{:keys [pass fail error load-fail]} exp]
-  (or (< pass (:pass exp 0))
-      (> fail (:fail exp 0))
+;; A property-based suite draws random cases, so its assertion count drifts run to
+;; run — :tolerance is how far below the recorded pass count that suite may land
+;; before it counts as a regression. Everything else is pinned exactly.
+(defn- worse? [{:keys [pass fail error load-fail]} exp tolerance]
+  (or (< pass (- (:pass exp 0) (or tolerance 0)))
+      (> fail (+ (:fail exp 0) (or tolerance 0)))
       (> error (:error exp 0))
       (> load-fail (:load-fail exp 0))))
 
@@ -151,7 +154,7 @@
         logdir (str repo-root "/target/libconformance")]
     (.mkdirs (java.io.File. logdir))
     (let [rows (doall
-                 (for [{:keys [name skip expect] :as e} entries]
+                 (for [{:keys [name skip expect tolerance] :as e} entries]
                    (if skip
                      (do (println (format "%-20s SKIP  %s" name skip))
                          {:name name :verdict :skip})
@@ -170,8 +173,8 @@
                          (do (println (format "%-20s NO-RESULT  exit=%s (see %s/%s.log)"
                                               name (:exit r) logdir name))
                              {:name name :verdict :fail})
-                         (let [bad (and expect (worse? r expect))
-                               better (and expect (> (:pass r) (:pass expect 0)))]
+                         (let [bad (and expect (worse? r expect tolerance))
+                               better (and expect (> (:pass r) (+ (:pass expect 0) (or tolerance 0))))]
                            (println (format "%-20s %-6s %s%s"
                                             name
                                             (cond bad "WORSE" better "BETTER" :else "ok")
@@ -191,6 +194,11 @@
                        (count (filter #(#{:skip :missing :no-tests} (:verdict %)) rows))))
       (when (seq bad)
         (println "REGRESSED:" (str/join " " (map :name bad))))
+      ;; JOLT_LIBCONF_REPORT=<file> dumps {name tally} so the manifest's :expect
+      ;; entries can be refreshed from a run instead of retyped.
+      (when-let [out (System/getenv "JOLT_LIBCONF_REPORT")]
+        (spit out (pr-str (into {} (keep (fn [r] (when (:got r) [(:name r) (:got r)])) rows))))
+        (println "wrote" out))
       (System/exit (if (seq bad) 1 0)))))
 
 ;; run on load so `jolt run test/conformance/libs/run.clj [lib ...]` executes.

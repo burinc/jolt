@@ -440,6 +440,21 @@ else
   fails=$((fails + 1))
 fi
 
+# The rest of clojure.test's public surface — *test-out*/with-test-out,
+# successful?, compose/join-fixtures, assert-predicate/assert-any/try-expr,
+# function?, *load-tests*, set-test/deftest-, test-ns/test-all-vars/run-test-var.
+# Test runners and reporters reach for these; every expectation is certified
+# against reference clojure.test.
+cta_out="$($jolt run test/chez/clojure-test-api.clj 2>/dev/null)"
+if printf '%s' "$cta_out" | grep -q 'CLOJURE-TEST-API OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: clojure.test public surface"
+  echo "    $(printf '%s' "$cta_out" | grep CLOJURE-TEST-API-RESULT | tail -1)"
+  printf '%s' "$cta_out" | grep 'clojure-test-api FAIL' | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # clojure.pprint cl-format: a representative, JVM-certified subset of the upstream
 # test_cl_format suite (~A ~S ~D ~F ~$ ~% ~& ~C ~( ~) ~{ ~} ~[ ~] ~< ~> ~T ~* ~R).
 # The file tallies per-case pass/fail and emits a PPRINT OK / PPRINT FAIL sentinel.

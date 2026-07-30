@@ -705,7 +705,23 @@
                             jolt-nil))
         (cons "isInterrupted" (lambda (self)
                                 (and (box? (jhost-state self)) (unbox (jhost-state self)) #t)))))
-(define (current-thread-handle) (make-jhost "thread" (current-interrupt-box)))
+;; ONE handle per thread, cached in a thread parameter. The JVM's
+;; Thread/currentThread is identity-stable, and code relies on it: keying a map by
+;; the current thread, or comparing two calls with identical?/=. Allocating a fresh
+;; jhost per call made every such comparison false — tools.logging's suite tags each
+;; log entry with its calling thread and then asks whether it was logged directly.
+;; The cell carries the owning thread's id for the same reason current-interrupt-box
+;; does: a Chez thread parameter is inherited by a forked thread, and a child must
+;; not report the parent's handle as its own.
+(define thread-handle-cell (make-thread-parameter #f))      ; (thread-id . handle)
+(define (current-thread-handle)
+  (let ((c (thread-handle-cell))
+        (id (get-thread-id)))
+    (if (and (pair? c) (eqv? (car c) id))
+        (cdr c)
+        (let ((h (make-jhost "thread" (current-interrupt-box))))
+          (thread-handle-cell (cons id h))
+          h))))
 (register-class-statics! "Thread" (list (cons "currentThread" current-thread-handle)))
 (register-class-statics! "java.lang.Thread" (list (cons "currentThread" current-thread-handle)))
 

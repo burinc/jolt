@@ -333,6 +333,31 @@
               (conj (pop acc) (conj (peek acc) x))))
           [] items))
 
+;; clojure.core/maybe-destructured, for deftype/defrecord method params: a param
+;; that is not a symbol becomes a gensym, destructured in a let the caller wraps
+;; the body in. Returns [param-vector let-bindings]. core.logic's Substitutions
+;; has (cons [this [k v]] …), and the JVM accepts it — deftype's own params are
+;; not the fn macro's, so each definer desugars them itself. (reify and
+;; extend-type reach fn directly and get this for free.)
+(defn- destructured-params [argv]
+  (loop [ps (seq argv) nps [] lets []]
+    (if ps
+      (if (symbol? (first ps))
+        (recur (next ps) (conj nps (first ps)) lets)
+        (let [g (fresh-sym)]
+          (recur (next ps) (conj nps g) (conj (conj lets (first ps)) g))))
+      [nps lets])))
+
+;; Every symbol a destructuring pattern binds (a superset: an :or default's own
+;; symbols come along, which only makes the mutable-field live-read rewrite skip
+;; a name it would have rewritten). Used to shadow those names against the fields.
+(defn- pattern-syms [x]
+  (cond
+    (symbol? x) (if (= (name x) "&") [] [x])
+    (vector? x) (vec (mapcat pattern-syms x))
+    (map? x) (vec (mapcat pattern-syms (vals x)))
+    :else []))
+
 ;; deftype is sugar over make-deftype-ctor (a ctx-capturing clojure.core fn that
 ;; bakes the ns-qualified type tag at def time) plus extend-type for any inline
 ;; protocol methods — so it compiles as a plain (do …). Each method body sees the
@@ -441,20 +466,28 @@
         mk-clause (fn [spec]
                     ;; fresh-name each _ param so two _ params don't collide on the
                     ;; field binds / live-read instance (see defrecord's mk-clause).
-                    (let [argv (mapv (fn [p] (if (= p (quote _)) (gensym "_p") p)) (nth spec 1))
+                    (let [raw (mapv (fn [p] (if (= p (quote _)) (gensym "_p") p)) (nth spec 1))
+                          dp (destructured-params raw)
+                          argv (nth dp 0)
+                          dlets (nth dp 1)
                           inst (first argv)
                           ;; A method param shadows a same-named field (Clojure
                           ;; semantics): don't let-bind a field the param already
                           ;; provides, and treat those params as shadowing so a
                           ;; mutable field's live-read rewrite doesn't override them.
-                          pnames (set (map name argv))
+                          ;; A destructured param's own bindings shadow too — hence
+                          ;; the destructuring let sits INSIDE the field binds.
+                          dsyms (vec (mapcat pattern-syms dlets))
+                          shadowed (set (concat argv dsyms))
+                          pnames (set (map name shadowed))
                           ;; let-bind only immutable fields; mutable ones are read live
                           ;; via rewrite-body so a set! within the method is observed.
                           binds (vec (mapcat (fn [f] [f `(get ~inst ~(keyword (name f)))])
                                              (filter (fn [f] (and (not (mutable? f))
                                                                   (not (contains? pnames (name f)))))
                                                      fields)))
-                          mbody (map (fn [bf] (rewrite-body inst (set argv) bf)) (drop 2 spec))]
+                          mbody (map (fn [bf] (rewrite-body inst shadowed bf)) (drop 2 spec))
+                          mbody (if (seq dlets) (list (list* 'let dlets mbody)) mbody)]
                       (list argv (list* 'let binds mbody))))
         groups (group-by-head body)
         ;; merge clauses by method NAME across ALL protocols into one multi-arity
@@ -688,15 +721,22 @@
                     ;; (the common (m [_ _] …) on a 1-arg protocol method) don't
                     ;; collide — the field binds read (get this :field) off the
                     ;; FIRST param, which an ignored second _ would otherwise shadow.
-                    (let [argv (mapv (fn [p] (if (= p (quote _)) (gensym "_p") p)) (nth spec 1))
+                    (let [raw (mapv (fn [p] (if (= p (quote _)) (gensym "_p") p)) (nth spec 1))
+                          dp (destructured-params raw)
+                          argv (nth dp 0)
+                          dlets (nth dp 1)
                           inst (first argv)
                           hinted (assoc argv 0 (vary-meta inst assoc :tag (name name-sym)))
                           ;; a method param shadows a same-named field (Clojure
-                          ;; semantics), so don't rebind a field the param provides.
-                          pnames (set (map name argv))
+                          ;; semantics), so don't rebind a field the param provides —
+                          ;; including a name a destructured param binds, whose let
+                          ;; sits inside the field binds.
+                          pnames (set (map name (concat argv (mapcat pattern-syms dlets))))
                           binds (vec (mapcat (fn [f] [f `(get ~inst ~(keyword (name f)))])
-                                             (remove (fn [f] (contains? pnames (name f))) fields)))]
-                      (list hinted (list* 'let binds (drop 2 spec)))))
+                                             (remove (fn [f] (contains? pnames (name f))) fields)))
+                          mbody (drop 2 spec)
+                          mbody (if (seq dlets) (list (list* 'let dlets mbody)) mbody)]
+                      (list hinted (list* 'let binds mbody))))
         groups (group-by-head body)
         ;; merge clauses by name across protocols into one multi-arity fn (see
         ;; deftype's by-name).

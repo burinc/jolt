@@ -13,145 +13,189 @@
 {:libs
  [;; ---------------------------------------------------------- collections/util
   {:name "medley"
-   :paths ["src" "test"]}
+   :paths ["src" "test"]
+   :expect {:tests 55 :pass 293 :fail 0 :error 0}}
 
   {:name "camel-snake-kebab"
-   :paths ["src" "test"]}
+   :paths ["src" "test"]
+   :expect {:tests 5 :pass 163 :fail 0 :error 0}}
 
   {:name "cuerdas"
-   :paths ["src" "test"]}
+   :paths ["src" "test"]
+   :expect {:tests 71 :pass 293 :fail 5 :error 2}}
 
   {:name "dependency"
-   :paths ["src" "test"]}
+   :paths ["src" "test"]
+   :expect {:tests 9 :pass 40 :fail 0 :error 0}}
 
   {:name "ordered"
    :paths ["src" "test"]
-   :exclude-nses ["flatland.ordered.performance-test"]}
+   :exclude-nses ["flatland.ordered.performance-test"]
+   :expect {:tests 25 :pass 129 :fail 0 :error 0}}
 
   {:name "text-diff"
-   :paths ["src" "test"]}
+   :paths ["src" "test"]
+   :expect {:tests 11 :pass 29 :fail 0 :error 0}}
 
   {:name "math.combinatorics"
    :paths ["src/main/clojure" "src/test/clojure"]
-   :test-paths ["src/test/clojure"]}
+   :test-paths ["src/test/clojure"]
+   :expect {:tests 18 :pass 1193 :fail 0 :error 0}}
 
   {:name "data.priority-map"
    :paths ["src/main/clojure" "src/test/clojure"]
-   :test-paths ["src/test/clojure"]}
+   :test-paths ["src/test/clojure"]
+   :expect {:tests 4 :pass 142 :fail 0 :error 0}}
 
   {:name "core.cache"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   :deps ["@data.priority-map/src/main/clojure"]}
+   :deps ["@data.priority-map/src/main/clojure"]
+   :expect {:tests 23 :pass 1314 :fail 0 :error 0}}
 
   {:name "core.memoize"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   :deps ["@core.cache/src/main/clojure" "@data.priority-map/src/main/clojure"]}
+   :deps ["@core.cache/src/main/clojure" "@data.priority-map/src/main/clojure"]
+   :expect {:tests 18 :pass 207 :fail 0 :error 0}}
 
   ;; ---------------------------------------------------------- language / meta
   {:name "tools.macro"
    :paths ["src/main/clojure" "src/test/clojure"]
-   :test-paths ["src/test/clojure"]}
+   :test-paths ["src/test/clojure"]
+   :expect {:tests 4 :pass 14 :fail 0 :error 0}}
 
   {:name "algo.monads"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   :deps ["@tools.macro/src/main/clojure"]}
+   :deps ["@tools.macro/src/main/clojure"]
+   :expect {:tests 11 :pass 28 :fail 0 :error 0}}
 
   {:name "core.match"
    :paths ["src/main/clojure" "src/test/clojure"]
-   :test-paths ["src/test/clojure"]}
+   :test-paths ["src/test/clojure"]
+   ;; both suites match on the result of JVM reflection (.getReturnType, java.lang.Void)
+   :exclude-nses ["clojure.core.match.test.java" "clojure.core.match.test.date"]
+   :expect {:tests 118 :pass 153 :fail 0 :error 0}}
 
   {:name "core.logic"
    :paths ["src/main/clojure" "src/test/clojure"]
-   :test-paths ["src/test/clojure"]}
+   :test-paths ["src/test/clojure"]
+   :expect {:tests 405 :pass 549 :fail 3 :error 0 :load-fail 1}}
 
   {:name "core.contracts"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   :extra-deps {org.clojure/core.unify {:mvn/version "0.5.7"}}}
+   :extra-deps {org.clojure/core.unify {:mvn/version "0.5.7"}}
+   :expect {:tests 14 :pass 45 :fail 0 :error 0}}
 
   {:name "tools.reader"
    :paths ["src/main/clojure" "src/test/clojure"]
-   :test-paths ["src/test/clojure"]}
+   :test-paths ["src/test/clojure"]
+   :expect {:tests 46 :pass 574 :fail 4 :error 9 :load-fail 1}}
 
   {:name "tools.namespace"
    :paths ["src/main/clojure" "src/test/clojure"]
-   :test-paths ["src/test/clojure"]}
+   :test-paths ["src/test/clojure"]
+   :expect {:tests 26 :pass 52 :fail 0 :error 5}}
 
   {:name "rewrite-clj"
    :paths ["src" "resources" "test"]
-   :deps ["@tools.reader/src/main/clojure" "@test.check/src/main/clojure"]}
+   :deps ["@tools.reader/src/main/clojure" "@test.check/src/main/clojure"]
+   :expect {:tests 162 :pass 3380 :fail 0 :error 0}}
 
   ;; ---------------------------------------------------------- spec + testing
   {:name "spec.alpha"
    :paths ["src/main/clojure" "src/test/clojure"]
-   :test-paths ["src/test/clojure"]}
+   :test-paths ["src/test/clojure"]
+   :expect {:tests 13 :pass 166 :fail 4 :error 4}}
 
   {:name "test.check"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
    :deps ["@spec.alpha/src/main/clojure"]
-   :timeout 900}
+   :timeout 900
+   ;; property-based: the assertion count moves with the generated cases
+   :tolerance 40
+   :expect {:tests 123 :pass 230 :fail 15 :error 3}}
 
   {:name "test.chuck"
    :paths ["src" "test"]
    :deps ["@test.check/src/main/clojure" "@spec.alpha/src/main/clojure"]
-   :timeout 900}
+   :timeout 900
+   ;; property-based: the assertion count moves with the generated cases
+   :tolerance 30
+   :expect {:tests 33 :pass 42 :fail 15 :error 2 :load-fail 2}}
 
   ;; ---------------------------------------------------------- data formats
   {:name "data.csv"
    :paths ["src/main/clojure" "src/test/clojure"]
-   :test-paths ["src/test/clojure"]}
+   :test-paths ["src/test/clojure"]
+   :expect {:tests 4 :pass 26 :fail 0 :error 0}}
 
   {:name "data.codec"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   :deps ["@test.check/src/main/clojure"]}
+   :deps ["@test.check/src/main/clojure" "@spec.alpha/src/main/clojure"]
+   ;; The suite checks jolt's base64 against commons-codec's and against the
+   ;; clojure.lang.IFn$OLLOL primitive interfaces — neither exists here, so the
+   ;; comparison assertions cannot run. data.codec itself is exercised by the
+   ;; assertions that do not reach for them.
+   :note "commons-codec + IFn$O..O primitive interfaces are JVM-only"
+   :expect {:tests 14 :pass 1 :fail 2 :error 11}}
 
   {:name "data.json"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   :deps ["~time/src" "@spec.alpha/src/main/clojure"]}
+   :deps ["~time/src" "@spec.alpha/src/main/clojure"]
+   :expect {:tests 244 :pass 316 :fail 3 :error 5}}
 
   {:name "data.zip"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   :deps ["~xml/src"]}
+   :deps ["~xml/src"]
+   :expect {:tests 9 :pass 12 :fail 0 :error 0}}
 
   {:name "yamlstar"
    :root "yamlstar/core"
    :paths ["src" "test"]
-   :deps ["~time/src"]}
+   :deps ["~time/src"]
+   :expect {:tests 44 :pass 103 :fail 0 :error 0}}
 
   ;; ---------------------------------------------------------- markup / text
   {:name "hiccup"
-   :paths ["src" "test"]}
+   :paths ["src" "test"]
+   :expect {:tests 64 :pass 382 :fail 4 :error 0}}
 
   {:name "markdown-clj"
    :paths ["src/clj" "src/cljc" "test"]
-   :exclude-nses ["markdown.benchmark"]}
+   :exclude-nses ["markdown.benchmark"]
+   :expect {:tests 94 :pass 177 :fail 0 :error 3}}
 
   {:name "Selmer"
    :paths ["src" "test" "resources"]
    :deps ["@data.json/src/main/clojure" "~time/src"]
-   :exclude-nses ["selmer.benchmark"]}
+   :exclude-nses ["selmer.benchmark"]
+   :expect {:tests 131 :pass 464 :fail 13 :error 44}}
 
   {:name "html"
-   :paths ["src" "test"]}
+   :paths ["src" "test"]
+   :expect {:tests 2 :pass 35 :fail 0 :error 0}}
 
   ;; ---------------------------------------------------------- data / config
   {:name "honeysql"
    :paths ["src" "test"]
    :deps ["~time/src" "@core.cache/src/main/clojure"
-          "@data.priority-map/src/main/clojure"]}
+          "@data.priority-map/src/main/clojure"]
+   :expect {:tests 175 :pass 832 :fail 0 :error 0}}
 
   {:name "config"
-   :paths ["src" "test"]}
+   :paths ["src" "test"]
+   :expect {:tests 3 :pass 8 :fail 0 :error 0}}
 
   {:name "aero"
-   :paths ["src" "test"]}
+   :paths ["src" "test"]
+   :expect {:tests 28 :pass 59 :fail 0 :error 0}}
 
   {:name "malli"
    :paths ["src" "resources" "test"]
@@ -164,28 +208,33 @@
                 borkdude/edamame {:mvn/version "1.5.37"}
                 fipp/fipp {:mvn/version "0.6.29"}
                 mvxcvi/arrangement {:mvn/version "2.1.0"}}
-   :timeout 900}
+   :timeout 900
+   :expect {:tests 28 :pass 118 :fail 7 :error 8 :load-fail 20}}
 
   ;; ---------------------------------------------------------- web
   {:name "ring-codec"
-   :paths ["src" "test"]}
+   :paths ["src" "test"]
+   :expect {:tests 9 :pass 68 :fail 4 :error 0}}
 
   {:name "ring-core"
    :root "ring"
    :paths ["ring-core/src" "ring-core-protocols/src" "ring-core/test"]
    :test-paths ["ring-core/test"]
-   :deps ["@ring-codec/src" "~time/src" "~jolt-crypto/src"]}
+   :deps ["@ring-codec/src" "~time/src" "~jolt-crypto/src"]
+   :expect {:tests 126 :pass 326 :fail 12 :error 28 :load-fail 5}}
 
   {:name "ring-spec"
    :paths ["src" "test"]
-   :deps ["@spec.alpha/src/main/clojure" "@ring/ring-core-protocols/src"]}
+   :deps ["@spec.alpha/src/main/clojure" "@ring/ring-core-protocols/src"]
+   :expect {:tests 1 :pass 0 :fail 1 :error 0}}
 
   {:name "reitit-core"
    :root "reitit"
    :paths ["modules/reitit-core/src" "test/cljc"]
    :test-paths ["test/cljc"]
    :deps ["~router/src" "@spec.alpha/src/main/clojure"]
-   :extra-deps {meta-merge/meta-merge {:mvn/version "1.0.0"}}
+   :extra-deps {meta-merge/meta-merge {:mvn/version "1.0.0"}
+   :expect {:tests 27 :pass 343 :fail 1 :error 22}}
    ;; test/cljc holds the suites for every reitit module; these are the ones that
    ;; need reitit-core alone (the rest pull reitit-ring / -malli / muuntaja /
    ;; jsonista, which are not in the checkout).
@@ -195,28 +244,36 @@
   ;; ---------------------------------------------------------- tooling
   {:name "compliment"
    :paths ["src" "test"]
-   ;; Most of compliment's suites are written against nubank/matcher-combinators,
-   ;; which is not in the checkout. These are the ones that use plain clojure.test.
-   ;; Reflection-backed sources (class members, classes, resources) do not apply to
-   ;; jolt's host model — see the library's own CONFORMANCE.md.
+   :extra-deps {nubank/matcher-combinators {:mvn/version "3.9.2"}}
+   ;; Reflection-backed sources (class members, classes, resources) and classpath
+   ;; enumeration do not apply to jolt's host model, and t-core/t-vars pin exact
+   ;; candidate lists that jolt's different clojure.core surface changes — see the
+   ;; library's own CONFORMANCE.md. These are the host-neutral suites.
    :nses ["compliment.t-context" "compliment.sources.t-special-forms"
           "compliment.sources.t-local-bindings" "compliment.sources.t-keywords"
-          "compliment.sources.t-data-readers"]}
+          "compliment.sources.t-data-readers"]
+   ;; completions reflect the live runtime (interned keywords, loaded namespaces),
+   ;; so the assertion count moves with suite order
+   :tolerance 10
+   :expect {:tests 7 :pass 65 :fail 0 :error 0}}
 
   {:name "lasertag"
    :paths ["src" "test"]
-   :deps ["~time/src"]}
+   :deps ["~time/src"]
+   :expect {:tests 58 :pass 46 :fail 12 :error 0}}
 
   {:name "tools.logging"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   ;; the log4j2 suite needs the org.apache.logging.log4j jars
-   :exclude-nses ["clojure.tools.logging.test-log4j2"]}
+   ;; test-impl pins the log4j2 backend, which needs the org.apache.logging.log4j jars
+   :exclude-nses ["clojure.tools.logging.test-impl"]
+   :expect {:tests 67 :pass 217 :fail 2 :error 4}}
 
   ;; ---------------------------------------------------------- time
   {:name "tick"
    :paths ["src" "test"]
-   :deps ["~time/src" "@spec.alpha/src/main/clojure"]}
+   :deps ["~time/src" "@spec.alpha/src/main/clojure"]
+   :expect {:tests 41 :pass 620 :fail 0 :error 0 :load-fail 1}}
 
   ;; ---------------------------------------------------------- skipped
   {:name "process"

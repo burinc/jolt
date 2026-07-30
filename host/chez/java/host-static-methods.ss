@@ -84,10 +84,23 @@
 ;; Per-thread interrupt flag, lazily allocated so each OS thread gets its own box.
 ;; A thread handle (from currentThread) captures this box, so .interrupt from
 ;; another thread sets the target thread's flag.
-(define thread-interrupt-box (make-thread-parameter #f))
+;;
+;; The cell carries the owning thread's id, because a Chez thread parameter is
+;; INHERITED: a forked thread starts with the creating thread's value. A plain
+;; (make-thread-parameter #f) therefore handed a child its PARENT's box — so
+;; interrupting the child set the parent's flag, and the monitor-ownership check in
+;; concurrency.ss saw a child as holding a lock the parent had taken. Comparing the
+;; stored id against (get-thread-id) makes an inherited cell miss, so the child
+;; allocates its own box on first use; no global table, so no per-thread leak.
+(define thread-interrupt-cell (make-thread-parameter #f))   ; (thread-id . box)
 (define (current-interrupt-box)
-  (or (thread-interrupt-box)
-      (let ((b (box #f))) (thread-interrupt-box b) b)))
+  (let ((c (thread-interrupt-cell))
+        (id (get-thread-id)))
+    (if (and (pair? c) (eqv? (car c) id))
+        (cdr c)
+        (let ((b (box #f)))
+          (thread-interrupt-cell (cons id b))
+          b))))
 (define (clear-thread-interrupt!) (set-box! (current-interrupt-box) #f))
 
 ;; libc sched_yield, resolved once; fall back to a zero-length park if the symbol

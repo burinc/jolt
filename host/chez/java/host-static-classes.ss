@@ -199,14 +199,34 @@
     (cond ((eq? p 'out) (current-output-port))
           ((eq? p 'err) (current-error-port))
           (else p))))
+;; print / println / printf are PrintStream's, and System/out is a port-writer, so
+;; ported code writing (.println System/out …) lands here. println with no argument
+;; is the bare newline, as on the JVM.
 (register-host-methods! "port-writer"
   (list (cons "write" (lambda (self x) (display (writer-piece x) (port-writer-port self)) jolt-nil))
         (cons "append" (lambda (self x . rest) (display (append-text x rest) (port-writer-port self)) self))
+        (cons "print" (lambda (self x) (display (writer-piece x) (port-writer-port self)) jolt-nil))
+        (cons "println" (lambda (self . xs)
+                          (let ((p (port-writer-port self)))
+                            (unless (null? xs) (display (writer-piece (car xs)) p))
+                            (display "\n" p))
+                          jolt-nil))
         (cons "flush" (lambda (self) (flush-output-port (port-writer-port self)) jolt-nil))
         (cons "close" (lambda (self) jolt-nil))
         (cons "toString" (lambda (self) ""))))
 (def-dynvar! "clojure.core" "*out*" (make-jhost "port-writer" (vector 'out)))
 (def-dynvar! "clojure.core" "*err*" (make-jhost "port-writer" (vector 'err)))
+
+;; System/out and System/err — the process's own streams, so unlike *out*/*err*
+;; they are NOT affected by a (binding [*out* …]), matching the JVM. Ported code
+;; writes to them directly ((.println System/out …)); they are the same
+;; port-writers *out*/*err* root to, since jolt models a stream and a writer the
+;; same way. setOut/setErr are deliberately absent: redirecting the process
+;; streams needs the proxy-over-host-class support that is still missing, and a
+;; half-working setOut would silently drop output.
+(register-class-statics! "System"
+  (list (cons "out" (make-jhost "port-writer" (vector 'out)))
+        (cons "err" (make-jhost "port-writer" (vector 'err)))))
 
 ;; PrintWriter — a thin wrapper over a target writer. write/append/print forward
 ;; the rendered text to the target. clojure.data.json's pretty printer builds

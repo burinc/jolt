@@ -32,6 +32,24 @@
 ;; (test.chuck rebinds it around its property reports).
 (def ^:dynamic *testing-contexts* (list))
 
+;; Where test reporting goes. A library that captures test output binds this and
+;; wraps its printing in with-test-out — test.check's clojure-test integration
+;; does exactly that — so everything this namespace prints goes through it too.
+(def ^:dynamic *test-out* *out*)
+
+(defmacro with-test-out
+  "Runs body with *out* bound to the value of *test-out*."
+  [& body]
+  `(binding [*out* *test-out*] ~@body))
+
+;; Bind to false when loading production code and with-test / deftest / deftest- /
+;; set-test create nothing.
+(def ^:dynamic *load-tests* true)
+
+;; Accepted for parity and inert here: jolt reports a crash by message, not by
+;; printing a stack trace, so there is no depth to cap.
+(def ^:dynamic *stack-trace-depth* nil)
+
 (defn reset-report! []
   (reset! counters {:test 0 :pass 0 :fail 0 :error 0 :fails []})
   (reset! ctx-stack [])
@@ -48,11 +66,11 @@
 (defn fail! [form]
   (let [line (str (ctx-str) (when (or (seq *testing-contexts*) (seq @ctx-stack)) " ") "FAIL: " form)]
     (swap! counters (fn [r] (-> r (update :fail inc) (update :fails conj line))))
-    (println line)))
+    (with-test-out (println line))))
 (defn err! [form]
   (let [line (str (ctx-str) (when (or (seq *testing-contexts*) (seq @ctx-stack)) " ") "ERROR: " form)]
     (swap! counters (fn [r] (-> r (update :error inc) (update :fails conj line))))
-    (println line)))
+    (with-test-out (println line))))
 
 (defn n-pass [] (:pass @counters))
 (defn n-fail [] (:fail @counters))
@@ -70,7 +88,11 @@
 ;; clojure.test/report multimethod — present so suites that add reporting
 ;; methods (defmethod clojure.test/report :begin-test-var ...) load. The runner
 ;; below does its own console output and doesn't dispatch through it.
-(defmulti report :type)
+;;
+;; ^:dynamic like the reference's: a suite that installs its own reporter for the
+;; duration of a run rebinds this rather than adding methods (test.check's
+;; clojure-test suite does, and so does every TAP/JUnit reporter).
+(defmulti ^:dynamic report :type)
 (defmethod report :default [_m] nil)
 
 ;; do-report routes a {:type …} report map through the report multimethod — the
@@ -108,6 +130,47 @@
      (catch Throwable e#
        (clojure.test/do-report {:type :error :message ~msg :form '~form
                                 :actual (clojure.test/err-text e#)}))))
+
+;; The building blocks a library uses when it writes its own assert-expr method:
+;; assert-predicate for a functional predicate (args evaluated so the report shows
+;; the values), assert-any for anything else, try-expr to wrap either so an
+;; unexpected throw reports :error instead of escaping.
+(defn assert-predicate
+  "Returns generic assertion code for any functional predicate. :expected is the
+  original form, :actual the form with its sub-forms evaluated."
+  [msg form]
+  (let [args (rest form)
+        pred (first form)]
+    `(let [values# (list ~@args)
+           result# (apply ~pred values#)]
+       (if result#
+         (clojure.test/do-report {:type :pass :message ~msg
+                                  :expected '~form :actual (cons ~pred values#)})
+         (clojure.test/do-report {:type :fail :message ~msg :form '~form
+                                  :expected '~form
+                                  :actual (list '~'not (cons '~pred values#))}))
+       result#)))
+
+(defn assert-any
+  "Returns generic assertion code for any test, including macros, host method
+  calls, or isolated symbols."
+  [msg form]
+  `(let [value# ~form]
+     (if value#
+       (clojure.test/do-report {:type :pass :message ~msg
+                                :expected '~form :actual value#})
+       (clojure.test/do-report {:type :fail :message ~msg :form '~form
+                                :expected '~form :actual value#}))
+     value#))
+
+(defmacro try-expr
+  "Used by `is` to catch unexpected exceptions. You don't call this."
+  [msg form]
+  `(try ~(assert-expr msg form)
+        (catch Throwable t#
+          (clojure.test/do-report {:type :error :message ~msg :form '~form
+                                   :expected '~form
+                                   :actual (clojure.test/err-text t#)}))))
 
 ;; The common pure predicates whose args `is` evaluates so a failure shows the
 ;; actual values — (is (= expected got)) prints `got`, not just the form. A macro
@@ -227,21 +290,45 @@
   []
   (str/join " " (reverse *testing-contexts*)))
 
+(defn testing-vars-str
+  "Returns a string representation of the current test: the names in
+  *testing-vars* as a list, then the source file and line of the assertion."
+  [m]
+  (str (reverse (map (fn [v] (:name (meta v))) *testing-vars*))
+       " (" (:file m) ":" (:line m) ")"))
+
 (defmacro deftest [name & body]
-  `(do
-     (defn ~name [] ~@body)
-     ;; the var carries :test metadata like clojure.test's deftest, so tooling
-     ;; that discovers tests by scanning var meta finds it.
-     (alter-meta! (var ~name) assoc :test ~name)
-     (swap! clojure.test/registry conj {:name '~name
-                                        :ns (clojure.core/ns-name clojure.core/*ns*)
-                                        :fn ~name})
-     (var ~name)))
+  (when *load-tests*
+    `(do
+       (defn ~name [] ~@body)
+       ;; the var carries :test metadata like clojure.test's deftest, so tooling
+       ;; that discovers tests by scanning var meta finds it.
+       (alter-meta! (var ~name) assoc :test ~name)
+       (swap! clojure.test/registry conj {:name '~name
+                                          :ns (clojure.core/ns-name clojure.core/*ns*)
+                                          :fn ~name})
+       (var ~name))))
+
+(defmacro deftest-
+  "Like deftest but the var is private."
+  [name & body]
+  (when *load-tests*
+    `(doto (clojure.test/deftest ~name ~@body)
+       (alter-meta! assoc :private true))))
 
 ;; with-test attaches a test body as :test metadata on a var-defining form (which
 ;; must return the var), like clojure.test's — schema's tests wrap s/defn this way.
 (defmacro with-test [definition & body]
-  `(doto ~definition (alter-meta! assoc :test (fn [] ~@body))))
+  (if *load-tests*
+    `(doto ~definition (alter-meta! assoc :test (fn [] ~@body)))
+    definition))
+
+(defmacro set-test
+  "Sets the :test metadata of an existing var to a fn with the given body. Does
+  not change the var's value. Ignored when *load-tests* is false."
+  [name & body]
+  (when *load-tests*
+    `(alter-meta! (var ~name) assoc :test (fn [] ~@body))))
 
 ;; Template substitution (not let-binding), so argv symbols substitute inside
 ;; quote and nested forms: (are [x] (special-symbol? 'x) if def) tests 'if.
@@ -270,6 +357,17 @@
   (if (empty? fixtures)
     (body-fn)
     ((first fixtures) (fn [] (wrap-fixtures (rest fixtures) body-fn)))))
+
+(defn compose-fixtures
+  "Composes two fixture functions into one that combines their behavior."
+  [f1 f2]
+  (fn [g] (f1 (fn [] (f2 g)))))
+
+(defn join-fixtures
+  "Composes a collection of fixtures, in order. Always returns a valid fixture
+  function, even for an empty collection."
+  [fixtures]
+  (reduce compose-fixtures (fn [f] (f)) fixtures))
 
 (defn- run-one [t]
   (swap! counters update :test inc)
@@ -341,10 +439,11 @@
              :pass  (- (:pass r)  (:pass before))
              :fail  (- (:fail r)  (:fail before))
              :error (- (:error r) (:error before))}]
-      (println)
-      (println (str "Ran " (:test d) " tests. "
-                    (:pass d) " assertions passed, "
-                    (:fail d) " failures, " (:error d) " errors."))
+      (with-test-out
+        (println)
+        (println (str "Ran " (:test d) " tests. "
+                      (:pass d) " assertions passed, "
+                      (:fail d) " failures, " (:error d) " errors.")))
       d)))
 
 ;; --- var-level API (clojure.test parity) -------------------------------------
@@ -384,3 +483,59 @@
   "Run a single test var: (run-test my-test)."
   [v]
   `(clojure.test/test-var (var ~v)))
+
+(defn run-test-var
+  "Run a single test var, given the var itself."
+  [v]
+  (test-vars [v]))
+
+(defn get-possibly-unbound-var
+  "Like var-get but returns nil if the var is unbound."
+  [v]
+  (try (var-get v) (catch Throwable _ nil)))
+
+(defn function?
+  "True when x is a function, or a symbol resolving to one (not a macro)."
+  [x]
+  (if (symbol? x)
+    (when-let [v (resolve x)]
+      (when-let [value (get-possibly-unbound-var v)]
+        (and (fn? value) (not (:macro (meta v))))))
+    (fn? x)))
+
+(defn successful?
+  "True when the test summary reports no failures and no errors."
+  [summary]
+  (and (zero? (:fail summary 0)) (zero? (:error summary 0))))
+
+(defn test-all-vars
+  "Calls test-vars on every var interned in the namespace, with fixtures."
+  [n]
+  (test-vars (vals (ns-interns (if (symbol? n) n (ns-name n))))))
+
+(defn test-ns
+  "If the namespace defines test-ns-hook, calls that; otherwise tests every var in
+  it. Returns this call's summary counts.
+
+  Unlike the reference this does not bind *report-counters* to a fresh ref —
+  jolt's counters live in one atom and the summary is a before/after delta — so a
+  reporter that pokes at *report-counters* sees the cumulative atom rather than a
+  per-namespace ref."
+  [n]
+  (let [before @counters
+        ns-sym (if (symbol? n) n (ns-name n))]
+    (if-let [hook (find-var (symbol (str ns-sym) "test-ns-hook"))]
+      ((var-get hook))
+      (test-all-vars ns-sym))
+    (let [r @counters]
+      {:type :summary
+       :test  (- (:test r)  (:test before))
+       :pass  (- (:pass r)  (:pass before))
+       :fail  (- (:fail r)  (:fail before))
+       :error (- (:error r) (:error before))})))
+
+(defn run-all-tests
+  "Runs the tests in every loaded namespace, or in those whose name matches re."
+  ([] (apply run-tests (map ns-name (all-ns))))
+  ([re] (apply run-tests (filter (fn [n] (re-matches re (name n)))
+                                 (map ns-name (all-ns))))))
