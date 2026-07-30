@@ -4348,6 +4348,13 @@
   {:suite "string-model / codepoint strings" :label "count of astral string" :expected "1" :actual "(count \"😀\")" :portability :common}
   {:suite "string-model / codepoint strings" :label "seq counts codepoints" :expected "2" :actual "(count (seq \"😀x\"))" :portability :common}
   {:suite "string-model / codepoint strings" :label "subs across astral boundary" :expected "\"😀\"" :actual "(subs \"a😀b\" 1 2)" :portability :common}
+  ;; .charAt yields the whole codepoint, so an astral character comes back as one
+  ;; char above 0xFFFF. (char that) then throws — correctly, and the same way the
+  ;; JVM's char does — where on the JVM .charAt would have handed back a surrogate
+  ;; that fits. Any escaper written as (char (int (.charAt s i))) hits this;
+  ;; data.json's does.
+  {:suite "string-model / codepoint strings" :label "charAt of an astral character is the codepoint" :expected "[128512 1]" :actual "[(int (.charAt \"😀\" 0)) (.length \"😀\")]" :portability :jvm}
+  {:suite "string-model / codepoint strings" :label "char of it is out of range, as on the JVM" :expected "\"IllegalArgumentException\"" :actual "(try (char (int (.charAt \"😀\" 0))) (catch Exception e (.getSimpleName (class e))))" :portability :jvm}
   {:suite "concurrency-model / compare-and-set!" :label "value equality where JVM uses identity" :expected "true" :actual "(compare-and-set! (atom [1]) [1] [2])" :portability :common}
   {:suite "reader-model / read-eval" :label "#= is inert data" :expected "false" :actual "(= 3 (read-string \"#=(+ 1 2)\"))" :portability :common}
   {:suite "reader-model / nested fn literals" :label "nested #() reads" :expected "true" :actual "(string? (str (read-string \"#(#(inc %))\")))" :portability :common}

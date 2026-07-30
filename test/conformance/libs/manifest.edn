@@ -155,8 +155,15 @@
   {:name "data.json"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   :deps ["~time/src" "@spec.alpha/src/main/clojure"]
-   :expect {:tests 244 :pass 316 :fail 3 :error 5}}
+   ;; json-gen-test round-trips through stest/check, which generates via test.check
+   :deps ["~time/src" "@spec.alpha/src/main/clojure" "@test.check/src/main/clojure"]
+   :timeout 900
+   ;; The residue is one case in each of the two APIs: an astral character. jolt
+   ;; strings are codepoint-indexed, so .charAt hands data.json's escaper a value
+   ;; above 0xFFFF where the JVM hands it a surrogate — the escape comes out
+   ;; \u1f603 rather than the \ud83d\ude03 pair, and the unescaped path throws
+   ;; out of (char cp). :string-model, see known-divergences.edn.
+   :expect {:tests 244 :pass 320 :fail 2 :error 2}}
 
   {:name "data.zip"
    :paths ["src/main/clojure" "src/test/clojure"]

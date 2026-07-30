@@ -279,6 +279,8 @@
    {:suite "string-model / codepoint strings", :label "count of astral string", :category :string-model}
    {:suite "string-model / codepoint strings", :label "seq counts codepoints", :category :string-model}
    {:suite "string-model / codepoint strings", :label "subs across astral boundary", :category :string-model}
+   {:suite "string-model / codepoint strings", :label "charAt of an astral character is the codepoint", :category :string-model}
+   {:suite "string-model / codepoint strings", :label "char of it is out of range, as on the JVM", :category :string-model}
    {:suite "concurrency-model / compare-and-set!", :label "value equality where JVM uses identity", :category :concurrency-model}
    {:suite "reader-model / read-eval", :label "#= is inert data", :category :reader-model}
    {:suite "permissive / empty MapEntry", :label "empty of a map entry", :category :permissive}]}

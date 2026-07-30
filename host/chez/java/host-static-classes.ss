@@ -289,8 +289,11 @@
 ;; for a host writer target it falls back to that writer's own write.
 (define (pw-forward target s)
   (cond
+    ;; through port-writer-port, not the raw slot: a port-writer holds the SYMBOL
+    ;; 'out / 'err and resolves it per call, so a (PrintWriter. *out*) built inside
+    ;; a with-out-str writes to the capture rather than past it.
     ((and (jhost? target) (string=? (jhost-tag target) "port-writer"))
-     (display s (vector-ref (jhost-state target) 0)))
+     (display s (port-writer-port target)))
     ((and (jhost? target) (memv #t (list (string=? (jhost-tag target) "writer")
                                          (string=? (jhost-tag target) "string-builder"))))
      (sb-set! target (string-append (sb-str target) s)))
