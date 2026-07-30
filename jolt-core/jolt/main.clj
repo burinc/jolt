@@ -123,10 +123,16 @@
 ;; (stdin), an existing file, or a *.jolt/*.clj/*.cljc/*.cljs path. .jolt is the
 ;; same language as .clj and only marks a file as using jolt-specific interop
 ;; rather than portable Clojure.
+;; A directory is never a file to run, however much it looks like one: `test` is a
+;; :tasks entry AND a directory in every jolt project, and file-exists? answers #t
+;; for a directory, so `jolt test` used to be dispatched here and die in
+;; load-file's decoder ("failed on #<binary input port test>: is a directory")
+;; rather than running the task.
 (defn- run-file-arg? [x]
-  (or (= "-" x)
-      (some #(str/ends-with? x %) [".jolt" ".clj" ".cljc" ".cljs"])
-      (jolt.host/file-exists? x)))
+  (and (not (jolt.host/directory? x))
+       (or (= "-" x)
+           (some #(str/ends-with? x %) [".jolt" ".clj" ".cljc" ".cljs"])
+           (jolt.host/file-exists? x))))
 
 ;; run [-m NS args… | FILE]  — FILE may be "-" (stdin)
 (defn- cmd-run [more]

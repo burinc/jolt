@@ -270,10 +270,32 @@ jobs:
           fi
           ls -la dist
 
-      - name: Upload to the GitHub Release
+      # The linux binary is what the fleet gates below run against, so hand it over
+      # as a workflow artifact. A workflow_dispatch dry run creates no release, so
+      # the artifact — not `gh release download` — is the only way to reach it.
+      # `**` and the find-based unpack below, not a fixed glob: on a
+      # workflow_dispatch dry run GITHUB_REF_NAME is the BRANCH, so a branch with a
+      # slash in it ("fix/foo") nests the tarball a directory deeper. Real tags never
+      # do, but the dry run is how this gate gets tested before a release depends on
+      # it, so it has to survive one.
+      - name: Upload the linux binary for the fleet gates
+        if: matrix.target == 'x86_64-linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jolt-x86_64-linux
+          path: dist/**/*.tar.gz
+          retention-days: 1
+
+      # DRAFT, so the release is not public until the fleet gates pass: `publish`
+      # below flips it. A draft is invisible to the install script and to Homebrew
+      # (both read the latest PUBLISHED release), so a fleet regression leaves a tag
+      # with assets attached for inspection and nothing anyone can install —
+      # i.e. the release aborts. Each matrix row creates-or-updates the same draft.
+      - name: Upload to the GitHub Release (draft)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
@@ -281,13 +303,204 @@ jobs:
             dist/*.zip.sha256
           fail_on_unmatched_files: false
 
+  # --- fleet gates: the jolt-lang libraries and examples, on the tag's own binary.
+  #
+  # These run ONLY here (release.yml is `on: push: tags: v*` + workflow_dispatch), so
+  # a regular commit or PR pays nothing for them — tests.yml stays the per-commit
+  # gate. The cost lands once per release, where it buys the thing the jolt-repo gate
+  # structurally cannot see: whether a language change breaks real code that a user
+  # would `git/sha`-pin. v0.5.13 is the case in point — making byte[] elements signed
+  # was correct and fully green in-repo, and truncated every HTTP response body in
+  # jolt-lang/http-client, because its ByteArrayInputStream.read() returned the raw
+  # (now negative) element and every drain loop read that as EOF.
+  #
+  # Each row mirrors the library's OWN tests.yml — same apt packages, same
+  # `JOLT_PWD="$PWD" jolt -M:test` — so a red row means the same thing here as in
+  # that repo. ci/fleet-smoke.sh is the shared entrypoint (also runnable by hand
+  # when a row goes red).
+  #
+  # Not covered here, deliberately:
+  #   clojure/tools.cli   the jolt harness for it is local-only; nothing upstream to
+  #                       check out.
+  #   db's postgres half  its own job below, which needs a service container.
+  libraries:
+    name: library ${{ matrix.repo }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - repo: jolt-crypto         # AES/HMAC/SHA over OpenSSL — all byte[] work
+            apt: libssl3
+          - repo: http-client         # TLS + gzip + HTTP over jolt.ffi
+            apt: libssl3
+          - repo: ring-chez-adapter   # BSD sockets over jolt.ffi
+            apt: libssl3 curl
+          - repo: db                  # sqlite over jolt.ffi (postgres: libraries-db)
+            apt: libsqlite3-0
+          - repo: transit-jolt
+            apt: ''
+          - repo: xml
+            apt: libxml2
+          - repo: yaml
+            apt: ''
+          - repo: time                # needs a non-English locale on the OS
+            apt: locales
+          - repo: logging
+            apt: ''
+          - repo: nrepl
+            apt: ''
+          - repo: router
+            apt: ''
+          - repo: glimmer             # GTK4 widget tree; the suite is headless
+            apt: libgtk-4-1
+          - repo: glimmer-gl          # + GL geometry/matrix
+            apt: libgtk-4-1 libgl1
+    steps:
+      - name: Check out jolt (for ci/fleet-smoke.sh)
+        uses: actions/checkout@v5
+        with:
+          path: jolt
+      - name: Check out jolt-lang/${{ matrix.repo }}
+        uses: actions/checkout@v5
+        with:
+          repository: jolt-lang/${{ matrix.repo }}
+          path: lib
+      - uses: actions/download-artifact@v4
+        with:
+          name: jolt-x86_64-linux
+      - name: Unpack the jolt under test
+        run: |
+          set -eu
+          tgz="$(find . -name '*x86_64-linux.tar.gz' -print -quit)"
+          [ -n "$tgz" ] || { echo "no linux tarball in the artifact"; exit 1; }
+          tar -xzf "$tgz" -C .
+          bin="$(find . -type f -name jolt -perm -u+x -print -quit)"
+          [ -n "$bin" ] || { echo "no jolt binary in $tgz"; exit 1; }
+          mv "$bin" ./jolt-bin
+          ./jolt-bin --version
+      - name: Install the library's system deps
+        run: |
+          sudo apt-get update
+          # liblz4/zlib/tinfo are jolt's own dynamic deps; the rest is per-library.
+          sudo apt-get install -y liblz4-1 zlib1g libtinfo6 ${{ matrix.apt }}
+      # jolt's DateTimeFormatter localizes month/day names through libc strftime, so
+      # a non-English locale has to exist on the OS (the JVM bundles its own; jolt,
+      # like babashka, does not). tick's suite formats a French month name.
+      - name: Generate the fr_FR locale (time)
+        if: matrix.repo == 'time'
+        run: sudo locale-gen fr_FR.UTF-8 && sudo update-locale
+      - name: Test
+        run: jolt/ci/fleet-smoke.sh lib ./jolt-bin
+
+  # db's postgres backend needs a live server, and `services` is job-level — so it
+  # gets its own job rather than starting a postgres container for all 13 rows above.
+  # Its suite skips the postgres section when JOLT_TEST_PG_URI is unset, which is why
+  # the matrix row above still covers the sqlite half.
+  libraries-db:
+    name: library db (postgres)
+    needs: build
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: jolt_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: jolt
+      - uses: actions/checkout@v5
+        with:
+          repository: jolt-lang/db
+          path: lib
+      - uses: actions/download-artifact@v4
+        with:
+          name: jolt-x86_64-linux
+      - name: Unpack the jolt under test
+        run: |
+          set -eu
+          tgz="$(find . -name '*x86_64-linux.tar.gz' -print -quit)"
+          tar -xzf "$tgz" -C .
+          mv "$(find . -type f -name jolt -perm -u+x -print -quit)" ./jolt-bin
+          ./jolt-bin --version
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y liblz4-1 zlib1g libtinfo6 libpq5 libsqlite3-0
+      - name: Test
+        env:
+          JOLT_TEST_PG_URI: postgres://postgres:postgres@127.0.0.1:5432/jolt_test
+        run: jolt/ci/fleet-smoke.sh lib ./jolt-bin
+
+  # Every example app BUILDS with this binary, and the ones with a headless test task
+  # run it. The build is the valuable half: `jolt build` is the whole compiler
+  # pipeline (analyze, tree-shake, direct-link, cc-link) over real third-party
+  # dependency trees — ring/reitit/Selmer/honeysql/integrant/tick — which is far more
+  # compiler surface than the in-repo build smokes reach. See ci/examples-smoke.sh
+  # for the per-app manifest and why each build-only app is build-only.
+  examples:
+    name: examples
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: jolt
+      - uses: actions/checkout@v5
+        with:
+          repository: jolt-lang/examples
+          path: examples
+      - uses: actions/download-artifact@v4
+        with:
+          name: jolt-x86_64-linux
+      - name: Unpack the jolt under test
+        run: |
+          set -eu
+          tgz="$(find . -name '*x86_64-linux.tar.gz' -print -quit)"
+          tar -xzf "$tgz" -C .
+          mv "$(find . -type f -name jolt -perm -u+x -print -quit)" ./jolt-bin
+          ./jolt-bin --version
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          # jolt's own deps, plus every native library any example declares: the GUI
+          # apps are built (not run), but jolt loads a declared :jolt/native at
+          # require time, so the .so has to be present to compile them.
+          sudo apt-get install -y liblz4-1 zlib1g libtinfo6 build-essential \
+            libssl3 libsqlite3-0 libgtk-4-1 libgl1
+      - name: Build every example, run the test tasks
+        run: jolt/ci/examples-smoke.sh examples ./jolt-bin
+
+  # Flip the draft release public. Nothing downstream (install script, Homebrew tap)
+  # sees the release until this runs, so a red fleet gate aborts the release with the
+  # tag and assets intact for inspection.
+  publish:
+    name: publish the release
+    needs: [build, libraries, libraries-db, examples]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Un-draft ${{ github.ref_name }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "${GITHUB_REF_NAME}" --draft=false --latest
+
   # Bump the Homebrew tap (jolt-lang/homebrew-jolt) to this tag: rewrite each
   # platform's url + sha256 in Formula/jolt.rb from the release's .sha256 assets.
   # Needs a HOMEBREW_TAP_TOKEN secret — a PAT with contents:write on the tap repo
   # (the default GITHUB_TOKEN can't push to another repo). Skipped if unset.
+  # After `publish`, so the tap never points at a release the fleet gates rejected.
   homebrew:
     name: update homebrew tap
-    needs: build
+    needs: publish
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
