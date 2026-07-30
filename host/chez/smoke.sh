@@ -552,7 +552,18 @@ fi
 
 # jolt.process — the stdlib sub-process API against real programs (capture, pipes,
 # stdin, :dir/:env, exit codes, signals). The file self-checks and prints a marker.
-process_out="$($jolt run test/chez/process-test.clj 2>/dev/null)"
+#
+# Captured to a FILE, not with $(…), unlike every other case here: this is the one
+# case that spawns child processes, and a command substitution does not return until
+# every writer has closed the pipe — not just until the command exits. A child that
+# inherits that pipe and outlives jolt (the destroy/signal case leaves a `sleep`
+# behind if destroy does not take) therefore blocks the read forever, which is how
+# this case hung the gate for hours with nothing to show for it. Redirecting to a
+# file gives the children a file descriptor with no reader to wait on.
+process_log="$(mktemp)"
+$jolt run test/chez/process-test.clj >"$process_log" 2>/dev/null || true
+process_out="$(cat "$process_log")"
+rm -f "$process_log"
 if printf '%s' "$process_out" | grep -q 'PROCESS-TEST OK'; then
   pass=$((pass + 1))
 else
