@@ -24,7 +24,11 @@
          (lambda (self . rest)
            (let ((port (in-stream-port self)))
              (if (null? rest)
+                 ;; InputStream.read() returns the byte as an UNSIGNED int 0..255
+                 ;; (-1 at EOF) — the one place a byte is not signed, because the
+                 ;; return has to distinguish 0xff from end-of-stream.
                  (let ((b (get-u8 port))) (if (eof-object? b) -1 (->num b)))
+                 ;; read(buf …) fills a byte-array, whose elements ARE signed.
                  (let* ((buf (car rest))
                         (vec (jolt-array-vec buf))
                         (off (if (>= (length rest) 3) (jnum->exact (cadr rest)) 0))
@@ -34,7 +38,7 @@
                          (let ((b (get-u8 port)))
                            (if (eof-object? b)
                                (if (= i 0) -1 (->num i))
-                               (begin (vector-set! vec (+ off i) b) (loop (+ i 1))))))))))))
+                               (begin (vector-set! vec (+ off i) (na-u8->byte b)) (loop (+ i 1))))))))))))
    (cons "readAllBytes" (lambda (self) (let ((bv (get-bytevector-all (in-stream-port self))))
                                          (na-byte-array (if (eof-object? bv) (make-bytevector 0) bv)))))
    (cons "skip" (lambda (self n) (let ((bv (get-bytevector-n (in-stream-port self) (jnum->exact n))))
@@ -275,6 +279,10 @@
   (cond ((in-stream? input) (let ((bv (get-bytevector-all (in-stream-port input)))) (if (eof-object? bv) (make-bytevector 0) bv)))
         ((bytevector? input) input)
         ((and (jolt-array? input) (eq? (jolt-array-kind input) 'byte)) (na-bytearray->bv input))
+        ;; a File source is a BYTE source for every byte destination, not just for
+        ;; another file: (io/copy f baos) used to fall through to input-text, slurp
+        ;; the file as UTF-8, and replace every non-UTF-8 byte with U+FFFD.
+        ((jfile? input) (read-file-bytes (path-of input)))
         ;; a byte-input-stream shim (host tagged-table, :jolt/input-stream — e.g.
         ;; http-client's ByteArrayInputStream): drain it byte-exact, like slurp.
         ((and (htable? input) (jolt-truthy? (jolt-ref-get input (keyword "jolt" "input-stream"))))
@@ -295,10 +303,8 @@
     ((and (jhost? output) (member (jhost-tag output) '("writer" "file-writer" "port-writer" "print-writer")))
      (record-method-dispatch output "write" (list->cseq (list (input-text input)))))
     ((or (jfile? output) (string? output))
-     (let ((bv (cond
-                 ((jfile? input) (read-file-bytes (path-of input)))
-                 ((not (string? input)) (input-bytes input))
-                 (else #f))))
+     ;; a string INPUT is its characters (io/copy's text source), never a filename
+     (let ((bv (and (not (string? input)) (input-bytes input))))
        (if bv
            (with-port (open-file-output-port (path-of output) (file-options no-fail) (buffer-mode block))
              (lambda (port) (put-bytevector port bv)))
@@ -309,8 +315,7 @@
     ((and (htable? output) (jolt-truthy? (jolt-ref-get output (keyword "jolt" "output-stream"))))
      (let ((bv (input-bytes input)))
        (record-method-dispatch output "write"
-         (list->cseq (list (if bv (make-jolt-array (list->vector (bytevector->u8-list bv)) 'byte)
-                               (input-text input)))))))
+         (list->cseq (list (if bv (na-bv->bytearray bv) (input-text input)))))))
     (else (throw-jvm (quote IllegalArgumentException) "io/copy: unsupported output type")))
   jolt-nil)
 (def-var! "clojure.java.io" "copy" jio-copy)

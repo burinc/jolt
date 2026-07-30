@@ -807,11 +807,15 @@
                   (set! out (cons (bitwise-and (bitwise-arithmetic-shift-right acc bits) 255) out))))
               (string->list str))
     (u8-list->bytevector (reverse out))))
+;; .encode / .decode return byte[] on the JVM, so they return a jolt byte-array here
+;; (signed elements, seqable, bytes?) — they used to hand back a raw Chez bytevector,
+;; which no collection dispatcher knows, so (vec (.decode dec s)) threw "Don't know
+;; how to create ISeq from" and every caller had to route it through String. first.
 (register-host-methods! "b64-encoder"
-  (list (cons "encode" (lambda (self bs) (string->utf8 (b64-encode bs))))
+  (list (cons "encode" (lambda (self bs) (na-bv->bytearray (string->utf8 (b64-encode bs)))))
         (cons "encodeToString" (lambda (self bs) (b64-encode bs)))))
 (register-host-methods! "b64-decoder"
-  (list (cons "decode" (lambda (self s) (b64-decode s)))))
+  (list (cons "decode" (lambda (self s) (na-bv->bytearray (b64-decode s))))))
 (register-class-statics! "Base64"
   (list (cons "getEncoder" (lambda () (make-jhost "b64-encoder" '())))
         (cons "getDecoder" (lambda () (make-jhost "b64-decoder" '())))))
@@ -1180,7 +1184,8 @@
                                 ((or (jolt-nil? a) (jolt-nil? b)) #f)
                                 (else (equal? (jolt-array-vec a) (jolt-array-vec b))))))
          (cons "fill" (lambda (a v)
-                        (let* ((bv (jolt-array-vec a)) (n (ja-len bv)))
+                        (let* ((bv (jolt-array-vec a)) (n (ja-len bv))
+                               (v (na-elem-of (jolt-array-kind a) v)))
                           (do ((i 0 (fx+ i 1))) ((fx=? i n) jolt-nil) (ja-set! bv i v)))))
          (cons "copyOf" (lambda (a n)
                           (let* ((src (jolt-array-vec a)) (len (jnum->exact n)) (kind (jolt-array-kind a))
@@ -1196,7 +1201,18 @@
                                    (ja-set! out i (ja-ref src (+ f i))))
                                  (make-jolt-array out kind))))
          (cons "sort" arrays-sort)
-         (cons "toString" (lambda (a) (jolt-pr-str (apply jolt-vector (ja->list (jolt-array-vec a)))))))))
+         ;; Arrays.toString is "[a, b]" — comma-separated element toString, "null"
+         ;; for a nil array. It used to print the elements as a jolt VECTOR, which
+         ;; renders "[a b]" (no commas) and pr-quotes a string element.
+         (cons "toString" (lambda (a)
+                            (if (jolt-nil? a) "null"
+                                (let ((parts (map (lambda (x) (if (jolt-nil? x) "null" (jolt-str-render-one x)))
+                                                  (ja->list (jolt-array-vec a)))))
+                                  (string-append
+                                    "[" (if (null? parts) ""
+                                            (fold-left (lambda (acc s) (string-append acc ", " s))
+                                                       (car parts) (cdr parts)))
+                                    "]"))))))))
   (register-class-statics! "Arrays" arrays-statics)
   (register-class-statics! "java.util.Arrays" arrays-statics))
 
@@ -1239,11 +1255,21 @@
   '("Random" "java.util.Random"))
 (register-host-methods! "random"
   (list
+    ;; nextBytes draws one nextInt() per FOUR bytes, taking them low-to-high — it
+    ;; does not draw 8 bits per byte, which consumed the LCG four times as fast and
+    ;; produced a different stream from the JVM's for the same seed. Elements are
+    ;; signed bytes (the JVM's (byte)rnd cast).
     (cons "nextBytes" (lambda (self ba)
-                        (let ((v (jolt-array-vec ba))
-                              (st (jhost-state self)))
-                          (do ((i 0 (fx+ i 1))) ((fx=? i (vector-length v)))
-                            (vector-set! v i (random-next 8 st)))
+                        (let* ((v (jolt-array-vec ba)) (n (vector-length v))
+                               (st (jhost-state self)))
+                          (let loop ((i 0))
+                            (when (fx<? i n)
+                              (let inner ((rnd (random-u32->s32 (random-next 32 st)))
+                                          (k (min (fx- n i) 4)) (i i))
+                                (if (fx=? k 0) (loop i)
+                                    (begin (vector-set! v i (na-byte-of (bitwise-and rnd #xff)))
+                                           (inner (bitwise-arithmetic-shift-right rnd 8)
+                                                  (fx- k 1) (fx+ i 1)))))))
                           jolt-nil)))
     (cons "nextInt" (lambda (self . a)
                       (let ((st (jhost-state self)))

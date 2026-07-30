@@ -72,9 +72,22 @@
       (make-jolt-array (na-make-backing (na-idx a) kind (if (pair? rest) (car rest) init)) kind)
       (na-from-seq a kind)))
 
-;; numeric tower: array element defaults / masked bytes / count are
+;; numeric tower: array element defaults / narrowed bytes / count are
 ;; EXACT integers (= JVM byte/short/int), matching exact integer literals.
-(define (na-byte-of v) (bitwise-and (exact (floor v)) #xff))
+
+;; A byte-array element is a SIGNED byte, -128..127, like the JVM's byte[]: a value
+;; above 127 reads negative, so (neg? b), a (bit-and b 0xff) mask, and arithmetic
+;; over a high byte all behave as they do on the JVM. na-byte-of is the ONE place a
+;; value entering a byte array is narrowed — Byte.byteValue() semantics: truncate
+;; toward zero (the JVM's d2i, not floor — (byte-array [-1.9]) is -1, not -2), take
+;; the low 8 bits, fold the sign bit. na-bytearray->bv masks back to 0..255 at the
+;; raw-byte seam, so the two carriers round-trip byte-exactly.
+(define (na-u8->byte b) (if (fx<? b 128) b (fx- b 256)))
+(define (na-byte-of v) (na-u8->byte (bitwise-and (exact (truncate v)) #xff)))
+;; Narrow a value being STORED into an array to its element kind. Only 'byte has a
+;; range jolt must maintain (the u8 <-> s8 bridge above depends on it); the other
+;; kinds hold whatever integer/flonum they are given, as they always have.
+(define (na-elem-of kind v) (if (eq? kind 'byte) (na-byte-of v) v))
 
 ;; --- constructors -----------------------------------------------------------
 (define (na-object-array a . rest)  (na-num-array a rest jolt-nil 'object))
@@ -94,16 +107,24 @@
     (else (make-jolt-array
            (list->vector (map (lambda (c) (if (char? c) c (integer->char (exact (truncate c)))))
                               (seq->list (jolt-seq a)))) 'char))))
+;; Chez bytevector (unsigned 0..255) -> jolt byte-array (signed -128..127). The
+;; inbound half of the raw-bytes seam: every producer of a byte-array from raw bytes
+;; — .getBytes, stream reads, Files/readAllBytes, Base64, FFI — funnels through here.
+(define (na-bv->bytearray bv)
+  (let* ((n (bytevector-length bv)) (v (make-vector n 0)))
+    (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (na-u8->byte (bytevector-u8-ref bv i))))
+    (make-jolt-array v 'byte)))
 ;; (byte-array n [init]) | (byte-array coll). Also coerces the host's OTHER byte
-;; carrier — a Chez bytevector (what String/.getBytes produce) — and a string's
+;; carrier — a Chez bytevector (what the charset encoders produce) — and a string's
 ;; UTF-8 bytes, so bytevector and byte-array interconvert across interop seams.
 (define (na-byte-array a . rest)
   (cond
     ((number? a) (make-jolt-array (make-vector (exact (na-idx a)) (na-byte-of (if (pair? rest) (car rest) 0))) 'byte))
-    ((bytevector? a) (make-jolt-array (list->vector (bytevector->u8-list a)) 'byte))
-    ((string? a) (make-jolt-array (list->vector (bytevector->u8-list (string->utf8 a))) 'byte))
+    ((bytevector? a) (na-bv->bytearray a))
+    ((string? a) (na-bv->bytearray (string->utf8 a)))
     (else (make-jolt-array (list->vector (map na-byte-of (seq->list (jolt-seq a)))) 'byte))))
-;; jolt byte-array -> Chez bytevector (for String decode / utf8->string).
+;; jolt byte-array -> Chez bytevector (for String decode / utf8->string). The
+;; outbound half: the #xff mask folds a signed element back to its raw byte.
 (define (na-bytearray->bv arr)
   (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (bv (make-bytevector n)))
     (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (bitwise-and (exact (vector-ref v i)) #xff)))
@@ -118,7 +139,13 @@
       (na-from-seq arr 'object)))
 
 ;; --- typed aset (return the stored value) -----------------------------------
-(define (na-aset! arr i v) (ja-set! (jolt-array-vec arr) (exact (na-idx i)) v) v)
+;; Through na-array-set! (below), so a byte array narrows what it is handed rather
+;; than storing it raw. The JVM would reject (aset bytes 0 200) outright — Array.set
+;; can see that 200 is an Integer, not a Byte — but jolt models every integer as one
+;; type, so it cannot tell (byte -1) from 255. Narrowing keeps the array's -128..127
+;; invariant intact (aget / seq / (String. bytes) all agree) where a raw store
+;; would break it.
+(define (na-aset! arr i v) (na-array-set! arr i v))
 (define (na-aset-int arr i v)     (na-aset! arr i v))
 (define (na-aset-long arr i v)    (na-aset! arr i v))
 (define (na-aset-short arr i v)   (na-aset! arr i v))
@@ -127,9 +154,9 @@
 (define (na-aset-char arr i v)    (na-aset! arr i v))
 (define (na-aset-boolean arr i v) (na-aset! arr i v))
 (define (na-aset-byte arr i v)
-  (let ((bv (jolt-array-vec arr)) (j (exact (na-idx i))))
+  (let ((bv (jolt-array-vec arr)) (j (exact (na-idx i))) (b (na-byte-of v)))
     (ja-check bv j)
-    (vector-set! bv j (na-byte-of v)) v))
+    (vector-set! bv j b) b))
 
 ;; --- coercions (identity on arrays; byte/short are masked scalar casts) ------
 (define (na-bytes x) (if (and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)) x (na-byte-array x)))
@@ -179,15 +206,22 @@
 ;; count/nth/seq/get above are NATIVE-OPS (inlined at call sites), so aget/alength/
 ;; array-seq/vec already use the set!-extended globals; ref-put! is a host var
 ;; (var-deref'd), so re-assert its cell to the array-aware closure.
+;; THE array write seam: the aset overlay, jolt-aset3, and any jolt.host/ref-put!
+;; on an array all land here. Narrows the value to the element kind (na-elem-of) and
+;; answers what was actually stored, so aset's return agrees with a following aget.
+(define (na-array-set! a k v)
+  (let ((sv (na-elem-of (jolt-array-kind a) v)))
+    (ja-set! (jolt-array-vec a) (exact (na-idx k)) sv) sv))
 (define %na-ref-put! jolt-ref-put!)
 (set! jolt-ref-put!
   (lambda (t k v)
-    (if (jolt-array? t) (begin (ja-set! (jolt-array-vec t) (exact (na-idx k)) v) t)
+    (if (jolt-array? t) (begin (na-array-set! t k v) t)
         (%na-ref-put! t k v))))
 (def-var! "jolt.host" "ref-put!" jolt-ref-put!)
 ;; native-op target for the 1-dim (aset arr i v): write through the array-aware
-;; ref-put! and return the stored value (JVM aset returns the val, not the array).
-(define (jolt-aset3 a i v) (jolt-ref-put! a i v) v)
+;; seam and return the stored value (JVM aset returns the val, not the array).
+(define (jolt-aset3 a i v)
+  (if (jolt-array? a) (na-array-set! a i v) (begin (jolt-ref-put! a i v) v)))
 ;; unboxed read target for (aget ^doubles a i): direct flvector-ref on the backing,
 ;; skipping jolt-nth's case-lambda + jolt-array?/flvector? dispatch. Emitted only
 ;; when jolt.passes.numeric proved the array is a ^doubles/^floats (flvector) param.

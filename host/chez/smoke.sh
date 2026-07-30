@@ -10,6 +10,37 @@ cd "$root"
 # script-mode case below keeps the source-load path covered).
 jolt="${JOLT_BIN:-bin/jolt}"
 
+# Every case here is a sub-second jolt invocation, so a case that does not finish
+# has hung — and a hung case is invisible: `make -Oline` shows nothing for a target
+# until it completes, so a CI gate sits silent until the 6-hour job limit with no
+# clue which case it was. Cap each invocation instead: the case then FAILS and names
+# itself. JOLT_SMOKE_TIMEOUT=0 disables the cap (for a debugger on a live case).
+#
+# --foreground matters, it is not a detail: without it GNU timeout runs the command
+# in its OWN PROCESS GROUP so it can signal the whole group. The jolt.process case
+# spawns children and asserts on destroy / alive? / a 143 SIGTERM exit, all of which
+# read the process group — under a plain `timeout` that case dies with no output on
+# Linux while still passing on macOS. --foreground leaves the group alone.
+#
+# coreutils' timeout is not on a stock macOS, so fall back to running uncapped rather
+# than skipping the case or hard-failing the gate on a missing tool.
+smoke_timeout="${JOLT_SMOKE_TIMEOUT:-120}"
+if [ "$smoke_timeout" = "0" ]; then
+  jolt_timeout=""
+else
+  for t in timeout gtimeout; do
+    if command -v "$t" >/dev/null 2>&1 && "$t" --foreground 1 true >/dev/null 2>&1; then
+      jolt_timeout="$t --foreground $smoke_timeout"
+      break
+    fi
+  done
+  if [ -z "${jolt_timeout:-}" ]; then
+    jolt_timeout=""
+    echo "  note: no timeout(1) with --foreground — a hung case will block instead of failing"
+  fi
+fi
+jolt="$jolt_timeout $jolt"
+
 fails=0
 check() {
   got="$($jolt -e "$1" 2>/dev/null | tail -1)"
@@ -521,14 +552,38 @@ fi
 
 # jolt.process — the stdlib sub-process API against real programs (capture, pipes,
 # stdin, :dir/:env, exit codes, signals). The file self-checks and prints a marker.
-process_out="$($jolt run test/chez/process-test.clj 2>/dev/null)"
+#
+# Captured to a FILE, not with $(…), unlike every other case here: this is the one
+# case that spawns child processes, and a command substitution does not return until
+# every writer has closed the pipe — not just until the command exits. A child that
+# inherits that pipe and outlives jolt (the destroy/signal case leaves a `sleep`
+# behind if destroy does not take) therefore blocks the read forever, which is how
+# this case hung the gate for hours with nothing to show for it. Redirecting to a
+# file gives the children a file descriptor with no reader to wait on.
+# stderr goes INTO the log, not to /dev/null: if the run dies before it can print a
+# single check, "FAIL: jolt.process" with nothing under it is all the gate says, and
+# the reason — the exception — is exactly what was thrown away.
+process_log="$(mktemp)"
+$jolt run test/chez/process-test.clj >"$process_log" 2>&1 || true
+process_out="$(cat "$process_log")"
 if printf '%s' "$process_out" | grep -q 'PROCESS-TEST OK'; then
   pass=$((pass + 1))
 else
   echo "  FAIL: jolt.process"
-  printf '%s\n' "$process_out" | grep FAIL | head -5 | sed 's/^/    /'
+  # the case's own FAILs if it got that far, else the last of whatever it did say —
+  # an exception, or the "  .. <label>" the test prints before each check, whose LAST
+  # line then names the check that blocked. Never nothing.
+  if printf '%s\n' "$process_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$process_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$process_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$process_out" | tail -6 | sed 's/^/    /'
+  else
+    echo "    (no output at all — died or was killed before its first check)"
+  fi
   fails=$((fails + 1))
 fi
+rm -f "$process_log"
 
 # jolt.parser — the general parser-combinator core, running rm-hull/jasentaa's
 # own suite for the adopted pieces plus jolt's added combinators. Self-checks.

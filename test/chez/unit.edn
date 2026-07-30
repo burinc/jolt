@@ -612,6 +612,17 @@
   {:suite "bytes" :expr "(String. (byte-array [104 105]) \"UTF-8\")" :expected "\"hi\""}
   {:suite "bytes" :expr "(int (first (String. (byte-array [200]) \"ISO-8859-1\")))" :expected "200"}
   {:suite "bytes" :expr "(String. (.getBytes \"round\" \"UTF-8\") \"UTF-8\")" :expected "\"round\""}
+  ;; byte[] elements are signed (-128..127) like the JVM's; the host's OTHER byte
+  ;; carrier (a Chez bytevector, what the encoders produce) is unsigned 0..255, and
+  ;; na-byte-array / na-bytearray->bv are the only seam between them. These pin
+  ;; both directions so a high byte can't leak through unfolded (jolt-kevb).
+  {:suite "bytes" :expr "(vec (byte-array (.getBytes \"õ\" \"ISO-8859-1\")))" :expected "[-11]"}
+  {:suite "bytes" :expr "(vec (byte-array \"õ\"))" :expected "[-61 -75]"}
+  {:suite "bytes" :expr "(mapv #(bit-and % 0xff) (byte-array [255 128 127]))" :expected "[255 128 127]"}
+  {:suite "bytes" :expr "(vec (byte-array (byte-array [255 128])))" :expected "[-1 -128]"}
+  {:suite "bytes" :expr "(let [a (byte-array 2)] (aset a 0 200) (aset a 1 -1) (vec a))" :expected "[-56 -1]"}
+  {:suite "bytes" :expr "(vec (byte-array 2 200))" :expected "[-56 -56]"}
+  {:suite "bytes" :expr "(do (require 'jolt.fs) (let [p (jolt.fs/create-temp-file)] (try (do (jolt.fs/write-bytes p (byte-array [255 128 0 65])) (vec (jolt.fs/read-all-bytes p))) (finally (jolt.fs/delete-if-exists p)))))" :expected "[-1 -128 0 65]"}
   {:suite "deftype-map" :expr "(do (deftype Mp [m] clojure.lang.IPersistentMap (without [_ k] m)) [(map? (->Mp 1)) (record? (->Mp 1))])" :expected "[true false]"}
   ;; contains? routes to a set-like deftype's own `contains` (not field presence);
   ;; the plain field-presence arm is guarded to skip a type declaring contains.

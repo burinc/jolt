@@ -6,9 +6,24 @@
             [clojure.string :as str]))
 
 (def failures (atom []))
-(defn check-eq [label got want]
-  (when-not (= got want)
-    (swap! failures conj (str label ": want " (pr-str want) " got " (pr-str got)))))
+
+;; A MACRO, not a fn, so the label is announced BEFORE the expression under test runs
+;; — as a fn, `got` is evaluated at the call site and a check that blocks never
+;; reaches the announcement. Every check here spawns a real child process, so any one
+;; of them can block forever on a pipe or a wait, and this file used to print nothing
+;; until the final verdict: a hung check left an empty log with no way to tell which.
+;; (It hung the CI gate for over three hours exactly this way; jolt-pgbh.)
+;;
+;; The flush is load-bearing, not decoration: smoke.sh redirects this to a file, where
+;; output is block-buffered, so a killed process loses whatever it had not flushed —
+;; which is how "it printed nothing at all" survived even a 120s cap.
+(defmacro check-eq [label got want]
+  `(do
+     (print (str "  .. " ~label "\n"))
+     (flush)
+     (let [g# ~got w# ~want]
+       (when-not (= g# w#)
+         (swap! failures conj (str ~label ": want " (pr-str w#) " got " (pr-str g#)))))))
 
 ;; tokenize (pure)
 (check-eq "tokenize" (p/tokenize "a  b 'c d'") ["a" "b" "c d"])

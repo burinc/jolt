@@ -1681,11 +1681,12 @@
   ;; A Charset OBJECT has to reach the encoder as a charset, not as its printed
   ;; form: .getBytes rendered it to "#object[java.nio.charset.Charset]", matched
   ;; no arm, and silently encoded UTF-8. ASCII-only text and an explicit UTF-8
-  ;; request both hide that, so these assert a non-ASCII round-trip. Byte values
-  ;; are deliberately not asserted — jolt's byte arrays are unsigned where the
-  ;; JVM's are signed, which is a separate divergence.
+  ;; request both hide that, so these assert a non-ASCII round-trip — and now the
+  ;; byte VALUES too, since byte[] elements are signed like the JVM's
+  ;; (`arrays / signed byte elements`).
   {:suite "host-interop / Charset aliases" :label "getBytes/String. round-trip through a Charset object" :expected "\"sõme ßÒññÝ\"" :actual "(let [cs (java.nio.charset.Charset/forName \"ISO-8859-1\")] (String. (.getBytes \"sõme ßÒññÝ\" cs) cs))" :portability :jvm}
   {:suite "host-interop / Charset aliases" :label "a Charset object encodes one byte per char, not UTF-8" :expected "1" :actual "(alength (.getBytes \"õ\" (java.nio.charset.Charset/forName \"ISO-8859-1\")))" :portability :jvm}
+  {:suite "host-interop / Charset aliases" :label "a Charset object encodes the latin-1 byte, not the UTF-8 pair" :expected "[-11]" :actual "(vec (.getBytes \"õ\" (java.nio.charset.Charset/forName \"ISO-8859-1\")))" :portability :jvm}
   {:suite "host-interop / Charset aliases" :label "an aliased Charset object still selects its canonical encoding" :expected "1" :actual "(alength (.getBytes \"õ\" (java.nio.charset.Charset/forName \"l1\")))" :portability :jvm}
   {:suite "host-interop / Charset aliases" :label "unknown vs malformed charset names throw different exceptions" :expected "[\"java.nio.charset.UnsupportedCharsetException\" \"java.nio.charset.IllegalCharsetNameException\"]" :actual "[(try (java.nio.charset.Charset/forName \"NOPE-9\") (catch Throwable e (.getName (class e)))) (try (java.nio.charset.Charset/forName \"bad name\") (catch Throwable e (.getName (class e))))]" :portability :jvm}
   {:suite "predicates / nil & boolean" :label "nil? true" :expected "true" :actual "(nil? nil)" :portability :common}
@@ -2028,6 +2029,14 @@
   {:suite "regex / literals & predicate" :label "combined (?sm) still works" :expected "\"b\"" :actual "(re-find #\"(?sm)^b\" \"a\\nb\")" :portability :common}
   {:suite "regex / literals & predicate" :label "re-quote-replacement of a regex" :expected "\"x+y\"" :actual "(clojure.string/re-quote-replacement #\"x+y\")" :portability :common}
   {:suite "regex / literals & predicate" :label "escaped ] in a char class" :expected "\"]x\"" :actual "(re-find #\"[\\]]x\" \"]x\")" :portability :common}
+  ;; {n} is EXACTLY n. It used to translate to irregex's unbounded (** n #f …), so
+  ;; every {n} behaved as {n,}: \d{4} swallowed all of "20260729", re-matches
+  ;; accepted a longer string, and (?:%[0-9a-f]{2})+ ran past the last escape (which
+  ;; is how ring-codec's percent-decode broke). {n,} and {n,m} were always right.
+  {:suite "regex / bounded repetition" :label "{n} is exactly n, not n-or-more" :expected "[\"aa\" \"a\" \"\" \"123\" \"2026\"]" :actual "[(re-find #\"a{2}\" \"aaaa\") (re-find #\"a{1}\" \"aaaa\") (re-find #\"a{0}\" \"aaaa\") (re-find #\"[0-9]{3}\" \"12345\") (re-find #\"\\d{4}\" \"20260729\")]" :portability :common}
+  {:suite "regex / bounded repetition" :label "{n,} and {n,m} keep their bounds" :expected "[\"aaaa\" \"aaa\" \"aa\"]" :actual "[(re-find #\"a{2,}\" \"aaaa\") (re-find #\"a{2,3}\" \"aaaa\") (re-find #\"a{2}?\" \"aaaa\")]" :portability :common}
+  {:suite "regex / bounded repetition" :label "an exact bound anchors and splits" :expected "[nil nil (quote (\"12\" \"34\" \"56\")) \"YY\"]" :actual "[(re-matches #\"\\d{4}\" \"20260\") (re-find #\"^\\d{2}$\" \"123\") (re-seq #\"\\d{2}\" \"123456\") (clojure.string/replace \"20260729\" #\"\\d{4}\" \"Y\")]" :portability :common}
+  {:suite "regex / bounded repetition" :label "an exact bound inside a group stops the outer +" :expected "[\"%FE%FF%00%2F\" \"abab\" \"xxy\"]" :actual "[(re-find #\"(?:%[A-Fa-f0-9]{2})+\" \"foo%FE%FF%00%2Fbar\") (first (re-find #\"(ab){2}\" \"ababab\")) (re-find #\"x{2}y\" \"xxxy\")]" :portability :common}
   {:suite "regex / literals & predicate" :label "escaped ] amid class members" :expected "\")\"" :actual "(re-find #\"[\\.\\,\\s\\]\\}\\)]\" \")\")" :portability :common}
   {:suite "regex / literals & predicate" :label "replacement backslash escape" :expected "4" :actual "(count (clojure.string/replace \"abc\" #\"b\" \"\\\\\\\\d\"))" :portability :common}
   {:suite "interop / String methods" :label "str of a reify with toString" :expected "\"xyz\"" :actual "(str (reify Object (toString [_] \"xyz\")))" :portability :jvm}
@@ -4061,6 +4070,11 @@
   {:suite "reader / radix N suffix" :label "2r1010N reads as integer 10" :expected "10" :actual "(read-string \"2r1010N\")" :portability :common}
   {:suite "ns / refer-all in ns-refers" :label ":refer :all names appear in ns-refers" :expected "true" :actual "(do (require '[clojure.set :refer :all]) (contains? (ns-refers *ns*) 'union))" :portability :common}
   {:suite "io / binary copy File→File" :label "io/copy preserves raw bytes when both sides are files" :expected "[255 254 0 65]" :actual "(do (require '[clojure.java.io :as io]) (let [f1 (java.io.File/createTempFile \"jcp\" \".bin\") f2 (java.io.File/createTempFile \"jcp\" \".bin\")] (io/copy (byte-array [255 254 0 65]) f1) (io/copy f1 f2) (let [in (java.io.FileInputStream. f2) ba (byte-array 4) _ (.read in ba) result (mapv #(bit-and % 0xFF) (vec ba))] (.close in) (.delete f1) (.delete f2) result)))" :portability :jvm}
+  ;; A File source is a BYTE source for EVERY byte destination, not only for another
+  ;; file: (io/copy f stream) used to slurp the file as UTF-8 and replace each
+  ;; non-UTF-8 byte with U+FFFD (ef bf bd), so binary bodies came out corrupt.
+  {:suite "io / binary copy File→File" :label "io/copy File→OutputStream stays byte-exact" :expected "[-1 -128 0 65]" :actual "(do (require '[clojure.java.io :as io]) (let [f (java.io.File/createTempFile \"jcps\" \".bin\") _ (io/copy (byte-array [255 128 0 65]) f) baos (java.io.ByteArrayOutputStream.)] (io/copy f baos) (.delete f) (vec (.toByteArray baos))))" :portability :jvm}
+  {:suite "io / binary copy File→File" :label "a byte round-trip through Base64 survives" :expected "\"sõme\"" :actual "(String. (.decode (java.util.Base64/getDecoder) (.encodeToString (java.util.Base64/getEncoder) (.getBytes \"sõme\" \"UTF-8\"))) \"UTF-8\")" :portability :jvm}
   {:suite "io / File.delete non-empty dir" :label "File.delete returns false for non-empty directory" :expected "false" :actual "(do (require '[clojure.java.io :as io]) (let [d (doto (java.io.File/createTempFile \"jtd\" \".d\") (.delete) (.mkdir)) child (java.io.File. d \"child.txt\")] (spit child \"x\") (let [deleted (.delete d)] (.delete child) (.delete d) deleted)))" :portability :jvm}
   {:suite "async / transducer backpressure" :label "fixed-buffer transducer put blocks when full" :expected "[true 2 3 4 :done]" :actual "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1 (map inc)) p (future (a/>!! c 1) (a/>!! c 2) (a/>!! c 3) :done)] (Thread/sleep 100) (let [parked (not (realized? p)) v1 (a/<!! c) v2 (a/<!! c) v3 (a/<!! c) result @p] [parked v1 v2 v3 result])))" :portability :jvm}
   {:suite "async / close does not complete pending put" :label "pending rendezvous put parks until consumed, even on close" :expected "[:v true]" :actual "(do (require '[clojure.core.async :as a]) (let [c (a/chan) p (future (a/>!! c :v))] (Thread/sleep 50) (a/close! c) [(a/<!! c) @p]))" :portability :jvm}
@@ -4200,4 +4214,64 @@
   {:suite "arrays / oob exception" :label "aset OOB caught by parent IndexOutOfBoundsException" :expected ":ioobe" :actual "(try (aset (long-array 2) 9 1) (catch IndexOutOfBoundsException e :ioobe))" :portability :common}
   {:suite "arrays / oob exception" :label "byte-array aset OOB" :expected ":aioobe" :actual "(try (aset (byte-array 2) 5 (byte 1)) (catch ArrayIndexOutOfBoundsException e :aioobe))" :portability :common}
   {:suite "arrays / oob exception" :label "OOB not caught by an unrelated exception class" :expected ":outer" :actual "(try (try (aget (double-array 3) 5) (catch NullPointerException e :npe)) (catch Throwable t :outer))" :portability :common}
+
+  ;; A byte[] element is a SIGNED byte (-128..127), like the JVM's: a value above
+  ;; 127 reads negative, so (neg? b) / (bit-and b 0xff) / arithmetic over a high
+  ;; byte behave as they do on the JVM. Every byte[] producer (byte-array,
+  ;; .getBytes, stream reads, Files/readAllBytes, Base64, Random/nextBytes, FFI)
+  ;; and consumer (String., .write, Base64, FFI) shares the one narrow/mask seam,
+  ;; so bytes survive a round-trip unchanged (jolt-kevb).
+  {:suite "arrays / signed byte elements" :label "byte-array narrows like Byte.byteValue" :expected "[-1 -128 127 -1 -128 0]" :actual "(vec (byte-array [255 128 127 -1 -128 256]))" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "aget reads a high byte as negative" :expected "-56" :actual "(aget (byte-array [200]) 0)" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "a 0xff mask recovers the unsigned value" :expected "255" :actual "(bit-and (aget (byte-array [255]) 0) 0xff)" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "seq / reduce see signed elements" :expected "[(quote (-1 -1)) -2]" :actual "[(seq (byte-array [255 255])) (reduce + (byte-array [255 255]))]" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "a double element truncates toward zero, it does not floor" :expected "[1 -1]" :actual "(vec (byte-array [1.9 -1.9]))" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "the fill value of (byte-array n init) narrows too" :expected "[-1 -1 -1]" :actual "(vec (byte-array 3 (byte -1)))" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "aset-byte stores signed" :expected "[-1 -56]" :actual "(let [a (byte-array 2)] (aset-byte a 0 -1) (aset-byte a 1 (unchecked-byte 200)) (vec a))" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "aset stores a negative byte" :expected "-1" :actual "(let [a (byte-array 1)] (aset a 0 (byte -1)) (aget a 0))" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "aclone / Arrays copy keep the sign" :expected "[[-1] [-1 -128] [-1 0]]" :actual "[(vec (aclone (byte-array [255]))) (vec (java.util.Arrays/copyOfRange (byte-array [255 128 1]) 0 2)) (vec (java.util.Arrays/copyOf (byte-array [255]) 2))]" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "Arrays/fill takes a negative byte" :expected "[-1 -1]" :actual "(let [a (byte-array 2)] (java.util.Arrays/fill a (byte -1)) (vec a))" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "Arrays/equals sees 255 and -1 as the same byte" :expected "true" :actual "(java.util.Arrays/equals (byte-array [255]) (byte-array [-1]))" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "Arrays/toString is comma-separated, over signed bytes" :expected "[\"[-1, 1]\" \"[1, 2]\"]" :actual "[(java.util.Arrays/toString (byte-array [255 1])) (java.util.Arrays/toString (int-array [1 2]))]" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "Arrays/toString renders element toString, nil as null" :expected "[\"[a, 1, null]\" \"[a, b]\" \"[1.0, 2.0]\" \"[]\"]" :actual "[(java.util.Arrays/toString (object-array [\"a\" 1 nil])) (java.util.Arrays/toString (char-array [\\a \\b])) (java.util.Arrays/toString (double-array [1 2])) (java.util.Arrays/toString (byte-array 0))]" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label ".getBytes yields signed bytes" :expected "[[-11] [-61 -75] [65 66]]" :actual "[(vec (.getBytes \"õ\" \"ISO-8859-1\")) (vec (.getBytes \"õ\" \"UTF-8\")) (vec (.getBytes \"AB\"))]" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "signed bytes decode back through (String. bytes cs)" :expected "[\"õ\" [-11]]" :actual "(let [s (String. (byte-array [-11]) \"ISO-8859-1\")] [s (vec (.getBytes s \"ISO-8859-1\"))])" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "a stream read fills the buffer signed; the 1-arg read stays unsigned" :expected "[[-1] 255]" :actual "[(let [in (java.io.ByteArrayInputStream. (byte-array [255])) b (byte-array 1)] (.read in b) (vec b)) (.read (java.io.ByteArrayInputStream. (byte-array [255])))]" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "ByteArrayOutputStream round-trips a high byte" :expected "[-1 -128]" :actual "(vec (.toByteArray (doto (java.io.ByteArrayOutputStream.) (.write (byte-array [255 128])))))" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "a file round-trip preserves the raw bytes" :expected "[-1 -128 0 65]" :actual "(let [f (java.io.File/createTempFile \"jsb\" \".bin\")] (with-open [o (java.io.FileOutputStream. f)] (.write o (byte-array [255 128 0 65]))) (let [r (vec (java.nio.file.Files/readAllBytes (.toPath f)))] (.delete f) r))" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "ByteBuffer get returns a signed byte" :expected "[-1 [-1 -128]]" :actual "[(.get (java.nio.ByteBuffer/wrap (byte-array [255]))) (let [bb (java.nio.ByteBuffer/wrap (byte-array [255 128])) d (byte-array 2)] (.get bb d) (vec d))]" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "ByteBuffer put takes a negative byte" :expected "[-1 127]" :actual "(let [bb (java.nio.ByteBuffer/allocate 2)] (.put bb (byte -1)) (.put bb (byte 127)) (vec (.array bb)))" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "Base64 decodes to a signed byte[] and re-encodes it" :expected "[[-1 -1] \"//8=\" [47 119 61 61]]" :actual "[(vec (.decode (java.util.Base64/getDecoder) \"//8=\")) (.encodeToString (java.util.Base64/getEncoder) (byte-array [-1 -1])) (vec (.encode (java.util.Base64/getEncoder) (byte-array [255])))]" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "Base64 output is a byte[], not an opaque host buffer" :expected "[true true]" :actual "[(bytes? (.decode (java.util.Base64/getDecoder) \"//8=\")) (bytes? (.encode (java.util.Base64/getEncoder) (byte-array [1])))]" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "Random/nextBytes matches the JVM LCG, four bytes per nextInt" :expected "[53 -99 65 -70 -9 -118 -2 13]" :actual "(let [a (byte-array 8)] (.nextBytes (java.util.Random. 42) a) (vec a))" :portability :jvm}
+  {:suite "arrays / signed byte elements" :label "nextBytes consumes one nextInt per four bytes" :expected "true" :actual "(let [a (byte-array 4) r (java.util.Random. 7) _ (.nextBytes r a)] (= (.nextInt r) (.nextInt (doto (java.util.Random. 7) (.nextInt)))))" :portability :jvm}
+
+  ;; The idioms that read bytes back out. %x / %X / %o are UNSIGNED conversions: a
+  ;; negative argument prints the two's complement of its integer type, never a
+  ;; signed magnitude — jolt used to print "-1" for (format "%x" -1). The WIDTH is
+  ;; the argument's Java type (Byte 8 / Short 16 / Integer 32 / Long 64) and jolt
+  ;; unifies every integer as one type, so it takes the narrowest width holding the
+  ;; value: a byte out of a byte[] prints two digits like the JVM's Byte, an
+  ;; int-sized value eight like its Integer. A long whose value fits narrower is the
+  ;; one case that diverges — allowlisted :integer-box-model, next row but one.
+  {:suite "numbers / unsigned string conversions" :label "an unmasked byte hex-formats at byte width" :expected "[\"FE\" \"%C3%B5\" \"ff\" \"-1\"]" :actual "[(format \"%02X\" (aget (byte-array [254]) 0)) (apply str (map (partial format \"%%%02X\") (.getBytes \"õ\" \"UTF-8\"))) (format \"%x\" 255) (format \"%d\" -1)]" :portability :jvm}
+  ;; The whole percent-encoder shape real libraries write over raw UTF-8 bytes —
+  ;; ring-codec's percent-encode and cognitect aws-api's request signer, unmodified.
+  ;; Character/isLetterOrDigit classifies an int codepoint, so a signed high byte
+  ;; reaches it and is correctly not a letter.
+  {:suite "numbers / unsigned string conversions" :label "the unmasked percent-encoder idiom over UTF-8 bytes" :expected "\"a%2Fb%20%C3%B5%3D1\"" :actual "(let [sb (StringBuilder.)] (doseq [b (.getBytes \"a/b õ=1\" \"UTF-8\")] (.append sb (if (Character/isLetterOrDigit b) (char b) (format \"%%%02X\" b)))) (.toString sb))" :portability :jvm}
+  {:suite "numbers / unsigned string conversions" :label "Character/isLetter & isLetterOrDigit over chars and codepoints" :expected "[true false true false true true false]" :actual "[(Character/isLetter \\a) (Character/isLetter \\5) (Character/isLetterOrDigit \\5) (Character/isLetterOrDigit \\-) (Character/isLetterOrDigit 65) (Character/isLetter 122) (Character/isLetter (aget (byte-array [200]) 0))]" :portability :jvm}
+  {:suite "numbers / unsigned string conversions" :label "a masked byte formats as two hex digits" :expected "\"ff800f\"" :actual "(apply str (map #(format \"%02x\" (bit-and % 0xff)) (byte-array [255 128 15])))" :portability :jvm}
+  ;; DIVERGENT (:integer-box-model): the JVM widens by the argument's declared type,
+  ;; so these are 16 / 22 digits there. The corpus keeps jolt's value.
+  {:suite "numbers / unsigned string conversions" :label "a negative long takes the narrowest width holding it" :expected "[\"ff\" \"FF01\" \"377\" \"ff00\" \"fed4\"]" :actual "[(format \"%x\" -1) (format \"%X\" -255) (format \"%o\" -1) (format \"%x\" -256) (format \"%x\" -300)]" :portability :common}
+  {:suite "numbers / unsigned string conversions" :label "a value needing 64 bits still gets them" :expected "[\"ffffffff7fffffff\" \"8000000000000000\"]" :actual "[(format \"%x\" -2147483649) (format \"%x\" -9223372036854775808)]" :portability :common}
+  ;; Past the signed-64 range there is no fixed-width two's complement to print, so
+  ;; it is a signed magnitude — what the JVM's Formatter does for a BigInteger. The
+  ;; width search used to mask here, rendering -(2^70) as "0". Reference Clojure's
+  ;; format rejects a BigInt for %x outright, so this row is jolt-only.
+  {:suite "numbers / unsigned string conversions" :label "past 64 bits it is a signed magnitude, not a wrap" :expected "[\"-400000000000000000\" \"400000000000000000\" \"-8000000000000001\"]" :actual "[(format \"%x\" -1180591620717411303424N) (format \"%x\" 1180591620717411303424N) (format \"%x\" (dec -9223372036854775808))]" :portability :common}
+  {:suite "numbers / unsigned string conversions" :label "Integer/Long toHexString are unsigned at their own width" :expected "[\"ffffffff\" \"ffffff00\" \"ffffffffffffffff\" \"ff\"]" :actual "[(Integer/toHexString -1) (Integer/toHexString -256) (Long/toHexString -1) (Integer/toHexString 255)]" :portability :jvm}
+  {:suite "numbers / unsigned string conversions" :label "toOctalString / toBinaryString are unsigned too" :expected "[\"37777777777\" \"11111111111111111111111111111111\" \"1777777777777777777777\" \"101\"]" :actual "[(Integer/toOctalString -1) (Integer/toBinaryString -1) (Long/toOctalString -1) (Integer/toBinaryString 5)]" :portability :jvm}
+  {:suite "numbers / unsigned string conversions" :label "toString with a radix is signed magnitude, lowercase" :expected "[\"-ff\" \"-ff\" \"-255\" \"ff\"]" :actual "[(Integer/toString -255 16) (Long/toString -255 16) (Long/toString -255) (Integer/toString 255 16)]" :portability :jvm}
 ]

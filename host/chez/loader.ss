@@ -1258,6 +1258,11 @@
 (def-var! "jolt.host" "source-roots" (lambda () (list->cseq source-roots)))
 (def-var! "jolt.host" "load-namespace" (lambda (n) (load-namespace n) jolt-nil))
 (def-var! "jolt.host" "file-exists?" (lambda (p) (if (file-exists? p) #t #f)))
+;; …and whether it is a DIRECTORY, which file-exists? also answers #t for. A bare
+;; argv token is dispatched as a file to run before a :tasks lookup (main.clj's
+;; run-file-arg?), so `jolt test` in any project with a test/ dir — which is every
+;; jolt library — took the file path and died decoding a directory.
+(def-var! "jolt.host" "directory?" (lambda (p) (if (file-directory? p) #t #f)))
 (def-var! "jolt.host" "getenv" (lambda (n) (let ((v (getenv n))) (if v v jolt-nil))))
 
 ;; jolt version string — one source (jolt-version-string, rt.ss): the baked

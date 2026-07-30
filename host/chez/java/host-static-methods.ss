@@ -270,6 +270,9 @@
 (define long-2^64 (expt 2 64))
 ;; interpret a 64-bit value as a signed long (top bit = sign), like the JVM.
 (define (as-signed64 v) (if (>= v long-2^63) (- v long-2^64) v))
+;; and back: a negative long as its 64-bit unsigned form, for the unsigned string
+;; conversions (Long.toHexString(-1) is "ffffffffffffffff").
+(define (long->u64 n) (if (< n 0) (+ n long-2^64) n))
 (define (long-nlz n) (- 64 (integer-length (bitwise-and (jnum->exact n) long-mask64))))
 (define (long-reverse n)
   (let ((v (bitwise-and (jnum->exact n) long-mask64)))
@@ -286,7 +289,17 @@
         (cons "numberOfLeadingZeros" (lambda (n) (->num (long-nlz n))))
         (cons "reverse" (lambda (n) (->num (long-reverse n))))
         (cons "parseLong" (lambda (s . r) (parse-int-or-throw s (if (null? r) 10 (jnum->exact (car r))) "parseLong")))
-        (cons "valueOf" (lambda (s . r) (parse-int-or-throw s (if (null? r) 10 (jnum->exact (car r))) "valueOf")))))
+        (cons "valueOf" (lambda (s . r) (parse-int-or-throw s (if (null? r) 10 (jnum->exact (car r))) "valueOf")))
+        (cons "compare" (lambda (x y) (let ((a (jnum->exact x)) (b (jnum->exact y)))
+                                        (->num (cond ((< a b) -1) ((> a b) 1) (else 0))))))
+        ;; toHexString/toOctalString/toBinaryString are UNSIGNED (the value's 64-bit
+        ;; two's complement, lowercase); toString with a radix is signed magnitude.
+        ;; Chez's number->string emits uppercase hex digits, so downcase them all —
+        ;; Integer/toString had the same slip ((Integer/toString -255 16) was "-FF").
+        (cons "toHexString" (lambda (x) (string-downcase (number->string (long->u64 (jnum->exact x)) 16))))
+        (cons "toOctalString" (lambda (x) (number->string (long->u64 (jnum->exact x)) 8)))
+        (cons "toBinaryString" (lambda (x) (number->string (long->u64 (jnum->exact x)) 2)))
+        (cons "toString" (lambda (x . r) (string-downcase (number->string (jnum->exact x) (if (null? r) 10 (jnum->exact (car r)))))))))
 
 ;; JVM Integer.toHexString/etc. treat the int as 32-bit unsigned.
 (define (int->u32 n) (if (< n 0) (+ n 4294967296) n))
@@ -305,7 +318,7 @@
         (cons "toHexString" (lambda (x) (string-downcase (number->string (int->u32 (jnum->exact x)) 16))))
         (cons "toOctalString" (lambda (x) (number->string (int->u32 (jnum->exact x)) 8)))
         (cons "toBinaryString" (lambda (x) (number->string (int->u32 (jnum->exact x)) 2)))
-        (cons "toString" (lambda (x . r) (number->string (jnum->exact x) (if (null? r) 10 (jnum->exact (car r))))))))
+        (cons "toString" (lambda (x . r) (string-downcase (number->string (jnum->exact x) (if (null? r) 10 (jnum->exact (car r)))))))))
 
 ;; Byte / Short bounds (their values are plain integers on jolt; the statics let
 ;; libraries reference the JVM ranges — clojure.test.check generates over them).
@@ -352,6 +365,16 @@
         (cons "isUpperCase" (lambda (c) (let ((n (char-code c))) (and (>= n 65) (<= n 90)))))
         (cons "isLowerCase" (lambda (c) (let ((n (char-code c))) (and (>= n 97) (<= n 122)))))
         (cons "isDigit" (lambda (c) (let ((n (char-code c))) (and (>= n 48) (<= n 57)))))
+        ;; isLetter / isLetterOrDigit take a char or an int codepoint, so a byte read
+        ;; out of a byte[] reaches them — negative for a high byte, which is not a
+        ;; letter on the JVM either (it is not a valid codepoint). cognitect aws-api's
+        ;; request signer classifies each UTF-8 byte of a URI this way.
+        (cons "isLetter" (lambda (c) (let ((n (char-code c)))
+                                       (or (and (>= n 65) (<= n 90)) (and (>= n 97) (<= n 122))))))
+        (cons "isLetterOrDigit" (lambda (c) (let ((n (char-code c)))
+                                              (or (and (>= n 48) (<= n 57))
+                                                  (and (>= n 65) (<= n 90))
+                                                  (and (>= n 97) (<= n 122))))))
         ;; JVM Character.isWhitespace: Unicode whitespace (so U+2028 line separator
         ;; counts, like the JVM) MINUS the no-break spaces the JVM excludes
         ;; (U+00A0/U+2007/U+202F). char<=?space missed everything above ASCII.
