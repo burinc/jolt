@@ -455,6 +455,19 @@ else
   fails=$((fails + 1))
 fi
 
+# clojure.zip + clojure.data: the surface data.zip and cider-nrepl drive, including
+# the SHAPE of a diff result (its map arm is a seq, its vector/set arms are
+# vectors). Both load on require, so they cannot be corpus rows.
+zd_out="$($jolt run test/chez/zip-data-test.clj 2>/dev/null)"
+if printf '%s' "$zd_out" | grep -q 'ZIP-DATA OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: clojure.zip / clojure.data"
+  echo "    $(printf '%s' "$zd_out" | grep ZIP-DATA-RESULT | tail -1)"
+  printf '%s' "$zd_out" | grep 'zip-data FAIL' | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # clojure.pprint cl-format: a representative, JVM-certified subset of the upstream
 # test_cl_format suite (~A ~S ~D ~F ~$ ~% ~& ~C ~( ~) ~{ ~} ~[ ~] ~< ~> ~T ~* ~R).
 # The file tallies per-case pass/fail and emits a PPRINT OK / PPRINT FAIL sentinel.

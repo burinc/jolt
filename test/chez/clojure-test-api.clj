@@ -168,6 +168,36 @@
      1
      "run-test-var runs one var's test")
 
+;; --- the report-counter vars a reporter reads ------------------------------------
+;; test.check and test.chuck bind and read these around their own reporting.
+(ok= t/*initial-report-counters* {:test 0 :pass 0 :fail 0 :error 0}
+     "*initial-report-counters* is the zeroed summary")
+(ok= (binding [t/*report-counters* (ref t/*initial-report-counters*)]
+       (some? t/*report-counters*))
+     true
+     "*report-counters* is bindable")
+(ok= (let [before (t/n-pass)]
+       (t/inc-report-counter :pass)
+       (- (t/n-pass) before))
+     1
+     "inc-report-counter bumps a counter by key")
+(ok= (t/testing "a" (t/testing "b" (vec t/*testing-contexts*))) ["b" "a"]
+     "*testing-contexts* stacks innermost first")
+
+(deftest ^:private api-two-assertions (is true) (is true))
+
+(ok= (let [before (t/n-pass)]
+       (binding [t/*test-out* (java.io.StringWriter.)] (t/test-vars [#'api-two-assertions]))
+       (- (t/n-pass) before))
+     2
+     "test-vars runs each var's :test fn")
+
+(ok= (let [before (t/n-pass)]
+       (binding [t/*test-out* (java.io.StringWriter.)] (t/run-test api-two-assertions))
+       (- (t/n-pass) before))
+     2
+     "run-test takes the var by name")
+
 (let [n @passes f @fails]
   (doseq [m f] (println "clojure-test-api FAIL " m))
   (println "CLOJURE-TEST-API-RESULT pass" n "fail" (count f))

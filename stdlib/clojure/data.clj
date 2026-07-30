@@ -44,12 +44,9 @@
   "Diff associative things a and b, comparing only keys in ks."
   [a b ks]
   (reduce
-   ;; mapv (vector result) rather than the reference's (doall (map …)): the diff
-   ;; triples are destructured positionally and a list with a nil middle element
-   ;; mis-binds under jolt destructuring, whereas a vector indexes cleanly.
-   (fn [diff1 diff2] (mapv merge diff1 diff2))
+   (fn [diff1 diff2] (doall (map merge diff1 diff2)))
    [nil nil nil]
-   (mapv (partial diff-associative-key a b) ks)))
+   (map (partial diff-associative-key a b) ks)))
 
 (defn- diff-sequential [a b]
   (vec (mapv vectorize (diff-associative

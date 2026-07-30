@@ -331,7 +331,11 @@
         (cons "toHexString" (lambda (x) (string-downcase (number->string (int->u32 (jnum->exact x)) 16))))
         (cons "toOctalString" (lambda (x) (number->string (int->u32 (jnum->exact x)) 8)))
         (cons "toBinaryString" (lambda (x) (number->string (int->u32 (jnum->exact x)) 2)))
-        (cons "toString" (lambda (x . r) (string-downcase (number->string (jnum->exact x) (if (null? r) 10 (jnum->exact (car r)))))))))
+        (cons "toString" (lambda (x . r) (string-downcase (number->string (jnum->exact x) (if (null? r) 10 (jnum->exact (car r)))))))
+        ;; Integer.max/min (Java 8): plain two-arg integer max/min, not clojure.core's
+        ;; variadic ones — orchard calls them.
+        (cons "max" (lambda (x y) (->num (max (jnum->exact x) (jnum->exact y)))))
+        (cons "min" (lambda (x y) (->num (min (jnum->exact x) (jnum->exact y)))))))
 
 ;; Byte / Short bounds (their values are plain integers on jolt; the statics let
 ;; libraries reference the JVM ranges — clojure.test.check generates over them).
@@ -368,9 +372,18 @@
         (cons "isInfinite" (lambda (x) (and (flonum? x) (infinite? x))))
         (cons "MAX_VALUE" 1.7976931348623157e308) (cons "MIN_VALUE" 4.9e-324)
         (cons "POSITIVE_INFINITY" +inf.0) (cons "NEGATIVE_INFINITY" -inf.0) (cons "NaN" +nan.0)))
+;; Float's bounds and specials are the float ones, not double's — data.json's
+;; suite round-trips them by name. jolt has one flonum type, so the values are
+;; doubles carrying the float magnitudes.
 (register-class-statics! "Float"
   (list (cons "TYPE" "float")
-        (cons "parseFloat" parse-double-or-throw) (cons "valueOf" ->double)))
+        (cons "parseFloat" parse-double-or-throw) (cons "valueOf" ->double)
+        (cons "toString" (lambda (x) (jolt-str-render-one (->double x))))
+        (cons "isNaN" (lambda (x) (and (flonum? x) (nan? x))))
+        (cons "isInfinite" (lambda (x) (and (flonum? x) (infinite? x))))
+        (cons "MAX_VALUE" 3.4028235e38) (cons "MIN_VALUE" 1.4e-45)
+        (cons "POSITIVE_INFINITY" +inf.0) (cons "NEGATIVE_INFINITY" -inf.0)
+        (cons "NaN" +nan.0)))
 
 ;; Character: ASCII predicates (the engine is byte/ASCII oriented).
 (register-class-statics! "java.lang.Character"
@@ -393,7 +406,22 @@
         ;; (U+00A0/U+2007/U+202F). char<=?space missed everything above ASCII.
         (cons "isWhitespace" (lambda (c) (let ((cp (char-code c)))
                                            (and (char-whitespace? (integer->char cp))
-                                                (not (fx=? cp #xA0)) (not (fx=? cp #x2007)) (not (fx=? cp #x202F))))))))
+                                                (not (fx=? cp #xA0)) (not (fx=? cp #x2007)) (not (fx=? cp #x202F))))))
+        ;; Codepoint bounds, as plain integers. The UTF-16 surrogate API
+        ;; (MIN_HIGH_SURROGATE, highSurrogate/lowSurrogate, toCodePoint, …) is
+        ;; deliberately absent: a surrogate is not a Unicode scalar value, so it is
+        ;; not representable as a char on this host — jolt strings are indexed by
+        ;; codepoint, and there are no surrogate halves to hand back.
+        (cons "MIN_VALUE" (integer->char 0))
+        (cons "MAX_VALUE" (integer->char #xFFFF))
+        (cons "MIN_CODE_POINT" (->num 0))
+        (cons "MAX_CODE_POINT" (->num #x10FFFF))
+        (cons "MIN_SUPPLEMENTARY_CODE_POINT" (->num #x10000))
+        (cons "charCount" (lambda (cp) (->num (if (>= (jnum->exact cp) #x10000) 2 1))))
+        ;; Character.codePointOf(name) is deliberately absent: it is a lookup in the
+        ;; Unicode character-name database, which this host does not carry, and a
+        ;; partial ASCII-only table would answer wrongly rather than not at all.
+        ))
 
 ;; String/valueOf(Object): "null" for nil, else jolt's str semantics.
 ;; String/format(fmt args…) / (locale fmt args…) -> the clojure.core format engine.

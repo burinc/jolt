@@ -55,7 +55,13 @@
 
 (define (jolt-pr-readable-base x)
   (cond
-    ((string? x) (string-append "\"" (jolt-str-escape x) "\""))
+    ;; *print-readably* nil makes pr print a string like print does — bare, no
+    ;; quotes or escapes — at every nesting level. Chars already honored it
+    ;; (jolt-char->string); strings were escaping unconditionally.
+    ((string? x)
+     (if (jolt-truthy? (jolt-var-get (jolt-var "clojure.core" "*print-readably*")))
+         (string-append "\"" (jolt-str-escape x) "\"")
+         x))
     ;; pr renders the infinities / NaN in READABLE form (##Inf reads back), unlike
     ;; str's "Infinity"/"-Infinity"/"NaN". Applies at every nesting level.
     ((and (flonum? x) (fl= x +inf.0)) "##Inf")
