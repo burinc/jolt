@@ -3087,6 +3087,15 @@
   {:suite "integer-box-model / narrow int class collapses to Long" :label "int class" :expected "java.lang.Long" :actual "(class (int 5))" :portability :common}
   {:suite "integer-box-model / narrow int class collapses to Long" :label "instance? Byte is false" :expected "false" :actual "(instance? Byte (byte 5))" :portability :common}
   {:suite "integer-box-model / narrow int class collapses to Long" :label "instance? Long is true" :expected "true" :actual "(instance? Long (byte 5))" :portability :common}
+  ;; The float side of the same collapse, and the permissive instance? that goes
+  ;; with it — a value answers to every numeric class its magnitude could satisfy.
+  {:suite "integer-box-model / narrow int class collapses to Long" :label "float class collapses to Double" :expected "java.lang.Double" :actual "(class (float 1.5))" :portability :common}
+  {:suite "integer-box-model / narrow int class collapses to Long" :label "instance? Float is true" :expected "true" :actual "(instance? Float 1.5)" :portability :common}
+  {:suite "integer-box-model / narrow int class collapses to Long" :label "instance? BigInt is true for any integer" :expected "[true true]" :actual "[(instance? clojure.lang.BigInt 1) (instance? java.math.BigInteger 1)]" :portability :common}
+  ;; subvec is a vector on jolt, not a view class of its own. A library that derives
+  ;; the subvec class from a sample value then reads every vector as a subvec.
+  {:suite "seq-type-model / subvec has no class of its own" :label "subvec class" :expected "clojure.lang.PersistentVector" :actual "(class (subvec [1 2 3 4 5] 1 3))" :portability :common}
+  {:suite "seq-type-model / subvec has no class of its own" :label "the values still agree" :expected "[2 3]" :actual "(subvec [1 2 3 4 5] 1 3)" :portability :common}
   {:suite "untested / JVM-shape stubs (documented jolt behavior)" :label "class number" :expected "java.lang.Long" :actual "(class 1)" :portability :common}
   {:suite "untested / JVM-shape stubs (documented jolt behavior)" :label "class string" :expected "java.lang.String" :actual "(class \"s\")" :portability :common}
   {:suite "untested / JVM-shape stubs (documented jolt behavior)" :label "class keyword" :expected "clojure.lang.Keyword" :actual "(class :k)" :portability :common}

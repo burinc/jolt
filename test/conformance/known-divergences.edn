@@ -183,6 +183,20 @@
    :jvm "\"ff\" (the byte widens to int -1 … so also \"ffffffff\"; the two-digit form needs Byte/toUnsignedInt)"
    :jolt "\"ffffffff\" — the same, since the static's width is 32 by name"
    :note "Both agree here: Integer/toHexString is 32 bits wide on both, so a signed byte gives eight digits on both. Listed only to point at the portable forms — Byte/toUnsignedInt or (bit-and b 0xff) — since format's %x DOES infer its width and is the case that diverges (see the :entries row for numbers / unsigned string conversions)."}
+  ;; The same collapse on the float side: one flonum type reported as Double, and
+  ;; instance? answers to both Float and Double so either check written against the
+  ;; JVM keeps working.
+  {:category :integer-box-model
+   :behavior "(class (float 1.5)), (instance? Float 1.5)"
+   :jvm "java.lang.Float, false"
+   :jolt "java.lang.Double, true"
+   :note "Chez has one flonum. instance? is deliberately permissive for Float/Double and Integer/Long/BigInt/BigInteger — a value answers to every check its magnitude could satisfy — while Short and Byte stay false. That is a superset of the checks portable code writes; it does NOT follow (supers (class x)), which reports the single collapsed class."}
+  ;; subvec returns a plain vector, so it has no class of its own.
+  {:category :seq-type-model
+   :behavior "(class (subvec [1 2 3 4 5] 1 3))"
+   :jvm "clojure.lang.APersistentVector$SubVector"
+   :jolt "clojure.lang.PersistentVector"
+   :note "jolt's subvec is a vector, not a view class. A library that derives the subvec class from a sample value — lasertag does — then sees every vector as a subvec. Values and behavior are identical; only the class differs."}
   ;; ByteBuffer.slice() copies where the JVM shares the backing array.
   {:category :host-model
    :behavior "(.array (.slice buf)) after (.position buf 1)"
@@ -244,6 +258,10 @@
   {:suite "integer-box-model / narrow int class collapses to Long", :label "int class", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Byte is false", :category :integer-box-model}
     {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Long is true", :category :integer-box-model}
+  {:suite "integer-box-model / narrow int class collapses to Long", :label "float class collapses to Double", :category :integer-box-model}
+  {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Float is true", :category :integer-box-model}
+  {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? BigInt is true for any integer", :category :integer-box-model}
+  {:suite "seq-type-model / subvec has no class of its own", :label "subvec class", :category :seq-type-model}
     ;; naa9: vswap! is a macro on the JVM (:macro true) for inline performance;
    ;; jolt implements it as a regular function. Semantics are equivalent — the
    ;; JVM macro is a perf inline, not a semantic difference.
