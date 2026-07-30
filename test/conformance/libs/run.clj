@@ -101,7 +101,8 @@
       {:tests (parse-long t) :pass (parse-long pa)
        :fail (parse-long f) :error (parse-long e) :load-fail (parse-long lf)})))
 
-(defn- run-lib [{:keys [name root dir paths deps local-deps extra-deps nses exclude-nses timeout]
+(defn- run-lib [{:keys [name root dir paths deps local-deps extra-deps nses exclude-nses
+                        preload timeout]
                  :as entry}]
   (let [lib-root (str libs-root "/" (or root name))
         srcs (map #(resolve-path lib-root %) (or paths ["src" "test"]))
@@ -128,7 +129,8 @@
             all-deps (merge (or extra-deps {}) locals)
             sdeps (cond-> {:paths cp} (seq all-deps) (assoc :deps all-deps))
             cmd (vec (concat [jolt-bin "-Sdeps" (pr-str sdeps)
-                              "-m" "lib-conformance-run" (str timeout-ms)]
+                              "-m" "lib-conformance-run" (str timeout-ms)
+                              (if (seq preload) (str/join "," preload) "-")]
                              nses))
             ;; A suite that opens a file by a project-relative path needs the
             ;; working directory its own build uses — in a multi-module repo that

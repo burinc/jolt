@@ -39,6 +39,7 @@ One entry per library: how to put it on the classpath, and what it scored.
 | `:extra-deps` | ordinary deps.edn coordinates, for deps with no local checkout — jolt resolves the source out of the jar |
 | `:nses` | explicit namespace list; omitted means "discover every namespace under `:test-paths` that defines tests" |
 | `:exclude-nses` | namespaces to skip (benchmarks, JVM-only suites) |
+| `:preload` | jolt-side namespaces to require before the suites — a shim registering a host class the library reaches for through interop |
 | `:expect` | the recorded tally |
 | `:timeout` | seconds before the child is killed (default 300) |
 | `:skip` / `:note` | why a library is not run, or why a non-zero tally is expected |

@@ -258,7 +258,12 @@
    ;; jsonista, which are not in the checkout).
    :nses ["reitit.core-test" "reitit.impl-test" "reitit.trie-test"
           "reitit.spec-test"]
-   :expect {:tests 27 :pass 343 :fail 1 :error 22}}
+   ;; reitit's fast router is built on reitit.Trie, a compiled Java class. jolt-lang/
+   ;; router reimplements that trie in Clojure and registers it as the reitit.Trie
+   ;; host class, which is how reitit-core runs here unmodified — but only if it is
+   ;; loaded before reitit builds a router.
+   :preload ["reitit.trie-jolt"]
+   :expect {:tests 27 :pass 615 :fail 0 :error 0}}
 
   ;; ---------------------------------------------------------- tooling
   {:name "compliment"
