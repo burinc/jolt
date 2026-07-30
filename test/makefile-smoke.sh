@@ -5,6 +5,10 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
+# Test each caller override independently of the Make process that launched us.
+# Command-line variables also propagate to nested Makes through these flags.
+unset CHEZ CHEZSCHEME MAKEFLAGS MAKEOVERRIDES
+
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
