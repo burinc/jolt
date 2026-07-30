@@ -649,7 +649,8 @@
               (else "UTF-8")))
       "UTF-8"))
 (define (decode-bytevector bv rest)
-  (let ((cs (charset-canonical-down (string-charset-name rest))))
+  (let* ((name (string-charset-name rest))
+         (cs (charset-canonical-down name)))
     (cond
       ((string=? cs "utf-8") (utf8->string bv))
       ((or (string=? cs "iso-8859-1") (string=? cs "us-ascii"))
@@ -660,7 +661,14 @@
       ((or (string=? cs "utf-32") (string=? cs "utf-32be"))
        (utf32->string bv (endianness big)))
       ((string=? cs "utf-32le") (utf32->string bv (endianness little)))
-      (else (guard (e (#t (list->string (map integer->char (bytevector->u8-list bv))))) (utf8->string bv))))))
+      ;; anything else through the system iconv (natives-str.ss); a charset the
+      ;; host does not have is the JVM's UnsupportedEncodingException rather than
+      ;; a silent reinterpretation of the bytes as UTF-8.
+      (else (let ((u8 (iconv-bytes bv name "UTF-8")))
+              (if u8
+                  (guard (e (#t (list->string (map integer->char (bytevector->u8-list u8)))))
+                    (utf8->string u8))
+                  (unsupported-encoding-throw name)))))))
 ;; (String. bytes offset length [charset]) — decode a SLICE. Returns (bv . rest')
 ;; where rest' is the charset args; a plain (String. bytes [charset]) is unsliced.
 (define (bytes-slice-for-string bv rest)
@@ -764,36 +772,79 @@
   (register-class-ctor! "java.text.ParseException" parse-exc-ctor))
 
 ;; ---- URLEncoder / URLDecoder (www-form-urlencoded) --------------------------
-(define (url-unreserved? b)
-  (or (and (>= b 48) (<= b 57)) (and (>= b 65) (<= b 90)) (and (>= b 97) (<= b 122))
-      (= b 46) (= b 42) (= b 95) (= b 45)))
+;; Both honour the charset argument, which they used to ignore and always encode
+;; UTF-8 — so (URLEncoder/encode "\u3044" "Shift_JIS") is %82%A2, not %E3%81%84.
+;;
+;; The conversion is per RUN, not per string or per character, which is what the
+;; JVM does: unreserved ASCII passes through as itself and only the characters
+;; between them are converted, together. It matters for a stateful charset —
+;; UTF-16 writes a byte-order mark at the head of whatever it is handed, so
+;; (URLEncoder/encode "foo/bar" "UTF-16") is foo%FE%FF%00%2Fbar, one mark before
+;; the escaped "/" rather than one at the head of the whole string.
+(define (url-unreserved-char? c)
+  (let ((b (char->integer c)))
+    (or (and (>= b 48) (<= b 57)) (and (>= b 65) (<= b 90)) (and (>= b 97) (<= b 122))
+        (= b 46) (= b 42) (= b 95) (= b 45))))
 (define hex-digits "0123456789ABCDEF")
-(define (url-encode s . _)
-  (let ((bs (string->utf8 (if (string? s) s (jolt-str-render-one s)))) (out '()))
+;; The charset is validated up front, as on the JVM: a name the host cannot honour
+;; is an error even when the input happens to be all-unreserved and no conversion
+;; would have run.
+(define (url-charset cs)
+  (let ((name (charset-arg-name cs)))
+    (if (or (charset-lookup name) (iconv-known? name)) cs (unsupported-encoding-throw name))))
+(define (url-encode s . rest)
+  (let* ((str (if (string? s) s (jolt-str-render-one s)))
+         (cs (url-charset (if (null? rest) "UTF-8" (car rest))))
+         (n (string-length str))
+         (out '()))
+    (define (emit-escaped! bv)
+      (do ((i 0 (+ i 1))) ((= i (bytevector-length bv)))
+        (let ((b (bytevector-u8-ref bv i)))
+          (set! out (cons (string-ref hex-digits (bitwise-and b 15))
+                     (cons (string-ref hex-digits (bitwise-arithmetic-shift-right b 4))
+                       (cons #\% out)))))))
     (let loop ((i 0))
-      (if (= i (bytevector-length bs)) (list->string (reverse out))
-          (let ((b (bytevector-u8-ref bs i)))
-            (cond ((url-unreserved? b) (set! out (cons (integer->char b) out)))
-                  ((= b 32) (set! out (cons #\+ out)))
-                  (else (set! out (cons (string-ref hex-digits (bitwise-and b 15))
-                                   (cons (string-ref hex-digits (bitwise-arithmetic-shift-right b 4))
-                                     (cons #\% out))))))
-            (loop (+ i 1)))))))
+      (if (>= i n)
+          (list->string (reverse out))
+          (let ((c (string-ref str i)))
+            (cond
+              ((url-unreserved-char? c) (set! out (cons c out)) (loop (+ i 1)))
+              ((char=? c #\space) (set! out (cons #\+ out)) (loop (+ i 1)))
+              (else
+               (let run ((j i))
+                 (if (and (< j n)
+                          (not (url-unreserved-char? (string-ref str j)))
+                          (not (char=? (string-ref str j) #\space)))
+                     (run (+ j 1))
+                     (begin (emit-escaped! (charset-encode-bv (substring str i j) cs))
+                            (loop j)))))))))))
 (define (hexv c)
   (cond ((and (char<=? #\0 c) (char<=? c #\9)) (- (char->integer c) 48))
         ((and (char<=? #\A c) (char<=? c #\F)) (- (char->integer c) 55))
         ((and (char<=? #\a c) (char<=? c #\f)) (- (char->integer c) 87))
          (else (throw-jvm 'IllegalArgumentException "URLDecoder: illegal hex escape"))))
-(define (url-decode s . _)
-  (let* ((str (if (string? s) s (jolt-str-render-one s))) (n (string-length str)) (out '()))
+(define (url-decode s . rest)
+  (let* ((str (if (string? s) s (jolt-str-render-one s)))
+         (cs (list (url-charset (if (null? rest) "UTF-8" (car rest)))))
+         (n (string-length str))
+         (out '()))
     (let loop ((i 0))
-      (if (>= i n) (utf8->string (u8-list->bytevector (reverse out)))
+      (if (>= i n)
+          (list->string (reverse out))
           (let ((c (string-ref str i)))
-            (cond ((char=? c #\+) (set! out (cons 32 out)) (loop (+ i 1)))
-                  ((char=? c #\%)
-                   (set! out (cons (+ (* 16 (hexv (string-ref str (+ i 1)))) (hexv (string-ref str (+ i 2)))) out))
-                   (loop (+ i 3)))
-                  (else (set! out (cons (char->integer c) out)) (loop (+ i 1)))))))))
+            (cond
+              ((char=? c #\+) (set! out (cons #\space out)) (loop (+ i 1)))
+              ((char=? c #\%)
+               (let run ((j i) (bytes '()))
+                 (if (and (< j n) (char=? (string-ref str j) #\%))
+                     (run (+ j 3) (cons (+ (* 16 (hexv (string-ref str (+ j 1))))
+                                           (hexv (string-ref str (+ j 2))))
+                                        bytes))
+                     (let ((dec (decode-bytevector (u8-list->bytevector (reverse bytes)) cs)))
+                       (do ((k 0 (+ k 1))) ((= k (string-length dec)))
+                         (set! out (cons (string-ref dec k) out)))
+                       (loop j)))))
+              (else (set! out (cons c out)) (loop (+ i 1)))))))))
 (define (u8-list->bytevector lst)
   (let ((bv (make-bytevector (length lst))))
     (let loop ((l lst) (i 0)) (if (null? l) bv (begin (bytevector-u8-set! bv i (car l)) (loop (cdr l) (+ i 1)))))))
@@ -1665,9 +1716,13 @@
     (if (not (charset-legal-name? s))
         (throw-jvm 'java.nio.charset.IllegalCharsetNameException s)
         (let ((hit (charset-lookup s)))
-          (if hit
-              (make-jhost "charset" (vector (car hit) (cdr hit)))
-              (throw-jvm 'java.nio.charset.UnsupportedCharsetException s))))))
+          (cond
+            (hit (make-jhost "charset" (vector (car hit) (cdr hit))))
+            ;; the table lists the charsets Chez encodes natively; the rest come
+            ;; from the system iconv, so forName must accept whatever encoding
+            ;; through it will accept or the two disagree about the same name.
+            ((iconv-known? s) (make-jhost "charset" (vector s #x10FFFF)))
+            (else (throw-jvm 'java.nio.charset.UnsupportedCharsetException s)))))))
 (define (charset-name c) (vector-ref (jhost-state c) 0))
 (define (charset-encode-max c) (vector-ref (jhost-state c) 1))
 ;; One charset ARGUMENT — a name string or a Charset object — as its name string.

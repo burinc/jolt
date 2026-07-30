@@ -165,7 +165,7 @@
   ;; ---------------------------------------------------------- markup / text
   {:name "hiccup"
    :paths ["src" "test"]
-   :expect {:tests 64 :pass 382 :fail 4 :error 0}}
+   :expect {:tests 64 :pass 384 :fail 2 :error 0}}
 
   {:name "markdown-clj"
    :paths ["src/clj" "src/cljc" "test"]
@@ -221,7 +221,7 @@
   ;; ---------------------------------------------------------- web
   {:name "ring-codec"
    :paths ["src" "test"]
-   :expect {:tests 9 :pass 68 :fail 4 :error 0}}
+   :expect {:tests 9 :pass 72 :fail 0 :error 0}}
 
   {:name "ring-core"
    :root "ring"

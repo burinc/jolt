@@ -117,33 +117,94 @@
   (let loop ((p (reverse parts)))
     (if (and (pair? p) (string=? (car p) "")) (loop (cdr p)) (reverse p))))
 
+;; --- charsets Chez has no codec for, through the system iconv ----------------
+;; Chez encodes UTF-8/16/32 and the two single-byte Latin sets. Everything else a
+;; caller can name — Shift_JIS, EUC-JP, windows-1252, KOI8-R — needs real tables,
+;; and libc already carries them, so ask iconv rather than shipping our own. Where
+;; iconv is missing (Windows) these are #f and the caller reports
+;; UnsupportedEncodingException, which is what the JVM throws for a charset it
+;; does not have. Silently returning UTF-8 bytes, as this used to, left the caller
+;; no way to tell it had asked for something the host could not do.
+(define c-iconv-open  (jolt-foreign-proc-safe "iconv_open" '(string string) 'void*))
+(define c-iconv-conv  (jolt-foreign-proc-safe "iconv" '(void* void* void* void* void*) 'size_t))
+(define c-iconv-close (jolt-foreign-proc-safe "iconv_close" '(void*) 'int))
+(define iconv-size-max (- (expt 2 (* 8 (foreign-sizeof 'size_t))) 1))
+
+;; iconv_open, or #f when the host has no such charset. The descriptor must be
+;; closed by the caller.
+(define (iconv-open-cd from to)
+  (and c-iconv-open
+       (guard (e (#t #f))
+         (let ((cd (c-iconv-open to from)))
+           (and (not (= cd iconv-size-max)) (not (= cd 0)) cd)))))
+
+(define (iconv-known? name)
+  (let ((cd (iconv-open-cd "UTF-8" name)))
+    (and cd (begin (c-iconv-close cd) #t))))
+
+;; Convert bytes between two charsets, or #f if the host cannot. The four
+;; iconv arguments are pointers to a cursor pair, so they live in one 32-byte
+;; block at offsets 0/8/16/24: in pointer, in remaining, out pointer, out
+;; remaining. Worst case a byte grows to four (UTF-32), plus room for a BOM.
+(define (iconv-bytes bv from to)
+  (and c-iconv-conv c-iconv-close
+       (let ((cd (iconv-open-cd from to)))
+         (and cd
+              (let* ((inlen (bytevector-length bv))
+                     (outcap (+ 32 (* 4 (max inlen 1))))
+                     (inbuf (foreign-alloc (max inlen 1)))
+                     (outbuf (foreign-alloc outcap))
+                     (cells (foreign-alloc 32))
+                     (result
+                      (guard (e (#t #f))
+                        (do ((i 0 (+ i 1))) ((= i inlen))
+                          (foreign-set! 'unsigned-8 inbuf i (bytevector-u8-ref bv i)))
+                        (foreign-set! 'void* cells 0 inbuf)
+                        (foreign-set! 'unsigned-64 cells 8 inlen)
+                        (foreign-set! 'void* cells 16 outbuf)
+                        (foreign-set! 'unsigned-64 cells 24 outcap)
+                        (and (not (= iconv-size-max
+                                     (c-iconv-conv cd cells (+ cells 8) (+ cells 16) (+ cells 24))))
+                             (let* ((n (- outcap (foreign-ref 'unsigned-64 cells 24)))
+                                    (out (make-bytevector n)))
+                               (do ((i 0 (+ i 1))) ((= i n) out)
+                                 (bytevector-u8-set! out i (foreign-ref 'unsigned-8 outbuf i))))))))
+                (foreign-free inbuf) (foreign-free outbuf) (foreign-free cells)
+                (c-iconv-close cd)
+                result)))))
+
+(define (unsupported-encoding-throw name)
+  (jolt-throw (jolt-host-throwable "java.io.UnsupportedEncodingException" name)))
+
 ;; Encode a string to bytes (a bytevector) under a named charset. UTF-8 default;
 ;; ISO-8859-1/US-ASCII are one byte per char; UTF-16/UTF-32 via Chez's codecs
-;; (plain "UTF-16" emits a big-endian BOM then BE, matching the JVM). Names are
-;; canonicalized first, so any JVM alias works. Shared by .getBytes and
-;; decode-bytevector (String.).
+;; (plain "UTF-16" emits a big-endian BOM then BE, matching the JVM); anything
+;; else through iconv. Names are canonicalized first, so any JVM alias works.
+;; Shared by .getBytes and decode-bytevector (String.).
 (define (charset-encode-bv s csname)
   ;; through charset-canonical-down (host-static-classes.ss), so every JVM alias
   ;; the Charset table knows resolves here too — (.getBytes s "l1") used to fall
   ;; past this cond's partial list and silently return UTF-8 bytes.
-  (let ((cs (charset-canonical-down (charset-arg-name csname))))
-    (cond
-      ((string=? cs "utf-8") (string->utf8 s))
-      ((member cs '("iso-8859-1" "us-ascii"))
-       (let* ((n (string-length s)) (bv (make-bytevector n)))
-         (do ((i 0 (+ i 1))) ((= i n) bv)
-           (bytevector-u8-set! bv i (bitwise-and (char->integer (string-ref s i)) #xff)))))
-      ((string=? cs "utf-16be") (string->utf16 s (endianness big)))
-      ((string=? cs "utf-16le") (string->utf16 s (endianness little)))
-      ((string=? cs "utf-16")
-       (let ((be (string->utf16 s (endianness big))))
-         (let* ((n (bytevector-length be)) (bv (make-bytevector (+ n 2))))
-           (bytevector-u8-set! bv 0 #xfe) (bytevector-u8-set! bv 1 #xff)
-           (bytevector-copy! be 0 bv 2 n) bv)))
-      ((or (string=? cs "utf-32be") (string=? cs "utf-32"))
-       (string->utf32 s (endianness big)))
-      ((string=? cs "utf-32le") (string->utf32 s (endianness little)))
-      (else (string->utf8 s)))))
+  (let ((name (charset-arg-name csname)))
+    (let ((cs (charset-canonical-down name)))
+      (cond
+        ((string=? cs "utf-8") (string->utf8 s))
+        ((member cs '("iso-8859-1" "us-ascii"))
+         (let* ((n (string-length s)) (bv (make-bytevector n)))
+           (do ((i 0 (+ i 1))) ((= i n) bv)
+             (bytevector-u8-set! bv i (bitwise-and (char->integer (string-ref s i)) #xff)))))
+        ((string=? cs "utf-16be") (string->utf16 s (endianness big)))
+        ((string=? cs "utf-16le") (string->utf16 s (endianness little)))
+        ((string=? cs "utf-16")
+         (let ((be (string->utf16 s (endianness big))))
+           (let* ((n (bytevector-length be)) (bv (make-bytevector (+ n 2))))
+             (bytevector-u8-set! bv 0 #xfe) (bytevector-u8-set! bv 1 #xff)
+             (bytevector-copy! be 0 bv 2 n) bv)))
+        ((or (string=? cs "utf-32be") (string=? cs "utf-32"))
+         (string->utf32 s (endianness big)))
+        ((string=? cs "utf-32le") (string->utf32 s (endianness little)))
+        (else (or (iconv-bytes (string->utf8 s) "UTF-8" name)
+                  (unsupported-encoding-throw name)))))))
 
 ;; Object.hashCode parity: Java's specified String hash and Clojure's Symbol hash
 ;; (Util.hashCombine), so (.hashCode s) / (.hashCode sym) match the JVM. 32-bit int.
