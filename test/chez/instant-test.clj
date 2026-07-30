@@ -86,6 +86,19 @@
      #inst "2020-01-02"
      "bound into *data-readers* for the inst tag")
 
+;; --- the java.time base types --------------------------------------------------
+;; Instant / Duration are core (RFC 0008 keeps the base value types here and the
+;; formatting/zone layer in jolt-lang/time). They autoload on first use, which the
+;; corpus runner cannot do, so they are gated here alongside clojure.instant.
+(ok= (str (java.time.Instant/parse "2020-01-02T03:04:05Z")) "2020-01-02T03:04:05Z"
+     "Instant/parse round-trips through str")
+(ok= (inst? (java.time.Instant/now)) true "Instant/now is an inst")
+(ok= (str (java.time.Duration/ofMillis 1500)) "PT1.5S" "Duration/ofMillis prints ISO-8601")
+(ok= (str (java.time.Duration/between (java.time.Instant/parse "2020-01-01T00:00:00Z")
+                                      (java.time.Instant/parse "2020-01-01T00:00:10Z")))
+     "PT10S"
+     "Duration/between of two instants")
+
 (let [n @passes f @fails]
   (doseq [m f] (println "instant FAIL " m))
   (println "INSTANT-RESULT pass" n "fail" (count f))

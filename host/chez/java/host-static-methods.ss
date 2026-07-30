@@ -427,10 +427,22 @@
 ;; String/format(fmt args…) / (locale fmt args…) -> the clojure.core format engine.
 (register-class-statics! "String"
   (list (cons "valueOf" (lambda (x . _) (if (jolt-nil? x) "null" (jolt-str-render-one x))))
+        ;; String.format(fmt, Object...) is called both ways in the wild: with the
+        ;; args spread, and with a single Object[] holding them (which is what the
+        ;; JVM's varargs actually compiles to, and what Selmer writes). Splat a lone
+        ;; array argument so both reach the same format engine. A leading Locale is
+        ;; accepted and ignored — formatting here is locale-independent.
         (cons "format" (lambda (a . rest)
-                         (if (and (jhost? a) (string=? (jhost-tag a) "locale"))
-                             (apply jolt-format (car rest) (cdr rest))
-                             (apply jolt-format a rest))))))
+                         (let* ((locale? (and (jhost? a) (string=? (jhost-tag a) "locale")))
+                                (fmt (if locale? (car rest) a))
+                                (args (if locale? (cdr rest) rest))
+                                ;; jolt-array? / ja->list live in natives-array.ss,
+                                ;; loaded after this file — resolved at call time.
+                                (args (if (and (pair? args) (null? (cdr args))
+                                               (jolt-array? (car args)))
+                                          (ja->list (jolt-array-vec (car args)))
+                                          args)))
+                           (apply jolt-format fmt args))))))
 
 ;; ---- java.text.NumberFormat -------------------------------------------------
 ;; A grouping decimal formatter (selmer number-format / cuerdas). state:
