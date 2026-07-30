@@ -176,7 +176,7 @@
    :paths ["src" "test" "resources"]
    :deps ["@data.json/src/main/clojure" "~time/src"]
    :exclude-nses ["selmer.benchmark"]
-   :expect {:tests 131 :pass 464 :fail 13 :error 44}}
+   :expect {:tests 131 :pass 484 :fail 13 :error 24}}
 
   {:name "html"
    :paths ["src" "test"]
@@ -233,13 +233,13 @@
    :paths ["modules/reitit-core/src" "test/cljc"]
    :test-paths ["test/cljc"]
    :deps ["~router/src" "@spec.alpha/src/main/clojure"]
-   :extra-deps {meta-merge/meta-merge {:mvn/version "1.0.0"}
-   :expect {:tests 27 :pass 343 :fail 1 :error 22}}
+   :extra-deps {meta-merge/meta-merge {:mvn/version "1.0.0"}}
    ;; test/cljc holds the suites for every reitit module; these are the ones that
    ;; need reitit-core alone (the rest pull reitit-ring / -malli / muuntaja /
    ;; jsonista, which are not in the checkout).
    :nses ["reitit.core-test" "reitit.impl-test" "reitit.trie-test"
-          "reitit.spec-test"]}
+          "reitit.spec-test"]
+   :expect {:tests 27 :pass 343 :fail 1 :error 22}}
 
   ;; ---------------------------------------------------------- tooling
   {:name "compliment"

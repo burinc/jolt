@@ -151,7 +151,7 @@
      (let* ((str (matcher-t-str m))
             (len (string-length str))
             (start (matcher-t-pos m))
-            (mm (and (<= start len) (irregex-search (matcher-t-irx m) str start))))
+            (mm (and (<= start len) (irx-search-from (matcher-t-irx m) str start))))
        (if mm
            (let ((ms (irregex-match-start-index mm 0))
                  (e (irregex-match-end-index mm 0)))
@@ -207,6 +207,29 @@
         (matcher-note-match! m mm)
         (begin (matcher-t-last-set! m #f) #f))))
 
+;; Next match at or after cursor `i`.
+;;
+;; A pattern anchored at the start of input (`^` without (?m), or \A) can only
+;; match at index 0, so once a scan has moved past 0 there is nothing left to find.
+;; irregex marks such a pattern ~consumer? and its own irregex-fold stops on that
+;; flag; jolt's scanning loops (re-seq, replace-all, split, matcher find) hand-roll
+;; their own loop, so they have to honor it here.
+;;
+;; Without this, irregex-search treats its start argument as the string ORIGIN and
+;; re-anchors ^ there: (str/replace "abcabc" #"^abc" "-") replaced twice, and
+;; (re-seq #"^abc" "abcabc") returned two matches, where the JVM does one. Selmer's
+;; include-tag parser strips its tag with ^.+?include\s*, so a nested
+;; {% include "a/include/head.html" %} lost everything up to the LAST "include"
+;; and resolved to "/head.html".
+;;
+;; Residual: a bos nested inside an alternation (#"^a|b") is not flagged a
+;; consumer — it can legitimately match elsewhere — so scanning continues and its
+;; ^ branch can still re-anchor at the resume offset. irregex's own fold has the
+;; same limit.
+(define (irx-search-from irx s i)
+  (and (or (= i 0) (not (flag-set? (irregex-flags irx) ~consumer?)))
+       (irregex-search irx s i)))
+
 ;; All non-overlapping matches, left to right. Advance past each match end (or by
 ;; one on a zero-width match). nil when there are no matches (Clojure: seq-able as
 ;; nil, so (if-let [m (re-seq ...)] ...) works).
@@ -214,7 +237,7 @@
   (let ((irx (regex-t-irx (jolt-re-pattern re)))
         (len (string-length s)))
     (let loop ((start 0) (acc '()))
-      (let ((m (and (<= start len) (irregex-search irx s start))))
+      (let ((m (and (<= start len) (irx-search-from irx s start))))
         (if m
             (let ((ms (irregex-match-start-index m 0))
                   (e (irregex-match-end-index m 0)))
