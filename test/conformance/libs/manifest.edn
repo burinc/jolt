@@ -110,7 +110,13 @@
   {:name "spec.alpha"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   :expect {:tests 13 :pass 166 :fail 4 :error 4}}
+   ;; s/exercise generates through test.check
+   :deps ["@test.check/src/main/clojure"]
+   ;; the 4 fails are instrument's ::caller, which spec reads off the JVM stack
+   ;; trace. jolt does tail calls, so the calling frame is gone before anything can
+   ;; look — the conform failure still throws with the same explain-data, it just
+   ;; carries no ::caller. See known-divergences.edn.
+   :expect {:tests 13 :pass 170 :fail 4 :error 0}}
 
   {:name "test.check"
    :paths ["src/main/clojure" "src/test/clojure"]
@@ -245,6 +251,10 @@
   {:name "ring-spec"
    :paths ["src" "test"]
    :deps ["@spec.alpha/src/main/clojure" "@ring/ring-core-protocols/src"]
+   ;; ring-spec's only test is the lein template placeholder, (is (= 0 1)) under a
+   ;; "FIXME, I fail." — it fails on the JVM too. The library itself loads, which is
+   ;; what running it here checks.
+   :note "the single failure is upstream's unedited template test"
    :expect {:tests 1 :pass 0 :fail 1 :error 0}}
 
   {:name "reitit-core"

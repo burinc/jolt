@@ -197,6 +197,16 @@
    :jvm "clojure.lang.APersistentVector$SubVector"
    :jolt "clojure.lang.PersistentVector"
    :note "jolt's subvec is a vector, not a view class. A library that derives the subvec class from a sample value — lasertag does — then sees every vector as a subvec. Values and behavior are identical; only the class differs."}
+  ;; (.getStackTrace (Thread/currentThread)) is empty. jolt does proper tail calls,
+  ;; so the frames a caller-naming API wants are the ones TCO has already erased —
+  ;; (defn f [x y] (g x y)) leaves no f frame to find. jolt reports a backtrace for a
+  ;; THROW by walking the live continuation, which is the non-tail spine and is what
+  ;; error reporting actually needs; there is no reified stack to hand back on demand.
+  {:category :host-model
+   :behavior "(.getStackTrace (Thread/currentThread)), and clojure.spec.test.alpha's ::caller derived from it"
+   :jvm "the caller's frames; ::caller {:var-scope the-calling-var}"
+   :jolt "an empty StackTraceElement[]; no ::caller key"
+   :note "Inherent to tail calls, not a missing shim. spec's instrument still throws the same conform ExceptionInfo with the same explain-data — only the ::caller annotation is absent. Surfaces in spec.alpha's clojure.test-clojure.instr suite."}
   ;; ByteBuffer.slice() copies where the JVM shares the backing array.
   {:category :host-model
    :behavior "(.array (.slice buf)) after (.position buf 1)"
