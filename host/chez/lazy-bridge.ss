@@ -80,10 +80,29 @@
        (if (jolt-lazyseq-realized? x) (deliver) (run!))))))
 
 ;; Shadow fork-thread so any spawn (future/agent/core.async/process, all loaded
-;; after this file) flips jolt-mt? on. Captured in a prior define so the RHS sees
-;; the primitive, not the top-level binding being defined (Chez top-level letrec*).
+;; after this file) flips jolt-mt? on and joins the live-thread set. Captured in a
+;; prior define so the RHS sees the primitive, not the top-level binding being
+;; defined (Chez top-level letrec*).
+;;
+;; Chez exposes no list of running threads, so the shadow keeps one: a thread
+;; enters the set as its body starts and leaves when the body returns. This backs
+;; Thread/getAllStackTraces (io.ss), whose callers are leak checks counting
+;; threads before and after some work.
+(define live-threads (make-eqv-hashtable))
+(define live-threads-mutex (make-mutex))
+(define (live-thread-ids)
+  (with-mutex live-threads-mutex (vector->list (hashtable-keys live-threads))))
 (define %ls-orig-fork-thread fork-thread)
-(define (fork-thread thunk) (jolt-mark-mt!) (%ls-orig-fork-thread thunk))
+(define (fork-thread thunk)
+  (jolt-mark-mt!)
+  (%ls-orig-fork-thread
+   (lambda ()
+     (let ((id (get-thread-id)))
+       (with-mutex live-threads-mutex (hashtable-set! live-threads id #t))
+       (dynamic-wind
+         (lambda () #f)
+         thunk
+         (lambda () (with-mutex live-threads-mutex (hashtable-delete! live-threads id))))))))
 
 ;; coll->cells: coerce the body result to the cell representation = a seq | nil.
 (define (jolt-coll->cells c) (jolt-seq c))

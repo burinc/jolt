@@ -714,6 +714,11 @@
 ;; does: a Chez thread parameter is inherited by a forked thread, and a child must
 ;; not report the parent's handle as its own.
 (define thread-handle-cell (make-thread-parameter #f))      ; (thread-id . handle)
+;; Mirror of the per-thread cache keyed by thread id, so another thread can name
+;; this one — Thread/getAllStackTraces has to hand back the SAME handle
+;; currentThread does, or a caller cannot find itself in the map.
+(define thread-handles-by-id (make-eqv-hashtable))
+(define thread-handles-mutex (make-mutex))
 (define (current-thread-handle)
   (let ((c (thread-handle-cell))
         (id (get-thread-id)))
@@ -721,9 +726,35 @@
         (cdr c)
         (let ((h (make-jhost "thread" (current-interrupt-box))))
           (thread-handle-cell (cons id h))
+          (with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
           h))))
-(register-class-statics! "Thread" (list (cons "currentThread" current-thread-handle)))
-(register-class-statics! "java.lang.Thread" (list (cons "currentThread" current-thread-handle)))
+;; A handle for a thread that has never asked who it is. Its interrupt box is its
+;; own, so .interrupt through it does not reach that thread — the thread adopts a
+;; real handle the moment it calls currentThread.
+(define (thread-handle-for-id id)
+  (if (eqv? id (get-thread-id))
+      (current-thread-handle)              ; the caller must find ITSELF in the map
+      (or (with-mutex thread-handles-mutex (hashtable-ref thread-handles-by-id id #f))
+          (let ((h (make-jhost "thread" (box #f))))
+            (with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
+            h))))
+;; Thread/getAllStackTraces: the live threads mapped to EMPTY stack traces. jolt
+;; reifies no call stack (TCO erases caller frames) and .getStackTrace is already
+;; an empty StackTraceElement[], so the traces are honestly empty; the thread set
+;; is real, which is what the callers want — ring's suites count threads before
+;; and after a request to check for leaks.
+(define (all-stack-traces)
+  (let loop ((ids (cons (get-thread-id) (live-thread-ids)))
+             (seen '())
+             (m empty-pmap))
+    (cond ((null? ids) m)
+          ((memv (car ids) seen) (loop (cdr ids) seen m))
+          (else (loop (cdr ids) (cons (car ids) seen)
+                      (jolt-assoc m (thread-handle-for-id (car ids)) (jolt-vector)))))))
+(let ((statics (list (cons "currentThread" current-thread-handle)
+                     (cons "getAllStackTraces" all-stack-traces))))
+  (register-class-statics! "Thread" statics)
+  (register-class-statics! "java.lang.Thread" statics))
 
 ;; --- java.io.File / java.util.UUID constructors -----------------------------
 ;; (java.io.File. parent child) joins with "/"; (File. path) wraps the path.
