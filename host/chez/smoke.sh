@@ -591,7 +591,11 @@ rm -f "$process_log"
 # the way the JVM does), where sysctl only counts the cores that exist. A wrong
 # answer here is invisible to any value-comparing gate: it returned a plausible
 # 1 for as long as it was hardcoded, which silently serialised pmap.
-cpu_want="$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo '')"
+# nproc also honours OMP_NUM_THREADS / OMP_THREAD_LIMIT, which the affinity mask
+# does not — unset them here or a CI runner that exports either makes this disagree
+# with a perfectly correct answer.
+cpu_want="$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc 2>/dev/null \
+            || sysctl -n hw.logicalcpu 2>/dev/null || echo '')"
 if [ -n "$cpu_want" ]; then
   check '(.availableProcessors (Runtime/getRuntime))' "$cpu_want"
   check '(jolt.host/available-processors)' "$cpu_want"
