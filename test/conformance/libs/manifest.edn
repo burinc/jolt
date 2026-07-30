@@ -238,7 +238,7 @@
    ;; a JVM library with no jolt equivalent. The multipart suites need Apache
    ;; commons-fileupload and commons-io; both are JVM-only too.
    :note "clj-time (Joda) + commons-fileupload/commons-io are JVM-only"
-   :expect {:tests 151 :pass 397 :fail 15 :error 23 :load-fail 2}}
+   :expect {:tests 151 :pass 399 :fail 15 :error 22 :load-fail 2}}
 
   {:name "ring-spec"
    :paths ["src" "test"]

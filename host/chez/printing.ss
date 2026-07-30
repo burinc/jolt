@@ -36,6 +36,15 @@
   (register-pr-str-arm! pred render)
   (register-pr-readable-arm! pred render))
 
+;; A user's (defmethod print-method T …) IS the printer for T, as on the JVM — it
+;; outranks every built-in rendering, including an arm a library registered for
+;; its own host class. So the user method is consulted BEFORE the arm list rather
+;; than being one more entry in it (where whichever arm was registered last won).
+;; The java layer installs this: resolving the method needs (class x), which is
+;; its concern. It returns the rendered string, or #f when there is no method.
+(define pr-user-method-render #f)
+(define (set-pr-user-method-render! f) (set! pr-user-method-render f))
+
 ;; *print-namespace-maps* shared-ns detector: returns the namespace string when
 ;; the map is non-empty, the var is true, every key is a namespace-qualified
 ;; keyword, and they all share the same (non-nil) namespace. Otherwise #f.
@@ -116,10 +125,11 @@
     ;; is QUOTED, which is the (pr x) vs (print x) difference on the JVM.
     (else (jolt-pr-str/readable x #t))))
 (define (jolt-pr-readable-dispatch x)
-  (let loop ((as jolt-pr-readable-arms))
-    (cond ((null? as) (jolt-pr-readable-base x))
-          (((caar as) x) ((cdar as) x))
-          (else (loop (cdr as))))))
+  (or (and pr-user-method-render (pr-user-method-render x))
+      (let loop ((as jolt-pr-readable-arms))
+        (cond ((null? as) (jolt-pr-readable-base x))
+              (((caar as) x) ((cdar as) x))
+              (else (loop (cdr as)))))))
 
 ;; *print-meta* support. The var is def'd after this file loads, so capture its
 ;; cell lazily; jolt-var-get (patched by dyn-binding.ss) honors a `binding`.

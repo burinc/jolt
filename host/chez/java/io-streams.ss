@@ -340,24 +340,50 @@
                                                  "Closeable" "AutoCloseable" "Flushable" "Appendable"))) #t)
         (else 'pass))))))
 
-;; --- pr / pr-str honor a user (defmethod print-method SomeRecord …) ----------
-;; The readable printer's base jrec arm (records.ss) renders the default
-;; #ns.Name{…} form. A library often installs its own print form via
-;; (defmethod print-method OrderedMap [o ^Writer w] …). This arm, registered after
-;; that base one (so it is checked first) and after the char-writer Writer type it
-;; needs, renders such a record through its print-method into a StringWriter.
+;; --- pr / pr-str honor a user (defmethod print-method T …) -------------------
+;; On the JVM print-method IS the printer, so installing one changes what pr
+;; emits for that type. Here the printer is a list of native arms, and this hook
+;; (printing.ss consults it before that list) restores the JVM's precedence: a
+;; record renders through its method instead of the default #ns.Name{…} form, and
+;; a host class renders through its method instead of the arm the library that
+;; provided the class registered — for instance ring's session store, which
+;; round-trips a java.time.Instant through a custom print-method and edn reader.
 ;;
-;; Only a DIRECT method (keyed by the record's class-name tag) counts — the
-;; multimethod's :default falls back to __pr-str1, which returns here, so
-;; consulting the direct method table (not a full resolve) keeps a record with no
-;; user method on the default path and avoids infinite recursion.
-(define (jrec-user-print-method r)
+;; Two dispatch values are tried: the type tag the multimethod dispatches on
+;; itself (a record's class name, or the :jolt/… tag of a built-in), then the
+;; value's class, since a method written for a host type names the class —
+;; (defmethod print-method java.time.Instant …) — and jolt's tag for one of those
+;; is the catch-all :object.
+;;
+;; Only a DIRECT method counts — the multimethod's :default falls back to
+;; __pr-str1, which returns here, so a full resolve would recurse forever.
+;;
+;; jolt's own print-method entries are all keyed by type tag, so resolving a
+;; class per printed value would be dead weight until a library installs a
+;; class-keyed method. Whether any exists is settled once per multimethod epoch.
+(define pm-class-keys-epoch -1)
+(define pm-has-class-keys? #f)
+(define (pm-class-keys? tbl)
+  (unless (fx= pm-class-keys-epoch jolt-mm-epoch)
+    (set! pm-class-keys-epoch jolt-mm-epoch)
+    (set! pm-has-class-keys?
+          (let loop ((ks (vector->list (hashtable-keys tbl))))
+            (and (pair? ks) (or (jclass? (car ks)) (loop (cdr ks)))))))
+  pm-has-class-keys?)
+
+(define (user-print-method x)
   (let ((mf (var-deref "clojure.core" "print-method")))
     (and (jolt-multifn? mf)
-         (hashtable-ref (jolt-multifn-methods mf) (jrec-tag r) #f))))
-(register-pr-readable-arm!
-  (lambda (x) (and (jrec? x) (jrec-user-print-method x)))
+         (let ((tbl (jolt-multifn-methods mf)))
+           (or (hashtable-ref tbl (jolt-type x) #f)
+               (and (pm-class-keys? tbl)
+                    (let ((c (jolt-class-name x)))
+                      (and (string? c)
+                           (hashtable-ref tbl (jolt-class-for c) #f)))))))))
+(set-pr-user-method-render!
   (lambda (x)
-    (let ((port (open-output-string)))
-      (jolt-invoke (jrec-user-print-method x) x (make-char-writer port))
-      (get-output-string port))))
+    (let ((m (user-print-method x)))
+      (and m
+           (let ((port (open-output-string)))
+             (jolt-invoke m x (make-char-writer port))
+             (get-output-string port))))))
