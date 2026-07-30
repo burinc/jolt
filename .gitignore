@@ -3,6 +3,7 @@ AGENTS.md
 CLAUDE.md
 build/
 target/
+/.cache/
 .clj-kondo/
 .cpcache/
 .dirge/

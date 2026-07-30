@@ -71,7 +71,7 @@ fi
 
 # --- jolt release build ------------------------------------------------------
 cd /src
-make jolt-release
+make CHEZ=/opt/chez/bin/chez jolt-release
 
 # --- report + in-container smoke ---------------------------------------------
 b=target/release/jolt

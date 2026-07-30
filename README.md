@@ -20,8 +20,11 @@ executable) and need only the base system libraries:
 
 `make build` provisions [Chez Scheme](https://cisco.github.io/ChezScheme/) and a
 C compiler locally through [Makes](https://github.com/makeplus/makes), then
-builds the standalone binary. The conformance gate additionally uses Clojure on
-the JVM as an optional oracle, but running jolt does not.
+builds the standalone binary. An explicit `CHEZ=/path/to/chez` (or
+`CHEZSCHEME=/path/to/scheme`) is authoritative and bypasses local provisioning;
+release builders use this to retain their threaded Chez and platform toolchain.
+The conformance gate additionally uses Clojure on the JVM as an optional oracle,
+but running jolt does not.
 
 ### Dependency resolution
 

@@ -9,7 +9,17 @@ M := .cache/makes
 $(shell [ -d '$M' ] || git clone -q $R '$M')
 
 include $M/init.mk
+
+# An explicit caller-selected Chez is authoritative. This preserves CI/release
+# toolchains whose threading, libc floor, and native libraries are intentional.
+JOLT-CHEZ := $(or $(CHEZ),$(CHEZSCHEME))
+ifneq (,$(JOLT-CHEZ))
+SHELL-DEPS += $(JOLT-CHEZ)
+else
 include $M/chezscheme.mk
+JOLT-CHEZ := $(CHEZSCHEME)
+endif
+
 include $M/clean.mk
 include $M/shell.mk
 
@@ -18,7 +28,7 @@ MAKES-CLEAN := \
   target/ \
 
 PREFIX ?= $(if $(IS-ROOT),/usr/local,$(HOME)/.local)
-CHEZ ?= $(CHEZSCHEME)
+CHEZ ?= $(JOLT-CHEZ)
 
 # A locally built Chez links its kernel against the bundled lz4 and zlib. Their
 # static archives remain in the Makes build tree rather than the installed Chez
@@ -45,8 +55,15 @@ JOLT-TARGETS-NEEDING-DEPS := \
 
 default:: build
 
-# Install the pinned Chez/C toolchain and initialize every vendored dependency.
-deps: submodules $(CHEZSCHEME)
+# Honor an explicit Chez or install the pinned toolchain, initialize every
+# vendored dependency, and enforce Jolt's threaded-runtime requirement.
+deps: submodules $(JOLT-CHEZ)
+	@threaded=$$(printf '(write (threaded?)) (newline)\n' | \
+	  '$(JOLT-CHEZ)' -q 2>/dev/null | tr -d '\r'); \
+	  test "$$threaded" = '#t' || { \
+	    echo "Jolt requires a threaded Chez Scheme ($(JOLT-CHEZ) reported $$threaded)" >&2; \
+	    exit 1; \
+	  }
 
 submodules:
 	@if git submodule status --recursive | grep -q '^-'; then \
@@ -72,7 +89,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values corpus unit mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke certify
+ci: submodules values corpus unit mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -360,6 +377,11 @@ shakelocal: testbin
 # this diffs them so a load added to one but not the other fails the gate.
 manifestcheck:
 	@sh host/chez/manifest-check.sh
+
+# Makefile dependency selection: explicit Chez overrides must bypass local
+# Makes provisioning so release jobs retain their chosen compiler and libc.
+makefilesmoke:
+	@bash test/makefile-smoke.sh
 
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
 certify:
