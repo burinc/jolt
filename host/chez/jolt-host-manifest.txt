@@ -10,6 +10,7 @@
 add-shutdown-hook
 allow-unresolved-vars?
 array-value?
+available-processors
 backtrace-string
 block-sigint
 build-binary

@@ -94,6 +94,37 @@
                (catch Exception e (if (re-find #"No such file" (str (ex-message e))) :nosuch :other)))
           :nosuch)
 
+;; A child that cannot be waited on must still produce an answer. With SIGCHLD set
+;; to SIG_IGN the kernel reaps every child itself, so waitpid can only ever fail
+;; with ECHILD — and the reap loop used to treat that as "ask again", spinning
+;; forever while holding the process mutex. No output, no exit, for as long as the
+;; caller waited: that is what sat on a CI gate for 3h42m (jolt-pgbh). The
+;; disposition survives exec, so jolt can inherit it from a parent it never chose,
+;; which is why it reproduced on one runner and nowhere else.
+;;
+;; Set it here deliberately, after a spawn has already run (so the spawn path's
+;; SIG_DFL restore has happened and is not what is under test), to put the reap
+;; loop in exactly that state. If this check hangs, the spin is back — smoke.sh's
+;; per-case cap names it.
+(jolt.ffi/load-library)
+(def c-signal (jolt.ffi/__cfn "signal" [:int :pointer] :pointer))
+(def SIGCHLD (if (str/includes? (System/getProperty "os.name") "Mac") 20 17))
+;; Every blocking call stays INSIDE a check-eq, so the label is announced before it
+;; runs: written as a `let` binding instead, the deref hangs before anything is
+;; printed and the log ends on the PREVIOUS check's label — pointing at the wrong
+;; one. (Verified by reintroducing the spin: that is exactly what it did.)
+(let [prev (c-signal SIGCHLD 1)]                     ; 1 = SIG_IGN
+  ;; 0 when the kernel auto-reaped it (the status is then unrecoverable — a
+  ;; documented divergence from the JVM, which always reaps its own children), or
+  ;; the true 5 on a platform that still let us reap. Never a hang.
+  (check-eq "unwaitable child still yields an exit code"
+            (contains? #{0 5} (:exit @(process ["sh" "-c" "exit 5"]))) true)
+  ;; a signalled child's status IS recoverable without waitpid: 128+signal
+  (let [proc (process ["sleep" "10"])]
+    (p/destroy proc)
+    (check-eq "unwaitable signalled child reports 128+SIGTERM" (:exit @proc) 143))
+  (c-signal SIGCHLD prev))                           ; put the disposition back
+
 ;; class / instance? derive from the central registry
 (check-eq "pb instance?" (instance? java.lang.ProcessBuilder (java.lang.ProcessBuilder. ["true"])) true)
 (check-eq "proc class" (.getName (class (:proc @(process ["true"])))) "java.lang.Process")

@@ -585,6 +585,21 @@ else
 fi
 rm -f "$process_log"
 
+# Runtime.availableProcessors reports the host's real usable CPU count. The value
+# is machine-dependent, so the expectation comes from the OS rather than a literal
+# — nproc first, because it honours the CPU affinity mask the way this does (and
+# the way the JVM does), where sysctl only counts the cores that exist. A wrong
+# answer here is invisible to any value-comparing gate: it returned a plausible
+# 1 for as long as it was hardcoded, which silently serialised pmap.
+cpu_want="$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo '')"
+if [ -n "$cpu_want" ]; then
+  check '(.availableProcessors (Runtime/getRuntime))' "$cpu_want"
+  check '(jolt.host/available-processors)' "$cpu_want"
+  # pmap sizes its look-ahead window from it, so a broken count degrades pmap
+  # rather than failing it — assert the seam is wired, not just present.
+  check '(count (pmap inc (range 100)))' '100'
+fi
+
 # jolt.parser — the general parser-combinator core, running rm-hull/jasentaa's
 # own suite for the adopted pieces plus jolt's added combinators. Self-checks.
 parser_out="$($jolt run test/chez/parser-test.clj 2>/dev/null)"

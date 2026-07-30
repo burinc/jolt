@@ -27,10 +27,51 @@
 ;; --- libc entry points -------------------------------------------------------
 (define proc-waitpid (jolt-foreign-proc-safe "waitpid" '(int void* int) 'int))
 (define proc-kill    (jolt-foreign-proc-safe "kill"    '(int int)       'int))
+(define proc-signal  (jolt-foreign-proc-safe "signal"  '(int void*) 'void*))
+;; errno, to tell a waitpid that was merely interrupted (EINTR — retry) from one
+;; that can never succeed (ECHILD — the child is gone, retrying is an infinite
+;; loop). Both spellings of the location accessor: Darwin/BSD, then glibc/musl.
+(define proc-errno-loc
+  (or (jolt-foreign-proc-safe "__error" '() 'void*)
+      (jolt-foreign-proc-safe "__errno_location" '() 'void*)))
+(define (proc-errno)
+  (if proc-errno-loc (guard (e (#t 0)) (foreign-ref 'int (proc-errno-loc) 0)) 0))
 
 (define proc-WNOHANG 1)        ; macOS + Linux
 (define proc-SIGTERM 15)
 (define proc-SIGKILL 9)
+(define proc-EINTR 4)          ; macOS + Linux
+(define proc-ECHILD 10)        ; macOS + Linux
+;; SIGCHLD is 20 on Darwin/BSD and 17 on Linux. Same machine-type test as
+;; concurrency.ss uses for the SIG_BLOCK numerics.
+(define proc-SIGCHLD
+  (let* ((s (symbol->string (machine-type))) (n (string-length s)))
+    (let loop ((i 0))
+      (cond ((> (+ i 3) n) 17)                            ; default: Linux
+            ((string=? (substring s i (+ i 3)) "osx") 20) ; Darwin/macOS
+            (else (loop (+ i 1)))))))
+
+;; A jolt that spawns children has to be able to reap them, so SIGCHLD must not be
+;; left at an INHERITED SIG_IGN: with that disposition the kernel reaps every child
+;; itself and waitpid can only ever fail with ECHILD, making exit statuses
+;; unknowable. The disposition does survive exec, so jolt can arrive with it set
+;; through no choice of its own — a CI runner, a supervisor, any parent that
+;; ignored SIGCHLD. Restore SIG_DFL once, before the first spawn, as a JVM does
+;; when it installs its own child handling.
+;;
+;; On the first spawn rather than at load: a jolt that never starts a process has
+;; no business touching the process's signal dispositions. Only SIG_IGN is
+;; replaced — an inherited real HANDLER is left alone, since something in the
+;; process legitimately wants those notifications.
+(define proc-sigchld-checked? (box #f))
+(define (proc-ensure-reapable!)
+  (unless (unbox proc-sigchld-checked?)
+    (set-box! proc-sigchld-checked? #t)
+    (when proc-signal
+      (guard (e (#t #f))
+        (let ((prev (proc-signal proc-SIGCHLD 0)))     ; install SIG_DFL, get the old one
+          ;; SIG_IGN is 1; anything else (SIG_DFL = 0, or a handler address) is put back.
+          (unless (eqv? prev 1) (proc-signal proc-SIGCHLD prev)))))))
 
 ;; WEXITSTATUS / signalled-process convention: a process killed by signal N
 ;; reports 128+N, matching the JVM's Process.exitValue on Unix.
@@ -40,16 +81,26 @@
         (bitwise-and (bitwise-arithmetic-shift-right raw 8) #xff)
         (+ 128 termsig))))
 
-;; One waitpid call; returns (values rc decoded-or-#f). rc = pid on reap, 0 when
-;; WNOHANG and still running, -1 on EINTR/error.
+;; One waitpid call; returns (values rc decoded-or-#f errno). rc = pid on reap, 0
+;; when WNOHANG and still running, -1 on error (errno says which).
 (define (proc-waitpid-once pid nohang?)
   (if (not proc-waitpid)
-      (values -1 #f)
+      (values -1 #f proc-ECHILD)
       (let ((buf (foreign-alloc 4)))
-        (let ((rc (proc-waitpid pid buf (if nohang? proc-WNOHANG 0))))
-          (let ((raw (foreign-ref 'int buf 0)))
-            (foreign-free buf)
-            (values rc (and (= rc pid) (proc-decode-status raw))))))))
+        (let* ((rc (proc-waitpid pid buf (if nohang? proc-WNOHANG 0)))
+               (err (if (< rc 0) (proc-errno) 0))
+               (raw (foreign-ref 'int buf 0)))
+          (foreign-free buf)
+          (values rc (and (= rc pid) (proc-decode-status raw)) err)))))
+
+;; The status to report for a child that can no longer be waited on (ECHILD:
+;; something else reaped it). If we signalled it, Unix convention gives the answer
+;; — 128+signal, the same encoding proc-decode-status uses. Otherwise the status is
+;; genuinely unrecoverable and 0 is reported, a documented divergence from the JVM
+;; (which always reaps its own children and so always knows). proc-ensure-reapable!
+;; is what keeps this from arising in the first place.
+(define (proc-lost-status st)
+  (or (unbox (proc-p-signalled st)) 0))
 
 ;; --- shell command construction ----------------------------------------------
 (define (proc-sh-quote s)      ; single-quote a token for /bin/sh
@@ -252,7 +303,7 @@
 
 ;; --- java.lang.Process -------------------------------------------------------
 ;; state: #(stdin-os stdout-is stderr-is pid exit-box cmd mutex stdout-port
-;;          stdin-port inherit-latches)
+;;          stdin-port inherit-latches signalled-box)
 (define (proc-p-stdin-os st)   (vector-ref (jhost-state st) 0))
 (define (proc-p-stdout-is st)  (vector-ref (jhost-state st) 1))
 (define (proc-p-stderr-is st)  (vector-ref (jhost-state st) 2))
@@ -263,6 +314,9 @@
 (define (proc-p-stdout-port st) (vector-ref (jhost-state st) 7))
 (define (proc-p-stdin-port st)  (vector-ref (jhost-state st) 8))
 (define (proc-p-inherit-latches st) (vector-ref (jhost-state st) 9))
+;; The 128+signal status of a signal WE sent, if any — the one recoverable answer
+;; when the child turns out to be unwaitable (see proc-lost-status).
+(define (proc-p-signalled st)  (vector-ref (jhost-state st) 10))
 (define (proc-process? x) (and (jhost? x) (string=? (jhost-tag x) "process")))
 
 ;; ProcessBuilder.start resolves the program before spawning and throws
@@ -305,6 +359,7 @@
         (string-append "Cannot run program \""
                        (if (string? (car cmd)) (car cmd) (jolt-str-render-one (car cmd)))
                        "\": error=2, No such file or directory")))
+    (proc-ensure-reapable!)
     (call-with-values
       (lambda () (open-process-ports (proc-build-shell-command self) (buffer-mode block) #f))
       (lambda (child-stdin child-stdout child-stderr pid)
@@ -317,7 +372,7 @@
                             (make-in-stream child-stdout)
                             (make-in-stream child-stderr)
                             pid (box #f) (proc-pb-cmd self) (make-mutex)
-                            child-stdout child-stdin latches)))
+                            child-stdout child-stdin latches (box #f))))
           ;; INHERIT emulation: pump between the pipe and jolt's own stdio. The
           ;; output pumps are latched so waitFor can join them — INHERIT output
           ;; must be flushed before the process is reported finished.
@@ -329,30 +384,55 @@
 ;; Block until the process exits, caching and returning the decoded status. Any
 ;; INHERIT output pumps are joined first, so all forwarded output has landed by
 ;; the time the exit status is returned (matching fd-level INHERIT).
+;; EVERY branch here has to reach a decision. This loop runs while holding the
+;; process mutex, so a branch that retries forever does not merely spin — it
+;; deadlocks every other method on the process, silently and for as long as the
+;; caller is willing to wait. That is what sat on a CI gate for 3h42m (jolt-pgbh):
+;; a waitpid failing with ECHILD fell into the `else` retry, which could never
+;; succeed. Only EINTR is retried, because only EINTR means "ask again".
 (define (proc-wait-blocking st)
   (let ((code
           (with-mutex (proc-p-mutex st)
             (or (unbox (proc-p-exit-box st))
                 (let loop ()
                   (call-with-values (lambda () (proc-waitpid-once (proc-p-pid st) #f))
-                    (lambda (rc decoded)
-                      (cond ((and decoded (= rc (proc-p-pid st)))
-                             (set-box! (proc-p-exit-box st) decoded) decoded)
-                            (else (or (unbox (proc-p-exit-box st)) (loop)))))))))))
+                    (lambda (rc decoded err)
+                      (cond
+                        ((and decoded (= rc (proc-p-pid st)))
+                         (set-box! (proc-p-exit-box st) decoded) decoded)
+                        ;; another caller reaped it between our check and our wait
+                        ((unbox (proc-p-exit-box st)))
+                        ;; interrupted by a signal: the child may well still be
+                        ;; running, so this is the one case worth asking again.
+                        ((and (< rc 0) (= err proc-EINTR)) (loop))
+                        ;; unwaitable (ECHILD) or waitpid unavailable — no number of
+                        ;; retries changes that.
+                        (else (let ((c (proc-lost-status st)))
+                                (set-box! (proc-p-exit-box st) c) c))))))))))
     (for-each proc-latch-wait (unbox (proc-p-inherit-latches st)))
     code))
 
-;; Non-blocking liveness poll (reaps and caches on exit).
+;; Non-blocking liveness poll (reaps and caches on exit). An unwaitable child is
+;; reported dead AND has its status cached, so a waitFor after it cannot go looking
+;; for a child that will never be there.
 (define (proc-alive? st)
   (with-mutex (proc-p-mutex st)
     (if (unbox (proc-p-exit-box st)) #f
         (call-with-values (lambda () (proc-waitpid-once (proc-p-pid st) #t))
-          (lambda (rc decoded)
-            (cond ((= rc 0) #t)
+          (lambda (rc decoded err)
+            (cond ((= rc 0) #t)                      ; still running
                   (decoded (set-box! (proc-p-exit-box st) decoded) #f)
-                  (else #f)))))))
+                  ((and (< rc 0) (= err proc-EINTR)) #t)   ; no answer yet, assume alive
+                  (else (set-box! (proc-p-exit-box st) (proc-lost-status st)) #f)))))))
 
-(define (proc-signal st sig) (when proc-kill (proc-kill (proc-p-pid st) sig)) st)
+;; Records a terminating signal we sent, so proc-lost-status can still give the
+;; right answer for a child that something else reaps before we get to it.
+(define (proc-signal st sig)
+  (when proc-kill
+    (proc-kill (proc-p-pid st) sig)
+    (when (or (= sig proc-SIGTERM) (= sig proc-SIGKILL))
+      (set-box! (proc-p-signalled st) (+ 128 sig))))
+  st)
 
 (register-host-methods! "process"
   (list (cons "getOutputStream" (lambda (self) (proc-p-stdin-os self)))
@@ -371,8 +451,14 @@
           (with-mutex (proc-p-mutex self)
             (or (unbox (proc-p-exit-box self))
                 (call-with-values (lambda () (proc-waitpid-once (proc-p-pid self) #t))
-                  (lambda (rc decoded)
+                  (lambda (rc decoded err)
                     (cond (decoded (set-box! (proc-p-exit-box self) decoded) (->num decoded))
+                          ;; unwaitable: it HAS exited (something else reaped it), so
+                          ;; report the recoverable status rather than claiming it is
+                          ;; still running — exitValue would otherwise throw forever.
+                          ((and (< rc 0) (not (= err proc-EINTR)))
+                           (let ((c (proc-lost-status self)))
+                             (set-box! (proc-p-exit-box self) c) (->num c)))
                           (else (throw-jvm (quote IllegalThreadStateException) "process has not exited")))))))))
         (cons "toHandle" (lambda (self) (make-proc-handle (proc-p-pid self))))
         (cons "onExit"   (lambda (self) (make-proc-completable self)))
@@ -454,7 +540,7 @@
         (cons "removeShutdownHook"
           (lambda (self hook)
             (set-box! proc-shutdown-hooks (remq hook (unbox proc-shutdown-hooks))) #t))
-        (cons "availableProcessors" (lambda (self) (->num 1)))
+        (cons "availableProcessors" (lambda (self) (->num (jolt-available-processors))))
         (cons "exec" (lambda (self . args) (proc-runtime-exec args)))))
 (register-class-statics! "java.lang.Runtime" (list (cons "getRuntime" (lambda () the-jolt-runtime))))
 

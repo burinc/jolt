@@ -58,6 +58,70 @@
                (and (foreign-entry? name)
                     (foreign-procedure name args res))))))))
 
+;; --- how many processors can this process use ---------------------------------
+;; Backs jolt.host/available-processors, which Runtime.availableProcessors and
+;; pmap's look-ahead window read. Each host is asked the question the JVM asks
+;; there, not merely "how many CPUs exist":
+;;
+;;   - Linux: sched_getaffinity, so a process pinned with taskset or confined to
+;;     a cpuset sees only the CPUs it may actually run on. This is what the JVM
+;;     and nproc report; sysconf(_SC_NPROCESSORS_ONLN) would name the whole
+;;     machine regardless of the mask.
+;;   - Darwin: sysctlbyname("hw.logicalcpu"), there being no affinity API.
+;;   - Windows: NUMBER_OF_PROCESSORS, which the OS always sets.
+;;
+;; sysconf is the last resort for other POSIX hosts. _SC_NPROCESSORS_ONLN is a
+;; per-libc number rather than a standard one (84 on glibc and musl, 58 on the
+;; BSDs), and an unrecognised name yields -1, so both are tried and an
+;; out-of-range answer is rejected.
+;;
+;; A cgroup CPU quota (`docker --cpus=2` on a 16-core host) is NOT honoured: the
+;; JVM's container support divides quota by period and would say 2 where this
+;; says 16. Tracked as a divergence (jolt-j4sd).
+;;
+;; Resolved once on first call, not at load time — in a built binary top-level
+;; forms run during heap build on every startup, and this is a syscall.
+(define cpu-count-getaffinity (jolt-foreign-proc-safe "sched_getaffinity" '(int size_t u8*) 'int))
+(define cpu-count-sysctlbyname (jolt-foreign-proc-safe "sysctlbyname" '(string u8* u8* void* size_t) 'int))
+(define cpu-count-sysconf (jolt-foreign-proc-safe "sysconf" '(int) 'long))
+(define (cpu-count-sane n) (and n (exact? n) (fx>? n 0) (fx<=? n 4096) n))
+;; cpu_set_t is 1024 bits; the kernel fills as many bytes as it has CPUs for.
+(define (cpu-count-from-affinity)
+  (and cpu-count-getaffinity
+       (guard (e (#t #f))
+         (let ((mask (make-bytevector 128 0)))
+           (and (fx=? 0 (cpu-count-getaffinity 0 128 mask))
+                (let loop ((i 0) (n 0))
+                  (if (fx=? i 128)
+                      (cpu-count-sane n)
+                      (loop (fx+ i 1) (fx+ n (bitwise-bit-count (bytevector-u8-ref mask i)))))))))))
+(define (cpu-count-from-sysctl)
+  (and cpu-count-sysctlbyname
+       (guard (e (#t #f))
+         (let ((out (make-bytevector 4 0))
+               (len (make-bytevector 8 0)))
+           (bytevector-u64-native-set! len 0 4)
+           (and (fx=? 0 (cpu-count-sysctlbyname "hw.logicalcpu" out len 0 0))
+                (cpu-count-sane (bytevector-u32-native-ref out 0)))))))
+(define (cpu-count-from-sysconf)
+  (and cpu-count-sysconf
+       (guard (e (#t #f))
+         (or (cpu-count-sane (cpu-count-sysconf 84))
+             (cpu-count-sane (cpu-count-sysconf 58))))))
+(define (cpu-count-from-env)
+  (let ((v (getenv "NUMBER_OF_PROCESSORS")))
+    (and v (cpu-count-sane (string->number v)))))
+(define cpu-count-cached #f)
+(define (jolt-available-processors)
+  (or cpu-count-cached
+      (let ((n (or (cpu-count-from-affinity)
+                   (cpu-count-from-sysctl)
+                   (cpu-count-from-sysconf)
+                   (cpu-count-from-env)
+                   1)))                      ; never 0: callers size windows with it
+        (set! cpu-count-cached n)
+        n)))
+
 (load "host/chez/collections.ss")
 (load "host/chez/seq.ss")
 
@@ -358,6 +422,10 @@
 ;; http client throwing java.net.ConnectException). Strictly better than a
 ;; hand-rolled :jolt/ex-info table, which carries only the class.
 (def-var! "jolt.host" "throwable" jolt-host-throwable)
+;; jolt.host/available-processors — the host's usable CPU count (see above). The
+;; JVM spelling of the same question, Runtime.availableProcessors, is mapped in
+;; the java layer (java/process.ss); clojure.core reaches it through here.
+(def-var! "jolt.host" "available-processors" (lambda () (jolt-available-processors)))
 ;; var def-time metadata: the :def emit passes the def's reader meta
 ;; (^:private / ^Type tag / docstring -> {:doc}) here, stored in an eq side-table
 ;; keyed by the cell. jolt-meta (natives-meta.ss) merges it onto {:ns :name},
