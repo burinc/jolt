@@ -1316,9 +1316,24 @@
                      (rdr-discard-cb (if (jolt-nil? cb) #f cb)))
         (let-values (((form j) (rdr-read-top s 0 (string-length s))))
           (if (rdr-eof? form) (keyword "jolt" "reader-eof") form)))))
-(define (jolt-read-string s)
-  (let ((form (jolt-read-form-raw s)))
-    (if (jolt-nil? form) form (rdr-form->data form))))
+;; read-string: the 1-arity returns nil at end of input (the documented seed
+;; wart, src 18); the (opts s) arity is the reference's, where :eof sets the
+;; end-of-input value and its ABSENCE makes end of input an error. :read-cond and
+;; :features are accepted and ignored: jolt's reader always resolves #?
+;; conditionals, against the fixed host feature set {:jolt :clj :default} (see
+;; rdr-features), so a reader-conditional string reads the same either way.
+;; malli's generator-ast suite calls this arity.
+(define rdr-kw-eof (keyword #f "eof"))
+(define jolt-read-string
+  (case-lambda
+    ((s) (let ((form (jolt-read-form-raw s)))
+           (if (jolt-nil? form) form (rdr-form->data form))))
+    ((opts s)
+     (let ((form (if (jolt-nil? s) jolt-nil (jolt-read-form-raw s))))
+       (cond ((not (jolt-nil? form)) (rdr-form->data form))
+             ((and (pmap? opts) (jolt-contains? opts rdr-kw-eof))
+              (jolt-get opts rdr-kw-eof))
+             (else (jolt-throw (jolt-ex-info "EOF while reading" empty-pmap))))))))
 
 ;; __parse-next: [form rest-of-string] or nil when only whitespace/comments left.
 (define (jolt-parse-next s)

@@ -525,6 +525,20 @@
         attr-map (when (and (seq body) (next body) (map? (first body)) (not (symbol? (first body))))
                    (first body))
         body (if attr-map (rest body) body)
+        ;; A TRAILING attr-map after the arity clauses — (defn f ([x] …) ([x y] …)
+        ;; {:k v}) — also merges into the var metadata. Only a clause-list body
+        ;; can carry one: the JVM wraps a single-arity `[params] body` into one
+        ;; clause before it looks at the last form, which is why
+        ;; (defn f [x] {:a 1}) is a map-returning body and not an attr-map.
+        ;; malli's instrument suite declares its :malli/schema this way.
+        trail (when (not (vector? (first body)))
+                (loop [cs body prev nil]
+                  (if (seq cs) (recur (rest cs) (first cs)) prev)))
+        trail-attr (when (and trail (map? trail) (not (symbol? trail))) trail)
+        body (if trail-attr
+               (loop [cs body acc []]
+                 (if (next cs) (recur (rest cs) (conj acc (first cs))) (seq acc)))
+               body)
         ;; the bare name + any ^{:map} metadata the reader attached to it.
         fn-only-name (if (symbol? fn-name) fn-name (first (rest fn-name)))
         name-meta (meta fn-only-name)
@@ -538,14 +552,17 @@
                      (if (seq cs)
                        (recur (rest cs) (conj acc (first (first cs))))
                        (seq acc))))
-        ;; precedence, matching the JVM: name metadata < the derived :arglists <
-        ;; attr-map < docstring. So an explicit {:arglists '([x])} in the attr-map
-        ;; wins, while ^{:arglists …} on the NAME does not — the JVM ignores it
-        ;; there. Assembling the derived value last discarded the attr-map's.
+        ;; precedence, matching the JVM's conj order: name metadata < the derived
+        ;; :arglists < docstring < leading attr-map < trailing attr-map. So an
+        ;; explicit {:arglists '([x])} in an attr-map wins, while ^{:arglists …} on
+        ;; the NAME does not — the JVM ignores it there — and a :doc key in either
+        ;; attr-map overrides the docstring (the JVM conj'es the attr-maps onto
+        ;; {:doc docstring}, so they are what wins).
         m1 name-meta
         m2 (if arglists (assoc (if m1 m1 {}) :arglists arglists) m1)
-        m3 (if attr-map (conj (if m2 m2 {}) attr-map) m2)
-        meta-map (if docstring (assoc (if m3 m3 {}) :doc docstring) m3)]
+        m3 (if docstring (assoc (if m2 m2 {}) :doc docstring) m2)
+        m4 (if attr-map (conj (if m3 m3 {}) attr-map) m3)
+        meta-map (if trail-attr (conj (if m4 m4 {}) trail-attr) m4)]
     ;; pass the name through to fn: the compiled fn's host name carries it, so
     ;; stack traces read app.deep/level3 instead of a gensym. All metadata
     ;; (docstring + attr-map + the name's own + :arglists) is attached to the def

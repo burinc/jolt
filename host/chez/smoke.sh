@@ -453,6 +453,20 @@ else
   fails=$((fails + 1))
 fi
 
+# clojure.instant: RFC3339 parsing + the #inst reader constructors. Gated here
+# rather than in the corpus because the corpus runner loads no loader, so a
+# load-on-require namespace cannot be required there. Every expectation in the
+# file is certified against reference Clojure.
+inst_out="$($jolt run test/chez/instant-test.clj 2>/dev/null)"
+if printf '%s' "$inst_out" | grep -q 'INSTANT OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: clojure.instant suite"
+  echo "    $(printf '%s' "$inst_out" | grep INSTANT-RESULT | tail -1)"
+  printf '%s' "$inst_out" | grep 'instant FAIL' | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # A throwing go/thread body reports to stderr (the JVM's uncaught-exception
 # handler behavior) while the channel still just closes: <!! stays nil.
 thr_out="$($jolt -e "(do (require '[clojure.core.async :as a]) (pr (a/<!! (a/thread (/ 1 0)))))" 2>/tmp/jolt-smoke-thr-err)"

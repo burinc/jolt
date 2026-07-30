@@ -408,13 +408,23 @@
 ;; head symbol matches name nm, bare or clojure.core-qualified — the reader
 ;; produces clojure.core/unquote(-splicing) for ~/~@ (JVM parity), and this is
 ;; only used to spot those heads in syntax-quote templates.
+;; hc-list?, not cseq?: a macro that REBUILDS a template — deftype's rewrite-body
+;; maps over the method body to rewrite mutable-field reads — hands back a lazy
+;; seq, and a ~ inside it must still read as an unquote. Testing cseq? only meant
+;; those templates lowered their (unquote x) as an ordinary list call, so a
+;; deftype method's `(= ~a ~b) came out as (clojure.core/= (clojure.core/unquote
+;; a) …) — which is what broke core.match, whose pattern types are deftypes. The
+;; JVM's isUnquote is likewise a plain ISeq + head check.
 (define (hc-head-is? x nm)
-  (and (cseq? x)
-       (let ((h (seq-first x)))
-         (and (symbol-t? h) (string=? (symbol-t-name h) nm)
-              (let ((ns (hc-sym-ns h)))
-                (or (jolt-nil? ns) (and (string? ns) (string=? ns "clojure.core"))))))))
-(define (hc-second x) (seq-first (jolt-seq (seq-more x))))
+  (and (hc-list? x)
+       (let ((s (jolt-seq x)))
+         (and (not (jolt-nil? s))
+              (let ((h (seq-first s)))
+                (and (symbol-t? h) (string=? (symbol-t-name h) nm)
+                     (let ((ns (hc-sym-ns h)))
+                       (or (jolt-nil? ns)
+                           (and (string? ns) (string=? ns "clojure.core"))))))))))
+(define (hc-second x) (seq-first (jolt-seq (seq-more (jolt-seq x)))))
 
 ;; compile path: resolve against the compile ns, via the shared resolver
 ;; (reader.ss jsq-resolve-symbol). Same resolution the data path uses, so a

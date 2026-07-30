@@ -622,6 +622,21 @@
       (lambda () (mutex-release m)))))
 (def-var! "jolt.host" "with-monitor" jolt-with-monitor)
 
+;; The bare halves of the same monitor, for the (monitor-enter x) /
+;; (monitor-exit x) special forms. Code that expands its own locking macro
+;; instead of calling clojure.core/locking emits these directly — dynaload does,
+;; and it sits under malli — so they take and release the very same per-object
+;; mutex `locking` uses, and the two compose. Both yield nil: the JVM emits a
+;; NIL after the monitor op rather than the object.
+(define (jolt-monitor-enter obj)
+  (mutex-acquire (object-monitor obj))
+  jolt-nil)
+(define (jolt-monitor-exit obj)
+  (mutex-release (object-monitor obj))
+  jolt-nil)
+(def-var! "jolt.host" "monitor-enter" jolt-monitor-enter)
+(def-var! "jolt.host" "monitor-exit" jolt-monitor-exit)
+
 ;; --- cooperative thread interrupt -------------------------------------------
 ;; Chez has no force-kill, but its engine timer (set-timer + timer-interrupt-
 ;; handler, thread-local) is polled at procedure-call / loop back-edges — so a

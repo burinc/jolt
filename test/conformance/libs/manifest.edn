@@ -1,0 +1,229 @@
+;; Recipes + recorded standings for replaying third-party libraries' own test
+;; suites on jolt. See README.md. Driven by run.clj (`make libconformance`).
+;;
+;; Path prefixes: bare = relative to the library's own root, "@x" = another
+;; library under the conformance-libraries checkout, "~x" = a first-party jolt
+;; library checked out beside this repo, "/x" = absolute.
+;;
+;; :expect is the tally last observed. The gate fails when pass drops or
+;; fail/error/load-fail rise; it reports BETTER (not a failure) when pass rises,
+;; so improving a library is a manifest edit away. :note records why a non-zero
+;; fail/error count is expected — a host-model divergence, a missing JVM-only
+;; dependency, or a tracked bug.
+{:libs
+ [;; ---------------------------------------------------------- collections/util
+  {:name "medley"
+   :paths ["src" "test"]}
+
+  {:name "camel-snake-kebab"
+   :paths ["src" "test"]}
+
+  {:name "cuerdas"
+   :paths ["src" "test"]}
+
+  {:name "dependency"
+   :paths ["src" "test"]}
+
+  {:name "ordered"
+   :paths ["src" "test"]
+   :exclude-nses ["flatland.ordered.performance-test"]}
+
+  {:name "text-diff"
+   :paths ["src" "test"]}
+
+  {:name "math.combinatorics"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]}
+
+  {:name "data.priority-map"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]}
+
+  {:name "core.cache"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :deps ["@data.priority-map/src/main/clojure"]}
+
+  {:name "core.memoize"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :deps ["@core.cache/src/main/clojure" "@data.priority-map/src/main/clojure"]}
+
+  ;; ---------------------------------------------------------- language / meta
+  {:name "tools.macro"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]}
+
+  {:name "algo.monads"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :deps ["@tools.macro/src/main/clojure"]}
+
+  {:name "core.match"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]}
+
+  {:name "core.logic"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]}
+
+  {:name "core.contracts"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :extra-deps {org.clojure/core.unify {:mvn/version "0.5.7"}}}
+
+  {:name "tools.reader"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]}
+
+  {:name "tools.namespace"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]}
+
+  {:name "rewrite-clj"
+   :paths ["src" "resources" "test"]
+   :deps ["@tools.reader/src/main/clojure" "@test.check/src/main/clojure"]}
+
+  ;; ---------------------------------------------------------- spec + testing
+  {:name "spec.alpha"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]}
+
+  {:name "test.check"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :deps ["@spec.alpha/src/main/clojure"]
+   :timeout 900}
+
+  {:name "test.chuck"
+   :paths ["src" "test"]
+   :deps ["@test.check/src/main/clojure" "@spec.alpha/src/main/clojure"]
+   :timeout 900}
+
+  ;; ---------------------------------------------------------- data formats
+  {:name "data.csv"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]}
+
+  {:name "data.codec"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :deps ["@test.check/src/main/clojure"]}
+
+  {:name "data.json"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :deps ["~time/src" "@spec.alpha/src/main/clojure"]}
+
+  {:name "data.zip"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :deps ["~xml/src"]}
+
+  {:name "yamlstar"
+   :root "yamlstar/core"
+   :paths ["src" "test"]
+   :deps ["~time/src"]}
+
+  ;; ---------------------------------------------------------- markup / text
+  {:name "hiccup"
+   :paths ["src" "test"]}
+
+  {:name "markdown-clj"
+   :paths ["src/clj" "src/cljc" "test"]
+   :exclude-nses ["markdown.benchmark"]}
+
+  {:name "Selmer"
+   :paths ["src" "test" "resources"]
+   :deps ["@data.json/src/main/clojure" "~time/src"]
+   :exclude-nses ["selmer.benchmark"]}
+
+  {:name "html"
+   :paths ["src" "test"]}
+
+  ;; ---------------------------------------------------------- data / config
+  {:name "honeysql"
+   :paths ["src" "test"]
+   :deps ["~time/src" "@core.cache/src/main/clojure"
+          "@data.priority-map/src/main/clojure"]}
+
+  {:name "config"
+   :paths ["src" "test"]}
+
+  {:name "aero"
+   :paths ["src" "test"]}
+
+  {:name "malli"
+   :paths ["src" "resources" "test"]
+   :deps ["~time/src" "@spec.alpha/src/main/clojure"
+          "@test.check/src/main/clojure" "@spec-tools/src"
+          "@test.chuck/src" "@ordered/src"]
+   ;; malli's own deps, from the upstream deps.edn; jolt resolves the source out
+   ;; of the Maven jars.
+   :extra-deps {borkdude/dynaload {:mvn/version "0.3.5"}
+                borkdude/edamame {:mvn/version "1.5.37"}
+                fipp/fipp {:mvn/version "0.6.29"}
+                mvxcvi/arrangement {:mvn/version "2.1.0"}}
+   :timeout 900}
+
+  ;; ---------------------------------------------------------- web
+  {:name "ring-codec"
+   :paths ["src" "test"]}
+
+  {:name "ring-core"
+   :root "ring"
+   :paths ["ring-core/src" "ring-core-protocols/src" "ring-core/test"]
+   :test-paths ["ring-core/test"]
+   :deps ["@ring-codec/src" "~time/src" "~jolt-crypto/src"]}
+
+  {:name "ring-spec"
+   :paths ["src" "test"]
+   :deps ["@spec.alpha/src/main/clojure" "@ring/ring-core-protocols/src"]}
+
+  {:name "reitit-core"
+   :root "reitit"
+   :paths ["modules/reitit-core/src" "test/cljc"]
+   :test-paths ["test/cljc"]
+   :deps ["~router/src" "@spec.alpha/src/main/clojure"]
+   :extra-deps {meta-merge/meta-merge {:mvn/version "1.0.0"}}
+   ;; test/cljc holds the suites for every reitit module; these are the ones that
+   ;; need reitit-core alone (the rest pull reitit-ring / -malli / muuntaja /
+   ;; jsonista, which are not in the checkout).
+   :nses ["reitit.core-test" "reitit.impl-test" "reitit.trie-test"
+          "reitit.spec-test"]}
+
+  ;; ---------------------------------------------------------- tooling
+  {:name "compliment"
+   :paths ["src" "test"]
+   ;; Most of compliment's suites are written against nubank/matcher-combinators,
+   ;; which is not in the checkout. These are the ones that use plain clojure.test.
+   ;; Reflection-backed sources (class members, classes, resources) do not apply to
+   ;; jolt's host model — see the library's own CONFORMANCE.md.
+   :nses ["compliment.t-context" "compliment.sources.t-special-forms"
+          "compliment.sources.t-local-bindings" "compliment.sources.t-keywords"
+          "compliment.sources.t-data-readers"]}
+
+  {:name "lasertag"
+   :paths ["src" "test"]
+   :deps ["~time/src"]}
+
+  {:name "tools.logging"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   ;; the log4j2 suite needs the org.apache.logging.log4j jars
+   :exclude-nses ["clojure.tools.logging.test-log4j2"]}
+
+  ;; ---------------------------------------------------------- time
+  {:name "tick"
+   :paths ["src" "test"]
+   :deps ["~time/src" "@spec.alpha/src/main/clojure"]}
+
+  ;; ---------------------------------------------------------- skipped
+  {:name "process"
+   :skip "babashka.process is vendored (vendor/process); covered by `make smoke`"}
+
+  {:name "core.typed"
+   :skip "needs the JVM (asm, tools.analyzer.jvm); not a conformance target"}
+
+  {:name "ansatz"
+   :skip "kernel is Java; not a conformance target"}]}

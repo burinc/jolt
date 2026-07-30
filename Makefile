@@ -6,7 +6,7 @@
 
 CHEZ ?= $(shell command -v chez 2>/dev/null || command -v chezscheme 2>/dev/null || command -v scheme 2>/dev/null)
 
-.PHONY: test ci testbin values corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint compilepathsmoke aotcacheperf submodules httpsfetch mvnhttp depssmoke depsunit
+.PHONY: test ci testbin values corpus unit smoke buildsmoke buildlibsmoke staticnativesmoke selfhost sci cts certify ffi transient infer wp devirt fieldread numwp fieldnum protoret pic narrow directlink unitcontext numeric oparity inline inline-body dcerefs shakesmoke shakelocal manifestcheck remint jolt jolt-release jolt-debug joltsmoke devboot gateboot gatebootsmoke devbootsmoke aotcachesmoke aotfingerprint compilepathsmoke aotcacheperf submodules httpsfetch libconformance mvnhttp depssmoke depsunit
 
 # Every target needs the vendored submodules; fail with the fix, not a load error.
 submodules:
@@ -93,6 +93,16 @@ staticnativesmoke: testbin
 # Not in `make test` — needs network + a working system OpenSSL.
 httpsfetch:
 	@sh host/chez/https-fetch-smoke.sh
+
+# OPT-IN: replay third-party libraries' own clojure.test suites and compare the
+# tallies against test/conformance/libs/manifest.edn. Not in `make test` — needs
+# the upstream library checkouts ($JOLT_CONFORMANCE_LIBS, default
+# ../conformance-libraries), which are not vendored. Skips cleanly without them.
+# `make libconformance LIBS="malli honeysql"` runs a subset.
+# See test/conformance/libs/README.md.
+libconformance: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" \
+	 JOLT_NO_USER_DEPS=1 target/release/jolt run test/conformance/libs/run.clj $(LIBS)
 
 # jolt.mvn-http pure-function tests (URL/redirect/header/body parsing). No
 # network, no OpenSSL — runs in the default gate.
