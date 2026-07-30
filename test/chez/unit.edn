@@ -70,6 +70,11 @@
   {:suite "errors" :expr "(try (clojure.string/no-such-fn 1) (catch Throwable e (ex-message e)))" :expected "\"No such var: clojure.string/no-such-fn\""}
   {:suite "errors" :expr "(do (require (quote [clojure.string :as s])) (try (s/no-such-fn 1) (catch Throwable e (ex-message e))))" :expected "\"No such var: s/no-such-fn\""}
   {:suite "errors" :expr "(try (Nope/whatever 1) (catch Throwable e (ex-message e)))" :expected "\"Unknown class Nope\""}
+  ;; A hyphen munges to an underscore in a JVM package name, so a record literal or
+  ;; a (munge (str *ns*)) lookup names the class my_app.core.Foo where jolt calls it
+  ;; my-app.core.Foo. forName demunges to find it. Not certifiable on the JVM: its
+  ;; own Class/forName cannot see a class this harness defined at eval time.
+  {:suite "errors" :expr "(do (defrecord Foo-bar [a]) [(instance? (Class/forName \"user.Foo_bar\") (->Foo-bar 1)) (= (->Foo-bar 1) (clojure.lang.Reflector/invokeConstructor (Class/forName \"user.Foo_bar\") (object-array [1])))])" :expected "[true true]"}
   {:suite "exinfo" :expr "(type (ex-info \"x\" {}))" :expected "clojure.lang.ExceptionInfo"}
   {:suite "hostobj" :expr "(.getName (.getClass \"x\"))" :expected "\"java.lang.String\""}
   {:suite "hostobj" :expr "(.getClass 5)" :expected "java.lang.Long"}

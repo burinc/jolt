@@ -520,12 +520,25 @@
   (or (hashtable-ref class-statics-tbl nm #f)
       (hashtable-ref class-ctors-tbl nm #f)
       (hashtable-ref jvm-class-parents nm #f)))
+;; A namespace with a hyphen munges to an underscore in the package name, so a
+;; record defined in my-app.core is my_app.core.Foo on the JVM. jolt keeps the
+;; namespace as written, so a forName of the munged name has to demunge to find
+;; it — that is the name a library computes from (munge (str *ns*)), and it is how
+;; a #my_app.core.Foo[…] record literal names its class.
+(define (forname-demunged nm)
+  (and (let loop ((i 0))
+         (cond ((>= i (string-length nm)) #f)
+               ((char=? (string-ref nm i) #\_) #t)
+               (else (loop (+ i 1)))))
+       (let ((d (list->string (map (lambda (c) (if (char=? c #\_) #\- c)) (string->list nm)))))
+         (and (forname-known? d) d))))
 (register-class-statics! "Class"
   (list (cons "forName"
               (lambda (nm . _)
                 (cond
                   ((and (> (string-length nm) 0) (char=? (string-ref nm 0) #\[)) nm)
                   ((forname-known? nm) (make-class-obj nm))
+                  ((forname-demunged nm) => make-class-obj)
                   (else (jolt-throw (jolt-host-throwable "java.lang.ClassNotFoundException" nm))))))))
 
 ;; ---- System helpers (defined before use above via top-level order) ----------

@@ -1644,7 +1644,25 @@
       (jch-set-supers! tag (append protos
                                    '("clojure.lang.IRecord" "clojure.lang.IObj"
                                      "clojure.lang.IPersistentMap" "java.util.Map"
-                                     "clojure.lang.IHashEq" "java.io.Serializable")))))
+                                     "clojure.lang.IHashEq" "java.io.Serializable"))))
+    ;; every defrecord gets a static create(map) on the JVM — it is what the
+    ;; #ns.Rec{…} literal is read through, positionally or by key.
+    (let ((ctor (hashtable-ref class-ctors-tbl tag #f))
+          (shape (hashtable-ref chez-record-shapes-tbl
+                                (string-append (chez-current-ns) "/->" (symbol-t-name name-sym)) #f)))
+      (when (and ctor shape)
+        (register-class-statics! tag
+          (list (cons "create"
+                      (lambda (m)
+                        ;; declared fields positionally, anything else assoc'd on —
+                        ;; a record keeps unknown keys in its extension map.
+                        (let ((kws (vector-ref shape 0)))
+                          (let loop ((rec (apply ctor (map (lambda (k) (jolt-get m k)) kws)))
+                                     (ks (seq->list (jolt-seq (jolt-keys m)))))
+                            (cond ((null? ks) rec)
+                                  ((member (car ks) kws) (loop rec (cdr ks)))
+                                  (else (loop (jolt-assoc rec (car ks) (jolt-get m (car ks)))
+                                              (cdr ks)))))))))))))
   jolt-nil)
 (def-var! "clojure.core" "register-record-type!" register-record-type!)
 (def-var! "clojure.core" "make-protocol" make-protocol)

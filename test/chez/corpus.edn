@@ -62,6 +62,19 @@
   {:suite "interop / exception constructors" :label "ClassNotFoundException and SQLException carry their message" :expected "[\"c\" \"s\"]" :actual "[(.getMessage (ClassNotFoundException. \"c\")) (.getMessage (java.sql.SQLException. \"s\"))]" :portability :jvm}
   {:suite "interop / java.sql.Date subclassing" :label "a java.util.Date is not a java.sql.Date (subclass, not the same class)" :expected "[false true true true]" :actual "(let [d (java.util.Date. 0) sd (java.sql.Date. 0)] [(instance? java.sql.Date d) (instance? java.util.Date d) (instance? java.sql.Date sd) (instance? java.util.Date sd)])" :portability :jvm}
   {:suite "interop / java.sql.Date subclassing" :label "the two report distinct classes" :expected "[java.util.Date java.sql.Date]" :actual "[(class (java.util.Date. 0)) (class (java.sql.Date. 0))]" :portability :jvm}
+  ;; A GregorianCalendar built from fields holds those fields, not an instant, until
+  ;; something asks for one — so a .setTimeZone after the fact still decides what
+  ;; they meant. clojure.instant's construct-calendar is written exactly that way.
+  ;; Every row pins the zone, since the calendar's default is the machine's.
+  {:suite "interop / Calendar and TimeZone" :label "fields resolve in the zone set after them" :expected "1289567655666" :actual "(let [c (doto (java.util.GregorianCalendar. 2010 10 12 13 14 15) (.set java.util.Calendar/MILLISECOND 666) (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT+00:00\")))] (.getTimeInMillis c))" :portability :jvm}
+  {:suite "interop / Calendar and TimeZone" :label "a non-zero offset shifts the instant" :expected "1289560455000" :actual "(let [c (doto (java.util.GregorianCalendar. 2010 10 12 13 14 15) (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT+02:00\")))] (.getTimeInMillis c))" :portability :jvm}
+  {:suite "interop / Calendar and TimeZone" :label "the custom GMT id forms" :expected "[19800000 -28800000 0 30600000]" :actual "[(.getRawOffset (java.util.TimeZone/getTimeZone \"GMT+05:30\")) (.getRawOffset (java.util.TimeZone/getTimeZone \"GMT-8\")) (.getRawOffset (java.util.TimeZone/getTimeZone \"UTC\")) (.getRawOffset (java.util.TimeZone/getTimeZone \"GMT+0830\"))]" :portability :jvm}
+  {:suite "interop / Calendar and TimeZone" :label "a named zone keeps its id" :expected "\"America/New_York\"" :actual "(.getID (java.util.TimeZone/getTimeZone \"America/New_York\"))" :portability :jvm}
+  {:suite "interop / Calendar and TimeZone" :label "get reads the derived fields too" :expected "[1970 0 1 5 1 0]" :actual "(let [c (doto (java.util.Calendar/getInstance (java.util.TimeZone/getTimeZone \"GMT\")) (.setTimeInMillis 0))] [(.get c java.util.Calendar/YEAR) (.get c java.util.Calendar/MONTH) (.get c java.util.Calendar/DAY_OF_MONTH) (.get c java.util.Calendar/DAY_OF_WEEK) (.get c java.util.Calendar/DAY_OF_YEAR) (.get c java.util.Calendar/HOUR_OF_DAY)])" :portability :jvm}
+  {:suite "interop / Calendar and TimeZone" :label "add of a month clamps the day" :expected "[2011 1 28]" :actual "(let [c (doto (java.util.GregorianCalendar. 2011 0 31) (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\")) (.add java.util.Calendar/MONTH 1))] [(.get c java.util.Calendar/YEAR) (.get c java.util.Calendar/MONTH) (.get c java.util.Calendar/DAY_OF_MONTH)])" :portability :jvm}
+  {:suite "interop / Calendar and TimeZone" :label "add of a day rolls the year" :expected "[2012 0 1]" :actual "(let [c (doto (java.util.GregorianCalendar. 2011 11 31) (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\")) (.add java.util.Calendar/DAY_OF_MONTH 1))] [(.get c java.util.Calendar/YEAR) (.get c java.util.Calendar/MONTH) (.get c java.util.Calendar/DAY_OF_MONTH)])" :portability :jvm}
+  {:suite "interop / Calendar and TimeZone" :label "add of a year clamps Feb 29" :expected "[2013 1 28]" :actual "(let [c (doto (java.util.GregorianCalendar. 2012 1 29) (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\")) (.add java.util.Calendar/YEAR 1))] [(.get c java.util.Calendar/YEAR) (.get c java.util.Calendar/MONTH) (.get c java.util.Calendar/DAY_OF_MONTH)])" :portability :jvm}
+  {:suite "interop / Calendar and TimeZone" :label "an out-of-range field normalizes on read" :expected "[2011 1]" :actual "(let [c (doto (java.util.GregorianCalendar. 2010 10 12) (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\")) (.set java.util.Calendar/MONTH 13))] [(.get c java.util.Calendar/YEAR) (.get c java.util.Calendar/MONTH)])" :portability :jvm}
   {:suite "interop / BigInteger" :label "the (signum, magnitude-bytes) ctor reads bytes unsigned, big-endian" :expected "[258 44221 -258]" :actual "[(BigInteger. 1 (byte-array [1 2])) (BigInteger. 1 (byte-array [-84 -67])) (BigInteger. -1 (byte-array [1 2]))]" :portability :jvm}
   {:suite "interop / BigInteger" :label "a digest hex-formatted through it (Selmer hash filter)" :expected "\"acbd18db4cc2f85cedef654fccc4a4d8\"" :actual "(format \"%032x\" (BigInteger. 1 (byte-array [-84 -67 24 -37 76 -62 -8 92 -19 -17 101 79 -52 -60 -92 -40])))" :portability :jvm}
   {:suite "interop / BigInteger" :label "the string ctor still parses, with an optional radix" :expected "[123 255]" :actual "[(BigInteger. \"123\") (BigInteger. \"ff\" 16)]" :portability :jvm}
@@ -182,6 +195,17 @@
   {:suite "interop / Class.forName" :label "unknown class throws ClassNotFoundException" :expected ":nf" :actual "(try (Class/forName \"no.such.Klass\") (catch ClassNotFoundException _ :nf))" :portability :jvm}
   {:suite "interop / Class.forName" :label "known class resolves" :expected "\"java.lang.String\"" :actual "(.getName (Class/forName \"java.lang.String\"))" :portability :jvm}
   {:suite "interop / Class.forName" :label "miss with known last-segment throws ClassNotFoundException" :expected ":cnfe" :actual "(try (Class/forName \"com.acme.String\") (catch ClassNotFoundException _ :cnfe))" :portability :jvm}
+  ;; Reflective construction: a record class reports a constructor per declared
+  ;; arity and a static create(map), and clojure.lang.Reflector calls them. This is
+  ;; how a Clojure-level reader builds a #ns.Rec[…] / #ns.Rec{…} literal — it looks
+  ;; up the constructor whose parameter count matches what it read.
+  {:suite "interop / reflective construction" :label "a record has a static create" :expected "\"#user.CFoo{:a 1, :b 2}\"" :actual "(do (defrecord CFoo [a b]) (pr-str (CFoo/create {:a 1 :b 2})))" :portability :jvm}
+  {:suite "interop / reflective construction" :label "create keeps keys that are not fields" :expected "true" :actual "(do (defrecord CFoo2 [a b]) (= (assoc (->CFoo2 1 2) :extra :kept) (CFoo2/create {:a 1 :b 2 :extra :kept})))" :portability :jvm}
+  {:suite "interop / reflective construction" :label "getConstructors reports the field arity and the field+meta+ext arity" :expected "[true true]" :actual "(do (defrecord CFoo3 [a b]) (let [cs (.getConstructors (Class/forName \"user.CFoo3\"))] [(boolean (some #(= 2 (count (.getParameterTypes %))) cs)) (boolean (some #(= 4 (count (.getParameterTypes %))) cs))]))" :portability :jvm}
+  {:suite "interop / reflective construction" :label "Reflector/invokeConstructor builds the record" :expected "true" :actual "(do (defrecord CFoo4 [a b]) (= (->CFoo4 1 2) (clojure.lang.Reflector/invokeConstructor (Class/forName \"user.CFoo4\") (object-array [1 2]))))" :portability :jvm}
+  {:suite "interop / reflective construction" :label "Reflector/invokeStaticMethod reaches create" :expected "true" :actual "(do (defrecord CFoo5 [a b]) (= (->CFoo5 9 8) (clojure.lang.Reflector/invokeStaticMethod (Class/forName \"user.CFoo5\") \"create\" (object-array [{:a 9 :b 8}]))))" :portability :jvm}
+  {:suite "interop / reflective construction" :label "Reflector/invokeInstanceMethod" :expected "\"ABC\"" :actual "(clojure.lang.Reflector/invokeInstanceMethod \"abc\" \"toUpperCase\" (object-array []))" :portability :jvm}
+  {:suite "interop / reflective construction" :label "a host class constructor too" :expected "\"foo\"" :actual "(clojure.lang.Reflector/invokeConstructor (Class/forName \"java.lang.String\") (object-array [\"foo\"]))" :portability :jvm}
   {:suite "clojure.string / replace" :label "char match and replacement" :expected "\"a-b-c\"" :actual "(clojure.string/replace \"a/b/c\" \\/ \\-)" :portability :common}
   {:suite "clojure.string / replace" :label "char match, string replacement" :expected "\"x_y\"" :actual "(clojure.string/replace \"x.y\" \\. \"_\")" :portability :common}
   {:suite "interop-fixes / deprecated #^ metadata reader" :label "#^ type hint on a param" :expected "\"x\"" :actual "(do (defn f1 [#^String s] s) (f1 \"x\"))" :portability :common}
@@ -701,6 +725,17 @@
   {:suite "interop / StringReader & StringBuilder" :label "StringBuilder append" :expected "\"ab1\"" :actual "(.toString (-> (StringBuilder.) (.append \"a\") (.append \\b) (.append 1)))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "capacity arg is not content" :expected "\"x\"" :actual "(.toString (.append (StringBuilder. 16) \"x\"))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "setLength truncates" :expected "\"ab\"" :actual "(let [sb (StringBuilder.)] (.append sb \"abcd\") (.setLength sb 2) (.toString sb))" :portability :jvm}
+  {:suite "interop / StringReader & StringBuilder" :label "delete, deleteCharAt and their end clamp" :expected "[\"abdef\" \"adef\" \"abcd\"]" :actual "[(str (.deleteCharAt (StringBuilder. \"abcdef\") 2)) (str (.delete (StringBuilder. \"abcdef\") 1 3)) (str (.delete (StringBuilder. \"abcdef\") 4 99))]" :portability :jvm}
+  {:suite "interop / StringReader & StringBuilder" :label "insert, replace and reverse" :expected "[\"abcXYdef\" \"aZZZdef\" \"fedcba\"]" :actual "[(str (.insert (StringBuilder. \"abcdef\") 3 \"XY\")) (str (.replace (StringBuilder. \"abcdef\") 1 3 \"ZZZ\")) (str (.reverse (StringBuilder. \"abcdef\")))]" :portability :jvm}
+  {:suite "interop / StringReader & StringBuilder" :label "indexOf / lastIndexOf, -1 when absent" :expected "[1 4 4 -1]" :actual "[(.indexOf (StringBuilder. \"abcabc\") \"bc\") (.indexOf (StringBuilder. \"abcabc\") \"bc\" 2) (.lastIndexOf (StringBuilder. \"abcabc\") \"bc\") (.indexOf (StringBuilder. \"abc\") \"zz\")]" :portability :jvm}
+  {:suite "interop / StringReader & StringBuilder" :label "substring, isEmpty and setCharAt" :expected "[\"cdef\" \"cd\" true \"Zbcdef\"]" :actual "[(.substring (StringBuilder. \"abcdef\") 2) (.substring (StringBuilder. \"abcdef\") 2 4) (.isEmpty (StringBuilder.)) (let [b (StringBuilder. \"abcdef\")] (.setCharAt b 0 \\Z) (str b))]" :portability :jvm}
+  {:suite "interop / StringReader & StringBuilder" :label "an out-of-range index is a StringIndexOutOfBoundsException" :expected "\"StringIndexOutOfBoundsException\"" :actual "(try (.deleteCharAt (StringBuilder. \"ab\") 5) (catch Exception e (.getSimpleName (class e))))" :portability :jvm}
+  ;; LineNumberingPushbackReader is pushback over java.io.LineNumberReader, so a
+  ;; \r, a \n and a \r\n all read as one \n and each counts a line. tools.reader's
+  ;; source logging reads through it and reproduces the source text from what it got.
+  {:suite "interop / StringReader & StringBuilder" :label "line terminators normalize to \\n" :expected "\"a\\nb\\nc\\nd\"" :actual "(let [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"a\\r\\nb\\rc\\nd\"))] (loop [acc []] (let [c (.read r)] (if (neg? c) (apply str acc) (recur (conj acc (char c)))))))" :portability :jvm}
+  {:suite "interop / StringReader & StringBuilder" :label "getLineNumber counts them, 1-based" :expected "3" :actual "(let [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"a\\r\\nb\\rc\"))] (dotimes [_ 4] (.read r)) (.getLineNumber r))" :portability :jvm}
+  {:suite "interop / StringReader & StringBuilder" :label "pushback sits above the line count, so an unread \\n is not recounted" :expected "[2 2 \\newline]" :actual "(let [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"ab\\ncd\"))] (dotimes [_ 3] (.read r)) (let [n (.getLineNumber r)] (.unread r (int \\newline)) [n (.getLineNumber r) (char (.read r))]))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "char-array of string" :expected "true" :actual "(instance? (Class/forName \"[C\") (char-array \"ab\"))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "reader over char[]" :expected "97" :actual "(do (require (quote clojure.java.io)) (.read (clojure.java.io/reader (char-array \"abc\"))))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "with-open closes shim" :expected "97" :actual "(with-open [r (StringReader. \"a\")] (.read r))" :portability :jvm}
@@ -1387,6 +1422,10 @@
   {:suite "core / with-local-vars" :label "vars are values" :expected "5" :actual "(with-local-vars [x 0] (let [bump (fn [v] (var-set v (+ 5 (var-get v))))] (bump x) (var-get x)))" :portability :common}
   {:suite "core / with-local-vars" :label "init sees outer" :expected "3" :actual "(let [y 3] (with-local-vars [x y] (var-get x)))" :portability :common}
   {:suite "core / with-local-vars" :label "body result" :expected ":done" :actual "(with-local-vars [x 1] :done)" :portability :common}
+  ;; A local var is created dynamic, so it takes a thread binding like any other —
+  ;; tools.reader's source-logging reader carries one out of with-local-vars and
+  ;; hands it to with-bindings.
+  {:suite "core / with-local-vars" :label "a local var takes a thread binding" :expected "[1 2 1]" :actual "(let [v (with-local-vars [x nil] x)] (alter-var-root v (constantly 1)) [(deref v) (with-bindings {v 2} (deref v)) (deref v)])" :portability :common}
   {:suite "core / with-open" :label "body result" :expected ":r" :actual "(let [log (atom [])] (with-open [c {:close (fn [] (swap! log conj :closed))}] :r))" :portability :common}
   {:suite "core / with-open" :label "close runs" :expected "[:closed]" :actual "(let [log (atom [])] (with-open [c {:close (fn [] (swap! log conj :closed))}] :r) (deref log))" :portability :common}
   {:suite "core / with-open" :label "close on throw" :expected "[]" :actual "(let [log (atom [])] (try (with-open [c {:close (fn [] (swap! log conj :closed))}] (throw (ex-info \"boom\" {}))) (catch Exception e nil)) (deref log))" :portability :common}
@@ -2275,6 +2314,15 @@
   {:suite "seq / lazy over infinite" :label "sequence value + completion flush" :expected "[[0 1] [2 3] [4]]" :actual "(sequence (partition-all 2) (range 5))" :portability :common}
   {:suite "seq / lazy over infinite" :label "sequence empty stays a seq" :expected "true" :actual "(seq? (sequence (filter even?) [1 3 5]))" :portability :common}
   {:suite "seq / lazy over infinite" :label "sequence empty prints as empty" :expected "()" :actual "(sequence (filter even?) [1 3 5])" :portability :common}
+  ;; The 1-arity of sequence is not seq: an empty source yields () rather than nil,
+  ;; and a source that is already a seq comes back untouched. tools.reader's
+  ;; syntax-quote leans on the first half — it wraps every template in
+  ;; (sequence (seq (concat ...))) precisely so `(~@[]) is () and not nil.
+  {:suite "seq / sequence of a plain source" :label "an empty source is (), not nil" :expected "[() () () ()]" :actual "[(sequence nil) (sequence []) (sequence \"\") (sequence {})]" :portability :common}
+  {:suite "seq / sequence of a plain source" :label "the empty result is still a seq" :expected "true" :actual "(seq? (sequence nil))" :portability :common}
+  {:suite "seq / sequence of a plain source" :label "a seq source is handed back identically" :expected "[true false]" :actual "(let [l (list 1 2) v (vec (range 3))] [(identical? l (sequence l)) (identical? v (sequence v))])" :portability :common}
+  {:suite "seq / sequence of a plain source" :label "a non-seq source is seq'd" :expected "[1 2]" :actual "(sequence [1 2])" :portability :common}
+  {:suite "seq / sequence of a plain source" :label "the syntax-quote shape an empty splice lowers to" :expected "()" :actual "(sequence (seq (concat [])))" :portability :common}
   {:suite "seq / lazy over infinite" :label "eduction is lazy over infinite" :expected "1" :actual "(first (eduction (map inc) (range)))" :portability :common}
   {:suite "seq / lazy over infinite" :label "eduction reduces" :expected "9" :actual "(reduce + (eduction (filter odd?) [1 2 3 4 5]))" :portability :common}
   {:suite "seq / lazy over infinite" :label "eduction into" :expected "[2 3 4]" :actual "(into [] (eduction (map inc) [1 2 3]))" :portability :common}
@@ -3425,6 +3473,13 @@
   {:suite "conformance / data structures" :label "sorted-set seq" :expected "[1 2 3]" :actual "(seq (sorted-set 3 1 2))" :portability :common}
   {:suite "conformance / data structures" :label "coll? set" :expected "true" :actual "(coll? #{1 2})" :portability :common}
   {:suite "conformance / data structures" :label "conj map entry" :expected "{:a 1, :b 2}" :actual "(conj {:a 1} [:b 2])" :portability :common}
+  ;; The reader stamps a position only on list forms, so on a vector, map or set a
+  ;; :line / :column / :file key can only have come from the program that wrote it —
+  ;; quoting must hand it back. tools.reader's metadata suite compares literals
+  ;; carrying exactly these keys against what its own reader produced.
+  {:suite "conformance / metadata / vars" :label "a quoted vector keeps position keys the program wrote" :expected "{:line 4 :column 5 :file \"v.clj\"}" :actual "(meta '^{:line 4 :column 5 :file \"v.clj\"} [7])" :portability :common}
+  {:suite "conformance / metadata / vars" :label "so does a quoted set" :expected "{:end-line 3 :a 1}" :actual "(meta '^{:end-line 3 :a 1} #{7})" :portability :common}
+  {:suite "conformance / metadata / vars" :label "so does a quoted map" :expected "{:line 1 :column 2}" :actual "(meta '^{:line 1 :column 2} {:k 1})" :portability :common}
   {:suite "conformance / metadata / vars" :label "vary-meta" :expected "{:x 2}" :actual "(meta (vary-meta (with-meta [1] {:x 1}) update :x inc))" :portability :common}
   {:suite "conformance / metadata / vars" :label "defonce no-redef" :expected "1" :actual "(do (defonce dv1 1) (defonce dv1 2) dv1)" :portability :common}
   {:suite "conformance / metadata / vars" :label "binding dynamic" :expected "10" :actual "(do (def ^:dynamic *x* 1) (binding [*x* 10] *x*))" :portability :common}

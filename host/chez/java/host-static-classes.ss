@@ -136,6 +136,14 @@
       (render-piece x)
       (substring (render-piece x) (jnum->exact (car rest)) (jnum->exact (cadr rest)))))
 
+;; Every index-taking StringBuilder method reports the same way the JVM does.
+(define (sb-range-check s start end)
+  (let ((n (string-length s)))
+    (when (or (< start 0) (> end n) (> start end))
+      (throw-jvm (quote StringIndexOutOfBoundsException)
+                 (string-append "start " (number->string start) ", end " (number->string end)
+                                ", length " (number->string n))))))
+
 (register-class-ctor! "StringBuilder"
   (lambda args (make-jhost "string-builder"
     ;; a numeric first arg is a CAPACITY hint, not content.
@@ -150,7 +158,53 @@
                               (sb-set! self (if (< n (string-length cur))
                                                 (substring cur 0 n)
                                                 (string-append cur (make-string (- n (string-length cur)) #\nul)))))
-                            jolt-nil))))
+                            jolt-nil))
+        (cons "isEmpty" (lambda (self) (= 0 (string-length (sb-str self)))))
+        (cons "substring" (lambda (self start . rest)
+                            (let* ((cur (sb-str self)) (s (jnum->exact start))
+                                   (e (if (null? rest) (string-length cur) (jnum->exact (car rest)))))
+                              (sb-range-check cur s e)
+                              (substring cur s e))))
+        (cons "indexOf" (lambda (self needle . rest)
+                          (->num (str-index-of (sb-str self) (render-piece needle)
+                                               (if (null? rest) 0 (jnum->exact (car rest)))))))
+        (cons "lastIndexOf" (lambda (self needle)
+                              (->num (str-last-index-of (sb-str self) (render-piece needle)))))
+        (cons "setCharAt" (lambda (self i ch)
+                            (let* ((cur (sb-str self)) (i (jnum->exact i)))
+                              (sb-range-check cur i (+ i 1))
+                              (sb-set! self (string-append (substring cur 0 i) (render-piece ch)
+                                                           (substring cur (+ i 1) (string-length cur)))))
+                            jolt-nil))
+        (cons "deleteCharAt" (lambda (self i)
+                               (let* ((cur (sb-str self)) (i (jnum->exact i)))
+                                 (sb-range-check cur i (+ i 1))
+                                 (sb-set! self (string-append (substring cur 0 i)
+                                                              (substring cur (+ i 1) (string-length cur)))))
+                               self))
+        ;; delete clamps its end to the length, the way the JVM does.
+        (cons "delete" (lambda (self start end)
+                         (let* ((cur (sb-str self)) (n (string-length cur))
+                                (s (jnum->exact start)) (e (min n (jnum->exact end))))
+                           (sb-range-check cur s (max s e))
+                           (sb-set! self (string-append (substring cur 0 s) (substring cur (max s e) n))))
+                         self))
+        (cons "replace" (lambda (self start end txt)
+                          (let* ((cur (sb-str self)) (n (string-length cur))
+                                 (s (jnum->exact start)) (e (min n (jnum->exact end))))
+                            (sb-range-check cur s (max s e))
+                            (sb-set! self (string-append (substring cur 0 s) (render-piece txt)
+                                                         (substring cur (max s e) n))))
+                          self))
+        (cons "insert" (lambda (self offset x . rest)
+                         (let* ((cur (sb-str self)) (n (string-length cur)) (i (jnum->exact offset)))
+                           (sb-range-check cur i i)
+                           (sb-set! self (string-append (substring cur 0 i) (append-text x rest)
+                                                        (substring cur i n))))
+                         self))
+        (cons "reverse" (lambda (self)
+                          (sb-set! self (list->string (reverse (string->list (sb-str self)))))
+                          self))))
 ;; (str sb) / print a StringBuilder -> its accumulated content, like the JVM
 ;; (str calls toString). Without this str renders the opaque host object.
 (register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "string-builder"))) sb-str)
@@ -552,30 +606,52 @@
         (cons "close" (lambda (self) jolt-nil))))
 
 ;; ---- PushbackReader ---------------------------------------------------------
-;; state: a vector #(wrapped-reader pushed-list)
+;; state: a vector #(wrapped-reader pushed-list line-numbering? line column skip-lf?)
 (register-class-ctor! "PushbackReader"
-  (lambda (rdr . _) (make-jhost "pushback-reader" (vector rdr '()))))
+  (lambda (rdr . _) (make-jhost "pushback-reader" (vector rdr '() #f 0 0 #f))))
 ;; Fully-qualified aliases so (java.io.PushbackReader. …) / (java.io.StringReader. …)
 ;; resolve to these built-ins even when a library defines a deftype of the same
 ;; simple name (tools.reader), which would otherwise take the bare-name slot.
 (register-class-ctor! "java.io.PushbackReader" (lookup-class class-ctors-tbl "PushbackReader"))
 (register-class-ctor! "java.io.StringReader" (lookup-class class-ctors-tbl "StringReader"))
-;; LineNumberingPushbackReader: a pushback-reader (jolt doesn't track line
-;; numbers; getLineNumber is a stub for error-reporting paths that read it).
-(register-class-ctor! "LineNumberingPushbackReader"
-  (lambda (rdr . _) (make-jhost "pushback-reader" (vector rdr '()))))
-(register-class-ctor! "clojure.lang.LineNumberingPushbackReader"
-  (lambda (rdr . _) (make-jhost "pushback-reader" (vector rdr '()))))
+;; clojure.lang.LineNumberingPushbackReader is pushback over java.io.LineNumberReader,
+;; and that reader normalizes line terminators: \r, \n and \r\n each read as a single
+;; \n and bump the line number. So a source read through it looks the same whether it
+;; was written on Unix, Windows or a classic Mac — tools.reader's source logging
+;; depends on that, and without it a \r leaks through as its own character.
+(define (make-lnpbr rdr . _) (make-jhost "pushback-reader" (vector rdr '() #t 0 0 #f)))
+(register-class-ctor! "LineNumberingPushbackReader" make-lnpbr)
+(register-class-ctor! "clojure.lang.LineNumberingPushbackReader" make-lnpbr)
 (define (read-unit r)        ; read one code unit (flonum) from any reader, -1 at EOF
   (record-method-dispatch r "read" jolt-nil))
+;; One character from the wrapped reader, terminators folded to \n. Pushback sits
+;; ABOVE this (as it does on the JVM), so an unread \n is handed straight back and
+;; does not count a second line.
+(define (pbr-read-translated self)
+  (let* ((st (jhost-state self))
+         (c (read-unit (vector-ref st 0)))
+         (n (and (number? c) (jnum->exact c))))
+    (cond
+      ((and (vector-ref st 5) (eqv? n 10))     ; the \n of a \r\n pair, already counted
+       (vector-set! st 5 #f)
+       (pbr-read-translated self))
+      (else
+       (vector-set! st 5 (eqv? n 13))
+       (cond
+         ((or (eqv? n 13) (eqv? n 10))
+          (vector-set! st 3 (+ 1 (vector-ref st 3)))
+          (vector-set! st 4 0)
+          (->num 10))
+         (else (vector-set! st 4 (+ 1 (vector-ref st 4))) c))))))
 (register-host-methods! "pushback-reader"
   (list (cons "read"
           (lambda (self . rest)
             (define (read1)
-              (let ((pushed (vector-ref (jhost-state self) 1)))
-                (if (pair? pushed)
-                    (begin (vector-set! (jhost-state self) 1 (cdr pushed)) (car pushed))
-                    (read-unit (vector-ref (jhost-state self) 0)))))
+              (let* ((st (jhost-state self)) (pushed (vector-ref st 1)))
+                (cond
+                  ((pair? pushed) (vector-set! st 1 (cdr pushed)) (car pushed))
+                  ((vector-ref st 2) (pbr-read-translated self))
+                  (else (read-unit (vector-ref st 0))))))
             (if (null? rest)
                 (read1)
                 ;; .read(cbuf, off, len) -> read one code unit at a time into cbuf,
@@ -601,7 +677,10 @@
                         (loop (- i 1) (cons (->num (char->integer (vector-ref dv i))) acc))))))
             jolt-nil))
         (cons "close" (lambda (self) jolt-nil))
-        (cons "getLineNumber" (lambda (self) 0))))
+        ;; 1-based, like clojure.lang.LineNumberingPushbackReader's own +1 over the
+        ;; underlying LineNumberReader. A plain PushbackReader counts nothing.
+        (cons "getLineNumber" (lambda (self) (->num (+ 1 (vector-ref (jhost-state self) 3)))))
+        (cons "getColumnNumber" (lambda (self) (->num (vector-ref (jhost-state self) 4))))))
 
 ;; ---- StringTokenizer --------------------------------------------------------
 ;; state: a vector #(tokens-list pos)
@@ -1229,7 +1308,68 @@
         ;; Class.isInstance(o) == (instance? class o); core.logic's deftype .equals
         ;; uses (.. this getClass (isInstance o)).
         (cons "isInstance" (lambda (self o) (if (instance-check self o) #t #f)))
+        (cons "getConstructors" (lambda (self) (class-constructors self)))
+        (cons "getDeclaredConstructors" (lambda (self) (class-constructors self)))
         (cons "getClass" (lambda (self) (make-class-obj "java.lang.Class")))))
+
+;; ---- constructors as values -------------------------------------------------
+;; Enough of java.lang.reflect.Constructor to pick a constructor by arity and call
+;; it, which is how a Clojure-level reader builds a #ns.Rec[…] literal: find the
+;; constructor whose parameter count matches, then invoke it. jolt knows the arity
+;; of a deftype or defrecord constructor from its declared fields; for any other
+;; class it has no signature to report, so getConstructors is empty there and a
+;; caller sees the same "no matching constructor" it would for a real mismatch.
+;; A record also carries the JVM's (fields + meta + ext-map) constructor, so an
+;; arity-counting caller finds the same two it would on the JVM.
+(define ctor-arity-probe '(0 1 2 3 4 5))
+(define (ctor-obj cls arity) (make-jhost "class-ctor" (vector cls arity)))
+(define (class-constructors cls)
+  (let* ((nm (jclass-name cls))
+         (dbl (hashtable-ref chez-record-dbl-tbl nm #f)))
+    (cond
+      ;; a deftype or defrecord: its fields ARE its signature
+      (dbl (let ((n (vector-length dbl)))
+             (if (hashtable-ref chez-record-type-tbl nm #f)
+                 (jolt-vector (ctor-obj cls n) (ctor-obj cls (+ n 2)))
+                 (jolt-vector (ctor-obj cls n)))))
+      ;; a host class jolt backs: the arities its registered constructor accepts.
+      ;; Many are variadic and coerce, so the probe stops at 5 rather than claiming
+      ;; every arity; past that a caller gets the constructor's own error.
+      ((lookup-class class-ctors-tbl nm)
+       => (lambda (c)
+            (let ((mask (procedure-arity-mask c)))
+              (apply jolt-vector
+                     (map (lambda (k) (ctor-obj cls k))
+                          (filter (lambda (k) (bitwise-bit-set? mask k)) ctor-arity-probe))))))
+      (else (jolt-vector)))))
+(register-host-methods! "class-ctor"
+  (list (cons "getParameterCount" (lambda (self) (->num (vector-ref (jhost-state self) 1))))
+        (cons "getParameterTypes"
+              (lambda (self)
+                (apply jolt-vector
+                       (make-list (vector-ref (jhost-state self) 1) (jolt-class-for "java.lang.Object")))))
+        (cons "getDeclaringClass" (lambda (self) (vector-ref (jhost-state self) 0)))
+        (cons "newInstance" (lambda (self . args) (apply reflect-construct (vector-ref (jhost-state self) 0) args)))
+        (cons "toString" (lambda (self) (jclass-name (vector-ref (jhost-state self) 0))))))
+
+;; ---- clojure.lang.Reflector -------------------------------------------------
+;; The reflective entry points Clojure code reaches for by name. Each is the
+;; dynamic form of an interop call jolt already performs, so they route to the
+;; same registries rather than to a second mechanism.
+(define (reflect-args a) (if (jolt-nil? a) '() (seq->list (jolt-seq a))))
+(define (reflect-construct cls . args)
+  (apply host-new (if (jclass? cls) (jclass-name cls) (jolt-str-render-one cls)) args))
+(register-class-statics! "clojure.lang.Reflector"
+  (list (cons "invokeConstructor"
+              (lambda (cls args) (apply reflect-construct cls (reflect-args args))))
+        (cons "invokeStaticMethod"
+              (lambda (cls method args)
+                (apply host-static-call (if (jclass? cls) (jclass-name cls) (jolt-str-render-one cls))
+                       (jolt-str-render-one method) (reflect-args args))))
+        (cons "invokeInstanceMethod"
+              (lambda (target method args)
+                (record-method-dispatch target (jolt-str-render-one method)
+                                        (list->cseq (reflect-args args)))))))
 ;; (class x) on a jclass value returns java.lang.Class, so (instance? Class
 ;; (class y)) and class-based dispatch see the correct JVM class.
 (register-class-arm! jclass? (lambda (x) "java.lang.Class"))

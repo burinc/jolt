@@ -373,8 +373,8 @@
 (define (ms-of d)
   (cond ((number? d) d)
         ((jinst? d) (jinst-ms d))
-        ((and (jhost? d) (member (jhost-tag d) '("calendar" "sql-date")))
-         (vector-ref (jhost-state d) 0))
+        ((and (jhost? d) (string=? (jhost-tag d) "calendar")) (cal-ms d))
+        ((and (jhost? d) (string=? (jhost-tag d) "sql-date")) (vector-ref (jhost-state d) 0))
         (else (throw-jvm (quote IllegalArgumentException) (string-append "not a date value: " (jolt-final-str d))))))
 ;; coerce a user-supplied ms (exact or flonum) to an exact integer for storage.
 (define (ms->exact ms) (exact (round ms)))
@@ -440,12 +440,110 @@
         (cons "toLocalDate" (lambda (self) (host-static-call "java.time.LocalDate" "ofEpochDay" (inst-floor-div (ms-of self) 86400000))))
         (cons "toString" (lambda (self) (inst-rfc3339 (make-jinst (ms-of self)))))))
 
-;; java.util.Calendar: a mutable broken-down UTC time over an epoch-ms. setTime/
-;; getTime read/write it; set(field,value) recomputes ms from the field projection.
+;; java.util.TimeZone: an id, and the offset that id stands for. A custom id —
+;; GMT+05:30 and the forms around it — is parsed here; a named IANA zone resolves
+;; through libc (tz-primitives.ss), which is also where its DST transitions come
+;; from. Where there is no tzdata a named zone reads as UTC, the same answer the
+;; JVM gives for an id it does not know.
+
+;; A leading GMT / UTC / UT is a prefix only when the rest is empty or an offset.
+(define (tz-strip-gmt s)
+  (let ((n (string-length s)))
+    (define (try k tag)
+      (and (>= n k) (string-ci=? (substring s 0 k) tag)
+           (or (= n k) (memv (string-ref s k) '(#\+ #\-)))
+           (substring s k n)))
+    (or (try 3 "GMT") (try 3 "UTC") (try 2 "UT") s)))
+
+;; ±H | ±HH | ±HMM | ±HHMM | ±HH:MM | ±HH:MM:SS -> seconds east of UTC, else #f.
+(define (tz-parse-offset s)
+  (let ((n (string-length s)))
+    (and (>= n 2)
+         (let ((sign (case (string-ref s 0) ((#\+) 1) ((#\-) -1) (else #f))))
+           (and sign
+                (let loop ((i 1) (ds '()))
+                  (if (= i n)
+                      (let* ((d (list->vector (reverse ds))) (k (vector-length d)))
+                        (define (num lo hi)
+                          (let l ((j lo) (acc 0))
+                            (if (= j hi) acc (l (+ j 1) (+ (* acc 10) (vector-ref d j))))))
+                        (and (memv k '(1 2 3 4 6))
+                             (let ((h (if (= k 3) (num 0 1) (num 0 (min k 2))))
+                                   (m (cond ((= k 3) (num 1 3)) ((>= k 4) (num 2 4)) (else 0)))
+                                   (sec (if (= k 6) (num 4 6) 0)))
+                               (and (<= h 23) (<= m 59) (<= sec 59)
+                                    (* sign (+ (* h 3600) (* m 60) sec))))))
+                      (let ((c (string-ref s i)))
+                        (cond ((char=? c #\:) (loop (+ i 1) ds))
+                              ((and (char>=? c #\0) (char<=? c #\9))
+                               (loop (+ i 1) (cons (- (char->integer c) 48) ds)))
+                              (else #f))))))))))
+
+(define (tz-custom-offset id)            ; seconds | #f when the id is a named zone
+  (let ((body (tz-strip-gmt id)))
+    (cond ((string=? body "") 0)
+          ((string-ci=? body "Z") 0)
+          (else (tz-parse-offset body)))))
+
+(define tz-probe-jan 1767225600)         ; 2026-01-01T00:00:00Z
+(define tz-probe-jul 1782864000)         ; 2026-07-01T00:00:00Z
+
+(define (tz-offset-seconds id epoch-secs)
+  (or (tz-custom-offset id) (tzp-tz-offset id epoch-secs) 0))
+
+;; The JVM's raw offset is standard time. DST only ever adds, so the smaller of a
+;; midwinter and a midsummer probe is standard time in either hemisphere.
+(define (tz-raw-offset-seconds id)
+  (or (tz-custom-offset id)
+      (let ((a (tzp-tz-offset id tz-probe-jan)) (b (tzp-tz-offset id tz-probe-jul)))
+        (and a b (min a b)))
+      0))
+
+(define (timezone-of id) (make-jhost "timezone" (vector (if (string? id) id (jolt-str-render-one id)))))
+(define (timezone? x) (and (jhost? x) (string=? (jhost-tag x) "timezone")))
+(define (tz-id tz) (if (timezone? tz) (vector-ref (jhost-state tz) 0) (jolt-str-render-one tz)))
+(define (tz-offset-ms tz ms)
+  (* 1000 (tz-offset-seconds (tz-id tz) (inst-floor-div (ms->exact ms) 1000))))
+
+(register-host-methods! "timezone"
+  (list (cons "getID" (lambda (self) (tz-id self)))
+        (cons "toString" (lambda (self) (tz-id self)))
+        (cons "getOffset" (lambda (self ms) (tz-offset-ms self ms)))
+        (cons "getRawOffset" (lambda (self) (* 1000 (tz-raw-offset-seconds (tz-id self)))))
+        (cons "hasSameRules" (lambda (self o) (string=? (tz-id self) (tz-id o))))
+        (cons "useDaylightTime"
+              (lambda (self)
+                (let ((id (tz-id self)))
+                  (not (= (tz-offset-seconds id tz-probe-jan)
+                          (tz-offset-seconds id tz-probe-jul))))))
+        (cons "inDaylightTime"
+              (lambda (self d)
+                (> (tz-offset-ms self (ms-of d))
+                   (* 1000 (tz-raw-offset-seconds (tz-id self))))))))
+
+;; jolt reads every date in UTC unless a zone says otherwise, so that is what the
+;; default zone is — the JVM's would be the machine's.
+(define timezone-statics
+  (list (cons "getTimeZone" timezone-of)
+        (cons "getDefault" (lambda () (timezone-of "UTC")))))
+(register-class-statics! "TimeZone" timezone-statics)
+(register-class-statics! "java.util.TimeZone" timezone-statics)
+
+;; java.util.Calendar / GregorianCalendar: a broken-down time plus the zone it is
+;; read in. Either the instant or the fields are authoritative, never both, and the
+;; other is derived on demand. That is what makes
+;;   (doto (GregorianCalendar. y m d h mi s) (.set Calendar/MILLISECOND n)
+;;                                           (.setTimeZone tz))
+;; mean what it does on the JVM: the fields are resolved in whichever zone is
+;; current when the instant is finally asked for, so setting the zone last still
+;; decides what the fields meant.
 ;; Field constants are Java's int values so .set/.get dispatch on the right field.
-(define cal-YEAR 1) (define cal-MONTH 2) (define cal-DAY_OF_MONTH 5)
+(define cal-ERA 0) (define cal-YEAR 1) (define cal-MONTH 2)
+(define cal-WEEK_OF_YEAR 3) (define cal-WEEK_OF_MONTH 4) (define cal-DAY_OF_MONTH 5)
+(define cal-DAY_OF_YEAR 6) (define cal-DAY_OF_WEEK 7) (define cal-DAY_OF_WEEK_IN_MONTH 8)
+(define cal-AM_PM 9) (define cal-HOUR 10)
 (define cal-HOUR_OF_DAY 11) (define cal-MINUTE 12) (define cal-SECOND 13)
-(define cal-MILLISECOND 14)
+(define cal-MILLISECOND 14) (define cal-ZONE_OFFSET 15) (define cal-DST_OFFSET 16)
 (define (cal-ms->fields ms)            ; -> vector [y mo0 d hh mi ss frac] (MONTH 0-based, JVM)
   (let ((f (inst-fields ms)))
     (vector (list-ref f 0) (- (list-ref f 1) 1) (list-ref f 2)
@@ -458,37 +556,188 @@
   (cond ((= fld cal-YEAR) 0) ((= fld cal-MONTH) 1) ((= fld cal-DAY_OF_MONTH) 2)
         ((= fld cal-HOUR_OF_DAY) 3) ((= fld cal-MINUTE) 4) ((= fld cal-SECOND) 5)
         ((= fld cal-MILLISECOND) 6) (else #f)))
+;; state: #(instant-ms | #f, field-vector | #f, TimeZone). At most one of the
+;; first two is #f, and asking for it fills it in from the other.
+(define (cal-zone c) (vector-ref (jhost-state c) 2))
+
+(define (cal-ms c)
+  (let ((st (jhost-state c)))
+    (or (vector-ref st 0)
+        (let* ((local (cal-fields->ms (vector-ref st 1)))
+               (id (tz-id (vector-ref st 2)))
+               ;; the offset depends on the instant and the instant on the offset,
+               ;; so probe with the local reading and correct once.
+               (o (* 1000 (tz-offset-seconds id (inst-floor-div local 1000))))
+               (ms (- local (* 1000 (tz-offset-seconds id (inst-floor-div (- local o) 1000))))))
+          (vector-set! st 0 ms)
+          ms))))
+
+(define (cal-fields c)
+  (let ((st (jhost-state c)))
+    (or (vector-ref st 1)
+        (let* ((ms (vector-ref st 0))
+               (f (cal-ms->fields (+ ms (tz-offset-ms (vector-ref st 2) ms)))))
+          (vector-set! st 1 f)
+          f))))
+
+(define (cal-set-ms! c ms)
+  (let ((st (jhost-state c)))
+    (vector-set! st 0 (ms->exact ms)) (vector-set! st 1 #f) jolt-nil))
+
+;; Reading or editing a field completes the calendar first, as the JVM does:
+;; pending fields resolve to an instant in the current zone and are then re-derived
+;; from it, so an out-of-range MONTH 13 or DAY_OF_MONTH 32 reads back normalized.
+(define (cal-complete! c)
+  (let ((st (jhost-state c)))
+    (unless (vector-ref st 0)
+      (cal-ms c)
+      (vector-set! st 1 #f)))
+  (cal-fields c))
+
+;; hand back the fields for mutation: the instant they described is now stale.
+(define (cal-edit-fields! c)
+  (let ((f (cal-complete! c))) (vector-set! (jhost-state c) 0 #f) f))
+
+(define (cal-days-in-month y m)          ; m is 1-12
+  (- (days-from-civil (if (= m 12) (+ y 1) y) (if (= m 12) 1 (+ m 1)) 1)
+     (days-from-civil y m 1)))
+
+;; Derived fields are computed, not stored, so they cannot go stale under .set.
+(define (cal-get c fld)
+  (let* ((f (cal-complete! c))
+         (y (vector-ref f 0)) (mo0 (vector-ref f 1))
+         (d (vector-ref f 2)) (h (vector-ref f 3)))
+    (cond
+      ((cal-field-index fld) => (lambda (i) (vector-ref f i)))
+      ((= fld cal-ERA) (if (> y 0) 1 0))
+      ((= fld cal-DAY_OF_WEEK) (+ 1 (inst-floor-mod (+ (days-from-civil y (+ mo0 1) d) 4) 7)))
+      ((= fld cal-DAY_OF_YEAR) (+ 1 (- (days-from-civil y (+ mo0 1) d) (days-from-civil y 1 1))))
+      ((= fld cal-AM_PM) (if (< h 12) 0 1))
+      ((= fld cal-HOUR) (modulo h 12))
+      ((= fld cal-ZONE_OFFSET) (* 1000 (tz-raw-offset-seconds (tz-id (cal-zone c)))))
+      ((= fld cal-DST_OFFSET)
+       (let ((id (tz-id (cal-zone c))))
+         (- (* 1000 (tz-offset-seconds id (inst-floor-div (cal-ms c) 1000)))
+            (* 1000 (tz-raw-offset-seconds id)))))
+      (else 0))))
+
+;; add moves YEAR and MONTH in calendar steps, clamping the day (Jan 31 plus one
+;; month is Feb 28); day-scale fields keep the wall-clock time and shift the date;
+;; time-scale fields add real elapsed time, as on the JVM.
+(define (cal-add-days! c n)
+  (let ((f (cal-edit-fields! c))) (vector-set! f 2 (+ (vector-ref f 2) n)) jolt-nil))
+
+(define (cal-add! c fld amount)
+  (cond
+    ((= fld cal-MONTH)
+     (let* ((f (cal-edit-fields! c))
+            (tot (+ (* 12 (vector-ref f 0)) (vector-ref f 1) amount))
+            (y (inst-floor-div tot 12)) (mo0 (inst-floor-mod tot 12)))
+       (vector-set! f 0 y) (vector-set! f 1 mo0)
+       (vector-set! f 2 (min (vector-ref f 2) (cal-days-in-month y (+ mo0 1))))))
+    ((= fld cal-YEAR)
+     (let* ((f (cal-edit-fields! c)) (y (+ (vector-ref f 0) amount)))
+       (vector-set! f 0 y)
+       (vector-set! f 2 (min (vector-ref f 2) (cal-days-in-month y (+ (vector-ref f 1) 1))))))
+    ((or (= fld cal-DAY_OF_MONTH) (= fld cal-DAY_OF_YEAR) (= fld cal-DAY_OF_WEEK))
+     (cal-add-days! c amount))
+    ((or (= fld cal-WEEK_OF_YEAR) (= fld cal-WEEK_OF_MONTH) (= fld cal-DAY_OF_WEEK_IN_MONTH))
+     (cal-add-days! c (* 7 amount)))
+    ((or (= fld cal-HOUR_OF_DAY) (= fld cal-HOUR)) (cal-set-ms! c (+ (cal-ms c) (* 3600000 amount))))
+    ((= fld cal-MINUTE) (cal-set-ms! c (+ (cal-ms c) (* 60000 amount))))
+    ((= fld cal-SECOND) (cal-set-ms! c (+ (cal-ms c) (* 1000 amount))))
+    ((= fld cal-MILLISECOND) (cal-set-ms! c (+ (cal-ms c) amount)))
+    (else jolt-nil))
+  jolt-nil)
+
 (register-host-methods! "calendar"
-  (list (cons "setTime" (lambda (self d) (vector-set! (jhost-state self) 0 (ms->exact (ms-of d))) jolt-nil))
-        (cons "getTime" (lambda (self) (make-jinst (vector-ref (jhost-state self) 0))))
-        (cons "getTimeInMillis" (lambda (self) (vector-ref (jhost-state self) 0)))
-        (cons "setTimeInMillis" (lambda (self ms) (vector-set! (jhost-state self) 0 (ms->exact ms)) jolt-nil))
-        (cons "set" (lambda (self field val)
-                      (let ((v (cal-ms->fields (vector-ref (jhost-state self) 0)))
-                            (idx (cal-field-index (jnum->exact field))))
-                        (when idx (vector-set! v idx (jnum->exact val))
-                              (vector-set! (jhost-state self) 0 (cal-fields->ms v)))
-                        jolt-nil)))
-        (cons "get" (lambda (self field)
-                      (let ((v (cal-ms->fields (vector-ref (jhost-state self) 0)))
-                            (idx (cal-field-index (jnum->exact field))))
-                        (if idx (vector-ref v idx) 0))))))
+  (list (cons "setTime" (lambda (self d) (cal-set-ms! self (ms-of d))))
+        (cons "getTime" (lambda (self) (make-jinst (cal-ms self))))
+        (cons "getTimeInMillis" (lambda (self) (cal-ms self)))
+        (cons "setTimeInMillis" (lambda (self ms) (cal-set-ms! self ms)))
+        (cons "getTimeZone" (lambda (self) (cal-zone self)))
+        (cons "setTimeZone"
+              (lambda (self tz)
+                (let ((st (jhost-state self)))
+                  ;; the JVM invalidates the fields here, so a calendar that has an
+                  ;; instant re-reads its fields in the new zone, while one still
+                  ;; holding pending fields resolves them in it instead.
+                  (when (vector-ref st 0) (vector-set! st 1 #f))
+                  (vector-set! st 2 (if (timezone? tz) tz (timezone-of (jolt-str-render-one tz)))))
+                jolt-nil))
+        (cons "set"
+              (lambda (self . a)
+                (let ((n (length a)) (f (cal-edit-fields! self)))
+                  (cond
+                    ((= n 2)
+                     (let ((idx (cal-field-index (jnum->exact (car a)))))
+                       (when idx (vector-set! f idx (jnum->exact (cadr a))))))
+                    ((memv n '(3 5 6))
+                     (let ((v (map jnum->exact a)))
+                       (vector-set! f 0 (list-ref v 0))
+                       (vector-set! f 1 (list-ref v 1))
+                       (vector-set! f 2 (list-ref v 2))
+                       ;; the multi-field arities set only the fields they name —
+                       ;; the JVM leaves the rest, MILLISECOND included, alone.
+                       (when (>= n 5)
+                         (vector-set! f 3 (list-ref v 3))
+                         (vector-set! f 4 (list-ref v 4)))
+                       (when (= n 6) (vector-set! f 5 (list-ref v 5)))))
+                    (else (throw-jvm (quote IllegalArgumentException)
+                                     "No matching method set for calendar")))
+                  jolt-nil)))
+        (cons "get" (lambda (self field) (cal-get self (jnum->exact field))))
+        (cons "add" (lambda (self field amount) (cal-add! self (jnum->exact field) (jnum->exact amount))))
+        (cons "before" (lambda (self o) (< (cal-ms self) (ms-of o))))
+        (cons "after" (lambda (self o) (> (cal-ms self) (ms-of o))))))
+
+(define (calendar-arg-zone args)
+  (or (let loop ((a args)) (cond ((null? a) #f) ((timezone? (car a)) (car a)) (else (loop (cdr a)))))
+      (timezone-of "UTC")))
+
+(define (calendar-of-ms ms zone) (make-jhost "calendar" (vector (ms->exact ms) #f zone)))
+
+;; GregorianCalendar(): now. (y month day [hour minute [second]]): those fields in
+;; the default zone, with MILLISECOND 0. A TimeZone argument sets the zone; a
+;; Locale argument is accepted and ignored — jolt has the one calendar system.
+(define (gregorian-calendar-ctor . args)
+  (if (and (pair? args) (number? (car args)))
+      (let ((n (length args)))
+        (when (< n 3)
+          (throw-jvm (quote IllegalArgumentException)
+                     "No matching ctor found for class GregorianCalendar"))
+        (let ((at (lambda (i dflt) (if (> n i) (jnum->exact (list-ref args i)) dflt))))
+          (make-jhost "calendar"
+                      (vector #f (vector (at 0 0) (at 1 0) (at 2 1) (at 3 0) (at 4 0) (at 5 0) 0)
+                              (calendar-arg-zone '())))))
+      (calendar-of-ms (now-ms) (calendar-arg-zone args))))
+
+(register-class-ctor! "GregorianCalendar" gregorian-calendar-ctor)
+(register-class-ctor! "java.util.GregorianCalendar" gregorian-calendar-ctor)
+
 (define calendar-statics
-  (list (cons "getInstance" (lambda _ (make-jhost "calendar" (vector (now-ms)))))
-        (cons "YEAR" cal-YEAR) (cons "MONTH" cal-MONTH) (cons "DAY_OF_MONTH" cal-DAY_OF_MONTH)
+  (list (cons "getInstance" (lambda args (calendar-of-ms (now-ms) (calendar-arg-zone args))))
+        (cons "ERA" cal-ERA) (cons "YEAR" cal-YEAR) (cons "MONTH" cal-MONTH)
+        (cons "WEEK_OF_YEAR" cal-WEEK_OF_YEAR) (cons "WEEK_OF_MONTH" cal-WEEK_OF_MONTH)
+        (cons "DATE" cal-DAY_OF_MONTH) (cons "DAY_OF_MONTH" cal-DAY_OF_MONTH)
+        (cons "DAY_OF_YEAR" cal-DAY_OF_YEAR) (cons "DAY_OF_WEEK" cal-DAY_OF_WEEK)
+        (cons "DAY_OF_WEEK_IN_MONTH" cal-DAY_OF_WEEK_IN_MONTH)
+        (cons "AM_PM" cal-AM_PM) (cons "HOUR" cal-HOUR)
         (cons "HOUR_OF_DAY" cal-HOUR_OF_DAY) (cons "MINUTE" cal-MINUTE)
-        (cons "SECOND" cal-SECOND) (cons "MILLISECOND" cal-MILLISECOND)))
+        (cons "SECOND" cal-SECOND) (cons "MILLISECOND" cal-MILLISECOND)
+        (cons "ZONE_OFFSET" cal-ZONE_OFFSET) (cons "DST_OFFSET" cal-DST_OFFSET)
+        (cons "AM" 0) (cons "PM" 1)
+        (cons "JANUARY" 0) (cons "FEBRUARY" 1) (cons "MARCH" 2) (cons "APRIL" 3)
+        (cons "MAY" 4) (cons "JUNE" 5) (cons "JULY" 6) (cons "AUGUST" 7)
+        (cons "SEPTEMBER" 8) (cons "OCTOBER" 9) (cons "NOVEMBER" 10) (cons "DECEMBER" 11)
+        (cons "SUNDAY" 1) (cons "MONDAY" 2) (cons "TUESDAY" 3) (cons "WEDNESDAY" 4)
+        (cons "THURSDAY" 5) (cons "FRIDAY" 6) (cons "SATURDAY" 7)))
 (register-class-statics! "Calendar" calendar-statics)
 (register-class-statics! "java.util.Calendar" calendar-statics)
-
-;; java.util.TimeZone: an opaque id holder (format-ms is UTC, so a non-UTC zone is
-;; not honored — only the UTC case the corpus uses is exercised).
-(define (timezone-of id) (make-jhost "timezone" (vector (if (string? id) id (jolt-str-render-one id)))))
-(define timezone-statics
-  (list (cons "getTimeZone" timezone-of)
-        (cons "getDefault" (lambda () (timezone-of "default")))))
-(register-class-statics! "TimeZone" timezone-statics)
-(register-class-statics! "java.util.TimeZone" timezone-statics)
+;; GregorianCalendar inherits Calendar's constants and adds the era ones.
+(define gregorian-statics (append (list (cons "AD" 1) (cons "BC" 0)) calendar-statics))
+(register-class-statics! "GregorianCalendar" gregorian-statics)
+(register-class-statics! "java.util.GregorianCalendar" gregorian-statics)
 
 ;; java.text.SimpleDateFormat: holds a pattern; .setTimeZone is accepted (format-ms
 ;; is UTC); .format(date) renders the date per the pattern via the format-ms engine.

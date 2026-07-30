@@ -157,6 +157,25 @@
    :jvm "java.lang.String"
    :jolt "clojure.core/String"
    :note "A consequence of the class model — a class name is not a java.lang-resolved token in syntax-quote."}
+  ;; On the JVM syntax-quote is purely a reader macro, so nothing of it survives a
+  ;; read. jolt's compile-path reader emits (syntax-quote form) and the analyzer
+  ;; lowers it, which is invisible except when the form is itself quoted. The data
+  ;; path (read-string / read) does expand at read time and agrees with the JVM.
+  {:category :reader-model
+   :behavior "'`foo/bar in source — a quoted syntax-quote"
+   :jvm "(quote foo/bar) — the reader has already expanded it"
+   :jolt "(syntax-quote foo/bar) — the analyzer expands it"
+   :note "(read-string \"`foo/bar\") agrees with the JVM; only a syntax-quote quoted in compiled source differs. Surfaces in clojure.tools.reader's read-syntax-quote suite."}
+  ;; the reader stamps a position on list forms for error reporting, and quote takes
+  ;; it back off so a quoted list literal stays a constant rather than an allocating
+  ;; (with-meta …). The JVM keeps it, and cannot tell it from a position the program
+  ;; wrote — jolt drops both. Vectors, maps, sets and symbols are never stamped, so
+  ;; they keep whatever the program wrote (corpus, "conformance / metadata / vars").
+  {:category :reader-model
+   :behavior "(meta '(foo)) read from a file, and (meta '^{:line 99} (foo))"
+   :jvm "{:line N :column M} / {:line 99 :column M}"
+   :jolt "nil / nil"
+   :note "Only :line/:column/:file, only on a quoted LIST. Keeps quoted list literals constant instead of reallocating a with-meta wrapper per evaluation."}
   ;; Integer/toHexString of a byte read out of a byte[]. Unlike format's %x (which
   ;; infers the width and is handled in :entries), these statics name their width.
   {:category :integer-box-model

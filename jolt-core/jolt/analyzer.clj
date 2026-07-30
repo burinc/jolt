@@ -514,13 +514,15 @@
 (defn- analyze-special [ctx op items env]
   (case op
     ;; A quoted collection keeps its USER metadata (rewrite-clj coerces
-    ;; '^:x (4 5 6) and expects the meta back), but not the reader's location keys
-    ;; (:line/:column/:file) — like Clojure, which strips those from a quoted
-    ;; constant. The kept metadata is itself part of the literal, so quote it.
+    ;; '^:x (4 5 6) and expects the meta back). A list form is the one thing the
+    ;; reader stamps with :line/:column/:file, and that is its own bookkeeping
+    ;; rather than data, so it comes back off — but only there: on a vector, map,
+    ;; set or symbol the only possible source of a position key is the program
+    ;; that wrote it. The kept metadata is part of the literal, so quote it.
     "quote" (let [qf (second items)
                   m (form-coll-meta qf)
                   m (when (map? m)
-                      (let [u (dissoc m :line :column :end-line :end-column :file)]
+                      (let [u (if (form-list? qf) (dissoc m :line :column :file) m)]
                         (when (seq u) u)))]
               (if (nil? m)
                 (quote-node qf)
