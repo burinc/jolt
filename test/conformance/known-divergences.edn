@@ -156,9 +156,33 @@
    :behavior "`String (syntax-quote of a bare class name)"
    :jvm "java.lang.String"
    :jolt "clojure.core/String"
-   :note "A consequence of the class model — a class name is not a java.lang-resolved token in syntax-quote."}]
+   :note "A consequence of the class model — a class name is not a java.lang-resolved token in syntax-quote."}
+  ;; Integer/toHexString of a byte read out of a byte[]. Unlike format's %x (which
+  ;; infers the width and is handled in :entries), these statics name their width.
+  {:category :integer-box-model
+   :behavior "(Integer/toHexString (aget (byte-array [255]) 0))"
+   :jvm "\"ff\" (the byte widens to int -1 … so also \"ffffffff\"; the two-digit form needs Byte/toUnsignedInt)"
+   :jolt "\"ffffffff\" — the same, since the static's width is 32 by name"
+   :note "Both agree here: Integer/toHexString is 32 bits wide on both, so a signed byte gives eight digits on both. Listed only to point at the portable forms — Byte/toUnsignedInt or (bit-and b 0xff) — since format's %x DOES infer its width and is the case that diverges (see the :entries row for numbers / unsigned string conversions)."}
+  ;; ByteBuffer.slice() copies where the JVM shares the backing array.
+  {:category :host-model
+   :behavior "(.array (.slice buf)) after (.position buf 1)"
+   :jvm "the WHOLE shared backing array (slice is a view; .array ignores the offset)"
+   :jolt "just the sliced bytes (slice copies)"
+   :note "jolt's byte-buffer state is #(backing position limit) with no array offset, so a slice cannot express \"0-based view into a shared backing\". Read paths — hexdumps, decoders — are unaffected; a write through a slice does not propagate back. Tracked as jolt-93c9."}]
  :entries
- [{:suite "forms / fn",
+ [;; %x / %X / %o widen by the argument's Java type on the JVM (Byte 8 bits, Short
+  ;; 16, Integer 32, Long 64). jolt unifies every integer as one type, so it cannot
+  ;; read the width off the argument and takes the narrowest one holding the value —
+  ;; which IS the JVM's answer whenever the value's origin type is the narrowest
+  ;; that holds it, so an unmasked byte out of a byte[] hex-formats at two digits
+  ;; and an int-sized hash at eight (both certified in the rows above). What
+  ;; diverges is a long whose value fits narrower: the JVM pads to 16 digits.
+  ;; (bit-and b 0xff) pins the width explicitly and is identical on both. jolt-kevb.
+  {:suite "numbers / unsigned string conversions",
+   :label "a negative long takes the narrowest width holding it",
+   :category :integer-box-model}
+  {:suite "forms / fn",
    :label "no param vector",
    :category :strictness}
   {:suite "io / cold tagged types via print-method",

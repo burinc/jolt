@@ -270,9 +270,15 @@
                       (let ((s (substring body 0 comma)))
                         (if (> (string-length s) 0) (string->number s) #f))
                       (string->number body)))
-               (m (and comma
-                       (let ((s (substring body (+ comma 1) (string-length body))))
-                         (if (> (string-length s) 0) (string->number s) #f))))
+               ;; {n} is EXACTLY n, so its upper bound is n — not #f, which is
+               ;; irregex's "no bound" and made every {n} behave as {n,}: \d{4}
+               ;; matched all of "20260729", [0-9]{2} all of "1234", and
+               ;; (?:%[0-9a-f]{2})+ ran past the last percent-escape. Only a comma
+               ;; opens the bound: {n,} (nothing after it) is unbounded, {n,m} is m.
+               (m (if comma
+                      (let ((s (substring body (+ comma 1) (string-length body))))
+                        (if (> (string-length s) 0) (string->number s) #f))
+                      n))
                (j (+ cb 1))
                (lazy? (and (< j end) (char=? (string-ref src j) #\?)))
                (j (if lazy? (+ j 1) j))

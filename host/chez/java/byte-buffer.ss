@@ -1,6 +1,6 @@
 ;; byte-buffer.ss — java.nio.ByteBuffer over a jolt byte-array. A buffer is a
 ;; jhost tagged "byte-buffer" with mutable #(backing-array position limit); the
-;; backing is a jolt byte-array (vector of 0..255). Covers the slice of the API
+;; backing is a jolt byte-array (signed bytes, -128..127). Covers the slice of the API
 ;; portable code reaches for — wrap / get(byte[]) / array / remaining / position /
 ;; limit / duplicate / flip / rewind — e.g. cognitect aws-api wrapping blob bytes.
 
@@ -73,7 +73,9 @@
                          (do ((i 0 (fx+ i 1))) ((fx=? i n))
                            (vector-set! dv (+ dp i) (vector-ref sv i)))
                          (bb-pos! self (+ dp n))))
-                      (else (vector-set! dv dp (jnum->exact src)) (bb-pos! self (+ dp 1))))
+                      ;; a lone byte: narrowed like any byte-array store, so the
+                      ;; backing stays in -128..127 whichever form the caller used.
+                      (else (vector-set! dv dp (na-byte-of src)) (bb-pos! self (+ dp 1))))
                     self)))
     ;; get(): relative single byte at position, advancing it.
     ;; get(int i): absolute single byte at index i (position unchanged).

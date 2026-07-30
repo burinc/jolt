@@ -5,6 +5,32 @@
 ;; jolt-str-render-one via converters + jolt-truthy?).
 
 (define (->long x) (exact (truncate x)))
+;; %x / %X / %o are UNSIGNED conversions on the JVM: a negative argument prints the
+;; two's complement of its integer type, not a signed magnitude ("%x" -1 was "-1"
+;; here, which is wrong under any width). The WIDTH is the argument's Java type —
+;; Byte 8 bits, Short 16, Integer 32, Long 64 — and jolt unifies every integer as
+;; one type, so it cannot read the width off the argument and one of the two ends
+;; must diverge. jolt takes the NARROWEST width that holds the value, which is the
+;; JVM's answer whenever the value's origin type is the narrowest that holds it:
+;; a byte out of a byte[] prints two digits and an int-sized hash prints eight,
+;; so the hex-dump and percent-encode idioms match the JVM unmasked. The cost is a
+;; long whose value fits narrower — (format "%x" (long -1)) is "ff" here and
+;; "ffffffffffffffff" on the JVM — allowlisted under :integer-box-model. Masking
+;; ((bit-and b 0xff)) pins the width explicitly and is identical on both.
+;; A value outside the signed-64 range has no fixed-width two's complement to print
+;; — the JVM would be holding a BigInteger there, whose %x is a signed magnitude
+;; with a leading minus — so that is what it gets. Masking it to 64 bits, as the
+;; width search would, silently rendered -(2^70) as "0".
+(define (fmt-radix v radix)
+  (let ((n (->long v)))
+    (cond
+      ((>= n 0) (number->string n radix))
+      ((< n (- (expt 2 63))) (string-append "-" (number->string (- n) radix)))
+      (else
+       (let loop ((bits 8))
+         (if (>= n (- (expt 2 (- bits 1))))
+             (number->string (bitwise-and n (- (expt 2 bits) 1)) radix)
+             (loop (fx* bits 2))))))))
 (define (pad-left s n c) (if (fx>=? (string-length s) n) s (string-append (make-string (fx- n (string-length s)) c) s)))
 (define (fmt-float x prec)
   (let* ((neg (< x 0)) (ax (abs x))
@@ -47,9 +73,9 @@
                                        ((#\s) (if (jolt-nil? a) "null" (jolt-str-render-one a)))
                                        ((#\S) (string-upcase (if (jolt-nil? a) "null" (jolt-str-render-one a))))
                                        ((#\f) (fmt-float a (or prec 6)))
-                                       ((#\x) (string-downcase (number->string (->long a) 16)))
-                                       ((#\X) (string-upcase (number->string (->long a) 16)))
-                                       ((#\o) (number->string (->long a) 8))
+                                       ((#\x) (string-downcase (fmt-radix a 16)))
+                                       ((#\X) (string-upcase (fmt-radix a 16)))
+                                       ((#\o) (fmt-radix a 8))
                                        ((#\b) (if (jolt-truthy? a) "true" "false"))
                                        ((#\c) (string (integer->char (->long a))))
                                        (else (jolt-throw (jolt-host-throwable "java.util.UnknownFormatConversionException"

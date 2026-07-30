@@ -343,7 +343,7 @@
         (cons "size"          (lambda (p . _) (nio-size (nfp p))))
         (cons "delete"        (lambda (p) (nio-delete1 (nfp p) #f) jolt-nil))
         (cons "deleteIfExists"(lambda (p) (nio-delete1 (nfp p) #t)))
-        (cons "readAllBytes"  (lambda (p) (make-jolt-array (list->vector (bytevector->u8-list (nio-read-bv (nfp p)))) 'byte)))
+        (cons "readAllBytes"  (lambda (p) (na-bv->bytearray (nio-read-bv (nfp p)))))
         (cons "readAllLines"  (lambda (p . _) (nio-read-lines (nfp p))))
         (cons "newInputStream"(lambda (p . _) (make-in-stream (open-file-input-port (nfp p)))))
         (cons "createTempFile"      (lambda args (nio-files-create-temp args #f)))

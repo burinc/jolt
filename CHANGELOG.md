@@ -7,7 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`byte-array` elements are signed bytes, −128..127, like the JVM's `byte[]`.**
+  They were unsigned 0..255, so `(vec (byte-array [255 128]))` was `[255 128]` where
+  the JVM gives `[-1 -128]`, and every numeric look at a high byte disagreed:
+  `(neg? b)` never fired, `(= b -1)` was never true, `(reduce + bytes)` summed to a
+  different number, and a `(bit-and b 0xff)` mask that is load-bearing on the JVM
+  was a no-op here. Nothing errored — the answers were just quietly different.
+
+  This is one representation change across every producer and consumer, not a
+  per-call-site patch: `na-byte-of` is the one place a value entering a byte array is
+  narrowed (`Byte.byteValue()` semantics — truncate toward zero, low 8 bits, fold the
+  sign), `na-bv->bytearray` the one place raw bytes become a byte array, and
+  `na-bytearray->bv` the one place they go back. `byte-array` / `.getBytes` /
+  `String.` / stream reads / `Files/readAllBytes` / `jolt.fs` / `io/copy` /
+  `ByteBuffer` / Base64 / `Random/nextBytes` / `jolt.ffi` read-array/write-array all
+  route through those three, so bytes survive any round-trip byte-exactly. `aset` on
+  a byte array narrows rather than storing raw — the JVM rejects `(aset bytes 0 200)`
+  because it can see 200 is an Integer, and jolt has one integer type, so narrowing
+  is what keeps the array's range invariant true for `aget`/`seq`/`String.`.
+  `InputStream.read()` stays unsigned 0..255, which is its contract and the only way
+  a caller can tell `0xff` from end-of-stream.
+
+  `(byte-array [-1.9])` is now `-1`, not `-2` — the JVM's `d2i` truncates toward
+  zero where this floored.
+
+- **`format`'s `%x` / `%X` / `%o` are unsigned conversions.** They printed a signed
+  magnitude, so `(format "%x" -1)` was `"-1"` — wrong under any width. The JVM takes
+  the width from the argument's type (`Byte` 8 bits, `Short` 16, `Integer` 32, `Long`
+  64); jolt unifies every integer as one type and so takes the narrowest width that
+  holds the value. That is the JVM's answer whenever the value's origin type is the
+  narrowest that holds it, so an unmasked byte out of a `byte[]` prints two digits
+  and an int-sized value eight — which is what the common hex-dump and
+  percent-encoder idioms need, and it keeps ring-codec and cognitect aws-api's signer
+  correct unmodified. A long whose value fits narrower is the one case that
+  diverges (`(format "%x" (long -1))` is `"ff"` here, 16 digits on the JVM); it is
+  entered in `known-divergences.edn` under `:integer-box-model`. `(bit-and b 0xff)`
+  pins the width explicitly and is identical on both.
+
 ### Fixed
+
+- **`{n}` in a regex meant `{n,}`.** The translator handed irregex an unbounded
+  upper bound for an exact count, so every exact repetition matched greedily past
+  it: `(re-find #"\d{4}" "20260729")` returned the whole string instead of `"2026"`,
+  `(re-matches #"\d{4}" "20260")` matched where the JVM returns nil,
+  `(re-seq #"\d{2}" "123456")` gave one element instead of three, and
+  `#"(?:%[0-9a-f]{2})+"` ran past the last percent-escape — which is how
+  ring-codec's `percent-decode` came apart. `{n,}` and `{n,m}` were always right;
+  only the comma-less form was wrong.
+
+- **`Base64` handed back an opaque host buffer instead of a `byte[]`.**
+  `.decode` / `.encode` return `byte[]` on the JVM, so `(vec (.decode dec s))` is
+  ordinary Clojure; here they returned a raw Chez bytevector that no collection
+  dispatcher knows, so that threw `Don't know how to create ISeq from` and callers
+  had to route every result through `String.` first. Both return a byte array now,
+  and `bytes?` is true of them.
+
+- **`Random/nextBytes` produced a different stream from the JVM for the same seed.**
+  It drew 8 bits per byte, consuming the LCG four times as fast as
+  `java.util.Random`, which draws one `nextInt()` per four bytes and takes them
+  low-to-high. Every other `Random` method already matched; this one did not, so a
+  seeded byte fill was not reproducible against the JVM.
+
+- **`io/copy` from a `File` to anything but another file went through text.** A File
+  source was only treated as a byte source when the destination was also a file;
+  everything else fell through to slurping it as UTF-8, which replaced each
+  non-UTF-8 byte with U+FFFD. `(io/copy f stream)` on a binary file returned
+  corrupt bytes.
+
+- **`Arrays/toString` printed a jolt vector.** `"[1 2]"` rather than the JVM's
+  `"[1, 2]"` — no commas, a `nil` element rendered empty instead of `null`, and a
+  string element came out `pr`-quoted.
+
+- **`Integer/toString` with a radix uppercased its digits** (`"-FF"` for
+  `(Integer/toString -255 16)`, where the JVM gives `"-ff"`), and `Long` was missing
+  `toHexString` / `toOctalString` / `toBinaryString` / `toString` / `compare`
+  altogether. `Character/isLetter` and `isLetterOrDigit` were missing too — aws-api's
+  request signer classifies each UTF-8 byte of a URI through them.
 
 - **A compile-time error pointed at the top of the enclosing form, not at the
   expression that failed.** The only position available to the reporter was the one

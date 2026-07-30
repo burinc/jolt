@@ -85,10 +85,11 @@
 ;; memory, byte-exact (no UTF-8 / latin1 decode) — for socket recv/send and the
 ;; zlib / OpenSSL buffers an HTTP client passes through. read-array returns a
 ;; fresh byte-array of n bytes; write-array copies a byte-array's bytes into ptr
-;; and returns the count.
+;; and returns the count. Foreign memory is unsigned octets and a byte-array element
+;; is a signed byte, so the two directions fold and mask across that seam.
 (define (ffi-read-array ptr n)
   (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (v (make-vector n 0)))
-    (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (foreign-ref 'unsigned-8 p i)))
+    (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (na-u8->byte (foreign-ref 'unsigned-8 p i))))
     (make-jolt-array v 'byte)))
 (define (ffi-write-array ptr arr)
   (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (p (jnum->exact ptr)))
