@@ -367,6 +367,9 @@ jobs:
         with:
           repository: jolt-lang/${{ matrix.repo }}
           path: lib
+          # transit-jolt keeps the transit-format exemplars as a submodule and its
+          # suite refuses to run without them; harmless for the repos with none.
+          submodules: recursive
       - uses: actions/download-artifact@v4
         with:
           name: jolt-x86_64-linux
@@ -455,6 +458,20 @@ jobs:
         with:
           repository: jolt-lang/examples
           path: examples
+      # glimmer-app, glimmer-gl-app and fps-demo consume glimmer as
+      # {:local/root "../../glimmer"} — a SIBLING two levels up from the app dir,
+      # i.e. the workspace root once examples/ is checked out under it. Their
+      # deps.edn says the path is provisional ("push glimmer to a git remote and swap
+      # to :git/url to make this app self-contained"), so honour the layout they have
+      # rather than pinning a sha here that would then need chasing.
+      - uses: actions/checkout@v5
+        with:
+          repository: jolt-lang/glimmer
+          path: glimmer
+      - uses: actions/checkout@v5
+        with:
+          repository: jolt-lang/glimmer-gl
+          path: glimmer-gl
       - uses: actions/download-artifact@v4
         with:
           name: jolt-x86_64-linux
