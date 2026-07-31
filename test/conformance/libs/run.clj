@@ -147,12 +147,16 @@
 ;; ---------------------------------------------------------------- reporting
 
 ;; A property-based suite draws random cases, so its assertion count drifts run to
-;; run — :tolerance is how far below the recorded pass count that suite may land
-;; before it counts as a regression. Everything else is pinned exactly.
+;; run — :tolerance is how far the recorded pass/fail/error counts may move before
+;; it counts as a regression. It covers error as well as fail because which of the
+;; two a generated case lands in is itself unstable: test.chuck's regex suite feeds
+;; random patterns to re-pattern, and whether one is rejected or blows up inside
+;; the engine moves run to run while the total stays put. Everything without a
+;; :tolerance is pinned exactly.
 (defn- worse? [{:keys [pass fail error load-fail]} exp tolerance]
   (or (< pass (- (:pass exp 0) (or tolerance 0)))
       (> fail (+ (:fail exp 0) (or tolerance 0)))
-      (> error (:error exp 0))
+      (> error (+ (:error exp 0) (or tolerance 0)))
       (> load-fail (:load-fail exp 0))))
 
 (defn- tally-str [{:keys [tests pass fail error load-fail]}]

@@ -6,6 +6,13 @@
   {:suite "host-interop / PersistentList-create" :label "an empty created list is list?" :expected "true" :actual "(list? (clojure.lang.PersistentList/create []))" :portability :jvm}
   {:suite "host-interop / PersistentList-create" :label "created list agrees with a literal on list?/seq?/class" :expected "[true true true]" :actual "(let [c (clojure.lang.PersistentList/create [1 2 3])] [(= (list? c) (list? (quote (1 2 3)))) (seq? c) (= c (quote (1 2 3)))])" :portability :jvm}
   {:suite "host-interop / reify ILookup" :label "(get reify k) / (:k reify) / (get reify k d) route to valAt" :expected "[1 1 :dflt]" :actual "(let [r (reify clojure.lang.ILookup (valAt [_ k] (get {:a 1} k)) (valAt [_ k d] (get {:a 1} k d)))] [(:a r) (get r :a) (get r :z :dflt)])" :portability :jvm}
+  ;; A pattern the engine will not compile is a PatternSyntaxException, catchable
+  ;; as itself or as IllegalArgumentException. It used to escape as an unnamed
+  ;; condition, and — worse — the compile ran inside the regex cache's mutex, so
+  ;; throwing left it held and the next thread to compile any regex blocked forever.
+  {:suite "regex / an uncompilable pattern" :label "throws PatternSyntaxException" :expected "[:pse :pse :pse]" :actual "(mapv (fn [p] (try (re-pattern p) :parsed (catch java.util.regex.PatternSyntaxException e :pse))) [\"(\" \"[\" \"(?\"])" :portability :jvm}
+  {:suite "regex / an uncompilable pattern" :label "which is an IllegalArgumentException" :expected "[:iae true]" :actual "[(try (re-pattern \"(\") (catch IllegalArgumentException e :iae)) (isa? java.util.regex.PatternSyntaxException java.lang.IllegalArgumentException)]" :portability :jvm}
+  {:suite "regex / an uncompilable pattern" :label "and does not leave the compile lock held" :expected "\"bbb\"" :actual "(do (try (re-pattern \"(\") (catch Throwable e :caught)) (deref (future (re-find (re-pattern \"b+\") \"abbb\")) 5000 :TIMED-OUT))" :portability :common}
   {:suite "regex / anchored global scan" :label "a ^-anchored pattern replaces only at the string start" :expected "[\"-abc\" \"-XaX\"]" :actual "[(clojure.string/replace \"abcabc\" #\"^abc\" \"-\") (clojure.string/replace \"aXaX\" #\"^a\" \"-\")]" :portability :common}
   {:suite "regex / anchored global scan" :label "re-seq of a ^-anchored pattern yields at most one match" :expected "[\"abc\"]" :actual "(vec (re-seq #\"^abc\" \"abcabc\"))" :portability :common}
   {:suite "regex / anchored global scan" :label "\\A anchors the same way as ^" :expected "\"-abc\"" :actual "(clojure.string/replace \"abcabc\" #\"\\Aabc\" \"-\")" :portability :common}
@@ -738,6 +745,11 @@
   {:suite "interop / StringReader & StringBuilder" :label "pushback sits above the line count, so an unread \\n is not recounted" :expected "[2 2 \\newline]" :actual "(let [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"ab\\ncd\"))] (dotimes [_ 3] (.read r)) (let [n (.getLineNumber r)] (.unread r (int \\newline)) [n (.getLineNumber r) (char (.read r))]))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "char-array of string" :expected "true" :actual "(instance? (Class/forName \"[C\") (char-array \"ab\"))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "reader over char[]" :expected "97" :actual "(do (require (quote clojure.java.io)) (.read (clojure.java.io/reader (char-array \"abc\"))))" :portability :jvm}
+  ;; nil is not a source. io/reader used to render it and hand back a reader over
+  ;; the empty string, so a missing io/resource read as an empty file instead of
+  ;; saying so — which is how test.chuck's grammar load failed with a message that
+  ;; had a hole in it.
+  {:suite "interop / StringReader & StringBuilder" :label "reader/writer/slurp of nil name it" :expected "[\"Cannot open <nil> as a Reader.\" \"Cannot open <nil> as a Reader.\" \"Cannot open <nil> as a Writer.\"]" :actual "(do (require (quote clojure.java.io)) (mapv (fn [f] (try (f nil) (catch Exception e (ex-message e)))) [slurp clojure.java.io/reader clojure.java.io/writer]))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "with-open closes shim" :expected "97" :actual "(with-open [r (StringReader. \"a\")] (.read r))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "File.toURL methods read it back" :expected "\"file:/tmp/x\"" :actual "(do (require (quote clojure.java.io)) (.toString (.toURL (clojure.java.io/file \"/tmp/x\"))))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "vector :import shares deftype ctor" :expected "\"hi!\"" :actual "(do (ns spec.nodea) (defprotocol SpecP (spec-pm [this])) (deftype SpecTN [t] SpecP (spec-pm [this] (str t \"!\"))) (ns spec.nodeb (:import [spec.nodea SpecTN])) (.spec-pm (SpecTN. \"hi\")))" :portability :jvm}

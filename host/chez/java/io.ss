@@ -435,7 +435,7 @@
     ((and (htable? src) (jolt-truthy? (jolt-ref-get src (keyword "jolt" "input-stream"))))
      (decode-bytevector (drain-byte-stream src) (slurp-encoding opts)))
     ((string? src) (slurp-path (project-relative src)))
-    (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-final-str src) "> as a Reader")))))
+    (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str src) "> as a Reader.")))))
 
 (define (spit-append? opts)
   (let loop ((o opts))
@@ -551,7 +551,11 @@
     ((string? x) (host-new "StringReader" (read-file-string (project-relative x))))
     ((or (cseq? x) (empty-list-t? x) (pvec? x))
      (host-new "StringReader" (seq-source->string x)))
-    (else (host-new "StringReader" (jolt-str-render-one x)))))
+    ;; anything else is not a source, and quietly rendering it would read as empty
+    ;; content — (io/reader nil) used to hand back a reader over "" rather than say
+    ;; so. Same coercion error the JVM raises, and the same one io/writer raises.
+    (else (throw-jvm (quote IllegalArgumentException)
+                     (string-append "Cannot open <" (jolt-pr-str x) "> as a Reader.")))))
 
 ;; --- clojure.java.io/writer: an existing writer passes through; a File / path
 ;; gets a file-backed writer (host-static.ss "file-writer") that persists on
@@ -562,7 +566,7 @@
     ((and (jhost? x) (string=? (jhost-tag x) "file-writer")) x)
     ((jfile? x) (make-jhost "file-writer" (vector (jfile-path x) "")))
     ((string? x) (make-jhost "file-writer" (vector x "")))
-    (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-final-str x) "> as a Writer")))))
+    (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as a Writer.")))))
 
 ;; --- clojure.java.io ns -----------------------------------------------------
 (def-var! "clojure.java.io" "file" jolt-make-file)

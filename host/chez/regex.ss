@@ -54,22 +54,39 @@
 (define regex-cache (make-hashtable string-hash string=?))
 (define regex-cache-mutex (make-mutex 'regex-cache))
 
+;; A pattern the engine will not compile is a PatternSyntaxException, the same
+;; catchable thing the JVM throws — not the raw internal error, which surfaced as
+;; an unnamed condition no (catch PatternSyntaxException …) could see.
+(define (regex-syntax-error source e)
+  (jolt-throw
+   (jolt-host-throwable "java.util.regex.PatternSyntaxException"
+     (string-append (guard (e2 (#t "Unsupported pattern")) (condition-message-of e))
+                    " near index 0\n" source))))
+
+(define (condition-message-of e)
+  (if (and (condition? e) (message-condition? e)) (condition-message e) "Unsupported pattern"))
+
 (define (cached-regex-entry source)
   "Return (count . irx) for source, compiling if needed."
+  ;; dynamic-wind, not a bare release: a pattern that fails to compile used to
+  ;; leave the mutex held, so the next thread to compile ANY regex blocked forever.
   (mutex-acquire regex-cache-mutex)
-  (let ((entry (hashtable-ref regex-cache source #f)))
-    (if entry
-        (begin (mutex-release regex-cache-mutex) entry)
-        (let-values (((sre opts) (java-pattern->sre source)))
-          (let* ((irx (apply irregex sre opts))
-                 (has-caps? (sre-has-backref? sre))
-                 (count (irregex-num-submatches irx))
-                 (entry (if (or has-caps? (> count 0))
-                           (cons count (apply irregex sre 'backtrack opts))
-                           (cons 0 irx))))
-            (hashtable-set! regex-cache source entry)
-            (mutex-release regex-cache-mutex)
-            entry)))))
+  (dynamic-wind
+    (lambda () #f)
+    (lambda ()
+      (let ((entry (hashtable-ref regex-cache source #f)))
+        (or entry
+            (let ((entry (guard (e (#t (regex-syntax-error source e)))
+                           (let-values (((sre opts) (java-pattern->sre source)))
+                             (let* ((irx (apply irregex sre opts))
+                                    (has-caps? (sre-has-backref? sre))
+                                    (count (irregex-num-submatches irx)))
+                               (if (or has-caps? (> count 0))
+                                   (cons count (apply irregex sre 'backtrack opts))
+                                   (cons 0 irx)))))))
+              (hashtable-set! regex-cache source entry)
+              entry))))
+    (lambda () (mutex-release regex-cache-mutex))))
 
 (define (jolt-regex source)
   (let ((entry (cached-regex-entry source)))

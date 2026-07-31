@@ -280,7 +280,7 @@
         ((bytevector? x) (make-in-stream (open-bytevector-input-port x)))
         ((and (jhost? x) (string=? (jhost-tag x) "url")) (make-in-stream (open-file-input-port (url-strip-scheme (url-spec x)) (file-options) (buffer-mode block))))
         ((string? x) (make-in-stream (open-file-input-port (project-relative x) (file-options) (buffer-mode block))))
-        (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-final-str x) "> as an InputStream")))))
+        (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as an InputStream.")))))
 (define (jio-output-stream x . rest)
   (cond ((out-stream? x) x)
         ((or (jfile? x) (string? x))
@@ -290,7 +290,7 @@
            (make-out-stream (open-file-output-port (path-of x)
                               (if append? (file-options no-fail no-truncate append) (file-options no-fail))
                               (buffer-mode block)))))
-        (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-final-str x) "> as an OutputStream")))))
+        (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as an OutputStream.")))))
 (def-var! "clojure.java.io" "input-stream" jio-input-stream)
 (def-var! "clojure.java.io" "output-stream" jio-output-stream)
 

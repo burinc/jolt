@@ -50,6 +50,10 @@ A library **regresses** when `pass` drops or `fail` / `error` / `load-fail` rise
 against `:expect`. A rising `pass` is reported as `BETTER` and does not fail the
 gate — improving a library is then a one-line manifest edit.
 
+`:tolerance` widens that on all four counters, not just `pass`: in a generative
+suite whether a drawn case fails or errors moves run to run while the total
+stays put.
+
 `:expect` is deliberately a tally and not a per-assertion baseline. Some suites
 are order- and environment-sensitive (compliment completes against the live
 runtime, for instance), so pinning individual assertions would be noise. What the
