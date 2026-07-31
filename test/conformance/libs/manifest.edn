@@ -242,18 +242,17 @@
    ;; level and reads its `user` var, so it still has to compile — hence criterium.
    :shims ["!test/conformance/libs/shims/cheshire" "!test/conformance/libs/shims/criterium"]
    :exclude-nses ["selmer.benchmark"]
-   ;; Remaining, by owner:
-   ;;   1 fail  — number-format with a locale: String/format ignores the Locale's
-   ;;     decimal separator, so :de renders "123.045" for "123,045". A third
-   ;;     locale-sensitive surface, alongside ::currency-data and ::date-names.
+   ;; No failures left. Remaining, by owner:
    ;;   2 errors — io/resource returns a java.io.File where the JVM returns a file:
    ;;     URL, so render-file cannot resolve one and Selmer calls .startsWith on it.
    ;;     Fixing it means teaching slurp/io/file to coerce a URL first, and moving
    ;;     the AOT-embedded branch in step so both answer the same surface.
-   ;;   1 error — currency for locale "en": the ::currency-data point is waiting on
-   ;;     jolt-lang/time to register providers.
    ;;   1 error — commons-lang StringEscapeUtils, a JVM jar; not portable.
-   :expect {:tests 131 :pass 518 :fail 1 :error 4}}
+   ;;
+   ;; The locale work behind this tally lives on three extension points core
+   ;; declares and jolt-lang/time fills in: :date-names, :number-symbols and
+   ;; :currency-data. Running Selmer needs that library on :deps, which it has.
+   :expect {:tests 131 :pass 522 :fail 0 :error 3}}
 
   {:name "html"
    :paths ["src" "test"]
