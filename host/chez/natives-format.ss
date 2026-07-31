@@ -44,6 +44,11 @@
              (number->string (bitwise-and n (- (expt 2 bits) 1)) radix)
              (loop (fx* bits 2))))))))
 (define (pad-left s n c) (if (fx>=? (string-length s) n) s (string-append (make-string (fx- n (string-length s)) c) s)))
+;; The decimal separator %f renders. "." everywhere except inside a
+;; String.format(Locale, …) call, which binds this to the locale's separator —
+;; the JVM formats 123.045 as "123,045" under de. Bound rather than passed so
+;; every directive path picks it up without threading an argument through.
+(define format-decimal-sep (make-parameter "."))
 (define (fmt-float x prec)
   (let* ((neg (< x 0)) (ax (abs x))
          (scale (expt 10 prec))
@@ -52,7 +57,9 @@
          (frac (exact (truncate (- scaled (* i scale))))))
     (string-append (if neg "-" "")
                    (number->string i)
-                   (if (fx>? prec 0) (string-append "." (pad-left (number->string frac) prec #\0)) ""))))
+                   (if (fx>? prec 0)
+                       (string-append (format-decimal-sep) (pad-left (number->string frac) prec #\0))
+                       ""))))
 (define (jolt-format fmt . args)
   (let ((fmt (jolt-need-string fmt))
         (out (open-output-string)))

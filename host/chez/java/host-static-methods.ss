@@ -437,6 +437,26 @@
 
 ;; String/valueOf(Object): "null" for nil, else jolt's str semantics.
 ;; String/format(fmt args…) / (locale fmt args…) -> the clojure.core format engine.
+;; A locale's decimal and grouping separators. Core carries ROOT ("." and ",") and
+;; jolt-lang/time registers the rest — the same split as ::date-names, and
+;; :fallback :default for the same reason: the JVM falls back to ROOT for an
+;; unknown locale rather than failing, so :default reproduces that mechanism and a
+;; locale supplied for a pattern with no numeric directive still gets an answer.
+(let ((kw (lambda (n) (keyword #f n))))
+  (jolt-register-extension-point! (kw "number-symbols")
+    (jolt-hash-map
+      (kw "key") (kw "string")
+      (kw "root") ""
+      (kw "fields") (jolt-hash-map (kw "decimal-sep") (kw "string")
+                                   (kw "grouping-sep") (kw "string"))
+      (kw "default") (jolt-hash-map (kw "decimal-sep") "." (kw "grouping-sep") ",")
+      (kw "fallback") (kw "default")
+      (kw "hint") "The jolt-lang/time library carries per-locale number symbols.")))
+(define (number-symbol id name dflt)
+  (let* ((data (jolt-extension-value (keyword #f "number-symbols") id))
+         (v (jolt-get-dispatch data (keyword #f name) jolt-nil)))
+    (if (jolt-nil? v) dflt v)))
+
 (register-class-statics! "String"
   (list (cons "valueOf" (lambda (x . _) (if (jolt-nil? x) "null" (jolt-str-render-one x))))
         ;; String.format(fmt, Object...) is called both ways in the wild: with the
@@ -460,7 +480,14 @@
                                                (jolt-array? (car args)))
                                           (ja->list (jolt-array-vec (car args)))
                                           args)))
-                           (apply jolt-format fmt args))))))
+                           ;; The locale drives the decimal separator: the JVM
+                           ;; renders %.3f of 123.04455 as "123,045" under de.
+                           (if locale?
+                               (parameterize ((format-decimal-sep
+                                               (number-symbol (jolt-str-render-one a)
+                                                              "decimal-sep" ".")))
+                                 (apply jolt-format fmt args))
+                               (apply jolt-format fmt args)))))))
 
 ;; ---- java.text.NumberFormat -------------------------------------------------
 ;; A grouping decimal formatter (selmer number-format / cuerdas). state:
