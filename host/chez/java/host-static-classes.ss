@@ -297,6 +297,11 @@
     ((and (jhost? target) (memv #t (list (string=? (jhost-tag target) "writer")
                                          (string=? (jhost-tag target) "string-builder"))))
      (sb-set! target (string-append (sb-str target) s)))
+    ;; every other host writer knows how to write itself — a file-backed writer, an
+    ;; OutputStreamWriter, a nested PrintWriter. Naming them one by one left
+    ;; (PrintWriter. (io/writer f)) falling through to the pprint protocol below,
+    ;; which a file writer does not implement.
+    ((jhost? target) (record-method-dispatch target "write" (jolt-list s)))
     (else
      (jolt-invoke (var-deref "clojure.pprint" "-write") target s))))
 (register-class-ctor! "PrintWriter"

@@ -770,6 +770,12 @@
 ;; File statics: the platform separators plus createTempFile / listRoots.
 (define temp-file-counter 0)
 (define (file-create-temp prefix suffix . dir)
+  ;; the JVM rejects a prefix under three characters, so a caller that works here
+  ;; works there too
+  (when (< (string-length (jolt-str-render-one prefix)) 3)
+    (throw-jvm (quote IllegalArgumentException)
+               (string-append "Prefix string \"" (jolt-str-render-one prefix)
+                              "\" too short: length must be at least 3")))
   (let* ((d (cond ((pair? dir) (file-path-of (car dir)))
                   ((getenv "TMPDIR") => (lambda (t) t))
                   (else "/tmp")))
