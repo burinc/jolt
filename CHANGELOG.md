@@ -95,6 +95,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a relative path. It now asserts that a relative path absolutizes under user.dir
   and that `relativize` undoes `absolutize`, the round-trip `match` performs.
 
+- **`clojure.pprint`'s `simple-dispatch` and `code-dispatch` are multimethods, so
+  libraries can extend them.** They were plain functions that `case`d on a type
+  keyword, so `(. clojure.pprint/simple-dispatch addMethod Tie pprint-tie)` — which
+  core.logic's nominal namespace does — failed with "No matching method addMethod",
+  and `clojure.core.logic.nominal.tests` could not load. Both are now `(defmulti …
+  class)` with methods for the same interfaces the reference uses
+  (`IPersistentVector`/`-Map`/`-Set`, `PersistentQueue`, `ISeq`, `IDeref`, `nil`,
+  `:default`; `code-dispatch` adds `Symbol`), each arm still calling the per-type
+  printer it always did, so built-in output is unchanged — a defrecord still prints
+  as a bare map, as it does on the JVM.
+
 - **A sub-process that could not be waited on hung the caller forever.** The reap
   loop retried on any `waitpid` failure, including `ECHILD` — the child already
   reaped by something else, which no number of retries changes. The loop holds the

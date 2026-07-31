@@ -495,6 +495,21 @@ else
   fails=$((fails + 1))
 fi
 
+# clojure.pprint dispatch-fn gate: simple-dispatch and code-dispatch must be real
+# multimethods on class so libraries can extend them (core.logic's nominal
+# namespace does (. clojure.pprint/simple-dispatch addMethod …)). Gated here for
+# the same reason clojure.instant is: it requires loading clojure.pprint and
+# registering methods, which the corpus runner never does.
+pdm_out="$($jolt run test/chez/pprint-dispatch-test.clj 2>/dev/null)"
+if printf '%s' "$pdm_out" | grep -q 'PPRINT-DISPATCH OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: clojure.pprint dispatch-fn suite"
+  echo "    $(printf '%s' "$pdm_out" | grep PPRINT-DISPATCH-RESULT | tail -1)"
+  printf '%s' "$pdm_out" | grep 'pprint-dispatch FAIL' | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # A throwing go/thread body reports to stderr (the JVM's uncaught-exception
 # handler behavior) while the channel still just closes: <!! stays nil.
 thr_out="$($jolt -e "(do (require '[clojure.core.async :as a]) (pr (a/<!! (a/thread (/ 1 0)))))" 2>/tmp/jolt-smoke-thr-err)"
