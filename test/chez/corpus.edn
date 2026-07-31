@@ -900,6 +900,15 @@
   {:suite "inst / value semantics & printing" :label "unequal instants" :expected "false" :actual "(= #inst \"2020-01-01T00:00:00Z\" #inst \"2020-01-01T00:00:01Z\")" :portability :common}
   {:suite "inst / value semantics & printing" :label "works as map key" :expected ":v" :actual "(get {#inst \"2020-01-01T00:00:00Z\" :v} #inst \"2020-01-01T00:00:00.000Z\")" :portability :common}
   {:suite "inst / value semantics & printing" :label "pr-str round-trips" :expected "\"#inst \\\"2020-01-01T00:00:00.000-00:00\\\"\"" :actual "(pr-str #inst \"2020-01-01T00:00:00Z\")" :portability :common}
+  {:suite "io / java.net.URL" :label "str renders the spec" :expected "\"https://e.com/x\"" :actual "(str (java.net.URL. \"https://e.com/x\"))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "empty authority collapses" :expected "\"file:/a/b/\"" :actual "(str (java.net.URL. \"file:///a/b/\"))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "empty authority collapses for http" :expected "\"http:/a\"" :actual "(str (java.net.URL. \"http:///a\"))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "a real authority is kept" :expected "\"file://host/a\"" :actual "(str (java.net.URL. \"file://host/a\"))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "a fourth slash is not an empty authority" :expected "\"file:////any/other/\"" :actual "(str (java.net.URL. \"file:////any/other/\"))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "protocol lowercases" :expected "\"file:/a\"" :actual "(str (java.net.URL. \"FILE:/a\"))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "no protocol throws" :expected "\"no protocol: /some/path/\"" :actual "(try (java.net.URL. \"/some/path/\") (catch java.net.MalformedURLException e (.getMessage e)))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "unknown protocol throws" :expected "\"unknown protocol: bogus\"" :actual "(try (java.net.URL. \"bogus://x\") (catch java.net.MalformedURLException e (.getMessage e)))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "jar spec is left alone" :expected "\"jar:file:/x!/y\"" :actual "(str (java.net.URL. \"jar:file:/x!/y\"))" :portability :jvm}
   {:suite "io / with-out-str captures" :label "println" :expected "\"hi\\n\"" :actual "(with-out-str (println \"hi\"))" :portability :common}
   {:suite "io / with-out-str captures" :label "print spaces" :expected "\"a b\"" :actual "(with-out-str (print \"a\" \"b\"))" :portability :common}
   {:suite "io / with-out-str captures" :label "prn quotes" :expected "\"[1 2]\\n\"" :actual "(with-out-str (prn [1 2]))" :portability :common}

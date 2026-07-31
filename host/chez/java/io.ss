@@ -246,10 +246,44 @@
   (let ((i (let loop ((j 0)) (cond ((>= j (string-length spec)) #f)
                                    ((char=? (string-ref spec j) #\:) j) (else (loop (+ j 1)))))))
     (if i (substring spec 0 i) "")))
+;; The JVM canonicalizes a spec on the way in: the protocol lowercases, and an
+;; EMPTY authority collapses, so "file:///a/b/" and "http:///a" render "file:/a/b/"
+;; and "http:/a" while "file://host/a" keeps its host. Callers compare these
+;; strings (Selmer stores a resource path as one), so rendering the spec verbatim
+;; diverges on the most common shape there is — a file: URL built from a path.
+(define url-known-protocols '("http" "https" "file" "jar" "ftp" "mailto" "netdoc"))
+(define (url-canonical spec)
+  (let* ((i (let loop ((j 0)) (cond ((>= j (string-length spec)) #f)
+                                    ((char=? (string-ref spec j) #\:) j)
+                                    (else (loop (+ j 1))))))
+         (proto (and i (string-downcase (substring spec 0 i))))
+         (rest (and i (substring spec (+ i 1) (string-length spec)))))
+    (unless (and proto (> (string-length proto) 0))
+      (jolt-throw (jolt-host-throwable "java.net.MalformedURLException"
+                                       (string-append "no protocol: " spec))))
+    (unless (member proto url-known-protocols)
+      (jolt-throw (jolt-host-throwable "java.net.MalformedURLException"
+                                       (string-append "unknown protocol: " proto))))
+    ;; An empty authority drops its "//": "file:///a/b/" renders "file:/a/b/" and
+    ;; "http:///a" renders "http:/a". A FOURTH slash does not — "file:////x" stays
+    ;; as written, because the path itself then begins "//" and the JVM keeps it.
+    ;; Both shapes turn up: the first is File.toURL, the second is what a caller
+    ;; builds by hand as "file:///" + an absolute path.
+    (string-append proto ":"
+                   (if (and (>= (string-length rest) 4)
+                            (string=? (substring rest 0 3) "///")
+                            (not (char=? (string-ref rest 3) #\/)))
+                       (substring rest 2 (string-length rest))
+                       rest))))
 ;; (java.net.URL. spec) — a basic file/http URL value (a library may register a
 ;; richer URL shim, which overrides this).
-(register-class-ctor! "URL" (lambda (spec . _) (make-url (jolt-str-render-one spec))))
-(register-class-ctor! "java.net.URL" (lambda (spec . _) (make-url (jolt-str-render-one spec))))
+(register-class-ctor! "URL" (lambda (spec . _) (make-url (url-canonical (jolt-str-render-one spec)))))
+(register-class-ctor! "java.net.URL" (lambda (spec . _) (make-url (url-canonical (jolt-str-render-one spec)))))
+;; (str url) is the spec, like the JVM — without this it renders the opaque
+;; #object[java.net.URL] form and any caller that builds a path from it gets that
+;; string instead.
+(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "url")))
+                      url-spec)
 (register-host-methods! "url"
   (list (cons "toString"       (lambda (self) (url-spec self)))
         (cons "toExternalForm" (lambda (self) (url-spec self)))
