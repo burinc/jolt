@@ -89,12 +89,14 @@
    :test-paths ["src/test/clojure"]
    ;; nominal.tests loads now that the pretty printer's dispatch fns are
    ;; multimethods it can addMethod to (jolt-v5fh.16), which is where the 64 extra
-   ;; passes come from — and with it a nominal-logic residue that was invisible
-   ;; while the namespace could not load at all: freshness constraints and the
-   ;; reification of nom vars (jolt-v5fh.18). Of the 3 fails in the main suite,
-   ;; those are reification ORDER for != and treec — the constraint set is
-   ;; identical, the rendering walks a set, and set order is a host difference.
-   :expect {:tests 423 :pass 613 :fail 39 :error 6}}
+   ;; passes come from. The nominal residue that surfaced with it (36 fail / 6
+   ;; error) was two host ns bugs, both fixed at the root: :use ignored :exclude
+   ;; in its refer-all registration, so the test ns's `fresh`/`hash` resolved to
+   ;; clojure.core.logic.nominal's instead of clojure.core.logic's / clojure.core's;
+   ;; and the refer-clojure macro registered :exclude under the analysis-time ns
+   ;; (never the ns an ns form creates), so fd.clj's `-rator` syntax-quotes
+   ;; qualified to clojure.core/== instead of clojure.core.logic.fd/==.
+   :expect {:tests 423 :pass 658 :fail 0 :error 0}}
 
   {:name "core.contracts"
    :paths ["src/main/clojure" "src/test/clojure"]

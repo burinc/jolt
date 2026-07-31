@@ -45,6 +45,21 @@
   (let ((cur (hashtable-ref ns-refer-all-table cns '())))
     (unless (member target cur)
       (hashtable-set! ns-refer-all-table cns (cons target cur)))))
+;; :use with :exclude drops names from the refer-all set: (cns . target) ->
+;; (name -> #t). An excluded name is skipped for that target in the refer-all
+;; walk, so resolution falls through to an earlier refer-all target (or fails)
+;; exactly as load-lib's filtered refer leaves the prior mapping in place.
+(define ns-refer-all-exclude-table (make-hashtable equal-hash equal?))
+(define (chez-register-refer-all-excludes! cns target names)
+  (when (pair? names)
+    (let ((h (or (hashtable-ref ns-refer-all-exclude-table (cons cns target) #f)
+                 (let ((h (make-hashtable string-hash string=?)))
+                   (hashtable-set! ns-refer-all-exclude-table (cons cns target) h)
+                   h))))
+      (for-each (lambda (n) (hashtable-set! h n #t)) names))))
+(define (chez-refer-all-excluded? cns target name)
+  (let ((h (hashtable-ref ns-refer-all-exclude-table (cons cns target) #f)))
+    (and h (hashtable-ref h name #f) #t)))
 (define (chez-resolve-refer cns name)
   (let ((r (hashtable-ref ns-refer-table (cons cns name) #f)))
     (cond
@@ -53,7 +68,9 @@
      (else
       (let loop ((ts (hashtable-ref ns-refer-all-table cns '())))
         (cond ((null? ts) #f)
-              ((let ((c (var-cell-lookup (car ts) name))) (and c (var-cell-defined? c))) (car ts))
+              ((and (not (chez-refer-all-excluded? cns (car ts) name))
+                    (let ((c (var-cell-lookup (car ts) name))) (and c (var-cell-defined? c))))
+               (car ts))
               (else (loop (cdr ts)))))))))
 ;; --- libspec parsing (shared by the loader + compile-eval) ------------------
 ;; A libspec is one of: a bare symbol `foo`; a vector `[foo :as f :refer [x]]`;
@@ -235,14 +252,15 @@
                 (lambda (acc target-ns)
                   (let ((publics (ns-vars-pmap-when target-ns
                                                    (lambda (c) (not (var-private? c))))))
-                    (pmap-fold
-                     publics
-                     (lambda (k v acc)
-                       (let ((nm (symbol-t-name k)))
-                         (if (jolt-contains? acc (jolt-symbol #f nm))
-                             acc
-                             (jolt-assoc acc (jolt-symbol #f nm) v))))
-                     acc)))
+                     (pmap-fold
+                      publics
+                      (lambda (k v acc)
+                        (let ((nm (symbol-t-name k)))
+                          (if (or (jolt-contains? acc (jolt-symbol #f nm))
+                                  (chez-refer-all-excluded? cns target-ns nm))
+                              acc
+                              (jolt-assoc acc (jolt-symbol #f nm) v))))
+                      acc)))
                 m
                 all-refs))))
      m))
@@ -438,15 +456,39 @@
 (define (chez-core-excluded? cns name)
   (let ((h (hashtable-ref ns-core-exclude-table cns #f)))
     (and h (hashtable-ref h name #f) #t)))
+;; refer-clojure is a MACRO here (marked below) whose expander is this fn, so
+;; args arrive UNEVALUATED: a top-level (:exclude [names]) is raw, while the ns
+;; macro emits quoted args ((quote :exclude) (quote [names])) — the JVM shape,
+;; where the macro splices them into a (refer ...) call and the quotes evaluate.
+;; Unwrapping one quote layer makes both spellings mean the same exclusion.
+(define (rc-unquote x)
+  (if (and (cseq? x) (cseq-list? x))
+      (let ((items (seq->list x)))
+        (if (and (pair? items) (symbol-t? (car items))
+                 (string=? (symbol-t-name (car items)) "quote") (pair? (cdr items)))
+            (cadr items) x))
+      x))
+;; The expander must NOT register at expansion time: that would record the
+;; exclusion under the ns in effect during ANALYSIS, but an ns form's in-ns only
+;; switches chez-current-ns when the expansion EVALUATES. Emit a runtime call
+;; instead; it runs after in-ns, so the exclusion lands in the ns the form
+;; creates and is in place before the loader reads the next form.
 (define (jolt-refer-clojure . args)
+  (let loop ((a args) (names '()))
+    (cond
+     ((or (null? a) (null? (cdr a)))
+      (jolt-list (jolt-symbol "clojure.core" "refer-clojure-register!")
+                 (jolt-list (jolt-symbol #f "quote") (apply jolt-list (reverse names)))))
+     ((let ((k (rc-unquote (car a))) (v (rc-unquote (cadr a))))
+        (and (keyword? k) (string=? (keyword-t-name k) "exclude") v))
+      => (lambda (v)
+           (loop (cddr a) (append (filter symbol-t? (seq->list v)) names))))
+     (else (loop (cddr a) names)))))
+(define (jolt-refer-clojure-register! names)
   (let ((cns (chez-current-ns)))
-    (let loop ((a args))
-      (when (and (pair? a) (pair? (cdr a)))
-        (when (and (keyword? (car a)) (string=? (keyword-t-name (car a)) "exclude"))
-          (for-each (lambda (n) (when (symbol-t? n)
-                                  (chez-register-core-exclude! cns (symbol-t-name n))))
-                    (seq->list (cadr a))))
-        (loop (cddr a)))))
+    (for-each (lambda (n) (when (symbol-t? n)
+                            (chez-register-core-exclude! cns (symbol-t-name n))))
+              (seq->list names)))
   jolt-nil)
 
 ;; alter-meta! / reset-meta!: a var's metadata lives in var-meta-table (rt.ss);
@@ -532,6 +574,9 @@
 (def-var! "clojure.core" "refer" jolt-refer)
 (def-var! "clojure.core" "refer-clojure" jolt-refer-clojure)
 (mark-macro! "clojure.core" "refer-clojure")
+;; Runtime half of the refer-clojure macro: the expansion calls this AFTER the
+;; enclosing ns form's in-ns has switched chez-current-ns (see jolt-refer-clojure).
+(def-var! "clojure.core" "refer-clojure-register!" jolt-refer-clojure-register!)
 ;; defmacro — special form; the var cell exists so (resolve 'defmacro) works.
 ;; The expander re-emits the form (the special-form path handles analysis).
 (def-var! "clojure.core" "defmacro"

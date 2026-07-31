@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`:use` honors `:exclude`, and `(:refer-clojure :exclude …)` lands in the ns
+  being defined.** Two host namespace bugs, one visible failure surface: a library
+  test ns that `:use`s two namespaces exporting the same name got the WRONG one.
+  `use` registered its refer-all with no record of the spec's `:exclude`, so with
+  `(:use [a] [b :exclude [f]])` the bare `f` resolved to `b/f` — the later use
+  shadowed the earlier, exclusion or not — instead of falling through to `a/f`.
+  Excluded names are now recorded per (ns, target) and skipped in the refer-all
+  walk, so resolution falls through exactly like load-lib's filtered refer.
+  Separately, the `refer-clojure` macro registered its exclusions at macroexpansion
+  time under the analysis-time ns, so a `(:refer-clojure :exclude [==])` clause in
+  an ns form excluded nothing (the ns it named didn't exist yet); the expander now
+  emits a runtime registration call that runs after the form's `in-ns`, and unwraps
+  the ns macro's quoted args the way the JVM's splice-into-`refer` does. This is
+  what was behind core.logic's nominal suite residue (64/36/6 → 106/0/0): the test
+  ns's plain `fresh` was silently nominal's `fresh`, and fd.clj's `-rator`
+  syntax-quotes qualified to `clojure.core/==` instead of
+  `clojure.core.logic.fd/==`.
+
 ### Changed
 
 - **`byte-array` elements are signed bytes, −128..127, like the JVM's `byte[]`.**
