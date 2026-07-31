@@ -124,6 +124,11 @@
 ;; Covers the categories the current pipeline handles, extended to include
 ;; supplementary-plane letters (the known \p{L} above U+D7FF residual).
 
+(define sre-Zs
+  '(or #\space #\xA0 #\x1680 (/ #\x2000 #\x200A) #\x202F #\x205F #\x3000))
+(define sre-Z
+  '(or #\space #\xA0 #\x1680 (/ #\x2000 #\x200A) #\x2028 #\x2029 #\x202F #\x205F #\x3000))
+
 (define (prop-class-sre name)
   (cond
    ;; Letters — BMP + supplementary
@@ -135,7 +140,14 @@
     '(or lower (/ #\xDF #\xF6) (/ #\xF8 #\xFF)))
    ((or (string=? name "N") (string=? name "Nd") (string=? name "Digit"))
     'numeric)
-   ((or (string=? name "Z") (string=? name "Zs")) 'blank)
+   ;; The Unicode separator categories are a short fixed list, so spell them out
+   ;; rather than settling for irregex's ASCII `blank`. Zs is the space separators
+   ;; (the non-breaking ones included — \p{Z} is a category, not Java's
+   ;; isWhitespace), Zl the line separator, Zp the paragraph separator.
+   ((string=? name "Zs") sre-Zs)
+   ((string=? name "Zl") #\x2028)
+   ((string=? name "Zp") #\x2029)
+   ((string=? name "Z") sre-Z)
    ((string=? name "P") 'punct)
     ((string=? name "Ps") '(or #\( #\[ #\{))
     ((string=? name "Pe") '(or #\) #\] #\}))

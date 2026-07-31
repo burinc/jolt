@@ -2783,6 +2783,24 @@
   {:suite "clojure.string / split limit" :label "positive caps parts" :expected "[\"a\" \"b,c\"]" :actual "(do (require (quote [clojure.string :as s])) (s/split \"a,b,c\" #\",\" 2))" :portability :common}
   {:suite "clojure.string / split limit" :label "empty string" :expected "[\"\"]" :actual "(do (require (quote [clojure.string :as s])) (s/split \"\" #\",\"))" :portability :common}
   {:suite "clojure.string / split limit" :label "interior empties kept" :expected "[\"a\" \"\" \"b\"]" :actual "(do (require (quote [clojure.string :as s])) (s/split \"a,,b\" #\",\"))" :portability :common}
+  ;; Case mapping is the whole of Unicode, not just ASCII — Cyrillic, the accented
+  ;; Latin ranges, and the expansions (ß uppercases to SS, a final sigma lowercases
+  ;; to ς rather than σ).
+  {:suite "clojure.string / unicode case" :label "cyrillic round-trips" :expected "[\"русский\" \"РУССКИЙ\" \"Русский\"]" :actual "(do (require (quote [clojure.string :as s])) [(s/lower-case \"РУССКИЙ\") (s/upper-case \"русский\") (s/capitalize \"русский\")])" :portability :common}
+  {:suite "clojure.string / unicode case" :label "accented latin round-trips" :expected "[\"àéîõü\" \"ÀÉÎÕÜ\"]" :actual "(do (require (quote [clojure.string :as s])) [(s/lower-case \"ÀÉÎÕÜ\") (s/upper-case \"àéîõü\")])" :portability :common}
+  {:suite "clojure.string / unicode case" :label "the expanding and contextual mappings" :expected "[\"STRASSE\" \"σίσυφος\"]" :actual "[(.toUpperCase \"straße\") (.toLowerCase \"ΣΊΣΥΦΟΣ\")]" :portability :jvm}
+  ;; Two notions of whitespace, and the JVM uses both. clojure.string/trim drops
+  ;; whatever Character.isWhitespace accepts — the Unicode space separators, but
+  ;; not the non-breaking ones — while String.trim drops only what is at or below
+  ;; the space character and so leaves U+3000 alone.
+  {:suite "clojure.string / unicode whitespace" :label "trim and blank? follow isWhitespace" :expected "[\"a\" true true false]" :actual "(do (require (quote [clojure.string :as s])) (let [ideo (str (char 0x3000)) nb (str (char 0xa0))] [(s/trim (str ideo \"a\" ideo)) (= (str nb \"a\" nb) (s/trim (str nb \"a\" nb))) (s/blank? ideo) (s/blank? nb)]))" :portability :common}
+  {:suite "clojure.string / unicode whitespace" :label "triml and trimr reach the separators" :expected "[\"a\" \"a\"]" :actual "(do (require (quote [clojure.string :as s])) [(s/triml (str (char 0x2028) \"a\")) (s/trimr (str \"a\" (char 0x1680)))])" :portability :common}
+  {:suite "clojure.string / unicode whitespace" :label "String.trim stops at the space character" :expected "true" :actual "(let [ideo (str (char 0x3000))] (= (str ideo \"a\" ideo) (.trim (str ideo \"a\" ideo))))" :portability :jvm}
+  ;; \p{Z} is a Unicode CATEGORY, so unlike isWhitespace it does include the
+  ;; non-breaking separators. Zl and Zp are one character each. cuerdas tests
+  ;; blank? with (?u)^[\s\p{Z}]+$, which is what this is.
+  {:suite "clojure.string / unicode whitespace" :label "\\p{Z} covers the separator categories" :expected "[true true true true true true true true false]" :actual "(let [re (re-pattern \"(?u)^[\\\\s\\\\p{Z}]+$\")] (mapv (fn [c] (boolean (re-matches re (str c)))) [\\space (char 0xa0) (char 0x3000) (char 0x2028) (char 0x1680) (char 0x2007) \\tab \\newline \\a]))" :portability :common}
+  {:suite "clojure.string / unicode whitespace" :label "Zs, Zl and Zp are distinct" :expected "[true true true false]" :actual "[(boolean (re-matches (re-pattern \"^\\\\p{Zs}+$\") (str (char 0x2000)))) (boolean (re-matches (re-pattern \"^\\\\p{Zl}$\") (str (char 0x2028)))) (boolean (re-matches (re-pattern \"^\\\\p{Zp}$\") (str (char 0x2029)))) (boolean (re-matches (re-pattern \"^\\\\p{Z}$\") \"a\"))]" :portability :common}
   {:suite "clojure.string" :label "join" :expected "\"a,b,c\"" :actual "(do (require (quote [clojure.string :as s])) (s/join \",\" [\"a\" \"b\" \"c\"]))" :portability :common}
   {:suite "clojure.string" :label "join no sep" :expected "\"abc\"" :actual "(do (require (quote [clojure.string :as s])) (s/join [\"a\" \"b\" \"c\"]))" :portability :common}
   {:suite "clojure.string" :label "split" :expected "[\"a\" \"b\"]" :actual "(do (require (quote [clojure.string :as s])) (s/split \"a,b\" #\",\"))" :portability :common}

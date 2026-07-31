@@ -41,7 +41,16 @@
                   (string-set! r j (ascii-down-char (string-ref s j)))))
               (check (fx+ i 1)))))))
 
-;; --- ASCII trim: drop leading/trailing chars with code <= space (JVM .trim) ---
+;; Two different notions of whitespace, and the JVM uses both. String.trim drops
+;; anything at or below the space character; clojure.string/trim drops whatever
+;; Character.isWhitespace accepts, which reaches the Unicode space separators
+;; (U+3000 and friends) but NOT the non-breaking ones. Keep them apart: str-trim
+;; is String.trim, str-triml / str-trimr / str-trim* back clojure.string.
+(define (java-whitespace? c)
+  (and (char-whitespace? c)
+       (let ((cp (char->integer c)))
+         (not (or (fx=? cp #xA0) (fx=? cp #x2007) (fx=? cp #x202F))))))
+
 (define (str-trim s)
   (let ((len (string-length s)))
     (let scan-l ((i 0))
@@ -55,13 +64,14 @@
   (let ((len (string-length s)))
     (let loop ((i 0))
       (cond ((fx=? i len) "")
-            ((char<=? (string-ref s i) #\space) (loop (fx+ i 1)))
+            ((java-whitespace? (string-ref s i)) (loop (fx+ i 1)))
             (else (substring s i len))))))
 (define (str-trimr s)
   (let loop ((j (fx- (string-length s) 1)))
     (cond ((fx<? j 0) "")
-          ((char<=? (string-ref s j) #\space) (loop (fx- j 1)))
+          ((java-whitespace? (string-ref s j)) (loop (fx- j 1)))
           (else (substring s 0 (fx+ j 1))))))
+(define (str-trim* s) (str-trimr (str-triml s)))
 
 ;; --- substring search: first index of `needle` in `s` at/after `from`, or -1 --
 (define (char-by-char-match? s si needle nlen)
@@ -230,8 +240,8 @@
   (cond
     ((string=? method "toString") s)
     ((string=? method "hashCode") (java-string-hash s))
-    ((string=? method "toLowerCase") (ascii-string-down s))
-    ((string=? method "toUpperCase") (ascii-string-up s))
+    ((string=? method "toLowerCase") (string-downcase s))
+    ((string=? method "toUpperCase") (string-upcase s))
     ((string=? method "trim") (str-trim s))
     ((string=? method "length") (string-length s))   ; exact int (= JVM)
     ((string=? method "isEmpty") (fx=? (string-length s) 0))
@@ -331,8 +341,13 @@
                  (loop (fx+ i plen) (fx+ i plen) (cons (substring s start i) acc)))
                 (else (loop (fx+ i 1) start acc)))))))
 
-(define (str-upper s) (ascii-string-up s))
-(define (str-lower s) (ascii-string-down s))
+;; clojure.string/upper-case and lower-case, and String's toUpperCase /
+;; toLowerCase, map the whole of Unicode on the JVM — Cyrillic, Greek and the
+;; accented Latin ranges included. Chez's own case mappings are the Unicode ones,
+;; so use them; the ASCII pair above stays for the places that mean ASCII (a
+;; charset name, a header key) and must not fold a non-ASCII character.
+(define (str-upper s) (string-upcase s))
+(define (str-lower s) (string-downcase s))
 (define (str-reverse-b s) (list->string (reverse (string->list s))))
 
 ;; (str-find needle haystack) -> exact int index of first occurrence, or nil.
@@ -461,7 +476,9 @@
 
 (def-var! "clojure.core" "str-upper" str-upper)
 (def-var! "clojure.core" "str-lower" str-lower)
-(def-var! "clojure.core" "str-trim" str-trim)
+;; the var backs clojure.string/trim and blank?, so it is the isWhitespace rule;
+;; String.trim reaches the <= space one directly.
+(def-var! "clojure.core" "str-trim" str-trim*)
 (def-var! "clojure.core" "str-triml" str-triml)
 (def-var! "clojure.core" "str-trimr" str-trimr)
 (def-var! "clojure.core" "str-find" str-find)

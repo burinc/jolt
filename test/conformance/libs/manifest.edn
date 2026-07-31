@@ -22,7 +22,13 @@
 
   {:name "cuerdas"
    :paths ["src" "test"]
-   :expect {:tests 71 :pass 293 :fail 5 :error 2}}
+   ;; str/abbreviate formats through a Locale, which is jolt-lang/time's (RFC 0008)
+   :deps ["~time/src"]
+   ;; The two errors are java.text.BreakIterator, which abbreviate uses to find a
+   ;; word boundary. That is Unicode text segmentation (UAX #29) and jolt has no
+   ;; shim; an approximate one would quietly cut in the wrong place, so it stays
+   ;; absent and says so.
+   :expect {:tests 71 :pass 298 :fail 0 :error 2}}
 
   {:name "dependency"
    :paths ["src" "test"]
