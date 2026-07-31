@@ -33,6 +33,7 @@
 
 (define-record-type ext-point
   (fields id key-kind root fallback
+          hint                      ; string appended to a strict miss, or #f
           (mutable fields)          ; alist (field-name . type-name), declaration order
           (mutable default)         ; jolt map, total over fields
           providers)                ; hashtable: normalized key string -> jolt map
@@ -127,9 +128,10 @@
 ;; library declaring a point core also declares). Re-declaring it DIFFERENTLY is
 ;; drift — two sources disagreeing about one contract — and raises rather than
 ;; letting last-write-wins pick silently.
-(define (ext-same-declaration? p key-kind root fallback fields default)
+(define (ext-same-declaration? p key-kind root fallback hint fields default)
   (and (string=? (ext-point-key-kind p) key-kind)
        (string=? (ext-point-fallback p) fallback)
+       (equal? (ext-point-hint p) hint)
        (jolt=2 (ext-point-root p) root)
        (equal? (ext-point-fields p) fields)
        (jolt=2 (ext-point-default p) default)))
@@ -143,7 +145,14 @@
                                   (string-append (ext-show-id idn) " :fallback")))
            (root (ext-kw spec "root"))
            (fields (ext-parse-fields (ext-kw spec "fields") idn))
-           (default (ext-kw spec "default")))
+           (default (ext-kw spec "default"))
+           ;; optional: what a caller should DO about a strict miss, appended to
+           ;; the raise so the message ends in an action rather than a diagnosis.
+           (hint (let ((h (ext-kw spec "hint")))
+                   (cond ((jolt-nil? h) #f)
+                         ((string? h) h)
+                         (else (ext-bad! (string-append "extension point " (ext-show-id idn)
+                                                        " :hint must be a string")))))))
       (unless (member key-kind '("string" "keyword"))
         (ext-bad! (string-append "extension point " (ext-show-id idn)
                                  " :key must be :string or :keyword, got :" key-kind)))
@@ -162,13 +171,13 @@
                                    key-kind ", got " (jolt-pr-readable root)))))
       (let ((prior (hashtable-ref extension-points-tbl idn #f)))
         (cond
-          ((and prior (ext-same-declaration? prior key-kind root fallback fields default)) jolt-nil)
+          ((and prior (ext-same-declaration? prior key-kind root fallback hint fields default)) jolt-nil)
           (prior
            (ext-bad! (string-append "extension point " (ext-show-id idn)
                                     " is already declared with a different contract")))
           (else
            (hashtable-set! extension-points-tbl idn
-             (make-ext-point idn key-kind root fallback fields default
+             (make-ext-point idn key-kind root fallback hint fields default
                              (make-hashtable string-hash string=?)))
            (bump-extension-epoch!)
            jolt-nil))))))
@@ -243,7 +252,10 @@
                                 (jolt-pr-readable k)
                                 ". The point carries a default for its root key "
                                 (jolt-pr-readable (ext-point-root p))
-                                " only; a library must register this key."))))))
+                                " only; a library must register this key."
+                                (if (ext-point-hint p)
+                                    (string-append " " (ext-point-hint p))
+                                    "")))))))
 
 ;; Whether a key resolves without raising — lets a caller offer a better message
 ;; than the raise, and lets a gate assert the tiers agree on misses too.

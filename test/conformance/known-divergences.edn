@@ -30,6 +30,18 @@
  :documented
  [;; Deliberate/tracked divergences that are NOT corpus rows, so they live here (not in
   ;; :entries, which certify.clj gates for staleness against the corpus).
+  ;; (NumberFormat/getCurrencyInstance) with no argument resolves the JVM's DEFAULT
+  ;; locale, which is a property of the machine — en_CA gives "$123.45", en_US
+  ;; "$123.45", de_DE "123,45 €". jolt core has no notion of a default locale (it does
+  ;; not carry java.util.Locale at all; that is the jolt-lang/time library, RFC 0008),
+  ;; so the no-arg form answers for the ROOT locale. Every other locale is :strict and
+  ;; raises naming itself, so this is the only place the two can disagree. Not a corpus
+  ;; row precisely because the JVM side is machine-dependent and so uncertifiable.
+  {:category :host-model
+   :behavior "(.format (java.text.NumberFormat/getCurrencyInstance) 123.45)"
+   :jvm "the default locale's currency format, e.g. \"$123.45\" under en_US"
+   :jolt "\"\\u00a4\\u00a0123.45\" — the Locale.ROOT format"
+   :note "Core has no default locale. Explicit locales are :strict: an unregistered one raises rather than formatting with root separators."}
   ;; (str lazy-seq) renders the realized seq "(2 3)" rather than the JVM's opaque
   ;; "clojure.lang.LazySeq@<hash>". Deliberately friendlier; left as is.
   {:category :seq-type-model

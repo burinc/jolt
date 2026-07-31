@@ -1369,4 +1369,27 @@
   {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-n {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/register-extension-point! :xt-n {:key :string :root \"\" :fields {:sym :string} :default {:sym \"OTHER\"} :fallback :strict}))" :expected :throws}
   {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-o {:key :keyword :root :root :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/register-extension! :xt-o :de {:sym \"$$\"}) (:sym (jolt.host/extension-value :xt-o :de)))" :expected "\"$$\""}
   {:suite "extension points" :expr "(jolt.host/extension-value :xt-never-declared \"\")" :expected :throws}
+  ;; :hint rides along on the strict-miss message so a point can name the library
+  ;; that carries its data instead of leaving the caller to guess.
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-p {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict :hint \"add the widget library\"}) (try (jolt.host/extension-value :xt-p \"de\") (catch Exception e (boolean (re-find #\"widget library\" (.getMessage e))))))" :expected "true"}
+
+  ;; java.text.NumberFormat currency instances. Core answers for the ROOT locale
+  ;; and is strict beyond it; jolt-lang/time (which owns java.util.Locale) supplies
+  ;; the rest. Every expectation below was read off reference JVM Clojure 1.12.5 for
+  ;; Locale/ROOT — they are not corpus rows because the no-arg JVM call resolves the
+  ;; DEFAULT locale, which is machine-dependent and so not certifiable.
+  ;; The root string is ¤ + NBSP + digits; compared as codepoints so no non-ASCII
+  ;; literal has to survive a trip through this file.
+  {:suite "currency" :expr "(mapv int (.format (java.text.NumberFormat/getCurrencyInstance) 123.45))" :expected "[164 160 49 50 51 46 52 53]"}
+  {:suite "currency" :expr "(mapv int (.format (java.text.NumberFormat/getCurrencyInstance) -123.45))" :expected "[45 164 160 49 50 51 46 52 53]"}
+  {:suite "currency" :expr "(apply str (drop 2 (.format (java.text.NumberFormat/getCurrencyInstance) 12345678.0)))" :expected "\"12,345,678.00\""}
+  {:suite "currency" :expr "(apply str (drop 2 (.format (java.text.NumberFormat/getCurrencyInstance) 5)))" :expected "\"5.00\""}
+  {:suite "currency" :expr "(apply str (drop 2 (.format (java.text.NumberFormat/getCurrencyInstance) 0.0)))" :expected "\"0.00\""}
+  ;; an unregistered locale names the point rather than formatting it with root separators
+  {:suite "currency" :expr "(try (java.text.NumberFormat/getCurrencyInstance \"de\") (catch Exception e (boolean (re-find #\"currency-data\" (.getMessage e)))))" :expected "true"}
+  {:suite "currency" :expr "(java.text.NumberFormat/getCurrencyInstance \"de\")" :expected :throws}
+  ;; a provider registered the way the time library will: suffix symbol, swapped separators
+  {:suite "currency" :expr "(do (jolt.host/register-extension! :currency-data \"de-test\" {:symbol \"E\" :symbol-sep \" \" :symbol-first? false :decimal-sep \",\" :grouping-sep \".\"}) (.format (java.text.NumberFormat/getCurrencyInstance \"de-test\") 1234.5))" :expected "\"1.234,50 E\""}
+  ;; frac-digits 0 rounds half-to-even like the JVM: 2.5 -> 2, 1234.5 -> 1234
+  {:suite "currency" :expr "(do (jolt.host/register-extension! :currency-data \"jp-test\" {:symbol \"Y\" :symbol-sep \"\" :symbol-first? true :frac-digits 0}) [(.format (java.text.NumberFormat/getCurrencyInstance \"jp-test\") 2.5) (.format (java.text.NumberFormat/getCurrencyInstance \"jp-test\") 1234.5)])" :expected "[\"Y2\" \"Y1,234\"]"}
 ]
