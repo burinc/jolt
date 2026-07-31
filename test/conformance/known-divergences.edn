@@ -42,6 +42,31 @@
    :jvm "the default locale's currency format, e.g. \"$123.45\" under en_US"
    :jolt "\"\\u00a4\\u00a0123.45\" — the Locale.ROOT format"
    :note "Core has no default locale. Explicit locales are :strict: an unregistered one raises rather than formatting with root separators."}
+  ;; (java.text.SimpleDateFormat. pattern) with no Locale resolves the JVM's
+  ;; DEFAULT locale, a property of the machine — en gives "March"/"Saturday",
+  ;; fr "mars"/"samedi". jolt core has no notion of a default locale (it does not
+  ;; carry java.util.Locale at all; that is the jolt-lang/time library, RFC 0008),
+  ;; so the no-Locale form answers for the ROOT locale, whose wide names are the
+  ;; abbreviated forms ("Mar"/"Sat" — the JVM's own ROOT rendering, verified).
+  ;; Unlike ::currency-data the point is :fallback :default, because the JVM's
+  ;; own contract for an unknown locale is to fall back to ROOT. The no-Locale
+  ;; corpus row ("time / sdf locale names") keeps jolt's value; see :entries.
+  {:category :host-model
+   :behavior "(.format (java.text.SimpleDateFormat. \"MMMM\") some-date)"
+   :jvm "the default locale's month name, e.g. \"March\" under en"
+   :jolt "\"Mar\" — the Locale.ROOT name"
+   :note "Core has no default locale. Explicit locale ids resolve through the :date-names extension point (:fallback :default): an unregistered id falls back to ROOT rather than throwing."}
+  ;; java.text.SimpleDateFormat formats in UTC on jolt; the JVM's formats in the
+  ;; machine's DEFAULT time zone. So a fixed epoch renders "2014-03-01 00:00" here
+  ;; and "2014-02-28 19:00" on a JVM in EST. Pre-existing — format-ms has always
+  ;; been UTC (inst-time.ss says so) — and surfaced by the :date-names guard row,
+  ;; which now lives in unit.edn because the JVM side is machine-dependent and so
+  ;; cannot be certified.
+  {:category :host-model
+   :behavior "(.format (java.text.SimpleDateFormat. \"yyyy-MM-dd HH:mm\") (java.util.Date. 1393632000000))"
+   :jvm "the default zone's rendering, e.g. \"2014-02-28 19:00\" under EST"
+   :jolt "\"2014-03-01 00:00\" — UTC"
+   :note "format-ms is UTC by design; .setTimeZone is accepted but not honored."}
   ;; (str lazy-seq) renders the realized seq "(2 3)" rather than the JVM's opaque
   ;; "clojure.lang.LazySeq@<hash>". Deliberately friendlier; left as is.
   {:category :seq-type-model
@@ -235,7 +260,13 @@
    :jolt "just the sliced bytes (slice copies)"
    :note "jolt's byte-buffer state is #(backing position limit) with no array offset, so a slice cannot express \"0-based view into a shared backing\". Read paths — hexdumps, decoders — are unaffected; a write through a slice does not propagate back. Tracked as jolt-93c9."}]
  :entries
- [;; %x / %X / %o widen by the argument's Java type on the JVM (Byte 8 bits, Short
+ [;; SimpleDateFormat with no Locale answers for ROOT in jolt but the machine's
+  ;; DEFAULT locale on the JVM ("March|Mar|Saturday|Sat" under en), so this row's
+  ;; :expected is jolt's ROOT rendering, not the JVM's. See the :documented entry.
+  {:suite "time / sdf locale names",
+   :label "no-locale name directives render ROOT names",
+   :category :host-model}
+  ;; %x / %X / %o widen by the argument's Java type on the JVM (Byte 8 bits, Short
   ;; 16, Integer 32, Long 64). jolt unifies every integer as one type, so it cannot
   ;; read the width off the argument and takes the narrowest one holding the value —
   ;; which IS the JVM's answer whenever the value's origin type is the narrowest

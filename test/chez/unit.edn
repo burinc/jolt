@@ -1392,4 +1392,21 @@
   {:suite "currency" :expr "(do (jolt.host/register-extension! :currency-data \"de-test\" {:symbol \"E\" :symbol-sep \" \" :symbol-first? false :decimal-sep \",\" :grouping-sep \".\"}) (.format (java.text.NumberFormat/getCurrencyInstance \"de-test\") 1234.5))" :expected "\"1.234,50 E\""}
   ;; frac-digits 0 rounds half-to-even like the JVM: 2.5 -> 2, 1234.5 -> 1234
   {:suite "currency" :expr "(do (jolt.host/register-extension! :currency-data \"jp-test\" {:symbol \"Y\" :symbol-sep \"\" :symbol-first? true :frac-digits 0}) [(.format (java.text.NumberFormat/getCurrencyInstance \"jp-test\") 2.5) (.format (java.text.NumberFormat/getCurrencyInstance \"jp-test\") 1234.5)])" :expected "[\"Y2\" \"Y1,234\"]"}
+
+  ;; java.text.SimpleDateFormat locale names. Core answers for the ROOT locale
+  ;; (the corpus rows); any other locale's names arrive through the :date-names
+  ;; extension point — jolt-lang/time owns java.util.Locale and registers them
+  ;; (RFC 0008). These rows register their own ids, proving the seam end to end.
+  ;; Expectations read off reference JVM Clojure 1.12.5; 2014-03-01 is a Saturday.
+  ;; Guard: a numeric-only pattern must not move when the name tables do. Not a
+  ;; corpus row — jolt's SimpleDateFormat formats in UTC while the JVM's uses the
+  ;; machine's default zone, so the JVM side of this is machine-dependent and
+  ;; uncertifiable (see the :documented entry in known-divergences).
+  {:suite "date names" :expr "(.format (java.text.SimpleDateFormat. \"yyyy-MM-dd HH:mm\") (java.util.Date. 1393632000000))" :expected "\"2014-03-01 00:00\""}
+  {:suite "date names" :expr "(do (jolt.host/register-extension! :date-names \"fr-test\" {:months [\"janvier\" \"février\" \"mars\" \"avril\" \"mai\" \"juin\" \"juillet\" \"août\" \"septembre\" \"octobre\" \"novembre\" \"décembre\"] :months-short [\"janv.\" \"févr.\" \"mars\" \"avr.\" \"mai\" \"juin\" \"juil.\" \"août\" \"sept.\" \"oct.\" \"nov.\" \"déc.\"] :days [\"lundi\" \"mardi\" \"mercredi\" \"jeudi\" \"vendredi\" \"samedi\" \"dimanche\"] :days-short [\"lun.\" \"mar.\" \"mer.\" \"jeu.\" \"ven.\" \"sam.\" \"dim.\"]}) [(.format (java.text.SimpleDateFormat. \"MMMM\" \"fr-test\") (java.util.Date. 1393632000000)) (.format (java.text.SimpleDateFormat. \"EEE\" \"fr-test\") (java.util.Date. 1393632000000)) (.format (java.text.SimpleDateFormat. \"EEEE\" \"fr-test\") (java.util.Date. 1393632000000)) (.format (java.text.SimpleDateFormat. \"yyyy-MM-dd\" \"fr-test\") (java.util.Date. 1393632000000))])" :expected "[\"mars\" \"sam.\" \"samedi\" \"2014-03-01\"]"}
+  ;; the ctor renders the locale argument to an id rather than naming a class —
+  ;; a symbol renders to its name, the same seam the library's Locale :str uses.
+  ;; A PARTIAL provider value merges over ROOT: only :months is stated, and MMMM
+  ;; still answers.
+  {:suite "date names" :expr "(do (jolt.host/register-extension! :date-names \"de-test\" {:months [\"Januar\" \"Februar\" \"März\" \"April\" \"Mai\" \"Juni\" \"Juli\" \"August\" \"September\" \"Oktober\" \"November\" \"Dezember\"]}) (.format (java.text.SimpleDateFormat. \"MMMM\" 'de-test) (java.util.Date. 1393632000000)))" :expected "\"März\""}
 ]

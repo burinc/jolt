@@ -4278,6 +4278,17 @@
   {:suite "time / tz offset parse" :label "SimpleDateFormat X parses +05 offset" :expected "1704049200000" :actual "(.getTime (.parse (java.text.SimpleDateFormat. \"yyyy-MM-dd'T'HH:mm:ssX\") \"2024-01-01T00:00:00+05\"))" :portability :jvm}
   {:suite "time / tz offset parse" :label "SimpleDateFormat X parses Z offset" :expected "1704067200000" :actual "(.getTime (.parse (java.text.SimpleDateFormat. \"yyyy-MM-dd'T'HH:mm:ssX\") \"2024-01-01T00:00:00Z\"))" :portability :jvm}
   {:suite "time / tz offset parse" :label "SimpleDateFormat XX parses -0330 offset" :expected "1704079800000" :actual "(.getTime (.parse (java.text.SimpleDateFormat. \"yyyy-MM-dd'T'HH:mm:ssXX\") \"2024-01-01T00:00:00-0330\"))" :portability :jvm}
+  ;; SimpleDateFormat name directives read the :date-names extension point. Core
+  ;; carries the ROOT locale only: wide names are the abbreviated forms (the JVM
+  ;; renders "Mar" for MMMM at ROOT — verified, not a bug), an unregistered locale
+  ;; id falls back to ROOT rather than throwing, and no locale argument means ROOT
+  ;; (core has no default locale — the no-locale name row keeps jolt's value, see
+  ;; known-divergences). Numeric directives never consult the point. Expectations
+  ;; measured on reference JVM Clojure 1.12.5; 2014-03-01 is a Saturday.
+  {:suite "time / sdf locale names" :label "no-locale name directives render ROOT names" :expected "\"Mar|Mar|Sat|Sat\"" :actual "(.format (java.text.SimpleDateFormat. \"MMMM'|'MMM'|'EEEE'|'EEE\") (java.util.Date. 1393632000000))" :portability :jvm}
+  {:suite "time / sdf locale names" :label "explicit ROOT locale id renders ROOT names" :expected "\"Mar|Sat\"" :actual "(.format (java.text.SimpleDateFormat. \"MMMM'|'EEEE\" \"\") (java.util.Date. 1393632000000))" :portability :jvm}
+  {:suite "time / sdf locale names" :label "unregistered locale id falls back to ROOT" :expected "\"Mar|Sat\"" :actual "(.format (java.text.SimpleDateFormat. \"MMMM'|'EEEE\" \"tlh\") (java.util.Date. 1393632000000))" :portability :jvm}
+  {:suite "time / sdf locale names" :label "numeric pattern ignores the locale id" :expected "\"2014-03-01\"" :actual "(.format (java.text.SimpleDateFormat. \"yyyy-MM-dd\" \"tlh\") (java.util.Date. 1393632000000))" :portability :jvm}
   {:suite "host-interop / FQN statics" :label "java.lang.System/currentTimeMillis works" :expected "true" :actual "(pos? (java.lang.System/currentTimeMillis))" :portability :jvm}
   {:suite "host-interop / FQN statics" :label "java.lang.Character/isWhitespace matches short form" :expected "true" :actual "(= (Character/isWhitespace \\space) (java.lang.Character/isWhitespace \\space))" :portability :jvm}
   {:suite "host-interop / Math" :label "Math/getExponent 2.0 => 1 via IEEE 754 bit extraction" :expected "1" :actual "(Math/getExponent 2.0)" :portability :jvm}
