@@ -207,6 +207,15 @@
    :jvm "the caller's frames; ::caller {:var-scope the-calling-var}"
    :jolt "an empty StackTraceElement[]; no ::caller key"
    :note "Inherent to tail calls, not a missing shim. spec's instrument still throws the same conform ExceptionInfo with the same explain-data — only the ::caller annotation is absent. Surfaces in spec.alpha's clojure.test-clojure.instr suite."}
+  ;; clojure.instant's third reader. jolt has one millisecond instant type, so
+  ;; java.sql.Timestamp is java.util.Date and the sub-millisecond digits are gone.
+  ;; The other two readers agree with the JVM exactly, offset zone included
+  ;; (test/chez/instant-test.clj).
+  {:category :host-model
+   :behavior "(.getNanos (clojure.instant/read-instant-timestamp \"...T13:14:15.123456789Z\"))"
+   :jvm "123456789 — Timestamp keeps nanoseconds"
+   :jolt "the instant is millisecond-precise; the remaining digits truncate"
+   :note "One instant type, millisecond-based. read-instant-date and read-instant-calendar are exact."}
   ;; ByteBuffer.slice() copies where the JVM shares the backing array.
   {:category :host-model
    :behavior "(.array (.slice buf)) after (.position buf 1)"

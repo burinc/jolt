@@ -493,7 +493,14 @@
       (jolt-bigdec-from-string x)
       (jolt-bigdec x)))
 (define jbd-class-statics
-  (list (cons "valueOf" (lambda (x . _) (jolt-bigdec x)))
+  ;; BigDecimal.valueOf(long unscaled, int scale) is unscaled x 10^-scale — the
+  ;; scale is the value, not a formatting hint. Dropping it returned 50 where the
+  ;; JVM returns 0.050.
+  (list (cons "valueOf"
+              (lambda (x . rest)
+                (if (null? rest)
+                    (jolt-bigdec x)
+                    (make-jbigdec (jnum->exact x) (jnum->exact (car rest))))))
         (cons "ZERO" (jolt-bigdec-from-string "0"))
         (cons "ONE" (jolt-bigdec-from-string "1"))
         (cons "TEN" (jolt-bigdec-from-string "10"))))

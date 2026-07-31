@@ -627,6 +627,28 @@ else
 fi
 rm -f "$process_log"
 
+# A jolt that spawns has to restore SIG_DFL for SIGCHLD before its first spawn: the
+# disposition survives exec, so jolt can arrive with SIG_IGN through no choice of
+# its own (a CI runner, a supervisor), and with it in place the kernel reaps every
+# child and no exit status is knowable. `trap ''` is what sets SIG_IGN portably.
+# Run in its own process because the restore is once-per-process, on the first
+# spawn: process-test.clj sets SIG_IGN AFTER a spawn on purpose, to exercise the
+# reap loop, which means it cannot reach this path at all.
+# The timeout wrapper installs its OWN SIGCHLD handler to wait on its child, and a
+# handler does not survive exec — so the trap has to be inside it, on the raw
+# binary, or jolt starts with SIG_DFL and the case proves nothing.
+sigchld_log="$(mktemp)"
+$jolt_timeout sh -c "trap '' CHLD; exec ${JOLT_BIN:-bin/jolt} run test/chez/sigchld-test.clj" \
+  >"$sigchld_log" 2>&1 || true
+if grep -q 'SIGCHLD-TEST OK' "$sigchld_log"; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: SIGCHLD restored before the first spawn"
+  tail -3 "$sigchld_log" | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+rm -f "$sigchld_log"
+
 # Runtime.availableProcessors reports the host's real usable CPU count. The value
 # is machine-dependent, so the expectation comes from the OS rather than a literal
 # — nproc first, because it honours the CPU affinity mask the way this does (and

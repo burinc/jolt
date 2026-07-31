@@ -27,7 +27,10 @@
 ;; --- libc entry points -------------------------------------------------------
 (define proc-waitpid (jolt-foreign-proc-safe "waitpid" '(int void* int) 'int))
 (define proc-kill    (jolt-foreign-proc-safe "kill"    '(int int)       'int))
-(define proc-signal  (jolt-foreign-proc-safe "signal"  '(int void*) 'void*))
+;; libc signal(2). Named apart from the proc-signal recorder further down — this
+;; file is load-ed at top level, so a second define of the same name silently wins
+;; and the SIGCHLD restore below would reach the recorder instead.
+(define proc-libc-signal (jolt-foreign-proc-safe "signal" '(int void*) 'void*))
 ;; errno, to tell a waitpid that was merely interrupted (EINTR — retry) from one
 ;; that can never succeed (ECHILD — the child is gone, retrying is an infinite
 ;; loop). Both spellings of the location accessor: Darwin/BSD, then glibc/musl.
@@ -67,11 +70,13 @@
 (define (proc-ensure-reapable!)
   (unless (unbox proc-sigchld-checked?)
     (set-box! proc-sigchld-checked? #t)
-    (when proc-signal
+    (when proc-libc-signal
       (guard (e (#t #f))
-        (let ((prev (proc-signal proc-SIGCHLD 0)))     ; install SIG_DFL, get the old one
-          ;; SIG_IGN is 1; anything else (SIG_DFL = 0, or a handler address) is put back.
-          (unless (eqv? prev 1) (proc-signal proc-SIGCHLD prev)))))))
+        (let ((prev (proc-libc-signal proc-SIGCHLD 0)))   ; install SIG_DFL, get the old one
+          ;; SIG_IGN is 1; anything else (SIG_DFL = 0, or a handler address) is put
+          ;; back. SIG_ERR is -1 and means the call did not take, so leave it alone.
+          (unless (or (eqv? prev 1) (eqv? prev -1))
+            (proc-libc-signal proc-SIGCHLD prev)))))))
 
 ;; WEXITSTATUS / signalled-process convention: a process killed by signal N
 ;; reports 128+N, matching the JVM's Process.exitValue on Unix.
