@@ -73,10 +73,15 @@
 ;; macro table (host-contract hc-macro?/hc-expand-1; forward-referenced, resolved
 ;; at call time after the spine loads). macroexpand loops until the head is no
 ;; longer a macro (subforms are not expanded, matching Clojure).
+;; Any SEQ whose head is a macro symbol expands, which is Clojure's rule
+;; (macroexpand1 tests ISeq). Requiring a cseq-list? left a seq that came out of
+;; another expansion unexpanded — the head symbol and the value were identical,
+;; only the provenance differed, so (macroexpand-all (macroexpand-1 form)) stopped
+;; one level early on a macro that builds its own expansion.
 (define (nr-macroexpand-1 form)
-  (if (and (cseq? form) (cseq-list? form) (symbol-t? (seq-first form)))
+  (if (and (hc-list? form) (not (jolt-nil? (jolt-seq form))) (symbol-t? (seq-first (jolt-seq form))))
       (let ((ctx (make-analyze-ctx (chez-current-ns))))
-        (if (hc-macro? ctx (seq-first form)) (hc-expand-1 ctx form) form))
+        (if (hc-macro? ctx (seq-first (jolt-seq form))) (hc-expand-1 ctx form) form))
       form))
 (define (nr-macroexpand form)
   (let loop ((cur form))

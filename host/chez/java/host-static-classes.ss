@@ -136,6 +136,14 @@
       (render-piece x)
       (substring (render-piece x) (jnum->exact (car rest)) (jnum->exact (cadr rest)))))
 
+;; Every index-taking StringBuilder method reports the same way the JVM does.
+(define (sb-range-check s start end)
+  (let ((n (string-length s)))
+    (when (or (< start 0) (> end n) (> start end))
+      (throw-jvm (quote StringIndexOutOfBoundsException)
+                 (string-append "start " (number->string start) ", end " (number->string end)
+                                ", length " (number->string n))))))
+
 (register-class-ctor! "StringBuilder"
   (lambda args (make-jhost "string-builder"
     ;; a numeric first arg is a CAPACITY hint, not content.
@@ -150,7 +158,53 @@
                               (sb-set! self (if (< n (string-length cur))
                                                 (substring cur 0 n)
                                                 (string-append cur (make-string (- n (string-length cur)) #\nul)))))
-                            jolt-nil))))
+                            jolt-nil))
+        (cons "isEmpty" (lambda (self) (= 0 (string-length (sb-str self)))))
+        (cons "substring" (lambda (self start . rest)
+                            (let* ((cur (sb-str self)) (s (jnum->exact start))
+                                   (e (if (null? rest) (string-length cur) (jnum->exact (car rest)))))
+                              (sb-range-check cur s e)
+                              (substring cur s e))))
+        (cons "indexOf" (lambda (self needle . rest)
+                          (->num (str-index-of (sb-str self) (render-piece needle)
+                                               (if (null? rest) 0 (jnum->exact (car rest)))))))
+        (cons "lastIndexOf" (lambda (self needle)
+                              (->num (str-last-index-of (sb-str self) (render-piece needle)))))
+        (cons "setCharAt" (lambda (self i ch)
+                            (let* ((cur (sb-str self)) (i (jnum->exact i)))
+                              (sb-range-check cur i (+ i 1))
+                              (sb-set! self (string-append (substring cur 0 i) (render-piece ch)
+                                                           (substring cur (+ i 1) (string-length cur)))))
+                            jolt-nil))
+        (cons "deleteCharAt" (lambda (self i)
+                               (let* ((cur (sb-str self)) (i (jnum->exact i)))
+                                 (sb-range-check cur i (+ i 1))
+                                 (sb-set! self (string-append (substring cur 0 i)
+                                                              (substring cur (+ i 1) (string-length cur)))))
+                               self))
+        ;; delete clamps its end to the length, the way the JVM does.
+        (cons "delete" (lambda (self start end)
+                         (let* ((cur (sb-str self)) (n (string-length cur))
+                                (s (jnum->exact start)) (e (min n (jnum->exact end))))
+                           (sb-range-check cur s (max s e))
+                           (sb-set! self (string-append (substring cur 0 s) (substring cur (max s e) n))))
+                         self))
+        (cons "replace" (lambda (self start end txt)
+                          (let* ((cur (sb-str self)) (n (string-length cur))
+                                 (s (jnum->exact start)) (e (min n (jnum->exact end))))
+                            (sb-range-check cur s (max s e))
+                            (sb-set! self (string-append (substring cur 0 s) (render-piece txt)
+                                                         (substring cur (max s e) n))))
+                          self))
+        (cons "insert" (lambda (self offset x . rest)
+                         (let* ((cur (sb-str self)) (n (string-length cur)) (i (jnum->exact offset)))
+                           (sb-range-check cur i i)
+                           (sb-set! self (string-append (substring cur 0 i) (append-text x rest)
+                                                        (substring cur i n))))
+                         self))
+        (cons "reverse" (lambda (self)
+                          (sb-set! self (list->string (reverse (string->list (sb-str self)))))
+                          self))))
 ;; (str sb) / print a StringBuilder -> its accumulated content, like the JVM
 ;; (str calls toString). Without this str renders the opaque host object.
 (register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "string-builder"))) sb-str)
@@ -199,14 +253,34 @@
     (cond ((eq? p 'out) (current-output-port))
           ((eq? p 'err) (current-error-port))
           (else p))))
+;; print / println / printf are PrintStream's, and System/out is a port-writer, so
+;; ported code writing (.println System/out …) lands here. println with no argument
+;; is the bare newline, as on the JVM.
 (register-host-methods! "port-writer"
   (list (cons "write" (lambda (self x) (display (writer-piece x) (port-writer-port self)) jolt-nil))
         (cons "append" (lambda (self x . rest) (display (append-text x rest) (port-writer-port self)) self))
+        (cons "print" (lambda (self x) (display (writer-piece x) (port-writer-port self)) jolt-nil))
+        (cons "println" (lambda (self . xs)
+                          (let ((p (port-writer-port self)))
+                            (unless (null? xs) (display (writer-piece (car xs)) p))
+                            (display "\n" p))
+                          jolt-nil))
         (cons "flush" (lambda (self) (flush-output-port (port-writer-port self)) jolt-nil))
         (cons "close" (lambda (self) jolt-nil))
         (cons "toString" (lambda (self) ""))))
 (def-dynvar! "clojure.core" "*out*" (make-jhost "port-writer" (vector 'out)))
 (def-dynvar! "clojure.core" "*err*" (make-jhost "port-writer" (vector 'err)))
+
+;; System/out and System/err — the process's own streams, so unlike *out*/*err*
+;; they are NOT affected by a (binding [*out* …]), matching the JVM. Ported code
+;; writes to them directly ((.println System/out …)); they are the same
+;; port-writers *out*/*err* root to, since jolt models a stream and a writer the
+;; same way. setOut/setErr are deliberately absent: redirecting the process
+;; streams needs the proxy-over-host-class support that is still missing, and a
+;; half-working setOut would silently drop output.
+(register-class-statics! "System"
+  (list (cons "out" (make-jhost "port-writer" (vector 'out)))
+        (cons "err" (make-jhost "port-writer" (vector 'err)))))
 
 ;; PrintWriter — a thin wrapper over a target writer. write/append/print forward
 ;; the rendered text to the target. clojure.data.json's pretty printer builds
@@ -215,11 +289,19 @@
 ;; for a host writer target it falls back to that writer's own write.
 (define (pw-forward target s)
   (cond
+    ;; through port-writer-port, not the raw slot: a port-writer holds the SYMBOL
+    ;; 'out / 'err and resolves it per call, so a (PrintWriter. *out*) built inside
+    ;; a with-out-str writes to the capture rather than past it.
     ((and (jhost? target) (string=? (jhost-tag target) "port-writer"))
-     (display s (vector-ref (jhost-state target) 0)))
+     (display s (port-writer-port target)))
     ((and (jhost? target) (memv #t (list (string=? (jhost-tag target) "writer")
                                          (string=? (jhost-tag target) "string-builder"))))
      (sb-set! target (string-append (sb-str target) s)))
+    ;; every other host writer knows how to write itself — a file-backed writer, an
+    ;; OutputStreamWriter, a nested PrintWriter. Naming them one by one left
+    ;; (PrintWriter. (io/writer f)) falling through to the pprint protocol below,
+    ;; which a file writer does not implement.
+    ((jhost? target) (record-method-dispatch target "write" (jolt-list s)))
     (else
      (jolt-invoke (var-deref "clojure.pprint" "-write") target s))))
 (register-class-ctor! "PrintWriter"
@@ -532,30 +614,52 @@
         (cons "close" (lambda (self) jolt-nil))))
 
 ;; ---- PushbackReader ---------------------------------------------------------
-;; state: a vector #(wrapped-reader pushed-list)
+;; state: a vector #(wrapped-reader pushed-list line-numbering? line column skip-lf?)
 (register-class-ctor! "PushbackReader"
-  (lambda (rdr . _) (make-jhost "pushback-reader" (vector rdr '()))))
+  (lambda (rdr . _) (make-jhost "pushback-reader" (vector rdr '() #f 0 0 #f))))
 ;; Fully-qualified aliases so (java.io.PushbackReader. …) / (java.io.StringReader. …)
 ;; resolve to these built-ins even when a library defines a deftype of the same
 ;; simple name (tools.reader), which would otherwise take the bare-name slot.
 (register-class-ctor! "java.io.PushbackReader" (lookup-class class-ctors-tbl "PushbackReader"))
 (register-class-ctor! "java.io.StringReader" (lookup-class class-ctors-tbl "StringReader"))
-;; LineNumberingPushbackReader: a pushback-reader (jolt doesn't track line
-;; numbers; getLineNumber is a stub for error-reporting paths that read it).
-(register-class-ctor! "LineNumberingPushbackReader"
-  (lambda (rdr . _) (make-jhost "pushback-reader" (vector rdr '()))))
-(register-class-ctor! "clojure.lang.LineNumberingPushbackReader"
-  (lambda (rdr . _) (make-jhost "pushback-reader" (vector rdr '()))))
+;; clojure.lang.LineNumberingPushbackReader is pushback over java.io.LineNumberReader,
+;; and that reader normalizes line terminators: \r, \n and \r\n each read as a single
+;; \n and bump the line number. So a source read through it looks the same whether it
+;; was written on Unix, Windows or a classic Mac — tools.reader's source logging
+;; depends on that, and without it a \r leaks through as its own character.
+(define (make-lnpbr rdr . _) (make-jhost "pushback-reader" (vector rdr '() #t 0 0 #f)))
+(register-class-ctor! "LineNumberingPushbackReader" make-lnpbr)
+(register-class-ctor! "clojure.lang.LineNumberingPushbackReader" make-lnpbr)
 (define (read-unit r)        ; read one code unit (flonum) from any reader, -1 at EOF
   (record-method-dispatch r "read" jolt-nil))
+;; One character from the wrapped reader, terminators folded to \n. Pushback sits
+;; ABOVE this (as it does on the JVM), so an unread \n is handed straight back and
+;; does not count a second line.
+(define (pbr-read-translated self)
+  (let* ((st (jhost-state self))
+         (c (read-unit (vector-ref st 0)))
+         (n (and (number? c) (jnum->exact c))))
+    (cond
+      ((and (vector-ref st 5) (eqv? n 10))     ; the \n of a \r\n pair, already counted
+       (vector-set! st 5 #f)
+       (pbr-read-translated self))
+      (else
+       (vector-set! st 5 (eqv? n 13))
+       (cond
+         ((or (eqv? n 13) (eqv? n 10))
+          (vector-set! st 3 (+ 1 (vector-ref st 3)))
+          (vector-set! st 4 0)
+          (->num 10))
+         (else (vector-set! st 4 (+ 1 (vector-ref st 4))) c))))))
 (register-host-methods! "pushback-reader"
   (list (cons "read"
           (lambda (self . rest)
             (define (read1)
-              (let ((pushed (vector-ref (jhost-state self) 1)))
-                (if (pair? pushed)
-                    (begin (vector-set! (jhost-state self) 1 (cdr pushed)) (car pushed))
-                    (read-unit (vector-ref (jhost-state self) 0)))))
+              (let* ((st (jhost-state self)) (pushed (vector-ref st 1)))
+                (cond
+                  ((pair? pushed) (vector-set! st 1 (cdr pushed)) (car pushed))
+                  ((vector-ref st 2) (pbr-read-translated self))
+                  (else (read-unit (vector-ref st 0))))))
             (if (null? rest)
                 (read1)
                 ;; .read(cbuf, off, len) -> read one code unit at a time into cbuf,
@@ -581,7 +685,10 @@
                         (loop (- i 1) (cons (->num (char->integer (vector-ref dv i))) acc))))))
             jolt-nil))
         (cons "close" (lambda (self) jolt-nil))
-        (cons "getLineNumber" (lambda (self) 0))))
+        ;; 1-based, like clojure.lang.LineNumberingPushbackReader's own +1 over the
+        ;; underlying LineNumberReader. A plain PushbackReader counts nothing.
+        (cons "getLineNumber" (lambda (self) (->num (+ 1 (vector-ref (jhost-state self) 3)))))
+        (cons "getColumnNumber" (lambda (self) (->num (vector-ref (jhost-state self) 4))))))
 
 ;; ---- StringTokenizer --------------------------------------------------------
 ;; state: a vector #(tokens-list pos)
@@ -629,7 +736,8 @@
               (else "UTF-8")))
       "UTF-8"))
 (define (decode-bytevector bv rest)
-  (let ((cs (charset-canonical-down (string-charset-name rest))))
+  (let* ((name (string-charset-name rest))
+         (cs (charset-canonical-down name)))
     (cond
       ((string=? cs "utf-8") (utf8->string bv))
       ((or (string=? cs "iso-8859-1") (string=? cs "us-ascii"))
@@ -640,7 +748,14 @@
       ((or (string=? cs "utf-32") (string=? cs "utf-32be"))
        (utf32->string bv (endianness big)))
       ((string=? cs "utf-32le") (utf32->string bv (endianness little)))
-      (else (guard (e (#t (list->string (map integer->char (bytevector->u8-list bv))))) (utf8->string bv))))))
+      ;; anything else through the system iconv (natives-str.ss); a charset the
+      ;; host does not have is the JVM's UnsupportedEncodingException rather than
+      ;; a silent reinterpretation of the bytes as UTF-8.
+      (else (let ((u8 (iconv-bytes bv name "UTF-8")))
+              (if u8
+                  (guard (e (#t (list->string (map integer->char (bytevector->u8-list u8)))))
+                    (utf8->string u8))
+                  (unsupported-encoding-throw name)))))))
 ;; (String. bytes offset length [charset]) — decode a SLICE. Returns (bv . rest')
 ;; where rest' is the charset args; a plain (String. bytes [charset]) is unsliced.
 (define (bytes-slice-for-string bv rest)
@@ -668,10 +783,25 @@
           (else (jolt-str-render-one x)))))
 ;; (BigInteger. s) | (BigInteger. s radix) — parse a string in the given radix
 ;; (default 10). tools.reader's integer parser builds (BigInteger. digits radix).
-(register-class-ctor! "BigInteger"
-  (lambda (v . r) (parse-int-or-throw v (if (null? r) 10 (jnum->exact (car r))) "BigInteger")))
-(register-class-ctor! "java.math.BigInteger"
-  (lambda (v . r) (parse-int-or-throw v (if (null? r) 10 (jnum->exact (car r))) "BigInteger")))
+;; (BigInteger. signum magnitude-bytes) is the other JVM constructor: an unsigned
+;; big-endian magnitude with an explicit sign, which is how a digest is turned into
+;; a number before hex-formatting it (Selmer's {{ x|hash:"md5" }} filter does
+;; (format "%032x" (BigInteger. 1 bs))). Each byte contributes its UNSIGNED value,
+;; so the sign of jolt's signed byte array does not leak into the result.
+(define (bigint-from-magnitude signum bytes)
+  (let* ((v (jolt-array-vec bytes))
+         (n (ja-len v)))
+    (let loop ((i 0) (acc 0))
+      (if (fx>=? i n)
+          (* (jnum->exact signum) acc)
+          (loop (fx+ i 1)
+                (+ (* acc 256) (bitwise-and (jnum->exact (ja-ref v i)) #xFF)))))))
+(define (bigint-ctor v . r)
+  (if (and (pair? r) (jolt-array? (car r)))
+      (bigint-from-magnitude v (car r))
+      (parse-int-or-throw v (if (null? r) 10 (jnum->exact (car r))) "BigInteger")))
+(register-class-ctor! "BigInteger" bigint-ctor)
+(register-class-ctor! "java.math.BigInteger" bigint-ctor)
 (register-class-ctor! "MapEntry" (lambda (k v) (make-map-entry k v)))
 ;; clojure.lang.MapEntry/create — the static factory clojure.walk and kin use
 ;; when rebuilding map entries.
@@ -729,36 +859,79 @@
   (register-class-ctor! "java.text.ParseException" parse-exc-ctor))
 
 ;; ---- URLEncoder / URLDecoder (www-form-urlencoded) --------------------------
-(define (url-unreserved? b)
-  (or (and (>= b 48) (<= b 57)) (and (>= b 65) (<= b 90)) (and (>= b 97) (<= b 122))
-      (= b 46) (= b 42) (= b 95) (= b 45)))
+;; Both honour the charset argument, which they used to ignore and always encode
+;; UTF-8 — so (URLEncoder/encode "\u3044" "Shift_JIS") is %82%A2, not %E3%81%84.
+;;
+;; The conversion is per RUN, not per string or per character, which is what the
+;; JVM does: unreserved ASCII passes through as itself and only the characters
+;; between them are converted, together. It matters for a stateful charset —
+;; UTF-16 writes a byte-order mark at the head of whatever it is handed, so
+;; (URLEncoder/encode "foo/bar" "UTF-16") is foo%FE%FF%00%2Fbar, one mark before
+;; the escaped "/" rather than one at the head of the whole string.
+(define (url-unreserved-char? c)
+  (let ((b (char->integer c)))
+    (or (and (>= b 48) (<= b 57)) (and (>= b 65) (<= b 90)) (and (>= b 97) (<= b 122))
+        (= b 46) (= b 42) (= b 95) (= b 45))))
 (define hex-digits "0123456789ABCDEF")
-(define (url-encode s . _)
-  (let ((bs (string->utf8 (if (string? s) s (jolt-str-render-one s)))) (out '()))
+;; The charset is validated up front, as on the JVM: a name the host cannot honour
+;; is an error even when the input happens to be all-unreserved and no conversion
+;; would have run.
+(define (url-charset cs)
+  (let ((name (charset-arg-name cs)))
+    (if (or (charset-lookup name) (iconv-known? name)) cs (unsupported-encoding-throw name))))
+(define (url-encode s . rest)
+  (let* ((str (if (string? s) s (jolt-str-render-one s)))
+         (cs (url-charset (if (null? rest) "UTF-8" (car rest))))
+         (n (string-length str))
+         (out '()))
+    (define (emit-escaped! bv)
+      (do ((i 0 (+ i 1))) ((= i (bytevector-length bv)))
+        (let ((b (bytevector-u8-ref bv i)))
+          (set! out (cons (string-ref hex-digits (bitwise-and b 15))
+                     (cons (string-ref hex-digits (bitwise-arithmetic-shift-right b 4))
+                       (cons #\% out)))))))
     (let loop ((i 0))
-      (if (= i (bytevector-length bs)) (list->string (reverse out))
-          (let ((b (bytevector-u8-ref bs i)))
-            (cond ((url-unreserved? b) (set! out (cons (integer->char b) out)))
-                  ((= b 32) (set! out (cons #\+ out)))
-                  (else (set! out (cons (string-ref hex-digits (bitwise-and b 15))
-                                   (cons (string-ref hex-digits (bitwise-arithmetic-shift-right b 4))
-                                     (cons #\% out))))))
-            (loop (+ i 1)))))))
+      (if (>= i n)
+          (list->string (reverse out))
+          (let ((c (string-ref str i)))
+            (cond
+              ((url-unreserved-char? c) (set! out (cons c out)) (loop (+ i 1)))
+              ((char=? c #\space) (set! out (cons #\+ out)) (loop (+ i 1)))
+              (else
+               (let run ((j i))
+                 (if (and (< j n)
+                          (not (url-unreserved-char? (string-ref str j)))
+                          (not (char=? (string-ref str j) #\space)))
+                     (run (+ j 1))
+                     (begin (emit-escaped! (charset-encode-bv (substring str i j) cs))
+                            (loop j)))))))))))
 (define (hexv c)
   (cond ((and (char<=? #\0 c) (char<=? c #\9)) (- (char->integer c) 48))
         ((and (char<=? #\A c) (char<=? c #\F)) (- (char->integer c) 55))
         ((and (char<=? #\a c) (char<=? c #\f)) (- (char->integer c) 87))
          (else (throw-jvm 'IllegalArgumentException "URLDecoder: illegal hex escape"))))
-(define (url-decode s . _)
-  (let* ((str (if (string? s) s (jolt-str-render-one s))) (n (string-length str)) (out '()))
+(define (url-decode s . rest)
+  (let* ((str (if (string? s) s (jolt-str-render-one s)))
+         (cs (list (url-charset (if (null? rest) "UTF-8" (car rest)))))
+         (n (string-length str))
+         (out '()))
     (let loop ((i 0))
-      (if (>= i n) (utf8->string (u8-list->bytevector (reverse out)))
+      (if (>= i n)
+          (list->string (reverse out))
           (let ((c (string-ref str i)))
-            (cond ((char=? c #\+) (set! out (cons 32 out)) (loop (+ i 1)))
-                  ((char=? c #\%)
-                   (set! out (cons (+ (* 16 (hexv (string-ref str (+ i 1)))) (hexv (string-ref str (+ i 2)))) out))
-                   (loop (+ i 3)))
-                  (else (set! out (cons (char->integer c) out)) (loop (+ i 1)))))))))
+            (cond
+              ((char=? c #\+) (set! out (cons #\space out)) (loop (+ i 1)))
+              ((char=? c #\%)
+               (let run ((j i) (bytes '()))
+                 (if (and (< j n) (char=? (string-ref str j) #\%))
+                     (run (+ j 3) (cons (+ (* 16 (hexv (string-ref str (+ j 1))))
+                                           (hexv (string-ref str (+ j 2))))
+                                        bytes))
+                     (let ((dec (decode-bytevector (u8-list->bytevector (reverse bytes)) cs)))
+                       (do ((k 0 (+ k 1))) ((= k (string-length dec)))
+                         (set! out (cons (string-ref dec k) out)))
+                       (loop j)))))
+              (else (set! out (cons c out)) (loop (+ i 1)))))))))
 (define (u8-list->bytevector lst)
   (let ((bv (make-bytevector (length lst))))
     (let loop ((l lst) (i 0)) (if (null? l) bv (begin (bytevector-u8-set! bv i (car l)) (loop (cdr l) (+ i 1)))))))
@@ -1143,7 +1316,68 @@
         ;; Class.isInstance(o) == (instance? class o); core.logic's deftype .equals
         ;; uses (.. this getClass (isInstance o)).
         (cons "isInstance" (lambda (self o) (if (instance-check self o) #t #f)))
+        (cons "getConstructors" (lambda (self) (class-constructors self)))
+        (cons "getDeclaredConstructors" (lambda (self) (class-constructors self)))
         (cons "getClass" (lambda (self) (make-class-obj "java.lang.Class")))))
+
+;; ---- constructors as values -------------------------------------------------
+;; Enough of java.lang.reflect.Constructor to pick a constructor by arity and call
+;; it, which is how a Clojure-level reader builds a #ns.Rec[…] literal: find the
+;; constructor whose parameter count matches, then invoke it. jolt knows the arity
+;; of a deftype or defrecord constructor from its declared fields; for any other
+;; class it has no signature to report, so getConstructors is empty there and a
+;; caller sees the same "no matching constructor" it would for a real mismatch.
+;; A record also carries the JVM's (fields + meta + ext-map) constructor, so an
+;; arity-counting caller finds the same two it would on the JVM.
+(define ctor-arity-probe '(0 1 2 3 4 5))
+(define (ctor-obj cls arity) (make-jhost "class-ctor" (vector cls arity)))
+(define (class-constructors cls)
+  (let* ((nm (jclass-name cls))
+         (dbl (hashtable-ref chez-record-dbl-tbl nm #f)))
+    (cond
+      ;; a deftype or defrecord: its fields ARE its signature
+      (dbl (let ((n (vector-length dbl)))
+             (if (hashtable-ref chez-record-type-tbl nm #f)
+                 (jolt-vector (ctor-obj cls n) (ctor-obj cls (+ n 2)))
+                 (jolt-vector (ctor-obj cls n)))))
+      ;; a host class jolt backs: the arities its registered constructor accepts.
+      ;; Many are variadic and coerce, so the probe stops at 5 rather than claiming
+      ;; every arity; past that a caller gets the constructor's own error.
+      ((lookup-class class-ctors-tbl nm)
+       => (lambda (c)
+            (let ((mask (procedure-arity-mask c)))
+              (apply jolt-vector
+                     (map (lambda (k) (ctor-obj cls k))
+                          (filter (lambda (k) (bitwise-bit-set? mask k)) ctor-arity-probe))))))
+      (else (jolt-vector)))))
+(register-host-methods! "class-ctor"
+  (list (cons "getParameterCount" (lambda (self) (->num (vector-ref (jhost-state self) 1))))
+        (cons "getParameterTypes"
+              (lambda (self)
+                (apply jolt-vector
+                       (make-list (vector-ref (jhost-state self) 1) (jolt-class-for "java.lang.Object")))))
+        (cons "getDeclaringClass" (lambda (self) (vector-ref (jhost-state self) 0)))
+        (cons "newInstance" (lambda (self . args) (apply reflect-construct (vector-ref (jhost-state self) 0) args)))
+        (cons "toString" (lambda (self) (jclass-name (vector-ref (jhost-state self) 0))))))
+
+;; ---- clojure.lang.Reflector -------------------------------------------------
+;; The reflective entry points Clojure code reaches for by name. Each is the
+;; dynamic form of an interop call jolt already performs, so they route to the
+;; same registries rather than to a second mechanism.
+(define (reflect-args a) (if (jolt-nil? a) '() (seq->list (jolt-seq a))))
+(define (reflect-construct cls . args)
+  (apply host-new (if (jclass? cls) (jclass-name cls) (jolt-str-render-one cls)) args))
+(register-class-statics! "clojure.lang.Reflector"
+  (list (cons "invokeConstructor"
+              (lambda (cls args) (apply reflect-construct cls (reflect-args args))))
+        (cons "invokeStaticMethod"
+              (lambda (cls method args)
+                (apply host-static-call (if (jclass? cls) (jclass-name cls) (jolt-str-render-one cls))
+                       (jolt-str-render-one method) (reflect-args args))))
+        (cons "invokeInstanceMethod"
+              (lambda (target method args)
+                (record-method-dispatch target (jolt-str-render-one method)
+                                        (list->cseq (reflect-args args)))))))
 ;; (class x) on a jclass value returns java.lang.Class, so (instance? Class
 ;; (class y)) and class-based dispatch see the correct JVM class.
 (register-class-arm! jclass? (lambda (x) "java.lang.Class"))
@@ -1630,9 +1864,13 @@
     (if (not (charset-legal-name? s))
         (throw-jvm 'java.nio.charset.IllegalCharsetNameException s)
         (let ((hit (charset-lookup s)))
-          (if hit
-              (make-jhost "charset" (vector (car hit) (cdr hit)))
-              (throw-jvm 'java.nio.charset.UnsupportedCharsetException s))))))
+          (cond
+            (hit (make-jhost "charset" (vector (car hit) (cdr hit))))
+            ;; the table lists the charsets Chez encodes natively; the rest come
+            ;; from the system iconv, so forName must accept whatever encoding
+            ;; through it will accept or the two disagree about the same name.
+            ((iconv-known? s) (make-jhost "charset" (vector s #x10FFFF)))
+            (else (throw-jvm 'java.nio.charset.UnsupportedCharsetException s)))))))
 (define (charset-name c) (vector-ref (jhost-state c) 0))
 (define (charset-encode-max c) (vector-ref (jhost-state c) 1))
 ;; One charset ARGUMENT — a name string or a Charset object — as its name string.

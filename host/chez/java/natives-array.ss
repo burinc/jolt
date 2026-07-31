@@ -16,7 +16,7 @@
     ((float) "[F") ((boolean) "[Z") ((byte) "[B") ((char) "[C")
     (else "[Ljava.lang.Object;")))
 
-(define (na-idx i) (if (and (number? i) (not (exact? i))) (exact (floor i)) i))
+(define (na-idx i) (if (and (number? i) (not (exact? i))) (exact (floor i)) (jolt-need-num i)))
 
 ;; A double/float jolt-array is backed by a Chez FLVECTOR (unboxed flonums); every
 ;; other kind keeps a boxed Chez vector. These helpers let the collection

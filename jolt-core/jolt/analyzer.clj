@@ -44,7 +44,8 @@
 ;; analyzed in analyze-list), so keep them in sync by intent, not by equality.
 (def ^:private handled
   #{"quote" "if" "do" "def" "fn*" "let*" "loop*" "recur" "throw" "try"
-    "syntax-quote" "var" "letfn*" "set!" "defmacro"})
+    "syntax-quote" "var" "letfn*" "set!" "defmacro"
+    "monitor-enter" "monitor-exit"})
 
 (defn- uncompilable [why]
   (throw (str "jolt/uncompilable: " why)))
@@ -502,16 +503,26 @@
             {:op :set-var :the-var (the-var (:ns r) (:name r)) :val val-node}))
       :else (uncompilable "set! of an unsupported target"))))
 
+;; (monitor-enter x) / (monitor-exit x) — the raw monitor ops, lowered to the same
+;; identity-keyed per-object mutex `locking` takes, so the two compose. Both
+;; evaluate to nil, matching the JVM (which emits a NIL after the monitor op).
+(defn- analyze-monitor-op [ctx items env op]
+  (when-not (= 2 (count items))
+    (throw (str "Wrong number of args (" (dec (count items)) ") passed to: " op)))
+  (invoke (var-ref "jolt.host" op) [(analyze ctx (nth items 1) env)]))
+
 (defn- analyze-special [ctx op items env]
   (case op
     ;; A quoted collection keeps its USER metadata (rewrite-clj coerces
-    ;; '^:x (4 5 6) and expects the meta back), but not the reader's location keys
-    ;; (:line/:column/:file) — like Clojure, which strips those from a quoted
-    ;; constant. The kept metadata is itself part of the literal, so quote it.
+    ;; '^:x (4 5 6) and expects the meta back). A list form is the one thing the
+    ;; reader stamps with :line/:column/:file, and that is its own bookkeeping
+    ;; rather than data, so it comes back off — but only there: on a vector, map,
+    ;; set or symbol the only possible source of a position key is the program
+    ;; that wrote it. The kept metadata is part of the literal, so quote it.
     "quote" (let [qf (second items)
                   m (form-coll-meta qf)
                   m (when (map? m)
-                      (let [u (dissoc m :line :column :end-line :end-column :file)]
+                      (let [u (if (form-list? qf) (dissoc m :line :column :file) m)]
                         (when (seq u) u)))]
               (if (nil? m)
                 (quote-node qf)
@@ -547,6 +558,13 @@
               {:op :recur
                :args (mapv #(analyze ctx % env) (rest items))})
     "try" (analyze-try ctx items env)
+    ;; (monitor-enter x) / (monitor-exit x) — the bare halves of `locking`, which
+    ;; is a macro over the same jolt.host per-object monitor. Libraries that
+    ;; expand their own locking macro rather than calling clojure.core/locking
+    ;; emit these directly (borkdude/dynaload does, under malli), so lower them
+    ;; to that seam instead of punting. Like the JVM, both yield nil.
+    "monitor-enter" (analyze-monitor-op ctx items env "monitor-enter")
+    "monitor-exit" (analyze-monitor-op ctx items env "monitor-exit")
     "letfn*" (analyze-letfn* ctx items env)
     "fn*" (analyze-fn ctx items env)
     ;; Lower the backtick to construction code (zero runtime cost), then analyze
@@ -893,7 +911,7 @@
 ;; becomes a :coerce node carrying the checked runtime helper, so it feeds the
 ;; numeric lattice like a ^double/^long hint: (* (double x) 2.0) emits fl*. The
 ;; helper preserves clojure.core's full JVM semantics (checked, not bare
-;; exact->inexact). float -> double-kind (Jolt has no single-float); int ->
+;; jolt->fl). float -> double-kind (Jolt has no single-float); int ->
 ;; long-kind (Jolt's integer-box model), routing to jolt-int-cast so the JVM int
 ;; range is still enforced. Returns {:kind .. :cast-fn ..} or nil. n is the full
 ;; item count (head + args).

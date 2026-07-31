@@ -54,22 +54,39 @@
 (define regex-cache (make-hashtable string-hash string=?))
 (define regex-cache-mutex (make-mutex 'regex-cache))
 
+;; A pattern the engine will not compile is a PatternSyntaxException, the same
+;; catchable thing the JVM throws — not the raw internal error, which surfaced as
+;; an unnamed condition no (catch PatternSyntaxException …) could see.
+(define (regex-syntax-error source e)
+  (jolt-throw
+   (jolt-host-throwable "java.util.regex.PatternSyntaxException"
+     (string-append (guard (e2 (#t "Unsupported pattern")) (condition-message-of e))
+                    " near index 0\n" source))))
+
+(define (condition-message-of e)
+  (if (and (condition? e) (message-condition? e)) (condition-message e) "Unsupported pattern"))
+
 (define (cached-regex-entry source)
   "Return (count . irx) for source, compiling if needed."
+  ;; dynamic-wind, not a bare release: a pattern that fails to compile used to
+  ;; leave the mutex held, so the next thread to compile ANY regex blocked forever.
   (mutex-acquire regex-cache-mutex)
-  (let ((entry (hashtable-ref regex-cache source #f)))
-    (if entry
-        (begin (mutex-release regex-cache-mutex) entry)
-        (let-values (((sre opts) (java-pattern->sre source)))
-          (let* ((irx (apply irregex sre opts))
-                 (has-caps? (sre-has-backref? sre))
-                 (count (irregex-num-submatches irx))
-                 (entry (if (or has-caps? (> count 0))
-                           (cons count (apply irregex sre 'backtrack opts))
-                           (cons 0 irx))))
-            (hashtable-set! regex-cache source entry)
-            (mutex-release regex-cache-mutex)
-            entry)))))
+  (dynamic-wind
+    (lambda () #f)
+    (lambda ()
+      (let ((entry (hashtable-ref regex-cache source #f)))
+        (or entry
+            (let ((entry (guard (e (#t (regex-syntax-error source e)))
+                           (let-values (((sre opts) (java-pattern->sre source)))
+                             (let* ((irx (apply irregex sre opts))
+                                    (has-caps? (sre-has-backref? sre))
+                                    (count (irregex-num-submatches irx)))
+                               (if (or has-caps? (> count 0))
+                                   (cons count (apply irregex sre 'backtrack opts))
+                                   (cons 0 irx)))))))
+              (hashtable-set! regex-cache source entry)
+              entry))))
+    (lambda () (mutex-release regex-cache-mutex))))
 
 (define (jolt-regex source)
   (let ((entry (cached-regex-entry source)))
@@ -91,7 +108,8 @@
                 (loop (- i 1) (cons (if s s jolt-nil) acc))))))))
 
 (define (jolt-re-matches re s)
-  (let ((m (irregex-match (regex-t-irx (jolt-re-pattern re)) s)))
+  (let* ((s (jolt-need-str s))
+         (m (irregex-match (regex-t-irx (jolt-re-pattern re)) s)))
     (if m (irx-result m) jolt-nil)))
 
 ;; A stateful matcher (java.util.regex.Matcher): the compiled pattern, the target
@@ -151,7 +169,7 @@
      (let* ((str (matcher-t-str m))
             (len (string-length str))
             (start (matcher-t-pos m))
-            (mm (and (<= start len) (irregex-search (matcher-t-irx m) str start))))
+            (mm (and (<= start len) (irx-search-from (matcher-t-irx m) str start))))
        (if mm
            (let ((ms (irregex-match-start-index mm 0))
                  (e (irregex-match-end-index mm 0)))
@@ -207,14 +225,38 @@
         (matcher-note-match! m mm)
         (begin (matcher-t-last-set! m #f) #f))))
 
+;; Next match at or after cursor `i`.
+;;
+;; A pattern anchored at the start of input (`^` without (?m), or \A) can only
+;; match at index 0, so once a scan has moved past 0 there is nothing left to find.
+;; irregex marks such a pattern ~consumer? and its own irregex-fold stops on that
+;; flag; jolt's scanning loops (re-seq, replace-all, split, matcher find) hand-roll
+;; their own loop, so they have to honor it here.
+;;
+;; Without this, irregex-search treats its start argument as the string ORIGIN and
+;; re-anchors ^ there: (str/replace "abcabc" #"^abc" "-") replaced twice, and
+;; (re-seq #"^abc" "abcabc") returned two matches, where the JVM does one. Selmer's
+;; include-tag parser strips its tag with ^.+?include\s*, so a nested
+;; {% include "a/include/head.html" %} lost everything up to the LAST "include"
+;; and resolved to "/head.html".
+;;
+;; Residual: a bos nested inside an alternation (#"^a|b") is not flagged a
+;; consumer — it can legitimately match elsewhere — so scanning continues and its
+;; ^ branch can still re-anchor at the resume offset. irregex's own fold has the
+;; same limit.
+(define (irx-search-from irx s i)
+  (and (or (= i 0) (not (flag-set? (irregex-flags irx) ~consumer?)))
+       (irregex-search irx s i)))
+
 ;; All non-overlapping matches, left to right. Advance past each match end (or by
 ;; one on a zero-width match). nil when there are no matches (Clojure: seq-able as
 ;; nil, so (if-let [m (re-seq ...)] ...) works).
 (define (jolt-re-seq re s)
-  (let ((irx (regex-t-irx (jolt-re-pattern re)))
-        (len (string-length s)))
+  (let* ((s (jolt-need-str s))
+         (irx (regex-t-irx (jolt-re-pattern re)))
+         (len (string-length s)))
     (let loop ((start 0) (acc '()))
-      (let ((m (and (<= start len) (irregex-search irx s start))))
+      (let ((m (and (<= start len) (irx-search-from irx s start))))
         (if m
             (let ((ms (irregex-match-start-index m 0))
                   (e (irregex-match-end-index m 0)))

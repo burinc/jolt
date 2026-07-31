@@ -75,9 +75,14 @@
                     (cseq-lazy (car o) (lambda () (build (cdr o))))))))))
     (step coll jolt-nil #f jolt-empty-list)))
 
+;; The 1-arity is `seq` except that an empty source yields () rather than nil, and
+;; an argument that is already a seq is handed back untouched.
 (define jolt-sequence
   (case-lambda
-    ((coll) (jolt-seq coll))
+    ((coll) (if (jolt-seq? coll)
+                coll
+                (let ((s (jolt-seq coll)))
+                  (if (jolt-nil? s) jolt-empty-list s))))
     ((xform coll) (sequence-xf xform coll))))
 
 (def-var! "clojure.core" "sequence" jolt-sequence)

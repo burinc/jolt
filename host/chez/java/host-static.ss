@@ -235,11 +235,47 @@
     "OffsetDateTime" "java.time.OffsetDateTime"
     "OffsetTime" "java.time.OffsetTime" "Clock" "java.time.Clock"
     "Locale" "java.util.Locale"))
+;; Other first-party libraries that install host classes the JVM has built in.
+;; Same courtesy java.time gets: on the first miss of one of these names, require
+;; the library's install namespace when it is on the source roots, so an
+;; unmodified JVM library that reaches for the class just works once the
+;; dependency is declared — Selmer's {{ x|hash:"md5" }} filter calls
+;; MessageDigest/getInstance, and no JVM library requires an install namespace
+;; first. Off the roots, the message names the dependency to add.
+;; Each entry is #(install-ns coordinate (class-name …) done-latch).
+(define lib-class-providers
+  (list
+   (vector "jolt.crypto" "io.github.jolt-lang/jolt-crypto"
+           '("MessageDigest" "java.security.MessageDigest"
+             "SecureRandom" "java.security.SecureRandom"
+             "Mac" "javax.crypto.Mac"
+             "Cipher" "javax.crypto.Cipher"
+             "SecretKeySpec" "javax.crypto.spec.SecretKeySpec"
+             "IvParameterSpec" "javax.crypto.spec.IvParameterSpec")
+           (box #f))))
+(define (lib-provider-for class)
+  (let loop ((ps lib-class-providers))
+    (cond ((null? ps) #f)
+          ((member class (vector-ref (car ps) 2)) (car ps))
+          (else (loop (cdr ps))))))
+(define (lib-try-autoload! class)
+  (let ((p (lib-provider-for class)))
+    (and p
+         (not (unbox (vector-ref p 3)))
+         (begin (set-box! (vector-ref p 3) #t)
+                (and (find-ns-file (vector-ref p 0))
+                     (begin (load-namespace (vector-ref p 0)) #t))))))
+
 (define (unknown-class-message class)
-  (if (or (member class jt-library-names) (java-time-prefixed? class))
-      (string-append class " is provided by the jolt-lang/time library, not core "
-                     "(RFC 0008). Add io.github.jolt-lang/time to your deps.edn.")
-      (string-append "Unknown class " class)))
+  (cond
+    ((or (member class jt-library-names) (java-time-prefixed? class))
+     (string-append class " is provided by the jolt-lang/time library, not core "
+                    "(RFC 0008). Add io.github.jolt-lang/time to your deps.edn."))
+    ((lib-provider-for class)
+     => (lambda (p)
+          (string-append class " is provided by the " (vector-ref p 1)
+                         " library, not core. Add it to your deps.edn.")))
+    (else (string-append "Unknown class " class))))
 ;; Load the core base once, on the first `java.time.` miss. The latch is set
 ;; BEFORE the load so a self-referential static call while the base is loading
 ;; cannot recurse into another autoload attempt (load-namespace marks a namespace
@@ -268,6 +304,17 @@
                               #t))))))
 
 ;; ---- emit entry points ------------------------------------------------------
+;; A qualified reference whose namespace segment names a live namespace — directly
+;; or through a require :as alias — is a missing VAR, not a missing class. The
+;; analyzer reads any unresolved ns/name as a host static, so a typo in a
+;; clojure.string call used to report "Unknown class s", naming the alias as a
+;; class and sending the reader looking in the wrong place.
+(define (static-miss-message class member)
+  (let ((target (or (chez-resolve-alias (chez-current-ns) class) class)))
+    (if (chez-ns-exists? target)
+        (string-append "No such var: " class "/" member)
+        (unknown-class-message class))))
+
 (define (host-static-ref class member)
   (let ((cell (mutable-static-cell class member #f)))
     (if cell
@@ -276,10 +323,11 @@
           (if h
               (let ((v (hashtable-ref h member #f)))
                 (if v v (throw-jvm (quote IllegalArgumentException) (string-append "No matching field or method: " class "/" member))))
-              ;; class miss — autoload the java.time base and retry once, else throw
-              (if (jt-try-autoload! class)
+              ;; class miss — autoload a provider (the java.time base, or a
+              ;; first-party library that installs the class) and retry once
+              (if (or (jt-try-autoload! class) (lib-try-autoload! class))
                   (host-static-ref class member)
-                  (throw-jvm (quote IllegalArgumentException) (unknown-class-message class))))))))
+                  (throw-jvm (quote IllegalArgumentException) (static-miss-message class member))))))))
 
 (define (host-static-call class member . args)
   (apply (host-static-ref class member) args))
@@ -288,9 +336,10 @@
   (let ((ctor (lookup-class class-ctors-tbl class)))
     (cond
       (ctor (apply ctor args))
-      ;; a java.time. constructor may live in the not-yet-loaded base — autoload
-      ;; and retry once before falling through to the var / no-ctor paths.
-      ((jt-try-autoload! class) (apply host-new class args))
+      ;; the constructor may live in a not-yet-loaded provider (the java.time base,
+      ;; or a first-party library) — autoload and retry once before falling through
+      ;; to the var / no-ctor paths.
+      ((or (jt-try-autoload! class) (lib-try-autoload! class)) (apply host-new class args))
       ;; deftype/defrecord: the type name is bound as a VAR (the
       ;; make-deftype-ctor closure) in its defining ns, not a registered host class.
       ;; Resolve it in the current ns / clojure.core and invoke it — so (P. args)
@@ -310,7 +359,7 @@
 ;; ---- coercion helpers -------------------------------------------------------
 ;; numeric tower: currentTimeMillis/nanoTime are exact longs (JVM).
 (define (->num x) x)
-(define (jnum->exact n) (exact (truncate n)))
+(define (jnum->exact n) (exact (truncate (jolt-need-num n))))
 ;; parse an integer string in radix; #f on failure
 (define (parse-int-str s radix)
   (let ((n (string->number (str-trim (if (string? s) s (jolt-str-render-one s))) radix)))

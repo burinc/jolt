@@ -440,6 +440,34 @@ else
   fails=$((fails + 1))
 fi
 
+# The rest of clojure.test's public surface — *test-out*/with-test-out,
+# successful?, compose/join-fixtures, assert-predicate/assert-any/try-expr,
+# function?, *load-tests*, set-test/deftest-, test-ns/test-all-vars/run-test-var.
+# Test runners and reporters reach for these; every expectation is certified
+# against reference clojure.test.
+cta_out="$($jolt run test/chez/clojure-test-api.clj 2>/dev/null)"
+if printf '%s' "$cta_out" | grep -q 'CLOJURE-TEST-API OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: clojure.test public surface"
+  echo "    $(printf '%s' "$cta_out" | grep CLOJURE-TEST-API-RESULT | tail -1)"
+  printf '%s' "$cta_out" | grep 'clojure-test-api FAIL' | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# clojure.zip + clojure.data: the surface data.zip and cider-nrepl drive, including
+# the SHAPE of a diff result (its map arm is a seq, its vector/set arms are
+# vectors). Both load on require, so they cannot be corpus rows.
+zd_out="$($jolt run test/chez/zip-data-test.clj 2>/dev/null)"
+if printf '%s' "$zd_out" | grep -q 'ZIP-DATA OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: clojure.zip / clojure.data"
+  echo "    $(printf '%s' "$zd_out" | grep ZIP-DATA-RESULT | tail -1)"
+  printf '%s' "$zd_out" | grep 'zip-data FAIL' | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # clojure.pprint cl-format: a representative, JVM-certified subset of the upstream
 # test_cl_format suite (~A ~S ~D ~F ~$ ~% ~& ~C ~( ~) ~{ ~} ~[ ~] ~< ~> ~T ~* ~R).
 # The file tallies per-case pass/fail and emits a PPRINT OK / PPRINT FAIL sentinel.
@@ -450,6 +478,20 @@ else
   echo "  FAIL: clojure.pprint cl-format suite"
   echo "    $(printf '%s' "$pp_out" | grep PPRINT-RESULT | tail -1)"
   printf '%s' "$pp_out" | grep 'pprint FAIL' | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# clojure.instant: RFC3339 parsing + the #inst reader constructors. Gated here
+# rather than in the corpus because the corpus runner loads no loader, so a
+# load-on-require namespace cannot be required there. Every expectation in the
+# file is certified against reference Clojure.
+inst_out="$($jolt run test/chez/instant-test.clj 2>/dev/null)"
+if printf '%s' "$inst_out" | grep -q 'INSTANT OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: clojure.instant suite"
+  echo "    $(printf '%s' "$inst_out" | grep INSTANT-RESULT | tail -1)"
+  printf '%s' "$inst_out" | grep 'instant FAIL' | sed 's/^/    /'
   fails=$((fails + 1))
 fi
 

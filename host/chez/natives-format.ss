@@ -5,6 +5,18 @@
 ;; jolt-str-render-one via converters + jolt-truthy?).
 
 (define (->long x) (exact (truncate x)))
+
+;; Guard for the conversions that need a number. The JVM renders a nil argument as
+;; "null" whatever the conversion, and rejects one it cannot take with
+;; IllegalFormatConversionException, whose message names the conversion and the
+;; argument's class ("d != java.lang.String"). Without this the argument reached a
+;; Chez numeric primitive and the raw condition escaped with no class, so no catch
+;; clause could select it. %c also takes a char.
+(define (fmt-numeric d a f)
+  (cond ((jolt-nil? a) "null")
+        ((or (number? a) (and (char? a) (char=? d #\c))) (f a))
+        (else (jolt-throw (jolt-host-throwable "java.util.IllegalFormatConversionException"
+                (string-append (string d) " != " (jolt-class-name a)))))))
 ;; %x / %X / %o are UNSIGNED conversions on the JVM: a negative argument prints the
 ;; two's complement of its integer type, not a signed magnitude ("%x" -1 was "-1"
 ;; here, which is wrong under any width). The WIDTH is the argument's Java type —
@@ -42,7 +54,8 @@
                    (number->string i)
                    (if (fx>? prec 0) (string-append "." (pad-left (number->string frac) prec #\0)) ""))))
 (define (jolt-format fmt . args)
-  (let ((out (open-output-string)))
+  (let ((fmt (jolt-need-string fmt))
+        (out (open-output-string)))
     (let loop ((i 0) (as args))
       (if (fx>=? i (string-length fmt))
           (get-output-string out)
@@ -69,15 +82,16 @@
                            (let* ((a (if (null? as) jolt-nil (car as)))
                                   (rest (if (null? as) '() (cdr as)))
                                   (s (case d
-                                       ((#\d) (number->string (->long a)))
+                                       ((#\d) (fmt-numeric d a (lambda (n) (number->string (->long n)))))
                                        ((#\s) (if (jolt-nil? a) "null" (jolt-str-render-one a)))
                                        ((#\S) (string-upcase (if (jolt-nil? a) "null" (jolt-str-render-one a))))
-                                       ((#\f) (fmt-float a (or prec 6)))
-                                       ((#\x) (string-downcase (fmt-radix a 16)))
-                                       ((#\X) (string-upcase (fmt-radix a 16)))
-                                       ((#\o) (fmt-radix a 8))
+                                       ((#\f) (fmt-numeric d a (lambda (n) (fmt-float n (or prec 6)))))
+                                       ((#\x) (fmt-numeric d a (lambda (n) (string-downcase (fmt-radix n 16)))))
+                                       ((#\X) (fmt-numeric d a (lambda (n) (string-upcase (fmt-radix n 16)))))
+                                       ((#\o) (fmt-numeric d a (lambda (n) (fmt-radix n 8))))
                                        ((#\b) (if (jolt-truthy? a) "true" "false"))
-                                       ((#\c) (string (integer->char (->long a))))
+                                       ((#\c) (fmt-numeric d a (lambda (n) (if (char? n) (string n)
+                                                                               (string (integer->char (->long n)))))))
                                        (else (jolt-throw (jolt-host-throwable "java.util.UnknownFormatConversionException"
                                                         (string-append "Conversion = '" (string d) "'"))))))
                                   ;; pad to width: left-justify with spaces, else right-justify

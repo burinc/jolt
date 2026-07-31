@@ -156,11 +156,16 @@
 ;; binds these as lexical locals; var-get/var-set read/write the root. Each gets a
 ;; unique name so two locals never compare/hash equal as map keys.
 (define local-var-counter 0)
+(define local-var-meta (jolt-hash-map (keyword #f "dynamic") #t))
 (define (jolt-local-var . args)
   (set! local-var-counter (fx+ local-var-counter 1))
-  (make-var-cell "" (string-append "local-" (number->string local-var-counter))
-                 (if (pair? args) (car args) jolt-nil)
-                 #t))
+  (let ((c (make-var-cell "" (string-append "local-" (number->string local-var-counter))
+                          (if (pair? args) (car args) jolt-nil)
+                          #t)))
+    ;; Clojure builds these with Var/create + setDynamic, so a local var takes a
+    ;; thread binding like any other — tools.reader hands one to with-bindings.
+    (hashtable-set! var-meta-table c local-var-meta)
+    c))
 
 ;; --- chain the var-read paths onto the binding stack -------------------------
 

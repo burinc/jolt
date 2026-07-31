@@ -101,16 +101,16 @@
 
 ;; clojure.math fns always return a DOUBLE; Chez's sqrt/expt/sin/floor/... return
 ;; EXACT for exact args ((sqrt 9) -> 3, (sin 0) -> 0), so coerce.
-(define (m1 f) (lambda (x) (exact->inexact (f x))))
-(define (m2 f) (lambda (a b) (exact->inexact (f a b))))
+(define (m1 f) (lambda (x) (exact->inexact (f (jolt-need-num x)))))
+(define (m2 f) (lambda (a b) (exact->inexact (f (jolt-need-num a) (jolt-need-num b)))))
 ;; a real result stays a flonum; a complex result becomes +nan.0. Chez extends
 ;; several real-domain ops (sqrt/expt/log/asin/acos, and log's kin log10/log1p)
 ;; onto the complex plane for out-of-domain real inputs, but Java/clojure.math
 ;; returns NaN there. real? is #t for a flonum and #f for a Chez complex, so this
 ;; guards exactly the complex leak; NaN/Inf are real and pass through unchanged.
 (define (real-or-nan x) (if (and (number? x) (real? x)) (exact->inexact x) +nan.0))
-(define (m1c f) (lambda (x) (real-or-nan (f x))))
-(define (m2c f) (lambda (a b) (real-or-nan (f a b))))
+(define (m1c f) (lambda (x) (real-or-nan (f (jolt-need-num x)))))
+(define (m2c f) (lambda (a b) (real-or-nan (f (jolt-need-num a) (jolt-need-num b)))))
 (def-var! "clojure.math" "sqrt" (m1c sqrt))
 (def-var! "clojure.math" "cbrt" jolt-math-cbrt)
 (def-var! "clojure.math" "pow" (m2c expt))

@@ -44,7 +44,14 @@
    (cons "skip" (lambda (self n) (let ((bv (get-bytevector-n (in-stream-port self) (jnum->exact n))))
                                    (->num (if (eof-object? bv) 0 (bytevector-length bv))))))
    (cons "available" (lambda (self) (->num 0)))
-   (cons "close" (lambda (self) (close-port (in-stream-port self)) jolt-nil))
+   ;; A piped stream marks its shared pipe instead of closing the Chez port: a
+   ;; read after close has to raise the JVM's IOException, and a closed Chez port
+   ;; raises a classless host error before the port's own reader is consulted.
+   (cons "close" (lambda (self)
+                   (let ((p (piped-pipe self)))
+                     (if p (pipe-close-read! p) (close-port (in-stream-port self))))
+                   jolt-nil))
+   (cons "connect" (lambda (self other) (pipe-connect! self other) jolt-nil))
    (cons "mark" (lambda (self . _) jolt-nil))
    (cons "reset" (lambda (self) (guard (e (#t jolt-nil)) (set-port-position! (in-stream-port self) 0) jolt-nil)))
    (cons "markSupported" (lambda (self) #f))
@@ -84,12 +91,22 @@
                       (put-bytevector port bv))))
                ((bytevector? x) (put-bytevector port x))
                (else (throw-jvm (quote IllegalArgumentException) "OutputStream/write: unsupported argument")))
+             ;; a pipe's whole point is that the reader sees the write; Chez
+             ;; buffers a custom output port, so a producer streaming into a
+             ;; response body would otherwise stall until close.
+             (when (piped-pipe self) (flush-output-port port))
              jolt-nil)))
    (cons "flush" (lambda (self) (flush-output-port (out-stream-port self)) jolt-nil))
    (cons "close" (lambda (self) (flush-output-port (out-stream-port self))
                    ;; a ByteArrayOutputStream's close is a no-op (toByteArray stays valid);
-                   ;; a file stream's port is closed.
-                   (unless (vector-ref (jhost-state self) 1) (close-port (out-stream-port self))) jolt-nil))
+                   ;; a piped stream signals end-of-stream to its reader; a file
+                   ;; stream's port is closed.
+                   (let ((p (piped-pipe self)))
+                     (cond (p (pipe-close-write! p))
+                           ((vector-ref (jhost-state self) 1))
+                           (else (close-port (out-stream-port self)))))
+                   jolt-nil))
+   (cons "connect" (lambda (self other) (pipe-connect! self other) jolt-nil))
    (cons "toByteArray" (lambda (self) (na-byte-array (bytevector-copy (baos-bytes self)))))
    (cons "size" (lambda (self) (->num (bytevector-length (baos-bytes self)))))
    (cons "reset" (lambda (self) (baos-bytes self) (vector-set! (jhost-state self) 2 (make-bytevector 0)) jolt-nil))
@@ -221,6 +238,30 @@
             (else (apply prev src opts)))))
   (def-var! "clojure.core" "slurp" jolt-slurp))
 
+;; spit to a stream or writer writes INTO it and closes it, as on the JVM where
+;; spit wraps the target in a writer under with-open. jolt rendered the target as
+;; a path, so (spit an-output-stream "x") silently created a file literally named
+;; "#object[java.io.OutputStream]" and the stream stayed empty.
+(let ((prev jolt-spit))
+  (set! jolt-spit
+        (lambda (target content . opts)
+          (cond
+            ((out-stream? target)
+             (put-bytevector (out-stream-port target)
+                             (string->utf8 (jolt-str-render-one content)))
+             (jolt-close target) jolt-nil)
+            ((char-writer? target)
+             (put-string (char-writer-port target) (jolt-str-render-one content))
+             (jolt-close target) jolt-nil)
+            ;; the StringWriter / PrintWriter family (io.ss) accumulates through
+            ;; its own .write method.
+            ((and (jhost? target)
+                  (member (jhost-tag target) '("writer" "file-writer" "port-writer" "print-writer")))
+             (record-method-dispatch target "write" (jolt-list (jolt-str-render-one content)))
+             (jolt-close target) jolt-nil)
+            (else (apply prev target content opts)))))
+  (def-var! "clojure.core" "spit" jolt-spit))
+
 ;; with-open closes the new stream jhosts via their .close method.
 (let ((prev jolt-close))
   (set! jolt-close
@@ -239,7 +280,7 @@
         ((bytevector? x) (make-in-stream (open-bytevector-input-port x)))
         ((and (jhost? x) (string=? (jhost-tag x) "url")) (make-in-stream (open-file-input-port (url-strip-scheme (url-spec x)) (file-options) (buffer-mode block))))
         ((string? x) (make-in-stream (open-file-input-port (project-relative x) (file-options) (buffer-mode block))))
-        (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-final-str x) "> as an InputStream")))))
+        (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as an InputStream.")))))
 (define (jio-output-stream x . rest)
   (cond ((out-stream? x) x)
         ((or (jfile? x) (string? x))
@@ -249,7 +290,7 @@
            (make-out-stream (open-file-output-port (path-of x)
                               (if append? (file-options no-fail no-truncate append) (file-options no-fail))
                               (buffer-mode block)))))
-        (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-final-str x) "> as an OutputStream")))))
+        (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as an OutputStream.")))))
 (def-var! "clojure.java.io" "input-stream" jio-input-stream)
 (def-var! "clojure.java.io" "output-stream" jio-output-stream)
 
@@ -340,24 +381,148 @@
                                                  "Closeable" "AutoCloseable" "Flushable" "Appendable"))) #t)
         (else 'pass))))))
 
-;; --- pr / pr-str honor a user (defmethod print-method SomeRecord …) ----------
-;; The readable printer's base jrec arm (records.ss) renders the default
-;; #ns.Name{…} form. A library often installs its own print form via
-;; (defmethod print-method OrderedMap [o ^Writer w] …). This arm, registered after
-;; that base one (so it is checked first) and after the char-writer Writer type it
-;; needs, renders such a record through its print-method into a StringWriter.
+;; --- pr / pr-str honor a user (defmethod print-method T …) -------------------
+;; On the JVM print-method IS the printer, so installing one changes what pr
+;; emits for that type. Here the printer is a list of native arms, and this hook
+;; (printing.ss consults it before that list) restores the JVM's precedence: a
+;; record renders through its method instead of the default #ns.Name{…} form, and
+;; a host class renders through its method instead of the arm the library that
+;; provided the class registered — for instance ring's session store, which
+;; round-trips a java.time.Instant through a custom print-method and edn reader.
 ;;
-;; Only a DIRECT method (keyed by the record's class-name tag) counts — the
-;; multimethod's :default falls back to __pr-str1, which returns here, so
-;; consulting the direct method table (not a full resolve) keeps a record with no
-;; user method on the default path and avoids infinite recursion.
-(define (jrec-user-print-method r)
+;; Two dispatch values are tried: the type tag the multimethod dispatches on
+;; itself (a record's class name, or the :jolt/… tag of a built-in), then the
+;; value's class, since a method written for a host type names the class —
+;; (defmethod print-method java.time.Instant …) — and jolt's tag for one of those
+;; is the catch-all :object.
+;;
+;; Only a DIRECT method counts — the multimethod's :default falls back to
+;; __pr-str1, which returns here, so a full resolve would recurse forever.
+;;
+;; jolt's own print-method entries are all keyed by type tag, so resolving a
+;; class per printed value would be dead weight until a library installs a
+;; class-keyed method. Whether any exists is settled once per multimethod epoch.
+(define pm-class-keys-epoch -1)
+(define pm-has-class-keys? #f)
+(define (pm-class-keys? tbl)
+  (unless (fx= pm-class-keys-epoch jolt-mm-epoch)
+    (set! pm-class-keys-epoch jolt-mm-epoch)
+    (set! pm-has-class-keys?
+          (let loop ((ks (vector->list (hashtable-keys tbl))))
+            (and (pair? ks) (or (jclass? (car ks)) (loop (cdr ks)))))))
+  pm-has-class-keys?)
+
+(define (user-print-method x)
   (let ((mf (var-deref "clojure.core" "print-method")))
     (and (jolt-multifn? mf)
-         (hashtable-ref (jolt-multifn-methods mf) (jrec-tag r) #f))))
-(register-pr-readable-arm!
-  (lambda (x) (and (jrec? x) (jrec-user-print-method x)))
+         (let ((tbl (jolt-multifn-methods mf)))
+           (or (hashtable-ref tbl (jolt-type x) #f)
+               (and (pm-class-keys? tbl)
+                    (let ((c (jolt-class-name x)))
+                      (and (string? c)
+                           (hashtable-ref tbl (jolt-class-for c) #f)))))))))
+(set-pr-user-method-render!
   (lambda (x)
-    (let ((port (open-output-string)))
-      (jolt-invoke (jrec-user-print-method x) x (make-char-writer port))
-      (get-output-string port))))
+    (let ((m (user-print-method x)))
+      (and m
+           (let ((port (open-output-string)))
+             (jolt-invoke m x (make-char-writer port))
+             (get-output-string port))))))
+
+;; --- piped streams ----------------------------------------------------------
+;; A PipedOutputStream and its PipedInputStream share one buffer: the reader
+;; blocks until the writer produces or closes. jolt runs futures on real OS
+;; threads, which is what makes a pipe useful — ring.util.io/piped-input-stream
+;; streams a response body out of one.
+;;
+;; Each end is an ordinary in-stream/out-stream jhost over a CUSTOM Chez port, so
+;; slurp, with-open, io/copy and instance? treat it like any other stream. The
+;; extra state slot holds a box carrying the shared pipe: connect makes both ends
+;; point at one, and close marks it rather than closing the port.
+(define-record-type jpipe
+  ;; chunks is a queue of bytevectors oldest-first, with `pos` bytes of the head
+  ;; already handed out.
+  (fields mu cv (mutable chunks) (mutable pos) (mutable wclosed?) (mutable rclosed?))
+  (nongenerative jpipe-v1))
+(define (new-jpipe) (make-jpipe (make-mutex) (make-condition) '() 0 #f #f))
+
+(define (pipe-io-throw msg) (jolt-throw (jolt-host-throwable "java.io.IOException" msg)))
+
+(define (pipe-write! p bv start count)
+  (with-mutex (jpipe-mu p)
+    (when (jpipe-rclosed? p) (pipe-io-throw "Read end dead"))
+    (when (jpipe-wclosed? p) (pipe-io-throw "Pipe closed"))
+    (let ((chunk (make-bytevector count)))
+      (bytevector-copy! bv start chunk 0 count)
+      (jpipe-chunks-set! p (append (jpipe-chunks p) (list chunk)))
+      (condition-broadcast (jpipe-cv p))))
+  count)
+
+;; Blocks while the pipe is empty and the writer is still open. condition-wait
+;; releases the mutex and deactivates the thread, so a writer can run and the
+;; collector is not held up by a parked reader.
+(define (pipe-read! p bv start count)
+  (with-mutex (jpipe-mu p)
+    (let loop ()
+      (cond
+        ((jpipe-rclosed? p) (pipe-io-throw "Pipe closed"))
+        ((pair? (jpipe-chunks p))
+         (let* ((head (car (jpipe-chunks p)))
+                (avail (- (bytevector-length head) (jpipe-pos p)))
+                (n (min avail count)))
+           (bytevector-copy! head (jpipe-pos p) bv start n)
+           (if (= n avail)
+               (begin (jpipe-chunks-set! p (cdr (jpipe-chunks p))) (jpipe-pos-set! p 0))
+               (jpipe-pos-set! p (+ (jpipe-pos p) n)))
+           n))
+        ((jpipe-wclosed? p) 0)                      ; writer done: end of stream
+        (else (condition-wait (jpipe-cv p) (jpipe-mu p)) (loop))))))
+
+(define (pipe-close-write! p)
+  (with-mutex (jpipe-mu p)
+    (jpipe-wclosed?-set! p #t)
+    (condition-broadcast (jpipe-cv p))))
+(define (pipe-close-read! p)
+  (with-mutex (jpipe-mu p)
+    (jpipe-rclosed?-set! p #t)
+    (condition-broadcast (jpipe-cv p))))
+
+;; The shared pipe behind a stream, or #f when it is an ordinary file/array stream.
+(define (piped-cell x)
+  (let ((st (and (jhost? x) (jhost-state x))))
+    (and (vector? st) (fx>? (vector-length st) 3) (vector-ref st 3))))
+(define (piped-pipe x) (let ((c (piped-cell x))) (and c (unbox c))))
+
+;; connect joins the two ends onto ONE pipe. Either end may be the receiver, and
+;; either may already have been connected, so both boxes are pointed at the same
+;; buffer rather than one adopting the other's.
+(define (pipe-connect! a b)
+  (let ((ca (piped-cell a)) (cb (piped-cell b)))
+    (unless (and ca cb) (pipe-io-throw "Not a piped stream"))
+    (let ((shared (unbox ca)))
+      (set-box! cb shared))))
+
+(define (make-piped-in-stream . rest)
+  (let* ((cell (box (new-jpipe)))
+         (port (make-custom-binary-input-port
+                "piped-input"
+                (lambda (bv start count) (pipe-read! (unbox cell) bv start count))
+                #f #f (lambda () #f)))
+         (self (make-jhost "in-stream" (vector port #f #f cell))))
+    (when (pair? rest) (pipe-connect! self (car rest)))
+    self))
+
+(define (make-piped-out-stream . rest)
+  (let* ((cell (box (new-jpipe)))
+         (port (make-custom-binary-output-port
+                "piped-output"
+                (lambda (bv start count) (pipe-write! (unbox cell) bv start count))
+                #f #f (lambda () #f)))
+         (self (make-jhost "out-stream" (vector port #f #f cell))))
+    (when (pair? rest) (pipe-connect! self (car rest)))
+    self))
+
+(register-class-ctor! "PipedInputStream" make-piped-in-stream)
+(register-class-ctor! "java.io.PipedInputStream" make-piped-in-stream)
+(register-class-ctor! "PipedOutputStream" make-piped-out-stream)
+(register-class-ctor! "java.io.PipedOutputStream" make-piped-out-stream)

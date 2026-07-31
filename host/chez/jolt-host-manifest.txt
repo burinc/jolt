@@ -95,6 +95,8 @@ locale-name
 make-interrupt
 make-thread-local
 map-entry
+monitor-enter
+monitor-exit
 park-until-interrupt
 protocol-methods
 rational-type?

@@ -131,6 +131,12 @@
 (define (ns-has-vars? nm)
   (hashtable-ref ns-has-vars-set nm #f))
 
+;; Does this NAME string denote a live namespace? Same rule find-ns uses (the
+;; registry, or any var interned under the name), without the designator
+;; conversion — callers that already hold a name string.
+(define (chez-ns-exists? nm)
+  (and (string? nm) (or (and (hashtable-ref ns-registry nm #f) #t) (ns-has-vars? nm) #f)))
+
 (define (jolt-find-ns desig)
   (let ((nm (ns-desig->name desig)))
     (or (hashtable-ref ns-registry nm #f)

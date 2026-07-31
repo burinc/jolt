@@ -298,7 +298,7 @@
                   "devirt-resolve" "devirt-resolve-fl"
                   "register-clone*" "protocol-resolve"
                   "protocol-dispatch1" "protocol-dispatch2" "protocol-dispatch3"
-                  "exact->inexact" "jolt->fx"
+                  "jolt->fl" "jolt->fx"
                   "jolt-register-source!" "jolt-proto-epoch"
                   ;; --- bare heads emitted at sites the registry doesn't cover ---
                   ;; INVARIANT: any new bare Scheme head an emit* clause outputs
@@ -621,13 +621,13 @@
 ;; Scheme rest arg coerced to a jolt seq (nil when empty); recur carries the rest
 ;; seq directly, and the named let's init only runs on first entry.
 ;; Coerce a numeric-hinted param at fn entry, the way the JVM coerces a primitive
-;; parameter: ^double -> exact->inexact, ^long -> jolt->fx. Only the named-let init
+;; parameter: ^double -> jolt->fl, ^long -> jolt->fx. Only the named-let init
 ;; (first entry) coerces — recur carries already-typed values, like a JVM goto. This
 ;; is what makes the hint a contract the body's fl*/fx* ops can rely on. `orig` is
 ;; the param's source name (the :nhints key); `munged` the emitted identifier.
 (defn- nhint-init [nh orig munged]
   (let [k (get nh orig)]
-    (cond (= k :double) (str "(exact->inexact " munged ")")
+    (cond (= k :double) (str "(jolt->fl " munged ")")
           (= k :long)   (str "(jolt->fx " munged ")")
           :else munged)))
 
@@ -655,10 +655,10 @@
                 pbind)
         lett (str "(let " label " (" (str/join " " binds) ") " body ")")
         ;; a ^double/^long return hint coerces the arity's value on the way out
-        ;; (exact->inexact / jolt->fx), like a JVM primitive return — so a caller's
+        ;; (jolt->fl / jolt->fx), like a JVM primitive return — so a caller's
         ;; arithmetic over the result is sound.
         ret (:ret-nhint a)]
-    [paramlist (cond (= ret :double) (str "(exact->inexact " lett ")")
+    [paramlist (cond (= ret :double) (str "(jolt->fl " lett ")")
                      (= ret :long)   (str "(jolt->fx " lett ")")
                      :else lett)]))
 
@@ -1292,12 +1292,12 @@
     :throw (str "(jolt-throw " (emit (:expr node)) ")")
      ;; numeric coercion. A :cast-fn (from a user (double x)/(long x)/… cast)
      ;; emits the checked runtime helper — clojure.core's full JVM semantics —
-     ;; NOT the bare exact->inexact a proven typed-param coercion uses. The 2-arg
-     ;; :coerce (inlined ^double/^long param or return) has no :cast-fn and keeps
-     ;; the bare fast-path coercion.
+     ;; NOT the hint coercion (jolt->fl / jolt->fx) a proven typed-param cast uses.
+     ;; The 2-arg :coerce (inlined ^double/^long param or return) has no :cast-fn
+     ;; and keeps the hint coercion.
      :coerce (let [e (emit (:expr node))]
                (cond (:cast-fn node) (str "(" (:cast-fn node) " " e ")")
-                     (= :double (:kind node)) (str "(exact->inexact " e ")")
+                     (= :double (:kind node)) (str "(jolt->fl " e ")")
                      (= :long (:kind node)) (str "(jolt->fx " e ")")
                      :else e))
     :try (emit-try node)

@@ -1491,10 +1491,20 @@
       ;; caller gets a one-element list instead of the value.
       ((jrec? obj)
        (let ((boxed (dot-coll-method obj method-name rest)))
-         (if boxed (car boxed) (error #f (string-append "No method " method-name " for value: "
-                                                        (jolt-pr-str obj))))))
-      (else (error #f (string-append "No method " method-name " for value: "
-                                     (jolt-pr-str obj)))))))
+         (if boxed (car boxed) (no-method-throw method-name obj))))
+      (else (no-method-throw method-name obj)))))
+
+;; The end of the dispatch chain. A method call on nil is the JVM's
+;; NullPointerException; anything else is its IllegalArgumentException ("No
+;; matching method"). Raising a raw host error here left the value classless, so
+;; a catch clause could not select it and (class e) read :object.
+(define (no-method-throw method-name obj)
+  (if (jolt-nil? obj)
+      (throw-jvm (quote NullPointerException)
+                 (string-append "Cannot invoke \"" method-name "\" because the target is null"))
+      (throw-jvm (quote IllegalArgumentException)
+                 (string-append "No matching method " method-name " found for "
+                                (guard (e (#t "?")) (jolt-class-name obj))))))
 
 ;; ---- method-dispatch arm registry ------------------------------------------
 ;; A .method call (record-method-dispatch) is resolved by an ordered list of arms
@@ -1634,7 +1644,25 @@
       (jch-set-supers! tag (append protos
                                    '("clojure.lang.IRecord" "clojure.lang.IObj"
                                      "clojure.lang.IPersistentMap" "java.util.Map"
-                                     "clojure.lang.IHashEq" "java.io.Serializable")))))
+                                     "clojure.lang.IHashEq" "java.io.Serializable"))))
+    ;; every defrecord gets a static create(map) on the JVM — it is what the
+    ;; #ns.Rec{…} literal is read through, positionally or by key.
+    (let ((ctor (hashtable-ref class-ctors-tbl tag #f))
+          (shape (hashtable-ref chez-record-shapes-tbl
+                                (string-append (chez-current-ns) "/->" (symbol-t-name name-sym)) #f)))
+      (when (and ctor shape)
+        (register-class-statics! tag
+          (list (cons "create"
+                      (lambda (m)
+                        ;; declared fields positionally, anything else assoc'd on —
+                        ;; a record keeps unknown keys in its extension map.
+                        (let ((kws (vector-ref shape 0)))
+                          (let loop ((rec (apply ctor (map (lambda (k) (jolt-get m k)) kws)))
+                                     (ks (seq->list (jolt-seq (jolt-keys m)))))
+                            (cond ((null? ks) rec)
+                                  ((member (car ks) kws) (loop rec (cdr ks)))
+                                  (else (loop (jolt-assoc rec (car ks) (jolt-get m (car ks)))
+                                              (cdr ks)))))))))))))
   jolt-nil)
 (def-var! "clojure.core" "register-record-type!" register-record-type!)
 (def-var! "clojure.core" "make-protocol" make-protocol)

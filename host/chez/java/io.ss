@@ -435,7 +435,7 @@
     ((and (htable? src) (jolt-truthy? (jolt-ref-get src (keyword "jolt" "input-stream"))))
      (decode-bytevector (drain-byte-stream src) (slurp-encoding opts)))
     ((string? src) (slurp-path (project-relative src)))
-    (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-final-str src) "> as a Reader")))))
+    (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str src) "> as a Reader.")))))
 
 (define (spit-append? opts)
   (let loop ((o opts))
@@ -551,7 +551,11 @@
     ((string? x) (host-new "StringReader" (read-file-string (project-relative x))))
     ((or (cseq? x) (empty-list-t? x) (pvec? x))
      (host-new "StringReader" (seq-source->string x)))
-    (else (host-new "StringReader" (jolt-str-render-one x)))))
+    ;; anything else is not a source, and quietly rendering it would read as empty
+    ;; content — (io/reader nil) used to hand back a reader over "" rather than say
+    ;; so. Same coercion error the JVM raises, and the same one io/writer raises.
+    (else (throw-jvm (quote IllegalArgumentException)
+                     (string-append "Cannot open <" (jolt-pr-str x) "> as a Reader.")))))
 
 ;; --- clojure.java.io/writer: an existing writer passes through; a File / path
 ;; gets a file-backed writer (host-static.ss "file-writer") that persists on
@@ -562,7 +566,7 @@
     ((and (jhost? x) (string=? (jhost-tag x) "file-writer")) x)
     ((jfile? x) (make-jhost "file-writer" (vector (jfile-path x) "")))
     ((string? x) (make-jhost "file-writer" (vector x "")))
-    (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-final-str x) "> as a Writer")))))
+    (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as a Writer.")))))
 
 ;; --- clojure.java.io ns -----------------------------------------------------
 (def-var! "clojure.java.io" "file" jolt-make-file)
@@ -705,9 +709,56 @@
                             jolt-nil))
         (cons "isInterrupted" (lambda (self)
                                 (and (box? (jhost-state self)) (unbox (jhost-state self)) #t)))))
-(define (current-thread-handle) (make-jhost "thread" (current-interrupt-box)))
-(register-class-statics! "Thread" (list (cons "currentThread" current-thread-handle)))
-(register-class-statics! "java.lang.Thread" (list (cons "currentThread" current-thread-handle)))
+;; ONE handle per thread, cached in a thread parameter. The JVM's
+;; Thread/currentThread is identity-stable, and code relies on it: keying a map by
+;; the current thread, or comparing two calls with identical?/=. Allocating a fresh
+;; jhost per call made every such comparison false — tools.logging's suite tags each
+;; log entry with its calling thread and then asks whether it was logged directly.
+;; The cell carries the owning thread's id for the same reason current-interrupt-box
+;; does: a Chez thread parameter is inherited by a forked thread, and a child must
+;; not report the parent's handle as its own.
+(define thread-handle-cell (make-thread-parameter #f))      ; (thread-id . handle)
+;; Mirror of the per-thread cache keyed by thread id, so another thread can name
+;; this one — Thread/getAllStackTraces has to hand back the SAME handle
+;; currentThread does, or a caller cannot find itself in the map.
+(define thread-handles-by-id (make-eqv-hashtable))
+(define thread-handles-mutex (make-mutex))
+(define (current-thread-handle)
+  (let ((c (thread-handle-cell))
+        (id (get-thread-id)))
+    (if (and (pair? c) (eqv? (car c) id))
+        (cdr c)
+        (let ((h (make-jhost "thread" (current-interrupt-box))))
+          (thread-handle-cell (cons id h))
+          (with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
+          h))))
+;; A handle for a thread that has never asked who it is. Its interrupt box is its
+;; own, so .interrupt through it does not reach that thread — the thread adopts a
+;; real handle the moment it calls currentThread.
+(define (thread-handle-for-id id)
+  (if (eqv? id (get-thread-id))
+      (current-thread-handle)              ; the caller must find ITSELF in the map
+      (or (with-mutex thread-handles-mutex (hashtable-ref thread-handles-by-id id #f))
+          (let ((h (make-jhost "thread" (box #f))))
+            (with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
+            h))))
+;; Thread/getAllStackTraces: the live threads mapped to EMPTY stack traces. jolt
+;; reifies no call stack (TCO erases caller frames) and .getStackTrace is already
+;; an empty StackTraceElement[], so the traces are honestly empty; the thread set
+;; is real, which is what the callers want — ring's suites count threads before
+;; and after a request to check for leaks.
+(define (all-stack-traces)
+  (let loop ((ids (cons (get-thread-id) (live-thread-ids)))
+             (seen '())
+             (m empty-pmap))
+    (cond ((null? ids) m)
+          ((memv (car ids) seen) (loop (cdr ids) seen m))
+          (else (loop (cdr ids) (cons (car ids) seen)
+                      (jolt-assoc m (thread-handle-for-id (car ids)) (jolt-vector)))))))
+(let ((statics (list (cons "currentThread" current-thread-handle)
+                     (cons "getAllStackTraces" all-stack-traces))))
+  (register-class-statics! "Thread" statics)
+  (register-class-statics! "java.lang.Thread" statics))
 
 ;; --- java.io.File / java.util.UUID constructors -----------------------------
 ;; (java.io.File. parent child) joins with "/"; (File. path) wraps the path.
@@ -719,6 +770,12 @@
 ;; File statics: the platform separators plus createTempFile / listRoots.
 (define temp-file-counter 0)
 (define (file-create-temp prefix suffix . dir)
+  ;; the JVM rejects a prefix under three characters, so a caller that works here
+  ;; works there too
+  (when (< (string-length (jolt-str-render-one prefix)) 3)
+    (throw-jvm (quote IllegalArgumentException)
+               (string-append "Prefix string \"" (jolt-str-render-one prefix)
+                              "\" too short: length must be at least 3")))
   (let* ((d (cond ((pair? dir) (file-path-of (car dir)))
                   ((getenv "TMPDIR") => (lambda (t) t))
                   (else "/tmp")))

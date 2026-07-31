@@ -138,16 +138,15 @@
 ;; --- print-method ------------------------------------------------
 ;; Canonical dispatch (clojure/core.clj 3693): the :type metadata when it's a
 ;; keyword, else the value's type. On jolt, type is the keyword tag for
-;; builtins and the deftype name SYMBOL for records — so a record method is
-;; (defmethod print-method 'ns.Type [r w] ...) (class names aren't values
-;; here, the quoted full name is the dispatch value).
+;; builtins and the class name for records, so a record or host-class method is
+;; (defmethod print-method SomeType [x w] ...) — the class token is the value.
 ;;
-;; The :default renders through the host's fast printer. The host renderer
-;; calls BACK into this table for records (the api wires the hook after the
-;; overlay loads), so a record method fires nested inside collections too.
-;; Builtin overrides (e.g. a :number method) fire only when print-method is
-;; called directly — pr/pr-str keep the native fast path for builtins (a
-;; documented jolt divergence).
+;; The :default renders through the host's fast printer, and the host printer
+;; consults this table first (io-streams.ss), so a method here IS the printer for
+;; its type, as on the JVM: it fires from pr/prn/pr-str and nested inside
+;; collections. A method keyed by a class fires for a record or a host object; a
+;; built-in (number, string, vector) is keyed by its tag, since resolving a class
+;; per element printed would cost more than the feature is worth.
 (defmulti print-method (fn [x writer]
                          (let [t (get (meta x) :type)]
                            (if (keyword? t) t (__type-tag x)))))
@@ -172,23 +171,8 @@
 (defmethod print-method "clojure.core.Eduction" [e w]
   (print-method (apply list (seq e)) w))
 
-;; Cold tagged-type renderings, migrated from the host renderer (the hot
-;; types — numbers, strings, symbols, collections — stay native). Each is the
-;; exact output the host branch produced.
-(defmethod print-method :jolt/uuid [u w]
-  (.write w (str "#uuid \"" (get u :str) "\""))
-  nil)
-
-(defmethod print-method :jolt/regex [re w]
-  (.write w (str "#\"" (get re :source) "\""))
-  nil)
-
-;; a transient's get IS the dispatched collection lookup — read the wrapper's
-;; own :kind field with the host accessor (same trap as sorted colls).
-(defmethod print-method :jolt/transient [t w]
-  (.write w (str "#<transient " (name (jolt.host/ref-get t :kind)) ">"))
-  nil)
-
+;; A channel has no readable form, so name it here; every other host type the
+;; printer knows renders through :default, which is the native renderer.
 (defmethod print-method :jolt/chan [c w]
   (.write w "#<channel>")
   nil)

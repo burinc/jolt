@@ -1095,7 +1095,7 @@
   The receiver (param 0) is seeded as the record type with its :num fields surfaced
   (the unit rich field types, via *field-type-box*), so dbl-arith? contagions a :num field
   read that sits beside a proven :double operand — wrapping it in coerce :double,
-  emitted as exact->inexact. That is the same machinery a genuine ^double field
+  emitted as jolt->fl. That is the same machinery a genuine ^double field
   reaches; contagion is sound because Clojure double contagion makes the result a
   double regardless, so eagerly converting the :num operand is value-identical
   (the same rule dbl-arith? already encodes). A pure-:num expression (no proven :double operand)

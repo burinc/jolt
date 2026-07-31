@@ -684,3 +684,10 @@
 (cca-def! "go" cca-go-macro)           (mark-macro! "clojure.core.async" "go")
 (cca-def! "go-loop" cca-go-loop-macro) (mark-macro! "clojure.core.async" "go-loop")
 (cca-def! "thread" cca-thread-macro)   (mark-macro! "clojure.core.async" "thread")
+
+;; A channel is opaque, but it should still name itself: without these it fell to
+;; the :object catch-all, so (class ch) was :object and pr printed #object[:object].
+;; The tag is what print-method's :jolt/chan method (50-io.clj) dispatches on.
+(register-type-arm! async-chan? (lambda (x) (keyword "jolt" "chan")))
+(register-class-arm! async-chan?
+  (lambda (x) "clojure.core.async.impl.channels.ManyToManyChannel"))

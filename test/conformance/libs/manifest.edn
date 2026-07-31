@@ -1,0 +1,359 @@
+;; Recipes + recorded standings for replaying third-party libraries' own test
+;; suites on jolt. See README.md. Driven by run.clj (`make libconformance`).
+;;
+;; Path prefixes: bare = relative to the library's own root, "@x" = another
+;; library under the conformance-libraries checkout, "~x" = a first-party jolt
+;; library checked out beside this repo, "/x" = absolute.
+;;
+;; :expect is the tally last observed. The gate fails when pass drops or
+;; fail/error/load-fail rise; it reports BETTER (not a failure) when pass rises,
+;; so improving a library is a manifest edit away. :note records why a non-zero
+;; fail/error count is expected — a host-model divergence, a missing JVM-only
+;; dependency, or a tracked bug.
+{:libs
+ [;; ---------------------------------------------------------- collections/util
+  {:name "medley"
+   :paths ["src" "test"]
+   :expect {:tests 55 :pass 293 :fail 0 :error 0}}
+
+  {:name "camel-snake-kebab"
+   :paths ["src" "test"]
+   :expect {:tests 5 :pass 163 :fail 0 :error 0}}
+
+  {:name "cuerdas"
+   :paths ["src" "test"]
+   ;; str/abbreviate formats through a Locale, which is jolt-lang/time's (RFC 0008)
+   :deps ["~time/src"]
+   ;; The two errors are java.text.BreakIterator, which abbreviate uses to find a
+   ;; word boundary. That is Unicode text segmentation (UAX #29) and jolt has no
+   ;; shim; an approximate one would quietly cut in the wrong place, so it stays
+   ;; absent and says so.
+   :expect {:tests 71 :pass 298 :fail 0 :error 2}}
+
+  {:name "dependency"
+   :paths ["src" "test"]
+   :expect {:tests 9 :pass 40 :fail 0 :error 0}}
+
+  {:name "ordered"
+   :paths ["src" "test"]
+   :exclude-nses ["flatland.ordered.performance-test"]
+   :expect {:tests 25 :pass 129 :fail 0 :error 0}}
+
+  {:name "text-diff"
+   :paths ["src" "test"]
+   :expect {:tests 11 :pass 29 :fail 0 :error 0}}
+
+  {:name "math.combinatorics"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :expect {:tests 18 :pass 1193 :fail 0 :error 0}}
+
+  {:name "data.priority-map"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :expect {:tests 4 :pass 142 :fail 0 :error 0}}
+
+  {:name "core.cache"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :deps ["@data.priority-map/src/main/clojure"]
+   :expect {:tests 23 :pass 1314 :fail 0 :error 0}}
+
+  {:name "core.memoize"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :deps ["@core.cache/src/main/clojure" "@data.priority-map/src/main/clojure"]
+   :expect {:tests 18 :pass 207 :fail 0 :error 0}}
+
+  ;; ---------------------------------------------------------- language / meta
+  {:name "tools.macro"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :expect {:tests 4 :pass 14 :fail 0 :error 0}}
+
+  {:name "algo.monads"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :deps ["@tools.macro/src/main/clojure"]
+   :expect {:tests 11 :pass 28 :fail 0 :error 0}}
+
+  {:name "core.match"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   ;; both suites match on the result of JVM reflection (.getReturnType, java.lang.Void)
+   :exclude-nses ["clojure.core.match.test.java" "clojure.core.match.test.date"]
+   :expect {:tests 118 :pass 153 :fail 0 :error 0}}
+
+  {:name "core.logic"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   ;; the load-fail is clojure.core.logic.nominal, which extends the pretty printer
+   ;; with (. pp/simple-dispatch addMethod …) — jolt's dispatch fns are plain
+   ;; functions rather than multimethods, tracked in jolt-v5fh.16. The 3 fails are
+   ;; reification ORDER for != and treec: the constraint set is identical, the
+   ;; rendering walks a set, and set order is a host difference.
+   :expect {:tests 405 :pass 549 :fail 3 :error 0 :load-fail 1}}
+
+  {:name "core.contracts"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :extra-deps {org.clojure/core.unify {:mvn/version "0.5.7"}}
+   :expect {:tests 14 :pass 45 :fail 0 :error 0}}
+
+  {:name "tools.reader"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   ;; the 3 fails are the syntax-quote reader-model divergence (a quoted
+   ;; syntax-quote is data on the JVM, a form on jolt); see known-divergences.edn
+   :expect {:tests 50 :pass 884 :fail 3 :error 0}}
+
+  {:name "tools.namespace"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   ;; the remaining error is a test that builds a symlink through java.lang.reflect
+   ;; — Class/forName of an interface, make-array of it, then getMethod/invoke.
+   ;; That is the reflection API proper, which jolt does not have.
+   :expect {:tests 26 :pass 61 :fail 0 :error 1}}
+
+  {:name "rewrite-clj"
+   :paths ["src" "resources" "test"]
+   :deps ["@tools.reader/src/main/clojure" "@test.check/src/main/clojure"]
+   :expect {:tests 162 :pass 3380 :fail 0 :error 0}}
+
+  ;; ---------------------------------------------------------- spec + testing
+  {:name "spec.alpha"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   ;; s/exercise generates through test.check
+   :deps ["@test.check/src/main/clojure"]
+   ;; the 4 fails are instrument's ::caller, which spec reads off the JVM stack
+   ;; trace. jolt does tail calls, so the calling frame is gone before anything can
+   ;; look — the conform failure still throws with the same explain-data, it just
+   ;; carries no ::caller. See known-divergences.edn.
+   :expect {:tests 13 :pass 170 :fail 4 :error 0}}
+
+  {:name "test.check"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :deps ["@spec.alpha/src/main/clojure"]
+   :timeout 900
+   ;; property-based: the assertion count moves with the generated cases
+   :tolerance 40
+   :expect {:tests 123 :pass 230 :fail 15 :error 3}}
+
+  {:name "test.chuck"
+   ;; resources/ holds the regex grammar its parser slurps through io/resource
+   :paths ["src" "test" "resources"]
+   :deps ["@test.check/src/main/clojure" "@spec.alpha/src/main/clojure"]
+   :extra-deps {instaparse/instaparse {:mvn/version "1.5.0"}}
+   :timeout 900
+   ;; property-based: the assertion count moves with the generated cases
+   :tolerance 30
+   ;; regexes-test drives test.chuck's own regex parser against re-pattern over
+   ;; generated patterns, so its residue is regex-engine differences (jolt's is
+   ;; irregex behind a Java-ish front end) plus one instaparse divergence: a parse
+   ;; FAILURE surfaces here as "nth not supported on this type" instead of the
+   ;; ExceptionInfo the JVM raises. Tracked in jolt-v5fh.15. The remaining load-fail
+   ;; is clj-time, which needs joda-time.
+   :expect {:tests 39 :pass 73 :fail 35 :error 16 :load-fail 1}}
+
+  ;; ---------------------------------------------------------- data formats
+  {:name "data.csv"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :expect {:tests 4 :pass 26 :fail 0 :error 0}}
+
+  {:name "data.codec"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :deps ["@test.check/src/main/clojure" "@spec.alpha/src/main/clojure"]
+   ;; The suite checks jolt's base64 against commons-codec's and against the
+   ;; clojure.lang.IFn$OLLOL primitive interfaces — neither exists here, so the
+   ;; comparison assertions cannot run. data.codec itself is exercised by the
+   ;; assertions that do not reach for them.
+   :note "commons-codec + IFn$O..O primitive interfaces are JVM-only"
+   :expect {:tests 14 :pass 1 :fail 2 :error 11}}
+
+  {:name "data.json"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   ;; json-gen-test round-trips through stest/check, which generates via test.check
+   :deps ["~time/src" "@spec.alpha/src/main/clojure" "@test.check/src/main/clojure"]
+   :timeout 900
+   ;; The residue is one case in each of the two APIs: an astral character. jolt
+   ;; strings are codepoint-indexed, so .charAt hands data.json's escaper a value
+   ;; above 0xFFFF where the JVM hands it a surrogate — the escape comes out
+   ;; \u1f603 rather than the \ud83d\ude03 pair, and the unescaped path throws
+   ;; out of (char cp). :string-model, see known-divergences.edn.
+   :expect {:tests 244 :pass 320 :fail 2 :error 2}}
+
+  {:name "data.zip"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   :deps ["~xml/src"]
+   :expect {:tests 9 :pass 12 :fail 0 :error 0}}
+
+  {:name "yamlstar"
+   :root "yamlstar/core"
+   :paths ["src" "test"]
+   :deps ["~time/src"]
+   :expect {:tests 44 :pass 103 :fail 0 :error 0}}
+
+  ;; ---------------------------------------------------------- markup / text
+  {:name "hiccup"
+   :paths ["src" "test"]
+   :expect {:tests 64 :pass 385 :fail 1 :error 0}}
+
+  {:name "markdown-clj"
+   :paths ["src/clj" "src/cljc" "test"]
+   :exclude-nses ["markdown.benchmark"]
+   ;; NOT a clean upstream checkout: this one carries a jolt-specific edit stubbing
+   ;; out its yaml metadata parser, so one of the three errors is that stub and not
+   ;; a jolt result. Tracked in jolt-v5fh.17 — re-clone and put jolt-lang/yaml on,
+   ;; which supplies clj-yaml.core. The other two are commons-lang, a JVM jar.
+   :expect {:tests 94 :pass 177 :fail 0 :error 3}}
+
+  {:name "Selmer"
+   :paths ["src" "test" "resources"]
+   ;; jolt-crypto supplies java.security.MessageDigest, which the hash: filter
+   ;; calls — the JVM has it built in, jolt gets it from the library. It goes on as
+   ;; a real dependency, not a source path, so its :jolt/native libcrypto is loaded.
+   :deps ["@data.json/src/main/clojure" "~time/src"]
+   :local-deps ["~jolt-crypto"]
+   :exclude-nses ["selmer.benchmark"]
+   ;; The remaining failures are the date filter's LOCALE-dependent styles
+   ;; ({{d|date:shortDate:zh}}, :fr month names): jolt-lang/time formats in one
+   ;; fixed locale, so those render US-style. A jolt-lang/time gap, not core.
+   :expect {:tests 131 :pass 492 :fail 24 :error 7}}
+
+  {:name "html"
+   :paths ["src" "test"]
+   :expect {:tests 2 :pass 35 :fail 0 :error 0}}
+
+  ;; ---------------------------------------------------------- data / config
+  {:name "honeysql"
+   :paths ["src" "test"]
+   :deps ["~time/src" "@core.cache/src/main/clojure"
+          "@data.priority-map/src/main/clojure"]
+   :expect {:tests 175 :pass 832 :fail 0 :error 0}}
+
+  {:name "config"
+   :paths ["src" "test"]
+   :expect {:tests 3 :pass 8 :fail 0 :error 0}}
+
+  {:name "aero"
+   :paths ["src" "test"]
+   :expect {:tests 28 :pass 59 :fail 0 :error 0}}
+
+  {:name "malli"
+   :paths ["src" "resources" "test"]
+   :deps ["~time/src" "@spec.alpha/src/main/clojure"
+          "@test.check/src/main/clojure" "@spec-tools/src"
+          "@test.chuck/src" "@ordered/src"]
+   ;; malli's own deps, from the upstream deps.edn; jolt resolves the source out
+   ;; of the Maven jars.
+   :extra-deps {borkdude/dynaload {:mvn/version "0.3.5"}
+                borkdude/edamame {:mvn/version "1.5.37"}
+                fipp/fipp {:mvn/version "0.6.29"}
+                mvxcvi/arrangement {:mvn/version "2.1.0"}}
+   :timeout 900
+   :expect {:tests 28 :pass 121 :fail 4 :error 8 :load-fail 20}}
+
+  ;; ---------------------------------------------------------- web
+  {:name "ring-codec"
+   :paths ["src" "test"]
+   :expect {:tests 9 :pass 72 :fail 0 :error 0}}
+
+  {:name "ring-core"
+   :root "ring"
+   ;; the suite reads test/ring/assets/… relative to the module, not the repo root
+   :dir "ring-core"
+   :paths ["ring-core/src" "ring-core-protocols/src" "ring-websocket-protocols/src"
+           "ring-core/test"]
+   :test-paths ["ring-core/test"]
+   :deps ["@ring-codec/src" "~time/src"]
+   :local-deps ["~jolt-crypto"]
+   :extra-deps {crypto-random/crypto-random {:mvn/version "1.2.1"}
+                crypto-equality/crypto-equality {:mvn/version "1.0.1"}}
+   ;; The two session/cookie suites are written against clj-time, which is Joda —
+   ;; a JVM library with no jolt equivalent. The multipart suites need Apache
+   ;; commons-fileupload and commons-io; both are JVM-only too.
+   :note "clj-time (Joda) + commons-fileupload/commons-io are JVM-only"
+   :expect {:tests 151 :pass 405 :fail 15 :error 18 :load-fail 2}}
+
+  {:name "ring-spec"
+   :paths ["src" "test"]
+   :deps ["@spec.alpha/src/main/clojure" "@ring/ring-core-protocols/src"]
+   ;; ring-spec's only test is the lein template placeholder, (is (= 0 1)) under a
+   ;; "FIXME, I fail." — it fails on the JVM too. The library itself loads, which is
+   ;; what running it here checks.
+   :note "the single failure is upstream's unedited template test"
+   :expect {:tests 1 :pass 0 :fail 1 :error 0}}
+
+  {:name "reitit-core"
+   :root "reitit"
+   :paths ["modules/reitit-core/src" "test/cljc"]
+   :test-paths ["test/cljc"]
+   :deps ["~router/src" "@spec.alpha/src/main/clojure"]
+   :extra-deps {meta-merge/meta-merge {:mvn/version "1.0.0"}}
+   ;; test/cljc holds the suites for every reitit module; these are the ones that
+   ;; need reitit-core alone (the rest pull reitit-ring / -malli / muuntaja /
+   ;; jsonista, which are not in the checkout).
+   :nses ["reitit.core-test" "reitit.impl-test" "reitit.trie-test"
+          "reitit.spec-test"]
+   ;; reitit's fast router is built on reitit.Trie, a compiled Java class. jolt-lang/
+   ;; router reimplements that trie in Clojure and registers it as the reitit.Trie
+   ;; host class, which is how reitit-core runs here unmodified — but only if it is
+   ;; loaded before reitit builds a router.
+   :preload ["reitit.trie-jolt"]
+   :expect {:tests 27 :pass 615 :fail 0 :error 0}}
+
+  ;; ---------------------------------------------------------- tooling
+  {:name "compliment"
+   :paths ["src" "test"]
+   :extra-deps {nubank/matcher-combinators {:mvn/version "3.9.2"}}
+   ;; Reflection-backed sources (class members, classes, resources) and classpath
+   ;; enumeration do not apply to jolt's host model, and t-core/t-vars pin exact
+   ;; candidate lists that jolt's different clojure.core surface changes — see the
+   ;; library's own CONFORMANCE.md. These are the host-neutral suites.
+   :nses ["compliment.t-context" "compliment.sources.t-special-forms"
+          "compliment.sources.t-local-bindings" "compliment.sources.t-keywords"
+          "compliment.sources.t-data-readers"]
+   ;; completions reflect the live runtime (interned keywords, loaded namespaces),
+   ;; so the assertion count moves with suite order
+   :tolerance 10
+   :expect {:tests 7 :pass 65 :fail 0 :error 0}}
+
+  {:name "lasertag"
+   :paths ["src" "test"]
+   :deps ["~time/src"]
+   ;; lasertag classifies a value by its class, so every failure here is jolt's class
+   ;; model rather than a behavioral difference: the narrow numeric classes collapse
+   ;; to Long/Double (:integer-box-model), the specialized seq classes to
+   ;; PersistentList/LazySeq (:seq-type-model), and subvec has no class of its own —
+   ;; which lasertag derives from a sample value, so it reads every vector as a
+   ;; subvec. All recorded in known-divergences.edn.
+   :expect {:tests 58 :pass 46 :fail 12 :error 0}}
+
+  {:name "tools.logging"
+   :paths ["src/main/clojure" "src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   ;; test-impl pins the log4j2 backend, which needs the org.apache.logging.log4j jars
+   :exclude-nses ["clojure.tools.logging.test-impl"]
+   :expect {:tests 67 :pass 219 :fail 0 :error 4}}
+
+  ;; ---------------------------------------------------------- time
+  {:name "tick"
+   :paths ["src" "test"]
+   :deps ["~time/src" "@spec.alpha/src/main/clojure"]
+   :expect {:tests 41 :pass 620 :fail 0 :error 0 :load-fail 1}}
+
+  ;; ---------------------------------------------------------- skipped
+  {:name "process"
+   :skip "babashka.process is vendored (vendor/process); covered by `make smoke`"}
+
+  {:name "core.typed"
+   :skip "needs the JVM (asm, tools.analyzer.jvm); not a conformance target"}
+
+  {:name "ansatz"
+   :skip "kernel is Java; not a conformance target"}]}

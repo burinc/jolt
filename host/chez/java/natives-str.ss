@@ -41,7 +41,16 @@
                   (string-set! r j (ascii-down-char (string-ref s j)))))
               (check (fx+ i 1)))))))
 
-;; --- ASCII trim: drop leading/trailing chars with code <= space (JVM .trim) ---
+;; Two different notions of whitespace, and the JVM uses both. String.trim drops
+;; anything at or below the space character; clojure.string/trim drops whatever
+;; Character.isWhitespace accepts, which reaches the Unicode space separators
+;; (U+3000 and friends) but NOT the non-breaking ones. Keep them apart: str-trim
+;; is String.trim, str-triml / str-trimr / str-trim* back clojure.string.
+(define (java-whitespace? c)
+  (and (char-whitespace? c)
+       (let ((cp (char->integer c)))
+         (not (or (fx=? cp #xA0) (fx=? cp #x2007) (fx=? cp #x202F))))))
+
 (define (str-trim s)
   (let ((len (string-length s)))
     (let scan-l ((i 0))
@@ -55,13 +64,14 @@
   (let ((len (string-length s)))
     (let loop ((i 0))
       (cond ((fx=? i len) "")
-            ((char<=? (string-ref s i) #\space) (loop (fx+ i 1)))
+            ((java-whitespace? (string-ref s i)) (loop (fx+ i 1)))
             (else (substring s i len))))))
 (define (str-trimr s)
   (let loop ((j (fx- (string-length s) 1)))
     (cond ((fx<? j 0) "")
-          ((char<=? (string-ref s j) #\space) (loop (fx- j 1)))
+          ((java-whitespace? (string-ref s j)) (loop (fx- j 1)))
           (else (substring s 0 (fx+ j 1))))))
+(define (str-trim* s) (str-trimr (str-triml s)))
 
 ;; --- substring search: first index of `needle` in `s` at/after `from`, or -1 --
 (define (char-by-char-match? s si needle nlen)
@@ -117,33 +127,94 @@
   (let loop ((p (reverse parts)))
     (if (and (pair? p) (string=? (car p) "")) (loop (cdr p)) (reverse p))))
 
+;; --- charsets Chez has no codec for, through the system iconv ----------------
+;; Chez encodes UTF-8/16/32 and the two single-byte Latin sets. Everything else a
+;; caller can name — Shift_JIS, EUC-JP, windows-1252, KOI8-R — needs real tables,
+;; and libc already carries them, so ask iconv rather than shipping our own. Where
+;; iconv is missing (Windows) these are #f and the caller reports
+;; UnsupportedEncodingException, which is what the JVM throws for a charset it
+;; does not have. Silently returning UTF-8 bytes, as this used to, left the caller
+;; no way to tell it had asked for something the host could not do.
+(define c-iconv-open  (jolt-foreign-proc-safe "iconv_open" '(string string) 'void*))
+(define c-iconv-conv  (jolt-foreign-proc-safe "iconv" '(void* void* void* void* void*) 'size_t))
+(define c-iconv-close (jolt-foreign-proc-safe "iconv_close" '(void*) 'int))
+(define iconv-size-max (- (expt 2 (* 8 (foreign-sizeof 'size_t))) 1))
+
+;; iconv_open, or #f when the host has no such charset. The descriptor must be
+;; closed by the caller.
+(define (iconv-open-cd from to)
+  (and c-iconv-open
+       (guard (e (#t #f))
+         (let ((cd (c-iconv-open to from)))
+           (and (not (= cd iconv-size-max)) (not (= cd 0)) cd)))))
+
+(define (iconv-known? name)
+  (let ((cd (iconv-open-cd "UTF-8" name)))
+    (and cd (begin (c-iconv-close cd) #t))))
+
+;; Convert bytes between two charsets, or #f if the host cannot. The four
+;; iconv arguments are pointers to a cursor pair, so they live in one 32-byte
+;; block at offsets 0/8/16/24: in pointer, in remaining, out pointer, out
+;; remaining. Worst case a byte grows to four (UTF-32), plus room for a BOM.
+(define (iconv-bytes bv from to)
+  (and c-iconv-conv c-iconv-close
+       (let ((cd (iconv-open-cd from to)))
+         (and cd
+              (let* ((inlen (bytevector-length bv))
+                     (outcap (+ 32 (* 4 (max inlen 1))))
+                     (inbuf (foreign-alloc (max inlen 1)))
+                     (outbuf (foreign-alloc outcap))
+                     (cells (foreign-alloc 32))
+                     (result
+                      (guard (e (#t #f))
+                        (do ((i 0 (+ i 1))) ((= i inlen))
+                          (foreign-set! 'unsigned-8 inbuf i (bytevector-u8-ref bv i)))
+                        (foreign-set! 'void* cells 0 inbuf)
+                        (foreign-set! 'unsigned-64 cells 8 inlen)
+                        (foreign-set! 'void* cells 16 outbuf)
+                        (foreign-set! 'unsigned-64 cells 24 outcap)
+                        (and (not (= iconv-size-max
+                                     (c-iconv-conv cd cells (+ cells 8) (+ cells 16) (+ cells 24))))
+                             (let* ((n (- outcap (foreign-ref 'unsigned-64 cells 24)))
+                                    (out (make-bytevector n)))
+                               (do ((i 0 (+ i 1))) ((= i n) out)
+                                 (bytevector-u8-set! out i (foreign-ref 'unsigned-8 outbuf i))))))))
+                (foreign-free inbuf) (foreign-free outbuf) (foreign-free cells)
+                (c-iconv-close cd)
+                result)))))
+
+(define (unsupported-encoding-throw name)
+  (jolt-throw (jolt-host-throwable "java.io.UnsupportedEncodingException" name)))
+
 ;; Encode a string to bytes (a bytevector) under a named charset. UTF-8 default;
 ;; ISO-8859-1/US-ASCII are one byte per char; UTF-16/UTF-32 via Chez's codecs
-;; (plain "UTF-16" emits a big-endian BOM then BE, matching the JVM). Names are
-;; canonicalized first, so any JVM alias works. Shared by .getBytes and
-;; decode-bytevector (String.).
+;; (plain "UTF-16" emits a big-endian BOM then BE, matching the JVM); anything
+;; else through iconv. Names are canonicalized first, so any JVM alias works.
+;; Shared by .getBytes and decode-bytevector (String.).
 (define (charset-encode-bv s csname)
   ;; through charset-canonical-down (host-static-classes.ss), so every JVM alias
   ;; the Charset table knows resolves here too — (.getBytes s "l1") used to fall
   ;; past this cond's partial list and silently return UTF-8 bytes.
-  (let ((cs (charset-canonical-down (charset-arg-name csname))))
-    (cond
-      ((string=? cs "utf-8") (string->utf8 s))
-      ((member cs '("iso-8859-1" "us-ascii"))
-       (let* ((n (string-length s)) (bv (make-bytevector n)))
-         (do ((i 0 (+ i 1))) ((= i n) bv)
-           (bytevector-u8-set! bv i (bitwise-and (char->integer (string-ref s i)) #xff)))))
-      ((string=? cs "utf-16be") (string->utf16 s (endianness big)))
-      ((string=? cs "utf-16le") (string->utf16 s (endianness little)))
-      ((string=? cs "utf-16")
-       (let ((be (string->utf16 s (endianness big))))
-         (let* ((n (bytevector-length be)) (bv (make-bytevector (+ n 2))))
-           (bytevector-u8-set! bv 0 #xfe) (bytevector-u8-set! bv 1 #xff)
-           (bytevector-copy! be 0 bv 2 n) bv)))
-      ((or (string=? cs "utf-32be") (string=? cs "utf-32"))
-       (string->utf32 s (endianness big)))
-      ((string=? cs "utf-32le") (string->utf32 s (endianness little)))
-      (else (string->utf8 s)))))
+  (let ((name (charset-arg-name csname)))
+    (let ((cs (charset-canonical-down name)))
+      (cond
+        ((string=? cs "utf-8") (string->utf8 s))
+        ((member cs '("iso-8859-1" "us-ascii"))
+         (let* ((n (string-length s)) (bv (make-bytevector n)))
+           (do ((i 0 (+ i 1))) ((= i n) bv)
+             (bytevector-u8-set! bv i (bitwise-and (char->integer (string-ref s i)) #xff)))))
+        ((string=? cs "utf-16be") (string->utf16 s (endianness big)))
+        ((string=? cs "utf-16le") (string->utf16 s (endianness little)))
+        ((string=? cs "utf-16")
+         (let ((be (string->utf16 s (endianness big))))
+           (let* ((n (bytevector-length be)) (bv (make-bytevector (+ n 2))))
+             (bytevector-u8-set! bv 0 #xfe) (bytevector-u8-set! bv 1 #xff)
+             (bytevector-copy! be 0 bv 2 n) bv)))
+        ((or (string=? cs "utf-32be") (string=? cs "utf-32"))
+         (string->utf32 s (endianness big)))
+        ((string=? cs "utf-32le") (string->utf32 s (endianness little)))
+        (else (or (iconv-bytes (string->utf8 s) "UTF-8" name)
+                  (unsupported-encoding-throw name)))))))
 
 ;; Object.hashCode parity: Java's specified String hash and Clojure's Symbol hash
 ;; (Util.hashCombine), so (.hashCode s) / (.hashCode sym) match the JVM. 32-bit int.
@@ -169,8 +240,8 @@
   (cond
     ((string=? method "toString") s)
     ((string=? method "hashCode") (java-string-hash s))
-    ((string=? method "toLowerCase") (ascii-string-down s))
-    ((string=? method "toUpperCase") (ascii-string-up s))
+    ((string=? method "toLowerCase") (string-downcase s))
+    ((string=? method "toUpperCase") (string-upcase s))
     ((string=? method "trim") (str-trim s))
     ((string=? method "length") (string-length s))   ; exact int (= JVM)
     ((string=? method "isEmpty") (fx=? (string-length s) 0))
@@ -260,7 +331,7 @@
 
 ;; (string/split sep s) -> parts, splitting on each non-overlapping sep.
 (define (str-literal-split s sep)
-  (let ((slen (string-length s)) (plen (string-length sep)))
+  (let ((slen (string-length (jolt-need-str s))) (plen (string-length sep)))
     (if (fx=? plen 0)
         (map string (string->list s))
         (let loop ((i 0) (start 0) (acc '()))
@@ -270,8 +341,13 @@
                  (loop (fx+ i plen) (fx+ i plen) (cons (substring s start i) acc)))
                 (else (loop (fx+ i 1) start acc)))))))
 
-(define (str-upper s) (ascii-string-up s))
-(define (str-lower s) (ascii-string-down s))
+;; clojure.string/upper-case and lower-case, and String's toUpperCase /
+;; toLowerCase, map the whole of Unicode on the JVM — Cyrillic, Greek and the
+;; accented Latin ranges included. Chez's own case mappings are the Unicode ones,
+;; so use them; the ASCII pair above stays for the places that mean ASCII (a
+;; charset name, a header key) and must not fold a non-ASCII character.
+(define (str-upper s) (string-upcase s))
+(define (str-lower s) (string-downcase s))
 (define (str-reverse-b s) (list->string (reverse (string->list s))))
 
 ;; (str-find needle haystack) -> exact int index of first occurrence, or nil.
@@ -291,11 +367,12 @@
 ;; The clojure.string.clj split wrapper
 ;; layers the trailing-empty trim on top.
 (define (re-split irx s limit)
-  (let ((len (string-length s)))
+  (let* ((s (jolt-need-str s))
+         (len (string-length s)))
     (let loop ((start 0) (last 0) (out '()))
       (if (and limit (fx>=? (length out) (fx- limit 1)))
           (reverse (cons (substring s last len) out))
-          (let ((m (and (fx<=? start len) (irregex-search irx s start))))
+          (let ((m (and (fx<=? start len) (irx-search-from irx s start))))
             (if (not m)
                 (reverse (cons (substring s last len) out))
                 (let ((ms (irregex-match-start-index m 0))
@@ -366,7 +443,7 @@
 (define (re-replace irx s replacement all?)
   (let ((len (string-length s)))
     (let loop ((start 0) (last 0) (acc '()))
-      (let ((m (and (fx<=? start len) (irregex-search irx s start))))
+      (let ((m (and (fx<=? start len) (irx-search-from irx s start))))
         (if (not m)
             (apply string-append (reverse (cons (substring s last len) acc)))
             (let ((ms (irregex-match-start-index m 0))
@@ -399,7 +476,9 @@
 
 (def-var! "clojure.core" "str-upper" str-upper)
 (def-var! "clojure.core" "str-lower" str-lower)
-(def-var! "clojure.core" "str-trim" str-trim)
+;; the var backs clojure.string/trim and blank?, so it is the isWhitespace rule;
+;; String.trim reaches the <= space one directly.
+(def-var! "clojure.core" "str-trim" str-trim*)
 (def-var! "clojure.core" "str-triml" str-triml)
 (def-var! "clojure.core" "str-trimr" str-trimr)
 (def-var! "clojure.core" "str-find" str-find)

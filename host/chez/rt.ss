@@ -140,13 +140,13 @@
       "dev"))
 
 ;; --- rt arithmetic / logic shims (named in the emitter's native-ops) ----------
-(define (jolt-inc x) (+ x 1))
-(define (jolt-dec x) (- x 1))
-;; Coerce a ^long-hinted argument to a fixnum at fn entry, the way the JVM's
-;; longCast coerces a primitive-long parameter: truncate a flonum toward zero,
-;; pass an exact integer through, error if it doesn't fit a fixnum or isn't a
-;; number. The hint is a promise the value is a fixnum-range long; the body's fx*
-;; ops rely on it. (^double params coerce with the built-in exact->inexact.)
+(define (jolt-inc x) (+ (jolt-need-num x) 1))
+(define (jolt-dec x) (- (jolt-need-num x) 1))
+;; longCast/doubleCast coerce a primitive-hinted parameter or return: ^long
+;; truncates a flonum toward zero and passes an exact integer through, ^double
+;; widens any number. The hint is a promise the body's fx*/fl* ops rely on, so a
+;; value outside the tower is the JVM's cast failure (ClassCastException, or NPE
+;; for nil) — a raw host error would escape with no class for a catch to select.
 ;; A ^long is a 64-bit value; a Chez fixnum is only 61-bit, so a value that
 ;; overflows the fixnum range (a full-width long, e.g. from unchecked / wrapping
 ;; arithmetic) passes through as an exact integer rather than erroring. fx ops in
@@ -157,7 +157,11 @@
         ((and (number? x) (exact? x) (integer? x)) x)
         ((flonum? x) (exact (truncate x)))
         ((rational? x) (exact (truncate x)))
-        (else (error 'jolt "^long hint: not a number" x))))
+        (else (jolt-num-cast-throw x))))
+(define (jolt->fl x)
+  (cond ((flonum? x) x)
+        ((number? x) (exact->inexact x))
+        (else (jolt-num-cast-throw x))))
 ;; jolt `not`: only nil and false are falsey.
 (define (jolt-not x) (if (jolt-truthy? x) #f #t))
 

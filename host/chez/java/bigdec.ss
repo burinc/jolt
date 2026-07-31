@@ -479,3 +479,26 @@
 (register-class-arm! jbigdec? (lambda (x) "java.math.BigDecimal"))
 (register-num-arm! 'decimal? (lambda (prev) (lambda (x) (or (jbigdec? x) (prev x)))))
 (def-var! "clojure.core" "decimal?" jolt-decimal?)
+
+;; --- java.math.BigDecimal as a host class -----------------------------------
+;; The bigdec VALUE model above is complete (literals, arithmetic, class, hash);
+;; what was missing is the class itself as a construction target. Clojure code
+;; that wants an exact scale writes (BigDecimal. "1.50") rather than calling
+;; bigdec — tools.reader's own number reader does, which is why reading "1M"
+;; through it failed with "No matching ctor found for class BigDecimal".
+;; A trailing MathContext argument is accepted and ignored: rounding here follows
+;; *math-context*, as everywhere else in this file.
+(define (jbd-class-ctor x . _)
+  (if (string? x)
+      (jolt-bigdec-from-string x)
+      (jolt-bigdec x)))
+(define jbd-class-statics
+  (list (cons "valueOf" (lambda (x . _) (jolt-bigdec x)))
+        (cons "ZERO" (jolt-bigdec-from-string "0"))
+        (cons "ONE" (jolt-bigdec-from-string "1"))
+        (cons "TEN" (jolt-bigdec-from-string "10"))))
+(for-each
+  (lambda (n)
+    (register-class-ctor! n jbd-class-ctor)
+    (register-class-statics! n jbd-class-statics))
+  '("BigDecimal" "java.math.BigDecimal"))

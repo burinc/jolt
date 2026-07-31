@@ -8,13 +8,25 @@
 ;; java.lang.Math: sqrt/pow/floor/ceil/trig/log/exp always return a DOUBLE on the
 ;; JVM (Chez's sqrt/expt return EXACT for exact args, e.g. (sqrt 9) -> 3), so coerce
 ;; to flonum. round -> long (exact); abs/max/min preserve the argument's type.
-(define (->dbl x) (exact->inexact x))
+(define (->dbl x) (exact->inexact (jolt-need-num x)))
 ;; a complex result (Chez extends sqrt/expt/log/asin/acos and log's kin onto the
 ;; complex plane for out-of-domain real inputs) becomes +nan.0, matching Java;
 ;; real results stay flonums, NaN/Inf pass through. real? is #f on a Chez complex.
 (define (real-or-nan x) (if (and (number? x) (real? x)) (exact->inexact x) +nan.0))
 (define math-pi (acos -1.0))
+;; Every Math method takes numbers (PI/E are values, not methods), and each one
+;; hands its argument to a Chez numeric primitive. Check at the boundary: the
+;; condition Chez raises for a wrong-typed operand carries no class, so it would
+;; escape as #object[:object] with no catch clause able to select it. The hot path
+;; does not come through here — a Math call over proven flonums lowers to a native
+;; Chez flonum op (jolt.passes.numeric).
+(define (math-checked entry)
+  (let ((f (cdr entry)))
+    (if (procedure? f)
+        (cons (car entry) (lambda args (apply f (map jolt-need-num args))))
+        entry)))
 (register-class-statics! "Math"
+  (map math-checked
   (list (cons "sqrt" (lambda (x) (real-or-nan (sqrt x))))
         ;; cbrt/log10 (and hypot/expm1/log1p below) share the clojure.math impls
         ;; in math.ss (loaded after; the lambda bodies resolve at call time) so
@@ -71,7 +83,7 @@
         (cons "max" (lambda (a b) (if (> a b) a b))) (cons "min" (lambda (a b) (if (< a b) a b)))
         (cons "signum" (lambda (x) (cond ((< x 0) -1.0) ((> x 0) 1.0) (else 0.0))))
         (cons "PI" (->dbl (* 4 (atan 1)))) (cons "E" (->dbl (exp 1)))
-        (cons "random" (lambda args (random 1.0)))))
+        (cons "random" (lambda args (random 1.0))))))
 
 ;; Thread: real OS threads back futures/promises.
 ;;  - sleep parks the calling thread for `ms` ms (a worker sleeping doesn't block
@@ -84,10 +96,23 @@
 ;; Per-thread interrupt flag, lazily allocated so each OS thread gets its own box.
 ;; A thread handle (from currentThread) captures this box, so .interrupt from
 ;; another thread sets the target thread's flag.
-(define thread-interrupt-box (make-thread-parameter #f))
+;;
+;; The cell carries the owning thread's id, because a Chez thread parameter is
+;; INHERITED: a forked thread starts with the creating thread's value. A plain
+;; (make-thread-parameter #f) therefore handed a child its PARENT's box — so
+;; interrupting the child set the parent's flag, and the monitor-ownership check in
+;; concurrency.ss saw a child as holding a lock the parent had taken. Comparing the
+;; stored id against (get-thread-id) makes an inherited cell miss, so the child
+;; allocates its own box on first use; no global table, so no per-thread leak.
+(define thread-interrupt-cell (make-thread-parameter #f))   ; (thread-id . box)
 (define (current-interrupt-box)
-  (or (thread-interrupt-box)
-      (let ((b (box #f))) (thread-interrupt-box b) b)))
+  (let ((c (thread-interrupt-cell))
+        (id (get-thread-id)))
+    (if (and (pair? c) (eqv? (car c) id))
+        (cdr c)
+        (let ((b (box #f)))
+          (thread-interrupt-cell (cons id b))
+          b))))
 (define (clear-thread-interrupt!) (set-box! (current-interrupt-box) #f))
 
 ;; libc sched_yield, resolved once; fall back to a zero-length park if the symbol
@@ -103,7 +128,7 @@
 
 (define thread-statics
   (list (cons "sleep" (lambda (ms . _)
-                        (let* ((ms* (exact (floor ms)))
+                        (let* ((ms* (exact (floor (jolt-need-num ms))))
                                (secs (quotient ms* 1000))
                                (nanos (* (remainder ms* 1000) 1000000)))
                           (sleep (make-time 'time-duration nanos secs)))
@@ -318,7 +343,11 @@
         (cons "toHexString" (lambda (x) (string-downcase (number->string (int->u32 (jnum->exact x)) 16))))
         (cons "toOctalString" (lambda (x) (number->string (int->u32 (jnum->exact x)) 8)))
         (cons "toBinaryString" (lambda (x) (number->string (int->u32 (jnum->exact x)) 2)))
-        (cons "toString" (lambda (x . r) (string-downcase (number->string (jnum->exact x) (if (null? r) 10 (jnum->exact (car r)))))))))
+        (cons "toString" (lambda (x . r) (string-downcase (number->string (jnum->exact x) (if (null? r) 10 (jnum->exact (car r)))))))
+        ;; Integer.max/min (Java 8): plain two-arg integer max/min, not clojure.core's
+        ;; variadic ones — orchard calls them.
+        (cons "max" (lambda (x y) (->num (max (jnum->exact x) (jnum->exact y)))))
+        (cons "min" (lambda (x y) (->num (min (jnum->exact x) (jnum->exact y)))))))
 
 ;; Byte / Short bounds (their values are plain integers on jolt; the statics let
 ;; libraries reference the JVM ranges — clojure.test.check generates over them).
@@ -355,9 +384,18 @@
         (cons "isInfinite" (lambda (x) (and (flonum? x) (infinite? x))))
         (cons "MAX_VALUE" 1.7976931348623157e308) (cons "MIN_VALUE" 4.9e-324)
         (cons "POSITIVE_INFINITY" +inf.0) (cons "NEGATIVE_INFINITY" -inf.0) (cons "NaN" +nan.0)))
+;; Float's bounds and specials are the float ones, not double's — data.json's
+;; suite round-trips them by name. jolt has one flonum type, so the values are
+;; doubles carrying the float magnitudes.
 (register-class-statics! "Float"
   (list (cons "TYPE" "float")
-        (cons "parseFloat" parse-double-or-throw) (cons "valueOf" ->double)))
+        (cons "parseFloat" parse-double-or-throw) (cons "valueOf" ->double)
+        (cons "toString" (lambda (x) (jolt-str-render-one (->double x))))
+        (cons "isNaN" (lambda (x) (and (flonum? x) (nan? x))))
+        (cons "isInfinite" (lambda (x) (and (flonum? x) (infinite? x))))
+        (cons "MAX_VALUE" 3.4028235e38) (cons "MIN_VALUE" 1.4e-45)
+        (cons "POSITIVE_INFINITY" +inf.0) (cons "NEGATIVE_INFINITY" -inf.0)
+        (cons "NaN" +nan.0)))
 
 ;; Character: ASCII predicates (the engine is byte/ASCII oriented).
 (register-class-statics! "java.lang.Character"
@@ -380,16 +418,49 @@
         ;; (U+00A0/U+2007/U+202F). char<=?space missed everything above ASCII.
         (cons "isWhitespace" (lambda (c) (let ((cp (char-code c)))
                                            (and (char-whitespace? (integer->char cp))
-                                                (not (fx=? cp #xA0)) (not (fx=? cp #x2007)) (not (fx=? cp #x202F))))))))
+                                                (not (fx=? cp #xA0)) (not (fx=? cp #x2007)) (not (fx=? cp #x202F))))))
+        ;; Codepoint bounds, as plain integers. The UTF-16 surrogate API
+        ;; (MIN_HIGH_SURROGATE, highSurrogate/lowSurrogate, toCodePoint, …) is
+        ;; deliberately absent: a surrogate is not a Unicode scalar value, so it is
+        ;; not representable as a char on this host — jolt strings are indexed by
+        ;; codepoint, and there are no surrogate halves to hand back.
+        (cons "MIN_VALUE" (integer->char 0))
+        (cons "MAX_VALUE" (integer->char #xFFFF))
+        (cons "MIN_CODE_POINT" (->num 0))
+        (cons "MAX_CODE_POINT" (->num #x10FFFF))
+        (cons "MIN_SUPPLEMENTARY_CODE_POINT" (->num #x10000))
+        (cons "charCount" (lambda (cp) (->num (if (>= (jnum->exact cp) #x10000) 2 1))))
+        ;; Character.codePointOf(name) is deliberately absent: it is a lookup in the
+        ;; Unicode character-name database, which this host does not carry, and a
+        ;; partial ASCII-only table would answer wrongly rather than not at all.
+        ))
 
 ;; String/valueOf(Object): "null" for nil, else jolt's str semantics.
 ;; String/format(fmt args…) / (locale fmt args…) -> the clojure.core format engine.
 (register-class-statics! "String"
   (list (cons "valueOf" (lambda (x . _) (if (jolt-nil? x) "null" (jolt-str-render-one x))))
+        ;; String.format(fmt, Object...) is called both ways in the wild: with the
+        ;; args spread, and with a single Object[] holding them (which is what the
+        ;; JVM's varargs actually compiles to, and what Selmer writes). Splat a lone
+        ;; array argument so both reach the same format engine. A leading Locale is
+        ;; accepted and ignored — formatting here is locale-independent.
+        ;; The leading argument is a Locale when it is not the format string —
+        ;; String.format(Locale, String, Object...) vs String.format(String,
+        ;; Object...). Testing for the core "locale" jhost tag alone missed the
+        ;; Locale jolt-lang/time installs (a tagged table), so (String/format
+        ;; (Locale/getDefault) "%.3f" args) took the table as the format string.
+        ;; Formatting here is locale-independent, so the locale is dropped either way.
         (cons "format" (lambda (a . rest)
-                         (if (and (jhost? a) (string=? (jhost-tag a) "locale"))
-                             (apply jolt-format (car rest) (cdr rest))
-                             (apply jolt-format a rest))))))
+                         (let* ((locale? (and (pair? rest) (not (string? a))))
+                                (fmt (if locale? (car rest) a))
+                                (args (if locale? (cdr rest) rest))
+                                ;; jolt-array? / ja->list live in natives-array.ss,
+                                ;; loaded after this file — resolved at call time.
+                                (args (if (and (pair? args) (null? (cdr args))
+                                               (jolt-array? (car args)))
+                                          (ja->list (jolt-array-vec (car args)))
+                                          args)))
+                           (apply jolt-format fmt args))))))
 
 ;; ---- java.text.NumberFormat -------------------------------------------------
 ;; A grouping decimal formatter (selmer number-format / cuerdas). state:
@@ -449,12 +520,25 @@
   (or (hashtable-ref class-statics-tbl nm #f)
       (hashtable-ref class-ctors-tbl nm #f)
       (hashtable-ref jvm-class-parents nm #f)))
+;; A namespace with a hyphen munges to an underscore in the package name, so a
+;; record defined in my-app.core is my_app.core.Foo on the JVM. jolt keeps the
+;; namespace as written, so a forName of the munged name has to demunge to find
+;; it — that is the name a library computes from (munge (str *ns*)), and it is how
+;; a #my_app.core.Foo[…] record literal names its class.
+(define (forname-demunged nm)
+  (and (let loop ((i 0))
+         (cond ((>= i (string-length nm)) #f)
+               ((char=? (string-ref nm i) #\_) #t)
+               (else (loop (+ i 1)))))
+       (let ((d (list->string (map (lambda (c) (if (char=? c #\_) #\- c)) (string->list nm)))))
+         (and (forname-known? d) d))))
 (register-class-statics! "Class"
   (list (cons "forName"
               (lambda (nm . _)
                 (cond
                   ((and (> (string-length nm) 0) (char=? (string-ref nm 0) #\[)) nm)
                   ((forname-known? nm) (make-class-obj nm))
+                  ((forname-demunged nm) => make-class-obj)
                   (else (jolt-throw (jolt-host-throwable "java.lang.ClassNotFoundException" nm))))))))
 
 ;; ---- System helpers (defined before use above via top-level order) ----------
@@ -487,7 +571,8 @@
   (let ((prev (hashtable-ref sys-prop-table k jolt-nil)))
     (hashtable-delete! sys-prop-table k) prev))
 (define (sys-get-property k . dflt)
-  (let ((set-val (hashtable-ref sys-prop-table k #f)))
+  (let* ((k (jolt-need-string k))
+         (set-val (hashtable-ref sys-prop-table k #f)))
     (cond (set-val set-val)
           ((string=? k "os.name") sys-os-name)
           ((string=? k "jolt.version") (jolt-version-string))
