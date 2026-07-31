@@ -66,6 +66,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entered in `known-divergences.edn` under `:integer-box-model`. `(bit-and b 0xff)`
   pins the width explicitly and is identical on both.
 
+- **`clojure.java.io/resource` returns a `java.net.URL`, like the JVM.** It returned a
+  `java.io.File`, which `io.ss` papered over by answering `getProtocol`/`getFile` on a
+  File. Callers that branch on the real type broke: Selmer's `render-file` does
+  `(instance? java.net.URL path)`, took the `:else` branch on a File, and died on
+  `(.startsWith ^File …)`. Both branches now return a URL — a `file:` URL for a hit on
+  a source root, a `jar:`-classed embedded resource (class `java.net.URL`) for a file
+  baked into a built binary — so the "same surface whichever branch served it"
+  invariant holds in `make test`, not only inside a built binary. The File URL-compat
+  kludge is gone; a File no longer answers URL methods, as on the JVM.
+
+  A URL is now a first-class source too: `slurp` / `io/reader` / `io/input-stream` /
+  `.openStream` read a `file:` URL's target (a non-file protocol raises, as the JVM
+  does, rather than returning empty content) and `io/file` strips the scheme. These
+  had to land before the return-type flip or the common `(slurp (io/resource …))`
+  idiom would throw.
+
 ### Added
 
 - **`jolt build` compiles the runtime half of its flat source once and keeps the

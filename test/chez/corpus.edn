@@ -764,6 +764,11 @@
   {:suite "interop / StringReader & StringBuilder" :label "createTempFile wants a prefix of at least three" :expected "\"Prefix string \\\"pw\\\" too short: length must be at least 3\"" :actual "(try (java.io.File/createTempFile \"pw\" \".txt\") (catch IllegalArgumentException e (ex-message e)))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "with-open closes shim" :expected "97" :actual "(with-open [r (StringReader. \"a\")] (.read r))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "File.toURL methods read it back" :expected "\"file:/tmp/x\"" :actual "(do (require (quote clojure.java.io)) (.toString (.toURL (clojure.java.io/file \"/tmp/x\"))))" :portability :jvm}
+  ;; io/resource returns a java.net.URL on the JVM (a jar: URL inside the artifact)
+  ;; and here too — a file: URL on a source root, a jar:-classed embedded-res from a
+  ;; built binary. Both branches class as java.net.URL. Assert shape, not the path:
+  ;; the JVM's jar: spec and our file: spec differ, and an absolute path is
+  ;; machine-dependent. instance? is what callers (Selmer) branch on.
   {:suite "interop / StringReader & StringBuilder" :label "vector :import shares deftype ctor" :expected "\"hi!\"" :actual "(do (ns spec.nodea) (defprotocol SpecP (spec-pm [this])) (deftype SpecTN [t] SpecP (spec-pm [this] (str t \"!\"))) (ns spec.nodeb (:import [spec.nodea SpecTN])) (.spec-pm (SpecTN. \"hi\")))" :portability :jvm}
   {:suite "interop / PushbackReader & parse statics" :label "PushbackReader read" :expected "[97 98]" :actual "(let [r (java.io.PushbackReader. (java.io.StringReader. \"ab\"))] [(.read r) (.read r)])" :portability :jvm}
   {:suite "interop / PushbackReader & parse statics" :label "unread pushes back" :expected "[97 97 98]" :actual "(let [r (PushbackReader. (StringReader. \"ab\")) a (.read r)] (.unread r a) [a (.read r) (.read r)])" :portability :jvm}

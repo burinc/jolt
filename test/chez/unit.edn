@@ -249,7 +249,20 @@
  ;; used to answer none of it, which made orchard.meta flap on .getPath.
  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getName (io/resource \"clojure/string.clj\")))" :expected "\"string.clj\""}
  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io]) (quote [clojure.string :as s])) (s/ends-with? (.getPath (io/resource \"clojure/string.clj\")) \"clojure/string.clj\"))" :expected "true"}
- {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (boolean (seq (str (io/resource \"clojure/string.clj\")))))" :expected "true"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (boolean (seq (str (io/resource \"clojure/string.clj\")))))" :expected "true"}
+  ;; io/resource returns a java.net.URL, like the JVM, and its content reads back.
+  ;; Not a corpus row: what RESOLVES differs by model — the JVM answers from the
+  ;; classpath (clojure/string.clj lives in a jar), jolt from its source roots, and
+  ;; the gate harness sets no roots at all, so any row naming an ambient resource
+  ;; crashes there. This one owns its root, so it depends on nothing external.
+  ;; Restores the roots in a finally: set-source-roots! is global, and leaving a
+  ;; temp dir as the only root breaks every later row that needs to require.
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/joltresunit\") prior (jolt.host/source-roots)] (.mkdirs (io/file d)) (spit (io/file d \"probe.txt\") \"hello\") (try (jolt.host/set-source-roots! [d]) (let [u (io/resource \"probe.txt\")] [(instance? java.net.URL u) (.getName (class u)) (slurp u) (io/resource \"absent.txt\")]) (finally (jolt.host/set-source-roots! prior)))))" :expected "[true \"java.net.URL\" \"hello\" nil]"}
+  ;; a file: URL is a first-class source — slurp / .openStream / io/reader /
+  ;; io/input-stream read its bytes (verified by content, not type) and io/file
+  ;; strips the scheme. All five must hold before io/resource can return a URL.
+  ;; Built against a temp file so nothing here depends on a machine path.
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [f (java.io.File/createTempFile \"joltres\" \".txt\")] (spit f \"hello\") (let [u (java.net.URL. (str \"file:\" (.getAbsolutePath f))) r (and (= \"hello\" (slurp u)) (= \"hello\" (slurp (.openStream u))) (= \"hello\" (slurp (io/reader u))) (= \"hello\" (slurp (io/input-stream u))) (= (.getAbsolutePath f) (str (io/file u))))] (.delete f) r)))" :expected "true"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getPath (.toURL (io/file \"/tmp/x\"))))" :expected "\"/tmp/x\""}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getAbsolutePath (io/file \"/a/b\")))" :expected "\"/a/b\""}
   {:suite "ioreader" :expr "(slurp (StringReader. \"a=1\"))" :expected "\"a=1\""}
