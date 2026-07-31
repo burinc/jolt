@@ -243,17 +243,17 @@
    :shims ["!test/conformance/libs/shims/cheshire" "!test/conformance/libs/shims/criterium"]
    :exclude-nses ["selmer.benchmark"]
    ;; Remaining, by owner:
-   ;;  20 fails — the date filter's LOCALE-dependent styles ({{d|date:shortDate:zh}},
-   ;;     :fr month names). jolt-lang/time formats in one fixed locale.
-   ;;   1 fail  — sha512, which jolt-crypto's MessageDigest does not offer.
+   ;;   1 fail  — number-format with a locale: String/format ignores the Locale's
+   ;;     decimal separator, so :de renders "123.045" for "123,045". A third
+   ;;     locale-sensitive surface, alongside ::currency-data and ::date-names.
    ;;   2 errors — io/resource returns a java.io.File where the JVM returns a file:
    ;;     URL, so render-file cannot resolve one and Selmer calls .startsWith on it.
    ;;     Fixing it means teaching slurp/io/file to coerce a URL first, and moving
    ;;     the AOT-embedded branch in step so both answer the same surface.
    ;;   1 error — currency for locale "en": the ::currency-data point is waiting on
    ;;     jolt-lang/time to register providers.
-   ;;   1 error — commons-lang StringEscapeUtils, a JVM jar.
-   :expect {:tests 131 :pass 497 :fail 21 :error 5}}
+   ;;   1 error — commons-lang StringEscapeUtils, a JVM jar; not portable.
+   :expect {:tests 131 :pass 518 :fail 1 :error 4}}
 
   {:name "html"
    :paths ["src" "test"]
