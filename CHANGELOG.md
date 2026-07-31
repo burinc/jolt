@@ -95,6 +95,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a relative path. It now asserts that a relative path absolutizes under user.dir
   and that `relativize` undoes `absolutize`, the round-trip `match` performs.
 
+- **Java regex translation now matches the JVM on 17 long-tail `Pattern` edge cases.**
+  The `Pattern`→irregex translator (`host/chez/java/regex-translate.ss`) now agrees
+  with `java.util.regex.Pattern` on accept/reject for flag groups, character-class
+  intersection, inverted ranges, malformed quantifiers, and class-only escapes:
+  - empty and unknown flag groups (`(?)`, `((?){0,0})`, `(?c:Z)`) now compile, while
+    a dangling `*`/`+`/`?` after a body-less flag group (`(?)?`) is rejected;
+  - `&&` intersection with an empty side means "everything" (`[&&x]`, `[x&&]`,
+    `[%-&&&]`, `[x&&&&]`), and a leading `&&` with no left operand (`[&&&]`) still
+    rejects;
+  - inverted character ranges (`[b-a]`, `[]-X]`, `[x-\cx]`, `[{\x{10000}-}]`, and the
+    nested `[[[[{-\c}]]]]`) now reject;
+  - a quantifier with min greater than max (`{1,0}`) now rejects even with no
+    preceding atom;
+  - `\Q..\E` (empty) and `\R` are rejected inside a character class;
+  - `\e` is now ESCAPE (U+001B), not a literal `e`.
+  20 JVM-certified rows added to `test/chez/corpus.edn`.
+
 - **`conj` of a map into a `defrecord` merges the map's entries, as on the JVM.**
   The default record `conj` handler treated its argument as a single `[k v]` pair and
   `nth`'d it, so `(conj (map->R {:a 1}) {:b 2})` threw
