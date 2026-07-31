@@ -88,6 +88,21 @@
 (check "which nonsense" (fs/which "no-such-binary-xyz") nil)
 (check "cwd is dir" (fs/directory? (fs/cwd)) true)
 
+;; user.dir-relative resolution (string algebra only — touches no disk).
+;; Regression: project-relative consulted only JOLT_PWD. bin/jolt always exports
+;; it, but a built binary never does, so there absolutize was a no-op on a
+;; relative path and every fs/glob under a relative root came back relativized
+;; against the wrong base ("../../../../<root>/x"), breaking directory walks.
+;; Every case above roots at an absolute temp dir, which is why none caught it.
+(def user-dir (System/getProperty "user.dir"))
+(check "absolutize rel is absolute" (fs/absolute? (fs/absolutize "a/b.txt")) true)
+(check "absolutize rel roots at user.dir"
+       (str (fs/absolutize "a/b.txt")) (str user-dir "/a/b.txt"))
+(check "absolutize empty is user.dir" (str (fs/absolutize "")) (str user-dir))
+;; the round-trip babashka.fs/match runs on every relative-rooted glob
+(check "relativize undoes absolutize"
+       (str (fs/relativize (fs/absolutize "") (fs/absolutize "a/b.txt"))) "a/b.txt")
+
 ;; deletion
 (check "delete-if-exists" (fs/delete-if-exists (fs/path root "d3" "empty.txt")) true)
 (check "delete-if-exists neg" (fs/delete-if-exists (fs/path root "d3" "empty.txt")) false)

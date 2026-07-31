@@ -120,15 +120,30 @@
          0)
         (else (system (string-append "chmod 755 '" path "'")))))))
 
-;; A user-facing relative path resolves against JOLT_PWD — the user's cwd before
+;; user.dir — the project dir every user-facing relative path resolves against.
+;; JOLT_PWD carries it when the launcher moved away from it (bin/jolt exports the
+;; user's cwd before cd'ing to the repo root); a built binary never moves, so its
+;; own cwd is the project dir and PWD names it. This is the same chain
+;; System/getProperty "user.dir" answers with — kept in one place so a caller
+;; cannot implement half of it.
+(define (jolt-user-dir)
+  (let ((jp (getenv "JOLT_PWD")))
+    (if (and jp (> (string-length jp) 0))
+        jp
+        (let ((wd (getenv "PWD")))
+          (if (and wd (> (string-length wd) 0)) wd ".")))))
+
+;; A user-facing relative path resolves against user.dir — the user's cwd before
 ;; the launcher cd'd to the jolt repo root — matching the JVM, where io/file is
 ;; cwd-relative. (io/resource builds jfiles from the source roots directly, so it
 ;; isn't routed through here.)
 (define (project-relative p)
   (if (or (= (string-length p) 0) (char=? (string-ref p 0) #\/))
       p
-      (let ((pwd (getenv "JOLT_PWD")))
-        (if (and pwd (> (string-length pwd) 0)) (string-append pwd "/" p) p))))
+      (let ((base (jolt-user-dir)))
+        ;; "." adds nothing the OS won't do itself when it resolves a relative
+        ;; path — leave it alone rather than prefixing "./".
+        (if (string=? base ".") p (string-append base "/" p)))))
 
 ;; (io/file path) / (io/file parent child) — join children with "/". The File
 ;; keeps the path AS GIVEN (like the JVM: new File("rel").getPath() is "rel");
@@ -154,13 +169,13 @@
          (sort string<? (directory-list p)))))
 (define (jolt-dir? path) (if (file-directory? (project-relative (file-path-of path))) #t #f))
 
-;; absolute path string: a relative path resolves against JOLT_PWD (user.dir) —
-;; the same base every filesystem touch uses (project-relative). Resolving
-;; against (current-directory) here instead reported paths under the jolt repo
-;; root the launcher cd'd into, diverging from the JVM where io/file and
-;; getAbsolutePath are user.dir-relative.
+;; absolute path string: a relative path resolves against user.dir — the same
+;; base every filesystem touch uses (project-relative). Resolving against
+;; (current-directory) here instead reported paths under the jolt repo root the
+;; launcher cd'd into, diverging from the JVM where io/file and getAbsolutePath
+;; are user.dir-relative.
 (define (jfile-abs p)
-  (cond ((= (string-length p) 0) (or (getenv "JOLT_PWD") (getenv "PWD") "."))
+  (cond ((= (string-length p) 0) (jolt-user-dir))
         ((char=? (string-ref p 0) #\/) p)
         (else (project-relative p))))
 
