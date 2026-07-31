@@ -32,6 +32,9 @@ delete-file
 directory?
 enable-trace!
 exact?
+extension-epoch
+extension-has?
+extension-value
 file-exists?
 find-var
 form-bigdec-source
@@ -106,7 +109,10 @@ record-shapes
 record-type?
 ref-get
 ref-put!
+refine-extension!
 register-class-supers!
+register-extension!
+register-extension-point!
 register-source!
 resolvable-names
 resolve-class-hint

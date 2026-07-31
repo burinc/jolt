@@ -1346,4 +1346,27 @@
   ;; nil prints as nothing at all, so `-e` of a side-effecting form stays quiet —
   ;; `clojure -M -e nil` does the same.
   {:suite "repl-printer" :expr "nil" :expected ""}
+
+  ;; Extension points: core declares a point with a TOTAL default, a library
+  ;; registers a possibly-partial refinement at a key. Lookup is (merge default
+  ;; provider), so a provider only states what differs. :fallback :strict makes an
+  ;; unregistered key an error rather than a silently-defaulted wrong answer —
+  ;; the whole reason core can ship a point whose data it does not carry.
+  ;; Each row declares its own point id so rows cannot interfere.
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-a {:key :string :root \"\" :fields {:sym :string :digits :long} :default {:sym \"x\" :digits 2} :fallback :strict}) (let [m (jolt.host/extension-value :xt-a \"\")] [(:sym m) (:digits m)]))" :expected "[\"x\" 2]"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-b {:key :string :root \"\" :fields {:sym :string :digits :long} :default {:sym \"x\" :digits 2} :fallback :strict}) (jolt.host/register-extension! :xt-b \"de\" {:sym \"$$\"}) (let [m (jolt.host/extension-value :xt-b \"de\")] [(:sym m) (:digits m)]))" :expected "[\"$$\" 2]"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-c {:key :string :root \"\" :fields {:sym :string :digits :long} :default {:sym \"x\" :digits 2} :fallback :strict}) (jolt.host/register-extension! :xt-c \"de\" {:sym \"$$\" :digits 4}) (let [m (jolt.host/extension-value :xt-c \"de\")] [(:sym m) (:digits m)]))" :expected "[\"$$\" 4]"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-d {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/extension-value :xt-d \"fr\"))" :expected :throws}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-e {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (try (jolt.host/extension-value :xt-e \"fr\") (catch Exception e (boolean (and (re-find #\"xt-e\" (.getMessage e)) (re-find #\"fr\" (.getMessage e)))))))" :expected "true"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-f {:key :string :root \"\" :fields {:sym :string :digits :long} :default {:sym \"x\" :digits 2} :fallback :default}) (let [m (jolt.host/extension-value :xt-f \"zz\")] [(:sym m) (:digits m)]))" :expected "[\"x\" 2]"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-g {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/register-extension! :xt-g \"de\" {:nope \"y\"}))" :expected :throws}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-h {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/register-extension! :xt-h \"de\" {:sym 7}))" :expected :throws}
+  {:suite "extension points" :expr "(jolt.host/register-extension-point! :xt-i {:key :string :root \"\" :fields {:sym :string :digits :long} :default {:sym \"x\"} :fallback :strict})" :expected :throws}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-j {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/register-extension! :xt-j :de {:sym \"y\"}))" :expected :throws}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-k {:key :string :root \"\" :fields {:sym :string :digits :long} :default {:sym \"x\" :digits 2} :fallback :strict}) (jolt.host/register-extension! :xt-k \"de\" {:sym \"$$\"}) (jolt.host/refine-extension! :xt-k {:fields {:code :string} :default {:code \"XXX\"}}) (let [m (jolt.host/extension-value :xt-k \"de\")] [(:sym m) (:digits m) (:code m)]))" :expected "[\"$$\" 2 \"XXX\"]"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-l {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (let [e0 (jolt.host/extension-epoch)] (jolt.host/register-extension! :xt-l \"de\" {:sym \"y\"}) (> (jolt.host/extension-epoch) e0)))" :expected "true"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-m {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/register-extension-point! :xt-m {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) :ok)" :expected ":ok"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-n {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/register-extension-point! :xt-n {:key :string :root \"\" :fields {:sym :string} :default {:sym \"OTHER\"} :fallback :strict}))" :expected :throws}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-o {:key :keyword :root :root :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/register-extension! :xt-o :de {:sym \"$$\"}) (:sym (jolt.host/extension-value :xt-o :de)))" :expected "\"$$\""}
+  {:suite "extension points" :expr "(jolt.host/extension-value :xt-never-declared \"\")" :expected :throws}
 ]
