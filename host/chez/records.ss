@@ -714,7 +714,12 @@
 ;; (registered above but checked after this newer arm), so the guard preserves the
 ;; deftype's collection semantics (flatland.ordered's OrderedSet conjs a scalar).
 (register-conj-arm! (lambda (coll) (and (jrec? coll) (not (jrec-cl coll "cons"))))
-  (lambda (coll x) (jolt-assoc1 coll (jolt-nth x 0) (jolt-nth x 1))))
+  (lambda (coll x)
+    (if (pmap? x)
+        ;; a map folds its entries (JVM parity): (conj record {:k v ...}) merges them.
+        ;; Otherwise x is a [k v] pair / MapEntry — assoc the two elements.
+        (pmap-fold-fwd x (lambda (k v c) (jolt-assoc1 c k v)) coll)
+        (jolt-assoc1 coll (jolt-nth x 0) (jolt-nth x 1)))))
 ;; peek/pop on a deftype implementing IPersistentStack (data.priority-map, which
 ;; core.cache's LRU/LU caches lean on) dispatch to its methods.
 ;; empty? over a jrec: a map-like deftype is empty iff its entry seq is (data

@@ -4501,4 +4501,9 @@
   {:suite "numbers / unsigned string conversions" :label "Integer/Long toHexString are unsigned at their own width" :expected "[\"ffffffff\" \"ffffff00\" \"ffffffffffffffff\" \"ff\"]" :actual "[(Integer/toHexString -1) (Integer/toHexString -256) (Long/toHexString -1) (Integer/toHexString 255)]" :portability :jvm}
   {:suite "numbers / unsigned string conversions" :label "toOctalString / toBinaryString are unsigned too" :expected "[\"37777777777\" \"11111111111111111111111111111111\" \"1777777777777777777777\" \"101\"]" :actual "[(Integer/toOctalString -1) (Integer/toBinaryString -1) (Long/toOctalString -1) (Integer/toBinaryString 5)]" :portability :jvm}
   {:suite "numbers / unsigned string conversions" :label "toString with a radix is signed magnitude, lowercase" :expected "[\"-ff\" \"-ff\" \"-255\" \"ff\"]" :actual "[(Integer/toString -255 16) (Long/toString -255 16) (Long/toString -255) (Integer/toString 255 16)]" :portability :jvm}
+  ;; conj of a map into a defrecord must fold the map's entries (JVM parity) — the
+  ;; default record conj handler treated the map as a single [k v] pair and nth'd it,
+  ;; throwing. Surfaced via test.chuck's instaparse parse-failure path calling
+  ;; (merge <Failure> <line-col map>) in instaparse/failure.clj (jolt-v5fh.15).
+  {:suite "records / conj" :label "conj of a map into a defrecord folds its entries" :expected "{:a 10 :b 2 :c 30}" :actual "(do (defrecord RC15 [a b]) (into {} (conj (->RC15 1 2) {:a 10 :c 30})))" :portability :common}
 ]

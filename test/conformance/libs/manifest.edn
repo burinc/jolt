@@ -147,17 +147,18 @@
    ;; resources/ holds the regex grammar its parser slurps through io/resource
    :paths ["src" "test" "resources"]
    :deps ["@test.check/src/main/clojure" "@spec.alpha/src/main/clojure"]
-   :extra-deps {instaparse/instaparse {:mvn/version "1.5.0"}}
+   ;; the version test.chuck itself declares (its deps.edn / project.clj)
+   :extra-deps {instaparse/instaparse {:mvn/version "1.4.10"}}
    :timeout 900
    ;; property-based: the assertion count moves with the generated cases
    :tolerance 30
    ;; regexes-test drives test.chuck's own regex parser against re-pattern over
    ;; generated patterns, so its residue is regex-engine differences (jolt's is
-   ;; irregex behind a Java-ish front end) plus one instaparse divergence: a parse
-   ;; FAILURE surfaces here as "nth not supported on this type" instead of the
-   ;; ExceptionInfo the JVM raises. Tracked in jolt-v5fh.15. The remaining load-fail
-   ;; is clj-time, which needs joda-time.
-   :expect {:tests 39 :pass 73 :fail 35 :error 16 :load-fail 1}}
+   ;; irregex behind a Java-ish front end). The instaparse parse-FAILURE path now
+   ;; raises the same catchable ExceptionInfo the JVM raises (a conj-of-map-into-
+   ;; record bug had surfaced it as an internal "nth not supported" error). The
+   ;; remaining load-fail is clj-time, which needs joda-time.
+   :expect {:tests 39 :pass 75 :fail 40 :error 8 :load-fail 1}}
 
   ;; ---------------------------------------------------------- data formats
   {:name "data.csv"

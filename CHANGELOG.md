@@ -95,6 +95,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a relative path. It now asserts that a relative path absolutizes under user.dir
   and that `relativize` undoes `absolutize`, the round-trip `match` performs.
 
+- **`conj` of a map into a `defrecord` merges the map's entries, as on the JVM.**
+  The default record `conj` handler treated its argument as a single `[k v]` pair and
+  `nth`'d it, so `(conj (map->R {:a 1}) {:b 2})` threw
+  "nth not supported on this type: clojure.lang.PersistentArrayMap" instead of
+  merging; `merge`-ing a map into a record hits the same `conj` path. This surfaced
+  through test.chuck: `instaparse.failure/augment-failure` does
+  `(merge <Failure> {:line … :column …})`, so a regex that fails to parse raised an
+  uncatchable `UnsupportedOperationException` where the library (and the JVM) raise a
+  catchable `ExceptionInfo {:type ::regexes/parse-error}`. A map argument now folds
+  its entries; a `[k v]` pair or `MapEntry` is unchanged.
+
 - **`clojure.pprint`'s `simple-dispatch` and `code-dispatch` are multimethods, so
   libraries can extend them.** They were plain functions that `case`d on a type
   keyword, so `(. clojure.pprint/simple-dispatch addMethod Tie pprint-tie)` — which
