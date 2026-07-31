@@ -9,6 +9,66 @@
 ;; Loaded after compile-eval.ss (needs jolt-ce-analyze/jolt-ce-emit/ce-scan-requires!,
 ;; make-analyze-ctx) and rt.ss (read-file-string, the reader's rdr-read-form).
 
+;; --- build/emit phase profile -----------------------------------------------------
+;; JOLT_BUILD_PROFILE=1 reports each phase's wall-clock milliseconds on stderr.
+;; A build's time divides between jolt's own passes (source parses, the
+;; whole-program fixpoint, per-form emit) and Chez's compile-file of the flat
+;; runtime+app source, and those two call for unrelated fixes — so which one
+;; dominates has to be observable rather than guessed at.
+(define ei-profile? #f)
+(define ei-profile-last 0)
+(define ei-profile-start 0)
+(define (ei-profile-init!)
+  (set! ei-profile? (and (getenv "JOLT_BUILD_PROFILE") #t))
+  (when ei-profile?
+    (set! ei-profile-start (real-time))
+    (set! ei-profile-last ei-profile-start)))
+(define (ei-profile-pad s n)
+  (if (>= (string-length s) n) s (string-append s (make-string (- n (string-length s)) #\space))))
+(define (ei-profile-padl s n)
+  (if (>= (string-length s) n) s (string-append (make-string (- n (string-length s)) #\space) s)))
+;; Sub-phase accumulator. The two big phases are per-namespace loops, so their
+;; parts can't be marked once — each part adds into a named bucket, reported
+;; under its phase at the end. This is what says whether a phase is spending its
+;; time parsing the same sources repeatedly, analyzing, or in the fixpoint.
+(define ei-acc-tbl (make-hashtable string-hash string=?))
+(define (ei-timed label thunk)
+  (if ei-profile?
+      (let ((t0 (real-time)))
+        (let ((v (thunk)))
+          (hashtable-update! ei-acc-tbl label (lambda (x) (+ x (- (real-time) t0))) 0)
+          v))
+      (thunk)))
+(define (ei-acc-report!)
+  (when ei-profile?
+    (let-values (((ks vs) (hashtable-entries ei-acc-tbl)))
+      ;; slowest first — the point of the breakdown is which part to attack
+      (for-each
+        (lambda (p)
+          (display (string-append "jolt build: [profile]    - " (ei-profile-pad (car p) 21)
+                                  (ei-profile-padl (number->string (cdr p)) 7) " ms\n")
+                   (current-error-port)))
+        (sort (lambda (a b) (> (cdr a) (cdr b)))
+              (let loop ((i 0) (acc '()))
+                (if (fx=? i (vector-length ks))
+                    acc
+                    (loop (fx+ i 1) (cons (cons (vector-ref ks i) (vector-ref vs i)) acc)))))))
+    (hashtable-clear! ei-acc-tbl)
+    (flush-output-port (current-error-port))))
+
+;; Elapsed since the previous mark. Returns #f so it can sit in a let* binding
+;; between two phases without disturbing them.
+(define (ei-mark! label)
+  (when ei-profile?
+    (let ((now (real-time)))
+      (display (string-append "jolt build: [profile] " (ei-profile-pad label 24)
+                              (ei-profile-padl (number->string (- now ei-profile-last)) 7) " ms"
+                              "   (cumulative " (number->string (- now ei-profile-start)) ")\n")
+               (current-error-port))
+      (flush-output-port (current-error-port))
+      (set! ei-profile-last now)))
+  #f)
+
 ;; Read every top-level form from a source string (a Chez read-all).
 ;; Uses the same reader the spine reads single forms with.
 ;; Loop by READING POSITION, not by the first eof-form: a non-matching reader
@@ -85,17 +145,30 @@
 (define ei-cached-ir (make-hashtable string-hash string=?))
 (define ei-cached-ir-idx (make-hashtable string-hash string=?))
 
+;; Held as a VECTOR rather than the list bld-wp-infer! builds: the emit walk pops
+;; one form per call, and indexing a list cost a (length …) plus a (list-ref …)
+;; per pop — quadratic in a namespace's form count, paid on the largest ported
+;; namespaces precisely because they have the most forms.
 (define (ei-set-cached! ns forms)
-  (hashtable-set! ei-cached-ir ns forms)
+  (hashtable-set! ei-cached-ir ns (if (vector? forms) forms (list->vector forms)))
   (hashtable-set! ei-cached-ir-idx ns 0))
 
 (define (ei-next-cached ns)
   (let ((idx (hashtable-ref ei-cached-ir-idx ns #f))
         (forms (hashtable-ref ei-cached-ir ns #f)))
-    (if (and idx forms (< idx (length forms)))
-        (begin (hashtable-set! ei-cached-ir-idx ns (+ idx 1))
-               (list-ref forms idx))
-        #f)))
+    (cond
+      ((not (and idx forms)) #f)
+      ((fx<? idx (vector-length forms))
+       (hashtable-set! ei-cached-ir-idx ns (fx+ idx 1))
+       (vector-ref forms idx))
+      (else
+       ;; Exhausted: this namespace's emit walk is done with its whole-program IR,
+       ;; so drop it instead of holding every namespace's IR live until the build
+       ;; ends. Peak heap otherwise scales with the whole program. Returning #f is
+       ;; what an absent entry already returns, so a later call is unaffected.
+       (hashtable-delete! ei-cached-ir ns)
+       (hashtable-delete! ei-cached-ir-idx ns)
+       #f))))
 
 (define (ei-clear-cached!)
   (hashtable-clear! ei-cached-ir)
@@ -104,9 +177,13 @@
 (define (ei-compile-form ctx f optimize?)
   (let* ((ns (chez-actx-cns ctx))
          (cached (and optimize? (ei-next-cached ns)))
-         (ir (or cached (jolt-ce-analyze ctx f))))
+         (ir (or cached
+                 (ei-timed "emit: analyze" (lambda () (jolt-ce-analyze ctx f))))))
     (when optimize? (ei-publish-unit!))
-    (jolt-ce-emit-top (if optimize? (jolt-ce-run-passes ir ctx (ei-unit)) ir))))
+    (let ((ir* (if optimize?
+                   (ei-timed "emit: run-passes" (lambda () (jolt-ce-run-passes ir ctx (ei-unit))))
+                   ir)))
+      (ei-timed "emit: emit-top" (lambda () (jolt-ce-emit-top ir*))))))
 
 ;; The emitted `(def-var! …)(mark-macro! …)` pair for a defmacro, guard-wrapped
 ;; (tolerant) or bare (strict) to match guard?.

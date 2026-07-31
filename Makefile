@@ -330,7 +330,14 @@ gateboot: submodules
 # Smoke test: the gate boot image's staleness predicate. Drives
 # gate-boot-image-fresh? over synthetic input lists, so it boots no runtime,
 # touches nothing in the repo, and is safe under parallel make.
-gatebootsmoke: gateboot
+# devbootsmoke is a prerequisite for ORDERING, not because this needs anything it
+# builds: it touches host/chez/rt.ss and seed/prelude.ss to test its own cache
+# invalidation, and both are inputs to the gate boot image whose freshness this
+# asserts. Run concurrently under `make -j` the touch lands between this smoke's
+# freshness probe and the gate run it guards, and the gate correctly falls back to
+# source — failing a check about something else entirely. The two conflict by
+# construction, so they are sequenced rather than raced.
+gatebootsmoke: gateboot devbootsmoke
 	@sh test/chez/gateboot-smoke.sh
 
 # Smoke test: the dev boot cache is used when fresh and invalidated correctly.

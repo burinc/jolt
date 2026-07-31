@@ -46,7 +46,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entered in `known-divergences.edn` under `:integer-box-model`. `(bit-and b 0xff)`
   pins the width explicitly and is identical on both.
 
+### Added
+
+- **`jolt build` compiles the runtime half of its flat source once and keeps the
+  fasl.** A build emits one flat Scheme file — jolt's runtime (`rt.ss`, the
+  `clojure.core` prelude, the compiler image, the loader) followed by the app — and
+  handed the whole thing to Chez every time. The runtime half is byte-identical for
+  every app a given jolt builds in a given mode (verified: two unrelated apps
+  produce the same 3.0 MB to the byte), and compiling it is ~2.6s. It is now emitted
+  to its own `runtime.ss`, compiled once per (content, mode), and the fasl reused;
+  the two units are loaded into the boot in order, so the runtime's defines still
+  precede the app's reads.
+
+  A small app's build is mostly that one compile, so this is most of its build time:
+  `examples/hiccup-app` goes from 3.13s to 0.50s. A large app amortizes it against
+  its own work (`examples/ring-app` loses ~2.6s of ~42s). Cached under
+  `~/.jolt/runtime-cache` (`JOLT_RUNTIME_CACHE_DIR`), newest 8 entries kept;
+  `JOLT_RUNTIME_CACHE=0` opts out and `JOLT_NO_FLAT_SPLIT=1` restores the one-file
+  build. Skipped for `--tree-shake` (which rewrites the prelude per app), for
+  `--library`, and for cross builds.
+
+- **`JOLT_BUILD_PROFILE=1` reports each build phase's wall-clock time**, including a
+  breakdown inside the two expensive ones (the whole-program fixpoint and the emit
+  walk). `bench/build-phases.sh` drives it across build modes and prints the split
+  between jolt's own passes and Chez's compile. A build's cost divides between those
+  two and they want unrelated fixes, so which one dominates is worth being able to
+  see rather than assume — it is not the same for a small app as for a large one.
+
 ### Fixed
+
+- **A sub-process that could not be waited on hung the caller forever.** The reap
+  loop retried on any `waitpid` failure, including `ECHILD` — the child already
+  reaped by something else, which no number of retries changes. The loop holds the
+  process's mutex, so it did not merely spin: every other method on that process
+  deadlocked behind it, silently and indefinitely. This is what sat on a CI gate for
+  3h42m. `EINTR` is now the only retried failure; an unwaitable child resolves to a
+  status (128+signal when jolt signalled it, else 0 — the JVM always reaps its own
+  children and so always knows, jolt cannot recover a status the kernel consumed).
+
+  The condition is reachable through no fault of the program: with `SIGCHLD` set to
+  `SIG_IGN` the kernel reaps every child itself, and that disposition survives
+  `exec`, so jolt can inherit it from any parent. The first spawn now restores
+  `SIG_DFL` when it finds `SIG_IGN`, leaving a real inherited handler alone.
+
+- **`(.availableProcessors (Runtime/getRuntime))` always answered 1.** It was
+  hardcoded, so nothing sized to the machine — `pmap` in particular ran a fixed
+  4-wide window regardless of how many cores were available. It now reports the
+  processors this process may actually use: `sched_getaffinity` on Linux, so a
+  process confined by `taskset` or a cpuset sees its real limit rather than the whole
+  machine (what the JVM and `nproc` report); `hw.logicalcpu` on Darwin;
+  `NUMBER_OF_PROCESSORS` on Windows. `pmap` sizes its look-ahead from it, as Clojure
+  does. A cgroup CPU quota is not yet reflected (jolt-j4sd).
 
 - **`{n}` in a regex meant `{n,}`.** The translator handed irregex an unbounded
   upper bound for an exact count, so every exact repetition matched greedily past
