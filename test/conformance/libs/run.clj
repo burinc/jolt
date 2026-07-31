@@ -44,12 +44,13 @@
 (defn- resolve-path
   "A manifest path is relative to the library's own root unless it starts with
   `@` (relative to the conformance-libraries root), `~` (a first-party jolt
-  sibling library) or `/` (absolute)."
+  sibling library), `!` (this repo's root) or `/` (absolute)."
   [lib-root p]
   (cond
     (str/starts-with? p "/") p
     (str/starts-with? p "@") (str libs-root "/" (subs p 1))
     (str/starts-with? p "~") (str siblings-root "/" (subs p 1))
+    (str/starts-with? p "!") (str repo-root "/" (subs p 1))
     :else (str lib-root "/" p)))
 
 ;; ---------------------------------------------------------------- ns discovery
@@ -102,10 +103,19 @@
        :fail (parse-long f) :error (parse-long e) :load-fail (parse-long lf)})))
 
 (defn- run-lib [{:keys [name root dir paths deps local-deps extra-deps nses exclude-nses
-                        preload timeout]
+                        preload shims timeout]
                  :as entry}]
   (let [lib-root (str libs-root "/" (or root name))
         srcs (map #(resolve-path lib-root %) (or paths ["src" "test"]))
+        ;; A shim stands in for something the library expects from the JVM that jolt
+        ;; has no equivalent for — a Java logging backend, a JSON library built on
+        ;; Jackson. It goes AHEAD of the library's own sources and of its resolved
+        ;; deps so it wins the namespace, which is the whole point: the alternative
+        ;; is editing the checkout, and an edit there silently turns the recorded
+        ;; tally into a measurement of our own source. Shims live on jolt-owned
+        ;; paths (`!` = this repo, `~` = a first-party jolt library), never inside
+        ;; a checkout.
+        shims (map #(resolve-path lib-root %) (or shims []))
         deps (map #(resolve-path lib-root %) (or deps []))
         ;; A first-party jolt library must go on as a real :local/root dependency,
         ;; not a bare source path: its deps.edn is what declares :jolt/native, and
@@ -114,7 +124,7 @@
         ;; that is Apple's BoringSSL, which aborts the process inside EVP_Digest.
         local-deps (map #(resolve-path lib-root %) (or local-deps []))
         test-dirs (map #(resolve-path lib-root %) (:test-paths entry ["test"]))
-        cp (vec (concat [(str here "/runner")] srcs deps))
+        cp (vec (concat [(str here "/runner")] shims srcs deps))
         missing (remove exists? (concat cp local-deps))
         nses (remove (set (or exclude-nses []))
                      (or nses (discover-nses test-dirs)))

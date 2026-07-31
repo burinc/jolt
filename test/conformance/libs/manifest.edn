@@ -219,6 +219,11 @@
    ;; compatibility layer over jolt.yaml. It goes on as a real dependency rather
    ;; than a source path because it declares :jolt/native libyaml.
    :local-deps ["~yaml"]
+   ;; markdown-clj's own deps.edn asks for clj-commons/clj-yaml, and jolt resolves
+   ;; Maven now, so the real one — snakeyaml, i.e. Java — is what gets loaded and
+   ;; it dies on DumperOptions$FlowStyle. The same jolt-lang/yaml source goes on
+   ;; ahead of it as a shim so clj_yaml.core resolves to the compatibility layer.
+   :shims ["~yaml/src"]
    ;; the 2 errors are org.apache.commons.lang.StringEscapeUtils, a JVM jar
    :expect {:tests 94 :pass 180 :fail 0 :error 2}}
 
@@ -229,11 +234,23 @@
    ;; a real dependency, not a source path, so its :jolt/native libcrypto is loaded.
    :deps ["@data.json/src/main/clojure" "~time/src"]
    :local-deps ["~jolt-crypto"]
+   ;; core_test does (:require [cheshire.core :refer :all]). Selmer's own source
+   ;; resolves cheshire -> data.json -> jsonista at load and is fine on data.json,
+   ;; but the test names cheshire outright, and real cheshire wraps Jackson. The
+   ;; shim supplies the cheshire names over data.json.
+   ;; selmer.benchmark is excluded from the run but core_test requires it at top
+   ;; level and reads its `user` var, so it still has to compile — hence criterium.
+   :shims ["!test/conformance/libs/shims/cheshire" "!test/conformance/libs/shims/criterium"]
    :exclude-nses ["selmer.benchmark"]
-   ;; The remaining failures are the date filter's LOCALE-dependent styles
-   ;; ({{d|date:shortDate:zh}}, :fr month names): jolt-lang/time formats in one
-   ;; fixed locale, so those render US-style. A jolt-lang/time gap, not core.
-   :expect {:tests 131 :pass 492 :fail 24 :error 7}}
+   ;; Remaining, by owner:
+   ;;  20 fails — the date filter's LOCALE-dependent styles ({{d|date:shortDate:zh}},
+   ;;     :fr month names). jolt-lang/time formats in one fixed locale.
+   ;;   3 fails + 4 errors — java.net.URL / io/resource / File: (str url) renders
+   ;;     #object[java.net.URL], resource-path comes back nil, File has no
+   ;;     startsWith. These are jolt core, not the time library.
+   ;;   1 fail  — sha512, which jolt-crypto's MessageDigest does not offer.
+   ;;   1 error — commons-lang StringEscapeUtils, a JVM jar.
+   :expect {:tests 131 :pass 493 :fail 24 :error 6}}
 
   {:name "html"
    :paths ["src" "test"]
@@ -349,6 +366,13 @@
    :test-paths ["src/test/clojure"]
    ;; test-impl pins the log4j2 backend, which needs the org.apache.logging.log4j jars
    :exclude-nses ["clojure.tools.logging.test-impl"]
+   ;; impl/find-factory picks a backend at LOAD time and throws when every one it
+   ;; probes is missing, which on jolt is all of them — so without a backend the
+   ;; whole suite is a load-fail. The shim registers the classes its FIRST probe
+   ;; looks for (org.slf4j), leaving tools.logging itself unmodified and on its own
+   ;; slf4j code path. :preload because find-factory runs before any test does.
+   :shims ["!test/conformance/libs/shims/slf4j"]
+   :preload ["jolt.shim.slf4j"]
    :expect {:tests 67 :pass 219 :fail 0 :error 4}}
 
   ;; ---------------------------------------------------------- time
