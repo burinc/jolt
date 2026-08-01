@@ -707,10 +707,26 @@
                  (condition-broadcast (vector-ref st 3)))))
             jolt-nil)))
         (cons "run" (lambda (self) (let ((th (vector-ref (jhost-state self) 0))) (when th (jolt-invoke th))) jolt-nil))
-        (cons "join" (lambda (self . _)
-          (let ((st (jhost-state self)))
+        ;; join() and join(0) wait indefinitely; join(ms) waits at most ms and
+        ;; returns whether or not the thread finished. The timeout used to be
+        ;; discarded, which turned every bounded join into an unbounded one — a
+        ;; caller that joined a long-lived worker with a timeout deadlocked instead
+        ;; of giving up, with nothing in the code to suggest why.
+        (cons "join" (lambda (self . args)
+          (let* ((st (jhost-state self))
+                 (a (if (null? args) #f (car args)))
+                 (ms (if (or (not a) (jolt-nil? a)) #f (jnum->exact a))))
             (with-mutex (vector-ref st 2)
-              (let loop () (unless (vector-ref st 1) (condition-wait (vector-ref st 3) (vector-ref st 2)) (loop)))))
+              (if (or (not ms) (<= ms 0))
+                  (let loop () (unless (vector-ref st 1)
+                                 (condition-wait (vector-ref st 3) (vector-ref st 2))
+                                 (loop)))
+                  ;; An absolute deadline, so a spurious wakeup resumes waiting for
+                  ;; what is LEFT of the timeout rather than restarting it.
+                  (let ((deadline (ms->deadline ms)))
+                    (let loop () (unless (vector-ref st 1)
+                                   (when (condition-wait (vector-ref st 3) (vector-ref st 2) deadline)
+                                     (loop))))))))
           jolt-nil))
         ;; alive = started and not yet completed (JVM: false before .start)
         (cons "isAlive" (lambda (self) (let ((st (jhost-state self)))

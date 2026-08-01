@@ -430,6 +430,63 @@
 ;; JVM spelling of the same question, Runtime.availableProcessors, is mapped in
 ;; the java layer (java/process.ss); clojure.core reaches it through here.
 (def-var! "jolt.host" "available-processors" (lambda () (jolt-available-processors)))
+
+;; --- telemetry primitives ----------------------------------------------------
+;; Chez already keeps everything an observability layer needs — two clocks and the
+;; collector's counters — behind procedures returning Chez-specific record types
+;; (time objects, sstats). These republish them as plain exact integers, the only
+;; shape a Clojure caller can do arithmetic on, so a telemetry library reads them
+;; without knowing about `time` or `sstats`.
+;;
+;; The two clocks are NOT interchangeable and both are needed:
+;;   wall-nanos  ('time-utc)       nanoseconds since the Unix epoch. The only clock
+;;                                 that can date an event for a remote collector, so
+;;                                 a span's start/end timestamp uses it. It is not
+;;                                 monotonic — ntp can step it backwards, which is
+;;                                 exactly why it must not be used to time anything.
+;;   mono-nanos  ('time-monotonic) nanoseconds from an arbitrary origin, never
+;;                                 steps. A DURATION must be measured with this,
+;;                                 else a clock adjustment mid-span yields a
+;;                                 negative or wildly long elapsed time.
+;; A span therefore records a wall start AND a mono start, and derives its end as
+;; wall-start + (mono-end - mono-start).
+(define nanos/sec 1000000000)
+(define (time->nanos t) (+ (* nanos/sec (time-second t)) (time-nanosecond t)))
+(define (jolt-wall-nanos) (time->nanos (current-time 'time-utc)))
+(define (jolt-mono-nanos) (time->nanos (current-time 'time-monotonic)))
+(def-var! "jolt.host" "wall-nanos" jolt-wall-nanos)
+(def-var! "jolt.host" "mono-nanos" jolt-mono-nanos)
+
+;; Collector + memory counters. `statistics` allocates a fresh sstats record per
+;; call, so these are polling-cadence primitives (a metrics reader every N seconds),
+;; not per-span ones. Each reads its own snapshot: at the OTel layer the fields are
+;; independent instruments observed separately, so tearing across them is not
+;; observable in the exported data.
+(def-var! "jolt.host" "cpu-nanos"     (lambda () (time->nanos (sstats-cpu (statistics)))))
+(def-var! "jolt.host" "real-nanos"    (lambda () (time->nanos (sstats-real (statistics)))))
+(def-var! "jolt.host" "gc-count"      (lambda () (sstats-gc-count (statistics))))
+(def-var! "jolt.host" "gc-cpu-nanos"  (lambda () (time->nanos (sstats-gc-cpu (statistics)))))
+(def-var! "jolt.host" "gc-real-nanos" (lambda () (time->nanos (sstats-gc-real (statistics)))))
+(def-var! "jolt.host" "gc-bytes"      (lambda () (sstats-gc-bytes (statistics))))
+;; bytes-allocated is the live heap (what survived the last collection, plus what
+;; has been allocated since); current/maximum-memory-bytes are what Chez holds from
+;; the OS now and at its peak — the RSS-shaped numbers a runtime memory gauge wants.
+(def-var! "jolt.host" "bytes-allocated"      (lambda () (bytes-allocated)))
+(def-var! "jolt.host" "current-memory-bytes" (lambda () (current-memory-bytes)))
+(def-var! "jolt.host" "maximum-memory-bytes" (lambda () (maximum-memory-bytes)))
+;; The calling thread's id, so telemetry can be read per-thread. Wrapped in a lambda
+;; so the get-thread-id reference resolves at CALL time: a non-threaded Chez build
+;; lacks the binding, and only a caller that actually asks for a thread id should
+;; fail there rather than the whole runtime failing to load.
+(def-var! "jolt.host" "thread-id" (lambda () (get-thread-id)))
+;; The underlying runtime's identity, as strings. A telemetry resource has to name
+;; the runtime and machine it is reporting from (process.runtime.*, host.arch);
+;; System/getProperty answers neither here, since jolt has no JVM behind it.
+;; machine-type is Chez's own tag, e.g. tarm64osx / a6le, which encodes both the
+;; architecture and the OS.
+(def-var! "jolt.host" "scheme-version" (lambda () (scheme-version)))
+(def-var! "jolt.host" "machine-type" (lambda () (symbol->string (machine-type))))
+
 ;; var def-time metadata: the :def emit passes the def's reader meta
 ;; (^:private / ^Type tag / docstring -> {:doc}) here, stored in an eq side-table
 ;; keyed by the cell. jolt-meta (natives-meta.ss) merges it onto {:ns :name},

@@ -15,6 +15,7 @@ backtrace-string
 block-sigint
 build-binary
 build-library
+bytes-allocated
 call-on-main-thread
 call-on-main-thread-async
 callable-host?
@@ -27,6 +28,8 @@ class-supers
 class-value?
 compile-ns
 condition-message
+cpu-nanos
+current-memory-bytes
 deftype-ctor-class
 delete-file
 directory?
@@ -79,6 +82,10 @@ form-var-value-ns
 form-var-value?
 form-vec-items
 form-vec?
+gc-bytes
+gc-count
+gc-cpu-nanos
+gc-real-nanos
 getenv
 host-class-name?
 host-intern!
@@ -95,15 +102,19 @@ late-bind?
 list?
 load-namespace
 locale-name
+machine-type
 make-interrupt
 make-thread-local
 map-entry
+maximum-memory-bytes
 monitor-enter
 monitor-exit
+mono-nanos
 park-until-interrupt
 protocol-methods
 rational-type?
 read-all-stdin
+real-nanos
 record-ctor-key
 record-shapes
 record-type?
@@ -120,6 +131,7 @@ resolve-global
 run-expr-string
 run-interruptible
 run-main-pump
+scheme-version
 set-field!
 set-instant-ctor!
 set-source-roots!
@@ -132,9 +144,11 @@ stash-inline!
 stop-main-pump
 table?
 tagged-table
+thread-id
 throwable
 type-satisfies?
 tz-backend
 tz-offset-seconds
 unchecked-math?
+wall-nanos
 with-monitor

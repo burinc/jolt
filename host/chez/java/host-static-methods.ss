@@ -264,7 +264,13 @@
 (def-var! "clojure.core" "current-time-ms" (lambda () (->num (now-millis))))
 (register-class-statics! "System"
   (list (cons "currentTimeMillis" (lambda () (->num (now-millis))))
-        (cons "nanoTime" (lambda () (->num (* 1000000 (now-millis)))))
+        ;; System/nanoTime is the JVM's MONOTONIC high-resolution timer, not the
+        ;; wall clock in finer units — its origin is arbitrary and only differences
+        ;; between two readings are meaningful. It was (* 1000000 (now-millis)):
+        ;; wall-clock derived, so an ntp step could run it backwards, and
+        ;; millisecond-granular, so any interval under a millisecond timed as 0.
+        ;; jolt-mono-nanos (rt.ss) is Chez's 'time-monotonic clock, which is both.
+        (cons "nanoTime" (lambda () (->num (jolt-mono-nanos))))
         (cons "exit" (lambda args (exit (if (null? args) 0 (jnum->exact (car args))))))
         ;; System/gc -> a full Chez collection (so weak references clear and their
         ;; guardians fire); Runtime.gc() routes here too.

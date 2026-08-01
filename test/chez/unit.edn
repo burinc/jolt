@@ -633,6 +633,43 @@
   {:suite "hostshim" :expr "(do (__register-class-ctor! \"Box4\" (fn [] (jolt.host/tagged-table :my/box4))) (__register-instance-check! (fn [cn val] (if (= cn \"Box4\") (= :my/box4 (jolt.host/ref-get val :jolt/type)) nil))) (instance? Box4 \"not-a-box\"))" :expected "false"}
   {:suite "hostshim" :expr "(jolt.host/table? (jolt.host/tagged-table :t))" :expected "true"}
   {:suite "hostshim" :expr "(jolt.host/table? \"x\")" :expected "false"}
+  ;; telemetry — the observability primitives off Chez's clocks and collector.
+  ;; The two clocks are deliberately distinct: wall-nanos is the epoch timestamp a
+  ;; span reports, mono-nanos is what its DURATION must be measured with.
+  {:suite "telemetry" :expr "(> (jolt.host/wall-nanos) 1700000000000000000)" :expected "true"}
+  {:suite "telemetry" :expr "(let [a (jolt.host/mono-nanos) b (jolt.host/mono-nanos)] (>= b a))" :expected "true"}
+  ;; mono-nanos is NOT the epoch clock — it counts from an arbitrary origin, so a
+  ;; wall-clock step can't skew a duration. Guards against it being aliased to wall.
+  {:suite "telemetry" :expr "(< (jolt.host/mono-nanos) (jolt.host/wall-nanos))" :expected "true"}
+  ;; finer than millisecond granularity: 200 back-to-back reads can't all land on a
+  ;; 1e6 boundary unless the clock is really a millisecond counter scaled by 1e6.
+  {:suite "telemetry" :expr "(some (fn [_] (pos? (rem (jolt.host/mono-nanos) 1000000))) (range 200))" :expected "true"}
+  {:suite "telemetry" :expr "(>= (jolt.host/cpu-nanos) 0)" :expected "true"}
+  {:suite "telemetry" :expr "(>= (jolt.host/real-nanos) 0)" :expected "true"}
+  {:suite "telemetry" :expr "(>= (jolt.host/gc-count) 0)" :expected "true"}
+  {:suite "telemetry" :expr "(>= (jolt.host/gc-cpu-nanos) 0)" :expected "true"}
+  {:suite "telemetry" :expr "(>= (jolt.host/gc-real-nanos) 0)" :expected "true"}
+  {:suite "telemetry" :expr "(>= (jolt.host/gc-bytes) 0)" :expected "true"}
+  {:suite "telemetry" :expr "(pos? (jolt.host/bytes-allocated))" :expected "true"}
+  {:suite "telemetry" :expr "(pos? (jolt.host/current-memory-bytes))" :expected "true"}
+  {:suite "telemetry" :expr "(>= (jolt.host/maximum-memory-bytes) (jolt.host/current-memory-bytes))" :expected "true"}
+  {:suite "telemetry" :expr "(>= (jolt.host/thread-id) 0)" :expected "true"}
+  ;; Thread/join must honour its timeout: joining a thread that outlives the
+  ;; timeout has to return, not block until the thread happens to finish.
+  {:suite "threads" :expr "(let [t (Thread. (fn [] (Thread/sleep 30000)))] (.start t) (.join t 50) (.isAlive t))" :expected "true"}
+  {:suite "threads" :expr "(let [t (Thread. (fn [] nil))] (.start t) (.join t 10000) (.isAlive t))" :expected "false"}
+  {:suite "threads" :expr "(let [t (Thread. (fn [] nil))] (.start t) (.join t) (.isAlive t))" :expected "false"}
+  {:suite "telemetry" :expr "(clojure.string/starts-with? (jolt.host/scheme-version) \"Chez Scheme\")" :expected "true"}
+  {:suite "telemetry" :expr "(let [m (jolt.host/machine-type)] [(string? m) (pos? (count m))])" :expected "[true true]"}
+  ;; bytes-allocated reads the LIVE heap, so it only has to grow across an
+  ;; allocation the test still holds a reference to — dropping the data instead
+  ;; lets a collection land in between and legitimately shrink it.
+  {:suite "telemetry" :expr "(let [a (jolt.host/bytes-allocated) keep (into [] (map (fn [i] (str \"padpadpadpad\" i)) (range 100000))) b (jolt.host/bytes-allocated)] [(count keep) (> b a)])" :expected "[100000 true]"}
+  ;; System/nanoTime is the JVM's MONOTONIC high-resolution timer, so it must not be
+  ;; the wall clock and must not be millisecond-granular.
+  {:suite "telemetry" :expr "(let [a (System/nanoTime) b (System/nanoTime)] (>= b a))" :expected "true"}
+  {:suite "telemetry" :expr "(some (fn [_] (pos? (rem (System/nanoTime) 1000000))) (range 200))" :expected "true"}
+  {:suite "telemetry" :expr "(< (System/nanoTime) (* 1000000 (System/currentTimeMillis)))" :expected "true"}
   {:suite "bytes" :expr "(seq (byte-array \"hi\"))" :expected "(104 105)"}
   {:suite "bytes" :expr "(seq (byte-array (.getBytes \"AB\" \"UTF-8\")))" :expected "(65 66)"}
   {:suite "bytes" :expr "(alength (byte-array (.getBytes \"hello\" \"UTF-8\")))" :expected "5"}
