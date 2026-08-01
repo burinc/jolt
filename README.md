@@ -192,6 +192,30 @@ sessions and interruptible eval, plus the cider-nrepl ops an editor expects
 (app/stop!)
 ```
 
+Editors also ask for the classpath before connecting; `-Spath` answers it, on
+either side of the alias options, and an alias the project doesn't declare is
+skipped with a warning rather than failing the query:
+
+```bash
+bin/jolt -A:test:dev -Spath    # the source roots :test and :dev resolve to
+bin/jolt -Spath -M:test        # same, for the aliases a -M/-X/-T run would use
+```
+
+The rest of the `clj` option surface works the same way — each takes the aliases
+around it and runs no program:
+
+```bash
+bin/jolt -Stree                # the dependency tree, tools.deps format
+bin/jolt -Sdescribe            # version, deps.edn chain, and caches, as edn
+bin/jolt -P                    # fetch every dependency, then stop (CI, images)
+bin/jolt -Srepro …             # ignore ~/.clojure/deps.edn for this run
+bin/jolt -Sverbose …           # say where deps are read from and fetched into
+```
+
+`-Sforce`, `-Sthreads`, and `-Jopt` are accepted and ignored: jolt resolves its
+roots on every run, so there is no classpath cache to force, it fetches
+serially, and there is no JVM to pass options to.
+
 ## Compile a binary
 
 `bin/jolt build` ahead-of-time compiles a project into a single self-contained

@@ -61,10 +61,83 @@
 ;; supplies its own), like the clj CLI's tool basis.
 (def ^:private ^:dynamic *cli-tool?* false)
 
+;; The report options — -Spath (print the roots), -Stree (print the dependency
+;; tree), -Sdescribe (print the environment), -P (fetch the deps and stop). Each
+;; answers something about the project instead of running it, and each is bound
+;; around the re-dispatch of the rest of the argv so the forms that only add
+;; resolution context still count: `jolt -Spath -M:test` and `jolt -A:test
+;; -Spath` both report on the resolution that run would use, like the clj CLI,
+;; which accepts these on either side of the alias options.
+(def ^:private ^:dynamic *cli-report* nil)
+
+;; -Srepro: resolve from the project deps.edn alone, ignoring the user one.
+(def ^:private ^:dynamic *cli-repro?* false)
+
 (defn- resolve-current
   ([] (resolve-current []))
   ([aliases] (deps/resolve-project (project-dir) (into *cli-aliases* aliases)
-                                   *cli-extra-edn* {:tool? *cli-tool?*})))
+                                   *cli-extra-edn*
+                                   {:tool? *cli-tool?*
+                                    :repro? *cli-repro?*
+                                    :trace? (= :tree *cli-report*)})))
+
+(defn- print-roots [{:keys [roots]}]
+  (println (str/join ":" roots)))
+
+;; -Sdescribe's answer: the environment as one readable EDN map. Rendered a key
+;; per line, in a fixed order, so it stays diffable — a jolt map of this size is
+;; a hash map, and printing it directly would order the keys arbitrarily.
+(defn- print-describe [aliases]
+  (let [env (deps/env-info (project-dir) *cli-repro?*)
+        entries [[:version (version)]
+                 [:project-dir (:project-dir env)]
+                 [:config-files (:config-files env)]
+                 [:config-user (:config-user env)]
+                 [:config-project (:config-project env)]
+                 [:gitlibs-dir (:gitlibs-dir env)]
+                 [:mvn-local-repo (:mvn-local-repo env)]
+                 [:repro (:repro env)]
+                 [:aliases (vec aliases)]]]
+    (println (str "{" (str/join "\n " (map (fn [[k v]] (str k " " (pr-str v))) entries))
+                  "}"))))
+
+;; -Sverbose's preamble: where this resolution reads from and fetches into.
+;; The clj CLI prints its version of this on stdout; jolt keeps it on stderr,
+;; with the rest of its resolution chatter, so `-Sverbose -Spath` still pipes.
+(defn- print-verbose-env []
+  (let [env (deps/env-info (project-dir) *cli-repro?*)]
+    (binding [*out* *err*]
+      (println (str "version        = " (version)))
+      (println (str "project_dir    = " (:project-dir env)))
+      (println (str "user_deps      = " (or (:config-user env) "(skipped)")))
+      (println (str "project_deps   = " (:config-project env)))
+      (println (str "gitlibs_dir    = " (:gitlibs-dir env)))
+      (println (str "mvn_local_repo = " (:mvn-local-repo env))))))
+
+;; Answer the bound report option. `aliases` are the command's own (a -M/-X/-T
+;; selection) on top of the ones -A bound; `resolved` is its resolution — nil
+;; for -Sdescribe, which reads no dependencies at all.
+(defn- report! [aliases resolved]
+  (case *cli-report*
+    :path     (print-roots resolved)
+    :tree     (run! println (deps/dep-tree-lines (:trace resolved)))
+    :describe (print-describe (into *cli-aliases* aliases))
+    ;; -P: resolving IS the work — every dep is fetched into the caches by the
+    ;; time we get here, which is the point of a prepare step.
+    :prepare  nil))
+
+;; Every command that resolves the project with aliases of its own funnels
+;; through here: under a report option the resolution IS the answer, so report
+;; and run nothing — no natives loaded, no :main-opts, no :exec-fn.
+(defn- with-project [aliases resolved f]
+  (if *cli-report*
+    (report! aliases resolved)
+    (do (apply-project! resolved) (f))))
+
+;; …and the terminal form of the same thing, for an argv with no command left to
+;; take its aliases from: resolve (unless the report needs nothing) and answer.
+(defn- cmd-report []
+  (report! [] (when-not (= :describe *cli-report*) (resolve-current))))
 
 ;; Consume the first standalone "--" (POSIX end-of-options marker); everything
 ;; else — including any later "--" — is left as literal program data.
@@ -152,27 +225,28 @@
 (defn- cmd-M [arg more]
   (let [aliases (parse-aliases arg)
         {:keys [main-opts] :as resolved} (resolve-current aliases)]
-    (apply-project! resolved)
-    (if (or (seq main-opts) (seq more))
-      (apply-main-opts main-opts more)
-      (throw (ex-info (str "alias(es) " (pr-str aliases) " have no :main-opts") {})))))
+    (with-project aliases resolved
+      (fn []
+        (if (or (seq main-opts) (seq more))
+          (apply-main-opts main-opts more)
+          (throw (ex-info (str "alias(es) " (pr-str aliases) " have no :main-opts") {})))))))
 
-;; -A:alias… — add the aliases' paths/deps, then run the remaining argv as a
-;; command with *cli-aliases* bound, so the command's own project resolution
-;; (run/path/build/repl/task, or a following -M's) includes them.
+;; -A:alias… — select the aliases, then run the remaining argv as a command with
+;; *cli-aliases* bound, so the command's own project resolution (run/path/build/
+;; repl/task, or a following -M's) includes them. Binding them is all it does:
+;; every command it re-dispatches to resolves the project for itself, and `path`
+;; wants the roots printed rather than applied — resolving here as well walked
+;; the whole dependency tree a second time and printed its warnings twice.
 ;; -A and -Sdeps re-dispatch the remaining argv through -main, the command
 ;; dispatcher at the bottom of this file — declared here for the forward ref.
 (declare -main)
 
 (defn- cmd-A [arg more]
-  (let [aliases (parse-aliases arg)]
-    (binding [*cli-aliases* (into *cli-aliases* aliases)]
-      (apply-project! (resolve-current))
-      (apply -main more))))
+  (binding [*cli-aliases* (into *cli-aliases* (parse-aliases arg))]
+    (apply -main more)))
 
 (defn- cmd-path []
-  (let [{:keys [roots]} (resolve-current)]
-    (println (str/join ":" roots))))
+  (print-roots (resolve-current)))
 
 ;; -X / -T exec: invoke a function with a map argument, tools.deps style.
 ;; qualify-fn is taken directly from clojure.tools.deps.
@@ -224,11 +298,12 @@
 (defn- cmd-X [arg more]
   (let [aliases (parse-aliases arg)
         {:keys [argmap] :as resolved} (resolve-current aliases)]
-    (apply-project! resolved)
-    (let [[fsym-arg args] (if (and (seq more) (str/includes? (first more) "/"))
-                            [(symbol (first more)) (rest more)]
-                            [nil more])]
-      (exec-fn-call argmap fsym-arg args))))
+    (with-project aliases resolved
+      (fn []
+        (let [[fsym-arg args] (if (and (seq more) (str/includes? (first more) "/"))
+                                [(symbol (first more)) (rest more)]
+                                [nil more])]
+          (exec-fn-call argmap fsym-arg args))))))
 
 ;; -T:alias… [ns/fn] [k v …] — like -X but a TOOL execution: the project's own
 ;; paths and deps are replaced (the tool's alias supplies its deps), matching
@@ -521,6 +596,19 @@
   (println "  -T:alias [ns/fn] [k v …]  like -X, with the project paths/deps replaced")
   (println "  -Sdeps '<edn>' …       merge an extra deps.edn map, run the rest")
   (println)
+  (println "The report options answer something about the project and run nothing.")
+  (println "Each takes the aliases around it, so -A:test -Spath and -Spath -M:test")
+  (println "both report on the resolution that run would use:")
+  (println "  -Spath                 print the resolved source roots")
+  (println "  -Stree                 print the dependency tree")
+  (println "  -Sdescribe             print the environment as an edn map")
+  (println "  -P                     fetch every dependency, then stop")
+  (println)
+  (println "  -Srepro                ignore the user deps.edn (~/.clojure/deps.edn)")
+  (println "  -Sverbose              print where deps are read from and fetched into")
+  (println "  -Sforce, -Sthreads N, -Jopt   accepted and ignored: jolt resolves on")
+  (println "                         every run, fetches serially, and has no JVM")
+  (println)
   (println "The first standalone -- ends option parsing; everything after it is")
   (println "passed to the program as *command-line-args*.")
   (println)
@@ -528,11 +616,56 @@
   (println "can require the project's namespaces and its dependencies. Combine them")
   (println "with -Sdeps/-A to add paths or deps for a one-off evaluation."))
 
+;; Argv forms that only add resolution context — which files to read, which
+;; aliases to select, what to merge in — rather than doing something. A report
+;; option (-Spath / -Stree / -Sdescribe / -P) still lets these dispatch, since
+;; they change the answer, and skips everything else: a report runs no program.
+(defn- context-arg? [cmd]
+  (boolean (and cmd (or (#{"-Sdeps" "-Srepro" "-Sforce" "-Sthreads" "-Sverbose"
+                           "-Spath" "-Stree" "-Sdescribe"} cmd)
+                        (some #(str/starts-with? cmd %) ["-A" "-M" "-X" "-T" "-J"])))))
+
+(def ^:private report-opts
+  {"-Spath" :path, "-Stree" :tree, "-Sdescribe" :describe, "-P" :prepare})
+
 (defn -main [& args]
   (let [[cmd & more] args]
     (cond
+      ;; The report options — answer something about the project and run
+      ;; nothing. They may come before or after the alias options (`jolt
+      ;; -A:test:dev -Spath` is what editors ask with), so each binds the mode
+      ;; and re-dispatches rather than answering on the spot.
+      (get report-opts cmd)
+      (binding [*cli-report* (get report-opts cmd)] (apply -main more))
+
+      ;; …and once one is in effect, only the context-adding forms still
+      ;; dispatch: a task, a file, main opts, a REPL — none of it runs.
+      (and *cli-report* (not (context-arg? cmd)))
+      (cmd-report)
+
       ;; bare `jolt` starts a REPL, like bb/clj
       (nil? cmd)                         (repl)
+
+      ;; -Srepro — resolve from the project deps.edn alone, ignoring the user
+      ;; one, so a build is reproducible on a machine with a different
+      ;; ~/.clojure/deps.edn. (JOLT_NO_USER_DEPS does the same by environment.)
+      (= cmd "-Srepro")
+      (binding [*cli-repro?* true] (apply -main more))
+
+      ;; -Sverbose — say where the resolution reads from and fetches into, then
+      ;; run it with the progress lines on (the JOLT_DEBUG stream, for one run).
+      (= cmd "-Sverbose")
+      (binding [deps/*verbose* true]
+        (print-verbose-env)
+        (apply -main more))
+
+      ;; Accepted and ignored, so tooling that always passes them still works:
+      ;; jolt computes its roots on every run (there is no classpath cache to
+      ;; force or bypass), fetches serially, and has no JVM to pass options to.
+      (= cmd "-Sforce")                  (apply -main more)
+      (= cmd "-Sthreads")                (apply -main (rest more))
+      (str/starts-with? cmd "-J")        (apply -main more)
+
       (#{"help" "--help" "-h"} cmd)      (usage)
       (#{"version" "--version" "-V"} cmd) (println (str "jolt " (version)))
       (= cmd "run")                      (cmd-run more)
@@ -564,6 +697,13 @@
       (str/starts-with? cmd "-T")        (cmd-T cmd more)
       (= cmd "-m")                       (cmd-run (cons "-m" more))
       (= cmd "build")                    (cmd-build more)
+      ;; An -S option jolt doesn't have. Falling through would report it as an
+      ;; unknown task, which reads like a typo in the deps.edn rather than an
+      ;; option this CLI doesn't carry.
+      (str/starts-with? cmd "-S")
+      (throw (ex-info (str "unsupported option: " cmd " (jolt has -Sdeps, -Spath,"
+                           " -Stree, -Sdescribe, -Srepro, -Sforce, -Sthreads)")
+                      {:option cmd}))
       ;; a bare FILE (or "-" for stdin) runs it, `run` optional — like bb; a
       ;; non-file token falls through to a deps.edn :tasks lookup.
       (run-file-arg? cmd)                (cmd-run (cons cmd more))

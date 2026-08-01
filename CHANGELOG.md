@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`-Spath` prints the classpath and runs nothing**, like the clj CLI. It can
+  come on either side of the alias options — `jolt -A:test:dev -Spath` and
+  `jolt -Spath -M:test` both print the source roots that run would use, and
+  `-X`/`-T`/`-Sdeps` compose with it the same way (`-T` replacing the project's
+  own basis, as it does when running). Editors ask for the classpath this way
+  before connecting; jolt only had `jolt path`, which took no aliases from the
+  argv it was dispatched with, so Calva's `-A:test:dev -Spath` died on "unknown
+  command or task: -Spath".
+
+- **The rest of the clj option surface: `-Stree`, `-Sdescribe`, `-P`, `-Srepro`,
+  `-Sverbose`.** They compose with the aliases the same way `-Spath` does.
+  `-Stree` prints the dependency tree in the tools.deps format — a top dep
+  unprefixed, what it pulled in indented under it with `.`, and a node that lost
+  marked `X` with the reason (`:use-top`, `:older-version`, `:excluded`,
+  `:superseded`, …); the expansion already made those decisions, it just wasn't
+  recording them. `-Sdescribe` prints the version, the deps.edn chain, and the
+  cache locations as an edn map, without resolving a single dependency, so an
+  editor can ask cheaply and offline. `-P` fetches every dependency and stops —
+  the prepare step for a CI job or a container layer. `-Srepro` ignores
+  `~/.clojure/deps.edn` for one run (the per-run form of `JOLT_NO_USER_DEPS`),
+  and `-Sverbose` says which files the resolution reads and which caches it
+  fetches into, on stderr rather than clj's stdout so `-Sverbose -Spath` still
+  pipes.
+
+- **`-Sforce`, `-Sthreads N` and `-Jopt` are accepted and ignored**, so a tool
+  that always passes them isn't rejected: jolt resolves its roots on every run
+  (no classpath cache to force), fetches serially, and has no JVM. An `-S`
+  option jolt genuinely doesn't have now names itself as an unsupported option
+  instead of being reported as an unknown deps.edn task.
+
+### Fixed
+
+- **An undeclared alias is a warning, not an error.** tools.deps skips an alias
+  the deps chain doesn't declare and says so ("Specified aliases are undeclared
+  and are not being used"); jolt threw instead, so an editor sending a fixed
+  alias set got no classpath at all from a project that happens to declare only
+  some of them. It now warns on stderr and carries on with the aliases that do
+  exist.
+
+- **`-A` no longer resolves the project twice.** It resolved and applied the
+  deps before re-dispatching the rest of the argv, and every command it
+  re-dispatches to (`run`, `build`, `repl`, `nrepl-server`, a task, `-e`,
+  `-M`/`-X`/`-T`) resolves for itself — so each `-A` invocation walked the whole
+  dependency tree twice and printed any resolution warning twice with it.
+
 ## [0.5.14] - 2026-08-01
 
 Editor tooling works: jolt publishes its source roots as `java.class.path`,
