@@ -9,10 +9,11 @@
 # / :main-opts — plus multi-alias combination rules, alias visibility in `path`,
 # -A composing with -M, an undeclared alias warning and being skipped, the
 # java.time library autoload from the source roots, and the tools.deps CLI
-# surface: -X/-T exec, -Sdeps, the report options (-Spath / -Stree / -Sdescribe
-# / -P), -Srepro, -Sverbose, the accepted-and-ignored options, the user deps.edn
-# chain, :local/root jars, :git/tag + short sha, and git cache integrity (an
-# interrupted or failed fetch is never trusted as a cached checkout).
+# surface: -X/-T exec, -Sdeps, the report options (-Spath / -Stree / -Strace /
+# -Sdescribe / -P), -Scp, -Srepro, -Sverbose, the accepted-and-ignored options,
+# the user deps.edn chain, :local/root jars, :git/tag + short sha, and git cache
+# integrity (an interrupted or failed fetch is never trusted as a cached
+# checkout).
 #
 # The expansion engine itself (exclusions, version selection, orphan cutting) is
 # unit-tested in test/deps_expand_test.clj — see `make depsunit`.
@@ -221,7 +222,7 @@ esac
 
 # -Sdescribe answers from the deps.edn files alone: a project whose dependency
 # can't be fetched still describes, so an editor can ask cheaply and offline.
-mkdir -p "$tmp/baddep"
+mkdir -p "$tmp/baddep/src"
 cat > "$tmp/baddep/deps.edn" <<'EOF'
 {:paths ["src"]
  :deps {local/nope {:git/url "file:///nonexistent-jolt-smoke-repo"
@@ -230,10 +231,47 @@ EOF
 JOLT_PWD="$tmp/baddep" JOLT_QUIET=1 "$JOLT" -Sdescribe >/dev/null 2>&1
 check "-Sdescribe resolves no dependencies" "0" "$?"
 
-# an -S option jolt doesn't have says so, rather than reading as a bad task name
-out="$(runfull -Scp /tmp/x)"
+# -Scp — these roots, no expansion. The unfetchable dep above proves the
+# expansion is skipped rather than merely overridden.
+check "-Scp replaces the roots" "/a:/b" "$(runout -Scp /a:/b -Spath)"
+check "-Scp round-trips a recorded classpath" "$(runout -A:dev path)" \
+      "$(runout -Scp "$(runout -A:dev path)" -Spath)"
+check "-Scp expands no dependencies" "/a" \
+      "$(JOLT_PWD="$tmp/baddep" JOLT_QUIET=1 "$JOLT" -Scp /a -Spath 2>/dev/null)"
+# …and the deps.edn is still read, so an alias's :main-opts still run — against
+# the given roots, which is the point: a recorded classpath drives a run offline
+check "-Scp keeps the deps.edn main-opts" "main1" \
+      "$(run -Scp "$APP/src" -M:m1)"
+cat > "$tmp/baddep/src/badmain.clj" <<'EOF'
+(ns badmain)
+(defn -main [& _] (println "ran off the given roots"))
+EOF
+check "-Scp runs a program with the deps unfetched" "ran off the given roots" \
+      "$(JOLT_PWD="$tmp/baddep" JOLT_QUIET=1 "$JOLT" -Scp "$tmp/baddep/src" run -m badmain 2>&1 | tail -1)"
+
+# -Strace writes the expansion to trace.edn beside the deps.edn, and runs nothing
+rm -f "$APP/trace.edn"
+out="$(runfull -A:dev -Strace)"
 case "$out" in
-  *"unsupported option: -Scp"*) check "unknown -S option is named as one" ok ok ;;
+  *"Wrote $APP/trace.edn"*) check "-Strace says where it wrote" ok ok ;;
+  *) check "-Strace says where it wrote" "Wrote …/trace.edn" "$out" ;;
+esac
+if [ -f "$APP/trace.edn" ]; then
+  check "-Strace logs the expansion" "libc" \
+        "$("$JOLT" -e "(let [t (read-string (slurp \"$APP/trace.edn\"))]
+                         (println (some #(when (= 'local/libc (:lib %)) (name (:lib %)))
+                                        (:log t))))" 2>/dev/null | tail -1)"
+  check "-Strace records the version map" "true" \
+        "$("$JOLT" -e "(println (contains? (read-string (slurp \"$APP/trace.edn\")) :vmap))" 2>/dev/null | tail -1)"
+else
+  fail=$((fail+2)); echo "  FAIL: -Strace wrote no trace.edn" >&2
+fi
+rm -f "$APP/trace.edn"
+
+# an -S option jolt doesn't have says so, rather than reading as a bad task name
+out="$(runfull -Sman)"
+case "$out" in
+  *"unsupported option: -Sman"*) check "unknown -S option is named as one" ok ok ;;
   *) check "unknown -S option is named as one" "unsupported-option error" "$(printf '%s' "$out" | head -1)" ;;
 esac
 

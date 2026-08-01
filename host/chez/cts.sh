@@ -7,6 +7,8 @@
 # The comparison is exact, like certify's allowlist: a namespace doing WORSE
 # than the baseline fails the gate (regression), and one doing BETTER also
 # fails (stale baseline — update the file in the same change that improved it).
+# A namespace that doesn't match is re-run once on its own first, so a test that
+# lost a timing race against the parallel workers isn't reported as either.
 #
 #   JOLT_CTS_JOBS=N            parallel workers (default 4)
 #   JOLT_CTS_TIMEOUT=SECS      per-namespace timeout (default 120)
@@ -97,11 +99,30 @@ if [ ! -f "$baseline" ]; then
   exit 1
 fi
 
+# A namespace whose counts don't match the baseline is re-run once, alone,
+# before it counts. A few suite tests are timing-sensitive by construction —
+# realized-qmark asserts a `(future (sleep 1))` is NOT realized yet, and races
+# future-cancel — and they lose that race under the workers' CPU contention, so
+# the gate went red at random. A real regression fails again on its own; a
+# load-induced flake doesn't, and a hang gets a run with the machine to itself.
+recheck() { # ns -> "fail error", empty if it hung or crashed again
+  res=$(JOLT_PWD="$app" perl -e "alarm $tmo; exec @ARGV" -- "$jolt" -M:cts "$1" 2>&1 </dev/null)
+  echo "$res" | grep '^CTS-RESULT' | head -1 | awk '{print $4, $5}'
+}
+
 status=0
 while read -r ns p f e; do
   case "$p" in HUNG|CRASH) f="$p"; e="$p" ;; esac
   bl=$(grep -v '^#' "$baseline" | awk -v n="$ns" '$1==n {print $2, $3; exit}')
   if [ -n "$bl" ]; then bf="${bl%% *}"; be="${bl##* }"; else bf=0; be=0; fi
+  if [ "$f" != "$bf" ] || [ "$e" != "$be" ]; then
+    again=$(recheck "$ns")
+    if [ -n "$again" ]; then
+      [ "${again%% *}" = "$f" ] && [ "${again##* }" = "$e" ] \
+        || echo "cts: $ns differed under load (fail $f error $e), rechecked alone: $again"
+      f="${again%% *}"; e="${again##* }"
+    fi
+  fi
   if [ "$f" = "$bf" ] && [ "$e" = "$be" ]; then
     continue
   elif [ "$f" = "HUNG" ] || [ "$f" = "CRASH" ] \

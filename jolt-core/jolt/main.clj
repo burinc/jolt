@@ -73,13 +73,18 @@
 ;; -Srepro: resolve from the project deps.edn alone, ignoring the user one.
 (def ^:private ^:dynamic *cli-repro?* false)
 
+;; -Scp: source roots supplied on the command line, in place of the ones the
+;; dependencies would resolve to — the expansion is skipped entirely.
+(def ^:private ^:dynamic *cli-cp* nil)
+
 (defn- resolve-current
   ([] (resolve-current []))
   ([aliases] (deps/resolve-project (project-dir) (into *cli-aliases* aliases)
                                    *cli-extra-edn*
                                    {:tool? *cli-tool?*
                                     :repro? *cli-repro?*
-                                    :trace? (= :tree *cli-report*)})))
+                                    :cp *cli-cp*
+                                    :trace? (contains? #{:tree :trace-file} *cli-report*)})))
 
 (defn- print-roots [{:keys [roots]}]
   (println (str/join ":" roots)))
@@ -122,6 +127,13 @@
     :path     (print-roots resolved)
     :tree     (run! println (deps/dep-tree-lines (:trace resolved)))
     :describe (print-describe (into *cli-aliases* aliases))
+    ;; -Strace: the same trace -Stree renders, written beside the deps.edn it
+    ;; describes (`clojure -Strace` drops it in the current directory; jolt's is
+    ;; the project dir, which is where the argv's deps.edn came from).
+    :trace-file
+    (let [f (str (project-dir) "/trace.edn")]
+      (spit f (deps/trace-edn-string (:trace resolved)))
+      (binding [*out* *err*] (println (str "Wrote " f))))
     ;; -P: resolving IS the work — every dep is fetched into the caches by the
     ;; time we get here, which is the point of a prepare step.
     :prepare  nil))
@@ -601,9 +613,11 @@
   (println "both report on the resolution that run would use:")
   (println "  -Spath                 print the resolved source roots")
   (println "  -Stree                 print the dependency tree")
+  (println "  -Strace                write the dep expansion to trace.edn")
   (println "  -Sdescribe             print the environment as an edn map")
   (println "  -P                     fetch every dependency, then stop")
   (println)
+  (println "  -Scp CP …              run against these roots, expanding no deps")
   (println "  -Srepro                ignore the user deps.edn (~/.clojure/deps.edn)")
   (println "  -Sverbose              print where deps are read from and fetched into")
   (println "  -Sforce, -Sthreads N, -Jopt   accepted and ignored: jolt resolves on")
@@ -621,12 +635,13 @@
 ;; option (-Spath / -Stree / -Sdescribe / -P) still lets these dispatch, since
 ;; they change the answer, and skips everything else: a report runs no program.
 (defn- context-arg? [cmd]
-  (boolean (and cmd (or (#{"-Sdeps" "-Srepro" "-Sforce" "-Sthreads" "-Sverbose"
-                           "-Spath" "-Stree" "-Sdescribe"} cmd)
+  (boolean (and cmd (or (#{"-Sdeps" "-Scp" "-Srepro" "-Sforce" "-Sthreads" "-Sverbose"
+                           "-Spath" "-Stree" "-Strace" "-Sdescribe"} cmd)
                         (some #(str/starts-with? cmd %) ["-A" "-M" "-X" "-T" "-J"])))))
 
 (def ^:private report-opts
-  {"-Spath" :path, "-Stree" :tree, "-Sdescribe" :describe, "-P" :prepare})
+  {"-Spath" :path, "-Stree" :tree, "-Strace" :trace-file,
+   "-Sdescribe" :describe, "-P" :prepare})
 
 (defn -main [& args]
   (let [[cmd & more] args]
@@ -651,6 +666,15 @@
       ;; ~/.clojure/deps.edn. (JOLT_NO_USER_DEPS does the same by environment.)
       (= cmd "-Srepro")
       (binding [*cli-repro?* true] (apply -main more))
+
+      ;; -Scp CP — run against these source roots and expand no dependencies.
+      ;; The deps.edn chain is still read (aliases, :main-opts, :tasks), so a
+      ;; recorded classpath can drive a run offline: -Scp "$(jolt -Spath)".
+      (= cmd "-Scp")
+      (let [[cp & rest-args] more]
+        (when (nil? cp) (throw (ex-info "-Scp needs a classpath argument" {})))
+        (binding [*cli-cp* (vec (remove str/blank? (str/split cp #":")))]
+          (apply -main rest-args)))
 
       ;; -Sverbose — say where the resolution reads from and fetches into, then
       ;; run it with the progress lines on (the JOLT_DEBUG stream, for one run).
@@ -701,8 +725,9 @@
       ;; unknown task, which reads like a typo in the deps.edn rather than an
       ;; option this CLI doesn't carry.
       (str/starts-with? cmd "-S")
-      (throw (ex-info (str "unsupported option: " cmd " (jolt has -Sdeps, -Spath,"
-                           " -Stree, -Sdescribe, -Srepro, -Sforce, -Sthreads)")
+      (throw (ex-info (str "unsupported option: " cmd " (jolt has -Sdeps, -Scp, -Spath,"
+                           " -Stree, -Strace, -Sdescribe, -Srepro, -Sverbose,"
+                           " -Sforce, -Sthreads)")
                       {:option cmd}))
       ;; a bare FILE (or "-" for stdin) runs it, `run` optional — like bb; a
       ;; non-file token falls through to a deps.edn :tasks lookup.

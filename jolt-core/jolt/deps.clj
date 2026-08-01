@@ -744,6 +744,7 @@
                   _ (when include (swap! order conj lib))
                   _ (when trace
                       (swap! trace conj {:path (vec parents) :lib lib :coord use-coord
+                                         :orig-coord coord :coord-id coord-id
                                          :include (boolean include) :reason reason}))
                   {:keys [exclusions' cut' child-pred]} (update-excl lib use-coord coord-id use-path include reason exclusions cut)
                   new-q (if child-pred (conj q' (children-node lib use-coord use-path child-pred)) q')]
@@ -802,8 +803,9 @@
   `opts` carries the alias-combined coordinate maps applied at every node like
   tools.deps: :override-deps replaces a lib's coordinate wherever it appears
   (top-level or transitive); :default-deps supplies one where a dependent left
-  the coordinate nil. With :trace? the result also carries the expansion :trace
-  (see expand-deps), which dep-tree-lines renders."
+  the coordinate nil. With :trace? the result also carries the expansion
+  :trace — {:log [node …] :vmap version-map}, the tools.deps trace shape, which
+  dep-tree-lines renders and trace-edn-string writes out."
   ([deps base-dir] (resolve-deps deps base-dir nil))
   ([deps base-dir {:keys [override-deps default-deps trace?]}]
    (binding [*procure-memo* (or *procure-memo* (atom {}))]
@@ -831,7 +833,7 @@
         ;; caller warns with the lib names.
         :prep (vec (keep (fn [{:keys [lib edn]}] (when (:deps/prep-lib edn) lib)) infos))
         :libs libmap
-        :trace (some-> trace deref)}))))
+        :trace (when trace {:log @trace :vmap vmap})}))))
 
 ;; --- dependency tree --------------------------------------------------------
 ;; The trace is a flat log of expansion decisions in traversal order; the tree is
@@ -874,7 +876,7 @@
       . local/lib 1.2.3
         X local/other 1.0.0 :older-version"
   [trace]
-  (let [log (supersede (or trace []))
+  (let [log (supersede (:log trace))
         by-parent (reduce (fn [m {:keys [path] :as node}]
                             (update m (vec path) (fnil conj []) node))
                           {} log)]
@@ -884,6 +886,17 @@
                               (walk (conj path lib) (+ depth 2))))
                       (get by-parent path)))]
       (vec (walk [] 0)))))
+
+(defn trace-edn-string
+  "The trace as the edn text of `jolt -Strace`'s trace.edn: {:log [node …]
+  :vmap {…}}, one expansion decision per line so the file can be read by eye as
+  well as by `read-string`."
+  [{:keys [log vmap]}]
+  ;; long-hand keys, not the #:git{…} shorthand — tools.deps writes its trace
+  ;; the same way, and every edn reader takes the long form.
+  (binding [*print-namespace-maps* false]
+    (str "{:log\n [" (str/join "\n  " (map pr-str log)) "]\n"
+         " :vmap " (pr-str vmap) "}\n")))
 
 ;; --- public -----------------------------------------------------------------
 (defn- user-deps-path
@@ -926,7 +939,7 @@
   ([project-dir] (resolve-project project-dir []))
   ([project-dir alias-kws] (resolve-project project-dir alias-kws nil))
   ([project-dir alias-kws extra-edn] (resolve-project project-dir alias-kws extra-edn nil))
-  ([project-dir alias-kws extra-edn {:keys [tool? repro? trace?]}]
+  ([project-dir alias-kws extra-edn {:keys [tool? repro? trace? cp]}]
    (let [project-edn (read-deps-file (str project-dir "/deps.edn"))
          user-edn (when-not (or repro? (getenv "JOLT_NO_USER_DEPS"))
                     (try (read-deps-file (user-deps-path))
@@ -962,20 +975,29 @@
          all-deps (merge (or (:replace-deps argmap) (:deps argmap)
                              (if tool? {} (:deps edn)))
                          (:extra-deps argmap))
+         ;; :cp (the CLI's -Scp) supplies the roots outright, so the dependency
+         ;; graph is never expanded and nothing is fetched. The deps.edn chain is
+         ;; still read and the aliases still combine — that is only file reads,
+         ;; and an alias's :main-opts / :exec-fn and the project's :tasks come
+         ;; from there. tools.deps' --skip-cp draws the line in the same place:
+         ;; the merged edn and argmap, without calc-basis.
          {dep-roots :roots dep-natives :natives prep-libs :prep dep-trace :trace}
-         (binding [*mvn-local-repo* (when-let [r (:mvn/local-repo edn)]
-                                      (abspath project-dir r))
-                   *mvn-repos* (mvn-repo-urls edn)]
-           (resolve-deps all-deps project-dir
-                         {:override-deps (:override-deps argmap)
-                          :default-deps (:default-deps argmap)
-                          :trace? trace?}))
+         (when-not cp
+           (binding [*mvn-local-repo* (when-let [r (:mvn/local-repo edn)]
+                                        (abspath project-dir r))
+                     *mvn-repos* (mvn-repo-urls edn)]
+             (resolve-deps all-deps project-dir
+                           {:override-deps (:override-deps argmap)
+                            :default-deps (:default-deps argmap)
+                            :trace? trace?})))
          _ (when (seq prep-libs)
              (warn "deps declare :deps/prep-lib steps jolt does not run "
                    "(their compiled/generated assets will be missing): "
                    (str/join ", " prep-libs)))]
      ;; reconcile: the project's own roots/natives + every dep's, deduped once.
-     {:roots (dedup-by identity (concat project-roots dep-roots))
+     ;; With :cp the given roots ARE the answer — they replace the project's own
+     ;; paths too, like the clj CLI, where -Scp is the whole classpath.
+     {:roots (dedup-by identity (or cp (concat project-roots dep-roots)))
       :main-opts main-opts
       ;; the combined alias args map — the CLI's -X/-T read :exec-fn /
       ;; :exec-args / :ns-default / :ns-aliases from it.

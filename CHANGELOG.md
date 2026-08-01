@@ -18,26 +18,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   argv it was dispatched with, so Calva's `-A:test:dev -Spath` died on "unknown
   command or task: -Spath".
 
-- **The rest of the clj option surface: `-Stree`, `-Sdescribe`, `-P`, `-Srepro`,
-  `-Sverbose`.** They compose with the aliases the same way `-Spath` does.
+- **The rest of the clj option surface: `-Stree`, `-Strace`, `-Sdescribe`,
+  `-Scp`, `-P`, `-Srepro`, `-Sverbose`.**
+  They compose with the aliases the same way `-Spath` does.
   `-Stree` prints the dependency tree in the tools.deps format — a top dep
   unprefixed, what it pulled in indented under it with `.`, and a node that lost
   marked `X` with the reason (`:use-top`, `:older-version`, `:excluded`,
   `:superseded`, …); the expansion already made those decisions, it just wasn't
-  recording them. `-Sdescribe` prints the version, the deps.edn chain, and the
-  cache locations as an edn map, without resolving a single dependency, so an
-  editor can ask cheaply and offline. `-P` fetches every dependency and stops —
-  the prepare step for a CI job or a container layer. `-Srepro` ignores
-  `~/.clojure/deps.edn` for one run (the per-run form of `JOLT_NO_USER_DEPS`),
-  and `-Sverbose` says which files the resolution reads and which caches it
-  fetches into, on stderr rather than clj's stdout so `-Sverbose -Spath` still
-  pipes.
+  recording them, and `-Strace` writes the same log to `trace.edn` in the
+  tools.deps shape (`{:log [...] :vmap {...}}`). `-Sdescribe` prints the
+  version, the deps.edn chain, and the cache locations as an edn map, without
+  resolving a single dependency, so an editor can ask cheaply and offline. `-P`
+  fetches every dependency and stops — the prepare step for a CI job or a
+  container layer. `-Srepro` ignores `~/.clojure/deps.edn` for one run (the
+  per-run form of `JOLT_NO_USER_DEPS`), and `-Sverbose` says which files the
+  resolution reads and which caches it fetches into, on stderr rather than clj's
+  stdout so `-Sverbose -Spath` still pipes.
+
+- **`-Scp` runs against source roots given on the command line**, expanding no
+  dependencies — `jolt -Scp "$(jolt -Spath)" -M:test` runs offline with nothing
+  fetched. The deps.edn chain is still read, so aliases, `:main-opts` and
+  `:tasks` work; tools.deps' `--skip-cp` draws the line in the same place. What
+  goes with the expansion is a *dependency's* `:jolt/native` shared libraries —
+  the project's own still load.
 
 - **`-Sforce`, `-Sthreads N` and `-Jopt` are accepted and ignored**, so a tool
   that always passes them isn't rejected: jolt resolves its roots on every run
   (no classpath cache to force), fetches serially, and has no JVM. An `-S`
-  option jolt genuinely doesn't have now names itself as an unsupported option
-  instead of being reported as an unknown deps.edn task.
+  option jolt genuinely doesn't have (`-Sman`, `-Spom`) now names itself as an
+  unsupported option instead of being reported as an unknown deps.edn task.
 
 ### Fixed
 
