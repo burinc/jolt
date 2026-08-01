@@ -905,6 +905,8 @@
   {:suite "inst / value semantics & printing" :label "unequal instants" :expected "false" :actual "(= #inst \"2020-01-01T00:00:00Z\" #inst \"2020-01-01T00:00:01Z\")" :portability :common}
   {:suite "inst / value semantics & printing" :label "works as map key" :expected ":v" :actual "(get {#inst \"2020-01-01T00:00:00Z\" :v} #inst \"2020-01-01T00:00:00.000Z\")" :portability :common}
   {:suite "inst / value semantics & printing" :label "pr-str round-trips" :expected "\"#inst \\\"2020-01-01T00:00:00.000-00:00\\\"\"" :actual "(pr-str #inst \"2020-01-01T00:00:00Z\")" :portability :common}
+  {:suite "reader / delimiters" :label "a mismatched close reports, it does not hang" :expected "\"Unmatched delimiter: )\"" :actual "(try (read-string \"(def m {:a 1)\") (catch Exception e (.getMessage e)))" :portability :common}
+  {:suite "reader / delimiters" :label "mismatched bracket" :expected "\"Unmatched delimiter: }\"" :actual "(try (read-string \"[1 2}\") (catch Exception e (.getMessage e)))" :portability :common}
   {:suite "io / java.net.URL" :label "str renders the spec" :expected "\"https://e.com/x\"" :actual "(str (java.net.URL. \"https://e.com/x\"))" :portability :jvm}
   {:suite "io / java.net.URL" :label "empty authority collapses" :expected "\"file:/a/b/\"" :actual "(str (java.net.URL. \"file:///a/b/\"))" :portability :jvm}
   {:suite "io / java.net.URL" :label "empty authority collapses for http" :expected "\"http:/a\"" :actual "(str (java.net.URL. \"http:///a\"))" :portability :jvm}
