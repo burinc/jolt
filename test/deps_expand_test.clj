@@ -6,6 +6,7 @@
 
 (ns deps-expand-test
   (:require [clojure.string :as str]
+            [grenadine.version :as version]
             [jolt.deps :as deps]
             [jolt.deps.ext :as ext]))
 
@@ -19,7 +20,7 @@
 
 (defmethod ext/compare-versions [:fkn :fkn]
   [_lib coord-x coord-y]
-  (ext/compare-mvn-versions (:fkn/version coord-x) (:fkn/version coord-y)))
+  (version/compare-versions (:fkn/version coord-x) (:fkn/version coord-y)))
 
 (defmethod ext/coord-deps :fkn
   [lib coord]
@@ -186,8 +187,12 @@
 
 ;;;; Maven version comparator ordering
 
-(defn- lt [a b] (is= (str a " < " b) true (neg? (ext/compare-mvn-versions a b))))
-(defn- veq [a b] (is= (str a " = " b) 0 (ext/compare-mvn-versions a b)))
+(defn- cmp
+  "Through the :mvn method, so this pins the comparator the resolver really uses."
+  [a b]
+  (ext/compare-versions 'a/b {:mvn/version a} {:mvn/version b}))
+(defn- lt [a b] (is= (str a " < " b) true (neg? (cmp a b))))
+(defn- veq [a b] (is= (str a " = " b) 0 (cmp a b)))
 
 (lt "1.2.3" "1.2.10")
 (lt "1.9.0" "1.10.0")
@@ -203,6 +208,8 @@
 (veq "1.0" "1.0-final")
 (veq "1.0-ga" "1.0.0-release")
 (lt "1.0a1" "1.0")
+;; a dash opens a sub-list, which sorts under an integer in the same position
+(lt "1.0-1" "1.0.1")
 
 (println (str "deps-expand: " (- @checks @failures) "/" @checks " passed"))
 (when (pos? @failures)
