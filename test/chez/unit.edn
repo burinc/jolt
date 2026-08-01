@@ -659,6 +659,12 @@
   {:suite "threads" :expr "(let [t (Thread. (fn [] (Thread/sleep 30000)))] (.start t) (.join t 50) (.isAlive t))" :expected "true"}
   {:suite "threads" :expr "(let [t (Thread. (fn [] nil))] (.start t) (.join t 10000) (.isAlive t))" :expected "false"}
   {:suite "threads" :expr "(let [t (Thread. (fn [] nil))] (.start t) (.join t) (.isAlive t))" :expected "false"}
+  ;; join waits while the thread is ALIVE, and a thread that was never started
+  ;; never is — testing only the completion flag hung forever here, and burned the
+  ;; whole timeout in the bounded form.
+  {:suite "threads" :expr "(let [t (Thread. (fn [] nil))] (.join t) (.isAlive t))" :expected "false"}
+  {:suite "threads" :expr "(let [t (Thread. (fn [] nil)) a (System/nanoTime)] (.join t 5000) (< (- (System/nanoTime) a) 1000000000))" :expected "true"}
+  {:suite "threads" :expr "(try (.join (Thread. (fn [] nil)) -1) :no-throw (catch IllegalArgumentException e :iae))" :expected ":iae"}
   {:suite "telemetry" :expr "(clojure.string/starts-with? (jolt.host/scheme-version) \"Chez Scheme\")" :expected "true"}
   {:suite "telemetry" :expr "(let [m (jolt.host/machine-type)] [(string? m) (pos? (count m))])" :expected "[true true]"}
   ;; bytes-allocated reads the LIVE heap, so it only has to grow across an
