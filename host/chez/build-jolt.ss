@@ -93,18 +93,27 @@
 ;; its root-relative path ("jolt/main.clj", "clojure/string.clj") — exactly what
 ;; resolve-on-roots probes. Literals (not read-file-string at startup) because
 ;; flat.ss top-level forms run at every startup, with no source on disk.
+;;
+;; FIRST ROOT WINS, because that is what resolve-on-roots does on disk. Two roots
+;; can hold the same namespace — a vendored library shipping a host adapter under
+;; a jolt name — and register-embedded-resource! is a plain hashtable-set!, so
+;; emitting both would hand the binary the LAST one and silently disagree with
+;; the source tree it was built from.
 (define (jb-emit-source-embeds out)
-  (for-each
-    (lambda (root)
-      (for-each
-        (lambda (rp)
-          (let ((rel (car rp)) (abs (cdr rp)))
-            (when (ldr-source-path? rel)
-              (put-string out (string-append
-                "(register-embedded-resource! " (ei-str-lit rel) " "
-                (ei-bytes-lit (read-file-string abs)) ")\n")))))
-        (bld-walk-files root "" '())))
-    ldr-install-roots))
+  (let ((baked (make-hashtable string-hash string=?)))
+    (for-each
+      (lambda (root)
+        (for-each
+          (lambda (rp)
+            (let ((rel (car rp)) (abs (cdr rp)))
+              (when (and (ldr-source-path? rel)
+                         (not (hashtable-ref baked rel #f)))
+                (hashtable-set! baked rel #t)
+                (put-string out (string-append
+                  "(register-embedded-resource! " (ei-str-lit rel) " "
+                  (ei-bytes-lit (read-file-string abs)) ")\n")))))
+          (bld-walk-files root "" '())))
+      ldr-install-roots)))
 
 ;; Embed every runtime .ss the build inlines into an app (the transitive closure of
 ;; the manifest's loads: rt.ss + all it loads, the seed, compile-eval, loader, ffi,

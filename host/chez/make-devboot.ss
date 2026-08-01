@@ -86,19 +86,23 @@
                   (ei-bytes-lit (read-file-string path)) ")\n")))
             db-paths)
   ;; jolt-core + stdlib source embeds (bytevector values, 1B/char).
+  ;; First root wins, matching resolve-on-roots — see jb-emit-source-embeds.
   (put-string out "\n;; === embedded jolt-core + stdlib source ===\n")
-  (for-each
-    (lambda (root)
-      (for-each
-        (lambda (rp)
-          (let ((rel (car rp)) (abs (cdr rp)))
-            (when (ldr-source-path? rel)
-              (put-string out
-                (string-append
-                  "(register-embedded-resource! " (ei-str-lit rel) " "
-                  (ei-bytes-lit (read-file-string abs)) ")\n")))))
-        (bld-walk-files root "" '())))
-    ldr-install-roots)
+  (let ((baked (make-hashtable string-hash string=?)))
+    (for-each
+      (lambda (root)
+        (for-each
+          (lambda (rp)
+            (let ((rel (car rp)) (abs (cdr rp)))
+              (when (and (ldr-source-path? rel)
+                         (not (hashtable-ref baked rel #f)))
+                (hashtable-set! baked rel #t)
+                (put-string out
+                  (string-append
+                    "(register-embedded-resource! " (ei-str-lit rel) " "
+                    (ei-bytes-lit (read-file-string abs)) ")\n")))))
+          (bld-walk-files root "" '())))
+      ldr-install-roots))
   ;; Preload jolt.main + jolt.deps into the image.
   (put-string out "\n;; === AOT jolt.main + jolt.deps ===\n")
   (put-string out "(load-namespace \"jolt.main\")\n")

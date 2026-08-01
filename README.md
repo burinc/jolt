@@ -37,7 +37,7 @@ fatal:
   `io.github.OWNER/REPO` clones from GitHub.
 - **Maven deps** (`:mvn/version`) are downloaded over HTTPS by jolt itself (no
   `curl`), using the system **OpenSSL** (`libssl`/`libcrypto`) via FFI, and
-  extracted with `unzip`. Jolt embeds [Grenadine](https://github.com/ingydotnet/grenadine)
+  extracted with `unzip`. Jolt embeds [Grenadine](https://github.com/clojurestar/grenadine)
   to build effective POMs and resolve transitive dependencies without Java. A
   jar already in `~/.m2/repository` is reused with no download. Set
   `GRENADINE_LOCAL_REPOSITORY` to use another repository; an explicit
@@ -93,9 +93,10 @@ cd jolt
 bin/jolt -e '(+ 1 2)'        # => 3
 ```
 
-The `--recurse-submodules` matters: jolt vendors its regex engine and test
-suites as git submodules. In a checkout that's missing them (a plain
-`git clone`, or after pulling a commit that adds one), fetch them with:
+The `--recurse-submodules` matters: jolt vendors its regex engine, its Maven
+resolver, and its test suites as git submodules. In a checkout that's missing
+them (a plain `git clone`, or after pulling a commit that adds one), fetch them
+with:
 
 ```bash
 git submodule update --init --recursive

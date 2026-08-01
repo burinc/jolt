@@ -138,6 +138,14 @@ check '(->> (range 10) (filter even?) (map (fn [x] (* x x))) (reduce +))' '120'
 check '(let [{:keys [a b] :or {b 99}} {:a 1}] [a b])' '[1 99]'
 check '(map inc [1 2 3])' '(2 3 4)'
 check '(require [clojure.string :as s]) (s/upper-case "hello")' '"HELLO"'
+# The source a binary serves for a namespace is jolt's own, not a same-named one
+# from a later install root — the vendored Grenadine ships a jolt.deps facade for
+# embedders. Roots are first-wins and the bake matches, but only for source: the
+# ns itself is AOT-emitted and would keep working, so what a swap actually breaks
+# is io/resource, which is how orchard resolves a namespace to a file. Get it
+# backwards and an editor jumps to the wrong jolt/deps.clj.
+check '(require [clojure.java.io :as io] [clojure.string :as s])
+       (s/includes? (slurp (io/resource "jolt/deps.clj")) "defn resolve-project")' 'true'
 check '(eval (quote (+ 1 2)))' '3'
 check '(load-string "(def y 5) (* y y)")' '25'
 check '(defmacro add1 [x] (list (quote +) x 1)) (add1 10)' '11'
