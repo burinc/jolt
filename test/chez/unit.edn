@@ -229,6 +229,13 @@
   {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"hello\") (slurp \"/tmp/jolt-io-test.txt\"))" :expected "\"hello\""}
   {:suite "io" :expr "(do (spit \"/tmp/jolt-io-test.txt\" \"a\") (spit \"/tmp/jolt-io-test.txt\" \"b\" :append true) (slurp \"/tmp/jolt-io-test.txt\"))" :expected "\"ab\""}
   {:suite "io" :expr "(flush)" :expected ""}
+  ;; .listFiles / file-seq keep the form of the path they were given, like the
+  ;; JVM's new File(this, name) — a relative directory lists relative children.
+  ;; They used to answer absolute paths, so a caller relativizing the result
+  ;; against the directory it passed in (classpath scanning) got ../.. garbage.
+  {:suite "io" :expr "(do (.mkdirs (java.io.File. \"/tmp/jolt-ls-test/d\")) (spit \"/tmp/jolt-ls-test/d/a.txt\" \"x\") (with-out-str (print (mapv str (.listFiles (java.io.File. \"/tmp/jolt-ls-test/d\"))))))" :expected "\"[/tmp/jolt-ls-test/d/a.txt]\""}
+  {:suite "io" :expr "(do (.mkdirs (java.io.File. \"target/jolt-ls-rel/sub\")) (spit \"target/jolt-ls-rel/sub/a.txt\" \"x\") (mapv str (file-seq (java.io.File. \"target/jolt-ls-rel\"))))" :expected "[\"target/jolt-ls-rel\" \"target/jolt-ls-rel/sub\" \"target/jolt-ls-rel/sub/a.txt\"]"}
+  {:suite "io" :expr "(do (.mkdirs (java.io.File. \"target/jolt-ls-rel/sub\")) (mapv str (.listFiles (java.io.File. \"./target/jolt-ls-rel/\"))))" :expected "[\"./target/jolt-ls-rel/sub\"]"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (string? (slurp (io/file \"README.md\"))))" :expected "true"}
   {:suite "ioreader" :expr "(apply str (char-array \"abc\"))" :expected "\"abc\""}
   {:suite "ioreader" :expr "(.read (StringReader. (apply str (char-array \"Qz\"))))" :expected "81"}
@@ -799,6 +806,15 @@
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) m (a/mult c) t1 (a/chan) t2 (a/chan)] (a/tap m t1) (a/tap m t2) (a/>!! c :x) [(a/<!! t1) (a/<!! t2)]))" :expected "[:x :x]"}
   ;; clojure.test — instance? in is still reports correctly (instance? is a fn)
   {:suite "clojure.test" :expr "(do (require '[clojure.test :as t]) (t/reset-report!) (t/deftest t1 (t/is (instance? String 5))) (t/run-tests) [(t/n-pass) (t/n-fail)])" :expected "[0 1]"}
+  ;; clojure.test — the report map carries :expected (the form as written) and
+  ;; :actual (the form with its arguments evaluated, or the throwable), which is
+  ;; the contract every custom reporter reads. They used to be folded into a
+  ;; rendered :message, leaving a reporter (CIDER's test op, test.check,
+  ;; matcher-combinators) with nothing to report.
+  {:suite "clojure.test" :expr "(do (require '[clojure.test :as t]) (let [r (atom nil)] (binding [t/report (fn [m] (reset! r m))] (t/is (= 5 (+ 2 2)))) [(:type @r) (:expected @r) (:actual @r)]))" :expected "[:fail (= 5 (+ 2 2)) (not (= 5 4))]"}
+  {:suite "clojure.test" :expr "(do (require '[clojure.test :as t]) (let [r (atom nil)] (binding [t/report (fn [m] (reset! r m))] (t/is (= 1 (throw (ex-info \"kaboom\" {}))))) [(:type @r) (:expected @r) (ex-message (:actual @r))]))" :expected "[:error (= 1 (throw (ex-info \"kaboom\" {}))) \"kaboom\"]"}
+  {:suite "clojure.test" :expr "(do (require '[clojure.test :as t]) (let [r (atom nil)] (binding [t/report (fn [m] (reset! r m))] (t/is (instance? String 5))) [(:type @r) (:actual @r)]))" :expected "[:fail java.lang.Long]"}
+  {:suite "clojure.test" :expr "(do (require '[clojure.test :as t]) (binding [t/report (fn [_])] [(t/is (= 1 1)) (t/is 42) (t/is (instance? String \"s\")) (t/is (nil? nil))]))" :expected "[true 42 true true]"}
   ;; clojure.test — report multimethod override fires on assertion outcomes
   {:suite "clojure.test" :expr "(do (require '[clojure.test :as t]) (t/reset-report!) (def rpt (atom false)) (defmethod t/report :fail [m] (reset! rpt true)) (t/deftest t2 (t/is (= 1 2))) (t/run-tests) @rpt)" :expected "true"}
   ;; clojure.test — interned (:test meta) tests run inside :once fixtures

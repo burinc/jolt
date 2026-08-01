@@ -204,6 +204,11 @@
   {:suite "interop / SoftReference" :label "get returns the referent" :expected ":v" :actual "(.get (java.lang.ref.SoftReference. :v))" :portability :jvm}
   {:suite "interop / System.gc" :label "gc runs and returns" :expected "42" :actual "(do (System/gc) 42)" :portability :jvm}
   {:suite "interop / ConcurrentHashMap" :label "put + get/count/contains?" :expected "[1 1 true]" :actual "(let [m (java.util.concurrent.ConcurrentHashMap.)] (.put m :a 1) [(get m :a) (count m) (contains? m :a)])" :portability :jvm}
+  ;; The java.util.Map default methods: putIfAbsent answers the PREVIOUS value,
+  ;; the compute/merge family the NEW one, and a nil mapping counts as absent.
+  {:suite "interop / HashMap default methods" :label "putIfAbsent/computeIfAbsent/merge/compute/replace" :expected "[nil 1 1 10 10 15 42 nil 1 7 {:a 7 :b 15 :c 42}]" :actual "(let [m (java.util.HashMap.)] [(.putIfAbsent m :a 1) (.putIfAbsent m :a 2) (.get m :a) (.computeIfAbsent m :b (fn [k] 10)) (.computeIfAbsent m :b (fn [k] 99)) (.merge m :b 5 (fn [a b] (+ a b))) (.compute m :c (fn [k v] (if v 1 42))) (.computeIfPresent m :zz (fn [k v] 1)) (.replace m :a 7) (.get m :a) (into (sorted-map) m)])" :portability :jvm}
+  {:suite "interop / HashMap default methods" :label "compute returning nil removes the entry" :expected "[nil false 0]" :actual "(let [m (java.util.HashMap.)] (.put m :a 1) [(.compute m :a (fn [k v] nil)) (contains? m :a) (count m)])" :portability :jvm}
+  {:suite "interop / HashMap default methods" :label "forEach walks every entry" :expected "[[:a 1] [:b 2]]" :actual "(let [m (java.util.HashMap.) seen (atom [])] (.put m :a 1) (.put m :b 2) (.forEach m (fn [k v] (swap! seen conj [k v]))) (vec (sort-by first @seen)))" :portability :jvm}
   {:suite "interop / Class.forName" :label "unknown class throws ClassNotFoundException" :expected ":nf" :actual "(try (Class/forName \"no.such.Klass\") (catch ClassNotFoundException _ :nf))" :portability :jvm}
   {:suite "interop / Class.forName" :label "known class resolves" :expected "\"java.lang.String\"" :actual "(.getName (Class/forName \"java.lang.String\"))" :portability :jvm}
   {:suite "interop / Class.forName" :label "miss with known last-segment throws ClassNotFoundException" :expected ":cnfe" :actual "(try (Class/forName \"com.acme.String\") (catch ClassNotFoundException _ :cnfe))" :portability :jvm}
@@ -3037,6 +3042,16 @@
   {:suite "untested / hash family" :label "hash stable" :expected "true" :actual "(= (hash :a) (hash :a))" :portability :common}
   {:suite "untested / hash family" :label "hash int" :expected "true" :actual "(int? (hash [1 2]))" :portability :common}
   {:suite "untested / hash family" :label "hash-combine" :expected "true" :actual "(int? (hash-combine 1 2))" :portability :common}
+  ;; hash-combine's second argument is a VALUE, not a precomputed int: core is
+  ;; (Util/hashCombine x (Util/hash y)). jolt passed it through raw, so it threw
+  ;; out of bitwise-and on anything but a number.
+  {:suite "untested / hash family" :label "hash-combine hashes its second argument" :expected "-1640531430" :actual "(hash-combine 0 \"a\")" :portability :common}
+  {:suite "untested / hash family" :label "hash-combine over a keyword" :expected "-626406081" :actual "(hash-combine 17 :kw)" :portability :common}
+  {:suite "untested / hash family" :label "hash-combine over nil hashes it as 0" :expected "-1640531527" :actual "(hash-combine 0 nil)" :portability :common}
+  ;; Keyword.hashCode() is sym.hashCode() + 0x9e3779b9 — a JAVA hash, distinct
+  ;; from the keyword's hasheq, which is what jolt used to answer .hashCode with.
+  {:suite "untested / hash family" :label "keyword .hashCode is the Java hash, not hasheq" :expected "[1014124337 1158308175]" :actual "[(.hashCode :kw) (hash :kw)]" :portability :jvm}
+  {:suite "untested / hash family" :label "qualified keyword .hashCode" :expected "1013910665" :actual "(.hashCode :a/b)" :portability :jvm}
   {:suite "untested / hash family" :label "hash-ordered-coll" :expected "true" :actual "(int? (hash-ordered-coll [1 2]))" :portability :common}
   {:suite "untested / hash family" :label "hash-unordered-coll" :expected "true" :actual "(int? (hash-unordered-coll #{1}))" :portability :common}
   {:suite "untested / array stubs (vectors + host buffers)" :label "make-array" :expected "[nil nil nil]" :actual "(vec (make-array Object 3))" :portability :jvm}
