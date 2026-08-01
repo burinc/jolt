@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`java.class.path` answers with the resolved source roots.** jolt's classpath
+  is its source roots — the project's `:paths`, every dependency's root, and the
+  roots jolt ships — and the loader now publishes them through the system-property
+  table. Editor tooling ported from the JVM discovers project sources through that
+  property, so with it unset orchard's namespace scan, compliment's classpath
+  completion sources and cider-nrepl's `classpath` op all quietly returned nothing.
+
+- **`jolt.nrepl`: `register-version!`, REPL history vars, and the last error's
+  backtrace.** Middleware could register ops but not versions, so an editor had no
+  way to learn what dialect the server speaks (CIDER refuses the cider-nrepl ops
+  without a version entry); `register-version!` is the seam, beside
+  `register-ops!`. `evaluate` now sets `*1`/`*2`/`*3` and `*e` like every other
+  nREPL server, and records the backtrace of the exception in `*e`
+  (`last-error-backtrace`) — a jolt exception carries no stack of its own, and the
+  backtrace is only readable where it was caught, so tooling that presents the
+  error afterwards had nothing but the message. `*capturing-thread*` names the
+  thread whose output an eval is capturing, so middleware that forwards server
+  output doesn't send an eval's own output twice.
+
+### Fixed
+
+- **`clojure.test` report maps carry `:expected` and `:actual`.** Assertions
+  folded both into a rendered `:message`, leaving every custom reporter — CIDER's
+  test op, test.check, matcher-combinators, any TAP/JUnit reporter — with nothing
+  to report: a failure said what it printed but not what it compared. `:expected`
+  is now the form as written and `:actual` the form with its arguments evaluated
+  (or, for an error, the throwable itself rather than its message text), matching
+  clojure.test. `(is (instance? C x))` reports the class of `x` on both branches,
+  and `is` yields the value it tested, both like the reference.
+
+- **`clojure.core/hash-combine` hashes its second argument.** It is
+  `(Util/hashCombine x (Util/hash y))` — a seed and a VALUE — but jolt passed `y`
+  straight to the integer combiner, so `(hash-combine 0 "a")` threw out of
+  `bitwise-and` instead of hashing. Any ported library that folds `hash-combine`
+  over values died on the first non-number.
+
+- **A keyword's `.hashCode` is the Java hash, not its hasheq.**
+  `Keyword.hashCode()` is `sym.hashCode() + 0x9e3779b9`; jolt answered with the
+  murmur-based hasheq, so a keyword's `.hashCode` disagreed with the JVM while a
+  symbol's agreed.
+
+- **`.listFiles` / `file-seq` keep the form of the path they were given.** Like
+  `new File(this, name)`, listing a relative directory yields relative children;
+  jolt resolved the base to an absolute path first, so every child came back
+  absolute and a caller relativizing the results against the directory it passed
+  in (classpath scanning) got `../..`-prefixed garbage.
+
+- **`java.util.Map`'s default methods on the HashMap shim.** `putIfAbsent`,
+  `computeIfAbsent`, `computeIfPresent`, `compute`, `merge`, `replace` and
+  `forEach`, with the JVM's return values and its treatment of a nil mapping as
+  absent.
+
 ## [0.5.13] - 2026-08-01
 
 Locale-sensitive formatting works: `NumberFormat/getCurrencyInstance`,

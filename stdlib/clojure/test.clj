@@ -99,12 +99,20 @@
 ;; seam clojure.test assertions emit through. The built-in :pass/:fail/:error
 ;; methods feed jolt's counters; a library can add report types (test.check's
 ;; ::trial/::shrunk/::complete) and they dispatch here.
+;; A Throwable in :actual (an assertion that threw) renders as its class and
+;; message rather than as printed data — pr-str of a condition says nothing
+;; about what went wrong.
+(defn- report-value [v]
+  (if (instance? Throwable v)
+    (str (class v) ": " (err-text v))
+    (pr-str v)))
+
 (defn- report-line [m]
   (str (when (:message m) (str (:message m)
                                (when (or (:form m) (contains? m :expected) (contains? m :actual)) " ")))
        (when (:form m) (pr-str (:form m)))
        (when (contains? m :expected) (str " expected: " (pr-str (:expected m))))
-       (when (contains? m :actual) (str " actual: " (pr-str (:actual m))))))
+       (when (contains? m :actual) (str " actual: " (report-value (:actual m))))))
 (defmethod report :pass [_m] (inc-pass!))
 (defmethod report :fail [m] (fail! (report-line m)))
 (defmethod report :error [m] (err! (report-line m)))
@@ -220,7 +228,8 @@
             body  (nthrest form 2)]
         `(try
            ~@body
-           (clojure.test/do-report {:type :fail :message (str "expected " '~form " to throw" (when ~msg (str " — " ~msg)))})
+           (clojure.test/do-report {:type :fail :message (str "expected " '~form " to throw" (when ~msg (str " — " ~msg)))
+                                    :expected '~form :actual nil})
            (catch Throwable e#
              ;; instance? honors the exception hierarchy (a literal class symbol), so
              ;; (thrown? IllegalArgumentException …) matches an ArityException subclass
@@ -228,8 +237,9 @@
              ;; models only by name.
              (if (or (clojure.core/instance? ~klass-sym e#)
                      (clojure.test/class-match? e# ~klass))
-               (clojure.test/do-report {:type :pass})
-               (clojure.test/do-report {:type :fail :message (str "expected throw of " ~klass " but got " (clojure.core/class e#))})))))
+               (clojure.test/do-report {:type :pass :message ~msg :expected '~form :actual e#})
+               (clojure.test/do-report {:type :fail :message (str "expected throw of " ~klass " but got " (clojure.core/class e#))
+                                        :expected '~form :actual e#})))))
 
       ;; (is (thrown-with-msg? Class re body...))
       (thrown-form? form "thrown-with-msg?")
@@ -239,7 +249,8 @@
             body  (nthrest form 3)]
         `(try
            ~@body
-           (clojure.test/do-report {:type :fail :message (str "expected " '~form " to throw")})
+           (clojure.test/do-report {:type :fail :message (str "expected " '~form " to throw")
+                                    :expected '~form :actual nil})
            (catch Throwable e#
              (let [m# (or (clojure.core/ex-message e#) (str e#))]
                ;; honor the class hierarchy (ExceptionInfo IS a RuntimeException),
@@ -247,39 +258,63 @@
                (if (and (or (clojure.core/instance? ~klass-sym e#)
                             (clojure.test/class-match? e# ~klass))
                         (re-find ~re m#))
-                 (clojure.test/do-report {:type :pass})
-                 (clojure.test/do-report {:type :fail :message (str "expected throw of " ~klass " matching " ~re " but got " (clojure.core/class e#) ": " m#)}))))))
+                 (clojure.test/do-report {:type :pass :message ~msg :expected '~form :actual e#})
+                 (clojure.test/do-report {:type :fail :message (str "expected throw of " ~klass " matching " ~re " but got " (clojure.core/class e#) ": " m#)
+                                          :expected '~form :actual e#}))))))
 
       ;; instance? gets a dedicated report path for a clearer fail message
       ;; (mirrors thrown? above); it is a function now, but keep the explicit form.
       (and (seq? form) (= 'instance? (first form)))
       `(try
-         (if (instance? ~(second form) ~(nth form 2))
-           (clojure.test/do-report {:type :pass})
-           (clojure.test/do-report {:type :fail :message ~msg :form '~form}))
+         (let [object# ~(nth form 2)
+               result# (instance? ~(second form) object#)]
+           ;; :actual is the object's CLASS either way, like clojure.test's own
+           ;; instance? assertion — "expected a String, got a Long" is the useful
+           ;; report, not "got false".
+           (if result#
+             (clojure.test/do-report {:type :pass :message ~msg :expected '~form
+                                      :actual (clojure.core/class object#)})
+             (clojure.test/do-report {:type :fail :message ~msg :form '~form
+                                      :expected '~form :actual (clojure.core/class object#)}))
+           result#)
          (catch Throwable e#
            (clojure.test/do-report {:type :error :message ~msg :form '~form
-                                    :actual (clojure.test/err-text e#)})))
+                                    :expected '~form :actual e#})))
 
       ;; a predicate call — (= a b), (< x y), (pred? v): evaluate the args so a
       ;; failure shows the actual values, like clojure.test's assert-predicate.
+      ;; :expected is the form as written and :actual the form with its arguments
+      ;; evaluated, which is the contract every clojure.test reporter reads —
+      ;; a report that folded them into :message left a custom reporter (CIDER's
+      ;; test op, test.check, matcher-combinators) with nothing to show.
       (and (seq? form) (contains? clojure.test/reported-preds (first form)))
       `(try
-         (let [vs# (list ~@(rest form))]
-           (if (apply ~(first form) vs#)
-             (clojure.test/do-report {:type :pass})
-             (clojure.test/do-report {:type :fail :message (str (pr-str (list '~'not (cons '~(first form) vs#)))
-                                                                  (when ~msg (str " — " ~msg)))})))
+         (let [vs# (list ~@(rest form))
+               result# (apply ~(first form) vs#)]
+           (if result#
+             (clojure.test/do-report {:type :pass :message ~msg
+                                      :expected '~form :actual (cons '~(first form) vs#)})
+             (clojure.test/do-report {:type :fail :message ~msg :form '~form
+                                      :expected '~form
+                                      :actual (list '~'not (cons '~(first form) vs#))}))
+           result#)
          (catch Throwable e#
-           (clojure.test/do-report {:type :error :message (str (pr-str '~form) " threw: " (clojure.test/err-text e#))})))
+           (clojure.test/do-report {:type :error :message ~msg :form '~form
+                                    :expected '~form :actual e#})))
 
+     ;; `is` yields the value it tested (clojure.test's does), so it composes:
+     ;; (let [x (is (find-thing))] …)
      :else
      `(try
-        (if ~form
-          (clojure.test/do-report {:type :pass})
-          (clojure.test/do-report {:type :fail :message (str (pr-str '~form) (when ~msg (str " — " ~msg)))}))
+        (let [value# ~form]
+          (if value#
+            (clojure.test/do-report {:type :pass :message ~msg :expected '~form :actual value#})
+            (clojure.test/do-report {:type :fail :message ~msg :form '~form
+                                     :expected '~form :actual value#}))
+          value#)
         (catch Throwable e#
-          (clojure.test/do-report {:type :error :message (str (pr-str '~form) " threw: " (clojure.test/err-text e#))}))))))
+          (clojure.test/do-report {:type :error :message ~msg :form '~form
+                                   :expected '~form :actual e#}))))))
 
 (defmacro testing [s & body]
   `(binding [clojure.test/*testing-contexts* (conj clojure.test/*testing-contexts* ~s)]

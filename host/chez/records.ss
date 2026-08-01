@@ -1407,7 +1407,13 @@
              ((string=? method-name "toString")
               (string-append ":" (if (keyword-t-ns obj) (string-append (keyword-t-ns obj) "/") "")
                              (keyword-t-name obj)))
-             ((string=? method-name "hashCode") (keyword-t-khash obj))
+             ;; Keyword.hashCode() is sym.hashCode() + 0x9e3779b9 — the JAVA
+             ;; hash of the symbol, not its hasheq. keyword-t-khash is the hasheq
+             ;; (murmur-based), which .hashCode answered with, so a keyword's
+             ;; .hashCode disagreed with the JVM while a symbol's agreed.
+             ((string=? method-name "hashCode")
+              (jolt-s32 (+ (java-symbol-hash (keyword-t-name obj) (keyword-t-ns obj))
+                           #x9e3779b9)))
              ((string=? method-name "equals") (and (pair? rest) (eq? obj (car rest))))
              (else (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name " on Keyword")))))
       ;; clojure.lang.Symbol interop: the Named methods + getName/getNamespace.

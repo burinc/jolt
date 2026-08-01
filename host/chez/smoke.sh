@@ -872,5 +872,36 @@ else
 fi
 rm -rf "$bare"
 
+# A stale PWD does not decide where relative paths resolve. PWD is a shell
+# convention, not the process's working directory: a child started elsewhere (a
+# jolt.process :dir, or any parent that chdirs) inherits the parent's PWD, and
+# trusting it sent every relative path — the project's own deps.edn included —
+# to the parent's directory. This is what broke `make libconformance`, which runs
+# each library's suite with :dir set to that library's root.
+stale="$(mktemp -d)"
+mkdir -p "$stale/proj/src/sp"
+printf '{:paths ["src"] :aliases {:run {:main-opts ["-m" "sp.core"]}}}\n' > "$stale/proj/deps.edn"
+printf '(ns sp.core)\n(defn -main [& _] (println "cwd-wins:" (System/getProperty "user.dir")))\n' > "$stale/proj/src/sp/core.clj"
+abs_jolt2="$(cd "$(dirname "$JOLT_BIN")" && pwd)/$(basename "$JOLT_BIN")"
+stale_out="$( cd "$stale/proj" && PWD=/definitely/not/here "$abs_jolt2" -M:run 2>&1 )"
+if printf '%s' "$stale_out" | grep -q "cwd-wins:.*/proj"; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a stale PWD should not override the process's own working directory"
+  printf '%s\n' "$stale_out" | sed 's/^/    | /'
+  fails=$((fails + 1))
+fi
+# JOLT_PWD still wins — that is how bin/jolt reports the user's cwd after cd'ing
+# to the repo root.
+jp_out="$( cd "$stale" && JOLT_PWD="$stale/proj" "$abs_jolt2" -M:run 2>&1 )"
+if printf '%s' "$jp_out" | grep -q "cwd-wins:.*/proj"; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: JOLT_PWD should still name the project directory"
+  printf '%s\n' "$jp_out" | sed 's/^/    | /'
+  fails=$((fails + 1))
+fi
+rm -rf "$stale"
+
 echo "cli smoke: $pass passed, $fails failed"
 [ "$fails" -eq 0 ]

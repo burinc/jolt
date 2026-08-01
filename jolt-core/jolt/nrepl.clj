@@ -179,21 +179,62 @@
       (try ((resolve 'jolt.host/condition-message) e) (catch :default _ nil))
       (pr-str e)))
 
+(def ^:dynamic *capturing-thread*
+  "The thread of an `evaluate` in flight, for as long as it is capturing *out* to
+  return with the result — nil otherwise. Middleware that also forwards the
+  server's output (an out-subscribe implementation, which tees the *out* ROOT)
+  compares this against the writing thread, so an eval's own output isn't sent
+  twice: once in the eval reply and again as a stray `out` message.
+
+  It holds the THREAD rather than a flag because a future started by an eval
+  inherits the eval's bindings: a flag would read as true there and silence the
+  background output an out-subscribe exists to deliver. The inherited value is
+  the parent's thread, which is not the one writing."
+  nil)
+
+(def ^:private last-backtrace (atom nil))
+(defn last-error-backtrace
+  "The host backtrace of the exception now in *e, as jolt.host/backtrace-string
+  rendered it at the moment it was thrown, or nil.
+
+  A jolt exception value carries no stack of its own (Throwable->map has an empty
+  :trace), and the backtrace is only readable right where it was caught — so
+  `evaluate` records it here for tooling that presents the error afterwards (an
+  editor's error view, a stacktrace op), which otherwise has nothing but the
+  message to show."
+  [] @last-backtrace)
+
 (defn evaluate
   "Evaluate `code` (optionally in loaded ns `ns-str`), capturing *out*. Returns
   {:value .. :out .. :ns .. :err ..}. in-ns — not (binding [*ns* ..]) — sets the
   ns load-string resolves against on jolt. Reusable by eval middleware."
   [code ns-str]
-  (let [result (atom nil) err (atom nil)
+  (let [result (atom nil) err (atom nil) exc (atom nil)
         out (with-out-str
-              (try (when (and ns-str (not (str/blank? ns-str)) (find-ns (symbol ns-str)))
-                     (in-ns (symbol ns-str)))
-                   (reset! result (binding [*allow-unresolved-vars* true]
-                                    (load-string code)))
-                   (catch :default e
-                     (reset! err (str (err-msg e)
-                                      (when-let [bt (jolt.host/backtrace-string)]
-                                        (str "\n" bt)))))))]
+              (binding [*capturing-thread* (Thread/currentThread)]
+                (try (when (and ns-str (not (str/blank? ns-str)) (find-ns (symbol ns-str)))
+                       (in-ns (symbol ns-str)))
+                     (reset! result (binding [*allow-unresolved-vars* true]
+                                      (load-string code)))
+                     (catch :default e
+                       ;; the backtrace is read here, while it still describes
+                       ;; THIS failure
+                       (reset! exc e)
+                       (let [bt (jolt.host/backtrace-string)]
+                         (reset! last-backtrace bt)
+                         (reset! err (str (err-msg e) (when bt (str "\n" bt)))))))))]
+    ;; the REPL history vars, like clojure.main's REPL and every other nREPL
+    ;; server: an editor session can reach for *1 or (ex-data *e) after an error,
+    ;; and tooling (a stacktrace op) reads *e to find the last exception. These
+    ;; are process-wide roots — an nREPL server has no outer REPL loop whose
+    ;; thread bindings would shadow them.
+    ;; *e (and the backtrace beside it) survives a later successful eval, like
+    ;; every REPL's does
+    (if @exc
+      (alter-var-root #'*e (constantly @exc))
+      (do (alter-var-root #'*3 (constantly *2))
+          (alter-var-root #'*2 (constantly *1))
+          (alter-var-root #'*1 (constantly @result))))
     {:value (when (nil? @err) (pr-str @result))
      :out out
      :ns (str (ns-name *ns*))
@@ -204,6 +245,16 @@
 (defn register-ops!
   "Register op name(s) so `describe` advertises them. Call at middleware load."
   [& ops] (swap! extra-ops into (map name ops)))
+
+;; versions middleware advertise via describe, beside jolt's own. An editor reads
+;; this to decide what the server can do: CIDER looks for a "cider-nrepl" entry
+;; and refuses to use the ops it implies without one.
+(def ^:private extra-versions (atom {}))
+(defn register-version!
+  "Register a `describe` version entry: (register-version! \"cider-nrepl\"
+  {\"major\" 0 \"minor\" 57 \"incremental\" 0 \"version-string\" \"0.57.0\"}).
+  Call at middleware load, like register-ops!."
+  [name version] (swap! extra-versions assoc (clojure.core/name name) version))
 
 (defn completions
   "Return nREPL completion entries for `prefix` in request namespace `ns-str`.
@@ -252,7 +303,9 @@
       (= op "clone")    (respond request {"new-session" (new-session) "status" ["done"]})
       (= op "close")    (respond request {"status" ["session-closed" "done"]})
       (= op "describe") (respond request {"status" ["done"]
-                                          "versions" {"jolt-nrepl" {"major" 0 "minor" 1}}
+                                          "versions" (merge {"jolt-nrepl" {"major" 0 "minor" 1}
+                                                             "jolt" {"version-string" (jolt.host/jolt-version)}}
+                                                            @extra-versions)
                                           "ops" (zipmap (into #{"clone" "close" "describe" "eval" "load-file"
                                                                 "completions" "complete"}
                                                               @extra-ops)

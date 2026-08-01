@@ -171,9 +171,18 @@ auto-detect the port; override it with the argument or `JOLT_NREPL_PORT`.
 
 The server runs in dev mode — calls deref their var, so redefining a function
 takes effect on the next call without restarting the process. The built-in
-handler speaks `clone`/`describe`/`eval`/`load-file`/`close`; heavier ops
-(sessions, interruptible eval, completion) are added as nREPL middleware listed
-in `deps.edn` under `:nrepl/middleware`.
+handler speaks `clone`/`describe`/`eval`/`load-file`/`close`; everything past
+that is nREPL middleware, listed in `deps.edn` under `:nrepl/middleware`.
+[jolt-lang/nrepl](https://github.com/jolt-lang/nrepl) supplies both layers —
+sessions and interruptible eval, plus the cider-nrepl ops an editor expects
+(`info`, `complete`, the namespace browser, tests, error analysis):
+
+```clojure
+{:deps {jolt-lang/nrepl {:git/url "https://github.com/jolt-lang/nrepl"
+                         :git/sha "<full-sha>"}}
+ :nrepl/middleware [nrepl.middleware/default-middleware
+                    cider.nrepl/cider-middleware]}
+```
 
 ```clojure
 ;; from your editor, against the running process:

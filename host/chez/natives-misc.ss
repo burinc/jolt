@@ -102,7 +102,14 @@
 ;; --- hash family (JVM-compatible via hasheq.ss) ------------------------------
 ;; Replaces the old 24-bit masked hash with JVM Murmur3 hasheq.
 (define (nm-hash x) (jolt-hasheq x))
-(define (nm-hash-combine a b) (hash-combine a b))
+;; clojure.core/hash-combine (core_deftype.clj) is
+;;   (Util/hashCombine x (Util/hash y))
+;; — the first argument is a seed the caller already has as an int, the second is
+;; a VALUE that gets hashed on the way in. Passing y through raw made
+;; (hash-combine 0 "a") throw out of bitwise-and instead of hashing, so any
+;; ported library folding hash-combine over values (compliment hashes the
+;; classpath strings that way) died on the first non-integer.
+(define (nm-hash-combine seed x) (hash-combine seed (jolt-java-hashcode x)))
 (define (nm-hash-ordered-coll coll) (hash-ordered (jolt-seq coll)))
 (define (nm-hash-unordered-coll coll) (hash-unordered (jolt-seq coll)))
 (define (nm-mix-collection-hash hash-basis count) (mix-coll-hash hash-basis count))
