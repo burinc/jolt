@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.13] - 2026-08-01
+
+Locale-sensitive formatting works: `NumberFormat/getCurrencyInstance`,
+`SimpleDateFormat`'s month and day names, and `String/format`'s decimal separator
+all honor a `Locale`, with the per-locale data supplied by jolt-lang/time through
+a new extension-point seam. `io/resource` returns a `java.net.URL` like the JVM,
+`:use` honors `:exclude`, and a mismatched delimiter reports its position instead
+of hanging the reader.
+
 ### Fixed
 
 - **`:use` honors `:exclude`, and `(:refer-clojure :exclude …)` lands in the ns
@@ -2494,7 +2503,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.12...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.13...HEAD
+[0.5.13]: https://github.com/jolt-lang/jolt/compare/v0.5.12...v0.5.13
 [0.5.12]: https://github.com/jolt-lang/jolt/compare/v0.5.11...v0.5.12
 [0.5.11]: https://github.com/jolt-lang/jolt/compare/v0.5.10...v0.5.11
 [0.5.10]: https://github.com/jolt-lang/jolt/compare/v0.5.9...v0.5.10
