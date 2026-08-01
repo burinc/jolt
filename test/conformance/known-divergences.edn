@@ -176,6 +176,12 @@
    :jvm "throws ArityException — these are arity-2 only"
    :jolt "folds like +: no args => 0, one => the operand, N => a left fold"
    :note "The overlay is variadic where the JVM's is fixed-arity. At arity 2 — every arity the JVM accepts — the wrapping result is identical, 64-bit edges included, so portable code is unaffected. Costs nothing on the hot path either: proven-long operands lower straight to jolt-uncadd2 (a left fold past 2 operands) and never reach the variadic overlay, which only serves value position."}
+  ;; keys/vals accept a plain 2-element vector where the JVM casts to Map.Entry.
+  {:category :permissive
+   :behavior "(keys [[:a 1] [:b 2]]) — a vector of pairs rather than of map entries"
+   :jvm "throws ClassCastException — PersistentVector is not a java.util.Map$Entry"
+   :jolt "(:a :b)"
+   :note "jolt reads any 2-element vector as an entry, so a vector of pairs walks like a seq of map entries. Anything else — a string, a number, a longer vector — is the same ClassCastException the JVM throws, naming the same class; keys never returns a nil or an index into a non-entry."}
   ;; auto-gensym suffix differs by a trailing "__".
   {:category :reader-model
    :behavior "an auto-gensym x# expands to a symbol named"

@@ -1173,11 +1173,28 @@
 ;; non-map still fails (its elements are not MapEntries).
 ;; Like RT.keys/vals, a non-map argument is any seq of map entries — (keys
 ;; (filter pred a-map)) walks the entries.
+;; An element the JVM could not cast to Map.Entry is a ClassCastException naming
+;; its class — never a nil, and never a stray index into whatever the element
+;; happened to be ((keys ["ab"]) must throw, not hand back the strings' first
+;; characters). A plain 2-element vector is accepted where the JVM casts: jolt
+;; reads a vector of pairs as a seq of entries, a documented superset.
+(define (entry-like? e)
+  (and (pvec? e) (= 2 (pvec-count e))))
+(define (entry-cast-error e)
+  (jolt-throw (jolt-host-throwable "java.lang.ClassCastException"
+                (string-append
+                  "class "
+                  (guard (x (#t "value"))
+                    (let ((c (jolt-class-name e)))
+                      (if (string? c) c (jolt-pr-str e))))
+                  " cannot be cast to class java.util.Map$Entry"))))
 (define (entry-seq-part m idx)
   (let loop ((s (jolt-seq m)) (acc '()))
     (if (jolt-nil? s)
         (list->cseq (reverse acc))
-        (loop (jolt-seq (seq-more s)) (cons (jolt-nth (seq-first s) idx jolt-nil) acc)))))
+        (let ((e (seq-first s)))
+          (unless (entry-like? e) (entry-cast-error e))
+          (loop (jolt-seq (seq-more s)) (cons (jolt-nth e idx jolt-nil) acc))))))
 (define (jolt-keys m)
   (cond ((jolt-nil? m) jolt-nil)
         ((pmap? m) (list->cseq (pmap-fold m (lambda (k v a) (cons k a)) '())))

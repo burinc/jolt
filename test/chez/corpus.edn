@@ -1359,6 +1359,8 @@
   {:suite "maps / keys-vals-empty? as overlay fns" :label "keys sorted order" :expected "[1 2 3]" :actual "(vec (keys (sorted-map 2 :b 1 :a 3 :c)))" :portability :common}
   {:suite "maps / keys-vals-empty? as overlay fns" :label "vals sorted order" :expected "[:a :b :c]" :actual "(vec (vals (sorted-map 2 :b 1 :a 3 :c)))" :portability :common}
   {:suite "maps / keys-vals-empty? as overlay fns" :label "keys/vals zip" :expected "{:a 1, :b 2}" :actual "(zipmap (keys {:a 1 :b 2}) (vals {:a 1 :b 2}))" :portability :common}
+  {:suite "maps / keys-vals-empty? as overlay fns" :label "keys/vals walk a seq of map entries" :expected "[[:a :b] [1 2]]" :actual "[(vec (keys (filter (fn [e] true) {:a 1 :b 2}))) (vec (vals (filter (fn [e] true) {:a 1 :b 2})))]" :portability :common}
+  {:suite "maps / keys-vals-empty? as overlay fns" :label "a non-entry element is a ClassCastException" :expected "[:cce :cce :cce :cce]" :actual "[(try (vec (keys [\"ab\"])) (catch ClassCastException _ :cce)) (try (vec (vals [\"ab\"])) (catch ClassCastException _ :cce)) (try (vec (keys [1 2])) (catch ClassCastException _ :cce)) (try (vec (keys [[:a 1 2]])) (catch ClassCastException _ :cce))]" :portability :common}
   {:suite "maps / keys-vals-empty? as overlay fns" :label "empty? map" :expected "true" :actual "(empty? {})" :portability :common}
   {:suite "maps / keys-vals-empty? as overlay fns" :label "empty? vec" :expected "[true false]" :actual "[(empty? []) (empty? [1])]" :portability :common}
   {:suite "maps / keys-vals-empty? as overlay fns" :label "empty? list" :expected "[true false]" :actual "[(empty? ()) (empty? (list 1))]" :portability :common}
