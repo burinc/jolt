@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.16] - 2026-08-01
+
+Chez's clocks and collector counters are readable from Clojure now, as plain
+integers off `jolt.host`, which is enough for a profiler, a health endpoint or an
+OpenTelemetry exporter to work from. `System/nanoTime` and `Thread.join` were
+both wrong in ways that surfaced on the way there.
+
+### Added
+
+- **Telemetry primitives on `jolt.host`.** Two clocks (`wall-nanos`,
+  `mono-nanos`), the collector's counters (`cpu-nanos`, `real-nanos`,
+  `gc-count`, `gc-cpu-nanos`, `gc-real-nanos`, `gc-bytes`), the allocator's
+  (`bytes-allocated`, `current-memory-bytes`, `maximum-memory-bytes`),
+  `thread-id`, and the runtime's own identity (`scheme-version`,
+  `machine-type`). Chez tracked all of it already, but only behind record types
+  — time objects and sstats — that Clojure code can't do arithmetic on. The two
+  clocks stay distinct on purpose: `wall-nanos` is the only one a remote
+  collector can interpret and ntp can step it, `mono-nanos` never steps but has
+  an arbitrary origin, so anything reporting both an absolute timestamp and a
+  duration needs both and derives the timestamp from the pair.
+
+### Fixed
+
+- **`System/nanoTime` is monotonic.** It was `(* 1000000 (now-millis))` —
+  wall-clock derived, so a clock step ran it backwards, and millisecond-granular,
+  so any interval shorter than a millisecond timed as zero. It reads Chez's
+  `'time-monotonic` clock now, which is the JVM's contract for it.
+
+- **`Thread.join` honors its timeout and returns on an unstarted thread.** The
+  timeout argument was discarded outright, so every bounded join was an unbounded
+  one — a caller that joined a long-lived worker with a timeout deadlocked
+  instead of giving up. Both forms also waited on the "thread finished" flag
+  rather than on liveness, and that flag is never set on a thread that was never
+  started, so `join()` on one blocked forever and `join(ms)` burned the whole
+  timeout where the JVM returns at once. A negative timeout throws
+  `IllegalArgumentException` instead of waiting indefinitely.
+
 ## [0.5.15] - 2026-08-01
 
 Dependency resolution reads the POM Maven would. jolt used to take a jar's
