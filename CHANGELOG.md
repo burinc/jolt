@@ -12,8 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Maven transitive deps come from the real effective POM.** jolt used to scrape
   the `pom.xml` a jar happened to package under `META-INF/maven/`, so a jar that
   ships without one — `metosin/malli` is one — contributed no transitive deps at
-  all, and a project had to list them by hand. jolt now embeds
-  [Grenadine](https://github.com/ingydotnet/grenadine) and builds the effective
+  all, and a project had to list them by hand. jolt now vendors
+  [Grenadine](https://github.com/clojurestar/grenadine) as a git submodule under
+  `vendor/`, alongside irregex and babashka fs/process, and builds the effective
   POM from the repository: parent inheritance, properties, dependency
   management, BOM imports, and `<exclusions>`, which the expander already
   honored but never received. Resolving malli picks up its five deps and their

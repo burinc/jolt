@@ -86,19 +86,23 @@
                   (ei-bytes-lit (read-file-string path)) ")\n")))
             db-paths)
   ;; jolt-core + stdlib source embeds (bytevector values, 1B/char).
+  ;; First root wins, matching resolve-on-roots — see jb-emit-source-embeds.
   (put-string out "\n;; === embedded jolt-core + stdlib source ===\n")
-  (for-each
-    (lambda (root)
-      (for-each
-        (lambda (rp)
-          (let ((rel (car rp)) (abs (cdr rp)))
-            (when (ldr-source-path? rel)
-              (put-string out
-                (string-append
-                  "(register-embedded-resource! " (ei-str-lit rel) " "
-                  (ei-bytes-lit (read-file-string abs)) ")\n")))))
-        (bld-walk-files root "" '())))
-    ldr-install-roots)
+  (let ((baked (make-hashtable string-hash string=?)))
+    (for-each
+      (lambda (root)
+        (for-each
+          (lambda (rp)
+            (let ((rel (car rp)) (abs (cdr rp)))
+              (when (and (ldr-source-path? rel)
+                         (not (hashtable-ref baked rel #f)))
+                (hashtable-set! baked rel #t)
+                (put-string out
+                  (string-append
+                    "(register-embedded-resource! " (ei-str-lit rel) " "
+                    (ei-bytes-lit (read-file-string abs)) ")\n")))))
+          (bld-walk-files root "" '())))
+      ldr-install-roots))
   ;; Preload jolt.main + jolt.deps into the image.
   (put-string out "\n;; === AOT jolt.main + jolt.deps ===\n")
   (put-string out "(load-namespace \"jolt.main\")\n")
@@ -121,6 +125,19 @@
         (bld-walk-files root "" '())))
     ldr-install-roots)
   (close-port out))
+
+;; The Chez that wrote flat.so decides who can read it: a fasl only loads in the
+;; version that produced it. Record which one that was, so bin/jolt can tell it
+;; apart from the Chez it is about to run and fall back to source mode instead of
+;; dying on "incompatible fasl-object version" — the failure otherwise reports
+;; nothing about its own cause, and no jolt source has changed to explain it.
+;; $JOLT_CHEZ is what make hands down; a hand-run build just records nothing.
+(let ((exe (getenv "JOLT_CHEZ")))
+  (when (and exe (> (string-length exe) 0))
+    (let ((out (open-output-file (string-append jb-build "/flat.chez") 'replace)))
+      (put-string out exe)
+      (put-string out "\n")
+      (close-port out))))
 
 ;; --- 2. compile in a FRESH Chez (same approach as build-jolt step 2) ---------
 ;; compile-file must run against a clean chezscheme env so `error` and other

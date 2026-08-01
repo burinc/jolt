@@ -13,3 +13,6 @@
 [submodule "vendor/process"]
 	path = vendor/process
 	url = https://github.com/babashka/process
+[submodule "vendor/grenadine"]
+	path = vendor/grenadine
+	url = https://github.com/clojurestar/grenadine.git

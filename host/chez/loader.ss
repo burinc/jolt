@@ -34,8 +34,12 @@
 
 ;; Install roots — the directories that ship with Jolt (compiler + stdlib + vendored
 ;; deps). Shared by cli.ss, build-jolt.ss, and the bld-require-closure filter so the
-;; literal list stays in one place.
-(define ldr-install-roots '("jolt-core" "stdlib" "vendor/fs/src" "vendor/process/src"))
+;; literal list stays in one place. ORDER IS PRECEDENCE: the first root holding a
+;; namespace wins, on disk (resolve-on-roots) and in a built binary (build-jolt.ss
+;; bakes first-wins to match). Grenadine ships host adapters alongside its portable
+;; core, one of them named jolt.deps, so jolt-core has to precede it.
+(define ldr-install-roots
+  '("jolt-core" "stdlib" "vendor/fs/src" "vendor/process/src" "vendor/grenadine/src"))
 
 ;; True when `f` is a file owned by the Jolt runtime (compiler + stdlib) — either
 ;; an embedded-resource key (string or bytevector value) or a path under one of

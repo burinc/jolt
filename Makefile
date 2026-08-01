@@ -37,6 +37,12 @@ MAKES-CLEAN := \
 PREFIX ?= $(if $(IS-ROOT),/usr/local,$(HOME)/.local)
 CHEZ ?= $(JOLT-CHEZ)
 
+# Hand the selected Chez down to bin/jolt, so the targets that shell out to it
+# run the same interpreter as the ones that call $(CHEZ) directly. When make
+# provisions its own Chez (the one on PATH being a different version), bin/jolt's
+# own PATH search would otherwise pick the other one.
+export JOLT_CHEZ := $(CHEZ)
+
 # A locally built Chez links its kernel against the bundled lz4 and zlib. Their
 # static archives remain in the Makes build tree rather than the installed Chez
 # prefix, so expose them when linking Jolt's standalone launcher.
@@ -126,7 +132,7 @@ unit:
 # buildlibsmoke` slower with the prerequisite than without it. The staleness
 # check covers the same inputs build-jolt.ss embeds: the runtime .ss files, the
 # install roots, and the launcher stub. JOLT_FORCE_TESTBIN=1 rebuilds anyway.
-TESTBIN-INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src vendor/irregex
+TESTBIN-INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src vendor/grenadine/src vendor/irregex
 testbin:
 	@if [ -n "$${JOLT_FORCE_TESTBIN:-}" ] || [ ! -x target/release/jolt ] || \
 	   [ -n "$$(find $(TESTBIN-INPUTS) -type f -newer target/release/jolt -print -quit 2>/dev/null)" ]; then \
