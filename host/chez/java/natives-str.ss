@@ -46,10 +46,13 @@
 ;; Character.isWhitespace accepts, which reaches the Unicode space separators
 ;; (U+3000 and friends) but NOT the non-breaking ones. Keep them apart: str-trim
 ;; is String.trim, str-triml / str-trimr / str-trim* back clojure.string.
+;; U+001C..U+001F (the file/group/record/unit separators) are whitespace to Java but
+;; carry no Unicode White_Space property, so char-whitespace? alone misses them.
 (define (java-whitespace? c)
-  (and (char-whitespace? c)
-       (let ((cp (char->integer c)))
-         (not (or (fx=? cp #xA0) (fx=? cp #x2007) (fx=? cp #x202F))))))
+  (let ((cp (char->integer c)))
+    (cond ((or (fx=? cp #xA0) (fx=? cp #x2007) (fx=? cp #x202F)) #f)
+          ((and (fx>=? cp #x1C) (fx<=? cp #x1F)) #t)
+          (else (char-whitespace? c)))))
 
 (define (str-trim s)
   (let ((len (string-length s)))
@@ -72,6 +75,19 @@
           ((java-whitespace? (string-ref s j)) (loop (fx- j 1)))
           (else (substring s 0 (fx+ j 1))))))
 (define (str-trim* s) (str-trimr (str-triml s)))
+
+;; Java 11's strip family, over the same Character.isWhitespace as clojure.string's
+;; trim. String.trim cuts at <= U+0020 — its notion of "space" predates Unicode —
+;; where strip also removes the Unicode separators trim leaves behind.
+(define (str-strip s left? right?)
+  (let ((len (string-length s)))
+    (let scan-l ((i 0))
+      (cond ((fx=? i len) "")
+            ((and left? (java-whitespace? (string-ref s i))) (scan-l (fx+ i 1)))
+            (else (let scan-r ((j (fx- len 1)))
+                    (if (and right? (fx>? j i) (java-whitespace? (string-ref s j)))
+                        (scan-r (fx- j 1))
+                        (substring s i (fx+ j 1)))))))))
 
 ;; --- substring search: first index of `needle` in `s` at/after `from`, or -1 --
 (define (char-by-char-match? s si needle nlen)
@@ -278,8 +294,39 @@
     ((string=? method "replace") (str-replace-literal s (str-needle (arg 0)) (str-needle (arg 1))))
     ((string=? method "equalsIgnoreCase")
      (string=? (ascii-string-down s) (ascii-string-down (arg 0))))
+    ;; compareTo answers an INT on the JVM, not a double — it fed straight into
+    ;; (neg? …) fine but printed as -1.0, and (= -1 (.compareTo …)) was false.
     ((string=? method "compareTo")
-     (let ((o (arg 0))) (cond ((string<? s o) -1.0) ((string>? s o) 1.0) (else 0.0))))
+     (let ((o (jolt-need-str (arg 0)))) (cond ((string<? s o) -1) ((string>? s o) 1) (else 0))))
+    ((string=? method "compareToIgnoreCase")
+     (let ((a (string-downcase s)) (b (string-downcase (jolt-need-str (arg 0)))))
+       (cond ((string<? a b) -1) ((string>? a b) 1) (else 0))))
+    ;; CharSequence content equality — the same characters, whatever the receiver's
+    ;; concrete type (a StringBuilder compares equal to the String it holds).
+    ((string=? method "contentEquals")
+     (string=? s (jolt-str-render-one (arg 0))))
+    ;; (.regionMatches s toffset other ooffset len), plus the leading-boolean
+    ;; ignore-case overload the JVM also has.
+    ((string=? method "regionMatches")
+     (let* ((ic? (and (boolean? (arg 0)) (arg 0)))
+            (base (if (boolean? (arg 0)) 1 0))
+            (toff (jolt->idx (arg base)))
+            (other (jolt-need-str (arg (fx+ base 1))))
+            (ooff (jolt->idx (arg (fx+ base 2))))
+            (len (jolt->idx (arg (fx+ base 3)))))
+       (and (fx>=? toff 0) (fx>=? ooff 0)
+            (fx<=? (fx+ toff len) (string-length s))
+            (fx<=? (fx+ ooff len) (string-length other))
+            (let ((a (substring s toff (fx+ toff len)))
+                  (b (substring other ooff (fx+ ooff len))))
+              (if ic? (string-ci=? a b) (string=? a b))))))
+    ;; char[] of the string's characters — a real 'char array, the same value
+    ;; (char-array s) builds and (String. ca) reads back.
+    ((string=? method "toCharArray") (na-char-array s))
+    ;; Java 11 strip family. Unicode-aware whitespace, where trim cuts at <= U+0020.
+    ((string=? method "strip") (str-strip s #t #t))
+    ((string=? method "stripLeading") (str-strip s #t #f))
+    ((string=? method "stripTrailing") (str-strip s #f #t))
     ((string=? method "getBytes")
      ;; (.getBytes s) / (.getBytes s charset) -> a jolt byte-array (seqable /
      ;; countable / alength-able, like (byte-array …)); the JVM returns byte[].
