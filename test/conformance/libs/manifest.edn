@@ -242,17 +242,13 @@
    ;; level and reads its `user` var, so it still has to compile — hence criterium.
    :shims ["!test/conformance/libs/shims/cheshire" "!test/conformance/libs/shims/criterium"]
    :exclude-nses ["selmer.benchmark"]
-   ;; No failures left. Remaining, by owner:
-   ;;   2 errors — io/resource returns a java.io.File where the JVM returns a file:
-   ;;     URL, so render-file cannot resolve one and Selmer calls .startsWith on it.
-   ;;     Fixing it means teaching slurp/io/file to coerce a URL first, and moving
-   ;;     the AOT-embedded branch in step so both answer the same surface.
-   ;;   1 error — commons-lang StringEscapeUtils, a JVM jar; not portable.
+   ;; The one remaining error is commons-lang StringEscapeUtils, a JVM jar with no
+   ;; portable equivalent. Nothing else fails.
    ;;
    ;; The locale work behind this tally lives on three extension points core
    ;; declares and jolt-lang/time fills in: :date-names, :number-symbols and
    ;; :currency-data. Running Selmer needs that library on :deps, which it has.
-   :expect {:tests 131 :pass 522 :fail 0 :error 3}}
+   :expect {:tests 131 :pass 525 :fail 0 :error 1}}
 
   {:name "html"
    :paths ["src" "test"]
