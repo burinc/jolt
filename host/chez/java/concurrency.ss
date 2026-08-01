@@ -685,6 +685,10 @@
 ;; shared). A Thread runs its Runnable thunk; start forks, join waits on a
 ;; condition latched at completion. CountDownLatch is a counting barrier.
 (define (make-jthread thunk) (make-jhost "user-thread" (vector thunk #f (make-mutex) (make-condition) (box #f) #f)))
+;; alive = started and not yet completed. join waits on exactly this, so a thread
+;; that was never started is not waited for at all (JVM: isAlive is false before
+;; .start, so join returns at once).
+(define (jthread-alive? st) (and (vector-ref st 5) (not (vector-ref st 1))))
 ;; JVM Thread() is legal: the target is null and run/start are no-ops.
 (for-each (lambda (nm) (register-class-ctor! nm (lambda args (make-jthread (if (null? args) #f (car args))))))
           '("Thread" "java.lang.Thread"))
@@ -707,14 +711,32 @@
                  (condition-broadcast (vector-ref st 3)))))
             jolt-nil)))
         (cons "run" (lambda (self) (let ((th (vector-ref (jhost-state self) 0))) (when th (jolt-invoke th))) jolt-nil))
-        (cons "join" (lambda (self . _)
-          (let ((st (jhost-state self)))
+        ;; join() and join(0) wait indefinitely; join(ms) waits at most ms and
+        ;; returns whether or not the thread finished. The timeout used to be
+        ;; discarded, which turned every bounded join into an unbounded one — a
+        ;; caller that joined a long-lived worker with a timeout deadlocked instead
+        ;; of giving up, with nothing in the code to suggest why. A negative timeout
+        ;; is an IllegalArgumentException on the JVM, not an unbounded wait.
+        (cons "join" (lambda (self . args)
+          (let* ((st (jhost-state self))
+                 (a (if (null? args) #f (car args)))
+                 (ms (if (or (not a) (jolt-nil? a)) #f (jnum->exact a))))
+            (when (and ms (negative? ms))
+              (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
+                                               "timeout value is negative")))
             (with-mutex (vector-ref st 2)
-              (let loop () (unless (vector-ref st 1) (condition-wait (vector-ref st 3) (vector-ref st 2)) (loop)))))
+              (if (or (not ms) (= ms 0))
+                  (let loop () (when (jthread-alive? st)
+                                 (condition-wait (vector-ref st 3) (vector-ref st 2))
+                                 (loop)))
+                  ;; An absolute deadline, so a spurious wakeup resumes waiting for
+                  ;; what is LEFT of the timeout rather than restarting it.
+                  (let ((deadline (ms->deadline ms)))
+                    (let loop () (when (jthread-alive? st)
+                                   (when (condition-wait (vector-ref st 3) (vector-ref st 2) deadline)
+                                     (loop))))))))
           jolt-nil))
-        ;; alive = started and not yet completed (JVM: false before .start)
-        (cons "isAlive" (lambda (self) (let ((st (jhost-state self)))
-          (and (vector-ref st 5) (not (vector-ref st 1))))))
+        (cons "isAlive" (lambda (self) (jthread-alive? (jhost-state self))))
         (cons "interrupt" (lambda (self . _) (set-box! (vector-ref (jhost-state self) 4) #t) jolt-nil))
         (cons "isInterrupted" (lambda (self) (and (unbox (vector-ref (jhost-state self) 4)) #t)))
         (cons "setDaemon" (lambda (self . _) jolt-nil))))
