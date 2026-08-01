@@ -50,7 +50,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
   compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr \
+  devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr grenadine \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret remint sci selfhost shakelocal \
@@ -96,7 +96,7 @@ test: submodules selfhost ci
 # lockfile) — it RUNS correctly on any Chez, but `selfhost` rebuilds it and a
 # different Chez version may emit byte-different (gensym/order) output, so the
 # byte-fixpoint is a dev-machine check, not a CI one (jolt-8479).
-ci: submodules values corpus unit mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke certify
+ci: submodules values corpus unit grenadine mvnhttp depssmoke depsunit smoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion protoret pic narrow directlink unitcontext numeric oparity mathfl flarr inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke certify
 	@echo "OK: CI gates passed"
 
 # Self-host fixpoint: bootstrap.ss rebuild == checked-in seed.
@@ -194,6 +194,10 @@ depssmoke: testbin
 # type — the cases are ported from tools.deps' own test suite. Offline.
 depsunit:
 	@JOLT_NO_USER_DEPS=1 bin/jolt run test/deps_expand_test.clj
+
+# Vendored Grenadine core plus Jolt's effective-POM adapter. Offline.
+grenadine:
+	@JOLT_NO_USER_DEPS=1 bin/jolt run test/grenadine_test.clj
 
 # Build jolt as a self-contained native binary into target/<profile>/jolt. The
 # binary bundles the runtime, compiler, jolt-core + stdlib source, the Chez boots,

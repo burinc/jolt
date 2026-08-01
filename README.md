@@ -37,8 +37,12 @@ fatal:
   `io.github.OWNER/REPO` clones from GitHub.
 - **Maven deps** (`:mvn/version`) are downloaded over HTTPS by jolt itself (no
   `curl`), using the system **OpenSSL** (`libssl`/`libcrypto`) via FFI, and
-  extracted with `unzip`. A jar already in `~/.m2/repository` is reused with no
-  download.
+  extracted with `unzip`. Jolt embeds [Grenadine](https://github.com/ingydotnet/grenadine)
+  to build effective POMs and resolve transitive dependencies without Java. A
+  jar already in `~/.m2/repository` is reused with no download. Set
+  `GRENADINE_LOCAL_REPOSITORY` to use another repository; an explicit
+  `:mvn/local-repo` takes precedence, and `JOLT_LOCAL_REPO` remains supported as
+  a legacy fallback.
   - **macOS**: `brew install openssl@3` — jolt loads the Homebrew copy; the
     protected system `/usr/lib` OpenSSL can't be loaded into a non-Apple binary.
     `git`/`unzip` come with the Xcode command-line tools.
