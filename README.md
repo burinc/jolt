@@ -102,6 +102,12 @@ with:
 git submodule update --init --recursive
 ```
 
+`bin/jolt` needs a **threaded Chez Scheme 10.x** on `PATH` as `chez` or
+`chezscheme`; set `JOLT_CHEZ` to point at a specific one. `make` provisions its
+own 10.4.1 when `PATH` has a different version, and exports `JOLT_CHEZ` so both
+halves of a build agree — running `bin/jolt` by hand against a 9.x picks up
+whatever primitive that release predates (`variable flvector? is not bound`).
+
 Note that GitHub's auto-generated "Source code (zip/tar.gz)" archives on the
 releases page do **not** contain submodules, so they can't run or build —
 clone the repo instead (or grab a prebuilt binary from the same page).

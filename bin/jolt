@@ -15,24 +15,34 @@
 root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 export JOLT_PWD="${JOLT_PWD:-$PWD}"
 
-# Identify the Chez Scheme executable
-while read -r CHEZ
-do
-    if [ `which ${CHEZ}` ]
-    then
-	break;
-    fi
-done <<EOF
+# Identify the Chez Scheme executable. $JOLT_CHEZ is authoritative and is how the
+# Makefile hands down the one it selected — the same interpreter that mints the
+# seed and compiles target/dev/flat.so. Without it the gate can straddle two Chez
+# installs, because make provisions its own when the one on PATH is the wrong
+# version: source mode then dies on whichever primitive the older one lacks
+# ("variable flvector? is not bound"), and after `make devboot` it dies on
+# "incompatible fasl-object version" instead, since a fasl only loads in the Chez
+# that wrote it.
+if [ -z "${JOLT_CHEZ:-}" ]; then
+  while read -r JOLT_CHEZ
+  do
+      if [ `which ${JOLT_CHEZ}` ]
+      then
+  	break;
+      fi
+  done <<EOF
 chez
 chezscheme
 EOF
 
-# If we failed to find one, whinge and exit.
-if [ ! `which ${CHEZ}` ]
-then
-    echo "No valid Chez Scheme executable found: please install Chez Scheme."
-    exit 1
+  # If we failed to find one, whinge and exit.
+  if [ ! `which ${JOLT_CHEZ}` ]
+  then
+      echo "No valid Chez Scheme executable found: please install Chez Scheme."
+      exit 1
+  fi
 fi
+CHEZ="$JOLT_CHEZ"
 
 # Version for --version / banners: git describe of this checkout, else "dev".
 export JOLT_VERSION="${JOLT_VERSION:-$(git -C "$root" describe --tags --always --dirty 2>/dev/null || echo dev)}"
@@ -48,6 +58,7 @@ cd "$root" || exit 1
 # arg is "repl" (explicit REPL command).
 CACHE_SO="target/dev/flat.so"
 CACHE_INPUTS="target/dev/flat.inputs"
+CACHE_CHEZ="target/dev/flat.chez"
 use_cache=0
 if [ -f "$CACHE_SO" ] && [ -f "$CACHE_INPUTS" ] && [ $# -gt 0 ] && [ "$1" != "repl" ]; then
   stale=0
@@ -57,6 +68,20 @@ if [ -f "$CACHE_SO" ] && [ -f "$CACHE_INPUTS" ] && [ $# -gt 0 ] && [ "$1" != "re
       break
     fi
   done < "$CACHE_INPUTS"
+  # A fasl loads only in the Chez that wrote it, and neither of the two ways that
+  # stops being true touches a jolt source file: a Chez upgraded in place (the
+  # image is older than the executable), or a different Chez entirely (make
+  # provisions its own when PATH has the wrong version). Source mode is slower
+  # but correct; "incompatible fasl-object version" is neither.
+  if [ "$stale" = 0 ] && [ -f "$CACHE_CHEZ" ]; then
+    built_with="$(cat "$CACHE_CHEZ")"
+    # Resolve to a path before comparing: make hands down an absolute one and the
+    # PATH search leaves a bare name, and those are the same Chez.
+    chez_path="$(command -v "$CHEZ" 2>/dev/null || echo "$CHEZ")"
+    if [ "$built_with" != "$chez_path" ] || [ "$CACHE_SO" -ot "$built_with" ]; then
+      stale=1
+    fi
+  fi
   if [ "$stale" = 0 ]; then
     use_cache=1
   fi

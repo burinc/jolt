@@ -37,6 +37,12 @@ MAKES-CLEAN := \
 PREFIX ?= $(if $(IS-ROOT),/usr/local,$(HOME)/.local)
 CHEZ ?= $(JOLT-CHEZ)
 
+# Hand the selected Chez down to bin/jolt, so the targets that shell out to it
+# run the same interpreter as the ones that call $(CHEZ) directly. When make
+# provisions its own Chez (the one on PATH being a different version), bin/jolt's
+# own PATH search would otherwise pick the other one.
+export JOLT_CHEZ := $(CHEZ)
+
 # A locally built Chez links its kernel against the bundled lz4 and zlib. Their
 # static archives remain in the Makes build tree rather than the installed Chez
 # prefix, so expose them when linking Jolt's standalone launcher.
