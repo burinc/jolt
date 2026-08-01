@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.14] - 2026-08-01
+
+Editor tooling works: jolt publishes its source roots as `java.class.path`,
+`jolt.nrepl` gained the version and error-history seams an nREPL middleware needs,
+and `clojure.test` report maps carry `:expected`/`:actual` again, so a custom
+reporter can say what it compared. Together these let jolt-lang/nrepl serve the
+cider-nrepl op set to CIDER and Calva. A stale `PWD` no longer wins over the real
+working directory, and `keys`/`vals` throw on an element that isn't an entry
+instead of returning nonsense.
+
 ### Added
 
 - **`java.class.path` answers with the resolved source roots.** jolt's classpath
@@ -60,6 +70,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `computeIfAbsent`, `computeIfPresent`, `compute`, `merge`, `replace` and
   `forEach`, with the JVM's return values and its treatment of a nil mapping as
   absent.
+
+- **A stale `PWD` no longer decides `user.dir`.** `PWD` is exported by the shell
+  and is not updated by a process that changes directory itself, so any tool that
+  ran jolt after a `chdir` resolved every relative path against the directory it
+  started in. `user.dir` now prefers `JOLT_PWD`, then the real working directory,
+  and honors `PWD` only where it agrees with it.
+
+- **`keys` and `vals` throw on an element that isn't an entry.** Both indexed
+  every element blindly, so `(keys ["ab" "cd"])` handed back `(\a \c)` and
+  `(keys [1 2])` gave `(nil nil)` where the JVM throws — silent nonsense in place
+  of an error. Anything that is not a two-element vector now raises the same
+  `ClassCastException`, naming the same class. A vector of pairs still walks as a
+  seq of entries, which is a documented superset.
 
 ## [0.5.13] - 2026-08-01
 
@@ -2557,7 +2580,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.13...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.14...HEAD
+[0.5.14]: https://github.com/jolt-lang/jolt/compare/v0.5.13...v0.5.14
 [0.5.13]: https://github.com/jolt-lang/jolt/compare/v0.5.12...v0.5.13
 [0.5.12]: https://github.com/jolt-lang/jolt/compare/v0.5.11...v0.5.12
 [0.5.11]: https://github.com/jolt-lang/jolt/compare/v0.5.10...v0.5.11
