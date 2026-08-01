@@ -461,6 +461,7 @@
     ("pushback-reader" . "java.io.PushbackReader")
     ("char-writer" . "java.io.OutputStreamWriter")
     ("char-reader" . "java.io.InputStreamReader")
+    ("time-unit" . "java.util.concurrent.TimeUnit")
     ;; subprocess shims (process.ss), backing vendored babashka.process
     ("process-builder" . "java.lang.ProcessBuilder")
     ("process" . "java.lang.Process")

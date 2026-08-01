@@ -12,7 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Chez's clocks and collector counters are readable from Clojure now, as plain
 integers off `jolt.host`, which is enough for a profiler, a health endpoint or an
 OpenTelemetry exporter to work from. `System/nanoTime` and `Thread.join` were
-both wrong in ways that surfaced on the way there.
+both wrong in ways that surfaced on the way there, and `.split` turned out to be
+discarding its limit argument.
+
+The release workflow's own fleet gates were testing the wrong binary, which is
+why this is the first 0.5.16 to ship.
 
 ### Added
 
@@ -28,7 +32,63 @@ both wrong in ways that surfaced on the way there.
   an arbitrary origin, so anything reporting both an absolute timestamp and a
   duration needs both and derives the timestamp from the pair.
 
+- **`java.util.concurrent.TimeUnit`.** The seven constants, the `to*` conversions
+  (truncating toward zero, like the JVM) and `sleep`. Nothing modeled it before,
+  which meant every method taking a `(timeout, unit)` pair could not be called
+  with one — and that is how each of them went unnoticed with its timeout argument
+  discarded. `CountDownLatch.await`, `Future.get`, `ExecutorService.awaitTermination`
+  and `ReentrantLock.tryLock` all read it now: the bounded overloads gave up
+  immediately, waited forever, or (awaitTermination) read the amount as
+  milliseconds outright, so `5 SECONDS` was five milliseconds.
+
 ### Fixed
+
+- **The release's own fleet gates ran the wrong binary.** Every library gate and
+  the examples gate unpacked the release tarball into the workspace root and then
+  picked the jolt to test with `find . -name jolt -perm -u+x`, in a workspace that
+  also holds the jolt checkout — whose `bin/jolt` is an executable file by that
+  name. Which one won came down to directory traversal order, and the extracted
+  directory carries the version in its name, so the order flipped between one
+  release and the next: v0.5.16's gates all died on "No valid Chez Scheme
+  executable found" against a binary that was fine. The tarball now unpacks into a
+  directory of its own and is searched only there.
+
+- **A rebuilt binary was killed on macOS.** `jolt build` wrote its output over the
+  existing file, and macOS caches a code-signature verdict per vnode — so the
+  rewritten binary kept the stale verdict and the kernel `SIGKILL`ed the next run
+  with no output at all (`Killed: 9`). A rebuild-and-run loop over one output path
+  worked a handful of times and then started dying for no visible reason, on a
+  binary that ran fine the moment it was built somewhere else. The output is
+  removed before the new one is written, so it lands on a fresh inode; a failed
+  link now also leaves no binary rather than a half-overwritten one.
+
+- **`.split` honors its limit, on both `String` and `Pattern`.** The limit argument
+  was discarded outright, so `(.split "user:pass:word" ":" 2)` split three ways and
+  anything separating a key from a value that may itself contain the separator — a
+  URL header, a password, a status line's description — got the value truncated at
+  its first separator. Positive limits cap the parts and leave the last unsplit,
+  a negative limit keeps trailing empty strings, and 0 (the one-argument form)
+  drops them. Interior empty fields survive too: `(.split "a::b" ":")` was
+  `["a" "b"]` where the JVM gives three parts. Both methods answer a `String[]`
+  now; `String.split` used to return a vector and `Pattern.split` a seq, so the
+  same split printed two different ways.
+
+- **A compile error names the expression that failed.** Only the unresolved-symbol
+  diagnostic carried a position, so everything else raised while analyzing — an
+  uncompilable form, a destructuring pattern the desugarer rejects, a macro that
+  threw expanding — was reported at the enclosing top-level form's opening line,
+  over thirty lines of the analyzer's own frames (`analyze-list`, `map-seq`,
+  `seq->list`) naming nothing the reader could act on. Analysis failures carry the
+  innermost positioned form's `file:line:column` now, and the internals trace is
+  dropped, which is what the reporter already did for the one diagnostic that had
+  a position.
+
+- **A `proxy` method with several arities.** `proxy` accepts both
+  `(name [params*] body*)` and `(name ([params*] body*) ([params*] body*) ...)`;
+  only the flat form was handled, so the grouped one handed `reify` a body
+  expression where an arglist belonged and died in destructuring — "unsupported
+  destructuring pattern: (.read src buf off (min 1 len))" for a throttled
+  `InputStream`.
 
 - **`System/nanoTime` is monotonic.** It was `(* 1000000 (now-millis))` —
   wall-clock derived, so a clock step ran it backwards, and millisecond-granular,

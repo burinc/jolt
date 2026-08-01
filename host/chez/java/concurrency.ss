@@ -24,6 +24,55 @@
     (make-time 'time-duration nanos secs)))
 (define (ms->deadline ms) (add-duration (current-time 'time-utc) (ms->duration ms)))
 
+;; --- java.util.concurrent.TimeUnit ------------------------------------------
+;; A TimeUnit is a scale, so each constant is an object carrying its name and its
+;; size in nanoseconds; every method taking a (timeout, unit) pair converts through
+;; tu->ms. Nothing modeled TimeUnit before, so none of those methods could be CALLED
+;; with a unit at all — which is how each of them went so long with its timeout
+;; argument quietly discarded. Adding the type makes them reachable, so they are all
+;; fixed below rather than left as newly-reachable silent no-ops.
+(define time-unit-nanos
+  '(("NANOSECONDS" . 1) ("MICROSECONDS" . 1000) ("MILLISECONDS" . 1000000)
+    ("SECONDS" . 1000000000) ("MINUTES" . 60000000000)
+    ("HOURS" . 3600000000000) ("DAYS" . 86400000000000)))
+(define (make-time-unit nm nanos) (make-jhost "time-unit" (vector nm nanos)))
+(define (time-unit? x) (and (jhost? x) (string=? (jhost-tag x) "time-unit")))
+(define (time-unit-scale u) (vector-ref (jhost-state u) 1))
+
+;; JVM conversions TRUNCATE toward zero (SECONDS.toMinutes(90) is 1).
+(define (tu-convert self n per)
+  (quotient (* (jnum->exact n) (time-unit-scale self)) per))
+
+;; (amount, unit) -> milliseconds. A missing or non-TimeUnit unit leaves the amount
+;; alone, which is the plain-milliseconds shape awaitTermination has always taken.
+(define (tu->ms amount unit)
+  (let ((n (if (number? amount) (jnum->exact amount) 0)))
+    (if (time-unit? unit) (quotient (* n (time-unit-scale unit)) 1000000) n)))
+
+;; The timeout of a (… timeout unit) argument tail, in ms, or #f when absent — the
+;; untimed overload of the same method.
+(define (tu-args->ms args)
+  (if (null? args) #f (tu->ms (car args) (if (null? (cdr args)) #f (cadr args)))))
+
+(define time-unit-constants
+  (map (lambda (p) (cons (car p) (make-time-unit (car p) (cdr p)))) time-unit-nanos))
+(register-class-statics! "TimeUnit" time-unit-constants)
+(register-class-statics! "java.util.concurrent.TimeUnit" time-unit-constants)
+(register-host-methods! "time-unit"
+  (list (cons "toNanos"   (lambda (self n) (tu-convert self n 1)))
+        (cons "toMicros"  (lambda (self n) (tu-convert self n 1000)))
+        (cons "toMillis"  (lambda (self n) (tu-convert self n 1000000)))
+        (cons "toSeconds" (lambda (self n) (tu-convert self n 1000000000)))
+        (cons "toMinutes" (lambda (self n) (tu-convert self n 60000000000)))
+        (cons "toHours"   (lambda (self n) (tu-convert self n 3600000000000)))
+        (cons "toDays"    (lambda (self n) (tu-convert self n 86400000000000)))
+        (cons "sleep"     (lambda (self n) (sleep (ms->duration (tu->ms n self))) jolt-nil))
+        (cons "name"      (lambda (self) (vector-ref (jhost-state self) 0)))
+        (cons "toString"  (lambda (self) (vector-ref (jhost-state self) 0)))))
+;; ...and the same for (str TimeUnit/SECONDS): an enum constant's toString is its
+;; name on the JVM, where the generic host-object fallback prints #object[…].
+(register-str-render! time-unit? (lambda (u) (vector-ref (jhost-state u) 0)))
+
 ;; --- futures ----------------------------------------------------------------
 ;; A future is a mutable cell guarded by `mu`; workers/derefs coordinate on `cv`.
 ;;   done?       — result (or cancellation) is final; derefs may proceed
@@ -751,11 +800,27 @@
               (when (> (vector-ref st 0) 0) (vector-set! st 0 (- (vector-ref st 0) 1)))
               (when (= (vector-ref st 0) 0) (condition-broadcast (vector-ref st 2)))))
           jolt-nil))
-        (cons "await" (lambda (self . _)
-          (let ((st (jhost-state self)))
+        ;; await() waits indefinitely and is void; await(timeout, unit) waits at most
+        ;; that long and answers whether the count reached zero. The timeout used to
+        ;; be discarded, so the bounded form was an unbounded one — the same bug
+        ;; Thread.join had, unreachable until TimeUnit existed to write the call with.
+        (cons "await" (lambda (self . args)
+          (let ((st (jhost-state self))
+                (ms (tu-args->ms args)))
             (with-mutex (vector-ref st 1)
-              (let loop () (when (> (vector-ref st 0) 0) (condition-wait (vector-ref st 2) (vector-ref st 1)) (loop)))))
-          jolt-nil))
+              (if (not ms)
+                  (begin
+                    (let loop () (when (> (vector-ref st 0) 0)
+                                   (condition-wait (vector-ref st 2) (vector-ref st 1))
+                                   (loop)))
+                    jolt-nil)
+                  ;; absolute deadline, so a spurious wakeup resumes waiting for what
+                  ;; is left of the timeout rather than restarting it
+                  (let ((deadline (ms->deadline ms)))
+                    (let loop ()
+                      (cond ((<= (vector-ref st 0) 0) #t)
+                            ((condition-wait (vector-ref st 2) (vector-ref st 1) deadline) (loop))
+                            (else (<= (vector-ref st 0) 0))))))))))
          (cons "getCount" (lambda (self) (vector-ref (jhost-state self) 0)))))
 
 ;; --- java.util.concurrent.ExecutorService / Executors ----------------------
@@ -774,11 +839,29 @@
         (vector-set! st 0 #t)
         (condition-broadcast (vector-ref st 4))))))
 (register-host-methods! "j-future"
-  (list (cons "get" (lambda (self . _)
-          (let ((st (jhost-state self)))
-            (with-mutex (vector-ref st 3)
-              (let loop () (unless (vector-ref st 0) (condition-wait (vector-ref st 4) (vector-ref st 3)) (loop))))
-            (if (vector-ref st 2) (jolt-throw (vector-ref st 2)) (vector-ref st 1)))))
+  ;; get() waits for the task; get(timeout, unit) gives up at the deadline and throws
+  ;; TimeoutException, like the JVM. The timeout used to be discarded, so the bounded
+  ;; overload waited forever on a task that never finished.
+  (list (cons "get" (lambda (self . args)
+          (let* ((st (jhost-state self))
+                 (ms (tu-args->ms args))
+                 (done (with-mutex (vector-ref st 3)
+                         (if (not ms)
+                             (begin
+                               (let loop () (unless (vector-ref st 0)
+                                              (condition-wait (vector-ref st 4) (vector-ref st 3))
+                                              (loop)))
+                               #t)
+                             (let ((deadline (ms->deadline ms)))
+                               (let loop ()
+                                 (cond ((vector-ref st 0) #t)
+                                       ((condition-wait (vector-ref st 4) (vector-ref st 3) deadline) (loop))
+                                       (else (vector-ref st 0)))))))))
+            (cond ((not done)
+                   (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException"
+                                                    "timed out waiting for the task")))
+                  ((vector-ref st 2) (jolt-throw (vector-ref st 2)))
+                  (else (vector-ref st 1))))))
         (cons "isDone" (lambda (self) (vector-ref (jhost-state self) 0)))
         (cons "isCancelled" (lambda (self) #f))
         (cons "cancel" (lambda (self . _) #f))))
@@ -855,9 +938,12 @@
         (cons "isShutdown" (lambda (self) (vector-ref (jhost-state self) 0)))
         (cons "isTerminated" (lambda (self) (let* ((st (jhost-state self)) (q (unbox (vector-ref st 1))))
           (and (vector-ref st 0) (null? (car q)) (null? (cdr q)) (fx=? 0 (vector-ref st 4))))))
-        (cons "awaitTermination" (lambda (self ms . _)
+        ;; (timeout, unit) on the JVM. The unit used to be dropped and the amount read
+        ;; as milliseconds outright, so (.awaitTermination ex 5 TimeUnit/SECONDS)
+        ;; waited five MILLISECONDS and reported the pool still running.
+        (cons "awaitTermination" (lambda (self ms . rest)
           (let* ((st (jhost-state self))
-                 (deadline (+ (now-millis) (if (number? ms) (jnum->exact ms) 0))))
+                 (deadline (+ (now-millis) (tu->ms ms (if (null? rest) #f (car rest))))))
             ;; check under the mutex, but SLEEP OUTSIDE it — a worker's exit
             ;; decrement needs this mutex, so sleeping while holding it starves
             ;; the very transition awaited (the wait always rode to deadline).
@@ -894,11 +980,24 @@
               (vector-set! st 1 #f)
               (mutex-release (vector-ref st 0)))
             jolt-nil)))
-        (cons "tryLock" (lambda (self . _)
-          (let* ((st (jhost-state self)) (mu (vector-ref st 0)) (me (current-interrupt-box)))
+        ;; tryLock() gives up at once; tryLock(timeout, unit) keeps trying until the
+        ;; deadline. The timeout used to be discarded, so the bounded form gave up
+        ;; immediately on any lock that happened to be held at that instant.
+        (cons "tryLock" (lambda (self . args)
+          (let* ((st (jhost-state self)) (mu (vector-ref st 0)) (me (current-interrupt-box))
+                 (ms (tu-args->ms args)))
             (cond ((eq? (vector-ref st 1) me) (vector-set! st 2 (fx+ (vector-ref st 2) 1)) #t)
-                  ((mutex-acquire mu #f) (vector-set! st 1 me) (vector-set! st 2 1) #t)
-                  (else #f)))))
+                  (else
+                   (let ((deadline (and ms (ms->deadline ms))))
+                     (let attempt ()
+                       (cond ((mutex-acquire mu #f) (vector-set! st 1 me) (vector-set! st 2 1) #t)
+                             ;; Chez has no timed mutex-acquire, so poll: the wait is
+                             ;; bounded by the deadline and each nap is short enough
+                             ;; that the extra latency is not observable.
+                             ((and deadline (time<=? (current-time 'time-utc) deadline))
+                              (sleep (make-time 'time-duration 1000000 0))
+                              (attempt))
+                             (else #f)))))))))
         (cons "lockInterruptibly" (lambda (self)
           (let* ((st (jhost-state self)) (mu (vector-ref st 0)) (me (current-interrupt-box)))
             (when (unbox me)

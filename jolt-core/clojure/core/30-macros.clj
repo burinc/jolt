@@ -667,13 +667,27 @@
 ;; prepend it. ctor-args are ignored (there is no super to construct), as the
 ;; ThreadLocal case already ignores them. proxy-super / calling an inherited
 ;; concrete method is still unsupported (no superclass exists).
+;; One reify spec per arity of a proxy method spec. proxy accepts BOTH shapes:
+;;   (name [params*] body*)                          — one arity
+;;   (name ([params*] body*) ([params*] body*) ...)  — several
+;; Only the first was handled, so the multi-arity form fed reify a spec whose
+;; "arglist" was the whole ([params*] body*) list and destructuring died on the
+;; body expression ("unsupported destructuring pattern: (.read src buf off ...)").
+;; reify wants one (name [params*] body*) per arity and groups same-named specs
+;; into a multi-arity fn, so both shapes flatten to the same list here. `this` is
+;; implicit in a proxy body and explicit in a reify one, hence the cons.
+(defn- proxy-arity-specs [m]
+  (let [nm (first m)
+        arities (if (vector? (second m)) [(rest m)] (rest m))]
+    (map (fn [a] (list* nm (vec (cons 'this (first a))) (rest a))) arities)))
+
 (defmacro proxy [supers ctor-args & methods]
   (if (and (vector? supers) (= 1 (count supers))
            (let [s (name (first supers))] (or (= s "ThreadLocal") (= s "InheritableThreadLocal"))))
     (let [init (some (fn [m] (when (= "initialValue" (name (first m))) m)) methods)]
       `(jolt.host/make-thread-local (fn [] ~@(when init (nnext init)))))
     `(reify ~@supers
-       ~@(map (fn [m] (list* (first m) (vec (cons 'this (second m))) (nnext m))) methods))))
+       ~@(apply concat (map proxy-arity-specs methods)))))
 ;; definterface is JVM-only; bind the name to a marker and return the name (not a
 ;; var), matching the JVM where definterface yields the interface Class.
 (defmacro definterface [name-sym & body]
