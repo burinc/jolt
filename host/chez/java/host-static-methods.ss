@@ -464,7 +464,22 @@
     (if (jolt-nil? v) dflt v)))
 
 (register-class-statics! "String"
-  (list (cons "valueOf" (lambda (x . _) (if (jolt-nil? x) "null" (jolt-str-render-one x))))
+  ;; String.valueOf(char[]) is the chars as a string, not the array's own rendering —
+  ;; it answered "#object[[C]" where (String. ca) already gave "hi".
+  (list (cons "valueOf" (lambda (x . _)
+                          (cond ((jolt-nil? x) "null")
+                                ((and (jolt-array? x) (eq? (jolt-array-kind x) 'char))
+                                 (list->string (vector->list (jolt-array-vec x))))
+                                (else (jolt-str-render-one x)))))
+        ;; String.join(delim, elems) — elems as a collection or spread as varargs,
+        ;; the two shapes the JVM overloads on.
+        (cons "join" (lambda (delim . parts)
+                       (let ((items (if (and (fx=? (length parts) 1)
+                                             (not (string? (car parts))))
+                                        (seq->list (jolt-seq (car parts)))
+                                        parts)))
+                         (str-join-strs (map jolt-str-render-one items)
+                                        (jolt-str-render-one delim)))))
         ;; String.format(fmt, Object...) is called both ways in the wild: with the
         ;; args spread, and with a single Object[] holding them (which is what the
         ;; JVM's varargs actually compiles to, and what Selmer writes). Splat a lone

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.17] - 2026-08-01
+
+Gaps and wrong answers on the `java.lang.String` surface, found by probing it after
+`.toCharArray` turned out to be missing.
+
+### Added
+
+- **`.toCharArray`, `.strip` / `.stripLeading` / `.stripTrailing`,
+  `.compareToIgnoreCase`, `.contentEquals`, `.regionMatches` (both overloads), and
+  `String/join`.** `.toCharArray` answers a real `char[]` — the value `(char-array s)`
+  builds and `(String. ca)` reads back. The strip family is `Character.isWhitespace`,
+  where `.trim` cuts at `<= U+0020`, so strip removes the Unicode separators trim
+  leaves (U+3000) but not the non-breaking spaces Java deliberately excludes from
+  `isWhitespace` — the same predicate `clojure.string/trim` already used here, now
+  also covering U+001C..U+001F, which are whitespace to Java but carry no Unicode
+  White_Space property.
+
+### Fixed
+
+- **`.compareTo` answers an int.** It returned `-1.0` / `1.0` / `0.0`, so it read
+  correctly through `neg?` / `pos?` but printed as a double and was never `= -1`.
+
+- **`String/valueOf(char[])` is the characters.** It rendered the array itself, so
+  `(String/valueOf (char-array "hi"))` came back `"#object[[C]"` where
+  `(String. (char-array "hi"))` already gave `"hi"`.
+
 ## [0.5.16] - 2026-08-01
 
 Chez's clocks and collector counters are readable from Clojure now, as plain

@@ -499,6 +499,36 @@
   {:suite "str" :expr "(.replaceAll \"a_b_c\" \"_\" \"-\")" :expected "\"a-b-c\""}
   {:suite "str" :expr "(.replaceFirst \"a_b_c\" \"_\" \"-\")" :expected "\"a-b_c\""}
   {:suite "str" :expr "(vec (.split \"a,b,c\" \",\"))" :expected "[\"a\" \"b\" \"c\"]"}
+  ;; .toCharArray -> a real char[], the value (char-array s) builds and (String. ca) reads back
+  {:suite "str" :expr "(vec (.toCharArray \"ab\"))" :expected "[\\a \\b]"}
+  {:suite "str" :expr "(String. (.toCharArray \"hello\"))" :expected "\"hello\""}
+  {:suite "str" :expr "(alength (.toCharArray \"abc\"))" :expected "3"}
+  ;; compareTo answers an INT; it used to answer -1.0/1.0/0.0, so it read fine
+  ;; through (neg? …) but printed as a double and never = -1.
+  {:suite "str" :expr "(.compareTo \"a\" \"b\")" :expected "-1"}
+  {:suite "str" :expr "(= -1 (.compareTo \"a\" \"b\"))" :expected "true"}
+  {:suite "str" :expr "(.compareToIgnoreCase \"ABC\" \"abc\")" :expected "0"}
+  {:suite "str" :expr "(.contentEquals \"ab\" (StringBuilder. \"ab\"))" :expected "true"}
+  {:suite "str" :expr "[(.regionMatches \"abcd\" 1 \"bc\" 0 2) (.regionMatches \"abcd\" 1 \"xy\" 0 2)]" :expected "[true false]"}
+  ;; the leading-boolean ignore-case overload, and an out-of-range region (false, not a throw)
+  {:suite "str" :expr "[(.regionMatches \"abcd\" true 1 \"BC\" 0 2) (.regionMatches \"abcd\" false 1 \"BC\" 0 2)]" :expected "[true false]"}
+  {:suite "str" :expr "(.regionMatches \"ab\" 1 \"bc\" 0 5)" :expected "false"}
+  ;; strip is Character.isWhitespace where trim cuts at <= U+0020: the ideographic
+  ;; space goes, the NON-BREAKING space stays (Java excludes it from isWhitespace).
+  {:suite "str" :expr "[(.strip \"  a  \") (.stripLeading \"  a  \") (.stripTrailing \"  a  \")]" :expected "[\"a\" \"a  \" \"  a\"]"}
+  ;; by length, so the row carries no invisible characters: strip takes the
+  ;; ideographic spaces off (1 char left) where trim keeps them (3), and NEITHER
+  ;; touches the non-breaking space (3), which Java excludes from isWhitespace.
+  {:suite "str" :expr "[(count (.strip \"\\u3000a\\u3000\")) (count (.trim \"\\u3000a\\u3000\"))]" :expected "[1 3]"}
+  {:suite "str" :expr "(count (.strip \"\\u00a0a\\u00a0\"))" :expected "3"}
+  ;; U+001C..U+001F are whitespace to Java but carry no Unicode White_Space property
+  {:suite "str" :expr "(.strip \"\\u001ca\\u001c\")" :expected "\"a\""}
+  ;; String/valueOf(char[]) is the chars, not the array's own #object[[C] rendering
+  {:suite "str" :expr "(String/valueOf (char-array \"hi\"))" :expected "\"hi\""}
+  {:suite "str" :expr "[(String/valueOf 42) (String/valueOf nil)]" :expected "[\"42\" \"null\"]"}
+  ;; String/join over a collection and spread as varargs, the JVM's two overloads
+  {:suite "str" :expr "(String/join \",\" [\"a\" \"b\" \"c\"])" :expected "\"a,b,c\""}
+  {:suite "str" :expr "[(String/join \"-\" \"a\" \"b\") (String/join \",\" [])]" :expected "[\"a-b\" \"\"]"}
   ;; .split's limit, on both String and Pattern: >0 caps the parts and leaves the
   ;; last one unsplit, 0 (and the 1-arg form) drops trailing empties, <0 keeps them.
   ;; The limit used to be discarded, so splitting a key from a value that may itself
