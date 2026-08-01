@@ -44,7 +44,11 @@
 ;; print only when JOLT_DEBUG is set — otherwise a routine run (e.g. a ys-generated
 ;; program pulling a native-declaring lib) barfs them on every invocation. Genuine
 ;; warnings (an unresolvable dep, a malformed deps.edn) always print via `warn`.
-(defn- info [& xs] (when (getenv "JOLT_DEBUG") (apply warn xs)))
+(def ^:dynamic *verbose*
+  "True while the CLI's -Sverbose is in effect: the progress lines print for this
+  resolution without JOLT_DEBUG being set for the whole process."
+  false)
+(defn- info [& xs] (when (or *verbose* (getenv "JOLT_DEBUG")) (apply warn xs)))
 
 (defn- read-edn [path]
   (when (file-exists? path)
@@ -441,6 +445,16 @@
 (defmethod ext/dep-id :git [_ coord] (select-keys coord [:git/url :git/sha :git/tag]))
 (defmethod ext/dep-id :local [_ coord] (select-keys coord [:local/root]))
 
+;; What names a version in the dependency tree: the Maven version, the git tag
+;; if the coordinate is pinned by one (else the sha, shortened the way git
+;; prints it), the directory for a local root.
+(defmethod ext/coord-summary :mvn [lib coord] (str lib " " (:mvn/version coord)))
+(defmethod ext/coord-summary :git [lib coord]
+  (let [sha (:git/sha coord)]
+    (str lib " " (or (:git/tag coord)
+                     (when sha (subs sha 0 (min 7 (count sha))))))))
+(defmethod ext/coord-summary :local [lib coord] (str lib " " (:local/root coord)))
+
 (defn- mvn-info [lib coord]
   (memoized [:info lib (ext/dep-id lib coord)]
     (fn []
@@ -703,8 +717,10 @@
 (defn- expand-deps
   "Dep tree expansion, returns the version map. `order` is an atom collecting
   libs in first-inclusion order, so the final source roots keep a stable
-  breadth-first precedence."
-  [deps default-deps override-deps order]
+  breadth-first precedence. `trace`, when given, is an atom collecting one entry
+  per visited node — {:path parent-libs :lib :coord :include :reason} in
+  traversal order — which dep-tree-lines renders as the dependency tree."
+  [deps default-deps override-deps order trace]
   (loop [pendq nil ;; a resolved child list to look at first
          q (into clojure.lang.PersistentQueue/EMPTY (map vector deps)) ;; queue of nodes or child-lookups
          version-map nil ;; track all seen versions of libs and which version is selected
@@ -726,6 +742,10 @@
                   coord-id (ext/dep-id lib use-coord)
                   {:keys [include reason vmap]} (include-coord? version-map lib use-coord coord-id parents exclusions)
                   _ (when include (swap! order conj lib))
+                  _ (when trace
+                      (swap! trace conj {:path (vec parents) :lib lib :coord use-coord
+                                         :orig-coord coord :coord-id coord-id
+                                         :include (boolean include) :reason reason}))
                   {:keys [exclusions' cut' child-pred]} (update-excl lib use-coord coord-id use-path include reason exclusions cut)
                   new-q (if child-pred (conj q' (children-node lib use-coord use-path child-pred)) q')]
               (recur pendq new-q vmap exclusions' cut'))))
@@ -783,16 +803,19 @@
   `opts` carries the alias-combined coordinate maps applied at every node like
   tools.deps: :override-deps replaces a lib's coordinate wherever it appears
   (top-level or transitive); :default-deps supplies one where a dependent left
-  the coordinate nil."
+  the coordinate nil. With :trace? the result also carries the expansion
+  :trace — {:log [node …] :vmap version-map}, the tools.deps trace shape, which
+  dep-tree-lines renders and trace-edn-string writes out."
   ([deps base-dir] (resolve-deps deps base-dir nil))
-  ([deps base-dir {:keys [override-deps default-deps]}]
+  ([deps base-dir {:keys [override-deps default-deps trace?]}]
    (binding [*procure-memo* (or *procure-memo* (atom {}))]
      (let [abs #(absolutize-local % base-dir)
            top (filter-deps deps base-dir)
            override-deps (some->> override-deps (map (fn [[l c]] [l (abs c)])) (into {}))
            default-deps (some->> default-deps (map (fn [[l c]] [l (abs c)])) (into {}))
            order (atom [])
-           vmap (cut-orphans (expand-deps top default-deps override-deps order))
+           trace (when trace? (atom []))
+           vmap (cut-orphans (expand-deps top default-deps override-deps order trace))
            libmap (lib-paths vmap)
            infos (keep (fn [lib]
                          (when-let [coord (get libmap lib)]
@@ -809,7 +832,71 @@
         ;; steps, so their compiled/generated assets will be missing; the
         ;; caller warns with the lib names.
         :prep (vec (keep (fn [{:keys [lib edn]}] (when (:deps/prep-lib edn) lib)) infos))
-        :libs libmap}))))
+        :libs libmap
+        :trace (when trace {:log @trace :vmap vmap})}))))
+
+;; --- dependency tree --------------------------------------------------------
+;; The trace is a flat log of expansion decisions in traversal order; the tree is
+;; that log re-hung on the paths the nodes were reached by. Rendering follows
+;; clojure.tools.deps.tree so `jolt -Stree` reads like `clojure -Stree`.
+
+(defn- supersede
+  "A :newer-version decision retroactively unseats the nodes for that lib that
+  were included earlier in the walk — they were selected, then lost when the
+  newer coordinate turned up. tools.deps marks them :superseded as it goes."
+  [log]
+  (reduce (fn [acc {:keys [lib reason] :as node}]
+            (conj (if (= :newer-version reason)
+                    (mapv (fn [n] (if (and (= lib (:lib n)) (:include n))
+                                    (assoc n :include false :reason :superseded)
+                                    n))
+                          acc)
+                    acc)
+                  node))
+          [] log))
+
+(defn- tree-line [{:keys [lib coord include reason]} indent]
+  (let [pre (apply str (repeat indent " "))
+        summary (ext/coord-summary lib coord)]
+    (case reason
+      :new-top-dep (str pre summary)
+      (:new-dep :same-version) (str pre ". " summary)
+      :newer-version (str pre ". " summary " " reason)
+      (:use-top :older-version :excluded :parent-omitted :superseded)
+      (str pre "X " summary " " reason)
+      (str pre "? " summary " " include " " reason))))
+
+(defn dep-tree-lines
+  "Render an expansion trace (resolve-project with {:trace? true}) as the lines
+  of a dependency tree, in the tools.deps format: a top-level dep unprefixed, a
+  child indented under the dep that pulled it in and marked `.` when it made the
+  resolution or `X <reason>` when it lost.
+
+    local/app ../app
+      . local/lib 1.2.3
+        X local/other 1.0.0 :older-version"
+  [trace]
+  (let [log (supersede (:log trace))
+        by-parent (reduce (fn [m {:keys [path] :as node}]
+                            (update m (vec path) (fnil conj []) node))
+                          {} log)]
+    (letfn [(walk [path depth]
+              (mapcat (fn [{:keys [lib] :as node}]
+                        (cons (tree-line node depth)
+                              (walk (conj path lib) (+ depth 2))))
+                      (get by-parent path)))]
+      (vec (walk [] 0)))))
+
+(defn trace-edn-string
+  "The trace as the edn text of `jolt -Strace`'s trace.edn: {:log [node …]
+  :vmap {…}}, one expansion decision per line so the file can be read by eye as
+  well as by `read-string`."
+  [{:keys [log vmap]}]
+  ;; long-hand keys, not the #:git{…} shorthand — tools.deps writes its trace
+  ;; the same way, and every edn reader takes the long form.
+  (binding [*print-namespace-maps* false]
+    (str "{:log\n [" (str/join "\n  " (map pr-str log)) "]\n"
+         " :vmap " (pr-str vmap) "}\n")))
 
 ;; --- public -----------------------------------------------------------------
 (defn- user-deps-path
@@ -836,7 +923,8 @@
 
   The deps.edn chain merges like tools.deps (jolt.deps.edn/merge-edns): the
   user deps.edn ($CLJ_CONFIG / $XDG_CONFIG_HOME/clojure / ~/.clojure — skipped
-  under JOLT_NO_USER_DEPS), then the project deps.edn, then an optional extra
+  under JOLT_NO_USER_DEPS or the :repro? option, the CLI's -Srepro), then the
+  project deps.edn, then an optional extra
   map (the CLI's -Sdeps). Aliases combine from the merged map with the
   tools.deps rules (combine-aliases) and apply like tools.deps: :replace-deps
   (legacy :deps) replaces the project deps map, :extra-deps merges into it,
@@ -851,20 +939,24 @@
   ([project-dir] (resolve-project project-dir []))
   ([project-dir alias-kws] (resolve-project project-dir alias-kws nil))
   ([project-dir alias-kws extra-edn] (resolve-project project-dir alias-kws extra-edn nil))
-  ([project-dir alias-kws extra-edn {:keys [tool?]}]
+  ([project-dir alias-kws extra-edn {:keys [tool? repro? trace? cp]}]
    (let [project-edn (read-deps-file (str project-dir "/deps.edn"))
-         user-edn (when-not (getenv "JOLT_NO_USER_DEPS")
+         user-edn (when-not (or repro? (getenv "JOLT_NO_USER_DEPS"))
                     (try (read-deps-file (user-deps-path))
                          (catch :default e (warn (ex-message e)) nil)))
          edn (dedn/merge-edns [user-edn project-edn (some-> extra-edn dedn/canonicalize)])
          argmap (dedn/combine-aliases edn alias-kws)
-         ;; an unknown alias is an error, matching tools.deps ("Specified
-         ;; aliases are undeclared") — silently ignoring a typo'd alias runs
-         ;; the program without its deps and fails somewhere far away.
-         _ (let [missing (remove #(get-in edn [:aliases %]) alias-kws)]
+         ;; An alias the merged chain doesn't declare is skipped with a warning,
+         ;; the tools.deps behavior verbatim ("WARNING: Specified aliases are
+         ;; undeclared and are not being used"): loud enough that a typo'd alias
+         ;; doesn't run the program without its deps and fail somewhere far
+         ;; away, but not fatal — an editor sends a fixed alias set (Calva asks
+         ;; for `-A:test:dev -Spath`) and a project that declares only some of
+         ;; them still has a classpath, and a program, to give it.
+         _ (let [missing (distinct (remove #(get-in edn [:aliases %]) alias-kws))]
              (when (seq missing)
-               (throw (ex-info (str "Specified aliases are undeclared: " (vec missing))
-                               {:aliases (vec missing)}))))
+               (warn "Specified aliases are undeclared and are not being used: "
+                     (pr-str (vec missing)))))
          main-opts (:main-opts argmap)
          ;; Path order matches the clj CLI: the selected aliases' :extra-paths
          ;; come FIRST (in alias-selection order), then the project's :paths —
@@ -883,19 +975,29 @@
          all-deps (merge (or (:replace-deps argmap) (:deps argmap)
                              (if tool? {} (:deps edn)))
                          (:extra-deps argmap))
-         {dep-roots :roots dep-natives :natives prep-libs :prep}
-         (binding [*mvn-local-repo* (when-let [r (:mvn/local-repo edn)]
-                                      (abspath project-dir r))
-                   *mvn-repos* (mvn-repo-urls edn)]
-           (resolve-deps all-deps project-dir
-                         {:override-deps (:override-deps argmap)
-                          :default-deps (:default-deps argmap)}))
+         ;; :cp (the CLI's -Scp) supplies the roots outright, so the dependency
+         ;; graph is never expanded and nothing is fetched. The deps.edn chain is
+         ;; still read and the aliases still combine — that is only file reads,
+         ;; and an alias's :main-opts / :exec-fn and the project's :tasks come
+         ;; from there. tools.deps' --skip-cp draws the line in the same place:
+         ;; the merged edn and argmap, without calc-basis.
+         {dep-roots :roots dep-natives :natives prep-libs :prep dep-trace :trace}
+         (when-not cp
+           (binding [*mvn-local-repo* (when-let [r (:mvn/local-repo edn)]
+                                        (abspath project-dir r))
+                     *mvn-repos* (mvn-repo-urls edn)]
+             (resolve-deps all-deps project-dir
+                           {:override-deps (:override-deps argmap)
+                            :default-deps (:default-deps argmap)
+                            :trace? trace?})))
          _ (when (seq prep-libs)
              (warn "deps declare :deps/prep-lib steps jolt does not run "
                    "(their compiled/generated assets will be missing): "
                    (str/join ", " prep-libs)))]
      ;; reconcile: the project's own roots/natives + every dep's, deduped once.
-     {:roots (dedup-by identity (concat project-roots dep-roots))
+     ;; With :cp the given roots ARE the answer — they replace the project's own
+     ;; paths too, like the clj CLI, where -Scp is the whole classpath.
+     {:roots (dedup-by identity (or cp (concat project-roots dep-roots)))
       :main-opts main-opts
       ;; the combined alias args map — the CLI's -X/-T read :exec-fn /
       ;; :exec-args / :ns-default / :ns-aliases from it.
@@ -910,9 +1012,30 @@
       :embed-dirs (mapv #(abspath project-dir %) (:embed (:jolt/build edn)))
       :tasks (:tasks edn)
       :natives (dedup-by native-key (concat (:jolt/native edn) dep-natives))
+      ;; the expansion trace, when it was asked for (-Stree renders it)
+      :trace dep-trace
       ;; nREPL middleware a library contributes (jolt.nrepl composes them over its
       ;; built-in handler) — symbols resolving to a middleware fn or a vector of them.
       :nrepl-middleware (:nrepl/middleware edn)})))
+
+(defn env-info
+  "The files a resolution reads and the caches it fetches into, as data. One
+  source of truth for the CLI's two renderings of it: -Sdescribe prints the map,
+  -Sverbose the same values as lines before resolving. `repro?` reports whether
+  the user deps.edn is being skipped (-Srepro / JOLT_NO_USER_DEPS)."
+  ([project-dir] (env-info project-dir false))
+  ([project-dir repro?]
+   (let [repro? (boolean (or repro? (getenv "JOLT_NO_USER_DEPS")))
+         user (user-deps-path)
+         project (str project-dir "/deps.edn")]
+     {:project-dir project-dir
+      :config-user (when-not repro? user)
+      :config-project project
+      :config-files (vec (concat (when (and (not repro?) (file-exists? user)) [user])
+                                 (when (file-exists? project) [project])))
+      :gitlibs-dir (gitlibs-dir)
+      :mvn-local-repo (m2-repo-dir)
+      :repro repro?})))
 
 (defn add-deps
   "Resolve an inline deps map and add the resulting source roots to the loader,

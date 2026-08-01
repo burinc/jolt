@@ -7,11 +7,13 @@
 # Asserts the tools.deps alias args-map keys jolt supports — :extra-deps /
 # :extra-paths / :override-deps / :default-deps / :replace-deps / :replace-paths
 # / :main-opts — plus multi-alias combination rules, alias visibility in `path`,
-# -A composing with -M, an undeclared alias failing, the java.time library
-# autoload from the source roots, and the tools.deps CLI surface: -X/-T exec,
-# -Sdeps, the user deps.edn chain, :local/root jars, :git/tag + short sha, and
-# git cache integrity (an interrupted or failed fetch is never trusted as a
-# cached checkout).
+# -A composing with -M, an undeclared alias warning and being skipped, the
+# java.time library autoload from the source roots, and the tools.deps CLI
+# surface: -X/-T exec, -Sdeps, the report options (-Spath / -Stree / -Strace /
+# -Sdescribe / -P), -Scp, -Srepro, -Sverbose, the accepted-and-ignored options,
+# the user deps.edn chain, :local/root jars, :git/tag + short sha, and git cache
+# integrity (an interrupted or failed fetch is never trusted as a cached
+# checkout).
 #
 # The expansion engine itself (exclusions, version selection, orphan cutting) is
 # unit-tested in test/deps_expand_test.clj — see `make depsunit`.
@@ -42,6 +44,10 @@ check() { # label expected actual
 
 run() { JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" "$@" 2>&1 | tail -1; }
 runfull() { JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" "$@" 2>&1; }
+# stdout only — for the path queries, whose answer a warning on stderr must not
+# be able to displace. runall keeps every line (a tree, a describe map).
+runout() { JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" "$@" 2>/dev/null | tail -1; }
+runall() { JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" "$@" 2>/dev/null; }
 
 # baseline: project deps only
 check "project dep resolves (liba)" "liba A" "$(run run -m appver)"
@@ -113,11 +119,160 @@ check "multi-alias main-opts last-wins" "main2" "$(run -M:m1:m2)"
 # -A composes with -M (deps from -A, main from -M)
 check "-A composes with -M" "main1" "$(run -A:dev -M:m1)"
 
-# undeclared alias errors like tools.deps
+# an undeclared alias warns and is skipped, like tools.deps — an editor sends a
+# fixed alias set (Calva's `-A:test:dev`) and a project that happens not to
+# declare one of them still has a classpath, and a program, to run.
 out="$(runfull -A:nope path)"
 case "$out" in
-  *undeclared*) check "undeclared alias errors" ok ok ;;
-  *) check "undeclared alias errors" "undeclared-alias error" "$(printf '%s' "$out" | head -1)" ;;
+  *undeclared*) check "undeclared alias warns" ok ok ;;
+  *) check "undeclared alias warns" "undeclared-alias warning" "$(printf '%s' "$out" | head -1)" ;;
+esac
+check "undeclared alias still resolves the project" "$(runout path)" "$(runout -A:nope path)"
+check "undeclared alias keeps the declared ones" "$(runout -A:dev path)" "$(runout -A:nope:dev path)"
+check "undeclared alias still runs the program" "liba A" "$(run -A:nope run -m appver)"
+JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" -A:nope path >/dev/null 2>&1
+check "undeclared alias exits 0" "0" "$?"
+
+# -Spath — the clj CLI's "print the classpath and run nothing" option (what an
+# editor asks with). The alias-selecting forms still count, in either order.
+check "-Spath prints the roots" "$(runout path)" "$(runout -Spath)"
+check "-A:alias -Spath sees the alias" "$(runout -A:dev path)" "$(runout -A:dev -Spath)"
+check "-Spath -A:alias sees the alias" "$(runout -A:dev path)" "$(runout -Spath -A:dev)"
+check "-Spath -M:alias sees the alias" "$(runout -A:dev path)" "$(runout -Spath -M:dev)"
+check "-Spath -X:alias sees the alias" "$(runout -A:dev path)" "$(runout -Spath -X:dev)"
+check "-Spath -Sdeps sees the extra map" "$(runout -A:dev path)" \
+      "$(runout -Spath -Sdeps '{:aliases {:inj {:extra-paths ["dev"] :extra-deps {local/libc {:local/root "../libc"}}}}}' -A:inj)"
+# -T replaces the project basis, so its -Spath answer does too
+out="$(runout -Spath -T:xtool)"
+case "$out" in
+  *"$APP/src"*) check "-Spath -T replaces the project basis" "no src in path" "$out" ;;
+  *tooldep*)    check "-Spath -T replaces the project basis" ok ok ;;
+  *)            check "-Spath -T replaces the project basis" "tooldep in path" "$out" ;;
+esac
+# and nothing runs: no :main-opts, no :exec-fn, no task, no REPL
+out="$(runfull -Spath -M:m1)"
+case "$out" in
+  *main1*) check "-Spath -M runs no program" "no program output" "$out" ;;
+  *) check "-Spath -M runs no program" ok ok ;;
+esac
+out="$(runfull -Spath -X:xbuild)"
+case "$out" in
+  *exec:*) check "-Spath -X runs no exec-fn" "no exec output" "$out" ;;
+  *) check "-Spath -X runs no exec-fn" ok ok ;;
+esac
+check "-Spath with an undeclared alias still answers" "$(runout -A:dev path)" \
+      "$(runout -A:dev:nope -Spath)"
+
+# -Sdescribe — the environment as an edn map, without resolving any dependency
+out="$(runall -Sdescribe)"
+case "$out" in
+  *":config-project \"$APP/deps.edn\""*) check "-Sdescribe names the project deps.edn" ok ok ;;
+  *) check "-Sdescribe names the project deps.edn" ":config-project entry" "$out" ;;
+esac
+out="$(runall -A:dev -Sdescribe -A:dev2)"
+case "$out" in
+  *":aliases [:dev :dev2]"*) check "-Sdescribe reports the selected aliases" ok ok ;;
+  *) check "-Sdescribe reports the selected aliases" ":aliases [:dev :dev2]" "$out" ;;
+esac
+
+# -Stree — the dependency tree, tools.deps format: top deps unprefixed, the deps
+# they pull in indented under them with a `.`
+out="$(runall -Stree)"
+case "$out" in
+  "local/liba "*) check "-Stree prints the top dep" ok ok ;;
+  *) check "-Stree prints the top dep" "local/liba <coord>" "$out" ;;
+esac
+out="$(runall -A:dev -Stree)"
+case "$out" in
+  *"local/libc "*) check "-Stree sees the alias's deps" ok ok ;;
+  *) check "-Stree sees the alias's deps" "local/libc in the tree" "$out" ;;
+esac
+# a transitive dep hangs under the dep that pulled it in
+mkdir -p "$tmp/treeproj/src" "$tmp/treeparent/src" "$tmp/treechild/src"
+printf '{:paths ["src"]}\n' > "$tmp/treechild/deps.edn"
+printf '{:paths ["src"] :deps {local/treechild {:local/root "../treechild"}}}\n' > "$tmp/treeparent/deps.edn"
+printf '{:paths ["src"] :deps {local/treeparent {:local/root "../treeparent"}}}\n' > "$tmp/treeproj/deps.edn"
+out="$(JOLT_PWD="$tmp/treeproj" JOLT_QUIET=1 "$JOLT" -Stree 2>/dev/null)"
+case "$out" in
+  "local/treeparent "*"
+  . local/treechild "*) check "-Stree indents a transitive dep" ok ok ;;
+  *) check "-Stree indents a transitive dep" "child under parent" "$out" ;;
+esac
+
+# accepted-and-ignored options don't change the answer or fail
+check "-Sforce is accepted" "$(runout path)" "$(runout -Sforce -Spath)"
+check "-Sthreads N is accepted" "$(runout path)" "$(runout -Sthreads 4 -Spath)"
+check "-J is accepted (no JVM to pass it to)" "$(runout path)" "$(runout -J-Xmx512m -Spath)"
+
+# -Sverbose says where deps come from — on stderr, so stdout stays the answer
+check "-Sverbose leaves stdout alone" "$(runout path)" "$(runout -Sverbose -Spath)"
+out="$(JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" -Sverbose -Spath 2>&1 >/dev/null)"
+case "$out" in
+  *project_deps*gitlibs_dir*) check "-Sverbose reports the deps environment" ok ok ;;
+  *) check "-Sverbose reports the deps environment" "env lines on stderr" "$out" ;;
+esac
+
+# -P resolves everything and runs nothing
+check "-P prints nothing" "" "$(runout -P)"
+out="$(runfull -P -M:m1)"
+case "$out" in
+  *main1*) check "-P runs no program" "no program output" "$out" ;;
+  *) check "-P runs no program" ok ok ;;
+esac
+
+# -Sdescribe answers from the deps.edn files alone: a project whose dependency
+# can't be fetched still describes, so an editor can ask cheaply and offline.
+mkdir -p "$tmp/baddep/src"
+cat > "$tmp/baddep/deps.edn" <<'EOF'
+{:paths ["src"]
+ :deps {local/nope {:git/url "file:///nonexistent-jolt-smoke-repo"
+                    :git/sha "0000000000000000000000000000000000000000"}}}
+EOF
+JOLT_PWD="$tmp/baddep" JOLT_QUIET=1 "$JOLT" -Sdescribe >/dev/null 2>&1
+check "-Sdescribe resolves no dependencies" "0" "$?"
+
+# -Scp — these roots, no expansion. The unfetchable dep above proves the
+# expansion is skipped rather than merely overridden.
+check "-Scp replaces the roots" "/a:/b" "$(runout -Scp /a:/b -Spath)"
+check "-Scp round-trips a recorded classpath" "$(runout -A:dev path)" \
+      "$(runout -Scp "$(runout -A:dev path)" -Spath)"
+check "-Scp expands no dependencies" "/a" \
+      "$(JOLT_PWD="$tmp/baddep" JOLT_QUIET=1 "$JOLT" -Scp /a -Spath 2>/dev/null)"
+# …and the deps.edn is still read, so an alias's :main-opts still run — against
+# the given roots, which is the point: a recorded classpath drives a run offline
+check "-Scp keeps the deps.edn main-opts" "main1" \
+      "$(run -Scp "$APP/src" -M:m1)"
+cat > "$tmp/baddep/src/badmain.clj" <<'EOF'
+(ns badmain)
+(defn -main [& _] (println "ran off the given roots"))
+EOF
+check "-Scp runs a program with the deps unfetched" "ran off the given roots" \
+      "$(JOLT_PWD="$tmp/baddep" JOLT_QUIET=1 "$JOLT" -Scp "$tmp/baddep/src" run -m badmain 2>&1 | tail -1)"
+
+# -Strace writes the expansion to trace.edn beside the deps.edn, and runs nothing
+rm -f "$APP/trace.edn"
+out="$(runfull -A:dev -Strace)"
+case "$out" in
+  *"Wrote $APP/trace.edn"*) check "-Strace says where it wrote" ok ok ;;
+  *) check "-Strace says where it wrote" "Wrote …/trace.edn" "$out" ;;
+esac
+if [ -f "$APP/trace.edn" ]; then
+  check "-Strace logs the expansion" "libc" \
+        "$("$JOLT" -e "(let [t (read-string (slurp \"$APP/trace.edn\"))]
+                         (println (some #(when (= 'local/libc (:lib %)) (name (:lib %)))
+                                        (:log t))))" 2>/dev/null | tail -1)"
+  check "-Strace records the version map" "true" \
+        "$("$JOLT" -e "(println (contains? (read-string (slurp \"$APP/trace.edn\")) :vmap))" 2>/dev/null | tail -1)"
+else
+  fail=$((fail+2)); echo "  FAIL: -Strace wrote no trace.edn" >&2
+fi
+rm -f "$APP/trace.edn"
+
+# an -S option jolt doesn't have says so, rather than reading as a bad task name
+out="$(runfull -Sman)"
+case "$out" in
+  *"unsupported option: -Sman"*) check "unknown -S option is named as one" ok ok ;;
+  *) check "unknown -S option is named as one" "unsupported-option error" "$(printf '%s' "$out" | head -1)" ;;
 esac
 
 # java.time library autoload: an unrequired java.time.ZoneId reference loads
@@ -194,7 +349,18 @@ check "user deps.edn alias resolves" "libc C" \
 out="$(JOLT_PWD="$APP" JOLT_QUIET=1 CLJ_CONFIG="$tmp/userconf" "$JOLT" -A:useralias run -m appc 2>&1)"
 case "$out" in
   *undeclared*) check "JOLT_NO_USER_DEPS opts out of the user chain" ok ok ;;
-  *) check "JOLT_NO_USER_DEPS opts out of the user chain" "undeclared-alias error" "$(printf '%s' "$out" | head -1)" ;;
+  *) check "JOLT_NO_USER_DEPS opts out of the user chain" "undeclared-alias warning" "$(printf '%s' "$out" | head -1)" ;;
+esac
+# -Srepro opts out the same way, per run rather than per environment
+out="$(JOLT_PWD="$APP" JOLT_QUIET=1 CLJ_CONFIG="$tmp/userconf" JOLT_NO_USER_DEPS= "$JOLT" -Srepro -A:useralias run -m appc 2>&1)"
+case "$out" in
+  *undeclared*) check "-Srepro ignores the user deps.edn" ok ok ;;
+  *) check "-Srepro ignores the user deps.edn" "undeclared-alias warning" "$(printf '%s' "$out" | head -1)" ;;
+esac
+out="$(JOLT_PWD="$APP" JOLT_QUIET=1 CLJ_CONFIG="$tmp/userconf" JOLT_NO_USER_DEPS= "$JOLT" -Srepro -Sdescribe 2>/dev/null)"
+case "$out" in
+  *":repro true"*) check "-Srepro reports itself in -Sdescribe" ok ok ;;
+  *) check "-Srepro reports itself in -Sdescribe" ":repro true" "$out" ;;
 esac
 
 # :local/root pointing at a jar extracts it and uses the extraction as a root

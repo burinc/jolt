@@ -75,6 +75,14 @@
 
 (defmethod coord-deps :default [lib coord] (throw-bad-coord lib coord))
 
+(defmulti coord-summary
+  "Returns a one-line description of a lib at a coordinate — the library name
+  plus whatever names its version (a Maven version, a git tag or short sha, a
+  local path). The dependency tree (`jolt -Stree`) prints these."
+  (fn [lib coord] (coord-type coord)))
+
+(defmethod coord-summary :default [lib _coord] (str lib))
+
 (defmulti coord-info
   "Returns procurement info for a coordinate: {:root dir-or-nil, :manifest kw,
   :natives [...], :prep coords-with-:deps/prep-lib}. :root nil means the
