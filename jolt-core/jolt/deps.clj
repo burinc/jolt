@@ -11,14 +11,18 @@
   tools.gitlibs checkout ($GITLIBS / ~/.gitlibs) when the JVM toolchain already
   fetched them, else clone into a sha-immutable cache ($JOLT_GITLIBS, else
   ~/.jolt/gitlibs, or a jolt/ subdir of $GITLIBS) shared across projects.
-  Maven jars live in the standard local repository (~/.m2/repository;
-  :mvn/local-repo in deps.edn relocates it like tools.deps, JOLT_LOCAL_REPO
-  overrides from the environment) shared with the JVM toolchain in both
-  directions. Maven jars are fetched by jolt itself over HTTPS (jolt.mvn-http);
+  Maven POMs and jars live in the standard local repository
+  (~/.m2/repository; :mvn/local-repo in deps.edn relocates it like tools.deps,
+  GRENADINE_LOCAL_REPOSITORY supplies an environment default, and
+  JOLT_LOCAL_REPO remains as a legacy fallback) shared with the JVM toolchain
+  in both directions. Grenadine builds effective POMs and compares Maven
+  versions; files are fetched by jolt itself over HTTPS (jolt.mvn-http);
   git and unzip still shell out through jolt.host/sh (nothing here touches the JVM)."
   (:require [clojure.edn :as edn]
             [clojure.set :as set]
             [clojure.string :as str]
+            [grenadine.pom :as grenadine.pom]
+            [grenadine.version :as grenadine.version]
             [jolt.deps.edn :as dedn]
             [jolt.deps.ext :as ext]
             [jolt.mvn-http :as http]))
@@ -205,21 +209,26 @@
 ;; "<artifact>-<version>.jar.jolt/" directory beside the jar. The repository
 ;; location is configured the way tools.deps configures it — the :mvn/local-repo
 ;; top key of deps.edn (also accepted in an add-deps map); anyone already using
-;; it gets the same behavior for free. JOLT_LOCAL_REPO overrides it from the
-;; environment as a jolt-specific convenience. Setting JOLT_MVNLIBS opts out of
-;; sharing entirely: the legacy self-contained layout under it, jar not kept.
+;; it gets the same behavior for free. GRENADINE_LOCAL_REPOSITORY supplies the
+;; shared environment default, with JOLT_LOCAL_REPO retained as a legacy
+;; fallback. Setting JOLT_MVNLIBS opts out of sharing entirely: the legacy
+;; self-contained layout under it, jar not kept.
 
 (def ^:private ^:dynamic *mvn-local-repo*
   "The :mvn/local-repo of the resolution in progress (bound by resolve-project /
   add-deps from their deps.edn / deps map), nil for the default." nil)
 
 (defn- m2-repo-dir
-  "The local Maven repository dir, resolved like tools.deps: JOLT_LOCAL_REPO
-  (env, jolt-specific convenience) wins, then :mvn/local-repo, then
+  "The local Maven repository dir. An explicit :mvn/local-repo wins, followed
+  by Grenadine's environment setting, Jolt's legacy override, then the standard
   ~/.m2/repository."
-  ([] (m2-repo-dir (getenv "JOLT_LOCAL_REPO") *mvn-local-repo* (getenv "HOME")))
-  ([env-override cfg home]
-   (or env-override cfg (str (or home ".") "/.m2/repository"))))
+  ([] (m2-repo-dir *mvn-local-repo*
+                   (getenv "GRENADINE_LOCAL_REPOSITORY")
+                   (getenv "JOLT_LOCAL_REPO")
+                   (getenv "HOME")))
+  ([cfg grenadine-override jolt-override home]
+   (or cfg grenadine-override jolt-override
+       (str (or home ".") "/.m2/repository"))))
 
 (def ^:private default-mvn-repos
   ["https://repo.clojars.org" "https://repo1.maven.org/maven2"])
@@ -238,6 +247,40 @@
               (sort-by key (:mvn/repos edn)))))
 
 (defn- mvn-group [coord] (or (namespace coord) (name coord)))
+
+(defn- maven-path
+  [{:keys [group artifact version]} extension]
+  (str (str/replace group "." "/") "/" artifact "/" version "/"
+       artifact "-" version extension))
+
+(defn- fetch-maven-file
+  "Fetch `relative` into `target` from the configured repositories. Jolt's
+  downloader writes through a temporary file and atomically renames."
+  [relative target]
+  (if (file-exists? target)
+    target
+    (do
+      (sh (str "mkdir -p "
+               (pr-str (subs target 0 (str/last-index-of target "/")))))
+      (loop [repos *mvn-repos*]
+        (when-let [repo (first repos)]
+          (if (http/fetch (str repo "/" relative) target)
+            target
+            (recur (rest repos))))))))
+
+(defn- pom-text
+  "Return a POM as text, sharing the standard Maven repository with tools.deps."
+  [coords]
+  (let [relative (maven-path coords ".pom")
+        target (str (m2-repo-dir) "/" relative)]
+    (if-let [path (fetch-maven-file relative target)]
+      (slurp path)
+      (throw
+       (ex-info
+        (str "POM not found: " (:group coords) "/" (:artifact coords)
+             " " (:version coords))
+        {:type :jolt.deps/pom-not-found
+         :coords coords})))))
 
 (defn- cache-fresh?
   "Is the extraction at `dir` still valid for `jar`? The `.jolt-ok` marker is
@@ -302,10 +345,10 @@
                     d))
               (recur (rest repos)))))))))
 
-(defn- pom-deps-from
+(defn- raw-pom-deps-from
   "Transitive deps read from a pom.xml — as a deps map so the expansion walks
-  them like any other. Skips test/provided/system scope, org.clojure/clojure
-  (intrinsic), and non-literal versions (ranges / ${properties})."
+  them like any other. This fallback is only for a local JAR whose Maven
+  coordinates are unknown; repository Maven deps use Grenadine effective POMs."
   [pom]
   (do
     (when (file-exists? pom)
@@ -418,6 +461,36 @@
       (let [v (f)] (swap! *procure-memo* assoc k v) v))
     (f)))
 
+(defn- effective-pom-deps
+  "Build a Maven dependency map from Grenadine's effective POM model. Parent
+  inheritance, properties, dependency management, BOM imports, and exclusions
+  have already been resolved by Grenadine."
+  [lib coord]
+  (memoized
+   [:effective-pom lib (ext/dep-id lib coord)]
+   (fn []
+     (let [coords {:group (mvn-group lib)
+                   :artifact (name lib)
+                   :version (:mvn/version coord)}
+           effective (grenadine.pom/effective-pom coords pom-text)]
+       (into
+        {}
+        (keep
+         (fn [{:keys [group artifact version scope optional exclusions]}]
+           (when (and group artifact version
+                      (not (#{"test" "provided" "system"} scope))
+                      (not optional))
+             [(symbol group artifact)
+              (cond-> {:mvn/version version}
+                (seq exclusions)
+                (assoc :exclusions
+                       (set
+                        (map
+                         (fn [{:keys [group artifact]}]
+                           (symbol group artifact))
+                         exclusions))))])))
+        (:deps effective))))))
+
 (defn- manifest-info
   "Manifest detection for a git/local directory root: its deps.edn, else a bare
   source tree. A directory with no deps.edn contributes its default `src` path
@@ -451,7 +524,7 @@
           ;; its transitive deps are cljs/JVM tooling — don't walk them.
           (not (has-clj-source? root)) {:root nil :manifest :none}
           :else {:root root :manifest :mvn
-                 :pom (str root "/META-INF/maven/" (mvn-group lib) "/" (name lib) "/pom.xml")})))))
+                 :deps (effective-pom-deps lib coord)})))))
 
 (defn- git-info [lib coord]
   (memoized [:info lib (ext/dep-id lib coord)]
@@ -492,11 +565,13 @@
 (defmethod ext/coord-info :git [lib coord] (git-info lib coord))
 (defmethod ext/coord-info :local [lib coord] (local-info lib coord))
 
-(defn- children-of [{:keys [root manifest edn pom]}]
+(defn- children-of [{:keys [root manifest edn pom deps]}]
   (cond
     (nil? root) []
     (= manifest :deps-edn) (filter-deps (:deps edn) root)
-    (and (= manifest :mvn) pom (file-exists? pom)) (filter-deps (pom-deps-from pom) root)
+    (and (= manifest :mvn) deps) (filter-deps deps root)
+    (and (= manifest :mvn) pom (file-exists? pom))
+    (filter-deps (raw-pom-deps-from pom) root)
     :else []))
 
 (defmethod ext/coord-deps :mvn [lib coord] (children-of (mvn-info lib coord)))
@@ -509,7 +584,9 @@
 ;; selected coordinate (tools.deps throws instead; jolt prefers resolving with
 ;; the first-seen version over failing the whole resolution).
 (defmethod ext/compare-versions [:mvn :mvn] [_ x y]
-  (ext/compare-mvn-versions (:mvn/version x) (:mvn/version y)))
+  (grenadine.version/compare-versions
+   (:mvn/version x)
+   (:mvn/version y)))
 
 (defn- git-ancestor? [dir a b]
   (zero? (sh (str "git -C " (pr-str dir) " merge-base --is-ancestor " a " " b " 2>/dev/null"))))
