@@ -663,6 +663,24 @@
 (define (sys-clear-property k)
   (let ((prev (hashtable-ref sys-prop-table k jolt-nil)))
     (hashtable-delete! sys-prop-table k) prev))
+;; java.class.path — jolt's equivalent of the JVM classpath is the resolved
+;; source roots (project :paths + every dependency's roots), which a project
+;; command installs with set-source-roots! before it runs anything. Editor
+;; tooling ported from the JVM reads this property to find project sources
+;; (orchard's namespace/classpath scan, compliment's classpath completion
+;; sources, cider-nrepl's classpath op), so answer it from the live roots rather
+;; than leaving it unset — an unset value made those return nothing at all.
+;; The roots live in the loader, which is layered ABOVE the runtime (the gate
+;; harness boots rt.ss without it), so the loader installs the provider and this
+;; answers "" until it does.
+(define sys-class-path-provider (lambda () '()))
+(define (set-class-path-provider! f) (set! sys-class-path-provider f))
+(define (sys-class-path)
+  (let loop ((roots (sys-class-path-provider)) (acc ""))
+    (cond ((null? roots) acc)
+          ((string=? acc "") (loop (cdr roots) (car roots)))
+          (else (loop (cdr roots) (string-append acc ":" (car roots)))))))
+
 (define (sys-get-property k . dflt)
   (let* ((k (jolt-need-string k))
          (set-val (hashtable-ref sys-prop-table k #f)))
@@ -672,17 +690,20 @@
           ((string=? k "line.separator") "\n")
           ((string=? k "file.separator") "/")
           ((string=? k "path.separator") ":")
-          ;; user.dir is the user's cwd (JVM: the process cwd). jolt's launcher
-          ;; cd's to the repo root and resets PWD, but preserves the user's cwd in
-          ;; JOLT_PWD — prefer it so user.dir and spawned-child cwds agree.
-          ((string=? k "user.dir") (or (getenv "JOLT_PWD") (getenv "PWD") "."))
+          ((string=? k "java.class.path") (sys-class-path))
+          ;; user.dir is the user's cwd (JVM: the process cwd). jolt-user-dir (io.ss)
+          ;; owns that chain — JOLT_PWD, then the process's own working directory —
+          ;; so the property and every relative path resolve against the same place.
+          ((string=? k "user.dir") (jolt-user-dir))
           ((string=? k "user.home") (or (getenv "HOME") ""))
           ((string=? k "java.io.tmpdir") (or (getenv "TMPDIR") "/tmp"))
           ((pair? dflt) (car dflt))
           (else jolt-nil))))
 (define (sys-properties-map)
   (let ((base (jolt-hash-map "os.name" sys-os-name "line.separator" "\n" "file.separator" "/"
-                             "user.dir" (or (getenv "JOLT_PWD") (getenv "PWD") ".") "user.home" (or (getenv "HOME") "")
+                             "path.separator" ":" "java.class.path" (sys-class-path)
+                             "jolt.version" (jolt-version-string)
+                             "user.dir" (jolt-user-dir) "user.home" (or (getenv "HOME") "")
                              "java.io.tmpdir" (or (getenv "TMPDIR") "/tmp"))))
     (for-each
       (lambda (kv)

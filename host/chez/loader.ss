@@ -26,6 +26,12 @@
 (define (set-source-roots!* roots) (set! source-roots roots))
 (define (get-source-roots) source-roots)
 
+;; jolt's answer to (System/getProperty "java.class.path") is these roots — the
+;; loader owns them, the runtime's system-property table renders them. Tooling
+;; ported from the JVM (orchard's / compliment's classpath scans, cider-nrepl's
+;; classpath op) discovers project sources through that property.
+(set-class-path-provider! get-source-roots)
+
 ;; Install roots — the directories that ship with Jolt (compiler + stdlib + vendored
 ;; deps). Shared by cli.ss, build-jolt.ss, and the bld-require-closure filter so the
 ;; literal list stays in one place.
