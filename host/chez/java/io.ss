@@ -124,16 +124,26 @@
 
 ;; user.dir — the project dir every user-facing relative path resolves against.
 ;; JOLT_PWD carries it when the launcher moved away from it (bin/jolt exports the
-;; user's cwd before cd'ing to the repo root); a built binary never moves, so its
-;; own cwd is the project dir and PWD names it. This is the same chain
+;; user's cwd before cd'ing to the repo root); otherwise it is the process's own
+;; working directory, like the JVM's user.dir. This is the same chain
 ;; System/getProperty "user.dir" answers with — kept in one place so a caller
 ;; cannot implement half of it.
+;;
+;; PWD only gets a say when it agrees with that directory, where it is the
+;; symlink-preserving spelling of it. It is a SHELL convention, not the process's
+;; cwd: a child started in a different directory (jolt.process's :dir, or any
+;; parent that chdirs) inherits the parent's PWD, and trusting it resolved every
+;; relative path against the parent's directory — `jolt -m app` run with :dir set
+;; read the WRONG deps.edn, or none.
 (define (jolt-user-dir)
   (let ((jp (getenv "JOLT_PWD")))
     (if (and jp (> (string-length jp) 0))
         jp
-        (let ((wd (getenv "PWD")))
-          (if (and wd (> (string-length wd) 0)) wd ".")))))
+        (let ((cwd (current-directory))
+              (wd (getenv "PWD")))
+          (cond ((and wd (> (string-length wd) 0) (string=? wd cwd)) wd)
+                ((> (string-length cwd) 0) cwd)
+                (else "."))))))
 
 ;; A user-facing relative path resolves against user.dir — the user's cwd before
 ;; the launcher cd'd to the jolt repo root — matching the JVM, where io/file is
@@ -167,10 +177,23 @@
           ((char=? (string-ref p i) #\/) (substring p (+ i 1) (string-length p)))
           (else (loop (- i 1))))))
 
-;; directory children as full paths, sorted (the __list-dir seed primitive).
+;; directory children, sorted (the __list-dir seed primitive). The children keep
+;; the FORM OF THE PARENT, like File.listFiles(), which builds each child as
+;; new File(this, name): listing a relative directory yields relative children.
+;; Resolving the base to an absolute path first made every child absolute, so a
+;; caller that relativized the results against the directory it passed in (a
+;; classpath scanner turning files into namespace names) got ../../-prefixed
+;; garbage. A trailing slash is dropped the way the File constructor normalizes
+;; it away.
 (define (jolt-list-dir path)
-  (let ((p (project-relative (file-path-of path))))
-    (map (lambda (e) (string-append p "/" e))
+  (let* ((given (file-path-of path))
+         (p (project-relative given))
+         (trimmed (let loop ((n (string-length given)))
+                    (if (and (> n 1) (char=? (string-ref given (- n 1)) #\/))
+                        (loop (- n 1))
+                        (substring given 0 n))))
+         (base (if (string=? trimmed "") p trimmed)))
+    (map (lambda (e) (string-append (if (string=? base "/") "" base) "/" e))
          (sort string<? (directory-list p)))))
 (define (jolt-dir? path) (if (file-directory? (project-relative (file-path-of path))) #t #f))
 
@@ -327,7 +350,9 @@
       ((string=? name "isDirectory")    (list (if (file-directory? fp) #t #f)))
       ((string=? name "isFile")         (list (if (and (file-exists? fp) (not (file-directory? fp))) #t #f)))
       ((string=? name "isAbsolute")     (list (if (and (> (string-length p) 0) (char=? (string-ref p 0) #\/)) #t #f)))
-      ((string=? name "listFiles")      (list (list->cseq (map make-jfile (jolt-list-dir fp)))))
+      ;; listFiles builds each child from the path AS GIVEN (new File(this, name)
+      ;; on the JVM), so a File made from a relative path lists relative children.
+      ((string=? name "listFiles")      (list (list->cseq (map make-jfile (jolt-list-dir p)))))
       ;; .list -> the child NAMES (a String[]), nil if not a directory.
       ((string=? name "list")
        (list (if (file-directory? fp)
