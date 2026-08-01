@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.15] - 2026-08-01
+
+Dependency resolution reads the POM Maven would. jolt used to take a jar's
+transitive deps from whatever `pom.xml` the jar happened to package, which meant
+a jar that ships without one — `metosin/malli` — contributed none at all, and
+projects worked around it by listing them by hand. jolt now vendors Grenadine
+and builds the effective POM from the repository, so inheritance, properties,
+dependency management and exclusions all count. The CLI also grew the rest of
+the `clj` `-S` option surface, which is how editors ask for a classpath.
+
 ### Added
 
 - **Maven transitive deps come from the real effective POM.** jolt used to scrape
@@ -80,6 +90,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-dispatches to (`run`, `build`, `repl`, `nrepl-server`, a task, `-e`,
   `-M`/`-X`/`-T`) resolves for itself — so each `-A` invocation walked the whole
   dependency tree twice and printed any resolution warning twice with it.
+
+- **`bin/jolt` runs the same Chez as the rest of the build.** `make` provisions
+  its own Chez when the one on `PATH` is a different version, but `bin/jolt`
+  searched `PATH` itself, so a build could straddle two installs — the targets
+  calling `$(CHEZ)` getting one and the targets shelling out to `bin/jolt` the
+  other. That surfaced as whichever primitive the older Chez predates
+  (`variable flvector? is not bound` on a 9.x), or, once `make devboot` had run,
+  as `incompatible fasl-object version`, since a fasl only loads in the Chez
+  that wrote it. `bin/jolt` now takes `$JOLT_CHEZ`, which the Makefile exports.
+
+  Separately, the devboot image now records which Chez built it, and `bin/jolt`
+  falls back to source mode when that isn't the one about to run it or when it
+  has since been upgraded in place. Neither shows up in the image's input list,
+  so the cache read as current while nothing in jolt explained the failure.
+
+- **A built binary serves its own source for a shadowed namespace.** Install
+  roots are first-wins, but the binary baked them last-wins, so a namespace
+  present on two roots — a vendored library shipping a facade under a jolt name
+  — reached the binary as the wrong file while `bin/jolt` kept the right one.
+  The namespace itself is compiled in and kept working; what broke was
+  `io/resource`, which is how orchard maps a namespace back to a file, so an
+  editor could jump to the wrong source.
 
 ### Changed
 
@@ -2661,7 +2693,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.14...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.15...HEAD
+[0.5.15]: https://github.com/jolt-lang/jolt/compare/v0.5.14...v0.5.15
 [0.5.14]: https://github.com/jolt-lang/jolt/compare/v0.5.13...v0.5.14
 [0.5.13]: https://github.com/jolt-lang/jolt/compare/v0.5.12...v0.5.13
 [0.5.12]: https://github.com/jolt-lang/jolt/compare/v0.5.11...v0.5.12
