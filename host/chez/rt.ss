@@ -831,6 +831,14 @@
 ;; (jolt-str-render-one).
 (load "host/chez/natives-format.ss")
 
+;; extension points: the keyed provider registry core declares a
+;; contract on and a library fills in (jolt.host/register-extension-point! /
+;; register-extension! / refine-extension! / extension-value). Host-neutral — the
+;; java layer and libraries are clients. After collections.ss (jolt maps),
+;; converters.ss + the printers (error messages render values), and rt.ss's
+;; throw-jvm.
+(load "host/chez/extensions.ss")
+
 ;; namespaces: the namespace value model — find-ns/ns-name/
 ;; all-ns/the-ns/create-ns/in-ns/ns-publics/ns-map/ns-interns/ns-aliases/resolve/
 ;; find-var/ns-unmap/*ns*, over the var-table + chez-current-ns. Loaded LAST: needs

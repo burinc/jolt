@@ -76,6 +76,10 @@
   {:suite "interop / Calendar and TimeZone" :label "fields resolve in the zone set after them" :expected "1289567655666" :actual "(let [c (doto (java.util.GregorianCalendar. 2010 10 12 13 14 15) (.set java.util.Calendar/MILLISECOND 666) (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT+00:00\")))] (.getTimeInMillis c))" :portability :jvm}
   {:suite "interop / Calendar and TimeZone" :label "a non-zero offset shifts the instant" :expected "1289560455000" :actual "(let [c (doto (java.util.GregorianCalendar. 2010 10 12 13 14 15) (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT+02:00\")))] (.getTimeInMillis c))" :portability :jvm}
   {:suite "interop / Calendar and TimeZone" :label "the custom GMT id forms" :expected "[19800000 -28800000 0 30600000]" :actual "[(.getRawOffset (java.util.TimeZone/getTimeZone \"GMT+05:30\")) (.getRawOffset (java.util.TimeZone/getTimeZone \"GMT-8\")) (.getRawOffset (java.util.TimeZone/getTimeZone \"UTC\")) (.getRawOffset (java.util.TimeZone/getTimeZone \"GMT+0830\"))]" :portability :jvm}
+  ;; BigDecimal.valueOf(long unscaled, int scale) is unscaled x 10^-scale. The
+  ;; scale is the value, not a formatting hint: dropping it returns 50 for what is
+  ;; really 0.050.
+  {:suite "interop / Calendar and TimeZone" :label "BigDecimal/valueOf applies its scale" :expected "[0.050M 0.07M 1.5M 12345M]" :actual "[(BigDecimal/valueOf 50 3) (BigDecimal/valueOf 7 2) (BigDecimal/valueOf 1.5) (BigDecimal/valueOf 12345 0)]" :portability :jvm}
   {:suite "interop / Calendar and TimeZone" :label "a named zone keeps its id" :expected "\"America/New_York\"" :actual "(.getID (java.util.TimeZone/getTimeZone \"America/New_York\"))" :portability :jvm}
   {:suite "interop / Calendar and TimeZone" :label "get reads the derived fields too" :expected "[1970 0 1 5 1 0]" :actual "(let [c (doto (java.util.Calendar/getInstance (java.util.TimeZone/getTimeZone \"GMT\")) (.setTimeInMillis 0))] [(.get c java.util.Calendar/YEAR) (.get c java.util.Calendar/MONTH) (.get c java.util.Calendar/DAY_OF_MONTH) (.get c java.util.Calendar/DAY_OF_WEEK) (.get c java.util.Calendar/DAY_OF_YEAR) (.get c java.util.Calendar/HOUR_OF_DAY)])" :portability :jvm}
   {:suite "interop / Calendar and TimeZone" :label "add of a month clamps the day" :expected "[2011 1 28]" :actual "(let [c (doto (java.util.GregorianCalendar. 2011 0 31) (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\")) (.add java.util.Calendar/MONTH 1))] [(.get c java.util.Calendar/YEAR) (.get c java.util.Calendar/MONTH) (.get c java.util.Calendar/DAY_OF_MONTH)])" :portability :jvm}
@@ -184,6 +188,7 @@
   {:suite "arrays / areduce + amap" :label "amap leaves the source untouched" :expected "[1 2 3]" :actual "(let [a (long-array [1 2 3])] (amap a i r (* 2 (aget a i))) (vec a))" :portability :common}
   {:suite "arrays / areduce + amap" :label "amap over a double-array" :expected "[3.0 5.0]" :actual "(let [a (double-array [1.5 2.5])] (vec (amap a i r (* 2.0 (aget a i)))))" :portability :common}
   {:suite "io / *out*" :label "println honors a rebound *out*" :expected "\"hi\\n\"" :actual "(binding [*out* (java.io.StringWriter.)] (println \"hi\") (str *out*))" :portability :jvm}
+  {:suite "interop / Integer" :label "Long/compare is the same over the full long range" :expected "[-1 0 1 -1]" :actual "[(Long/compare 2 3) (Long/compare 3 3) (Long/compare 4 3) (Long/compare -9223372036854775808 9223372036854775807)]" :portability :jvm}
   {:suite "interop / Integer" :label "Integer/compare is a 3-way int comparison" :expected "[-1 0 1]" :actual "[(Integer/compare 2 3) (Integer/compare 3 3) (Integer/compare 4 3)]" :portability :jvm}
   {:suite "interop / Keyword table" :label "the keyword intern table is reflectively visible" :expected "[true \"tt\"]" :actual "(do (keyword \"tt\" \"tt-kw\") (let [f (doto (.getDeclaredField clojure.lang.Keyword \"table\") (.setAccessible true))] [(contains? (.get f nil) (quote tt/tt-kw)) (namespace (some (fn [s] (and (= (name s) \"tt-kw\") s)) (keys (.get f nil))))]))" :portability :jvm}
   {:suite "clojure.repl" :label "special-doc knows if" :expected "[(quote (if test then else?))]" :actual "(do (require (quote clojure.repl)) (:forms ((var clojure.repl/special-doc) (quote if))))" :portability :jvm}
@@ -759,6 +764,11 @@
   {:suite "interop / StringReader & StringBuilder" :label "createTempFile wants a prefix of at least three" :expected "\"Prefix string \\\"pw\\\" too short: length must be at least 3\"" :actual "(try (java.io.File/createTempFile \"pw\" \".txt\") (catch IllegalArgumentException e (ex-message e)))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "with-open closes shim" :expected "97" :actual "(with-open [r (StringReader. \"a\")] (.read r))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "File.toURL methods read it back" :expected "\"file:/tmp/x\"" :actual "(do (require (quote clojure.java.io)) (.toString (.toURL (clojure.java.io/file \"/tmp/x\"))))" :portability :jvm}
+  ;; io/resource returns a java.net.URL on the JVM (a jar: URL inside the artifact)
+  ;; and here too — a file: URL on a source root, a jar:-classed embedded-res from a
+  ;; built binary. Both branches class as java.net.URL. Assert shape, not the path:
+  ;; the JVM's jar: spec and our file: spec differ, and an absolute path is
+  ;; machine-dependent. instance? is what callers (Selmer) branch on.
   {:suite "interop / StringReader & StringBuilder" :label "vector :import shares deftype ctor" :expected "\"hi!\"" :actual "(do (ns spec.nodea) (defprotocol SpecP (spec-pm [this])) (deftype SpecTN [t] SpecP (spec-pm [this] (str t \"!\"))) (ns spec.nodeb (:import [spec.nodea SpecTN])) (.spec-pm (SpecTN. \"hi\")))" :portability :jvm}
   {:suite "interop / PushbackReader & parse statics" :label "PushbackReader read" :expected "[97 98]" :actual "(let [r (java.io.PushbackReader. (java.io.StringReader. \"ab\"))] [(.read r) (.read r)])" :portability :jvm}
   {:suite "interop / PushbackReader & parse statics" :label "unread pushes back" :expected "[97 97 98]" :actual "(let [r (PushbackReader. (StringReader. \"ab\")) a (.read r)] (.unread r a) [a (.read r) (.read r)])" :portability :jvm}
@@ -895,6 +905,17 @@
   {:suite "inst / value semantics & printing" :label "unequal instants" :expected "false" :actual "(= #inst \"2020-01-01T00:00:00Z\" #inst \"2020-01-01T00:00:01Z\")" :portability :common}
   {:suite "inst / value semantics & printing" :label "works as map key" :expected ":v" :actual "(get {#inst \"2020-01-01T00:00:00Z\" :v} #inst \"2020-01-01T00:00:00.000Z\")" :portability :common}
   {:suite "inst / value semantics & printing" :label "pr-str round-trips" :expected "\"#inst \\\"2020-01-01T00:00:00.000-00:00\\\"\"" :actual "(pr-str #inst \"2020-01-01T00:00:00Z\")" :portability :common}
+  {:suite "reader / delimiters" :label "a mismatched close reports, it does not hang" :expected "\"Unmatched delimiter: )\"" :actual "(try (read-string \"(def m {:a 1)\") (catch Exception e (.getMessage e)))" :portability :common}
+  {:suite "reader / delimiters" :label "mismatched bracket" :expected "\"Unmatched delimiter: }\"" :actual "(try (read-string \"[1 2}\") (catch Exception e (.getMessage e)))" :portability :common}
+  {:suite "io / java.net.URL" :label "str renders the spec" :expected "\"https://e.com/x\"" :actual "(str (java.net.URL. \"https://e.com/x\"))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "empty authority collapses" :expected "\"file:/a/b/\"" :actual "(str (java.net.URL. \"file:///a/b/\"))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "empty authority collapses for http" :expected "\"http:/a\"" :actual "(str (java.net.URL. \"http:///a\"))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "a real authority is kept" :expected "\"file://host/a\"" :actual "(str (java.net.URL. \"file://host/a\"))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "a fourth slash is not an empty authority" :expected "\"file:////any/other/\"" :actual "(str (java.net.URL. \"file:////any/other/\"))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "protocol lowercases" :expected "\"file:/a\"" :actual "(str (java.net.URL. \"FILE:/a\"))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "no protocol throws" :expected "\"no protocol: /some/path/\"" :actual "(try (java.net.URL. \"/some/path/\") (catch java.net.MalformedURLException e (.getMessage e)))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "unknown protocol throws" :expected "\"unknown protocol: bogus\"" :actual "(try (java.net.URL. \"bogus://x\") (catch java.net.MalformedURLException e (.getMessage e)))" :portability :jvm}
+  {:suite "io / java.net.URL" :label "jar spec is left alone" :expected "\"jar:file:/x!/y\"" :actual "(str (java.net.URL. \"jar:file:/x!/y\"))" :portability :jvm}
   {:suite "io / with-out-str captures" :label "println" :expected "\"hi\\n\"" :actual "(with-out-str (println \"hi\"))" :portability :common}
   {:suite "io / with-out-str captures" :label "print spaces" :expected "\"a b\"" :actual "(with-out-str (print \"a\" \"b\"))" :portability :common}
   {:suite "io / with-out-str captures" :label "prn quotes" :expected "\"[1 2]\\n\"" :actual "(with-out-str (prn [1 2]))" :portability :common}
@@ -1508,6 +1529,9 @@
   {:suite "namespaces / ns operations" :label "in-ns switches" :expected "true" :actual "(do (in-ns 'my.ns) (symbol? 'x))" :portability :common}
   {:suite "namespaces / ns operations" :label "ns form + alias" :expected "\"HI\"" :actual "(do (ns my.app (:require [clojure.string :as s])) (s/upper-case \"hi\"))" :portability :common}
   {:suite "namespaces / ns operations" :label "ns :use refers all" :expected "9" :actual "(do (ns src.lib) (def helper 9) (ns dst.app (:use [src.lib])) helper)" :portability :common}
+  {:suite "namespaces / ns operations" :label "ns :use :exclude falls through to the earlier use" :expected "[:from-a :b-other]" :actual "(do (ns src.xa) (intern 'src.xa 'thing :from-a) (ns src.xb) (intern 'src.xb 'thing :from-b) (intern 'src.xb 'other :b-other) (ns dst.xapp (:use [src.xa] [src.xb :exclude [thing]])) [(deref (ns-resolve 'dst.xapp 'thing)) (deref (ns-resolve 'dst.xapp 'other))])" :portability :common}
+  {:suite "namespaces / ns operations" :label "ns :use :exclude leaves the name unresolvable" :expected "[nil :c-other]" :actual "(do (ns src.xc) (intern 'src.xc 'thing2 :c-thing) (intern 'src.xc 'other :c-other) (ns dst.xapp2 (:use [src.xc :exclude [thing2]])) [(ns-resolve 'dst.xapp2 'thing2) (deref (ns-resolve 'dst.xapp2 'other))])" :portability :common}
+  {:suite "namespaces / ns operations" :label "ns :refer-clojure :exclude steers syntax-quote" :expected "\"(quote zq.fd/==)\"" :actual "(do (ns zq.fd (:refer-clojure :exclude [==])) (pr-str (read-string \"`==\")))" :portability :common}
   {:suite "namespaces / ns operations" :label "standalone use" :expected "7" :actual "(do (ns src.l2) (def k 7) (in-ns 'dst.a2) (use '[src.l2]) k)" :portability :common}
   {:suite "namespaces / ns operations" :label "ns-name" :expected "true" :actual "(do (require (quote [clojure.string])) (= 'clojure.string (ns-name (find-ns 'clojure.string))))" :portability :common}
   {:suite "namespaces / ns operations" :label "find-ns existing" :expected "true" :actual "(some? (find-ns 'clojure.core))" :portability :common}
@@ -4261,6 +4285,17 @@
   {:suite "time / tz offset parse" :label "SimpleDateFormat X parses +05 offset" :expected "1704049200000" :actual "(.getTime (.parse (java.text.SimpleDateFormat. \"yyyy-MM-dd'T'HH:mm:ssX\") \"2024-01-01T00:00:00+05\"))" :portability :jvm}
   {:suite "time / tz offset parse" :label "SimpleDateFormat X parses Z offset" :expected "1704067200000" :actual "(.getTime (.parse (java.text.SimpleDateFormat. \"yyyy-MM-dd'T'HH:mm:ssX\") \"2024-01-01T00:00:00Z\"))" :portability :jvm}
   {:suite "time / tz offset parse" :label "SimpleDateFormat XX parses -0330 offset" :expected "1704079800000" :actual "(.getTime (.parse (java.text.SimpleDateFormat. \"yyyy-MM-dd'T'HH:mm:ssXX\") \"2024-01-01T00:00:00-0330\"))" :portability :jvm}
+  ;; SimpleDateFormat name directives read the :date-names extension point. Core
+  ;; carries the ROOT locale only: wide names are the abbreviated forms (the JVM
+  ;; renders "Mar" for MMMM at ROOT — verified, not a bug), an unregistered locale
+  ;; id falls back to ROOT rather than throwing, and no locale argument means ROOT
+  ;; (core has no default locale — the no-locale name row keeps jolt's value, see
+  ;; known-divergences). Numeric directives never consult the point. Expectations
+  ;; measured on reference JVM Clojure 1.12.5; 2014-03-01 is a Saturday.
+  {:suite "time / sdf locale names" :label "no-locale name directives render ROOT names" :expected "\"Mar|Mar|Sat|Sat\"" :actual "(.format (java.text.SimpleDateFormat. \"MMMM'|'MMM'|'EEEE'|'EEE\") (java.util.Date. 1393632000000))" :portability :jvm}
+  {:suite "time / sdf locale names" :label "explicit ROOT locale id renders ROOT names" :expected "\"Mar|Sat\"" :actual "(.format (java.text.SimpleDateFormat. \"MMMM'|'EEEE\" \"\") (java.util.Date. 1393632000000))" :portability :jvm}
+  {:suite "time / sdf locale names" :label "unregistered locale id falls back to ROOT" :expected "\"Mar|Sat\"" :actual "(.format (java.text.SimpleDateFormat. \"MMMM'|'EEEE\" \"tlh\") (java.util.Date. 1393632000000))" :portability :jvm}
+  {:suite "time / sdf locale names" :label "numeric pattern ignores the locale id" :expected "\"2014-03-01\"" :actual "(.format (java.text.SimpleDateFormat. \"yyyy-MM-dd\" \"tlh\") (java.util.Date. 1393632000000))" :portability :jvm}
   {:suite "host-interop / FQN statics" :label "java.lang.System/currentTimeMillis works" :expected "true" :actual "(pos? (java.lang.System/currentTimeMillis))" :portability :jvm}
   {:suite "host-interop / FQN statics" :label "java.lang.Character/isWhitespace matches short form" :expected "true" :actual "(= (Character/isWhitespace \\space) (java.lang.Character/isWhitespace \\space))" :portability :jvm}
   {:suite "host-interop / Math" :label "Math/getExponent 2.0 => 1 via IEEE 754 bit extraction" :expected "1" :actual "(Math/getExponent 2.0)" :portability :jvm}
@@ -4496,4 +4531,29 @@
   {:suite "numbers / unsigned string conversions" :label "Integer/Long toHexString are unsigned at their own width" :expected "[\"ffffffff\" \"ffffff00\" \"ffffffffffffffff\" \"ff\"]" :actual "[(Integer/toHexString -1) (Integer/toHexString -256) (Long/toHexString -1) (Integer/toHexString 255)]" :portability :jvm}
   {:suite "numbers / unsigned string conversions" :label "toOctalString / toBinaryString are unsigned too" :expected "[\"37777777777\" \"11111111111111111111111111111111\" \"1777777777777777777777\" \"101\"]" :actual "[(Integer/toOctalString -1) (Integer/toBinaryString -1) (Long/toOctalString -1) (Integer/toBinaryString 5)]" :portability :jvm}
   {:suite "numbers / unsigned string conversions" :label "toString with a radix is signed magnitude, lowercase" :expected "[\"-ff\" \"-ff\" \"-255\" \"ff\"]" :actual "[(Integer/toString -255 16) (Long/toString -255 16) (Long/toString -255) (Integer/toString 255 16)]" :portability :jvm}
+  ;; conj of a map into a defrecord must fold the map's entries (JVM parity) — the
+  ;; default record conj handler treated the map as a single [k v] pair and nth'd it,
+  ;; throwing. Surfaced via test.chuck's instaparse parse-failure path calling
+  ;; (merge <Failure> <line-col map>) in instaparse/failure.clj (jolt-v5fh.15).
+  {:suite "records / conj" :label "conj of a map into a defrecord folds its entries" :expected "{:a 10 :b 2 :c 30}" :actual "(do (defrecord RC15 [a b]) (into {} (conj (->RC15 1 2) {:a 10 :c 30})))" :portability :common}
+  {:suite "regex-parity / flag groups" :label "empty flag group (?) matches empty" :expected "\"\"" :actual "(re-find (re-pattern \"(?)\") \"\")" :portability :common :jvm-certified true}
+  {:suite "regex-parity / flag groups" :label "empty flag group quantified {0,0} inside a capture" :expected "[\"\" \"\"]" :actual "(re-find (re-pattern \"((?){0,0})\") \"\")" :portability :common :jvm-certified true}
+  {:suite "regex-parity / flag groups" :label "unknown flag c is a no-op flag char" :expected "\"Z\"" :actual "(re-find (re-pattern \"(?c:Z)\") \"Z\")" :portability :common :jvm-certified true}
+  {:suite "regex-parity / flag groups" :label "dangling ? after a body-less flag group is rejected" :expected ":pse" :actual "(try (re-pattern \"(?)?\") :parsed (catch java.util.regex.PatternSyntaxException _ :pse))" :portability :common :jvm-certified true}
+  {:suite "regex-parity / intersection" :label "[&&x] empty left side intersects to just x" :expected "\"x\"" :actual "(re-find (re-pattern \"[&&x]\") \"x\")" :portability :common :jvm-certified true}
+  {:suite "regex-parity / intersection" :label "[x&&] empty right side intersects to just x" :expected "\"x\"" :actual "(re-find (re-pattern \"[x&&]\") \"x\")" :portability :common :jvm-certified true}
+  {:suite "regex-parity / intersection" :label "[%-&&&] range %-& intersected with empty keeps % and &" :expected "\"%\"" :actual "(re-find (re-pattern \"[%-&&&]\") \"%\")" :portability :common :jvm-certified true}
+  {:suite "regex-parity / intersection" :label "[x&&&&] repeated intersection keeps just x" :expected "\"x\"" :actual "(re-find (re-pattern \"[x&&&&]\") \"x\")" :portability :common :jvm-certified true}
+  {:suite "regex-parity / intersection" :label "[a-z&&[^aeiou]] excludes vowels" :expected "nil" :actual "(re-find (re-pattern \"[a-z&&[^aeiou]]\") \"a\")" :portability :common :jvm-certified true}
+  {:suite "regex-parity / intersection" :label "[a-z&&[^aeiou]] keeps consonants" :expected "\"b\"" :actual "(re-find (re-pattern \"[a-z&&[^aeiou]]\") \"b\")" :portability :common :jvm-certified true}
+  {:suite "regex-parity / intersection" :label "[x&&y] disjoint intersection matches nothing" :expected "nil" :actual "(re-seq (re-pattern \"[x&&y]\") \"xy\")" :portability :common :jvm-certified true}
+  {:suite "regex-parity / ranges" :label "inverted range [b-a] is rejected" :expected ":pse" :actual "(try (re-pattern \"[b-a]\") :parsed (catch java.util.regex.PatternSyntaxException _ :pse))" :portability :common :jvm-certified true}
+  {:suite "regex-parity / ranges" :label "inverted range quantified [b-a]?? is rejected" :expected ":pse" :actual "(try (re-pattern \"[b-a]??\") :parsed (catch java.util.regex.PatternSyntaxException _ :pse))" :portability :common :jvm-certified true}
+  {:suite "regex-parity / ranges" :label "leading ] then inverted range []-X] is rejected" :expected ":pse" :actual "(try (re-pattern \"[]-X]\") :parsed (catch java.util.regex.PatternSyntaxException _ :pse))" :portability :common :jvm-certified true}
+  {:suite "regex-parity / ranges" :label "range ending in a control escape below start [x-\\cx] is rejected" :expected ":pse" :actual "(try (re-pattern \"[x-\\\\cx]\") :parsed (catch java.util.regex.PatternSyntaxException _ :pse))" :portability :common :jvm-certified true}
+  {:suite "regex-parity / ranges" :label "range from an astral codepoint down [{\\x{10000}-}] is rejected" :expected ":pse" :actual "(try (re-pattern \"[{\\\\x{10000}-}]\") :parsed (catch java.util.regex.PatternSyntaxException _ :pse))" :portability :common :jvm-certified true}
+  {:suite "regex-parity / ranges" :label "inverted range inside nested classes [[[[{-\\c}]]]] is rejected" :expected ":pse" :actual "(try (re-pattern \"[[[[{-\\\\c}]]]]\") :parsed (catch java.util.regex.PatternSyntaxException _ :pse))" :portability :common :jvm-certified true}
+  {:suite "regex-parity / quantifiers" :label "quantifier min greater than max {1,0} is rejected" :expected ":pse" :actual "(try (re-pattern \"{1,0}\") :parsed (catch java.util.regex.PatternSyntaxException _ :pse))" :portability :common :jvm-certified true}
+  {:suite "regex-parity / class escapes" :label "empty quote escape [\\Q\\E] is rejected in a class" :expected ":pse" :actual "(try (re-pattern \"[\\\\Q\\\\E]\") :parsed (catch java.util.regex.PatternSyntaxException _ :pse))" :portability :common :jvm-certified true}
+  {:suite "regex-parity / class escapes" :label "linebreak escape [\\R] is rejected in a class" :expected ":pse" :actual "(try (re-pattern \"[\\\\R]\") :parsed (catch java.util.regex.PatternSyntaxException _ :pse))" :portability :common :jvm-certified true}
 ]

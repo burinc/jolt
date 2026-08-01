@@ -147,14 +147,18 @@
                    offset-sign offset-hours offset-minutes)))
 
 (defn- construct-calendar
-  "Construct a java.util.Calendar at the original instant. Unlike the JVM's, this
-  does not carry the offset zone — jolt's Calendar holds an instant only."
+  "Construct a java.util.Calendar preserving the timezone offset, but truncating
+  the subsecond fraction to milliseconds. The fields are set first and the zone
+  last, exactly as the reference does: a calendar resolves its fields in whatever
+  zone is current when the instant is finally asked for."
   [years months days hours minutes seconds nanoseconds
    offset-sign offset-hours offset-minutes]
-  (doto (java.util.Calendar/getInstance)
-    (.setTimeInMillis
-     (instant-ms years months days hours minutes seconds (quot nanoseconds 1000000)
-                 offset-sign offset-hours offset-minutes))))
+  (doto (java.util.GregorianCalendar. years (dec months) days hours minutes seconds)
+    (.set java.util.Calendar/MILLISECOND (quot nanoseconds 1000000))
+    (.setTimeZone (java.util.TimeZone/getTimeZone
+                   (format "GMT%s%02d:%02d"
+                           (if (neg? offset-sign) "-" "+")
+                           offset-hours offset-minutes)))))
 
 (defn- construct-timestamp
   "Construct a java.sql.Timestamp. On jolt that is java.util.Date, so the

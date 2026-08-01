@@ -1166,7 +1166,14 @@
             (chez-register-spec! (chez-current-ns) s)
             (when (and use? target
                        (not (or (member "only" opt-names) (member "refer" opt-names))))
-              (chez-register-refer-all! (chez-current-ns) target))))
+              (chez-register-refer-all! (chez-current-ns) target)
+              ;; [ns :exclude [names]] — the excluded names stay OUT of the
+              ;; refer-all set (load-lib applies the same filter to its refer).
+              (let ((excl (assoc "exclude" (cdr parsed))))
+                (when excl
+                  (chez-register-refer-all-excludes!
+                    (chez-current-ns) target
+                    (map symbol-t-name (filter symbol-t? (seq->list (cdr excl))))))))))
         (expand-spec s0)))
     specs))
 

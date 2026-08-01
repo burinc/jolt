@@ -249,7 +249,20 @@
  ;; used to answer none of it, which made orchard.meta flap on .getPath.
  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getName (io/resource \"clojure/string.clj\")))" :expected "\"string.clj\""}
  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io]) (quote [clojure.string :as s])) (s/ends-with? (.getPath (io/resource \"clojure/string.clj\")) \"clojure/string.clj\"))" :expected "true"}
- {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (boolean (seq (str (io/resource \"clojure/string.clj\")))))" :expected "true"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (boolean (seq (str (io/resource \"clojure/string.clj\")))))" :expected "true"}
+  ;; io/resource returns a java.net.URL, like the JVM, and its content reads back.
+  ;; Not a corpus row: what RESOLVES differs by model — the JVM answers from the
+  ;; classpath (clojure/string.clj lives in a jar), jolt from its source roots, and
+  ;; the gate harness sets no roots at all, so any row naming an ambient resource
+  ;; crashes there. This one owns its root, so it depends on nothing external.
+  ;; Restores the roots in a finally: set-source-roots! is global, and leaving a
+  ;; temp dir as the only root breaks every later row that needs to require.
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/joltresunit\") prior (jolt.host/source-roots)] (.mkdirs (io/file d)) (spit (io/file d \"probe.txt\") \"hello\") (try (jolt.host/set-source-roots! [d]) (let [u (io/resource \"probe.txt\")] [(instance? java.net.URL u) (.getName (class u)) (slurp u) (io/resource \"absent.txt\")]) (finally (jolt.host/set-source-roots! prior)))))" :expected "[true \"java.net.URL\" \"hello\" nil]"}
+  ;; a file: URL is a first-class source — slurp / .openStream / io/reader /
+  ;; io/input-stream read its bytes (verified by content, not type) and io/file
+  ;; strips the scheme. All five must hold before io/resource can return a URL.
+  ;; Built against a temp file so nothing here depends on a machine path.
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [f (java.io.File/createTempFile \"joltres\" \".txt\")] (spit f \"hello\") (let [u (java.net.URL. (str \"file:\" (.getAbsolutePath f))) r (and (= \"hello\" (slurp u)) (= \"hello\" (slurp (.openStream u))) (= \"hello\" (slurp (io/reader u))) (= \"hello\" (slurp (io/input-stream u))) (= (.getAbsolutePath f) (str (io/file u))))] (.delete f) r)))" :expected "true"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getPath (.toURL (io/file \"/tmp/x\"))))" :expected "\"/tmp/x\""}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getAbsolutePath (io/file \"/a/b\")))" :expected "\"/a/b\""}
   {:suite "ioreader" :expr "(slurp (StringReader. \"a=1\"))" :expected "\"a=1\""}
@@ -1346,4 +1359,67 @@
   ;; nil prints as nothing at all, so `-e` of a side-effecting form stays quiet —
   ;; `clojure -M -e nil` does the same.
   {:suite "repl-printer" :expr "nil" :expected ""}
+
+  ;; Extension points: core declares a point with a TOTAL default, a library
+  ;; registers a possibly-partial refinement at a key. Lookup is (merge default
+  ;; provider), so a provider only states what differs. :fallback :strict makes an
+  ;; unregistered key an error rather than a silently-defaulted wrong answer —
+  ;; the whole reason core can ship a point whose data it does not carry.
+  ;; Each row declares its own point id so rows cannot interfere.
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-a {:key :string :root \"\" :fields {:sym :string :digits :long} :default {:sym \"x\" :digits 2} :fallback :strict}) (let [m (jolt.host/extension-value :xt-a \"\")] [(:sym m) (:digits m)]))" :expected "[\"x\" 2]"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-b {:key :string :root \"\" :fields {:sym :string :digits :long} :default {:sym \"x\" :digits 2} :fallback :strict}) (jolt.host/register-extension! :xt-b \"de\" {:sym \"$$\"}) (let [m (jolt.host/extension-value :xt-b \"de\")] [(:sym m) (:digits m)]))" :expected "[\"$$\" 2]"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-c {:key :string :root \"\" :fields {:sym :string :digits :long} :default {:sym \"x\" :digits 2} :fallback :strict}) (jolt.host/register-extension! :xt-c \"de\" {:sym \"$$\" :digits 4}) (let [m (jolt.host/extension-value :xt-c \"de\")] [(:sym m) (:digits m)]))" :expected "[\"$$\" 4]"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-d {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/extension-value :xt-d \"fr\"))" :expected :throws}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-e {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (try (jolt.host/extension-value :xt-e \"fr\") (catch Exception e (boolean (and (re-find #\"xt-e\" (.getMessage e)) (re-find #\"fr\" (.getMessage e)))))))" :expected "true"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-f {:key :string :root \"\" :fields {:sym :string :digits :long} :default {:sym \"x\" :digits 2} :fallback :default}) (let [m (jolt.host/extension-value :xt-f \"zz\")] [(:sym m) (:digits m)]))" :expected "[\"x\" 2]"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-g {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/register-extension! :xt-g \"de\" {:nope \"y\"}))" :expected :throws}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-h {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/register-extension! :xt-h \"de\" {:sym 7}))" :expected :throws}
+  {:suite "extension points" :expr "(jolt.host/register-extension-point! :xt-i {:key :string :root \"\" :fields {:sym :string :digits :long} :default {:sym \"x\"} :fallback :strict})" :expected :throws}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-j {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/register-extension! :xt-j :de {:sym \"y\"}))" :expected :throws}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-k {:key :string :root \"\" :fields {:sym :string :digits :long} :default {:sym \"x\" :digits 2} :fallback :strict}) (jolt.host/register-extension! :xt-k \"de\" {:sym \"$$\"}) (jolt.host/refine-extension! :xt-k {:fields {:code :string} :default {:code \"XXX\"}}) (let [m (jolt.host/extension-value :xt-k \"de\")] [(:sym m) (:digits m) (:code m)]))" :expected "[\"$$\" 2 \"XXX\"]"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-l {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (let [e0 (jolt.host/extension-epoch)] (jolt.host/register-extension! :xt-l \"de\" {:sym \"y\"}) (> (jolt.host/extension-epoch) e0)))" :expected "true"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-m {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/register-extension-point! :xt-m {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) :ok)" :expected ":ok"}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-n {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/register-extension-point! :xt-n {:key :string :root \"\" :fields {:sym :string} :default {:sym \"OTHER\"} :fallback :strict}))" :expected :throws}
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-o {:key :keyword :root :root :fields {:sym :string} :default {:sym \"x\"} :fallback :strict}) (jolt.host/register-extension! :xt-o :de {:sym \"$$\"}) (:sym (jolt.host/extension-value :xt-o :de)))" :expected "\"$$\""}
+  {:suite "extension points" :expr "(jolt.host/extension-value :xt-never-declared \"\")" :expected :throws}
+  ;; :hint rides along on the strict-miss message so a point can name the library
+  ;; that carries its data instead of leaving the caller to guess.
+  {:suite "extension points" :expr "(do (jolt.host/register-extension-point! :xt-p {:key :string :root \"\" :fields {:sym :string} :default {:sym \"x\"} :fallback :strict :hint \"add the widget library\"}) (try (jolt.host/extension-value :xt-p \"de\") (catch Exception e (boolean (re-find #\"widget library\" (.getMessage e))))))" :expected "true"}
+
+  ;; java.text.NumberFormat currency instances. Core answers for the ROOT locale
+  ;; and is strict beyond it; jolt-lang/time (which owns java.util.Locale) supplies
+  ;; the rest. Every expectation below was read off reference JVM Clojure 1.12.5 for
+  ;; Locale/ROOT — they are not corpus rows because the no-arg JVM call resolves the
+  ;; DEFAULT locale, which is machine-dependent and so not certifiable.
+  ;; The root string is ¤ + NBSP + digits; compared as codepoints so no non-ASCII
+  ;; literal has to survive a trip through this file.
+  {:suite "currency" :expr "(mapv int (.format (java.text.NumberFormat/getCurrencyInstance) 123.45))" :expected "[164 160 49 50 51 46 52 53]"}
+  {:suite "currency" :expr "(mapv int (.format (java.text.NumberFormat/getCurrencyInstance) -123.45))" :expected "[45 164 160 49 50 51 46 52 53]"}
+  {:suite "currency" :expr "(apply str (drop 2 (.format (java.text.NumberFormat/getCurrencyInstance) 12345678.0)))" :expected "\"12,345,678.00\""}
+  {:suite "currency" :expr "(apply str (drop 2 (.format (java.text.NumberFormat/getCurrencyInstance) 5)))" :expected "\"5.00\""}
+  {:suite "currency" :expr "(apply str (drop 2 (.format (java.text.NumberFormat/getCurrencyInstance) 0.0)))" :expected "\"0.00\""}
+  ;; an unregistered locale names the point rather than formatting it with root separators
+  {:suite "currency" :expr "(try (java.text.NumberFormat/getCurrencyInstance \"de\") (catch Exception e (boolean (re-find #\"currency-data\" (.getMessage e)))))" :expected "true"}
+  {:suite "currency" :expr "(java.text.NumberFormat/getCurrencyInstance \"de\")" :expected :throws}
+  ;; a provider registered the way the time library will: suffix symbol, swapped separators
+  {:suite "currency" :expr "(do (jolt.host/register-extension! :currency-data \"de-test\" {:symbol \"E\" :symbol-sep \" \" :symbol-first? false :decimal-sep \",\" :grouping-sep \".\"}) (.format (java.text.NumberFormat/getCurrencyInstance \"de-test\") 1234.5))" :expected "\"1.234,50 E\""}
+  ;; frac-digits 0 rounds half-to-even like the JVM: 2.5 -> 2, 1234.5 -> 1234
+  {:suite "currency" :expr "(do (jolt.host/register-extension! :currency-data \"jp-test\" {:symbol \"Y\" :symbol-sep \"\" :symbol-first? true :frac-digits 0}) [(.format (java.text.NumberFormat/getCurrencyInstance \"jp-test\") 2.5) (.format (java.text.NumberFormat/getCurrencyInstance \"jp-test\") 1234.5)])" :expected "[\"Y2\" \"Y1,234\"]"}
+
+  ;; java.text.SimpleDateFormat locale names. Core answers for the ROOT locale
+  ;; (the corpus rows); any other locale's names arrive through the :date-names
+  ;; extension point — jolt-lang/time owns java.util.Locale and registers them
+  ;; (RFC 0008). These rows register their own ids, proving the seam end to end.
+  ;; Expectations read off reference JVM Clojure 1.12.5; 2014-03-01 is a Saturday.
+  ;; Guard: a numeric-only pattern must not move when the name tables do. Not a
+  ;; corpus row — jolt's SimpleDateFormat formats in UTC while the JVM's uses the
+  ;; machine's default zone, so the JVM side of this is machine-dependent and
+  ;; uncertifiable (see the :documented entry in known-divergences).
+  {:suite "date names" :expr "(.format (java.text.SimpleDateFormat. \"yyyy-MM-dd HH:mm\") (java.util.Date. 1393632000000))" :expected "\"2014-03-01 00:00\""}
+  {:suite "date names" :expr "(do (jolt.host/register-extension! :date-names \"fr-test\" {:months [\"janvier\" \"février\" \"mars\" \"avril\" \"mai\" \"juin\" \"juillet\" \"août\" \"septembre\" \"octobre\" \"novembre\" \"décembre\"] :months-short [\"janv.\" \"févr.\" \"mars\" \"avr.\" \"mai\" \"juin\" \"juil.\" \"août\" \"sept.\" \"oct.\" \"nov.\" \"déc.\"] :days [\"lundi\" \"mardi\" \"mercredi\" \"jeudi\" \"vendredi\" \"samedi\" \"dimanche\"] :days-short [\"lun.\" \"mar.\" \"mer.\" \"jeu.\" \"ven.\" \"sam.\" \"dim.\"]}) [(.format (java.text.SimpleDateFormat. \"MMMM\" \"fr-test\") (java.util.Date. 1393632000000)) (.format (java.text.SimpleDateFormat. \"EEE\" \"fr-test\") (java.util.Date. 1393632000000)) (.format (java.text.SimpleDateFormat. \"EEEE\" \"fr-test\") (java.util.Date. 1393632000000)) (.format (java.text.SimpleDateFormat. \"yyyy-MM-dd\" \"fr-test\") (java.util.Date. 1393632000000))])" :expected "[\"mars\" \"sam.\" \"samedi\" \"2014-03-01\"]"}
+  ;; the ctor renders the locale argument to an id rather than naming a class —
+  ;; a symbol renders to its name, the same seam the library's Locale :str uses.
+  ;; A PARTIAL provider value merges over ROOT: only :months is stated, and MMMM
+  ;; still answers.
+  {:suite "date names" :expr "(do (jolt.host/register-extension! :date-names \"de-test\" {:months [\"Januar\" \"Februar\" \"März\" \"April\" \"Mai\" \"Juni\" \"Juli\" \"August\" \"September\" \"Oktober\" \"November\" \"Dezember\"]}) (.format (java.text.SimpleDateFormat. \"MMMM\" 'de-test) (java.util.Date. 1393632000000)))" :expected "\"März\""}
 ]

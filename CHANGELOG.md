@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`:use` honors `:exclude`, and `(:refer-clojure :exclude …)` lands in the ns
+  being defined.** Two host namespace bugs, one visible failure surface: a library
+  test ns that `:use`s two namespaces exporting the same name got the WRONG one.
+  `use` registered its refer-all with no record of the spec's `:exclude`, so with
+  `(:use [a] [b :exclude [f]])` the bare `f` resolved to `b/f` — the later use
+  shadowed the earlier, exclusion or not — instead of falling through to `a/f`.
+  Excluded names are now recorded per (ns, target) and skipped in the refer-all
+  walk, so resolution falls through exactly like load-lib's filtered refer.
+  Separately, the `refer-clojure` macro registered its exclusions at macroexpansion
+  time under the analysis-time ns, so a `(:refer-clojure :exclude [==])` clause in
+  an ns form excluded nothing (the ns it named didn't exist yet); the expander now
+  emits a runtime registration call that runs after the form's `in-ns`, and unwraps
+  the ns macro's quoted args the way the JVM's splice-into-`refer` does. This is
+  what was behind core.logic's nominal suite residue (64/36/6 → 106/0/0): the test
+  ns's plain `fresh` was silently nominal's `fresh`, and fd.clj's `-rator`
+  syntax-quotes qualified to `clojure.core/==` instead of
+  `clojure.core.logic.fd/==`.
+
 ### Changed
 
 - **`byte-array` elements are signed bytes, −128..127, like the JVM's `byte[]`.**
@@ -45,6 +65,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   diverges (`(format "%x" (long -1))` is `"ff"` here, 16 digits on the JVM); it is
   entered in `known-divergences.edn` under `:integer-box-model`. `(bit-and b 0xff)`
   pins the width explicitly and is identical on both.
+
+- **`clojure.java.io/resource` returns a `java.net.URL`, like the JVM.** It returned a
+  `java.io.File`, which `io.ss` papered over by answering `getProtocol`/`getFile` on a
+  File. Callers that branch on the real type broke: Selmer's `render-file` does
+  `(instance? java.net.URL path)`, took the `:else` branch on a File, and died on
+  `(.startsWith ^File …)`. Both branches now return a URL — a `file:` URL for a hit on
+  a source root, a `jar:`-classed embedded resource (class `java.net.URL`) for a file
+  baked into a built binary — so the "same surface whichever branch served it"
+  invariant holds in `make test`, not only inside a built binary. The File URL-compat
+  kludge is gone; a File no longer answers URL methods, as on the JVM.
+
+  A URL is now a first-class source too: `slurp` / `io/reader` / `io/input-stream` /
+  `.openStream` read a `file:` URL's target (a non-file protocol raises, as the JVM
+  does, rather than returning empty content) and `io/file` strips the scheme. These
+  had to land before the return-type flip or the common `(slurp (io/resource …))`
+  idiom would throw.
 
 ### Added
 
@@ -94,6 +130,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at an absolute temp dir, so the one gate that runs a built binary never exercised
   a relative path. It now asserts that a relative path absolutizes under user.dir
   and that `relativize` undoes `absolutize`, the round-trip `match` performs.
+
+- **Java regex translation now matches the JVM on 17 long-tail `Pattern` edge cases.**
+  The `Pattern`→irregex translator (`host/chez/java/regex-translate.ss`) now agrees
+  with `java.util.regex.Pattern` on accept/reject for flag groups, character-class
+  intersection, inverted ranges, malformed quantifiers, and class-only escapes:
+  - empty and unknown flag groups (`(?)`, `((?){0,0})`, `(?c:Z)`) now compile, while
+    a dangling `*`/`+`/`?` after a body-less flag group (`(?)?`) is rejected;
+  - `&&` intersection with an empty side means "everything" (`[&&x]`, `[x&&]`,
+    `[%-&&&]`, `[x&&&&]`), and a leading `&&` with no left operand (`[&&&]`) still
+    rejects;
+  - inverted character ranges (`[b-a]`, `[]-X]`, `[x-\cx]`, `[{\x{10000}-}]`, and the
+    nested `[[[[{-\c}]]]]`) now reject;
+  - a quantifier with min greater than max (`{1,0}`) now rejects even with no
+    preceding atom;
+  - `\Q..\E` (empty) and `\R` are rejected inside a character class;
+  - `\e` is now ESCAPE (U+001B), not a literal `e`.
+  20 JVM-certified rows added to `test/chez/corpus.edn`.
+
+- **`conj` of a map into a `defrecord` merges the map's entries, as on the JVM.**
+  The default record `conj` handler treated its argument as a single `[k v]` pair and
+  `nth`'d it, so `(conj (map->R {:a 1}) {:b 2})` threw
+  "nth not supported on this type: clojure.lang.PersistentArrayMap" instead of
+  merging; `merge`-ing a map into a record hits the same `conj` path. This surfaced
+  through test.chuck: `instaparse.failure/augment-failure` does
+  `(merge <Failure> {:line … :column …})`, so a regex that fails to parse raised an
+  uncatchable `UnsupportedOperationException` where the library (and the JVM) raise a
+  catchable `ExceptionInfo {:type ::regexes/parse-error}`. A map argument now folds
+  its entries; a `[k v]` pair or `MapEntry` is unchanged.
+
+- **`clojure.pprint`'s `simple-dispatch` and `code-dispatch` are multimethods, so
+  libraries can extend them.** They were plain functions that `case`d on a type
+  keyword, so `(. clojure.pprint/simple-dispatch addMethod Tie pprint-tie)` — which
+  core.logic's nominal namespace does — failed with "No matching method addMethod",
+  and `clojure.core.logic.nominal.tests` could not load. Both are now `(defmulti …
+  class)` with methods for the same interfaces the reference uses
+  (`IPersistentVector`/`-Map`/`-Set`, `PersistentQueue`, `ISeq`, `IDeref`, `nil`,
+  `:default`; `code-dispatch` adds `Symbol`), each arm still calling the per-type
+  printer it always did, so built-in output is unchanged — a defrecord still prints
+  as a bare map, as it does on the JVM.
 
 - **A sub-process that could not be waited on hung the caller forever.** The reap
   loop retried on any `waitpid` failure, including `ECHILD` — the child already

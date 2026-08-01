@@ -71,6 +71,8 @@
   (hashtable-clear! ns-alias-table)
   (hashtable-clear! ns-refer-table)
   (hashtable-clear! ns-refer-all-table)
+  (hashtable-clear! ns-refer-all-exclude-table)
+  (hashtable-clear! ns-core-exclude-table)
   (clear-thread-interrupt!)   ; a case that set the runner thread's interrupt flag mustn't leak
   (when zj-ghier (jolt-invoke (var-deref "clojure.core" "reset!")
                    (var-cell-root zj-ghier) (jolt-invoke (var-deref "clojure.core" "make-hierarchy"))))

@@ -86,6 +86,24 @@
      #inst "2020-01-02"
      "bound into *data-readers* for the inst tag")
 
+;; --- read-instant-calendar / -timestamp -----------------------------------------
+;; The calendar reader keeps the literal's offset ZONE, not just the instant: it
+;; sets the fields and the zone last, so the fields resolve in that zone. Certified
+;; against reference Clojure. read-instant-timestamp truncates the fraction to
+;; milliseconds — jolt models java.sql.Timestamp as its one millisecond Date type —
+;; which is the one divergence here and is recorded in known-divergences.edn.
+(let [c (clojure.instant/read-instant-calendar "2010-11-12T13:14:15+02:00")]
+  (ok= (.getID (.getTimeZone c)) "GMT+02:00" "the calendar reader keeps the offset zone")
+  (ok= (.getTimeInMillis c) 1289560455000 "and the instant the offset implies")
+  (ok= (.get c java.util.Calendar/HOUR_OF_DAY) 13 "reading a field gives the LOCAL hour"))
+(let [c (clojure.instant/read-instant-calendar "2010-11-12T13:14:15.666-05:00")]
+  (ok= (.getID (.getTimeZone c)) "GMT-05:00" "a negative offset too")
+  (ok= (.getTimeInMillis c) 1289585655666 "with the millisecond fraction")
+  (ok= (.get c java.util.Calendar/MILLISECOND) 666 "which reads back as a field"))
+(ok= (inst-ms (clojure.instant/read-instant-timestamp "2010-11-12T13:14:15.666-00:00"))
+     1289567655666
+     "the timestamp reader is millisecond-precise (nanos truncate — a divergence)")
+
 ;; --- the java.time base types --------------------------------------------------
 ;; Instant / Duration are core (RFC 0008 keeps the base value types here and the
 ;; formatting/zone layer in jolt-lang/time). They autoload on first use, which the

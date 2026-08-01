@@ -2058,29 +2058,27 @@
 
 (def pprint-set (formatter-out "~<#{~;~@{~w~^ ~:_~}~;}~:>"))
 
-(defn- type-dispatcher [obj]
-  (cond
-    (symbol? obj) :symbol
-    (seq? obj) :list
-    (map? obj) :map
-    (vector? obj) :vector
-    (set? obj) :set
-    (nil? obj) nil
-    :else :default))
-
-;; simple-dispatch / code-dispatch are plain functions rather than multimethods:
-;; a multimethod baked into the seed can't capture this namespace's load context,
-;; and the printer never extends these tables externally.
-(defn simple-dispatch
+;; simple-dispatch and code-dispatch are multimethods on class, like the
+;; reference, so libraries can extend them: core.logic's nominal namespace does
+;;   (. clojure.pprint/simple-dispatch addMethod Tie pprint-tie)
+;; which a plain function rejects with "No matching method addMethod". Dispatch
+;; values mirror the reference (the persistent-collection interfaces,
+;; PersistentQueue, ISeq, IDeref, nil, :default; code-dispatch adds Symbol), and
+;; every arm calls the same per-type printer the old case form did, so built-in
+;; output is unchanged. A defrecord still routes to IPersistentMap and prints as
+;; a bare map — pprint differs from pr there on the JVM too.
+(defmulti simple-dispatch
   "The pretty print dispatch function for simple data structure format."
-  [obj]
-  (case (type-dispatcher obj)
-    :list (pprint-list obj)
-    :vector (pprint-vector obj)
-    :map (pprint-map obj)
-    :set (pprint-set obj)
-    nil (-write *out* (pr-str nil))
-    (pprint-simple-default obj)))
+  class)
+
+(defmethod simple-dispatch clojure.lang.IPersistentVector [obj] (pprint-vector obj))
+(defmethod simple-dispatch clojure.lang.IPersistentMap [obj] (pprint-map obj))
+(defmethod simple-dispatch clojure.lang.IPersistentSet [obj] (pprint-set obj))
+(defmethod simple-dispatch clojure.lang.PersistentQueue [obj] (pprint-simple-default obj))
+(defmethod simple-dispatch clojure.lang.ISeq [obj] (pprint-list obj))
+(defmethod simple-dispatch clojure.lang.IDeref [obj] (pprint-simple-default obj))
+(defmethod simple-dispatch nil [obj] (-write *out* (pr-str nil)))
+(defmethod simple-dispatch :default [obj] (pprint-simple-default obj))
 
 ;;; code dispatch
 
@@ -2106,17 +2104,19 @@
     (print (name sym))
     (pr sym)))
 
-(defn code-dispatch
+(defmulti code-dispatch
   "The pretty print dispatch function for pretty printing Clojure code."
-  [obj]
-  (case (type-dispatcher obj)
-    :list (pprint-code-list obj)
-    :symbol (pprint-code-symbol obj)
-    :vector (pprint-vector obj)
-    :map (pprint-map obj)
-    :set (pprint-set obj)
-    nil (pr obj)
-    (pprint-simple-default obj)))
+  class)
+
+(defmethod code-dispatch clojure.lang.IPersistentVector [obj] (pprint-vector obj))
+(defmethod code-dispatch clojure.lang.IPersistentMap [obj] (pprint-map obj))
+(defmethod code-dispatch clojure.lang.IPersistentSet [obj] (pprint-set obj))
+(defmethod code-dispatch clojure.lang.PersistentQueue [obj] (pprint-simple-default obj))
+(defmethod code-dispatch clojure.lang.ISeq [obj] (pprint-code-list obj))
+(defmethod code-dispatch clojure.lang.Symbol [obj] (pprint-code-symbol obj))
+(defmethod code-dispatch clojure.lang.IDeref [obj] (pprint-simple-default obj))
+(defmethod code-dispatch nil [obj] (pr obj))
+(defmethod code-dispatch :default [obj] (pprint-simple-default obj))
 
 (alter-var-root (var *print-pprint-dispatch*) (constantly simple-dispatch))
 

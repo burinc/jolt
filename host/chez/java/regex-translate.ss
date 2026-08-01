@@ -115,7 +115,11 @@
                        ((regex-flag->opt c) =>
                         (lambda (opt) (scan (+ j 1) (cons opt fs))))
                        ((char=? c #\))
-                        (loop (+ j 1) (append opts (reverse fs))))
+                        (if (and (< (+ j 1) end)
+                                 (memv (string-ref src (+ j 1)) '(#\* #\+ #\?)))
+                            (error 'java-pattern->sre
+                                   "dangling quantifier after flag group" src)
+                            (loop (+ j 1) (append opts (reverse fs)))))
                        ((char=? c #\:) (values (reverse opts) i))
                        (else (values (reverse opts) i))))))
               (values (reverse opts) i))))))
@@ -239,7 +243,12 @@
            '(or eol eos)
            '(look-ahead (or eos (seq (? #\return) #\newline eos))))
        src (+ i 1) end flags depth))
-     (else (maybe-quantifier c src (+ i 1) end flags depth)))))
+      ((char=? c #\{)
+       ;; A {n,m} with no preceding atom: Java still validates it and rejects
+       ;; a malformed one (min > max), but treats a well-formed brace as literal.
+       (let-values (((q i2) (parse-bounded c src i end flags depth)))
+         (maybe-quantifier c src (+ i 1) end flags depth)))
+      (else (maybe-quantifier c src (+ i 1) end flags depth)))))
 
 ;; ── Quantifiers ───────────────────────────────────────────────────────────────
 
@@ -296,12 +305,15 @@
                (j (if lazy? (+ j 1) j))
                (poss? (and (< j end) (char=? (string-ref src j) #\+)))
                (j (if poss? (+ j 1) j)))
-          (if (not n)
-              (values atom i)
-              (let ((base (if lazy?
-                             `(**? ,n ,(or m #f) ,atom)
-                             `(** ,n ,(or m #f) ,atom))))
-                (values (if poss? `(atomic ,base) base) j)))))))
+          (cond
+           ((not n) (values atom i))
+           ((and m (< m n))
+            (error 'java-pattern->sre "quantifier min greater than max" src))
+           (else
+            (let ((base (if lazy?
+                           `(**? ,n ,(or m #f) ,atom)
+                           `(** ,n ,(or m #f) ,atom))))
+              (values (if poss? `(atomic ,base) base) j))))))))
 
 ;; ── Escape sequences ──────────────────────────────────────────────────────────
 
@@ -321,8 +333,9 @@
           ((#\A) (values 'bos (+ i 1)))
           ((#\Z)
            (values '(look-ahead (or eos (seq (? #\return) #\newline eos))) (+ i 1)))
-          ((#\z) (values 'eos (+ i 1)))
-          ((#\t) (values #\tab (+ i 1)))
+           ((#\z) (values 'eos (+ i 1)))
+           ((#\e) (values (integer->char 27) (+ i 1)))
+           ((#\t) (values #\tab (+ i 1)))
           ((#\n) (values #\newline (+ i 1)))
           ((#\r) (values #\return (+ i 1)))
           ((#\f) (values (integer->char #x0C) (+ i 1)))
@@ -439,7 +452,7 @@
         (error 'java-pattern->sre "unterminated character class" src)
         (let ((negated? (and (char=? (string-ref src i1) #\^))))
           (let-values (((members i2)
-                        (parse-cc-body src (if negated? (+ i1 1) i1) end flags)))
+                        (parse-cc-body src (if negated? (+ i1 1) i1) end flags #t)))
             (if (>= i2 end)
                 (error 'java-pattern->sre "unterminated character class" src)
                 (let ((result (cond ((null? members) 'epsilon)
@@ -448,25 +461,31 @@
                   (values (if negated? `(~ ,result) result)
                           (+ i2 1)))))))))
 
-(define (parse-cc-body src i end flags)
-  (let loop ((i i) (members '()))
+(define (parse-cc-body src start end flags outer)
+  (let loop ((i start) (members '()))
     (if (>= i end)
         (values (reverse members) i)
         (let ((c (string-ref src i)))
           (cond
+           ((and outer (= i start) (char=? c #\]))
+            (maybe-cc-range #\] src (+ i 1) end flags loop members))
            ((char=? c #\]) (values (reverse members) i))
            ;; nested char class [a-z&&[^b]] — parse the inner class as a member
            ((char=? c #\[)
             (let-values (((nested i2) (parse-cc src i end flags)))
               (loop i2 (cons nested members))))
            ;; intersection: a-z&&[^b]
-           ((and (char=? c #\&) (< (+ i 1) end)
-                 (char=? (string-ref src (+ i 1)) #\&))
-            (let-values (((nested i2) (parse-cc-body src (+ i 2) end flags)))
+            ((and (char=? c #\&) (< (+ i 1) end)
+                  (char=? (string-ref src (+ i 1)) #\&))
+             (when (and outer (null? members)
+                        (< (+ i 2) end)
+                        (memv (string-ref src (+ i 2)) '(#\& #\])))
+               (error 'java-pattern->sre "bad class intersection syntax" src))
+             (let-values (((nested i2) (parse-cc-body src (+ i 2) end flags #f)))
               (if (>= i2 end)
                   (error 'java-pattern->sre "unterminated class intersection" src)
-                  (let ((prev (cc-members->sre (reverse members)))
-                        (nested-sre (cc-members->sre nested)))
+                  (let ((prev (if (null? members) 'any (cc-members->sre (reverse members))))
+                        (nested-sre (if (null? nested) 'any (cc-members->sre nested))))
                     (if (char=? (string-ref src i2) #\])
                         (values (list `(& ,prev ,nested-sre)) i2)
                         (loop (+ i2 1) (list `(& ,prev ,nested-sre))))))))
@@ -487,9 +506,12 @@
            (not (char=? (string-ref src (+ i 1)) #\])))
       (let ((i2 (+ i 1)))
         (let-values (((end-atom i3) (parse-cc-atom src i2 end flags)))
-          (if (and (char? atom) (char? end-atom))
-              (cont i3 (cons `(/ ,atom ,end-atom) members))
-              (cont (+ i 1) (cons #\- (cons atom members))))))
+          (cond
+           ((and (char? atom) (char? end-atom) (char>? atom end-atom))
+            (error 'java-pattern->sre "range out of order in character class" src))
+           ((and (char? atom) (char? end-atom))
+            (cont i3 (cons `(/ ,atom ,end-atom) members)))
+           (else (cont (+ i 1) (cons #\- (cons atom members)))))))
       (cont i (cons atom members))))
 
 (define (parse-cc-atom src i end flags)
@@ -534,8 +556,9 @@
                             (* 16 (hex-value (string-ref src (+ i 3))))
                             (hex-value (string-ref src (+ i 4))))))
                  (values (integer->char cp) (+ i 5)))
-               (values #\u (+ i 1))))
-          ((#\t) (values #\tab (+ i 1)))
+                (values #\u (+ i 1))))
+           ((#\e) (values (integer->char 27) (+ i 1)))
+           ((#\t) (values #\tab (+ i 1)))
           ((#\n) (values #\newline (+ i 1)))
           ((#\r) (values #\return (+ i 1)))
           ((#\f) (values (integer->char #x0C) (+ i 1)))
@@ -560,7 +583,11 @@
            (let ((eos-q (scan-qe src (+ i 1) end)))
              (let* ((end-q (or eos-q end))
                     (lit (substring src (+ i 1) end-q)))
-               (values (make-lit lit) (+ end-q (if eos-q 2 0))))))
+               (if (and eos-q (zero? (string-length lit)))
+                   (error 'java-pattern->sre "empty quote escape in character class" src)
+                   (values (make-lit lit) (+ end-q (if eos-q 2 0)))))))
+          ((#\R)
+           (error 'java-pattern->sre "linebreak escape not allowed in character class" src))
           (else (values c (+ i 1)))))))
 
 ;; ── Groups ────────────────────────────────────────────────────────────────────
@@ -629,7 +656,7 @@
              (if (and (< i2 end) (char=? (string-ref src i2) #\)))
                  (values `(atomic ,sre) (+ i2 1))
                  (error 'java-pattern->sre "unterminated atomic group" src))))
-           ((#\i #\s #\m #\x #\u #\U #\d #\-)
+           ((#\c #\i #\s #\m #\x #\u #\U #\d #\- #\))
            (parse-inline-flags-group src i end flags depth))
           ((#\#)
            (let ((close (str-scan-char src #\) (+ i 1) end)))
@@ -662,7 +689,7 @@
                   (cons (if neg 'not-ignore-space 'ignore-space) fs) neg))
             ;; u (UNICODE_CASE), U (UNICODE_CHARACTER_CLASS), d (UNIX_LINES):
             ;; accept and ignore — they don't change matching for our engine.
-            ((memv c '(#\u #\U #\d))
+            ((memv c '(#\c #\u #\U #\d))
              (scan (+ j 1) fs neg))
            ((char=? c #\:)
             (let ((new-flags (apply-inline-flags flags fs)))
@@ -672,9 +699,19 @@
                     (error 'java-pattern->sre "unterminated scoped flags group" src)))))
            ((char=? c #\))
             ;; Unscoped toggle (?i) — parse remainder with new flags
-            (let ((new-flags (apply-inline-flags flags fs)))
-              (let-values (((sre i2) (parse-expr src (+ j 1) end new-flags (+ depth 1))))
-                (values (wrap-flags-sre sre fs) i2))))
+            (let ((new-flags (apply-inline-flags flags fs))
+                  (k (+ j 1)))
+              (let ((qc (and (< k end) (string-ref src k))))
+                (cond
+                 ((and qc (memv qc '(#\* #\+ #\?)))
+                  (error 'java-pattern->sre "dangling quantifier after flag group" src))
+                 ((and qc (char=? qc #\{))
+                  (let-values (((qi i2) (parse-bounded 'epsilon src k end flags depth)))
+                    (let-values (((sre i3) (parse-expr src i2 end new-flags (+ depth 1))))
+                      (values (wrap-flags-sre sre fs) i3))))
+                 (else
+                  (let-values (((sre i2) (parse-expr src k end new-flags (+ depth 1))))
+                    (values (wrap-flags-sre sre fs) i2)))))))
            (else
             (error 'java-pattern->sre "unrecognized inline flag" src)))))))
 

@@ -131,14 +131,21 @@
                    "." (pad3 (list-ref f 6)) "-00:00")))
 
 ;; --- DateTimeFormatter pattern engine -----
+;; month-names backs .parse's month-name matching only; format-time names come
+;; from the :date-names extension point (sdf-date-names below).
 (define month-names (vector "January" "February" "March" "April" "May" "June" "July"
                             "August" "September" "October" "November" "December"))
-(define day-names (vector "Sunday" "Monday" "Tuesday" "Wednesday" "Thursday" "Friday" "Saturday"))
 
-(define (format-ms pattern ms)
+;; names is sdf-date-names' vector: #(months months-short days days-short), the
+;; days Monday-first (CLDR order); inst-fields' dow is 0=Sunday, hence dow-mon.
+(define (format-ms pattern ms names)
   (let ((f (inst-fields ms)) (n (string-length pattern)) (out (open-output-string)))
-    (let ((y (list-ref f 0)) (mo (list-ref f 1)) (d (list-ref f 2))
-          (hh (list-ref f 3)) (mi (list-ref f 4)) (se (list-ref f 5)) (dow (list-ref f 7)))
+    ;; let* — dow-mon is derived from dow, so the bindings must be sequential.
+    (let* ((y (list-ref f 0)) (mo (list-ref f 1)) (d (list-ref f 2))
+           (hh (list-ref f 3)) (mi (list-ref f 4)) (se (list-ref f 5)) (dow (list-ref f 7))
+           (months (vector-ref names 0)) (months-short (vector-ref names 1))
+           (days (vector-ref names 2)) (days-short (vector-ref names 3))
+           (dow-mon (modulo (+ dow 6) 7)))
       (define (run-len i c) (let loop ((j i)) (if (and (< j n) (char=? (string-ref pattern j) c)) (loop (+ j 1)) (- j i))))
       (let loop ((i 0))
         (when (< i n)
@@ -154,12 +161,12 @@
               ((char=? c #\y) (display (if (>= k 4) (number->string y) (pad2 (modulo y 100))) out) (loop (+ i k)))
               ((char=? c #\M)
                (display (cond ((= k 1) (number->string mo)) ((= k 2) (pad2 mo))
-                              ((= k 3) (substring (vector-ref month-names (- mo 1)) 0 3))
-                              (else (vector-ref month-names (- mo 1)))) out)
+                              ((= k 3) (vector-ref months-short (- mo 1)))
+                              (else (vector-ref months (- mo 1)))) out)
                (loop (+ i k)))
               ((char=? c #\d) (display (if (= k 1) (number->string d) (pad2 d)) out) (loop (+ i k)))
               ((char=? c #\E)
-               (display (if (>= k 4) (vector-ref day-names dow) (substring (vector-ref day-names dow) 0 3)) out)
+               (display (vector-ref (if (>= k 4) days days-short) dow-mon) out)
                (loop (+ i k)))
               ((char=? c #\H) (display (if (= k 1) (number->string hh) (pad2 hh)) out) (loop (+ i k)))
               ((char=? c #\h)
@@ -393,9 +400,11 @@
   (jt-instant-hook (* (ms->exact ms) 1000000)))
 ;; java.util.Locale is only meaningful for formatting, which is the jolt-lang/time
 ;; library (DateTimeFormatter and localized names). The library owns the single
-;; Locale registration; core does not carry a second one (RFC 0008). Nothing in the
-;; core java.util/java.text layer takes a Locale — SimpleDateFormat holds a bare
-;; pattern — so referencing Locale with no dependency errors, naming the library.
+;; Locale registration; core does not carry a second one (RFC 0008). Where a core
+;; ctor takes a Locale (SimpleDateFormat below), the argument is rendered to its
+;; id through jolt-str-render-one and resolved via the :date-names extension
+;; point — core never names the class, so referencing Locale with no dependency
+;; still errors, naming the library.
 
 ;; java.util.Date / java.sql.Timestamp: #inst's classes. (Date.) = now, (Date. ms)
 ;; or (Date. another-date) -> a jinst (ms-of accepts a number / jinst / instant), so
@@ -739,9 +748,55 @@
 (register-class-statics! "GregorianCalendar" gregorian-statics)
 (register-class-statics! "java.util.GregorianCalendar" gregorian-statics)
 
-;; java.text.SimpleDateFormat: holds a pattern; .setTimeZone is accepted (format-ms
-;; is UTC); .format(date) renders the date per the pattern via the format-ms engine.
-(define (sdf-ctor pat . _) (make-jhost "sdf" (vector (if (string? pat) pat (jolt-str-render-one pat)))))
+;; java.text.SimpleDateFormat: holds a pattern and an optional locale id;
+;; .setTimeZone is accepted (format-ms is UTC); .format(date) renders the date
+;; per the pattern via the format-ms engine.
+;;
+;; Month and day names are per-locale CLDR data core does not carry beyond the
+;; ROOT locale, declared as an extension point. :fallback is :default, NOT
+;; :strict (the opposite of ::currency-data): the JVM's own contract for an
+;; unknown locale is "fall back to ROOT", so the :default mechanism reproduces
+;; it exactly, and a locale passed for a purely numeric pattern still gets an
+;; answer instead of a raise. ROOT's wide names ARE the abbreviated forms (the
+;; JVM renders "Mar" for MMMM at ROOT — verified, not a bug). jolt-lang/time
+;; owns java.util.Locale and registers the rest (RFC 0008).
+;;
+;; The key is a locale ID STRING, not a Locale: core has no Locale class, and
+;; rendering the argument through jolt-str-render-one reaches the library's
+;; Locale (registered with a :str yielding its id) without core naming the class.
+(define sdf-root-months (vector "Jan" "Feb" "Mar" "Apr" "May" "Jun"
+                                "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"))
+(define sdf-root-days (vector "Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun"))  ; Monday-first, CLDR order
+(define sdf-root-names (vector sdf-root-months sdf-root-months sdf-root-days sdf-root-days))
+(let ((kw (lambda (n) (keyword #f n))))
+  (jolt-register-extension-point! (kw "date-names")
+    (jolt-hash-map
+      (kw "key") (kw "string")
+      (kw "root") ""
+      (kw "fields") (jolt-hash-map (kw "months") (kw "any")
+                                   (kw "months-short") (kw "any")
+                                   (kw "days") (kw "any")
+                                   (kw "days-short") (kw "any"))
+      (kw "default") (jolt-hash-map (kw "months") (apply jolt-vector (vector->list sdf-root-months))
+                                    (kw "months-short") (apply jolt-vector (vector->list sdf-root-months))
+                                    (kw "days") (apply jolt-vector (vector->list sdf-root-days))
+                                    (kw "days-short") (apply jolt-vector (vector->list sdf-root-days)))
+      (kw "fallback") (kw "default")
+      (kw "hint") "The jolt-lang/time library carries per-locale month and day names.")))
+
+;; Project the point's map for a locale id to format-ms' names vector. A field a
+;; provider set to nil (the field type is :any, so it can) falls back to ROOT's.
+(define (sdf-date-names id)
+  (let ((data (jolt-extension-value (keyword #f "date-names") id)))
+    (let ((f (lambda (name i)
+               (let* ((v (jolt-get-dispatch data (keyword #f name) jolt-nil))
+                      (s (if (jolt-nil? v) jolt-nil (jolt-seq v))))
+                 (if (jolt-nil? s) (vector-ref sdf-root-names i) (list->vector (seq->list s)))))))
+      (vector (f "months" 0) (f "months-short" 1) (f "days" 2) (f "days-short" 3)))))
+
+(define (sdf-ctor pat . rest)
+  (make-jhost "sdf" (vector (if (string? pat) pat (jolt-str-render-one pat))
+                            (and (pair? rest) (jolt-str-render-one (car rest))))))
 (register-class-ctor! "SimpleDateFormat" sdf-ctor)
 (register-class-ctor! "java.text.SimpleDateFormat" sdf-ctor)
 (register-host-methods! "sdf"
@@ -750,7 +805,10 @@
         (cons "applyPattern" (lambda (self p) (vector-set! (jhost-state self) 0 (jolt-str-render-one p)) jolt-nil))
         (cons "toPattern" (lambda (self) (vector-ref (jhost-state self) 0)))
         (cons "parse" (lambda (self s) (parse-ms (vector-ref (jhost-state self) 0) (jolt-str-render-one s))))
-        (cons "format" (lambda (self d) (format-ms (vector-ref (jhost-state self) 0) (ms-of d))))))
+        (cons "format" (lambda (self d)
+                         (let ((st (jhost-state self)))
+                           (format-ms (vector-ref st 0) (ms-of d)
+                                      (sdf-date-names (or (vector-ref st 1) ""))))))))
 
 ;; a jinst's java.util.Date method surface (record-method-dispatch arm).
 (register-method-arm! arm-priority-date

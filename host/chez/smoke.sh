@@ -495,6 +495,21 @@ else
   fails=$((fails + 1))
 fi
 
+# clojure.pprint dispatch-fn gate: simple-dispatch and code-dispatch must be real
+# multimethods on class so libraries can extend them (core.logic's nominal
+# namespace does (. clojure.pprint/simple-dispatch addMethod …)). Gated here for
+# the same reason clojure.instant is: it requires loading clojure.pprint and
+# registering methods, which the corpus runner never does.
+pdm_out="$($jolt run test/chez/pprint-dispatch-test.clj 2>/dev/null)"
+if printf '%s' "$pdm_out" | grep -q 'PPRINT-DISPATCH OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: clojure.pprint dispatch-fn suite"
+  echo "    $(printf '%s' "$pdm_out" | grep PPRINT-DISPATCH-RESULT | tail -1)"
+  printf '%s' "$pdm_out" | grep 'pprint-dispatch FAIL' | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # A throwing go/thread body reports to stderr (the JVM's uncaught-exception
 # handler behavior) while the channel still just closes: <!! stays nil.
 thr_out="$($jolt -e "(do (require '[clojure.core.async :as a]) (pr (a/<!! (a/thread (/ 1 0)))))" 2>/tmp/jolt-smoke-thr-err)"
@@ -626,6 +641,26 @@ else
   fails=$((fails + 1))
 fi
 rm -f "$process_log"
+
+# A jolt that spawns has to restore SIG_DFL for SIGCHLD before its first spawn: the
+# disposition survives exec, so jolt can arrive with SIG_IGN through no choice of
+# its own (a CI runner, a supervisor), and with it in place the kernel reaps every
+# child and no exit status is knowable. The case sets SIG_IGN itself rather than
+# inheriting it from a `trap ''` here — a shell may keep SIGCHLD for its own job
+# control and not pass the ignore through exec, which is the difference between
+# macOS and Linux and made the shell version vacuous in CI. Its own process because
+# the restore is once-per-process, on the first spawn: process-test.clj sets
+# SIG_IGN AFTER a spawn on purpose, so it cannot reach this path at all.
+sigchld_log="$(mktemp)"
+$jolt run test/chez/sigchld-test.clj >"$sigchld_log" 2>&1 || true
+if grep -q 'SIGCHLD-TEST OK' "$sigchld_log"; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: SIGCHLD restored before the first spawn"
+  tail -3 "$sigchld_log" | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+rm -f "$sigchld_log"
 
 # Runtime.availableProcessors reports the host's real usable CPU count. The value
 # is machine-dependent, so the expectation comes from the OS rather than a literal

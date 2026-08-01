@@ -373,6 +373,15 @@
         (else
          (let-values (((form j) (rdr-read-form s i end)))
            (cond
+             ;; A close delimiter that is not the one this collection is waiting
+             ;; for comes back UNCONSUMED (j = i). Treating that as a discard
+             ;; re-reads the same character forever, so a file with a mismatched
+             ;; delimiter hung the loader instead of failing: the only symptom was
+             ;; that loading never returned, which reads as a hang, not a syntax
+             ;; error. Any no-progress result is an error here, reported at its
+             ;; position like the JVM's.
+             ((and (rdr-eof? form) (= j i))
+              (rdr-error s i (string-append "Unmatched delimiter: " (string (string-ref s i)))))
              ((rdr-eof? form) (loop j acc))   ; a #_ discard or no-match #? — re-check at j
              ((rdr-splice-t? form)            ; #?@ — splice the matched collection's items
               (loop j (append (reverse (rdr-splice-t-items form)) acc)))

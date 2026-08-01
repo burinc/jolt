@@ -437,6 +437,26 @@
 
 ;; String/valueOf(Object): "null" for nil, else jolt's str semantics.
 ;; String/format(fmt args…) / (locale fmt args…) -> the clojure.core format engine.
+;; A locale's decimal and grouping separators. Core carries ROOT ("." and ",") and
+;; jolt-lang/time registers the rest — the same split as ::date-names, and
+;; :fallback :default for the same reason: the JVM falls back to ROOT for an
+;; unknown locale rather than failing, so :default reproduces that mechanism and a
+;; locale supplied for a pattern with no numeric directive still gets an answer.
+(let ((kw (lambda (n) (keyword #f n))))
+  (jolt-register-extension-point! (kw "number-symbols")
+    (jolt-hash-map
+      (kw "key") (kw "string")
+      (kw "root") ""
+      (kw "fields") (jolt-hash-map (kw "decimal-sep") (kw "string")
+                                   (kw "grouping-sep") (kw "string"))
+      (kw "default") (jolt-hash-map (kw "decimal-sep") "." (kw "grouping-sep") ",")
+      (kw "fallback") (kw "default")
+      (kw "hint") "The jolt-lang/time library carries per-locale number symbols.")))
+(define (number-symbol id name dflt)
+  (let* ((data (jolt-extension-value (keyword #f "number-symbols") id))
+         (v (jolt-get-dispatch data (keyword #f name) jolt-nil)))
+    (if (jolt-nil? v) dflt v)))
+
 (register-class-statics! "String"
   (list (cons "valueOf" (lambda (x . _) (if (jolt-nil? x) "null" (jolt-str-render-one x))))
         ;; String.format(fmt, Object...) is called both ways in the wild: with the
@@ -460,26 +480,48 @@
                                                (jolt-array? (car args)))
                                           (ja->list (jolt-array-vec (car args)))
                                           args)))
-                           (apply jolt-format fmt args))))))
+                           ;; The locale drives the decimal separator: the JVM
+                           ;; renders %.3f of 123.04455 as "123,045" under de.
+                           (if locale?
+                               (parameterize ((format-decimal-sep
+                                               (number-symbol (jolt-str-render-one a)
+                                                              "decimal-sep" ".")))
+                                 (apply jolt-format fmt args))
+                               (apply jolt-format fmt args)))))))
 
 ;; ---- java.text.NumberFormat -------------------------------------------------
 ;; A grouping decimal formatter (selmer number-format / cuerdas). state:
 ;; #(grouping? min-frac max-frac). .format groups the integer part with commas.
-(define (nf-make grouping? minf maxf) (make-jhost "numberformat" (vector grouping? minf maxf)))
-(define (group-int-str s)               ; "1234567" -> "1,234,567"
+(define (nf-make grouping? minf maxf) (make-jhost "numberformat" (vector grouping? minf maxf #f)))
+;; A currency instance carries its locale's data in slot 3; everything else is a
+;; plain decimal instance and leaves it #f.
+(define (nf-make-currency cur minf maxf) (make-jhost "numberformat" (vector #t minf maxf cur)))
+(define (nf-currency-of self) (vector-ref (jhost-state self) 3))
+(define (group-int-str* s sep)           ; "1234567" -> "1,234,567" with sep between groups
   (let* ((neg (and (> (string-length s) 0) (char=? (string-ref s 0) #\-)))
          (digs (if neg (substring s 1 (string-length s)) s))
          (n (string-length digs)) (out '()))
     (let loop ((i 0))
       (when (< i n)
-        (when (and (> i 0) (= 0 (modulo (- n i) 3))) (set! out (cons #\, out)))
-        (set! out (cons (string-ref digs i) out)) (loop (+ i 1))))
-    (string-append (if neg "-" "") (list->string (reverse out)))))
+        (when (and (> i 0) (= 0 (modulo (- n i) 3)))
+          (set! out (cons sep out)))
+        (set! out (cons (string (string-ref digs i)) out)) (loop (+ i 1))))
+    (apply string-append (if neg "-" "") (reverse out))))
+(define (group-int-str s) (group-int-str* s ","))
 (define (nf-format self x)
-  (let* ((grouping? (vector-ref (jhost-state self) 0))
+  (let* ((cur (nf-currency-of self))
+         (cfield (lambda (name dflt)
+                   (if cur (let ((v (jolt-get-dispatch cur (keyword #f name) jolt-nil)))
+                             (if (jolt-nil? v) dflt v))
+                       dflt)))
+         (grouping? (vector-ref (jhost-state self) 0))
          (minf (vector-ref (jhost-state self) 1)) (maxf (vector-ref (jhost-state self) 2))
+         (dec-sep (cfield "decimal-sep" "."))
+         (grp-sep (cfield "grouping-sep" ","))
          (neg (< x 0)) (ax (abs (exact->inexact x)))
          (scale (expt 10 maxf))
+         ;; Chez's round is round-half-to-EVEN, which is what the JVM's currency
+         ;; format does (1234.5 -> 1234, 2.5 -> 2 at zero fraction digits).
          (scaled (exact (round (* ax scale))))
          (ipart (quotient scaled scale)) (fpart (remainder scaled scale))
          (istr (number->string ipart))
@@ -488,17 +530,68 @@
          ;; trim trailing zeros down to minf
          (fstr (let loop ((s fstr0)) (if (and (> (string-length s) minf)
                                               (char=? (string-ref s (- (string-length s) 1)) #\0))
-                                         (loop (substring s 0 (- (string-length s) 1))) s))))
-    (string-append (if neg "-" "") (if grouping? (group-int-str istr) istr)
-                   (if (> (string-length fstr) 0) (string-append "." fstr) ""))))
+                                         (loop (substring s 0 (- (string-length s) 1))) s)))
+         (num (string-append (if grouping? (group-int-str* istr grp-sep) istr)
+                             (if (> (string-length fstr) 0) (string-append dec-sep fstr) ""))))
+    ;; The JVM puts the minus sign ahead of the whole thing, symbol included:
+    ;; -¤ 123.45, -$123.45, -123,45 €.
+    (string-append (if neg "-" "")
+                   (if cur
+                       (let ((sym (cfield "symbol" "")) (sep (cfield "symbol-sep" "")))
+                         (if (jolt-truthy? (cfield "symbol-first?" #t))
+                             (string-append sym sep num)
+                             (string-append num sep sym)))
+                       num))))
 (register-host-methods! "numberformat"
   (list (cons "format" (lambda (self n) (nf-format self n)))
         (cons "setMaximumFractionDigits" (lambda (self d) (vector-set! (jhost-state self) 2 (jnum->exact d)) jolt-nil))
         (cons "setMinimumFractionDigits" (lambda (self d) (vector-set! (jhost-state self) 1 (jnum->exact d)) jolt-nil))
         (cons "setGroupingUsed" (lambda (self b) (vector-set! (jhost-state self) 0 (jolt-truthy? b)) jolt-nil))))
+;; A currency instance's symbol, separators and fraction-digit count are per-locale
+;; CLDR data core does not carry. Declared as an extension point instead: core
+;; answers for the ROOT locale (the java.util.Locale.ROOT formatting the JVM does,
+;; ¤ + NBSP + digits) and is :strict beyond it, so an unregistered locale raises
+;; naming itself rather than formatting a German amount with root separators.
+;; jolt-lang/time owns java.util.Locale and registers the rest (RFC 0008).
+;;
+;; The key is a locale ID STRING, not a Locale: core has no Locale class, and
+;; rendering the argument through jolt-str-render-one reaches the library's Locale
+;; (registered with a :str yielding its id) without core naming the class.
+(let ((kw (lambda (n) (keyword #f n))))
+  (jolt-register-extension-point! (kw "currency-data")
+    (jolt-hash-map
+      (kw "key") (kw "string")
+      (kw "root") ""
+      (kw "fields") (jolt-hash-map (kw "symbol") (kw "string")
+                                   (kw "symbol-sep") (kw "string")
+                                   (kw "symbol-first?") (kw "boolean")
+                                   (kw "decimal-sep") (kw "string")
+                                   (kw "grouping-sep") (kw "string")
+                                   (kw "frac-digits") (kw "long"))
+      ;; Locale.ROOT: currency sign U+00A4, NBSP, then the amount.
+      (kw "default") (jolt-hash-map (kw "symbol") "\xa4;"
+                                    (kw "symbol-sep") "\xa0;"
+                                    (kw "symbol-first?") #t
+                                    (kw "decimal-sep") "."
+                                    (kw "grouping-sep") ","
+                                    (kw "frac-digits") 2)
+      (kw "fallback") (kw "strict")
+      (kw "hint") "The jolt-lang/time library carries per-locale currency data.")))
+
+;; (getCurrencyInstance) with no argument is the ROOT locale, not the process
+;; default the JVM would use — core has no notion of a default locale. Documented
+;; in known-divergences.
+(define (nf-currency-instance . args)
+  (let* ((key (if (null? args) "" (jolt-str-render-one (car args))))
+         (data (jolt-extension-value (keyword #f "currency-data") key))
+         (frac (let ((f (jolt-get-dispatch data (keyword #f "frac-digits") jolt-nil)))
+                 (if (jolt-nil? f) 2 f))))
+    (nf-make-currency data frac frac)))
+
 (let ((nf-statics (list (cons "getInstance" (lambda _ (nf-make #t 0 3)))
                         (cons "getNumberInstance" (lambda _ (nf-make #t 0 3)))
-                        (cons "getIntegerInstance" (lambda _ (nf-make #t 0 0))))))
+                        (cons "getIntegerInstance" (lambda _ (nf-make #t 0 0)))
+                        (cons "getCurrencyInstance" nf-currency-instance))))
   (register-class-statics! "NumberFormat" nf-statics)
   (register-class-statics! "java.text.NumberFormat" nf-statics))
 

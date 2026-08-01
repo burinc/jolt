@@ -28,15 +28,14 @@
 (define (register-embedded-resource! name content)
   (hashtable-set! embedded-resources name content))
 (define-record-type embedded-res (fields name content) (nongenerative jolt-embres-v1))
-;; io/resource must answer the SAME surface whichever branch served it. The other
-;; branch hands back a jfile, which carries a deliberate URL-compatibility surface
-;; (getPath / getFile / getProtocol / toURI / …) because the JVM returns a
-;; java.net.URL there. An embedded hit had none of it: .getPath threw and (class r)
-;; read :object, so a caller that resolves a resource to a path — orchard.namespace
-;; /canonical-source does (some-> (io/resource p) .getPath) — worked or failed
-;; depending only on whether the devboot cache had baked that file in.
-;; Registered below (after record-method-dispatch's arm registry exists) rather
-;; than inline, so both branches stay in one place.
+;; io/resource returns a java.net.URL from BOTH branches: a file: URL (a jhost
+;; "url") for a hit on a source root, and this embedded-res (class java.net.URL,
+;; protocol "jar") for a resource baked into a built binary. The two must answer the
+;; SAME surface — getPath / getFile / getName / getProtocol / openStream — so a
+;; caller that resolves a resource (orchard.namespace/canonical-source does
+;; (some-> (io/resource p) .getPath)) gets the same answer whichever branch served
+;; it. Registered below (after record-method-dispatch's arm registry exists)
+;; rather than inline, so both branches stay in one place.
 (define (embedded-res-method obj name args)
   (let ((nm (embedded-res-name obj)))
     (cond
@@ -50,6 +49,9 @@
       ((string=? name "exists")      (list #t))
       ((string=? name "isDirectory") (list #f))
       ((string=? name "isFile")      (list #t))
+      ((string=? name "openStream")
+       (let ((c (embedded-res-content obj)))
+         (list (host-new "StringReader" (if (bytevector? c) (utf8->string c) c)))))
       (else #f))))
 
 ;; --- self-contained build artifacts (jolt-eaj) ------------------------------
@@ -151,7 +153,10 @@
 ;; (jfile-fs / slurp / spit / the stream constructors).
 (define (jolt-make-file path . rest)
   (let loop ((p (file-path-of path)) (cs rest))
-    (if (null? cs) (make-jfile p)
+    (if (null? cs)
+        ;; (io/file url) strips the scheme — File of url.toURI on the JVM; only a
+        ;; file: url names a path. url-file-coercion is defined below; call-time ref.
+        (if (and (null? rest) (jhost? path) (string=? (jhost-tag path) "url")) (url-file-coercion path) (make-jfile p))
         (loop (string-append p "/" (file-path-of (car cs))) (cdr cs)))))
 ;; the on-disk path of a value: a relative path resolves against JOLT_PWD.
 (define (jfile-fs f) (project-relative (file-path-of f)))
@@ -246,16 +251,64 @@
   (let ((i (let loop ((j 0)) (cond ((>= j (string-length spec)) #f)
                                    ((char=? (string-ref spec j) #\:) j) (else (loop (+ j 1)))))))
     (if i (substring spec 0 i) "")))
+;; The JVM canonicalizes a spec on the way in: the protocol lowercases, and an
+;; EMPTY authority collapses, so "file:///a/b/" and "http:///a" render "file:/a/b/"
+;; and "http:/a" while "file://host/a" keeps its host. Callers compare these
+;; strings (Selmer stores a resource path as one), so rendering the spec verbatim
+;; diverges on the most common shape there is — a file: URL built from a path.
+(define url-known-protocols '("http" "https" "file" "jar" "ftp" "mailto" "netdoc"))
+(define (url-canonical spec)
+  (let* ((i (let loop ((j 0)) (cond ((>= j (string-length spec)) #f)
+                                    ((char=? (string-ref spec j) #\:) j)
+                                    (else (loop (+ j 1))))))
+         (proto (and i (string-downcase (substring spec 0 i))))
+         (rest (and i (substring spec (+ i 1) (string-length spec)))))
+    (unless (and proto (> (string-length proto) 0))
+      (jolt-throw (jolt-host-throwable "java.net.MalformedURLException"
+                                       (string-append "no protocol: " spec))))
+    (unless (member proto url-known-protocols)
+      (jolt-throw (jolt-host-throwable "java.net.MalformedURLException"
+                                       (string-append "unknown protocol: " proto))))
+    ;; An empty authority drops its "//": "file:///a/b/" renders "file:/a/b/" and
+    ;; "http:///a" renders "http:/a". A FOURTH slash does not — "file:////x" stays
+    ;; as written, because the path itself then begins "//" and the JVM keeps it.
+    ;; Both shapes turn up: the first is File.toURL, the second is what a caller
+    ;; builds by hand as "file:///" + an absolute path.
+    (string-append proto ":"
+                   (if (and (>= (string-length rest) 4)
+                            (string=? (substring rest 0 3) "///")
+                            (not (char=? (string-ref rest 3) #\/)))
+                       (substring rest 2 (string-length rest))
+                       rest))))
 ;; (java.net.URL. spec) — a basic file/http URL value (a library may register a
 ;; richer URL shim, which overrides this).
-(register-class-ctor! "URL" (lambda (spec . _) (make-url (jolt-str-render-one spec))))
-(register-class-ctor! "java.net.URL" (lambda (spec . _) (make-url (jolt-str-render-one spec))))
+(register-class-ctor! "URL" (lambda (spec . _) (make-url (url-canonical (jolt-str-render-one spec)))))
+(register-class-ctor! "java.net.URL" (lambda (spec . _) (make-url (url-canonical (jolt-str-render-one spec)))))
+;; (str url) is the spec, like the JVM — without this it renders the opaque
+;; #object[java.net.URL] form and any caller that builds a path from it gets that
+;; string instead.
+(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "url")))
+                      url-spec)
 (register-host-methods! "url"
   (list (cons "toString"       (lambda (self) (url-spec self)))
         (cons "toExternalForm" (lambda (self) (url-spec self)))
         (cons "getProtocol"    (lambda (self) (url-protocol (url-spec self))))
         (cons "getPath"        (lambda (self) (url-strip-scheme (url-spec self))))
-        (cons "getFile"        (lambda (self) (url-strip-scheme (url-spec self))))))
+        (cons "getFile"        (lambda (self) (url-strip-scheme (url-spec self))))
+        (cons "getName"        (lambda (self) (path-last-segment (url-strip-scheme (url-spec self)))))
+        ;; openStream / io/input-stream: a file: URL reads its target from disk; a
+        ;; URL of any other protocol has no local backing and raises (the JVM would
+        ;; connect or read the jar), never empty content.
+        (cons "openStream"     (lambda (self) (host-new "StringReader" (url-content self))))))
+;; (instance? java.net.URL x): the url jhost and an embedded-res (the jar: branch of
+;; io/resource) both report java.net.URL. records-interop's case-string has no URL
+;; arm, so answer it here where the two types live.
+(register-instance-check-arm!
+  (lambda (type-sym val)
+    (let ((tn (symbol-t-name type-sym)))
+      (if (or (string=? tn "URL") (string=? tn "java.net.URL"))
+          (or (and (jhost? val) (string=? (jhost-tag val) "url")) (embedded-res? val))
+          'pass))))
 
 ;; --- File method surface (record-method-dispatch arm) -----------------------
 (define (jfile-method f name args)        ; -> boxed result, or #f to fall through
@@ -270,11 +323,6 @@
       ;; File.toURI returns a java.net.URI (JVM), not a String.
       ((string=? name "toURI")          (list (uri-parse (string-append "file:" (jfile-abs fp)))))
       ((string=? name "toURL")          (list (make-url (string-append "file:" (jfile-abs fp)))))
-      ;; io/resource returns a File where the JVM returns a file: URL; answer the
-      ;; two URL methods resource-serving middleware (ring) calls on the result, so
-      ;; it sees a "file" protocol and a path without changing the return type.
-      ((string=? name "getProtocol")    (list "file"))
-      ((string=? name "getFile")        (list (jfile-abs fp)))
       ((string=? name "exists")         (list (if (file-exists? fp) #t #f)))
       ((string=? name "isDirectory")    (list (if (file-directory? fp) #t #f)))
       ((string=? name "isFile")         (list (if (and (file-exists? fp) (not (file-directory? fp))) #t #f)))
@@ -434,6 +482,16 @@
     (throw-jvm (quote java.io.FileNotFoundException)
                (string-append path " (No such file or directory)")))
   (read-file-string path))
+;; The content a URL names, as text: a file: URL reads its target from disk (a
+;; missing file is a FileNotFoundException, as on the JVM); any other protocol has
+;; no local backing, so raise rather than hand back empty content. slurp /
+;; io/reader / io/input-stream / .openStream all reach a URL through here.
+(define (url-content u)
+  (let ((spec (url-spec u)))
+    (if (string=? (url-protocol spec) "file")
+        (slurp-path (url-strip-scheme spec))
+        (throw-jvm (quote java.io.IOException)
+                   (string-append "protocol doesn't support input: " spec)))))
 (define (jolt-slurp src . opts)
   (cond
     ((jfile? src) (slurp-path (jfile-fs src)))
@@ -441,6 +499,8 @@
      (let ((c (embedded-res-content src)))
        (if (bytevector? c) (utf8->string c) c)))
     ((reader-jhost? src) (drain-reader src))
+    ;; a file: URL reads its target (jar:/http:/… raise in url-content).
+    ((and (jhost? src) (string=? (jhost-tag src) "url")) (url-content src))
     ;; bytes (a bytevector or a jolt byte-array): decode with :encoding (UTF-8
     ;; default). clj-http-lite slurps response-body byte arrays.
     ((bytevector? src) (decode-bytevector src (slurp-encoding opts)))
@@ -602,16 +662,19 @@
 (def-var! "clojure.java.io" "input-stream" jolt-io-reader)
 (def-var! "clojure.java.io" "output-stream" jolt-io-writer)
 ;; resource: jolt has no classpath, so a named resource is resolved against the
-;; loader's source roots (a project's :paths, e.g. "resources"). Returns a File
-;; (slurp/reader-able) for the first match, else nil. get-source-roots is the
-;; loader's accessor (loader.ss), resolved at call time — the runtime CLI loads it.
+;; loader's source roots (a project's :paths, e.g. "resources"). Returns a file:
+;; URL for the first match (a jar:-classed embedded-res if the file is baked into a
+;; built binary), else nil — matching the JVM, which returns a java.net.URL. Both
+;; branches answer the same URL surface. get-source-roots is the loader's accessor
+;; (loader.ss), resolved at call time — the runtime CLI loads it.
 (define (jolt-io-resource name)
   (let* ((nm (jolt-str-render-one name))
          (emb (hashtable-ref embedded-resources nm #f)))
     (if emb (make-embedded-res nm emb)
         (let loop ((roots (get-source-roots)))
           (cond ((null? roots) jolt-nil)
-                ((file-exists? (string-append (car roots) "/" nm)) (make-jfile (string-append (car roots) "/" nm)))
+                ((file-exists? (string-append (car roots) "/" nm))
+                 (make-url (string-append "file:" (car roots) "/" nm)))
                 (else (loop (cdr roots))))))))
 (def-var! "clojure.java.io" "resource" jolt-io-resource)
 ;; as-url honors a library-registered URL class (e.g. jolt-lang/http-client's full
