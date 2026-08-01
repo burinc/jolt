@@ -351,8 +351,10 @@
 
 (defn- raw-pom-deps-from
   "Transitive deps read from a pom.xml — as a deps map so the expansion walks
-  them like any other. This fallback is only for a local JAR whose Maven
-  coordinates are unknown; repository Maven deps use Grenadine effective POMs."
+  them like any other. Repository Maven deps use Grenadine effective POMs; this
+  reads whatever the jar itself packages, for a local jar whose Maven
+  coordinates are unknown and for a dep whose effective POM wouldn't build. It
+  skips a dependency it can't read a literal version for rather than failing."
   [pom]
   (do
     (when (file-exists? pom)
@@ -468,7 +470,16 @@
 (defn- effective-pom-deps
   "Build a Maven dependency map from Grenadine's effective POM model. Parent
   inheritance, properties, dependency management, BOM imports, and exclusions
-  have already been resolved by Grenadine."
+  have already been resolved by Grenadine.
+
+  nil when the effective POM can't be built — the .pom isn't in the repository
+  and can't be fetched (a hand-installed jar, or an offline machine), or the POM
+  names something Grenadine won't guess at, such as a version that stays
+  `${unresolved}` because it is set in a profile. Grenadine asserts every
+  declared coordinate before jolt filters by scope, so a test-scoped dependency
+  jolt drops anyway can be what makes a POM unmodellable. A nil sends the caller
+  to whatever pom.xml the jar itself carries; the alternative, failing the whole
+  resolution over a dependency that may not even be reachable, is worse."
   [lib coord]
   (memoized
    [:effective-pom lib (ext/dep-id lib coord)]
@@ -476,24 +487,31 @@
      (let [coords {:group (mvn-group lib)
                    :artifact (name lib)
                    :version (:mvn/version coord)}
-           effective (grenadine.pom/effective-pom coords pom-text)]
-       (into
-        {}
-        (keep
-         (fn [{:keys [group artifact version scope optional exclusions]}]
-           (when (and group artifact version
-                      (not (#{"test" "provided" "system"} scope))
-                      (not optional))
-             [(symbol group artifact)
-              (cond-> {:mvn/version version}
-                (seq exclusions)
-                (assoc :exclusions
-                       (set
-                        (map
-                         (fn [{:keys [group artifact]}]
-                           (symbol group artifact))
-                         exclusions))))])))
-        (:deps effective))))))
+           effective (try (grenadine.pom/effective-pom coords pom-text)
+                          (catch :default e
+                            (warn "no effective POM for " lib " "
+                                  (:mvn/version coord) ": " (ex-message e)
+                                  "\n  falling back to the pom.xml in its jar;"
+                                  " transitive deps may be incomplete")
+                            nil))]
+       (when effective
+         (into
+          {}
+          (keep
+           (fn [{:keys [group artifact version scope optional exclusions]}]
+             (when (and group artifact version
+                        (not (#{"test" "provided" "system"} scope))
+                        (not optional))
+               [(symbol group artifact)
+                (cond-> {:mvn/version version}
+                  (seq exclusions)
+                  (assoc :exclusions
+                         (set
+                          (map
+                           (fn [{:keys [group artifact]}]
+                             (symbol group artifact))
+                           exclusions))))])))
+          (:deps effective)))))))
 
 (defn- manifest-info
   "Manifest detection for a git/local directory root: its deps.edn, else a bare
@@ -537,8 +555,13 @@
           ;; a Maven dep with no jolt-loadable source contributes nothing and
           ;; its transitive deps are cljs/JVM tooling — don't walk them.
           (not (has-clj-source? root)) {:root nil :manifest :none}
+          ;; :pom is the fallback children-of reaches for when the effective POM
+          ;; can't be built — not every jar carries one, and the ones that do
+          ;; predate their own dependencyManagement, so it is second choice.
           :else {:root root :manifest :mvn
-                 :deps (effective-pom-deps lib coord)})))))
+                 :deps (effective-pom-deps lib coord)
+                 :pom (str root "/META-INF/maven/" (mvn-group lib) "/"
+                           (name lib) "/pom.xml")})))))
 
 (defn- git-info [lib coord]
   (memoized [:info lib (ext/dep-id lib coord)]

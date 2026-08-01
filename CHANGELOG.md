@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Maven transitive deps come from the real effective POM.** jolt used to scrape
+  the `pom.xml` a jar happened to package under `META-INF/maven/`, so a jar that
+  ships without one — `metosin/malli` is one — contributed no transitive deps at
+  all, and a project had to list them by hand. jolt now embeds
+  [Grenadine](https://github.com/ingydotnet/grenadine) and builds the effective
+  POM from the repository: parent inheritance, properties, dependency
+  management, BOM imports, and `<exclusions>`, which the expander already
+  honored but never received. Resolving malli picks up its five deps and their
+  transitives instead of nothing. The cost is one small `.pom` fetch per
+  dependency, cached in the local repository beside the jar.
+
+  A POM jolt can't model no longer sinks the resolution: an unfetchable `.pom`
+  (a hand-installed jar, an offline machine) or a version left `${unresolved}`
+  because it comes from a profile now warns and falls back to whatever the jar
+  packages. Grenadine checks every declared dependency before jolt filters by
+  scope, so a test-scoped dependency jolt discards anyway was enough to abort.
+
 - **`-Spath` prints the classpath and runs nothing**, like the clj CLI. It can
   come on either side of the alias options — `jolt -A:test:dev -Spath` and
   `jolt -Spath -M:test` both print the source roots that run would use, and
@@ -62,6 +79,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-dispatches to (`run`, `build`, `repl`, `nrepl-server`, a task, `-e`,
   `-M`/`-X`/`-T`) resolves for itself — so each `-A` invocation walked the whole
   dependency tree twice and printed any resolution warning twice with it.
+
+### Changed
+
+- **A deps.edn `:mvn/local-repo` now outranks the `JOLT_LOCAL_REPO`
+  environment variable**, matching how tools.deps treats explicit configuration.
+  `GRENADINE_LOCAL_REPOSITORY` sits between them as the shared environment
+  default; `JOLT_LOCAL_REPO` still works.
 
 ## [0.5.14] - 2026-08-01
 

@@ -77,4 +77,58 @@
          (ex-info "Jolt did not use Grenadine's effective POM or prune Clojure"
                   {:raw raw :filtered filtered}))))))
 
+;;;; A POM Grenadine cannot model degrades to the jar's own pom.xml rather than
+;;;; failing the whole resolution.
+
+(defn- deps-of
+  "effective-pom-deps for a lib whose POM text comes from `poms-by-coords`."
+  [poms-by-coords lib]
+  (with-redefs-fn
+    {(var jolt.deps/pom-text)
+     (fn [{:keys [group artifact version]}]
+       (or (get poms-by-coords [group artifact version])
+           (throw (ex-info (str "POM not found: " group "/" artifact " " version)
+                           {:type :jolt.deps/pom-not-found}))))}
+    (fn [] (@#'deps/effective-pom-deps lib {:mvn/version "1"}))))
+
+;; A jar sitting in the local repository without its .pom beside it — installed
+;; by hand, or fetched before the machine went offline. Its transitive deps are
+;; unknown, not a reason to abandon the resolution.
+(when-not (nil? (deps-of {} 'demo/unfetchable))
+  (throw (ex-info "an unfetchable POM should degrade to nil, not deps" {})))
+
+;; An unresolved ${property} anywhere in the POM — commonly a version defined
+;; only in a <profile>, and just as commonly on a test-scoped dependency jolt
+;; drops anyway. Grenadine asserts every declared coordinate before jolt gets to
+;; filter by scope, so the whole POM degrades.
+(when-not (nil? (deps-of
+                 {["demo" "unresolved" "1"]
+                  "<project>
+                     <modelVersion>4.0.0</modelVersion>
+                     <groupId>demo</groupId>
+                     <artifactId>unresolved</artifactId><version>1</version>
+                     <dependencies>
+                       <dependency>
+                         <groupId>junit</groupId><artifactId>junit</artifactId>
+                         <version>${junit.version}</version><scope>test</scope>
+                       </dependency>
+                     </dependencies>
+                   </project>"}
+                 'demo/unresolved))
+  (throw (ex-info "an unresolvable ${property} should degrade to nil, not deps" {})))
+
+;; ...and a degraded lib still reports whatever pom.xml its jar carries.
+(let [pom (str (System/getProperty "java.io.tmpdir") "/jolt-grenadine-fallback.xml")]
+  (spit pom "<project><dependencies>
+               <dependency>
+                 <groupId>demo</groupId><artifactId>packaged</artifactId>
+                 <version>3</version>
+               </dependency>
+             </dependencies></project>")
+  (let [children (@#'deps/children-of
+                  {:root "." :manifest :mvn :deps nil :pom pom})]
+    (when-not (= [['demo/packaged {:mvn/version "3"}]] (vec children))
+      (throw (ex-info "a degraded Maven dep should fall back to its jar's pom.xml"
+                      {:children children})))))
+
 (println "grenadine gate: passed")
