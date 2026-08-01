@@ -326,7 +326,9 @@
   {:suite "javastatic" :expr "(String. (.decode (Base64/getDecoder) (String. (.encode (Base64/getEncoder) (.getBytes \"hello\")))))" :expected "\"hello\""}
   {:suite "javastatic" :expr "(Integer/parseInt \"ff\" 16)" :expected "255"}
   {:suite "javastatic" :expr "(regex? (Pattern/compile \"a.c\"))" :expected "true"}
-  {:suite "javastatic" :expr "(.split (Pattern/compile \",\") \"a,b,c\")" :expected "(\"a\" \"b\" \"c\")"}
+  ;; String[], like the JVM — vec it to compare. Pattern.split used to answer a seq
+  ;; where String.split answered a vector; both are a real array now.
+  {:suite "javastatic" :expr "(vec (.split (Pattern/compile \",\") \"a,b,c\"))" :expected "[\"a\" \"b\" \"c\"]"}
   {:suite "javastatic" :expr "(do (require '[clojure.string :as s]) (s/replace \"a1b2\" (Pattern/compile \"[0-9]\") \"\"))" :expected "\"ab\""}
   {:suite "javastatic" :expr "(boolean (re-find (Pattern/compile \"^x\" Pattern/MULTILINE) \"y\\nx\"))" :expected "true"}
   {:suite "javastatic" :expr "(boolean (re-find (re-pattern (Pattern/quote \"a.c\")) \"za.cy\"))" :expected "true"}
@@ -497,6 +499,18 @@
   {:suite "str" :expr "(.replaceAll \"a_b_c\" \"_\" \"-\")" :expected "\"a-b-c\""}
   {:suite "str" :expr "(.replaceFirst \"a_b_c\" \"_\" \"-\")" :expected "\"a-b_c\""}
   {:suite "str" :expr "(vec (.split \"a,b,c\" \",\"))" :expected "[\"a\" \"b\" \"c\"]"}
+  ;; .split's limit, on both String and Pattern: >0 caps the parts and leaves the
+  ;; last one unsplit, 0 (and the 1-arg form) drops trailing empties, <0 keeps them.
+  ;; The limit used to be discarded, so splitting a key from a value that may itself
+  ;; contain the separator truncated the value at its first one.
+  {:suite "str" :expr "(vec (.split \"a:b:c\" \":\" 2))" :expected "[\"a\" \"b:c\"]"}
+  {:suite "str" :expr "(vec (.split \"q1,q2,,,\" \",\" -1))" :expected "[\"q1\" \"q2\" \"\" \"\" \"\"]"}
+  {:suite "str" :expr "(vec (.split \"q1,q2,,,\" \",\" 0))" :expected "[\"q1\" \"q2\"]"}
+  ;; an INTERIOR empty field survives; irregex-split used to collapse it
+  {:suite "str" :expr "(vec (.split \"a::b\" \":\"))" :expected "[\"a\" \"\" \"b\"]"}
+  {:suite "str" :expr "(vec (.split (java.util.regex.Pattern/compile \":\") \"a:b:c\" 2))" :expected "[\"a\" \"b:c\"]"}
+  {:suite "str" :expr "(vec (.split (java.util.regex.Pattern/compile \",\") \"q1,q2,,,\" -1))" :expected "[\"q1\" \"q2\" \"\" \"\" \"\"]"}
+  {:suite "str" :expr "(vec (.split (java.util.regex.Pattern/compile \":\") \"a::b\"))" :expected "[\"a\" \"\" \"b\"]"}
   {:suite "str" :expr "(.frobnicate \"abc\")" :expected :throws}
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/upper-case \"abc\"))" :expected "\"ABC\""}
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/lower-case \"ABC\"))" :expected "\"abc\""}
@@ -665,6 +679,19 @@
   {:suite "threads" :expr "(let [t (Thread. (fn [] nil))] (.join t) (.isAlive t))" :expected "false"}
   {:suite "threads" :expr "(let [t (Thread. (fn [] nil)) a (System/nanoTime)] (.join t 5000) (< (- (System/nanoTime) a) 1000000000))" :expected "true"}
   {:suite "threads" :expr "(try (.join (Thread. (fn [] nil)) -1) :no-throw (catch IllegalArgumentException e :iae))" :expected ":iae"}
+  ;; TimeUnit: nothing modeled it, so every (timeout, unit) method in the tree was
+  ;; uncallable AND silently discarded its timeout. Conversions truncate toward zero.
+  {:suite "threads" :expr "(.name java.util.concurrent.TimeUnit/SECONDS)" :expected "\"SECONDS\""}
+  {:suite "threads" :expr "(str java.util.concurrent.TimeUnit/MILLISECONDS)" :expected "\"MILLISECONDS\""}
+  {:suite "threads" :expr "(.toMillis java.util.concurrent.TimeUnit/SECONDS 5)" :expected "5000"}
+  {:suite "threads" :expr "(.toMinutes java.util.concurrent.TimeUnit/SECONDS 90)" :expected "1"}
+  ;; a latch nobody counts down: the bounded await must give up, not wait forever
+  {:suite "threads" :expr "(.await (java.util.concurrent.CountDownLatch. 1) 50 java.util.concurrent.TimeUnit/MILLISECONDS)" :expected "false"}
+  {:suite "threads" :expr "(let [l (java.util.concurrent.CountDownLatch. 1)] (.countDown l) (.await l 10 java.util.concurrent.TimeUnit/SECONDS))" :expected "true"}
+  ;; the unit is READ, not assumed to be milliseconds: 2 SECONDS must outlast a 200ms task
+  {:suite "threads" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor)] (.submit ex (fn [] (Thread/sleep 200))) (.shutdown ex) (.awaitTermination ex 10 java.util.concurrent.TimeUnit/SECONDS))" :expected "true"}
+  ;; a bounded Future/get throws TimeoutException instead of waiting out the task
+  {:suite "threads" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor) f (.submit ex (fn [] (Thread/sleep 30000)))] (try (.get f 50 java.util.concurrent.TimeUnit/MILLISECONDS) :no-throw (catch Throwable e :timeout)))" :expected ":timeout"}
   {:suite "telemetry" :expr "(clojure.string/starts-with? (jolt.host/scheme-version) \"Chez Scheme\")" :expected "true"}
   {:suite "telemetry" :expr "(let [m (jolt.host/machine-type)] [(string? m) (pos? (count m))])" :expected "[true true]"}
   ;; bytes-allocated reads the LIVE heap, so it only has to grow across an
@@ -810,6 +837,12 @@
   ;; function for tag error), so this pins the pr-str output shape directly.
   {:suite "ex-info #error readable" :expr "(pr-str (ex-info \"boom\" {:a 1}))" :expected "\"#error {\\n :cause \\\"boom\\\"\\n :data {:a 1}\\n :via [ {:type clojure.lang.ExceptionInfo :message \\\"boom\\\" :data {:a 1} :at nil}]\\n :trace []}\""}
   {:suite "proxy over an interface" :expr "(.call (proxy [java.util.concurrent.Callable] [] (call [] (* 6 7))))" :expected "42"}
+  ;; a proxy method with SEVERAL arities is written (name ([args] body) ([args] body)),
+  ;; the shape proxy accepts alongside the flat (name [args] body). Only the flat one
+  ;; was handled, so the grouped one handed reify a body expression where an arglist
+  ;; belonged and died in destructuring.
+  {:suite "proxy over an interface" :expr "(let [p (proxy [java.io.InputStream] [] (read ([] 65) ([b off len] 7)))] [(.read p) (.read p (byte-array 4) 0 4)])" :expected "[65 7]"}
+  {:suite "proxy over an interface" :expr "(let [p (proxy [java.io.InputStream] [] (read ([] 9)) (available ([] 3)))] [(.read p) (.available p)])" :expected "[9 3]"}
   ;; proxy-super takes a method NAME, not an expression: a body calling a super
   ;; method no var is named after (clojure.tools.logging's (proxy-super reset))
   ;; has to COMPILE — there is no superclass here, so it throws only if it runs.

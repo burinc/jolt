@@ -1079,11 +1079,11 @@
       (cond
         ((regex-t? obj)
          (cond ((string=? method-name "split")
-                ;; .split returns a String[] — a seq (prints
-                ;; (a b c), not a vector). re-split with no limit; drop trailing
-                ;; empties (JVM default).
-                (let ((parts (re-split (regex-t-irx obj) (car rest) #f)))
-                  (list->cseq (str-split-drop-trailing parts))))
+                ;; .split returns a String[] — a real array, the same shape
+                ;; String.split answers with. The optional second argument is the
+                ;; JVM's limit; it used to be dropped, so
+                ;; (.split COLON "user:pass:word" 2) split three ways.
+                (jvm-split-array (regex-t-irx obj) (car rest) (split-limit-arg rest 1)))
                ((string=? method-name "pattern") (regex-t-source obj))
                ((or (string=? method-name "toString")) (regex-t-source obj))
                ;; (.matcher pattern s) -> a Matcher (matcher-t) for stepping matches.

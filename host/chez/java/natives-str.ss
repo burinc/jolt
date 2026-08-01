@@ -292,8 +292,10 @@
     ((string=? method "matches") (if (irregex-match (str-irx (arg 0)) s) #t #f))
     ((string=? method "replaceAll") (irregex-replace/all (str-irx (arg 0)) s (arg 1)))
     ((string=? method "replaceFirst") (irregex-replace (str-irx (arg 0)) s (arg 1)))
+    ;; re-split, not irregex-split: irregex-split collapses an empty field, so
+    ;; ("a::b" ":") came back ("a" "b") where the JVM gives ("a" "" "b").
     ((string=? method "split")
-     (apply jolt-vector (str-split-drop-trailing (irregex-split (str-irx (arg 0)) s))))
+     (jvm-split-array (str-irx (arg 0)) s (split-limit-arg rest 1)))
     ;; universal object-methods that reach a string target (seed object-methods):
     ;; a thrown string / Exception. ctor (which keeps the message string) answers
     ;; getMessage with itself; equals is value equality.
@@ -388,6 +390,33 @@
                                       out
                                       (cons seg out)))))
                       (loop me me (cons (substring s last ms) out))))))))))
+
+;; JVM split semantics over re-split, shared by String.split and Pattern.split:
+;;   limit > 0   at most `limit` parts, the last left unsplit
+;;   limit = 0   split fully, trailing empty strings dropped — the 1-arg default
+;;   limit < 0   split fully, trailing empty strings KEPT
+;; Both methods used to discard the limit argument entirely, so `(.split "a:b:c" ":" 2)`
+;; came back three-way and every caller splitting a key from a value that may itself
+;; contain the separator (a URL header, a password, a status line's description) got
+;; the value truncated at its first separator.
+(define (jvm-split irx s limit)
+  (let ((parts (re-split irx s (and (fx>? limit 0) limit))))
+    (if (fx=? limit 0) (str-split-drop-trailing parts) parts)))
+
+;; The int limit of a .split call, defaulting to 0 (the 1-arg form).
+(define (split-limit-arg rest n)
+  (if (fx>? (length rest) n)
+      (let ((v (list-ref rest n))) (if (number? v) (exact (truncate v)) 0))
+      0))
+
+;; .split answers a String[], so hand back a real array — seqable, countable,
+;; nth-able and destructurable here exactly as an array is on the JVM. The two
+;; methods used to disagree about the surrogate for it: String.split returned a
+;; VECTOR and Pattern.split a SEQ, so the same split printed two different ways and
+;; compared equal to a vector through one and not the other. (natives-array.ss loads
+;; after this file; the reference resolves when the method runs.)
+(define (jvm-split-array irx s limit)
+  (make-jolt-array (na-list->backing (jvm-split irx s limit) 'object) 'object))
 
 ;; (str-split pat s [limit]) -> parts. Regex or literal separator; a positive
 ;; limit caps the part count (the unsplit tail kept), matching core-str-split.

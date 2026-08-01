@@ -2254,7 +2254,7 @@
   {:suite "regex / \\p property classes" :label "(?u) accepted" :expected "\"hi\"" :actual "(re-matches #\"(?u)^hi$\" \"hi\")" :portability :common}
   {:suite "regex / \\p property classes" :label "unknown class throws" :expected :throws :actual "(re-pattern \"\\p{Greek}\")" :portability :common}
   {:suite "regex / Pattern statics & String regex methods" :label "Pattern/compile is a regex" :expected "true" :actual "(regex? (Pattern/compile \"a.c\"))" :portability :jvm}
-  {:suite "regex / Pattern statics & String regex methods" :label "compiled .split" :expected "[\"a\" \"b\" \"c\"]" :actual "(.split (Pattern/compile \",\") \"a,b,c\")" :portability :jvm}
+  {:suite "regex / Pattern statics & String regex methods" :label "compiled .split" :expected "[\"a\" \"b\" \"c\"]" :actual "(vec (.split (Pattern/compile \",\") \"a,b,c\"))" :portability :jvm}
   {:suite "regex / Pattern statics & String regex methods" :label "str/replace w/ Pattern" :expected "\"ab\"" :actual "(do (require '[clojure.string :as s]) (s/replace \"a1b2\" (Pattern/compile \"[0-9]\") \"\"))" :portability :jvm}
   {:suite "regex / Pattern statics & String regex methods" :label "Pattern/MULTILINE ^" :expected "true" :actual "(boolean (re-find (Pattern/compile \"^x\" Pattern/MULTILINE) \"y\\nx\"))" :portability :jvm}
   {:suite "regex / Pattern statics & String regex methods" :label "Pattern/quote literal" :expected "true" :actual "(boolean (re-find (re-pattern (Pattern/quote \"a.c\")) \"za.cy\"))" :portability :jvm}

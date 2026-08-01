@@ -578,6 +578,38 @@ if ! printf '%s' "$read_err" | grep -q '^  at .*app/broke\.clj'; then
   echo "--- got ---"; echo "$read_err"; exit 1
 fi
 
+# A compile error names the line of the OFFENDING form, and prints no trace.
+#
+# The reporter can only do either when the throw carries a :jolt/error map, and
+# only the unresolved-symbol diagnostic built one. Everything else raised while
+# analyzing — an uncompilable form, a destructuring pattern the desugarer rejects,
+# a macro that threw expanding — arrived bare, so the report was the LOADER's
+# per-top-level-form position (a long defn's opening line) above thirty lines of
+# analyze-list/map-seq/seq->list internals naming nothing the reader can act on.
+# The bad pattern below sits on line 7 of an fn opening on line 3, so the two
+# positions are distinguishable.
+echo "build smoke: compile error names the offending form's line"
+badpos="$(dirname "$out")/badpos"; mkdir -p "$badpos/src/app"
+printf '{}\n' > "$badpos/deps.edn"
+{ echo '(ns app.core)'
+  echo ''
+  echo '(defn -main [& _]'
+  echo '  (println :a)'
+  echo '  (println :b)'
+  echo '  (println :c)'
+  echo '  (let [(a b) [1 2]]'
+  echo '    (println a b)))'
+} > "$badpos/src/app/core.clj"
+pos_err="$(JOLT_PWD="$badpos" "$joltabs" build -m app.core -o "$(dirname "$out")/badpos-bin" 2>&1 || true)"
+if ! printf '%s' "$pos_err" | grep -q '^  at .*app/core\.clj:7:'; then
+  echo "  FAIL: compile error did not name app/core.clj line 7 (the let it is in)"
+  echo "--- got ---"; echo "$pos_err"; exit 1
+fi
+if printf '%s' "$pos_err" | grep -q '^  trace:'; then
+  echo "  FAIL: compile error printed the analyzer's own frames"
+  echo "--- got ---"; echo "$pos_err"; exit 1
+fi
+
 # A set literal mixing an auto keyword with a plain one of the same alias text
 # must BUILD. ::o/x and :o/x are distinct, but the require scan reads in scan mode,
 # where an unresolved alias keeps its text, so both read as :o/x — and the
@@ -665,4 +697,4 @@ if [ "$got_split" != "$want" ] || [ "$got_split2" != "$want" ] || [ "$got_nospli
   exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + scan-alias-set + as-alias + flat-split + runtime-cache)"
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache)"

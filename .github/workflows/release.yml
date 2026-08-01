@@ -378,8 +378,17 @@ jobs:
           set -eu
           tgz="$(find . -name '*x86_64-linux.tar.gz' -print -quit)"
           [ -n "$tgz" ] || { echo "no linux tarball in the artifact"; exit 1; }
-          tar -xzf "$tgz" -C .
-          bin="$(find . -type f -name jolt -perm -u+x -print -quit)"
+          # Into a directory of its own, and searched there and NOWHERE else: this
+          # workspace also holds the jolt checkout, whose bin/jolt is an executable
+          # file named `jolt` too. Unpacking into `.` and searching `.` let the
+          # traversal decide which one won, and the extracted directory carries the
+          # VERSION in its name, so the order flipped from one release to the next —
+          # v0.5.16 picked up the checkout's dev launcher and every fleet gate died
+          # on "No valid Chez Scheme executable found" against a perfectly good
+          # binary.
+          mkdir -p unpacked
+          tar -xzf "$tgz" -C unpacked
+          bin="$(find unpacked -type f -name jolt -perm -u+x -print -quit)"
           [ -n "$bin" ] || { echo "no jolt binary in $tgz"; exit 1; }
           mv "$bin" ./jolt-bin
           ./jolt-bin --version
@@ -429,8 +438,14 @@ jobs:
         run: |
           set -eu
           tgz="$(find . -name '*x86_64-linux.tar.gz' -print -quit)"
-          tar -xzf "$tgz" -C .
-          mv "$(find . -type f -name jolt -perm -u+x -print -quit)" ./jolt-bin
+          [ -n "$tgz" ] || { echo "no linux tarball in the artifact"; exit 1; }
+          # Own directory, searched there only — see the fleet job above: the jolt
+          # checkout in this workspace also has an executable file named `jolt`.
+          mkdir -p unpacked
+          tar -xzf "$tgz" -C unpacked
+          bin="$(find unpacked -type f -name jolt -perm -u+x -print -quit)"
+          [ -n "$bin" ] || { echo "no jolt binary in $tgz"; exit 1; }
+          mv "$bin" ./jolt-bin
           ./jolt-bin --version
       - run: |
           sudo apt-get update
@@ -479,8 +494,14 @@ jobs:
         run: |
           set -eu
           tgz="$(find . -name '*x86_64-linux.tar.gz' -print -quit)"
-          tar -xzf "$tgz" -C .
-          mv "$(find . -type f -name jolt -perm -u+x -print -quit)" ./jolt-bin
+          [ -n "$tgz" ] || { echo "no linux tarball in the artifact"; exit 1; }
+          # Own directory, searched there only — see the fleet job above: the jolt
+          # checkout in this workspace also has an executable file named `jolt`.
+          mkdir -p unpacked
+          tar -xzf "$tgz" -C unpacked
+          bin="$(find unpacked -type f -name jolt -perm -u+x -print -quit)"
+          [ -n "$bin" ] || { echo "no jolt binary in $tgz"; exit 1; }
+          mv "$bin" ./jolt-bin
           ./jolt-bin --version
       - name: Install system deps
         run: |

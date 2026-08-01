@@ -1286,6 +1286,20 @@
         (for-each (lambda (p) (guard (e (#t #f)) (delete-file (car p))))
                   (list-tail (sort (lambda (a b) (time>? (cdr a) (cdr b))) fs)
                              bld-runtime-cache-keep))))))
+;; Remove an existing output before writing the new one, so the new binary lands on
+;; a FRESH inode.
+;;
+;; macOS caches a code-signature verdict per vnode. Rewriting an executable in place
+;; leaves the stale verdict attached to it, and the kernel then SIGKILLs the next run
+;; with no output whatsoever — `Killed: 9`, exit 137, nothing on stderr. A
+;; rebuild-and-run loop over one output path (the build smoke; anyone iterating on an
+;; app) therefore works a handful of times and then starts dying for no visible
+;; reason, on a binary that runs fine the moment it is built somewhere else.
+;;
+;; It also means a failed link leaves no output rather than a half-overwritten one.
+(define (bld-clear-output! out-path)
+  (when (file-exists? out-path) (delete-file out-path)))
+
 (define (bld-copy-file! from to)
   (let ((bs (read-file-bytes from)))
     (let ((out (open-file-output-port to (file-options no-fail))))
@@ -1353,6 +1367,7 @@
     ;; natives it's the prebuilt one bundled in jolt (no cc needed); with :static
     ;; natives it's re-linked here from the bundled kernel + launcher source so the
     ;; archives are baked in and their symbols resolve in the running binary.
+    (bld-clear-output! out-path)
     (if (> (string-length native-link) 0)
         (bld-relink-stub builddir native-link out-path)
         (jolt-spill-embedded! "stub/launcher" out-path))
@@ -1428,6 +1443,7 @@
   ;; -rdynamic (Linux) exports the executable's symbols into the dynamic table so
   ;; a statically-linked native lib's symbols resolve via (load-shared-object #f)
   ;; at startup. macOS keeps unstripped executable symbols dlsym-visible already.
+  (bld-clear-output! out-path)
   (bld-system (string-append
     (bld-cc) " " (bld-arch-flag) " -O2 " (if (> (string-length native-link) 0) (bld-export-symbols-flag) "")
     "-I'" (bld-csv-dir) "' '" main-c "' '" (bld-csv-dir) "/libkernel.a' "
@@ -1504,6 +1520,7 @@
     (let ((p (open-output-file lc 'replace)))
       (put-string p (bld-library-stub))
       (close-port p))
+    (bld-clear-output! out-path)
     (bld-system (string-append
       "cc -O2 -fPIC "
       ;; -install_name @rpath/<base> so a binary that link-edits against the dylib

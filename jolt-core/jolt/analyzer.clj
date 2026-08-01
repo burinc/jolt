@@ -1061,8 +1061,43 @@
       node
       (invoke (var-ref "clojure.core" "with-meta") [node (analyze ctx m env)]))))
 
+;; Anything raised while analyzing a form is a COMPILE-time failure, and the
+;; reporter can only tell — and only knows where to point — when the throw carries
+;; a :jolt/error map. With one it names the innermost positioned form and drops the
+;; analyzer's own recursion from the trace; without one it falls back to the
+;; LOADER's per-top-level-form position and prints thirty lines of jolt internals.
+;; resolve-error was the only thing that built one, so every other compile failure
+;; — an uncompilable form, a destructuring pattern the desugarer rejects, a macro
+;; that threw while expanding — reported the top-level form's opening line over a
+;; trace naming nothing the reader can act on.
+;;
+;; Attaching it here, at the one entry every top-level analysis goes through, costs
+;; a single try per top-level form and covers all of them. A throw that already
+;; carries :jolt/error passes through untouched: it knows its own position better.
+(defn- analysis-diagnostic? [e]
+  (let [d (ex-data e)] (and (some? d) (contains? d :jolt/error))))
+
+(defn- throw-message [e]
+  (cond (string? e) e
+        ;; an ex-info reports as its message alone; anything else keeps the
+        ;; "java.lang.Foo: msg" text the reporter would have printed for it
+        (some? (ex-data e)) (ex-message e)
+        :else (str e)))
+
+;; No position to add (a macro-built form, or a form handed straight to eval) means
+;; nothing to improve on, so leave the throw exactly as it was rather than trading
+;; its trace for a diagnostic that says no more than the fallback already does.
+(defn- as-analysis-diagnostic [e]
+  (let [pos (current-form-position)]
+    (if (or (nil? pos) (analysis-diagnostic? e))
+      e
+      (ex-info (throw-message e) {:jolt/error (merge {:type :analysis-error} pos)}))))
+
 (defn analyze
-  ([ctx form] (analyze ctx form (empty-env)))
+  ([ctx form]
+   (try
+     (analyze ctx form (empty-env))
+     (catch Throwable e (throw (as-analysis-diagnostic e)))))
   ([ctx form env]
    (cond
      (form-literal? form) (const form)
