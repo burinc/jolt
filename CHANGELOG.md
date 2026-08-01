@@ -75,6 +75,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`.toAbsolutePath` was a no-op on a relative path in a built binary, so every
+  `fs/glob` under a relative root came back unusable.** A user-facing relative path
+  resolves against user.dir, which is `JOLT_PWD` → `PWD` → `"."` — the chain
+  `System/getProperty "user.dir"` answers with. `project-relative` implemented only
+  the first link, and `JOLT_PWD` is exported by `bin/jolt` but by nothing in a built
+  binary, which never cd's away and so needs none. There the path came back
+  unresolved, `jfile-abs` returned a relative string in defiance of its own
+  contract, and babashka.fs's `match` — which relativizes each result against
+  `(absolutize "")` whenever the glob root is relative — subtracted an absolute cwd
+  from a relative entry: `(fs/glob "examples" "**")` yielded
+  `../../../../examples/sample.clj`. Nothing threw; every subsequent open just
+  missed. `project-relative` and `jfile-abs` now share one `jolt-user-dir` helper,
+  so neither can implement half the chain again.
+
+  The dev launcher masked this end to end — it always exports `JOLT_PWD`, so no
+  `bin/jolt` run could reproduce it — and `test/chez/fs-test.clj` rooted every case
+  at an absolute temp dir, so the one gate that runs a built binary never exercised
+  a relative path. It now asserts that a relative path absolutizes under user.dir
+  and that `relativize` undoes `absolutize`, the round-trip `match` performs.
+
 - **A sub-process that could not be waited on hung the caller forever.** The reap
   loop retried on any `waitpid` failure, including `ECHILD` — the child already
   reaped by something else, which no number of retries changes. The loop holds the
