@@ -18,9 +18,13 @@ executable) and need only the base system libraries:
 - **macOS arm64**: macOS 14+.
 - Anything else (Intel Mac, musl/Alpine, older glibc): build from source.
 
-Building from source needs only [Chez Scheme](https://cisco.github.io/ChezScheme/)
-(the gate invokes it as `chez`) and a C compiler. The conformance gate
-additionally uses Clojure on the JVM as an oracle, but running jolt does not.
+`make build` provisions [Chez Scheme](https://cisco.github.io/ChezScheme/) and a
+C compiler locally through [Makes](https://github.com/makeplus/makes), then
+builds the standalone binary. An explicit `CHEZ=/path/to/chez` (or
+`CHEZSCHEME=/path/to/scheme`) is authoritative and bypasses local provisioning;
+release builders use this to retain their threaded Chez and platform toolchain.
+The conformance gate additionally uses Clojure on the JVM as an optional oracle,
+but running jolt does not.
 
 ### Dependency resolution
 
@@ -75,8 +79,9 @@ Then `jolt -e '(+ 1 2)'`. To run from source instead (needs Chez), see
 
 ## Build
 
-There is no build step. The bootstrap seed (`host/chez/seed/{prelude,image}.ss`)
-is checked in, so a fresh clone runs immediately:
+Running from source has no build step. The bootstrap seed
+(`host/chez/seed/{prelude,image}.ss`) is checked in, so a fresh clone runs
+immediately:
 
 ```bash
 git clone --recurse-submodules https://github.com/jolt-lang/jolt.git
@@ -263,21 +268,25 @@ same Chez kernel development files + C compiler are required to link.
 
 ## Standalone jolt binary
 
-`make` builds jolt itself into a single self-contained native binary — the
-runtime, compiler, `jolt-core`/`stdlib` source, and the Chez boots are baked in,
-so the result runs and `build`s jolt apps on a machine with neither Chez nor a C
-compiler. Build it on a host that *does* have both.
+`make` (or `make build`) installs the build dependencies locally through Makes
+and builds jolt itself into a single self-contained native binary. The runtime,
+compiler, `jolt-core`/`stdlib` source, and the Chez boots are baked in, so the
+result runs and `build`s jolt apps on a machine with neither Chez nor a C
+compiler.
 
 ```bash
-make jolt-release             # => target/release/jolt (optimize-level 3, compressed)
+make build                    # => target/release/jolt (optimize-level 3, compressed)
+make install                  # => ~/.local/bin/jolt, or /usr/local/bin/jolt as root
+make install PREFIX=/opt/jolt # explicitly override the installation prefix
+make jolt-release             # force-rebuild the release binary
 make jolt-debug               # => target/debug/jolt   (optimize-level 0, inspector + debug info)
 make jolt                     # re-mint the seed first, then both
 ```
 
 `make jolt` re-mints the seed so the embedded compiler image is current before
-linking; use `jolt-release`/`jolt-debug` directly to skip that when the seed is
-already minted. Like `build`, both require Chez's kernel development files
-(`libkernel.a`, `scheme.h`) and a C compiler.
+linking; `jolt-release`/`jolt-debug` force their respective builds without
+re-minting. `make clean` removes build products; `make distclean` also removes
+the locally provisioned Makes toolchain.
 
 ## Architecture
 
