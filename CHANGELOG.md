@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rand`, `rand-int`, `Math/random` and `random-uuid` now differ between
+  processes and between threads.** Chez starts its PRNG from a fixed seed and
+  keeps the state per thread, so every jolt process replayed one identical
+  stream and every forked thread restarted it from the top. Two unrelated
+  processes agreed on every "random" value, and eight threads in one process
+  drew eight identical UUIDs. Clojure runs these off a process-global
+  `java.util.Random` seeded from the clock; jolt now seeds lazily on first draw
+  per thread, from the clock mixed with pid, thread id and a counter.
+
+- **`(java.util.Random.)` with no seed never worked.** It seeded from
+  `(truncate (current-time))`, and `current-time` answers a time object rather
+  than a number, so the no-arg constructor always threw. Seeded instances were
+  unaffected and still reproduce the JVM's exact LCG stream.
+
 ## [0.5.17] - 2026-08-01
 
 Gaps and wrong answers on the `java.lang.String` surface, found by probing it after

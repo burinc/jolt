@@ -531,7 +531,7 @@
 ;; LOCK ORDER: channel mu → fmu → wmu. Never hold two channel mutexes at once.
 (define (jolt-async-do-alts ports priority?)
   (let* ((n (pvec-count ports))
-         (start (if (jolt-truthy? priority?) 0 (random n)))
+         (start (if (jolt-truthy? priority?) 0 (jolt-random n)))
          (idx-of (lambda (k) (let ((m (fx+ start k))) (if (fx<? m n) m (fx- m n))))))
     ;; FAST PASS: one non-blocking attempt per op, no handler. Consumption here IS
     ;; the alts result, so consuming directly is correct on this pass only.

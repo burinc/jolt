@@ -11,7 +11,7 @@
 (define (jolt-uuid-pred? x) (juuid? x))
 
 (define hexd "0123456789abcdef")
-(define (rand-hex) (string-ref hexd (random 16)))
+(define (rand-hex) (string-ref hexd (jolt-random 16)))
 ;; v4: 8-4-4-4-12, version nibble (index 14) = 4, variant nibble (index 19) in 8-b.
 (define (random-uuid-str)
   (let ((cs (make-string 36)))
@@ -21,7 +21,7 @@
             (string-set! cs i
               (cond ((or (fx=? i 8) (fx=? i 13) (fx=? i 18) (fx=? i 23)) #\-)
                     ((fx=? i 14) #\4)
-                    ((fx=? i 19) (string-ref "89ab" (random 4)))
+                    ((fx=? i 19) (string-ref "89ab" (jolt-random 4)))
                     (else (rand-hex))))
             (loop (fx+ i 1)))))))
 (define (jolt-random-uuid) (make-juuid (random-uuid-str)))

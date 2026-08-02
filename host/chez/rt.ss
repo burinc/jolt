@@ -816,6 +816,46 @@
 ;; jolt-pr-str/jolt-str-join) + seq.ss (jolt-invoke).
 (load "host/chez/printing.ss")
 
+;; --- randomness -------------------------------------------------------------
+;; Chez's PRNG starts every thread from the SAME fixed seed, and the state is
+;; per-thread rather than shared. Both halves of that diverge from Clojure, where
+;; rand/rand-int/Math.random run off one process-global java.util.Random seeded
+;; from the clock:
+;;
+;;   - across processes, every jolt run replayed one identical stream, so two
+;;     unrelated processes agreed on every "random" value — including every
+;;     random-uuid, so a fleet minted colliding UUIDs;
+;;   - across threads, each forked thread restarted that same stream from the
+;;     top, so N request threads drew N identical values in ONE process.
+;;
+;; Seeding lazily on first use covers both: a thread that never draws pays
+;; nothing, and one that does is seeded before its first value. Seed from the
+;; clock (as the JVM does) mixed with pid and thread id so two threads starting
+;; inside the same nanosecond still diverge, and a counter so that even a
+;; coarse clock cannot hand out one seed twice.
+(define random-seeded? (make-thread-parameter #f))
+(define random-seed-counter 0)
+(define random-seed-mutex (make-mutex))
+
+(define (seed-random!)
+  (let* ((t (current-time 'time-utc))
+         (n (with-mutex random-seed-mutex
+              (set! random-seed-counter (+ random-seed-counter 1))
+              random-seed-counter))
+         (mix (bitwise-xor (time-nanosecond t)
+                           (* 1000000007 (time-second t))
+                           (* 2654435761 (get-process-id))
+                           (* 40503 (get-thread-id))
+                           (* 2246822519 n))))
+    ;; random-seed's domain is 1 .. 2^32-1
+    (random-seed (+ 1 (modulo mix 4294967294)))
+    (random-seeded? #t)))
+
+;; Every jolt-level draw goes through this, never `random` directly.
+(define (jolt-random n)
+  (unless (random-seeded?) (seed-random!))
+  (random n))
+
 ;; collection constructors + rand: bind the public
 ;; clojure.core names hash-map/hash-set/array-map/set/rand to the existing
 ;; pmap/pset ctors. After collections.ss (the ctors) + seq.ss (seq->list).
