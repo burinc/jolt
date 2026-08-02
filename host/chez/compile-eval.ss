@@ -184,16 +184,25 @@
 ;; push is baked in at compile time, only code compiled after this call is traced —
 ;; which is exactly the code you eval / reload in a live session.
 (def-var! "jolt.host" "enable-trace!" jolt-enable-trace!)
-;; Explicit opt-in for a whole run (JOLT_TRACE=1): turn tracing on BEFORE any app
-;; namespace is compiled, so a plain `-M:run` traces the app's own code too. Called
-;; from the runtime entrypoints (cli.ss, and the built jolt launcher) — NOT at load
-;; time: a built jolt runs top-level forms at heap-build time, where JOLT_TRACE is
-;; always unset, so a load-time check would never see the user's runtime env. Only an
-;; affirmative value (set, non-empty, not falsey) forces it on.
+;; Turn tracing on for a whole run, BEFORE any app namespace is compiled, so the
+;; app's own code carries the entry prologue. Called from the runtime entrypoints
+;; (cli.ss, and the built jolt launcher) — NOT at load time: a built jolt runs
+;; top-level forms at heap-build time, where JOLT_TRACE is always unset, so a
+;; load-time check would never see the user's runtime env.
+;;
+;; ON BY DEFAULT on this path — running from source is the develop-and-debug path,
+;; and without the history a tail call chain reports no location at all: TCO erases
+;; the frames, so the common shape (-main tail-calls a fn that throws) left the
+;; reporter with an empty continuation and nothing to name. Set JOLT_TRACE=0 to opt
+;; out. The cost is a per-entry ring push in code compiled at runtime; core is not
+;; affected (the seed prelude is already compiled), which is why a seq/string/map
+;; workload measures the same either way. It is only visible in code that is almost
+;; entirely user-level calls — a fib microbenchmark pays ~7x, which is the case to
+;; set JOLT_TRACE=0 for. A `jolt build` binary is unaffected: its prologues are
+;; baked at build time, so this runtime switch cannot add them.
 (define (jolt-trace-init-from-env!)
-  (let ((e (getenv "JOLT_TRACE")))
-    (when (and e (fx>? (string-length e) 0) (not (jolt-trace-env-off? e)))
-      (jolt-enable-trace!))))
+  (unless (jolt-trace-env-off? (getenv "JOLT_TRACE"))
+    (jolt-enable-trace!)))
 
 ;; (with-meta sym m) -> sym, else x — an (ns ^:no-doc name …) yields the name with
 ;; reader metadata as a with-meta form; strip it to read the bare ns symbol.

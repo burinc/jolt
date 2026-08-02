@@ -25,6 +25,10 @@
 ;; registries (host-static.ss), and after host-static-methods.ss (all-env-pairs).
 
 ;; --- libc entry points -------------------------------------------------------
+;; Only ever called WNOHANG (see proc-wait-blocking): a blocking waitpid parks in
+;; the kernel, where SIGCHLD=SIG_IGN can hold it indefinitely, and a plain foreign
+;; call also keeps the thread "active" for the stop-the-world collector while it
+;; waits. Polling sidesteps both.
 (define proc-waitpid (jolt-foreign-proc-safe "waitpid" '(int void* int) 'int))
 (define proc-kill    (jolt-foreign-proc-safe "kill"    '(int int)       'int))
 ;; libc signal(2). Named apart from the proc-signal recorder further down — this
@@ -395,21 +399,37 @@
 ;; caller is willing to wait. That is what sat on a CI gate for 3h42m (jolt-pgbh):
 ;; a waitpid failing with ECHILD fell into the `else` retry, which could never
 ;; succeed. Only EINTR is retried, because only EINTR means "ask again".
+;;
+;; POLLS with WNOHANG rather than issuing a blocking waitpid, because a blocking
+;; one can park in the KERNEL forever, where no amount of care in this loop
+;; reaches it: when SIGCHLD is SIG_IGN, POSIX has wait block until EVERY child has
+;; terminated before failing with ECHILD, and a child that became a zombie before
+;; the disposition changed leaves it parked indefinitely. A program that sets
+;; SIG_IGN itself, or inherits it, then called .waitFor and hung with the whole
+;; process at 0% CPU — the same shape as jolt-pgbh, one level lower down.
+;; proc-wait-timed already polls for exactly this reason; this is the last caller
+;; that did not. Backs off 0.2ms -> 10ms so a short-lived child is still reaped
+;; promptly while a long-lived one costs ~100 wakeups a second.
+(define proc-poll-step-max (* 10 1000000))       ; 10ms, in nanoseconds
 (define (proc-wait-blocking st)
   (let ((code
           (with-mutex (proc-p-mutex st)
             (or (unbox (proc-p-exit-box st))
-                (let loop ()
-                  (call-with-values (lambda () (proc-waitpid-once (proc-p-pid st) #f))
+                (let loop ((step 200000))        ; 0.2ms
+                  (call-with-values (lambda () (proc-waitpid-once (proc-p-pid st) #t))
                     (lambda (rc decoded err)
                       (cond
                         ((and decoded (= rc (proc-p-pid st)))
                          (set-box! (proc-p-exit-box st) decoded) decoded)
                         ;; another caller reaped it between our check and our wait
                         ((unbox (proc-p-exit-box st)))
-                        ;; interrupted by a signal: the child may well still be
-                        ;; running, so this is the one case worth asking again.
-                        ((and (< rc 0) (= err proc-EINTR)) (loop))
+                        ;; still running (WNOHANG rc = 0), or merely interrupted:
+                        ;; both mean "ask again", after a short wait.
+                        ((or (= rc 0) (and (< rc 0) (= err proc-EINTR)))
+                         (sleep (make-time 'time-duration step 0))
+                         (loop (if (< step proc-poll-step-max)
+                                   (min proc-poll-step-max (* step 2))
+                                   proc-poll-step-max)))
                         ;; unwaitable (ECHILD) or waitpid unavailable — no number of
                         ;; retries changes that.
                         (else (let ((c (proc-lost-status st)))

@@ -1447,15 +1447,11 @@
       ;; java.lang.Throwable interop over a Chez condition. A jolt host error
       ;; (`error`/`assertion-violationf`) raises a Chez condition; Clojure code
       ;; that catches it as a Throwable reads (.getMessage e) / (.toString e).
+      ;; The surface itself is the ONE shared Throwable table (throwable-method,
+      ;; records-interop.ss), so a raw condition and an ex-info answer exactly the
+      ;; same set of methods — restating them here is what let the two drift.
       ((condition? obj)
-       (cond ((or (string=? method-name "getMessage") (string=? method-name "getLocalizedMessage"))
-              (condition->message-string obj))
-             ((string=? method-name "toString") (condition->message-string obj))
-             ((string=? method-name "getCause") jolt-nil)
-             ;; java.sql.SQLException chaining — jolt errors don't chain (nil).
-             ((string=? method-name "getNextException") jolt-nil)
-             ((string=? method-name "getStackTrace") (jolt-vector))
-             ((string=? method-name "printStackTrace") jolt-nil)
+       (cond ((throwable-method obj method-name rest) => car)
              (else (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name " on Throwable")))))
       ;; java.lang.Character interop: (.toString \+) -> "+", etc.
       ((char? obj)

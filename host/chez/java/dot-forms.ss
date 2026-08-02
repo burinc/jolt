@@ -134,14 +134,13 @@
 ;; #f. Strings/numbers/records/jhost keep the base dispatcher (it shims them).
 (define (dot-object-method obj name args)
   (cond
-    ((string=? name "getMessage")
-     (list (if (jolt-ex-info-record? obj)
-               (jolt-ex-info-record-message obj)
-               (jolt-str-render-one obj))))
-    ((string=? name "getCause")  (list (if (jolt-ex-info-record? obj) (jolt-ex-info-record-cause obj) jolt-nil)))
-    ;; java.text.ParseException.getErrorOffset — the int offset stashed by its ctor.
-    ((string=? name "getErrorOffset") (list (if (jolt-ex-info-record? obj) (jolt-ex-info-record-error-offset obj) 0)))
-    ;; java.sql.SQLException chaining — ex-info / host throwables don't chain.
+    ;; A throwable answers the full java.lang.Throwable surface from the one shared
+    ;; table (records-interop.ss) — the same one the raw-condition path uses.
+    ((and (jolt-ex-info-record? obj) (throwable-method obj name args)) => values)
+    ;; getMessage/toString on a plain map: legacy exception-as-map interop, kept
+    ;; because a non-record map reaches this table too.
+    ((string=? name "getMessage") (list (jolt-str-render-one obj)))
+    ((string=? name "getCause")  (list jolt-nil))
     ((string=? name "getNextException") (list jolt-nil))
     ((string=? name "getStackTrace") (list (jolt-vector)))
     ((string=? name "toString")  (list (jolt-str-render-one obj)))

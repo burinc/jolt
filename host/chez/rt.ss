@@ -218,8 +218,13 @@
 ;; target that has no entry prologue (a core/native fn, an anonymous fn held in a
 ;; var) does not consume the mark, so a following non-tail frame can be mislabeled
 ;; as a tail rotation — a cosmetic mis-grouping in the trace, never a wrong result.
-(define jolt-trace-outer-size 48)          ; ribs (non-tail spine depth kept)
-(define jolt-trace-inner-size 6)           ; tail-calls kept per subproblem
+;; Both sizes are POWERS OF TWO so every ring wrap is an fxand against size-1. They
+;; are on the per-call path (two wraps per push), where fxmod against 48/6 compiled
+;; to real division and cost more than the rest of the push put together.
+(define jolt-trace-outer-size 64)          ; ribs (non-tail spine depth kept)
+(define jolt-trace-outer-mask 63)
+(define jolt-trace-inner-size 8)           ; tail-calls kept per subproblem
+(define jolt-trace-inner-mask 7)
 ;; A history: #(ribs-vector outer-head outer-count). A rib: #(name-vector head count).
 (define (jolt-make-rib) (vector (make-vector jolt-trace-inner-size #f) 0 0))
 (define (jolt-make-history)
@@ -230,28 +235,51 @@
     (vector ribs 0 0)))
 ;; A global switch (all threads) plus a per-thread ring, lazily created on first
 ;; use — so code run on a spawned thread (a future/agent) records into ITS OWN
-;; history, not the enabling thread's (make-thread-parameter hands a new thread the
-;; initial #f, so we can't rely on inheritance).
+;; history rather than racing the enabling thread's. A new thread inherits no ring
+;; either way, so the lazy create is what gives it one.
 (define jolt-trace-on? #f)
-(define jolt-trace-ring (make-thread-parameter #f))
-(define jolt-trace-tail? (make-thread-parameter #f))   ; caller-set, consumed per entry
-(define (jolt-trace-enable!) (set! jolt-trace-on? #t) (jolt-trace-ring (jolt-make-history)))
+;; Per-thread trace state lives in Chez VIRTUAL REGISTERS, not thread parameters.
+;; This is a hot path — the emitter puts a push in every compiled fn's prologue and
+;; a mark before every tail call — and a thread-parameter WRITE costs ~32ns against
+;; ~1ns for a virtual-register write (measured, Chez 10.4 arm64). The two writes per
+;; call that shape implies were ~70% of the whole tracing overhead, which is what
+;; kept tracing opt-in. Reads are ~2.4ns vs ~3.3ns, a smaller but free win.
+;;
+;; Virtual registers are a fixed global resource: (virtual-register-count) slots for
+;; the whole process (16 on every platform jolt targets). jolt claims two, allocated
+;; here so the assignment is in one place; nothing else in the runtime uses them.
+;; A freshly forked thread starts every slot at fixnum 0, NOT #f — so "no ring yet"
+;; is tested with vector?, never with a truthiness check.
+(define jolt-vreg-trace-ring 0)
+(define jolt-vreg-trace-tail 1)
+(define (jolt-trace-ring) (let ((h (virtual-register jolt-vreg-trace-ring))) (and (vector? h) h)))
+(define (jolt-trace-ring-set! h) (set-virtual-register! jolt-vreg-trace-ring h))
+(define (jolt-trace-tail?) (eq? (virtual-register jolt-vreg-trace-tail) #t))
+(define (jolt-trace-enable!) (set! jolt-trace-on? #t) (jolt-trace-ring-set! (jolt-make-history)))
 ;; this thread's ring, created on demand while tracing is on
 (define (jolt-trace-cur-ring)
   (or (jolt-trace-ring)
-      (and jolt-trace-on? (let ((h (jolt-make-history))) (jolt-trace-ring h) h))))
+      (and jolt-trace-on? (let ((h (jolt-make-history))) (jolt-trace-ring-set! h) h))))
 ;; Drop accumulated history at a top-level boundary (compile-eval.ss calls this per
 ;; top-level form) so an error's trace shows only the forms that led to it, not the
 ;; frames of earlier, already-returned REPL/eval forms.
+;; Clears IN PLACE — emptying the outer ring is enough, because a rib is reset by
+;; jolt-history-nontail! before it is written and the reader only walks the live
+;; outer count. Reallocating instead would build 64 ribs on every top-level form,
+;; which is every def in every namespace a run loads.
 (define (jolt-trace-reset!)
-  (when (jolt-trace-ring) (jolt-trace-ring (jolt-make-history)) (jolt-trace-tail? #f)))
-(define (jolt-trace-mark! t) (jolt-trace-tail? t))
+  (let ((h (jolt-trace-ring)))
+    (when h
+      (vector-set! h 1 0)
+      (vector-set! h 2 0)
+      (set-virtual-register! jolt-vreg-trace-tail #f))))
+(define (jolt-trace-mark! t) (set-virtual-register! jolt-vreg-trace-tail t))
 
 ;; push name into a rib's inner ring
 (define (jolt-rib-push! rib name)
   (let ((buf (vector-ref rib 0)) (i (vector-ref rib 1)) (cnt (vector-ref rib 2)))
     (vector-set! buf i name)
-    (vector-set! rib 1 (fxmod (fx+ i 1) jolt-trace-inner-size))
+    (vector-set! rib 1 (fxand (fx+ i 1) jolt-trace-inner-mask))
     (when (fx<? cnt jolt-trace-inner-size) (vector-set! rib 2 (fx+ cnt 1)))))
 ;; a non-tail entry: advance the outer ring, reset the new rib, seed it with name
 (define (jolt-history-nontail! h name)
@@ -259,15 +287,15 @@
          (rib (vector-ref ribs oh)))
     (vector-set! rib 1 0) (vector-set! rib 2 0)
     (jolt-rib-push! rib name)
-    (vector-set! h 1 (fxmod (fx+ oh 1) jolt-trace-outer-size))
+    (vector-set! h 1 (fxand (fx+ oh 1) jolt-trace-outer-mask))
     (when (fx<? oc jolt-trace-outer-size) (vector-set! h 2 (fx+ oc 1)))))
 ;; a tail entry: rotate the CURRENT rib's inner ring (bootstrap a rib if none yet)
 (define (jolt-history-tail! h name)
   (if (fx=? (vector-ref h 2) 0)
       (jolt-history-nontail! h name)
       (let* ((ribs (vector-ref h 0))
-             (cur (fxmod (fx+ (fx- (vector-ref h 1) 1) jolt-trace-outer-size)
-                         jolt-trace-outer-size)))
+             (cur (fxand (fx+ (fx- (vector-ref h 1) 1) jolt-trace-outer-size)
+                         jolt-trace-outer-mask)))
         (jolt-rib-push! (vector-ref ribs cur) name))))
 ;; Record a frame entry, routed by the caller's tail mark; then reset the mark so a
 ;; subsequent entry reached WITHOUT a mark (e.g. via apply) defaults to non-tail.
@@ -275,7 +303,7 @@
   (let ((h (jolt-trace-cur-ring)))
     (when h
       (if (jolt-trace-tail?) (jolt-history-tail! h name) (jolt-history-nontail! h name))
-      (jolt-trace-tail? #f)))
+      (set-virtual-register! jolt-vreg-trace-tail #f)))
   jolt-nil)
 
 ;; a rib's inner names, most-recent (deepest) tail first
@@ -285,8 +313,8 @@
       (if (fx>? k cnt)
           (reverse acc)
           (loop (fx+ k 1)
-                (cons (vector-ref buf (fxmod (fx+ (fx- head k) jolt-trace-inner-size)
-                                             jolt-trace-inner-size))
+                (cons (vector-ref buf (fxand (fx+ (fx- head k) jolt-trace-inner-size)
+                                             jolt-trace-inner-mask))
                       acc))))))
 ;; The whole history flattened to frame-names, most-recent (deepest) first:
 ;; current rib's tail-history, then its non-tail caller's, and so on outward.
@@ -297,7 +325,7 @@
           (let loop ((k 1) (acc '()))
             (if (fx>? k oc)
                 (apply append (reverse acc))
-                (let ((idx (fxmod (fx+ (fx- oh k) jolt-trace-outer-size) jolt-trace-outer-size)))
+                (let ((idx (fxand (fx+ (fx- oh k) jolt-trace-outer-size) jolt-trace-outer-mask)))
                   (loop (fx+ k 1) (cons (jolt-rib-names (vector-ref ribs idx)) acc)))))))))
 
 (define-condition-type &jolt-throw &condition
