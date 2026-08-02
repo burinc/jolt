@@ -1,8 +1,9 @@
-;; Dependency-expansion unit tests: the fake in-memory coordinate type and the
-;; test cases are taken from clojure.tools.deps (test_deps.clj + the faken
-;; extension), run against jolt.deps' ported expansion engine — exclusions,
-;; top-dep pinning, newest-version selection, orphan cutting, override/default
-;; deps, and the Maven version comparator. Run: bin/jolt run test/deps_expand_test.clj
+;; Dependency-expansion integration tests: the fake in-memory coordinate type
+;; and cases are taken from clojure.tools.deps (test_deps.clj + the faken
+;; extension). They run through jolt.deps into Grenadine's shared portable
+;; expander — exclusions, top-dep pinning, newest-version selection, orphan
+;; cutting, override/default deps, and the Maven version comparator.
+;; Run: bin/jolt run test/deps_expand_test.clj
 
 (ns deps-expand-test
   (:require [clojure.string :as str]
