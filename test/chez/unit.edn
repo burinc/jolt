@@ -1,4 +1,22 @@
 [
+  {:suite "securerandom" :expr "(let [r (java.security.SecureRandom.)] (int? (.nextInt r)))" :expected "true"}
+  {:suite "securerandom" :expr "(let [r (SecureRandom.)] (every? (fn [x] (and (>= x 0) (< x 10))) (repeatedly 500 (fn [] (.nextInt r 10)))))" :expected "true"}
+  {:suite "securerandom" :expr "(let [r (SecureRandom.) b (byte-array 16)] (.nextBytes r b) [(alength b) (> (count (distinct (seq b))) 4)])" :expected "[16 true]"}
+  {:suite "securerandom" :expr "(alength (.generateSeed (SecureRandom.) 32))" :expected "32"}
+  {:suite "securerandom" :expr "(let [r (SecureRandom.)] (every? (fn [x] (and (>= x 0.0) (< x 1.0))) (repeatedly 200 (fn [] (.nextDouble r)))))" :expected "true"}
+  {:suite "securerandom" :expr "(let [r (SecureRandom.)] (= #{true false} (set (repeatedly 200 (fn [] (.nextBoolean r))))))" :expected "true"}
+  {:suite "securerandom" :expr "(let [r (SecureRandom.)] (= 200 (count (distinct (repeatedly 200 (fn [] (.nextLong r)))))))" :expected "true"}
+  {:suite "securerandom" :expr "(let [r (SecureRandom.)] (= 200 (count (distinct (repeatedly 200 (fn [] (.nextInt r)))))))" :expected "true"}
+  {:suite "securerandom" :expr "(int? (.nextInt (SecureRandom/getInstance \"SHA1PRNG\") 100))" :expected "true"}
+  {:suite "securerandom" :expr "(int? (.nextInt (SecureRandom/getInstanceStrong) 100))" :expected "true"}
+  {:suite "securerandom" :expr "(try (.nextInt (SecureRandom.) 0) :no-throw (catch IllegalArgumentException e :threw))" :expected ":threw"}
+  {:suite "securerandom" :expr "(let [r (SecureRandom.)] (.setSeed r 42) (int? (.nextInt r 100)))" :expected "true"}
+  {:suite "securerandom" :expr "(let [r (SecureRandom.)] (every? (fn [x] (and (>= x 0.0) (< x 1.0))) (repeatedly 100 (fn [] (.nextFloat r)))))" :expected "true"}
+  {:suite "uuid" :expr "(let [u (str (random-uuid))] [(count u) (nth u 14) (contains? #{\\8 \\9 \\a \\b} (nth u 19))])" :expected "[36 \\4 true]"}
+  {:suite "uuid" :expr "(count (distinct (repeatedly 2000 #(str (random-uuid)))))" :expected "2000"}
+  {:suite "uuid" :expr "(every? (fn [_] (re-matches #\"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\" (str (random-uuid)))) (range 200))" :expected "true"}
+  {:suite "uuid" :expr "(let [us (repeatedly 400 #(str (random-uuid)))] (every? #(> (count (distinct (map (fn [u] (nth u %)) us))) 8) [0 1 2 7 9 35]))" :expected "true"}
+  {:suite "uuid" :expr "(= (str (random-uuid)) (str (random-uuid)))" :expected "false"}
   {:suite "special-form precedence" :expr "(do (ns sftest (:refer-clojure :exclude [def])) (defmacro def [n v] :shadowed) (clojure.core/defn ff [] 99) (ff))" :expected "99"}
   {:suite "special-form precedence" :expr "(do (set! (. clojure.lang.RT checkSpecAsserts) true) clojure.lang.RT/checkSpecAsserts)" :expected "true"}
   {:suite "atomwatch" :expr "(let [a (atom 0) seen (atom 0)] (add-watch a :k (fn [k r o n] (reset! seen 1))) (reset! a 5) @seen)" :expected "1"}

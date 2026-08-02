@@ -11,18 +11,32 @@
 (define (jolt-uuid-pred? x) (juuid? x))
 
 (define hexd "0123456789abcdef")
-(define (rand-hex) (string-ref hexd (jolt-random 16)))
-;; v4: 8-4-4-4-12, version nibble (index 14) = 4, variant nibble (index 19) in 8-b.
+;; Position of hex digit j within the 8-4-4-4-12 layout: one extra character for
+;; each hyphen already passed (they sit after hex digits 8, 12, 16 and 20).
+(define (uuid-hex-pos j)
+  (fx+ j
+       (if (fx>=? j 8) 1 0) (if (fx>=? j 12) 1 0)
+       (if (fx>=? j 16) 1 0) (if (fx>=? j 20) 1 0)))
+;; v4 from 16 bytes of OS entropy (jolt-random-bytes), NOT from the seeded PRNG:
+;; v4 UUIDs get used as session ids and reset tokens, where a guessable value is a
+;; forgeable one. RFC 4122 then overwrites 6 of the 128 bits — version 4 in the
+;; high nibble of byte 6, variant 10 in the top two bits of byte 8 — leaving 122
+;; random bits.
 (define (random-uuid-str)
-  (let ((cs (make-string 36)))
+  (let ((b (jolt-random-bytes 16))
+        (cs (make-string 36)))
+    (bytevector-u8-set! b 6 (fxior (fxand (bytevector-u8-ref b 6) #x0f) #x40))
+    (bytevector-u8-set! b 8 (fxior (fxand (bytevector-u8-ref b 8) #x3f) #x80))
+    (string-set! cs 8 #\-) (string-set! cs 13 #\-)
+    (string-set! cs 18 #\-) (string-set! cs 23 #\-)
     (let loop ((i 0))
-      (if (fx=? i 36) cs
-          (begin
-            (string-set! cs i
-              (cond ((or (fx=? i 8) (fx=? i 13) (fx=? i 18) (fx=? i 23)) #\-)
-                    ((fx=? i 14) #\4)
-                    ((fx=? i 19) (string-ref "89ab" (jolt-random 4)))
-                    (else (rand-hex))))
+      (if (fx=? i 16)
+          cs
+          (let ((v (bytevector-u8-ref b i)))
+            (string-set! cs (uuid-hex-pos (fx* i 2))
+                         (string-ref hexd (fxarithmetic-shift-right v 4)))
+            (string-set! cs (uuid-hex-pos (fx+ (fx* i 2) 1))
+                         (string-ref hexd (fxand v 15)))
             (loop (fx+ i 1)))))))
 (define (jolt-random-uuid) (make-juuid (random-uuid-str)))
 

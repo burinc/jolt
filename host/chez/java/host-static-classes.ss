@@ -1598,6 +1598,70 @@
                           (/ (random-next 24 st) (exact->inexact (expt 2 24))))))
     (cons "nextBoolean" (lambda (self) (fx=? 1 (random-next 1 (jhost-state self)))))))
 
+;; --- java.security.SecureRandom ----------------------------------------------
+;; Every draw comes straight from the OS CSPRNG (jolt-random-bytes), so there is
+;; no seed and no internal state to carry: unlike java.util.Random above, two
+;; instances are not distinguishable and none of this is reproducible. That is
+;; the contract — SecureRandom promises unpredictability, and the JVM explicitly
+;; does not promise a repeatable stream for a given seed.
+(define (sr-uint n)
+  (let ((bv (jolt-random-bytes n)))
+    (let loop ((i 0) (acc 0))
+      (if (fx=? i n) acc (loop (fx+ i 1) (+ (* acc 256) (bytevector-u8-ref bv i)))))))
+
+(define (sr-next-int-bound bound)
+  (if (<= bound 0)
+      (throw-jvm (quote IllegalArgumentException) "bound must be positive")
+      ;; Rejection sampling, not a bare modulo: taking (mod u bound) over a range
+      ;; that is not a multiple of bound makes the low residues more likely, which
+      ;; is a real bias in something callers reach for to pick tokens and salts.
+      (let loop ()
+        (let* ((u (bitwise-and (sr-uint 4) #x7fffffff))
+               (r (modulo u bound)))
+          (if (<= (- u r) (- 2147483648 bound)) (->num r) (loop))))))
+
+(for-each
+  (lambda (nm)
+    (register-class-ctor! nm
+      ;; (SecureRandom. seed) is accepted and the seed ignored: the JVM's seeded
+      ;; ctor SUPPLEMENTS entropy rather than replacing it, so ignoring it cannot
+      ;; make the output weaker than the caller asked for.
+      (lambda args (make-jhost "securerandom" #f)))
+    (register-class-statics! nm
+      (list (cons "getInstance" (lambda args (make-jhost "securerandom" #f)))
+            (cons "getInstanceStrong" (lambda args (make-jhost "securerandom" #f))))))
+  '("SecureRandom" "java.security.SecureRandom"))
+
+(register-host-methods! "securerandom"
+  (list
+    (cons "nextBytes" (lambda (self ba)
+                        (let* ((v (jolt-array-vec ba))
+                               (n (vector-length v))
+                               (bv (jolt-random-bytes n)))
+                          (let loop ((i 0))
+                            (when (fx<? i n)
+                              (vector-set! v i (na-byte-of (bytevector-u8-ref bv i)))
+                              (loop (fx+ i 1))))
+                          jolt-nil)))
+    (cons "nextInt" (lambda (self . a)
+                      (if (pair? a)
+                          (sr-next-int-bound (exact (truncate (car a))))
+                          (->num (random-u32->s32 (sr-uint 4))))))
+    (cons "nextLong" (lambda (self)
+                       (let ((u (sr-uint 8)))
+                         (->num (if (>= u #x8000000000000000) (- u #x10000000000000000) u)))))
+    (cons "nextDouble" (lambda (self)
+                         (* (bitwise-and (sr-uint 7) (- (expt 2 53) 1)) (/ 1.0 (expt 2 53)))))
+    (cons "nextFloat" (lambda (self)
+                        (/ (bitwise-and (sr-uint 3) (- (expt 2 24) 1))
+                           (exact->inexact (expt 2 24)))))
+    (cons "nextBoolean" (lambda (self) (fx=? 1 (bitwise-and (sr-uint 1) 1))))
+    (cons "generateSeed" (lambda (self n)
+                           (na-bv->bytearray (jolt-random-bytes (exact (truncate n))))))
+    ;; setSeed supplements on the JVM and never replaces; with an OS source there
+    ;; is nothing to supplement, so it is a no-op rather than a weakening.
+    (cons "setSeed" (lambda (self . _) jolt-nil))))
+
 ;; --- java.util.Optional -----------------------------------------------------
 ;; Returned by getters across java.time / java.net.http (e.g. HttpRequest.timeout,
 ;; HttpClient.connectTimeout). Value-equal so (= (Optional/of x) (Optional/of x)).
