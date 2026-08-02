@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.20] - 2026-08-02
+
+A backtrace could show frames from calls that had already finished, and in the
+common shape it pushed the frame you needed out of the trace entirely to make
+room for them.
+
+### Fixed
+
+- **A backtrace no longer lists calls that already returned.** The tail-frame
+  history keeps one entry per call reached, and its ring only ever moved forward
+  — so a call that returned kept its place, and its frames printed under the ones
+  that actually threw. Worse, once the ring filled they evicted the real caller.
+  A `-main` that prints a value and then throws looked like this:
+
+  ```
+  Unhandled exception: Divide by zero
+    trace:
+      app/inner (src/app.clj:3)
+      app/outer (src/app.clj:4)
+      jolt.time.impl/type-of (jolt/time/impl.clj:7)     <- from the println,
+      jolt.time.impl/jt? (jolt/time/impl.clj:78)           which had already
+      ... 12 more of the same                              returned
+  ```
+
+  and now names the caller it was dropping:
+
+  ```
+  Unhandled exception: Divide by zero
+    trace:
+      app/inner (src/app.clj:3)
+      app/outer (src/app.clj:4)
+      app/-main (src/app.clj:7)
+  ```
+
+  The compiler now pairs a save/restore of the ring position around every
+  non-tail call, so a returned call's entries are reused by whatever the caller
+  does next. Tail calls are deliberately left alone: consuming their result to
+  run the restore would make them non-tail and defeat tail-call elimination,
+  which is the reason the history exists at all. This costs 1.9–3.1x on
+  `jolt run` and **nothing** in a built binary, whose frame prologues are baked
+  at build time with tracing off.
+
+  One case still leaves residue: frames pushed by library code that the runtime
+  itself called into (a type registering per-value `str`/`compare` arms, say)
+  have no wrapped call site to unwind them. Those now sit below a complete
+  spine rather than on top of a truncated one.
+
+### Changed
+
+- **Registering an arm whose predicate claims a runtime-owned type now fails
+  loudly.** `=`, `hash`, `get`, `count`, `contains?`, `empty?`, `seq` and
+  `compare` each answer their commonest types before consulting the registries a
+  host type extends them through, so an arm matching one of those was silently
+  skipped and its handler never ran. Registration now probes the candidate
+  predicate and rejects it, naming the type. A shim that registered, say,
+  `string?` for `count` fails at registration instead of being quietly ignored
+  at every later call. Each registry checks only its **own** fast path — `get`
+  answers records but not strings, `count` the reverse — so an arm that is legal
+  for one and not another is still accepted where it belongs.
+
+### Performance
+
+- **`print`, `println` and `pr` resolve `*out*`, `*print-readably*` and
+  `*print-namespace-maps*` through cached var cells** instead of rebuilding
+  `"clojure.core/<name>"` and hashing it once per value printed. A/B/A in one
+  session over a print-saturated workload, two runs: 3.5% and 5.5% faster, with
+  drift of 0.15% and 0.33% between the A columns. Real programs print far less
+  than that benchmark, so expect less. Reads still go through the binding stack,
+  so `with-out-str` and `(binding [*print-readably* nil] …)` are unaffected.
+
+### Internal
+
+- Dependency-tree expansion moved out of `jolt.deps` into the vendored
+  [Grenadine](https://github.com/clojurestar/grenadine) library, which now owns
+  the tools.deps-compatible traversal, exclusion handling and version selection
+  alongside the effective-POM builder and version comparator it already
+  provided. Behaviour is unchanged — `-Stree`, `-Spath` and the resolution
+  warnings all render identically.
+
 ## [0.5.19] - 2026-08-02
 
 `print` was implemented as string conversion rather than as printing, so it
@@ -2962,7 +3041,12 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.15...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.20...HEAD
+[0.5.20]: https://github.com/jolt-lang/jolt/compare/v0.5.19...v0.5.20
+[0.5.19]: https://github.com/jolt-lang/jolt/compare/v0.5.18...v0.5.19
+[0.5.18]: https://github.com/jolt-lang/jolt/compare/v0.5.17...v0.5.18
+[0.5.17]: https://github.com/jolt-lang/jolt/compare/v0.5.16...v0.5.17
+[0.5.16]: https://github.com/jolt-lang/jolt/compare/v0.5.15...v0.5.16
 [0.5.15]: https://github.com/jolt-lang/jolt/compare/v0.5.14...v0.5.15
 [0.5.14]: https://github.com/jolt-lang/jolt/compare/v0.5.13...v0.5.14
 [0.5.13]: https://github.com/jolt-lang/jolt/compare/v0.5.12...v0.5.13
