@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.19] - 2026-08-02
+
+`print` was implemented as string conversion rather than as printing, so it
+disagreed with `pr` on six types: a BigDecimal lost its `M`, a regex printed as
+bare source, a UUID as bare hex, the infinities as `Infinity`/`NaN`, a bigint
+lost its `N`, and a char nested inside a collection kept the backslash that
+`print` is supposed to drop. On the JVM `print` is `pr` with `*print-readably*`
+off, and that flag changes only strings and chars.
+
 ### Changed
 
 - **`print`/`println`/`print-str` now render like `pr` with quoting off, not like
