@@ -1,3 +1,0 @@
-{:mvn/local-repo ".cache/m2"
- :deps
- {cc.clojure/grenadine {:mvn/version "0.1.2"}}}
