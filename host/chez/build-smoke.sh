@@ -396,8 +396,10 @@ fi
 # must not escape that file. Both the loader and the AOT'd binary bracket a
 # namespace's forms with a thread binding for the var (RT.load parity), so this
 # runs the app from source and as a built binary and expects the same answer.
+# The middle value is a widened bigint (jolt widens where the JVM throws) and
+# prints with the N suffix, as the JVM prints any bigint under print.
 umapp="$root/test/chez/unchecked-math-app"
-umwant="UNCHECKED-MATH -9223372036854775808 9223372036854775808 false"
+umwant="UNCHECKED-MATH -9223372036854775808 9223372036854775808N false"
 got_um_src="$(cd "$umapp" && JOLT_PWD="$umapp" "$joltabs" run -m umapp.main 2>&1 | tail -1)"
 if [ "$got_um_src" != "$umwant" ]; then
   echo "  FAIL: top-level (set! *unchecked-math* …) from source — want \`$umwant\`, got \`$got_um_src\`"; exit 1

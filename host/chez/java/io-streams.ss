@@ -412,8 +412,13 @@
             (and (pair? ks) (or (jclass? (car ks)) (loop (cdr ks)))))))
   pm-has-class-keys?)
 
+;; Resolved once: var-deref rebuilds "clojure.core/print-method" and hashes it on
+;; every call, which this pays per printed value. The cell is stable — def-var!
+;; mutates the root in place — so caching it is sound under redefinition.
+(define pm-cell #f)
 (define (user-print-method x)
-  (let ((mf (var-deref "clojure.core" "print-method")))
+  (unless pm-cell (set! pm-cell (jolt-var "clojure.core" "print-method")))
+  (let ((mf (var-cell-deref pm-cell)))
     (and (jolt-multifn? mf)
          (let ((tbl (jolt-multifn-methods mf)))
            (or (hashtable-ref tbl (jolt-type x) #f)

@@ -31,6 +31,7 @@
 ;; inst, uuid, record, var, …). Disjoint types, checked before the base cases.
 (define jolt-pr-readable-arms '())
 (define (register-pr-readable-arm! pred render)
+  (pr-arm-reject-fast-type! 'register-pr-readable-arm! pred)
   (set! jolt-pr-readable-arms (cons (cons pred render) jolt-pr-readable-arms)))
 (define (register-pr-arm! pred render)
   (register-pr-str-arm! pred render)
@@ -66,9 +67,11 @@
   (cond
     ;; *print-readably* nil makes pr print a string like print does — bare, no
     ;; quotes or escapes — at every nesting level. Chars already honored it
-    ;; (jolt-char->string); strings were escaping unconditionally.
+    ;; (jolt-char->string); strings were escaping unconditionally. The print
+    ;; family's override (jolt-pr-readable?, rt.ss) is checked before the var,
+    ;; so its per-value path skips this lookup entirely.
     ((string? x)
-     (if (jolt-truthy? (jolt-var-get (jolt-var "clojure.core" "*print-readably*")))
+     (if (jolt-pr-readable?)
          (string-append "\"" (jolt-str-escape x) "\"")
          x))
     ;; pr renders the infinities / NaN in READABLE form (##Inf reads back), unlike
@@ -124,12 +127,17 @@
     ;; passing readable? so that if it reaches the #object[…] fallback the content
     ;; is QUOTED, which is the (pr x) vs (print x) difference on the JVM.
     (else (jolt-pr-str/readable x #t))))
+;; A user print-method still outranks everything, including for a fast-path type —
+;; (defmethod print-method String …) is legal on the JVM — so the fast path skips
+;; only the arm walk, never the user-method check.
 (define (jolt-pr-readable-dispatch x)
   (or (and pr-user-method-render (pr-user-method-render x))
-      (let loop ((as jolt-pr-readable-arms))
-        (cond ((null? as) (jolt-pr-readable-base x))
-              (((caar as) x) ((cdar as) x))
-              (else (loop (cdr as)))))))
+      (if (pr-fast-type? x)
+          (jolt-pr-readable-base x)
+          (let loop ((as jolt-pr-readable-arms))
+            (cond ((null? as) (jolt-pr-readable-base x))
+                  (((caar as) x) ((cdar as) x))
+                  (else (loop (cdr as))))))))
 
 ;; *print-meta* support. The var is def'd after this file loads, so capture its
 ;; cell lazily; jolt-var-get (patched by dyn-binding.ss) honors a `binding`.

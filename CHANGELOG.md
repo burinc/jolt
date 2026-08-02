@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`print`/`println`/`print-str` now render like `pr` with quoting off, not like
+  `str`.** Previously `print` of a `2M` printed `2`, a regex printed `re`, and a
+  UUID printed the bare hex string. It now shares the readable renderer with `pr`
+  and only drops the string/char quoting, so those print as `2M`, `#"re"` and
+  `#uuid "…"`, and a mixed coll prints `[s a 2M]` instead of `[s \a 2M]` — the
+  JVM's `(binding [*print-readably* nil] (pr …))`. `str` is untouched (its
+  contract is `.toString`). The quoting-off flag rides a virtual register rather
+  than a per-value dynamic binding, which would have cost about 770ns a value.
+
+### Performance
+
+- **`pr`, `pr-str` and `print` skip the printer's arm registries for the value
+  types the runtime owns** — numbers, strings, chars, keywords, symbols, booleans
+  and nil now go straight to the renderer's base case instead of testing ~40
+  registered host-type predicates that cannot match them, and `print-method` is
+  resolved through a cached var cell instead of being looked up by name per
+  value. Measured over 200k values, A/B/A in one session: `pr-str` 220 ms → 162 ms
+  (1.36x), `print` 235 ms → 224 ms (parity — the delta is inside run-to-run
+  drift). A registered arm that could match one of those types is rejected at
+  registration, so the fast path cannot silently bypass a host shim's rendering.
+
 ## [0.5.18] - 2026-08-02
 
 Two things a program cannot work without: knowing where it broke, and getting
