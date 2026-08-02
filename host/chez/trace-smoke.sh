@@ -91,6 +91,28 @@ expect_match "innermost frame is boom, at the dividing line" "$out" 'app\.tail/b
 expect_match "caller frame -main, at the call site" "$out" 'app\.tail/-main (.*src/app/tail\.clj:8)'
 expect_no_match "no frame reports a defn line" "$out" 'tail\.clj:[36])'
 
+# A call that RETURNED must leave nothing behind. The ring's outer head only
+# advances on entry, so without the save/restore the emitter pairs around every
+# non-tail call, the ribs of a completed (noisy) call were still there at the next
+# throw and printed UNDER the frames that actually threw — and pushed the real
+# caller out of the ring entirely. `noise` here recurses 40 deep and returns long
+# before `boom` divides, so any noise/* frame in this trace is stale history.
+cat > "$work/src/app/stale.clj" <<'EOF'
+(ns app.stale)
+(defn noise [n] (if (zero? n) 0 (+ 1 (noise (dec n)))))
+(defn boom [x] (/ x 0))
+(defn caller [x] (+ 1 (boom x)))
+(defn -main [& _]
+  (println "noise" (noise 40))
+  (println (caller 1)))
+EOF
+echo "trace smoke: a returned call leaves no frames behind"
+out_stale="$(run_app app.stale)"
+expect_match "throwing frame is first" "$out_stale" 'app\.stale/boom (.*src/app/stale\.clj:3)'
+expect_match "its caller is next" "$out_stale" 'app\.stale/caller (.*src/app/stale\.clj:4)'
+expect_match "and -main survives the noisy call" "$out_stale" 'app\.stale/-main (.*src/app/stale\.clj:7)'
+expect_no_match "no frames from the call that already returned" "$out_stale" 'app\.stale/noise'
+
 echo "trace smoke: JOLT_TRACE=0 opts out"
 out_off="$(run_app app.tail JOLT_TRACE=0)"
 expect_match "still reports the message" "$out_off" 'Unhandled exception: Divide by zero'
