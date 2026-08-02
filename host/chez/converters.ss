@@ -11,6 +11,7 @@
 ;; Newest registration is checked first (matches the old outermost-wins order).
 (define str-render-registry '())   ; list of (pred . render), checked front-to-back
 (define (register-str-render! pred render)
+  (pr-arm-reject-fast-type! 'register-str-render! pred)
   (set! str-render-registry (cons (cons pred render) str-render-registry)))
 
 ;; str: nil -> "", string raw, char bare (not \c), regex -> raw source, a
@@ -36,17 +37,33 @@
        (if (or (not ns) (jolt-nil? ns))
            (symbol-t-name v)
            (string-append ns "/" (symbol-t-name v)))))
+    ;; numbers and booleans reach the printer without an arm ever claiming them
+    ;; (pr-fast-type?, rt.ss); the cases above already cover the rest of that set.
+    ((pr-fast-type? v) (jolt-pr-str v))
     (else
      (let loop ((rs str-render-registry))
        (cond
          ((null? rs) (jolt-pr-str v))
          (((caar rs) v) ((cdar rs) v))
          (else (loop (cdr rs))))))))
-;; print/println render non-readably: a nested string is raw. jolt-str-render-one
-;; is exactly that (collections fall through to jolt-pr-str). The print family
-;; uses this seam, NOT the str fn — which renders readably (below). A top-level nil
-;; prints "nil" (str renders it ""), so the seam special-cases it.
-(define (jolt-print-one v) (if (jolt-nil? v) "nil" (jolt-str-render-one v)))
+;; print/println render via the SAME readable renderer as pr, with string/char
+;; quoting off: the JVM's print is (binding [*print-readably* nil] (pr ...)).
+;; jolt-pr-readable already consults *print-readably* for strings (printing.ss)
+;; and chars (jolt-char->string) at every nesting depth, so overriding it here
+;; makes (print ["s" \a 2M]) render [s a 2M] while numbers, regexes, uuids and
+;; the infinities keep their readable form — one renderer, not a per-type print
+;; registry. nil renders "nil" via the readable base. The override is a virtual
+;; register (rt.ss), not a thread binding: two ~1ns vreg writes per value instead
+;; of a pmap alloc + fold + two thread-parameter writes. Saved/restored so
+;; nesting composes, inside dynamic-wind so an un-restored override cannot leak
+;; non-readable rendering into every later pr in this thread if the renderer
+;; throws.
+(define (jolt-print-one v)
+  (let ((prev (virtual-register jolt-vreg-print-readably)))
+    (dynamic-wind
+      (lambda () (set-virtual-register! jolt-vreg-print-readably #f))
+      (lambda () (jolt-pr-readable v))
+      (lambda () (set-virtual-register! jolt-vreg-print-readably prev)))))
 (def-var! "clojure.core" "__print1" jolt-print-one)
 
 ;; str: a top-level string/scalar renders as jolt-str-render-one (raw string,

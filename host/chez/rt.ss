@@ -260,7 +260,7 @@
 ;; kept tracing opt-in. Reads are ~2.4ns vs ~3.3ns, a smaller but free win.
 ;;
 ;; Virtual registers are a fixed global resource: (virtual-register-count) slots for
-;; the whole process (16 on every platform jolt targets). jolt claims four, allocated
+;; the whole process (16 on every platform jolt targets). jolt claims five, allocated
 ;; here so the assignment is in one place; nothing else in the runtime uses them.
 ;; A freshly forked thread starts every slot at fixnum 0, NOT #f — so "no ring yet"
 ;; is tested with vector?, never with a truthiness check, and line 0 means "unknown".
@@ -268,6 +268,18 @@
 (define jolt-vreg-trace-tail 1)
 (define jolt-vreg-line 2)        ; line currently executing in traced code
 (define jolt-vreg-catch-line 3)  ; line at the throw a catch clause is handling
+(define jolt-vreg-print-readably 4)  ; the print family's *print-readably* override; 0 = unset
+;; Effective *print-readably* for the readable renderer's string/char cases. The
+;; print family stashes its override in the slot above — a virtual-register write
+;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic
+;; binding — and only consults the var when the slot is unset. A fresh thread
+;; starts the slot at fixnum 0, so a stored #f (readably off) stays distinct from
+;; "unset"; jolt-var/-get resolve at call time (vars.ss / rt.ss load later).
+(define (jolt-pr-readable?)
+  (let ((o (virtual-register jolt-vreg-print-readably)))
+    (if (eq? o 0)
+        (jolt-truthy? (jolt-var-get (jolt-var "clojure.core" "*print-readably*")))
+        (jolt-truthy? o))))
 (define (jolt-trace-ring) (let ((h (virtual-register jolt-vreg-trace-ring))) (and (vector? h) h)))
 (define (jolt-trace-ring-set! h) (set-virtual-register! jolt-vreg-trace-ring h))
 (define (jolt-trace-tail?) (eq? (virtual-register jolt-vreg-trace-tail) #t))
@@ -733,7 +745,7 @@
   (cond ((null? strs) "") ((null? (cdr strs)) (car strs))
         (else (string-append (car strs) ", " (jolt-str-join-comma (cdr strs))))))
 (define (jolt-char->string c)
-  (if (jolt-truthy? (jolt-var-get (jolt-var "clojure.core" "*print-readably*")))
+  (if (jolt-pr-readable?)
       (string-append "\\" (case c ((#\newline) "newline") ((#\space) "space") ((#\tab) "tab")
                                   ((#\return) "return") ((#\backspace) "backspace") ((#\page) "formfeed")
                                   (else (string c))))
@@ -797,11 +809,53 @@
                       (parameterize ((jolt-print-depth (fx+ (jolt-print-depth) 1))) body ...)
                       (begin body ...)))))
 
+;; The value types the runtime itself owns: Chez immediates plus the two value
+;; records (keyword, symbol) no host shim can model. Every printer base case
+;; renders these directly, so walking the arm registries for one is dead work —
+;; and in print-heavy code they are nearly every value. Both printers and the str
+;; renderer skip straight to their base case for a value that answers true here.
+;;
+;; The correctness condition is that NO registered arm may match one of these, or
+;; the fast path would silently bypass it. That is enforced at registration
+;; (pr-arm-reject-fast-type!) rather than left to a comment, so a library shim
+;; registering through __register-pr! / __register-str! cannot introduce an arm
+;; the fast path would skip: it fails loudly at the point of registration instead
+;; of rendering wrongly at some later print.
+(define (pr-fast-type? x)
+  (or (number? x)
+      (string? x)
+      (jolt-nil? x)
+      (eq? x #t)
+      (eq? x #f)
+      (char? x)
+      (keyword? x)
+      (jolt-symbol? x)))
+
+;; One representative per fast-path type, covering the numeric tower (fixnum,
+;; bignum, ratio, flonum) since an arm could plausibly claim only one of those.
+(define pr-fast-probes
+  (list 0 (expt 2 70) 1/2 1.5 "s" jolt-nil #t #f #\a
+        (keyword #f "k") (jolt-symbol #f "s")))
+(define (pr-arm-reject-fast-type! who pred)
+  (for-each
+   (lambda (v)
+     ;; A predicate that throws on an unexpected type is not claiming it.
+     (when (guard (e (#t #f)) (and (pred v) #t))
+       (error who
+              (string-append
+               "arm predicate matches a runtime-owned value type, which the "
+               "printer fast path renders without consulting the arms (see "
+               "pr-fast-type? in rt.ss). Narrow the predicate to the type this "
+               "arm actually owns.")
+              v)))
+   pr-fast-probes))
+
 ;; A host shim registers a type's str-style rendering via register-pr-str-arm! (or
 ;; register-pr-arm! in printing.ss for both printers at once) instead of
 ;; set!-wrapping jolt-pr-str. Disjoint types, checked before the base cases.
 (define jolt-pr-str-arms '())
 (define (register-pr-str-arm! pred render)
+  (pr-arm-reject-fast-type! 'register-pr-str-arm! pred)
   (set! jolt-pr-str-arms (cons (cons pred render) jolt-pr-str-arms)))
 ;; Fallback rendering for a value no printer branch claims. The JVM prints an
 ;; unknown object as #object[<class> <hash> <toString>]; jolt used to hand the
@@ -869,10 +923,12 @@
     (else (jolt-object-repr x readable?))))
 (define (jolt-pr-str x) (jolt-pr-str/readable x #f))
 (define (jolt-pr-str/readable x readable?)
-  (let loop ((as jolt-pr-str-arms))
-    (cond ((null? as) (jolt-pr-str-base/readable x readable?))
-          (((caar as) x) ((cdar as) x))
-          (else (loop (cdr as))))))
+  (if (pr-fast-type? x)
+      (jolt-pr-str-base/readable x readable?)
+      (let loop ((as jolt-pr-str-arms))
+        (cond ((null? as) (jolt-pr-str-base/readable x readable?))
+              (((caar as) x) ((cdar as) x))
+              (else (loop (cdr as)))))))
 
 ;; converters + string ops: str/subs/vec/keyword/symbol/compare/int/
 ;; double/gensym — host-coupled seed natives def-var!'d into clojure.core. Loaded

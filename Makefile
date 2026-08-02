@@ -59,7 +59,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr grenadine \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  narrow numeric numwp oparity pic protoret remint sci selfhost shakelocal \
+  narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
   shakesmoke smoke staticnativesmoke test testbin transient unit unitcontext \
   values wp ci
 
@@ -474,3 +474,11 @@ aotfingerprint:
 # require. Needs Maven jars locally; NOT in the default ci gate (timing budget).
 aotcacheperf:
 	@sh test/chez/aot-cache-perf.sh
+
+# Perf probe for the print and pr value seams: 200000 values each through
+# with-out-str. Guards the per-value *print-readably* override and the printer's
+# fast path for runtime-owned types. Manual like aotcacheperf — the repo has no
+# wall-clock assertions in its default gates, and a timing floor would be flaky
+# on loaded CI. See the header of the script for how to read the numbers.
+printperf:
+	@$(CHEZ) --script test/chez/print-throughput.ss
