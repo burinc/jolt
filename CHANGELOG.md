@@ -52,7 +52,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Chez virtual registers at ~1ns, and the ring sizes are powers of two so a wrap is
   a mask rather than a division).
 
+### Added
+
+- **`java.security.SecureRandom`**, implemented natively over the same OS
+  entropy: `nextBytes`, `nextInt` (both arities), `nextLong`, `nextDouble`,
+  `nextFloat`, `nextBoolean`, `generateSeed`, `setSeed`, and the `getInstance` /
+  `getInstanceStrong` statics. `nextInt(bound)` rejection samples rather than
+  taking a bare modulo, which would bias toward the low residues. It no longer
+  auto-loads `jolt-crypto`: it is a JDK class on the JVM, and reaching for one
+  should not make a program declare a dependency.
+
 ### Fixed
+
+- **`rand`, `rand-int`, `Math/random` and `random-uuid` now differ between
+  processes and between threads.** Chez starts its PRNG from a fixed seed and
+  keeps the state per thread, so every jolt process replayed one identical
+  stream and every forked thread restarted it from the top. Two unrelated
+  processes agreed on every "random" value, and eight threads in one process
+  drew eight identical UUIDs. Clojure runs these off a process-global
+  `java.util.Random` seeded from the clock; jolt now seeds lazily on first draw
+  per thread, from the clock mixed with pid, thread id and a counter.
+
+- **`random-uuid` and `UUID/randomUUID` now draw from the OS CSPRNG.** They were
+  built out of `random`, which is seeded from the clock — unique per process
+  after the fix above, but still guessable by anyone who knows roughly when the
+  process started. Clojure backs `random-uuid` with `SecureRandom` because v4
+  UUIDs get used as session ids, CSRF nonces and reset tokens, where guessable
+  means forgeable. Bytes now come from `/dev/urandom`, or `BCryptGenRandom` /
+  `RtlGenRandom` on Windows. If a host offers no entropy source at all the
+  fallback says so on stderr rather than degrading quietly.
+
+
+- **`(java.util.Random.)` with no seed never worked.** It seeded from
+  `(truncate (current-time))`, and `current-time` answers a time object rather
+  than a number, so the no-arg constructor always threw. Seeded instances were
+  unaffected and still reproduce the JVM's exact LCG stream.
 
 - **`.waitFor` on a subprocess can no longer hang forever.** It issued a blocking
   `waitpid`, which parks in the kernel — and when `SIGCHLD` is `SIG_IGN`, POSIX has

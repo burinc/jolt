@@ -895,6 +895,124 @@
 ;; jolt-pr-str/jolt-str-join) + seq.ss (jolt-invoke).
 (load "host/chez/printing.ss")
 
+;; --- randomness -------------------------------------------------------------
+;; Chez's PRNG starts every thread from the SAME fixed seed, and the state is
+;; per-thread rather than shared. Both halves of that diverge from Clojure, where
+;; rand/rand-int/Math.random run off one process-global java.util.Random seeded
+;; from the clock:
+;;
+;;   - across processes, every jolt run replayed one identical stream, so two
+;;     unrelated processes agreed on every "random" value — including every
+;;     random-uuid, so a fleet minted colliding UUIDs;
+;;   - across threads, each forked thread restarted that same stream from the
+;;     top, so N request threads drew N identical values in ONE process.
+;;
+;; Seeding lazily on first use covers both: a thread that never draws pays
+;; nothing, and one that does is seeded before its first value. Seed from the
+;; clock (as the JVM does) mixed with pid and thread id so two threads starting
+;; inside the same nanosecond still diverge, and a counter so that even a
+;; coarse clock cannot hand out one seed twice.
+(define random-seeded? (make-thread-parameter #f))
+(define random-seed-counter 0)
+(define random-seed-mutex (make-mutex))
+
+(define (seed-random!)
+  (let* ((t (current-time 'time-utc))
+         (n (with-mutex random-seed-mutex
+              (set! random-seed-counter (+ random-seed-counter 1))
+              random-seed-counter))
+         (mix (bitwise-xor (time-nanosecond t)
+                           (* 1000000007 (time-second t))
+                           (* 2654435761 (get-process-id))
+                           (* 40503 (get-thread-id))
+                           (* 2246822519 n))))
+    ;; random-seed's domain is 1 .. 2^32-1
+    (random-seed (+ 1 (modulo mix 4294967294)))
+    (random-seeded? #t)))
+
+;; Every jolt-level draw goes through this, never `random` directly.
+(define (jolt-random n)
+  (unless (random-seeded?) (seed-random!))
+  (random n))
+
+;; --- OS entropy ---------------------------------------------------------------
+;; jolt-random is seeded from the clock, which makes it unique per process but
+;; still guessable: an observer who knows roughly when a process started can
+;; narrow the seed to a small range and enumerate it. Clojure backs random-uuid
+;; with SecureRandom because callers do use v4 UUIDs as session ids, CSRF nonces
+;; and password-reset links, where guessable means forgeable. The bytes behind a
+;; UUID therefore come from the OS, not from any seeded PRNG.
+;;
+;; Resolved lazily on first use and cached, never at load time: in a built binary
+;; top-level forms run during heap build, so a port opened there would be baked
+;; into the image and be a stale descriptor — shared by every process started
+;; from it — by the time anything drew from it.
+(define entropy-source 'unset)      ; 'unset | #f | input port (posix) | procedure (windows)
+
+(define (entropy-open-urandom)
+  (guard (e (#t #f))
+    (and (file-exists? "/dev/urandom")
+         (open-file-input-port "/dev/urandom" (file-options) (buffer-mode none)))))
+
+;; Windows has no /dev/urandom. BCryptGenRandom with a null algorithm handle and
+;; BCRYPT_USE_SYSTEM_PREFERRED_RNG (2) is the documented system CSPRNG;
+;; RtlGenRandom — exported from advapi32 only under its ordinal alias
+;; SystemFunction036 — covers anything without bcrypt. eval rather than a
+;; compiled foreign-procedure for the same reason jolt-foreign-proc-safe uses it
+;; there: on Windows a foreign reference inside a fasl is a load-time relocation
+;; that aborts the boot outright if the symbol is missing, before any guard runs.
+(define (entropy-open-windows)
+  (guard (e (#t #f))
+    (or (and (guard (e2 (#t #f)) (load-shared-object "bcrypt.dll") #t)
+             (foreign-entry? "BCryptGenRandom")
+             (let ((f (eval '(foreign-procedure "BCryptGenRandom"
+                                                (void* u8* unsigned-32 unsigned-32) int))))
+               (lambda (bv n) (fx=? 0 (f 0 bv n 2)))))
+        (and (guard (e2 (#t #f)) (load-shared-object "advapi32.dll") #t)
+             (foreign-entry? "SystemFunction036")
+             (let ((f (eval '(foreign-procedure "SystemFunction036" (u8* unsigned-32) boolean))))
+               (lambda (bv n) (f bv n)))))))
+
+(define (jolt-entropy-source)
+  (when (eq? entropy-source 'unset)
+    (set! entropy-source
+          (if (memq (machine-type) '(a6nt ta6nt i3nt ti3nt))
+              (entropy-open-windows)
+              (entropy-open-urandom))))
+  entropy-source)
+
+(define entropy-warned? #f)
+(define (entropy-warn-once!)
+  (unless entropy-warned?
+    (set! entropy-warned? #t)
+    ;; Loud, once: silently degrading a CSPRNG to a clock-seeded PRNG is how
+    ;; guessable session ids ship. Uniqueness still holds; unpredictability does not.
+    (display "jolt: no OS entropy source available -- random-uuid is falling back to the seeded PRNG\n"
+             (console-error-port))))
+
+;; `n` bytes from the OS CSPRNG. Falls back to the seeded PRNG only if the host
+;; offers no entropy source at all, which on every platform jolt ships is never.
+(define (jolt-random-bytes n)
+  (let ((bv (make-bytevector n 0))
+        (src (jolt-entropy-source)))
+    (cond
+      ((and (port? src)
+            (guard (e (#t #f))
+              ;; short reads are legal on a character device — loop to n
+              (let loop ((got 0))
+                (or (fx>=? got n)
+                    (let ((k (get-bytevector-n! src bv got (fx- n got))))
+                      (and (fixnum? k) (fx>? k 0) (loop (fx+ got k))))))))
+       bv)
+      ((and (procedure? src) (guard (e (#t #f)) (src bv n))) bv)
+      (else
+       (entropy-warn-once!)
+       (let loop ((i 0))
+         (if (fx=? i n)
+             bv
+             (begin (bytevector-u8-set! bv i (jolt-random 256))
+                    (loop (fx+ i 1)))))))))
+
 ;; collection constructors + rand: bind the public
 ;; clojure.core names hash-map/hash-set/array-map/set/rand to the existing
 ;; pmap/pset ctors. After collections.ss (the ctors) + seq.ss (seq->list).

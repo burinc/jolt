@@ -9,6 +9,11 @@ cd "$root"
 # built target/release/jolt — 10x faster boot than script mode; the explicit
 # script-mode case below keeps the source-load path covered).
 jolt="${JOLT_BIN:-bin/jolt}"
+# The same default, kept unwrapped: the cases that need an ABSOLUTE path to the
+# binary (they cd elsewhere first) resolved $JOLT_BIN directly, so running this
+# script without JOLT_BIN set built "<repo>/" — a directory — and failed three
+# cases that the make gate never saw, because the gate always sets JOLT_BIN.
+jolt_bin="${JOLT_BIN:-bin/jolt}"
 
 # Every case here is a sub-second jolt invocation, so a case that does not finish
 # has hung — and a hung case is invisible: `make -Oline` shows nothing for a target
@@ -49,6 +54,21 @@ check() {
   else
     echo "  FAIL: $1"
     echo "    want \`$2\` got \`$got\`"
+    fails=$((fails + 1))
+  fi
+}
+# Two separate jolt processes must not produce the same random draw. Chez seeds
+# its PRNG identically at every process start, so anything built on `random` —
+# rand, rand-int, Math/random, random-uuid — replayed one fixed stream: every
+# process agreed on "random" and every UUID a fleet minted collided.
+check_varies() {
+  a="$($jolt -e "$1" 2>/dev/null | tail -1)"
+  b="$($jolt -e "$1" 2>/dev/null | tail -1)"
+  if [ "$a" != "$b" ] && [ -n "$a" ]; then
+    pass=$((pass + 1))
+  else
+    echo "  FAIL (varies): $1"
+    echo "    two processes both produced \`$a\`"
     fails=$((fails + 1))
   fi
 }
@@ -871,7 +891,7 @@ bare="$(mktemp -d)"
 mkdir -p "$bare/app/src/app"
 printf '{:paths ["src"]}\n' > "$bare/app/deps.edn"
 printf '(ns app.core)\n(defn -main [& _] (println "bare:" (+ 40 2)))\n' > "$bare/app/src/app/core.clj"
-abs_jolt="$(cd "$(dirname "$JOLT_BIN")" && pwd)/$(basename "$JOLT_BIN")"
+abs_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
 if ( cd "$bare/app" && "$abs_jolt" build -m app.core -o app >/dev/null 2>&1 )    && [ "$("$bare/app/app" 2>/dev/null | tail -1)" = "bare: 42" ]; then
   pass=$((pass + 1))
 else
@@ -890,7 +910,7 @@ stale="$(mktemp -d)"
 mkdir -p "$stale/proj/src/sp"
 printf '{:paths ["src"] :aliases {:run {:main-opts ["-m" "sp.core"]}}}\n' > "$stale/proj/deps.edn"
 printf '(ns sp.core)\n(defn -main [& _] (println "cwd-wins:" (System/getProperty "user.dir")))\n' > "$stale/proj/src/sp/core.clj"
-abs_jolt2="$(cd "$(dirname "$JOLT_BIN")" && pwd)/$(basename "$JOLT_BIN")"
+abs_jolt2="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
 stale_out="$( cd "$stale/proj" && PWD=/definitely/not/here "$abs_jolt2" -M:run 2>&1 )"
 if printf '%s' "$stale_out" | grep -q "cwd-wins:.*/proj"; then
   pass=$((pass + 1))
@@ -910,6 +930,33 @@ else
   fails=$((fails + 1))
 fi
 rm -rf "$stale"
+
+# --- randomness is per-process and per-thread -------------------------------
+# Clojure on the JVM seeds Math/random from the clock, so every process draws a
+# different stream. jolt must match: a fixed seed makes rand-int, random-uuid
+# and Math/random agree across unrelated processes.
+check_varies '(rand-int 1000000000)'
+check_varies '(rand)'
+check_varies '(Math/random)'
+check_varies '(str (random-uuid))'
+check_varies '(str (java.util.UUID/randomUUID))'
+# Chez keeps the PRNG state per thread, and a forked thread started from the same
+# default seed — so two threads in ONE process drew identical "random" values.
+check '(let [t (atom nil) th (Thread. (fn [] (reset! t (rand-int 1000000000))))] (.start th) (.join th) (= @t (rand-int 1000000000)))' 'false'
+check '(let [n 8 out (atom []) ths (doall (map (fn [_] (Thread. (fn [] (swap! out conj (str (random-uuid)))))) (range n)))] (doseq [t ths] (.start t)) (doseq [t ths] (.join t)) (count (distinct @out)))' '8'
+# (java.util.Random.) with no seed fed a time OBJECT to truncate and always threw.
+check '(int? (.nextInt (java.util.Random.) 1000))' 'true'
+check_varies '(.nextInt (java.util.Random.) 1000000000)'
+# An explicit seed must still reproduce the JVM's exact LCG stream (values taken
+# from a real JVM, not derived from jolt's own implementation).
+check '(let [r (java.util.Random. 42)] [(.nextInt r 100) (.nextInt r 100) (.nextInt r 100)])' '[30 63 48]'
+check '(let [r (java.util.Random. 42)] [(.nextInt r 64) (.nextInt r 64)])' '[46 3]'
+check '(.nextLong (java.util.Random. 12345))' '6674089274190705457'
+# random-uuid draws from the OS CSPRNG, not the seeded PRNG. The fallback is
+# deliberately loud, so its absence is the assertion that entropy was reached —
+# a silent degradation here ships guessable session ids.
+check_no '(dotimes [_ 100] (random-uuid))' 'no OS entropy'
+check '(let [u (str (random-uuid))] [(count u) (nth u 14) (contains? #{\8 \9 \a \b} (nth u 19))])' '[36 \4 true]'
 
 echo "cli smoke: $pass passed, $fails failed"
 [ "$fails" -eq 0 ]

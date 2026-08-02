@@ -18,7 +18,7 @@
 ;; rand: a flonum in [0, n) (n defaults to 1.0) — jolt is all-flonum, so the
 ;; result is a double like every other number.
 (define (jolt-rand . n)
-  (let ((r (random 1.0)))
+  (let ((r (jolt-random 1.0)))
     (if (null? n) r (* r (exact->inexact (car n))))))
 
 (def-var! "clojure.core" "hash-map" jolt-hash-map-fn)

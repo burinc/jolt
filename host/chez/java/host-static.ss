@@ -246,8 +246,10 @@
 (define lib-class-providers
   (list
    (vector "jolt.crypto" "io.github.jolt-lang/jolt-crypto"
+           ;; SecureRandom is NOT here: the runtime implements it natively over the
+           ;; OS CSPRNG, so it needs no dependency — it is a JDK class on the JVM
+           ;; and reaching for one should not make a program declare a library.
            '("MessageDigest" "java.security.MessageDigest"
-             "SecureRandom" "java.security.SecureRandom"
              "Mac" "javax.crypto.Mac"
              "Cipher" "javax.crypto.Cipher"
              "SecretKeySpec" "javax.crypto.spec.SecretKeySpec"
