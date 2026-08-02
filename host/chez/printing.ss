@@ -49,9 +49,14 @@
 ;; *print-namespace-maps* shared-ns detector: returns the namespace string when
 ;; the map is non-empty, the var is true, every key is a namespace-qualified
 ;; keyword, and they all share the same (non-nil) namespace. Otherwise #f.
+;; resolved once — see pr-readably-cell (rt.ss) for why the cached cell is safe
+(define ns-maps-cell #f)
 (define (pr-ns-maps-shared-ns pairs)
   (and (pair? pairs)
-       (jolt-truthy? (jolt-var-get (jolt-var "clojure.core" "*print-namespace-maps*")))
+       (begin
+         (unless ns-maps-cell
+           (set! ns-maps-cell (jolt-var "clojure.core" "*print-namespace-maps*")))
+         (jolt-truthy? (jolt-var-get ns-maps-cell)))
        (keyword? (caar pairs))
        (let ((ns (keyword-t-ns (caar pairs))))
          (and ns (not (string=? ns ""))
@@ -181,6 +186,7 @@
 ;; suppressed while __with-out-str captures output to a string port: there the
 ;; redirect, not *out*, defines where text goes (pr-str / print-str rely on it).
 (define jolt-pprint-hook-suppressed (make-thread-parameter #f))
+(define out-cell #f)
 (define (jolt-write s)
   (cond ((and (not (jolt-nil? jolt-pprint-write-hook))
               (not (jolt-pprint-hook-suppressed))
@@ -192,7 +198,13 @@
         ;; which is why this tests for a write METHOD rather than for jhost:
         ;; keying on the representation silently skipped every reify Writer.
         ;; The default port-writer over stdout keeps the fast port path below.
-        ((let ((w (var-deref "clojure.core" "*out*")))
+        ;; resolved once — see pr-readably-cell (rt.ss). var-cell-deref, NOT
+        ;; var-cell-root: *out* is what with-out-str rebinds, so the read has to
+        ;; stay on the binding stack.
+        ((let ((w (begin
+                    (unless out-cell
+                      (set! out-cell (jolt-var "clojure.core" "*out*")))
+                    (var-cell-deref out-cell))))
            (and (or (iface-method w "write" #f)
                     (and (jhost? w)
                          (not (and (string=? (jhost-tag w) "port-writer")
