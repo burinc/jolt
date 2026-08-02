@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.18] - 2026-08-02
+
+Two things a program cannot work without: knowing where it broke, and getting
+randomness that is actually random. An uncaught error printed no location at all
+for the ordinary shape — a `-main` that tail-calls the function that throws — and
+`.printStackTrace` did not exist on the value a `catch` binds. Separately, every
+jolt process replayed one identical stream of "random" values, so a fleet minted
+colliding UUIDs, and the UUIDs were guessable even once they were unique.
+
 ### Changed
 
 - **A runtime error names the fn, file and line it came from, without setting
