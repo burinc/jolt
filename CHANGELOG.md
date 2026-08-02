@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A runtime error names the fn, file and line it came from, without setting
+  anything.** The tail-frame history that survives tail-call elimination is on by
+  default when running from source (`jolt run`, `-m`, `-M`, `-e`, the REPL); it was
+  behind `JOLT_TRACE` before. This is what a plain uncaught error looked like:
+
+  ```
+  Unhandled exception: Divide by zero
+  ```
+
+  and now:
+
+  ```
+  Unhandled exception: Divide by zero
+    trace:
+      app.core/boom (src/app/core.clj:4)
+      app.core/-main (src/app/core.clj:8)
+  ```
+
+  Each line is the one reached **inside that frame** — where the innermost
+  function threw, and where every frame above it made its call — the same thing a
+  JVM stack trace reports per frame, rather than the line each function happened
+  to be defined on. The compiler sets the current line before each call and a
+  function's entry records its caller's, so a frame's own line is the one recorded
+  by the frame below it. `.printStackTrace` snapshots the throwing line on entry to
+  the `catch`, so it reports the fault rather than the handler.
+
+  The reporter walked Chez's live continuation, which TCO erases a tail-called
+  frame from — so for the ordinary shape, `-main` tail-calling a fn that throws,
+  every frame was gone and the error printed with no location at all. A *non*-tail
+  call always worked, which is why this kept looking fixed when it was checked.
+
+  Set `JOLT_TRACE=0` to opt out. The cost is a ring push per entry in code compiled
+  at runtime; core is unaffected (the seed prelude is already compiled), so a
+  seq/string/map workload measures the same either way, and it is only visible in
+  code that is almost entirely user-level calls — a fib microbenchmark pays about
+  7x. A `jolt build` binary is unchanged: its prologues are decided at build time,
+  so it carries no tracing and no per-call cost unless built with it on.
+
+  Tracing itself also got ~2.5x cheaper even with the per-frame lines added
+  (per-thread state moved from thread parameters, whose writes cost ~32ns each, to
+  Chez virtual registers at ~1ns, and the ring sizes are powers of two so a wrap is
+  a mask rather than a division).
+
+### Added
+
+- **`java.security.SecureRandom`**, implemented natively over the same OS
+  entropy: `nextBytes`, `nextInt` (both arities), `nextLong`, `nextDouble`,
+  `nextFloat`, `nextBoolean`, `generateSeed`, `setSeed`, and the `getInstance` /
+  `getInstanceStrong` statics. `nextInt(bound)` rejection samples rather than
+  taking a bare modulo, which would bias toward the low residues. It no longer
+  auto-loads `jolt-crypto`: it is a JDK class on the JVM, and reaching for one
+  should not make a program declare a dependency.
+
 ### Fixed
 
 - **`rand`, `rand-int`, `Math/random` and `random-uuid` now differ between
@@ -27,22 +82,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RtlGenRandom` on Windows. If a host offers no entropy source at all the
   fallback says so on stderr rather than degrading quietly.
 
-### Added
-
-- **`java.security.SecureRandom`**, implemented natively over the same OS
-  entropy: `nextBytes`, `nextInt` (both arities), `nextLong`, `nextDouble`,
-  `nextFloat`, `nextBoolean`, `generateSeed`, `setSeed`, and the `getInstance` /
-  `getInstanceStrong` statics. `nextInt(bound)` rejection samples rather than
-  taking a bare modulo, which would bias toward the low residues. It no longer
-  auto-loads `jolt-crypto`: it is a JDK class on the JVM, and reaching for one
-  should not make a program declare a dependency.
-
-### Fixed
 
 - **`(java.util.Random.)` with no seed never worked.** It seeded from
   `(truncate (current-time))`, and `current-time` answers a time object rather
   than a number, so the no-arg constructor always threw. Seeded instances were
   unaffected and still reproduce the JVM's exact LCG stream.
+
+- **`.waitFor` on a subprocess can no longer hang forever.** It issued a blocking
+  `waitpid`, which parks in the kernel — and when `SIGCHLD` is `SIG_IGN`, POSIX has
+  wait block until *every* child has terminated before failing with `ECHILD`, so a
+  child that became a zombie beforehand left it parked for good, with the whole
+  process at 0% CPU. A program that sets `SIG_IGN` itself or inherits it could hang
+  on any `.waitFor`. It polls with `WNOHANG` now (0.2ms backing off to 10ms), the
+  way the timed `waitFor` already did, so no signal disposition can park it.
+
+  Found because tracing shifts timing enough to make the process suite hit this
+  every run instead of rarely; the hang predates that and is not caused by it.
+
+- **`.printStackTrace` exists on every exception, and prints the trace.** It was
+  reachable only on a raw Chez condition, so on the value a `catch` actually binds
+  — an ex-info, or any typed host throwable — it answered `No matching method
+  printStackTrace found for java.lang.ArithmeticException`. It now prints
+  `class: message` followed by the same backtrace an uncaught error reports, to
+  stderr or to a `PrintWriter`/`PrintStream` passed as its argument.
+
+  The cause was that `java.lang.Throwable`'s methods were restated in two places
+  that drifted. They are one table now (`throwable-method`), inherited by every
+  exception class the way the JVM inherits them from `Throwable`, which also filled
+  in `.getLocalizedMessage`, `.getSuppressed` and `.fillInStackTrace` — each of
+  which existed on one kind of throwable and not the other.
 
 ## [0.5.17] - 2026-08-01
 

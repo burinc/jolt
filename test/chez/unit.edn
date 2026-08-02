@@ -1562,4 +1562,31 @@
   ;; A PARTIAL provider value merges over ROOT: only :months is stated, and MMMM
   ;; still answers.
   {:suite "date names" :expr "(do (jolt.host/register-extension! :date-names \"de-test\" {:months [\"Januar\" \"Februar\" \"März\" \"April\" \"Mai\" \"Juni\" \"Juli\" \"August\" \"September\" \"Oktober\" \"November\" \"Dezember\"]}) (.format (java.text.SimpleDateFormat. \"MMMM\" 'de-test) (java.util.Date. 1393632000000)))" :expected "\"März\""}
+
+  ;; ---- java.lang.Throwable: one inherited surface -------------------------
+  ;; These were split between the raw-condition arm and the ex-info arm, so a
+  ;; method existed on one kind of throwable and not the other. .printStackTrace
+  ;; was the reported case: present on a Chez condition, missing on every ex-info
+  ;; and typed host throwable, which is what a `catch` actually binds. Each row
+  ;; below runs against all three shapes for that reason.
+  {:suite "throwable" :expr "(try (/ 1 0) (catch Exception e [(.getMessage e) (.getLocalizedMessage e)]))" :expected "[\"Divide by zero\" \"Divide by zero\"]"}
+  {:suite "throwable" :expr "(try (throw (ex-info \"boom\" {})) (catch Exception e (.getLocalizedMessage e)))" :expected "\"boom\""}
+  {:suite "throwable" :expr "(try (throw (Exception. \"plain\")) (catch Exception e (.getLocalizedMessage e)))" :expected "\"plain\""}
+  ;; jolt never suppresses, so empty is the JVM's own answer here, not a stand-in.
+  {:suite "throwable" :expr "(try (/ 1 0) (catch Exception e (vec (.getSuppressed e))))" :expected "[]"}
+  {:suite "throwable" :expr "(try (throw (ex-info \"boom\" {})) (catch Exception e (vec (.getSuppressed e))))" :expected "[]"}
+  ;; JVM contract: fillInStackTrace returns this. jolt has no stack to refill.
+  {:suite "throwable" :expr "(try (/ 1 0) (catch Exception e (identical? e (.fillInStackTrace e))))" :expected "true"}
+  {:suite "throwable" :expr "(try (throw (ex-info \"boom\" {})) (catch Exception e (identical? e (.fillInStackTrace e))))" :expected "true"}
+  ;; printStackTrace writes to stderr and yields nil, on every throwable shape.
+  ;; Asserted through nil? because the harness compares PRINTED output, where a
+  ;; bare nil is the empty string and would pass against almost anything.
+  {:suite "throwable" :expr "(try (/ 1 0) (catch Exception e (nil? (.printStackTrace e))))" :expected "true"}
+  {:suite "throwable" :expr "(try (throw (ex-info \"boom\" {:a 1})) (catch Exception e (nil? (.printStackTrace e))))" :expected "true"}
+  {:suite "throwable" :expr "(try (throw (Exception. \"plain\")) (catch Exception e (nil? (.printStackTrace e))))" :expected "true"}
+  ;; the 1-arg overload writes the same rendering to a writer instead of stderr
+  {:suite "throwable" :expr "(let [w (java.io.StringWriter.)] (try (throw (Exception. \"plain\")) (catch Exception e (.printStackTrace e w))) (.startsWith (str w) \"java.lang.Exception: plain\"))" :expected "true"}
+  ;; ExceptionInfo.toString appends the data map on the JVM too, so the trailing
+  ;; {} is parity, not jolt leaking its own rendering.
+  {:suite "throwable" :expr "(try (throw (ex-info \"boom\" {})) (catch Exception e (.toString e)))" :expected "\"clojure.lang.ExceptionInfo: boom {}\""}
 ]

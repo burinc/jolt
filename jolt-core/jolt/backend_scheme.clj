@@ -151,6 +151,25 @@
 (defn set-trace-frames! [on] (reset! (:trace-frames? (cur)) (boolean on)))
 (defn- trace-frames? [] @(:trace-frames? (cur)))
 
+;; The line an :invoke node sits on, or nil. The analyzer stamps :pos on every call
+;; form the reader gave a position to; a macro-built form carries none.
+(defn- node-line [node]
+  (let [p (:pos node)] (when (map? p) (:line p))))
+
+;; Under tracing, set the current line right before a call. That single virtual
+;; register store is what gives a backtrace a per-frame line: the callee's entry
+;; prologue reads it, so each ring entry carries the line its CALLER was on, and a
+;; frame's own line is the one recorded by the frame below it. Without this a frame
+;; could only report the line its function was DEFINED on, which in a long function
+;; points nowhere near the fault.
+;;
+;; `begin` keeps this transparent in every position, tail included — the call stays
+;; the last form, so TCO is unaffected.
+(defn- with-line [node s]
+  (if-let [l (and (trace-frames?) (node-line node))]
+    (str "(begin (jolt-line! " l ") " s ")")
+    s))
+
 ;; Source-map registration for a fn def: one hashtable insert at definition time,
 ;; no per-call cost, so a backtrace can name a frame ns/name (file:line) instead of
 ;; falling back to its bare Chez procedure name. On for runtime eval
@@ -1129,9 +1148,22 @@
 ;; success, catch and escape — Clojure finally semantics). Both keys optional.
 (defn- emit-try [node]
   (let [core (if-let [cs (:catch-sym node)]
-               (let [raw (munge-name (:catch-raw-sym node))]
+               (let [raw (munge-name (:catch-raw-sym node))
+                     ;; Snapshot the throwing line BEFORE the handler body runs:
+                     ;; the body's own calls move the current line, so by the time
+                     ;; it reaches .printStackTrace the line would be the handler's
+                     ;; rather than the fault's. Saved and restored, so a nested
+                     ;; catch cannot leave its throw's line behind for an outer
+                     ;; handler that runs later. Only under tracing — with it off
+                     ;; there are no line stores to snapshot.
+                     cl (when (trace-frames?) (fresh-label "_cl$"))]
                  (str "(guard (" raw " (else (let ((" (munge-name cs) " (jolt-unwrap-throw " raw "))) "
-                      "(let ((r " (emit (:catch-body node)) ")) (jolt-catch-complete!) r)))) "
+                      (if cl (str "(let ((" cl " (jolt-catch-enter!))) ") "")
+                      "(let ((r " (emit (:catch-body node)) ")) "
+                      (if cl (str "(jolt-catch-leave! " cl ") ") "")
+                      "(jolt-catch-complete!) r)"
+                      (if cl ")" "")
+                      "))) "
                       (emit (:body node)) ")"))
                (emit (:body node)))]
     (if-let [fin (:finally node)]
@@ -1216,9 +1248,10 @@
 ;; a sibling. The non-eligible path is byte-identical to before (no clone emitted).
 (defn- emit-invoke-maybe-clone [node]
   (let [base (emit-invoke node)]
-    (if-some [c (emit-impl-clone node)]
-      (str "(begin " c " " base ")")
-      base)))
+    (with-line node
+      (if-some [c (emit-impl-clone node)]
+        (str "(begin " c " " base ")")
+        base))))
 
 (defn emit* [node]
   (case (:op node)

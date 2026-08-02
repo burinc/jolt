@@ -119,6 +119,89 @@
 
 (def-var! "clojure.core" "instance-check" instance-check)
 
+;; ---- java.lang.Throwable: the surface EVERY throwable inherits ---------------
+;; On the JVM these are declared on Throwable itself, so every exception class has
+;; them by inheritance and no shim ever needs to restate them. jolt had no such
+;; place: the method bodies were duplicated across the `condition?` arm in
+;; records.ss and dot-object-method in dot-forms.ss, which is exactly how the two
+;; drifted — .printStackTrace existed on a raw Chez condition and was missing on
+;; every ex-info / (Exception. …) / typed host throwable, and .getLocalizedMessage
+;; the other way round. This is the single table both paths call.
+;;
+;; jolt models a throwable two ways: a jolt-ex-info-record (ex-info, and every
+;; typed host throwable via jolt-host-throwable) or a raw Chez condition (an error
+;; the host itself raised). Both answer here.
+;;
+;; Returns a BOXED result (a one-element list) or #f for "not a Throwable method",
+;; matching dot-object-method — a legitimate nil/#f result has to stay
+;; distinguishable from "no such method".
+(define (jolt-throwable-value? v)
+  (or (jolt-ex-info-record? v) (condition? v)))
+
+(define (jolt-throwable-message v)
+  (cond ((jolt-ex-info-record? v) (jolt-ex-info-record-message v))
+        ((condition? v) (condition->message-string v))
+        (else jolt-nil)))
+
+;; "class: message", the JVM Throwable.toString. jolt-str-render-one already
+;; renders an ex-info record that way (source-registry.ss); a raw condition has no
+;; class of its own, so its message stands alone.
+(define (jolt-throwable-tostring v)
+  (if (condition? v) (condition->message-string v) (jolt-str-render-one v)))
+
+;; Throwable.printStackTrace: the header line, then the same Clojure backtrace the
+;; uncaught reporter prints. Called from a catch clause the throw's captured
+;; continuation is still live (the emitted catch runs jolt-catch-complete! only
+;; AFTER the body), so the trace is the one that led to this throwable.
+;; jolt-backtrace-string lives in source-registry.ss, which loads after this file —
+;; a top-level forward reference, resolved at call time.
+(define (jolt-throwable-print-stack-trace v port)
+  (display (jolt-throwable-tostring v) port)
+  (newline port)
+  (let ((bt (guard (e (#t #f)) (jolt-backtrace-string v))))
+    (when bt (display bt port)))
+  jolt-nil)
+
+;; The target of a 1-arg .printStackTrace — a PrintStream / PrintWriter shim. Route
+;; through the target's own .write, so any writer (io.ss's, a library's) works.
+;; rest-args is a JOLT seq, not a Scheme list: passing a raw list made every
+;; dispatch miss. A target with no .write raises from there, which is the right
+;; report — swallowing it and quietly printing to stderr instead is what hid this.
+(define (jolt-throwable-print-to v target)
+  (let ((s (let ((p (open-output-string)))
+             (jolt-throwable-print-stack-trace v p)
+             (get-output-string p))))
+    (record-method-dispatch target "write" (jolt-list s))
+    jolt-nil))
+
+(define (throwable-method obj name args)
+  (cond
+    ((or (string=? name "getMessage") (string=? name "getLocalizedMessage"))
+     (list (jolt-throwable-message obj)))
+    ((string=? name "toString") (list (jolt-throwable-tostring obj)))
+    ((string=? name "getCause")
+     (list (if (jolt-ex-info-record? obj) (jolt-ex-info-record-cause obj) jolt-nil)))
+    ;; java.sql.SQLException chaining — jolt throwables don't chain.
+    ((string=? name "getNextException") (list jolt-nil))
+    ;; java.text.ParseException.getErrorOffset — the int its ctor stashed.
+    ((string=? name "getErrorOffset")
+     (list (if (jolt-ex-info-record? obj) (jolt-ex-info-record-error-offset obj) 0)))
+    ;; jolt reifies no StackTraceElement array: TCO erases caller frames, so there
+    ;; is no faithful per-frame array to hand back. Empty, like a JVM throwable
+    ;; whose stack trace has been stripped. The real frames are what
+    ;; printStackTrace renders, and what an uncaught error reports.
+    ((string=? name "getStackTrace") (list (jolt-vector)))
+    ;; jolt never suppresses: an empty array is the JVM's own answer for a
+    ;; throwable with nothing suppressed, so this is exact rather than a stand-in.
+    ((string=? name "getSuppressed") (list (jolt-vector)))
+    ;; JVM contract is "returns this"; jolt has no stack to refill.
+    ((string=? name "fillInStackTrace") (list obj))
+    ((string=? name "printStackTrace")
+     (list (if (pair? args)
+               (jolt-throwable-print-to obj (car args))
+               (jolt-throwable-print-stack-trace obj (current-error-port)))))
+    (else #f)))
+
 ;; Broad-catch fallback for catch-clause dispatch (analyze-try desugars
 ;; (catch C e …) to (or (instance? C e) (__catch-broad? "C" e))). A jolt host
 ;; condition or a raw raised value carries no jolt exception class, so instance?
