@@ -141,8 +141,16 @@
 ;; Arms dispatch newest-registration-first (cons front, walk head-first), matching
 ;; the precedence the set! chains produced. The built-in types stay inline in
 ;; jolt-seq itself.
+;; Records are NOT on this fast path — jolt-seq walks the arms for them — so the
+;; probe list deliberately omits jrec even though jolt-get's includes it. See
+;; reject-fast-type-claim! (values.ss).
+(define (seq-fast-probes)
+  (list jolt-nil jolt-empty-list (probe-cseq) (probe-pvec) (probe-pmap) (probe-pset) "s"))
+(define (seq-arm-reject-fast-type! who pred)
+  (reject-fast-type-claim! who pred (seq-fast-probes) "the jolt-seq fast path"))
 (define jolt-seq-arms '())
 (define (register-seq-arm! pred handler)
+  (seq-arm-reject-fast-type! 'register-seq-arm! pred)
   (set! jolt-seq-arms (cons (cons pred handler) jolt-seq-arms)))
 
 (define (jolt-seq x)

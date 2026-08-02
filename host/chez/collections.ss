@@ -480,8 +480,29 @@
 ;; A host shim registers a type's get via register-get-arm! (handler: (coll k d) ->
 ;; value) instead of set!-wrapping jolt-get — disjoint coll types, checked before the
 ;; base map/set/vec/string cases (cf. register-hash-arm!).
+;; Shared probe values for the collection fast paths. Built on demand, not at
+;; load: jolt-empty-list and list->cseq come from seq.ss and make-jrec from
+;; records.ss, both of which rt.ss loads after this file. Every arm registers
+;; later still. See reject-fast-type-claim! (values.ss) for why each registry
+;; passes its own subset rather than sharing one list — jolt-get answers records
+;; but not strings, count/empty/seq answer strings but not records.
+(define (probe-pvec) (jolt-vector))
+(define (probe-pmap) (jolt-hash-map))
+(define (probe-pset) empty-pset)
+(define (probe-cseq) (list->cseq (list 1)))
+;; Spliced, not listed: records.ss builds jrec-fast-type-probe well after
+;; transients.ss has already registered a get arm, so before that point there is
+;; simply no record to probe against.
+(define (probe-jrecs)
+  (probe-if-available (lambda () jrec-fast-type-probe)))
+
+(define (get-fast-probes)
+  (append (list (probe-pmap) (probe-pvec) (probe-pset)) (probe-jrecs)))
+(define (get-arm-reject-fast-type! who pred)
+  (reject-fast-type-claim! who pred (get-fast-probes) "the jolt-get fast path"))
 (define jolt-get-arms '())
 (define (register-get-arm! pred handler)
+  (get-arm-reject-fast-type! 'register-get-arm! pred)
   (set! jolt-get-arms (cons (cons pred handler) jolt-get-arms)))
 (define (jolt-get-base coll k d)
   (cond ((pmap? coll) (pmap-get coll k d))
@@ -552,8 +573,13 @@
 ;; extension types. jolt-seq / jolt-empty? / jolt-conj1 / jolt-nth /
 ;; jolt-contains? still use set! chains — migrate them to this registry the
 ;; same way when touched (each needs its own bench guard; seq is the hottest).
+(define (count-fast-probes)
+  (list (probe-pvec) (probe-pmap) (probe-pset) "s" jolt-nil jolt-empty-list (probe-cseq)))
+(define (count-arm-reject-fast-type! who pred)
+  (reject-fast-type-claim! who pred (count-fast-probes) "the jolt-count fast path"))
 (define jolt-count-arms '())
 (define (register-count-arm! pred handler)
+  (count-arm-reject-fast-type! 'register-count-arm! pred)
   (set! jolt-count-arms (cons (cons pred handler) jolt-count-arms)))
 (define (jolt-count-base coll)
   ;; arms exhausted: a deftype/record counts through its declared method.
@@ -633,15 +659,32 @@
                       (else (loop (cdr as))))))))
 
 ;; ---- contains? arms: host types register here instead of set!-wrapping jolt-contains? ---
+;; Widest of the four: contains? not only answers the collection types, it THROWS
+;; for the scalars (a number, boolean, keyword, symbol or char is not
+;; associative) before any arm is consulted. An arm claiming one of those would
+;; never run.
+(define (contains-fast-probes)
+  (append (list (probe-pmap) (probe-pset) (probe-pvec) jolt-nil "s"
+                (probe-cseq) jolt-empty-list 0 #t #f
+                (keyword #f "k") (jolt-symbol #f "s") #\a)
+          (probe-jrecs)))
+(define (contains-arm-reject-fast-type! who pred)
+  (reject-fast-type-claim! who pred (contains-fast-probes) "the jolt-contains? fast path"))
 (define jolt-contains-arms '())
 (define (register-contains-arm! pred handler)
+  (contains-arm-reject-fast-type! 'register-contains-arm! pred)
   (set! jolt-contains-arms (cons (cons pred handler) jolt-contains-arms)))
 
 ;; ---- empty? arms: host types register here instead of set!-wrapping jolt-empty? ---
 ;; Arms dispatch newest-registration-first, matching the set!-chain precedence.
 ;; The built-in types stay inline; arms checked before the seq-based fallback.
+(define (empty-fast-probes)
+  (list jolt-nil (probe-pvec) (probe-pmap) (probe-pset) "s" jolt-empty-list (probe-cseq)))
+(define (empty-arm-reject-fast-type! who pred)
+  (reject-fast-type-claim! who pred (empty-fast-probes) "the jolt-empty? fast path"))
 (define jolt-empty-arms '())
 (define (register-empty-arm! pred handler)
+  (empty-arm-reject-fast-type! 'register-empty-arm! pred)
   (set! jolt-empty-arms (cons (cons pred handler) jolt-empty-arms)))
 
 (define (jolt-empty? coll)
