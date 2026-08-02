@@ -275,10 +275,21 @@
 ;; binding — and only consults the var when the slot is unset. A fresh thread
 ;; starts the slot at fixnum 0, so a stored #f (readably off) stays distinct from
 ;; "unset"; jolt-var/-get resolve at call time (vars.ss / rt.ss load later).
+;; Resolved once and reused: jolt-var rebuilds "clojure.core/*print-readably*"
+;; with string-append and hashes it on every call, which on a per-item path is
+;; the whole cost of the lookup. The cell is stable under redefinition —
+;; def-var! mutates the root in place — and jolt-var-get still consults the
+;; binding stack, so a (binding [*print-readably* …]) is honoured. Lazily, since
+;; vars.ss/rt.ss finish loading after this point. Same shape as pm-cell
+;; (io-streams.ss) and the cells the backend emits for compiled code.
+(define pr-readably-cell #f)
 (define (jolt-pr-readable?)
   (let ((o (virtual-register jolt-vreg-print-readably)))
     (if (eq? o 0)
-        (jolt-truthy? (jolt-var-get (jolt-var "clojure.core" "*print-readably*")))
+        (begin
+          (unless pr-readably-cell
+            (set! pr-readably-cell (jolt-var "clojure.core" "*print-readably*")))
+          (jolt-truthy? (jolt-var-get pr-readably-cell)))
         (jolt-truthy? o))))
 (define (jolt-trace-ring) (let ((h (virtual-register jolt-vreg-trace-ring))) (and (vector? h) h)))
 (define (jolt-trace-ring-set! h) (set-virtual-register! jolt-vreg-trace-ring h))
