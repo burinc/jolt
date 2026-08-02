@@ -103,29 +103,42 @@
               (display (string-append "  [frame] " nm (if src " *MAPPED*"
                                                           (if keep? "" " (skipped)")) "\n")
                        (current-error-port)))
+            ;; No per-frame line from this source: the continuation carries no jolt
+            ;; positions, so each frame falls back to where its fn was defined.
             (loop (guard (e (#t #f)) (io 'link)) (fx+ n 1)
-                  (if keep? (cons (cons nm src) acc) acc))))))))
+                  (if keep? (cons (srcreg-frame nm src #f) acc) acc))))))))
 
 ;; Render a list of (frame-name . record) pairs (innermost/deepest first) to a
 ;; backtrace string. record is a source vector #(ns name file line) -> "ns/name
 ;; (file:line)", or 'ambiguous / #f -> the bare frame name. A run of the same
 ;; frame-name collapses to one "name (xN)" line (deep recursion, or a hot fn a
 ;; loop re-enters), and the number of distinct lines is capped.
+;; A frame to render: #(frame-name record own-line). own-line is the line reached
+;; INSIDE that frame (#f when unknown), which is what the JVM prints per frame and
+;; what a reader needs; the record's own line is where the function was DEFINED and
+;; is only the fallback.
+(define (srcreg-frame name record line) (vector name record line))
+(define (srcreg-frame-nm f) (vector-ref f 0))
+(define (srcreg-frame-rec f) (vector-ref f 1))
+(define (srcreg-frame-line f) (vector-ref f 2))
+
 (define (jolt-render-recs recs)
   (let ((port (open-output-string)))
     (let loop ((rs recs) (shown 0))
       (if (or (null? rs) (fx>=? shown 30))
           (get-output-string port)
-          (let* ((p (car rs)) (frame-name (car p)) (r (cdr p)))
+          (let* ((f (car rs)) (frame-name (srcreg-frame-nm f)) (r (srcreg-frame-rec f)))
             ;; count a maximal run of the same frame-name
             (let run ((tail (cdr rs)) (cnt 1))
-              (if (and (pair? tail) (string=? (car (car tail)) frame-name))
+              (if (and (pair? tail) (string=? (srcreg-frame-nm (car tail)) frame-name))
                   (run (cdr tail) (fx+ cnt 1))
                   (begin
                     (put-string port "    ")
                     (if (vector? r)
-                        (let ((ns (vector-ref r 0)) (nm (vector-ref r 1))
-                              (file (vector-ref r 2)) (line (vector-ref r 3)))
+                        (let* ((ns (vector-ref r 0)) (nm (vector-ref r 1))
+                               (file (vector-ref r 2))
+                               ;; the line reached in this frame, else where it was defined
+                               (line (or (srcreg-frame-line f) (vector-ref r 3))))
                           (put-string port ns) (put-string port "/") (put-string port nm)
                           (when (string? file)
                             (put-string port " (") (put-string port file)
@@ -148,16 +161,27 @@
 ;; The tail-frame history ring rendered as a backtrace, or #f when tracing is off /
 ;; empty. A mapped frame is kept; else drop plumbing (same rule as the continuation
 ;; path) so the two sources read consistently.
+;; jolt-trace-snapshot yields (name . call-site-line) innermost-first, where the
+;; line is the one the CALLER was on — the emitter sets it just before the call and
+;; the callee's prologue reads it going in. So a frame's OWN line is the line
+;; recorded by the entry one step deeper, and the innermost frame's comes from the
+;; live line at the throw. Do the shift on the RAW list, before dropping plumbing
+;; frames: a dropped frame still recorded the line of the frame outside it, and
+;; filtering first would hand that line to the wrong function.
 (define (jolt-history-backtrace)
   (let* ((hist (jolt-trace-snapshot))
-         (recs (let loop ((ns hist) (acc '()))
-                 (if (null? ns)
-                     (reverse acc)
-                     (let* ((nm (car ns)) (src (hashtable-ref source-registry nm #f)))
-                       (loop (cdr ns)
-                             (if (or src (not (srcreg-plumbing-name? nm)))
-                                 (cons (cons nm src) acc) acc)))))))
-    (and (pair? recs) (jolt-render-recs recs))))
+         (frames (let loop ((es hist) (prev (jolt-throw-line)) (acc '()))
+                   (if (null? es)
+                       (reverse acc)
+                       (let* ((e (car es)) (nm (car e)) (line (cdr e))
+                              (src (hashtable-ref source-registry nm #f))
+                              (own (and (fixnum? prev) (fx>? prev 0) prev)))
+                         (loop (cdr es)
+                               line
+                               (if (or src (not (srcreg-plumbing-name? nm)))
+                                   (cons (srcreg-frame nm src own) acc)
+                                   acc)))))))
+    (and (pair? frames) (jolt-render-recs frames))))
 
 (define (jolt-backtrace-string v)
   (or (jolt-history-backtrace)

@@ -225,8 +225,22 @@
 (define jolt-trace-outer-mask 63)
 (define jolt-trace-inner-size 8)           ; tail-calls kept per subproblem
 (define jolt-trace-inner-mask 7)
-;; A history: #(ribs-vector outer-head outer-count). A rib: #(name-vector head count).
-(define (jolt-make-rib) (vector (make-vector jolt-trace-inner-size #f) 0 0))
+;; A history: #(ribs-vector outer-head outer-count).
+;; A rib: #(name-vector line-vector head count) — names and CALL-SITE LINES in
+;; parallel vectors rather than a pair per entry, so a push allocates nothing.
+;;
+;; The line stored with an entry is the line the CALLER was on when it made this
+;; call, not a line inside the entry's own function: the emitter sets the current
+;; line before each call, and the callee's prologue reads it on the way in. Which
+;; means a frame's OWN line is the line recorded by the frame one level deeper
+;; (and, for the innermost frame, the current line at the throw). That shift is
+;; where a per-frame line comes from at all — a function has one definition
+;; position but is at a different line at each call it makes, and the JVM's
+;; per-frame line is the latter.
+(define (jolt-make-rib)
+  (vector (make-vector jolt-trace-inner-size #f)
+          (make-vector jolt-trace-inner-size 0)
+          0 0))
 (define (jolt-make-history)
   (let ((ribs (make-vector jolt-trace-outer-size #f)))
     (let loop ((i 0))
@@ -246,12 +260,14 @@
 ;; kept tracing opt-in. Reads are ~2.4ns vs ~3.3ns, a smaller but free win.
 ;;
 ;; Virtual registers are a fixed global resource: (virtual-register-count) slots for
-;; the whole process (16 on every platform jolt targets). jolt claims two, allocated
+;; the whole process (16 on every platform jolt targets). jolt claims four, allocated
 ;; here so the assignment is in one place; nothing else in the runtime uses them.
 ;; A freshly forked thread starts every slot at fixnum 0, NOT #f — so "no ring yet"
-;; is tested with vector?, never with a truthiness check.
+;; is tested with vector?, never with a truthiness check, and line 0 means "unknown".
 (define jolt-vreg-trace-ring 0)
 (define jolt-vreg-trace-tail 1)
+(define jolt-vreg-line 2)        ; line currently executing in traced code
+(define jolt-vreg-catch-line 3)  ; line at the throw a catch clause is handling
 (define (jolt-trace-ring) (let ((h (virtual-register jolt-vreg-trace-ring))) (and (vector? h) h)))
 (define (jolt-trace-ring-set! h) (set-virtual-register! jolt-vreg-trace-ring h))
 (define (jolt-trace-tail?) (eq? (virtual-register jolt-vreg-trace-tail) #t))
@@ -275,49 +291,84 @@
       (set-virtual-register! jolt-vreg-trace-tail #f))))
 (define (jolt-trace-mark! t) (set-virtual-register! jolt-vreg-trace-tail t))
 
-;; push name into a rib's inner ring
-(define (jolt-rib-push! rib name)
-  (let ((buf (vector-ref rib 0)) (i (vector-ref rib 1)) (cnt (vector-ref rib 2)))
+;; The emitter calls this before every call it compiles, with that call's source
+;; line. One virtual-register store, ~1ns — the cheapest thing that can answer
+;; "which line are we on" without a per-expression allocation or a stack discipline
+;; that tail calls would break.
+(define (jolt-line! n) (set-virtual-register! jolt-vreg-line n))
+;; The line to report for the INNERMOST frame. Inside a catch clause that is the
+;; line the throw came from, captured on the way in — by the time the handler runs,
+;; the handler's own calls have long since moved the current line. 0 means unknown.
+(define (jolt-throw-line)
+  (let ((c (virtual-register jolt-vreg-catch-line)))
+    (if (and (fixnum? c) (fx>? c 0))
+        c
+        (let ((l (virtual-register jolt-vreg-line)))
+          (and (fixnum? l) (fx>? l 0) l)))))
+;; Emitted around a catch clause's body: snapshot the throwing line and return the
+;; previous snapshot, which the paired leave restores. Save/restore rather than a
+;; bare set so a nested catch cannot leave an inner throw's line behind for an
+;; outer handler that runs afterwards.
+(define (jolt-catch-enter!)
+  (let ((prev (virtual-register jolt-vreg-catch-line))
+        (cur (virtual-register jolt-vreg-line)))
+    (set-virtual-register! jolt-vreg-catch-line (if (fixnum? cur) cur 0))
+    prev))
+(define (jolt-catch-leave! prev)
+  (set-virtual-register! jolt-vreg-catch-line (if (fixnum? prev) prev 0)))
+
+;; push name + the caller's current line into a rib's inner ring
+(define (jolt-rib-push! rib name line)
+  (let ((buf (vector-ref rib 0)) (lbuf (vector-ref rib 1))
+        (i (vector-ref rib 2)) (cnt (vector-ref rib 3)))
     (vector-set! buf i name)
-    (vector-set! rib 1 (fxand (fx+ i 1) jolt-trace-inner-mask))
-    (when (fx<? cnt jolt-trace-inner-size) (vector-set! rib 2 (fx+ cnt 1)))))
+    (vector-set! lbuf i line)
+    (vector-set! rib 2 (fxand (fx+ i 1) jolt-trace-inner-mask))
+    (when (fx<? cnt jolt-trace-inner-size) (vector-set! rib 3 (fx+ cnt 1)))))
 ;; a non-tail entry: advance the outer ring, reset the new rib, seed it with name
-(define (jolt-history-nontail! h name)
+(define (jolt-history-nontail! h name line)
   (let* ((ribs (vector-ref h 0)) (oh (vector-ref h 1)) (oc (vector-ref h 2))
          (rib (vector-ref ribs oh)))
-    (vector-set! rib 1 0) (vector-set! rib 2 0)
-    (jolt-rib-push! rib name)
+    (vector-set! rib 2 0) (vector-set! rib 3 0)
+    (jolt-rib-push! rib name line)
     (vector-set! h 1 (fxand (fx+ oh 1) jolt-trace-outer-mask))
     (when (fx<? oc jolt-trace-outer-size) (vector-set! h 2 (fx+ oc 1)))))
 ;; a tail entry: rotate the CURRENT rib's inner ring (bootstrap a rib if none yet)
-(define (jolt-history-tail! h name)
+(define (jolt-history-tail! h name line)
   (if (fx=? (vector-ref h 2) 0)
-      (jolt-history-nontail! h name)
+      (jolt-history-nontail! h name line)
       (let* ((ribs (vector-ref h 0))
              (cur (fxand (fx+ (fx- (vector-ref h 1) 1) jolt-trace-outer-size)
                          jolt-trace-outer-mask)))
-        (jolt-rib-push! (vector-ref ribs cur) name))))
+        (jolt-rib-push! (vector-ref ribs cur) name line))))
 ;; Record a frame entry, routed by the caller's tail mark; then reset the mark so a
 ;; subsequent entry reached WITHOUT a mark (e.g. via apply) defaults to non-tail.
+;; The line read here is the CALLER's — the emitter set it immediately before the
+;; call — so it belongs to the frame one level out. jolt-trace-snapshot hands the
+;; pairs to the reporter in that form and the reporter does the shift.
 (define (jolt-trace-push! name)
   (let ((h (jolt-trace-cur-ring)))
     (when h
-      (if (jolt-trace-tail?) (jolt-history-tail! h name) (jolt-history-nontail! h name))
+      (let ((line (let ((l (virtual-register jolt-vreg-line)))
+                    (if (fixnum? l) l 0))))
+        (if (jolt-trace-tail?)
+            (jolt-history-tail! h name line)
+            (jolt-history-nontail! h name line)))
       (set-virtual-register! jolt-vreg-trace-tail #f)))
   jolt-nil)
 
-;; a rib's inner names, most-recent (deepest) tail first
+;; a rib's inner entries as (name . call-site-line), most-recent (deepest) tail first
 (define (jolt-rib-names rib)
-  (let ((buf (vector-ref rib 0)) (head (vector-ref rib 1)) (cnt (vector-ref rib 2)))
+  (let ((buf (vector-ref rib 0)) (lbuf (vector-ref rib 1))
+        (head (vector-ref rib 2)) (cnt (vector-ref rib 3)))
     (let loop ((k 1) (acc '()))
       (if (fx>? k cnt)
           (reverse acc)
-          (loop (fx+ k 1)
-                (cons (vector-ref buf (fxand (fx+ (fx- head k) jolt-trace-inner-size)
-                                             jolt-trace-inner-mask))
-                      acc))))))
-;; The whole history flattened to frame-names, most-recent (deepest) first:
-;; current rib's tail-history, then its non-tail caller's, and so on outward.
+          (let ((i (fxand (fx+ (fx- head k) jolt-trace-inner-size) jolt-trace-inner-mask)))
+            (loop (fx+ k 1)
+                  (cons (cons (vector-ref buf i) (vector-ref lbuf i)) acc)))))))
+;; The whole history flattened to (name . call-site-line), most-recent (deepest)
+;; first: current rib's tail-history, then its non-tail caller's, and so on outward.
 (define (jolt-trace-snapshot)
   (let ((h (jolt-trace-ring)))
     (if (not h) '()

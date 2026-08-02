@@ -14,6 +14,9 @@
 #    TCO existed but was opt-in behind JOLT_TRACE, so nobody saw it. It is on by
 #    default on the source-run path now. A NON-tail call kept working throughout,
 #    which is why this looked fixed each time it was checked with a nested call.
+#    A frame also reported the line its function was DEFINED on rather than the
+#    line reached inside it, so even a working trace pointed at a defn dozens of
+#    lines above the fault.
 #
 # 2. .printStackTrace DID NOT EXIST on the value a catch binds. The Throwable
 #    methods were duplicated between the raw-condition arm (records.ss) and
@@ -76,12 +79,17 @@ expect_no_match() {
   fi
 }
 
-echo "trace smoke: an uncaught tail-call throw names fn, file and line"
+echo "trace smoke: an uncaught tail-call throw names fn, file and exact line"
 out="$(run_app app.tail)"
 expect_match "uncaught throw reports the message" "$out" 'Unhandled exception: Divide by zero'
 # The erroring fn is a tail call from a tail call: the whole point of the case.
-expect_match "innermost frame is boom, with file:line" "$out" 'app\.tail/boom (.*src/app/tail\.clj:3)'
-expect_match "caller frame -main is present too" "$out" 'app\.tail/-main (.*src/app/tail\.clj:6)'
+# EXACT lines, not the line each fn was DEFINED on: boom opens on line 3 and
+# divides on line 4; -main opens on line 6 and calls boom on line 8. A frame that
+# reported its defn line would match 3 and 6 here, so these two assertions are
+# what tell the difference.
+expect_match "innermost frame is boom, at the dividing line" "$out" 'app\.tail/boom (.*src/app/tail\.clj:4)'
+expect_match "caller frame -main, at the call site" "$out" 'app\.tail/-main (.*src/app/tail\.clj:8)'
+expect_no_match "no frame reports a defn line" "$out" 'tail\.clj:[36])'
 
 echo "trace smoke: JOLT_TRACE=0 opts out"
 out_off="$(run_app app.tail JOLT_TRACE=0)"
@@ -121,7 +129,12 @@ EOF
 echo "trace smoke: .printStackTrace works on every throwable a catch binds"
 pst="$(run_app app.pst)"
 expect_match "arithmetic error prints class and message" "$pst" 'java\.lang\.ArithmeticException: Divide by zero'
-expect_match "printStackTrace renders frames with file:line" "$pst" 'app\.pst/inner (.*src/app/pst\.clj:3)'
+# inner divides on 4 (defn on 3), outer calls inner on 7 (defn on 6), -main calls
+# outer on 10 — and a catch clause must report the THROWING line, not the line the
+# handler itself is on, which is what the snapshot at catch entry is for.
+expect_match "printStackTrace: innermost frame at the dividing line" "$pst" 'app\.pst/inner (.*src/app/pst\.clj:4)'
+expect_match "printStackTrace: caller frame at its call site" "$pst" 'app\.pst/outer (.*src/app/pst\.clj:7)'
+expect_match "printStackTrace: outermost frame at its call site" "$pst" 'app\.pst/-main (.*src/app/pst\.clj:10)'
 expect_match "ex-info prints class and message" "$pst" 'clojure\.lang\.ExceptionInfo: boom'
 expect_match "constructed exception prints class and message" "$pst" 'java\.lang\.Exception: plain'
 expect_match "1-arg overload writes to the given writer" "$pst" 'WRITER-OK'
@@ -132,4 +145,4 @@ if [ "$fails" -gt 0 ]; then
   echo "trace smoke: $fails failed, $pass passed"
   exit 1
 fi
-echo "trace smoke: $pass passed (tail-frame location, JOLT_TRACE=0 opt-out, Throwable surface)"
+echo "trace smoke: $pass passed (exact per-frame lines, JOLT_TRACE=0 opt-out, Throwable surface)"

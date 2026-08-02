@@ -23,9 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ```
   Unhandled exception: Divide by zero
     trace:
-      app.core/boom (src/app/core.clj:3)
-      app.core/-main (src/app/core.clj:6)
+      app.core/boom (src/app/core.clj:4)
+      app.core/-main (src/app/core.clj:8)
   ```
+
+  Each line is the one reached **inside that frame** — where the innermost
+  function threw, and where every frame above it made its call — the same thing a
+  JVM stack trace reports per frame, rather than the line each function happened
+  to be defined on. The compiler sets the current line before each call and a
+  function's entry records its caller's, so a frame's own line is the one recorded
+  by the frame below it. `.printStackTrace` snapshots the throwing line on entry to
+  the `catch`, so it reports the fault rather than the handler.
 
   The reporter walked Chez's live continuation, which TCO erases a tail-called
   frame from — so for the ordinary shape, `-main` tail-calling a fn that throws,
@@ -39,9 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   7x. A `jolt build` binary is unchanged: its prologues are decided at build time,
   so it carries no tracing and no per-call cost unless built with it on.
 
-  Tracing itself also got ~2.8x cheaper (per-thread state moved from thread
-  parameters, whose writes cost ~32ns each, to Chez virtual registers at ~1ns, and
-  the ring sizes are powers of two so a wrap is a mask rather than a division).
+  Tracing itself also got ~2.5x cheaper even with the per-frame lines added
+  (per-thread state moved from thread parameters, whose writes cost ~32ns each, to
+  Chez virtual registers at ~1ns, and the ring sizes are powers of two so a wrap is
+  a mask rather than a division).
 
 ### Fixed
 
