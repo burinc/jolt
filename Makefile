@@ -201,9 +201,9 @@ mvnhttp:
 depssmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/deps-alias-smoke.sh
 
-# Dependency-expansion unit tests: exclusions, version selection, orphan
-# cutting, and the Maven version comparator, driven through a fake coordinate
-# type — the cases are ported from tools.deps' own test suite. Offline.
+# Shared Grenadine dependency-expansion integration tests: exclusions, version
+# selection, orphan cutting, and the Maven version comparator, driven through
+# a fake coordinate type. The cases are ported from tools.deps. Offline.
 depsunit:
 	@JOLT_NO_USER_DEPS=1 bin/jolt run test/deps_expand_test.clj
 
