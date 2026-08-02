@@ -66,14 +66,52 @@
 
 ;; chars/strings: Chez natives (strings treated immutable).
 
+;; --- fast-path invariant for the arm registries ------------------------------
+;; jolt=2, jolt-hash and the printers all answer their commonest types before
+;; walking their arms. The correctness condition is that NO registered arm may
+;; claim one of those, or the fast path would silently skip it. That is enforced
+;; here at registration rather than left to a comment, so a shim registering a
+;; too-broad predicate fails loudly at the point of registration instead of
+;; being quietly ignored at some later call.
+;;
+;; Each registry passes its OWN probes: the fast paths are not the same set, and
+;; a guard wider than the fast path it protects would reject arms that are
+;; perfectly legal. jolt-hash, for one, walks the arms for chars, symbols,
+;; flonums and bignums, all of which the printer answers directly.
+(define (reject-fast-type-claim! who claims? probes what)
+  (for-each
+   (lambda (probe)
+     ;; A predicate that throws on an unexpected type is not claiming it.
+     (when (guard (e (#t #f)) (and (claims? probe) #t))
+       (error who
+              (string-append
+               "arm predicate matches a runtime-owned value type, which " what
+               " answers without consulting the arms. Narrow the predicate to "
+               "the type this arm actually owns.")
+              probe)))
+   probes))
+
 ;; --- jolt equality (Clojure =) — scalars + collections ----------------------
 ;; A host shim registers a type's equality via register-eq-arm! instead of
 ;; set!-wrapping jolt=2 (cf. register-hash-arm!). An arm is (pred . handler), both
 ;; (a b): the arm applies when pred holds (typically either arg is the type), and
 ;; handler returns the #t/#f result. Arms are checked before the base scalar/coll
 ;; cases; the entry is stable.
+;;
+;; Only the fixnum and flonum pairs are subject to the invariant. jolt=2's third
+;; fast clause — (eq? a b) on a non-number — legitimately short-circuits every
+;; type including records, so the usual either-arg-is-my-type predicate stays
+;; legal even though it matches those. Probes pair DISTINCT values so they land
+;; on the numeric clauses rather than that identity one.
+(define eq-fast-probes (list (cons 0 1) (cons 1.5 2.5)))
+(define (eq-arm-reject-fast-type! who pred)
+  (reject-fast-type-claim! who
+                           (lambda (probe) (pred (car probe) (cdr probe)))
+                           eq-fast-probes
+                           "the jolt=2 fixnum/flonum fast path"))
 (define jolt-eq-arms '())
 (define (register-eq-arm! pred handler)
+  (eq-arm-reject-fast-type! 'register-eq-arm! pred)
   (set! jolt-eq-arms (cons (cons pred handler) jolt-eq-arms)))
 (define (jolt=2-base a b)
   (cond
@@ -114,8 +152,17 @@
 ;; register-hash-arm! instead of set!-wrapping jolt-hash — the arms are disjoint
 ;; types, checked before the base cases, so the full behavior is gathered here plus
 ;; the registry rather than scattered across a set! chain (cf. register-str-render!).
+;; Narrower than the printer's set: only nil, keywords, fixnums and strings are
+;; answered before the arm walk, so chars, symbols, flonums, bignums and ratios
+;; all still reach the arms and an arm claiming one of those is legal.
+;; Built on demand, not at load: interning a keyword needs hasheq.ss, which
+;; rt.ss loads after this file. Every arm registers later still.
+(define (hash-fast-probes) (list jolt-nil (keyword #f "k") 0 "s"))
+(define (hash-arm-reject-fast-type! who pred)
+  (reject-fast-type-claim! who pred (hash-fast-probes) "the jolt-hash fast path"))
 (define jolt-hash-arms '())
 (define (register-hash-arm! pred handler)
+  (hash-arm-reject-fast-type! 'register-hash-arm! pred)
   (set! jolt-hash-arms (cons (cons pred handler) jolt-hash-arms)))
 (define (jolt-hash-base x)
   ;; Delegate to jolt-hasheq for all scalars; sequential/coll handled by

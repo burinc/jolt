@@ -836,19 +836,11 @@
 (define pr-fast-probes
   (list 0 (expt 2 70) 1/2 1.5 "s" jolt-nil #t #f #\a
         (keyword #f "k") (jolt-symbol #f "s")))
+;; Shares reject-fast-type-claim! (values.ss) with the eq and hash registries,
+;; which enforce the same invariant over their own — narrower — fast paths.
 (define (pr-arm-reject-fast-type! who pred)
-  (for-each
-   (lambda (v)
-     ;; A predicate that throws on an unexpected type is not claiming it.
-     (when (guard (e (#t #f)) (and (pred v) #t))
-       (error who
-              (string-append
-               "arm predicate matches a runtime-owned value type, which the "
-               "printer fast path renders without consulting the arms (see "
-               "pr-fast-type? in rt.ss). Narrow the predicate to the type this "
-               "arm actually owns.")
-              v)))
-   pr-fast-probes))
+  (reject-fast-type-claim! who pred pr-fast-probes
+                           "the printer fast path (see pr-fast-type? in rt.ss)"))
 
 ;; A host shim registers a type's str-style rendering via register-pr-str-arm! (or
 ;; register-pr-arm! in printing.ss for both printers at once) instead of
