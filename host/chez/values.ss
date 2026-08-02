@@ -78,6 +78,14 @@
 ;; a guard wider than the fast path it protects would reject arms that are
 ;; perfectly legal. jolt-hash, for one, walks the arms for chars, symbols,
 ;; flonums and bignums, all of which the printer answers directly.
+;; A probe whose type is not constructible yet, as a 0-or-1 element list to
+;; splice in. Registries load in rt.ss order but so do the types they probe —
+;; transients.ss registers a get arm before records.ss defines make-jrec — and a
+;; probe that cannot be built is simply one this registration is not checked
+;; against, which is strictly better than failing to boot.
+(define (probe-if-available thunk)
+  (guard (e (#t '())) (list (thunk))))
+
 (define (reject-fast-type-claim! who claims? probes what)
   (for-each
    (lambda (probe)

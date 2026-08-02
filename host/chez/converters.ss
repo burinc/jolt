@@ -205,8 +205,23 @@
 ;; pred holds (typically either arg is the type) and handler returns -1/0/1.
 ;; Arms are the last resort before the "cannot compare" error, so a library can
 ;; make its own values Comparable without editing this file.
+;; Only the SAME-TYPE pairs are subject to the invariant. jolt-compare's nil
+;; clauses are single-sided — (compare nil x) is -1 for every x — so the fast
+;; path answering them is correct for any type, and the usual
+;; either-arg-is-my-type predicate stays legal even though it matches them. Same
+;; distinction register-eq-arm! makes for its identity clause.
+(define (compare-fast-probes)
+  (list (cons 0 1) (cons "a" "b") (cons (keyword #f "a") (keyword #f "b"))
+        (cons (jolt-symbol #f "a") (jolt-symbol #f "b")) (cons #t #f)
+        (cons #\a #\b) (cons (probe-pvec) (probe-pvec))))
+(define (compare-arm-reject-fast-type! who pred)
+  (reject-fast-type-claim! who
+                           (lambda (probe) (pred (car probe) (cdr probe)))
+                           (compare-fast-probes)
+                           "the jolt-compare same-type fast path"))
 (define jolt-compare-arms '())
 (define (register-compare-arm! pred handler)
+  (compare-arm-reject-fast-type! 'register-compare-arm! pred)
   (set! jolt-compare-arms (cons (cons pred handler) jolt-compare-arms)))
 (define (jolt-compare a b)
   (cond

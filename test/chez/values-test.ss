@@ -109,5 +109,46 @@
                                                (lambda (a b) #t))))))
 (ok "registered eq arm is consulted" (jolt=2 (make-armtest-t 1) (make-armtest-t 2)))
 
+;; --- the collection and compare registries guard their own fast paths --------
+;; Same invariant as eq/hash, same trap: the sets are all different, so each
+;; registry has to probe its OWN. jolt-get answers records but not strings;
+;; count/empty/seq answer strings but not records; contains? throws for scalars
+;; before ever reaching an arm.
+(ok "get arm rejects pmap"    (raises? (lambda () (register-get-arm! pmap? (lambda (c k d) d)))))
+(ok "get arm rejects jrec"    (raises? (lambda () (register-get-arm! jrec? (lambda (c k d) d)))))
+(ok "count arm rejects string" (raises? (lambda () (register-count-arm! string? (lambda (c) 0)))))
+(ok "count arm rejects cseq"  (raises? (lambda () (register-count-arm! cseq? (lambda (c) 0)))))
+(ok "contains arm rejects number"
+    (raises? (lambda () (register-contains-arm! number? (lambda (c k) #f)))))
+(ok "contains arm rejects keyword"
+    (raises? (lambda () (register-contains-arm! keyword? (lambda (c k) #f)))))
+(ok "empty arm rejects string" (raises? (lambda () (register-empty-arm! string? (lambda (c) #t)))))
+(ok "seq arm rejects pvec"    (raises? (lambda () (register-seq-arm! pvec? (lambda (x) x)))))
+(ok "seq arm rejects string"  (raises? (lambda () (register-seq-arm! string? (lambda (x) x)))))
+(ok "compare arm rejects string pair"
+    (raises? (lambda () (register-compare-arm! (lambda (a b) (and (string? a) (string? b)))
+                                               (lambda (a b) 0)))))
+(ok "compare arm rejects char pair"
+    (raises? (lambda () (register-compare-arm! (lambda (a b) (and (char? a) (char? b)))
+                                               (lambda (a b) 0)))))
+
+;; the sets really do differ — a guard wider than its own fast path would reject
+;; arms that are perfectly legal
+(ok "get guard allows string"   (not (raises? (lambda () (get-arm-reject-fast-type! 'test string?)))))
+(ok "count guard allows jrec"   (not (raises? (lambda () (count-arm-reject-fast-type! 'test jrec?)))))
+(ok "seq guard allows jrec"     (not (raises? (lambda () (seq-arm-reject-fast-type! 'test jrec?)))))
+;; compare's nil clauses are single-sided and answer correctly for EVERY type, so
+;; the usual either-arg predicate must stay legal even though it matches them
+(ok "compare guard allows either-arg shape"
+    (not (raises? (lambda () (compare-arm-reject-fast-type!
+                              'test (lambda (a b) (or (armtest-t? a) (armtest-t? b))))))))
+
+;; and real arms on a type off the fast path still register and are consulted
+(ok "seq arm on a plain type registers"
+    (not (raises? (lambda () (register-seq-arm! armtest-t? (lambda (x) jolt-nil))))))
+(ok "count arm on a plain type registers"
+    (not (raises? (lambda () (register-count-arm! armtest-t? (lambda (x) 7))))))
+(ok "registered count arm is consulted" (= 7 (jolt-count (make-armtest-t 1))))
+
 (printf "values-test: ~a/~a passed\n" (- total fails) total)
 (exit (if (> fails 0) 1 0))

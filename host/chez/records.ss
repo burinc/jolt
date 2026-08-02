@@ -152,6 +152,14 @@
     (if (fx<= n 8)
         (apply (vector-ref jrec-ctor-vec n) desc ext (vector->list vals))
         (make-jrec* desc ext vals))))
+;; One throwaway record, built here at load and reused, for the arm registries to
+;; probe a candidate predicate against (reject-fast-type-claim!, values.ss).
+;; Built ONCE rather than per registration: registrations also happen at runtime,
+;; as user code defines records, and calling make-jrec from that context resolves
+;; differently. collections.ss reaches it through probe-if-available, since it
+;; loads before this file and the earliest arms register before it too.
+(define jrec-fast-type-probe (make-jrec 'fast-type-probe (vector) jolt-nil))
+
 ;; compatibility accessor: rebuilds a fresh field vector from the inline slots.
 ;; Read-only — never set! through this, it returns a copy.
 (define (jrec-vals r)
@@ -509,10 +517,12 @@
 ;; compiled to (get inst :field), never recurse); a NON-field key on a deftype that
 ;; implements clojure.lang.ILookup routes to its valAt (core.match's pattern types
 ;; compute ::tag in valAt), else the default.
-;; jrec is the hottest get target (every record field read); jolt-get-dispatch
-;; (collections.ss) checks jrec? directly and calls jrec-ref, skipping the get-arm
-;; walk. This registration is the equivalent fallback for any other caller.
-(register-get-arm! jrec? jrec-ref)
+;; jrec is the hottest get target (every record field read), so jolt-get-dispatch
+;; (collections.ss) checks jrec? directly and calls jrec-ref before the arm walk.
+;; There is NO get-arm registration for jrec: jolt-get-arms has exactly one
+;; consumer — the else branch of that same cond — so an arm on jrec? could never
+;; run. register-get-arm! now rejects one at registration rather than accepting a
+;; handler it would silently never call.
 ;; A jrec is a defrecord (map of fields) by default, BUT a deftype that
 ;; implements a clojure.lang collection interface carries the op as an inline
 ;; method — prefer that method, else fall back to the field/map behavior. (jrec-cl
