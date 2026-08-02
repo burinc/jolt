@@ -1156,15 +1156,28 @@
                      ;; catch cannot leave its throw's line behind for an outer
                      ;; handler that runs later. Only under tracing — with it off
                      ;; there are no line stores to snapshot.
-                     cl (when (trace-frames?) (fresh-label "_cl$"))]
-                 (str "(guard (" raw " (else (let ((" (munge-name cs) " (jolt-unwrap-throw " raw "))) "
-                      (if cl (str "(let ((" cl " (jolt-catch-enter!))) ") "")
-                      "(let ((r " (emit (:catch-body node)) ")) "
-                      (if cl (str "(jolt-catch-leave! " cl ") ") "")
-                      "(jolt-catch-complete!) r)"
-                      (if cl ")" "")
-                      "))) "
-                      (emit (:body node)) ")"))
+                     cl (when (trace-frames?) (fresh-label "_cl$"))
+                     ;; A throw unwinds straight past the per-call ring restores
+                     ;; between the raise and here, so the head is left wherever the
+                     ;; deepest frame put it. Snapshot on the way INTO the try and
+                     ;; put it back AFTER the handler body — not before. The handler
+                     ;; is exactly where .printStackTrace reads the throw's spine,
+                     ;; and restoring first would discard the frames it exists to
+                     ;; report. Afterwards, the abandoned ribs have to go, or every
+                     ;; later backtrace on this thread carries them.
+                     ts (when (trace-frames?) (fresh-label "_ts$"))
+                     body (str "(guard (" raw " (else (let ((" (munge-name cs) " (jolt-unwrap-throw " raw "))) "
+                               (if cl (str "(let ((" cl " (jolt-catch-enter!))) ") "")
+                               "(let ((r " (emit (:catch-body node)) ")) "
+                               (if cl (str "(jolt-catch-leave! " cl ") ") "")
+                               (if ts (str "(jolt-trace-unwind! " ts ") ") "")
+                               "(jolt-catch-complete!) r)"
+                               (if cl ")" "")
+                               "))) "
+                               (emit (:body node)) ")")]
+                 (if ts
+                   (str "(let ((" ts " (jolt-trace-save))) " body ")")
+                   body))
                (emit (:body node)))]
     (if-let [fin (:finally node)]
       (str "(dynamic-wind (lambda () #f) (lambda () " core ") (lambda () " (emit fin) "))")
@@ -1246,12 +1259,28 @@
 
 ;; Wrap emit-invoke so an eligible impl registration also emits its contagion clone as
 ;; a sibling. The non-eligible path is byte-identical to before (no clone emitted).
+;; Under tracing, pair a ring save/restore around a NON-TAIL call so the frames of
+;; a call that has returned stop showing up in a later backtrace (see
+;; jolt-trace-save in rt.ss). Only non-tail: consuming a tail call's result to run
+;; the restore afterwards would turn it into a non-tail call and defeat TCO, which
+;; is the whole reason the history ring exists. *tail?* is still accurate here —
+;; :invoke is tail-transparent, and emit-invoke restores the binding it captured.
+(defn- with-unwind [s]
+  (if (and (trace-frames?) (not *tail?*))
+    (let [sv (fresh-label "_tu$")
+          r (fresh-label "_tr$")]
+      (str "(let ((" sv " (jolt-trace-save))) (let ((" r " " s ")) "
+           "(jolt-trace-unwind! " sv ") " r "))"))
+    s))
+
 (defn- emit-invoke-maybe-clone [node]
   (let [base (emit-invoke node)]
     (with-line node
+      ;; the clone `define` stays at the nesting it had before — only the call
+      ;; itself goes inside the unwind binding
       (if-some [c (emit-impl-clone node)]
-        (str "(begin " c " " base ")")
-        base))))
+        (str "(begin " c " " (with-unwind base) ")")
+        (with-unwind base)))))
 
 (defn emit* [node]
   (case (:op node)
