@@ -952,6 +952,11 @@ check_varies '(.nextInt (java.util.Random.) 1000000000)'
 check '(let [r (java.util.Random. 42)] [(.nextInt r 100) (.nextInt r 100) (.nextInt r 100)])' '[30 63 48]'
 check '(let [r (java.util.Random. 42)] [(.nextInt r 64) (.nextInt r 64)])' '[46 3]'
 check '(.nextLong (java.util.Random. 12345))' '6674089274190705457'
+# random-uuid draws from the OS CSPRNG, not the seeded PRNG. The fallback is
+# deliberately loud, so its absence is the assertion that entropy was reached —
+# a silent degradation here ships guessable session ids.
+check_no '(dotimes [_ 100] (random-uuid))' 'no OS entropy'
+check '(let [u (str (random-uuid))] [(count u) (nth u 14) (contains? #{\8 \9 \a \b} (nth u 19))])' '[36 \4 true]'
 
 echo "cli smoke: $pass passed, $fails failed"
 [ "$fails" -eq 0 ]
