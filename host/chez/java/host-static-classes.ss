@@ -1537,7 +1537,12 @@
   (lambda (nm)
     (register-class-ctor! nm
       (lambda args
-        (let ((given (if (pair? args) (car args) (exact (truncate (current-time))))))
+        ;; No-seed (Random.) used (truncate (current-time)) — current-time returns a
+        ;; time OBJECT, not a number, so truncate threw and the no-arg ctor never
+        ;; worked at all. The JVM seeds this instance from nanoTime mixed with a
+        ;; uniquifier; jolt-random is already seeded per process and per thread, so
+        ;; drawing the 48-bit seed from it gives distinct instances the same way.
+        (let ((given (if (pair? args) (car args) (jolt-random 281474976710656))))
           (make-jhost "random" (vector (random-init-seed given)))))))
   '("Random" "java.util.Random"))
 (register-host-methods! "random"

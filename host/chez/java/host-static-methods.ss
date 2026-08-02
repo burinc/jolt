@@ -83,7 +83,7 @@
         (cons "max" (lambda (a b) (if (> a b) a b))) (cons "min" (lambda (a b) (if (< a b) a b)))
         (cons "signum" (lambda (x) (cond ((< x 0) -1.0) ((> x 0) 1.0) (else 0.0))))
         (cons "PI" (->dbl (* 4 (atan 1)))) (cons "E" (->dbl (exp 1)))
-        (cons "random" (lambda args (random 1.0))))))
+        (cons "random" (lambda args (jolt-random 1.0))))))
 
 ;; Thread: real OS threads back futures/promises.
 ;;  - sleep parks the calling thread for `ms` ms (a worker sleeping doesn't block
