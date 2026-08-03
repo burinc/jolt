@@ -96,15 +96,35 @@
 
 (defn- full-sha? [s] (and (string? s) (= 40 (count s)) (re-matches #"[0-9a-f]+" s)))
 
+(defn- git-coord
+  "A git coordinate with tools.deps' legacy spellings folded into the namespaced
+  keys. deps.edn files in the wild still write :sha and :tag — malli pins
+  spec-alpha2 as {:git/url … :sha …} — and tools.deps accepts both, so a
+  coordinate that resolves there has to resolve here. The namespaced key wins if
+  both are somehow present."
+  [coord]
+  (cond-> coord
+    (and (:sha coord) (not (:git/sha coord))) (assoc :git/sha (:sha coord))
+    (and (:tag coord) (not (:git/tag coord))) (assoc :git/tag (:tag coord))))
+
 (defn- resolve-git-tag
-  "Resolve a tag to its commit sha via git ls-remote, preferring the peeled
-  ^{} ref (an annotated tag's target commit). Cached under the gitlibs dir —
-  a tag+sha coordinate is reproducible via the sha, the tag resolution is only
-  consulted to verify/complete it, so a cached answer is fine."
+  "Resolve a tag via git ls-remote to [commit-sha tag-object-sha]. An annotated
+  tag carries both: the peeled ^{} ref is the commit it points at, the unpeeled
+  ref is the tag object itself. A deps.edn may pin EITHER — `git ls-remote`
+  prints the tag object for refs/tags/X, so that is what a coordinate written
+  from its output holds (cognitect-labs/test-runner v0.5.0 is one), and
+  tools.deps accepts both. tag-object-sha is nil for a lightweight tag, where
+  the two coincide. Cached under the gitlibs dir as one line of two tokens —
+  the commit, then the tag object or \"-\" when there is none. A one-token file
+  is what an older jolt wrote, which recorded only the commit; it is re-resolved
+  rather than trusted, so a coordinate pinning the tag object is not rejected
+  off a cache that predates knowing about it."
   [url tag]
   (let [cache (str (gitlibs-dir) "/tags/" (sanitize url) "/" (sanitize tag))]
-    (if (file-exists? cache)
-      (str/trim (slurp cache))
+    (if-let [cached (when (file-exists? cache)
+                      (let [[commit obj] (str/split (str/trim (slurp cache)) #"\s+")]
+                        (when obj [commit (when (not= obj "-") obj)])))]
+      cached
       (when-let [out (sh-out (str "git ls-remote " (pr-str url) " "
                                   (pr-str (str "refs/tags/" tag)) " "
                                   (pr-str (str "refs/tags/" tag "^{}"))))]
@@ -113,11 +133,14 @@
                       (some (fn [l] (let [[sha ref] (str/split l #"\s+")]
                                       (when (and ref (str/ends-with? ref suffix)) sha)))
                             lines))
-              sha (or (parse "^{}") (parse (str "refs/tags/" tag)))]
-          (when sha
+              peeled (parse "^{}")
+              obj (parse (str "refs/tags/" tag))
+              commit (or peeled obj)
+              obj (when (and peeled obj (not= peeled obj)) obj)]
+          (when commit
             (sh (str "mkdir -p " (pr-str (str (gitlibs-dir) "/tags/" (sanitize url)))))
-            (spit cache sha)
-            sha))))))
+            (spit cache (str commit " " (or obj "-")))
+            [commit obj]))))))
 
 (defn- resolve-git-sha
   "The full commit sha a git coordinate pins: a full :git/sha as-is; with a
@@ -127,14 +150,20 @@
   (cond
     (and sha (full-sha? sha) (not tag)) sha
     (and tag sha)
-    (let [tag-sha (or (resolve-git-tag url tag)
-                      (throw (ex-info (str "git dep " coord ": tag " tag " not found in " url)
-                                      {:coord coord :spec spec})))]
-      (if (str/starts-with? tag-sha sha)
+    (let [[tag-sha obj-sha]
+          (or (resolve-git-tag url tag)
+              (throw (ex-info (str "git dep " coord ": tag " tag " not found in " url)
+                              {:coord coord :spec spec})))]
+      ;; Either sha an annotated tag carries pins it, as in tools.deps. What gets
+      ;; checked out is always the commit.
+      (if (or (str/starts-with? tag-sha sha)
+              (and obj-sha (str/starts-with? obj-sha sha)))
         tag-sha
         (throw (ex-info (str "git dep " coord ": :git/sha " sha " does not match tag "
-                             tag " (" tag-sha ")")
-                        {:coord coord :spec spec :tag-sha tag-sha}))))
+                             tag " (" tag-sha
+                             (when obj-sha (str ", tag object " obj-sha)) ")")
+                        {:coord coord :spec spec :tag-sha tag-sha
+                         :tag-object-sha obj-sha}))))
     (full-sha? sha) sha
     :else
     (throw (ex-info
@@ -423,6 +452,34 @@
 (defn- intrinsic-dep? [lib]
   (or (= lib 'org.clojure/clojure) (= lib 'org.clojure/clojurescript)))
 
+(declare effective-pom-deps)
+
+;; ...but org.clojure/clojure being intrinsic does NOT make its DEPENDENCIES
+;; intrinsic. The artifact depends on spec.alpha and core.specs.alpha, neither of
+;; which is part of core on either host, so on the JVM a project that declares
+;; only Clojure still gets clojure.spec.alpha — and libraries lean on that,
+;; requiring spec without ever naming it (kaocha, and spec.alpha's own suite).
+;; Dropping the coordinate whole took its children with it and those libraries
+;; could not load. Substitute the children instead.
+(def ^:private clojure-spec-libs
+  '[org.clojure/spec.alpha org.clojure/core.specs.alpha])
+
+;; What Clojure 1.12 ships, for when the POM cannot be read (offline, or a
+;; hand-installed jar). Being a version behind is far better than the namespace
+;; being absent, which is a load failure rather than a resolution difference.
+(def ^:private clojure-spec-fallback
+  {'org.clojure/spec.alpha {:mvn/version "0.5.238"}
+   'org.clojure/core.specs.alpha {:mvn/version "0.4.74"}})
+
+(defn- clojure-spec-deps
+  "The spec coordinates the declared Clojure would bring in on the JVM, read off
+  that Clojure's own POM so the versions match what tools.deps would resolve."
+  [coord]
+  (or (when (:mvn/version coord)
+        (not-empty (select-keys (or (effective-pom-deps 'org.clojure/clojure coord true) {})
+                                clojure-spec-libs)))
+      clojure-spec-fallback))
+
 (defn- absolutize-local [spec base-dir]
   (if (and (map? spec) (:local/root spec))
     (update spec :local/root #(abspath base-dir %))
@@ -435,12 +492,16 @@
   may fill it during expansion)."
   [deps base-dir]
   (into []
-        (keep (fn [[lib spec]]
-                (cond
-                  (intrinsic-dep? lib) nil
-                  (:jolt/module spec)
-                  (do (info "skipping janet dependency " lib " (:jolt/module is obsolete on Chez)") nil)
-                  :else [lib (absolutize-local spec base-dir)])))
+        (mapcat (fn [[lib spec]]
+                  (cond
+                    ;; jolt IS Clojure, so the coordinate itself contributes
+                    ;; nothing — but its spec children are not part of core here
+                    ;; either, and on the JVM they come in with it.
+                    (= lib 'org.clojure/clojure) (seq (clojure-spec-deps spec))
+                    (intrinsic-dep? lib) nil
+                    (:jolt/module spec)
+                    (do (info "skipping janet dependency " lib " (:jolt/module is obsolete on Chez)") nil)
+                    :else [[lib (absolutize-local spec base-dir)]])))
         deps))
 
 (defn- known-coord? [coord]
@@ -480,8 +541,14 @@
   declared coordinate before jolt filters by scope, so a test-scoped dependency
   jolt drops anyway can be what makes a POM unmodellable. A nil sends the caller
   to whatever pom.xml the jar itself carries; the alternative, failing the whole
-  resolution over a dependency that may not even be reachable, is worse."
-  [lib coord]
+  resolution over a dependency that may not even be reachable, is worse.
+
+  quiet? suppresses the fallback warning, for a caller that has its own answer
+  for a missing POM and so is not degrading — the Clojure spec substitution
+  below reads this way and would otherwise warn on every offline resolution
+  about a jar jolt never loads."
+  ([lib coord] (effective-pom-deps lib coord false))
+  ([lib coord quiet?]
   (memoized
    [:effective-pom lib (ext/dep-id lib coord)]
    (fn []
@@ -490,10 +557,11 @@
                    :version (:mvn/version coord)}
            effective (try (grenadine.pom/effective-pom coords pom-text)
                           (catch :default e
-                            (warn "no effective POM for " lib " "
-                                  (:mvn/version coord) ": " (ex-message e)
-                                  "\n  falling back to the pom.xml in its jar;"
-                                  " transitive deps may be incomplete")
+                            (when-not quiet?
+                              (warn "no effective POM for " lib " "
+                                    (:mvn/version coord) ": " (ex-message e)
+                                    "\n  falling back to the pom.xml in its jar;"
+                                    " transitive deps may be incomplete"))
                             nil))]
        (when effective
          (into
@@ -512,7 +580,7 @@
                            (fn [{:keys [group artifact]}]
                              (symbol group artifact))
                            exclusions))))])))
-          (:deps effective)))))))
+          (:deps effective))))))))
 
 (defn- manifest-info
   "Manifest detection for a git/local directory root: its deps.edn, else a bare
@@ -534,7 +602,7 @@
 (defmethod ext/coord-type-keys :local [_] #{:local/root})
 
 (defmethod ext/dep-id :mvn [_ coord] (select-keys coord [:mvn/version]))
-(defmethod ext/dep-id :git [_ coord] (select-keys coord [:git/url :git/sha :git/tag]))
+(defmethod ext/dep-id :git [_ coord] (select-keys (git-coord coord) [:git/url :git/sha :git/tag]))
 (defmethod ext/dep-id :local [_ coord] (select-keys coord [:local/root]))
 
 ;; What names a version in the dependency tree: the Maven version, the git tag
@@ -542,7 +610,8 @@
 ;; prints it), the directory for a local root.
 (defmethod ext/coord-summary :mvn [lib coord] (str lib " " (:mvn/version coord)))
 (defmethod ext/coord-summary :git [lib coord]
-  (let [sha (:git/sha coord)]
+  (let [coord (git-coord coord)
+        sha (:git/sha coord)]
     (str lib " " (or (:git/tag coord)
                      (when sha (subs sha 0 (min 7 (count sha))))))))
 (defmethod ext/coord-summary :local [lib coord] (str lib " " (:local/root coord)))
@@ -567,7 +636,8 @@
 (defn- git-info [lib coord]
   (memoized [:info lib (ext/dep-id lib coord)]
     (fn []
-      (let [url (or (:git/url coord) (infer-git-url lib)
+      (let [coord (git-coord coord)
+            url (or (:git/url coord) (infer-git-url lib)
                     (throw (ex-info
                              (str "git dep " lib " has no :git/url and none could be inferred "
                                   "from its lib name. Add :git/url, or name the coordinate after "

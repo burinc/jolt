@@ -55,6 +55,8 @@
   {:suite "clojure.template / do-template" :label "substitution reaches inside quote" :expected "(quote (a b))" :actual "(do (require (quote clojure.template)) (clojure.template/do-template [x] (quote x) (a b)))" :portability :common}
   {:suite "interop / Integer statics" :label "Integer/max and Integer/min are the two-arg Java statics" :expected "[7 3]" :actual "[(Integer/max 3 7) (Integer/min 3 7)]" :portability :jvm}
   {:suite "interop / Character codepoints" :label "the codepoint bounds and charCount" :expected "[1114111 65536 0 1 2]" :actual "[Character/MAX_CODE_POINT Character/MIN_SUPPLEMENTARY_CODE_POINT Character/MIN_CODE_POINT (Character/charCount 65) (Character/charCount 65536)]" :portability :jvm}
+  {:suite "interop / Runtime memory" :label "the memory trio holds its invariants" :expected "[true true true true]" :actual "(let [r (Runtime/getRuntime)] [(pos? (.totalMemory r)) (<= 0 (.freeMemory r)) (<= (.freeMemory r) (.totalMemory r)) (<= (.totalMemory r) (.maxMemory r))])" :portability :jvm}
+  {:suite "interop / Character codepoints" :label "codePointAt reads the codepoint at an index" :expected "[98 233 121]" :actual "[(Character/codePointAt \"abc\" 1) (Character/codePointAt \"\\u00e9\" 0) (Character/codePointAt (char-array [\\x \\y]) 1)]" :portability :jvm}
   {:suite "interop / Float statics" :label "Float carries the float bounds and specials, not double's" :expected "[true true true true true true true]" :actual "[(Float/isNaN Float/NaN) (Float/isInfinite Float/POSITIVE_INFINITY) (Float/isInfinite Float/NEGATIVE_INFINITY) (pos? Float/POSITIVE_INFINITY) (neg? Float/NEGATIVE_INFINITY) (> Float/MAX_VALUE 3.0E38) (< Float/MAX_VALUE Double/MAX_VALUE)]" :portability :jvm}
   {:suite "interop / Double statics" :label "isNaN / isInfinite / the specials / parseDouble" :expected "[true true false true true 1.5]" :actual "[(Double/isNaN (/ 0.0 0.0)) (Double/isInfinite (/ 1.0 0.0)) (Double/isNaN 1.0) (Double/isNaN Double/NaN) (Double/isInfinite Double/POSITIVE_INFINITY) (Double/parseDouble \"1.5\")]" :portability :jvm}
   {:suite "interop / exception constructors" :label "the common java.lang / java.io exception ctors carry their message" :expected "[\"a\" \"b\" \"c\" \"d\"]" :actual "[(.getMessage (NullPointerException. \"a\")) (.getMessage (IllegalStateException. \"b\")) (.getMessage (IndexOutOfBoundsException. \"c\")) (.getMessage (java.io.IOException. \"d\"))]" :portability :jvm}
@@ -113,6 +115,70 @@
   {:suite "deftype / IPersistentStack" :label "peek/pop dispatch" :expected "[1 [2 3]]" :actual "(do (deftype Stk [v] clojure.lang.IPersistentStack (peek [_] (first v)) (pop [_] (->Stk (rest v)))) [(peek (->Stk [1 2 3])) (vec (.v (pop (->Stk [1 2 3]))))])" :portability :jvm}
   {:suite "deftype / equiv" :label "(= deftype other) uses equiv method" :expected "true" :actual "(do (deftype EqT [m] clojure.lang.IPersistentCollection (equiv [_ o] (= o m)) clojure.lang.Seqable (seq [_] (seq m))) (= (->EqT {:a 1}) {:a 1}))" :portability :jvm}
   {:suite "deftype / IDeref" :label "@ dispatches to the deref method" :expected "7" :actual "(do (deftype Box [v] clojure.lang.IDeref (deref [_] v)) (deref (->Box 7)))" :portability :jvm}
+  ;; A reify that DECLARES clojure.lang.IFn is callable and answers ifn?/instance?
+  ;; for it, like the JVM; fn? stays false (reify does not implement Fn). Calling
+  ;; one already worked — only the predicates read false, so malli's :ifn schema
+  ;; rejected a value it should accept.
+  ;; java.io.File.equals compares the abstract pathname, so two Files built from
+  ;; one path are = and interchangeable as a map key — ring's resource tests
+  ;; compare response bodies that way. The two-arg ctor joins with exactly one
+  ;; separator; a parent ending in "/" used to produce "a//c".
+  {:suite "interop / File" :label "File equality by pathname, and one-separator join" :expected "[true false true 1 \"a/c\" \"a/c\" \"/c\" \"a/c\" \"a\"]" :actual "(let [a (java.io.File. \"a/b\") b (java.io.File. \"a/b\") c (java.io.File. \"a/c\")] [(= a b) (= a c) (= #{a} #{b}) (get {a 1} b) (.getPath (java.io.File. (java.io.File. \"a/\") \"c\")) (.getPath (java.io.File. \"a\" \"c\")) (.getPath (java.io.File. \"/\" \"c\")) (.getPath (java.io.File. \"a\" \"/c\")) (.getPath (java.io.File. \"a\" \"\"))])" :portability :jvm}
+  ;; A deftype or reify declaring java.lang.Iterable or java.util.Iterator is
+  ;; seqable, as on the JVM. ring's multipart middleware hands `sequence` an
+  ;; item iterator wrapped in (reify Iterable (iterator [_] ...)). Seqable wins
+  ;; over Iterable for a type declaring both, matching RT.seqFrom.
+  {:suite "interop / Iterable" :label "a reify Iterable or Iterator is seqable, and Seqable wins" :expected "[[1 2 3] [10 20 30] [11 21 31] [7 8]]" :actual "(let [src (atom [1 2 3]) it (reify java.util.Iterator (hasNext [_] (boolean (seq @src))) (next [_] (let [v (first @src)] (swap! src rest) v))) able (reify Iterable (iterator [_] (let [s (atom [10 20 30])] (reify java.util.Iterator (hasNext [_] (boolean (seq @s))) (next [_] (let [v (first @s)] (swap! s rest) v)))))) _ (deftype Both [xs] clojure.lang.Seqable (seq [_] (seq xs)) Iterable (iterator [_] (throw (ex-info \"iterator must not win\" {}))))] [(vec (iterator-seq it)) (vec (seq able)) (vec (sequence (map inc) able)) (vec (seq (->Both [7 8])))])" :portability :jvm}
+  ;; java.lang.reflect.Array with a concrete component type is array allocation,
+  ;; not reflection — malli's regex engine writes (Array/newInstance Object n)
+  ;; where its own :bb and :cljs branches write (object-array n). Void/TYPE is
+  ;; the one primitive class token jolt was missing; sci maps every primitive
+  ;; name to its token and stopped at the first absent one.
+  {:suite "interop / reflect Array" :label "newInstance, getLength, get and set" :expected "[3 :x nil 3 \"void\"]" :actual "(let [a (java.lang.reflect.Array/newInstance Object 3)] (java.lang.reflect.Array/set a 0 :x) [(java.lang.reflect.Array/getLength a) (java.lang.reflect.Array/get a 0) (java.lang.reflect.Array/get a 1) (alength a) (str Void/TYPE)])" :portability :jvm}
+  ;; println flushes when *flush-on-newline*, and OutputStreamWriter.flush reaches
+  ;; the stream underneath — together, that is what makes text printed through a
+  ;; writer arrive rather than sit in its buffer. Neither is a value an
+  ;; expression can read directly, so this row is the contract: the first write
+  ;; lands, the second does not until the explicit flush.
+  {:suite "io / flush on newline" :label "println reaches the stream under a writer" :expected "[\"x\\n\" \"x\\n\" \"x\\ny\\n\"]" :actual "(let [b (java.io.ByteArrayOutputStream.) w (java.io.OutputStreamWriter. b) a (do (binding [*out* w] (println \"x\")) (.toString b)) c (do (binding [*out* w *flush-on-newline* false] (println \"y\")) (.toString b)) d (do (.flush w) (.toString b))] [a c d])" :portability :jvm}
+  ;; A URL built with a URLStreamHandler reads through it, whatever its protocol:
+  ;; openConnection is the handler's and openStream is that connection's
+  ;; getInputStream, so slurp and io/reader both reach it. Selmer's
+  ;; :url-stream-handler option serves templates from a URL space jolt has no
+  ;; protocol for. getPath is the PATH component, not the spec minus its scheme.
+  {:suite "interop / URL" :label "a stream handler decides what a URL reads" :expected "[\"https://example.com/a.html\" \"content of https://example.com/a.html\" \"/a.html\"]" :actual "(let [h (proxy [java.net.URLStreamHandler] [] (openConnection [u] (proxy [java.net.URLConnection] [u] (getInputStream [] (java.io.ByteArrayInputStream. (.getBytes (str \"content of \" u))))))) u (java.net.URL. nil \"https://example.com/a.html\" h)] [(str u) (slurp u) (.getPath u)])" :portability :jvm}
+  ;; getFile of a URL with an authority is the path, not the whole spec — this
+  ;; row lived in unit.edn asserting "http://h/p", which was jolt's bug, not a
+  ;; divergence. The JVM says "/p".
+  {:suite "interop / URL" :label "protocol and file components" :expected "[\"file\" \"/p\" \"http\"]" :actual "[(.getProtocol (java.net.URL. \"file:/tmp/x\")) (.getFile (java.net.URL. \"http://h/p\")) (.getProtocol (java.net.URL. \"http://h/p\"))]" :portability :jvm}
+  ;; the constructor overloads, told apart by argument type, and the path/host
+  ;; split every non-file URL needs.
+  {:suite "interop / URL" :label "constructor overloads, path and host" :expected "[\"file:/tmp/x\" \"/tmp/x\" \"/a/b.txt\" \"h.com\" \"\" \"https://h.com/a.txt\" \"https://h.com/dir/y.html\" \"https://o.com/z\"]" :actual "[(str (java.net.URL. \"file:///tmp/x\")) (.getPath (java.net.URL. \"file:///tmp/x\")) (.getPath (java.net.URL. \"https://h.com/a/b.txt\")) (.getHost (java.net.URL. \"https://h.com/a/b.txt\")) (.getHost (java.net.URL. \"file:/tmp/x\")) (str (java.net.URL. \"https\" \"h.com\" \"/a.txt\")) (str (java.net.URL. (java.net.URL. \"https://h.com/dir/x.html\") \"y.html\")) (str (java.net.URL. (java.net.URL. \"https://h.com/dir/x.html\") \"https://o.com/z\"))]" :portability :jvm}
+  ;; proxy over a CONCRETE class extends by delegation: the proxy builds a real
+  ;; base instance, answers what it declares, forwards the rest, and proxy-super
+  ;; reaches the base's own implementation. It is an instance of the base and of
+  ;; the base's supertypes. clojure.tools.logging's log-stream needs all of it.
+  {:suite "interop / proxy" :label "delegates to the base instance, and proxy-super calls it" :expected "[\"hi\" \"\" true true]" :actual "(let [p (proxy [java.io.ByteArrayOutputStream] [] (flush [] (proxy-super flush) :ov))] (.write p (.getBytes \"hi\")) [(.toString p) (do (.reset p) (.toString p)) (instance? java.io.ByteArrayOutputStream p) (instance? java.io.OutputStream p)])" :portability :jvm}
+  ;; proxy-super takes a method NAME, not an expression, so a body calling a super
+  ;; method no var is named after has to COMPILE — clojure.tools.logging's
+  ;; (proxy-super reset). It now runs too, and reaches the base's own reset.
+  {:suite "interop / proxy" :label "proxy-super names a method, not a var" :expected "nil" :actual "(do (defn pxsup [] (proxy [java.io.ByteArrayOutputStream] [] (flush [] (proxy-super reset)))) (try (.flush (pxsup)) (catch Throwable t :threw)))" :portability :jvm}
+  ;; the whole log-stream shape: a PrintStream over a proxy whose flush override
+  ;; reads the accumulated text off the base, with System/setOut redirecting to it.
+  {:suite "interop / proxy" :label "PrintStream over a proxy, redirected through System/setOut" :expected "[\"a\" \"b\"]" :actual "(let [captured (atom []) ps (java.io.PrintStream. (proxy [java.io.ByteArrayOutputStream] [] (flush [] (let [this this] (proxy-super flush) (let [m (.trim (.toString this))] (proxy-super reset) (when (> (.length m) 0) (swap! captured conj m)))))) true) orig System/out] (System/setOut ps) (.println System/out \"a\") (.println System/out \"b\") (System/setOut orig) @captured)" :portability :jvm}
+  ;; (. Class MEMBER) with no arguments is ambiguous on the JVM too — a static
+  ;; field if one exists, else a no-arg static method — and jolt decides at
+  ;; runtime on what its one registry holds. It used to apply the field VALUE as
+  ;; a zero-arg procedure and hand back nil; the (. Class -MEMBER) field spelling
+  ;; was rejected outright. Four malli namespaces load-failed on LocalDate/-MIN.
+  ;; The two call forms are here so the fix cannot regress them.
+  {:suite "interop / static members" :label "(. Class FIELD), (. Class -FIELD) and the call forms" :expected "[2147483647 2147483647 2147483647 \"42\" 7]" :actual "[(. java.lang.Integer MAX_VALUE) (. java.lang.Integer -MAX_VALUE) java.lang.Integer/MAX_VALUE (. java.lang.Long toString 42) (. java.lang.Long parseLong \"7\")]" :portability :jvm}
+  ;; System.arraycopy behaves as if the source range were copied through a
+  ;; temporary, so an overlapping copy within one array still reads pre-copy
+  ;; values — a naive forward loop gives [1 1 1 1 1] for the second case.
+  {:suite "interop / arrays" :label "System/arraycopy, including an overlapping copy" :expected "[[1 2 3 4] [1 1 2 3 4]]" :actual "(let [a (byte-array [1 2 3 4]) b (byte-array 4) c (int-array [1 2 3 4 5])] (System/arraycopy a 0 b 0 4) (System/arraycopy c 0 c 1 4) [(vec b) (vec c)])" :portability :jvm}
+  {:suite "interop / arrays" :label "System/arraycopy raises the JVM exception classes" :expected "[\"ArrayIndexOutOfBoundsException\" \"ArrayStoreException\" \"NullPointerException\"]" :actual "[(try (System/arraycopy (int-array 3) 0 (int-array 2) 0 3) (catch Exception e (.getSimpleName (class e)))) (try (System/arraycopy (int-array 3) 0 (byte-array 3) 0 3) (catch Exception e (.getSimpleName (class e)))) (try (System/arraycopy nil 0 (int-array 3) 0 1) (catch Exception e (.getSimpleName (class e))))]" :portability :jvm}
+  {:suite "reify / IFn" :label "a reify declaring IFn is ifn? and an instance of it" :expected "[true false true \"Invoked!\"]" :actual "(let [r (reify clojure.lang.IFn (invoke [_] \"Invoked!\"))] [(ifn? r) (fn? r) (instance? clojure.lang.IFn r) (r)])" :portability :jvm}
   {:suite "reify / IDeref" :label "@ dispatches to the deref method" :expected "7" :actual "(deref (reify clojure.lang.IDeref (deref [_] 7)))" :portability :jvm}
   {:suite "deftype / mutable field" :label "set! is observed by a later read in the same method" :expected "9" :actual "(do (deftype B [^:unsynchronized-mutable v] clojure.lang.IDeref (deref [_] (set! v 9) v)) (deref (->B 0)))" :portability :jvm}
   {:suite "def / metadata evaluation" :label "a symbol metadata value evaluates to its var" :expected "true" :actual "(do (def ^{:af rest} mv 1) (fn? (:af (meta (var mv)))))" :portability :common}
@@ -3722,6 +3788,10 @@
   {:suite "stdlib / pprint cl-format" :label "~{~} iteration with separator" :expected "\"1, 2, 3\"" :actual "(do (require (quote [clojure.pprint :as ppc])) (ppc/cl-format nil \"~{~a~^, ~}\" [1 2 3]))" :portability :common}
   {:suite "stdlib / pprint cl-format" :label "~[~] conditional selects by arg" :expected "\"two\"" :actual "(do (require (quote [clojure.pprint :as ppc])) (ppc/cl-format nil \"~[zero~;one~;two~]\" 2))" :portability :common}
   {:suite "stdlib / pprint cl-format" :label "~5a pads to width" :expected "\"ab   |\"" :actual "(do (require (quote [clojure.pprint :as ppc])) (ppc/cl-format nil \"~5a|\" \"ab\"))" :portability :common}
+  {:suite "interop / reader classes" :label "LineNumberingPushbackReader reports its own class" :expected "\"clojure.lang.LineNumberingPushbackReader\"" :actual "(.getName (class (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"a\"))))" :portability :common}
+  {:suite "interop / reader classes" :label "a plain PushbackReader reports its own class" :expected "\"java.io.PushbackReader\"" :actual "(.getName (class (java.io.PushbackReader. (java.io.StringReader. \"a\"))))" :portability :common}
+  {:suite "interop / reader classes" :label "LineNumberingPushbackReader is a PushbackReader" :expected "true" :actual "(instance? java.io.PushbackReader (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"a\")))" :portability :common}
+  {:suite "interop / reader classes" :label "a PushbackReader is not line-numbering" :expected "false" :actual "(instance? clojure.lang.LineNumberingPushbackReader (java.io.PushbackReader. (java.io.StringReader. \"a\")))" :portability :common}
   {:suite "interop / java.io File" :label "getName" :expected "\"c.txt\"" :actual "(.getName (java.io.File. \"/a/b/c.txt\"))" :portability :jvm}
   {:suite "interop / java.io File" :label "getParent" :expected "\"/a/b\"" :actual "(.getParent (java.io.File. \"/a/b/c.txt\"))" :portability :jvm}
   {:suite "interop / java.io File" :label "getPath keeps relative path" :expected "\"rel/x\"" :actual "(.getPath (java.io.File. \"rel/x\"))" :portability :jvm}
@@ -3972,7 +4042,7 @@
   {:suite "iref / watches" :label "agent watches fire on state change" :expected "[0 1]" :actual "(let [ag (agent 0) p (promise)] (add-watch ag :w (fn [k r o n] (deliver p [o n]))) (send ag inc) (deref p 2000 :timeout))" :portability :common}
   {:suite "iref / meta" :label "alter-meta! works on atoms" :expected "{:x 1 :y 2}" :actual "(let [a (atom 1 :meta {:x 1})] (alter-meta! a assoc :y 2))" :portability :common}
   {:suite "casts / checked narrow" :label "doubles range-check themselves, then truncate" :expected "[1 1 3 1 \\a 0]" :actual "[(byte 1.1) (short 1.9) (int 3.7) (long 1.5) (char 97.5) (long ##NaN)]" :portability :common}
-  {:suite "casts / checked narrow" :label "out-of-range values throw IllegalArgumentException" :expected "[:iae :iae :iae :iae :iae :iae :iae]" :actual "[(try (byte 128) (catch IllegalArgumentException _ :iae)) (try (byte 127.000001) (catch IllegalArgumentException _ :iae)) (try (short 40000) (catch IllegalArgumentException _ :iae)) (try (int 2147483647.000001) (catch IllegalArgumentException _ :iae)) (try (char -1) (catch IllegalArgumentException _ :iae)) (try (char 65536) (catch IllegalArgumentException _ :iae)) (try (long 1e300) (catch IllegalArgumentException _ :iae))]" :portability :common}
+  {:suite "casts / checked narrow" :label "out-of-range values throw IllegalArgumentException" :expected "[:iae :iae :iae :iae :iae :iae :iae]" :actual "[(try (byte 128) (catch IllegalArgumentException _ :iae)) (try (byte 127.000001) (catch IllegalArgumentException _ :iae)) (try (short 40000) (catch IllegalArgumentException _ :iae)) (try (int 2147483647.000001) (catch IllegalArgumentException _ :iae)) (try (char -1) (catch IllegalArgumentException _ :iae)) (try (char 1114112) (catch IllegalArgumentException _ :iae)) (try (long 1e300) (catch IllegalArgumentException _ :iae))]" :portability :common}
   {:suite "casts / checked narrow" :label "the throw carries the JVM message" :expected "\"Value out of range for byte: 128\"" :actual "(try (byte 128) (catch IllegalArgumentException e (ex-message e)))" :portability :common}
   {:suite "casts / checked narrow" :label "ratios and bigdecs truncate; non-numbers are CCE" :expected "[1 5 :cce]" :actual "[(byte 3/2) (int 5.5M) (try (byte true) (catch ClassCastException _ :cce))]" :portability :common}
   {:suite "casts / checked narrow" :label "float range-checks against Float/MAX_VALUE" :expected "[:iae 1.5]" :actual "[(try (float 1e300) (catch IllegalArgumentException _ :iae)) (float 1.5)]" :portability :common}
@@ -4462,6 +4532,9 @@
  {:suite "charsets / named encodings" :label "URL encode converts per escaped run, not per string" :expected "\"foo%FE%FF%00%2Fbar\"" :actual "(java.net.URLEncoder/encode \"foo/bar\" \"UTF-16\")" :portability :common}
  {:suite "charsets / named encodings" :label "URL decode reads one escaped run at a time" :expected "\"foo/bar\"" :actual "(java.net.URLDecoder/decode \"foo%FE%FF%00%2Fbar\" \"UTF-16\")" :portability :common}
  {:suite "charsets / named encodings" :label "URL codec round-trips through UTF-8" :expected "[\"h%C3%A9llo+w%C3%B6rld%21\" \"a b/c\"]" :actual "[(java.net.URLEncoder/encode \"h\\u00e9llo w\\u00f6rld!\" \"UTF-8\") (java.net.URLDecoder/decode \"a+b%2Fc\" \"UTF-8\")]" :portability :common}
+ {:suite "charsets / named encodings" :label "a stateful charset closes back to ASCII" :expected "[27 36 66 36 36 27 40 66]" :actual "(vec (.getBytes \"\\u3044\" \"ISO-2022-JP\"))" :portability :common}
+ {:suite "charsets / named encodings" :label "a stateful charset shifts back mid-string too" :expected "[97 27 36 66 36 36 27 40 66 98]" :actual "(vec (.getBytes \"a\\u3044b\" \"ISO-2022-JP\"))" :portability :common}
+ {:suite "charsets / named encodings" :label "a stateful charset leaves pure ASCII unescaped" :expected "[97 98 99]" :actual "(vec (.getBytes \"abc\" \"ISO-2022-JP\"))" :portability :common}
  {:suite "streams / pipes and stream targets" :label "a piped pair streams from another thread" :expected "\"Hello World\"" :actual "(let [in (java.io.PipedInputStream.) out (java.io.PipedOutputStream.)] (.connect in out) (future (try (spit out \"Hello World\") (finally (.close out)))) (slurp in))" :portability :common}
  {:suite "streams / pipes and stream targets" :label "a pipe connects through the constructor" :expected "\"abc\"" :actual "(let [out (java.io.PipedOutputStream.) in (java.io.PipedInputStream. out)] (future (try (spit out \"abc\") (finally (.close out)))) (slurp in))" :portability :common}
  {:suite "streams / pipes and stream targets" :label "reading a closed pipe is an IOException" :expected ":ioe" :actual "(let [in (java.io.PipedInputStream.) out (java.io.PipedOutputStream.)] (.connect in out) (.close in) (try (slurp in) (catch java.io.IOException e :ioe)))" :portability :common}
@@ -4477,12 +4550,12 @@
   {:suite "string-model / codepoint strings" :label "seq counts codepoints" :expected "2" :actual "(count (seq \"😀x\"))" :portability :common}
   {:suite "string-model / codepoint strings" :label "subs across astral boundary" :expected "\"😀\"" :actual "(subs \"a😀b\" 1 2)" :portability :common}
   ;; .charAt yields the whole codepoint, so an astral character comes back as one
-  ;; char above 0xFFFF. (char that) then throws — correctly, and the same way the
-  ;; JVM's char does — where on the JVM .charAt would have handed back a surrogate
-  ;; that fits. Any escaper written as (char (int (.charAt s i))) hits this;
-  ;; data.json's does.
+  ;; char above 0xFFFF, where the JVM would have handed back a surrogate half.
+  ;; (char that) round-trips rather than throwing — jolt's char spans the Unicode
+  ;; scalar values because its strings are code-point indexed, which is a
+  ;; deliberate superset of the JVM's 16-bit char (see known-divergences). The
+  ;; round trip is pinned in unit.edn, not here, since the JVM throws.
   {:suite "string-model / codepoint strings" :label "charAt of an astral character is the codepoint" :expected "[128512 1]" :actual "[(int (.charAt \"😀\" 0)) (.length \"😀\")]" :portability :jvm}
-  {:suite "string-model / codepoint strings" :label "char of it is out of range, as on the JVM" :expected "\"IllegalArgumentException\"" :actual "(try (char (int (.charAt \"😀\" 0))) (catch Exception e (.getSimpleName (class e))))" :portability :jvm}
   {:suite "concurrency-model / compare-and-set!" :label "value equality where JVM uses identity" :expected "true" :actual "(compare-and-set! (atom [1]) [1] [2])" :portability :common}
   {:suite "reader-model / read-eval" :label "#= is inert data" :expected "false" :actual "(= 3 (read-string \"#=(+ 1 2)\"))" :portability :common}
   {:suite "reader-model / nested fn literals" :label "nested #() reads" :expected "true" :actual "(string? (str (read-string \"#(#(inc %))\")))" :portability :common}
@@ -4612,4 +4685,15 @@
   {:suite "regex-parity / quantifiers" :label "quantifier min greater than max {1,0} is rejected" :expected ":pse" :actual "(try (re-pattern \"{1,0}\") :parsed (catch java.util.regex.PatternSyntaxException _ :pse))" :portability :common :jvm-certified true}
   {:suite "regex-parity / class escapes" :label "empty quote escape [\\Q\\E] is rejected in a class" :expected ":pse" :actual "(try (re-pattern \"[\\\\Q\\\\E]\") :parsed (catch java.util.regex.PatternSyntaxException _ :pse))" :portability :common :jvm-certified true}
   {:suite "regex-parity / class escapes" :label "linebreak escape [\\R] is rejected in a class" :expected ":pse" :actual "(try (re-pattern \"[\\\\R]\") :parsed (catch java.util.regex.PatternSyntaxException _ :pse))" :portability :common :jvm-certified true}
+  {:suite "murmur3 / statics" :label "Murmur3/hashLong 0 is 0" :expected "0" :actual "(clojure.lang.Murmur3/hashLong 0)" :portability :common :jvm-certified true}
+  {:suite "murmur3 / statics" :label "Murmur3/hashLong of a small long" :expected "1871679806" :actual "(clojure.lang.Murmur3/hashLong 42)" :portability :common :jvm-certified true}
+  {:suite "murmur3 / statics" :label "Murmur3/hashInt" :expected "1343918321" :actual "(clojure.lang.Murmur3/hashInt 7)" :portability :common :jvm-certified true}
+  {:suite "murmur3 / statics" :label "Murmur3/hashUnencodedChars" :expected "1118836419" :actual "(clojure.lang.Murmur3/hashUnencodedChars \"abc\")" :portability :common :jvm-certified true}
+  {:suite "murmur3 / statics" :label "Murmur3/mixCollHash" :expected "-1952648160" :actual "(clojure.lang.Murmur3/mixCollHash 100 3)" :portability :common :jvm-certified true}
+  {:suite "murmur3 / statics" :label "Murmur3/hashOrdered over a vector" :expected "736442005" :actual "(clojure.lang.Murmur3/hashOrdered [1 2 3])" :portability :common :jvm-certified true}
+  {:suite "murmur3 / statics" :label "Murmur3/hashUnordered over a vector" :expected "439094965" :actual "(clojure.lang.Murmur3/hashUnordered [1 2 3])" :portability :common :jvm-certified true}
+  {:suite "murmur3 / statics" :label "Util/hashCombine mixes two hashes" :expected "-1640530378" :actual "(clojure.lang.Util/hashCombine 17 42)" :portability :common :jvm-certified true}
+  {:suite "protocols / cross-ns extend" :label "extend-protocol to a record named by its fully-qualified name, from a third ns" :expected "42" :actual "(do (ns fqx.a) (clojure.core/defrecord Box [v]) (ns fqx.b) (clojure.core/defprotocol Unwrap (unwrap [this])) (ns fqx.c) (clojure.core/extend-protocol fqx.b/Unwrap fqx.a.Box (unwrap [this] (:v this))) (fqx.b/unwrap (fqx.a/->Box 42)))" :portability :common :jvm-certified true}
+  {:suite "protocols / specificity" :label "a more specific class beats the Object default (Throwable)" :expected ":throwable" :actual "(do (defprotocol Pd (fd [x])) (extend-protocol Pd Object (fd [_] :object)) (extend-protocol Pd Throwable (fd [_] :throwable)) (fd (ex-info \"x\" {})))" :portability :common :jvm-certified true}
+  {:suite "protocols / specificity" :label "an atom dispatches on clojure.lang.IRef, not Object" :expected ":iref" :actual "(do (defprotocol Pr (fr [x])) (extend-protocol Pr Object (fr [_] :object)) (extend-protocol Pr clojure.lang.IRef (fr [_] :iref)) (fr (atom 1)))" :portability :common :jvm-certified true}
 ]

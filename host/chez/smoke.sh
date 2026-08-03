@@ -166,6 +166,10 @@ check '(require [clojure.string :as s]) (s/upper-case "hello")' '"HELLO"'
 # backwards and an editor jumps to the wrong jolt/deps.clj.
 check '(require [clojure.java.io :as io] [clojure.string :as s])
        (s/includes? (slurp (io/resource "jolt/deps.clj")) "defn resolve-project")' 'true'
+# (The URL io/resource answers for a file on a source root must be ABSOLUTE; that
+# is asserted in deps-alias-smoke.sh, which has fixture projects with real roots.
+# Here jolt-core/stdlib are baked into the binary, so this takes the embedded-
+# resource branch instead and never builds a file: URL at all.)
 check '(eval (quote (+ 1 2)))' '3'
 check '(load-string "(def y 5) (* y y)")' '25'
 check '(defmacro add1 [x] (list (quote +) x 1)) (add1 10)' '11'
@@ -493,6 +497,53 @@ else
   echo "  FAIL: clojure.zip / clojure.data"
   echo "    $(printf '%s' "$zd_out" | grep ZIP-DATA-RESULT | tail -1)"
   printf '%s' "$zd_out" | grep 'zip-data FAIL' | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# clojure.datafy: cannot be corpus rows (a qualified reference in the same form
+# as its require compiles before the require runs), and the arms only fire if the
+# value reports a class more specific than Object — which is what an atom, a
+# throwable and a namespace now do. The file runs unchanged on reference Clojure
+# and prints the same DATAFY OK there.
+df_out="$($jolt run test/chez/datafy-test.clj 2>/dev/null)"
+if printf '%s' "$df_out" | grep -q 'DATAFY OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: clojure.datafy"
+  printf '%s' "$df_out" | grep 'datafy FAIL' | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# Protocol identity across namespaces. Two namespaces each define a protocol named
+# Greet and extend it to Object; they are distinct interfaces, so each namespace
+# keeps its own impl, and a record in one namespace does not answer instance? for
+# a same-named protocol in the other. Keying by the SIMPLE name made the second
+# extend replace the first — a silent wrong answer rather than a crash, and it
+# needs two namespaces, so it is a fixture rather than a corpus row.
+pc_want="A=:from-A B=:from-B reified=:reified-A cross-instance=false own-instance=true satisfies=true"
+pc_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+pc_out="$(cd "$root/test/chez/proto-collision-app" && "$pc_jolt" -M -m app.core 2>/dev/null)"
+if [ "$pc_out" = "$pc_want" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: protocol identity fixture"
+  echo "    want: $pc_want"
+  echo "    got:  $pc_out"
+  fails=$((fails + 1))
+fi
+
+# clojure.stacktrace: the surface test runners print an errored test with (kaocha
+# calls print-cause-trace, clojure.test's reporter print-stack-trace). Loads on
+# require, so it cannot be a corpus row either. The frame list is empty on jolt —
+# tail calls leave nothing to report — but the throwable line, the ex-data and the
+# Caused by chain match reference Clojure exactly, and that is what is pinned.
+st_out="$($jolt run test/chez/stacktrace-test.clj 2>/dev/null)"
+if printf '%s' "$st_out" | grep -q 'STACKTRACE OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: clojure.stacktrace"
+  echo "    $(printf '%s' "$st_out" | grep STACKTRACE-RESULT | tail -1)"
+  printf '%s' "$st_out" | grep 'stacktrace FAIL' | sed 's/^/    /'
   fails=$((fails + 1))
 fi
 

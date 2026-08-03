@@ -323,7 +323,8 @@
     ((or (bytevector? src) (string? src)
          (and (jolt-array? src) (eq? (jolt-array-kind src) 'byte)))
      (write-all! (na-byte-array src)))
-    ((and (jhost? src) (member (jhost-tag src) '("string-reader" "pushback-reader")))
+    ((and (jhost? src) (or (string=? (jhost-tag src) "string-reader")
+                           (pushback-reader-tag? (jhost-tag src))))
      (write-all! (na-byte-array (drain-reader src))))
     (else
      (let ((buf (na-byte-array 8192)))
@@ -334,6 +335,31 @@
              (loop)))))))
   jolt-nil)
 (def-var! "clojure.java.io" "copy" jolt-io-copy)
+
+;; java.lang.reflect.Array — allocation and element access over an array whose
+;; component type is named rather than written literally. This is not the
+;; reflection API in any deep sense: newInstance with a concrete component type
+;; is what make-array already does, and malli's own :bb and :cljs branches spell
+;; the same call (object-array capacity). Like make-array, the component type
+;; selects nothing here — jolt's arrays are object-kinded unless built by a typed
+;; constructor — so a primitive component gives an object array of that length.
+(define (na-need-array x)
+  (if (jolt-array? x)
+      x
+      (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
+                                       "Argument is not an array"))))
+(let ((statics
+       (list
+        (cons "newInstance" (lambda (component len . dims)
+                              (if (pair? dims)
+                                  (throw-jvm (quote IllegalArgumentException)
+                                    "Array/newInstance: multi-dimensional arrays are not supported")
+                                  (na-make-array component len))))
+        (cons "getLength" (lambda (arr) (->num (ja-len (jolt-array-vec (na-need-array arr))))))
+        (cons "get" (lambda (arr i) (ja-ref (jolt-array-vec (na-need-array arr)) (na-idx i))))
+        (cons "set" (lambda (arr i v) (na-array-set! (na-need-array arr) (na-idx i) v) jolt-nil)))))
+  (register-class-statics! "Array" statics)
+  (register-class-statics! "java.lang.reflect.Array" statics))
 
 ;; java.lang.reflect.Field over the modeled class registry: getDeclaredFields on
 ;; a Class naming a deftype/defrecord returns its declared fields, each

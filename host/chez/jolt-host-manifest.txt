@@ -111,7 +111,9 @@ monitor-enter
 monitor-exit
 mono-nanos
 park-until-interrupt
+protocol-key-of
 protocol-methods
+proxy-super-call
 rational-type?
 read-all-stdin
 real-nanos
@@ -141,6 +143,7 @@ sh
 sh-out
 source-roots
 stash-inline!
+static-member
 stop-main-pump
 table?
 tagged-table

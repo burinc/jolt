@@ -122,7 +122,18 @@
   {:name "rewrite-clj"
    :paths ["src" "resources" "test"]
    :deps ["@tools.reader/src/main/clojure" "@test.check/src/main/clojure"]
-   :expect {:tests 162 :pass 3380 :fail 0 :error 0}}
+   :expect {:tests 163 :pass 3381 :fail 0 :error 0}}
+  ;; Upstream runs test-isolated/ as its own kaocha profile, and the isolation is
+  ;; the point: the test asserts a coercion works when rewrite-clj.zip is the ONLY
+  ;; namespace required, so requiring any other test namespace pulls in
+  ;; rewrite-clj.node and the assertion passes for the wrong reason. A separate
+  ;; entry is a separate process, which is exactly that isolation.
+  {:name "rewrite-clj-isolated"
+   :root "rewrite-clj"
+   :paths ["src" "resources" "test-isolated"]
+   :test-paths ["test-isolated"]
+   :deps ["@tools.reader/src/main/clojure"]
+   :expect {:tests 1 :pass 1 :fail 0 :error 0}}
 
   ;; ---------------------------------------------------------- spec + testing
   {:name "spec.alpha"
@@ -143,7 +154,7 @@
    :timeout 900
    ;; property-based: the assertion count moves with the generated cases
    :tolerance 40
-   :expect {:tests 123 :pass 230 :fail 15 :error 3}}
+   :expect {:tests 123 :pass 236 :fail 10 :error 2}}
 
   {:name "test.chuck"
    ;; resources/ holds the regex grammar its parser slurps through io/resource
@@ -163,7 +174,7 @@
    ;; exception-handling namespaces compare printed #error maps whose :trace is
    ;; empty because tail calls leave no frames to report. The load-fail is clj-time,
    ;; which needs joda-time.
-   :expect {:tests 39 :pass 98 :fail 22 :error 3 :load-fail 1}}
+   :expect {:tests 39 :pass 110 :fail 17 :error 2 :load-fail 1}}
 
   ;; ---------------------------------------------------------- data formats
   {:name "data.csv"
@@ -175,25 +186,35 @@
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
    :deps ["@test.check/src/main/clojure" "@spec.alpha/src/main/clojure"]
-   ;; The suite checks jolt's base64 against commons-codec's and against the
-   ;; clojure.lang.IFn$OLLOL primitive interfaces — neither exists here, so the
-   ;; comparison assertions cannot run. data.codec itself is exercised by the
-   ;; assertions that do not reach for them.
-   :note "commons-codec + IFn$O..O primitive interfaces are JVM-only"
-   :expect {:tests 14 :pass 1 :fail 2 :error 11}}
+   ;; The suite checks jolt's base64 against commons-codec's, which the
+   ;; jolt.shim.commons-codec shim registers ahead of the library's sources.
+   ;; The 2 remaining failures are clojure.lang.IFn$O..O primitive-interface
+   ;; instance? checks — JVM function interfaces jolt has no model for.
+   :shims ["!test/conformance/libs/shims/data.codec"]
+   :preload ["jolt.shim.commons-codec"]
+   :note "IFn$O..O primitive function interfaces are JVM-only"
+   :expect {:tests 14 :pass 12 :fail 2 :error 0}}
 
   {:name "data.json"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
    ;; json-gen-test round-trips through stest/check, which generates via test.check
+   ;; The 72 ::sci-not-available errors are malli.sci dynaloading sci.core, which
+   ;; does not fully load here: sci reaches PRIVATE clojure.core internals by var
+   ;; (imap-cons, system-newline) and pulls further deps behind them. Putting
+   ;; jolt's vendored sci on the path does not change the count — it is a chain,
+   ;; not one gap, and it is what `make sci`'s own floor already tracks. So the
+   ;; :=> / function-schema surface stays unexercised here rather than pretending.
    :deps ["~time/src" "@spec.alpha/src/main/clojure" "@test.check/src/main/clojure"]
    :timeout 900
-   ;; The residue is one case in each of the two APIs: an astral character. jolt
-   ;; strings are codepoint-indexed, so .charAt hands data.json's escaper a value
-   ;; above 0xFFFF where the JVM hands it a surrogate — the escape comes out
-   ;; \u1f603 rather than the \ud83d\ude03 pair, and the unescaped path throws
-   ;; out of (char cp). :string-model, see known-divergences.edn.
-   :expect {:tests 244 :pass 320 :fail 2 :error 2}}
+   ;; The residue is one :escape-unicode true case in each of the two APIs, and
+   ;; it is the string model rather than a bug: jolt strings are codepoint-indexed,
+   ;; so .charAt hands data.json's escaper an astral character whole where the JVM
+   ;; hands it a surrogate half, and the escape comes out \u1f603 rather than the
+   ;; \ud83d\ude03 pair. Matching would mean UTF-16 count/nth/char. The
+   ;; :escape-unicode false path used to throw out of (char cp) and no longer does.
+   ;; :string-model, see known-divergences.edn.
+   :expect {:tests 244 :pass 322 :fail 2 :error 0}}
 
   {:name "data.zip"
    :paths ["src/main/clojure" "src/test/clojure"]
@@ -210,7 +231,7 @@
   ;; ---------------------------------------------------------- markup / text
   {:name "hiccup"
    :paths ["src" "test"]
-   :expect {:tests 64 :pass 385 :fail 1 :error 0}}
+   :expect {:tests 64 :pass 386 :fail 0 :error 0}}
 
   {:name "markdown-clj"
    :paths ["src/clj" "src/cljc" "test"]
@@ -223,9 +244,12 @@
    ;; Maven now, so the real one — snakeyaml, i.e. Java — is what gets loaded and
    ;; it dies on DumperOptions$FlowStyle. The same jolt-lang/yaml source goes on
    ;; ahead of it as a shim so clj_yaml.core resolves to the compatibility layer.
-   :shims ["~yaml/src"]
-   ;; the 2 errors are org.apache.commons.lang.StringEscapeUtils, a JVM jar
-   :expect {:tests 94 :pass 180 :fail 0 :error 2}}
+   :shims ["~yaml/src" "!test/conformance/libs/shims/markdown-clj"]
+   ;; the autourl tests unescape markdown's HTML output through
+   ;; org.apache.commons.lang.StringEscapeUtils, supplied by the preloaded
+   ;; jolt.shim.commons-lang shim. No residue.
+   :preload ["jolt.shim.commons-lang"]
+   :expect {:tests 94 :pass 182 :fail 0 :error 0}}
 
   {:name "Selmer"
    :paths ["src" "test" "resources"]
@@ -242,13 +266,13 @@
    ;; level and reads its `user` var, so it still has to compile — hence criterium.
    :shims ["!test/conformance/libs/shims/cheshire" "!test/conformance/libs/shims/criterium"]
    :exclude-nses ["selmer.benchmark"]
-   ;; The one remaining error is commons-lang StringEscapeUtils, a JVM jar with no
-   ;; portable equivalent. Nothing else fails.
+   ;; StringEscapeUtils is not referenced anywhere in the suite, so no commons-lang
+   ;; shim is attached.
    ;;
    ;; The locale work behind this tally lives on three extension points core
    ;; declares and jolt-lang/time fills in: :date-names, :number-symbols and
    ;; :currency-data. Running Selmer needs that library on :deps, which it has.
-   :expect {:tests 131 :pass 525 :fail 0 :error 1}}
+   :expect {:tests 131 :pass 526 :fail 0 :error 0}}
 
   {:name "html"
    :paths ["src" "test"]
@@ -257,9 +281,19 @@
   ;; ---------------------------------------------------------- data / config
   {:name "honeysql"
    :paths ["src" "test"]
+   ;; honey.sql-alphanumeric-test is a defspec over generated identifiers, so it
+   ;; needs test.check and test.chuck's generators the way honeysql's own
+   ;; deps.edn declares them; without those on the recipe the namespace is a
+   ;; load failure rather than a missing dependency anyone would notice.
    :deps ["~time/src" "@core.cache/src/main/clojure"
-          "@data.priority-map/src/main/clojure"]
-   :expect {:tests 175 :pass 832 :fail 0 :error 0}}
+          "@data.priority-map/src/main/clojure"
+          "@test.check/src/main/clojure" "@test.chuck/src" "@test.chuck/resources"]
+   ;; test.chuck's string-from-regex generator parses the pattern with instaparse,
+   ;; at the version test.chuck itself declares
+   :extra-deps {instaparse/instaparse {:mvn/version "1.4.10"}}
+   ;; that suite is a defspec, so its assertion count moves with the drawn cases
+   :tolerance 40
+   :expect {:tests 177 :pass 2842 :fail 0 :error 0}}
 
   {:name "config"
    :paths ["src" "test"]
@@ -280,8 +314,26 @@
                 borkdude/edamame {:mvn/version "1.5.37"}
                 fipp/fipp {:mvn/version "0.6.29"}
                 mvxcvi/arrangement {:mvn/version "2.1.0"}}
+   ;; jolt.time installs the java.time.* class seams; malli's own requires do
+   ;; not reach it, so it is preloaded.
+   :preload ["jolt.time"]
    :timeout 900
-   :expect {:tests 28 :pass 121 :fail 4 :error 8 :load-fail 20}}
+   ;; Keying protocol dispatch by defining namespace (jolt-ewmt) is what moved
+   ;; this: malli.generator-ast evals a textually-renamed copy of
+   ;; malli.generator, so a SECOND protocol also named Generator was extended to
+   ;; Object and replaced the real -generator. Eight more namespaces load and the
+   ;; suite went 28 tests / 121 assertions to the figures below. The remaining
+   ;; The 8 remaining load failures are both JVM-internal: fipp reaching Clojure's
+   ;; private #'clojure.core/mk-am through core.rrb-vector (7), and jsonista, i.e.
+   ;; Jackson (1).
+   ;;
+   ;; Of what runs: 72 errors are the sci chain above. 104 of the failures are
+   ;; parser-info-test alone, which round-trips values drawn by (mg/sample s
+   ;; {:seed 0}) — a fixed seed draws DIFFERENT values here than on the JVM, so
+   ;; the test runs over different data. :every parsing and registry references
+   ;; themselves agree with 1.12.5 exactly on literal inputs, checked directly.
+   ;; That is the same family as test.check's :tolerance, not a malli bug.
+   :expect {:tests 209 :pass 12059 :fail 149 :error 76 :load-fail 8}}
 
   ;; ---------------------------------------------------------- web
   {:name "ring-codec"
@@ -295,15 +347,27 @@
    :paths ["ring-core/src" "ring-core-protocols/src" "ring-websocket-protocols/src"
            "ring-core/test"]
    :test-paths ["ring-core/test"]
-   :deps ["@ring-codec/src" "~time/src"]
+   :deps ["@ring-codec/src" "~time/src" "~multipart/src"]
    :local-deps ["~jolt-crypto"]
    :extra-deps {crypto-random/crypto-random {:mvn/version "1.2.1"}
                 crypto-equality/crypto-equality {:mvn/version "1.0.1"}}
    ;; The two session/cookie suites are written against clj-time, which is Joda —
-   ;; a JVM library with no jolt equivalent. The multipart suites need Apache
-   ;; commons-fileupload and commons-io; both are JVM-only too.
-   :note "clj-time (Joda) + commons-fileupload/commons-io are JVM-only"
-   :expect {:tests 151 :pass 405 :fail 15 :error 18 :load-fail 2}}
+   ;; a JVM library with no jolt equivalent. The multipart suites are served by
+   ;; jolt.shim.commons-fileupload, which registers the commons-fileupload2 class
+   ;; surface ring reaches for over jolt-lang/multipart's RFC 7578 parser — glue,
+   ;; not a parser, so ring's own code paths stay its own. Every multipart test
+   ;; passes. commons-io (IOUtils/toByteArray in the
+   ;; byte-array store, FileUtils/writeStringToFile in the resource-response
+   ;; test) is supplied by the preloaded jolt.shim.commons-io shim. The
+   ;; resource tests still hit java.net.URLClassLoader and jar: URLs, JDK
+   ;; surface with no jolt equivalent. The 8 failures that went away were
+   ;; java.io.File comparing by identity under = rather than by pathname.
+   :shims ["!test/conformance/libs/shims/ring-core"]
+   ;; commons-fileupload before ring.middleware.multipart-params, which imports
+   ;; its classes at load.
+   :preload ["jolt.shim.commons-io" "jolt.shim.commons-fileupload"]
+   :note "clj-time (Joda) + commons-fileupload are JVM-only; URLClassLoader/jar: URLs are jolt gaps"
+   :expect {:tests 152 :pass 446 :fail 5 :error 5 :load-fail 2}}
 
   {:name "ring-spec"
    :paths ["src" "test"]
@@ -371,13 +435,16 @@
    ;; slf4j code path. :preload because find-factory runs before any test does.
    :shims ["!test/conformance/libs/shims/slf4j"]
    :preload ["jolt.shim.slf4j"]
-   :expect {:tests 67 :pass 219 :fail 0 :error 4}}
+   ;; log-capture!/with-logs redirect the process streams through a PrintStream
+   ;; over a proxy of ByteArrayOutputStream, so the whole suite passing is the
+   ;; proxy-by-delegation path working end to end.
+   :expect {:tests 67 :pass 226 :fail 0 :error 0}}
 
   ;; ---------------------------------------------------------- time
   {:name "tick"
    :paths ["src" "test"]
    :deps ["~time/src" "@spec.alpha/src/main/clojure"]
-   :expect {:tests 41 :pass 620 :fail 0 :error 0 :load-fail 1}}
+   :expect {:tests 67 :pass 723 :fail 0 :error 0}}
 
   ;; ---------------------------------------------------------- skipped
   {:name "process"

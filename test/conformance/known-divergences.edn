@@ -100,6 +100,46 @@
   ;; (exact)"), pinned jolt-side: it buckets as :jvm-error in certify (the :actual throws
   ;; on the JVM), which is informational — not gated — so it lives in :documented, not
   ;; in :entries (which certify would flag as stale).
+  ;; jolt's strings are indexed by Unicode CODE POINT where the JVM's are indexed
+  ;; by UTF-16 code unit, and (char n) follows the string model rather than the
+  ;; JVM's 16-bit char: it has to accept the whole scalar-value range or it could
+  ;; not rebuild a char that (first s) just handed out. A superset — every value
+  ;; the JVM accepts still works, and surrogates stay rejected because they are
+  ;; not scalar values.
+  ;;
+  ;; The visible consequence is in libraries that hand-encode \uXXXX per char:
+  ;; data.json's :escape-unicode writes \u1f603 for an astral character where the
+  ;; JVM writes the surrogate pair \ud83d\ude03. Matching that would mean adopting
+  ;; UTF-16 semantics for count/nth/char, which is the model choice jolt made the
+  ;; other way. The round trip is pinned in unit.edn ("char / code points").
+  {:category :string-model
+   :behavior "(char 128515), the code point (first \"<astral>\") yields"
+   :jvm "throws IllegalArgumentException — a JVM char is 16 bits"
+   :jolt "returns that character; (int (first (str (char 128515)))) is 128515 again"
+   :note "Deliberate superset of the JVM, following jolt's code-point string model."}
+  ;; proxy over a concrete class EXTENDS BY DELEGATION: jolt generates no classes,
+  ;; so the proxy holds a real base instance, answers what its body declares and
+  ;; forwards the rest. Two consequences, both inherent to delegation rather than
+  ;; to how it is written here.
+  ;;
+  ;; The base holds no reference back to the proxy, so a base method that calls an
+  ;; overridden method reaches the BASE's version where the JVM's virtual dispatch
+  ;; would re-enter the override. Overriding a method the base itself calls is the
+  ;; case this does not model; overriding a leaf method (the common one, and what
+  ;; clojure.tools.logging's log-stream does) behaves identically.
+  {:category :host-model
+   :behavior "a base method calling a method the proxy overrides"
+   :jvm "re-enters the override (virtual dispatch)"
+   :jolt "runs the base's own version"
+   :note "Delegation, not subclassing. Overriding a leaf method is unaffected."}
+  ;; A proxy method returns its body's value; the JVM coerces to the declared
+  ;; return type, so a void method yields nil there. jolt has no signatures — the
+  ;; same is already true of reify.
+  {:category :host-model
+   :behavior "(.flush (proxy [java.io.ByteArrayOutputStream] [] (flush [] :x)))"
+   :jvm "nil — flush() is declared void"
+   :jolt ":x — the body's value"
+   :note "No method signatures; reify has always behaved this way."}
   {:category :numeric-model
    :behavior "(loop [i 5] (+ i 9223372036854775807))"
    :jvm "throws ArithmeticException (primitive long add overflows at 2^63)"
@@ -264,7 +304,27 @@
    :behavior "(.array (.slice buf)) after (.position buf 1)"
    :jvm "the WHOLE shared backing array (slice is a view; .array ignores the offset)"
    :jolt "just the sliced bytes (slice copies)"
-   :note "jolt's byte-buffer state is #(backing position limit) with no array offset, so a slice cannot express \"0-based view into a shared backing\". Read paths — hexdumps, decoders — are unaffected; a write through a slice does not propagate back. Tracked as jolt-93c9."}]
+   :note "jolt's byte-buffer state is #(backing position limit) with no array offset, so a slice cannot express \"0-based view into a shared backing\". Read paths — hexdumps, decoders — are unaffected; a write through a slice does not propagate back. Tracked as jolt-93c9."}
+  ;; No classloaders. This is not a shim gap that could be filled — a classloader
+  ;; is a JVM linkage concept, and jolt compiles ahead of time to native code with
+  ;; no class-loading step to intercept. Surfaced running kaocha, whose dynapath
+  ;; dependency reaches for java.net.URLClassLoader at load and so cannot run on
+  ;; jolt at all; libraries that use kaocha need their secondary test runner.
+  {:category :host-model
+   :behavior "java.net.URLClassLoader and the classloader API generally"
+   :jvm "present — dynapath/pomegranate manipulate the runtime classpath through it"
+   :jolt "absent; a reference raises \"Unable to resolve symbol: URLClassLoader\""
+   :note "Substrate-inherent, like the reflection API. Affects kaocha (via dynapath), which blocks it as a test harness for rewrite-clj / malli / ordered / tick — each of those has another upstream runner that does work."}
+  ;; No JMX / java.lang.management. Runtime's own memory API is present and maps
+  ;; onto Chez's heap accounting (totalMemory/freeMemory/maxMemory/gc), which is
+  ;; what most callers want; the MXBean layer above it is a JVM management
+  ;; subsystem with no counterpart here. Surfaced in criterium's benchmark
+  ;; warm-up, which reads getMemoryMXBean after settling the heap.
+  {:category :host-model
+   :behavior "java.lang.management.ManagementFactory/getMemoryMXBean and the MXBean API"
+   :jvm "returns a MemoryMXBean reporting heap/non-heap usage, GC counts, and more"
+   :jolt "absent; the call raises \"No matching method getMemoryMXBean\""
+   :note "Runtime.totalMemory/freeMemory/maxMemory ARE present over Chez's collector accounting. What is missing is JMX itself. Affects criterium's benchmark reporting, not its timing."}]
  :entries
  [;; SimpleDateFormat with no Locale answers for ROOT in jolt but the machine's
   ;; DEFAULT locale on the JVM ("March|Mar|Saturday|Sat" under en), so this row's
@@ -338,7 +398,6 @@
    {:suite "string-model / codepoint strings", :label "seq counts codepoints", :category :string-model}
    {:suite "string-model / codepoint strings", :label "subs across astral boundary", :category :string-model}
    {:suite "string-model / codepoint strings", :label "charAt of an astral character is the codepoint", :category :string-model}
-   {:suite "string-model / codepoint strings", :label "char of it is out of range, as on the JVM", :category :string-model}
    {:suite "concurrency-model / compare-and-set!", :label "value equality where JVM uses identity", :category :concurrency-model}
    {:suite "reader-model / read-eval", :label "#= is inert data", :category :reader-model}
    {:suite "permissive / empty MapEntry", :label "empty of a map entry", :category :permissive}]}

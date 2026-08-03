@@ -185,6 +185,23 @@
 (register-class-statics! "APersistentMap" ap-map-statics)
 (register-class-statics! "clojure.lang.APersistentMap" ap-map-statics)
 
+;; clojure.lang.Murmur3 — the hash primitives clojure.core/hash is built on,
+;; called directly by libraries that hash a composite value by hand (malli's
+;; regex parser combines a function hashCode with a position and a register
+;; map). hasheq.ss already holds the port; this only names it for interop.
+;; hashOrdered/hashUnordered take any seqable, as the Java Iterable overloads do.
+(define murmur3-statics
+  (list (cons "hashInt" (lambda (n) (murmur3-hash-int (jolt->fx n))))
+        (cons "hashLong" (lambda (n) (murmur3-hash-long (jolt->fx n))))
+        (cons "hashUnencodedChars"
+              (lambda (s) (murmur3-hash-unencoded-chars (jolt-final-str s))))
+        (cons "hashOrdered" (lambda (xs) (hash-ordered (jolt-seq xs))))
+        (cons "hashUnordered" (lambda (xs) (hash-unordered (jolt-seq xs))))
+        (cons "mixCollHash"
+              (lambda (h n) (mix-coll-hash (jolt->fx h) (jolt->fx n))))))
+(register-class-statics! "Murmur3" murmur3-statics)
+(register-class-statics! "clojure.lang.Murmur3" murmur3-statics)
+
 ;; clojure.lang.RT/map: build a map from a [k v k v…] array/seq (RT.map). Small
 ;; maps keep insertion order (PersistentArrayMap). tools.reader builds map and
 ;; namespaced-map literals this way.
@@ -280,6 +297,10 @@
                      ;; guarded no-op is the faithful behavior under live threads.
                      (guard (e (#t #f)) (collect (collect-maximum-generation)))
                      jolt-nil))
+        ;; No finalizers on this host, so running them is genuinely a no-op — which
+        ;; is also all the JVM promises (a hint, deprecated for removal since 18).
+        ;; criterium calls it alongside System/gc to settle the heap before timing.
+        (cons "runFinalization" (lambda _ jolt-nil))
         ;; wrapped in lambdas: the helpers are defined below, resolved at call time.
         (cons "getProperty" (lambda (k . d) (apply sys-get-property k d)))
         (cons "setProperty" (lambda (k v) (sys-set-property k v)))
@@ -291,7 +312,38 @@
         ;; decide whether to emit ANSI, and a nil means "not a tty".
         (cons "console" (lambda _ jolt-nil))
         (cons "lineSeparator" (lambda _ "\n"))
-        (cons "identityHashCode" (lambda (x) (->num (equal-hash x))))))
+        (cons "identityHashCode" (lambda (x) (->num (equal-hash x))))
+        ;; System.arraycopy(src, srcPos, dest, destPos, length). Specified to
+        ;; behave as if the source range were copied to a temporary first, so a
+        ;; copy that OVERLAPS within one array still reads pre-copy values —
+        ;; walking backwards when the ranges overlap forwards is what gives that
+        ;; without the temporary.
+        (cons "arraycopy" (lambda (src src-pos dst dst-pos len)
+                            (sys-arraycopy src src-pos dst dst-pos len)))))
+
+(define (sys-arraycopy src src-pos dst dst-pos len)
+  (when (or (jolt-nil? src) (jolt-nil? dst))
+    (throw-jvm 'NullPointerException "arraycopy source or destination is nil"))
+  (unless (and (jolt-array? src) (jolt-array? dst))
+    (throw-jvm 'ArrayStoreException "arraycopy operands must be arrays"))
+  ;; A copy between different element kinds is the JVM's ArrayStoreException;
+  ;; only reference arrays are allowed to differ, and jolt models those as one
+  ;; kind, so equal kinds is the whole rule here.
+  (unless (eq? (jolt-array-kind src) (jolt-array-kind dst))
+    (throw-jvm 'ArrayStoreException "arraycopy between arrays of different types"))
+  (let ((sp (na-idx src-pos)) (dp (na-idx dst-pos)) (n (na-idx len))
+        (slen (ja-len (jolt-array-vec src))) (dlen (ja-len (jolt-array-vec dst))))
+    (when (or (negative? sp) (negative? dp) (negative? n)
+              (> (+ sp n) slen) (> (+ dp n) dlen))
+      (jolt-throw (jolt-host-throwable "java.lang.ArrayIndexOutOfBoundsException"
+                                       "arraycopy: last source index out of bounds")))
+    (let ((sv (jolt-array-vec src)) (dv (jolt-array-vec dst)))
+      (if (and (eq? sv dv) (< sp dp))
+          (let loop ((i (- n 1)))
+            (when (>= i 0) (ja-set! dv (+ dp i) (ja-ref sv (+ sp i))) (loop (- i 1))))
+          (let loop ((i 0))
+            (when (< i n) (ja-set! dv (+ dp i) (ja-ref sv (+ sp i))) (loop (+ i 1))))))
+    jolt-nil))
 
 ;; java.lang.Long.bitCount: the population count of the value's 64-bit two's-
 ;; complement (mask to 64 bits so a negative long counts like the JVM, e.g.
@@ -374,6 +426,13 @@
         (cons "toString" (lambda (x . r) (number->string (jnum->exact x))))))
 
 
+;; java.lang.Void has no values — it exists so a caller can NAME the void
+;; primitive type, which is the only thing TYPE is for here. sci's prim->class
+;; maps every primitive name to its class token and stops at the first one
+;; missing, so the whole of sci.core failed to load without it.
+(register-class-statics! "Void" (list (cons "TYPE" "void")))
+(register-class-statics! "java.lang.Void" (list (cons "TYPE" "void")))
+
 (register-class-statics! "Boolean"
   (list (cons "TYPE" "boolean")
         (cons "parseBoolean" (lambda (s) (string=? "true" (ascii-string-down (if (string? s) s (jolt-str-render-one s))))))
@@ -436,6 +495,21 @@
         (cons "MAX_CODE_POINT" (->num #x10FFFF))
         (cons "MIN_SUPPLEMENTARY_CODE_POINT" (->num #x10000))
         (cons "charCount" (lambda (cp) (->num (if (>= (jnum->exact cp) #x10000) 2 1))))
+        ;; codePointAt(seq, index) — the codepoint at `index`. jolt strings are
+        ;; indexed by codepoint, so this is the code of the char sitting there,
+        ;; which is what the JVM answers for every character in the BMP. Above it
+        ;; the JVM's index counts UTF-16 units and an astral character occupies
+        ;; two; that is the :string-model divergence already recorded, not a
+        ;; difference in this method. The char[] overload is accepted too.
+        ;; yaml-parser (yamlstar) classifies each input character through this,
+        ;; and its own non-JVM branches spell it (int (nth input i)).
+        (cons "codePointAt"
+              (lambda (s i)
+                (let ((idx (jnum->exact i)))
+                  (->num (char->integer
+                          (if (jolt-array? s)
+                              (vector-ref (jolt-array-vec s) idx)
+                              (string-ref (jolt-str-render-one s) idx)))))))
         ;; Character.codePointOf(name) is deliberately absent: it is a lookup in the
         ;; Unicode character-name database, which this host does not carry, and a
         ;; partial ASCII-only table would answer wrongly rather than not at all.
