@@ -7,6 +7,7 @@
 
 (ns deps-expand-test
   (:require [clojure.string :as str]
+            [clojurestar.deps :as portable-deps]
             [grenadine.version :as version]
             [jolt.deps :as deps]
             [jolt.deps.ext :as ext]))
@@ -47,6 +48,8 @@
     (println "  FAIL:" label)
     (println "    expected:" (pr-str expected))
     (println "    got:     " (pr-str actual))))
+
+(is= "portable facade returns nil" nil (portable-deps/add-deps {}))
 
 ;;;; the repo from tools.deps test_deps.clj
 
