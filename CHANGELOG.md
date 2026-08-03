@@ -7,6 +7,137 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-03
+
+Running third-party suites through each library's *own* runner, instead of a
+bespoke harness that hand-listed namespaces and supplied its own deps, reached
+code paths that had never executed. Most of this release is what that surfaced.
+
+The largest single find was protocol identity. Dispatch keyed a method table by
+the protocol's SIMPLE name, so two protocols named alike in different namespaces
+shared one table and the later `extend` silently replaced the earlier one — a
+wrong answer, not a crash.
+
+### Added
+
+- **`proxy` extends a concrete class by delegation.** It used to desugar to
+  `reify`, which has no base, so a proxy over a concrete class answered only the
+  methods its body declared and `proxy-super` threw unconditionally. jolt
+  generates no classes, so a proxy now constructs a real base instance, answers
+  what the body declares, forwards the rest, and `proxy-super` calls the base's
+  own implementation. A proxy is an instance of its base and reports its class
+  and host tags. A super naming an interface has nothing to construct and stays
+  the reify it was.
+
+  Delegation is not subclassing in one respect, recorded in
+  `known-divergences.edn`: the base holds no reference back, so a base method
+  calling an overridden method runs the base's version where the JVM re-enters
+  the override. Overriding a leaf method — the common case — is identical.
+
+- **`java.io.PrintStream`, and `System/setOut` / `System/setErr`.** Redirecting
+  the process streams was previously withheld for want of the proxy support
+  above.
+
+- **A `URLStreamHandler` decides what its URL reads.** `openConnection` is the
+  handler's, `openStream` is that connection's `getInputStream`, and `slurp` and
+  `io/reader` route the same way. The constructors are now told apart by
+  argument type the way the JVM's overloads are, so `(URL. context spec handler)`
+  works.
+
+- **A `deftype` or `reify` declaring `Iterable` or `Iterator` is seqable**, as on
+  the JVM, walked lazily. `Seqable` wins over `Iterable` for a type declaring
+  both, matching `RT.seqFrom`.
+
+- **`clojure.test` reports like reference Clojure** — the blank line,
+  `FAIL in (test-name) (file:line)`, the testing context and message, then
+  `expected:` / `  actual:`. Every editor integration, CI parser and third-party
+  reporter keys off that shape, and test.check's own suite asserts on it.
+  Position comes from the reader rather than a stack walk. `*report-counters*`
+  is incremented too.
+
+- **`clojure.stacktrace`**, which Clojure ships and jolt did not. Frame lists are
+  empty here — tail calls, already a recorded divergence — but the throwable
+  line, `ex-data` and cause chain match exactly.
+
+- `java.lang.reflect.Array` (`newInstance`/`getLength`/`get`/`set`),
+  `Void/TYPE`, `System/arraycopy` with its overlapping-copy semantics,
+  `Character/codePointAt`, `Murmur3/hashCombine`, `clojure.datafy`,
+  `clojure.java.javadoc`, and Runtime's memory API.
+
+### Fixed
+
+- **Protocol dispatch keys by defining namespace**, not simple name. Resolved
+  through `:refer` and `:as`; a symbol naming no protocol keeps its bare name,
+  because that is how `value-host-tags` spells the tags a value reports.
+- **`(. Class MEMBER)` reads a static field** when one is registered. It always
+  emitted a static call, so a field's value was applied as a zero-arg procedure
+  and came back **nil** — a silent wrong answer. `(. Class -MEMBER)` was rejected
+  outright.
+- **`java.io.File` compares by pathname under `=`.** `.equals` and `hash` already
+  agreed, so two Files built from one path were unequal only through `=`. The
+  two-arg constructor also joins with exactly one separator.
+- **`println` and `prn` flush when `*flush-on-newline*`**, and
+  `clojure.core/flush` dispatches to the writer `*out*` holds rather than only
+  flushing the Chez port. The var existed and defaulted true with nothing
+  reading it, so text sat in a writer's buffer.
+- **`OutputStreamWriter` leaves the stream it wraps open**, and its flush reaches
+  it. Transcoding the stream's port closes that port under R6RS, so
+  `(.toString baos)` after wrapping one failed.
+- `getPath` / `getFile` on a URL are the path component, not the spec minus a
+  `file:` prefix; `io/reader` on a URL no longer reads the spec as a local path.
+- A `reify` declaring `IFn` is `ifn?` and an instance of it.
+- iconv issues the POSIX reset call, so a stateful charset emits its closing
+  escape.
+- `keys` / `vals` throw `ClassCastException` on a non-entry element.
+- Accepts the sha an annotated tag carries as well as the commit it peels to,
+  and the legacy `:sha` / `:tag` spellings.
+
+### Changed
+
+- **`(char n)` spans the Unicode scalar values.** jolt's strings are code-point
+  indexed, so it could not rebuild a char `(first s)` had just handed out. This
+  is a deliberate superset of the JVM's 16-bit char; the clojure-test-suite
+  already treats that assertion as host-dependent, and jank and basilisp behave
+  as jolt now does. Recorded in `known-divergences.edn`. Surrogates stay
+  rejected.
+- **An incomplete `make test` run can no longer read as a pass.** The gate runs
+  as a sub-make behind a wrapper: a verdict line is printed either way, so the
+  log can never end on a passing target — which also covers `make test | tail`.
+  A complete pass writes a receipt naming the tree it covers, and `make
+  gate-status` answers whether the working tree is gated. `-i` and `-k` are
+  refused for gate targets.
+
+### Library conformance
+
+| library | before | after |
+| --- | --- | --- |
+| malli | 121 pass, 20 load-fail | **12,059** pass, 8 load-fail |
+| honeysql | 832 pass | **2,842** pass |
+| ring-core | 405 pass, 15 fail, 18 error | **446**, **5**, **5** |
+| tick | 620 pass, 1 load-fail | **723**, 0 |
+| Selmer | 525 pass, 1 error | **526**, **0** |
+| tools.logging | 219 pass, 4 error | **226**, **0** |
+| test.check | 230 pass, 15 fail | **236**, **10** |
+| test.chuck | 98 pass, 22 fail | **110**, **17** |
+| data.json | 320 pass, 2 error | **322**, **0** |
+| markdown-clj | 180 pass, 2 error | **182**, **0** |
+| data.codec | 1 pass, 11 error | **12**, **0** |
+| hiccup | 385 pass, 1 fail | 386, **0** |
+| rewrite-clj | 3,380 pass | 3,381 pass |
+
+malli's fail and error counts also rise, because seven namespaces that used to
+load-fail now run at all. Its residue is characterised in the manifest: 72
+errors are sci, which does not fully load here (it reaches private
+`clojure.core` internals by var), and 104 of the failures are one test that
+round-trips values drawn with a fixed seed — a seed draws different values here
+than on the JVM.
+
+ring-core's multipart suite runs against jolt-lang/multipart, an RFC 7578
+parser, through a shim registering the commons-fileupload2 class surface ring
+reaches for. The shim is glue: it decides nothing about multipart syntax, which
+is what keeps the suite worth running.
+
+
 ## [0.5.20] - 2026-08-02
 
 A backtrace could show frames from calls that had already finished, and in the
@@ -3042,6 +3173,7 @@ Clojure-compatible standard library.
   install script.
 
 [Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.20...HEAD
+[0.6.0]: https://github.com/jolt-lang/jolt/compare/v0.5.20...v0.6.0
 [0.5.20]: https://github.com/jolt-lang/jolt/compare/v0.5.19...v0.5.20
 [0.5.19]: https://github.com/jolt-lang/jolt/compare/v0.5.18...v0.5.19
 [0.5.18]: https://github.com/jolt-lang/jolt/compare/v0.5.17...v0.5.18
