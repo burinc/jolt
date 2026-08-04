@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-04
+
+Undoes a dev-mode performance regression that shipped in 0.5.20 and 0.6.0, and
+takes backtraces off the tail-frame history ring and onto the live continuation,
+which is what made the regression unnecessary in the first place. Built binaries
+were never affected in any release — they compile with tracing off — so this is
+entirely about `jolt run` / `-M:alias`.
+
+### Fixed
+
+- **Up to 19× slower numeric code on the `jolt run` path (0.5.20, 0.6.0).** The
+  tail-frame backtrace fix in 0.5.20 paired a history-ring save/restore around
+  every non-tail call. It was applied downstream of every branch of the call
+  emitter, so a call the inference had already reduced to a single machine
+  instruction got wrapped too — a proven `(aget ^doubles a ^long i)` became
+
+  ```scheme
+  (let ((_tu$ (jolt-trace-save)))
+    (let ((_tr$ (flvector-ref (jolt-array-vec a) i))) (jolt-trace-unwind! _tu$) _tr$))
+  ```
+
+  The `let` is the costly half: the restore runs after the call, so an unboxed
+  flonum is held across it, lands on the heap, and takes the surrounding `fl+`
+  chain with it. The cost tracked how well the inference had done — 19× on a
+  flonum array loop, 1.9× on `vector conj`, 1.05× on lazy seqs. A proven
+  `aget`/`aset` loop measured 10.4 ms on 0.5.19, 206.1 ms on 0.6.0, and 10.4 ms
+  here; every phase of a real image pipeline paid 4.5–8.6× and is likewise back to
+  its 0.5.19 timing. Tracing itself still costs (~10× on a `fib` microbenchmark
+  against `JOLT_TRACE=0`) — that is the per-entry ring push, is unchanged by this
+  release, and is why `JOLT_TRACE=0` exists.
+
+- **Deep recursion lost the outermost frames of a backtrace.** The history ring
+  holds 64 subproblems, so a 90-deep non-tail recursion reported `down (x64)` and
+  dropped `-main` entirely. The spine now comes from the live continuation, which
+  has no such bound, and the trace reports the true depth with its caller. This is
+  the same failure the 0.5.20 fix set out to address; that fix covered calls that
+  had already *returned*, never depth.
+
+- **The AOT cache served artifacts across trace modes.** Whether tracing is on
+  changes the emitted code, so a cached fasl is only valid for the mode that
+  produced it, and the cache generation did not record which. A traced run that
+  reused untraced artifacts silently reported **no** backtrace frames at all — the
+  feature switched off by a cache hit. The generation is now keyed on trace mode.
+
+- **Cached namespaces recorded a source path that no longer existed.** The cache
+  compiled the emitted Scheme from a pid-unique temp and renamed it away, so
+  `compile-file` baked the temp's name into every frame's source object. Nothing
+  read that path before this release; the continuation-based backtrace does. The
+  `.scm` is now published at its final name — still via temp + atomic rename, so a
+  concurrent compiler never sees a half-written file — and compiled from there.
+  `clojure.core/compile`'s artifact writer had the identical shape and is fixed
+  alongside.
+
 ### Changed
 
 - **Eval-path frames carry source objects.** Runtime-compiled code (an AOT cache
@@ -19,16 +72,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plain `read`+`eval`, verbatim. Traces are unchanged; `JOLT_DEBUG_FRAMES=1` shows
   the resolved line per frame (`source=jolt-eval-src-1@278 -> clj:L4`).
 
-### Fixed
-
-- **AOT cache frames point at the cached `.scm`, not a deleted temp.** The cache
-  compiled the emitted Scheme from a pid-unique temp and renamed both files into
-  place, so `compile-file` baked the temp's name into every frame's source object
-  — a path that died the moment the rename happened. The `.scm` is now published
-  at its final name (still via temp + atomic rename, so concurrent compilers never
-  see a half-written file) and compiled from there; only the `.so` temp is renamed
-  last. The same fix lands in `clojure.core/compile`'s artifact writer, which had
-  the identical shape.
+- **Backtraces are rendered from the live continuation.** The reporter read the
+  whole trace off the tail-frame history ring, with the continuation only as a
+  fallback. That is backwards: the continuation *is* the stack, it is exact, and
+  reading it costs nothing per call (the `call/cc` is paid at the throw). Each
+  frame's clj line now comes from a `#|L<line>|#` marker the emitter leaves beside
+  every traced call site, resolved through the frame's source object. The ring is
+  consulted only for frames tail-call optimisation erased, which is the one thing
+  the stack genuinely cannot hold. Trace output is unchanged apart from the
+  deep-recursion fix above.
 
 ## [0.6.0] - 2026-08-03
 
