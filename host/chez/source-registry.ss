@@ -455,7 +455,13 @@
 ;; Only the REPL/nREPL error paths (jolt.host/backtrace-string) and the no-
 ;; continuation fallback (jolt-backtrace-string) still read the whole history;
 ;; the uncaught reporter itself prefers the live continuation and takes just the
-;; innermost rib from the ring (see jolt-backtrace-string below).
+;; innermost rib from the ring (see jolt-backtrace-string below). Since trace-r4
+;; deleted the per-call ring restore, the whole history is a BOUNDED window of
+;; recent subproblems — returned calls' ribs are no longer reused, they just sit
+;; behind the head until jolt-trace-reset! clears them at the next top-level
+;; boundary. Those two paths are best-effort by construction (a REPL's own
+;; continuation is its machinery, and a no-continuation throw has no exact spine
+;; to prefer), so the window is what they show.
 (define (jolt-history-backtrace)
   (let* ((hist (jolt-trace-snapshot))
          (frames (let loop ((es hist) (prev (jolt-throw-line)) (acc '()))

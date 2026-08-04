@@ -37,18 +37,6 @@
                      duplicate or discard the call (inline/pure-fns). `/`/quot/rem/
                      mod throw on a zero divisor and are OUT; even?/odd? throw on a
                      non-integer and are OUT.
-    :leaf?           the op's :call proc cannot enter a jolt fn prologue — no
-                     receiver it dispatches on, no function argument it applies.
-                     A call to one can therefore never push a tail-frame history
-                     rib, so the back end omits the ring save/restore around it
-                     (backend-scheme's leaf!/with-unwind). Set only where that is
-                     an actual property of the runtime proc: the numeric family
-                     handles numbers and throws on anything else. `=` is NOT here
-                     — jolt= on a deftype reaches a user equals. Collection ops
-                     (nth/count/get) are not either: a custom Indexed/Counted/
-                     ILookup impl is a user method with a prologue of its own, and
-                     its frames are exactly what the history exists to keep.
-                     Absent = keep the wrapper, so an unclassified op stays correct.
     :foldable?       a seed-tier pure numeric fn that constant-folds at compile
                      time (fold/foldable's key set). min/max/abs are OUT: they live
                      in a later core tier that isn't loaded when fold loads.")
@@ -56,38 +44,38 @@
 (def op-registry
   ;; arithmetic
   {"+"   {:call "jolt-n+"    :value "jolt-add"   :dbl "fl+"  :lng "jolt-l+"    :bd "jbd-add"
-          :dbl-contagion? true :num-result? true :num-args? true :pure? true :foldable? true :leaf? true}
+          :dbl-contagion? true :num-result? true :num-args? true :pure? true :foldable? true}
    "-"   {:call "jolt-n-"    :value "jolt-sub"   :dbl "fl-"  :lng "jolt-l-"    :bd "jbd-sub"
-          :dbl-contagion? true :num-result? true :num-args? true :pure? true :foldable? true :leaf? true}
+          :dbl-contagion? true :num-result? true :num-args? true :pure? true :foldable? true}
    "*"   {:call "jolt-n*"    :value "jolt-mul"   :dbl "fl*"  :lng "jolt-l*"    :bd "jbd-mul"
-          :dbl-contagion? true :num-result? true :num-args? true :pure? true :foldable? true :leaf? true}
+          :dbl-contagion? true :num-result? true :num-args? true :pure? true :foldable? true}
    "/"   {:call "jolt-n-div" :value "jolt-div"   :dbl "fl/"                   :bd "jbd-div"
-          :dbl-contagion? true :num-result? true :num-args? true :foldable? true :leaf? true}
+          :dbl-contagion? true :num-result? true :num-args? true :foldable? true}
    ;; comparisons: vacuously true at arity 1 and don't inspect the arg, but
    ;; Scheme's < demands a number even there — cmp1-ops special-cases that.
    "<"   {:call "jolt-n<"   :value "jolt-lt" :bool? true
-          :dbl "fl<?"  :lng "jolt-l<"  :bd "jbd-lt?" :pure? true :foldable? true :leaf? true}
+          :dbl "fl<?"  :lng "jolt-l<"  :bd "jbd-lt?" :pure? true :foldable? true}
    ">"   {:call "jolt-n>"   :value "jolt-gt" :bool? true
-          :dbl "fl>?"  :lng "jolt-l>"  :bd "jbd-gt?" :pure? true :foldable? true :leaf? true}
+          :dbl "fl>?"  :lng "jolt-l>"  :bd "jbd-gt?" :pure? true :foldable? true}
    "<="  {:call "jolt-n<="  :value "jolt-le" :bool? true
-          :dbl "fl<=?" :lng "jolt-l<=" :bd "jbd-le?" :pure? true :foldable? true :leaf? true}
+          :dbl "fl<=?" :lng "jolt-l<=" :bd "jbd-le?" :pure? true :foldable? true}
    ">="  {:call "jolt-n>="  :value "jolt-ge" :bool? true
-          :dbl "fl>=?" :lng "jolt-l>=" :bd "jbd-ge?" :pure? true :foldable? true :leaf? true}
+          :dbl "fl>=?" :lng "jolt-l>=" :bd "jbd-ge?" :pure? true :foldable? true}
    "="   {:call "jolt=" :bool? true :arity #(>= % 2)
           :fixed {2 "jolt=2"} :dbl "fl=?" :lng "jolt-l=" :pure? true :foldable? true}
    "=="  {:dbl "fl=?" :lng "jolt-l="}  ; numeric-only, not a native op
    "not=" {:pure? true}                ; not a native op; pure classifier only
    "inc" {:call "jolt-n-inc" :value "jolt-inc" :arity #(= % 1)
-          :dbl-contagion? true :num-result? true :num-args? true :pure? true :foldable? true :leaf? true}
+          :dbl-contagion? true :num-result? true :num-args? true :pure? true :foldable? true}
    "dec" {:call "jolt-n-dec" :value "jolt-dec" :arity #(= % 1)
-          :dbl-contagion? true :num-result? true :num-args? true :pure? true :foldable? true :leaf? true}
+          :dbl-contagion? true :num-result? true :num-args? true :pure? true :foldable? true}
    "not" {:call "jolt-not" :arity #(= % 1) :bool? true :pure? true}
    "min" {:call "jolt-n-min" :value "jolt-min"
           :dbl "flmin" :lng "jolt-l-min" :bd "jbd-min"
-          :num-result? true :num-args? true :pure? true :leaf? true}
+          :num-result? true :num-args? true :pure? true}
    "max" {:call "jolt-n-max" :value "jolt-max"
           :dbl "flmax" :lng "jolt-l-max" :bd "jbd-max"
-          :num-result? true :num-args? true :pure? true :leaf? true}
+          :num-result? true :num-args? true :pure? true}
    "abs" {:num-result? true :num-args? true :pure? true}  ; overlay fn, not a native op
    ;; no :bd — there is no jbd-mod. The bigdec kind is only assigned to quot/rem
    ;; (passes.numeric bd-result-kind), so a "jbd-mod" here never reached emission;
@@ -96,13 +84,13 @@
    ;; Bigdec mod goes through the generic jolt-mod, which is already bigdec-aware.
    "mod"   {:call "jolt-mod"  :arity #(= % 2)
             :lng "jolt-l-mod"
-            :num-result? true :num-args? true :foldable? true :leaf? true}
+            :num-result? true :num-args? true :foldable? true}
    "rem"   {:call "jolt-rem"  :arity #(= % 2)
             :lng "jolt-l-rem"  :bd "jbd-rem"
-            :num-result? true :num-args? true :foldable? true :leaf? true}
+            :num-result? true :num-args? true :foldable? true}
    "quot"  {:call "jolt-quot" :arity #(= % 2)
             :lng "jolt-l-quot" :bd "jbd-quot"
-            :num-result? true :num-args? true :foldable? true :leaf? true}
+            :num-result? true :num-args? true :foldable? true}
    "unchecked-add"      {:lng "jolt-uncadd2"}
    "unchecked-subtract" {:lng "jolt-uncsub2"}
    "unchecked-multiply" {:lng "jolt-uncmul2"}
@@ -154,11 +142,11 @@
    "keys"    {:call "jolt-keys"    :arity #(= % 1)}
    "vals"    {:call "jolt-vals"    :arity #(= % 1)}
    ;; predicates
-   "even?"    {:call "jolt-even?"  :arity #(= % 1) :bool? true :leaf? true}
-   "odd?"     {:call "jolt-odd?"   :arity #(= % 1) :bool? true :leaf? true}
-   "pos?"     {:call "jolt-pos?"   :arity #(= % 1) :bool? true :bd "jbd-pos?" :pure? true :leaf? true}
-   "neg?"     {:call "jolt-neg?"   :arity #(= % 1) :bool? true :bd "jbd-neg?" :pure? true :leaf? true}
-   "zero?"    {:call "jolt-zero?"  :arity #(= % 1) :bool? true :bd "jbd-zero?" :pure? true :leaf? true}
+   "even?"    {:call "jolt-even?"  :arity #(= % 1) :bool? true}
+   "odd?"     {:call "jolt-odd?"   :arity #(= % 1) :bool? true}
+   "pos?"     {:call "jolt-pos?"   :arity #(= % 1) :bool? true :bd "jbd-pos?" :pure? true}
+   "neg?"     {:call "jolt-neg?"   :arity #(= % 1) :bool? true :bd "jbd-neg?" :pure? true}
+   "zero?"    {:call "jolt-zero?"  :arity #(= % 1) :bool? true :bd "jbd-zero?" :pure? true}
    "identity" {:call "jolt-identity" :arity #(= % 1)}
    "nil?"     {:call "jolt-nil?"   :arity #(= % 1) :bool? true :pure? true}
    "some?"    {:call "jolt-some?"  :arity #(= % 1) :bool? true :pure? true}
@@ -239,19 +227,6 @@
                                       (vals (:fixed spec))))))
               (remove nil?))
         op-registry))
-
-;; Emitted procs a call to which cannot enter a jolt fn prologue (:leaf? above), so
-;; the back end emits no tail-frame ring save/restore around them. Covers every proc
-;; a :leaf? op can emit at the `nop` branch — its :call name plus each :fixed helper
-;; — mirroring bool-returning-ops. The :dbl/:lng/:bd fast-path procs are NOT listed:
-;; those are emitted by the :num-kind branch, which leaf!s itself.
-(def leaf-call-procs
-  (into #{}
-        (for [[_ spec] op-registry
-              :when (:leaf? spec)
-              proc (cons (:call spec) (vals (:fixed spec)))
-              :when proc]
-          proc)))
 
 ;; --- classifier op-name sets (each replaces a hand-list in a pass) -----------
 (defn- keys-with [flag] (into #{} (keep (fn [[op spec]] (when (flag spec) op))) op-registry))

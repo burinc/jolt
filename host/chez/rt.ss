@@ -364,60 +364,19 @@
              (cur (fxand (fx+ (fx- (vector-ref h 1) 1) jolt-trace-outer-size)
                          jolt-trace-outer-mask)))
         (jolt-rib-push! (vector-ref ribs cur) name line))))
-;; --- unwinding the outer ring on return --------------------------------------
-;; The outer head only advances on entry. Without a matching rewind, a subproblem
-;; that already RETURNED keeps its rib, and the snapshot below hands those frames
-;; to the reporter alongside the live ones — so an error thrown after a (println …)
-;; printed that println's callees under the frames that actually threw.
-;;
-;; The emitter pairs these around every NON-TAIL call under tracing: save the ring
-;; position before, restore it after. Ribs of a returned call are then reused by
-;; whatever the caller does next, which is exactly stack discipline. Tail calls are
-;; NOT wrapped — consuming their result would defeat TCO, and their frames are the
-;; ones the ring exists to preserve.
-;;
-;; This restores only the NON-TAIL spine to exactness. The per-rib tail window
-;; stays bounded (jolt-trace-inner-size), which is inherent: a self-tail-call loop
-;; is O(1) space under TCO, so keeping every tail frame the way a JVM stack would
-;; is precisely the space guarantee TCO exists to provide.
-;;
-;; BOTH rings have to be restored. The outer head alone leaves the tail entries a
-;; returned call rotated into the CURRENT rib — the caller's own rib, since a tail
-;; call does not advance the outer ring — so those frames would still print. The
-;; current rib's inner position is saved alongside.
-;;
-;; All four numbers pack into one fixnum, a byte each, so the save allocates
-;; nothing on a per-call path; -1 means "no ring", and the restore is then a no-op.
-;; Every field is far under a byte: outer head/count <= 64, inner head/count <= 8.
-(define (jolt-trace-save)
-  (let ((h (jolt-trace-ring)))
-    (if (not h)
-        -1
-        (let ((oh (vector-ref h 1)) (oc (vector-ref h 2)))
-          (if (fx=? oc 0)
-              (fxlogor (fxsll oc 8) oh)
-              (let ((rib (vector-ref (vector-ref h 0)
-                                     (fxand (fx+ (fx- oh 1) jolt-trace-outer-size)
-                                            jolt-trace-outer-mask))))
-                (fxlogor oh
-                         (fxsll oc 8)
-                         (fxsll (vector-ref rib 2) 16)
-                         (fxsll (vector-ref rib 3) 24))))))))
-(define (jolt-trace-unwind! sv)
-  (when (fx>=? sv 0)
-    (let ((h (jolt-trace-ring)))
-      (when h
-        (let ((oh (fxlogand sv 255))
-              (oc (fxlogand (fxsra sv 8) 255)))
-          (vector-set! h 1 oh)
-          (vector-set! h 2 oc)
-          (unless (fx=? oc 0)
-            (let ((rib (vector-ref (vector-ref h 0)
-                                   (fxand (fx+ (fx- oh 1) jolt-trace-outer-size)
-                                          jolt-trace-outer-mask))))
-              (vector-set! rib 2 (fxlogand (fxsra sv 16) 255))
-              (vector-set! rib 3 (fxlogand (fxsra sv 24) 255))))))))
-  jolt-nil)
+;; --- no per-call ring restore (trace-r4) -----------------------------------
+;; The outer head only advances on entry. The reporter reads the non-tail spine
+;; off the LIVE CONTINUATION (source-registry.ss jolt-backtrace-string) and
+;; consults the ring only for TCO-erased frames, from the CURRENT (innermost)
+;; rib — the rib the deepest live subproblem is rotating. Returned subproblems'
+;; ribs sit strictly behind the head and are never read; they are cleared by
+;; jolt-trace-reset! at each top-level boundary. R3 paired a save/restore
+;; (jolt-trace-save / jolt-trace-unwind!) around every non-tail call to keep
+;; the whole history exact for the ring-as-spine reader; trace-r4 deleted that
+;; emission — the continuation is the exact spine now, so the pair paid a call
+;; per call site for a read nobody does. The rib advance itself is KEPT: the
+;; current-rib bound's safety argument ("a returned call's rib is never the
+;; current rib") depends on non-tail entries advancing the outer head.
 
 ;; Record a frame entry, routed by the caller's tail mark; then reset the mark so a
 ;; subsequent entry reached WITHOUT a mark (e.g. via apply) defaults to non-tail.

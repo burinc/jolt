@@ -1,12 +1,11 @@
-;; run-trace-emit.ss — under tracing, the ring save/restore goes around calls that
-;; can PUSH A FRAME, and nowhere else.
+;; run-trace-emit.ss — trace-r4: the emitter emits NO ring save/restore at all.
 ;;
-;; The tail-frame history needs a save/restore pair around every non-tail call so a
-;; returned subproblem's ribs stop showing up in a later backtrace (run-trace's
-;; stale-frame case, and trace-smoke.sh's app.stale). That wrapper was applied in
-;; emit-invoke-maybe-clone, which sits DOWNSTREAM of every branch of emit-invoke —
-;; so it also wrapped the branches that lower to a single Chez primitive and can
-;; therefore never enter a jolt fn prologue at all:
+;; R3 paired a save/restore around every non-tail call that could reach a jolt fn
+;; prologue, so a returned subproblem's ribs stopped showing up in a later
+;; backtrace (trace-smoke.sh's app.stale). That wrapper sat in
+;; emit-invoke-maybe-clone, DOWNSTREAM of every branch of emit-invoke — so it also
+;; wrapped the branches that lower to a single Chez primitive and can never enter
+;; a jolt fn prologue at all:
 ;;
 ;;   (aget ^doubles a ^long i)  ->  (flvector-ref (jolt-array-vec a) i)
 ;;
@@ -16,14 +15,20 @@
 ;;     (let ((_tr$ (flvector-ref (jolt-array-vec a) i))) (jolt-trace-unwind! _tu$) _tr$))
 ;;
 ;; — two procedure calls and a let-bound flonum around one machine instruction. The
-;; let binding is the expensive half: holding a flonum across a call forces it onto
+;; let binding was the expensive half: holding a flonum across a call forces it onto
 ;; the heap, so the whole surrounding unboxed fl+ chain re-boxes. Measured 19x on a
 ;; (dotimes [i n] (aset b i (+ (aget a i) 0.5))) loop, and 4.5-8.6x across every
-;; phase of a real image pipeline, against ~3% for the ring push itself.
+;; phase of a real image pipeline, against ~3% for the ring push itself. The
+;; `:leaf?` registry fact and `leaf!` existed only to keep that wrapper off the
+;; primitive sites.
 ;;
-;; So: a site that lowers to a primitive gets NO wrapper, and a site that really
-;; applies a jolt fn still gets one. The second half is what keeps this from being
-;; a silent revert of the stale-frame fix — run-trace-emit checks both directions.
+;; trace-r4 deletes the wrapper outright: the reporter reads the non-tail spine
+;; off the LIVE CONTINUATION and takes only the current rib's TCO-erased tail
+;; frames from the ring (source-registry.ss jolt-backtrace-string), so the
+;; save/restore paid a call per call site for a read nobody does. Nothing emits
+;; jolt-trace-save or jolt-trace-unwind! any more — every case below asserts the
+;; negation. What survives is pinned too: the inline primitive lowerings, the
+;; #|L<line>|# position markers, and the tracing-off behaviour.
 ;;
 ;;   chez --script host/chez/run-trace-emit.ss
 (import (chezscheme))
@@ -69,37 +74,39 @@
   (gate-check "(5) proven Math/sqrt emits flsqrt" (gate-sub? e "flsqrt") #t)
   (gate-check "(5) ...and takes no trace-save" (saves? e) #f))
 
-;; --- (5b) UNTYPED numeric ops: the registry's :leaf? fact -------------------------
-;; The branches above all need the inference to have proven a type. Untyped code
-;; falls to the generic `nop` branch, where the op registry decides: a numeric op
-;; only ever handles numbers, so jolt-n< / jolt-n+ / jolt-n-inc can't reach a
-;; prologue either. This is most of what a loop over unhinted locals emits, and
-;; leaving it out left the array loop still ~4.6x.
+;; --- (5b) UNTYPED numeric ops ------------------------------------------------
+;; Untyped code falls to the generic `nop` branch and emits the generic numeric
+;; op (jolt-n< / jolt-n+ / jolt-n-inc). trace-r4 removed the per-call ring
+;; save/restore entirely, so NO site emits jolt-trace-save / jolt-trace-unwind!
+;; any more — the reporter reads the non-tail spine off the live continuation
+;; and takes only the current (innermost) rib's TCO-erased tail frames from the
+;; ring. What the gate still pins below: the primitive/inline lowerings survive,
+;; the markers survive, and the tracing-off behaviour survives.
 (let ((e (emit-num "(def _ (fn [a b] (if (< a b) (+ a 1) (dec b))))")))
   (gate-check "(5b) untyped < emits the generic numeric op" (gate-sub? e "jolt-n<") #t)
   (gate-check "(5b) ...and takes no trace-save" (saves? e) #f))
-;; the counterexample the fact is drawn against: a COLLECTION op keeps its wrapper,
-;; because a custom Indexed/Counted/ILookup impl is a user method with a prologue.
 (let ((e (emit-num "(def _ (fn [c] (+ 1 (count c))))")))
   (gate-check "(5c) count over a collection emits jolt-count" (gate-sub? e "jolt-count") #t)
-  (gate-check "(5c) ...and KEEPS its trace-save (may reach a user Counted impl)" (saves? e) #t))
+  (gate-check "(5c) ...and takes no trace-save (save/restore is gone entirely)" (saves? e) #f))
 (let ((e (emit-num "(def _ (fn [c i] (+ 1 (nth c i))))")))
-  (gate-check "(5d) nth over a collection keeps its trace-save" (saves? e) #t))
-;; `=` is excluded from :leaf? on purpose — jolt= on a deftype reaches a user equals.
+  (gate-check "(5d) nth over a collection emits jolt-nth" (gate-sub? e "jolt-nth") #t)
+  (gate-check "(5d) ...and takes no trace-save" (saves? e) #f))
 (let ((e (emit-num "(def _ (fn [x y] (if (= x y) 1 2)))")))
-  (gate-check "(5e) = keeps its trace-save (may reach a user equals)" (saves? e) #t))
+  (gate-check "(5e) = emits the generic equality op" (gate-sub? e "jolt=") #t)
+  (gate-check "(5e) ...and takes no trace-save" (saves? e) #f))
 
-;; --- (6) a real call still gets the wrapper --------------------------------------
-;; The other direction, and the reason this gate exists in both halves: an ordinary
-;; invoke of an unknown fn CAN enter a prologue and push a rib, so it must keep the
-;; save/restore or a returned call's frames come back into later backtraces.
+;; --- (6) a real call takes no save/restore either ----------------------------------
+;; The other direction, and what trace-r4 changed: an ordinary non-tail invoke of
+;; an unknown fn CAN enter a prologue and push a rib, but it no longer wraps the
+;; call in a save/restore. The continuation is the exact spine; a returned call's
+;; rib merely sits behind the ring head until the next top-level reset.
 (let ((e (emit-num "(def _ (fn [f x] (+ 1 (f x))))")))
-  (gate-check "(6) non-tail invoke of an unknown fn keeps trace-save" (saves? e) #t)
-  (gate-check "(6) ...and its paired unwind" (unwinds? e) #t))
+  (gate-check "(6) non-tail invoke of an unknown fn takes no trace-save" (saves? e) #f)
+  (gate-check "(6) ...and no trace-unwind" (unwinds? e) #f))
 ;; a non-tail call to a named user fn, the shape trace-smoke's app.stale exercises
 (ev "(def user-fn (fn [x] x))")
 (let ((e (emit-num "(def _ (fn [x] (+ 1 (user-fn x))))")))
-  (gate-check "(7) non-tail call to a user fn keeps trace-save" (saves? e) #t))
+  (gate-check "(7) non-tail call to a user fn takes no trace-save" (saves? e) #f))
 ;; TAIL position never took a wrapper (consuming the result would defeat TCO) —
 ;; unchanged by this fix, pinned so it stays that way.
 (let ((e (emit-num "(def _ (fn [f x] (f x)))")))

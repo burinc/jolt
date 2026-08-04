@@ -34,7 +34,6 @@
 (def ^:private lng-ops op-registry/lng-ops)
 (def ^:private bd-ops op-registry/bd-ops)
 (def ^:private cmp1-ops op-registry/cmp1-ops)
-(def ^:private leaf-call-procs op-registry/leaf-call-procs)
 (def ^:private registry-emitted-names op-registry/registry-emitted-names)
 ;; Host interop methods with a Chez RT shim (rt.ss jolt-host-call). A `.method`
 ;; call on any other method routes to record-method-dispatch (a reify/record
@@ -900,22 +899,6 @@
     (tail-marked-call callee operand-strs)
     (plain-call callee operand-strs)))
 
-;; Set by the primitive branches of emit-invoke's cond, read by with-unwind. The
-;; mark sits ON the branch (see leaf!) rather than in a predicate beside it, because
-;; a predicate would be a second copy of that cond ladder and the two would drift —
-;; and a drift here is silent, costing either a stale trace frame or a re-boxed hot
-;; loop. Rebound per :invoke (emit-invoke-maybe-clone), so an inner call's mark
-;; cannot leak out to the enclosing one.
-(def ^:dynamic *invoke-leaf-box* nil)
-
-;; Mark the :invoke being emitted as lowering to inline Chez primitives that cannot
-;; enter a jolt fn prologue; returns its argument unchanged so a branch wraps its
-;; own emitted string. Runs after the branch's operands are emitted, and each nested
-;; :invoke binds its own box, so the mark always lands on the right call.
-(defn- leaf! [s]
-  (when-some [b *invoke-leaf-box*] (reset! b true))
-  s)
-
 (defn- emit-invoke [node]
   (let [tail? *tail?*]           ; capture: children below emit non-tail
    (binding [*tail?* false]
@@ -1026,33 +1009,29 @@
       ;; at a jolt-flaget procedure boundary. An unproven index keeps (jolt-flaget A I),
       ;; which owns the fixnum?/na-idx coercion; the inline flvector-ref's own range
       ;; check is the bounds contract on the hot path (a pre-check regresses ~11%).
-      ;; leaf!: flvector-ref is a primitive, and jolt-flaget only coerces the index
-      ;; (fixnum?/na-idx) — neither can enter a jolt fn prologue, so no ring unwind.
       (:fl-aget node)
-      (leaf!
-       (order-args
-        (fn [as]
-          (if (:fl-idx-long node)
-            (str "(flvector-ref (jolt-array-vec " (first as) ") " (second as) ")")
-            (str "(jolt-flaget " (str/join " " as) ")")))))
+      (order-args
+       (fn [as]
+         (if (:fl-idx-long node)
+           (str "(flvector-ref (jolt-array-vec " (first as) ") " (second as) ")")
+           (str "(jolt-flaget " (str/join " " as) ")"))))
       ;; (aset ^doubles a i v): proven index AND :double value (:fl-idx-long +
       ;; :fl-val-double) store inline — (let ((v V)) (flvector-set! (jolt-array-vec A)
       ;; I v) v) — and return the stored value (JVM contract; the let evaluates V once).
       ;; Otherwise keep (jolt-flaset A I V), which owns exact->inexact for a non-double.
       (:fl-aset node)
-      (leaf!
-       (order-args
-        (fn [as]
-          (if (and (:fl-idx-long node) (:fl-val-double node))
-            (let [v (fresh-label "_v$")]
-              (str "(let ((" v " " (nth as 2) ")) (flvector-set! (jolt-array-vec "
-                   (first as) ") " (second as) " " v ") " v ")"))
-            (str "(jolt-flaset " (str/join " " as) ")")))))
-      (:fl-op node) (leaf! (order-args (fn [as] (str "(" (:fl-op node) " " (str/join " " as) ")"))))
+      (order-args
+       (fn [as]
+         (if (and (:fl-idx-long node) (:fl-val-double node))
+           (let [v (fresh-label "_v$")]
+             (str "(let ((" v " " (nth as 2) ")) (flvector-set! (jolt-array-vec "
+                  (first as) ") " (second as) " " v ") " v ")"))
+           (str "(jolt-flaset " (str/join " " as) ")"))))
+      (:fl-op node) (order-args (fn [as] (str "(" (:fl-op node) " " (str/join " " as) ")")))
       ;; hint-directed fast arithmetic: jolt.passes.numeric proved every operand a
       ;; flonum (^double) or fixnum (^long), so emit the Chez fl*/fx* op.
-      (:num-kind node) (leaf! (emit-numeric (:num-kind node) (:name fnode) args order-args))
-      (and nop (= 1 (count args)) (cmp1-ops nop)) (leaf! (str "(begin " (first args) " #t)"))
+      (:num-kind node) (emit-numeric (:num-kind node) (:name fnode) args order-args)
+      (and nop (= 1 (count args)) (cmp1-ops nop)) (str "(begin " (first args) " #t)")
       ;; (get coll k [default]) with a struct-typed coll — the inference marked the
       ;; receiver with :hint :struct and a :shape matching the declared field layout.
       ;; Read the field by its static slot instead of the generic jolt-get dispatch.
@@ -1070,19 +1049,12 @@
                   (struct-field-index (:shape recv) (:val key-node)))
             dir (when (and idx (not (:nilable recv)))
                   (direct-field-accessor (:shape recv) idx))]
-        ;; leaf! on the two STATIC-SLOT reads only: jrecN-fI is a vector-ref and
-        ;; jrec-field-at indexes the same slot. The generic jolt-get fallback is NOT
-        ;; leaf — a custom ILookup deftype resolves valAt to a user method, which
-        ;; has a prologue and does push a rib.
         (cond
-          dir  (leaf! (order-args (fn [as] (str "(" dir " " (first as) ")"))))
-          idx  (leaf! (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit key-node) ")"))))
+          dir  (order-args (fn [as] (str "(" dir " " (first as) ")")))
+          idx  (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit key-node) ")")))
           :else (order-args (fn [as] (str "(jolt-get " (str/join " " as) ")")))))
-      ;; a generic native op. leaf! only when the registry says this proc cannot
-      ;; reach a jolt prologue (:leaf? — the numeric family); an op over a
-      ;; collection can resolve to a user method and keeps its ring unwind.
-      nop (let [s (order-args (fn [as] (str "(" nop " " (str/join " " as) ")")))]
-            (if (leaf-call-procs nop) (leaf! s) s))
+      ;; a generic native op.
+      nop (order-args (fn [as] (str "(" nop " " (str/join " " as) ")")))
       ;; (:k coll [default]) -> (jolt-get coll :k [default]) — the key (fnode) is a
       ;; const, so only the coll/default args carry order. When the inference typed
       ;; the receiver as a record whose declared fields include :k (it carries the
@@ -1097,11 +1069,9 @@
                   (struct-field-index (:shape recv) (:val fnode)))
             dir (when (and idx (not (:nilable recv)))
                   (direct-field-accessor (:shape recv) idx))]
-        ;; same split as the (get coll k) branch above: static slot reads are leaf,
-        ;; the generic jolt-get fallback is not.
         (cond
-          dir  (leaf! (order-args (fn [as] (str "(" dir " " (first as) ")"))))
-          idx  (leaf! (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit fnode) ")"))))
+          dir  (order-args (fn [as] (str "(" dir " " (first as) ")")))
+          idx  (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit fnode) ")")))
           :else (order-args (fn [as] (str "(jolt-get " (first as) " " (emit fnode) (defstr as) ")")))))
       ;; (coll k [default]) -> lookup — coll (fnode) is the callee, evaluated
       ;; before the key/default args. A VECTOR literal invokes as nth (a bad
@@ -1193,27 +1163,15 @@
                      ;; handler that runs later. Only under tracing — with it off
                      ;; there are no line stores to snapshot.
                      cl (when (trace-frames?) (fresh-label "_cl$"))
-                     ;; A throw unwinds straight past the per-call ring restores
-                     ;; between the raise and here, so the head is left wherever the
-                     ;; deepest frame put it. Snapshot on the way INTO the try and
-                     ;; put it back AFTER the handler body — not before. The handler
-                     ;; is exactly where .printStackTrace reads the throw's spine,
-                     ;; and restoring first would discard the frames it exists to
-                     ;; report. Afterwards, the abandoned ribs have to go, or every
-                     ;; later backtrace on this thread carries them.
-                     ts (when (trace-frames?) (fresh-label "_ts$"))
                      body (str "(guard (" raw " (else (let ((" (munge-name cs) " (jolt-unwrap-throw " raw "))) "
                                (if cl (str "(let ((" cl " (jolt-catch-enter!))) ") "")
                                "(let ((r " (emit (:catch-body node)) ")) "
                                (if cl (str "(jolt-catch-leave! " cl ") ") "")
-                               (if ts (str "(jolt-trace-unwind! " ts ") ") "")
                                "(jolt-catch-complete!) r)"
                                (if cl ")" "")
                                "))) "
                                (emit (:body node)) ")")]
-                 (if ts
-                   (str "(let ((" ts " (jolt-trace-save))) " body ")")
-                   body))
+                 body)
                (emit (:body node)))]
     (if-let [fin (:finally node)]
       (str "(dynamic-wind (lambda () #f) (lambda () " core ") (lambda () " (emit fin) "))")
@@ -1295,42 +1253,12 @@
 
 ;; Wrap emit-invoke so an eligible impl registration also emits its contagion clone as
 ;; a sibling. The non-eligible path is byte-identical to before (no clone emitted).
-;; Under tracing, pair a ring save/restore around a NON-TAIL call so the frames of
-;; a call that has returned stop showing up in a later backtrace (see
-;; jolt-trace-save in rt.ss). Only non-tail: consuming a tail call's result to run
-;; the restore afterwards would turn it into a non-tail call and defeat TCO, which
-;; is the whole reason the history ring exists. *tail?* is still accurate here —
-;; :invoke is tail-transparent, and emit-invoke restores the binding it captured.
-;;
-;; And only around a call that can actually PUSH a rib. A rib is pushed by a jolt
-;; fn's entry prologue, so a site that lowers to inline Chez primitives — a proven
-;; (aget ^doubles a ^long i) is one flvector-ref — can never leave one behind and
-;; needs no restore. Wrapping those was ruinous rather than merely wasteful: the
-;; restore has to run AFTER the call, so the result gets let-bound across it, and
-;; holding an unboxed flonum across a procedure call forces it onto the heap. The
-;; surrounding fl+ chain then re-boxes with it. Measured 19x on a
-;; (dotimes [i n] (aset b i (+ (aget a i) 0.5))) loop and 4.5-8.6x across a real
-;; image pipeline, against ~3% for the ring push itself. run-trace-emit.ss gates
-;; both directions — no wrapper on the primitive branches, wrapper still there on
-;; the ones that reach a prologue.
-(defn- with-unwind [s leaf?]
-  (if (and (trace-frames?) (not *tail?*) (not leaf?))
-    (let [sv (fresh-label "_tu$")
-          r (fresh-label "_tr$")]
-      (str "(let ((" sv " (jolt-trace-save))) (let ((" r " " s ")) "
-           "(jolt-trace-unwind! " sv ") " r "))"))
-    s))
-
 (defn- emit-invoke-maybe-clone [node]
-  (let [box (atom false)
-        base (binding [*invoke-leaf-box* box] (emit-invoke node))
-        leaf? @box]
+  (let [base (emit-invoke node)]
     (with-line node
-      ;; the clone `define` stays at the nesting it had before — only the call
-      ;; itself goes inside the unwind binding
       (if-some [c (emit-impl-clone node)]
-        (str "(begin " c " " (with-unwind base leaf?) ")")
-        (with-unwind base leaf?)))))
+        (str "(begin " c " " base ")")
+        base))))
 
 (defn emit* [node]
   (case (:op node)
