@@ -60,6 +60,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
+  traceemit \
   shakesmoke smoke staticnativesmoke test testbin transient unit unitcontext \
   values wp ci
 
@@ -114,6 +115,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi \
   transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
+  traceemit \
   inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke \
   certify
@@ -432,6 +434,15 @@ protoret:
 # runtime invalidates the cache (the epoch bump) so the new impl is served.
 pic:
 	@$(CHEZ) --script host/chez/run-pic.ss
+
+# Under tracing, the tail-frame ring save/restore goes around calls that can push a
+# rib and nowhere else. A site lowering to inline Chez primitives (a proven aget is
+# one flvector-ref) can never reach a fn prologue, and wrapping it let-binds the
+# result across the restore — which re-boxes an unboxed flonum and cost 19x on an
+# array loop. Gates both directions: no wrapper on the primitive branches, wrapper
+# still present on the ones that really apply a fn.
+traceemit:
+	@$(CHEZ) --script host/chez/run-trace-emit.ss
 
 # Nilable record types + flow-sensitive narrowing: a record-or-nil types as a nilable
 # record (some?/nil? don't fold, so a runtime guard stays); inside (if (some? x) ..)

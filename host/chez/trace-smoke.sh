@@ -118,6 +118,30 @@ out_off="$(run_app app.tail JOLT_TRACE=0)"
 expect_match "still reports the message" "$out_off" 'Unhandled exception: Divide by zero'
 expect_no_match "no history frames when opted out" "$out_off" 'app\.tail/boom'
 
+# Whether tracing is on changes the code the emitter produces — the entry prologue
+# and the per-call save/restore are baked in at compile time. So a cached fasl is
+# only valid for the trace mode it was compiled under, and the cache generation has
+# to say which. It did not, so the two modes shared a generation and each loaded the
+# other's artifacts: a JOLT_TRACE=0 run first left untraced fasls that a later traced
+# run happily reused, silently reporting NO history frames — the feature turned off
+# by a cache hit. The reverse direction cost speed instead of frames (a traced fasl
+# reused under JOLT_TRACE=0), which is how this surfaced.
+echo "trace smoke: the AOT cache does not share artifacts across trace modes"
+cache="$work/tracecache"
+rm -rf "$cache"
+# cold, tracing OFF: compiles and caches untraced fasls
+run_app app.tail "JOLT_CACHE_DIR=$cache JOLT_TRACE=0" > /dev/null
+# warm, tracing ON, same cache: must NOT serve the untraced artifacts
+out_flip="$(run_app app.tail "JOLT_CACHE_DIR=$cache")"
+expect_match "tracing on after an untraced run still names the throwing fn" "$out_flip" 'app\.tail/boom (.*src/app/tail\.clj:4)'
+expect_match "...and its caller" "$out_flip" 'app\.tail/-main (.*src/app/tail\.clj:8)'
+# and the other direction: a traced generation must not be served to an opted-out run
+cache2="$work/tracecache2"
+rm -rf "$cache2"
+run_app app.tail "JOLT_CACHE_DIR=$cache2" > /dev/null
+out_flip2="$(run_app app.tail "JOLT_CACHE_DIR=$cache2 JOLT_TRACE=0")"
+expect_no_match "JOLT_TRACE=0 after a traced run has no history frames" "$out_flip2" 'app\.tail/boom'
+
 # .printStackTrace over each shape a catch can bind: a host-raised arithmetic
 # error, an ex-info, and a constructed exception. Each must print "class: message"
 # and then the frames — the same rendering the uncaught reporter uses.

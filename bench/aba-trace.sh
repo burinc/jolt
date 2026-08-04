@@ -23,9 +23,21 @@ benchdir="$PWD/bench"
 A="${1:?usage: aba-trace.sh JOLT_A JOLT_B [runs]}"
 B="${2:?usage: aba-trace.sh JOLT_A JOLT_B [runs]}"
 RUNS="${3:-5}"
-# Call-heavy by construction: tracing costs a ring push per fn entry, so the
-# workloads that show it are the ones that are almost entirely user-level calls.
-BENCHES="${BENCHES:-fib:25 tak:18 binary-trees:12}"
+# TWO shapes, and both are needed — the set here was call-heavy only, and that is
+# exactly why a 19x regression in the other shape shipped unnoticed.
+#
+#   fib/tak/binary-trees   almost entirely user-level calls. Shows the per-entry
+#                          ring push, which is what tracing fundamentally costs.
+#   arrays/mathfns/        tight NUMERIC loops the inference proves and unboxes.
+#   loop-recur/mandelbrot  Nearly frame-free, so tracing should be nearly free too
+#                          — and any per-call-SITE work the emitter adds here lands
+#                          on code that had none, so it shows up as a multiple, not
+#                          a percentage. A ring save/restore around every non-tail
+#                          call once let-bound each unboxed flonum across a
+#                          procedure call and re-boxed the lot: 10.5 -> 206 ms on an
+#                          (aset b i (+ (aget a i) 0.5)) loop, invisible to the
+#                          call-heavy three.
+BENCHES="${BENCHES:-fib:25 tak:18 binary-trees:12 arrays:40000 mathfns:1000000 loop-recur:20000 mandelbrot:200}"
 
 time_one () { # $1 = jolt binary, $2 = ns:arg
   spec="$2"; ns="${spec%%:*}"; arg="${spec##*:}"

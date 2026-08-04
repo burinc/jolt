@@ -481,13 +481,25 @@
                (top-level-value 'jolt-baked-runtime-fingerprint))
           (aot-source-fingerprint))))
   aot-fingerprint-memo)
-;; <dir>/<jolt-version>-<runtime fingerprint>/v1 — the version names the release
+;; …-tr when the tail-frame history is on. Whether tracing is enabled changes the
+;; CODE the emitter produces — an entry prologue per fn, plus a ring save/restore
+;; around every non-tail call that can reach one — so a fasl is only valid for the
+;; mode it was compiled under, and the generation has to say which. It did not, so
+;; the two modes shared a generation and each was served the other's artifacts. Both
+;; directions were wrong, and the frame-losing one is the worse: a traced run after
+;; an untraced one reported NO history frames, the feature silently turned off by a
+;; cache hit. (The reverse merely paid tracing's cost with tracing nominally off,
+;; which is how it surfaced.) Read from the runtime flag rather than from JOLT_TRACE
+;; directly, so a REPL that calls jolt.host/enable-trace! with the env var unset is
+;; keyed correctly too. trace-smoke.sh gates both directions.
+(define (aot-trace-tag) (if jolt-trace-on? "-tr" ""))
+;; <dir>/<jolt-version>-<runtime fingerprint>[-tr]/v1 — the version names the release
 ;; a fasl came from, the fingerprint pins the exact runtime that emitted it. One
 ;; such GENERATION per runtime; rebuilding jolt starts a new one and strands the
 ;; last, so the first consult in a process also collects the superseded ones.
 (define (aot-generation-dir)
   (string-append (aot-cache-dir) "/" (jolt-version-string)
-                 "-" (aot-runtime-fingerprint)))
+                 "-" (aot-runtime-fingerprint) (aot-trace-tag)))
 ;; Generations are kept by LAST USE, not by age: a marker file refreshed once per
 ;; process is the only evidence a generation is still someone's, since a run that
 ;; hits on everything never writes to it.
