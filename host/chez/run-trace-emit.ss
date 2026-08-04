@@ -156,7 +156,7 @@
   (gate-check "(10) tracing on: marker before the line-3 call" (gate-sub? e "#|L3|#") #t)
   (gate-check "(10) tracing on: no marker on the def line" (gate-sub? e "#|L1|#") #f)
   (gate-check "(10) tracing on: one marker per recorded position"
-              (= (count-sub? e "#|L") (count-sub? e "(jolt-line! ")) #t)
+              (= (count-sub? e "#|L") (count-sub? e "(jolt-site! ")) #t)
   ;; the marker is genuinely a comment: reading the emitted string yields the
   ;; same datum with or without the markers
   (gate-check "(10) round-trip: marker reads as a comment"
@@ -166,7 +166,7 @@
 (set-trace-frames! #f)
 (let ((e (emit-num marker-src)))
   (gate-check "(10) tracing off: no marker" (gate-sub? e "#|L") #f)
-  (gate-check "(10) tracing off: no jolt-line!" (gate-sub? e "(jolt-line! ") #f))
+  (gate-check "(10) tracing off: no jolt-site!" (gate-sub? e "(jolt-site! ") #f))
 (set-trace-frames! #t)
 
 ;; --- (11) clj-line lookup: nearest preceding #|L<n>|# marker --------------------

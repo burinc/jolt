@@ -143,11 +143,12 @@
 ;; is populated before each form's emit.
 (defn- ctor-shapes [] (get @(:config (cur)) :record-shapes))
 
-;; Opt-in tail-frame history (JOLT_TRACE): emit a (jolt-trace-push! "name") at the
-;; head of every named fn body, so an entry records the frame into the runtime ring
-;; buffer (rt.ss) and a TCO-elided frame still shows in an error's backtrace. OFF
-;; during the seed mint and `jolt build` (byte-determinism + no runtime cost);
-;; compile-eval.ss turns it on for runtime-eval'd user code when JOLT_TRACE is set.
+;; Opt-in tail-frame history (JOLT_TRACE): instrument TAIL CALL SITES with
+;; continuation marks (rt.ss jolt-trace-rib / jolt-trace-rib-site!) so a
+;; TCO-elided frame still shows in an error's backtrace — nothing in a fn
+;; prologue, no per-entry work (R1, bead jolt-pfhc). OFF during the seed mint and
+;; `jolt build` (byte-determinism + no runtime cost); compile-eval.ss turns it on
+;; for runtime-eval'd user code when JOLT_TRACE is set.
 (defn set-trace-frames! [on] (reset! (:trace-frames? (cur)) (boolean on)))
 (defn- trace-frames? [] @(:trace-frames? (cur)))
 
@@ -169,10 +170,22 @@
 ;; gives a byte offset into the generated .scm, and scanning back for the nearest
 ;; marker recovers the ORIGINAL clj line (source-registry.ss
 ;; jolt-marker-line-at-offset). Must be a block comment — a `;;` comment would
-;; comment out the rest of the one-line top-level form.
-(defn- with-line [node s]
+;; comment out the rest of the one-line top-level form. The per-call store is
+;; jolt-site! — here always a bare line FIXNUM, an immediate store at exactly the
+;; old jolt-line! cost (the pair-on-every-store variant measured +7% on the
+;; arrays bench: a constant-pool load per store, on hot recur loops that are all
+;; non-tail calls). The ('ns/fn' . line) PAIR the innermost-frame splice needs is
+;; stored only by TAIL call emissions (sited-tail-call / the :throw case), and
+;; there AFTER the operands are temp-bound — an operand's own invoke stores a
+;; fixnum, so a pair stored before operand evaluation would be stomped and the
+;; TCO-erased frame would lose its name (app.tailstale's thrower caught this).
+;; One slot, two store types: every call overwrites it, so at a throw it always
+;; describes the innermost call — pair = that call was tail (its frame is erased
+;; and the pair alone names it, source-registry.ss jolt-site-frame); fixnum =
+;; non-tail (the continuation names the frame, the fixnum is its line).
+(defn- with-site [node s]
   (if-let [l (and (trace-frames?) (node-line node))]
-    (str "#|L" l "|# (begin (jolt-line! " l ") " s ")")
+    (str "#|L" l "|# (begin (jolt-site! " l ") " s ")")
     s))
 
 ;; Source-map registration for a fn def: one hashtable insert at definition time,
@@ -221,6 +234,15 @@
 ;; clears it by default; the tail-transparent forms (fn body, if/do/let/loop) pass
 ;; it to their tail child. Default false so a top-level form is treated non-tail.
 (def ^:dynamic *tail?* false)
+;; R1 (bead jolt-pfhc): the tail-site instrumentation's static site literal. While
+;; emitting a named fn's body, *trace-site* is the enclosing fn's qualified name
+;; (the same (or qname self) the old prologue push used) and *trace-self* is the
+;; set of that fn's own binding names, so a tail call can stamp its rib entry
+;; with the fn it lives in and elide direct self-tail-calls (the erased frame is
+;; the enclosing fn, already named by the chain or the continuation). nil / empty
+;; in code outside any named fn (top-level, anonymous fns): those tail sites skip.
+(def ^:dynamic *trace-site* nil)
+(def ^:dynamic *trace-self* #{})
 
 (defn- fresh-label [prefix] (str prefix (swap! (:gensym-counter (cur)) inc)))
 
@@ -393,7 +415,10 @@
 ;; and invoke reads it to decide whether the call is tail. Every other op's
 ;; children are non-tail, so `emit` clears *tail?* before dispatching them — that
 ;; way a stray true can't leak into, say, a call sitting in a vector literal.
-(def ^:private tail-transparent-ops #{:if :do :let :loop :invoke})
+;; :throw is tail-transparent so the :throw emit case still sees *tail?* — a
+;; TAIL throw must store the site-vreg pair (sited-tail-call) or its TCO-erased
+;; frame has no name at report time (app.tailstale's thrower).
+(def ^:private tail-transparent-ops #{:if :do :let :loop :invoke :throw})
 (defn emit [node]
   (let [s (if (and *tail?* (not (tail-transparent-ops (:op node))))
             (binding [*tail?* false] (emit* node))
@@ -696,18 +721,10 @@
         ;; per-var frame name. Nested/anonymous fns ignore it (self is nil).
         qname (when (and self *qualifying-ns*)
                 (str (munge-name *qualifying-ns*) "/" self))
-        clauses (binding [*known-procs* (if self (conj *known-procs* self) *known-procs*)]
+        clauses (binding [*known-procs* (if self (conj *known-procs* self) *known-procs*)
+                          *trace-site* (or qname self)
+                          *trace-self* (cond-> #{} self (conj self) qname (conj qname))]
                   (mapv emit-arity-clause arities))
-        ;; trace mode: record this frame on entry (before the body), so a frame
-        ;; the body then tail-calls away is still in the ring at throw time. A
-        ;; `recur` re-enters via the named-let, not the lambda, so a tight loop
-        ;; records once, not per iteration.
-        clauses (if (and (trace-frames?) self)
-                  (mapv (fn [c] [(nth c 0)
-                                 (str "(begin (jolt-trace-push! " (chez-str-lit (or qname self)) ") "
-                                      (nth c 1) ")")])
-                        clauses)
-                  clauses)
         lambda (if (= 1 (count clauses))
                  (let [c (first clauses)] (str "(lambda " (nth c 0) " " (nth c 1) ")"))
                  (str "(case-lambda "
@@ -881,22 +898,60 @@
 ;; A plain Scheme application: (callee op ...).
 (defn- plain-call [callee operand-strs]
   (str "(" callee (if (seq operand-strs) (str " " (str/join " " operand-strs)) "") ")"))
-;; A tail call in trace mode. Force-bind the operands to temps FIRST (so any
-;; operand whose own evaluation records a trace entry runs before our mark), THEN
-;; set the tail mark, THEN apply — the callee's entry prologue consumes the mark
-;; with nothing in between, so it can't be clobbered. Still a tail call: the let*'s
-;; last form is the application, so TCO is preserved.
-(defn- tail-marked-call [callee operand-strs]
-  (let [tmps (mapv (fn [_] (fresh-label "_tt$")) operand-strs)
-        binds (str/join " " (map (fn [t a] (str "(" t " " a ")")) tmps operand-strs))]
-    (str "(let* (" binds ") (jolt-trace-mark! #t) " (plain-call callee tmps) ")")))
-;; Emit a call, tail-marked when we're in tail position and tracing is on; a plain
-;; application otherwise. The mark is consumed by the callee's entry prologue —
-;; direct calls (:local known-proc, direct-link) always have one; a jolt-invoke
-;; call usually reaches one but not always (see the best-effort note in rt.ss).
-(defn- emit-call [tail? callee operand-strs]
-  (if (and (trace-frames?) tail?)
-    (tail-marked-call callee operand-strs)
+;; A bare Scheme identifier (vs a composite callee expression).
+(defn- bare-scheme-id? [s] (boolean (re-matches #"[^()\s]+" s)))
+;; A tail call in trace mode (R1, bead jolt-pfhc). Force-bind the operands to
+;; temps FIRST (so any operand whose own evaluation records a trace entry runs
+;; before the instrumentation; the call stays the last form, so TCO is
+;; preserved), then read the current frame's continuation mark in tail position:
+;; a live rib (a tail chain is already running) is mutated in place with this
+;; site; #f (this frame was entered non-tail) starts a fresh 8-slot rib under
+;; with-continuation-mark. The site literal '("ns/fn" . line) is a static pair
+;; baked in the emitted code; <line> is where THIS fn's tail call happens (no
+;; caller-line shift). The callee expression appears twice; a non-identifier
+;; callee is bound to a temp too. Self-tail calls never reach here (emit-call
+;; elides them), so a tight self-loop records once, not per iteration.
+(defn- traced-tail-call [site-qname line callee operand-strs]
+  (let [tts (mapv (fn [_] (fresh-label "_tt$")) operand-strs)
+        cal (when-not (bare-scheme-id? callee) (fresh-label "_tc$"))
+        binds (str/join " "
+                        (concat (when cal [(str "(" cal " " callee ")")])
+                                (map (fn [t a] (str "(" t " " a ")")) tts operand-strs)))
+        v (fresh-label "_tv$")
+        site (str "'(" (chez-str-lit site-qname) " . " line ")")
+        call (plain-call (or cal callee) tts)]
+    (str "(let* (" binds ") "
+         "(call-with-immediate-continuation-mark jolt-trace-key "
+         "(lambda (" v ") "
+         "(if (vector? " v ") "
+         "(begin (jolt-trace-rib-site! " v " " site ") " call ") "
+         "(with-continuation-mark jolt-trace-key "
+         "(jolt-trace-rib " site ") " call ")))))")))
+;; A tail call to a NATIVE op (or jolt-throw): no marks — it cannot extend a
+;; user-fn tail chain — but the ('ns/fn' . line) pair goes into the site vreg so
+;; the reporter can name this frame if the native op throws (the frame is TCO-
+;; erased by the tail call). Same temp discipline as traced-tail-call, and for
+;; the same reason: an operand's own invoke stores a fixnum into the slot, so
+;; the pair must be stored after the operands are bound, right before the call.
+(defn- sited-tail-call [site-qname line callee operand-strs]
+  (let [tts (mapv (fn [_] (fresh-label "_tt$")) operand-strs)
+        binds (str/join " " (map (fn [t a] (str "(" t " " a ")")) tts operand-strs))
+        site (str "'(" (chez-str-lit site-qname) " . " line ")")]
+    (if (seq binds)
+      (str "(let* (" binds ") (jolt-site! " site ") " (plain-call callee tts) ")")
+      (str "(begin (jolt-site! " site ") " (plain-call callee operand-strs) ")"))))
+;; Emit a call. In tail position with tracing on, a call to a DIFFERENT fn than
+;; the enclosing one is instrumented as a tail site — marks (traced-tail-call)
+;; for user fns, the site-vreg pair (sited-tail-call) for native ops and
+;; jolt-throw (R1 addendum: they cannot extend a user-fn tail chain). Everything
+;; else — non-tail calls, JOLT_TRACE=0, direct self-tail-calls — is a plain
+;; application, byte-identical to untraced code.
+(defn- emit-call [tail? callee operand-strs line marks?]
+  (if (and (trace-frames?) tail? *trace-site*
+           (not (contains? *trace-self* callee)))
+    (if marks?
+      (traced-tail-call *trace-site* line callee operand-strs)
+      (sited-tail-call *trace-site* line callee operand-strs))
     (plain-call callee operand-strs)))
 
 (defn- emit-invoke [node]
@@ -905,6 +960,7 @@
     (let [fnode (:fn node)
         arg-nodes (:args node)
         args (mapv emit arg-nodes)
+        tl (or (node-line node) 0)
         nop (native-op fnode (count args))
         kind (ifn-kind fnode)
         ;; order args left-to-right (build receives the spliced operand strings)
@@ -920,7 +976,7 @@
                                 (str "jolt-invoke" (count args))
                                 "jolt-invoke")]
                    (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
-                                 (fn [operands] (emit-call tail? callee operands)))))]
+                                 (fn [operands] (emit-call tail? callee operands tl true)))))]
     (cond
       ;; devirtualized protocol call: the inference proved the receiver (arg 0) is
       ;; one record type, so resolve the impl by that static tag instead of routing
@@ -1054,7 +1110,7 @@
           idx  (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit key-node) ")")))
           :else (order-args (fn [as] (str "(jolt-get " (str/join " " as) ")")))))
       ;; a generic native op.
-      nop (order-args (fn [as] (str "(" nop " " (str/join " " as) ")")))
+      nop (order-args (fn [as] (emit-call tail? nop as tl false)))
       ;; (:k coll [default]) -> (jolt-get coll :k [default]) — the key (fnode) is a
       ;; const, so only the coll/default args carry order. When the inference typed
       ;; the receiver as a record whose declared fields include :k (it carries the
@@ -1099,7 +1155,7 @@
       ;; holds an arbitrary IFn -> dynamic dispatch.
       (= :local (:op fnode))
       (if (*known-procs* (munge-name (:name fnode)))
-        (order-args (fn [as] (emit-call tail? (munge-name (:name fnode)) as)))
+        (order-args (fn [as] (emit-call tail? (munge-name (:name fnode)) as tl true)))
         (invoke))
       ;; closed-world direct call: the callee var is an app fn def already emitted
       ;; with a Scheme binding — apply it directly, no var lookup, no jolt-invoke.
@@ -1108,7 +1164,7 @@
       ;; below (which still uses the direct binding as the invoke target).
       (and (= :var (:op fnode)) (direct-linkable? (:ns fnode) (:name fnode))
            (direct-link-fn? (:ns fnode) (:name fnode)))
-      (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as)))
+      (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as tl true)))
        ;; record ctor with matching arity: inline the native per-arity ctor
        ;; (make-jrecN) directly — desc + ext + one inline slot per field —
        ;; eliminating jolt-invoke / var-deref / rest-list / ctor call / hashtable
@@ -1255,7 +1311,7 @@
 ;; a sibling. The non-eligible path is byte-identical to before (no clone emitted).
 (defn- emit-invoke-maybe-clone [node]
   (let [base (emit-invoke node)]
-    (with-line node
+    (with-site node
       (if-some [c (emit-impl-clone node)]
         (str "(begin " c " " base ")")
         base))))
@@ -1329,7 +1385,20 @@
      :map (emit-ordered "jolt-hash-map"
                        (mapcat (fn [p] [(nth p 0) (nth p 1)]) (:pairs node)))
     :quote (emit-quoted (:form node))
-    :throw (str "(jolt-throw " (emit (:expr node)) ")")
+    ;; the thrown value is an operand (emitted non-tail); the throw itself goes
+    ;; through emit-call with marks?=#f, so a TAIL throw gets the site-vreg pair
+    ;; (sited-tail-call — stored after the operand is bound, so the operand's own
+    ;; fixnum store cannot stomp it) and still names its TCO-erased frame. A
+    ;; non-tail throw needs neither: the continuation names the frame, and the
+    ;; operand's own with-site store carries the line. The analyzer stamps :pos
+    ;; on call forms, not on throw special forms, so the site line falls back to
+    ;; the thrown expression's — (throw (ex-info …)) sits on one line.
+    :throw (let [line (or (node-line node) (node-line (:expr node)))
+                 e (binding [*tail?* false] (emit (:expr node)))
+                 call (emit-call *tail?* "jolt-throw" [e] (or line 0) false)]
+             (if (and (trace-frames?) line)
+               (str "#|L" line "|# " call)
+               call))
      ;; numeric coercion. A :cast-fn (from a user (double x)/(long x)/… cast)
      ;; emits the checked runtime helper — clojure.core's full JVM semantics —
      ;; NOT the hint coercion (jolt->fl / jolt->fx) a proven typed-param cast uses.

@@ -135,6 +135,50 @@ expect_match "its caller is next" "$out_stale" 'app\.stale/caller (.*src/app/sta
 expect_match "and -main survives the noisy call" "$out_stale" 'app\.stale/-main (.*src/app/stale\.clj:7)'
 expect_no_match "no frames from the call that already returned" "$out_stale" 'app\.stale/noise'
 
+# R1 (bead jolt-pfhc): the ring's rib-advance-on-entry invariant kept a returned
+# call's rib behind the outer head, so NO fixture could gate a tail-recursive call
+# that RETURNS before a later throw — app.stale's recursion is non-tail, it never
+# enters a rib at all. Continuation marks die with their frame, so staleness is
+# structural now: ping/pong mutually tail-recurse to completion (NOT self-calls —
+# those are elided), then -main calls a thrower. The trace must NOT resurrect
+# ping/pong and MUST name the thrower.
+cat > "$work/src/app/tailstale.clj" <<'EOF'
+(ns app.tailstale)
+(declare pong)
+(defn ping [n]
+  (if (zero? n) :done (pong (dec n))))
+(defn pong [n]
+  (if (zero? n) :done (ping (dec n))))
+(defn thrower [] (throw (ex-info "stalestale" {:a 1})))
+(defn -main [& _]
+  (println "ping" (ping 5))
+  (thrower))
+EOF
+echo "trace smoke: a returned mutual-tail recursion leaves no frames behind"
+out_ts="$(run_app app.tailstale)"
+expect_match "mutual-tail: the thrower is named" "$out_ts" 'app\.tailstale/thrower'
+expect_no_match "mutual-tail: ping left the trace" "$out_ts" 'app\.tailstale/ping'
+expect_no_match "mutual-tail: pong left the trace" "$out_ts" 'app\.tailstale/pong'
+# the positive dual: a NON-TAIL entry into a mutual tail chain that throws mid-
+# chain — the hops between the entry and the throw must appear, with their lines.
+cat > "$work/src/app/tailchain.clj" <<'EOF'
+(ns app.tailchain)
+(declare q)
+(defn p [n]
+  (if (zero? n) (throw (ex-info "chain" {:n n})) (q (dec n))))
+(defn q [n]
+  (if (zero? n) (throw (ex-info "chain" {:n n})) (p (dec n))))
+(defn -main [& _]
+  (println "chain" (p 3)))
+EOF
+echo "trace smoke: a live mutual tail chain reports its hops"
+out_tc="$(run_app app.tailchain)"
+expect_match "mutual-chain: p named" "$out_tc" 'app\.tailchain/p'
+expect_match "mutual-chain: p at its own call line" "$out_tc" 'app\.tailchain/p (.*src/app/tailchain\.clj:4)'
+expect_match "mutual-chain: q named" "$out_tc" 'app\.tailchain/q'
+expect_match "mutual-chain: q at its own call line" "$out_tc" 'app\.tailchain/q (.*src/app/tailchain\.clj:6)'
+expect_no_match "mutual-chain: no defn lines" "$out_tc" 'tailchain\.clj:[35])'
+
 echo "trace smoke: JOLT_TRACE=0 opts out"
 out_off="$(run_app app.tail JOLT_TRACE=0)"
 expect_match "still reports the message" "$out_off" 'Unhandled exception: Divide by zero'
