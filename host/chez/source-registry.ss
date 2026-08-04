@@ -108,6 +108,167 @@
             (loop (guard (e (#t #f)) (io 'link)) (fx+ n 1)
                   (if keep? (cons (srcreg-frame nm src #f) acc) acc))))))))
 
+;; --- clj-line lookup for generated .scm offsets ---------------------------------
+;;
+;; The back end (backend_scheme.clj with-line) emits an inline Chez block comment
+;; #|L<clj-line>|# immediately before every traced call site in the generated
+;; .scm. A Chez frame's source object carries a byte offset into that file; a
+;; backtrace must map it back to the ORIGINAL .clj line the site was emitted
+;; from. Returns the line as a fixnum, or #f when no marker precedes the offset.
+;;
+;; The scan is FORWARD, tracking Scheme lexical state, and builds a sorted table
+;; of (marker-start . line) pairs in ONE pass; a lookup is a binary search over
+;; that table (the nearest preceding marker), O(log markers) per frame instead
+;; of O(file). A backward scan could not tell a real marker from the same bytes
+;; inside a user STRING LITERAL — a Clojure string like "#|L999|# oops" is
+;; user-controlled, and every offset after it would resolve to a fabricated
+;; line. The forward scanner skips:
+;;   - "..." string literals, with \ escapes (an escaped \" does not end the
+;;     string; \\ then a quote DOES — the backslash escapes exactly one char);
+;;   - #| ... |# block comments, which NEST in Chez (a marker is recognized only
+;;     when the comment is exactly #|L<digits>|# with an immediate close);
+;;   - #\ character literals, so a #\" can't open a string or a #\| start a
+;;     comment (defensive: the emitter renders chars as (integer->char N), never
+;;     #\);
+;;   - ; line comments (the emitter never emits one — a top-level form is one
+;;     line, so a ; comment would swallow the rest of it — but they are free to
+;;     skip).
+;; Deliberately NOT handled (the emitter cannot produce them): #; datum
+;; comments, and bar-delimited |symbol| syntax containing #|.
+(define jolt-marker-cache-text (make-hashtable string-hash string=?))
+(define jolt-marker-cache-file (make-hashtable string-hash string=?))
+
+;; Forward scan -> sorted vector of (start . line) pairs, one per real marker.
+(define (jolt-marker-table text)
+  (define n (string-length text))
+  (define (digit? c) (char<=? #\0 c #\9))
+  (define (alpha? c) (or (char<=? #\a c #\z) (char<=? #\A c #\Z)))
+  (define (hex-digit? c)
+    (or (digit? c) (char<=? #\a c #\f) (char<=? #\A c #\F)))
+  ;; Is text[i..] exactly "#|L<digits>|#"?  (line . end) or #f.
+  (define (marker-at? i)
+    (and (<= (+ i 3) n)
+         (char=? (string-ref text i) #\#)
+         (char=? (string-ref text (+ i 1)) #\|)
+         (char=? (string-ref text (+ i 2)) #\L)
+         (let loop ((j (+ i 3)) (acc 0) (digits? #f))
+           (cond
+             ((and (< j n) (digit? (string-ref text j)))
+              (loop (+ j 1) (+ (* acc 10)
+                               (- (char->integer (string-ref text j))
+                                  (char->integer #\0)))
+                    #t))
+             ((and digits? (< (+ j 1) n)
+                   (char=? (string-ref text j) #\|)
+                   (char=? (string-ref text (+ j 1)) #\#))
+              (cons acc (+ j 2)))
+             (else #f)))))
+  (let scan ((i 0) (out '()))
+    (cond
+      ((>= i n) (list->vector (reverse out)))
+      ;; string literal: \" stays inside, \\ does not escape a later quote
+      ((char=? (string-ref text i) #\")
+       (let skip ((j (+ i 1)))
+         (cond
+           ((>= j n) (scan n out))
+           ((char=? (string-ref text j) #\\)
+            (if (< (+ j 1) n) (skip (+ j 2)) (scan n out)))
+           ((char=? (string-ref text j) #\") (scan (+ j 1) out))
+           (else (skip (+ j 1))))))
+      ;; #\ char literal: consume it whole so #\" etc. can't mislead the scan
+      ((and (char=? (string-ref text i) #\#)
+            (< (+ i 1) n)
+            (char=? (string-ref text (+ i 1)) #\\))
+       (cond
+         ((>= (+ i 2) n) (scan n out))
+         ((let ((c (string-ref text (+ i 2))))
+            (or (char=? c #\x) (char=? c #\u)))
+          ;; hex codepoint: #\x41, #\u0041, #\x(41), #\u(41)
+          (if (and (< (+ i 3) n) (char=? (string-ref text (+ i 3)) #\())
+              (let inner ((k (+ i 4)))
+                (cond
+                  ((and (< k n) (hex-digit? (string-ref text k))) (inner (+ k 1)))
+                  ((and (< k n) (char=? (string-ref text k) #\))) (scan (+ k 1) out))
+                  (else (scan (+ i 3) out))))
+              (let skip ((j (+ i 3)))
+                (cond ((and (< j n) (hex-digit? (string-ref text j))) (skip (+ j 1)))
+                      (else (scan j out))))))
+         ((alpha? (string-ref text (+ i 2)))
+          ;; named char: #\space, #\newline, ...
+          (let skip ((j (+ i 3)))
+            (cond ((and (< j n) (alpha? (string-ref text j))) (skip (+ j 1)))
+                  (else (scan j out)))))
+         (else (scan (+ i 3) out))))
+      ;; #| block comment (nests); our markers are exactly such comments
+      ((and (char=? (string-ref text i) #\#)
+            (< (+ i 1) n)
+            (char=? (string-ref text (+ i 1)) #\|))
+       (let ((m (marker-at? i)))
+         (if m
+             (scan (cdr m) (cons (cons i (car m)) out))
+             (let skip ((j (+ i 2)) (depth 1))
+               (cond
+                 ((>= j n) (scan n out))
+                 ((and (char=? (string-ref text j) #\#)
+                       (< (+ j 1) n)
+                       (char=? (string-ref text (+ j 1)) #\|))
+                  (skip (+ j 2) (+ depth 1)))
+                 ((and (char=? (string-ref text j) #\|)
+                       (< (+ j 1) n)
+                       (char=? (string-ref text (+ j 1)) #\#))
+                  (if (= depth 1) (scan (+ j 2) out) (skip (+ j 2) (- depth 1))))
+                 (else (skip (+ j 1) depth)))))))
+      ;; ; line comment
+      ((char=? (string-ref text i) #\;)
+       (let skip ((j (+ i 1)))
+         (cond
+           ((>= j n) (scan n out))
+           ((char=? (string-ref text j) #\newline) (scan (+ j 1) out))
+           (else (skip (+ j 1))))))
+      (else (scan (+ i 1) out)))))
+
+;; Rightmost marker start <= offset, else #f. Binary search over the sorted
+;; table; an offset past the last marker (or past the end of the file) lands on
+;; the last marker, matching the old backward scan. An offset exactly AT a
+;; marker's start resolves to that marker (its bytes begin there).
+(define (jolt-marker-line-from-table table offset)
+  (let loop ((lo 0) (hi (- (vector-length table) 1)) (best #f))
+    (cond
+      ((> lo hi) best)
+      (else
+       (let ((mid (quotient (+ lo hi) 2)))
+         (if (<= (car (vector-ref table mid)) offset)
+             (loop (+ mid 1) hi (cdr (vector-ref table mid)))
+             (loop lo (- mid 1) best)))))))
+
+(define (jolt-marker-line-at-offset text offset)
+  (let ((tbl (hashtable-ref jolt-marker-cache-text text #f)))
+    (if tbl
+        (jolt-marker-line-from-table tbl offset)
+        (let ((tbl (jolt-marker-table text)))
+          ;; content-keyed: exact (never stale), and a backtrace resolves many
+          ;; frames against the same generated text. Cap at 16 entries so a
+          ;; long-lived process can't accumulate every file it ever touched.
+          (when (fx>=? (hashtable-size jolt-marker-cache-text) 16)
+            (hashtable-clear! jolt-marker-cache-text))
+          (hashtable-set! jolt-marker-cache-text text tbl)
+          (jolt-marker-line-from-table tbl offset)))))
+
+;; Convenience wrapper for a generated file on disk. Cached per path+mtime: the
+;; same .scm serves every frame of a backtrace, so read+scan it once. Whole-
+;; second mtime granularity means a file regenerated within the same second can
+;; serve a stale table — acceptable on a debug path, never a correctness claim.
+(define (jolt-marker-line-in-file path offset)
+  (define (read-table)
+    (call-with-input-file path
+      (lambda (p) (jolt-marker-table (get-string-all p)))))
+  (let* ((mtime (time-second (file-modification-time path)))
+         (entry (hashtable-ref jolt-marker-cache-file path #f)))
+    (unless (and entry (= (car entry) mtime))
+      (set! entry (cons mtime (read-table)))
+      (hashtable-set! jolt-marker-cache-file path entry))
+    (jolt-marker-line-from-table (cdr entry) offset)))
+
 ;; Render a list of (frame-name . record) pairs (innermost/deepest first) to a
 ;; backtrace string. record is a source vector #(ns name file line) -> "ns/name
 ;; (file:line)", or 'ambiguous / #f -> the bare frame name. A run of the same

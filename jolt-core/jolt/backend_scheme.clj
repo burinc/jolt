@@ -165,10 +165,15 @@
 ;; points nowhere near the fault.
 ;;
 ;; `begin` keeps this transparent in every position, tail included — the call stays
-;; the last form, so TCO is unaffected.
+;; the last form, so TCO is unaffected. Under the same gate, also emit an inline
+;; Chez block comment #|L<line>|# right before the form: a frame's source object
+;; gives a byte offset into the generated .scm, and scanning back for the nearest
+;; marker recovers the ORIGINAL clj line (source-registry.ss
+;; jolt-marker-line-at-offset). Must be a block comment — a `;;` comment would
+;; comment out the rest of the one-line top-level form.
 (defn- with-line [node s]
   (if-let [l (and (trace-frames?) (node-line node))]
-    (str "(begin (jolt-line! " l ") " s ")")
+    (str "#|L" l "|# (begin (jolt-line! " l ") " s ")")
     s))
 
 ;; Source-map registration for a fn def: one hashtable insert at definition time,

@@ -112,4 +112,146 @@
   (gate-check "(9) tracing off: no trace-unwind" (unwinds? e) #f))
 (set-trace-frames! #t)
 
+;; --- (10) position markers: #|L<n>|# before each traced call site --------------
+;; The marker must carry the CORRECT clj line, so the source is multi-line and the
+;; two calls sit on distinct lines — an off-by-one in either direction would fail.
+(define (count-sub? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0) (c 0))
+      (cond ((> (+ i m) n) c)
+            ((string=? (substring s i (+ i m)) sub) (loop (+ i 1) (+ c 1)))
+            (else (loop (+ i 1) c))))))
+;; remove every #|L<digits>|# from an emitted string (for the round-trip check)
+(define (strip-markers e)
+  (define (marker-end? i)
+    ;; e[i..] starts with "#|L": index just past the closing "|#" of a marker, or #f
+    (let ((n (string-length e)))
+      (let loop ((j (+ i 3)))
+        (cond
+          ((>= j n) #f)
+          ((char<=? #\0 (string-ref e j) #\9) (loop (+ j 1)))
+          ((and (< (+ j 1) n)
+                (char=? (string-ref e j) #\|)
+                (char=? (string-ref e (+ j 1)) #\#))
+           (+ j 2))
+          (else #f)))))
+  (let ((n (string-length e)))
+    (let loop ((i 0) (out '()))
+      (cond
+        ((>= i n) (apply string-append (reverse out)))
+        ((and (<= (+ i 3) n) (string=? (substring e i (+ i 3)) "#|L"))
+         (let ((j (marker-end? i)))
+           (if j (loop j out) (loop (+ i 1) (cons (substring e i (+ i 1)) out)))))
+        (else (loop (+ i 1) (cons (substring e i (+ i 1)) out)))))))
+(define marker-src "(def mdemo (fn [f x]\n         (let [a (f 1)]\n           (f a))))")
+(let ((e (emit-num marker-src)))
+  (gate-check "(10) tracing on: marker before the line-2 call" (gate-sub? e "#|L2|#") #t)
+  (gate-check "(10) tracing on: marker before the line-3 call" (gate-sub? e "#|L3|#") #t)
+  (gate-check "(10) tracing on: no marker on the def line" (gate-sub? e "#|L1|#") #f)
+  (gate-check "(10) tracing on: one marker per recorded position"
+              (= (count-sub? e "#|L") (count-sub? e "(jolt-line! ")) #t)
+  ;; the marker is genuinely a comment: reading the emitted string yields the
+  ;; same datum with or without the markers
+  (gate-check "(10) round-trip: marker reads as a comment"
+              (equal? (read (open-input-string e))
+                      (read (open-input-string (strip-markers e))))
+              #t))
+(set-trace-frames! #f)
+(let ((e (emit-num marker-src)))
+  (gate-check "(10) tracing off: no marker" (gate-sub? e "#|L") #f)
+  (gate-check "(10) tracing off: no jolt-line!" (gate-sub? e "(jolt-line! ") #f))
+(set-trace-frames! #t)
+
+;; --- (11) clj-line lookup: nearest preceding #|L<n>|# marker --------------------
+;; #|L10|# (foo) #|L20|# (bar) #|L30|# (baz)  — L10 sits at 0..6, L20 at 14..20,
+;; L30 at 28..34; the calls' parens open at 8 / 22 / 36.
+(let* ((t3 "#|L10|# (foo) #|L20|# (bar) #|L30|# (baz)")
+       (t1 "(foo) #|L7|# (bar)"))
+  (gate-check "(11) nearest preceding marker" (jolt-marker-line-at-offset t3 12) 10)
+  (gate-check "(11) later marker wins between markers" (jolt-marker-line-at-offset t3 22) 20)
+  (gate-check "(11) multiple markers: last wins past the end" (jolt-marker-line-at-offset t3 39) 30)
+  (gate-check "(11) offset before any marker" (jolt-marker-line-at-offset t1 2) #f)
+  (gate-check "(11) offset inside the marker itself" (jolt-marker-line-at-offset t3 18) 20)
+  (gate-check "(11) offset past the end clamps" (jolt-marker-line-at-offset t3 1000) 30))
+
+;; --- (11b) lexical scan: bytes inside strings/comments are never markers -------
+;; A user string literal can contain "#|L999|#": the FORWARD scan must not record
+;; it, so every offset after the literal resolves to the REAL marker (3), never
+;; 999. s2 also exercises \" (escaped quote does not end the string), s3 an
+;; unclosed "#|L" inside a string, s5 a marker hidden in a NESTED block comment,
+;; and s7 a #\" CHARACTER literal (not a string opener).
+(let* ((s1 "#|L3|# (sink \"#|L999|# oops\")")
+       (s2 "#|L3|# (sink \"say \\\"#|L999|#\\\"\")")
+       (s3 "#|L3|# (sink \"#|L\")")
+       (s4 "(sink \"#|L999|#\")")
+       (s5 "#| outer #|L5|# |# (sink)")
+       (s6 "#|L3|# #| outer #|L5|# |# (sink)")
+       (s7 "#|L3|# (f #\\\") #|L7|# (g)"))
+  (gate-check "(11b) offset inside the fake marker in a string" (jolt-marker-line-at-offset s1 16) 3)
+  (gate-check "(11b) offset past the fake marker in a string" (jolt-marker-line-at-offset s1 30) 3)
+  (gate-check "(11b) escaped quote: marker bytes stay in the string" (jolt-marker-line-at-offset s2 24) 3)
+  (gate-check "(11b) escaped quote: offset past the string" (jolt-marker-line-at-offset s2 33) 3)
+  (gate-check "(11b) '#|L' with no close stays in the string" (jolt-marker-line-at-offset s3 16) 3)
+  (gate-check "(11b) '#|L' with no close: offset past the string" (jolt-marker-line-at-offset s3 19) 3)
+  (gate-check "(11b) fake marker before any real marker -> #f" (jolt-marker-line-at-offset s4 10) #f)
+  (gate-check "(11b) nested comment hides its inner marker" (jolt-marker-line-at-offset s5 24) #f)
+  (gate-check "(11b) nested comment: real marker still wins" (jolt-marker-line-at-offset s6 27) 3)
+  (gate-check "(11b) #\\\" is a char literal, not a string opener" (jolt-marker-line-at-offset s7 14) 3)
+  (gate-check "(11b) marker after a #\\\" char literal registers" (jolt-marker-line-at-offset s7 24) 7))
+
+;; --- (12) integration: lookup resolves markers in REAL emitted output ----------
+;; The R3 consumption path: a frame's src byte offset into the generated .scm is
+;; fed to jolt-marker-line-at-offset, which must recover the original clj line.
+;; Use the real emitted string from (10) — #|L2|# / #|L3|# sit 6 bytes apart-shape
+;; (the L is 2 in, the digit 3 in), so offsets just past the 'L' and well into
+;; each call must resolve to 2 and 3 respectively, and an offset before the first
+;; marker must resolve to #f.
+(define (find-sub s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i m) n) #f)
+            ((string=? (substring s i (+ i m)) sub) i)
+            (else (loop (+ i 1)))))))
+(let* ((e (emit-num marker-src))
+       (i2 (find-sub e "#|L2|#"))
+       (i3 (find-sub e "#|L3|#")))
+  (gate-check "(12) offset before the first marker" (jolt-marker-line-at-offset e 1) #f)
+  (gate-check "(12) offset inside the line-2 marker" (jolt-marker-line-at-offset e (+ i2 3)) 2)
+  (gate-check "(12) offset at the line-2 call" (jolt-marker-line-at-offset e (+ i2 8)) 2)
+  (gate-check "(12) offset inside the line-3 marker" (jolt-marker-line-at-offset e (+ i3 3)) 3)
+  (gate-check "(12) offset at the line-3 call" (jolt-marker-line-at-offset e (+ i3 8)) 3)
+  (gate-check "(12) offset past the last call" (jolt-marker-line-at-offset e (+ i3 30)) 3)
+  ;; the file wrapper reads the same generated text from disk
+  (let ((p (format "/tmp/jolt-marker-r1-~a.scm" (random 1000000))))
+    (call-with-output-file p (lambda (out) (display e out)))
+    (gate-check "(12) file wrapper resolves the same line"
+                (jolt-marker-line-in-file p (+ i3 3)) 3)
+    (delete-file p)))
+
+;; --- (12b) integration: the R1B defect — a user string's fake marker ----------
+;; (def s (fn [] (sink "#|L999|# oops"))) — the string literal carries the exact
+;; bytes of a marker. The lookup must resolve every offset after it to the REAL
+;; clj line (3, the sink call's line), never 999. The escaped-quote and
+;; unclosed-"#|L" variants keep the marker-shaped bytes from ending the string
+;; prematurely or leaking into the scan.
+(define marker-str-src "(def s\n  (fn [sink]\n    (sink \"#|L999|# oops\")))")
+(define marker-esc-src "(def s2\n  (fn [sink]\n    (sink \"say \\\"#|L999|#\\\"\")))")
+(define marker-open-src "(def s3\n  (fn [sink]\n    (sink \"#|L\")))")
+(let* ((e (emit-num marker-str-src))
+       (i3 (find-sub e "#|L3|#"))
+       (istr (find-sub e "\"#|L999|# oops\"")))
+  (gate-check "(12b) real marker precedes the sink call" (jolt-marker-line-at-offset e (+ i3 3)) 3)
+  (gate-check "(12b) offset inside the fake marker in the string" (jolt-marker-line-at-offset e (+ istr 6)) 3)
+  (gate-check "(12b) offset past the fake marker, still in the string" (jolt-marker-line-at-offset e (+ istr 14)) 3)
+  (gate-check "(12b) offset past the string literal" (jolt-marker-line-at-offset e (+ istr 20)) 3)
+  (gate-check "(12b) offset past the whole form" (jolt-marker-line-at-offset e (+ istr 40)) 3))
+(let* ((e (emit-num marker-esc-src))
+       (istr (find-sub e "\"say \\\"#|L999|#\\\"\"")))
+  (gate-check "(12b) escaped quotes: fake marker still inert" (jolt-marker-line-at-offset e (+ istr 8)) 3)
+  (gate-check "(12b) escaped quotes: offset past the string" (jolt-marker-line-at-offset e (+ istr 30)) 3))
+(let* ((e (emit-num marker-open-src))
+       (istr (find-sub e "\"#|L\"")))
+  (gate-check "(12b) unclosed '#|L' in a string is inert" (jolt-marker-line-at-offset e (+ istr 2)) 3)
+  (gate-check "(12b) unclosed '#|L': offset past the form" (jolt-marker-line-at-offset e (+ istr 20)) 3))
+
 (gate-summary "trace-emit")
