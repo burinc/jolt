@@ -204,7 +204,7 @@
   (unless (jolt-trace-env-off? (getenv "JOLT_TRACE"))
     (jolt-enable-trace!)))
 ;; Host-side mirror of the emitter's trace-frames? flag: whether the emitted
-;; text carries #|L<line>|# markers (backend_scheme.clj with-line). When it is
+;; text carries #|L<line>|# markers (backend_scheme.clj with-site). When it is
 ;; off, no markers exist, so the annotated read below would attach source
 ;; objects with nothing to resolve them against — the eval path then takes
 ;; exactly today's plain-read route. The SAME flag the emitter consults, so the
@@ -420,9 +420,6 @@
      ;; record this form's source location first, so a compile- or run-time error
      ;; in it reports the right place.
      (jolt-enter-form! form)
-     ;; drop tail-frame history from earlier top-level forms, so an error's trace
-     ;; shows only this form's own call history (a no-op unless JOLT_TRACE is on).
-     (jolt-trace-reset!)
      (let* ((scm (jolt-analyze-emit-form form ns))
             (cap (jolt-aot-capture)))            ; tee for the AOT cache (loader.ss)
        (when cap (put-string cap scm) (newline cap))

@@ -155,8 +155,12 @@
   (gate-check "(10) tracing on: marker before the line-2 call" (gate-sub? e "#|L2|#") #t)
   (gate-check "(10) tracing on: marker before the line-3 call" (gate-sub? e "#|L3|#") #t)
   (gate-check "(10) tracing on: no marker on the def line" (gate-sub? e "#|L1|#") #f)
-  (gate-check "(10) tracing on: one marker per recorded position"
-              (= (count-sub? e "#|L") (count-sub? e "(jolt-line! ")) #t)
+  ;; R2 (bead jolt-knn8): the per-call fixnum store is gone — a marker is a
+  ;; comment only. mdemo's sole tail call goes through jolt-invoke (f is a
+  ;; param, a dynamic callee), so it records via continuation marks; nothing
+  ;; here writes the site vreg at all.
+  (gate-check "(10) tracing on: no per-call site store (R2)"
+              (gate-sub? e "(jolt-site! ") #f)
   ;; the marker is genuinely a comment: reading the emitted string yields the
   ;; same datum with or without the markers
   (gate-check "(10) round-trip: marker reads as a comment"
@@ -166,7 +170,29 @@
 (set-trace-frames! #f)
 (let ((e (emit-num marker-src)))
   (gate-check "(10) tracing off: no marker" (gate-sub? e "#|L") #f)
-  (gate-check "(10) tracing off: no jolt-line!" (gate-sub? e "(jolt-line! ") #f))
+  (gate-check "(10) tracing off: no jolt-site!" (gate-sub? e "(jolt-site! ") #f))
+(set-trace-frames! #t)
+
+;; --- (10b) R2: the site vreg pair at native-op tail sites, callsite table ----
+;; A NAMED fn whose body ends in a native-op tail call: exactly one jolt-site!
+;; store, carrying the static ('fn . line) pair (sited-tail-call), and the def
+;; wrapper registers the site's static callee for the reporter's staleness
+;; validator (jolt-register-callsite!). A dynamic-callee site (mdemo's f above)
+;; registers nothing.
+(define sited-src "(def sdemo (fn sdemo [x]\n  (+ x 1)))")
+(let ((e (emit-num sited-src)))
+  (gate-check "(10b) native tail site stores the pair" (gate-sub? e "(jolt-site! '(") #t)
+  (gate-check "(10b) exactly one site store" (= (count-sub? e "(jolt-site! ") 1) #t)
+  ;; this harness emits with source registration OFF, so the callee registers
+  ;; under its bare munged name (the direct-link-build form); with it on (dev,
+  ;; open-world build) the same site registers "clojure.core/+".
+  (gate-check "(10b) callsite registered with its static callee"
+              (gate-sub? e "(jolt-register-callsite! \"sdemo\" 2 \"+\")") #t))
+(set-trace-frames! #f)
+(let ((e (emit-num sited-src)))
+  (gate-check "(10b) tracing off: no site store" (gate-sub? e "(jolt-site! ") #f)
+  (gate-check "(10b) tracing off: no callsite registration"
+              (gate-sub? e "(jolt-register-callsite! ") #f))
 (set-trace-frames! #t)
 
 ;; --- (11) clj-line lookup: nearest preceding #|L<n>|# marker --------------------

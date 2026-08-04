@@ -880,6 +880,16 @@
                 ;; mint keeps it off, since its output must not carry this machine's
                 ;; absolute paths (emit-image.ss).
                 ((var-deref "jolt.backend-scheme" "set-source-reg!") (not direct-link?))
+                ;; Bake tracing into built binaries by default (0.6.2): the tail-
+                ;; site instrumentation is marks at user tail sites plus one vreg
+                ;; store at native/throw tail sites — measured at ~1.0-1.3x of the
+                ;; untraced floor — and the chain's site literals carry their own
+                ;; lines, so a deployed binary's trace needs no marker files.
+                ;; JOLT_TRACE=0 at BUILD time opts out (build-time axis, like the
+                ;; dev-mode emission toggle; the baked binary has no runtime knob).
+                ;; The seed mint is untouched — its emission stays untraced.
+                ((var-deref "jolt.backend-scheme" "set-trace-frames!")
+                 (not (jolt-trace-env-off? (getenv "JOLT_TRACE"))))
                 ;; Cache resolved var cells per reference site in the APP forms
                 ;; (bld-emit-ns / ei-emit-ns-records). A user build is a single
                 ;; compile of fixed source, so the gensym-numbered cell names are
@@ -949,6 +959,10 @@
                 (set-direct-link-flag! #f)
                 ((var-deref "jolt.backend-scheme" "set-direct-link!") #f)
                 ((var-deref "jolt.backend-scheme" "set-source-reg!") #f)
+                ;; restore the DEV-mode emission state, not #f — an in-process
+                ;; build (nREPL, cmd-build without exec) must not turn off tracing
+                ;; for code the session compiles afterwards.
+                ((var-deref "jolt.backend-scheme" "set-trace-frames!") jolt-trace-on?)
                 ;; drop the accumulated direct-link fqn set too — a later
                 ;; in-process build would otherwise bind calls against defs
                 ;; recorded for THIS one. (bld-wp-infer!'s record/protocol
@@ -1081,8 +1095,16 @@
                             ;; aliased symbol behaves the same as on the JVM / interpreted
                             ;; jolt, not off the entry ns's alias table).
                             "        (set-chez-ns! \"user\")\n"
+                            ;; The same host-fault capture the cli's run path has
+                            ;; (cli-core.ss jolt-cli-run): a raw Chez condition gets
+                            ;; its k/marks/site stashed BEFORE the unwind, so a
+                            ;; traced binary maps the fault to fn + line. jolt
+                            ;; throws skip it (jolt-capture-fault! tests) and
+                            ;; raise-continuable preserves warning semantics.
                             "        (when (and maincell (var-cell-defined? maincell))\n"
-                            "          (apply jolt-invoke (var-cell-root maincell) args))))\n"
+                            "          (with-exception-handler\n"
+                            "            (lambda (c) (when (serious-condition? c) (jolt-capture-fault! c)) (raise-continuable c))\n"
+                            "            (lambda () (apply jolt-invoke (var-cell-root maincell) args))))))\n"
                             "    (exit 0)))\n")))
           (close-port out))
         (ei-mark! "write flat.ss")

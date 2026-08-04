@@ -169,7 +169,7 @@
 
 ;; --- clj-line lookup for generated .scm offsets ---------------------------------
 ;;
-;; The back end (backend_scheme.clj with-line) emits an inline Chez block comment
+;; The back end (backend_scheme.clj with-site) emits an inline Chez block comment
 ;; #|L<clj-line>|# immediately before every traced call site in the generated
 ;; .scm. A Chez frame's source object carries a byte offset into that file; a
 ;; backtrace must map it back to the ORIGINAL .clj line the site was emitted
@@ -442,74 +442,216 @@
                     (put-char port #\newline)
                     (loop tail (fx+ shown 1))))))))))
 
-;; The tail-frame history ring rendered as a backtrace, or #f when tracing is off /
-;; empty. A mapped frame is kept; else drop plumbing (same rule as the continuation
-;; path) so the two sources read consistently.
-;; jolt-trace-snapshot yields (name . call-site-line) innermost-first, where the
-;; line is the one the CALLER was on — the emitter sets it just before the call and
-;; the callee's prologue reads it going in. So a frame's OWN line is the line
-;; recorded by the entry one step deeper, and the innermost frame's comes from the
-;; live line at the throw. Do the shift on the RAW list, before dropping plumbing
-;; frames: a dropped frame still recorded the line of the frame outside it, and
-;; filtering first would hand that line to the wrong function.
-;; Only the REPL/nREPL error paths (jolt.host/backtrace-string) and the no-
-;; continuation fallback (jolt-backtrace-string) still read the whole history;
-;; the uncaught reporter itself prefers the live continuation and takes just the
-;; innermost rib from the ring (see jolt-backtrace-string below). Since trace-r4
-;; deleted the per-call ring restore, the whole history is a BOUNDED window of
-;; recent subproblems — returned calls' ribs are no longer reused, they just sit
-;; behind the head until jolt-trace-reset! clears them at the next top-level
-;; boundary. Those two paths are best-effort by construction (a REPL's own
-;; continuation is its machinery, and a no-continuation throw has no exact spine
-;; to prefer), so the window is what they show.
+;; The tail-site continuation marks rendered as a backtrace, or #f when tracing is
+;; off / no marked frame is live. A mapped frame is kept; else drop plumbing (same
+;; rule as the continuation path) so the two sources read consistently.
+;; The marks captured at the throw (rt.ss jolt-throw-marks) give one RIB per live
+;; marked frame; each rib is #(count buf) of site literals ('("ns/fn" . line)),
+;; and every entry carries the line of the tail call IN ITS OWN fn — no caller
+;; line shift anywhere. This path (REPL/nREPL via jolt.host/backtrace-string, and
+;; the no-continuation fallback in jolt-backtrace-string) renders EVERY live
+;; marked frame's chain, innermost first — exact, no returned residue, strictly
+;; better than the old bounded-window ring.
 (define (jolt-history-backtrace)
-  (let* ((hist (jolt-trace-snapshot))
-         (frames (let loop ((es hist) (prev (jolt-throw-line)) (acc '()))
-                   (if (null? es)
-                       (reverse acc)
-                       (let* ((e (car es)) (nm (car e)) (line (cdr e))
-                              (src (hashtable-ref source-registry nm #f))
-                              (own (and (fixnum? prev) (fx>? prev 0) prev)))
-                         (loop (cdr es)
-                               line
-                               (if (or src (not (srcreg-plumbing-name? nm)))
-                                   (cons (srcreg-frame nm src own) acc)
-                                   acc)))))))
-    (and (pair? frames) (jolt-render-recs frames))))
+  (let* ((marks (jolt-throw-marks))
+         (ribs (if marks (continuation-marks->list marks jolt-trace-key) '()))
+         (cont-names (let ((h (make-hashtable string-hash string=?))) h))
+         (chain (let loop ((ribs ribs) (acc '()))
+                  (if (null? ribs)
+                      acc
+                      (loop (cdr ribs)
+                            (append acc (jolt-marks-tail-frames (car ribs) cont-names))))))
+         (site (jolt-throw-site))
+         (recs (if (jolt-site-splice? site cont-names chain '())
+                   (cons (jolt-site-frame site) chain)
+                   chain)))
+    (and (pair? recs) (jolt-render-recs recs))))
 
-;; Recover TCO-erased frames from the history ring. `rib` is the innermost rib's
-;; (name . call-site-line) entries (jolt-trace-innermost-rib), most-recent first:
-;; the tail chain between the throw and the deepest live frame. `cont-names` is a
-;; string-set of the frame names the live continuation already reports. Only
-;; entries GENUINELY ABSENT from the continuation are taken — a frame that is live
-;; cannot have been TCO-erased, so a ring copy of it is either a duplicate of the
-;; continuation or a returned call's residue, and both must be dropped. The line
-;; shift runs over the RAW rib (a dropped entry still recorded the line of the
-;; entry inside it), the same discipline jolt-history-backtrace uses.
-(define (jolt-ring-tail-frames rib cont-names)
-  (let loop ((es rib) (prev (jolt-throw-line)) (acc '()))
-    (if (null? es)
+;; Recover TCO-erased frames from the tail-site continuation marks. `rib` is the
+;; innermost live rib (continuation-marks-first of the marks captured at the
+;; throw), decoded to (qname . own-line) entries, deepest first: the tail chain
+;; between the throw and the deepest live frame. `cont-names` is a string-set of
+;; the frame names the live continuation already reports. Only entries GENUINELY
+;; ABSENT from the continuation are taken — a frame that is live cannot have been
+;; TCO-erased, so a mark copy of it is either a duplicate of the continuation or
+;; a dead frame's residue, and both must be dropped. NO line shift: each entry
+;; carries the line of the tail call IN ITS OWN fn. A rib holds at most 8
+;; entries; when more were recorded (count > 8) the oldest count-8 are gone, so
+;; render the survivors plus an elision marker.
+(define (jolt-marks-tail-frames rib cont-names)
+  (let* ((cnt (vector-ref rib 0)) (buf (vector-ref rib 1))
+         (n (fxmin cnt 8)))
+    (let loop ((k 0) (acc '()))
+      (if (fx>=? k n)
+          (let ((acc (if (fx>? cnt 8)
+                         (cons (srcreg-frame (string-append "(elided "
+                                                            (number->string (fx- cnt 8))
+                                                            " tail frames)")
+                                             #f #f)
+                               acc)
+                         acc)))
+            (reverse acc))
+          (let* ((e (vector-ref buf (fxand (fx- (fx- cnt 1) k) 7)))
+                 (nm (car e)) (line (cdr e))
+                 (src (hashtable-ref source-registry nm #f)))
+            (loop (fx+ k 1)
+                  (if (and (not (hashtable-ref cont-names nm #f))
+                           (or src (not (srcreg-plumbing-name? nm))))
+                      (cons (srcreg-frame nm src (and (fixnum? line) (fx>? line 0) line)) acc)
+                      acc)))))))
+
+;; The innermost frame, spliced from the vreg site (rt.ss jolt-throw-site) that the
+;; throw's own call site stored — the one frame neither the continuation (TCO
+;; erased) nor the tail chain (a native-op / throw site records no mark) can name.
+;; Rendered innermost-first, before the chain.
+(define (jolt-site-frame site)
+  (let ((nm (car site)) (line (cdr site)))
+    (srcreg-frame nm (hashtable-ref source-registry nm #f)
+                  (and (fixnum? line) (fx>? line 0) line))))
+;; Anti-dup belt plus the R2 staleness validator (bead jolt-knn8). Splice the
+;; site IFF (1) its name is absent from the live continuation (a live frame
+;; cannot have been TCO-erased); (2) it differs from the chain's deepest entry
+;; (when they agree, the chain already names the frame); and (3) the compile-
+;; time callsite table AGREES: only tail sites write the site vreg now, so the
+;; raise-time stash can be a returned chain's residue — the pair is trusted
+;; only when the innermost live context (the chain's deepest entry, else the
+;; innermost continuation frame) statically calls the fn the pair names. A
+;; site the table has no entry for (a dynamic callee) falls back to the belt
+;; alone — bounded, and strictly no worse than R1.
+(define (jolt-site-splice? site cont-names chain cont)
+  (and (pair? site)
+       (let ((nm (car site)))
+         (and (not (hashtable-ref cont-names nm #f))
+              (or (null? chain)
+                  (not (string=? (srcreg-frame-nm (car chain)) nm)))
+              ;; Two candidate contexts, because either may be the innermost:
+              ;; the chain's deepest entry (the marked frame's last tail site)
+              ;; or the innermost continuation frame (deeper when the throw
+              ;; left live frames, e.g. a non-tail call chain below the marked
+              ;; frame). ACCEPT if any registered context calls nm, or if any
+              ;; context is unregistered (a dynamic site — no evidence);
+              ;; REJECT only when every known context disagrees. A rejected
+              ;; pair is exactly a returned tail site's residue.
+              (let ((ctxs (append (if (pair? chain) (list (car chain)) '())
+                                  (if (pair? cont) (list (car cont)) '()))))
+                (or (null? ctxs)
+                    (let check ((cs ctxs) (any-unknown #f))
+                      (if (null? cs)
+                          any-unknown
+                          (let ((expected (jolt-callsite-callees
+                                           (srcreg-frame-nm (car cs))
+                                           (srcreg-frame-line (car cs)))))
+                            (cond
+                              ((not expected) (check (cdr cs) #t))
+                              ((member nm expected) #t)
+                              (else (check (cdr cs) any-unknown))))))))))))
+
+;; Where the tail chain belongs among the continuation frames. The chain's
+;; frames run OUTSIDE the fn the chain's deepest site tail-called; when the
+;; throw left that fn's frame live (a non-tail throw inside it), the
+;; continuation reports it — and any frames deeper than it — ABOVE the chain.
+;; Splice the chain after the OUTERMOST cont frame named by the deepest site's
+;; static callee (jolt-callsite-callee), so a caller can never render above
+;; its callee. When the callee is unknown or absent from the continuation
+;; (the throw was at the chain fn's tail — the common case), the chain goes on
+;; top as before. Fixes the app.sitestale-shaped ordering the R1 fixtures never
+;; exercised: their throws were all in tail position.
+(define (jolt-splice-chain chain cont cont-names)
+  (if (null? chain)
+      (values cont 0)
+      (let ((es (jolt-callsite-callees (srcreg-frame-nm (car chain))
+                                       (srcreg-frame-line (car chain)))))
+        (if (and es (exists (lambda (x) (hashtable-ref cont-names x #f)) es))
+            (let ((last (let scan ((cs cont) (i 0) (last -1))
+                          (if (null? cs)
+                              last
+                              (scan (cdr cs) (fx+ i 1)
+                                    (if (member (srcreg-frame-nm (car cs)) es) i last))))))
+              (if (fx<? last 0)
+                  (values (append chain cont) 0)
+                  ;; the chain goes AFTER cont[last], i.e. before index last+1
+                  ;; — the returned index must say so, or the assembler undoes
+                  ;; the app.sitestale ordering fix by one position.
+                  (let split ((k 0) (cs cont) (acc '()))
+                    (if (fx>? k last)
+                        (values (append (reverse acc) chain cs) (fx+ last 1))
+                        (split (fx+ k 1) (cdr cs) (cons (car cs) acc))))))
+            (values (append chain cont) 0)))))
+
+;; The cont index of the first frame at or after `start` whose registered static
+;; callees contain the rib's oldest surviving entry's fn — the fn the frame was
+;; created to run, which then started the tail chain. Overflowed ribs (count > 8)
+;; lost the true oldest entry, so ANY surviving entry's fn will do. #f when no
+;; frame anchors the rib.
+(define (jolt-find-anchor rib cont start)
+  (let* ((cnt (vector-ref rib 0))
+         (buf (vector-ref rib 1))
+         (targets (if (fx>? cnt 8)
+                      (let loop ((i (fx- cnt 8)) (acc '()))
+                        (if (fx>=? i cnt)
+                            (reverse acc)
+                            (loop (fx+ i 1) (cons (car (vector-ref buf (fxand i 7))) acc))))
+                      (list (car (vector-ref buf 0))))))
+    (if (fx>=? start (length cont))
+        #f
+        (let scan ((i start) (cs (list-tail cont start)))
+          (if (null? cs)
+              #f
+              (let ((es (jolt-callsite-callees (srcreg-frame-nm (car cs))
+                                               (srcreg-frame-line (car cs)))))
+                (if (and es (exists (lambda (t) (member t es)) targets))
+                    i
+                    (scan (fx+ i 1) (cdr cs)))))))))
+
+;; Ribs 2..n (innermost first) spliced among the continuation frames already
+;; holding rib 1's chain. Each outer rib belongs immediately inside the frame
+;; whose call created the rib's frame — its chain renders where the TCO-erased
+;; frames ran, immediately before that frame. The scan resumes strictly after
+;; the previous anchor (starting just after rib 1's insertion point), so a later
+;; rib never anchors before an earlier rib's position. A rib with nothing to
+;; render (all entries filtered) or no anchoring frame is dropped — it was never
+;; rendered before R3, and mis-placing is worse than omitting. Returns an alist
+;; of cont-index -> the chain frames to splice there, in rib order.
+(define (jolt-anchor-outer-ribs ribs cont start cont-names)
+  (let loop ((ribs ribs) (start start) (acc '()))
+    (if (null? ribs)
         (reverse acc)
-        (let* ((e (car es)) (nm (car e)) (line (cdr e))
-               (src (hashtable-ref source-registry nm #f))
-               (own (and (fixnum? prev) (fx>? prev 0) prev)))
-          (loop (cdr es)
-                line
-                (if (and (not (hashtable-ref cont-names nm #f))
-                         (or src (not (srcreg-plumbing-name? nm))))
-                    (cons (srcreg-frame nm src own) acc)
-                    acc))))))
+        (let* ((chain (jolt-marks-tail-frames (car ribs) cont-names))
+               (idx (and (pair? chain)
+                         (jolt-find-anchor (car ribs) cont (fx+ start 1)))))
+          (if (not idx)
+              (loop (cdr ribs) start acc)
+              (loop (cdr ribs) idx (cons (cons idx chain) acc)))))))
+
+;; The final frame list: `cont` with rib 1's chain inserted before cont[i1] (its
+;; jolt-splice-chain splice index; an empty chain inserts nothing) and each outer
+;; chain from `anchors` before its anchor frame. One pass over cont.
+(define (jolt-assemble-trace cont i1 chain1 anchors)
+  ;; the insert check runs one extra iteration with cs empty, so a chain whose
+  ;; insert index equals (length cont) — after the outermost frame — lands
+  ;; instead of vanishing.
+  (let build ((i 0) (cs cont) (acc '()))
+    (let* ((before (cond ((fx=? i i1) chain1)
+                         ((assv i anchors) => cdr)
+                         (else '())))
+           (acc (append (reverse before) acc)))
+      (if (null? cs)
+          (reverse acc)
+          (build (fx+ i 1) (cdr cs) (cons (car cs) acc))))))
 
 ;; Multi-line backtrace for an uncaught value, built from the CONTINUATION with
-;; the ring consulted only for frames TCO erased:
-;;   1. The ring's innermost rib (jolt-trace-innermost-rib) — the tail chain
-;;      between the throw and the deepest live frame. Only entries absent from
-;;      the continuation are spliced in, so a returned call's residue (a rib the
-;;      ring has advanced past, or a live frame's duplicate) cannot appear.
-;;   2. The live continuation (jolt-frame-records) — the exact non-tail spine,
+;; the tail-site marks consulted only for frames TCO erased:
+;;   1. The innermost frame from the vreg site (jolt-throw-site), when it survives
+;;      the anti-dup belt (not in the continuation, and not the chain's deepest
+;;      entry — R1 addendum).
+;;   2. The innermost live rib (continuation-marks-first of the marks captured at
+;;      the throw) — the tail chain between the throw and the deepest live frame.
+;;      Only entries absent from the continuation are spliced in, so a dead frame's
+;;      residue cannot appear.
+;;   3. The live continuation (jolt-frame-records) — the exact non-tail spine,
 ;;      each frame at the line of the call that created it.
 ;; No continuation (a host condition raised outside jolt-throw): fall back to the
-;; whole history as before, since there is no exact source to prefer. #f when
+;; whole marked chain as before, since there is no exact source to prefer. #f when
 ;; neither source yields a frame (the caller then prints just the location).
 (define (jolt-backtrace-string v)
   (let ((k (jolt-error-continuation v)))
@@ -521,8 +663,24 @@
                                          (hashtable-set! h (srcreg-frame-nm f) #t))
                                        cont)
                              h))
-               (recs (append (jolt-ring-tail-frames (jolt-trace-innermost-rib) cont-names)
-                             cont)))
+               (marks (jolt-throw-marks))
+               (ribs (let ((rs (if marks (continuation-marks->list marks jolt-trace-key) '())))
+                       (filter (lambda (r) (and (vector? r) (fx>? (vector-ref r 0) 0))) rs)))
+               (site (jolt-throw-site))
+               (recs (if (null? ribs)
+                         (if (jolt-site-splice? site cont-names '() cont)
+                             (cons (jolt-site-frame site) cont)
+                             cont)
+                         (let* ((chain (jolt-marks-tail-frames (car ribs) cont-names))
+                                (i1 (call-with-values
+                                     (lambda () (jolt-splice-chain chain cont cont-names))
+                                     (lambda (body i) i)))
+                                (anchors (jolt-anchor-outer-ribs (cdr ribs) cont i1 cont-names))
+                                (body (jolt-assemble-trace cont i1 chain anchors))
+                                (recs (if (jolt-site-splice? site cont-names chain cont)
+                                          (cons (jolt-site-frame site) body)
+                                          body)))
+                           recs))))
           (and (pair? recs) (jolt-render-recs recs))))))
 
 ;; Exposed for the REPL / nREPL error paths, which catch errors themselves instead

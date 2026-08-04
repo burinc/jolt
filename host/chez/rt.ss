@@ -190,84 +190,61 @@
 ;; stack trace (source-registry.ss). call/cc is paid only on a throw, never per
 ;; call; the captured k is walked, never invoked.
 (define jolt-throw-cont (make-thread-parameter #f))
+;; The continuation marks (incl. the tail-site rib chain) captured at the same
+;; throw, cleared together with the continuation. Read by source-registry.ss.
+(define jolt-throw-marks (make-thread-parameter #f))
+;; The site vreg's ('ns/fn' . line) pair as it stood AT the raise (R2, bead
+;; jolt-knn8). Only tail sites write the vreg now, so its live value can be a
+;; returned chain's residue — the reporter must see the throw-time snapshot,
+;; validated against the callsite table, never the live slot.
+(define jolt-throw-sitep (make-thread-parameter #f))
 
 ;; Cleared after a catch handler completes normally so the parked continuation
 ;; (and its captured frames) does not root live data until the next throw.
-(define (jolt-catch-complete!) (jolt-throw-cont #f))
+(define (jolt-catch-complete!)
+  (jolt-throw-cont #f) (jolt-throw-marks #f) (jolt-throw-sitep #f))
 
-;; --- tail-frame history: a ring of rings (opt-in) ----------------------------
+;; --- tail-frame marks: TCO-erased frames via continuation marks (opt-in) -----
 ;; TCO erases tail-called frames from the native continuation, so an uncaught
 ;; error's backtrace shows only the surviving non-tail spine — the immediate error
 ;; site is often a tail call and is missing. When tracing is enabled (JOLT_TRACE,
-;; wired in compile-eval.ss), each compiled fn records its frame-name on entry, and
-;; the reporter reads this history to recover TCO-elided frames.
-;;
-;; The store is MIT-Scheme's "history" shape — a ring of rings. The OUTER ring
-;; holds one RIB per non-tail subproblem (the real call spine); each rib's INNER
-;; ring holds the recent tail-calls made AT that subproblem. A non-tail entry
-;; advances the outer ring (a fresh rib); a tail entry rotates the current rib's
-;; inner ring. So a tight tail loop (mutual recursion, a non-recur self-tail-call)
-;; churns ONE rib's small inner ring instead of flushing the outer spine — the
-;; caller context that led into the loop survives. Both rings are fixed-size, so
-;; the whole history is bounded: a constant space factor, NOT a change to the
-;; asymptotic space TCO guarantees.
-;;
-;; Whether an entry is tail or non-tail is set by the CALLER: the emitter marks a
-;; tail call with (jolt-trace-mark! #t) right before it; a non-tail entry is the
-;; default. NOTE this is best-effort: a tail call routed through jolt-invoke to a
-;; target that has no entry prologue (a core/native fn, an anonymous fn held in a
-;; var) does not consume the mark, so a following non-tail frame can be mislabeled
-;; as a tail rotation — a cosmetic mis-grouping in the trace, never a wrong result.
-;; Both sizes are POWERS OF TWO so every ring wrap is an fxand against size-1. They
-;; are on the per-call path (two wraps per push), where fxmod against 48/6 compiled
-;; to real division and cost more than the rest of the push put together.
-(define jolt-trace-outer-size 64)          ; ribs (non-tail spine depth kept)
-(define jolt-trace-outer-mask 63)
-(define jolt-trace-inner-size 8)           ; tail-calls kept per subproblem
-(define jolt-trace-inner-mask 7)
-;; A history: #(ribs-vector outer-head outer-count).
-;; A rib: #(name-vector line-vector head count) — names and CALL-SITE LINES in
-;; parallel vectors rather than a pair per entry, so a push allocates nothing.
-;;
-;; The line stored with an entry is the line the CALLER was on when it made this
-;; call, not a line inside the entry's own function: the emitter sets the current
-;; line before each call, and the callee's prologue reads it on the way in. Which
-;; means a frame's OWN line is the line recorded by the frame one level deeper
-;; (and, for the innermost frame, the current line at the throw). That shift is
-;; where a per-frame line comes from at all — a function has one definition
-;; position but is at a different line at each call it makes, and the JVM's
-;; per-frame line is the latter.
-(define (jolt-make-rib)
-  (vector (make-vector jolt-trace-inner-size #f)
-          (make-vector jolt-trace-inner-size 0)
-          0 0))
-(define (jolt-make-history)
-  (let ((ribs (make-vector jolt-trace-outer-size #f)))
-    (let loop ((i 0))
-      (when (fx<? i jolt-trace-outer-size)
-        (vector-set! ribs i (jolt-make-rib)) (loop (fx+ i 1))))
-    (vector ribs 0 0)))
-;; A global switch (all threads) plus a per-thread ring, lazily created on first
-;; use — so code run on a spawned thread (a future/agent) records into ITS OWN
-;; history rather than racing the enabling thread's. A new thread inherits no ring
-;; either way, so the lazy create is what gives it one.
+;; wired in compile-eval.ss), the emitter instruments TAIL CALL SITES ONLY —
+;; nothing in a fn prologue, no per-entry work at all: a site reads the current
+;; frame's continuation mark (call-with-immediate-continuation-mark), mutates the
+;; shared rib in place when the caller chain is live, or starts a fresh rib with a
+;; static ('ns/fn' . line) site literal (with-continuation-mark). The mark lives on
+;; the Chez continuation (Flatt/Dybvig PLDI 2020) and dies with its frame, so a
+;; returned call leaves nothing behind: staleness is impossible by construction,
+;; and the ring-of-ribs machinery this replaced is gone (R1, bead jolt-pfhc).
+(define jolt-trace-key '|jolt%trace|)
+;; A rib: #(count buf) — buf holds 8 site literals, count is MONOTONIC (entries
+;; live at (fxand i 7); total-count - 8 = elided when > 8). A site is a static pair
+;; '("ns/fn" . line) baked in the emitted code — no registry, no id coordination,
+;; allocated once at compile.
+(define (jolt-trace-rib site)
+  (let ((b (make-vector 8 #f)))
+    (vector-set! b 0 site)
+    (vector 1 b)))
+(define (jolt-trace-rib-site! rib site)
+  (let ((h (vector-ref rib 0)) (b (vector-ref rib 1)))
+    (vector-set! b (fxand h 7) site)
+    (vector-set! rib 0 (fx+ h 1))))
 (define jolt-trace-on? #f)
-;; Per-thread trace state lives in Chez VIRTUAL REGISTERS, not thread parameters.
-;; This is a hot path — the emitter puts a push in every compiled fn's prologue and
-;; a mark before every tail call — and a thread-parameter WRITE costs ~32ns against
-;; ~1ns for a virtual-register write (measured, Chez 10.4 arm64). The two writes per
-;; call that shape implies were ~70% of the whole tracing overhead, which is what
-;; kept tracing opt-in. Reads are ~2.4ns vs ~3.3ns, a smaller but free win.
+;; Per-thread trace state lives in Chez VIRTUAL REGISTERS, not thread parameters:
+;; a thread-parameter WRITE costs ~32ns against ~1ns for a virtual-register write
+;; (measured, Chez 10.4 arm64), and jolt-site! sits on the hot path. Reads are
+;; ~2.4ns vs ~3.3ns, a smaller but free win.
 ;;
 ;; Virtual registers are a fixed global resource: (virtual-register-count) slots for
-;; the whole process (16 on every platform jolt targets). jolt claims five, allocated
+;; the whole process (16 on every platform jolt targets). jolt claims three, allocated
 ;; here so the assignment is in one place; nothing else in the runtime uses them.
-;; A freshly forked thread starts every slot at fixnum 0, NOT #f — so "no ring yet"
-;; is tested with vector?, never with a truthiness check, and line 0 means "unknown".
-(define jolt-vreg-trace-ring 0)
-(define jolt-vreg-trace-tail 1)
-(define jolt-vreg-line 2)        ; line currently executing in traced code
-(define jolt-vreg-catch-line 3)  ; line at the throw a catch clause is handling
+;; A freshly forked thread starts every slot at fixnum 0, NOT #f, so "unset" means
+;; fixnum 0 (the site slots hold a site pair or 0). Slots 0 and 1 are FREE since
+;; R3 (jolt-230w) removed the R1 ring/mark vregs — the tail marks live on the
+;; continuation, not in a vreg — so new virtual-register users should claim them
+;; before renumbering anything. The surviving slots keep their R2 numbers.
+(define jolt-vreg-site 2)        ; ('ns/fn' . line) of the innermost live call site
+(define jolt-vreg-catch-line 3)  ; the site at the throw a catch clause is handling
 (define jolt-vreg-print-readably 4)  ; the print family's *print-readably* override; 0 = unset
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
@@ -291,146 +268,74 @@
             (set! pr-readably-cell (jolt-var "clojure.core" "*print-readably*")))
           (jolt-truthy? (jolt-var-get pr-readably-cell)))
         (jolt-truthy? o))))
-(define (jolt-trace-ring) (let ((h (virtual-register jolt-vreg-trace-ring))) (and (vector? h) h)))
-(define (jolt-trace-ring-set! h) (set-virtual-register! jolt-vreg-trace-ring h))
-(define (jolt-trace-tail?) (eq? (virtual-register jolt-vreg-trace-tail) #t))
-(define (jolt-trace-enable!) (set! jolt-trace-on? #t) (jolt-trace-ring-set! (jolt-make-history)))
-;; this thread's ring, created on demand while tracing is on
-(define (jolt-trace-cur-ring)
-  (or (jolt-trace-ring)
-      (and jolt-trace-on? (let ((h (jolt-make-history))) (jolt-trace-ring-set! h) h))))
-;; Drop accumulated history at a top-level boundary (compile-eval.ss calls this per
-;; top-level form) so an error's trace shows only the forms that led to it, not the
-;; frames of earlier, already-returned REPL/eval forms.
-;; Clears IN PLACE — emptying the outer ring is enough, because a rib is reset by
-;; jolt-history-nontail! before it is written and the reader only walks the live
-;; outer count. Reallocating instead would build 64 ribs on every top-level form,
-;; which is every def in every namespace a run loads.
-(define (jolt-trace-reset!)
-  (let ((h (jolt-trace-ring)))
-    (when h
-      (vector-set! h 1 0)
-      (vector-set! h 2 0)
-      (set-virtual-register! jolt-vreg-trace-tail #f))))
-(define (jolt-trace-mark! t) (set-virtual-register! jolt-vreg-trace-tail t))
+(define (jolt-trace-enable!) (set! jolt-trace-on? #t))
 
-;; The emitter calls this before every call it compiles, with that call's source
-;; line. One virtual-register store, ~1ns — the cheapest thing that can answer
-;; "which line are we on" without a per-expression allocation or a stack discipline
-;; that tail calls would break.
-(define (jolt-line! n) (set-virtual-register! jolt-vreg-line n))
+;; TAIL call emissions store their static ('ns/fn' . line) pair here right
+;; before the call (sited-tail-call / the :throw case). Since R2 (bead
+;; jolt-knn8) NOTHING else writes it — non-tail code carries no per-call
+;; instrumentation — so the live slot can hold a returned chain's residue.
+;; Consumers therefore read the THROW-TIME snapshot (jolt-throw-sitep), and the
+;; reporter validates it against the callsite table before splicing.
+(define (jolt-site! p) (set-virtual-register! jolt-vreg-site p))
 ;; The line to report for the INNERMOST frame. Inside a catch clause that is the
-;; line the throw came from, captured on the way in — by the time the handler runs,
-;; the handler's own calls have long since moved the current line. 0 means unknown.
+;; line the throw came from, snapshotted on the way in; else the pair stashed at
+;; the raise. Never the live vreg — it can be stale between throws.
 (define (jolt-throw-line)
   (let ((c (virtual-register jolt-vreg-catch-line)))
-    (if (and (fixnum? c) (fx>? c 0))
+    (if (pair? c)
+        (let ((l (cdr c))) (and (fixnum? l) (fx>? l 0) l))
+        (let ((s (jolt-throw-sitep)))
+          (if (pair? s)
+              (let ((l (cdr s))) (and (fixnum? l) (fx>? l 0) l))
+              #f)))))
+;; The site pair ('ns/fn' . line) of the innermost call at the throw — the
+;; catch-line snapshot when a handler is running, else the raise-time stash.
+;; #f when unset. The reporter must validate this against the callsite table
+;; (jolt-callsite-callee) before trusting the name.
+(define (jolt-throw-site)
+  (let ((c (virtual-register jolt-vreg-catch-line)))
+    (if (pair? c)
         c
-        (let ((l (virtual-register jolt-vreg-line)))
-          (and (fixnum? l) (fx>? l 0) l)))))
-;; Emitted around a catch clause's body: snapshot the throwing line and return the
+        (let ((s (jolt-throw-sitep)))
+          (and (pair? s) s)))))
+;; Emitted around a catch clause's body: snapshot the throwing site and return the
 ;; previous snapshot, which the paired leave restores. Save/restore rather than a
-;; bare set so a nested catch cannot leave an inner throw's line behind for an
-;; outer handler that runs afterwards.
+;; bare set so a nested catch cannot leave an inner throw's site behind for an
+;; outer handler that runs afterwards. Reads the raise-time stash, not the live
+;; vreg — by handler time the handler's context is what the vreg describes.
 (define (jolt-catch-enter!)
   (let ((prev (virtual-register jolt-vreg-catch-line))
-        (cur (virtual-register jolt-vreg-line)))
-    (set-virtual-register! jolt-vreg-catch-line (if (fixnum? cur) cur 0))
+        (cur (jolt-throw-sitep)))
+    (set-virtual-register! jolt-vreg-catch-line (if (pair? cur) cur 0))
     prev))
-(define (jolt-catch-leave! prev)
-  (set-virtual-register! jolt-vreg-catch-line (if (fixnum? prev) prev 0)))
 
-;; push name + the caller's current line into a rib's inner ring
-(define (jolt-rib-push! rib name line)
-  (let ((buf (vector-ref rib 0)) (lbuf (vector-ref rib 1))
-        (i (vector-ref rib 2)) (cnt (vector-ref rib 3)))
-    (vector-set! buf i name)
-    (vector-set! lbuf i line)
-    (vector-set! rib 2 (fxand (fx+ i 1) jolt-trace-inner-mask))
-    (when (fx<? cnt jolt-trace-inner-size) (vector-set! rib 3 (fx+ cnt 1)))))
-;; a non-tail entry: advance the outer ring, reset the new rib, seed it with name
-(define (jolt-history-nontail! h name line)
-  (let* ((ribs (vector-ref h 0)) (oh (vector-ref h 1)) (oc (vector-ref h 2))
-         (rib (vector-ref ribs oh)))
-    (vector-set! rib 2 0) (vector-set! rib 3 0)
-    (jolt-rib-push! rib name line)
-    (vector-set! h 1 (fxand (fx+ oh 1) jolt-trace-outer-mask))
-    (when (fx<? oc jolt-trace-outer-size) (vector-set! h 2 (fx+ oc 1)))))
-;; a tail entry: rotate the CURRENT rib's inner ring (bootstrap a rib if none yet)
-(define (jolt-history-tail! h name line)
-  (if (fx=? (vector-ref h 2) 0)
-      (jolt-history-nontail! h name line)
-      (let* ((ribs (vector-ref h 0))
-             (cur (fxand (fx+ (fx- (vector-ref h 1) 1) jolt-trace-outer-size)
-                         jolt-trace-outer-mask)))
-        (jolt-rib-push! (vector-ref ribs cur) name line))))
-;; --- no per-call ring restore (trace-r4) -----------------------------------
-;; The outer head only advances on entry. The reporter reads the non-tail spine
-;; off the LIVE CONTINUATION (source-registry.ss jolt-backtrace-string) and
-;; consults the ring only for TCO-erased frames, from the CURRENT (innermost)
-;; rib — the rib the deepest live subproblem is rotating. Returned subproblems'
-;; ribs sit strictly behind the head and are never read; they are cleared by
-;; jolt-trace-reset! at each top-level boundary. R3 paired a save/restore
-;; (jolt-trace-save / jolt-trace-unwind!) around every non-tail call to keep
-;; the whole history exact for the ring-as-spine reader; trace-r4 deleted that
-;; emission — the continuation is the exact spine now, so the pair paid a call
-;; per call site for a read nobody does. The rib advance itself is KEPT: the
-;; current-rib bound's safety argument ("a returned call's rib is never the
-;; current rib") depends on non-tail entries advancing the outer head.
-
-;; Record a frame entry, routed by the caller's tail mark; then reset the mark so a
-;; subsequent entry reached WITHOUT a mark (e.g. via apply) defaults to non-tail.
-;; The line read here is the CALLER's — the emitter set it immediately before the
-;; call — so it belongs to the frame one level out. jolt-trace-snapshot hands the
-;; pairs to the reporter in that form and the reporter does the shift.
-(define (jolt-trace-push! name)
-  (let ((h (jolt-trace-cur-ring)))
-    (when h
-      (let ((line (let ((l (virtual-register jolt-vreg-line)))
-                    (if (fixnum? l) l 0))))
-        (if (jolt-trace-tail?)
-            (jolt-history-tail! h name line)
-            (jolt-history-nontail! h name line)))
-      (set-virtual-register! jolt-vreg-trace-tail #f)))
+;; --- compile-time callsite table (R2, bead jolt-knn8) ------------------------
+;; (jolt-register-callsite! "ns/f" line "ns/callee"): the emitter registers, at
+;; def load time, the STATIC callee of each call site in a traced fn. Costs
+;; nothing per call — it is the metadata that lets the reporter reject a stale
+;; site pair: a pair is spliced as the innermost frame only when the callsite
+;; table agrees that the innermost live context actually called that fn.
+;; A line can carry several calls (an operand and its outer call share it), so
+;; each key maps to a LIST of distinct callees and validation is membership.
+(define jolt-callsite-table (make-hashtable string-hash string=?))
+(define (jolt-callsite-key fqn line)
+  (string-append fqn ":" (number->string line)))
+(define (jolt-register-callsite! fqn line callee)
+  (let* ((k (jolt-callsite-key fqn line))
+         (cur (hashtable-ref jolt-callsite-table k '())))
+    (unless (member callee cur)
+      (hashtable-set! jolt-callsite-table k (cons callee cur))))
   jolt-nil)
+;; The registered static callees at (fqn, line) as a non-empty list, or #f
+;; (unknown / dynamic site — nothing was registered).
+(define (jolt-callsite-callees fqn line)
+  (and (string? fqn) (fixnum? line)
+       (let ((v (hashtable-ref jolt-callsite-table (jolt-callsite-key fqn line) '())))
+         (and (pair? v) v))))
+(define (jolt-catch-leave! prev)
+  (set-virtual-register! jolt-vreg-catch-line (if (pair? prev) prev 0)))
 
-;; a rib's inner entries as (name . call-site-line), most-recent (deepest) tail first
-(define (jolt-rib-names rib)
-  (let ((buf (vector-ref rib 0)) (lbuf (vector-ref rib 1))
-        (head (vector-ref rib 2)) (cnt (vector-ref rib 3)))
-    (let loop ((k 1) (acc '()))
-      (if (fx>? k cnt)
-          (reverse acc)
-          (let ((i (fxand (fx+ (fx- head k) jolt-trace-inner-size) jolt-trace-inner-mask)))
-            (loop (fx+ k 1)
-                  (cons (cons (vector-ref buf i) (vector-ref lbuf i)) acc)))))))
-;; The whole history flattened to (name . call-site-line), most-recent (deepest)
-;; first: current rib's tail-history, then its non-tail caller's, and so on outward.
-(define (jolt-trace-snapshot)
-  (let ((h (jolt-trace-ring)))
-    (if (not h) '()
-        (let* ((ribs (vector-ref h 0)) (oh (vector-ref h 1)) (oc (vector-ref h 2)))
-          (let loop ((k 1) (acc '()))
-            (if (fx>? k oc)
-                (apply append (reverse acc))
-                (let ((idx (fxand (fx+ (fx- oh k) jolt-trace-outer-size) jolt-trace-outer-mask)))
-                  (loop (fx+ k 1) (cons (jolt-rib-names (vector-ref ribs idx)) acc)))))))))
-;; The innermost (current) rib's entries as (name . call-site-line), most-recent
-;; (deepest) first, or '() when tracing is off / the ring is empty. This is the
-;; tail chain between the throw and the deepest live frame — the ONLY part of the
-;; history a backtrace may trust. The outer head advances only on entry, so a
-;; returned call's rib is by construction no longer current: by the time a later
-;; call pushes, the ring has advanced past it and its frames sit in a deeper rib
-;; that the reporter never reads. See jolt-backtrace-string in source-registry.ss.
-(define (jolt-trace-innermost-rib)
-  (let ((h (jolt-trace-ring)))
-    (if (not h) '()
-        (let ((oh (vector-ref h 1)) (oc (vector-ref h 2)))
-          (if (fx=? oc 0)
-              '()
-              (jolt-rib-names (vector-ref (vector-ref h 0)
-                                          (fxand (fx+ (fx- oh 1) jolt-trace-outer-size)
-                                                 jolt-trace-outer-mask))))))))
+
 
 (define-condition-type &jolt-throw &condition
   make-jolt-throw-condition jolt-throw-condition?
@@ -445,8 +350,26 @@
 (define (jolt-throw v)
   (call/cc (lambda (k)
              (jolt-throw-cont (cons v k))
+             (jolt-throw-marks (current-continuation-marks))
+             (jolt-throw-sitep (let ((s (virtual-register jolt-vreg-site)))
+                                 (and (pair? s) s)))
              (raise (condition (make-message-condition (jolt-throw-message v))
                                (make-jolt-throw-condition v))))))
+;; The same capture for a HOST condition (a fault raised outside jolt-throw:
+;; car of a non-pair, a bad flvector index). Installed by the cli's run wrapper
+;; via with-exception-handler, which runs BEFORE the stack unwinds — a guard's
+;; handler runs after, when the frames are already gone. Identity-tagged with
+;; the condition itself, which is what jolt-unwrap-throw hands the reporter for
+;; a non-&jolt-throw raise. jolt throws skip this (they captured already, with
+;; the RIGHT identity — overwriting would orphan their k).
+(define (jolt-capture-fault! c)
+  (unless (jolt-throw-condition? c)
+    (call/cc (lambda (k)
+               (jolt-throw-cont (cons c k))
+               (jolt-throw-marks (current-continuation-marks))
+               (jolt-throw-sitep (let ((s (virtual-register jolt-vreg-site)))
+                                   (and (pair? s) s)))
+               #f))))
 (define (jolt-unwrap-throw x)
   (if (jolt-throw-condition? x) (jolt-throw-condition-value x) x))
 ;; ex-info builds a jolt-ex-info-record (NOT a pmap — pmap?/coll?/seqable?/ifn?

@@ -243,7 +243,17 @@
 
 (define (jolt-cli-run cli-args prepare-build!)
   (guard (v (#t (jolt-report-uncaught v)))
-    (jolt-cli-dispatch cli-args prepare-build!)
+    ;; Host faults (a condition raised outside jolt-throw) get their k / marks /
+    ;; site captured HERE: a with-exception-handler runs before the stack
+    ;; unwinds, where the frames still exist — the guard above runs after, when
+    ;; they are gone. jolt throws skip the capture (jolt-capture-fault! tests),
+    ;; warnings pass through untouched, and raise-continuable preserves a
+    ;; continuable raise's resume semantics.
+    (with-exception-handler
+      (lambda (c)
+        (when (serious-condition? c) (jolt-capture-fault! c))
+        (raise-continuable c))
+      (lambda () (jolt-cli-dispatch cli-args prepare-build!)))
     ;; normal-return twin of the exit-handler flush above
     (guard (_ (#t #f)) (flush-output-port (current-output-port)))))
 

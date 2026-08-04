@@ -135,6 +135,110 @@ expect_match "its caller is next" "$out_stale" 'app\.stale/caller (.*src/app/sta
 expect_match "and -main survives the noisy call" "$out_stale" 'app\.stale/-main (.*src/app/stale\.clj:7)'
 expect_no_match "no frames from the call that already returned" "$out_stale" 'app\.stale/noise'
 
+# R1 (bead jolt-pfhc): the ring's rib-advance-on-entry invariant kept a returned
+# call's rib behind the outer head, so NO fixture could gate a tail-recursive call
+# that RETURNS before a later throw — app.stale's recursion is non-tail, it never
+# enters a rib at all. Continuation marks die with their frame, so staleness is
+# structural now: ping/pong mutually tail-recurse to completion (NOT self-calls —
+# those are elided), then -main calls a thrower. The trace must NOT resurrect
+# ping/pong and MUST name the thrower.
+cat > "$work/src/app/tailstale.clj" <<'EOF'
+(ns app.tailstale)
+(declare pong)
+(defn ping [n]
+  (if (zero? n) :done (pong (dec n))))
+(defn pong [n]
+  (if (zero? n) :done (ping (dec n))))
+(defn thrower [] (throw (ex-info "stalestale" {:a 1})))
+(defn -main [& _]
+  (println "ping" (ping 5))
+  (thrower))
+EOF
+echo "trace smoke: a returned mutual-tail recursion leaves no frames behind"
+out_ts="$(run_app app.tailstale)"
+expect_match "mutual-tail: the thrower is named" "$out_ts" 'app\.tailstale/thrower'
+expect_no_match "mutual-tail: ping left the trace" "$out_ts" 'app\.tailstale/ping'
+expect_no_match "mutual-tail: pong left the trace" "$out_ts" 'app\.tailstale/pong'
+# the positive dual: a NON-TAIL entry into a mutual tail chain that throws mid-
+# chain — the hops between the entry and the throw must appear, with their lines.
+cat > "$work/src/app/tailchain.clj" <<'EOF'
+(ns app.tailchain)
+(declare q)
+(defn p [n]
+  (if (zero? n) (throw (ex-info "chain" {:n n})) (q (dec n))))
+(defn q [n]
+  (if (zero? n) (throw (ex-info "chain" {:n n})) (p (dec n))))
+(defn -main [& _]
+  (println "chain" (p 3)))
+EOF
+echo "trace smoke: a live mutual tail chain reports its hops"
+out_tc="$(run_app app.tailchain)"
+expect_match "mutual-chain: p named" "$out_tc" 'app\.tailchain/p'
+expect_match "mutual-chain: p at its own call line" "$out_tc" 'app\.tailchain/p (.*src/app/tailchain\.clj:4)'
+expect_match "mutual-chain: q named" "$out_tc" 'app\.tailchain/q'
+expect_match "mutual-chain: q at its own call line" "$out_tc" 'app\.tailchain/q (.*src/app/tailchain\.clj:6)'
+expect_no_match "mutual-chain: no defn lines" "$out_tc" 'tailchain\.clj:[35])'
+
+# R2 (bead jolt-knn8): only tail sites write the site vreg, so a pair can
+# outlive its chain: g ends in a native-op tail call, returns normally, then a
+# DIFFERENT fn throws from a non-tail position. Nothing refreshes the vreg in
+# between, so the raise-time stash is g's stale pair — the callsite-table
+# validator must reject it (the innermost context's static callee is h, not g).
+# Without the validator this trace grows a phantom "g" frame.
+cat > "$work/src/app/sitestale.clj" <<'EOF'
+(ns app.sitestale)
+(defn g [x]
+  (+ x 1))
+(defn h []
+  (let [x (throw (ex-info "late" {:x 1}))]
+    x))
+(defn -main [& _]
+  (println "g" (g 41))
+  (h))
+EOF
+echo "trace smoke: a returned native tail site cannot haunt a later throw"
+out_ss="$(run_app app.sitestale)"
+expect_match "sitestale: the thrower is named at its line" "$out_ss" 'app\.sitestale/h (.*src/app/sitestale\.clj:5)'
+expect_no_match "sitestale: the returned fn's site is rejected" "$out_ss" 'app\.sitestale/g'
+
+# R2: a HOST fault (no jolt-throw anywhere — a bad primitive-array index) is
+# captured by the cli's with-exception-handler while the frames are live, so
+# the trace still names the fn and its exact line.
+cat > "$work/src/app/hostfault.clj" <<'EOF'
+(ns app.hostfault)
+(defn kaboom [n]
+  (aget (double-array 3) n))
+(defn -main [& _]
+  (println "before")
+  (println (kaboom 10)))
+EOF
+echo "trace smoke: a host fault still maps fn and line"
+out_hf="$(run_app app.hostfault)"
+expect_match "hostfault: the faulting fn is named at its line" "$out_hf" 'app\.hostfault/kaboom (.*src/app/hostfault\.clj:3)'
+expect_match "hostfault: the caller is present" "$out_hf" 'app\.hostfault/-main'
+
+# R3 (bead jolt-230w): a chain at EVERY spine level, not just the innermost.
+# dive tail-calls mid (rib on -main's callee frame), mid calls hop non-tail
+# (new frame), hop tail-calls thrower (inner rib), thrower throws tail (site
+# pair). Before R3 the outer rib was invisible: dive was simply missing.
+cat > "$work/src/app/twolevel.clj" <<'EOF'
+(ns app.twolevel)
+(defn thrower [n] (throw (ex-info "deep" {:n n})))
+(defn hop [n] (thrower n))
+(defn mid [n] (+ 1 (hop n)))
+(defn dive [n] (mid n))
+(defn -main [& _] (println (dive 3)))
+EOF
+echo "trace smoke: chains recover at every spine level"
+out_tl="$(run_app app.twolevel)"
+expect_match "twolevel: thrower at its line" "$out_tl" 'app\.twolevel/thrower (.*src/app/twolevel\.clj:2)'
+expect_match "twolevel: hop at its tail-call line" "$out_tl" 'app\.twolevel/hop (.*src/app/twolevel\.clj:3)'
+expect_match "twolevel: mid at its call line" "$out_tl" 'app\.twolevel/mid (.*src/app/twolevel\.clj:4)'
+expect_match "twolevel: dive recovered from the OUTER rib" "$out_tl" 'app\.twolevel/dive (.*src/app/twolevel\.clj:5)'
+expect_match "twolevel: -main at its call line" "$out_tl" 'app\.twolevel/-main (.*src/app/twolevel\.clj:6)'
+flat_tl="$(printf '%s' "$out_tl" | tr '\n' ' ')"
+expect_match "twolevel: frames in stack order" "$flat_tl" 'thrower .*twolevel/hop .*twolevel/mid .*twolevel/dive .*twolevel/-main'
+
 echo "trace smoke: JOLT_TRACE=0 opts out"
 out_off="$(run_app app.tail JOLT_TRACE=0)"
 expect_match "still reports the message" "$out_off" 'Unhandled exception: Divide by zero'
@@ -208,6 +312,21 @@ expect_match "constructed exception prints class and message" "$pst" 'java\.lang
 expect_match "1-arg overload writes to the given writer" "$pst" 'WRITER-OK'
 expect_match "getLocalizedMessage/getSuppressed/fillInStackTrace" "$pst" 'SURFACE Divide by zero 0 true'
 expect_match "execution continued past every catch" "$pst" 'DONE'
+
+# Built binaries trace by default (0.6.2): jolt build bakes the tail-site
+# instrumentation in, so a deployed binary's uncaught error still names the
+# TCO-erased frame with its exact line — no marker files needed, the site
+# literals carry the lines. JOLT_TRACE=0 at BUILD time opts the binary out.
+echo "trace smoke: a built binary traces by default"
+( cd "$work" && "$joltabs" build -m app.tail -o tailbin >/dev/null 2>&1 )
+out_bt="$("$work/tailbin" 2>&1)"
+expect_match "built: the tail-erased thrower is named at its line" "$out_bt" 'app\.tail/boom (.*src/app/tail\.clj:4)'
+expect_match "built: its caller is present" "$out_bt" 'app\.tail/-main'
+echo "trace smoke: JOLT_TRACE=0 at build time opts the binary out"
+( cd "$work" && env JOLT_TRACE=0 "$joltabs" build -m app.tail -o tailbin0 >/dev/null 2>&1 )
+out_bt0="$("$work/tailbin0" 2>&1)"
+expect_match "untraced build: still reports the message" "$out_bt0" 'Unhandled exception: Divide by zero'
+expect_no_match "untraced build: no baked trace frames" "$out_bt0" 'app\.tail/boom (.*:4)'
 
 if [ "$fails" -gt 0 ]; then
   echo "trace smoke: $fails failed, $pass passed"
