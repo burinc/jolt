@@ -313,6 +313,21 @@ expect_match "1-arg overload writes to the given writer" "$pst" 'WRITER-OK'
 expect_match "getLocalizedMessage/getSuppressed/fillInStackTrace" "$pst" 'SURFACE Divide by zero 0 true'
 expect_match "execution continued past every catch" "$pst" 'DONE'
 
+# Built binaries trace by default (0.6.2): jolt build bakes the tail-site
+# instrumentation in, so a deployed binary's uncaught error still names the
+# TCO-erased frame with its exact line — no marker files needed, the site
+# literals carry the lines. JOLT_TRACE=0 at BUILD time opts the binary out.
+echo "trace smoke: a built binary traces by default"
+( cd "$work" && "$joltabs" build -m app.tail -o tailbin >/dev/null 2>&1 )
+out_bt="$("$work/tailbin" 2>&1)"
+expect_match "built: the tail-erased thrower is named at its line" "$out_bt" 'app\.tail/boom (.*src/app/tail\.clj:4)'
+expect_match "built: its caller is present" "$out_bt" 'app\.tail/-main'
+echo "trace smoke: JOLT_TRACE=0 at build time opts the binary out"
+( cd "$work" && env JOLT_TRACE=0 "$joltabs" build -m app.tail -o tailbin0 >/dev/null 2>&1 )
+out_bt0="$("$work/tailbin0" 2>&1)"
+expect_match "untraced build: still reports the message" "$out_bt0" 'Unhandled exception: Divide by zero'
+expect_no_match "untraced build: no baked trace frames" "$out_bt0" 'app\.tail/boom (.*:4)'
+
 if [ "$fails" -gt 0 ]; then
   echo "trace smoke: $fails failed, $pass passed"
   exit 1

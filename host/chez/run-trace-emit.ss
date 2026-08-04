@@ -183,8 +183,11 @@
 (let ((e (emit-num sited-src)))
   (gate-check "(10b) native tail site stores the pair" (gate-sub? e "(jolt-site! '(") #t)
   (gate-check "(10b) exactly one site store" (= (count-sub? e "(jolt-site! ") 1) #t)
+  ;; this harness emits with source registration OFF, so the callee registers
+  ;; under its bare munged name (the direct-link-build form); with it on (dev,
+  ;; open-world build) the same site registers "clojure.core/+".
   (gate-check "(10b) callsite registered with its static callee"
-              (gate-sub? e "(jolt-register-callsite! \"sdemo\" 2 \"clojure.core/+\")") #t))
+              (gate-sub? e "(jolt-register-callsite! \"sdemo\" 2 \"+\")") #t))
 (set-trace-frames! #f)
 (let ((e (emit-num sited-src)))
   (gate-check "(10b) tracing off: no site store" (gate-sub? e "(jolt-site! ") #f)

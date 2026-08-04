@@ -259,7 +259,14 @@
 ;; :coll / computed callees — nil.
 (defn- static-callee [fnode]
   (case (:op fnode)
-    :var (dl-fqn (:ns fnode) (:name fnode))
+    ;; The registered name must be the SAME form the callee's own *trace-site*
+    ;; uses, or the validator false-rejects every genuine pair: qualified
+    ;; "(munged ns)/(munged name)" when source registration is on (dev, the
+    ;; open-world build), the bare munged short name in a direct-link build
+    ;; (qualifying is off there and sites record short names).
+    :var (if (source-reg?)
+           (str (munge-name (:ns fnode)) "/" (munge-name (:name fnode)))
+           (munge-name (:name fnode)))
     :local (let [nm (munge-name (:name fnode))]
              (when (contains? *known-procs* nm)
                (if (contains? *trace-self* nm)
