@@ -179,6 +179,44 @@ expect_match "mutual-chain: q named" "$out_tc" 'app\.tailchain/q'
 expect_match "mutual-chain: q at its own call line" "$out_tc" 'app\.tailchain/q (.*src/app/tailchain\.clj:6)'
 expect_no_match "mutual-chain: no defn lines" "$out_tc" 'tailchain\.clj:[35])'
 
+# R2 (bead jolt-knn8): only tail sites write the site vreg, so a pair can
+# outlive its chain: g ends in a native-op tail call, returns normally, then a
+# DIFFERENT fn throws from a non-tail position. Nothing refreshes the vreg in
+# between, so the raise-time stash is g's stale pair — the callsite-table
+# validator must reject it (the innermost context's static callee is h, not g).
+# Without the validator this trace grows a phantom "g" frame.
+cat > "$work/src/app/sitestale.clj" <<'EOF'
+(ns app.sitestale)
+(defn g [x]
+  (+ x 1))
+(defn h []
+  (let [x (throw (ex-info "late" {:x 1}))]
+    x))
+(defn -main [& _]
+  (println "g" (g 41))
+  (h))
+EOF
+echo "trace smoke: a returned native tail site cannot haunt a later throw"
+out_ss="$(run_app app.sitestale)"
+expect_match "sitestale: the thrower is named at its line" "$out_ss" 'app\.sitestale/h (.*src/app/sitestale\.clj:5)'
+expect_no_match "sitestale: the returned fn's site is rejected" "$out_ss" 'app\.sitestale/g'
+
+# R2: a HOST fault (no jolt-throw anywhere — a bad primitive-array index) is
+# captured by the cli's with-exception-handler while the frames are live, so
+# the trace still names the fn and its exact line.
+cat > "$work/src/app/hostfault.clj" <<'EOF'
+(ns app.hostfault)
+(defn kaboom [n]
+  (aget (double-array 3) n))
+(defn -main [& _]
+  (println "before")
+  (println (kaboom 10)))
+EOF
+echo "trace smoke: a host fault still maps fn and line"
+out_hf="$(run_app app.hostfault)"
+expect_match "hostfault: the faulting fn is named at its line" "$out_hf" 'app\.hostfault/kaboom (.*src/app/hostfault\.clj:3)'
+expect_match "hostfault: the caller is present" "$out_hf" 'app\.hostfault/-main'
+
 echo "trace smoke: JOLT_TRACE=0 opts out"
 out_off="$(run_app app.tail JOLT_TRACE=0)"
 expect_match "still reports the message" "$out_off" 'Unhandled exception: Divide by zero'

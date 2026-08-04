@@ -462,7 +462,7 @@
                       (loop (cdr ribs)
                             (append acc (jolt-marks-tail-frames (car ribs) cont-names))))))
          (site (jolt-throw-site))
-         (recs (if (jolt-site-splice? site cont-names chain)
+         (recs (if (jolt-site-splice? site cont-names chain '())
                    (cons (jolt-site-frame site) chain)
                    chain)))
     (and (pair? recs) (jolt-render-recs recs))))
@@ -508,16 +508,72 @@
   (let ((nm (car site)) (line (cdr site)))
     (srcreg-frame nm (hashtable-ref source-registry nm #f)
                   (and (fixnum? line) (fx>? line 0) line))))
-;; Two-condition anti-dup belt: splice the site IFF its name is absent from the
-;; live continuation (a live frame cannot have been TCO-erased) AND differs from
-;; the chain's deepest (innermost) entry — when they agree, the chain already
-;; names the frame and the site is a duplicate.
-(define (jolt-site-splice? site cont-names chain)
+;; Anti-dup belt plus the R2 staleness validator (bead jolt-knn8). Splice the
+;; site IFF (1) its name is absent from the live continuation (a live frame
+;; cannot have been TCO-erased); (2) it differs from the chain's deepest entry
+;; (when they agree, the chain already names the frame); and (3) the compile-
+;; time callsite table AGREES: only tail sites write the site vreg now, so the
+;; raise-time stash can be a returned chain's residue — the pair is trusted
+;; only when the innermost live context (the chain's deepest entry, else the
+;; innermost continuation frame) statically calls the fn the pair names. A
+;; site the table has no entry for (a dynamic callee) falls back to the belt
+;; alone — bounded, and strictly no worse than R1.
+(define (jolt-site-splice? site cont-names chain cont)
   (and (pair? site)
        (let ((nm (car site)))
          (and (not (hashtable-ref cont-names nm #f))
               (or (null? chain)
-                  (not (string=? (srcreg-frame-nm (car chain)) nm)))))))
+                  (not (string=? (srcreg-frame-nm (car chain)) nm)))
+              ;; Two candidate contexts, because either may be the innermost:
+              ;; the chain's deepest entry (the marked frame's last tail site)
+              ;; or the innermost continuation frame (deeper when the throw
+              ;; left live frames, e.g. a non-tail call chain below the marked
+              ;; frame). ACCEPT if any registered context calls nm, or if any
+              ;; context is unregistered (a dynamic site — no evidence);
+              ;; REJECT only when every known context disagrees. A rejected
+              ;; pair is exactly a returned tail site's residue.
+              (let ((ctxs (append (if (pair? chain) (list (car chain)) '())
+                                  (if (pair? cont) (list (car cont)) '()))))
+                (or (null? ctxs)
+                    (let check ((cs ctxs) (any-unknown #f))
+                      (if (null? cs)
+                          any-unknown
+                          (let ((expected (jolt-callsite-callees
+                                           (srcreg-frame-nm (car cs))
+                                           (srcreg-frame-line (car cs)))))
+                            (cond
+                              ((not expected) (check (cdr cs) #t))
+                              ((member nm expected) #t)
+                              (else (check (cdr cs) any-unknown))))))))))))
+
+;; Where the tail chain belongs among the continuation frames. The chain's
+;; frames run OUTSIDE the fn the chain's deepest site tail-called; when the
+;; throw left that fn's frame live (a non-tail throw inside it), the
+;; continuation reports it — and any frames deeper than it — ABOVE the chain.
+;; Splice the chain after the OUTERMOST cont frame named by the deepest site's
+;; static callee (jolt-callsite-callee), so a caller can never render above
+;; its callee. When the callee is unknown or absent from the continuation
+;; (the throw was at the chain fn's tail — the common case), the chain goes on
+;; top as before. Fixes the app.sitestale-shaped ordering the R1 fixtures never
+;; exercised: their throws were all in tail position.
+(define (jolt-splice-chain chain cont cont-names)
+  (if (null? chain)
+      cont
+      (let ((es (jolt-callsite-callees (srcreg-frame-nm (car chain))
+                                       (srcreg-frame-line (car chain)))))
+        (if (and es (exists (lambda (x) (hashtable-ref cont-names x #f)) es))
+            (let ((last (let scan ((cs cont) (i 0) (last -1))
+                          (if (null? cs)
+                              last
+                              (scan (cdr cs) (fx+ i 1)
+                                    (if (member (srcreg-frame-nm (car cs)) es) i last))))))
+              (if (fx<? last 0)
+                  (append chain cont)
+                  (let split ((k 0) (cs cont) (acc '()))
+                    (if (fx>? k last)
+                        (append (reverse acc) chain cs)
+                        (split (fx+ k 1) (cdr cs) (cons (car cs) acc))))))
+            (append chain cont)))))
 
 ;; Multi-line backtrace for an uncaught value, built from the CONTINUATION with
 ;; the tail-site marks consulted only for frames TCO erased:
@@ -549,10 +605,10 @@
                           (jolt-marks-tail-frames rib cont-names)
                           '()))
                (site (jolt-throw-site))
-               (recs (append (if (jolt-site-splice? site cont-names chain)
-                                 (cons (jolt-site-frame site) chain)
-                                 chain)
-                             cont)))
+               (recs (let ((body (jolt-splice-chain chain cont cont-names)))
+                       (if (jolt-site-splice? site cont-names chain cont)
+                           (cons (jolt-site-frame site) body)
+                           body))))
           (and (pair? recs) (jolt-render-recs recs))))))
 
 ;; Exposed for the REPL / nREPL error paths, which catch errors themselves instead

@@ -193,10 +193,16 @@
 ;; The continuation marks (incl. the tail-site rib chain) captured at the same
 ;; throw, cleared together with the continuation. Read by source-registry.ss.
 (define jolt-throw-marks (make-thread-parameter #f))
+;; The site vreg's ('ns/fn' . line) pair as it stood AT the raise (R2, bead
+;; jolt-knn8). Only tail sites write the vreg now, so its live value can be a
+;; returned chain's residue — the reporter must see the throw-time snapshot,
+;; validated against the callsite table, never the live slot.
+(define jolt-throw-sitep (make-thread-parameter #f))
 
 ;; Cleared after a catch handler completes normally so the parked continuation
 ;; (and its captured frames) does not root live data until the next throw.
-(define (jolt-catch-complete!) (jolt-throw-cont #f) (jolt-throw-marks #f))
+(define (jolt-catch-complete!)
+  (jolt-throw-cont #f) (jolt-throw-marks #f) (jolt-throw-sitep #f))
 
 ;; --- tail-frame marks: TCO-erased frames via continuation marks (opt-in) -----
 ;; TCO erases tail-called frames from the native continuation, so an uncaught
@@ -266,44 +272,68 @@
         (jolt-truthy? o))))
 (define (jolt-trace-enable!) (set! jolt-trace-on? #t))
 
-;; The emitter calls this before every call it compiles, with that call's site — a
-;; static ('ns/fn' . line) pair baked into the emitted code (R1 addendum, bead
-;; jolt-pfhc). One virtual-register store, ~1ns — the cheapest thing that can
-;; answer "which call are we on" without a per-expression allocation or a stack
-;; discipline that tail calls would break. The pair names the ENCLOSING fn at the
-;; call site, so a TCO-erased innermost frame can be spliced into a backtrace
-;; (source-registry.ss jolt-throw-site / jolt-site-splice?).
+;; TAIL call emissions store their static ('ns/fn' . line) pair here right
+;; before the call (sited-tail-call / the :throw case). Since R2 (bead
+;; jolt-knn8) NOTHING else writes it — non-tail code carries no per-call
+;; instrumentation — so the live slot can hold a returned chain's residue.
+;; Consumers therefore read the THROW-TIME snapshot (jolt-throw-sitep), and the
+;; reporter validates it against the callsite table before splicing.
 (define (jolt-site! p) (set-virtual-register! jolt-vreg-site p))
 ;; The line to report for the INNERMOST frame. Inside a catch clause that is the
-;; line the throw came from, captured on the way in — by the time the handler runs,
-;; the handler's own calls have long since moved the current line. A fresh thread
-;; starts every slot at fixnum 0 (unset); the slots hold a site pair or 0.
+;; line the throw came from, snapshotted on the way in; else the pair stashed at
+;; the raise. Never the live vreg — it can be stale between throws.
 (define (jolt-throw-line)
   (let ((c (virtual-register jolt-vreg-catch-line)))
     (if (pair? c)
         (let ((l (cdr c))) (and (fixnum? l) (fx>? l 0) l))
-        (let ((s (virtual-register jolt-vreg-site)))
+        (let ((s (jolt-throw-sitep)))
           (if (pair? s)
               (let ((l (cdr s))) (and (fixnum? l) (fx>? l 0) l))
               #f)))))
-;; The site pair ('ns/fn' . line) of the innermost call at the throw — the same
-;; capture discipline as jolt-throw-line (the catch-line snapshot when a handler
-;; is running, else the live site). #f when unset.
+;; The site pair ('ns/fn' . line) of the innermost call at the throw — the
+;; catch-line snapshot when a handler is running, else the raise-time stash.
+;; #f when unset. The reporter must validate this against the callsite table
+;; (jolt-callsite-callee) before trusting the name.
 (define (jolt-throw-site)
   (let ((c (virtual-register jolt-vreg-catch-line)))
     (if (pair? c)
         c
-        (let ((s (virtual-register jolt-vreg-site)))
+        (let ((s (jolt-throw-sitep)))
           (and (pair? s) s)))))
 ;; Emitted around a catch clause's body: snapshot the throwing site and return the
 ;; previous snapshot, which the paired leave restores. Save/restore rather than a
 ;; bare set so a nested catch cannot leave an inner throw's site behind for an
-;; outer handler that runs afterwards.
+;; outer handler that runs afterwards. Reads the raise-time stash, not the live
+;; vreg — by handler time the handler's context is what the vreg describes.
 (define (jolt-catch-enter!)
   (let ((prev (virtual-register jolt-vreg-catch-line))
-        (cur (virtual-register jolt-vreg-site)))
+        (cur (jolt-throw-sitep)))
     (set-virtual-register! jolt-vreg-catch-line (if (pair? cur) cur 0))
     prev))
+
+;; --- compile-time callsite table (R2, bead jolt-knn8) ------------------------
+;; (jolt-register-callsite! "ns/f" line "ns/callee"): the emitter registers, at
+;; def load time, the STATIC callee of each call site in a traced fn. Costs
+;; nothing per call — it is the metadata that lets the reporter reject a stale
+;; site pair: a pair is spliced as the innermost frame only when the callsite
+;; table agrees that the innermost live context actually called that fn.
+;; A line can carry several calls (an operand and its outer call share it), so
+;; each key maps to a LIST of distinct callees and validation is membership.
+(define jolt-callsite-table (make-hashtable string-hash string=?))
+(define (jolt-callsite-key fqn line)
+  (string-append fqn ":" (number->string line)))
+(define (jolt-register-callsite! fqn line callee)
+  (let* ((k (jolt-callsite-key fqn line))
+         (cur (hashtable-ref jolt-callsite-table k '())))
+    (unless (member callee cur)
+      (hashtable-set! jolt-callsite-table k (cons callee cur))))
+  jolt-nil)
+;; The registered static callees at (fqn, line) as a non-empty list, or #f
+;; (unknown / dynamic site — nothing was registered).
+(define (jolt-callsite-callees fqn line)
+  (and (string? fqn) (fixnum? line)
+       (let ((v (hashtable-ref jolt-callsite-table (jolt-callsite-key fqn line) '())))
+         (and (pair? v) v))))
 (define (jolt-catch-leave! prev)
   (set-virtual-register! jolt-vreg-catch-line (if (pair? prev) prev 0)))
 
@@ -323,8 +353,25 @@
   (call/cc (lambda (k)
              (jolt-throw-cont (cons v k))
              (jolt-throw-marks (current-continuation-marks))
+             (jolt-throw-sitep (let ((s (virtual-register jolt-vreg-site)))
+                                 (and (pair? s) s)))
              (raise (condition (make-message-condition (jolt-throw-message v))
                                (make-jolt-throw-condition v))))))
+;; The same capture for a HOST condition (a fault raised outside jolt-throw:
+;; car of a non-pair, a bad flvector index). Installed by the cli's run wrapper
+;; via with-exception-handler, which runs BEFORE the stack unwinds — a guard's
+;; handler runs after, when the frames are already gone. Identity-tagged with
+;; the condition itself, which is what jolt-unwrap-throw hands the reporter for
+;; a non-&jolt-throw raise. jolt throws skip this (they captured already, with
+;; the RIGHT identity — overwriting would orphan their k).
+(define (jolt-capture-fault! c)
+  (unless (jolt-throw-condition? c)
+    (call/cc (lambda (k)
+               (jolt-throw-cont (cons c k))
+               (jolt-throw-marks (current-continuation-marks))
+               (jolt-throw-sitep (let ((s (virtual-register jolt-vreg-site)))
+                                   (and (pair? s) s)))
+               #f))))
 (define (jolt-unwrap-throw x)
   (if (jolt-throw-condition? x) (jolt-throw-condition-value x) x))
 ;; ex-info builds a jolt-ex-info-record (NOT a pmap — pmap?/coll?/seqable?/ifn?

@@ -157,35 +157,22 @@
 (defn- node-line [node]
   (let [p (:pos node)] (when (map? p) (:line p))))
 
-;; Under tracing, set the current line right before a call. That single virtual
-;; register store is what gives a backtrace a per-frame line: the callee's entry
-;; prologue reads it, so each ring entry carries the line its CALLER was on, and a
-;; frame's own line is the one recorded by the frame below it. Without this a frame
-;; could only report the line its function was DEFINED on, which in a long function
-;; points nowhere near the fault.
-;;
-;; `begin` keeps this transparent in every position, tail included — the call stays
-;; the last form, so TCO is unaffected. Under the same gate, also emit an inline
-;; Chez block comment #|L<line>|# right before the form: a frame's source object
-;; gives a byte offset into the generated .scm, and scanning back for the nearest
-;; marker recovers the ORIGINAL clj line (source-registry.ss
-;; jolt-marker-line-at-offset). Must be a block comment — a `;;` comment would
-;; comment out the rest of the one-line top-level form. The per-call store is
-;; jolt-site! — here always a bare line FIXNUM, an immediate store at exactly the
-;; old jolt-line! cost (the pair-on-every-store variant measured +7% on the
-;; arrays bench: a constant-pool load per store, on hot recur loops that are all
-;; non-tail calls). The ('ns/fn' . line) PAIR the innermost-frame splice needs is
-;; stored only by TAIL call emissions (sited-tail-call / the :throw case), and
-;; there AFTER the operands are temp-bound — an operand's own invoke stores a
-;; fixnum, so a pair stored before operand evaluation would be stomped and the
-;; TCO-erased frame would lose its name (app.tailstale's thrower caught this).
-;; One slot, two store types: every call overwrites it, so at a throw it always
-;; describes the innermost call — pair = that call was tail (its frame is erased
-;; and the pair alone names it, source-registry.ss jolt-site-frame); fixnum =
-;; non-tail (the continuation names the frame, the fixnum is its line).
+;; Under tracing, emit an inline Chez block comment #|L<line>|# right before every
+;; call: a frame's source object gives a byte offset into the generated .scm, and
+;; scanning back for the nearest marker recovers the ORIGINAL clj line
+;; (source-registry.ss jolt-marker-line-at-offset). Must be a block comment — a
+;; `;;` comment would comment out the rest of the one-line top-level form. R2
+;; (bead jolt-knn8): the per-call (jolt-site! LINE) fixnum store is GONE — non-tail
+;; code now compiles with no per-call instrumentation at all, so a continuation
+;; names a non-tail frame with its exact line for free. The ('ns/fn' . line) PAIR
+;; the innermost-frame splice needs is stored only by TAIL call emissions
+;; (sited-tail-call / the :throw case), there AFTER the operands are temp-bound.
+;; A pair now survives its chain's return, so the reporter validates the splice
+;; against the compile-time callsite table (*callsites* / jolt-register-callsite!)
+;; before accepting it (source-registry.ss jolt-site-splice?).
 (defn- with-site [node s]
   (if-let [l (and (trace-frames?) (node-line node))]
-    (str "#|L" l "|# (begin (jolt-site! " l ") " s ")")
+    (str "#|L" l "|# " s)
     s))
 
 ;; Source-map registration for a fn def: one hashtable insert at definition time,
@@ -243,6 +230,56 @@
 ;; in code outside any named fn (top-level, anonymous fns): those tail sites skip.
 (def ^:dynamic *trace-site* nil)
 (def ^:dynamic *trace-self* #{})
+
+;; R2 (bead jolt-knn8): compile-time callsite table, the staleness fix for the
+;; site vreg once only tail sites write it. While emitting a def's init under
+;; tracing, *callsites* holds an atom of {fn-qname {line static-callee}}; each
+;; call site the emitter compiles records its static callee. The def emit renders
+;; one (jolt-register-callsite! "ns/f" LINE "callee") sibling per entry, so the
+;; reporter can verify the throw-stashed pair names the callee the innermost site
+;; actually entered (source-registry.ss jolt-site-splice?). nil outside a def.
+(def ^:dynamic *callsites* nil)
+;; A line can carry SEVERAL calls ((println (kaboom 10)) — operand and outer
+;; call share it), so each line maps to a VECTOR of distinct callees and the
+;; validator accepts membership; a single-winner entry false-rejected genuine
+;; pairs whenever calls nest on one line.
+(defn- register-callsite! [line callee]
+  (when (and (trace-frames?) *callsites* *trace-site* line callee)
+    (let [m @*callsites*
+          sites (get m *trace-site*)
+          cur (get sites line)]
+      (when-not (some (fn [c] (= c callee)) cur)
+        (swap! *callsites* assoc *trace-site*
+               (assoc sites line (conj (or cur []) callee)))))))
+;; The static callee fqn of a call site's fn head, or nil for a genuinely dynamic
+;; callee (an arbitrary IFn through jolt-invoke — register nothing for that line).
+;; :var — the var's fqn, matching the qualified name a source-registered frame
+;; reports; :local — a known procedure (self / a letrec-bound named fn): its
+;; qualified name, or the enclosing fn's *trace-site* for a self-call; :keyword /
+;; :coll / computed callees — nil.
+(defn- static-callee [fnode]
+  (case (:op fnode)
+    :var (dl-fqn (:ns fnode) (:name fnode))
+    :local (let [nm (munge-name (:name fnode))]
+             (when (contains? *known-procs* nm)
+               (if (contains? *trace-self* nm)
+                 *trace-site*
+                 (if *qualifying-ns* (str (munge-name *qualifying-ns*) "/" nm) nm))))
+    nil))
+;; The def-emit sibling: one (jolt-register-callsite! …) per collected (line,
+;; callee) entry, or "" when tracing is off / nothing collected — the seed mint
+;; and `jolt build` emit with tracing off, so they stay byte-identical. Entries
+;; sorted for deterministic output; "last call emitted on a line wins" (a tail
+;; call is emitted after its operands, so its callee wins a shared line).
+(defn- trace-callsite-reg []
+  (if (and (trace-frames?) *callsites* (seq @*callsites*))
+    (str/join ""
+      (for [[site sites] (sort-by key @*callsites*)
+            [line callees] (sort-by key sites)
+            callee (sort callees)]
+        (str " (jolt-register-callsite! " (chez-str-lit site) " " line " "
+             (chez-str-lit callee) ")")))
+    ""))
 
 (defn- fresh-label [prefix] (str prefix (swap! (:gensym-counter (cur)) inc)))
 
@@ -961,6 +998,10 @@
         arg-nodes (:args node)
         args (mapv emit arg-nodes)
         tl (or (node-line node) 0)
+        ;; R2: record this site's static callee for the callsite table. Runs after
+        ;; the args are emitted, so when a line carries both a call and its
+        ;; operand's call the OUTER (later-emitted) callee wins — the tail call's.
+        _ (when tl (register-callsite! tl (static-callee fnode)))
         nop (native-op fnode (count args))
         kind (ifn-kind fnode)
         ;; order args left-to-right (build receives the spliced operand strings)
@@ -1441,7 +1482,11 @@
     ;; whole point of the unique name, and it ties qualification to the runtime-eval
     ;; path. The seed mint and `jolt build` emit with source-reg off, so core keeps
     ;; its short names and prelude.ss stays byte-identical across a re-mint.
-    :def (binding [*qualifying-ns* (when (source-reg?) (:ns node))]
+    ;; *callsites* is bound HERE, not in register-callsite! — a dynamic var
+    ;; must hold the atom before the init emission runs or every site record
+    ;; silently no-ops and the callsite table stays empty.
+    :def (binding [*qualifying-ns* (when (source-reg?) (:ns node))
+                   *callsites* (when (trace-frames?) (atom {}))]
            (let [reg (trace-source-reg node)
                  d (cond
                      (:no-init node)
@@ -1458,13 +1503,14 @@
                           (emit-with-cells #(emit (:init node))) " " (emit-def-meta node) ")")
                      :else
                      (str "(def-var! " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) " "
-                          (emit-with-cells #(emit (:init node))) ")"))]
+                          (emit-with-cells #(emit (:init node))) ")"))
+                   creg (trace-callsite-reg)]
              ;; a def evaluates to its VAR ((var? (def x)) is true), so the source
-             ;; registration must not be the value of the form — bind the def's
-             ;; result, register, and hand the var back.
-             (if (= reg "") d
+             ;; and callsite registrations must not be the value of the form — bind
+             ;; the def's result, register, and hand the var back.
+             (if (= (str reg creg) "") d
                  (let [v (fresh-label "_dv$")]
-                   (str "(let ((" v " " d "))" reg " " v ")")))))
+                   (str "(let ((" v " " d "))" reg creg " " v ")")))))
     (throw (ex-info (str "emit: op not yet ported / unhandled: " (pr-str (:op node))) {}))))
 
 ;; ^:dynamic / ^:redef on a def opts it out of direct-linking: it stays redefinable,
