@@ -55,11 +55,12 @@ endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
-  compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
+  aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr grenadine \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
+  traceemit \
   shakesmoke smoke staticnativesmoke test testbin transient unit unitcontext \
   values wp ci
 
@@ -114,8 +115,9 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi \
   transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
+  traceemit traceeval \
   inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke \
-  gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   certify
 TEST-GATES := submodules selfhost ci
 
@@ -433,6 +435,21 @@ protoret:
 pic:
 	@$(CHEZ) --script host/chez/run-pic.ss
 
+# Under tracing, the tail-frame ring save/restore goes around calls that can push a
+# rib and nowhere else. A site lowering to inline Chez primitives (a proven aget is
+# one flvector-ref) can never reach a fn prologue, and wrapping it let-binds the
+# result across the restore — which re-boxes an unboxed flonum and cost 19x on an
+# array loop. Gates both directions: no wrapper on the primitive branches, wrapper
+# still present on the ones that really apply a fn.
+traceemit:
+	@$(CHEZ) --script host/chez/run-trace-emit.ss
+
+# trace-r2: an eval-path (cache-miss) frame carries a source object, and its
+# (source-name . offset) resolves to the original clj line via the eval marker
+# registry; with tracing off the eval path registers nothing.
+traceeval:
+	@$(CHEZ) --script host/chez/run-traceeval.ss
+
 # Nilable record types + flow-sensitive narrowing: a record-or-nil types as a nilable
 # record (some?/nil? don't fold, so a runtime guard stays); inside (if (some? x) ..)
 # the then-branch narrows x to non-nil, so its field reads bare-index and unbox.
@@ -569,6 +586,13 @@ compilepathsmoke: testbin
 # equal-hash saw ~26 bytes of a source and served stale fasls for everything else.
 aotfingerprint:
 	@$(CHEZ) --script test/chez/aot-fingerprint-test.ss
+
+# A frame from a CACHED namespace must report a source path that EXISTS. The cache
+# used to compile a pid-unique temp and rename it away, so compile-file baked a
+# path that died with the rename — which the R3 trace would then fail to resolve
+# offsets against.
+aotcachepathsmoke: testbin
+	@sh test/chez/aot-cache-path-smoke.sh
 
 # Perf measurement: cold (recompile) vs warm (cache hit) for a multi-library
 # require. Needs Maven jars locally; NOT in the default ci gate (timing budget).

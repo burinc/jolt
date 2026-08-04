@@ -143,11 +143,17 @@ carry both plus the rose-tree machinery.
 
 | Workload | ×N | vs JVM | jolt (ms) | JVM (ms) | Bound by |
 |---|---:|---:|---:|---:|---|
-| SplitMix `mix-64` | 100k | **8.7×** | 34.7 | 4.0 | 64-bit integer arithmetic |
-| deftype alloc + protocol dispatch | 100k | **3.9×** | 24.0 | 6.1 | open-world dispatch |
-| raw `split` + `rand-long` | 20k | **19.1×** | 70.7 | 3.7 | bignum 64-bit + dispatch |
-| `gen/large-integer` | 2k | **6.9×** | 60.0 | 8.7 | arithmetic + rose-tree machinery |
-| `(gen/vector gen/large-integer)` | 500 | **18.5×** | 695.3 | 37.5 | element gen + gen machinery |
+| SplitMix `mix-64` | 100k | **8.2×** | 48.4 | 5.9 | 64-bit integer arithmetic |
+| deftype alloc + protocol dispatch | 100k | **4.3×** | 28.6 | 6.7 | open-world dispatch |
+| raw `split` + `rand-long` | 20k | **21.3×** | 78.7 | 3.7 | bignum 64-bit + dispatch |
+| `gen/large-integer` | 2k | **7.4×** | 66.8 | 9.0 | arithmetic + rose-tree machinery |
+| `(gen/vector gen/large-integer)` | 500 | **21.4×** | 755.2 | 35.3 | element gen + gen machinery |
+
+Both columns are a fresh `bench/testcheck.sh` pair on one machine in one sitting,
+which is the only way the ratio means anything — the absolutes here read ~1.4× the
+previously published ones on BOTH hosts (JVM `mix-64` 4.0→5.9 alongside jolt
+34.7→48.4), so that shift is the machine, not either runtime. Compare ratios
+across revisions of this table, not milliseconds.
 
 Two no-C codegen levers collapsed the **arithmetic** half: emitting `bit-and`/
 `bit-or`/`bit-xor`/`bit-not` as inlined Chez `bitwise-*` primitives (they had gone
@@ -246,3 +252,35 @@ targets, even if the ray tracer stays flat.
 parent's compiler files (`host/chez/seed/image.ss` +
 `jolt-core/jolt/passes/types.clj`), builds and times each bench against `HEAD`,
 then restores the working tree. A1≈A2 rules out drift; B vs A is the change.
+
+### Dev mode, and why `aba.sh` cannot see it
+
+`bench/aba.sh` compiles each benchmark with `jolt build`, and a built binary's
+prologues are baked with tracing OFF. So it is **structurally blind** to anything
+that only exists on the `jolt run` / `-M:alias` path — which is where the
+tail-frame history lives, and where tracing is on by default.
+
+That blindness is not hypothetical. A per-call ring save/restore landed in v0.5.20
+costing up to **19×** on proven-numeric code, shipped in v0.5.20 and v0.6.0, and
+every AOT number above stayed flat throughout because built binaries never carried
+it. What surfaced it was an application getting slower, not a benchmark.
+
+`bench/aba-trace.sh` is the dev-mode A/B/A. Give it two already-built binaries
+(a compiler change needs `make remint`, so reminting between phases would dominate
+the wall clock):
+
+    bench/aba-trace.sh /tmp/jolt-A /tmp/jolt-B
+
+Its bench set deliberately spans BOTH shapes, because the original set was
+call-heavy only and that is precisely why the regression was invisible:
+
+| shape | benches | what it shows |
+|---|---|---|
+| call-heavy | `fib` `tak` `binary-trees` | the per-entry ring push — what tracing fundamentally costs |
+| numeric loops | `arrays` `mathfns` `loop-recur` `mandelbrot` | per-call-SITE work landing on code that had none, so it reads as a multiple rather than a percentage |
+
+Tracing is **not** free, and the cost is very uneven. Against `JOLT_TRACE=0` on the
+same binary: `fib` ~10× (6.9 vs 0.7 ms), `binary-trees` ~1.6×, while the numeric
+benches are within noise. Reach for `JOLT_TRACE=0` when timing a dev-mode run —
+and note it changes the emitted code, so give it its own `JOLT_CACHE_DIR` or you
+will time a mix of both modes.

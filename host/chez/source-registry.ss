@@ -80,13 +80,70 @@
       (and (fx>? (string-length nm) 0) (char=? (string-ref nm 0) #\$))
       (and (fx>=? (string-length nm) 5) (string=? (substring nm 0 5) "jolt-"))))
 
+;; An inspector message that may return ZERO values (e.g. 'source-path when a
+;; frame carries no source) — read it as one value or #f. `guard` alone cannot
+;; catch a zero-value return, so the read goes through call-with-values with a
+;; null-tolerant collector.
+(define (srcreg-inspect-get io msg)
+  (call-with-values (lambda () (guard (e (#t (values 'srcreg-inspect-err))) (io msg)))
+    (lambda args (if (or (null? args) (eq? (car args) 'srcreg-inspect-err)) #f (car args)))))
+
+;; A frame's source as (source-name . byte-offset), or #f. Read from the
+;; inspector's 'source-object (which carries the sfd and the bfp/efp range)
+;; rather than 'source-path: the latter reports only the path string for
+;; eval'd code, while the source object always carries the positions.
+(define (srcreg-frame-source-pair io)
+  (guard (e (#t #f))
+    (let ((so (srcreg-inspect-get io 'source-object)))
+      (and so
+           (let ((path (source-file-descriptor-path (source-object-sfd so)))
+                 (bfp (source-object-bfp so)))
+             (and (string? path) (fixnum? bfp) (cons path bfp)))))))
+
+;; JOLT_DEBUG_FRAMES extra: the frame's source object, when it has one. For the
+;; eval path that is (synthetic-name . offset) resolved through the eval marker
+;; registry back to the ORIGINAL clj line — the surface trace-r2's gate asserts
+;; on. Exception-proof: the debug print must never break the frame walk.
+(define (srcreg-frame-source-debug io)
+  (guard (e (#t ""))
+    (let ((pair (srcreg-frame-source-pair io)))
+      (if pair
+          (let ((name (car pair)) (offset (cdr pair)))
+            (string-append " source=" name "@" (number->string offset)
+                           (if (jolt-eval-source-name? name)
+                               (let ((l (jolt-eval-source-line name offset)))
+                                 (if l (string-append " -> clj:L" (number->string l))
+                                     " -> clj:?"))
+                               "")))
+          ""))))
+
+;; A frame's OWN line — where its execution is paused, which Chez annotates with
+;; the position of the call that CREATED the frame: the call site inside the
+;; caller, exactly what the JVM prints for a frame. Resolve the frame's
+;; (source-name . offset) through the marker lookup: a .scm path resolves via the
+;; on-disk marker table (jolt-marker-line-in-file), a synthetic eval name via the
+;; eval registry (jolt-eval-source-line). #f when the frame carries no source or
+;; no marker precedes its offset — the renderer then falls back to the defn line.
+;; Exception-proof: the reporter runs while an error is being reported.
+(define (srcreg-frame-line-from-source-pair io)
+  (guard (e (#t #f))
+    (let ((pair (srcreg-frame-source-pair io)))
+      (and pair
+           (let ((name (car pair)) (offset (cdr pair)))
+             (if (jolt-eval-source-name? name)
+                 (jolt-eval-source-line name offset)
+                 (jolt-marker-line-in-file name offset)))))))
+
 ;; Walk a continuation, returning its frames (innermost first) as (frame-name .
 ;; record) pairs. record is a source vector #(ns name file line) for a frame that
 ;; maps to registered Clojure source, the symbol 'ambiguous for a short name shared
 ;; across namespaces, or #f for an unmapped-but-named frame (the common case on the
 ;; open-world eval path, where nothing is registered — the bare frame name is still
 ;; a useful trace line). Plumbing frames (host spine, eval boundary) and unnamed
-;; frames are skipped; raw depth is capped.
+;; frames are skipped; raw depth is capped. Each frame carries the line reached
+;; INSIDE it, from the R1/R2 marker lookup on its source object — the caller's
+;; call site — so a rendered frame points at where it was when the error hit, not
+;; where its fn was defined.
 (define (jolt-frame-records k)
   ;; read the env at call time, not load time: a built binary runs top-level forms
   ;; at heap-build time, where this would always be unset.
@@ -98,15 +155,250 @@
           (let* ((nm (srcreg-frame-name io))
                  (src (and nm (hashtable-ref source-registry nm #f)))
                  ;; keep a frame that maps, or any named frame that isn't plumbing
-                 (keep? (and nm (or src (not (srcreg-plumbing-name? nm))))))
+                 (keep? (and nm (or src (not (srcreg-plumbing-name? nm)))))
+                 ;; the line reached inside this frame (only a mapped frame prints
+                 ;; one, so only it pays the marker lookup)
+                 (line (and src (srcreg-frame-line-from-source-pair io))))
             (when (and debug? nm)
               (display (string-append "  [frame] " nm (if src " *MAPPED*"
-                                                          (if keep? "" " (skipped)")) "\n")
+                                                          (if keep? "" " (skipped)"))
+                                      (srcreg-frame-source-debug io) "\n")
                        (current-error-port)))
-            ;; No per-frame line from this source: the continuation carries no jolt
-            ;; positions, so each frame falls back to where its fn was defined.
             (loop (guard (e (#t #f)) (io 'link)) (fx+ n 1)
-                  (if keep? (cons (srcreg-frame nm src #f) acc) acc))))))))
+                  (if keep? (cons (srcreg-frame nm src line) acc) acc))))))))
+
+;; --- clj-line lookup for generated .scm offsets ---------------------------------
+;;
+;; The back end (backend_scheme.clj with-line) emits an inline Chez block comment
+;; #|L<clj-line>|# immediately before every traced call site in the generated
+;; .scm. A Chez frame's source object carries a byte offset into that file; a
+;; backtrace must map it back to the ORIGINAL .clj line the site was emitted
+;; from. Returns the line as a fixnum, or #f when no marker precedes the offset.
+;;
+;; The scan is FORWARD, tracking Scheme lexical state, and builds a sorted table
+;; of (marker-start . line) pairs in ONE pass; a lookup is a binary search over
+;; that table (the nearest preceding marker), O(log markers) per frame instead
+;; of O(file). A backward scan could not tell a real marker from the same bytes
+;; inside a user STRING LITERAL — a Clojure string like "#|L999|# oops" is
+;; user-controlled, and every offset after it would resolve to a fabricated
+;; line. The forward scanner skips:
+;;   - "..." string literals, with \ escapes (an escaped \" does not end the
+;;     string; \\ then a quote DOES — the backslash escapes exactly one char);
+;;   - #| ... |# block comments, which NEST in Chez (a marker is recognized only
+;;     when the comment is exactly #|L<digits>|# with an immediate close);
+;;   - #\ character literals, so a #\" can't open a string or a #\| start a
+;;     comment (defensive: the emitter renders chars as (integer->char N), never
+;;     #\);
+;;   - ; line comments (the emitter never emits one — a top-level form is one
+;;     line, so a ; comment would swallow the rest of it — but they are free to
+;;     skip).
+;; Deliberately NOT handled (the emitter cannot produce them): #; datum
+;; comments, and bar-delimited |symbol| syntax containing #|.
+(define jolt-marker-cache-text (make-hashtable string-hash string=?))
+(define jolt-marker-cache-file (make-hashtable string-hash string=?))
+
+;; Forward scan -> sorted vector of (start . line) pairs, one per real marker.
+(define (jolt-marker-table text)
+  (define n (string-length text))
+  (define (digit? c) (char<=? #\0 c #\9))
+  (define (alpha? c) (or (char<=? #\a c #\z) (char<=? #\A c #\Z)))
+  (define (hex-digit? c)
+    (or (digit? c) (char<=? #\a c #\f) (char<=? #\A c #\F)))
+  ;; Is text[i..] exactly "#|L<digits>|#"?  (line . end) or #f.
+  (define (marker-at? i)
+    (and (<= (+ i 3) n)
+         (char=? (string-ref text i) #\#)
+         (char=? (string-ref text (+ i 1)) #\|)
+         (char=? (string-ref text (+ i 2)) #\L)
+         (let loop ((j (+ i 3)) (acc 0) (digits? #f))
+           (cond
+             ((and (< j n) (digit? (string-ref text j)))
+              (loop (+ j 1) (+ (* acc 10)
+                               (- (char->integer (string-ref text j))
+                                  (char->integer #\0)))
+                    #t))
+             ((and digits? (< (+ j 1) n)
+                   (char=? (string-ref text j) #\|)
+                   (char=? (string-ref text (+ j 1)) #\#))
+              (cons acc (+ j 2)))
+             (else #f)))))
+  (let scan ((i 0) (out '()))
+    (cond
+      ((>= i n) (list->vector (reverse out)))
+      ;; string literal: \" stays inside, \\ does not escape a later quote
+      ((char=? (string-ref text i) #\")
+       (let skip ((j (+ i 1)))
+         (cond
+           ((>= j n) (scan n out))
+           ((char=? (string-ref text j) #\\)
+            (if (< (+ j 1) n) (skip (+ j 2)) (scan n out)))
+           ((char=? (string-ref text j) #\") (scan (+ j 1) out))
+           (else (skip (+ j 1))))))
+      ;; #\ char literal: consume it whole so #\" etc. can't mislead the scan
+      ((and (char=? (string-ref text i) #\#)
+            (< (+ i 1) n)
+            (char=? (string-ref text (+ i 1)) #\\))
+       (cond
+         ((>= (+ i 2) n) (scan n out))
+         ((let ((c (string-ref text (+ i 2))))
+            (or (char=? c #\x) (char=? c #\u)))
+          ;; hex codepoint: #\x41, #\u0041, #\x(41), #\u(41)
+          (if (and (< (+ i 3) n) (char=? (string-ref text (+ i 3)) #\())
+              (let inner ((k (+ i 4)))
+                (cond
+                  ((and (< k n) (hex-digit? (string-ref text k))) (inner (+ k 1)))
+                  ((and (< k n) (char=? (string-ref text k) #\))) (scan (+ k 1) out))
+                  (else (scan (+ i 3) out))))
+              (let skip ((j (+ i 3)))
+                (cond ((and (< j n) (hex-digit? (string-ref text j))) (skip (+ j 1)))
+                      (else (scan j out))))))
+         ((alpha? (string-ref text (+ i 2)))
+          ;; named char: #\space, #\newline, ...
+          (let skip ((j (+ i 3)))
+            (cond ((and (< j n) (alpha? (string-ref text j))) (skip (+ j 1)))
+                  (else (scan j out)))))
+         (else (scan (+ i 3) out))))
+      ;; #| block comment (nests); our markers are exactly such comments
+      ((and (char=? (string-ref text i) #\#)
+            (< (+ i 1) n)
+            (char=? (string-ref text (+ i 1)) #\|))
+       (let ((m (marker-at? i)))
+         (if m
+             (scan (cdr m) (cons (cons i (car m)) out))
+             (let skip ((j (+ i 2)) (depth 1))
+               (cond
+                 ((>= j n) (scan n out))
+                 ((and (char=? (string-ref text j) #\#)
+                       (< (+ j 1) n)
+                       (char=? (string-ref text (+ j 1)) #\|))
+                  (skip (+ j 2) (+ depth 1)))
+                 ((and (char=? (string-ref text j) #\|)
+                       (< (+ j 1) n)
+                       (char=? (string-ref text (+ j 1)) #\#))
+                  (if (= depth 1) (scan (+ j 2) out) (skip (+ j 2) (- depth 1))))
+                 (else (skip (+ j 1) depth)))))))
+      ;; ; line comment
+      ((char=? (string-ref text i) #\;)
+       (let skip ((j (+ i 1)))
+         (cond
+           ((>= j n) (scan n out))
+           ((char=? (string-ref text j) #\newline) (scan (+ j 1) out))
+           (else (skip (+ j 1))))))
+      (else (scan (+ i 1) out)))))
+
+;; Rightmost marker start <= offset, else #f. Binary search over the sorted
+;; table; an offset past the last marker (or past the end of the file) lands on
+;; the last marker, matching the old backward scan. An offset exactly AT a
+;; marker's start resolves to that marker (its bytes begin there).
+(define (jolt-marker-line-from-table table offset)
+  (let loop ((lo 0) (hi (- (vector-length table) 1)) (best #f))
+    (cond
+      ((> lo hi) best)
+      (else
+       (let ((mid (quotient (+ lo hi) 2)))
+         (if (<= (car (vector-ref table mid)) offset)
+             (loop (+ mid 1) hi (cdr (vector-ref table mid)))
+             (loop lo (- mid 1) best)))))))
+
+(define (jolt-marker-line-at-offset text offset)
+  (let ((tbl (hashtable-ref jolt-marker-cache-text text #f)))
+    (if tbl
+        (jolt-marker-line-from-table tbl offset)
+        (let ((tbl (jolt-marker-table text)))
+          ;; content-keyed: exact (never stale), and a backtrace resolves many
+          ;; frames against the same generated text. Cap at 16 entries so a
+          ;; long-lived process can't accumulate every file it ever touched.
+          (when (fx>=? (hashtable-size jolt-marker-cache-text) 16)
+            (hashtable-clear! jolt-marker-cache-text))
+          (hashtable-set! jolt-marker-cache-text text tbl)
+          (jolt-marker-line-from-table tbl offset)))))
+
+;; --- eval-path source registry -------------------------------------------------
+;; On the eval path (an AOT cache MISS) the emitted Scheme is a transient string:
+;; it is gone by the time anything throws. To let a backtrace resolve a frame's
+;; (source-name . offset) back to a clj line, compile-eval.ss registers the marker
+;; table for the text under a SYNTHETIC source name before eval'ing it. The name
+;; is never a filesystem path (jolt-eval-source-name?), so a consumer knows to
+;; consult this registry instead of reading a .scm off disk. Populated only when
+;; tracing is on; with tracing off the whole block costs nothing.
+;;
+;; Growth is bounded: jolt-eval-source-max tables, oldest evicted FIFO. A table
+;; is one (marker-start . clj-line) pair per traced call site — a few hundred
+;; bytes for a typical top-level form — so the registry stays under roughly
+;; jolt-eval-source-max * (form size) no matter how long a REPL/nREPL session
+;; runs, and the most recent forms (the set a fresh backtrace can mention) are
+;; exactly the ones kept.
+;;
+;; Thread-safety: futures/agents compile on their own threads, so two threads
+;; must not draw the same counter value or interleave table inserts. A mutex
+;; guards counter increment + insert; that is one acquisition per top-level
+;; form, under tracing only, negligible against the analysis+emit already paid.
+(define jolt-eval-source-max 4096)
+(define jolt-eval-source-counter 0)
+(define jolt-eval-source-mutex (make-mutex))
+(define jolt-eval-marker-registry (make-hashtable string-hash string=?))
+(define jolt-eval-source-queue '())          ; names in insertion order (FIFO)
+(define jolt-eval-source-queue-tail '())
+(define (jolt-eval-queue-push! name)
+  (let ((c (cons name '())))
+    (if (null? jolt-eval-source-queue-tail)
+        (begin (set! jolt-eval-source-queue c)
+               (set! jolt-eval-source-queue-tail c))
+        (begin (set-cdr! jolt-eval-source-queue-tail c)
+               (set! jolt-eval-source-queue-tail c)))))
+(define (jolt-eval-queue-pop!)
+  (when (pair? jolt-eval-source-queue)
+    (let ((name (car jolt-eval-source-queue)))
+      (set! jolt-eval-source-queue (cdr jolt-eval-source-queue))
+      (when (null? jolt-eval-source-queue) (set! jolt-eval-source-queue-tail '()))
+      name)))
+;; Register the marker table for one eval'd Scheme text; returns the synthetic
+;; source name to pass make-source-file-descriptor. Once per top-level form.
+(define (jolt-register-eval-marker-table! scm)
+  (mutex-acquire jolt-eval-source-mutex)
+  (let ((name (string-append "jolt-eval-src-"
+                             (number->string jolt-eval-source-counter))))
+    (set! jolt-eval-source-counter (+ jolt-eval-source-counter 1))
+    (when (fx>=? (hashtable-size jolt-eval-marker-registry) jolt-eval-source-max)
+      (let ((old (jolt-eval-queue-pop!)))
+        (when old (hashtable-delete! jolt-eval-marker-registry old))))
+    (hashtable-set! jolt-eval-marker-registry name (jolt-marker-table scm))
+    (jolt-eval-queue-push! name)
+    (mutex-release jolt-eval-source-mutex)
+    name))
+;; Resolve an eval-path frame's (name . offset) to a clj line, or #f when the
+;; name was evicted / never registered or no marker precedes the offset.
+(define (jolt-eval-source-line name offset)
+  (let ((tbl (hashtable-ref jolt-eval-marker-registry name #f)))
+    (and tbl (jolt-marker-line-from-table tbl offset))))
+;; Is this source name a registry key rather than a real file? The distinguisher
+;; between "consult the eval registry" and "read a .scm off disk": every name
+;; this registry mints is "jolt-eval-src-" followed by decimal digits, and no
+;; generated artifact on disk is ever named that.
+(define (jolt-eval-source-name? name)
+  (and (string? name)
+       (let ((n (string-length name)))
+         (and (fx>=? n 14)
+              (string=? (substring name 0 14) "jolt-eval-src-")
+              (let loop ((i 14))
+                (or (fx>=? i n)
+                    (and (char<=? #\0 (string-ref name i) #\9)
+                         (loop (fx+ i 1)))))))))
+
+;; Convenience wrapper for a generated file on disk. Cached per path+mtime: the
+;; same .scm serves every frame of a backtrace, so read+scan it once. Whole-
+;; second mtime granularity means a file regenerated within the same second can
+;; serve a stale table — acceptable on a debug path, never a correctness claim.
+(define (jolt-marker-line-in-file path offset)
+  (define (read-table)
+    (call-with-input-file path
+      (lambda (p) (jolt-marker-table (get-string-all p)))))
+  (let* ((mtime (time-second (file-modification-time path)))
+         (entry (hashtable-ref jolt-marker-cache-file path #f)))
+    (unless (and entry (= (car entry) mtime))
+      (set! entry (cons mtime (read-table)))
+      (hashtable-set! jolt-marker-cache-file path entry))
+    (jolt-marker-line-from-table (cdr entry) offset)))
 
 ;; Render a list of (frame-name . record) pairs (innermost/deepest first) to a
 ;; backtrace string. record is a source vector #(ns name file line) -> "ns/name
@@ -150,14 +442,6 @@
                     (put-char port #\newline)
                     (loop tail (fx+ shown 1))))))))))
 
-;; Multi-line backtrace for an uncaught value. Two sources, in preference order:
-;;   1. The tail-frame history ring (rt.ss), when JOLT_TRACE enabled it — an
-;;      execution history of the runtime-compiled fns entered before the throw,
-;;      INCLUDING ones TCO erased from the live continuation. Most-recent first.
-;;   2. Otherwise the live continuation (jolt-frame-records) — the accurate but
-;;      TCO-truncated non-tail spine.
-;; Each frame maps to "ns/name (file:line)" when registered, else its bare name.
-;; #f when neither source yields a frame (the caller then prints just the location).
 ;; The tail-frame history ring rendered as a backtrace, or #f when tracing is off /
 ;; empty. A mapped frame is kept; else drop plumbing (same rule as the continuation
 ;; path) so the two sources read consistently.
@@ -168,6 +452,16 @@
 ;; live line at the throw. Do the shift on the RAW list, before dropping plumbing
 ;; frames: a dropped frame still recorded the line of the frame outside it, and
 ;; filtering first would hand that line to the wrong function.
+;; Only the REPL/nREPL error paths (jolt.host/backtrace-string) and the no-
+;; continuation fallback (jolt-backtrace-string) still read the whole history;
+;; the uncaught reporter itself prefers the live continuation and takes just the
+;; innermost rib from the ring (see jolt-backtrace-string below). Since trace-r4
+;; deleted the per-call ring restore, the whole history is a BOUNDED window of
+;; recent subproblems — returned calls' ribs are no longer reused, they just sit
+;; behind the head until jolt-trace-reset! clears them at the next top-level
+;; boundary. Those two paths are best-effort by construction (a REPL's own
+;; continuation is its machinery, and a no-continuation throw has no exact spine
+;; to prefer), so the window is what they show.
 (define (jolt-history-backtrace)
   (let* ((hist (jolt-trace-snapshot))
          (frames (let loop ((es hist) (prev (jolt-throw-line)) (acc '()))
@@ -183,12 +477,53 @@
                                    acc)))))))
     (and (pair? frames) (jolt-render-recs frames))))
 
+;; Recover TCO-erased frames from the history ring. `rib` is the innermost rib's
+;; (name . call-site-line) entries (jolt-trace-innermost-rib), most-recent first:
+;; the tail chain between the throw and the deepest live frame. `cont-names` is a
+;; string-set of the frame names the live continuation already reports. Only
+;; entries GENUINELY ABSENT from the continuation are taken — a frame that is live
+;; cannot have been TCO-erased, so a ring copy of it is either a duplicate of the
+;; continuation or a returned call's residue, and both must be dropped. The line
+;; shift runs over the RAW rib (a dropped entry still recorded the line of the
+;; entry inside it), the same discipline jolt-history-backtrace uses.
+(define (jolt-ring-tail-frames rib cont-names)
+  (let loop ((es rib) (prev (jolt-throw-line)) (acc '()))
+    (if (null? es)
+        (reverse acc)
+        (let* ((e (car es)) (nm (car e)) (line (cdr e))
+               (src (hashtable-ref source-registry nm #f))
+               (own (and (fixnum? prev) (fx>? prev 0) prev)))
+          (loop (cdr es)
+                line
+                (if (and (not (hashtable-ref cont-names nm #f))
+                         (or src (not (srcreg-plumbing-name? nm))))
+                    (cons (srcreg-frame nm src own) acc)
+                    acc))))))
+
+;; Multi-line backtrace for an uncaught value, built from the CONTINUATION with
+;; the ring consulted only for frames TCO erased:
+;;   1. The ring's innermost rib (jolt-trace-innermost-rib) — the tail chain
+;;      between the throw and the deepest live frame. Only entries absent from
+;;      the continuation are spliced in, so a returned call's residue (a rib the
+;;      ring has advanced past, or a live frame's duplicate) cannot appear.
+;;   2. The live continuation (jolt-frame-records) — the exact non-tail spine,
+;;      each frame at the line of the call that created it.
+;; No continuation (a host condition raised outside jolt-throw): fall back to the
+;; whole history as before, since there is no exact source to prefer. #f when
+;; neither source yields a frame (the caller then prints just the location).
 (define (jolt-backtrace-string v)
-  (or (jolt-history-backtrace)
-      (let ((k (jolt-error-continuation v)))
-        (and k
-             (let ((recs (jolt-frame-records k)))
-               (and (pair? recs) (jolt-render-recs recs)))))))
+  (let ((k (jolt-error-continuation v)))
+    (if (not k)
+        (jolt-history-backtrace)
+        (let* ((cont (jolt-frame-records k))
+               (cont-names (let ((h (make-hashtable string-hash string=?)))
+                             (for-each (lambda (f)
+                                         (hashtable-set! h (srcreg-frame-nm f) #t))
+                                       cont)
+                             h))
+               (recs (append (jolt-ring-tail-frames (jolt-trace-innermost-rib) cont-names)
+                             cont)))
+          (and (pair? recs) (jolt-render-recs recs))))))
 
 ;; Exposed for the REPL / nREPL error paths, which catch errors themselves instead
 ;; of going through the uncaught reporter. Returns the "  trace:\n<frames>" block

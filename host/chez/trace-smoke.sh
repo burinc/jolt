@@ -91,6 +91,28 @@ expect_match "innermost frame is boom, at the dividing line" "$out" 'app\.tail/b
 expect_match "caller frame -main, at the call site" "$out" 'app\.tail/-main (.*src/app/tail\.clj:8)'
 expect_no_match "no frame reports a defn line" "$out" 'tail\.clj:[36])'
 
+# 90-deep NON-TAIL recursion must report the TRUE depth and the outermost caller.
+# The ring's outer capacity is 64 ribs: if the reporter ever read the spine off
+# the ring, this would print ~64 `down` frames (the head wraps, and the wrap
+# overwrites -main's own rib) and lose -main entirely — the R3 regression this
+# round must not reintroduce. The live continuation holds all 90 frames, and
+# -main must survive in it too, so its call into `down` is NON-TAIL (a tail
+# call would TCO-erase -main's frame, and the wrapped ring no longer has it).
+cat > "$work/src/app/deep.clj" <<'EOF'
+(ns app.deep)
+(defn down [n]
+  (if (zero? n)
+    (throw (ex-info "deep" {:n n}))
+    (+ 1 (down (dec n)))))
+(defn -main [& _]
+  (let [r (down 90)]
+    (println "sum" r)))
+EOF
+echo "trace smoke: 90-deep non-tail recursion reports the true depth"
+out_deep="$(run_app app.deep)"
+expect_match "deep: outermost caller -main present" "$out_deep" 'app\.deep/-main (.*src/app/deep\.clj:7)'
+expect_match "deep: all 90 down frames reported (true depth)" "$out_deep" 'app\.deep/down.*(x90)'
+
 # A call that RETURNED must leave nothing behind. The ring's outer head only
 # advances on entry, so without the save/restore the emitter pairs around every
 # non-tail call, the ribs of a completed (noisy) call were still there at the next
@@ -117,6 +139,30 @@ echo "trace smoke: JOLT_TRACE=0 opts out"
 out_off="$(run_app app.tail JOLT_TRACE=0)"
 expect_match "still reports the message" "$out_off" 'Unhandled exception: Divide by zero'
 expect_no_match "no history frames when opted out" "$out_off" 'app\.tail/boom'
+
+# Whether tracing is on changes the code the emitter produces — the entry prologue
+# and the per-call save/restore are baked in at compile time. So a cached fasl is
+# only valid for the trace mode it was compiled under, and the cache generation has
+# to say which. It did not, so the two modes shared a generation and each loaded the
+# other's artifacts: a JOLT_TRACE=0 run first left untraced fasls that a later traced
+# run happily reused, silently reporting NO history frames — the feature turned off
+# by a cache hit. The reverse direction cost speed instead of frames (a traced fasl
+# reused under JOLT_TRACE=0), which is how this surfaced.
+echo "trace smoke: the AOT cache does not share artifacts across trace modes"
+cache="$work/tracecache"
+rm -rf "$cache"
+# cold, tracing OFF: compiles and caches untraced fasls
+run_app app.tail "JOLT_CACHE_DIR=$cache JOLT_TRACE=0" > /dev/null
+# warm, tracing ON, same cache: must NOT serve the untraced artifacts
+out_flip="$(run_app app.tail "JOLT_CACHE_DIR=$cache")"
+expect_match "tracing on after an untraced run still names the throwing fn" "$out_flip" 'app\.tail/boom (.*src/app/tail\.clj:4)'
+expect_match "...and its caller" "$out_flip" 'app\.tail/-main (.*src/app/tail\.clj:8)'
+# and the other direction: a traced generation must not be served to an opted-out run
+cache2="$work/tracecache2"
+rm -rf "$cache2"
+run_app app.tail "JOLT_CACHE_DIR=$cache2" > /dev/null
+out_flip2="$(run_app app.tail "JOLT_CACHE_DIR=$cache2 JOLT_TRACE=0")"
+expect_no_match "JOLT_TRACE=0 after a traced run has no history frames" "$out_flip2" 'app\.tail/boom'
 
 # .printStackTrace over each shape a catch can bind: a host-raised arithmetic
 # error, an ex-info, and a constructed exception. Each must print "class: message"
