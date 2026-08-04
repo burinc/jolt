@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-08-04
+
+Rebuilds tracing on compile-time metadata, removing the per-entry ring push
+that 0.6.1 left in place — tracing is now effectively free and on by default
+everywhere, including built binaries. (#531, #532)
+
+### Changed
+
+- **Tracing is ~free, in dev mode and in built binaries.** The tail-frame
+  ring, the per-entry push, the per-call line store, and the tail mark are all
+  gone. The only runtime instrumentation left is one virtual-register store of
+  a static `(fn . line)` pair at tail call sites; every call site additionally
+  registers its static callee in load-time tables, and the reporter
+  RECONSTRUCTS TCO-erased chains from those tables at throw time — backward
+  from the throw-site pair through unambiguous tail edges, forward between
+  live frames through unique tail-exit paths. Reconstruction can be
+  incomplete (a fork in the static call graph stops it; a mutual-recursion
+  cycle renders once, not per iteration) but never invented. Dev mode against
+  `JOLT_TRACE=0` on the same binary: `fib` 7.1 → 0.9 ms (floor 0.7; was ~10×),
+  `tak` at the floor (was ~9×), `binary-trees` 70.1 vs floor 68.0 (was 1.6×),
+  `arrays`/`mathfns`/`loop-recur`/`mandelbrot` at floor parity. A zipper-heavy
+  library test suite (rewrite-clj, ~10⁸ delegation tail calls) runs traced at
+  untraced speed. An intermediate continuation-marks design was measured and
+  rejected: Chez marks ballooned the heap to tens of GB at that call volume.
+- **`jolt build` bakes tracing in by default.** A deployed binary's uncaught
+  error names TCO-erased frames with exact lines — the site literals and
+  tables carry everything; no source or marker files needed at run time.
+  `JOLT_TRACE=0 jolt build` produces an untraced binary (build-time axis; the
+  baked binary has no runtime knob). Built benches, traced vs untraced
+  builds: `tak`/`binary-trees`/`arrays`/`mathfns`/`loop-recur`/`mandelbrot`
+  within noise; `fib:30` 9.5 vs 7.7 ms (~0.6 ns/call — the tail-site store on
+  tail-position arithmetic, which can throw and so must be recorded).
+
+### Added
+
+- **Host faults get real traces.** A raw Chez condition (a bad
+  primitive-array index) has its site captured pre-unwind — in the cli run
+  path and in built binaries' launchers — so the trace names the faulting fn
+  and line. These previously fell back to a bounded history window, or
+  nothing.
+- **Erased frames recover at every spine level.** Forward gap-filling names
+  the TCO-erased fns between any two live frames when the static call graph
+  is unambiguous there — the old ring only ever recovered the innermost
+  chain.
+
+### Fixed
+
+- An explicit `throw` in tail position reported its fn's definition line
+  instead of the throw line.
+- A trace could show a caller above its callee when the throw left live
+  frames below a recovered chain.
+
 ## [0.6.1] - 2026-08-04
 
 Undoes a dev-mode performance regression that shipped in 0.5.20 and 0.6.0, and
