@@ -6,25 +6,22 @@
 # The AOT cache used to compile a pid-unique temp (base.tmp<pid>.scm) and rename
 # it away, so every frame from a cache hit pointed at a path that no longer
 # exists. This check drives a throwing app twice under a fresh JOLT_CACHE_DIR —
-# cold (miss) then warm (hit) — and on the WARM run asserts that the source path
-# baked into the cached .so (the same string the frame source objects carry, and
-# what the R3 trace will resolve offsets against) exists on disk and is the
-# final .scm, not a temp.
+# cold (miss) then warm (hit) — and on the WARM run asserts that the path the
+# RUNTIME reports for each frame exists on disk and is the final .scm, not a temp.
 #
-# The path is observed in the fasl rather than by walking frames because nothing
-# in the shipped runtime exposes it yet — jolt-frame-records reads only each
-# frame's NAME today. The .so is the same bytes the frames were compiled from, so
-# the paths it embeds ARE the ones the frame source objects carry.
-#
-# It is NOT that the continuation cannot supply it. A frame's (io 'source-object)
-# and (io 'source-path) do carry the path, and with this fix in place the latter
-# resolves all three values instead of two — file, line and column — precisely
-# because the file now exists:
 #   before:  (".../boom-74-E212836D-11.tmp12072.scm" 570)      <- missing
 #   after:   (".../boom-74-E212836D-11.scm" 3 125)             <- exists
-# (An inspector message returns an inspector OBJECT; reading it carelessly yields
-# #f and makes it look as though Chez kept nothing.) R3 walks frames for real and
-# should assert the frame-side property directly then.
+#
+# Chez resolves a source object to line and column only when it can read the file,
+# which is why the fixed form yields three values where the broken one yielded two.
+#
+# The path comes from the frame source objects (JOLT_DEBUG_FRAMES prints them),
+# NOT from scraping the cached .so. Chez fasls are compressed, so `strings` over
+# one returns mangled fragments: on Linux CI an earlier version of this check read
+# "W.DXMDTLZWm5/…scm" for a real path of "/tmp/tmp.DXMDTLZWm5/…scm" and failed
+# while the runtime was entirely correct. It passed on macOS, which is how it got
+# this far. The runtime's own report is also what the trace actually resolves
+# offsets against, so it is the right thing to assert on.
 
 set -e
 
@@ -79,36 +76,36 @@ else
   fails=$((fails+1))
 fi
 
-# --- (c) every source path baked into the cached .so exists and is final -------
-so="$(find "$cache" -name '*.so' 2>/dev/null | head -1)"
-if [ -z "$so" ]; then
-  echo "FAIL: (c) no .so under the cache dir — nothing was cached"
+# --- (c) the path the RUNTIME reports for a cached frame exists and is final ---
+# Read from the frame source objects via JOLT_DEBUG_FRAMES, not by scraping the
+# .so. Chez fasls are COMPRESSED, so `strings`/`grep -a` over one yields mangled
+# fragments -- on Linux CI this produced "W.DXMDTLZWm5/...scm" for a real path of
+# "/tmp/tmp.DXMDTLZWm5/...scm", which read as a missing file and failed the gate
+# while the runtime was perfectly correct. It happened to work on macOS. The
+# runtime's own report is both the honest source and the thing R3 actually
+# resolves offsets against.
+paths="$(printf '%s' "$out_b" \
+  | sed -n 's/.*source=\([^ ]*\.scm\)@[0-9][0-9]*.*/\1/p' | sort -u)"
+if [ -z "$paths" ]; then
+  echo "FAIL: (c) no frame reported a .scm source path on the warm run"
+  printf '%s\n' "$out_b" | grep '\[frame\]' | head -10
   fails=$((fails+1))
 else
-  echo "PASS: (c) cache holds a .so: $so"; pass=$((pass+1))
-  # `strings` is binutils and is not everywhere; fall back to a binary-safe grep
-  # so a host without it reports the real result instead of a spurious failure.
-  if command -v strings >/dev/null 2>&1; then
-    paths="$(strings "$so" 2>/dev/null | grep -o '[^[:space:]]*\.scm' | sort -u)"
-  else
-    paths="$(LC_ALL=C grep -a -o '[^[:space:]]*\.scm' "$so" 2>/dev/null | sort -u)"
-  fi
-  if [ -z "$paths" ]; then
-    echo "FAIL: (c2) no .scm path embedded in the cached .so"
-    fails=$((fails+1))
-  else
-    echo "PASS: (c2) cached .so embeds $(printf '%s\n' "$paths" | wc -l | tr -d ' ') source path(s)"
-    pass=$((pass+1))
-  fi
+  echo "PASS: (c) warm frames report $(printf '%s\n' "$paths" | wc -l | tr -d ' ') source path(s)"
+  pass=$((pass+1))
   for p in $paths; do
+    case "$p" in
+      /*) ;;
+      *)  echo "FAIL: (c1) reported path is not absolute: $p"; fails=$((fails+1)); continue ;;
+    esac
     if [ -f "$p" ]; then
-      echo "PASS: (c3) recorded path exists: $p"; pass=$((pass+1))
+      echo "PASS: (c2) reported path exists: $p"; pass=$((pass+1))
     else
-      echo "FAIL: (c3) recorded path does not exist: $p"; fails=$((fails+1))
+      echo "FAIL: (c2) reported path does not exist: $p"; fails=$((fails+1))
     fi
     case "$p" in
-      *".tmp"*) echo "FAIL: (c4) recorded path is a temp: $p"; fails=$((fails+1)) ;;
-      *) echo "PASS: (c4) recorded path is the final .scm: $p"; pass=$((pass+1)) ;;
+      *".tmp"*) echo "FAIL: (c3) reported path is a temp: $p"; fails=$((fails+1)) ;;
+      *) echo "PASS: (c3) reported path is the final .scm: $p"; pass=$((pass+1)) ;;
     esac
   done
 fi
