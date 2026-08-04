@@ -55,7 +55,7 @@ endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
-  compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
+  aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr grenadine \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
@@ -117,7 +117,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   traceemit \
   inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke \
-  gatebootsmoke aotcachesmoke aotfingerprint compilepathsmoke makefilesmoke \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   certify
 TEST-GATES := submodules selfhost ci
 
@@ -580,6 +580,13 @@ compilepathsmoke: testbin
 # equal-hash saw ~26 bytes of a source and served stale fasls for everything else.
 aotfingerprint:
 	@$(CHEZ) --script test/chez/aot-fingerprint-test.ss
+
+# A frame from a CACHED namespace must report a source path that EXISTS. The cache
+# used to compile a pid-unique temp and rename it away, so compile-file baked a
+# path that died with the rename — which the R3 trace would then fail to resolve
+# offsets against.
+aotcachepathsmoke: testbin
+	@sh test/chez/aot-cache-path-smoke.sh
 
 # Perf measurement: cold (recompile) vs warm (cache hit) for a multi-library
 # require. Needs Maven jars locally; NOT in the default ci gate (timing budget).

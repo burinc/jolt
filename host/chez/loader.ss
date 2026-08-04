@@ -714,6 +714,13 @@
 ;; ("No namespace: X found"). So each process compiles to a pid-unique temp and
 ;; rename(2)s it into place — atomic within a filesystem, so the .so appears
 ;; complete-or-not-at-all. The .so (the cache-hit signal) is published LAST.
+;; The .scm is also published via temp + rename, landing at its FINAL name BEFORE
+;; the compile: compile-file bakes the name of the file it read into the frame
+;; source objects, so compiling the temp would leave every cached frame pointing
+;; at a path deleted by the rename. Temp+rename keeps a concurrent compiler from
+;; ever seeing a half-written .scm (two processes race on base.scm; each sees a
+;; complete file, and the content is a pure function of the key, so both write
+;; the same bytes anyway).
 ;; The final base is only known AFTER the capture load: it folds in the deps, and
 ;; the deps are what that load records. Writing under the pre-load base instead
 ;; would strand the fasl — the next run computes the key WITH deps and misses it,
@@ -742,12 +749,12 @@
                           (delete-file tmp-scm #f) (delete-file tmp-so #f) #f))
             (let ((out (open-output-file tmp-scm 'replace)))
               (put-string out captured) (close-output-port out))
+            (rename-file tmp-scm scm)
             ;; compile-file prints "compiling X with output to Y" per file to
             ;; current-output-port by default — swallow it so a cache miss can't
             ;; corrupt the running program's stdout.
             (parameterize ((current-output-port (open-output-string)))
-              (compile-file tmp-scm tmp-so))
-            (rename-file tmp-scm scm)
+              (compile-file scm tmp-so))
             (rename-file tmp-so so))
           (unless (file-exists? so)
             (aot-info (string-append "no .so produced for " name))))))))
@@ -959,6 +966,10 @@
 ;; pid-unique temp and rename(2) each file into place, .so last, so a concurrent
 ;; reader sees a complete artifact or none. The stale .so goes first for the same
 ;; reason — until the new one lands there must be no signal pointing at old .meta.
+;; The .scm lands at its FINAL name before the compile: compile-file bakes the
+;; name of the file it read into the frame source objects, so compiling the temp
+;; would leave every frame loaded from this artifact pointing at a path deleted
+;; by the rename (same bug as the AOT cache's, fixed alongside it).
 (define (cpath-publish! name dir captured deps)
   (let* ((base (string-append dir "/" (ns-name->rel name)))
          (pid (number->string (get-process-id)))
@@ -968,12 +979,12 @@
     (guard (e (else (delete-file tmp-scm #f) (delete-file tmp-so #f) (raise e)))
       (let ((out (open-output-file tmp-scm 'replace)))
         (put-string out captured) (close-output-port out))
+      (rename-file tmp-scm (cpath-scm-file base))
       ;; compile-file narrates to current-output-port by default — swallow it so a
       ;; compile can't corrupt the running program's stdout.
       (parameterize ((current-output-port (open-output-string)))
-        (compile-file tmp-scm tmp-so))
+        (compile-file (cpath-scm-file base) tmp-so))
       (delete-file (cpath-so-file base) #f)
-      (rename-file tmp-scm (cpath-scm-file base))
       (cpath-write-meta! (cpath-meta-file base) (cpath-meta-lines name deps))
       (rename-file tmp-so (cpath-so-file base)))
     base))

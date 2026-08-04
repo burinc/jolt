@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **AOT cache frames point at the cached `.scm`, not a deleted temp.** The cache
+  compiled the emitted Scheme from a pid-unique temp and renamed both files into
+  place, so `compile-file` baked the temp's name into every frame's source object
+  — a path that died the moment the rename happened. The `.scm` is now published
+  at its final name (still via temp + atomic rename, so concurrent compilers never
+  see a half-written file) and compiled from there; only the `.so` temp is renamed
+  last. The same fix lands in `clojure.core/compile`'s artifact writer, which had
+  the identical shape.
+
 ## [0.6.0] - 2026-08-03
 
 Running third-party suites through each library's *own* runner, instead of a
