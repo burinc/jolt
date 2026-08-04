@@ -156,9 +156,9 @@
   (gate-check "(10) tracing on: marker before the line-3 call" (gate-sub? e "#|L3|#") #t)
   (gate-check "(10) tracing on: no marker on the def line" (gate-sub? e "#|L1|#") #f)
   ;; R2 (bead jolt-knn8): the per-call fixnum store is gone — a marker is a
-  ;; comment only. mdemo's sole tail call goes through jolt-invoke (f is a
-  ;; param, a dynamic callee), so it records via continuation marks; nothing
-  ;; here writes the site vreg at all.
+  ;; comment only. mdemo's fn literal is UNNAMED, so it has no *trace-site*
+  ;; and its tail call emits plain (R4: a tail site is one jolt-site! store
+  ;; of the enclosing fn's static pair, which an anonymous fn cannot name).
   (gate-check "(10) tracing on: no per-call site store (R2)"
               (gate-sub? e "(jolt-site! ") #f)
   ;; the marker is genuinely a comment: reading the emitted string yields the
@@ -185,9 +185,10 @@
   (gate-check "(10b) exactly one site store" (= (count-sub? e "(jolt-site! ") 1) #t)
   ;; this harness emits with source registration OFF, so the callee registers
   ;; under its bare munged name (the direct-link-build form); with it on (dev,
-  ;; open-world build) the same site registers "clojure.core/+".
+  ;; open-world build) the same site registers "clojure.core/+". The trailing
+  ;; #t is the tail? flag (R4) — chain reconstruction follows tail edges only.
   (gate-check "(10b) callsite registered with its static callee"
-              (gate-sub? e "(jolt-register-callsite! \"sdemo\" 2 \"+\")") #t))
+              (gate-sub? e "(jolt-register-callsite! \"sdemo\" 2 \"+\" #t)") #t))
 (set-trace-frames! #f)
 (let ((e (emit-num sited-src)))
   (gate-check "(10b) tracing off: no site store" (gate-sub? e "(jolt-site! ") #f)

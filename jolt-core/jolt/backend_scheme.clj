@@ -143,12 +143,13 @@
 ;; is populated before each form's emit.
 (defn- ctor-shapes [] (get @(:config (cur)) :record-shapes))
 
-;; Opt-in tail-frame history (JOLT_TRACE): instrument TAIL CALL SITES with
-;; continuation marks (rt.ss jolt-trace-rib / jolt-trace-rib-site!) so a
-;; TCO-elided frame still shows in an error's backtrace — nothing in a fn
-;; prologue, no per-entry work (R1, bead jolt-pfhc). OFF during the seed mint and
-;; `jolt build` (byte-determinism + no runtime cost); compile-eval.ss turns it on
-;; for runtime-eval'd user code when JOLT_TRACE is set.
+;; Tail-frame tracing (JOLT_TRACE): a TAIL CALL SITE stores its static
+;; ('ns/fn' . line) pair in the site vreg — one store, no allocation, nothing
+;; in a fn prologue (R4, bead jolt-hm1p) — and every call site registers its
+;; static callee in the callsite tables at def load, from which the reporter
+;; reconstructs TCO-erased chains. OFF during the seed mint (byte-determinism);
+;; compile-eval.ss turns it on for runtime-eval'd user code and build.ss for
+;; `jolt build` output, both honoring JOLT_TRACE=0.
 (defn set-trace-frames! [on] (reset! (:trace-frames? (cur)) (boolean on)))
 (defn- trace-frames? [] @(:trace-frames? (cur)))
 
@@ -243,14 +244,23 @@
 ;; call share it), so each line maps to a VECTOR of distinct callees and the
 ;; validator accepts membership; a single-winner entry false-rejected genuine
 ;; pairs whenever calls nest on one line.
-(defn- register-callsite! [line callee]
+;; Entries are [callee tail?]: the reporter's chain reconstruction follows
+;; TAIL edges only (a chain hop is by definition a tail call); the validator
+;; consults every entry. A site seen both ways keeps tail? = true.
+(defn- register-callsite! [line callee tail?]
   (when (and (trace-frames?) *callsites* *trace-site* line callee)
     (let [m @*callsites*
           sites (get m *trace-site*)
-          cur (get sites line)]
-      (when-not (some (fn [c] (= c callee)) cur)
+          cur (get sites line)
+          seen (some (fn [e] (when (= (nth e 0) callee) e)) cur)]
+      (cond
+        (nil? seen)
         (swap! *callsites* assoc *trace-site*
-               (assoc sites line (conj (or cur []) callee)))))))
+               (assoc sites line (conj (or cur []) [callee (boolean tail?)])))
+        (and tail? (not (nth seen 1)))
+        (swap! *callsites* assoc *trace-site*
+               (assoc sites line (mapv (fn [e] (if (= (nth e 0) callee) [callee true] e))
+                                       cur)))))))
 ;; The static callee fqn of a call site's fn head, or nil for a genuinely dynamic
 ;; callee (an arbitrary IFn through jolt-invoke — register nothing for that line).
 ;; :var — the var's fqn, matching the qualified name a source-registered frame
@@ -283,9 +293,9 @@
     (str/join ""
       (for [[site sites] (sort-by key @*callsites*)
             [line callees] (sort-by key sites)
-            callee (sort callees)]
+            [callee tail?] (sort-by (fn [e] (nth e 0)) callees)]
         (str " (jolt-register-callsite! " (chez-str-lit site) " " line " "
-             (chez-str-lit callee) ")")))
+             (chez-str-lit callee) " " (if tail? "#t" "#f") ")")))
     ""))
 
 (defn- fresh-label [prefix] (str prefix (swap! (:gensym-counter (cur)) inc)))
@@ -942,41 +952,15 @@
 ;; A plain Scheme application: (callee op ...).
 (defn- plain-call [callee operand-strs]
   (str "(" callee (if (seq operand-strs) (str " " (str/join " " operand-strs)) "") ")"))
-;; A bare Scheme identifier (vs a composite callee expression).
-(defn- bare-scheme-id? [s] (boolean (re-matches #"[^()\s]+" s)))
-;; A tail call in trace mode (R1, bead jolt-pfhc). Force-bind the operands to
-;; temps FIRST (so any operand whose own evaluation records a trace entry runs
-;; before the instrumentation; the call stays the last form, so TCO is
-;; preserved), then read the current frame's continuation mark in tail position:
-;; a live rib (a tail chain is already running) is mutated in place with this
-;; site; #f (this frame was entered non-tail) starts a fresh 8-slot rib under
-;; with-continuation-mark. The site literal '("ns/fn" . line) is a static pair
-;; baked in the emitted code; <line> is where THIS fn's tail call happens (no
-;; caller-line shift). The callee expression appears twice; a non-identifier
-;; callee is bound to a temp too. Self-tail calls never reach here (emit-call
-;; elides them), so a tight self-loop records once, not per iteration.
-(defn- traced-tail-call [site-qname line callee operand-strs]
-  (let [tts (mapv (fn [_] (fresh-label "_tt$")) operand-strs)
-        cal (when-not (bare-scheme-id? callee) (fresh-label "_tc$"))
-        binds (str/join " "
-                        (concat (when cal [(str "(" cal " " callee ")")])
-                                (map (fn [t a] (str "(" t " " a ")")) tts operand-strs)))
-        v (fresh-label "_tv$")
-        site (str "'(" (chez-str-lit site-qname) " . " line ")")
-        call (plain-call (or cal callee) tts)]
-    (str "(let* (" binds ") "
-         "(call-with-immediate-continuation-mark jolt-trace-key "
-         "(lambda (" v ") "
-         "(if (vector? " v ") "
-         "(begin (jolt-trace-rib-site! " v " " site ") " call ") "
-         "(with-continuation-mark jolt-trace-key "
-         "(jolt-trace-rib " site ") " call ")))))")))
-;; A tail call to a NATIVE op (or jolt-throw): no marks — it cannot extend a
-;; user-fn tail chain — but the ('ns/fn' . line) pair goes into the site vreg so
-;; the reporter can name this frame if the native op throws (the frame is TCO-
-;; erased by the tail call). Same temp discipline as traced-tail-call, and for
-;; the same reason: an operand's own invoke stores a fixnum into the slot, so
-;; the pair must be stored after the operands are bound, right before the call.
+;; A tail call in trace mode (R4, bead jolt-hm1p): ONE virtual-register store
+;; of the static ('ns/fn' . line) site pair, after the operands are temp-bound
+;; — an operand's own tail site would otherwise stomp the slot before the call
+;; runs. The call stays the last form, so TCO is preserved. This is the WHOLE
+;; runtime instrumentation; erased chains are reconstructed at report time
+;; from the callsite tables. (The R1-R3 continuation-marks design recorded
+;; chains at runtime and ballooned the heap on delegation-heavy code — every
+;; mark op allocated; see rt.ss.) Self-tail calls never reach here (emit-call
+;; elides them), so a tight self-loop stores once, not per iteration.
 (defn- sited-tail-call [site-qname line callee operand-strs]
   (let [tts (mapv (fn [_] (fresh-label "_tt$")) operand-strs)
         binds (str/join " " (map (fn [t a] (str "(" t " " a ")")) tts operand-strs))
@@ -985,17 +969,13 @@
       (str "(let* (" binds ") (jolt-site! " site ") " (plain-call callee tts) ")")
       (str "(begin (jolt-site! " site ") " (plain-call callee operand-strs) ")"))))
 ;; Emit a call. In tail position with tracing on, a call to a DIFFERENT fn than
-;; the enclosing one is instrumented as a tail site — marks (traced-tail-call)
-;; for user fns, the site-vreg pair (sited-tail-call) for native ops and
-;; jolt-throw (R1 addendum: they cannot extend a user-fn tail chain). Everything
-;; else — non-tail calls, JOLT_TRACE=0, direct self-tail-calls — is a plain
+;; the enclosing one stores its site pair (sited-tail-call). Everything else —
+;; non-tail calls, JOLT_TRACE=0, direct self-tail-calls — is a plain
 ;; application, byte-identical to untraced code.
-(defn- emit-call [tail? callee operand-strs line marks?]
+(defn- emit-call [tail? callee operand-strs line]
   (if (and (trace-frames?) tail? *trace-site*
            (not (contains? *trace-self* callee)))
-    (if marks?
-      (traced-tail-call *trace-site* line callee operand-strs)
-      (sited-tail-call *trace-site* line callee operand-strs))
+    (sited-tail-call *trace-site* line callee operand-strs)
     (plain-call callee operand-strs)))
 
 (defn- emit-invoke [node]
@@ -1008,7 +988,7 @@
         ;; R2: record this site's static callee for the callsite table. Runs after
         ;; the args are emitted, so when a line carries both a call and its
         ;; operand's call the OUTER (later-emitted) callee wins — the tail call's.
-        _ (when tl (register-callsite! tl (static-callee fnode)))
+        _ (when tl (register-callsite! tl (static-callee fnode) tail?))
         nop (native-op fnode (count args))
         kind (ifn-kind fnode)
         ;; order args left-to-right (build receives the spliced operand strings)
@@ -1024,7 +1004,7 @@
                                 (str "jolt-invoke" (count args))
                                 "jolt-invoke")]
                    (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
-                                 (fn [operands] (emit-call tail? callee operands tl true)))))]
+                                 (fn [operands] (emit-call tail? callee operands tl)))))]
     (cond
       ;; devirtualized protocol call: the inference proved the receiver (arg 0) is
       ;; one record type, so resolve the impl by that static tag instead of routing
@@ -1158,7 +1138,7 @@
           idx  (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit key-node) ")")))
           :else (order-args (fn [as] (str "(jolt-get " (str/join " " as) ")")))))
       ;; a generic native op.
-      nop (order-args (fn [as] (emit-call tail? nop as tl false)))
+      nop (order-args (fn [as] (emit-call tail? nop as tl)))
       ;; (:k coll [default]) -> (jolt-get coll :k [default]) — the key (fnode) is a
       ;; const, so only the coll/default args carry order. When the inference typed
       ;; the receiver as a record whose declared fields include :k (it carries the
@@ -1203,7 +1183,7 @@
       ;; holds an arbitrary IFn -> dynamic dispatch.
       (= :local (:op fnode))
       (if (*known-procs* (munge-name (:name fnode)))
-        (order-args (fn [as] (emit-call tail? (munge-name (:name fnode)) as tl true)))
+        (order-args (fn [as] (emit-call tail? (munge-name (:name fnode)) as tl)))
         (invoke))
       ;; closed-world direct call: the callee var is an app fn def already emitted
       ;; with a Scheme binding — apply it directly, no var lookup, no jolt-invoke.
@@ -1212,7 +1192,7 @@
       ;; below (which still uses the direct binding as the invoke target).
       (and (= :var (:op fnode)) (direct-linkable? (:ns fnode) (:name fnode))
            (direct-link-fn? (:ns fnode) (:name fnode)))
-      (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as tl true)))
+      (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as tl)))
        ;; record ctor with matching arity: inline the native per-arity ctor
        ;; (make-jrecN) directly — desc + ext + one inline slot per field —
        ;; eliminating jolt-invoke / var-deref / rest-list / ctor call / hashtable
@@ -1443,7 +1423,7 @@
     ;; the thrown expression's — (throw (ex-info …)) sits on one line.
     :throw (let [line (or (node-line node) (node-line (:expr node)))
                  e (binding [*tail?* false] (emit (:expr node)))
-                 call (emit-call *tail?* "jolt-throw" [e] (or line 0) false)]
+                 call (emit-call *tail?* "jolt-throw" [e] (or line 0))]
              (if (and (trace-frames?) line)
                (str "#|L" line "|# " call)
                call))
@@ -1564,20 +1544,36 @@
                               (:arities (:init node))))
         vreg (when anon-variadic
                (str " (jolt-register-variadic! " anon-variadic " " b ")"))
-        init (binding [*variadic-reg-suppressed?* (boolean anon-variadic)]
-               (emit-with-cells #(emit (:init node))))]
+        ;; *callsites* is bound around the init emission and the registration
+        ;; sibling read while still bound — this is the BUILD path's def emit,
+        ;; and without it a built binary had empty callsite tables: the
+        ;; reporter's backwalk dead-ended after the throw-time pair and a
+        ;; built trace showed the erased fn but never its erased callers.
+        init+creg (binding [*variadic-reg-suppressed?* (boolean anon-variadic)
+                            *callsites* (when (trace-frames?) (atom {}))]
+                    (let [i (emit-with-cells #(emit (:init node)))]
+                      [i (trace-callsite-reg)]))
+        init (nth init+creg 0)
+        creg (nth init+creg 1)]
     (cond
       dl?
       (if (jmeta-nonempty? (:meta node))
         (str "(begin (define " b " " init ") (def-var-with-meta! "
              (chez-str-lit ns) " " (chez-str-lit nm) " " b " " (emit-def-meta node) ")"
-             (or reg "") (or vreg "") ")")
+             (or reg "") (or vreg "") creg ")")
         (str "(begin (define " b " " init ") (def-var! "
-             (chez-str-lit ns) " " (chez-str-lit nm) " " b ")" (or reg "") (or vreg "") ")"))
+             (chez-str-lit ns) " " (chez-str-lit nm) " " b ")" (or reg "") (or vreg "") creg ")"))
       (jmeta-nonempty? (:meta node))
-      (str "(def-var-with-meta! " (chez-str-lit ns) " " (chez-str-lit nm) " " init " " (emit-def-meta node) ")")
+      (if (= creg "")
+        (str "(def-var-with-meta! " (chez-str-lit ns) " " (chez-str-lit nm) " " init " " (emit-def-meta node) ")")
+        ;; a def evaluates to its var — bind, register, hand the var back
+        (let [v (fresh-label "_dv$")]
+          (str "(let ((" v " (def-var-with-meta! " (chez-str-lit ns) " " (chez-str-lit nm) " " init " " (emit-def-meta node) ")))" creg " " v ")")))
       :else
-      (str "(def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")"))))
+      (if (= creg "")
+        (str "(def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")")
+        (let [v (fresh-label "_dv$")]
+          (str "(let ((" v " (def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")))" creg " " v ")"))))))
 
 (defn emit-top-form [node]
   (cond

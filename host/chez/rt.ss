@@ -190,45 +190,32 @@
 ;; stack trace (source-registry.ss). call/cc is paid only on a throw, never per
 ;; call; the captured k is walked, never invoked.
 (define jolt-throw-cont (make-thread-parameter #f))
-;; The continuation marks (incl. the tail-site rib chain) captured at the same
-;; throw, cleared together with the continuation. Read by source-registry.ss.
-(define jolt-throw-marks (make-thread-parameter #f))
 ;; The site vreg's ('ns/fn' . line) pair as it stood AT the raise (R2, bead
-;; jolt-knn8). Only tail sites write the vreg now, so its live value can be a
-;; returned chain's residue — the reporter must see the throw-time snapshot,
-;; validated against the callsite table, never the live slot.
+;; jolt-knn8). Only tail sites write the vreg, so its live value can be a
+;; returned call's residue — the reporter must see the throw-time snapshot,
+;; validated against the callsite tables, never the live slot.
 (define jolt-throw-sitep (make-thread-parameter #f))
 
 ;; Cleared after a catch handler completes normally so the parked continuation
 ;; (and its captured frames) does not root live data until the next throw.
 (define (jolt-catch-complete!)
-  (jolt-throw-cont #f) (jolt-throw-marks #f) (jolt-throw-sitep #f))
+  (jolt-throw-cont #f) (jolt-throw-sitep #f))
 
-;; --- tail-frame marks: TCO-erased frames via continuation marks (opt-in) -----
+;; --- tail-frame recovery: compile-time tables + one vreg store (R4) ----------
 ;; TCO erases tail-called frames from the native continuation, so an uncaught
-;; error's backtrace shows only the surviving non-tail spine — the immediate error
-;; site is often a tail call and is missing. When tracing is enabled (JOLT_TRACE,
-;; wired in compile-eval.ss), the emitter instruments TAIL CALL SITES ONLY —
-;; nothing in a fn prologue, no per-entry work at all: a site reads the current
-;; frame's continuation mark (call-with-immediate-continuation-mark), mutates the
-;; shared rib in place when the caller chain is live, or starts a fresh rib with a
-;; static ('ns/fn' . line) site literal (with-continuation-mark). The mark lives on
-;; the Chez continuation (Flatt/Dybvig PLDI 2020) and dies with its frame, so a
-;; returned call leaves nothing behind: staleness is impossible by construction,
-;; and the ring-of-ribs machinery this replaced is gone (R1, bead jolt-pfhc).
-(define jolt-trace-key '|jolt%trace|)
-;; A rib: #(count buf) — buf holds 8 site literals, count is MONOTONIC (entries
-;; live at (fxand i 7); total-count - 8 = elided when > 8). A site is a static pair
-;; '("ns/fn" . line) baked in the emitted code — no registry, no id coordination,
-;; allocated once at compile.
-(define (jolt-trace-rib site)
-  (let ((b (make-vector 8 #f)))
-    (vector-set! b 0 site)
-    (vector 1 b)))
-(define (jolt-trace-rib-site! rib site)
-  (let ((h (vector-ref rib 0)) (b (vector-ref rib 1)))
-    (vector-set! b (fxand h 7) site)
-    (vector-set! rib 0 (fx+ h 1))))
+;; error's backtrace shows only the surviving non-tail spine — the immediate
+;; error site is often a tail call and is missing. When tracing is enabled
+;; (JOLT_TRACE, wired in compile-eval.ss), the emitter instruments TAIL CALL
+;; SITES ONLY, and the instrumentation is ONE virtual-register store of a
+;; static ('ns/fn' . line) pair — no allocation, no marks, no per-entry work.
+;; Erased chains are reconstructed at REPORT time from the callsite tables
+;; (above): backward from the throw-time pair through unambiguous tail-entry
+;; edges, forward from each live frame's registered callee through unambiguous
+;; tail exits. Two earlier designs died here: the R0 ring push cost ~10x on
+;; call-heavy code, and the R1-R3 continuation-marks ribs ballooned the heap
+;; to tens of GB on delegation-heavy code (rewrite-clj's zipper suite: 40s ->
+;; 300s timeout; every hop's mark op allocated). What ships is the JVM model:
+;; all metadata compile-time, the stack itself the only runtime record.
 (define jolt-trace-on? #f)
 ;; Per-thread trace state lives in Chez VIRTUAL REGISTERS, not thread parameters:
 ;; a thread-parameter WRITE costs ~32ns against ~1ns for a virtual-register write
@@ -309,28 +296,60 @@
     (set-virtual-register! jolt-vreg-catch-line (if (pair? cur) cur 0))
     prev))
 
-;; --- compile-time callsite table (R2, bead jolt-knn8) ------------------------
-;; (jolt-register-callsite! "ns/f" line "ns/callee"): the emitter registers, at
-;; def load time, the STATIC callee of each call site in a traced fn. Costs
-;; nothing per call — it is the metadata that lets the reporter reject a stale
-;; site pair: a pair is spliced as the innermost frame only when the callsite
-;; table agrees that the innermost live context actually called that fn.
+;; --- compile-time callsite tables (R2 + R4, beads jolt-knn8 / jolt-hm1p) -----
+;; (jolt-register-callsite! "ns/f" line "ns/callee" tail?): the emitter
+;; registers, at def load time, the STATIC callee of each call site in a traced
+;; fn. Costs nothing per call — this is the metadata the reporter reconstructs
+;; TCO-erased chains from (R4: there is NO runtime chain recording at all; Chez
+;; continuation marks at production volume ballooned the heap to tens of GB on
+;; delegation-heavy code, so the whole marks layer was replaced by these tables
+;; plus the two vreg site stores).
+;; Three views, all load-time-built, report-time-read:
+;;   all sites:  (fqn:line) -> callees     — the staleness validator's evidence
+;;   tail exits: fqn -> ((line . callee)…) — forward walk: how a fn left its
+;;                                           frame (the TCO hop it made)
+;;   tail entries: callee -> ((fqn . line)…) — backward walk: who could have
+;;                                             tail-called the erased fn
 ;; A line can carry several calls (an operand and its outer call share it), so
-;; each key maps to a LIST of distinct callees and validation is membership.
+;; every view holds LISTS of distinct entries; walks follow only UNAMBIGUOUS
+;; edges and stop at the first fork, so a reconstruction can be incomplete but
+;; never invented.
 (define jolt-callsite-table (make-hashtable string-hash string=?))
+(define jolt-tail-exits (make-hashtable string-hash string=?))
+(define jolt-tail-entries (make-hashtable string-hash string=?))
+;; fn -> every callee it registers anywhere: the validator's second evidence
+;; tier, because a CATCH context's frame can resolve to an imprecise line (the
+;; guard's establishment point, not the failing try's) and a line-keyed lookup
+;; then reads the wrong site's callees.
+(define jolt-fn-callees-table (make-hashtable string-hash string=?))
 (define (jolt-callsite-key fqn line)
   (string-append fqn ":" (number->string line)))
-(define (jolt-register-callsite! fqn line callee)
-  (let* ((k (jolt-callsite-key fqn line))
-         (cur (hashtable-ref jolt-callsite-table k '())))
-    (unless (member callee cur)
-      (hashtable-set! jolt-callsite-table k (cons callee cur))))
+(define (jolt-table-add! tbl key entry)
+  (let ((cur (hashtable-ref tbl key '())))
+    (unless (member entry cur)
+      (hashtable-set! tbl key (cons entry cur)))))
+(define (jolt-register-callsite! fqn line callee tail?)
+  (jolt-table-add! jolt-callsite-table (jolt-callsite-key fqn line) callee)
+  (jolt-table-add! jolt-fn-callees-table fqn callee)
+  (when tail?
+    (jolt-table-add! jolt-tail-exits fqn (cons line callee))
+    (jolt-table-add! jolt-tail-entries callee (cons fqn line)))
   jolt-nil)
 ;; The registered static callees at (fqn, line) as a non-empty list, or #f
 ;; (unknown / dynamic site — nothing was registered).
 (define (jolt-callsite-callees fqn line)
   (and (string? fqn) (fixnum? line)
        (let ((v (hashtable-ref jolt-callsite-table (jolt-callsite-key fqn line) '())))
+         (and (pair? v) v))))
+;; A fn's registered tail exits ((line . callee)…) / tail entries ((fqn . line)…).
+(define (jolt-callsite-tail-exits fqn)
+  (and (string? fqn) (hashtable-ref jolt-tail-exits fqn '())))
+(define (jolt-callsite-tail-entries fqn)
+  (and (string? fqn) (hashtable-ref jolt-tail-entries fqn '())))
+;; Every callee a fn registers, at any line, or #f when the fn is unregistered.
+(define (jolt-callsite-fn-callees fqn)
+  (and (string? fqn)
+       (let ((v (hashtable-ref jolt-fn-callees-table fqn '())))
          (and (pair? v) v))))
 (define (jolt-catch-leave! prev)
   (set-virtual-register! jolt-vreg-catch-line (if (pair? prev) prev 0)))
@@ -350,7 +369,6 @@
 (define (jolt-throw v)
   (call/cc (lambda (k)
              (jolt-throw-cont (cons v k))
-             (jolt-throw-marks (current-continuation-marks))
              (jolt-throw-sitep (let ((s (virtual-register jolt-vreg-site)))
                                  (and (pair? s) s)))
              (raise (condition (make-message-condition (jolt-throw-message v))
@@ -364,12 +382,13 @@
 ;; the RIGHT identity — overwriting would orphan their k).
 (define (jolt-capture-fault! c)
   (unless (jolt-throw-condition? c)
-    (call/cc (lambda (k)
-               (jolt-throw-cont (cons c k))
-               (jolt-throw-marks (current-continuation-marks))
-               (jolt-throw-sitep (let ((s (virtual-register jolt-vreg-site)))
-                                   (and (pair? s) s)))
-               #f))))
+    ;; NO call/cc here: Chez already attaches &continuation to a serious
+    ;; condition, and jolt-error-continuation reads it — a per-raise capture
+    ;; would heap-freeze a whole stack for every INTERNALLY-CAUGHT host
+    ;; condition, which a hot raise path cannot afford. Only the site pair is
+    ;; stashed; an O(1) read.
+    (jolt-throw-sitep (let ((s (virtual-register jolt-vreg-site)))
+                        (and (pair? s) s)))))
 (define (jolt-unwrap-throw x)
   (if (jolt-throw-condition? x) (jolt-throw-condition-value x) x))
 ;; ex-info builds a jolt-ex-info-record (NOT a pmap — pmap?/coll?/seqable?/ifn?
