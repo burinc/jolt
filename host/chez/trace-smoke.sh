@@ -217,6 +217,28 @@ out_hf="$(run_app app.hostfault)"
 expect_match "hostfault: the faulting fn is named at its line" "$out_hf" 'app\.hostfault/kaboom (.*src/app/hostfault\.clj:3)'
 expect_match "hostfault: the caller is present" "$out_hf" 'app\.hostfault/-main'
 
+# R3 (bead jolt-230w): a chain at EVERY spine level, not just the innermost.
+# dive tail-calls mid (rib on -main's callee frame), mid calls hop non-tail
+# (new frame), hop tail-calls thrower (inner rib), thrower throws tail (site
+# pair). Before R3 the outer rib was invisible: dive was simply missing.
+cat > "$work/src/app/twolevel.clj" <<'EOF'
+(ns app.twolevel)
+(defn thrower [n] (throw (ex-info "deep" {:n n})))
+(defn hop [n] (thrower n))
+(defn mid [n] (+ 1 (hop n)))
+(defn dive [n] (mid n))
+(defn -main [& _] (println (dive 3)))
+EOF
+echo "trace smoke: chains recover at every spine level"
+out_tl="$(run_app app.twolevel)"
+expect_match "twolevel: thrower at its line" "$out_tl" 'app\.twolevel/thrower (.*src/app/twolevel\.clj:2)'
+expect_match "twolevel: hop at its tail-call line" "$out_tl" 'app\.twolevel/hop (.*src/app/twolevel\.clj:3)'
+expect_match "twolevel: mid at its call line" "$out_tl" 'app\.twolevel/mid (.*src/app/twolevel\.clj:4)'
+expect_match "twolevel: dive recovered from the OUTER rib" "$out_tl" 'app\.twolevel/dive (.*src/app/twolevel\.clj:5)'
+expect_match "twolevel: -main at its call line" "$out_tl" 'app\.twolevel/-main (.*src/app/twolevel\.clj:6)'
+flat_tl="$(printf '%s' "$out_tl" | tr '\n' ' ')"
+expect_match "twolevel: frames in stack order" "$flat_tl" 'thrower .*twolevel/hop .*twolevel/mid .*twolevel/dive .*twolevel/-main'
+
 echo "trace smoke: JOLT_TRACE=0 opts out"
 out_off="$(run_app app.tail JOLT_TRACE=0)"
 expect_match "still reports the message" "$out_off" 'Unhandled exception: Divide by zero'

@@ -236,15 +236,13 @@
 ;; ~2.4ns vs ~3.3ns, a smaller but free win.
 ;;
 ;; Virtual registers are a fixed global resource: (virtual-register-count) slots for
-;; the whole process (16 on every platform jolt targets). jolt claims five, allocated
+;; the whole process (16 on every platform jolt targets). jolt claims three, allocated
 ;; here so the assignment is in one place; nothing else in the runtime uses them.
 ;; A freshly forked thread starts every slot at fixnum 0, NOT #f, so "unset" means
-;; fixnum 0 (the site slots hold a site pair or 0). Slots 0 and 1 (the R1 ring/mark
-;; vregs) are UNUSED since R1 — the tail marks live on the continuation, not in a
-;; vreg — but the allocations stay so vreg numbering for
-;; site/catch-line/print-readably does not shift. R3 (jolt-230w) frees them.
-(define jolt-vreg-trace-ring 0)
-(define jolt-vreg-trace-tail 1)
+;; fixnum 0 (the site slots hold a site pair or 0). Slots 0 and 1 are FREE since
+;; R3 (jolt-230w) removed the R1 ring/mark vregs — the tail marks live on the
+;; continuation, not in a vreg — so new virtual-register users should claim them
+;; before renumbering anything. The surviving slots keep their R2 numbers.
 (define jolt-vreg-site 2)        ; ('ns/fn' . line) of the innermost live call site
 (define jolt-vreg-catch-line 3)  ; the site at the throw a catch clause is handling
 (define jolt-vreg-print-readably 4)  ; the print family's *print-readably* override; 0 = unset

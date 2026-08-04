@@ -558,7 +558,7 @@
 ;; exercised: their throws were all in tail position.
 (define (jolt-splice-chain chain cont cont-names)
   (if (null? chain)
-      cont
+      (values cont 0)
       (let ((es (jolt-callsite-callees (srcreg-frame-nm (car chain))
                                        (srcreg-frame-line (car chain)))))
         (if (and es (exists (lambda (x) (hashtable-ref cont-names x #f)) es))
@@ -568,12 +568,76 @@
                               (scan (cdr cs) (fx+ i 1)
                                     (if (member (srcreg-frame-nm (car cs)) es) i last))))))
               (if (fx<? last 0)
-                  (append chain cont)
+                  (values (append chain cont) 0)
+                  ;; the chain goes AFTER cont[last], i.e. before index last+1
+                  ;; — the returned index must say so, or the assembler undoes
+                  ;; the app.sitestale ordering fix by one position.
                   (let split ((k 0) (cs cont) (acc '()))
                     (if (fx>? k last)
-                        (append (reverse acc) chain cs)
+                        (values (append (reverse acc) chain cs) (fx+ last 1))
                         (split (fx+ k 1) (cdr cs) (cons (car cs) acc))))))
-            (append chain cont)))))
+            (values (append chain cont) 0)))))
+
+;; The cont index of the first frame at or after `start` whose registered static
+;; callees contain the rib's oldest surviving entry's fn — the fn the frame was
+;; created to run, which then started the tail chain. Overflowed ribs (count > 8)
+;; lost the true oldest entry, so ANY surviving entry's fn will do. #f when no
+;; frame anchors the rib.
+(define (jolt-find-anchor rib cont start)
+  (let* ((cnt (vector-ref rib 0))
+         (buf (vector-ref rib 1))
+         (targets (if (fx>? cnt 8)
+                      (let loop ((i (fx- cnt 8)) (acc '()))
+                        (if (fx>=? i cnt)
+                            (reverse acc)
+                            (loop (fx+ i 1) (cons (car (vector-ref buf (fxand i 7))) acc))))
+                      (list (car (vector-ref buf 0))))))
+    (if (fx>=? start (length cont))
+        #f
+        (let scan ((i start) (cs (list-tail cont start)))
+          (if (null? cs)
+              #f
+              (let ((es (jolt-callsite-callees (srcreg-frame-nm (car cs))
+                                               (srcreg-frame-line (car cs)))))
+                (if (and es (exists (lambda (t) (member t es)) targets))
+                    i
+                    (scan (fx+ i 1) (cdr cs)))))))))
+
+;; Ribs 2..n (innermost first) spliced among the continuation frames already
+;; holding rib 1's chain. Each outer rib belongs immediately inside the frame
+;; whose call created the rib's frame — its chain renders where the TCO-erased
+;; frames ran, immediately before that frame. The scan resumes strictly after
+;; the previous anchor (starting just after rib 1's insertion point), so a later
+;; rib never anchors before an earlier rib's position. A rib with nothing to
+;; render (all entries filtered) or no anchoring frame is dropped — it was never
+;; rendered before R3, and mis-placing is worse than omitting. Returns an alist
+;; of cont-index -> the chain frames to splice there, in rib order.
+(define (jolt-anchor-outer-ribs ribs cont start cont-names)
+  (let loop ((ribs ribs) (start start) (acc '()))
+    (if (null? ribs)
+        (reverse acc)
+        (let* ((chain (jolt-marks-tail-frames (car ribs) cont-names))
+               (idx (and (pair? chain)
+                         (jolt-find-anchor (car ribs) cont (fx+ start 1)))))
+          (if (not idx)
+              (loop (cdr ribs) start acc)
+              (loop (cdr ribs) idx (cons (cons idx chain) acc)))))))
+
+;; The final frame list: `cont` with rib 1's chain inserted before cont[i1] (its
+;; jolt-splice-chain splice index; an empty chain inserts nothing) and each outer
+;; chain from `anchors` before its anchor frame. One pass over cont.
+(define (jolt-assemble-trace cont i1 chain1 anchors)
+  ;; the insert check runs one extra iteration with cs empty, so a chain whose
+  ;; insert index equals (length cont) — after the outermost frame — lands
+  ;; instead of vanishing.
+  (let build ((i 0) (cs cont) (acc '()))
+    (let* ((before (cond ((fx=? i i1) chain1)
+                         ((assv i anchors) => cdr)
+                         (else '())))
+           (acc (append (reverse before) acc)))
+      (if (null? cs)
+          (reverse acc)
+          (build (fx+ i 1) (cdr cs) (cons (car cs) acc))))))
 
 ;; Multi-line backtrace for an uncaught value, built from the CONTINUATION with
 ;; the tail-site marks consulted only for frames TCO erased:
@@ -600,15 +664,23 @@
                                        cont)
                              h))
                (marks (jolt-throw-marks))
-               (rib (and marks (continuation-marks-first marks jolt-trace-key)))
-               (chain (if (and rib (vector? rib))
-                          (jolt-marks-tail-frames rib cont-names)
-                          '()))
+               (ribs (let ((rs (if marks (continuation-marks->list marks jolt-trace-key) '())))
+                       (filter (lambda (r) (and (vector? r) (fx>? (vector-ref r 0) 0))) rs)))
                (site (jolt-throw-site))
-               (recs (let ((body (jolt-splice-chain chain cont cont-names)))
-                       (if (jolt-site-splice? site cont-names chain cont)
-                           (cons (jolt-site-frame site) body)
-                           body))))
+               (recs (if (null? ribs)
+                         (if (jolt-site-splice? site cont-names '() cont)
+                             (cons (jolt-site-frame site) cont)
+                             cont)
+                         (let* ((chain (jolt-marks-tail-frames (car ribs) cont-names))
+                                (i1 (call-with-values
+                                     (lambda () (jolt-splice-chain chain cont cont-names))
+                                     (lambda (body i) i)))
+                                (anchors (jolt-anchor-outer-ribs (cdr ribs) cont i1 cont-names))
+                                (body (jolt-assemble-trace cont i1 chain anchors))
+                                (recs (if (jolt-site-splice? site cont-names chain cont)
+                                          (cons (jolt-site-frame site) body)
+                                          body)))
+                           recs))))
           (and (pair? recs) (jolt-render-recs recs))))))
 
 ;; Exposed for the REPL / nREPL error paths, which catch errors themselves instead
