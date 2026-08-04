@@ -456,6 +456,22 @@
                 (apply append (reverse acc))
                 (let ((idx (fxand (fx+ (fx- oh k) jolt-trace-outer-size) jolt-trace-outer-mask)))
                   (loop (fx+ k 1) (cons (jolt-rib-names (vector-ref ribs idx)) acc)))))))))
+;; The innermost (current) rib's entries as (name . call-site-line), most-recent
+;; (deepest) first, or '() when tracing is off / the ring is empty. This is the
+;; tail chain between the throw and the deepest live frame — the ONLY part of the
+;; history a backtrace may trust. The outer head advances only on entry, so a
+;; returned call's rib is by construction no longer current: by the time a later
+;; call pushes, the ring has advanced past it and its frames sit in a deeper rib
+;; that the reporter never reads. See jolt-backtrace-string in source-registry.ss.
+(define (jolt-trace-innermost-rib)
+  (let ((h (jolt-trace-ring)))
+    (if (not h) '()
+        (let ((oh (vector-ref h 1)) (oc (vector-ref h 2)))
+          (if (fx=? oc 0)
+              '()
+              (jolt-rib-names (vector-ref (vector-ref h 0)
+                                          (fxand (fx+ (fx- oh 1) jolt-trace-outer-size)
+                                                 jolt-trace-outer-mask))))))))
 
 (define-condition-type &jolt-throw &condition
   make-jolt-throw-condition jolt-throw-condition?

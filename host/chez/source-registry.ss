@@ -117,13 +117,33 @@
                                "")))
           ""))))
 
+;; A frame's OWN line — where its execution is paused, which Chez annotates with
+;; the position of the call that CREATED the frame: the call site inside the
+;; caller, exactly what the JVM prints for a frame. Resolve the frame's
+;; (source-name . offset) through the marker lookup: a .scm path resolves via the
+;; on-disk marker table (jolt-marker-line-in-file), a synthetic eval name via the
+;; eval registry (jolt-eval-source-line). #f when the frame carries no source or
+;; no marker precedes its offset — the renderer then falls back to the defn line.
+;; Exception-proof: the reporter runs while an error is being reported.
+(define (srcreg-frame-line-from-source-pair io)
+  (guard (e (#t #f))
+    (let ((pair (srcreg-frame-source-pair io)))
+      (and pair
+           (let ((name (car pair)) (offset (cdr pair)))
+             (if (jolt-eval-source-name? name)
+                 (jolt-eval-source-line name offset)
+                 (jolt-marker-line-in-file name offset)))))))
+
 ;; Walk a continuation, returning its frames (innermost first) as (frame-name .
 ;; record) pairs. record is a source vector #(ns name file line) for a frame that
 ;; maps to registered Clojure source, the symbol 'ambiguous for a short name shared
 ;; across namespaces, or #f for an unmapped-but-named frame (the common case on the
 ;; open-world eval path, where nothing is registered — the bare frame name is still
 ;; a useful trace line). Plumbing frames (host spine, eval boundary) and unnamed
-;; frames are skipped; raw depth is capped.
+;; frames are skipped; raw depth is capped. Each frame carries the line reached
+;; INSIDE it, from the R1/R2 marker lookup on its source object — the caller's
+;; call site — so a rendered frame points at where it was when the error hit, not
+;; where its fn was defined.
 (define (jolt-frame-records k)
   ;; read the env at call time, not load time: a built binary runs top-level forms
   ;; at heap-build time, where this would always be unset.
@@ -135,16 +155,17 @@
           (let* ((nm (srcreg-frame-name io))
                  (src (and nm (hashtable-ref source-registry nm #f)))
                  ;; keep a frame that maps, or any named frame that isn't plumbing
-                 (keep? (and nm (or src (not (srcreg-plumbing-name? nm))))))
+                 (keep? (and nm (or src (not (srcreg-plumbing-name? nm)))))
+                 ;; the line reached inside this frame (only a mapped frame prints
+                 ;; one, so only it pays the marker lookup)
+                 (line (and src (srcreg-frame-line-from-source-pair io))))
             (when (and debug? nm)
               (display (string-append "  [frame] " nm (if src " *MAPPED*"
                                                           (if keep? "" " (skipped)"))
                                       (srcreg-frame-source-debug io) "\n")
                        (current-error-port)))
-            ;; No per-frame line from this source: the continuation carries no jolt
-            ;; positions, so each frame falls back to where its fn was defined.
             (loop (guard (e (#t #f)) (io 'link)) (fx+ n 1)
-                  (if keep? (cons (srcreg-frame nm src #f) acc) acc))))))))
+                  (if keep? (cons (srcreg-frame nm src line) acc) acc))))))))
 
 ;; --- clj-line lookup for generated .scm offsets ---------------------------------
 ;;
@@ -421,14 +442,6 @@
                     (put-char port #\newline)
                     (loop tail (fx+ shown 1))))))))))
 
-;; Multi-line backtrace for an uncaught value. Two sources, in preference order:
-;;   1. The tail-frame history ring (rt.ss), when JOLT_TRACE enabled it — an
-;;      execution history of the runtime-compiled fns entered before the throw,
-;;      INCLUDING ones TCO erased from the live continuation. Most-recent first.
-;;   2. Otherwise the live continuation (jolt-frame-records) — the accurate but
-;;      TCO-truncated non-tail spine.
-;; Each frame maps to "ns/name (file:line)" when registered, else its bare name.
-;; #f when neither source yields a frame (the caller then prints just the location).
 ;; The tail-frame history ring rendered as a backtrace, or #f when tracing is off /
 ;; empty. A mapped frame is kept; else drop plumbing (same rule as the continuation
 ;; path) so the two sources read consistently.
@@ -439,6 +452,10 @@
 ;; live line at the throw. Do the shift on the RAW list, before dropping plumbing
 ;; frames: a dropped frame still recorded the line of the frame outside it, and
 ;; filtering first would hand that line to the wrong function.
+;; Only the REPL/nREPL error paths (jolt.host/backtrace-string) and the no-
+;; continuation fallback (jolt-backtrace-string) still read the whole history;
+;; the uncaught reporter itself prefers the live continuation and takes just the
+;; innermost rib from the ring (see jolt-backtrace-string below).
 (define (jolt-history-backtrace)
   (let* ((hist (jolt-trace-snapshot))
          (frames (let loop ((es hist) (prev (jolt-throw-line)) (acc '()))
@@ -454,12 +471,53 @@
                                    acc)))))))
     (and (pair? frames) (jolt-render-recs frames))))
 
+;; Recover TCO-erased frames from the history ring. `rib` is the innermost rib's
+;; (name . call-site-line) entries (jolt-trace-innermost-rib), most-recent first:
+;; the tail chain between the throw and the deepest live frame. `cont-names` is a
+;; string-set of the frame names the live continuation already reports. Only
+;; entries GENUINELY ABSENT from the continuation are taken — a frame that is live
+;; cannot have been TCO-erased, so a ring copy of it is either a duplicate of the
+;; continuation or a returned call's residue, and both must be dropped. The line
+;; shift runs over the RAW rib (a dropped entry still recorded the line of the
+;; entry inside it), the same discipline jolt-history-backtrace uses.
+(define (jolt-ring-tail-frames rib cont-names)
+  (let loop ((es rib) (prev (jolt-throw-line)) (acc '()))
+    (if (null? es)
+        (reverse acc)
+        (let* ((e (car es)) (nm (car e)) (line (cdr e))
+               (src (hashtable-ref source-registry nm #f))
+               (own (and (fixnum? prev) (fx>? prev 0) prev)))
+          (loop (cdr es)
+                line
+                (if (and (not (hashtable-ref cont-names nm #f))
+                         (or src (not (srcreg-plumbing-name? nm))))
+                    (cons (srcreg-frame nm src own) acc)
+                    acc))))))
+
+;; Multi-line backtrace for an uncaught value, built from the CONTINUATION with
+;; the ring consulted only for frames TCO erased:
+;;   1. The ring's innermost rib (jolt-trace-innermost-rib) — the tail chain
+;;      between the throw and the deepest live frame. Only entries absent from
+;;      the continuation are spliced in, so a returned call's residue (a rib the
+;;      ring has advanced past, or a live frame's duplicate) cannot appear.
+;;   2. The live continuation (jolt-frame-records) — the exact non-tail spine,
+;;      each frame at the line of the call that created it.
+;; No continuation (a host condition raised outside jolt-throw): fall back to the
+;; whole history as before, since there is no exact source to prefer. #f when
+;; neither source yields a frame (the caller then prints just the location).
 (define (jolt-backtrace-string v)
-  (or (jolt-history-backtrace)
-      (let ((k (jolt-error-continuation v)))
-        (and k
-             (let ((recs (jolt-frame-records k)))
-               (and (pair? recs) (jolt-render-recs recs)))))))
+  (let ((k (jolt-error-continuation v)))
+    (if (not k)
+        (jolt-history-backtrace)
+        (let* ((cont (jolt-frame-records k))
+               (cont-names (let ((h (make-hashtable string-hash string=?)))
+                             (for-each (lambda (f)
+                                         (hashtable-set! h (srcreg-frame-nm f) #t))
+                                       cont)
+                             h))
+               (recs (append (jolt-ring-tail-frames (jolt-trace-innermost-rib) cont-names)
+                             cont)))
+          (and (pair? recs) (jolt-render-recs recs))))))
 
 ;; Exposed for the REPL / nREPL error paths, which catch errors themselves instead
 ;; of going through the uncaught reporter. Returns the "  trace:\n<frames>" block
