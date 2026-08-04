@@ -80,6 +80,43 @@
       (and (fx>? (string-length nm) 0) (char=? (string-ref nm 0) #\$))
       (and (fx>=? (string-length nm) 5) (string=? (substring nm 0 5) "jolt-"))))
 
+;; An inspector message that may return ZERO values (e.g. 'source-path when a
+;; frame carries no source) — read it as one value or #f. `guard` alone cannot
+;; catch a zero-value return, so the read goes through call-with-values with a
+;; null-tolerant collector.
+(define (srcreg-inspect-get io msg)
+  (call-with-values (lambda () (guard (e (#t (values 'srcreg-inspect-err))) (io msg)))
+    (lambda args (if (or (null? args) (eq? (car args) 'srcreg-inspect-err)) #f (car args)))))
+
+;; A frame's source as (source-name . byte-offset), or #f. Read from the
+;; inspector's 'source-object (which carries the sfd and the bfp/efp range)
+;; rather than 'source-path: the latter reports only the path string for
+;; eval'd code, while the source object always carries the positions.
+(define (srcreg-frame-source-pair io)
+  (guard (e (#t #f))
+    (let ((so (srcreg-inspect-get io 'source-object)))
+      (and so
+           (let ((path (source-file-descriptor-path (source-object-sfd so)))
+                 (bfp (source-object-bfp so)))
+             (and (string? path) (fixnum? bfp) (cons path bfp)))))))
+
+;; JOLT_DEBUG_FRAMES extra: the frame's source object, when it has one. For the
+;; eval path that is (synthetic-name . offset) resolved through the eval marker
+;; registry back to the ORIGINAL clj line — the surface trace-r2's gate asserts
+;; on. Exception-proof: the debug print must never break the frame walk.
+(define (srcreg-frame-source-debug io)
+  (guard (e (#t ""))
+    (let ((pair (srcreg-frame-source-pair io)))
+      (if pair
+          (let ((name (car pair)) (offset (cdr pair)))
+            (string-append " source=" name "@" (number->string offset)
+                           (if (jolt-eval-source-name? name)
+                               (let ((l (jolt-eval-source-line name offset)))
+                                 (if l (string-append " -> clj:L" (number->string l))
+                                     " -> clj:?"))
+                               "")))
+          ""))))
+
 ;; Walk a continuation, returning its frames (innermost first) as (frame-name .
 ;; record) pairs. record is a source vector #(ns name file line) for a frame that
 ;; maps to registered Clojure source, the symbol 'ambiguous for a short name shared
@@ -101,7 +138,8 @@
                  (keep? (and nm (or src (not (srcreg-plumbing-name? nm))))))
             (when (and debug? nm)
               (display (string-append "  [frame] " nm (if src " *MAPPED*"
-                                                          (if keep? "" " (skipped)")) "\n")
+                                                          (if keep? "" " (skipped)"))
+                                      (srcreg-frame-source-debug io) "\n")
                        (current-error-port)))
             ;; No per-frame line from this source: the continuation carries no jolt
             ;; positions, so each frame falls back to where its fn was defined.
@@ -253,6 +291,78 @@
             (hashtable-clear! jolt-marker-cache-text))
           (hashtable-set! jolt-marker-cache-text text tbl)
           (jolt-marker-line-from-table tbl offset)))))
+
+;; --- eval-path source registry -------------------------------------------------
+;; On the eval path (an AOT cache MISS) the emitted Scheme is a transient string:
+;; it is gone by the time anything throws. To let a backtrace resolve a frame's
+;; (source-name . offset) back to a clj line, compile-eval.ss registers the marker
+;; table for the text under a SYNTHETIC source name before eval'ing it. The name
+;; is never a filesystem path (jolt-eval-source-name?), so a consumer knows to
+;; consult this registry instead of reading a .scm off disk. Populated only when
+;; tracing is on; with tracing off the whole block costs nothing.
+;;
+;; Growth is bounded: jolt-eval-source-max tables, oldest evicted FIFO. A table
+;; is one (marker-start . clj-line) pair per traced call site — a few hundred
+;; bytes for a typical top-level form — so the registry stays under roughly
+;; jolt-eval-source-max * (form size) no matter how long a REPL/nREPL session
+;; runs, and the most recent forms (the set a fresh backtrace can mention) are
+;; exactly the ones kept.
+;;
+;; Thread-safety: futures/agents compile on their own threads, so two threads
+;; must not draw the same counter value or interleave table inserts. A mutex
+;; guards counter increment + insert; that is one acquisition per top-level
+;; form, under tracing only, negligible against the analysis+emit already paid.
+(define jolt-eval-source-max 4096)
+(define jolt-eval-source-counter 0)
+(define jolt-eval-source-mutex (make-mutex))
+(define jolt-eval-marker-registry (make-hashtable string-hash string=?))
+(define jolt-eval-source-queue '())          ; names in insertion order (FIFO)
+(define jolt-eval-source-queue-tail '())
+(define (jolt-eval-queue-push! name)
+  (let ((c (cons name '())))
+    (if (null? jolt-eval-source-queue-tail)
+        (begin (set! jolt-eval-source-queue c)
+               (set! jolt-eval-source-queue-tail c))
+        (begin (set-cdr! jolt-eval-source-queue-tail c)
+               (set! jolt-eval-source-queue-tail c)))))
+(define (jolt-eval-queue-pop!)
+  (when (pair? jolt-eval-source-queue)
+    (let ((name (car jolt-eval-source-queue)))
+      (set! jolt-eval-source-queue (cdr jolt-eval-source-queue))
+      (when (null? jolt-eval-source-queue) (set! jolt-eval-source-queue-tail '()))
+      name)))
+;; Register the marker table for one eval'd Scheme text; returns the synthetic
+;; source name to pass make-source-file-descriptor. Once per top-level form.
+(define (jolt-register-eval-marker-table! scm)
+  (mutex-acquire jolt-eval-source-mutex)
+  (let ((name (string-append "jolt-eval-src-"
+                             (number->string jolt-eval-source-counter))))
+    (set! jolt-eval-source-counter (+ jolt-eval-source-counter 1))
+    (when (fx>=? (hashtable-size jolt-eval-marker-registry) jolt-eval-source-max)
+      (let ((old (jolt-eval-queue-pop!)))
+        (when old (hashtable-delete! jolt-eval-marker-registry old))))
+    (hashtable-set! jolt-eval-marker-registry name (jolt-marker-table scm))
+    (jolt-eval-queue-push! name)
+    (mutex-release jolt-eval-source-mutex)
+    name))
+;; Resolve an eval-path frame's (name . offset) to a clj line, or #f when the
+;; name was evicted / never registered or no marker precedes the offset.
+(define (jolt-eval-source-line name offset)
+  (let ((tbl (hashtable-ref jolt-eval-marker-registry name #f)))
+    (and tbl (jolt-marker-line-from-table tbl offset))))
+;; Is this source name a registry key rather than a real file? The distinguisher
+;; between "consult the eval registry" and "read a .scm off disk": every name
+;; this registry mints is "jolt-eval-src-" followed by decimal digits, and no
+;; generated artifact on disk is ever named that.
+(define (jolt-eval-source-name? name)
+  (and (string? name)
+       (let ((n (string-length name)))
+         (and (fx>=? n 14)
+              (string=? (substring name 0 14) "jolt-eval-src-")
+              (let loop ((i 14))
+                (or (fx>=? i n)
+                    (and (char<=? #\0 (string-ref name i) #\9)
+                         (loop (fx+ i 1)))))))))
 
 ;; Convenience wrapper for a generated file on disk. Cached per path+mtime: the
 ;; same .scm serves every frame of a backtrace, so read+scan it once. Whole-

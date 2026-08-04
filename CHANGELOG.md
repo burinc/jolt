@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Eval-path frames carry source objects.** Runtime-compiled code (an AOT cache
+  miss) was a transient string: by the time anything threw, the text was gone, so
+  a frame from that code could not point back into it. The eval path now reads
+  each emitted form with `get-datum/annotations` under a synthetic source name and
+  registers that text's `#|L<line>|#` markers under the same name first, so a
+  frame's `(source-name . offset)` resolves to the original clj line even though
+  the text itself is gone. Gated on tracing — with tracing off the path is the old
+  plain `read`+`eval`, verbatim. Traces are unchanged; `JOLT_DEBUG_FRAMES=1` shows
+  the resolved line per frame (`source=jolt-eval-src-1@278 -> clj:L4`).
+
 ### Fixed
 
 - **AOT cache frames point at the cached `.scm`, not a deleted temp.** The cache

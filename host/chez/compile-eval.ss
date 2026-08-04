@@ -203,6 +203,37 @@
 (define (jolt-trace-init-from-env!)
   (unless (jolt-trace-env-off? (getenv "JOLT_TRACE"))
     (jolt-enable-trace!)))
+;; Host-side mirror of the emitter's trace-frames? flag: whether the emitted
+;; text carries #|L<line>|# markers (backend_scheme.clj with-line). When it is
+;; off, no markers exist, so the annotated read below would attach source
+;; objects with nothing to resolve them against — the eval path then takes
+;; exactly today's plain-read route. The SAME flag the emitter consults, so the
+;; two can never disagree about whether a form's text has markers. Resolved at
+;; load time (the image is resident), read at eval time (the flag flips at
+;; runtime via jolt-enable-trace! / emit-image).
+(define jolt-ce-trace-frames?-fn (var-deref "jolt.backend-scheme" "trace-frames?"))
+(define (jolt-ce-trace-frames?)
+  (and (procedure? jolt-ce-trace-frames?-fn) (jolt-ce-trace-frames?-fn)))
+
+;; Eval one emitted Scheme form WITH Chez source annotations, so a frame from
+;; this code carries a source object whose name is a registry key and whose
+;; offset is a byte position in `scm` — the pair a backtrace resolves to a clj
+;; line via jolt-eval-source-line. get-datum/annotations is what attaches the
+;; source object; make-source-file-descriptor needs a BINARY port, and
+;; get-datum/annotations a TEXTUAL one, so the text is opened twice over the
+;; same bytes. The registered marker table is all that survives this call — the
+;; text itself is transient. Tracing must be on (markers present) when called.
+(define (jolt-eval-with-source scm)
+  (let* ((bv (string->utf8 scm))
+         (name (jolt-register-eval-marker-table! scm))
+         (sfd (make-source-file-descriptor name (open-bytevector-input-port bv)))
+         (ann (call-with-values
+               (lambda ()
+                 (get-datum/annotations
+                  (transcoded-port (open-bytevector-input-port bv) (native-transcoder))
+                  sfd 0))
+               (lambda (a p) a))))
+    (eval ann (interaction-environment))))
 
 ;; (with-meta sym m) -> sym, else x — an (ns ^:no-doc name …) yields the name with
 ;; reader metadata as a with-meta form; strip it to read the bare ns symbol.
@@ -395,7 +426,9 @@
      (let* ((scm (jolt-analyze-emit-form form ns))
             (cap (jolt-aot-capture)))            ; tee for the AOT cache (loader.ss)
        (when cap (put-string cap scm) (newline cap))
-       (eval (read (open-input-string scm)) (interaction-environment))))))
+       (if (jolt-ce-trace-frames?)
+           (jolt-eval-with-source scm)
+           (eval (read (open-input-string scm)) (interaction-environment)))))))
 
 ;; Source string -> value (read one form, compile + eval on Chez, in the
 ;; top-level environment where rt.ss's runtime procedures live).

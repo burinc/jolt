@@ -115,7 +115,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi \
   transient infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
-  traceemit \
+  traceemit traceeval \
   inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   certify
@@ -443,6 +443,12 @@ pic:
 # still present on the ones that really apply a fn.
 traceemit:
 	@$(CHEZ) --script host/chez/run-trace-emit.ss
+
+# trace-r2: an eval-path (cache-miss) frame carries a source object, and its
+# (source-name . offset) resolves to the original clj line via the eval marker
+# registry; with tracing off the eval path registers nothing.
+traceeval:
+	@$(CHEZ) --script host/chez/run-traceeval.ss
 
 # Nilable record types + flow-sensitive narrowing: a record-or-nil types as a nilable
 # record (some?/nil? don't fold, so a runtime guard stays); inside (if (some? x) ..)
