@@ -19,7 +19,10 @@
 ;; Loaded LAST from rt.ss: needs the collections, the var table, the printers,
 ;; and proc-name-tbl (rt.ss) for the procedure -> "ns/name" direction.
 
-(define jolt-image-format-version 1)
+;; 2: closures travel as source records (image-fnsrc), sorted colls as
+;; image-sorted, unhandled resources as image-stub. A version-1 reader
+;; refuses these images by the header check instead of misreading records.
+(define jolt-image-format-version 2)
 
 ;; --- classification -----------------------------------------------------------
 ;; An eq hashtable is the ONE hashtable kind Chez can fasl; eqv/equal/string-hash

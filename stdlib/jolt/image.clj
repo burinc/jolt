@@ -6,25 +6,28 @@
   does not. There are no thread stacks, no continuations, and nothing suspended
   mid-call comes back. See RFC 0009 for the design.
 
-  Functions travel by NAME: a fn that is some var's root is written as the var's
-  name and resolved through the var table on the way back in, so it stays
-  callable. An anonymous closure has no name to write, so `dump!` refuses it and
-  tells you where in the graph it lives:
+  Functions travel as data. A fn that is some var's root is written as the
+  var's NAME and resolved on the way back in, so it stays callable and IS the
+  live fn. An anonymous closure travels as its SOURCE — the fn* form plus the
+  captured values, recovered from the live closure — and restore compiles it
+  back in its defining namespace. That makes an image code: restoring one
+  evaluates the fn sources it carries, so only load images you trust, the
+  same way you would only load code you trust.
 
-      (jolt.image/dump! \"app.jimg\" {:handlers {:go (fn [x] x)}})
-      ;; ExceptionInfo: image: cannot write #<procedure> at :handlers -> :go
-
-  Use `scan` first to find those without writing anything."
+  What still refuses: a closure whose captured local was optimized into the
+  compiled code (a let over compile-time constants — the message names the
+  capture), and open resources with neither a handler nor stub mode. Use
+  `scan` to find both without writing anything."
   (:require [jolt.host :as host]))
 
 (defn dump!
   "Write V to PATH as a jolt image. Returns nil.
 
-  Throws if the graph holds anything that cannot be written — an anonymous
-  closure, an open resource with no registered handler, a sorted map or set
-  (their comparator machinery is not encodable in this format version). The
-  message names the path through the graph to the offending object, and no file
-  is written."
+  Throws if the graph holds anything that cannot be written — an open
+  resource with no registered handler, or a closure whose captures were
+  optimized away. The message names the path through the graph to the
+  offending object, and no file is written. Pass {:unwritable :stub} to
+  dump such objects as resolvable stubs instead."
   ([path v] (host/image-write! path v))
   ([path v opts]
    ;; {:unwritable :stub} dumps unhandled resources as stubs instead of
@@ -41,9 +44,11 @@
   (host/image-read path))
 
 (defn scan
-  "Dry run over V. Returns a vector of {:path :object} maps, one per object that
-  `dump!` would refuse — empty when V is writable. Prefer this to a speculative
-  dump when you want to know what in your state is not data."
+  "Dry run over V. Returns a vector of {:path :object :disposition} maps, one
+  per object a strict `dump!` would refuse — empty when V is writable.
+  :disposition is :would-stub when stub mode would dump it as a placeholder,
+  :unwritable when nothing can. Prefer this to a speculative dump when you
+  want to know what in your state is not data."
   [v]
   (host/image-scan v))
 
