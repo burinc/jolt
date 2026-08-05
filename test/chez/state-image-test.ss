@@ -448,6 +448,166 @@
     "[:before :after]")
 (when (file-exists? world-tmp) (delete-file world-tmp))
 
+;; --- R3: read side — restored closures are CALLED ---------------------------
+;; The R2 write fixtures now get their round-trip halves: dump through the real
+;; write path, read through jolt-image-read (the restore transform), and CALL.
+;; Captures must be RUNTIME-computed: const-fold bakes a let-bound constant
+;; into the code and the capture disappears from the closure — the folded
+;; fixture below pins that refusal instead.
+(ev "(def r3 {:f (fn [x] (* x 3))})")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/r3)"))
+(is "restored anon fn is callable"
+    (string-append "((:f (jolt.host/image-read \"" tmp "\")) 14)")
+    "42")
+(ev "(def r3cap (let [a (+ 2 (count [1 2 3]))] {:f (fn [x] (+ a x))}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/r3cap)"))
+(is "a runtime-captured local round-trips and calls"
+    (string-append "((:f (jolt.host/image-read \"" tmp "\")) 37)")
+    "42")
+
+;; keyword + named-fn capture: the keyword went through free-values in the
+;; BODY, so re-interning must have applied; the named fn traveled fn-ref and
+;; must resolve to the LIVE fn. These are the assertions most likely to catch
+;; a bypass (a fasl keyword copy or a re-compiled core fn).
+(ev "(def mix {:m (let [k (deref (atom :tag)) nf inc] (fn [x] [k nf x]))})")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/mix)"))
+(is "restored closure returns the INTERNED keyword"
+    (string-append "(let [r ((:m (jolt.host/image-read \"" tmp "\")) 0)]"
+                   " (identical? (nth r 0) :tag))")
+    "true")
+(is "restored closure calls the LIVE named fn (fn-ref path)"
+    (string-append "(let [r ((:m (jolt.host/image-read \"" tmp "\")) 41)]"
+                   " (identical? (nth r 1) inc))")
+    "true")
+
+;; nested closures: the outer literal's src-form contains the inner one, and
+;; the outer's free-name list carries every name the whole form needs, so the
+;; restored outer returns a working inner closure.
+(ev "(def r3nest (let [k (+ 1 (count [1 2]))] {:outer (fn [x m] (fn [y] (+ (* x y) k m)))}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/r3nest)"))
+(is "nested closures round-trip; call both"
+    (string-append "(let [g (jolt.host/image-read \"" tmp "\")"
+                   " inner ((:outer g) 5 2)] (inner 3))")
+    "20")
+
+;; shared-capture identity: two closures over ONE atom; after restore the atom
+;; each closure captured must BE the graph's own (:a g) — three-way eq — and
+;; mutation through one closure must be visible through the other and through
+;; the graph reference.
+(define (closure-free-vals c)
+  (let ((io (inspect/object c)))
+    (let loop ((i 0) (acc '()))
+      (if (fx>=? i (io 'length))
+          (reverse acc)
+          (let ((vo (io 'ref i)))
+            (loop (fx+ i 1) (cons ((vo 'ref) 'value) acc)))))))
+(ev "(def r3shared (let [a (atom 1)] {:f1 (fn [] (swap! a inc)) :f2 (fn [] (deref a)) :a a}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/r3shared)"))
+(let* ((g (jolt-image-read tmp))
+       (f1 (jolt-get g (keyword #f "f1") jolt-nil))
+       (f2 (jolt-get g (keyword #f "f2") jolt-nil))
+       (ga (jolt-get g (keyword #f "a") jolt-nil)))
+  (ok "restored closures share one atom with the graph (three-way eq)"
+      (and (procedure? f1) (procedure? f2)
+           (let ((a1 (closure-free-vals f1)) (a2 (closure-free-vals f2)))
+             (and (pair? a1) (pair? a2)
+                  (eq? (car a1) ga) (eq? (car a2) ga)
+                  (eq? (car a1) (car a2))))))
+  (ok "swap through one restored closure is visible through the other and the graph"
+      (let ((_ (jolt-invoke f1)))
+        (and (= (jolt-atom-val ga) 2) (= (jolt-invoke f2) 2)))))
+
+;; the R2 cycle fixture read back and CALLED: ((deref a)) returns the closure
+;; itself, and the atom's val IS that closure after the call.
+(ev "(def cyc (let [a (atom nil)] (reset! a (fn [x] (deref a))) {:self a}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/cyc)"))
+(let* ((g (jolt-image-read tmp))
+       (a (jolt-get g (keyword #f "self") jolt-nil))
+       (cl (jolt-atom-val a)))
+  ;; (deref a) yields the atom's VAL — the closure itself — so a restored
+  ;; call returning the very closure being called is the cycle proof
+  (ok "restored cycle closure calls and returns itself through its atom"
+      (and (procedure? cl) (eq? (jolt-invoke cl 'x) cl)))
+  (ok "restored cycle closure is still the atom's val after the call"
+      (eq? (jolt-atom-val a) cl)))
+
+;; folded capture: a let-bound CONSTANT is baked into the compiled code, so the
+;; capture is unrecoverable at dump — refuse with a named, actionable message;
+;; scan reports the same finding.
+(ev "(def r3folded (let [a 5] {:f (fn [x] (+ a x))}))")
+(is "folded capture refuses at dump naming the local"
+    (string-append "(try (jolt.host/image-write! \"" tmp "\" user/r3folded) :no-throw"
+                   " (catch Exception e (if (re-find #\"captured local 'a' was optimized\" (ex-message e))"
+                   " :named :wrong)))")
+    ":named")
+(is "scan agrees the folded capture is unwritable"
+    "(= 1 (count (jolt.host/image-scan user/r3folded)))"
+    "true")
+
+;; multi-arity + variadic literals round-trip and are callable at each arity.
+(ev "(def r3arity (let [k (+ 2 (count [1 2 3]))] {:f (fn ([x] (* x k)) ([x y] (+ x y k))) :v (fn [x & xs] (+ x (count xs) k))}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/r3arity)"))
+(is "multi-arity restored closure is callable at each arity"
+    (string-append "(let [g (jolt.host/image-read \"" tmp "\")]"
+                   " (str ((:f g) 7) \"/\" ((:f g) 2 3)))")
+    "35/10")
+(is "variadic restored closure is callable"
+    (string-append "((:v (jolt.host/image-read \"" tmp "\")) 5 9 9)")
+    "12")
+
+;; world restore with closures: a var whose root holds a closure-bearing map
+;; travels; restore-world! rebuilds it into a live closure.
+(jolt-compile-eval "(def r3app {:cb (let [a (+ 2 (count [1 2 3]))] (fn [x] (+ a x))) :n 1})" "r3.app")
+(ev (string-append "(jolt.host/image-dump-world! \"" world-tmp "\" [\"r3.app\"])"))
+(jolt-compile-eval "(def r3app {:cb :clobbered})" "r3.app")
+(is "restore-world! rebuilds closures and reports the rebound count"
+    (string-append "(let [n (jolt.host/image-restore-world! \"" world-tmp "\")]"
+                   " (str n \"/\" ((:cb r3.app/r3app) 37) \"/\" (:n r3.app/r3app)))")
+    "1/42/1")
+
+;; error paths: a malformed record (free-values arity != free-names) refuses
+;; with a named error.
+(define (str-contains? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0))
+      (and (<= (+ i m) n)
+           (or (string=? (substring s i (+ i m)) sub)
+               (loop (+ i 1)))))))
+(let* ((fn-form (list->cseq (list (jolt-symbol #f "fn*")
+                                  (apply jolt-vector (list (jolt-symbol #f "x")))
+                                  (list->cseq (list (jolt-symbol #f "x"))))))
+       (bad (make-image-fnsrc "jfn$r3$bad$0" fn-form "user"
+                              (apply jolt-vector (list (jolt-symbol #f "x")))
+                              (vector 1 2))))
+  (ok "malformed fnsrc record refuses with a named error"
+      (call/cc (lambda (k)
+        (with-exception-handler
+          (lambda (e)
+            (k (str-contains? (condition->message-string e) "malformed fn source record")))
+          (lambda () (image-graph-process bad 'restore #f) #f))))))
+
+;; compiler-dropped build: the tree-shaken manifest drops the 'image +
+;; 'compile-eval tags, so a runtime with only rt.ss has no compile seam. Probe
+;; that condition in a subprocess (same build as this gate, minus the spine).
+(let ((probe "/tmp/jolt-image-noce-probe.ss")
+      (out   "/tmp/jolt-image-noce-out.txt")
+      (chez-bin (or (getenv "JOLT_CHEZ") "chez")))
+  (call-with-output-file probe
+    (lambda (p)
+      (put-string p "(import (chezscheme))\n")
+      (put-string p "(load \"host/chez/rt.ss\")\n")
+      (put-string p "(guard (e (#t (display (condition->message-string e)) (newline)))\n")
+      (put-string p "  (image-eval-fnsrc (make-image-fnsrc \"jfn$r3$nce$0\" '() \"user\" '() (vector)) '()))\n"))
+    'replace)
+  (let* ((rc (system (string-append chez-bin " --script " probe " > " out " 2>&1")))
+         (msg (read-file-string out)))
+    (ok "compiler-dropped build refuses fnsrc restore, naming the fn"
+        (and (fx=? rc 0)
+             (str-contains? msg "no compiler")
+             (str-contains? msg "jfn$r3$nce$0")))
+    (delete-file probe)
+    (delete-file out)))
+
 (cleanup!)
 (when (file-exists? (string-append tmp ".txt")) (delete-file (string-append tmp ".txt")))
 

@@ -301,11 +301,17 @@
                      (val (hashtable-ref tbl
                                          (refuse-on-fail (lambda () (image-munge orig)))
                                          'image-missing)))
-                (loop (jolt-next s)
-                      (cons (if (eq? val 'image-missing)
-                                jolt-nil
-                                (walk val (cons (string-append "free:" orig) path)))
-                            acc)))))))))
+                ;; A name the source references but the compiled closure does not
+                ;; carry: const-folding baked its value into the code (a let-bound
+                ;; constant, a provably-dead branch), so the value is UNRECOVERABLE
+                ;; here while the stored source still needs it. Binding nil instead
+                ;; would restore a closure that silently computes with nil — refuse,
+                ;; naming the capture, so the failure is at dump time and actionable.
+                (if (eq? val 'image-missing)
+                    (refuse (cons 'image-folded orig))
+                    (loop (jolt-next s)
+                          (cons (walk val (cons (string-append "free:" orig) path))
+                                acc))))))))))
 
 ;; The image-fnsrc record is memoized BEFORE its free values are recovered, so
 ;; a capture cycle (closure -> atom -> closure) finds this record in the memo
@@ -316,12 +322,84 @@
                              (vector))))
     (hashtable-set! memo x r)
     (let ((fvs (image-recover-free-values x (vector-ref (cdr reg) 2) walk path)))
-      (if (eq? fvs 'image-no)
-          (jolt-throw (jolt-ex-info
-                        (string-append "image: cannot write " (image-describe-obj x)
-                                       " at " (image-path->string path))
-                        jolt-nil))
-          (begin (image-fnsrc-free-values-set! r fvs) r)))))
+      (cond
+        ((vector? fvs)
+         (image-fnsrc-free-values-set! r fvs)
+         (image-meta-copy! x r)
+         r)
+        ((and (pair? fvs) (eq? (car fvs) 'image-folded))
+         (jolt-throw (jolt-ex-info
+                       (string-append "image: cannot write " (image-describe-obj x)
+                                      " at " (image-path->string path)
+                                      ": captured local '" (cdr fvs)
+                                      "' was optimized into the compiled code, so its value"
+                                      " cannot be recovered from the live closure —"
+                                      " store a named fn, or the data to rebuild one")
+                       jolt-nil)))
+        (else
+         (jolt-throw (jolt-ex-info
+                       (string-append "image: cannot write " (image-describe-obj x)
+                                      " at " (image-path->string path))
+                       jolt-nil)))))))
+
+;; A condition's human text, best effort — jolt ex-info and raw Chez
+;; conditions both pass through here on the restore failure path.
+(define (image-condition-text e)
+  (cond
+    ((and (jolt-ex-info-record? e) (string? (jolt-ex-info-record-message e)))
+     (jolt-ex-info-record-message e))
+    ((condition? e) (condition->message-string e))
+    (else "error")))
+
+;; The compile spine, reached through the top level at CALL time —
+;; compile-eval.ss loads after this file, and a tree-shaken build that
+;; dropped the compiler has no binding at all: refuse by name instead of
+;; surfacing an unbound-variable error mid-restore.
+(define (image-compile-eval-seam)
+  (let ((ce (guard (e (#t #f)) (top-level-value 'jolt-compile-eval-form))))
+    (and (procedure? ce) ce)))
+
+;; Rebuild one fn source record into a live closure: compile
+;; (fn* [free-names…] form) in the record's defining ns, then apply it to
+;; the restored free values. The wrapper params SHADOW the outer-scope
+;; names the body references — that is what reconstructs the lexical
+;; environment the closure was compiled in.
+(define (image-eval-fnsrc x tfvs)
+  (let ((ce (image-compile-eval-seam)))
+    (unless ce
+      (jolt-throw (jolt-ex-info
+                    (string-append "image: this build has no compiler; cannot rebuild fn "
+                                   (image-fnsrc-name x) " from source"
+                                   " (a tree-shaken build that dropped the compiler"
+                                   " cannot restore images holding anonymous fns)")
+                    jolt-nil)))
+    (let* ((frees (image-fnsrc-free-names x))
+           (params (let loop ((s (jolt-seq frees)) (acc '()))
+                     (if (jolt-nil? s)
+                         (reverse acc)
+                         (loop (seq-more s) (cons (jolt-symbol #f (seq-first s)) acc)))))
+           (wrapper (list->cseq (list (jolt-symbol #f "fn*")
+                                      (apply jolt-vector params)
+                                      (image-fnsrc-form x))))
+           (wfn (guard (e (#t (jolt-throw (jolt-ex-info
+                                            (string-append "image: cannot compile fn "
+                                                           (image-fnsrc-name x) " in ns "
+                                                           (image-fnsrc-ns x) ": "
+                                                           (image-condition-text e))
+                                            jolt-nil))))
+                  (ce wrapper (image-fnsrc-ns x)))))
+      (apply jolt-invoke wfn tfvs))))
+
+;; Restore fns are tried in registration order; the first that accepts wins —
+;; the same contract the externals handler path has always had.
+(define (image-restore-handler payload)
+  (let loop ((hs image-handlers))
+    (if (null? hs)
+        (jolt-throw (jolt-ex-info "image: no handler registered to restore a resource" jolt-nil))
+        (let ((r (call/cc (lambda (k)
+                   (with-exception-handler (lambda (e) (k 'image-no))
+                     (lambda () (jolt-invoke (caddr (car hs)) payload)))))))
+          (if (eq? r 'image-no) (loop (cdr hs)) r)))))
 
 ;; The one traversal skeleton in two modes, so scan and dump share the arms and
 ;; cannot disagree about what is writable. 'rebuild returns a substituted copy
@@ -332,6 +410,11 @@
 ;; instead of building or throwing. The memo doubles as the cycle guard:
 ;; mutable cells (atoms, var cells, mutable hashtables, fnsrc records) are
 ;; memoized before their children fill in, so a cycle through them resolves.
+;; The read side is 'rebuild plus fnsrc/handled reconstruction, so the two
+;; modes share every container arm; only report diverges.
+(define (image-rebuild-mode? mode)
+  (or (eq? mode 'rebuild) (eq? mode 'restore)))
+
 (define (image-graph-process root mode report!)
   (let ((memo (make-eq-hashtable)))
     (letrec ((walk
@@ -340,30 +423,40 @@
                   ;; scalar leaves can never hold a procedure
                   ((or (null? x) (boolean? x) (number? x) (char? x)
                        (symbol? x) (string? x) (bytevector? x))
-                   (if (eq? mode 'rebuild) x #t))
+                   (if (image-rebuild-mode? mode) x #t))
                   ((hashtable-ref memo x #f) =>
-                   (lambda (m) (if (eq? mode 'rebuild) m #t)))
+                   (lambda (m) (if (image-rebuild-mode? mode) m #t)))
                   (else
                    (cond
+                     ;; R3 read side: image-owned records rebuild first, before
+                     ;; user handlers could claim them. A stored fn source record
+                     ;; becomes a live closure; a stored handler payload is handed
+                     ;; to the registered restore fn.
+                     ((and (eq? mode 'restore) (image-fnsrc? x))
+                      (walk-fnsrc-restore x path))
+                     ((and (eq? mode 'restore) (image-handled? x))
+                      (walk-handled-restore x path))
                      ;; handlers claim at any depth, before anything else
                      ((and (pair? image-handlers) (image-handler-for x)) =>
                       (lambda (h)
-                        (if (eq? mode 'rebuild)
+                        (if (image-rebuild-mode? mode)
                             (let ((r (make-image-handled (jolt-invoke (cadr h) x))))
                               (hashtable-set! memo x r)
                               r)
                             (begin (hashtable-set! memo x #t) #t))))
                      ;; a named fn stays in place: the fn-ref external restores
-                     ;; it as the live fn (cheaper than source, no form needed)
+                     ;; it as the live fn (cheaper than source, no form needed).
+                     ;; On the READ side a procedure IS an already-restored
+                     ;; fn-ref external — force the fn-ref verdict (identity).
                      ((procedure? x)
-                      (let ((v (image-proc-verdict x)))
+                      (let ((v (if (eq? mode 'restore) 'fn-ref (image-proc-verdict x))))
                         (cond
                           ((eq? v 'fn-ref)
-                           (if (eq? mode 'rebuild)
+                           (if (image-rebuild-mode? mode)
                                (begin (hashtable-set! memo x x) x)
                                #t))
                           ((eq? v 'refuse)
-                           (if (eq? mode 'rebuild)
+                           (if (image-rebuild-mode? mode)
                                (jolt-throw
                                  (jolt-ex-info
                                    (string-append "image: cannot write " (image-describe-obj x)
@@ -371,10 +464,16 @@
                                    jolt-nil))
                                (begin (hashtable-set! memo x #t) (report! x path))))
                           (else
-                           ;; v is a (name . registration) pair
-                           (if (eq? mode 'rebuild)
+                           ;; v is a (name . registration) pair. Report mode must
+                           ;; agree with what the build would do, so it prechecks
+                           ;; recoverability (a const-folded capture refuses).
+                           (if (image-rebuild-mode? mode)
                                (image-fnsrc-build x v walk memo path)
-                               #t)))))
+                               (let ((probe (image-recover-free-values
+                                              x (vector-ref (cdr v) 2)
+                                              (lambda (fv p) #t) path)))
+                                 (hashtable-set! memo x #t)
+                                 (if (vector? probe) #t (report! x path))))))))
                      (else
                        ;; non-procedure externals the descriptor machinery
                        ;; cannot encode (non-eq hashtables, ports, threads):
@@ -398,10 +497,10 @@
                           (walk-hashtable x path))
                          ((and (record? x) (record-rtd x))
                           (walk-record x path))
-                         (else (if (eq? mode 'rebuild) x #t)))))))))
+                         (else (if (image-rebuild-mode? mode) x #t)))))))))
              (walk-pmap
               (lambda (x path)
-                (if (eq? mode 'rebuild)
+                (if (image-rebuild-mode? mode)
                     (let ((entries '()) (dirty #f))
                       (pmap-fold-fwd x
                         (lambda (k v acc)
@@ -433,7 +532,7 @@
                       #t))))
              (walk-pset
               (lambda (x path)
-                (if (eq? mode 'rebuild)
+                (if (image-rebuild-mode? mode)
                     (let ((items '()) (dirty #f))
                       (pset-fold x
                         (lambda (e acc)
@@ -457,7 +556,7 @@
              (walk-pvec
               (lambda (x path)
                 (let ((n (pvec-count x)))
-                  (if (eq? mode 'rebuild)
+                  (if (image-rebuild-mode? mode)
                       (let ((items '()) (dirty #f))
                         (let loop ((i 0))
                           (if (fx<? i n)
@@ -482,7 +581,7 @@
                         #t)))))
              (walk-var-cell
               (lambda (x path)
-                (if (eq? mode 'rebuild)
+                (if (image-rebuild-mode? mode)
                     (let ((nx (make-var-cell (var-cell-ns x) (var-cell-name x)
                                              jolt-nil (var-cell-defined? x))))
                       (hashtable-set! memo x nx)
@@ -499,7 +598,7 @@
              ;; (the scan/dump parity fix)
              (walk-atom
               (lambda (x path)
-                (if (eq? mode 'rebuild)
+                (if (image-rebuild-mode? mode)
                     (let ((nx (make-jolt-atom jolt-nil '() jolt-nil (make-mutex))))
                       (hashtable-set! memo x nx)
                       (image-meta-copy! x nx)
@@ -519,7 +618,7 @@
                       #t))))
              (walk-pair
               (lambda (x path)
-                (if (eq? mode 'rebuild)
+                (if (image-rebuild-mode? mode)
                     (let* ((a (walk (car x) (cons "car" path)))
                            (d (walk (cdr x) (cons "cdr" path))))
                       (or (hashtable-ref memo x #f)
@@ -536,7 +635,7 @@
              (walk-vector
               (lambda (x path)
                 (let ((n (vector-length x)))
-                  (if (eq? mode 'rebuild)
+                  (if (image-rebuild-mode? mode)
                       (let ((out (make-vector n)) (dirty #f))
                         (let loop ((i 0))
                           (if (fx<? i n)
@@ -562,7 +661,7 @@
              (walk-hashtable
               (lambda (x path)
                 (let-values (((ks vs) (hashtable-entries x)))
-                  (if (eq? mode 'rebuild)
+                  (if (image-rebuild-mode? mode)
                       (let ((nx (make-hashtable (hashtable-hash-function x)
                                                 (hashtable-equivalence-function x))))
                         (hashtable-set! memo x nx)
@@ -592,7 +691,7 @@
                 (let* ((rtd (record-rtd x))
                        (names (record-type-field-names rtd))
                        (n (vector-length names)))
-                  (if (eq? mode 'rebuild)
+                  (if (image-rebuild-mode? mode)
                       (let ((vals (make-vector n)) (dirty #f))
                         (let loop ((i 0))
                           (if (fx<? i n)
@@ -620,7 +719,43 @@
                                         (lambda () ((record-accessor rtd i) x)))))))
                               (walk v (cons (symbol->string (vector-ref names i)) path)))
                             (loop (fx+ i 1))))
-                        #t))))))
+                        #t)))))
+             ;; R3 read side: a stored fn source record rebuilds into a live
+             ;; closure. Bottom-up: the record's free values transform first (a
+             ;; captured value may itself be or contain a fnsrc record), then the
+             ;; wrapper (fn* [free-names…] form) is compiled+eval'd in the
+             ;; record's ns and APPLIED to the transformed values — the wrapper
+             ;; params SHADOW the outer-scope names the body references. The
+             ;; result is memoized keyed by the RECORD, so a record shared by two
+             ;; slots evals once and both slots get the SAME closure; a cycle
+             ;; through a mutable cell works because the cell is memoized before
+             ;; its contents walk (the R2 order), so the closure's free value IS
+             ;; the restored cell.
+             (walk-fnsrc-restore
+              (lambda (x path)
+                (let* ((frees (image-fnsrc-free-names x))
+                       (fvs (image-fnsrc-free-values x))
+                       (n (vector-length fvs)))
+                  (unless (fx=? n (pvec-count frees))
+                    (jolt-throw (jolt-ex-info
+                                  (string-append "image: malformed fn source record "
+                                                 (image-fnsrc-name x) ": " (number->string n)
+                                                 " free values for " (number->string (pvec-count frees))
+                                                 " free names")
+                                  jolt-nil)))
+                  (let ((tfvs (map (lambda (v)
+                                     (walk v (cons (string-append "free:" (image-fnsrc-name x)) path)))
+                                   (vector->list fvs))))
+                    (let ((cl (image-eval-fnsrc x tfvs)))
+                      (hashtable-set! memo x cl)
+                      (image-meta-copy! x cl)
+                      cl)))))
+             (walk-handled-restore
+              (lambda (x path)
+                (let ((tp (walk (image-handled-payload x) (cons "payload" path))))
+                  (let ((r (image-restore-handler tp)))
+                    (hashtable-set! memo x r)
+                    r)))))
       (walk root '()))))
 
 ;; The write path's substitution entry: a copy of the graph where every anon
@@ -779,7 +914,10 @@
       (unless (and (vector? b) (fx=? (vector-length b) 2))
         (jolt-throw (jolt-ex-info (string-append "image: malformed body in " path) jolt-nil)))
       (image-reattach-meta! (vector-ref b 1))
-      (vector-ref b 0))))
+      ;; R3: rebuild what the write side substituted — fn source records become
+      ;; live closures, handler payloads go back through their restore fns.
+      ;; Runs after meta re-attachment so container rebuilds carry meta forward.
+      (image-graph-process (vector-ref b 0) 'restore #f))))
 
 ;; --- whole-world image ----------------------------------------------------------
 ;; The Smalltalk/Common Lisp shape: don't ask which variable to save, save the
@@ -874,12 +1012,9 @@
                  (nm (substring k (fx+ slash 1) (string-length k))))
             (let ((cell (jolt-var ns nm))
                   (v (cdr p)))
-              ;; a handler claimed this var on the way out; hand the payload back
-              ;; to whichever registered handler accepts it
-              (var-cell-root-set! cell (if (image-handled? v)
-                                           (image-decode-external
-                                             (list 'handler (image-handled-payload v)))
-                                           v))
+              ;; handled payloads and fn source records were already rebuilt by
+              ;; the read transform; the root binds as-is
+              (var-cell-root-set! cell v)
               (var-cell-defined?-set! cell #t)
               (set! n (fx+ n 1)))))
         (vector-ref w 1))
