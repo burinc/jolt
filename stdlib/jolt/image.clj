@@ -81,9 +81,10 @@
   "Write every data var in the application's namespaces to PATH.
 
   With no NAMESPACES, dumps every namespace that is not the language's own —
-  clojure.*, jolt.* and user are skipped, because their vars (*ns*, printer and
+  clojure.* and jolt.* are skipped, because their vars (*ns*, printer and
   reader settings) belong to the process being restored into, not to the image.
-  Pass a seq of namespace-name strings to be explicit.
+  `user` is kept: at a REPL it is where the work lives. Pass a seq of
+  namespace-name strings to be explicit.
 
   Runs the before-dump hooks first. Vars holding functions are skipped: the
   restoring build already has the code."
