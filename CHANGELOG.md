@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-08-05
+
+### Changed
+
+- Vendored grenadine updated to v0.1.5. The effective-POM reader now handles
+  Unicode in Maven XML and legacy Maven dependency forms, widening the set of
+  POMs `jolt.deps` can resolve transitively. (#536)
+
 ## [0.6.3] - 2026-08-05
 
 Adds `jolt.image` — write a running program's state to a file and restore it
