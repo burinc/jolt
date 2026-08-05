@@ -120,6 +120,7 @@ maximum-memory-bytes
 monitor-enter
 monitor-exit
 mono-nanos
+munge-name
 park-until-interrupt
 protocol-key-of
 protocol-methods

@@ -9,6 +9,11 @@
 
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
+;; gate-boot's optimized profile compiles with generate-inspector-information off,
+;; which suppresses the closure free-var info free-value recovery needs
+;; ((io 'ref i) reports nothing); the release runtime has it ON, so turn it back
+;; on here — only code compiled after this point (the fixture evals) is affected.
+(generate-inspector-information #t)
 
 (define total 0) (define fails 0)
 (define (ok name pred)
@@ -124,25 +129,231 @@
                    " ((first (jolt.host/image-read \"" tmp "\")) 21))")
     "42")
 
-;; a bare closure has no name to write -> refused, with the path to it
-(is "anonymous closure is refused"
-    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (fn [x] x)}}) :no-throw"
+;; a closure with no source registration to write -> refused, with the path to
+;; it (a core-tier closure like partial's is never jfn$-registered)
+(is "unregistered closure is refused"
+    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (partial + 1)}}) :no-throw"
                    " (catch Exception e (if (re-find #\"cannot write\" (ex-message e)) :refused :wrong-error)))")
     ":refused")
 (is "refusal names the path"
-    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (fn [x] x)}}) \"\""
+    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (partial + 1)}}) \"\""
                    " (catch Exception e (if (re-find #\":handlers\" (ex-message e)) :has-path :no-path)))")
     ":has-path")
 
 ;; --- scan reports without writing ----------------------------------------------
 (is "scan is empty for pure data"
     "(count (jolt.host/image-scan {:a [1 2] :b #{3}}))" "0")
-(is "scan finds the closure"
-    "(count (jolt.host/image-scan {:f (fn [x] x)}))" "1")
+;; R2: a registered anon literal substitutes, so scan no longer flags it. The
+;; fixture is a separate def: an inline literal's registration sibling runs after
+;; the enclosing form's value is computed, so scan would see it unregistered.
+(ev "(def scn {:f (fn [x] x)})")
+(is "scan is empty for a registered anon fn"
+    "(count (jolt.host/image-scan user/scn))" "0")
+(is "scan reports an unregistered closure"
+    "(count (jolt.host/image-scan {:p (partial + 1)}))" "1")
 (is "scan reports a path"
-    "(-> (jolt.host/image-scan {:outer {:inner (fn [x] x)}}) first :path string? )" "true")
+    "(-> (jolt.host/image-scan {:outer {:p (partial + 1)}}) first :path string? )" "true")
 (is "scan is empty for a named fn"
     "(count (jolt.host/image-scan {:f inc}))" "0")
+
+;; --- R2: anonymous closures substitute as image-fnsrc records -------------------
+;; Write-side only: dump! succeeds where it refused, and the records land in the
+;; fasl body. R3 reconstructs them; here they come back inert, so the tests read
+;; the file low-level (the way jolt-image-read does) and assert the fields.
+
+(define (closure-name c)
+  (guard (e (#t #f))
+    (let* ((io (inspect/object c))
+           (code (guard (e (#t #f)) (io 'code))))
+      (and code (guard (e (#t #f)) (code 'name))))))
+
+(define (image-body path)
+  (let ((port (open-file-input-port path)))
+    (let* ((h (fasl-read port))
+           (descs (fasl-read port))
+           (exts (list->vector (map image-decode-external descs)))
+           (b (fasl-read port 'load exts)))
+      (close-port port)
+      b)))
+
+(define (image-graph path) (vector-ref (image-body path) 0))
+
+(define (find-fnsrcs root)
+  (let ((acc '()))
+    (image-walk root (lambda (x p) (when (image-fnsrc? x) (set! acc (cons x acc)))))
+    (reverse acc)))
+
+(define (jvec->strings v)
+  (let loop ((s (jolt-seq v)) (acc '()))
+    (if (jolt-nil? s)
+        (reverse acc)
+        (loop (seq-more s) (cons (seq-first s) acc)))))
+
+;; the free-VALUE aligned to a registered free-name (matched by munged name), or
+;; #f when the name isn't there
+(define (fvs-by-name r nm)
+  (let ((frees (jvec->strings (image-fnsrc-free-names r)))
+        (fvs (image-fnsrc-free-values r)))
+    (let ((i (let loop ((l frees) (j 0))
+               (cond ((null? l) #f)
+                     ((string=? (car l) nm) j)
+                     (else (loop (cdr l) (+ j 1)))))))
+      (and i (vector-ref fvs i)))))
+
+;; a def whose init is an anon literal binds that literal directly (named by the
+;; define), so the R2 cases bind the literal to a local first and store it inside
+;; data, leaving it anonymous for the dump
+(ev "(def img {:f (fn [x] (* x 2))})")
+(is "anon fn in state dumps"
+    (string-append "(do (jolt.host/image-write! \"" tmp "\" user/img) :ok)")
+    ":ok")
+(let* ((g (image-graph tmp))
+       (recs (find-fnsrcs g))
+       (orig (jolt-get (var-deref "user" "img") (keyword #f "f") jolt-nil)))
+  (ok "dump writes exactly one fnsrc record" (= 1 (length recs)))
+  (ok "fnsrc name matches the live closure's inspector name"
+      (string=? (image-fnsrc-name (car recs)) (closure-name orig)))
+  (ok "fnsrc ns" (string=? (image-fnsrc-ns (car recs)) "user"))
+  (ok "fnsrc free-names is an empty jolt vector"
+      (and (pvec? (image-fnsrc-free-names (car recs)))
+           (fx=? 0 (pvec-count (image-fnsrc-free-names (car recs))))))
+  (ok "fnsrc form is the registered fn* form"
+      (let* ((r (car recs))
+             (reg (image-fn-form-lookup (image-fnsrc-name r))))
+        (and reg (equal? (jolt-final-str (jolt-pr-readable (image-fnsrc-form r)))
+                         (jolt-final-str (jolt-pr-readable (vector-ref reg 0))))))))
+
+;; a closure shared through two slots writes ONE record; the read-back graph
+;; shares it (memoized by identity)
+(ev "(def shared (let [f (fn [x] (* x 2))] {:a f :b f}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/shared)"))
+(let* ((g (image-graph tmp))
+       (recs (find-fnsrcs g))
+       (va (jolt-get g (keyword #f "a") jolt-nil))
+       (vb (jolt-get g (keyword #f "b") jolt-nil)))
+  (ok "shared closure writes one record" (= 1 (length recs)))
+  (ok "shared closure is one shared record" (and (eq? va vb) (image-fnsrc? va))))
+
+;; a capture cycle (closure -> atom -> closure) survives: the recovered free
+;; value re-enters the transformer and finds the copy, not the live atom. The
+;; closure rides inside a map (a def whose direct value is a closure would land
+;; in proc-name-tbl and travel fn-ref instead).
+(ev "(def cyc (let [a (atom nil)] (reset! a (fn [x] (deref a))) {:self a}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/cyc)"))
+(let* ((g (image-graph tmp))
+       (self (jolt-get g (keyword #f "self") jolt-nil))
+       (rec (jolt-atom-val self)))
+  (ok "cycle root is a map" (and (pmap? g) (jolt-atom? self)))
+  (ok "cycle atom holds one fnsrc record" (image-fnsrc? rec))
+  (ok "fnsrc free-value cycles back into the graph"
+      (let ((fvs (image-fnsrc-free-values rec)))
+        (and (vector? fvs)
+             (fx=? 1 (vector-length fvs))
+             (eq? (vector-ref fvs 0) self)))))
+
+;; a keyword and a named fn captured as free values travel as themselves: the
+;; keyword re-interns, the named fn goes fn-ref (not source). The closure rides
+;; inside a map so the def's direct value isn't the closure (that would put it in
+;; proc-name-tbl and it would travel fn-ref), and the captured values are runtime
+;; (a deref) so the analyzer cannot fold them into the literal.
+(ev "(def mix {:m (let [k (deref (atom :tag)) nf inc] (fn [x] [k nf x]))})")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/mix)"))
+(let* ((g (image-graph tmp))
+       (recs (find-fnsrcs g))
+       (r (and (= 1 (length recs)) (car recs))))
+  (ok "mix writes one fnsrc record" (= 1 (length recs)))
+  (ok "mix free-values carry the keyword"
+      (and r (eq? (fvs-by-name r "k") (keyword #f "tag"))))
+  (ok "mix free-values carry the named fn via fn-ref"
+      (and r (eq? (fvs-by-name r "nf") (var-deref "clojure.core" "inc")))))
+
+;; a def whose DIRECT value is a closure lands in proc-name-tbl (var-set! names
+;; it) and travels fn-ref with NO record — whether its literal folded to the
+;; direct init (a let over constants) or not. Pins that fn-ref precedence.
+(ev "(def fold (let [k :tag nf inc] (fn [x] [k nf x])))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/fold)"))
+(let* ((g (image-graph tmp)))
+  (ok "folded closure writes no fnsrc record" (null? (find-fnsrcs g)))
+  (ok "folded closure travels fn-ref as the live fn"
+      (eq? g (var-deref "user" "fold"))))
+
+;; munge-name agreement: the write side munges registered free names with the
+;; same mapping the emitter used, so a capture whose local needs munging is
+;; still matched by name. Pin both sides, then end-to-end.
+(define (jolt-backend-munge s)
+  (jolt-invoke1 (var-deref "jolt.backend-scheme" "munge-name") s))
+(define (jolt-host-munge s)
+  (jolt-invoke1 (var-deref "jolt.host" "munge-name") s))
+(ok "munge seam agrees with the backend emitter"
+    (equal? (map jolt-host-munge '("x" "base" "hash#" "f'" "a$b" "if" "lambda" "jolt-x" "jv$x" "inc"))
+            (map jolt-backend-munge '("x" "base" "hash#" "f'" "a$b" "if" "lambda" "jolt-x" "jv$x" "inc"))))
+(ev "(def adv {:f (let [if (atom 3) hash# (atom 5)] (fn [x] (+ x (deref if) (deref hash#))))})")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/adv)"))
+(let* ((g (image-graph tmp))
+       (recs (find-fnsrcs g))
+       (r (and (= 1 (length recs)) (car recs))))
+  (ok "adversarial capture writes one fnsrc" (= 1 (length recs)))
+  (ok "adversarial free-names keep original names"
+      (and r
+           (let ((l (jvec->strings (image-fnsrc-free-names r))))
+             (and (member "if" l) (member "hash#" l)))))
+  (ok "adversarial free-values matched by munged name"
+      (and r
+           (eqv? (jolt-atom-val (fvs-by-name r "if")) 3)
+           (eqv? (jolt-atom-val (fvs-by-name r "hash#")) 5))))
+
+;; the atom arm covers watches + validator (scan/dump parity): a registered anon
+;; watch substitutes, an unregistered one is reported and refused
+(ev "(def wa (atom 0))")
+(ev "(add-watch user/wa :w (fn [k r o n] nil))")
+(is "scan is empty for an atom with a registered anon watch"
+    "(count (jolt.host/image-scan user/wa))" "0")
+(is "dump succeeds with a registered anon watch"
+    (string-append "(do (jolt.host/image-write! \"" tmp "\" user/wa) :ok)")
+    ":ok")
+;; the watch list stores (key . fn) pairs; the walk substitutes each fn
+(let* ((g (image-graph tmp))
+       (ws (jolt-atom-watches g)))
+  (ok "watch slot holds one fnsrc record"
+      (and (pair? ws)
+           (pair? (car ws))
+           (image-fnsrc? (cdr (car ws)))
+           (null? (cdr ws))))
+  (ok "watch key preserved" (eq? (car (car ws)) (keyword #f "w"))))
+(ev "(def wb (atom 0))")
+(ev "(add-watch user/wb :w (partial + 1))")
+(is "scan reports an unregistered watch"
+    "(count (jolt.host/image-scan user/wb))" "1")
+(is "dump refuses an unregistered watch"
+    (string-append "(try (jolt.host/image-write! \"" tmp "\" user/wb) :no-throw"
+                   " (catch Exception e (if (re-find #\"cannot write\" (ex-message e)) :refused :wrong-error)))")
+    ":refused")
+
+;; metadata rides to the substituted object: the write side copies the meta
+;; table entry across the transform memo, so collect-meta keys the copy
+(ev "(def mm (with-meta {:f (fn [x] x)} {:m 1}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/mm)"))
+(let* ((b (image-body tmp))
+       (g (vector-ref b 0))
+       (meta-alist (vector-ref b 1)))
+  (ok "the substituted map is a fresh object" (not (eq? g (var-deref "user" "mm"))))
+  (ok "meta rides keyed by the substituted map"
+      (let ((e (assq g meta-alist)))
+        (and e (= 1 (jolt-get (cdr e) (keyword #f "m") jolt-nil))))))
+
+;; handlers claim at any depth (not just var roots), procedures and resources
+(ev "(jolt.host/image-register-handler! (fn [x] (and (map? x) (= (:res-id x) 7))) (fn [x] {:claimed (:res-id x)}) (fn [d] d))")
+(ev "(def deep {:outer {:r {:res-id 7 :keep 1}}})")
+(is "handler claims a resource at depth"
+    (string-append "(do (jolt.host/image-write! \"" tmp "\" user/deep) :ok)")
+    ":ok")
+(let* ((g (image-graph tmp))
+       (handled '()))
+  (image-walk g (lambda (x p) (when (image-handled? x) (set! handled (cons x handled)))))
+  (ok "one image-handled record at depth" (= 1 (length handled)))
+  (ok "handler payload rides in the body"
+      (= 7 (jolt-get (image-handled-payload (car handled)) (keyword #f "claimed") jolt-nil))))
+
 
 ;; --- header / compatibility ------------------------------------------------------
 (is "reading a non-image fails with a clear message"

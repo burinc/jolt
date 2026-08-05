@@ -103,7 +103,12 @@
                 ((var-cell? x)
                  (walk (var-cell-root x)
                        (cons (string-append "#'" (var-cell-ns x) "/" (var-cell-name x)) path)))
-                ((jolt-atom? x) (walk (jolt-atom-val x) (cons "@" path)))
+                ;; cover val + watches + validator — everything fasl-write sees
+                ((jolt-atom? x)
+                 (walk (jolt-atom-val x) (cons "@" path))
+                 (for-each (lambda (w) (walk w (cons "@watch" path)))
+                           (jolt-atom-watches x))
+                 (walk (jolt-atom-validator x) (cons "@validator" path)))
                 ((pair? x) (walk (car x) (cons "car" path)) (walk (cdr x) (cons "cdr" path)))
                 ((vector? x)
                  (let ((n (vector-length x)))
@@ -191,16 +196,450 @@
              (if (eq? r 'image-no) (loop (cdr hs)) r)))))
     (else (jolt-throw (jolt-ex-info "image: unknown external descriptor" jolt-nil)))))
 
+;; --- R2: substitution pre-pass --------------------------------------------------
+;; A var root a handler claimed, replaced by the handler's plain-data payload.
+;; Substituting through the transformer (not only at world var roots) is what
+;; lets a handler claim a resource at ANY depth: the payload rides in the body,
+;; so a function inside it becomes a fn-ref or an image-fnsrc and a keyword
+;; inside it gets re-interned, exactly as if the application had stored that
+;; data directly. Routing it through a descriptor instead would put it in the
+;; one part of the file that cannot carry either.
+(define-record-type image-handled (fields payload) (nongenerative image-handled-v1))
+
+;; An anonymous closure a state image can rebuild from source (write side here;
+;; R3 reconstructs). name is the unique jfn$<ns>$<def>$<n> the backend bound
+;; the literal under — what Chez's inspector reports for the live closure;
+;; form/ns/free-names come from the load-time registration (fn-form-registry.ss);
+;; free-values are the LIVE captured values recovered by name through the
+;; inspector and pushed back through this same pass, so a captured mutable cell
+;; cycles into the written graph instead of pointing into the live one. Rides in
+;; the BODY: its fields are walked by fasl, so a keyword inside re-interns, a
+;; named fn goes fn-ref, and a nested anon closure was already substituted.
+(define-record-type image-fnsrc
+  (fields name form ns free-names (mutable free-values))
+  (nongenerative image-fnsrc-v1))
+
+;; backend_scheme.clj's munge-name, exposed so the write side munges registered
+;; free names with EXACTLY the mapping the emitter used. Deref'd at dump time,
+;; when the compiler core is loaded; the stateimage gate pins agreement between
+;; this seam and the backend.
+(def-var! "jolt.host" "munge-name"
+  (lambda (s) (jolt-invoke1 (var-deref "jolt.backend-scheme" "munge-name") s)))
+
+(define (image-munge s) (jolt-invoke1 (var-deref "jolt.host" "munge-name") s))
+
+(define (image-string-prefix? s pre)
+  (let ((n (string-length s)) (m (string-length pre)))
+    (and (fx>=? n m) (string=? (substring s 0 m) pre))))
+
+;; Carry the meta side-table entry from a rebuilt object's original (the weak
+;; table in natives-meta.ss), so image-collect-meta keys the SUBSTITUTED
+;; objects — the ones fasl-write actually sees.
+(define (image-meta-copy! orig new)
+  (when (not (eq? orig new))
+    (let ((m (call/cc (lambda (k)
+              (with-exception-handler (lambda (e) (k jolt-nil))
+                (lambda () (jolt-meta orig)))))))
+      (unless (jolt-nil? m)
+        (hashtable-set! meta-table new m)))))
+
+;; A procedure's substitution decision, shared by both modes so scan and dump
+;; cannot disagree. Returns the registration (name . (form ns free-names)) for
+;; a registered jfn$ literal, or #f when the closure must refuse: no inspector
+;; name, not jfn$-prefixed, or no registration (core-tier closures, bare
+;; unregistered lambdas, no-inspector builds).
+(define (image-fnsrc-probe x)
+  (guard (e (#t #f))
+    (let* ((io (inspect/object x))
+           (code (io 'code))
+           (nm (and code (code 'name))))
+      (and (string? nm)
+           (image-string-prefix? nm "jfn$")
+           (let ((reg (image-fn-form-lookup nm)))
+             (and reg (cons nm reg)))))))
+
+;; The one procedure decision, consumed by BOTH modes so scan and dump cannot
+;; disagree. Precedence: a handler is claimed in the walk's outer cond before
+;; this arm ever runs; then a named var-root fn (fn-ref — restore as the live
+;; fn); then a registered jfn$ literal (returns (name . registration)); else
+;; 'refuse. scan and dump branch on the same verdict, never on their own copies
+;; of the rules.
+(define (image-proc-verdict x)
+  (cond
+    ((hashtable-ref proc-name-tbl x #f) 'fn-ref)
+    (else (or (image-fnsrc-probe x) 'refuse))))
+
+;; Recover the LIVE captured values, in REGISTERED free-name order, by munging
+;; each original name and matching it against the inspector's munged names. A
+;; registered name the inspector does not report (cp0 dropped a dead capture)
+;; binds jolt-nil. Every recovered value runs back through the transformer so
+;; the written graph never points into the live one. Any inspector/munge
+;; failure returns 'image-no (the caller refuses) — never a crash, never a
+;; silent partial; the free-value walk itself is unguarded so a refusal on a
+;; nested free value keeps its own, more specific path.
+(define (image-recover-free-values x frees walk path)
+  (call/cc
+    (lambda (refuse)
+      (define (refuse-on-fail thunk)
+        (guard (e (#t (refuse 'image-no))) (thunk)))
+      (let* ((io (refuse-on-fail (lambda () (inspect/object x))))
+             (n (refuse-on-fail (lambda () (io 'length))))
+             (tbl (make-hashtable string-hash string=?)))
+        (let loop ((i 0))
+          (when (and n (fx<? i n))
+            (let* ((vo (refuse-on-fail (lambda () (io 'ref i))))
+                   (nm0 (refuse-on-fail (lambda () (vo 'name))))
+                   (nm (if (symbol? nm0) (symbol->string nm0) nm0))
+                   (v (refuse-on-fail (lambda () ((vo 'ref) 'value)))))
+              (when (string? nm)
+                (hashtable-set! tbl nm v)))
+            (loop (fx+ i 1))))
+        (let loop ((s (jolt-seq frees)) (acc '()))
+          (if (jolt-nil? s)
+              (list->vector (reverse acc))
+              (let* ((orig (jolt-first s))
+                     (val (hashtable-ref tbl
+                                         (refuse-on-fail (lambda () (image-munge orig)))
+                                         'image-missing)))
+                (loop (jolt-next s)
+                      (cons (if (eq? val 'image-missing)
+                                jolt-nil
+                                (walk val (cons (string-append "free:" orig) path)))
+                            acc)))))))))
+
+;; The image-fnsrc record is memoized BEFORE its free values are recovered, so
+;; a capture cycle (closure -> atom -> closure) finds this record in the memo
+;; instead of recursing forever; the free-values field is mutable for that fill.
+(define (image-fnsrc-build x reg walk memo path)
+  (let ((r (make-image-fnsrc (car reg) (vector-ref (cdr reg) 0)
+                             (vector-ref (cdr reg) 1) (vector-ref (cdr reg) 2)
+                             (vector))))
+    (hashtable-set! memo x r)
+    (let ((fvs (image-recover-free-values x (vector-ref (cdr reg) 2) walk path)))
+      (if (eq? fvs 'image-no)
+          (jolt-throw (jolt-ex-info
+                        (string-append "image: cannot write " (image-describe-obj x)
+                                       " at " (image-path->string path))
+                        jolt-nil))
+          (begin (image-fnsrc-free-values-set! r fvs) r)))))
+
+;; The one traversal skeleton in two modes, so scan and dump share the arms and
+;; cannot disagree about what is writable. 'rebuild returns a substituted copy
+;; of the graph — identity for any subtree that holds nothing to substitute,
+;; dirtiness tracked bottom-up — and throws jolt-ex-info on the first object
+;; the write path cannot encode, with the route to it; 'report performs the
+;; same descent and decisions but records a finding via (report! obj path)
+;; instead of building or throwing. The memo doubles as the cycle guard:
+;; mutable cells (atoms, var cells, mutable hashtables, fnsrc records) are
+;; memoized before their children fill in, so a cycle through them resolves.
+(define (image-graph-process root mode report!)
+  (let ((memo (make-eq-hashtable)))
+    (letrec ((walk
+              (lambda (x path)
+                (cond
+                  ;; scalar leaves can never hold a procedure
+                  ((or (null? x) (boolean? x) (number? x) (char? x)
+                       (symbol? x) (string? x) (bytevector? x))
+                   (if (eq? mode 'rebuild) x #t))
+                  ((hashtable-ref memo x #f) =>
+                   (lambda (m) (if (eq? mode 'rebuild) m #t)))
+                  (else
+                   (cond
+                     ;; handlers claim at any depth, before anything else
+                     ((and (pair? image-handlers) (image-handler-for x)) =>
+                      (lambda (h)
+                        (if (eq? mode 'rebuild)
+                            (let ((r (make-image-handled (jolt-invoke (cadr h) x))))
+                              (hashtable-set! memo x r)
+                              r)
+                            (begin (hashtable-set! memo x #t) #t))))
+                     ;; a named fn stays in place: the fn-ref external restores
+                     ;; it as the live fn (cheaper than source, no form needed)
+                     ((procedure? x)
+                      (let ((v (image-proc-verdict x)))
+                        (cond
+                          ((eq? v 'fn-ref)
+                           (if (eq? mode 'rebuild)
+                               (begin (hashtable-set! memo x x) x)
+                               #t))
+                          ((eq? v 'refuse)
+                           (if (eq? mode 'rebuild)
+                               (jolt-throw
+                                 (jolt-ex-info
+                                   (string-append "image: cannot write " (image-describe-obj x)
+                                                  " at " (image-path->string path))
+                                   jolt-nil))
+                               (begin (hashtable-set! memo x #t) (report! x path))))
+                          (else
+                           ;; v is a (name . registration) pair
+                           (if (eq? mode 'rebuild)
+                               (image-fnsrc-build x v walk memo path)
+                               #t)))))
+                     (else
+                       ;; non-procedure externals the descriptor machinery
+                       ;; cannot encode (non-eq hashtables, ports, threads):
+                       ;; report them in scan; rebuild leaves them for the
+                       ;; externals stage, which refuses with the path. A
+                       ;; keyword and a named fn's fn-ref encode fine.
+                       (when (and (eq? mode 'report)
+                                  (image-external? x)
+                                  (not (image-encode-external x)))
+                         (hashtable-set! memo x #t)
+                         (report! x path))
+                       (cond
+                         ((pmap? x) (walk-pmap x path))
+                         ((pset? x) (walk-pset x path))
+                         ((pvec? x) (walk-pvec x path))
+                         ((var-cell? x) (walk-var-cell x path))
+                         ((jolt-atom? x) (walk-atom x path))
+                         ((pair? x) (walk-pair x path))
+                         ((vector? x) (walk-vector x path))
+                         ((and (hashtable? x) (hashtable-mutable? x))
+                          (walk-hashtable x path))
+                         ((and (record? x) (record-rtd x))
+                          (walk-record x path))
+                         (else (if (eq? mode 'rebuild) x #t)))))))))
+             (walk-pmap
+              (lambda (x path)
+                (if (eq? mode 'rebuild)
+                    (let ((entries '()) (dirty #f))
+                      (pmap-fold-fwd x
+                        (lambda (k v acc)
+                          (let* ((wk (walk k (cons "<key>" path)))
+                                 (wv (walk v (cons (image-describe-obj k) path))))
+                            (set! entries (cons (cons wk wv) entries))
+                            (set! dirty (or dirty (not (eq? wk k)) (not (eq? wv v))))
+                            acc))
+                        #f)
+                      (if (hashtable-ref memo x #f)
+                          (hashtable-ref memo x #f)
+                          (if dirty
+                              (let ((nx (apply jolt-hash-map
+                                               (apply append
+                                                      (map (lambda (e) (list (car e) (cdr e)))
+                                                           (reverse entries))))))
+                                (hashtable-set! memo x nx)
+                                (image-meta-copy! x nx)
+                                nx)
+                              (begin (hashtable-set! memo x x) x))))
+                    (begin
+                      (hashtable-set! memo x #t)
+                      (pmap-fold-fwd x
+                        (lambda (k v acc)
+                          (walk k (cons "<key>" path))
+                          (walk v (cons (image-describe-obj k) path))
+                          acc)
+                        #f)
+                      #t))))
+             (walk-pset
+              (lambda (x path)
+                (if (eq? mode 'rebuild)
+                    (let ((items '()) (dirty #f))
+                      (pset-fold x
+                        (lambda (e acc)
+                          (let ((w (walk e (cons (image-describe-obj e) path))))
+                            (set! items (cons w items))
+                            (set! dirty (or dirty (not (eq? w e))))
+                            acc))
+                        #f)
+                      (if (hashtable-ref memo x #f)
+                          (hashtable-ref memo x #f)
+                          (if dirty
+                              (let ((nx (apply jolt-hash-set (reverse items))))
+                                (hashtable-set! memo x nx)
+                                (image-meta-copy! x nx)
+                                nx)
+                              (begin (hashtable-set! memo x x) x))))
+                    (begin
+                      (hashtable-set! memo x #t)
+                      (pset-fold x (lambda (e acc) (walk e (cons (image-describe-obj e) path)) acc) #f)
+                      #t))))
+             (walk-pvec
+              (lambda (x path)
+                (let ((n (pvec-count x)))
+                  (if (eq? mode 'rebuild)
+                      (let ((items '()) (dirty #f))
+                        (let loop ((i 0))
+                          (if (fx<? i n)
+                              (let* ((v (pvec-nth-d x i jolt-nil))
+                                     (w (walk v (cons (number->string i) path))))
+                                (set! items (cons w items))
+                                (set! dirty (or dirty (not (eq? v w))))
+                                (loop (fx+ i 1)))
+                              (or (hashtable-ref memo x #f)
+                                  (if dirty
+                                      (let ((nx (apply jolt-vector (reverse items))))
+                                        (hashtable-set! memo x nx)
+                                        (image-meta-copy! x nx)
+                                        nx)
+                                      (begin (hashtable-set! memo x x) x))))))
+                      (begin
+                        (hashtable-set! memo x #t)
+                        (let loop ((i 0))
+                          (when (fx<? i n)
+                            (walk (pvec-nth-d x i jolt-nil) (cons (number->string i) path))
+                            (loop (fx+ i 1))))
+                        #t)))))
+             (walk-var-cell
+              (lambda (x path)
+                (if (eq? mode 'rebuild)
+                    (let ((nx (make-var-cell (var-cell-ns x) (var-cell-name x)
+                                             jolt-nil (var-cell-defined? x))))
+                      (hashtable-set! memo x nx)
+                      (var-cell-root-set! nx
+                        (walk (var-cell-root x)
+                              (cons (string-append "#'" (var-cell-ns x) "/" (var-cell-name x)) path)))
+                      nx)
+                    (begin
+                      (hashtable-set! memo x #t)
+                      (walk (var-cell-root x)
+                            (cons (string-append "#'" (var-cell-ns x) "/" (var-cell-name x)) path))
+                      #t))))
+             ;; cover val + watches + validator — everything fasl-write sees
+             ;; (the scan/dump parity fix)
+             (walk-atom
+              (lambda (x path)
+                (if (eq? mode 'rebuild)
+                    (let ((nx (make-jolt-atom jolt-nil '() jolt-nil (make-mutex))))
+                      (hashtable-set! memo x nx)
+                      (image-meta-copy! x nx)
+                      (jolt-atom-val-set! nx (walk (jolt-atom-val x) (cons "@" path)))
+                      (jolt-atom-watches-set! nx
+                        (map (lambda (w) (walk w (cons "@watch" path)))
+                             (jolt-atom-watches x)))
+                      (jolt-atom-validator-set! nx
+                        (walk (jolt-atom-validator x) (cons "@validator" path)))
+                      nx)
+                    (begin
+                      (hashtable-set! memo x #t)
+                      (walk (jolt-atom-val x) (cons "@" path))
+                      (for-each (lambda (w) (walk w (cons "@watch" path)))
+                                (jolt-atom-watches x))
+                      (walk (jolt-atom-validator x) (cons "@validator" path))
+                      #t))))
+             (walk-pair
+              (lambda (x path)
+                (if (eq? mode 'rebuild)
+                    (let* ((a (walk (car x) (cons "car" path)))
+                           (d (walk (cdr x) (cons "cdr" path))))
+                      (or (hashtable-ref memo x #f)
+                          (if (and (eq? a (car x)) (eq? d (cdr x)))
+                              (begin (hashtable-set! memo x x) x)
+                              (let ((nx (cons a d)))
+                                (hashtable-set! memo x nx)
+                                nx))))
+                    (begin
+                      (hashtable-set! memo x #t)
+                      (walk (car x) (cons "car" path))
+                      (walk (cdr x) (cons "cdr" path))
+                      #t))))
+             (walk-vector
+              (lambda (x path)
+                (let ((n (vector-length x)))
+                  (if (eq? mode 'rebuild)
+                      (let ((out (make-vector n)) (dirty #f))
+                        (let loop ((i 0))
+                          (if (fx<? i n)
+                              (let* ((v (vector-ref x i))
+                                     (w (walk v (cons (number->string i) path))))
+                                (vector-set! out i w)
+                                (set! dirty (or dirty (not (eq? v w))))
+                                (loop (fx+ i 1)))
+                              (or (hashtable-ref memo x #f)
+                                  (if dirty
+                                      (begin
+                                        (hashtable-set! memo x out)
+                                        (image-meta-copy! x out)
+                                        out)
+                                      (begin (hashtable-set! memo x x) x))))))
+                      (begin
+                        (hashtable-set! memo x #t)
+                        (let loop ((i 0))
+                          (when (fx<? i n)
+                            (walk (vector-ref x i) (cons (number->string i) path))
+                            (loop (fx+ i 1))))
+                        #t)))))
+             (walk-hashtable
+              (lambda (x path)
+                (let-values (((ks vs) (hashtable-entries x)))
+                  (if (eq? mode 'rebuild)
+                      (let ((nx (make-hashtable (hashtable-hash-function x)
+                                                (hashtable-equivalence-function x))))
+                        (hashtable-set! memo x nx)
+                        (image-meta-copy! x nx)
+                        (let loop ((i 0))
+                          (when (fx<? i (vector-length ks))
+                            (hashtable-set! nx
+                              (walk (vector-ref ks i) (cons "<key>" path))
+                              (walk (vector-ref vs i)
+                                    (cons (image-describe-obj (vector-ref ks i)) path)))
+                            (loop (fx+ i 1))))
+                        nx)
+                      (begin
+                        (hashtable-set! memo x #t)
+                        (let loop ((i 0))
+                          (when (fx<? i (vector-length ks))
+                            (walk (vector-ref ks i) (cons "<key>" path))
+                            (walk (vector-ref vs i)
+                                  (cons (image-describe-obj (vector-ref ks i)) path))
+                            (loop (fx+ i 1))))
+                        #t)))))
+             ;; generic record: walk declared fields by name. Covers user
+             ;; defrecords, lazy seqs, refs, image records, everything not
+             ;; special-cased above.
+             (walk-record
+              (lambda (x path)
+                (let* ((rtd (record-rtd x))
+                       (names (record-type-field-names rtd))
+                       (n (vector-length names)))
+                  (if (eq? mode 'rebuild)
+                      (let ((vals (make-vector n)) (dirty #f))
+                        (let loop ((i 0))
+                          (if (fx<? i n)
+                              (let* ((v (call/cc (lambda (k)
+                                        (with-exception-handler (lambda (e) (k #f))
+                                          (lambda () ((record-accessor rtd i) x))))))
+                                     (w (walk v (cons (symbol->string (vector-ref names i)) path))))
+                                (vector-set! vals i w)
+                                (set! dirty (or dirty (not (eq? v w))))
+                                (loop (fx+ i 1)))
+                              (or (hashtable-ref memo x #f)
+                                  (if dirty
+                                      (let ((nx (apply (record-constructor rtd)
+                                                       (vector->list vals))))
+                                        (hashtable-set! memo x nx)
+                                        (image-meta-copy! x nx)
+                                        nx)
+                                      (begin (hashtable-set! memo x x) x))))))
+                      (begin
+                        (hashtable-set! memo x #t)
+                        (let loop ((i 0))
+                          (when (fx<? i n)
+                            (let ((v (call/cc (lambda (k)
+                                      (with-exception-handler (lambda (e) (k #f))
+                                        (lambda () ((record-accessor rtd i) x)))))))
+                              (walk v (cons (symbol->string (vector-ref names i)) path)))
+                            (loop (fx+ i 1))))
+                        #t))))))
+      (walk root '()))))
+
+;; The write path's substitution entry: a copy of the graph where every anon
+;; closure became an image-fnsrc record and every handler-claimed resource an
+;; image-handled payload; throws (with the object's route) on the first thing
+;; the write path cannot encode.
+(define (image-substitute v)
+  (image-graph-process v 'rebuild #f))
+
 ;; --- scan ----------------------------------------------------------------------
 ;; Dry run: every object that cannot be encoded, with the route to it. Returns a
 ;; jolt vector of maps so callers can render or assert on it.
 (define (jolt-image-scan v)
   (let ((bad '()))
-    (image-walk v (lambda (x path)
-                    (when (and (image-external? x) (not (image-encode-external x)))
-                      (set! bad (cons (cons (image-path->string path)
-                                            (image-describe-obj x))
-                                      bad)))))
+    (image-graph-process v 'report
+      (lambda (x path)
+        (set! bad (cons (cons (image-path->string path)
+                              (image-describe-obj x))
+                        bad))))
     (apply jolt-vector
            (map (lambda (p)
                   (jolt-hash-map (jolt-keyword "path") (car p)
@@ -272,14 +711,18 @@
   (for-each (lambda (p) (hashtable-set! meta-table (car p) (cdr p))) pairs))
 
 (define (jolt-image-write! path v)
-  ;; externals are collected in encounter order; the eq table is only for
-  ;; membership, since a keyword-dense graph makes a list scan quadratic.
-  (let ((externals '()) (ext-seen (make-eq-hashtable)) (ext-tail #f))
+  ;; R2: substitute first — anon closures become image-fnsrc records and handler
+  ;; resources become image-handled payloads, so what fasl sees is exactly what
+  ;; the transformer approved (any refusal has already thrown, with its path).
+  (let* ((v* (image-substitute v))
+         ;; externals are collected in encounter order; the eq table is only for
+         ;; membership, since a keyword-dense graph makes a list scan quadratic.
+         (externals '()) (ext-seen (make-eq-hashtable)) (ext-tail #f))
     ;; Body first: the externals list is discovered during fasl-write, so it
     ;; cannot be written ahead of the body.
     (let ((body (call-with-bytevector-output-port
                   (lambda (p)
-                    (fasl-write (vector v (image-collect-meta v)) p
+                    (fasl-write (vector v* (image-collect-meta v*)) p
                       (lambda (x)
                         (and (image-external? x)
                              (begin
@@ -295,8 +738,8 @@
                               ;; Re-walk for the path only on the failure branch,
                               ;; so the happy path pays nothing for it.
                               (let ((where "<unknown>"))
-                                (image-walk v (lambda (o p)
-                                                (when (eq? o x) (set! where (image-path->string p)))))
+                                (image-walk v* (lambda (o p)
+                                                 (when (eq? o x) (set! where (image-path->string p)))))
                                 (jolt-throw (jolt-ex-info
                                               (string-append "image: cannot write "
                                                              (image-describe-obj x)
@@ -375,14 +818,6 @@
 (define (jolt-image-add-after-restore-hook! f)
   (set! image-after-restore-hooks (append image-after-restore-hooks (list f))) jolt-nil)
 (define (image-run-hooks! hs) (for-each (lambda (f) (jolt-invoke f)) hs) jolt-nil)
-
-;; A var root a handler claimed, replaced by the handler's plain-data payload.
-;; Substituting HERE rather than through the fasl externals mechanism is what
-;; lets the payload be ordinary state: it rides in the body, so a function inside
-;; it becomes a fn-ref and a keyword inside it gets re-interned, exactly as if the
-;; application had stored that data directly. Routing it through a descriptor
-;; instead would put it in the one part of the file that cannot carry either.
-(define-record-type image-handled (fields payload) (nongenerative image-handled-v1))
 
 ;; ns-list is a jolt seq of namespace-name strings, or nil for "every namespace
 ;; that isn't the language's own".
