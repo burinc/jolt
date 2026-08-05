@@ -230,6 +230,95 @@
   (fields kind cmp-fn entries)
   (nongenerative image-sorted-v1))
 
+;; A resource the dump could not write (port, thread, non-eq hashtable,
+;; unregistered closure) that stub mode substitutes in place of a refusal. id
+;; is a per-dump ordinal; kind the object's class string; description its
+;; human rendering; path the graph route to it; extra a jolt map of per-kind
+;; detail from a registered describer (or jolt-nil). Rides in the BODY like
+;; image-fnsrc. Restore keeps the record as an inert value unless a resolver
+;; claims it; jolt.image/stubs lists them, resolve-stub! replaces them.
+(define-record-type image-stub
+  (fields id kind description path extra)
+  (nongenerative image-stub-v1))
+
+;; --- R6: stub describers and resolvers -----------------------------------------
+;; A describer supplies per-kind detail for a stub. GUARDED: a describer that
+;; throws contributes jolt-nil extra — it must never fail the dump.
+(define image-stub-describers '())   ; list of (pred . f)
+(define (jolt-image-register-stub-describer! pred f)
+  (set! image-stub-describers (cons (cons pred f) image-stub-describers))
+  jolt-nil)
+(define (image-stub-describer-for x)
+  (let loop ((ds image-stub-describers))
+    (cond ((null? ds) #f)
+          ((jolt-truthy? (jolt-invoke (caar ds) x)) (cdar ds))
+          (else (loop (cdr ds))))))
+
+;; A resolver turns a stub back into a live value during restore. pred-or-kind
+;; is a jolt fn (gets the stub info map) or a kind string; f gets the info map
+;; and returns the live value. Matching is registration-order first-accepting.
+(define image-stub-resolvers '())   ; list of (pred-or-kind . f)
+(define (jolt-image-register-stub-resolver! pred-or-kind f)
+  (set! image-stub-resolvers (cons (cons pred-or-kind f) image-stub-resolvers))
+  jolt-nil)
+
+(define (image-stub-info s)
+  ;; the info map resolver preds and jolt.image/stubs see
+  (jolt-hash-map (jolt-keyword "id") (image-stub-id s)
+                 (jolt-keyword "kind") (image-stub-kind s)
+                 (jolt-keyword "description") (image-stub-description s)
+                 (jolt-keyword "path") (image-stub-path s)
+                 (jolt-keyword "extra") (image-stub-extra s)))
+
+(define (image-stub-resolver-match spec info)
+  (cond
+    ((string? spec) (string=? spec (jolt-str-one (jolt-get info (jolt-keyword "kind")))))
+    (else (guard (e (#t #f)) (jolt-truthy? (jolt-invoke spec info))))))
+
+(define (image-stub-resolver-for s)
+  (let ((info (image-stub-info s)))
+    (let loop ((rs image-stub-resolvers))
+      (cond ((null? rs) #f)
+            ((image-stub-resolver-match (caar rs) info) (cdar rs))
+            (else (loop (cdr rs)))))))
+
+(define (image-stub-detail-of x)
+  ;; the describer's detail, guarded: a throwing describer is jolt-nil extra
+  (let ((d (image-stub-describer-for x)))
+    (if d
+        (call/cc (lambda (k)
+          (with-exception-handler (lambda (e) (k jolt-nil))
+            (lambda () (jolt-invoke d x)))))
+        jolt-nil)))
+
+;; kind is the class string via the class arms, with image-describe-obj as the
+;; fallback so a stub always names itself even when the class chain cannot.
+(define (image-stub-kind-of x)
+  (guard (e (#t (image-describe-obj x)))
+    (let ((n (jolt-class-name x)))
+      (if (and (string? n) (not (string=? n "")))
+          n
+          (image-describe-obj x)))))
+
+;; Built-ins: a file port stubs with direction, a recoverable name, and
+;; open/closed state; a thread stubs with the id Chez exposes cheaply.
+(jolt-image-register-stub-describer!
+  (lambda (x) (port? x))
+  (lambda (x)
+    (jolt-hash-map
+      (jolt-keyword "direction")
+      (if (input-port? x) (jolt-keyword "input") (jolt-keyword "output"))
+      (jolt-keyword "name")
+      (guard (e (#t jolt-nil))
+        (let ((n (port-name x))) (if (string? n) n jolt-nil)))
+      (jolt-keyword "open")
+      (not (port-closed? x)))))
+(jolt-image-register-stub-describer!
+  (lambda (x) (thread? x))
+  ;; a Chez thread object exposes no identity of its own (get-thread-id names
+  ;; the CALLING thread) — the kind string is the honest detail
+  (lambda (x) (jolt-hash-map)))
+
 ;; backend_scheme.clj's munge-name, exposed so the write side munges registered
 ;; free names with EXACTLY the mapping the emitter used. Deref'd at dump time,
 ;; when the compiler core is loaded; the stateimage gate pins agreement between
@@ -327,7 +416,7 @@
 ;; The image-fnsrc record is memoized BEFORE its free values are recovered, so
 ;; a capture cycle (closure -> atom -> closure) finds this record in the memo
 ;; instead of recursing forever; the free-values field is mutable for that fill.
-(define (image-fnsrc-build x reg walk memo path)
+(define (image-fnsrc-build x reg walk memo path make-stub)
   (let ((r (make-image-fnsrc (car reg) (vector-ref (cdr reg) 0)
                              (vector-ref (cdr reg) 1) (vector-ref (cdr reg) 2)
                              (vector))))
@@ -339,14 +428,22 @@
          (image-meta-copy! x r)
          r)
         ((and (pair? fvs) (eq? (car fvs) 'image-folded))
-         (jolt-throw (jolt-ex-info
-                       (string-append "image: cannot write " (image-describe-obj x)
-                                      " at " (image-path->string path)
-                                      ": captured local '" (cdr fvs)
-                                      "' was optimized into the compiled code, so its value"
-                                      " cannot be recovered from the live closure —"
-                                      " store a named fn, or the data to rebuild one")
-                       jolt-nil)))
+         ;; stub mode: the closure itself is the unwritable object — stub it,
+         ;; naming the folded capture in the description
+         (if make-stub
+             (let ((s (make-stub x path
+                                 (string-append "folded capture " (cdr fvs)))))
+               (hashtable-set! memo x s)
+               (image-meta-copy! x s)
+               s)
+             (jolt-throw (jolt-ex-info
+                           (string-append "image: cannot write " (image-describe-obj x)
+                                          " at " (image-path->string path)
+                                          ": captured local '" (cdr fvs)
+                                          "' was optimized into the compiled code, so its value"
+                                          " cannot be recovered from the live closure —"
+                                          " store a named fn, or the data to rebuild one")
+                           jolt-nil))))
         (else
          (jolt-throw (jolt-ex-info
                        (string-append "image: cannot write " (image-describe-obj x)
@@ -424,11 +521,32 @@
 ;; The read side is 'rebuild plus fnsrc/handled reconstruction, so the two
 ;; modes share every container arm; only report diverges.
 (define (image-rebuild-mode? mode)
-  (or (eq? mode 'rebuild) (eq? mode 'restore)))
+  (or (eq? mode 'rebuild) (eq? mode 'rebuild-stub) (eq? mode 'restore)))
+;; Stub mode: a refusal builds an image-stub instead of throwing. 'rebuild-stub
+;; substitutes stubs in; 'report-stub reports them with a :would-stub finding
+;; instead of :unwritable.
+(define (image-stub-mode? mode)
+  (or (eq? mode 'rebuild-stub) (eq? mode 'report-stub)))
+(define (image-report-disposition mode)
+  (if (eq? mode 'report-stub)
+      (jolt-keyword "would-stub")
+      (jolt-keyword "unwritable")))
 
 (define (image-graph-process root mode report!)
-  (let ((memo (make-eq-hashtable)))
-    (letrec ((walk
+  (let ((memo (make-eq-hashtable))
+        (stub-acc '()))
+    (letrec ((stub-id-box (list 0))
+             (make-stub
+               (lambda (x path desc)
+                 (let ((id (car stub-id-box)))
+                   (set-car! stub-id-box (+ id 1))
+                   (let ((s (make-image-stub id (image-stub-kind-of x)
+                                             (or desc (image-describe-obj x))
+                                             (image-path->string path)
+                                             (image-stub-detail-of x))))
+                     (set! stub-acc (cons s stub-acc))
+                     s))))
+             (walk
               (lambda (x path)
                 (cond
                   ;; scalar leaves can never hold a procedure
@@ -449,6 +567,22 @@
                       (walk-handled-restore x path))
                      ((and (eq? mode 'restore) (image-sorted? x))
                       (walk-sorted-restore x path))
+                     ;; a stub with a matching resolver becomes the live value it
+                     ;; stands for; without one it stays the inert record — the
+                     ;; per-restore table (populated by restore-world!) lists it
+                     ((and (eq? mode 'restore) (image-stub? x))
+                      (let ((r (image-stub-resolver-for x)))
+                        (if r
+                            (let ((v (guard (e (#t (jolt-throw (jolt-ex-info
+                                        (string-append "image: stub resolver failed for #"
+                                                       (number->string (image-stub-id x))
+                                                       " (" (image-stub-kind x) "): "
+                                                       (image-condition-text e))
+                                        jolt-nil))))
+                                       (jolt-invoke r (image-stub-info x)))))
+                              (hashtable-set! memo x v)
+                              v)
+                            (begin (hashtable-set! memo x x) x))))
                      ;; handlers claim at any depth, before anything else
                      ((and (pair? image-handlers) (image-handler-for x)) =>
                       (lambda (h)
@@ -469,49 +603,68 @@
                                (begin (hashtable-set! memo x x) x)
                                #t))
                           ((eq? v 'refuse)
-                           (if (image-rebuild-mode? mode)
-                               (jolt-throw
-                                 (jolt-ex-info
-                                   (string-append "image: cannot write " (image-describe-obj x)
-                                                  " at " (image-path->string path))
-                                   jolt-nil))
-                               (begin (hashtable-set! memo x #t) (report! x path))))
+                           (cond
+                             ((eq? mode 'rebuild-stub)
+                              (let ((s (make-stub x path #f)))
+                                (hashtable-set! memo x s)
+                                s))
+                             ((image-rebuild-mode? mode)
+                              (jolt-throw
+                                (jolt-ex-info
+                                  (string-append "image: cannot write " (image-describe-obj x)
+                                                 " at " (image-path->string path))
+                                  jolt-nil)))
+                             (else
+                              (hashtable-set! memo x #t)
+                              (report! x path (image-report-disposition mode)))))
                           (else
                            ;; v is a (name . registration) pair. Report mode must
                            ;; agree with what the build would do, so it prechecks
                            ;; recoverability (a const-folded capture refuses).
                            (if (image-rebuild-mode? mode)
-                               (image-fnsrc-build x v walk memo path)
+                               (image-fnsrc-build x v walk memo path
+                                                  (if (eq? mode 'rebuild-stub) make-stub #f))
                                (let ((probe (image-recover-free-values
                                               x (vector-ref (cdr v) 2)
                                               (lambda (fv p) #t) path)))
                                  (hashtable-set! memo x #t)
-                                 (if (vector? probe) #t (report! x path))))))))
+                                 (if (vector? probe)
+                                     #t
+                                     (report! x path (image-report-disposition mode)))))))))
                      (else
                        ;; non-procedure externals the descriptor machinery
                        ;; cannot encode (non-eq hashtables, ports, threads):
                        ;; report them in scan; rebuild leaves them for the
                        ;; externals stage, which refuses with the path. A
                        ;; keyword and a named fn's fn-ref encode fine.
-                       (when (and (eq? mode 'report)
-                                  (image-external? x)
-                                  (not (image-encode-external x)))
-                         (hashtable-set! memo x #t)
-                         (report! x path))
                        (cond
-                         ((pmap? x) (walk-pmap x path))
-                         ((pset? x) (walk-pset x path))
-                         ((pvec? x) (walk-pvec x path))
-                         ((htable-sorted? x) (walk-sorted x path))
-                         ((var-cell? x) (walk-var-cell x path))
-                         ((jolt-atom? x) (walk-atom x path))
-                         ((pair? x) (walk-pair x path))
-                         ((vector? x) (walk-vector x path))
-                         ((and (hashtable? x) (hashtable-mutable? x))
-                          (walk-hashtable x path))
-                         ((and (record? x) (record-rtd x))
-                          (walk-record x path))
-                         (else (if (image-rebuild-mode? mode) x #t)))))))))
+                         ;; stub-mode REBUILD substitutes; stub-mode REPORT must
+                         ;; still report (as :would-stub), never swallow
+                         ((and (eq? mode 'rebuild-stub) (image-external? x)
+                               (not (image-encode-external x)))
+                          (let ((s (make-stub x path #f)))
+                            (hashtable-set! memo x s)
+                            s))
+                         (else
+                           (when (and (or (eq? mode 'report) (eq? mode 'report-stub))
+                                      (image-external? x)
+                                      (not (image-encode-external x)))
+                             (hashtable-set! memo x #t)
+                             (report! x path (image-report-disposition mode)))
+                           (cond
+                             ((pmap? x) (walk-pmap x path))
+                             ((pset? x) (walk-pset x path))
+                             ((pvec? x) (walk-pvec x path))
+                             ((htable-sorted? x) (walk-sorted x path))
+                             ((var-cell? x) (walk-var-cell x path))
+                             ((jolt-atom? x) (walk-atom x path))
+                             ((pair? x) (walk-pair x path))
+                             ((vector? x) (walk-vector x path))
+                             ((and (hashtable? x) (hashtable-mutable? x))
+                              (walk-hashtable x path))
+                             ((and (record? x) (record-rtd x))
+                              (walk-record x path))
+                             (else (if (image-rebuild-mode? mode) x #t)))))))))))
              (walk-pmap
               (lambda (x path)
                 (if (image-rebuild-mode? mode)
@@ -849,29 +1002,40 @@
                   (let ((r (image-restore-handler tp)))
                     (hashtable-set! memo x r)
                     r)))))
-      (walk root '()))))
+      ;; the walk must finish before the accumulator is read — argument
+      ;; evaluation order is unspecified, so sequence explicitly
+      (let ((g (walk root '())))
+        (values g (reverse stub-acc))))))
 
 ;; The write path's substitution entry: a copy of the graph where every anon
 ;; closure became an image-fnsrc record and every handler-claimed resource an
 ;; image-handled payload; throws (with the object's route) on the first thing
 ;; the write path cannot encode.
 (define (image-substitute v)
-  (image-graph-process v 'rebuild #f))
+  (let-values (((g stubs) (image-graph-process v 'rebuild #f)))
+    g))
 
 ;; --- scan ----------------------------------------------------------------------
 ;; Dry run: every object that cannot be encoded, with the route to it. Returns a
 ;; jolt vector of maps so callers can render or assert on it.
 (define (jolt-image-scan v)
+  ;; stub-aware by default: an object a stub-mode dump would stub reports
+  ;; :would-stub, so dumpable? (which counts only :unwritable) stays true for
+  ;; graphs a stub-mode dump can write.
+  (jolt-image-scan-mode v 'report-stub))
+(define (jolt-image-scan-mode v mode)
   (let ((bad '()))
-    (image-graph-process v 'report
-      (lambda (x path)
-        (set! bad (cons (cons (image-path->string path)
-                              (image-describe-obj x))
+    (image-graph-process v mode
+      (lambda (x path disp)
+        (set! bad (cons (list (image-path->string path)
+                              (image-describe-obj x)
+                              disp)
                         bad))))
     (apply jolt-vector
            (map (lambda (p)
                   (jolt-hash-map (jolt-keyword "path") (car p)
-                                 (jolt-keyword "object") (cdr p)))
+                                 (jolt-keyword "object") (cadr p)
+                                 (jolt-keyword "disposition") (caddr p)))
                 (reverse bad)))))
 
 ;; --- header --------------------------------------------------------------------
@@ -938,11 +1102,27 @@
 (define (image-reattach-meta! pairs)
   (for-each (lambda (p) (hashtable-set! meta-table (car p) (cdr p))) pairs))
 
-(define (jolt-image-write! path v)
+(define jolt-image-write!
+  (case-lambda
+    ((path v) (jolt-image-write!* path v jolt-nil))
+    ((path v opts) (jolt-image-write!* path v opts))))
+(define (jolt-image-write!* path v opts)
   ;; R2: substitute first — anon closures become image-fnsrc records and handler
   ;; resources become image-handled payloads, so what fasl sees is exactly what
-  ;; the transformer approved (any refusal has already thrown, with its path).
-  (let* ((v* (image-substitute v))
+  ;; the transformer approved. OPTS is jolt-nil or a jolt map; {:unwritable :stub}
+  ;; substitutes image-stub records for otherwise-refused objects (ports,
+  ;; threads, non-eq hashtables, unregistered closures) instead of failing the
+  ;; dump, and the return value reports them as {:stubbed [info-maps]}.
+  (let* ((stub-mode? (and (not (jolt-nil? opts))
+                          (eq? (jolt-get opts (jolt-keyword "unwritable") jolt-nil)
+                               (jolt-keyword "stub"))))
+         (stubs #f)
+         (v* (let-values (((g s)
+                           (image-graph-process v
+                                                (if stub-mode? 'rebuild-stub 'rebuild)
+                                                #f)))
+               (set! stubs s)
+               g))
          ;; externals are collected in encounter order; the eq table is only for
          ;; membership, since a keyword-dense graph makes a list scan quadratic.
          (externals '()) (ext-seen (make-eq-hashtable)) (ext-tail #f))
@@ -992,7 +1172,10 @@
             (put-bytevector port desc-bytes)
             (put-bytevector port body)
             (close-port port)))))
-    jolt-nil))
+    (if stub-mode?
+        (jolt-hash-map (jolt-keyword "stubbed")
+                       (apply jolt-vector (map image-stub-info stubs)))
+        jolt-nil)))
 
 (define (jolt-image-read path)
   (unless (file-exists? path)
@@ -1010,7 +1193,8 @@
       ;; R3: rebuild what the write side substituted — fn source records become
       ;; live closures, handler payloads go back through their restore fns.
       ;; Runs after meta re-attachment so container rebuilds carry meta forward.
-      (image-graph-process (vector-ref b 0) 'restore #f))))
+      (let-values (((g stubs) (image-graph-process (vector-ref b 0) 'restore #f)))
+        g))))
 
 ;; --- whole-world image ----------------------------------------------------------
 ;; The Smalltalk/Common Lisp shape: don't ask which variable to save, save the
@@ -1079,14 +1263,28 @@
           (loop (fx+ i 1)))))
     out))
 
-(define (jolt-image-dump-world! path ns-list)
-  (image-run-hooks! image-before-dump-hooks)
-  (jolt-image-write! path (vector 'jolt-world (image-world-vars ns-list))))
+;; The world capture is best-effort BY DEFAULT: an unhandled resource stubs
+;; instead of failing the dump, and the return value reports what was stubbed.
+;; {:unwritable :fail} opts back into the strict contract dump! has.
+(define jolt-image-dump-world!
+  (case-lambda
+    ((path ns-list) (jolt-image-dump-world! path ns-list jolt-nil))
+    ((path ns-list opts)
+     (image-run-hooks! image-before-dump-hooks)
+     (let ((strict? (and (not (jolt-nil? opts))
+                         (eq? (jolt-get opts (jolt-keyword "unwritable") jolt-nil)
+                              (jolt-keyword "fail")))))
+       (jolt-image-write! path (vector 'jolt-world (image-world-vars ns-list))
+                          (if strict?
+                              jolt-nil
+                              (jolt-hash-map (jolt-keyword "unwritable")
+                                             (jolt-keyword "stub"))))))))
 
 (define (jolt-image-scan-world ns-list)
   (jolt-image-scan (vector 'jolt-world (image-world-vars ns-list))))
 
 (define (jolt-image-restore-world! path)
+  (hashtable-clear! image-restore-stub-tbl)
   (let ((w (jolt-image-read path)))
     (unless (and (vector? w) (fx=? (vector-length w) 2) (eq? (vector-ref w 0) 'jolt-world))
       (jolt-throw (jolt-ex-info
@@ -1106,13 +1304,135 @@
             (let ((cell (jolt-var ns nm))
                   (v (cdr p)))
               ;; handled payloads and fn source records were already rebuilt by
-              ;; the read transform; the root binds as-is
+              ;; the read transform; the root binds as-is. Unresolved stubs left
+              ;; in the root are recorded with their owning var so
+              ;; jolt.image/stubs can list them and resolve-stub! can reach them.
+              (image-walk v (lambda (o pth)
+                              (when (image-stub? o)
+                                (hashtable-set! image-restore-stub-tbl
+                                                (image-stub-id o) (cons o k)))))
               (var-cell-root-set! cell v)
               (var-cell-defined?-set! cell #t)
               (set! n (fx+ n 1)))))
         (vector-ref w 1))
       (image-run-hooks! image-after-restore-hooks)
       n)))
+
+;; --- unresolved stubs after a world restore -------------------------------------
+;; id -> (stub . "ns/name"), reset per restore-world! call. Value images cannot
+;; be reached after the fact (the caller holds the graph), so resolvers must be
+;; registered before read-image for those; this table is the WORLD workflow.
+(define image-restore-stub-tbl (make-eqv-hashtable))
+
+(define (jolt-image-stubs)
+  (let-values (((ks vs) (hashtable-entries image-restore-stub-tbl)))
+    (let loop ((i 0) (acc '()))
+      (if (fx>=? i (vector-length ks))
+          (apply jolt-vector
+                 (map cdr (sort (lambda (a b) (< (car a) (car b))) acc)))
+          (let* ((e (vector-ref vs i))
+                 (info (jolt-assoc (image-stub-info (car e))
+                                   (jolt-keyword "var") (cdr e))))
+            (loop (fx+ i 1) (cons (cons (vector-ref ks i) info) acc)))))))
+
+;; Replace STUB (by identity) with VALUE everywhere under ROOT. Mutable cells
+;; patch in place; immutable containers rebuild bottom-up; memo preserves
+;; sharing. Returns (values new-root replaced-count).
+(define (image-replace-stub root stub value)
+  (let ((memo (make-eq-hashtable)) (count 0))
+    (define (sub x)
+      (cond
+        ((eq? x stub) (set! count (fx+ count 1)) value)
+        ((or (null? x) (boolean? x) (number? x) (char? x)
+             (symbol? x) (string? x) (bytevector? x))
+         x)
+        ((hashtable-ref memo x #f) => (lambda (m) m))
+        ((pmap? x)
+         (let ((entries '()) (dirty #f))
+           (pmap-fold-fwd x (lambda (k v acc)
+                              (let ((sk (sub k)) (sv (sub v)))
+                                (set! entries (cons (cons sk sv) entries))
+                                (set! dirty (or dirty (not (eq? sk k)) (not (eq? sv v))))
+                                acc))
+                          #f)
+           (let ((nx (if dirty
+                         (apply jolt-hash-map
+                                (apply append (map (lambda (e) (list (car e) (cdr e)))
+                                                   (reverse entries))))
+                         x)))
+             (hashtable-set! memo x nx)
+             (when dirty (image-meta-copy! x nx))
+             nx)))
+        ((pvec? x)
+         (let* ((cnt (pvec-count x)) (dirty #f)
+                (items (let loop ((i 0) (acc '()))
+                         (if (fx>=? i cnt)
+                             (reverse acc)
+                             (let* ((v (pvec-nth-d x i jolt-nil)) (sv (sub v)))
+                               (unless (eq? sv v) (set! dirty #t))
+                               (loop (fx+ i 1) (cons sv acc)))))))
+           (let ((nx (if dirty (apply jolt-vector items) x)))
+             (hashtable-set! memo x nx)
+             (when dirty (image-meta-copy! x nx))
+             nx)))
+        ((pset? x)
+         (let ((dirty #f)
+               (items (reverse (pset-fold x (lambda (e acc)
+                                              (let ((se (sub e)))
+                                                (unless (eq? se e) (set! dirty #t))
+                                                (cons se acc)))
+                                          '()))))
+           (let ((nx (if dirty (apply jolt-hash-set items) x)))
+             (hashtable-set! memo x nx)
+             (when dirty (image-meta-copy! x nx))
+             nx)))
+        ((jolt-atom? x)
+         (hashtable-set! memo x x)
+         (jolt-atom-val-set! x (sub (jolt-atom-val x)))
+         x)
+        ((pair? x)
+         (hashtable-set! memo x x)
+         (let ((a (sub (car x))) (d (sub (cdr x))))
+           (if (and (eq? a (car x)) (eq? d (cdr x)))
+               x
+               (let ((nx (cons a d))) (hashtable-set! memo x nx) nx))))
+        ((vector? x)
+         (hashtable-set! memo x x)
+         (let loop ((i 0))
+           (when (fx<? i (vector-length x))
+             (vector-set! x i (sub (vector-ref x i)))
+             (loop (fx+ i 1))))
+         x)
+        ((and (hashtable? x) (hashtable-mutable? x))
+         (hashtable-set! memo x x)
+         (let-values (((ks vs) (hashtable-entries x)))
+           (let loop ((i 0))
+             (when (fx<? i (vector-length ks))
+               (hashtable-set! x (vector-ref ks i) (sub (vector-ref vs i)))
+               (loop (fx+ i 1)))))
+         x)
+        (else (hashtable-set! memo x x) x)))
+    (let ((r (sub root)))
+      (values r count))))
+
+(define (jolt-image-resolve-stub! id value)
+  (let ((e (hashtable-ref image-restore-stub-tbl id #f)))
+    (unless e
+      (jolt-throw (jolt-ex-info
+                    (string-append "image: no unresolved stub #"
+                                   (jolt-str-one id) " from the last world restore")
+                    jolt-nil)))
+    (let* ((k (cdr e))
+           (slash (let scan ((i 0))
+                    (cond ((fx>=? i (string-length k)) #f)
+                          ((char=? (string-ref k i) #\/) i)
+                          (else (scan (fx+ i 1))))))
+           (cell (jolt-var (substring k 0 slash)
+                           (substring k (fx+ slash 1) (string-length k)))))
+      (let-values (((nr cnt) (image-replace-stub (var-cell-root cell) (car e) value)))
+        (var-cell-root-set! cell nr)
+        (hashtable-delete! image-restore-stub-tbl id)
+        cnt))))
 
 (def-var! "jolt.host" "image-dump-world!" jolt-image-dump-world!)
 (def-var! "jolt.host" "image-restore-world!" jolt-image-restore-world!)
@@ -1122,5 +1442,20 @@
 (def-var! "jolt.host" "image-write!" jolt-image-write!)
 (def-var! "jolt.host" "image-read" jolt-image-read)
 (def-var! "jolt.host" "image-scan" jolt-image-scan)
+(def-var! "jolt.host" "image-register-stub-describer!" jolt-image-register-stub-describer!)
+(def-var! "jolt.host" "image-register-stub-resolver!" jolt-image-register-stub-resolver!)
+(def-var! "jolt.host" "image-stubs" jolt-image-stubs)
+(def-var! "jolt.host" "image-resolve-stub!" jolt-image-resolve-stub!)
 (def-var! "jolt.host" "image-register-handler!" jolt-image-register-handler!)
 (def-var! "jolt.host" "image-runtime-version" jolt-image-runtime-version)
+
+;; --- stub presentation -----------------------------------------------------------
+;; An unresolved stub prints as #image/stub{...} and reports the class
+;; jolt.image.Stub, so an error from using one names what it is and where to
+;; look (jolt.image/stubs lists it; resolve-stub! attaches a live value).
+(define (image-stub-render s)
+  (string-append "#image/stub{:id " (number->string (image-stub-id s))
+                 " :kind " (jolt-pr-readable (image-stub-kind s))
+                 " :path " (jolt-pr-readable (image-stub-path s)) "}"))
+(register-pr-arm! image-stub? image-stub-render)
+(register-class-arm! image-stub? (lambda (s) "jolt.image.Stub"))

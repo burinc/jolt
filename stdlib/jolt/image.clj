@@ -25,8 +25,11 @@
   (their comparator machinery is not encodable in this format version). The
   message names the path through the graph to the offending object, and no file
   is written."
-  [path v]
-  (host/image-write! path v))
+  ([path v] (host/image-write! path v))
+  ([path v opts]
+   ;; {:unwritable :stub} dumps unhandled resources as stubs instead of
+   ;; failing; the return value then reports {:stubbed [...]}
+   (host/image-write! path v opts)))
 
 (defn read-image
   "Read the value written by `dump!` at PATH.
@@ -89,7 +92,10 @@
   Runs the before-dump hooks first. Vars holding functions are skipped: the
   restoring build already has the code."
   ([path] (dump-world! path nil))
-  ([path namespaces] (host/image-dump-world! path namespaces)))
+  ([path namespaces] (host/image-dump-world! path namespaces))
+  ([path namespaces opts]
+   ;; stubs by default; {:unwritable :fail} restores dump!'s strictness
+   (host/image-dump-world! path namespaces opts)))
 
 (defn restore-world!
   "Read a world image and rebind every var it holds. Returns the number of vars
@@ -116,3 +122,46 @@
   carried — reopen resources, re-derive computed cells, restart threads."
   [f]
   (host/image-add-after-restore-hook! f))
+
+;; --- resource stubs -----------------------------------------------------------
+;; An open resource the encoder has no handler for — a port, a thread, a
+;; closure whose capture was optimized away — can dump as a STUB: a
+;; placeholder recording what stood there. `dump-world!` stubs by default
+;; (a whole-program capture should not die on a logger's file port) and its
+;; return value reports what was stubbed; `dump!` stays strict unless you
+;; pass {:unwritable :stub}. On restore a stub with a registered resolver is
+;; replaced inline; the rest come back as inert values that print as
+;; #image/stub{...} and list through `stubs`.
+
+(defn register-stub-describer!
+  "Teach the dump side per-kind detail for stubs. PRED picks the objects;
+  F gets the live object and returns a map that rides in the stub's :extra.
+  Guarded: a describer that throws contributes nothing and never fails a
+  dump. File ports (direction, name, open state) are built in."
+  [pred f]
+  (host/image-register-stub-describer! pred f))
+
+(defn register-stub-resolver!
+  "Supply the restore half for a stub kind. KIND-OR-PRED is a kind string or
+  a predicate over the stub info map {:id :kind :description :path :extra};
+  F gets that map and returns the live value. A matching stub never
+  materializes — restore replaces it inline. Register before `read-image`
+  for value images; world restores can also resolve after the fact with
+  `resolve-stub!`."
+  [kind-or-pred f]
+  (host/image-register-stub-resolver! kind-or-pred f))
+
+(defn stubs
+  "The unresolved stubs from the last `restore-world!`, oldest id first:
+  {:id :kind :description :path :extra :var}. Empty when everything either
+  resolved or nothing was stubbed. Value images are not listed — their graph
+  belongs to the caller; register resolvers before reading those."
+  []
+  (host/image-stubs))
+
+(defn resolve-stub!
+  "Replace unresolved stub ID from the last world restore with VALUE,
+  rewriting the owning var's root (mutable cells patch in place). Returns
+  the number of slots replaced."
+  [id value]
+  (host/image-resolve-stub! id value))

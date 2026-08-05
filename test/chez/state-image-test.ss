@@ -646,8 +646,8 @@
 ;; compiler-dropped build: the tree-shaken manifest drops the 'image +
 ;; 'compile-eval tags, so a runtime with only rt.ss has no compile seam. Probe
 ;; that condition in a subprocess (same build as this gate, minus the spine).
-(let ((probe "/tmp/jolt-image-noce-probe.ss")
-      (out   "/tmp/jolt-image-noce-out.txt")
+(let ((probe (string-append tmp ".noce-probe.ss"))
+      (out   (string-append tmp ".noce-out.txt"))
       (chez-bin (or (getenv "JOLT_CHEZ") "chez")))
   (call-with-output-file probe
     (lambda (p)
@@ -664,6 +664,107 @@
              (str-contains? msg "jfn$r3$nce$0")))
     (delete-file probe)
     (delete-file out)))
+
+
+;; --- R6: resource stubs ---------------------------------------------------------
+;; dump! stays strict by default; {:unwritable :stub} substitutes an image-stub
+;; for anything the encoder refuses. dump-world! stubs by default and reports.
+
+(define stub-probe-file (string-append tmp ".stub-probe.txt"))
+(define stub-port (open-file-output-port stub-probe-file (file-options no-fail)))
+
+(ok "strict dump! still refuses a port"
+    (call/cc (lambda (k)
+      (with-exception-handler (lambda (e) (k #t))
+        (lambda () (jolt-image-write! tmp (jolt-hash-map (jolt-keyword "log") stub-port)) #f)))))
+
+;; stub mode: the port dumps as a stub, the write reports it, the read
+;; brings back an inert record that prints and names its class
+(let ((rep (jolt-image-write! tmp (jolt-hash-map (jolt-keyword "log") stub-port)
+                              (jolt-hash-map (jolt-keyword "unwritable") (jolt-keyword "stub")))))
+  (ok "stub-mode dump reports the stubbed port"
+      (fx=? 1 (jolt-count (jolt-get rep (jolt-keyword "stubbed") jolt-nil)))))
+(let* ((g (jolt-image-read tmp))
+       (st (jolt-get g (jolt-keyword "log") jolt-nil)))
+  (ok "stubbed port restores as an inert image-stub" (image-stub? st))
+  (ok "stub prints as #image/stub{...}"
+      (let ((r (jolt-pr-readable st)))
+        (and (string? r) (fx>=? (string-length r) 12)
+             (string=? (substring r 0 12) "#image/stub{"))))
+  (ok "stub class is jolt.image.Stub" (string=? (jolt-class-name st) "jolt.image.Stub"))
+  (ok "port stub extra carries direction + open state"
+      (let ((ex (image-stub-extra st)))
+        (and (eq? (jolt-get ex (jolt-keyword "direction") jolt-nil) (jolt-keyword "output"))
+             (eq? (jolt-get ex (jolt-keyword "open") jolt-nil) #t)))))
+
+;; a throwing describer never fails the dump
+(jolt-image-register-stub-describer!
+  (lambda (x) (and (hashtable? x) (not (image-eq-hashtable? x))))
+  (lambda (x) (error 'describer "boom")))
+(let ((rep (jolt-image-write! tmp (jolt-hash-map (jolt-keyword "tbl") (make-hashtable equal-hash equal?))
+                              (jolt-hash-map (jolt-keyword "unwritable") (jolt-keyword "stub")))))
+  (ok "throwing describer does not fail the dump"
+      (fx=? 1 (jolt-count (jolt-get rep (jolt-keyword "stubbed") jolt-nil)))))
+
+;; folded capture stubs in stub mode, naming the capture
+(jolt-compile-eval "(def r6folded (let [a 5] {:f (fn [x] (+ a x))}))" "user")
+(let ((rep (jolt-image-write! tmp (var-cell-root (jolt-var "user" "r6folded"))
+                              (jolt-hash-map (jolt-keyword "unwritable") (jolt-keyword "stub")))))
+  (ok "folded capture stubs in stub mode, description names the capture"
+      (let* ((sv (jolt-get rep (jolt-keyword "stubbed") jolt-nil))
+             (info (jolt-nth sv 0))
+             (d (jolt-get info (jolt-keyword "description") jolt-nil)))
+        (and (fx=? 1 (jolt-count sv)) (string? d)
+             (str-contains? d "folded capture a")))))
+
+;; scan dispositions: a port is :would-stub
+(let ((f (jolt-image-scan (jolt-hash-map (jolt-keyword "log") stub-port))))
+  (ok "scan reports a port as :would-stub"
+      (and (fx=? 1 (jolt-count f))
+           (eq? (jolt-get (jolt-nth f 0) (jolt-keyword "disposition") jolt-nil)
+                (jolt-keyword "would-stub")))))
+
+;; world: stub by default, listed with its var, resolved in place
+(jolt-compile-eval "(def cfg {:name \"app\" :log nil})" "r6.world")
+(let ((cell (jolt-var "r6.world" "cfg")))
+  (var-cell-root-set! cell
+    (jolt-assoc (var-cell-root cell) (jolt-keyword "log") stub-port)))
+(let ((rep (jolt-image-dump-world! world-tmp (jolt-vector "r6.world"))))
+  (ok "dump-world! stubs by default and reports"
+      (fx=? 1 (jolt-count (jolt-get rep (jolt-keyword "stubbed") jolt-nil)))))
+(jolt-compile-eval "(def cfg :clobbered)" "r6.world")
+(jolt-image-restore-world! world-tmp)
+(let ((ss (jolt-image-stubs)))
+  (ok "stubs lists the unresolved stub with its owning var"
+      (and (fx=? 1 (jolt-count ss))
+           (string=? (jolt-get (jolt-nth ss 0) (jolt-keyword "var") jolt-nil) "r6.world/cfg")))
+  (let* ((id (jolt-get (jolt-nth ss 0) (jolt-keyword "id") jolt-nil))
+         (cnt (jolt-image-resolve-stub! id "LIVE-AGAIN")))
+    (ok "resolve-stub! replaces one slot" (fx=? 1 cnt))
+    (ok "resolved value lands in the var's map"
+        (equal? "LIVE-AGAIN"
+                (jolt-get (var-cell-root (jolt-var "r6.world" "cfg"))
+                          (jolt-keyword "log") jolt-nil)))
+    (ok "stubs empties after resolve" (fx=? 0 (jolt-count (jolt-image-stubs))))))
+
+;; resolver pre-registered: the stub never materializes
+;; kind strings match the STUBBED OBJECT's class (a port's, here), so a
+;; catch-all predicate is the simplest fixture
+(jolt-image-register-stub-resolver! (lambda (info) #t)
+  (lambda (info) "RESOLVED-INLINE"))
+(let ((cell (jolt-var "r6.world" "cfg")))
+  (var-cell-root-set! cell
+    (jolt-assoc (var-cell-root cell) (jolt-keyword "log") stub-port)))
+(jolt-image-dump-world! world-tmp (jolt-vector "r6.world"))
+(jolt-image-restore-world! world-tmp)
+(ok "pre-registered resolver restores inline; stubs stays empty"
+    (and (equal? "RESOLVED-INLINE"
+                 (jolt-get (var-cell-root (jolt-var "r6.world" "cfg"))
+                           (jolt-keyword "log") jolt-nil))
+         (fx=? 0 (jolt-count (jolt-image-stubs)))))
+
+(close-port stub-port)
+(delete-file stub-probe-file)
 
 (cleanup!)
 (when (file-exists? (string-append tmp ".txt")) (delete-file (string-append tmp ".txt")))
