@@ -88,13 +88,61 @@
 (rt "empty colls" "[[] {} #{} ()]"                 "[[] {} #{} ()]")
 (rt "record"      "(do (defrecord P [x y]) (->P 1 2))" "#user.P{:x 1, :y 2}")
 
-;; Sorted maps/sets keep their comparator machinery in a Chez hashtable, which
-;; this format version does not encode. The point of the assertion is that it is
-;; REFUSED clearly, not that it crashes somewhere in fasl.
-(is "sorted map is refused, not crashed"
-    (string-append "(try (jolt.host/image-write! \"" tmp "\" (sorted-map :b 2 :a 1)) :no-throw"
-                   " (catch Exception e (if (re-find #\"cannot write\" (ex-message e)) :refused :wrong-error)))")
-    ":refused")
+;; --- R4: sorted maps and sets travel -------------------------------------------
+;; The wrapper's internal comparator machinery (a wrapped comparator closure + an
+;; :ops table of closures in a string-keyed hashtable) never reaches the externals
+;; path now: the transformer intercepts htable-sorted? and restores through the
+;; public constructors with the ORIGINAL :cmp-fn.
+
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" (sorted-map :b 2 :a 1))"))
+(is "natural sorted-map round-trips (order, lookups, count, sorted?, assoc)"
+    (string-append "(let [m (jolt.host/image-read \"" tmp "\")]"
+                   " (vector (keys m) (m :a) (m :b) (count m) (sorted? m) (keys (assoc m :c 3))))")
+    "[(:a :b) 1 2 2 true (:a :b :c)]")
+
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" (sorted-set 5 3 8 1))"))
+(is "natural sorted-set round-trips (order, lookup, count, sorted?, conj)"
+    (string-append "(let [s (jolt.host/image-read \"" tmp "\")]"
+                   " (vector (seq s) (s 3) (count s) (sorted? s) (seq (conj s 4))))")
+    "[(1 3 5 8) 3 4 true (1 3 4 5 8)]")
+
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" (sorted-map-by > 1 :a 2 :b 3 :c))"))
+;; fn-ref restores the VAR ROOT; a bare `>` reference compiles to the seq.ss
+;; value-position singleton, which is a different (pre-existing) identity —
+;; jolt-obtq tracks it — so the assertion derefs the var.
+(is "named comparator (>) round-trips; cmp-fn IS clojure.core/>'s root"
+    (string-append "(let [m (jolt.host/image-read \"" tmp "\")"
+                   "       f (jolt.host/ref-get m :cmp-fn)]"
+                   " (vector (keys m) (identical? f (deref (var clojure.core/>))) (sorted? m)))")
+    "[(3 2 1) true true]")
+
+(ev (string-append "(jolt.host/image-write! \"" tmp "\""
+                   " (sorted-map-by (fn [a b] (compare (str a) (str b))) :b 2 :a 1))"))
+(is "anon comparator round-trips; restored map sorts by it, new key lands in order"
+    (string-append "(let [m (jolt.host/image-read \"" tmp "\")]"
+                   " (vector (keys m) (keys (assoc m :c 3))))")
+    "[(:a :b) (:a :b :c)]")
+
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" (atom [(sorted-map :b 2 :a 1)]))"))
+(is "sorted-map nested in a vector inside an atom round-trips"
+    (string-append "(let [m (first @(jolt.host/image-read \"" tmp "\"))]"
+                   " (vector (keys m) (sorted? m)))")
+    "[(:a :b) true]")
+
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" (with-meta (sorted-map :b 2 :a 1) {:m 1}))"))
+(is "meta on a sorted map round-trips"
+    (string-append "(:m (meta (jolt.host/image-read \"" tmp "\")))")
+    "1")
+
+(is "scan of a natural sorted map is empty"
+    "(count (jolt.host/image-scan (sorted-map :b 2 :a 1)))"
+    "0")
+;; (partial compare) would be compare ITSELF (partial's 1-arg arity), a named
+;; fn — (comp - compare) is a real core-tier closure with no registration
+(is "scan of a sorted-map-by with an unregistered closure reports one finding at the comparator"
+    (string-append "(let [f (jolt.host/image-scan (sorted-map-by (comp - compare) :b 2 :a 1))]"
+                   " (vector (count f) (boolean (re-find #\"cmp-fn\" (str (:path (first f)))))))")
+    "[1 true]")
 
 ;; deep + wide, to catch anything that only shows up past the small-map cutoff
 (is "large map round-trips"
@@ -446,6 +494,15 @@
                    " (jolt.host/image-restore-world! \"" world-tmp "\")"
                    " (pr-str @user/hooklog))")
     "[:before :after]")
+;; a sorted-map var survives a world dump/restore
+(ev "(ns imgtest.sorted)")
+(jolt-compile-eval "(def sm (sorted-map :b 2 :a 1))" "imgtest.sorted")
+(ev (string-append "(jolt.host/image-dump-world! \"" world-tmp "\" [\"imgtest.sorted\"])"))
+(is "world dump/restore brings a sorted-map var back, sorted"
+    (string-append "(do (jolt.host/image-restore-world! \"" world-tmp "\")"
+                   " (let [m imgtest.sorted/sm] (vector (keys m) (sorted? m))))")
+    "[(:a :b) true]")
+
 (when (file-exists? world-tmp) (delete-file world-tmp))
 
 ;; --- R3: read side — restored closures are CALLED ---------------------------

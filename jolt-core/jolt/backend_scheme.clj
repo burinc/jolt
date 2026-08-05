@@ -1577,11 +1577,16 @@
                    creg (trace-callsite-reg)
                    freg (fnsrc-flush)]
              ;; a def evaluates to its VAR ((var? (def x)) is true), so the source
-             ;; and callsite/fnsrc registrations must not be the value of the form —
-             ;; bind the def's result, register, and hand the var back.
-             (if (= (str reg creg freg) "") d
-                 (let [v (fresh-label "_dv$")]
-                   (str "(let ((" v " " d "))" reg creg freg " " v ")")))))
+             ;; and callsite registrations must not be the value of the form —
+             ;; bind the def's result, register, and hand the var back. The fnsrc
+             ;; registrations run BEFORE the form: they are static data, and the
+             ;; form's own evaluation may already dump a closure it just created.
+             (let [pre (if (= freg "") "" (str "(begin" freg " "))
+                   post (if (= freg "") "" ")")
+                   body (if (= (str reg creg) "") d
+                            (let [v (fresh-label "_dv$")]
+                              (str "(let ((" v " " d "))" reg creg " " v ")")))]
+               (str pre body post))))
     (throw (ex-info (str "emit: op not yet ported / unhandled: " (pr-str (:op node))) {}))))
 
 ;; ^:dynamic / ^:redef on a def opts it out of direct-linking: it stays redefinable,
@@ -1647,25 +1652,28 @@
         init (nth init+creg 0)
         creg (nth init+creg 1)
         freg (nth init+creg 2)]
+    ;; fnsrc registrations run BEFORE the define/def-var!: static data, and the
+    ;; init (or a form evaluated right after in the same top-level do) may dump a
+    ;; closure the init just created.
     (cond
       dl?
       (if (jmeta-nonempty? (:meta node))
-        (str "(begin (define " b " " init ") (def-var-with-meta! "
+        (str "(begin" freg " (define " b " " init ") (def-var-with-meta! "
              (chez-str-lit ns) " " (chez-str-lit nm) " " b " " (emit-def-meta node) ")"
-             (or reg "") (or vreg "") creg freg ")")
-        (str "(begin (define " b " " init ") (def-var! "
-             (chez-str-lit ns) " " (chez-str-lit nm) " " b ")" (or reg "") (or vreg "") creg freg ")"))
+             (or reg "") (or vreg "") creg ")")
+        (str "(begin" freg " (define " b " " init ") (def-var! "
+             (chez-str-lit ns) " " (chez-str-lit nm) " " b ")" (or reg "") (or vreg "") creg ")"))
       (jmeta-nonempty? (:meta node))
       (if (= (str creg freg) "")
         (str "(def-var-with-meta! " (chez-str-lit ns) " " (chez-str-lit nm) " " init " " (emit-def-meta node) ")")
-        ;; a def evaluates to its var — bind, register, hand the var back
+        ;; a def evaluates to its var — register first, bind, hand the var back
         (let [v (fresh-label "_dv$")]
-          (str "(let ((" v " (def-var-with-meta! " (chez-str-lit ns) " " (chez-str-lit nm) " " init " " (emit-def-meta node) ")))" creg freg " " v ")")))
+          (str "(begin" freg " (let ((" v " (def-var-with-meta! " (chez-str-lit ns) " " (chez-str-lit nm) " " init " " (emit-def-meta node) ")))" creg " " v "))")))
       :else
       (if (= (str creg freg) "")
         (str "(def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")")
         (let [v (fresh-label "_dv$")]
-          (str "(let ((" v " (def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")))" creg freg " " v ")"))))))
+          (str "(begin" freg " (let ((" v " (def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")))" creg " " v "))"))))))
 
 (defn emit-top-form [node]
   (binding [*fnsrc-ns* (or (:ns node) (:fnsrc-ns node))
@@ -1687,9 +1695,8 @@
                 :else (emit node))
           freg (fnsrc-flush)]
       (if (= freg "") scm
-          ;; a non-def top-level form with registered literals keeps its VALUE:
-          ;; the eval path reads ONE form, so appending the registration siblings
-          ;; after scm would drop them, and the form's value must survive anyway —
-          ;; bind, register, hand the value back (the :def cases wrap the same way).
-          (let [v (fresh-label "_tf$")]
-            (str "(let ((" v " " scm "))" freg " " v ")"))))))
+          ;; registrations run BEFORE the form: they are static data with no
+          ;; dependency on the form's evaluation, and the form itself may dump a
+          ;; closure it just created — the registration must already be there.
+          ;; begin keeps the form's value as the result.
+          (str "(begin" freg " " scm ")")))))

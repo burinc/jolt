@@ -166,11 +166,10 @@
          (and p (list 'fn-ref (car p) (cdr p)))))
       ;; A non-eq hashtable is refused rather than described. Its contents would
       ;; have to ride in the descriptor stream, which is written WITHOUT an
-      ;; externals-pred — so a table holding procedures (a sorted map's internal
-      ;; comparator machinery is exactly this) would blow up there, outside the
-      ;; mechanism that is supposed to catch it. Refusing keeps the failure inside
-      ;; the path-reporting path. Sorted maps and sorted sets are therefore not
-      ;; writable in this format version.
+      ;; externals-pred — so a table holding procedures would blow up there,
+      ;; outside the mechanism that is supposed to catch it. Refusing keeps the
+      ;; failure inside the path-reporting path. (A sorted coll never reaches
+      ;; this arm: the transformer intercepts the wrapper upstream.)
       (else #f))))
 
 (define (image-decode-external d)
@@ -218,6 +217,18 @@
 (define-record-type image-fnsrc
   (fields name form ns free-names (mutable free-values))
   (nongenerative image-fnsrc-v1))
+
+;; A sorted map/set a state image rebuilds from the public constructors: kind
+;; ('map | 'set), the ORIGINAL user comparator (jolt-nil for natural order), and
+;; the entries in seq order — (key . val) pairs for a map, elements for a set.
+;; The write-side arm on htable-sorted? intercepts the wrapper before the
+;; externals path ever sees its internal comparator hashtable; cmp-fn composes
+;; with the proc verdict (named fn -> fn-ref, registered literal -> image-fnsrc,
+;; else refuse-with-path) and entries walk as plain data. Restore re-mints
+;; through sorted-map(-by)/sorted-set(-by) and folds the entries in ordered.
+(define-record-type image-sorted
+  (fields kind cmp-fn entries)
+  (nongenerative image-sorted-v1))
 
 ;; backend_scheme.clj's munge-name, exposed so the write side munges registered
 ;; free names with EXACTLY the mapping the emitter used. Deref'd at dump time,
@@ -436,6 +447,8 @@
                       (walk-fnsrc-restore x path))
                      ((and (eq? mode 'restore) (image-handled? x))
                       (walk-handled-restore x path))
+                     ((and (eq? mode 'restore) (image-sorted? x))
+                      (walk-sorted-restore x path))
                      ;; handlers claim at any depth, before anything else
                      ((and (pair? image-handlers) (image-handler-for x)) =>
                       (lambda (h)
@@ -489,6 +502,7 @@
                          ((pmap? x) (walk-pmap x path))
                          ((pset? x) (walk-pset x path))
                          ((pvec? x) (walk-pvec x path))
+                         ((htable-sorted? x) (walk-sorted x path))
                          ((var-cell? x) (walk-var-cell x path))
                          ((jolt-atom? x) (walk-atom x path))
                          ((pair? x) (walk-pair x path))
@@ -552,6 +566,58 @@
                     (begin
                       (hashtable-set! memo x #t)
                       (pset-fold x (lambda (e acc) (walk e (cons (image-describe-obj e) path)) acc) #f)
+                      #t))))
+             (walk-sorted
+              (lambda (x path)
+                (if (image-rebuild-mode? mode)
+                    ;; write side: substitute to an image-sorted record. The
+                    ;; wrapper is immutable data, so there are no cycles to
+                    ;; pre-memoize; cmp-fn routes through the shared proc
+                    ;; verdict, entries walk as plain data.
+                    (let ((map? (htable-sorted-map? x)))
+                      (if map?
+                          (let ((pairs '()))
+                            (let loop ((s (jolt-seq x)))
+                              (unless (jolt-nil? s)
+                                (let* ((e (jolt-first s))
+                                       (k (jolt-nth e 0))
+                                       (v (jolt-nth e 1))
+                                       (wk (walk k (cons "<key>" path)))
+                                       (wv (walk v (cons (image-describe-obj k) path))))
+                                  (set! pairs (cons (cons wk wv) pairs)))
+                                (loop (jolt-next s))))
+                            (let ((r (make-image-sorted 'map
+                                       (walk (jolt-ref-get x kw-cmp-fn) (cons "cmp-fn" path))
+                                       (list->vector (reverse pairs)))))
+                              (hashtable-set! memo x r)
+                              (image-meta-copy! x r)
+                              r))
+                          (let ((items '()))
+                            (let loop ((s (jolt-seq x)))
+                              (unless (jolt-nil? s)
+                                (set! items (cons (walk (jolt-first s)
+                                                        (cons (image-describe-obj (jolt-first s)) path))
+                                                  items))
+                                (loop (jolt-next s))))
+                            (let ((r (make-image-sorted 'set
+                                       (walk (jolt-ref-get x kw-cmp-fn) (cons "cmp-fn" path))
+                                       (list->vector (reverse items)))))
+                              (hashtable-set! memo x r)
+                              (image-meta-copy! x r)
+                              r))))
+                    (begin
+                      (hashtable-set! memo x #t)
+                      (walk (jolt-ref-get x kw-cmp-fn) (cons "cmp-fn" path))
+                      (let loop ((s (jolt-seq x)))
+                        (unless (jolt-nil? s)
+                          (let ((e (jolt-first s)))
+                            (if (htable-sorted-map? x)
+                                (begin
+                                  (walk (jolt-nth e 0) (cons "<key>" path))
+                                  (walk (jolt-nth e 1)
+                                        (cons (image-describe-obj (jolt-nth e 0)) path)))
+                                (walk e (cons (image-describe-obj e) path))))
+                          (loop (jolt-next s))))
                       #t))))
              (walk-pvec
               (lambda (x path)
@@ -750,6 +816,33 @@
                       (hashtable-set! memo x cl)
                       (image-meta-copy! x cl)
                       cl)))))
+             ;; R4 read side: a stored sorted coll rebuilds through the public
+             ;; constructors. cmp-fn is walked first (jolt-nil -> natural ctor,
+             ;; live fn -> fn-ref identity, stored fnsrc -> compiled closure);
+             ;; the entries were written in sorted order, so folding them in via
+             ;; jolt-assoc / jolt-conj (which dispatch sorted) is ordered input.
+             (walk-sorted-restore
+              (lambda (x path)
+                (let* ((map? (eq? (image-sorted-kind x) 'map))
+                       (cmp-fn (walk (image-sorted-cmp-fn x) (cons "cmp-fn" path)))
+                       (entries (image-sorted-entries x))
+                       (n (vector-length entries)))
+                  (let ((coll (if (jolt-nil? cmp-fn)
+                                  (jolt-invoke (var-deref "clojure.core"
+                                                           (if map? "sorted-map" "sorted-set")))
+                                  (jolt-invoke (var-deref "clojure.core"
+                                                           (if map? "sorted-map-by" "sorted-set-by"))
+                                               cmp-fn))))
+                    (let loop ((i 0))
+                      (when (fx<? i n)
+                        (let ((e (walk (vector-ref entries i) (cons "entry" path))))
+                          (if map?
+                              (set! coll (jolt-assoc coll (car e) (cdr e)))
+                              (set! coll (jolt-conj coll e)))
+                          (loop (fx+ i 1)))))
+                    (hashtable-set! memo x coll)
+                    (image-meta-copy! x coll)
+                    coll))))
              (walk-handled-restore
               (lambda (x path)
                 (let ((tp (walk (image-handled-payload x) (cons "payload" path))))

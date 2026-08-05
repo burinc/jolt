@@ -491,6 +491,15 @@
     (hashtable-set! proc-name-tbl v (cons ns name)))
   (hashtable-set! ns-has-vars-set ns #t)
   (let ((c (jolt-var ns name))) (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
+;; Value-position comparison references compile to the seq.ss chain singletons
+;; (jolt-lt/gt/le/ge), not to the clojure.core var roots — the roots were later
+;; re-bound by the checked numeric layer, so def-var! never saw these procs.
+;; Register them so a stored comparator like (sorted-map-by >) travels as a
+;; fn-ref (by name) like any other named core fn.
+(hashtable-set! proc-name-tbl jolt-lt (cons "clojure.core" "<"))
+(hashtable-set! proc-name-tbl jolt-gt (cons "clojure.core" ">"))
+(hashtable-set! proc-name-tbl jolt-le (cons "clojure.core" "<="))
+(hashtable-set! proc-name-tbl jolt-ge (cons "clojure.core" ">="))
 ;; Set of ns-name strings that have at least one var — makes ns-has-vars? O(1)
 ;; instead of scanning the entire var-table per require-miss. Updated in def-var!
 ;; (and wherever vars are removed, though removal is rare).

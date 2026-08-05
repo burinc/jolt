@@ -51,6 +51,7 @@
 (define kw-sorted-map (keyword "jolt" "sorted-map"))
 (define kw-sorted-set (keyword "jolt" "sorted-set"))
 (define kw-ops (keyword #f "ops"))
+(define kw-cmp-fn (keyword #f "cmp-fn"))
 (define kw-op-count (keyword #f "count"))
 (define kw-op-seq (keyword #f "seq"))
 (define kw-op-get (keyword #f "get"))
