@@ -94,5 +94,19 @@
 (define pn (closure-name (var-deref "app" "p")))
 (ok "partial closure not jfn$-named" (or (not pn) (not (string-prefix? pn "jfn$"))))
 
+
+;; a macro can splice a LIVE value (here the namespace object) into a fn body;
+;; emit-quoted has no rendering for it, so the literal compiles UNREGISTERED
+;; instead of failing the compilation (the Selmer regression)
+(jolt-eval "(defmacro spliced-ns-fn [] (list 'fn '[x] (list 'str 'x *ns*)))" "app")
+(jolt-eval "(def spliced {:f (spliced-ns-fn)})" "app")
+(define spl (var-deref "app" "spliced"))
+(define spl-f (jolt-get spl (keyword #f "f") jolt-nil))
+(ok "spliced-live-value literal compiles and runs"
+    (string? (jolt-invoke spl-f "pfx")))
+(ok "spliced-live-value literal is unregistered (skipped, not fatal)"
+    (let ((nm (closure-name spl-f)))
+      (or (not nm) (not (image-fn-form-lookup nm)))))
+
 (printf "\nfnform gate: ~a/~a passed\n" (- total fails) total)
 (exit (if (> fails 0) 1 0))

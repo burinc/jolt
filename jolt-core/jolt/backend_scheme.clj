@@ -807,11 +807,18 @@
 (defn- fnsrc-flush []
   (if (or (fnsrc-system-ns? *fnsrc-ns*) (empty? @*fnsrc-regs*))
     ""
-    (str " " (str/join " " (map (fn [[nm form ns frees]]
-                                  (str "(image-register-fn-form! " (chez-str-lit nm) " "
-                                       (emit-quoted form) " " (chez-str-lit ns) " "
-                                       (emit-quoted frees) ")"))
-                                @*fnsrc-regs*)))))
+    ;; best-effort: a macro can splice a LIVE value (a namespace, a var's
+    ;; value) into a fn body, and emit-quoted has no rendering for those.
+    ;; Such a literal just goes unregistered — its closure refuses at dump
+    ;; like any other unregistered fn — rather than failing the whole
+    ;; compilation of code that never dumps anything.
+    (str " " (str/join " " (keep (fn [[nm form ns frees]]
+                                   (try
+                                     (str "(image-register-fn-form! " (chez-str-lit nm) " "
+                                          (emit-quoted form) " " (chez-str-lit ns) " "
+                                          (emit-quoted frees) ")")
+                                     (catch Exception _ nil)))
+                                 @*fnsrc-regs*)))))
 
 (defn- emit-fn [node]
   (let [;; a def's DIRECT anonymous init is named by its define, so it keeps the
