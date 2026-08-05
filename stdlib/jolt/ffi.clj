@@ -72,10 +72,13 @@
               (ffi/read-into! buf frame off n)     ; no per-chunk array
               (recur (+ off n))))))
 
-  foreign-fn lowers
-  a compile-time-typed signature to a real Chez foreign-procedure. foreign-callable
-  is the inverse — it wraps a jolt fn as a C-callable function pointer so C can
-  call back into jolt (e.g. GTK signal handlers); free-callable releases it.")
+  foreign-fn lowers a compile-time-typed signature to a real Chez
+  foreign-procedure. Its optional
+  trailing map accepts :blocking and :capture-native-error literal Booleans;
+  capture returns [native-result error-code] atomically and requires a non-void
+  scalar result. foreign-callable is the inverse — it wraps a jolt fn as a
+  C-callable function pointer so C can call back into jolt (e.g. GTK signal
+  handlers); free-callable releases it.")
 
 (defmacro layout
   "Compile a literal [:struct [[field type] ...]] descriptor into immutable ABI
@@ -203,16 +206,34 @@
 ;;   (ffi/defcfn c-fcntl "fcntl" [:int :int :varargs :int] :int)
 ;; C's default argument promotions still apply after the marker: pass values
 ;; narrower than int as :int (and float as :double), not as an exact narrow type.
-(defmacro foreign-fn [csym argtypes rettype & [opt]]
-  (if (= opt :blocking)
-    (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)
-    (list 'jolt.ffi/__cfn csym argtypes rettype)))
+;; An options map may instead combine :blocking with
+;; :capture-native-error. Capture returns [native-result error-code] (result
+;; first), with the error slot read in the foreign-call return path. The analyzer
+;; validates the literal map and rejects capture on :void.
+(defn- cfn-form [csym argtypes rettype args who]
+  (let [n (count args)]
+    (cond
+      (zero? n)
+      (list 'jolt.ffi/__cfn csym argtypes rettype)
 
-;; (defcfn name "c_symbol" [argtypes] rettype [:blocking]) — def a foreign function.
-(defmacro defcfn [name csym argtypes rettype & [opt]]
-  (list 'def name (if (= opt :blocking)
-                    (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)
-                    (list 'jolt.ffi/__cfn csym argtypes rettype))))
+      (and (= n 1) (= (first args) :blocking))
+      (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)
+
+      (and (= n 1) (map? (first args)))
+      (list 'jolt.ffi/__cfn csym argtypes rettype (first args))
+
+      :else
+      (throw (ex-info (str "jolt.ffi/" who ": trailing option must be "
+                           ":blocking or an options map; got " (vec args))
+                      {:jolt/ffi-option args})))))
+
+(defmacro foreign-fn [csym argtypes rettype & args]
+  (cfn-form csym argtypes rettype args "foreign-fn"))
+
+;; (defcfn name "c_symbol" [argtypes] rettype [:blocking | {opts}]) — def a
+;; foreign function. The trailing option matches foreign-fn.
+(defmacro defcfn [name csym argtypes rettype & args]
+  (list 'def name (cfn-form csym argtypes rettype args "defcfn")))
 
 ;; foreign-callable wraps a jolt fn `f` as a C-callable function pointer — the
 ;; inverse of foreign-fn, so C can call back INTO jolt (GTK signal handlers, a

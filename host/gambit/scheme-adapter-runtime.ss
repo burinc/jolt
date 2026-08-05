@@ -195,6 +195,25 @@
     ((_ name args res) (sa-ffi-raise 'sa-foreign-procedure))
     ((_ conv name args res) (sa-ffi-raise 'sa-foreign-procedure))))
 
+;; (sa-foreign-procedure-native-error error-convention conv name args res)
+;; -> foreign procedure
+;; SYNTAX: an atomic native-error-capturing foreign procedure. Degradation: the
+;; gambit target has no ffi tier, so every shape raises the same documented
+;; unsupported error as the rest of the tier.
+(define-syntax sa-foreign-procedure-native-error
+  (syntax-rules ()
+    ((_ error-convention conv name args res)
+     (sa-ffi-raise 'sa-foreign-procedure-native-error))))
+
+;; The compiler emits this target wrapper so Chez can select errno versus
+;; GetLastError at expansion time. Gambit has neither native FFI convention;
+;; route it through the adapter capability so it degrades honestly.
+(define-syntax jolt-ffi-native-error-procedure
+  (syntax-rules ()
+    ((_ conv name args res)
+     (sa-foreign-procedure-native-error unsupported-native-error
+                                        conv name args res))))
+
 ;; (sa-foreign-procedure-blocking name args res) -> foreign procedure
 ;; SYNTAX: like sa-foreign-procedure, but the call is __collect_safe. Contract:
 ;; mark the call so a blocking foreign invocation does not stop other threads'

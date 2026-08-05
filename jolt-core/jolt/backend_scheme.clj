@@ -771,7 +771,8 @@
                   ;; ffi lowering (emit-ffi-fn/emit-ffi-callable: the sa-* adapter
                   ;; syntaxes a Chez foreign-procedure/callable expands to).
                   "sa-foreign-procedure" "sa-foreign-procedure-blocking"
-                  "sa-foreign-callable" "sa-foreign-callable-collect-safe"}]
+                  "sa-foreign-callable" "sa-foreign-callable-collect-safe"
+                  "jolt-ffi-native-error-procedure" "call-with-values"}]
     (into from-registry helpers)))
 
 ;; Most jolt names are already valid Scheme identifiers. The one that isn't is
@@ -1309,19 +1310,39 @@
                                (pointer-check return-param return-name "return destination"))
           conv (if vi (str " (__varargs_after " vi ")") "")
           signature (str " (" (str/join " " emitted-types) ") " emitted-return)
-          fp (str "(" (if (:blocking node) "sa-foreign-procedure-blocking " "sa-foreign-procedure ")
-                  conv " " (chez-str-lit (:csym node)) signature ")")
+          csym (chez-str-lit (:csym node))
+          capture (:capture-native-error node)
+          capture-conv (cond
+                         (:blocking node) "__collect_safe"
+                         ;; The outer wrapper already adds one list. A compound
+                         ;; convention needs one more so the adapter receives
+                         ;; (__varargs_after n) as one datum rather than two
+                         ;; flat convention arguments.
+                         vi (str "(__varargs_after " vi ")")
+                         :else "")
+          fp (if capture
+               (str "(jolt-ffi-native-error-procedure (" capture-conv ") "
+                    csym signature ")")
+               (str "(" (if (:blocking node)
+                           "sa-foreign-procedure-blocking "
+                           "sa-foreign-procedure ")
+                    conv " " csym signature ")"))
           ;; Preserve the historical global-only path for scalar varargs. A
           ;; fixed aggregate before :varargs needs scoped lookup because it can
           ;; only come from a named native library; that address+convention form
           ;; is covered by the aggregate C witness on each target ABI.
           scoped (if (and vi (empty? aggregates))
                    "#f"
-                   (str "(let ((a (jolt-ffi-dlsym-native " (chez-str-lit (:csym node)) "))) "
-                        "(and a (foreign-procedure"
-                        (when (:blocking node) " __collect_safe")
-                        (when vi conv)
-                        " a" signature ")))"))
+                   (str "(let ((a (jolt-ffi-dlsym-native " csym "))) "
+                        "(and a "
+                        (if capture
+                          (str "(jolt-ffi-native-error-procedure (" capture-conv ") a"
+                               signature ")")
+                          (str "(foreign-procedure"
+                               (when (:blocking node) " __collect_safe")
+                               (when vi conv)
+                               " a" signature ")"))
+                        "))"))
           proc (str "(or p (begin (set! p (or " scoped " " fp ")) p))")
           call-args (if ret-aggregate? (into [native-destination] native-args) native-args)
           call (str "(" proc
@@ -1330,6 +1351,15 @@
           ;; NULL char*, which is Scheme's false, not jolt's nil. getenv of an
           ;; unset name returned false to Clojure before this.
           body (cond
+                 capture
+                 (str "(call-with-values (lambda () " call ")"
+                      " (lambda (result native-error)"
+                      " (jolt-vector "
+                      (if (= "string" (:rettype node))
+                        "(jolt-ffi-c->string result)"
+                        "result")
+                      " native-error)))")
+
                  ret-aggregate? (str "(begin " call " " return-param ")")
                  (= "string" (:rettype node)) (str "(jolt-ffi-c->string " call ")")
                  :else call)

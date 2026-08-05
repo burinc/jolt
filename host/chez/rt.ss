@@ -141,6 +141,42 @@
         (guard (_ (#t #f)) (flush-output-port (current-error-port)))
         (jolt-c-exit code))))
 
+;; Build a foreign procedure whose invocation returns both the native result
+;; and the calling thread's native error slot as Scheme values. Chez captures
+;; the slot in the foreign-call return path, before collect-safe reactivation or
+;; later Scheme/native work can overwrite it.
+;;
+;; Select from the compiler target, not this process's machine-type: cross-image
+;; builds rebind #%$target-machine while the build host remains unchanged. An
+;; unrecognized target fails during expansion rather than guessing a nearby ABI.
+(define-syntax jolt-ffi-native-error-convention-case
+  (lambda (x)
+    (syntax-case x ()
+      ((_ get-last-error-form errno-form)
+       (case (eval '(#%$target-machine))
+         ((i3nt ti3nt a6nt ta6nt arm64nt tarm64nt)
+          #'get-last-error-form)
+         ((i3le ti3le a6le ta6le
+           ppc32le tppc32le arm32le tarm32le
+           arm64le tarm64le rv64le trv64le la64le tla64le
+           i3osx ti3osx a6osx ta6osx
+           ppc32osx tppc32osx arm64osx tarm64osx)
+          #'errno-form)
+         (else
+          (error 'jolt-ffi-native-error-convention-case
+                 "unsupported target machine"
+                 (eval '(#%$target-machine)))))))))
+
+(define-syntax jolt-ffi-native-error-procedure
+  (lambda (x)
+    (syntax-case x ()
+      ((_ (conv ...) name args res)
+       #'(jolt-ffi-native-error-convention-case
+           (sa-foreign-procedure-native-error
+            __get_last_error (conv ...) name args res)
+           (sa-foreign-procedure-native-error
+            __errno (conv ...) name args res))))))
+
 ;; --- how many processors can this process use ---------------------------------
 ;; Backs jolt.host/available-processors, which Runtime.availableProcessors and
 ;; pmap's look-ahead window read. Each host is asked the question the JVM asks

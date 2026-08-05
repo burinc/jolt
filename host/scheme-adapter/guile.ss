@@ -103,6 +103,9 @@
 ;;   sa-foreign-procedure   UNIMPLEMENTED  Guile: (pointer->procedure ret (dynamic-func name
 ;;                                        lib) args) — (system foreign). must verify call
 ;;                                        shape translation; SYNTAX on Chez (lowering).
+;;   sa-foreign-procedure-native-error UNIMPLEMENTED Must capture errno atomically
+;;                                        at the foreign call boundary; a later
+;;                                        read is racy and not equivalent.
 ;;   sa-foreign-procedure-blocking UNIMPLEMENTED  ?? must verify collect-safety; may
 ;;                                        collapse to plain sa-foreign-procedure only if the
 ;;                                        collector never stops other threads.

@@ -508,13 +508,15 @@ cts: testbin
 # The widths gate covers the exact scalar vocabulary across both halves of the
 # API: runtime memory access and compiler-emitted procedures/callables. The
 # layout gate compares declarative struct metadata and field access against C;
-# the aggregate gate covers structs passed and returned by C value.
+# the aggregate gate covers structs passed and returned by C value; the native
+# error gate covers atomic errno/GetLastError capture and option composition.
 ffi:
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-layout-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-aggregate-test.sh "$(CHEZ)"
 	@bin/jolt run test/chez/jolt-ffi-scoped-test.clj
+	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
