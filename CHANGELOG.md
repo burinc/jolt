@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-08-05
+
+Adds `jolt.image` — write a running program's state to a file and restore it
+in a fresh process, on another machine or another CPU architecture. State
+travels, execution does not: no thread stacks, no continuations. Design in
+RFC 0009; a working GUI example lives in jolt-lang/examples
+(`image-dump-example`). (#533, #534)
+
+### Added
+
+- **`jolt.image/dump-world!` / `restore-world!` — save the program, not a
+  variable.** Walks the var table and writes every var's root, so nothing in
+  an application lists what its state consists of; a new `def` is in the
+  image without touching the saving code. Code does not travel — a var whose
+  root is a function is skipped, since the restoring process is the same
+  build and already has it. `clojure.*`/`jolt.*` vars stay with the process
+  being restored into; `user` is kept. `add-before-dump-hook!` /
+  `add-after-restore-hook!` bracket the pair (quiesce on the way out, rebuild
+  derived state on the way in), and `restore-world!` returns the number of
+  vars rebound.
+- **`jolt.image/dump!` / `read-image`** — the same machinery for a single
+  value you name.
+- **`scan` / `scan-world` / `dumpable?`** — dry runs that name the route
+  through the graph to anything unwritable
+  (`#'app.core/state -> :handlers -> "GET /x" -> #<procedure>`) instead of
+  writing a subtly incomplete image. `dump!` refuses with the same path.
+- **`register-handler!`** — teach the encoder a resource: a predicate, a
+  fn that renders it as plain data, and a fn that re-acquires it on restore.
+  Claimed at var roots, so a handler payload is ordinary state (functions
+  become names, keywords re-intern).
+- **Cross-architecture images.** The body is a machine-independent stream by
+  construction — code travels by name, never as code objects — so an image
+  written on arm64 reads on x86-64. Structural sharing, cycles, records,
+  metadata, and every numeric type round-trip; interned keywords are
+  re-interned on the way in, so restored maps look up correctly. The header
+  pins the runtime: an image survives a machine or architecture change but
+  not a Chez upgrade, and a mismatch is refused with the reason named.
+- Not writable, by design: anonymous closures (store a named fn, or data to
+  rebuild one from) and sorted maps/sets. Both are refused with a clear
+  message, never silently dropped.
+
+### Internal
+
+- New `stateimage` gate (in `make ci`): pins the value/world round-trips and
+  the Chez fasl behaviour the format assumes — what fasls, what is refused,
+  machine-independence of data-only streams — so a Chez upgrade fails a test
+  rather than someone's image.
+
 ## [0.6.2] - 2026-08-04
 
 Rebuilds tracing on compile-time metadata, removing the per-entry ring push
