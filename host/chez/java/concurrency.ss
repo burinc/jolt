@@ -589,10 +589,19 @@
       ((jolt-delay? x) (jolt-delay-force x))
       ;; a record/reify implementing clojure.lang.IDeref: @x calls its `deref`
       ;; method with the value itself as the leading `this`.
+      ;;
+      ;; opts are forwarded, so a type implementing clojure.lang.IBlockingDeref
+      ;; gets (deref this timeout-ms timeout-value) rather than the blocking
+      ;; one-arity. Dropping them here did not fail loudly: the timed call
+      ;; silently became an untimed one, so (deref proc 1500 ::timeout) on a
+      ;; babashka.process record waited for the process to exit however long
+      ;; that took, and the caller's timeout branch was unreachable. That made
+      ;; every bounded subprocess call in a downstream harness unbounded, and
+      ;; leaked the processes it thought it was killing.
       ((and (jrec? x) (find-method-any-protocol (jrec-tag x) "deref"))
-       => (lambda (m) (jolt-invoke m x)))
+       => (lambda (m) (apply jolt-invoke m x opts)))
       ((and (reified-methods x) (hashtable-ref (reified-methods x) "deref" #f))
-       => (lambda (m) (jolt-invoke m x)))
+       => (lambda (m) (apply jolt-invoke m x opts)))
       (else (apply %pre-conc-deref x opts)))))
 
 ;; realized? for a future/promise/delay. Wrapped over the overlay version in
