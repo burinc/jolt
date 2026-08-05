@@ -1244,6 +1244,11 @@
 ;; uncaught-throwable renderer. After the printers/equality it relies on.
 (load "host/chez/source-registry.ss")
 
+;; Unique anon-fn names -> {source form, ns, free locals} for the image write
+;; side. Plain defines (no def-var! / manifest lines): only emitted code and the
+;; image writer call them, never Clojure.
+(load "host/chez/fn-form-registry.ss")
+
 ;; State images: dump the value graph to a file and read it back. Loads LAST —
 ;; walks jolt collections, var cells and atoms, prints paths through the printers,
 ;; and reads proc-name-tbl to write a fn as its var's name.

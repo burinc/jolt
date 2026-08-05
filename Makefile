@@ -56,7 +56,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr grenadine \
+  devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr fnform grenadine \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
@@ -115,7 +115,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi \
   transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
-  traceemit traceeval \
+  fnform traceemit traceeval \
   inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   certify
@@ -466,6 +466,12 @@ narrow:
 # jolt-invoke; ^:dynamic/^:redef and nested defs opt out.
 directlink:
 	@$(CHEZ) --script test/chez/directlink-test.ss
+
+# Unique anon-fn letrec names + source-form registration (R1): a user-ns anon
+# literal registers jfn$<ns>$<def>$<n> -> {form, ns, free-names} and the live
+# closure's inspector name must agree; system-ns closures stay unregistered.
+fnform:
+	@$(CHEZ) --script test/chez/fnform-test.ss
 
 # Compilation-unit context: the emit-session state (mode flags, direct-link
 # registries, ctor shapes, gensym, cache cells) is per-unit, so two units are

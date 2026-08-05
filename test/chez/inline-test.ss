@@ -20,6 +20,16 @@
   (let-values (((f j) (rdr-read-form str 0 (string-length str))))
     (let ((ctx (make-analyze-ctx ns)))
       (jolt-ce-emit (jolt-ce-run-passes (jolt-ce-analyze ctx f) ctx)))))
+;; the CODE portion of an emission: an anon literal's registration sibling
+;; carries its original SOURCE form, so a gone-from-the-code callee name still
+;; appears verbatim in the registration tail — cut it off before asserting.
+(define (code-part s)
+  (let ((marker "(image-register-fn-form!"))
+    (let ((ns (string-length s)) (nm (string-length marker)))
+      (let loop ((i 0))
+        (cond ((> (+ i nm) ns) s)
+              ((string=? (substring s i (+ i nm)) marker) (substring s 0 i))
+              (else (loop (+ i 1))))))))
 (define (ev s) (jolt-compile-eval s "u"))
 
 ;; inlining is a closed-world optimization — requires optimize + direct-link.
@@ -29,7 +39,7 @@
 ;; a small plain fn is spliced; the call to it disappears.
 (ev "(def add1 (fn* ([x] (+ x 1))))")
 (let ((e (emitf "u" "(fn* ([y] (add1 y)))")))
-  (ok "plain fn is inlined (call to add1 gone)" (not (has? e "add1")))
+  (ok "plain fn is inlined (call to add1 gone)" (not (has? (code-part e) "add1")))
   (ok "inlined body present (jolt-n+ ... 1)" (has? e "(jolt-n+")))
 (ok "inlined plain fn runtime: (add1 41) = 42" (= 42 (jnum->exact (ev "((fn* ([y] (add1 y))) 41)"))))
 
@@ -37,7 +47,7 @@
 (ev "(def ^double dwork (fn* ([^double a ^double b] (+ (* a a) (* b b)))))")
 (let ((e (emitf "u" "(fn* ([] (dwork 3.0 4.0)))")))
   (ok "inlined ^double fn body uses fl*" (has? e "(#3%fl*"))
-  (ok "inlined ^double fn call to dwork is gone" (not (has? e "dwork"))))
+  (ok "inlined ^double fn call to dwork is gone" (not (has? (code-part e) "dwork"))))
 (ok "inlined ^double call: 3^2+4^2 = 25" (= 25 (jnum->exact (ev "((fn* ([] (dwork 3.0 4.0))))"))))
 ;; coercion travels with the splice: int args become doubles, so the result is a
 ;; flonum 25.0 — matching the called fn, not an exact 25.
@@ -53,7 +63,7 @@
 (ev "(def ^double sq (fn* ([^double x] (* x x))))")
 (let ((e (emitf "u" "(fn* ([] (loop [acc 0.0 i 0] (if (< i 3) (recur (+ acc (sq 2.0)) (inc i)) acc))))")))
   (ok "accumulator over inlined ^double call lowers to fl+" (has? e "(#3%fl+"))
-  (ok "the sq call is inlined away" (not (has? e "sq"))))
+  (ok "the sq call is inlined away" (not (has? (code-part e) "sq"))))
 (ok "accumulator over inlined ^double call: 3*4.0 = 12" (= 12 (jnum->exact (ev "((fn* ([] (loop [acc 0.0 i 0] (if (< i 3) (recur (+ acc (sq 2.0)) (inc i)) acc)))))"))))
 
 (set-optimize! #f)

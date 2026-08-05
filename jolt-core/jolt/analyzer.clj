@@ -17,7 +17,7 @@
   (:require [jolt.ir :refer [const local var-ref the-var host-ref if-node do-node invoke
                              coerce-node
                              def-node let-node fn-node vector-node map-node set-node
-                             quote-node throw-node host-static host-new]]
+                             quote-node throw-node host-static host-new reduce-ir-children]]
             [jolt.host :refer [form-sym? form-sym-name form-sym-ns form-list?
                                form-vec? form-map? form-set?
                                form-literal? form-keyword? form-elements form-vec-items
@@ -260,21 +260,72 @@
         form))
     form))
 
+;; The ORIGINAL (pre-munge) names of the locals a fn literal references that are
+;; bound OUTSIDE it — its image-registration free-name list. Computed by walking
+;; the analyzed arities with the LEXICAL environment (a set of in-scope names):
+;; a :local not in the set is free; a binding form extends the set only for the
+;; scope it covers, and a binding's init is walked BEFORE its own name binds
+;; ((let [y y] …) reports the outer y). A nested :fn's body IS descended, with
+;; its own params/rest/self-name added: the outer literal's :src-form textually
+;; contains the nested one, so restore evaluates the whole outer form with the
+;; outer's free names bound, and a name free only inside the nested literal must
+;; be in the outer's list or it would resolve to a same-named global at eval.
+;; Sorted so the registration is stable across builds.
+(defn- fn-free-names [arities fn-name]
+  (let [refs (atom #{})
+        ;; each arity's params bind only in that arity: (fn ([x] y) ([y] y))
+        ;; references y free in the first arity even though the second binds it
+        arity-own (fn [a] (into (set (if (:rest a) (conj (:params a) (:rest a)) (:params a)))
+                                (when fn-name [fn-name])))]
+    (letfn [(walk [n bound]
+              (let [op (:op n)]
+                (cond
+                  (= op :local) (when-not (contains? bound (:name n))
+                                  (swap! refs conj (:name n)))
+                  (= op :fn)
+                  (doseq [a (:arities n)]
+                    (walk (:body a)
+                          (into (if (:name n) (conj bound (:name n)) bound)
+                                (if (:rest a) (conj (:params a) (:rest a)) (:params a)))))
+                  (or (= op :let) (= op :loop))
+                  (let [b* (reduce (fn [b [nm init]]
+                                     (walk init b)
+                                     (conj b nm))
+                                   bound (:bindings n))]
+                    (walk (:body n) b*))
+                  (= op :try)
+                  (do (walk (:body n) bound)
+                      (when (:catch-body n)
+                        (walk (:catch-body n) (if (:catch-sym n) (conj bound (:catch-sym n)) bound)))
+                      (when (:finally n) (walk (:finally n) bound)))
+                  :else
+                  (reduce-ir-children (fn [acc c] (walk c bound) acc) nil n))))]
+      (doseq [a arities] (walk (:body a) (arity-own a)))
+      (vec (sort @refs)))))
+
 (defn- analyze-fn [ctx items env]
   (let [named (form-sym? (nth items 1))
         fn-name (when named (form-sym-name (nth items 1)))
         rest-items (if named (drop 2 items) (drop 1 items))
-        first* (strip-arglist-meta (first rest-items))]
-    (cond
-      (form-vec? first*)
-        (fn-node fn-name [(analyze-arity ctx first* (rest rest-items) env fn-name)])
-      (form-list? first*)
-        (fn-node fn-name
-                 (mapv (fn [clause]
-                         (let [cl (vec (form-elements clause))]
-                           (analyze-arity ctx (strip-arglist-meta (first cl)) (rest cl) env fn-name)))
-                       rest-items))
-      :else (uncompilable "fn: bad params"))))
+        first* (strip-arglist-meta (first rest-items))
+        node (cond
+               (form-vec? first*)
+               (fn-node fn-name [(analyze-arity ctx first* (rest rest-items) env fn-name)])
+               (form-list? first*)
+               (fn-node fn-name
+                        (mapv (fn [clause]
+                                (let [cl (vec (form-elements clause))]
+                                  (analyze-arity ctx (strip-arglist-meta (first cl)) (rest cl) env fn-name)))
+                              rest-items))
+               :else (uncompilable "fn: bad params"))
+        ;; :src-form is the original post-expansion (fn* params body…) form —
+        ;; what the image rebuilds from; :free-names the original names of the
+        ;; locals it captures. Attached to named fns too (invisible to emission
+        ;; unless read; the prelude mint ignores them).
+        node (assoc node
+                    :src-form (cons 'fn* (rest items))
+                    :free-names (fn-free-names (:arities node) fn-name))]
+    node))
 
 ;; class names that catch everything (the JVM root types); a (catch Throwable e …)
 ;; clause matches any thrown value unconditionally.
@@ -1109,7 +1160,10 @@
 (defn analyze
   ([ctx form]
    (try
-     (analyze ctx form (empty-env))
+     ;; Stamp the compile namespace on the TOP-LEVEL node so the back end can
+     ;; gate anon-fn naming/registration on it even for a non-def form (a def
+     ;; carries its own :ns). Invisible to emission unless read.
+     (assoc (analyze ctx form (empty-env)) :fnsrc-ns (compile-ns ctx))
      (catch Throwable e (throw (as-analysis-diagnostic e)))))
   ([ctx form env]
    (cond
