@@ -63,6 +63,13 @@
         ;; a lazy-seq carries its own realized? flag (lazy-bridge.ss). The overlay
         ;; realized? reads :jolt/type and throws on a jolt-lazyseq record.
         ((jolt-lazyseq? x) (jolt-lazyseq-realized? x))
+        ;; a record/reify implementing clojure.lang.IPending answers via its
+        ;; isRealized method (the JVM casts to IPending and calls it); the
+        ;; result is boolean-cast like any interface-boolean return.
+        ((and (jrec? x) (find-method-any-protocol (jrec-tag x) "isRealized"))
+         => (lambda (m) (if (jolt-truthy? (jolt-invoke m x)) #t #f)))
+        ((and (reified-methods x) (hashtable-ref (reified-methods x) "isRealized" #f))
+         => (lambda (m) (if (jolt-truthy? (jolt-invoke m x)) #t #f)))
         ;; a seq cell answers by its forced flag: the rest of a realized lazy
         ;; chain is a cseq under jolt's seq model, and (realized? (rest s)) after
         ;; a next must be true like the JVM's realized LazySeq — never a throw
