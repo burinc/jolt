@@ -141,27 +141,42 @@
 ;; throws needs-restart instead (recorded in known-divergences.edn). jolt
 ;; previously returned normally, which read as success. Every deref below is
 ;; bounded so a regression FAILS the check instead of hanging the gate.
+;; ORDERING: the send happens first and `entered` proves the action is running
+;; before the awaiting future starts — otherwise the future can win the race,
+;; await an idle healthy agent, and return normally (seen on Linux CI). With
+;; the agent provably busy, await either enters the wait (the mid-fail path
+;; under test) or arrives after the failure (the entry path) — both throw.
 (let [a (agent 0)
-      go (promise)
-      t (future (try (await a) false
-                     (catch RuntimeException e
-                       (= "Agent is failed, needs restart" (ex-message e)))))]
-  (send a (fn [s] (when (= :go (deref go 5000 :timeout)) (throw (ex-info "boom" {}))) s))
-  (Thread/sleep 50)               ;; let await enter the wait loop on a healthy agent
-  (deliver go :go)
-  (chk "agent-await-midfail: agent failing during await throws needs-restart"
-       (= true (deref t 12000 :hang))))
+      entered (promise)
+      go (promise)]
+  (send a (fn [s]
+            (deliver entered :in)
+            (when (= :go (deref go 5000 :timeout)) (throw (ex-info "boom" {})))
+            s))
+  (deref entered 5000 :timeout)
+  (let [t (future (try (await a) false
+                       (catch RuntimeException e
+                         (= "Agent is failed, needs restart" (ex-message e)))))]
+    (Thread/sleep 50)             ;; let await enter the wait loop on a healthy agent
+    (deliver go :go)
+    (chk "agent-await-midfail: agent failing during await throws needs-restart"
+         (= true (deref t 12000 :hang)))))
 
 (let [a (agent 0)
-      go (promise)
-      t (future (try (await-for 5000 a) false
-                     (catch RuntimeException e
-                       (= "Agent is failed, needs restart" (ex-message e)))))]
-  (send a (fn [s] (when (= :go (deref go 5000 :timeout)) (throw (ex-info "boom" {}))) s))
-  (Thread/sleep 50)
-  (deliver go :go)
-  (chk "agent-awaitfor-midfail: await-for on an agent failing mid-wait throws needs-restart"
-       (= true (deref t 12000 :hang))))
+      entered (promise)
+      go (promise)]
+  (send a (fn [s]
+            (deliver entered :in)
+            (when (= :go (deref go 5000 :timeout)) (throw (ex-info "boom" {})))
+            s))
+  (deref entered 5000 :timeout)
+  (let [t (future (try (await-for 5000 a) false
+                       (catch RuntimeException e
+                         (= "Agent is failed, needs restart" (ex-message e)))))]
+    (Thread/sleep 50)
+    (deliver go :go)
+    (chk "agent-awaitfor-midfail: await-for on an agent failing mid-wait throws needs-restart"
+         (= true (deref t 12000 :hang)))))
 
 ;; --- PSL R4 cluster-4 confirmation: AtomicReference.updateAndGet is a CAS
 ;; retry loop, the fn runs LOCK-FREE (JVM parity) — so the fn may re-enter the
