@@ -13,9 +13,12 @@
 ;;   - :env  -> `env -i K=V …` prefix (the env map starts as a copy of the parent
 ;;     environment, so `env -i` reproduces exactly the intended set)
 ;;   - file / discard redirects -> shell `1> 'f'` / `2>> 'f'` / `1>/dev/null`
-;;   - INHERIT / stream redirects -> a pump thread copying between the pipe and
-;;     the jolt process's own stdio (open-process-ports always pipes, so fd-level
-;;     inheritance is emulated; the fidelity gap is a documented divergence).
+;;   - INHERIT -> a posix_spawn spawn path that leaves the inherited fds
+;;     untouched in the child (true fd-level inheritance: isatty holds, stdin
+;;     offsets are shared) and builds pipes only for the non-inherited streams.
+;;     Where that FFI surface is unavailable (Windows machine types), a pump
+;;     thread copying between the pipe and jolt's own stdio remains as
+;;     emulation.
 ;;
 ;; Exit status, liveness and signalling go through libc waitpid/kill via FFI. A
 ;; per-process mutex serialises reaping so isAlive/waitFor/exitValue never race a
@@ -310,6 +313,185 @@
     (let loop () (unless (unbox (vector-ref latch 2))
                    (condition-wait (vector-ref latch 1) (vector-ref latch 0)) (loop)))))
 
+;; --- fd-level spawn (Redirect.INHERIT) ---------------------------------------
+;; open-process-ports pipes all three streams unconditionally (its child closes
+;; every other descriptor), so INHERIT through it can only ever be pump
+;; emulation: the child sees a pipe, isatty is false, output detours through
+;; jolt's ports, and stdin reads ahead of what the child consumed. A spawn with
+;; any INHERIT stream therefore goes through posix_spawn instead: a child fd
+;; that gets no file action IS the parent's descriptor — tty answers true,
+;; writes land without an intermediary, successive INHERIT-stdin children share
+;; the read offset — and pipes are built only for the streams that ask for one.
+;; Everything downstream (waitpid reaping, kill, the stream wrappers) is shared
+;; with the pipe path. Where this FFI surface is unavailable (Windows machine
+;; types), the pump emulation below remains the fallback.
+
+;; blocking pipe I/O must be __collect_safe: a plain foreign call keeps the
+;; thread "active" for the stop-the-world collector, so a read parked on an
+;; idle pipe would freeze every other thread's GC. Same nt/eval split as
+;; jolt-foreign-proc-safe (a compiled foreign-procedure is a load-time fasl
+;; relocation that aborts boot on Windows machine types).
+(define-syntax proc-foreign-blocking
+  (lambda (x)
+    (syntax-case x (quote)
+      ((_ name (quote args) (quote res))
+       (if (memq (machine-type) '(a6nt ta6nt i3nt ti3nt))
+           #'(guard (e (#t #f))
+               (load-shared-object #f)
+               (and (foreign-entry? name)
+                    (eval `(foreign-procedure __collect_safe ,name ,'args ,'res))))
+           #'(guard (e (#t #f))
+               (load-shared-object #f)
+               (and (foreign-entry? name)
+                    (foreign-procedure __collect_safe name args res))))))))
+
+(define proc-c-pipe  (jolt-foreign-proc-safe "pipe"  '(void*) 'int))
+(define proc-c-close (jolt-foreign-proc-safe "close" '(int)   'int))
+(define proc-fa-init    (jolt-foreign-proc-safe "posix_spawn_file_actions_init"     '(void*) 'int))
+(define proc-fa-dup2    (jolt-foreign-proc-safe "posix_spawn_file_actions_adddup2"  '(void* int int) 'int))
+(define proc-fa-close   (jolt-foreign-proc-safe "posix_spawn_file_actions_addclose" '(void* int) 'int))
+(define proc-fa-destroy (jolt-foreign-proc-safe "posix_spawn_file_actions_destroy"  '(void*) 'int))
+(define proc-c-spawn (jolt-foreign-proc-safe "posix_spawn" '(void* string void* void* void* void*) 'int))
+(define proc-c-read  (proc-foreign-blocking "read"  '(int void* size_t) 'ssize_t))
+(define proc-c-write (proc-foreign-blocking "write" '(int void* size_t) 'ssize_t))
+
+(define proc-spawn-fd-ok?
+  (and proc-c-pipe proc-c-close proc-fa-init proc-fa-dup2 proc-fa-close
+       proc-fa-destroy proc-c-spawn proc-c-read proc-c-write #t))
+
+;; marshal a string list into a NULL-terminated char**; returns (array . cstrs)
+;; so the caller can free every allocation once posix_spawn has copied them.
+(define (proc-marshal-cstr s)
+  (let* ((bv (string->utf8 s))
+         (n (bytevector-length bv))
+         (p (foreign-alloc (+ n 1))))
+    (let loop ((i 0))
+      (when (< i n)
+        (foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i))
+        (loop (+ i 1))))
+    (foreign-set! 'unsigned-8 p n 0)
+    p))
+(define (proc-marshal-argv strs)
+  (let* ((ps (map proc-marshal-cstr strs))
+         (arr (foreign-alloc (* 8 (+ 1 (length ps))))))
+    (let loop ((i 0) (rest ps))
+      (if (null? rest)
+          (foreign-set! 'void* arr (* 8 i) 0)
+          (begin (foreign-set! 'void* arr (* 8 i) (car rest))
+                 (loop (+ i 1) (cdr rest)))))
+    (cons arr ps)))
+(define (proc-free-argv m)
+  (for-each foreign-free (cdr m))
+  (foreign-free (car m)))
+
+;; binary ports over the raw pipe fds. EINTR is retried; any other read error
+;; reads as EOF (the child is gone and the pipe with it). A short write returns
+;; its count and Chez's port machinery re-calls for the rest.
+(define proc-fd-buf-size 32768)
+(define (proc-fd-input-port fd)
+  (let ((buf (foreign-alloc proc-fd-buf-size)))
+    (make-custom-binary-input-port
+      (string-append "process-fd-" (number->string fd))
+      (lambda (bv start n)
+        (let ((want (min n proc-fd-buf-size)))
+          (let retry ()
+            (let ((got (proc-c-read fd buf want)))
+              (cond
+                ((> got 0)
+                 (let loop ((i 0))
+                   (when (< i got)
+                     (bytevector-u8-set! bv (+ start i) (foreign-ref 'unsigned-8 buf i))
+                     (loop (+ i 1))))
+                 got)
+                ((= got 0) 0)
+                ((= (proc-errno) proc-EINTR) (retry))
+                (else 0))))))
+      #f #f
+      (lambda () (foreign-free buf) (proc-c-close fd)))))
+(define (proc-fd-output-port fd)
+  (let ((buf (foreign-alloc proc-fd-buf-size)))
+    (make-custom-binary-output-port
+      (string-append "process-fd-" (number->string fd))
+      (lambda (bv start n)
+        (let ((want (min n proc-fd-buf-size)))
+          (let loop ((i 0))
+            (when (< i want)
+              (foreign-set! 'unsigned-8 buf i (bytevector-u8-ref bv (+ start i)))
+              (loop (+ i 1))))
+          (let retry ()
+            (let ((wrote (proc-c-write fd buf want)))
+              (cond
+                ((>= wrote 0) wrote)
+                ((= (proc-errno) proc-EINTR) (retry))
+                (else (error 'process "write to child failed" fd)))))))
+      #f #f
+      (lambda () (foreign-free buf) (proc-c-close fd)))))
+
+;; What the API hands back for a stream that was INHERITED: the JVM's null
+;; streams. Reads are at EOF from the start; writes are accepted and dropped.
+(define (proc-null-input-port)
+  (open-bytevector-input-port (make-bytevector 0)))
+(define (proc-null-output-port)
+  (make-custom-binary-output-port "process-null" (lambda (bv start n) n) #f #f #f))
+
+;; The pipe fds are not close-on-exec (fcntl/ioctl are variadic, which the FFI
+;; cannot call safely on arm64), so a concurrent spawn's child could inherit
+;; them and hold a read end open past this child's exit. Exclusion by mutex
+;; instead: no other fd-level spawn runs between pipe() and posix_spawn.
+(define proc-spawn-fd-mutex (make-mutex))
+
+;; Spawn `/bin/sh -c sh-cmd` with fd-level stdio: an inherited stream gets no
+;; file action (the child keeps the parent's descriptor); the rest get pipes.
+;; Returns (values stdin-port stdout-port stderr-port pid), #f for inherited
+;; ends. attrp is NULL: signal mask and dispositions are inherited, matching
+;; the pipe path.
+(define (proc-spawn-fd-level sh-cmd inherit-in? inherit-out? inherit-err?)
+  (define (mk-pipe)
+    (let ((fds (foreign-alloc 8)))
+      (if (= 0 (proc-c-pipe fds))
+          (let ((p (cons (foreign-ref 'int fds 0) (foreign-ref 'int fds 4))))
+            (foreign-free fds) p)
+          (begin (foreign-free fds)
+                 (throw-jvm (quote java.io.IOException) "pipe: cannot allocate")))))
+  (with-mutex proc-spawn-fd-mutex
+    (let* ((in-p  (and (not inherit-in?)  (mk-pipe)))
+           (out-p (and (not inherit-out?) (mk-pipe)))
+           (err-p (and (not inherit-err?) (mk-pipe)))
+           (fa (foreign-alloc 128))
+           (pidbuf (foreign-alloc 8)))
+      (proc-fa-init fa)
+      (when in-p  (proc-fa-dup2 fa (car in-p) 0)
+                  (proc-fa-close fa (car in-p)) (proc-fa-close fa (cdr in-p)))
+      (when out-p (proc-fa-dup2 fa (cdr out-p) 1)
+                  (proc-fa-close fa (cdr out-p)) (proc-fa-close fa (car out-p)))
+      (when err-p (proc-fa-dup2 fa (cdr err-p) 2)
+                  (proc-fa-close fa (cdr err-p)) (proc-fa-close fa (car err-p)))
+      (let* ((argv (proc-marshal-argv (list "/bin/sh" "-c" sh-cmd)))
+             (envp (proc-marshal-argv
+                    (map (lambda (p) (string-append (car p) "=" (cdr p)))
+                         (all-env-pairs))))
+             (rc (proc-c-spawn pidbuf "/bin/sh" fa 0 (car argv) (car envp)))
+             (pid (foreign-ref 'int pidbuf 0)))
+        (proc-fa-destroy fa)
+        (foreign-free fa) (foreign-free pidbuf)
+        (proc-free-argv argv) (proc-free-argv envp)
+        ;; parent side: the child's pipe ends close unconditionally; on a failed
+        ;; spawn the parent ends close too, before the throw.
+        (when in-p  (proc-c-close (car in-p)))
+        (when out-p (proc-c-close (cdr out-p)))
+        (when err-p (proc-c-close (cdr err-p)))
+        (if (= rc 0)
+            (values (and in-p  (proc-fd-output-port (cdr in-p)))
+                    (and out-p (proc-fd-input-port (car out-p)))
+                    (and err-p (proc-fd-input-port (car err-p)))
+                    pid)
+            (begin
+              (when in-p  (proc-c-close (cdr in-p)))
+              (when out-p (proc-c-close (car out-p)))
+              (when err-p (proc-c-close (car err-p)))
+              (throw-jvm (quote java.io.IOException)
+                (string-append "posix_spawn failed (errno " (number->string rc) ")"))))))))
+
 ;; --- java.lang.Process -------------------------------------------------------
 ;; state: #(stdin-os stdout-is stderr-is pid exit-box cmd mutex stdout-port
 ;;          stdin-port inherit-latches signalled-box)
@@ -369,26 +551,47 @@
                        (if (string? (car cmd)) (car cmd) (jolt-str-render-one (car cmd)))
                        "\": error=2, No such file or directory")))
     (proc-ensure-reapable!)
-    (call-with-values
-      (lambda () (open-process-ports (proc-build-shell-command self) (buffer-mode block) #f))
-      (lambda (child-stdin child-stdout child-stderr pid)
-        (let* ((rin  (proc-pb-redir-in self))
-               (rout (proc-pb-redir-out self))
-               (rerr (proc-pb-redir-err self))
-               (inherit? (lambda (r) (and (proc-redirect? r) (eq? (proc-redirect-kind r) 'inherit))))
-               (latches (box '()))
-               (pst (vector (make-out-stream child-stdin)
-                            (make-in-stream child-stdout)
-                            (make-in-stream child-stderr)
-                            pid (box #f) (proc-pb-cmd self) (make-mutex)
-                            child-stdout child-stdin latches (box #f))))
-          ;; INHERIT emulation: pump between the pipe and jolt's own stdio. The
-          ;; output pumps are latched so waitFor can join them — INHERIT output
-          ;; must be flushed before the process is reported finished.
-          (when (inherit? rin)  (proc-pump (current-input-port) child-stdin #t))
-          (when (inherit? rout) (set-box! latches (cons (proc-pump child-stdout (current-output-port) #f) (unbox latches))))
-          (when (inherit? rerr) (set-box! latches (cons (proc-pump child-stderr (current-error-port) #f) (unbox latches))))
-          (make-jhost "process" pst))))))
+    (let* ((rin  (proc-pb-redir-in self))
+           (rout (proc-pb-redir-out self))
+           (rerr (proc-pb-redir-err self))
+           (inherit? (lambda (r) (and (proc-redirect? r) (eq? (proc-redirect-kind r) 'inherit)))))
+      (if (and proc-spawn-fd-ok?
+               (or (inherit? rin) (inherit? rout) (inherit? rerr)))
+          ;; fd-level INHERIT: the child writes the real descriptors directly,
+          ;; so anything jolt has buffered must land first to keep its order.
+          (begin
+            (guard (e (#t #f)) (flush-output-port (current-output-port)))
+            (guard (e (#t #f)) (flush-output-port (current-error-port)))
+            (call-with-values
+              (lambda () (proc-spawn-fd-level (proc-build-shell-command self)
+                                              (inherit? rin) (inherit? rout) (inherit? rerr)))
+              (lambda (cin cout cerr pid)
+                (let* ((child-stdin  (or cin  (proc-null-output-port)))
+                       (child-stdout (or cout (proc-null-input-port)))
+                       (child-stderr (or cerr (proc-null-input-port)))
+                       (pst (vector (make-out-stream child-stdin)
+                                    (make-in-stream child-stdout)
+                                    (make-in-stream child-stderr)
+                                    pid (box #f) (proc-pb-cmd self) (make-mutex)
+                                    child-stdout child-stdin (box '()) (box #f))))
+                  (make-jhost "process" pst)))))
+          (call-with-values
+            (lambda () (open-process-ports (proc-build-shell-command self) (buffer-mode block) #f))
+            (lambda (child-stdin child-stdout child-stderr pid)
+              (let* ((latches (box '()))
+                     (pst (vector (make-out-stream child-stdin)
+                                  (make-in-stream child-stdout)
+                                  (make-in-stream child-stderr)
+                                  pid (box #f) (proc-pb-cmd self) (make-mutex)
+                                  child-stdout child-stdin latches (box #f))))
+                ;; INHERIT emulation fallback (no posix_spawn FFI): pump between
+                ;; the pipe and jolt's own stdio. The output pumps are latched so
+                ;; waitFor can join them — INHERIT output must be flushed before
+                ;; the process is reported finished.
+                (when (inherit? rin)  (proc-pump (current-input-port) child-stdin #t))
+                (when (inherit? rout) (set-box! latches (cons (proc-pump child-stdout (current-output-port) #f) (unbox latches))))
+                (when (inherit? rerr) (set-box! latches (cons (proc-pump child-stderr (current-error-port) #f) (unbox latches))))
+                (make-jhost "process" pst))))))))
 
 ;; Block until the process exits, caching and returning the decoded status. Any
 ;; INHERIT output pumps are joined first, so all forwarded output has landed by

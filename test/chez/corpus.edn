@@ -120,6 +120,8 @@
   {:suite "deftype / IBlockingDeref" :label "timed deref of a 1-arity-only IDeref is a failed cast" :expected "[:cce :cce]" :actual "(do (deftype OBox [] clojure.lang.IDeref (deref [_] 1)) (deftype TOnly [] clojure.lang.IBlockingDeref (deref [_ ms tv] tv)) [(try (deref (->OBox) 5 :tv) (catch ClassCastException _ :cce)) (try (deref (->TOnly)) (catch ClassCastException _ :cce))])" :portability :jvm}
   {:suite "deftype / IPending" :label "realized? dispatches to the isRealized method" :expected "[false true]" :actual "(do (deftype Pend [v] clojure.lang.IPending (isRealized [_] v)) [(realized? (->Pend false)) (realized? (->Pend true))])" :portability :jvm}
   {:suite "reify / IPending" :label "realized? dispatches to the isRealized method" :expected "true" :actual "(realized? (reify clojure.lang.IPending (isRealized [_] true)))" :portability :jvm}
+  {:suite "compilation unit / top-level do" :label "defmacro then use in one top-level do" :expected "42" :actual "(do (defmacro cu-m [] 42) (cu-m))" :portability :jvm}
+  {:suite "compilation unit / top-level do" :label "a macro expanding to do unrolls into top-level forms" :expected "8" :actual "(do (defmacro cu-emit [] (quote (do (def cu-x 7) (def cu-y (+ cu-x 1))))) (cu-emit) cu-y)" :portability :jvm}
   ;; A reify that DECLARES clojure.lang.IFn is callable and answers ifn?/instance?
   ;; for it, like the JVM; fn? stays false (reify does not implement Fn). Calling
   ;; one already worked — only the predicates read false, so malli's :ifn schema
