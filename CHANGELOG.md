@@ -7,19 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-08-06
+
 ### Added
 
 - **`jolt.socket`: `java.net.Socket` / `ServerSocket` / `InetSocketAddress` /
   `InetAddress` over POSIX sockets** (`(require 'jolt.socket)` registers the
-  classes; IPv4, blocking I/O). Contributed in #542, hardened in the follow-up:
-  writes to a peer-closed socket throw `IOException` instead of silently
-  dropping (SIGPIPE guarded via `MSG_NOSIGNAL`/`SO_NOSIGPIPE`), `ServerSocket`
-  binds the wildcard address like Java (port 0 + `getLocalPort` report the
-  kernel-assigned port via `getsockname`), accepted sockets know their peer,
+  classes; IPv4, blocking I/O). Contributed by @allen-munsch in #542,
+  hardened in #543: writes to a peer-closed socket throw `IOException`
+  instead of silently dropping (SIGPIPE guarded via
+  `MSG_NOSIGNAL`/`SO_NOSIGPIPE`), `ServerSocket` binds the wildcard address
+  like Java (port 0 + `getLocalPort` report the kernel-assigned port via
+  `getsockname`), accepted sockets know their peer,
   `class`/`instance?`/`str` answer as the mirrored classes, and
   `InetAddress/getByName` resolves. Deliberate gaps are in
   `known-divergences.edn`: `available()` is 0, a recv error reads as EOF,
   connect timeouts are ignored.
+
+### Fixed
+
+- **`ProcessBuilder$Redirect/INHERIT` inherits the real file descriptors.**
+  A spawn with any INHERIT stream goes through `posix_spawn`: the child sees
+  the actual fd (`isatty` answers truthfully, stdin's read offset is shared
+  between children), pipes are built only for the streams that ask for one,
+  and the API returns null streams for the inherited ends like the JVM. Pump
+  emulation remains as the fallback where that FFI surface is unavailable.
+  (#541)
+- **A top-level macro call expanding to `do` unrolls into top-level forms**,
+  per Clojure's compilation-unit rule: each child compiles and evaluates
+  before the next, so a macro emitting `(do (require ...) (deftest ...))`
+  has the require in force when the `deftest` compiles. Previously only a
+  literal `(do ...)` unrolled; babashka.process's own suite loads exactly
+  this way.
 
 ## [0.6.5] - 2026-08-05
 
