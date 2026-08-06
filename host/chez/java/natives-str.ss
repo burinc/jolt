@@ -154,7 +154,7 @@
 (define c-iconv-open  (jolt-foreign-proc-safe "iconv_open" '(string string) 'void*))
 (define c-iconv-conv  (jolt-foreign-proc-safe "iconv" '(void* void* void* void* void*) 'size_t))
 (define c-iconv-close (jolt-foreign-proc-safe "iconv_close" '(void*) 'int))
-(define iconv-size-max (- (expt 2 (* 8 (foreign-sizeof 'size_t))) 1))
+(define iconv-size-max (- (expt 2 (* 8 (sa-foreign-sizeof 'size_t))) 1))
 
 ;; iconv_open, or #f when the host has no such charset. The descriptor must be
 ;; closed by the caller.
@@ -178,17 +178,17 @@
          (and cd
               (let* ((inlen (bytevector-length bv))
                      (outcap (+ 32 (* 4 (max inlen 1))))
-                     (inbuf (foreign-alloc (max inlen 1)))
-                     (outbuf (foreign-alloc outcap))
-                     (cells (foreign-alloc 32))
+                     (inbuf (sa-foreign-alloc (max inlen 1)))
+                     (outbuf (sa-foreign-alloc outcap))
+                     (cells (sa-foreign-alloc 32))
                      (result
                       (guard (e (#t #f))
                         (do ((i 0 (+ i 1))) ((= i inlen))
-                          (foreign-set! 'unsigned-8 inbuf i (bytevector-u8-ref bv i)))
-                        (foreign-set! 'void* cells 0 inbuf)
-                        (foreign-set! 'unsigned-64 cells 8 inlen)
-                        (foreign-set! 'void* cells 16 outbuf)
-                        (foreign-set! 'unsigned-64 cells 24 outcap)
+                          (sa-foreign-set! 'unsigned-8 inbuf i (bytevector-u8-ref bv i)))
+                        (sa-foreign-set! 'void* cells 0 inbuf)
+                        (sa-foreign-set! 'unsigned-64 cells 8 inlen)
+                        (sa-foreign-set! 'void* cells 16 outbuf)
+                        (sa-foreign-set! 'unsigned-64 cells 24 outcap)
                         (and (not (= iconv-size-max
                                      (c-iconv-conv cd cells (+ cells 8) (+ cells 16) (+ cells 24))))
                              ;; Then reset the descriptor to its initial state, which
@@ -200,11 +200,11 @@
                              ;; writes. Stateless charsets write nothing.
                              (begin (c-iconv-conv cd 0 0 (+ cells 16) (+ cells 24))
                                     #t)
-                             (let* ((n (- outcap (foreign-ref 'unsigned-64 cells 24)))
+                             (let* ((n (- outcap (sa-foreign-ref 'unsigned-64 cells 24)))
                                     (out (make-bytevector n)))
                                (do ((i 0 (+ i 1))) ((= i n) out)
-                                 (bytevector-u8-set! out i (foreign-ref 'unsigned-8 outbuf i))))))))
-                (foreign-free inbuf) (foreign-free outbuf) (foreign-free cells)
+                                 (bytevector-u8-set! out i (sa-foreign-ref 'unsigned-8 outbuf i))))))))
+                (sa-foreign-free inbuf) (sa-foreign-free outbuf) (sa-foreign-free cells)
                 (c-iconv-close cd)
                 result)))))
 

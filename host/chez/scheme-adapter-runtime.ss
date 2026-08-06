@@ -225,3 +225,109 @@
                   (loop (fx+ i 1)
                         (if (string? vn) (cons (cons vn v) acc) acc))))))
         #f)))
+
+;; ---- R7: ffi tier (capability: ffi) -----------------------------------------
+
+;; (sa-foreign-procedure name args res) -> foreign procedure
+;; SYNTAX: compile-time-typed foreign-procedure creation. (sa-foreign-procedure
+;; "f" (int) int) lowers to (foreign-procedure "f" (int) int) — the compiled
+;; (non-Windows) branch of jolt-foreign-proc-safe / proc-foreign-blocking, where
+;; the type signature is literal at the call site. Contract: build a foreign
+;; procedure for a statically-known signature. Degradation: none — a target
+;; expands this to its native foreign-procedure form.
+(define-syntax sa-foreign-procedure
+  (syntax-rules ()
+    ((_ name args res) (foreign-procedure name args res))))
+
+;; (sa-foreign-procedure-blocking name args res) -> foreign procedure
+;; SYNTAX: like sa-foreign-procedure, but the call is __collect_safe — a blocking
+;; foreign call must not freeze the stop-the-world collector process-wide (the
+;; R4-pinned blocking-FFI collect-safety semantic; process.ss's pipe pump depends
+;; on it). Contract: mark the call so a blocking foreign invocation does not stop
+;; other threads' GC. Degradation: a target whose collector never stops other
+;; threads may collapse this to plain sa-foreign-procedure.
+(define-syntax sa-foreign-procedure-blocking
+  (syntax-rules ()
+    ((_ name args res) (foreign-procedure __collect_safe name args res))))
+
+;; (sa-foreign-procedure-runtime name args res blocking?) -> foreign procedure | #f
+;; Construct a foreign procedure from a RUNTIME-known signature under the
+;; Windows-machine-type policy: eval the constructed (foreign-procedure ...) form
+;; (with __collect_safe when blocking?) rather than compiling it. On Windows a
+;; compiled foreign reference is a load-time fasl relocation that aborts the boot
+;; if the symbol is missing, before any guard runs, and petite cannot create FPs —
+;; the eval defers creation to a point where the caller has already proven the
+;; entry exists. Contract: create a foreign procedure for a runtime signature.
+;; Degradation: raise — callers only ask when sa-foreign-entry? has said yes.
+(define (sa-foreign-procedure-runtime name args res blocking?)
+  (eval (if blocking?
+            `(foreign-procedure __collect_safe ,name ,args ,res)
+            `(foreign-procedure ,name ,args ,res))))
+
+;; (sa-foreign-alloc n) -> pointer
+;; Allocate N raw bytes of foreign memory; the caller owns them and must release
+;; them with sa-foreign-free. Contract: malloc-style foreign allocation.
+;; Degradation: none — a target with the ffi capability provides it; without it,
+;; raise 'unsupported (jolt.ffi surfaces that as a clean jolt-level error).
+(define (sa-foreign-alloc n) (foreign-alloc n))
+
+;; (sa-foreign-free p) -> void
+;; Release foreign memory allocated by sa-foreign-alloc. Contract: free foreign
+;; memory. Degradation: none — see sa-foreign-alloc.
+(define (sa-foreign-free p) (foreign-free p))
+
+;; (sa-foreign-ref type addr off) -> value
+;; Typed read of one value at byte offset OFF of the foreign block at ADDR. The
+;; TYPE VOCABULARY is part of the contract: Chez's foreign type symbols (int,
+;; unsigned-8, void*, ...) — the values jolt.ffi's ffi-type->chez produces.
+;; Contract: the typed read. Degradation: none.
+(define (sa-foreign-ref type addr off) (foreign-ref type addr off))
+
+;; (sa-foreign-set! type addr off v) -> void
+;; Typed write of V at byte offset OFF of the foreign block at ADDR. Contract:
+;; the typed write. Degradation: none.
+(define (sa-foreign-set! type addr off v) (foreign-set! type addr off v))
+
+;; (sa-foreign-sizeof type) -> exact integer
+;; Size in bytes of a foreign type (struct layout, array allocation). Contract:
+;; the type's byte size. Degradation: none.
+(define (sa-foreign-sizeof type) (foreign-sizeof type))
+
+;; (sa-lock-object x) -> void
+;; Pin X against the collector while C holds a reference to it (the callable
+;; registry locks the code object behind a C-visible entry point). Contract: keep
+;; X address-stable and live. Degradation: a target whose collector never moves
+;; objects may no-op BOTH sa-lock-object and sa-unlock-object (say so in the doc);
+;; no-oping only one is a leak or a crash.
+(define (sa-lock-object x) (lock-object x))
+
+;; (sa-unlock-object x) -> void
+;; Release a sa-lock-object pin. Contract: undo the pin. Degradation: no-op
+;; exactly when sa-lock-object no-ops.
+(define (sa-unlock-object x) (unlock-object x))
+
+;; (sa-load-shared-object name-or-#f) -> void
+;; dlopen of the named shared object; #f = the running process's own symbols.
+;; Contract: make the object's symbols resolvable by name. Degradation: raise —
+;; and jolt.ffi/load-library must surface that as a clean jolt-level error, not a
+;; VM abort (verified on Chez: a missing library raises a guardable error and the
+;; jolt-level message is unchanged).
+(define (sa-load-shared-object name) (load-shared-object name))
+
+;; (sa-foreign-entry? name) -> boolean
+;; Does the named C entry resolve (in the process or a loaded object). Contract:
+;; an existence probe for C symbols. Degradation: #f for anything unresolved.
+(define (sa-foreign-entry? name) (foreign-entry? name))
+
+;; (sa-foreign-entry-address name) -> pointer
+;; The address of the named C entry — the embedded boot arrays' symbols in a
+;; built binary resolve through this (build-jolt.ss's emitted launcher). Contract:
+;; resolve a C symbol to its address. Degradation: raise — callers only ask for
+;; symbols they know exist.
+(define (sa-foreign-entry-address name) (foreign-entry name))
+
+;; (sa-foreign-callable-entry-point co) -> pointer
+;; A foreign-callable code object's C-visible entry-point address — what the
+;; callable registry hands to C. Contract: the entry address of a callable.
+;; Degradation: none.
+(define (sa-foreign-callable-entry-point co) (foreign-callable-entry-point co))

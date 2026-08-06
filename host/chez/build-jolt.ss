@@ -153,13 +153,13 @@
 ;; as C arrays) into the embedded-bytes store, so build-self-contained can spill
 ;; them. Done lazily on `build` only.
 (define (jolt-materialize-bundles!)
-  (load-shared-object #f)
-  (let ((memcpy (foreign-procedure \"memcpy\" (u8* uptr uptr) void*)))
+  (sa-load-shared-object #f)
+  (let ((memcpy (sa-foreign-procedure \"memcpy\" (u8* uptr uptr) void*)))
     (for-each
       (lambda (spec)
-        (let* ((len (foreign-ref 'unsigned-int (foreign-entry (caddr spec)) 0))
+        (let* ((len (sa-foreign-ref 'unsigned-int (sa-foreign-entry-address (caddr spec)) 0))
                (bv (make-bytevector len)))
-          (memcpy bv (foreign-entry (cadr spec)) len)
+          (memcpy bv (sa-foreign-entry-address (cadr spec)) len)
           (register-embedded-bytes! (car spec) bv)))
       '((\"csv/petite.boot\" \"jolt_petite_boot\" \"jolt_petite_boot_len\")
         (\"csv/scheme.boot\" \"jolt_scheme_boot\" \"jolt_scheme_boot_len\")

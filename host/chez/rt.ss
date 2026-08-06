@@ -59,13 +59,13 @@
        ;; both branches under a runtime os-family test.
        (with-syntax
            ((win #'(guard (e (#t #f))
-                   (load-shared-object #f)
-                   (and (foreign-entry? name)
-                        (eval `(foreign-procedure ,name ,'args ,'res)))))
+                   (sa-load-shared-object #f)
+                   (and (sa-foreign-entry? name)
+                        (sa-foreign-procedure-runtime name (quote args) (quote res) #f))))
             (unx #'(guard (e (#t #f))
-                   (load-shared-object #f)
-                   (and (foreign-entry? name)
-                        (foreign-procedure name args res)))))
+                   (sa-load-shared-object #f)
+                   (and (sa-foreign-entry? name)
+                        (sa-foreign-procedure name args res)))))
          #'(if (eq? (sa-os-family) 'windows) win unx))))))
 
 ;; --- how many processors can this process use ---------------------------------
@@ -1013,14 +1013,16 @@
 ;; that aborts the boot outright if the symbol is missing, before any guard runs.
 (define (entropy-open-windows)
   (guard (e (#t #f))
-    (or (and (guard (e2 (#t #f)) (load-shared-object "bcrypt.dll") #t)
-             (foreign-entry? "BCryptGenRandom")
-             (let ((f (eval '(foreign-procedure "BCryptGenRandom"
-                                                (void* u8* unsigned-32 unsigned-32) int))))
+    (or (and (guard (e2 (#t #f)) (sa-load-shared-object "bcrypt.dll") #t)
+             (sa-foreign-entry? "BCryptGenRandom")
+             (let ((f (sa-foreign-procedure-runtime "BCryptGenRandom"
+                                                    '(void* u8* unsigned-32 unsigned-32)
+                                                    'int #f)))
                (lambda (bv n) (fx=? 0 (f 0 bv n 2)))))
-        (and (guard (e2 (#t #f)) (load-shared-object "advapi32.dll") #t)
-             (foreign-entry? "SystemFunction036")
-             (let ((f (eval '(foreign-procedure "SystemFunction036" (u8* unsigned-32) boolean))))
+        (and (guard (e2 (#t #f)) (sa-load-shared-object "advapi32.dll") #t)
+             (sa-foreign-entry? "SystemFunction036")
+             (let ((f (sa-foreign-procedure-runtime "SystemFunction036"
+                                                    '(u8* unsigned-32) 'boolean #f)))
                (lambda (bv n) (f bv n)))))))
 
 (define (jolt-entropy-source)

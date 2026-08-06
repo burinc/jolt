@@ -559,7 +559,7 @@
                                    archive "' -o '" so "'")
                     (string-append "cc -shared -Wl,--whole-archive '" archive
                                    "' -Wl,--no-whole-archive -Wl,--unresolved-symbols=ignore-all -o '" so "'")))
-              (load-shared-object so)))))
+              (sa-load-shared-object so)))))
       (seq->list natives))))
 
 (define (bld-one-static-link form)
