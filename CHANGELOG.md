@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-08-06
+
+### Added
+
+- **Portability groundwork for #446** — a general Scheme layer with the
+  Chez-specific bits isolated. Every Chez-only identifier the host uses is
+  now either in the documented adapter contract (`host/scheme-adapter/`) or
+  routed through `sa-*` capability entry points
+  (`host/chez/scheme-adapter-runtime.ss`), enforced by new ci gates
+  (`portcheck`, `adaptercheck`, `degradedbacktrace`). Capability tiers
+  (threads / ffi / introspect / native-compile) make a WASM-class target
+  definable; the threads-tier audit behind this produced the concurrency
+  fixes above. No user-facing behavior change otherwise.
+
+- **`jolt.socket`: `java.net.Socket` / `ServerSocket` / `InetSocketAddress` /
+  `InetAddress` over POSIX sockets** (`(require 'jolt.socket)` registers the
+  classes; IPv4, blocking I/O). Contributed by @allen-munsch in #542,
+  hardened in #543: writes to a peer-closed socket throw `IOException`
+  instead of silently dropping (SIGPIPE guarded via
+  `MSG_NOSIGNAL`/`SO_NOSIGPIPE`), `ServerSocket` binds the wildcard address
+  like Java (port 0 + `getLocalPort` report the kernel-assigned port via
+  `getsockname`), accepted sockets know their peer,
+  `class`/`instance?`/`str` answer as the mirrored classes, and
+  `InetAddress/getByName` resolves. Deliberate gaps are in
+  `known-divergences.edn`: `available()` is 0, a recv error reads as EOF,
+  connect timeouts are ignored.
+
 ### Fixed
 
 - The install script honors `PREFIX` (`PREFIX=~/.local bash install` puts the
@@ -27,37 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restart"` instead of returning normally. Entering the wait on an
   already-failed agent matches the JVM exactly; an agent failing mid-wait
   throws where the JVM blocks forever (deliberate; `known-divergences.edn`).
-
-### Added
-
-- **Portability groundwork for #446** — a general Scheme layer with the
-  Chez-specific bits isolated. Every Chez-only identifier the host uses is
-  now either in the documented adapter contract (`host/scheme-adapter/`) or
-  routed through `sa-*` capability entry points
-  (`host/chez/scheme-adapter-runtime.ss`), enforced by new ci gates
-  (`portcheck`, `adaptercheck`, `degradedbacktrace`). Capability tiers
-  (threads / ffi / introspect / native-compile) make a WASM-class target
-  definable; the threads-tier audit behind this produced the concurrency
-  fixes above. No user-facing behavior change otherwise.
-
-## [0.6.6] - 2026-08-06
-
-### Added
-
-- **`jolt.socket`: `java.net.Socket` / `ServerSocket` / `InetSocketAddress` /
-  `InetAddress` over POSIX sockets** (`(require 'jolt.socket)` registers the
-  classes; IPv4, blocking I/O). Contributed by @allen-munsch in #542,
-  hardened in #543: writes to a peer-closed socket throw `IOException`
-  instead of silently dropping (SIGPIPE guarded via
-  `MSG_NOSIGNAL`/`SO_NOSIGPIPE`), `ServerSocket` binds the wildcard address
-  like Java (port 0 + `getLocalPort` report the kernel-assigned port via
-  `getsockname`), accepted sockets know their peer,
-  `class`/`instance?`/`str` answer as the mirrored classes, and
-  `InetAddress/getByName` resolves. Deliberate gaps are in
-  `known-divergences.edn`: `available()` is 0, a recv error reads as EOF,
-  connect timeouts are ignored.
-
-### Fixed
 
 - **`ProcessBuilder$Redirect/INHERIT` inherits the real file descriptors.**
   A spawn with any INHERIT stream goes through `posix_spawn`: the child sees
