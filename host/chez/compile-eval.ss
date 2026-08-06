@@ -388,6 +388,30 @@
          (and (symbol-t? h) (jolt-nil? (hc-sym-ns h))
               (string=? (symbol-t-name h) "do")))))
 
+;; Clojure's compilation-unit rule applies to a top-level MACRO CALL too: the
+;; form is macroexpanded first, and when the expansion lands on (do ...) its
+;; children are compiled+evaluated as their own top-level forms — that is how a
+;; macro can emit (do (require …) (deftest …)) with the require in force before
+;; the deftest compiles. The expansion here is a PROBE: a non-do expansion is
+;; discarded and the ORIGINAL form goes to the analyzer unchanged (its macro
+;; arm re-expands, keeping def position stamping and the rest of that path), so
+;; only forms that really unroll take this route. Special-form heads never
+;; expand, mirroring analyze-list's precedence; an expander that throws is the
+;; analyzer's to report, with its source position.
+(define (ce-expand-to-top-do form ns)
+  (let ((ctx (make-analyze-ctx ns)))
+    (let loop ((f form) (n 0))
+      (cond
+        ((> n 100) #f)                    ; runaway expansion; leave it to the analyzer
+        ((ce-top-do? f) f)
+        ((and (cseq? f) (cseq-list? f)
+              (let ((h (seq-first f)))
+                (and (symbol-t? h)
+                     (not (hc-special? (symbol-t-name h)))
+                     (hc-macro? ctx h))))
+         (loop (guard (e (#t #f)) (hc-expand-1 ctx f)) (+ n 1)))
+        (else #f)))))
+
 ;; Compile + eval ONE already-read form in compile ns `ns`; returns the value.
 ;; A top-level (do ...) is UNROLLED — each subform compiled+eval'd in turn, like
 ;; Clojure's top-level do — so a runtime defmacro/def in an earlier subform is
@@ -413,6 +437,19 @@
            result
            (let ((r (jolt-compile-eval-form (car fs) cur)))
              (loop (cdr fs) r (chez-current-ns))))))
+    ;; a macro call whose expansion is a (do ...): unroll the expansion the same
+    ;; way (each child re-enters, so nested macro-to-do chains unroll too). The
+    ;; children are macro-built and carry no reader position, so each list child
+    ;; without one inherits the call form's — an error in a child (an ns form's
+    ;; failing :require, say) must still point at the form in the source file.
+    ((ce-expand-to-top-do form ns)
+     => (lambda (expansion)
+          (jolt-compile-eval-form
+            (apply jolt-list
+                   (cons (seq-first expansion)
+                         (map (lambda (c) (hc-propagate-pos form c))
+                              (cdr (seq->list expansion)))))
+            ns)))
     ;; defmacro is compiled like any other form — the analyzer lowers it to a def
     ;; of the expander fn + (mark-macro! …) so subsequent forms expand it. One
     ;; macro-expansion path (no separate spine interception).
