@@ -1,0 +1,120 @@
+# host/chez/portability-blocklist.txt — Chez-only identifiers the host may not use
+# directly. Rounds R2-R9 of the portable-scheme-layer epic move each tier behind
+# host/scheme-adapter/chez.ss; the allowlist (portability-allowlist.txt) shrinks to
+# empty as they do, and this file grows with what the census finds.
+#
+# Format: one identifier per line, tiers are "# tier: <name>" headers. A tier whose
+# name starts with "srfi-" is linted but wholesale-allowlisted: the census counts
+# it, the gate never fails on it (parameterize/make-parameter are SRFI-39 — present
+# in every serious Scheme, not worth per-file allowlist lines while R2+ decides
+# their migration).
+#
+# R6RS check: every entry is non-R6RS, OR an R6RS-library member whose host call
+# shape is Chez-flavored and owned by a later round (noted inline). Verified-still
+# standard names are dropped rather than listed: make-eq-hashtable, make-eqv-
+# hashtable, symbol-hashtable?, list-sort, vector-sort, vector-sort!, guard,
+# string-copy!, time-second, time-nanosecond, eval, environment, exit,
+# command-line, condition-continuation, make-continuation-condition,
+# continuation-condition?, and the fx/fl/bytevector/vector/string R6RS arithmetic
+# are all standard R6RS and deliberately absent. `exit`/`eval` are standard, but
+# the host's Chez-ENV-SPECIFIER call sites ((environment '(chezscheme))) are real
+# migration work — tracked by R8, not by this gate.
+#
+# tier: ffi
+foreign-procedure
+foreign-alloc
+foreign-ref
+foreign-set!
+foreign-sizeof
+foreign-free
+foreign-entry
+foreign-callable
+lock-object
+unlock-object
+#
+# tier: threads
+fork-thread
+make-mutex
+with-mutex
+mutex-acquire
+mutex-release
+make-condition
+condition-wait
+condition-signal
+condition-broadcast
+make-thread-parameter
+get-thread-id
+#
+# tier: eval/compile
+compile
+compile-to-file
+compile-file
+compile-whole-program
+make-boot-file
+interaction-environment
+top-level-value
+set-top-level-value!
+top-level-bound?
+expand
+current-eval
+sc-expand
+#
+# tier: fasl/image
+fasl-write
+fasl-read
+fasl-file
+#
+# tier: introspect
+inspect
+inspect/object
+#
+# tier: system
+getenv
+putenv
+abort
+current-time    # rnrs (rnrs time) member, but the host calls it ZERO-ARG, which is
+                # Chez-only (R6RS requires a time-type argument) — R3 owns it
+cpu-time
+real-time
+sleep
+system
+open-process-ports
+collect
+collect-request-handler
+bytes-allocated
+collect-maximum-generation
+#
+# tier: misc
+gensym
+format
+printf
+fprintf
+pretty-print
+void
+box
+unbox
+set-box!
+add1
+sub1
+fxvector
+make-fxvector
+iota
+last-pair
+list-head
+list-copy
+sort
+sort!
+vector-copy
+vector-append
+date-and-time
+record-writer
+hashtable-values
+hashtable-cells
+#
+# tier: chez-unsafe
+$primitive  # reader artifact for #3%/#% unsafe-primitive syntax — files that use
+            # Chez's unsafe primitives appear in the census here
+#
+# tier: srfi-portable
+parameterize
+make-parameter
