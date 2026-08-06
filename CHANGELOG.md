@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-08-05
+
+Images now carry the two things 0.6.3 refused: anonymous functions and
+sorted collections. Open resources stub instead of refusing. Image format
+is now v2 — older runtimes refuse a v2 image with the reason named. (#539)
+
+### Added
+
+- **Anonymous functions travel in images.** A `fn` literal is compiled under
+  a stable name with its source form and free names registered at load time;
+  the dump records the source plus the captured values (recovered live from
+  the closure), and restore rebuilds a callable closure in the defining
+  namespace. Captures optimized into the compiled code refuse at dump,
+  naming the local — never a closure that silently computes with `nil`.
+- **Sorted maps and sets travel in images**, restored through the public
+  constructors with the original comparator (natural or user-supplied).
+- **Open resources dump as resolvable stubs.** `dump-world!` stubs
+  unwritable values (ports, threads, sockets) by default and reports them
+  under `:stubbed`; `dump!` stays strict unless `{:unwritable :stub}`.
+  After restore, `jolt.image/stubs` lists what needs rebuilding, inert until
+  `resolve-stub!` replaces one; `register-stub-describer!` /
+  `register-stub-resolver!` extend both ends. `scan` reports each value's
+  `:disposition` so the split is visible before writing.
+
+### Fixed
+
+- Timed `(deref ref timeout-ms timeout-val)` on a record or reify
+  implementing `IBlockingDeref` reaches the 3-arity method instead of
+  silently blocking on the one-arity; a `deref` method existing only at the
+  other arity throws the JVM's `ClassCastException` naming the interface.
+  (#537, #540, fixes #538)
+- `realized?` dispatches to a record or reify `isRealized` method
+  (`clojure.lang.IPending`). (#540)
+
+### Conformance
+
+- mount (application state lifecycle) passes its full suite — 21 tests,
+  131 assertions, matching JVM Clojure exactly — and joins the
+  libconformance fleet. (#540)
+
 ## [0.6.4] - 2026-08-05
 
 ### Changed
