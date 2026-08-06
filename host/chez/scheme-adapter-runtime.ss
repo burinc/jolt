@@ -21,7 +21,12 @@
 ;; rt.ss:51 and process.ss:338 are MACROS that resolve sa-os-family at
 ;; expansion time. PSL R5+R6 pinned this order; the R3 comment claiming
 ;; "second, after rt.ss" is obsolete.
-(import (chezscheme))
+;; NO (import (chezscheme)) here: this file is INLINED into the flat runtime
+;; (bld-runtime-manifest, and again via rt.ss's own load) — a mid-program
+;; import re-exposes Chez's error/warning bindings over rt.ss's %chez-error
+;; shadowing and turned compile warnings fatal in standalone `jolt build`
+;; (the bare-directory smoke caught it). Runtime files never import; the
+;; top level already sees (chezscheme), including under chez --script.
 
 ;; (sa-run-process cmd transcoder) -> (values stdin stdout stderr pid)
 ;; Spawn CMD (a shell string) with block buffering and the given transcoder
