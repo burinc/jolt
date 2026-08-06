@@ -144,7 +144,10 @@
 (check-eq "getByName class" (.getName (class (java.net.InetAddress/getByName "localhost"))) "java.net.Inet4Address")
 (let [isa (java.net.InetSocketAddress. "127.0.0.1" 8080)]
   (check-eq "isa port" (.getPort isa) 8080)
-  (check-eq "isa host" (.getHostName isa) "127.0.0.1")
+  ;; getHostString, not getHostName: the JVM reverse-resolves a literal to
+  ;; "localhost" (nameservice-dependent); getHostString answers the literal
+  ;; on both. jolt's getHostName skips the reverse lookup — known divergence.
+  (check-eq "isa host" (.getHostString isa) "127.0.0.1")
   (check-eq "isa getAddress" (.getHostAddress (.getAddress isa)) "127.0.0.1"))
 
 ;; no-arg Socket + .connect(endpoint)

@@ -348,6 +348,16 @@
    :jvm "aborts with SocketTimeoutException after 5000 ms"
    :jolt "blocks until the OS-level connect resolves"
    :note "A timed connect needs non-blocking mode + poll; not modeled. The no-timeout arity behaves identically on both."}
+  ;; getHostName does no reverse lookup. The JVM reverse-resolves a
+  ;; literal-address InetSocketAddress ("127.0.0.1" answers "localhost" when
+  ;; the nameservice maps it), which makes its value machine-dependent —
+  ;; the same reason the locale rows are uncertifiable. getHostString answers
+  ;; the literal on both and is the portable accessor.
+  {:category :host-model
+   :behavior "(.getHostName (java.net.InetSocketAddress. \"127.0.0.1\" 80)) — requires (require 'jolt.socket)"
+   :jvm "\"localhost\" — reverse lookup through the nameservice (machine-dependent)"
+   :jolt "\"127.0.0.1\" — the literal; no reverse lookup"
+   :note "Reverse DNS would need getnameinfo and makes the answer environment-dependent; the JVM's own javadoc flags the lookup. Use .getHostString for the literal on both. Caught certifying test/chez/socket-test.clj against the JVM."}
   ;; InetSocketAddress.toString is host:port; the JVM renders hostname/ip:port.
   {:category :host-model
    :behavior "(str (java.net.InetSocketAddress. \"127.0.0.1\" 80)) — requires (require 'jolt.socket)"
