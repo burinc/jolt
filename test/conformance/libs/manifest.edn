@@ -303,6 +303,19 @@
    :paths ["src" "test"]
    :expect {:tests 28 :pass 59 :fail 0 :error 0}}
 
+  ;; the jolt-lang/mount sibling checkout: upstream tolitius/mount with the
+  ;; datomic + tools.nrepl TEST dependencies replaced by local stand-ins (the
+  ;; library source itself is unchanged). Preloading mount.test puts the suite
+  ;; in :cljc mode, which the .cljc tests assume; the var/* tests flip to :clj
+  ;; mode around themselves. The tapp config loads from a CWD-relative path,
+  ;; hence :dir.
+  {:name "mount"
+   :paths ["~mount/src" "~mount/test/core" "~mount/test/clj"]
+   :test-paths ["~mount/test/core" "~mount/test/clj"]
+   :dir "~mount"
+   :preload ["mount.test"]
+   :expect {:tests 21 :pass 131 :fail 0 :error 0}}
+
   {:name "malli"
    :paths ["src" "resources" "test"]
    :deps ["~time/src" "@spec.alpha/src/main/clojure"
