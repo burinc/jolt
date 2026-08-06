@@ -686,6 +686,24 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.socket — the java.net.Socket/ServerSocket surface over real loopback TCP
+# (roundtrip, EOF, broken pipe, ephemeral ports, class model). Self-checks, one marker.
+# stderr goes into the capture: a run that dies before its first check must leave
+# the exception, not an empty log.
+sock_out="$($jolt run test/chez/socket-test.clj 2>&1)"
+if printf '%s' "$sock_out" | grep -q 'SOCKET-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.socket"
+  if printf '%s\n' "$sock_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$sock_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$sock_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$sock_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # jolt.process — the stdlib sub-process API against real programs (capture, pipes,
 # stdin, :dir/:env, exit codes, signals). The file self-checks and prints a marker.
 #
