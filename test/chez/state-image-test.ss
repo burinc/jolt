@@ -766,6 +766,18 @@
 (close-port stub-port)
 (delete-file stub-probe-file)
 
+;; --- PSL R4: cross-version restore — a v0.6.5-made world image holding a ref
+;; and an atom must restore against today's runtime. jolt-ref-v1's field list is
+;; image-format surface (refs travel as raw nongenerative records), so a layout
+;; change fails HERE, not in someone's app at restore time. The proper
+;; versioned-reconstruction fix is bead jolt-867l.11; this pins the regression
+;; until it lands.
+(ok "v0.6.5 fixture present" (file-exists? "test/chez/fixtures/image-v0.6.5-ref-atom.image"))
+(jolt-image-restore-world! "test/chez/fixtures/image-v0.6.5-ref-atom.image")
+(is "v0.6.5 fixture: imgtest/plain" "imgtest/plain" "7")
+(is "v0.6.5 fixture: imgtest/my-atom deref" "(deref imgtest/my-atom)" "42")
+(is "v0.6.5 fixture: imgtest/my-ref deref" "(deref imgtest/my-ref)" "99")
+
 (cleanup!)
 (when (file-exists? (string-append tmp ".txt")) (delete-file (string-append tmp ".txt")))
 

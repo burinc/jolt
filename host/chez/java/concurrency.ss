@@ -392,9 +392,11 @@
   (when (jolt-in-agent-action?)
     (jolt-throw (jolt-host-throwable "java.lang.Exception" "Can't await in agent action"))))
 ;; An already-failed agent rejects the await like it rejects a send — the JVM's
-;; await dispatches a latch action to each agent and the send throws. (An agent
-;; that fails DURING the await returns once the queue halts — friendlier than
-;; the JVM, whose latch action never runs so await blocks forever.)
+;; await dispatches a latch action to each agent and the send throws (verified
+;; against JVM Clojure 1.12). The same throw fires when an agent fails DURING
+;; the wait: the loop below exits on the failure broadcast (the worker halts and
+;; broadcasts), and the post-loop check re-throws — (await a) / (await-for ms a)
+;; never return normally on a failed agent.
 (define (jolt-agent-failed-throw a)
   (jolt-throw (jolt-host-throwable "java.lang.RuntimeException"
                                    "Agent is failed, needs restart"
@@ -406,8 +408,12 @@
       (with-mutex (jolt-agent-mu a)
         (unless (jolt-nil? (jolt-agent-err a)) (jolt-agent-failed-throw a))
         (let loop ()
-          (when (or (jolt-agent-running? a) (not (jagent-q-empty? a)))
-            (condition-wait (jolt-agent-cv a) (jolt-agent-mu a)) (loop)))))
+          (when (and (jolt-nil? (jolt-agent-err a))
+                     (or (jolt-agent-running? a) (not (jagent-q-empty? a))))
+            (condition-wait (jolt-agent-cv a) (jolt-agent-mu a)) (loop)))
+        ;; the agent failed while we waited (worker halted + broadcast): the JVM
+        ;; throws on a failed agent, so re-check rather than returning normally.
+        (unless (jolt-nil? (jolt-agent-err a)) (jolt-agent-failed-throw a))))
     agents)
   jolt-nil)
 (define (jolt-agent-await-for ms . agents)
@@ -422,11 +428,19 @@
           (with-mutex (jolt-agent-mu a)
             (unless (jolt-nil? (jolt-agent-err a)) (jolt-agent-failed-throw a))
             (let loop ()
-              (when (or (jolt-agent-running? a) (not (jagent-q-empty? a)))
+              (when (and (jolt-nil? (jolt-agent-err a))
+                         (or (jolt-agent-running? a) (not (jagent-q-empty? a))))
                 (if (condition-wait (jolt-agent-cv a) (jolt-agent-mu a) deadline)
                     (loop)
-                    (when (or (jolt-agent-running? a) (not (jagent-q-empty? a)))
-                      (set! ok #f))))))))
+                    ;; re-check the drain predicate on a wakeup-at-deadline race:
+                    ;; a drain that completed as the deadline hit is not a timeout
+                    (when (and (jolt-nil? (jolt-agent-err a))
+                               (or (jolt-agent-running? a) (not (jagent-q-empty? a))))
+                      (set! ok #f)))))
+            ;; failure during the wait throws (JVM parity); only a clean drain or
+            ;; a genuine timeout returns.
+            (unless (or (not ok) (jolt-nil? (jolt-agent-err a)))
+              (jolt-agent-failed-throw a)))))
       agents)
     ok))
 
@@ -684,16 +698,38 @@
 ;; objects. dynamic-wind releases on normal, exceptional, and continuation exit.
 (define monitor-table (make-weak-eq-hashtable))
 (define monitor-table-lock (make-mutex))
+;; A monitor is REENTRANT per thread, like a JVM intrinsic lock: a nested
+;; (locking x ...) on the same object from the same thread re-enters instead
+;; of deadlocking on the non-recursive Chez mutex. State: #(mutex owner count),
+;; owner being the thread's interrupt box (current-interrupt-box) — the same
+;; identity the ReentrantLock uses, so it is safe under fork-inheritance.
 (define (object-monitor obj)
   (with-mutex monitor-table-lock
     (or (hashtable-ref monitor-table obj #f)
-        (let ((m (make-mutex))) (hashtable-set! monitor-table obj m) m))))
+        (let ((m (vector (make-mutex) #f 0)))
+          (hashtable-set! monitor-table obj m) m))))
+(define (monitor-enter! m)
+  (let ((me (current-interrupt-box)))
+    (if (eq? (vector-ref m 1) me)
+        (vector-set! m 2 (fx+ (vector-ref m 2) 1))
+        (begin (mutex-acquire (vector-ref m 0))
+               (vector-set! m 1 me)
+               (vector-set! m 2 1)))))
+(define (monitor-exit! m)
+  (let ((me (current-interrupt-box)))
+    (unless (eq? (vector-ref m 1) me)
+      (jolt-throw (jolt-host-throwable "java.lang.IllegalMonitorStateException"
+                                       "not lock owner")))
+    (vector-set! m 2 (fx- (vector-ref m 2) 1))
+    (when (fx=? 0 (vector-ref m 2))
+      (vector-set! m 1 #f)
+      (mutex-release (vector-ref m 0)))))
 (define (jolt-with-monitor obj thunk)
   (let ((m (object-monitor obj)))
     (dynamic-wind
-      (lambda () (mutex-acquire m))
+      (lambda () (monitor-enter! m))
       thunk
-      (lambda () (mutex-release m)))))
+      (lambda () (monitor-exit! m)))))
 (def-var! "jolt.host" "with-monitor" jolt-with-monitor)
 
 ;; The bare halves of the same monitor, for the (monitor-enter x) /
@@ -703,10 +739,10 @@
 ;; mutex `locking` uses, and the two compose. Both yield nil: the JVM emits a
 ;; NIL after the monitor op rather than the object.
 (define (jolt-monitor-enter obj)
-  (mutex-acquire (object-monitor obj))
+  (monitor-enter! (object-monitor obj))
   jolt-nil)
 (define (jolt-monitor-exit obj)
-  (mutex-release (object-monitor obj))
+  (monitor-exit! (object-monitor obj))
   jolt-nil)
 (def-var! "jolt.host" "monitor-enter" jolt-monitor-enter)
 (def-var! "jolt.host" "monitor-exit" jolt-monitor-exit)
@@ -900,6 +936,7 @@
       (let spawn ((k n-workers))
         (when (> k 0)
           (fork-thread (lambda ()
+            (*txn* #f)      ; worker must not inherit the creating thread's txn
             (let loop ()
               (let ((job (with-mutex (vector-ref st 2)
                            (let poll ()

@@ -22,6 +22,59 @@
 # SRFI-18 basis (threads, mutexes, conditions). make-thread-parameter follows
 # the SRFI-39 parameter discipline that R6RS parameterize/make-parameter
 # establish. get-thread-id returns the current thread object.
+#
+# GET-THREAD-ID IS A NUMBER, DISTINCT PER LIVE THREAD (PSL R4, pinned): Chez
+# returns a fixnum id. Host code multiplies it into the random seed
+# (rt.ss:967) and keys an eqv?-hashtable by it (lazy-bridge.ss live-threads);
+# no site assumes ordering. A target whose native thread ids are objects must
+# map them to a numeric per-thread id for this contract name.
+#
+# CONDITION-WAIT MAY WAKE SPURIOUSLY (PSL R4, pinned): every host wait site
+# re-checks its predicate in a loop (each site recorded in the R4 table);
+# targets need not suppress spurious wakeups.
+#
+# THREAD-PARAMETER FORK-INHERITANCE (PSL R4, pinned): a thread created with
+# fork-thread starts with the CREATING thread's CURRENT values of every
+# thread parameter (the SRFI-18 semantic, and Chez's). The host depends on
+# this in two directions and a target adapter must reproduce it:
+#   - dyn-binding-stack (dyn-binding.ss): binding conveyance into futures,
+#     agents, go blocks, and async callbacks. future/go/Thread.start/
+#     executor forks ALSO re-install an explicit snapshot, but the
+#     agent-worker forks (concurrency.ss:305, 467), the tap delivery thread
+#     (concurrency.ss:530), and the async put!/take! callback forks
+#     (async.ss:480-482, 490, 492) rely on inheritance ALONE — fresh-default
+#     fork semantics would silently drop the creating thread's dynamic
+#     bindings there.
+#   - *txn* (refs.ss): the STM transaction record. Twelve fork bodies clear
+#     it with an explicit (*txn* #f) because a child would otherwise inherit
+#     the parent's in-flight transaction; the clears are written under (and
+#     document) the inheritance model. R4 added the executor-worker clear
+#     (concurrency.ss:902): a pool created inside a dosync forked workers
+#     holding the stale txn record, so a job calling ref-set outside a txn
+#     silently wrote into the dead log (never committed) instead of throwing
+#     IllegalStateException like the JVM.
+# A parameter used with the OPPOSITE assumption (fresh default per thread,
+# worked around the inheritance — thread-interrupt-cell in
+# host-static-methods.ss, random-seeded? in rt.ss, *agent-nested* in
+# concurrency.ss) defends itself with an owner-identity check or an explicit
+# reset at use, so those work under either model; they are noted per file in
+# the R4 table, not re-pinned here.
+#
+# ThreadLocal (host-static-classes.ss:1195) is the one opposite-direction
+# parameter that does NOT defend: under fork-inheritance a child inherits the
+# parent's SET value instead of re-running its init-thunk (the JVM always
+# yields a fresh value per thread). Accepted divergence, documented in the R4
+# table; a fresh-default-per-thread target reproduces JVM ThreadLocal exactly.
+#
+# MUTEXES ARE NON-RECURSIVE (PSL R4, pinned): same-thread re-acquire blocks,
+# per SRFI-18 mutex-acquire!. No host site re-acquires: re-entrant entry is
+# handled structurally — nested dosync joins the outer transaction through
+# the *txn* thread parameter (jolt-sync, refs.ss:159-161) and atom/ref/user
+# callbacks are never invoked under a held lock (atoms.ss swap! runs f and
+# watches outside the CAS lock; refs.ss fires watches after commit, outside
+# stm-lock). A target whose mutexes are recursive must still satisfy every
+# contract name with the non-recursive discipline, since host code relies on
+# re-entrance NOT being recursion.
 fork-thread
 make-mutex
 mutex-acquire

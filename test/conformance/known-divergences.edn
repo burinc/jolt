@@ -358,6 +358,18 @@
    :jvm "\"localhost\" — reverse lookup through the nameservice (machine-dependent)"
    :jolt "\"127.0.0.1\" — the literal; no reverse lookup"
    :note "Reverse DNS would need getnameinfo and makes the answer environment-dependent; the JVM's own javadoc flags the lookup. Use .getHostString for the literal on both. Caught certifying test/chez/socket-test.clj against the JVM."}
+  ;; An agent that FAILS while an await is parked on it: the JVM's latch
+  ;; count-down action sits in the failed agent's halted queue and never runs,
+  ;; so JVM await blocks forever (a known JVM wart). jolt throws the same
+  ;; "Agent is failed, needs restart" it throws for an await ENTERED on a
+  ;; failed agent (that entry case IS JVM parity). Deliberate: an error beats
+  ;; an unbounded hang, and previously jolt returned normally — which read as
+  ;; success. PSL R4; pinned by stm-test.clj's agent-await-midfail checks.
+  {:category :concurrency-model
+   :behavior "(await a) while a fails mid-wait"
+   :jvm "blocks forever (the failed agent never runs the latch action)"
+   :jolt "throws RuntimeException \"Agent is failed, needs restart\""
+   :note "await entered on an ALREADY-failed agent throws identically on both. jolt returning normally (pre-R4) was the silent-success worst case."}
   ;; InetSocketAddress.toString is host:port; the JVM renders hostname/ip:port.
   {:category :host-model
    :behavior "(str (java.net.InetSocketAddress. \"127.0.0.1\" 80)) — requires (require 'jolt.socket)"
