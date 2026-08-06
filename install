@@ -8,7 +8,18 @@ set -euo pipefail
 
 version=""
 checksum=""
-default_install_dir="/usr/local/bin"
+# Destination precedence mirrors the Makefile (PREFIX ?= root ? /usr/local :
+# ~/.local): an explicit --dir wins; else $PREFIX/bin when PREFIX is set; else
+# /usr/local/bin for root and ~/.local/bin for everyone else — a plain
+# `curl | bash` must never need sudo.
+if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    default_install_dir="/usr/local/bin"
+else
+    default_install_dir="$HOME/.local/bin"
+fi
+if [[ -n "${PREFIX:-}" ]]; then
+    default_install_dir="${PREFIX%/}/bin"
+fi
 install_dir="$default_install_dir"
 download_dir=""
 
@@ -22,7 +33,8 @@ print_help() {
     echo "  install [--dir <dir>] [--download-dir <dir>] [--version <version>] [--checksum <sha256>]"
     echo
     echo "Defaults:"
-    echo " * Installation directory: ${default_install_dir}"
+    echo " * Installation directory: \$PREFIX/bin if PREFIX is set;"
+    echo "   otherwise /usr/local/bin when run as root, ~/.local/bin when not"
     echo " * Download directory: a temporary directory"
     echo " * Version: the latest release on GitHub"
     echo " * Checksum: fetched from the release and verified automatically"

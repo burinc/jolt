@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The install script honors `PREFIX` (`PREFIX=~/.local bash install` puts the
+  binary in `~/.local/bin`) and, when neither `PREFIX` nor `--dir` is given,
+  defaults to `~/.local/bin` for non-root users instead of failing on
+  `/usr/local/bin` with permission denied. Root keeps `/usr/local/bin`.
+
 ## [0.6.6] - 2026-08-06
 
 ### Added
