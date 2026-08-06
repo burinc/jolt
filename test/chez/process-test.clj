@@ -129,6 +129,48 @@
 (check-eq "pb instance?" (instance? java.lang.ProcessBuilder (java.lang.ProcessBuilder. ["true"])) true)
 (check-eq "proc class" (.getName (class (:proc @(process ["true"])))) "java.lang.Process")
 
+;; --- fd-level INHERIT ---------------------------------------------------------
+;; Redirect.INHERIT hands the child jolt's REAL fds (posix_spawn leaves 0/1/2
+;; untouched), not a pump-fed pipe. Two things only real inheritance can do:
+;; the child sees a tty when jolt runs on one, and successive INHERIT-stdin
+;; children share the fd offset. Both run a nested jolt, because this test's
+;; own stdio belongs to the smoke harness.
+(def jolt-bin (or (System/getenv "JOLT_BIN") "bin/jolt"))
+(def mac? (str/includes? (System/getProperty "os.name") "Mac"))
+
+;; a child that writes through INHERIT lands on the nested jolt's stdout
+(let [nested (str "(-> (java.lang.ProcessBuilder. [\"sh\" \"-c\" \"echo INHERITED-OUT\"])"
+                  " (.redirectOutput java.lang.ProcessBuilder$Redirect/INHERIT)"
+                  " (.start) (.waitFor))")
+      out (:out (sh [jolt-bin "-e" nested]))]
+  (check-eq "INHERIT stdout reaches the parent's stdout"
+            (str/includes? out "INHERITED-OUT") true))
+
+;; isatty: under a pty (script(1)), an INHERIT child's stdout IS the terminal.
+;; A pump-fed pipe can never answer true here.
+(when (fs/which "script")
+  (let [nested (str "(-> (java.lang.ProcessBuilder. [\"sh\" \"-c\" \"test -t 1 && echo IS-A-TTY || echo NOT-A-TTY\"])"
+                    " (.redirectOutput java.lang.ProcessBuilder$Redirect/INHERIT)"
+                    " (.start) (.waitFor))")
+        cmd (if mac?
+              ["script" "-q" "/dev/null" jolt-bin "-e" nested]
+              ["script" "-qec" (str jolt-bin " -e '" nested "'") "/dev/null"])
+        out (:out (sh cmd))]
+    (check-eq "INHERIT stdout is the real fd (isatty under a pty)"
+              (str/includes? out "IS-A-TTY") true)))
+
+;; INHERIT stdin shares the fd AND its read offset: a first child consuming
+;; exactly two bytes leaves the rest for the second. The pumps slurped ahead
+;; into the first child's pipe, starving the second.
+(let [nested (str "(let [rd (fn [cmd] (let [p (-> (java.lang.ProcessBuilder. cmd)"
+                  " (.redirectInput java.lang.ProcessBuilder$Redirect/INHERIT) (.start))]"
+                  " (.waitFor p) (slurp (.getInputStream p))))]"
+                  " (rd [\"sh\" \"-c\" \"dd bs=1 count=2 2>/dev/null >/dev/null\"])"
+                  " (print (str \"SECOND=<\" (rd [\"cat\"]) \">\")))")
+      out (:out (sh [jolt-bin "-e" nested] {:in "ABCD"}))]
+  (check-eq "INHERIT stdin shares the fd offset between children"
+            (str/includes? out "SECOND=<CD>") true))
+
 (if (empty? @failures)
   (println "PROCESS-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))
