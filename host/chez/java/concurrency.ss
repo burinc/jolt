@@ -588,11 +588,17 @@
       ((jolt-agent? x) (jolt-agent-state x))
       ((jolt-delay? x) (jolt-delay-force x))
       ;; a record/reify implementing clojure.lang.IDeref: @x calls its `deref`
-      ;; method with the value itself as the leading `this`.
-      ((and (jrec? x) (find-method-any-protocol (jrec-tag x) "deref"))
-       => (lambda (m) (jolt-invoke m x)))
+      ;; method with the value itself as the leading `this`. The timed arity
+      ;; passes its opts through — (deref r ms val) reaches the IBlockingDeref
+      ;; 3-arity method, and a record implementing only the 1-arity fails with
+      ;; an arity error rather than silently taking the blocking path (the JVM
+      ;; throws ClassCastException there).
+      ((and (jrec? x)
+            (find-method-any-protocol-arity (jrec-tag x) "deref"
+                                            (if (null? opts) 1 3)))
+       => (lambda (m) (apply jolt-invoke m x opts)))
       ((and (reified-methods x) (hashtable-ref (reified-methods x) "deref" #f))
-       => (lambda (m) (jolt-invoke m x)))
+       => (lambda (m) (apply jolt-invoke m x opts)))
       (else (apply %pre-conc-deref x opts)))))
 
 ;; realized? for a future/promise/delay. Wrapped over the overlay version in
