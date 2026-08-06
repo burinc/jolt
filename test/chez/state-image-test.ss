@@ -9,6 +9,11 @@
 
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
+;; gate-boot's optimized profile compiles with generate-inspector-information off,
+;; which suppresses the closure free-var info free-value recovery needs
+;; ((io 'ref i) reports nothing); the release runtime has it ON, so turn it back
+;; on here — only code compiled after this point (the fixture evals) is affected.
+(generate-inspector-information #t)
 
 (define total 0) (define fails 0)
 (define (ok name pred)
@@ -83,13 +88,61 @@
 (rt "empty colls" "[[] {} #{} ()]"                 "[[] {} #{} ()]")
 (rt "record"      "(do (defrecord P [x y]) (->P 1 2))" "#user.P{:x 1, :y 2}")
 
-;; Sorted maps/sets keep their comparator machinery in a Chez hashtable, which
-;; this format version does not encode. The point of the assertion is that it is
-;; REFUSED clearly, not that it crashes somewhere in fasl.
-(is "sorted map is refused, not crashed"
-    (string-append "(try (jolt.host/image-write! \"" tmp "\" (sorted-map :b 2 :a 1)) :no-throw"
-                   " (catch Exception e (if (re-find #\"cannot write\" (ex-message e)) :refused :wrong-error)))")
-    ":refused")
+;; --- R4: sorted maps and sets travel -------------------------------------------
+;; The wrapper's internal comparator machinery (a wrapped comparator closure + an
+;; :ops table of closures in a string-keyed hashtable) never reaches the externals
+;; path now: the transformer intercepts htable-sorted? and restores through the
+;; public constructors with the ORIGINAL :cmp-fn.
+
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" (sorted-map :b 2 :a 1))"))
+(is "natural sorted-map round-trips (order, lookups, count, sorted?, assoc)"
+    (string-append "(let [m (jolt.host/image-read \"" tmp "\")]"
+                   " (vector (keys m) (m :a) (m :b) (count m) (sorted? m) (keys (assoc m :c 3))))")
+    "[(:a :b) 1 2 2 true (:a :b :c)]")
+
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" (sorted-set 5 3 8 1))"))
+(is "natural sorted-set round-trips (order, lookup, count, sorted?, conj)"
+    (string-append "(let [s (jolt.host/image-read \"" tmp "\")]"
+                   " (vector (seq s) (s 3) (count s) (sorted? s) (seq (conj s 4))))")
+    "[(1 3 5 8) 3 4 true (1 3 4 5 8)]")
+
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" (sorted-map-by > 1 :a 2 :b 3 :c))"))
+;; fn-ref restores the VAR ROOT; a bare `>` reference compiles to the seq.ss
+;; value-position singleton, which is a different (pre-existing) identity —
+;; jolt-obtq tracks it — so the assertion derefs the var.
+(is "named comparator (>) round-trips; cmp-fn IS clojure.core/>'s root"
+    (string-append "(let [m (jolt.host/image-read \"" tmp "\")"
+                   "       f (jolt.host/ref-get m :cmp-fn)]"
+                   " (vector (keys m) (identical? f (deref (var clojure.core/>))) (sorted? m)))")
+    "[(3 2 1) true true]")
+
+(ev (string-append "(jolt.host/image-write! \"" tmp "\""
+                   " (sorted-map-by (fn [a b] (compare (str a) (str b))) :b 2 :a 1))"))
+(is "anon comparator round-trips; restored map sorts by it, new key lands in order"
+    (string-append "(let [m (jolt.host/image-read \"" tmp "\")]"
+                   " (vector (keys m) (keys (assoc m :c 3))))")
+    "[(:a :b) (:a :b :c)]")
+
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" (atom [(sorted-map :b 2 :a 1)]))"))
+(is "sorted-map nested in a vector inside an atom round-trips"
+    (string-append "(let [m (first @(jolt.host/image-read \"" tmp "\"))]"
+                   " (vector (keys m) (sorted? m)))")
+    "[(:a :b) true]")
+
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" (with-meta (sorted-map :b 2 :a 1) {:m 1}))"))
+(is "meta on a sorted map round-trips"
+    (string-append "(:m (meta (jolt.host/image-read \"" tmp "\")))")
+    "1")
+
+(is "scan of a natural sorted map is empty"
+    "(count (jolt.host/image-scan (sorted-map :b 2 :a 1)))"
+    "0")
+;; (partial compare) would be compare ITSELF (partial's 1-arg arity), a named
+;; fn — (comp - compare) is a real core-tier closure with no registration
+(is "scan of a sorted-map-by with an unregistered closure reports one finding at the comparator"
+    (string-append "(let [f (jolt.host/image-scan (sorted-map-by (comp - compare) :b 2 :a 1))]"
+                   " (vector (count f) (boolean (re-find #\"cmp-fn\" (str (:path (first f)))))))")
+    "[1 true]")
 
 ;; deep + wide, to catch anything that only shows up past the small-map cutoff
 (is "large map round-trips"
@@ -124,25 +177,231 @@
                    " ((first (jolt.host/image-read \"" tmp "\")) 21))")
     "42")
 
-;; a bare closure has no name to write -> refused, with the path to it
-(is "anonymous closure is refused"
-    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (fn [x] x)}}) :no-throw"
+;; a closure with no source registration to write -> refused, with the path to
+;; it (a core-tier closure like partial's is never jfn$-registered)
+(is "unregistered closure is refused"
+    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (partial + 1)}}) :no-throw"
                    " (catch Exception e (if (re-find #\"cannot write\" (ex-message e)) :refused :wrong-error)))")
     ":refused")
 (is "refusal names the path"
-    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (fn [x] x)}}) \"\""
+    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (partial + 1)}}) \"\""
                    " (catch Exception e (if (re-find #\":handlers\" (ex-message e)) :has-path :no-path)))")
     ":has-path")
 
 ;; --- scan reports without writing ----------------------------------------------
 (is "scan is empty for pure data"
     "(count (jolt.host/image-scan {:a [1 2] :b #{3}}))" "0")
-(is "scan finds the closure"
-    "(count (jolt.host/image-scan {:f (fn [x] x)}))" "1")
+;; R2: a registered anon literal substitutes, so scan no longer flags it. The
+;; fixture is a separate def: an inline literal's registration sibling runs after
+;; the enclosing form's value is computed, so scan would see it unregistered.
+(ev "(def scn {:f (fn [x] x)})")
+(is "scan is empty for a registered anon fn"
+    "(count (jolt.host/image-scan user/scn))" "0")
+(is "scan reports an unregistered closure"
+    "(count (jolt.host/image-scan {:p (partial + 1)}))" "1")
 (is "scan reports a path"
-    "(-> (jolt.host/image-scan {:outer {:inner (fn [x] x)}}) first :path string? )" "true")
+    "(-> (jolt.host/image-scan {:outer {:p (partial + 1)}}) first :path string? )" "true")
 (is "scan is empty for a named fn"
     "(count (jolt.host/image-scan {:f inc}))" "0")
+
+;; --- R2: anonymous closures substitute as image-fnsrc records -------------------
+;; Write-side only: dump! succeeds where it refused, and the records land in the
+;; fasl body. R3 reconstructs them; here they come back inert, so the tests read
+;; the file low-level (the way jolt-image-read does) and assert the fields.
+
+(define (closure-name c)
+  (guard (e (#t #f))
+    (let* ((io (inspect/object c))
+           (code (guard (e (#t #f)) (io 'code))))
+      (and code (guard (e (#t #f)) (code 'name))))))
+
+(define (image-body path)
+  (let ((port (open-file-input-port path)))
+    (let* ((h (fasl-read port))
+           (descs (fasl-read port))
+           (exts (list->vector (map image-decode-external descs)))
+           (b (fasl-read port 'load exts)))
+      (close-port port)
+      b)))
+
+(define (image-graph path) (vector-ref (image-body path) 0))
+
+(define (find-fnsrcs root)
+  (let ((acc '()))
+    (image-walk root (lambda (x p) (when (image-fnsrc? x) (set! acc (cons x acc)))))
+    (reverse acc)))
+
+(define (jvec->strings v)
+  (let loop ((s (jolt-seq v)) (acc '()))
+    (if (jolt-nil? s)
+        (reverse acc)
+        (loop (seq-more s) (cons (seq-first s) acc)))))
+
+;; the free-VALUE aligned to a registered free-name (matched by munged name), or
+;; #f when the name isn't there
+(define (fvs-by-name r nm)
+  (let ((frees (jvec->strings (image-fnsrc-free-names r)))
+        (fvs (image-fnsrc-free-values r)))
+    (let ((i (let loop ((l frees) (j 0))
+               (cond ((null? l) #f)
+                     ((string=? (car l) nm) j)
+                     (else (loop (cdr l) (+ j 1)))))))
+      (and i (vector-ref fvs i)))))
+
+;; a def whose init is an anon literal binds that literal directly (named by the
+;; define), so the R2 cases bind the literal to a local first and store it inside
+;; data, leaving it anonymous for the dump
+(ev "(def img {:f (fn [x] (* x 2))})")
+(is "anon fn in state dumps"
+    (string-append "(do (jolt.host/image-write! \"" tmp "\" user/img) :ok)")
+    ":ok")
+(let* ((g (image-graph tmp))
+       (recs (find-fnsrcs g))
+       (orig (jolt-get (var-deref "user" "img") (keyword #f "f") jolt-nil)))
+  (ok "dump writes exactly one fnsrc record" (= 1 (length recs)))
+  (ok "fnsrc name matches the live closure's inspector name"
+      (string=? (image-fnsrc-name (car recs)) (closure-name orig)))
+  (ok "fnsrc ns" (string=? (image-fnsrc-ns (car recs)) "user"))
+  (ok "fnsrc free-names is an empty jolt vector"
+      (and (pvec? (image-fnsrc-free-names (car recs)))
+           (fx=? 0 (pvec-count (image-fnsrc-free-names (car recs))))))
+  (ok "fnsrc form is the registered fn* form"
+      (let* ((r (car recs))
+             (reg (image-fn-form-lookup (image-fnsrc-name r))))
+        (and reg (equal? (jolt-final-str (jolt-pr-readable (image-fnsrc-form r)))
+                         (jolt-final-str (jolt-pr-readable (vector-ref reg 0))))))))
+
+;; a closure shared through two slots writes ONE record; the read-back graph
+;; shares it (memoized by identity)
+(ev "(def shared (let [f (fn [x] (* x 2))] {:a f :b f}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/shared)"))
+(let* ((g (image-graph tmp))
+       (recs (find-fnsrcs g))
+       (va (jolt-get g (keyword #f "a") jolt-nil))
+       (vb (jolt-get g (keyword #f "b") jolt-nil)))
+  (ok "shared closure writes one record" (= 1 (length recs)))
+  (ok "shared closure is one shared record" (and (eq? va vb) (image-fnsrc? va))))
+
+;; a capture cycle (closure -> atom -> closure) survives: the recovered free
+;; value re-enters the transformer and finds the copy, not the live atom. The
+;; closure rides inside a map (a def whose direct value is a closure would land
+;; in proc-name-tbl and travel fn-ref instead).
+(ev "(def cyc (let [a (atom nil)] (reset! a (fn [x] (deref a))) {:self a}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/cyc)"))
+(let* ((g (image-graph tmp))
+       (self (jolt-get g (keyword #f "self") jolt-nil))
+       (rec (jolt-atom-val self)))
+  (ok "cycle root is a map" (and (pmap? g) (jolt-atom? self)))
+  (ok "cycle atom holds one fnsrc record" (image-fnsrc? rec))
+  (ok "fnsrc free-value cycles back into the graph"
+      (let ((fvs (image-fnsrc-free-values rec)))
+        (and (vector? fvs)
+             (fx=? 1 (vector-length fvs))
+             (eq? (vector-ref fvs 0) self)))))
+
+;; a keyword and a named fn captured as free values travel as themselves: the
+;; keyword re-interns, the named fn goes fn-ref (not source). The closure rides
+;; inside a map so the def's direct value isn't the closure (that would put it in
+;; proc-name-tbl and it would travel fn-ref), and the captured values are runtime
+;; (a deref) so the analyzer cannot fold them into the literal.
+(ev "(def mix {:m (let [k (deref (atom :tag)) nf inc] (fn [x] [k nf x]))})")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/mix)"))
+(let* ((g (image-graph tmp))
+       (recs (find-fnsrcs g))
+       (r (and (= 1 (length recs)) (car recs))))
+  (ok "mix writes one fnsrc record" (= 1 (length recs)))
+  (ok "mix free-values carry the keyword"
+      (and r (eq? (fvs-by-name r "k") (keyword #f "tag"))))
+  (ok "mix free-values carry the named fn via fn-ref"
+      (and r (eq? (fvs-by-name r "nf") (var-deref "clojure.core" "inc")))))
+
+;; a def whose DIRECT value is a closure lands in proc-name-tbl (var-set! names
+;; it) and travels fn-ref with NO record — whether its literal folded to the
+;; direct init (a let over constants) or not. Pins that fn-ref precedence.
+(ev "(def fold (let [k :tag nf inc] (fn [x] [k nf x])))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/fold)"))
+(let* ((g (image-graph tmp)))
+  (ok "folded closure writes no fnsrc record" (null? (find-fnsrcs g)))
+  (ok "folded closure travels fn-ref as the live fn"
+      (eq? g (var-deref "user" "fold"))))
+
+;; munge-name agreement: the write side munges registered free names with the
+;; same mapping the emitter used, so a capture whose local needs munging is
+;; still matched by name. Pin both sides, then end-to-end.
+(define (jolt-backend-munge s)
+  (jolt-invoke1 (var-deref "jolt.backend-scheme" "munge-name") s))
+(define (jolt-host-munge s)
+  (jolt-invoke1 (var-deref "jolt.host" "munge-name") s))
+(ok "munge seam agrees with the backend emitter"
+    (equal? (map jolt-host-munge '("x" "base" "hash#" "f'" "a$b" "if" "lambda" "jolt-x" "jv$x" "inc"))
+            (map jolt-backend-munge '("x" "base" "hash#" "f'" "a$b" "if" "lambda" "jolt-x" "jv$x" "inc"))))
+(ev "(def adv {:f (let [if (atom 3) hash# (atom 5)] (fn [x] (+ x (deref if) (deref hash#))))})")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/adv)"))
+(let* ((g (image-graph tmp))
+       (recs (find-fnsrcs g))
+       (r (and (= 1 (length recs)) (car recs))))
+  (ok "adversarial capture writes one fnsrc" (= 1 (length recs)))
+  (ok "adversarial free-names keep original names"
+      (and r
+           (let ((l (jvec->strings (image-fnsrc-free-names r))))
+             (and (member "if" l) (member "hash#" l)))))
+  (ok "adversarial free-values matched by munged name"
+      (and r
+           (eqv? (jolt-atom-val (fvs-by-name r "if")) 3)
+           (eqv? (jolt-atom-val (fvs-by-name r "hash#")) 5))))
+
+;; the atom arm covers watches + validator (scan/dump parity): a registered anon
+;; watch substitutes, an unregistered one is reported and refused
+(ev "(def wa (atom 0))")
+(ev "(add-watch user/wa :w (fn [k r o n] nil))")
+(is "scan is empty for an atom with a registered anon watch"
+    "(count (jolt.host/image-scan user/wa))" "0")
+(is "dump succeeds with a registered anon watch"
+    (string-append "(do (jolt.host/image-write! \"" tmp "\" user/wa) :ok)")
+    ":ok")
+;; the watch list stores (key . fn) pairs; the walk substitutes each fn
+(let* ((g (image-graph tmp))
+       (ws (jolt-atom-watches g)))
+  (ok "watch slot holds one fnsrc record"
+      (and (pair? ws)
+           (pair? (car ws))
+           (image-fnsrc? (cdr (car ws)))
+           (null? (cdr ws))))
+  (ok "watch key preserved" (eq? (car (car ws)) (keyword #f "w"))))
+(ev "(def wb (atom 0))")
+(ev "(add-watch user/wb :w (partial + 1))")
+(is "scan reports an unregistered watch"
+    "(count (jolt.host/image-scan user/wb))" "1")
+(is "dump refuses an unregistered watch"
+    (string-append "(try (jolt.host/image-write! \"" tmp "\" user/wb) :no-throw"
+                   " (catch Exception e (if (re-find #\"cannot write\" (ex-message e)) :refused :wrong-error)))")
+    ":refused")
+
+;; metadata rides to the substituted object: the write side copies the meta
+;; table entry across the transform memo, so collect-meta keys the copy
+(ev "(def mm (with-meta {:f (fn [x] x)} {:m 1}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/mm)"))
+(let* ((b (image-body tmp))
+       (g (vector-ref b 0))
+       (meta-alist (vector-ref b 1)))
+  (ok "the substituted map is a fresh object" (not (eq? g (var-deref "user" "mm"))))
+  (ok "meta rides keyed by the substituted map"
+      (let ((e (assq g meta-alist)))
+        (and e (= 1 (jolt-get (cdr e) (keyword #f "m") jolt-nil))))))
+
+;; handlers claim at any depth (not just var roots), procedures and resources
+(ev "(jolt.host/image-register-handler! (fn [x] (and (map? x) (= (:res-id x) 7))) (fn [x] {:claimed (:res-id x)}) (fn [d] d))")
+(ev "(def deep {:outer {:r {:res-id 7 :keep 1}}})")
+(is "handler claims a resource at depth"
+    (string-append "(do (jolt.host/image-write! \"" tmp "\" user/deep) :ok)")
+    ":ok")
+(let* ((g (image-graph tmp))
+       (handled '()))
+  (image-walk g (lambda (x p) (when (image-handled? x) (set! handled (cons x handled)))))
+  (ok "one image-handled record at depth" (= 1 (length handled)))
+  (ok "handler payload rides in the body"
+      (= 7 (jolt-get (image-handled-payload (car handled)) (keyword #f "claimed") jolt-nil))))
+
 
 ;; --- header / compatibility ------------------------------------------------------
 (is "reading a non-image fails with a clear message"
@@ -235,7 +494,277 @@
                    " (jolt.host/image-restore-world! \"" world-tmp "\")"
                    " (pr-str @user/hooklog))")
     "[:before :after]")
+;; a sorted-map var survives a world dump/restore
+(ev "(ns imgtest.sorted)")
+(jolt-compile-eval "(def sm (sorted-map :b 2 :a 1))" "imgtest.sorted")
+(ev (string-append "(jolt.host/image-dump-world! \"" world-tmp "\" [\"imgtest.sorted\"])"))
+(is "world dump/restore brings a sorted-map var back, sorted"
+    (string-append "(do (jolt.host/image-restore-world! \"" world-tmp "\")"
+                   " (let [m imgtest.sorted/sm] (vector (keys m) (sorted? m))))")
+    "[(:a :b) true]")
+
 (when (file-exists? world-tmp) (delete-file world-tmp))
+
+;; --- R3: read side — restored closures are CALLED ---------------------------
+;; The R2 write fixtures now get their round-trip halves: dump through the real
+;; write path, read through jolt-image-read (the restore transform), and CALL.
+;; Captures must be RUNTIME-computed: const-fold bakes a let-bound constant
+;; into the code and the capture disappears from the closure — the folded
+;; fixture below pins that refusal instead.
+(ev "(def r3 {:f (fn [x] (* x 3))})")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/r3)"))
+(is "restored anon fn is callable"
+    (string-append "((:f (jolt.host/image-read \"" tmp "\")) 14)")
+    "42")
+(ev "(def r3cap (let [a (+ 2 (count [1 2 3]))] {:f (fn [x] (+ a x))}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/r3cap)"))
+(is "a runtime-captured local round-trips and calls"
+    (string-append "((:f (jolt.host/image-read \"" tmp "\")) 37)")
+    "42")
+
+;; keyword + named-fn capture: the keyword went through free-values in the
+;; BODY, so re-interning must have applied; the named fn traveled fn-ref and
+;; must resolve to the LIVE fn. These are the assertions most likely to catch
+;; a bypass (a fasl keyword copy or a re-compiled core fn).
+(ev "(def mix {:m (let [k (deref (atom :tag)) nf inc] (fn [x] [k nf x]))})")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/mix)"))
+(is "restored closure returns the INTERNED keyword"
+    (string-append "(let [r ((:m (jolt.host/image-read \"" tmp "\")) 0)]"
+                   " (identical? (nth r 0) :tag))")
+    "true")
+(is "restored closure calls the LIVE named fn (fn-ref path)"
+    (string-append "(let [r ((:m (jolt.host/image-read \"" tmp "\")) 41)]"
+                   " (identical? (nth r 1) inc))")
+    "true")
+
+;; nested closures: the outer literal's src-form contains the inner one, and
+;; the outer's free-name list carries every name the whole form needs, so the
+;; restored outer returns a working inner closure.
+(ev "(def r3nest (let [k (+ 1 (count [1 2]))] {:outer (fn [x m] (fn [y] (+ (* x y) k m)))}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/r3nest)"))
+(is "nested closures round-trip; call both"
+    (string-append "(let [g (jolt.host/image-read \"" tmp "\")"
+                   " inner ((:outer g) 5 2)] (inner 3))")
+    "20")
+
+;; shared-capture identity: two closures over ONE atom; after restore the atom
+;; each closure captured must BE the graph's own (:a g) — three-way eq — and
+;; mutation through one closure must be visible through the other and through
+;; the graph reference.
+(define (closure-free-vals c)
+  (let ((io (inspect/object c)))
+    (let loop ((i 0) (acc '()))
+      (if (fx>=? i (io 'length))
+          (reverse acc)
+          (let ((vo (io 'ref i)))
+            (loop (fx+ i 1) (cons ((vo 'ref) 'value) acc)))))))
+(ev "(def r3shared (let [a (atom 1)] {:f1 (fn [] (swap! a inc)) :f2 (fn [] (deref a)) :a a}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/r3shared)"))
+(let* ((g (jolt-image-read tmp))
+       (f1 (jolt-get g (keyword #f "f1") jolt-nil))
+       (f2 (jolt-get g (keyword #f "f2") jolt-nil))
+       (ga (jolt-get g (keyword #f "a") jolt-nil)))
+  (ok "restored closures share one atom with the graph (three-way eq)"
+      (and (procedure? f1) (procedure? f2)
+           (let ((a1 (closure-free-vals f1)) (a2 (closure-free-vals f2)))
+             (and (pair? a1) (pair? a2)
+                  (eq? (car a1) ga) (eq? (car a2) ga)
+                  (eq? (car a1) (car a2))))))
+  (ok "swap through one restored closure is visible through the other and the graph"
+      (let ((_ (jolt-invoke f1)))
+        (and (= (jolt-atom-val ga) 2) (= (jolt-invoke f2) 2)))))
+
+;; the R2 cycle fixture read back and CALLED: ((deref a)) returns the closure
+;; itself, and the atom's val IS that closure after the call.
+(ev "(def cyc (let [a (atom nil)] (reset! a (fn [x] (deref a))) {:self a}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/cyc)"))
+(let* ((g (jolt-image-read tmp))
+       (a (jolt-get g (keyword #f "self") jolt-nil))
+       (cl (jolt-atom-val a)))
+  ;; (deref a) yields the atom's VAL — the closure itself — so a restored
+  ;; call returning the very closure being called is the cycle proof
+  (ok "restored cycle closure calls and returns itself through its atom"
+      (and (procedure? cl) (eq? (jolt-invoke cl 'x) cl)))
+  (ok "restored cycle closure is still the atom's val after the call"
+      (eq? (jolt-atom-val a) cl)))
+
+;; folded capture: a let-bound CONSTANT is baked into the compiled code, so the
+;; capture is unrecoverable at dump — refuse with a named, actionable message;
+;; scan reports the same finding.
+(ev "(def r3folded (let [a 5] {:f (fn [x] (+ a x))}))")
+(is "folded capture refuses at dump naming the local"
+    (string-append "(try (jolt.host/image-write! \"" tmp "\" user/r3folded) :no-throw"
+                   " (catch Exception e (if (re-find #\"captured local 'a' was optimized\" (ex-message e))"
+                   " :named :wrong)))")
+    ":named")
+(is "scan agrees the folded capture is unwritable"
+    "(= 1 (count (jolt.host/image-scan user/r3folded)))"
+    "true")
+
+;; multi-arity + variadic literals round-trip and are callable at each arity.
+(ev "(def r3arity (let [k (+ 2 (count [1 2 3]))] {:f (fn ([x] (* x k)) ([x y] (+ x y k))) :v (fn [x & xs] (+ x (count xs) k))}))")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" user/r3arity)"))
+(is "multi-arity restored closure is callable at each arity"
+    (string-append "(let [g (jolt.host/image-read \"" tmp "\")]"
+                   " (str ((:f g) 7) \"/\" ((:f g) 2 3)))")
+    "35/10")
+(is "variadic restored closure is callable"
+    (string-append "((:v (jolt.host/image-read \"" tmp "\")) 5 9 9)")
+    "12")
+
+;; world restore with closures: a var whose root holds a closure-bearing map
+;; travels; restore-world! rebuilds it into a live closure.
+(jolt-compile-eval "(def r3app {:cb (let [a (+ 2 (count [1 2 3]))] (fn [x] (+ a x))) :n 1})" "r3.app")
+(ev (string-append "(jolt.host/image-dump-world! \"" world-tmp "\" [\"r3.app\"])"))
+(jolt-compile-eval "(def r3app {:cb :clobbered})" "r3.app")
+(is "restore-world! rebuilds closures and reports the rebound count"
+    (string-append "(let [n (jolt.host/image-restore-world! \"" world-tmp "\")]"
+                   " (str n \"/\" ((:cb r3.app/r3app) 37) \"/\" (:n r3.app/r3app)))")
+    "1/42/1")
+
+;; error paths: a malformed record (free-values arity != free-names) refuses
+;; with a named error.
+(define (str-contains? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0))
+      (and (<= (+ i m) n)
+           (or (string=? (substring s i (+ i m)) sub)
+               (loop (+ i 1)))))))
+(let* ((fn-form (list->cseq (list (jolt-symbol #f "fn*")
+                                  (apply jolt-vector (list (jolt-symbol #f "x")))
+                                  (list->cseq (list (jolt-symbol #f "x"))))))
+       (bad (make-image-fnsrc "jfn$r3$bad$0" fn-form "user"
+                              (apply jolt-vector (list (jolt-symbol #f "x")))
+                              (vector 1 2))))
+  (ok "malformed fnsrc record refuses with a named error"
+      (call/cc (lambda (k)
+        (with-exception-handler
+          (lambda (e)
+            (k (str-contains? (condition->message-string e) "malformed fn source record")))
+          (lambda () (image-graph-process bad 'restore #f) #f))))))
+
+;; compiler-dropped build: the tree-shaken manifest drops the 'image +
+;; 'compile-eval tags, so a runtime with only rt.ss has no compile seam. Probe
+;; that condition in a subprocess (same build as this gate, minus the spine).
+(let ((probe (string-append tmp ".noce-probe.ss"))
+      (out   (string-append tmp ".noce-out.txt"))
+      (chez-bin (or (getenv "JOLT_CHEZ") "chez")))
+  (call-with-output-file probe
+    (lambda (p)
+      (put-string p "(import (chezscheme))\n")
+      (put-string p "(load \"host/chez/rt.ss\")\n")
+      (put-string p "(guard (e (#t (display (condition->message-string e)) (newline)))\n")
+      (put-string p "  (image-eval-fnsrc (make-image-fnsrc \"jfn$r3$nce$0\" '() \"user\" '() (vector)) '()))\n"))
+    'replace)
+  (let* ((rc (system (string-append chez-bin " --script " probe " > " out " 2>&1")))
+         (msg (read-file-string out)))
+    (ok "compiler-dropped build refuses fnsrc restore, naming the fn"
+        (and (fx=? rc 0)
+             (str-contains? msg "no compiler")
+             (str-contains? msg "jfn$r3$nce$0")))
+    (delete-file probe)
+    (delete-file out)))
+
+
+;; --- R6: resource stubs ---------------------------------------------------------
+;; dump! stays strict by default; {:unwritable :stub} substitutes an image-stub
+;; for anything the encoder refuses. dump-world! stubs by default and reports.
+
+(define stub-probe-file (string-append tmp ".stub-probe.txt"))
+(define stub-port (open-file-output-port stub-probe-file (file-options no-fail)))
+
+(ok "strict dump! still refuses a port"
+    (call/cc (lambda (k)
+      (with-exception-handler (lambda (e) (k #t))
+        (lambda () (jolt-image-write! tmp (jolt-hash-map (jolt-keyword "log") stub-port)) #f)))))
+
+;; stub mode: the port dumps as a stub, the write reports it, the read
+;; brings back an inert record that prints and names its class
+(let ((rep (jolt-image-write! tmp (jolt-hash-map (jolt-keyword "log") stub-port)
+                              (jolt-hash-map (jolt-keyword "unwritable") (jolt-keyword "stub")))))
+  (ok "stub-mode dump reports the stubbed port"
+      (fx=? 1 (jolt-count (jolt-get rep (jolt-keyword "stubbed") jolt-nil)))))
+(let* ((g (jolt-image-read tmp))
+       (st (jolt-get g (jolt-keyword "log") jolt-nil)))
+  (ok "stubbed port restores as an inert image-stub" (image-stub? st))
+  (ok "stub prints as #image/stub{...}"
+      (let ((r (jolt-pr-readable st)))
+        (and (string? r) (fx>=? (string-length r) 12)
+             (string=? (substring r 0 12) "#image/stub{"))))
+  (ok "stub class is jolt.image.Stub" (string=? (jolt-class-name st) "jolt.image.Stub"))
+  (ok "port stub extra carries direction + open state"
+      (let ((ex (image-stub-extra st)))
+        (and (eq? (jolt-get ex (jolt-keyword "direction") jolt-nil) (jolt-keyword "output"))
+             (eq? (jolt-get ex (jolt-keyword "open") jolt-nil) #t)))))
+
+;; a throwing describer never fails the dump
+(jolt-image-register-stub-describer!
+  (lambda (x) (and (hashtable? x) (not (image-eq-hashtable? x))))
+  (lambda (x) (error 'describer "boom")))
+(let ((rep (jolt-image-write! tmp (jolt-hash-map (jolt-keyword "tbl") (make-hashtable equal-hash equal?))
+                              (jolt-hash-map (jolt-keyword "unwritable") (jolt-keyword "stub")))))
+  (ok "throwing describer does not fail the dump"
+      (fx=? 1 (jolt-count (jolt-get rep (jolt-keyword "stubbed") jolt-nil)))))
+
+;; folded capture stubs in stub mode, naming the capture
+(jolt-compile-eval "(def r6folded (let [a 5] {:f (fn [x] (+ a x))}))" "user")
+(let ((rep (jolt-image-write! tmp (var-cell-root (jolt-var "user" "r6folded"))
+                              (jolt-hash-map (jolt-keyword "unwritable") (jolt-keyword "stub")))))
+  (ok "folded capture stubs in stub mode, description names the capture"
+      (let* ((sv (jolt-get rep (jolt-keyword "stubbed") jolt-nil))
+             (info (jolt-nth sv 0))
+             (d (jolt-get info (jolt-keyword "description") jolt-nil)))
+        (and (fx=? 1 (jolt-count sv)) (string? d)
+             (str-contains? d "folded capture a")))))
+
+;; scan dispositions: a port is :would-stub
+(let ((f (jolt-image-scan (jolt-hash-map (jolt-keyword "log") stub-port))))
+  (ok "scan reports a port as :would-stub"
+      (and (fx=? 1 (jolt-count f))
+           (eq? (jolt-get (jolt-nth f 0) (jolt-keyword "disposition") jolt-nil)
+                (jolt-keyword "would-stub")))))
+
+;; world: stub by default, listed with its var, resolved in place
+(jolt-compile-eval "(def cfg {:name \"app\" :log nil})" "r6.world")
+(let ((cell (jolt-var "r6.world" "cfg")))
+  (var-cell-root-set! cell
+    (jolt-assoc (var-cell-root cell) (jolt-keyword "log") stub-port)))
+(let ((rep (jolt-image-dump-world! world-tmp (jolt-vector "r6.world"))))
+  (ok "dump-world! stubs by default and reports"
+      (fx=? 1 (jolt-count (jolt-get rep (jolt-keyword "stubbed") jolt-nil)))))
+(jolt-compile-eval "(def cfg :clobbered)" "r6.world")
+(jolt-image-restore-world! world-tmp)
+(let ((ss (jolt-image-stubs)))
+  (ok "stubs lists the unresolved stub with its owning var"
+      (and (fx=? 1 (jolt-count ss))
+           (string=? (jolt-get (jolt-nth ss 0) (jolt-keyword "var") jolt-nil) "r6.world/cfg")))
+  (let* ((id (jolt-get (jolt-nth ss 0) (jolt-keyword "id") jolt-nil))
+         (cnt (jolt-image-resolve-stub! id "LIVE-AGAIN")))
+    (ok "resolve-stub! replaces one slot" (fx=? 1 cnt))
+    (ok "resolved value lands in the var's map"
+        (equal? "LIVE-AGAIN"
+                (jolt-get (var-cell-root (jolt-var "r6.world" "cfg"))
+                          (jolt-keyword "log") jolt-nil)))
+    (ok "stubs empties after resolve" (fx=? 0 (jolt-count (jolt-image-stubs))))))
+
+;; resolver pre-registered: the stub never materializes
+;; kind strings match the STUBBED OBJECT's class (a port's, here), so a
+;; catch-all predicate is the simplest fixture
+(jolt-image-register-stub-resolver! (lambda (info) #t)
+  (lambda (info) "RESOLVED-INLINE"))
+(let ((cell (jolt-var "r6.world" "cfg")))
+  (var-cell-root-set! cell
+    (jolt-assoc (var-cell-root cell) (jolt-keyword "log") stub-port)))
+(jolt-image-dump-world! world-tmp (jolt-vector "r6.world"))
+(jolt-image-restore-world! world-tmp)
+(ok "pre-registered resolver restores inline; stubs stays empty"
+    (and (equal? "RESOLVED-INLINE"
+                 (jolt-get (var-cell-root (jolt-var "r6.world" "cfg"))
+                           (jolt-keyword "log") jolt-nil))
+         (fx=? 0 (jolt-count (jolt-image-stubs)))))
+
+(close-port stub-port)
+(delete-file stub-probe-file)
 
 (cleanup!)
 (when (file-exists? (string-append tmp ".txt")) (delete-file (string-append tmp ".txt")))

@@ -215,6 +215,32 @@
 ;; emit-fn therefore skips its own variadic registration and emit-def-cached emits
 ;; the sibling (jolt-register-variadic! …) against the define's own binding.
 (def ^:dynamic *variadic-reg-suppressed?* false)
+;; R1 (bead jolt-hqpn): unique letrec names + source-form registration for
+;; anonymous fn literals in NON-SYSTEM namespaces, so a live closure reports its
+;; source form through Chez's inspector and a state image can rebuild it as code.
+;; Bound where emit-top-form / the :def cases establish per-top-level-form
+;; context: *fnsrc-ns* (the namespace being emitted), *fnsrc-def* (the enclosing
+;; top-level def name, nil for a top-level expression), *fnsrc-counter* (an
+;; atom: anon literals seen so far in this top-level form), *fnsrc-regs* (an
+;; atom: the collected [name form ns free-names] rows, flushed as
+;; image-register-fn-form! siblings after the form), and *fnsrc-def-init?* (true
+;; only while emitting a def's DIRECT fn init, which the define itself names and
+;; must not wrap). All nil/false outside any top-level form: emit-fn then keeps
+;; the old bare lambda, so off-context emission is byte-unchanged.
+(def ^:dynamic *fnsrc-ns* nil)
+(def ^:dynamic *fnsrc-def* nil)
+(def ^:dynamic *fnsrc-counter* nil)
+(def ^:dynamic *fnsrc-regs* nil)
+(def ^:dynamic *fnsrc-def-init?* false)
+;; Same split as image-system-ns? in host/chez/state-image.ss: a namespace the
+;; language owns (clojure.core or a clojure.* / jolt.* prefix) keeps its old
+;; emission — the seed mint and the core overlay must stay byte-identical. nil
+;; (no per-form context) counts as system so a bare emit never changes.
+(defn- fnsrc-system-ns? [ns]
+  (or (nil? ns)
+      (= ns "clojure.core")
+      (str/starts-with? ns "clojure.")
+      (str/starts-with? ns "jolt.")))
 ;; True while emitting a node in TAIL position. Only used, in trace mode, to mark a
 ;; tail call so the runtime routes its callee into the current history rib instead
 ;; of a new one (rt.ss). It never affects semantics — a wrong value only mislabels
@@ -765,8 +791,41 @@
                      (= ret :long)   (str "(jolt->fx " lett ")")
                      :else lett)]))
 
+;; The globally unique letrec name for the next anon literal:
+;; jfn$<munged-ns>$<munged-def>$<counter> (counter per top-level def);
+;; literals outside any def use jfn$<munged-ns>$$<counter> (counter per
+;; top-level form). Deterministic: same source emits the same names.
+(defn- fnsrc-name []
+  (str "jfn$" (munge-name *fnsrc-ns*)
+       (if *fnsrc-def* (str "$" (munge-name *fnsrc-def*) "$") "$$")
+       (let [n @*fnsrc-counter*] (swap! *fnsrc-counter* inc) n)))
+
+;; A top-level form's collected anon-fn registrations as Scheme siblings:
+;;   (image-register-fn-form! "jfn$…" <quoted fn* form> "ns" <quoted free names>)
+;; "" when the namespace is system or nothing was collected, so the seed mint
+;; and any fn-free def emit byte-identically.
+(defn- fnsrc-flush []
+  (if (or (fnsrc-system-ns? *fnsrc-ns*) (empty? @*fnsrc-regs*))
+    ""
+    ;; best-effort: a macro can splice a LIVE value (a namespace, a var's
+    ;; value) into a fn body, and emit-quoted has no rendering for those.
+    ;; Such a literal just goes unregistered — its closure refuses at dump
+    ;; like any other unregistered fn — rather than failing the whole
+    ;; compilation of code that never dumps anything.
+    (str " " (str/join " " (keep (fn [[nm form ns frees]]
+                                   (try
+                                     (str "(image-register-fn-form! " (chez-str-lit nm) " "
+                                          (emit-quoted form) " " (chez-str-lit ns) " "
+                                          (emit-quoted frees) ")")
+                                     (catch Exception _ nil)))
+                                 @*fnsrc-regs*)))))
+
 (defn- emit-fn [node]
-  (let [arities (:arities node)
+  (let [;; a def's DIRECT anonymous init is named by its define, so it keeps the
+        ;; bare lambda; *fnsrc-def-init?* is set only around that init's emission
+        ;; and cleared for the body below, so a nested literal isn't mistaken for it.
+        def-init? *fnsrc-def-init?*
+        arities (:arities node)
         ;; a named fn binds its own name as a known-procedure local across ALL
         ;; arities, so self-calls emit directly rather than via jolt-invoke.
         self (when-let [nm (:name node)] (munge-name nm))
@@ -775,9 +834,16 @@
         ;; per-var frame name. Nested/anonymous fns ignore it (self is nil).
         qname (when (and self *qualifying-ns*)
                 (str (munge-name *qualifying-ns*) "/" self))
+        ;; the unique name is allocated BEFORE the arity bodies emit, so an
+        ;; enclosing literal numbers ahead of the literals nested inside it
+        ;; (document order — jfn$ns$def$0 is the outermost)
+        fnsrc-nm (when (and (nil? (:name node)) (not def-init?)
+                            (not (fnsrc-system-ns? *fnsrc-ns*)) (:src-form node))
+                   (fnsrc-name))
         clauses (binding [*known-procs* (if self (conj *known-procs* self) *known-procs*)
                           *trace-site* (or qname self)
-                          *trace-self* (cond-> #{} self (conj self) qname (conj qname))]
+                          *trace-self* (cond-> #{} self (conj self) qname (conj qname))
+                          *fnsrc-def-init?* false]
                   (mapv emit-arity-clause arities))
         lambda (if (= 1 (count clauses))
                  (let [c (first clauses)] (str "(lambda " (nth c 0) " " (nth c 1) ")"))
@@ -823,10 +889,29 @@
           (if qname
             (str "(letrec* ((" qname " " lambda ") (" m " " qname ")) " ret ")")
             (str "(letrec ((" m " " lambda ")) " ret ")"))))
-      (if anon-label
-        (str "(let ((" anon-label " " lambda ")) "
-             "(jolt-register-variadic! " variadic-fixed " " anon-label "))")
-        lambda))))
+      (if (not fnsrc-nm)
+        ;; system namespaces, a def's direct init, and ad-hoc fns (contagion
+        ;; clones) keep the old emission byte-identical: a bare lambda named by
+        ;; the enclosing define, or the fnvar label for an anon variadic (see
+        ;; the comment above on why the lambda must sit in the binding position).
+        (if anon-label
+          (str "(let ((" anon-label " " lambda ")) "
+               "(jolt-register-variadic! " variadic-fixed " " anon-label "))")
+          lambda)
+        ;; a non-system anon literal: bind it letrec under a globally unique name
+        ;; so Chez reports that name through the inspector ((io 'code) 'name),
+        ;; and register its source form + defining ns + free locals for the
+        ;; image. The variadic registration stays in the letrec BODY so the
+        ;; binding holds the bare lambda and the name survives (same constraint
+        ;; as the named path above).
+        (let [nm fnsrc-nm
+              form (:src-form node)
+              frees (:free-names node)]
+          (swap! *fnsrc-regs* conj [nm form *fnsrc-ns* frees])
+          (if variadic-fixed
+            (str "(letrec ((" nm " " lambda ")) "
+                 "(jolt-register-variadic! " variadic-fixed " " nm "))")
+            (str "(letrec ((" nm " " lambda ")) " nm ")")))))))
 
 ;; If fnode is a clojure.core (or host) ref to a native-op primitive, return the
 ;; Scheme op string — only at an arity where the Scheme op and the jolt fn agree.
@@ -1473,7 +1558,12 @@
     ;; must hold the atom before the init emission runs or every site record
     ;; silently no-ops and the callsite table stays empty.
     :def (binding [*qualifying-ns* (when (source-reg?) (:ns node))
-                   *callsites* (when (trace-frames?) (atom {}))]
+                   *callsites* (when (trace-frames?) (atom {}))
+                   *fnsrc-ns* (:ns node)
+                   *fnsrc-def* (:name node)
+                   *fnsrc-counter* (atom 0)
+                   *fnsrc-regs* (atom [])
+                   *fnsrc-def-init?* (= :fn (:op (:init node)))]
            (let [reg (trace-source-reg node)
                  d (cond
                      (:no-init node)
@@ -1491,13 +1581,19 @@
                      :else
                      (str "(def-var! " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) " "
                           (emit-with-cells #(emit (:init node))) ")"))
-                   creg (trace-callsite-reg)]
+                   creg (trace-callsite-reg)
+                   freg (fnsrc-flush)]
              ;; a def evaluates to its VAR ((var? (def x)) is true), so the source
-             ;; and callsite registrations must not be the value of the form — bind
-             ;; the def's result, register, and hand the var back.
-             (if (= (str reg creg) "") d
-                 (let [v (fresh-label "_dv$")]
-                   (str "(let ((" v " " d "))" reg creg " " v ")")))))
+             ;; and callsite registrations must not be the value of the form —
+             ;; bind the def's result, register, and hand the var back. The fnsrc
+             ;; registrations run BEFORE the form: they are static data, and the
+             ;; form's own evaluation may already dump a closure it just created.
+             (let [pre (if (= freg "") "" (str "(begin" freg " "))
+                   post (if (= freg "") "" ")")
+                   body (if (= (str reg creg) "") d
+                            (let [v (fresh-label "_dv$")]
+                              (str "(let ((" v " " d "))" reg creg " " v ")")))]
+               (str pre body post))))
     (throw (ex-info (str "emit: op not yet ported / unhandled: " (pr-str (:op node))) {}))))
 
 ;; ^:dynamic / ^:redef on a def opts it out of direct-linking: it stays redefinable,
@@ -1549,41 +1645,65 @@
         ;; and without it a built binary had empty callsite tables: the
         ;; reporter's backwalk dead-ended after the throw-time pair and a
         ;; built trace showed the erased fn but never its erased callers.
+        ;; The fnsrc context rides the same binding: the init's anon literals
+        ;; collect into *fnsrc-regs* and flush before the binding returns.
         init+creg (binding [*variadic-reg-suppressed?* (boolean anon-variadic)
-                            *callsites* (when (trace-frames?) (atom {}))]
+                            *callsites* (when (trace-frames?) (atom {}))
+                            *fnsrc-ns* ns
+                            *fnsrc-def* nm
+                            *fnsrc-counter* (atom 0)
+                            *fnsrc-regs* (atom [])
+                            *fnsrc-def-init?* fn?]
                     (let [i (emit-with-cells #(emit (:init node)))]
-                      [i (trace-callsite-reg)]))
+                      [i (trace-callsite-reg) (fnsrc-flush)]))
         init (nth init+creg 0)
-        creg (nth init+creg 1)]
+        creg (nth init+creg 1)
+        freg (nth init+creg 2)]
+    ;; fnsrc registrations run BEFORE the define/def-var!: static data, and the
+    ;; init (or a form evaluated right after in the same top-level do) may dump a
+    ;; closure the init just created.
     (cond
       dl?
       (if (jmeta-nonempty? (:meta node))
-        (str "(begin (define " b " " init ") (def-var-with-meta! "
+        (str "(begin" freg " (define " b " " init ") (def-var-with-meta! "
              (chez-str-lit ns) " " (chez-str-lit nm) " " b " " (emit-def-meta node) ")"
              (or reg "") (or vreg "") creg ")")
-        (str "(begin (define " b " " init ") (def-var! "
+        (str "(begin" freg " (define " b " " init ") (def-var! "
              (chez-str-lit ns) " " (chez-str-lit nm) " " b ")" (or reg "") (or vreg "") creg ")"))
       (jmeta-nonempty? (:meta node))
-      (if (= creg "")
+      (if (= (str creg freg) "")
         (str "(def-var-with-meta! " (chez-str-lit ns) " " (chez-str-lit nm) " " init " " (emit-def-meta node) ")")
-        ;; a def evaluates to its var — bind, register, hand the var back
+        ;; a def evaluates to its var — register first, bind, hand the var back
         (let [v (fresh-label "_dv$")]
-          (str "(let ((" v " (def-var-with-meta! " (chez-str-lit ns) " " (chez-str-lit nm) " " init " " (emit-def-meta node) ")))" creg " " v ")")))
+          (str "(begin" freg " (let ((" v " (def-var-with-meta! " (chez-str-lit ns) " " (chez-str-lit nm) " " init " " (emit-def-meta node) ")))" creg " " v "))")))
       :else
-      (if (= creg "")
+      (if (= (str creg freg) "")
         (str "(def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")")
         (let [v (fresh-label "_dv$")]
-          (str "(let ((" v " (def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")))" creg " " v ")"))))))
+          (str "(begin" freg " (let ((" v " (def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")))" creg " " v "))"))))))
 
 (defn emit-top-form [node]
-  (cond
-    ;; off direct-link (the seed mint + runtime-via-image) this is exactly `emit`,
-    ;; whose :def case already wraps cache cells, so the seed stays byte-unchanged.
-    (not (direct-link?)) (emit node)
-    ;; top-level do splices: each statement/ret is itself a top-level form.
-    (= :do (:op node))
-    (str "(begin " (str/join " " (map emit-top-form (:statements node)))
-         (if (empty? (:statements node)) "" " ") (emit-top-form (:ret node)) ")")
-    (and (= :def (:op node)) (not (:no-init node)) (not (dl-opt-out? (:meta node))))
-    (emit-def-cached node)
-    :else (emit node)))
+  (binding [*fnsrc-ns* (or (:ns node) (:fnsrc-ns node))
+            *fnsrc-def* (when (= :def (:op node)) (:name node))
+            *fnsrc-counter* (atom 0)
+            *fnsrc-regs* (atom [])]
+    (let [scm (cond
+                ;; off direct-link (the seed mint + runtime-via-image) this is exactly
+                ;; `emit`, whose :def case already wraps cache cells, so the seed stays
+                ;; byte-unchanged. The :def cases bind their own fnsrc context over
+                ;; this one (fresh counter/regs per def) and flush it themselves.
+                (not (direct-link?)) (emit node)
+                ;; top-level do splices: each statement/ret is itself a top-level form.
+                (= :do (:op node))
+                (str "(begin " (str/join " " (map emit-top-form (:statements node)))
+                     (if (empty? (:statements node)) "" " ") (emit-top-form (:ret node)) ")")
+                (and (= :def (:op node)) (not (:no-init node)) (not (dl-opt-out? (:meta node))))
+                (emit-def-cached node)
+                :else (emit node))
+          freg (fnsrc-flush)]
+      (if (= freg "") scm
+          ;; registrations run BEFORE the form: they are static data with no
+          ;; dependency on the form's evaluation, and the form itself may dump a
+          ;; closure it just created — the registration must already be there.
+          ;; begin keeps the form's value as the result.
+          (str "(begin" freg " " scm ")")))))

@@ -10,7 +10,7 @@
 ;; Loaded after host-contract.ss + the compiler image.
 
 (define jolt-ce-analyze (var-deref "jolt.analyzer" "analyze"))
-(define jolt-ce-emit (var-deref "jolt.backend-scheme" "emit"))
+(define jolt-ce-emit (var-deref "jolt.backend-scheme" "emit-top-form"))
 ;; jolt.passes/run-passes: const-fold every analyzed form, plus inline + type
 ;; inference when the unit opted into direct-linking (jolt build --opt). Off that
 ;; path it is a pure const-fold. Loaded from the compiler image (jolt.passes).

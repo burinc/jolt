@@ -96,8 +96,12 @@ image-read
 image-register-handler!
 image-restore-world!
 image-runtime-version
+image-register-stub-describer!
+image-register-stub-resolver!
+image-resolve-stub!
 image-scan
 image-scan-world
+image-stubs
 image-write!
 inference-enabled?
 inline-enabled?
@@ -120,6 +124,7 @@ maximum-memory-bytes
 monitor-enter
 monitor-exit
 mono-nanos
+munge-name
 park-until-interrupt
 protocol-key-of
 protocol-methods

@@ -211,11 +211,12 @@
     (tree-collect (nd-right t) proj
                   (conj (tree-collect (nd-left t) proj acc) (proj t)))))
 
-(defn- make-sorted [tag tree cnt cmp ops]
+(defn- make-sorted [tag tree cnt cmp cmp-fn ops]
   (-> (jolt.host/tagged-table tag)
       (jolt.host/ref-put! :tree tree)
       (jolt.host/ref-put! :cnt cnt)
       (jolt.host/ref-put! :cmp cmp)
+      (jolt.host/ref-put! :cmp-fn cmp-fn)
       (jolt.host/ref-put! :ops ops)))
 
 ;; entries as a vector (ascending), the materialized form seq/rseq/subseq use.
@@ -236,8 +237,8 @@
         node (tree-lookup tree cmp k)]
     (cond
       (and node (= v (nd-val node))) sm
-      node (make-sorted :jolt/sorted-map (tree-replace cmp tree k v) (sfield sm :cnt) (sfield sm :cmp) (sfield sm :ops))
-      :else (make-sorted :jolt/sorted-map (blacken (tree-ins cmp tree k v)) (inc (sfield sm :cnt)) (sfield sm :cmp) (sfield sm :ops)))))
+      node (make-sorted :jolt/sorted-map (tree-replace cmp tree k v) (sfield sm :cnt) (sfield sm :cmp) (sfield sm :cmp-fn) (sfield sm :ops))
+      :else (make-sorted :jolt/sorted-map (blacken (tree-ins cmp tree k v)) (inc (sfield sm :cnt)) (sfield sm :cmp) (sfield sm :cmp-fn) (sfield sm :ops)))))
 
 (defn- sm-assoc-many [sm kvs]
   (let [n (count kvs)]
@@ -253,7 +254,7 @@
     (if (nil? (tree-lookup tree cmp k))
       sm
       (let [t (tree-del cmp tree k)]
-        (make-sorted :jolt/sorted-map (when t (blacken t)) (dec (sfield sm :cnt)) (sfield sm :cmp) (sfield sm :ops))))))
+        (make-sorted :jolt/sorted-map (when t (blacken t)) (dec (sfield sm :cnt)) (sfield sm :cmp) (sfield sm :cmp-fn) (sfield sm :ops))))))
 
 (defn- sm-dissoc-many [sm ks] (reduce sm-dissoc-1 sm ks))
 
@@ -277,7 +278,7 @@
   (let [cmp (the-cmp ss) tree (sfield ss :tree)]
     (if (tree-lookup tree cmp x)
       ss
-      (make-sorted :jolt/sorted-set (blacken (tree-ins cmp tree x nil)) (inc (sfield ss :cnt)) (sfield ss :cmp) (sfield ss :ops)))))
+      (make-sorted :jolt/sorted-set (blacken (tree-ins cmp tree x nil)) (inc (sfield ss :cnt)) (sfield ss :cmp) (sfield ss :cmp-fn) (sfield ss :ops)))))
 
 (defn- ss-conj-many [ss xs] (reduce ss-conj-1 ss xs))
 
@@ -286,7 +287,7 @@
     (if (nil? (tree-lookup tree cmp x))
       ss
       (let [t (tree-del cmp tree x)]
-        (make-sorted :jolt/sorted-set (when t (blacken t)) (dec (sfield ss :cnt)) (sfield ss :cmp) (sfield ss :ops))))))
+        (make-sorted :jolt/sorted-set (when t (blacken t)) (dec (sfield ss :cnt)) (sfield ss :cmp) (sfield ss :cmp-fn) (sfield ss :ops))))))
 
 (defn- ss-disj-many [ss xs] (reduce ss-disj-1 ss xs))
 
@@ -303,7 +304,7 @@
    :assoc    sm-assoc-many
    :dissoc   sm-dissoc-many
    :conj     sm-conj-many
-   :empty    (fn [sm] (make-sorted :jolt/sorted-map nil 0 (sfield sm :cmp) (sfield sm :ops)))})
+   :empty    (fn [sm] (make-sorted :jolt/sorted-map nil 0 (sfield sm :cmp) (sfield sm :cmp-fn) (sfield sm :ops)))})
 
 (def ^:private ss-ops
   {:count    (fn [ss] (sfield ss :cnt))
@@ -315,21 +316,21 @@
    :contains (fn [ss x] (not (nil? (tree-lookup (sfield ss :tree) (the-cmp ss) x))))
    :conj     ss-conj-many
    :disj     ss-disj-many
-   :empty    (fn [ss] (make-sorted :jolt/sorted-set nil 0 (sfield ss :cmp) (sfield ss :ops)))})
+   :empty    (fn [ss] (make-sorted :jolt/sorted-set nil 0 (sfield ss :cmp) (sfield ss :cmp-fn) (sfield ss :ops)))})
 
 ;; --- constructors + predicates -----------------------------------------------
 
 (defn sorted-map [& kvs]
-  (sm-assoc-many (make-sorted :jolt/sorted-map nil 0 nil sm-ops) (vec kvs)))
+  (sm-assoc-many (make-sorted :jolt/sorted-map nil 0 nil nil sm-ops) (vec kvs)))
 
 (defn sorted-map-by [comparator & kvs]
-  (sm-assoc-many (make-sorted :jolt/sorted-map nil 0 (fn->cmp comparator) sm-ops) (vec kvs)))
+  (sm-assoc-many (make-sorted :jolt/sorted-map nil 0 (fn->cmp comparator) comparator sm-ops) (vec kvs)))
 
 (defn sorted-set [& xs]
-  (ss-conj-many (make-sorted :jolt/sorted-set nil 0 nil ss-ops) (vec xs)))
+  (ss-conj-many (make-sorted :jolt/sorted-set nil 0 nil nil ss-ops) (vec xs)))
 
 (defn sorted-set-by [comparator & xs]
-  (ss-conj-many (make-sorted :jolt/sorted-set nil 0 (fn->cmp comparator) ss-ops) (vec xs)))
+  (ss-conj-many (make-sorted :jolt/sorted-set nil 0 (fn->cmp comparator) comparator ss-ops) (vec xs)))
 
 (defn sorted-map? [x] (= :jolt/sorted-map (sfield x :jolt/type)))
 (defn sorted-set? [x] (= :jolt/sorted-set (sfield x :jolt/type)))
