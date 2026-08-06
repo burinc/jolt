@@ -92,12 +92,18 @@
 (define chez-exports (library-exports '(chezscheme)))
 
 (define (bound-on-target? sym)
-  ;; The combined environment: (chezscheme) exports OR a top-level binding.
-  ;; library-exports enumerates BOTH variable and syntax bindings (it sees
-  ;; with-mutex, which top-level-bound? cannot); top-level-bound? sees OUR
-  ;; capability definitions, which the runtime file loaded as plain top-level
-  ;; defines and library-exports cannot.
-  (or (memq sym chez-exports) (top-level-bound? sym)))
+  ;; The combined environment: (chezscheme) exports OR a top-level binding OR a
+  ;; top-level SYNTAX binding. library-exports enumerates BOTH variable and
+  ;; syntax bindings (it sees with-mutex, which top-level-bound? cannot);
+  ;; top-level-bound? sees OUR capability variable definitions, which the
+  ;; runtime file loaded as plain top-level defines and library-exports cannot;
+  ;; environment-symbols of the interaction environment also sees OUR
+  ;; define-syntax capability names (sa-foreign-procedure and
+  ;; sa-foreign-procedure-blocking — the R7 ffi tier), which top-level-bound?
+  ;; and environment-bound? both miss.
+  (or (memq sym chez-exports)
+      (top-level-bound? sym)
+      (memq sym (environment-symbols (interaction-environment)))))
 
 (define (main)
   (let ((names (read-contract-names contract-file)))

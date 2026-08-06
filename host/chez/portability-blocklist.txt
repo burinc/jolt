@@ -30,13 +30,16 @@
 #
 # tier: ffi
 foreign-procedure
+load-shared-object
 foreign-alloc
 foreign-ref
 foreign-set!
 foreign-sizeof
 foreign-free
 foreign-entry
+foreign-entry?
 foreign-callable
+foreign-callable-entry-point
 lock-object
 unlock-object
 #

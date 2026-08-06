@@ -146,6 +146,42 @@ sa-introspect-enabled?
 sa-continuation-frames
 sa-procedure-info
 #
+# tier: capability-ffi
+# OUR OWN definitions in host/chez/scheme-adapter-runtime.ss (loaded FIRST in
+# the runtime manifest), not (chezscheme) exports — a target's adapter must
+# provide these SAME call shapes. Each is a one-liner over a blocklisted
+# ffi-tier native (foreign-alloc/free/ref/set!/sizeof, lock-object/unlock-object,
+# load-shared-object, foreign-entry?/foreign-callable-entry-point, or the
+# Windows-path eval'd foreign-procedure construction); adaptercheck loads the
+# runtime file and probes the combined environment. sa-foreign-procedure and
+# sa-foreign-procedure-blocking are SYNTAX (compile-time-typed lowering to the
+# native foreign-procedure form, __collect_safe in the blocking case) — a target
+# must provide them as macros with the same lowering. Permitted degradation, per
+# entry point:
+# - sa-lock-object/sa-unlock-object may BOTH no-op on a non-moving collector
+#   (never just one — that leaks or crashes);
+# - sa-load-shared-object must raise on targets without dlopen, and
+#   jolt.ffi/load-library must surface it as a clean jolt-level error;
+# - sa-foreign-procedure-blocking may collapse to plain sa-foreign-procedure
+#   ONLY if the collector never stops other threads (the R4 collect-safety
+#   semantic);
+# - the data-plane entries (alloc/free/ref/set!/sizeof) degrade none — a target
+#   with the ffi capability provides them; without it, jolt.ffi raises cleanly.
+sa-foreign-alloc
+sa-foreign-free
+sa-foreign-ref
+sa-foreign-set!
+sa-foreign-sizeof
+sa-lock-object
+sa-unlock-object
+sa-load-shared-object
+sa-foreign-entry?
+sa-foreign-entry-address
+sa-foreign-callable-entry-point
+sa-foreign-procedure-runtime
+sa-foreign-procedure
+sa-foreign-procedure-blocking
+#
 # tier: misc
 # format is the Chez/Guile ~a ~s ~d subset (SRFI-28); printf/fprintf are
 # format to the current/given output port. pretty-print is the standard

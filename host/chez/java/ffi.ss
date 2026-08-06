@@ -18,11 +18,11 @@
 ;; loads the running process's own symbols (libc, sockets).
 (define (ffi-load-library . args)
   (if (or (null? args) (jolt-nil? (car args)))
-      (begin (load-shared-object #f) jolt-nil)
-      (begin (load-shared-object (jolt-str-render-one (car args))) jolt-nil)))
+      (begin (sa-load-shared-object #f) jolt-nil)
+      (begin (sa-load-shared-object (jolt-str-render-one (car args))) jolt-nil)))
 
 (define (ffi-loaded? name)
-  (guard (e (#t #f)) (load-shared-object (jolt-str-render-one name)) #t))
+  (guard (e (#t #f)) (sa-load-shared-object (jolt-str-render-one name)) #t))
 
 ;; --- foreign type keywords ---------------------------------------------------
 ;; The keyword type names jolt.ffi accepts (in foreign-fn signatures and the
@@ -54,14 +54,14 @@
 ;; --- foreign memory ----------------------------------------------------------
 ;; alloc returns a pointer (integer address). The caller frees it. read/write take
 ;; a type keyword and an optional byte offset.
-(define (ffi-alloc nbytes) (foreign-alloc (jnum->exact nbytes)))
-(define (ffi-free ptr) (foreign-free (jnum->exact ptr)) jolt-nil)
+(define (ffi-alloc nbytes) (sa-foreign-alloc (jnum->exact nbytes)))
+(define (ffi-free ptr) (sa-foreign-free (jnum->exact ptr)) jolt-nil)
 (define (ffi-read ptr ty . off)
-  (foreign-ref (ffi-type->chez ty) (jnum->exact ptr) (if (pair? off) (jnum->exact (car off)) 0)))
+  (sa-foreign-ref (ffi-type->chez ty) (jnum->exact ptr) (if (pair? off) (jnum->exact (car off)) 0)))
 (define (ffi-write ptr ty off val)
-  (foreign-set! (ffi-type->chez ty) (jnum->exact ptr) (jnum->exact off) val) jolt-nil)
+  (sa-foreign-set! (ffi-type->chez ty) (jnum->exact ptr) (jnum->exact off) val) jolt-nil)
 ;; sizeof a foreign type (for laying out structs / arrays).
-(define (ffi-sizeof ty) (foreign-sizeof (ffi-type->chez ty)))
+(define (ffi-sizeof ty) (sa-foreign-sizeof (ffi-type->chez ty)))
 (define (ffi-null? ptr) (and (number? ptr) (= (jnum->exact ptr) 0)))
 (define ffi-null 0)
 
@@ -70,12 +70,12 @@
 ;; sequences) — for a socket recv buffer and similar fixed-length reads.
 (define (ffi-read-bytes ptr n)
   (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (bv (make-bytevector n)))
-    (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (foreign-ref 'unsigned-8 p i)))
+    (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (sa-foreign-ref 'unsigned-8 p i)))
     (guard (e (#t (list->string (map integer->char (bytevector->u8-list bv))))) (utf8->string bv))))
 ;; write a string's UTF-8 bytes into ptr (no NUL terminator); return the count.
 (define (ffi-write-bytes ptr s)
   (let* ((bv (string->utf8 (jolt-str-render-one s))) (n (bytevector-length bv)) (p (jnum->exact ptr)))
-    (do ((i 0 (+ i 1))) ((= i n)) (foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
+    (do ((i 0 (+ i 1))) ((= i n)) (sa-foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
     n))
 (def-var! "jolt.ffi" "read-bytes" ffi-read-bytes)
 (def-var! "jolt.ffi" "write-bytes" ffi-write-bytes)
@@ -89,11 +89,11 @@
 ;; is a signed byte, so the two directions fold and mask across that seam.
 (define (ffi-read-array ptr n)
   (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (v (make-vector n 0)))
-    (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (na-u8->byte (foreign-ref 'unsigned-8 p i))))
+    (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (na-u8->byte (sa-foreign-ref 'unsigned-8 p i))))
     (make-jolt-array v 'byte)))
 (define (ffi-write-array ptr arr)
   (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (p (jnum->exact ptr)))
-    (do ((i 0 (+ i 1))) ((= i n)) (foreign-set! 'unsigned-8 p i (bitwise-and (exact (vector-ref v i)) #xff)))
+    (do ((i 0 (+ i 1))) ((= i n)) (sa-foreign-set! 'unsigned-8 p i (bitwise-and (exact (vector-ref v i)) #xff)))
     n))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "write-array" ffi-write-array)
@@ -105,18 +105,18 @@
   (if (ffi-null? ptr) jolt-nil
       (let ((p (jnum->exact ptr)))
         (let loop ((i 0) (acc '()))
-          (let ((b (foreign-ref 'unsigned-8 p i)))
+          (let ((b (sa-foreign-ref 'unsigned-8 p i)))
             (if (= b 0) (utf8->string (u8-list->bytevector (reverse acc)))
                 (loop (+ i 1) (cons b acc))))))))
 ;; Copy a jolt string's UTF-8 bytes into a freshly alloc'd NUL-terminated buffer;
 ;; the caller frees it. Returns the pointer.
 (define (ffi-string->ptr s)
   (let* ((bv (string->utf8 (jolt-str-render-one s))) (n (bytevector-length bv))
-         (p (foreign-alloc (+ n 1))))
+         (p (sa-foreign-alloc (+ n 1))))
     ;; free on a mid-copy throw — the caller only ever sees a whole buffer
-    (guard (e (#t (guard (_ (#t #f)) (foreign-free p)) (raise e)))
-      (do ((i 0 (+ i 1))) ((= i n)) (foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
-      (foreign-set! 'unsigned-8 p n 0)
+    (guard (e (#t (guard (_ (#t #f)) (sa-foreign-free p)) (raise e)))
+      (do ((i 0 (+ i 1))) ((= i n)) (sa-foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
+      (sa-foreign-set! 'unsigned-8 p n 0)
       p)))
 
 ;; --- callbacks: receive calls FROM C ----------------------------------------
@@ -128,13 +128,13 @@
 ;; left registered lives for the process (the GTK-signal-handler common case).
 (define ffi-callable-table (make-eqv-hashtable))   ; entry-point addr -> code object
 (define (jolt-ffi-register-callable! co)
-  (lock-object co)
-  (let ((addr (foreign-callable-entry-point co)))
+  (sa-lock-object co)
+  (let ((addr (sa-foreign-callable-entry-point co)))
     (hashtable-set! ffi-callable-table addr co)
     addr))
 (define (ffi-free-callable addr)
   (let* ((a (jnum->exact addr)) (co (hashtable-ref ffi-callable-table a #f)))
-    (when co (unlock-object co) (hashtable-delete! ffi-callable-table a))
+    (when co (sa-unlock-object co) (hashtable-delete! ffi-callable-table a))
     jolt-nil))
 
 ;; --- library exports: name -> entry-point address ---------------------------
@@ -169,14 +169,14 @@
 ;; platform candidate in turn and fail unless the spec is optional.
 (define (jolt-build-load-native cands optional? process?)
   (if process?
-      (begin (load-shared-object #f) #t)
+      (begin (sa-load-shared-object #f) #t)
       (let loop ((cs cands))
         (cond
           ((null? cs)
            (unless optional?
              (error 'jolt-build "required native library not found" cands))
            #f)
-          ((guard (e (#t #f)) (load-shared-object (car cs)) #t) #t)
+          ((guard (e (#t #f)) (sa-load-shared-object (car cs)) #t) #t)
           (else (loop (cdr cs)))))))
 
 ;; --- expose under jolt.ffi ---------------------------------------------------

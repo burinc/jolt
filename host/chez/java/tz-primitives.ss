@@ -38,11 +38,11 @@
        (with-mutex tzp-mutex
          (tzp-setenv "TZ" zone 1)
          (tzp-tzset)
-         (let ((tp (foreign-alloc 8)))
-           (foreign-set! 'long tp 0 epoch)
+         (let ((tp (sa-foreign-alloc 8)))
+           (sa-foreign-set! 'long tp 0 epoch)
            (let ((tm (tzp-localtime tp)))
-             (foreign-free tp)
-             (and tm (not (eq? tm 0)) (foreign-ref 'long tm 40)))))))
+             (sa-foreign-free tp)
+             (and tm (not (eq? tm 0)) (sa-foreign-ref 'long tm 40)))))))
 
 ;; Capability probe: trust libc only if it returns known-correct offsets for known
 ;; zones/instants. Rejects Windows (garbage tm_gmtoff) and missing tzdata.
@@ -77,12 +77,12 @@
   (and tzp-locale-available?
        (let ((libc-loc (tzp-locale->libc locale))
              (buf (make-bytevector 128))
-             (tm (foreign-alloc 56)))
-         (foreign-set! 'integer-32 tm 0 0) (foreign-set! 'integer-32 tm 4 0)
-         (foreign-set! 'integer-32 tm 8 0) (foreign-set! 'integer-32 tm 12 1)
-         (foreign-set! 'integer-32 tm 16 tm-mon) (foreign-set! 'integer-32 tm 20 70)
-         (foreign-set! 'integer-32 tm 24 tm-wday) (foreign-set! 'integer-32 tm 28 0)
-         (foreign-set! 'integer-32 tm 32 -1)
+             (tm (sa-foreign-alloc 56)))
+         (sa-foreign-set! 'integer-32 tm 0 0) (sa-foreign-set! 'integer-32 tm 4 0)
+         (sa-foreign-set! 'integer-32 tm 8 0) (sa-foreign-set! 'integer-32 tm 12 1)
+         (sa-foreign-set! 'integer-32 tm 16 tm-mon) (sa-foreign-set! 'integer-32 tm 20 70)
+         (sa-foreign-set! 'integer-32 tm 24 tm-wday) (sa-foreign-set! 'integer-32 tm 28 0)
+         (sa-foreign-set! 'integer-32 tm 32 -1)
          (let ((result (with-mutex tzp-mutex
                          (let ((saved (tzp-setlocale tzp-LC_TIME libc-loc)))
                            (if saved
@@ -90,7 +90,7 @@
                                  (tzp-setlocale tzp-LC_TIME "C")
                                  (and (> n 0) n))
                                #f)))))
-           (foreign-free tm)
+           (sa-foreign-free tm)
            (and result
                 (let ((bv (make-bytevector result)))
                   (bytevector-copy! buf 0 bv 0 result)

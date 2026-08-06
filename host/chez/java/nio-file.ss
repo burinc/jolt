@@ -918,7 +918,7 @@
 (define c-getpwuid (jolt-foreign-proc-safe "getpwuid" '(unsigned-int) 'iptr))
 (define (nio-cstr-at addr)                      ; a NUL-terminated C string at a raw address
   (let loop ((i 0) (acc '()))
-    (let ((b (foreign-ref 'unsigned-8 addr i)))
+    (let ((b (sa-foreign-ref 'unsigned-8 addr i)))
       (if (= b 0) (list->string (map integer->char (reverse acc)))
           (loop (+ i 1) (cons b acc))))))
 (define (nio-stat-uid fp)
@@ -927,7 +927,7 @@
                 (let ((buf (make-bytevector 256 0)))
                   (and (= 0 (c-stat fp buf)) (bytevector-u32-ref buf (if nio-macos? 16 28) (native-endianness)))))))
 (define (nio-uid->name uid)
-  (and c-getpwuid (let ((pw (c-getpwuid uid))) (and (not (= 0 pw)) (nio-cstr-at (foreign-ref 'iptr pw 0))))))
+  (and c-getpwuid (let ((pw (c-getpwuid uid))) (and (not (= 0 pw)) (nio-cstr-at (sa-foreign-ref 'iptr pw 0))))))
 ;; user-principal values compare and hash by name; getOwner honors NOFOLLOW.
 (define (nio-userprin? x) (and (jhost? x) (string=? (jhost-tag x) "user-principal")))
 (register-eq-arm! (lambda (a b) (and (nio-userprin? a) (nio-userprin? b)))
