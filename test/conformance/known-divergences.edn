@@ -324,7 +324,36 @@
    :behavior "java.lang.management.ManagementFactory/getMemoryMXBean and the MXBean API"
    :jvm "returns a MemoryMXBean reporting heap/non-heap usage, GC counts, and more"
    :jolt "absent; the call raises \"No matching method getMemoryMXBean\""
-   :note "Runtime.totalMemory/freeMemory/maxMemory ARE present over Chez's collector accounting. What is missing is JMX itself. Affects criterium's benchmark reporting, not its timing."}]
+   :note "Runtime.totalMemory/freeMemory/maxMemory ARE present over Chez's collector accounting. What is missing is JMX itself. Affects criterium's benchmark reporting, not its timing."}
+  ;; jolt.socket (stdlib, require-gated): java.net.Socket over POSIX fds. The
+  ;; stream's available() would need ioctl(FIONREAD), and ioctl is variadic —
+  ;; variadic C calls through the FFI are unsafe on arm64 — so it answers 0.
+  ;; InputStream.available()=0 is a legal Java answer callers must handle anyway.
+  {:category :host-model
+   :behavior "(.available (.getInputStream socket)) — requires (require 'jolt.socket)"
+   :jvm "the number of bytes readable without blocking"
+   :jolt "always 0"
+   :note "FIONREAD needs ioctl, which is variadic and so FFI-unsafe on arm64. Loop-on-read code is unaffected; code that polls available() to avoid blocking will block."}
+  ;; A recv error reads as EOF: errno is not reachable through the FFI, so
+  ;; ECONNRESET (Java: SocketException) cannot be told from EINTR (Java: retry).
+  {:category :host-model
+   :behavior "(.read (.getInputStream socket)) on a reset connection — requires (require 'jolt.socket)"
+   :jvm "throws java.net.SocketException (\"Connection reset\")"
+   :jolt "-1 (EOF)"
+   :note "No errno through the FFI, so error and orderly shutdown collapse to EOF. Writes DO throw (send's return distinguishes); only the read side is permissive."}
+  ;; connect's timeout argument is accepted and ignored — the underlying
+  ;; connect(2) is always blocking (equivalent to Java's timeout 0).
+  {:category :host-model
+   :behavior "(.connect socket endpoint 5000) — requires (require 'jolt.socket)"
+   :jvm "aborts with SocketTimeoutException after 5000 ms"
+   :jolt "blocks until the OS-level connect resolves"
+   :note "A timed connect needs non-blocking mode + poll; not modeled. The no-timeout arity behaves identically on both."}
+  ;; InetSocketAddress.toString is host:port; the JVM renders hostname/ip:port.
+  {:category :host-model
+   :behavior "(str (java.net.InetSocketAddress. \"127.0.0.1\" 80)) — requires (require 'jolt.socket)"
+   :jvm "\"/127.0.0.1:80\" (hostname null for a literal; \"localhost/127.0.0.1:80\" for a name)"
+   :jolt "\"127.0.0.1:80\""
+   :note "jolt does not resolve in the InetSocketAddress constructor (the JVM does), so the hostname/ip split doesn't exist to render. Socket/ServerSocket toString follow the JVM shape."}]
  :entries
  [;; SimpleDateFormat with no Locale answers for ROOT in jolt but the machine's
   ;; DEFAULT locale on the JVM ("March|Mar|Saturday|Sat" under en), so this row's

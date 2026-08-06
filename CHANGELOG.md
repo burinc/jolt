@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`jolt.socket`: `java.net.Socket` / `ServerSocket` / `InetSocketAddress` /
+  `InetAddress` over POSIX sockets** (`(require 'jolt.socket)` registers the
+  classes; IPv4, blocking I/O). Contributed in #542, hardened in the follow-up:
+  writes to a peer-closed socket throw `IOException` instead of silently
+  dropping (SIGPIPE guarded via `MSG_NOSIGNAL`/`SO_NOSIGPIPE`), `ServerSocket`
+  binds the wildcard address like Java (port 0 + `getLocalPort` report the
+  kernel-assigned port via `getsockname`), accepted sockets know their peer,
+  `class`/`instance?`/`str` answer as the mirrored classes, and
+  `InetAddress/getByName` resolves. Deliberate gaps are in
+  `known-divergences.edn`: `available()` is 0, a recv error reads as EOF,
+  connect timeouts are ignored.
+
 ## [0.6.5] - 2026-08-05
 
 Images now carry the two things 0.6.3 refused: anonymous functions and
