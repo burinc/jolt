@@ -116,7 +116,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform traceemit traceeval \
-  inline inline-body dcerefs shakelocal manifestcheck portcheck irvalidate devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   certify
 TEST-GATES := submodules selfhost ci
@@ -535,6 +535,12 @@ portcheck:
 
 census:
 	@sh host/chez/portability-check.sh --census
+
+# PSL R2 adapter contract gate: assert every CONTRACT.txt name is bound in
+# (chezscheme). The chez adapter defines nothing — this only fails when the
+# contract file lists a name Chez does not provide.
+adaptercheck:
+	@$(CHEZ) --script host/scheme-adapter/chez.ss
 
 # Makefile dependency selection: explicit Chez overrides must bypass local
 # Makes provisioning so release jobs retain their chosen compiler and libc.

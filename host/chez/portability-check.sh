@@ -1,5 +1,5 @@
 #!/bin/sh
-# portability-check.sh — PSL R1 portability lint gate wrapper (POSIX sh).
+# portability-check.sh — PSL portability lint gate wrapper (POSIX sh).
 #
 # Runs host/chez/portability-check.ss under the build's Chez. The checker scans
 # every handwritten host .ss file (including itself) for blocklisted Chez-only
@@ -8,6 +8,8 @@
 #   --regen          rewrite host/chez/portability-allowlist.txt from reality
 #   --census         emit .dirge/psl-census.md (regenerated, not hand-edited)
 #   --dump-operators print the full operator inventory (dev aid)
+#   --contract FILE  contract file to load instead of the default
+#                    (host/scheme-adapter/CONTRACT.txt if present)
 #
 # Chez resolution mirrors bin/jolt: JOLT_CHEZ wins (the Makefile hands down the
 # interpreter it selected — same one that mints the seed and compiles

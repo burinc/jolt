@@ -161,6 +161,69 @@
 (define (srfi-tier? tier) (and tier (starts-with? tier "srfi-")))
 
 ;; ---------------------------------------------------------------------------
+;; contract: identifiers every target's adapter must provide (CONTRACT.txt).
+;; Contract names are allowed everywhere with NO allowlist lines, but still
+;; count in the census under "contract:<tier>". The contract file uses the
+;; same "# tier: NAME" format as the blocklist.
+;; ---------------------------------------------------------------------------
+
+(define contract-file (rooted "host/scheme-adapter/CONTRACT.txt"))
+(define contract (make-eq-hashtable))
+(define contract-tiers '())
+
+(define (contract-arg cl)
+  (let loop ((l cl))
+    (cond ((null? l) #f)
+          ((and (string=? (car l) "--contract") (pair? (cdr l))) (cadr l))
+          (else (loop (cdr l))))))
+
+(define (read-contract path)
+  (for-each
+    (lambda (line)
+      (cond
+        ((tier-header? line)
+         (let ((name (tier-header-name line)))
+           (unless (member name contract-tiers)
+             (set! contract-tiers (append contract-tiers (list name))))))
+        (else
+         (let* ((t (strip-comment line))
+                (toks (string->tokens t)))
+           (cond
+             ((null? toks) #f)
+             ((or (starts-with? t "#") (starts-with? t ";")) #f)
+             ((null? contract-tiers)
+              (error 'portability-check
+                     "contract identifier before any # tier: header" line))
+             (else
+              (hashtable-set! contract
+                              (string->symbol (car toks))
+                              (car (reverse contract-tiers)))))))
+        ))
+    (read-lines path)))
+
+(define (contract-tier sym)
+  (let ((t (hashtable-ref contract sym #f)))
+    (and t (string-append "contract:" t))))
+
+(define (tier-of sym)
+  (or (contract-tier sym) (blocklist-tier sym)))
+
+(define (contract-tier? tier)
+  (and tier (starts-with? tier "contract:")))
+
+(define (census-tiers)
+  (append (map (lambda (t) (string-append "contract:" t)) contract-tiers)
+          tier-order))
+
+(define (check-contract-overlap)
+  (for-each
+    (lambda (sym)
+      (when (blocklist-tier sym)
+        (error 'portability-check
+               "name in both CONTRACT.txt and the blocklist:" sym)))
+    (vector->list (hashtable-keys contract))))
+
+;; ---------------------------------------------------------------------------
 ;; allowlist: list of (file-string . identifier-symbol)
 ;; ---------------------------------------------------------------------------
 
@@ -278,7 +341,7 @@
       (else
        (when (symbol? h)
          (bump! ops h)
-         (let ((tier (blocklist-tier h)))
+         (let ((tier (tier-of h)))
            (when tier (bump! hits h))))
        (when (and (eq? h '$primitive) (pair? (cdr d)))
          (let ((last (let tail ((l (cdr d)))
@@ -296,7 +359,7 @@
 (define (walk d ops hits)
   (cond
     ((symbol? d)
-     (let ((tier (blocklist-tier d)))
+     (let ((tier (tier-of d)))
        (when tier (bump! hits d))))
     ((pair? d) (walk-pair d ops hits))
     ((vector? d) (vector-for-each (lambda (x) (walk x ops hits)) d))
@@ -308,7 +371,7 @@
 (define (walk-hits-only d hits)
   (cond
     ((symbol? d)
-     (let ((tier (blocklist-tier d)))
+     (let ((tier (tier-of d)))
        (when tier (bump! hits d))))
     ((pair? d)
      (walk-hits-only (car d) hits)
@@ -379,7 +442,8 @@
           (for-each
             (lambda (hit)
               (let ((id (car hit)))
-                (unless (or (srfi-tier? (blocklist-tier id))
+                (unless (or (contract-tier? (tier-of id))
+                            (srfi-tier? (tier-of id))
                             (covered-by-allowlist? file id allow))
                   (printf "  ~a:~a\n" file id)
                   (set! fail (+ fail 1)))))
@@ -409,7 +473,7 @@
         "# host/chez/portability-allowlist.txt — generated file, do not hand-edit.\n"
         "# Regenerate with: sh host/chez/portability-check.sh --regen\n"
         "# Lines: <file> <identifier>. A line whose hit disappears is STALE and fails the gate.\n"
-        "# srfi-portable tier hits are never listed here (wholesale-allowlisted).\n")
+        "# srfi-portable tier hits and CONTRACT names are never listed here.\n")
       p)
     (for-each
       (lambda (row)
@@ -426,8 +490,8 @@
     (lambda (r)
       (for-each
         (lambda (hit)
-          (let* ((id (car hit)) (tier (blocklist-tier id)))
-            (unless (srfi-tier? tier)
+          (let* ((id (car hit)) (tier (tier-of id)))
+            (unless (or (contract-tier? tier) (srfi-tier? tier))
               (set! rows (cons (list (car r) id) rows)))))
         (caddr r)))
     results)
@@ -452,7 +516,7 @@
     (if (null? l) n (loop (cdr l) (+ n (cdar l))))))
 
 (define (hits-in-tier hits tier)
-  (filter (lambda (h) (string=? (blocklist-tier (car h)) tier)) hits))
+  (filter (lambda (h) (string=? (tier-of (car h)) tier)) hits))
 
 (define (ids-cell ids)
   (let loop ((l ids) (acc '()))
@@ -488,14 +552,14 @@
                                 (filter (lambda (r)
                                           (pair? (hits-in-tier (caddr r) tier)))
                                         results)))
-                        tier-order))
+                        (census-tiers)))
          (tier-totals (map (lambda (tt)
                              (cons (car tt)
                                    (let loop ((rs (cdr tt)) (n 0))
                                      (if (null? rs)
                                          n
                                          (loop (cdr rs)
-                                               (+ n (hits-total (caddr (car rs)))))))))
+                                               (+ n (hits-total (hits-in-tier (caddr (car rs)) (car tt)))))))))
                            per-tier))
          (grand-total (let loop ((tt tier-totals) (n 0))
                          (if (null? tt) n (loop (cdr tt) (+ n (cdr (car tt)))))))
@@ -508,18 +572,20 @@
     (let ((p (open-output-file census-file '(replace))))
       (display
         (string-append
-          "# PSL R1 Chez-ism census\n\n"
+          "# PSL Chez-ism census\n\n"
           "Regenerated file — do not hand-edit. Regenerate from the repo root with\n\n"
           "    sh host/chez/portability-check.sh --census\n"
           "    (or: make census)\n\n"
           "Reads every handwritten host `.ss` (`host/chez/*.ss` + `host/chez/java/*.ss`,\n"
           "excluding `seed/` and `stub/`) as data, collects every operator-position symbol\n"
-          "plus every blocklisted identifier in any position, and counts those that match\n"
-          "`host/chez/portability-blocklist.txt`. This is the work-list for rounds R2-R9;\n"
-          "each round shrinks the allowlist and this census together.\n\n")
+          "plus every blocklisted or CONTRACT-listed identifier in any position, and counts\n"
+          "those matching the blocklist or `host/scheme-adapter/CONTRACT.txt`. This is the\n"
+          "work-list for rounds R2-R9; each round shrinks the allowlist and this census\n"
+          "together.\n\n")
         p)
-      (format p "Scanned ~a files; ~a blocklisted identifiers in ~a tiers; ~a total hits.\n\n"
-              (length results) (hashtable-size blocklist) (length tier-order) grand-total)
+      (format p "Scanned ~a files; ~a blocklisted identifiers in ~a tiers; ~a contract identifiers in ~a tiers; ~a total hits.\n\n"
+              (length results) (hashtable-size blocklist) (length tier-order)
+              (hashtable-size contract) (length contract-tiers) grand-total)
       (display "## Hits by tier\n\n" p)
       (for-each
         (lambda (tt)
@@ -564,8 +630,12 @@
                 ((member "--dump-operators" args) 'dump)
                 (else 'gate))))
     (read-blocklist blocklist-file)
-    (printf "portability check: blocklist loaded, ~a identifiers in ~a tiers\n"
-            (hashtable-size blocklist) (length tier-order))
+    (let ((cf (or (contract-arg args) contract-file)))
+      (when (file-exists? cf) (read-contract cf)))
+    (check-contract-overlap)
+    (printf "portability check: blocklist loaded, ~a identifiers in ~a tiers; contract ~a identifiers in ~a tiers\n"
+            (hashtable-size blocklist) (length tier-order)
+            (hashtable-size contract) (length contract-tiers))
     (let* ((files (find-files))
            (scanned (scan-all files))
            (results (car scanned))

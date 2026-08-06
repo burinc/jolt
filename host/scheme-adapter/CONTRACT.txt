@@ -1,0 +1,75 @@
+# host/scheme-adapter/CONTRACT.txt — the portable-scheme-layer CONTRACT.
+#
+# Every identifier here is something EVERY target's adapter must provide.
+# On Chez these are all natives, so host/scheme-adapter/chez.ss asserts they
+# are bound and defines NOTHING (zero wrappers, zero runtime cost). The
+# portability gate allows contract names everywhere with NO per-file allowlist
+# lines; the census still counts them under "contract:<tier>" so the
+# inventory stays honest. This file is the source of truth for
+# TARGET-CONTRACT.md (R10).
+#
+# Format mirrors portability-blocklist.txt: one identifier per line, tiers are
+# "# tier: <name>" headers. The HOST CALL SHAPE is the binding shape — a
+# target adapter must match it, not merely provide the name.
+#
+# Curated in R2: each entry must be something a portable implementation
+# (Guile/WASM is the motivating target) can reasonably provide. Anything that
+# failed that bar stayed on the blocklist (ffi, eval/compile, fasl,
+# introspection, GC hooks, Chez-only list/vector odds) — those get routed
+# through adapter capability entry points in R4-R9.
+#
+# tier: threads
+# SRFI-18 basis (threads, mutexes, conditions). make-thread-parameter follows
+# the SRFI-39 parameter discipline that R6RS parameterize/make-parameter
+# establish. get-thread-id returns the current thread object.
+fork-thread
+make-mutex
+mutex-acquire
+mutex-release
+with-mutex
+make-condition
+condition-wait
+condition-signal
+condition-broadcast
+make-thread-parameter
+get-thread-id
+#
+# tier: system
+# getenv: R7RS get-environment-variable shape — (getenv "NAME") -> string or #f.
+# system: POSIX — runs the command via the shell and returns the exit status as
+# an exact integer (build.ss checks (zero? rc)).
+# sleep/current-time are R6RS (rnrs time) members, so the contract shape is the
+# R6RS one: sleep takes a time object (the host passes (make-time ...) results),
+# current-time takes an explicit time-type ('time-utc/'time-monotonic). The host
+# ALSO calls (current-time) with zero args in run-corpus.ss — a Chez extension
+# returning a time-utc object; Guile's SRFI-19 (current-time) matches that shape,
+# so adapters must accept both the R6RS one-arg form and the zero-arg form.
+getenv
+sleep
+current-time
+system
+#
+# tier: misc
+# format is the Chez/Guile ~a ~s ~d subset (SRFI-28); printf/fprintf are
+# format to the current/given output port. pretty-print is the standard
+# pretty printer. box/unbox/set-box! are SRFI-111. gensym is R7RS. sort is the
+# Chez argument shape (sort predicate list) — SRFI-132 has the opposite order,
+# so adapters wrap. iota/list-head are SRFI-1 (take). vector-copy is SRFI-43.
+# hashtable-values returns a vector of the table's values, hashtable-cells a
+# list of (key . value) pairs (adapters build both from the R6RS
+# hashtable-keys/for-each API).
+gensym
+format
+printf
+fprintf
+pretty-print
+void
+box
+unbox
+set-box!
+sort
+iota
+list-head
+vector-copy
+hashtable-values
+hashtable-cells

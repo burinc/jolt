@@ -1,7 +1,15 @@
-# host/chez/portability-blocklist.txt — Chez-only identifiers the host may not use
-# directly. Rounds R2-R9 of the portable-scheme-layer epic move each tier behind
-# host/scheme-adapter/chez.ss; the allowlist (portability-allowlist.txt) shrinks to
-# empty as they do, and this file grows with what the census finds.
+# host/chez/portability-blocklist.txt — FORBIDDEN Chez-only identifiers the host
+# may not use directly, regardless of target. Rounds R4-R9 of the
+# portable-scheme-layer epic route each tier behind capability entry points in
+# host/scheme-adapter/chez.ss; the allowlist (portability-allowlist.txt) shrinks
+# to empty as they do, and this file grows with what the census finds.
+#
+# Names every target's adapter must provide moved to
+# host/scheme-adapter/CONTRACT.txt in R2 (threads, system basics, and the misc
+# universal primitives: boxes, format, sort, gensym, SRFI-1/SRFI-43 ops,
+# hashtable extensions). The gate allows those everywhere — no allowlist lines.
+# What remains here is the genuinely never-portable core: FFI, eval/compile,
+# fasl, introspection, GC hooks, and Chez-only list/vector odds.
 #
 # Format: one identifier per line, tiers are "# tier: <name>" headers. A tier whose
 # name starts with "srfi-" is linted but wholesale-allowlisted: the census counts
@@ -32,19 +40,6 @@ foreign-callable
 lock-object
 unlock-object
 #
-# tier: threads
-fork-thread
-make-mutex
-with-mutex
-mutex-acquire
-mutex-release
-make-condition
-condition-wait
-condition-signal
-condition-broadcast
-make-thread-parameter
-get-thread-id
-#
 # tier: eval/compile
 compile
 compile-to-file
@@ -69,15 +64,10 @@ inspect
 inspect/object
 #
 # tier: system
-getenv
 putenv
 abort
-current-time    # rnrs (rnrs time) member, but the host calls it ZERO-ARG, which is
-                # Chez-only (R6RS requires a time-type argument) — R3 owns it
 cpu-time
 real-time
-sleep
-system
 open-process-ports
 collect
 collect-request-handler
@@ -85,31 +75,16 @@ bytes-allocated
 collect-maximum-generation
 #
 # tier: misc
-gensym
-format
-printf
-fprintf
-pretty-print
-void
-box
-unbox
-set-box!
 add1
 sub1
 fxvector
 make-fxvector
-iota
 last-pair
-list-head
 list-copy
-sort
 sort!
-vector-copy
 vector-append
 date-and-time
 record-writer
-hashtable-values
-hashtable-cells
 #
 # tier: chez-unsafe
 $primitive  # reader artifact for #3%/#% unsafe-primitive syntax — files that use
