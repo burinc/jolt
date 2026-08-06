@@ -49,6 +49,28 @@ sleep
 current-time
 system
 #
+# tier: capability-system
+# OUR OWN definitions in host/chez/scheme-adapter-runtime.ss (loaded second in
+# the runtime manifest), not (chezscheme) exports — a target's adapter must
+# provide these SAME call shapes. Each is a one-liner over a blocklisted
+# system-tier native (open-process-ports / collect / bytes-allocated /
+# memory-bytes / real-time); adaptercheck loads the runtime file and probes
+# the combined environment for them. Permitted degradation, per entry point:
+# sa-gc-collect may no-op (the JVM gc it maps is only a hint); sa-run-process
+# must raise 'unsupported on targets without subprocess support (no caller
+# tolerates a fake); sa-real-time-ms may use any monotonic ms clock but never
+# a constant (callers stamp temp files with it); sa-total-memory-bytes may
+# approximate — callers only display it or subtract sa-bytes-allocated from
+# it; sa-max-memory-bytes may return a large constant (the JVM arm already
+# falls back to Long.MAX_VALUE semantics).
+sa-run-process
+sa-gc-collect
+sa-gc-max-generation
+sa-bytes-allocated
+sa-total-memory-bytes
+sa-max-memory-bytes
+sa-real-time-ms
+#
 # tier: misc
 # format is the Chez/Guile ~a ~s ~d subset (SRFI-28); printf/fprintf are
 # format to the current/given output port. pretty-print is the standard

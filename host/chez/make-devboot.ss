@@ -10,6 +10,7 @@
 (import (chezscheme))
 
 (load "host/chez/rt.ss")
+(load "host/chez/scheme-adapter-runtime.ss")
 (set-chez-ns! "clojure.core")
 (load "host/chez/seed/prelude.ss")
 (load "host/chez/post-prelude.ss")

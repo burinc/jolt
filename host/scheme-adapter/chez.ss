@@ -13,9 +13,11 @@
 ;; This file is a gate-time script, not part of the runtime: nothing in the
 ;; host loads it at startup. Run it with `make adaptercheck` (chez --script).
 ;;
-;; R4-R9 route the FORBIDDEN tiers (ffi, eval/compile, fasl, introspection,
-;; GC hooks, Chez-only list/vector odds) through capability entry points that
-;; will land here; until then the blocklist + allowlist gate covers them.
+;; R3 started routing the FORBIDDEN tiers through capability entry points in
+;; the RUNTIME half (host/chez/scheme-adapter-runtime.ss — the system tier:
+;; process/GC/clock); R4-R9 route the rest (ffi, eval/compile, fasl,
+;; introspection, Chez-only list/vector odds). The assertion pass loads that
+;; runtime file at gate time so the capability-system names are probed too.
 (import (chezscheme))
 
 ;; ---- minimal line parsing, self-contained (mirrors portability-check.ss) ----
@@ -58,6 +60,19 @@
     (string-append (substring sp 0 (- (string-length sp) (string-length "chez.ss")))
                    "CONTRACT.txt")))
 
+;; ---- capability runtime load (gate-time only) ------------------------------
+;; The capability-system names are OUR definitions, not (chezscheme) exports:
+;; load the runtime half so the assertion pass below can probe them. Loading
+;; the file is also the compile check — a broken entry point fails here.
+
+(define (runtime-file)
+  (let* ((d (substring contract-file 0
+                       (- (string-length contract-file) (string-length "CONTRACT.txt"))))
+         (root (substring d 0 (- (string-length d) (string-length "host/scheme-adapter/")))))
+    (string-append root "host/chez/scheme-adapter-runtime.ss")))
+
+(load (runtime-file))
+
 ;; ---- the assertion pass ----
 
 (define (read-contract-names path)
@@ -76,19 +91,20 @@
 
 (define chez-exports (library-exports '(chezscheme)))
 
-(define (bound-in-chezscheme? sym)
-  ;; library-exports enumerates BOTH variable and syntax bindings of
-  ;; (chezscheme), so membership is the authoritative boundness test for a
-  ;; contract name — and it sees syntax forms like with-mutex that an
-  ;; eval/value probe cannot. (1715 plain-symbol exports on Chez 10.4.1.)
-  (memq sym chez-exports))
+(define (bound-on-target? sym)
+  ;; The combined environment: (chezscheme) exports OR a top-level binding.
+  ;; library-exports enumerates BOTH variable and syntax bindings (it sees
+  ;; with-mutex, which top-level-bound? cannot); top-level-bound? sees OUR
+  ;; capability definitions, which the runtime file loaded as plain top-level
+  ;; defines and library-exports cannot.
+  (or (memq sym chez-exports) (top-level-bound? sym)))
 
 (define (main)
   (let ((names (read-contract-names contract-file)))
     (let ((missing
-            (filter (lambda (s) (not (bound-in-chezscheme? s))) names)))
+            (filter (lambda (s) (not (bound-on-target? s))) names)))
       (for-each (lambda (s) (printf "  NOT-BOUND ~a\n" s)) missing)
-      (printf "adaptercheck: ~a contract names checked against (chezscheme)\n"
+      (printf "adaptercheck: ~a contract names checked against the combined env\n"
               (length names))
       (if (null? missing)
           (begin (printf "adaptercheck: chez adapter contract satisfied\n") 0)

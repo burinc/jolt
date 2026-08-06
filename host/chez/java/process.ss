@@ -576,7 +576,7 @@
                                     child-stdout child-stdin (box '()) (box #f))))
                   (make-jhost "process" pst)))))
           (call-with-values
-            (lambda () (open-process-ports (proc-build-shell-command self) (buffer-mode block) #f))
+            (lambda () (sa-run-process (proc-build-shell-command self) #f))
             (lambda (child-stdin child-stdout child-stderr pid)
               (let* ((latches (box '()))
                      (pst (vector (make-out-stream child-stdin)
@@ -776,15 +776,15 @@
         ;; with no configured ceiling — and Long/MAX_VALUE is what the JVM reports
         ;; for exactly that case. criterium reads all four for its report, and
         ;; without them a benchmark namespace crashes rather than running.
-        (cons "totalMemory" (lambda (self) (->num (current-memory-bytes))))
+        (cons "totalMemory" (lambda (self) (->num (sa-total-memory-bytes))))
         (cons "freeMemory"
-          (lambda (self) (->num (max 0 (- (current-memory-bytes) (bytes-allocated))))))
+          (lambda (self) (->num (max 0 (- (sa-total-memory-bytes) (sa-bytes-allocated))))))
         (cons "maxMemory" (lambda (self) (->num 9223372036854775807)))
         ;; Runtime.gc routes to System/gc on the JVM, so it gets the same guarded
         ;; hint semantics — Chez's collect refuses while multiple threads are live,
         ;; and neither of these ever throws on the JVM.
         (cons "gc" (lambda (self)
-                     (guard (e (#t #f)) (collect (collect-maximum-generation)))
+                     (guard (e (#t #f)) (sa-gc-collect))
                      jolt-nil))
         ;; No finalizers on this host, so running them is genuinely a no-op — which
         ;; is also all the JVM promises (a hint, deprecated for removal since 18).

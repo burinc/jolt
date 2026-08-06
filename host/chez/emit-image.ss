@@ -21,7 +21,7 @@
 (define (ei-profile-init!)
   (set! ei-profile? (and (getenv "JOLT_BUILD_PROFILE") #t))
   (when ei-profile?
-    (set! ei-profile-start (real-time))
+    (set! ei-profile-start (sa-real-time-ms))
     (set! ei-profile-last ei-profile-start)))
 (define (ei-profile-pad s n)
   (if (>= (string-length s) n) s (string-append s (make-string (- n (string-length s)) #\space))))
@@ -34,9 +34,9 @@
 (define ei-acc-tbl (make-hashtable string-hash string=?))
 (define (ei-timed label thunk)
   (if ei-profile?
-      (let ((t0 (real-time)))
+      (let ((t0 (sa-real-time-ms)))
         (let ((v (thunk)))
-          (hashtable-update! ei-acc-tbl label (lambda (x) (+ x (- (real-time) t0))) 0)
+          (hashtable-update! ei-acc-tbl label (lambda (x) (+ x (- (sa-real-time-ms) t0))) 0)
           v))
       (thunk)))
 (define (ei-acc-report!)
@@ -60,7 +60,7 @@
 ;; between two phases without disturbing them.
 (define (ei-mark! label)
   (when ei-profile?
-    (let ((now (real-time)))
+    (let ((now (sa-real-time-ms)))
       (display (string-append "jolt build: [profile] " (ei-profile-pad label 24)
                               (ei-profile-padl (number->string (- now ei-profile-last)) 7) " ms"
                               "   (cumulative " (number->string (- now ei-profile-start)) ")\n")

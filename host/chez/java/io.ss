@@ -663,7 +663,7 @@
         (with-port (open-output-file p 'append)
           (lambda (port) (put-string port text)))
         (let ((tmp (string-append p ".spit-tmp-"
-                                   (number->string (real-time)) "-"
+                                   (number->string (sa-real-time-ms)) "-"
                                    (number->string (with-mutex io-counter-mutex
                                                      (begin (set! spit-tmp-counter (+ spit-tmp-counter 1))
                                                             spit-tmp-counter))))))

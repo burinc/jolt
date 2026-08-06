@@ -116,7 +116,7 @@
 (define (bld-sh-wrap cmd)
   (if bld-nt?
       (let* ((stamp (or bld-shell-stamp
-                        (let ((s (number->string (real-time))))
+                        (let ((s (number->string (sa-real-time-ms))))
                           (set! bld-shell-stamp s) s)))
              (tmp (or (getenv "TEMP") (getenv "TMP") "."))
              (f (begin (set! bld-shell-counter (+ bld-shell-counter 1))
@@ -227,6 +227,7 @@
 (define bld-runtime-manifest
   (list
     "(load \"host/chez/rt.ss\")"
+    "(load \"host/chez/scheme-adapter-runtime.ss\")"
     "(set-chez-ns! \"clojure.core\")"
     'prelude
     "(load \"host/chez/post-prelude.ss\")"

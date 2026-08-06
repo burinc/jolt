@@ -1278,8 +1278,8 @@
 
 (define (jolt-sh-out cmd)
   (call-with-values
-    (lambda () (open-process-ports (string-append "exec sh -c " (sh-quote cmd))
-                                   (buffer-mode block) (native-transcoder)))
+    (lambda () (sa-run-process (string-append "exec sh -c " (sh-quote cmd))
+                               (native-transcoder)))
     (lambda (stdin stdout stderr pid)
       (close-port stdin)
       (let ((out (get-string-all stdout)))

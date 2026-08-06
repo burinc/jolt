@@ -31,6 +31,7 @@
 (load "host/chez/host-contract.ss")
 (load bs-seed-image)
 (load "host/chez/compile-eval.ss")
+(load "host/chez/scheme-adapter-runtime.ss")
 (load "host/chez/emit-image.ss")
 
 ;; Rebuild both artifacts from source ON CHEZ and write them out. Any overlay/

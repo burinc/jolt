@@ -554,9 +554,9 @@
 ;; bytes-allocated is the live heap (what survived the last collection, plus what
 ;; has been allocated since); current/maximum-memory-bytes are what Chez holds from
 ;; the OS now and at its peak — the RSS-shaped numbers a runtime memory gauge wants.
-(def-var! "jolt.host" "bytes-allocated"      (lambda () (bytes-allocated)))
-(def-var! "jolt.host" "current-memory-bytes" (lambda () (current-memory-bytes)))
-(def-var! "jolt.host" "maximum-memory-bytes" (lambda () (maximum-memory-bytes)))
+(def-var! "jolt.host" "bytes-allocated"      (lambda () (sa-bytes-allocated)))
+(def-var! "jolt.host" "current-memory-bytes" (lambda () (sa-total-memory-bytes)))
+(def-var! "jolt.host" "maximum-memory-bytes" (lambda () (sa-max-memory-bytes)))
 ;; The calling thread's id, so telemetry can be read per-thread. Wrapped in a lambda
 ;; so the get-thread-id reference resolves at CALL time: a non-threaded Chez build
 ;; lacks the binding, and only a caller that actually asks for a thread id should

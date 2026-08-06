@@ -62,6 +62,8 @@ fasl-file
 # tier: introspect
 inspect
 inspect/object
+statistics
+machine-type
 #
 # tier: system
 putenv
@@ -73,6 +75,10 @@ collect
 collect-request-handler
 bytes-allocated
 collect-maximum-generation
+current-memory-bytes
+maximum-memory-bytes
+collect-trip-bytes
+file-modification-time
 #
 # tier: misc
 add1
