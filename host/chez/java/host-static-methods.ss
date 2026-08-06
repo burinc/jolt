@@ -295,7 +295,7 @@
                      ;; System.gc is a HINT on the JVM and never throws; Chez's
                      ;; collect refuses when multiple threads are active, so a
                      ;; guarded no-op is the faithful behavior under live threads.
-                     (guard (e (#t #f)) (collect (collect-maximum-generation)))
+                     (guard (e (#t #f)) (sa-gc-collect))
                      jolt-nil))
         ;; No finalizers on this host, so running them is genuinely a no-op — which
         ;; is also all the JVM promises (a hint, deprecated for removal since 18).
@@ -744,10 +744,10 @@
                   ((char=? (string-ref hay (+ i j)) (string-ref needle j)) (inner (+ j 1)))
                   (else (outer (+ i 1)))))))))
 (define sys-os-name
-  (let ((m (symbol->string (machine-type))))
-    (cond ((or (substring-index "osx" m) (substring-index "macos" m)) "Mac OS X")
-          ((or (substring-index "nt" m) (substring-index "windows" m)) "Windows")
-          (else "Linux"))))
+  (case (sa-os-family)
+    ((macos) "Mac OS X")
+    ((windows) "Windows")
+    (else "Linux")))
 ;; runtime-settable system properties (System/setProperty). A set value wins over
 ;; the built-in defaults below; clearProperty removes it.
 (define sys-prop-table (make-hashtable string-hash string=?))
@@ -810,7 +810,7 @@
 ;; fixes multi-line values that the old line-based parse broke).
 (define (all-env-pairs)
   (call-with-values
-    (lambda () (open-process-ports "env -0" (buffer-mode block) (native-transcoder)))
+    (lambda () (sa-run-process "env -0" (native-transcoder)))
     (lambda (stdin stdout stderr pid)
       (let* ((raw (get-string-all stdout))
              (s (if (eof-object? raw) "" raw)))

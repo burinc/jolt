@@ -682,12 +682,7 @@
 
 ;; ---- stat-backed perms + real path (increment: what the fs suite exercises) --
 ;; st_mode lives at a platform-specific offset in struct stat; read only that.
-(define nio-macos?
-  (let ((m (symbol->string (machine-type))))
-    (let loop ((i 0))
-      (cond ((> (+ i 3) (string-length m)) #f)
-            ((string=? (substring m i (+ i 3)) "osx") #t)
-            (else (loop (+ i 1)))))))
+(define nio-macos? (eq? (sa-os-family) 'macos))
 ;; struct stat field offsets are platform ABIs, not portable: verified for
 ;; Darwin (st_mode@4/st_uid@16, all arches) and x86_64 Linux glibc
 ;; (st_mode@24/st_uid@28 -- ground-truthed via offsetof probes). aarch64 Linux
@@ -696,19 +691,13 @@
 ;; clear error instead. st_mtim@88 is identical on both Linux ABIs, so the
 ;; mtime readers stay unguarded. Add a verified branch (not a guess) when a
 ;; new host is brought up.
-(define nio-x86-64-linux?
-  (let* ((m (symbol->string (machine-type))) (n (string-length m)))
-    (and (>= n 2) (string=? (substring m (- n 2) n) "le")
-         (let loop ((i 0))
-           (cond ((> (+ i 2) n) #f)
-                 ((string=? (substring m i (+ i 2)) "a6") #t)
-                 (else (loop (+ i 1))))))))
+(define nio-x86-64-linux? (and (eq? (sa-arch) 'x86-64) (eq? (sa-endian) 'little)))
 (define nio-stat-layout-known? (or nio-macos? nio-x86-64-linux?))
 (define (nio-stat-layout-guard! who)
   (unless nio-stat-layout-known?
     (jolt-throw (jolt-host-throwable "java.lang.UnsupportedOperationException"
       (string-append who " is not supported on this host: unverified struct stat layout for "
-                     (symbol->string (machine-type)))))))
+                     (sa-host-tag))))))
 (define c-stat (jolt-foreign-proc-safe "stat" '(string u8*) 'int))
 (define c-realpath (jolt-foreign-proc-safe "realpath" '(string u8*) 'iptr))
 (define (nio-stat-mode fp)

@@ -52,14 +52,9 @@
 (define proc-SIGKILL 9)
 (define proc-EINTR 4)          ; macOS + Linux
 (define proc-ECHILD 10)        ; macOS + Linux
-;; SIGCHLD is 20 on Darwin/BSD and 17 on Linux. Same machine-type test as
+;; SIGCHLD is 20 on Darwin/BSD and 17 on Linux. Same os-family test as
 ;; concurrency.ss uses for the SIG_BLOCK numerics.
-(define proc-SIGCHLD
-  (let* ((s (symbol->string (machine-type))) (n (string-length s)))
-    (let loop ((i 0))
-      (cond ((> (+ i 3) n) 17)                            ; default: Linux
-            ((string=? (substring s i (+ i 3)) "osx") 20) ; Darwin/macOS
-            (else (loop (+ i 1)))))))
+(define proc-SIGCHLD (if (eq? (sa-os-family) 'macos) 20 17))
 
 ;; A jolt that spawns children has to be able to reap them, so SIGCHLD must not be
 ;; left at an INHERITED SIG_IGN: with that disposition the kernel reaps every child
@@ -335,15 +330,19 @@
   (lambda (x)
     (syntax-case x (quote)
       ((_ name (quote args) (quote res))
-       (if (memq (machine-type) '(a6nt ta6nt i3nt ti3nt))
-           #'(guard (e (#t #f))
-               (load-shared-object #f)
-               (and (foreign-entry? name)
-                    (eval `(foreign-procedure __collect_safe ,name ,'args ,'res))))
-           #'(guard (e (#t #f))
-               (load-shared-object #f)
-               (and (foreign-entry? name)
-                    (foreign-procedure __collect_safe name args res))))))))
+       ;; Decide at RUNTIME, not expansion (same compile-file constraint as
+       ;; rt.ss's jolt-foreign-proc-safe): emit both branches under a runtime
+       ;; os-family test.
+       (with-syntax
+           ((win #'(guard (e (#t #f))
+                   (load-shared-object #f)
+                   (and (foreign-entry? name)
+                        (eval `(foreign-procedure __collect_safe ,name ,'args ,'res)))))
+            (unx #'(guard (e (#t #f))
+                   (load-shared-object #f)
+                   (and (foreign-entry? name)
+                        (foreign-procedure __collect_safe name args res)))))
+         #'(if (eq? (sa-os-family) 'windows) win unx))))))
 
 (define proc-c-pipe  (jolt-foreign-proc-safe "pipe"  '(void*) 'int))
 (define proc-c-close (jolt-foreign-proc-safe "close" '(int)   'int))
@@ -576,7 +575,7 @@
                                     child-stdout child-stdin (box '()) (box #f))))
                   (make-jhost "process" pst)))))
           (call-with-values
-            (lambda () (open-process-ports (proc-build-shell-command self) (buffer-mode block) #f))
+            (lambda () (sa-run-process (proc-build-shell-command self) #f))
             (lambda (child-stdin child-stdout child-stderr pid)
               (let* ((latches (box '()))
                      (pst (vector (make-out-stream child-stdin)
@@ -776,15 +775,15 @@
         ;; with no configured ceiling — and Long/MAX_VALUE is what the JVM reports
         ;; for exactly that case. criterium reads all four for its report, and
         ;; without them a benchmark namespace crashes rather than running.
-        (cons "totalMemory" (lambda (self) (->num (current-memory-bytes))))
+        (cons "totalMemory" (lambda (self) (->num (sa-total-memory-bytes))))
         (cons "freeMemory"
-          (lambda (self) (->num (max 0 (- (current-memory-bytes) (bytes-allocated))))))
+          (lambda (self) (->num (max 0 (- (sa-total-memory-bytes) (sa-bytes-allocated))))))
         (cons "maxMemory" (lambda (self) (->num 9223372036854775807)))
         ;; Runtime.gc routes to System/gc on the JVM, so it gets the same guarded
         ;; hint semantics — Chez's collect refuses while multiple threads are live,
         ;; and neither of these ever throws on the JVM.
         (cons "gc" (lambda (self)
-                     (guard (e (#t #f)) (collect (collect-maximum-generation)))
+                     (guard (e (#t #f)) (sa-gc-collect))
                      jolt-nil))
         ;; No finalizers on this host, so running them is genuinely a no-op — which
         ;; is also all the JVM promises (a hint, deprecated for removal since 18).

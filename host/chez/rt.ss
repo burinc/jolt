@@ -28,6 +28,11 @@
       (apply %chez-error #f args)
       (apply %chez-error args)))
 
+;; The scheme-adapter runtime loads FIRST: top-levels below (and in the
+;; java/*.ss loads) call sa-* entry points. rt.ss owning this load makes every
+;; loader of rt.ss — boot scripts, gate harnesses, emitted programs — correct
+;; by construction; a boot file loading it earlier is a harmless re-define.
+(load "host/chez/scheme-adapter-runtime.ss")
 (load "host/chez/values.ss")
 (load "host/chez/hasheq.ss")
 ;; Resolve a libc entry point at RUN time; #f when the entry doesn't exist
@@ -48,15 +53,20 @@
   (lambda (x)
     (syntax-case x (quote)
       ((_ name (quote args) (quote res))
-       (if (memq (machine-type) '(a6nt ta6nt i3nt ti3nt))
-           #'(guard (e (#t #f))
-               (load-shared-object #f)
-               (and (foreign-entry? name)
-                    (eval `(foreign-procedure ,name ,'args ,'res))))
-           #'(guard (e (#t #f))
-               (load-shared-object #f)
-               (and (foreign-entry? name)
-                    (foreign-procedure name args res))))))))
+       ;; Decide at RUNTIME, not expansion: under compile-file a transformer
+       ;; cannot call the runtime binding sa-os-family at expansion time
+       ;; ("variable is not bound" in the compile-time environment), so emit
+       ;; both branches under a runtime os-family test.
+       (with-syntax
+           ((win #'(guard (e (#t #f))
+                   (load-shared-object #f)
+                   (and (foreign-entry? name)
+                        (eval `(foreign-procedure ,name ,'args ,'res)))))
+            (unx #'(guard (e (#t #f))
+                   (load-shared-object #f)
+                   (and (foreign-entry? name)
+                        (foreign-procedure name args res)))))
+         #'(if (eq? (sa-os-family) 'windows) win unx))))))
 
 ;; --- how many processors can this process use ---------------------------------
 ;; Backs jolt.host/available-processors, which Runtime.availableProcessors and
@@ -540,23 +550,23 @@
 (def-var! "jolt.host" "wall-nanos" jolt-wall-nanos)
 (def-var! "jolt.host" "mono-nanos" jolt-mono-nanos)
 
-;; Collector + memory counters. `statistics` allocates a fresh sstats record per
-;; call, so these are polling-cadence primitives (a metrics reader every N seconds),
-;; not per-span ones. Each reads its own snapshot: at the OTel layer the fields are
-;; independent instruments observed separately, so tearing across them is not
-;; observable in the exported data.
-(def-var! "jolt.host" "cpu-nanos"     (lambda () (time->nanos (sstats-cpu (statistics)))))
-(def-var! "jolt.host" "real-nanos"    (lambda () (time->nanos (sstats-real (statistics)))))
-(def-var! "jolt.host" "gc-count"      (lambda () (sstats-gc-count (statistics))))
-(def-var! "jolt.host" "gc-cpu-nanos"  (lambda () (time->nanos (sstats-gc-cpu (statistics)))))
-(def-var! "jolt.host" "gc-real-nanos" (lambda () (time->nanos (sstats-gc-real (statistics)))))
-(def-var! "jolt.host" "gc-bytes"      (lambda () (sstats-gc-bytes (statistics))))
+;; Collector + memory counters. sa-stats takes one statistics snapshot per read,
+;; so these are polling-cadence primitives (a metrics reader every N seconds),
+;; not per-span ones. All six fields come from that one snapshot: at the OTel
+;; layer the fields are independent instruments observed separately, so sharing
+;; a snapshot is not observable in the exported data.
+(def-var! "jolt.host" "cpu-nanos"     (lambda () (vector-ref (sa-stats) 0)))
+(def-var! "jolt.host" "real-nanos"    (lambda () (vector-ref (sa-stats) 1)))
+(def-var! "jolt.host" "gc-count"      (lambda () (vector-ref (sa-stats) 2)))
+(def-var! "jolt.host" "gc-cpu-nanos"  (lambda () (vector-ref (sa-stats) 3)))
+(def-var! "jolt.host" "gc-real-nanos" (lambda () (vector-ref (sa-stats) 4)))
+(def-var! "jolt.host" "gc-bytes"      (lambda () (vector-ref (sa-stats) 5)))
 ;; bytes-allocated is the live heap (what survived the last collection, plus what
 ;; has been allocated since); current/maximum-memory-bytes are what Chez holds from
 ;; the OS now and at its peak — the RSS-shaped numbers a runtime memory gauge wants.
-(def-var! "jolt.host" "bytes-allocated"      (lambda () (bytes-allocated)))
-(def-var! "jolt.host" "current-memory-bytes" (lambda () (current-memory-bytes)))
-(def-var! "jolt.host" "maximum-memory-bytes" (lambda () (maximum-memory-bytes)))
+(def-var! "jolt.host" "bytes-allocated"      (lambda () (sa-bytes-allocated)))
+(def-var! "jolt.host" "current-memory-bytes" (lambda () (sa-total-memory-bytes)))
+(def-var! "jolt.host" "maximum-memory-bytes" (lambda () (sa-max-memory-bytes)))
 ;; The calling thread's id, so telemetry can be read per-thread. Wrapped in a lambda
 ;; so the get-thread-id reference resolves at CALL time: a non-threaded Chez build
 ;; lacks the binding, and only a caller that actually asks for a thread id should
@@ -565,10 +575,10 @@
 ;; The underlying runtime's identity, as strings. A telemetry resource has to name
 ;; the runtime and machine it is reporting from (process.runtime.*, host.arch);
 ;; System/getProperty answers neither here, since jolt has no JVM behind it.
-;; machine-type is Chez's own tag, e.g. tarm64osx / a6le, which encodes both the
-;; architecture and the OS.
+;; sa-host-tag is the runtime's own tag, e.g. tarm64osx / a6le, which encodes both
+;; the architecture and the OS.
 (def-var! "jolt.host" "scheme-version" (lambda () (scheme-version)))
-(def-var! "jolt.host" "machine-type" (lambda () (symbol->string (machine-type))))
+(def-var! "jolt.host" "machine-type" (lambda () (sa-host-tag)))
 
 ;; var def-time metadata: the :def emit passes the def's reader meta
 ;; (^:private / ^Type tag / docstring -> {:doc}) here, stored in an eq side-table
@@ -1016,7 +1026,7 @@
 (define (jolt-entropy-source)
   (when (eq? entropy-source 'unset)
     (set! entropy-source
-          (if (memq (machine-type) '(a6nt ta6nt i3nt ti3nt))
+          (if (eq? (sa-os-family) 'windows)
               (entropy-open-windows)
               (entropy-open-urandom))))
   entropy-source)

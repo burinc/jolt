@@ -1,0 +1,172 @@
+# host/scheme-adapter/CONTRACT.txt — the portable-scheme-layer CONTRACT.
+#
+# Every identifier here is something EVERY target's adapter must provide.
+# On Chez these are all natives, so host/scheme-adapter/chez.ss asserts they
+# are bound and defines NOTHING (zero wrappers, zero runtime cost). The
+# portability gate allows contract names everywhere with NO per-file allowlist
+# lines; the census still counts them under "contract:<tier>" so the
+# inventory stays honest. This file is the source of truth for
+# TARGET-CONTRACT.md (R10).
+#
+# Format mirrors portability-blocklist.txt: one identifier per line, tiers are
+# "# tier: <name>" headers. The HOST CALL SHAPE is the binding shape — a
+# target adapter must match it, not merely provide the name.
+#
+# Curated in R2: each entry must be something a portable implementation
+# (Guile/WASM is the motivating target) can reasonably provide. Anything that
+# failed that bar stayed on the blocklist (ffi, eval/compile, fasl,
+# introspection, GC hooks, Chez-only list/vector odds) — those get routed
+# through adapter capability entry points in R4-R9.
+#
+# tier: threads
+# SRFI-18 basis (threads, mutexes, conditions). make-thread-parameter follows
+# the SRFI-39 parameter discipline that R6RS parameterize/make-parameter
+# establish. get-thread-id returns the current thread object.
+#
+# GET-THREAD-ID IS A NUMBER, DISTINCT PER LIVE THREAD (PSL R4, pinned): Chez
+# returns a fixnum id. Host code multiplies it into the random seed
+# (rt.ss:967) and keys an eqv?-hashtable by it (lazy-bridge.ss live-threads);
+# no site assumes ordering. A target whose native thread ids are objects must
+# map them to a numeric per-thread id for this contract name.
+#
+# CONDITION-WAIT MAY WAKE SPURIOUSLY (PSL R4, pinned): every host wait site
+# re-checks its predicate in a loop (each site recorded in the R4 table);
+# targets need not suppress spurious wakeups.
+#
+# THREAD-PARAMETER FORK-INHERITANCE (PSL R4, pinned): a thread created with
+# fork-thread starts with the CREATING thread's CURRENT values of every
+# thread parameter (the SRFI-18 semantic, and Chez's). The host depends on
+# this in two directions and a target adapter must reproduce it:
+#   - dyn-binding-stack (dyn-binding.ss): binding conveyance into futures,
+#     agents, go blocks, and async callbacks. future/go/Thread.start/
+#     executor forks ALSO re-install an explicit snapshot, but the
+#     agent-worker forks (concurrency.ss:305, 467), the tap delivery thread
+#     (concurrency.ss:530), and the async put!/take! callback forks
+#     (async.ss:480-482, 490, 492) rely on inheritance ALONE — fresh-default
+#     fork semantics would silently drop the creating thread's dynamic
+#     bindings there.
+#   - *txn* (refs.ss): the STM transaction record. Twelve fork bodies clear
+#     it with an explicit (*txn* #f) because a child would otherwise inherit
+#     the parent's in-flight transaction; the clears are written under (and
+#     document) the inheritance model. R4 added the executor-worker clear
+#     (concurrency.ss:902): a pool created inside a dosync forked workers
+#     holding the stale txn record, so a job calling ref-set outside a txn
+#     silently wrote into the dead log (never committed) instead of throwing
+#     IllegalStateException like the JVM.
+# A parameter used with the OPPOSITE assumption (fresh default per thread,
+# worked around the inheritance — thread-interrupt-cell in
+# host-static-methods.ss, random-seeded? in rt.ss, *agent-nested* in
+# concurrency.ss) defends itself with an owner-identity check or an explicit
+# reset at use, so those work under either model; they are noted per file in
+# the R4 table, not re-pinned here.
+#
+# ThreadLocal (host-static-classes.ss:1195) is the one opposite-direction
+# parameter that does NOT defend: under fork-inheritance a child inherits the
+# parent's SET value instead of re-running its init-thunk (the JVM always
+# yields a fresh value per thread). Accepted divergence, documented in the R4
+# table; a fresh-default-per-thread target reproduces JVM ThreadLocal exactly.
+#
+# MUTEXES ARE NON-RECURSIVE (PSL R4, pinned): same-thread re-acquire blocks,
+# per SRFI-18 mutex-acquire!. No host site re-acquires: re-entrant entry is
+# handled structurally — nested dosync joins the outer transaction through
+# the *txn* thread parameter (jolt-sync, refs.ss:159-161) and atom/ref/user
+# callbacks are never invoked under a held lock (atoms.ss swap! runs f and
+# watches outside the CAS lock; refs.ss fires watches after commit, outside
+# stm-lock). A target whose mutexes are recursive must still satisfy every
+# contract name with the non-recursive discipline, since host code relies on
+# re-entrance NOT being recursion.
+fork-thread
+make-mutex
+mutex-acquire
+mutex-release
+with-mutex
+make-condition
+condition-wait
+condition-signal
+condition-broadcast
+make-thread-parameter
+get-thread-id
+#
+# tier: system
+# getenv: R7RS get-environment-variable shape — (getenv "NAME") -> string or #f.
+# system: POSIX — runs the command via the shell and returns the exit status as
+# an exact integer (build.ss checks (zero? rc)).
+# sleep/current-time are R6RS (rnrs time) members, so the contract shape is the
+# R6RS one: sleep takes a time object (the host passes (make-time ...) results),
+# current-time takes an explicit time-type ('time-utc/'time-monotonic). The host
+# ALSO calls (current-time) with zero args in run-corpus.ss — a Chez extension
+# returning a time-utc object; Guile's SRFI-19 (current-time) matches that shape,
+# so adapters must accept both the R6RS one-arg form and the zero-arg form.
+getenv
+sleep
+current-time
+system
+#
+# tier: capability-system
+# OUR OWN definitions in host/chez/scheme-adapter-runtime.ss (loaded FIRST in
+# the runtime manifest), not (chezscheme) exports — a target's adapter must
+# provide these SAME call shapes. Each is a one-liner over a blocklisted
+# system-tier native (open-process-ports / collect / bytes-allocated /
+# memory-bytes / real-time); adaptercheck loads the runtime file and probes
+# the combined environment for them. Permitted degradation, per entry point:
+# sa-gc-collect may no-op (the JVM gc it maps is only a hint); sa-run-process
+# must raise 'unsupported on targets without subprocess support (no caller
+# tolerates a fake); sa-real-time-ms may use any monotonic ms clock but never
+# a constant (callers stamp temp files with it); sa-total-memory-bytes may
+# approximate — callers only display it or subtract sa-bytes-allocated from
+# it; sa-max-memory-bytes may return a large constant (the JVM arm already
+# falls back to Long.MAX_VALUE semantics).
+sa-run-process
+sa-gc-collect
+sa-gc-max-generation
+sa-bytes-allocated
+sa-total-memory-bytes
+sa-max-memory-bytes
+sa-real-time-ms
+sa-file-mtime-ms
+sa-gc-trip-bytes!
+#
+# tier: capability-introspect
+# OUR definitions in host/chez/scheme-adapter-runtime.ss for the blocklist's
+# introspect tier (machine-type / inspect/object / statistics). The machine
+# tag is exposed ONLY as sa-host-tag for naming (release dirs, image headers,
+# telemetry); every logic branch consumes the DERIVED properties
+# (sa-os-family / sa-arch / sa-endian) — a Guile target has no ta6osx to give
+# but can answer "what OS / arch / byte order is this". sa-stats degrades to
+# a zero vector; the walker/procedure entry points degrade to '() / #f and
+# the backtrace renders without frames, gated by sa-introspect-enabled?
+# (a dynamic parameter — the degraded-backtrace gate flips it to prove throws
+# still carry type+message).
+sa-host-tag
+sa-os-family
+sa-arch
+sa-endian
+sa-stats
+sa-introspect-enabled?
+sa-continuation-frames
+sa-procedure-info
+#
+# tier: misc
+# format is the Chez/Guile ~a ~s ~d subset (SRFI-28); printf/fprintf are
+# format to the current/given output port. pretty-print is the standard
+# pretty printer. box/unbox/set-box! are SRFI-111. gensym is R7RS. sort is the
+# Chez argument shape (sort predicate list) — SRFI-132 has the opposite order,
+# so adapters wrap. iota/list-head are SRFI-1 (take). vector-copy is SRFI-43.
+# hashtable-values returns a vector of the table's values, hashtable-cells a
+# list of (key . value) pairs (adapters build both from the R6RS
+# hashtable-keys/for-each API).
+gensym
+format
+printf
+fprintf
+pretty-print
+void
+box
+unbox
+set-box!
+sort
+iota
+list-head
+vector-copy
+hashtable-values
+hashtable-cells

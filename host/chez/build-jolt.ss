@@ -24,6 +24,7 @@
 
 (import (chezscheme))
 
+(load "host/chez/scheme-adapter-runtime.ss")  ; before rt.ss: macros + top-levels in rt.ss/java/*.ss call sa-*
 (load "host/chez/rt.ss")
 (set-chez-ns! "clojure.core")
 (load "host/chez/seed/prelude.ss")
@@ -170,7 +171,7 @@
 (suppress-greeting #t)
 ;; GC tuning: larger nursery for allocation-heavy workloads. Default 16 MB;
 ;; override via JOLT_GC_TRIP_BYTES env (integer bytes).
-(collect-trip-bytes
+(sa-gc-trip-bytes!
   (let ((trip (getenv \"JOLT_GC_TRIP_BYTES\"))
         (default (* 16 1024 1024)))
     (if trip (or (string->number trip) default) default)))

@@ -10,6 +10,14 @@
 ;; atom/var/agent.  Loaded after atoms.ss (shares jolt-iref-state-throw and
 ;; the iref tables).
 
+;; The lock field is DEAD at runtime (stm-lock serializes every commit; no code
+;; reads it) but it is FROZEN in the record layout: refs travel in images as
+;; raw nongenerative records, so jolt-ref-v1's field list is image-format
+;; surface — a 0.6.5 image holding a ref fails to restore against a changed
+;; layout with "incompatible record type jolt-ref". Removing the field needs
+;; state-image to walk refs by value (like walk-atom) and a compat story for
+;; existing images first: bead jolt-867l tracks it. Verified 2026-08-06 by
+;; dumping {ref} with the v0.6.5 release binary and restoring here.
 (define-record-type jolt-ref
   (fields (mutable val) lock)
   (nongenerative jolt-ref-v1))

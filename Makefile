@@ -115,8 +115,8 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi \
   transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
-  fnform traceemit traceeval \
-  inline inline-body dcerefs shakelocal manifestcheck irvalidate devbootsmoke \
+  fnform traceemit traceeval degradedbacktrace \
+  inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   certify
 TEST-GATES := submodules selfhost ci
@@ -455,6 +455,12 @@ traceemit:
 traceeval:
 	@$(CHEZ) --script host/chez/run-traceeval.ss
 
+# PSL R6: with introspection suppressed (sa-introspect-enabled? #f), a throw
+# still surfaces type+message while the walker entry points return empty and
+# the backtrace renders without continuation frames.
+degradedbacktrace:
+	@$(CHEZ) --script host/chez/run-degraded-backtrace.ss
+
 # Nilable record types + flow-sensitive narrowing: a record-or-nil types as a nilable
 # record (some?/nil? don't fold, so a runtime guard stays); inside (if (some? x) ..)
 # the then-branch narrows x to non-nil, so its field reads bare-index and unbox.
@@ -526,6 +532,21 @@ shakelocal: testbin
 # this diffs them so a load added to one but not the other fails the gate.
 manifestcheck:
 	@sh host/chez/manifest-check.sh
+
+# PSL R1 portability lint gate: fails when a blocklisted Chez-only identifier
+# appears in a host file that is not allowlisted for it (and on stale allowlist
+# lines). Allowlist seeded from current reality; rounds R2-R9 shrink it to empty.
+portcheck:
+	@sh host/chez/portability-check.sh
+
+census:
+	@sh host/chez/portability-check.sh --census
+
+# PSL R2 adapter contract gate: assert every CONTRACT.txt name is bound in
+# (chezscheme). The chez adapter defines nothing — this only fails when the
+# contract file lists a name Chez does not provide.
+adaptercheck:
+	@$(CHEZ) --script host/scheme-adapter/chez.ss
 
 # Makefile dependency selection: explicit Chez overrides must bypass local
 # Makes provisioning so release jobs retain their chosen compiler and libc.

@@ -29,6 +29,7 @@
 " (current-error-port))
   (exit 1))
 
+(load "host/chez/scheme-adapter-runtime.ss")  ; before rt.ss: macros + top-levels in rt.ss/java/*.ss call sa-*
 (load "host/chez/rt.ss")
 (set-chez-ns! "clojure.core")
 (load "host/chez/seed/prelude.ss")

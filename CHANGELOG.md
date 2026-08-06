@@ -13,6 +13,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binary in `~/.local/bin`) and, when neither `PREFIX` nor `--dir` is given,
   defaults to `~/.local/bin` for non-root users instead of failing on
   `/usr/local/bin` with permission denied. Root keeps `/usr/local/bin`.
+- **Monitors are reentrant per thread, like JVM intrinsic locks.** A nested
+  `(locking x ...)` on the same object from the same thread deadlocked, and
+  a non-owner `monitor-exit` silently released someone else's lock instead
+  of throwing `IllegalMonitorStateException`. (#446 threads audit)
+- **Executor pool workers no longer inherit an in-flight transaction.** A
+  pool created inside a `dosync` handed its workers the live transaction,
+  so a job's `ref-set` outside any transaction silently wrote into the dead
+  transaction log instead of throwing `IllegalStateException`.
+- **Atomic `updateAndGet`/`getAndUpdate` run the update fn lock-free** in a
+  CAS retry loop like the JVM; a fn that touched its own atomic deadlocked.
+- **`await`/`await-for` on a failed agent throw** `"Agent is failed, needs
+  restart"` instead of returning normally. Entering the wait on an
+  already-failed agent matches the JVM exactly; an agent failing mid-wait
+  throws where the JVM blocks forever (deliberate; `known-divergences.edn`).
+
+### Added
+
+- **Portability groundwork for #446** — a general Scheme layer with the
+  Chez-specific bits isolated. Every Chez-only identifier the host uses is
+  now either in the documented adapter contract (`host/scheme-adapter/`) or
+  routed through `sa-*` capability entry points
+  (`host/chez/scheme-adapter-runtime.ss`), enforced by new ci gates
+  (`portcheck`, `adaptercheck`, `degradedbacktrace`). Capability tiers
+  (threads / ffi / introspect / native-compile) make a WASM-class target
+  definable; the threads-tier audit behind this produced the concurrency
+  fixes above. No user-facing behavior change otherwise.
 
 ## [0.6.6] - 2026-08-06
 

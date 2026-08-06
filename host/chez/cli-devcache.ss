@@ -8,7 +8,7 @@
 (when (let ((m (getenv "JOLT_DEVCACHE"))) (and m (not (string=? m ""))))
   (display "devcache: using target/dev/flat.so\n" (current-error-port)))
 ;; GC tuning (same as the binary's launcher).
-(collect-trip-bytes
+(sa-gc-trip-bytes!
   (let ((trip (getenv "JOLT_GC_TRIP_BYTES"))
         (default (* 16 1024 1024)))
     (if trip (or (string->number trip) default) default)))

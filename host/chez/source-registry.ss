@@ -149,10 +149,11 @@
   ;; at heap-build time, where this would always be unset.
   (let ((debug? (getenv "JOLT_DEBUG_FRAMES")))
    (guard (e (#t '()))
-    (let loop ((io (inspect/object k)) (n 0) (acc '()))
-      (if (or (not io) (fx>=? n 400))
+    (let loop ((ios (sa-continuation-frames k)) (acc '()))
+      (if (null? ios)
           (reverse acc)
-          (let* ((nm (srcreg-frame-name io))
+          (let* ((io (car ios))
+                 (nm (srcreg-frame-name io))
                  (src (and nm (hashtable-ref source-registry nm #f)))
                  ;; keep a frame that maps, or any named frame that isn't plumbing
                  (keep? (and nm (or src (not (srcreg-plumbing-name? nm)))))
@@ -164,7 +165,7 @@
                                                           (if keep? "" " (skipped)"))
                                       (srcreg-frame-source-debug io) "\n")
                        (current-error-port)))
-            (loop (guard (e (#t #f)) (io 'link)) (fx+ n 1)
+            (loop (cdr ios)
                   (if keep? (cons (srcreg-frame nm src line) acc) acc))))))))
 
 ;; --- clj-line lookup for generated .scm offsets ---------------------------------
@@ -393,7 +394,7 @@
   (define (read-table)
     (call-with-input-file path
       (lambda (p) (jolt-marker-table (get-string-all p)))))
-  (let* ((mtime (time-second (file-modification-time path)))
+  (let* ((mtime (div (sa-file-mtime-ms path) 1000))
          (entry (hashtable-ref jolt-marker-cache-file path #f)))
     (unless (and entry (= (car entry) mtime))
       (set! entry (cons mtime (read-table)))
