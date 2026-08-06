@@ -28,6 +28,11 @@
       (apply %chez-error #f args)
       (apply %chez-error args)))
 
+;; The scheme-adapter runtime loads FIRST: top-levels below (and in the
+;; java/*.ss loads) call sa-* entry points. rt.ss owning this load makes every
+;; loader of rt.ss — boot scripts, gate harnesses, emitted programs — correct
+;; by construction; a boot file loading it earlier is a harmless re-define.
+(load "host/chez/scheme-adapter-runtime.ss")
 (load "host/chez/values.ss")
 (load "host/chez/hasheq.ss")
 ;; Resolve a libc entry point at RUN time; #f when the entry doesn't exist
