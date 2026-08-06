@@ -588,21 +588,37 @@
       ((jolt-agent? x) (jolt-agent-state x))
       ((jolt-delay? x) (jolt-delay-force x))
       ;; a record/reify implementing clojure.lang.IDeref: @x calls its `deref`
-      ;; method with the value itself as the leading `this`.
-      ;;
-      ;; opts are forwarded, so a type implementing clojure.lang.IBlockingDeref
-      ;; gets (deref this timeout-ms timeout-value) rather than the blocking
-      ;; one-arity. Dropping them here did not fail loudly: the timed call
-      ;; silently became an untimed one, so (deref proc 1500 ::timeout) on a
-      ;; babashka.process record waited for the process to exit however long
-      ;; that took, and the caller's timeout branch was unreachable. That made
-      ;; every bounded subprocess call in a downstream harness unbounded, and
-      ;; leaked the processes it thought it was killing.
-      ((and (jrec? x) (find-method-any-protocol (jrec-tag x) "deref"))
-       => (lambda (m) (apply jolt-invoke m x opts)))
+      ;; method with the value itself as the leading `this`. The timed arity
+      ;; passes its opts through — (deref r ms val) reaches the IBlockingDeref
+      ;; 3-arity method. A deref method that exists only at the other arity is
+      ;; the JVM's failed interface cast: throw ClassCastException naming the
+      ;; interface the requested arity belongs to.
+      ((and (jrec? x)
+            (find-method-any-protocol-arity (jrec-tag x) "deref"
+                                            (if (null? opts) 1 3)))
+       ;; the arity lookup falls back to any same-name method, so verify the
+       ;; chosen impl really accepts this call's arity before invoking.
+       => (lambda (m)
+            (if (and (procedure? m)
+                     (not (bitwise-bit-set? (procedure-arity-mask m)
+                                            (+ 1 (length opts)))))
+                (jolt-throw (deref-cast-error x opts))
+                (apply jolt-invoke m x opts))))
       ((and (reified-methods x) (hashtable-ref (reified-methods x) "deref" #f))
-       => (lambda (m) (apply jolt-invoke m x opts)))
+       => (lambda (m)
+            (if (and (procedure? m)
+                     (not (bitwise-bit-set? (procedure-arity-mask m)
+                                            (+ 1 (length opts)))))
+                (jolt-throw (deref-cast-error x opts))
+                (apply jolt-invoke m x opts))))
       (else (apply %pre-conc-deref x opts)))))
+
+(define (deref-cast-error x opts)
+  (jolt-host-throwable
+   "java.lang.ClassCastException"
+   (string-append "class " (guard (e (#t "?")) (jolt-class-name x))
+                  " cannot be cast to class "
+                  (if (null? opts) "clojure.lang.IDeref" "clojure.lang.IBlockingDeref"))))
 
 ;; realized? for a future/promise/delay. Wrapped over the overlay version in
 ;; post-prelude.ss.
