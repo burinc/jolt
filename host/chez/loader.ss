@@ -513,7 +513,7 @@
       (close-port out))))
 (define (aot-file-seconds path)
   (guard (e (else 0))
-    (let ((t (file-modification-time path))) (time-second t))))
+    (div (sa-file-mtime-ms path) 1000)))
 (define (aot-delete-tree path)
   (guard (e (else #f))
     (if (and (file-directory? path) (not (file-symbolic-link? path)))

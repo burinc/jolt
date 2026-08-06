@@ -114,12 +114,7 @@
       (cond
         (c (c path #o755))
         ;; Windows has no chmod and needs none (execute is by extension)
-        ((let ((m (symbol->string (machine-type))))
-           (let loop ((i 0))
-             (cond ((> (+ i 2) (string-length m)) #f)
-                   ((string=? (substring m i (+ i 2)) "nt") #t)
-                   (else (loop (+ i 1))))))
-         0)
+        ((eq? (sa-os-family) 'windows) 0)
         (else (system (string-append "chmod 755 '" path "'")))))))
 
 ;; user.dir — the project dir every user-facing relative path resolves against.
@@ -214,10 +209,7 @@
       (let ((port (open-file-input-port p))) (let ((n (file-length port))) (close-port port) n))))
 ;; last-modified as epoch milliseconds (0 if the file is absent).
 (define (file-mtime-millis p)
-  (if (file-exists? p)
-      (let ((t (file-modification-time p)))
-        (+ (* (time-second t) 1000) (div (time-nanosecond t) 1000000)))
-      0))
+  (if (file-exists? p) (sa-file-mtime-ms p) 0))
 ;; set atime+mtime from epoch milliseconds via utimes(2). struct timeval is
 ;; sec + usec, 16 bytes each on the 64-bit platforms Chez targets; usec fits
 ;; its field (< 1e6) so a signed 64-bit native-endian write covers the layout.

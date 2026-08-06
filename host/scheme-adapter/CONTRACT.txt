@@ -103,7 +103,7 @@ current-time
 system
 #
 # tier: capability-system
-# OUR OWN definitions in host/chez/scheme-adapter-runtime.ss (loaded second in
+# OUR OWN definitions in host/chez/scheme-adapter-runtime.ss (loaded FIRST in
 # the runtime manifest), not (chezscheme) exports — a target's adapter must
 # provide these SAME call shapes. Each is a one-liner over a blocklisted
 # system-tier native (open-process-ports / collect / bytes-allocated /
@@ -123,6 +123,28 @@ sa-bytes-allocated
 sa-total-memory-bytes
 sa-max-memory-bytes
 sa-real-time-ms
+sa-file-mtime-ms
+sa-gc-trip-bytes!
+#
+# tier: capability-introspect
+# OUR definitions in host/chez/scheme-adapter-runtime.ss for the blocklist's
+# introspect tier (machine-type / inspect/object / statistics). The machine
+# tag is exposed ONLY as sa-host-tag for naming (release dirs, image headers,
+# telemetry); every logic branch consumes the DERIVED properties
+# (sa-os-family / sa-arch / sa-endian) — a Guile target has no ta6osx to give
+# but can answer "what OS / arch / byte order is this". sa-stats degrades to
+# a zero vector; the walker/procedure entry points degrade to '() / #f and
+# the backtrace renders without frames, gated by sa-introspect-enabled?
+# (a dynamic parameter — the degraded-backtrace gate flips it to prove throws
+# still carry type+message).
+sa-host-tag
+sa-os-family
+sa-arch
+sa-endian
+sa-stats
+sa-introspect-enabled?
+sa-continuation-frames
+sa-procedure-info
 #
 # tier: misc
 # format is the Chez/Guile ~a ~s ~d subset (SRFI-28); printf/fprintf are

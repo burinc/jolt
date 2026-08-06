@@ -11,10 +11,7 @@
 ;; jolt.host/tz-backend         :libc | :fallback
 
 ;; LC_TIME varies by platform: 5 on macOS, 2 on Linux/glibc.
-(define tzp-LC_TIME
-  (case (machine-type)
-    ((a6osx t3osx i3osx ta6osx tarm64osx arm64osx) 5)
-    (else 2)))
+(define tzp-LC_TIME (if (eq? (sa-os-family) 'macos) 5 2))
 (define tzp-mutex (make-mutex))
 
 ;; Guard-wrapped FFI via jolt-foreign-proc-safe (deferred symbol lookup so a

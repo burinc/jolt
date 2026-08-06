@@ -652,6 +652,10 @@
   (call-with-output-file probe
     (lambda (p)
       (put-string p "(import (chezscheme))\n")
+      ;; every boot path loads the runtime adapter FIRST (rt.ss top-levels
+      ;; call sa-* — scheme-adapter-runtime.ss header); this probe is a boot
+      ;; path too.
+      (put-string p "(load \"host/chez/scheme-adapter-runtime.ss\")\n")
       (put-string p "(load \"host/chez/rt.ss\")\n")
       (put-string p "(guard (e (#t (display (condition->message-string e)) (newline)))\n")
       (put-string p "  (image-eval-fnsrc (make-image-fnsrc \"jfn$r3$nce$0\" '() \"user\" '() (vector)) '()))\n"))

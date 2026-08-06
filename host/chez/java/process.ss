@@ -52,14 +52,9 @@
 (define proc-SIGKILL 9)
 (define proc-EINTR 4)          ; macOS + Linux
 (define proc-ECHILD 10)        ; macOS + Linux
-;; SIGCHLD is 20 on Darwin/BSD and 17 on Linux. Same machine-type test as
+;; SIGCHLD is 20 on Darwin/BSD and 17 on Linux. Same os-family test as
 ;; concurrency.ss uses for the SIG_BLOCK numerics.
-(define proc-SIGCHLD
-  (let* ((s (symbol->string (machine-type))) (n (string-length s)))
-    (let loop ((i 0))
-      (cond ((> (+ i 3) n) 17)                            ; default: Linux
-            ((string=? (substring s i (+ i 3)) "osx") 20) ; Darwin/macOS
-            (else (loop (+ i 1)))))))
+(define proc-SIGCHLD (if (eq? (sa-os-family) 'macos) 20 17))
 
 ;; A jolt that spawns children has to be able to reap them, so SIGCHLD must not be
 ;; left at an INHERITED SIG_IGN: with that disposition the kernel reaps every child
@@ -335,15 +330,19 @@
   (lambda (x)
     (syntax-case x (quote)
       ((_ name (quote args) (quote res))
-       (if (memq (machine-type) '(a6nt ta6nt i3nt ti3nt))
-           #'(guard (e (#t #f))
-               (load-shared-object #f)
-               (and (foreign-entry? name)
-                    (eval `(foreign-procedure __collect_safe ,name ,'args ,'res))))
-           #'(guard (e (#t #f))
-               (load-shared-object #f)
-               (and (foreign-entry? name)
-                    (foreign-procedure __collect_safe name args res))))))))
+       ;; Decide at RUNTIME, not expansion (same compile-file constraint as
+       ;; rt.ss's jolt-foreign-proc-safe): emit both branches under a runtime
+       ;; os-family test.
+       (with-syntax
+           ((win #'(guard (e (#t #f))
+                   (load-shared-object #f)
+                   (and (foreign-entry? name)
+                        (eval `(foreign-procedure __collect_safe ,name ,'args ,'res)))))
+            (unx #'(guard (e (#t #f))
+                   (load-shared-object #f)
+                   (and (foreign-entry? name)
+                        (foreign-procedure __collect_safe name args res)))))
+         #'(if (eq? (sa-os-family) 'windows) win unx))))))
 
 (define proc-c-pipe  (jolt-foreign-proc-safe "pipe"  '(void*) 'int))
 (define proc-c-close (jolt-foreign-proc-safe "close" '(int)   'int))

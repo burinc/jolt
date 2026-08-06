@@ -16,10 +16,13 @@ cd "$root"
 fail=0
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 
-# cli.ss's runtime loads, in order: the block from the first rt.ss load to the
-# shared entry tail (cli-tail.ss — source roots + jolt-cli-run; it loads
-# build.ss later, conditionally, which is not part of the runtime skeleton).
-sed -n '/(load "host\/chez\/rt.ss")/,/(load "host\/chez\/cli-tail.ss")/p' host/chez/cli.ss \
+# cli.ss's runtime loads, in order: the block from the first runtime load
+# (scheme-adapter-runtime.ss — PSL R5+R6 made the adapter load FIRST, before
+# rt.ss, because rt.ss's jolt-foreign-proc-safe macro resolves sa-os-family at
+# expansion time) to the shared entry tail (cli-tail.ss — source roots +
+# jolt-cli-run; it loads build.ss later, conditionally, which is not part of
+# the runtime skeleton).
+sed -n '/(load "host\/chez\/scheme-adapter-runtime.ss")/,/(load "host\/chez\/cli-tail.ss")/p' host/chez/cli.ss \
   | grep -oE 'host/chez/[a-zA-Z0-9_/.-]+\.ss' \
   | grep -v '^host/chez/cli-tail\.ss$' > "$tmp/cli"
 
@@ -44,7 +47,7 @@ fi
 # The gates stop before cli-core.ss deliberately (loader.ss would turn their
 # alias-only `require` into real file loading), so compare against the manifest
 # truncated at compile-eval.ss.
-sed -n '/(load "host\/chez\/rt.ss")/,/(load "host\/chez\/compile-eval.ss")/p' host/chez/gate-boot.ss \
+sed -n '/(load "host\/chez\/scheme-adapter-runtime.ss")/,/(load "host\/chez\/compile-eval.ss")/p' host/chez/gate-boot.ss \
   | grep -oE 'host/chez/[a-zA-Z0-9_/.-]+\.ss' > "$tmp/gate"
 sed -n '1,/^host\/chez\/compile-eval\.ss$/p' "$tmp/manifest" > "$tmp/manifest-prefix"
 if ! diff -u "$tmp/gate" "$tmp/manifest-prefix" > "$tmp/gdiff"; then

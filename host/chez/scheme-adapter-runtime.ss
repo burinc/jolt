@@ -16,10 +16,11 @@
 ;; (derived from what the callers actually tolerate — see .dirge/specs/
 ;; psl-r3-system-tier.md for the per-site tolerance table).
 ;;
-;; Loaded second in bld-runtime-manifest (right after rt.ss) so every consumer
-;; — rt.ss's java loads, loader.ss, the on-demand build.ss/emit-image.ss —
-;; sees it; every reference from those files is inside a lambda, resolved at
-;; call time, so no consumer depends on an earlier slot.
+;; Loaded FIRST in bld-runtime-manifest (before rt.ss) so the sa-* names are
+;; bound before rt.ss's own top level and the java/*.ss files it loads run —
+;; rt.ss:51 and process.ss:338 are MACROS that resolve sa-os-family at
+;; expansion time. PSL R5+R6 pinned this order; the R3 comment claiming
+;; "second, after rt.ss" is obsolete.
 (import (chezscheme))
 
 ;; (sa-run-process cmd transcoder) -> (values stdin stdout stderr pid)
@@ -80,3 +81,142 @@
 ;; stamps must differ between runs.
 (define (sa-real-time-ms)
   (real-time))
+
+;; ---- R5: io remainder (mtime) + the last GC hook -----------------------------
+
+;; (sa-file-mtime-ms path) -> exact integer
+;; Epoch milliseconds of PATH's last modification. Contract: a per-file mtime
+;; usable for newer-than comparisons (build freshness, AOT cache keys, the
+;; gate-boot staleness predicate). Degradation: none — stat is universal on
+;; real targets; do not fake.
+(define (sa-file-mtime-ms path)
+  (let ((t (file-modification-time path)))
+    (+ (* (time-second t) 1000) (div (time-nanosecond t) 1000000))))
+
+;; (sa-gc-trip-bytes! n) -> void
+;; Set the allocation threshold at which a trip collection triggers — the
+;; dev-cache CLI's GC tuning knob (cli-devcache.ss). Contract: honor N as a
+;; collection-trip hint. Degradation: may no-op — the call tunes a dev cache
+;; only; collection still happens on its own schedule.
+(define (sa-gc-trip-bytes! n)
+  (collect-trip-bytes n))
+
+;; ---- R6: introspection tier (capability: introspect) -------------------------
+
+;; sa-introspect-enabled? — dynamic parameter, default #t. The degraded-
+;; backtrace gate flips it to #f to prove that throw surfaces still carry
+;; type+message while every introspect entry point returns empty/#f and the
+;; backtrace renders without continuation frames.
+(define sa-introspect-enabled? (make-parameter #t))
+
+;; (sa-host-tag) -> string
+;; The runtime's host tag (here Chez's machine type, e.g. "tarm64osx"). NAMING
+;; ONLY: release/fasl directory names, image headers, telemetry strings, error
+;; text. No logic may branch on it — logic branches use sa-os-family /
+;; sa-arch / sa-endian. Contract: an opaque, per-build-stable host string.
+;; Degradation: any identifier string the target names itself with.
+(define (sa-host-tag)
+  (symbol->string (machine-type)))
+
+(define (sa-tag-contains? tag needle)
+  (let ((n (string-length tag)) (m (string-length needle)))
+    (let loop ((i 0))
+      (cond ((> (+ i m) n) #f)
+            ((string=? (substring tag i (+ i m)) needle) #t)
+            (else (loop (+ i 1)))))))
+
+;; (sa-os-family) -> 'macos | 'windows | 'linux
+;; The OS family every host OS branch derives: SIGCHLD/SIG_BLOCK numerics
+;; (process.ss, concurrency.ss), LC_TIME (tz-primitives.ss), struct-stat
+;; offsets (nio-file.ss), the chmod and entropy fallbacks (io.ss, rt.ss),
+;; os.name (host-static-methods.ss), link libraries (build.ss). Contract: one
+;; of the three symbols. Degradation: none — the sites have no safe assumed
+;; default; an unrecognized host falls back to 'linux, matching today's
+;; else-branches.
+(define (sa-os-family)
+  (let ((m (sa-host-tag)))
+    (cond ((or (sa-tag-contains? m "osx") (sa-tag-contains? m "macos")) 'macos)
+          ((or (sa-tag-contains? m "nt") (sa-tag-contains? m "windows")) 'windows)
+          (else 'linux))))
+
+;; (sa-arch) -> 'x86-64 | 'arm64 | 'i386 | 'other
+;; The machine architecture — the nio-file stat-layout guard keys on x86-64.
+;; Contract: the architecture symbol. Degradation: 'other for an unrecognized
+;; host; callers treat it as unverified.
+(define (sa-arch)
+  (let ((m (sa-host-tag)))
+    (cond ((sa-tag-contains? m "arm64") 'arm64)
+          ((sa-tag-contains? m "a6") 'x86-64)
+          ((sa-tag-contains? m "i3") 'i386)
+          (else 'other))))
+
+;; (sa-endian) -> 'little | 'big | #f
+;; Byte order of the host. Contract: the byte order. Degradation: #f for an
+;; unrecognized suffix — the stat-layout guard treats that as unverified.
+(define (sa-endian)
+  (let* ((m (sa-host-tag)) (n (string-length m)))
+    (if (>= n 2)
+        (let ((suf (substring m (- n 2) n)))
+          (cond ((string=? suf "le") 'little)
+                ((string=? suf "be") 'big)
+                (else #f)))
+        #f)))
+
+;; (sa-stats) -> #(cpu-nanos real-nanos gc-count gc-cpu-nanos gc-real-nanos
+;;                gc-bytes)
+;; One statistics snapshot as the six exact-integer fields rt.ss reads into
+;; the jolt.host telemetry vars (time fields pre-converted to nanos). Contract:
+;; the six fields in this order. Degradation: a zero vector — the OTel layer
+;; maps zeros to absent metrics.
+(define (sa-stats)
+  (let ((s (statistics)))
+    (vector (time->nanos (sstats-cpu s))
+            (time->nanos (sstats-real s))
+            (sstats-gc-count s)
+            (time->nanos (sstats-gc-cpu s))
+            (time->nanos (sstats-gc-real s))
+            (sstats-gc-bytes s))))
+
+;; (sa-continuation-frames k) -> list of frame inspectors | '()
+;; The continuation's frames, innermost first, each an inspector object the
+;; walker queries with the messages it already uses ('type 'code 'name
+;; 'source-object 'link 'ref 'length). The 400-frame cap and the guard live
+;; here, so a walker cannot crash the render. Contract: stepping a throw
+;; continuation. Degradation: '() when sa-introspect-enabled? is #f or the
+;; target has no inspector — the backtrace then renders from the compile-time
+;; tables alone (jolt-backwalk) or reports no frames.
+(define (sa-continuation-frames k)
+  (guard (e (#t '()))
+    (if (sa-introspect-enabled?)
+        (let loop ((io (inspect/object k)) (n 0) (acc '()))
+          (if (or (not io) (fx>=? n 400))
+              (reverse acc)
+              (loop (guard (e (#t #f)) (io 'link)) (fx+ n 1) (cons io acc))))
+        '())))
+
+;; (sa-procedure-info x) -> (name . ((free-name . value) ...)) | #f
+;; A procedure's inspector name and live free-variable captures, in
+;; registration order — what the image graph needs to serialize closures
+;; (state-image.ss). Contract: name + captured values. Degradation: #f — the
+;; image writer refuses the closure ('image-no), the same verdict as today's
+;; no-inspector builds.
+(define (sa-procedure-info x)
+  (guard (e (#t #f))
+    (if (sa-introspect-enabled?)
+        (let* ((io (inspect/object x))
+               (code (io 'code))
+               (nm0 (and code (code 'name)))
+               (nm (cond ((string? nm0) nm0)
+                         ((symbol? nm0) (symbol->string nm0))
+                         (else #f)))
+               (n (io 'length)))
+          (let loop ((i 0) (acc '()))
+            (if (or (not n) (fx>=? i n))
+                (cons nm (reverse acc))
+                (let* ((vo (io 'ref i))
+                       (vn0 (vo 'name))
+                       (vn (if (symbol? vn0) (symbol->string vn0) vn0))
+                       (v ((vo 'ref) 'value)))
+                  (loop (fx+ i 1)
+                        (if (string? vn) (cons (cons vn v) acc) acc))))))
+        #f)))

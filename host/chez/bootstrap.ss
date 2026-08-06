@@ -23,6 +23,7 @@
 
 ;; Load the runtime + the SEED compiler (prelude for macros, image for the
 ;; analyzer/emitter), exactly as the spine assembles a program.
+(load "host/chez/scheme-adapter-runtime.ss")  ; before rt.ss: macros + top-levels in rt.ss/java/*.ss call sa-*
 (load "host/chez/rt.ss")
 (set-chez-ns! "clojure.core")
 (load bs-seed-prelude)
@@ -31,7 +32,6 @@
 (load "host/chez/host-contract.ss")
 (load bs-seed-image)
 (load "host/chez/compile-eval.ss")
-(load "host/chez/scheme-adapter-runtime.ss")
 (load "host/chez/emit-image.ss")
 
 ;; Rebuild both artifacts from source ON CHEZ and write them out. Any overlay/

@@ -69,9 +69,9 @@
 ;; process). Where a decision is about the OUTPUT binary instead (link libs, the
 ;; boots, the .exe/.dylib suffix, symbol export), use the target-aware predicates
 ;; below so `jolt build --target <machine>` cross-compiles correctly.
-(define bld-machine (symbol->string (machine-type)))
-(define bld-osx? (bld-contains? bld-machine "osx"))
-(define bld-nt? (bld-contains? bld-machine "nt"))
+(define bld-machine (sa-host-tag))
+(define bld-osx? (eq? (sa-os-family) 'macos))
+(define bld-nt? (eq? (sa-os-family) 'windows))
 
 ;; The target machine: #f = build for the host; a Chez machine string
 ;; ("ta6osx", "tarm64le", "ta6nt", …) = cross-compile. Set by jolt build --target.
@@ -226,8 +226,12 @@
 ;; Tagging keeps the splice/drop decisions off fragile substring matching.
 (define bld-runtime-manifest
   (list
-    "(load \"host/chez/rt.ss\")"
+    ;; The runtime adapter loads FIRST: its sa-* entry points are referenced at
+    ;; top level and inside macros during rt.ss's own load (rt.ss:51, and the
+    ;; java/*.ss files rt.ss loads), so a later slot would resolve them
+    ;; unbound. PSL R5+R6 pinned this order.
     "(load \"host/chez/scheme-adapter-runtime.ss\")"
+    "(load \"host/chez/rt.ss\")"
     "(set-chez-ns! \"clojure.core\")"
     'prelude
     "(load \"host/chez/post-prelude.ss\")"
@@ -1058,7 +1062,7 @@
           ;; environment variable (integer bytes, e.g. \"33554432\" for 32 MB).
           (put-string out
             (string-append
-              "(collect-trip-bytes\n"
+              "(sa-gc-trip-bytes!\n"
               "  (let ((trip (getenv \"JOLT_GC_TRIP_BYTES\"))\n"
               "        (default (* 16 1024 1024)))\n"
               "    (if trip (or (string->number trip) default) default)))\n"))
@@ -1303,11 +1307,11 @@
   (guard (e (#t #f))
     (let* ((dir (bld-runtime-cache-dir))
            (fs (map (lambda (f) (let ((p (string-append dir "/" f)))
-                                  (cons p (file-modification-time p))))
-                    (filter (lambda (f) (bld-suffix? f ".so")) (directory-list dir)))))
+                                   (cons p (sa-file-mtime-ms p))))
+                     (filter (lambda (f) (bld-suffix? f ".so")) (directory-list dir)))))
       (when (> (length fs) bld-runtime-cache-keep)
         (for-each (lambda (p) (guard (e (#t #f)) (delete-file (car p))))
-                  (list-tail (sort (lambda (a b) (time>? (cdr a) (cdr b))) fs)
+                  (list-tail (sort (lambda (a b) (> (cdr a) (cdr b))) fs)
                              bld-runtime-cache-keep))))))
 ;; Remove an existing output before writing the new one, so the new binary lands on
 ;; a FRESH inode.

@@ -115,7 +115,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi \
   transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
-  fnform traceemit traceeval \
+  fnform traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   certify
@@ -454,6 +454,12 @@ traceemit:
 # registry; with tracing off the eval path registers nothing.
 traceeval:
 	@$(CHEZ) --script host/chez/run-traceeval.ss
+
+# PSL R6: with introspection suppressed (sa-introspect-enabled? #f), a throw
+# still surfaces type+message while the walker entry points return empty and
+# the backtrace renders without continuation frames.
+degradedbacktrace:
+	@$(CHEZ) --script host/chez/run-degraded-backtrace.ss
 
 # Nilable record types + flow-sensitive narrowing: a record-or-nil types as a nilable
 # record (some?/nil? don't fold, so a runtime guard stays); inside (if (some? x) ..)

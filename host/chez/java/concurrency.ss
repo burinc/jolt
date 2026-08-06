@@ -1311,15 +1311,8 @@
 (define c-sigaddset (jolt-foreign-proc-safe "sigaddset" '(u8* int) 'int))
 ;; POSIX SIG_BLOCK/SIG_UNBLOCK numerics differ by platform: Linux/glibc 0/1,
 ;; Darwin/macOS 1/2 (SIG_UNBLOCK is SIG_BLOCK+1 on both). Resolve SIG_BLOCK for
-;; this host from the machine-type symbol — macOS builds contain "osx".
-(define jolt-sig-block-how
-  (let* ((s (symbol->string (machine-type)))
-         (n (string-length s)))
-    (let loop ((i 0))
-      (cond
-        ((> (+ i 3) n) 0)                              ; default: Linux/glibc
-        ((string=? (substring s i (+ i 3)) "osx") 1)   ; Darwin/macOS
-        (else (loop (+ i 1)))))))
+;; this host from the os-family property.
+(define jolt-sig-block-how (if (eq? (sa-os-family) 'macos) 1 0))
 (define (jolt-set-sigint-blocked block?)
   (when (and c-pthread-sigmask c-sigemptyset c-sigaddset)
     (let ((set (make-bytevector 128 0))

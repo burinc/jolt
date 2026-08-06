@@ -9,13 +9,17 @@
 ;; SO is fresh when it exists and is at least as new as every path listed one per
 ;; line in INPUTS. Anything unclear — no image, no list, a listed file that has
 ;; since been deleted — is NOT fresh, so the caller falls back to source. The
-;; comparison is whole seconds: file-modification-time has sub-second resolution,
-;; but rounding down can only make a borderline file look NEWER than the image
-;; (stale, fall back), never older, so the error is on the safe side.
+;; comparison is exact milliseconds (sa-file-mtime-ms): a file touched in the
+;; same millisecond as the image counts as fresh; anything newer falls back to
+;; source. No rounding, so a borderline file never looks older than it is — the
+;; error is on the safe side (rebuild).
+;; Standalone script: self-load the runtime adapter for sa-file-mtime-ms. A
+;; second load by gate-boot.ss is a harmless redefinition.
+(load "host/chez/scheme-adapter-runtime.ss")
 
 (define (gate-boot-image-fresh? so inputs)
   (and (file-exists? so) (file-exists? inputs)
-       (let ((t (time-second (file-modification-time so))))
+       (let ((t (sa-file-mtime-ms so)))
          (call-with-input-file inputs
            (lambda (p)
              (let loop ()
@@ -23,5 +27,5 @@
                  (cond ((eof-object? line) #t)
                        ((string=? line "") (loop))
                        ((not (file-exists? line)) #f)
-                       ((> (time-second (file-modification-time line)) t) #f)
+                       ((> (sa-file-mtime-ms line) t) #f)
                        (else (loop))))))))))
