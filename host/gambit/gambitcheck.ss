@@ -393,6 +393,75 @@
   (check-raise-message "sa-run-process" (lambda () (sa-run-process "echo hi" #f))
                        "subprocess support is unsupported on the gambit target"))
 
+;; ---- coroutines tier (fibers R1) — the call/cc-based fiber primitive --------
+;; Mirrors the Chez gate's correctness set at small scale: round trip,
+;; round-robin order, per-fiber raise isolation with a surviving scheduler,
+;; raise-after-park (the guard must ride the continuation), deep-stack yield.
+(define (test-coroutines)
+  (define (all-done? ls)
+    (or (null? ls) (and (eq? (jolt-fiber-state (car ls)) 'done) (all-done? (cdr ls)))))
+  (define (deep-yield n)
+    (if (= n 0) (sa-fiber-yield) (deep-yield (- n 1))))
+  (printf "== coroutines: fiber primitive (call/cc, R1) ==\n")
+  ;; round trip: body runs before/after a yield; fiber completes with its value
+  (let ((log '()))
+    (define f (sa-fiber-spawn (lambda ()
+                                (set! log (cons 'a log))
+                                (sa-fiber-yield)
+                                (set! log (cons 'b log))
+                                'rt-done)))
+    (sa-fiber-run-all)
+    (check "round trip: body order" (reverse log) '(a b))
+    (check "round trip: state done" (jolt-fiber-state f) 'done)
+    (check "round trip: result" (jolt-fiber-result f) 'rt-done))
+  ;; round robin: N fibers each yield M times in strict rotation
+  (let ((log '()) (N 4) (M 3))
+    (define fs
+      (map (lambda (i)
+             (sa-fiber-spawn
+               (lambda ()
+                 (let loop ((m M))
+                   (if (> m 0)
+                       (begin (set! log (append log (list i)))
+                              (sa-fiber-yield)
+                              (loop (- m 1)))
+                       #f)))))
+           '(0 1 2 3)))
+    (sa-fiber-run-all)
+    (check "round-robin: strict rotation"
+           (let loop ((k 0))
+             (if (>= k (* N M))
+                 #t
+                 (and (= (list-ref log k) (modulo k N)) (loop (+ k 1)))))
+           #t)
+    (check "round-robin: all done" (all-done? fs) #t))
+  ;; raise isolation: one fiber raises, the scheduler survives, others run
+  (let ((log '()))
+    (define fibers
+      (map (lambda (i)
+             (sa-fiber-spawn
+               (lambda ()
+                 (if (= i 1)
+                     (error 'fiber-test "boom")
+                     (set! log (cons i log))))))
+           '(0 1 2 3)))
+    (define f2 (sa-fiber-spawn (lambda () 'ok)))
+    (sa-fiber-run-all)
+    (check "raise: non-raising fibers ran" (length log) 3)
+    (check "raise: raising fiber dead" (jolt-fiber-state (list-ref fibers 1)) 'dead)
+    (check "raise: error recorded"
+           (condition-message (jolt-fiber-error (list-ref fibers 1))) "boom")
+    (sa-fiber-run-all)
+    (check "raise: scheduler reusable" (jolt-fiber-result f2) 'ok))
+  ;; raise AFTER a park: the resume-path guard must ride the continuation
+  (let ((f (sa-fiber-spawn (lambda () (sa-fiber-yield) (error 'fiber-test "late")))))
+    (sa-fiber-run-all)
+    (check "raise after park: dead" (jolt-fiber-state f) 'dead))
+  ;; yield from 20 frames down
+  (let ((f (sa-fiber-spawn (lambda () (deep-yield 20) 'deep-ok))))
+    (sa-fiber-run-all)
+    (check "deep yield: result" (jolt-fiber-result f) 'deep-ok)))
+
 ;; ---- main --------------------------------------------------------------------
 
 (assert-contract-names)
@@ -403,6 +472,7 @@
 (test-threads)
 (test-hasheq-known-answers)
 (test-sa-surface)
+(test-coroutines)
 
 (printf "\ngambitcheck: ~a failure(s)\n" failures)
 (if (= failures 0)

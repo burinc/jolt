@@ -339,3 +339,125 @@
 ;; sa-fasl-write wrote. Degradation: raise — same story as sa-fasl-write.
 (define (sa-fasl-read port . rest)
   (error 'sa-fasl-read "fasl serialization is unsupported on the gambit target"))
+
+;; ---- fibers R1: coroutines tier (capability: coroutines) --------------------
+;; Stackful green threads sharing one OS thread, per CONTRACT.txt's coroutines
+;; tier. R0(e) pinned the primitive: ##continuation-capture/##continuation-graft
+;; SIGBUS gsi on same-stack re-entry; call/cc is the usable primitive (the
+;; switch is ~10x the Chez cost interpreted, and there is no transparent IO
+;; parking on this target, so `go` stays on OS threads — the plan's documented
+;; degradation). The scheduler mirrors host/chez/fibers.ss: each park captures
+;; a FRESH continuation and the scheduler invokes each continuation exactly
+;; once, so call/cc's multi-shot-ness is never exercised (the plan's one-shot
+;; discipline — a resumed fiber must never re-enter the caller's half-finished
+;; expression). The current fiber rides a plain global here — the virtual
+;; register is a Chez perf choice (R0(c): 2ns vs 33ns thread-parameter write),
+;; not a contract shape.
+
+(define-record-type jolt-fiber
+  (fields (mutable state)
+          thunk
+          (mutable k)
+          (mutable result)
+          (mutable error)
+          (mutable next)
+          (mutable slice))
+  (nongenerative jolt-fiber-v1))
+
+(define jolt-fiber-q-head #f)
+(define jolt-fiber-q-tail #f)
+(define jolt-sched-k #f)
+(define jolt-gambit-current-fiber #f)
+
+(define (jolt-current-fiber) jolt-gambit-current-fiber)
+
+(define (jolt-fiber-enqueue! f)
+  (if jolt-fiber-q-tail
+      (begin (jolt-fiber-next-set! jolt-fiber-q-tail f)
+             (set! jolt-fiber-q-tail f))
+      (begin (set! jolt-fiber-q-head f)
+             (set! jolt-fiber-q-tail f))))
+
+(define (jolt-fiber-dequeue!)
+  (let ((f jolt-fiber-q-head))
+    (if f
+        (begin
+          (set! jolt-fiber-q-head (jolt-fiber-next f))
+          (if (not jolt-fiber-q-head) (set! jolt-fiber-q-tail #f))
+          (jolt-fiber-next-set! f #f)
+          f)
+        #f)))
+
+(define (jolt-fiber-to-scheduler! f)
+  (set! jolt-gambit-current-fiber #f)
+  (call/cc
+    (lambda (k)
+      (jolt-fiber-k-set! f k)
+      (jolt-sched-k))))
+
+(define (sa-fiber-yield)
+  (let ((f (jolt-current-fiber)))
+    (if f
+        (begin (jolt-fiber-state-set! f 'ready)
+               (jolt-fiber-enqueue! f)
+               (jolt-fiber-to-scheduler! f))
+        (error 'sa-fiber-yield "yield called outside a fiber"))))
+
+(define (jolt-fiber-park!)
+  (let ((f (jolt-current-fiber)))
+    (if f
+        (begin (jolt-fiber-state-set! f 'parked)
+               (jolt-fiber-to-scheduler! f))
+        (error 'jolt-fiber-park! "park called outside a fiber"))))
+
+(define (sa-fiber-resume f)
+  (if (eq? (jolt-fiber-state f) 'parked)
+      (begin (jolt-fiber-state-set! f 'ready)
+             (jolt-fiber-enqueue! f))
+      #f))
+
+(define (sa-fiber-spawn thunk)
+  (let ((f (make-jolt-fiber 'ready thunk #f #f #f #f #f)))
+    (jolt-fiber-enqueue! f)
+    f))
+
+(define (jolt-fiber-run f)
+  (set! jolt-gambit-current-fiber f)
+  (call/cc
+    (lambda (k)
+      (set! jolt-sched-k k)
+      (jolt-fiber-resume* f))))
+
+(define (jolt-fiber-resume* f)
+  (case (jolt-fiber-state f)
+    ((ready)
+     (if (jolt-fiber-k f)
+         ((jolt-fiber-k f))
+         (begin
+           (jolt-fiber-state-set! f 'running)
+           (let ((r (guard (e (#t (jolt-fiber-dead! f e)))
+                      ((jolt-fiber-thunk f)))))
+             (jolt-fiber-done! f r)))))
+    (else (error 'jolt-fiber-run "fiber in unexpected state"
+                 (jolt-fiber-state f)))))
+
+(define (jolt-fiber-done! f r)
+  (jolt-fiber-state-set! f 'done)
+  (jolt-fiber-result-set! f r)
+  (jolt-fiber-k-set! f #f)
+  (set! jolt-gambit-current-fiber #f)
+  (jolt-sched-k))
+
+(define (jolt-fiber-dead! f e)
+  (jolt-fiber-state-set! f 'dead)
+  (jolt-fiber-error-set! f e)
+  (jolt-fiber-k-set! f #f)
+  (set! jolt-gambit-current-fiber #f)
+  (jolt-sched-k))
+
+(define (sa-fiber-run-all)
+  (let loop ()
+    (let ((f (jolt-fiber-dequeue!)))
+      (if f
+          (begin (jolt-fiber-run f) (loop))
+          #f))))

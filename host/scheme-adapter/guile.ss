@@ -174,6 +174,24 @@
 ;;   scheme-version         UNIMPLEMENTED  Guile: (version) -> "3.0.9" — zero-arg, naming/
 ;;                                        telemetry only; nothing may parse it.
 
+;; ---------------------------------------------------------------------------
+;; tier: coroutines (fibers R1 — the fiber primitive + single-carrier scheduler)
+;; ---------------------------------------------------------------------------
+;;   sa-fiber-spawn         UNIMPLEMENTED  ?? Guile: call/cc-based coroutines; Guile Fibers
+;;                                        exists upstream as a reference. must verify
+;;                                        continuation re-entry semantics (Guile's call/cc
+;;                                        is multi-shot — the plan's one-shot discipline
+;;                                        plus a scheduler that owns completion is what
+;;                                        prevents re-running).
+;;   sa-fiber-yield         UNIMPLEMENTED  ?? same.
+;;   sa-fiber-resume        UNIMPLEMENTED  ?? same.
+;;   sa-fiber-run-all       UNIMPLEMENTED  ?? same; must verify the "drain, then poll"
+;;                                        shape against Guile's prompt machinery.
+;;                                        must verify: contract permits binding every name
+;;                                        to a message-carrying raise when continuations
+;;                                        are unusable — `go` then falls back to an OS
+;;                                        thread (the plan's documented degradation).
+
 ;; ===========================================================================
 ;; gate-time half (mirrors chez.ss's assertion pass) — UNIMPLEMENTED
 ;; ===========================================================================

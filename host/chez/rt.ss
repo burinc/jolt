@@ -235,13 +235,19 @@
 ;; the whole process (16 on every platform jolt targets). jolt claims three, allocated
 ;; here so the assignment is in one place; nothing else in the runtime uses them.
 ;; A freshly forked thread starts every slot at fixnum 0, NOT #f, so "unset" means
-;; fixnum 0 (the site slots hold a site pair or 0). Slots 0 and 1 are FREE since
-;; R3 (jolt-230w) removed the R1 ring/mark vregs — the tail marks live on the
-;; continuation, not in a vreg — so new virtual-register users should claim them
-;; before renumbering anything. The surviving slots keep their R2 numbers.
+;; fixnum 0 (the site slots hold a site pair or 0). Slot 0 was claimed by R1's
+;; fibers (jolt-nvpr.2): it holds the current fiber record — a per-switch vreg
+;; write is ~2ns against ~33ns for a thread-parameter write, which is what keeps
+;; the 3.4M switches/sec design point (R0(c)); the fibers define re-defines the
+;; value in fibers.ss so the standalone gate can load it without rt.ss. Slot 1
+;; remains FREE since R3 (jolt-230w) removed the R1 ring/mark vregs — the tail
+;; marks live on the continuation, not in a vreg — so new virtual-register users
+;; should claim it before renumbering anything. The surviving slots keep their
+;; R2 numbers.
 (define jolt-vreg-site 2)        ; ('ns/fn' . line) of the innermost live call site
 (define jolt-vreg-catch-line 3)  ; the site at the throw a catch clause is handling
 (define jolt-vreg-print-readably 4)  ; the print family's *print-readably* override; 0 = unset
+(define jolt-vreg-current-fiber 0)  ; fibers.ss: the running fiber record, or 0 (fixnum) when not on a fiber
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
 ;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic
@@ -1254,6 +1260,14 @@
 ;; thread macros, def-var!'d into clojure.core.async. After concurrency.ss (reuses
 ;; ms->duration) and the collection/seq layer.
 (load "host/chez/java/async.ss")
+
+;; Fibers (R1, jolt-nvpr.2): the fiber primitive + single-carrier scheduler
+;; behind the CONTRACT.txt `coroutines` tier. Also loaded by
+;; scheme-adapter-runtime.ss (which loads first) so the adaptercheck gate sees
+;; the sa-fiber-* names; this second load is a harmless re-define. After
+;; async.ss — the R3/R4 channel path is the first consumer, and fibers.ss
+;; itself needs nothing from the runtime.
+(load "host/chez/fibers.ss")
 
 ;; BigDecimal: the jbigdec value type + bigdec/decimal?/class/equality/
 ;; printing. Loads LAST so its set!-wraps of jolt-class/jolt=2/the printers sit

@@ -119,7 +119,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   fnform traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
-  certify gambitcheck
+  certify gambitcheck fibers
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -213,6 +213,14 @@ selfhost:
 # Value-model unit tests (nil/truthiness/collections on Chez).
 values:
 	@$(CHEZ) --script test/chez/values-test.ss
+
+# Fibers R1 (epic jolt-nvpr.2): the fiber primitive + single-carrier scheduler
+# behind the CONTRACT.txt coroutines tier. Correctness (round trip, completion,
+# per-fiber raise isolation, round-robin order, deep-stack yield) plus the
+# pinned numbers (spawn < 5us, switch < 100ns, per-fiber live < 8KB by R0's
+# corrected absolute-live-bytes measurement). Detection-free, no jolt boot.
+fibers:
+	@$(CHEZ) --script test/chez/fibers-test.ss
 
 # Corpus conformance vs JVM-sourced expecteds (allowlist + floor).
 corpus:
