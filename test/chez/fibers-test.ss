@@ -213,6 +213,14 @@
 ;; catches a real regression (a switch that starts copying stacks, or a slice
 ;; swap that regresses to thread parameters at 33 ns per write) without
 ;; measuring the runner's mood.
+;;
+;; The ratio is not machine-INVARIANT, only machine-tolerant: continuation
+;; capture is more memory-bound than a bare call, so it degrades faster on a
+;; slower box. Measured pair — dev machine 53ns switch / 2.40ns call = 22x;
+;; shared CI runner 134ns / 3.92ns = 34x (the switch slowed 2.5x, the call
+;; 1.6x). 60x was chosen to sit ~1.75x above the CI figure; a much slower or
+;; noisier runner could climb toward it, and the fix then is to raise the
+;; ceiling with the new measured pair recorded here, not to delete the check.
 (define CAL-N 2000000)
 (define (cal-op x) x)                       ; a bare procedure call
 (define cal-t0 (mono-nanos))
