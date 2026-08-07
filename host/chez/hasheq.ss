@@ -16,6 +16,31 @@
 ;; only reaches these paths after `fixnum?` guards or type dispatch.
 ;;
 ;; Loaded from rt.ss BEFORE collections.ss so key-hash can use jolt-hasheq.
+;;
+;; TARGET-OWNED FILE (PSL R10): hasheq.ss is a per-target implementation a port
+;; REPLACES rather than migrates — the Chez-tuned hash engine. The #3% sites
+;; above are proven-sound unsafe variants (bounded intermediates, guarded
+;; entry); a target port supplies its own hasheq using safe ops or its own
+;; unsafe forms, keeping the SAME exported procedures. The portability gate
+;; allows this file's $primitive use only because the file is target-owned.
+;; Loaded by rt.ss as a plain top-level load, so the "exports" are the
+;; procedures the rest of the host actually calls from here (verified against
+;; call sites, not guessed). A target must reimplement exactly these:
+;;   jolt-hasheq                    entry point: fast paths + arms + fallback
+;;   murmur3-hash-long-flat         fixnum hashing (collections.ss key-hash)
+;;   murmur3-hash-int               int hashing (java/host-static-methods.ss)
+;;   murmur3-hash-long              long/bignum-in-range hashing
+;;   murmur3-hash-unencoded-chars   string-char hashing (host-static-methods)
+;;   big-integer-hashcode           bignum hash (java/bigdec.ss)
+;;   mix-coll-hash                  collection combine (collections/records/...)
+;;   hash-ordered                   seq hashing (seq.ss, reader.ss, ...)
+;;   hash-unordered                 map/set hashing (natives-misc, static-methods)
+;;   entry-hasheq                   (key . value) pair hash (collections/records)
+;;   hash-combine                   combiner (natives-reader, io, natives-str)
+;;   compute-keyword-hasheq         keyword hashing (values.ss)
+;;   symbol-hasheq / compute-symbol-hasheq   symbol hashing (records.ss)
+;; (string-hasheq, double-hasheq, jolt-hasheq-fallback and the caches stay
+;; INTERNAL — reached only through jolt-hasheq.)
 
 ;; ============================================================================
 ;; 32-bit signed integer helpers — all macros (syntax-rules) so they textually

@@ -1,8 +1,13 @@
 # host/chez/portability-blocklist.txt — FORBIDDEN Chez-only identifiers the host
 # may not use directly, regardless of target. Rounds R4-R9 of the
 # portable-scheme-layer epic route each tier behind capability entry points in
-# host/scheme-adapter/chez.ss; the allowlist (portability-allowlist.txt) shrinks
-# to empty as they do, and this file grows with what the census finds.
+# host/scheme-adapter/chez.ss. The end state (R10) is structural, not zero
+# lines: the allowlist (portability-allowlist.txt) may only name TARGET-OWNED
+# files — per-target implementations a port replaces rather than migrates
+# (today: host/chez/scheme-adapter-runtime.ss and host/chez/hasheq.ss). An
+# allowlist line naming any other file fails the gate regardless of whether its
+# hit is real: a real forbidden-name use in a normal file is routed through the
+# adapter, never allowlisted. This file grows with what the census finds.
 #
 # Names every target's adapter must provide moved to
 # host/scheme-adapter/CONTRACT.txt in R2 (threads, system basics, and the misc

@@ -117,6 +117,16 @@
 (define allowlist-file (rooted "host/chez/portability-allowlist.txt"))
 (define census-file (rooted ".dirge/psl-census.md"))
 
+(define target-owned-files
+  ;; A target-owned file is a per-target implementation a port REPLACES rather
+  ;; than migrates: today the adapter runtime (the sanctioned home of the
+  ;; forbidden names) and the Chez-tuned hash implementation. PSL R10 strict
+  ;; lint: the allowlist may ONLY name these files. A real forbidden-name use
+  ;; in any other file is a signal to route through the adapter, never to
+  ;; allowlist.
+  '("host/chez/scheme-adapter-runtime.ss"
+    "host/chez/hasheq.ss"))
+
 ;; ---------------------------------------------------------------------------
 ;; blocklist: identifier symbol -> tier name (tier headers are "# tier: NAME")
 ;; ---------------------------------------------------------------------------
@@ -430,6 +440,16 @@
        #t)
       (else (loop (cdr l))))))
 
+(define (not-target-owned-files lines)
+  ;; Allowlist lines whose file is not target-owned. The rule is STRUCTURAL:
+  ;; it fires even when the line's hit is real, because a real forbidden-name
+  ;; use in a normal file is exactly what must be routed through the adapter.
+  (let loop ((l lines) (bad '()))
+    (cond
+      ((null? l) (reverse bad))
+      ((member (car (car l)) target-owned-files) (loop (cdr l) bad))
+      (else (loop (cdr l) (cons (car (car l)) bad))))))
+
 (define (run-gate results errors)
   (let ((allow (read-allowlist allowlist-file)))
     (define fail 0)
@@ -455,6 +475,14 @@
           (printf "  STALE ~a ~a\n" (car line) (cdr line))
           (set! stale (+ stale 1))))
       allow)
+    ;; STRICT LINT (PSL R10): the allowlist may only name target-owned files.
+    ;; This fails STRUCTURALLY — a real hit in a non-target-owned file is
+    ;; exactly what must be routed through the adapter, not allowlisted.
+    (for-each
+      (lambda (f)
+        (printf "  NOT-TARGET-OWNED ~a: not target-owned; route through the adapter instead of allowlisting\n" f)
+        (set! fail (+ fail 1)))
+      (not-target-owned-files allow))
     (for-each (lambda (e) (printf "  READ-ERROR ~a: ~a\n" (car e) (cadr e))) errors)
     (printf "portability check: scanned ~a files\n" (length results))
     (if (and (= fail 0) (= stale 0) (null? errors))
@@ -501,11 +529,21 @@
                             (and (string=? (car a) (car b))
                                  (string<? (symbol->string (cadr a))
                                            (symbol->string (cadr b)))))))))
-    (write-allowlist sorted)
-    (printf "portability check: regenerated ~a lines\n" (length sorted))
-    (printf "portability check: scanned ~a files\n" (length results))
-    (for-each (lambda (e) (printf "  READ-ERROR ~a: ~a\n" (car e) (cadr e))) errors)
-    (if (null? errors) 0 1)))
+    (let ((bad (not-target-owned-files sorted)))
+      (if (null? bad)
+          (begin
+            (write-allowlist sorted)
+            (printf "portability check: regenerated ~a lines\n" (length sorted))
+            (printf "portability check: scanned ~a files\n" (length results))
+            (for-each (lambda (e) (printf "  READ-ERROR ~a: ~a\n" (car e) (cadr e))) errors)
+            (if (null? errors) 0 1))
+          (begin
+            (for-each
+              (lambda (f)
+                (printf "  NOT-TARGET-OWNED ~a: not target-owned; route through the adapter instead of allowlisting\n" f))
+              bad)
+            (printf "portability check: regen aborted — allowlist may only name target-owned files\n")
+            1)))))
 
 ;; ---------------------------------------------------------------------------
 ;; census: emit .dirge/psl-census.md

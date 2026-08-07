@@ -535,7 +535,8 @@ manifestcheck:
 
 # PSL R1 portability lint gate: fails when a blocklisted Chez-only identifier
 # appears in a host file that is not allowlisted for it (and on stale allowlist
-# lines). Allowlist seeded from current reality; rounds R2-R9 shrink it to empty.
+# lines, and on any line naming a non-target-owned file). Allowlist seeded from
+# current reality; the R10 end state is the two target-owned files.
 portcheck:
 	@sh host/chez/portability-check.sh
 
