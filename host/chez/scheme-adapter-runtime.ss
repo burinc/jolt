@@ -250,6 +250,27 @@
   (syntax-rules ()
     ((_ name args res) (foreign-procedure __collect_safe name args res))))
 
+;; (sa-foreign-callable proc args res) -> foreign callable
+;; SYNTAX: compile-time-typed foreign-callable creation, mirroring
+;; sa-foreign-procedure. (sa-foreign-callable f (int) int) lowers to
+;; (foreign-callable f (int) int) — the compile-time lowering of jolt.ffi/
+;; __ccallable (backend_scheme.clj emit-ffi-callable), wrapped by
+;; jolt-ffi-register-callable! so the collector neither moves nor reclaims the
+;; callable while C may call through it. Contract: build a foreign callable
+;; around a Scheme procedure for a statically-known signature. Degradation:
+;; none — a target expands this to its native foreign-callable form.
+(define-syntax sa-foreign-callable
+  (syntax-rules ()
+    ((_ proc args res) (foreign-callable proc args res))))
+
+;; (sa-foreign-callable-collect-safe proc args res) -> foreign callable
+;; SYNTAX: like sa-foreign-callable, but the callable entry uses the
+;; __collect_safe convention that reactivates the thread — for callbacks
+;; invoked while the thread is parked in a :blocking foreign call.
+(define-syntax sa-foreign-callable-collect-safe
+  (syntax-rules ()
+    ((_ proc args res) (foreign-callable __collect_safe proc args res))))
+
 ;; (sa-foreign-procedure-runtime name args res blocking?) -> foreign procedure | #f
 ;; Construct a foreign procedure from a RUNTIME-known signature under the
 ;; Windows-machine-type policy: eval the constructed (foreign-procedure ...) form
