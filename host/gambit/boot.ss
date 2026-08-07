@@ -100,6 +100,9 @@
 ;; post-prelude re-asserts the native overrides the overlay stubs out (ns-name,
 ;; char?, atom?, realized?, ...) — cli.ss order: prelude, post-prelude, image.
 (##include "../chez/post-prelude.ss")
+;; the clojure.core names the excluded java/ tree owns on Chez — after
+;; post-prelude so these bindings are the last word
+(##include "host-vars.ss")
 (##include "seed/image.ss")
 (##include "../chez/compile-eval.ss")
 

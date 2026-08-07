@@ -2,10 +2,11 @@
 
 [![tests](https://github.com/jolt-lang/jolt/actions/workflows/tests.yml/badge.svg)](https://github.com/jolt-lang/jolt/actions/workflows/tests.yml)
 
-A Clojure implementation on [Chez Scheme](https://cisco.github.io/ChezScheme/).
-Jolt reads Clojure source, analyzes it to a host-neutral IR, emits Scheme, and
-runs it on Chez. The compiler is self-hosted: it is written in Clojure
-(`jolt-core/`) and compiles itself. It ships a Clojure-compatible standard library.
+A Clojure implementation on Scheme. Jolt reads Clojure source, analyzes it to a
+host-neutral IR, emits Scheme, and runs it — on [Chez](https://cisco.github.io/ChezScheme/)
+by default, or on [Gambit](https://gambitscheme.org/) compiled to JavaScript for
+the browser. The compiler is self-hosted: it is written in Clojure (`jolt-core/`)
+and compiles itself. It ships a Clojure-compatible standard library.
 
 ## Requirements
 
@@ -364,6 +365,48 @@ source roots by *when* they load:
 Chez (read → analyze → IR → emit → eval). `host/chez/bootstrap.ss` rebuilds that
 seed from source on pure Chez; the build is a self-hosting fixpoint (a rebuild
 reproduces the checked-in seed byte-for-byte).
+
+`host/gambit/` is the same overlay on a second Scheme — its own adapter, kernel,
+and cross-minted seed. See [Scheme backends](#scheme-backends).
+
+## Scheme backends
+
+Chez is the default target: every gate, library, and release runs there, and it
+is the only target with FFI, native compilation, program images, and standalone
+binaries. Gambit is a second, demo-grade target that also compiles to a single
+JavaScript file — the live REPL on the [website](https://jolt-lang.github.io) is
+jolt evaluating in the browser.
+
+Host-specific runtime code sits behind an adapter contract
+(`host/scheme-adapter/CONTRACT.txt` lists the names and capability tiers;
+`TARGET-CONTRACT.md` next to it is the porting document). A target implements a
+capability or degrades it honestly — an absent one raises rather than faking a
+result.
+
+The Gambit targets need `gambit-scheme` (brew) and skip cleanly without it:
+
+```bash
+make gambitcheck              # adapter + shims on native gsi
+make gambitkernel             # the booted kernel and natives (113 checks)
+make gambiteval               # jolt source through the compiler, renders pinned to Chez
+make gambitseed               # re-mint host/gambit/seed/ (runs on Chez, after a seed change)
+make gambitweb                # => target/gambit/jolt-web.js, the browser bundle
+```
+
+`make gambitweb` compiles the whole stack — kernel, seed, compiler, and a
+queue-polling REPL loop (`host/gambit/repl-main.ss`) — into one self-contained
+JavaScript file in about 30 seconds. The output is roughly 32 MB raw and 4 MB
+gzipped, which is what a web server actually ships. The build is reproducible:
+the same sources produce a byte-identical bundle. Point it at a site checkout to
+refresh the live demo:
+
+```bash
+make gambitweb GAMBIT_WEB_OUT=../jolt-lang.github.io/resources/static/js/jolt-web.js
+```
+
+The page defines `joltQueue` and `joltOut` before loading the bundle; a Scheme
+thread inside it polls the queue and hands results back, so page JavaScript never
+calls into Scheme.
 
 ## Differences from Clojure
 

@@ -414,10 +414,41 @@
      (syntax-case (list e ...) ()
        ((p ...) body ...)))))
 
-(define (condition? x) (error-object? x))
-(define (message-condition? x) (error-object? x))
+;; error-object? covers only what `error` raised. Gambit's OWN runtime
+;; exceptions — unbound variable, wrong argument count, wrong type — are
+;; separate object types it answers #f for, and there is no umbrella predicate
+;; (no `exception?`, no `##exception?` in 4.9.7). Treating them as non-conditions
+;; makes every host-level failure opaque to the shared code: records-interop
+;; classifies a raise by `condition?`, so a Gambit error fell through to the
+;; class-model default and rendered as "#object[:object]" with no message.
+;;
+;; display-exception describes any exception Gambit knows ("Unbound variable: x",
+;; "Wrong number of arguments passed to procedure"), and prints the distinctive
+;; "This object was raised: <v>" for a plain value — so the description itself is
+;; the test, and a new exception type in a future Gambit is covered without a
+;; list to maintain.
+(define (%gambit-exception-text x)
+  (guard (e (#t #f))
+    (let ((s (call-with-output-string (lambda (p) (display-exception x p)))))
+      (and (string? s)
+           (> (string-length s) 0)
+           (not (string-prefix? "This object was raised:" s))
+           (%trim-trailing-newline s)))))
+
+(define (%trim-trailing-newline s)
+  (let loop ((n (string-length s)))
+    (cond ((= n 0) "")
+          ((memv (string-ref s (- n 1)) '(#
+ewline #eturn)) (loop (- n 1)))
+          (else (substring s 0 n)))))
+
+(define (condition? x)
+  (or (error-object? x) (and (%gambit-exception-text x) #t)))
+(define (message-condition? x) (condition? x))
 (define (condition-message c)
-  (if (error-object? c) (error-object-message c) #f))
+  (cond ((error-object? c) (error-object-message c))
+        ((%gambit-exception-text c))
+        (else #f)))
 (define (condition-irritants c)
   (if (error-object? c) (error-object-irritants c) '()))
 

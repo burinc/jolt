@@ -65,7 +65,8 @@ JOLT-TARGETS-NEEDING-DEPS := \
   values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci gate-run-test gate-run-ci gate-status
+.PHONY: build install test ci gate-run-test gate-run-ci gate-status \
+        gambitcheck gambitkernel gambiteval gambitseed gambitweb
 
 default:: build
 
@@ -568,6 +569,7 @@ certify:
 # cleanly when gambit-scheme is absent. NEVER bare gsc/gsi (gsc on PATH is
 # Ghostscript): always the brew-prefix binary.
 GAMBIT_GSI := $(shell brew --prefix gambit-scheme 2>/dev/null)/bin/gsi
+GAMBIT_GSC := $(shell brew --prefix gambit-scheme 2>/dev/null)/bin/gsc
 gambitcheck:
 	@if [ -x "$(GAMBIT_GSI)" ]; then \
 		"$(GAMBIT_GSI)" host/gambit/gambitcheck.ss; \
@@ -587,12 +589,31 @@ gambitkernel:
 
 # G3 eval gate: real jolt source through jolt-compile-eval on the booted
 # manifest + cross-minted seed, renders pinned to Chez captures. Detection-
-# gated like gambitcheck; boots the full seed so it takes ~1 min on gsi.
+# gated like gambitcheck and NOT in the ci list — it boots the full seed, so
+# it takes about a minute on gsi. Run from the repo root.
 gambiteval:
 	@if [ -x "$(GAMBIT_GSI)" ]; then \
 		"$(GAMBIT_GSI)" host/gambit/eval-test.ss; \
 	else \
 		echo "gambiteval: gambit-scheme not installed (brew) — skipped"; \
+	fi
+
+# The browser bundle: the whole stack (kernel + seed + compiler + a queue-polling
+# REPL loop) compiled to one JavaScript file by the Gambit backend. ~30s, ~32MB
+# raw / ~4MB gzipped, which is what a web server ships. Point GAMBIT_WEB_OUT at
+# a site checkout to refresh the live demo:
+#   make gambitweb GAMBIT_WEB_OUT=../jolt-lang.github.io/resources/static/js/jolt-web.js
+# NEVER bare gsc — that is Ghostscript on a brew machine.
+GAMBIT_WEB_OUT ?= target/gambit/jolt-web.js
+gambitweb:
+	@if [ -x "$(GAMBIT_GSC)" ]; then \
+		mkdir -p "$$(dirname "$(GAMBIT_WEB_OUT)")"; \
+		out="$$(cd "$$(dirname "$(GAMBIT_WEB_OUT)")" && pwd)/$$(basename "$(GAMBIT_WEB_OUT)")"; \
+		(cd host/gambit && "$(GAMBIT_GSC)" -target js -exe -o "$$out" repl-main.ss); \
+		echo "gambitweb: $(GAMBIT_WEB_OUT) ($$(wc -c < "$$out" | tr -d ' ') bytes,\
+ $$(gzip -c "$$out" | wc -c | tr -d ' ') gzipped)"; \
+	else \
+		echo "gambitweb: gambit-scheme not installed (brew) — skipped"; \
 	fi
 
 # G3 compiler-on-gsi (jolt-mj95.4): cross-mint the Gambit seed from the Chez
@@ -601,16 +622,6 @@ gambiteval:
 # Runs on CHEZ (gambitseed), not gsi.
 gambitseed:
 	$(CHEZ) --script host/gambit/gen-seed.ss
-
-# G3 gate (jolt-mj95.4): 40+ jolt source rows through jolt-compile-eval on
-# native gsi via the gambit boot + seed. Detection-gated like gambitkernel;
-# NOT in the ci list. Run from the repo root.
-gambiteval:
-	@if [ -x "$(GAMBIT_GSI)" ]; then \
-		"$(GAMBIT_GSI)" host/gambit/eval-test.ss; \
-	else \
-		echo "gambiteval: gambit-scheme not installed (brew) — skipped"; \
-	fi
 
 # Re-mint the seed after changing a seed source (reader/analyzer/backend/core).
 remint:
