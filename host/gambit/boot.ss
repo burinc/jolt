@@ -1,5 +1,5 @@
-;; boot.ss — the G2 boot: the curated jolt runtime subset loads on native gsi
-;; (Gambit 4.9.7). jolt-mj95.3.
+;; boot.ss — the G2/G3 boot: the curated jolt runtime subset + the cross-minted
+;; compiler seed load on native gsi (Gambit 4.9.7). jolt-mj95.3/.4.
 ;;
 ;; ONE compilation unit: everything is ##include-spliced (NOT load'd) so the
 ;; shim macros from prelude-shims.ss (define-record-type, fx aliases,
@@ -75,6 +75,33 @@
 (##include "../chez/syntax-quote.ss")
 (##include "../chez/host-contract.ss")
 
+;; ---- G3: the cross-minted compiler on gsi (jolt-mj95.4) ----------------------
+;;
+;; The seed (host/gambit/seed/{prelude,image}.ss — clojure.core + the compiler,
+;; minted at :gambit by make gambitseed) is spliced HERE, BEFORE compile-eval.ss,
+;; mirroring cli.ss's load order: compile-eval.ss's top-level forms var-deref the
+;; image's vars (jolt.analyzer/analyze, jolt.backend-scheme/emit-top-form), so
+;; the image must have loaded first. Same-unit rule: all three are ##include'd —
+;; the seed's emitted code expands seq.ss's macros in this unit; a load'd seed
+;; would be a separate unit that cannot see them.
+(##include "eval-syntax.ss")  ;; GENERATED: seq.ss macros into the interaction env for runtime eval
+(##include "seed/prelude.ss")
+;; post-prelude re-asserts the native overrides the overlay stubs out (ns-name,
+;; char?, atom?, realized?, ...) — cli.ss order: prelude, post-prelude, image.
+(##include "../chez/post-prelude.ss")
+(##include "seed/image.ss")
+(##include "../chez/compile-eval.ss")
+
+;; The compiled image's compiler unit defaults to :chez (new-unit's :target); the
+;; boot must flip it to :gambit before any runtime compile, or the emitter writes
+;; #3% unsafe spellings that cannot load on gsi. set-target! (R9) resets the
+;; current unit's :target — the unit compile-eval.ss's set-prelude-mode! just
+;; created on first touch (cur() lazily populates current-unit-box).
+(let ((st (var-deref "jolt.backend-scheme" "set-target!")))
+  (if (procedure? st)
+      (begin (st (keyword #f "gambit")) (display "boot: backend target -> :gambit\n"))
+      (begin (display "boot: FATAL set-target! missing from seed image\n") (exit 1))))
+
 ;; ---- smoke ---------------------------------------------------------------
 ;; Must exercise a LAZY seq (jolt-concat / jolt-map), not just jolt-first on a
 ;; vector — the lazy force path is where jolt-mt? and the cseq tail thunks live.
@@ -98,3 +125,10 @@
 (write (jolt-seq (jolt-seq "abcde")))
 (newline)
 (display "boot: values+hasheq+collections+seq+rt-core OK\n")
+
+;; G3 smoke: the compiler on gsi — the epic's exit criterion.
+(write (jolt-compile-eval "(+ 1 2)" "user"))
+(newline)
+(write (jolt-compile-eval "(map inc [1 2 3])" "user"))
+(newline)
+(display "boot: compile-eval OK\n")

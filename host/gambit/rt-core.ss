@@ -1039,3 +1039,203 @@
 ;; State images: dump the value graph to a file and read it back. Loads LAST —
 ;; walks jolt collections, var cells and atoms, prints paths through the printers,
 ;; and reads proc-name-tbl to write a fn as its var's name.
+
+;; clojure.core/str-join — the chez definition lives in java/natives-str.ss, which
+;; the gambit boot EXCLUDES (G2 java/ cut). The printer (printing.ss, rt-core) and
+;; clojure.core/join resolve this var at runtime, so the gambit kernel must define
+;; it: render each element with jolt-str-render-one, join by sep (default "").
+(define (jolt-str-join-var coll . opt)
+  (let ((sep (if (pair? opt) (jolt-str-render-one (car opt)) "")))
+    ;; seq-more may return jolt-empty-list (map tail) — normalize via jolt-seq
+    ;; like seq->list, or the next round calls cseq accessors on the empty list
+    (let loop ((s (jolt-seq coll)) (acc '()))
+      (if (jolt-nil? s)
+          (apply string-append (reverse acc))
+          (let ((piece (jolt-str-render-one (seq-first s))))
+            (loop (jolt-seq (seq-more s))
+                  (if (null? acc)
+                      (list piece)
+                      (cons piece (cons sep acc)))))))))
+(def-var! "clojure.core" "str-join" jolt-str-join-var)
+
+;; jolt-string-method — chez defines it in java/natives-str.ss, which the gambit
+;; boot EXCLUDES (G2 java/ cut), but records-gambit.ss's record-method-dispatch
+;; falls through a string target to it and the compiler (image + prelude) calls
+;; string methods (indexOf, startsWith, substring, ...) while compiling. Port of
+;; the string surface the compiler path exercises, on Gambit primitives (JVM
+;; semantics: -1 when a search misses).
+(define (jolt-string-method method s rest)
+  (define (arg n) (list-ref rest n))
+  (define (arg-idx n)
+    (let ((v (arg n))) (if (integer? v) v (exact (truncate v)))))
+  (cond
+    ((string=? method "toString") s)
+    ((string=? method "length") (string-length s))
+    ((string=? method "charAt") (string-ref s (arg-idx 0)))
+    ((string=? method "indexOf")
+     (let ((needle (jolt-need-str (arg 0))))
+       (or (if (fx>? (length rest) 1)
+               (string-index s needle (arg-idx 1))
+               (string-index s needle))
+           -1)))
+    ((string=? method "lastIndexOf")
+     (or (string-rindex s (jolt-need-str (arg 0))) -1))
+    ((string=? method "startsWith") (string-prefix? (jolt-need-str (arg 0)) s))
+    ((string=? method "endsWith") (string-suffix? (jolt-need-str (arg 0)) s))
+    ((string=? method "substring")
+     (substring s (arg-idx 0)
+                (if (fx>? (length rest) 1) (arg-idx 1) (string-length s))))
+    (else (error 'jolt-string-method "unhandled string method on gambit" method))))
+
+;; ---- clojure.core/str-* natives ---------------------------------------------
+;; chez defines these in java/natives-str.ss (excluded, G2 java/ cut); the
+;; prelude's clojure.string overlay and the compiler image var-deref them at
+;; runtime. Self-contained ports on Gambit primitives. Regex branches raise a
+;; clear error — the compiler path only passes literal needles.
+(define (jolt->idx x) (if (integer? x) x (exact (truncate x))))
+(define (jolt-char-by-char-match? s si needle nlen)
+  (let loop ((j 0))
+    (cond ((fx=? j nlen) #t)
+          ((char=? (string-ref s (fx+ si j)) (string-ref needle j)) (loop (fx+ j 1)))
+          (else #f))))
+(define (str-index-of s needle from)
+  (let ((nlen (string-length needle)) (slen (string-length s)))
+    (let loop ((i (max 0 from)))
+      (cond ((fx>? (fx+ i nlen) slen) -1)
+            ((jolt-char-by-char-match? s i needle nlen) i)
+            (else (loop (fx+ i 1)))))))
+(define (str-last-index-of s needle)
+  (let ((nlen (string-length needle)) (slen (string-length s)))
+    (let loop ((i (fx- slen nlen)) (found -1))
+      (cond ((fx<? i 0) found)
+            ((jolt-char-by-char-match? s i needle nlen) i)
+            (else (loop (fx- i 1) found))))))
+(define (str-needle x)
+  (cond ((char? x) (string x))
+        ((number? x) (string (integer->char (exact (truncate x)))))
+        ((string? x) x)
+        (else (jolt-str-render-one x))))
+(define (str-replace-literal s a b)
+  (let ((alen (string-length a)) (slen (string-length s)))
+    (if (fx=? alen 0) s
+        (let ((op (open-output-string)))
+          (let loop ((i 0))
+            (if (fx>? (fx+ i alen) slen)
+                (begin (display (substring s i slen) op) (get-output-string op))
+                (if (jolt-char-by-char-match? s i a alen)
+                    (begin (display b op) (loop (fx+ i alen)))
+                    (begin (display (string-ref s i) op) (loop (fx+ i 1))))))))))
+(define (str-replace-literal-first s a b)
+  (let ((alen (string-length a)) (i (str-index-of s a 0)))
+    (if (fx<? i 0) s
+        (string-append (substring s 0 i) b (substring s (fx+ i alen) (string-length s))))))
+(define (str-triml s)
+  (let ((len (string-length s)))
+    (let loop ((i 0))
+      (cond ((fx=? i len) "")
+            ((char<=? (string-ref s i) #\space) (loop (fx+ i 1)))
+            (else (substring s i len))))))
+(define (str-trimr s)
+  (let loop ((j (fx- (string-length s) 1)))
+    (cond ((fx<? j 0) "")
+          ((char<=? (string-ref s j) #\space) (loop (fx- j 1)))
+          (else (substring s 0 (fx+ j 1))))))
+(define (str-upper s) (string-upcase s))
+(define (str-lower s) (string-downcase s))
+(define (str-reverse-b s) (list->string (reverse (string->list s))))
+(define (str-find needle s)
+  (let ((i (str-index-of s needle 0)))
+    (if (fx<? i 0) jolt-nil i)))
+(define (str-literal-split s sep)
+  (let ((slen (string-length (jolt-need-str s))) (plen (string-length sep)))
+    (if (fx=? plen 0)
+        (map (lambda (c) (list->string (list c))) (string->list s))
+        (let loop ((i 0) (start 0) (acc '()))
+          (cond ((fx>? (fx+ i plen) slen)
+                 (reverse (cons (substring s start slen) acc)))
+                ((string=? (substring s i (fx+ i plen)) sep)
+                 (loop (fx+ i plen) (fx+ i plen) (cons (substring s start i) acc)))
+                (else (loop (fx+ i 1) start acc)))))))
+(define (jolt-str-join-strs strs sep)
+  (let loop ((xs strs) (first #t) (acc '()))
+    (cond ((null? xs) (apply string-append (reverse acc)))
+          (first (loop (cdr xs) #f (cons (car xs) acc)))
+          (else (loop (cdr xs) #f (cons (car xs) (cons sep acc)))))))
+(define (str-split pat s . opt)
+  (let ((limit (if (and (pair? opt) (not (jolt-nil? (car opt)))) (jolt->idx (car opt)) #f)))
+    (if (jolt-regex? pat)
+        (error 'str-split "regex split unsupported on the gambit boot" pat)
+        (let ((parts (str-literal-split s pat)))
+          (apply jolt-vector
+            (if (and limit (fx>? limit 0) (fx>? (length parts) limit))
+                (append (list-head parts (fx- limit 1))
+                        (list (jolt-str-join-strs (list-tail parts (fx- limit 1)) pat)))
+                parts))))))
+(define (str-replace-all pat repl s)
+  (if (jolt-regex? pat)
+      (error 'str-replace-all "regex replace unsupported on the gambit boot" pat)
+      (str-replace-literal s (str-needle pat) (str-needle repl))))
+(define (str-replace pat repl s)
+  (if (jolt-regex? pat)
+      (error 'str-replace "regex replace unsupported on the gambit boot" pat)
+      (str-replace-literal-first s (str-needle pat) (str-needle repl))))
+(def-var! "clojure.core" "str-upper" str-upper)
+(def-var! "clojure.core" "str-lower" str-lower)
+(def-var! "clojure.core" "str-trim" str-trim)
+(def-var! "clojure.core" "str-triml" str-triml)
+(def-var! "clojure.core" "str-trimr" str-trimr)
+(def-var! "clojure.core" "str-find" str-find)
+(def-var! "clojure.core" "str-reverse-b" str-reverse-b)
+(def-var! "clojure.core" "str-split" str-split)
+(def-var! "clojure.core" "str-replace" str-replace)
+(def-var! "clojure.core" "str-replace-all" str-replace-all)
+
+;; source-registry.ss is excluded (introspect off on this target); the def
+;; path emits registration calls — a no-op keeps them inert, matching the
+;; degraded-introspection mode where backtraces carry no frames.
+(define (jolt-register-source! . _) #f)
+
+;; fn-form-registry.ss is excluded (image capability raises on this target);
+;; the anon-fn emission registers source forms for image closure capture — a
+;; no-op keeps those calls inert, matching the image-off degradation.
+(define (image-register-fn-form! . _) #f)
+
+;; host-static-classes.ss is excluded (no JVM class mirrors on this target);
+;; instance-check paths probe jclass? — always #f, the cond arms fall through.
+(define (jclass? x) #f)
+(define (jclass-name x) (error (quote jclass-name) "no host classes on the gambit target"))
+
+;; ---- concurrency tier stubs (demo boot: single-threaded) ---------------------
+;; java/concurrency.ss + natives-queue.ss are excluded from this boot. Gambit
+;; satisfies the threads CONTRACT (G0: parameters fork-inherit, mutexes
+;; non-recursive), so a real port is possible — tracked on the epic; the demo
+;; REPL is single-threaded. Predicates answer #f (nothing can construct these
+;; types here); constructors and operations raise a message-carrying condition.
+(define (jolt-conc-unsupported who)
+  (lambda _ (error who "futures/promises/agents are unsupported in the gambit demo boot")))
+(define (jolt-future? x) #f)
+(define (jolt-promise? x) #f)
+(define (jolt-agent? x) #f)
+(define (jolt-delay? x) #f)
+(define (jolt-queue? x) #f)
+(define (jolt-conc-realized? x) #f)
+(define (jolt-native-future-done? x) #f)
+(define (jolt-native-future-cancelled? x) #f)
+(define jolt-agent-new (jolt-conc-unsupported 'agent))
+(define jolt-agent-send (jolt-conc-unsupported 'send))
+(define jolt-agent-await (jolt-conc-unsupported 'await))
+(define jolt-agent-error (jolt-conc-unsupported 'agent-error))
+(define jolt-agent-restart (jolt-conc-unsupported 'restart-agent))
+(define jolt-promise-new (jolt-conc-unsupported 'promise))
+(define jolt-deliver (jolt-conc-unsupported 'deliver))
+
+;; ---- class-registry seams (host-static-classes.ss is excluded) ---------------
+;; deftype/defrecord registration calls: recorded in minimal tables (nothing on
+;; this boot reads them back — no host interop), so definitions succeed.
+(define class-ctors-tbl (make-hashtable string-hash string=?))
+(define (register-class-ctor! tag ctor) (hashtable-set! class-ctors-tbl tag ctor))
+(define class-methods-tbl (make-hashtable string-hash string=?))
+(define (register-class-methods! tag methods) (hashtable-set! class-methods-tbl tag methods))
+(define instance-check-arms '())
+(define (register-instance-check-arm! h) (set! instance-check-arms (cons h instance-check-arms)))
+(define (register-instance-check! cls pred) #f)

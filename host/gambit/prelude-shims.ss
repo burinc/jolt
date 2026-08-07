@@ -594,3 +594,37 @@
       (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
                     (string-append "For input string: \""
                                    (if (string? s) s (jolt-str-render-one s)) "\"")))))
+
+;; make-thread-parameter — a Chez PRIMITIVE (no .ss definition), absent on Gambit.
+;; compile-eval.ss's jolt-current-source / jolt-aot-capture* are thread parameters;
+;; a plain Gambit parameter covers the single-threaded boot (parameter/v protocol
+;; matches: (p) get, (p v) set).
+(define (make-thread-parameter v) (make-parameter v))
+
+;; register-class-statics! — host-static.ss is in the G2-excluded java/ tree, but
+;; compile-eval.ss registers the JVM-Compiler statics emulation (Compiler/LINE,
+;; /COLUMN, /specials, /CHAR_MAP, /demunge) at its load time. Real minimal
+;; registry with the same FQN+short-merge semantics as host-static.ss, so the
+;; registration is recorded rather than dropped; nothing reads the table on the
+;; gambit boot (no host interop) — this is a binding seam, not a feature.
+(define class-statics-tbl (make-hashtable string-hash string=?))
+(define (short-class-name s)
+  (let loop ((i (- (string-length s) 1)))
+    (cond ((< i 0) s)
+          ((char=? (string-ref s i) #\.) (substring s (+ i 1) (string-length s)))
+          (else (loop (- i 1))))))
+(define (register-class-statics! name members)
+  (let ((h (or (hashtable-ref class-statics-tbl name #f)
+               (hashtable-ref class-statics-tbl (short-class-name name) #f)
+               (make-hashtable string-hash string=?))))
+    (hashtable-set! class-statics-tbl name h)
+    (unless (string=? name (short-class-name name))
+      (hashtable-set! class-statics-tbl (short-class-name name) h))
+    (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members)))
+
+;; Chez gensym accepts a STRING prefix; Gambit only a symbol. Normalize.
+(define %gambit-gensym gensym)
+(define (gensym . p)
+  (if (and (pair? p) (string? (car p)))
+      (%gambit-gensym (string->symbol (car p)))
+      (apply %gambit-gensym p)))
