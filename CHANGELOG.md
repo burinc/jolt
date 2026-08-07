@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-08-07
+
+### Added
+
+- **Variadic FFI** (#551): a `:varargs` marker in a `defcfn` argtype vector
+  declares the binding variadic and marks the fixed/variadic boundary — types
+  before it are the named parameters, types after it the concrete variadic
+  arguments. Calls emit Chez's `(__varargs_after n)` convention so variadic
+  arguments travel where the callee's `va_list` reads them; on Apple arm64
+  they ride the caller's stack, and a fixed-arity binding silently corrupts
+  them (fcntl's F_SETFL flags never land). Marker-first, marker-last, and
+  `:varargs` combined with `:blocking` reject at compile time with messages
+  naming the rule.
+
 ## [0.6.7] - 2026-08-06
 
 ### Added
@@ -3485,7 +3499,15 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.5.20...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.6.8...HEAD
+[0.6.8]: https://github.com/jolt-lang/jolt/compare/v0.6.7...v0.6.8
+[0.6.7]: https://github.com/jolt-lang/jolt/compare/v0.6.6...v0.6.7
+[0.6.6]: https://github.com/jolt-lang/jolt/compare/v0.6.5...v0.6.6
+[0.6.5]: https://github.com/jolt-lang/jolt/compare/v0.6.4...v0.6.5
+[0.6.4]: https://github.com/jolt-lang/jolt/compare/v0.6.3...v0.6.4
+[0.6.3]: https://github.com/jolt-lang/jolt/compare/v0.6.2...v0.6.3
+[0.6.2]: https://github.com/jolt-lang/jolt/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/jolt-lang/jolt/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/jolt-lang/jolt/compare/v0.5.20...v0.6.0
 [0.5.20]: https://github.com/jolt-lang/jolt/compare/v0.5.19...v0.5.20
 [0.5.19]: https://github.com/jolt-lang/jolt/compare/v0.5.18...v0.5.19
