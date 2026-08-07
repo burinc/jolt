@@ -550,3 +550,26 @@
   (let ((p (or (table-ref %vreg-table n #f)
                (let ((q (make-parameter 0))) (table-set! %vreg-table n q) q))))
     (p v)))
+
+;; parse-int-str / parse-int-or-throw — ported from java/host-static.ss (G2
+;; EXCLUDES the java/ tree; natives-misc.ss's jolt-bigint calls them). String
+;; -> integer in RADIX, #f on failure; parse-int-or-throw raises a jolt
+;; NumberFormatException. str-trim is String.trim (java/natives-str.ss): chars
+;; at or below space.
+(define (str-trim s)
+  (let ((len (string-length s)))
+    (let scan-l ((i 0))
+      (cond ((fx=? i len) "")
+            ((char<=? (string-ref s i) #\space) (scan-l (fx+ i 1)))
+            (else (let scan-r ((j (fx- len 1)))
+                    (if (char<=? (string-ref s j) #\space)
+                        (scan-r (fx- j 1))
+                        (substring s i (fx+ j 1)))))))))
+(define (parse-int-str s radix)
+  (let ((n (string->number (str-trim (if (string? s) s (jolt-str-render-one s))) radix)))
+    (and n (integer? n) n)))
+(define (parse-int-or-throw s radix what)
+  (or (parse-int-str s radix)
+      (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
+                    (string-append "For input string: \""
+                                   (if (string? s) s (jolt-str-render-one s)) "\"")))))

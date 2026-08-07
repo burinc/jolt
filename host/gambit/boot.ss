@@ -65,6 +65,15 @@
 (##include "../chez/lazy-bridge.ss")
 (##include "../chez/natives-transduce.ss")
 (##include "../chez/vars.ss")
+(##include "../chez/natives-misc.ss")
+(##include "../chez/natives-format.ss")
+(##include "../chez/extensions.ss")
+(##include "../chez/ns.ss")
+(##include "../chez/dyn-binding.ss")
+(##include "../chez/natives-reader.ss")
+(##include "../chez/reader.ss")
+(##include "../chez/syntax-quote.ss")
+(##include "../chez/host-contract.ss")
 
 ;; ---- smoke ---------------------------------------------------------------
 ;; Must exercise a LAZY seq (jolt-concat / jolt-map), not just jolt-first on a
