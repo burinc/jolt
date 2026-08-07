@@ -10,17 +10,16 @@
 ;; atom/var/agent.  Loaded after atoms.ss (shares jolt-iref-state-throw and
 ;; the iref tables).
 
-;; The lock field is DEAD at runtime (stm-lock serializes every commit; no code
-;; reads it) but it is FROZEN in the record layout: refs travel in images as
-;; raw nongenerative records, so jolt-ref-v1's field list is image-format
-;; surface — a 0.6.5 image holding a ref fails to restore against a changed
-;; layout with "incompatible record type jolt-ref". Removing the field needs
-;; state-image to walk refs by value (like walk-atom) and a compat story for
-;; existing images first: bead jolt-867l tracks it. Verified 2026-08-06 by
-;; dumping {ref} with the v0.6.5 release binary and restoring here.
+;; Refs travel in state images by VALUE (state-image.ss substitutes an
+;; image-ref descriptor on dump and re-mints through make-jolt-ref on
+;; restore), so this layout is NOT image-format surface and may change
+;; freely. The uid jolt-ref-v1 is RETIRED: format-2 images carry refs as raw
+;; nongenerative jolt-ref-v1 records (fields: val lock), and the legacy
+;; restore arm depends on materializing that rtd from the fasl without a
+;; live conflict — never reuse the v1 uid for a different layout.
 (define-record-type jolt-ref
-  (fields (mutable val) lock)
-  (nongenerative jolt-ref-v1))
+  (fields (mutable val))
+  (nongenerative jolt-ref-v2))
 
 ;; IRef arm: refs are watchable/validatable through the iref tables.
 (register-iref-arm! jolt-ref?)
@@ -102,7 +101,7 @@
   (let loop ((o opts) (validator jolt-nil) (m #f))
     (cond
       ((or (null? o) (null? (cdr o)))
-       (let ((r (make-jolt-ref v (make-mutex))))
+       (let ((r (make-jolt-ref v)))
          ;; validate init via iref validator table
          (when (and (not (jolt-nil? validator)) (jolt-not (jolt-invoke validator v)))
            (jolt-iref-state-throw))
