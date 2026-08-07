@@ -751,6 +751,28 @@
                           (jolt-keyword "log") jolt-nil)))
     (ok "stubs empties after resolve" (fx=? 0 (jolt-count (jolt-image-stubs))))))
 
+;; a stub inside a REF's val resolves through the in-place substitution walk
+;; (the walk previously passed refs through untouched — resolved stubs never
+;; landed inside a ref)
+(let ((sp (open-file-output-port "/tmp/jolt-image-refstub.txt" (file-options no-fail))))
+  (jolt-compile-eval "(def holder nil)" "r11.world")
+  (let ((cell (jolt-var "r11.world" "holder")))
+    (var-cell-root-set! cell (jolt-ref-new sp)))
+  (jolt-image-dump-world! tmp (jolt-vector "r11.world"))
+  (jolt-compile-eval "(def holder :clobbered)" "r11.world")
+  (jolt-image-restore-world! tmp)
+  (let ((ss (jolt-image-stubs)))
+    (ok "stub inside a ref's val is listed"
+        (fx=? 1 (jolt-count ss)))
+    (when (fx=? 1 (jolt-count ss))
+      (let ((id (jolt-get (jolt-nth ss 0) (jolt-keyword "id") jolt-nil)))
+        (ok "resolve-stub! replaces the slot inside the ref"
+            (and (fx=? 1 (jolt-image-resolve-stub! id "PORT-AGAIN"))
+                 (equal? "PORT-AGAIN"
+                         (jolt-ref-val (var-cell-root (jolt-var "r11.world" "holder")))))))))
+  (close-port sp)
+  (delete-file "/tmp/jolt-image-refstub.txt"))
+
 ;; resolver pre-registered: the stub never materializes
 ;; kind strings match the STUBBED OBJECT's class (a port's, here), so a
 ;; catch-all predicate is the simplest fixture
@@ -770,17 +792,64 @@
 (close-port stub-port)
 (delete-file stub-probe-file)
 
-;; --- PSL R4: cross-version restore — a v0.6.5-made world image holding a ref
-;; and an atom must restore against today's runtime. jolt-ref-v1's field list is
-;; image-format surface (refs travel as raw nongenerative records), so a layout
-;; change fails HERE, not in someone's app at restore time. The proper
-;; versioned-reconstruction fix is bead jolt-867l.11; this pins the regression
-;; until it lands.
+;; --- cross-version restore: the LEGACY-FORMAT proof. A v0.6.5-made (format-2)
+;; world image carries its ref as a raw nongenerative jolt-ref-v1 record; the
+;; live type is jolt-ref-v2, so the v1 rtd materializes from the fasl and the
+;; legacy restore arm re-mints a live ref from it. This fixture is permanent:
+;; it is the only thing proving old ref-carrying images keep restoring.
 (ok "v0.6.5 fixture present" (file-exists? "test/chez/fixtures/image-v0.6.5-ref-atom.image"))
 (jolt-image-restore-world! "test/chez/fixtures/image-v0.6.5-ref-atom.image")
 (is "v0.6.5 fixture: imgtest/plain" "imgtest/plain" "7")
 (is "v0.6.5 fixture: imgtest/my-atom deref" "(deref imgtest/my-atom)" "42")
 (is "v0.6.5 fixture: imgtest/my-ref deref" "(deref imgtest/my-ref)" "99")
+;; the legacy-restored ref is a LIVE v2 ref, not an inert v1 record: STM works
+(is "v0.6.5 fixture: legacy ref participates in dosync"
+    "(do (dosync (ref-set imgtest/my-ref 100)) (deref imgtest/my-ref))" "100")
+
+;; --- refs travel by value (format 3, jolt-867l.11): descriptor on dump,
+;; re-mint on restore. Value, meta, shared identity, cycles, and STM liveness
+;; all survive; the raw jolt-ref record never enters the fasl, so its layout
+;; is no longer image-format surface.
+(is "ref round-trip: value + meta + identity + cycle + dosync"
+    (string-append
+      "(let [r (ref 99 :meta {:tag :hot})"
+      "      shared (ref [1 2])"
+      "      cyc (ref nil)"
+      "      _ (dosync (ref-set cyc {:self cyc}))"
+      "      _ (jolt.host/image-write! \"" tmp "\" {:a r :b shared :c shared :cyc cyc})"
+      "      g (jolt.host/image-read \"" tmp "\")]"
+      "  [(deref (:a g)) (:tag (meta (:a g)))"
+      "   (identical? (:b g) (:c g))"
+      "   (identical? (:cyc g) (:self (deref (:cyc g))))"
+      "   (do (dosync (ref-set (:a g) 100)) (deref (:a g)))])")
+    "[99 :hot true true 100]")
+;; format discipline: the new image writes header version 3, and its bytes
+;; carry the descriptor rtd, never the live ref rtd
+(define (bv-contains? bv s)
+  (let* ((sb (string->utf8 s)) (m (bytevector-length sb)) (n (bytevector-length bv)))
+    (let scan ((i 0))
+      (cond ((fx>? (fx+ i m) n) #f)
+            ((let cmp ((j 0))
+               (or (fx=? j m)
+                   (and (fx=? (bytevector-u8-ref bv (fx+ i j)) (bytevector-u8-ref sb j))
+                        (cmp (fx+ j 1))))) #t)
+            (else (scan (fx+ i 1)))))))
+(ok "ref-carrying image is format 3 with no raw jolt-ref rtd"
+    (let ((port (open-file-input-port tmp)))
+      (let* ((h (fasl-read port))
+             (rest (get-bytevector-all port)))
+        (close-port port)
+        (and (fx=? 3 (vector-ref h 1))
+             (bv-contains? rest "image-ref")
+             (not (bv-contains? rest "jolt-ref-v2"))))))
+;; an unknown format version refuses with a clean error naming both versions
+(let ((vport (open-file-output-port tmp (file-options no-fail))))
+  (fasl-write (vector 'jolt-image 99 (jolt-image-runtime-version) (sa-host-tag)) vport)
+  (close-port vport))
+(ok "future format version refuses cleanly"
+    (call/cc (lambda (k)
+      (with-exception-handler (lambda (e) (k #t))
+        (lambda () (jolt-image-read tmp) #f)))))
 
 (cleanup!)
 (when (file-exists? (string-append tmp ".txt")) (delete-file (string-append tmp ".txt")))

@@ -22,7 +22,14 @@
 ;; 2: closures travel as source records (image-fnsrc), sorted colls as
 ;; image-sorted, unhandled resources as image-stub. A version-1 reader
 ;; refuses these images by the header check instead of misreading records.
-(define jolt-image-format-version 2)
+;; 3: refs travel as image-ref descriptors instead of raw jolt-ref records,
+;; so the ref record layout is no longer image-format surface. A version-2
+;; reader refuses these images by the header check — on a runtime without
+;; the descriptor a ref would restore as an inert record, silently wrong.
+;; This build still READS version 2: everything a v2 image can contain
+;; (including raw jolt-ref-v1 records) restores here via the legacy arm.
+(define jolt-image-format-version 3)
+(define jolt-image-read-versions '(2 3))
 
 ;; --- classification -----------------------------------------------------------
 ;; An eq hashtable is the ONE hashtable kind Chez can fasl; eqv/equal/string-hash
@@ -232,6 +239,32 @@
 (define-record-type image-sorted
   (fields kind cmp-fn entries)
   (nongenerative image-sorted-v1))
+
+;; A ref travels by VALUE: the write side substitutes this descriptor for the
+;; live jolt-ref, restore re-mints a fresh ref through make-jolt-ref and copies
+;; meta — so the ref record's layout is not image-format surface (refs.ss can
+;; change it freely; the v1 lock-field freeze is lifted). val is mutable so a
+;; self-referencing ref memoizes its descriptor before its val walks, exactly
+;; like walk-atom. Watches and validators live in the weak iref side tables and
+;; do not travel — the same as when refs rode raw. Images older than format 3
+;; carry refs as raw jolt-ref-v1 records instead; see image-legacy-ref? below.
+(define-record-type image-ref
+  (fields (mutable val))
+  (nongenerative image-ref-v1))
+
+;; A raw jolt-ref record in a format-2 image (v0.6.5/v0.6.6). The live runtime
+;; type is jolt-ref-v2, so the fasl's nongenerative jolt-ref-v1 rtd (fields:
+;; val lock) materializes from the image without conflict and its instances
+;; arrive as inert records of that type — NOT jolt-ref? — which the restore
+;; walk re-mints into live refs, reading val through the materialized rtd's
+;; own accessor. The jolt-ref-v1 uid is RETIRED: it must never be reused for
+;; a record with a different layout, or these images stop reading.
+(define (image-legacy-ref? x)
+  (and (record? x)
+       (record-rtd x)
+       (eq? (record-type-uid (record-rtd x)) 'jolt-ref-v1)))
+(define (legacy-ref-val x)
+  ((record-accessor (record-rtd x) 0) x))
 
 ;; A resource the dump could not write (port, thread, non-eq hashtable,
 ;; unregistered closure) that stub mode substitutes in place of a refusal. id
@@ -563,6 +596,13 @@
                       (walk-handled-restore x path))
                      ((and (eq? mode 'restore) (image-sorted? x))
                       (walk-sorted-restore x path))
+                     ;; a ref descriptor re-mints a live ref; a raw jolt-ref-v1
+                     ;; record from a format-2 image re-mints through the
+                     ;; legacy arm (same construction, val read via its own rtd)
+                     ((and (eq? mode 'restore) (image-ref? x))
+                      (walk-ref-restore (image-ref-val x) x path))
+                     ((and (eq? mode 'restore) (image-legacy-ref? x))
+                      (walk-ref-restore (legacy-ref-val x) x path))
                      ;; a stub with a matching resolver becomes the live value it
                      ;; stands for; without one it stays the inert record — the
                      ;; per-restore table (populated by restore-world!) lists it
@@ -654,6 +694,7 @@
                              ((htable-sorted? x) (walk-sorted x path))
                              ((var-cell? x) (walk-var-cell x path))
                              ((jolt-atom? x) (walk-atom x path))
+                             ((jolt-ref? x) (walk-ref x path))
                              ((pair? x) (walk-pair x path))
                              ((vector? x) (walk-vector x path))
                              ((and (hashtable? x) (hashtable-mutable? x))
@@ -831,6 +872,35 @@
                                 (jolt-atom-watches x))
                       (walk (jolt-atom-validator x) (cons "@validator" path))
                       #t))))
+             ;; cover val — the ref's only traveling state. Watches/validators
+             ;; live in the weak iref side tables and do not travel (identical
+             ;; to the raw-record days); the STM lock is global, nothing else
+             ;; to carry. Write side substitutes the descriptor; memoize BEFORE
+             ;; walking val so a self-referencing ref closes its cycle on the
+             ;; descriptor.
+             (walk-ref
+              (lambda (x path)
+                (if (image-rebuild-mode? mode)
+                    (let ((nx (make-image-ref jolt-nil)))
+                      (hashtable-set! memo x nx)
+                      (image-meta-copy! x nx)
+                      (image-ref-val-set! nx (walk (jolt-ref-val x) (cons "ref" path)))
+                      nx)
+                    (begin
+                      (hashtable-set! memo x #t)
+                      (walk (jolt-ref-val x) (cons "ref" path))
+                      #t))))
+             ;; read side: re-mint a live ref from a descriptor's (or a legacy
+             ;; raw record's) val — the caller passes the val read the right
+             ;; way for x's representation. Memoize before walking val, same
+             ;; cycle discipline as walk-atom.
+             (walk-ref-restore
+              (lambda (v x path)
+                (let ((nx (make-jolt-ref jolt-nil)))
+                  (hashtable-set! memo x nx)
+                  (image-meta-copy! x nx)
+                  (jolt-ref-val-set! nx (walk v (cons "ref" path)))
+                  nx)))
              (walk-pair
               (lambda (x path)
                 (if (image-rebuild-mode? mode)
@@ -1044,11 +1114,10 @@
 (define (image-check-header! h path)
   (unless (and (vector? h) (fx=? (vector-length h) 4) (eq? (vector-ref h 0) 'jolt-image))
     (jolt-throw (jolt-ex-info (string-append "image: " path " is not a jolt image") jolt-nil)))
-  (unless (equal? (vector-ref h 1) jolt-image-format-version)
+  (unless (member (vector-ref h 1) jolt-image-read-versions)
     (jolt-throw (jolt-ex-info
                   (string-append "image: " path " has format version "
-                                 (jolt-str-one (vector-ref h 1)) ", this build reads version "
-                                 (number->string jolt-image-format-version))
+                                 (jolt-str-one (vector-ref h 1)) ", this build reads versions 2 and 3")
                   jolt-nil)))
   ;; The fasl version moves with Chez, and a mismatch otherwise surfaces as an
   ;; opaque fasl-read error, so name it here instead.
@@ -1385,6 +1454,10 @@
         ((jolt-atom? x)
          (hashtable-set! memo x x)
          (jolt-atom-val-set! x (sub (jolt-atom-val x)))
+         x)
+        ((jolt-ref? x)
+         (hashtable-set! memo x x)
+         (jolt-ref-val-set! x (sub (jolt-ref-val x)))
          x)
         ((pair? x)
          (hashtable-set! memo x x)
