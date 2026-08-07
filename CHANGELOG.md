@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Gambit target groundwork** (second Scheme target, toward a browser
+  REPL): the adapter/shim layer and the full jolt kernel manifest boot on
+  native Gambit with reader/printer at parity, gated by `make gambitcheck`
+  and `make gambitkernel`.
+
 ## [0.6.8] - 2026-08-07
 
 ### Added

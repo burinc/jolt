@@ -304,6 +304,27 @@
 (define-syntax fxsra
   (syntax-rules () ((_ a b) (fxarithmetic-shift-right a b))))
 
+;; Chez fxlogbit? (i fx): #t when bit i of fixnum fx is set. Gambit 4.9.7 has
+;; no bit-test primitive (no bitwise-bit-set? / fixnum bit-test in any module);
+;; decompose via fxand + shift. Used by seq.ss's jolt-invoke* arity pre-checks
+;; and the procedure-arity-mask probes below.
+(define (fxlogbit? i fx)
+  (not (fx=? 0 (fxand fx (fxarithmetic-shift-left 1 i)))))
+
+;; Chez procedure-arity-mask: bitmask of the arg counts a procedure accepts.
+;; Gambit 4.9.7 has NO arity introspection at all (procedure-arity exists in no
+;; module — grep of the installed library confirms). Return the all-bits mask so
+;; jolt-invoke*'s (fxlogbit? n (procedure-arity-mask f)) pre-check always passes
+;; and the call proceeds — Gambit's own runtime raises on a real arity mismatch.
+;; The Chez build keeps precise masks; this is a port-of-convenience shim.
+(define (procedure-arity-mask f) -1)
+
+;; R6RS bitwise-bit-set? (n i): #t when bit i of n is set. Gambit 4.9.7 lacks
+;; it (records-gambit.ss's satisfies? path is the one user in the subset).
+;; Same fx decomposition as fxlogbit? — the only caller passes a fixnum mask.
+(define (bitwise-bit-set? n i)
+  (not (fx=? 0 (fxand n (fxarithmetic-shift-left 1 i)))))
+
 ;; R6RS bitwise shift spellings (natives-num.ss is the one user in the subset:
 ;; jolt-bit-shift-left/right, bit-mask, jolt-bit-test — 6 call sites) → Gambit's
 ;; arithmetic-shift. Gambit does not bind the R6RS bitwise-arithmetic-shift-*

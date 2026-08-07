@@ -575,6 +575,16 @@ gambitcheck:
 		echo "gambitcheck: gambit-scheme not installed (brew) — skipped"; \
 	fi
 
+# G2 kernel-test gate (jolt-mj95.4): the full booted manifest on native gsi,
+# driven through the real natives. Same detection-gated shape as gambitcheck;
+# NOT in the ci list. Run from the repo root (boot's irregex load is cwd-relative).
+gambitkernel:
+	@if [ -x "$(GAMBIT_GSI)" ]; then \
+		"$(GAMBIT_GSI)" host/gambit/kernel-test.ss; \
+	else \
+		echo "gambitkernel: gambit-scheme not installed (brew) — skipped"; \
+	fi
+
 # Re-mint the seed after changing a seed source (reader/analyzer/backend/core).
 remint:
 	@sh host/chez/remint.sh
