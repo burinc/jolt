@@ -118,7 +118,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   fnform traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
-  certify
+  certify gambitcheck
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -560,6 +560,19 @@ certify:
 		clojure -M test/conformance/certify.clj; \
 	else \
 		echo "certify: clojure not on PATH — skipped"; \
+	fi
+
+# Gambit adapter gate (G1, jolt-mj95.2): loads host/gambit/{prelude-shims,
+# scheme-adapter-runtime,hasheq}.ss under native gsi and asserts the
+# CONTRACT.txt names + shim behavior. Detection-gated like certify — skips
+# cleanly when gambit-scheme is absent. NEVER bare gsc/gsi (gsc on PATH is
+# Ghostscript): always the brew-prefix binary.
+GAMBIT_GSI := $(shell brew --prefix gambit-scheme 2>/dev/null)/bin/gsi
+gambitcheck:
+	@if [ -x "$(GAMBIT_GSI)" ]; then \
+		"$(GAMBIT_GSI)" host/gambit/gambitcheck.ss; \
+	else \
+		echo "gambitcheck: gambit-scheme not installed (brew) — skipped"; \
 	fi
 
 # Re-mint the seed after changing a seed source (reader/analyzer/backend/core).

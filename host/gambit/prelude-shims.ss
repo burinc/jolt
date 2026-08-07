@@ -1,0 +1,463 @@
+;; prelude-shims.ss — the Gambit target's syntax/API shims, loaded FIRST in every
+;; boot path (rt.ss owns the load; gambitcheck loads it directly).
+;;
+;; G1 (jolt-mj95.2): the syntax/API layer for native gsi (Gambit 4.9.7). Every
+;; shim here exists because the curated host subset (the G2 boot manifest) uses
+;; an R6RS/Chez spelling that Gambit does not provide under that name — see
+;; .dirge/gambit-spike-findings.md for the probe verdicts this builds on, and
+;; the census lists below for exactly what is shimmed (grep as data, not by eye).
+;;
+;; DESIGN NOTES
+;; ------------
+;; - Gambit's plain-script top level lacks several (gambit) module names
+;;   (format/printf/system/...), so the prelude starts by importing the (gambit)
+;;   module. Gambit's native define-record-type is renamed out of the way
+;;   (%gambit-native-record, unused) because it is the define-type sugar with
+;;   keyword syntax — NOT the R6RS form the host writes.
+;; - Records: Gambit has NO record mechanism with parent support and inclusive
+;;   predicates (the findings doc's "R7RS define-record-type works" verdict is
+;;   wrong: the (scheme base) version IS Gambit's native macro, which rejects the
+;;   R6RS field-spec form; probe 2026-08-07). The host needs both — the jrec
+;;   family (records.ss define-jrec-family) generates parent clauses, and
+;;   collections.ss dispatches on (jrec? x) as a GENERIC record test, which
+;;   requires the base predicate to be true of child instances. So the shim
+;;   implements define-record-type itself over native vectors: an instance is
+;;   #(type-id field0 field1 ...) with parent fields laid out first, a load-time
+;;   registry maps type-name -> rtd (id parent-name nfields field-names), and
+;;   constructor/accessor/setter/predicate bindings are eval'd into the
+;;   interaction environment (the same mechanism def-var! relies on — the G0
+;;   pin that eval'd defines are visible to later evals).
+;;   DIVERGENCE (documented): a gambit record IS a native vector, so (vector? r)
+;;   is #t where Chez gives #f. Host dispatch never tests raw vector? on records
+;;   (jolt-vector? = pvec?, and pvec is itself a record), so the jolt-level
+;;   classification is unaffected. Accessor/predicate type checks use the same
+;;   ancestor-chain logic as R6RS.
+;; - nongenerative uids are accepted and IGNORED (no image capability on this
+;;   target). protocol/parent in record clauses: parent IS supported (the jrec
+;;   family needs it); protocol is an error.
+
+;; Gambit's plain-script top level lacks several (gambit) module names
+;; (format/printf/system/...), so the prelude imports the (gambit) module —
+;; EXCEPT its native define-record-type (the define-type sugar with keyword
+;; syntax, NOT the R6RS form the host writes), which this file replaces with
+;; its own translator below.
+(import (except (gambit) define-record-type))
+
+;; ============================================================================
+;; interaction environment — the eval target for record bindings and, later,
+;; def-var!. R7RS (scheme repl) interaction-environment if bound, else Gambit's
+;; repl-environment. Either way (interaction-environment) returns THE top-level
+;; environment where define lands (G0 pin).
+;; ============================================================================
+
+(define %jolt-interaction-environment
+  (guard (e (#t (repl-environment)))
+    (interaction-environment)))
+
+(define (interaction-environment)
+  %jolt-interaction-environment)
+
+;; ============================================================================
+;; R6RS define-record-type translator
+;; ============================================================================
+
+(define jolt-record-table (make-table test: eq?))     ;; type-name sym -> rtd
+(define jolt-record-id-table (make-table test: eqv?)) ;; id fixnum -> rtd
+(define jolt-record-counter 0)
+
+;; rtd = #(id parent-name nfields field-name-list)
+(define (jolt-record-id-of name)
+  (let ((rtd (table-ref jolt-record-table name #f)))
+    (and rtd (vector-ref rtd 0))))
+
+(define (jolt-record-nfields id)
+  (vector-ref (table-ref jolt-record-id-table id #f) 2))
+
+(define (register-jolt-record-type! name parent-name fields)
+  (let* ((parent-id (and parent-name (jolt-record-id-of parent-name)))
+         (parent-n (if parent-id (jolt-record-nfields parent-id) 0))
+         (n (+ parent-n (length fields)))
+         (id (begin (set! jolt-record-counter (+ jolt-record-counter 1))
+                    jolt-record-counter))
+         (rtd (vector id parent-name n fields)))
+    (table-set! jolt-record-table name rtd)
+    (table-set! jolt-record-id-table id rtd)
+    id))
+
+;; Is ID a descendant-or-self of ANCESTOR-ID? Inclusive predicate semantics.
+(define (jolt-record-ancestor? id ancestor-id)
+  (or (= id ancestor-id)
+      (let* ((rtd (table-ref jolt-record-id-table id #f))
+             (pn (and rtd (vector-ref rtd 1))))
+        (and pn (jolt-record-ancestor? (jolt-record-id-of pn) ancestor-id)))))
+
+(define (make-jolt-record-ctor id n)
+  (lambda args
+    (if (not (= (length args) n))
+        (error 'record-constructor "wrong number of arguments" n (length args))
+        (let ((v (make-vector (+ n 1))))
+          (vector-set! v 0 id)
+          (let loop ((i 0) (args args))
+            (if (< i n)
+                (begin (vector-set! v (+ i 1) (car args))
+                       (loop (+ i 1) (cdr args)))
+                v))))))
+
+(define (make-jolt-record-pred id)
+  (lambda (x)
+    (and (vector? x)
+         (>= (vector-length x) 1)
+         (fixnum? (vector-ref x 0))
+         (jolt-record-ancestor? (vector-ref x 0) id))))
+
+(define (make-jolt-record-field id parent-n own-index)
+  (+ 1 parent-n own-index))
+
+(define (make-jolt-record-accessor id parent-n own-index)
+  (let ((off (make-jolt-record-field id parent-n own-index)))
+    (lambda (r)
+      (if (not (and (vector? r) (> (vector-length r) off)
+                    (jolt-record-ancestor? (vector-ref r 0) id)))
+          (error 'record-accessor "not an instance of this record type" id r))
+      (vector-ref r off))))
+
+(define (make-jolt-record-setter id parent-n own-index)
+  (let ((off (make-jolt-record-field id parent-n own-index)))
+    (lambda (r v)
+      (if (not (and (vector? r) (> (vector-length r) off)
+                    (jolt-record-ancestor? (vector-ref r 0) id)))
+          (error 'record-setter "not an instance of this record type" id r))
+      (vector-set! r off v))))
+
+;; Build the record type and eval its ctor/pred/accessor/setter bindings into
+;; the interaction environment (names computed from the record name exactly as
+;; Chez generates them: make-<name>/<name>?/<name>-<field>/<name>-<field>-set!
+;; for a bare name-spec, or the explicit ctor/pred from (name ctor pred)).
+(define (make-jolt-record-type name ctor pred parent-name fields)
+  (let* ((parent-id (and parent-name (jolt-record-id-of parent-name)))
+         (parent-n (if parent-id (jolt-record-nfields parent-id) 0))
+         (id (register-jolt-record-type! name parent-name fields))
+         (env (interaction-environment))
+         (nstr (symbol->string name))
+         (ctor-name (or ctor (string->symbol (string-append "make-" nstr))))
+         (pred-name (or pred (string->symbol (string-append nstr "?")))))
+    (eval (list 'define ctor-name (list 'make-jolt-record-ctor id
+                                        (+ parent-n (length fields))))
+          env)
+    (eval (list 'define pred-name (list 'make-jolt-record-pred id)) env)
+    (let loop ((j 0) (fs fields))
+      (if (pair? fs)
+          (let* ((spec (car fs))               ; (kind . name), kind ∈ mutable|immutable
+                 (f (cdr spec))
+                 (acc (string->symbol (string-append nstr "-" (symbol->string f))))
+                 (setn (string->symbol (string-append (symbol->string acc) "-set!"))))
+            (eval (list 'define acc (list 'make-jolt-record-accessor
+                                          id parent-n j))
+                  env)
+            ;; R6RS: only (mutable f) fields have a mutator binding.
+            (when (eq? (car spec) 'mutable)
+              (eval (list 'define setn (list 'make-jolt-record-setter
+                                             id parent-n j))
+                    env))
+            (loop (+ j 1) (cdr fs)))
+          #f))
+    id))
+
+;; field-spec extraction: (kind . name) pairs. R6RS semantics: a PLAIN spec is
+;; IMMUTABLE — only (mutable f) fields get a setter binding.
+(define-syntax jolt-record-field-names
+  (syntax-rules (mutable immutable)
+    ((_ ()) '())
+    ((_ ((mutable f) rest ...)) (cons (cons 'mutable 'f) (jolt-record-field-names (rest ...))))
+    ((_ ((immutable f) rest ...)) (cons (cons 'immutable 'f) (jolt-record-field-names (rest ...))))
+    ((_ (f rest ...)) (cons (cons 'immutable 'f) (jolt-record-field-names (rest ...))))))
+
+(define-syntax define-record-type
+  (syntax-rules (fields mutable immutable nongenerative parent protocol)
+    ((_ (name ctor pred) (parent p) (fields spec ...) (nongenerative uid))
+     (define name (make-jolt-record-type 'name 'ctor 'pred 'p
+                                         (jolt-record-field-names (spec ...)))))
+    ((_ (name ctor pred) (fields spec ...) (nongenerative uid))
+     (define name (make-jolt-record-type 'name 'ctor 'pred #f
+                                         (jolt-record-field-names (spec ...)))))
+    ((_ (name ctor pred) (parent p) (fields spec ...))
+     (define name (make-jolt-record-type 'name 'ctor 'pred 'p
+                                         (jolt-record-field-names (spec ...)))))
+    ((_ (name ctor pred) (fields spec ...))
+     (define name (make-jolt-record-type 'name 'ctor 'pred #f
+                                         (jolt-record-field-names (spec ...)))))
+    ((_ name (fields spec ...) (nongenerative uid))
+     (define name (make-jolt-record-type 'name #f #f #f
+                                         (jolt-record-field-names (spec ...)))))
+    ((_ name (fields spec ...))
+     (define name (make-jolt-record-type 'name #f #f #f
+                                         (jolt-record-field-names (spec ...)))))
+    ((_ name (parent p) (fields spec ...) (nongenerative uid))
+     (define name (make-jolt-record-type 'name #f #f 'p
+                                         (jolt-record-field-names (spec ...)))))
+    ((_ name (parent p) (fields spec ...))
+     (define name (make-jolt-record-type 'name #f #f 'p
+                                         (jolt-record-field-names (spec ...)))))
+    ((_ (name ctor pred) (nongenerative uid))
+     (define name (make-jolt-record-type 'name 'ctor 'pred #f '())))
+    ((_ name (nongenerative uid))
+     (define name (make-jolt-record-type 'name #f #f #f '())))
+    ((_ name (protocol p) rest ...)
+     (error 'define-record-type "protocol clauses are unsupported on the gambit target" 'name))))
+
+;; ============================================================================
+;; R6RS hashtable API over Gambit tables.
+;;
+;; CENSUS (curated subset, 2026-08-07): make-hashtable 53, hashtable-ref 170,
+;; hashtable-set! 97, hashtable-keys 22, hashtable-delete! 17, make-weak-eq-
+;; hashtable 10, make-eq-hashtable 6, hashtable-contains? 6, hashtable-values 5
+;; (CONTRACT misc), hashtable-entries 4, hashtable-size 3, make-eqv-hashtable 1,
+;; hashtable-cells 0 (CONTRACT misc). hashtable-update!/copy/mutable?/symbol-
+;; hashtable? are NOT used in the subset — deliberately not shimmed.
+;;
+;; make-hashtable is always called with a hash function + equiv predicate
+;; (e.g. (make-hashtable string-hash string=?)). Gambit tables hash internally
+;; (equal?-consistent), so the hash argument is accepted and DROPPED — every
+;; table operation is behaviorally identical; the hash function is only an
+;; internal implementation detail. string-hash is provided so the argument
+;; expression evaluates.
+;; ============================================================================
+
+(define (string-hash s) (equal?-hash s))
+
+(define (make-eq-hashtable . rest) (make-table test: eq?))
+(define (make-eqv-hashtable . rest) (make-table test: eqv?))
+(define (make-weak-eq-hashtable) (make-table test: eq? weak-keys: #t))
+(define (make-hashtable hash-fn equiv) (make-table test: equiv))
+
+(define (hashtable-ref t k d) (table-ref t k d))
+(define (hashtable-set! t k v) (table-set! t k v))
+;; Gambit deletion is (table-set! t k) with no value (G0 probe: delete = set!
+;; with no value; there is no table-delete!).
+(define (hashtable-delete! t k) (table-set! t k))
+(define (hashtable-size t) (table-length t))
+
+(define %hashtable-missing (gensym 'hashtable-missing))
+(define (hashtable-contains? t k)
+  (not (eq? (table-ref t k %hashtable-missing) %hashtable-missing)))
+
+;; R6RS hashtable-keys returns a VECTOR.
+(define (hashtable-keys t)
+  (list->vector (map car (table->list t))))
+
+;; R6RS hashtable-entries returns TWO values: keys vector, values vector.
+(define (hashtable-entries t)
+  (let ((cells (table->list t)))
+    (values (list->vector (map car cells))
+            (list->vector (map cdr cells)))))
+
+;; CONTRACT misc: hashtable-values (vector of values), hashtable-cells (list of
+;; (key . value) pairs).
+(define (hashtable-values t)
+  (list->vector (map cdr (table->list t))))
+
+(define (hashtable-cells t)
+  (table->list t))
+
+;; ============================================================================
+;; fx spelling aliases.
+;;
+;; CENSUS: fx+ 146, fx- 56, fx=? 55, fx<? 47, fx>? 31, fxand 26, fx* 10, fxsra 7,
+;; fxsll 6, fxmax 5, fxior 5, fxnot 2, fxmin 2, fxremainder 1, fxquotient 1.
+;; fl=? 1 (hasheq's -0.0 arm) -> Gambit fl=.
+;; Gambit binds fx+ fx- fx* fxand fxior fxnot fxmax fxmin fxquotient fxremainder
+;; natively; fx=?/fx<?/fx>? need the trailing-? spellings, and fxsll/fxsra map to
+;; fxarithmetic-shift-left/right. fx<=? fx>=? fx1+ fx1- fxsrl: zero uses in the
+;; subset — not aliased.
+;; ============================================================================
+
+(define-syntax fx=?
+  (syntax-rules () ((_ a ...) (fx= a ...))))
+(define-syntax fx<?
+  (syntax-rules () ((_ a ...) (fx< a ...))))
+(define-syntax fx>?
+  (syntax-rules () ((_ a ...) (fx> a ...))))
+(define-syntax fl=?
+  (syntax-rules () ((_ a ...) (fl= a ...))))
+(define-syntax fxsll
+  (syntax-rules () ((_ a b) (fxarithmetic-shift-left a b))))
+(define-syntax fxsra
+  (syntax-rules () ((_ a b) (fxarithmetic-shift-right a b))))
+
+;; R6RS bitwise shift spellings (natives-num.ss is the one user in the subset:
+;; jolt-bit-shift-left/right, bit-mask, jolt-bit-test — 6 call sites) → Gambit's
+;; arithmetic-shift. Gambit does not bind the R6RS bitwise-arithmetic-shift-*
+;; names; arithmetic-shift with a NEGATIVE count is the arithmetic right shift
+;; (floor semantics — identical to R6RS bitwise-arithmetic-shift-right).
+(define-syntax bitwise-arithmetic-shift-left
+  (syntax-rules () ((_ x n) (arithmetic-shift x n))))
+(define-syntax bitwise-arithmetic-shift-right
+  (syntax-rules () ((_ x n) (arithmetic-shift x (- n)))))
+
+;; ============================================================================
+;; Chez condition accessors over Gambit error objects.
+;;
+;; CENSUS: condition-message 7, condition? 7, message-condition? 2,
+;; condition-irritants 1. Gambit's (error 'who "msg" irr...) folds exactly like
+;; Chez: error-object-message -> "msg", error-object-irritants -> (irr...).
+;; Non-error raised values: condition? -> #f, message/irritants -> #f / '().
+;; ============================================================================
+
+;; Chez's (error who "msg" irritant ...) keeps WHO out of the message and the
+;; irritants. Gambit's native error is message-first (a symbol who would BECOME
+;; the message and push "msg" into the irritants — probed 4.9.7), so the shim
+;; re-shapes: message = the string, irritants = the rest, who dropped (Gambit
+;; has no who slot; the host's five error sites read message + irritants only).
+(define %gambit-error error)
+(define (error who . rest)
+  (if (and (pair? rest) (string? (car rest)))
+      (apply %gambit-error (car rest) (cdr rest))
+      (apply %gambit-error who rest)))
+
+(define (condition? x) (error-object? x))
+(define (message-condition? x) (error-object? x))
+(define (condition-message c)
+  (if (error-object? c) (error-object-message c) #f))
+(define (condition-irritants c)
+  (if (error-object? c) (error-object-irritants c) '()))
+
+;; ============================================================================
+;; thread-name mappings (G0 verdicts: the PIN holds — parameters fork-inherit
+;; into SRFI-18 threads; mutexes are non-recursive; condvar wait shape differs
+;; from Chez condition-wait and is mapped here).
+;; ============================================================================
+
+(define (mutex-acquire m . rest)
+  (if (pair? rest) (mutex-lock! m (car rest)) (mutex-lock! m)))
+(define (mutex-release m) (mutex-unlock! m))
+
+(define-syntax with-mutex
+  (syntax-rules ()
+    ((_ m body ...)
+     (dynamic-wind (lambda () (mutex-lock! m))
+                   (lambda () body ...)
+                   (lambda () (mutex-unlock! m))))))
+
+(define (make-thread-parameter init) (make-parameter init))
+
+;; SRFI-18 spellings: make-condition-variable / condition-variable-signal! /
+;; condition-variable-broadcast.
+(define (make-condition) (make-condition-variable))
+(define (condition-signal cv) (condition-variable-signal! cv))
+(define (condition-broadcast cv) (condition-variable-broadcast! cv))
+
+;; (condition-wait cv m [timeout]) — the SRFI-18 idiom is a single
+;; (mutex-unlock! m cv [timeout]) call: it releases M, waits on CV (or times
+;; out), and RE-ACQUIRES M before returning. Unit-tested in gambitcheck.
+(define (condition-wait cv m . rest)
+  ;; SRFI-18's (mutex-unlock! m cv [timeout]) releases M and waits, but does
+  ;; NOT re-acquire on wake — Chez's condition-wait DOES, and every host wait
+  ;; loop assumes it (unlock follows the loop). Re-lock before returning.
+  ;; A NUMBER timeout is normalized to a time object: the js runtime treats a
+  ;; raw absolute-seconds real as a setTimeout DELAY (32-bit-overflow warnings,
+  ;; infinite reschedule loop — probed under node); a time object works on
+  ;; both targets.
+  (let ((r (if (pair? rest)
+               (let ((t (car rest)))
+                 (mutex-unlock! m cv (if (number? t) (seconds->time t) t)))
+               (mutex-unlock! m cv))))
+    (mutex-lock! m)
+    r))
+
+(define (fork-thread thunk) (thread-start! (make-thread thunk)))
+
+;; CONTRACT: get-thread-id is a NUMBER, distinct per live thread. Gambit has no
+;; native thread ids, so a weak table maps thread objects to a monotonic
+;; counter. Weak keys so a dead thread's slot (and id) can be reclaimed.
+(define thread-id-table (make-table test: eq? weak-keys: #t))
+(define thread-id-mutex (make-mutex))
+(define thread-id-counter 0)
+
+(define (get-thread-id)
+  (let ((t (current-thread)))
+    (or (table-ref thread-id-table t #f)
+        (begin
+          (mutex-lock! thread-id-mutex)
+          (let ((id (or (table-ref thread-id-table t #f)
+                        (begin (set! thread-id-counter (+ thread-id-counter 1))
+                               (table-set! thread-id-table t thread-id-counter)
+                               thread-id-counter))))
+            (mutex-unlock! thread-id-mutex)
+            id)))))
+
+;; ============================================================================
+;; CONTRACT misc names (system/sort/time helpers the host spells differently).
+;; ============================================================================
+
+;; Chez sort shape is (sort predicate list); Gambit's native is list-sort with
+;; the same (less? list) order.
+(define (sort pred lst) (list-sort pred lst))
+
+(define (list-head lst n)
+  (let loop ((lst lst) (n n) (acc '()))
+    (if (<= n 0)
+        (reverse acc)
+        (loop (cdr lst) (- n 1) (cons (car lst) acc)))))
+
+;; iota / vector-copy / box / unbox / set-box! / void / gensym / pretty-print /
+;; getenv / system come from (gambit) natively; format/printf/fprintf are shimmed below.
+
+;; R6RS sleep takes a TIME object; Gambit's thread-sleep! takes real seconds.
+(define (sleep t)
+  (if (number? t)
+      (thread-sleep! t)
+      (thread-sleep! (time->seconds t))))
+
+;; CONTRACT: current-time accepts the R6RS one-arg time-type form AND the Chez
+;; zero-arg form. Gambit's native is zero-arg only; the type argument is ignored
+;; (a utc time object is monotonic enough for elapsed deltas within a process).
+(define %gambit-current-time current-time)
+(define (current-time . rest) (%gambit-current-time))
+
+;; make-time is not bound natively (and unused in the curated subset — the
+;; CONTRACT comment mentions the host passing make-time results to sleep).
+;; R6RS order: (make-time type nanosecond second).
+(define (make-time type nanosecond second)
+  (seconds->time (+ second (/ nanosecond 1000000000))))
+
+;; CONTRACT misc: system is the shell-out; Gambit spells it shell-command.
+(define (system cmd) (shell-command cmd))
+
+(define (scheme-version)
+  (guard (e (#t "Gambit Scheme"))
+    (##version-string)))
+
+;; Chez's equal-hash (used by the hasheq fallback) maps onto Gambit's equal?-hash.
+(define (equal-hash x) (equal?-hash x))
+
+;; CONTRACT: format is the ~a ~s ~d ~% ~~ subset (SRFI-28); printf/fprintf are
+;; format to the current/given output port. Gambit binds NONE of these natively
+;; (probed 4.9.7) — the earlier note claiming they come from (gambit) was wrong.
+(define (%format-to port fmt args)
+  (let ((n (string-length fmt)))
+    (let loop ((i 0) (args args))
+      (when (< i n)
+        (let ((c (string-ref fmt i)))
+          (if (and (char=? c #\~) (< (+ i 1) n))
+              (let ((d (string-ref fmt (+ i 1))))
+                (case d
+                  ((#\a #\A) (display (car args) port) (loop (+ i 2) (cdr args)))
+                  ((#\s #\S) (write (car args) port) (loop (+ i 2) (cdr args)))
+                  ((#\d #\D) (display (car args) port) (loop (+ i 2) (cdr args)))
+                  ((#\%) (newline port) (loop (+ i 2) args))
+                  ((#\~) (display #\~ port) (loop (+ i 2) args))
+                  (else (display c port) (loop (+ i 1) args))))
+              (begin (display c port) (loop (+ i 1) args))))))))
+
+;; R6RS get-line over Gambit's read-line.
+(define (get-line port) (read-line port))
+
+(define (format fmt . args)
+  (call-with-output-string
+    (lambda (p) (%format-to p fmt args))))
+
+(define (printf fmt . args)
+  (%format-to (current-output-port) fmt args))
+
+(define (fprintf port fmt . args)
+  (%format-to port fmt args))
