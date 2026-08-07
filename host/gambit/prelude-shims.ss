@@ -163,6 +163,20 @@
           #f))
     id))
 
+;; R6RS record runtime introspection over the shim registry. CENSUS (boot
+;; manifest, 2026-08-11): record-constructor + record-type-descriptor only, the
+;; make-pmap/make-pset raw-constructor fast paths in collections.ss. Under the
+;; shim a record type NAME is bound to its registered id (make-jolt-record-type
+;; returns it), so the descriptor is the registry rtd and the raw constructor
+;; is rebuilt from it.
+(define (record-type-descriptor name)
+  (if (fixnum? name) (table-ref jolt-record-id-table name #f) #f))
+(define (record-constructor rtd)
+  (if (vector? rtd)
+      (let ((id (vector-ref rtd 0)) (n (vector-ref rtd 2)))
+        (make-jolt-record-ctor id n))
+      (error 'record-constructor "not a jolt record descriptor" rtd)))
+
 ;; field-spec extraction: (kind . name) pairs. R6RS semantics: a PLAIN spec is
 ;; IMMUTABLE — only (mutable f) fields get a setter binding.
 (define-syntax jolt-record-field-names
@@ -234,6 +248,8 @@
 (define (hashtable-set! t k v) (table-set! t k v))
 ;; Gambit deletion is (table-set! t k) with no value (G0 probe: delete = set!
 ;; with no value; there is no table-delete!).
+(define (hashtable-clear! t)
+  (for-each (lambda (kv) (table-set! t (car kv))) (table->list t)))
 (define (hashtable-delete! t k) (table-set! t k))
 (define (hashtable-size t) (table-length t))
 
@@ -277,12 +293,37 @@
   (syntax-rules () ((_ a ...) (fx< a ...))))
 (define-syntax fx>?
   (syntax-rules () ((_ a ...) (fx> a ...))))
+(define-syntax fx<=?
+  (syntax-rules () ((_ a ...) (fx<= a ...))))
+(define-syntax fx>=?
+  (syntax-rules () ((_ a ...) (fx>= a ...))))
 (define-syntax fl=?
   (syntax-rules () ((_ a ...) (fl= a ...))))
 (define-syntax fxsll
   (syntax-rules () ((_ a b) (fxarithmetic-shift-left a b))))
 (define-syntax fxsra
   (syntax-rules () ((_ a b) (fxarithmetic-shift-right a b))))
+
+;; Chez fxlogbit? (i fx): #t when bit i of fixnum fx is set. Gambit 4.9.7 has
+;; no bit-test primitive (no bitwise-bit-set? / fixnum bit-test in any module);
+;; decompose via fxand + shift. Used by seq.ss's jolt-invoke* arity pre-checks
+;; and the procedure-arity-mask probes below.
+(define (fxlogbit? i fx)
+  (not (fx=? 0 (fxand fx (fxarithmetic-shift-left 1 i)))))
+
+;; Chez procedure-arity-mask: bitmask of the arg counts a procedure accepts.
+;; Gambit 4.9.7 has NO arity introspection at all (procedure-arity exists in no
+;; module — grep of the installed library confirms). Return the all-bits mask so
+;; jolt-invoke*'s (fxlogbit? n (procedure-arity-mask f)) pre-check always passes
+;; and the call proceeds — Gambit's own runtime raises on a real arity mismatch.
+;; The Chez build keeps precise masks; this is a port-of-convenience shim.
+(define (procedure-arity-mask f) -1)
+
+;; R6RS bitwise-bit-set? (n i): #t when bit i of n is set. Gambit 4.9.7 lacks
+;; it (records-gambit.ss's satisfies? path is the one user in the subset).
+;; Same fx decomposition as fxlogbit? — the only caller passes a fixnum mask.
+(define (bitwise-bit-set? n i)
+  (not (fx=? 0 (fxand n (fxarithmetic-shift-left 1 i)))))
 
 ;; R6RS bitwise shift spellings (natives-num.ss is the one user in the subset:
 ;; jolt-bit-shift-left/right, bit-mask, jolt-bit-test — 6 call sites) → Gambit's
@@ -313,6 +354,17 @@
   (if (and (pair? rest) (string? (car rest)))
       (apply %gambit-error (car rest) (cdr rest))
       (apply %gambit-error who rest)))
+
+;; Chez syntax-case has with-syntax; Gambit's (gambit) module exposes
+;; syntax-case but not with-syntax. rt.ss's jolt-foreign-proc-safe transformer
+;; uses it (a macro definition, so it must expand in the boot unit). The
+;; standard with-syntax reduction over syntax-case: bind pattern vars from a
+;; list of expression values.
+(define-syntax with-syntax
+  (syntax-rules ()
+    ((_ ((p e) ...) body ...)
+     (syntax-case (list e ...) ()
+       ((p ...) body ...)))))
 
 (define (condition? x) (error-object? x))
 (define (message-condition? x) (error-object? x))
@@ -423,6 +475,21 @@
 ;; CONTRACT misc: system is the shell-out; Gambit spells it shell-command.
 (define (system cmd) (shell-command cmd))
 
+;; CONTRACT: getenv — Chez's (getenv "NAME") returns #f when the variable is
+;; unset; Gambit's raises ("Unbound OS environment variable"). Preserve the
+;; zero-arg alist form and the optional-default form; make the bare string form
+;; Chez-shaped.
+(define %gambit-getenv getenv)
+(define (getenv key . rest)
+  (if (null? rest)
+      (guard (e (#t #f)) (%gambit-getenv key))
+      (apply %gambit-getenv key rest)))
+
+;; CONTRACT: fork-thread — Chez's spawn; Gambit composes make-thread +
+;; thread-start!. lazy-bridge.ss shadows it to flip jolt-mt? and track live
+;; threads, so it must exist before that file loads.
+(define (fork-thread thunk) (thread-start! (make-thread thunk)))
+
 (define (scheme-version)
   (guard (e (#t "Gambit Scheme"))
     (##version-string)))
@@ -449,15 +516,81 @@
                   (else (display c port) (loop (+ i 1) args))))
               (begin (display c port) (loop (+ i 1) args))))))))
 
+;; R6RS fold-left / fold-right — Gambit binds neither (its SRFI-1 fold has a
+;; DIFFERENT proc arg order: (kons x acc) vs R6RS's (f acc x)). Direct ports.
+(define (fold-left f init . lists)
+  (if (null? (cdr lists))
+      (let loop ((acc init) (l (car lists)))
+        (if (null? l) acc (loop (f acc (car l)) (cdr l))))
+      (let loop ((acc init) (ls lists))
+        (if (null? (car ls)) acc
+            (loop (apply f acc (map car ls)) (map cdr ls))))))
+(define (fold-right f init . lists)
+  (if (null? (cdr lists))
+      (let loop ((l (car lists)))
+        (if (null? l) init (f (car l) (loop (cdr l)))))
+      (let loop ((ls lists))
+        (if (null? (car ls)) init
+            (apply f (append (map car ls) (list (loop (map cdr ls)))))))))
+
 ;; R6RS get-line over Gambit's read-line.
 (define (get-line port) (read-line port))
 
+;; Chez's format accepts a #f port meaning "to a string" — records.ss calls
+;; (format #f "f~a" i). The plain SRFI-28 spelling (format "~a" x) is the
+;; default; a leading #f shifts to the next arg as the format string.
 (define (format fmt . args)
-  (call-with-output-string
-    (lambda (p) (%format-to p fmt args))))
+  (if (eq? fmt #f)
+      (call-with-output-string (lambda (p) (%format-to p (car args) (cdr args))))
+      (call-with-output-string (lambda (p) (%format-to p fmt args)))))
 
 (define (printf fmt . args)
   (%format-to (current-output-port) fmt args))
 
 (define (fprintf port fmt . args)
   (%format-to port fmt args))
+
+;; make-thread-parameter — Chez spelling; Gambit has no such name (probed
+;; 4.9.7). Plain make-parameter IS thread-aware here (G0 pin: parameters
+;; fork-inherit into SRFI-18 threads), which is the whole point of Chez's
+;; thread parameters, so the alias is faithful. rt-core's throw-site params
+;; (jolt-throw-cont/sitep) and print depth use it.
+(define (make-thread-parameter v) (make-parameter v))
+
+;; virtual-register / set-virtual-register!: Chez's fixed per-thread slot
+;; array (rt-core claims slots 2/3/4). Gambit has no equivalent; one parameter
+;; per claimed slot, created lazily, reproduces the per-thread semantics and
+;; the "fresh thread starts every slot at fixnum 0" contract. converters.ss's
+;; jolt-print-one stashes a print-readably override in slot jolt-vreg-print-
+;; readably through these.
+(define %vreg-table (make-table test: eqv?))  ;; slot fixnum -> parameter
+(define (virtual-register n)
+  (let ((p (table-ref %vreg-table n #f)))
+    (if p (p) 0)))
+(define (set-virtual-register! n v)
+  (let ((p (or (table-ref %vreg-table n #f)
+               (let ((q (make-parameter 0))) (table-set! %vreg-table n q) q))))
+    (p v)))
+
+;; parse-int-str / parse-int-or-throw — ported from java/host-static.ss (G2
+;; EXCLUDES the java/ tree; natives-misc.ss's jolt-bigint calls them). String
+;; -> integer in RADIX, #f on failure; parse-int-or-throw raises a jolt
+;; NumberFormatException. str-trim is String.trim (java/natives-str.ss): chars
+;; at or below space.
+(define (str-trim s)
+  (let ((len (string-length s)))
+    (let scan-l ((i 0))
+      (cond ((fx=? i len) "")
+            ((char<=? (string-ref s i) #\space) (scan-l (fx+ i 1)))
+            (else (let scan-r ((j (fx- len 1)))
+                    (if (char<=? (string-ref s j) #\space)
+                        (scan-r (fx- j 1))
+                        (substring s i (fx+ j 1)))))))))
+(define (parse-int-str s radix)
+  (let ((n (string->number (str-trim (if (string? s) s (jolt-str-render-one s))) radix)))
+    (and n (integer? n) n)))
+(define (parse-int-or-throw s radix what)
+  (or (parse-int-str s radix)
+      (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
+                    (string-append "For input string: \""
+                                   (if (string? s) s (jolt-str-render-one s)) "\"")))))
