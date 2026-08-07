@@ -13,6 +13,7 @@ host/chez/scheme-adapter-runtime.ss fasl-read
 host/chez/scheme-adapter-runtime.ss fasl-write
 host/chez/scheme-adapter-runtime.ss file-modification-time
 host/chez/scheme-adapter-runtime.ss foreign-alloc
+host/chez/scheme-adapter-runtime.ss foreign-callable
 host/chez/scheme-adapter-runtime.ss foreign-callable-entry-point
 host/chez/scheme-adapter-runtime.ss foreign-entry
 host/chez/scheme-adapter-runtime.ss foreign-entry?

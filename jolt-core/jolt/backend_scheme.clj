@@ -85,6 +85,20 @@
 (defn set-var-cache! [on] (reset! (:var-cache? (cur)) (boolean on)))
 (defn- var-cache? [] @(:var-cache? (cur)))
 
+;; TARGET PRIMITIVES. The back end emits a small set of Chez-only spellings
+;; directly — the #3% unsafe variants of runtime ops (vector-ref, fx=, the
+;; flonum arithmetic ops) that the PIC inline-cache probe and the proven-
+;; :double/:long emit sites rely on. A target port swaps THIS table, never the
+;; emitter: each key is a MEANING, and all seven emission sites derive their
+;; spelling from :unsafe-prefix + the safe op name (one mechanism, no per-site
+;; strings). A target without unsafe variants maps :unsafe-prefix to "" — every
+;; derived spelling degrades to the checked op, safe-and-slower, never wrong.
+(defn set-target! [t] (reset! (:target (cur)) t))
+(defn- target [] @(:target (cur)))
+(def ^:private target-prims
+  {:chez {:unsafe-prefix "#3%"}})
+(defn- unsafe-prefix [] (get-in target-prims [(target) :unsafe-prefix]))
+
 ;; contagion clone sites (jolt devirt-gated fl* contagion for :num fields): a set of
 ;; "tag|proto|method" keys for impls whose body has a :num field beside a proven
 ;; :double operand — worth a contagion-specialized clone at the devirt site. It lives
@@ -450,8 +464,10 @@
                   ;; (emit-def-cached, :forward-decl, :the-ns).
                   "define" "def-var!" "def-var-with-meta!"
                   "declare-var!" "intern-ns!"
-                  ;; ffi lowering (emit-ffi-fn: a Chez foreign-procedure).
-                  "foreign-procedure"}]
+                  ;; ffi lowering (emit-ffi-fn/emit-ffi-callable: the sa-* adapter
+                  ;; syntaxes a Chez foreign-procedure/callable expands to).
+                  "sa-foreign-procedure" "sa-foreign-procedure-blocking"
+                  "sa-foreign-callable" "sa-foreign-callable-collect-safe"}]
     (into from-registry helpers)))
 
 ;; Most jolt names are already valid Scheme identifiers. The one that isn't is
@@ -713,7 +729,7 @@
 (defn- emit-ffi-fn [node]
   (let [n (count (:argtypes node))
         params (mapv (fn [i] (str "a" i)) (range n))
-        fp (str "(foreign-procedure " (when (:blocking node) "__collect_safe ")
+        fp (str "(" (if (:blocking node) "sa-foreign-procedure-blocking " "sa-foreign-procedure ")
                 (chez-str-lit (:csym node))
                 " (" (str/join " " (map ffi-type->chez (:argtypes node))) ") "
                 (ffi-type->chez (:rettype node)) ")")]
@@ -733,8 +749,8 @@
 ;; hands to C. :collect-safe emits the convention that reactivates the thread on
 ;; entry, for callbacks invoked while it is parked in a :blocking foreign call.
 (defn- emit-ffi-callable [node]
-  (str "(jolt-ffi-register-callable! (foreign-callable "
-       (when (:collect-safe node) "__collect_safe ")
+  (str "(jolt-ffi-register-callable! ("
+       (if (:collect-safe node) "sa-foreign-callable-collect-safe " "sa-foreign-callable ")
        (emit (:fn node))
        " (" (str/join " " (map ffi-type->chez (:argtypes node))) ") "
        (ffi-type->chez (:rettype node)) "))"))
@@ -950,8 +966,8 @@
 (defn- pic-scan-clauses [v d]
   (str/join " "
             (for [i (range pic-n)]
-              (str "(and (eq? (#3%vector-ref " v " " (* 2 i) ") " d ")"
-                   " (#3%vector-ref " v " " (+ (* 2 i) 1) "))"))))
+              (str "(and (eq? (" (unsafe-prefix) "vector-ref " v " " (* 2 i) ") " d ")"
+                   " (" (unsafe-prefix) "vector-ref " v " " (+ (* 2 i) 1) "))"))))
 
 ;; A reference into the Clojure stdlib (clojure.*) with no impl on Chez yet.
 (defn- stdlib-var? [n]
@@ -969,8 +985,8 @@
 ;; 61, so those map to the widening jolt-l+/-/* rather than any fx op.
 (defn- emit-numeric [kind nm args order-args]
   (cond
-    (and (= kind :double) (= nm "inc")) (str "(#3%fl+ " (first args) " 1.0)")
-    (and (= kind :double) (= nm "dec")) (str "(#3%fl- " (first args) " 1.0)")
+    (and (= kind :double) (= nm "inc")) (str "(" (unsafe-prefix) "fl+ " (first args) " 1.0)")
+    (and (= kind :double) (= nm "dec")) (str "(" (unsafe-prefix) "fl- " (first args) " 1.0)")
     ;; inc/dec tolerate a 64-bit operand (jolt-l-inc/dec fall back past fixnum range);
     ;; unchecked-inc/dec wrap (Java long). Neither can use the raising fx1+/fx1-.
     (and (= kind :long) (= nm "inc")) (str "(jolt-l-inc " (first args) ")")
@@ -979,7 +995,7 @@
     (and (= kind :long) (= nm "unchecked-dec")) (str "(jolt-uncdec " (first args) ")")
     :else
     (let [op (case kind :double (dbl-ops nm) :long (lng-ops nm) :bigdec (bd-ops nm))
-          op (if (= kind :double) (str "#3%" op) op)]
+          op (if (= kind :double) (str (unsafe-prefix) op) op)]
       (cond
         (and (contains? #{"<" "<=" ">" ">=" "==" "="} nm) (> (count args) 2))
         ;; a chained comparison (<= a b c) means (and (<= a b) (<= b c)); the fast
@@ -1161,7 +1177,7 @@
                           (str "(let* ((" r " " (first as) ")"
                                " (" v " (or " c " (let ((_nv (jolt-pic-make))) (set! " c " _nv) _nv)))"
                                " (" d " (jrec-pic-desc " r ")))"
-                               " ((if (and " d " (#3%fx= (#3%vector-ref " v " " pic-epoch-idx ") jolt-proto-epoch))"
+                               " ((if (and " d " (" (unsafe-prefix) "fx= (" (unsafe-prefix) "vector-ref " v " " pic-epoch-idx ") jolt-proto-epoch))"
                                 " (or " scan " (jolt-pic-install " v " " d " " proto " " method " " r "))"
                                 " (jolt-pic-rebuild " v " " d " " proto " " method " " r "))"
                                 " " apply-args "))"))

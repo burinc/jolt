@@ -93,6 +93,7 @@
    :prelude-mode? (atom false)
    :direct-link? (atom false)
    :var-cache? (atom false)
+   :target (atom :chez)
    :trace-frames? (atom false)
    :source-reg? (atom false)
    :direct-link-defined (atom #{})
