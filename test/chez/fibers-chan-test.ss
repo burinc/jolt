@@ -83,6 +83,25 @@
                   (sleep (make-time 'time-duration 1000000 0))
                   (loop))))))
 
+;; The same, for a SET of fibers. This exists because of a real CI failure worth
+;; remembering: a cross-thread wake lands a fiber on the run queue AFTER
+;; sa-fiber-run-all has already drained and returned, so a single drain is not
+;; enough whenever another OS thread is what unblocks the fiber. Locally the
+;; threads were always blocked in take before the fibers ran, so every put
+;; completed immediately and one drain sufficed; on a slower runner some fibers
+;; parked and were left runnable-but-unrun. sa-fiber-run-all is a one-shot
+;; drain, NOT a scheduler — a real carrier loops (R5), and until then a test
+;; that mixes threads and fibers has to pump.
+(define (run-all-until-all fs secs what)
+  (let ((deadline (+ (now-secs) secs)))
+    (let loop ()
+      (cond ((all-done? fs) #t)
+            ((> (now-secs) deadline)
+             (set! fails (+ fails 1)) (printf "  FAIL: ~a (timed out)\n" what) #f)
+            (else (sa-fiber-run-all)
+                  (sleep (make-time 'time-duration 1000000 0))
+                  (loop))))))
+
 (printf "== R3: one waiter protocol for threads and fibers ==\n")
 
 ;; --- 1. fiber -> thread, unbuffered ------------------------------------------
@@ -194,7 +213,7 @@
                              (jolt-async-give ch6 (+ 100 i))
                              (vector-set! t6-done i #t)))))
 (wait-until (lambda () (all-vector? t6-done)) 5.0 "all thread puts delivered")
-(sa-fiber-run-all)
+(run-all-until-all fs6 5.0 "6a. fiber takers finished")
 (ok "6a. every value delivered exactly once"
     (equal? (sort (lambda (a b) (< a b)) log6) '(100 101 102 103 104 105)))
 (ok "6a. all fiber-takers done" (all-done? fs6))
@@ -214,7 +233,7 @@
                              (vector-set! t6b-done i #t)))))
 (define fs6b
   (spawn-n N6 (lambda (i) (sa-fiber-spawn (lambda () (jolt-fiber->! ch6b (+ 200 i)))))))
-(sa-fiber-run-all)
+(run-all-until-all fs6b 5.0 "6b. fiber putters finished")
 (wait-until (lambda () (all-vector? t6b-done)) 5.0 "all thread takes completed")
 (ok "6b. every value delivered exactly once"
     (equal? (sort (lambda (a b) (< a b)) log6b) '(200 201 202 203 204 205)))
