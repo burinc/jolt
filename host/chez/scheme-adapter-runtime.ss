@@ -422,3 +422,14 @@
 ;; externals through EXTS. Degradation: raise — same story as sa-fasl-write.
 (define (sa-fasl-read port . rest)
   (apply fasl-read port rest))
+
+;; ---- fibers R1: coroutines tier (capability: coroutines) --------------------
+;; The fiber primitive + single-carrier scheduler (fibers epic, R1 jolt-nvpr.2).
+;; The entry points are defined in fibers.ss, NOT here — this load is what makes
+;; them visible to the gate-time adaptercheck (which loads ONLY this file) and to
+;; every runtime loader. rt.ss loads fibers.ss again in the usual place; the
+;; duplicate define is the harmless re-define pattern this file already relies on
+;; (rt.ss:35 loads this file, and the flat build inlines both). fibers.ss is
+;; self-contained — it uses only Chez natives, so loading it here, before the
+;; value layer, is safe.
+(load "host/chez/fibers.ss")

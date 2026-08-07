@@ -247,3 +247,37 @@ vector-copy
 hashtable-values
 hashtable-cells
 scheme-version
+#
+# tier: coroutines
+# Stackful green threads sharing one OS thread (the carrier) — the fibers
+# primitive, R1 of epic jolt-nvpr.2. The surface a scheduler drives; per R0's
+# findings the Chez implementation keeps the per-fiber slice in ONE virtual
+# register holding the current fiber record (a thread-parameter write is 33ns
+# vs 2ns for a vreg — three writes per switch measured 8.6x and would drop the
+# 3.4M switches/sec design point to ~350k) and the run queue is INTRUSIVE (the
+# fiber record carries its next link — free by construction).
+# Shapes:
+#   (sa-fiber-spawn thunk) -> fiber: create a fiber running THUNK and make it
+#     runnable; returns the fiber record. Spawning inside a fiber is legal.
+#   (sa-fiber-yield) -> void: park the CURRENT fiber and move it to the back
+#     of the run queue (round-robin); returns when the scheduler resumes it.
+#     An error outside a fiber.
+#   (sa-fiber-resume fiber) -> void: make a PARKED fiber runnable again. A
+#     no-op when the fiber is already runnable — a double wakeup (the R4 alts!
+#     commit race) must not corrupt the queue.
+#   (sa-fiber-run-all) -> void: run the carrier's run queue until it drains —
+#     the scheduler shape the plan names ("run ready fibers until the queue
+#     drains, then block in the poller"; the poll step is R8). A fiber parked
+#     via the resume path stops the drain until resumed. Exceptions inside a
+#     fiber kill that fiber and never reach the sa-fiber-run-all caller —
+#     per-fiber isolation.
+# Permitted degradation: a target with NO usable continuations must still bind
+# every name — to a message-carrying raise (never leave a name unbound); the
+# plan's portability fallback is that `go` then runs on an OS thread, which is
+# today's behavior. Gambit (R0(e)): call/cc-based implementation — the switch
+# is ~10x the Chez cost interpreted and transparent IO parking does not port,
+# so the target keeps `go` on OS threads (the plan's documented degradation).
+sa-fiber-spawn
+sa-fiber-yield
+sa-fiber-resume
+sa-fiber-run-all

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fibers R1 (jolt-nvpr.2): the fiber primitive and a single-carrier
+  scheduler** behind the new `coroutines` CONTRACT.txt tier (`sa-fiber-spawn`,
+  `sa-fiber-yield`, `sa-fiber-resume`, `sa-fiber-run-all`), in
+  `host/chez/fibers.ss`. Per R0's measurements: the per-fiber slice rides in
+  one virtual register (2ns vs 33ns per thread-parameter write), the run queue
+  is intrusive (the next link lives in the fiber record), and exceptions are
+  isolated per fiber (a raise kills the fiber, never the scheduler loop).
+  The Chez gate (`make fibers`, in CI) asserts correctness (round trip,
+  completion, raise isolation, 8-fiber round-robin, yield from 40 frames deep)
+  and the pinned numbers: spawn 0.04us (< 5us), switch 50ns (< 100ns),
+  3.7KB live per parked fiber (< 8KB, by the R0-corrected absolute-live-bytes
+  measurement). Gambit satisfies the tier with a call/cc-based scheduler
+  (verified under native gsi in gambitcheck); `go` stays on OS threads there
+  per the plan's documented degradation. No jolt-level `go` or channel code
+  yet — those are later rounds.
+
 - **Gambit is a second Scheme backend** — the first target ported through the
   portable Scheme layer (#446). Jolt reads, compiles, and evaluates source on
   native Gambit, and the whole stack compiles to a single JavaScript file via
