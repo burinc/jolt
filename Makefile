@@ -585,6 +585,23 @@ gambitkernel:
 		echo "gambitkernel: gambit-scheme not installed (brew) — skipped"; \
 	fi
 
+# G3 compiler-on-gsi (jolt-mj95.4): cross-mint the Gambit seed from the Chez
+# seed ON CHEZ with the backend target at :gambit (R9), grep-verifying the
+# emission contains no chez-only spelling before writing host/gambit/seed/.
+# Runs on CHEZ (gambitseed), not gsi.
+gambitseed:
+	$(CHEZ) --script host/gambit/gen-seed.ss
+
+# G3 gate (jolt-mj95.4): 40+ jolt source rows through jolt-compile-eval on
+# native gsi via the gambit boot + seed. Detection-gated like gambitkernel;
+# NOT in the ci list. Run from the repo root.
+gambiteval:
+	@if [ -x "$(GAMBIT_GSI)" ]; then \
+		"$(GAMBIT_GSI)" host/gambit/eval-test.ss; \
+	else \
+		echo "gambiteval: gambit-scheme not installed (brew) — skipped"; \
+	fi
+
 # Re-mint the seed after changing a seed source (reader/analyzer/backend/core).
 remint:
 	@sh host/chez/remint.sh
