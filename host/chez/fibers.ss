@@ -85,7 +85,14 @@
 (define jolt-vreg-current-fiber 0)
 
 ;; The single carrier's intrusive run queue (head/tail; the `next` link lives
-;; in each fiber record). R5 makes this per-carrier; R1 has one carrier.
+;; in each fiber record). R3 makes it thread-safe: a channel delivery to a
+;; fiber-waiter (alt-deliver! in async.ss) resumes the fiber — enqueues it —
+;; and that can run on ANY thread (a putter delivering to a parked fiber-taker)
+;; while the carrier is mid-dequeue, so the head/tail pair is guarded by a leaf
+;; mutex. Lock order: ... → run-queue mu is ALWAYS the last lock acquired; the
+;; enqueue/dequeue below never acquire anything else, so the order never
+;; cycles. R5 (work stealing) may swap this for a lock-free queue.
+(define jolt-fiber-q-mu (make-mutex))
 (define jolt-fiber-q-head #f)
 (define jolt-fiber-q-tail #f)
 
@@ -154,19 +161,23 @@
     (if (eq? r 0) #f r)))
 
 (define (jolt-fiber-enqueue! f)
+  (mutex-acquire jolt-fiber-q-mu)
   (if jolt-fiber-q-tail
       (begin (jolt-fiber-next-set! jolt-fiber-q-tail f)
              (set! jolt-fiber-q-tail f))
       (begin (set! jolt-fiber-q-head f)
-             (set! jolt-fiber-q-tail f))))
+             (set! jolt-fiber-q-tail f)))
+  (mutex-release jolt-fiber-q-mu))
 
 (define (jolt-fiber-dequeue!)
+  (mutex-acquire jolt-fiber-q-mu)
   (let ((f jolt-fiber-q-head))
     (when f
       (set! jolt-fiber-q-head (jolt-fiber-next f))
       (unless jolt-fiber-q-head (set! jolt-fiber-q-tail #f))
       ;; clear the link so a completed fiber does not retain the queue
       (jolt-fiber-next-set! f #f))
+    (mutex-release jolt-fiber-q-mu)
     f))
 
 ;; --- the switch -------------------------------------------------------------

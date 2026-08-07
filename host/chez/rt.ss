@@ -1269,6 +1269,13 @@
 ;; itself needs nothing from the runtime.
 (load "host/chez/fibers.ss")
 
+;; Fiber-aware <! / >! (R3, jolt-nvpr.4): the one waiter protocol for threads
+;; and fibers. After BOTH async.ss (the channel + handler machinery) and
+;; fibers.ss (sa-fiber-resume) — it registers the fiber wakeup strategy and
+;; the jolt-fiber-<! / jolt-fiber->! primitives. Not loaded by the adapter
+;; runtime (it depends on async.ss).
+(load "host/chez/java/fibers-async.ss")
+
 ;; BigDecimal: the jbigdec value type + bigdec/decimal?/class/equality/
 ;; printing. Loads LAST so its set!-wraps of jolt-class/jolt=2/the printers sit
 ;; outermost over every earlier extension.

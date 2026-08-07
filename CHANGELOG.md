@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fibers R3 (jolt-nvpr.4): one waiter protocol for threads and fibers.** A
+  pending channel operation is a handler, never a fork. The alt-taker/alt-putter
+  records in `host/chez/java/async.ss` — the list machinery `ac-notify!` already
+  drains under the channel mutex — gain a `wake` field, and `alt-deliver!`
+  dispatches on it: a thread-waiter is woken by its condvar exactly as before, a
+  fiber-waiter by enqueuing the fiber on its carrier's run queue
+  (`sa-fiber-resume`, safe cross-thread now that the run queue in
+  `host/chez/fibers.ss` has a mutex). The channel core never learns what a fiber
+  is: a fiber's `< !` registers as an alt-taker, its `>!` as an alt-putter. The
+  new bridge `host/chez/java/fibers-async.ss` defines `jolt-fiber-<!` /
+  `jolt-fiber->!`, the Scheme-level primitives R4's `go` will drive: the
+  immediate-completion path takes a buffered value or drains a waiting putter
+  under the channel mutex with no continuation capture, and the park path
+  registers the handler, releases the channel mutex, then suspends — the commit
+  decision (park vs. already-delivered) happens inside the handler mutex, so a
+  delivery racing the release can never be lost. A parked fiber taker counts as
+  a waiting taker for the unbuffered readiness check in `ac-try-give!/locked`,
+  so `offer!`/`put!` complete against it instead of forking a thread. Lock order
+  stays channel mu → handler mu → run-queue mu; "never yield while holding the
+  channel mutex" is now stated in async.ss's lock-order comment. The new `make
+  fibers` gate (`fibers-chan-test.ss`, 47 checks) covers thread/fiber handoff in
+  both directions, buffered and unbuffered, a thread-put waking a parked fiber
+  and a fiber-put waking a parked thread, no-capture immediate completion (the
+  park counter stays at zero; 81ns vs 1775ns per take), N×M exactly-once
+  delivery, close! waking both waiter kinds, a fiber parking while a sibling on
+  the same carrier puts, and a pumping-thread stress drain. The `thread-sleep`
+  helpers in async.ss moved to Chez `sleep`.
+
 - **Fibers R2 (jolt-nvpr.3): per-fiber dynamic state.** A fiber's `binding`
   frames, current namespace, and STM `*txn*` now travel with the fiber instead
   of the carrier. R0 pinned the bug: dyn-binding.ss pushes a binding frame by

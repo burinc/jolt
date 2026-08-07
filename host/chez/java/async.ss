@@ -25,13 +25,24 @@
 (define (jolt-async-unblocking-buffer? b)
   (if (and (async-buffer? b) (memq (async-buffer-kind b) '(dropping sliding promise))) #t #f))
 
-;; --- alt-handler (one per alts! call, shared across ports) -------------------
+;; --- alt-handler: the ONE waiter notion (alts!, plus R3 fiber waiters) --------
+;; A pending channel operation is a handler with active?/claim/commit semantics
+;; and a wakeup strategy. The `wake` field is #f for a thread-waiter (the
+;; blocked <!!/>!! waiter: alt-deliver! signals wcv, exactly as before) or a
+;; fiber record for a fiber-waiter (alt-deliver! resumes it — enqueues it on
+;; its carrier's run queue). The channel core never inspects the wake: it
+;; commits via claim+mailbox and lets the handler decide how to wake. This is
+;; the R3 waiter protocol — one handler notion, two wakeup strategies, no fork
+;; of the channel code into fiber and thread paths. The name stays alt-handler
+;; because the alt-takers/alt-putters lists ARE the shared waiter lists: a
+;; fiber's <! registers as an alt-taker, exactly as alts! does.
 (define-record-type alt-handler
-  (fields fmu (mutable active?) wmu wcv mailbox)
-  (nongenerative alt-handler-v1))
-(define (alt-handler-alloc)
+  (fields fmu (mutable active?) wmu wcv mailbox (mutable wake))
+  (nongenerative alt-handler-v2))
+(define (alt-handler-alloc . wake)
   ((record-constructor (record-type-descriptor alt-handler))
-   (make-mutex) #t (make-mutex) (make-condition) (vector #f #f #f)))
+   (make-mutex) #t (make-mutex) (make-condition) (vector #f #f #f)
+   (if (pair? wake) (car wake) #f)))
 
 ;; --- channels ---------------------------------------------------------------
 ;; items: an amortized-O(1) FIFO held as a mutable #(out in len) — `out` is the
@@ -84,18 +95,36 @@
 
 ;; --- alt handler claim/deliver -----------------------------------------------
 ;; alt-claim! returns #t exactly once per handler (first claim wins).
-;; LOCK ORDER: channel mu → fmu → wmu. Never hold two channel mutexes at once.
+;; LOCK ORDER: channel mu → fmu → wmu → run-queue mu (a fiber wake's enqueue).
+;; Never hold two channel mutexes at once. Never YIELD while holding a channel
+;; mutex: a waiter registers under the channel mutex and releases it before it
+;; suspends — a fiber that parks holding the mutex deadlocks its carrier and
+;; every other fiber on it (the R3 invariant; the fiber-side registration in
+;; fibers-async.ss releases before parking).
 (define (alt-claim! h)
   (with-mutex (alt-handler-fmu h)
     (and (alt-handler-active? h)
          (begin (alt-handler-active?-set! h #f) #t))))
 
-;; alt-deliver! — call ONLY after alt-claim! returned #t.
+;; alt-deliver! — call ONLY after alt-claim! returned #t. The mailbox write and
+;; the wake decision happen under wmu so a fiber-waiter's park (which checks the
+;; mailbox and sets its state under the SAME wmu, see jolt-fiber-waiter-wait!)
+;; cannot race the delivery: a deliver that observes the fiber 'running means it
+;; has not finished parking and will see the mailbox before it decides to park;
+;; one that observes 'parked means the fiber is committed and must be enqueued.
+;; The resume runs under wmu and takes the run-queue mutex — a leaf lock never
+;; acquired by the fiber park path, so the order above has no cycle.
+(define jolt-fiber-wake-fn #f)  ; set by fibers-async.ss (loads after this file)
 (define (alt-deliver! h val port)
   (with-mutex (alt-handler-wmu h)
     (let ((mb (alt-handler-mailbox h)))
       (vector-set! mb 1 val) (vector-set! mb 2 port) (vector-set! mb 0 #t))
-    (condition-signal (alt-handler-wcv h))))
+    (let ((w (alt-handler-wake h)))
+      (if w
+          (if jolt-fiber-wake-fn
+              (jolt-fiber-wake-fn w)
+              (condition-signal (alt-handler-wcv h)))
+          (condition-signal (alt-handler-wcv h))))))
 
 ;; ac-notify! — drain pending alt registrations after any channel state mutation.
 ;; Called with the channel mutex held. Loops steps 1→2→3 until a full pass makes
@@ -383,7 +412,15 @@
            (if (< (ac-qlen ch) (async-chan-cap ch))
                (begin (ac-qpush! ch (cons v #f)) (ac-notify! ch) 'ok)
                'full))
-          ((> (async-chan-takew ch) 0)
+          ;; a waiting taker makes the rendezvous possible: a thread parked in a
+          ;; blocking take (takew), or a fiber parked as an alt-taker (R3 — the
+          ;; fiber's <! registers an alt-handler, invisible to takew). Without
+          ;; the alt-taker clause, offer!/put! to an unbuffered channel would
+          ;; report 'full while a fiber waited, and put! would fork a thread
+          ;; instead of completing on the caller.
+          ((or (> (async-chan-takew ch) 0)
+               (ormap (lambda (h) (alt-handler-active? h))
+                      (async-chan-alt-takers ch)))
            (let ((box (vector #f)))
              (ac-qpush! ch (cons v box))
              (ac-notify! ch)
