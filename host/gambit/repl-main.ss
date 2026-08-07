@@ -13,7 +13,9 @@
 ;;   globalThis.joltQueue = []            // page pushes source strings
 ;;   globalThis.joltOut(kind, text)       // "ready" | "result" | "error"
 
-(##include "boot.ss")
+;; the profile chosen at generation time (make gambitweb PROFILE=...); regenerate
+;; with gen-boot.ss to change what the bundle carries
+(##include "boot-active.ss")
 
 (define (js-ready!)
   (##inline-host-statement

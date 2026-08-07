@@ -391,18 +391,64 @@ make gambitkernel             # the booted kernel and natives (113 checks)
 make gambiteval               # jolt source through the compiler, renders pinned to Chez
 make gambitseed               # re-mint host/gambit/seed/ (runs on Chez, after a seed change)
 make gambitweb                # => target/gambit/jolt-web.js, the browser bundle
+make gambitweb PROFILE=repl   # a smaller bundle (see Build profiles below)
+make gambitprofile            # gate: reduced profile runs, excluded features report
 ```
 
 `make gambitweb` compiles the whole stack — kernel, seed, compiler, and a
 queue-polling REPL loop (`host/gambit/repl-main.ss`) — into one self-contained
-JavaScript file in about 30 seconds. The output is roughly 32 MB raw and 4 MB
-gzipped, which is what a web server actually ships. The build is reproducible:
-the same sources produce a byte-identical bundle. Point it at a site checkout to
-refresh the live demo:
+JavaScript file in about 30 seconds. The build is reproducible: the same sources
+produce a byte-identical bundle. Point it at a site checkout to refresh the live
+demo:
 
 ```bash
 make gambitweb GAMBIT_WEB_OUT=../jolt-lang.github.io/resources/static/js/jolt-web.js
 ```
+
+### Build profiles
+
+`PROFILE` selects how much of the language a build carries.
+`host/gambit/profiles.ss` lists the profiles and the optional feature groups
+they are built from; `boot.ss` remains the source of load order, and a group only
+names which of its files are optional.
+
+```bash
+make gambitweb PROFILE=repl    # clojure.core + compiler, no regex
+make gambitweb PROFILE=full    # everything (the default)
+```
+
+Excluding a group does two things. Its files are left out, and **every name it
+owned is bound to a raise that names the group** — derived by scanning the
+excluded files for their definitions, so the error surface tracks the code
+instead of a hand-kept list. A dropped feature reports itself:
+
+```
+user=> (re-seq #"[a-z]+" "ab cd")
+java.lang.UnsupportedOperationException: jolt-re-pattern is not in this build:
+the regex feature group was excluded
+```
+
+A predicate over a type the build cannot hold answers `false` rather than
+raising — a value simply is not a regex — while anything that would produce or
+consume that type raises. `make gambitprofile` gates both halves: the reduced
+profile still runs the language, and an excluded feature names its group,
+including through indirection like `clojure.string/split`.
+
+Measured cost of each group in the bundle (raw / gzipped, and gzipped is what a
+web server ships):
+
+| group | cost | without it |
+|---|---|---|
+| regex | 2.4 MB / 0.4 MB | no `re-*`, no `#"..."` |
+| compiler | 2.9 MB / 0.5 MB | no `eval`, no REPL, no runtime macros |
+| clojure.core | 8.7 MB / 0.7 MB | the kernel alone — an embedding, not a Clojure |
+| **kernel (floor)** | **19.4 MB / 2.1 MB** | the Gambit runtime plus jolt's kernel |
+| full | 31.0 MB / 3.3 MB | |
+
+The floor dominates, so a profile trades features for the last third of the
+bundle: `repl` ships 27.7 MB / 3.1 MB against `full`'s 32.6 MB / 3.5 MB. Adding
+a group is worth it when it is separable *and* measurable — a group worth
+kilobytes is churn.
 
 The page defines `joltQueue` and `joltOut` before loading the bundle; a Scheme
 thread inside it polls the queue and hands results back, so page JavaScript never
