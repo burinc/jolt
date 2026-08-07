@@ -287,22 +287,35 @@
 ;; subset — not aliased.
 ;; ============================================================================
 
+;; JS-TARGET CONSTRAINT: Gambit-js fixnums are ~30-bit (tagged), so 32-bit
+;; hash values overflow Gambit's NATIVE fx ops there ((fxarithmetic-shift-right
+;; 704819571 0) is a FIXNUM-expected error under node while fine on gsi). The
+;; aliases therefore map to GENERIC arithmetic — correct on both targets;
+;; performance is not a goal on this target.
+;; The NATIVE fx ops carry the same ~30-bit ceiling — host code runs 32-bit
+;; hash intermediates through fx+/fx*/fxand (146/10/26 sites), so those shadow
+;; to generic arithmetic too. Same correctness-over-speed call as the aliases.
+(define (fx+ . xs) (apply + xs))
+(define (fx- . xs) (apply - xs))
+(define (fx* . xs) (apply * xs))
+(define (fxand . xs) (apply bitwise-and xs))
+(define (fxior . xs) (apply bitwise-ior xs))
+(define (fxnot x) (bitwise-not x))
+(define (fxmax . xs) (apply max xs))
+(define (fxmin . xs) (apply min xs))
+(define (fxquotient a b) (quotient a b))
+(define (fxremainder a b) (remainder a b))
+
 (define-syntax fx=?
-  (syntax-rules () ((_ a ...) (fx= a ...))))
+  (syntax-rules () ((_ a ...) (= a ...))))
 (define-syntax fx<?
-  (syntax-rules () ((_ a ...) (fx< a ...))))
+  (syntax-rules () ((_ a ...) (< a ...))))
 (define-syntax fx>?
-  (syntax-rules () ((_ a ...) (fx> a ...))))
-(define-syntax fx<=?
-  (syntax-rules () ((_ a ...) (fx<= a ...))))
-(define-syntax fx>=?
-  (syntax-rules () ((_ a ...) (fx>= a ...))))
-(define-syntax fl=?
-  (syntax-rules () ((_ a ...) (fl= a ...))))
+  (syntax-rules () ((_ a ...) (> a ...))))
 (define-syntax fxsll
-  (syntax-rules () ((_ a b) (fxarithmetic-shift-left a b))))
+  (syntax-rules () ((_ a b) (arithmetic-shift a b))))
 (define-syntax fxsra
-  (syntax-rules () ((_ a b) (fxarithmetic-shift-right a b))))
+  (syntax-rules () ((_ a b) (arithmetic-shift a (- b)))))
 
 ;; Chez fxlogbit? (i fx): #t when bit i of fixnum fx is set. Gambit 4.9.7 has
 ;; no bit-test primitive (no bitwise-bit-set? / fixnum bit-test in any module);
@@ -628,3 +641,14 @@
   (if (and (pair? p) (string? (car p)))
       (%gambit-gensym (string->symbol (car p)))
       (apply %gambit-gensym p)))
+
+(define-syntax fl=?
+  (syntax-rules () ((_ a ...) (fl= a ...))))
+(define-syntax fx<=?
+  (syntax-rules () ((_ a ...) (<= a ...))))
+(define-syntax fx>=?
+  (syntax-rules () ((_ a ...) (>= a ...))))
+(define-syntax fx1+
+  (syntax-rules () ((_ a) (+ a 1))))
+(define-syntax fx1-
+  (syntax-rules () ((_ a) (- a 1))))

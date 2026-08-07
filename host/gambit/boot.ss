@@ -14,7 +14,11 @@
 ;; java interop. vendor/irregex is NOT under host/chez and loads normally.
 (define %gambit-load load)
 (define (load path . rest)
-  (if (and (string? path) (string-prefix? "host/chez/" path))
+  (if (and (string? path)
+           (or (string-prefix? "host/chez/" path)
+               ;; irregex is ##include'd below (the js target has no
+               ;; filesystem — a runtime load cannot work there)
+               (string-prefix? "vendor/irregex/" path)))
       #f
       (apply %gambit-load path rest)))
 
@@ -43,6 +47,7 @@
 (##include "rt-core.ss")
 
 ;; regex needs regex-translate.ss (pure; rt.ss used to preload it from java/).
+(##include "../../vendor/irregex/irregex.scm")
 (##include "../chez/java/regex-translate.ss")
 (##include "../chez/regex.ss")
 (##include "../chez/atoms.ss")
