@@ -79,5 +79,43 @@
 (ok "free-callable releases the callback"
     (jolt-nil? (ev "(jolt.ffi/free-callable cmp)")))
 
+;; variadic libc: fcntl is (int fd, int cmd, ...) — two fixed args, the flags
+;; argument variadic. Apple arm64 passes variadic args on the stack, so only
+;; the (__varargs_after 2) calling convention lands it — a fixed-arity binding
+;; silently corrupts it (this test FAILED against the marker-last encoding
+;; that emitted __varargs_after 3 = nothing variadic). :varargs marks the
+;; fixed/variadic boundary. F_SETFL O_NONBLOCK on a real socket, read back
+;; with F_GETFL.
+(ev "(def c-socket (jolt.ffi/__cfn \"socket\" [:int :int :int] :int))")
+(ev "(def c-close  (jolt.ffi/__cfn \"close\" [:int] :int))")
+(ev "(def c-fcntl  (jolt.ffi/__cfn \"fcntl\" [:int :int :varargs :int] :int))")
+(ev "(def f-getfl 3)")
+(ev "(def f-setfl 4)")
+;; O_NONBLOCK is 0x0004 on Darwin, 0x800 on Linux — gate on the os family so
+;; this passes on both macOS dev machines and Linux CI.
+(ev (string-append "(def o-nonblock "
+                   (if (eq? (sa-os-family) 'linux) "2048" "4")
+                   ")"))
+(ok "variadic fcntl F_SETFL sets O_NONBLOCK"
+    (jolt-truthy?
+      (ev "(let [fd (c-socket 2 1 0)] (c-fcntl fd f-setfl o-nonblock) (let [after (c-fcntl fd f-getfl 0)] (c-close fd) (pos? (bit-and after o-nonblock))))")))
+(ok "variadic fcntl F_SETFL can clear O_NONBLOCK again"
+    (jolt-truthy?
+      (ev "(let [fd (c-socket 2 1 0)] (c-fcntl fd f-setfl o-nonblock) (c-fcntl fd f-setfl 0) (let [after (c-fcntl fd f-getfl 0)] (c-close fd) (zero? (bit-and after o-nonblock))))")))
+
+;; malformed :varargs shapes reject at compile with a message that names the
+;; rule — a marker first (C needs a named parameter), a trailing marker
+;; (nothing variadic), and :blocking (no convention combining)
+(define (rejects? s)
+  (call/cc (lambda (k)
+    (with-exception-handler (lambda (e) (k #t))
+      (lambda () (ev s) #f)))))
+(ok ":varargs first rejects"
+    (rejects? "(jolt.ffi/__cfn \"fcntl\" [:varargs :int] :int)"))
+(ok ":varargs last rejects"
+    (rejects? "(jolt.ffi/__cfn \"fcntl\" [:int :int :varargs] :int)"))
+(ok ":varargs with :blocking rejects"
+    (rejects? "(jolt.ffi/__cfn \"recv\" [:int :varargs :int] :int :blocking)"))
+
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))

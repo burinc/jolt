@@ -25,6 +25,14 @@
 ;; the analyzer/back end turn it into a Chez foreign-procedure.
 ;; An optional trailing :blocking marks a call that may block (accept/recv/...),
 ;; so it's emitted collect-safe and won't pin the garbage collector.
+;; A :varargs marker inside the argtype vector declares a VARIADIC libc
+;; function and marks the boundary: the types before :varargs are the fixed
+;; (named) parameters, the types after it are the concrete variadic arguments
+;; the binding always passes. The call is emitted with the variadic calling
+;; convention (__varargs_after n, n = fixed-arg count) — required on Apple
+;; arm64, which passes variadic arguments on the stack; a fixed-arity binding
+;; silently corrupts them. fcntl is (int fd, int cmd, ...), so:
+;;   (ffi/defcfn c-fcntl "fcntl" [:int :int :varargs :int] :int)
 (defmacro foreign-fn [csym argtypes rettype & [opt]]
   (if (= opt :blocking)
     (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)

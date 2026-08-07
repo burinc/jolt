@@ -727,20 +727,44 @@
 (defn- ffi-type->chez [t]
   (or (ffi-types t) (throw (ex-info (str "jolt.ffi: unknown foreign type :" t) {}))))
 (defn- emit-ffi-fn [node]
-  (let [n (count (:argtypes node))
-        params (mapv (fn [i] (str "a" i)) (range n))
-        fp (str "(" (if (:blocking node) "sa-foreign-procedure-blocking " "sa-foreign-procedure ")
-                (chez-str-lit (:csym node))
-                " (" (str/join " " (map ffi-type->chez (:argtypes node))) ") "
-                (ffi-type->chez (:rettype node)) ")")]
-    ;; Lazy resolution: the foreign-procedure form is deferred inside a closure.
-    ;; On first call, the cell `p` is set to the FP and then invoked; subsequent
-    ;; calls skip the set!. This lets a defcfn's defining form (top-level def)
-    ;; evaluate to a callable closure before the shared library is loaded —
-    ;; critical for :optional :jolt/native libs whose load-object runs in the
-    ;; scheme-start launcher, after the heap is already built.
-    (str "(let ((p #f)) (lambda (" (str/join " " params) ") "
-         "((or p (begin (set! p " fp ") p)) " (str/join " " params) ")))")))
+  ;; A "varargs" marker in the argtype vector declares the binding variadic and
+  ;; marks the FIXED/VARIADIC boundary: types before it are the named
+  ;; parameters, types after it are the concrete variadic arguments this
+  ;; binding always passes. The call is emitted with Chez's (__varargs_after n)
+  ;; convention (n = the fixed-arg count = the marker's index), so the variadic
+  ;; arguments travel where the callee's va_list reads them — Apple arm64
+  ;; passes variadic args on the stack, and a fixed-arity binding silently
+  ;; corrupts them (fcntl, ioctl, open). C requires a named parameter before
+  ;; the ellipsis, and a trailing marker would declare nothing variadic, so
+  ;; both malformed shapes are rejected. Only supported on the non-blocking
+  ;; path: __collect_safe cannot combine with a varargs convention.
+  (let [at (:argtypes node)
+        vi (first (keep-indexed (fn [i t] (when (= t "varargs") i)) at))]
+    (when (and vi (zero? vi))
+      (throw (ex-info "jolt.ffi: :varargs needs at least one fixed argtype before it"
+                      {:argtypes at})))
+    (when (and vi (= vi (dec (count at))))
+      (throw (ex-info "jolt.ffi: :varargs marks the boundary — the variadic argtypes follow it"
+                      {:argtypes at})))
+    (when (and vi (:blocking node))
+      (throw (ex-info "jolt.ffi: :varargs cannot combine with :blocking" {:argtypes at})))
+    (let [types (if vi (vec (concat (subvec at 0 vi) (subvec at (inc vi)))) at)
+          n (count types)
+          params (mapv (fn [i] (str "a" i)) (range n))
+          conv (if vi (str " (__varargs_after " vi ")") "")
+          fp (str "(" (if (:blocking node) "sa-foreign-procedure-blocking " "sa-foreign-procedure ")
+                  conv " "
+                  (chez-str-lit (:csym node))
+                  " (" (str/join " " (map ffi-type->chez types)) ") "
+                  (ffi-type->chez (:rettype node)) ")")]
+      ;; Lazy resolution: the foreign-procedure form is deferred inside a closure.
+      ;; On first call, the cell `p` is set to the FP and then invoked; subsequent
+      ;; calls skip the set!. This lets a defcfn's defining form (top-level def)
+      ;; evaluate to a callable closure before the shared library is loaded —
+      ;; critical for :optional :jolt/native libs whose load-object runs in the
+      ;; scheme-start launcher, after the heap is already built.
+      (str "(let ((p #f)) (lambda (" (str/join " " params) ") "
+           "((or p (begin (set! p " fp ") p)) " (str/join " " params) ")))"))))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the
