@@ -477,8 +477,7 @@
 (define (aot-runtime-fingerprint)
   (when (eq? aot-fingerprint-memo 'unset)
     (set! aot-fingerprint-memo
-      (or (and (top-level-bound? 'jolt-baked-runtime-fingerprint)
-               (top-level-value 'jolt-baked-runtime-fingerprint))
+      (or (sa-baked-global 'jolt-baked-runtime-fingerprint)
           (aot-source-fingerprint))))
   aot-fingerprint-memo)
 ;; …-tr when the tail-frame history is on. Whether tracing is enabled changes the
@@ -754,7 +753,7 @@
             ;; current-output-port by default — swallow it so a cache miss can't
             ;; corrupt the running program's stdout.
             (parameterize ((current-output-port (open-output-string)))
-              (compile-file scm tmp-so))
+              (sa-compile-file scm tmp-so #f))
             (rename-file tmp-so so))
           (unless (file-exists? so)
             (aot-info (string-append "no .so produced for " name))))))))
@@ -983,7 +982,7 @@
       ;; compile-file narrates to current-output-port by default — swallow it so a
       ;; compile can't corrupt the running program's stdout.
       (parameterize ((current-output-port (open-output-string)))
-        (compile-file (cpath-scm-file base) tmp-so))
+        (sa-compile-file (cpath-scm-file base) tmp-so #f))
       (delete-file (cpath-so-file base) #f)
       (cpath-write-meta! (cpath-meta-file base) (cpath-meta-lines name deps))
       (rename-file tmp-so (cpath-so-file base)))
