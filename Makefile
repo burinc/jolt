@@ -66,7 +66,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
 
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status \
-        gambitcheck gambitkernel gambiteval gambitseed gambitweb
+        gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile
 
 default:: build
 
@@ -598,15 +598,33 @@ gambiteval:
 		echo "gambiteval: gambit-scheme not installed (brew) — skipped"; \
 	fi
 
+# Build profiles: generate the reduced repl profile and check that the language
+# still works while an excluded feature reports itself instead of failing as an
+# unbound name. Cheap (a gsi load, no js compile), so it can gate the mechanism.
+gambitprofile:
+	@if [ -x "$(GAMBIT_GSI)" ]; then \
+		$(CHEZ) --script host/gambit/gen-boot.ss repl; \
+		"$(GAMBIT_GSI)" host/gambit/profile-test.ss; \
+	else \
+		echo "gambitprofile: gambit-scheme not installed (brew) — skipped"; \
+	fi
+
 # The browser bundle: the whole stack (kernel + seed + compiler + a queue-polling
 # REPL loop) compiled to one JavaScript file by the Gambit backend. ~30s, ~32MB
 # raw / ~4MB gzipped, which is what a web server ships. Point GAMBIT_WEB_OUT at
 # a site checkout to refresh the live demo:
 #   make gambitweb GAMBIT_WEB_OUT=../jolt-lang.github.io/resources/static/js/jolt-web.js
 # NEVER bare gsc — that is Ghostscript on a brew machine.
+# PROFILE selects how much of the language the bundle carries (host/gambit/
+# profiles.ss lists them: full, repl, kernel). gen-boot.ss writes the boot for it
+# on Chez — Gambit resolves ##include at expansion time, so this cannot be a
+# runtime switch — and binds every name an excluded group owned to a raise that
+# names the group.
+PROFILE ?= full
 GAMBIT_WEB_OUT ?= target/gambit/jolt-web.js
 gambitweb:
 	@if [ -x "$(GAMBIT_GSC)" ]; then \
+		$(CHEZ) --script host/gambit/gen-boot.ss $(PROFILE); \
 		mkdir -p "$$(dirname "$(GAMBIT_WEB_OUT)")"; \
 		out="$$(cd "$$(dirname "$(GAMBIT_WEB_OUT)")" && pwd)/$$(basename "$(GAMBIT_WEB_OUT)")"; \
 		(cd host/gambit && "$(GAMBIT_GSC)" -target js -exe -o "$$out" repl-main.ss); \

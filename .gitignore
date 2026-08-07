@@ -19,3 +19,6 @@ test/_*.janet
 
 # Beads issue tracker (local dev tooling)
 .beads/
+
+# generated gambit profile boots (host/gambit/boot.ss is the source of order)
+host/gambit/boot-*.ss
