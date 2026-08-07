@@ -9,10 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Gambit target groundwork** (second Scheme target, toward a browser
-  REPL): the adapter/shim layer and the full jolt kernel manifest boot on
-  native Gambit with reader/printer at parity, gated by `make gambitcheck`
-  and `make gambitkernel`.
+- **Gambit is a second Scheme backend** — the first target ported through the
+  portable Scheme layer (#446). Jolt reads, compiles, and evaluates source on
+  native Gambit, and the whole stack compiles to a single JavaScript file via
+  `gsc -target js` that boots in about a second in a browser (the live REPL on
+  jolt-lang.github.io). `host/gambit/` holds the adapter, prelude shims, hash
+  kernel, and a target-owned runtime kernel; the seed and the expansion-hostile
+  macros are generated on Chez (`make gambitseed`) rather than hand-written.
+  Three detection-gated targets hold the boundary: `make gambitcheck` (adapter
+  and shims), `make gambitkernel` (the booted kernel, 113 checks), and
+  `make gambiteval` (jolt source through the compiler, renders pinned to Chez
+  captures). Nothing on the Chez path changed.
+
+  The backend is demo-grade: FFI, AOT compilation, and program images raise,
+  the concurrency tier is stubbed, and only checked primitives are emitted.
+  `jolt build` binaries remain Chez-only. See "Scheme Backends" in the docs for
+  the contract a new target must satisfy.
 
 ## [0.6.8] - 2026-08-07
 
