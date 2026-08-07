@@ -177,7 +177,7 @@
 ;; the spawned-but-never-run fibers complete immediately; drain the queue
 (sa-fiber-run-all)
 
-;; --- switch: per switch < 100ns (measured 12.5ns bare) ------------------------
+;; --- switch: depth-independence (the property, not the speed) -----------------
 ;; N fibers round-robin, each yielding M times: every park costs one switch out
 ;; and one switch in, so switches = 2*N*M. The trip threshold is raised for the
 ;; timed region so the ~3.5KB per captured segment does not trigger GC mid-run.
