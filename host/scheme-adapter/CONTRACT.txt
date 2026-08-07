@@ -182,6 +182,41 @@ sa-foreign-procedure-runtime
 sa-foreign-procedure
 sa-foreign-procedure-blocking
 #
+# tier: eval
+# interaction-environment: R7RS (scheme repl), not Chez-only. The ONLY host
+# call shape is the standard (eval expr (interaction-environment)) — jolt's
+# compile spine evals emitted Scheme in the top-level environment (rt.ss's
+# runtime procedures live there), so jolt's top level IS the interaction
+# environment (def-var! targets it). A target adapter must provide an
+# interaction environment whose eval sees the target's top level.
+interaction-environment
+#
+# tier: capability-native-compile
+# OUR OWN definitions in host/chez/scheme-adapter-runtime.ss — the eval/compile
+# tier's compile-file / make-boot-file / compile parameters behind one entry
+# surface. sa-compile-file compiles a Scheme source file to a native object
+# under a TARGET-NEUTRAL profile alist: ((optimize . 0..3) (inspector-info .
+# bool) (source-info . bool) (compressed . bool)); #f means target defaults. A
+# target maps the keys it has and ignores the rest. Permitted degradation:
+# sa-compile-file and sa-make-boot-file must RAISE on targets that cannot
+# compile to native code — the AOT cache (loader.ss) treats the raise as a
+# cache disable and loads from source, and `jolt build` must surface it as a
+# clean jolt-level error, not a Scheme backtrace.
+sa-baked-global
+sa-compile-file
+sa-make-boot-file
+#
+# tier: capability-image
+# OUR OWN definitions in host/chez/scheme-adapter-runtime.ss — the fasl/image
+# tier's fasl-write/fasl-read behind one entry surface. Shapes mirror the real
+# call sites in state-image.ss exactly: (sa-fasl-write obj port [externals-pred])
+# and (sa-fasl-read port [who exts]). Permitted degradation: must RAISE on
+# targets without fasl serialization — jolt.image's dump/restore entry points
+# surface a clean unsupported jolt-level error (verified: they already guard
+# the write/read and convert a raise into a jolt-level message).
+sa-fasl-write
+sa-fasl-read
+#
 # tier: misc
 # format is the Chez/Guile ~a ~s ~d subset (SRFI-28); printf/fprintf are
 # format to the current/given output port. pretty-print is the standard

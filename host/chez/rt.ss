@@ -144,8 +144,7 @@
 ;; has no baked define and falls back to $JOLT_VERSION (bin/jolt sets it from
 ;; `git describe`), then "dev".
 (define (jolt-version-string)
-  (or (and (top-level-bound? 'jolt-baked-version-early)
-           (top-level-value 'jolt-baked-version-early))
+  (or (sa-baked-global 'jolt-baked-version-early)
       (let ((v (getenv "JOLT_VERSION"))) (and v (> (string-length v) 0) v))
       "dev"))
 

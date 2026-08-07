@@ -460,7 +460,7 @@
 ;; dropped the compiler has no binding at all: refuse by name instead of
 ;; surfacing an unbound-variable error mid-restore.
 (define (image-compile-eval-seam)
-  (let ((ce (guard (e (#t #f)) (top-level-value 'jolt-compile-eval-form))))
+  (let ((ce (sa-baked-global 'jolt-compile-eval-form)))
     (and (procedure? ce) ce)))
 
 ;; Rebuild one fn source record into a live closure: compile
@@ -1126,7 +1126,7 @@
     ;; cannot be written ahead of the body.
     (let ((body (call-with-bytevector-output-port
                   (lambda (p)
-                    (fasl-write (vector v* (image-collect-meta v*)) p
+                    (sa-fasl-write (vector v* (image-collect-meta v*)) p
                       (lambda (x)
                         (and (image-external? x)
                              (begin
@@ -1162,9 +1162,9 @@
                                        "image: a resource handler returned a value that is not plain data"
                                        jolt-nil))))
                     (lambda () (call-with-bytevector-output-port
-                                 (lambda (p) (fasl-write descs p)))))))))
+                                 (lambda (p) (sa-fasl-write descs p)))))))))
           (let ((port (open-file-output-port path (file-options no-fail))))
-            (fasl-write (image-header) port)
+            (sa-fasl-write (image-header) port)
             (put-bytevector port desc-bytes)
             (put-bytevector port body)
             (close-port port)))))
@@ -1177,11 +1177,11 @@
   (unless (file-exists? path)
     (jolt-throw (jolt-ex-info (string-append "image: no such file: " path) jolt-nil)))
   (let ((port (open-file-input-port path)))
-    (let* ((h (fasl-read port))
+    (let* ((h (sa-fasl-read port))
            (_ (image-check-header! h path))
-           (descs (fasl-read port))
+           (descs (sa-fasl-read port))
            (exts (list->vector (map image-decode-external descs)))
-           (b (fasl-read port 'load exts)))
+           (b (sa-fasl-read port 'load exts)))
       (close-port port)
       (unless (and (vector? b) (fx=? (vector-length b) 2))
         (jolt-throw (jolt-ex-info (string-append "image: malformed body in " path) jolt-nil)))

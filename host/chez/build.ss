@@ -1235,7 +1235,7 @@
 ;; raising ((take nil coll) must throw, not walk off a nil count). Level 2
 ;; keeps every check with nearly all of the optimization.
 (define bld-chez-params
-  `(("optimized" (optimize-level 2)
+  '(("optimized" (optimize-level 2)
                  (generate-inspector-information #f)
                  (generate-procedure-source-information #f)
                  (fasl-compressed #t))
@@ -1257,17 +1257,19 @@
           "" (cdr params))
         "")))
 
-;; Compile one flat source file under the mode's Chez parameters.
+;; Compile one flat source file under the mode's Chez parameters. The mode->params
+;; table stays as jolt build policy; this is a thin translation of those params
+;; into the target-neutral profile sa-compile-file consumes.
 (define (bld-chez-compile-file mode src so)
   (let ((params (assoc mode bld-chez-params)))
     (if params
         (let ((pv (lambda (k) (cadr (assq k (cdr params))))))
-          (parameterize ((optimize-level (pv 'optimize-level))
-                         (generate-inspector-information (pv 'generate-inspector-information))
-                         (generate-procedure-source-information (pv 'generate-procedure-source-information))
-                         (fasl-compressed (pv 'fasl-compressed)))
-            (compile-file src so)))
-        (compile-file src so))))
+          (sa-compile-file src so
+            `((optimize . ,(pv 'optimize-level))
+              (inspector-info . ,(pv 'generate-inspector-information))
+              (source-info . ,(pv 'generate-procedure-source-information))
+              (compressed . ,(pv 'fasl-compressed)))))
+        (sa-compile-file src so #f))))
 
 ;; --- runtime-half fasl cache -------------------------------------------------
 ;; The runtime half of the flat source (rt.ss + the clojure.core prelude +
@@ -1385,10 +1387,10 @@
     ;; foreign-procedure at runtime, but every defcfn in the image was
     ;; AOT-compiled, so the FFI is unaffected.
     ;; The unit fasls go in after the Chez boots, in the order they were compiled.
-    (apply make-boot-file boot '()
-           (append (list petite)
-                   (if petite-only? '() (list scheme))
-                   (map cadr units)))
+    (sa-make-boot-file boot
+      (append (list petite)
+              (if petite-only? '() (list scheme))
+              (map cadr units)))
     (ei-mark! "make-boot-file")
     ;; The stub is the native launcher the boot is appended to. With no :static
     ;; natives it's the prebuilt one bundled in jolt (no cc needed); with :static

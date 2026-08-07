@@ -331,3 +331,69 @@
 ;; callable registry hands to C. Contract: the entry address of a callable.
 ;; Degradation: none.
 (define (sa-foreign-callable-entry-point co) (foreign-callable-entry-point co))
+
+;; ---- R8: eval/compile/AOT (capabilities: native-compile, image) --------------
+
+;; (sa-baked-global sym) -> value | #f
+;; The top-level value of SYM, or #f when unbound. Callers probe optionally-
+;; baked globals (jolt-baked-runtime-fingerprint, jolt-baked-version-early,
+;; jolt-compile-eval-form) whose values are never #f, so #f is a safe absent
+;; sentinel. Contract: reflect on the running top level by symbol. Degradation:
+;; none — every target has SOME notion of its global environment; a target that
+;; truly cannot reflect returns #f always (all three callers tolerate absent).
+(define (sa-baked-global sym)
+  (guard (e (#t #f))
+    (and (top-level-bound? sym) (top-level-value sym))))
+
+;; (sa-compile-file src so profile) -> void
+;; Compile the Scheme source file SRC to the native object SO under PROFILE:
+;; #f = target defaults, or an alist with TARGET-NEUTRAL keys
+;; (optimize . 0..3), (inspector-info . bool), (source-info . bool),
+;; (compressed . bool). The Chez impl parameterizes optimize-level /
+;; generate-inspector-information / generate-procedure-source-information /
+;; fasl-compressed and calls compile-file; a target maps the keys it has and
+;; ignores the rest. Contract: native compilation of SRC to SO. Degradation:
+;; raise a message-carrying condition ((error 'sa-compile-file "...")), never a
+;; bare raise — the AOT cache (loader.ss) treats the raise as a cache disable
+;; and falls back to loading from source (verified with the entry point forced
+;; to raise: programs run correctly from source); `jolt build` surfaces it as a
+;; jolt-level error whose message is the condition's.
+(define (sa-compile-file src so profile)
+  (if profile
+      (let ((pv (lambda (k) (cdr (assq k profile)))))
+        (parameterize ((optimize-level (pv 'optimize))
+                       (generate-inspector-information (pv 'inspector-info))
+                       (generate-procedure-source-information (pv 'source-info))
+                       (fasl-compressed (pv 'compressed)))
+          (compile-file src so)))
+      (compile-file src so)))
+
+;; (sa-make-boot-file out base-boots) -> void
+;; Assemble the boot file OUT from the base boot files BASE-BOOTS — exactly the
+;; shape build.ss:1388 uses, (apply make-boot-file out '() base-boots), with the
+;; boot program '() (the running executable loads the boots directly). Contract:
+;; write a boot file the target's runtime can boot from. Degradation: raise —
+;; same story as sa-compile-file.
+(define (sa-make-boot-file out base-boots)
+  (apply make-boot-file out '() base-boots))
+
+;; (sa-fasl-write obj port [externals-pred]) -> void
+;; fasl-serialize OBJ to PORT, optionally under the externals predicate
+;; state-image.ss passes so refused objects are COLLECTED as externals instead
+;; of failing the write (jolt.image's dump path). Contract: serialize a value
+;; graph to a byte image, honoring the externals hook. Degradation: raise — a
+;; target without fasl serialization surfaces jolt.image's dump as a clean
+;; jolt-level unsupported error carrying the condition's message — so the raise
+;; must be a message-carrying condition ((error 'sa-fasl-write "...")), never a
+;; bare raise, whose ex-message is nil (verified both ways with the entry point
+;; forced to raise).
+(define (sa-fasl-write obj port . rest)
+  (apply fasl-write obj port rest))
+
+;; (sa-fasl-read port [who exts]) -> value
+;; Deserialize the next object from PORT; the (sa-fasl-read port 'load exts)
+;; shape restores a body whose externals were resolved by the caller (jolt.image's
+;; restore path). Contract: read back what sa-fasl-write wrote, resolving
+;; externals through EXTS. Degradation: raise — same story as sa-fasl-write.
+(define (sa-fasl-read port . rest)
+  (apply fasl-read port rest))

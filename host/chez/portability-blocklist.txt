@@ -49,7 +49,10 @@ compile-to-file
 compile-file
 compile-whole-program
 make-boot-file
-interaction-environment
+optimize-level
+generate-inspector-information
+generate-procedure-source-information
+fasl-compressed
 top-level-value
 set-top-level-value!
 top-level-bound?
