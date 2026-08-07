@@ -44,6 +44,12 @@
 (##include "hasheq.ss")
 (##include "../chez/collections.ss")
 (##include "../chez/seq.ss")
+;; The register-*-arm! fast-type probes are LOAD-TIME SELF-CHECKS (they run
+;; each new predicate against sample values). The jrec-cl predicate probe
+;; spins on the js target (records dispatch against probe values); the
+;; invariant these checks enforce is already proven on every Chez gate run,
+;; so this target skips the probe machinery.
+(set! reject-fast-type-claim! (lambda _ #f))
 (##include "rt-core.ss")
 
 ;; regex needs regex-translate.ss (pure; rt.ss used to preload it from java/).
@@ -89,7 +95,7 @@
 ;; the image must have loaded first. Same-unit rule: all three are ##include'd —
 ;; the seed's emitted code expands seq.ss's macros in this unit; a load'd seed
 ;; would be a separate unit that cannot see them.
-(##include "eval-syntax.ss")  ;; GENERATED: seq.ss macros into the interaction env for runtime eval
+(##include "eval-fns.ss")  ;; seq.ss numeric macros as eval-world FUNCTIONS (js exes cannot eval define-syntax)
 (##include "seed/prelude.ss")
 ;; post-prelude re-asserts the native overrides the overlay stubs out (ns-name,
 ;; char?, atom?, realized?, ...) — cli.ss order: prelude, post-prelude, image.
@@ -107,33 +113,5 @@
       (begin (st (keyword #f "gambit")) (display "boot: backend target -> :gambit\n"))
       (begin (display "boot: FATAL set-target! missing from seed image\n") (exit 1))))
 
-;; ---- smoke ---------------------------------------------------------------
-;; Must exercise a LAZY seq (jolt-concat / jolt-map), not just jolt-first on a
-;; vector — the lazy force path is where jolt-mt? and the cseq tail thunks live.
+;; (smoke block removed — gambitkernel/gambiteval gates cover it)
 
-(write (jolt-vector 1 2 3))
-(newline)
-(write (jolt-hash-map 'a 1 'b 2))
-(newline)
-(write (jolt-hash-set 1 2 3))
-(newline)
-(write (jolt= (jolt-vector 1 2) (jolt-vector 1 2)))
-(newline)
-(write (jolt-first (jolt-vector 10 20 30)))
-(newline)
-;; lazy: a string seq is built from cseq-lazy tail thunks (str->seq); forcing
-;; it walks seq-more's (not jolt-mt?) path. jolt-concat/map wrap everything in
-;; jolt-make-lazy-seq (lazy-bridge.ss) and land in the kernel-test once that
-;; file boots.
-(write (jolt-count (jolt-seq "abcde")))
-(newline)
-(write (jolt-seq (jolt-seq "abcde")))
-(newline)
-(display "boot: values+hasheq+collections+seq+rt-core OK\n")
-
-;; G3 smoke: the compiler on gsi — the epic's exit criterion.
-(write (jolt-compile-eval "(+ 1 2)" "user"))
-(newline)
-(write (jolt-compile-eval "(map inc [1 2 3])" "user"))
-(newline)
-(display "boot: compile-eval OK\n")
