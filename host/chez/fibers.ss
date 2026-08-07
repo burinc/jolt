@@ -25,9 +25,11 @@
 ;;     and invoked exactly once per resume, so the multi-shot re-entry trap
 ;;     cannot happen).
 ;;
-;; The slice: the record carries a `slice` field that R1 leaves #f — R2 owns
-;; the dynamic-binding work (per the round split, dyn-binding.ss is NOT
-;; touched here; the field is the place R2 fills).
+;; The slice: the record carries a `slice` field holding the fiber's per-fiber
+;; dynamic state (a jolt-dslice record — the dyn-binding-stack value, the
+;; current namespace, and the STM *txn*). R2 owns the dynamic-binding work
+;; (per the round split, dyn-binding.ss is NOT touched here; the swap lives in
+;; the switch below).
 ;;
 ;; Loaded from rt.ss in the usual place AND from scheme-adapter-runtime.ss
 ;; (which loads first, so the gate-time adaptercheck, which loads only that
@@ -39,7 +41,8 @@
 ;; sa-fiber-resume) | 'done | 'dead (raised; error field holds the condition).
 ;; thunk: the fiber body (immutable). k: the one-shot continuation captured at
 ;; the last park (unconsumed while 'parked). result/error: completion payload.
-;; next: intrusive run-queue link. slice: R2's per-fiber dynamic slice (#f).
+;; next: intrusive run-queue link. slice: R2's per-fiber dynamic slice (a
+;; jolt-dslice: dyn-binding-stack value, current ns, *txn* — see below).
 (define-record-type jolt-fiber
   (fields (mutable state)
           thunk
@@ -49,6 +52,30 @@
           (mutable next)
           (mutable slice))
   (nongenerative jolt-fiber-v1))
+
+;; --- the per-fiber dynamic slice ---------------------------------------------
+;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
+;; dyn-binding-stack thread parameter as a SETTER, and a setter write is not
+;; undone by a continuation escape (R0(a)): a fiber that parks inside a binding
+;; leaves its frames on the carrier, visible to the scheduler and to every
+;; other fiber, and a second fiber popping its own frame can pop the parked
+;; fiber's. `set-chez-ns!` leaks the same way. The swap below saves the fiber's
+;; slice on switch-out and restores the incoming party's on switch-in.
+;;
+;; The scheduler's own slice is captured per sa-fiber-run-all entry, so the
+;; carrier reverts to the CALLER's state between fibers (the parked-fiber leak
+;; regression). *txn* is parameterize-managed inside dosync, so it unwinds on
+;; park on its own (R0(a)) — its two jobs in the slice are: a fiber parked
+;; inside a dosync resumes INSIDE its txn, and sa-fiber-spawn does NOT convey
+;; it (async-go-spawn parity: a child whose first dosync joined the parent's
+;; txn would write into the parent's log).
+;;
+;; Writes are diffed with eq?: a thread-parameter WRITE is ~33 ns vs ~2 ns to
+;; read (R0(c)), so a swap between two parties with identical slices — the
+;; common case — costs a few reads and zero writes.
+(define-record-type jolt-dslice
+  (fields (mutable stack) (mutable ns) (mutable txn))
+  (nongenerative jolt-dslice-v1))
 
 ;; The virtual-register slot holding the current fiber record (0 = not on a
 ;; fiber — a fresh thread starts every slot at fixnum 0, NOT #f). Allocated
@@ -68,6 +95,59 @@
 ;; can only park while ITS carrier's scheduler is running it, so there is
 ;; never a second writer.
 (define jolt-sched-k #f)
+
+;; The three thread parameters that make up a fiber's dynamic slice live in
+;; other host files (dyn-binding.ss's dyn-binding-stack, multimethods.ss's
+;; chez-current-ns-param, refs.ss's *txn*). The full boot defines all three
+;; BEFORE this file's last load (rt.ss loads fibers.ss last), so these
+;; references capture the real parameters there; a standalone load (the R1
+;; gate, or scheme-adapter-runtime.ss before the rest of rt.ss) sees them
+;; unbound and gets a private fallback parameter instead — behaviorally
+;; identical for the R1 semantics, and rt.ss's later re-load of this file
+;; re-captures the real ones (the harmless re-define pattern this file already
+;; uses for jolt-vreg-current-fiber). The probe is a guard on the reference,
+;; not top-level-bound? (blocklisted: fibers.ss is not a target-owned file).
+(define jolt-slice-stack-param
+  (guard (e (#t (make-thread-parameter '())))
+    dyn-binding-stack))
+(define jolt-slice-ns-param
+  (guard (e (#t (make-thread-parameter "user")))
+    chez-current-ns-param))
+(define jolt-slice-txn-param
+  (guard (e (#t (make-thread-parameter #f)))
+    *txn*))
+
+;; The scheduler's own slice — the caller's dynamic state at sa-fiber-run-all
+;; entry — kept in one mutable record so the per-run capture allocates nothing.
+(define jolt-sched-slice (make-jolt-dslice #f #f #f))
+(define (jolt-sched-slice-capture!)
+  (jolt-dslice-stack-set! jolt-sched-slice (jolt-slice-stack-param))
+  (jolt-dslice-ns-set! jolt-sched-slice (jolt-slice-ns-param))
+  (jolt-dslice-txn-set! jolt-sched-slice (jolt-slice-txn-param)))
+
+;; Save the CURRENT carrier values into fiber f's slice record. Runs in f's own
+;; dynamic context, BEFORE the switch invokes the scheduler continuation — the
+;; parameterize unwind fires as part of that invocation, so reading earlier is
+;; the only way to capture a txn a fiber is parked inside.
+(define (jolt-fiber-slice-save! f)
+  (let ((s (jolt-fiber-slice f)))
+    (jolt-dslice-stack-set! s (jolt-slice-stack-param))
+    (jolt-dslice-ns-set! s (jolt-slice-ns-param))
+    (jolt-dslice-txn-set! s (jolt-slice-txn-param))))
+
+;; Restore the carrier to slice s's values. Writes are diffed with eq?: a
+;; thread-parameter WRITE is ~33 ns vs ~2 ns to read (R0(c)), so a swap between
+;; two fibers with identical slices (the common case — empty stacks, same ns,
+;; no txn) costs the reads and zero writes. eq? can only skip a write when the
+;; carrier already holds the exact object, so it can never miss a change.
+(define (jolt-fiber-slice-restore! s)
+  (when s
+    (let ((v (jolt-dslice-stack s)))
+      (unless (eq? v (jolt-slice-stack-param)) (jolt-slice-stack-param v)))
+    (let ((v (jolt-dslice-ns s)))
+      (unless (eq? v (jolt-slice-ns-param)) (jolt-slice-ns-param v)))
+    (let ((v (jolt-dslice-txn s)))
+      (unless (eq? v (jolt-slice-txn-param)) (jolt-slice-txn-param v)))))
 
 (define (jolt-current-fiber)
   (let ((r (virtual-register jolt-vreg-current-fiber)))
@@ -108,6 +188,7 @@
   (call/1cc
     (lambda (k)
       (jolt-fiber-k-set! f k)
+      (jolt-fiber-slice-save! f)
       (jolt-sched-k))))
 
 ;; (sa-fiber-yield) -> void. Park the current fiber and move it to the back of
@@ -142,10 +223,19 @@
     (jolt-fiber-enqueue! f)))
 
 ;; (sa-fiber-spawn thunk) -> fiber. Create a fiber running THUNK and make it
-;; runnable; return the record. Spawning inside a fiber is legal. The slice
-;; field starts #f (R2 conveys the parent's bindings).
+;; runnable; return the record. Spawning inside a fiber is legal. The child's
+;; slice CONVEYS the parent's current dynamic state (the carrier's live values
+;; at spawn — reading the params in the parent's context), exactly as
+;; async-go-spawn snapshots (dyn-binding-stack) for a thread today; *txn* is
+;; always #f so a child spawned inside a dosync cannot join the parent's
+;; transaction (ref-sets into the parent's log would be committed by the
+;; parent, not the child).
 (define (sa-fiber-spawn thunk)
-  (let ((f (make-jolt-fiber 'ready thunk #f #f #f #f #f)))
+  (let ((f (make-jolt-fiber
+            'ready thunk #f #f #f #f
+            (make-jolt-dslice (jolt-slice-stack-param)
+                              (jolt-slice-ns-param)
+                              #f))))
     (jolt-fiber-enqueue! f)
     f))
 
@@ -157,7 +247,16 @@
   (call/1cc
     (lambda (k)
       (set! jolt-sched-k k)
-      (jolt-fiber-resume* f))))
+      ;; scheduler -> fiber: restore the incoming fiber's slice BEFORE running
+      ;; it (for a resume, before its continuation re-enters — the dynamic-wind
+      ;; before-thunks then re-fire over the restored values)
+      (jolt-fiber-slice-restore! (jolt-fiber-slice f))
+      (jolt-fiber-resume* f)))
+  ;; The fiber parked, finished, or died: its setter-written dynamic state
+  ;; (binding frames, current ns) is still live on the carrier — a continuation
+  ;; escape does not undo a setter write (R0(a)). fiber -> scheduler: revert to
+  ;; the scheduler's slice so the carrier between fibers is the CALLER's state.
+  (jolt-fiber-slice-restore! jolt-sched-slice))
 
 ;; Per-fiber exception isolation: the guard frame sits BELOW the fiber's own
 ;; frames and is part of the fiber's captured continuation, so it catches a
@@ -190,6 +289,7 @@
   (jolt-fiber-state-set! f 'done)
   (jolt-fiber-result-set! f r)
   (jolt-fiber-k-set! f #f)
+  (jolt-fiber-slice-set! f #f)
   (set-virtual-register! jolt-vreg-current-fiber 0)
   (jolt-sched-k))
 
@@ -197,14 +297,18 @@
   (jolt-fiber-state-set! f 'dead)
   (jolt-fiber-error-set! f e)
   (jolt-fiber-k-set! f #f)
+  (jolt-fiber-slice-set! f #f)
   (set-virtual-register! jolt-vreg-current-fiber 0)
   (jolt-sched-k))
 
 ;; (sa-fiber-run-all) -> void. Run the carrier's run queue until it drains —
 ;; the scheduler shape the plan names ("run ready fibers until the queue
 ;; drains, then block in the poller"); the poll step is R8's. A fiber that
-;; parks (jolt-fiber-park!) stops the drain until resumed.
+;; parks (jolt-fiber-park!) stops the drain until resumed. The scheduler's
+;; slice is captured at entry — the caller's dynamic state, which every park
+;; restores onto the carrier.
 (define (sa-fiber-run-all)
+  (jolt-sched-slice-capture!)
   (let loop ()
     (let ((f (jolt-fiber-dequeue!)))
       (when f

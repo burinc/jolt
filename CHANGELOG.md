@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fibers R2 (jolt-nvpr.3): per-fiber dynamic state.** A fiber's `binding`
+  frames, current namespace, and STM `*txn*` now travel with the fiber instead
+  of the carrier. R0 pinned the bug: dyn-binding.ss pushes a binding frame by
+  calling a thread parameter as a setter, and a setter write survives a
+  continuation escape — a fiber parked inside a `binding` leaked its frames
+  onto the carrier, visible to the scheduler and every other fiber, and a
+  second fiber's pop could pop the parked fiber's. The fix lives in the
+  scheduler: each fiber carries a dynamic slice (`host/chez/fibers.ss`,
+  `jolt-dslice`), saved on switch-out and restored on switch-in, with the
+  carrier reverting to the caller's state between fibers. Writes are diffed
+  with eq? (a thread-parameter write is 33ns vs 2ns to read), so identical
+  slices cost reads only; the switch ratio in `make fibers` moved from ~22x to
+  ~27x a bare procedure call (ceiling 60x). `sa-fiber-spawn` conveys the
+  parent's bindings and namespace but never its `*txn*` (async-go-spawn
+  parity), so a child spawned inside a dosync cannot join the parent's
+  transaction. `dyn-binding.ss` is untouched. The new `make fibers` gate
+  (`fibers-state-test.ss`) asserts the six R2 scenarios: binding invisibility
+  between siblings, the parked-frame leak regression, bindings intact on
+  resume, transaction isolation across two fibers on one carrier, spawn
+  conveyance, and namespace-follows-fiber.
+
 - **Fibers R1 (jolt-nvpr.2): the fiber primitive and a single-carrier
   scheduler** behind the new `coroutines` CONTRACT.txt tier (`sa-fiber-spawn`,
   `sa-fiber-yield`, `sa-fiber-resume`, `sa-fiber-run-all`), in
