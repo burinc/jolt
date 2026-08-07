@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-08-06
+
+### Added
+
+- **Portable Scheme layer completed** (#446, rounds R7–R10). The FFI tier,
+  eval/compile/AOT, and the backend's unsafe-primitive and FFI emission all
+  route through the scheme-adapter now; the lint allowlist is structurally
+  confined to the two target-owned files. `host/scheme-adapter/` gains
+  `TARGET-CONTRACT.md` (the porting document) and `guile.ss` (a structural
+  stub a port starts from); design notes are RFC 0010 on the site. No
+  behavior change on Chez — the seed prelude is byte-identical and the hot
+  FFI paths measured within noise.
+
+### Changed
+
+- **State image format version 3**: refs now travel in `jolt.image` dumps by
+  value (a descriptor is written; restore re-mints live refs — identity,
+  cycles, metadata, and STM liveness all preserved). This build still reads
+  version-2 images, including ones holding refs; runtimes at 0.6.6 or older
+  refuse version-3 images with a clean version error. Dropping the ref
+  record's dead lock field also makes `(ref x)` cheaper: the STM microbench
+  runs ~1.17x faster and a ref-heavy image round-trip ~1.2x faster.
+
+### Fixed
+
+- `jolt.image/resolve-stub!` now replaces a stub held inside a ref's value;
+  the substitution walk previously passed refs through untouched.
+
 ## [0.6.6] - 2026-08-06
 
 ### Added
