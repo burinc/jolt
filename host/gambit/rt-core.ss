@@ -1200,10 +1200,7 @@
 ;; no-op keeps those calls inert, matching the image-off degradation.
 (define (image-register-fn-form! . _) #f)
 
-;; host-static-classes.ss is excluded (no JVM class mirrors on this target);
-;; instance-check paths probe jclass? — always #f, the cond arms fall through.
-(define (jclass? x) #f)
-(define (jclass-name x) (error (quote jclass-name) "no host classes on the gambit target"))
+;; jclass?/jclass-name and the class objects they read live in host-vars.ss.
 
 ;; ---- concurrency tier stubs (demo boot: single-threaded) ---------------------
 ;; java/concurrency.ss + natives-queue.ss are excluded from this boot. Gambit

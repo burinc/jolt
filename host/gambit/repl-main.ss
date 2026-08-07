@@ -34,20 +34,33 @@
 
 (define (throw-text e)
   ;; a jolt throw is a condition wrapping the jolt value (rt-core); an ex-info
-  ;; record renders as Class: message. Plain conditions carry a message.
+  ;; record renders as Class: message. A host-level failure goes through the same
+  ;; class mapping and one-line folding the rest of the runtime uses
+  ;; (gambit-error-tostring, host-vars.ss), so the REPL never prints a bare
+  ;; "error" or a multi-line Gambit description.
   (or (guard (ee (#t #f))
         (let ((v (jolt-unwrap-throw e)))
           (and (jolt-ex-info-record? v)
                (string-append (jolt-ex-info-record-class-name v) ": "
                               (let ((m (jolt-ex-info-record-message v)))
                                 (if (string? m) m (jolt-pr-readable m)))))))
-      (guard (ee (#t #f))
-        (let ((m (condition-message e))) (and (string? m) m)))
+      (guard (ee (#t #f)) (and (gambit-host-error? e) (gambit-error-tostring e)))
+      (guard (ee (#t #f)) (let ((v (jolt-unwrap-throw e))) (jolt-pr-readable v)))
       "error"))
 
+;; An expression's printed output belongs in the terminal that ran it, not in the
+;; browser console, so each evaluation runs with stdout captured and the text is
+;; emitted before the value (or before the error, if it printed and then threw).
 (define (repl-step src)
-  (guard (e (#t (js-emit "error" (throw-text e))))
-    (js-emit "result" (jolt-eval-str src))))
+  (let ((printed "") (value #f) (failure #f))
+    (set! printed
+      (call-with-output-string
+        (lambda (port)
+          (parameterize ((current-output-port port))
+            (guard (e (#t (set! failure (throw-text e))))
+              (set! value (jolt-eval-str src)))))))
+    (when (> (string-length printed) 0) (js-emit "out" printed))
+    (if failure (js-emit "error" failure) (js-emit "result" value))))
 
 (js-ready!)
 (let loop ()

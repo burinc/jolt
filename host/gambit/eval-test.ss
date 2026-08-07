@@ -66,6 +66,31 @@
 ;; the runtime target must never emit chez unsafe spellings
 (check "(count \"gambit\")" "6")
 
+;; ---- host tier: the names the excluded java/ tree owns on Chez ---------------
+;; `time` reaches current-time-ms and the printer's host-writer probe; both were
+;; unbound names before host-vars.ss, so the macro died with a bare Gambit error.
+(check "(time 1)" "1")
+(check "(time (reduce + (range 100)))" "4950")
+(check "(> (current-time-ms) 1700000000000)" "true")
+(check "(do (flush) :ok)" ":ok")
+
+;; A type this target cannot construct answers the question instead of raising.
+(check "(delay? 1)" "false")
+(check "(queue? 1)" "false")
+(check "(tap> 1)" "false")
+
+;; An absent capability raises a catchable, named error rather than crashing on
+;; an unbound global.
+(check "(try (future 1) (catch Exception e (str (class e))))"
+       "\"class java.lang.UnsupportedOperationException\"")
+
+;; Gambit has no arity introspection, so its own runtime raises on a mismatch;
+;; those exceptions must still carry a class and a message (they rendered as
+;; "#object[:object]" before).
+(check "(try ((fn [x] x)) (catch Exception e (str (class e))))"
+       "\"class clojure.lang.ArityException\"")
+(check "(str (class 1))" "\"class java.lang.Long\"")
+
 ;; a ^double-hinted fn compiles WITHOUT #3% in the emitted text (the R9
 ;; target-prims table at :gambit maps the unsafe prefix to "")
 (let ((scm (jolt-analyze-emit-form
