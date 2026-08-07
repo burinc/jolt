@@ -221,9 +221,12 @@ values:
 # corrected absolute-live-bytes measurement). Detection-free, no jolt boot.
 # fibers-state-test.ss is the R2 dynamic-slice gate (per-fiber bindings/ns/txn;
 # loads rt.ss for the real thread parameters).
+# fibers-chan-test.ss is the R3 waiter-protocol gate (fiber <! / >! over the
+# existing channel handlers; loads rt.ss for the real async.ss channels).
 fibers:
 	@$(CHEZ) --script test/chez/fibers-test.ss
 	@$(CHEZ) --script test/chez/fibers-state-test.ss
+	@$(CHEZ) --script test/chez/fibers-chan-test.ss
 
 # Corpus conformance vs JVM-sourced expecteds (allowlist + floor).
 corpus:
