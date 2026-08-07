@@ -225,7 +225,12 @@ sa-fasl-read
 # so adapters wrap. iota/list-head are SRFI-1 (take). vector-copy is SRFI-43.
 # hashtable-values returns a vector of the table's values, hashtable-cells a
 # list of (key . value) pairs (adapters build both from the R6RS
-# hashtable-keys/for-each API).
+# hashtable-keys/for-each API). scheme-version (added R10): zero-arg, a
+# human-readable version string of the target Scheme implementation — the
+# exact format is target-specific (Chez's native returns "Chez Scheme Version
+# 10.4.1"; a Guile adapter would wrap its (version)). Naming/telemetry only:
+# no host logic may parse it except target-owned build machinery (release
+# dirs, image headers), which knows its own target's format.
 gensym
 format
 printf
@@ -241,3 +246,4 @@ list-head
 vector-copy
 hashtable-values
 hashtable-cells
+scheme-version
