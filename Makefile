@@ -219,8 +219,11 @@ values:
 # per-fiber raise isolation, round-robin order, deep-stack yield) plus the
 # pinned numbers (spawn < 5us, switch < 100ns, per-fiber live < 8KB by R0's
 # corrected absolute-live-bytes measurement). Detection-free, no jolt boot.
+# fibers-state-test.ss is the R2 dynamic-slice gate (per-fiber bindings/ns/txn;
+# loads rt.ss for the real thread parameters).
 fibers:
 	@$(CHEZ) --script test/chez/fibers-test.ss
+	@$(CHEZ) --script test/chez/fibers-state-test.ss
 
 # Corpus conformance vs JVM-sourced expecteds (allowlist + floor).
 corpus:
