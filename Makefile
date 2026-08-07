@@ -585,6 +585,16 @@ gambitkernel:
 		echo "gambitkernel: gambit-scheme not installed (brew) — skipped"; \
 	fi
 
+# G3 eval gate: real jolt source through jolt-compile-eval on the booted
+# manifest + cross-minted seed, renders pinned to Chez captures. Detection-
+# gated like gambitcheck; boots the full seed so it takes ~1 min on gsi.
+gambiteval:
+	@if [ -x "$(GAMBIT_GSI)" ]; then \
+		"$(GAMBIT_GSI)" host/gambit/eval-test.ss; \
+	else \
+		echo "gambiteval: gambit-scheme not installed (brew) — skipped"; \
+	fi
+
 # G3 compiler-on-gsi (jolt-mj95.4): cross-mint the Gambit seed from the Chez
 # seed ON CHEZ with the backend target at :gambit (R9), grep-verifying the
 # emission contains no chez-only spelling before writing host/gambit/seed/.
