@@ -339,7 +339,11 @@
             #x9e3779b9))))
 
 ;; Symbol hasheq = Util.hashCombine(Murmur3.hashUnencodedChars(name), hash(ns)).
-(define symbol-hasheq-cache (make-weak-eq-hashtable))
+;; STRONG table (not weak like Chez): the js target's weak tables spin on
+;; symbol/string keys (WeakRef cannot hold primitive-likes — the lookup hung
+;; under node). Symbols and strings are program vocabulary; the caches are
+;; bounded by it, so strength costs little.
+(define symbol-hasheq-cache (make-eq-hashtable))
 
 (define (compute-symbol-hasheq ns name)
   (let ((ns-hash (if (or (jolt-nil? ns) (not ns) (eq? ns '()))
@@ -353,8 +357,8 @@
         (hashtable-set! symbol-hasheq-cache sym h)
         h)))
 
-;; String hasheq cache — same pattern as the symbol cache.
-(define string-hasheq-cache (make-weak-eq-hashtable))
+;; String hasheq cache — same pattern (and the same strong-table reason).
+(define string-hasheq-cache (make-eq-hashtable))
 
 (define (compute-string-hasheq s)
   (murmur3-hash-int (java-string-hashcode s)))
