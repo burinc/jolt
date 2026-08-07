@@ -204,8 +204,27 @@
 (define switch-ns
   (/ (exact->inexact (- (mono-nanos) sw-t0)) (* 2.0 SW-N SW-M)))
 (collect-trip-bytes old-trip)
-(printf "  switch: ~a ns/switch (assert < 100ns)\n" switch-ns)
-(ok "switch < 100ns" (< switch-ns 100.0))
+
+;; The assertion is a RATIO against a calibration loop measured in this same
+;; process, not an absolute nanosecond ceiling. An absolute one is a flake: this
+;; switch measured 53 ns on a dev machine and 124 ns on a shared CI runner, so a
+;; 100 ns ceiling failed CI while the code was fine. A ratio scales with the
+;; machine — both the baseline and the switch slow down together — so it still
+;; catches a real regression (a switch that starts copying stacks, or a slice
+;; swap that regresses to thread parameters at 33 ns per write) without
+;; measuring the runner's mood.
+(define CAL-N 2000000)
+(define (cal-op x) x)                       ; a bare procedure call
+(define cal-t0 (mono-nanos))
+(define cal-sink
+  (let loop ((i CAL-N) (acc 0))
+    (if (fx>? i 0) (loop (fx- i 1) (cal-op i)) acc)))
+(define cal-ns (/ (exact->inexact (- (mono-nanos) cal-t0)) CAL-N))
+(define switch-ratio (/ switch-ns (max 0.2 cal-ns)))
+(printf "  switch: ~a ns/switch  (bare call ~a ns; ratio ~a, assert < 60x)\n"
+        switch-ns cal-ns switch-ratio)
+(ok "switch within 60x a bare procedure call" (< switch-ratio 60.0))
+(ok "calibration loop ran" (fx>=? cal-sink 0))
 
 ;; --- per-fiber memory: < 8KB, absolute-live-bytes method ----------------------
 ;; R0's corrected measurement: retain the parked fibers in a global, force a
