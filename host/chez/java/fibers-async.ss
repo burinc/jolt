@@ -108,13 +108,16 @@
 ;;
 ;; jolt-fiber-go-spawn is the :fiber backend of clojure.core.async/go-spawn
 ;; (the dispatcher lives in async.ss; thread stays the :thread backend). It
-;; spawns the body as a fiber on the R4 carrier — the one OS thread that loops
-;; sa-fiber-run-all and parks on the run-queue condition when it drains
-;; (fibers.ss). Parking inside the body works ACROSS function boundaries,
-;; which the JVM's state-machine go structurally cannot do: any <! / >! the
-;; body (or a function it calls) hits dispatches through the <! / >! redefs
-;; below to jolt-fiber-<! / jolt-fiber->!, which park the fiber via the R3
-;; handler protocol.
+;; spawns the body as a fiber on the R5 carrier pool — N OS threads, each
+;; looping drain-then-park (fibers.ss). Parking inside the body works ACROSS
+;; function boundaries, which the JVM's state-machine go structurally cannot
+;; do: any <! / >! the body (or a function it calls) hits dispatches through
+;; the redefs below to jolt-fiber-<! / jolt-fiber->!, which park the fiber via
+;; the R3 handler protocol.
+;;
+;; The pool's size is clojure.core.async/*fiber-carrier-count*, defined and
+;; read in fibers.ss (host setter jolt-fiber-carrier-count-set! for tests);
+;; jolt-fiber-ensure-carrier! starts it at the first :fiber go spawn.
 
 ;; (jolt-fiber-go-spawn thunk) -> buffered(1) channel. Conveys the parent's
 ;; dynamic slice (sa-fiber-spawn reads the spawner's bindings; *txn* is never
@@ -159,14 +162,18 @@
   (let ((mb (jolt-fiber-waiter-wait! h)))
     (jolt-vector (vector-ref mb 1) (vector-ref mb 2))))
 
-;; <! / >! dispatch on "am I on a fiber?" — the vreg read (R0's 2ns dispatch).
-;; On a fiber they park (the R3 primitives); on a plain thread they are the
-;; blocking ops of today, so :thread-backend go bodies (real threads) and any
-;; <! on a bare thread are byte-for-byte unchanged. <!! / >!! are NOT redefined
-;; here: inside a fiber they keep blocking the carrier (R4 keeps that, R5 owns
-;; the decision).
+;; <! / >! / <!! / >!! dispatch on "am I on a fiber?" — the vreg read (R0's 2ns
+;; dispatch). On a fiber they park (the R3 primitives, and — R5's decision —
+;; <!! / >!! park exactly the same way: parking a blocking take preserves its
+;; observable semantics without holding the OS thread, so on a fiber there is
+;; no difference between <! and <!!, or between >! and >!!); on a plain thread
+;; they are the blocking ops of today, so :thread-backend go bodies (real
+;; threads), bare <!! on a thread, and the conformance gate's expectations are
+;; byte-for-byte unchanged.
 (cca-def! "<!" (lambda (ch) (if (jolt-current-fiber) (jolt-fiber-<! ch) (jolt-async-take ch))))
 (cca-def! ">!" (lambda (ch v) (if (jolt-current-fiber) (jolt-fiber->! ch v) (jolt-async-give ch v))))
+(cca-def! "<!!" (lambda (ch) (if (jolt-current-fiber) (jolt-fiber-<! ch) (jolt-async-take ch))))
+(cca-def! ">!!" (lambda (ch v) (if (jolt-current-fiber) (jolt-fiber->! ch v) (jolt-async-give ch v))))
 
 ;; Install the alts! fiber-await hook (see async.ss).
 (set! jolt-fiber-alt-await-fn jolt-fiber-alt-await)
