@@ -76,35 +76,65 @@
 ;; Force a park in every case: take from an EMPTY channel, delivered later from
 ;; this thread. Values arrive through a second channel so the body's own result
 ;; channel stays the thing under test.
-(ev "(def fed (clojure.core.async/chan 1))")
+;; Feeding a value and then asserting "that park happened" is a RACE: on a slower
+;; machine the value can already be waiting when the take runs, which completes it
+;; inline with no park at all — CI caught exactly that on the mixed body. So each
+;; step WAITS for the counter it expects to move before feeding the next value, and
+;; the wait is itself the assertion: if the mechanism regressed, it times out.
+(define (mono-ns)
+  (let ((t (current-time (quote time-monotonic))))
+    (+ (* 1000000000 (time-second t)) (time-nanosecond t))))
 
-(define (sm-parks) jolt-sm-parks)
-(define (cap-parks) jolt-fiber-chan-parks)
+(define (wait-counter label get target)
+  (let ((deadline (+ (mono-ns) (* 10 1000000000))))
+    (let loop ()
+      (cond ((>= (get) target) #t)
+            ((> (mono-ns) deadline)
+             (gate-check (string-append label " (timed out at " (number->string (get))
+                         " waiting for " (number->string target) ")")
+                         #f #t)
+             #f)
+            (else (sleep (make-time (quote time-duration) 2000000 0)) (loop))))))
 
-;; (fiber-run SRC) evaluates SRC under the :fiber backend and returns
+(define (feed1 v) (ev (string-append "(clojure.core.async/>!! __ch " v ")")))
+
+;; Spawn SRC on the :fiber backend against a fresh empty channel __ch, run STEPS
+;; (each a thunk that waits for a counter then feeds), and return
 ;; [value cheap-delta capture-delta].
-(define (fiber-run label src feeder)
-  (let ((c0 (sm-parks)) (p0 (cap-parks)))
-    (ev (string-append
-         "(def __res (clojure.core.async/chan 1))"))
+(define (fiber-run label src steps)
+  (let ((c0 jolt-sm-parks) (p0 jolt-fiber-chan-parks))
     (ev (string-append
          "(binding [clojure.core.async/*go-backend* :fiber]"
          "  (clojure.core.async/go-spawn (fn* [] nil))"      ; start the carriers
          "  (def __ch (clojure.core.async/chan))"
          "  (def __out " src "))"))
-    (feeder)
-    (let ((v (ev "(clojure.core.async/<!! __out)")))
-      (list v (- (sm-parks) c0) (- (cap-parks) p0)))))
+    (for-each (lambda (st) (st c0 p0)) steps)
+    ;; BOUNDED: with the pass broken a value may never arrive, and a bare <!! would
+    ;; hang the gate instead of failing it — which is the one thing a gate must
+    ;; never do.
+    (let ((v (ev (string-append
+                  "(first (clojure.core.async/alts!! "
+                  "[__out (clojure.core.async/timeout 10000)]))"))))
+      (list v (- jolt-sm-parks c0) (- jolt-fiber-chan-parks p0)))))
 
-(define (feed! . vs)
-  (for-each (lambda (v)
-              (ev (string-append "(clojure.core.async/>!! __ch " v ")")))
-            vs))
+;; a step: wait for N cheap parks so far, then feed v
+(define (after-cheap label n v)
+  (lambda (c0 p0)
+    (when (wait-counter (string-append label ": cheap park #" (number->string n))
+                        (lambda () jolt-sm-parks) (+ c0 n))
+      (when v (feed1 v)))))
+
+;; a step: wait for N captures so far, then feed v
+(define (after-capture label n v)
+  (lambda (c0 p0)
+    (when (wait-counter (string-append label ": capture #" (number->string n))
+                        (lambda () jolt-fiber-chan-parks) (+ p0 n))
+      (when v (feed1 v)))))
 
 ;; a park the pass rewrote: cheap, and nothing captured
 (define r-lex
   (fiber-run "lexical" "(clojure.core.async/go (inc (clojure.core.async/<! __ch)))"
-             (lambda () (feed! "41"))))
+             (list (after-cheap "lexical" 1 "41"))))
 (gate-check "lexical park: value" (car r-lex) 42)
 (gate-check "lexical park: one cheap park" (cadr r-lex) 1)
 (gate-check "lexical park: no capture" (caddr r-lex) 0)
@@ -112,12 +142,13 @@
 ;; a park the pass could not see: captured, and no cheap park
 (define r-helper
   (fiber-run "helper" "(clojure.core.async/go (inc (helper-take __ch)))"
-             (lambda () (feed! "41"))))
+             (list (after-capture "helper" 1 "41"))))
 (gate-check "park through a call: value" (car r-helper) 42)
 (gate-check "park through a call: no cheap park" (cadr r-helper) 0)
 (gate-check "park through a call: one capture" (caddr r-helper) 1)
 
-;; both in ONE body: the choice really is per park site
+;; both in ONE body: the choice really is per park site. Each value is fed only
+;; once the park it belongs to has happened, so the counts are exact.
 (define r-mixed
   (fiber-run "mixed"
              (string-append
@@ -126,22 +157,26 @@
               "        b (helper-take __ch)"
               "        c (clojure.core.async/<! __ch)]"
               "    [a b c]))")
-             (lambda () (feed! "1" "2" "3"))))
+             (list (after-cheap "mixed" 1 "1")
+                   (after-capture "mixed" 1 "2")
+                   (after-cheap "mixed" 2 "3"))))
 (gate-check "mixed body: value" (jolt-pr-str (car r-mixed)) "[1 2 3]")
 (gate-check "mixed body: two cheap parks" (cadr r-mixed) 2)
 (gate-check "mixed body: one capture" (caddr r-mixed) 1)
 
-;; a go-loop draining a channel: one cheap park per take, recur included
+;; a go-loop draining a channel: cheap parks only, however the feeding interleaves
 (define r-loop
   (fiber-run "go-loop"
              (string-append
               "(clojure.core.async/go-loop [acc 0]"
               "  (let [v (clojure.core.async/<! __ch)]"
               "    (if (nil? v) acc (recur (+ acc v)))))")
-             (lambda () (feed! "1" "2" "3") (ev "(clojure.core.async/close! __ch)"))))
+             (list (after-cheap "go-loop" 1 "1")
+                   (lambda (c0 p0) (feed1 "2") (feed1 "3")
+                           (ev "(clojure.core.async/close! __ch)")))))
 (gate-check "go-loop: summed" (car r-loop) 6)
 (gate-check "go-loop: no captures" (caddr r-loop) 0)
-(gate-check "go-loop: parked at least once" (> (cadr r-loop) 0) #t)
+(gate-check "go-loop: parked cheaply" (> (cadr r-loop) 0) #t)
 
 ;; --- 3. same values on both backends ----------------------------------------
 (printf "\n== 3. the same answers on :thread and :fiber ==\n")
