@@ -141,6 +141,99 @@
                  60.0 "3. watch churn"))
 (ok "3. the watches fired" (> watch-hits 0))
 
+;; --- 4. the reader's weak side-tables ----------------------------------------
+;; rdr-map-order records a map literal's SOURCE key order, written on every map
+;; literal read and consulted by the analyzer. Two threads reading source at once
+;; is ordinary (an nREPL session evaluating while the loader requires), and a
+;; weak-eq table is the kind that CANNOT be read unlocked while another thread
+;; writes it: Chez's eq adjust! relinks live cells in place with $set-tlc-next!
+;; (s/library.ss) and the reader is unsafe primitive code, so a resize concurrent
+;; with a lookup hangs or faults. Unguarded this scenario hangs rather than
+;; failing, which is why run-threads is bounded.
+(printf "\n== 4. concurrent map-literal reads (rdr-map-order) ==\n")
+(define rdr-bad 0)
+(define rdr-bad-mu (make-mutex))
+(ok "4. every reader thread finished"
+    (run-threads 12
+                 (lambda (t)
+                   (let loop ((i 0))
+                     (when (fx<? i 3000)
+                       ;; a fresh map each time, so every read is a cache MISS and
+                       ;; writes the table — the shape that resizes it
+                       (let* ((es (list (keyword #f (string-append "k" (number->string t)))
+                                        i
+                                        (keyword #f (string-append "j" (number->string i)))
+                                        t))
+                              (m (rdr-make-map es)))
+                         (unless (equal? (rdr-map-order-ref m) es)
+                           (with-mutex rdr-bad-mu (set! rdr-bad (+ rdr-bad 1)))))
+                       (loop (fx+ i 1)))))
+                 90.0 "4. concurrent map-literal reads"))
+(ok "4. every map kept its own source order" (= rdr-bad 0))
+
+;; --- 5. the deftype ctor -> tag table ----------------------------------------
+;; Also weak-eq, but the opposite profile: read on multimethod dispatch and the
+;; class-tag chain, written only at deftype/defrecord DEFINITION. A mutex would
+;; sit on dispatch to protect a write that happens a few hundred times in a
+;; process, so it is COPY-ON-WRITE instead — the writer copies under a lock and
+;; swaps the box, and a reader unboxes once and walks a table nobody will mutate
+;; again.
+;;
+;; No hammer here. A rare-writer table cannot be made to fault on demand, and a
+;; synthetic one would pass unfixed (this scenario did, at 200 ctors and again at
+;; 20000). What IS exact is the mechanism: a snapshot taken before a write must
+;; still be the table it was. Revert the writer to mutating in place and the first
+;; two checks fail immediately, with no timing involved.
+(printf "\n== 5. the ctor-tag table is copy-on-write ==\n")
+(define tag-ctor-a (lambda () 'a))
+(define tag-ctor-b (lambda () 'b))
+(deftype-ctor-tag-set! tag-ctor-a "t.A")
+(define tag-snapshot (unbox chez-deftype-ctor-tag-box))
+(define tag-snapshot-size (hashtable-size tag-snapshot))
+(deftype-ctor-tag-set! tag-ctor-b "t.B")
+(ok "5. a write swaps the box instead of mutating in place"
+    (not (eq? tag-snapshot (unbox chez-deftype-ctor-tag-box))))
+(ok "5. a reader's snapshot is unaffected by the write"
+    (and (= tag-snapshot-size (hashtable-size tag-snapshot))
+         (not (hashtable-ref tag-snapshot tag-ctor-b #f))))
+(ok "5. the new table carries both entries"
+    (and (equal? (deftype-ctor-tag tag-ctor-a) "t.A")
+         (equal? (deftype-ctor-tag tag-ctor-b) "t.B")))
+;; the copy has to stay WEAK, or every ctor ever defined would be pinned
+(ok "5. the copy is still a weak table" (hashtable-weak? (unbox chez-deftype-ctor-tag-box)))
+;; and concurrent readers must still see a consistent table while types register
+(define tag-bad 0)
+(define tag-bad-mu (make-mutex))
+(define tag-n 4000)
+(define tag-ctors
+  (let loop ((i 0) (acc '()))
+    (if (fx=? i tag-n) (list->vector (reverse acc)) (loop (fx+ i 1) (cons (lambda () i) acc)))))
+(define (tag-want i) (string-append "t.T" (number->string i)))
+(ok "5. definers and dispatchers all finished"
+    (run-threads 9
+                 (lambda (t)
+                   (if (fx=? t 0)
+                       (let loop ((i 0))
+                         (when (fx<? i tag-n)
+                           (deftype-ctor-tag-set! (vector-ref tag-ctors i) (tag-want i))
+                           (loop (fx+ i 1))))
+                       (let loop ((r 0))
+                         (when (fx<? r 40)
+                           (let inner ((i 0))
+                             (when (fx<? i tag-n)
+                               (let ((got (deftype-ctor-tag (vector-ref tag-ctors i))))
+                                 (when (and got (not (string=? got (tag-want i))))
+                                   (with-mutex tag-bad-mu (set! tag-bad (+ tag-bad 1)))))
+                               (inner (fx+ i 1))))
+                           (loop (fx+ r 1))))))
+                 120.0 "5. ctor-tag churn"))
+(ok "5. no read ever returned another type's tag" (= tag-bad 0))
+(ok "5. every ctor is registered at the end"
+    (let loop ((i 0))
+      (cond ((fx=? i tag-n) #t)
+            ((equal? (deftype-ctor-tag (vector-ref tag-ctors i)) (tag-want i)) (loop (fx+ i 1)))
+            (else #f))))
+
 (printf "\nthread-safety-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "thread-safety-test: PASS — shared side-tables under concurrency\n") (exit 0))

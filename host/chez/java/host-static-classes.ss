@@ -1358,7 +1358,7 @@
   (cond ((jclass? x) (jclass-name x))
         ((string? x) x)
         ;; a deftype/defrecord NAME var holds its ctor; treat it as the class
-        ((procedure? x) (hashtable-ref chez-deftype-ctor-tag x #f))
+        ((procedure? x) (deftype-ctor-tag x))
         (else #f)))
 ;; = compares jclass values by name (stable interning makes this eq?-level);
 ;; strings are no longer = to a jclass — class-key survives for internal
@@ -1936,7 +1936,7 @@
 ;; its positional ctor are one value here.)
 (def-var! "jolt.host" "class-object?"
   (lambda (x) (if (or (jclass? x)
-                      (and (procedure? x) (hashtable-ref chez-deftype-ctor-tag x #f) #t))
+                      (and (procedure? x) (deftype-ctor-tag x) #t))
                   #t #f)))
 ;; nth over the java.util List shims, like RT.nth on a java.util.List.
 ;; This stays a set!-wrap of jolt-nth rather than a registered arm: unlike

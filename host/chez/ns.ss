@@ -186,7 +186,7 @@
 (define (jolt-all-ns)
   (let ((seen (make-hashtable string-hash string=?)))
     (vector-for-each (lambda (k) (hashtable-set! seen k #t)) (hashtable-keys ns-registry))
-    (vector-for-each (lambda (c) (hashtable-set! seen (var-cell-ns c) #t)) (hashtable-values var-table))
+    (vector-for-each (lambda (c) (hashtable-set! seen (var-cell-ns c) #t)) (var-table-cells))
     (list->cseq (map intern-ns! (vector->list (hashtable-keys seen))))))
 
 ;; ns-publics / ns-map / ns-interns: a {sym -> var-cell} jolt map built by scanning
@@ -202,7 +202,7 @@
       (lambda (c)
         (when (and (string=? (var-cell-ns c) nm) (var-cell-defined? c) (keep? c))
           (set! m (jolt-assoc m (jolt-symbol #f (var-cell-name c)) c))))
-      (hashtable-values var-table))
+      (var-table-cells))
     m))
 (define (ns-vars-pmap nm) (ns-vars-pmap-when nm (lambda (c) #t)))
 (define (jolt-ns-publics desig) (ns-vars-pmap-when (ns-desig->name desig) (lambda (c) (not (var-private? c)))))
@@ -445,7 +445,7 @@
           (let ((nm (var-cell-name c)))
             (when (and (or (not only) (member nm only)) (not (member nm excl)))
               (chez-register-refer! cns nm target)))))
-      (hashtable-values var-table))
+      (var-table-cells))
     jolt-nil))
 ;; (:refer-clojure :exclude [names…]) — clojure.core always resolves on Chez, so
 ;; the only thing to track is the EXCLUDE set: an excluded name is not

@@ -147,7 +147,7 @@
      (let-values (((items changed) (ldr-conv-each (vector->list (pvec-v x)))))
        (if changed (rdr-carry-meta x (apply jolt-vector items)) x)))
     ((pmap? x)
-     (let ((order (hashtable-ref rdr-map-order x #f)))
+     (let ((order (rdr-map-order-ref x)))
        (if order
            (let-values (((kvs changed) (ldr-conv-each order)))
              (if changed (rdr-carry-meta x (rdr-make-map kvs)) x))
@@ -269,7 +269,7 @@
 ;; one of those then no-ops instead of hunting for a (nonexistent) source file.
 (define loaded-ns (make-hashtable string-hash string=?))
 (vector-for-each (lambda (c) (hashtable-set! loaded-ns (var-cell-ns c) #t))
-                 (hashtable-values var-table))
+                 (var-table-cells))
 
 ;; clojure.core.async ships native channel primitives (async.ss) AND a Clojure
 ;; overlay (stdlib/clojure/core/async.clj) with the higher-level dataflow API

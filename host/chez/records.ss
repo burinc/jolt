@@ -187,7 +187,26 @@
 ;; ctor procedure -> its class tag: the type NAME var holds the ctor (a jolt-ism;
 ;; the JVM resolves it to the class), so class-key maps the ctor back to the
 ;; class for (ancestors TypeName) / (isa? x TypeName) / derive on the type.
-(define chez-deftype-ctor-tag (make-weak-eq-hashtable))
+;; COPY-ON-WRITE, because this one is read-mostly and write-almost-never: it is
+;; written once per deftype/defrecord DEFINITION and read on multimethod dispatch
+;; (mm-dispatch-val-canon), the class-tag chain and the interop path. A weak-eq
+;; table cannot be read unlocked while another thread writes it — Chez's eq
+;; adjust! relinks live cells in place with $set-tlc-next! (s/library.ss) and the
+;; reader is unsafe primitive code, so a resize concurrent with a lookup hangs or
+;; faults. But a mutex on THIS read path would sit on dispatch.
+;;
+;; So the writer copies under the lock and swaps the box; a reader unboxes once
+;; and walks a table nobody will ever mutate again. The copy is O(number of
+;; deftypes) and happens only at definition time. The GC's own rehash of a weak
+;; table is not a factor: it stops the world.
+(define chez-deftype-ctor-tag-box (box (make-weak-eq-hashtable)))
+(define chez-deftype-ctor-tag-mu (make-mutex))
+(define (deftype-ctor-tag p) (hashtable-ref (unbox chez-deftype-ctor-tag-box) p #f))
+(define (deftype-ctor-tag-set! ctor tag)
+  (with-mutex chez-deftype-ctor-tag-mu
+    (let ((t (hashtable-copy (unbox chez-deftype-ctor-tag-box) #t)))  ; copy is weak too
+      (hashtable-set! t ctor tag)
+      (set-box! chez-deftype-ctor-tag-box t))))
 ;; A deftype/defrecord name used as a multimethod DISPATCH VALUE evaluates to its
 ;; ctor token (a procedure). Normalize it to the "ns.Name" class-name STRING that
 ;; __type-tag / class / type yield for an INSTANCE (jolt models a class as its name
@@ -196,7 +215,7 @@
 ;; Called from multimethods.ss (forward-referenced; records.ss loads after it but
 ;; before any user defmethod runs).
 (define (mm-dispatch-val-canon dval)
-  (or (and (procedure? dval) (hashtable-ref chez-deftype-ctor-tag dval #f))
+  (or (and (procedure? dval) (deftype-ctor-tag dval))
       dval))
 (define chez-simple-name-tag (make-hashtable string-hash string=?))
 ;; simple deftype/defrecord name -> its "ns.Name" tag, or #f. Used by the analyzer
@@ -954,7 +973,7 @@
         ;; JVM, so a protocol extended to Class dispatches on them (schema extends its
         ;; Schema protocol to Class, then calls (spec SomeClass)).
         ((jclass? obj) '("Class" "java.lang.Class" "Object"))
-        ((and (procedure? obj) (hashtable-ref chez-deftype-ctor-tag obj #f))
+        ((and (procedure? obj) (deftype-ctor-tag obj))
          '("Class" "java.lang.Class" "Object"))
         ;; a named fn reports its own JVM-style class "ns$munged-name" (the same
         ;; (class the-fn) yields) ahead of the generic IFn tags, so a protocol
@@ -1076,7 +1095,7 @@
     ;; bare deftype is an IType; defrecord (which runs register-record-type!
     ;; right after) replaces the row with the record interface set.
     (jch-set-supers! tag '("clojure.lang.IType"))
-    (hashtable-set! chez-deftype-ctor-tag ctor tag)
+    (deftype-ctor-tag-set! ctor tag)
     ;; record the shape for whole-program inference, keyed by the positional
     ;; ctor var "ns/->Name" the analyzer resolves a (->Name …) call to.
     (register-record-shape! (string-append (chez-current-ns) "/->" (symbol-t-name name-sym))
@@ -1420,7 +1439,7 @@
       ;; java.lang.Class reflection methods off the "ns.Name" tag it carries, so
       ;; (.getName Bar)/(.getSimpleName Bar) work when the type is held by value —
       ;; schema resolves class schemas by calling these on the record class.
-      ((and (procedure? obj) (hashtable-ref chez-deftype-ctor-tag obj #f))
+      ((and (procedure? obj) (deftype-ctor-tag obj))
        => (lambda (tag)
             (cond ((or (string=? method-name "getName") (string=? method-name "getCanonicalName")
                        (string=? method-name "getTypeName")) tag)

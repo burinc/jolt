@@ -1309,7 +1309,9 @@
                     (if (jolt-nil? s) acc
                         (loop (jolt-next s) (cons (jolt-first s) acc))))))
         (out '()))
-    (let-values (((ks vs) (hashtable-entries var-table)))
+    (let* ((kv (var-table-entries))          ; snapshot under var-table-mu (rt.ss)
+           (ks (car kv))
+           (vs (cdr kv)))
       (let loop ((i 0))
         (when (fx<? i (vector-length ks))
           (let* ((cell (vector-ref vs i))

@@ -493,20 +493,38 @@
   (nongenerative var-cell-v3))
 (define var-table (make-hashtable string-hash string=?))
 (define var-table-mu (make-mutex))
-;; var-table-mu covers EVERY mutation of var-table and of ns-has-vars-set below:
-;; jolt-var's insert, declare-var!'s insert, def-var!'s index write, and
-;; remove-ns's sweep (ns.ss). Two writers racing was the corrupting case — a
-;; hashtable-set! that rehashes while another one is mid-move leaves the table's
-;; internals inconsistent, and the damage surfaces later as a fault inside the
-;; collector, naming nothing.
+;; var-table-mu covers EVERY mutation of var-table and of ns-has-vars-set below
+;; (jolt-var's insert, declare-var!'s insert, def-var!'s index write, remove-ns's
+;; sweep in ns.ss, the gate harnesses' prune) and every WHOLE-TABLE scan
+;; (var-table-cells / var-table-entries). Single-key reads deliberately take no
+;; lock. The asymmetry is not an oversight, so here is the reasoning in full,
+;; against Chez 10's implementation.
 ;;
-;; The READ side is still unlocked, and that is a KNOWN GAP, not a claim: a
-;; hashtable-ref concurrent with a rehashing hashtable-set! has the same problem
-;; in miniature. Locking it is not free — measured at 70 -> 95 ns on a var-table
-;; probe, and var-deref is emitted per var reference (572 of them in the seed
-;; prelude alone) — so closing it needs a design that keeps the read cheap
-;; (copy-on-write behind a box, or a genuinely-single-threaded fast path shared
-;; with the lazy-seq work). Tracked as jolt-asj; the inventory is on jolt-3907.
+;; A STRONG general hashtable — which this is, unlike the weak-eq side-tables
+;; elsewhere in the runtime — never mutates existing structure on the read path or
+;; on a resize. s/newhash.ss: a non-resizing insert is one vector-set! of a
+;; fully-formed list (`(cons (cons x v) bucket)`), an update is one set-cdr! of a
+;; value, and adjust! builds a COMPLETE new bucket vector out of fresh spine
+;; conses, leaving the old one untouched, then publishes it with a single
+;; ht-vec-set!. $gen-hashtable-ref snapshots ht-vec once and takes its mask from
+;; that same vector, so the index cannot be torn. A reader therefore walks a
+;; consistent structure and the worst it can observe is a STALE MISS — which
+;; jolt-var's double-check turns into a lock acquisition and a re-read.
+;;
+;; Measured, 16 threads probing-then-inserting 15k fresh keys each: with writers
+;; unlocked, ~8.6k of 240k entries lost and no crash; with writers serialized and
+;; reads still unlocked, 240k of 240k, repeatably. Lost entries were the real bug
+;; (a vanished cell means the next lookup interns a fresh one and the previous
+;; root is gone), and serializing writers is the whole fix.
+;;
+;; This does NOT generalize to the weak-eq tables. Their adjust! (s/library.ss)
+;; relinks live cells in place with $set-tlc-next! while a reader may be walking
+;; them, and the reader is unsafe primitive code, so an unlocked read there hangs
+;; or faults. That is why those tables take locks (or go per-thread) and this one
+;; does not. Do not "unify" the two policies.
+;;
+;; Locking the single-key read would cost 70 -> 95 ns on a probe, on a path
+;; var-deref hits per var reference at an uncached site. It buys nothing here.
 ;;
 ;; Interning has to be atomic or two threads racing the same NEW name would each
 ;; get their own cell, and a def through one would be invisible through the other.
@@ -520,6 +538,22 @@
               (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f)))
                 (hashtable-set! var-table k c)
                 c))))))
+;; A whole-table scan is the one read that DOES need the lock, and for a different
+;; reason than a rehash: hashtable-keys/values read ht-size, allocate a
+;; zero-filled vector of that length, then walk the buckets bounded by both. A
+;; concurrent insert truncates the result; a concurrent remove-ns leaves trailing
+;; FILL slots, and every caller here immediately does (var-cell-ns c) on each
+;; element, which on a fill 0 is an error that takes down whatever was running.
+;; Measured: 3000 scans racing a grow/shrink writer produced 1.66M slots that were
+;; fill rather than entries.
+;;
+;; The lock covers only the snapshot. Callers iterate the returned vector outside
+;; it, so no caller's body (jolt-assoc, intern-ns!, the image walker) runs under
+;; the lock.
+(define (var-table-cells) (with-mutex var-table-mu (hashtable-values var-table)))
+(define (var-table-entries)
+  (with-mutex var-table-mu
+    (let-values (((ks vs) (hashtable-entries var-table))) (cons ks vs))))
 ;; non-creating lookup (resolve / find-var / ns-unmap): #f when absent, so a
 ;; probe never interns an empty cell.
 (define (var-cell-lookup ns name) (hashtable-ref var-table (string-append ns "/" name) #f))

@@ -124,7 +124,7 @@
       (apply jolt-vector (pset-fold x cons '()))
       (jolt-get x hc-kw-value)))
 (define (hc-map-pairs x)
-  (let ((kv (hashtable-ref rdr-map-order x #f)))
+  (let ((kv (rdr-map-order-ref x)))
     (if kv
         ;; reader-built map literal: emit pairs in SOURCE order (kv = k1 v1 k2 v2 …)
         ;; so the analyzer evaluates the values left-to-right.
@@ -380,7 +380,7 @@
           (let ((ns (var-cell-ns c)))
             (when (or (string=? ns cns) (string=? ns "clojure.core"))
               (set! acc (cons (var-cell-name c) acc))))))
-      (hashtable-values var-table))
+      (var-table-cells))
     (list->cseq acc)))
 
 (define (hc-intern! ctx ns-name nm) (declare-var! ns-name nm) jolt-nil)
