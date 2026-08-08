@@ -14,8 +14,12 @@
 ;;
 ;; This file provides the primitives; the higher-level dataflow API (mult, mix,
 ;; pub/sub, pipeline, map, merge, reduce, …) is a Clojure overlay over them.
-;; go/go-loop/thread are macros (mark-macro!) expanding to go-spawn. Loaded after
-;; concurrency.ss (reuses ms->duration). Requires a threaded Chez build.
+;; `thread` is a macro here (mark-macro!) expanding to thread-spawn. `go` and
+;; `go-loop` are NOT: they live in the overlay, because the CPS pass that decides
+;; a park's representation per site needs &env, macroexpand and resolve, which a
+;; Scheme expander over reader forms does not have. go-spawn — the runtime the
+;; overlay's fallback path emits — stays here. Loaded after concurrency.ss
+;; (reuses ms->duration). Requires a threaded Chez build.
 
 ;; --- buffers ----------------------------------------------------------------
 (define-record-type async-buffer (fields n kind) (nongenerative async-buffer-v1))
@@ -745,17 +749,15 @@
                               (else (finish (car res) (cdr res)))))))))))))))
 
 ;; --- macros (expander fns over the reader forms) ----------------------------
-(define cca-go-spawn-sym (jolt-symbol "clojure.core.async" "go-spawn"))
-(define cca-go-sym (jolt-symbol "clojure.core.async" "go"))
+;; go / go-loop are deliberately absent. They used to expand here, to a bare
+;; (go-spawn (fn* [] body…)), and the overlay's defmacro then redefined the same
+;; two vars — so which expansion a form got depended on whether the overlay had
+;; been loaded, and the native pair was dead in every configuration that matters
+;; (the loader drops clojure.core.async from loaded-ns precisely so a require
+;; always pulls the overlay). One definition now, in the overlay, where the CPS
+;; pass can reach &env / macroexpand / resolve.
 (define cca-fn*-sym (jolt-symbol #f "fn*"))
-(define cca-loop-sym (jolt-symbol #f "loop"))
 
-;; (go body...) -> (clojure.core.async/go-spawn (fn* [] body...))
-(define (cca-go-macro . body)
-  (jolt-list cca-go-spawn-sym (apply jolt-list cca-fn*-sym empty-pvec body)))
-;; (go-loop bindings body...) -> (go (loop bindings body...))
-(define (cca-go-loop-macro bindings . body)
-  (jolt-list cca-go-sym (apply jolt-list cca-loop-sym bindings body)))
 ;; (thread body...) — a real OS thread, ALWAYS: unlike go/go-loop it does NOT
 ;; honor *go-backend*, so a blocking body does not silently pin the fiber
 ;; carrier when a :fiber binding is in scope. thread is the documented escape
@@ -790,9 +792,26 @@
 (cca-def! "__offer!" jolt-async-offer!)
 ;; alts! entry point — handler-registration, not poll loop
 (cca-def! "__do-alts" jolt-async-do-alts)
-(cca-def! "go" cca-go-macro)           (mark-macro! "clojure.core.async" "go")
-(cca-def! "go-loop" cca-go-loop-macro) (mark-macro! "clojure.core.async" "go-loop")
 (cca-def! "thread" cca-thread-macro)   (mark-macro! "clojure.core.async" "thread")
+
+;; go / go-loop are defined by the overlay, but the primitives above pre-seed this
+;; namespace, so a bare (clojure.core.async/chan) resolves with no require and a
+;; bare (clojure.core.async/go …) would report "No such var" from a namespace that
+;; visibly exists. Reserve the two names with a stub that says what to do instead.
+;; NOT marked a macro, so the analyzer compiles the form as an ordinary call and
+;; the stub raises at run time; the overlay's defmacro replaces both roots and
+;; marks them. Same idiom natives-reader.ss uses for `letfn`.
+(let ((needs-overlay
+       (lambda (nm)
+         (lambda args
+           (jolt-throw
+            (jolt-ex-info
+             (string-append "clojure.core.async/" nm
+                            " is defined by the clojure.core.async overlay: "
+                            "(require '[clojure.core.async :refer [" nm "]]) first")
+             (jolt-hash-map)))))))
+  (cca-def! "go" (needs-overlay "go"))
+  (cca-def! "go-loop" (needs-overlay "go-loop")))
 
 ;; A channel is opaque, but it should still name itself: without these it fell to
 ;; the :object catch-all, so (class ch) was :object and pr printed #object[:object].
