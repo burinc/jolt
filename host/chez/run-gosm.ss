@@ -40,33 +40,33 @@
 
 ;; --- 1. the representation, on the expansion --------------------------------
 (printf "== 1. which representation the pass chose ==\n")
-(define (expand s) (ev (string-append "(pr-str (macroexpand '" s "))")))
+(define (go-expansion s) (ev (string-append "(pr-str (macroexpand '" s "))")))
 
-(define x-lex (expand "(go (<! ch))"))
+(define x-lex (go-expansion "(go (<! ch))"))
 (gate-check "lexical park -> __sm-spawn" (gate-sub? x-lex "__sm-spawn") #t)
 (gate-check "lexical park -> __sm-take" (gate-sub? x-lex "__sm-take") #t)
 
-(define x-none (expand "(go (+ 1 2))"))
+(define x-none (go-expansion "(go (+ 1 2))"))
 (gate-check "no park -> go-spawn" (gate-sub? x-none "go-spawn") #t)
 (gate-check "no park -> no __sm-" (gate-sub? x-none "__sm-") #f)
 
 ;; A park the pass cannot see stays on today's path: the whole body compiles as it
 ;; always did, and the park captures at run time.
-(define x-helper (expand "(go (helper ch))"))
+(define x-helper (go-expansion "(go (helper ch))"))
 (gate-check "park through a call -> go-spawn" (gate-sub? x-helper "go-spawn") #t)
 (gate-check "park through a call -> no __sm-" (gate-sub? x-helper "__sm-") #f)
 
 ;; alts! is out of scope this round — assert that plainly rather than leaving it
 ;; to be discovered.
-(define x-alts (expand "(go (alts! [ch]))"))
+(define x-alts (go-expansion "(go (alts! [ch]))"))
 (gate-check "alts! not rewritten (scoped out)" (gate-sub? x-alts "__sm-") #f)
 
 ;; A body whose recur targets the body fn itself: the pass changes that fn's
 ;; arity, so it declines the whole body.
-(define x-brecur (expand "(go (do (<! ch) (recur)))"))
+(define x-brecur (go-expansion "(go (do (<! ch) (recur)))"))
 (gate-check "recur on the body fn -> declined" (gate-sub? x-brecur "__sm-") #f)
 
-(define x-loop (expand "(go-loop [] (let [v (<! ch)] (when v (recur))))"))
+(define x-loop (go-expansion "(go-loop [] (let [v (<! ch)] (when v (recur))))"))
 (gate-check "go-loop park -> __sm-take" (gate-sub? x-loop "__sm-take") #t)
 
 ;; --- 2. the counters, on the :fiber backend ---------------------------------
