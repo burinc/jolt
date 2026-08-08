@@ -58,7 +58,7 @@
                      (hashtable-keys var-table)))
   (for-each (lambda (cr) (unless (eq? (var-cell-root (car cr)) (cdr cr))
                            (var-cell-root-set! (car cr) (cdr cr)))) zj-roots)
-  (zj-prune! ns-registry zj-ns-base)
+  (with-mutex ns-registry-mu (zj-prune! ns-registry zj-ns-base))  ; same rule as var-table (ns.ss)
   (zj-prune! type-registry zj-type-base)
   (hashtable-clear! ns-alias-table)
   (hashtable-clear! ns-refer-table)

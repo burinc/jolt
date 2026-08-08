@@ -202,13 +202,25 @@
 ;; writes a static field — clojure.spec.alpha's (set! (. clojure.lang.RT
 ;; checkSpecAsserts) flag) — lands here; the analyzer lowers the set! to a
 ;; set-static-field! call and a plain Class/member read consults the cell first.
+;; A set! of a mutable static runs at RUN time from any thread. Both
+;; check-then-creates go under one mutex: split, two threads setting different
+;; members of the same class each build their own inner table and one member's
+;; cell is dropped with it, so a later read of that member sees nil forever. The
+;; cell itself is a mutable vector whose slot is written outside the lock, which
+;; is a whole-value write and needs none — this only has to guarantee that both
+;; writers reach the SAME cell.
+(define mutable-statics-mu (make-mutex))
 (define mutable-statics-tbl (make-hashtable string-hash string=?))
 (define (mutable-static-cell class member create?)
-  (let ((h (or (hashtable-ref mutable-statics-tbl class #f)
-               (and create? (let ((nh (make-hashtable string-hash string=?)))
-                              (hashtable-set! mutable-statics-tbl class nh) nh)))))
-    (and h (or (hashtable-ref h member #f)
-               (and create? (let ((c (vector jolt-nil))) (hashtable-set! h member c) c))))))
+  (if create?
+      (with-mutex mutable-statics-mu
+        (let ((h (or (hashtable-ref mutable-statics-tbl class #f)
+                     (let ((nh (make-hashtable string-hash string=?)))
+                       (hashtable-set! mutable-statics-tbl class nh) nh))))
+          (or (hashtable-ref h member #f)
+              (let ((c (vector jolt-nil))) (hashtable-set! h member c) c))))
+      (let ((h (hashtable-ref mutable-statics-tbl class #f)))
+        (and h (hashtable-ref h member #f)))))
 (def-var! "jolt.host" "set-static-field!"
   (lambda (class member val)
     (vector-set! (mutable-static-cell class member #t) 0 val)

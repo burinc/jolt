@@ -65,7 +65,7 @@
                      (hashtable-keys var-table)))
   (for-each (lambda (cr) (unless (eq? (var-cell-root (car cr)) (cdr cr))
                            (var-cell-root-set! (car cr) (cdr cr)))) zj-roots)
-  (zj-prune! ns-registry zj-ns-base)
+  (with-mutex ns-registry-mu (zj-prune! ns-registry zj-ns-base))  ; same rule as var-table (ns.ss)
   (zj-prune! type-registry zj-type-base)
   ;; roll back the loader dedup — a row's require must reload for the next row,
   ;; since the vars it defined were just pruned from var-table

@@ -234,6 +234,145 @@
             ((equal? (deftype-ctor-tag (vector-ref tag-ctors i)) (tag-want i)) (loop (fx+ i 1)))
             (else #f))))
 
+;; --- 6. the multimethod tables ------------------------------------------------
+;; defmethod writes the methods table and bumps a global epoch; dispatch reads it
+;; and memoizes isa?-resolved values in a per-multifn cache that defmethod
+;; invalidates with hashtable-clear!. All of it used to be unlocked. Two
+;; properties, both of which failed before: every defmethod is still there at the
+;; end (racing inserts drop entries), and the whole-table scan mm-find-isa does
+;; never sees a FILL slot.
+(printf "\n== 6. concurrent defmethod while dispatching ==\n")
+(define mm-n 1500)
+(define mm-sym (jolt-symbol "t6" "mm"))
+(define mm-mf (jolt-defmulti-setup mm-sym (lambda (x) x)))
+(define mm-err 0)
+(define mm-err-mu (make-mutex))
+;; A sentinel registered BEFORE the threads start, and never in a definer's key
+;; range. mm-resolve finds it in the methods table directly and returns without
+;; touching mm-find-isa — which matters because this gate loads rt.ss only, so
+;; clojure.core's isa? is unbound and the isa? path would raise for reasons that
+;; have nothing to do with what is under test. Resolving a key that a definer has
+;; not written yet is exactly how that happened.
+(define mm-sentinel -1)
+(jolt-defmethod-setup mm-sym mm-sentinel (lambda (x) x))
+(ok "6. definers and dispatchers all finished"
+    (run-threads 8
+                 (lambda (t)
+                   (if (fx<? t 2)
+                       ;; two definers, disjoint key ranges so neither overwrites
+                       ;; the other's methods
+                       (let loop ((i 0))
+                         (when (fx<? i mm-n)
+                           (jolt-defmethod-setup mm-sym (+ (* t mm-n) i) (lambda (x) x))
+                           (loop (fx+ i 1))))
+                       (let loop ((r 0))
+                         (when (fx<? r 60)
+                           (guard (e (#t (with-mutex mm-err-mu (set! mm-err (+ mm-err 1)))))
+                             ;; the whole-table scan, concurrent with the inserts —
+                             ;; unlocked this reads FILL slots and jolt-assoc gets
+                             ;; a dispatch value of 0. (The isa? path is not driven
+                             ;; here: this gate loads rt.ss only, so clojure.core's
+                             ;; isa? / global-hierarchy are unbound. run-unit and
+                             ;; the corpus cover isa? dispatch with the overlay up.)
+                             (jolt-methods-setup mm-mf)
+                             (mm-resolve mm-mf mm-sentinel))
+                           (loop (fx+ r 1))))))
+                 120.0 "6. defmethod churn"))
+(ok "6. no dispatch raised" (= mm-err 0))
+(ok "6. every defmethod survived"
+    (let loop ((i 0) (missing 0))
+      (if (fx=? i (* 2 mm-n))
+          (= missing 0)
+          (loop (fx+ i 1)
+                (if (hashtable-ref (jolt-multifn-methods mm-mf) i #f) missing (+ missing 1))))))
+
+;; --- 7. the protocol registry -------------------------------------------------
+;; register-protocol-method builds type-registry's nested tables check-then-create
+;; and bumps jolt-proto-epoch, and find-method-any-protocol walks
+;; (hashtable-keys ti). The race is on a tag's FIRST registration — that is the
+;; only moment two threads can both find no inner table and each make one, with
+;; the second overwriting the first's protocol out of existence. So both definers
+;; walk the SAME fresh tags in lockstep under different protocol names, making
+;; every iteration a first registration for both of them. (An earlier version
+;; raced two protocols onto one shared tag and passed unfixed: it had exactly two
+;; contended instants in 1200 iterations.) Checked against the unfixed code: it
+;; loses a protocol on 2 of 3 runs, the same rate scenario 1 reproduces at.
+(printf "\n== 7. concurrent extend-type while resolving ==\n")
+(define pr-n 1500)
+(define pr-err 0)
+(define pr-err-mu (make-mutex))
+(define (pr-tag i) (string-append "t7.T" (number->string i)))
+(ok "7. registrars and resolvers all finished"
+    (run-threads 8
+                 (lambda (t)
+                   (if (fx<? t 2)
+                       (let loop ((i 0))
+                         (when (fx<? i pr-n)
+                           (register-protocol-method (pr-tag i)
+                                                     (string-append "P" (number->string t))
+                                                     "m" (lambda (x) x))
+                           (loop (fx+ i 1))))
+                       (let loop ((r 0))
+                         (when (fx<? r 400)
+                           (guard (e (#t (with-mutex pr-err-mu (set! pr-err (+ pr-err 1)))))
+                             ;; the whole-table scan over a type's protocols, while
+                             ;; those protocols are being inserted
+                             (find-method-any-protocol (pr-tag (fxmod r pr-n)) "m")
+                             (find-method-any-protocol-arity (pr-tag (fxmod r pr-n)) "m" 1))
+                           (loop (fx+ r 1))))))
+                 120.0 "7. extend churn"))
+(ok "7. no resolve raised" (= pr-err 0))
+(ok "7. neither definer's protocol was lost on any type"
+    (let loop ((i 0) (lost 0))
+      (if (fx=? i pr-n)
+          (= lost 0)
+          (loop (fx+ i 1)
+                (+ lost
+                   (if (find-protocol-method (pr-tag i) "P0" "m") 0 1)
+                   (if (find-protocol-method (pr-tag i) "P1" "m") 0 1))))))
+
+;; --- 8. the class graph and its derived caches --------------------------------
+;; jch-register-supers! read-modify-writes jvm-class-parents and invalidates two
+;; memo caches with hashtable-clear!; jch-known? built its table by publishing an
+;; EMPTY one and filling it afterwards, so a concurrent instance? read it mid-fill
+;; and got a definitive #f for a class the graph does model.
+(printf "\n== 8. concurrent class-graph registration while asking isa? ==\n")
+(define jch-n 800)
+(define jch-bad 0)
+(define jch-bad-mu (make-mutex))
+(define (jch-name i) (string-append "t8.C" (number->string i)))
+(ok "8. registrars and askers all finished"
+    (run-threads 8
+                 (lambda (t)
+                   (if (fx<? t 2)
+                       (let loop ((i 0))
+                         (when (fx<? i jch-n)
+                           (jch-register-supers! (jch-name i) (list "t8.Base"))
+                           (loop (fx+ i 1))))
+                       (let loop ((r 0))
+                         (when (fx<? r 200)
+                           ;; t8.Base is grafted by the very first registration, so
+                           ;; once it is known it must STAY known — a half-built
+                           ;; jch-known-cache is what made this flip back to #f
+                           (when (and (fx> r 20) (not (jch-known? "t8.Base")))
+                             (with-mutex jch-bad-mu (set! jch-bad (+ jch-bad 1))))
+                           (jch-closure (jch-name (fxmod r jch-n)))
+                           (jch-tags (jch-name (fxmod r jch-n)))
+                           (loop (fx+ r 1))))))
+                 120.0 "8. class-graph churn"))
+(ok "8. a known class never read back as unknown" (= jch-bad 0))
+(ok "8. every registration survived"
+    (let loop ((i 0))
+      (cond ((fx=? i jch-n) #t)
+            ((member "t8.Base" (jch-direct-supers (jch-name i))) (loop (fx+ i 1)))
+            (else #f))))
+;; and the ancestry the caches serve is the CURRENT one, not a pre-clear leftover
+(ok "8. the cached closure matches the live graph"
+    (let loop ((i 0))
+      (cond ((fx=? i jch-n) #t)
+            ((member "t8.Base" (jch-closure (jch-name i))) (loop (fx+ i 1)))
+            (else #f))))
+
 (printf "\nthread-safety-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "thread-safety-test: PASS — shared side-tables under concurrency\n") (exit 0))

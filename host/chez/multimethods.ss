@@ -47,6 +47,34 @@
 (define kw-default (keyword #f "default"))
 (define (new-mm-table) (make-hashtable key-hash jolt=))
 
+;; mm-tbl-mu serializes every MUTATION of every multifn's methods / prefers /
+;; cache tables, every WHOLE-TABLE scan of them, and the jolt-mm-epoch bump.
+;; Single-key reads stay unlocked, on the split rt.ss spells out for var-table:
+;; these are strong general hashtables, whose insert publishes a fully-formed
+;; list with one vector-set! and whose resize builds a complete new bucket vector
+;; before publishing it, so an unlocked reader walks consistent structure and the
+;; worst it can see is a stale miss. That matters here because the read is the
+;; dispatch path — mm-resolve's first act is a probe of the methods table — and a
+;; mutex there would sit on every multimethod call in the program.
+;;
+;; One mutex for all multifns rather than one per multifn: the writers are
+;; defmethod / prefer-method / remove-method, which run at definition time, and a
+;; per-multifn lock would mean a record field and a jolt-multifn-v3 UID for no
+;; measurable gain.
+;;
+;; Two things go wrong without this. Racing defmethods lose entries outright (the
+;; PR that added var-table-mu measured 8.6k of 240k lost on a strong table with
+;; unlocked writers), and a lost defmethod is a method that silently is not
+;; there. And the dispatch CACHE is invalidated by hashtable-clear!, so a resolve
+;; that began before a defmethod could publish its now-stale answer AFTER the
+;; clear and have every later dispatch read it — a wrong method rather than a
+;; stale miss. mm-resolve's publish re-checks the generation under the lock for
+;; exactly that.
+;;
+;; User code never runs under this mutex: mm-find-isa calls isa? / parents, and
+;; every caller resolves before it locks.
+(define mm-tbl-mu (make-mutex))
+
 ;; (defmulti-setup 'name dispatch & opts) — opts is a flat :default/:hierarchy plist.
 (define (parse-mm-opts opts)
   (let loop ((o opts) (dk kw-default) (h #f))
@@ -118,8 +146,9 @@
                         (deft (if (jolt-multifn? core) (jolt-multifn-default core) kw-default))
                         (m (make-jolt-multifn nm disp (new-mm-table) deft #f (new-mm-table) (new-mm-table) -1 #f)))
                    (def-var! mns nm m) m))))
-    (hashtable-set! (jolt-multifn-methods mf) (mm-dispatch-val-canon dval) impl)
-    (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1))
+    (with-mutex mm-tbl-mu
+      (hashtable-set! (jolt-multifn-methods mf) (mm-dispatch-val-canon dval) impl)
+      (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1)))
     mf))
 
 ;; --- dispatch ----------------------------------------------------------------
@@ -158,8 +187,13 @@
   (let* ((methods (jolt-multifn-methods mf))
          (isa? (mm-isa? mf))
          (default (jolt-multifn-default mf))
+         ;; a whole-table scan, so it takes the lock like every other one: keys
+         ;; reads ht-size, allocates a vector of that length and walks the buckets
+         ;; bounded by both, so a concurrent defmethod truncates the result and a
+         ;; concurrent remove-method leaves trailing FILL slots — which then go to
+         ;; jolt= as dispatch values. The isa? scan below runs OUTSIDE the lock.
          (keys (filter (lambda (k) (not (jolt= k default)))
-                       (vector->list (hashtable-keys methods))))
+                       (vector->list (with-mutex mm-tbl-mu (hashtable-keys methods)))))
          (matches (filter (lambda (k) (isa? dv k)) keys)))
     (cond
       ((null? matches) #f)
@@ -207,13 +241,20 @@
       (else h))))
 
 ;; drop the whole cache if the epoch advanced or the hierarchy value changed.
+;; The check is re-run under the lock: the clear and the two stamp writes have to
+;; be one step, or two threads noticing the same invalidation can interleave a
+;; clear between the other's clear and its stamp, leaving the cache stamped
+;; current while an entry from the previous generation survives.
 (define (mm-cache-validate! mf)
   (let ((hier (mm-current-hierarchy mf)))
     (unless (and (fx= (jolt-multifn-cache-epoch mf) jolt-mm-epoch)
                  (eq? (jolt-multifn-cache-hier mf) hier))
-      (hashtable-clear! (jolt-multifn-cache mf))
-      (jolt-multifn-cache-epoch-set! mf jolt-mm-epoch)
-      (jolt-multifn-cache-hier-set! mf hier))))
+      (with-mutex mm-tbl-mu
+        (unless (and (fx= (jolt-multifn-cache-epoch mf) jolt-mm-epoch)
+                     (eq? (jolt-multifn-cache-hier mf) hier))
+          (hashtable-clear! (jolt-multifn-cache mf))
+          (jolt-multifn-cache-epoch-set! mf jolt-mm-epoch)
+          (jolt-multifn-cache-hier-set! mf hier))))))
 
 ;; resolve dv to its method fn. An exact table hit is always current (defmethod /
 ;; remove mutate that table and bump the epoch), so it bypasses the cache. On a
@@ -228,9 +269,24 @@
           (mm-cache-validate! mf)
           (let ((cache (jolt-multifn-cache mf)))
             (or (hashtable-ref cache dv #f)
-                (let ((m (or (mm-find-isa mf dv)
-                             (hashtable-ref methods (jolt-multifn-default mf) #f))))
-                  (when m (hashtable-set! cache dv m))
+                ;; Read the generation we are about to resolve against BEFORE
+                ;; resolving, then publish only if it is still the one the cache
+                ;; is stamped with. Without that, a resolve which started before a
+                ;; defmethod can land its stale answer after mm-cache-validate!
+                ;; cleared the table, and every later dispatch reads it — a wrong
+                ;; method, not a stale miss, and it never expires because the
+                ;; stamp already says current. mm-find-isa runs OUTSIDE the lock:
+                ;; it calls isa? / parents, which is user code.
+                (let* ((epoch jolt-mm-epoch)
+                       (hier (mm-current-hierarchy mf))
+                       (m (or (mm-find-isa mf dv)
+                              (hashtable-ref methods (jolt-multifn-default mf) #f))))
+                  (when m
+                    (with-mutex mm-tbl-mu
+                      (when (and (fx= epoch jolt-mm-epoch)
+                                 (fx= (jolt-multifn-cache-epoch mf) epoch)
+                                 (eq? (jolt-multifn-cache-hier mf) hier))
+                        (hashtable-set! cache dv m))))
                   m)))))))
 
 (define (mm-no-method mf dv)
@@ -281,27 +337,34 @@
   (when (jolt-multifn? mf)
     ;; a preference b-over-a (direct or transitive) makes a-over-b a conflict, as
     ;; in Clojure MultiFn.preferMethod.
+    ;; the conflict check calls parents (user code), so it stays outside the lock
     (when (mm-prefers? mf dval-b dval-a)
       (throw-jvm (quote IllegalStateException)
                  (string-append "Preference conflict in multimethod '" (jolt-multifn-name mf)
                                 "': " (jolt-pr-str dval-b) " is already preferred to " (jolt-pr-str dval-a))))
-    (let ((sub (or (hashtable-ref (jolt-multifn-prefers mf) dval-a #f)
-                   (let ((h (new-mm-table)))
-                     (hashtable-set! (jolt-multifn-prefers mf) dval-a h) h))))
-      (hashtable-set! sub dval-b #t))
-    (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1)))
+    (with-mutex mm-tbl-mu
+      ;; the sub-table lookup and its insert are one step: two threads preferring
+      ;; different pairs under the same dval-a would otherwise each build a fresh
+      ;; sub-table and one of the preferences would be dropped with it.
+      (let ((sub (or (hashtable-ref (jolt-multifn-prefers mf) dval-a #f)
+                     (let ((h (new-mm-table)))
+                       (hashtable-set! (jolt-multifn-prefers mf) dval-a h) h))))
+        (hashtable-set! sub dval-b #t))
+      (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1))))
   mf)
 
 (define (jolt-remove-method-setup mf dval)
   (when (jolt-multifn? mf)
-    (hashtable-delete! (jolt-multifn-methods mf) dval)
-    (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1)))
+    (with-mutex mm-tbl-mu
+      (hashtable-delete! (jolt-multifn-methods mf) dval)
+      (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1))))
   mf)
 
 (define (jolt-remove-all-methods-setup mf)
   (when (jolt-multifn? mf)
-    (hashtable-clear! (jolt-multifn-methods mf))
-    (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1)))
+    (with-mutex mm-tbl-mu
+      (hashtable-clear! (jolt-multifn-methods mf))
+      (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1))))
   mf)
 
 (define (jolt-get-method-setup mf dval)
@@ -314,9 +377,17 @@
           jolt-nil)
       jolt-nil))
 
+;; Whole-table scans, so they snapshot under the lock and build the jolt map
+;; outside it. hashtable-entries reads ht-size, allocates two vectors of that
+;; length and walks the buckets bounded by both, so a concurrent defmethod
+;; truncates the result and a concurrent remove-method leaves trailing FILL slots
+;; — which would reach jolt-assoc as a dispatch value of 0.
 (define (jolt-methods-setup mf)
   (if (jolt-multifn? mf)
-      (let-values (((ks vs) (hashtable-entries (jolt-multifn-methods mf))))
+      (let* ((kv (with-mutex mm-tbl-mu
+                   (let-values (((ks vs) (hashtable-entries (jolt-multifn-methods mf))))
+                     (cons ks vs))))
+             (ks (car kv)) (vs (cdr kv)))
         (let loop ((i 0) (m (jolt-hash-map)))
           (if (fx>=? i (vector-length ks)) m
               (loop (fx+ i 1) (jolt-assoc m (vector-ref ks i) (vector-ref vs i))))))
@@ -324,14 +395,20 @@
 
 (define (jolt-prefers-setup mf)
   (if (not (jolt-multifn? mf)) (jolt-hash-map)
-      (let-values (((ks vs) (hashtable-entries (jolt-multifn-prefers mf))))
+      ;; the inner sub-tables are snapshotted in the SAME critical section: a
+      ;; prefer-method landing between the outer scan and an inner one would
+      ;; otherwise be read mid-insert.
+      (let* ((kv (with-mutex mm-tbl-mu
+                   (let-values (((ks vs) (hashtable-entries (jolt-multifn-prefers mf))))
+                     (cons ks (vector-map (lambda (sub) (hashtable-keys sub)) vs)))))
+             (ks (car kv)) (subs (cdr kv)))
         (let loop ((i 0) (m (jolt-hash-map)))
           (if (fx>=? i (vector-length ks)) m
               ;; each value is an inner set of preferred-over keys -> a jolt set
               (loop (fx+ i 1)
                     (jolt-assoc m (vector-ref ks i)
                                 (apply jolt-hash-set
-                                       (vector->list (hashtable-keys (vector-ref vs i)))))))))))
+                                       (vector->list (vector-ref subs i))))))))))
 
 ;; Print a multifn like the JVM's #object[clojure.lang.MultiFn 0x… "name"] rather
 ;; than dumping the record's fields (methods table, hierarchy, cache, …).
