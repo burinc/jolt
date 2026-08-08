@@ -19,6 +19,18 @@
 (define (jolt-some? x) (not (jolt-nil-t? x)))
 
 ;; --- truthiness: only nil and false are falsey -------------------------------
+;; A fiber park is a continuation escape that is NOT an exit — the computation
+;; resumes where it left off. try/finally lowers to dynamic-wind, so its
+;; after-thunk fires on that escape and would run the cleanup mid-operation: a
+;; with-open closing a file that is still in use, a lock released while still
+;; held. The emitted after-thunk therefore asks this predicate first and skips
+;; the finally while a park is unwinding. The Chez fiber scheduler installs the
+;; real one (per-carrier, off a virtual register); on a host with no fibers it
+;; stays #f and finally runs exactly as before. It must NOT be true for any other
+;; escape — an interrupt abort is a real exit and its finally has to run.
+(define jolt-park-unwinding?-hook (lambda () #f))
+(define (jolt-park-unwinding?) (jolt-park-unwinding?-hook))
+
 (define (jolt-truthy? x) (not (or (jolt-nil? x) (eq? x #f))))
 
 ;; --- keywords: interned so identity works; optional namespace ----------------

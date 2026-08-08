@@ -200,10 +200,16 @@
 (printf "\n== 6a. N fiber-takers, M thread-putters: exactly once ==\n")
 (define N6 6)
 (define M6 6)
+;; Collected under a mutex. 6b's collectors are real OS THREADS, and an
+;; unsynchronized (set! log (cons v log)) is a read-modify-write: two threads can
+;; interleave and drop a value, which showed up as a rare "every value delivered
+;; exactly once" failure under full-gate CPU contention while passing in
+;; isolation. The bug was in the TEST, not the protocol.
+(define log-mu (make-mutex))
 (define log6 '())
 (define ch6 (jolt-async-chan))
 (define fs6
-  (spawn-n N6 (lambda (i) (sa-fiber-spawn (lambda () (set! log6 (cons (jolt-fiber-<! ch6) log6)))))))
+  (spawn-n N6 (lambda (i) (sa-fiber-spawn (lambda () (let ((v (jolt-fiber-<! ch6))) (with-mutex log-mu (set! log6 (cons v log6)))))))))
 (sa-fiber-run-all)
 (ok "6a. all fiber-takers parked" (all? (lambda (f) (eq? (jolt-fiber-state f) 'parked)) fs6))
 (define p6 jolt-fiber-chan-parks)
@@ -229,7 +235,7 @@
 (define ch6b (jolt-async-chan))
 (spawn-n M6 (lambda (i)
               (fork-thread (lambda ()
-                             (set! log6b (cons (jolt-async-take ch6b) log6b))
+                             (let ((v (jolt-async-take ch6b))) (with-mutex log-mu (set! log6b (cons v log6b))))
                              (vector-set! t6b-done i #t)))))
 (define fs6b
   (spawn-n N6 (lambda (i) (sa-fiber-spawn (lambda () (jolt-fiber->! ch6b (+ 200 i)))))))

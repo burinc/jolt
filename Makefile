@@ -223,10 +223,15 @@ values:
 # loads rt.ss for the real thread parameters).
 # fibers-chan-test.ss is the R3 waiter-protocol gate (fiber <! / >! over the
 # existing channel handlers; loads rt.ss for the real async.ss channels).
+# fibers-go-test.ss is the R4 gate (epic jolt-nvpr.5): go on fibers via the
+# *go-backend* opt-in (sections 1-3 through the compiler), and alts! as a wait
+# set (sections 4-7 through the host seam; the :default check loads the
+# overlay).
 fibers:
 	@$(CHEZ) --script test/chez/fibers-test.ss
 	@$(CHEZ) --script test/chez/fibers-state-test.ss
 	@$(CHEZ) --script test/chez/fibers-chan-test.ss
+	@$(CHEZ) --script test/chez/fibers-go-test.ss
 
 # Corpus conformance vs JVM-sourced expecteds (allowlist + floor).
 corpus:

@@ -1359,8 +1359,12 @@
 ;; (jolt-throw = Scheme `raise` of a &jolt-throw condition); catch lowers to
 ;; `guard`, whose raw binding is unwrapped via jolt-unwrap-throw so the catch var
 ;; receives the jolt value (preserving ex-data/ex-message and the backtrace
-;; identity tag). finally lowers to `dynamic-wind`'s after-thunk (runs on
-;; success, catch and escape — Clojure finally semantics). Both keys optional.
+;; identity tag). finally lowers to `dynamic-wind`'s after-thunk, guarded by
+;; jolt-park-unwinding?: it runs on success, on catch and on a real escape, but
+;; NOT while a fiber park is unwinding. A park is not an exit — the computation
+;; resumes — so running the finally there would close a file still in use. Every
+;; other escape, an interrupt abort included, is an exit and still runs it.
+;; Both keys optional.
 (defn- emit-try [node]
   (let [core (if-let [cs (:catch-sym node)]
                (let [raw (munge-name (:catch-raw-sym node))
@@ -1383,7 +1387,8 @@
                  body)
                (emit (:body node)))]
     (if-let [fin (:finally node)]
-      (str "(dynamic-wind (lambda () #f) (lambda () " core ") (lambda () " (emit fin) "))")
+      (str "(dynamic-wind (lambda () #f) (lambda () " core ")"
+           " (lambda () (if (jolt-park-unwinding?) #f " (emit fin) ")))")
       core)))
 
 ;; Does this IR node emit to an expression that yields a Scheme boolean? Used to

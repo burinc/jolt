@@ -71,7 +71,7 @@
                 v)
               (begin
                 (mutex-release (async-chan-mu ch))
-                (jolt-fiber-waiter-wait! h))))
+                (vector-ref (jolt-fiber-waiter-wait! h) 1))))
         (begin
           (mutex-release (async-chan-mu ch))
           r))))
@@ -90,16 +90,83 @@
          (async-chan-alt-putters-set! ch
            (append (async-chan-alt-putters ch) (list (cons h v))))
          (ac-notify! ch)
-         (if (vector-ref (alt-handler-mailbox h) 0)
-             (let ((ok (vector-ref (alt-handler-mailbox h) 1)))
-               (mutex-release (async-chan-mu ch))
-               ok)
-             (begin
-               (mutex-release (async-chan-mu ch))
-               (jolt-fiber-waiter-wait! h))))))))
+           (if (vector-ref (alt-handler-mailbox h) 0)
+               (let ((ok (vector-ref (alt-handler-mailbox h) 1)))
+                 (mutex-release (async-chan-mu ch))
+                 ok)
+              (begin
+                (mutex-release (async-chan-mu ch))
+                (vector-ref (jolt-fiber-waiter-wait! h) 1))))))))
 
 ;; The fiber wakeup strategy — alt-deliver! dispatches through this hook so
 ;; async.ss (loaded before fibers.ss) never forward-references a fiber
 ;; primitive. Installed here, after both files are loaded; no channel op can
 ;; run before the boot finishes loading, so the hook is always live in use.
 (set! jolt-fiber-wake-fn sa-fiber-resume)
+
+;; --- R4: go on fibers, and alts! as a wait set (epic jolt-nvpr.5) -------------
+;;
+;; jolt-fiber-go-spawn is the :fiber backend of clojure.core.async/go-spawn
+;; (the dispatcher lives in async.ss; thread stays the :thread backend). It
+;; spawns the body as a fiber on the R4 carrier — the one OS thread that loops
+;; sa-fiber-run-all and parks on the run-queue condition when it drains
+;; (fibers.ss). Parking inside the body works ACROSS function boundaries,
+;; which the JVM's state-machine go structurally cannot do: any <! / >! the
+;; body (or a function it calls) hits dispatches through the <! / >! redefs
+;; below to jolt-fiber-<! / jolt-fiber->!, which park the fiber via the R3
+;; handler protocol.
+
+;; (jolt-fiber-go-spawn thunk) -> buffered(1) channel. Conveys the parent's
+;; dynamic slice (sa-fiber-spawn reads the spawner's bindings; *txn* is never
+;; conveyed — a child spawned inside a dosync cannot join the parent's txn,
+;; the same rule async-go-spawn-thread enforces for threads).
+(define (jolt-fiber-go-spawn thunk)
+  (let ((w (ac-make 1 'fixed #f)))
+    (sa-fiber-spawn
+     (lambda ()
+       (*txn* #f)
+       (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
+         (if (car r)
+             (when (not (jolt-nil? (cdr r))) (jolt-async-give w (cdr r)))
+             (async-report-uncaught! "go/fiber body (channel closed)" (cdr r)))
+         (jolt-async-close! w))))
+    (jolt-fiber-ensure-carrier!)
+    w))
+
+;; The R3 park, generalized to return the handler's mailbox (value + port) —
+;; the alts! fiber await needs the port; <! / >! need only the value.
+;; Contract unchanged otherwise: call with the channel mutex RELEASED; the
+;; commit-to-park decision is atomic with alt-deliver!'s mailbox write.
+(define (jolt-fiber-waiter-wait! h)
+  (let ((f (jolt-current-fiber)))
+    (unless f
+      (error 'jolt-fiber-waiter-wait! "channel wait outside a fiber"))
+    (let ((park?
+           (with-mutex (alt-handler-wmu h)
+             (if (vector-ref (alt-handler-mailbox h) 0)
+                 #f
+                 (begin (jolt-fiber-state-set! f 'parked) #t)))))
+      (when park?
+        (set! jolt-fiber-chan-parks (+ jolt-fiber-chan-parks 1))
+        (jolt-fiber-to-scheduler! f))
+      (alt-handler-mailbox h))))
+
+;; The fiber alts! await: park on the already-registered shared handler and
+;; return [val port]. Registered by async.ss's __do-alts with wake = the
+;; fiber, so alt-deliver! resumes the fiber; this is the mirror of the thread
+;; waiter's condition-wait on the same mailbox.
+(define (jolt-fiber-alt-await h)
+  (let ((mb (jolt-fiber-waiter-wait! h)))
+    (jolt-vector (vector-ref mb 1) (vector-ref mb 2))))
+
+;; <! / >! dispatch on "am I on a fiber?" — the vreg read (R0's 2ns dispatch).
+;; On a fiber they park (the R3 primitives); on a plain thread they are the
+;; blocking ops of today, so :thread-backend go bodies (real threads) and any
+;; <! on a bare thread are byte-for-byte unchanged. <!! / >!! are NOT redefined
+;; here: inside a fiber they keep blocking the carrier (R4 keeps that, R5 owns
+;; the decision).
+(cca-def! "<!" (lambda (ch) (if (jolt-current-fiber) (jolt-fiber-<! ch) (jolt-async-take ch))))
+(cca-def! ">!" (lambda (ch v) (if (jolt-current-fiber) (jolt-fiber->! ch v) (jolt-async-give ch v))))
+
+;; Install the alts! fiber-await hook (see async.ss).
+(set! jolt-fiber-alt-await-fn jolt-fiber-alt-await)
