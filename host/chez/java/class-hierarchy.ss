@@ -15,14 +15,31 @@
 
 ;; canonical-name -> list of direct super canonical-names. Mutable + extensible.
 (define jvm-class-parents (make-hashtable string-hash string=?))
-;; closure cache, invalidated whenever the graph is extended.
+;; closure cache, invalidated whenever the graph is extended. A Chez hashtable
+;; corrupts under concurrent WRITES (the damage surfaces later inside the
+;; collector, never as an error naming the table), and these two are memo caches on
+;; the protocol-dispatch path, so every thread that dispatches fills them. The
+;; misses are what write, and a miss happens once per class name: read lock-free,
+;; then insert under the mutex the invalidating clear already holds. Steady state
+;; is pure reads, so this costs nothing once warm.
 (define jch-cache-mutex (make-mutex))
 (define jch-closure-cache (make-hashtable string-hash string=?))
 (define jch-tags-cache (make-hashtable string-hash string=?))
+(define (jch-cache-put! ht k v)
+  (with-mutex jch-cache-mutex (hashtable-set! ht k v))
+  v)
+
+;; Bumped on every change to the graph, so a caller that derives a per-type answer
+;; from it can cache that answer and revalidate with one fixnum compare instead of
+;; re-walking (jrdesc-ifc-of, records.ss). A deftype gains interfaces after its
+;; descriptor exists, and can gain more later through extend-type.
+(define jch-graph-epoch 0)
+(define (jch-bump-epoch!) (set! jch-graph-epoch (fx+ jch-graph-epoch 1)))
 
 ;; Merge direct supers for a class (union with any already registered). Public so
 ;; libraries can graft their own classes onto the modeled hierarchy.
 (define (jch-register-supers! name supers)
+  (jch-bump-epoch!)
   (let ((cur (hashtable-ref jvm-class-parents name '())))
     (hashtable-set! jvm-class-parents name
                     (let add ((ss supers) (acc cur))
@@ -49,6 +66,7 @@
 ;; Replace a class's direct supers outright (defrecord re-declares the row its
 ;; deftype half registered). Same cache invalidation as a register.
 (define (jch-set-supers! name supers)
+  (jch-bump-epoch!)
   (hashtable-set! jvm-class-parents name supers)
   (with-mutex jch-cache-mutex
     (hashtable-clear! jch-closure-cache)
@@ -66,8 +84,7 @@
                      ((member (car pending) seen) (loop (cdr pending) seen))
                      (else (loop (append (jch-direct-supers (car pending)) (cdr pending))
                                  (cons (car pending) seen)))))))
-        (hashtable-set! jch-closure-cache name result)
-        result)))
+        (jch-cache-put! jch-closure-cache name result))))
 
 ;; ns segment munging for a JVM-spelled class name: dashes become underscores
 ;; (clojure.core-test.x -> clojure.core_test.x).
@@ -98,8 +115,7 @@
                            (acc2 (if (or (string=? simple fqn) (member simple acc1))
                                      acc1 (cons simple acc1))))
                       (build (cdr cs) acc2))))))
-        (hashtable-set! jch-tags-cache name result)
-        result)))
+        (jch-cache-put! jch-tags-cache name result))))
 
 ;; Is WANTED (canonical or simple) the class CHILD (canonical) or one of its
 ;; ancestors? Object is every class's root. Matched by full name or last segment so
@@ -115,40 +131,57 @@
 
 ;; Does the graph model WANTED at all (as a class or as any class's ancestor)? Used
 ;; by instance? to decide between a definitive #f and 'pass (defer to other arms).
+;; Built into a LOCAL table and published with one store, rather than assigned
+;; empty and then filled: a concurrent reader must never see a half-built table
+;; (it would answer "not modeled" for a class that is), and two threads filling
+;; one shared table is the write-vs-write case a Chez hashtable does not survive.
+;; Two threads may each build one; both are complete, so whichever publishes last
+;; is correct.
 (define jch-known-cache #f)
-(define (jch-known? wanted)
-  (when (not jch-known-cache)
-    (set! jch-known-cache (make-hashtable string-hash string=?))
+(define (jch-build-known-cache)
+  (let ((ht (make-hashtable string-hash string=?)))
     (let-values (((keys vals) (hashtable-entries jvm-class-parents)))
       (vector-for-each
        (lambda (k supers)
-         (hashtable-set! jch-known-cache k #t)
-         (hashtable-set! jch-known-cache (jch-last-segment k) #t)
+         (hashtable-set! ht k #t)
+         (hashtable-set! ht (jch-last-segment k) #t)
          (for-each (lambda (s)
-                     (hashtable-set! jch-known-cache s #t)
-                     (hashtable-set! jch-known-cache (jch-last-segment s) #t))
+                     (hashtable-set! ht s #t)
+                     (hashtable-set! ht (jch-last-segment s) #t))
                    supers))
-       keys vals)))
-  (or (hashtable-ref jch-known-cache wanted #f)
-      (hashtable-ref jch-known-cache (jch-last-segment wanted) #f)))
+       keys vals))
+    ht))
+(define (jch-known? wanted)
+  (let ((ht (or jch-known-cache
+                (let ((built (jch-build-known-cache)))
+                  (set! jch-known-cache built)
+                  built))))
+    (or (hashtable-ref ht wanted #f)
+        (hashtable-ref ht (jch-last-segment wanted) #f))))
 
 ;; simple last-segment -> canonical FQN for a modeled class (first registered
 ;; wins). Lets a simple exception name (from chez-condition-exc-class) resolve to
 ;; its graph key so the exception hierarchy answers through the one graph.
 (define jch-simple->fqn-cache #f)
-(define (jch-fqn-of-simple name)
-  (when (not jch-simple->fqn-cache)
-    (set! jch-simple->fqn-cache (make-hashtable string-hash string=?))
+(define (jch-build-simple->fqn-cache)
+  (let ((ht (make-hashtable string-hash string=?)))
     (let-values (((keys vals) (hashtable-entries jvm-class-parents)))
       (vector-for-each
        (lambda (k supers)
          (for-each (lambda (n)
                      (let ((seg (jch-last-segment n)))
-                       (when (not (hashtable-ref jch-simple->fqn-cache seg #f))
-                         (hashtable-set! jch-simple->fqn-cache seg n))))
+                       (when (not (hashtable-ref ht seg #f))
+                         (hashtable-set! ht seg n))))
                    (cons k supers)))
-       keys vals)))
-  (or (hashtable-ref jch-simple->fqn-cache name #f) name))
+       keys vals))
+    ht))
+;; Built-then-published, for the reason given at jch-known-cache.
+(define (jch-fqn-of-simple name)
+  (let ((ht (or jch-simple->fqn-cache
+                (let ((built (jch-build-simple->fqn-cache)))
+                  (set! jch-simple->fqn-cache built)
+                  built))))
+    (or (hashtable-ref ht name #f) name)))
 
 ;; A register also invalidates the derived caches.
 (define jch-register-supers!-inner jch-register-supers!)
@@ -186,7 +219,7 @@
             "clojure.lang.IExceptionInfo" "clojure.lang.IReduceInit"
             "java.util.List" "java.util.Set" "java.util.Collection" "java.util.Map"
             "java.util.Iterator" "java.lang.Iterable" "java.lang.CharSequence"
-            "java.lang.Comparable" "java.lang.Runnable"
+            "java.lang.Appendable" "java.lang.Comparable" "java.lang.Runnable"
             "java.util.concurrent.Callable" "java.io.Serializable"))
 
 ;; ---- seed the built-in graph: direct supers only, faithful to the JVM ---------
@@ -335,7 +368,10 @@
 (jch-register-supers! "java.io.FileWriter" '("java.io.OutputStreamWriter"))
 (jch-register-supers! "java.io.InputStreamReader" '("java.io.Reader"))
 (jch-register-supers! "java.io.StringWriter" '("java.io.Writer"))
-(jch-register-supers! "java.lang.StringBuilder" '())
+;; StringBuilder is a CharSequence and an Appendable, which is what lets count/seq/
+;; nth and the regex entry points take one the way they take a String.
+(jch-register-supers! "java.lang.StringBuilder" '("java.lang.CharSequence" "java.lang.Appendable"))
+(jch-register-supers! "java.lang.Appendable" '())
 (jch-register-supers! "java.util.StringTokenizer" '())
 (jch-register-supers! "java.nio.charset.Charset" '())
 (jch-register-supers! "java.util.Base64" '())

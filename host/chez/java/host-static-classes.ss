@@ -165,6 +165,12 @@
                                    (e (if (null? rest) (string-length cur) (jnum->exact (car rest)))))
                               (sb-range-check cur s e)
                               (substring cur s e))))
+        ;; CharSequence.subSequence — AbstractStringBuilder returns substring(a, b),
+        ;; i.e. a String, which is itself a CharSequence.
+        (cons "subSequence" (lambda (self a b)
+                              (let* ((cur (sb-str self)) (s (jnum->exact a)) (e (jnum->exact b)))
+                                (sb-range-check cur s e)
+                                (substring cur s e))))
         (cons "indexOf" (lambda (self needle . rest)
                           (->num (str-index-of (sb-str self) (render-piece needle)
                                                (if (null? rest) 0 (jnum->exact (car rest)))))))
@@ -207,7 +213,23 @@
                           self))))
 ;; (str sb) / print a StringBuilder -> its accumulated content, like the JVM
 ;; (str calls toString). Without this str renders the opaque host object.
-(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "string-builder"))) sb-str)
+(define (sb-jhost? x) (and (jhost? x) (string=? (jhost-tag x) "string-builder")))
+(register-str-render! sb-jhost? sb-str)
+;; A StringBuilder IS a java.lang.CharSequence, so it answers (class …),
+;; instance? through the class graph, and the three RT entry points that name a
+;; CharSequence — count is its length, seq walks its characters, nth reads one.
+;; Without the class arm (class sb) leaked the :object placeholder.
+(register-class-arm! sb-jhost? (lambda (x) "java.lang.StringBuilder"))
+;; An array class reaches instance-check as a raw string ("[C"), not a symbol, and
+;; this arm is newer than the base taxonomy so it is asked first — hence the
+;; symbol-t? guard before reading the name.
+(register-instance-check-arm!
+  (lambda (type-sym val)
+    (if (and (sb-jhost? val) (symbol-t? type-sym))
+        (jch-isa? "java.lang.StringBuilder" (symbol-t-name type-sym))
+        'pass)))
+(register-count-arm! sb-jhost? (lambda (x) (string-length (sb-str x))))
+(register-seq-arm! sb-jhost? (lambda (x) (jolt-seq (sb-str x))))
 
 ;; ---- StringWriter -----------------------------------------------------------
 ;; Writer.write(int) writes the CHAR for that code; append(char) appends the char.
@@ -1946,11 +1968,17 @@
 ;; base jolt-nth is the only way nth reaches these shims. See the note by
 ;; register-count-arm! in collections.ss — jolt-nth's migration to an arm
 ;; registry is deferred until it gets its own bench guard.
+;; A StringBuilder rides the same wrap: RT.nth reads a CharSequence by charAt, and
+;; delegating its content string reuses the base nth's own bounds reporting.
 (define %shim-nth jolt-nth)
+(define (shim-nth-target coll)
+  (cond ((al-family? coll) (list->cseq (al->list coll)))
+        ((sb-jhost? coll) (sb-str coll))
+        (else coll)))
 (set! jolt-nth
   (case-lambda
-    ((coll i) (if (al-family? coll) (%shim-nth (list->cseq (al->list coll)) i) (%shim-nth coll i)))
-    ((coll i d) (if (al-family? coll) (%shim-nth (list->cseq (al->list coll)) i d) (%shim-nth coll i d)))))
+    ((coll i) (%shim-nth (shim-nth-target coll) i))
+    ((coll i d) (%shim-nth (shim-nth-target coll) i d))))
 (def-var! "clojure.core" "nth" jolt-nth)
 
 ;; --- java.nio.charset ---------------------------------------------------------

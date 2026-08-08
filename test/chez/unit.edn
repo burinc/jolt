@@ -1589,4 +1589,9 @@
   ;; Wider than the JVM's 16-bit char by design, hence a unit row not a corpus
   ;; one. Surrogates are not scalar values and stay rejected.
   {:suite "char / code points" :expr "[(int (char 65)) (int (char 128515)) (int (first (str (char 128515)))) (try (char 55296) (catch Exception e (ex-message e))) (try (char 1114112) (catch Exception e (ex-message e)))]" :expected "[65 128515 128515 \"Value out of range for char: 55296\" \"Value out of range for char: 1114112\"]"}
+  ;; The same model seen from the string side: an astral character is ONE element,
+  ;; so there is no surrogate half to index out. A JVM string holds two code units
+  ;; here, which is why a parser test that expects a lone surrogate to be rejected
+  ;; cannot pass — see the :string-model entry in known-divergences.edn.
+  {:suite "string / surrogate halves" :expr "(let [c (str (char 128169))] [(count c) (int (first c)) (nil? (second c)) (= c (str (first c)))])" :expected "[1 128169 true true]"}
 ]

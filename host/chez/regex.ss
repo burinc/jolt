@@ -108,7 +108,7 @@
                 (loop (- i 1) (cons (if s s jolt-nil) acc))))))))
 
 (define (jolt-re-matches re s)
-  (let* ((s (jolt-need-str s))
+  (let* ((s (rx-charseq->string s))
          (m (irregex-match (regex-t-irx (jolt-re-pattern re)) s)))
     (if m (irx-result m) jolt-nil)))
 
@@ -119,17 +119,24 @@
 (define-record-type matcher-t
   (fields irx str (mutable pos) (mutable last))
   (nongenerative jolt-matcher-v1))
-;; The regex entry points take a CharSequence on the JVM, not just a String, and a
-;; library that wants to match over a WINDOW of a larger string passes its own
+;; EVERY regex entry point takes a CharSequence on the JVM, not just a String, and
+;; a library matching over a WINDOW of a larger string passes its own
 ;; implementation rather than copying — instaparse's Segment is a deftype with
 ;; length/charAt/subSequence/toString. irregex works on Scheme strings, so realize
-;; one through the type's own toString. A value that is not a CharSequence is
-;; handed through untouched, so it still fails where it would have.
+;; one: a deftype through jrec-charseq->string (records.ss), a host CharSequence
+;; (StringBuilder, StringWriter) through the str registry that already renders its
+;; content for (str sb). Anything that is not a CharSequence gets the cast error it
+;; would have got from jolt-need-str. Forward refs resolve at call time.
+(define (rx-host-charseq->string s)
+  (let ((cls (guard (e (#t #f)) (jolt-class-name s))))
+    (and (string? cls) (jch-isa? cls "java.lang.CharSequence")
+         (let ((content (guard (e (#t #f)) (jolt-object-content s))))
+           (and (string? content) content)))))
 (define (rx-charseq->string s)
-  (if (string? s)
-      s
-      (let ((tostr (and (jrec? s) (find-method-any-protocol (jrec-tag s) "toString"))))
-        (if tostr (record-method-dispatch s "toString" jolt-nil) s))))
+  (cond ((string? s) s)
+        ((and (jrec? s) (jrec-charseq->string s)))
+        ((rx-host-charseq->string s))
+        (else (jolt-need-str s))))
 (define (jolt-re-matcher re s)
   (make-matcher-t (regex-t-irx (jolt-re-pattern re)) (rx-charseq->string s) 0 #f))
 (define (jolt-matcher? x) (matcher-t? x))
@@ -163,7 +170,7 @@
 (define jolt-re-find
   (case-lambda
     ((re s)
-     (let ((m (irregex-search (regex-t-irx (jolt-re-pattern re)) s)))
+     (let ((m (irregex-search (regex-t-irx (jolt-re-pattern re)) (rx-charseq->string s))))
        (if m (irx-result m) jolt-nil)))
     ((m)
      (let* ((str (matcher-t-str m))
@@ -252,7 +259,7 @@
 ;; one on a zero-width match). nil when there are no matches (Clojure: seq-able as
 ;; nil, so (if-let [m (re-seq ...)] ...) works).
 (define (jolt-re-seq re s)
-  (let* ((s (jolt-need-str s))
+  (let* ((s (rx-charseq->string s))
          (irx (regex-t-irx (jolt-re-pattern re)))
          (len (string-length s)))
     (let loop ((start 0) (acc '()))

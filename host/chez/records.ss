@@ -29,14 +29,19 @@
 ;; (uninitialized) until the first register-protocol-method for this desc; a
 ;; stale (pre-redef) descriptor has its ptable set to #f explicitly so lookups
 ;; fall back to the string registry. See register-protocol-method / protocol-resolve.
+;; ifc caches the questions that depend only on the type's DECLARED interfaces, so
+;; none of them walks the class graph per value: which collection shape it prints
+;; in, and whether it is a CharSequence. Both are asked on hot paths (every count
+;; of a record, every print of one) and both are fixed once the deftype form has
+;; run. #f = not yet derived; see jrdesc-ifc-of.
 (define-record-type (jrdesc make-jrdesc-rec jrdesc?)
-  (fields tag fkeys index (mutable ptable))
-  (nongenerative chez-jrdesc-v3))
+  (fields tag fkeys index (mutable ptable) (mutable ifc))
+  (nongenerative chez-jrdesc-v4))
 (define (make-jrdesc tag fkey-list)
   (let ((index (make-eq-hashtable)))
     (let loop ((ks fkey-list) (i 0))
       (unless (null? ks) (hashtable-set! index (car ks) i) (loop (cdr ks) (+ i 1))))
-    (make-jrdesc-rec tag (list->vector fkey-list) index #f)))
+    (make-jrdesc-rec tag (list->vector fkey-list) index #f #f)))
 ;; declared field count of a descriptor (== the record's arity: a desc is built from
 ;; the same field list as its ctor). jrec-field-ref dispatches on this fixnum so Chez
 ;; compiles the case to a jump/binary search instead of an arity-predicate chain.
@@ -178,7 +183,12 @@
 ;; default jrec-as-map behaviour (map?/record?/field-seq) is gated on it, while
 ;; method dispatch (a deftype implementing ISeq/Counted/…) stays open to any jrec.
 (define chez-record-type-tbl (make-hashtable string-hash string=?))
-(define (jrec-record? x) (and (jrec? x) (hashtable-ref chez-record-type-tbl (jrec-tag x) #f) #t))
+;; The string-keyed lookup. jrec-record? answers from the per-type cache instead
+;; (jrdesc-ifc-of), which is what derives its value; this is the one that reads the
+;; table, so nothing recurses.
+(define (jrec-record?-uncached x)
+  (and (jrec? x) (hashtable-ref chez-record-type-tbl (jrec-tag x) #f) #t))
+(define (jrec-record? x) (and (jrec? x) (vector-ref (jrdesc-ifc-of x) 3)))
 ;; every deftype/defrecord tag, and a simple-name -> tag index. An extend-protocol
 ;; in a DIFFERENT ns names the type bare (it is :import-ed), so register-method
 ;; resolves "Raw" to its real tag "a.util.Raw" here instead of prepending the
@@ -459,7 +469,41 @@
                                result)))
          (map-hash (mix-coll-hash (car total) (cdr total))))
     (i32 (bitwise-xor class-hash map-hash))))
+;; A non-record deftype that declares a collection interface prints in THAT
+;; collection's shape, which is how print-method dispatches on the JVM: ISeq as
+;; (…), IPersistentVector as […], IPersistentSet as #{…}, IPersistentMap as
+;; {k v, …}. The shape is derived per type by jrdesc-derive-ifc, which is where the
+;; precedence and the choice of these four are explained; a defrecord keeps its
+;; #ns.Name{…} form.
+;;
+;; Elements render through jolt-pr-readable, so print / println reach this too
+;; (with *print-readably* off) rather than a type's toString, again as on the JVM.
+(define (jrec-coll-print-shape r) (vector-ref (jrdesc-ifc-of r) 1))
+(define (jrec-coll-pr r shape)
+  (if (jolt-print-hash?)
+      "#"
+      (with-deeper-print
+        (if (eq? shape 'map)
+            ;; a map's seq yields entries; render each as "k v" and comma-join, in
+            ;; the order the type's own seq produced them (the JVM prints an
+            ;; insertion-ordered map-like deftype in that order too).
+            (string-append "{"
+              (jolt-str-join-comma
+                (jolt-limited-list-strs
+                  (map (lambda (e) (string-append (jolt-pr-readable (jolt-nth e 0)) " "
+                                                  (jolt-pr-readable (jolt-nth e 1))))
+                       (seq->list r))))
+              "}")
+            (let ((body (jolt-str-join (jolt-limited-seq-strs (jolt-seq r) jolt-pr-readable))))
+              (case shape
+                ((seq) (string-append "(" body ")"))
+                ((vec) (string-append "[" body "]"))
+                (else (string-append "#{" body "}"))))))))
 (define (jrec-pr r)                      ; #ns.Name{:k v, :k v}
+  (cond
+    ((jrec-coll-print-shape r) => (lambda (shape) (jrec-coll-pr r shape)))
+    (else (jrec-field-pr r))))
+(define (jrec-field-pr r)
   (let ((fkeys (jrdesc-fkeys (jrec-desc r))))
     (string-append "#" (jrec-tag r) "{"
       (let ((n (vector-length fkeys)))
@@ -530,6 +574,86 @@
 ;; Same lookup as collections.ss rec-coll-method — one definition, aliased here.
 (define jrec-cl rec-coll-method)
 
+;; Does this deftype/record implement INTERFACE, directly or through one of the
+;; interfaces it declares? register-inline-protocol! files each declared interface
+;; as a super of the type's own tag in the class graph, so the graph answers
+;; transitively and by either spelling: a type declaring
+;; clojure.lang.IPersistentVector is an Associative and a Sequential too, exactly
+;; as instanceof is on the JVM.
+(define (jrec-declares? x interface)
+  (and (jrec? x) (jch-isa? (jrec-tag x) interface)))
+
+;; Everything about a type that follows from its DECLARED interfaces, derived once
+;; per descriptor: is it a defrecord, does it declare a collection interface, which
+;; collection shape does it print in, is it a CharSequence. These sit on hot paths —
+;; every count of a record, every print of one — where the per-value cost is real:
+;; asking the class graph each time cost 1.25x on (count deftype), and
+;; jrec-declares-coll-iface? allocated a fresh key list on every call.
+;;
+;; Revalidated against the two epochs that between them cover every way the answers
+;; can change: the class graph's (a deftype's interfaces land AFTER its descriptor
+;; exists) and the protocol registry's (extend-type can add one later). Both only
+;; increase, so their sum increases whenever either does and one compare suffices.
+(define (jrdesc-ifc-epoch) (fx+ jch-graph-epoch jolt-proto-epoch))
+;; The shape order is the JVM's print-method precedence, verified against it: ISeq
+;; outranks IPersistentVector / IPersistentSet / IPersistentMap, and IRecord
+;; outranks IPersistentMap (prefer-method), so a defrecord has no shape at all.
+;; Exactly these four have a print-method there — a type declaring only
+;; IPersistentList or IPersistentCollection falls through to #object[…], so neither
+;; is listed.
+(define (jrdesc-derive-ifc d record?)
+  (let ((tag (jrdesc-tag d)))
+    (vector (jrdesc-ifc-epoch)
+            (and (not record?)
+                 (cond ((jch-isa? tag "clojure.lang.ISeq") 'seq)
+                       ((jch-isa? tag "clojure.lang.IPersistentVector") 'vec)
+                       ((jch-isa? tag "clojure.lang.IPersistentSet") 'set)
+                       ((jch-isa? tag "clojure.lang.IPersistentMap") 'map)
+                       (else #f)))
+            (jch-isa? tag "java.lang.CharSequence")
+            record?
+            (and (not record?) (tag-declares-coll-iface? tag)))))
+(define (jrdesc-ifc-of x)
+  (let* ((d (jrec-desc x))
+         (c (jrdesc-ifc d)))
+    (if (and c (fx=? (vector-ref c 0) (jrdesc-ifc-epoch)))
+        c
+        (let ((fresh (jrdesc-derive-ifc d (jrec-record?-uncached x))))
+          (jrdesc-ifc-set! d fresh)
+          fresh))))
+
+;; A CharSequence is not a collection, but three of RT's entry points name one
+;; anyway — RT.count is its length, RT.seq walks its characters, RT.nth reads one
+;; by index. A deftype presenting a WINDOW over a string (instaparse's Segment)
+;; relies on all three. The cached flag is checked BEFORE the method lookup, not
+;; after: these sit on the count path, where find-method-any-protocol has to walk
+;; the type's protocol tables, and asking it first cost 1.26x on (count deftype).
+;; A type that is not a CharSequence now pays a vector-ref and a fixnum compare.
+(define (jrec-charseq? x)
+  (and (jrec? x) (vector-ref (jrdesc-ifc-of x) 2)))
+(define (jrec-charseq-method x name)
+  (and (jrec-charseq? x) (jrec-cl x name)))
+;; The characters of a CharSequence deftype, lazily, through length + charAt —
+;; the pair the interface guarantees, and what StringSeq reads on the JVM. Not
+;; via toString: a seq must not depend on a method seq does not use.
+(define (jrec-charseq->seq x len charat)
+  (let ((n (->idx (jolt-invoke len x))))
+    (let build ((i 0))
+      (if (fx>=? i n)
+          jolt-nil
+          (cseq-lazy (jolt-invoke charat x i) (lambda () (build (fx+ i 1))))))))
+;; The content of a CharSequence deftype as one string, for the callers that need
+;; a whole string rather than a walk (the regex entry points). toString is what the
+;; interface guarantees and what a window type implements, so prefer it; a type
+;; that declares the interface without one is assembled from charAt. #f when the
+;; value is not a CharSequence deftype at all.
+(define (jrec-charseq->string x)
+  (cond ((jrec-charseq-method x "toString")
+         => (lambda (m) (jolt-need-str (jolt-invoke m x))))
+        ((jrec-charseq-method x "charAt")
+         => (lambda (m) (list->string (seq->list (jrec-charseq->seq x (jrec-cl x "length") m)))))
+        (else #f)))
+
 ;; A deftype that DECLARES a clojure.lang collection interface but leaves one of
 ;; its methods unimplemented throws AbstractMethodError when a core fn reaches
 ;; for it, like the JVM — it must not fall back to the bare-deftype
@@ -539,14 +663,17 @@
   '("IPersistentCollection" "IPersistentMap" "IPersistentVector" "IPersistentSet"
     "IPersistentStack" "IPersistentList" "ISeq" "Seqable" "Indexed" "Counted"
     "Associative" "ILookup" "Reversible" "Sorted"))
+;; Keyed by TAG so jrdesc-derive-ifc can compute it once per type; the walk builds
+;; a key list, which is why answering it per call was worth caching.
+(define (tag-declares-coll-iface? tag)
+  (let ((ti (hashtable-ref type-registry tag #f)))
+    (and ti
+         (let loop ((ps (vector->list (hashtable-keys ti))))
+           (cond ((null? ps) #f)
+                 ((member (jch-last-segment (car ps)) jrec-coll-iface-names) #t)
+                 (else (loop (cdr ps))))))))
 (define (jrec-declares-coll-iface? x)
-  (and (jrec? x) (not (jrec-record? x))
-       (let ((ti (hashtable-ref type-registry (jrec-tag x) #f)))
-         (and ti
-              (let loop ((ps (vector->list (hashtable-keys ti))))
-                (cond ((null? ps) #f)
-                      ((member (jch-last-segment (car ps)) jrec-coll-iface-names) #t)
-                      (else (loop (cdr ps)))))))))
+  (and (jrec? x) (vector-ref (jrdesc-ifc-of x) 4)))
 ;; Does this deftype DECLARE clojure.lang.Sequential? On the JVM that marker is
 ;; what makes a value participate in sequential value equality — the collection
 ;; side's .equiv tests `instanceof Sequential` and then compares element-wise —
@@ -580,17 +707,27 @@
              (find-method-any-protocol (jrec-tag v) method)))
         ((jreify? v) (let ((rm (reified-methods v))) (and rm (hashtable-ref rm method #f))))
         (else #f)))
+;; a record counts its declared fields plus anything assoc'd on beyond them
+(define (jrec-field-count coll)
+  (+ (jrec-nfields coll)
+     (let ((ext (jrec-ext coll))) (if (jolt-nil? ext) 0 (jolt-count ext)))))
 (register-count-arm! (lambda (coll) (or (jrec? coll) (jolt-transient? coll)))
   (lambda (coll)
-    (cond ((jrec-cl coll "count") => (lambda (m) (jolt-invoke m coll)))
-          ((jrec-declares-coll-iface? coll) (jrec-abstract-method-error coll "count"))
-          ((jrec? coll) (+ (jrec-nfields coll)
-                           (let ((ext (jrec-ext coll))) (if (jolt-nil? ext) 0 (jolt-count ext)))))
-          ((jolt-transient? coll) (t-count coll))
-          (else (error 'count "uncountable record"))))
-  ;; note: the else arm is unreachable since the predicate matches both
-  ;; jrec? and jolt-transient? — kept as a safety net
-)
+    (cond
+      ((jolt-transient? coll) (t-count coll))
+      ((jrec-cl coll "count") => (lambda (m) (jolt-invoke m coll)))
+      ;; One cached read answers the rest. A defrecord IS a map of its fields, and
+      ;; is the common case here, so it is settled before anything else.
+      (else
+       (let ((ifc (jrdesc-ifc-of coll)))
+         (cond
+           ((vector-ref ifc 3) (jrec-field-count coll))
+           ((vector-ref ifc 4) (jrec-abstract-method-error coll "count"))
+           ;; RT.count reaches CharSequence.length once Counted and
+           ;; IPersistentCollection have both missed — a declared `count` above
+           ;; therefore outranks `length`, as it does on the JVM.
+           ((vector-ref ifc 2) (jolt-invoke (jrec-cl coll "length") coll))
+           (else (jrec-field-count coll))))))))
 ;; contains?: a deftype implementing Associative/containsKey (e.g. core.cache's
 ;; caches) answers through that; a plain defrecord checks its fields.
 (register-contains-arm! (lambda (coll) (jrec-cl coll "containsKey"))
@@ -711,6 +848,11 @@
 ;; Seqable, whatever its field count. Deciding emptiness from the jrec's own field
 ;; count instead would answer for the WRAPPER rather than the collection: a
 ;; deftype holding a backing map has one field, so it would never read as empty.
+;; Registered FIRST of the four so it is checked LAST (arms dispatch newest-first):
+;; RT.seq tries Seqable before CharSequence, so a type declaring both seqs through
+;; its own seq method and only a CharSequence-only type walks characters.
+(register-seq-arm! (lambda (x) (jrec-charseq-method x "charAt"))
+  (lambda (x) (jrec-charseq->seq x (jrec-cl x "length") (jrec-cl x "charAt"))))
 (register-seq-arm! (lambda (x) (and (jrec? x) (jrec-declares-coll-iface? x)))
   (lambda (x) (jrec-abstract-method-error x "seq")))
 (register-seq-arm! jrec-record?
