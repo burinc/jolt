@@ -148,17 +148,28 @@
 ;; def-var! reads both tables on EVERY def, so both go through one mutex.
 ;;
 ;; The read side keeps a lock-free fast path, because the read side is the hot
-;; one: iref-count is the number of entries across both tables, bumped under the
-;; mutex and read without it, so a program that watches nothing pays one box read
-;; instead of two weak-table probes per def — cheaper than before the lock. A
-;; fixnum box read cannot tear, and the only transition that matters (0 -> 1)
-;; happens before the watch can fire.
+;; one: iref-writes counts the add-watch / set-validator! calls that put an entry
+;; in either table, so a program that watches nothing pays one box read instead of
+;; two weak-table probes per def — cheaper than before the lock. It is a call
+;; COUNT, not a live-entry count: nothing decrements it, so once a watch has
+;; existed the fast path is off for good even if remove-watch took it away again.
+;; That direction is the safe one, and it is why remove-watch does not bump — it
+;; can only shrink an entry some earlier bump already accounted for.
+;;
+;; The bump is inside the mutex and BEFORE the table write, which is what makes
+;; the fast path sound: a def-var! racing an add-watch either misses the bump and
+;; the entry both (the watch was not registered yet) or sees the bump and takes
+;; the lock, where it finds whatever the writer left. Bumping after the write
+;; would leave a window where the entry is in the table and iref-any? still reads
+;; 0, and that def would silently skip validation and notification. A fixnum box
+;; read cannot tear.
 (define iref-watch-tbl (make-weak-eq-hashtable))
 (define iref-validator-tbl (make-weak-eq-hashtable))
 (define iref-tbl-mu (make-mutex))
-(define iref-count (box 0))
-(define (iref-any?) (not (eqv? 0 (unbox iref-count))))
-(define (iref-tbl-bump!) (set-box! iref-count (fx+ 1 (unbox iref-count))))
+(define iref-writes (box 0))
+(define (iref-any?) (not (eqv? 0 (unbox iref-writes))))
+;; call with iref-tbl-mu HELD — the read-modify-write is not atomic on its own.
+(define (iref-tbl-bump!) (set-box! iref-writes (fx+ 1 (unbox iref-writes))))
 (define (iref-watches-of r)
   (if (iref-any?) (with-mutex iref-tbl-mu (hashtable-ref iref-watch-tbl r '())) '()))
 (define (iref-validator-of r)
@@ -186,9 +197,9 @@
      a)
     ((iref? a)
      (with-mutex iref-tbl-mu
+       (iref-tbl-bump!)
        (hashtable-set! iref-watch-tbl a
          (jolt-watch-add (hashtable-ref iref-watch-tbl a '()) key f)))
-     (iref-tbl-bump!)
      a)
     (else (throw-jvm (quote ClassCastException) "add-watch: not a watchable reference"))))
 (define (jolt-remove-watch a key)
@@ -213,8 +224,9 @@
       ((iref? a)
        (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke vf (jolt-deref a))))
          (jolt-iref-state-throw))
-       (with-mutex iref-tbl-mu (hashtable-set! iref-validator-tbl a vf))
-       (iref-tbl-bump!))
+       (with-mutex iref-tbl-mu
+         (iref-tbl-bump!)
+         (hashtable-set! iref-validator-tbl a vf)))
       (else (throw-jvm (quote ClassCastException) "set-validator!: not a reference")))
     jolt-nil))
 (define (jolt-get-validator a)

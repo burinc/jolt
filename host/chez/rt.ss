@@ -493,10 +493,25 @@
   (nongenerative var-cell-v3))
 (define var-table (make-hashtable string-hash string=?))
 (define var-table-mu (make-mutex))
+;; var-table-mu covers EVERY mutation of var-table and of ns-has-vars-set below:
+;; jolt-var's insert, declare-var!'s insert, def-var!'s index write, and
+;; remove-ns's sweep (ns.ss). Two writers racing was the corrupting case — a
+;; hashtable-set! that rehashes while another one is mid-move leaves the table's
+;; internals inconsistent, and the damage surfaces later as a fault inside the
+;; collector, naming nothing.
+;;
+;; The READ side is still unlocked, and that is a KNOWN GAP, not a claim: a
+;; hashtable-ref concurrent with a rehashing hashtable-set! has the same problem
+;; in miniature. Locking it is not free — measured at 70 -> 95 ns on a var-table
+;; probe, and var-deref is emitted per var reference (572 of them in the seed
+;; prelude alone) — so closing it needs a design that keeps the read cheap
+;; (copy-on-write behind a box, or a genuinely-single-threaded fast path shared
+;; with the lazy-seq work). Tracked as jolt-asj; the inventory is on jolt-3907.
+;;
 ;; Interning has to be atomic or two threads racing the same NEW name would each
 ;; get their own cell, and a def through one would be invisible through the other.
 ;; Double-checked: the hit path (every name after the first) takes no lock, and the
-;; insert re-checks under the lock, where no writer is mutating the table.
+;; insert re-checks under the lock.
 (define (jolt-var ns name)
   (let ((k (string-append ns "/" name)))
     (or (hashtable-ref var-table k #f)
@@ -519,6 +534,13 @@
 (define proc-name-tbl (make-weak-eq-hashtable))
 ;; The check and the set have to be one atomic step (first def of a proc wins), and
 ;; a def can come from any thread — nREPL sessions evaluate on their own.
+;;
+;; The READS take the same mutex, through proc-name-of. Serializing writers alone
+;; would leave the case that actually bites: a hashtable-ref concurrent with a
+;; hashtable-set! that rehashes reads a table mid-move, and the damage surfaces
+;; later inside the collector naming nothing. Every read is cold — printing a fn's
+;; arity name (seq.ss), the image walker (state-image.ss), the class arm
+;; (java/host-class.ss) — so none of them can afford to skip it either.
 (define proc-name-mu (make-mutex))
 (define (proc-name-of v) (with-mutex proc-name-mu (hashtable-ref proc-name-tbl v #f)))
 (define (def-var! ns name v)
@@ -528,7 +550,7 @@
     (with-mutex proc-name-mu
       (unless (hashtable-contains? proc-name-tbl v)
         (hashtable-set! proc-name-tbl v (cons ns name)))))
-  (hashtable-set! ns-has-vars-set ns #t)
+  (with-mutex var-table-mu (hashtable-set! ns-has-vars-set ns #t))
   (let ((c (jolt-var ns name))) (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
 ;; Value-position comparison references compile to the seq.ss chain singletons
 ;; (jolt-lt/gt/le/ge), not to the clojure.core var roots — the roots were later
@@ -643,6 +665,8 @@
 ;; declare / (def name) with no init: reserve the cell ONLY if absent. An
 ;; existing root is left intact — Clojure's (def x) with no init does not clobber
 ;; a prior binding (do (def x 7) (def x) x) => 7. Returns the cell either way.
+;; Same double-check as jolt-var, and for the same reason: the insert is a
+;; var-table mutation and has to be serialized against jolt-var's.
 (define (declare-var! ns name)
   (let* ((k (string-append ns "/" name))
          (c (hashtable-ref var-table k #f)))
@@ -653,9 +677,13 @@
         ;; declaration-only var stays defined?=#f and resolve/find-var/ns-interns
         ;; miss it in an AOT build. The existing root is left intact.
         (begin (var-cell-defined?-set! c #t) c)
-        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f)))  ; declared => interned/resolvable
-          (hashtable-set! var-table k c)
-          c))))
+        (with-mutex var-table-mu
+          (let ((c (hashtable-ref var-table k #f)))
+            (if c
+                (begin (var-cell-defined?-set! c #t) c)
+                (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f)))  ; declared => interned/resolvable
+                  (hashtable-set! var-table k c)
+                  c)))))))
 
 ;; regex: defines regex-t + the re-* fns (def-var!'d into
 ;; clojure.core), so it loads after def-var! and before the printer below (which

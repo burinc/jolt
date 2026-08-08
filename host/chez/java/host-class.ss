@@ -82,8 +82,8 @@
      s)
     (get-output-string out)))
 (register-class-arm!
-  (lambda (x) (and (procedure? x) (hashtable-ref proc-name-tbl x #f)))
-  (lambda (x) (let ((p (hashtable-ref proc-name-tbl x #f)))
+  (lambda (x) (and (procedure? x) (proc-name-of x)))
+  (lambda (x) (let ((p (proc-name-of x)))
                 ;; the ns segment munges too (a-b.core -> a_b.core), like
                 ;; Compiler.munge; dots stay.
                 (string-append (class-munge-name (car p)) "$" (class-munge-name (cdr p))))))

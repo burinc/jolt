@@ -654,7 +654,7 @@
 ;; invokable, so the site is classified structurally, not by matching Chez's
 ;; error message text after the fact.
 (define (jolt-proc-arity-name f)
-  (let ((p (hashtable-ref proc-name-tbl f #f)))
+  (let ((p (proc-name-of f)))
     (if p (string-append (car p) "/" (cdr p)) "fn")))
 (define (jolt-arity-error-name name nargs)
   (jolt-throw (jolt-host-throwable "clojure.lang.ArityException"

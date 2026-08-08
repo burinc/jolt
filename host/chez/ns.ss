@@ -372,12 +372,16 @@
   (let* ((nm (ns-desig->name desig))
          (n  (jolt-find-ns desig)))            ; the removed Namespace (JVM returns it), or nil
     (hashtable-delete! ns-registry nm)
-    (hashtable-delete! ns-has-vars-set nm)  ; keep the O(1) index honest, else a
-                                            ; later require of nm would no-op
-    (vector-for-each
-      (lambda (k) (let ((c (hashtable-ref var-table k #f)))
-                    (when (and c (string=? (var-cell-ns c) nm)) (hashtable-delete! var-table k))))
-      (hashtable-keys var-table))
+    ;; the sweep is a var-table mutation, so it runs under rt.ss's var-table-mu
+    ;; like every other one — including the hashtable-keys snapshot, which would
+    ;; otherwise be taken while another thread interned into the table.
+    (with-mutex var-table-mu
+      (hashtable-delete! ns-has-vars-set nm)  ; keep the O(1) index honest, else a
+                                              ; later require of nm would no-op
+      (vector-for-each
+        (lambda (k) (let ((c (hashtable-ref var-table k #f)))
+                      (when (and c (string=? (var-cell-ns c) nm)) (hashtable-delete! var-table k))))
+        (hashtable-keys var-table)))
     n))
 
 ;; intern: create/set a var ns/sym to val (or an unbound cell). Returns the var.

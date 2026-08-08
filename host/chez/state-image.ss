@@ -170,7 +170,7 @@
       (h (list 'handler (jolt-invoke (cadr h) x)))
       ((keyword? x) (list 'kw (keyword-t-ns x) (keyword-t-name x)))
       ((procedure? x)
-       (let ((p (hashtable-ref proc-name-tbl x #f)))
+       (let ((p (proc-name-of x)))
          ;; A named fn travels as its var's name. A bare closure has no stable
          ;; identity to write, so it is refused here and reported with its path.
          (and p (list 'fn-ref (car p) (cdr p)))))
@@ -401,7 +401,7 @@
 ;; of the rules.
 (define (image-proc-verdict x)
   (cond
-    ((hashtable-ref proc-name-tbl x #f) 'fn-ref)
+    ((proc-name-of x) 'fn-ref)
     (else (or (image-fnsrc-probe x) 'refuse))))
 
 ;; Recover the LIVE captured values, in REGISTERED free-name order, by munging
