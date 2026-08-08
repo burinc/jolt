@@ -551,6 +551,9 @@
                                  (jolt-throw (jolt-host-throwable "java.lang.IndexOutOfBoundsException" "index out of bounds"))))
              ((or (cseq? coll) (empty-list-t? coll)) (seq-nth coll i #f jolt-nil))
              ((rec-coll-method coll "nth") => (lambda (m) (jolt-invoke m coll i)))
+             ;; RT.nth reads a CharSequence by charAt once Indexed has missed —
+             ;; jrec-charseq-method (records.ss) resolves at call time.
+             ((jrec-charseq-method coll "charAt") => (lambda (m) (jolt-invoke m coll i)))
              (else (throw-jvm (quote UnsupportedOperationException) (string-append "nth not supported on this type: " (jolt-class-name coll)))))))
     ((coll i d)
      (jolt-nth-nil-idx! i)
@@ -560,6 +563,9 @@
              ((string? coll) (if (and (fx>=? i 0) (fx<? i (string-length coll))) (string-ref coll i) d))
              ((or (cseq? coll) (empty-list-t? coll)) (seq-nth coll i #t d))
              ((rec-coll-method coll "nth") => (lambda (m) (jolt-invoke m coll i d)))
+             ((jrec-charseq-method coll "charAt")
+              => (lambda (m) (let ((n (jolt-count coll)))
+                               (if (and (fx>=? i 0) (fx<? i n)) (jolt-invoke m coll i) d))))
              (else d))))))
 
 ;; a count is an exact integer (JVM parity: count returns a long). jolt= is

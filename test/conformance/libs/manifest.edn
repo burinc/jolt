@@ -190,6 +190,15 @@
    :tolerance 40
    :expect {:tests 123 :pass 236 :fail 10 :error 2}}
 
+  {:name "instaparse"
+   :paths ["src" "test"]
+   ;; All five remaining failures are one divergence, in abnf-test's unicode-test:
+   ;; it feeds a parser half of a surrogate pair and expects a parse failure, but a
+   ;; jolt string is indexed by code point, so (str (first "<astral>")) is the whole
+   ;; character and parses. A surrogate half is not a value jolt can hold
+   ;; (:string-model in known-divergences.edn) — nothing to reject.
+   :expect {:tests 28 :pass 9515 :fail 5 :error 0}}
+
   {:name "test.chuck"
    ;; resources/ holds the regex grammar its parser slurps through io/resource
    :paths ["src" "test" "resources"]

@@ -1589,4 +1589,18 @@
   ;; Wider than the JVM's 16-bit char by design, hence a unit row not a corpus
   ;; one. Surrogates are not scalar values and stay rejected.
   {:suite "char / code points" :expr "[(int (char 65)) (int (char 128515)) (int (first (str (char 128515)))) (try (char 55296) (catch Exception e (ex-message e))) (try (char 1114112) (catch Exception e (ex-message e)))]" :expected "[65 128515 128515 \"Value out of range for char: 55296\" \"Value out of range for char: 1114112\"]"}
+  ;; The same model seen from the string side: an astral character is ONE element,
+  ;; so there is no surrogate half to index out. A JVM string holds two code units
+  ;; here, which is why a parser test that expects a lone surrogate to be rejected
+  ;; cannot pass — see the :string-model entry in known-divergences.edn.
+  {:suite "string / surrogate halves" :expr "(let [c (str (char 128169))] [(count c) (int (first c)) (nil? (second c)) (= c (str (first c)))])" :expected "[1 128169 true true]"}
+  ;; str of a deftype/record with no toString is its print form: the JVM answers
+  ;; Object.toString there ("user.Rec@3c6f0c28"), which jolt has no identity hash
+  ;; for, so it renders the value instead and drops the leading # of the record
+  ;; marker. A COLLECTION deftype prints in its collection's shape, which has no
+  ;; such marker — dropping a character there produced "1 2 3)".
+  {:suite "printing / str of a deftype" :expr "(do (deftype Sq [v] clojure.lang.ISeq (seq [_] (seq v)) (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v))) (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil) (cons [_ o] (cons o (seq v)))) [(str (->Sq [1 2 3])) (format \"%s\" (->Sq [1 2 3])) (str \"x=\" (->Sq [1 2]))])" :expected "[\"(1 2 3)\" \"(1 2 3)\" \"x=(1 2)\"]"}
+  {:suite "printing / str of a deftype" :expr "(do (defrecord Rc [a]) (deftype Dt [a]) [(str (->Rc 1)) (str (->Dt 1))])" :expected "[\"user.Rc{:a 1}\" \"user.Dt{:a 1}\"]"}
+  ;; a declared toString still wins, collection shape or not
+  {:suite "printing / str of a deftype" :expr "(do (deftype Sqt [v] clojure.lang.ISeq (seq [_] (seq v)) (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v))) (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil) (cons [_ o] (cons o (seq v))) Object (toString [_] \"MINE\")) (str (->Sqt [1 2])))" :expected "\"MINE\""}
 ]

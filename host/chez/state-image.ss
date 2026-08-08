@@ -57,6 +57,48 @@
       (port? x)
       (thread? x)))
 
+;; A record's fields for image purposes: its own AND every parent's, root first —
+;; the order record-constructor takes them in. record-type-field-names reports only
+;; a type's own fields, so walking by it alone misses the inherited ones and
+;; rebuilding by it alone misapplies the constructor. That is not a corner case:
+;; every defrecord/deftype instance is a chez-jrec subtype whose descriptor and
+;; extension map live on the PARENT, so a record holding an atom used to fail the
+;; dump outright ("incorrect number of arguments to #<procedure constructor>").
+;; Memoized per rtd — the walk asks once per object.
+(define image-record-fields-tbl (make-eq-hashtable))
+(define image-record-fields-mutex (make-mutex))
+(define (image-record-fields rtd)      ; -> vector of (name . accessor)
+  (or (hashtable-ref image-record-fields-tbl rtd #f)
+      (let* ((chain (let up ((r rtd) (acc '()))
+                      (if r (up (record-type-parent r) (cons r acc)) acc)))
+             (fields (apply append
+                            (map (lambda (r)
+                                   (let ((ns (record-type-field-names r)))
+                                     (let loop ((i 0) (acc '()))
+                                       (if (fx=? i (vector-length ns))
+                                           (reverse acc)
+                                           (loop (fx+ i 1)
+                                                 (cons (cons (vector-ref ns i) (record-accessor r i))
+                                                       acc))))))
+                                 chain)))
+             (v (list->vector fields)))
+        (with-mutex image-record-fields-mutex
+          (hashtable-set! image-record-fields-tbl rtd v))
+        v)))
+;; A field read that answers #f rather than escaping: an opaque or uninitialized
+;; field must not abort a dump that is only trying to find what is in it.
+(define (image-record-field-ref f x)
+  (call/cc (lambda (k)
+             (with-exception-handler (lambda (e) (k #f))
+               (lambda () ((cdr f) x))))))
+;; A jrec's descriptor is its TYPE, not its value: every instance of the type
+;; shares one, and it rides raw in the fasl (which is why its layout is frozen —
+;; see make-jrdesc). Walking it would copy it per instance, giving each restored
+;; record its own descriptor, and would drag the descriptor's internal eq
+;; hashtable through the transform. The record's own fields and its extension map
+;; are the value, and those are walked.
+(define (image-opaque-field? v) (jrdesc? v))
+
 ;; --- path-tracking walker ------------------------------------------------------
 ;; fasl-write's externals-pred sees objects but not where they live, and an
 ;; "unserializable object" error with no path is close to useless on a real
@@ -132,18 +174,18 @@
                      (when (fx<? i (vector-length ks))
                        (walk (vector-ref vs i) (cons (image-describe-obj (vector-ref ks i)) path))
                        (loop (fx+ i 1))))))
-                ;; generic record: walk declared fields by name. Covers user
-                ;; defrecords, lazy seqs, refs, everything not special-cased.
+                ;; generic record: walk declared fields by name, inherited ones
+                ;; included. Covers user defrecords, lazy seqs, refs, everything
+                ;; not special-cased.
                 ((and (record? x) (record-rtd x))
-                 (let* ((rtd (record-rtd x))
-                        (names (record-type-field-names rtd))
-                        (n (vector-length names)))
+                 (let* ((fs (image-record-fields (record-rtd x)))
+                        (n (vector-length fs)))
                    (let loop ((i 0))
                      (when (fx<? i n)
-                       (let ((v (call/cc (lambda (k)
-                                  (with-exception-handler (lambda (e) (k #f))
-                                    (lambda () ((record-accessor rtd i) x)))))))
-                         (walk v (cons (symbol->string (vector-ref names i)) path)))
+                       (let* ((f (vector-ref fs i))
+                              (v (image-record-field-ref f x)))
+                         (unless (image-opaque-field? v)
+                           (walk v (cons (symbol->string (car f)) path))))
                        (loop (fx+ i 1))))))
                 (else #t)))))))
   jolt-nil)
@@ -947,8 +989,13 @@
               (lambda (x path)
                 (let-values (((ks vs) (hashtable-entries x)))
                   (if (image-rebuild-mode? mode)
-                      (let ((nx (make-hashtable (hashtable-hash-function x)
-                                                (hashtable-equivalence-function x))))
+                      ;; an eq/eqv hashtable has NO hash function to read back
+                      ;; (hashtable-hash-function answers #f), so it has to be
+                      ;; re-made through its own constructor
+                      (let ((nx (let ((eqv (hashtable-equivalence-function x)))
+                                  (cond ((eq? eqv eq?) (make-eq-hashtable))
+                                        ((eq? eqv eqv?) (make-eqv-hashtable))
+                                        (else (make-hashtable (hashtable-hash-function x) eqv))))))
                         (hashtable-set! memo x nx)
                         (image-meta-copy! x nx)
                         (let loop ((i 0))
@@ -968,22 +1015,24 @@
                                   (cons (image-describe-obj (vector-ref ks i)) path))
                             (loop (fx+ i 1))))
                         #t)))))
-             ;; generic record: walk declared fields by name. Covers user
-             ;; defrecords, lazy seqs, refs, image records, everything not
-             ;; special-cased above.
+             ;; generic record: walk declared fields by name, inherited ones
+             ;; included (image-record-fields). Covers user defrecords, lazy seqs,
+             ;; refs, image records, everything not special-cased above. The
+             ;; rebuild applies record-constructor to the SAME list, which is why
+             ;; the parent's fields have to be in it and in front.
              (walk-record
               (lambda (x path)
                 (let* ((rtd (record-rtd x))
-                       (names (record-type-field-names rtd))
-                       (n (vector-length names)))
+                       (fs (image-record-fields rtd))
+                       (n (vector-length fs)))
                   (if (image-rebuild-mode? mode)
                       (let ((vals (make-vector n)) (dirty #f))
                         (let loop ((i 0))
                           (if (fx<? i n)
-                              (let* ((v (call/cc (lambda (k)
-                                        (with-exception-handler (lambda (e) (k #f))
-                                          (lambda () ((record-accessor rtd i) x))))))
-                                     (w (walk v (cons (symbol->string (vector-ref names i)) path))))
+                              (let* ((f (vector-ref fs i))
+                                     (v (image-record-field-ref f x))
+                                     (w (if (image-opaque-field? v) v
+                                            (walk v (cons (symbol->string (car f)) path)))))
                                 (vector-set! vals i w)
                                 (set! dirty (or dirty (not (eq? v w))))
                                 (loop (fx+ i 1)))
@@ -999,10 +1048,10 @@
                         (hashtable-set! memo x #t)
                         (let loop ((i 0))
                           (when (fx<? i n)
-                            (let ((v (call/cc (lambda (k)
-                                      (with-exception-handler (lambda (e) (k #f))
-                                        (lambda () ((record-accessor rtd i) x)))))))
-                              (walk v (cons (symbol->string (vector-ref names i)) path)))
+                            (let* ((f (vector-ref fs i))
+                                   (v (image-record-field-ref f x)))
+                              (unless (image-opaque-field? v)
+                                (walk v (cons (symbol->string (car f)) path))))
                             (loop (fx+ i 1))))
                         #t)))))
              ;; R3 read side: a stored fn source record rebuilds into a live
