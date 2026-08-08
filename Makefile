@@ -67,7 +67,8 @@ JOLT-TARGETS-NEEDING-DEPS := \
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
-        fibersbench
+        fibersbench \
+        fibersresidue
 
 default:: build
 
@@ -242,6 +243,12 @@ fibers:
 # blind to dev mode (every phase runs the runtime from source).
 fibersbench:
 	@sh bench/fibers/run.sh
+
+# R0-residue probes (jolt-nvpr.10): the size of a fiber with REAL frames, and
+# memory under fiber churn. Opt-in like fibersbench, NOT part of make ci.
+fibersresidue:
+	@$(CHEZ) --script bench/fibers/residue.ss
+	@$(CHEZ) --script bench/fibers/churn.ss
 
 # Corpus conformance vs JVM-sourced expecteds (allowlist + floor).
 corpus:
