@@ -399,6 +399,64 @@
       (str "(let (" (str/join " " binds) ") " raw ")")
       raw)))
 
+;; A cache-cell scope for a top-level EXPRESSION (jolt-g3u). Without it the
+;; collector exists only inside a def, so every var / protocol / ctor site in a
+;; bare top-level form resolves PER ACCESS. Measured: a var-ref call at such a
+;; site costs 101-125 ns against 28 ns at a cached site and 11 ns through a local,
+;; and 3M calls do 3M var-table reads against 2 at a cached site. A bare top-level
+;; (loop …) went 120.8 -> 25.1 ns/op with this.
+;;
+;; TWO restrictions, both of which cost real measurements to find.
+;;
+;; Not a def. A direct-link def emits a bare (define …), which cannot sit inside a
+;; let, and both :def paths already wrap their own INIT — the part that repeats.
+;;
+;; And only when the form contains a LOOP (or a self-recurring fn), not merely a
+;; :fn. That looks over-cautious and is not. A cell has to be paid for: the emitted
+;; (var-cell-deref (or c …)) is several times the text of a (var-deref …), and a
+;; top-level form is compiled by Chez every time it is loaded. So the cell wins
+;; only if its site actually runs again, and a loop is the one thing that proves
+;; it will — a top-level fn may never be called. Wrapping on :fn too cost 14% on
+;; `require clojure.test` (0.44 -> 0.50s), verified by switching the wrapper at
+;; runtime inside ONE binary so no build variance was involved, and bought that
+;; path nothing: a namespace being loaded is defs and defmethods whose bodies run
+;; once at load. Confirmed it was the cells and not the const pool by trying a
+;; cells-only variant, which was equally slow.
+;;
+;; Gated on var-cache? for the same reason the :var site is: the seed mint runs
+;; with it OFF and must stay a byte-fixpoint, and this wrapper would otherwise
+;; change mint output through the const pool (which no other flag gates) even
+;; though no cache cell would be registered.
+(def ^:private repeat-ops #{:loop :recur})
+
+(defn- node-tree-any?
+  "Does any node in this tree satisfy pred? Walks map values and sequential
+  children, which covers every shape the analyzer builds."
+  [pred x]
+  (cond
+    (and (map? x) (:op x) (pred x)) true
+    ;; a :const holds a literal, which cannot contain a loop and can be arbitrarily
+    ;; large (a 10k-element vector literal at top level). Stop rather than walk it.
+    (and (map? x) (= :const (:op x))) false
+    (map? x) (boolean (some (fn [v] (node-tree-any? pred v)) (vals x)))
+    (sequential? x) (boolean (some (fn [v] (node-tree-any? pred v)) x))
+    :else false))
+
+;; Does this top-level form contain something whose body PROVABLY runs more than
+;; once? A loop (or a self-recurring fn) does. A plain :fn does not — it may never
+;; be called, and that distinction is the whole design; see emit-top-cells.
+(defn- top-form-repeats? [node]
+  (node-tree-any? (fn [n] (contains? repeat-ops (:op n))) node))
+
+(defn- emit-top-cells [node emit-thunk]
+  (if (and (var-cache?)
+           ;; never a def: the :def cases already wrap their INIT, which is the
+           ;; part that repeats. A def's remaining pieces run once.
+           (not= :def (:op node))
+           (top-form-repeats? node))
+    (emit-with-cells emit-thunk)
+    (emit-thunk)))
+
 ;; Scheme syntactic keywords. A jolt local with one of these names would, when
 ;; emitted verbatim, shadow the Scheme form in operator position (a local named
 ;; `if` would turn the special form (if …) the back end emits into a call), so
@@ -1737,14 +1795,16 @@
                 ;; `emit`, whose :def case already wraps cache cells, so the seed stays
                 ;; byte-unchanged. The :def cases bind their own fnsrc context over
                 ;; this one (fresh counter/regs per def) and flush it themselves.
-                (not (direct-link?)) (emit node)
+                ;; emit-top-cells declines a :def itself, so this reaches it only
+                ;; for expressions.
+                (not (direct-link?)) (emit-top-cells node #(emit node))
                 ;; top-level do splices: each statement/ret is itself a top-level form.
                 (= :do (:op node))
                 (str "(begin " (str/join " " (map emit-top-form (:statements node)))
                      (if (empty? (:statements node)) "" " ") (emit-top-form (:ret node)) ")")
                 (and (= :def (:op node)) (not (:no-init node)) (not (dl-opt-out? (:meta node))))
                 (emit-def-cached node)
-                :else (emit node))
+                :else (emit-top-cells node #(emit node)))
           freg (fnsrc-flush)]
       (if (= freg "") scm
           ;; registrations run BEFORE the form: they are static data with no

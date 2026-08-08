@@ -391,8 +391,14 @@ run_o() {
 o_cold="$(run_o)"
 o_warm="$(run_o)"
 o_scm="$(find "$cache_o" -name 'olib.top-*.scm' | head -1)"
-o_defines="$(grep -o '"in-ns") (jolt-symbol #f "[^"]*"' "$o_scm" 2>/dev/null \
-             | sed 's/.*#f "//;s/"//' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+# Each in-ns reference followed by the namespace symbol it interns. Matched
+# through a window rather than adjacently, because the two are no longer
+# neighbours in the emitted text: a top-level var reference now resolves through
+# a per-form cache cell (jolt-g3u), so `in-ns` and its argument are separated by
+# the cell's (or … (set! …)) . The window is what this check actually wants —
+# which namespaces the artifact interns — independent of how a var ref is spelled.
+o_defines="$(grep -o 'in-ns.\{0,200\}' "$o_scm" 2>/dev/null \
+             | sed -n 's/.*jolt-symbol #f "\([^"]*\)".*/\1/p' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 rm -rf "$cache_o"
 if [ "$o_cold" = ":overridden" ] && [ "$o_warm" = ":overridden" ] && [ "$o_defines" = "olib.top" ]; then
   echo "PASS: (o) artifact defines only olib.top; override survives the hit"; pass=$((pass+1))
