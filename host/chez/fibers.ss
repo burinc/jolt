@@ -92,7 +92,13 @@
 ;; mutex. Lock order: ... → run-queue mu is ALWAYS the last lock acquired; the
 ;; enqueue/dequeue below never acquire anything else, so the order never
 ;; cycles. R5 (work stealing) may swap this for a lock-free queue.
+;;
+;; jolt-fiber-q-cv is the R4 carrier's park: the carrier thread waits on it
+;; when the queue is empty (never a spin) and jolt-fiber-enqueue! signals it
+;; on the empty→non-empty transition. Both sides hold q-mu, so a wake cannot
+;; be lost between the carrier's empty check and its wait.
 (define jolt-fiber-q-mu (make-mutex))
+(define jolt-fiber-q-cv (make-condition))
 (define jolt-fiber-q-head #f)
 (define jolt-fiber-q-tail #f)
 
@@ -165,7 +171,9 @@
   (if jolt-fiber-q-tail
       (begin (jolt-fiber-next-set! jolt-fiber-q-tail f)
              (set! jolt-fiber-q-tail f))
-      (begin (set! jolt-fiber-q-head f)
+      ;; empty -> non-empty: wake the R4 carrier if it is parked on q-cv
+      (begin (condition-signal jolt-fiber-q-cv)
+             (set! jolt-fiber-q-head f)
              (set! jolt-fiber-q-tail f)))
   (mutex-release jolt-fiber-q-mu))
 
@@ -325,3 +333,40 @@
       (when f
         (jolt-fiber-run f)
         (loop)))))
+
+;; --- the R4 carrier (epic jolt-nvpr.5) ---------------------------------------
+;; R3 found that sa-fiber-run-all is a ONE-SHOT drain, not a scheduler: a
+;; cross-thread wake lands a fiber on the queue after the drain returned and
+;; nothing runs it (the R3 gate had to pump). R4's go-on-fibers therefore
+;; needs a carrier that LOOPS. Exactly ONE carrier thread, started lazily on
+;; the first :fiber go spawn (jolt-fiber-ensure-carrier!, called from
+;; jolt-fiber-go-spawn in fibers-async.ss) and parked on jolt-fiber-q-cv when
+;; the run queue is empty — never a spin; a wake (enqueue) signals it. The
+;; carrier pool and the blocking policy are R5's, not this round's.
+;;
+;; The loop is run-all-then-park: drain the queue, and if it is empty, wait on
+;; the condition. The check and the wait both hold q-mu, so an enqueue cannot
+;; slip between them: it either lands before the check (the carrier sees a
+;; non-empty queue and does not wait) or signals the condition the carrier is
+;; (or is about to be) waiting on.
+(define (jolt-fiber-carrier-loop)
+  (let loop ()
+    (sa-fiber-run-all)
+    (mutex-acquire jolt-fiber-q-mu)
+    (unless jolt-fiber-q-head
+      (condition-wait jolt-fiber-q-cv jolt-fiber-q-mu))
+    (mutex-release jolt-fiber-q-mu)
+    (loop)))
+
+;; Start the carrier exactly once, on the first :fiber go spawn. Double-start
+;; is guarded by its own mutex (the started? flag); the carrier thread inherits
+;; the spawner's thread parameters at fork, which is irrelevant here — every
+;; run-all re-captures the scheduler slice at entry.
+(define jolt-fiber-carrier-mu (make-mutex))
+(define jolt-fiber-carrier-started? #f)
+(define (jolt-fiber-ensure-carrier!)
+  (mutex-acquire jolt-fiber-carrier-mu)
+  (unless jolt-fiber-carrier-started?
+    (set! jolt-fiber-carrier-started? #t)
+    (fork-thread jolt-fiber-carrier-loop))
+  (mutex-release jolt-fiber-carrier-mu))

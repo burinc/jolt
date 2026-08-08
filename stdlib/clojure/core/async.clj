@@ -71,9 +71,10 @@
 
 (defn thread-call
   "Executes f in another thread, returning a channel that receives f's result then
-  closes."
-  ([f] (clojure.core.async/go-spawn f))
-  ([f _workload] (clojure.core.async/go-spawn f)))
+  closes. Always a real OS thread — thread is the documented escape for blocking
+  work and does NOT honor *go-backend* (unlike go/go-loop)."
+  ([f] (clojure.core.async/thread-spawn f))
+  ([f _workload] (clojure.core.async/thread-spawn f)))
 
 (defmacro io-thread
   "Executes body in another thread, returning a channel that receives the result

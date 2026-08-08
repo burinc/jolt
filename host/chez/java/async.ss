@@ -115,6 +115,10 @@
 ;; The resume runs under wmu and takes the run-queue mutex — a leaf lock never
 ;; acquired by the fiber park path, so the order above has no cycle.
 (define jolt-fiber-wake-fn #f)  ; set by fibers-async.ss (loads after this file)
+;; R4: the fiber alts! await — (jolt-fiber-alt-await-fn h) -> [val port], parked.
+;; Set by fibers-async.ss (loads after this file); #f until then, which is fine
+;; because no alts! can run before the boot finishes loading.
+(define jolt-fiber-alt-await-fn #f)
 (define (alt-deliver! h val port)
   (with-mutex (alt-handler-wmu h)
     (let ((mb (alt-handler-mailbox h)))
@@ -554,7 +558,33 @@
   (when (jolt-nil? v)
     (throw-jvm (quote IllegalArgumentException) "Can't put nil on a channel")))
 
+;; clojure.core.async/*go-backend* — the R4 opt-in seam (epic jolt-nvpr.5):
+;; :thread (default) is byte-for-byte today's go (a real OS thread); :fiber
+;; spawns the body on the R4 fiber carrier. Read at SPAWN time — a runtime
+;; call, not a macroexpansion — so (binding [*go-backend* :fiber] …) covers
+;; every go that runs inside the scope, including ones in functions it calls.
+;; The default stays :thread for the whole epic; R6 decides whether it flips.
+(define jolt-go-backend-thread (keyword #f "thread"))
+(define jolt-go-backend-fiber (keyword #f "fiber"))
+(def-dynvar! "clojure.core.async" "*go-backend*" jolt-go-backend-thread)
+(define (go-backend-current)
+  (let ((cell (var-cell-lookup "clojure.core.async" "*go-backend*")))
+    (if (and cell (var-cell-defined? cell))
+        (let ((bv (dyn-binding-value cell)))
+          (if (eq? bv dyn-no-binding) (var-cell-root cell) bv))
+        jolt-go-backend-thread)))
+
+;; The R4 dispatcher: go/go-loop/go-spawn go through here and honor the var;
+;; thread/thread-call keep a real OS thread regardless (the documented escape
+;; for blocking work — a fiber would pin its carrier). jolt-fiber-go-spawn is
+;; defined in fibers-async.ss, which loads after this file; the reference
+;; resolves at call time, before any :fiber spawn can happen.
 (define (async-go-spawn thunk)
+  (if (eq? (go-backend-current) jolt-go-backend-fiber)
+      (jolt-fiber-go-spawn thunk)
+      (async-go-spawn-thread thunk)))
+
+(define (async-go-spawn-thread thunk)
   (let ((w (ac-make 1 'fixed #f)) (snap (dyn-binding-stack)))
     (fork-thread
      (lambda ()
@@ -597,8 +627,23 @@
           ;; registration won — stop and read the mailbox). If not ready, register
           ;; and ac-notify! under the same lock so a fresh taker pairs with parked
           ;; alt-putters (and vice versa) via notify's pairing step.
-          (let ((h (alt-handler-alloc))
-                (registered '()))
+          ;;
+          ;; The handler's wake is the current FIBER when alts! runs on one (R4):
+          ;; alt-deliver! then resumes the fiber instead of signalling the condvar,
+          ;; and the await below parks instead of blocking the carrier — a fiber
+          ;; waiter is exactly the R3 one-waiter protocol, no second mechanism.
+          ;; On a plain thread wake is #f and the await is the condvar wait.
+          ;;
+          ;; PRUNING (which side): the winner prunes. finish/await call
+          ;; unregister!, which removes the handler from EVERY port it registered
+          ;; on — so a handler that lost on ports B..N is taken off their waiter
+          ;; lists the moment the alts! completes on A; a long-lived channel never
+          ;; accumulates dead handlers from lost alts! calls. ac-notify!'s scan is
+          ;; the backstop for a registration that dies by claim-race mid-notify
+          ;; ("dead registration — dropped" in the drain steps).
+          (let* ((f (jolt-current-fiber))
+                 (h (alt-handler-alloc f))
+                 (registered '()))
             (let* ((unregister!
                     (lambda ()
                       (for-each
@@ -616,15 +661,23 @@
                    (finish (lambda (val port) (unregister!) (jolt-vector val port)))
                    (await
                     (lambda ()
-                      (with-mutex (alt-handler-wmu h)
-                        (let ((mb (alt-handler-mailbox h)))
-                          (let wait-loop ()
-                            (unless (vector-ref mb 0)
-                              (condition-wait (alt-handler-wcv h) (alt-handler-wmu h))
-                              (wait-loop)))))
-                      (unregister!)
-                      (let ((mb (alt-handler-mailbox h)))
-                        (jolt-vector (vector-ref mb 1) (vector-ref mb 2))))))
+                      (if (and f jolt-fiber-alt-await-fn)
+                          ;; fiber waiter: park, never block the carrier (the
+                          ;; handler's channel mutexes are all released here)
+                          (let ((r (jolt-fiber-alt-await-fn h)))
+                            (unregister!)
+                            r)
+                          ;; thread waiter: condvar
+                          (begin
+                            (with-mutex (alt-handler-wmu h)
+                              (let ((mb (alt-handler-mailbox h)))
+                                (let wait-loop ()
+                                  (unless (vector-ref mb 0)
+                                    (condition-wait (alt-handler-wcv h) (alt-handler-wmu h))
+                                    (wait-loop)))))
+                            (unregister!)
+                            (let ((mb (alt-handler-mailbox h)))
+                              (jolt-vector (vector-ref mb 1) (vector-ref mb 2))))))))
               (let reg-loop ((j 0))
                 (if (fx=? j n)
                     (await)
@@ -697,9 +750,13 @@
 ;; (go-loop bindings body...) -> (go (loop bindings body...))
 (define (cca-go-loop-macro bindings . body)
   (jolt-list cca-go-sym (apply jolt-list cca-loop-sym bindings body)))
-;; (thread body...) — a real OS thread (same shape as go here).
+;; (thread body...) — a real OS thread, ALWAYS: unlike go/go-loop it does NOT
+;; honor *go-backend*, so a blocking body does not silently pin the fiber
+;; carrier when a :fiber binding is in scope. thread is the documented escape
+;; for blocking work (fibers-plan.md).
+(define cca-thread-spawn-sym (jolt-symbol "clojure.core.async" "thread-spawn"))
 (define (cca-thread-macro . body)
-  (jolt-list cca-go-spawn-sym (apply jolt-list cca-fn*-sym empty-pvec body)))
+  (jolt-list cca-thread-spawn-sym (apply jolt-list cca-fn*-sym empty-pvec body)))
 
 ;; --- install clojure.core.async ---------------------------------------------
 (define (cca-def! name v) (def-var! "clojure.core.async" name v))
@@ -719,6 +776,9 @@
 (cca-def! "take!" jolt-async-take!)
 (cca-def! "offer!" jolt-async-offer!)
 (cca-def! "go-spawn" async-go-spawn)
+;; thread-spawn: always a real OS thread, whatever *go-backend* says (thread
+;; is the documented escape; the go macro dispatches, thread must not).
+(cca-def! "thread-spawn" async-go-spawn-thread)
 ;; non-blocking primitives also used by the Clojure overlay and external callers.
 (cca-def! "__poll!" jolt-async-poll!)
 (cca-def! "__offer!" jolt-async-offer!)
