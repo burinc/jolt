@@ -53,6 +53,25 @@
    :test-paths ["src/test/clojure"]
    :expect {:tests 4 :pass 142 :fail 0 :error 0}}
 
+  {:name "core.async"
+   ;; jolt SHIPS clojure.core.async: the channel primitives are native
+   ;; (host/chez/java/async.ss, real OS threads) and the dataflow API is an
+   ;; overlay under stdlib/. So the upstream src/main is deliberately NOT on
+   ;; :paths — it would shadow jolt's implementation with the JVM one (the IOC
+   ;; state-machine macros, java.util.concurrent) and fail to load. Only the
+   ;; upstream TESTS run, against jolt's own implementation. That makes this the
+   ;; standing regression gate for async.ss, which the fibers epic modifies.
+   :paths ["src/test/clojure"]
+   :test-paths ["src/test/clojure"]
+   ;; impl.buffers / impl.timers are upstream internals the suites reach for
+   ;; directly; the shims map them onto jolt's native equivalents.
+   :shims ["!test/conformance/libs/shims/core.async"]
+   :nses ["clojure.core.async-test"
+          "clojure.core.pipeline-test"
+          "clojure.core.async.timers-test"
+          "clojure.core.async.lab-test"]
+   :expect {:tests 0 :pass 0 :fail 0 :error 0}}
+
   {:name "core.cache"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]

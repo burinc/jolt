@@ -113,7 +113,7 @@
                           "java.lang.ClassCastException"
                           (string-append "class " (jolt-class-name m)
                                          " cannot be cast to class clojure.lang.IPersistentMap"))))
-           (hashtable-set! meta-table r m))
+           (meta-table-set! r m))
          r))
       ((and (keyword-t? (car o)) (string=? (keyword-t-name (car o)) "validator"))
        (loop (cddr o) (cadr o) m))

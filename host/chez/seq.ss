@@ -121,10 +121,19 @@
 ;; 1, while the variadic arity's real fixed count is 2 — and calling it with one
 ;; real argument plus a box would bind b to the box and r to nil.
 (define-record-type lazy-rest (fields seq) (nongenerative jolt-lazy-rest-v1))
+;; Written on every variadic closure creation and read by jolt-apply, from
+;; whatever threads the program runs — and a Chez hashtable is not thread-safe.
+;; An unsynchronized write racing a read corrupts the table's internals, and the
+;; damage shows up later as a SIGSEGV inside the collector or as a hang, never as
+;; an error naming this table. Both sides take the mutex; on the read side that is
+;; the apply path, where a mutex is noise next to the list building around it.
 (define variadic-fixed-arity-tbl (make-weak-eq-hashtable))
+(define variadic-tbl-mu (make-mutex))
 (define (jolt-register-variadic! v proc)
-  (hashtable-set! variadic-fixed-arity-tbl proc v)
+  (with-mutex variadic-tbl-mu (hashtable-set! variadic-fixed-arity-tbl proc v))
   proc)
+(define (variadic-fixed-arity-of proc)
+  (with-mutex variadic-tbl-mu (hashtable-ref variadic-fixed-arity-tbl proc #f)))
 ;; The rest binding emitted for every variadic arity. A boxed rest is the seq
 ;; itself; anything else is the ordinary Chez rest list.
 (define (jolt-rest-seq xs)
@@ -1138,7 +1147,7 @@
           (else (loop (fx+ i 1) (jolt-seq (seq-more s)) (cons (seq-first s) acc))))))
 (define (jolt-apply f . args)
   (let* ((r (reverse args)) (tail (car r)) (fixed (reverse (cdr r)))
-         (v (and (procedure? f) (hashtable-ref variadic-fixed-arity-tbl f #f))))
+         (v (and (procedure? f) (variadic-fixed-arity-of f))))
     (cond
       ((eq? f jolt-concat)
        (lazy-concat-seq (fold-right jolt-cons (jolt-seq tail) fixed)))

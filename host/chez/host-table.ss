@@ -118,7 +118,7 @@
   (lambda (x m)
     (if (htable? x)
         (let ((c (meta-copy x)))
-          (if (jolt-nil? m) (hashtable-delete! meta-table c) (hashtable-set! meta-table c m))
+          (if (jolt-nil? m) (meta-table-del! c) (meta-table-set! c m))
           c)
         (%ht-with-meta x m))))
 ;; the clojure.core var was def-var!'d in natives-meta.ss to the prior closure; user

@@ -10,7 +10,30 @@
 ;; Weak so a collection's metadata is reclaimed with the collection — collection
 ;; ops (conj/assoc/into) carry meta forward onto fresh values, so a strong table
 ;; would retain every meta-bearing intermediate.
+;; A Chez hashtable is NOT thread-safe, and this one is written from whatever
+;; thread calls with-meta or an op that carries meta forward. Unsynchronized
+;; mutation corrupts the table's internals, and the corruption surfaces later as
+;; a SIGSEGV inside the collector (`nonrecoverable invalid memory reference`,
+;; faulting in S_do_gc) or as a hang — never as an error naming this table. So
+;; every touch of meta-table goes through meta-table-mu.
+;;
+;; meta-count keeps the fast path lock-free: it is a plain fixnum box, bumped
+;; under the mutex when an entry is added, and read without one. Programs that
+;; never attach collection metadata therefore pay a single box read per op — and
+;; not the hashtable-size call this used to make, which had to consult the table
+;; itself. It may overcount once entries are collected, which only costs an
+;; unnecessary trip down the slow path.
 (define meta-table (make-weak-eq-hashtable))
+(define meta-table-mu (make-mutex))
+(define meta-count (box 0))
+(define (meta-table-set! k v)
+  (with-mutex meta-table-mu
+    (hashtable-set! meta-table k v)
+    (set-box! meta-count (fx+ 1 (unbox meta-count)))))
+(define (meta-table-del! k)
+  (with-mutex meta-table-mu (hashtable-delete! meta-table k)))
+(define (meta-table-get k)
+  (with-mutex meta-table-mu (hashtable-ref meta-table k #f)))
 
 (define (jolt-meta x)
   (cond
@@ -35,7 +58,9 @@
     ((and (jrec? x) (jrec-cl x "meta")) => (lambda (m) (jolt-invoke m x)))
     ;; everything else (collections, fns, reify, atoms/agents and any reference
     ;; type) reads the identity side-table; a value with no entry is nil meta.
-    (else (hashtable-ref meta-table x jolt-nil))))
+    ;; no metadata anywhere yet: skip the table (and its mutex) entirely
+    ((fx=? 0 (unbox meta-count)) jolt-nil)
+    (else (or (meta-table-get x) jolt-nil))))
 
 ;; fresh-identity copy of a metadatable value (so attaching meta doesn't mutate
 ;; the original). The copy only needs a distinct identity for the meta side-table;
@@ -73,7 +98,7 @@
     ((and (jrec? x) (jrec-cl x "withMeta")) => (lambda (meth) (jolt-invoke meth x m)))
     ((or (pvec? x) (pmap? x) (pset? x) (cseq? x) (empty-list-t? x) (jolt-lazyseq? x) (jrec? x) (jreify? x) (procedure? x))
      (let ((c (meta-copy x)))
-       (if (jolt-nil? m) (hashtable-delete! meta-table c) (hashtable-set! meta-table c m))
+       (if (jolt-nil? m) (meta-table-del! c) (meta-table-set! c m))
        c))
     (else (throw-jvm (quote ClassCastException) (string-append (jolt-final-str x) " cannot be cast to clojure.lang.IObj")))))
 
@@ -85,13 +110,13 @@
 ;; meta() forward. Returns DST. The size check is the fast path: programs that
 ;; never attach collection metadata pay one O(1) check per op, no lookup.
 (define (meta-carry src dst)
-  (if (fx=? 0 (hashtable-size meta-table))
+  (if (fx=? 0 (unbox meta-count))
       dst
-      (let ((m (hashtable-ref meta-table src #f)))
+      (let ((m (meta-table-get src)))
         (if m
             ;; never attach to the shared () singleton — use a fresh instance
             (let ((d (if (empty-list-t? dst) (fresh-empty-list) dst)))
-              (hashtable-set! meta-table d m) d)
+              (meta-table-set! d m) d)
             dst))))
 
 ;; (type x) — Clojure's (or (:type (meta x)) (class x)). With no JVM classes the

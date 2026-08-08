@@ -377,7 +377,7 @@
               (with-exception-handler (lambda (e) (k jolt-nil))
                 (lambda () (jolt-meta orig)))))))
       (unless (jolt-nil? m)
-        (hashtable-set! meta-table new m)))))
+        (meta-table-set! new m)))))
 
 ;; A procedure's substitution decision, shared by both modes so scan and dump
 ;; cannot disagree. Returns the registration (name . (form ns free-names)) for
@@ -1165,7 +1165,7 @@
     acc))
 
 (define (image-reattach-meta! pairs)
-  (for-each (lambda (p) (hashtable-set! meta-table (car p) (cdr p))) pairs))
+  (for-each (lambda (p) (meta-table-set! (car p) (cdr p))) pairs))
 
 (define jolt-image-write!
   (case-lambda

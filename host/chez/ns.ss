@@ -510,14 +510,14 @@
         new)
       (let* ((cur (let ((m (jolt-meta ref))) (if (jolt-nil? m) (jolt-hash-map) m)))
              (new (apply jolt-invoke f cur args)))
-        (hashtable-set! meta-table ref new)
+        (meta-table-set! ref new)
         new)))
 (define (jolt-reset-meta! ref m)
   (if (var-cell? ref)
       (begin
         (hashtable-set! var-meta-table ref m)
         (var-meta-sync-macro! ref m))
-      (hashtable-set! meta-table ref m))
+      (meta-table-set! ref m))
   m)
 
 ;; --- RESOLVE FRICTION: native-op cells -------------------------------------

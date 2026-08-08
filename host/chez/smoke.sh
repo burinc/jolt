@@ -460,6 +460,20 @@ else
   fails=$((fails + 1))
 fi
 
+# The runtime's shared side-tables (metadata, the variadic fixed-arity registry)
+# must survive concurrent access: a Chez hashtable is not thread-safe, and
+# unsynchronized mutation corrupts it into a SIGSEGV inside the collector or a
+# hang. This runs a core.async pipeline sweep with a hand-rolled VARIADIC
+# transducer, which is what actually reproduced — the built-in (map f) does not.
+tt_out="$($jolt run test/chez/thread-tables.clj 2>&1)"
+if printf '%s' "$tt_out" | grep -q 'THREAD-TABLES OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: shared side-tables under concurrent access"
+  echo "    $(printf '%s' "$tt_out" | tail -1)"
+  fails=$((fails + 1))
+fi
+
 # clojure.test extension points (assert-expr / do-report / report) need separate
 # top-level forms — assert-expr must register before `is` expands — so this is a
 # multi-form `jolt run`, not an -e one-liner. The file self-checks its tallies.
