@@ -63,6 +63,26 @@
 (check "(area {:shape :circle :r 21})" "42")
 ;; anonymous fns + map results
 (check "((fn [a b] {:sum (+ a b) :prod (* a b)}) 3 4)" "{:sum 7, :prod 12}")
+;; deftype interface surface: a CharSequence window answers count/seq/nth and the
+;; regex entry points, and a collection deftype prints in its collection's shape.
+;; These live in records.ss, so they reach here only through the GENERATED
+;; records-gambit.ss — a stale generation shows up as a failure on these rows.
+(check (string-append "(do (deftype Sg [s cnt] CharSequence (length [_] cnt)"
+                      " (charAt [_ i] (.charAt s i)) (subSequence [_ a b] (subs s a b))"
+                      " (toString [_] (subs s 0 cnt)))"
+                      " [(count (->Sg \"abcd\" 3)) (vec (seq (->Sg \"abcd\" 3))) (nth (->Sg \"abcd\" 3) 1)])")
+       "[3 [\\a \\b \\c] \\b]")
+(check (string-append "(do (deftype Sgr [s cnt] CharSequence (length [_] cnt)"
+                      " (charAt [_ i] (.charAt s i)) (subSequence [_ a b] (subs s a b))"
+                      " (toString [_] (subs s 0 cnt)))"
+                      " (re-matches #\"a+\" (->Sgr \"aaa\" 3)))")
+       "\"aaa\"")
+(check (string-append "(do (deftype Psq [v] clojure.lang.ISeq (seq [_] (seq v))"
+                      " (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v)))"
+                      " (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil)"
+                      " (cons [_ o] (cons o (seq v))))"
+                      " [(pr-str (->Psq [1 2 3])) (str (->Psq [1 2 3]))])")
+       "[\"(1 2 3)\" \"(1 2 3)\"]")
 ;; the runtime target must never emit chez unsafe spellings
 (check "(count \"gambit\")" "6")
 

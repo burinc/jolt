@@ -19,7 +19,9 @@
 (print-brackets #f)
 
 (define src "host/chez/records.ss")
-(define out "host/gambit/records-gambit.ss")
+;; GEN_RECORDS_OUT redirects the write, which is what `make gambitgencheck` uses
+;; to generate into a temp file and diff against the committed one.
+(define out (or (getenv "GEN_RECORDS_OUT") "host/gambit/records-gambit.ss"))
 
 (define (read-all f)
   (with-input-from-file f
