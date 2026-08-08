@@ -567,6 +567,12 @@
 (define jolt-go-backend-thread (keyword #f "thread"))
 (define jolt-go-backend-fiber (keyword #f "fiber"))
 (def-dynvar! "clojure.core.async" "*go-backend*" jolt-go-backend-thread)
+;; R5: the fiber carrier-pool size (fibers.ss reads this root; jolt-nil = the
+;; machine's processor count, a positive fixnum pins the pool — set it BEFORE
+;; the first :fiber go, or between a jolt-fiber-pool-reset! and the next go).
+;; The host setter jolt-fiber-carrier-count-set! writes this same root, so the
+;; two knobs never disagree. The pool starts once per process.
+(def-var! "clojure.core.async" "*fiber-carrier-count*" jolt-nil)
 (define (go-backend-current)
   (let ((cell (var-cell-lookup "clojure.core.async" "*go-backend*")))
     (if (and cell (var-cell-defined? cell))

@@ -232,6 +232,7 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-state-test.ss
 	@$(CHEZ) --script test/chez/fibers-chan-test.ss
 	@$(CHEZ) --script test/chez/fibers-go-test.ss
+	@$(CHEZ) --script test/chez/fibers-pool-test.ss
 
 # Corpus conformance vs JVM-sourced expecteds (allowlist + floor).
 corpus:

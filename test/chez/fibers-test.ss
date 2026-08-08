@@ -19,6 +19,11 @@
 
 (import (chezscheme))
 (load "host/chez/fibers.ss")
+;; R5 (jolt-nvpr.6): fibers now live on a POOL of N carriers (N defaults to
+;; the processor count). This gate drives the scheduler SYNCHRONOUSLY with
+;; sa-fiber-run-all on one carrier, so it pins the pool to exactly one — the
+;; documented "pin it to 1 for determinism" use of the count knob.
+(jolt-fiber-carrier-count-set! 1)
 
 (define total 0)
 (define fails 0)

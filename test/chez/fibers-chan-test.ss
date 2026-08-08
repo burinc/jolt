@@ -31,6 +31,10 @@
 
 (import (chezscheme))
 (load "host/chez/rt.ss")
+;; R5 (jolt-nvpr.6): the pool defaults to the processor count; this gate
+;; drives fibers synchronously (sa-fiber-run-all on one carrier), so pin it —
+;; the documented "pin to 1 for determinism" use of the count knob.
+(jolt-fiber-carrier-count-set! 1)
 
 (define total 0)
 (define fails 0)
