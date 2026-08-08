@@ -51,7 +51,7 @@
                    ;; meta entry = non-dynamic (runtime dynamic vars are tagged
                    ;; via def-dynvar!/def-var-with-meta!; the declare path via
                    ;; set-var-meta!).
-                   (let ((m (hashtable-ref var-meta-table cell #f)))
+                   (let ((m (var-cell-meta cell)))
                      (when (not (and m (jolt-truthy? (jolt-get m (keyword #f "dynamic")))))
                        (jolt-throw
                         (jolt-ex-info
@@ -161,10 +161,10 @@
   (set! local-var-counter (fx+ local-var-counter 1))
   (let ((c (make-var-cell "" (string-append "local-" (number->string local-var-counter))
                           (if (pair? args) (car args) jolt-nil)
-                          #t)))
+                          #t #f #f)))
     ;; Clojure builds these with Var/create + setDynamic, so a local var takes a
     ;; thread binding like any other — tools.reader hands one to with-bindings.
-    (hashtable-set! var-meta-table c local-var-meta)
+    (var-cell-meta-set! c local-var-meta)
     c))
 
 ;; --- chain the var-read paths onto the binding stack -------------------------

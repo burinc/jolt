@@ -248,6 +248,8 @@
 (define jolt-vreg-catch-line 3)  ; the site at the throw a catch clause is handling
 (define jolt-vreg-print-readably 4)  ; the print family's *print-readably* override; 0 = unset
 (define jolt-vreg-current-fiber 0)  ; fibers.ss: the running fiber record, or 0 (fixnum) when not on a fiber
+;; slot 1: fibers.ss jolt-vreg-park-unwinding — a park escape is unwinding this carrier
+;; slot 5: hasheq.ss jolt-vreg-hasheq-caches — this thread's (symbol . string) hasheq tables
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
 ;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic
@@ -479,14 +481,30 @@
 ;; cell) from a cell lazily materialised by a forward `var-deref` / `(var x)` on a
 ;; not-yet-defined name — `resolve` returns the cell iff defined?.
 ;; ns-unmap clears it. Avoids the (def x nil) edge of probing the root.
-(define-record-type var-cell (fields ns name (mutable root) (mutable defined?)) (nongenerative var-cell-v2))
+;; meta and macro? live IN the cell, not in side-tables keyed by it. They used to
+;; be two eq-hashtables, which a Chez hashtable's lack of thread safety made a
+;; hazard: a def on one thread writing them while another reads is unsynchronized
+;; mutation, and the damage surfaces as a fault inside the collector. A field is
+;; safe (two threads writing one field write a whole value, never a torn
+;; structure) and it is FASTER than the lookup it replaces, which matters because
+;; macro-var? is on the analyzer's hot path.
+(define-record-type var-cell
+  (fields ns name (mutable root) (mutable defined?) (mutable meta) (mutable macro?))
+  (nongenerative var-cell-v3))
 (define var-table (make-hashtable string-hash string=?))
+(define var-table-mu (make-mutex))
+;; Interning has to be atomic or two threads racing the same NEW name would each
+;; get their own cell, and a def through one would be invisible through the other.
+;; Double-checked: the hit path (every name after the first) takes no lock, and the
+;; insert re-checks under the lock, where no writer is mutating the table.
 (define (jolt-var ns name)
   (let ((k (string-append ns "/" name)))
     (or (hashtable-ref var-table k #f)
-        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f)))
-          (hashtable-set! var-table k c)
-          c))))
+        (with-mutex var-table-mu
+          (or (hashtable-ref var-table k #f)
+              (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f)))
+                (hashtable-set! var-table k c)
+                c))))))
 ;; non-creating lookup (resolve / find-var / ns-unmap): #f when absent, so a
 ;; probe never interns an empty cell.
 (define (var-cell-lookup ns name) (hashtable-ref var-table (string-append ns "/" name) #f))
@@ -499,11 +517,17 @@
 ;; JVM-style class name and clojure.spec.alpha's fn-sym can recover the symbol of a
 ;; bare-fn predicate. Weak so GC'd fns drop out. Last def of a given proc wins.
 (define proc-name-tbl (make-weak-eq-hashtable))
+;; The check and the set have to be one atomic step (first def of a proc wins), and
+;; a def can come from any thread — nREPL sessions evaluate on their own.
+(define proc-name-mu (make-mutex))
+(define (proc-name-of v) (with-mutex proc-name-mu (hashtable-ref proc-name-tbl v #f)))
 (define (def-var! ns name v)
   ;; first def of a given proc wins, so an alias like (def inc' inc) — which binds
   ;; the SAME proc to a second var — doesn't rename inc.
-  (when (and (procedure? v) (not (hashtable-contains? proc-name-tbl v)))
-    (hashtable-set! proc-name-tbl v (cons ns name)))
+  (when (procedure? v)
+    (with-mutex proc-name-mu
+      (unless (hashtable-contains? proc-name-tbl v)
+        (hashtable-set! proc-name-tbl v (cons ns name)))))
   (hashtable-set! ns-has-vars-set ns #t)
   (let ((c (jolt-var ns name))) (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
 ;; Value-position comparison references compile to the seq.ss chain singletons
@@ -511,10 +535,11 @@
 ;; re-bound by the checked numeric layer, so def-var! never saw these procs.
 ;; Register them so a stored comparator like (sorted-map-by >) travels as a
 ;; fn-ref (by name) like any other named core fn.
-(hashtable-set! proc-name-tbl jolt-lt (cons "clojure.core" "<"))
-(hashtable-set! proc-name-tbl jolt-gt (cons "clojure.core" ">"))
-(hashtable-set! proc-name-tbl jolt-le (cons "clojure.core" "<="))
-(hashtable-set! proc-name-tbl jolt-ge (cons "clojure.core" ">="))
+(with-mutex proc-name-mu
+  (hashtable-set! proc-name-tbl jolt-lt (cons "clojure.core" "<"))
+  (hashtable-set! proc-name-tbl jolt-gt (cons "clojure.core" ">"))
+  (hashtable-set! proc-name-tbl jolt-le (cons "clojure.core" "<="))
+  (hashtable-set! proc-name-tbl jolt-ge (cons "clojure.core" ">=")))
 ;; Set of ns-name strings that have at least one var — makes ns-has-vars? O(1)
 ;; instead of scanning the entire var-table per require-miss. Updated in def-var!
 ;; (and wherever vars are removed, though removal is rare).
@@ -590,12 +615,11 @@
 ;; keyed by the cell. jolt-meta (natives-meta.ss) merges it onto {:ns :name},
 ;; which it derives from the cell — so EVERY var (plain def, native-op, declare)
 ;; reports {:ns :name} like Clojure, with the user meta layered on when present.
-(define var-meta-table (make-eq-hashtable))
 (define jolt-kw-var-ns (keyword #f "ns"))
 (define jolt-kw-var-name (keyword #f "name"))
 (define jolt-kw-var-macro (keyword #f "macro"))
 (define (def-var-with-meta! ns name v m)
-  (let ((c (def-var! ns name v))) (hashtable-set! var-meta-table c m) c))
+  (let ((c (def-var! ns name v))) (var-cell-meta-set! c m) c))
 ;; A runtime-defined DYNAMIC var (the *earmuffed* core vars): tagged :dynamic so
 ;; push-thread-bindings accepts it — with no meta entry a var is non-dynamic and
 ;; binding throws, like the JVM.
@@ -605,18 +629,17 @@
 ;; Attach meta to an already-interned var (the declare/no-init emission path:
 ;; (def ^:dynamic *x*) must be bindable before its root is set).
 (define (set-var-meta! ns name m)
-  (hashtable-set! var-meta-table (jolt-var ns name) m))
+  (var-cell-meta-set! (jolt-var ns name) m))
 ;; runtime-macro registry: a var whose root holds a macro
 ;; expander fn is flagged here, so the ON-CHEZ analyzer's form-macro?/form-expand-1
 ;; (host-contract.ss) expand it. The prelude emits each core/stdlib defmacro as a
 ;; def-var! of its (cross-compiled) expander followed by (mark-macro! ns name).
-;; Keyed by cell (eq), like var-meta-table — survives a later (def name ...) that
+;; Kept in the cell, like meta — survives a later (def name ...) that
 ;; replaces the expander but keeps the same cell, matching Clojure (a defmacro IS a
 ;; def whose var carries :macro).
-(define var-macro-table (make-eq-hashtable))
 (define (mark-macro! ns name)
-  (let ((c (jolt-var ns name))) (hashtable-set! var-macro-table c #t) c))
-(define (macro-var? cell) (and cell (hashtable-ref var-macro-table cell #f) #t))
+  (let ((c (jolt-var ns name))) (var-cell-macro?-set! c #t) c))
+(define (macro-var? cell) (and cell (var-cell-macro? cell) #t))
 ;; declare / (def name) with no init: reserve the cell ONLY if absent. An
 ;; existing root is left intact — Clojure's (def x) with no init does not clobber
 ;; a prior binding (do (def x 7) (def x) x) => 7. Returns the cell either way.
@@ -630,7 +653,7 @@
         ;; declaration-only var stays defined?=#f and resolve/find-var/ns-interns
         ;; miss it in an AOT build. The existing root is left intact.
         (begin (var-cell-defined?-set! c #t) c)
-        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t)))  ; declared => interned/resolvable
+        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f)))  ; declared => interned/resolvable
           (hashtable-set! var-table k c)
           c))))
 

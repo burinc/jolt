@@ -62,7 +62,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
   traceemit \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
-  values wp ci
+  threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status \
@@ -121,7 +121,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   fnform traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
-  certify gambitcheck fibers gosm
+  certify gambitcheck fibers gosm threadsafety
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -416,6 +416,13 @@ devirt:
 # the same values.
 gosm:
 	@$(CHEZ) --script host/chez/run-gosm.ss
+
+# The runtime's shared side-tables under concurrent access (jolt-3907). Scenario 1
+# is a reproducer: with the hasheq caches shared instead of per-thread it faults
+# inside the collector on most runs. test/chez/thread-tables.clj (smoke.sh) covers
+# the same bug class through a core.async pipeline sweep.
+threadsafety:
+	@$(CHEZ) --script test/chez/thread-safety-test.ss
 
 # Native record field reads: a keyword lookup on a statically-known record reads
 # the field by its declared slot (jrec-field-at) instead of jolt-get; the value

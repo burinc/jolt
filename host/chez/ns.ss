@@ -194,7 +194,7 @@
 ;; var; ns-publics drops the ones marked ^:private (defn-/def ^:private), like the
 ;; JVM. ns-aliases is an empty map (map? is true).
 (define (var-private? c)
-  (let ((m (hashtable-ref var-meta-table c #f)))
+  (let ((m (var-cell-meta c)))
     (and m (jolt-truthy? (jolt-get m (keyword #f "private"))))))
 (define (ns-vars-pmap-when nm keep?)
   (let ((m (jolt-hash-map)))
@@ -391,7 +391,7 @@
     (let ((cell (if (pair? vopt) (def-var! nm s (car vopt)) (declare-var! nm s)))
           (m (jolt-meta sym)))
       (unless (jolt-nil? m)
-        (hashtable-set! var-meta-table cell m)
+        (var-cell-meta-set! cell m)
         (var-meta-sync-macro! cell m))
       cell)))
 
@@ -491,7 +491,7 @@
               (seq->list names)))
   jolt-nil)
 
-;; alter-meta! / reset-meta!: a var's metadata lives in var-meta-table (rt.ss);
+;; alter-meta! / reset-meta!: a var's metadata lives in the cell's meta field;
 ;; any other reference (atom/agent/namespace) uses the identity meta side-table
 ;; jolt-meta reads. A truthy :macro in the new meta marks the var as a macro
 ;; (JVM parity: Var.isMacro reads meta), so re-export idioms that copy a macro's
@@ -500,12 +500,12 @@
 ;; defmacro vars derive :macro rather than storing it.
 (define (var-meta-sync-macro! cell m)
   (when (jolt-truthy? (jolt-get m jolt-kw-var-macro))
-    (hashtable-set! var-macro-table cell #t)))
+    (var-cell-macro?-set! cell #t)))
 (define (jolt-alter-meta! ref f . args)
   (if (var-cell? ref)
-      (let* ((cur (or (hashtable-ref var-meta-table ref #f) (jolt-hash-map)))
+      (let* ((cur (or (var-cell-meta ref) (jolt-hash-map)))
              (new (apply jolt-invoke f cur args)))
-        (hashtable-set! var-meta-table ref new)
+        (var-cell-meta-set! ref new)
         (var-meta-sync-macro! ref new)
         new)
       (let* ((cur (let ((m (jolt-meta ref))) (if (jolt-nil? m) (jolt-hash-map) m)))
@@ -515,7 +515,7 @@
 (define (jolt-reset-meta! ref m)
   (if (var-cell? ref)
       (begin
-        (hashtable-set! var-meta-table ref m)
+        (var-cell-meta-set! ref m)
         (var-meta-sync-macro! ref m))
       (meta-table-set! ref m))
   m)

@@ -39,12 +39,12 @@
   (cond
     ((symbol-t? x) (let ((m (symbol-t-meta x))) (if (jolt-nil? m) jolt-nil m)))
     ;; a var's meta is {:ns :name} (derived from the cell) + :macro true for a
-    ;; macro var (derived from var-macro-table, like Var.isMacro reading meta on
-    ;; the JVM) + any def-time user meta from rt.ss's var-meta-table. :ns is the
+    ;; macro var (derived from the cell's macro? field, like Var.isMacro reading meta on
+    ;; the JVM) + any def-time user meta from the cell's meta field. :ns is the
     ;; Namespace VALUE (intern-ns! of the cell's ns string), like the JVM, so
     ;; (class (:ns (meta #'x))) is clojure.lang.Namespace; :name is the symbol.
      ((var-cell? x)
-      (let* ((user (hashtable-ref var-meta-table x #f))
+      (let* ((user (var-cell-meta x))
              (base (jolt-assoc (if user user (jolt-hash-map))
                                jolt-kw-var-ns (intern-ns! (var-cell-ns x))
                                jolt-kw-var-name (jolt-symbol #f (var-cell-name x)))))

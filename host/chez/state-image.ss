@@ -839,7 +839,8 @@
               (lambda (x path)
                 (if (image-rebuild-mode? mode)
                     (let ((nx (make-var-cell (var-cell-ns x) (var-cell-name x)
-                                             jolt-nil (var-cell-defined? x))))
+                                             jolt-nil (var-cell-defined? x)
+                                             (var-cell-meta x) (var-cell-macro? x))))
                       (hashtable-set! memo x nx)
                       (var-cell-root-set! nx
                         (walk (var-cell-root x)

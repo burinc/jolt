@@ -228,7 +228,7 @@
 
 ;; Runtime macros: a defmacro is emitted into the prelude as a
 ;; def-var! of its cross-compiled expander fn plus (mark-macro! ns name), so the
-;; var cell is flagged a macro (rt.ss var-macro-table). form-macro? checks the
+;; var cell is flagged a macro (rt.ss var-cell macro? field). form-macro? checks the
 ;; flag; form-expand-1 applies the expander to the unevaluated arg forms (the rest
 ;; of the list), and the analyzer re-analyzes the returned form.
 (define (hc-macro? ctx sym)
@@ -304,7 +304,7 @@
 ;; A var's declared numeric return (^double/^long on its name) -> :double/:long,
 ;; read from its meta. Lets jolt.passes.numeric type a call to it.
 (define (hc-cell-num-ret cell)
-  (let ((m (and cell (hashtable-ref var-meta-table cell #f))))
+  (let ((m (and cell (var-cell-meta cell))))
     (and m (let* ((t (jolt-get m hc-kw-tag))   ; ^double/^long is a symbol; ^"double" a string
                   (s (cond ((symbol-t? t) (symbol-t-name t)) ((string? t) t) (else #f))))
              (cond ((equal? s "double") hc-kw-double)

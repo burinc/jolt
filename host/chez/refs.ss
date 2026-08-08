@@ -25,8 +25,16 @@
 (register-iref-arm! jolt-ref?)
 
 ;; Per-ref min/max history (defaults 0 and 10), stored in weak side tables.
+;; ref-min-history / ref-max-history live in side-tables rather than ref fields.
+;; A Chez hashtable is not thread-safe and STM is concurrent by definition, so
+;; both go through one mutex: unsynchronized mutation corrupts the table and the
+;; damage surfaces as a fault inside the collector, naming nothing. Cold on both
+;; sides — these are only touched by the user-facing getter/setter, never by the
+;; commit path (jolt-ref-history-count is 0; history is not implemented) — so the
+;; lock costs nothing measurable.
 (define ref-min-history-tbl (make-weak-eq-hashtable))
 (define ref-max-history-tbl (make-weak-eq-hashtable))
+(define ref-history-mu (make-mutex))
 
 ;; --- transaction record -------------------------------------------------------
 ;; A per-transaction record, held in the thread-parameter *txn* (#f when
@@ -207,15 +215,17 @@
 
 (define (jolt-ref-min-history . args)
   (let ((ref (car args)))
-    (if (= (length args) 2)
-        (begin (hashtable-set! ref-min-history-tbl ref (cadr args)) ref)
-        (hashtable-ref ref-min-history-tbl ref 0))))
+    (with-mutex ref-history-mu
+      (if (= (length args) 2)
+          (begin (hashtable-set! ref-min-history-tbl ref (cadr args)) ref)
+          (hashtable-ref ref-min-history-tbl ref 0)))))
 
 (define (jolt-ref-max-history . args)
   (let ((ref (car args)))
-    (if (= (length args) 2)
-        (begin (hashtable-set! ref-max-history-tbl ref (cadr args)) ref)
-        (hashtable-ref ref-max-history-tbl ref 10))))
+    (with-mutex ref-history-mu
+      (if (= (length args) 2)
+          (begin (hashtable-set! ref-max-history-tbl ref (cadr args)) ref)
+          (hashtable-ref ref-max-history-tbl ref 10)))))
 
 ;; --- deref -------------------------------------------------------------------
 ;; Inside a transaction, return the in-txn value from the log (falling back

@@ -142,13 +142,34 @@
 (define (iref? r)
   (let loop ((as iref-arms))
     (cond ((null? as) #f) (((car as) r) #t) (else (loop (cdr as))))))
+;; Watches and validators for the IRefs that are NOT atoms (vars, refs) live in
+;; side-tables — an atom keeps its own in the record. A Chez hashtable is not
+;; thread-safe, and add-watch/set-validator! can be called from any thread while
+;; def-var! reads both tables on EVERY def, so both go through one mutex.
+;;
+;; The read side keeps a lock-free fast path, because the read side is the hot
+;; one: iref-count is the number of entries across both tables, bumped under the
+;; mutex and read without it, so a program that watches nothing pays one box read
+;; instead of two weak-table probes per def — cheaper than before the lock. A
+;; fixnum box read cannot tear, and the only transition that matters (0 -> 1)
+;; happens before the watch can fire.
 (define iref-watch-tbl (make-weak-eq-hashtable))
 (define iref-validator-tbl (make-weak-eq-hashtable))
+(define iref-tbl-mu (make-mutex))
+(define iref-count (box 0))
+(define (iref-any?) (not (eqv? 0 (unbox iref-count))))
+(define (iref-tbl-bump!) (set-box! iref-count (fx+ 1 (unbox iref-count))))
+(define (iref-watches-of r)
+  (if (iref-any?) (with-mutex iref-tbl-mu (hashtable-ref iref-watch-tbl r '())) '()))
+(define (iref-validator-of r)
+  (if (iref-any?)
+      (with-mutex iref-tbl-mu (hashtable-ref iref-validator-tbl r jolt-nil))
+      jolt-nil))
 (define (iref-notify r old new)
   (for-each (lambda (kv) (jolt-invoke (cdr kv) (car kv) r old new))
-            (reverse (hashtable-ref iref-watch-tbl r '()))))
+            (reverse (iref-watches-of r))))
 (define (iref-validate r v)
-  (let ((vf (hashtable-ref iref-validator-tbl r jolt-nil)))
+  (let ((vf (iref-validator-of r)))
     (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke vf v)))
       (jolt-iref-state-throw))))
 
@@ -164,7 +185,10 @@
      (jolt-atom-watches-set! a (jolt-watch-add (jolt-atom-watches a) key f))
      a)
     ((iref? a)
-     (hashtable-set! iref-watch-tbl a (jolt-watch-add (hashtable-ref iref-watch-tbl a '()) key f))
+     (with-mutex iref-tbl-mu
+       (hashtable-set! iref-watch-tbl a
+         (jolt-watch-add (hashtable-ref iref-watch-tbl a '()) key f)))
+     (iref-tbl-bump!)
      a)
     (else (throw-jvm (quote ClassCastException) "add-watch: not a watchable reference"))))
 (define (jolt-remove-watch a key)
@@ -174,8 +198,9 @@
        (remp (lambda (kv) (jolt=2 (car kv) key)) (jolt-atom-watches a)))
      a)
     ((iref? a)
-     (hashtable-set! iref-watch-tbl a
-       (remp (lambda (kv) (jolt=2 (car kv) key)) (hashtable-ref iref-watch-tbl a '())))
+     (with-mutex iref-tbl-mu
+       (hashtable-set! iref-watch-tbl a
+         (remp (lambda (kv) (jolt=2 (car kv) key)) (hashtable-ref iref-watch-tbl a '()))))
      a)
     (else (throw-jvm (quote ClassCastException) "remove-watch: not a watchable reference"))))
 (define (jolt-set-validator! a f)
@@ -188,12 +213,13 @@
       ((iref? a)
        (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke vf (jolt-deref a))))
          (jolt-iref-state-throw))
-       (hashtable-set! iref-validator-tbl a vf))
+       (with-mutex iref-tbl-mu (hashtable-set! iref-validator-tbl a vf))
+       (iref-tbl-bump!))
       (else (throw-jvm (quote ClassCastException) "set-validator!: not a reference")))
     jolt-nil))
 (define (jolt-get-validator a)
   (cond ((jolt-atom? a) (jolt-atom-validator a))
-        ((iref? a) (hashtable-ref iref-validator-tbl a jolt-nil))
+        ((iref? a) (iref-validator-of a))
         (else jolt-nil)))
 
 ;; vars are watchable IRefs: a root change (def / var-set on the root /
@@ -204,8 +230,9 @@
 (set! def-var!
   (lambda (ns name v)
     (let ((c (jolt-var ns name)))
-      (if (or (pair? (hashtable-ref iref-watch-tbl c '()))
-              (not (jolt-nil? (hashtable-ref iref-validator-tbl c jolt-nil))))
+      (if (and (iref-any?)
+               (or (pair? (iref-watches-of c))
+                   (not (jolt-nil? (iref-validator-of c)))))
           (let ((old (var-cell-root c)))
             (iref-validate c v)
             (let ((r (def-var!-pre-iref ns name v)))
