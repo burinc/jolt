@@ -102,7 +102,7 @@
 ;; (each a thunk that waits for a counter then feeds), and return
 ;; [value cheap-delta capture-delta].
 (define (fiber-run label src steps)
-  (let ((c0 jolt-sm-parks) (p0 jolt-fiber-chan-parks))
+  (let ((c0 (jolt-sm-parks)) (p0 (jolt-fiber-chan-parks)))
     (ev (string-append
          "(binding [clojure.core.async/*go-backend* :fiber]"
          "  (clojure.core.async/go-spawn (fn* [] nil))"      ; start the carriers
@@ -115,20 +115,20 @@
     (let ((v (ev (string-append
                   "(first (clojure.core.async/alts!! "
                   "[__out (clojure.core.async/timeout 10000)]))"))))
-      (list v (- jolt-sm-parks c0) (- jolt-fiber-chan-parks p0)))))
+      (list v (- (jolt-sm-parks) c0) (- (jolt-fiber-chan-parks) p0)))))
 
 ;; a step: wait for N cheap parks so far, then feed v
 (define (after-cheap label n v)
   (lambda (c0 p0)
     (when (wait-counter (string-append label ": cheap park #" (number->string n))
-                        (lambda () jolt-sm-parks) (+ c0 n))
+                        jolt-sm-parks (+ c0 n))
       (when v (feed1 v)))))
 
 ;; a step: wait for N captures so far, then feed v
 (define (after-capture label n v)
   (lambda (c0 p0)
     (when (wait-counter (string-append label ": capture #" (number->string n))
-                        (lambda () jolt-fiber-chan-parks) (+ p0 n))
+                        jolt-fiber-chan-parks (+ p0 n))
       (when v (feed1 v)))))
 
 ;; a park the pass rewrote: cheap, and nothing captured
@@ -189,7 +189,6 @@
    (list "park through a call" "(go (inc (helper-take c)))" "5" "6")
    (list "park inside try" "(go (try (<! c) (catch Throwable e :caught)))" "5" "5")
    (list "park in a vector literal" "(go (vector (<! c) :b))" "1" "[1 :b]")
-   ;; eval cannot see the local c, on jolt or on the JVM — park through a global
    ;; eval runs with its own current ns and cannot see the local c (nor can it on
    ;; the JVM) — park through a qualified global instead
    (list "park through eval" "(go (inc (eval '(clojure.core.async/<! user/evch))))" "5" "6")

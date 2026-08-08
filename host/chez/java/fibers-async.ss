@@ -30,9 +30,11 @@
 ;;
 ;; alts! is unchanged this round; R4 replaces it with a wait set.
 
-;; The capture counter the gate asserts on: how many continuation captures
-;; happened in fiber channel ops. The immediate path never touches it.
-(define jolt-fiber-chan-parks 0)
+;; The capture counter the gate asserts on — how many continuation captures
+;; happened in fiber channel ops — is (jolt-fiber-chan-parks), summed over the
+;; carriers in fibers.ss. Bumped here through jolt-fiber-bump-chan-parks!, which
+;; touches only the parking fiber's own carrier. The immediate path never
+;; touches it.
 
 ;; A waiter handler whose wake is fiber f — the fiber-wake strategy.
 (define (jolt-fiber-waiter f) (alt-handler-alloc f))
@@ -42,9 +44,19 @@
 ;; it before parking and with-mutex cannot do that. A throw would otherwise escape
 ;; with the mutex held and deadlock every later op on that channel.
 ;; jolt-async-give is unaffected: its with-mutex releases on the unwind.
+;;
+;; The guard is CONDITIONAL because guard costs a call/cc per entry and this sits
+;; on every fiber put. Both callers run async-check-put! before taking the mutex
+;; (that hoist is what makes this safe — do not remove it), so with the nil check
+;; already done the only thrower left inside ac-try-give!/locked is the transducer
+;; step; the rest is a buffer push and a notify. A channel with no xform cannot
+;; raise here and does not pay for the frame. The redundant async-check-put! that
+;; ac-try-give!/locked still does is left alone: it guards the OTHER callers.
 (define (jolt-chan-locked-give! ch v)
-  (guard (e (#t (mutex-release (async-chan-mu ch)) (raise e)))
-    (ac-try-give!/locked ch v)))
+  (if (async-chan-xrf ch)
+      (guard (e (#t (mutex-release (async-chan-mu ch)) (raise e)))
+        (ac-try-give!/locked ch v))
+      (ac-try-give!/locked ch v)))
 
 ;; (jolt-fiber-<! ch) -> value | nil (closed). Fiber-side take: a buffered
 ;; value, a waiting putter, or a closed channel complete immediately (no
@@ -142,7 +154,7 @@
                  #f
                  (begin (jolt-fiber-state-set! f 'parked) #t)))))
       (when park?
-        (set! jolt-fiber-chan-parks (+ jolt-fiber-chan-parks 1))
+        (jolt-fiber-bump-chan-parks! f)
         (jolt-fiber-to-scheduler! f))
       (alt-handler-mailbox h))))
 

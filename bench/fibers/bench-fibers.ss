@@ -507,8 +507,8 @@
     ;; the representation, in the same run as the number: a cheap park holds no
     ;; continuation, a capture holds one for every process
     (printf "holding-a-continuation: ~a/~a\n" n-captured k)
-    (printf "cheap-parks: ~a\n" jolt-sm-parks)
-    (printf "captures: ~a\n" jolt-fiber-chan-parks)
+    (printf "cheap-parks: ~a\n" (jolt-sm-parks))
+    (printf "captures: ~a\n" (jolt-fiber-chan-parks))
     (flush!)))
 
 
@@ -550,18 +550,16 @@
         (let ((t2 (mono-nanos)))
           (list (/ (exact->inexact (- t2 t1)) k)
                 (eq? (jolt-fiber-state f) (quote done)))))))
-  (jolt-fiber-carrier-count-set! 1)
-  (jolt-fiber-pool-reset!)
   ;; ONE arm per process. Run in the same process the second arm read 25% slower
   ;; than the first whichever order they went in, so the ordering bias was larger
   ;; than the effect — the memory phases are split for the same reason.
   (jolt-fiber-carrier-count-set! 1)
   (jolt-fiber-pool-reset!)
-  (let* ((c0 jolt-sm-parks)
-         (p0 jolt-fiber-chan-parks)
+  (let* ((c0 (jolt-sm-parks))
+         (p0 (jolt-fiber-chan-parks))
          (r (arm kind))
-         (c1 jolt-sm-parks)
-         (p1 jolt-fiber-chan-parks))
+         (c1 (jolt-sm-parks))
+         (p1 (jolt-fiber-chan-parks)))
     (printf "arm: ~a\n" kind)
     (printf "round-trips: ~a\n" k)
     (printf "ns-per-round-trip: ~a\n" (car r))
@@ -596,6 +594,7 @@
      (printf "  spawn-thread K | spawn-fiber K | spawn-fiber-go K\n")
      (printf "  mem-baseline | mem-fiber-raw | mem-fiber-go | mem-thread\n")
      (printf "  mem-sm-park | mem-cap-park\n")
+     (printf "  park-switch-sm | park-switch-cap\n")
      (printf "  ping-thread | ping-fiber | fanin-thread | fanin-fiber\n")
      (printf "  switch | scaling\n")
      (exit 1))))

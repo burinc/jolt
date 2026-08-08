@@ -150,10 +150,39 @@
 ;;     values (thread parameters are per thread). Per carrier, allocated once.
 ;; The park-unwinding flag is a vreg (slot 1) for exactly this reason — per
 ;; thread — so it needs no carrier record at all.
+;; sm-parks / chan-parks: the two park counters the gates and benches assert on —
+;; a cheap park (java/sm.ss) and a continuation capture (java/fibers-async.ss).
+;; They live on the CARRIER, not in a global, because a carrier only ever bumps
+;; its own: as one global `set!` from N carrier threads the increments are a
+;; read-modify-write with no lock, so they are lost updates waiting to happen, and
+;; run-gosm.ss asserts EXACT deltas on them. Per-carrier keeps the bump free (no
+;; lock on the park path this round exists to make cheap) and the totals exact.
+;; Summed by jolt-sm-parks / jolt-fiber-chan-parks below; a pool reset zeroes
+;; them along with the carriers, which is what the benches want.
 (define-record-type jolt-carrier
   (fields mu cv (mutable head) (mutable tail)
-          (mutable sched-k) sched-slice (mutable thread) (mutable stop?))
-  (nongenerative jolt-carrier-v1))
+          (mutable sched-k) sched-slice (mutable thread) (mutable stop?)
+          (mutable sm-parks) (mutable chan-parks))
+  (nongenerative jolt-carrier-v2))
+
+;; (jolt-fiber-bump-sm-parks! f) / (jolt-fiber-bump-chan-parks! f) — called by the
+;; parking fiber, on its own carrier's field, so no two threads touch one field.
+(define (jolt-fiber-bump-sm-parks! f)
+  (let ((c (jolt-fiber-carrier f)))
+    (jolt-carrier-sm-parks-set! c (+ 1 (jolt-carrier-sm-parks c)))))
+(define (jolt-fiber-bump-chan-parks! f)
+  (let ((c (jolt-fiber-carrier f)))
+    (jolt-carrier-chan-parks-set! c (+ 1 (jolt-carrier-chan-parks c)))))
+(define (jolt-carrier-total get)
+  (let ((v jolt-fiber-carriers))
+    (if (not v)
+        0
+        (let loop ((i 0) (n 0))
+          (if (fx=? i (vector-length v)) n (loop (fx+ i 1) (+ n (get (vector-ref v i)))))))))
+;; Cheap parks (the CPS'd bodies) and continuation captures (every other park),
+;; across the whole pool. Procedures, not variables — the totals are summed.
+(define (jolt-sm-parks) (jolt-carrier-total jolt-carrier-sm-parks))
+(define (jolt-fiber-chan-parks) (jolt-carrier-total jolt-carrier-chan-parks))
 
 ;; The pool. jolt-fiber-carriers is the vector of carrier records, built at
 ;; the FIRST spawn with the current count; carrier THREADS start lazily at the
@@ -226,7 +255,7 @@
         (do ((i 0 (fx+ i 1))) ((fx=? i n))
           (vector-set! v i
             (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
-                               (make-jolt-dslice #f #f #f) #f #f)))
+                               (make-jolt-dslice #f #f #f) #f #f 0 0)))
         (set! jolt-fiber-carriers v)))
     (mutex-release jolt-fiber-rr-mu)))
 
@@ -446,6 +475,13 @@
 (define (jolt-fiber-resume* f)
   (case (jolt-fiber-state f)
     ((ready)
+     ;; 'running on every entry, not just the first. A resume used to leave it
+     ;; 'ready, so 'ready meant both "on the run queue" and "executing" — the
+     ;; state machine at the top of this file and alt-deliver!'s race argument
+     ;; (async.ss) both name 'running for the second. Nothing reads it: the
+     ;; deliver race turns on the commit under the handler's wmu, and
+     ;; sa-fiber-resume acts only on 'parked. The comments should still be true.
+     (jolt-fiber-state-set! f 'running)
      (cond
        ((jolt-fiber-k f) ((jolt-fiber-k f)))
        ;; An sm RESUME (a pending step, not #f/'running): the thunk is java/sm.ss's
@@ -456,7 +492,6 @@
        ;; call/cc off the resume path the cheap park exists to make cheap.
        ((procedure? (jolt-fiber-sm f)) ((jolt-fiber-thunk f)))
        (else
-        (jolt-fiber-state-set! f 'running)
         (let ((r (guard (e (#t (jolt-fiber-dead! f e)))
                     ((jolt-fiber-thunk f)))))
           (jolt-fiber-done! f r)))))

@@ -123,7 +123,7 @@
 (sa-fiber-run-all)
 (ok "1. thread got the value" (eq? t1-val 42))
 (ok "1. fiber put completed" (eq? (jolt-fiber-result f1) #t))
-(ok "1. exactly one park (the put)" (= jolt-fiber-chan-parks 1))
+(ok "1. exactly one park (the put)" (= (jolt-fiber-chan-parks) 1))
 
 ;; --- 2. thread -> fiber, unbuffered ------------------------------------------
 ;; The fiber's <! parks (empty); the thread's blocking put delivers the value
@@ -133,28 +133,28 @@
 (define f2 (sa-fiber-spawn (lambda () (jolt-fiber-<! ch2))))
 (sa-fiber-run-all)
 (ok "2. fiber taker parked" (eq? (jolt-fiber-state f2) 'parked))
-(define p2 jolt-fiber-chan-parks)
+(define p2 (jolt-fiber-chan-parks))
 (ok "2. thread put completed (taker already waiting)" (eq? (jolt-async-give ch2 43) #t))
 (sa-fiber-run-all)
 (ok "2. fiber got the value" (eq? (jolt-fiber-result f2) 43))
-(ok "2. no additional capture" (= jolt-fiber-chan-parks p2))
+(ok "2. no additional capture" (= (jolt-fiber-chan-parks) p2))
 
 ;; --- 3. buffered, both directions (immediate) --------------------------------
 ;; Room on the put side and a buffered value on the take side complete without
 ;; parking — the capture counter must not move.
 (printf "\n== 3. buffered, both directions (immediate) ==\n")
 (define ch3 (jolt-async-chan 2))
-(define p3 jolt-fiber-chan-parks)
+(define p3 (jolt-fiber-chan-parks))
 (define f3a (sa-fiber-spawn (lambda () (jolt-fiber->! ch3 1))))
 (sa-fiber-run-all)
 (ok "3. fiber put into room: immediate, no capture"
-    (and (eq? (jolt-fiber-result f3a) #t) (= jolt-fiber-chan-parks p3)))
+    (and (eq? (jolt-fiber-result f3a) #t) (= (jolt-fiber-chan-parks) p3)))
 (ok "3. thread take got the value" (eq? (jolt-async-take ch3) 1))
 (ok "3. thread put into room" (eq? (jolt-async-give ch3 2) #t))
 (define f3b (sa-fiber-spawn (lambda () (jolt-fiber-<! ch3))))
 (sa-fiber-run-all)
 (ok "3. fiber take of a buffered value: immediate, no capture"
-    (and (eq? (jolt-fiber-result f3b) 2) (= jolt-fiber-chan-parks p3)))
+    (and (eq? (jolt-fiber-result f3b) 2) (= (jolt-fiber-chan-parks) p3)))
 
 ;; --- 4. a take that finds a waiting putter: immediate, no capture ------------
 (printf "\n== 4. take finds a waiting putter: no capture ==\n")
@@ -162,10 +162,10 @@
 (define f4p (sa-fiber-spawn (lambda () (jolt-fiber->! ch4 5))))
 (sa-fiber-run-all)
 (ok "4. putter parked" (eq? (jolt-fiber-state f4p) 'parked))
-(define p4 jolt-fiber-chan-parks)
+(define p4 (jolt-fiber-chan-parks))
 (define f4t (sa-fiber-spawn (lambda () (jolt-fiber-<! ch4))))
 (sa-fiber-run-all)
-(ok "4. taker drained the putter without parking" (= jolt-fiber-chan-parks p4))
+(ok "4. taker drained the putter without parking" (= (jolt-fiber-chan-parks) p4))
 (ok "4. taker got the value" (eq? (jolt-fiber-result f4t) 5))
 (ok "4. putter completed" (eq? (jolt-fiber-result f4p) #t))
 
@@ -177,13 +177,13 @@
 (define t5-val 'unset)
 (fork-thread (lambda () (set! t5-val (jolt-async-take ch5))))
 (wait-until (lambda () (> (async-chan-takew ch5) 0)) 5.0 "thread blocked in take")
-(define p5 jolt-fiber-chan-parks)
+(define p5 (jolt-fiber-chan-parks))
 (define f5 (sa-fiber-spawn (lambda () (jolt-fiber->! ch5 44))))
 (sa-fiber-run-all)
 (wait-until (lambda () (not (eq? t5-val 'unset))) 5.0 "thread take completed")
 (ok "5. thread got the fiber's value" (eq? t5-val 44))
 (ok "5. fiber put completed immediately, no capture"
-    (and (eq? (jolt-fiber-result f5) #t) (= jolt-fiber-chan-parks p5)))
+    (and (eq? (jolt-fiber-result f5) #t) (= (jolt-fiber-chan-parks) p5)))
 
 ;; --- 5b. put! completes on the caller against a parked fiber taker -----------
 ;; Without the ac-try-give! alt-taker clause, put! would see 'full and fork a
@@ -216,7 +216,7 @@
   (spawn-n N6 (lambda (i) (sa-fiber-spawn (lambda () (let ((v (jolt-fiber-<! ch6))) (with-mutex log-mu (set! log6 (cons v log6)))))))))
 (sa-fiber-run-all)
 (ok "6a. all fiber-takers parked" (all? (lambda (f) (eq? (jolt-fiber-state f) 'parked)) fs6))
-(define p6 jolt-fiber-chan-parks)
+(define p6 (jolt-fiber-chan-parks))
 (define t6-done (make-vector M6 #f))
 (spawn-n M6 (lambda (i)
               (fork-thread (lambda ()
@@ -227,7 +227,7 @@
 (ok "6a. every value delivered exactly once"
     (equal? (sort (lambda (a b) (< a b)) log6) '(100 101 102 103 104 105)))
 (ok "6a. all fiber-takers done" (all-done? fs6))
-(ok "6a. no extra captures" (= jolt-fiber-chan-parks p6))
+(ok "6a. no extra captures" (= (jolt-fiber-chan-parks) p6))
 
 ;; --- 6b. N fiber-putters, M thread-takers: exactly once -----------------------
 ;; Threads block in take (takew); a fiber put either completes immediately
@@ -279,12 +279,12 @@
 (define f8a (sa-fiber-spawn (lambda () (jolt-fiber-<! ch8))))
 (sa-fiber-run-all)
 (ok "8. taker parked" (eq? (jolt-fiber-state f8a) 'parked))
-(define p8 jolt-fiber-chan-parks)
+(define p8 (jolt-fiber-chan-parks))
 (define f8b (sa-fiber-spawn (lambda () (jolt-fiber->! ch8 8))))
 (sa-fiber-run-all)
 (ok "8. putter completed via pairing" (eq? (jolt-fiber-result f8b) #t))
 (ok "8. taker got the value" (eq? (jolt-fiber-result f8a) 8))
-(ok "8. only the taker parked" (= jolt-fiber-chan-parks p8))
+(ok "8. only the taker parked" (= (jolt-fiber-chan-parks) p8))
 (ok "8. both done" (and (eq? (jolt-fiber-state f8a) 'done) (eq? (jolt-fiber-state f8b) 'done)))
 
 ;; --- 9. offer! completes against a parked fiber taker -------------------------
@@ -293,9 +293,9 @@
 (define f9 (sa-fiber-spawn (lambda () (jolt-fiber-<! ch9))))
 (sa-fiber-run-all)
 (ok "9. fiber taker parked" (eq? (jolt-fiber-state f9) 'parked))
-(define p9 jolt-fiber-chan-parks)
+(define p9 (jolt-fiber-chan-parks))
 (ok "9. offer! completed" (eq? (jolt-async-offer! ch9 9) #t))
-(ok "9. no capture" (= jolt-fiber-chan-parks p9))
+(ok "9. no capture" (= (jolt-fiber-chan-parks) p9))
 (sa-fiber-run-all)
 (ok "9. fiber got the value" (eq? (jolt-fiber-result f9) 9))
 

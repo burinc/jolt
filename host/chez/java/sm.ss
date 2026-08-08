@@ -19,10 +19,12 @@
 ;; __do-alts is its own round) and a park inside a try (the rewrite would have to
 ;; carry the exception frame explicitly). Both fall back to the capture.
 
-;; The cheap-park counter, the mirror of fibers-async.ss's jolt-fiber-chan-parks
-;; (continuation captures in channel ops). The gates read both: a body whose parks
-;; were all rewritten moves this one and leaves that one alone.
-(define jolt-sm-parks 0)
+;; The cheap-park counter is (jolt-sm-parks), the mirror of
+;; (jolt-fiber-chan-parks) (continuation captures in channel ops). Both are summed
+;; over the carriers in fibers.ss and bumped through jolt-fiber-bump-sm-parks! /
+;; jolt-fiber-bump-chan-parks!, which touch only the parking fiber's own carrier.
+;; The gates read both: a body whose parks were all rewritten moves this one and
+;; leaves that one alone.
 
 ;; --- the park ---------------------------------------------------------------
 ;; Store the rest of the computation and hand the carrier back. The differences
@@ -43,7 +45,7 @@
     (error 'jolt-sm-park!
            "cheap park outside a CPS'd go body (needs jolt-sm-drive as the fiber thunk)"
            (jolt-fiber-sm f)))
-  (set! jolt-sm-parks (+ jolt-sm-parks 1))
+  (jolt-fiber-bump-sm-parks! f)
   (jolt-fiber-sm-set! f resume)
   (jolt-fiber-k-set! f #f)
   (set-virtual-register! jolt-vreg-current-fiber 0)

@@ -85,8 +85,8 @@
          (f (sa-fiber-spawn (lambda () (jolt-sm-drive w body-fn)))))
     (cons f w)))
 
-(define (cheap) jolt-sm-parks)
-(define (caught) jolt-fiber-chan-parks)
+(define (cheap) (jolt-sm-parks))
+(define (caught) (jolt-fiber-chan-parks))
 
 (printf "== R7: the cheap park ==\n")
 

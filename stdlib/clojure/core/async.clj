@@ -47,9 +47,18 @@
 
 ;; Forms the pass does not look inside. A park in one of them stays where it is;
 ;; a park-free one is emitted whole.
+;;
+;; This is clojure.core/special-syms minus the five heads the pass DOES rewrite
+;; (do let* if loop* recur), plus defmacro and import*. Listing the rest
+;; exhaustively is the point: a special form that falls through to sm-cps's
+;; :else arm is rebuilt as an ordinary application, which evaluates its subforms
+;; as expressions — a silent miscompile. case* / deftype* / reify* are
+;; unreachable today (jolt's `case` expands to let* + if, `reify` to a
+;; (make-reified {...} "iface") call), so they are here to make the fallback true
+;; by construction rather than by accident of how those macros expand.
 (def ^:private sm-opaque
-  '#{quote try fn* letfn* set! def defmacro throw var syntax-quote
-     monitor-enter monitor-exit new .})
+  '#{quote try catch finally fn* letfn* set! def defmacro throw var
+     monitor-enter monitor-exit new . & case* deftype* reify* import*})
 
 ;; recur inside one of these targets it, not an enclosing loop.
 (def ^:private sm-recur-barrier '#{fn* loop* letfn*})
