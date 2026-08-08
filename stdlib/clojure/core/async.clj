@@ -209,16 +209,16 @@
 (defn- sm-cps-if
   [ctx form k]
   (let [t (second form)
-        arms (drop 2 form)]
-    (let [ts (gensym "t__")]
-      (sm-kont ctx ts
-               (fn [c]
-                 (list 'if ts
-                       (sm-cps c (first arms) k)
-                       (if (> (count arms) 1)
-                         (sm-cps c (second arms) k)
-                         (list k nil))))
-               (fn [c ks] (sm-cps c t ks))))))
+        arms (drop 2 form)
+        ts (gensym "t__")]
+    (sm-kont ctx ts
+             (fn [c]
+               (list 'if ts
+                     (sm-cps c (first arms) k)
+                     (if (> (count arms) 1)
+                       (sm-cps c (second arms) k)
+                       (list k nil))))
+             (fn [c ks] (sm-cps c t ks)))))
 
 (defn- sm-cps
   "Rewrite form so that its value is passed to the continuation named by k."
