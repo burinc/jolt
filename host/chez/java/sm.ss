@@ -28,9 +28,9 @@
 ;; Store the rest of the computation and hand the carrier back. The differences
 ;; from jolt-fiber-to-scheduler! are the whole point: no call/1cc, and k is left
 ;; CLEAR so the scheduler re-enters through the thunk (jolt-sm-drive below), which
-;; is what re-establishes the body's guard on every resume. Everything else —
-;; clearing the current-fiber vreg, saving the slice, flagging the escape as a park
-;; so try/finally after-thunks skip — is identical, and has to be.
+;; is what re-establishes the body's exception handler on every resume. Everything
+;; else — clearing the current-fiber vreg, saving the slice, flagging the escape as
+;; a park so try/finally after-thunks skip — is identical, and has to be.
 (define (jolt-sm-park! f resume)
   ;; The sm field holds 'running while a driver is on the stack, the pending step
   ;; while parked, #f otherwise. A cheap park is only correct UNDER a driver: the
@@ -66,37 +66,39 @@
         (resume))))
 
 ;; --- the driver -------------------------------------------------------------
-;; The fiber thunk of a CPS'd body, run on the first entry and on every resume
-;; (jolt-fiber-resume* enters through the thunk whenever k is clear, and a cheap
-;; park clears it). The guard therefore wraps the body again on each resume, which
-;; an ordinary closure stored in k would not do — a captured continuation carries
-;; resume*'s guard frame inside itself, a closure has no frames at all.
+;; The fiber thunk of a CPS'd body. It runs on the first entry AND on every
+;; resume, because jolt-fiber-resume* enters through the thunk whenever k is
+;; clear and a cheap park clears it. That re-entrance is what makes the body's
+;; error handling survive a park: a cheap park leaves no frames, so nothing else
+;; could put the handler back.
 ;;
-;; The go channel closes on a throw, the way async-go-spawn-thread and
-;; jolt-fiber-go-spawn both do it.
+;; The handler's job is jolt-fiber-go-spawn's contract for a throwing body —
+;; report it and CLOSE the result channel, so a reader sees nil instead of
+;; waiting forever. resume* deliberately does not guard an sm resume (its handler
+;; marks the fiber dead WITHOUT closing that channel, which is the wrong one),
+;; so this is the only thing between a throwing body and the carrier.
+;;
+;; with-exception-handler and not `guard`: guard unwinds to its own body, which
+;; costs a call/cc per entry, and this sits on the resume path the cheap park
+;; exists to make cheap (measured: 1.25x -> 1.05x). Nothing here needs the
+;; unwind — jolt-fiber-dead! escapes to the scheduler itself, so the handler
+;; never returns to the raise point.
 (define (jolt-sm-drive w body-fn)
   (let ((f (jolt-current-fiber)))
-    ;; with-exception-handler, NOT guard: guard unwinds to its own body, which
-;; costs a call/cc on every entry — and this runs on every resume, which is
-;; exactly the path the cheap park exists to make cheap. Nothing here needs the
-;; unwind: the handler reports, closes the channel, and jolt-fiber-dead! escapes
-;; to the scheduler itself, so it never returns to the raise point.
     (with-exception-handler
       (lambda (e)
-        ;; the handler is the ONLY thing between a throwing body and the carrier
-        ;; (resume* deliberately does not guard an sm resume), so a failure while
-        ;; reporting or closing must still mark the fiber dead
+        ;; a failure while reporting or closing must still mark the fiber dead
         (guard (_ (#t (jolt-fiber-dead! f e)))
           (async-report-uncaught! "go/fiber body (channel closed)" e)
           (jolt-async-close! w))
         (jolt-fiber-dead! f e))
       (lambda ()
-      (let ((step (jolt-fiber-sm f)))
-        ;; 'running marks "a driver is on the stack" — see jolt-sm-park!
-        (jolt-fiber-sm-set! f 'running)
-        (if (procedure? step)
-            (step)
-            (jolt-invoke body-fn (lambda (v) (jolt-sm-finish! w f v)))))))))
+        (let ((step (jolt-fiber-sm f)))
+          ;; 'running marks "a driver is on the stack" — see jolt-sm-park!
+          (jolt-fiber-sm-set! f 'running)
+          (if (procedure? step)
+              (step)
+              (jolt-invoke body-fn (lambda (v) (jolt-sm-finish! w f v)))))))))
 
 ;; The terminal continuation on a fiber. The value cannot simply be returned: after
 ;; a cheap park nothing is left on the stack to return through, so the delivery and
