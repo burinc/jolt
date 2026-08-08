@@ -91,13 +91,29 @@
 (defn- sm-parks? [ctx form]
   (sm-tree-any? (fn [f] (some? (sm-park-kind ctx (sm-head f)))) form))
 
+(defn- sm-expand
+  "One macroexpansion step chain, skipping a head that names a local."
+  [ctx form]
+  (if (and (seq? form)
+           (symbol? (sm-head form))
+           (not (contains? (:locals ctx) (sm-head form)))
+           (not (contains? sm-opaque (sm-head form))))
+    (macroexpand form)
+    form))
+
 (defn- sm-targets-recur?
-  "A recur that would rebind the loop this pass is rewriting."
-  [form]
-  (cond
-    (= (sm-head form) 'recur) true
-    (contains? sm-recur-barrier (sm-head form)) false
-    :else (boolean (some sm-targets-recur? (sm-children form)))))
+  "A recur that would rebind the loop this pass is rewriting. Expands as it walks:
+  the barrier names are the SPECIAL forms (fn*/loop*/letfn*), so testing them
+  against unexpanded source would miss `loop` and `fn` and mistake an inner loop's
+  recur for this one's — which is a miscompile in either direction."
+  [ctx form]
+  (let [ex (sm-expand ctx form)
+        h (sm-head ex)]
+    (cond
+      (= h 'quote) false
+      (= h 'recur) true
+      (contains? sm-recur-barrier h) false
+      :else (boolean (some (fn [c] (sm-targets-recur? ctx c)) (sm-children ex))))))
 
 ;; A form may be emitted whole only if it neither parks NOR carries a recur this
 ;; pass owns. The recur half is the trap: in
@@ -110,7 +126,7 @@
 ;; recur.
 (defn- sm-inline-ok? [ctx form]
   (and (not (sm-parks? ctx form))
-       (or (nil? (:rec ctx)) (not (sm-targets-recur? form)))))
+       (or (nil? (:rec ctx)) (not (sm-targets-recur? ctx form)))))
 
 (defn- sm-bind [ctx sym] (update ctx :locals conj sym))
 
@@ -212,12 +228,7 @@
     (if-not (seq? form)
       ;; a collection literal holding a park: left whole, parks the old way
       (list k form)
-      (let [h0 (sm-head form)
-            ex (if (and (symbol? h0)
-                        (not (contains? (:locals ctx) h0))
-                        (not (contains? sm-opaque h0)))
-                 (macroexpand form)
-                 form)
+      (let [ex (sm-expand ctx form)
             h (sm-head ex)
             pk (sm-park-kind ctx h)]
         (cond
@@ -245,7 +256,7 @@
           ;; park inside it captures a continuation, and that capture includes the
           ;; pending (k _) frame, so the resume carries on properly.
           (or (contains? sm-opaque h) (not (symbol? h)))
-          (if (and (:rec ctx) (sm-targets-recur? ex)) (sm-bail) (list k form))
+          (if (and (:rec ctx) (sm-targets-recur? ctx ex)) (sm-bail) (list k form))
 
           :else
           (sm-cps-seq ctx (vec (rest ex))
@@ -261,7 +272,7 @@
     (when (and (sm-parks? ctx form)
                ;; a recur in the body targets the body fn itself, whose arity this
                ;; pass changes
-               (not (sm-targets-recur? form)))
+               (not (sm-targets-recur? ctx form)))
       (try
         (let [k (gensym "k__")]
           (list 'fn* [k] (sm-cps (sm-bind ctx k) form k)))

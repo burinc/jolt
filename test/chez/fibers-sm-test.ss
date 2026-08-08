@@ -70,6 +70,14 @@
 
 (define (settled? f) (memq (jolt-fiber-state f) '(done dead)))
 
+;; Hand the fiber ONE value, but only once it is actually parked — otherwise the
+;; producer races the consumer and a take that finds a waiting putter completes
+;; without parking, so the park count would depend on the interleaving. A parked
+;; alt-taker is already registered, so the give completes on this thread.
+(define (feed-parked! f ch v what)
+  (and (pump-until (lambda () (eq? (jolt-fiber-state f) 'parked)) 5.0 what)
+       (begin (jolt-async-give ch v) (sa-fiber-run-all) #t)))
+
 ;; Spawn a CPS'd body the way jolt-sm-fiber-spawn does, minus the carrier start —
 ;; this gate runs the scheduler itself.
 (define (sm-spawn body-fn)
@@ -126,14 +134,13 @@
        (if (fx=? i 5)
            (k acc)
            (jolt-sm-take ch3 (lambda (v) (loop (fx+ i 1) (+ acc v)))))))))
-(define t3-done #f)
-(fork-thread (lambda ()
-               (let loop ((i 1))
-                 (when (fx<=? i 5) (jolt-async-give ch3 i) (loop (fx+ i 1))))
-               (set! t3-done #t)))
+(let loop ((i 1))
+  (when (fx<=? i 5)
+    (feed-parked! (car fw3) ch3 i "3. parked before each value")
+    (loop (fx+ i 1))))
 (pump-until (lambda () (settled? (car fw3))) 5.0 "3. chain finished")
 (ok "3. summed every value" (= (jolt-fiber-result (car fw3)) 15))
-(ok "3. five cheap parks" (= (cheap) (+ c3 5)))
+(ok "3. five cheap parks, one per take" (= (cheap) (+ c3 5)))
 (ok "3. no captures" (= (caught) p3))
 
 ;; --- 4. MIXING cheap parks and captures in one body --------------------------
@@ -152,10 +159,11 @@
        (lambda (a)
          (let ((b (helper-take ch4)))            ; captures a continuation
            (jolt-sm-take ch4 (lambda (c) (k (list a b c))))))))))
-(fork-thread (lambda ()
-               (jolt-async-give ch4 'a)
-               (jolt-async-give ch4 'b)
-               (jolt-async-give ch4 'c)))
+;; one value per observed park, so the counts are the mechanism and not the race:
+;; park 1 is cheap, park 2 is the helper's capture, park 3 is cheap again
+(feed-parked! (car fw4) ch4 'a "4. parked on the first (cheap) take")
+(feed-parked! (car fw4) ch4 'b "4. parked on the helper's (captured) take")
+(feed-parked! (car fw4) ch4 'c "4. parked on the third (cheap) take")
 (pump-until (lambda () (settled? (car fw4))) 5.0 "4. mixed body finished")
 (ok "4. every park delivered, in order"
     (equal? (jolt-fiber-result (car fw4)) '(a b c)))
@@ -163,9 +171,12 @@
 (ok "4. exactly one capture" (= (caught) (+ p4 1)))
 
 ;; --- 5. a throw after a cheap park --------------------------------------------
-;; The resume runs under a guard the DRIVER installs; a stored closure carries no
-;; frames, so without that guard this throw would escape the scheduler and take
-;; the carrier with it. The sibling finishing is the proof it did not.
+;; A cheap park leaves no frames, so the body's error handling has to be
+;; re-established on each resume. It is: the resume re-enters through the thunk,
+;; which is the driver, whose guard reports the throw and CLOSES the go channel —
+;; the contract jolt-fiber-go-spawn has for a throwing body. Drop that guard and
+;; "its channel was closed" fails (verified); resume*'s own thunk-path guard still
+;; marks the fiber dead, which is why the carrier survives either way.
 (printf "\n== 5. a throw after a cheap park kills only its own process ==\n")
 (define ch5 (jolt-async-chan))
 (define ch5b (ac-make 1 'fixed #f))

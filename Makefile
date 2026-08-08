@@ -57,7 +57,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
-  gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
+  gateboot gatebootsmoke gosm httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
   traceemit \
@@ -121,7 +121,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   fnform traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
-  certify gambitcheck fibers
+  certify gambitcheck fibers gosm
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -409,6 +409,13 @@ wp:
 # protocol var; the result must match ordinary dispatch.
 devirt:
 	@$(CHEZ) --script host/chez/run-devirt.ss
+
+# Fibers R7 (jolt-nvpr.9): the CPS pass over a go body. Asserts WHICH
+# representation each park site got (on the expansion, and on the cheap-park vs
+# capture counters), that the fallbacks still work, and that both backends give
+# the same values.
+gosm:
+	@$(CHEZ) --script host/chez/run-gosm.ss
 
 # Native record field reads: a keyword lookup on a statically-known record reads
 # the field by its declared slot (jrec-field-at) instead of jolt-get; the value
