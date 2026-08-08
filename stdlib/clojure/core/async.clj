@@ -1,8 +1,10 @@
 ;; clojure.core.async — higher-level dataflow API over the channel primitives.
 ;;
 ;; The primitives (chan, <!, >!, <!!, >!!, close!, put!, take!, offer!, timeout,
-;; promise-chan, buffer/dropping-buffer/sliding-buffer, go/go-loop/thread, go-spawn)
-;; are provided natively (host/chez/java/async.ss) on real OS threads. This overlay
+;; promise-chan, buffer/dropping-buffer/sliding-buffer, thread, go-spawn) are
+;; provided natively (host/chez/java/async.ss) on real OS threads. go and go-loop
+;; are NOT: they are defined below, because the pass that picks a park's
+;; representation per site needs &env, macroexpand and resolve. This overlay
 ;; adds the portable dataflow operators — alts!, pipe, pipeline, split, reduce,
 ;; transduce, mult, mix, pub/sub, map, merge, and the deprecated map</map>/… —
 ;; ported from clojure.core.async over those primitives. Because go blocks are real
@@ -70,11 +72,26 @@
 
 (defn- sm-head [form] (when (seq? form) (first form)))
 
+;; A head as the ANALYZER will read it. A special-form head may arrive
+;; clojure.core-QUALIFIED and still dispatch to the special form: analyze-list*
+;; builds its sf-name from either spelling, because syntax-quote qualifies a
+;; macro like `letfn` whose expansion the analyzer lowers as a special form. So
+;; (clojure.core/let* …) and (let* …) are the same form to the compiler, and this
+;; pass has to agree — matching only the unqualified spelling drops a qualified
+;; let* / try / quote / fn* / recur through to sm-cps's :else arm, where it is
+;; rebuilt as an ordinary application and its subforms are evaluated as
+;; expressions. That evaluates a binding vector, a catch clause, or a quoted
+;; datum, and hoists a park out of a fn body — silently.
+(defn- sm-sf-head
+  [form]
+  (let [h (sm-head form)]
+    (if (and (symbol? h) (= "clojure.core" (namespace h))) (symbol (name h)) h)))
+
 (defn- sm-children
   "Subforms to walk for a tree predicate. A quoted form has none."
   [form]
   (cond
-    (= (sm-head form) 'quote) nil
+    (= (sm-sf-head form) 'quote) nil
     (seq? form) (seq form)
     (vector? form) (seq form)
     (set? form) (seq form)
@@ -106,7 +123,7 @@
   (if (and (seq? form)
            (symbol? (sm-head form))
            (not (contains? (:locals ctx) (sm-head form)))
-           (not (contains? sm-opaque (sm-head form))))
+           (not (contains? sm-opaque (sm-sf-head form))))
     (macroexpand form)
     form))
 
@@ -117,7 +134,7 @@
   recur for this one's — which is a miscompile in either direction."
   [ctx form]
   (let [ex (sm-expand ctx form)
-        h (sm-head ex)]
+        h (sm-sf-head ex)]
     (cond
       (= h 'quote) false
       (= h 'recur) true
@@ -237,8 +254,13 @@
     (if-not (seq? form)
       ;; a collection literal holding a park: left whole, parks the old way
       (list k form)
+      ;; h is the head as WRITTEN (what a park test and a rebuilt application need)
+      ;; and sf is the same head as the analyzer reads it — the two differ only for
+      ;; a clojure.core-qualified special form, and every dispatch below turns on
+      ;; sf so that spelling cannot slip past into the :else arm.
       (let [ex (sm-expand ctx form)
             h (sm-head ex)
+            sf (sm-sf-head ex)
             pk (sm-park-kind ctx h)]
         (cond
           pk
@@ -250,12 +272,12 @@
                                  'clojure.core.async/__sm-put)
                                (concat args [k]))))
 
-          (= h 'do) (sm-cps-body ctx (rest ex) k)
-          (= h 'let*) (sm-cps-let ctx (vec (second ex)) (drop 2 ex) k)
-          (= h 'if) (sm-cps-if ctx ex k)
-          (= h 'loop*) (sm-cps-loop ctx (vec (second ex)) (drop 2 ex) k)
+          (= sf 'do) (sm-cps-body ctx (rest ex) k)
+          (= sf 'let*) (sm-cps-let ctx (vec (second ex)) (drop 2 ex) k)
+          (= sf 'if) (sm-cps-if ctx ex k)
+          (= sf 'loop*) (sm-cps-loop ctx (vec (second ex)) (drop 2 ex) k)
 
-          (= h 'recur)
+          (= sf 'recur)
           (let [rec (:rec ctx)]
             (when (or (nil? rec) (not= (count (rest ex)) (:n rec))) (sm-bail))
             (sm-cps-seq ctx (vec (rest ex))
@@ -264,7 +286,7 @@
           ;; A form this pass does not rewrite. Emitting it whole is correct: a
           ;; park inside it captures a continuation, and that capture includes the
           ;; pending (k _) frame, so the resume carries on properly.
-          (or (contains? sm-opaque h) (not (symbol? h)))
+          (or (contains? sm-opaque sf) (not (symbol? h)))
           (if (and (:rec ctx) (sm-targets-recur? ctx ex)) (sm-bail) (list k form))
 
           :else
@@ -276,7 +298,12 @@
   was. nil means: nothing here parks where the pass can see it, or the body did
   something the pass will not guess at."
   [env body]
-  (let [ctx {:env env :locals #{} :rec nil}
+  ;; :locals starts from the ENCLOSING scope, not empty. sm-park-kind is already
+  ;; safe without it ((resolve &env sym) answers nil for a local), but sm-expand
+  ;; calls the one-argument macroexpand, which has no env — so a `go` written
+  ;; inside a scope whose local shares a name with a macro would have that local's
+  ;; call expanded as the macro.
+  (let [ctx {:env env :locals (if env (set (keys env)) #{}) :rec nil}
         form (if (= 1 (count body)) (first body) (cons 'do body))]
     (when (and (sm-parks? ctx form)
                ;; a recur in the body targets the body fn itself, whose arity this

@@ -69,6 +69,34 @@
 (define x-loop (go-expansion "(go-loop [] (let [v (<! ch)] (when v (recur))))"))
 (gate-check "go-loop park -> __sm-take" (gate-sub? x-loop "__sm-take") #t)
 
+;; A special-form head may arrive clojure.core-QUALIFIED and still be that special
+;; form to the analyzer (analyze-list*'s sf-name arm; verified here by evaluating
+;; one). The pass must read it the same way, or it rebuilds the form as an
+;; application and evaluates a binding vector / a catch clause / a quoted datum as
+;; an expression, and hoists a park out of a fn body. Each of these produced
+;; exactly that before sm-sf-head existed, so the checks are on the EXPANSION —
+;; the values below would not all fail.
+(gate-check "the analyzer does treat a qualified head as the special form"
+            (ev "(clojure.core/let* [x 1] (+ x 1))") 2)
+(define x-qlet (go-expansion "(go (clojure.core/let* [v (<! ch)] v))"))
+(gate-check "qualified let*: not rebuilt as an application"
+            (gate-sub? x-qlet "clojure.core/let*") #f)
+(gate-check "qualified let*: rewritten like let*" (gate-sub? x-qlet "__sm-take") #t)
+;; try / fn* are opaque, so the body is still CPS'd (__sm-spawn) but the form goes
+;; through WHOLE: the catch clause and the fn body must survive verbatim and the
+;; park must be left to the capture, not rewritten.
+(define x-qtry (go-expansion "(go (clojure.core/try (<! ch) (catch Throwable e :c)))"))
+(gate-check "qualified try: catch clause not evaluated"
+            (gate-sub? x-qtry "(clojure.core/try (<! ch) (catch Throwable e :c))") #t)
+(gate-check "qualified try: park left to capture" (gate-sub? x-qtry "__sm-take") #f)
+(define x-qfn (go-expansion "(go (clojure.core/fn* [] (<! ch)))"))
+(gate-check "qualified fn*: body not hoisted out of the closure"
+            (gate-sub? x-qfn "(clojure.core/fn* [] (<! ch))") #t)
+(gate-check "qualified fn*: park stays inside the closure" (gate-sub? x-qfn "__sm-take") #f)
+;; quote has no children, so the pass never sees the park and declines the body
+(define x-qquote (go-expansion "(go (clojure.core/quote (<! ch)))"))
+(gate-check "qualified quote: datum not evaluated" (gate-sub? x-qquote "__sm-") #f)
+
 ;; --- 2. the counters, on the :fiber backend ---------------------------------
 (printf "\n== 2. cheap parks vs captures, per park site ==\n")
 ;; A helper the pass cannot see through. Its <! parks by capturing.
@@ -193,7 +221,14 @@
    ;; the JVM) — park through a qualified global instead
    (list "park through eval" "(go (inc (eval '(clojure.core.async/<! user/evch))))" "5" "6")
    (list "alts!" "(go (first (alts! [c])))" "5" "5")
-   (list "nested go" "(go (<! (go (<! c))))" "4" "4")))
+   (list "nested go" "(go (<! (go (<! c))))" "4" "4")
+   ;; A local shadows a macro for the analyzer, so it has to shadow it for the
+   ;; pass. sm-park-kind was always right here (resolve consults &env); the trap
+   ;; is sm-expand, which calls the one-argument macroexpand and so has to be told
+   ;; the enclosing locals. Unshadowed this reads 5 through the `or` MACRO, which
+   ;; is what a pass with an empty :locals produces.
+   (list "a local shadowing a macro name"
+         "(let [or (fn [a b] :fn-called)] (go (or (<! c) :b)))" "5" ":fn-called")))
 
 (for-each
  (lambda (cs)
@@ -228,5 +263,40 @@
        "        (let [v (clojure.core.async/<!! o)]"
        "          (pr-str [mid @ran v]))))))")))
 (gate-check "finally skipped on the park, ran once on exit" fin "[0 1 1]")
+
+;; --- 5. what a park must not disturb ----------------------------------------
+(printf "\n== 5. dynamic state across a park, and a blocking thread body ==\n")
+
+;; A dynamic binding has to survive a CHEAP park. It does, but only because
+;; jolt's `binding` expands through a try/finally, which is opaque to the pass —
+;; so the park inside it takes the capture and the frame rides the continuation.
+;; If that expansion ever loses its try, the pass would start rewriting across
+;; the push/pop and the value here would come back :outer with nothing else
+;; failing. Pin it: the park is forced (empty channel, fed after a wait) so this
+;; cannot pass by completing inline.
+(ev "(def ^:dynamic *gosm-x* :outer)")
+(define dynv
+  (fiber-run "binding"
+             (string-append
+              "(clojure.core.async/go"
+              "  (binding [user/*gosm-x* :inner]"
+              "    (let [v (clojure.core.async/<! __ch)] [v user/*gosm-x*])))")
+             (list (after-capture "binding" 1 "1"))))
+(gate-check "binding survives the park" (jolt-pr-str (car dynv)) "[1 :inner]")
+(gate-check "binding: the park really happened" (caddr dynv) 1)
+
+;; The :thread backend arm of __sm-take is the one case 3 never exercises: every
+;; channel there is pre-filled, so the take completes without blocking. Force it
+;; to block, and check the continuation still runs and the value is right.
+(define thr
+  (ev (string-append
+       "(let [c (clojure.core.async/chan)]"
+       "  (binding [clojure.core.async/*go-backend* :thread]"
+       "    (let [o (clojure.core.async/go (inc (clojure.core.async/<! c)))]"
+       "      (Thread/sleep 60)"
+       "      (clojure.core.async/>!! c 41)"
+       "      (pr-str (first (clojure.core.async/alts!! "
+       "                       [o (clojure.core.async/timeout 10000)]))))))")))
+(gate-check "a CPS'd body that BLOCKS on the thread backend" thr "42")
 
 (gate-summary "gosm")

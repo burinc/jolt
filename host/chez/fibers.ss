@@ -490,7 +490,19 @@
        ;; marks the fiber dead without closing the body's go channel, so a reader
        ;; of that channel would wait forever. Skipping it also keeps the guard's
        ;; call/cc off the resume path the cheap park exists to make cheap.
-       ((procedure? (jolt-fiber-sm f)) ((jolt-fiber-thunk f)))
+       ((procedure? (jolt-fiber-sm f))
+        ((jolt-fiber-thunk f))
+        ;; Unreachable: jolt-sm-drive parks, finishes, or dies, and each of those
+        ;; escapes to the scheduler through the carrier's sched-k. But it is the
+        ;; ONE arm here that does not end in an escape or a jolt-fiber-done!, so
+        ;; if the driver ever did return, the fiber would sit in 'running with
+        ;; nothing left to run it, its go channel never closed, and every reader
+        ;; of that channel waiting forever — with no error naming any of it. Kill
+        ;; the fiber instead, which closes nothing but at least records why.
+        (jolt-fiber-dead! f
+          (condition (make-error)
+                     (make-message-condition
+                      "jolt-fiber-resume*: the sm driver returned without completing the fiber"))))
        (else
         (let ((r (guard (e (#t (jolt-fiber-dead! f e)))
                     ((jolt-fiber-thunk f)))))
