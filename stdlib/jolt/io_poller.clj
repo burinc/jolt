@@ -129,11 +129,15 @@
 ;; One monitor serializes everything a fiber and the poller thread share:
 ;;   :fds      {fd {:waiters [fiber ...] :ready bool :filt :read|:write}}
 ;;   :pending  {fd filt}   ; registered by a fiber, not yet in the poller's set
-;;   :to-delete #{fd}      ; processed, EV_DELETE/EPOLL_CTL_DEL pending
 ;;   :pipe     [r w]       ; control pipe — registration wake
 ;;   :kq       n           ; the poller's kqueue / epoll fd
+;; The pending EV_DELETE/EPOLL_CTL_DEL set is NOT here: process-events! hands it
+;; straight to poller-loop, which carries it in a loop variable to the next
+;; poller-round. It used to be mirrored into this atom as :to-delete, written on
+;; every round and read by nobody, which made the round's critical section look
+;; like it was protecting something it was not.
 (def ^:private pm (Object.))
-(def ^:private state (atom {:fds {} :pending {} :to-delete #{} :pipe nil :kq nil :started? false}))
+(def ^:private state (atom {:fds {} :pending {} :pipe nil :kq nil :started? false}))
 
 ;; how many times the poller entered its blocking wait — the R8 gate-3 handle
 (def waits (atom 0))
@@ -166,7 +170,7 @@
   ;; isolation; a stress that keeps registrations landing loses ~11% of them.
   (let [adds (locking pm
                (let [a (:pending @state)]
-                 (swap! state assoc :pending {} :to-delete #{})
+                 (swap! state assoc :pending {})
                  a))]
     (let [nch (+ (count adds) (count to-delete))
           chbuf (when (and macos? (pos? nch)) (ffi/alloc (* 256 KEVENT-SIZE)))]
@@ -197,7 +201,7 @@
   (locking pm
     (loop [fds fds dels #{} woken []]
       (if (empty? fds)
-        (do (swap! state assoc :to-delete (into (:to-delete @state) dels)) [woken dels])
+        [woken dels]
         (let [fd (first fds)]
           (if (= fd (pipe-read!))
             (do (drain-pipe!) (recur (rest fds) dels woken))
