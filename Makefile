@@ -236,6 +236,7 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-go-test.ss
 	@$(CHEZ) --script test/chez/fibers-pool-test.ss
 	@$(CHEZ) --script test/chez/fibers-io-test.ss
+	@$(CHEZ) --script test/chez/fibers-sm-test.ss
 
 # Fibers R6 (jolt-nvpr.7): the :thread vs :fiber benchmark harness. Opt-in and
 # NOT part of the gate — benchmarks do not belong in CI. Runs each measurement
