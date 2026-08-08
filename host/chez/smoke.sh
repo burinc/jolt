@@ -603,6 +603,18 @@ else
   fails=$((fails + 1))
 fi
 
+# A channel transducer's ex-handler receives the ORIGINAL throwable, so ex-data
+# and ex-message survive. It used to be handed the raw raised condition, which
+# reaches jolt code as an opaque #object[:object] with all three nil.
+exh_out="$($jolt -e "(do (require '[clojure.core.async :as a]) (let [seen (atom nil) c (a/chan 1 (map (fn [x] (throw (ex-info \"err\" {:data x})))) (fn [e] (reset! seen e) :err))] (a/>!! c 3) (pr [(ex-data @seen) (ex-message @seen)])))" 2>/dev/null)"
+if [ "$exh_out" = '[{:data 3} "err"]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: transducer ex-handler should get the original ex-info"
+  echo "    got \`$exh_out\`"
+  fails=$((fails + 1))
+fi
+
 # A throwing go/thread body reports to stderr (the JVM's uncaught-exception
 # handler behavior) while the channel still just closes: <!! stays nil.
 thr_out="$($jolt -e "(do (require '[clojure.core.async :as a]) (pr (a/<!! (a/thread (/ 1 0)))))" 2>/tmp/jolt-smoke-thr-err)"

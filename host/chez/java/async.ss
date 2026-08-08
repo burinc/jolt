@@ -224,8 +224,14 @@
 ;; if the xform throws and exh returns non-nil, that value is added to the buffer.
 (define (ac-xrf-apply ch . v)
   (let ((xrf (async-chan-xrf ch)) (exh (async-chan-exh ch)))
+    ;; The handler is jolt code and takes a THROWABLE, so the raised condition
+    ;; has to be unwrapped exactly as a catch clause would — jolt-throw raises a
+    ;; &jolt-throw condition wrapping the value, and handing that straight to the
+    ;; handler delivers an opaque #object[:object] whose ex-data, ex-message and
+    ;; class are all nil. The future path (concurrency.ss) already unwraps; this
+    ;; was the one site that did not.
     (guard (e (#t (if exh
-                      (let ((else (jolt-invoke exh e)))
+                      (let ((else (jolt-invoke exh (jolt-unwrap-throw e))))
                         (unless (jolt-nil? else) (ac-buf-give! ch else))
                         (async-chan-xrf ch))   ; treat as non-reduced
                       (raise e))))
