@@ -158,8 +158,16 @@
 ;; ADDs and last round's DELETEs, then blocks in the ONE collect-safe wait with
 ;; that changelist applied atomically. Returns the fds whose events fired.
 (defn- poller-round [kq to-delete]
-  (let [adds (locking pm (:pending @state))]
-    (locking pm (swap! state assoc :pending {} :to-delete #{}))
+  ;; Read AND clear :pending in ONE critical section. As two — read, then clear —
+  ;; a registration landing in between was erased without ever being applied to
+  ;; the kqueue/epoll set, so that fd's readiness was never reported and the fiber
+  ;; waiting on it never resumed. The window is microseconds, which is why it
+  ;; showed up as one fiber of eight failing to finish, once, and never again in
+  ;; isolation; a stress that keeps registrations landing loses ~11% of them.
+  (let [adds (locking pm
+               (let [a (:pending @state)]
+                 (swap! state assoc :pending {} :to-delete #{})
+                 a))]
     (let [nch (+ (count adds) (count to-delete))
           chbuf (when (and macos? (pos? nch)) (ffi/alloc (* 256 KEVENT-SIZE)))]
       (try

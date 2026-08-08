@@ -474,6 +474,19 @@ else
   fails=$((fails + 1))
 fi
 
+# A readiness registration must never be lost. jolt.io-poller drained its pending
+# registrations in two critical sections, so one landing in between was erased
+# before reaching the kqueue/epoll set and the fiber waiting on that fd never
+# resumed — unfixed this workload loses ~11% of its registrations.
+pr_out="$($jolt run test/chez/poller-registration.clj 2>&1)"
+if printf '%s' "$pr_out" | grep -q 'POLLER-REGISTRATION OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: readiness registrations lost under concurrent parking"
+  echo "    $(printf '%s' "$pr_out" | tail -1)"
+  fails=$((fails + 1))
+fi
+
 # clojure.test extension points (assert-expr / do-report / report) need separate
 # top-level forms — assert-expr must register before `is` expands — so this is a
 # multi-form `jolt run`, not an -e one-liner. The file self-checks its tallies.
