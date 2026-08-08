@@ -192,12 +192,12 @@
 
   {:name "instaparse"
    :paths ["src" "test"]
-   ;; unicode-test was rewritten to jolt's string model: jolt strings are
-   ;; codepoint-indexed with no UTF-16 surrogate pairs, so (str (first
-   ;; "<astral>")) is the whole character and parses. The JVM's "feed a lone
-   ;; surrogate half and expect a parse failure" cases are empty-string /
-   ;; wrong-char cases now (see :string-model in known-divergences.edn).
-   :expect {:tests 28 :pass 9519 :fail 0 :error 0}}
+   ;; All five remaining failures are one divergence, in abnf-test's unicode-test:
+   ;; it feeds a parser half of a surrogate pair and expects a parse failure, but a
+   ;; jolt string is indexed by code point, so (str (first "<astral>")) is the whole
+   ;; character and parses. A surrogate half is not a value jolt can hold
+   ;; (:string-model in known-divergences.edn) — nothing to reject.
+   :expect {:tests 28 :pass 9515 :fail 5 :error 0}}
 
   {:name "test.chuck"
    ;; resources/ holds the regex grammar its parser slurps through io/resource
