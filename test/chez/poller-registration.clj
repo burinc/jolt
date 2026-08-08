@@ -24,9 +24,13 @@
 (def rounds 40)
 (def per 8)
 
+;; Both ends of every connection are closed at the end of the round. Holding the
+;; accepted Socket rather than just its stream is the point: 40 rounds of 8 leaks
+;; 320 descriptors otherwise, and under a low ulimit -n the gate starts failing on
+;; accept for a reason that has nothing to do with the bug it exists to catch.
 (defn- one-round [ss port]
   (let [clients (doall (for [_ (range per)] (java.net.Socket. "127.0.0.1" port)))
-        srvs (doall (for [_ (range per)] (.getOutputStream (.accept ss))))
+        srvs (doall (for [_ (range per)] (.accept ss)))
         outs (doall (for [c clients]
                       (binding [a/*go-backend* :fiber]
                         (a/go (let [b (byte-array 8)
@@ -34,22 +38,22 @@
                                 (String. b 0 n "UTF-8"))))))]
     ;; let them all park before the data arrives, so every read registers
     (Thread/sleep 15)
-    (doseq [s srvs] (.write s (.getBytes "x" "UTF-8") 0 1))
+    (doseq [s srvs] (.write (.getOutputStream s) (.getBytes "x" "UTF-8") 0 1))
     (let [got (doall (for [o outs] (first (a/alts!! [o (a/timeout 2000)]))))]
       (doseq [c clients] (.close c))
+      (doseq [s srvs] (.close s))
       (count (filter #(= "x" %) got)))))
 
 (let [ss (java.net.ServerSocket. 0)
       port (.getLocalPort ss)]
   (loop [r 0 acc 0]
-    (cond
-      (= r rounds)
-      (println "POLLER-REGISTRATION OK" acc)
-
-      :else
+    (if (= r rounds)
+      (do (.close ss)
+          (println "POLLER-REGISTRATION OK" acc))
       (let [n (one-round ss port)]
         (if (< n per)
           (do (println (str "POLLER-REGISTRATION LOST " (- per n) " of " per
                             " readiness registrations in round " r))
+              (.close ss)
               (System/exit 1))
           (recur (inc r) (+ acc n)))))))
