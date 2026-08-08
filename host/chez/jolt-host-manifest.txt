@@ -30,6 +30,7 @@ compile-ns
 condition-message
 cpu-nanos
 current-memory-bytes
+current-fiber
 deftype-ctor-class
 delete-file
 directory?
@@ -38,6 +39,10 @@ exact?
 extension-epoch
 extension-has?
 extension-value
+fiber-park-commit!
+fiber-resume
+fiber-to-scheduler!
+fiber?
 file-exists?
 find-var
 form-bigdec-source
@@ -85,6 +90,7 @@ form-vec?
 gc-bytes
 gc-count
 gc-cpu-nanos
+gc-full!
 gc-real-nanos
 getenv
 host-class-name?

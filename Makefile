@@ -56,7 +56,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  devbootsmoke devirt directlink ffi fieldjoin fieldnum fieldread flarr fnform grenadine \
+  devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
   gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
@@ -234,6 +234,7 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-chan-test.ss
 	@$(CHEZ) --script test/chez/fibers-go-test.ss
 	@$(CHEZ) --script test/chez/fibers-pool-test.ss
+	@$(CHEZ) --script test/chez/fibers-io-test.ss
 
 # Fibers R6 (jolt-nvpr.7): the :thread vs :fiber benchmark harness. Opt-in and
 # NOT part of the gate — benchmarks do not belong in CI. Runs each measurement
