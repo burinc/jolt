@@ -177,3 +177,32 @@
 
 ;; Install the alts! fiber-await hook (see async.ss).
 (set! jolt-fiber-alt-await-fn jolt-fiber-alt-await)
+
+;; --- R8: the IO-parking host seams (epic jolt-nvpr.8) -------------------------
+;; jolt.socket (stdlib, Clojure over jolt.ffi) parks a fiber on an EAGAIN by
+;; asking "am I on a fiber?", registering readiness with its poller (also
+;; Clojure), committing to park under the poller's table lock, then switching.
+;; These names are the entire fiber surface the Clojure layer needs, and the
+;; discipline is exactly the channel waiters':
+;;   - the 'parked commit (fiber-park-commit!) and the wake's state read inside
+;;     sa-fiber-resume are serialized by the CALLER's lock — for the poller
+;;     that is its table lock, a new leaf in the lock chain (nothing the
+;;     fiber-park path does takes the run-queue mutex; the poller's wake runs
+;;     sa-fiber-resume AFTER releasing the table lock, so pm -> carrier-mu and
+;;     the channel chain wmu -> carrier-mu share no cycle).
+;;   - fiber-to-scheduler! runs OUTSIDE that lock (a fiber that parks holding
+;;     the table lock deadlocks its carrier), mirroring the R3 "release before
+;;     park" invariant.
+(def-var! "jolt.host" "fiber?" (lambda () (if (jolt-current-fiber) #t #f)))
+(def-var! "jolt.host" "current-fiber" (lambda () (or (jolt-current-fiber) jolt-nil)))
+(def-var! "jolt.host" "fiber-park-commit!" (lambda () (jolt-fiber-state-set! (jolt-current-fiber) 'parked)))
+;; jolt-fiber-to-scheduler! takes the fiber (it clears the current-fiber vreg
+;; before capturing, so the record has to be passed in, not read afterwards).
+(def-var! "jolt.host" "fiber-to-scheduler!"
+  (lambda () (jolt-fiber-to-scheduler! (jolt-current-fiber))))
+(def-var! "jolt.host" "fiber-resume" sa-fiber-resume)
+;; Unguarded full collect for the R8 gate: System/gc swallows Chez's
+;; "cannot collect when multiple threads are active" refusal (the JVM-faithful
+;; guarded no-op), but the gate must SEE that refusal when the poller's blocking
+;; wait is not collect-safe — a collect that fails proves it.
+(def-var! "jolt.host" "gc-full!" (lambda () (sa-gc-collect)))

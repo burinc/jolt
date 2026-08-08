@@ -12,6 +12,7 @@
   .connect ignores its timeout argument (always blocking), and toString
   formats are approximate. IPv4 only."
   (:require [jolt.ffi :as ffi]
+            [jolt.io-poller :as poller]
             [clojure.string :as str]))
 
 ;; -- FFI --------------------------------------------------------------------
@@ -109,8 +110,10 @@
 
 (defn- guard-fd! [fd]
   ;; accepted fds don't reliably inherit socket options — set SO_NOSIGPIPE
-  ;; explicitly on every fd we hand out.
-  (when macos? (set-opt-1! fd so-nosigpipe)))
+  ;; explicitly on every fd we hand out, and O_NONBLOCK so the R8 readiness
+  ;; interception can park a fiber instead of pinning its carrier.
+  (when macos? (set-opt-1! fd so-nosigpipe))
+  (poller/nonblock! fd))
 
 (defn- new-fd! []
   (let [fd (c-socket AF-INET SOCK-STREAM 0)]
@@ -141,9 +144,22 @@
 
 (defn- connect-fd! [fd host port]
   ;; resolve + connect; frees the sockaddr either way. Returns the resolved ip.
+  ;; The fd is O_NONBLOCK (fibers R8), so connect answers EINPROGRESS; wait for
+  ;; writability (parking on a fiber, blocking kevent on a thread — the same
+  ;; dispatch every other IO path uses), then read SO_ERROR for the verdict.
   (let [ip (resolve-host host)
         sa (make-sockaddr ip port)
-        r  (c-connect fd sa 16)]
+        r  (loop []
+             (let [r (c-connect fd sa 16)]
+               (cond
+                 (zero? r) 0
+                 (poller/connect-pending? (poller/errno))
+                 (do (poller/wait-ready fd :write)
+                     (let [e (poller/so-error fd)]
+                       (if (zero? e)
+                         0
+                         (if (poller/connect-pending? e) (recur) -1))))
+                 :else r)))]
     (ffi/free sa)
     (when (neg? r)
       (throw (java.io.IOException. (str "connect failed: " host ":" port))))
@@ -241,11 +257,24 @@
        (jolt.host/ref-put! :port (jolt.host/ref-get self :port))))})
 
 ;; -- SocketInputStream -------------------------------------------------------
+(defn- io-call [op fd wait-kind]
+  ;; Run one blocking-capable syscall with the fd in O_NONBLOCK mode (fibers
+  ;; R8). EAGAIN waits for readiness — parking the fiber on the poller when
+  ;; there is a current fiber, blocking on a private kevent/epoll_wait when
+  ;; there is not — and retries; EINTR retries immediately; anything else is
+  ;; the syscall's real answer, returned as-is (callers read errno semantics).
+  (loop []
+    (let [r (op)]
+      (cond
+        (and (neg? r) (poller/eintr?)) (recur)
+        (and (neg? r) (poller/eagain?)) (do (poller/wait-ready fd wait-kind) (recur))
+        :else r))))
+
 (defn- do-recv [fd buf len]
   ;; n <= 0 answers EOF: recv 0 is orderly shutdown; a negative return (error)
   ;; also reads as EOF because errno isn't reachable to tell ECONNRESET from
   ;; EINTR. Java throws SocketException there — documented divergence.
-  (let [n (c-recv fd buf len 0)]
+  (let [n (io-call #(c-recv fd buf len 0) fd :read)]
     (if (pos? n)
       {:n n :bytes (ffi/read-array buf n)}
       {:n -1 :bytes nil})))
@@ -284,7 +313,7 @@
   ;; ECONNRESET) — throw like Java rather than silently dropping the rest.
   (loop [off 0]
     (when (< off len)
-      (let [s (c-send fd (+ buf off) (- len off) msg-nosignal)]
+      (let [s (io-call #(c-send fd (+ buf off) (- len off) msg-nosignal) fd :write)]
         (when-not (pos? s)
           (throw (java.io.IOException. "Broken pipe")))
         (recur (+ off s))))))
@@ -345,7 +374,8 @@
      (let [sa (ffi/alloc 16) lenp (ffi/alloc 4)]
        (try
          (ffi/write lenp :int 0 16)
-         (let [cfd (c-accept (jolt.host/ref-get self :fd) sa lenp)]
+         (let [cfd (io-call #(c-accept (jolt.host/ref-get self :fd) sa lenp)
+                            (jolt.host/ref-get self :fd) :read)]
            (when (neg? cfd) (throw (java.io.IOException. "accept() failed")))
            (guard-fd! cfd)
            (doto (tt :socket "java.net.Socket")
