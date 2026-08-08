@@ -124,9 +124,10 @@
 ;; implementation rather than copying — instaparse's Segment is a deftype with
 ;; length/charAt/subSequence/toString. irregex works on Scheme strings, so realize
 ;; one: a deftype through jrec-charseq->string (records.ss), a host CharSequence
-;; (StringBuilder, StringWriter) through the str registry that already renders its
-;; content for (str sb). Anything that is not a CharSequence gets the cast error it
-;; would have got from jolt-need-str. Forward refs resolve at call time.
+;; (StringBuilder) through the str registry that already renders its content for
+;; (str sb). The class graph is what decides, so a host type that is NOT a
+;; CharSequence — a StringWriter is a Writer — still gets the cast error it would
+;; have got from jolt-need-str, as on the JVM. Forward refs resolve at call time.
 (define (rx-host-charseq->string s)
   (let ((cls (guard (e (#t #f)) (jolt-class-name s))))
     (and (string? cls) (jch-isa? cls "java.lang.CharSequence")

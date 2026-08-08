@@ -33,13 +33,15 @@
 ;; from it can cache that answer and revalidate with one fixnum compare instead of
 ;; re-walking (jrdesc-ifc-of, records.ss). A deftype gains interfaces after its
 ;; descriptor exists, and can gain more later through extend-type.
+;; Bumped LAST, after the table is written and the memo caches are cleared: a
+;; concurrent reader that saw the new epoch first could derive from the old graph
+;; and stamp the answer as current, which revalidation could never catch.
 (define jch-graph-epoch 0)
 (define (jch-bump-epoch!) (set! jch-graph-epoch (fx+ jch-graph-epoch 1)))
 
 ;; Merge direct supers for a class (union with any already registered). Public so
 ;; libraries can graft their own classes onto the modeled hierarchy.
 (define (jch-register-supers! name supers)
-  (jch-bump-epoch!)
   (let ((cur (hashtable-ref jvm-class-parents name '())))
     (hashtable-set! jvm-class-parents name
                     (let add ((ss supers) (acc cur))
@@ -48,7 +50,8 @@
                             (else (add (cdr ss) (append acc (list (car ss)))))))))
   (with-mutex jch-cache-mutex
     (hashtable-clear! jch-closure-cache)
-    (hashtable-clear! jch-tags-cache)))
+    (hashtable-clear! jch-tags-cache))
+  (jch-bump-epoch!))
 
 ;; A munged fn class name "ns$name" (jolt-class for a def'd fn) isn't in the
 ;; table; like the JVM (a fn extends clojure.lang.AFunction) its super is
@@ -66,13 +69,13 @@
 ;; Replace a class's direct supers outright (defrecord re-declares the row its
 ;; deftype half registered). Same cache invalidation as a register.
 (define (jch-set-supers! name supers)
-  (jch-bump-epoch!)
   (hashtable-set! jvm-class-parents name supers)
   (with-mutex jch-cache-mutex
     (hashtable-clear! jch-closure-cache)
     (hashtable-clear! jch-tags-cache))
   (set! jch-known-cache #f)
-  (set! jch-simple->fqn-cache #f))
+  (set! jch-simple->fqn-cache #f)
+  (jch-bump-epoch!))
 
 ;; transitive supers of NAME (canonical), excluding NAME and Object; Object is the
 ;; universal root supplied by callers. Breadth-first, deduped, stable order.
@@ -183,13 +186,15 @@
                   built))))
     (or (hashtable-ref ht name #f) name)))
 
-;; A register also invalidates the derived caches.
+;; A register also invalidates the derived caches — after the table is written,
+;; for the reason given at jch-bump-epoch!: dropping them first lets a concurrent
+;; reader rebuild one from the pre-registration graph and publish it as current.
 (define jch-register-supers!-inner jch-register-supers!)
 (set! jch-register-supers!
   (lambda (name supers)
+    (jch-register-supers!-inner name supers)
     (set! jch-known-cache #f)
-    (set! jch-simple->fqn-cache #f)
-    (jch-register-supers!-inner name supers)))
+    (set! jch-simple->fqn-cache #f)))
 
 ;; throw-jvm (rt.ss) resolves an unlisted simple exception name through this graph
 ;; now that it exists — so (throw-jvm 'RuntimeException …) reports
