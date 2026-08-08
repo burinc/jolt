@@ -66,7 +66,8 @@ JOLT-TARGETS-NEEDING-DEPS := \
 
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status \
-        gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile
+        gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
+        fibersbench
 
 default:: build
 
@@ -233,6 +234,13 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-chan-test.ss
 	@$(CHEZ) --script test/chez/fibers-go-test.ss
 	@$(CHEZ) --script test/chez/fibers-pool-test.ss
+
+# Fibers R6 (jolt-nvpr.7): the :thread vs :fiber benchmark harness. Opt-in and
+# NOT part of the gate — benchmarks do not belong in CI. Runs each measurement
+# phase as a subprocess and prints the comparison table; like aba.sh it is
+# blind to dev mode (every phase runs the runtime from source).
+fibersbench:
+	@sh bench/fibers/run.sh
 
 # Corpus conformance vs JVM-sourced expecteds (allowlist + floor).
 corpus:
