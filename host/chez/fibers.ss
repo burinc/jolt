@@ -446,13 +446,20 @@
 (define (jolt-fiber-resume* f)
   (case (jolt-fiber-state f)
     ((ready)
-     (if (jolt-fiber-k f)
-         ((jolt-fiber-k f))
-         (begin
-           (jolt-fiber-state-set! f 'running)
-           (let ((r (guard (e (#t (jolt-fiber-dead! f e)))
-                       ((jolt-fiber-thunk f)))))
-             (jolt-fiber-done! f r)))))
+     (cond
+       ((jolt-fiber-k f) ((jolt-fiber-k f)))
+       ;; An sm RESUME (a pending step, not #f/'running): the thunk is java/sm.ss's
+       ;; driver, which installs its own handler and escapes to the scheduler
+       ;; itself. Guarding it here would be redundant AND wrong — this handler
+       ;; marks the fiber dead without closing the body's go channel, so a reader
+       ;; of that channel would wait forever. Skipping it also keeps the guard's
+       ;; call/cc off the resume path the cheap park exists to make cheap.
+       ((procedure? (jolt-fiber-sm f)) ((jolt-fiber-thunk f)))
+       (else
+        (jolt-fiber-state-set! f 'running)
+        (let ((r (guard (e (#t (jolt-fiber-dead! f e)))
+                    ((jolt-fiber-thunk f)))))
+          (jolt-fiber-done! f r)))))
     (else (error 'jolt-fiber-run "fiber in unexpected state"
                  (jolt-fiber-state f)))))
 
