@@ -102,13 +102,57 @@
 (ev "(require '[clojure.core.async
                 :refer [go chan <! <!! >!! *go-backend*]])")
 
-;; --- 1. parallelism: N carriers beat one carrier (a ratio, one run) ----------
-;; M CPU-bound fibers (pure fixnum work, no allocation, no parks) are placed
-;; round-robin over the pool; with one carrier they serialize. Both halves are
-;; timed in THIS process back-to-back, so the assertion is the ratio T1/T2 —
-;; immune to how fast or busy the runner is (per the flake history in
-;; fibers-test.ss, absolute ceilings are the CI-flake trap).
-(printf "\n== 1. N carriers beat one carrier (ratio within one run) ==\n")
+;; --- 1. the carriers really do run at the same time -------------------------
+;; A SPEEDUP assertion was tried here first and was wrong in principle: it
+;; measures the machine, not our code. CI proved it — 1 carrier 204.40ms vs 4
+;; carriers 202.48ms, speedup 1.01, on a runner with no real parallelism to give,
+;; while the same check reads 5.34x locally. No ceiling makes that valid, and a
+;; 1-CPU skip does not save it because a throttled runner still reports 4 CPUs.
+;;
+;; What IS about our code is whether two fibers on DIFFERENT carriers make
+;; progress simultaneously, and that can be proved structurally: each waits for a
+;; flag the other sets. If the carriers were serialized — one thread, or a pool
+;; that secretly runs one fiber at a time — the first fiber would spin forever
+;; holding its carrier and the second would never run, so the rendezvous could
+;; not complete. It completes only under genuine concurrency, and it says nothing
+;; about how FAST the machine is. The waits are bounded so a serialized scheduler
+;; fails as a timeout instead of hanging CI.
+;;
+;; The timings are still printed, because they are useful to a reader — they are
+;; just not assertions.
+(printf "\n== 1. two carriers run at the same time (rendezvous, no timing) ==\n")
+(define rv-a (box #f))
+(define rv-b (box #f))
+(define rv-a-saw-b (box #f))
+(define rv-b-saw-a (box #f))
+(define (spin-until bx deadline-ns)
+  (let loop ()
+    (cond ((unbox bx) #t)
+          ((> (mono-nanos) deadline-ns) #f)
+          (else (loop)))))
+
+(jolt-fiber-carrier-count-set! 2)
+(jolt-fiber-pool-reset!)
+(jolt-fiber-ensure-carrier!)
+;; round-robin puts these two on carrier 0 and carrier 1
+(define rv-f1
+  (sa-fiber-spawn (lambda ()
+                    (set-box! rv-a #t)
+                    (set-box! rv-a-saw-b (spin-until rv-b (+ (mono-nanos) 10000000000))))))
+(define rv-f2
+  (sa-fiber-spawn (lambda ()
+                    (set-box! rv-b #t)
+                    (set-box! rv-b-saw-a (spin-until rv-a (+ (mono-nanos) 10000000000))))))
+(wait-until (lambda () (and (eq? (jolt-fiber-state rv-f1) 'done)
+                            (eq? (jolt-fiber-state rv-f2) 'done)))
+            30.0 "1. both rendezvous fibers finished")
+(ok "1. the two fibers are on different carriers"
+    (not (eq? (jolt-fiber-carrier rv-f1) (jolt-fiber-carrier rv-f2))))
+(ok "1. each fiber saw the other's flag (so both carriers ran at once)"
+    (and (unbox rv-a-saw-b) (unbox rv-b-saw-a)))
+
+;; Timings, printed for the record and asserted only against something no working
+;; pool can trip: N carriers must not be dramatically SLOWER than one.
 (define (cpu-bound-fiber n)
   (lambda ()
     (let loop ((i 0) (acc 0))
@@ -119,31 +163,24 @@
     (wait-until (lambda () (all-done? fs)) 60.0 "cpu-bound batch finished")
     (/ (exact->inexact (- (mono-nanos) t0)) 1000000.0)))  ;; ms
 
-(jolt-fiber-carrier-count-set! #f)          ;; restore the machine default
+(jolt-fiber-carrier-count-set! #f)          ;; the machine default
 (jolt-fiber-pool-reset!)
 (define n-pool (jolt-fiber-carrier-count))
 (define m-batch (fx* 2 n-pool))
 (define iters 20000000)
-
-(if (fx=? n-pool 1)
-    (begin
-      (printf "  1 logical CPU — no parallelism to measure; skipping check 1\n")
-      (ok "1. pool beats one carrier (skipped on a 1-CPU machine)" #t))
-    (begin
-      ;; single-carrier baseline: pin to 1, start the pool, time M fibers
-      (jolt-fiber-carrier-count-set! 1)
-      (jolt-fiber-pool-reset!)
-      (jolt-fiber-ensure-carrier!)
-      (let* ((t1 (run-cpu-batch m-batch iters))
-             ;; the pool at the machine default: same M fibers, N carriers
-             (t2 (begin (jolt-fiber-carrier-count-set! n-pool)
-                        (jolt-fiber-pool-reset!)
-                        (jolt-fiber-ensure-carrier!)
-                        (run-cpu-batch m-batch iters)))
-             (speedup (/ (max t1 0.001) (max t2 0.001))))
-        (printf "  1 carrier: ~,2f ms; ~a carriers: ~,2f ms; speedup ~,2f\n"
-                t1 n-pool t2 speedup)
-        (ok "1. pool beats one carrier (speedup > 1.25)" (> speedup 1.25)))))
+(jolt-fiber-carrier-count-set! 1)
+(jolt-fiber-pool-reset!)
+(jolt-fiber-ensure-carrier!)
+(define t-one (run-cpu-batch m-batch iters))
+(jolt-fiber-carrier-count-set! n-pool)
+(jolt-fiber-pool-reset!)
+(jolt-fiber-ensure-carrier!)
+(define t-pool (run-cpu-batch m-batch iters))
+(printf "  1 carrier: ~,2f ms; ~a carriers: ~,2f ms (ratio ~,2f — printed, not asserted;\n"
+        t-one n-pool t-pool (/ (max t-one 0.001) (max t-pool 0.001)))
+(printf "   a shared runner often shows ~~1.0 with no parallelism to give)\n")
+(ok "1. the pool is not dramatically slower than one carrier"
+    (< t-pool (* 4.0 (max t-one 0.001))))
 
 ;; --- 2. round-robin placement ------------------------------------------------
 ;; Spawning K fibers over N carriers puts fiber i on carrier (i mod N) — the
