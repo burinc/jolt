@@ -157,24 +157,51 @@
 (ok "2b. go-loop order preserved" (eqv? (jv-nth r2b 4) 4))
 (ok "2b. go-loop length" (= (jolt-count r2b) 5))
 
-;; dynamic-wind-carrying form: try/finally lowers to dynamic-wind (R2 found
-;; each park fires a handler pair). The finally must run exactly once, at the
-;; real exit — not when the fiber parks on the <!. The >!! only returns once
-;; the fiber's taker committed, so by the time (<!! g) returns the body is
-;; done and the log holds exactly [:finally].
+;; try/finally lowers to dynamic-wind, and a park is a continuation escape, so
+;; the after-thunk fires on the park unless something stops it — which would run
+;; the cleanup mid-operation (with-open closing a file still in use). The
+;; after-thunk is guarded by jolt-park-unwinding? (values.ss), set only around a
+;; park escape.
+;;
+;; The park is FORCED here, and that matters: the first version of this check let
+;; the >!! race the fiber, so locally the value was ready before the fiber ever
+;; parked, no park happened, and the check passed while the bug was live. Only
+;; the slower CI runner parked first and caught it. Assert the log is EMPTY after
+;; the park, then exactly [:finally] after the exit — the empty-after-park half is
+;; the one with teeth.
 (define r2c (ev "
 (binding [*go-backend* :fiber]
   (let [c (chan)
         log (atom [])
         g (go (try (let [v (<! c)] v)
                    (finally (swap! log conj :finally))))]
-    (>!! c :got)
-    (let [r (<!! g)]
-      [r (count @log) @log])))"))
+    (Thread/sleep 300)                  ;; the fiber is parked on the <! by now
+    (let [at-park (count @log)]
+      (>!! c :got)
+      (let [r (<!! g)]
+        [r (count @log) @log at-park])))))"))
 (ok "2c. try/finally body value" (jolt=2 (jv-nth r2c 0) (keyword #f "got")))
-(ok "2c. finally ran exactly once (not at park)" (= (jv-nth r2c 1) 1))
+(ok "2c. finally did NOT run at the park" (= (jv-nth r2c 3) 0))
+(ok "2c. finally ran exactly once, at the real exit" (= (jv-nth r2c 1) 1))
 (ok "2c. finally ran with the right content"
     (jolt=2 (jv-nth r2c 2) (jolt-vector (keyword #f "finally"))))
+
+;; A real exit AFTER a park must still run the finally — this is what proves the
+;; park flag is cleared on resume rather than left set for the rest of the fiber.
+;; Without it, suppressing the park would silently suppress every later exit too.
+(define r2d (ev "
+(binding [*go-backend* :fiber]
+  (let [c (chan)
+        log (atom [])
+        g (go (try (let [v (<! c)] (throw (ex-info \"after the park\" {:v v})))
+                   (catch Exception e :caught)
+                   (finally (swap! log conj :finally))))]
+    (Thread/sleep 300)
+    (>!! c :go)
+    (let [r (<!! g)] [r @log])))"))
+(ok "2d. throw after a park still caught" (jolt=2 (jv-nth r2d 0) (keyword #f "caught")))
+(ok "2d. finally still runs on a real exit after a park"
+    (jolt=2 (jv-nth r2d 1) (jolt-vector (keyword #f "finally"))))
 
 ;; --- 3. :thread is unchanged: same body under both backends, same result -----
 (printf "\n== 3. same body, both backends, same result ==\n")

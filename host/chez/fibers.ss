@@ -83,6 +83,19 @@
 ;; print-readably 4); this duplicate definition keeps the file self-contained
 ;; for the standalone gate and is a harmless re-define under the full boot.
 (define jolt-vreg-current-fiber 0)
+;; Slot 1: non-zero while a PARK escape is unwinding this carrier. Read by the
+;; try/finally after-thunk (values.ss jolt-park-unwinding?) so a park does not
+;; run cleanup that belongs to the real exit. A vreg and not a global because R5
+;; runs several carriers, each of which can be mid-park independently.
+(define jolt-vreg-park-unwinding 1)
+(define (jolt-park-unwinding-set! on?)
+  (set-virtual-register! jolt-vreg-park-unwinding (if on? 1 0)))
+;; Installed only when the full runtime is present; a standalone load of this
+;; file (the R1 gate) has no values.ss, and the guard keeps that working — the
+;; same probe pattern this file already uses for the slice parameters.
+(guard (e (#t #f))
+  (set! jolt-park-unwinding?-hook
+        (lambda () (eqv? 1 (virtual-register jolt-vreg-park-unwinding)))))
 
 ;; The single carrier's intrusive run queue (head/tail; the `next` link lives
 ;; in each fiber record). R3 makes it thread-safe: a channel delivery to a
@@ -208,6 +221,10 @@
     (lambda (k)
       (jolt-fiber-k-set! f k)
       (jolt-fiber-slice-save! f)
+      ;; The dynamic-wind after-thunks between here and the scheduler are about
+      ;; to fire as this continuation unwinds. They belong to forms the fiber is
+      ;; still inside, so flag the escape as a park and let them skip.
+      (jolt-park-unwinding-set! #t)
       (jolt-sched-k))))
 
 ;; (sa-fiber-yield) -> void. Park the current fiber and move it to the back of
@@ -271,6 +288,8 @@
       ;; before-thunks then re-fire over the restored values)
       (jolt-fiber-slice-restore! (jolt-fiber-slice f))
       (jolt-fiber-resume* f)))
+  ;; Back on the scheduler: whatever escape brought us here is over.
+  (jolt-park-unwinding-set! #f)
   ;; The fiber parked, finished, or died: its setter-written dynamic state
   ;; (binding frames, current ns) is still live on the carrier — a continuation
   ;; escape does not undo a setter write (R0(a)). fiber -> scheduler: revert to
