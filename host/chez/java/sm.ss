@@ -2,9 +2,9 @@
 ;;
 ;; A fiber parks by capturing a continuation, and Chez represents that as a stack
 ;; segment which stays live for as long as the process is parked (~3.5 KB, whatever
-;; the depth). A park that clojure.core.async.sm could rewrite does not need one:
-;; the rest of the body is already a closure, so the op stores the closure and
-;; switches to the scheduler with no capture at all.
+;; the depth). A park the CPS pass in clojure.core.async could rewrite does not
+;; need one: the rest of the body is already a closure, so the op stores the
+;; closure and switches to the scheduler with no capture at all.
 ;;
 ;; The two mechanisms coexist inside one fiber and are chosen per park site, by
 ;; whether a continuation was threaded to the op. So a body that parks lexically

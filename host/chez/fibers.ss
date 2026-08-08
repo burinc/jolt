@@ -59,6 +59,10 @@
 ;; carrier: the fiber's carrier record, fixed at spawn, never changed — R0(d)
 ;; pins a fiber to its carrier for life (a continuation captured on carrier A
 ;; cannot resume on B).
+;; sm: the pending step of a fiber whose body was CPS'd (java/sm.ss), #f for
+;; every other fiber. A cheap park stores the rest of the computation here
+;; instead of capturing a continuation, clears k, and lets the thunk — a
+;; re-entrant driver — pick the step up on the next run.
 (define-record-type jolt-fiber
   (fields (mutable state)
           thunk
@@ -67,8 +71,9 @@
           (mutable error)
           (mutable next)
           (mutable slice)
-          carrier)
-  (nongenerative jolt-fiber-v1))
+          carrier
+          (mutable sm))
+  (nongenerative jolt-fiber-v2))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -398,7 +403,7 @@
               (make-jolt-dslice (jolt-slice-stack-param)
                                 (jolt-slice-ns-param)
                                 #f)
-              c)))
+              c #f)))
       (jolt-fiber-enqueue! c f)
       f)))
 
@@ -431,8 +436,12 @@
 ;; scheduler. R0(b) verified guard chains ride the continuation correctly.
 ;; The discriminator is the continuation, not the state: a fiber that yielded
 ;; is 'ready AND holds a captured k, so it must be resumed at the park point —
-;; re-applying the thunk would re-run it from scratch (an infinite loop). Only
-;; a 'ready fiber with NO k is a first run. 'parked fibers are never dequeued:
+;; re-applying the thunk would re-run it from scratch (an infinite loop). A
+;; 'ready fiber with NO k enters through its THUNK. That is a first run for an
+;; ordinary fiber, and for a CPS'd body (java/sm.ss) it is also every resume: a
+;; cheap park leaves k clear and stashes the pending step in the sm field, so
+;; the thunk is a re-entrant driver that runs the step — which is what puts this
+;; guard back around the body on each resume. 'parked fibers are never dequeued:
 ;; sa-fiber-resume moves them to 'ready before enqueue.
 (define (jolt-fiber-resume* f)
   (case (jolt-fiber-state f)
@@ -458,6 +467,7 @@
   (jolt-fiber-state-set! f 'done)
   (jolt-fiber-result-set! f r)
   (jolt-fiber-k-set! f #f)
+  (jolt-fiber-sm-set! f #f)
   (jolt-fiber-slice-set! f #f)
   (set-virtual-register! jolt-vreg-current-fiber 0)
   ((jolt-carrier-sched-k (jolt-fiber-carrier f))))
@@ -466,6 +476,7 @@
   (jolt-fiber-state-set! f 'dead)
   (jolt-fiber-error-set! f e)
   (jolt-fiber-k-set! f #f)
+  (jolt-fiber-sm-set! f #f)
   (jolt-fiber-slice-set! f #f)
   (set-virtual-register! jolt-vreg-current-fiber 0)
   ((jolt-carrier-sched-k (jolt-fiber-carrier f))))

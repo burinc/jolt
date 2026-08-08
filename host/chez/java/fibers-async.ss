@@ -37,23 +37,14 @@
 ;; A waiter handler whose wake is fiber f — the fiber-wake strategy.
 (define (jolt-fiber-waiter f) (alt-handler-alloc f))
 
-;; Park on an already-registered handler whose channel mutex is RELEASED.
-;; Returns mailbox slot 1: the value for a <!, #t/#f for a >!.
-;; The commit-to-park decision is made under h's wmu (atomic with alt-deliver!'s
-;; mailbox write + resume); the capture+switch follows outside the wmu.
-(define (jolt-fiber-waiter-wait! h)
-  (let ((f (jolt-current-fiber)))
-    (unless f
-      (error 'jolt-fiber-waiter-wait! "channel wait outside a fiber"))
-    (let ((park?
-           (with-mutex (alt-handler-wmu h)
-             (if (vector-ref (alt-handler-mailbox h) 0)
-                 #f
-                 (begin (jolt-fiber-state-set! f 'parked) #t)))))
-      (when park?
-        (set! jolt-fiber-chan-parks (+ jolt-fiber-chan-parks 1))
-        (jolt-fiber-to-scheduler! f))
-      (vector-ref (alt-handler-mailbox h) 1))))
+;; ac-try-give!/locked can THROW — a nil value, or a transducer step raising — and
+;; this path holds the channel mutex BY HAND, because it has to be able to release
+;; it before parking and with-mutex cannot do that. A throw would otherwise escape
+;; with the mutex held and deadlock every later op on that channel.
+;; jolt-async-give is unaffected: its with-mutex releases on the unwind.
+(define (jolt-chan-locked-give! ch v)
+  (guard (e (#t (mutex-release (async-chan-mu ch)) (raise e)))
+    (ac-try-give!/locked ch v)))
 
 ;; (jolt-fiber-<! ch) -> value | nil (closed). Fiber-side take: a buffered
 ;; value, a waiting putter, or a closed channel complete immediately (no
@@ -80,8 +71,9 @@
 ;; taker completes immediately (no capture); a full channel registers an
 ;; alt-putter and parks.
 (define (jolt-fiber->! ch v)
+  (async-check-put! v)                   ; throws — keep it outside the mutex
   (mutex-acquire (async-chan-mu ch))
-  (let ((r (ac-try-give!/locked ch v)))
+  (let ((r (jolt-chan-locked-give! ch v)))
     (cond
       ((eq? r 'ok) (mutex-release (async-chan-mu ch)) #t)
       ((eq? r 'closed) (mutex-release (async-chan-mu ch)) #f)

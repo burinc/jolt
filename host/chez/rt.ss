@@ -1276,6 +1276,14 @@
 ;; runtime (it depends on async.ss).
 (load "host/chez/java/fibers-async.ss")
 
+;; The cheap park (R7, jolt-nvpr.9): __sm-spawn/__sm-take/__sm-put, the ops a
+;; CPS'd go body (the pass in clojure.core.async) calls. A
+;; lexically-parking body stores the rest of the computation as an ordinary
+;; closure in the fiber's k field and switches without capturing a
+;; continuation — no stack segment held while parked. Loaded after
+;; fibers-async.ss (reuses its waiter handler and channel protocol).
+(load "host/chez/java/sm.ss")
+
 ;; BigDecimal: the jbigdec value type + bigdec/decimal?/class/equality/
 ;; printing. Loads LAST so its set!-wraps of jolt-class/jolt=2/the printers sit
 ;; outermost over every earlier extension.
