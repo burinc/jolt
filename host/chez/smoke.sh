@@ -487,6 +487,21 @@ else
   fails=$((fails + 1))
 fi
 
+# Two threads requiring one namespace must load it once, and neither may return
+# from require until it is whole. Nothing serialized load-namespace* before, so
+# both ran the target's top level, and the mark-before-load that terminates a
+# require cycle told the second thread "loaded" while the file was still running.
+# The loader follows JLS 12.4.2 per namespace now; unfixed this reports 7 of 8
+# threads returning early.
+cr_out="$($jolt run test/chez/concurrent-require.clj 2>&1)"
+if printf '%s' "$cr_out" | grep -q 'CONCURRENT-REQUIRE OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: concurrent require of one namespace"
+  echo "    $(printf '%s' "$cr_out" | tail -1)"
+  fails=$((fails + 1))
+fi
+
 # clojure.test extension points (assert-expr / do-report / report) need separate
 # top-level forms — assert-expr must register before `is` expands — so this is a
 # multi-form `jolt run`, not an -e one-liner. The file self-checks its tallies.
