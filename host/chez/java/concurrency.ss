@@ -599,8 +599,13 @@
       ((jolt-promise? x)
        (if (null? opts) (jolt-promise-deref x)
            (jolt-promise-deref-timed x (car opts) (cadr opts))))
-      ((jolt-agent? x) (jolt-agent-state x))
-      ((jolt-delay? x) (jolt-delay-force x))
+      ;; An agent and a delay are IDeref but NOT IBlockingDeref, so the timed
+      ;; arity is a failed interface cast on the JVM, not a silent 1-arity call
+      ;; that drops the timeout.
+      ((jolt-agent? x)
+       (if (null? opts) (jolt-agent-state x) (jolt-throw (deref-cast-error x opts))))
+      ((jolt-delay? x)
+       (if (null? opts) (jolt-delay-force x) (jolt-throw (deref-cast-error x opts))))
       ;; a record/reify implementing clojure.lang.IDeref: @x calls its `deref`
       ;; method with the value itself as the leading `this`. The timed arity
       ;; passes its opts through — (deref r ms val) reaches the IBlockingDeref
@@ -625,7 +630,11 @@
                                             (+ 1 (length opts)))))
                 (jolt-throw (deref-cast-error x opts))
                 (apply jolt-invoke m x opts))))
-      (else (apply %pre-conc-deref x opts)))))
+      ;; Everything else (atom, ref, var, …) is IDeref at most: the timed arity
+      ;; is the same failed cast. Without this it reached %pre-conc-deref, which
+      ;; raised a host error whose (class e) was the opaque :object sentinel.
+      ((null? opts) (%pre-conc-deref x))
+      (else (jolt-throw (deref-cast-error x opts))))))
 
 (define (deref-cast-error x opts)
   (jolt-host-throwable
