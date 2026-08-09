@@ -694,18 +694,89 @@
 ;; contract (the portable seam the analyzer uses), NOT host-native predicates, so
 ;; this stays host-neutral — the contract walks the host's reader forms.
 (declare emit-quoted)
+
+;; --- sharing the quoted constructions ----------------------------------------
+;; emit-quoted renders a form as the constructor calls that rebuild it, and it
+;; renders a SUBTREE every time it meets one. That is fine for a lone quoted datum
+;; and quadratic for the fnsrc registrations, which are the one caller that emits
+;; forms NESTED INSIDE EACH OTHER: every anon fn registers its whole source form,
+;; and an anon fn written inside another one is part of both, so a chain of depth
+;; N emits O(N^2) text. The CPS pass in clojure.core.async builds exactly that
+;; chain — one closure per park site — and a 240-park go body emitted 5.4 MB of
+;; registrations, which analyze/emit/Chez then each paid for in proportion.
+;;
+;; So the pool hash-conses: a construction is emitted once, bound to a name, and
+;; every later occurrence of the same construction is that name. Because a child's
+;; construction is interned before its parent's is built, the parent is assembled
+;; out of NAMES and costs O(its own arity) rather than O(its subtree) — which is
+;; what turns the total linear. It also collapses the repetition inside one form
+;; (every (jolt-symbol #f "x") in a body is now one object).
+;;
+;; Sharing the VALUES is sound because these are immutable constructions: symbols,
+;; persistent collections and literals. It is the same argument hoist-const makes,
+;; and the values reaching image-register-fn-form! are equal to the ones it got
+;; before, structurally and by every observation the image writer makes of them.
+;;
+;; nil pool (every other caller, and every system namespace) is the identity: the
+;; construction is returned inline, byte for byte as before, so the seed mint and
+;; the core overlay are untouched.
+(def ^:dynamic *quote-pool* nil)
+
+;; Rows already emitted, as [src-form binding-name]. Interning alone made the TEXT
+;; linear but left the WALK quadratic: assembling a parent's construction still
+;; descended through the nested literal it contains, all the way to the leaves,
+;; only to rediscover constructions the pool already had. This stops the descent —
+;; a sub-form that IS an already-emitted literal is that literal's binding name.
+;;
+;; Matched by IDENTITY, which is exact here and costs a pointer compare: analyze-fn
+;; hands a literal's :src-form back as the very object nested inside its parent's
+;; :src-form. Equality would be the obvious alternative and is the wrong tool — a
+;; jolt seq does not cache its hash, so asking whether two forms are equal walks
+;; the subtree this exists to avoid walking. A miss (a form the analyzer had to
+;; rebuild) just descends as before.
+(def ^:dynamic *quote-shared* nil)
+
+(defn- q-shared-name [form]
+  (when-let [rows *quote-shared*]
+    (loop [i 0]
+      (when (< i (count rows))
+        (let [r (nth rows i)]
+          (if (identical? (nth r 0) form) (nth r 1) (recur (inc i))))))))
+
+(defn- q-intern
+  "The text to use at a USE SITE for a construction: the construction itself with
+  no pool, else a binding name, recording the construction once."
+  [expr]
+  (let [pool *quote-pool*]
+    (if (nil? pool)
+      expr
+      (or (get (:by-expr @pool) expr)
+          (let [nm (str "_q$" (count (:order @pool)))]
+            (swap! pool (fn [p] (-> p
+                                    (assoc-in [:by-expr expr] nm)
+                                    (update :order conj [nm expr]))))
+            nm)))))
+
+;; Both sorted renderings below order by EMITTED TEXT, because a set and a map
+;; value have no source order and the host hash order is not stable across Chez
+;; versions (jolt-8479). A pooled subterm renders as a binding name handed out in
+;; traversal order — i.e. in host-hash order — so sorting those would reintroduce
+;; exactly the instability the sort exists to remove. Emit the items unpooled, sort
+;; the real text, and intern only the finished construction.
 (defn- emit-quoted-map [pairs]
   ;; pairs: a jolt vector of [k-form v-form] pairs (form-map-pairs)
-  (str "(jolt-hash-map "
-       (str/join " " (mapcat (fn [p] [(emit-quoted (nth p 0)) (emit-quoted (nth p 1))]) pairs))
-       ")"))
+  (q-intern
+   (str "(jolt-hash-map "
+        (str/join " " (mapcat (fn [p] [(emit-quoted (nth p 0)) (emit-quoted (nth p 1))]) pairs))
+        ")")))
 (defn- emit-quoted-map-value [m]
   ;; A jolt map VALUE (def/symbol metadata is a value, not a reader form). (keys m)
   ;; iterates in host-hash order, which is not stable across Chez versions, so emit
   ;; the pairs sorted by their emitted Scheme text — keeps the seed byte-fixed
   ;; regardless of the host hash (jolt-8479).
-  (let [pairs (sort (map (fn [k] (str (emit-quoted k) " " (emit-quoted (get m k)))) (keys m)))]
-    (str "(jolt-hash-map " (str/join " " pairs) ")")))
+  (let [pairs (binding [*quote-pool* nil]
+                (vec (sort (map (fn [k] (str (emit-quoted k) " " (emit-quoted (get m k)))) (keys m)))))]
+    (q-intern (str "(jolt-hash-map " (str/join " " pairs) ")"))))
 ;; emit-quoted reconstructs both raw reader forms (from :quote) AND plain jolt
 ;; values (def/symbol :meta). Reader forms are walked via the jolt.host form-*
 ;; contract; the native-predicate branches below catch genuine jolt collection
@@ -717,16 +788,26 @@
     (form-literal? form) (emit-const form)
     (form-sym? form)
     (let [m (form-sym-meta form) sns (form-sym-ns form) nm (form-sym-name form)]
-      (if (and m (pos? (count m)))
-        ;; carry reader metadata (^:foo bar) onto the quoted symbol so (meta 'x) sees it
-        (str "(jolt-symbol/meta " (if sns (chez-str-lit sns) "#f") " " (chez-str-lit nm) " "
-             (emit-quoted m) ")")
-        (str "(jolt-symbol " (if sns (chez-str-lit sns) "#f") " " (chez-str-lit nm) ")")))
+      (q-intern
+       (if (and m (pos? (count m)))
+         ;; carry reader metadata (^:foo bar) onto the quoted symbol so (meta 'x) sees it
+         (str "(jolt-symbol/meta " (if sns (chez-str-lit sns) "#f") " " (chez-str-lit nm) " "
+              (emit-quoted m) ")")
+         (str "(jolt-symbol " (if sns (chez-str-lit sns) "#f") " " (chez-str-lit nm) ")"))))
     ;; sort items by emitted text: a set has no source order, and host-hash order
-    ;; is not stable across Chez versions (jolt-8479).
-    (form-set? form) (str "(jolt-hash-set " (str/join " " (sort (map emit-quoted (form-set-items form)))) ")")
-    (form-list? form) (str "(jolt-list " (str/join " " (map emit-quoted (form-elements form))) ")")
-    (form-vec? form) (str "(jolt-vector " (str/join " " (map emit-quoted (form-vec-items form))) ")")
+    ;; is not stable across Chez versions (jolt-8479) — so the items are emitted
+    ;; unpooled, or the sort would be over binding names handed out in that same
+    ;; unstable order. See the pool comment above.
+    (form-set? form)
+    (q-intern (str "(jolt-hash-set "
+                   (str/join " " (binding [*quote-pool* nil]
+                                   (vec (sort (map emit-quoted (form-set-items form))))))
+                   ")"))
+    ;; a fn literal is a list, so this is the only branch that has to ask
+    (form-list? form)
+    (or (q-shared-name form)
+        (q-intern (str "(jolt-list " (str/join " " (map emit-quoted (form-elements form))) ")")))
+    (form-vec? form) (q-intern (str "(jolt-vector " (str/join " " (map emit-quoted (form-vec-items form))) ")"))
     (form-map? form) (emit-quoted-map (form-map-pairs form))
     ;; a quoted #"…" regex value -> reconstruct it (same as the :regex IR leaf).
     (form-regex? form) (str "(jolt-regex " (chez-str-lit (form-regex-source form)) ")")
@@ -741,13 +822,16 @@
     (and (map? form) (= :jolt/tagged (get form :jolt/type)))
     (let [nm (name (get form :tag))
           tsym (if (= \# (first nm)) (subs nm 1) nm)]
-      (str "(jolt-tagged-literal (jolt-symbol #f " (chez-str-lit tsym) ") "
-           (emit-quoted (get form :form)) ")"))
+      (q-intern (str "(jolt-tagged-literal (jolt-symbol #f " (chez-str-lit tsym) ") "
+                     (emit-quoted (get form :form)) ")")))
     ;; plain jolt VALUES (metadata maps and anything nested in them)
     (map? form) (emit-quoted-map-value form)
-    (vector? form) (str "(jolt-vector " (str/join " " (map emit-quoted form)) ")")
-    (set? form) (str "(jolt-hash-set " (str/join " " (sort (map emit-quoted form))) ")")
-    (seq? form) (str "(jolt-list " (str/join " " (map emit-quoted form)) ")")
+    (vector? form) (q-intern (str "(jolt-vector " (str/join " " (map emit-quoted form)) ")"))
+    (set? form) (q-intern (str "(jolt-hash-set "
+                               (str/join " " (binding [*quote-pool* nil]
+                                               (vec (sort (map emit-quoted form)))))
+                               ")"))
+    (seq? form) (q-intern (str "(jolt-list " (str/join " " (map emit-quoted form)) ")"))
     :else (throw (ex-info (str "emit-quoted: unsupported quoted form " (pr-str form)) {}))))
 
 ;; A def's :meta is a jolt map value. Non-empty? (a plain def carries {}).
@@ -915,6 +999,18 @@
 ;;   (image-register-fn-form! "jfn$…" <quoted fn* form> "ns" <quoted free names>)
 ;; "" when the namespace is system or nothing was collected, so the seed mint
 ;; and any fn-free def emit byte-identically.
+;;
+;; Emitted under a *quote-pool*, which is what keeps this linear. The rows are in
+;; innermost-first order (emit-fn conjes after emitting the body), so a nested
+;; literal's construction is already interned by the time its enclosing literal is
+;; assembled, and the enclosing one costs its own arity instead of its whole
+;; subtree. Without it a chain of N nested literals emitted O(N^2) text — see the
+;; pool comment at emit-quoted. The bindings come out in dependency order for the
+;; same reason, so let* binds them in one pass.
+;;
+;; A row that throws leaves whatever it interned before throwing in the pool, so
+;; the let* can carry a binding nothing references. Dead, valid, and confined to a
+;; path that is already best-effort.
 (defn- fnsrc-flush []
   (if (or (fnsrc-system-ns? *fnsrc-ns*) (empty? @*fnsrc-regs*))
     ""
@@ -923,13 +1019,40 @@
     ;; Such a literal just goes unregistered — its closure refuses at dump
     ;; like any other unregistered fn — rather than failing the whole
     ;; compilation of code that never dumps anything.
-    (str " " (str/join " " (keep (fn [[nm form ns frees]]
-                                   (try
-                                     (str "(image-register-fn-form! " (chez-str-lit nm) " "
-                                          (emit-quoted form) " " (chez-str-lit ns) " "
-                                          (emit-quoted frees) ")")
-                                     (catch Exception _ nil)))
-                                 @*fnsrc-regs*)))))
+    (let [pool (atom {:by-expr {} :order []})
+          ;; the rows in order, each emitted with every EARLIER row available to
+          ;; stop the walk at (see *quote-shared*). Innermost first, so a nested
+          ;; literal is always already there by the time its parent is emitted.
+          ;; reduce and not map: each row's emission depends on the ones before it.
+          out (binding [*quote-pool* pool]
+                (reduce
+                 (fn [acc row]
+                   (let [nm (nth row 0) form (nth row 1) ns (nth row 2) frees (nth row 3)
+                         q (try
+                             (binding [*quote-shared* (:shared acc)]
+                               (let [f (emit-quoted form)]
+                                 [f (str "(image-register-fn-form! " (chez-str-lit nm) " "
+                                         f " " (chez-str-lit ns) " "
+                                         (emit-quoted frees) ")")]))
+                             (catch Exception _ nil))]
+                     (if (nil? q)
+                       acc
+                       (-> acc
+                           (update :calls conj (nth q 1))
+                           (update :shared conj [form (nth q 0)])))))
+                 {:calls [] :shared []}
+                 @*fnsrc-regs*))
+          calls (:calls out)
+          binds (:order @pool)]
+      (cond
+        ;; every row threw: nothing to register, and a let* with no body is not a
+        ;; form at all
+        (empty? calls) ""
+        (empty? binds) (str " " (str/join " " calls))
+        :else
+        (str " (let* ("
+             (str/join " " (map (fn [b] (str "(" (nth b 0) " " (nth b 1) ")")) binds))
+             ") " (str/join " " calls) ")")))))
 
 (defn- emit-fn [node]
   (let [;; a def's DIRECT anonymous init is named by its define, so it keeps the

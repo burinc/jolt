@@ -281,6 +281,20 @@
 ;; outer's free names bound, and a name free only inside the nested literal must
 ;; be in the outer's list or it would resolve to a same-named global at eval.
 ;; Sorted so the registration is stable across builds.
+;;
+;; A nested :fn is READ, not descended. analyze-fn runs bottom-up, so a nested
+;; literal already carries the answer for its own subtree: :free-names is exactly
+;; the names it references that nothing inside it binds, which is what descending
+;; would recompute. Filtering that list against the enclosing scope gives the same
+;; set — a name is this literal's iff the nested one leaves it free AND nothing out
+;; here binds it — and it costs the nested list rather than the nested subtree.
+;;
+;; Descending was quadratic, and it was the analyzer's whole cost on nested
+;; literals: every literal walked its entire subtree, so a chain of N of them
+;; walked O(N^2) nodes. The CPS pass in clojure.core.async builds that chain (one
+;; closure per park site) and 240 sites spent 1.4 s here. Reading takes it to 30 ms.
+;; A node with no :free-names (one a pass built, rather than analyze-fn) is
+;; descended as before, so the fallback cannot silently drop a capture.
 (defn- fn-free-names [arities fn-name]
   (let [refs (atom #{})
         ;; each arity's params bind only in that arity: (fn ([x] y) ([y] y))
@@ -293,10 +307,13 @@
                   (= op :local) (when-not (contains? bound (:name n))
                                   (swap! refs conj (:name n)))
                   (= op :fn)
-                  (doseq [a (:arities n)]
-                    (walk (:body a)
-                          (into (if (:name n) (conj bound (:name n)) bound)
-                                (if (:rest a) (conj (:params a) (:rest a)) (:params a)))))
+                  (if-let [inner (:free-names n)]
+                    (doseq [nm inner]
+                      (when-not (contains? bound nm) (swap! refs conj nm)))
+                    (doseq [a (:arities n)]
+                      (walk (:body a)
+                            (into (if (:name n) (conj bound (:name n)) bound)
+                                  (if (:rest a) (conj (:params a) (:rest a)) (:params a))))))
                   (or (= op :let) (= op :loop))
                   (let [b* (reduce (fn [b [nm init]]
                                      (walk init b)
@@ -313,7 +330,16 @@
       (doseq [a arities] (walk (:body a) (arity-own a)))
       (vec (sort @refs)))))
 
-(defn- analyze-fn [ctx items env]
+;; Is the form's own head already the bare, meta-free symbol fn*? Then the form IS
+;; what :src-form rebuilds and the rebuild can be skipped — see analyze-fn.
+(defn- fn-head-canonical? [items]
+  (let [h (first items)]
+    (and (form-sym? h)
+         (nil? (form-sym-ns h))
+         (= "fn*" (form-sym-name h))
+         (let [m (form-sym-meta h)] (or (nil? m) (zero? (count m)))))))
+
+(defn- analyze-fn [ctx form items env]
   (let [named (form-sym? (nth items 1))
         fn-name (when named (form-sym-name (nth items 1)))
         rest-items (if named (drop 2 items) (drop 1 items))
@@ -332,8 +358,20 @@
         ;; what the image rebuilds from; :free-names the original names of the
         ;; locals it captures. Attached to named fns too (invisible to emission
         ;; unless read; the prelude mint ignores them).
+        ;;
+        ;; The rebuild exists to normalize a clojure.core-QUALIFIED head (a macro's
+        ;; syntax-quote can produce one, and analyze-list* dispatches on either
+        ;; spelling) down to the bare fn*. When the head is already bare the rebuild
+        ;; produces a form equal to the one we were handed, so hand back the ORIGINAL
+        ;; OBJECT instead. That is not a micro-optimization: a nested literal's
+        ;; :src-form is then the very object sitting inside its parent's :src-form,
+        ;; which is what lets the back end emit the parent's registration by pointing
+        ;; at the nested one rather than walking into it again (fnsrc-flush). Rebuilt,
+        ;; the two are equal and not identical, and the back end has no cheap way to
+        ;; discover the relationship — jolt seqs do not cache their hash, so testing
+        ;; equality costs the subtree the sharing was meant to save.
         node (assoc node
-                    :src-form (cons 'fn* (rest items))
+                    :src-form (if (fn-head-canonical? items) form (cons 'fn* (rest items)))
                     :free-names (fn-free-names (:arities node) fn-name))]
     node))
 
@@ -572,7 +610,7 @@
     (throw (str "Wrong number of args (" (dec (count items)) ") passed to: " op)))
   (invoke (var-ref "jolt.host" op) [(analyze ctx (nth items 1) env)]))
 
-(defn- analyze-special [ctx op items env]
+(defn- analyze-special [ctx op form items env]
   (case op
     ;; A quoted collection keeps its USER metadata (rewrite-clj coerces
     ;; '^:x (4 5 6) and expects the meta back). A list form is the one thing the
@@ -627,7 +665,7 @@
     "monitor-enter" (analyze-monitor-op ctx items env "monitor-enter")
     "monitor-exit" (analyze-monitor-op ctx items env "monitor-exit")
     "letfn*" (analyze-letfn* ctx items env)
-    "fn*" (analyze-fn ctx items env)
+    "fn*" (analyze-fn ctx form items env)
     ;; Lower the backtick to construction code (zero runtime cost), then analyze
     ;; it — the macroexpand/compile-time step, per read -> macroexpand -> compile.
     "syntax-quote" (analyze ctx (form-syntax-quote-lower ctx (second items)) env)
@@ -1061,7 +1099,7 @@
           (and sf-name (contains? handled sf-name))
             ;; stamp the form's source offset onto a top-level def so the back end
             ;; can register it (jv$ns$name -> source) for native stack traces.
-            (let [node (analyze-special ctx sf-name items env)
+            (let [node (analyze-special ctx sf-name form items env)
                   p (form-position form)]
               (if (and p (= :def (:op node))) (stamp-def-pos ctx env node p) node))
           (and hname (not shadowed) (method-head? hname))
