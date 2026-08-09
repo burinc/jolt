@@ -110,9 +110,15 @@
                      (when (fx<? i n)
                        (walk (pvec-nth-d x i jolt-nil) (cons (number->string i) path))
                        (loop (fx+ i 1))))))
+                ;; root AND meta: meta is a FIELD of the cell (rt.ss), so fasl-write
+                ;; sees it, so the walk has to. Skipping it let (def ^{:test (fn …)} v)
+                ;; scan clean and then fail the dump on the very same graph, with no
+                ;; path to name — and ^{:test fn} is where deftest puts a test body.
                 ((var-cell? x)
-                 (walk (var-cell-root x)
-                       (cons (string-append "#'" (var-cell-ns x) "/" (var-cell-name x)) path)))
+                 (let ((vp (string-append "#'" (var-cell-ns x) "/" (var-cell-name x))))
+                   (walk (var-cell-root x) (cons vp path))
+                   (let ((m (var-cell-meta x)))
+                     (when m (walk m (cons (string-append vp " meta") path))))))
                 ;; cover val + watches + validator — everything fasl-write sees
                 ((jolt-atom? x)
                  (walk (jolt-atom-val x) (cons "@" path))
@@ -835,22 +841,30 @@
                             (walk (pvec-nth-d x i jolt-nil) (cons (number->string i) path))
                             (loop (fx+ i 1))))
                         #t)))))
+             ;; root AND meta, on both paths. meta is a FIELD of the cell (rt.ss), so
+             ;; fasl-write sees it and the walk has to reach it — same parity rule as
+             ;; the atom below. The rebuilt cell takes the WALKED meta, so a stub or a
+             ;; handled payload inside it is rebuilt like any other reachable value;
+             ;; installing the original would have carried the source graph's objects
+             ;; into the rebuilt one.
              (walk-var-cell
               (lambda (x path)
-                (if (image-rebuild-mode? mode)
-                    (let ((nx (make-var-cell (var-cell-ns x) (var-cell-name x)
-                                             jolt-nil (var-cell-defined? x)
-                                             (var-cell-meta x) (var-cell-macro? x))))
-                      (hashtable-set! memo x nx)
-                      (var-cell-root-set! nx
-                        (walk (var-cell-root x)
-                              (cons (string-append "#'" (var-cell-ns x) "/" (var-cell-name x)) path)))
-                      nx)
-                    (begin
-                      (hashtable-set! memo x #t)
-                      (walk (var-cell-root x)
-                            (cons (string-append "#'" (var-cell-ns x) "/" (var-cell-name x)) path))
-                      #t))))
+                (let* ((vp (string-append "#'" (var-cell-ns x) "/" (var-cell-name x)))
+                       (mp (cons (string-append vp " meta") path))
+                       (m (var-cell-meta x)))
+                  (if (image-rebuild-mode? mode)
+                      (let ((nx (make-var-cell (var-cell-ns x) (var-cell-name x)
+                                               jolt-nil (var-cell-defined? x)
+                                               #f (var-cell-macro? x))))
+                        (hashtable-set! memo x nx)
+                        (var-cell-root-set! nx (walk (var-cell-root x) (cons vp path)))
+                        (var-cell-meta-set! nx (and m (walk m mp)))
+                        nx)
+                      (begin
+                        (hashtable-set! memo x #t)
+                        (walk (var-cell-root x) (cons vp path))
+                        (when m (walk m mp))
+                        #t)))))
              ;; cover val + watches + validator — everything fasl-write sees
              ;; (the scan/dump parity fix)
              (walk-atom
