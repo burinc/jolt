@@ -78,7 +78,7 @@
   ;; winder to unwind normally.
   (jolt-park-drop-finallys!)
   (jolt-park-unwinding-set! #t)
-  (set-virtual-register! jolt-vreg-no-preempt 0)   ; see jolt-fiber-to-scheduler!
+  (jolt-fiber-sic-set! f (jolt-current-disable-count))  ; see jolt-fiber-to-scheduler!
   ((jolt-carrier-sched-k (jolt-fiber-carrier f))))
 
 ;; Commit to a cheap park on an already-registered handler whose channel mutex is
@@ -92,14 +92,14 @@
 ;; with an empty mailbox. jolt-sm-park! clears the region as it escapes; the
 ;; no-park path exits it here.
 (define (jolt-sm-commit! f h resume)
-  (jolt-no-preempt-enter!)
+  (disable-interrupts)
   (let* ((park? (with-mutex (alt-handler-wmu h)
                   (if (vector-ref (alt-handler-mailbox h) 0)
                       #f
                       (begin (jolt-fiber-state-set! f 'parked) #t)))))
     (if park?
         (jolt-sm-park! f resume)
-        (begin (jolt-no-preempt-exit!) (resume)))))
+        (begin (enable-interrupts) (resume)))))
 
 ;; --- the driver -------------------------------------------------------------
 ;; The fiber thunk of a CPS'd body. It runs on the first entry AND on every

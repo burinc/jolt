@@ -66,17 +66,16 @@
 ;; 4-producer/1-consumer run on one carrier stalled at 802 of 1600 values with a
 ;; short quantum, and hung outright with a shorter one.
 ;;
-;; So these ops mark a non-preemptible region for exactly as long as they hold
-;; the mutex.
-;; The timer still fires in here; the handler sees the depth and declines,
-;; re-arming instead. Release BEFORE leaving the region: the other order reopens
-;; the window.
+;; So these ops disable interrupts for exactly as long as they hold the mutex.
+;; Chez defers a timer raised in here and delivers it at the enable, so the
+;; preemption is postponed rather than lost. Release BEFORE re-enabling: the
+;; other order reopens the window.
 (define (jolt-chan-lock! ch)
-  (jolt-no-preempt-enter!)
+  (disable-interrupts)
   (mutex-acquire (async-chan-mu ch)))
 (define (jolt-chan-unlock! ch)
   (mutex-release (async-chan-mu ch))
-  (jolt-no-preempt-exit!))
+  (enable-interrupts))
 
 (define (jolt-chan-locked-give! ch v)
   (if (async-chan-xrf ch)
@@ -222,20 +221,23 @@
   (let ((f (jolt-current-fiber)))
     (unless f
       (error 'jolt-fiber-waiter-wait! "channel wait outside a fiber"))
-    ;; Commit and park are ONE non-preemptible region — see jolt-sm-commit!.
-    ;; jolt-fiber-to-scheduler! clears it on the way out, so the resumed path
-    ;; must NOT exit it again; only the no-park path does.
-    (jolt-no-preempt-enter!)
+    ;; Commit and park are ONE region with interrupts disabled — see
+    ;; jolt-sm-commit!. The park records the depth (swish's pcb-sic) and the
+    ;; resume is restored to it, so the resumed path must NOT enable again; only
+    ;; the no-park path does.
+    (disable-interrupts)
     (let ((park?
            (with-mutex (alt-handler-wmu h)
              (if (vector-ref (alt-handler-mailbox h) 0)
                  #f
                  (begin (jolt-fiber-state-set! f 'parked) #t)))))
-      (if park?
-          (begin
-            (jolt-fiber-bump-chan-parks! f)
-            (jolt-fiber-to-scheduler! f))
-          (jolt-no-preempt-exit!))
+      (when park?
+        (jolt-fiber-bump-chan-parks! f)
+        (jolt-fiber-to-scheduler! f))
+      ;; Balances the disable above on BOTH paths: the park returns here when the
+      ;; fiber is resumed (restored to the depth it parked at), so it owes the
+      ;; same enable the no-park path does.
+      (enable-interrupts)
       (alt-handler-mailbox h))))
 
 ;; The fiber alts! await: park on the already-registered shared handler and

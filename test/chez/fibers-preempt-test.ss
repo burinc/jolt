@@ -40,23 +40,32 @@
 (printf "== fiber preemption ==\n")
 
 ;; --- 1. off by default ------------------------------------------------------
-;; OFF by default, until the channel stress below is clean at a tight quantum
-;; (jolt-atc.6). Cooperative-only is an unbounded starvation window and SHOULD
-;; not be the default, but shipping a scheduler with known races is worse.
-(ok "1. preemption is OFF by default" (not (jolt-fiber-preempt-ticks)))
+;; ON, and the ONLY path. There is no off switch: cooperative-only is an
+;; unbounded starvation window, and a mode flag would mean one of the two
+;; schedulers gets far less exercise than the other.
+(ok "1. preemption is on, with the default quantum"
+    (eqv? (jolt-fiber-preempt-ticks) jolt-fiber-preempt-ticks-default))
 (jolt-fiber-preempt-ticks-set! 20000)
-(ok "1. host setter turns it on" (eqv? 20000 (jolt-fiber-preempt-ticks)))
+(ok "1. host setter pins a different quantum" (eqv? 20000 (jolt-fiber-preempt-ticks)))
 (jolt-fiber-preempt-ticks-set! #f)
-(ok "1. host setter turns it back off" (not (jolt-fiber-preempt-ticks)))
-(ok "1. a non-positive tick count is refused"
-    (guard (e (#t #t)) (jolt-fiber-preempt-ticks-set! 0) #f))
+(ok "1. #f restores the default rather than disabling"
+    (eqv? (jolt-fiber-preempt-ticks) jolt-fiber-preempt-ticks-default))
+;; A quantum below the floor cannot make progress, so it is refused rather than
+;; allowed to livelock the carrier.
+(ok "1. a quantum below the floor is refused"
+    (guard (e (#t #t))
+      (jolt-fiber-preempt-ticks-set! (fx- jolt-fiber-preempt-ticks-min 1)) #f))
+(ok "1. the floor itself is accepted"
+    (guard (e (#t #f))
+      (jolt-fiber-preempt-ticks-set! jolt-fiber-preempt-ticks-min) #t))
 
 ;; --- 2. cooperatively, a spinner starves its carrier ------------------------
 ;; ONE carrier, so B has nowhere else to go. A spins on a box the driver flips;
 ;; the flag is how the test stops it without ever letting it park.
-;; section 2 needs cooperative behaviour on purpose, which is no longer the
-;; default, so it asks for it explicitly
-(jolt-fiber-preempt-ticks-set! #f)
+;; Section 2 wants the cooperative failure mode on purpose. With no off switch,
+;; it asks for a quantum long enough that nothing is preempted inside the 0.3s
+;; window below — which is what "cooperative" now means here.
+(jolt-fiber-preempt-ticks-set! 10000000000)
 (jolt-fiber-pool-reset!)
 (jolt-fiber-carrier-count-set! 1)
 
@@ -121,10 +130,10 @@
 (ok "4. preemption did not bump the chan-park counter"
     (= chan-before (jolt-fiber-chan-parks)))
 
-;; --- 5. turning it off again restores cooperative behaviour -----------------
-;; Proves the knob is read per dispatch rather than latched at pool start, which
-;; is what makes it safe to leave the machinery compiled in while off.
-(jolt-fiber-preempt-ticks-set! #f)
+;; --- 5. a long quantum starves again ----------------------------------------
+;; The knob is read per dispatch rather than latched at pool start, so raising it
+;; after the pool is running takes effect.
+(jolt-fiber-preempt-ticks-set! 10000000000)
 (jolt-fiber-pool-reset!)
 (jolt-fiber-carrier-count-set! 1)
 (define off-stop (box #f))
@@ -133,7 +142,7 @@
 (define off-b (sa-fiber-spawn (lambda () (set-box! off-b-ran #t))))
 (jolt-fiber-ensure-carrier!)
 (sleep (make-time 'time-duration 300000000 0))
-(ok "5. with the knob off the queued fiber starves again" (not (unbox off-b-ran)))
+(ok "5. with a long quantum the queued fiber starves again" (not (unbox off-b-ran)))
 (set-box! off-stop #t)
 (wait-until (lambda () (unbox off-b-ran)) 5.0 "5. B runs after A finishes")
 
@@ -147,13 +156,13 @@
 ;; walks into a section another fiber is halfway through. Before the guards, this
 ;; stalled at 802 of 1600 values; before the commit-window guard, at 0 of 1600.
 ;;
-;; Quantum is 200 ticks, which is roughly 0.1us and about 5000x tighter than the
-;; default. Anything looser stops exercising the window at all: at the default a
-;; channel-bound fiber parks long before its quantum expires and no preemption
-;; ever lands inside an op.
+;; Runs at the FLOOR, the tightest quantum the scheduler accepts, which is four
+;; orders of magnitude below the default. Anything looser stops exercising the
+;; window at all: at the default a channel-bound fiber parks long before its
+;; quantum expires and no preemption ever lands inside an op.
 (jolt-fiber-pool-reset!)
 (jolt-fiber-carrier-count-set! 1)
-(jolt-fiber-preempt-ticks-set! 200)
+(jolt-fiber-preempt-ticks-set! jolt-fiber-preempt-ticks-min)
 
 (define NPROD 4)
 (define NPER 300)
@@ -162,12 +171,18 @@
 (define st-got 0)
 (define st-before (jolt-fiber-preempts))
 
+;; Each producer BURNS a quantum between puts. Without that the test proves
+;; nothing: a purely channel-bound fiber parks long before its quantum expires,
+;; so no preemption ever fires and the run is trivially clean. The spin is what
+;; puts a preemption near, and sometimes inside, a channel op.
+(define (st-burn n) (let loop ((i 0) (acc 0)) (if (fx=? i n) acc (loop (fx+ i 1) (fx+ acc i)))))
 (do ((i 0 (+ i 1))) ((= i NPROD))
   (let ((id i))
     (sa-fiber-spawn
      (lambda ()
        (let loop ((j 0))
          (when (< j NPER)
+           (st-burn 400)
            (jolt-fiber->! st-ch (+ (* id 100000) j))
            (loop (+ j 1))))))))
 (sa-fiber-spawn
@@ -185,8 +200,27 @@
 (ok "6. no value duplicated" (= (hashtable-size st-seen) (* NPROD NPER)))
 (ok "6. preemption actually fired during the stress"
     (> (jolt-fiber-preempts) st-before))
+;; --- 7. a long synchronous drain stays linear -------------------------------
+;; The interrupt depth a park records has to be BALANCED when the fiber resumes.
+;; It was not, at first: every yield left the depth one higher than it found it,
+;; so the stored count grew without bound and the restore loop turned a drain
+;; quadratic. 10,000 yields still finished and 200,000 hung, which is exactly the
+;; shape of bug the other sections cannot see — they all use short bodies.
 (jolt-fiber-preempt-ticks-set! #f)
+(jolt-fiber-pool-reset!)
+(jolt-fiber-carrier-count-set! 1)
+(define drain-f
+  (sa-fiber-spawn
+   (lambda () (let loop ((i 0)) (when (< i 200000) (sa-fiber-yield) (loop (+ i 1)))))))
+(define drain-t0 (now-secs))
+(jolt-fiber-drain! (jolt-fiber-carrier drain-f))
+(ok "7. 200k yields complete on a synchronous drain"
+    (eq? 'done (jolt-fiber-state drain-f)))
+;; Linear, not quadratic. The quadratic version did not finish in minutes, so any
+;; sane bound catches it; 30s leaves room for a slow machine.
+(ok "7. and in linear time" (< (- (now-secs) drain-t0) 30.0))
 
+(jolt-fiber-preempt-ticks-set! #f)
 (jolt-fiber-pool-reset!)
 (printf "\nfibers-preempt-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)

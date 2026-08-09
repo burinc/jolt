@@ -73,8 +73,9 @@
           (mutable slice)
           carrier
           (mutable sm)
-          (mutable monitors))
-  (nongenerative jolt-fiber-v3))
+          (mutable monitors)
+          (mutable sic))
+  (nongenerative jolt-fiber-v4))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -178,36 +179,30 @@
 ;; the end — the correct answer, just without the shortcut.
 (define jolt-vreg-fiber-winder-base 6)
 
-;; Slot 7: how deep this carrier is inside a region that must not be preempted.
+;; --- the interrupt discipline (swish erlang.ss, ported) ----------------------
+;; A region that must not be preempted disables interrupts. Chez DEFERS a timer
+;; raised while they are off and delivers it at the enable, so this covers every
+;; region so marked without the scheduler enumerating them — which a hand-rolled
+;; "am I in a critical section" counter cannot do, and which is why the earlier
+;; one kept missing regions (a channel op, a commit-to-park, a yield transition,
+;; each found only by tightening the quantum until it broke).
 ;;
-;; A DEPTH and not a flag, because the regions nest: alt-deliver! enqueues onto a
-;; carrier's run queue while holding a channel mutex, so the queue guard closes
-;; inside the channel guard.
+;; The piece that makes it work, and the piece that was skipped the first time:
+;; the disable COUNT has to ride across a context switch. This handler escapes to
+;; the scheduler rather than returning, so an (enable-interrupts) it interrupts
+;; never completes and the count would stay raised on that carrier forever. Swish
+;; carries it in pcb-sic and rebuilds it on the far side (erlang.ss:958-968);
+;; jolt-fiber-sic is that field, and jolt-adjust-interrupts! is that loop.
 ;;
-;; This replaced disable-interrupts, which looked like the obvious tool and is
-;; the one swish uses. It does not work here. Chez DEFERS a timer raised while
-;; interrupts are off and delivers it at the enable, so the handler fires from
-;; inside enable-interrupts — and this handler escapes to the scheduler instead
-;; of returning, so the enable never completes and the carrier's disable count
-;; is left raised for good. Preemption then stops firing on that carrier
-;; entirely. Swish survives that because @yield carries the count across the
-;; switch in pcb-sic and rebuilds it on the other side; a counter the handler
-;; simply consults needs no such accounting, and is a vreg write rather than two
-;; calls into the interrupt machinery.
-;;
-;; Nothing has to save or restore it across a park: every guarded region releases
-;; its lock and leaves the region before parking, so the depth is 0 at every
-;; park and every dispatch. That was the same claim made for the interrupt count,
-;; but here it actually holds, because this counter is ours and only these
-;; regions touch it.
-(define jolt-vreg-no-preempt 7)
-(define (jolt-no-preempt-enter!)
-  (set-virtual-register! jolt-vreg-no-preempt
-                         (fx+ 1 (virtual-register jolt-vreg-no-preempt))))
-(define (jolt-no-preempt-exit!)
-  (set-virtual-register! jolt-vreg-no-preempt
-                         (fx- (virtual-register jolt-vreg-no-preempt) 1)))
-(define (jolt-no-preempt?) (fx>? (virtual-register jolt-vreg-no-preempt) 0))
+;; Neither disable-interrupts nor enable-interrupts needs a primitive to read the
+;; count: both RETURN the new one, so a disable/enable pair measures it.
+(define (jolt-current-disable-count)
+  (let ((n (disable-interrupts))) (enable-interrupts) (fx- n 1)))
+(define (jolt-adjust-interrupts! from to)
+  (let loop ((n from))
+    (cond ((fx>? n to) (enable-interrupts) (loop (fx- n 1)))
+          ((fx<? n to) (disable-interrupts) (loop (fx+ n 1)))
+          (else (void)))))
 
 ;; The chain with the finally winders removed. Returns the ARGUMENT ITSELF when
 ;; nothing is dropped — the overwhelmingly common case — so a park with no
@@ -307,8 +302,9 @@
 (define-record-type jolt-carrier
   (fields mu cv (mutable head) (mutable tail)
           (mutable sched-k) sched-slice (mutable thread) (mutable stop?)
-          (mutable sm-parks) (mutable chan-parks) (mutable preempts))
-  (nongenerative jolt-carrier-v3))
+          (mutable sm-parks) (mutable chan-parks) (mutable preempts)
+          (mutable sic))
+  (nongenerative jolt-carrier-v4))
 
 ;; (jolt-fiber-bump-sm-parks! f) / (jolt-fiber-bump-chan-parks! f) — called by the
 ;; parking fiber, on its own carrier's field, so no two threads touch one field.
@@ -400,7 +396,7 @@
         (do ((i 0 (fx+ i 1))) ((fx=? i n))
           (vector-set! v i
             (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
-                               (make-jolt-dslice #f #f #f) #f #f 0 0 0)))
+                               (make-jolt-dslice #f #f #f) #f #f 0 0 0 0)))
         (set! jolt-fiber-carriers v)))
     (mutex-release jolt-fiber-rr-mu)))
 
@@ -438,7 +434,7 @@
 ;; dropping it, so nothing is lost: the preemption lands at the enable.
 (define (jolt-fiber-enqueue! c f)
   (begin
-    (jolt-no-preempt-enter!)
+    (disable-interrupts)
     (mutex-acquire (jolt-carrier-mu c))
     (if (jolt-carrier-tail c)
         (begin (jolt-fiber-next-set! (jolt-carrier-tail c) f)
@@ -447,11 +443,11 @@
                (jolt-carrier-head-set! c f)
                (jolt-carrier-tail-set! c f)))
     (mutex-release (jolt-carrier-mu c))
-    (jolt-no-preempt-exit!)))
+    (enable-interrupts)))
 
 (define (jolt-fiber-dequeue! c)
   (begin
-    (jolt-no-preempt-enter!)
+    (disable-interrupts)
     (mutex-acquire (jolt-carrier-mu c))
     (let ((f (jolt-carrier-head c)))
       (when f
@@ -460,7 +456,7 @@
         ;; clear the link so a completed fiber does not retain the queue
         (jolt-fiber-next-set! f #f))
       (mutex-release (jolt-carrier-mu c))
-      (jolt-no-preempt-exit!)
+      (enable-interrupts)
       f)))
 
 ;; The three thread parameters that make up a fiber's dynamic slice live in
@@ -552,12 +548,11 @@
       ;; exit-only cleanup but need a before-thunk of their own (loader.ss).
       (jolt-park-drop-finallys!)
       (jolt-park-unwinding-set! #t)
-      ;; A park leaves NO non-preemptible region behind. The commit-to-park
-      ;; sequences enter one and then escape through here rather than exiting it
-      ;; (they cannot exit: the escape is the last thing they do), so clearing it
-      ;; is this function's job. Leaving it set would hand the carrier to the
-      ;; NEXT fiber with preemption suppressed.
-      (set-virtual-register! jolt-vreg-no-preempt 0)
+      ;; swish's pcb-sic: remember how deep in disabled-interrupt regions this
+      ;; fiber was, so its resume can be put back exactly there. Without it the
+      ;; count a parking fiber leaves behind would be inherited by whatever the
+      ;; carrier runs next.
+      (jolt-fiber-sic-set! f (jolt-current-disable-count))
       ((jolt-carrier-sched-k (jolt-fiber-carrier f))))))
 
 ;; (sa-fiber-yield) -> void. Park the current fiber and move it to the back of
@@ -573,10 +568,16 @@
 (define (sa-fiber-yield)
   (let ((f (jolt-current-fiber)))
     (if f
-        (begin (jolt-no-preempt-enter!)
+        (begin (disable-interrupts)
                (jolt-fiber-state-set! f 'ready)
                (jolt-fiber-enqueue! (jolt-fiber-carrier f) f)
-               (jolt-fiber-to-scheduler! f))
+               (jolt-fiber-to-scheduler! f)
+               ;; The restart point, and it must BALANCE the disable above —
+               ;; swish's @check-and-enable-interrupts. Without it every yield
+               ;; leaves the depth one higher than it found it, the stored sic
+               ;; grows without bound, and jolt-adjust-interrupts! turns a drain
+               ;; quadratic: 10k yields still finished, 200k hung.
+               (enable-interrupts))
         (error 'sa-fiber-yield "yield called outside a fiber"))))
 
 ;; Park WITHOUT re-enqueueing: the fiber is not runnable until sa-fiber-resume.
@@ -587,9 +588,10 @@
 (define (jolt-fiber-park!)
   (let ((f (jolt-current-fiber)))
     (if f
-        (begin (jolt-no-preempt-enter!)
+        (begin (disable-interrupts)
                (jolt-fiber-state-set! f 'parked)
-               (jolt-fiber-to-scheduler! f))
+               (jolt-fiber-to-scheduler! f)
+               (enable-interrupts))          ; balance, see sa-fiber-yield
         (error 'jolt-fiber-park! "park called outside a fiber"))))
 
 ;; (sa-fiber-resume f) -> void. Make a PARKED fiber runnable again (enqueue on
@@ -617,7 +619,7 @@
               (make-jolt-dslice (jolt-slice-stack-param)
                                 (jolt-slice-ns-param)
                                 #f)
-              c #f '())))
+              c #f '() 0)))
       (jolt-fiber-enqueue! c f)
       f)))
 
@@ -682,8 +684,15 @@
 ;; contract *fiber-carrier-count* already documents: set it before the first
 ;; :fiber go, or between a pool reset and the next one. The host setter updates
 ;; both and is always immediate.
+;; A quantum shorter than a dispatch cannot make progress: the timer expires
+;; again before the fiber executes anything, so the carrier spends all its time
+;; preempting and re-dispatching. Measured: 2 ticks completes the channel stress
+;; (slowly, 24k preemptions), 1 tick never finishes. The floor is set well above
+;; that boundary rather than at it, since dispatch cost varies by machine, and it
+;; is still four orders of magnitude below the default.
+(define jolt-fiber-preempt-ticks-min 100)
 (define jolt-fiber-preempt-ticks-default 1000000)   ; ~0.45ms, measured
-(define jolt-fiber-preempt-ticks-global #f)        ; #f = off, the default for now
+(define jolt-fiber-preempt-ticks-global jolt-fiber-preempt-ticks-default)
 (define (jolt-fiber-preempt-ticks) jolt-fiber-preempt-ticks-global)
 (define (jolt-fiber-preempt-refresh!)
   (let ((v (guard (e (#t #f))
@@ -691,14 +700,16 @@
                (if (and cell (var-cell-defined? cell)) (var-cell-root cell) #f)))))
     ;; a positive fixnum pins the quantum, 0 is the escape hatch, and jolt-nil
     ;; (an unset var) leaves the default alone
-    (when (and (fixnum? v) (fx>? v 0))
+    (when (and (fixnum? v) (fx>=? v jolt-fiber-preempt-ticks-min))
       (set! jolt-fiber-preempt-ticks-global v))))
 (define (jolt-fiber-preempt-ticks-set! n)
   ;; #f restores the default rather than turning preemption off — there is no off.
-  (when (and n (not (and (fixnum? n) (fx>? n 0))))
+  ;; #f restores the default quantum. There is no "off": see above.
+  (when (and n (not (and (fixnum? n) (fx>=? n jolt-fiber-preempt-ticks-min))))
     (error 'jolt-fiber-preempt-ticks-set!
-           "preempt ticks must be a positive fixnum or #f (off)" n))
-  (set! jolt-fiber-preempt-ticks-global n)
+           "preempt ticks must be #f or a fixnum >= jolt-fiber-preempt-ticks-min"
+           n jolt-fiber-preempt-ticks-min))
+  (set! jolt-fiber-preempt-ticks-global (or n jolt-fiber-preempt-ticks-default))
   (guard (e (#t #f))
     (let ((cell (var-cell-lookup "clojure.core.async" "*fiber-preempt-ticks*")))
       (when (and cell (var-cell-defined? cell))
@@ -731,12 +742,11 @@
   (let ((f (jolt-current-fiber))
         (ticks jolt-fiber-preempt-ticks-global))
     (cond
-      ;; Off a fiber (mid-park, between dispatches), or inside a region that must
-      ;; run to completion (a held channel or run-queue mutex). Re-arm and let it
-      ;; go: the fiber loses this quantum, which is far cheaper than suspending it
-      ;; holding a lock that its own carrier needs.
-      ((or (not f) (jolt-no-preempt?))
-       (when ticks (set-timer ticks))
+      ;; Off a fiber: mid-park, or between dispatches. A region that must run to
+      ;; completion needs no test here — it disabled interrupts, so Chez has not
+      ;; delivered this timer yet and will not until the region ends.
+      ((not f)
+       (set-timer ticks)
        (void))
       (else
        (jolt-fiber-bump-preempts! f)
@@ -757,13 +767,10 @@
 ;; of a yield. Per drain still composes with jolt-run-interruptible, which saves
 ;; and restores the handler around its own thunk.
 (define (jolt-fiber-install-preempt-handler!)
-  (when jolt-fiber-preempt-ticks-global
-    (timer-interrupt-handler jolt-fiber-preempt-handler)))
+  (timer-interrupt-handler jolt-fiber-preempt-handler))
 (define (jolt-fiber-arm-preempt!)
-  (let ((ticks jolt-fiber-preempt-ticks-global))
-    (when ticks (set-timer ticks))))
-(define (jolt-fiber-disarm-preempt!)
-  (when jolt-fiber-preempt-ticks-global (set-timer 0)))
+  (set-timer jolt-fiber-preempt-ticks-global))
+(define (jolt-fiber-disarm-preempt!) (set-timer 0))
 
 ;; --- monitors (the observable half of swish's, erlang.ss:434) ----------------
 ;; A fiber that dies is otherwise unobservable. fibers-async.ss and sm.ss both
@@ -828,7 +835,8 @@
 ;; Resume (or first-run) fiber f on ITS carrier's thread, returning to the
 ;; loop when f parks, finishes, or dies.
 (define (jolt-fiber-run f)
-  (let ((c (jolt-fiber-carrier f)))
+  (let* ((c (jolt-fiber-carrier f))
+         (base (jolt-carrier-sic c)))
     (set-virtual-register! jolt-vreg-current-fiber f)
     (call/1cc
       (lambda (k)
@@ -840,11 +848,18 @@
         ;; it (for a resume, before its continuation re-enters — the dynamic-wind
         ;; before-thunks then re-fire over the restored values)
         (jolt-fiber-slice-restore! (jolt-fiber-slice f))
+        ;; Put the carrier back to the interrupt depth this fiber parked at. A
+        ;; first run starts at the carrier's own baseline.
+        (jolt-adjust-interrupts! (jolt-current-disable-count)
+                                 (if (jolt-fiber-k f) (jolt-fiber-sic f) base))
         (jolt-fiber-arm-preempt!)
         (jolt-fiber-resume* f)))
     ;; Disarm FIRST: everything below runs on the scheduler, which must never be
     ;; preempted (a timer here would park the carrier's own loop).
     (jolt-fiber-disarm-preempt!)
+    ;; However the fiber left the interrupt depth — parked inside a region, or
+    ;; simply finished — the scheduler resumes at its own baseline.
+    (jolt-adjust-interrupts! (jolt-current-disable-count) base)
     ;; Back on the scheduler: whatever escape brought us here is over.
     (jolt-park-unwinding-set! #f)
     ;; The fiber parked, finished, or died: its setter-written dynamic state
@@ -970,6 +985,11 @@
 ;; restores onto the carrier.
 (define (jolt-fiber-drain! c)
   (jolt-fiber-install-preempt-handler!)
+  ;; The carrier's own interrupt depth, measured once per drain. Every fiber is
+  ;; put back to this before the scheduler runs again, and a first run starts
+  ;; here. Measured rather than assumed 0, because a drain can be entered from
+  ;; user code (sa-fiber-run-all) that is itself inside a disabled region.
+  (jolt-carrier-sic-set! c (jolt-current-disable-count))
   (jolt-carrier-sched-slice-capture! c)
   (let loop ()
     (let ((f (jolt-fiber-dequeue! c)))
