@@ -26,6 +26,26 @@
 ;; The gates read both: a body whose parks were all rewritten moves this one and
 ;; leaves that one alone.
 
+;; --- the driver invariant ----------------------------------------------------
+;; The sm field holds 'running while a driver is on the stack, the pending step
+;; while parked, #f otherwise. A cheap park is only correct UNDER a driver: the
+;; resume is re-entered through the fiber's thunk, and if that thunk is not
+;; jolt-sm-drive then nothing consumes the stored step and the thunk re-runs the
+;; body FROM THE TOP — a silent re-take. Calling __sm-take by hand on an ordinary
+;; fiber is the way to get there, so it is checked rather than described.
+;;
+;; Checked at the OP, before the channel is touched. Checking it at the park
+;; instead let the op run to the point of no return first: the handler is already
+;; on the channel's waiter list and the fiber is already committed to 'parked
+;; under the handler's wmu, so the throw left a registered waiter behind and a
+;; value delivered to it afterwards went nowhere. Here the fiber dies with the
+;; channel exactly as it was.
+(define (jolt-sm-check-driver! who f)
+  (unless (eq? (jolt-fiber-sm f) 'running)
+    (error who
+           "cheap park outside a CPS'd go body (needs jolt-sm-drive as the fiber thunk)"
+           (jolt-fiber-sm f))))
+
 ;; --- the park ---------------------------------------------------------------
 ;; Store the rest of the computation and hand the carrier back. The differences
 ;; from jolt-fiber-to-scheduler! are the whole point: no call/1cc, and k is left
@@ -33,18 +53,21 @@
 ;; is what re-establishes the body's exception handler on every resume. Everything
 ;; else — clearing the current-fiber vreg, saving the slice, flagging the escape as
 ;; a park so try/finally after-thunks skip — is identical, and has to be.
+;;
+;; The two field writes below are deliberately UNORDERED with respect to a
+;; concurrent observer: sm first leaves (k = a consumed continuation, sm = step)
+;; visible, k first would leave (k = none, sm = 'running), and jolt-fiber-resume*
+;; dispatches wrongly on either. Neither order is safe on its own. What makes it
+;; safe is R0(d): the fiber is pinned to its carrier and ONLY that carrier's
+;; thread dequeues it, so the carrier executing this sequence cannot also be
+;; dispatching it. A cross-thread sa-fiber-resume landing mid-sequence only flips
+;; 'parked to 'ready and enqueues. Anything that gave a second thread the right to
+;; run this fiber — a manual sa-fiber-run-all against a live pool is the one way
+;; in — breaks the park, not just the counters.
 (define (jolt-sm-park! f resume)
-  ;; The sm field holds 'running while a driver is on the stack, the pending step
-  ;; while parked, #f otherwise. A cheap park is only correct UNDER a driver: the
-  ;; resume is re-entered through the fiber's thunk, and if that thunk is not
-  ;; jolt-sm-drive then nothing consumes the stored step and the thunk re-runs the
-  ;; body FROM THE TOP — a silent re-take. Calling __sm-take on an ordinary fiber
-  ;; is the way to get there, so it is checked here rather than described in a
-  ;; comment.
-  (unless (eq? (jolt-fiber-sm f) 'running)
-    (error 'jolt-sm-park!
-           "cheap park outside a CPS'd go body (needs jolt-sm-drive as the fiber thunk)"
-           (jolt-fiber-sm f)))
+  ;; unreachable, both ops check before they touch the channel; kept because this
+  ;; is the point the invariant is actually load-bearing
+  (jolt-sm-check-driver! 'jolt-sm-park! f)
   (jolt-fiber-bump-sm-parks! f)
   (jolt-fiber-sm-set! f resume)
   (jolt-fiber-k-set! f #f)
@@ -57,9 +80,8 @@
 ;; RELEASED. The commit is atomic with alt-deliver!'s mailbox write under h's wmu,
 ;; exactly as jolt-fiber-waiter-wait! does it: a deliver that beat the commit is
 ;; seen here and the resume runs inline instead of parking.
-(define (jolt-sm-commit! h resume)
-  (let* ((f (jolt-current-fiber))
-         (park? (with-mutex (alt-handler-wmu h)
+(define (jolt-sm-commit! f h resume)
+  (let* ((park? (with-mutex (alt-handler-wmu h)
                   (if (vector-ref (alt-handler-mailbox h) 0)
                       #f
                       (begin (jolt-fiber-state-set! f 'parked) #t)))))
@@ -124,11 +146,19 @@
       (jolt-sm-fiber-spawn body-fn)
       (async-go-spawn-thread (lambda () (jolt-invoke body-fn jolt-sm-thread-finish)))))
 
+;; The thunk is RE-ENTRANT — jolt-fiber-resume* runs it again on every cheap park
+;; — so it must hold nothing that is meant to happen once per fiber.
+;; jolt-fiber-go-spawn's thunk opens with (*txn* #f), and copying that here would
+;; have re-cleared *txn* on every resume, after jolt-fiber-slice-restore! had just
+;; put the fiber's own value back. Nothing reaches it today (dosync expands
+;; through an fn*, which is opaque to the pass, so a park inside a transaction
+;; takes the capture), but the line is not needed either way: sa-fiber-spawn
+;; builds the child's slice with txn #f by construction, and jolt-fiber-run
+;; restores that slice before the first entry.
 (define (jolt-sm-fiber-spawn body-fn)
   (let ((w (ac-make 1 'fixed #f)))
     (sa-fiber-spawn
      (lambda ()
-       (*txn* #f)                        ; a go body never inherits the spawner's txn
        (jolt-sm-drive w body-fn)))
     (jolt-fiber-ensure-carrier!)
     w))
@@ -139,16 +169,20 @@
 ;; and grows no stack per park. On a fiber a ready channel completes inline and an
 ;; empty/full one parks cheaply.
 
+;; The fiber branch checks the driver invariant BEFORE the channel mutex, so a
+;; misuse throws with the channel and the waiter lists exactly as it found them.
 (define (jolt-sm-take ch k)
-  (if (jolt-current-fiber)
-      (jolt-sm-fiber-take ch k)
-      (jolt-invoke k (jolt-async-take ch))))
+  (let ((f (jolt-current-fiber)))
+    (if f
+        (begin (jolt-sm-check-driver! 'clojure.core.async/__sm-take f)
+               (jolt-sm-fiber-take f ch k))
+        (jolt-invoke k (jolt-async-take ch)))))
 
-(define (jolt-sm-fiber-take ch k)
+(define (jolt-sm-fiber-take f ch k)
   (mutex-acquire (async-chan-mu ch))
   (let ((r (ac-poll!/locked ch)))
     (if (eq? r ac-poll-empty)
-        (let ((h (jolt-fiber-waiter (jolt-current-fiber))))
+        (let ((h (jolt-fiber-waiter f)))
           (async-chan-alt-takers-set! ch (append (async-chan-alt-takers ch) (list h)))
           (ac-notify! ch)
           (if (vector-ref (alt-handler-mailbox h) 0)
@@ -158,17 +192,19 @@
               (begin
                 (mutex-release (async-chan-mu ch))
                 (jolt-sm-commit!
-                 h (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1)))))))
+                 f h (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1)))))))
         (begin
           (mutex-release (async-chan-mu ch))
           (jolt-invoke k r)))))
 
 (define (jolt-sm-put ch v k)
-  (if (jolt-current-fiber)
-      (jolt-sm-fiber-put ch v k)
-      (jolt-invoke k (jolt-async-give ch v))))
+  (let ((f (jolt-current-fiber)))
+    (if f
+        (begin (jolt-sm-check-driver! 'clojure.core.async/__sm-put f)
+               (jolt-sm-fiber-put f ch v k))
+        (jolt-invoke k (jolt-async-give ch v)))))
 
-(define (jolt-sm-fiber-put ch v k)
+(define (jolt-sm-fiber-put f ch v k)
   ;; the nil check BEFORE the mutex: it throws, and this path releases by hand
   (async-check-put! v)
   (mutex-acquire (async-chan-mu ch))
@@ -177,7 +213,7 @@
       ((eq? r 'ok) (mutex-release (async-chan-mu ch)) (jolt-invoke k #t))
       ((eq? r 'closed) (mutex-release (async-chan-mu ch)) (jolt-invoke k #f))
       (else
-       (let ((h (jolt-fiber-waiter (jolt-current-fiber))))
+       (let ((h (jolt-fiber-waiter f)))
          (async-chan-alt-putters-set! ch
            (append (async-chan-alt-putters ch) (list (cons h v))))
          (ac-notify! ch)
@@ -188,7 +224,7 @@
              (begin
                (mutex-release (async-chan-mu ch))
                (jolt-sm-commit!
-                h (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1)))))))))))
+                f h (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1)))))))))))
 
 (cca-def! "__sm-spawn" jolt-sm-spawn)
 (cca-def! "__sm-take" jolt-sm-take)

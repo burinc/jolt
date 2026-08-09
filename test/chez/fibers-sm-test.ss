@@ -306,6 +306,41 @@
 (ok "11. counted every step" (= (jolt-fiber-result (car fw11)) n11))
 (ok "11. no parks — the channel was always ready" (= (cheap) c11))
 
+;; --- 12. an sm op on an ordinary fiber refuses, and refuses CLEANLY -----------
+;; The cheap park is only correct under jolt-sm-drive: it clears k and stashes the
+;; step, and a fiber whose thunk is anything else would re-run that thunk from the
+;; top on the next dispatch — a silent re-take. __sm-take is a def'd var, so a
+;; program CAN call it on an ordinary fiber; it must throw.
+;;
+;; And it must throw with the channel untouched. Checked at the park instead, the
+;; op had already appended a waiter to alt-takers and committed the fiber to
+;; 'parked under that waiter's wmu, so the throw stranded a registered handler and
+;; the next value delivered to it went nowhere. Both halves are asserted: the
+;; ordinary fiber dies, AND a later take on the same channel still gets the value.
+(printf "\n== 12. an sm op on an ordinary fiber refuses cleanly ==\n")
+(define ch12 (jolt-async-chan))
+(define c12 (cheap))
+(define p12 (caught))
+;; an ORDINARY fiber (thunk is not a driver, so sm stays #f), calling __sm-take
+(define f12 (sa-fiber-spawn (lambda () (jolt-sm-take ch12 (lambda (v) v)))))
+(sa-fiber-run-all)
+(ok "12. the fiber died rather than parking" (eq? (jolt-fiber-state f12) 'dead))
+(ok "12. no cheap park was counted" (= (cheap) c12))
+(ok "12. no capture was counted" (= (caught) p12))
+(ok "12. no waiter was left on the channel" (null? (async-chan-alt-takers ch12)))
+;; the channel is still usable: a real CPS'd body parks on it and gets the value
+(define fw12 (sm-spawn (lambda (k) (jolt-sm-take ch12 (lambda (v) (k (+ v 1)))))))
+(sa-fiber-run-all)
+(ok "12. a real body parks on the same channel"
+    (feed-parked! (car fw12) ch12 41 "12. park"))
+(ok "12. and the value still arrives" (= (jolt-fiber-result (car fw12)) 42))
+;; the put side takes the same check
+(define ch12b (jolt-async-chan))
+(define f12b (sa-fiber-spawn (lambda () (jolt-sm-put ch12b 1 (lambda (v) v)))))
+(sa-fiber-run-all)
+(ok "12. the put side refuses too" (eq? (jolt-fiber-state f12b) 'dead))
+(ok "12. and leaves no putter behind" (null? (async-chan-alt-putters ch12b)))
+
 (printf "\nfibers-sm-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "fibers-sm-test: PASS — the cheap park, chosen per park site\n") (exit 0))
