@@ -266,19 +266,28 @@
                              (fn [c2 ks] (sm-cps c2 init ks)))))))]
       (step ctx (seq bindings)))))
 
+;; A test that PARKS becomes a continuation parameter; one that does not goes
+;; straight into the if. Routing it through a continuation either way was correct
+;; and cost a closure per if — and since when / cond / case / and / or / if-let
+;; all lower to if, an if-heavy body paid it at every one. Nothing is duplicated
+;; by inlining it: both arms name k, they do not carry it, so each is emitted
+;; once whichever shape the test takes.
 (defn- sm-cps-if
   [ctx form k]
   (let [t (second form)
         arms (drop 2 form)
-        ts (gensym "t__")]
-    (sm-kont ctx ts
-             (fn [c]
-               (list 'if ts
-                     (sm-cps c (first arms) k)
-                     (if (> (count arms) 1)
-                       (sm-cps c (second arms) k)
-                       (list k nil))))
-             (fn [c ks] (sm-cps c t ks)))))
+        arm (fn [c ts]
+              (list 'if ts
+                    (sm-cps c (first arms) k)
+                    (if (> (count arms) 1)
+                      (sm-cps c (second arms) k)
+                      (list k nil))))]
+    (if (sm-inline-ok? ctx t)
+      (arm ctx t)
+      (let [ts (gensym "t__")]
+        (sm-kont ctx ts
+                 (fn [c] (arm c ts))
+                 (fn [c ks] (sm-cps c t ks)))))))
 
 (defn- sm-cps
   "Rewrite form so that its value is passed to the continuation named by k."
