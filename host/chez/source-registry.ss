@@ -84,6 +84,19 @@
                 "record-method-dispatch" "protocol-resolve" "devirt-resolve"
                 "list->cseq" "host-static-call" "host-call"))
     h))
+;; The `jolt-` prefix rule is also what BOUNDS A FIBER BACKTRACE, which is not
+;; obvious from here. A throw inside a go body has the whole scheduler below it
+;; on the continuation — jolt-fiber-run, jolt-fiber-drain!, jolt-fiber-resume*,
+;; jolt-fiber-carrier-loop — and every one of those is filtered by that prefix,
+;; so the rendered trace ends at the user's own frames with nothing after them.
+;; Swish needs an explicit boundary marker for this (erlang.ss limit-stack,
+;; a recognisable frame walk-stack stops at); jolt gets it from the naming
+;; convention instead, and more generally, since the rule covers any host frame
+;; rather than one planted spot.
+;;
+;; So this is load-bearing beyond tidiness: narrowing the prefix rule, or letting
+;; a scheduler procedure be named without the prefix, puts carrier internals back
+;; into every go-block trace.
 (define (srcreg-plumbing-name? nm)
   (or (hashtable-ref srcreg-plumbing-names nm #f)
       (and (fx>? (string-length nm) 0) (char=? (string-ref nm 0) #\$))
