@@ -281,8 +281,14 @@
   (if (sm-inline-ok? ctx form)
     (list k form)
     (if-not (seq? form)
-      ;; a collection literal holding a park: left whole, parks the old way
-      (list k form)
+      ;; A collection literal holding a park: left whole, parks the old way. Same
+      ;; recur guard as the opaque arm below, and for the same reason — emitted
+      ;; whole, a recur this pass owns lands inside a continuation fn* and targets
+      ;; THAT fn instead of the loop. Only reachable from source the JVM rejects (a
+      ;; recur outside tail position), which is exactly why it is a check and not a
+      ;; comment: the pass may cost a park its cheap representation, never its
+      ;; meaning, and that should hold by construction.
+      (if (and (:rec ctx) (sm-targets-recur? ctx form)) (sm-bail) (list k form))
       ;; h is the head as WRITTEN (what a park test and a rebuilt application need)
       ;; and sf is the same head as the analyzer reads it — the two differ only for
       ;; a clojure.core-qualified special form, and every dispatch below turns on

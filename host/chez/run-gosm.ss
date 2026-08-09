@@ -69,6 +69,16 @@
 (define x-loop (go-expansion "(go-loop [] (let [v (<! ch)] (when v (recur))))"))
 (gate-check "go-loop park -> __sm-take" (gate-sub? x-loop "__sm-take") #t)
 
+;; A recur the pass OWNS, sitting inside a collection literal. The literal is left
+;; whole, so the recur would land inside a continuation fn* and target that fn
+;; instead of the loop — the same trap the opaque arm bails on, reached through the
+;; arm above it. jolt accepts the form (the JVM does not: recur outside tail
+;; position), and unfixed the rewritten body looped forever where the ordinary
+;; expansion returns. Declining costs nothing here and keeps "the pass may cost a
+;; park its cheap representation, never its meaning" true by construction.
+(define x-vrecur (go-expansion "(go (loop [i 0] (if (< i 2) [(recur (inc i))] (<! ch))))"))
+(gate-check "recur inside a collection literal -> declined" (gate-sub? x-vrecur "__sm-") #f)
+
 ;; A special-form head may arrive clojure.core-QUALIFIED and still be that special
 ;; form to the analyzer (analyze-list*'s sf-name arm; verified here by evaluating
 ;; one). The pass must read it the same way, or it rebuilds the form as an
