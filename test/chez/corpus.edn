@@ -6,6 +6,20 @@
   {:suite "host-interop / PersistentList-create" :label "an empty created list is list?" :expected "true" :actual "(list? (clojure.lang.PersistentList/create []))" :portability :jvm}
   {:suite "host-interop / PersistentList-create" :label "created list agrees with a literal on list?/seq?/class" :expected "[true true true]" :actual "(let [c (clojure.lang.PersistentList/create [1 2 3])] [(= (list? c) (list? (quote (1 2 3)))) (seq? c) (= c (quote (1 2 3)))])" :portability :jvm}
   {:suite "host-interop / reify ILookup" :label "(get reify k) / (:k reify) / (get reify k d) route to valAt" :expected "[1 1 :dflt]" :actual "(let [r (reify clojure.lang.ILookup (valAt [_ k] (get {:a 1} k)) (valAt [_ k d] (get {:a 1} k d)))] [(:a r) (get r :a) (get r :z :dflt)])" :portability :jvm}
+  ;; (.-x obj) is Reflector.getInstanceField: a DECLARED deftype/defrecord slot and
+  ;; nothing else. Not a key assoc'd onto a record, not a map key, not a method of
+  ;; the same name. It used to answer nil for all of those, which reads as a field
+  ;; that is present and nil and sends the caller down the wrong branch.
+  {:suite "host-interop / .-field reads a declared field" :label "a record's own slot, nil value and all" :expected "[1 nil 7]" :actual "(do (ns fld.ns) (clojure.core/defrecord Fa [a b]) (clojure.core/deftype Tk [x]) [(.-a (fld.ns/->Fa 1 2)) (.-a (fld.ns/->Fa nil 2)) (.-x (fld.ns/->Tk 7))])" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "a slot the record does not declare" :expected "\"No matching field found: zz for class fldb.ns.Fb\"" :actual "(do (ns fldb.ns) (clojure.core/defrecord Fb [a]) (clojure.core/try (.-zz (fldb.ns/->Fb 1)) (clojure.core/catch IllegalArgumentException e (.getMessage e))))" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "a key assoc'd onto a record is not a field" :expected "\"No matching field found: zz for class fldc.ns.Fc\"" :actual "(do (ns fldc.ns) (clojure.core/defrecord Fc [a]) (clojure.core/try (.-zz (clojure.core/assoc (fldc.ns/->Fc 1) :zz 9)) (clojure.core/catch IllegalArgumentException e (.getMessage e))))" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "a method of the same name is not a field" :expected "\"No matching field found: count for class clojure.lang.PersistentVector\"" :actual "(try (.-count [1 2]) (catch IllegalArgumentException e (.getMessage e)))" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "a string and a set have no fields at all" :expected "[\"No matching field found: a for class java.lang.String\" \"No matching field found: a for class clojure.lang.PersistentHashSet\"]" :actual "(mapv (fn [x] (try (.-a x) (catch IllegalArgumentException e (.getMessage e)))) [\"s\" #{1}])" :portability :jvm}
+  ;; A no-arg (.x obj) tries the method and then the FIELD, so its miss is worded as
+  ;; a field; a miss WITH arguments can only have been a method.
+  {:suite "host-interop / .-field reads a declared field" :label "a missed 0-arg member read reports as a field, a 1-arg one as a method" :expected "[\"No matching field found: nosuch for class java.lang.String\" \"No matching method nosuch found taking 1 args for class java.lang.String\"]" :actual "[(try (.nosuch \"s\") (catch IllegalArgumentException e (.getMessage e))) (try (.nosuch \"s\" 1) (catch IllegalArgumentException e (.getMessage e)))]" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "and a java.util.Map reports its class, not an internal tag" :expected "[\"No matching field found: nosuch for class java.util.HashMap\" \"No matching method nosuch found taking 1 args for class java.util.HashMap\"]" :actual "(let [h (java.util.HashMap.)] [(try (.nosuch h) (catch IllegalArgumentException e (.getMessage e))) (try (.nosuch h 1) (catch IllegalArgumentException e (.getMessage e)))])" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "method reads are untouched" :expected "[2 1 \"AB\"]" :actual "[(.count [1 2]) (.valAt {:a 1} :a) (.toUpperCase \"ab\")]" :portability :jvm}
   ;; A pattern the engine will not compile is a PatternSyntaxException, catchable
   ;; as itself or as IllegalArgumentException. It used to escape as an unnamed
   ;; condition, and — worse — the compile ran inside the regex cache's mutex, so
@@ -755,7 +769,11 @@
   {:suite "hierarchy / global + multimethod dispatch" :label "dispatch exact beats isa" :expected ":exact" :actual "(do (derive :de/e1 :de/e2) (defmulti emm identity) (defmethod emm :de/e2 [_] :parent) (defmethod emm :de/e1 [_] :exact) (emm :de/e1))" :portability :common}
   {:suite "interop / dot forms" :label "method call" :expected "\"v=41\"" :actual "(. {:value 41 :describe (fn [self] (str \"v=\" (:value self)))} describe)" :portability :jvm}
   {:suite "interop / dot forms" :label "method with args" :expected "\"Hello Alice\"" :actual "(. {:greet (fn [self n] (str \"Hello \" n))} greet \"Alice\")" :portability :jvm}
+  ;; jolt's map-as-object read (dot-forms.ss): a key the map HAS reads as a field.
+  ;; The JVM throws here — see known-divergences.edn. A key it does NOT have throws
+  ;; on both, which is the row below.
   {:suite "interop / dot forms" :label "field access .-" :expected "41" :actual "(.-value {:value 41})" :portability :jvm}
+  {:suite "interop / dot forms" :label "field access .- of an absent key is an error, not nil" :expected "\"No matching field found: nope for class clojure.lang.PersistentArrayMap\"" :actual "(try (.-nope {:value 41}) (catch IllegalArgumentException e (.getMessage e)))" :portability :jvm}
   {:suite "interop / dot forms" :label "dot field keyword" :expected "41" :actual "(. {:value 41} :value)" :portability :jvm}
   {:suite "interop / dot dispatch arms" :label "zero-arg coll-interop .count" :expected "3" :actual "(.count [1 2 3])" :portability :jvm}
   {:suite "interop / dot dispatch arms" :label "zero-arg coll-interop .seq" :expected "[1 2]" :actual "(.seq [1 2])" :portability :jvm}
@@ -1341,6 +1359,29 @@
   {:suite "map / access" :label "contains? key" :expected "true" :actual "(contains? {:a 1} :a)" :portability :common}
   {:suite "map / access" :label "contains? missing" :expected "false" :actual "(contains? {:a 1} :z)" :portability :common}
   {:suite "map / access" :label "find returns entry" :expected "[:a 1]" :actual "(find {:a 1} :a)" :portability :common}
+  ;; Same rule as the set lookups below: a map answers with the key it is HOLDING,
+  ;; not the equal one the caller probed with, and assoc replacing a value must not
+  ;; swap that key out. Only the stored key carries the metadata.
+  {:suite "map / the stored key, not the probe key" :label "find's entry carries the map's own key" :expected "{:a 1}" :actual "(meta (key (find (assoc {} ^{:a 1} [1 2] :v) [1 2])))" :portability :common}
+  {:suite "map / the stored key, not the probe key" :label "and does past the array-map threshold, in the trie" :expected "{:a 1}" :actual "(meta (key (find (into (assoc {} ^{:a 1} [1 2] :v) (map (fn [i] [[i i i] i]) (range 40))) [1 2])))" :portability :common}
+  {:suite "map / the stored key, not the probe key" :label "a sorted map answers from its node" :expected "{:a 1}" :actual "(meta (key (find (sorted-map ^{:a 1} [1 2] :v) [1 2])))" :portability :common}
+  {:suite "map / the stored key, not the probe key" :label "assoc of a new value keeps the stored key" :expected "{:a 1}" :actual "(meta (first (keys (assoc {^{:a 1} [1 2] :v1} ^{:a 2} [1 2] :v2))))" :portability :common}
+  {:suite "map / the stored key, not the probe key" :label "so does assoc in the trie" :expected "{:a 1}" :actual "(meta (first (filter (fn [k] (= k [1 2])) (keys (assoc (into (assoc {} ^{:a 1} [1 2] :v1) (map (fn [i] [[i i i] i]) (range 40))) ^{:a 2} [1 2] :v2)))))" :portability :common}
+  ;; [324 794] and [681 114] have the same full hash, so they share one collision
+  ;; bucket — a different replace path than the trie leaf above.
+  {:suite "map / the stored key, not the probe key" :label "and a hash-collision bucket" :expected "[{:a 1} :v3 :v2]" :actual "(let [m (assoc (assoc {} ^{:a 1} [324 794] :v1) [681 114] :v2) m2 (assoc m ^{:a 2} [324 794] :v3)] [(meta (first (filter (fn [k] (= k [324 794])) (keys m2)))) (get m2 [324 794]) (get m2 [681 114])])" :portability :common}
+  {:suite "map / the stored key, not the probe key" :label "which find reads through as well" :expected "{:a 1}" :actual "(meta (key (find (assoc (assoc (assoc {} ^{:a 1} [324 794] :v1) [681 114] :v2) ^{:a 2} [324 794] :v3) [324 794])))" :portability :common}
+  {:suite "map / the stored key, not the probe key" :label "select-keys carries the source map's keys over" :expected "{:a 1}" :actual "(meta (first (keys (select-keys (assoc {} ^{:a 1} [1 2] :v) [[1 2]]))))" :portability :common}
+  ;; RT.find takes nil, Associative and java.util.Map (plus the key-addressable
+  ;; transients). A set, a string or a list is an IllegalArgumentException, not a
+  ;; silently-minted entry.
+  {:suite "map / find's accepted types" :label "a set is not associative" :expected "\"find not supported on type: clojure.lang.PersistentHashSet\"" :actual "(try (find #{1} 1) (catch IllegalArgumentException e (.getMessage e)))" :portability :common}
+  {:suite "map / find's accepted types" :label "and neither is a sorted set" :expected "\"find not supported on type: clojure.lang.PersistentTreeSet\"" :actual "(try (find (sorted-set 1) 1) (catch IllegalArgumentException e (.getMessage e)))" :portability :common}
+  {:suite "map / find's accepted types" :label "nor a string, keyword or list" :expected "[\"java.lang.String\" \"clojure.lang.Keyword\" \"clojure.lang.PersistentList\"]" :actual "(mapv (fn [x] (try (find x 0) (catch IllegalArgumentException e (clojure.string/replace (.getMessage e) \"find not supported on type: \" \"\")))) [\"ab\" :kw (list 1 2)])" :portability :common}
+  {:suite "map / find's accepted types" :label "nil finds nothing rather than throwing" :expected "nil" :actual "(find nil :a)" :portability :common}
+  {:suite "map / find's accepted types" :label "a record and a vector are associative" :expected "[[:a 1] [1 :y]]" :actual "(do (ns fnd.ns) (clojure.core/defrecord Fr [a]) [(clojure.core/find (fnd.ns/->Fr 1) :a) (clojure.core/find [:x :y] 1)])" :portability :common}
+  {:suite "map / find's accepted types" :label "a transient map and vector are, a transient set is not" :expected "[[:a 1] [1 :y] \"clojure.lang.PersistentHashSet$TransientHashSet\"]" :actual "[(find (transient {:a 1}) :a) (find (transient [:x :y]) 1) (try (find (transient #{1}) 1) (catch IllegalArgumentException e (clojure.string/replace (.getMessage e) \"find not supported on type: \" \"\")))]" :portability :common}
+  {:suite "map / find's accepted types" :label "select-keys inherits find's type check" :expected "\"find not supported on type: clojure.lang.PersistentHashSet\"" :actual "(try (select-keys #{1} [1]) (catch IllegalArgumentException e (.getMessage e)))" :portability :common}
   {:suite "map / access" :label "keys" :expected "true" :actual "(= #{:a :b} (set (keys {:a 1 :b 2})))" :portability :common}
   {:suite "map / access" :label "vals" :expected "true" :actual "(= #{1 2} (set (vals {:a 1 :b 2})))" :portability :common}
   {:suite "map / update" :label "assoc adds" :expected "{:a 1, :b 2}" :actual "(assoc {:a 1} :b 2)" :portability :common}
@@ -2706,6 +2747,30 @@
   {:suite "set / operations" :label "get missing nil" :expected "nil" :actual "(get #{1 2} 9)" :portability :common}
   {:suite "set / operations" :label "set as fn present" :expected "2" :actual "(#{1 2 3} 2)" :portability :common}
   {:suite "set / operations" :label "set as fn missing" :expected "nil" :actual "(#{1 2 3} 9)" :portability :common}
+  ;; A set lookup answers with the element the set is HOLDING, not with the probe
+  ;; key that was equal to it. Only the stored one carries the element's metadata,
+  ;; and farolero's return-from reads exactly that: *bound-blocks* is a set of
+  ;; ^{:on-stack? volatile} [thread block-name] pairs, looked up by an equal but
+  ;; bare pair, then (meta block) is deref'd.
+  {:suite "set / lookup returns the stored element" :label "a set as a fn hands back the stored element, with its metadata" :expected "{:a 1}" :actual "(meta (#{^{:a 1} [1 2]} [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "get hands back the stored element, not the probe key" :expected "{:a 1}" :actual "(meta (get #{^{:a 1} [1 2]} [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "the not-found arity does too" :expected "{:a 1}" :actual "(meta (get #{^{:a 1} [1 2]} [1 2] :d))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "the element is identical? to the one that went in" :expected "true" :actual "(let [e ^{:a 1} [1 2]] (identical? e (get #{e} [1 2])))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "conj of an equal element keeps the one already stored" :expected "{:a 1}" :actual "(meta (get (conj #{^{:a 1} [1 2]} ^{:a 2} [1 2]) [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "into and set build through that same conj" :expected "[{:a 1} {:a 1}]" :actual "(let [e ^{:a 1} [1 2]] [(meta (get (into #{} [e]) [1 2])) (meta (get (set [e]) [1 2]))])" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "a set deep enough to be a trie, not a single node" :expected "{:a 1}" :actual "(meta (get (into #{} (concat (map vector (range 40)) [^{:a 1} [1 2]])) [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "disj of an unrelated element leaves it stored" :expected "{:a 1}" :actual "(meta (get (disj (conj #{^{:a 1} [1 2]} [9 9]) [9 9]) [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "a transient set's get" :expected "{:a 1}" :actual "(meta (get (conj! (transient #{}) ^{:a 1} [1 2]) [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "a transient set is callable, and answers the same" :expected "{:a 1}" :actual "(meta ((conj! (transient #{}) ^{:a 1} [1 2]) [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "a transient made from a populated set keeps its elements" :expected "{:a 1}" :actual "(meta (get (transient #{^{:a 1} [1 2]}) [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "conj! of an equal element REPLACES it, unlike the persistent conj" :expected "{:a 2}" :actual "(meta (get (-> (transient #{}) (conj! ^{:a 1} [1 2]) (conj! ^{:a 2} [1 2])) [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "persistent! carries the stored element out" :expected "{:a 1}" :actual "(meta (get (persistent! (conj! (transient #{}) ^{:a 1} [1 2])) [1 2]))" :portability :common}
+  ;; conj! keeps the element already filed as the KEY and stores the new one as the
+  ;; lookup value, and persistent! carries that split through: seq answers with the
+  ;; first, get with the second. A set rebuilt element-by-element would collapse it.
+  {:suite "set / lookup returns the stored element" :label "persistent! keeps conj!'s split — seq gives the first, get the second" :expected "[{:a 1} {:a 2}]" :actual "(let [s (persistent! (-> (transient #{}) (conj! ^{:a 1} [1 2]) (conj! ^{:a 2} [1 2])))] [(meta (first (seq s))) (meta (get s [1 2]))])" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "a stored nil is found, and is not the not-found value" :expected "[nil :absent]" :actual "[(get #{nil} nil :absent) (get #{1} nil :absent)]" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "a sorted set answers with its stored element too" :expected "{:a 1}" :actual "(meta ((sorted-set ^{:a 1} [1 2]) [1 2]))" :portability :common}
   {:suite "set / literals & value elements" :label "literal evaluates elements" :expected "#{4 2}" :actual "#{(inc 1) (* 2 2)}" :portability :common}
   {:suite "set / literals & value elements" :label "map elements by value" :expected "true" :actual "(= #{{:a 1}} #{(hash-map :a 1)})" :portability :common}
   {:suite "set / literals & value elements" :label "contains? map by value" :expected "true" :actual "(contains? #{(hash-map :x 1)} {:x 1})" :portability :common}

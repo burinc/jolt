@@ -429,6 +429,18 @@
 (is "namespaced keywords re-intern"          (string-append "(identical? :a/b (first (keys " (rt-expr "{:a/b 1}") ")))") "true")
 (is "nested keyword lookup"                  (string-append "(get-in " (rt-expr "{:a {:b {:c 7}}}") " [:a :b :c])") "7")
 (is "keyword set membership"                 (string-append "(contains? " (rt-expr "#{:x :y}") " :x)") "true")
+;; A lookup answers with the element the collection HOLDS, and its metadata rides
+;; along, so the image has to carry the stored element and not just something equal
+;; to it. The set's lookup value is separately addressable from its key — conj! of
+;; an equal element splits the two — so the pset arms rebuild pair-wise; a walk that
+;; folded elements alone would restore a set whose get and seq had been merged.
+(is "a set's element keeps its metadata across a round trip"
+    (string-append "(meta (get " (rt-expr "#{^{:a 1} [1 2]}") " [1 2]))") "{:a 1}")
+(is "a map's stored key keeps its metadata across a round trip"
+    (string-append "(meta (key (find " (rt-expr "(assoc {} ^{:a 1} [1 2] :v)") " [1 2])))") "{:a 1}")
+(is "a set's conj! split survives a round trip"
+    (string-append "(let [s " (rt-expr "(persistent! (-> (transient #{}) (conj! ^{:a 1} [1 2]) (conj! ^{:a 2} [1 2])))")
+                   "] [(meta (first (seq s))) (meta (get s [1 2]))])") "[{:a 1} {:a 2}]")
 (is "record field access after restore"
     (string-append "(do (defrecord Q [a b]) (:a " (rt-expr "(->Q 5 6)") "))") "5")
 (is "record = after restore"

@@ -6,24 +6,52 @@
 ;; --- canonical Clojure ports -------------------------------------------------
 ;; find first — merge-with and memoize below use it.
 
-;; find was previously missing from jolt entirely. Presence (contains?), not
-;; value, decides — so (find {:a nil} :a) is [:a nil]. Works on vectors by
-;; index. The result must be a REAL entry (key/val are strict), so it is
-;; minted as the first entry of a one-entry map — nil values survive (the
-;; map builder switches to a phm when nil is involved).
+;; Presence (contains?), not value, decides — so (find {:a nil} :a) is [:a nil].
+;; Works on vectors by index. The result is a REAL entry (key/val are strict).
+;;
+;; The entry's key is the key the COLLECTION holds, not the equal one the caller
+;; probed with: (meta (key (find m k))) reads the stored key's metadata on the
+;; JVM. A native map answers from its own storage, and a sorted map through its
+;; :entry-at op; a vector (keyed by index), a record and a deftype have no
+;; separate stored key, so those mint the entry from k.
+;;
+;; RT.find takes nil, Associative and java.util.Map (plus the key-addressable
+;; transients) and throws on anything else — a set, a string, a list.
+;;
+;; Everything but the native map lives here, apart from find, because find's
+;; 2-arity call sites lower to the native jolt-find2 (op-registry): that answers
+;; for a native map directly and calls this one by name for the rest, so the type
+;; taxonomy stays in Clojure and the hot path pays no var deref. NOT private —
+;; jolt-find2 resolves it by name.
+(defn find-other [m k]
+  (cond
+    (nil? m) nil
+    ;; associative? is false for a sorted SET, so one falls through to the throw
+    (associative? m)
+    (if (sorted? m)
+      ((get (jolt.host/ref-get m :ops) :entry-at) m k)
+      (when (contains? m k) (jolt.host/map-entry k (get m k))))
+    ;; a java.util.Map has no Clojure key object to preserve, and neither does a
+    ;; transient (the JVM's TransientHashMap.entryAt mints from the probe key too)
+    (or (instance? java.util.Map m) (jolt.host/transient-associative? m))
+    (when (contains? m k) (jolt.host/map-entry k (get m k)))
+    :else (throw (jolt.host/throwable
+                  "java.lang.IllegalArgumentException"
+                  (str "find not supported on type: " (.getName (class m)))))))
+
 (defn find [m k]
-  (when (contains? m k) (first {k (get m k)})))
+  (let [e (jolt.host/entry-at m k ::not-native)]
+    (if (identical? e ::not-native) (find-other m k) e)))
+
+;; Back to the plain JVM shape now that find is a native call: conj the ENTRY, so
+;; the result carries the source map's own key objects.
+(defn select-keys [map keyseq]
+  (reduce (fn [m k] (let [e (find map k)] (if (nil? e) m (conj m e))))
+          (with-meta {} (meta map)) keyseq))
 
 ;; some? lives in the top leaf block now (forward refs are errors).
 (defn true? [x] (= true x))
 (defn false? [x] (= false x))
-
-;; Presence-preserving and order-preserving: a key with a nil value is kept, and
-;; the result follows keyseq order (an empty-map base keeps nil values and
-;; canonicalizes collection keys).
-(defn select-keys [map keyseq]
-  (reduce (fn [m k] (if (contains? map k) (assoc m k (get map k)) m))
-          (with-meta {} (meta map)) keyseq))
 
 (defn some-vals
   "Returns a map with only the non-nil values of map m. Returns nil if m has no

@@ -101,7 +101,11 @@
     "clojure.core/global-hierarchy" "clojure.core/parents"
     ;; the readable printer consults print-method for a value with a user method
     ;; (io-streams.ss user-print-method), so it must survive tree-shaking
-    "clojure.core/print-method"))
+    "clojure.core/print-method"
+    ;; find's call sites lower to jolt-find2 (host-table.ss), which answers for a
+    ;; native map itself and resolves find-other by name for every other type — so
+    ;; an app that only ever calls find has no IR edge to it
+    "clojure.core/find-other"))
 
 ;; --- reading a minted blob (prelude.ss) into records ------------------------
 ;; The prelude is a flat list of (guard CLAUSE (def-var! "ns" "name" V)) forms (+ the

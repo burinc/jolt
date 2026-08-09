@@ -2000,24 +2000,40 @@
       ((string=? method-name "__methodImplCache") jolt-nil)
       ((jrec? obj)
        (let ((boxed (dot-coll-method obj method-name rest)))
-         (if boxed (car boxed) (no-method-throw method-name obj))))
-      (else (no-method-throw method-name obj)))))
+         (if boxed
+             (car boxed)
+             (no-method-throw method-name obj (length rest)))))
+      (else (no-method-throw method-name obj (length rest))))))
 
-(define (no-method-throw method-name obj)
-  (if (jolt-nil? obj)
-      (throw-jvm
-        'NullPointerException
-        (string-append
-          "Cannot invoke \""
-          method-name
-          "\" because the target is null"))
-      (throw-jvm
-        'IllegalArgumentException
-        (string-append
-          "No matching method "
-          method-name
-          " found for "
-          (guard (e (#t "?")) (jolt-class-name obj))))))
+(define (no-method-throw method-name obj . maybe-argc)
+  (let* ((argc (if (null? maybe-argc) 0 (car maybe-argc)))
+         (dashed? (and (> (string-length method-name) 1)
+                       (char=? (string-ref method-name 0) #\-)))
+         (bare (if dashed?
+                   (substring method-name 1 (string-length method-name))
+                   method-name)))
+    (cond
+      ((jolt-nil? obj)
+       (throw-jvm
+         'NullPointerException
+         (string-append
+           "Cannot invoke \""
+           method-name
+           "\" because the target is null")))
+      ((or dashed? (fx=? argc 0))
+       (throw-jvm
+         'IllegalArgumentException
+         (string-append
+           "No matching field found: "
+           bare
+           " for class "
+           (guard (e (#t "?")) (jolt-class-name obj)))))
+      (else
+       (throw-jvm
+         'IllegalArgumentException
+         (string-append "No matching method " method-name " found taking "
+           (number->string argc) " args for class "
+           (guard (e (#t "?")) (jolt-class-name obj))))))))
 
 (define method-dispatch-arms '())
 

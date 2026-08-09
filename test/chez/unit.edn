@@ -63,6 +63,15 @@
   {:suite "dotform" :expr "(.-value {:value 41})" :expected "41"}
   {:suite "dotform" :expr "(.-x {:x 7 :y 9})" :expected "7"}
   {:suite "dotform" :expr "(. {:value 41} -value)" :expected "41"}
+  ;; the map-as-object read above answers for a key the map HAS. A key it does not
+  ;; have, an undeclared record slot, or a value with no field concept at all is an
+  ;; error — it used to be a silent nil, which reads as a present-and-nil field.
+  {:suite "dotform" :expr "(try (.-nope {:value 41}) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching field found: nope for class clojure.lang.PersistentArrayMap\""}
+  {:suite "dotform" :expr "(do (defrecord Rz [x]) (try (.-zz (->Rz 7)) (catch IllegalArgumentException e (.getMessage e))))" :expected "\"No matching field found: zz for class user.Rz\""}
+  {:suite "dotform" :expr "(do (defrecord Ry [x]) (try (.-zz (assoc (->Ry 7) :zz 9)) (catch IllegalArgumentException e (.getMessage e))))" :expected "\"No matching field found: zz for class user.Ry\""}
+  {:suite "dotform" :expr "(mapv (fn [v] (try (.-a v) (catch IllegalArgumentException e (.getMessage e)))) [\"s\" [1] #{1}])" :expected "[\"No matching field found: a for class java.lang.String\" \"No matching field found: a for class clojure.lang.PersistentVector\" \"No matching field found: a for class clojure.lang.PersistentHashSet\"]"}
+  ;; a dashed name never reaches the method surface: .count works, .-count does not
+  {:suite "dotform" :expr "(try (.-count [1 2]) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching field found: count for class clojure.lang.PersistentVector\""}
   {:suite "dotform" :expr "(do (defrecord Rf [x]) (.-x (->Rf 7)))" :expected "7"}
   {:suite "dotform" :expr "(do (defrecord Rg [a b]) (.-b (->Rg 1 2)))" :expected "2"}
   {:suite "dotform" :expr "(do (defprotocol Greet (hi [_])) (defrecord Rh [nm] Greet (hi [_] (str \"hi \" nm))) (. (->Rh \"x\") hi))" :expected "\"hi x\""}

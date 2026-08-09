@@ -100,6 +100,23 @@
   ;; (exact)"), pinned jolt-side: it buckets as :jvm-error in certify (the :actual throws
   ;; on the JVM), which is informational — not gated — so it lives in :documented, not
   ;; in :entries (which certify would flag as stale).
+  ;; jolt's dot form reads a plain map as an object: (. m member) calls a stored fn
+  ;; with the map as self and otherwise reads the key, and (.-member m) reads the
+  ;; key (dot-forms.ss's precedence note). The JVM has no fields on a
+  ;; PersistentArrayMap, so every one of those throws there. Deliberate, and a
+  ;; superset — portable JVM code never reaches for a field on a map.
+  ;;
+  ;; Only a key the map HAS answers. An absent key, an undeclared record slot, or a
+  ;; value with no field concept (a string, a vector, a set) raises
+  ;; IllegalArgumentException like the JVM does, rather than the nil it used to
+  ;; return — a nil reads as a field that is present and set to nil, so a caller
+  ;; testing it silently took the wrong branch. Pinned by "interop / dot forms" and
+  ;; the dotform rows in unit.edn.
+  {:category :permissive
+   :behavior "(.-value {:value 41}) and (. {:value 41} value)"
+   :jvm "throws IllegalArgumentException — a map has no fields"
+   :jolt "41 — the map-as-object read"
+   :note "A key the map does not have throws on both. jolt's own values (deftype/defrecord slots) follow the JVM exactly: an undeclared slot is an error, not nil."}
   ;; jolt's strings are indexed by Unicode CODE POINT where the JVM's are indexed
   ;; by UTF-16 code unit, and (char n) follows the string model rather than the
   ;; JVM's 16-bit char: it has to accept the whole scalar-value range or it could

@@ -1767,20 +1767,39 @@
       ;; caller gets a one-element list instead of the value.
       ((jrec? obj)
        (let ((boxed (dot-coll-method obj method-name rest)))
-         (if boxed (car boxed) (no-method-throw method-name obj))))
-      (else (no-method-throw method-name obj)))))
+         (if boxed (car boxed) (no-method-throw method-name obj (length rest)))))
+      (else (no-method-throw method-name obj (length rest))))))
 
 ;; The end of the dispatch chain. A method call on nil is the JVM's
 ;; NullPointerException; anything else is its IllegalArgumentException ("No
 ;; matching method"). Raising a raw host error here left the value classless, so
 ;; a catch clause could not select it and (class e) read :object.
-(define (no-method-throw method-name obj)
-  (if (jolt-nil? obj)
-      (throw-jvm (quote NullPointerException)
-                 (string-append "Cannot invoke \"" method-name "\" because the target is null"))
-      (throw-jvm (quote IllegalArgumentException)
-                 (string-append "No matching method " method-name " found for "
-                                (guard (e (#t "?")) (jolt-class-name obj))))))
+;;
+;; Which of the two it is follows the JVM's reflector. A no-arg member read tries
+;; the method and then the FIELD, so (.-x obj) and a missed 0-arg (.x obj) both
+;; end as "No matching field found" — getting here with a dash at all means no arm
+;; claimed it, since dot-forms.ss answers a field read only for a declared
+;; deftype/defrecord slot. A miss with arguments can only have been a method.
+;; Reading the dash back off here keeps the spellings apart without every arm
+;; having to thread the distinction through.
+(define (no-method-throw method-name obj . maybe-argc)
+  (let* ((argc (if (null? maybe-argc) 0 (car maybe-argc)))
+         (dashed? (and (> (string-length method-name) 1)
+                       (char=? (string-ref method-name 0) #\-)))
+         (bare (if dashed? (substring method-name 1 (string-length method-name)) method-name)))
+    (cond
+      ((jolt-nil? obj)
+       (throw-jvm (quote NullPointerException)
+                  (string-append "Cannot invoke \"" method-name "\" because the target is null")))
+      ((or dashed? (fx=? argc 0))
+       (throw-jvm (quote IllegalArgumentException)
+                  (string-append "No matching field found: " bare " for class "
+                                 (guard (e (#t "?")) (jolt-class-name obj)))))
+      (else
+       (throw-jvm (quote IllegalArgumentException)
+                  (string-append "No matching method " method-name " found taking "
+                                 (number->string argc) " args for class "
+                                 (guard (e (#t "?")) (jolt-class-name obj))))))))
 
 ;; ---- method-dispatch arm registry ------------------------------------------
 ;; A .method call (record-method-dispatch) is resolved by an ordered list of arms

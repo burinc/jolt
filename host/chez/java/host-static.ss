@@ -159,8 +159,10 @@
            ;; form, so #time/date could not read at all.
            ((string=? (jhost-tag obj) "class")
             (apply (host-static-ref (jclass-name obj) method-name) args))
-           (else (throw-jvm (quote IllegalArgumentException)
-                            (string-append "No matching method " method-name " for " (jhost-tag obj)))))))
+           ;; the shared end of the chain, so a host object reports its real class
+           ;; rather than its internal tag, and a (.-x obj) read that no registered
+           ;; member claimed reads as a missing FIELD like it does everywhere else
+           (else (no-method-throw method-name obj (length args))))))
       ((number? obj) (apply number-method method-name obj (if (jolt-nil? rest-args) '() (seq->list rest-args))))
       (else 'pass))))
 
