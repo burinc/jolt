@@ -67,7 +67,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
-        fibersbench \
+        fibersbench dynbench \
         fibersresidue
 
 default:: build
@@ -237,6 +237,13 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-pool-test.ss
 	@$(CHEZ) --script test/chez/fibers-io-test.ss
 	@$(CHEZ) --script test/chez/fibers-sm-test.ss
+
+# The dynamic-var binding stack (jolt-3bo): lookup cost against binding DEPTH and
+# against the number of vars in one frame, push/pop throughput, and the two
+# workloads the trade-off is judged on — N nested fn literals (deep) and a real
+# namespace compile (wide and shallow). Opt-in, NOT part of make ci.
+dynbench:
+	@sh bench/dyn-binding/run.sh
 
 # Fibers R6 (jolt-nvpr.7): the :thread vs :fiber benchmark harness. Opt-in and
 # NOT part of the gate — benchmarks do not belong in CI. Runs each measurement
