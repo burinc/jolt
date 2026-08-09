@@ -274,6 +274,40 @@
 (printf "  per-fiber: ~a bytes live (assert < 8192)\n" per-fiber-bytes)
 (ok "per-fiber live < 8KB" (< per-fiber-bytes 8192))
 
+;; --- what this gate does NOT cover, asserted so it cannot be misread ---------
+;; This file loads fibers.ss ON ITS OWN, with no adapter and no value layer, to
+;; keep that file honestly self-contained. The consequence is easy to forget:
+;; every adapter-backed feature in it is captured by guarded reference and
+;; DEGRADES TO A NO-OP here. So a pass from this gate says nothing whatever
+;; about the winder-drop path — jolt-park-drop-finallys! does not do anything in
+;; this process, and could be arbitrarily broken without a single check moving.
+;;
+;; That is not hypothetical. A stack-truncation attempt (jolt-atc.3) was wrong
+;; enough to kill every fiber under the full boot and this gate passed clean,
+;; because the primitive it needed was absent and the call degraded to nothing.
+;;
+;; So the degradation is asserted rather than assumed. Two things follow: the
+;; no-op path stays deliberately exercised (a target without these primitives
+;; must still run fibers), and if fibers.ss ever gains a HARD dependency on the
+;; adapter these checks fail loudly instead of the gate quietly covering less
+;; than it appears to.
+;;
+;; The real coverage for this path is fibers-state-test.ss section 7, which
+;; loads rt.ss and asserts the behaviour (a finally skipped on a park, a
+;; with-mutex released, a parameterize unwound). Mutation-checked: disabling the
+;; predicate there fails 4 of its checks.
+(ok "degradation: no marker without the value layer" (not jolt-finally-marker))
+(ok "degradation: no winder rtd without the adapter" (not jolt-winder-rtd))
+(ok "degradation: the chain reader answers empty" (null? (jolt-sa-winders)))
+(ok "degradation: dropping finallys is inert here, and does not raise"
+    (begin (jolt-park-drop-finallys!) #t))
+;; A fiber still has to run and park with the whole mechanism absent — that is
+;; the portability claim the fallbacks exist to make.
+(define degr-f (sa-fiber-spawn (lambda () (sa-fiber-yield) 'ok)))
+(sa-fiber-run-all)
+(ok "degradation: a fiber still completes with no winder support"
+    (eq? 'done (jolt-fiber-state degr-f)))
+
 (printf "\nfibers-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "fibers-test: PASS — fiber primitive + scheduler\n") (exit 0))

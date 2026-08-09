@@ -586,10 +586,23 @@
 ;; mechanism jolt already uses for thread interrupt (concurrency.ss
 ;; jolt-run-interruptible).
 ;;
-;; OFF BY DEFAULT. This changes when a fiber can lose its carrier, which is a
-;; behavioural change for every existing program, so it is opt-in: set the tick
-;; count via clojure.core.async/*fiber-preempt-ticks* or the host setter. #f or
-;; 0 means cooperative-only, exactly as before.
+;; ON BY DEFAULT. Cooperative-only scheduling is not a milder setting, it is an
+;; unbounded starvation window: one compute-bound fiber holds its carrier for as
+;; long as it feels like and nothing else on that carrier runs. That is a
+;; liveness bug, so the preemptive path is THE path and there is no reason to
+;; ship two. It costs about 13% on a yield (215 -> 243 ns), all of it arming and
+;; disarming the timer, independent of the quantum.
+;;
+;; The quantum is measured, not guessed: ticks are polled at calls and loop
+;; back-edges, so on this machine ~100k ticks is 45us and the default below is
+;; about 0.45ms — the sub-millisecond range swish uses. A queued fiber therefore
+;; waits at most one quantum, and a compute-bound fiber pays one park per
+;; quantum, which at this length is noise.
+;;
+;; Setting it to #f (or the var to 0) restores cooperative-only. That is an
+;; ESCAPE HATCH, not a supported mode: it exists because preemption touches the
+;; timer, which foreign calls and jolt-run-interruptible also use, and a one-line
+;; workaround beats a rebuild if that interaction ever bites in the field.
 ;;
 ;; What preemption does NOT fix: a fiber inside a blocking foreign call cannot
 ;; be preempted, because the timer is only polled in Scheme. Parkable IO
@@ -606,14 +619,18 @@
 ;; contract *fiber-carrier-count* already documents: set it before the first
 ;; :fiber go, or between a pool reset and the next one. The host setter updates
 ;; both and is always immediate.
-(define jolt-fiber-preempt-ticks-global #f)
+(define jolt-fiber-preempt-ticks-default 1000000)   ; ~0.45ms, measured
+(define jolt-fiber-preempt-ticks-global jolt-fiber-preempt-ticks-default)
 (define (jolt-fiber-preempt-ticks) jolt-fiber-preempt-ticks-global)
 (define (jolt-fiber-preempt-refresh!)
   (let ((v (guard (e (#t #f))
              (let ((cell (var-cell-lookup "clojure.core.async" "*fiber-preempt-ticks*")))
                (if (and cell (var-cell-defined? cell)) (var-cell-root cell) #f)))))
-    (when (and (fixnum? v) (fx>? v 0))
-      (set! jolt-fiber-preempt-ticks-global v))))
+    ;; a positive fixnum pins the quantum, 0 is the escape hatch, and jolt-nil
+    ;; (an unset var) leaves the default alone
+    (cond ((and (fixnum? v) (fx>? v 0)) (set! jolt-fiber-preempt-ticks-global v))
+          ((eqv? v 0) (set! jolt-fiber-preempt-ticks-global #f))
+          (else (void)))))
 (define (jolt-fiber-preempt-ticks-set! n)
   (when (and n (not (and (fixnum? n) (fx>? n 0))))
     (error 'jolt-fiber-preempt-ticks-set!
@@ -669,11 +686,16 @@
 ;; thunk; the cost is that a run-interruptible inside a fiber leaves the timer
 ;; disarmed (it ends with set-timer 0), so that fiber runs cooperatively until
 ;; its next dispatch.
+;; Installing the HANDLER is per drain, not per dispatch: it is a parameter
+;; write, and paying it on every fiber dispatch showed up as a third of the cost
+;; of a yield. Per drain still composes with jolt-run-interruptible, which saves
+;; and restores the handler around its own thunk.
+(define (jolt-fiber-install-preempt-handler!)
+  (when jolt-fiber-preempt-ticks-global
+    (timer-interrupt-handler jolt-fiber-preempt-handler)))
 (define (jolt-fiber-arm-preempt!)
   (let ((ticks jolt-fiber-preempt-ticks-global))
-    (when ticks
-      (timer-interrupt-handler jolt-fiber-preempt-handler)
-      (set-timer ticks))))
+    (when ticks (set-timer ticks))))
 (define (jolt-fiber-disarm-preempt!)
   (when jolt-fiber-preempt-ticks-global (set-timer 0)))
 
@@ -881,6 +903,7 @@
 ;; slice is captured at entry — the caller's dynamic state, which every park
 ;; restores onto the carrier.
 (define (jolt-fiber-drain! c)
+  (jolt-fiber-install-preempt-handler!)
   (jolt-carrier-sched-slice-capture! c)
   (let loop ()
     (let ((f (jolt-fiber-dequeue! c)))

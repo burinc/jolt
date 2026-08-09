@@ -40,18 +40,25 @@
 (printf "== fiber preemption ==\n")
 
 ;; --- 1. off by default ------------------------------------------------------
-(ok "1. preemption is OFF by default" (not (jolt-fiber-preempt-ticks)))
+;; ON by default. Cooperative-only is not a milder default, it is an unbounded
+;; starvation window, so the preemptive path is the only path that ships.
+(ok "1. preemption is ON by default" (and (jolt-fiber-preempt-ticks) #t))
+(ok "1. the default quantum is sub-millisecond"
+    (eqv? (jolt-fiber-preempt-ticks) jolt-fiber-preempt-ticks-default))
 
 (jolt-fiber-preempt-ticks-set! 20000)
-(ok "1. host setter turns it on" (eqv? 20000 (jolt-fiber-preempt-ticks)))
+(ok "1. host setter pins a different quantum" (eqv? 20000 (jolt-fiber-preempt-ticks)))
 (jolt-fiber-preempt-ticks-set! #f)
-(ok "1. host setter turns it back off" (not (jolt-fiber-preempt-ticks)))
+(ok "1. the escape hatch turns it off" (not (jolt-fiber-preempt-ticks)))
 (ok "1. a non-positive tick count is refused"
     (guard (e (#t #t)) (jolt-fiber-preempt-ticks-set! 0) #f))
 
 ;; --- 2. cooperatively, a spinner starves its carrier ------------------------
 ;; ONE carrier, so B has nowhere else to go. A spins on a box the driver flips;
 ;; the flag is how the test stops it without ever letting it park.
+;; section 2 needs cooperative behaviour on purpose, which is no longer the
+;; default, so it asks for it explicitly
+(jolt-fiber-preempt-ticks-set! #f)
 (jolt-fiber-pool-reset!)
 (jolt-fiber-carrier-count-set! 1)
 
@@ -101,6 +108,7 @@
 ;; sm cheap park nor a channel park.
 (jolt-fiber-pool-reset!)
 (jolt-fiber-carrier-count-set! 1)
+(jolt-fiber-preempt-ticks-set! 20000)
 (define sm-before (jolt-sm-parks))
 (define chan-before (jolt-fiber-chan-parks))
 (define p4-before (jolt-fiber-preempts))
