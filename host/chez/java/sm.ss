@@ -159,11 +159,20 @@
 ;; takes the capture), but the line is not needed either way: sa-fiber-spawn
 ;; builds the child's slice with txn #f by construction, and jolt-fiber-run
 ;; restores that slice before the first entry.
+;; The channel->fiber registration has to happen HERE TOO, not only in
+;; jolt-fiber-go-spawn: a go body the CPS pass could transform is spawned by
+;; this function instead, and which of the two runs is a property of the body
+;; (whether every park site was rewritable), not something the caller chose. A
+;; monitor that worked on one and silently answered nil on the other would be
+;; worse than no monitor at all, because the difference is invisible from the
+;; jolt side. jolt-go-chan-fiber-set! lives in fibers-async.ss, which rt.ss
+;; loads before this file.
 (define (jolt-sm-fiber-spawn body-fn)
   (let ((w (ac-make 1 'fixed #f)))
-    (sa-fiber-spawn
-     (lambda ()
-       (jolt-sm-drive w body-fn)))
+    (jolt-go-chan-fiber-set! w
+      (sa-fiber-spawn
+       (lambda ()
+         (jolt-sm-drive w body-fn))))
     (jolt-fiber-ensure-carrier!)
     w))
 

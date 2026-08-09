@@ -238,6 +238,7 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-io-test.ss
 	@$(CHEZ) --script test/chez/fibers-sm-test.ss
 	@$(CHEZ) --script test/chez/fibers-preempt-test.ss
+	@$(CHEZ) --script test/chez/fibers-monitor-test.ss
 
 # The dynamic-var binding stack (jolt-3bo): lookup cost against binding DEPTH and
 # against the number of vars in one frame, push/pop throughput, and the two

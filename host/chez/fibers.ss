@@ -72,8 +72,9 @@
           (mutable next)
           (mutable slice)
           carrier
-          (mutable sm))
-  (nongenerative jolt-fiber-v2))
+          (mutable sm)
+          (mutable monitors))
+  (nongenerative jolt-fiber-v3))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -569,7 +570,7 @@
               (make-jolt-dslice (jolt-slice-stack-param)
                                 (jolt-slice-ns-param)
                                 #f)
-              c #f)))
+              c #f '())))
       (jolt-fiber-enqueue! c f)
       f)))
 
@@ -676,6 +677,65 @@
 (define (jolt-fiber-disarm-preempt!)
   (when jolt-fiber-preempt-ticks-global (set-timer 0)))
 
+;; --- monitors (the observable half of swish's, erlang.ss:434) ----------------
+;; A fiber that dies is otherwise unobservable. fibers-async.ss and sm.ss both
+;; handle a throwing go body the same way — report it and close the result
+;; channel — so a reader gets nil, which is exactly what a body returning nil
+;; gives. The condition lands on jolt-fiber-error and nothing can reach it.
+;;
+;; A monitor is a procedure called exactly once when the fiber finishes, with
+;; the condition if it died and #f if it completed normally. Swish delivers this
+;; as a DOWN message through a process mailbox; jolt has no mailboxes, so only
+;; the shape carries over and the callback is the primitive. The jolt-level
+;; channel surface is built on it in fibers-async.ss.
+;;
+;; The list is written by whoever registers, from any thread, and read by the
+;; dying fiber's own carrier, so it is a shared side table and takes the same
+;; treatment as the others (jolt-3907): one mutex, held only to swap the list,
+;; never while a monitor runs.
+(define jolt-fiber-monitor-mu (make-mutex))
+
+;; (jolt-fiber-monitor! f proc) -> void. Register PROC on fiber F.
+;;
+;; A fiber that has ALREADY finished calls PROC inline rather than dropping it.
+;; Without that, monitoring is a race nobody can win: the caller cannot check
+;; the state and register atomically from outside, so a fiber that died between
+;; the two would never notify and the caller would wait forever. This is the
+;; job swish's demonitor&flush does at the other end.
+(define (jolt-fiber-monitor! f proc)
+  (let ((now
+         (with-mutex jolt-fiber-monitor-mu
+           (let ((st (jolt-fiber-state f)))
+             (cond
+               ;; Already finished: deliver inline, reading the SAME field
+               ;; jolt-fiber-notify-monitors! reads. 'done must not be assumed
+               ;; to mean success — a go body that threw is caught inside the
+               ;; fiber thunk and reaches 'done with its error field set.
+               ((or (eq? st 'done) (eq? st 'dead)) (list (jolt-fiber-error f)))
+               (else
+                (jolt-fiber-monitors-set! f (cons proc (jolt-fiber-monitors f)))
+                #f))))))
+    (when now (proc (car now)))))
+
+;; Called from jolt-fiber-done! / jolt-fiber-dead!, BEFORE they escape to the
+;; scheduler — those never return, so anything after the escape would not run.
+;;
+;; The list is taken and cleared under the mutex so a monitor cannot fire twice,
+;; and the monitors themselves run OUTSIDE it: they are user code, they run on
+;; the dying fiber's carrier, and holding a lock across them would let one
+;; monitor deadlock every other fiber's registration. A monitor that raises is
+;; contained so it cannot stop the remaining ones or corrupt the completion —
+;; the fiber is already finishing and there is nowhere left to report to.
+(define (jolt-fiber-notify-monitors! f err)
+  (let ((ms (with-mutex jolt-fiber-monitor-mu
+              (let ((ms (jolt-fiber-monitors f)))
+                (jolt-fiber-monitors-set! f '())
+                ms))))
+    (let loop ((ms ms))
+      (unless (null? ms)
+        (guard (e (#t #f)) ((car ms) err))
+        (loop (cdr ms))))))
+
 ;; --- the scheduler ----------------------------------------------------------
 ;; Resume (or first-run) fiber f on ITS carrier's thread, returning to the
 ;; loop when f parks, finishes, or dies.
@@ -770,6 +830,12 @@
   (jolt-fiber-k-set! f #f)
   (jolt-fiber-sm-set! f #f)
   (jolt-fiber-slice-set! f #f)
+  ;; NOT a literal #f: jolt-fiber-go-spawn catches a throwing body inside the
+  ;; fiber thunk (it has to, so it can report and close the go channel), so that
+  ;; fiber finishes NORMALLY and only its error field says otherwise. Reading the
+  ;; field here is what makes a monitor see those, and it is #f for a fiber that
+  ;; genuinely succeeded.
+  (jolt-fiber-notify-monitors! f (jolt-fiber-error f))
   (set-virtual-register! jolt-vreg-current-fiber 0)
   ((jolt-carrier-sched-k (jolt-fiber-carrier f))))
 
@@ -779,6 +845,7 @@
   (jolt-fiber-k-set! f #f)
   (jolt-fiber-sm-set! f #f)
   (jolt-fiber-slice-set! f #f)
+  (jolt-fiber-notify-monitors! f e)
   (set-virtual-register! jolt-vreg-current-fiber 0)
   ((jolt-carrier-sched-k (jolt-fiber-carrier f))))
 
