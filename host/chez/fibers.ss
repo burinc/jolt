@@ -564,10 +564,17 @@
 ;; its carrier's run queue (round-robin); returns when the scheduler resumes
 ;; it. An error outside a fiber — the vreg read is the "am I on a fiber?"
 ;; dispatch R0's design calls out.
+;; The state change, the enqueue and the switch are ONE transition and must not
+;; be preempted partway. A timer landing between the enqueue and the switch runs
+;; the handler, which enqueues this same fiber AGAIN — it is then on the run
+;; queue twice, gets dispatched twice, and the second dispatch finds it in a
+;; state the scheduler says is impossible. That is the "fiber in unexpected
+;; state" failure. jolt-fiber-to-scheduler! clears the region as it escapes.
 (define (sa-fiber-yield)
   (let ((f (jolt-current-fiber)))
     (if f
-        (begin (jolt-fiber-state-set! f 'ready)
+        (begin (jolt-no-preempt-enter!)
+               (jolt-fiber-state-set! f 'ready)
                (jolt-fiber-enqueue! (jolt-fiber-carrier f) f)
                (jolt-fiber-to-scheduler! f))
         (error 'sa-fiber-yield "yield called outside a fiber"))))
@@ -575,10 +582,13 @@
 ;; Park WITHOUT re-enqueueing: the fiber is not runnable until sa-fiber-resume.
 ;; Internal for R1 — this is the park shape R3's channel waiters use (a take!
 ;; whose callback resumes the fiber) — and what makes sa-fiber-resume real.
+;; Same transition rule as sa-fiber-yield: a preemption between marking 'parked
+;; and switching would queue a fiber that is about to park.
 (define (jolt-fiber-park!)
   (let ((f (jolt-current-fiber)))
     (if f
-        (begin (jolt-fiber-state-set! f 'parked)
+        (begin (jolt-no-preempt-enter!)
+               (jolt-fiber-state-set! f 'parked)
                (jolt-fiber-to-scheduler! f))
         (error 'jolt-fiber-park! "park called outside a fiber"))))
 
