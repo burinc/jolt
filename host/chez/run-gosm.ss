@@ -79,6 +79,34 @@
 (define x-vrecur (go-expansion "(go (loop [i 0] (if (< i 2) [(recur (inc i))] (<! ch))))"))
 (gate-check "recur inside a collection literal -> declined" (gate-sub? x-vrecur "__sm-") #f)
 
+;; The same trap reached through the four arms that CPS a subform. A recur emits a
+;; bare call to the loop fn and throws k away, which is what a recur MEANS only in
+;; tail position; an application argument, a let* init, a non-final do statement
+;; and an if test each hand down a fresh continuation, and discarding that one
+;; discarded the rest of the computation. Unfixed, each of these rewrote and
+;; answered the take (100) where the ordinary expansion answers 102 / :after / :t.
+;; Asserted on the EXPANSION, since "declined" is the fix, and on one VALUE below,
+;; since agreeing with the ordinary expansion is the property the fix is for.
+(define (recur-nontail-expansion shape)
+  (go-expansion (string-append "(go (loop [i 0] (if (< i 2) " shape " (<! ch))))")))
+(for-each
+ (lambda (p)
+   (gate-check (string-append "non-tail recur in " (car p) " -> declined")
+               (gate-sub? (recur-nontail-expansion (cdr p)) "__sm-") #f))
+ '(("an application argument" . "(inc (recur (inc i)))")
+   ("a let* init"             . "(let [x (recur (inc i))] (inc x))")
+   ("a do statement"          . "(do (recur (inc i)) :after)")
+   ("an if test"              . "(if (recur (inc i)) :t :f)")))
+;; and it still answers what the ordinary expansion answers
+(gate-check "non-tail recur: the value is the ordinary expansion's"
+            (ev (string-append
+                 "(let [c (clojure.core.async/chan 1)]"
+                 "  (clojure.core.async/>!! c 100)"
+                 "  (binding [clojure.core.async/*go-backend* :fiber]"
+                 "    (clojure.core.async/<!! (clojure.core.async/go"
+                 "      (loop [i 0] (if (< i 2) (inc (recur (inc i))) (<! c)))))))"))
+            102)
+
 ;; A special-form head may arrive clojure.core-QUALIFIED and still be that special
 ;; form to the analyzer (analyze-list*'s sf-name arm; verified here by evaluating
 ;; one). The pass must read it the same way, or it rebuilds the form as an

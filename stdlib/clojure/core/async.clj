@@ -237,13 +237,18 @@
   and b's init means the a above it. Evaluating them as a flat argument list
   instead put every init in the scope OUTSIDE the loop, where that `a` is
   whatever `a` the enclosing scope happens to have: a compile error if there is
-  none, and silently the wrong value if there is one."
+  none, and silently the wrong value if there is one.
+
+  :rec carries the loop's TAIL continuation as well as its name and arity. A
+  recur compiles to a bare call to lp, which throws away whatever continuation
+  sm-cps was handed, and that is only the same thing as a recur where the
+  continuation in hand IS this one — see the recur arm in sm-cps."
   [ctx bindings body k]
   (let [names (vec (take-nth 2 bindings))
         lp (gensym "lp__")]
     (letfn [(enter [c]
               (let [c' (assoc (sm-bind* (sm-bind c lp) names)
-                              :rec {:name lp :n (count names)})]
+                              :rec {:name lp :n (count names) :k k})]
                 (list 'letfn* [lp (list 'fn* names (sm-cps-body c' body k))]
                       ;; the names are the let*/continuation bindings built above;
                       ;; the fn's params shadow them inside the body
@@ -312,9 +317,24 @@
           (= sf 'if) (sm-cps-if ctx ex k)
           (= sf 'loop*) (sm-cps-loop ctx (vec (second ex)) (drop 2 ex) k)
 
+          ;; recur is a bare call to the loop fn, which DISCARDS k. That is the
+          ;; right thing only where k is the loop's own tail continuation, and
+          ;; every arm that CPSes a subform hands down a fresh one instead: an
+          ;; application argument, a let* init, a non-final do statement, an if
+          ;; test. Reached through any of those, discarding k threw the rest of
+          ;; the computation away — (loop [i 0] (if (< i 2) (inc (recur (inc i)))
+          ;; (<! ch))) answered the take where the ordinary expansion answers it
+          ;; plus two. Only source the JVM rejects (a recur outside tail
+          ;; position) gets here, which is why nothing caught it; jolt accepts
+          ;; that source, so the two expansions have to agree on what it means.
+          ;; Bail, the same as the collection-literal and opaque arms do for the
+          ;; same reason.
           (= sf 'recur)
           (let [rec (:rec ctx)]
-            (when (or (nil? rec) (not= (count (rest ex)) (:n rec))) (sm-bail))
+            (when (or (nil? rec)
+                      (not= (count (rest ex)) (:n rec))
+                      (not= k (:k rec)))
+              (sm-bail))
             (sm-cps-seq ctx (vec (rest ex))
                         (fn [_ args] (apply list (:name rec) args))))
 
