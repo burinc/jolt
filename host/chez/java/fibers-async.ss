@@ -52,9 +52,35 @@
 ;; step; the rest is a buffer push and a notify. A channel with no xform cannot
 ;; raise here and does not pay for the frame. The redundant async-check-put! that
 ;; ac-try-give!/locked still does is left alone: it guards the OTHER callers.
+;; --- holding a channel mutex against preemption -----------------------------
+;; async.ss states the R3 invariant: never yield while holding a channel mutex,
+;; because a fiber that suspends holding it strands every later op on that
+;; channel. The fiber ops honour it by hand — they release before they park.
+;; PREEMPTION BREAKS THAT, since the timer suspends a fiber wherever it happens
+;; to be, including mid-section.
+;;
+;; And it does not fail as a clean deadlock, which is what makes it dangerous.
+;; Fibers on one carrier share an OS thread and Chez mutexes are recursive per
+;; thread, so the next fiber's acquire SUCCEEDS and walks straight into a section
+;; another fiber is halfway through. Measured before this guard existed: a
+;; 4-producer/1-consumer run on one carrier stalled at 802 of 1600 values with a
+;; short quantum, and hung outright with a shorter one.
+;;
+;; So these ops mark a non-preemptible region for exactly as long as they hold
+;; the mutex.
+;; The timer still fires in here; the handler sees the depth and declines,
+;; re-arming instead. Release BEFORE leaving the region: the other order reopens
+;; the window.
+(define (jolt-chan-lock! ch)
+  (jolt-no-preempt-enter!)
+  (mutex-acquire (async-chan-mu ch)))
+(define (jolt-chan-unlock! ch)
+  (mutex-release (async-chan-mu ch))
+  (jolt-no-preempt-exit!))
+
 (define (jolt-chan-locked-give! ch v)
   (if (async-chan-xrf ch)
-      (guard (e (#t (mutex-release (async-chan-mu ch)) (raise e)))
+      (guard (e (#t (jolt-chan-unlock! ch) (raise e)))
         (ac-try-give!/locked ch v))
       (ac-try-give!/locked ch v)))
 
@@ -62,7 +88,7 @@
 ;; value, a waiting putter, or a closed channel complete immediately (no
 ;; capture); an empty open channel registers an alt-taker and parks.
 (define (jolt-fiber-<! ch)
-  (mutex-acquire (async-chan-mu ch))
+  (jolt-chan-lock! ch)
   (let ((r (ac-poll!/locked ch)))
     (if (eq? r ac-poll-empty)
         (let ((h (jolt-fiber-waiter (jolt-current-fiber))))
@@ -70,13 +96,13 @@
           (ac-notify! ch)
           (if (vector-ref (alt-handler-mailbox h) 0)
               (let ((v (vector-ref (alt-handler-mailbox h) 1)))
-                (mutex-release (async-chan-mu ch))
+                (jolt-chan-unlock! ch)
                 v)
               (begin
-                (mutex-release (async-chan-mu ch))
+                (jolt-chan-unlock! ch)
                 (vector-ref (jolt-fiber-waiter-wait! h) 1))))
         (begin
-          (mutex-release (async-chan-mu ch))
+          (jolt-chan-unlock! ch)
           r))))
 
 ;; (jolt-fiber->! ch v) -> #t | #f (closed). Fiber-side put: room or a waiting
@@ -84,11 +110,11 @@
 ;; alt-putter and parks.
 (define (jolt-fiber->! ch v)
   (async-check-put! v)                   ; throws — keep it outside the mutex
-  (mutex-acquire (async-chan-mu ch))
+  (jolt-chan-lock! ch)
   (let ((r (jolt-chan-locked-give! ch v)))
     (cond
-      ((eq? r 'ok) (mutex-release (async-chan-mu ch)) #t)
-      ((eq? r 'closed) (mutex-release (async-chan-mu ch)) #f)
+      ((eq? r 'ok) (jolt-chan-unlock! ch) #t)
+      ((eq? r 'closed) (jolt-chan-unlock! ch) #f)
       (else
        (let ((h (jolt-fiber-waiter (jolt-current-fiber))))
          (async-chan-alt-putters-set! ch
@@ -96,10 +122,10 @@
          (ac-notify! ch)
            (if (vector-ref (alt-handler-mailbox h) 0)
                (let ((ok (vector-ref (alt-handler-mailbox h) 1)))
-                 (mutex-release (async-chan-mu ch))
+                 (jolt-chan-unlock! ch)
                  ok)
               (begin
-                (mutex-release (async-chan-mu ch))
+                (jolt-chan-unlock! ch)
                 (vector-ref (jolt-fiber-waiter-wait! h) 1))))))))
 
 ;; The fiber wakeup strategy — alt-deliver! dispatches through this hook so
@@ -196,14 +222,20 @@
   (let ((f (jolt-current-fiber)))
     (unless f
       (error 'jolt-fiber-waiter-wait! "channel wait outside a fiber"))
+    ;; Commit and park are ONE non-preemptible region — see jolt-sm-commit!.
+    ;; jolt-fiber-to-scheduler! clears it on the way out, so the resumed path
+    ;; must NOT exit it again; only the no-park path does.
+    (jolt-no-preempt-enter!)
     (let ((park?
            (with-mutex (alt-handler-wmu h)
              (if (vector-ref (alt-handler-mailbox h) 0)
                  #f
                  (begin (jolt-fiber-state-set! f 'parked) #t)))))
-      (when park?
-        (jolt-fiber-bump-chan-parks! f)
-        (jolt-fiber-to-scheduler! f))
+      (if park?
+          (begin
+            (jolt-fiber-bump-chan-parks! f)
+            (jolt-fiber-to-scheduler! f))
+          (jolt-no-preempt-exit!))
       (alt-handler-mailbox h))))
 
 ;; The fiber alts! await: park on the already-registered shared handler and

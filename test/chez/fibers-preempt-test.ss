@@ -40,16 +40,14 @@
 (printf "== fiber preemption ==\n")
 
 ;; --- 1. off by default ------------------------------------------------------
-;; ON by default. Cooperative-only is not a milder default, it is an unbounded
-;; starvation window, so the preemptive path is the only path that ships.
-(ok "1. preemption is ON by default" (and (jolt-fiber-preempt-ticks) #t))
-(ok "1. the default quantum is sub-millisecond"
-    (eqv? (jolt-fiber-preempt-ticks) jolt-fiber-preempt-ticks-default))
-
+;; OFF by default, until the channel stress below is clean at a tight quantum
+;; (jolt-atc.6). Cooperative-only is an unbounded starvation window and SHOULD
+;; not be the default, but shipping a scheduler with known races is worse.
+(ok "1. preemption is OFF by default" (not (jolt-fiber-preempt-ticks)))
 (jolt-fiber-preempt-ticks-set! 20000)
-(ok "1. host setter pins a different quantum" (eqv? 20000 (jolt-fiber-preempt-ticks)))
+(ok "1. host setter turns it on" (eqv? 20000 (jolt-fiber-preempt-ticks)))
 (jolt-fiber-preempt-ticks-set! #f)
-(ok "1. the escape hatch turns it off" (not (jolt-fiber-preempt-ticks)))
+(ok "1. host setter turns it back off" (not (jolt-fiber-preempt-ticks)))
 (ok "1. a non-positive tick count is refused"
     (guard (e (#t #t)) (jolt-fiber-preempt-ticks-set! 0) #f))
 
@@ -138,6 +136,56 @@
 (ok "5. with the knob off the queued fiber starves again" (not (unbox off-b-ran)))
 (set-box! off-stop #t)
 (wait-until (lambda () (unbox off-b-ran)) 5.0 "5. B runs after A finishes")
+
+;; --- 6. channel ops are not preempted mid-critical-section ------------------
+;; The regression test for the two races preemption introduced, both found by
+;; running this with the quantum tightened until it broke.
+;;
+;; ONE carrier on purpose. Fibers on a carrier share an OS thread and Chez
+;; mutexes are recursive per thread, so a fiber suspended holding a channel mutex
+;; does NOT announce itself as a deadlock — the next fiber's acquire succeeds and
+;; walks into a section another fiber is halfway through. Before the guards, this
+;; stalled at 802 of 1600 values; before the commit-window guard, at 0 of 1600.
+;;
+;; Quantum is 200 ticks, which is roughly 0.1us and about 5000x tighter than the
+;; default. Anything looser stops exercising the window at all: at the default a
+;; channel-bound fiber parks long before its quantum expires and no preemption
+;; ever lands inside an op.
+(jolt-fiber-pool-reset!)
+(jolt-fiber-carrier-count-set! 1)
+(jolt-fiber-preempt-ticks-set! 200)
+
+(define NPROD 4)
+(define NPER 300)
+(define st-ch (jolt-async-chan 4))
+(define st-seen (make-eqv-hashtable))
+(define st-got 0)
+(define st-before (jolt-fiber-preempts))
+
+(do ((i 0 (+ i 1))) ((= i NPROD))
+  (let ((id i))
+    (sa-fiber-spawn
+     (lambda ()
+       (let loop ((j 0))
+         (when (< j NPER)
+           (jolt-fiber->! st-ch (+ (* id 100000) j))
+           (loop (+ j 1))))))))
+(sa-fiber-spawn
+ (lambda ()
+   (let loop ()
+     (let ((v (jolt-fiber-<! st-ch)))
+       (unless (jolt-nil? v)
+         (hashtable-set! st-seen v (+ 1 (hashtable-ref st-seen v 0)))
+         (set! st-got (+ st-got 1))
+         (loop))))))
+(jolt-fiber-ensure-carrier!)
+(wait-until (lambda () (>= st-got (* NPROD NPER))) 60.0
+            "6. every value delivered under a tight quantum")
+(ok "6. no value lost" (= st-got (* NPROD NPER)))
+(ok "6. no value duplicated" (= (hashtable-size st-seen) (* NPROD NPER)))
+(ok "6. preemption actually fired during the stress"
+    (> (jolt-fiber-preempts) st-before))
+(jolt-fiber-preempt-ticks-set! #f)
 
 (jolt-fiber-pool-reset!)
 (printf "\nfibers-preempt-test: ~a checks, ~a failure(s)\n" total fails)

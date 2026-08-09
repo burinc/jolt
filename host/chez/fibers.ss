@@ -178,6 +178,37 @@
 ;; the end — the correct answer, just without the shortcut.
 (define jolt-vreg-fiber-winder-base 6)
 
+;; Slot 7: how deep this carrier is inside a region that must not be preempted.
+;;
+;; A DEPTH and not a flag, because the regions nest: alt-deliver! enqueues onto a
+;; carrier's run queue while holding a channel mutex, so the queue guard closes
+;; inside the channel guard.
+;;
+;; This replaced disable-interrupts, which looked like the obvious tool and is
+;; the one swish uses. It does not work here. Chez DEFERS a timer raised while
+;; interrupts are off and delivers it at the enable, so the handler fires from
+;; inside enable-interrupts — and this handler escapes to the scheduler instead
+;; of returning, so the enable never completes and the carrier's disable count
+;; is left raised for good. Preemption then stops firing on that carrier
+;; entirely. Swish survives that because @yield carries the count across the
+;; switch in pcb-sic and rebuilds it on the other side; a counter the handler
+;; simply consults needs no such accounting, and is a vreg write rather than two
+;; calls into the interrupt machinery.
+;;
+;; Nothing has to save or restore it across a park: every guarded region releases
+;; its lock and leaves the region before parking, so the depth is 0 at every
+;; park and every dispatch. That was the same claim made for the interrupt count,
+;; but here it actually holds, because this counter is ours and only these
+;; regions touch it.
+(define jolt-vreg-no-preempt 7)
+(define (jolt-no-preempt-enter!)
+  (set-virtual-register! jolt-vreg-no-preempt
+                         (fx+ 1 (virtual-register jolt-vreg-no-preempt))))
+(define (jolt-no-preempt-exit!)
+  (set-virtual-register! jolt-vreg-no-preempt
+                         (fx- (virtual-register jolt-vreg-no-preempt) 1)))
+(define (jolt-no-preempt?) (fx>? (virtual-register jolt-vreg-no-preempt) 0))
+
 ;; The chain with the finally winders removed. Returns the ARGUMENT ITSELF when
 ;; nothing is dropped — the overwhelmingly common case — so a park with no
 ;; finally in scope allocates nothing and the tail is shared when the dropped
@@ -406,8 +437,8 @@
 ;; Chez defers a timer interrupt while interrupts are disabled rather than
 ;; dropping it, so nothing is lost: the preemption lands at the enable.
 (define (jolt-fiber-enqueue! c f)
-  (let ((preempting? (and jolt-fiber-preempt-ticks-global #t)))
-    (when preempting? (disable-interrupts))
+  (begin
+    (jolt-no-preempt-enter!)
     (mutex-acquire (jolt-carrier-mu c))
     (if (jolt-carrier-tail c)
         (begin (jolt-fiber-next-set! (jolt-carrier-tail c) f)
@@ -416,11 +447,11 @@
                (jolt-carrier-head-set! c f)
                (jolt-carrier-tail-set! c f)))
     (mutex-release (jolt-carrier-mu c))
-    (when preempting? (enable-interrupts))))
+    (jolt-no-preempt-exit!)))
 
 (define (jolt-fiber-dequeue! c)
-  (let ((preempting? (and jolt-fiber-preempt-ticks-global #t)))
-    (when preempting? (disable-interrupts))
+  (begin
+    (jolt-no-preempt-enter!)
     (mutex-acquire (jolt-carrier-mu c))
     (let ((f (jolt-carrier-head c)))
       (when f
@@ -429,7 +460,7 @@
         ;; clear the link so a completed fiber does not retain the queue
         (jolt-fiber-next-set! f #f))
       (mutex-release (jolt-carrier-mu c))
-      (when preempting? (enable-interrupts))
+      (jolt-no-preempt-exit!)
       f)))
 
 ;; The three thread parameters that make up a fiber's dynamic slice live in
@@ -521,6 +552,12 @@
       ;; exit-only cleanup but need a before-thunk of their own (loader.ss).
       (jolt-park-drop-finallys!)
       (jolt-park-unwinding-set! #t)
+      ;; A park leaves NO non-preemptible region behind. The commit-to-park
+      ;; sequences enter one and then escape through here rather than exiting it
+      ;; (they cannot exit: the escape is the last thing they do), so clearing it
+      ;; is this function's job. Leaving it set would hand the carrier to the
+      ;; NEXT fiber with preemption suppressed.
+      (set-virtual-register! jolt-vreg-no-preempt 0)
       ((jolt-carrier-sched-k (jolt-fiber-carrier f))))))
 
 ;; (sa-fiber-yield) -> void. Park the current fiber and move it to the back of
@@ -586,12 +623,27 @@
 ;; mechanism jolt already uses for thread interrupt (concurrency.ss
 ;; jolt-run-interruptible).
 ;;
-;; ON BY DEFAULT. Cooperative-only scheduling is not a milder setting, it is an
-;; unbounded starvation window: one compute-bound fiber holds its carrier for as
-;; long as it feels like and nothing else on that carrier runs. That is a
-;; liveness bug, so the preemptive path is THE path and there is no reason to
-;; ship two. It costs about 13% on a yield (215 -> 243 ns), all of it arming and
-;; disarming the timer, independent of the quantum.
+;; OFF BY DEFAULT, and that is an evidence-based call rather than caution.
+;;
+;; Cooperative-only really is an unbounded starvation window, so this SHOULD be
+;; the only path. It was, briefly. Then a channel stress test (4 producers and a
+;; consumer pinned to one carrier) was run with the quantum tightened, and it
+;; found two real races: a preemption inside a channel op's critical section
+;; (jolt-chan-lock!) and one inside the commit-to-park window
+;; (jolt-fiber-waiter-wait!, jolt-sm-commit!). Both are fixed below, and both
+;; were quantum-INDEPENDENT — a short quantum only made them near-certain
+;; instead of rare.
+;;
+;; With those fixed the test is clean from ~200 ticks up, and the default here is
+;; 1,000,000. But it still stalls at 5 ticks and violates the fiber state machine
+;; at 2 ("fiber in unexpected state with irritant running"). By the same argument
+;; that made the first two bugs real, those are races too, and a large quantum
+;; makes them rare rather than absent. A rare race in a scheduler is the worst
+;; kind to ship: it surfaces as an inexplicable hang under load.
+;;
+;; So preemption stays available and stays off until the stress test is clean at
+;; a tight quantum. jolt-atc.6 tracks that. When it is, this flips and the branch
+;; below goes away.
 ;;
 ;; The quantum is measured, not guessed: ticks are polled at calls and loop
 ;; back-edges, so on this machine ~100k ticks is 45us and the default below is
@@ -599,10 +651,11 @@
 ;; waits at most one quantum, and a compute-bound fiber pays one park per
 ;; quantum, which at this length is noise.
 ;;
-;; Setting it to #f (or the var to 0) restores cooperative-only. That is an
-;; ESCAPE HATCH, not a supported mode: it exists because preemption touches the
-;; timer, which foreign calls and jolt-run-interruptible also use, and a one-line
-;; workaround beats a rebuild if that interaction ever bites in the field.
+;; Turning it on costs about 13% on a yield (215 -> 243 ns), all of it arming and
+;; disarming the timer and independent of the quantum. The non-preemptible-region
+;; counter is left unconditional: it is two virtual-register writes, it is
+;; correct whether or not the timer is armed, and making it conditional would be
+;; one more thing to get wrong when the default flips.
 ;;
 ;; What preemption does NOT fix: a fiber inside a blocking foreign call cannot
 ;; be preempted, because the timer is only polled in Scheme. Parkable IO
@@ -620,7 +673,7 @@
 ;; :fiber go, or between a pool reset and the next one. The host setter updates
 ;; both and is always immediate.
 (define jolt-fiber-preempt-ticks-default 1000000)   ; ~0.45ms, measured
-(define jolt-fiber-preempt-ticks-global jolt-fiber-preempt-ticks-default)
+(define jolt-fiber-preempt-ticks-global #f)        ; #f = off, the default for now
 (define (jolt-fiber-preempt-ticks) jolt-fiber-preempt-ticks-global)
 (define (jolt-fiber-preempt-refresh!)
   (let ((v (guard (e (#t #f))
@@ -628,13 +681,13 @@
                (if (and cell (var-cell-defined? cell)) (var-cell-root cell) #f)))))
     ;; a positive fixnum pins the quantum, 0 is the escape hatch, and jolt-nil
     ;; (an unset var) leaves the default alone
-    (cond ((and (fixnum? v) (fx>? v 0)) (set! jolt-fiber-preempt-ticks-global v))
-          ((eqv? v 0) (set! jolt-fiber-preempt-ticks-global #f))
-          (else (void)))))
+    (when (and (fixnum? v) (fx>? v 0))
+      (set! jolt-fiber-preempt-ticks-global v))))
 (define (jolt-fiber-preempt-ticks-set! n)
+  ;; #f restores the default rather than turning preemption off — there is no off.
   (when (and n (not (and (fixnum? n) (fx>? n 0))))
     (error 'jolt-fiber-preempt-ticks-set!
-           "preempt ticks must be a positive fixnum or #f" n))
+           "preempt ticks must be a positive fixnum or #f (off)" n))
   (set! jolt-fiber-preempt-ticks-global n)
   (guard (e (#t #f))
     (let ((cell (var-cell-lookup "clojure.core.async" "*fiber-preempt-ticks*")))
@@ -668,8 +721,11 @@
   (let ((f (jolt-current-fiber))
         (ticks jolt-fiber-preempt-ticks-global))
     (cond
-      ((not (and f ticks))
-       ;; off-fiber, or preemption turned off mid-flight: re-arm only if still on
+      ;; Off a fiber (mid-park, between dispatches), or inside a region that must
+      ;; run to completion (a held channel or run-queue mutex). Re-arm and let it
+      ;; go: the fiber loses this quantum, which is far cheaper than suspending it
+      ;; holding a lock that its own carrier needs.
+      ((or (not f) (jolt-no-preempt?))
        (when ticks (set-timer ticks))
        (void))
       (else

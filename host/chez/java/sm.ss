@@ -78,20 +78,28 @@
   ;; winder to unwind normally.
   (jolt-park-drop-finallys!)
   (jolt-park-unwinding-set! #t)
+  (set-virtual-register! jolt-vreg-no-preempt 0)   ; see jolt-fiber-to-scheduler!
   ((jolt-carrier-sched-k (jolt-fiber-carrier f))))
 
 ;; Commit to a cheap park on an already-registered handler whose channel mutex is
 ;; RELEASED. The commit is atomic with alt-deliver!'s mailbox write under h's wmu,
 ;; exactly as jolt-fiber-waiter-wait! does it: a deliver that beat the commit is
 ;; seen here and the resume runs inline instead of parking.
+;; The commit and the park that follows it are ONE non-preemptible region. A
+;; timer landing between them finds the fiber already marked 'parked, sets it
+;; back to 'ready and enqueues it, and then the park runs anyway — so the fiber
+;; is on the run queue AND parked, gets dispatched, and returns from its park
+;; with an empty mailbox. jolt-sm-park! clears the region as it escapes; the
+;; no-park path exits it here.
 (define (jolt-sm-commit! f h resume)
+  (jolt-no-preempt-enter!)
   (let* ((park? (with-mutex (alt-handler-wmu h)
                   (if (vector-ref (alt-handler-mailbox h) 0)
                       #f
                       (begin (jolt-fiber-state-set! f 'parked) #t)))))
     (if park?
         (jolt-sm-park! f resume)
-        (resume))))
+        (begin (jolt-no-preempt-exit!) (resume)))))
 
 ;; --- the driver -------------------------------------------------------------
 ;; The fiber thunk of a CPS'd body. It runs on the first entry AND on every
@@ -192,7 +200,7 @@
         (jolt-invoke k (jolt-async-take ch)))))
 
 (define (jolt-sm-fiber-take f ch k)
-  (mutex-acquire (async-chan-mu ch))
+  (jolt-chan-lock! ch)
   (let ((r (ac-poll!/locked ch)))
     (if (eq? r ac-poll-empty)
         (let ((h (jolt-fiber-waiter f)))
@@ -200,14 +208,14 @@
           (ac-notify! ch)
           (if (vector-ref (alt-handler-mailbox h) 0)
               (let ((v (vector-ref (alt-handler-mailbox h) 1)))
-                (mutex-release (async-chan-mu ch))
+                (jolt-chan-unlock! ch)
                 (jolt-invoke k v))
               (begin
-                (mutex-release (async-chan-mu ch))
+                (jolt-chan-unlock! ch)
                 (jolt-sm-commit!
                  f h (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1)))))))
         (begin
-          (mutex-release (async-chan-mu ch))
+          (jolt-chan-unlock! ch)
           (jolt-invoke k r)))))
 
 (define (jolt-sm-put ch v k)
@@ -220,11 +228,11 @@
 (define (jolt-sm-fiber-put f ch v k)
   ;; the nil check BEFORE the mutex: it throws, and this path releases by hand
   (async-check-put! v)
-  (mutex-acquire (async-chan-mu ch))
+  (jolt-chan-lock! ch)
   (let ((r (jolt-chan-locked-give! ch v)))
     (cond
-      ((eq? r 'ok) (mutex-release (async-chan-mu ch)) (jolt-invoke k #t))
-      ((eq? r 'closed) (mutex-release (async-chan-mu ch)) (jolt-invoke k #f))
+      ((eq? r 'ok) (jolt-chan-unlock! ch) (jolt-invoke k #t))
+      ((eq? r 'closed) (jolt-chan-unlock! ch) (jolt-invoke k #f))
       (else
        (let ((h (jolt-fiber-waiter f)))
          (async-chan-alt-putters-set! ch
@@ -232,10 +240,10 @@
          (ac-notify! ch)
          (if (vector-ref (alt-handler-mailbox h) 0)
              (let ((ok (vector-ref (alt-handler-mailbox h) 1)))
-               (mutex-release (async-chan-mu ch))
+               (jolt-chan-unlock! ch)
                (jolt-invoke k ok))
              (begin
-               (mutex-release (async-chan-mu ch))
+               (jolt-chan-unlock! ch)
                (jolt-sm-commit!
                 f h (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1)))))))))))
 

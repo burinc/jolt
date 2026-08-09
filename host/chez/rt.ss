@@ -252,6 +252,8 @@
 ;; slot 5: hasheq.ss jolt-vreg-hasheq-caches — this thread's (symbol . string) hasheq tables
 ;; slot 6: fibers.ss jolt-vreg-fiber-winder-base — the winder chain this carrier
 ;;   dispatched the running fiber with, so the park's finally walk knows where to stop
+;; slot 7: fibers.ss jolt-vreg-no-preempt — depth of the non-preemptible regions
+;;   (a held channel or run-queue mutex) this carrier is inside
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
 ;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic
