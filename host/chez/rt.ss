@@ -1380,8 +1380,11 @@
 ;; The cheap park (R7, jolt-nvpr.9): __sm-spawn/__sm-take/__sm-put, the ops a
 ;; CPS'd go body (the pass in clojure.core.async) calls. A
 ;; lexically-parking body stores the rest of the computation as an ordinary
-;; closure in the fiber's k field and switches without capturing a
-;; continuation — no stack segment held while parked. Loaded after
+;; closure in the fiber's SM field, clears k, and switches without capturing a
+;; continuation — no stack segment held while parked. Those two writes are the
+;; whole resume rule: jolt-fiber-resume* takes k when it is set and re-enters
+;; through the thunk when it is clear, which is what puts the driver (and the
+;; body's exception handler) back for a cheap resume. Loaded after
 ;; fibers-async.ss (reuses its waiter handler and channel protocol).
 (load "host/chez/java/sm.ss")
 
