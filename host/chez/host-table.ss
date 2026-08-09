@@ -45,6 +45,33 @@
 ;; map-entry constructor: a 2-elem entry-flagged pvec (map-entry? true, vector?
 ;; false), so sorted-map seq/first produce real map entries that key/val accept.
 (def-var! "jolt.host" "map-entry" make-map-entry)
+;; The stored entry for k, or nil — the native map's Associative.entryAt. The
+;; entry's key is the key the MAP holds, which is jolt= to the one probed with but
+;; is the only one carrying the element's metadata; clojure.core/find reads it.
+;;
+;; Anything that is not a native map answers `not-mine`, which find distinguishes
+;; from a real nil (an absent key). That is what keeps find at one traversal for
+;; the overwhelmingly common case: without the sentinel a miss on a native map
+;; would have to re-probe through find's slower arms to tell the two apart.
+(def-var! "jolt.host" "entry-at"
+  (lambda (m k not-mine)
+    (if (pmap? m)
+        (let ((p (pmap-entry-at m k)))
+          (if p (make-map-entry (car p) (cdr p)) jolt-nil))
+        not-mine)))
+;; clojure.core/find's 2-arity call sites lower here (op-registry "find"), so the
+;; overwhelmingly common case — a native map — costs one traversal and an entry,
+;; with no var deref in front of it. Everything else is the type taxonomy, which
+;; belongs with the rest of it in the core overlay: hand off to find-other there.
+;; :inline-only?, so a value-position `find` still resolves to the overlay var.
+(define (jolt-find2 m k)
+  (if (pmap? m)
+      (let ((p (pmap-entry-at m k)))
+        (if p (make-map-entry (car p) (cdr p)) jolt-nil))
+      (let ((cell (var-cell-lookup "clojure.core" "find-other")))
+        (if (and cell (var-cell-defined? cell))
+            (jolt-invoke (var-cell-root cell) m k)
+            jolt-nil))))
 
 ;; --- sorted-coll recognition + ops access ------------------------------------
 (define kw-jtype (keyword "jolt" "type"))

@@ -215,7 +215,11 @@
 
 ;; jolt= alist ops (for hash-collision buckets)
 (define (assoc-jolt k al) (cond ((null? al) #f) ((jolt= (caar al) k) (car al)) (else (assoc-jolt k (cdr al)))))
-(define (alist-replace k v al) (if (jolt= (caar al) k) (cons (cons k v) (cdr al)) (cons (car al) (alist-replace k v (cdr al)))))
+;; Replacing a key's value KEEPS the key already stored, dropping the equal one
+;; assoc was handed (JVM PersistentHashMap.assoc only clones the value slot). The
+;; two are jolt=, but only the stored one carries the metadata that seq/keys/find
+;; hand back.
+(define (alist-replace k v al) (if (jolt= (caar al) k) (cons (cons (caar al) v) (cdr al)) (cons (car al) (alist-replace k v (cdr al)))))
 (define (alist-remove k al) (cond ((null? al) '()) ((jolt= (caar al) k) (cdr al)) (else (cons (car al) (alist-remove k (cdr al))))))
 
 ;; split two leaves that collided at `shift` into a subtree (or hcoll if the
@@ -246,7 +250,8 @@
                    (make-hnode bm (vec-set arr i (make-hcoll (hcoll-hash child) (alist-replace k v al))))
                     (begin (set-box! added #t)
                            (make-hnode bm (vec-set arr i (make-hcoll (hcoll-hash child) (append al (list (cons k v))))))))))
-            ((jolt= (car child) k) (make-hnode bm (vec-set arr i (cons k v))))   ; replace
+            ;; replace: the leaf keeps ITS key, not the equal one handed in
+            ((jolt= (car child) k) (make-hnode bm (vec-set arr i (cons (car child) v))))
             (else (set-box! added #t)
                   (make-hnode bm (vec-set arr i (split-leaf (fx+ shift 5) (car child) (cdr child) h k v)))))))))
 
@@ -258,6 +263,18 @@
                 ((hcoll? child) (let ((p (assoc-jolt k (hcoll-alist child)))) (if p (cdr p) default)))
                 ((jolt= (car child) k) (cdr child))
                 (else default))))))
+
+;; node-get, but answering with the whole stored (key . value) pair — #f when the
+;; key is absent. The pair's car is the key the map HOLDS, which is what `find`
+;; must put in its entry (see pmap-entry-at).
+(define (node-entry node shift h k)
+  (let* ((bit (bitpos h shift)) (bm (hnode-bm node)))
+    (if (fx=? 0 (fxand bm bit)) #f
+        (let ((child (vector-ref (hnode-arr node) (arr-index bm bit))))
+          (cond ((hnode? child) (node-entry child (fx+ shift 5) h k))
+                ((hcoll? child) (assoc-jolt k (hcoll-alist child)))
+                ((jolt= (car child) k) child)
+                (else #f))))))
 
 (define (node-dissoc node shift h k removed)
   (let* ((bit (bitpos h shift)) (bm (hnode-bm node)) (arr (hnode-arr node)))
@@ -331,7 +348,9 @@
 ;; k/v adjacent): folds scan it directly with no per-key HAMT lookup, and assoc
 ;; replacing an existing key updates the value in place via order-replace.
 (define (append-key ord k v) (cons (cons k v) ord))  ; O(1) prepend — reversed order, reversed at iteration
-(define (order-replace ord k v) (if (not ord) ord (let loop ((o ord)) (cond ((null? o) '()) ((jolt= (caar o) k) (cons (cons k v) (cdr o))) (else (cons (car o) (loop (cdr o))))))))
+;; keeps the stored key, like node-assoc's leaf replace — the order list is what
+;; seq/keys read, so a replaced value must not swap the key out from under them.
+(define (order-replace ord k v) (if (not ord) ord (let loop ((o ord)) (cond ((null? o) '()) ((jolt= (caar o) k) (cons (cons (caar o) v) (cdr o))) (else (cons (car o) (loop (cdr o))))))))
 (define (remove-key ord k) (let loop ((o ord)) (cond ((null? o) '()) ((jolt= (caar o) k) (cdr o)) (else (cons (car o) (loop (cdr o)))))))
 
 ;; growth rule (PersistentArrayMap.assoc): a new key appends to the order while in
@@ -369,6 +388,9 @@
         (make-pmap r (fx- (pmap-cnt m) 1) (if ord (remove-key ord k) #f))
         m)))
 (define (pmap-get m k default) (node-get (pmap-root m) 0 (key-hash k) k default))
+;; the stored (key . value) pair, or #f — `find` builds its entry from this so the
+;; entry's key is the map's own key object, not the equal one probed with.
+(define (pmap-entry-at m k) (node-entry (pmap-root m) 0 (key-hash k) k))
 (define (pmap-contains? m k) (not (eq? pmap-absent (node-get (pmap-root m) 0 (key-hash k) k pmap-absent))))
 ;; The universal fold idiom across the runtime is `(pmap-fold m (lambda (k v a)
 ;; (cons ... a)) '())`, which accumulates in REVERSE visitation order. So that this
@@ -428,8 +450,24 @@
 (define (pset-conj s e) (if (pmap-contains? (pset-m s) e) s (make-pset (pmap-assoc (pset-m s) e e))))
 (define (pset-disj s e) (make-pset (pmap-dissoc (pset-m s) e)))
 (define (pset-contains? s e) (pmap-contains? (pset-m s) e))
+;; A lookup answers with the element the set HOLDS, not with the equal probe key
+;; it was handed — only the stored one carries the element's metadata, and callers
+;; read it (farolero's return-from derefs (:on-stack? (meta block))). pset-conj
+;; stores each element as both key and value, so the backing map's value IS that
+;; element.
+(define (pset-get s e default) (pmap-get (pset-m s) e default))
 (define (pset-count s) (pmap-cnt (pset-m s)))
 (define (pset-fold s proc acc) (pmap-fold (pset-m s) (lambda (k v a) (proc k a)) acc))
+;; Fold over the stored (element . lookup-value) PAIRS. The two are normally the
+;; same element, but a transient conj! of an element equal to one already in keeps
+;; the old key and stores the new value (JVM ATransientSet.conj = impl.assoc(v,v)),
+;; and persistent! carries that split through — so (seq s) yields the first and
+;; (get s k) the second. Anything that REBUILDS a set element-by-element loses the
+;; split and silently collapses get onto seq's element; the image walker rebuilds,
+;; hence these two.
+(define (pset-fold-pairs s proc acc) (pmap-fold (pset-m s) proc acc))
+(define (pset-from-pairs pairs)   ; pairs: list of (key . lookup-value)
+  (make-pset (fold-left (lambda (m p) (pmap-put-hash m (car p) (cdr p))) empty-pmap-hash pairs)))
 (define (jolt-hash-set . xs) (let loop ((s empty-pset) (xs xs)) (if (null? xs) s (loop (pset-conj s (car xs)) (cdr xs)))))
 
 ;; ============================================================================
@@ -506,7 +544,7 @@
   (set! jolt-get-arms (cons (cons pred handler) jolt-get-arms)))
 (define (jolt-get-base coll k d)
   (cond ((pmap? coll) (pmap-get coll k d))
-        ((pset? coll) (if (pset-contains? coll k) k d))
+        ((pset? coll) (pset-get coll k d))
         ((pvec? coll) (pvec-nth-d coll k d))
         ((string? coll) (let ((i (->idx k)))
                           (if (and (fixnum? i) (fx>=? i 0) (fx<? i (string-length coll))) (string-ref coll i) d)))
@@ -516,7 +554,7 @@
 (define (jolt-get-dispatch coll k d)
   (cond ((pmap? coll) (pmap-get coll k d))
         ((pvec? coll) (pvec-nth-d coll k d))
-        ((pset? coll) (if (pset-contains? coll k) k d))
+        ((pset? coll) (pset-get coll k d))
         ((jrec? coll) (jrec-ref coll k d))
         (else (let loop ((as jolt-get-arms))
                 (cond ((null? as) (jolt-get-base coll k d))

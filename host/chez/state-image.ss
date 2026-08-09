@@ -144,8 +144,14 @@
                                     (walk v (cons (image-describe-obj k) path))
                                     acc)
                                 #f))
+                ;; the lookup value is a distinct object when a transient conj!
+                ;; split it from its key, and it carries its own metadata
                 ((pset? x)
-                 (pset-fold x (lambda (e acc) (walk e (cons (image-describe-obj e) path)) acc) #f))
+                 (pset-fold-pairs x (lambda (e v acc)
+                                      (walk e (cons (image-describe-obj e) path))
+                                      (unless (eq? v e) (walk v (cons (image-describe-obj v) path)))
+                                      acc)
+                                  #f))
                 ((pvec? x)
                  (let ((n (pvec-count x)))
                    (let loop ((i 0))
@@ -779,25 +785,34 @@
              (walk-pset
               (lambda (x path)
                 (if (image-rebuild-mode? mode)
-                    (let ((items '()) (dirty #f))
-                      (pset-fold x
-                        (lambda (e acc)
-                          (let ((w (walk e (cons (image-describe-obj e) path))))
-                            (set! items (cons w items))
-                            (set! dirty (or dirty (not (eq? w e))))
+                    ;; pair-wise, like the sub path: the lookup value can be an
+                    ;; element merely jolt= to the key it is filed under
+                    (let ((pairs '()) (dirty #f))
+                      (pset-fold-pairs x
+                        (lambda (e v acc)
+                          (let* ((w (walk e (cons (image-describe-obj e) path)))
+                                 (wv (if (eq? v e) w (walk v (cons (image-describe-obj v) path)))))
+                            (set! pairs (cons (cons w wv) pairs))
+                            (set! dirty (or dirty (not (eq? w e)) (not (eq? wv v))))
                             acc))
                         #f)
                       (if (hashtable-ref memo x #f)
                           (hashtable-ref memo x #f)
                           (if dirty
-                              (let ((nx (apply jolt-hash-set (reverse items))))
+                              (let ((nx (pset-from-pairs (reverse pairs))))
                                 (hashtable-set! memo x nx)
                                 (image-meta-copy! x nx)
                                 nx)
                               (begin (hashtable-set! memo x x) x))))
                     (begin
                       (hashtable-set! memo x #t)
-                      (pset-fold x (lambda (e acc) (walk e (cons (image-describe-obj e) path)) acc) #f)
+                      ;; the split lookup value is its own object, with its own
+                      ;; metadata for image-collect-meta to pick up
+                      (pset-fold-pairs x (lambda (e v acc)
+                                           (walk e (cons (image-describe-obj e) path))
+                                           (unless (eq? v e) (walk v (cons (image-describe-obj v) path)))
+                                           acc)
+                                       #f)
                       #t))))
              (walk-sorted
               (lambda (x path)
@@ -1489,14 +1504,16 @@
              (hashtable-set! memo x nx)
              (when dirty (image-meta-copy! x nx))
              nx)))
+        ;; pair-wise: a set's lookup value can be an element merely jolt= to its key
+        ;; (pset-fold-pairs), and rebuilding element-by-element would drop it
         ((pset? x)
          (let ((dirty #f)
-               (items (reverse (pset-fold x (lambda (e acc)
-                                              (let ((se (sub e)))
-                                                (unless (eq? se e) (set! dirty #t))
-                                                (cons se acc)))
-                                          '()))))
-           (let ((nx (if dirty (apply jolt-hash-set items) x)))
+               (pairs (reverse (pset-fold-pairs x (lambda (e v acc)
+                                                    (let ((se (sub e)) (sv (sub v)))
+                                                      (unless (and (eq? se e) (eq? sv v)) (set! dirty #t))
+                                                      (cons (cons se sv) acc)))
+                                                '()))))
+           (let ((nx (if dirty (pset-from-pairs pairs) x)))
              (hashtable-set! memo x nx)
              (when dirty (image-meta-copy! x nx))
              nx)))
