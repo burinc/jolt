@@ -1176,26 +1176,29 @@
 ;; works today; it only turns an undiagnosable hang into an error that names both
 ;; namespaces and both threads.
 ;;
-;; Ownership is by THREAD id, which is what makes step 3 a cycle break rather
-;; than a self-deadlock, and it survives a park: a fiber is pinned to its carrier
-;; for life (R0(d)), so a load that parks resumes on the thread that claimed it
-;; and load-namespace* deliberately keeps the claim across the park rather than
+;; Ownership is by EXECUTION CONTEXT — the fiber when a fiber is loading, the
+;; thread id otherwise (ldr-load-ctx) — which is what makes step 3 a cycle break
+;; rather than a self-deadlock, and it survives a park: a fiber is pinned to its
+;; carrier for life (R0(d)), so a load that parks resumes as the same context and
+;; load-namespace* deliberately keeps the claim across the park rather than
 ;; treating the escape as an exit.
 ;;
 ;; A load CAN park. (require 'x) from a go block on the :fiber backend, where x's
-;; top level does a blocking channel op, is the shape. Every OTHER thread wanting
-;; x then blocks in step 2 until the fiber comes back and finishes, which is the
-;; right answer and better than the pre-protocol behaviour (they read the
-;; mark-before-load and returned with x half-built).
+;; top level does a blocking channel op, is the shape, and it is the only way one
+;; context ever observes another's claim on one carrier — same-carrier fibers do
+;; not run concurrently. Everyone else wanting x then waits in step 2 until the
+;; fiber comes back and finishes, which is the right answer and better than the
+;; pre-protocol behaviour (they read the mark-before-load and returned with x
+;; half-built).
 ;;
-;; What is NOT closed is another FIBER on the same carrier: two fibers share a
-;; thread id, so it reads the parked load's claim as its own and takes step 3,
-;; returning with x half-loaded. Ownership by fiber would turn that into a step 2
-;; wait, and a step 2 wait there blocks the carrier the parked load needs in order
-;; to finish — a real deadlock in place of a stale read. It wants a check that
-;; RAISES on "another fiber on my carrier owns this load" rather than either, so
-;; the invariant is thread-per-load, not fiber-per-load, and it is stated here
-;; rather than left to be discovered. Tracked as jolt-n31.
+;; Thread id alone was not enough for that, because two fibers on one carrier share
+;; one: a sibling fiber read the parked load's claim as its own, took step 3, and
+;; returned with x half-loaded and no error. Nor is it enough to make a sibling
+;; wait, because the wait itself has to be a PARK — a condition-wait would block the
+;; carrier the parked load needs in order to finish. ldr-wait-for-load! picks the
+;; mechanism from the waiter, and the cycle walk keys on the context, so two fibers
+;; deadlocking over each other's loads is reported like any other cycle instead of
+;; hanging.
 ;;
 ;; One behaviour improves as a side effect: :reload-all over a require cycle used
 ;; to recurse forever, because it turns the dedup off for the whole extent and
@@ -1211,20 +1214,22 @@
 ;;                      This is why ldr-assert-claim! refuses re-entry instead of
 ;;                      re-taking the claim: re-taking it is a single step that
 ;;                      breaks the invariant, putting two threads in one load body.
-;;   No lost wakeup     a parked thread always has an owner left to wake it. Rests
-;;                      on condition-wait releasing ldr-load-mu atomically with
-;;                      blocking, so no ldr-end-load! fits between the owner check
-;;                      and the park, and on ldr-end-load! broadcasting from
-;;                      dynamic-wind's after thunk, which runs on every exit. A
-;;                      FIBER park is not an exit and is skipped there, which keeps
-;;                      the property rather than weakening it: the owner is still
-;;                      recorded, still the same thread, and still on its way back
-;;                      to finish the load and broadcast.
+;;   No lost wakeup     a blocked waiter always has an owner left to wake it. Rests
+;;                      on the wait committing before the lock drops — condition-wait
+;;                      releases ldr-load-mu atomically with blocking, and a fiber's
+;;                      park sets 'parked and captures its continuation while the
+;;                      lock is still held — so no ldr-end-load! fits between the
+;;                      owner check and the wait, and on ldr-end-load! broadcasting
+;;                      AND resuming from dynamic-wind's after thunk, which runs on
+;;                      every exit. The LOADER's own park is not an exit and is
+;;                      skipped there, which keeps the property rather than weakening
+;;                      it: the owner is still recorded, still the same context, and
+;;                      still on its way back to finish the load and wake everyone.
 ;;   Cycle detection    ldr-wait-cycle fires on exactly the waits that would
 ;;                      deadlock: it never misses a cycle and never raises on a
 ;;                      graph that would still have made progress. Rests on the
 ;;                      wait-for graph being FUNCTIONAL (one namespace per blocked
-;;                      thread, one owner per namespace) and on the pre-state being
+;;                      context, one owner per namespace) and on the pre-state being
 ;;                      acyclic, which holds because every earlier wait was checked.
 ;;   No deadlock        the lock graph is acyclic. The one edge that is not the
 ;;                      loader's to remove is stm-lock -> the load a parked
@@ -1234,16 +1239,65 @@
 ;;                      and hung.
 (define ldr-load-mu (make-mutex))
 (define ldr-load-cv (make-condition))
-(define ldr-loading (make-hashtable string-hash string=?))  ; ns -> owning thread id
-(define ldr-waiting (make-eqv-hashtable))                   ; thread id -> ns it waits on
+(define ldr-loading (make-hashtable string-hash string=?))  ; ns -> the context loading it
+(define ldr-waiting (make-eqv-hashtable))                   ; context -> ns it waits on
+(define ldr-fiber-waiters (make-hashtable string-hash string=?))  ; ns -> parked fibers
+
+;; --- who a load belongs to ---------------------------------------------------
+;; The FIBER when a fiber is loading, and the thread id otherwise. Thread id alone
+;; was wrong in both directions once a load could park, because two fibers on one
+;; carrier share one. Fiber A's load parks; fiber B on the same carrier requires the
+;; same namespace, reads A's claim as its own, takes step 3 and returns with the
+;; namespace half-loaded, silently. A fiber is the finer identity and it is the right
+;; one: step 3 asks "am I already inside this load", and the answer is per execution,
+;; not per OS thread. It is only ever compared and used as a table key, never
+;; dereferenced, so nothing here depends on the fiber record's shape.
+;;
+;; Same-carrier fibers never run concurrently, so B can only ever observe A's claim
+;; while A is PARKED — this is the parked-load case and nothing else.
+(define (ldr-load-ctx) (or (jolt-current-fiber) (get-thread-id)))
+(define (ldr-ctx-str ctx)
+  (if (jolt-fiber? ctx) "a fiber" (string-append "thread " (number->string ctx))))
+
+;; Wait for the load of `name` to end. Call with ldr-load-mu HELD; returns with it
+;; held again, and the caller re-checks — a wakeup is "something changed", never
+;; "the namespace is yours".
+;;
+;; A fiber must not use the condition variable. condition-wait blocks the CARRIER
+;; thread, and the load it is waiting for is very likely parked on that same carrier
+;; (see above), so blocking there is a deadlock, and even when the owner is on
+;; another thread it stalls every unrelated fiber the carrier is running. It parks
+;; instead, and ldr-end-load! resumes it.
+;;
+;; The park is committed while the mutex is still held — jolt-fiber-park! sets
+;; 'parked and captures the continuation, and only the escape past with-mutex's
+;; dynamic-wind releases the lock — so ldr-end-load! cannot run between the
+;; registration and the park, and there is no wakeup to lose. The resume then
+;; re-acquires through the same dynamic-wind's before thunk. That release-on-park /
+;; re-acquire-on-resume is the one thing here that leans on with-mutex being a
+;; dynamic-wind: it is what makes a park inside this critical section safe, and it is
+;; the opposite of what load-namespace*'s own after thunk wants, which is why that
+;; one asks jolt-park-unwinding? and this one must not.
+(define (ldr-wait-for-load! name)
+  (let ((f (jolt-current-fiber)))
+    (if f
+        (begin
+          (hashtable-set! ldr-fiber-waiters name
+                          (cons f (hashtable-ref ldr-fiber-waiters name '())))
+          (jolt-fiber-park!))
+        (condition-wait ldr-load-cv ldr-load-mu))))
 
 ;; Call with ldr-load-mu HELD. Would `me` waiting on `name` (owned by `owner`) close
 ;; a cycle? Follow owner -> what it waits on -> who owns that -> …; if the chain
 ;; reaches `me`, everyone in it is waiting on everyone else. Returns the chain as a
-;; list of (thread . ns-it-waits-on) in wait order, or #f if there is no cycle — the
-;; error names every thread in it, because a cycle of three reported as two threads
-;; sends you looking for a two-namespace cycle that isn't there. Bounded so a table
+;; list of (context . ns-it-waits-on) in wait order, or #f if there is no cycle — the
+;; error names every context in it, because a cycle of three reported as two sends
+;; you looking for a two-namespace cycle that isn't there. Bounded so a table
 ;; mutated under us can never spin.
+;;
+;; Contexts and not thread ids, which is what extends this to fibers: two fibers on
+;; one carrier that park mid-load waiting on each other are a genuine cycle, and
+;; keyed by thread id they collided in ldr-waiting and the walk could not see it.
 (define (ldr-wait-cycle owner me)
   (let loop ((t owner) (n 0) (acc '()))
     (and (fx< n 256)
@@ -1254,19 +1308,21 @@
                   (and o (if (eqv? o me) (reverse acc) (loop o (fx+ n 1) acc)))))))))
 
 ;; "thread 3 waits on a/b (held by thread 5), thread 5 waits on …" — the wait-for
-;; chain the caller is about to close, rendered in the order it was walked.
+;; chain the caller is about to close, rendered in the order it was walked. Fibers
+;; render as "a fiber" rather than being numbered; the namespaces are what names the
+;; cycle, and a fiber has no id to print.
 (define (ldr-wait-chain-str chain)
   (let loop ((c chain) (out ""))
     (if (null? c)
         out
         (loop (cdr c)
               (string-append out (if (string=? out "") "" ", ")
-                             "thread " (number->string (caar c))
+                             (ldr-ctx-str (caar c))
                              " waits on " (cdar c))))))
 
 ;; -> 'loaded | 'recursive | 'claimed. Steps 1-6.
 (define (ldr-begin-load! name force?)
-  (let ((me (get-thread-id)))
+  (let ((me (ldr-load-ctx)))
     (with-mutex ldr-load-mu
       (let loop ()
         (let ((owner (hashtable-ref ldr-loading name #f)))
@@ -1277,15 +1333,15 @@
                (when chain
                  (throw-jvm (quote IllegalStateException)
                    (string-append
-                     "Deadlocked require: thread " (number->string me)
-                     " is about to wait on " name " (held by thread "
-                     (number->string owner) "), and " (ldr-wait-chain-str chain)
-                     ", which closes back on thread " (number->string me) ". "
+                     "Deadlocked require: " (ldr-ctx-str me)
+                     " is about to wait on " name " (held by "
+                     (ldr-ctx-str owner) "), and " (ldr-wait-chain-str chain)
+                     ", which closes back on " (ldr-ctx-str me) ". "
                      (number->string (fx+ 1 (length chain)))
-                     " threads entered a require cycle from different ends; break"
+                     " loads entered a require cycle from different ends; break"
                      " the cycle or require these namespaces from one thread."))))
              (hashtable-set! ldr-waiting me name)
-             (condition-wait ldr-load-cv ldr-load-mu)
+             (ldr-wait-for-load! name)
              (hashtable-delete! ldr-waiting me)
              (loop))
             ((and (not force?) (not (ldr-reload-all?)) (ns-dedup-loaded? name))
@@ -1296,10 +1352,22 @@
 ;; Step 11: drop the claim and wake everyone waiting on this namespace. Broadcast
 ;; and not signal — the waiters re-check a condition that may not be true for all
 ;; of them (a failed load leaves the namespace unloaded, and exactly one of them
-;; should go on to claim it).
+;; should go on to claim it). Parked fibers are woken the same way and for the same
+;; reason: resume them all and let them re-check.
+;;
+;; Both under the lock, so a waiter that has registered but not yet parked cannot be
+;; missed — it registered with the lock held and stays committed to the park until
+;; the escape drops it. The list is cleared as it is drained, so a fiber that goes
+;; on to wait again registers itself afresh and no resume is ever delivered twice.
+;; sa-fiber-resume takes only its carrier's run-queue mutex, which is the last lock
+;; in the order, so calling it from here closes no cycle.
 (define (ldr-end-load! name)
   (with-mutex ldr-load-mu
     (hashtable-delete! ldr-loading name)
+    (let ((fs (hashtable-ref ldr-fiber-waiters name '())))
+      (unless (null? fs)
+        (hashtable-delete! ldr-fiber-waiters name)
+        (for-each sa-fiber-resume fs)))
     (condition-broadcast ldr-load-cv)))
 
 ;; The dynamic-wind before thunk below: the claim must be ours. On first entry it is,
@@ -1316,18 +1384,18 @@
 ;; in it at once. There is no version of that re-entry that keeps "in the body implies
 ;; you hold the claim" true, so it is refused rather than papered over.
 (define (ldr-assert-claim! name)
-  (let ((me (get-thread-id)))
+  (let ((me (ldr-load-ctx)))
     (with-mutex ldr-load-mu
       (let ((owner (hashtable-ref ldr-loading name #f)))
         (unless (eqv? owner me)
           (throw-jvm (quote IllegalStateException)
             (string-append
-              "Re-entered the load of " name " on thread " (number->string me)
+              "Re-entered the load of " name " on " (ldr-ctx-str me)
               ", which no longer holds its claim ("
-              (if owner (string-append "thread " (number->string owner) " does")
+              (if owner (string-append (ldr-ctx-str owner) " does")
                   "the load has already ended")
               "). A continuation captured inside a load cannot be resumed; the"
-              " namespace would be loaded by two threads at once.")))))))
+              " namespace would be loaded twice at once.")))))))
 
 ;; load-namespace: load `name`'s source once. Marked loaded BEFORE eval so a
 ;; dependency cycle terminates (Clojure's behavior). force? (a :reload of the

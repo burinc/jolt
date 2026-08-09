@@ -48,6 +48,10 @@
 ;;      fiber that loaded it and for a thread that waited on it. A park is a
 ;;      continuation escaping the load body, and treating it as an exit wedged the
 ;;      namespace marked-but-empty for the life of the process.
+;;   I. a sibling FIBER on the carrier the parked load is on gets the whole
+;;      namespace too. It shares the owner's thread id, so ownership by thread read
+;;      the claim as its own and returned half-loaded; and it has to wait by parking,
+;;      because blocking that carrier is the one thing the parked load cannot survive.
 ;;
 ;; Run: jolt run test/chez/concurrent-require.clj  (wired into smoke.sh)
 
@@ -134,6 +138,16 @@
        "(def got (a/<!! ch))\n"
        "(def after :ran)\n"))
 
+;; Property I's target: the same shape, in a namespace of its own so H has not
+;; already loaded it. The delay is longer because two fibers have to reach it.
+(def sibling-src
+  (str "(ns ldrtest.sibling (:require [clojure.core.async :as a]))\n"
+       "(def ch (a/chan 1))\n"
+       "(def before :ran)\n"
+       "(a/thread (Thread/sleep 250) (a/>!! ch :fed))\n"
+       "(def got (a/<!! ch))\n"
+       "(def after :ran)\n"))
+
 (defn- write-sources! []
   (let [dir (str tmp-root "/ldrtest")]
     (.mkdirs (java.io.File. dir))
@@ -145,7 +159,8 @@
     (spit (str dir "/boom.clj") dosync-src)
     (spit (str dir "/dedup.clj") (dedup-src "dedup"))
     (spit (str dir "/dedupab.clj") (dedup-src "dedupab"))
-    (spit (str dir "/parky.clj") parky-src)))
+    (spit (str dir "/parky.clj") parky-src)
+    (spit (str dir "/sibling.clj") sibling-src)))
 
 ;; A gate every thread spins on, so they all enter require together — without it
 ;; the first finishes before the rest start and there is no race to lose.
@@ -333,8 +348,16 @@
 ;; Asserted on the way a caller would notice: the require completes, the namespace is
 ;; WHOLE (the form after the park ran), and a thread that asked for the same
 ;; namespace while it was parked got the whole thing too rather than an empty shell.
-(defn- parked-load-failures []
+;; ONE carrier for both H and I, set before anything spawns a fiber (the pool is
+;; built at the first spawn and read once). H does not need it. I does: two fibers
+;; only share a thread id when they share a carrier, and with the default pool they
+;; would land on different ones and exercise the ordinary cross-thread path instead.
+(defn- one-carrier! []
   (require 'clojure.core.async)
+  (alter-var-root (resolve 'clojure.core.async/*fiber-carrier-count*) (constantly 1)))
+
+(defn- parked-load-failures []
+  (one-carrier!)
   (let [go-spawn (resolve 'clojure.core.async/go-spawn)
         backend (resolve 'clojure.core.async/*go-backend*)
         <!! (deref (resolve 'clojure.core.async/<!!))
@@ -365,6 +388,50 @@
       (conj (str "a thread that required ldrtest.parky while its load was parked got"
                  " a half-built namespace: " (pr-str r2))))))
 
+;; Property I: a SIBLING FIBER on the carrier the parked load is on (jolt-n31).
+;;
+;; Two fibers on one carrier share a thread id, so keying load ownership by thread
+;; read the parked load's claim as the sibling's own: it took step 3, the cycle
+;; break, and returned with the namespace half-loaded and no error. Ownership is by
+;; execution context now, so the sibling sees somebody else's claim and waits.
+;;
+;; And it has to wait by PARKING. The load it is waiting for is parked on the carrier
+;; they share, so a condition-wait would block the one thread that can ever resume it
+;; — the fix for the stale read would have been a hang. ldr-wait-for-load! picks the
+;; mechanism from the waiter and ldr-end-load! resumes the parked ones.
+;;
+;; One carrier and two fibers requiring the same parking namespace, the second
+;; spawned while the first is inside the load: the first claims and parks on its
+;; channel, the carrier then runs the second, which finds the claim. Both must come
+;; back with the namespace whole. A hang here fails by timeout, which is why the
+;; derefs are bounded.
+(defn- sibling-fiber-failures []
+  (let [go-spawn (resolve 'clojure.core.async/go-spawn)
+        backend (resolve 'clojure.core.async/*go-backend*)
+        <!! (deref (resolve 'clojure.core.async/<!!))
+        ask (fn [] (with-bindings {backend :fiber}
+                     (go-spawn (fn []
+                                 (try (require 'ldrtest.sibling)
+                                      (if (resolve 'ldrtest.sibling/after) :whole :half)
+                                      (catch Throwable e (str (.getMessage e))))))))
+        a (ask)
+        ;; inside the load and parked by now, not merely queued behind it
+        b (do (Thread/sleep 60) (ask))
+        [sa ra] (deref-timeout (future (<!! a)) 15000)
+        [sb rb] (deref-timeout (future (<!! b)) 15000)]
+    (cond-> []
+      (or (= :timeout sa) (= :timeout sb))
+      (conj (str "two fibers on one carrier requiring a namespace that parks did not"
+                 " both return: the sibling blocked the carrier its owner needed in"
+                 " order to finish"))
+      (and (not= :timeout sa) (not= :whole ra))
+      (conj (str "the fiber that owned the parked load came back with "
+                 (pr-str ra) ", expected :whole"))
+      (and (not= :timeout sb) (not= :whole rb))
+      (conj (str "a sibling fiber on the same carrier came back with " (pr-str rb)
+                 ", expected :whole — it read the parked load's claim as its own"
+                 " and took the cycle break")))))
+
 (defn- clean-up! []
   ;; the temp root is per-run (currentTimeMillis), so clean it up rather than
   ;; leave one behind on every smoke run
@@ -374,7 +441,7 @@
   (doseq [p [(str tmp-root "/ldrtest/target.clj") (str tmp-root "/ldrtest/x.clj")
              (str tmp-root "/ldrtest/y.clj") (str tmp-root "/ldrtest/boom.clj")
              (str tmp-root "/ldrtest/dedup.clj") (str tmp-root "/ldrtest/dedupab.clj")
-             (str tmp-root "/ldrtest/parky.clj")
+             (str tmp-root "/ldrtest/parky.clj") (str tmp-root "/ldrtest/sibling.clj")
              (str tmp-root "/ldrtest") tmp-root]]
     (try (.delete (java.io.File. p)) (catch Throwable _ nil))))
 
@@ -387,7 +454,8 @@
                      (into (cycle-failures))
                      (into (dosync-wait-failures))
                      (into (dosync-dedup-failures))
-                     (into (parked-load-failures)))]
+                     (into (parked-load-failures))
+                     (into (sibling-fiber-failures)))]
     (clean-up!)
     (if (seq failures)
       (do (doseq [f failures] (println "FAIL:" f))
@@ -395,6 +463,7 @@
           (System/exit 1))
       (println "CONCURRENT-REQUIRE OK" n-threads "threads on 1 namespace,"
                n-distinct "namespaces in parallel, cycle and dosync-wait not hung,"
-               "dosync dedups, a parked load finishes"))))
+               "dosync dedups, a parked load finishes for its owner and its"
+               "siblings"))))
 
 (-main)
