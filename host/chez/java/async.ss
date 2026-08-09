@@ -808,6 +808,11 @@
 ;; unmarked fn, but that stub is unreachable (the analyzer lowers every letfn form
 ;; before any macro runs) and this one is not. The overlay's defmacro replaces both
 ;; roots and re-marks them.
+;;
+;; The message names a BARE require, not a :refer. Requiring the namespace at all
+;; is what loads the overlay, and whoever reads this wrote the qualified call, so
+;; telling them to refer the name asks them to rewrite a call site that is already
+;; right. (require 'clojure.core.async) makes the very form that raised work.
 (let ((needs-overlay
        (lambda (nm)
          (lambda args
@@ -815,7 +820,7 @@
             (jolt-ex-info
              (string-append "clojure.core.async/" nm
                             " is defined by the clojure.core.async overlay: "
-                            "(require '[clojure.core.async :refer [" nm "]]) first")
+                            "(require 'clojure.core.async) first")
              (jolt-hash-map)))))))
   (cca-def! "go" (needs-overlay "go"))           (mark-macro! "clojure.core.async" "go")
   (cca-def! "go-loop" (needs-overlay "go-loop")) (mark-macro! "clojure.core.async" "go-loop"))
