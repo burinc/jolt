@@ -349,16 +349,28 @@
                          (when (fx<? i jch-n)
                            (jch-register-supers! (jch-name i) (list "t8.Base"))
                            (loop (fx+ i 1))))
-                       (let loop ((r 0))
+                       ;; t8.Base is grafted by the very first registration, so
+                       ;; once it is known it must STAY known — a half-built
+                       ;; jch-known-cache is what made this flip back to #f.
+                       ;;
+                       ;; LATCHED on the first #t this thread sees, not asserted
+                       ;; from a fixed round onward. Nothing makes a registrar
+                       ;; have run by round 20: jch-known? builds its table on
+                       ;; first call and caches it until a register invalidates
+                       ;; it, so an asker that gets there first legitimately
+                       ;; reads #f — and then keeps reading it off that cached
+                       ;; table every round. That is the CI failure, and it is
+                       ;; not the property. Latching still catches the bug this
+                       ;; scenario is for, which publishes an EMPTY table over a
+                       ;; complete one.
+                       (let loop ((r 0) (seen? #f))
                          (when (fx<? r 200)
-                           ;; t8.Base is grafted by the very first registration, so
-                           ;; once it is known it must STAY known — a half-built
-                           ;; jch-known-cache is what made this flip back to #f
-                           (when (and (fx> r 20) (not (jch-known? "t8.Base")))
-                             (with-mutex jch-bad-mu (set! jch-bad (+ jch-bad 1))))
-                           (jch-closure (jch-name (fxmod r jch-n)))
-                           (jch-tags (jch-name (fxmod r jch-n)))
-                           (loop (fx+ r 1))))))
+                           (let ((known? (jch-known? "t8.Base")))
+                             (when (and seen? (not known?))
+                               (with-mutex jch-bad-mu (set! jch-bad (+ jch-bad 1))))
+                             (jch-closure (jch-name (fxmod r jch-n)))
+                             (jch-tags (jch-name (fxmod r jch-n)))
+                             (loop (fx+ r 1) (or seen? known?)))))))
                  120.0 "8. class-graph churn"))
 (ok "8. a known class never read back as unknown" (= jch-bad 0))
 (ok "8. every registration survived"
