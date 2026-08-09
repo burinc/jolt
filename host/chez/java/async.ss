@@ -798,9 +798,16 @@
 ;; namespace, so a bare (clojure.core.async/chan) resolves with no require and a
 ;; bare (clojure.core.async/go …) would report "No such var" from a namespace that
 ;; visibly exists. Reserve the two names with a stub that says what to do instead.
-;; NOT marked a macro, so the analyzer compiles the form as an ordinary call and
-;; the stub raises at run time; the overlay's defmacro replaces both roots and
-;; marks them. Same idiom natives-reader.ss uses for `letfn`.
+;; MARKED a macro, so it raises from the EXPANDER with the body still unevaluated.
+;; As a plain fn the stub was reached as an ordinary call, which evaluates the body
+;; as arguments first: (clojure.core.async/go (swap! a conj :x)) ran the swap! and
+;; then reported that nothing had, and a body that parks —
+;; (clojure.core.async/go (clojure.core.async/<! ch)) on an empty channel — blocked
+;; forever instead of reporting anything at all, which is worse than the "No such
+;; var" this exists to improve on. natives-reader.ss reserves `letfn` with an
+;; unmarked fn, but that stub is unreachable (the analyzer lowers every letfn form
+;; before any macro runs) and this one is not. The overlay's defmacro replaces both
+;; roots and re-marks them.
 (let ((needs-overlay
        (lambda (nm)
          (lambda args
@@ -810,8 +817,8 @@
                             " is defined by the clojure.core.async overlay: "
                             "(require '[clojure.core.async :refer [" nm "]]) first")
              (jolt-hash-map)))))))
-  (cca-def! "go" (needs-overlay "go"))
-  (cca-def! "go-loop" (needs-overlay "go-loop")))
+  (cca-def! "go" (needs-overlay "go"))           (mark-macro! "clojure.core.async" "go")
+  (cca-def! "go-loop" (needs-overlay "go-loop")) (mark-macro! "clojure.core.async" "go-loop"))
 
 ;; A channel is opaque, but it should still name itself: without these it fell to
 ;; the :object catch-all, so (class ch) was :object and pr printed #object[:object].
