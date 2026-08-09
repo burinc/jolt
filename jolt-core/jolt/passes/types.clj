@@ -98,14 +98,14 @@
    :source-reg? (atom false)
    :direct-link-defined (atom #{})
    :direct-link-fns (atom #{})
-   ;; the back-end gensym label counter and the per-def cache-cell collector — emit
-   ;; scratch, per-unit so a build's labels are deterministic without a process-global.
+   ;; the back-end gensym label counter — emit scratch, per-unit so a build's labels
+   ;; are deterministic without a process-global. Shared across threads on purpose:
+   ;; swap! is atomic, and one counter is what keeps a registered anon-fn name unique
+   ;; process-wide. The per-def cache-cell collector and constant pool that used to
+   ;; sit beside it are thread-bound vars in the back end (*cache-cells* /
+   ;; *const-pool*) — they are per-emit-session scratch that emit-with-cells swaps in
+   ;; and out, and sharing one of those across threads corrupts both threads' output.
    :gensym-counter (atom 0)
-   :cache-cells (atom nil)
-   ;; per-def constant pool: {emitted-expr -> binding-name} for pure constant
-   ;; constructions (keyword literals) hoisted out of their use sites, so a def
-   ;; builds each distinct constant once instead of at every evaluation.
-   :const-pool (atom nil)
    ;; jolt.passes.inline scratch: the fixpoint dirty flag run-passes reads/resets and
    ;; the alpha-rename counter for inlined binders.
    :dirty (atom false)

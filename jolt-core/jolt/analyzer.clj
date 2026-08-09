@@ -50,11 +50,13 @@
 (defn- uncompilable [why]
   (throw (str "jolt/uncompilable: " why)))
 
+;; Process-wide on purpose: an anon fn's generated name is REGISTERED (backend
+;; rname), so it has to be unique across every thread compiling, not just within one
+;; compilation. Read and bump in one swap! — reading the atom and then incrementing
+;; it is two steps, and two threads that interleaved between them got the same name.
 (def ^:private gensym-counter (atom 0))
 (defn- gen-name [prefix]
-  (let [n @gensym-counter]
-    (swap! gensym-counter inc)
-    (str "_r$" prefix n)))
+  (str "_r$" prefix (dec (swap! gensym-counter inc))))
 
 ;; The innermost list form currently being analyzed that carries reader position
 ;; metadata — what a diagnostic raised anywhere below it should name. Without it
@@ -72,13 +74,21 @@
 ;; Only forms that HAVE a line are recorded, so descending through a macro-built
 ;; form (which carries none) keeps the nearest enclosing real position rather than
 ;; erasing it.
-(def ^:private innermost-positioned-form (atom nil))
+;;
+;; The box is per COMPILATION, bound by `analyze` below, not one atom for the
+;; process. Shared, two threads compiling at once overwrote each other between the
+;; save and the restore, and a diagnostic from one namespace reported a line from
+;; whatever the other thread happened to be analyzing. The var holds the box rather
+;; than the form so the hot path stays what it was — one atom write per positioned
+;; form, not a thread-binding push per form, which is the cost the reference
+;; compiler pays to bind LINE/COLUMN in analyzeSeq.
+(def ^:dynamic *positioned-form-box* nil)
 
 ;; The position a diagnostic should carry: the innermost positioned form's, or nil
 ;; when nothing under analysis had reader metadata (a macro-built form, or a form
-;; handed straight to eval).
+;; handed straight to eval). nil box means nothing is under analysis on this thread.
 (defn current-form-position []
-  (let [f @innermost-positioned-form]
+  (let [f (when *positioned-form-box* @*positioned-form-box*)]
     (when (some? f) (form-position f))))
 
 (defn- empty-env [] {:locals #{} :hints {}})
@@ -1106,13 +1116,14 @@
 ;; normal return is deliberate: an escaping throw is on its way to the reporter,
 ;; which wants the position of the form that failed.
 (defn- analyze-list [ctx form env]
-  (if (some? (form-line form))
-    (let [prev @innermost-positioned-form]
-      (reset! innermost-positioned-form form)
-      (let [node (analyze-list* ctx form env)]
-        (reset! innermost-positioned-form prev)
-        node))
-    (analyze-list* ctx form env)))
+  (let [box *positioned-form-box*]
+    (if (and box (some? (form-line form)))
+      (let [prev @box]
+        (reset! box form)
+        (let [node (analyze-list* ctx form env)]
+          (reset! box prev)
+          node))
+      (analyze-list* ctx form env))))
 
 ;; A vector/map/set literal carrying reader metadata (^:foo {…}, ^{:tag :int} [1])
 ;; keeps it as a runtime value: wrap the collection node in (with-meta coll meta).
@@ -1159,12 +1170,17 @@
 
 (defn analyze
   ([ctx form]
-   (try
-     ;; Stamp the compile namespace on the TOP-LEVEL node so the back end can
-     ;; gate anon-fn naming/registration on it even for a non-def form (a def
-     ;; carries its own :ns). Invisible to emission unless read.
-     (assoc (analyze ctx form (empty-env)) :fnsrc-ns (compile-ns ctx))
-     (catch Throwable e (throw (as-analysis-diagnostic e)))))
+   ;; One position box per compilation, over the catch too — as-analysis-diagnostic
+   ;; reads it. `or` rather than a fresh box every time: an analyze that re-enters
+   ;; this arity (a macro analyzing a form it built) keeps the chain it is nested
+   ;; inside, which is what the single shared atom used to give it on one thread.
+   (binding [*positioned-form-box* (or *positioned-form-box* (atom nil))]
+     (try
+       ;; Stamp the compile namespace on the TOP-LEVEL node so the back end can
+       ;; gate anon-fn naming/registration on it even for a non-def form (a def
+       ;; carries its own :ns). Invisible to emission unless read.
+       (assoc (analyze ctx form (empty-env)) :fnsrc-ns (compile-ns ctx))
+       (catch Throwable e (throw (as-analysis-diagnostic e))))))
   ([ctx form env]
    (cond
      (form-literal? form) (const form)

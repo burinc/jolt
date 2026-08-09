@@ -347,12 +347,29 @@
 ;; def init is being emitted this holds an atom; each site appends a fresh cell name
 ;; (bound to #f in a let wrapping the def, so it persists across calls and is shared
 ;; by every invocation) and resolves into it on first use. nil outside a def (a site
-;; there falls back to a per-call resolve). Lives on the unit (:cache-cells).
+;; there falls back to a per-call resolve).
+;;
+;; THREAD-LOCAL, like every other piece of emit-session scratch in this file
+;; (*fnsrc-counter*, *callsites*, *tail?*, …) and like the reference compiler, which
+;; keeps its whole compilation state in thread-bound Vars. These two lived on the
+;; unit — one object for the whole process — and emit-with-cells swapped them in and
+;; out around each def. That save/restore is a read-modify-write on shared state, so
+;; two threads compiling at once traded collectors: one thread's hoisted constant was
+;; registered into the other's pool, the `let` that should have bound it never saw
+;; it, and a namespace that compiled cleanly alone died with "variable _kc$81 is not
+;; bound". Rebinding also unwinds on a throw, which the reset! pair did not — a
+;; failed emit used to leave the unit pointing at the abandoned def's collector, and
+;; every later def in the process appended cells to it.
+;;
+;; The gensym counter deliberately stays shared on the unit: swap! is atomic, and one
+;; counter per process is what keeps a registered anon-fn name globally unique.
+(def ^:dynamic *cache-cells* nil)
+(def ^:dynamic *const-pool* nil)
 
 ;; Emit a def's init (via the supplied thunk) under a fresh cache-cell collector,
 ;; then wrap the result in a let binding any cells its body registered so they
-;; persist in the def's closure. Saves/restores the outer collector for nested
-;; defs. Used by both the runtime def emit and the direct-link top-level emit.
+;; persist in the def's closure. The binding nests for nested defs and unwinds on a
+;; throw. Used by both the runtime def emit and the direct-link top-level emit.
 ;; Hoist a PURE CONSTANT construction out of its use site: the site emits a bare
 ;; variable read, and the def's wrapper binds it once. The pool is keyed by the
 ;; emitted expression, so a constant appearing at ten sites in one def is built
@@ -371,7 +388,7 @@
 ;;
 ;; Outside a def (no pool) the raw expression is returned unchanged.
 (defn- hoist-const [expr]
-  (let [pool @(:const-pool (cur))]
+  (let [pool *const-pool*]
     (if pool
       (or (get @pool expr)
           (let [nm (fresh-label "_kc$")]
@@ -382,13 +399,9 @@
 (defn- emit-with-cells [emit-thunk]
   (let [cells (atom [])
         pool (atom {})
-        prev @(:cache-cells (cur))
-        prev-pool @(:const-pool (cur))
-        _ (reset! (:cache-cells (cur)) cells)
-        _ (reset! (:const-pool (cur)) pool)
-        raw (emit-thunk)
-        _ (reset! (:cache-cells (cur)) prev)
-        _ (reset! (:const-pool (cur)) prev-pool)
+        raw (binding [*cache-cells* cells
+                      *const-pool* pool]
+              (emit-thunk))
         ;; constants bind eagerly (value first); lazy cache cells start #f. Sorted
         ;; by binding name so a build's output stays deterministic.
         consts (map (fn [p] (str "(" (val p) " " (key p) ")"))
@@ -1211,7 +1224,7 @@
                           dv (str "(" resolver-name " " (chez-str-lit (:devirt-type node)) " "
                                   (chez-str-lit (:devirt-proto node)) " " (chez-str-lit (:devirt-method node))
                                   " " r ")")
-                          cells @(:cache-cells (cur))
+                          cells *cache-cells*
                           ;; cache the resolved impl in a per-site cell when inside a
                           ;; def; else resolve per call. The cell carries (epoch . fn):
                           ;; each call compares its epoch against jolt-proto-epoch and
@@ -1242,7 +1255,7 @@
                     (let [r (fresh-label "_r$")
                           d (fresh-label "_d$")
                           v (fresh-label "_v$")
-                          cells @(:cache-cells (cur))
+                          cells *cache-cells*
                           proto (chez-str-lit (:proto node))
                           method (chez-str-lit (:method node))
                           apply-args (str/join " " (cons r (rest as)))]
@@ -1391,7 +1404,7 @@
               (not-any? #{"double"} (get shape :tags))))
        (let [s (get (ctor-shapes) (str (:ns fnode) "/" (:name fnode)))
              tag (:type s)
-             cells @(:cache-cells (cur))
+             cells *cache-cells*
              desc-lookup (str "(hashtable-ref chez-tag-desc " (chez-str-lit tag) " #f)")
              cached-desc (if cells
                            (let [c (fresh-label "_cdesc$")]
@@ -1556,7 +1569,7 @@
              ;; jolt-var-get throws on a forward-declared var). Outside a def,
              ;; resolve per access.
              :else
-             (let [cells @(:cache-cells (cur))
+             (let [cells *cache-cells*
                    nslit (chez-str-lit (:ns node)) nmlit (chez-str-lit (:name node))]
                (if (and (var-cache?) cells)
                  (let [c (fresh-label "_vc$")]
