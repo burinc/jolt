@@ -811,6 +811,31 @@
                      (make-message-condition
                       "jolt-fiber-resume*: the sm driver returned without completing the fiber"))))
        (else
+        ;; WHY THERE IS NO STACK TRUNCATION HERE.
+        ;;
+        ;; This fiber's continuation is rooted in the drain iteration that
+        ;; happened to dispatch it, so a parked fiber retains those frames and a
+        ;; LATER iteration resumes it by reinstating them. It is correct only
+        ;; because jolt-fiber-done! and jolt-fiber-dead! ESCAPE through the
+        ;; carrier's sched-k instead of returning: the stale frames are returned
+        ;; through, but never returned INTO. Nothing enforces that, so anything
+        ;; added below which completes a fiber by returning rather than escaping
+        ;; would resume a drain iteration that already finished.
+        ;;
+        ;; Swish makes this structural by cutting the stack at process entry
+        ;; (erlang.ss @thunk->cont, #%$current-stack-link #%$null-continuation).
+        ;; That was tried here and does not port: with the cut, every fiber
+        ;; shape — including one that merely returns a value — dies with
+        ;; "attempt to invoke shot one-shot continuation". Swish can do it
+        ;; because it builds a process's continuation ONCE at spawn in a frame
+        ;; made for it, and its scheduler resumes a stored continuation rather
+        ;; than calling a thunk inside its own dispatch frame, which is what
+        ;; happens here. Matching that shape means capturing each fiber's
+        ;; continuation eagerly at spawn, which gives up the property R0 chose
+        ;; deliberately and this file's header states: a fiber costs a stack
+        ;; segment from the moment it PARKS, not from the moment it is created.
+        ;;
+        ;; So the escape discipline above is the invariant. Keep it.
         (let ((r (guard (e (#t (jolt-fiber-dead! f e)))
                     ((jolt-fiber-thunk f)))))
           (jolt-fiber-done! f r)))))
