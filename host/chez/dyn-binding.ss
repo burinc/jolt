@@ -155,11 +155,18 @@
 ;; __local-var: a fresh free-standing var cell (not interned). with-local-vars
 ;; binds these as lexical locals; var-get/var-set read/write the root. Each gets a
 ;; unique name so two locals never compare/hash equal as map keys.
+;; The bump and the read are one step — "two locals never compare/hash equal" is
+;; the whole reason for the counter, and unlocked two threads draw the same
+;; number. See jolt-gensym in converters.ss.
 (define local-var-counter 0)
+(define local-var-mutex (make-mutex))
 (define local-var-meta (jolt-hash-map (keyword #f "dynamic") #t))
 (define (jolt-local-var . args)
-  (set! local-var-counter (fx+ local-var-counter 1))
-  (let ((c (make-var-cell "" (string-append "local-" (number->string local-var-counter))
+  (let ((c (make-var-cell "" (string-append "local-"
+                                            (number->string
+                                             (with-mutex local-var-mutex
+                                               (set! local-var-counter (fx+ local-var-counter 1))
+                                               local-var-counter)))
                           (if (pair? args) (car args) jolt-nil)
                           #t #f #f)))
     ;; Clojure builds these with Var/create + setDynamic, so a local var takes a

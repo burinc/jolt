@@ -172,8 +172,14 @@
                (let [a (:pending @state)]
                  (swap! state assoc :pending {})
                  a))]
+    ;; The changelist is sized to nch, not to a fixed 256. :pending holds one
+    ;; entry per fd and nothing caps it, so a round that drains more than 256
+    ;; registrations wrote past the end of the buffer and then told the kernel to
+    ;; read that many entries — heap corruption, not a dropped registration. The
+    ;; event buffer below is a different thing: 256 is the count passed to
+    ;; kevent/epoll_wait as the most events to report, so it bounds itself.
     (let [nch (+ (count adds) (count to-delete))
-          chbuf (when (and macos? (pos? nch)) (ffi/alloc (* 256 KEVENT-SIZE)))]
+          chbuf (when (and macos? (pos? nch)) (ffi/alloc (* nch KEVENT-SIZE)))]
       (try
         (when chbuf
           (let [i (atom 0)]

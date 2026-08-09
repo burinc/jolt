@@ -394,10 +394,18 @@
 ;; the syntax-quote specials + resolver live in reader.ss (jsq-specials /
 ;; jsq-resolve-symbol), shared with the read-string data path.
 
+;; The bump and the read are one step. This one runs during COMPILATION, which is
+;; now parallel across namespaces, and unlocked two threads draw the same number
+;; — see jolt-gensym in converters.ss.
 (define hc-sq-gensym-counter 0)
+(define hc-sq-gensym-mutex (make-mutex))
 (define (hc-sq-gensym base)
-  (set! hc-sq-gensym-counter (+ hc-sq-gensym-counter 1))
-  (jolt-symbol #f (string-append base "__" (number->string hc-sq-gensym-counter) "__auto")))
+  (jolt-symbol #f (string-append base "__"
+                                 (number->string
+                                  (with-mutex hc-sq-gensym-mutex
+                                    (set! hc-sq-gensym-counter (+ hc-sq-gensym-counter 1))
+                                    hc-sq-gensym-counter))
+                                 "__auto")))
 
 (define (hc-sym nm) (jolt-symbol #f nm))
 ;; is `x` a non-empty list FORM whose head is the unqualified symbol `nm`?

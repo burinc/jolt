@@ -548,10 +548,18 @@
 ;; fixed arity is the MAX positional used (Clojure: #(do %2 %&) -> [p1 p2 & rest]).
 ;; Param names carry a trailing "#" so a #() inside a syntax-quote still reads them
 ;; as auto-gensyms.
+;; The bump and the read are one step, like every other name counter in the
+;; runtime: unlocked, two threads reading a form at once draw the same number and
+;; the "#" auto-gensym these mint is no longer unique. See jolt-gensym.
 (define rdr-anon-counter 0)
+(define rdr-name-counter-mutex (make-mutex))
 (define (rdr-anon-gensym)
-  (set! rdr-anon-counter (+ rdr-anon-counter 1))
-  (jolt-symbol #f (string-append "p__" (number->string rdr-anon-counter) "#")))
+  (jolt-symbol #f (string-append "p__"
+                                 (number->string
+                                  (with-mutex rdr-name-counter-mutex
+                                    (set! rdr-anon-counter (+ rdr-anon-counter 1))
+                                    rdr-anon-counter))
+                                 "#")))
 (define (rdr-pct-index nm)               ; % ->1, %& ->'rest, %N ->N, else #f
   (cond ((string=? nm "%") 1)
         ((string=? nm "%&") 'rest)
@@ -1077,8 +1085,12 @@
 
 (define rdr-sq-gensym-counter 0)
 (define (rdr-sq-gensym base)
-  (set! rdr-sq-gensym-counter (fx+ rdr-sq-gensym-counter 1))
-  (jolt-symbol #f (string-append base "__" (number->string rdr-sq-gensym-counter) "__auto")))
+  (jolt-symbol #f (string-append base "__"
+                                 (number->string
+                                  (with-mutex rdr-name-counter-mutex
+                                    (set! rdr-sq-gensym-counter (fx+ rdr-sq-gensym-counter 1))
+                                    rdr-sq-gensym-counter))
+                                 "__auto")))
 
 ;; special forms / interop heads stay bare in backquote, like the JVM reader
 ;; The one list of names a syntax-quote leaves BARE (not namespace-qualified):

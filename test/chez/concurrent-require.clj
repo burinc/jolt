@@ -21,19 +21,25 @@
 ;; ever runs, so it exercises none of what happens when two do. Loading distinct
 ;; namespaces in parallel broke two ways, and both are gated on this file now:
 ;;
-;;   C. every require completes. The compiler's emit session is one process-global
-;;      unit and emit-with-cells save/restores its slots per def, so two threads
-;;      emitting at once trade constant pools and a namespace that compiles fine
-;;      alone dies on "variable _kc$81 is not bound". The require gate serializes
-;;      loads for exactly this reason.
+;; The gate is per NAMESPACE, not one lock over every load: ldr-load-mu is held
+;; only across the begin/end bookkeeping and the load itself runs unlocked, which
+;; is the point of taking JLS 12.4.2 per namespace rather than Clojure's single
+;; RT.REQUIRE_LOCK. So the threads below really are compiling at the same time,
+;; and C and D are both live.
+;;
+;;   C. every require completes. The compiler's emit session used to live on one
+;;      process-global unit, with emit-with-cells save/restoring its slots per
+;;      def, so two threads emitting at once traded constant pools and a namespace
+;;      that compiled fine alone died on "variable _kc$81 is not bound". The fix
+;;      is not a lock: *cache-cells* and *const-pool* are thread-bound vars in
+;;      backend_scheme now, so each thread's emit session is its own.
 ;;   D. every namespace is in *loaded-libs* afterwards. The loader used to conj
 ;;      the ref with a bare read-modify-write, so two threads finishing together
 ;;      dropped one of the two marks — and a namespace missing from *loaded-libs*
 ;;      reads as unloaded and runs its top level again on the next require, which
 ;;      is the bug A tests for, arriving through the other table. A separate probe
-;;      lost 3 to 15 of 24 that way. This assertion does not isolate it while the
-;;      gate stands (C fails first, and with the gate no two marks overlap), so it
-;;      is here as the check that starts carrying weight the day the gate goes.
+;;      lost 3 to 15 of 24 that way. Twelve loads finishing at once do overlap
+;;      here, so this is the check for it and not a placeholder.
 ;;   E. two threads entering one require cycle from opposite ends report it instead
 ;;      of hanging, and one of them still completes. This is where the JVM gives up
 ;;      and deadlocks; the loader walks its wait-for graph before blocking.

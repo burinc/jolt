@@ -1520,11 +1520,20 @@
           obj)
          ((string=? method-name "getMethod")
           (or (hashtable-ref (jolt-multifn-methods obj) (car rest) #f) jolt-nil))
+         ;; keys AND values in one critical section, like jolt-methods-setup —
+         ;; snapshotting only the keys and reffing each one afterwards let a
+         ;; remove-method landing in between answer #f, and that raw Scheme false
+         ;; went into the returned map as the value for a dispatch value that no
+         ;; longer has a method.
          ((string=? method-name "getMethodTable")
-          (let ((tbl (jolt-multifn-methods obj)) (m (jolt-hash-map)))
-            (vector-for-each (lambda (k) (set! m (jolt-assoc1 m k (hashtable-ref tbl k #f))))
-                             (with-mutex mm-tbl-mu (hashtable-keys tbl)))
-            m))
+          (let* ((tbl (jolt-multifn-methods obj))
+                 (kv (with-mutex mm-tbl-mu
+                       (let-values (((ks vs) (hashtable-entries tbl))) (cons ks vs))))
+                 (ks (car kv)) (vs (cdr kv)))
+            (let loop ((i 0) (m (jolt-hash-map)))
+              (if (fx>=? i (vector-length ks))
+                  m
+                  (loop (fx+ i 1) (jolt-assoc1 m (vector-ref ks i) (vector-ref vs i)))))))
          ((string=? method-name "toString") (jolt-str-render-one obj))
          (else (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name " on MultiFn")))))
       ((and (jrec? obj) (find-method-any-protocol-arity (jrec-tag obj) method-name (+ 1 (length rest))))
