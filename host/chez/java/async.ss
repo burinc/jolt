@@ -577,6 +577,14 @@
 ;; The host setter jolt-fiber-carrier-count-set! writes this same root, so the
 ;; two knobs never disagree. The pool starts once per process.
 (def-var! "clojure.core.async" "*fiber-carrier-count*" jolt-nil)
+;; Preemption quantum, in Chez engine ticks (fibers.ss reads this root; the host
+;; setter jolt-fiber-preempt-ticks-set! writes it, so the two never disagree).
+;; jolt-nil or 0 means COOPERATIVE ONLY, which is the default and the behaviour
+;; every existing program has: a fiber leaves its carrier only at a channel op.
+;; A positive fixnum arms a timer per dispatch, so a compute-bound go block
+;; yields instead of pinning its carrier. Opt-in because it changes when a fiber
+;; can lose its carrier.
+(def-var! "clojure.core.async" "*fiber-preempt-ticks*" jolt-nil)
 (define (go-backend-current)
   (let ((cell (var-cell-lookup "clojure.core.async" "*go-backend*")))
     (if (and cell (var-cell-defined? cell))

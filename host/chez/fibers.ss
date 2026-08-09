@@ -275,8 +275,8 @@
 (define-record-type jolt-carrier
   (fields mu cv (mutable head) (mutable tail)
           (mutable sched-k) sched-slice (mutable thread) (mutable stop?)
-          (mutable sm-parks) (mutable chan-parks))
-  (nongenerative jolt-carrier-v2))
+          (mutable sm-parks) (mutable chan-parks) (mutable preempts))
+  (nongenerative jolt-carrier-v3))
 
 ;; (jolt-fiber-bump-sm-parks! f) / (jolt-fiber-bump-chan-parks! f) — called by the
 ;; parking fiber, on its own carrier's field, so no two threads touch one field.
@@ -368,7 +368,7 @@
         (do ((i 0 (fx+ i 1))) ((fx=? i n))
           (vector-set! v i
             (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
-                               (make-jolt-dslice #f #f #f) #f #f 0 0)))
+                               (make-jolt-dslice #f #f #f) #f #f 0 0 0)))
         (set! jolt-fiber-carriers v)))
     (mutex-release jolt-fiber-rr-mu)))
 
@@ -390,26 +390,46 @@
 ;; jolt-fiber-enqueue!/locked: mu must already be held. The empty→non-empty
 ;; transition signals the carrier's condition so a parked carrier wakes (the
 ;; wake is exactly the R4 design: check and wait hold the same mutex).
+;; Both run with INTERRUPTS DISABLED, which matters once preemption is on
+;; (jolt-fiber-preempt-ticks below). Two reasons, and the second is the sharper:
+;;
+;;   - the empty->non-empty enqueue writes head and then tail, and the dequeue
+;;     reads both. A timer firing between the two writes leaves head set with
+;;     tail stale, which breaks (head = #f) <=> (tail = #f) and loses fibers.
+;;   - these use explicit mutex-acquire / mutex-release and NOT with-mutex, so
+;;     there is no dynamic-wind to release the lock. A preemption in the middle
+;;     parks the fiber still holding the carrier's queue mutex, and the carrier
+;;     that must dequeue it is the one now blocked on that mutex. That is a
+;;     deadlock, not a lost update.
+;;
+;; Chez defers a timer interrupt while interrupts are disabled rather than
+;; dropping it, so nothing is lost: the preemption lands at the enable.
 (define (jolt-fiber-enqueue! c f)
-  (mutex-acquire (jolt-carrier-mu c))
-  (if (jolt-carrier-tail c)
-      (begin (jolt-fiber-next-set! (jolt-carrier-tail c) f)
-             (jolt-carrier-tail-set! c f))
-      (begin (condition-signal (jolt-carrier-cv c))
-             (jolt-carrier-head-set! c f)
-             (jolt-carrier-tail-set! c f)))
-  (mutex-release (jolt-carrier-mu c)))
+  (let ((preempting? (and jolt-fiber-preempt-ticks-global #t)))
+    (when preempting? (disable-interrupts))
+    (mutex-acquire (jolt-carrier-mu c))
+    (if (jolt-carrier-tail c)
+        (begin (jolt-fiber-next-set! (jolt-carrier-tail c) f)
+               (jolt-carrier-tail-set! c f))
+        (begin (condition-signal (jolt-carrier-cv c))
+               (jolt-carrier-head-set! c f)
+               (jolt-carrier-tail-set! c f)))
+    (mutex-release (jolt-carrier-mu c))
+    (when preempting? (enable-interrupts))))
 
 (define (jolt-fiber-dequeue! c)
-  (mutex-acquire (jolt-carrier-mu c))
-  (let ((f (jolt-carrier-head c)))
-    (when f
-      (jolt-carrier-head-set! c (jolt-fiber-next f))
-      (unless (jolt-carrier-head c) (jolt-carrier-tail-set! c #f))
-      ;; clear the link so a completed fiber does not retain the queue
-      (jolt-fiber-next-set! f #f))
-    (mutex-release (jolt-carrier-mu c))
-    f))
+  (let ((preempting? (and jolt-fiber-preempt-ticks-global #t)))
+    (when preempting? (disable-interrupts))
+    (mutex-acquire (jolt-carrier-mu c))
+    (let ((f (jolt-carrier-head c)))
+      (when f
+        (jolt-carrier-head-set! c (jolt-fiber-next f))
+        (unless (jolt-carrier-head c) (jolt-carrier-tail-set! c #f))
+        ;; clear the link so a completed fiber does not retain the queue
+        (jolt-fiber-next-set! f #f))
+      (mutex-release (jolt-carrier-mu c))
+      (when preempting? (enable-interrupts))
+      f)))
 
 ;; The three thread parameters that make up a fiber's dynamic slice live in
 ;; other host files (dyn-binding.ss's dyn-binding-stack, multimethods.ss's
@@ -553,6 +573,109 @@
       (jolt-fiber-enqueue! c f)
       f)))
 
+;; --- preemption (swish's quantum, erlang.ss:872 and @yield) ------------------
+;; Without this a fiber only ever leaves its carrier at a channel op, so a
+;; compute-bound go block pins that carrier for as long as it runs and every
+;; fiber queued behind it is stranded. Growing the pool does not help — R0(d)
+;; pins a fiber to its carrier, so nothing can migrate the stranded work.
+;;
+;; Swish solves it with a quantum: set-timer at every restart point, and the
+;; timer handler forces a yield. Chez polls the engine timer at procedure calls
+;; and loop back-edges, so even a tight Scheme loop is preemptible — the same
+;; mechanism jolt already uses for thread interrupt (concurrency.ss
+;; jolt-run-interruptible).
+;;
+;; OFF BY DEFAULT. This changes when a fiber can lose its carrier, which is a
+;; behavioural change for every existing program, so it is opt-in: set the tick
+;; count via clojure.core.async/*fiber-preempt-ticks* or the host setter. #f or
+;; 0 means cooperative-only, exactly as before.
+;;
+;; What preemption does NOT fix: a fiber inside a blocking foreign call cannot
+;; be preempted, because the timer is only polled in Scheme. Parkable IO
+;; (stdlib/jolt/io_poller.clj) is the answer there, not this.
+;; The tick count is CACHED in a plain global, and every hot path reads that and
+;; nothing else. This is not premature: the first version consulted the var on
+;; each dispatch and wrapped the queue ops unconditionally, which took a yield
+;; from 211 ns to 556 ns — a 2.6x tax paid by every program for a feature that
+;; is off by default. Reading one global costs a load and a branch, so with
+;; preemption off the whole mechanism is invisible.
+;;
+;; The cost is that setting the VAR directly only takes effect at the next
+;; refresh (pool start, or jolt-fiber-preempt-ticks-set!). That is the same
+;; contract *fiber-carrier-count* already documents: set it before the first
+;; :fiber go, or between a pool reset and the next one. The host setter updates
+;; both and is always immediate.
+(define jolt-fiber-preempt-ticks-global #f)
+(define (jolt-fiber-preempt-ticks) jolt-fiber-preempt-ticks-global)
+(define (jolt-fiber-preempt-refresh!)
+  (let ((v (guard (e (#t #f))
+             (let ((cell (var-cell-lookup "clojure.core.async" "*fiber-preempt-ticks*")))
+               (if (and cell (var-cell-defined? cell)) (var-cell-root cell) #f)))))
+    (when (and (fixnum? v) (fx>? v 0))
+      (set! jolt-fiber-preempt-ticks-global v))))
+(define (jolt-fiber-preempt-ticks-set! n)
+  (when (and n (not (and (fixnum? n) (fx>? n 0))))
+    (error 'jolt-fiber-preempt-ticks-set!
+           "preempt ticks must be a positive fixnum or #f" n))
+  (set! jolt-fiber-preempt-ticks-global n)
+  (guard (e (#t #f))
+    (let ((cell (var-cell-lookup "clojure.core.async" "*fiber-preempt-ticks*")))
+      (when (and cell (var-cell-defined? cell))
+        (var-cell-root-set! cell n)))))
+
+;; How many times the pool has preempted a fiber. Like the park counters this
+;; is per carrier so no two threads touch one field; summed by
+;; jolt-fiber-preempts. Used by the gate to prove preemption actually fired
+;; rather than the test merely finishing.
+(define (jolt-fiber-bump-preempts! f)
+  (let ((c (jolt-fiber-carrier f)))
+    (jolt-carrier-preempts-set! c (+ 1 (jolt-carrier-preempts c)))))
+(define (jolt-fiber-preempts) (jolt-carrier-total jolt-carrier-preempts))
+
+;; The handler. Runs on the carrier thread when its quantum expires.
+;;
+;; The off-fiber case is not just a guard, it is what makes the park paths safe:
+;; jolt-fiber-to-scheduler! and jolt-sm-park! both clear the current-fiber vreg
+;; BEFORE they touch the winder chain and escape, so a timer landing anywhere in
+;; that window sees no fiber and does nothing. Without it, a preemption inside
+;; jolt-park-drop-finallys! would be a park that re-enters the chain
+;; read-modify-write and clobbers it with a stale value when the fiber resumes.
+;;
+;; A preempted fiber always takes the CONTINUATION path, never the sm cheap
+;; park: the cheap park stores a pending step, and a timer fires at an arbitrary
+;; point where there is no step to store. It also does not bump the sm/chan park
+;; counters — run-gosm.ss asserts exact deltas on those, and a preemption is
+;; neither kind of park.
+(define (jolt-fiber-preempt-handler)
+  (let ((f (jolt-current-fiber))
+        (ticks jolt-fiber-preempt-ticks-global))
+    (cond
+      ((not (and f ticks))
+       ;; off-fiber, or preemption turned off mid-flight: re-arm only if still on
+       (when ticks (set-timer ticks))
+       (void))
+      (else
+       (jolt-fiber-bump-preempts! f)
+       (jolt-fiber-state-set! f 'ready)
+       (jolt-fiber-enqueue! (jolt-fiber-carrier f) f)
+       ;; re-armed by jolt-fiber-arm-preempt! when this fiber is next dispatched
+       (jolt-fiber-to-scheduler! f)))))
+
+;; Arm around a dispatch, disarm on the way back to the drain loop, so the
+;; scheduler itself is never preempted. Installing the handler per dispatch
+;; rather than once per carrier keeps this composable with
+;; jolt-run-interruptible, which saves and restores the handler around its own
+;; thunk; the cost is that a run-interruptible inside a fiber leaves the timer
+;; disarmed (it ends with set-timer 0), so that fiber runs cooperatively until
+;; its next dispatch.
+(define (jolt-fiber-arm-preempt!)
+  (let ((ticks jolt-fiber-preempt-ticks-global))
+    (when ticks
+      (timer-interrupt-handler jolt-fiber-preempt-handler)
+      (set-timer ticks))))
+(define (jolt-fiber-disarm-preempt!)
+  (when jolt-fiber-preempt-ticks-global (set-timer 0)))
+
 ;; --- the scheduler ----------------------------------------------------------
 ;; Resume (or first-run) fiber f on ITS carrier's thread, returning to the
 ;; loop when f parks, finishes, or dies.
@@ -569,7 +692,11 @@
         ;; it (for a resume, before its continuation re-enters — the dynamic-wind
         ;; before-thunks then re-fire over the restored values)
         (jolt-fiber-slice-restore! (jolt-fiber-slice f))
+        (jolt-fiber-arm-preempt!)
         (jolt-fiber-resume* f)))
+    ;; Disarm FIRST: everything below runs on the scheduler, which must never be
+    ;; preempted (a timer here would park the carrier's own loop).
+    (jolt-fiber-disarm-preempt!)
     ;; Back on the scheduler: whatever escape brought us here is over.
     (jolt-park-unwinding-set! #f)
     ;; The fiber parked, finished, or died: its setter-written dynamic state
@@ -714,6 +841,7 @@
   (mutex-acquire jolt-fiber-pool-mu)
   (unless jolt-fiber-pool-started?
     (set! jolt-fiber-pool-started? #t)
+    (jolt-fiber-preempt-refresh!)
     (jolt-fiber-ensure-carriers!)
     (let ((v jolt-fiber-carriers) (n (vector-length jolt-fiber-carriers)))
       (do ((i 0 (fx+ i 1))) ((fx=? i n))
