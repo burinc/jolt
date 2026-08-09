@@ -97,6 +97,79 @@
 (define x-qquote (go-expansion "(go (clojure.core/quote (<! ch)))"))
 (gate-check "qualified quote: datum not evaluated" (gate-sub? x-qquote "__sm-") #f)
 
+;; A BACKTICK is jolt's other quoting special form. jolt's reader leaves it as
+;; (syntax-quote datum) for the analyzer, where the JVM's reader expands it during
+;; read — so it is absent from clojure.core/special-syms, which is where sm-opaque
+;; came from. Missing, the datum fell to sm-cps's :else arm and was rebuilt as an
+;; application: the park inside it became a REAL take and the value came back as a
+;; syntax-quoted gensym. Both spellings, since the reader's is unqualified and a
+;; macro's syntax-quote can qualify it.
+(define x-sq (go-expansion "(go (list `(<! ch) :done))"))
+(gate-check "syntax-quote: datum not evaluated" (gate-sub? x-sq "__sm-take") #f)
+(gate-check "syntax-quote: datum survives whole" (gate-sub? x-sq "(<! ch)") #t)
+(define x-qsq (go-expansion "(go (list (clojure.core/syntax-quote (<! ch)) :done))"))
+(gate-check "qualified syntax-quote: datum not evaluated" (gate-sub? x-qsq "__sm-take") #f)
+;; and the value, on both backends, against a channel that stays UNDRAINED
+(define sq-val
+  (ev (string-append
+       "(let [c (clojure.core.async/chan 1)]"
+       "  (clojure.core.async/>!! c 99)"
+       "  (binding [clojure.core.async/*go-backend* :fiber]"
+       "    (let [v (clojure.core.async/<!! (clojure.core.async/go (list `(<! c) :done)))]"
+       "      (pr-str [v (clojure.core.async/poll! c)]))))")))
+(gate-check "syntax-quote: datum is data, channel untouched" sq-val
+            "[((clojure.core.async/<! user/c) :done) 99]")
+
+;; loop* bindings are SEQUENTIAL — analyze-bindings threads each into the env the
+;; next is analyzed in — so a later init means the name above it, not whatever the
+;; enclosing scope calls that name. Built as a flat argument list to the loop fn,
+;; every init landed outside the loop's scope instead. Pinned with an outer `a` in
+;; scope, because that is the shape that comes back wrong rather than failing to
+;; compile: unfixed this reads :outer-a and answers [:wrong :outer-a-inc].
+(ev "(def a :outer-a)")
+(define seq-init
+  (ev (string-append
+       "(let [c (clojure.core.async/chan 1)]"
+       "  (clojure.core.async/>!! c 100)"
+       "  (binding [clojure.core.async/*go-backend* :fiber]"
+       "    (pr-str (clojure.core.async/<!! (clojure.core.async/go"
+       "      (loop [a 1 b (inc a)]"
+       "        (if (= b 2) [b (clojure.core.async/<! c)] [:wrong a])))))))")))
+(gate-check "loop: a later init sees the binding above it" seq-init "[2 100]")
+;; the same, with the init that the next one depends on PARKING
+(define seq-init-park
+  (ev (string-append
+       "(let [c (clojure.core.async/chan 1)]"
+       "  (clojure.core.async/>!! c 5)"
+       "  (binding [clojure.core.async/*go-backend* :fiber]"
+       "    (pr-str (clojure.core.async/<!! (clojure.core.async/go"
+       "      (loop [a (clojure.core.async/<! c) b (inc a)] [a b]))))))")))
+(gate-check "loop: a later init sees a PARKING binding above it" seq-init-park "[5 6]")
+
+;; The set sm-opaque has to complement is the ANALYZER's, not the portable
+;; clojure.core/special-syms it was written from. Every head analyze-list*
+;; dispatches to a special form and the pass does not rewrite must be opaque to
+;; it, or that head falls to sm-cps's :else arm and is rebuilt as an ordinary
+;; application. Asserted against the live vars rather than restated here, so a
+;; special form added to the analyzer fails THIS check on the day it lands
+;; instead of miscompiling a go body later. syntax-quote is how the gap was
+;; found: jolt lowers a backtick as a special form, the JVM's reader expands it
+;; during read, so special-syms never named it.
+(ev "(def sm-rewrites #{\"do\" \"let*\" \"if\" \"loop*\" \"recur\"})")
+(gate-check "every analyzer special form is rewritten or opaque to the pass"
+            (ev (string-append
+                 "(pr-str (sort (remove (fn [s] (contains? clojure.core.async/sm-opaque (symbol s)))"
+                 "                      (remove sm-rewrites jolt.analyzer/handled))))"))
+            "()")
+;; and the other direction is not asserted on purpose: sm-opaque names heads the
+;; analyzer handles elsewhere (new, ., case*, deftype*, reify*, import*, catch,
+;; finally), and listing extras only ever costs a park its cheap representation.
+(gate-check "the pass rewrites exactly the five heads it claims"
+            (ev (string-append
+                 "(pr-str (sort (filter (fn [s] (contains? clojure.core.async/sm-opaque (symbol s)))"
+                 "                      sm-rewrites)))"))
+            "()")
+
 ;; --- 2. the counters, on the :fiber backend ---------------------------------
 (printf "\n== 2. cheap parks vs captures, per park site ==\n")
 ;; A helper the pass cannot see through. Its <! parks by capturing.

@@ -51,15 +51,24 @@
 ;; a park-free one is emitted whole.
 ;;
 ;; This is clojure.core/special-syms minus the five heads the pass DOES rewrite
-;; (do let* if loop* recur), plus defmacro and import*. Listing the rest
-;; exhaustively is the point: a special form that falls through to sm-cps's
+;; (do let* if loop* recur), plus defmacro, import* and syntax-quote. Listing the
+;; rest exhaustively is the point: a special form that falls through to sm-cps's
 ;; :else arm is rebuilt as an ordinary application, which evaluates its subforms
 ;; as expressions — a silent miscompile. case* / deftype* / reify* are
 ;; unreachable today (jolt's `case` expands to let* + if, `reify` to a
 ;; (make-reified {...} "iface") call), so they are here to make the fallback true
 ;; by construction rather than by accident of how those macros expand.
+;;
+;; syntax-quote is the one head special-syms does not name and jolt still lowers
+;; as a special form, because jolt's reader leaves a backtick as
+;; (syntax-quote datum) for the analyzer while the JVM's reader expands it during
+;; read. So the set to complement is jolt's analyzer `handled`, not the portable
+;; special-syms, and dropping the difference cost `(go (list `(<! ch) :done))` its
+;; meaning: the datum is data, but the :else arm rebuilt it as an application,
+;; CPS'd the (<! ch) inside it into a real take, and syntax-quoted the resulting
+;; gensym — so the channel was drained and the value came back (user/a__257 :done).
 (def ^:private sm-opaque
-  '#{quote try catch finally fn* letfn* set! def defmacro throw var
+  '#{quote syntax-quote try catch finally fn* letfn* set! def defmacro throw var
      monitor-enter monitor-exit new . & case* deftype* reify* import*})
 
 ;; recur inside one of these targets it, not an enclosing loop.
@@ -220,17 +229,37 @@
 
 (defn- sm-cps-loop
   "loop* becomes a letfn* function called in tail position, so a recur chain is a
-  tail call and does not grow the stack across parks."
+  tail call and does not grow the stack across parks.
+
+  The inits bind SEQUENTIALLY under the loop's own names, exactly as sm-cps-let
+  does and as the analyzer reads loop* — analyze-bindings threads each binding
+  into the env the next one is analyzed in, so (loop [a 1 b (inc a)] …) is legal
+  and b's init means the a above it. Evaluating them as a flat argument list
+  instead put every init in the scope OUTSIDE the loop, where that `a` is
+  whatever `a` the enclosing scope happens to have: a compile error if there is
+  none, and silently the wrong value if there is one."
   [ctx bindings body k]
   (let [names (vec (take-nth 2 bindings))
-        inits (vec (take-nth 2 (rest bindings)))
         lp (gensym "lp__")]
-    (sm-cps-seq ctx inits
-                (fn [c args]
-                  (let [c' (assoc (sm-bind* (sm-bind c lp) names)
-                                  :rec {:name lp :n (count names)})]
-                    (list 'letfn* [lp (list 'fn* names (sm-cps-body c' body k))]
-                          (apply list lp args)))))))
+    (letfn [(enter [c]
+              (let [c' (assoc (sm-bind* (sm-bind c lp) names)
+                              :rec {:name lp :n (count names)})]
+                (list 'letfn* [lp (list 'fn* names (sm-cps-body c' body k))]
+                      ;; the names are the let*/continuation bindings built above;
+                      ;; the fn's params shadow them inside the body
+                      (apply list lp names))))
+            (step [c pairs]
+              (if (empty? pairs)
+                (enter c)
+                (let [b (first pairs)
+                      init (second pairs)
+                      more (drop 2 pairs)]
+                  (if (sm-inline-ok? c init)
+                    (list 'let* [b init] (step (sm-bind c b) more))
+                    (sm-kont c b
+                             (fn [c2] (step c2 more))
+                             (fn [c2 ks] (sm-cps c2 init ks)))))))]
+      (step ctx (seq bindings)))))
 
 (defn- sm-cps-if
   [ctx form k]
