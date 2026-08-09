@@ -442,16 +442,42 @@
 ;; though no cache cell would be registered.
 (def ^:private repeat-ops #{:loop :recur})
 
+;; Keys whose value is PAYLOAD hanging off a node rather than IR under it. They
+;; have to be skipped, and :src-form is not an optimization — it is the difference
+;; between linear and quadratic. Every :fn node carries its whole source form, so a
+;; fn literal written inside another is in both, and walking them all costs the sum
+;; of the subtree sizes. 240 nested literals spent 89 ms of a 90 ms emit right here,
+;; and it showed up as 633k reads of clojure.core/map?, sequential?, vector? and
+;; seq? — this walk's own operations, called O(source size) times per fn.
+;;
+;; Skipping it cannot lose a loop. :src-form is the SOURCE the image rebuilds a
+;; closure from; a loop written in it is already in the IR under :arities, which is
+;; walked. :free-names is a vector of name strings and holds no nodes at all.
+;; Checked rather than asserted: over 247 top-level forms from eight real files the
+;; two walks never disagreed.
+;;
+;; They CAN disagree in one direction, and it is the harmless one. A source form
+;; carrying a map literal that happens to look like IR — (fn [] {:op :loop}) — used
+;; to answer "repeats" off the DATA, and now does not. The wrapper this drives is an
+;; optimization, so the old answer only bought that form some cache cells it could
+;; not use; nothing reads the cells that is not also emitted by the same pass. A
+;; quoted {:op :recur} still answers true, through the :quote node rather than
+;; through :src-form — pre-existing, equally harmless, and left alone.
+(def ^:private node-payload-keys #{:src-form :free-names})
+
 (defn- node-tree-any?
   "Does any node in this tree satisfy pred? Walks map values and sequential
-  children, which covers every shape the analyzer builds."
+  children, which covers every shape the analyzer builds — minus the payload keys
+  above, which hold source and names rather than IR."
   [pred x]
   (cond
     (and (map? x) (:op x) (pred x)) true
     ;; a :const holds a literal, which cannot contain a loop and can be arbitrarily
     ;; large (a 10k-element vector literal at top level). Stop rather than walk it.
     (and (map? x) (= :const (:op x))) false
-    (map? x) (boolean (some (fn [v] (node-tree-any? pred v)) (vals x)))
+    (map? x) (boolean (some (fn [e] (and (not (contains? node-payload-keys (key e)))
+                                         (node-tree-any? pred (val e))))
+                            x))
     (sequential? x) (boolean (some (fn [v] (node-tree-any? pred v)) x))
     :else false))
 
