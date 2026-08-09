@@ -18,16 +18,38 @@
 (define (jolt-nil? x) (jolt-nil-t? x))
 (define (jolt-some? x) (not (jolt-nil-t? x)))
 
-;; --- truthiness: only nil and false are falsey -------------------------------
+;; --- the exit-only-cleanup marker --------------------------------------------
 ;; A fiber park is a continuation escape that is NOT an exit — the computation
 ;; resumes where it left off. try/finally lowers to dynamic-wind, so its
 ;; after-thunk fires on that escape and would run the cleanup mid-operation: a
 ;; with-open closing a file that is still in use, a lock released while still
-;; held. The emitted after-thunk therefore asks this predicate first and skips
-;; the finally while a park is unwinding. The Chez fiber scheduler installs the
-;; real one (per-carrier, off a virtual register); on a host with no fibers it
-;; stays #f and finally runs exactly as before. It must NOT be true for any other
-;; escape — an interrupt abort is a real exit and its finally has to run.
+;; held.
+;;
+;; This procedure is the MARK that says so. The back end emits it as the `in`
+;; thunk of every finally's dynamic-wind (backend_scheme.clj emit-try), and a
+;; park drops exactly the winders whose `in` is eq? to it before escaping
+;; (fibers.ss jolt-park-winders), so those after-thunks never run on a park.
+;; The identity is the whole mechanism, so it must stay ONE shared top-level
+;; procedure: a fresh (lambda () #f) per site would compare unequal and the
+;; finally would run mid-park again.
+;;
+;; It has to be a marker and not a record-type test, because Chez tags every
+;; dynamic-wind alike: with-mutex is a plain `winder` too, and loader.ss's
+;; ldr-wait-for-load! deliberately relies on with-mutex releasing its lock on a
+;; park and re-acquiring it on resume. Dropping winders by type would leave a
+;; parked fiber holding the loader mutex.
+;;
+;; The body is never reached for its value — a finally has no before-thunk — so
+;; #f is arbitrary.
+(define jolt-finally-in (lambda () #f))
+
+;; The older seam, still used by HOST dynamic-winds that want exit-only cleanup
+;; but cannot use the marker because they need a real before-thunk of their own
+;; (loader.ss load-namespace*). Emitted code no longer consults it. The Chez
+;; fiber scheduler installs the real one (per-carrier, off a virtual register);
+;; on a host with no fibers it stays #f. It must NOT be true for any escape
+;; other than a park — an interrupt abort is a real exit and its cleanup has to
+;; run.
 (define jolt-park-unwinding?-hook (lambda () #f))
 (define (jolt-park-unwinding?) (jolt-park-unwinding?-hook))
 

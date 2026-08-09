@@ -115,6 +115,119 @@
 (define jolt-vreg-park-unwinding 1)
 (define (jolt-park-unwinding-set! on?)
   (set-virtual-register! jolt-vreg-park-unwinding (if on? 1 0)))
+
+;; --- dropping the finally winders on a park ----------------------------------
+;; A park escape unwinds the fiber's dynamic-wind chain on its way to the
+;; scheduler. Most of that chain SHOULD unwind: a parameterize has to put the
+;; carrier back to the scheduler's value or the next fiber inherits it, and a
+;; with-mutex has to release, which is what lets loader.ss park inside its load
+;; lock. What must NOT run is a jolt `finally`, because a park is not an exit.
+;;
+;; So instead of suppressing the finally from inside the after-thunk (which cost
+;; two procedure calls on EVERY finally exit, park or not), the park removes
+;; those winders from the chain before escaping. Chez then never runs them.
+;;
+;; The chain itself is reached through the adapter (sa-winder-in,
+;; sa-current-winders, sa-current-winders-set!), because $primitive access is
+;; the adapter's job and this file is not target-owned. They are captured by
+;; GUARDED REFERENCE for the same reason the slice parameters below are: the R1
+;; gate loads this file on its own, with no adapter present, and the header's
+;; promise that it is self-contained has to keep holding. The fallbacks make the
+;; filter a no-op rather than an error.
+;;
+;; The marker is captured the same way this file captures the slice parameters
+;; below: a guarded reference, because scheme-adapter-runtime.ss loads this file
+;; BEFORE values.ss defines jolt-finally-in. That load gets #f here, which makes
+;; the predicate false everywhere and the filter a no-op — exactly the
+;; pre-existing behaviour, which is all the R1 gate needs. rt.ss re-loads this
+;; file after values.ss and re-captures the real procedure, the same harmless
+;; re-define pattern used for jolt-vreg-current-fiber.
+(define jolt-finally-marker
+  (guard (e (#t #f)) jolt-finally-in))
+(define jolt-sa-winders
+  (guard (e (#t (lambda () '()))) sa-current-winders))
+(define jolt-sa-winders-set!
+  (guard (e (#t (lambda (w) #f))) sa-current-winders-set!))
+;; The rtd and its `in` accessor, not the sa-winder-in wrapper: this sits in a
+;; loop over the whole chain on every park, and going through the wrapper cost
+;; two indirect calls per element (measured 32 ns/park against 12 ns for the
+;; hoisted form on a 6-winder chain). record-rtd and record-accessor are plain
+;; R6RS, so naming them here does not put a $primitive in this file.
+(define jolt-winder-rtd
+  (guard (e (#t #f)) sa-winder-rtd))
+(define jolt-winder-in-ref
+  (guard (e (#t #f)) (record-accessor jolt-winder-rtd 0)))
+
+;; A winder the back end emitted for a `finally` — recognised by its `in` thunk
+;; being the one shared marker (values.ss jolt-finally-in). Every other winder,
+;; including with-mutex, parameterize and any host dynamic-wind, answers #f and
+;; is left alone. Kept as a named predicate for the gates; the park path below
+;; inlines it with the globals hoisted out of the loop.
+(define (jolt-finally-winder? r)
+  (and jolt-winder-rtd
+       jolt-finally-marker
+       (eq? (record-rtd r) jolt-winder-rtd)
+       (eq? (jolt-winder-in-ref r) jolt-finally-marker)))
+
+;; Slot 6: the winder chain as it stood when this carrier dispatched the running
+;; fiber — the fiber's BASE. Set once per dispatch in jolt-fiber-run, read only
+;; by the walk below. A vreg for the same reason slot 1 is one: it is per
+;; carrier thread, and several carriers dispatch independently. A fresh thread
+;; starts the slot at fixnum 0, which is not a list, so the walk simply runs to
+;; the end — the correct answer, just without the shortcut.
+(define jolt-vreg-fiber-winder-base 6)
+
+;; The chain with the finally winders removed. Returns the ARGUMENT ITSELF when
+;; nothing is dropped — the overwhelmingly common case — so a park with no
+;; finally in scope allocates nothing and the tail is shared when the dropped
+;; winders are outermost. Walks the WHOLE chain; the park path uses
+;; jolt-park-winders* with a base instead.
+(define (jolt-park-winders w)
+  (jolt-park-winders* w 0 jolt-winder-rtd jolt-winder-in-ref jolt-finally-marker))
+
+;; The walk, with the loop-invariant globals passed in, stopping at BASE.
+;;
+;; Stopping there is not just an optimisation, it is the exact boundary: a park
+;; escapes to the carrier's sched-k, whose own chain IS base, so Chez unwinds
+;; only the winders ABOVE base. Anything at or below it is untouched by the
+;; escape, so filtering it could not change what runs — and walking it is pure
+;; cost, which at depth 0 is the entire cost (the fiber's chain and the base are
+;; then the same list and this returns on the first test).
+(define (jolt-park-winders* w base rtd in-ref marker)
+  (cond ((null? w) w)
+        ((eq? w base) w)
+        ((let ((r (car w)))
+           (and (eq? (record-rtd r) rtd) (eq? (in-ref r) marker)))
+         (jolt-park-winders* (cdr w) base rtd in-ref marker))
+        (else
+         (let ((rest (jolt-park-winders* (cdr w) base rtd in-ref marker)))
+           (if (eq? rest (cdr w)) w (cons (car w) rest))))))
+
+;; (jolt-park-drop-finallys!) — called at every park, just before the escape.
+;;
+;; DELIBERATELY NOT WRAPPED IN `guard`, and nothing that mutates the chain may
+;; be: `guard` saves the winder chain on entry and RESTORES it on exit, so the
+;; write below would be silently undone and every finally would run mid-park
+;; again — with no error to say so. That is not hypothetical, it is how the
+;; first version of this function failed. The same goes for dynamic-wind,
+;; with-mutex and parameterize: the mutation has to happen in the park's own
+;; frame, on the way out.
+;;
+;; It needs no guard anyway. Reading and writing the chain cannot fail, and when
+;; jolt-finally-marker is #f (the adapter-time load, before values.ss)
+;; jolt-finally-winder? is false everywhere, jolt-park-winders returns its
+;; argument, and no write happens at all — exactly the pre-existing behaviour.
+(define (jolt-park-drop-finallys!)
+  (let ((rtd jolt-winder-rtd)
+        (marker jolt-finally-marker))
+    ;; No rtd or no marker means nothing can ever match, so skip the walk
+    ;; entirely rather than traverse the chain to learn that.
+    (when (and rtd marker)
+      (let ((w (jolt-sa-winders))
+            (base (virtual-register jolt-vreg-fiber-winder-base)))
+        (unless (or (null? w) (eq? w base))
+          (let ((kept (jolt-park-winders* w base rtd jolt-winder-in-ref marker)))
+            (unless (eq? kept w) (jolt-sa-winders-set! kept))))))))
 ;; Installed only when the full runtime is present; a standalone load of this
 ;; file (the R1 gate) has no values.ss, and the guard keeps that working — the
 ;; same probe pattern this file already uses for the slice parameters.
@@ -380,8 +493,12 @@
       (jolt-fiber-k-set! f k)
       (jolt-fiber-slice-save! f)
       ;; The dynamic-wind after-thunks between here and the scheduler are about
-      ;; to fire as this continuation unwinds. They belong to forms the fiber is
-      ;; still inside, so flag the escape as a park and let them skip.
+      ;; to fire as this continuation unwinds. The ones the back end emitted for
+      ;; a `finally` belong to forms the fiber is still inside, so drop them
+      ;; from the chain outright. The rest — parameterize, with-mutex — SHOULD
+      ;; unwind, and do. The flag stays for the host dynamic-winds that want
+      ;; exit-only cleanup but need a before-thunk of their own (loader.ss).
+      (jolt-park-drop-finallys!)
       (jolt-park-unwinding-set! #t)
       ((jolt-carrier-sched-k (jolt-fiber-carrier f))))))
 
@@ -445,6 +562,9 @@
     (call/1cc
       (lambda (k)
         (jolt-carrier-sched-k-set! c k)
+        ;; The chain sched-k was captured with: the boundary a park unwinds down
+        ;; to, and therefore the point the finally walk can stop at.
+        (set-virtual-register! jolt-vreg-fiber-winder-base (jolt-sa-winders))
         ;; scheduler -> fiber: restore the incoming fiber's slice BEFORE running
         ;; it (for a resume, before its continuation re-enters — the dynamic-wind
         ;; before-thunks then re-fire over the restored values)

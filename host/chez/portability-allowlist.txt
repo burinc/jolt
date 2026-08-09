@@ -3,6 +3,7 @@
 # Lines: <file> <identifier>. A line whose hit disappears is STALE and fails the gate.
 # srfi-portable tier hits and CONTRACT names are never listed here.
 host/chez/hasheq.ss $primitive
+host/chez/scheme-adapter-runtime.ss $primitive
 host/chez/scheme-adapter-runtime.ss bytes-allocated
 host/chez/scheme-adapter-runtime.ss collect
 host/chez/scheme-adapter-runtime.ss collect-maximum-generation

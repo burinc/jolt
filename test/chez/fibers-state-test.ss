@@ -193,6 +193,98 @@
 (ok "6. carrier ns restored to the scheduler's after the round"
     (string=? (chez-current-ns) "user"))
 
+;; --- 7. the park drops jolt finallys and NOTHING else -----------------------
+;; A park escape unwinds the fiber's dynamic-wind chain. jolt-park-drop-finallys!
+;; (fibers.ss) removes exactly the winders the back end emitted for a `finally`,
+;; recognised by their before-thunk being the shared jolt-finally-in marker, and
+;; leaves every other winder to unwind normally.
+;;
+;; Both halves have teeth, and the SECOND is the one with real consequences:
+;;
+;;   - drop too little and a finally runs mid-park, closing a file the fiber is
+;;     still using. That is what the flag used to prevent.
+;;   - drop too much and a with-mutex does not release on the park, so the fiber
+;;     parks HOLDING the lock. loader.ss's ldr-wait-for-load! deliberately parks
+;;     inside ldr-load-mu and relies on with-mutex's dynamic-wind releasing it
+;;     and re-acquiring on resume; dropping that winder wedges every later
+;;     require in the process. Chez tags with-mutex as the same `winder` record
+;;     type as a finally, so nothing but the marker distinguishes them — which is
+;;     exactly why this check exists.
+;;
+;; A parameterize is checked alongside it: it has to unwind so the next fiber on
+;; the carrier does not inherit the parked fiber's value, and has to be back in
+;; force when the fiber resumes.
+(define w-log '())
+(define (w-say x) (set! w-log (cons x w-log)))
+(define w-mu (make-mutex))
+(define w-param (make-parameter 'scheduler))
+;; Probed from ANOTHER THREAD, and that is not incidental: Chez mutexes are
+;; recursive, so the thread running the drain can re-acquire a mutex it is
+;; already holding and would report "free" even when the parked fiber still owns
+;; it — the exact deadlock this check exists to catch would pass silently.
+(define (w-mutex-free?)
+  (let ((free? #f))
+    (thread-join
+     (fork-thread
+      (lambda ()
+        (set! free? (if (mutex-acquire w-mu #f)
+                        (begin (mutex-release w-mu) #t)
+                        #f)))))
+    free?))
+
+(define w-fiber
+  (sa-fiber-spawn
+   (lambda ()
+     (parameterize ((w-param 'fiber))
+       (with-mutex w-mu
+         (dynamic-wind
+          jolt-finally-in                       ; the marker the back end emits
+          (lambda ()
+            (w-say (list 'before-park (w-param)))
+            ;; jolt-fiber-park! and NOT sa-fiber-yield: yield re-enqueues, so a
+            ;; one-fiber drain would resume it in the same pass and run to
+            ;; completion before the park could be observed at all.
+            (jolt-fiber-park!)
+            (w-say (list 'after-park (w-param)))
+            'ok)
+          (lambda () (w-say 'FINALLY))))))))
+
+;; run until the fiber parks in the yield
+(jolt-fiber-drain! (jolt-fiber-carrier w-fiber))
+(define w-at-park (reverse w-log))
+(ok "7. finally did NOT run on the park"
+    (not (memq 'FINALLY w-at-park)))
+(ok "7. with-mutex DID release on the park (loader.ss depends on this)"
+    (w-mutex-free?))
+(ok "7. parameterize DID unwind on the park"
+    (eq? (w-param) 'scheduler))
+
+;; resume: a parked fiber is only runnable again through sa-fiber-resume
+(sa-fiber-resume w-fiber)
+(jolt-fiber-drain! (jolt-fiber-carrier w-fiber))
+(define w-final (reverse w-log))
+(ok "7. fiber resumed inside its own parameterize"
+    (equal? (cadr w-final) '(after-park fiber)))
+(ok "7. finally ran exactly once, at the real exit"
+    (= 1 (length (filter (lambda (x) (eq? x 'FINALLY)) w-final))))
+(ok "7. mutex released again after the real exit" (w-mutex-free?))
+(ok "7. carrier parameter back to the scheduler's after the round"
+    (eq? (w-param) 'scheduler))
+
+;; The marker is matched with eq?, so it must be ONE shared procedure. A fresh
+;; (lambda () #f) per site would compare unequal and the finally would run
+;; mid-park again — silently, with every test above still passing except this.
+(ok "7. a non-marker dynamic-wind is not mistaken for a finally"
+    (not (jolt-finally-winder?
+          (dynamic-wind (lambda () #f)
+                        (lambda () (car (sa-current-winders)))
+                        (lambda () #f)))))
+(ok "7. a marker dynamic-wind IS recognised"
+    (jolt-finally-winder?
+     (dynamic-wind jolt-finally-in
+                   (lambda () (car (sa-current-winders)))
+                   (lambda () #f))))
+
 (printf "\nfibers-state-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "fibers-state-test: PASS — per-fiber dynamic state\n") (exit 0))

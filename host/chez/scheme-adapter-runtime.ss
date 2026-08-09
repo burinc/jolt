@@ -432,4 +432,43 @@
 ;; (rt.ss:35 loads this file, and the flat build inlines both). fibers.ss is
 ;; self-contained — it uses only Chez natives, so loading it here, before the
 ;; value layer, is safe.
+
+;; The dynamic-wind chain, for the scheduler's park path. NOT contract names:
+;; these are Chez internals the fiber switch needs and no other target has to
+;; supply — fibers.ss degrades to "change nothing" when sa-winder-in answers #f
+;; for everything, which is what a target without them gets.
+;;
+;; They live HERE rather than in fibers.ss because $primitive access is the
+;; adapter's job: fibers.ss is not target-owned, so the portability gate makes
+;; it route through this file.
+;;
+;; Chez models the chain as a list of records — `winder` for dynamic-wind, with
+;; fields #(in out attachments), and `critical-winder` for parameterize and
+;; friends. The rtd is not exported, so it is recovered by building one winder
+;; and reading its type back.
+(define sa-winder-rtd
+  (guard (e (#t #f))
+    (dynamic-wind (lambda () #f)
+                  (lambda () (record-rtd (car (#%$current-winders))))
+                  (lambda () #f))))
+(define sa-winder-in-ref
+  (guard (e (#t (lambda (r) #f)))
+    (record-accessor sa-winder-rtd 0)))
+
+;; (sa-winder-in w) -> the winder's before-thunk, or #f when W is not a
+;; dynamic-wind winder (a parameterize's critical-winder answers #f).
+(define (sa-winder-in w)
+  (and sa-winder-rtd
+       (eq? (record-rtd w) sa-winder-rtd)
+       (sa-winder-in-ref w)))
+
+;; (sa-current-winders) -> the chain, innermost first.
+;; (sa-current-winders-set! w) -> void. Replaces it wholesale.
+;;
+;; A write must happen in the frame that escapes, NOT inside a guard,
+;; dynamic-wind, with-mutex or parameterize: every one of those restores the
+;; chain on exit and would silently undo it. See jolt-park-drop-finallys!.
+(define (sa-current-winders) (#%$current-winders))
+(define (sa-current-winders-set! w) (#%$current-winders w))
+
 (load "host/chez/fibers.ss")

@@ -546,7 +546,10 @@
                   "case-lambda"
                   ;; binding + try/finally (emit-try): both thread through
                   ;; dynamic-wind; a binding form and a finally both emit it.
-                  "dynamic-wind"
+                  ;; jolt-finally-in is that dynamic-wind's before-thunk, emitted
+                  ;; by name because the fiber park recognises it with eq? — a
+                  ;; shadowed or inlined copy would make the finally run mid-park.
+                  "dynamic-wind" "jolt-finally-in"
                   ;; host interop (emit-invoke static call, :host-new,
                   ;; :host-static field ref).
                   "host-new" "host-static-call" "host-static-ref"
@@ -1579,11 +1582,22 @@
 ;; (jolt-throw = Scheme `raise` of a &jolt-throw condition); catch lowers to
 ;; `guard`, whose raw binding is unwrapped via jolt-unwrap-throw so the catch var
 ;; receives the jolt value (preserving ex-data/ex-message and the backtrace
-;; identity tag). finally lowers to `dynamic-wind`'s after-thunk, guarded by
-;; jolt-park-unwinding?: it runs on success, on catch and on a real escape, but
-;; NOT while a fiber park is unwinding. A park is not an exit — the computation
-;; resumes — so running the finally there would close a file still in use. Every
-;; other escape, an interrupt abort included, is an exit and still runs it.
+;; identity tag). finally lowers to `dynamic-wind`'s after-thunk, and runs on
+;; success, on catch and on a real escape, but NOT while a fiber park is
+;; unwinding. A park is not an exit — the computation resumes — so running the
+;; finally there would close a file still in use. Every other escape, an
+;; interrupt abort included, is an exit and still runs it.
+;;
+;; The park case is handled by the BEFORE-thunk, which is the shared marker
+;; procedure jolt-finally-in (values.ss) rather than a fresh (lambda () #f) per
+;; site. A park drops exactly the winders carrying that marker before it escapes
+;; (fibers.ss jolt-park-winders), so the after-thunk below never runs on a park
+;; and needs no guard of its own. It used to ask jolt-park-unwinding?, which
+;; cost two procedure calls on every finally exit — and `binding` expands to a
+;; try/finally, so every binding form paid it too.
+;;
+;; This is why the marker must be emitted by NAME and not inlined: the filter
+;; recognises it with eq?.
 ;; Both keys optional.
 (defn- emit-try [node]
   (let [core (if-let [cs (:catch-sym node)]
@@ -1607,8 +1621,8 @@
                  body)
                (emit (:body node)))]
     (if-let [fin (:finally node)]
-      (str "(dynamic-wind (lambda () #f) (lambda () " core ")"
-           " (lambda () (if (jolt-park-unwinding?) #f " (emit fin) ")))")
+      (str "(dynamic-wind jolt-finally-in (lambda () " core ")"
+           " (lambda () " (emit fin) "))")
       core)))
 
 ;; Does this IR node emit to an expression that yields a Scheme boolean? Used to

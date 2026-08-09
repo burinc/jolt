@@ -73,6 +73,10 @@
   (jolt-fiber-k-set! f #f)
   (set-virtual-register! jolt-vreg-current-fiber 0)
   (jolt-fiber-slice-save! f)
+  ;; Same escape discipline as jolt-fiber-to-scheduler!: drop the finally
+  ;; winders so their after-thunks do not run on a park, leave every other
+  ;; winder to unwind normally.
+  (jolt-park-drop-finallys!)
   (jolt-park-unwinding-set! #t)
   ((jolt-carrier-sched-k (jolt-fiber-carrier f))))
 
