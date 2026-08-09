@@ -305,13 +305,23 @@
 ;;
 ;; That is not hypothetical. It reproduces on the rollback path, where a failed load
 ;; re-takes this lock to unmark before releasing its claim, and in the window between
-;; claiming a namespace and marking it. So: inside an ambient transaction write
-;; through its log, which is transactional AND takes no lock at all; outside one, a
-;; leaf mutex of our own that no transaction ever waits on. Either way the edge
-;; ns_load -> stm-lock does not exist and the cycle cannot close.
+;; claiming a namespace and marking it. So the mark goes through a leaf mutex of our
+;; own that no transaction ever waits on, and the edge ns_load -> stm-lock does not
+;; exist.
 ;;
-;; What that leaves open is a mark landing while a user transaction that also writes
-;; *loaded-libs* is committing. Narrow, and the alternative is a hang.
+;; NOT through the ambient transaction's log when there is one, which is what this
+;; did first. It looks like the better answer — transactional, and it takes no lock
+;; at all — and it is wrong twice, because the mark is not the transaction's to own.
+;; A load either happened or it did not, and the file's defs are in the image either
+;; way; an abort that rolls the mark back leaves loaded-ns marked and *loaded-libs*
+;; not, which reads as unloaded and re-runs the whole namespace. And a buffered write
+;; is invisible to ns-dedup-loaded? until commit, so
+;; (dosync (require 'x) (require 'x)) ran x's top level twice.
+;;
+;; What the direct write leaves open is a mark landing while a user transaction that
+;; also writes *loaded-libs* is committing, which costs that namespace one extra
+;; reload. Narrow, one-directional, and the alternatives are a hang or the two bugs
+;; above.
 ;;
 ;; Call with NO loader mutex held either. A (dosync (require ...)) reaches ldr-tbl-mu
 ;; while holding stm-lock, so the loader taking these in the other order would be the
@@ -321,10 +331,8 @@
   (let* ((libs-cell (var-cell-lookup "clojure.core" "*loaded-libs*"))
          (libs-ref (and libs-cell (var-cell-root libs-cell))))
     (when (and libs-ref (jolt-ref? libs-ref))
-      (if (*txn*)
-          (jolt-ref-set libs-ref (f (txn-read libs-ref)))
-          (with-mutex ldr-libs-mu
-            (jolt-ref-val-set! libs-ref (f (jolt-ref-val libs-ref))))))))
+      (with-mutex ldr-libs-mu
+        (jolt-ref-val-set! libs-ref (f (jolt-ref-val libs-ref)))))))
 
 ;; Seed *loaded-libs* ref from the initial loaded-ns set (for tools.namespace
 ;; and core.typed which conj/disj on it).  Must happen after the async deletion.
@@ -870,13 +878,22 @@
 
 ;; Has `name` cleared the loaded-ns / *loaded-libs* dedup? A tools.namespace disj
 ;; from *loaded-libs* forces a reload even though loaded-ns still holds.
+;;
+;; txn-read and not jolt-ref-val, because the disj this is here to honour is a USER
+;; write and a user writes a ref through the STM. tools.namespace disj'ing inside a
+;; (dosync …) should force the reload from the next form onward, not from the
+;; commit. Outside a transaction txn-read IS jolt-ref-val, so the ordinary path is
+;; unchanged, and it acquires nothing, so this stays safe to call under ldr-load-mu
+;; (see ldr-libs-update!'s "a load must never take stm-lock"). The loader's own
+;; marks are not in any log — ldr-libs-update! writes the ref directly, for the
+;; reasons set out there — so this sees them whether a transaction is open or not.
 (define (ns-dedup-loaded? name)
   (let* ((libs-cell (var-cell-lookup "clojure.core" "*loaded-libs*"))
          (libs-ref (and libs-cell (var-cell-root libs-cell))))
     (and (hashtable-ref loaded-ns name #f)
          (or (not libs-ref)
              (not (jolt-ref? libs-ref))
-             (jolt-contains? (jolt-ref-val libs-ref) (jolt-symbol #f name))))))
+             (jolt-contains? (txn-read libs-ref) (jolt-symbol #f name))))))
 
 ;; --- clojure.core/compile + *compile-path* -----------------------------------
 ;; Clojure's `compile` writes a namespace's compiled form under *compile-path* so a
@@ -1160,12 +1177,25 @@
 ;; namespaces and both threads.
 ;;
 ;; Ownership is by THREAD id, which is what makes step 3 a cycle break rather
-;; than a self-deadlock. Two fibers on one carrier share a thread id, so if a
-;; load ever parked mid-way another fiber on that carrier would read its claim as
-;; its own and take step 3 — returning with the namespace half-loaded. Nothing
-;; loading does park (it is file I/O and eval, and a top-level form runs on the
-;; carrier rather than as a fiber), but the invariant is thread-per-load, not
-;; fiber-per-load, and it should be stated rather than discovered.
+;; than a self-deadlock, and it survives a park: a fiber is pinned to its carrier
+;; for life (R0(d)), so a load that parks resumes on the thread that claimed it
+;; and load-namespace* deliberately keeps the claim across the park rather than
+;; treating the escape as an exit.
+;;
+;; A load CAN park. (require 'x) from a go block on the :fiber backend, where x's
+;; top level does a blocking channel op, is the shape. Every OTHER thread wanting
+;; x then blocks in step 2 until the fiber comes back and finishes, which is the
+;; right answer and better than the pre-protocol behaviour (they read the
+;; mark-before-load and returned with x half-built).
+;;
+;; What is NOT closed is another FIBER on the same carrier: two fibers share a
+;; thread id, so it reads the parked load's claim as its own and takes step 3,
+;; returning with x half-loaded. Ownership by fiber would turn that into a step 2
+;; wait, and a step 2 wait there blocks the carrier the parked load needs in order
+;; to finish — a real deadlock in place of a stale read. It wants a check that
+;; RAISES on "another fiber on my carrier owns this load" rather than either, so
+;; the invariant is thread-per-load, not fiber-per-load, and it is stated here
+;; rather than left to be discovered. Tracked as jolt-n31.
 ;;
 ;; One behaviour improves as a side effect: :reload-all over a require cycle used
 ;; to recurse forever, because it turns the dedup off for the whole extent and
@@ -1185,7 +1215,11 @@
 ;;                      on condition-wait releasing ldr-load-mu atomically with
 ;;                      blocking, so no ldr-end-load! fits between the owner check
 ;;                      and the park, and on ldr-end-load! broadcasting from
-;;                      dynamic-wind's after thunk, which runs on every exit.
+;;                      dynamic-wind's after thunk, which runs on every exit. A
+;;                      FIBER park is not an exit and is skipped there, which keeps
+;;                      the property rather than weakening it: the owner is still
+;;                      recorded, still the same thread, and still on its way back
+;;                      to finish the load and broadcast.
 ;;   Cycle detection    ldr-wait-cycle fires on exactly the waits that would
 ;;                      deadlock: it never misses a cycle and never raises on a
 ;;                      graph that would still have made progress. Rests on the
@@ -1271,14 +1305,16 @@
 ;; The dynamic-wind before thunk below: the claim must be ours. On first entry it is,
 ;; because ldr-begin-load! has just set it, so this is a check and nothing more.
 ;;
-;; It re-runs if a continuation captured inside a load escapes and is then re-entered,
-;; and that is the case worth being strict about. Re-taking the claim unconditionally
-;; looks like the natural mirror of dropping it on the way out, and it is wrong: by
-;; then the load has already ended and another thread can own the namespace, so the
-;; re-entering thread would take the claim out from under a thread that is running the
-;; body, and both would be in it at once. There is no version of re-entry that keeps
-;; "in the body implies you hold the claim" true, so it is refused rather than papered
-;; over. Nothing loading parks today, which is why this has never fired.
+;; It re-runs if a continuation captured inside a load escapes and is then re-entered.
+;; A PARK is that, and it is not an exit — the after thunk below keeps the claim
+;; across one, so the resumed load still owns it and this passes.
+;;
+;; Any OTHER re-entry is refused. Re-taking the claim unconditionally looks like the
+;; natural mirror of dropping it on the way out, and it is wrong: the load has ended
+;; by then and another thread can own the namespace, so the re-entering thread would
+;; take the claim out from under a thread that is running the body, and both would be
+;; in it at once. There is no version of that re-entry that keeps "in the body implies
+;; you hold the claim" true, so it is refused rather than papered over.
 (define (ldr-assert-claim! name)
   (let ((me (get-thread-id)))
     (with-mutex ldr-load-mu
@@ -1307,17 +1343,39 @@
     ;; read AFTER claiming, not before: while this thread was waiting in step 2
     ;; another may have loaded the namespace and then had its own load fail, and
     ;; a stale #t here would make the guard below skip the rollback.
-    (let ((was-loaded? (ns-dedup-loaded? name)))
+    (let ((was-loaded? (ns-dedup-loaded? name))
+          (finished? #f))
       ;; step 11/12: drop the claim and wake the waiters on EVERY exit. dynamic-wind
       ;; and not a guard: a guard only sees a raise, and any other way out of the
       ;; body — a continuation escaping the load — would leave the claim standing,
       ;; which is a namespace no other thread can ever load and no error to say why.
       ;; The inner guard in ldr-load-body still rolls the mark back and re-raises, so
       ;; the throw path is unchanged.
+      ;;
+      ;; A PARK is the one escape that is not an exit, and it has to be told apart
+      ;; from the others. A fiber whose load parks — a top-level (<!! ch) in a
+      ;; namespace required from a go block on the :fiber backend — comes back and
+      ;; carries the load on from the park point, on the SAME thread, because R0(d)
+      ;; pins a fiber to its carrier for life. Treating that as an exit dropped the
+      ;; claim, woke the waiters onto a half-built namespace, and then made the
+      ;; resume die in ldr-assert-claim! with the mark still standing and the
+      ;; rollback stranded in the abandoned guard — so the namespace was wedged
+      ;; loaded-but-empty for the life of the process and every later require of it
+      ;; no-op'd. jolt-park-unwinding? is the flag jolt's own try/finally consults
+      ;; for exactly this question, and the answer here is the same: cleanup that
+      ;; belongs to the real exit does not run on a park.
+      ;;
+      ;; And when it IS the real exit, a body that neither finished nor raised
+      ;; (a continuation escaping the load for good) never reached ldr-load-body's
+      ;; guard, so the mark is rolled back here instead. Idempotent against the
+      ;; guard's own rollback on the throw path.
       (dynamic-wind
         (lambda () (ldr-assert-claim! name))
-        (lambda () (ldr-load-body name force? was-loaded?))
-        (lambda () (ldr-end-load! name))))))
+        (lambda () (ldr-load-body name force? was-loaded?) (set! finished? #t))
+        (lambda ()
+          (unless (jolt-park-unwinding?)
+            (unless (or finished? was-loaded?) (ldr-unmark-loaded! name))
+            (ldr-end-load! name)))))))
 
 ;; The load itself, run by the one thread that claimed it (never concurrently for
 ;; a given name, and never re-entered for it on this thread).

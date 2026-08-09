@@ -41,6 +41,13 @@
 ;;      parks holding stm-lock, so nothing a load does may ever need stm-lock back.
 ;;      Found by modelling the lock graph rather than by running anything: the cycle
 ;;      is stm-lock -> the load being waited on -> stm-lock, and it hung outright.
+;;   G. a require inside a transaction dedups, and an aborted transaction does not
+;;      un-load a namespace that really loaded. The mark is two tables and buffering
+;;      one of them in the txn log split them apart in both directions.
+;;   H. a load that PARKS finishes, and the namespace is whole afterwards for the
+;;      fiber that loaded it and for a thread that waited on it. A park is a
+;;      continuation escaping the load body, and treating it as an exit wedged the
+;;      namespace marked-but-empty for the life of the process.
 ;;
 ;; Run: jolt run test/chez/concurrent-require.clj  (wired into smoke.sh)
 
@@ -104,6 +111,29 @@
        "(def x (reduce + (range 8000000)))\n"
        "(throw (ex-info \"boom\" {}))\n"))
 
+;; Property G's targets. Same defonce-plus-swap! shape as the main target, so the
+;; counter measures double-loading directly. Two of them because the transaction
+;; that requires `dedup` commits and the one that requires `dedupab` aborts, and
+;; those are different bugs in the same asymmetry.
+(defn- dedup-src [nm]
+  (str "(ns ldrtest." nm ")\n"
+       "(defonce counter (atom 0))\n"
+       "(swap! counter inc)\n"
+       "(def sentinel :loaded)\n"))
+
+;; Property H's target: a namespace that PARKS at top level. The channel is fed by
+;; a real thread after a delay, so the (<!! ch) below cannot complete inline — on
+;; the :fiber backend it is a genuine park with the load half-run, which is the
+;; state the load protocol has to survive. `after` is last so a require that
+;; returned early is visible.
+(def parky-src
+  (str "(ns ldrtest.parky (:require [clojure.core.async :as a]))\n"
+       "(def ch (a/chan 1))\n"
+       "(def before :ran)\n"
+       "(a/thread (Thread/sleep 150) (a/>!! ch :fed))\n"
+       "(def got (a/<!! ch))\n"
+       "(def after :ran)\n"))
+
 (defn- write-sources! []
   (let [dir (str tmp-root "/ldrtest")]
     (.mkdirs (java.io.File. dir))
@@ -112,7 +142,10 @@
       (spit (str dir "/m" i ".clj") (distinct-src i)))
     (spit (str dir "/x.clj") (cycle-src "x" "y"))
     (spit (str dir "/y.clj") (cycle-src "y" "x"))
-    (spit (str dir "/boom.clj") dosync-src)))
+    (spit (str dir "/boom.clj") dosync-src)
+    (spit (str dir "/dedup.clj") (dedup-src "dedup"))
+    (spit (str dir "/dedupab.clj") (dedup-src "dedupab"))
+    (spit (str dir "/parky.clj") parky-src)))
 
 ;; A gate every thread spins on, so they all enter require together — without it
 ;; the first finishes before the rest start and there is no race to lose.
@@ -258,6 +291,80 @@
                  " deadlocked: the transaction holds stm-lock while parked and the"
                  " load needed it back")))))
 
+;; Property G: a require inside a transaction dedups like any other, and an aborted
+;; transaction does not undo a load that really happened.
+;;
+;; The mark is two tables — loaded-ns and the *loaded-libs* ref — and ns-dedup-loaded?
+;; wants both. Writing the ref through the ambient transaction's log split them.
+;; A buffered write is invisible until commit, so the SECOND require in the same
+;; transaction read the committed ref, saw no mark, and ran the whole namespace
+;; again; and an abort discarded the mark while loaded-ns kept it, so the next
+;; require after the transaction ran it again too. Neither is the transaction's call
+;; to make: the file's defs are in the image either way. ldr-libs-update! writes the
+;; ref directly now.
+(defn- dosync-dedup-failures []
+  (dosync (require 'ldrtest.dedup) (require 'ldrtest.dedup))
+  (try (dosync (require 'ldrtest.dedupab) (throw (ex-info "abort" {})))
+       (catch Throwable _ nil))
+  (require 'ldrtest.dedupab)
+  (let [in-txn (deref @(resolve 'ldrtest.dedup/counter))
+        aborted (deref @(resolve 'ldrtest.dedupab/counter))]
+    (cond-> []
+      (not= 1 in-txn)
+      (conj (str "two requires of one namespace inside a single dosync ran its top"
+                 " level " in-txn " times, expected 1"))
+      (not= 1 aborted)
+      (conj (str "a require whose transaction then aborted left the namespace"
+                 " half-marked; the next require ran its top level again, "
+                 aborted " loads in total, expected 1")))))
+
+;; Property H: a load that PARKS. (require 'x) from a go block on the :fiber backend,
+;; where x's top level does a blocking channel op, is a continuation escaping the
+;; middle of the load — and the fiber comes back to finish it, on the same thread,
+;; because a fiber is pinned to its carrier for life.
+;;
+;; load-namespace* runs the load body inside a dynamic-wind, so the park fired the
+;; after thunk: the claim was dropped and the waiters woken onto a half-built
+;; namespace, and then the resume died in ldr-assert-claim! with the mark still
+;; standing and the rollback stranded in the abandoned guard. The namespace was
+;; wedged loaded-but-empty for the life of the process and every later require of it
+;; no-op'd without an error. The after thunk skips on a park now.
+;;
+;; Asserted on the way a caller would notice: the require completes, the namespace is
+;; WHOLE (the form after the park ran), and a thread that asked for the same
+;; namespace while it was parked got the whole thing too rather than an empty shell.
+(defn- parked-load-failures []
+  (require 'clojure.core.async)
+  (let [go-spawn (resolve 'clojure.core.async/go-spawn)
+        backend (resolve 'clojure.core.async/*go-backend*)
+        <!! (deref (resolve 'clojure.core.async/<!!))
+        ;; go-spawn + the backend var directly rather than the `go` macro: this file
+        ;; is loaded as data by `jolt run`, and the pass behind `go` is beside the
+        ;; point here — what matters is that the body runs on a fiber.
+        out (with-bindings {backend :fiber}
+              (go-spawn (fn [] (require 'ldrtest.parky) :done)))
+        ;; a second asker, on a plain thread, while the fiber's load is parked
+        other (do (Thread/sleep 60)
+                  (future (try (require 'ldrtest.parky)
+                               (some? (resolve 'ldrtest.parky/after))
+                               (catch Throwable e (str (.getMessage e))))))
+        [s r] (deref-timeout (future (<!! out)) 15000)
+        [s2 r2] (deref-timeout other 15000)]
+    (cond-> []
+      (= :timeout s)
+      (conj "a require whose namespace parks at top level never completed")
+      (and (not= :timeout s) (not= :done r))
+      (conj (str "a require from a fiber over a parking namespace failed: "
+                 (pr-str r) " (the load body's continuation could not be resumed)"))
+      (nil? (resolve 'ldrtest.parky/after))
+      (conj (str "ldrtest.parky is marked loaded but half-built: the form after its"
+                 " top-level park never ran, and require no-ops from here on"))
+      (= :timeout s2)
+      (conj "a thread requiring a namespace whose load was parked never returned")
+      (and (not= :timeout s2) (not (true? r2)))
+      (conj (str "a thread that required ldrtest.parky while its load was parked got"
+                 " a half-built namespace: " (pr-str r2))))))
+
 (defn- clean-up! []
   ;; the temp root is per-run (currentTimeMillis), so clean it up rather than
   ;; leave one behind on every smoke run
@@ -266,6 +373,8 @@
          (catch Throwable _ nil)))
   (doseq [p [(str tmp-root "/ldrtest/target.clj") (str tmp-root "/ldrtest/x.clj")
              (str tmp-root "/ldrtest/y.clj") (str tmp-root "/ldrtest/boom.clj")
+             (str tmp-root "/ldrtest/dedup.clj") (str tmp-root "/ldrtest/dedupab.clj")
+             (str tmp-root "/ldrtest/parky.clj")
              (str tmp-root "/ldrtest") tmp-root]]
     (try (.delete (java.io.File. p)) (catch Throwable _ nil))))
 
@@ -276,13 +385,16 @@
                      (into (one-namespace-failures))
                      (into (distinct-namespaces-failures))
                      (into (cycle-failures))
-                     (into (dosync-wait-failures)))]
+                     (into (dosync-wait-failures))
+                     (into (dosync-dedup-failures))
+                     (into (parked-load-failures)))]
     (clean-up!)
     (if (seq failures)
       (do (doseq [f failures] (println "FAIL:" f))
           (println "CONCURRENT-REQUIRE FAILED")
           (System/exit 1))
       (println "CONCURRENT-REQUIRE OK" n-threads "threads on 1 namespace,"
-               n-distinct "namespaces in parallel, cycle and dosync-wait not hung"))))
+               n-distinct "namespaces in parallel, cycle and dosync-wait not hung,"
+               "dosync dedups, a parked load finishes"))))
 
 (-main)
