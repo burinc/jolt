@@ -6,6 +6,20 @@
   {:suite "host-interop / PersistentList-create" :label "an empty created list is list?" :expected "true" :actual "(list? (clojure.lang.PersistentList/create []))" :portability :jvm}
   {:suite "host-interop / PersistentList-create" :label "created list agrees with a literal on list?/seq?/class" :expected "[true true true]" :actual "(let [c (clojure.lang.PersistentList/create [1 2 3])] [(= (list? c) (list? (quote (1 2 3)))) (seq? c) (= c (quote (1 2 3)))])" :portability :jvm}
   {:suite "host-interop / reify ILookup" :label "(get reify k) / (:k reify) / (get reify k d) route to valAt" :expected "[1 1 :dflt]" :actual "(let [r (reify clojure.lang.ILookup (valAt [_ k] (get {:a 1} k)) (valAt [_ k d] (get {:a 1} k d)))] [(:a r) (get r :a) (get r :z :dflt)])" :portability :jvm}
+  ;; (.-x obj) is Reflector.getInstanceField: a DECLARED deftype/defrecord slot and
+  ;; nothing else. Not a key assoc'd onto a record, not a map key, not a method of
+  ;; the same name. It used to answer nil for all of those, which reads as a field
+  ;; that is present and nil and sends the caller down the wrong branch.
+  {:suite "host-interop / .-field reads a declared field" :label "a record's own slot, nil value and all" :expected "[1 nil 7]" :actual "(do (ns fld.ns) (clojure.core/defrecord Fa [a b]) (clojure.core/deftype Tk [x]) [(.-a (fld.ns/->Fa 1 2)) (.-a (fld.ns/->Fa nil 2)) (.-x (fld.ns/->Tk 7))])" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "a slot the record does not declare" :expected "\"No matching field found: zz for class fldb.ns.Fb\"" :actual "(do (ns fldb.ns) (clojure.core/defrecord Fb [a]) (clojure.core/try (.-zz (fldb.ns/->Fb 1)) (clojure.core/catch IllegalArgumentException e (.getMessage e))))" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "a key assoc'd onto a record is not a field" :expected "\"No matching field found: zz for class fldc.ns.Fc\"" :actual "(do (ns fldc.ns) (clojure.core/defrecord Fc [a]) (clojure.core/try (.-zz (clojure.core/assoc (fldc.ns/->Fc 1) :zz 9)) (clojure.core/catch IllegalArgumentException e (.getMessage e))))" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "a method of the same name is not a field" :expected "\"No matching field found: count for class clojure.lang.PersistentVector\"" :actual "(try (.-count [1 2]) (catch IllegalArgumentException e (.getMessage e)))" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "a string and a set have no fields at all" :expected "[\"No matching field found: a for class java.lang.String\" \"No matching field found: a for class clojure.lang.PersistentHashSet\"]" :actual "(mapv (fn [x] (try (.-a x) (catch IllegalArgumentException e (.getMessage e)))) [\"s\" #{1}])" :portability :jvm}
+  ;; A no-arg (.x obj) tries the method and then the FIELD, so its miss is worded as
+  ;; a field; a miss WITH arguments can only have been a method.
+  {:suite "host-interop / .-field reads a declared field" :label "a missed 0-arg member read reports as a field, a 1-arg one as a method" :expected "[\"No matching field found: nosuch for class java.lang.String\" \"No matching method nosuch found taking 1 args for class java.lang.String\"]" :actual "[(try (.nosuch \"s\") (catch IllegalArgumentException e (.getMessage e))) (try (.nosuch \"s\" 1) (catch IllegalArgumentException e (.getMessage e)))]" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "and a java.util.Map reports its class, not an internal tag" :expected "[\"No matching field found: nosuch for class java.util.HashMap\" \"No matching method nosuch found taking 1 args for class java.util.HashMap\"]" :actual "(let [h (java.util.HashMap.)] [(try (.nosuch h) (catch IllegalArgumentException e (.getMessage e))) (try (.nosuch h 1) (catch IllegalArgumentException e (.getMessage e)))])" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "method reads are untouched" :expected "[2 1 \"AB\"]" :actual "[(.count [1 2]) (.valAt {:a 1} :a) (.toUpperCase \"ab\")]" :portability :jvm}
   ;; A pattern the engine will not compile is a PatternSyntaxException, catchable
   ;; as itself or as IllegalArgumentException. It used to escape as an unnamed
   ;; condition, and — worse — the compile ran inside the regex cache's mutex, so
@@ -755,7 +769,11 @@
   {:suite "hierarchy / global + multimethod dispatch" :label "dispatch exact beats isa" :expected ":exact" :actual "(do (derive :de/e1 :de/e2) (defmulti emm identity) (defmethod emm :de/e2 [_] :parent) (defmethod emm :de/e1 [_] :exact) (emm :de/e1))" :portability :common}
   {:suite "interop / dot forms" :label "method call" :expected "\"v=41\"" :actual "(. {:value 41 :describe (fn [self] (str \"v=\" (:value self)))} describe)" :portability :jvm}
   {:suite "interop / dot forms" :label "method with args" :expected "\"Hello Alice\"" :actual "(. {:greet (fn [self n] (str \"Hello \" n))} greet \"Alice\")" :portability :jvm}
+  ;; jolt's map-as-object read (dot-forms.ss): a key the map HAS reads as a field.
+  ;; The JVM throws here — see known-divergences.edn. A key it does NOT have throws
+  ;; on both, which is the row below.
   {:suite "interop / dot forms" :label "field access .-" :expected "41" :actual "(.-value {:value 41})" :portability :jvm}
+  {:suite "interop / dot forms" :label "field access .- of an absent key is an error, not nil" :expected "\"No matching field found: nope for class clojure.lang.PersistentArrayMap\"" :actual "(try (.-nope {:value 41}) (catch IllegalArgumentException e (.getMessage e)))" :portability :jvm}
   {:suite "interop / dot forms" :label "dot field keyword" :expected "41" :actual "(. {:value 41} :value)" :portability :jvm}
   {:suite "interop / dot dispatch arms" :label "zero-arg coll-interop .count" :expected "3" :actual "(.count [1 2 3])" :portability :jvm}
   {:suite "interop / dot dispatch arms" :label "zero-arg coll-interop .seq" :expected "[1 2]" :actual "(.seq [1 2])" :portability :jvm}

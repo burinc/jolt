@@ -379,7 +379,9 @@
      (substring s (jolt->idx (arg 0)) (jolt->idx (arg 1))))
     ;; Class.isArray over a class-name string: array classes are "[…" (e.g. "[C").
     ((string=? method "isArray") (and (fx>? (string-length s) 0) (char=? (string-ref s 0) #\[)))
-    (else (throw-jvm (quote IllegalArgumentException) (string-append "No matching method " method " for value")))))
+    ;; the shared end of the chain, so a string reports the same way every other
+    ;; value does — including "No matching field found" for a (.-x "s") read
+    (else (no-method-throw method s (length rest)))))
 
 ;; --- clojure.core str-* primitives (the substrate clojure.string.clj calls) ---
 ;; clojure.string.clj is pure Clojure over these
