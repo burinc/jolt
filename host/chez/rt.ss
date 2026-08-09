@@ -341,10 +341,26 @@
 (define jolt-fn-callees-table (make-hashtable string-hash string=?))
 (define (jolt-callsite-key fqn line)
   (string-append fqn ":" (number->string line)))
+;; The four tables above are written by jolt-register-callsite!, which the back
+;; end emits into every compiled namespace and which therefore runs at LOAD —
+;; concurrently, now that namespaces load in parallel. Each add is a
+;; read-modify-write, so unlocked the adds simply lose each other: 8 threads
+;; registering 6000 distinct sites each dropped 297 of 48000. A dropped edge is
+;; a stack-trace reconstruction that stops early rather than a wrong one, but
+;; "incomplete, never invented" is the claim this table makes, and losing entries
+;; to a race is not how it was meant to hold.
+;;
+;; Writes only. The reads below are single-key reads of a STRONG hashtable, which
+;; is safe unlocked for the reasons set out at var-table, and they sit on the
+;; backtrace path where a lock would be pointless anyway. One mutex for all four
+;; because one registration writes up to four of them and they are never read
+;; under it.
+(define jolt-callsite-mu (make-mutex))
 (define (jolt-table-add! tbl key entry)
-  (let ((cur (hashtable-ref tbl key '())))
-    (unless (member entry cur)
-      (hashtable-set! tbl key (cons entry cur)))))
+  (with-mutex jolt-callsite-mu
+    (let ((cur (hashtable-ref tbl key '())))
+      (unless (member entry cur)
+        (hashtable-set! tbl key (cons entry cur))))))
 (define (jolt-register-callsite! fqn line callee tail?)
   (jolt-table-add! jolt-callsite-table (jolt-callsite-key fqn line) callee)
   (jolt-table-add! jolt-fn-callees-table fqn callee)

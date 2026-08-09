@@ -373,6 +373,124 @@
             ((member "t8.Base" (jch-closure (jch-name i))) (loop (fx+ i 1)))
             (else #f))))
 
+;; --- 9. keyword interning ----------------------------------------------------
+;; The worst one the audit found, and not because it corrupts anything: these are
+;; STRONG hashtables, so the failure is a lost update, not a fault. But keyword
+;; equality IS identity (values.ss jolt=2-base answers keywords with eq?, which is
+;; what makes (:k m) a pointer compare), so a lost intern means two keyword-t for
+;; one name and (= :foo :foo) false between the threads that made them. The hashes
+;; still agree, since khash comes from ns/name — so a map lookup finds the right
+;; bucket, fails the equality check, and answers nil for a key the map has.
+;;
+;; Asserted as a property, not as a crash: unfixed, 8 threads over 4000 fresh
+;; names split 64 of them and (get {:kw-0 42} :kw-0) came back nil across a split.
+(printf "\n== 9. concurrent interning of fresh keywords ==\n")
+(define kw-threads 8)
+(define kw-n 4000)
+(define kw-res (make-vector kw-threads #f))
+(ok "9. every thread finished interning"
+    (run-threads kw-threads
+                 (lambda (t)
+                   (let loop ((i 0) (acc '()))
+                     (if (fx=? i kw-n)
+                         (vector-set! kw-res t (list->vector (reverse acc)))
+                         (loop (fx+ i 1)
+                               (cons (keyword #f (string-append "ts9-kw-" (number->string i)))
+                                     acc)))))
+                 60.0 "9. keyword interning"))
+(define kw-split 0)
+(let loop ((i 0))
+  (when (fx<? i kw-n)
+    (let ((k0 (vector-ref (vector-ref kw-res 0) i)))
+      (let scan ((t 1))
+        (cond ((fx=? t kw-threads) #f)
+              ((not (eq? k0 (vector-ref (vector-ref kw-res t) i)))
+               (set! kw-split (+ kw-split 1)))
+              (else (scan (fx+ t 1))))))
+    (loop (fx+ i 1))))
+(ok "9. one object per keyword name across every thread" (= kw-split 0))
+;; the consequence, stated directly: a map keyed by one thread's keyword must
+;; answer another thread's keyword of the same name
+(ok "9. a map keyed by one thread's keyword answers another thread's"
+    (let loop ((i 0))
+      (cond ((fx=? i kw-n) #t)
+            ((let ((m (jolt-hash-map (vector-ref (vector-ref kw-res 0) i) 42)))
+               (eqv? 42 (jolt-get m (vector-ref (vector-ref kw-res (fx- kw-threads 1)) i) jolt-nil)))
+             (loop (fx+ i 1)))
+            (else #f))))
+;; symbol name strings are pooled by the same check-then-set, for JVM-parity
+;; string identity ((str sym) is compared by identity in core.logic)
+(define sym-res (make-vector kw-threads #f))
+(ok "9. every thread finished interning symbol names"
+    (run-threads kw-threads
+                 (lambda (t)
+                   (let loop ((i 0) (acc '()))
+                     (if (fx=? i kw-n)
+                         (vector-set! sym-res t (list->vector (reverse acc)))
+                         (loop (fx+ i 1)
+                               (cons (symbol-t-name
+                                      (jolt-symbol #f (string-append "ts9-sym-" (number->string i))))
+                                     acc)))))
+                 60.0 "9. symbol-string interning"))
+(ok "9. one name string per symbol name across every thread"
+    (let loop ((i 0))
+      (cond ((fx=? i kw-n) #t)
+            ((let ((s0 (vector-ref (vector-ref sym-res 0) i)))
+               (let scan ((t 1))
+                 (cond ((fx=? t kw-threads) #t)
+                       ((eq? s0 (vector-ref (vector-ref sym-res t) i)) (scan (fx+ t 1)))
+                       (else #f))))
+             (loop (fx+ i 1)))
+            (else #f))))
+
+;; --- 10. the two registrations the BACK END emits ----------------------------
+;; jolt-register-callsite! and jolt-register-source! are emitted into every
+;; compiled namespace and run at load. That used to be single-threaded; namespaces
+;; now load in parallel, so both run concurrently and both were read-modify-write.
+;; Strong tables again, so the failure is lost updates: 297 of 48000 callsite
+;; entries, and the source registry's 'ambiguous marker missed 3 of 400 times.
+(printf "\n== 10. the back end's load-time registrations ==\n")
+(define reg-threads 8)
+(define reg-n 6000)
+(ok "10. every registrar finished"
+    (run-threads reg-threads
+                 (lambda (t)
+                   (let loop ((i 0))
+                     (when (fx<? i reg-n)
+                       (jolt-register-callsite!
+                        (string-append "ts10.ns" (number->string t) "/f") i
+                        (string-append "ts10-callee-" (number->string i)) #f)
+                       (loop (fx+ i 1)))))
+                 120.0 "10. callsite registration"))
+(ok "10. no callsite registration was lost"
+    (let loop ((t 0))
+      (cond ((fx=? t reg-threads) #t)
+            ((let inner ((i 0))
+               (cond ((fx=? i reg-n) #t)
+                     ((jolt-callsite-callees (string-append "ts10.ns" (number->string t) "/f") i)
+                      (inner (fx+ i 1)))
+                     (else #f)))
+             (loop (fx+ t 1)))
+            (else #f))))
+
+;; The 'ambiguous marker exists so a trace is never MISATTRIBUTED: two defs whose
+;; emitted procname collides must drop the ns/file:line rather than pick one. Both
+;; registrars reading #f before either writes defeats exactly that.
+(define amb-rounds 400)
+(define amb-missed 0)
+(let loop ((r 0))
+  (when (fx<? r amb-rounds)
+    (let ((nm (string-append "ts10-proc-" (number->string r))))
+      (run-threads 2
+                   (lambda (t)
+                     (jolt-register-source! nm (string-append "ts10.ns" (number->string t))
+                                            "f" "a.clj" 1))
+                   30.0 "10. source registration")
+      (unless (eq? (hashtable-ref source-registry nm #f) 'ambiguous)
+        (set! amb-missed (+ amb-missed 1))))
+    (loop (fx+ r 1))))
+(ok "10. a colliding procname is always marked ambiguous" (= amb-missed 0))
+
 (printf "\nthread-safety-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "thread-safety-test: PASS — shared side-tables under concurrency\n") (exit 0))

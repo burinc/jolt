@@ -1174,12 +1174,24 @@
       (let ((ns (keyword-t-ns tag)))
         (if (and ns (not (jolt-nil? ns))) (string-append ns "/" (keyword-t-name tag)) (keyword-t-name tag)))
       (jolt-str-render-one tag)))
+;; hsc-mu covers the two global registries below that are written after boot:
+;; this one (reachable from Clojure as clojure.core/__register-class-methods!, so
+;; from a namespace load, which is now parallel) and jolt-class-for-tbl's intern.
+;; Single-key reads of both stay unlocked — strong hashtables, per var-table.
+(define hsc-mu (make-mutex))
+
+;; The probe and the create are ONE step. Split, two threads registering methods
+;; for one tag each built their own inner table and published it over the other's,
+;; so every method in the loser's batch vanished — the same shape as the protocol
+;; registry's type-registry. The member writes go under the same lock, since they
+;; mutate the table this just published.
 (define (register-tagged-methods! tag members)
-  (let* ((key (tag->method-key tag))
-         (h (or (hashtable-ref tagged-methods-tbl key #f)
-                (let ((nh (make-hashtable string-hash string=?)))
-                  (hashtable-set! tagged-methods-tbl key nh) nh))))
-    (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members)))
+  (with-mutex hsc-mu
+    (let* ((key (tag->method-key tag))
+           (h (or (hashtable-ref tagged-methods-tbl key #f)
+                  (let ((nh (make-hashtable string-hash string=?)))
+                    (hashtable-set! tagged-methods-tbl key nh) nh))))
+      (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members))))
 
 ;; htable arm: dispatch (.method obj a*) through the table's tag method registry;
 ;; an unregistered method falls through (sorted colls are htables too).
@@ -1345,13 +1357,21 @@
 ;; identity, =, and defmethod table keys are stable. Called by the analyzer for
 ;; every class-name symbol (java.util.Date, clojure.lang.Atom) at evaluation time.
 (define jolt-class-for-tbl (make-hashtable string-hash string=?))
+;; Double-checked, like every other interner in the runtime. The hit path — every
+;; class name after the first — is the bare hashtable-ref it always was, which
+;; matters because the analyzer calls this per class-name symbol, and only a
+;; first-ever intern takes the lock. The blast radius of a lost intern is smaller
+;; here than for keywords: the eq-arm below compares jclass by NAME and the hash
+;; arm hashes the name, so a duplicate still answers = and still keys a defmethod
+;; table (new-mm-table is keyed by jolt=). It is the eq?-identity this comment
+;; promises that a race would take away.
 (define (jolt-class-for name)
-  (let ((existing (hashtable-ref jolt-class-for-tbl name #f)))
-    (if existing
-        existing
-        (let ((obj (make-class-obj name)))
-          (hashtable-set! jolt-class-for-tbl name obj)
-          obj))))
+  (or (hashtable-ref jolt-class-for-tbl name #f)
+      (with-mutex hsc-mu
+        (or (hashtable-ref jolt-class-for-tbl name #f)
+            (let ((obj (make-class-obj name)))
+              (hashtable-set! jolt-class-for-tbl name obj)
+              obj)))))
 (def-var! "jolt.host" "jolt-class-for" jolt-class-for)
 
 (define (class-key x)

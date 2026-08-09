@@ -45,17 +45,37 @@
 ;; NUL separator can't occur in a keyword ns/name, so the intern key is
 ;; unambiguous (a "/" separator would collide ns="a" name="b/c" with ns="a/b").
 (define (keyword-intern-key ns name) (string-append (or ns "") "\x0;" name))
+;; Interning has to be ATOMIC, and for a harder reason than the other side-tables
+;; in the runtime: keyword equality IS identity (jolt=2-base answers keywords with
+;; eq?, which is what makes (:k m) a pointer compare). Two threads racing the same
+;; NEW name each got their own keyword-t, and from then on (= :foo :foo) was false
+;; between them — with the hashes still agreeing, since khash is derived from
+;; ns/name, so a map lookup found the right bucket and then failed the equality
+;; check and answered nil. 8 threads interning 4000 fresh names split 64 of them,
+;; and (get {:kw-0 42} :kw-0) across the split came back nil.
+;;
+;; Double-checked, exactly like rt.ss's jolt-var and for the same reasons. These
+;; are STRONG hashtables, so an unlocked single-key read walks consistent
+;; structure and the worst it can observe is a stale miss; the miss re-checks
+;; under the lock. So the hot path — every keyword after the first — is the same
+;; bare hashtable-ref it was, and only a first-ever intern pays the mutex.
+;; The lock is a leaf: compute-keyword-hasheq is pure arithmetic.
+(define keyword-table-mu (make-mutex))
 (define (keyword ns name)
   (if ns
       (let ((k (keyword-intern-key ns name)))
         (or (hashtable-ref keyword-table k #f)
-            (let ((kw (make-keyword-t ns name (compute-keyword-hasheq ns name))))
-              (hashtable-set! keyword-table k kw)
-              kw)))
+            (with-mutex keyword-table-mu
+              (or (hashtable-ref keyword-table k #f)
+                  (let ((kw (make-keyword-t ns name (compute-keyword-hasheq ns name))))
+                    (hashtable-set! keyword-table k kw)
+                    kw)))))
       (or (hashtable-ref keyword-table-bare name #f)
-          (let ((kw (make-keyword-t #f name (compute-keyword-hasheq #f name))))
-            (hashtable-set! keyword-table-bare name kw)
-            kw))))
+          (with-mutex keyword-table-mu
+            (or (hashtable-ref keyword-table-bare name #f)
+                (let ((kw (make-keyword-t #f name (compute-keyword-hasheq #f name))))
+                  (hashtable-set! keyword-table-bare name kw)
+                  kw))))))
 (define (keyword? x) (keyword-t? x))
 
 ;; --- symbols: ns + name + meta; NOT interned (meta varies), = by ns/name ------
@@ -63,11 +83,19 @@
 ;; two separately-read `?a` symbols share one name-string object, so code that
 ;; compares symbol names by identity (core.logic's non-unique lvar equality, via
 ;; (str sym)) behaves like the JVM.
+;; Same double-check as the keyword tables above. A lost update here is milder —
+;; the pool is about STRING identity, and two objects for one name only means the
+;; JVM-parity property this exists for stops holding for that name — but it is the
+;; same unlocked check-then-set on the same kind of table, reached from every
+;; thread that reads a symbol, and the miss path is just as cold.
 (define symbol-string-pool (make-hashtable string-hash string=?))
+(define symbol-string-pool-mu (make-mutex))
 (define (intern-symbol-string s)
   (if (string? s)
       (or (hashtable-ref symbol-string-pool s #f)
-          (begin (hashtable-set! symbol-string-pool s s) s))
+          (with-mutex symbol-string-pool-mu
+            (or (hashtable-ref symbol-string-pool s #f)
+                (begin (hashtable-set! symbol-string-pool s s) s))))
       s))
 (define-record-type symbol-t (fields ns name meta) (nongenerative symbol-v1))
 (define (jolt-symbol ns name)

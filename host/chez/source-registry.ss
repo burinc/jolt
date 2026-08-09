@@ -21,14 +21,23 @@
 ;; (now-uncertain) ns/file:line, so a trace is never misattributed.
 (define source-registry (make-hashtable string-hash string=?))
 
+;; The whole cond is ONE critical section. This runs at load, emitted by the back
+;; end once per def, and namespaces now load in parallel — so two threads
+;; registering the same procname under different namespaces both read #f, both
+;; write their own vector, and neither writes 'ambiguous. The trace then names one
+;; of them with confidence, which is exactly the misattribution the marker exists
+;; to prevent (400 contended pairs missed it 3 times). Reads stay unlocked: this is
+;; a strong hashtable and every read of it is single-key.
+(define source-registry-mu (make-mutex))
 (define (jolt-register-source! procname ns nm file line)
-  (let ((existing (hashtable-ref source-registry procname #f)))
-    (cond
-      ((not existing) (hashtable-set! source-registry procname (vector ns nm file line)))
-      ((and (vector? existing)
-            (or (not (equal? (vector-ref existing 0) ns))
-                (not (equal? (vector-ref existing 1) nm))))
-       (hashtable-set! source-registry procname 'ambiguous))))
+  (with-mutex source-registry-mu
+    (let ((existing (hashtable-ref source-registry procname #f)))
+      (cond
+        ((not existing) (hashtable-set! source-registry procname (vector ns nm file line)))
+        ((and (vector? existing)
+              (or (not (equal? (vector-ref existing 0) ns))
+                  (not (equal? (vector-ref existing 1) nm))))
+         (hashtable-set! source-registry procname 'ambiguous)))))
   jolt-nil)
 (def-var! "jolt.host" "register-source!" jolt-register-source!)
 

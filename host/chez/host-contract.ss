@@ -542,9 +542,18 @@
 ;; {:params :body :nhints :ret} here (keyed ns/name) as its form is optimized;
 ;; jolt.passes.inline fetches it to splice the body at a call site. The stash is an
 ;; opaque jolt value to the host — IR maps round-tripping through the table.
+;; Shared across compilations on purpose — that is what makes cross-namespace
+;; inlining possible — so it is written from every thread compiling once
+;; namespaces load in parallel. Concurrent inserts into a strong hashtable lose
+;; each other, and a lost stash is an inline that silently does not happen. The
+;; fetch is a single-key read and stays unlocked: it sits at every candidate call
+;; site, and an unlocked read of a strong table is safe (see var-table in rt.ss).
 (define inline-stash-table (make-hashtable string-hash string=?))
+(define inline-stash-mu (make-mutex))
 (define (hc-stash-inline! ctx ns-name nm m)
-  (hashtable-set! inline-stash-table (string-append ns-name "/" nm) m) jolt-nil)
+  (with-mutex inline-stash-mu
+    (hashtable-set! inline-stash-table (string-append ns-name "/" nm) m))
+  jolt-nil)
 (define (hc-inline-ir ctx ns-name nm)
   (or (hashtable-ref inline-stash-table (string-append ns-name "/" nm) #f) jolt-nil))
 
