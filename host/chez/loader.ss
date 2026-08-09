@@ -400,7 +400,7 @@
                                (cons ldr-assert-cell (var-cell-root ldr-assert-cell))
                                (cons ldr-unchecked-cell
                                      (var-cell-root ldr-unchecked-cell)))))
-              (dyn-binding-stack (cons frame (dyn-binding-stack)))))
+              (dyn-push-frame! frame)))
           thunk
           (lambda () (dyn-binding-stack (cdr (dyn-binding-stack))))))))
 
@@ -1026,7 +1026,7 @@
     (if (not cell)
         (thunk)
         (dynamic-wind
-          (lambda () (dyn-binding-stack (cons (list (cons cell #t)) (dyn-binding-stack))))
+          (lambda () (dyn-push-frame! (list (cons cell #t))))
           thunk
           (lambda () (dyn-binding-stack (cdr (dyn-binding-stack))))))))
 

@@ -290,7 +290,7 @@
     (if (not cell)
         (thunk)
         (dynamic-wind
-          (lambda () (dyn-binding-stack (cons (list (cons cell a)) (dyn-binding-stack))))
+          (lambda () (dyn-push-frame! (list (cons cell a))))
           thunk
           (lambda () (dyn-binding-stack (cdr (dyn-binding-stack))))))))
 

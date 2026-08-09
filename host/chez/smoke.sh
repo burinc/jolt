@@ -502,6 +502,20 @@ else
   fails=$((fails + 1))
 fi
 
+# A dynamic var must still read its binding after the read path learned to skip
+# the walk for vars nobody binds (jolt-3bo). The gate is the two push sites that
+# do NOT go through push-thread-bindings — the loader's per-file vars and the
+# agent's *agent* — because the ordinary binding path keeps working when those
+# forget to flag the cell, and the var then silently reads its root.
+db_out="$($jolt run test/chez/dyn-binding.clj 2>&1)"
+if printf '%s' "$db_out" | grep -q 'DYN-BINDING OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: dynamic var binding semantics"
+  printf '%s\n' "$db_out" | tail -4 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # clojure.test extension points (assert-expr / do-report / report) need separate
 # top-level forms — assert-expr must register before `is` expands — so this is a
 # multi-form `jolt run`, not an -e one-liner. The file self-checks its tallies.

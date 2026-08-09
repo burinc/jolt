@@ -21,19 +21,85 @@
 ;; for free (the future shim also installs an explicit snapshot, belt-and-suspenders).
 (define dyn-binding-stack (make-thread-parameter '()))
 
-;; find the innermost (cell . value) pair binding CELL, or #f.
-(define (dyn-find-binding cell)
+;; --- pushing a frame ---------------------------------------------------------
+;; THE one place a frame reaches the stack. Everything else — the loader's
+;; per-file vars, cpath-with-compile-files, the agent's *agent*, and
+;; push-thread-bindings itself — goes through here, so the dyn-bound? flags below
+;; cannot be set in some paths and forgotten in others. (Restoring a whole stack
+;; captured elsewhere, which is what the future/agent/executor conveyance does, is
+;; not a push: those frames were built by a push that already flagged them.)
+;; A hand-rolled loop rather than for-each: this is on every push, and the closure
+;; for-each wants cost a one-var frame ~7 ns of its 140.
+(define (dyn-push-frame! pairs)
+  (let loop ((p pairs))
+    (when (pair? p)
+      (var-cell-dyn-bound?-set! (caar p) #t)
+      (loop (cdr p))))
+  (dyn-binding-stack (cons pairs (dyn-binding-stack))))
+
+;; --- reading a var -----------------------------------------------------------
+;; THE GATE, and why every read below opens with it.
+;;
+;; dyn-bound? is Clojure's Var.threadBound. Without it every var reference in
+;; compiled code — every clojure.core/map?, every user fn — crossed the whole
+;; binding stack to discover there was nothing to find, because the stack is
+;; non-empty for the duration of any compile or load and `assq` cannot answer
+;; "absent" early. Measured, counting frames crossed:
+;;
+;;   emitting 120 nested fn literals   2.04M frames, 92.5% of them by lookups that
+;;                                     found nothing, 16 vars ever bound in the
+;;                                     whole process
+;;   compiling clojure/set.clj         194k frames, 99.4% by lookups that found
+;;                                     nothing, 20 vars ever bound
+;;
+;; So the walk was almost entirely spent proving a negative about vars nobody
+;; binds, and the flag answers exactly that in one field read: 6 ns flat against
+;; 1425 ns at depth 512 (bench/dyn-binding, `make dynbench`).
+;;
+;; WHAT MAKES IT SOUND is one invariant: if a cell appears in any frame of THIS
+;; THREAD's stack, its flag is set. Every way a stack comes to be preserves it —
+;; a push flags the frame's cells before publishing it (dyn-push-frame!, the only
+;; one), a pop only removes, and the future / agent / executor / fiber-slice paths
+;; install a stack some earlier push already built. The flag is never cleared, so
+;; nothing can un-flag a cell that is still bound somewhere.
+;;
+;; That is also why it needs no synchronisation. A binding is visible only to the
+;; thread that pushed it and to threads that inherited that stack at fork, and in
+;; both cases the flag write happened before the stack the reader can see. Cells
+;; flagged by an unrelated thread only cost this one a fruitless walk, which is
+;; the direction that is safe. A field write is a whole-value write — the same
+;; argument meta and macro? rest on.
+;;
+;; MONOTONE and process-wide, like the JVM's: a var bound once pays the walk
+;; forever after. That costs the ~16 vars that are genuinely dynamic nothing they
+;; were not already paying.
+;;
+;; What it does NOT do is make a var that IS bound cheap to find: that is still a
+;; walk, and still O(depth). It is 7.5% of the frames above and was not worth a
+;; second mechanism — jolt-3bo records the cumulative index that would kill it and
+;; the measurement that said not to bother yet.
+
+;; The walk itself, ungated, so the two readers below test the flag exactly once.
+;; Testing it in both dyn-find-binding and dyn-binding-value cost a bound var
+;; 8.5 -> 11.3 ns for nothing.
+(define (dyn-walk-frames cell)
   (let loop ((frames (dyn-binding-stack)))
     (and (pair? frames)
          (or (assq cell (car frames))
              (loop (cdr frames))))))
 
+;; the innermost (cell . value) pair binding CELL, or #f
+(define (dyn-find-binding cell)
+  (and (var-cell-dyn-bound? cell) (dyn-walk-frames cell)))
+
 ;; a unique sentinel: distinguishes "no thread binding" from a binding whose
 ;; value happens to be jolt-nil.
 (define dyn-no-binding (list 'no-binding))
+;; No empty-stack check of its own: the walk answers that in one pair?, and the
+;; gate has already turned away every var that is not dynamic.
 (define (dyn-binding-value cell)
-  (if (pair? (dyn-binding-stack))
-      (let ((p (dyn-find-binding cell)))
+  (if (var-cell-dyn-bound? cell)
+      (let ((p (dyn-walk-frames cell)))
         (if p
              (let ((val (cdr p)))
                val)   ; no auto-deref — a var-cell value is the value, like JVM
@@ -60,7 +126,7 @@
                          jolt-nil))))
                    (cons (cons cell v) acc))
                  '())))
-    (dyn-binding-stack (cons pairs (dyn-binding-stack)))
+    (dyn-push-frame! pairs)
     jolt-nil))
 
 (define (jolt-pop-thread-bindings)
@@ -83,11 +149,10 @@
       (let ((cells (map (lambda (nm) (var-cell-lookup "clojure.core" nm))
                         '("*warn-on-reflection*" "*assert*" "*unchecked-math*"))))
         (if (for-all values cells) cells 'missing))))
-  (dyn-binding-stack
-    (cons (if (pair? jolt-nsload-cells)
-              (map (lambda (c) (cons c (var-cell-root c))) jolt-nsload-cells)
-              '())
-          (dyn-binding-stack)))
+  (dyn-push-frame!
+    (if (pair? jolt-nsload-cells)
+        (map (lambda (c) (cons c (var-cell-root c))) jolt-nsload-cells)
+        '()))
   jolt-nil)
 (define (jolt-ns-load-vars-pop!)
   (when (pair? (dyn-binding-stack))
@@ -168,7 +233,7 @@
                                                (set! local-var-counter (fx+ local-var-counter 1))
                                                local-var-counter)))
                           (if (pair? args) (car args) jolt-nil)
-                          #t #f #f)))
+                          #t #f #f #f)))
     ;; Clojure builds these with Var/create + setDynamic, so a local var takes a
     ;; thread binding like any other — tools.reader hands one to with-bindings.
     (var-cell-meta-set! c local-var-meta)

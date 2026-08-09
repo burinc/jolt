@@ -853,9 +853,14 @@
                        (mp (cons (string-append vp " meta") path))
                        (m (var-cell-meta x)))
                   (if (image-rebuild-mode? mode)
+                      ;; dyn-bound? is NOT carried over: it is a per-process
+                      ;; observation ("someone bound this var here"), not part of
+                      ;; the var's value, and a rebuilt cell has had no bindings.
+                      ;; Copying it in would only cost the rebuilt var its fast
+                      ;; read path, never break it.
                       (let ((nx (make-var-cell (var-cell-ns x) (var-cell-name x)
                                                jolt-nil (var-cell-defined? x)
-                                               #f (var-cell-macro? x))))
+                                               #f (var-cell-macro? x) #f)))
                         (hashtable-set! memo x nx)
                         (var-cell-root-set! nx (walk (var-cell-root x) (cons vp path)))
                         (var-cell-meta-set! nx (and m (walk m mp)))

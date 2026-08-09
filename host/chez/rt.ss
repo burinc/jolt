@@ -504,9 +504,15 @@
 ;; safe (two threads writing one field write a whole value, never a torn
 ;; structure) and it is FASTER than the lookup it replaces, which matters because
 ;; macro-var? is on the analyzer's hot path.
+;;
+;; dyn-bound? is the "has this var EVER had a thread binding" flag — Clojure's
+;; Var.threadBound, and the whole reason a var read is not O(binding depth). See
+;; dyn-binding.ss, which owns it; it lives here because it has to be a field for
+;; the same reason meta and macro? are.
 (define-record-type var-cell
-  (fields ns name (mutable root) (mutable defined?) (mutable meta) (mutable macro?))
-  (nongenerative var-cell-v3))
+  (fields ns name (mutable root) (mutable defined?) (mutable meta) (mutable macro?)
+          (mutable dyn-bound?))
+  (nongenerative var-cell-v4))
 (define var-table (make-hashtable string-hash string=?))
 (define var-table-mu (make-mutex))
 ;; var-table-mu covers EVERY mutation of var-table and of ns-has-vars-set below
@@ -551,7 +557,7 @@
     (or (hashtable-ref var-table k #f)
         (with-mutex var-table-mu
           (or (hashtable-ref var-table k #f)
-              (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f)))
+              (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f)))
                 (hashtable-set! var-table k c)
                 c))))))
 ;; A whole-table scan is the one read that DOES need the lock, and for a different
@@ -731,7 +737,7 @@
           (let ((c (hashtable-ref var-table k #f)))
             (if c
                 (begin (var-cell-defined?-set! c #t) c)
-                (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f)))  ; declared => interned/resolvable
+                (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f)))  ; declared => interned/resolvable
                   (hashtable-set! var-table k c)
                   c)))))))
 
