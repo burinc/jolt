@@ -1124,23 +1124,45 @@
     (else (error 'jolt-fiber-run "fiber in unexpected state"
                  (jolt-fiber-state f)))))
 
-;; Completion paths: settle the fiber's payload, drop the consumed continuation,
-;; PUBLISH the terminal state (jolt-fiber-finish!, which also runs the monitors),
-;; clear the current-fiber vreg (the scheduler owns the CPU now — a stale vreg
-;; would make a later yield from a non-fiber context enqueue a dead fiber and
-;; invoke the consumed sched-k), then hand control back to the scheduler — again
-;; via the fiber's OWN carrier, the only one that can be running it. The carrier
-;; field is deliberately NOT cleared: placement is fixed at spawn (R0(d)) and the
-;; gates assert on it after completion.
+;; Completion paths: settle the fiber's payload, PUBLISH the terminal state
+;; (jolt-fiber-finish!, which also runs the monitors), clear the current-fiber vreg
+;; (the scheduler owns the CPU now — a stale vreg would make a later yield from a
+;; non-fiber context enqueue a dead fiber and invoke the consumed sched-k), drop the
+;; consumed continuation and the dynamic slice, then hand control back to the
+;; scheduler — again via the fiber's OWN carrier, the only one that can be running it.
 ;;
-;; The state goes LAST of the record writes, because it is what makes the rest
-;; readable from another thread: a monitor registering concurrently, and every
-;; gate that waits on a fiber by polling its state and then reading its result.
+;; WHAT MUST HAPPEN BEFORE WHAT, and it is not one rule but two (jolt-kdq7).
+;;
+;; The PAYLOAD — result and error — is written before the state, because the state is
+;; what publishes it: a monitor registering concurrently, and every gate that waits on
+;; a fiber by polling its state and then reading its result, both read the payload
+;; through the state.
+;;
+;; The SCHEDULER'S OWN FIELDS — k, sm, slice — are cleared AFTER it, and that is the
+;; opposite rule for the opposite reason. They publish nothing: only jolt-fiber-run and
+;; resume* read them, on this carrier's own thread. What they are is state a park needs,
+;; so clearing them while the fiber can still be parked is a trap. It was one: cleared
+;; first, the fiber sat 'running with no slice, and a timer landing in that window
+;; parked it and made jolt-fiber-slice-save! write into #f. The raise is inside the
+;; handler and this function is called outside resume*'s guard, so it took the CARRIER
+;; thread with it and stranded every fiber pinned to it — a wedged program with no
+;; error pointing anywhere near the fiber that completed.
+;;
+;; So the clears sit where nothing can park the fiber, and TWO independent things put
+;; them there rather than one. The vreg goes to 0 first, so a timer arriving from here
+;; on finds no fiber at all and the handler's off-fiber arm does nothing. And the state
+;; is already terminal, so even with the vreg set the handler refuses (jolt-9d3m).
+;; Belt and braces on purpose: this failure does not look like its cause.
+;;
+;; The remaining window — after result-set!, before finish! — is preemptible, and that
+;; is fine and not an oversight: the slice is still live there, so the park saves and
+;; the resume restores, and the fiber comes back and finishes. Nothing in the payload
+;; write is order-sensitive against being re-entered.
+;;
+;; The carrier field is deliberately NOT cleared: placement is fixed at spawn (R0(d))
+;; and the gates assert on it after completion.
 (define (jolt-fiber-done! f r)
   (jolt-fiber-result-set! f r)
-  (jolt-fiber-k-set! f #f)
-  (jolt-fiber-sm-set! f #f)
-  (jolt-fiber-slice-set! f #f)
   ;; #f and not a condition: jolt-fiber-go-spawn catches a throwing body inside
   ;; the fiber thunk (it has to, so it can report and close the go channel), so
   ;; that fiber finishes NORMALLY and only its error field says otherwise. #f
@@ -1148,14 +1170,17 @@
   ;; a fiber that genuinely succeeded.
   (jolt-fiber-finish! f 'done #f)
   (set-virtual-register! jolt-vreg-current-fiber 0)
-  ((jolt-carrier-sched-k (jolt-fiber-carrier f))))
-
-(define (jolt-fiber-dead! f e)
   (jolt-fiber-k-set! f #f)
   (jolt-fiber-sm-set! f #f)
   (jolt-fiber-slice-set! f #f)
+  ((jolt-carrier-sched-k (jolt-fiber-carrier f))))
+
+(define (jolt-fiber-dead! f e)
   (jolt-fiber-finish! f 'dead e)
   (set-virtual-register! jolt-vreg-current-fiber 0)
+  (jolt-fiber-k-set! f #f)
+  (jolt-fiber-sm-set! f #f)
+  (jolt-fiber-slice-set! f #f)
   ((jolt-carrier-sched-k (jolt-fiber-carrier f))))
 
 ;; (jolt-fiber-drain! c) -> void. Run carrier c's run queue until it drains —

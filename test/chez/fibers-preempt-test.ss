@@ -487,6 +487,81 @@
     (let ((c (vector-ref jolt-fiber-carriers 0)))
       (and (not (jolt-carrier-head c)) (not (jolt-carrier-tail c)))))
 
+;; --- 13. the completion path is a transition too (jolt-kdq7) ------------------
+;; Section 12 is about a fiber that has committed to PARK. This is the other
+;; multi-write transition that reads as atomic and is not: jolt-fiber-done! settled
+;; the payload, dropped the scheduler's own fields, and published the terminal state
+;; last — so between the slice going and the state arriving the fiber was still
+;; 'running with no slice, and a preemption there parked it and made
+;; jolt-fiber-slice-save! write into #f. That raise is inside the timer handler and
+;; jolt-fiber-done! is called outside resume*'s guard, so it killed the CARRIER, and
+;; every fiber pinned to it was stranded — a wedged program with no error pointing at
+;; the fiber that completed.
+;;
+;; AIMED, not waited for. A quantum landing in a three-poll window is a coin flip
+;; nobody should gate on, so the fiber's last act is (set-timer n) and a return: the
+;; tick then falls due n poll points into the completion path, and sweeping n walks
+;; the whole path. 3 of the first 40 offsets parked a slice-less fiber before the fix.
+;;
+;; The probe is a wrapper on jolt-fiber-slice-save!, which is where the write happened
+;; and therefore the only place that can see it — a fiber that survives tells you
+;; nothing, because a park with no slice restores nothing and often gets away with it.
+(jolt-fiber-pool-reset!)
+(jolt-fiber-carrier-count-set! 1)
+(jolt-fiber-preempt-ticks-set! #f)
+
+(define cp-bad 0)
+(define cp-orig jolt-fiber-slice-save!)
+(set! jolt-fiber-slice-save!
+  (lambda (f)
+    (if (jolt-dslice? (jolt-fiber-slice f))
+        (cp-orig f)
+        ;; do NOT write, so the sweep can finish and report every offset rather than
+        ;; dying on the first
+        (set! cp-bad (+ cp-bad 1)))))
+
+(define CP-N 40)
+(define cp-before (jolt-fiber-preempts))
+(define cp-unfinished 0)
+(let loop ((n 1))
+  (when (<= n CP-N)
+    (let ((f (sa-fiber-spawn (lambda () (set-timer n) 'v))))
+      (sa-fiber-run-all)
+      ;; a preempted fiber goes back on the queue, so keep draining until it settles
+      (let drain ((k 0))
+        (cond ((memq (jolt-fiber-state f) '(done dead)) #t)
+              ((< k 50) (sa-fiber-run-all) (drain (+ k 1)))
+              (else (set! cp-unfinished (+ cp-unfinished 1)))))
+      (loop (+ n 1)))))
+(set-timer 0)
+(set! jolt-fiber-slice-save! cp-orig)
+
+;; The control: without preemptions landing in that path the sweep proves nothing.
+(ok "13. the aimed ticks did preempt inside the completion path"
+    (> (jolt-fiber-preempts) cp-before))
+(ok "13. no offset parks a fiber whose slice has been cleared" (= 0 cp-bad))
+(ok "13. every fiber in the sweep finished" (= 0 cp-unfinished))
+
+;; And the fields really are cleared by the time the fiber is finished — the fix moves
+;; the clears, it does not drop them. A retained continuation or slice on a completed
+;; fiber is a stack segment and a dynamic slice that never get collected.
+(define cp-f (sa-fiber-spawn (lambda () 'v)))
+(sa-fiber-run-all)
+(ok "13. a completed fiber still drops its continuation, sm step and slice"
+    (and (eq? 'done (jolt-fiber-state cp-f))
+         (not (jolt-fiber-k cp-f))
+         (not (jolt-fiber-sm cp-f))
+         (not (jolt-fiber-slice cp-f))
+         (eq? 'v (jolt-fiber-result cp-f))))
+;; The same for the dying path, which has the identical shape.
+(define cp-d (sa-fiber-spawn (lambda () (error 'cp "boom"))))
+(sa-fiber-run-all)
+(ok "13. and so does one that died, with its condition kept"
+    (and (eq? 'dead (jolt-fiber-state cp-d))
+         (not (jolt-fiber-k cp-d))
+         (not (jolt-fiber-slice cp-d))
+         (jolt-fiber-error cp-d)))
+
 (jolt-fiber-preempt-ticks-set! #f)
 (jolt-fiber-pool-reset!)
 
