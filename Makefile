@@ -67,6 +67,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
+        gambitgen gambitgencheck \
         fibersbench dynbench \
         fibersresidue
 
@@ -121,7 +122,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   fnform traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck lockcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
-  certify gambitcheck fibers gosm threadsafety
+  certify gambitcheck gambitgencheck fibers gosm threadsafety
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -631,6 +632,7 @@ makefilesmoke:
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
 certify:
 	@if command -v clojure >/dev/null 2>&1; then \
+		clojure -M test/conformance/certify.clj --self-test && \
 		clojure -M test/conformance/certify.clj; \
 	else \
 		echo "certify: clojure not on PATH — skipped"; \
@@ -643,6 +645,29 @@ certify:
 # Ghostscript): always the brew-prefix binary.
 GAMBIT_GSI := $(shell brew --prefix gambit-scheme 2>/dev/null)/bin/gsi
 GAMBIT_GSC := $(shell brew --prefix gambit-scheme 2>/dev/null)/bin/gsc
+
+# host/gambit/records-gambit.ss is GENERATED from host/chez/records.ss (the
+# define-jrec-family phase wall — see gen-records.ss). Regenerate after every
+# records.ss change.
+gambitgen:
+	$(CHEZ) --script host/gambit/gen-records.ss
+
+# ...and this is what makes that an invariant rather than a note: regenerate into
+# a temp file and diff. A records.ss change that never reached the generated file
+# fails here instead of silently leaving the Gambit host a release behind. Runs
+# on Chez alone, so it gates in CI whether or not gambit is installed.
+gambitgencheck:
+	@out=$$(mktemp -d)/records-gambit.ss; \
+	  GEN_RECORDS_OUT="$$out" $(CHEZ) --script host/gambit/gen-records.ss >/dev/null; \
+	  if diff -q "$$out" host/gambit/records-gambit.ss >/dev/null; then \
+	    echo "gambitgencheck: records-gambit.ss is current with records.ss"; \
+	  else \
+	    echo "gambitgencheck: host/gambit/records-gambit.ss is STALE — run 'make gambitgen'" >&2; \
+	    diff -u host/gambit/records-gambit.ss "$$out" | head -40 >&2; \
+	    rm -f "$$out"; exit 1; \
+	  fi; \
+	  rm -f "$$out"
+
 gambitcheck:
 	@if [ -x "$(GAMBIT_GSI)" ]; then \
 		"$(GAMBIT_GSI)" host/gambit/gambitcheck.ss; \

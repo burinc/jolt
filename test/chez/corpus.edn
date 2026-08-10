@@ -6,6 +6,20 @@
   {:suite "host-interop / PersistentList-create" :label "an empty created list is list?" :expected "true" :actual "(list? (clojure.lang.PersistentList/create []))" :portability :jvm}
   {:suite "host-interop / PersistentList-create" :label "created list agrees with a literal on list?/seq?/class" :expected "[true true true]" :actual "(let [c (clojure.lang.PersistentList/create [1 2 3])] [(= (list? c) (list? (quote (1 2 3)))) (seq? c) (= c (quote (1 2 3)))])" :portability :jvm}
   {:suite "host-interop / reify ILookup" :label "(get reify k) / (:k reify) / (get reify k d) route to valAt" :expected "[1 1 :dflt]" :actual "(let [r (reify clojure.lang.ILookup (valAt [_ k] (get {:a 1} k)) (valAt [_ k d] (get {:a 1} k d)))] [(:a r) (get r :a) (get r :z :dflt)])" :portability :jvm}
+  ;; (.-x obj) is Reflector.getInstanceField: a DECLARED deftype/defrecord slot and
+  ;; nothing else. Not a key assoc'd onto a record, not a map key, not a method of
+  ;; the same name. It used to answer nil for all of those, which reads as a field
+  ;; that is present and nil and sends the caller down the wrong branch.
+  {:suite "host-interop / .-field reads a declared field" :label "a record's own slot, nil value and all" :expected "[1 nil 7]" :actual "(do (ns fld.ns) (clojure.core/defrecord Fa [a b]) (clojure.core/deftype Tk [x]) [(.-a (fld.ns/->Fa 1 2)) (.-a (fld.ns/->Fa nil 2)) (.-x (fld.ns/->Tk 7))])" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "a slot the record does not declare" :expected "\"No matching field found: zz for class fldb.ns.Fb\"" :actual "(do (ns fldb.ns) (clojure.core/defrecord Fb [a]) (clojure.core/try (.-zz (fldb.ns/->Fb 1)) (clojure.core/catch IllegalArgumentException e (.getMessage e))))" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "a key assoc'd onto a record is not a field" :expected "\"No matching field found: zz for class fldc.ns.Fc\"" :actual "(do (ns fldc.ns) (clojure.core/defrecord Fc [a]) (clojure.core/try (.-zz (clojure.core/assoc (fldc.ns/->Fc 1) :zz 9)) (clojure.core/catch IllegalArgumentException e (.getMessage e))))" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "a method of the same name is not a field" :expected "\"No matching field found: count for class clojure.lang.PersistentVector\"" :actual "(try (.-count [1 2]) (catch IllegalArgumentException e (.getMessage e)))" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "a string and a set have no fields at all" :expected "[\"No matching field found: a for class java.lang.String\" \"No matching field found: a for class clojure.lang.PersistentHashSet\"]" :actual "(mapv (fn [x] (try (.-a x) (catch IllegalArgumentException e (.getMessage e)))) [\"s\" #{1}])" :portability :jvm}
+  ;; A no-arg (.x obj) tries the method and then the FIELD, so its miss is worded as
+  ;; a field; a miss WITH arguments can only have been a method.
+  {:suite "host-interop / .-field reads a declared field" :label "a missed 0-arg member read reports as a field, a 1-arg one as a method" :expected "[\"No matching field found: nosuch for class java.lang.String\" \"No matching method nosuch found taking 1 args for class java.lang.String\"]" :actual "[(try (.nosuch \"s\") (catch IllegalArgumentException e (.getMessage e))) (try (.nosuch \"s\" 1) (catch IllegalArgumentException e (.getMessage e)))]" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "and a java.util.Map reports its class, not an internal tag" :expected "[\"No matching field found: nosuch for class java.util.HashMap\" \"No matching method nosuch found taking 1 args for class java.util.HashMap\"]" :actual "(let [h (java.util.HashMap.)] [(try (.nosuch h) (catch IllegalArgumentException e (.getMessage e))) (try (.nosuch h 1) (catch IllegalArgumentException e (.getMessage e)))])" :portability :jvm}
+  {:suite "host-interop / .-field reads a declared field" :label "method reads are untouched" :expected "[2 1 \"AB\"]" :actual "[(.count [1 2]) (.valAt {:a 1} :a) (.toUpperCase \"ab\")]" :portability :jvm}
   ;; A pattern the engine will not compile is a PatternSyntaxException, catchable
   ;; as itself or as IllegalArgumentException. It used to escape as an unnamed
   ;; condition, and — worse — the compile ran inside the regex cache's mutex, so
@@ -755,7 +769,11 @@
   {:suite "hierarchy / global + multimethod dispatch" :label "dispatch exact beats isa" :expected ":exact" :actual "(do (derive :de/e1 :de/e2) (defmulti emm identity) (defmethod emm :de/e2 [_] :parent) (defmethod emm :de/e1 [_] :exact) (emm :de/e1))" :portability :common}
   {:suite "interop / dot forms" :label "method call" :expected "\"v=41\"" :actual "(. {:value 41 :describe (fn [self] (str \"v=\" (:value self)))} describe)" :portability :jvm}
   {:suite "interop / dot forms" :label "method with args" :expected "\"Hello Alice\"" :actual "(. {:greet (fn [self n] (str \"Hello \" n))} greet \"Alice\")" :portability :jvm}
+  ;; jolt's map-as-object read (dot-forms.ss): a key the map HAS reads as a field.
+  ;; The JVM throws here — see known-divergences.edn. A key it does NOT have throws
+  ;; on both, which is the row below.
   {:suite "interop / dot forms" :label "field access .-" :expected "41" :actual "(.-value {:value 41})" :portability :jvm}
+  {:suite "interop / dot forms" :label "field access .- of an absent key is an error, not nil" :expected "\"No matching field found: nope for class clojure.lang.PersistentArrayMap\"" :actual "(try (.-nope {:value 41}) (catch IllegalArgumentException e (.getMessage e)))" :portability :jvm}
   {:suite "interop / dot forms" :label "dot field keyword" :expected "41" :actual "(. {:value 41} :value)" :portability :jvm}
   {:suite "interop / dot dispatch arms" :label "zero-arg coll-interop .count" :expected "3" :actual "(.count [1 2 3])" :portability :jvm}
   {:suite "interop / dot dispatch arms" :label "zero-arg coll-interop .seq" :expected "[1 2]" :actual "(.seq [1 2])" :portability :jvm}
@@ -1341,6 +1359,29 @@
   {:suite "map / access" :label "contains? key" :expected "true" :actual "(contains? {:a 1} :a)" :portability :common}
   {:suite "map / access" :label "contains? missing" :expected "false" :actual "(contains? {:a 1} :z)" :portability :common}
   {:suite "map / access" :label "find returns entry" :expected "[:a 1]" :actual "(find {:a 1} :a)" :portability :common}
+  ;; Same rule as the set lookups below: a map answers with the key it is HOLDING,
+  ;; not the equal one the caller probed with, and assoc replacing a value must not
+  ;; swap that key out. Only the stored key carries the metadata.
+  {:suite "map / the stored key, not the probe key" :label "find's entry carries the map's own key" :expected "{:a 1}" :actual "(meta (key (find (assoc {} ^{:a 1} [1 2] :v) [1 2])))" :portability :common}
+  {:suite "map / the stored key, not the probe key" :label "and does past the array-map threshold, in the trie" :expected "{:a 1}" :actual "(meta (key (find (into (assoc {} ^{:a 1} [1 2] :v) (map (fn [i] [[i i i] i]) (range 40))) [1 2])))" :portability :common}
+  {:suite "map / the stored key, not the probe key" :label "a sorted map answers from its node" :expected "{:a 1}" :actual "(meta (key (find (sorted-map ^{:a 1} [1 2] :v) [1 2])))" :portability :common}
+  {:suite "map / the stored key, not the probe key" :label "assoc of a new value keeps the stored key" :expected "{:a 1}" :actual "(meta (first (keys (assoc {^{:a 1} [1 2] :v1} ^{:a 2} [1 2] :v2))))" :portability :common}
+  {:suite "map / the stored key, not the probe key" :label "so does assoc in the trie" :expected "{:a 1}" :actual "(meta (first (filter (fn [k] (= k [1 2])) (keys (assoc (into (assoc {} ^{:a 1} [1 2] :v1) (map (fn [i] [[i i i] i]) (range 40))) ^{:a 2} [1 2] :v2)))))" :portability :common}
+  ;; [324 794] and [681 114] have the same full hash, so they share one collision
+  ;; bucket — a different replace path than the trie leaf above.
+  {:suite "map / the stored key, not the probe key" :label "and a hash-collision bucket" :expected "[{:a 1} :v3 :v2]" :actual "(let [m (assoc (assoc {} ^{:a 1} [324 794] :v1) [681 114] :v2) m2 (assoc m ^{:a 2} [324 794] :v3)] [(meta (first (filter (fn [k] (= k [324 794])) (keys m2)))) (get m2 [324 794]) (get m2 [681 114])])" :portability :common}
+  {:suite "map / the stored key, not the probe key" :label "which find reads through as well" :expected "{:a 1}" :actual "(meta (key (find (assoc (assoc (assoc {} ^{:a 1} [324 794] :v1) [681 114] :v2) ^{:a 2} [324 794] :v3) [324 794])))" :portability :common}
+  {:suite "map / the stored key, not the probe key" :label "select-keys carries the source map's keys over" :expected "{:a 1}" :actual "(meta (first (keys (select-keys (assoc {} ^{:a 1} [1 2] :v) [[1 2]]))))" :portability :common}
+  ;; RT.find takes nil, Associative and java.util.Map (plus the key-addressable
+  ;; transients). A set, a string or a list is an IllegalArgumentException, not a
+  ;; silently-minted entry.
+  {:suite "map / find's accepted types" :label "a set is not associative" :expected "\"find not supported on type: clojure.lang.PersistentHashSet\"" :actual "(try (find #{1} 1) (catch IllegalArgumentException e (.getMessage e)))" :portability :common}
+  {:suite "map / find's accepted types" :label "and neither is a sorted set" :expected "\"find not supported on type: clojure.lang.PersistentTreeSet\"" :actual "(try (find (sorted-set 1) 1) (catch IllegalArgumentException e (.getMessage e)))" :portability :common}
+  {:suite "map / find's accepted types" :label "nor a string, keyword or list" :expected "[\"java.lang.String\" \"clojure.lang.Keyword\" \"clojure.lang.PersistentList\"]" :actual "(mapv (fn [x] (try (find x 0) (catch IllegalArgumentException e (clojure.string/replace (.getMessage e) \"find not supported on type: \" \"\")))) [\"ab\" :kw (list 1 2)])" :portability :common}
+  {:suite "map / find's accepted types" :label "nil finds nothing rather than throwing" :expected "nil" :actual "(find nil :a)" :portability :common}
+  {:suite "map / find's accepted types" :label "a record and a vector are associative" :expected "[[:a 1] [1 :y]]" :actual "(do (ns fnd.ns) (clojure.core/defrecord Fr [a]) [(clojure.core/find (fnd.ns/->Fr 1) :a) (clojure.core/find [:x :y] 1)])" :portability :common}
+  {:suite "map / find's accepted types" :label "a transient map and vector are, a transient set is not" :expected "[[:a 1] [1 :y] \"clojure.lang.PersistentHashSet$TransientHashSet\"]" :actual "[(find (transient {:a 1}) :a) (find (transient [:x :y]) 1) (try (find (transient #{1}) 1) (catch IllegalArgumentException e (clojure.string/replace (.getMessage e) \"find not supported on type: \" \"\")))]" :portability :common}
+  {:suite "map / find's accepted types" :label "select-keys inherits find's type check" :expected "\"find not supported on type: clojure.lang.PersistentHashSet\"" :actual "(try (select-keys #{1} [1]) (catch IllegalArgumentException e (.getMessage e)))" :portability :common}
   {:suite "map / access" :label "keys" :expected "true" :actual "(= #{:a :b} (set (keys {:a 1 :b 2})))" :portability :common}
   {:suite "map / access" :label "vals" :expected "true" :actual "(= #{1 2} (set (vals {:a 1 :b 2})))" :portability :common}
   {:suite "map / update" :label "assoc adds" :expected "{:a 1, :b 2}" :actual "(assoc {:a 1} :b 2)" :portability :common}
@@ -2706,6 +2747,30 @@
   {:suite "set / operations" :label "get missing nil" :expected "nil" :actual "(get #{1 2} 9)" :portability :common}
   {:suite "set / operations" :label "set as fn present" :expected "2" :actual "(#{1 2 3} 2)" :portability :common}
   {:suite "set / operations" :label "set as fn missing" :expected "nil" :actual "(#{1 2 3} 9)" :portability :common}
+  ;; A set lookup answers with the element the set is HOLDING, not with the probe
+  ;; key that was equal to it. Only the stored one carries the element's metadata,
+  ;; and farolero's return-from reads exactly that: *bound-blocks* is a set of
+  ;; ^{:on-stack? volatile} [thread block-name] pairs, looked up by an equal but
+  ;; bare pair, then (meta block) is deref'd.
+  {:suite "set / lookup returns the stored element" :label "a set as a fn hands back the stored element, with its metadata" :expected "{:a 1}" :actual "(meta (#{^{:a 1} [1 2]} [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "get hands back the stored element, not the probe key" :expected "{:a 1}" :actual "(meta (get #{^{:a 1} [1 2]} [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "the not-found arity does too" :expected "{:a 1}" :actual "(meta (get #{^{:a 1} [1 2]} [1 2] :d))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "the element is identical? to the one that went in" :expected "true" :actual "(let [e ^{:a 1} [1 2]] (identical? e (get #{e} [1 2])))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "conj of an equal element keeps the one already stored" :expected "{:a 1}" :actual "(meta (get (conj #{^{:a 1} [1 2]} ^{:a 2} [1 2]) [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "into and set build through that same conj" :expected "[{:a 1} {:a 1}]" :actual "(let [e ^{:a 1} [1 2]] [(meta (get (into #{} [e]) [1 2])) (meta (get (set [e]) [1 2]))])" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "a set deep enough to be a trie, not a single node" :expected "{:a 1}" :actual "(meta (get (into #{} (concat (map vector (range 40)) [^{:a 1} [1 2]])) [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "disj of an unrelated element leaves it stored" :expected "{:a 1}" :actual "(meta (get (disj (conj #{^{:a 1} [1 2]} [9 9]) [9 9]) [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "a transient set's get" :expected "{:a 1}" :actual "(meta (get (conj! (transient #{}) ^{:a 1} [1 2]) [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "a transient set is callable, and answers the same" :expected "{:a 1}" :actual "(meta ((conj! (transient #{}) ^{:a 1} [1 2]) [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "a transient made from a populated set keeps its elements" :expected "{:a 1}" :actual "(meta (get (transient #{^{:a 1} [1 2]}) [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "conj! of an equal element REPLACES it, unlike the persistent conj" :expected "{:a 2}" :actual "(meta (get (-> (transient #{}) (conj! ^{:a 1} [1 2]) (conj! ^{:a 2} [1 2])) [1 2]))" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "persistent! carries the stored element out" :expected "{:a 1}" :actual "(meta (get (persistent! (conj! (transient #{}) ^{:a 1} [1 2])) [1 2]))" :portability :common}
+  ;; conj! keeps the element already filed as the KEY and stores the new one as the
+  ;; lookup value, and persistent! carries that split through: seq answers with the
+  ;; first, get with the second. A set rebuilt element-by-element would collapse it.
+  {:suite "set / lookup returns the stored element" :label "persistent! keeps conj!'s split — seq gives the first, get the second" :expected "[{:a 1} {:a 2}]" :actual "(let [s (persistent! (-> (transient #{}) (conj! ^{:a 1} [1 2]) (conj! ^{:a 2} [1 2])))] [(meta (first (seq s))) (meta (get s [1 2]))])" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "a stored nil is found, and is not the not-found value" :expected "[nil :absent]" :actual "[(get #{nil} nil :absent) (get #{1} nil :absent)]" :portability :common}
+  {:suite "set / lookup returns the stored element" :label "a sorted set answers with its stored element too" :expected "{:a 1}" :actual "(meta ((sorted-set ^{:a 1} [1 2]) [1 2]))" :portability :common}
   {:suite "set / literals & value elements" :label "literal evaluates elements" :expected "#{4 2}" :actual "#{(inc 1) (* 2 2)}" :portability :common}
   {:suite "set / literals & value elements" :label "map elements by value" :expected "true" :actual "(= #{{:a 1}} #{(hash-map :a 1)})" :portability :common}
   {:suite "set / literals & value elements" :label "contains? map by value" :expected "true" :actual "(contains? #{(hash-map :x 1)} {:x 1})" :portability :common}
@@ -4250,11 +4315,11 @@
   {:suite "interop / exceptions" :label "StackOverflowError is an Error with its own class" :expected "[true true]" :actual "(let [e (java.lang.StackOverflowError. \"so\")] [(instance? Error e) (= java.lang.StackOverflowError (class e))])" :portability :jvm}
   {:suite "interop / exceptions" :label "NoSuchElementException is a RuntimeException" :expected "true" :actual "(instance? RuntimeException (java.util.NoSuchElementException. \"n\"))" :portability :jvm}
   {:suite "interop / exceptions" :label "ArityException carries the JVM message" :expected "\"Wrong number of args (3) passed to: foo\"" :actual "(ex-message (clojure.lang.ArityException. 3 \"foo\"))" :portability :jvm}
-  {:suite "conformance / destructuring" :label "rest-pattern positional elements walk the seq (a map destructures)" :expected "[:a 1 ([:b 2])]" :actual "(let [[[k v] & ks] {:a 1 :b 2}] [k v ks])" :portability :common}
-  {:suite "conformance / destructuring" :label "rest-pattern over a vector unchanged" :expected "[1 2 (3 4)]" :actual "(let [[a b & r] [1 2 3 4]] [a b r])" :portability :common}
+  {:suite "conformance / destructuring" :label "rest-pattern positional elements walk the seq (a map destructures)" :expected "[:a 1 (quote ([:b 2]))]" :actual "(let [[[k v] & ks] {:a 1 :b 2}] [k v ks])" :portability :common}
+  {:suite "conformance / destructuring" :label "rest-pattern over a vector unchanged" :expected "[1 2 (quote (3 4))]" :actual "(let [[a b & r] [1 2 3 4]] [a b r])" :portability :common}
   {:suite "conformance / regex" :label "hex escapes match their characters" :expected "\"aAb\"" :actual "(re-find #\"a\\x41b\" \"aAb\")" :portability :common}
   {:suite "interop / class model" :label "str of a named fn is class@hash" :expected "true" :actual "(boolean (re-find #\"^clojure\\.core\\$inc@\" (str inc)))" :portability :jvm}
-  {:suite "conformance / seq" :label "keys and vals accept a seq of map entries" :expected "[(:a :c) (1 3)]" :actual "(let [es (filter (fn [[k v]] (odd? v)) {:a 1 :b 2 :c 3})] [(keys es) (vals es)])" :portability :common}
+  {:suite "conformance / seq" :label "keys and vals accept a seq of map entries" :expected "[(quote (:a :c)) (quote (1 3))]" :actual "(let [es (filter (fn [[k v]] (odd? v)) {:a 1 :b 2 :c 3})] [(keys es) (vals es)])" :portability :common}
   {:suite "conformance / regex" :label "unicode escapes match their characters" :expected "\"A\"" :actual "(re-find #\"\\u0041\" \"zAz\")" :portability :common}
   {:suite "interop / strings" :label "String repeat and isBlank" :expected "[\"ababab\" true false]" :actual "[(.repeat \"ab\" 3) (.isBlank \"  \") (.isBlank \"a\")]" :portability :jvm}
   {:suite "interop / io" :label "*out* is a java.io.Writer" :expected "true" :actual "(instance? java.io.Writer *out*)" :portability :jvm}
@@ -4309,7 +4374,7 @@
   ;; ============================================================================
   ;; conformance / hamt-order — JVM PersistentHashMap/HashSet iteration order (Stage 2)
   ;; ============================================================================
-  {:suite "conformance / hamt-order" :label "zipmap 12 entries hash-iteration order" :expected "([0 0] [7 7] [1 1] [4 4] [6 6] [3 3] [2 2] [11 11] [9 9] [5 5] [10 10] [8 8])" :actual "(pr-str (seq (zipmap (range 12) (range 12))))" :portability :common}
+  {:suite "conformance / hamt-order" :label "zipmap 12 entries hash-iteration order" :expected "\"([0 0] [7 7] [1 1] [4 4] [6 6] [3 3] [2 2] [11 11] [9 9] [5 5] [10 10] [8 8])\"" :actual "(pr-str (seq (zipmap (range 12) (range 12))))" :portability :common}
   ;; ============================================================================
   ;; conformance / stage3 — drop insertion-order accommodations
   ;; ============================================================================
@@ -4440,15 +4505,15 @@
   {:suite "munging / jolt-nil local" :label "a local named jolt-nil must not shadow the runtime nil" :expected "nil" :actual "(let [jolt-nil 5] nil)" :portability :common}
   {:suite "munging / fl+ local" :label "a local named fl+ must not shadow the flonum add" :expected "3.0" :actual "(let [fl+ 1] (+ fl+ 2.0))" :portability :common}
   {:suite "munging / var-deref local" :label "a local named var-deref must not shadow the runtime var-deref" :expected "9" :actual "(let [var-deref 9] var-deref)" :portability :common}
-  {:suite "reader / float N suffix" :label "1e2N rejects float with N suffix" :expected "throws" :actual "(read-string \"1e2N\")" :portability :common}
-  {:suite "reader / surrogate in string" :label "\\ud800 in string throws Invalid character constant" :expected "throws" :actual "(read-string \"\\\"\\\\ud800\\\"\")" :portability :common}
-  {:suite "reader / top-level splice" :label "#?@ at top level throws" :expected "throws" :actual "(read-string \"#?@(:clj [1])\")" :portability :common}
+  {:suite "reader / float N suffix" :label "1e2N rejects float with N suffix" :expected :throws :actual "(read-string \"1e2N\")" :portability :common}
+  {:suite "reader / surrogate in string" :label "\\ud800 in string throws Invalid character constant" :expected :throws :actual "(read-string \"\\\"\\\\ud800\\\"\")" :portability :common}
+  {:suite "reader / top-level splice" :label "#?@ at top level throws" :expected :throws :actual "(read-string \"#?@(:clj [1])\")" :portability :common}
   {:suite "reader / record literal" :label "#ns.Type{} constructs record in read-string" :expected "42" :actual "(do (defrecord Rdlit [a]) (:a (read-string \"#user.Rdlit{:a 42}\")))" :portability :common}
   {:suite "reader / record vector ctor" :label "#ns.Type[] constructs record from vector" :expected "\"a\"" :actual "(do (defrecord Rdlvec [x y]) (:x (read-string \"#user.Rdlvec[\\\"a\\\" 2]\")))" :portability :common}
   {:suite "reader / qualified arrow call" :label "a qualified ->name call is a list, not a record ctor to apply" :expected "true" :actual "(= (list 'u/->long 1) (read-string \"(u/->long 1)\"))" :portability :common}
   {:suite "reader / qualified arrow call" :label "a qualified map->name call is a list too" :expected "true" :actual "(= (list 'u/map->Foo {:a 1}) (read-string \"(u/map->Foo {:a 1})\"))" :portability :common}
-  {:suite "reader / EOF in unicode escape" :label "\\\\u with <4 hex digits throws" :expected "throws" :actual "(read-string \"\\\"\\\\uD\\\"\")" :portability :common}
-  {:suite "reader / EOF in regex backslash" :label "trailing backslash in regex throws" :expected "throws" :actual "(read-string \"#\\\"a\\\\\")" :portability :common}
+  {:suite "reader / EOF in unicode escape" :label "\\\\u with <4 hex digits throws" :expected :throws :actual "(read-string \"\\\"\\\\uD\\\"\")" :portability :common}
+  {:suite "reader / EOF in regex backslash" :label "trailing backslash in regex throws" :expected :throws :actual "(read-string \"#\\\"a\\\\\")" :portability :common}
   {:suite "syntax-quote / defmacro qualified" :label "`defmacro qualifies to ns, not bare" :expected "true" :actual "(not= 'defmacro (second (read-string \"`defmacro\")))" :portability :common}
   {:suite "syntax-quote / catch bare" :label "`catch stays bare (special form)" :expected "true" :actual "(= 'catch (second (read-string \"`catch\")))" :portability :common}
   {:suite "syntax-quote / reify* bare" :label "`reify* stays bare (special form)" :expected "true" :actual "(= 'reify* (second (read-string \"`reify*\")))" :portability :common}
@@ -4466,7 +4531,7 @@
  ;; Stage C — positional ctor throws on wrong arity
  {:suite "records / ctor-arity" :label "positional ctor throws on 1 arg for 2-field record" :expected ":arity-throw" :actual "(do (defrecord ArC9 [x y]) (try (->ArC9 1) (catch Exception e :arity-throw)))" :portability :common}
  ;; Stage D — range step 0 repeats infinitely
- {:suite "seq / range-step-zero" :label "range step 0 repeats start infinitely" :expected "(5 5 5)" :actual "(take 3 (range 5 10 0))" :portability :jvm}
+ {:suite "seq / range-step-zero" :label "range step 0 repeats start infinitely" :expected "(quote (5 5 5))" :actual "(take 3 (range 5 10 0))" :portability :jvm}
  ;; Stage D — binding does not auto-deref var-cell
  {:suite "binding / no-auto-deref" :label "binding does not auto-deref var-cell value" :expected "\"clojure.lang.Var\"" :actual "(do (def ^:dynamic *bd11* 10) (def bd11v 20) (.getName (class (binding [*bd11* (var bd11v)] *bd11*))))" :portability :common}
   {:suite "sorted / subseq seek" :label "boundary comparators map+set batch" :expected "'[([2 :b] [3 :c]) ([1 :a] [2 :b]) ([1 :a] [2 :b]) ([3 :c] [2 :b]) (5 9) (5 1) nil nil]" :actual "[(subseq (sorted-map 1 :a 2 :b 3 :c) >= 2) (subseq (sorted-map 1 :a 2 :b 3 :c) < 3) (subseq (sorted-map 1 :a 2 :b 3 :c) <= 2) (rsubseq (sorted-map 1 :a 2 :b 3 :c) > 1) (subseq (sorted-set 1 5 9) > 4) (rsubseq (sorted-set 1 5 9) < 6) (subseq (sorted-map) > 1) (subseq (sorted-map 5 :e) > 5)]" :portability :common}
@@ -4704,4 +4769,30 @@
   {:suite "protocols / cross-ns extend" :label "extend-protocol to a record named by its fully-qualified name, from a third ns" :expected "42" :actual "(do (ns fqx.a) (clojure.core/defrecord Box [v]) (ns fqx.b) (clojure.core/defprotocol Unwrap (unwrap [this])) (ns fqx.c) (clojure.core/extend-protocol fqx.b/Unwrap fqx.a.Box (unwrap [this] (:v this))) (fqx.b/unwrap (fqx.a/->Box 42)))" :portability :common :jvm-certified true}
   {:suite "protocols / specificity" :label "a more specific class beats the Object default (Throwable)" :expected ":throwable" :actual "(do (defprotocol Pd (fd [x])) (extend-protocol Pd Object (fd [_] :object)) (extend-protocol Pd Throwable (fd [_] :throwable)) (fd (ex-info \"x\" {})))" :portability :common :jvm-certified true}
   {:suite "protocols / specificity" :label "an atom dispatches on clojure.lang.IRef, not Object" :expected ":iref" :actual "(do (defprotocol Pr (fr [x])) (extend-protocol Pr Object (fr [_] :object)) (extend-protocol Pr clojure.lang.IRef (fr [_] :iref)) (fr (atom 1)))" :portability :common :jvm-certified true}
+  {:suite "CharSequence / a deftype window over a string" :label "count is length, not the field count" :expected "6" :actual "(do (deftype Sgc [s off cnt] CharSequence (length [_] cnt) (charAt [_ i] (.charAt s (+ off i))) (subSequence [_ a b] (subs s (+ off a) (+ off b))) (toString [_] (subs s off (+ off cnt)))) (count (->Sgc \"aaaaaa\" 0 6)))" :portability :jvm}
+  {:suite "CharSequence / a deftype window over a string" :label "count of a window that is not the whole string" :expected "3" :actual "(do (deftype Sgc2 [s off cnt] CharSequence (length [_] cnt) (charAt [_ i] (.charAt s (+ off i))) (subSequence [_ a b] (subs s (+ off a) (+ off b))) (toString [_] (subs s off (+ off cnt)))) (count (->Sgc2 \"abcdefgh\" 2 3)))" :portability :jvm}
+  {:suite "CharSequence / a deftype window over a string" :label "the fully-qualified interface name resolves the same way" :expected "4" :actual "(do (deftype Sgc3 [s cnt] java.lang.CharSequence (length [_] cnt) (charAt [_ i] (.charAt s i)) (subSequence [_ a b] (subs s a b)) (toString [_] (subs s 0 cnt))) (count (->Sgc3 \"abcd\" 4)))" :portability :jvm}
+  {:suite "CharSequence / a deftype window over a string" :label "a declared Counted.count outranks CharSequence.length (RT.count order)" :expected "7" :actual "(do (deftype Sgc4 [] CharSequence (length [_] 99) (charAt [_ i] \\x) (subSequence [_ a b] \"x\") (toString [_] \"x\") clojure.lang.Counted (count [_] 7)) (count (->Sgc4)))" :portability :jvm}
+  {:suite "CharSequence / a deftype window over a string" :label "seq walks the characters" :expected "[\\a \\b \\c]" :actual "(do (deftype Sgc5 [s cnt] CharSequence (length [_] cnt) (charAt [_ i] (.charAt s i)) (subSequence [_ a b] (subs s a b)) (toString [_] (subs s 0 cnt))) (vec (seq (->Sgc5 \"abcd\" 3))))" :portability :jvm}
+  {:suite "CharSequence / a deftype window over a string" :label "nth reads a character by index" :expected "\\b" :actual "(do (deftype Sgc6 [s cnt] CharSequence (length [_] cnt) (charAt [_ i] (.charAt s i)) (subSequence [_ a b] (subs s a b)) (toString [_] (subs s 0 cnt))) (nth (->Sgc6 \"abcd\" 3) 1))" :portability :jvm}
+  {:suite "CharSequence / a deftype window over a string" :label "declaring the interface without length is an AbstractMethodError, not a cast error" :expected ":abstract" :actual "(do (deftype Sgc7 [] CharSequence (charAt [_ i] \\x) (subSequence [_ a b] \"x\") (toString [_] \"xx\")) (try (count (->Sgc7)) (catch java.lang.AbstractMethodError e :abstract)))" :portability :jvm}
+  {:suite "CharSequence / a deftype window over a string" :label "a coll interface that is not Seqable still seqs the characters (RT.seqFrom order)" :expected "[\\a \\b]" :actual "(do (deftype Sgc8 [s] CharSequence (length [_] (count s)) (charAt [_ i] (.charAt s i)) (subSequence [_ a b] (subs s a b)) (toString [_] s) clojure.lang.Counted (count [_] 99)) (vec (seq (->Sgc8 \"ab\"))))" :portability :jvm}
+  {:suite "CharSequence / regex over a non-string" :label "re-matches takes a CharSequence" :expected "\"aaaaaa\"" :actual "(do (deftype Sgr [s cnt] CharSequence (length [_] cnt) (charAt [_ i] (.charAt s i)) (subSequence [_ a b] (subs s a b)) (toString [_] (subs s 0 cnt))) (re-matches #\"a+\" (->Sgr \"aaaaaa\" 6)))" :portability :jvm}
+  {:suite "CharSequence / regex over a non-string" :label "re-find takes a CharSequence" :expected "\"bc\"" :actual "(do (deftype Sgr2 [s cnt] CharSequence (length [_] cnt) (charAt [_ i] (.charAt s i)) (subSequence [_ a b] (subs s a b)) (toString [_] (subs s 0 cnt))) (re-find #\"bc\" (->Sgr2 \"abcd\" 4)))" :portability :jvm}
+  {:suite "CharSequence / regex over a non-string" :label "re-seq takes a CharSequence" :expected "[\"a\" \"a\" \"a\"]" :actual "(do (deftype Sgr3 [s cnt] CharSequence (length [_] cnt) (charAt [_ i] (.charAt s i)) (subSequence [_ a b] (subs s a b)) (toString [_] (subs s 0 cnt))) (vec (re-seq #\"a\" (->Sgr3 \"aaa\" 3))))" :portability :jvm}
+  {:suite "StringBuilder / is a CharSequence" :label "count is the accumulated length" :expected "6" :actual "(count (StringBuilder. \"abcdef\"))" :portability :jvm}
+  {:suite "StringBuilder / is a CharSequence" :label "instance? CharSequence" :expected "true" :actual "(instance? CharSequence (StringBuilder. \"a\"))" :portability :jvm}
+  {:suite "StringBuilder / is a CharSequence" :label "seq walks the characters" :expected "[\\a \\b]" :actual "(vec (seq (StringBuilder. \"ab\")))" :portability :jvm}
+  {:suite "StringBuilder / is a CharSequence" :label "nth reads a character by index" :expected "\\b" :actual "(nth (StringBuilder. \"ab\") 1)" :portability :jvm}
+  {:suite "StringBuilder / is a CharSequence" :label "an empty builder is empty?" :expected "[true false]" :actual "[(empty? (StringBuilder.)) (empty? (StringBuilder. \"a\"))]" :portability :jvm}
+  {:suite "StringBuilder / is a CharSequence" :label "re-matches takes a StringBuilder" :expected "\"abc\"" :actual "(re-matches #\"a.*\" (StringBuilder. \"abc\"))" :portability :jvm}
+  {:suite "StringBuilder / is a CharSequence" :label "subSequence is the CharSequence window" :expected "\"bcd\"" :actual "(str (.subSequence (StringBuilder. \"abcdef\") 1 4))" :portability :jvm}
+  {:suite "printing / a collection deftype prints in its collection's shape" :label "a deftype declaring ISeq prints as a seq" :expected "\"(1 2 3)\"" :actual "(do (deftype Psq [v] clojure.lang.ISeq (seq [_] (seq v)) (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v))) (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil) (cons [_ o] (cons o (seq v)))) (pr-str (->Psq [1 2 3])))" :portability :jvm}
+  {:suite "printing / a collection deftype prints in its collection's shape" :label "an ISeq deftype whose seq is nil prints as ()" :expected "\"()\"" :actual "(do (deftype Pse [] clojure.lang.ISeq (seq [_] nil) (first [_] nil) (next [_] nil) (more [_] ()) (count [_] 0) (equiv [_ o] (nil? (seq o))) (empty [_] nil) (cons [_ o] (list o))) (pr-str (->Pse)))" :portability :jvm}
+  {:suite "printing / a collection deftype prints in its collection's shape" :label "a deftype declaring IPersistentVector prints as a vector" :expected "\"[1 2 3]\"" :actual "(do (deftype Pvc [v] clojure.lang.IPersistentVector (seq [_] (seq v)) (count [_] (count v)) (nth [_ i] (nth v i)) (nth [_ i d] (nth v i d)) (length [_] (count v)) (assoc [_ i x] (assoc v i x)) (assocN [_ i x] (assoc v i x)) (cons [_ o] (conj v o)) (equiv [_ o] (= v o)) (empty [_] [])) (pr-str (->Pvc [1 2 3])))" :portability :jvm}
+  {:suite "printing / a collection deftype prints in its collection's shape" :label "a deftype declaring IPersistentSet prints as a set" :expected "\"#{1}\"" :actual "(do (deftype Pst [s] clojure.lang.IPersistentSet (seq [_] (seq s)) (count [_] (count s)) (contains [_ x] (contains? s x)) (disjoin [_ x] (disj s x)) (get [_ x] (get s x)) (cons [_ o] (conj s o)) (equiv [_ o] (= s o)) (empty [_] #{})) (pr-str (->Pst #{1})))" :portability :jvm}
+  {:suite "printing / a collection deftype prints in its collection's shape" :label "a deftype declaring IPersistentMap prints as a map, in its own seq order" :expected "\"{:z 1, :a 2}\"" :actual "(do (deftype Pmp [ks m] clojure.lang.IPersistentMap (seq [_] (seq (map (fn [k] (clojure.lang.MapEntry. k (get m k))) ks))) (count [_] (count ks)) (assoc [this k x] this) (assocEx [this k x] this) (without [this k] this) (containsKey [_ k] (contains? m k)) (entryAt [_ k] (find m k)) (valAt [_ k] (get m k)) (valAt [_ k d] (get m k d)) (cons [this o] this) (equiv [_ o] (= m o)) (empty [_] {}) (iterator [this] (.iterator (seq this)))) (pr-str (->Pmp [:z :a] {:z 1 :a 2})))" :portability :jvm}
+  {:suite "printing / a collection deftype prints in its collection's shape" :label "ISeq outranks the other collection interfaces" :expected "\"(1 2)\"" :actual "(do (deftype Pvs [v] clojure.lang.IPersistentVector (count [_] (count v)) (nth [_ i] (nth v i)) (nth [_ i d] (nth v i d)) (length [_] (count v)) (assoc [_ i x] (assoc v i x)) (assocN [_ i x] (assoc v i x)) (cons [_ o] (conj v o)) (equiv [_ o] (= v o)) (empty [_] []) clojure.lang.ISeq (seq [_] (seq v)) (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v)))) (pr-str (->Pvs [1 2])))" :portability :jvm}
+  {:suite "printing / a collection deftype prints in its collection's shape" :label "*print-length* applies to a collection deftype" :expected "\"[1 2 ...]\"" :actual "(do (deftype Pvl [v] clojure.lang.IPersistentVector (seq [_] (seq v)) (count [_] (count v)) (nth [_ i] (nth v i)) (nth [_ i d] (nth v i d)) (length [_] (count v)) (assoc [_ i x] (assoc v i x)) (assocN [_ i x] (assoc v i x)) (cons [_ o] (conj v o)) (equiv [_ o] (= v o)) (empty [_] [])) (binding [*print-length* 2] (pr-str (->Pvl [1 2 3 4]))))" :portability :jvm}
+  {:suite "printing / a collection deftype prints in its collection's shape" :label "a defrecord still prints as a record" :expected "\"#prc.ns.Prc{:a 1}\"" :actual "(do (ns prc.ns) (clojure.core/defrecord Prc [a]) (clojure.core/pr-str (prc.ns/->Prc 1)))" :portability :jvm}
 ]

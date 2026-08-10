@@ -63,6 +63,15 @@
   {:suite "dotform" :expr "(.-value {:value 41})" :expected "41"}
   {:suite "dotform" :expr "(.-x {:x 7 :y 9})" :expected "7"}
   {:suite "dotform" :expr "(. {:value 41} -value)" :expected "41"}
+  ;; the map-as-object read above answers for a key the map HAS. A key it does not
+  ;; have, an undeclared record slot, or a value with no field concept at all is an
+  ;; error — it used to be a silent nil, which reads as a present-and-nil field.
+  {:suite "dotform" :expr "(try (.-nope {:value 41}) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching field found: nope for class clojure.lang.PersistentArrayMap\""}
+  {:suite "dotform" :expr "(do (defrecord Rz [x]) (try (.-zz (->Rz 7)) (catch IllegalArgumentException e (.getMessage e))))" :expected "\"No matching field found: zz for class user.Rz\""}
+  {:suite "dotform" :expr "(do (defrecord Ry [x]) (try (.-zz (assoc (->Ry 7) :zz 9)) (catch IllegalArgumentException e (.getMessage e))))" :expected "\"No matching field found: zz for class user.Ry\""}
+  {:suite "dotform" :expr "(mapv (fn [v] (try (.-a v) (catch IllegalArgumentException e (.getMessage e)))) [\"s\" [1] #{1}])" :expected "[\"No matching field found: a for class java.lang.String\" \"No matching field found: a for class clojure.lang.PersistentVector\" \"No matching field found: a for class clojure.lang.PersistentHashSet\"]"}
+  ;; a dashed name never reaches the method surface: .count works, .-count does not
+  {:suite "dotform" :expr "(try (.-count [1 2]) (catch IllegalArgumentException e (.getMessage e)))" :expected "\"No matching field found: count for class clojure.lang.PersistentVector\""}
   {:suite "dotform" :expr "(do (defrecord Rf [x]) (.-x (->Rf 7)))" :expected "7"}
   {:suite "dotform" :expr "(do (defrecord Rg [a b]) (.-b (->Rg 1 2)))" :expected "2"}
   {:suite "dotform" :expr "(do (defprotocol Greet (hi [_])) (defrecord Rh [nm] Greet (hi [_] (str \"hi \" nm))) (. (->Rh \"x\") hi))" :expected "\"hi x\""}
@@ -1603,4 +1612,18 @@
   ;; Wider than the JVM's 16-bit char by design, hence a unit row not a corpus
   ;; one. Surrogates are not scalar values and stay rejected.
   {:suite "char / code points" :expr "[(int (char 65)) (int (char 128515)) (int (first (str (char 128515)))) (try (char 55296) (catch Exception e (ex-message e))) (try (char 1114112) (catch Exception e (ex-message e)))]" :expected "[65 128515 128515 \"Value out of range for char: 55296\" \"Value out of range for char: 1114112\"]"}
+  ;; The same model seen from the string side: an astral character is ONE element,
+  ;; so there is no surrogate half to index out. A JVM string holds two code units
+  ;; here, which is why a parser test that expects a lone surrogate to be rejected
+  ;; cannot pass — see the :string-model entry in known-divergences.edn.
+  {:suite "string / surrogate halves" :expr "(let [c (str (char 128169))] [(count c) (int (first c)) (nil? (second c)) (= c (str (first c)))])" :expected "[1 128169 true true]"}
+  ;; str of a deftype/record with no toString is its print form: the JVM answers
+  ;; Object.toString there ("user.Rec@3c6f0c28"), which jolt has no identity hash
+  ;; for, so it renders the value instead and drops the leading # of the record
+  ;; marker. A COLLECTION deftype prints in its collection's shape, which has no
+  ;; such marker — dropping a character there produced "1 2 3)".
+  {:suite "printing / str of a deftype" :expr "(do (deftype Sq [v] clojure.lang.ISeq (seq [_] (seq v)) (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v))) (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil) (cons [_ o] (cons o (seq v)))) [(str (->Sq [1 2 3])) (format \"%s\" (->Sq [1 2 3])) (str \"x=\" (->Sq [1 2]))])" :expected "[\"(1 2 3)\" \"(1 2 3)\" \"x=(1 2)\"]"}
+  {:suite "printing / str of a deftype" :expr "(do (defrecord Rc [a]) (deftype Dt [a]) [(str (->Rc 1)) (str (->Dt 1))])" :expected "[\"user.Rc{:a 1}\" \"user.Dt{:a 1}\"]"}
+  ;; a declared toString still wins, collection shape or not
+  {:suite "printing / str of a deftype" :expr "(do (deftype Sqt [v] clojure.lang.ISeq (seq [_] (seq v)) (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v))) (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil) (cons [_ o] (cons o (seq v))) Object (toString [_] \"MINE\")) (str (->Sqt [1 2])))" :expected "\"MINE\""}
 ]

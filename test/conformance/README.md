@@ -23,10 +23,21 @@ closes that gap.
   5s per-case watchdog) and compares with Clojure's `=`. It buckets each row:
   - `certified` / `certified-throws` — jolt's `:expected` matches real Clojure
   - `divergent` — both evaluate but jolt's `:expected` disagrees with Clojure
-  - `throws-mismatch` — jolt and Clojure disagree on whether it throws
-  - `jvm-error` — `:actual` isn't runnable on vanilla Clojure (host-coupled /
-    jolt-specific) — informational, not certifiable
+  - `throws-mismatch` — `:throws` but Clojure returned a value
+  - `jvm-raises` — Clojure ran the row and raised where jolt answers a value; the
+    mirror of `throws-mismatch`, and gated the same way
+  - `uncertifiable` — Clojure cannot express the row at all (a jolt-only fn, a lib
+    off the classpath) — informational, the one bucket the oracle can't judge
+  - `expected-error` — the `:expected` *source* doesn't evaluate, so the row
+    asserts nothing on either runner — always a corpus bug, gated at zero
   - `read-error` / `timeout` — won't read on the JVM reader, or ran too long
+
+  Each row's forms are read and evaluated one at a time, as a REPL does, and a row
+  that fails on a name jolt resolves out of the box (a bare `StringWriter`,
+  `clojure.math`) is retried with just that name supplied — resolution is the only
+  thing that changes, and the row gets certified for its value instead of being
+  written off. `--self-test` checks the classifier itself against one fixture row
+  per bucket; `make certify` runs it first.
 
 - **`known-divergences.edn`** — every current divergence, classified. Most are
   **deliberate** jolt-specific or host-model deltas (see `:legend`): the all-double

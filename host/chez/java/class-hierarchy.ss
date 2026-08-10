@@ -15,32 +15,46 @@
 
 ;; canonical-name -> list of direct super canonical-names. Mutable + extensible.
 (define jvm-class-parents (make-hashtable string-hash string=?))
-;; closure cache, invalidated whenever the graph is extended.
+;; closure cache, invalidated whenever the graph is extended. A Chez hashtable
+;; corrupts under concurrent WRITES (the damage surfaces later inside the
+;; collector, never as an error naming the table), and these two are memo caches on
+;; the protocol-dispatch path, so every thread that dispatches fills them.
 ;;
 ;; jch-cache-mutex covers every MUTATION of jvm-class-parents, every WHOLE-TABLE
-;; scan of it, both derived caches, and jch-epoch. Single-key reads stay
+;; scan of it, both derived caches, and jch-graph-epoch. Single-key reads stay
 ;; unlocked, on the split rt.ss spells out for var-table — these are strong
 ;; general hashtables, so an unlocked reader walks consistent structure and the
 ;; worst it sees is a stale miss. That is not a nicety here: jch-tags is on the
 ;; protocol-dispatch path and jch-closure under it, so a mutex on the read would
-;; sit on every protocol call in the program.
+;; sit on every protocol call in the program. Steady state is pure reads, so this
+;; costs nothing once warm.
 ;;
-;; jch-epoch exists because invalidation is a hashtable-clear!, and a clear can
-;; be undone. jch-closure / jch-tags compute outside the lock (the walk is not
-;; cheap and calls nothing that needs one), so without an epoch a walk that began
-;; before a jch-set-supers! could publish its pre-change answer after the clear,
-;; and every later dispatch would read it. A stale ancestry is a wrong isa? and a
-;; wrong protocol method, and it would never expire. Each publish re-checks the
-;; generation it computed against.
+;; jch-graph-epoch is the graph's generation, and it does two jobs.
+;;
+;; Invalidation is a hashtable-clear!, and a clear can be undone. jch-closure /
+;; jch-tags compute outside the lock (the walk is not cheap and calls nothing that
+;; needs one), so without a generation a walk that began before a jch-set-supers!
+;; could publish its pre-change answer after the clear, and every later dispatch
+;; would read it. A stale ancestry is a wrong isa? and a wrong protocol method,
+;; and it would never expire. Each publish re-checks the generation it computed
+;; against.
+;;
+;; It is also read by callers that derive a per-type answer from the graph and
+;; want to revalidate with one fixnum compare instead of re-walking (jrdesc-ifc-of,
+;; records.ss) — a deftype gains interfaces after its descriptor exists, and can
+;; gain more later through extend-type. Bumped LAST, after the table is written
+;; and the memo caches are cleared: a concurrent reader that saw the new epoch
+;; first could derive from the old graph and stamp the answer as current, which
+;; revalidation could never catch.
 (define jch-cache-mutex (make-mutex))
-(define jch-epoch 0)
+(define jch-graph-epoch 0)
 (define jch-closure-cache (make-hashtable string-hash string=?))
 (define jch-tags-cache (make-hashtable string-hash string=?))
 ;; call with jch-cache-mutex HELD
 (define (jch-invalidate!/locked)
   (hashtable-clear! jch-closure-cache)
   (hashtable-clear! jch-tags-cache)
-  (set! jch-epoch (fx+ jch-epoch 1)))
+  (set! jch-graph-epoch (fx+ jch-graph-epoch 1)))
 
 ;; Merge direct supers for a class (union with any already registered). Public so
 ;; libraries can graft their own classes onto the modeled hierarchy.
@@ -75,15 +89,15 @@
 (define (jch-set-supers! name supers)
   (jolt-with-mutex jch-cache-mutex
     (hashtable-set! jvm-class-parents name supers)
-    (jch-invalidate!/locked)
     (set! jch-known-cache #f)
-    (set! jch-simple->fqn-cache #f)))
+    (set! jch-simple->fqn-cache #f)
+    (jch-invalidate!/locked)))
 
 ;; transitive supers of NAME (canonical), excluding NAME and Object; Object is the
 ;; universal root supplied by callers. Breadth-first, deduped, stable order.
 (define (jch-closure name)
   (or (hashtable-ref jch-closure-cache name #f)
-      (let* ((epoch jch-epoch)                ; read BEFORE the walk — see jch-epoch
+      (let* ((epoch jch-graph-epoch)      ; read BEFORE the walk — see jch-graph-epoch
              (result
               (let loop ((pending (jch-direct-supers name)) (seen '()))
                 (cond ((null? pending) (reverse seen))
@@ -91,7 +105,7 @@
                       (else (loop (append (jch-direct-supers (car pending)) (cdr pending))
                                   (cons (car pending) seen)))))))
         (jolt-with-mutex jch-cache-mutex
-          (when (fx= epoch jch-epoch) (hashtable-set! jch-closure-cache name result)))
+          (when (fx= epoch jch-graph-epoch) (hashtable-set! jch-closure-cache name result)))
         result)))
 
 ;; ns segment munging for a JVM-spelled class name: dashes become underscores
@@ -112,7 +126,7 @@
 ;; "Object". Memoized — this is on the hot protocol-dispatch path.
 (define (jch-tags name)
   (or (hashtable-ref jch-tags-cache name #f)
-      (let* ((epoch jch-epoch)                ; read BEFORE the walk — see jch-epoch
+      (let* ((epoch jch-graph-epoch)      ; read BEFORE the walk — see jch-graph-epoch
              (chain (cons name (jch-closure name)))
              (result
               (let build ((cs chain) (acc '()))
@@ -125,7 +139,7 @@
                                      acc1 (cons simple acc1))))
                       (build (cdr cs) acc2))))))
         (jolt-with-mutex jch-cache-mutex
-          (when (fx= epoch jch-epoch) (hashtable-set! jch-tags-cache name result)))
+          (when (fx= epoch jch-graph-epoch) (hashtable-set! jch-tags-cache name result)))
         result)))
 
 ;; Is WANTED (canonical or simple) the class CHILD (canonical) or one of its
@@ -246,7 +260,7 @@
             "clojure.lang.IExceptionInfo" "clojure.lang.IReduceInit"
             "java.util.List" "java.util.Set" "java.util.Collection" "java.util.Map"
             "java.util.Iterator" "java.lang.Iterable" "java.lang.CharSequence"
-            "java.lang.Comparable" "java.lang.Runnable"
+            "java.lang.Appendable" "java.lang.Comparable" "java.lang.Runnable"
             "java.util.concurrent.Callable" "java.io.Serializable"))
 
 ;; ---- seed the built-in graph: direct supers only, faithful to the JVM ---------
@@ -395,7 +409,10 @@
 (jch-register-supers! "java.io.FileWriter" '("java.io.OutputStreamWriter"))
 (jch-register-supers! "java.io.InputStreamReader" '("java.io.Reader"))
 (jch-register-supers! "java.io.StringWriter" '("java.io.Writer"))
-(jch-register-supers! "java.lang.StringBuilder" '())
+;; StringBuilder is a CharSequence and an Appendable, which is what lets count/seq/
+;; nth and the regex entry points take one the way they take a String.
+(jch-register-supers! "java.lang.StringBuilder" '("java.lang.CharSequence" "java.lang.Appendable"))
+(jch-register-supers! "java.lang.Appendable" '())
 (jch-register-supers! "java.util.StringTokenizer" '())
 (jch-register-supers! "java.nio.charset.Charset" '())
 (jch-register-supers! "java.util.Base64" '())

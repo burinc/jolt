@@ -242,6 +242,12 @@
     (else #f)))
 
 (define (jolt-cli-run cli-args prepare-build!)
+  ;; On the main thread, before anything user code can reach: Chez's exit-handler
+  ;; is a thread parameter, so the shutdown-hook wrapper has to be installed on
+  ;; the thread that will call (exit), and this is that thread for both CLI
+  ;; entries. Without it a hook registered from a worker would be invisible to a
+  ;; System/exit here.
+  (jolt-install-exit-handler!)
   (guard (v (#t (jolt-report-uncaught v)))
     ;; Host faults (a condition raised outside jolt-throw) get their k / marks /
     ;; site captured HERE: a with-exception-handler runs before the stack
@@ -254,7 +260,11 @@
         (when (serious-condition? c) (jolt-capture-fault! c))
         (raise-continuable c))
       (lambda () (jolt-cli-dispatch cli-args prepare-build!)))
-    ;; normal-return twin of the exit-handler flush above
+    ;; normal-return twin of the exit-handler above. A `chez --script` that
+    ;; returns instead of calling (exit) ends the process without ever running
+    ;; the exit handler, so the shutdown hooks have to be run from here as well —
+    ;; the runner is once-per-process, so whichever path gets there first wins.
+    (guard (_ (#t #f)) (jolt-run-shutdown-hooks!))
     (guard (_ (#t #f)) (flush-output-port (current-output-port)))))
 
 (define (jolt-cli-dispatch cli-args prepare-build!)

@@ -157,6 +157,26 @@
                       (substring method-name 1 (string-length method-name))
                       method-name)))
       (cond
+        ;; A FIELD read. Checked FIRST, so no method arm below can claim a dashed
+        ;; name — (.-count [1 2]) is not the count, the way the JVM's
+        ;; Reflector.getInstanceField is not the method surface.
+        ;;
+        ;; What answers is a declared deftype/defrecord slot, plus the map-as-object
+        ;; read this file has always supported (see the precedence note above): a
+        ;; key the map HAS reads as a field. What does not answer is the case that
+        ;; used to return a silent nil — an undeclared record slot, a key the map
+        ;; does not have, a string/vector/set with no field concept at all. Those
+        ;; pass, and the end of the chain (no-method-throw) reads the leading dash
+        ;; back off to raise "No matching field found". A nil there was the bad
+        ;; shape: it reads as a field that is present and nil, so a caller testing
+        ;; it took the wrong branch instead of failing.
+        (field?
+         (let ((kw (keyword #f mname)))
+           (cond
+             ((jrec? obj) (if (jrec-field-index obj kw) (jrec-lookup obj kw jolt-nil) 'pass))
+             ((and (jolt-map? obj) (jolt-truthy? (jolt-contains? obj kw)))
+              (jolt-get obj kw jolt-nil))
+             (else 'pass))))
         ;; clojure.lang.MultiFn .dispatchFn / .getMethod — clojure.spec.alpha's
         ;; multi-spec walks a multimethod through these.
         ((jolt-multifn? obj)
@@ -195,7 +215,7 @@
         ;; over the generic collection interop below — e.g. data.priority-map
         ;; declares both seq[this] (Seqable) and seq[this ascending] (Sorted), and
         ;; (.seq pm false) must reach the 2-arg one, not dot-coll's plain seq.
-        ((and (not field?) (jrec? obj)
+        ((and (jrec? obj)
               (find-method-any-protocol-arity (jrec-tag obj) mname (+ 1 (length rest))))
          => (lambda (f) (apply jolt-invoke f obj rest)))
         ;; collection interop first (entry count / seq / nth / get / containsKey).
@@ -204,10 +224,8 @@
         ;; clojure.lang.Sorted (comparator / entryKey / seqFrom) on a sorted
         ;; map/set, before the map arm below reads the method name as a key.
         ;; data.priority-map's subseq/rsubseq reach for these.
-        ((and (not field?) (htable-sorted? obj) (sorted-iface-method? mname))
+        ((and (htable-sorted? obj) (sorted-iface-method? mname))
          (sorted-iface-dispatch obj mname rest))
-        ;; (.-field obj) / (. obj -field): field read on a record or map.
-        (field? (jolt-get obj (keyword #f mname) jolt-nil))
         ;; non-record map: a universal object-method (getMessage/...) wins first,
         ;; then a stored procedure is a method (call with self), else the field.
         ((and (jolt-map? obj) (not (jrec? obj)))

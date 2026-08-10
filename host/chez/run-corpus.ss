@@ -219,6 +219,10 @@
 ;; a crash NOT in test/chez/corpus-crash-baseline.txt is a regression; a
 ;; baseline label that no longer crashes is STALE (fails until the baseline
 ;; is updated in the same change). JOLT_CORPUS_CRASH_WRITE=1 regenerates.
+;; The baseline is EMPTY: its last ten entries were rows whose :expected was
+;; not evaluable source (an unquoted seq, or "throws" written as a string
+;; instead of :throws), so they crashed here and jvm-error'd under certify and
+;; asserted nothing on either side. Keep it empty — a crash is a bug in the row.
 (define crash-baseline-file "test/chez/corpus-crash-baseline.txt")
 (define crash-baseline
   (let ((h (make-hashtable string-hash string=?)))

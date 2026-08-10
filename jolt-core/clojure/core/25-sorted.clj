@@ -232,6 +232,12 @@
   (let [n (tree-lookup (sfield sm :tree) (the-cmp sm) k)]
     (if (nil? n) not-found (nd-val n))))
 
+;; Associative.entryAt — the entry carries the node's own key, which is what
+;; clojure.core/find hands back (its metadata is read).
+(defn- sm-entry-at [sm k]
+  (let [n (tree-lookup (sfield sm :tree) (the-cmp sm) k)]
+    (when-not (nil? n) (map-entry n))))
+
 (defn- sm-assoc-1 [sm k v]
   (let [cmp (the-cmp sm) tree (sfield sm :tree)
         node (tree-lookup tree cmp k)]
@@ -300,6 +306,7 @@
    :rseq     (fn [sm] (seq (vec (reverse (sc-entries sm map-entry)))))
    :first    (fn [sm] (first (sc-entries sm map-entry)))
    :get      sm-get
+   :entry-at sm-entry-at
    :contains (fn [sm k] (not (nil? (tree-lookup (sfield sm :tree) (the-cmp sm) k))))
    :assoc    sm-assoc-many
    :dissoc   sm-dissoc-many

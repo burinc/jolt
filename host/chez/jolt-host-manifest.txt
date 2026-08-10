@@ -35,6 +35,7 @@ deftype-ctor-class
 delete-file
 directory?
 enable-trace!
+entry-at
 exact?
 extension-epoch
 extension-has?
@@ -170,6 +171,7 @@ table?
 tagged-table
 thread-id
 throwable
+transient-associative?
 type-satisfies?
 tz-backend
 tz-offset-seconds

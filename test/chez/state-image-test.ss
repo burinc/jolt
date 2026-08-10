@@ -429,10 +429,57 @@
 (is "namespaced keywords re-intern"          (string-append "(identical? :a/b (first (keys " (rt-expr "{:a/b 1}") ")))") "true")
 (is "nested keyword lookup"                  (string-append "(get-in " (rt-expr "{:a {:b {:c 7}}}") " [:a :b :c])") "7")
 (is "keyword set membership"                 (string-append "(contains? " (rt-expr "#{:x :y}") " :x)") "true")
+;; A lookup answers with the element the collection HOLDS, and its metadata rides
+;; along, so the image has to carry the stored element and not just something equal
+;; to it. The set's lookup value is separately addressable from its key — conj! of
+;; an equal element splits the two — so the pset arms rebuild pair-wise; a walk that
+;; folded elements alone would restore a set whose get and seq had been merged.
+(is "a set's element keeps its metadata across a round trip"
+    (string-append "(meta (get " (rt-expr "#{^{:a 1} [1 2]}") " [1 2]))") "{:a 1}")
+(is "a map's stored key keeps its metadata across a round trip"
+    (string-append "(meta (key (find " (rt-expr "(assoc {} ^{:a 1} [1 2] :v)") " [1 2])))") "{:a 1}")
+(is "a set's conj! split survives a round trip"
+    (string-append "(let [s " (rt-expr "(persistent! (-> (transient #{}) (conj! ^{:a 1} [1 2]) (conj! ^{:a 2} [1 2])))")
+                   "] [(meta (first (seq s))) (meta (get s [1 2]))])") "[{:a 1} {:a 2}]")
 (is "record field access after restore"
     (string-append "(do (defrecord Q [a b]) (:a " (rt-expr "(->Q 5 6)") "))") "5")
 (is "record = after restore"
     (string-append "(do (defrecord R [a]) (= (->R 1) " (rt-expr "(->R 1)") "))") "true")
+;; A record's INHERITED fields are part of its value. A jrec keeps its descriptor
+;; and its extension map on the PARENT type, so a walk that reads only a record's
+;; own fields both under-reports what a dump refuses and rebuilds the record with
+;; the wrong arity — an atom in a record field failed the dump outright
+;; ("incorrect number of arguments to #<procedure constructor>").
+(is "a record field that needs substitution round-trips"
+    (string-append
+      "(do (defrecord Holder [a b])"
+      "  (let [h (->Holder (atom 1) :x)"
+      "        _ (jolt.host/image-write! \"" tmp "\" {:h h})"
+      "        g (jolt.host/image-read \"" tmp "\")]"
+      "    [(deref (:a (:h g))) (:b (:h g)) (record? (:h g))]))")
+    "[1 :x true]")
+;; the extension map rides on the parent too: an assoc'd key holding an atom is
+;; reached only by walking the inherited fields
+(is "an assoc'd record key holding an atom round-trips"
+    (string-append
+      "(do (defrecord Holder2 [a])"
+      "  (let [h (assoc (->Holder2 1) :extra (atom 7))"
+      "        _ (jolt.host/image-write! \"" tmp "\" {:h h})"
+      "        g (jolt.host/image-read \"" tmp "\")]"
+      "    [(:a (:h g)) (deref (:extra (:h g)))]))")
+    "[1 7]")
+;; the descriptor itself must NOT be walked, and so not copied: it is the type,
+;; not the value, and every instance shares one — as they do live. Rebuilding
+;; these two records (each holds an atom) must leave that sharing intact.
+(ok "restored instances of one type share one descriptor"
+    (let ((g (begin
+               (ev (string-append
+                     "(do (defrecord Holder3 [a])"
+                     "  (jolt.host/image-write! \"" tmp "\""
+                     "    [(->Holder3 (atom 1)) (->Holder3 (atom 2))]))"))
+               (jolt-compile-eval (string-append "(jolt.host/image-read \"" tmp "\")") "user"))))
+      (let ((a (jolt-nth g 0)) (b (jolt-nth g 1)))
+        (and (jrec? a) (jrec? b) (eq? (jrec-desc a) (jrec-desc b))))))
 ;; symbols are not interned and compare by ns/name, so a copy must still work as a key
 (is "symbol-keyed lookup works"              (string-append "(get " (rt-expr "{'a 1}") " 'a)") "1")
 (is "string-keyed lookup works"              (string-append "(get " (rt-expr "{\"s\" 1}") " \"s\")") "1")
@@ -828,6 +875,18 @@
 ;; the legacy-restored ref is a LIVE v2 ref, not an inert v1 record: STM works
 (is "v0.6.5 fixture: legacy ref participates in dosync"
     "(do (dosync (ref-set imgtest/my-ref 100)) (deref imgtest/my-ref))" "100")
+
+;; --- the same proof for RECORDS. A defrecord/deftype instance rides raw, and
+;; its descriptor (jrdesc) rides inside it, so the descriptor's field list is
+;; image-format surface exactly as the ref record's was: a released image
+;; carrying one stops restoring the moment jrdesc gains or loses a field.
+;; Fixture made by the real v0.6.8 binary; permanent, like the v0.6.5 one.
+(ok "v0.6.8 record fixture present" (file-exists? "test/chez/fixtures/image-v0.6.8-record.image"))
+(jolt-image-restore-world! "test/chez/fixtures/image-v0.6.8-record.image")
+(is "v0.6.8 fixture: imgrec8/plain" "imgrec8/plain" "7")
+(is "v0.6.8 fixture: a defrecord instance prints" "(pr-str imgrec8/box)" "#imgrec8.Box{:a 1, :b \"two\"}")
+(is "v0.6.8 fixture: its fields read" "[(:a imgrec8/box) (:b imgrec8/box) (count imgrec8/box)]" "[1 two 2]")
+(is "v0.6.8 fixture: a deftype instance prints" "(pr-str imgrec8/pt)" "#imgrec8.Pt{:x 3, :y 4}")
 
 ;; --- refs travel by value (format 3, jolt-867l.11): descriptor on dump,
 ;; re-mint on restore. Value, meta, shared identity, cycles, and STM liveness

@@ -215,15 +215,17 @@
 (ok "4. all 8 round trips completed" all-done4)
 ;; A fiber that never resumed has #f for a result, and string=? on it RAISES —
 ;; which turned an already-reported timeout into a crash that ended the whole
-;; fibers gate and buried the failure. Compare only strings; anything else is a
-;; failed check, not an exception.
+;; fibers gate and buried the failure. Guard on all-done4 like the other result
+;; reads, and compare only strings; anything else is a failed check, not an
+;; exception.
 (ok "4. every fiber got its own payload"
-    (let loop ((i 0))
-      (or (fx=? i r8-n)
-          (let ((r (jolt-fiber-result (list-ref f4s i))))
-            (and (string? r)
-                 (string=? r (string-append "m" (number->string i)))
-                 (loop (fx+ i 1)))))))
+    (and all-done4
+         (let loop ((i 0))
+           (or (fx=? i r8-n)
+               (let ((r (jolt-fiber-result (list-ref f4s i))))
+                 (and (string? r)
+                      (string=? r (string-append "m" (number->string i)))
+                      (loop (fx+ i 1))))))))
 
 ;; --- 5. accept parks too -------------------------------------------------------
 (printf "\n== 5. a fiber blocked in accept parks and resumes on a connection ==\n")

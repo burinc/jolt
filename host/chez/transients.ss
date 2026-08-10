@@ -7,7 +7,9 @@
 ;;         so building an N-vector was O(N^2).
 ;;   map : a Chez hashtable keyed by key-hash / jolt= (value-equality, nil-safe —
 ;;         a jolt-nil key stores fine here).
-;;   set : a Chez hashtable of elements.
+;;   set : a Chez hashtable mapping each element to itself, so a lookup answers
+;;         with the stored element (which carries the metadata) and not the equal
+;;         key it was probed with — the JVM's ITransientMap-of-val->val.
 ;;   cow : fallback for anything else (e.g. a sorted coll) — copy-on-write over
 ;;         the persistent ops, preserving jolt's superset of Clojure's transients.
 ;;
@@ -43,9 +45,14 @@
        ;; visit in iteration order so `ord` ends up reverse-insertion (persistent! reverses it back)
        (pmap-fold-fwd coll (lambda (k v acc) (hashtable-set! ht k v) (when ord (set! ord (cons (cons k v) ord))) (set! cnt (fx+ cnt 1)) acc) 0)
        (make-jolt-transient 'map ht (fxmax tmap-min-cap cnt) #t ord)))
+    ;; a set's buffer maps each element to ITSELF, so a lookup can answer with the
+    ;; element the set holds rather than the equal key it was probed with (JVM
+    ;; TransientHashSet is likewise an ITransientMap of val->val). Chez's
+    ;; hashtable-set! keeps the existing key and overwrites the value, which is
+    ;; exactly ATransientSet.conj's impl.assoc(val,val).
     ((pset? coll)
      (let ((ht (make-hashtable key-hash jolt=2)))
-       (pset-fold coll (lambda (e acc) (hashtable-set! ht e #t) acc) 0)
+       (pset-fold coll (lambda (e acc) (hashtable-set! ht e (pset-get coll e e)) acc) 0)
        (make-jolt-transient 'set ht 0 #t #f)))
     ;; a deftype implementing clojure.lang.IEditableCollection.asTransient
     ;; (flatland's OrderedMap/OrderedSet) returns its OWN transient type, which
@@ -124,10 +131,14 @@
               (for-each (lambda (p) (set! m (pmap-put-ordered m (car p) (hashtable-ref ht (car p) jolt-nil))))
                         (reverse (jolt-transient-ord t)))
               m))))
+    ;; Rebuilt pair-wise, not through pset-conj: conj! of an element equal to one
+    ;; already in keeps the old key and overwrites the value, and that split has to
+    ;; survive into the persistent set the way the JVM's does — seq yields the first
+    ;; element, get the second (pset-fold-pairs).
     ((set)
-     (let ((ht (jolt-transient-buf t)) (s empty-pset))
-       (vector-for-each (lambda (e) (set! s (pset-conj s e))) (hashtable-keys ht))
-       s))
+     (let ((ht (jolt-transient-buf t)) (m empty-pmap-hash))
+       (vector-for-each (lambda (e) (set! m (pmap-put-hash m e (hashtable-ref ht e e)))) (hashtable-keys ht))
+       (make-pset m)))
     (else (jolt-transient-buf t))))))
 
 ;; --- in-place mutation -------------------------------------------------------
@@ -171,7 +182,7 @@
         (jolt-trans-check t "conj!")
         (case (jolt-transient-kind t)
           ((vec) (for-each (lambda (x) (tvec-conj1! t x)) xs))
-          ((set) (for-each (lambda (x) (hashtable-set! (jolt-transient-buf t) x #t)) xs))
+          ((set) (for-each (lambda (x) (hashtable-set! (jolt-transient-buf t) x x)) xs))
           ((map) (for-each (lambda (x) (tmap-conj-entry! t x)) xs))
           (else (jolt-transient-buf-set! t (apply jolt-conj (jolt-transient-buf t) xs))))
         t))))))
@@ -258,7 +269,9 @@
   (case (jolt-transient-kind t)
     ((vec) (let ((i (->idx k))) (if (tvec-in-bounds? t i) (vector-ref (jolt-transient-buf t) i) d)))
     ((map) (hashtable-ref (jolt-transient-buf t) k d))
-    ((set) (if (hashtable-contains? (jolt-transient-buf t) k) k d))
+    ;; the buffer's value IS the stored element (jolt-transient-new), so this hands
+    ;; back what the set holds rather than the equal key it was probed with
+    ((set) (hashtable-ref (jolt-transient-buf t) k d))
     (else (%prev-jolt-get (jolt-transient-buf t) k d))))
 (define (t-count t)
   (jolt-trans-check t "count")
@@ -278,6 +291,18 @@
 ;; count/contains?/nth wrappers are collapsed into records.ss (loaded later) —
 ;; only the get-arm registration lives here.
 (register-get-arm! jolt-transient? (lambda (coll k d) (t-get coll k d)))
+
+;; Is this transient key-addressable — the JVM's ITransientAssociative2, which is
+;; what RT.find accepts alongside Associative? A transient map or vector is; a
+;; transient SET is not (find on one throws). The `cow` fallback is jolt's own
+;; superset, so it answers for whatever it wraps.
+(def-var! "jolt.host" "transient-associative?"
+  (lambda (t)
+    (and (jolt-transient? t)
+         (case (jolt-transient-kind t)
+           ((vec map) #t)
+           ((set) #f)
+           (else (let ((c (jolt-transient-buf t))) (or (jrec? c) (htable? c))))))))
 
 (def-var! "clojure.core" "transient" jolt-transient-new)
 (def-var! "clojure.core" "transient?" jolt-transient?)

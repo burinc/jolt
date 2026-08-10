@@ -368,23 +368,41 @@
 
 (define (jrec-pic-desc x) (and (jrec? x) (jrec-desc x)))
 
+(define rec-tbl-mu (make-mutex))
+
 (define chez-record-type-tbl
   (make-hashtable string-hash string=?))
 
-(define (jrec-record? x)
+(define (jrec-record?-uncached x)
   (and (jrec? x)
        (hashtable-ref chez-record-type-tbl (jrec-tag x) #f)
        #t))
 
+(define (jrec-record? x)
+  (and (jrec? x) (vector-ref (jrdesc-ifc-of x) 3)))
+
 (define chez-deftype-tag-set
   (make-hashtable string-hash string=?))
 
-(define chez-deftype-ctor-tag (make-weak-eq-hashtable))
+(define chez-deftype-ctor-tag-box
+  (box (make-weak-eq-hashtable)))
+
+(define chez-deftype-ctor-tag-mu (make-mutex))
+
+(define (deftype-ctor-tag p)
+  (hashtable-ref (unbox chez-deftype-ctor-tag-box) p #f))
+
+(define (deftype-ctor-tag-set! ctor tag)
+  (jolt-with-mutex
+    chez-deftype-ctor-tag-mu
+    (let ((t (hashtable-copy
+               (unbox chez-deftype-ctor-tag-box)
+               #t)))
+      (hashtable-set! t ctor tag)
+      (set-box! chez-deftype-ctor-tag-box t))))
 
 (define (mm-dispatch-val-canon dval)
-  (or (and (procedure? dval)
-           (hashtable-ref chez-deftype-ctor-tag dval #f))
-      dval))
+  (or (and (procedure? dval) (deftype-ctor-tag dval)) dval))
 
 (define chez-simple-name-tag
   (make-hashtable string-hash string=?))
@@ -426,14 +444,16 @@
 
 (define (register-record-shape! ctor-key field-kws
          field-tags type-tag)
-  (hashtable-set!
-    chez-record-shapes-tbl
-    ctor-key
-    (vector field-kws field-tags type-tag))
-  (hashtable-set!
-    chez-record-dbl-tbl
-    type-tag
-    (list->vector (map chez-double-tag? field-tags))))
+  (jolt-with-mutex
+    rec-tbl-mu
+    (hashtable-set!
+      chez-record-shapes-tbl
+      ctor-key
+      (vector field-kws field-tags type-tag))
+    (hashtable-set!
+      chez-record-dbl-tbl
+      type-tag
+      (list->vector (map chez-double-tag? field-tags)))))
 
 (define (chez-shape-simple-name s)
   (let loop ((i (- (string-length s) 1)))
@@ -474,7 +494,12 @@
         (kw-type (keyword #f "type"))
         (out (jolt-hash-map)))
     (let-values (((ks vs)
-                  (hashtable-entries chez-record-shapes-tbl)))
+                  (jolt-with-mutex
+                    rec-tbl-mu
+                    (let-values (((a b)
+                                  (hashtable-entries
+                                    chez-record-shapes-tbl)))
+                      (values a b)))))
       (vector-for-each
         (lambda (k v)
           (let ((type-tag (vector-ref v 2)))
@@ -511,7 +536,9 @@
     (if (hashtable-ref chez-record-shapes-tbl preferred #f)
         preferred
         (let loop ((ks (vector->list
-                         (hashtable-keys chez-record-shapes-tbl))))
+                         (jolt-with-mutex
+                           rec-tbl-mu
+                           (hashtable-keys chez-record-shapes-tbl)))))
           (cond
             ((null? ks) #f)
             ((string=? (chez-shape-simple-name (car ks)) target)
@@ -521,7 +548,12 @@
 (define (chez-protocol-methods-map)
   (let ((out (jolt-hash-map)))
     (let-values (((ks vs)
-                  (hashtable-entries chez-protocol-methods-tbl)))
+                  (jolt-with-mutex
+                    rec-tbl-mu
+                    (let-values (((a b)
+                                  (hashtable-entries
+                                    chez-protocol-methods-tbl)))
+                      (values a b)))))
       (vector-for-each
         (lambda (k v)
           (set! out (jolt-assoc out k (jolt-vector (car v) (cdr v)))))
@@ -665,7 +697,41 @@
          (map-hash (mix-coll-hash (car total) (cdr total))))
     (i32 (bitwise-xor class-hash map-hash))))
 
+(define (jrec-coll-print-shape r)
+  (vector-ref (jrdesc-ifc-of r) 1))
+
+(define (jrec-coll-pr r shape)
+  (if (jolt-print-hash?)
+      "#"
+      (with-deeper-print
+        (if (eq? shape 'map)
+            (string-append
+              "{"
+              (jolt-str-join-comma
+                (jolt-limited-list-strs
+                  (map (lambda (e)
+                         (string-append
+                           (jolt-pr-readable (jolt-nth e 0))
+                           " "
+                           (jolt-pr-readable (jolt-nth e 1))))
+                       (seq->list r))))
+              "}")
+            (let ((body (jolt-str-join
+                          (jolt-limited-seq-strs
+                            (jolt-seq r)
+                            jolt-pr-readable))))
+              (case shape
+                ((seq) (string-append "(" body ")"))
+                ((vec) (string-append "[" body "]"))
+                (else (string-append "#{" body "}"))))))))
+
 (define (jrec-pr r)
+  (cond
+    ((jrec-coll-print-shape r) =>
+     (lambda (shape) (jrec-coll-pr r shape)))
+    (else (jrec-field-pr r))))
+
+(define (jrec-field-pr r)
   (let ((fkeys (jrdesc-fkeys (jrec-desc r))))
     (string-append "#" (jrec-tag r) "{"
       (let ((n (vector-length fkeys)))
@@ -722,32 +788,107 @@
 
 (define jrec-cl rec-coll-method)
 
+(define (jrec-declares? x interface)
+  (and (jrec? x) (jch-isa? (jrec-tag x) interface)))
+
+(define jrdesc-ifc-tbl (make-weak-eq-hashtable))
+
+(define jrdesc-ifc-mutex (make-mutex))
+
+(define (jrdesc-ifc d) (hashtable-ref jrdesc-ifc-tbl d #f))
+
+(define (jrdesc-ifc-set! d v)
+  (jolt-with-mutex
+    jrdesc-ifc-mutex
+    (hashtable-set! jrdesc-ifc-tbl d v)))
+
+(define (jrdesc-ifc-epoch)
+  (fx+ jch-graph-epoch jolt-proto-epoch))
+
+(define (jrdesc-derive-ifc d record?)
+  (let ((tag (jrdesc-tag d)) (epoch (jrdesc-ifc-epoch)))
+    (vector epoch
+      (and (not record?)
+           (cond
+             ((jch-isa? tag "clojure.lang.ISeq") 'seq)
+             ((jch-isa? tag "clojure.lang.IPersistentVector") 'vec)
+             ((jch-isa? tag "clojure.lang.IPersistentSet") 'set)
+             ((jch-isa? tag "clojure.lang.IPersistentMap") 'map)
+             (else #f)))
+      (jch-isa? tag "java.lang.CharSequence") record?
+      (and (not record?) (tag-declares-coll-iface? tag)))))
+
+(define (jrdesc-ifc-of x)
+  (let* ((d (jrec-desc x)) (c (jrdesc-ifc d)))
+    (if (and c (fx=? (vector-ref c 0) (jrdesc-ifc-epoch)))
+        c
+        (let ((fresh (jrdesc-derive-ifc
+                       d
+                       (jrec-record?-uncached x))))
+          (jrdesc-ifc-set! d fresh)
+          fresh))))
+
+(define (jrec-charseq? x)
+  (and (jrec? x) (vector-ref (jrdesc-ifc-of x) 2)))
+
+(define (jrec-charseq-method x name)
+  (and (jrec-charseq? x) (jrec-cl x name)))
+
+(define (jrec-charseq-length-method x)
+  (or (jrec-cl x "length")
+      (jrec-abstract-method-error x "length")))
+
+(define (jrec-charseq->seq x len charat)
+  (let ((n (->idx (jolt-invoke len x))))
+    (let build ((i 0))
+      (if (fx>=? i n)
+          jolt-nil
+          (cseq-lazy
+            (jolt-invoke charat x i)
+            (lambda () (build (fx+ i 1))))))))
+
+(define (jrec-charseq->string x)
+  (cond
+    ((jrec-charseq-method x "toString") =>
+     (lambda (m) (jolt-need-str (jolt-invoke m x))))
+    ((jrec-charseq-method x "charAt") =>
+     (lambda (m)
+       (list->string
+         (seq->list
+           (jrec-charseq->seq x (jrec-charseq-length-method x) m)))))
+    (else #f)))
+
 (define jrec-coll-iface-names
   '("IPersistentCollection" "IPersistentMap" "IPersistentVector" "IPersistentSet"
      "IPersistentStack" "IPersistentList" "ISeq" "Seqable"
      "Indexed" "Counted" "Associative" "ILookup" "Reversible"
      "Sorted"))
 
+(define (tag-declares-coll-iface? tag)
+  (let ((ti (hashtable-ref type-registry tag #f)))
+    (and ti
+         (let loop ((ps (vector->list
+                          (jolt-with-mutex
+                            rec-tbl-mu
+                            (hashtable-keys ti)))))
+           (cond
+             ((null? ps) #f)
+             ((member (jch-last-segment (car ps)) jrec-coll-iface-names)
+              #t)
+             (else (loop (cdr ps))))))))
+
 (define (jrec-declares-coll-iface? x)
-  (and (jrec? x)
-       (not (jrec-record? x))
-       (let ((ti (hashtable-ref type-registry (jrec-tag x) #f)))
-         (and ti
-              (let loop ((ps (vector->list (hashtable-keys ti))))
-                (cond
-                  ((null? ps) #f)
-                  ((member
-                     (jch-last-segment (car ps))
-                     jrec-coll-iface-names)
-                   #t)
-                  (else (loop (cdr ps)))))))))
+  (and (jrec? x) (vector-ref (jrdesc-ifc-of x) 4)))
 
 (define (jrec-sequential-decl? x)
   (and (jrec? x)
        (not (jrec-record? x))
        (let ((ti (hashtable-ref type-registry (jrec-tag x) #f)))
          (and ti
-              (let loop ((ps (vector->list (hashtable-keys ti))))
+              (let loop ((ps (vector->list
+                               (jolt-with-mutex
+                                 rec-tbl-mu
+                                 (hashtable-keys ti)))))
                 (cond
                   ((null? ps) #f)
                   ((string=? (jch-last-segment (car ps)) "Sequential") #t)
@@ -776,20 +917,27 @@
        (and rm (hashtable-ref rm method #f))))
     (else #f)))
 
+(define (jrec-field-count coll)
+  (+ (jrec-nfields coll)
+     (let ((ext (jrec-ext coll)))
+       (if (jolt-nil? ext) 0 (jolt-count ext)))))
+
 (register-count-arm!
   (lambda (coll) (or (jrec? coll) (jolt-transient? coll)))
   (lambda (coll)
     (cond
+      ((jolt-transient? coll) (t-count coll))
       ((jrec-cl coll "count") =>
        (lambda (m) (jolt-invoke m coll)))
-      ((jrec-declares-coll-iface? coll)
-       (jrec-abstract-method-error coll "count"))
-      ((jrec? coll)
-       (+ (jrec-nfields coll)
-          (let ((ext (jrec-ext coll)))
-            (if (jolt-nil? ext) 0 (jolt-count ext)))))
-      ((jolt-transient? coll) (t-count coll))
-      (else (error 'count "uncountable record")))))
+      (else
+       (let ((ifc (jrdesc-ifc-of coll)))
+         (cond
+           ((vector-ref ifc 3) (jrec-field-count coll))
+           ((vector-ref ifc 4)
+            (jrec-abstract-method-error coll "count"))
+           ((vector-ref ifc 2)
+            (jolt-invoke (jrec-charseq-length-method coll) coll))
+           (else (jrec-field-count coll))))))))
 
 (register-contains-arm!
   (lambda (coll) (jrec-cl coll "containsKey"))
@@ -977,6 +1125,14 @@
   (lambda (x) (jrec-abstract-method-error x "seq")))
 
 (register-seq-arm!
+  (lambda (x) (jrec-charseq-method x "charAt"))
+  (lambda (x)
+    (jrec-charseq->seq
+      x
+      (jrec-charseq-length-method x)
+      (jrec-cl x "charAt"))))
+
+(register-seq-arm!
   jrec-record?
   (lambda (x) (list->cseq (jrec-entry-list x))))
 
@@ -1091,9 +1247,12 @@
               method))
          (k (hashtable-ref proto-method-keys s #f)))
     (or k
-        (let ((nk (gensym (string-append proto "." method))))
-          (hashtable-set! proto-method-keys s nk)
-          nk))))
+        (jolt-with-mutex
+          rec-tbl-mu
+          (or (hashtable-ref proto-method-keys s #f)
+              (let ((nk (gensym (string-append proto "." method))))
+                (hashtable-set! proto-method-keys s nk)
+                nk))))))
 
 (define (find-protocol-method-desc desc proto method)
   (let ((pt (jrdesc-ptable desc)))
@@ -1101,23 +1260,28 @@
          (hashtable-ref pt (intern-pm-key proto method) #f))))
 
 (define (register-protocol-method type-tag proto method fn)
-  (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
-  (let* ((ti (or (hashtable-ref type-registry type-tag #f)
-                 (let ((h (make-hashtable string-hash string=?)))
-                   (hashtable-set! type-registry type-tag h)
-                   h)))
-         (pi (or (hashtable-ref ti proto #f)
-                 (let ((h (make-hashtable string-hash string=?)))
-                   (hashtable-set! ti proto h)
-                   h))))
-    (hashtable-set! pi method fn))
+  (jolt-with-mutex
+    rec-tbl-mu
+    (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+    (let* ((ti (or (hashtable-ref type-registry type-tag #f)
+                   (let ((h (make-hashtable string-hash string=?)))
+                     (hashtable-set! type-registry type-tag h)
+                     h)))
+           (pi (or (hashtable-ref ti proto #f)
+                   (let ((h (make-hashtable string-hash string=?)))
+                     (hashtable-set! ti proto h)
+                     h))))
+      (hashtable-set! pi method fn)))
   (let ((desc (hashtable-ref chez-tag-desc type-tag #f)))
     (when desc
-      (let ((pt (or (jrdesc-ptable desc)
-                    (let ((h (make-eq-hashtable)))
-                      (jrdesc-ptable-set! desc h)
-                      h))))
-        (hashtable-set! pt (intern-pm-key proto method) fn))))
+      (let ((k (intern-pm-key proto method)))
+        (jolt-with-mutex
+          rec-tbl-mu
+          (let ((pt (or (jrdesc-ptable desc)
+                        (let ((h (make-eq-hashtable)))
+                          (jrdesc-ptable-set! desc h)
+                          h))))
+            (hashtable-set! pt k fn))))))
   (remove-clone! type-tag proto method)
   (if #f #f))
 
@@ -1130,7 +1294,8 @@
 (define (find-method-any-protocol type-tag method)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti
-         (let* ((ks (hashtable-keys ti)) (n (vector-length ks)))
+         (let* ((ks (jolt-with-mutex rec-tbl-mu (hashtable-keys ti)))
+                (n (vector-length ks)))
            (let loop ((i 0))
              (and (fx< i n)
                   (let ((f (hashtable-ref
@@ -1147,7 +1312,8 @@
          nargs)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti
-         (let* ((ks (hashtable-keys ti)) (n (vector-length ks)))
+         (let* ((ks (jolt-with-mutex rec-tbl-mu (hashtable-keys ti)))
+                (n (vector-length ks)))
            (let loop ((i 0) (fallback #f))
              (if (fx>= i n)
                  fallback
@@ -1167,7 +1333,8 @@
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti
          (or (and (hashtable-ref ti qname #f) #t)
-             (let* ((ks (hashtable-keys ti)) (n (vector-length ks)))
+             (let* ((ks (jolt-with-mutex rec-tbl-mu (hashtable-keys ti)))
+                    (n (vector-length ks)))
                (let loop ((i 0))
                  (and (fx< i n)
                       (or (proto-class-match? (vector-ref ks i) qname)
@@ -1214,8 +1381,7 @@
     ((jolt-lazyseq? obj) (jch-tags "clojure.lang.LazySeq"))
     ((var-cell? obj) (jch-tags "clojure.lang.Var"))
     ((jclass? obj) '("Class" "java.lang.Class" "Object"))
-    ((and (procedure? obj)
-          (hashtable-ref chez-deftype-ctor-tag obj #f))
+    ((and (procedure? obj) (deftype-ctor-tag obj))
      '("Class" "java.lang.Class" "Object"))
     ((and (procedure? obj) (hashtable-ref proc-name-tbl obj #f)) =>
      (lambda (p)
@@ -1273,9 +1439,11 @@
          (dbl-flags (list->vector (map chez-double-tag? field-tags)))
          (ndbl (vector-length dbl-flags))
          (desc (make-jrdesc tag kws))
-         (old-desc (hashtable-ref chez-tag-desc tag #f))
-         (_ (when old-desc (jrdesc-ptable-set! old-desc #f)))
-         (_ (hashtable-set! chez-tag-desc tag desc))
+         (_ (jolt-with-mutex
+              rec-tbl-mu
+              (let ((old-desc (hashtable-ref chez-tag-desc tag #f)))
+                (when old-desc (jrdesc-ptable-set! old-desc #f)))
+              (hashtable-set! chez-tag-desc tag desc)))
          (nf (length kws))
          (ctor (lambda args
                  (when (not (= (length args) nf))
@@ -1313,13 +1481,15 @@
                 (symbol-t-name name-sym)
                 #f))
       (register-class-ctor! (symbol-t-name name-sym) ctor))
-    (hashtable-set! chez-deftype-tag-set tag #t)
-    (hashtable-set!
-      chez-simple-name-tag
-      (symbol-t-name name-sym)
-      tag)
+    (jolt-with-mutex
+      rec-tbl-mu
+      (hashtable-set! chez-deftype-tag-set tag #t)
+      (hashtable-set!
+        chez-simple-name-tag
+        (symbol-t-name name-sym)
+        tag))
     (jch-set-supers! tag '("clojure.lang.IType"))
-    (hashtable-set! chez-deftype-ctor-tag ctor tag)
+    (deftype-ctor-tag-set! ctor tag)
     (register-record-shape!
       (string-append
         (chez-current-ns)
@@ -1340,10 +1510,12 @@
     (for-each
       (lambda (mn)
         (let ((m (if (symbol-t? mn) (symbol-t-name mn) mn)))
-          (hashtable-set!
-            chez-protocol-methods-tbl
-            (string-append ns "/" m)
-            (cons proto-name m))))
+          (jolt-with-mutex
+            rec-tbl-mu
+            (hashtable-set!
+              chez-protocol-methods-tbl
+              (string-append ns "/" m)
+              (cons proto-name m)))))
       (seq->list method-names)))
   jolt-nil)
 
@@ -1413,10 +1585,12 @@
 (define extend-mark "__jolt_extend__")
 
 (define (mark-extend! tag proto-name)
-  (let ((ti (hashtable-ref type-registry tag #f)))
-    (when ti
-      (let ((pi (hashtable-ref ti proto-name #f)))
-        (when pi (hashtable-set! pi extend-mark #t))))))
+  (jolt-with-mutex
+    rec-tbl-mu
+    (let ((ti (hashtable-ref type-registry tag #f)))
+      (when ti
+        (let ((pi (hashtable-ref ti proto-name #f)))
+          (when pi (hashtable-set! pi extend-mark #t)))))))
 
 (define (register-method type-name proto-name method-name
          fn)
@@ -1443,16 +1617,18 @@
   jolt-nil)
 
 (define (register-inline-protocol! type-name proto-name)
-  (let* ((tag (string-append (chez-current-ns) "." type-name))
-         (ti (or (hashtable-ref type-registry tag #f)
-                 (let ((h (make-hashtable string-hash string=?)))
-                   (hashtable-set! type-registry tag h)
-                   h))))
-    (unless (hashtable-ref ti proto-name #f)
-      (hashtable-set!
-        ti
-        proto-name
-        (make-hashtable string-hash string=?))))
+  (let ((tag (string-append (chez-current-ns) "." type-name)))
+    (jolt-with-mutex
+      rec-tbl-mu
+      (let ((ti (or (hashtable-ref type-registry tag #f)
+                    (let ((h (make-hashtable string-hash string=?)))
+                      (hashtable-set! type-registry tag h)
+                      h))))
+        (unless (hashtable-ref ti proto-name #f)
+          (hashtable-set!
+            ti
+            proto-name
+            (make-hashtable string-hash string=?))))))
   (let ((iface (cond
                  ((proto-key-qualified? proto-name)
                   (proto-iface-name proto-name))
@@ -1567,16 +1743,18 @@
   (make-hashtable string-hash string=?))
 
 (define (register-clone type-tag proto method fn)
-  (let* ((ti (or (hashtable-ref clone-registry type-tag #f)
-                 (let ((h (make-hashtable string-hash string=?)))
-                   (hashtable-set! clone-registry type-tag h)
-                   h)))
-         (pi (or (hashtable-ref ti proto #f)
-                 (let ((h (make-hashtable string-hash string=?)))
-                   (hashtable-set! ti proto h)
-                   h))))
-    (hashtable-set! pi method fn)
-    jolt-nil))
+  (jolt-with-mutex
+    rec-tbl-mu
+    (let* ((ti (or (hashtable-ref clone-registry type-tag #f)
+                   (let ((h (make-hashtable string-hash string=?)))
+                     (hashtable-set! clone-registry type-tag h)
+                     h)))
+           (pi (or (hashtable-ref ti proto #f)
+                   (let ((h (make-hashtable string-hash string=?)))
+                     (hashtable-set! ti proto h)
+                     h))))
+      (hashtable-set! pi method fn)
+      jolt-nil)))
 
 (define (register-clone* type-name proto method fn)
   (register-clone
@@ -1592,10 +1770,12 @@
            (and pi (hashtable-ref pi method #f))))))
 
 (define (remove-clone! type-tag proto method)
-  (let ((ti (hashtable-ref clone-registry type-tag #f)))
-    (when ti
-      (let ((pi (hashtable-ref ti proto #f)))
-        (when pi (hashtable-delete! pi method))))))
+  (jolt-with-mutex
+    rec-tbl-mu
+    (let ((ti (hashtable-ref clone-registry type-tag #f)))
+      (when ti
+        (let ((pi (hashtable-ref ti proto #f)))
+          (when pi (hashtable-delete! pi method)))))))
 
 (define (devirt-resolve-fl type-tag proto-name method-name
          obj)
@@ -1646,8 +1826,7 @@
                   '()
                   (seq->list rest-args))))
     (cond
-      ((and (procedure? obj)
-            (hashtable-ref chez-deftype-ctor-tag obj #f)) =>
+      ((and (procedure? obj) (deftype-ctor-tag obj)) =>
        (lambda (tag)
          (cond
            ((or (string=? method-name "getName")
@@ -1668,24 +1847,40 @@
       ((jolt-multifn? obj)
        (cond
          ((string=? method-name "addMethod")
-          (hashtable-set!
-            (jolt-multifn-methods obj)
-            (car rest)
-            (cadr rest))
+          (jolt-with-mutex
+            mm-tbl-mu
+            (hashtable-set!
+              (jolt-multifn-methods obj)
+              (car rest)
+              (cadr rest))
+            (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1)))
           obj)
          ((string=? method-name "removeMethod")
-          (hashtable-delete! (jolt-multifn-methods obj) (car rest))
+          (jolt-with-mutex
+            mm-tbl-mu
+            (hashtable-delete! (jolt-multifn-methods obj) (car rest))
+            (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1)))
           obj)
          ((string=? method-name "getMethod")
           (or (hashtable-ref (jolt-multifn-methods obj) (car rest) #f)
               jolt-nil))
          ((string=? method-name "getMethodTable")
-          (let ((tbl (jolt-multifn-methods obj)) (m (jolt-hash-map)))
-            (vector-for-each
-              (lambda (k)
-                (set! m (jolt-assoc1 m k (hashtable-ref tbl k #f))))
-              (hashtable-keys tbl))
-            m))
+          (let* ((tbl (jolt-multifn-methods obj))
+                 (kv (jolt-with-mutex
+                       mm-tbl-mu
+                       (let-values (((ks vs) (hashtable-entries tbl)))
+                         (cons ks vs))))
+                 (ks (car kv))
+                 (vs (cdr kv)))
+            (let loop ((i 0) (m (jolt-hash-map)))
+              (if (fx>=? i (vector-length ks))
+                  m
+                  (loop
+                    (fx+ i 1)
+                    (jolt-assoc1
+                      m
+                      (vector-ref ks i)
+                      (vector-ref vs i)))))))
          ((string=? method-name "toString")
           (jolt-str-render-one obj))
          (else
@@ -1880,24 +2075,40 @@
       ((string=? method-name "__methodImplCache") jolt-nil)
       ((jrec? obj)
        (let ((boxed (dot-coll-method obj method-name rest)))
-         (if boxed (car boxed) (no-method-throw method-name obj))))
-      (else (no-method-throw method-name obj)))))
+         (if boxed
+             (car boxed)
+             (no-method-throw method-name obj (length rest)))))
+      (else (no-method-throw method-name obj (length rest))))))
 
-(define (no-method-throw method-name obj)
-  (if (jolt-nil? obj)
-      (throw-jvm
-        'NullPointerException
-        (string-append
-          "Cannot invoke \""
-          method-name
-          "\" because the target is null"))
-      (throw-jvm
-        'IllegalArgumentException
-        (string-append
-          "No matching method "
-          method-name
-          " found for "
-          (guard (e (#t "?")) (jolt-class-name obj))))))
+(define (no-method-throw method-name obj . maybe-argc)
+  (let* ((argc (if (null? maybe-argc) 0 (car maybe-argc)))
+         (dashed? (and (> (string-length method-name) 1)
+                       (char=? (string-ref method-name 0) #\-)))
+         (bare (if dashed?
+                   (substring method-name 1 (string-length method-name))
+                   method-name)))
+    (cond
+      ((jolt-nil? obj)
+       (throw-jvm
+         'NullPointerException
+         (string-append
+           "Cannot invoke \""
+           method-name
+           "\" because the target is null")))
+      ((or dashed? (fx=? argc 0))
+       (throw-jvm
+         'IllegalArgumentException
+         (string-append
+           "No matching field found: "
+           bare
+           " for class "
+           (guard (e (#t "?")) (jolt-class-name obj)))))
+      (else
+       (throw-jvm
+         'IllegalArgumentException
+         (string-append "No matching method " method-name " found taking "
+           (number->string argc) " args for class "
+           (guard (e (#t "?")) (jolt-class-name obj))))))))
 
 (define method-dispatch-arms '())
 
@@ -2066,7 +2277,7 @@
             (let ((pi (hashtable-ref ti pn-str #f)))
               (when (and pi (hashtable-ref pi extend-mark #f))
                 (set! out (cons (jolt-symbol jolt-nil tag) out)))))))
-      (hashtable-keys type-registry))
+      (jolt-with-mutex rec-tbl-mu (hashtable-keys type-registry)))
     (if (null? out) jolt-nil (list->cseq out))))
 
 (register-str-render!
@@ -2076,10 +2287,13 @@
                (jrec-tag v)
                "Object"
                "toString")))
-      (if f
-          (jolt-invoke f v)
-          (let ((s (jrec-pr v)))
-            (substring s 1 (string-length s)))))))
+      (cond
+        (f (jolt-invoke f v))
+        ((jrec-coll-print-shape v) =>
+         (lambda (shape) (jrec-coll-pr v shape)))
+        (else
+         (let ((s (jrec-field-pr v)))
+           (substring s 1 (string-length s))))))))
 
 (register-str-render!
   (lambda (v)
@@ -2102,7 +2316,9 @@
                (chez-current-ns)
                "."
                (symbol-t-name name-sym))))
-    (hashtable-set! chez-record-type-tbl tag #t)
+    (jolt-with-mutex
+      rec-tbl-mu
+      (hashtable-set! chez-record-type-tbl tag #t))
     (let ((protos (filter
                     (lambda (s) (not (string=? s "clojure.lang.IType")))
                     (jch-direct-supers tag))))

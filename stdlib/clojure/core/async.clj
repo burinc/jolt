@@ -470,8 +470,8 @@
   (do-alts ports opts))
 
 (defn alts!
-  "Like alts!!. In jolt a go block is a real thread, so parking and blocking alts
-  are the same operation."
+  "Like alts!!. Parking and blocking alts are the same operation in jolt: on a
+  thread-backed go both block, and on a fiber both park."
   [ports & {:as opts}]
   (do-alts ports opts))
 

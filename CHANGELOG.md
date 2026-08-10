@@ -5,9 +5,118 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.9] - 2026-08-10
+
+### Changed
+
+- **`(.-field obj)` raises when the field is absent**, where it used to answer
+  nil — so `(.-zz record)` and `(.-nope map)` no longer read as a field that is
+  present and set to nil, and a caller testing one no longer silently takes the
+  wrong branch. The JVM raises `IllegalArgumentException` there and so does
+  jolt now. What still answers is unchanged: a declared `deftype`/`defrecord`
+  slot, and the documented map-as-object read where a key the map HAS reads as
+  a field. Code that relied on the nil needs a `contains?`/`get` instead.
+
+### Fixed
+
+- **A lookup answers with the element the collection HOLDS**, not the key it was
+  probed with, so metadata on the stored element survives. `(#{^{:x 1} [a b]}
+  [a b])` handed back the bare probe and lost the metadata; `assoc` replaced a
+  stored key with the equal one it was given, `find` minted its entry from the
+  probe, and `select-keys` rebuilt through `assoc`. All of them read the
+  collection's own entry now.
+
+- **`count`/`seq`/`nth` work on a `CharSequence`**, which `RT.count`/`RT.seq`/
+  `RT.nth` reach for on the JVM: a `deftype` presenting a window over a string
+  answered its field count rather than its length. `re-matches`/`re-find`/
+  `re-seq` accept one too (only `re-matcher` did), and `StringBuilder` is a
+  `CharSequence` at all now — it had no supers row and no `count`/`seq`/`nth`/
+  `subSequence`.
+
+- **`deref`'s timed arity is a real `IBlockingDeref` cast.** `(deref (delay 7)
+  50 :timeout)` returned 7 with the timeout silently dropped, where the JVM
+  throws `ClassCastException` because `Delay` is `IDeref` but not
+  `IBlockingDeref`; same for an agent. `atom`/`ref`/`var` did throw, but
+  reported the class as an opaque `:object` sentinel.
+
+- **A core.async transducer's `:ex-handler` gets the original throwable.** It
+  was handed the raw raised condition, so `ex-data`, `ex-message` and the class
+  all read nil and the thrown `ex-info`'s data was lost. core.async also joins
+  the library conformance manifest, giving `async.ss` a standing regression gate.
+
+- **The runtime's shared side-tables are serialized.** A Chez hashtable is not
+  thread-safe, and the metadata table (every `with-meta`) and the variadic
+  fixed-arity registry (every variadic closure creation) were written from
+  whatever thread the program ran on. The corruption surfaced later as an
+  invalid memory reference inside the collector, or a hang — reproducibly, as a
+  crash of core.async's own pipeline test, and in builds predating the fibers
+  work.
+
+- **Shutdown hooks run** (#571). `Runtime.addShutdownHook` kept a list nothing
+  ever read, so `jolt.process`'s `:shutdown` option — `destroy-tree` and
+  friends — cleaned up nothing on any exit path, and a `SIGTERM` to a jolt
+  program left its child processes running. Hooks now run once per process from
+  a single registry, on normal return, on `System/exit`, on an uncaught throw,
+  and on `SIGTERM`/`SIGHUP`.
+
+  The signals are taken over only once a hook is actually registered, by a
+  thread parked in `sigwait` — Chez runs a `register-signal-handler` handler on
+  the main thread at its next safe point, and the two ways a program usually
+  waits (a `deref` of a promise, a blocking foreign call) never reach one, so
+  that route would have made the process ignore the signal instead of handling
+  it. A program with no hooks is untouched and dies on `SIGTERM` as before. Exit
+  status is 128+signal, as on the JVM.
+
+- **A blocking stdin read no longer stops the rest of the program.** `read-line`
+  and the REPL waited inside Chez's own blocking read, which holds the whole
+  Scheme world: a `future` stopped ticking and an agent stopped draining the
+  moment the main thread reached a prompt, where a JVM keeps both running. The
+  wait now happens in `sleep` and the port is read once it has something. A
+  buffered line costs one `char-ready?` and no sleep, so a piped `read-line` loop
+  keeps its throughput (1326 -> 1386 ns/line, 1.045x).
+
+- **A subprocess can be interrupted with `^C` again.** Children spawned the
+  default way came up with SIGINT set to `SIG_IGN`, so `^C` in a terminal killed
+  your program and left the subprocess running. That is the `system(3)` leak the
+  convention exists to avoid rather than the convention itself — a child's
+  dispositions should match what a plain shell would give it, as they do on the
+  JVM. `posix_spawn` now drives every spawn rather than only the ones redirecting
+  a stream to `:inherit` (it already piped every other stream); Chez's fork,
+  which is where the ignore was set, stays as the fallback for platforms without
+  the FFI surface.
+
+- **A child process no longer inherits jolt's signal mask.** jolt blocks SIGINT
+  in its own threads so `^C` reaches the one parked for it, and now blocks
+  SIGTERM/SIGHUP for the shutdown watcher; both travelled to every child through
+  `posix_spawn`'s null attributes and through Chez's fork. A child that starts
+  with SIGTERM blocked survives the `destroy` a shutdown hook calls, and one with
+  SIGINT blocked ignores `^C`. The mask is emptied for the length of a spawn and
+  put back, so a child gets the default mask the JVM would give it.
 
 ### Added
+
+- **Fibers R8: a socket read parks the fiber instead of pinning its carrier.**
+  `jolt.socket` runs its syscalls with the fd in `O_NONBLOCK`; on `EAGAIN` it
+  registers readiness with the new `jolt.io-poller` and parks the fiber, so the
+  carrier runs other fibers meanwhile, and blocks on a private
+  `kevent`/`epoll_wait` exactly as before when there is no fiber. User code keeps
+  its blocking shape either way. File offload is not in this round.
+
+- **Fibers R5: a carrier pool, and `<!!` parks on a fiber.** The scheduler state
+  R4 kept in globals moved into a per-carrier record — run queue, mutex,
+  condition, resume continuation, dynamic slice, thread, stop flag — since R4's
+  single global resume continuation stops being safe the moment there is more
+  than one carrier. Carriers default to the processor count and are overridable;
+  placement is round-robin at spawn and never revisited, because a fiber cannot
+  migrate.
+
+- **Fibers R4: `go` on fibers, opt-in.** A `go` body can run on a fiber.
+  `clojure.core.async/*go-backend*` selects it (`:thread` default, `:fiber` to
+  opt in), read at spawn time off the dynamic binding, so a `binding` covers
+  every `go` in its scope including ones inside functions it calls.
+  `thread`/`thread-call` stay real OS threads regardless — that is the documented
+  escape for blocking work, which would otherwise pin a carrier. The default is
+  unchanged.
 
 - **Fibers R3 (jolt-nvpr.4): one waiter protocol for threads and fibers.** A
   pending channel operation is a handler, never a fork. The alt-taker/alt-putter
@@ -73,6 +182,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (verified under native gsi in gambitcheck); `go` stays on OS threads there
   per the plan's documented degradation. No jolt-level `go` or channel code
   yet — those are later rounds.
+
+- **Gambit build profiles**, so a bundle carries only the language a build
+  needs. The Gambit runtime plus jolt's kernel is two thirds of the bundle and
+  cannot be dropped; what is separable is regex, the compiler, and
+  `clojure.core` itself, so the profiles trade features for the last third —
+  `repl` ships 27.7MB / 3.1MB gzipped against `full`'s 32.6MB / 3.5MB.
+  `make gambitweb` builds the browser bundle, and `host/gambit/host-vars.ss`
+  binds the 40 `clojure.core` names the `java/` tree owns on Chez (`(time 1)`
+  reached an unbound global and failed as a bare Gambit exception); each is
+  either implemented or raises a catchable `UnsupportedOperationException` that
+  names itself.
 
 - **Gambit is a second Scheme backend** — the first target ported through the
   portable Scheme layer (#446). Jolt reads, compiles, and evaluates source on
@@ -3583,7 +3703,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.6.8...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.6.9...HEAD
+[0.6.9]: https://github.com/jolt-lang/jolt/compare/v0.6.8...v0.6.9
 [0.6.8]: https://github.com/jolt-lang/jolt/compare/v0.6.7...v0.6.8
 [0.6.7]: https://github.com/jolt-lang/jolt/compare/v0.6.6...v0.6.7
 [0.6.6]: https://github.com/jolt-lang/jolt/compare/v0.6.5...v0.6.6

@@ -1599,11 +1599,9 @@
         (unless enq (jolt-invoke thunk))
         jolt-nil)))
 
-(define jolt-pump-kih
-  (lambda ()
-    (for-each (lambda (th) (guard (e (#t #f)) (th)))
-              (reverse (unbox jolt-shutdown-hooks)))
-    (exit 0)))
+;; (exit 0) rather than calling _exit: the exit handler runs the hooks, so ^C
+;; while parked reaches exactly the same cleanup every other exit path does.
+(define jolt-pump-kih (lambda () (exit 0)))
 
 ;; Park the calling thread until a keyboard interrupt (^C), running the shutdown
 ;; hooks and exiting when it arrives — AND own the main-thread pump while parked.
@@ -1716,44 +1714,235 @@
     (condition-broadcast jolt-main-queue-cv))
   jolt-nil)
 
-;; Shutdown hooks run by jolt-pump-kih (the keyboard-interrupt-handler installed by
-;; park-until-interrupt) before (exit 0), so a foreground server (nREPL) can close
-;; its socket and drop .nrepl-port on ^C instead of Chez's default mutex-corrupting
-;; abort. Newest-first; each hook is isolated so one failing hook can't block the exit.
-(define jolt-shutdown-hooks (box '()))
-(define (jolt-add-shutdown-hook thunk)
-  (set-box! jolt-shutdown-hooks (cons thunk (unbox jolt-shutdown-hooks)))
-  jolt-nil)
+;; --- POSIX signal masks ------------------------------------------------------
+;; pthread_sigmask/sigaddset are libc/libpthread symbols, resolvable once the
+;; process object is loaded (as the socket fns already are). foreign-procedure
+;; resolves its symbol eagerly, and these POSIX signal fns don't exist on
+;; Windows — resolving them unguarded aborted startup ("no entry for
+;; pthread_sigmask"). Guard so a non-POSIX host yields #f; every caller below
+;; then no-ops (Windows delivers ^C through the console, not a per-thread mask).
+;;
+;; The sets live in FOREIGN memory, not bytevectors: the watcher below hands one
+;; to a __collect_safe sigwait and stays parked in it, where the collector is
+;; free to move a bytevector out from under the pointer C is holding.
+(define c-pthread-sigmask
+  (jolt-foreign-proc-safe "pthread_sigmask" '(int void* void*) 'int))
+(define c-sigemptyset (jolt-foreign-proc-safe "sigemptyset" '(void*) 'int))
+(define c-sigaddset (jolt-foreign-proc-safe "sigaddset" '(void* int) 'int))
+;; POSIX SIG_BLOCK/SIG_UNBLOCK numerics differ by platform: Linux/glibc 0/1,
+;; Darwin/macOS 1/2 (SIG_UNBLOCK is SIG_BLOCK+1 on both). Resolve SIG_BLOCK for
+;; this host from the os-family property.
+(define jolt-sig-block-how (if (eq? (sa-os-family) 'macos) 1 0))
+(define jolt-sig-unblock-how (+ jolt-sig-block-how 1))
+(define jolt-sig-setmask-how (+ jolt-sig-block-how 2))
+(define jolt-sigmask-ok? (and c-pthread-sigmask c-sigemptyset c-sigaddset #t))
+;; 128 bytes covers Linux's 1024-bit sigset_t and is larger than macOS's 4-byte
+;; one. The caller owns the block and frees it (or keeps it for the process's
+;; life, as the watcher does).
+(define (jolt-make-sigset sigs)
+  (let ((s (sa-foreign-alloc 128)))
+    (c-sigemptyset s)
+    (for-each (lambda (n) (c-sigaddset s n)) sigs)
+    s))
 
 ;; Per-thread SIGINT mask. A worker thread parked in a foreign call (the nREPL
 ;; accept loop in c-accept, or a conn handler) can't run Chez's keyboard-interrupt
 ;; handler on ^C, so if SIGINT is delivered there the process hangs. Block SIGINT
 ;; in the primordial thread BEFORE forking such workers (they inherit the mask),
 ;; then park-until-interrupt unblocks it in the primordial once its handler is
-;; installed, so ^C is always delivered to the parked thread. pthread_sigmask/
-;; sigaddset are libc/libpthread symbols, resolvable once the process object is
-;; loaded (as the socket fns already are). 128 bytes covers Linux's 1024-bit
-;; sigset_t and is larger than macOS's 4-byte one.
-;; foreign-procedure resolves its symbol eagerly, and these POSIX signal fns don't
-;; exist on Windows — resolving them unguarded aborted startup ("no entry for
-;; pthread_sigmask"). Guard so a non-POSIX host yields #f; jolt-set-sigint-blocked
-;; then no-ops (Windows delivers ^C through the console, not a per-thread mask).
-(define c-pthread-sigmask
-  (jolt-foreign-proc-safe "pthread_sigmask" '(int u8* u8*) 'int))
-(define c-sigemptyset (jolt-foreign-proc-safe "sigemptyset" '(u8*) 'int))
-(define c-sigaddset (jolt-foreign-proc-safe "sigaddset" '(u8* int) 'int))
-;; POSIX SIG_BLOCK/SIG_UNBLOCK numerics differ by platform: Linux/glibc 0/1,
-;; Darwin/macOS 1/2 (SIG_UNBLOCK is SIG_BLOCK+1 on both). Resolve SIG_BLOCK for
-;; this host from the os-family property.
-(define jolt-sig-block-how (if (eq? (sa-os-family) 'macos) 1 0))
+;; installed, so ^C is always delivered to the parked thread.
 (define (jolt-set-sigint-blocked block?)
-  (when (and c-pthread-sigmask c-sigemptyset c-sigaddset)
-    (let ((set (make-bytevector 128 0))
-          (old (make-bytevector 128 0)))
-      (c-sigemptyset set)
-      (c-sigaddset set 2)                          ; SIGINT = 2
-      (c-pthread-sigmask (if block? jolt-sig-block-how (+ jolt-sig-block-how 1)) set old)))
+  (when jolt-sigmask-ok?
+    (let ((set (jolt-make-sigset '(2)))              ; SIGINT = 2
+          (old (sa-foreign-alloc 128)))
+      (c-pthread-sigmask (if block? jolt-sig-block-how jolt-sig-unblock-how) set old)
+      (sa-foreign-free set)
+      (sa-foreign-free old)))
   jolt-nil)
+
+;; --- shutdown hooks ----------------------------------------------------------
+;; ONE registry for every "run this before the process ends" hook, whichever API
+;; asked for it: jolt.host/add-shutdown-hook (nREPL closing its socket and
+;; dropping .nrepl-port on ^C) and java.lang.Runtime's addShutdownHook, which is
+;; what babashka.process's `:shutdown` option registers. Those were two separate
+;; lists with one runner between them, and the Runtime one was written and never
+;; read — so `:shutdown destroy-tree` cleaned up nothing at all, on any exit path
+;; (#571).
+;;
+;; The hooks run:
+;;   - on every (exit n), via the exit handler the arming below installs — a
+;;     -main that returns, an explicit (System/exit n), and an uncaught throw all
+;;     end there;
+;;   - on ^C while parked in park-until-interrupt (jolt-pump-kih exits);
+;;   - on SIGTERM / SIGHUP, through the watcher thread further down.
+;; Once per process, in registration order, each hook isolated so one that
+;; throws cannot keep the rest from running.
+;;
+;; Entries are (key . thunk): the key is what removeShutdownHook matches on (the
+;; JVM hands back the same Thread object), and is the thunk itself for the
+;; anonymous jolt.host form.
+(define jolt-shutdown-hooks (box '()))
+(define jolt-shutdown-mutex (make-mutex))
+(define jolt-shutdown-ran (box #f))
+
+(define (jolt-register-shutdown-hook! key thunk)
+  (jolt-with-mutex jolt-shutdown-mutex
+    (set-box! jolt-shutdown-hooks (cons (cons key thunk) (unbox jolt-shutdown-hooks))))
+  ;; outside the mutex: arming takes it to test the watcher's flag
+  (jolt-arm-shutdown!)
+  jolt-nil)
+
+(define (jolt-add-shutdown-hook thunk) (jolt-register-shutdown-hook! thunk thunk))
+
+;; #t when a hook keyed by KEY was registered and is now removed, matching
+;; Runtime.removeShutdownHook's boolean.
+(define (jolt-remove-shutdown-hook! key)
+  (jolt-with-mutex jolt-shutdown-mutex
+    (let* ((before (unbox jolt-shutdown-hooks))
+           (after (remp (lambda (e) (eq? (car e) key)) before)))
+      (set-box! jolt-shutdown-hooks after)
+      (not (= (length before) (length after))))))
+
+;; Runs the hooks exactly once per process, whichever exit path gets here first.
+;; The once-flag is flipped under the mutex together with taking the list, so a
+;; SIGTERM landing while the main thread is already exiting cannot run them twice.
+(define (jolt-run-shutdown-hooks!)
+  (let ((hooks (jolt-with-mutex jolt-shutdown-mutex
+                 (and (not (unbox jolt-shutdown-ran))
+                      (begin (set-box! jolt-shutdown-ran #t)
+                             (reverse (unbox jolt-shutdown-hooks)))))))
+    (when hooks
+      (for-each (lambda (e) (guard (_ (#t #f)) ((cdr e)))) hooks)))
+  jolt-nil)
+
+;; The Runnable a java.lang.Thread was constructed with, or #f (Thread() with no
+;; target is legal). A shutdown hook is registered AS a Thread — that is the JVM's
+;; API — and the runner invokes its body directly on the thread doing the
+;; shutdown, rather than forking one thread per hook only to wait for it.
+(define (jolt-thread-body th)
+  (and (jhost? th)
+       (string=? (jhost-tag th) "user-thread")
+       (vector-ref (jhost-state th) 0)))
+
+;; Every exit runs the hooks first, then flushes — a hook that prints must reach
+;; the console like any other output. Guarded: a hook that throws, or a broken
+;; pipe on the flush, must not turn exit into a second crash.
+;;
+;; Installed at RUN time, not as a top-level form. A standalone binary boots by
+;; loading a boot file and then calling Sscheme_start, and whatever the boot
+;; file's top-level forms left in exit-handler is not what is in force by the time
+;; the program runs — a wrapper installed at load time is simply never called
+;; there, which is why hooks ran under `chez --script` and not in a built binary.
+;;
+;; PER THREAD, because Chez's exit-handler is a thread parameter: a wrapper
+;; installed on one thread is invisible to (exit) called on another. So every
+;; entry point installs it on the main thread (jolt-cli-run, and the launcher a
+;; `jolt build` emits), and arming installs it on whatever thread registered the
+;; hook — which is the thread most likely to be the one that later exits.
+(define jolt-exit-handler-installed (make-thread-parameter #f))
+(define (jolt-install-exit-handler!)
+  (unless (jolt-exit-handler-installed)
+    (jolt-exit-handler-installed #t)
+    (let ((base (exit-handler)))
+      (exit-handler
+        (lambda args
+          (guard (_ (#t #f)) (jolt-run-shutdown-hooks!))
+          (guard (_ (#t #f)) (flush-output-port (current-output-port)))
+          (guard (_ (#t #f)) (flush-output-port (current-error-port)))
+          (apply base args)))))
+  jolt-nil)
+
+;; --- SIGTERM / SIGHUP --------------------------------------------------------
+;; The signals a JVM runs shutdown hooks for and jolt can take over: SIGTERM (the
+;; default `kill`, what a supervisor sends) and SIGHUP. Same numbers on Linux and
+;; macOS. SIGINT is deliberately NOT here — Chez owns it through
+;; keyboard-interrupt-handler, and ^C reaches a child through the foreground
+;; process group anyway.
+(define jolt-shutdown-signals '(15 1))
+(define jolt-shutdown-sigset #f)
+(define c-sigwait (jolt-foreign-proc-blocking "sigwait" '(void* void*) 'int))
+;; The watcher cannot leave through Chez's (exit): called off the main thread it
+;; never returns. It has already run the hooks and flushed by then, so _exit is
+;; the whole of what is left to do.
+(define c-underscore-exit (jolt-foreign-proc-safe "_exit" '(int) 'void))
+
+;; Arming happens on the FIRST shutdown hook, never before. Taking a signal over means
+;; its default "terminate now" disposition no longer applies, and a program with
+;; nothing to clean up must stay killable even when its main thread is somewhere
+;; Scheme cannot be resumed from — parked in Chez's own blocking stdin read, say,
+;; where no Scheme thread runs at all. A program that registered a hook has asked
+;; for the cleanup and takes that trade; one that never did is left exactly as it
+;; was.
+;;
+;; A DEDICATED THREAD parked in sigwait, not (register-signal-handler): Chez runs
+;; a registered handler on the main thread at its next safe point, and the two
+;; ways a program most often waits — condition-wait (deref of a promise) and a
+;; blocking foreign call — are not safe points. The handler would never run and
+;; the process would then ignore the signal entirely, which is worse than not
+;; handling it. Blocking the signals here also blocks them in every thread forked
+;; afterwards (a new thread inherits its creator's mask), so the kernel has no
+;; thread to deliver to and leaves the signal pending for sigwait to take.
+(define (jolt-arm-shutdown!)
+  (jolt-install-exit-handler!)
+  (when (and jolt-sigmask-ok? c-sigwait c-underscore-exit)
+    (let ((start? (jolt-with-mutex jolt-shutdown-mutex
+                    (and (not jolt-shutdown-sigset)
+                         (begin (set! jolt-shutdown-sigset
+                                      (jolt-make-sigset jolt-shutdown-signals))
+                                #t)))))
+      (when start?
+        (let ((old (sa-foreign-alloc 128)))
+          (c-pthread-sigmask jolt-sig-block-how jolt-shutdown-sigset old)
+          (sa-foreign-free old))
+        (fork-thread
+          (lambda ()
+            (let ((sigbuf (sa-foreign-alloc 8)))
+              (let loop ()
+                (if (= 0 (c-sigwait jolt-shutdown-sigset sigbuf))
+                    (let ((sig (sa-foreign-ref 'int sigbuf 0)))
+                      (guard (_ (#t #f)) (jolt-run-shutdown-hooks!))
+                      (guard (_ (#t #f)) (flush-output-port (current-output-port)))
+                      (guard (_ (#t #f)) (flush-output-port (current-error-port)))
+                      ;; 128+signal is the status a shell reports for a process
+                      ;; killed by that signal, and what the JVM exits with here.
+                      (c-underscore-exit (+ 128 sig)))
+                    (loop))))))))) ; EINTR — ask again
+  jolt-nil)
+
+;; --- a child must not inherit jolt's signal mask -----------------------------
+;; Both spawn paths hand the calling thread's mask straight to the child —
+;; posix_spawn with a NULL attrp, and Chez's own fork — and jolt blocks signals
+;; in threads for its own reasons: SIGINT so ^C reaches the thread parked in
+;; park-until-interrupt rather than an nREPL worker sitting in a foreign call,
+;; SIGTERM/SIGHUP so the watcher above can take them. Either one inherited is
+;; wrong in a way that bites at once: a child with SIGTERM blocked survives the
+;; very destroy the shutdown hook exists to call, and a child with SIGINT blocked
+;; ignores ^C (jolt-e5sb). A JVM gives its children a default mask; so does this.
+;;
+;; The mask is emptied on THIS thread for the length of the spawn and put back
+;; exactly as it was, so the whole of jolt's private masking is undone at once
+;; rather than a named subset of it. That leaves one fork+exec in which jolt
+;; itself is unmasked: a SIGTERM landing there kills it without running hooks, as
+;; it did before there were hooks, and a ^C landing there may be taken by this
+;; thread instead of the parked one. Both are pre-existing behavior. The
+;; window-free alternative, posix_spawnattr with POSIX_SPAWN_SETSIGMASK, reaches
+;; only one of the two paths — Chez's fork takes no attributes — and two
+;; mechanisms for one rule is worse than one honest window.
+(define jolt-empty-sigset (and jolt-sigmask-ok? (jolt-make-sigset '())))
+(define (jolt-with-empty-sigmask thunk)
+  (if (not jolt-empty-sigset)
+      (thunk)
+      (let* ((old (sa-foreign-alloc 128))
+             (restore (lambda ()
+                        (c-pthread-sigmask jolt-sig-setmask-how old 0)
+                        (sa-foreign-free old))))
+        (c-pthread-sigmask jolt-sig-setmask-how jolt-empty-sigset old)
+        ;; not dynamic-wind: its after-thunk can run more than once, and this one
+        ;; frees. Normal return and throw both restore exactly once; multiple
+        ;; values survive the round trip.
+        (let ((vals (guard (e (#t (restore) (raise e))) (call-with-values thunk list))))
+          (restore)
+          (apply values vals)))))
 
 (def-var! "jolt.host" "call-on-main-thread" jolt-call-on-main-thread)
 (def-var! "jolt.host" "call-on-main-thread-async" jolt-call-on-main-thread-async)

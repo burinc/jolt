@@ -106,6 +106,10 @@
                   :fixed {3 "jolt-assoc3"}}
    "dissoc"      {:call "jolt-dissoc"  :arity #(>= % 1) :fixed {2 "jolt-dissoc2"}}
    "contains?"   {:call "jolt-contains?" :arity #(= % 2) :bool? true}
+   ;; :inline-only? — jolt-find2 answers for the native map and hands everything
+   ;; else to clojure.core/find-other, so it is only the 2-arity call form; a
+   ;; value-position `find` still resolves to the overlay var.
+   "find"        {:call "jolt-find2"  :arity #(= % 2) :inline-only? true}
    "empty?"      {:call "jolt-empty?"   :arity #(= % 1) :bool? true}
    "peek"        {:call "jolt-peek"    :arity #(= % 1)}
    "pop"         {:call "jolt-pop"     :arity #(= % 1)}
