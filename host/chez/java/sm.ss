@@ -61,17 +61,26 @@
 ;; parameterize would revert, a lock would be released and not retaken, a
 ;; binding frame would be popped out from under the code that pushed it.
 ;;
-;; What keeps it true is the pass, not this file. `try` and `fn*` are the only
-;; two heads the back end lowers to a dynamic-wind (backend_scheme emit-try, and
-;; every host form that takes a thunk), and both are in sm-opaque — which is what
-;; also covers binding, dosync and locking, since each of those puts its body
-;; behind one or the other. A park inside any of them falls back to the capture,
-;; where the wind is fine.
+;; What keeps it true is the pass, not this file, and the two heads it turns on
+;; are opaque for DIFFERENT reasons. `try` is the only head the back end emits a
+;; dynamic-wind for, and only for its finally clause (backend_scheme emit-try).
+;; `fn*` emits a plain lambda and no wind at all; it is opaque because the pass
+;; cannot see what the thunk is handed to, and a host form that takes one winds
+;; around the call. That distinction is load-bearing and not pedantic: the pass
+;; emits its OWN fn* continuations, in sm-kont and sm-cps-loop, with cheap park
+;; sites inside them, so a bare fn* has to be wind-free or the pass would break
+;; this invariant by construction. Between them the two cover binding, dosync and
+;; locking, since each puts its body behind one or the other. A park inside any of
+;; them falls back to the capture, where the wind is fine.
 ;;
-;; Nothing checks this. If the back end ever emits a wind for something the pass
-;; DOES rewrite, parked go blocks break silently and after the fact — the
-;; after-thunk has already run by the time anything notices. Adding such a form
-;; means adding its head to sm-opaque in the same change.
+;; The invariant IS checked, by run-gosm.ss section 1c, which scans the emitted
+;; Scheme for a rewritten park site inside a dynamic-wind's extent. Nesting and
+;; not presence: a body may legally carry both, and does whenever a park inside a
+;; try falls back. What the drift check beside it cannot see is exactly this
+;; direction — that one catches a special form ADDED to the analyzer, not the back
+;; end growing a wind for a head the pass already rewrites, and not a new
+;; rewriting arm for a head that winds. Either change means adding the head to
+;; sm-opaque in the same commit; 1c is what says so instead of hoping.
 ;;
 ;; Store the rest of the computation and hand the carrier back. The differences
 ;; from jolt-fiber-to-scheduler! are the whole point: no call/1cc, and k is left

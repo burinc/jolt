@@ -1605,9 +1605,13 @@
 ;; the fiber thunk, so it does not rewind: any wind between the CPS driver and a
 ;; rewritten park site would have its after-thunk fire mid-computation and its
 ;; before-thunk never run again. clojure.core.async's pass keeps that from
-;; happening by treating `try` and `fn*` as opaque, which is sound exactly
-;; because those two are the only heads that reach a dynamic-wind. Emitting one
-;; for anything else means adding that head to sm-opaque in the same change; see
+;; happening by treating `try` and `fn*` as opaque — `try` because of this clause,
+;; and `fn*` NOT because it winds. A bare fn* emits a plain lambda, which is what
+;; lets the pass wrap its own continuations around park sites; it is opaque because
+;; the pass cannot see what the thunk is handed to, and a host form that takes one
+;; winds around the call. Emitting a wind for anything else means adding that head
+;; to sm-opaque in the same change, and run-gosm.ss section 1c fails if it does
+;; not: it scans the emission for a rewritten park site inside a wind's extent. See
 ;; the invariant note at jolt-sm-park!.
 ;; Both keys optional.
 (defn- emit-try [node]

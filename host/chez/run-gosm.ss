@@ -263,6 +263,109 @@
                  "                      sm-rewrites)))"))
             "()")
 
+;; --- 1c. a rewritten body emits no dynamic-wind ------------------------------
+;; THE invariant the cheap park rests on (java/sm.ss, at jolt-sm-park!): a cheap
+;; park does not rewind. It escapes the whole winder chain above the carrier's
+;; base and comes back in through the fiber thunk with nothing rebuilt, so a wind
+;; between the driver and a rewritten park site is not suspended across the park,
+;; it is destroyed by it — the after-thunk fires while the computation is still
+;; live and the before-thunk never runs again.
+;;
+;; Nothing checked it, and the drift check above cannot: that one catches a
+;; special form ADDED to the analyzer, not an existing head that starts emitting a
+;; wind, and not a head dropped out of sm-opaque. So check the thing itself, on
+;; the emitted SCHEME, which is the only place the answer lives.
+;;
+;; The property is NESTING, not presence. A body may carry a driver AND a wind
+;; and still be correct: (go (try (<! ch) (finally :x))) is __sm-spawn'd, and the
+;; take inside the try is left as a CAPTURE, which rewinds the chain properly. So
+;; "the emission holds no dynamic-wind" is the wrong test — the right one is that
+;; no REWRITTEN park site sits inside a wind's extent, which is what the pass buys
+;; by never descending into try or fn*.
+(ev "(def ch (clojure.core.async/chan))")
+(ev "(defn helper-take [c] (clojure.core.async/<! c))")
+(define (emit-scheme src) (jolt-analyze-emit-form (jolt-ce-read src) "user"))
+
+;; The two spellings a rewritten park site emits to. Pinned by a check below, so a
+;; rename or a direct-linked build cannot make the scan blind instead of failing.
+(define sm-call-take "(var-deref \"clojure.core.async\" \"__sm-take\")")
+(define sm-call-put  "(var-deref \"clojure.core.async\" \"__sm-put\")")
+
+;; Is a rewritten park site inside some dynamic-wind's balanced extent? One
+;; left-to-right scan: `winds` holds the depth each open wind started at, so a
+;; site seen with that list non-empty is inside one. String literals are skipped
+;; whole (the emission is full of them and they hold parens), and the two park
+;; spellings are tested BEFORE the skip, since the op name lives inside a literal.
+(define (wind-holds-park? s)
+  (let ((n (string-length s)))
+    (define (at? i sub)
+      (let ((m (string-length sub)))
+        (and (fx<=? (fx+ i m) n) (string=? (substring s i (fx+ i m)) sub))))
+    (let loop ((i 0) (depth 0) (winds (quote ())))
+      (cond
+        ((fx>=? i n) #f)
+        ((at? i sm-call-take)
+         (or (pair? winds) (loop (fx+ i (string-length sm-call-take)) depth winds)))
+        ((at? i sm-call-put)
+         (or (pair? winds) (loop (fx+ i (string-length sm-call-put)) depth winds)))
+        ((char=? (string-ref s i) #\")
+         (let skip ((j (fx+ i 1)))
+           (cond ((fx>=? j n) #f)
+                 ((char=? (string-ref s j) #\\) (skip (fx+ j 2)))
+                 ((char=? (string-ref s j) #\") (loop (fx+ j 1) depth winds))
+                 (else (skip (fx+ j 1))))))
+        ((at? i "(dynamic-wind") (loop (fx+ i 1) (fx+ depth 1) (cons depth winds)))
+        ((char=? (string-ref s i) #\() (loop (fx+ i 1) (fx+ depth 1) winds))
+        ((char=? (string-ref s i) #\))
+         (let ((d (fx- depth 1)))
+           (loop (fx+ i 1) d
+                 (if (and (pair? winds) (fx=? (car winds) d)) (cdr winds) winds))))
+        (else (loop (fx+ i 1) depth winds))))))
+
+;; The scan itself, unit-checked on hand-built shapes. Without this the checks
+;; below could pass by the scan never recognising anything.
+(gate-check "1c. scan: a park inside a wind is caught"
+            (wind-holds-park?
+             (string-append "(dynamic-wind jolt-finally-in (lambda () (jolt-invoke2 "
+                            sm-call-take " x k)) (lambda () 1))")) #t)
+(gate-check "1c. scan: a put inside a wind is caught"
+            (wind-holds-park?
+             (string-append "(dynamic-wind jolt-finally-in (lambda () (jolt-invoke3 "
+                            sm-call-put " x v k)) (lambda () 1))")) #t)
+(gate-check "1c. scan: a park AFTER the wind closes is not"
+            (wind-holds-park?
+             (string-append "(begin (dynamic-wind jolt-finally-in (lambda () 1) (lambda () 2))"
+                            " (jolt-invoke2 " sm-call-take " x k))")) #f)
+(gate-check "1c. scan: a paren inside a string literal does not shift the depth"
+            (wind-holds-park?
+             (string-append "(dynamic-wind jolt-finally-in (lambda () \"))))\") (lambda () 1))"
+                            " (jolt-invoke2 " sm-call-take " x k)")) #f)
+;; and the spelling it looks for is the one the back end actually emits
+(gate-check "1c. the emission does contain a park site the scan can see"
+            (gate-sub? (emit-scheme "(go (<! ch))") sm-call-take) #t)
+(gate-check "1c. and the put spelling too"
+            (gate-sub? (emit-scheme "(go (>! ch 1))") sm-call-put) #t)
+
+(for-each
+ (lambda (p)
+   (gate-check (string-append "1c. no rewritten park inside a wind: " (car p))
+               (wind-holds-park? (emit-scheme (cdr p))) #f))
+ (list
+  (cons "a lexical take"          "(go (<! ch))")
+  (cons "a put"                   "(go (>! ch 1))")
+  (cons "a go-loop"               "(go-loop [] (let [v (<! ch)] (when v (recur))))")
+  (cons "if / let / loop / recur" "(go (loop [i 0] (if (< i 2) (recur (inc (<! ch))) [(<! ch) i])))")
+  (cons "a mixed body"            "(go [(<! ch) (helper-take ch)])")
+  ;; the two heads that DO emit a wind. Declined today, so their park captures —
+  ;; and the check still holds, which is the point: it constrains the nesting, not
+  ;; the presence of a wind.
+  (cons "try / finally"           "(go (try (<! ch) (finally :x)))")
+  (cons "binding"                 "(go (binding [*warn-on-reflection* true] (<! ch)))")
+  ;; a rewritten park BEFORE a wind, and a wind inside a continuation the pass
+  ;; built: legal, and the shape most likely to trip a sloppier check
+  (cons "a park, then a wind"     "(go (do (<! ch) (try :a (finally :b))))")
+  (cons "a wind, then a park"     "(go (do (try :a (finally :b)) (<! ch)))")))
+
 ;; --- 2. the counters, on the :fiber backend ---------------------------------
 (printf "\n== 2. cheap parks vs captures, per park site ==\n")
 ;; A helper the pass cannot see through. Its <! parks by capturing.
@@ -371,6 +474,89 @@
 (gate-check "go-loop: summed" (car r-loop) 6)
 (gate-check "go-loop: no captures" (caddr r-loop) 0)
 (gate-check "go-loop: parked cheaply" (> (cadr r-loop) 0) #t)
+
+;; --- the PUT side, which nothing here covered (jolt-eo4j) --------------------
+;; Every parking op above is a take. sm-cps picks __sm-put for >! / >!! the same
+;; way it picks __sm-take for <! / <!!, but that is where the symmetry stops:
+;; __sm-put carries two arguments rather than one, and jolt-sm-fiber-put reaches
+;; jolt-sm-commit! through its own branch — it registers an alt-PUTTER and its
+;; resume answers #t/#f instead of a value. fibers-sm-test.ss calls jolt-sm-put by
+;; hand, which gates the OP; nothing gated the pass emitting it.
+(ev "(defn helper-put [c v] (clojure.core.async/>! c v))")
+
+(define x-put (go-expansion "(go (clojure.core.async/>! ch 1))"))
+(gate-check "put -> __sm-put" (gate-sub? x-put "__sm-put") #t)
+(gate-check "put -> not __sm-take" (gate-sub? x-put "__sm-take") #f)
+;; channel, then value, then the continuation — a two-argument op is the one place
+;; sm-cps-seq's ordering can go wrong silently
+(gate-check "put: channel and value in source order, k last"
+            (gate-sub? x-put "__sm-put ch 1 k__") #t)
+(gate-check ">!! is the same op to the pass"
+            (gate-sub? (go-expansion "(go (clojure.core.async/>!! ch 1))") "__sm-put") #t)
+(gate-check "put through a call -> go-spawn"
+            (gate-sub? (go-expansion "(go (helper-put ch 1))") "__sm-") #f)
+
+;; An UNBUFFERED __ch, so the put has nobody to hand its value to and must park.
+;; The driver's take is what resumes it, and the body's value is the put's own
+;; answer.
+(define put-got (box #f))
+(define (take-after-cheap label n)
+  (lambda (c0 p0)
+    (when (wait-counter (string-append label ": cheap park #" (number->string n))
+                        jolt-sm-parks (+ c0 n))
+      (set-box! put-got (ev "(clojure.core.async/<!! __ch)")))))
+
+(define r-put
+  (fiber-run "put" "(clojure.core.async/go (clojure.core.async/>! __ch 41))"
+             (list (take-after-cheap "put" 1))))
+(gate-check "put: the body answers true" (car r-put) #t)
+(gate-check "put: the value reached the taker" (unbox put-got) 41)
+(gate-check "put: one cheap park" (cadr r-put) 1)
+(gate-check "put: no capture" (caddr r-put) 0)
+
+;; The put fallback, mirroring the take one: through a helper it captures.
+(define put-got2 (box #f))
+(define r-put-helper
+  (fiber-run "put via helper" "(clojure.core.async/go (helper-put __ch 42))"
+             (list (lambda (c0 p0)
+                     (when (wait-counter "put via helper: capture #1"
+                                         jolt-fiber-chan-parks (+ p0 1))
+                       (set-box! put-got2 (ev "(clojure.core.async/<!! __ch)")))))))
+(gate-check "put through a call: the value still arrives" (unbox put-got2) 42)
+(gate-check "put through a call: no cheap park" (cadr r-put-helper) 0)
+(gate-check "put through a call: one capture" (caddr r-put-helper) 1)
+
+;; Source order across a park, which a two-argument op is the only op that can
+;; get wrong: sm-cps-seq binds a park-free form to the LEFT of a parking one
+;; before the park, so the destination is evaluated first. Built as a flat
+;; argument list it would land inside the take's continuation and run second.
+(gate-check "put: the destination is evaluated before the parking value"
+            (ev (string-append
+                 "(let [src (clojure.core.async/chan 1)"
+                 "      dst (clojure.core.async/chan 1)"
+                 "      ord (atom [])]"
+                 "  (clojure.core.async/>!! src :v)"
+                 "  (binding [clojure.core.async/*go-backend* :fiber]"
+                 "    (clojure.core.async/<!! (clojure.core.async/go"
+                 "      (clojure.core.async/>! (do (swap! ord conj :dst) dst)"
+                 "                             (do (swap! ord conj :val)"
+                 "                                 (clojure.core.async/<! src))))))"
+                 "  (pr-str @ord))"))
+            "[:dst :val]")
+
+;; A closed channel answers false rather than parking, on both backends and
+;; through the rewritten op — the one put outcome that is not a park.
+(for-each
+ (lambda (backend)
+   (gate-check (string-append "put on a closed channel is false on " backend)
+               (ev (string-append
+                    "(let [c (clojure.core.async/chan 1)]"
+                    "  (clojure.core.async/close! c)"
+                    "  (binding [clojure.core.async/*go-backend* " backend "]"
+                    "    (pr-str (clojure.core.async/<!! (clojure.core.async/go"
+                    "      [(clojure.core.async/>! c :x) :done])))))"))
+               "[false :done]"))
+ '(":thread" ":fiber"))
 
 ;; --- 3. same values on both backends ----------------------------------------
 (printf "\n== 3. the same answers on :thread and :fiber ==\n")
