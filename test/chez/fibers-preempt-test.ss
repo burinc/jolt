@@ -215,6 +215,54 @@
 ;; sane bound catches it; 30s leaves room for a slow machine.
 (ok "7. and in linear time" (< (- (now-secs) drain-t0) 30.0))
 
+;; --- 9. preemption never lands inside a lock --------------------------------
+;; The bug this gate exists for. An OS mutex has THREAD granularity and fibers
+;; multiplex one thread, so a fiber suspended holding one loses exclusion either
+;; way: unwinding releases it mid-section, and not unwinding lets the next fiber
+;; on the SAME carrier acquire it anyway, because Chez mutexes are recursive per
+;; thread. Measured before the gate existed: (swap! a inc) through the
+;; with-mutex'd compare-and-set lost an update, 11999 of 12000, on every run.
+;;
+;; ONE carrier, so nothing else can paper over it, and each fiber burns a quantum
+;; between updates so preemptions actually fall due mid-region rather than while
+;; the fiber is parked.
+(jolt-fiber-pool-reset!)
+(jolt-fiber-carrier-count-set! 1)
+(jolt-fiber-preempt-ticks-set! jolt-fiber-preempt-ticks-min)
+
+(define LK-N 4)
+(define LK-PER 2000)
+(define lk-atom (jolt-atom-new 0))
+(define lk-obj (jolt-atom-new 'monitored))
+(define lk-mon 0)
+(define lk-done 0)
+(define lk-before (jolt-fiber-preempts))
+(define (lk-burn n) (let loop ((i 0) (a 0)) (if (fx=? i n) a (loop (fx+ i 1) (fx+ a i)))))
+(define (lk-inc x) (+ x 1))
+
+(do ((i 0 (+ i 1))) ((= i LK-N))
+  (sa-fiber-spawn
+   (lambda ()
+     (let loop ((j 0))
+       (if (< j LK-PER)
+           (begin
+             (lk-burn 200)
+             (jolt-swap! lk-atom lk-inc)            ; with-mutex'd CAS
+             ;; a monitor too: jolt's user-facing `locking`, the class a
+             ;; with-mutex wrapper alone would miss
+             (jolt-with-monitor lk-obj (lambda () (set! lk-mon (+ lk-mon 1))))
+             (loop (+ j 1)))
+           (set! lk-done (+ lk-done 1)))))))
+(jolt-fiber-ensure-carrier!)
+(wait-until (lambda () (= lk-done LK-N)) 90.0 "9. every fiber finished")
+(ok "9. no atom update lost under preemption"
+    (= (jolt-atom-val lk-atom) (* LK-N LK-PER)))
+(ok "9. no monitored update lost under preemption"
+    (= lk-mon (* LK-N LK-PER)))
+(ok "9. preemption actually fired during the run"
+    (> (jolt-fiber-preempts) lk-before))
+(ok "9. no lock left held on the carrier" (= 0 (jolt-locks-held)))
+
 (jolt-fiber-preempt-ticks-set! #f)
 (jolt-fiber-pool-reset!)
 (printf "\nfibers-preempt-test: ~a checks, ~a failure(s)\n" total fails)

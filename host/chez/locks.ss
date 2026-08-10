@@ -59,6 +59,16 @@
 (define (jolt-locks-exit!)
   (set-virtual-register! jolt-vreg-locks (fx- (virtual-register jolt-vreg-locks) 1)))
 
+;; NOTE on how a refused preemption is remembered. It is NOT remembered here.
+;; The obvious design — a pending flag, honoured when the outermost region exits
+;; — would have to park from inside a dynamic-wind's after-thunk, since that is
+;; where the release happens, and escaping from an after-thunk is its own hazard.
+;; The timer is a better memory than a flag: the scheduler's handler simply
+;; re-arms on a short retry when it finds a lock held, so the preemption lands
+;; just after the region ends without anything here knowing about fibers. That is
+;; also what Go does — a goroutine interrupted at an unsafe point is resumed and
+;; retried later.
+
 ;; (jolt-with-mutex m body ...) — the replacement for Chez's with-mutex.
 ;; Deliberately a DIFFERENT NAME rather than a shadow: a shadow would make every
 ;; site silently safe, which is pleasant right up until the gate cannot tell

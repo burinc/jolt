@@ -757,6 +757,12 @@
 ;; point where there is no step to store. It also does not bump the sm/chan park
 ;; counters — run-gosm.ss asserts exact deltas on those, and a preemption is
 ;; neither kind of park.
+;; The retry interval used when a preemption falls due at a moment it cannot be
+;; taken. Short, because the regions it waits on are short — measured ~55ns mean
+;; — so this lands the preemption just after the region instead of a whole
+;; quantum later.
+(define (jolt-fiber-preempt-retry-ticks) jolt-fiber-preempt-ticks-min)
+
 (define (jolt-fiber-preempt-handler)
   (let ((f (jolt-current-fiber)))
     (cond
@@ -767,6 +773,16 @@
       ;; would leave a timer running over the scheduler itself, where every
       ;; delivery is a no-op that costs a handler call.
       ((not f) (void))
+      ;; A LOCK IS HELD. Switching here loses mutual exclusion whichever way it
+      ;; goes: unwinding releases the mutex mid-section, and not unwinding leaves
+      ;; this fiber holding an OS mutex while another fiber on the SAME carrier
+      ;; runs — and Chez mutexes are recursive per thread, so that fiber's
+      ;; acquire succeeds anyway. So do not switch; come back shortly. Dropping
+      ;; the request instead would quietly restore starvation for a fiber that is
+      ;; inside a region whenever the timer fires.
+      ((fx>? (jolt-locks-held) 0)
+       (set-timer (jolt-fiber-preempt-retry-ticks))
+       (void))
       (else
        (jolt-fiber-bump-preempts! f)
        (jolt-fiber-state-set! f 'ready)
