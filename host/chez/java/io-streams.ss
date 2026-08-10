@@ -542,7 +542,7 @@
 (define (pipe-io-throw msg) (jolt-throw (jolt-host-throwable "java.io.IOException" msg)))
 
 (define (pipe-write! p bv start count)
-  (with-mutex (jpipe-mu p)
+  (jolt-with-mutex (jpipe-mu p)
     (when (jpipe-rclosed? p) (pipe-io-throw "Read end dead"))
     (when (jpipe-wclosed? p) (pipe-io-throw "Pipe closed"))
     (let ((chunk (make-bytevector count)))
@@ -555,7 +555,7 @@
 ;; releases the mutex and deactivates the thread, so a writer can run and the
 ;; collector is not held up by a parked reader.
 (define (pipe-read! p bv start count)
-  (with-mutex (jpipe-mu p)
+  (jolt-with-mutex (jpipe-mu p)
     (let loop ()
       (cond
         ((jpipe-rclosed? p) (pipe-io-throw "Pipe closed"))
@@ -572,11 +572,11 @@
         (else (condition-wait (jpipe-cv p) (jpipe-mu p)) (loop))))))
 
 (define (pipe-close-write! p)
-  (with-mutex (jpipe-mu p)
+  (jolt-with-mutex (jpipe-mu p)
     (jpipe-wclosed?-set! p #t)
     (condition-broadcast (jpipe-cv p))))
 (define (pipe-close-read! p)
-  (with-mutex (jpipe-mu p)
+  (jolt-with-mutex (jpipe-mu p)
     (jpipe-rclosed?-set! p #t)
     (condition-broadcast (jpipe-cv p))))
 

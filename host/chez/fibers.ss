@@ -45,9 +45,13 @@
 ;;
 ;; Loaded from rt.ss in the usual place AND from scheme-adapter-runtime.ss
 ;; (which loads first, so the gate-time adaptercheck, which loads only that
-;; file, sees the sa-fiber-* names bound). Self-contained: uses nothing beyond
-;; Chez natives (guarded references to the runtime's var machinery and
-;; processor probe), so the gate test loads it directly.
+;; file, sees the sa-fiber-* names bound). Nearly self-contained: beyond Chez
+;; natives it needs ONLY host/chez/locks.ss, which every loader of this file
+;; loads first, because every lock in the runtime routes through the counting
+;; wrapper there and jolt-with-mutex is a macro rather than something that can
+;; be captured at run time. Everything else it borrows from the runtime (the var
+;; machinery, the processor probe, the adapter seams) is a guarded reference
+;; with a working fallback, so a standalone load still runs.
 
 ;; --- the fiber record -------------------------------------------------------
 ;; state: 'ready (on the run queue) | 'running | 'parked (waiting on
@@ -389,7 +393,7 @@
 ;; carriers that then get orphaned.
 (define (jolt-fiber-ensure-carriers!)
   (unless jolt-fiber-carriers
-    (mutex-acquire jolt-fiber-rr-mu)
+    (jolt-lock! jolt-fiber-rr-mu)
     (unless jolt-fiber-carriers
       (let* ((n (jolt-fiber-carrier-count))
              (v (make-vector n)))
@@ -398,7 +402,7 @@
             (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
                                (make-jolt-dslice #f #f #f) #f #f 0 0 0 0)))
         (set! jolt-fiber-carriers v)))
-    (mutex-release jolt-fiber-rr-mu)))
+    (jolt-unlock! jolt-fiber-rr-mu)))
 
 ;; Pick the next carrier by round-robin. Runs ONCE at spawn — the fiber never
 ;; changes carrier (R0(d)). The read-and-advance of jolt-fiber-rr happens
@@ -408,10 +412,10 @@
   (jolt-fiber-ensure-carriers!)
   (let ((v jolt-fiber-carriers)
         (n (vector-length jolt-fiber-carriers)))
-    (mutex-acquire jolt-fiber-rr-mu)
+    (jolt-lock! jolt-fiber-rr-mu)
     (let ((c (vector-ref v (mod jolt-fiber-rr n))))
       (set! jolt-fiber-rr (fx+ jolt-fiber-rr 1))
-      (mutex-release jolt-fiber-rr-mu)
+      (jolt-unlock! jolt-fiber-rr-mu)
       c)))
 
 ;; The intrusive per-carrier queue. `next` lives in each fiber record.
@@ -435,27 +439,27 @@
 (define (jolt-fiber-enqueue! c f)
   (begin
     (disable-interrupts)
-    (mutex-acquire (jolt-carrier-mu c))
+    (jolt-lock! (jolt-carrier-mu c))
     (if (jolt-carrier-tail c)
         (begin (jolt-fiber-next-set! (jolt-carrier-tail c) f)
                (jolt-carrier-tail-set! c f))
         (begin (condition-signal (jolt-carrier-cv c))
                (jolt-carrier-head-set! c f)
                (jolt-carrier-tail-set! c f)))
-    (mutex-release (jolt-carrier-mu c))
+    (jolt-unlock! (jolt-carrier-mu c))
     (enable-interrupts)))
 
 (define (jolt-fiber-dequeue! c)
   (begin
     (disable-interrupts)
-    (mutex-acquire (jolt-carrier-mu c))
+    (jolt-lock! (jolt-carrier-mu c))
     (let ((f (jolt-carrier-head c)))
       (when f
         (jolt-carrier-head-set! c (jolt-fiber-next f))
         (unless (jolt-carrier-head c) (jolt-carrier-tail-set! c #f))
         ;; clear the link so a completed fiber does not retain the queue
         (jolt-fiber-next-set! f #f))
-      (mutex-release (jolt-carrier-mu c))
+      (jolt-unlock! (jolt-carrier-mu c))
       (enable-interrupts)
       f)))
 
@@ -817,7 +821,7 @@
 ;; job swish's demonitor&flush does at the other end.
 (define (jolt-fiber-monitor! f proc)
   (let ((now
-         (with-mutex jolt-fiber-monitor-mu
+         (jolt-with-mutex jolt-fiber-monitor-mu
            (let ((st (jolt-fiber-state f)))
              (cond
                ;; Already finished: deliver inline, reading the SAME field
@@ -840,7 +844,7 @@
 ;; contained so it cannot stop the remaining ones or corrupt the completion —
 ;; the fiber is already finishing and there is nowhere left to report to.
 (define (jolt-fiber-notify-monitors! f err)
-  (let ((ms (with-mutex jolt-fiber-monitor-mu
+  (let ((ms (jolt-with-mutex jolt-fiber-monitor-mu
               (let ((ms (jolt-fiber-monitors f)))
                 (jolt-fiber-monitors-set! f '())
                 ms))))
@@ -1056,12 +1060,12 @@
 (define (jolt-fiber-carrier-loop c)
   (let loop ()
     (jolt-fiber-drain! c)
-    (mutex-acquire (jolt-carrier-mu c))
+    (jolt-lock! (jolt-carrier-mu c))
     (cond
-      ((jolt-carrier-stop? c) (mutex-release (jolt-carrier-mu c)) (void))
-      ((jolt-carrier-head c) (mutex-release (jolt-carrier-mu c)) (loop))
+      ((jolt-carrier-stop? c) (jolt-unlock! (jolt-carrier-mu c)) (void))
+      ((jolt-carrier-head c) (jolt-unlock! (jolt-carrier-mu c)) (loop))
       (else (condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c))
-            (mutex-release (jolt-carrier-mu c))
+            (jolt-unlock! (jolt-carrier-mu c))
             (loop)))))
 
 ;; Start the pool exactly once, on the first :fiber go spawn. Double-start is
@@ -1069,7 +1073,7 @@
 ;; the spawner's thread parameters at fork, which is irrelevant here — every
 ;; drain re-captures the scheduler slice at entry.
 (define (jolt-fiber-ensure-carrier!)
-  (mutex-acquire jolt-fiber-pool-mu)
+  (jolt-lock! jolt-fiber-pool-mu)
   (unless jolt-fiber-pool-started?
     (set! jolt-fiber-pool-started? #t)
     (jolt-fiber-preempt-refresh!)
@@ -1079,7 +1083,7 @@
         (let ((c (vector-ref v i)))
           (jolt-carrier-thread-set! c
             (fork-thread (lambda () (jolt-fiber-carrier-loop c))))))))
-  (mutex-release jolt-fiber-pool-mu))
+  (jolt-unlock! jolt-fiber-pool-mu))
 
 ;; (jolt-fiber-pool-reset!) -> void. Stop every carrier thread (each finishes
 ;; its queue, then exits on the stop flag), join them, and drop the pool so
@@ -1090,22 +1094,22 @@
 ;; mid-fiber finishes that fiber before exiting (the join waits), but a
 ;; PARKED fiber is abandoned: no thread is left to resume it.
 (define (jolt-fiber-pool-reset!)
-  (mutex-acquire jolt-fiber-pool-mu)
+  (jolt-lock! jolt-fiber-pool-mu)
   (let ((v jolt-fiber-carriers))
     (when v
       (let ((n (vector-length v)))
         (do ((i 0 (fx+ i 1))) ((fx=? i n))
           (let ((c (vector-ref v i)))
-            (mutex-acquire (jolt-carrier-mu c))
+            (jolt-lock! (jolt-carrier-mu c))
             (jolt-carrier-stop?-set! c #t)
             (condition-broadcast (jolt-carrier-cv c))
-            (mutex-release (jolt-carrier-mu c))))
+            (jolt-unlock! (jolt-carrier-mu c))))
         (do ((i 0 (fx+ i 1))) ((fx=? i n))
           (let ((t (jolt-carrier-thread (vector-ref v i))))
             (when t (thread-join t)))))))
-  (mutex-acquire jolt-fiber-rr-mu)
+  (jolt-lock! jolt-fiber-rr-mu)
   (set! jolt-fiber-carriers #f)
   (set! jolt-fiber-rr 0)
-  (mutex-release jolt-fiber-rr-mu)
+  (jolt-unlock! jolt-fiber-rr-mu)
   (set! jolt-fiber-pool-started? #f)
-  (mutex-release jolt-fiber-pool-mu))
+  (jolt-unlock! jolt-fiber-pool-mu))

@@ -328,7 +328,7 @@
       ;; threads see the same value, so they build the same path — and the
       ;; file-exists? retry below does not catch it, since neither has created
       ;; the file yet and the caller that creates it second clobbers the first.
-      (let* ((n (with-mutex nio-temp-mutex
+      (let* ((n (jolt-with-mutex nio-temp-mutex
                   (set! nio-temp-counter (+ nio-temp-counter 1))
                   nio-temp-counter))
              (full (string-append d (if (string? prefix) prefix "")

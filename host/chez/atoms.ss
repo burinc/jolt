@@ -79,7 +79,7 @@
 ;; CAS the val from `old` to `nv` by identity (eq?), atomically. Returns #t on
 ;; success. The compute step (f) runs outside this, so we re-check under the lock.
 (define (jolt-atom-cas! a old nv)
-  (with-mutex (jolt-atom-lock a)
+  (jolt-with-mutex (jolt-atom-lock a)
     (if (eq? (jolt-atom-val a) old)
         (begin (jolt-atom-val-set! a nv) #t)
         #f)))
@@ -100,7 +100,7 @@
 (define (jolt-reset! a v)
   (jolt-need-atom a)
   (jolt-atom-validate a v)
-  (let ((old (with-mutex (jolt-atom-lock a)
+  (let ((old (jolt-with-mutex (jolt-atom-lock a)
                (let ((o (jolt-atom-val a))) (jolt-atom-val-set! a v) o))))
     (jolt-atom-notify a old v)
     v))
@@ -108,7 +108,7 @@
 ;; compare-and-set! keeps jolt= (value) semantics, done atomically under the lock.
 (define (jolt-compare-and-set! a oldv newv)
   (jolt-atom-validate a newv)
-  (let ((swapped (with-mutex (jolt-atom-lock a)
+  (let ((swapped (jolt-with-mutex (jolt-atom-lock a)
                    (if (jolt= (jolt-atom-val a) oldv)
                        (begin (jolt-atom-val-set! a newv) #t)
                        #f))))
@@ -126,7 +126,7 @@
 
 (define (jolt-reset-vals! a v)
   (jolt-atom-validate a v)
-  (let ((old (with-mutex (jolt-atom-lock a)
+  (let ((old (jolt-with-mutex (jolt-atom-lock a)
                (let ((o (jolt-atom-val a))) (jolt-atom-val-set! a v) o))))
     (jolt-atom-notify a old v)
     (jolt-vector old v)))
@@ -171,10 +171,10 @@
 ;; call with iref-tbl-mu HELD — the read-modify-write is not atomic on its own.
 (define (iref-tbl-bump!) (set-box! iref-writes (fx+ 1 (unbox iref-writes))))
 (define (iref-watches-of r)
-  (if (iref-any?) (with-mutex iref-tbl-mu (hashtable-ref iref-watch-tbl r '())) '()))
+  (if (iref-any?) (jolt-with-mutex iref-tbl-mu (hashtable-ref iref-watch-tbl r '())) '()))
 (define (iref-validator-of r)
   (if (iref-any?)
-      (with-mutex iref-tbl-mu (hashtable-ref iref-validator-tbl r jolt-nil))
+      (jolt-with-mutex iref-tbl-mu (hashtable-ref iref-validator-tbl r jolt-nil))
       jolt-nil))
 (define (iref-notify r old new)
   (for-each (lambda (kv) (jolt-invoke (cdr kv) (car kv) r old new))
@@ -196,7 +196,7 @@
      (jolt-atom-watches-set! a (jolt-watch-add (jolt-atom-watches a) key f))
      a)
     ((iref? a)
-     (with-mutex iref-tbl-mu
+     (jolt-with-mutex iref-tbl-mu
        (iref-tbl-bump!)
        (hashtable-set! iref-watch-tbl a
          (jolt-watch-add (hashtable-ref iref-watch-tbl a '()) key f)))
@@ -209,7 +209,7 @@
        (remp (lambda (kv) (jolt=2 (car kv) key)) (jolt-atom-watches a)))
      a)
     ((iref? a)
-     (with-mutex iref-tbl-mu
+     (jolt-with-mutex iref-tbl-mu
        (hashtable-set! iref-watch-tbl a
          (remp (lambda (kv) (jolt=2 (car kv) key)) (hashtable-ref iref-watch-tbl a '()))))
      a)
@@ -224,7 +224,7 @@
       ((iref? a)
        (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke vf (jolt-deref a))))
          (jolt-iref-state-throw))
-       (with-mutex iref-tbl-mu
+       (jolt-with-mutex iref-tbl-mu
          (iref-tbl-bump!)
          (hashtable-set! iref-validator-tbl a vf)))
       (else (throw-jvm (quote ClassCastException) "set-validator!: not a reference")))

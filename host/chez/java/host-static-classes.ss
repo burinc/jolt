@@ -504,7 +504,7 @@
 ;; atomic; a mutex-held fn deadlocked on the non-recursive Chez mutex there
 ;; (PSL R4 cluster 4).
 (define (atomic-cas! self o n)
-  (with-mutex (atomic-lock self)
+  (jolt-with-mutex (atomic-lock self)
     (if (jolt=2 (unbox (atomic-box self)) o)
         (begin (set-box! (atomic-box self) n) #t) #f)))
 (let ((ref-ctor (lambda args (make-atomic (if (pair? args) (car args) jolt-nil))))
@@ -520,7 +520,7 @@
 (register-host-methods! "atomic"
   (list (cons "get" (lambda (self) (unbox (atomic-box self))))
         (cons "set" (lambda (self v) (set-box! (atomic-box self) v) jolt-nil))
-        (cons "getAndSet" (lambda (self v) (with-mutex (atomic-lock self)
+        (cons "getAndSet" (lambda (self v) (jolt-with-mutex (atomic-lock self)
                             (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) v) o))))
         (cons "compareAndSet" (lambda (self o n) (atomic-cas! self o n)))
         (cons "updateAndGet" (lambda (self f)
@@ -531,17 +531,17 @@
           (let loop ((v (unbox (atomic-box self))))
             (let ((n (jolt-invoke f v)))
               (if (atomic-cas! self v n) v (loop (unbox (atomic-box self))))))))
-        (cons "incrementAndGet" (lambda (self) (with-mutex (atomic-lock self)
+        (cons "incrementAndGet" (lambda (self) (jolt-with-mutex (atomic-lock self)
                                   (let ((n (+ (unbox (atomic-box self)) 1))) (set-box! (atomic-box self) n) n))))
-        (cons "decrementAndGet" (lambda (self) (with-mutex (atomic-lock self)
+        (cons "decrementAndGet" (lambda (self) (jolt-with-mutex (atomic-lock self)
                                   (let ((n (- (unbox (atomic-box self)) 1))) (set-box! (atomic-box self) n) n))))
-        (cons "getAndIncrement" (lambda (self) (with-mutex (atomic-lock self)
+        (cons "getAndIncrement" (lambda (self) (jolt-with-mutex (atomic-lock self)
                                   (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) (+ o 1)) o))))
-        (cons "getAndDecrement" (lambda (self) (with-mutex (atomic-lock self)
+        (cons "getAndDecrement" (lambda (self) (jolt-with-mutex (atomic-lock self)
                                   (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) (- o 1)) o))))
-        (cons "addAndGet" (lambda (self d) (with-mutex (atomic-lock self)
+        (cons "addAndGet" (lambda (self d) (jolt-with-mutex (atomic-lock self)
                             (let ((n (+ (unbox (atomic-box self)) (jnum->exact d)))) (set-box! (atomic-box self) n) n))))
-        (cons "getAndAdd" (lambda (self d) (with-mutex (atomic-lock self)
+        (cons "getAndAdd" (lambda (self d) (jolt-with-mutex (atomic-lock self)
                             (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) (+ o (jnum->exact d))) o))))
         (cons "intValue" (lambda (self) (jnum->exact (unbox (atomic-box self)))))
         (cons "longValue" (lambda (self) (jnum->exact (unbox (atomic-box self)))))
@@ -1186,7 +1186,7 @@
 ;; registry's type-registry. The member writes go under the same lock, since they
 ;; mutate the table this just published.
 (define (register-tagged-methods! tag members)
-  (with-mutex hsc-mu
+  (jolt-with-mutex hsc-mu
     (let* ((key (tag->method-key tag))
            (h (or (hashtable-ref tagged-methods-tbl key #f)
                   (let ((nh (make-hashtable string-hash string=?)))
@@ -1367,7 +1367,7 @@
 ;; promises that a race would take away.
 (define (jolt-class-for name)
   (or (hashtable-ref jolt-class-for-tbl name #f)
-      (with-mutex hsc-mu
+      (jolt-with-mutex hsc-mu
         (or (hashtable-ref jolt-class-for-tbl name #f)
             (let ((obj (make-class-obj name)))
               (hashtable-set! jolt-class-for-tbl name obj)

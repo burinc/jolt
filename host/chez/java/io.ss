@@ -656,7 +656,7 @@
           (lambda (port) (put-string port text)))
         (let ((tmp (string-append p ".spit-tmp-"
                                    (number->string (sa-real-time-ms)) "-"
-                                   (number->string (with-mutex io-counter-mutex
+                                   (number->string (jolt-with-mutex io-counter-mutex
                                                      (begin (set! spit-tmp-counter (+ spit-tmp-counter 1))
                                                             spit-tmp-counter))))))
           (with-port (open-output-file tmp 'replace)
@@ -914,7 +914,7 @@
 ;; getAndIncrement), used by id generators such as core.logic's lvar.
 (define rt-next-id-counter 1)
 (define (rt-next-id)
-  (with-mutex io-counter-mutex
+  (jolt-with-mutex io-counter-mutex
     (let ((v rt-next-id-counter))
       (set! rt-next-id-counter (+ rt-next-id-counter 1))
       v)))
@@ -973,7 +973,7 @@
         (cdr c)
         (let ((h (make-jhost "thread" (current-interrupt-box))))
           (thread-handle-cell (cons id h))
-          (with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
+          (jolt-with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
           h))))
 ;; A handle for a thread that has never asked who it is. Its interrupt box is its
 ;; own, so .interrupt through it does not reach that thread — the thread adopts a
@@ -981,9 +981,9 @@
 (define (thread-handle-for-id id)
   (if (eqv? id (get-thread-id))
       (current-thread-handle)              ; the caller must find ITSELF in the map
-      (or (with-mutex thread-handles-mutex (hashtable-ref thread-handles-by-id id #f))
+      (or (jolt-with-mutex thread-handles-mutex (hashtable-ref thread-handles-by-id id #f))
           (let ((h (make-jhost "thread" (box #f))))
-            (with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
+            (jolt-with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
             h))))
 ;; Thread/getAllStackTraces: the live threads mapped to EMPTY stack traces. jolt
 ;; reifies no call stack (TCO erases caller frames) and .getStackTrace is already
@@ -1041,7 +1041,7 @@
                   ((getenv "TMPDIR") => (lambda (t) t))
                   (else "/tmp")))
          (sfx (if (or (null? (list suffix)) (jolt-nil? suffix)) ".tmp" (jolt-str-render-one suffix))))
-    (let ((n (with-mutex io-counter-mutex
+    (let ((n (jolt-with-mutex io-counter-mutex
               (set! temp-file-counter (+ temp-file-counter 1))
               temp-file-counter)))
     (let loop ((n n))

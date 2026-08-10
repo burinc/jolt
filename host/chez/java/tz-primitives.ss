@@ -35,7 +35,7 @@
 ;; localtime returns a STATIC buffer — do NOT foreign-free it.
 (define (tzp-offset-raw zone epoch)
   (and tzp-tz-symbols?
-       (with-mutex tzp-mutex
+       (jolt-with-mutex tzp-mutex
          (tzp-setenv "TZ" zone 1)
          (tzp-tzset)
          (let ((tp (sa-foreign-alloc 8)))
@@ -83,7 +83,7 @@
          (sa-foreign-set! 'integer-32 tm 16 tm-mon) (sa-foreign-set! 'integer-32 tm 20 70)
          (sa-foreign-set! 'integer-32 tm 24 tm-wday) (sa-foreign-set! 'integer-32 tm 28 0)
          (sa-foreign-set! 'integer-32 tm 32 -1)
-         (let ((result (with-mutex tzp-mutex
+         (let ((result (jolt-with-mutex tzp-mutex
                          (let ((saved (tzp-setlocale tzp-LC_TIME libc-loc)))
                            (if saved
                                (let ((n (tzp-strftime buf 128 fmt tm)))

@@ -27,13 +27,13 @@
 (define meta-table-mu (make-mutex))
 (define meta-count (box 0))
 (define (meta-table-set! k v)
-  (with-mutex meta-table-mu
+  (jolt-with-mutex meta-table-mu
     (hashtable-set! meta-table k v)
     (set-box! meta-count (fx+ 1 (unbox meta-count)))))
 (define (meta-table-del! k)
-  (with-mutex meta-table-mu (hashtable-delete! meta-table k)))
+  (jolt-with-mutex meta-table-mu (hashtable-delete! meta-table k)))
 (define (meta-table-get k)
-  (with-mutex meta-table-mu (hashtable-ref meta-table k #f)))
+  (jolt-with-mutex meta-table-mu (hashtable-ref meta-table k #f)))
 
 (define (jolt-meta x)
   (cond

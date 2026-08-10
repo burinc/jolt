@@ -263,7 +263,7 @@
 (define (jolt-local-var . args)
   (let ((c (make-var-cell "" (string-append "local-"
                                             (number->string
-                                             (with-mutex local-var-mutex
+                                             (jolt-with-mutex local-var-mutex
                                                (set! local-var-counter (fx+ local-var-counter 1))
                                                local-var-counter)))
                           (if (pair? args) (car args) jolt-nil)

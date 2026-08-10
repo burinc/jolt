@@ -146,7 +146,7 @@
                         (deft (if (jolt-multifn? core) (jolt-multifn-default core) kw-default))
                         (m (make-jolt-multifn nm disp (new-mm-table) deft #f (new-mm-table) (new-mm-table) -1 #f)))
                    (def-var! mns nm m) m))))
-    (with-mutex mm-tbl-mu
+    (jolt-with-mutex mm-tbl-mu
       (hashtable-set! (jolt-multifn-methods mf) (mm-dispatch-val-canon dval) impl)
       (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1)))
     mf))
@@ -193,7 +193,7 @@
          ;; concurrent remove-method leaves trailing FILL slots — which then go to
          ;; jolt= as dispatch values. The isa? scan below runs OUTSIDE the lock.
          (keys (filter (lambda (k) (not (jolt= k default)))
-                       (vector->list (with-mutex mm-tbl-mu (hashtable-keys methods)))))
+                       (vector->list (jolt-with-mutex mm-tbl-mu (hashtable-keys methods)))))
          (matches (filter (lambda (k) (isa? dv k)) keys)))
     (cond
       ((null? matches) #f)
@@ -249,7 +249,7 @@
   (let ((hier (mm-current-hierarchy mf)))
     (unless (and (fx= (jolt-multifn-cache-epoch mf) jolt-mm-epoch)
                  (eq? (jolt-multifn-cache-hier mf) hier))
-      (with-mutex mm-tbl-mu
+      (jolt-with-mutex mm-tbl-mu
         (unless (and (fx= (jolt-multifn-cache-epoch mf) jolt-mm-epoch)
                      (eq? (jolt-multifn-cache-hier mf) hier))
           (hashtable-clear! (jolt-multifn-cache mf))
@@ -282,7 +282,7 @@
                        (m (or (mm-find-isa mf dv)
                               (hashtable-ref methods (jolt-multifn-default mf) #f))))
                   (when m
-                    (with-mutex mm-tbl-mu
+                    (jolt-with-mutex mm-tbl-mu
                       (when (and (fx= epoch jolt-mm-epoch)
                                  (fx= (jolt-multifn-cache-epoch mf) epoch)
                                  (eq? (jolt-multifn-cache-hier mf) hier))
@@ -342,7 +342,7 @@
       (throw-jvm (quote IllegalStateException)
                  (string-append "Preference conflict in multimethod '" (jolt-multifn-name mf)
                                 "': " (jolt-pr-str dval-b) " is already preferred to " (jolt-pr-str dval-a))))
-    (with-mutex mm-tbl-mu
+    (jolt-with-mutex mm-tbl-mu
       ;; the sub-table lookup and its insert are one step: two threads preferring
       ;; different pairs under the same dval-a would otherwise each build a fresh
       ;; sub-table and one of the preferences would be dropped with it.
@@ -355,14 +355,14 @@
 
 (define (jolt-remove-method-setup mf dval)
   (when (jolt-multifn? mf)
-    (with-mutex mm-tbl-mu
+    (jolt-with-mutex mm-tbl-mu
       (hashtable-delete! (jolt-multifn-methods mf) dval)
       (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1))))
   mf)
 
 (define (jolt-remove-all-methods-setup mf)
   (when (jolt-multifn? mf)
-    (with-mutex mm-tbl-mu
+    (jolt-with-mutex mm-tbl-mu
       (hashtable-clear! (jolt-multifn-methods mf))
       (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1))))
   mf)
@@ -384,7 +384,7 @@
 ;; — which would reach jolt-assoc as a dispatch value of 0.
 (define (jolt-methods-setup mf)
   (if (jolt-multifn? mf)
-      (let* ((kv (with-mutex mm-tbl-mu
+      (let* ((kv (jolt-with-mutex mm-tbl-mu
                    (let-values (((ks vs) (hashtable-entries (jolt-multifn-methods mf))))
                      (cons ks vs))))
              (ks (car kv)) (vs (cdr kv)))
@@ -398,7 +398,7 @@
       ;; the inner sub-tables are snapshotted in the SAME critical section: a
       ;; prefer-method landing between the outer scan and an inner one would
       ;; otherwise be read mid-insert.
-      (let* ((kv (with-mutex mm-tbl-mu
+      (let* ((kv (jolt-with-mutex mm-tbl-mu
                    (let-values (((ks vs) (hashtable-entries (jolt-multifn-prefers mf))))
                      (cons ks (vector-map (lambda (sub) (hashtable-keys sub)) vs)))))
              (ks (car kv)) (subs (cdr kv)))

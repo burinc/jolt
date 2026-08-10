@@ -87,13 +87,13 @@
   (if ns
       (let ((k (keyword-intern-key ns name)))
         (or (hashtable-ref keyword-table k #f)
-            (with-mutex keyword-table-mu
+            (jolt-with-mutex keyword-table-mu
               (or (hashtable-ref keyword-table k #f)
                   (let ((kw (make-keyword-t ns name (compute-keyword-hasheq ns name))))
                     (hashtable-set! keyword-table k kw)
                     kw)))))
       (or (hashtable-ref keyword-table-bare name #f)
-          (with-mutex keyword-table-mu
+          (jolt-with-mutex keyword-table-mu
             (or (hashtable-ref keyword-table-bare name #f)
                 (let ((kw (make-keyword-t #f name (compute-keyword-hasheq #f name))))
                   (hashtable-set! keyword-table-bare name kw)
@@ -115,7 +115,7 @@
 (define (intern-symbol-string s)
   (if (string? s)
       (or (hashtable-ref symbol-string-pool s #f)
-          (with-mutex symbol-string-pool-mu
+          (jolt-with-mutex symbol-string-pool-mu
             (or (hashtable-ref symbol-string-pool s #f)
                 (begin (hashtable-set! symbol-string-pool s s) s))))
       s))

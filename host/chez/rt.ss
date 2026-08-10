@@ -33,6 +33,9 @@
 ;; loader of rt.ss — boot scripts, gate harnesses, emitted programs — correct
 ;; by construction; a boot file loading it earlier is a harmless re-define.
 (load "host/chez/scheme-adapter-runtime.ss")
+;; Before everything else that locks: jolt-with-mutex is a MACRO, so it has to be
+;; defined before any file that uses it is loaded. It depends on nothing but Chez.
+(load "host/chez/locks.ss")
 (load "host/chez/values.ss")
 (load "host/chez/hasheq.ss")
 ;; Resolve a libc entry point at RUN time; #f when the entry doesn't exist
@@ -250,6 +253,8 @@
 (define jolt-vreg-current-fiber 0)  ; fibers.ss: the running fiber record, or 0 (fixnum) when not on a fiber
 ;; slot 1: fibers.ss jolt-vreg-park-unwinding — a park escape is unwinding this carrier
 ;; slot 5: hasheq.ss jolt-vreg-hasheq-caches — this thread's (symbol . string) hasheq tables
+;; slot 7: locks.ss jolt-vreg-locks — how many locks this carrier holds; the
+;;   scheduler refuses to preempt a fiber while it is non-zero
 ;; slot 6: fibers.ss jolt-vreg-fiber-winder-base — the winder chain this carrier
 ;;   dispatched the running fiber with, so the park's finally walk knows where to stop
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
@@ -359,7 +364,7 @@
 ;; under it.
 (define jolt-callsite-mu (make-mutex))
 (define (jolt-table-add! tbl key entry)
-  (with-mutex jolt-callsite-mu
+  (jolt-with-mutex jolt-callsite-mu
     (let ((cur (hashtable-ref tbl key '())))
       (unless (member entry cur)
         (hashtable-set! tbl key (cons entry cur))))))
@@ -557,7 +562,7 @@
 (define (jolt-var ns name)
   (let ((k (string-append ns "/" name)))
     (or (hashtable-ref var-table k #f)
-        (with-mutex var-table-mu
+        (jolt-with-mutex var-table-mu
           (or (hashtable-ref var-table k #f)
               (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f)))
                 (hashtable-set! var-table k c)
@@ -574,9 +579,9 @@
 ;; The lock covers only the snapshot. Callers iterate the returned vector outside
 ;; it, so no caller's body (jolt-assoc, intern-ns!, the image walker) runs under
 ;; the lock.
-(define (var-table-cells) (with-mutex var-table-mu (hashtable-values var-table)))
+(define (var-table-cells) (jolt-with-mutex var-table-mu (hashtable-values var-table)))
 (define (var-table-entries)
-  (with-mutex var-table-mu
+  (jolt-with-mutex var-table-mu
     (let-values (((ks vs) (hashtable-entries var-table))) (cons ks vs))))
 ;; non-creating lookup (resolve / find-var / ns-unmap): #f when absent, so a
 ;; probe never interns an empty cell.
@@ -600,22 +605,22 @@
 ;; arity name (seq.ss), the image walker (state-image.ss), the class arm
 ;; (java/host-class.ss) — so none of them can afford to skip it either.
 (define proc-name-mu (make-mutex))
-(define (proc-name-of v) (with-mutex proc-name-mu (hashtable-ref proc-name-tbl v #f)))
+(define (proc-name-of v) (jolt-with-mutex proc-name-mu (hashtable-ref proc-name-tbl v #f)))
 (define (def-var! ns name v)
   ;; first def of a given proc wins, so an alias like (def inc' inc) — which binds
   ;; the SAME proc to a second var — doesn't rename inc.
   (when (procedure? v)
-    (with-mutex proc-name-mu
+    (jolt-with-mutex proc-name-mu
       (unless (hashtable-contains? proc-name-tbl v)
         (hashtable-set! proc-name-tbl v (cons ns name)))))
-  (with-mutex var-table-mu (hashtable-set! ns-has-vars-set ns #t))
+  (jolt-with-mutex var-table-mu (hashtable-set! ns-has-vars-set ns #t))
   (let ((c (jolt-var ns name))) (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
 ;; Value-position comparison references compile to the seq.ss chain singletons
 ;; (jolt-lt/gt/le/ge), not to the clojure.core var roots — the roots were later
 ;; re-bound by the checked numeric layer, so def-var! never saw these procs.
 ;; Register them so a stored comparator like (sorted-map-by >) travels as a
 ;; fn-ref (by name) like any other named core fn.
-(with-mutex proc-name-mu
+(jolt-with-mutex proc-name-mu
   (hashtable-set! proc-name-tbl jolt-lt (cons "clojure.core" "<"))
   (hashtable-set! proc-name-tbl jolt-gt (cons "clojure.core" ">"))
   (hashtable-set! proc-name-tbl jolt-le (cons "clojure.core" "<="))
@@ -735,7 +740,7 @@
         ;; declaration-only var stays defined?=#f and resolve/find-var/ns-interns
         ;; miss it in an AOT build. The existing root is left intact.
         (begin (var-cell-defined?-set! c #t) c)
-        (with-mutex var-table-mu
+        (jolt-with-mutex var-table-mu
           (let ((c (hashtable-ref var-table k #f)))
             (if c
                 (begin (var-cell-defined?-set! c #t) c)
@@ -1082,7 +1087,7 @@
 
 (define (seed-random!)
   (let* ((t (current-time 'time-utc))
-         (n (with-mutex random-seed-mutex
+         (n (jolt-with-mutex random-seed-mutex
               (set! random-seed-counter (+ random-seed-counter 1))
               random-seed-counter))
          (mix (bitwise-xor (time-nanosecond t)

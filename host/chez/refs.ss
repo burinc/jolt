@@ -178,7 +178,7 @@
       (let ((txn (make-txn))
             (aborted #f)
             (result #f))
-        (with-mutex stm-lock
+        (jolt-with-mutex stm-lock
           (parameterize ((*txn* txn))
             (guard (e (#t (set! aborted #t) (set! result e)))
               (set! result (jolt-invoke thunk)))
@@ -215,14 +215,14 @@
 
 (define (jolt-ref-min-history . args)
   (let ((ref (car args)))
-    (with-mutex ref-history-mu
+    (jolt-with-mutex ref-history-mu
       (if (= (length args) 2)
           (begin (hashtable-set! ref-min-history-tbl ref (cadr args)) ref)
           (hashtable-ref ref-min-history-tbl ref 0)))))
 
 (define (jolt-ref-max-history . args)
   (let ((ref (car args)))
-    (with-mutex ref-history-mu
+    (jolt-with-mutex ref-history-mu
       (if (= (length args) 2)
           (begin (hashtable-set! ref-max-history-tbl ref (cadr args)) ref)
           (hashtable-ref ref-max-history-tbl ref 10)))))

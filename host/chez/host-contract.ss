@@ -402,7 +402,7 @@
 (define (hc-sq-gensym base)
   (jolt-symbol #f (string-append base "__"
                                  (number->string
-                                  (with-mutex hc-sq-gensym-mutex
+                                  (jolt-with-mutex hc-sq-gensym-mutex
                                     (set! hc-sq-gensym-counter (+ hc-sq-gensym-counter 1))
                                     hc-sq-gensym-counter))
                                  "__auto")))
@@ -559,7 +559,7 @@
 (define inline-stash-table (make-hashtable string-hash string=?))
 (define inline-stash-mu (make-mutex))
 (define (hc-stash-inline! ctx ns-name nm m)
-  (with-mutex inline-stash-mu
+  (jolt-with-mutex inline-stash-mu
     (hashtable-set! inline-stash-table (string-append ns-name "/" nm) m))
   jolt-nil)
 (define (hc-inline-ir ctx ns-name nm)

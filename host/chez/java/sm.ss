@@ -93,7 +93,7 @@
 ;; no-park path exits it here.
 (define (jolt-sm-commit! f h resume)
   (disable-interrupts)
-  (let* ((park? (with-mutex (alt-handler-wmu h)
+  (let* ((park? (jolt-with-mutex (alt-handler-wmu h)
                   (if (vector-ref (alt-handler-mailbox h) 0)
                       #f
                       (begin (jolt-fiber-state-set! f 'parked) #t)))))

@@ -18,6 +18,7 @@
 ;; timed region so segment churn (3.5KB per park) does not pollute the number.
 
 (import (chezscheme))
+(load "host/chez/locks.ss")   ; fibers.ss locks through it; jolt-with-mutex is a macro
 (load "host/chez/fibers.ss")
 ;; R5 (jolt-nvpr.6): fibers now live on a POOL of N carriers (N defaults to
 ;; the processor count). This gate drives the scheduler SYNCHRONOUSLY with

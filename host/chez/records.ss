@@ -223,7 +223,7 @@
 (define chez-deftype-ctor-tag-mu (make-mutex))
 (define (deftype-ctor-tag p) (hashtable-ref (unbox chez-deftype-ctor-tag-box) p #f))
 (define (deftype-ctor-tag-set! ctor tag)
-  (with-mutex chez-deftype-ctor-tag-mu
+  (jolt-with-mutex chez-deftype-ctor-tag-mu
     (let ((t (hashtable-copy (unbox chez-deftype-ctor-tag-box) #t)))  ; copy is weak too
       (hashtable-set! t ctor tag)
       (set-box! chez-deftype-ctor-tag-box t))))
@@ -297,7 +297,7 @@
 (define (chez-double-tag? t) (and (string? t) (string=? t "double")))
 
 (define (register-record-shape! ctor-key field-kws field-tags type-tag)
-  (with-mutex rec-tbl-mu
+  (jolt-with-mutex rec-tbl-mu
     (hashtable-set! chez-record-shapes-tbl ctor-key
                     (vector field-kws field-tags type-tag))
     (hashtable-set! chez-record-dbl-tbl type-tag
@@ -346,7 +346,7 @@
     ;; index the full type tag "ns.Name" AND the simple record name -> ctor-key
     ;; for nested-field-tag resolution (qualified entries are unambiguous; the
     ;; simple entry is the cross-ns fallback and may be overwritten on collision).
-    (let-values (((ks vs) (with-mutex rec-tbl-mu
+    (let-values (((ks vs) (jolt-with-mutex rec-tbl-mu
                             (let-values (((a b) (hashtable-entries chez-record-shapes-tbl)))
                               (values a b)))))
       (vector-for-each
@@ -377,7 +377,7 @@
          (preferred (string-append ns "/->" simple)))
     (if (hashtable-ref chez-record-shapes-tbl preferred #f)
         preferred
-        (let loop ((ks (vector->list (with-mutex rec-tbl-mu (hashtable-keys chez-record-shapes-tbl)))))
+        (let loop ((ks (vector->list (jolt-with-mutex rec-tbl-mu (hashtable-keys chez-record-shapes-tbl)))))
           (cond ((null? ks) #f)
                 ((string=? (chez-shape-simple-name (car ks)) target) (car ks))
                 (else (loop (cdr ks))))))))
@@ -385,7 +385,7 @@
 ;; materialize chez-protocol-methods-tbl into "ns/method" -> [proto method].
 (define (chez-protocol-methods-map)
   (let ((out (jolt-hash-map)))
-    (let-values (((ks vs) (with-mutex rec-tbl-mu
+    (let-values (((ks vs) (jolt-with-mutex rec-tbl-mu
                             (let-values (((a b) (hashtable-entries chez-protocol-methods-tbl)))
                               (values a b)))))
       (vector-for-each
@@ -587,7 +587,7 @@
   (and (jrec? x) (not (jrec-record? x))
        (let ((ti (hashtable-ref type-registry (jrec-tag x) #f)))
          (and ti
-              (let loop ((ps (vector->list (with-mutex rec-tbl-mu (hashtable-keys ti)))))
+              (let loop ((ps (vector->list (jolt-with-mutex rec-tbl-mu (hashtable-keys ti)))))
                 (cond ((null? ps) #f)
                       ((member (jch-last-segment (car ps)) jrec-coll-iface-names) #t)
                       (else (loop (cdr ps)))))))))
@@ -600,7 +600,7 @@
   (and (jrec? x) (not (jrec-record? x))
        (let ((ti (hashtable-ref type-registry (jrec-tag x) #f)))
          (and ti
-              (let loop ((ps (vector->list (with-mutex rec-tbl-mu (hashtable-keys ti)))))
+              (let loop ((ps (vector->list (jolt-with-mutex rec-tbl-mu (hashtable-keys ti)))))
                 (cond ((null? ps) #f)
                       ((string=? (jch-last-segment (car ps)) "Sequential") #t)
                       (else (loop (cdr ps)))))))))
@@ -872,7 +872,7 @@
     ;; mint two gensyms, and the descriptor ptable is keyed by that identity — so
     ;; a store under one key and a lookup under the other miss each other for the
     ;; life of the process, silently demoting the record fast path.
-    (or k (with-mutex rec-tbl-mu
+    (or k (jolt-with-mutex rec-tbl-mu
             (or (hashtable-ref proto-method-keys s #f)
                 (let ((nk (gensym (string-append proto "." method))))
                   (hashtable-set! proto-method-keys s nk) nk))))))
@@ -886,7 +886,7 @@
   ;; the epoch bump, the two check-then-creates and the impl write are ONE step:
   ;; split, two threads extending the same type each build their own inner table
   ;; and the second overwrite drops the first's impl entirely.
-  (with-mutex rec-tbl-mu
+  (jolt-with-mutex rec-tbl-mu
     (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
     (let* ((ti (or (hashtable-ref type-registry type-tag #f)
                    (let ((h (make-hashtable string-hash string=?))) (hashtable-set! type-registry type-tag h) h)))
@@ -901,7 +901,7 @@
       ;; intern-pm-key first, OUTSIDE the lock it takes itself, then the ptable
       ;; create-and-write as one step for the same reason as above
       (let ((k (intern-pm-key proto method)))
-        (with-mutex rec-tbl-mu
+        (jolt-with-mutex rec-tbl-mu
           (let ((pt (or (jrdesc-ptable desc)
                         (let ((h (make-eq-hashtable))) (jrdesc-ptable-set! desc h) h))))
             (hashtable-set! pt k fn))))))
@@ -918,7 +918,7 @@
     (and ti
          ;; snapshot under the lock — a bare hashtable-keys racing a registration
          ;; returns FILL slots, and the ref below would then be given 0
-         (let* ((ks (with-mutex rec-tbl-mu (hashtable-keys ti))) (n (vector-length ks)))
+         (let* ((ks (jolt-with-mutex rec-tbl-mu (hashtable-keys ti))) (n (vector-length ks)))
            (let loop ((i 0))
              (and (fx< i n)
                   (let ((f (hashtable-ref (hashtable-ref ti (vector-ref ks i) #f) method #f)))
@@ -932,7 +932,7 @@
 (define (find-method-any-protocol-arity type-tag method nargs)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti
-         (let* ((ks (with-mutex rec-tbl-mu (hashtable-keys ti))) (n (vector-length ks)))
+         (let* ((ks (jolt-with-mutex rec-tbl-mu (hashtable-keys ti))) (n (vector-length ks)))
            (let loop ((i 0) (fallback #f))
              (if (fx>= i n)
                  fallback
@@ -950,7 +950,7 @@
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti
          (or (and (hashtable-ref ti qname #f) #t)
-             (let* ((ks (with-mutex rec-tbl-mu (hashtable-keys ti))) (n (vector-length ks)))
+             (let* ((ks (jolt-with-mutex rec-tbl-mu (hashtable-keys ti))) (n (vector-length ks)))
                (let loop ((i 0))
                  (and (fx< i n)
                       (or (proto-class-match? (vector-ref ks i) qname)
@@ -1104,7 +1104,7 @@
           ;; the same tag can install its desc between this read and this write
           ;; and have its ptable invalidated by us right after, leaving the live
           ;; desc permanently on the slow path.
-          (_ (with-mutex rec-tbl-mu
+          (_ (jolt-with-mutex rec-tbl-mu
                (let ((old-desc (hashtable-ref chez-tag-desc tag #f)))
                  (when old-desc (jrdesc-ptable-set! old-desc #f)))
                (hashtable-set! chez-tag-desc tag desc)))
@@ -1136,7 +1136,7 @@
               (hashtable-ref chez-simple-name-tag (symbol-t-name name-sym) #f))
       (register-class-ctor! (symbol-t-name name-sym) ctor))
     ;; index the tag so a cross-ns extend-protocol resolves the bare type name.
-    (with-mutex rec-tbl-mu
+    (jolt-with-mutex rec-tbl-mu
       (hashtable-set! chez-deftype-tag-set tag #t)
       (hashtable-set! chez-simple-name-tag (symbol-t-name name-sym) tag))
     ;; graft the type onto the class graph so isa?/supers/ancestors see it. A
@@ -1164,7 +1164,7 @@
   (let ((ns (chez-current-ns)))
     (for-each (lambda (mn)
                 (let ((m (if (symbol-t? mn) (symbol-t-name mn) mn)))
-                  (with-mutex rec-tbl-mu
+                  (jolt-with-mutex rec-tbl-mu
                     (hashtable-set! chez-protocol-methods-tbl
                                     (string-append ns "/" m) (cons proto-name m)))))
               (seq->list method-names)))
@@ -1250,7 +1250,7 @@
 ;; extenders excludes them.
 (define extend-mark "__jolt_extend__")
 (define (mark-extend! tag proto-name)
-  (with-mutex rec-tbl-mu
+  (jolt-with-mutex rec-tbl-mu
     (let ((ti (hashtable-ref type-registry tag #f)))
       (when ti (let ((pi (hashtable-ref ti proto-name #f)))
                  (when pi (hashtable-set! pi extend-mark #t)))))))
@@ -1285,7 +1285,7 @@
 ;; instance?/satisfies? on the protocol hold.
 (define (register-inline-protocol! type-name proto-name)
   (let ((tag (string-append (chez-current-ns) "." type-name)))
-    (with-mutex rec-tbl-mu
+    (jolt-with-mutex rec-tbl-mu
       (let ((ti (or (hashtable-ref type-registry tag #f)
                     (let ((h (make-hashtable string-hash string=?))) (hashtable-set! type-registry tag h) h))))
         (unless (hashtable-ref ti proto-name #f)
@@ -1421,7 +1421,7 @@
 ;; epoch and removing a not-yet-present clone), then the clone's sibling def registers.
 (define clone-registry (make-hashtable string-hash string=?))
 (define (register-clone type-tag proto method fn)
-  (with-mutex rec-tbl-mu
+  (jolt-with-mutex rec-tbl-mu
     (let* ((ti (or (hashtable-ref clone-registry type-tag #f)
                    (let ((h (make-hashtable string-hash string=?))) (hashtable-set! clone-registry type-tag h) h)))
            (pi (or (hashtable-ref ti proto #f)
@@ -1438,7 +1438,7 @@
   (let ((ti (hashtable-ref clone-registry type-tag #f)))
     (and ti (let ((pi (hashtable-ref ti proto #f))) (and pi (hashtable-ref pi method #f))))))
 (define (remove-clone! type-tag proto method)
-  (with-mutex rec-tbl-mu
+  (jolt-with-mutex rec-tbl-mu
     (let ((ti (hashtable-ref clone-registry type-tag #f)))
       (when ti
         (let ((pi (hashtable-ref ti proto #f)))
@@ -1509,12 +1509,12 @@
          ;; .addMethod left every multifn's dispatch cache stamped current, so a
          ;; value already resolved through isa? kept its old method for good.
          ((string=? method-name "addMethod")
-          (with-mutex mm-tbl-mu
+          (jolt-with-mutex mm-tbl-mu
             (hashtable-set! (jolt-multifn-methods obj) (car rest) (cadr rest))
             (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1)))
           obj)
          ((string=? method-name "removeMethod")
-          (with-mutex mm-tbl-mu
+          (jolt-with-mutex mm-tbl-mu
             (hashtable-delete! (jolt-multifn-methods obj) (car rest))
             (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1)))
           obj)
@@ -1527,7 +1527,7 @@
          ;; longer has a method.
          ((string=? method-name "getMethodTable")
           (let* ((tbl (jolt-multifn-methods obj))
-                 (kv (with-mutex mm-tbl-mu
+                 (kv (jolt-with-mutex mm-tbl-mu
                        (let-values (((ks vs) (hashtable-entries tbl))) (cons ks vs))))
                  (ks (car kv)) (vs (cdr kv)))
             (let loop ((i 0) (m (jolt-hash-map)))
@@ -1844,7 +1844,7 @@
           (when ti (let ((pi (hashtable-ref ti pn-str #f)))
                      (when (and pi (hashtable-ref pi extend-mark #f))
                        (set! out (cons (jolt-symbol jolt-nil tag) out)))))))
-      (with-mutex rec-tbl-mu (hashtable-keys type-registry)))
+      (jolt-with-mutex rec-tbl-mu (hashtable-keys type-registry)))
     (if (null? out) jolt-nil (list->cseq out))))
 
 ;; jolt exception values (ex-info + host-constructed throwables) are ex-info-shaped
@@ -1871,7 +1871,7 @@
 ;; "ns.Name" tag make-deftype-ctor bakes — so jrec-record? distinguishes the two.
 (define (register-record-type! name-sym)
   (let ((tag (string-append (chez-current-ns) "." (symbol-t-name name-sym))))
-    (with-mutex rec-tbl-mu (hashtable-set! chez-record-type-tbl tag #t))
+    (jolt-with-mutex rec-tbl-mu (hashtable-set! chez-record-type-tbl tag #t))
     ;; a defrecord's class ancestry: replace the deftype IType row with the
     ;; record interfaces (their closure supplies Associative/Seqable/ILookup/…),
     ;; keeping any protocol interfaces already grafted by the inline

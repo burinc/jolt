@@ -72,9 +72,9 @@
 ;; other order reopens the window.
 (define (jolt-chan-lock! ch)
   (disable-interrupts)
-  (mutex-acquire (async-chan-mu ch)))
+  (jolt-lock! (async-chan-mu ch)))
 (define (jolt-chan-unlock! ch)
-  (mutex-release (async-chan-mu ch))
+  (jolt-unlock! (async-chan-mu ch))
   (enable-interrupts))
 
 (define (jolt-chan-locked-give! ch v)
@@ -188,9 +188,9 @@
 (define jolt-go-chan-fibers (make-weak-eq-hashtable))
 (define jolt-go-chan-fibers-mu (make-mutex))
 (define (jolt-go-chan-fiber-set! ch f)
-  (with-mutex jolt-go-chan-fibers-mu (hashtable-set! jolt-go-chan-fibers ch f)))
+  (jolt-with-mutex jolt-go-chan-fibers-mu (hashtable-set! jolt-go-chan-fibers ch f)))
 (define (jolt-go-chan-fiber ch)
-  (with-mutex jolt-go-chan-fibers-mu (hashtable-ref jolt-go-chan-fibers ch #f)))
+  (jolt-with-mutex jolt-go-chan-fibers-mu (hashtable-ref jolt-go-chan-fibers ch #f)))
 
 ;; (fiber-monitor ch) -> channel. Yields the throwable if the go body died, and
 ;; CLOSES (nil) if it completed normally — which is what makes a throwing body
@@ -227,7 +227,7 @@
     ;; the no-park path does.
     (disable-interrupts)
     (let ((park?
-           (with-mutex (alt-handler-wmu h)
+           (jolt-with-mutex (alt-handler-wmu h)
              (if (vector-ref (alt-handler-mailbox h) 0)
                  #f
                  (begin (jolt-fiber-state-set! f 'parked) #t)))))

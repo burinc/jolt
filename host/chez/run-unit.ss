@@ -60,12 +60,12 @@
   ;; a var-table mutation, so it takes var-table-mu like every other one (rt.ss).
   ;; This harness is single-threaded, but the invariant is easier to keep if it
   ;; has no exceptions.
-  (with-mutex var-table-mu
+  (jolt-with-mutex var-table-mu
     (vector-for-each (lambda (k) (unless (hashtable-ref zj-base k #f) (hashtable-delete! var-table k)))
                      (hashtable-keys var-table)))
   (for-each (lambda (cr) (unless (eq? (var-cell-root (car cr)) (cdr cr))
                            (var-cell-root-set! (car cr) (cdr cr)))) zj-roots)
-  (with-mutex ns-registry-mu (zj-prune! ns-registry zj-ns-base))  ; same rule as var-table (ns.ss)
+  (jolt-with-mutex ns-registry-mu (zj-prune! ns-registry zj-ns-base))  ; same rule as var-table (ns.ss)
   (zj-prune! type-registry zj-type-base)
   ;; roll back the loader dedup — a row's require must reload for the next row,
   ;; since the vars it defined were just pruned from var-table

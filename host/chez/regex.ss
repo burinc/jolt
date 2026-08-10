@@ -70,7 +70,7 @@
   "Return (count . irx) for source, compiling if needed."
   ;; dynamic-wind, not a bare release: a pattern that fails to compile used to
   ;; leave the mutex held, so the next thread to compile ANY regex blocked forever.
-  (mutex-acquire regex-cache-mutex)
+  (jolt-lock! regex-cache-mutex)
   (dynamic-wind
     (lambda () #f)
     (lambda ()
@@ -86,7 +86,7 @@
                                    (cons 0 irx)))))))
               (hashtable-set! regex-cache source entry)
               entry))))
-    (lambda () (mutex-release regex-cache-mutex))))
+    (lambda () (jolt-unlock! regex-cache-mutex))))
 
 (define (jolt-regex source)
   (let ((entry (cached-regex-entry source)))

@@ -17,7 +17,7 @@
 (define fn-form-tbl-mu (make-mutex))
 
 (define (image-register-fn-form! name form ns free-names)
-  (with-mutex fn-form-tbl-mu
+  (jolt-with-mutex fn-form-tbl-mu
     (hashtable-set! fn-form-tbl name (vector form ns free-names)))
   jolt-nil)
 

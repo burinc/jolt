@@ -134,11 +134,11 @@
 (define (jolt-ffi-register-callable! co)
   (sa-lock-object co)
   (let ((addr (sa-foreign-callable-entry-point co)))
-    (with-mutex ffi-tbl-mu (hashtable-set! ffi-callable-table addr co))
+    (jolt-with-mutex ffi-tbl-mu (hashtable-set! ffi-callable-table addr co))
     addr))
 (define (ffi-free-callable addr)
   (let* ((a (jnum->exact addr))
-         (co (with-mutex ffi-tbl-mu
+         (co (jolt-with-mutex ffi-tbl-mu
                ;; take-and-remove as one step, so two frees of the same address
                ;; cannot both unlock the object
                (let ((c (hashtable-ref ffi-callable-table a #f)))
@@ -161,7 +161,7 @@
 ;; keyed by integer addresses, where eq? is correct.)
 (define ffi-export-table (make-hashtable string-hash equal?))  ; name(string) -> addr(integer)
 (define (jolt-ffi-register-export! name addr)
-  (with-mutex ffi-tbl-mu (hashtable-set! ffi-export-table name addr)) addr)
+  (jolt-with-mutex ffi-tbl-mu (hashtable-set! ffi-export-table name addr)) addr)
 ;; lookup for the C stub: name (a Scheme string) -> addr, or 0 if unknown.
 (define (jolt-ffi-lookup-export name)
   (let ((a (hashtable-ref ffi-export-table name #f))) (if a a 0)))

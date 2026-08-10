@@ -30,7 +30,7 @@
 ;; a strong hashtable and every read of it is single-key.
 (define source-registry-mu (make-mutex))
 (define (jolt-register-source! procname ns nm file line)
-  (with-mutex source-registry-mu
+  (jolt-with-mutex source-registry-mu
     (let ((existing (hashtable-ref source-registry procname #f)))
       (cond
         ((not existing) (hashtable-set! source-registry procname (vector ns nm file line)))
@@ -378,7 +378,7 @@
 ;; Register the marker table for one eval'd Scheme text; returns the synthetic
 ;; source name to pass make-source-file-descriptor. Once per top-level form.
 (define (jolt-register-eval-marker-table! scm)
-  (mutex-acquire jolt-eval-source-mutex)
+  (jolt-lock! jolt-eval-source-mutex)
   (let ((name (string-append "jolt-eval-src-"
                              (number->string jolt-eval-source-counter))))
     (set! jolt-eval-source-counter (+ jolt-eval-source-counter 1))
@@ -387,7 +387,7 @@
         (when old (hashtable-delete! jolt-eval-marker-registry old))))
     (hashtable-set! jolt-eval-marker-registry name (jolt-marker-table scm))
     (jolt-eval-queue-push! name)
-    (mutex-release jolt-eval-source-mutex)
+    (jolt-unlock! jolt-eval-source-mutex)
     name))
 ;; Resolve an eval-path frame's (name . offset) to a clj line, or #f when the
 ;; name was evicted / never registered or no marker precedes the offset.

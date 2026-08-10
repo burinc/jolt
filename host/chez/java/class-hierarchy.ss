@@ -48,7 +48,7 @@
   ;; the read-modify-write is ONE step: two threads grafting different supers
   ;; onto the same class would otherwise each union against the value they read
   ;; and the second write would drop the first's.
-  (with-mutex jch-cache-mutex
+  (jolt-with-mutex jch-cache-mutex
     (let ((cur (hashtable-ref jvm-class-parents name '())))
       (hashtable-set! jvm-class-parents name
                       (let add ((ss supers) (acc cur))
@@ -73,7 +73,7 @@
 ;; Replace a class's direct supers outright (defrecord re-declares the row its
 ;; deftype half registered). Same cache invalidation as a register.
 (define (jch-set-supers! name supers)
-  (with-mutex jch-cache-mutex
+  (jolt-with-mutex jch-cache-mutex
     (hashtable-set! jvm-class-parents name supers)
     (jch-invalidate!/locked)
     (set! jch-known-cache #f)
@@ -90,7 +90,7 @@
                       ((member (car pending) seen) (loop (cdr pending) seen))
                       (else (loop (append (jch-direct-supers (car pending)) (cdr pending))
                                   (cons (car pending) seen)))))))
-        (with-mutex jch-cache-mutex
+        (jolt-with-mutex jch-cache-mutex
           (when (fx= epoch jch-epoch) (hashtable-set! jch-closure-cache name result)))
         result)))
 
@@ -124,7 +124,7 @@
                            (acc2 (if (or (string=? simple fqn) (member simple acc1))
                                      acc1 (cons simple acc1))))
                       (build (cdr cs) acc2))))))
-        (with-mutex jch-cache-mutex
+        (jolt-with-mutex jch-cache-mutex
           (when (fx= epoch jch-epoch) (hashtable-set! jch-tags-cache name result)))
         result)))
 
@@ -153,7 +153,7 @@
 (define jch-known-cache #f)
 (define (jch-known-table)
   (or jch-known-cache
-      (with-mutex jch-cache-mutex
+      (jolt-with-mutex jch-cache-mutex
         (or jch-known-cache
             (let ((t (make-hashtable string-hash string=?)))
               (let-values (((keys vals) (hashtable-entries jvm-class-parents)))
@@ -184,7 +184,7 @@
 (define jch-simple->fqn-cache #f)
 (define (jch-simple->fqn-table)
   (or jch-simple->fqn-cache
-      (with-mutex jch-cache-mutex
+      (jolt-with-mutex jch-cache-mutex
         (or jch-simple->fqn-cache
             (let ((t (make-hashtable string-hash string=?)))
               (let-values (((keys vals) (hashtable-entries jvm-class-parents)))
@@ -210,7 +210,7 @@
 (define jch-register-supers!-inner jch-register-supers!)
 (set! jch-register-supers!
   (lambda (name supers)
-    (with-mutex jch-cache-mutex
+    (jolt-with-mutex jch-cache-mutex
       (jch-register-supers!-inner name supers)
       (set! jch-known-cache #f)
       (set! jch-simple->fqn-cache #f))))
@@ -230,7 +230,7 @@
 ;; written at deftype / defprotocol time from whatever thread defines, so the
 ;; write is serialized; the read stays unlocked (strong general table)
 (define (jch-mark-interface! name)
-  (with-mutex jch-cache-mutex (hashtable-set! jch-interface-set name #t)))
+  (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-interface-set name #t)))
 (define (jch-interface? name) (hashtable-ref jch-interface-set name #f))
 (for-each jch-mark-interface!
           '("clojure.lang.Seqable" "clojure.lang.Sequential" "clojure.lang.Sorted"

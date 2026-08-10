@@ -40,7 +40,7 @@
 ;; guards lazy creation of a node's mutex on the multi-threaded path
 (define jolt-lazyseq-lock-init (make-mutex))
 (define (jolt-lazyseq-ensure-lock! x)
-  (with-mutex jolt-lazyseq-lock-init
+  (jolt-with-mutex jolt-lazyseq-lock-init
     (or (jolt-lazyseq-lock x)
         (let ((m (make-mutex))) (jolt-lazyseq-lock-set! x m) m))))
 
@@ -76,7 +76,7 @@
   (cond
     ((not jolt-mt?) (if (jolt-lazyseq-realized? x) (deliver) (run!)))
     (else                                          ; multi-threaded: always lock
-     (with-mutex (jolt-lazyseq-ensure-lock! x)     ; locking on a lazily-made mutex
+     (jolt-with-mutex (jolt-lazyseq-ensure-lock! x)     ; locking on a lazily-made mutex
        (if (jolt-lazyseq-realized? x) (deliver) (run!))))))
 
 ;; Shadow fork-thread so any spawn (future/agent/core.async/process, all loaded
@@ -91,18 +91,18 @@
 (define live-threads (make-eqv-hashtable))
 (define live-threads-mutex (make-mutex))
 (define (live-thread-ids)
-  (with-mutex live-threads-mutex (vector->list (hashtable-keys live-threads))))
+  (jolt-with-mutex live-threads-mutex (vector->list (hashtable-keys live-threads))))
 (define %ls-orig-fork-thread fork-thread)
 (define (fork-thread thunk)
   (jolt-mark-mt!)
   (%ls-orig-fork-thread
    (lambda ()
      (let ((id (get-thread-id)))
-       (with-mutex live-threads-mutex (hashtable-set! live-threads id #t))
+       (jolt-with-mutex live-threads-mutex (hashtable-set! live-threads id #t))
        (dynamic-wind
          (lambda () #f)
          thunk
-         (lambda () (with-mutex live-threads-mutex (hashtable-delete! live-threads id))))))))
+         (lambda () (jolt-with-mutex live-threads-mutex (hashtable-delete! live-threads id))))))))
 
 ;; coll->cells: coerce the body result to the cell representation = a seq | nil.
 (define (jolt-coll->cells c) (jolt-seq c))

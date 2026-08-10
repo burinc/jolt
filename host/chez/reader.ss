@@ -405,8 +405,8 @@
 ;; it sits inside.
 (define rdr-side-mu (make-mutex))
 (define rdr-map-order (make-weak-eq-hashtable))
-(define (rdr-map-order-ref m) (with-mutex rdr-side-mu (hashtable-ref rdr-map-order m #f)))
-(define (rdr-map-order-set! m es) (with-mutex rdr-side-mu (hashtable-set! rdr-map-order m es)))
+(define (rdr-map-order-ref m) (jolt-with-mutex rdr-side-mu (hashtable-ref rdr-map-order m #f)))
+(define (rdr-map-order-set! m es) (jolt-with-mutex rdr-side-mu (hashtable-set! rdr-map-order m es)))
 (define (rdr-make-map es)
   ;; the JVM reader rejects duplicate literal keys before building the map. Guard
   ;; the (cddr kvs) step so an odd-length literal ({:a}) stops here instead of
@@ -556,7 +556,7 @@
 (define (rdr-anon-gensym)
   (jolt-symbol #f (string-append "p__"
                                  (number->string
-                                  (with-mutex rdr-name-counter-mutex
+                                  (jolt-with-mutex rdr-name-counter-mutex
                                     (set! rdr-anon-counter (+ rdr-anon-counter 1))
                                     rdr-anon-counter))
                                  "#")))
@@ -654,9 +654,9 @@
 ;; jolt.time), and the data path applies a ctor form, so a name test would try to
 ;; apply an unbound var at read time.
 (define rdr-ctor-forms (make-weak-eq-hashtable))   ; under rdr-side-mu, see above
-(define (rdr-mark-ctor-form v) (with-mutex rdr-side-mu (hashtable-set! rdr-ctor-forms v #t)) v)
+(define (rdr-mark-ctor-form v) (jolt-with-mutex rdr-side-mu (hashtable-set! rdr-ctor-forms v #t)) v)
 (define (rdr-ctor-call? v)
-  (and (cseq? v) (with-mutex rdr-side-mu (hashtable-ref rdr-ctor-forms v #f)) #t))
+  (and (cseq? v) (jolt-with-mutex rdr-side-mu (hashtable-ref rdr-ctor-forms v #f)) #t))
 
 ;; Is v a tagged-literal pmap (#inst/#uuid/#regex/#bigdec at read time)?
 (define (rdr-tagged-form? v)
@@ -1087,7 +1087,7 @@
 (define (rdr-sq-gensym base)
   (jolt-symbol #f (string-append base "__"
                                  (number->string
-                                  (with-mutex rdr-name-counter-mutex
+                                  (jolt-with-mutex rdr-name-counter-mutex
                                     (set! rdr-sq-gensym-counter (fx+ rdr-sq-gensym-counter 1))
                                     rdr-sq-gensym-counter))
                                  "__auto")))

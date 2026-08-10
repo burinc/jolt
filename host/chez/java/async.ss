@@ -106,7 +106,7 @@
 ;; every other fiber on it (the R3 invariant; the fiber-side registration in
 ;; fibers-async.ss releases before parking).
 (define (alt-claim! h)
-  (with-mutex (alt-handler-fmu h)
+  (jolt-with-mutex (alt-handler-fmu h)
     (and (alt-handler-active? h)
          (begin (alt-handler-active?-set! h #f) #t))))
 
@@ -124,7 +124,7 @@
 ;; because no alts! can run before the boot finishes loading.
 (define jolt-fiber-alt-await-fn #f)
 (define (alt-deliver! h val port)
-  (with-mutex (alt-handler-wmu h)
+  (jolt-with-mutex (alt-handler-wmu h)
     (let ((mb (alt-handler-mailbox h)))
       (vector-set! mb 1 val) (vector-set! mb 2 port) (vector-set! mb 0 #t))
     (let ((w (alt-handler-wake h)))
@@ -281,14 +281,14 @@
     (async-chan-alt-putters-set! ch '())
     (condition-broadcast (async-chan-cv ch)))
   jolt-nil)
-(define (jolt-async-close! ch) (with-mutex (async-chan-mu ch) (ac-close! ch)))
+(define (jolt-async-close! ch) (jolt-with-mutex (async-chan-mu ch) (ac-close! ch)))
 
 ;; >! / >!! — put, blocking. false if closed; nil may not be put. With a
 ;; transducer the value is run through it (one put -> zero or more channel values);
 ;; a `reduced` result closes the channel.
 (define (jolt-async-give ch v)
   (async-check-put! v)
-  (with-mutex (async-chan-mu ch)
+  (jolt-with-mutex (async-chan-mu ch)
     (cond
       ((async-chan-closed? ch) #f)
       ((async-chan-xrf ch)
@@ -348,7 +348,7 @@
 ;; A promise channel PEEKS — its one value stays for every taker.
 ;; When the queue is empty, drains pending alt-putters before parking.
 (define (jolt-async-take ch)
-  (with-mutex (async-chan-mu ch)
+  (jolt-with-mutex (async-chan-mu ch)
     (let loop ()
       (cond ((eq? (async-chan-kind ch) 'promise)
              (cond ((not (ac-qempty? ch)) (ac-peek ch))
@@ -403,7 +403,7 @@
                ac-poll-empty)))
         (else ac-poll-empty)))
 (define (ac-poll! ch)
-  (with-mutex (async-chan-mu ch) (ac-poll!/locked ch)))
+  (jolt-with-mutex (async-chan-mu ch) (ac-poll!/locked ch)))
 
 ;; non-blocking give: 'ok (accepted), 'full (would block), or 'closed.
 ;; ac-try-give!/locked: mutex must already be held.
@@ -442,7 +442,7 @@
           (else 'full)))))))
 (define (ac-try-give! ch v)
   (async-check-put! v)
-  (with-mutex (async-chan-mu ch) (ac-try-give!/locked ch v)))
+  (jolt-with-mutex (async-chan-mu ch) (ac-try-give!/locked ch v)))
 
 ;; offer! / poll! — never block. offer! returns #t/#f(closed) on completion, nil if
 ;; it would block; poll! returns a value, nil (closed+empty), or the ::none sentinel.
@@ -484,7 +484,7 @@
           (else (loop cur (cdr cur))))))
 
 (define (timeout-thread)
-  (mutex-acquire timeout-mu)
+  (jolt-lock! timeout-mu)
   (let loop ()
     (let cleanup ()
       (if (and (pair? timeout-pending) (<= (caar timeout-pending) (now-millis)))
@@ -501,23 +501,23 @@
               (let ((wait-ms (- (caar timeout-pending) (now-millis))))
                 (if (> wait-ms 0)
                     (begin
-                      (mutex-release timeout-mu)
+                      (jolt-unlock! timeout-mu)
                       (sleep (ms->duration wait-ms))
-                      (mutex-acquire timeout-mu)))
+                      (jolt-lock! timeout-mu)))
                 (loop)))))))
 
 ;; (timeout ms) — a channel that closes after ms milliseconds.
 (define (jolt-async-timeout ms)
   (let* ((w (ac-make 0 'unbuffered #f))
          (dl (+ (now-millis) (exact (floor ms)))))
-    (mutex-acquire timeout-mu)
+    (jolt-lock! timeout-mu)
     (let ((head? (timeout-insert! dl w)))
       (when head?
         (condition-signal timeout-cv))
       (unless timeout-running?
         (set! timeout-running? #t)
         (fork-thread timeout-thread))
-      (mutex-release timeout-mu)
+      (jolt-unlock! timeout-mu)
       w)))
 
 ;; (put! ch v [cb [on-caller?]]) — async put, optional completion callback. If the
@@ -667,7 +667,7 @@
                       (for-each
                         (lambda (entry)
                           (let ((ch (car entry)) (is-put (cdr entry)))
-                            (with-mutex (async-chan-mu ch)
+                            (jolt-with-mutex (async-chan-mu ch)
                               (if is-put
                                   (async-chan-alt-putters-set! ch
                                     (remp (lambda (hp) (eq? (car hp) h))
@@ -687,7 +687,7 @@
                             r)
                           ;; thread waiter: condvar
                           (begin
-                            (with-mutex (alt-handler-wmu h)
+                            (jolt-with-mutex (alt-handler-wmu h)
                               (let ((mb (alt-handler-mailbox h)))
                                 (let wait-loop ()
                                   (unless (vector-ref mb 0)
@@ -705,7 +705,7 @@
                           (let* ((ch (pvec-nth-d port 0 jolt-nil))
                                  (v (pvec-nth-d port 1 jolt-nil))
                                  (res
-                                  (with-mutex (async-chan-mu ch)
+                                  (jolt-with-mutex (async-chan-mu ch)
                                     (let ((ready?
                                            (or (async-chan-closed? ch)
                                                (async-chan-xrf ch)
@@ -735,7 +735,7 @@
                           ;; take from bare channel
                           (let* ((ch port)
                                  (res
-                                  (with-mutex (async-chan-mu ch)
+                                  (jolt-with-mutex (async-chan-mu ch)
                                     (let ((ready?
                                            (or (not (ac-qempty? ch))
                                                (async-chan-closed? ch))))

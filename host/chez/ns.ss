@@ -33,12 +33,12 @@
 (define ns-registry-mu (make-mutex))
 (define (intern-ns! name)
   (or (hashtable-ref ns-registry name #f)
-      (with-mutex ns-registry-mu
+      (jolt-with-mutex ns-registry-mu
         (or (hashtable-ref ns-registry name #f)
             (let ((n (make-jns name))) (hashtable-set! ns-registry name n) n)))))
 ;; The lock covers only the snapshot; callers walk the returned vector outside it.
 (define (ns-registry-names)
-  (with-mutex ns-registry-mu (hashtable-keys ns-registry)))
+  (jolt-with-mutex ns-registry-mu (hashtable-keys ns-registry)))
 (intern-ns! "user")
 (intern-ns! "clojure.core")
 
@@ -63,13 +63,13 @@
 (define ns-map-mu (make-mutex))
 (define ns-alias-table (make-hashtable equal-hash equal?))
 (define (chez-register-alias! cns alias target)
-  (with-mutex ns-map-mu (hashtable-set! ns-alias-table (cons cns alias) target)))
+  (jolt-with-mutex ns-map-mu (hashtable-set! ns-alias-table (cons cns alias) target)))
 (define (chez-resolve-alias cns alias)
   (hashtable-ref ns-alias-table (cons cns alias) #f))
 ;; :refer brings an UNQUALIFIED name into cns, resolving to target-ns/name.
 (define ns-refer-table (make-hashtable equal-hash equal?))
 (define (chez-register-refer! cns name target)
-  (with-mutex ns-map-mu (hashtable-set! ns-refer-table (cons cns name) target)))
+  (jolt-with-mutex ns-map-mu (hashtable-set! ns-refer-table (cons cns name) target)))
 ;; refer-all (a bare `use`): cns -> list of fully-referred target ns names. A name
 ;; not found per-name resolves to the first refer-all target that defines it.
 (define ns-refer-all-table (make-hashtable equal-hash equal?))
@@ -77,7 +77,7 @@
   ;; read-modify-write of a list, so it is one step: two threads `use`-ing
   ;; different namespaces into one cns would otherwise each cons onto the value
   ;; they read and the second write would drop the first's target.
-  (with-mutex ns-map-mu
+  (jolt-with-mutex ns-map-mu
     (let ((cur (hashtable-ref ns-refer-all-table cns '())))
       (unless (member target cur)
         (hashtable-set! ns-refer-all-table cns (cons target cur))))))
@@ -88,7 +88,7 @@
 (define ns-refer-all-exclude-table (make-hashtable equal-hash equal?))
 (define (chez-register-refer-all-excludes! cns target names)
   (when (pair? names)
-    (with-mutex ns-map-mu
+    (jolt-with-mutex ns-map-mu
       (let ((h (or (hashtable-ref ns-refer-all-exclude-table (cons cns target) #f)
                    (let ((h (make-hashtable string-hash string=?)))
                      (hashtable-set! ns-refer-all-exclude-table (cons cns target) h)
@@ -255,7 +255,7 @@
         (when (string=? (car k) cns)
           (set! m (jolt-assoc m (jolt-symbol #f (cdr k))
                               (intern-ns! (hashtable-ref ns-alias-table k #f))))))
-      (with-mutex ns-map-mu (hashtable-keys ns-alias-table)))
+      (jolt-with-mutex ns-map-mu (hashtable-keys ns-alias-table)))
     m))
 
 ;; ns-refers: the {sym -> var} referred into `desig` via refer/use, plus the
@@ -280,7 +280,7 @@
            (let* ((target (hashtable-ref ns-refer-table k #f))
                   (c (and target (var-cell-lookup target (cdr k)))))
              (when c (set! m (jolt-assoc m (jolt-symbol #f (cdr k)) c))))))
-       (with-mutex ns-map-mu (hashtable-keys ns-refer-table)))
+       (jolt-with-mutex ns-map-mu (hashtable-keys ns-refer-table)))
      ;; refer-all: merge all public vars from :refer :all namespaces
      (let ((all-refs (hashtable-ref ns-refer-all-table cns #f)))
        (when all-refs
@@ -385,7 +385,7 @@
     (when c (var-cell-defined?-set! c #f)
             (var-cell-root-set! c (make-jolt-var-unbound (var-cell-ns c) (var-cell-name c))))
     ;; tombstone: block resolution of this name in this ns via refers/all
-    (with-mutex ns-map-mu (hashtable-set! ns-refer-table (cons cns nm) 'unmapped)))
+    (jolt-with-mutex ns-map-mu (hashtable-set! ns-refer-table (cons cns nm) 'unmapped)))
   jolt-nil)
 
 ;; --- ns runtime fns ---------------------------------------------------------
@@ -408,11 +408,11 @@
 (define (jolt-remove-ns desig)
   (let* ((nm (ns-desig->name desig))
          (n  (jolt-find-ns desig)))            ; the removed Namespace (JVM returns it), or nil
-    (with-mutex ns-registry-mu (hashtable-delete! ns-registry nm))
+    (jolt-with-mutex ns-registry-mu (hashtable-delete! ns-registry nm))
     ;; the sweep is a var-table mutation, so it runs under rt.ss's var-table-mu
     ;; like every other one — including the hashtable-keys snapshot, which would
     ;; otherwise be taken while another thread interned into the table.
-    (with-mutex var-table-mu
+    (jolt-with-mutex var-table-mu
       (hashtable-delete! ns-has-vars-set nm)  ; keep the O(1) index honest, else a
                                               ; later require of nm would no-op
       (vector-for-each
@@ -456,7 +456,7 @@
     (chez-register-alias! cns alias target)
     jolt-nil))
 (define (jolt-ns-unalias ns-desig alias-sym)
-  (with-mutex ns-map-mu
+  (jolt-with-mutex ns-map-mu
     (hashtable-delete! ns-alias-table (cons (ns-desig->name ns-desig) (symbol-t-name alias-sym))))
   jolt-nil)
 
@@ -491,7 +491,7 @@
 ;; that excludes and defines its own, e.g. core.logic.fd's ==).
 (define ns-core-exclude-table (make-hashtable equal-hash equal?))  ; cns -> (name -> #t)
 (define (chez-register-core-exclude! cns name)
-  (with-mutex ns-map-mu
+  (jolt-with-mutex ns-map-mu
    (let ((h (or (hashtable-ref ns-core-exclude-table cns #f)
                 (let ((h (make-hashtable string-hash string=?)))
                   (hashtable-set! ns-core-exclude-table cns h) h))))

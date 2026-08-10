@@ -188,7 +188,7 @@
 (define jolt-gensym-mutex (make-mutex))
 (define (jolt-gensym . prefix)
   (let ((p (if (null? prefix) "G__" (car prefix)))
-        (n (with-mutex jolt-gensym-mutex
+        (n (jolt-with-mutex jolt-gensym-mutex
              (set! jolt-gensym-counter (+ jolt-gensym-counter 1))
              jolt-gensym-counter)))
     (jolt-symbol #f

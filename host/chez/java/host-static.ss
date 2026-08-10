@@ -213,7 +213,7 @@
 (define mutable-statics-tbl (make-hashtable string-hash string=?))
 (define (mutable-static-cell class member create?)
   (if create?
-      (with-mutex mutable-statics-mu
+      (jolt-with-mutex mutable-statics-mu
         (let ((h (or (hashtable-ref mutable-statics-tbl class #f)
                      (let ((nh (make-hashtable string-hash string=?)))
                        (hashtable-set! mutable-statics-tbl class nh) nh))))

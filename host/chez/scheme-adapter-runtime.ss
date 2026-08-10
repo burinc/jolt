@@ -472,4 +472,8 @@
 (define (sa-current-winders-set! w) (#%$current-winders w))
 
 
+;; locks.ss first: fibers.ss uses the counting lock wrapper, and jolt-with-mutex
+;; is a macro, so it must be defined before this load rather than captured at
+;; run time the way the sa-* seams are.
+(load "host/chez/locks.ss")
 (load "host/chez/fibers.ss")

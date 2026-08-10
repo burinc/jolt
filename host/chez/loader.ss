@@ -331,12 +331,12 @@
   (let* ((libs-cell (var-cell-lookup "clojure.core" "*loaded-libs*"))
          (libs-ref (and libs-cell (var-cell-root libs-cell))))
     (when (and libs-ref (jolt-ref? libs-ref))
-      (with-mutex ldr-libs-mu
+      (jolt-with-mutex ldr-libs-mu
         (jolt-ref-val-set! libs-ref (f (jolt-ref-val libs-ref)))))))
 
 ;; Seed *loaded-libs* ref from the initial loaded-ns set (for tools.namespace
 ;; and core.typed which conj/disj on it).  Must happen after the async deletion.
-(let ((ks (with-mutex ldr-tbl-mu (hashtable-keys loaded-ns))))
+(let ((ks (jolt-with-mutex ldr-tbl-mu (hashtable-keys loaded-ns))))
   (ldr-libs-update!
     (lambda (s)
       (let loop ((i 0) (s s))
@@ -691,7 +691,7 @@
   (or (hashtable-ref aot-own-key-memo name #f)
       (let ((f (aot-cacheable-file name)))
         (and f (let ((k (aot-cache-key (ldr-read-source f))))
-                 (with-mutex ldr-tbl-mu (hashtable-set! aot-own-key-memo name k))
+                 (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-own-key-memo name k))
                  k)))))
 (define (aot-base-for-own name own) (string-append (aot-cache-subdir) "/"
                                                    (aot-cache-sanitize name) "-" own))
@@ -725,11 +725,11 @@
             ;; the cycle still contributes it, so an edit anywhere still moves the key.
             (equal-hash own)
             (begin
-              (with-mutex ldr-tbl-mu (hashtable-set! aot-dep-inflight ik #t))
+              (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-dep-inflight ik #t))
               (let* ((deps (sort string<? (aot-read-dep-list
                                             (aot-dep-sidecar (aot-base-for-own name own)))))
                      (d (fold-left (lambda (h dep) (aot-hash-mix h (aot-ns-digest dep))) 17 deps)))
-                (with-mutex ldr-tbl-mu
+                (jolt-with-mutex ldr-tbl-mu
                   (hashtable-delete! aot-dep-inflight ik)
                   (hashtable-set! aot-dep-digest-memo name d))
                 d))))))
@@ -807,7 +807,7 @@
           (aot-write-dep-list! (aot-dep-sidecar (aot-base-for-own name own)) deps)
           ;; this run already computed a digest for `name` from the OLD sidecar;
           ;; drop it so a later require in the same process sees the new deps.
-          (with-mutex ldr-tbl-mu (hashtable-delete! aot-dep-digest-memo name))
+          (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-dep-digest-memo name))
           (guard (e (else (aot-info (string-append "compile failed for " name))
                           (delete-file tmp-scm #f) (delete-file tmp-so #f) #f))
             (let ((out (open-output-file tmp-scm 'replace)))
@@ -864,12 +864,12 @@
 
 ;; Mark a namespace as loaded in both the host hashtable and the *loaded-libs* ref.
 (define (ldr-mark-loaded! name)
-  (with-mutex ldr-tbl-mu (hashtable-set! loaded-ns name #t))
+  (jolt-with-mutex ldr-tbl-mu (hashtable-set! loaded-ns name #t))
   (ldr-libs-update! (lambda (s) (pset-conj s (jolt-symbol #f name)))))
 
 ;; Undo ldr-mark-loaded! — a failed load rolls its mark back so a retry loads.
 (define (ldr-unmark-loaded! name)
-  (with-mutex ldr-tbl-mu (hashtable-delete! loaded-ns name))
+  (jolt-with-mutex ldr-tbl-mu (hashtable-delete! loaded-ns name))
   (ldr-libs-update! (lambda (s) (pset-disj s (jolt-symbol #f name)))))
 
 ;; Has `name` cleared the loaded-ns / *loaded-libs* dedup? A tools.namespace disj
@@ -1316,7 +1316,7 @@
 ;; -> 'loaded | 'recursive | 'claimed. Steps 1-6.
 (define (ldr-begin-load! name force?)
   (let ((me (ldr-load-ctx)))
-    (with-mutex ldr-load-mu
+    (jolt-with-mutex ldr-load-mu
       (let loop ()
         (let ((owner (hashtable-ref ldr-loading name #f)))
           (cond
@@ -1355,7 +1355,7 @@
 ;; sa-fiber-resume takes only its carrier's run-queue mutex, which is the last lock
 ;; in the order, so calling it from here closes no cycle.
 (define (ldr-end-load! name)
-  (with-mutex ldr-load-mu
+  (jolt-with-mutex ldr-load-mu
     (hashtable-delete! ldr-loading name)
     (let ((fs (hashtable-ref ldr-fiber-waiters name '())))
       (unless (null? fs)
@@ -1378,7 +1378,7 @@
 ;; you hold the claim" true, so it is refused rather than papered over.
 (define (ldr-assert-claim! name)
   (let ((me (ldr-load-ctx)))
-    (with-mutex ldr-load-mu
+    (jolt-with-mutex ldr-load-mu
       (let ((owner (hashtable-ref ldr-loading name #f)))
         (unless (eqv? owner me)
           (throw-jvm (quote IllegalStateException)

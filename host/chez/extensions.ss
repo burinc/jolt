@@ -191,7 +191,7 @@
       ;; point must not each build a providers table, or a provider registered
       ;; through one is invisible through the other. ext-bad! throws from inside
       ;; the mutex, which with-mutex releases on the unwind.
-      (with-mutex ext-mu
+      (jolt-with-mutex ext-mu
         (let ((prior (hashtable-ref extension-points-tbl idn #f)))
           (cond
             ((and prior (ext-same-declaration? prior key-kind root fallback hint fields default)) jolt-nil)
@@ -225,7 +225,7 @@
     ;; and default, merges, and writes both back, so two concurrent refines would
     ;; otherwise drop one of them and leave the point's default no longer total
     ;; over its fields.
-    (with-mutex ext-mu
+    (jolt-with-mutex ext-mu
      (let ((new-fields (ext-parse-fields (ext-kw spec "fields") idn))
           (new-default (ext-kw spec "default")))
       ;; A field already declared may be repeated only at the same type (an
@@ -263,7 +263,7 @@
     ;; the provider write and the epoch bump together: a bump lost to a race is a
     ;; call site that keeps serving the resolution it cached before this provider
     ;; existed, with the stamp already saying current, so it never expires
-    (with-mutex ext-mu
+    (jolt-with-mutex ext-mu
       (hashtable-set! (ext-point-providers p) ks value)
       (bump-extension-epoch!))
     jolt-nil))
