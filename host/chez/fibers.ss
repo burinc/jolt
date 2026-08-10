@@ -422,8 +422,8 @@
 ;; jolt-fiber-enqueue!/locked: mu must already be held. The empty→non-empty
 ;; transition signals the carrier's condition so a parked carrier wakes (the
 ;; wake is exactly the R4 design: check and wait hold the same mutex).
-;; Both run with INTERRUPTS DISABLED, which matters once preemption is on
-;; (jolt-fiber-preempt-ticks below). Two reasons, and the second is the sharper:
+;; Both hold a COUNTED lock, which is what keeps preemption out of them. Two
+;; reasons it must, and the second is the sharper:
 ;;
 ;;   - the empty->non-empty enqueue writes head and then tail, and the dequeue
 ;;     reads both. A timer firing between the two writes leaves head set with
@@ -434,11 +434,10 @@
 ;;     that must dequeue it is the one now blocked on that mutex. That is a
 ;;     deadlock, not a lost update.
 ;;
-;; Chez defers a timer interrupt while interrupts are disabled rather than
-;; dropping it, so nothing is lost: the preemption lands at the enable.
+;; The scheduler refuses to preempt while the count is non-zero and retries
+;; shortly after, so nothing is lost: the preemption lands just past the region.
 (define (jolt-fiber-enqueue! c f)
   (begin
-    (disable-interrupts)
     (jolt-lock! (jolt-carrier-mu c))
     (if (jolt-carrier-tail c)
         (begin (jolt-fiber-next-set! (jolt-carrier-tail c) f)
@@ -446,12 +445,10 @@
         (begin (condition-signal (jolt-carrier-cv c))
                (jolt-carrier-head-set! c f)
                (jolt-carrier-tail-set! c f)))
-    (jolt-unlock! (jolt-carrier-mu c))
-    (enable-interrupts)))
+    (jolt-unlock! (jolt-carrier-mu c))))
 
 (define (jolt-fiber-dequeue! c)
   (begin
-    (disable-interrupts)
     (jolt-lock! (jolt-carrier-mu c))
     (let ((f (jolt-carrier-head c)))
       (when f
@@ -460,7 +457,6 @@
         ;; clear the link so a completed fiber does not retain the queue
         (jolt-fiber-next-set! f #f))
       (jolt-unlock! (jolt-carrier-mu c))
-      (enable-interrupts)
       f)))
 
 ;; The three thread parameters that make up a fiber's dynamic slice live in

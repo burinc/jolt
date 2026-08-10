@@ -70,12 +70,12 @@
 ;; Chez defers a timer raised in here and delivers it at the enable, so the
 ;; preemption is postponed rather than lost. Release BEFORE re-enabling: the
 ;; other order reopens the window.
-(define (jolt-chan-lock! ch)
-  (disable-interrupts)
-  (jolt-lock! (async-chan-mu ch)))
-(define (jolt-chan-unlock! ch)
-  (jolt-unlock! (async-chan-mu ch))
-  (enable-interrupts))
+;; No interrupt manipulation here any more. jolt-lock! counts the lock, and the
+;; scheduler refuses to preempt a fiber while the count is non-zero, so the
+;; region is protected by the same mechanism as every other lock in the runtime
+;; rather than by a second one bolted onto this path.
+(define (jolt-chan-lock! ch) (jolt-lock! (async-chan-mu ch)))
+(define (jolt-chan-unlock! ch) (jolt-unlock! (async-chan-mu ch)))
 
 (define (jolt-chan-locked-give! ch v)
   (if (async-chan-xrf ch)
