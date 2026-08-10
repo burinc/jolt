@@ -662,6 +662,73 @@
          (not (jolt-fiber-slice cp-d))
          (jolt-fiber-error cp-d)))
 
+;; --- 14. the borrowed timer still preempts (jolt-449m) ------------------------
+;; jolt-run-interruptible BORROWS the timer: it installs its own handler and arms
+;; its own tick. jolt-ly62 made the borrow give both halves back on every way out,
+;; the park included, so it can no longer outlive itself. What was still open is
+;; the window DURING the borrow: the borrowed handler answered a quantum by
+;; re-arming its own tick and RETURNING, so nothing on the carrier was preempted
+;; for as long as the body ran — and the body is arbitrary user code reached
+;; through the public jolt.host/run-interruptible seam (a whole eval, in the
+;; interrupt use it exists for). Measured unfixed, one carrier, 20,000 ticks: a
+;; spinning fiber inside a borrow ran 36,983,637 iterations with 0 preemptions
+;; and a sibling queued behind it never ran; the same spin outside a borrow was
+;; preempted 46 times.
+;;
+;; Asserted on the preempt COUNT and not on a starving sibling, because the count
+;; is the mechanism and a sibling is a race. The control beside it is what makes
+;; the count mean something: the same spin, same length, no borrow.
+(jolt-fiber-pool-reset!)
+(jolt-fiber-carrier-count-set! 1)
+(jolt-fiber-preempt-ticks-set! jolt-fiber-preempt-ticks-min)
+(define (rb-spin n) (let loop ((i 0)) (if (fx<? i n) (loop (fx+ i 1)) i)))
+(define RB-N 2000000)
+
+;; control: a plain spin of this length is preempted, so the length is enough.
+(define rb-c0 (jolt-fiber-preempts))
+(define rb-plain (sa-fiber-spawn (lambda () (rb-spin RB-N))))
+(sa-fiber-run-all)
+(ok "14. control: a plain spin of this length is preempted"
+    (> (jolt-fiber-preempts) rb-c0))
+(ok "14. control: and it finished" (eq? 'done (jolt-fiber-state rb-plain)))
+
+;; the same spin inside a borrow
+(define rb-c1 (jolt-fiber-preempts))
+(define rb-borrowed
+  (sa-fiber-spawn
+   (lambda ()
+     (jolt-run-interruptible (jolt-make-interrupt) (lambda () (rb-spin RB-N))))))
+(sa-fiber-run-all)
+(ok "14. a fiber inside run-interruptible is preempted too"
+    (> (jolt-fiber-preempts) rb-c1))
+(ok "14. and the body still ran to completion"
+    (and (eq? 'done (jolt-fiber-state rb-borrowed))
+         (eqv? RB-N (jolt-fiber-result rb-borrowed))))
+
+;; the borrow's own job is unchanged: a token set mid-body still aborts, and the
+;; abort is an EXIT, so it must not be confused with the preemption escape.
+(define rb-tok (jolt-make-interrupt))
+(define rb-aborted (box #f))
+(define rb-int
+  (sa-fiber-spawn
+   (lambda ()
+     (guard (e (#t (set-box! rb-aborted (jolt-interrupted? rb-tok))))
+       (jolt-run-interruptible rb-tok
+         (lambda () (jolt-interrupt! rb-tok) (rb-spin RB-N) 'not-interrupted))))))
+(sa-fiber-run-all)
+(ok "14. an interrupt inside a fiber still aborts the body" (unbox rb-aborted))
+(ok "14. and the fiber survives it" (eq? 'done (jolt-fiber-state rb-int)))
+
+;; The handler is the scheduler's again once the borrow is over — the borrow must
+;; hand it back on the REAL exit as well as on a park.
+(ok "14. the borrow returns the scheduler's handler on the real exit"
+    (eq? (timer-interrupt-handler) jolt-fiber-preempt-handler))
+
+;; Off a fiber nothing changes: there is no quantum to hand back, and the borrow
+;; leaves the timer disarmed.
+(define rb-off (jolt-run-interruptible (jolt-make-interrupt) (lambda () (rb-spin 1000) 'off)))
+(ok "14. off a fiber the borrow is unchanged" (eq? 'off rb-off))
+
 (jolt-fiber-preempt-ticks-set! #f)
 (jolt-fiber-pool-reset!)
 

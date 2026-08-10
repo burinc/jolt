@@ -1033,16 +1033,69 @@
   ;; real exit — the borrow would hand the carrier its own handler a second time
   ;; and lose whatever an enclosing borrow had installed.
   (let* ((prev-handler (timer-interrupt-handler))
+         ;; --- handing the quantum back DURING the borrow (jolt-449m) -----------
+         ;; jolt-ly62 stopped the borrow outliving itself. What was still open is
+         ;; the extent of the borrow: the handler below answered a quantum by
+         ;; re-arming its own tick and RETURNING, so nothing on the carrier was
+         ;; preempted for as long as the body ran. Measured, one carrier and a
+         ;; 20,000 tick quantum: a spinning fiber inside a borrow managed
+         ;; 36,983,637 iterations and 0 preemptions while a sibling queued behind
+         ;; it never ran; the same spin outside a borrow was preempted 46 times.
+         ;; That is the unbounded starvation window the head of fibers.ss says no
+         ;; setting can open, and the body reached through jolt.host/run-interruptible
+         ;; is arbitrary user code — a whole eval, in the interrupt use it exists for.
+         ;;
+         ;; The borrow polls far more often than the quantum, so the fix is to
+         ;; COUNT what it consumes and let the scheduler decide once it adds up.
+         ;; `borrowed` is ticks since the fiber last had the CPU handed to it; the
+         ;; before-thunk zeroes it, because a rewind means the fiber has just been
+         ;; dispatched and its quantum restarts.
+         (borrowed 0)
+         ;; What the borrow last armed, so the accounting adds real ticks. It arms
+         ;; the TIGHTER of the two demands, so a quantum shorter than the poll
+         ;; interval is still honoured instead of being rounded up to it.
+         (armed interrupt-check-ticks)
+         (arm!
+          (lambda ()
+            (let ((n (if (jolt-current-fiber)
+                         (fxmin interrupt-check-ticks (jolt-fiber-preempt-ticks))
+                         interrupt-check-ticks)))
+              (set! armed n)
+              (set-timer n))))
          (r (call/cc
               (lambda (k)
                 (dynamic-wind
                   (lambda ()
+                    (set! borrowed 0)
                     (timer-interrupt-handler
                       (lambda ()
-                        (if (and (box? token) (unbox token))
-                            (k interrupt-sentinel)
-                            (begin (set-timer interrupt-check-ticks) (void)))))
-                    (set-timer interrupt-check-ticks))
+                        (cond
+                          ((and (box? token) (unbox token)) (k interrupt-sentinel))
+                          (else
+                           (set! borrowed (fx+ borrowed armed))
+                           (cond
+                             ;; The quantum has fallen due. Hand it to the
+                             ;; scheduler's handler, which either escapes through
+                             ;; sched-k — and the after-thunk below gives the timer
+                             ;; back, the before-thunk re-takes it on resume — or
+                             ;; refuses (a lock held, a transition committed) and
+                             ;; re-arms short to retry. When it refuses, `armed`
+                             ;; still names the old tick, so the next count is high
+                             ;; and the retry lands early. That is the only safe
+                             ;; direction: the guarantee is an upper bound on the
+                             ;; window, and early only tightens it.
+                             ;;
+                             ;; The jolt-current-fiber test is load-bearing, not a
+                             ;; nicety: off a fiber the scheduler's handler does
+                             ;; nothing AND does not re-arm, so calling it there
+                             ;; would leave the borrow with no timer and stop the
+                             ;; interrupt from ever being noticed.
+                             ((and (jolt-current-fiber)
+                                   (fx>=? borrowed (jolt-fiber-preempt-ticks)))
+                              (set! borrowed 0)
+                              (jolt-fiber-preempt-handler))
+                             (else (arm!) (void)))))))
+                    (arm!))
                   (lambda () (thunk))
                   ;; Runs on every way out of the body, the park included. Disarm
                   ;; BEFORE restoring the handler: the other order leaves a window
