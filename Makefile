@@ -229,6 +229,10 @@ values:
 # *go-backend* opt-in (sections 1-3 through the compiler), and alts! as a wait
 # set (sections 4-7 through the host seam; the :default check loads the
 # overlay).
+# fibers-lock-test.ss is the object-monitor gate (jolt-3a87): `locking` and the
+# bare monitor-enter/monitor-exit halves across a fiber switch. A monitor is the
+# one lock in the runtime that wraps user code, so neither half of locks.ss's
+# premise — short regions, never spanning a park — holds for it.
 fibers:
 	@$(CHEZ) --script test/chez/fibers-test.ss
 	@$(CHEZ) --script test/chez/fibers-state-test.ss
@@ -238,6 +242,7 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-io-test.ss
 	@$(CHEZ) --script test/chez/fibers-sm-test.ss
 	@$(CHEZ) --script test/chez/fibers-preempt-test.ss
+	@$(CHEZ) --script test/chez/fibers-lock-test.ss
 	@$(CHEZ) --script test/chez/fibers-monitor-test.ss
 
 # The dynamic-var binding stack (jolt-3bo): lookup cost against binding DEPTH and

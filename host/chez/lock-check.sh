@@ -18,11 +18,13 @@
 # scan monitor-enter!/monitor-exit! by name, because jolt-with-monitor is the
 # user-facing `locking` and therefore jolt's analogue of the `synchronized` case
 # that pinned Loom's virtual threads until JEP 491. Those two now take their
-# mutex through jolt-lock!, so scanning them was scanning a wrapper rather than a
-# primitive, and it left two entries on the allowlist that could never go to
-# zero. They are covered transitively and strictly: rewriting either of them to
-# grab the mutex directly shows up here as a new bare mutex-acquire in
-# concurrency.ss. Mutation-verified in that direction, not assumed.
+# mutex through the wrapper (jolt-with-mutex, over the monitor's bookkeeping lock
+# — ownership itself is a field, see concurrency.ss), so scanning them was
+# scanning a wrapper rather than a primitive, and it left two entries on the
+# allowlist that could never go to zero. They are covered transitively and
+# strictly: rewriting either of them to grab the mutex directly shows up here as
+# a new bare mutex-acquire in concurrency.ss. Mutation-verified in that
+# direction, not assumed.
 #
 #   sh host/chez/lock-check.sh          check against the allowlist
 #   sh host/chez/lock-check.sh --regen  regenerate it (review the diff!)

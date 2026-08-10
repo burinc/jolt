@@ -698,52 +698,179 @@
 
 ;; --- object monitors (locking) ----------------------------------------------
 ;; (locking obj body…) takes obj's monitor for the body — a real per-object lock
-;; now that futures/agents/threads share one heap. Each object gets a recursive
-;; Chez mutex (a thread may re-enter a monitor it already holds, like the JVM),
-;; held in an identity-keyed weak table so monitors are reclaimed with their
-;; objects. dynamic-wind releases on normal, exceptional, and continuation exit.
+;; now that futures/agents/threads share one heap. Monitors live in an
+;; identity-keyed weak table so they are reclaimed with their objects, and a
+;; monitor is REENTRANT for its holder, like a JVM intrinsic lock: a nested
+;; (locking x …) on the same object re-enters instead of deadlocking.
+;;
+;; OWNERSHIP IS A FIELD, NOT THE OS MUTEX, AND THAT IS THE WHOLE DESIGN (jolt-3a87).
+;;
+;; This used to be the obvious thing: one Chez mutex per object, acquired through
+;; jolt-lock! for the length of the body, with the owner recorded as the thread's
+;; interrupt box. Every lock in the runtime is held that way, and locks.ss explains
+;; why it is sound — the scheduler refuses to preempt a fiber that holds a counted
+;; lock, and such regions are SHORT (~55ns mean) and never span a park.
+;;
+;; A monitor is the one lock in the runtime that wraps code it did not write, so
+;; neither half of that premise holds, and it failed three ways at once:
+;;
+;;   1. `locking` was a dynamic-wind, so a park UNWOUND it: the monitor was released
+;;      mid-body and re-taken on resume, and two fibers on one carrier were inside
+;;      one body at the same time. Worse, the second one's re-entry found the owner
+;;      equal to its own identity, because the owner was the CARRIER THREAD and
+;;      same-carrier fibers share it — so it took the reentrant arm silently.
+;;   2. the bare (monitor-enter x) / (monitor-exit x) halves have no wind at all, so
+;;      a park in between kept the OS mutex across the switch. jolt-locks-held then
+;;      stayed up on the carrier for as long as the fiber was parked, which makes
+;;      every LATER fiber on that carrier unpreemptible, and a sibling's acquire
+;;      succeeded anyway because Chez mutexes are recursive per thread.
+;;   3. holding the mutex for the body meant jolt-locks-held was up for the body, so
+;;      a long (locking o …) could not be preempted at all and starved everything
+;;      queued behind it — the unbounded starvation window fibers.ss says no setting
+;;      can open.
+;;
+;; All three come through the same trapdoor: an OS mutex has THREAD granularity and a
+;; fiber is not a thread. So the mutex below is no longer the monitor. It is a
+;; BOOKKEEPING lock, held only across the enter/exit decision — which really is one
+;; of the short regions locks.ss is about — and mutual exclusion is carried by the
+;; owner field, which a context switch cannot disturb because it is not a wind.
+;;
+;; What that buys, in the order the symptoms above appear: ownership survives a park
+;; and a preemption, so nothing else can be inside the body; the bare halves become
+;; correct rather than merely diagnosable; and the body is preemptible again, because
+;; no counted lock is held while it runs.
+;;
+;; A contender WAITS, and how it waits depends on what it is. A fiber parks on the
+;; monitor's own waiter list and the release resumes it — never a condition-wait,
+;; which would block the carrier that may be the very thing the holder needs in order
+;; to reach its release. A thread waits on the condition variable. This is the shape
+;; loader.ss already uses for its load claims (ldr-load-mu / ldr-load-cv /
+;; ldr-fiber-waiters) and it rests on the same two facts: the registration and the
+;; commit-to-park both happen under the bookkeeping lock that the release also takes,
+;; so no wakeup can be lost, and the only park inside that lock is this wait, which
+;; gives the lock up on the way out — so no fiber is ever parked HOLDING it, which is
+;; the precondition locks.ss puts on parking inside jolt-with-mutex at all.
+;;
+;; NOT the JEP 491 reimplementation locks.ss rules out. That paragraph is about the
+;; runtime's own locks, of which there are many and all short. There is one object
+;; monitor primitive, and making one lock fiber-aware is not making all of them so.
 (define monitor-table (make-weak-eq-hashtable))
 (define monitor-table-lock (make-mutex))
-;; A monitor is REENTRANT per thread, like a JVM intrinsic lock: a nested
-;; (locking x ...) on the same object from the same thread re-enters instead
-;; of deadlocking on the non-recursive Chez mutex. State: #(mutex owner count),
-;; owner being the thread's interrupt box (current-interrupt-box) — the same
-;; identity the ReentrantLock uses, so it is safe under fork-inheritance.
+;; #(bk owner count cv fibers)
+;;   bk     the bookkeeping mutex — held across a decision, never across a body
+;;   owner  the FIBER when a fiber holds it, else the thread's interrupt box
+;;          (current-interrupt-box, the identity the ReentrantLock uses, which is
+;;          safe under fork-inheritance), or #f when free
+;;   count  reentrancy depth for the owner
+;;   cv     thread waiters; condition-wait releases bk atomically with blocking
+;;   fibers parked fiber waiters, resumed by the release
+(define monitor-i-bk 0)
+(define monitor-i-owner 1)
+(define monitor-i-count 2)
+(define monitor-i-cv 3)
+(define monitor-i-fibers 4)
 (define (object-monitor obj)
   (jolt-with-mutex monitor-table-lock
     (or (hashtable-ref monitor-table obj #f)
-        (let ((m (vector (make-mutex) #f 0)))
+        (let ((m (vector (make-mutex) #f 0 (make-condition) '())))
           (hashtable-set! monitor-table obj m) m))))
+
+;; Who is asking. The FIBER when there is one, and this is the field that decides
+;; reentrancy, so it is also what stopped a sibling fiber walking into a held
+;; section: two fibers on one carrier share a thread and therefore shared the old
+;; answer. A fiber is only ever compared and used as a list element here, so nothing
+;; depends on the record's shape.
+(define (monitor-self) (or (jolt-current-fiber) (current-interrupt-box)))
+
+;; Call with bk HELD; returns with it held again, and the caller RE-CHECKS — a wakeup
+;; means "something changed", never "the monitor is yours".
+;;
+;; A fiber must not use the condition variable. condition-wait blocks the carrier
+;; thread, and the holder may be a fiber on that same carrier, so blocking there is a
+;; deadlock; even when the holder is elsewhere it stalls every unrelated fiber the
+;; carrier is running. It parks, and monitor-exit! resumes it. The park is committed
+;; while bk is still held — jolt-fiber-park! sets 'parked and captures the
+;; continuation, and only the escape past jolt-with-mutex's dynamic-wind releases bk
+;; — so no release can fit between the registration and the park, and the resume
+;; re-acquires bk through the same wind's before thunk.
+(define (monitor-wait! m)
+  (let ((f (jolt-current-fiber)))
+    (if f
+        (begin
+          (vector-set! m monitor-i-fibers (cons f (vector-ref m monitor-i-fibers)))
+          (jolt-fiber-park!))
+        (condition-wait (vector-ref m monitor-i-cv) (vector-ref m monitor-i-bk)))))
+
 (define (monitor-enter! m)
-  (let ((me (current-interrupt-box)))
-    (if (eq? (vector-ref m 1) me)
-        (vector-set! m 2 (fx+ (vector-ref m 2) 1))
-        (begin (jolt-lock! (vector-ref m 0))
-               (vector-set! m 1 me)
-               (vector-set! m 2 1)))))
+  (let ((me (monitor-self)))
+    (jolt-with-mutex (vector-ref m monitor-i-bk)
+      (let loop ()
+        (let ((owner (vector-ref m monitor-i-owner)))
+          (cond
+            ((eq? owner me)
+             (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count))))
+            ((not owner)
+             (vector-set! m monitor-i-owner me)
+             (vector-set! m monitor-i-count 1))
+            (else (monitor-wait! m) (loop))))))))
+
+;; The waiters are taken and cleared under bk so no resume is delivered twice, and
+;; they are woken OUTSIDE it: sa-fiber-resume takes the carrier's run-queue mutex,
+;; and keeping the two apart means this path closes no cycle at all rather than
+;; relying on that mutex being last in the order. Broadcast and not signal, for
+;; loader.ss's reason: the waiters re-check a condition that will be true for exactly
+;; one of them.
 (define (monitor-exit! m)
-  (let ((me (current-interrupt-box)))
-    (unless (eq? (vector-ref m 1) me)
-      (jolt-throw (jolt-host-throwable "java.lang.IllegalMonitorStateException"
-                                       "not lock owner")))
-    (vector-set! m 2 (fx- (vector-ref m 2) 1))
-    (when (fx=? 0 (vector-ref m 2))
-      (vector-set! m 1 #f)
-      (jolt-unlock! (vector-ref m 0)))))
+  (let ((me (monitor-self)))
+    (let ((wake
+           (jolt-with-mutex (vector-ref m monitor-i-bk)
+             (unless (eq? (vector-ref m monitor-i-owner) me)
+               (jolt-throw (jolt-host-throwable "java.lang.IllegalMonitorStateException"
+                                                "not lock owner")))
+             (vector-set! m monitor-i-count (fx- (vector-ref m monitor-i-count) 1))
+             (if (fx=? 0 (vector-ref m monitor-i-count))
+                 (let ((fs (vector-ref m monitor-i-fibers)))
+                   (vector-set! m monitor-i-owner #f)
+                   (vector-set! m monitor-i-fibers '())
+                   (condition-broadcast (vector-ref m monitor-i-cv))
+                   fs)
+                 '()))))
+      (for-each sa-fiber-resume wake))))
+
+;; The enter happens OUTSIDE the dynamic-wind, and the exit asks whether this is a
+;; real exit. Both halves matter and neither is the obvious spelling.
+;;
+;; A before-thunk that entered would re-enter on every resume, because a park escapes
+;; through this wind and the rewind re-runs it — the same trap dyn-with-frame
+;; describes for a binding frame, and the same answer: do it once, outside.
+;;
+;; A park is not an exit, so the after-thunk must not release: the monitor is meant to
+;; still be held when the fiber comes back, which is the entire point of the field
+;; above. jolt-park-unwinding? is the seam that tells the two apart, and it is the
+;; same one load-namespace* uses to keep its claim across a park. A raise and
+;; run-interruptible's escape are REAL exits and answer #f, so those still release.
+;;
+;; This leans on `locking` being opaque to the CPS pass in clojure.core.async, which
+;; it is because it takes a thunk: a CHEAP park never rewinds, so it would skip this
+;; after-thunk and never come back to it, and the monitor would leak. That is the same
+;; thing parameterize and binding rely on, and sm.ss's invariant names all three.
 (define (jolt-with-monitor obj thunk)
   (let ((m (object-monitor obj)))
+    (monitor-enter! m)
     (dynamic-wind
-      (lambda () (monitor-enter! m))
+      (lambda () #f)
       thunk
-      (lambda () (monitor-exit! m)))))
+      (lambda () (unless (jolt-park-unwinding?) (monitor-exit! m))))))
 (def-var! "jolt.host" "with-monitor" jolt-with-monitor)
 
 ;; The bare halves of the same monitor, for the (monitor-enter x) /
 ;; (monitor-exit x) special forms. Code that expands its own locking macro
 ;; instead of calling clojure.core/locking emits these directly — dynaload does,
 ;; and it sits under malli — so they take and release the very same per-object
-;; mutex `locking` uses, and the two compose. Both yield nil: the JVM emits a
-;; NIL after the monitor op rather than the object.
+;; monitor `locking` uses, and the two compose. Holding one across a park is now
+;; simply correct: there is no wind to unwind and ownership is a field, so the
+;; monitor is still held when the fiber comes back and a sibling waits for it.
+;; Both yield nil: the JVM emits a NIL after the monitor op rather than the object.
 (define (jolt-monitor-enter obj)
   (monitor-enter! (object-monitor obj))
   jolt-nil)
