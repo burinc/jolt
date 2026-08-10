@@ -14,10 +14,15 @@
 # one tightened quantum at a time. So the obligation is checked here rather than
 # documented and hoped for.
 #
-# Three primitive classes are covered, and the third is the one a with-mutex
-# shadow alone would miss: jolt-with-monitor is the user-facing `locking`, which
-# is jolt's analogue of the `synchronized` case that pinned Loom's virtual
-# threads until JEP 491.
+# The scan covers the three mutex PRIMITIVES and nothing else. It used to also
+# scan monitor-enter!/monitor-exit! by name, because jolt-with-monitor is the
+# user-facing `locking` and therefore jolt's analogue of the `synchronized` case
+# that pinned Loom's virtual threads until JEP 491. Those two now take their
+# mutex through jolt-lock!, so scanning them was scanning a wrapper rather than a
+# primitive, and it left two entries on the allowlist that could never go to
+# zero. They are covered transitively and strictly: rewriting either of them to
+# grab the mutex directly shows up here as a new bare mutex-acquire in
+# concurrency.ss. Mutation-verified in that direction, not assumed.
 #
 #   sh host/chez/lock-check.sh          check against the allowlist
 #   sh host/chez/lock-check.sh --regen  regenerate it (review the diff!)
@@ -32,9 +37,9 @@ SANCTIONED='host/chez/locks.ss'
 scan() {
   for f in host/chez/*.ss host/chez/java/*.ss; do
     case " $SANCTIONED " in *" $f "*) continue ;; esac
-    grep -nE '\((mutex-acquire|mutex-release|with-mutex|monitor-enter!|monitor-exit!)[ )]' "$f" 2>/dev/null \
+    grep -nE '\((mutex-acquire|mutex-release|with-mutex)[ )]' "$f" 2>/dev/null \
       | while IFS=: read -r ln _; do
-          op=$(sed -n "${ln}p" "$f" | grep -oE '\((mutex-acquire|mutex-release|with-mutex|monitor-enter!|monitor-exit!)[ )]' | head -1 | tr -d '() ')
+          op=$(sed -n "${ln}p" "$f" | grep -oE '\((mutex-acquire|mutex-release|with-mutex)[ )]' | head -1 | tr -d '() ')
           [ -n "$op" ] && echo "$f $op"
         done
   done | sort | uniq -c | awk '{print $2" "$3" "$1}' | sort
@@ -46,7 +51,9 @@ if [ "${1:-}" = "--regen" ]; then
     echo "#   sh host/chez/lock-check.sh --regen"
     echo "# Lines: <file> <primitive> <count>. A line whose count DROPS is stale"
     echo "# and fails the gate, so migrating a site to the wrapper must update this."
-    echo "# The goal is for this file to shrink to nothing but the wrapper itself."
+    echo "# Empty is the goal and the current state: every acquisition in the runtime
+# routes through host/chez/locks.ss. A monitor counts transitively, through
+# jolt-lock!, so it needs no entry here."
     scan
   } > "$ALLOW"
   echo "lock check: regenerated $(grep -cv '^#' "$ALLOW") entries"

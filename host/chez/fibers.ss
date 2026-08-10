@@ -218,15 +218,11 @@
           ((fx<? n to) (disable-interrupts) (loop (fx+ n 1)))
           (else (void)))))
 
-;; The chain with the finally winders removed. Returns the ARGUMENT ITSELF when
-;; nothing is dropped — the overwhelmingly common case — so a park with no
-;; finally in scope allocates nothing and the tail is shared when the dropped
-;; winders are outermost. Walks the WHOLE chain; the park path uses
-;; jolt-park-winders* with a base instead.
-(define (jolt-park-winders w)
-  (jolt-park-winders* w 0 jolt-winder-rtd jolt-winder-in-ref jolt-finally-marker))
-
-;; The walk, with the loop-invariant globals passed in, stopping at BASE.
+;; The chain with the finally winders removed, stopping at BASE. Returns the
+;; ARGUMENT ITSELF when nothing is dropped — the overwhelmingly common case — so
+;; a park with no finally in scope allocates nothing, and the tail is shared when
+;; the dropped winders are outermost. The loop-invariant globals are passed in
+;; rather than read per element; see the note on jolt-winder-rtd.
 ;;
 ;; Stopping there is not just an optimisation, it is the exact boundary: a park
 ;; escapes to the carrier's sched-k, whose own chain IS base, so Chez unwinds

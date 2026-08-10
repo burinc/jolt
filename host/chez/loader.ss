@@ -1422,9 +1422,17 @@
       ;; resume die in ldr-assert-claim! with the mark still standing and the
       ;; rollback stranded in the abandoned guard — so the namespace was wedged
       ;; loaded-but-empty for the life of the process and every later require of it
-      ;; no-op'd. jolt-park-unwinding? is the flag jolt's own try/finally consults
-      ;; for exactly this question, and the answer here is the same: cleanup that
-      ;; belongs to the real exit does not run on a park.
+      ;; no-op'd. jolt-park-unwinding? answers that question: cleanup belonging to
+      ;; the real exit does not run on a park.
+      ;;
+      ;; jolt's own try/finally used to consult the same flag and no longer does.
+      ;; The back end now emits a shared marker (values.ss jolt-finally-in) as
+      ;; every finally's before-thunk and the scheduler drops those winders off
+      ;; the chain before it escapes, so a finally never runs on a park in the
+      ;; first place. That trick is not available here, because THIS wind needs a
+      ;; before-thunk of its own: ldr-assert-claim! has to re-run when the fiber
+      ;; resumes. A winder that must rewind cannot be dropped, so it stays on the
+      ;; chain and asks instead. It is the only such site left.
       ;;
       ;; And when it IS the real exit, a body that neither finished nor raised
       ;; (a continuation escaping the load for good) never reached ldr-load-body's
