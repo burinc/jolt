@@ -383,6 +383,12 @@
 ;; (jolt-fiber-carrier-count-set! n | #f) — set the pool size for the NEXT
 ;; pool start; #f restores the machine default. Writes both the host global
 ;; and the var's root cell, so the two knobs never disagree.
+;;
+;; #f writes jolt-nil, not #f: the var is SEEDED with jolt-nil for "unset"
+;; (async.ss), and a reset through here has to leave it reading the way it read
+;; before anyone set it. Writing Scheme #f would work for every reader in the
+;; runtime — they all test (fixnum? v) — but it makes (nil? *fiber-carrier-count*)
+;; answer false for a knob nobody set, so a program cannot ask whether it is set.
 (define (jolt-fiber-carrier-count-set! n)
   (when (and n (not (and (fixnum? n) (fx>? n 0))))
     (error 'jolt-fiber-carrier-count-set!
@@ -391,7 +397,7 @@
   (guard (e (#t #f))
     (let ((cell (var-cell-lookup "clojure.core.async" "*fiber-carrier-count*")))
       (when (and cell (var-cell-defined? cell))
-        (var-cell-root-set! cell n)))))
+        (var-cell-root-set! cell (or n jolt-nil))))))
 
 ;; Build the carrier vector at the current count, exactly once. Double-build
 ;; is guarded under rr-mu (double-checked): two threads spawning for the first
@@ -759,10 +765,13 @@
            "preempt ticks must be #f or a fixnum >= jolt-fiber-preempt-ticks-min"
            n jolt-fiber-preempt-ticks-min))
   (set! jolt-fiber-preempt-ticks-global (or n jolt-fiber-preempt-ticks-default))
+  ;; #f writes jolt-nil for the same reason the carrier-count setter does: the
+  ;; var is seeded with jolt-nil and an unset knob has to read as nil however it
+  ;; came to be unset, not as false.
   (guard (e (#t #f))
     (let ((cell (var-cell-lookup "clojure.core.async" "*fiber-preempt-ticks*")))
       (when (and cell (var-cell-defined? cell))
-        (var-cell-root-set! cell n)))))
+        (var-cell-root-set! cell (or n jolt-nil))))))
 
 ;; How many times the pool has preempted a fiber. Like the park counters this
 ;; is per carrier so no two threads touch one field; summed by

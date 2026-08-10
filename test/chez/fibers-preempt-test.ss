@@ -59,6 +59,27 @@
     (guard (e (#t #f))
       (jolt-fiber-preempt-ticks-set! jolt-fiber-preempt-ticks-min) #t))
 
+;; --- 1b. an unset knob reads NIL, not false (jolt-dpye) ----------------------
+;; Both vars are seeded with jolt-nil for "unset", and both host setters take #f
+;; to mean "unset it again". #f used to go straight into the root, which every
+;; reader in the runtime survives — they all test (fixnum? v) — but which makes
+;; (nil? *fiber-preempt-ticks*) answer false for a knob nobody set, so a program
+;; cannot ask whether it is set. Asserted on the ROOT, since that is where the
+;; two spellings differ.
+(define (knob-root name)
+  (let ((cell (var-cell-lookup "clojure.core.async" name)))
+    (and cell (var-cell-defined? cell) (var-cell-root cell))))
+(jolt-fiber-preempt-ticks-set! 20000)
+(ok "1b. a pinned quantum reaches the var" (eqv? 20000 (knob-root "*fiber-preempt-ticks*")))
+(jolt-fiber-preempt-ticks-set! #f)
+(ok "1b. a #f reset leaves the quantum var nil"
+    (jolt-nil? (knob-root "*fiber-preempt-ticks*")))
+(jolt-fiber-carrier-count-set! 2)
+(ok "1b. a pinned carrier count reaches the var" (eqv? 2 (knob-root "*fiber-carrier-count*")))
+(jolt-fiber-carrier-count-set! #f)
+(ok "1b. a #f reset leaves the carrier-count var nil"
+    (jolt-nil? (knob-root "*fiber-carrier-count*")))
+
 ;; --- 2. cooperatively, a spinner starves its carrier ------------------------
 ;; ONE carrier, so B has nowhere else to go. A spins on a box the driver flips;
 ;; the flag is how the test stops it without ever letting it park.
