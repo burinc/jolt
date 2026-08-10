@@ -812,6 +812,38 @@
       ;; would leave a timer running over the scheduler itself, where every
       ;; delivery is a no-op that costs a handler call.
       ((not f) (void))
+      ;; NOT 'running. resume* sets 'running on every entry, and every transition
+      ;; that leaves a fiber in some other state while it is still executing runs
+      ;; inside disable-interrupts — so a handler that gets here on a fiber which is
+      ;; not 'running is looking at a fiber that has COMMITTED to a transition it has
+      ;; not finished, and taking it apart breaks the commit three different ways:
+      ;;
+      ;;   'parked    the commit landed and the switch has not. This is
+      ;;              stdlib/jolt/io_poller.clj wait-fiber, and it is the reason this
+      ;;              arm belongs in the scheduler rather than in the seam: the
+      ;;              channel ops bracket commit-and-switch in disable-interrupts,
+      ;;              and that seam is CLOJURE and cannot. Preempting it queues the
+      ;;              fiber, dispatches it, and lets it run on to its own
+      ;;              jolt.host/fiber-to-scheduler! — which does not set the state,
+      ;;              because the commit did. So it escapes neither queued nor
+      ;;              'parked, and sa-fiber-resume (which acts only on 'parked) is a
+      ;;              silent no-op for the rest of the process.
+      ;;   'ready     the same window, one step later: the wake arrived first, so the
+      ;;              fiber is on the run queue AND still running. Enqueueing it
+      ;;              again is not a duplicate, it is a cycle — see
+      ;;              jolt-fiber-enqueue!/locked, which writes f.next := f when f is
+      ;;              the sole entry and leaves the carrier dispatching it forever.
+      ;;   'done/'dead  jolt-fiber-finish! has already published the terminal state
+      ;;              and is running monitors, which are user code. Resuming past
+      ;;              that point means the state is never published again, so the
+      ;;              fiber never reads as finished.
+      ;;
+      ;; Refused rather than dropped, and re-armed short like the lock arm: a seam
+      ;; may in principle sit in the gap for a while, and the promise at the head of
+      ;; this section is that no setting opens an unbounded starvation window.
+      ((not (eq? (jolt-fiber-state f) 'running))
+       (set-timer (jolt-fiber-preempt-retry-ticks))
+       (void))
       ;; A LOCK IS HELD. Switching here loses mutual exclusion whichever way it
       ;; goes: unwinding releases the mutex mid-section, and not unwinding leaves
       ;; this fiber holding an OS mutex while another fiber on the SAME carrier

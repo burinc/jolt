@@ -32,6 +32,17 @@
 ;; closes it (both the commit and the wake's state read are serialized by the
 ;; caller's lock; pm is a new leaf in the lock chain: nothing the park path does
 ;; takes the run-queue mutex, and the wake resumes outside pm).
+;;
+;; What this file CANNOT do, and does not have to. The channel ops bracket their
+;; commit and their switch in disable-interrupts, because between the two the fiber
+;; is marked but has not left, and a preemption there takes the commit apart. This
+;; file is Clojure and has no such bracket: wait-fiber commits under pm and switches
+;; after releasing it, so the gap is open here by construction. The scheduler closes
+;; it instead — jolt-fiber-preempt-handler refuses to preempt a fiber that is not
+;; 'running, which is exactly the set of fibers that have committed to a transition
+;; they have not finished (jolt-9d3m, and fibers-preempt-test.ss section 12). So the
+;; order below matters and the interrupt state does not: commit under pm, release,
+;; then switch.
 
 (ns jolt.io-poller
   (:require [jolt.ffi :as ffi]

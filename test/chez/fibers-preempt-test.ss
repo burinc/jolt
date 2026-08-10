@@ -400,6 +400,96 @@
                     "11. the interrupted fiber finishes")
         (unbox caught))))
 
+;; --- 12. a fiber that has committed to park is not preempted (jolt-9d3m) -----
+;; The channel ops bracket the commit and the switch in disable-interrupts and say
+;; why: they are ONE transition and a timer landing between them finds the fiber
+;; already marked and takes it apart. The IO-parking seam CANNOT do that, because
+;; it is Clojure — stdlib/jolt/io_poller.clj wait-fiber commits under the poller
+;; lock and switches after releasing it, so the gap is preemptible and no amount
+;; of care in that file can close it. The scheduler has to.
+;;
+;; The states a fiber can be observed in are the whole argument. resume* sets
+;; 'running on every entry, and both other transitions run with interrupts off, so
+;; a handler that fires on a fiber which is NOT 'running is looking at a fiber that
+;; has committed to something and is a few instructions from handing the carrier
+;; over. There are two such states and each fails differently.
+;;
+;; A drain on THIS thread rather than a carrier pool: the two failures are a lost
+;; fiber and a self-linked run queue, and both are easier to see synchronously than
+;; through a timeout.
+(jolt-fiber-pool-reset!)
+(jolt-fiber-carrier-count-set! 1)
+(jolt-fiber-preempt-ticks-set! jolt-fiber-preempt-ticks-min)
+
+(define (cw-spin n) (let loop ((i 0) (a 0)) (if (fx=? i n) a (loop (fx+ i 1) (fx+ a i)))))
+(define CW-SPIN 400000)     ; many quanta at the floor, so the timer certainly falls due
+
+;; The control, and the test is worth nothing without it: the SAME spin in a fiber
+;; that is plainly 'running must be preempted, or "not preempted" below would only
+;; be saying the timer never fired.
+(define cw-control-before (jolt-fiber-preempts))
+(define cw-control (sa-fiber-spawn (lambda () (cw-spin CW-SPIN) 'ok)))
+(sa-fiber-run-all)
+(ok "12. control: the same spin IS preempted while the fiber is 'running"
+    (> (jolt-fiber-preempts) cw-control-before))
+
+;; 12a. committed, not yet switched. Unfixed: the handler flips it to 'ready,
+;; queues it and parks through a continuation of its own; the fiber is dispatched,
+;; runs on, and reaches the real switch with state 'running — so it is neither
+;; queued nor 'parked, and sa-fiber-resume (which acts only on 'parked) can never
+;; bring it back. The wake is a silent no-op and the fiber is gone.
+(define cw-a-resumed #f)
+(define cw-a-before (jolt-fiber-preempts))
+(define cw-a
+  (sa-fiber-spawn
+   (lambda ()
+     (let ((f (jolt-current-fiber)))
+       ;; jolt.host/fiber-park-commit!
+       (jolt-fiber-state-set! f 'parked)
+       (cw-spin CW-SPIN)                    ; the gap the poller lock has just left open
+       ;; jolt.host/fiber-to-scheduler!
+       (jolt-fiber-to-scheduler! f)
+       (set! cw-a-resumed #t)
+       'ok))))
+(sa-fiber-run-all)
+(ok "12a. a committed fiber is not preempted in the gap"
+    (= (jolt-fiber-preempts) cw-a-before))
+(ok "12a. it reaches the switch still 'parked" (eq? 'parked (jolt-fiber-state cw-a)))
+(sa-fiber-resume cw-a)
+(sa-fiber-run-all)
+(ok "12a. so the poller's wake brings it back" cw-a-resumed)
+(ok "12a. and it completes" (eq? 'done (jolt-fiber-state cw-a)))
+
+;; 12b. committed AND already woken. The poller thread can call fiber-resume the
+;; moment the pipe write lands, which is before the switch: the fiber is then
+;; 'ready and ON the run queue while still running. Preempting it enqueues a fiber
+;; that is already queued, and jolt-fiber-enqueue!/locked spells out what that is —
+;; not a duplicate, a CYCLE (f.next := f when f is the sole entry), so the carrier
+;; dispatches the same fiber forever. Here the second dispatch finds it 'done and
+;; the drain dies with "fiber in unexpected state".
+(define cw-b-resumed #f)
+(define cw-b-before (jolt-fiber-preempts))
+(define cw-b
+  (sa-fiber-spawn
+   (lambda ()
+     (let ((f (jolt-current-fiber)))
+       (jolt-fiber-state-set! f 'parked)    ; commit
+       (sa-fiber-resume f)                  ; the poller got in first: 'ready + queued
+       (cw-spin CW-SPIN)
+       (jolt-fiber-to-scheduler! f)
+       (set! cw-b-resumed #t)
+       'ok))))
+(ok "12b. a woken-but-not-yet-switched fiber drains without error"
+    (guard (e (#t #f)) (sa-fiber-run-all) #t))
+(ok "12b. it was not preempted while queued" (= (jolt-fiber-preempts) cw-b-before))
+(ok "12b. it ran to completion" (and cw-b-resumed (eq? 'done (jolt-fiber-state cw-b))))
+(ok "12b. and left the run queue empty, not self-linked"
+    (let ((c (vector-ref jolt-fiber-carriers 0)))
+      (and (not (jolt-carrier-head c)) (not (jolt-carrier-tail c)))))
+
+(jolt-fiber-preempt-ticks-set! #f)
+(jolt-fiber-pool-reset!)
+
 (printf "\nfibers-preempt-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "fibers-preempt-test: PASS — preemptive scheduling\n") (exit 0))
