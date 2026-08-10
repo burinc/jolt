@@ -113,7 +113,17 @@
   ;; winder to unwind normally.
   (jolt-park-drop-finallys!)
   (jolt-park-unwinding-set! #t)
-  (jolt-fiber-sic-set! f (jolt-current-disable-count))  ; see jolt-fiber-to-scheduler!
+  ;; NO interrupt depth is recorded, which is the one place this differs from
+  ;; jolt-fiber-to-scheduler! rather than merely skipping its capture. That one
+  ;; saves the depth in jolt-fiber-sic because its resume re-enters THROUGH k, back
+  ;; inside whatever disabled region the fiber parked in, so the region has to be
+  ;; rebuilt around it. A cheap park has no k and does not rewind: the region
+  ;; jolt-sm-commit! opened is destroyed by this escape exactly as a dynamic-wind
+  ;; would be, and the resume comes in through the thunk at the carrier's baseline
+  ;; with nothing to restore. jolt-fiber-run reads sic only when k is set, so a
+  ;; value written here could never be read anyway — it was, and it read as though
+  ;; the depth travelled (jolt-kkt3). fibers-sm-test.ss scenario 13 pins the depth
+  ;; a resumed step actually runs at, in both directions.
   ((jolt-carrier-sched-k (jolt-fiber-carrier f))))
 
 ;; Commit to a cheap park on an already-registered handler whose channel mutex is

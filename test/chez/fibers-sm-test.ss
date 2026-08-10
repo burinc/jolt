@@ -341,6 +341,62 @@
 (ok "12. the put side refuses too" (eq? (jolt-fiber-state f12b) 'dead))
 (ok "12. and leaves no putter behind" (null? (async-chan-alt-putters ch12b)))
 
+;; --- 13. a resumed step runs at the carrier's baseline interrupt depth --------
+;; jolt-sm-commit! disables interrupts to make "mark parked" and "escape" one
+;; region, and jolt-sm-park! escapes out of it. The depth is NOT carried across a
+;; cheap park the way a continuation park's is (jolt-fiber-sic), and it must not
+;; be: a cheap park does not rewind. The disabled region is destroyed by the park
+;; exactly as a dynamic-wind would be, so there is no frame left to restore a
+;; depth for, and the resume enters the driver fresh at the carrier's baseline.
+;;
+;; Pinned here because the alternative is a plausible-looking bug in either
+;; direction: carrying the depth across would resume the step with interrupts off
+;; and never turn them back on, so that fiber would stop being preemptible for as
+;; long as it ran, and forgetting to walk the region back on the way OUT would
+;; leave the scheduler itself with interrupts disabled (jolt-kkt3).
+(printf "\n== 13. a resumed step runs at the carrier's baseline depth ==\n")
+(define ch13 (jolt-async-chan))
+(define d13-before (jolt-current-disable-count))
+(define d13-in-step 'unset)
+(define fw13
+  (sm-spawn
+   (lambda (k)
+     (jolt-sm-take ch13
+                   (lambda (v)
+                     (set! d13-in-step (jolt-current-disable-count))
+                     (k v))))))
+(sa-fiber-run-all)
+(ok "13. the body parked cheaply" (eq? (jolt-fiber-state (car fw13)) 'parked))
+(ok "13. and the drain left the carrier at its own depth"
+    (= (jolt-current-disable-count) d13-before))
+(ok "13. the value arrives" (feed-parked! (car fw13) ch13 5 "13. park"))
+(ok "13. the resumed step ran with interrupts ENABLED, at the baseline"
+    (eqv? d13-in-step d13-before))
+(ok "13. and the fiber completed" (= (jolt-fiber-result (car fw13)) 5))
+(ok "13. the carrier is back at its own depth afterwards"
+    (= (jolt-current-disable-count) d13-before))
+;; The same for a put, whose commit runs through the other branch of
+;; jolt-sm-fiber-put.
+(define ch13b (jolt-async-chan))
+(define d13b-in-step 'unset)
+(define fw13b
+  (sm-spawn
+   (lambda (k)
+     (jolt-sm-put ch13b 7
+                  (lambda (okp)
+                    (set! d13b-in-step (jolt-current-disable-count))
+                    (k okp))))))
+(sa-fiber-run-all)
+(ok "13. the putter parked cheaply" (eq? (jolt-fiber-state (car fw13b)) 'parked))
+(define t13 'unset)
+(fork-thread (lambda () (set! t13 (jolt-async-take ch13b))))
+(pump-until (lambda () (settled? (car fw13b))) 5.0 "13. putter finished")
+(ok "13. the taker got the value" (eqv? t13 7))
+(ok "13. the resumed put step ran at the baseline too"
+    (eqv? d13b-in-step d13-before))
+(ok "13. and the carrier is still at its own depth"
+    (= (jolt-current-disable-count) d13-before))
+
 (printf "\nfibers-sm-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "fibers-sm-test: PASS — the cheap park, chosen per park site\n") (exit 0))
