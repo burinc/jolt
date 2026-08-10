@@ -190,6 +190,15 @@
 (define race-done-mu (make-mutex))
 (define race-stop (box #f))
 
+;; THE GENERATION A WORKER CARRIES IS THE ONE IT ACTED ON, never a fresh read.
+;; This used to end the round with (spin (unbox race-gen)), and that loses rounds.
+;; Main cannot finish round g until every worker has reported it, so the last
+;; report releases main straight into round g+1 and the bump that opens it — and a
+;; worker still between its own report and that re-read then reads g+1 and stores
+;; it as `seen`. Round g+1 is invisible to that worker, race-done never reaches
+;; RACE-N, and the await below spins forever with RACE-N threads spinning beside
+;; it. Seen as a CI wedge: 85 minutes on this gate at 499% CPU with no output and
+;; nothing to end it. Reproduced deterministically by widening that exact window.
 (define race-threads
   (let loop ((i 0) (acc '()))
     (if (fx=? i RACE-N)
@@ -201,28 +210,40 @@
                          (cond
                            ((unbox race-stop) (void))
                            ((fx>? (unbox race-gen) seen)
-                            (let ((f (unbox race-target)))
-                              (when f (sa-fiber-resume f)))
-                            (jolt-with-mutex race-done-mu
-                              (set-box! race-done (fx+ 1 (unbox race-done))))
-                            (spin (unbox race-gen)))
+                            (let ((g (unbox race-gen)))   ; the round being served
+                              (let ((f (unbox race-target)))
+                                (when f (sa-fiber-resume f)))
+                              (jolt-with-mutex race-done-mu
+                                (set-box! race-done (fx+ 1 (unbox race-done))))
+                              (spin g)))
                            (else (spin seen))))))
                     acc)))))
 
 (define race-bad 0)
 (define race-woke 0)
-(do ((r 0 (fx+ r 1))) ((fx=? r RACE-ROUNDS))
+(define race-stuck #f)
+;; BOUNDED, because a gate that hangs is worse than one that fails: a hang says
+;; nothing about what broke and burns the CI slot until somebody notices. The
+;; bound is enormous relative to RACE-N resumes — reaching it means the barrier
+;; lost a worker, which is a bug in the barrier or in sa-fiber-resume, and either
+;; way it should be reported and not spun on.
+(define RACE-AWAIT-LIMIT 2000000000)
+(do ((r 0 (fx+ r 1))) ((or race-stuck (fx=? r RACE-ROUNDS)))
   (let ((f (sa-fiber-spawn (lambda () (jolt-fiber-park!) 'woke))))
     (sa-fiber-run-all)                        ; runs it up to the park
     (set-box! race-target f)
     (set-box! race-done 0)
     (set-box! race-gen (fx+ 1 (unbox race-gen)))   ; release all RACE-N at once
-    (let await () (unless (fx=? RACE-N (unbox race-done)) (await)))
+    (let await ((n 0))
+      (cond ((fx=? RACE-N (unbox race-done)) (void))
+            ((fx>? n RACE-AWAIT-LIMIT) (set! race-stuck #t))
+            (else (await (fx+ n 1)))))
     (unless (fx=? 1 (rq-length race-c)) (set! race-bad (fx+ race-bad 1)))
     (sa-fiber-run-all)
     (if (eq? 'done (jolt-fiber-state f))
         (set! race-woke (fx+ race-woke 1))
         (set! race-bad (fx+ race-bad 1)))))
+(ok "concurrent resume: every round released every resumer" (not race-stuck))
 (set-box! race-stop #t)
 (set-box! race-gen (fx+ 1 (unbox race-gen)))     ; one last release so they exit
 (for-each thread-join race-threads)
