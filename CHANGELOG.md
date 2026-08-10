@@ -5,9 +5,52 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.9] - 2026-08-10
+
+### Changed
+
+- **`(.-field obj)` raises when the field is absent**, where it used to answer
+  nil — so `(.-zz record)` and `(.-nope map)` no longer read as a field that is
+  present and set to nil, and a caller testing one no longer silently takes the
+  wrong branch. The JVM raises `IllegalArgumentException` there and so does
+  jolt now. What still answers is unchanged: a declared `deftype`/`defrecord`
+  slot, and the documented map-as-object read where a key the map HAS reads as
+  a field. Code that relied on the nil needs a `contains?`/`get` instead.
 
 ### Fixed
+
+- **A lookup answers with the element the collection HOLDS**, not the key it was
+  probed with, so metadata on the stored element survives. `(#{^{:x 1} [a b]}
+  [a b])` handed back the bare probe and lost the metadata; `assoc` replaced a
+  stored key with the equal one it was given, `find` minted its entry from the
+  probe, and `select-keys` rebuilt through `assoc`. All of them read the
+  collection's own entry now.
+
+- **`count`/`seq`/`nth` work on a `CharSequence`**, which `RT.count`/`RT.seq`/
+  `RT.nth` reach for on the JVM: a `deftype` presenting a window over a string
+  answered its field count rather than its length. `re-matches`/`re-find`/
+  `re-seq` accept one too (only `re-matcher` did), and `StringBuilder` is a
+  `CharSequence` at all now — it had no supers row and no `count`/`seq`/`nth`/
+  `subSequence`.
+
+- **`deref`'s timed arity is a real `IBlockingDeref` cast.** `(deref (delay 7)
+  50 :timeout)` returned 7 with the timeout silently dropped, where the JVM
+  throws `ClassCastException` because `Delay` is `IDeref` but not
+  `IBlockingDeref`; same for an agent. `atom`/`ref`/`var` did throw, but
+  reported the class as an opaque `:object` sentinel.
+
+- **A core.async transducer's `:ex-handler` gets the original throwable.** It
+  was handed the raw raised condition, so `ex-data`, `ex-message` and the class
+  all read nil and the thrown `ex-info`'s data was lost. core.async also joins
+  the library conformance manifest, giving `async.ss` a standing regression gate.
+
+- **The runtime's shared side-tables are serialized.** A Chez hashtable is not
+  thread-safe, and the metadata table (every `with-meta`) and the variadic
+  fixed-arity registry (every variadic closure creation) were written from
+  whatever thread the program ran on. The corruption surfaced later as an
+  invalid memory reference inside the collector, or a hang — reproducibly, as a
+  crash of core.async's own pipeline test, and in builds predating the fibers
+  work.
 
 - **Shutdown hooks run** (#571). `Runtime.addShutdownHook` kept a list nothing
   ever read, so `jolt.process`'s `:shutdown` option — `destroy-tree` and
@@ -51,6 +94,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   put back, so a child gets the default mask the JVM would give it.
 
 ### Added
+
+- **Fibers R8: a socket read parks the fiber instead of pinning its carrier.**
+  `jolt.socket` runs its syscalls with the fd in `O_NONBLOCK`; on `EAGAIN` it
+  registers readiness with the new `jolt.io-poller` and parks the fiber, so the
+  carrier runs other fibers meanwhile, and blocks on a private
+  `kevent`/`epoll_wait` exactly as before when there is no fiber. User code keeps
+  its blocking shape either way. File offload is not in this round.
+
+- **Fibers R5: a carrier pool, and `<!!` parks on a fiber.** The scheduler state
+  R4 kept in globals moved into a per-carrier record — run queue, mutex,
+  condition, resume continuation, dynamic slice, thread, stop flag — since R4's
+  single global resume continuation stops being safe the moment there is more
+  than one carrier. Carriers default to the processor count and are overridable;
+  placement is round-robin at spawn and never revisited, because a fiber cannot
+  migrate.
+
+- **Fibers R4: `go` on fibers, opt-in.** A `go` body can run on a fiber.
+  `clojure.core.async/*go-backend*` selects it (`:thread` default, `:fiber` to
+  opt in), read at spawn time off the dynamic binding, so a `binding` covers
+  every `go` in its scope including ones inside functions it calls.
+  `thread`/`thread-call` stay real OS threads regardless — that is the documented
+  escape for blocking work, which would otherwise pin a carrier. The default is
+  unchanged.
 
 - **Fibers R3 (jolt-nvpr.4): one waiter protocol for threads and fibers.** A
   pending channel operation is a handler, never a fork. The alt-taker/alt-putter
@@ -116,6 +182,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (verified under native gsi in gambitcheck); `go` stays on OS threads there
   per the plan's documented degradation. No jolt-level `go` or channel code
   yet — those are later rounds.
+
+- **Gambit build profiles**, so a bundle carries only the language a build
+  needs. The Gambit runtime plus jolt's kernel is two thirds of the bundle and
+  cannot be dropped; what is separable is regex, the compiler, and
+  `clojure.core` itself, so the profiles trade features for the last third —
+  `repl` ships 27.7MB / 3.1MB gzipped against `full`'s 32.6MB / 3.5MB.
+  `make gambitweb` builds the browser bundle, and `host/gambit/host-vars.ss`
+  binds the 40 `clojure.core` names the `java/` tree owns on Chez (`(time 1)`
+  reached an unbound global and failed as a bare Gambit exception); each is
+  either implemented or raises a catchable `UnsupportedOperationException` that
+  names itself.
 
 - **Gambit is a second Scheme backend** — the first target ported through the
   portable Scheme layer (#446). Jolt reads, compiles, and evaluates source on
@@ -3626,7 +3703,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.6.8...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.6.9...HEAD
+[0.6.9]: https://github.com/jolt-lang/jolt/compare/v0.6.8...v0.6.9
 [0.6.8]: https://github.com/jolt-lang/jolt/compare/v0.6.7...v0.6.8
 [0.6.7]: https://github.com/jolt-lang/jolt/compare/v0.6.6...v0.6.7
 [0.6.6]: https://github.com/jolt-lang/jolt/compare/v0.6.5...v0.6.6
