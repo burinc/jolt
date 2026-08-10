@@ -74,6 +74,10 @@
 ;; recur inside one of these targets it, not an enclosing loop.
 (def ^:private sm-recur-barrier '#{fn* loop* letfn*})
 
+;; The two heads whose subforms are DATA. sm-children stops at both, so the
+;; walkers never descend into a template.
+(def ^:private sm-quoting '#{quote syntax-quote})
+
 (defn- sm-bail []
   (throw (ex-info "sm/bail" {::bail true})))
 
@@ -97,10 +101,17 @@
     (if (and (symbol? h) (= "clojure.core" (namespace h))) (symbol (name h)) h)))
 
 (defn- sm-children
-  "Subforms to walk for a tree predicate. A quoted form has none."
+  "Subforms to walk for a tree predicate. A quoted form has none, and neither
+  does a syntax-quoted one: its subforms are DATA, and the walkers below
+  macroexpand what they descend into, so walking a template ran the expander of
+  every macro named inside a backtick — code the analyzer never expands and the
+  compiler never sees. The predicates would only ever be conservative about it
+  (sm-cps emits a syntax-quote whole through the sm-opaque arm either way), so
+  nothing is lost by stopping, and an expander that throws or has side effects
+  no longer gets to run on a quoted template."
   [form]
   (cond
-    (= (sm-sf-head form) 'quote) nil
+    (contains? sm-quoting (sm-sf-head form)) nil
     (seq? form) (seq form)
     (vector? form) (seq form)
     (set? form) (seq form)
@@ -111,11 +122,17 @@
   (or (pred form)
       (boolean (some (fn [c] (sm-tree-any? pred c)) (sm-children form)))))
 
+;; :env IS the &env map — local symbol to nil, the shape analyzer.clj's
+;; amp-env-map builds and the one both `resolve` and a macro expect. It is the
+;; pass's only record of what is in scope: sm-bind extends it as continuation
+;; parameters and let* bindings come into scope, so it stays true as the pass
+;; descends, and sm-expand hands it to the expander so a macro sees the scope the
+;; analyzer would have shown it.
 (defn- sm-park-kind
   "nil, :take or :put — and only when sym resolves to the exact var. A local of
   the same name shadows it."
   [ctx sym]
-  (when (and (symbol? sym) (not (contains? (:locals ctx) sym)))
+  (when (and (symbol? sym) (not (contains? (:env ctx) sym)))
     (let [v (resolve (:env ctx) sym)]
       (cond
         (nil? v) nil
@@ -126,14 +143,26 @@
 (defn- sm-parks? [ctx form]
   (sm-tree-any? (fn [f] (some? (sm-park-kind ctx (sm-head f)))) form))
 
+;; UNDER THE LOCALS AS &env, which is not a nicety. sm-cps does not merely
+;; classify with the expansion, it REBUILDS the body out of it — every one of the
+;; do / let* / if / loop* / :else arms emits from `ex`. The one-argument
+;; macroexpand has no env and binds &env to {}, so a macro that reads &env
+;; expands one way here and another way when the analyzer reaches it, and the
+;; program that gets compiled inside a park-bearing go body is not the one the
+;; same source compiles to anywhere else. clojure.core/__macroexpand-env
+;; (natives-reader.ss) is the seam that passes it; :env below is that map, kept
+;; current by sm-bind as the pass introduces continuation parameters, so a macro
+;; asking "is this name a local" gets the same answer the analyzer would give.
+;;
+;; A head that names a local is not expanded at all, whatever it resolves to.
 (defn- sm-expand
   "One macroexpansion step chain, skipping a head that names a local."
   [ctx form]
   (if (and (seq? form)
            (symbol? (sm-head form))
-           (not (contains? (:locals ctx) (sm-head form)))
+           (not (contains? (:env ctx) (sm-head form)))
            (not (contains? sm-opaque (sm-sf-head form))))
-    (macroexpand form)
+    (clojure.core/__macroexpand-env form (:env ctx))
     form))
 
 (defn- sm-targets-recur?
@@ -163,7 +192,10 @@
   (and (not (sm-parks? ctx form))
        (or (nil? (:rec ctx)) (not (sm-targets-recur? ctx form)))))
 
-(defn- sm-bind [ctx sym] (update ctx :locals conj sym))
+;; nil is the &env value for a local, matching analyzer.clj's amp-env-map — the
+;; JVM maps a local to a compiler binding object, and the consumers that read
+;; &env at all only look at its keys.
+(defn- sm-bind [ctx sym] (update ctx :env assoc sym nil))
 
 (defn- sm-bind* [ctx syms]
   (loop [c ctx s (seq syms)]
@@ -362,12 +394,14 @@
   was. nil means: nothing here parks where the pass can see it, or the body did
   something the pass will not guess at."
   [env body]
-  ;; :locals starts from the ENCLOSING scope, not empty. sm-park-kind is already
-  ;; safe without it ((resolve &env sym) answers nil for a local), but sm-expand
-  ;; calls the one-argument macroexpand, which has no env — so a `go` written
-  ;; inside a scope whose local shares a name with a macro would have that local's
-  ;; call expanded as the macro.
-  (let [ctx {:env env :locals (if env (set (keys env)) #{}) :rec nil}
+  ;; The scope starts from the ENCLOSING one, not empty, and it is the go macro's
+  ;; own &env — so a `go` written inside a scope whose local shares a name with a
+  ;; macro does not have that local's call expanded as the macro, and a macro the
+  ;; pass expands sees the same locals the analyzer would have shown it.
+  ;; (or env {}) because a top-level go gets nil, and jolt-resolve treats a
+  ;; non-map env as "no locals" — the same answer, said once here instead of at
+  ;; every use.
+  (let [ctx {:env (or env {}) :rec nil}
         form (if (= 1 (count body)) (first body) (cons 'do body))]
     (when (and (sm-parks? ctx form)
                ;; a recur in the body targets the body fn itself, whose arity this

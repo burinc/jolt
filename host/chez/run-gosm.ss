@@ -158,6 +158,58 @@
 (gate-check "syntax-quote: datum is data, channel untouched" sq-val
             "[((clojure.core.async/<! user/c) :done) 99]")
 
+;; A macro named inside a syntax-quoted datum must not be EXPANDED either. The
+;; datum is data: the analyzer never expands it, so neither may the pass, and it
+;; used to — sm-children stopped at `quote` and walked straight into a backtick,
+;; and sm-targets-recur? macroexpands what it walks. An expander with a side
+;; effect ran on a template; one that throws (a template holding a call the macro
+;; rejects, which is legal inside a backtick) took the whole `go` form down with
+;; it. Gated with a macro that throws, so the failure is unambiguous — unfixed
+;; this line does not report a failed check, it kills the gate with the macro's
+;; own message, which is the point.
+(ev "(defmacro gosm-boom [] (throw (ex-info \"gosm-boom expanded\" {})))")
+(define x-sqm (go-expansion "(go (list `(user/gosm-boom) (<! ch)))"))
+(gate-check "syntax-quote: a macro in the datum is not expanded"
+            (gate-sub? x-sqm "gosm-boom") #t)
+
+;; --- 1b. the pass expands under the analyzer's &env ---------------------------
+;; sm-cps does not merely classify with an expansion, it REBUILDS the body out of
+;; it, so the expansion the pass takes has to be the one the analyzer would have
+;; taken. The one-argument macroexpand binds &env to {}, and a macro that reads
+;; &env then expanded one way inside a park-bearing go body and another way
+;; everywhere else — silently, and only when the body happened to park where the
+;; pass could see it. clojure.core/__macroexpand-env is the seam that carries the
+;; locals through; the pass's :env is the &env map, extended as it binds.
+;;
+;; env-has? is expanded by the PASS (its argument parks, so the form is not
+;; emitted whole) and reports whether the enclosing let's local was in scope at
+;; expansion time. Under {} it answers false, which is the bug. Named qualified
+;; because this file runs with the current namespace left at clojure.core.async
+;; by the overlay load above, and the def lands in user.
+(ev "(defmacro env-has? [s x] (list 'vector (contains? &env s) x))")
+;; the contrast: the public one-argument macroexpand has no env to pass, so it
+;; sees no locals at all. That is the answer the pass must NOT take.
+(gate-check "&env: the env-less macroexpand sees no locals"
+            (ev "(pr-str (macroexpand '(user/env-has? outer :v)))")
+            "(vector false :v)")
+(define x-env (go-expansion "(go (let [outer 1] (user/env-has? outer (<! ch))))"))
+(gate-check "&env: the pass expands with the enclosing local in scope"
+            (gate-sub? x-env "true") #t)
+(gate-check "&env: and never reports it absent"
+            (gate-sub? x-env "false") #f)
+(gate-check "&env: the value agrees"
+            (ev (string-append
+                 "(let [c (clojure.core.async/chan 1)]"
+                 "  (clojure.core.async/>!! c :v)"
+                 "  (binding [clojure.core.async/*go-backend* :fiber]"
+                 "    (pr-str (clojure.core.async/<!! (clojure.core.async/go"
+                 "      (let [outer 1] (user/env-has? outer (<! c))))))))"))
+            "[true :v]")
+;; the same form outside go — what the pass has to agree with
+(gate-check "&env: the ordinary expansion says the same"
+            (ev "(pr-str (let [outer 1] (user/env-has? outer :v)))")
+            "[true :v]")
+
 ;; loop* bindings are SEQUENTIAL — analyze-bindings threads each into the env the
 ;; next is analyzed in — so a later init means the name above it, not whatever the
 ;; enclosing scope calls that name. Built as a flat argument list to the loop fn,

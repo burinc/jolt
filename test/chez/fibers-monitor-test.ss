@@ -106,6 +106,33 @@
 (ok "6. monitoring a plain channel degrades to nil"
     (jolt-truthy? (ev "(nil? (<!! (fiber-monitor (chan))))")))
 
+;; --- 7. a CPS'd body that dies is reported too ------------------------------
+;; Section 5 covers a throw after a real park, which reaches jolt-fiber-dead!
+;; through the captured continuation. This is the other representation: the pass
+;; rewrites the body because it can SEE the take, so the fiber is spawned through
+;; __sm-spawn and the throw lands in jolt-sm-drive's handler. Both end at
+;; jolt-fiber-dead!, and both have to report. The channel is pre-filled so the
+;; take completes inline — which representation the body got is decided at
+;; compile time and does not depend on that.
+;;
+;; Run repeatedly with no sleep before the registration, so a good share of the
+;; rounds take jolt-fiber-monitor!'s ALREADY-FINISHED path rather than the
+;; registration path. Not a reproducer for the publication race — that window is
+;; two instructions wide and this does not hit it; test/chez/fibers-test.ss
+;; section 7c is what pins that, by holding the lock rather than racing it.
+(define r7 (ev "
+(binding [*go-backend* :fiber]
+  (loop [i 0 clean 0]
+    (if (= i 400)
+      clean
+      (let [c (chan 1)
+            _ (>!! c :v)
+            g (go (let [v (<! c)] (throw (ex-info \"race\" {:v v}))))
+            m (<!! (fiber-monitor g))]
+        (recur (inc i) (if (nil? m) (inc clean) clean))))))"))
+(ok "7. a rewritten body's death is never reported as a clean completion"
+    (jolt=2 r7 0))
+
 (printf "\nfibers-monitor-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "fibers-monitor-test: PASS — a dying fiber is observable\n") (exit 0))

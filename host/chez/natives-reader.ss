@@ -78,19 +78,43 @@
 ;; another expansion unexpanded — the head symbol and the value were identical,
 ;; only the provenance differed, so (macroexpand-all (macroexpand-1 form)) stopped
 ;; one level early on a macro that builds its own expansion.
-(define (nr-macroexpand-1 form)
+;;
+;; The ENV argument is what separates these two from the pair Clojure exposes.
+;; hc-expand-1 binds &env around the expander call, and the analyzer passes the
+;; in-scope locals (analyzer.clj amp-env-map: local symbol -> nil). The public
+;; macroexpand-1 has no env to pass and so binds {} — fine for a caller that is
+;; only INSPECTING an expansion, and wrong for one that then emits it, because a
+;; macro reading &env expands differently under {} and the emitted program is not
+;; the one the analyzer would have compiled.
+;;
+;; clojure.core.async's go pass is that caller: it macroexpands to find the park
+;; sites and rebuilds the body out of the expansion. __macroexpand-env is the
+;; seam it uses. Deliberately NOT a second arity on macroexpand-1 — the JVM's is
+;; one-argument and code that feature-tests the arity should keep getting that
+;; answer — and __-prefixed like the other internal entry points here.
+(define (nr-macroexpand-1* form env)
   (if (and (hc-list? form) (not (jolt-nil? (jolt-seq form))) (symbol-t? (seq-first (jolt-seq form))))
       (let ((ctx (make-analyze-ctx (chez-current-ns))))
-        (if (hc-macro? ctx (seq-first (jolt-seq form))) (hc-expand-1 ctx form) form))
+        (if (hc-macro? ctx (seq-first (jolt-seq form))) (hc-expand-1 ctx form env) form))
       form))
-(define (nr-macroexpand form)
+(define (nr-macroexpand* form env)
   (let loop ((cur form))
-    (let ((nxt (nr-macroexpand-1 cur))) (if (eq? cur nxt) cur (loop nxt)))))
+    (let ((nxt (nr-macroexpand-1* cur env))) (if (eq? cur nxt) cur (loop nxt)))))
+
+;; One empty map, not one per call: this is on the public macroexpand path and
+;; the value is immutable.
+(define nr-no-env (jolt-hash-map))
+(define (nr-macroexpand-1 form) (nr-macroexpand-1* form nr-no-env))
+(define (nr-macroexpand form) (nr-macroexpand* form nr-no-env))
+;; nil env is the empty one, so a caller with nothing to say need not build a map.
+(define (nr-macroexpand-env form env)
+  (nr-macroexpand* form (if (jolt-nil? env) nr-no-env env)))
 
 (def-var! "clojure.core" "__reader-features" nr-reader-features-get)
 (def-var! "clojure.core" "__reader-features-set!" nr-reader-features-set!)
 (def-var! "clojure.core" "reader-conditional" nr-reader-conditional)
 (def-var! "clojure.core" "macroexpand-1" nr-macroexpand-1)
+(def-var! "clojure.core" "__macroexpand-env" nr-macroexpand-env)
 
 ;; letfn is a special form (the analyzer lowers it to letrec*, checked before any
 ;; macro), but on the JVM it is also a clojure.core macro that (resolve 'letfn)
