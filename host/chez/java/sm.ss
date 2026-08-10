@@ -47,6 +47,32 @@
            (jolt-fiber-sm f))))
 
 ;; --- the park ---------------------------------------------------------------
+;; THE INVARIANT THE CHEAP PARK RESTS ON, which the pass states as its
+;; consequence ("not covered: a park inside a try") rather than as itself:
+;;
+;;   NO dynamic-wind MAY SIT BETWEEN jolt-sm-drive AND A CHEAP PARK SITE.
+;;
+;; A continuation park re-enters through k, so Chez rewinds the chain and every
+;; winder is put back. A cheap park has no k. It escapes to the scheduler — which
+;; runs every after-thunk above the carrier's base — and the resume comes back in
+;; through the THUNK, at base, with nothing rebuilt. So a wind in that extent is
+;; not suspended across the park, it is destroyed by it: the after-thunk fires
+;; while the computation is still live and the before-thunk never runs again. A
+;; parameterize would revert, a lock would be released and not retaken, a
+;; binding frame would be popped out from under the code that pushed it.
+;;
+;; What keeps it true is the pass, not this file. `try` and `fn*` are the only
+;; two heads the back end lowers to a dynamic-wind (backend_scheme emit-try, and
+;; every host form that takes a thunk), and both are in sm-opaque — which is what
+;; also covers binding, dosync and locking, since each of those puts its body
+;; behind one or the other. A park inside any of them falls back to the capture,
+;; where the wind is fine.
+;;
+;; Nothing checks this. If the back end ever emits a wind for something the pass
+;; DOES rewrite, parked go blocks break silently and after the fact — the
+;; after-thunk has already run by the time anything notices. Adding such a form
+;; means adding its head to sm-opaque in the same change.
+;;
 ;; Store the rest of the computation and hand the carrier back. The differences
 ;; from jolt-fiber-to-scheduler! are the whole point: no call/1cc, and k is left
 ;; CLEAR so the scheduler re-enters through the thunk (jolt-sm-drive below), which

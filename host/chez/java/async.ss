@@ -581,9 +581,18 @@
 ;; setter jolt-fiber-preempt-ticks-set! writes it, so the two never disagree).
 ;; jolt-nil means the built-in default, which is ON at roughly 0.45ms: a
 ;; compute-bound go block yields instead of pinning its carrier for as long as
-;; it runs. A positive fixnum pins a different quantum. 0 turns preemption off
-;; entirely, which is an escape hatch rather than a mode — cooperative-only
-;; scheduling lets one fiber starve every other fiber on its carrier.
+;; it runs. A fixnum at or above jolt-fiber-preempt-ticks-min pins a different
+;; quantum; anything below the floor, 0 included, is ignored and the default
+;; stands.
+;;
+;; THERE IS NO VALUE THAT TURNS PREEMPTION OFF. Cooperative-only is not a milder
+;; setting, it is an unbounded starvation window: one fiber that never reaches a
+;; channel op starves every other fiber on its carrier, and nothing can migrate
+;; them because a fiber is pinned to its carrier for life. Ask for a very long
+;; quantum if that is what you want. Read at pool start, so set it before the
+;; first :fiber go or between a pool reset and the next one; the host setter
+;; jolt-fiber-preempt-ticks-set! is immediate and refuses an out-of-range value
+;; out loud.
 (def-var! "clojure.core.async" "*fiber-preempt-ticks*" jolt-nil)
 (define (go-backend-current)
   (let ((cell (var-cell-lookup "clojure.core.async" "*go-backend*")))

@@ -727,6 +727,15 @@
 ;; (slowly, 24k preemptions), 1 tick never finishes. The floor is set well above
 ;; that boundary rather than at it, since dispatch cost varies by machine, and it
 ;; is still four orders of magnitude below the default.
+;;
+;; THE FLOOR IS ALSO THE WHOLE STORY ABOUT TURNING PREEMPTION OFF: there is no
+;; value that does it. 0 would be the obvious spelling — (set-timer 0) disarms —
+;; and it is refused along with everything else below the floor, because
+;; cooperative-only is not a milder setting, it is an unbounded starvation
+;; window, and a second scheduling path would get a fraction of the exercise the
+;; default one does. Something that wants effectively cooperative behaviour asks
+;; for a very long quantum. The var's own documentation (async.ss
+;; *fiber-preempt-ticks*) says the same thing, and used to say the opposite.
 (define jolt-fiber-preempt-ticks-min 100)
 (define jolt-fiber-preempt-ticks-default 1000000)   ; ~0.45ms, measured
 (define jolt-fiber-preempt-ticks-global jolt-fiber-preempt-ticks-default)
@@ -735,8 +744,11 @@
   (let ((v (guard (e (#t #f))
              (let ((cell (var-cell-lookup "clojure.core.async" "*fiber-preempt-ticks*")))
                (if (and cell (var-cell-defined? cell)) (var-cell-root cell) #f)))))
-    ;; a positive fixnum pins the quantum, 0 is the escape hatch, and jolt-nil
-    ;; (an unset var) leaves the default alone
+    ;; A fixnum at or above the floor pins the quantum. Anything else — jolt-nil
+    ;; (the unset var), a non-fixnum, or a value below the floor including 0 —
+    ;; leaves the default alone. Silently, because this runs at pool start where
+    ;; there is nobody to report to; the host setter below is the path that
+    ;; refuses out loud.
     (when (and (fixnum? v) (fx>=? v jolt-fiber-preempt-ticks-min))
       (set! jolt-fiber-preempt-ticks-global v))))
 (define (jolt-fiber-preempt-ticks-set! n)

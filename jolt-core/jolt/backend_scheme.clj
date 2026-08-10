@@ -1598,6 +1598,17 @@
 ;;
 ;; This is why the marker must be emitted by NAME and not inlined: the filter
 ;; recognises it with eq?.
+;;
+;; THIS IS ALSO THE ONLY dynamic-wind THE BACK END EMITS FOR A jolt FORM, and
+;; that fact is load-bearing elsewhere. The cheap park in host/chez/java/sm.ss
+;; escapes the whole winder chain above the carrier's base and resumes through
+;; the fiber thunk, so it does not rewind: any wind between the CPS driver and a
+;; rewritten park site would have its after-thunk fire mid-computation and its
+;; before-thunk never run again. clojure.core.async's pass keeps that from
+;; happening by treating `try` and `fn*` as opaque, which is sound exactly
+;; because those two are the only heads that reach a dynamic-wind. Emitting one
+;; for anything else means adding that head to sm-opaque in the same change; see
+;; the invariant note at jolt-sm-park!.
 ;; Both keys optional.
 (defn- emit-try [node]
   (let [core (if-let [cs (:catch-sym node)]

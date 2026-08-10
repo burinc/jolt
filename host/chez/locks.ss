@@ -75,6 +75,27 @@
 ;; whether a site was considered or merely inherited the shadow. host/chez/
 ;; lock-check.sh requires the explicit name, so the migration is visible and the
 ;; count can only go down.
+;;
+;; WHEN A FIBER MAY PARK INSIDE THE BODY. It is legal, and loader.ss's
+;; ldr-wait-for-load! depends on it: the after-thunk releases on the way out and
+;; the before-thunk re-acquires when the continuation is resumed, so the lock is
+;; not held across the park. What that costs is a blocking mutex-acquire on the
+;; RESUME — run from Chez's rewind, on the carrier thread, at the interrupt depth
+;; the fiber parked at, where the preemption timer is not polled and the carrier
+;; can do nothing else until it succeeds. So the precondition is not "the region
+;; is short", it is:
+;;
+;;   a fiber may park inside jolt-with-mutex only if no fiber on its carrier can
+;;   be holding m while this one is off the CPU.
+;;
+;; ldr-load-mu satisfies it because the only park inside that critical section is
+;; the wait itself, which gives the lock up on the way out, so a sibling fiber
+;; can never be parked holding it. A mutex a fiber can hold across a park would
+;; deadlock the carrier instead: the holder is queued behind the resume that is
+;; blocked waiting for it, and a fiber cannot migrate off its carrier to escape.
+;; A CHEAP park (java/sm.ss) is not allowed here at all — it never rewinds, so
+;; the lock would be released and never retaken. The CPS pass keeps them apart by
+;; treating every form that takes a thunk as opaque; see jolt-sm-park!.
 (define-syntax jolt-with-mutex
   (syntax-rules ()
     ((_ m e1 e2 ...)
