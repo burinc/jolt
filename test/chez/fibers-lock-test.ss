@@ -358,6 +358,143 @@
 
 (jolt-fiber-pool-reset!)
 
+;; --- 8. the OTHER two locks that wrap user code -------------------------------
+;; Sections 1-7 are about the object monitor, which is the lock this file was
+;; written for. It is not the only one whose region is a user body: jolt-sync
+;; (refs.ss) and jolt-delay-force (java/concurrency.ss) both ran theirs inside
+;; jolt-with-mutex, and locks.ss's premise — regions are SHORT and never span a
+;; park — is false of both for exactly the reason it was false of the monitor.
+;;
+;; So they are the same three failures, and they belong here rather than beside
+;; the STM and delay unit tests, because what is under test is the lock and not
+;; the transaction or the memoization.
+;;
+;; 8a. THE TRANSACTION'S ISOLATION (jolt-pb2s). jolt's STM has no MVCC and no
+;; retry: the global lock IS the isolation, so a park that drops it mid-body drops
+;; the only mechanism there is, and nothing afterwards can detect the conflict.
+;; Unfixed, the second transaction below ran to completion inside the first one's
+;; extent and the first then committed a value derived from a read that predated
+;; it — r = 1, where the only serializable outcomes are 100 (a then b) and 101
+;; (b then a).
+(jolt-fiber-carrier-count-set! 1)
+(define l10-r (jolt-ref-new 0))
+(define l10-ch (ac-make 1 'fixed #f))
+(define l10-read (box #f))
+;; a: read the ref, park mid-transaction, then write read+1.
+(define l10-a
+  (sa-fiber-spawn
+   (lambda ()
+     (jolt-sync
+      (lambda ()
+        (let ((v (jolt-ref-deref l10-r)))
+          (set-box! l10-read v)
+          (jolt-fiber-<! l10-ch)
+          (jolt-ref-set l10-r (+ v 1))))))))
+(sa-fiber-run-all)
+(ok "8a. the first transaction parked inside its body"
+    (and (eqv? 0 (unbox l10-read)) (eq? 'parked (jolt-fiber-state l10-a))))
+;; b: a whole transaction, start to finish, while a is parked.
+(define l10-b (sa-fiber-spawn (lambda () (jolt-sync (lambda () (jolt-ref-set l10-r 100))))))
+(sa-fiber-run-all)
+(ok "8a. a second transaction cannot run inside the first one's extent"
+    (eq? 'parked (jolt-fiber-state l10-b)))
+(ok "8a. and cannot have committed" (eqv? 0 (jolt-ref-val l10-r)))
+;; let a finish; b then gets the lock and commits after it.
+(jolt-async-give l10-ch 1)
+(sa-fiber-run-all)
+(let loop ((i 0))
+  (when (and (< i 5) (not (eq? 'done (jolt-fiber-state l10-b))))
+    (sa-fiber-run-all)
+    (loop (+ i 1))))
+(ok "8a. both transactions finished"
+    (and (eq? 'done (jolt-fiber-state l10-a)) (eq? 'done (jolt-fiber-state l10-b))))
+(ok "8a. the outcome is serializable (a then b)" (eqv? 100 (jolt-ref-val l10-r)))
+
+;; 8a'. AND THE TRANSACTION ENDS WHEN IT ENDS (jolt-49ay). The lock is only half of
+;; it: *txn* has to come back to nil too, and it did not. Chez's parameterize is a
+;; SWAP — one thunk is both the wind's before and its after, exchanging the
+;; parameter with a saved slot — and jolt-fiber-slice-restore! writes *txn* BEFORE
+;; the rewind runs that swap, so the saved slot came back holding the transaction
+;; instead of the outer nil, and the way out then restored the transaction. The
+;; fiber left its dosync still inside one, and its next dosync took the NESTED arm,
+;; joined the dead transaction, took no lock at all and wrote into a log nobody
+;; would ever commit. Three parked transactions in a row committed once.
+;;
+;; Pre-existing and reachable with no preemption at all, which is why the quantum is
+;; pinned long here: the park is the whole mechanism.
+(jolt-fiber-preempt-ticks-set! 100000000)
+(define l10b-r (jolt-ref-new 0))
+(define l10b-seen '())
+(define l10b-f
+  (sa-fiber-spawn
+   (lambda ()
+     (let loop ((i 0))
+       (when (< i 3)
+         (set! l10b-seen (cons (if (*txn*) 'in-a-txn 'clean) l10b-seen))
+         (jolt-sync
+          (lambda ()
+            (let ((v (jolt-ref-deref l10b-r)))
+              (jolt-fiber-park!)                 ; park INSIDE the transaction
+              (jolt-ref-set l10b-r (+ v 1)))))
+         (loop (+ i 1)))))))
+(let loop ((i 0))
+  (when (and (< i 20) (not (memq (jolt-fiber-state l10b-f) '(done dead))))
+    (sa-fiber-run-all)
+    (when (eq? 'parked (jolt-fiber-state l10b-f)) (sa-fiber-resume l10b-f))
+    (loop (+ i 1))))
+(ok "8a'. the fiber finished its three transactions"
+    (eq? 'done (jolt-fiber-state l10b-f)))
+(ok "8a'. each dosync started with no transaction running"
+    (equal? (reverse l10b-seen) '(clean clean clean)))
+(ok "8a'. so each one committed" (eqv? 3 (jolt-ref-val l10b-r)))
+;; The contended version: distinct transactions, and no update lost. This is the
+;; shape that measured 4 of 400 with the leak in place.
+(jolt-fiber-preempt-ticks-set! jolt-fiber-preempt-ticks-min)
+(define l10c-r (jolt-ref-new 0))
+(define l10c-txns '())
+(define l10c-N 40)
+(define (l10c-work)
+  (let loop ((i 0))
+    (when (< i l10c-N)
+      (jolt-sync
+       (lambda ()
+         (let ((t (*txn*)))
+           (unless (memq t l10c-txns) (set! l10c-txns (cons t l10c-txns))))
+         (let ((v (jolt-ref-deref l10c-r)))
+           ;; burn ticks so a preemption lands inside the transaction
+           (let spin ((k 0)) (when (fx<? k 2000) (spin (fx+ k 1))))
+           (jolt-ref-set l10c-r (+ v 1)))))
+      (loop (+ i 1)))))
+(define l10c-fs
+  (list (sa-fiber-spawn l10c-work) (sa-fiber-spawn l10c-work)
+        (sa-fiber-spawn l10c-work) (sa-fiber-spawn l10c-work)))
+(define l10c-before (jolt-fiber-preempts))
+(let loop ((i 0))
+  (when (and (< i 20000)
+             (not (for-all (lambda (f) (memq (jolt-fiber-state f) '(done dead))) l10c-fs)))
+    (sa-fiber-run-all)
+    (loop (+ i 1))))
+(ok "8a'. control: preemptions did land inside the transactions"
+    (> (jolt-fiber-preempts) l10c-before))
+(ok "8a'. every transaction was its own" (= (* 4 l10c-N) (length l10c-txns)))
+(ok "8a'. and no update was lost" (= (* 4 l10c-N) (jolt-ref-val l10c-r)))
+(jolt-fiber-preempt-ticks-set! #f)
+
+;; 8b. AND THE BODY IS PREEMPTIBLE (jolt-d7l5). Reason 3 of the monitor's three:
+;; a counted lock held for the body makes the fiber unpreemptible for the body,
+;; and a transaction body is arbitrary user code. Asserted on the count directly
+;; rather than by timing a starving sibling — jolt-locks-held is what the
+;; scheduler reads, so it is the property itself.
+(define l11-held (box #f))
+(define l11-f
+  (sa-fiber-spawn
+   (lambda () (jolt-sync (lambda () (set-box! l11-held (jolt-locks-held)))))))
+(sa-fiber-run-all)
+(ok "8b. a transaction body holds no counted lock" (eqv? 0 (unbox l11-held)))
+(ok "8b. and the transaction still ran" (eq? 'done (jolt-fiber-state l11-f)))
+
+(jolt-fiber-pool-reset!)
+
 (printf "\nfibers-lock-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "fibers-lock-test: PASS — monitors across a fiber switch\n") (exit 0))
