@@ -299,6 +299,63 @@
 (ok "6. monitor-exit without the monitor throws"
     (guard (e (#t #t)) (jolt-monitor-exit l7-obj) #f))
 
+;; --- 7. a fiber's own unwind releases, even past its vreg ---------------------
+;; Ownership by FIBER has one consequence that is not obvious and does not fail
+;; loudly. jolt-fiber-done!/dead! clear the current-fiber vreg BEFORE escaping, and
+;; the escape is what runs the fiber's winders — so a wind belonging to the fiber
+;; arrives at monitor-exit! off-fiber even though it is the owner.
+;;
+;; java/sm.ss makes that reachable on purpose: it handles a throwing CPS'd body with
+;; with-exception-handler rather than guard, so the handler runs at the raise point
+;; and jolt-fiber-dead! runs BEFORE the winders instead of after them. Refusing there
+;; left the monitor held for the life of the process and raised
+;; IllegalMonitorStateException out of an after-thunk, mid-escape, on top of a fiber
+;; that was already dying — so the next fiber to want that monitor simply waited
+;; forever with nothing to say why.
+;;
+;; The shape below is jolt-sm-drive's, written out rather than driven through the
+;; compiler, because what is under test is the handler discipline and not the CPS
+;; pass. fibers-sm-test.ss and run-gosm.ss cover the pass.
+(jolt-fiber-pool-reset!)
+(jolt-fiber-carrier-count-set! 1)
+(occ-reset!)
+(define l8-obj (vector 'l8))
+(define l8-later (box #f))
+(define l8-a
+  (sa-fiber-spawn
+   (lambda ()
+     (let ((f (jolt-current-fiber)))
+       (with-exception-handler
+         (lambda (e) (jolt-fiber-dead! f e))
+         (lambda ()
+           (jolt-with-monitor l8-obj (lambda () (occ-in!) (error 'l8 "boom")))))))))
+(guard (e (#t #f)) (sa-fiber-run-all))
+(ok "7. the fiber died" (eq? 'dead (jolt-fiber-state l8-a)))
+(define l8-b
+  (sa-fiber-spawn (lambda () (jolt-with-monitor l8-obj (lambda () (set-box! l8-later #t))))))
+(let loop ((i 0))
+  (when (and (< i 3) (not (unbox l8-later)))
+    (guard (e (#t #f)) (sa-fiber-run-all))
+    (loop (+ i 1))))
+(ok "7. and its unwind released the monitor it was holding" (unbox l8-later))
+(ok "7. so a later fiber gets it" (eq? 'done (jolt-fiber-state l8-b)))
+;; The narrowness is the point: the arm that accepts a terminal fiber's own unwind
+;; must not accept a LIVE fiber's monitor being released by anything else.
+(define l9-obj (vector 'l9))
+(define l9-held (box #f))
+(define l9-ch (ac-make 1 'fixed #f))
+(define l9-a
+  (sa-fiber-spawn
+   (lambda () (jolt-monitor-enter l9-obj) (set-box! l9-held #t) (jolt-fiber-<! l9-ch)
+              (jolt-monitor-exit l9-obj))))
+(sa-fiber-run-all)
+(ok "7. a live fiber's monitor cannot be released off-fiber"
+    (and (unbox l9-held)
+         (guard (e (#t #t)) (jolt-monitor-exit l9-obj) #f)))
+(jolt-async-give l9-ch 1)
+(sa-fiber-run-all)
+(ok "7. and the holder still releases it itself" (eq? 'done (jolt-fiber-state l9-a)))
+
 (jolt-fiber-pool-reset!)
 
 (printf "\nfibers-lock-test: ~a checks, ~a failure(s)\n" total fails)

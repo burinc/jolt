@@ -756,7 +756,7 @@
 ;; monitor primitive, and making one lock fiber-aware is not making all of them so.
 (define monitor-table (make-weak-eq-hashtable))
 (define monitor-table-lock (make-mutex))
-;; #(bk owner count cv fibers)
+;; #(bk owner count cv fibers box)
 ;;   bk     the bookkeeping mutex — held across a decision, never across a body
 ;;   owner  the FIBER when a fiber holds it, else the thread's interrupt box
 ;;          (current-interrupt-box, the identity the ReentrantLock uses, which is
@@ -764,15 +764,18 @@
 ;;   count  reentrancy depth for the owner
 ;;   cv     thread waiters; condition-wait releases bk atomically with blocking
 ;;   fibers parked fiber waiters, resumed by the release
+;;   box    the interrupt box of the thread the owner took it on — the THREAD
+;;          identity, which is what monitor-owner? needs when the owner is a fiber
 (define monitor-i-bk 0)
 (define monitor-i-owner 1)
 (define monitor-i-count 2)
 (define monitor-i-cv 3)
 (define monitor-i-fibers 4)
+(define monitor-i-box 5)
 (define (object-monitor obj)
   (jolt-with-mutex monitor-table-lock
     (or (hashtable-ref monitor-table obj #f)
-        (let ((m (vector (make-mutex) #f 0 (make-condition) '())))
+        (let ((m (vector (make-mutex) #f 0 (make-condition) '() #f)))
           (hashtable-set! monitor-table obj m) m))))
 
 ;; Who is asking. The FIBER when there is one, and this is the field that decides
@@ -781,6 +784,33 @@
 ;; answer. A fiber is only ever compared and used as a list element here, so nothing
 ;; depends on the record's shape.
 (define (monitor-self) (or (jolt-current-fiber) (current-interrupt-box)))
+
+;; Does `me` own m? Normally one eq?, and the second arm is not a loosening of it but
+;; the completion of it.
+;;
+;; A fiber's own winders run DURING its escape, and jolt-fiber-done! / jolt-fiber-dead!
+;; clear the current-fiber vreg before escaping. So a wind that belongs to the fiber —
+;; jolt-with-monitor's release, or a jolt `finally` calling the bare (monitor-exit x) —
+;; arrives here off-fiber even though it is the owner. java/sm.ss makes that reachable
+;; on purpose: it handles a throwing body with with-exception-handler rather than
+;; guard, precisely so the handler runs at the raise point, which puts dead! before the
+;; winders instead of after them. Refusing there left the monitor held for the life of
+;; the process and raised IllegalMonitorState out of an after-thunk, mid-escape, on top
+;; of an already-dying fiber.
+;;
+;; Narrow on purpose: the owner is a fiber, that fiber is TERMINAL, we are on the
+;; thread it ran on, and no fiber is mounted. A terminal fiber will never release the
+;; monitor itself, so the only alternative to accepting this is leaking it. A different
+;; fiber on the same carrier does not match (it has a current fiber), and neither does
+;; another thread (its interrupt box differs).
+(define (monitor-owner? m me)
+  (let ((owner (vector-ref m monitor-i-owner)))
+    (or (eq? owner me)
+        (and (jolt-fiber? owner)
+             (not (jolt-current-fiber))
+             (eq? (vector-ref m monitor-i-box) (current-interrupt-box))
+             (memq (jolt-fiber-state owner) '(done dead))
+             #t))))
 
 ;; Call with bk HELD; returns with it held again, and the caller RE-CHECKS — a wakeup
 ;; means "something changed", never "the monitor is yours".
@@ -811,6 +841,7 @@
              (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count))))
             ((not owner)
              (vector-set! m monitor-i-owner me)
+             (vector-set! m monitor-i-box (current-interrupt-box))
              (vector-set! m monitor-i-count 1))
             (else (monitor-wait! m) (loop))))))))
 
@@ -824,13 +855,14 @@
   (let ((me (monitor-self)))
     (let ((wake
            (jolt-with-mutex (vector-ref m monitor-i-bk)
-             (unless (eq? (vector-ref m monitor-i-owner) me)
+             (unless (monitor-owner? m me)
                (jolt-throw (jolt-host-throwable "java.lang.IllegalMonitorStateException"
                                                 "not lock owner")))
              (vector-set! m monitor-i-count (fx- (vector-ref m monitor-i-count) 1))
              (if (fx=? 0 (vector-ref m monitor-i-count))
                  (let ((fs (vector-ref m monitor-i-fibers)))
                    (vector-set! m monitor-i-owner #f)
+                   (vector-set! m monitor-i-box #f)
                    (vector-set! m monitor-i-fibers '())
                    (condition-broadcast (vector-ref m monitor-i-cv))
                    fs)
