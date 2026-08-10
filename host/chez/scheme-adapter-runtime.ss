@@ -231,7 +231,7 @@
 ;; (sa-foreign-procedure name args res) -> foreign procedure
 ;; SYNTAX: compile-time-typed foreign-procedure creation. (sa-foreign-procedure
 ;; "f" (int) int) lowers to (foreign-procedure "f" (int) int) — the compiled
-;; (non-Windows) branch of jolt-foreign-proc-safe / proc-foreign-blocking, where
+;; (non-Windows) branch of jolt-foreign-proc-safe / -blocking, where
 ;; the type signature is literal at the call site. Contract: build a foreign
 ;; procedure for a statically-known signature. Degradation: none — a target
 ;; expands this to its native foreign-procedure form.
