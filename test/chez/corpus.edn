@@ -4315,11 +4315,11 @@
   {:suite "interop / exceptions" :label "StackOverflowError is an Error with its own class" :expected "[true true]" :actual "(let [e (java.lang.StackOverflowError. \"so\")] [(instance? Error e) (= java.lang.StackOverflowError (class e))])" :portability :jvm}
   {:suite "interop / exceptions" :label "NoSuchElementException is a RuntimeException" :expected "true" :actual "(instance? RuntimeException (java.util.NoSuchElementException. \"n\"))" :portability :jvm}
   {:suite "interop / exceptions" :label "ArityException carries the JVM message" :expected "\"Wrong number of args (3) passed to: foo\"" :actual "(ex-message (clojure.lang.ArityException. 3 \"foo\"))" :portability :jvm}
-  {:suite "conformance / destructuring" :label "rest-pattern positional elements walk the seq (a map destructures)" :expected "[:a 1 ([:b 2])]" :actual "(let [[[k v] & ks] {:a 1 :b 2}] [k v ks])" :portability :common}
-  {:suite "conformance / destructuring" :label "rest-pattern over a vector unchanged" :expected "[1 2 (3 4)]" :actual "(let [[a b & r] [1 2 3 4]] [a b r])" :portability :common}
+  {:suite "conformance / destructuring" :label "rest-pattern positional elements walk the seq (a map destructures)" :expected "[:a 1 (quote ([:b 2]))]" :actual "(let [[[k v] & ks] {:a 1 :b 2}] [k v ks])" :portability :common}
+  {:suite "conformance / destructuring" :label "rest-pattern over a vector unchanged" :expected "[1 2 (quote (3 4))]" :actual "(let [[a b & r] [1 2 3 4]] [a b r])" :portability :common}
   {:suite "conformance / regex" :label "hex escapes match their characters" :expected "\"aAb\"" :actual "(re-find #\"a\\x41b\" \"aAb\")" :portability :common}
   {:suite "interop / class model" :label "str of a named fn is class@hash" :expected "true" :actual "(boolean (re-find #\"^clojure\\.core\\$inc@\" (str inc)))" :portability :jvm}
-  {:suite "conformance / seq" :label "keys and vals accept a seq of map entries" :expected "[(:a :c) (1 3)]" :actual "(let [es (filter (fn [[k v]] (odd? v)) {:a 1 :b 2 :c 3})] [(keys es) (vals es)])" :portability :common}
+  {:suite "conformance / seq" :label "keys and vals accept a seq of map entries" :expected "[(quote (:a :c)) (quote (1 3))]" :actual "(let [es (filter (fn [[k v]] (odd? v)) {:a 1 :b 2 :c 3})] [(keys es) (vals es)])" :portability :common}
   {:suite "conformance / regex" :label "unicode escapes match their characters" :expected "\"A\"" :actual "(re-find #\"\\u0041\" \"zAz\")" :portability :common}
   {:suite "interop / strings" :label "String repeat and isBlank" :expected "[\"ababab\" true false]" :actual "[(.repeat \"ab\" 3) (.isBlank \"  \") (.isBlank \"a\")]" :portability :jvm}
   {:suite "interop / io" :label "*out* is a java.io.Writer" :expected "true" :actual "(instance? java.io.Writer *out*)" :portability :jvm}
@@ -4374,7 +4374,7 @@
   ;; ============================================================================
   ;; conformance / hamt-order — JVM PersistentHashMap/HashSet iteration order (Stage 2)
   ;; ============================================================================
-  {:suite "conformance / hamt-order" :label "zipmap 12 entries hash-iteration order" :expected "([0 0] [7 7] [1 1] [4 4] [6 6] [3 3] [2 2] [11 11] [9 9] [5 5] [10 10] [8 8])" :actual "(pr-str (seq (zipmap (range 12) (range 12))))" :portability :common}
+  {:suite "conformance / hamt-order" :label "zipmap 12 entries hash-iteration order" :expected "\"([0 0] [7 7] [1 1] [4 4] [6 6] [3 3] [2 2] [11 11] [9 9] [5 5] [10 10] [8 8])\"" :actual "(pr-str (seq (zipmap (range 12) (range 12))))" :portability :common}
   ;; ============================================================================
   ;; conformance / stage3 — drop insertion-order accommodations
   ;; ============================================================================
@@ -4505,15 +4505,15 @@
   {:suite "munging / jolt-nil local" :label "a local named jolt-nil must not shadow the runtime nil" :expected "nil" :actual "(let [jolt-nil 5] nil)" :portability :common}
   {:suite "munging / fl+ local" :label "a local named fl+ must not shadow the flonum add" :expected "3.0" :actual "(let [fl+ 1] (+ fl+ 2.0))" :portability :common}
   {:suite "munging / var-deref local" :label "a local named var-deref must not shadow the runtime var-deref" :expected "9" :actual "(let [var-deref 9] var-deref)" :portability :common}
-  {:suite "reader / float N suffix" :label "1e2N rejects float with N suffix" :expected "throws" :actual "(read-string \"1e2N\")" :portability :common}
-  {:suite "reader / surrogate in string" :label "\\ud800 in string throws Invalid character constant" :expected "throws" :actual "(read-string \"\\\"\\\\ud800\\\"\")" :portability :common}
-  {:suite "reader / top-level splice" :label "#?@ at top level throws" :expected "throws" :actual "(read-string \"#?@(:clj [1])\")" :portability :common}
+  {:suite "reader / float N suffix" :label "1e2N rejects float with N suffix" :expected :throws :actual "(read-string \"1e2N\")" :portability :common}
+  {:suite "reader / surrogate in string" :label "\\ud800 in string throws Invalid character constant" :expected :throws :actual "(read-string \"\\\"\\\\ud800\\\"\")" :portability :common}
+  {:suite "reader / top-level splice" :label "#?@ at top level throws" :expected :throws :actual "(read-string \"#?@(:clj [1])\")" :portability :common}
   {:suite "reader / record literal" :label "#ns.Type{} constructs record in read-string" :expected "42" :actual "(do (defrecord Rdlit [a]) (:a (read-string \"#user.Rdlit{:a 42}\")))" :portability :common}
   {:suite "reader / record vector ctor" :label "#ns.Type[] constructs record from vector" :expected "\"a\"" :actual "(do (defrecord Rdlvec [x y]) (:x (read-string \"#user.Rdlvec[\\\"a\\\" 2]\")))" :portability :common}
   {:suite "reader / qualified arrow call" :label "a qualified ->name call is a list, not a record ctor to apply" :expected "true" :actual "(= (list 'u/->long 1) (read-string \"(u/->long 1)\"))" :portability :common}
   {:suite "reader / qualified arrow call" :label "a qualified map->name call is a list too" :expected "true" :actual "(= (list 'u/map->Foo {:a 1}) (read-string \"(u/map->Foo {:a 1})\"))" :portability :common}
-  {:suite "reader / EOF in unicode escape" :label "\\\\u with <4 hex digits throws" :expected "throws" :actual "(read-string \"\\\"\\\\uD\\\"\")" :portability :common}
-  {:suite "reader / EOF in regex backslash" :label "trailing backslash in regex throws" :expected "throws" :actual "(read-string \"#\\\"a\\\\\")" :portability :common}
+  {:suite "reader / EOF in unicode escape" :label "\\\\u with <4 hex digits throws" :expected :throws :actual "(read-string \"\\\"\\\\uD\\\"\")" :portability :common}
+  {:suite "reader / EOF in regex backslash" :label "trailing backslash in regex throws" :expected :throws :actual "(read-string \"#\\\"a\\\\\")" :portability :common}
   {:suite "syntax-quote / defmacro qualified" :label "`defmacro qualifies to ns, not bare" :expected "true" :actual "(not= 'defmacro (second (read-string \"`defmacro\")))" :portability :common}
   {:suite "syntax-quote / catch bare" :label "`catch stays bare (special form)" :expected "true" :actual "(= 'catch (second (read-string \"`catch\")))" :portability :common}
   {:suite "syntax-quote / reify* bare" :label "`reify* stays bare (special form)" :expected "true" :actual "(= 'reify* (second (read-string \"`reify*\")))" :portability :common}
@@ -4531,7 +4531,7 @@
  ;; Stage C — positional ctor throws on wrong arity
  {:suite "records / ctor-arity" :label "positional ctor throws on 1 arg for 2-field record" :expected ":arity-throw" :actual "(do (defrecord ArC9 [x y]) (try (->ArC9 1) (catch Exception e :arity-throw)))" :portability :common}
  ;; Stage D — range step 0 repeats infinitely
- {:suite "seq / range-step-zero" :label "range step 0 repeats start infinitely" :expected "(5 5 5)" :actual "(take 3 (range 5 10 0))" :portability :jvm}
+ {:suite "seq / range-step-zero" :label "range step 0 repeats start infinitely" :expected "(quote (5 5 5))" :actual "(take 3 (range 5 10 0))" :portability :jvm}
  ;; Stage D — binding does not auto-deref var-cell
  {:suite "binding / no-auto-deref" :label "binding does not auto-deref var-cell value" :expected "\"clojure.lang.Var\"" :actual "(do (def ^:dynamic *bd11* 10) (def bd11v 20) (.getName (class (binding [*bd11* (var bd11v)] *bd11*))))" :portability :common}
   {:suite "sorted / subseq seek" :label "boundary comparators map+set batch" :expected "'[([2 :b] [3 :c]) ([1 :a] [2 :b]) ([1 :a] [2 :b]) ([3 :c] [2 :b]) (5 9) (5 1) nil nil]" :actual "[(subseq (sorted-map 1 :a 2 :b 3 :c) >= 2) (subseq (sorted-map 1 :a 2 :b 3 :c) < 3) (subseq (sorted-map 1 :a 2 :b 3 :c) <= 2) (rsubseq (sorted-map 1 :a 2 :b 3 :c) > 1) (subseq (sorted-set 1 5 9) > 4) (rsubseq (sorted-set 1 5 9) < 6) (subseq (sorted-map) > 1) (subseq (sorted-map 5 :e) > 5)]" :portability :common}

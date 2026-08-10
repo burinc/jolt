@@ -1,5 +1,5 @@
 {:doc
- "Rows of test/chez/corpus.edn whose :expected differs from reference JVM Clojure. The corpus is JVM-sourced (regen-corpus.clj), so this list is only the rows whose JVM value is an opaque host object that cannot round-trip to readable source — Java arrays, transients, atoms, beans, proxies, and chunks print as #object[..@addr] with a per-run identity — plus the (fn* foo) strictness case. For that the corpus keeps jolt's value. certify.clj gates on NEW (unlisted) divergences and STALE entries. Keyed by [suite label].",
+ "Rows of test/chez/corpus.edn whose :expected differs from reference JVM Clojure. The corpus is JVM-sourced (regen-corpus.clj), so this list is only the rows whose JVM value is an opaque host object that cannot round-trip to readable source — Java arrays, transients, atoms, beans, proxies, and chunks print as #object[..@addr] with a per-run identity — plus the (fn* foo) strictness case. For that the corpus keeps jolt's value. The second class is rows where the JVM RAISES and jolt answers a value (certify's :jvm-raises) — a jolt superset, gated since the bucket split. certify.clj gates on NEW (unlisted) divergences and STALE entries. Keyed by [suite label].",
  :legend
  {:numeric-model
   "jolt has the full numeric tower (exact integer / Ratio / double / BigDecimal); binary ops dispatch by operand category with JVM contagion rules",
@@ -97,9 +97,8 @@
   ;; :long specialization, so the loop var stays generic and jolt computes the EXACT
   ;; bignum sum — where the JVM keeps `i` a primitive long and the add overflows. This
   ;; IS a corpus row (3754, "literal-init loop var + bignum-literal stays generic
-  ;; (exact)"), pinned jolt-side: it buckets as :jvm-error in certify (the :actual throws
-  ;; on the JVM), which is informational — not gated — so it lives in :documented, not
-  ;; in :entries (which certify would flag as stale).
+  ;; (exact)"): the :actual throws on the JVM, so certify buckets it :jvm-raises, which
+  ;; IS gated — the row is classified in :entries and the prose stays here.
   ;; jolt's dot form reads a plain map as an object: (. m member) calls a stored fn
   ;; with the map as self and otherwise reads the key, and (.-member m) reads the
   ;; key (dot-forms.ss's precedence note). The JVM has no fields on a
@@ -492,4 +491,139 @@
    {:suite "string-model / codepoint strings", :label "charAt of an astral character is the codepoint", :category :string-model}
    {:suite "concurrency-model / compare-and-set!", :label "value equality where JVM uses identity", :category :concurrency-model}
    {:suite "reader-model / read-eval", :label "#= is inert data", :category :reader-model}
-   {:suite "permissive / empty MapEntry", :label "empty of a map entry", :category :permissive}]}
+   ;; A \ud800 escape names half a surrogate pair, which is not a scalar value a
+   ;; code-point string can hold, so jolt's reader rejects it where the JVM reads a
+   ;; one-char string holding the unpaired half. Same model as the astral entries
+   ;; above, at read time rather than at index time.
+   {:suite "reader / surrogate in string", :label "\\ud800 in string throws Invalid character constant", :category :string-model}
+   {:suite "permissive / empty MapEntry", :label "empty of a map entry", :category :permissive}
+
+   ;; ==========================================================================
+   ;; Rows where the JVM RAN the program and RAISED while jolt answers a value
+   ;; (certify's :jvm-raises). These were filed as "not certifiable" and skipped
+   ;; until the bucket was split, which is how a wrong :expected on
+   ;; (.-value {:value 41}) survived. Classified below; none is a jolt bug.
+   ;; ==========================================================================
+
+   ;; jolt's conj! is variadic; the JVM's is [coll x] and raises on a third arg.
+   ;; The rows are about nil elements and dedup, not about arity — they just
+   ;; happen to be written in the multi-arg form.
+   {:suite "set / nil element", :label "transient conj! nil", :category :permissive}
+   {:suite "set / nil element", :label "transient contains? nil", :category :permissive}
+   {:suite "set / nil element", :label "transient disj! nil cnt", :category :permissive}
+   {:suite "set / nil element", :label "transient disj! removes", :category :permissive}
+   {:suite "transient / set", :label "conj! dedups", :category :permissive}
+   {:suite "transient / set", :label "map elements by value", :category :permissive}
+   {:suite "transient / vector", :label "conj! many args", :category :permissive}
+
+   ;; A jolt map answers member access with its key: (.-k m), (. m k), and a
+   ;; method-shaped value called with the map as self. The JVM's Reflector has no
+   ;; field or method of that name and raises. Deliberate superset (dot-forms.md).
+   {:suite "interop / dot forms", :label "field access .-", :category :permissive}
+   {:suite "interop / dot forms", :label "dot field keyword", :category :permissive}
+   {:suite "interop / dot forms", :label "method call", :category :permissive}
+   {:suite "interop / dot forms", :label "method with args", :category :permissive}
+
+   ;; Operations with one reasonable meaning that the JVM nevertheless rejects:
+   ;; a char match with a string replacement (JVM demands both be chars); a
+   ;; :rounding mode named by keyword rather than by the RoundingMode field
+   ;; symbol; a ^long hint on a local with a primitive initializer; a plain
+   ;; hierarchy map where the JVM wants an IRef; keys over a seq of pairs.
+   {:suite "clojure.string / replace", :label "char match, string replacement", :category :permissive}
+   {:suite "core / with-precision", :label "rounding arg accepted", :category :permissive}
+   {:suite "metadata / type hints", :label "type hint in let", :category :permissive}
+   {:suite "multimethods / hierarchies", :label "explicit :hierarchy", :category :permissive}
+   {:suite "permissive / keys on pair vector", :label "keys works on vector of pairs", :category :permissive}
+
+   ;; with-open closes anything carrying a :close fn; the JVM demands a member
+   ;; named close and raises on a map. line-seq and file-seq are the same shape:
+   ;; jolt duck-types the reader and takes a path string, where the JVM insists on
+   ;; BufferedReader and java.io.File. (*in* under with-in-str is a
+   ;; LineNumberingPushbackReader, which is not a BufferedReader even on the JVM.)
+   {:suite "core / with-open", :label "binding visible", :category :host-model}
+   {:suite "core / with-open", :label "body result", :category :host-model}
+   {:suite "core / with-open", :label "close runs", :category :host-model}
+   {:suite "core / with-open", :label "nested close order", :category :host-model}
+   {:suite "io / line-seq", :label "line-seq", :category :host-model}
+   {:suite "io / line-seq", :label "line-seq count", :category :host-model}
+   {:suite "io / line-seq", :label "line-seq empty", :category :host-model}
+   {:suite "io / line-seq", :label "line-seq is lazy seq", :category :host-model}
+   {:suite "io / slurp, spit, printf, flush (host-classified)", :label "file-seq finds files", :category :host-model}
+
+   ;; A class is named by a symbol in jolt's class model, so extend/extends?/supers
+   ;; take one where the JVM casts to java.lang.Class and raises.
+   {:suite "untested / protocols: extend + extends?", :label "extend registers", :category :host-model}
+   {:suite "untested / protocols: extend + extends?", :label "extend two methods", :category :host-model}
+   {:suite "untested / protocols: extend + extends?", :label "extends? after extend", :category :host-model}
+   {:suite "untested / protocols: extend + extends?", :label "extends? without", :category :host-model}
+   {:suite "core / extenders", :label "extends? on inline defrecord impl", :category :host-model}
+   {:suite "clojure.core / leaf batch (complement fnil munge etc.)", :label "supers empty set", :category :host-model}
+
+   ;; Array and JVM-shape stubs: jolt has no primitive arrays, no proxies and no
+   ;; Iterator/Enumeration, so to-array yields a vector, the aset-<prim> family
+   ;; writes into it, the coercion views are identity, and the proxy fns answer
+   ;; for the nil proxy the JVM dereferences. Whole suites of documented stubs.
+   {:suite "untested / array stubs (vectors + host buffers)", :label "aset-boolean", :category :host-model}
+   {:suite "untested / array stubs (vectors + host buffers)", :label "aset-byte", :category :host-model}
+   {:suite "untested / array stubs (vectors + host buffers)", :label "aset-char", :category :host-model}
+   {:suite "untested / array stubs (vectors + host buffers)", :label "aset-double", :category :host-model}
+   {:suite "untested / array stubs (vectors + host buffers)", :label "aset-float", :category :host-model}
+   {:suite "untested / array stubs (vectors + host buffers)", :label "aset-int", :category :host-model}
+   {:suite "untested / array stubs (vectors + host buffers)", :label "aset-long", :category :host-model}
+   {:suite "untested / array stubs (vectors + host buffers)", :label "aset-short", :category :host-model}
+   {:suite "untested / typed coercion views", :label "booleans", :category :host-model}
+   {:suite "untested / typed coercion views", :label "bytes view", :category :host-model}
+   {:suite "untested / typed coercion views", :label "chars first", :category :host-model}
+   {:suite "untested / typed coercion views", :label "ints", :category :host-model}
+   {:suite "untested / typed coercion views", :label "longs", :category :host-model}
+   {:suite "untested / typed coercion views", :label "shorts", :category :host-model}
+   {:suite "untested / JVM-shape stubs (documented jolt behavior)", :label "enumeration-seq", :category :host-model}
+   {:suite "untested / JVM-shape stubs (documented jolt behavior)", :label "iterator-seq", :category :host-model}
+   {:suite "untested / JVM-shape stubs (documented jolt behavior)", :label "init-proxy", :category :host-model}
+   {:suite "untested / JVM-shape stubs (documented jolt behavior)", :label "proxy-call-with-super calls", :category :host-model}
+   {:suite "untested / JVM-shape stubs (documented jolt behavior)", :label "proxy-mappings", :category :host-model}
+   {:suite "untested / JVM-shape stubs (documented jolt behavior)", :label "update-proxy", :category :host-model}
+
+   ;; Host classes jolt models rather than wraps: no ctor/method overload set to
+   ;; resolve against, so (Long. 42) / .shiftLeft on an integer / (Date. ts) /
+   ;; (SimpleDateFormat. pattern locale-id) all work where the JVM finds no
+   ;; matching member. String/valueOf answers for the Object overload the JVM only
+   ;; reaches with an explicit cast (a literal nil there selects char[] and NPEs).
+   ;; The SimpleDateFormat rows are the locale-id extension point of the
+   ;; :documented entry above.
+   {:suite "host-interop / UUID + Long + shiftLeft", :label "(UUID. msb lsb), .shiftLeft, (Long. n)", :category :host-model}
+   {:suite "host-interop / migratus class shims", :label "Timestamp is millis", :category :host-model}
+   {:suite "interop / String methods", :label "String/valueOf nil", :category :host-model}
+   {:suite "time / sdf locale names", :label "explicit ROOT locale id renders ROOT names", :category :host-model}
+   {:suite "time / sdf locale names", :label "numeric pattern ignores the locale id", :category :host-model}
+   {:suite "time / sdf locale names", :label "unregistered locale id falls back to ROOT", :category :host-model}
+
+   ;; A jolt chunk IS a vector, so vec accepts one; the JVM's ArrayChunk is not
+   ;; convertible to Object[]. Representation, not granularity.
+   {:suite "chunked-seq / over a vector", :label "chunk-first window past the first block", :category :host-model}
+
+   ;; .unread takes a char on jolt; the JVM's Reflector will not pass a Character to
+   ;; unread(int) and finds no 1-arg overload. (Both of these surfaced once certify
+   ;; started supplying the bare class names jolt resolves out of the box — before
+   ;; that the rows failed at PushbackReader/StringWriter and were filed unresolved.)
+   {:suite "interop / PushbackReader & parse statics", :label "unread accepts a char", :category :permissive}
+   ;; print-method dispatches on the printer's type token — :number for an integer,
+   ;; verified against the binary — where the JVM dispatches on (class x). So a
+   ;; defmethod keyed by :number fires here and never matches there. jolt's own
+   ;; (class 42) is still "java.lang.Long"; only the printer's dispatch differs.
+   {:suite "io / print-method multimethod", :label "direct builtin override", :category :host-model}
+
+   ;; ns-aliases takes no argument on jolt (it answers for the current ns);
+   ;; the JVM's is 1-arity and raises on the 0-arity call.
+   {:suite "namespaces / unified alias store", :label "alias fn visible to ns-aliases", :category :namespace-model}
+   {:suite "namespaces / unified alias store", :label "ns-unalias removes both views", :category :namespace-model}
+   {:suite "namespaces / unified alias store", :label "require :as registers the alias", :category :namespace-model}
+
+   ;; One integer type: an N suffix on a radix literal is a no-op rather than a
+   ;; parse error, and %x formats a bignum instead of rejecting it for not being
+   ;; a BigInteger. A loop var initialized from a literal promotes past 2^63
+   ;; where the JVM's primitive long raises.
+   {:suite "reader / radix N suffix", :label "2r1010N reads as integer 10", :category :reader-model}
+   {:suite "reader-model / nested fn literals", :label "nested #() reads", :category :reader-model}
+   {:suite "numbers / unsigned string conversions", :label "past 64 bits it is a signed magnitude, not a wrap", :category :integer-box-model}
+   {:suite "conformance / numeric pass", :label "literal-init loop var + bignum-literal stays generic (exact)", :category :numeric-model}]}
