@@ -765,6 +765,25 @@
 ;; Caveat: a thread blocked in a __collect_safe foreign call (socket recv/accept,
 ;; sleep) only sees the interrupt when it returns to Scheme — like the JVM not
 ;; killing native code.
+;;
+;; This BORROWS the timer, and on a fiber the timer belongs to the scheduler: it
+;; is what preempts a compute-bound fiber so the ones queued behind it on the same
+;; carrier are not starved. So both halves have to go back, the handler and the
+;; tick. Every exit below used to end with a bare (set-timer 0), which returns the
+;; handler and keeps the tick, and only the fiber's NEXT dispatch arms again — so a
+;; fiber that borrowed the timer once and then never parked pinned its carrier
+;; (jolt-ly62). jolt-fiber-rearm-preempt! puts it back, and does nothing off a
+;; fiber, where there was never anything armed to restore.
+;;
+;; It lives in fibers.ss, which rt.ss loads AFTER this file; the reference resolves
+;; at call time, the same forward reference async.ss makes to jolt-fiber-go-spawn
+;; and for the same reason. No fiber can exist before the boot finishes loading.
+;;
+;; There are two exits, not one: the guard re-raises past the call/cc, so it never
+;; reaches the lines after it and has to hand the timer back itself. The
+;; (set-timer 0) between the thunk and the outer restore stays a plain disarm on
+;; purpose — the borrower's handler is still installed there, and arming a fiber
+;; quantum into it would let the borrow outlive itself.
 (define interrupt-check-ticks 100000)   ; ~poll interval; responsive + low overhead
 (define interrupt-sentinel (cons 'jolt 'interrupted))
 (define jolt-kw-interrupted (keyword "jolt" "interrupted"))
@@ -784,10 +803,14 @@
                  ;; guard ensures timer+handler are disarmed on EVERY exit from
                  ;; the thunk — normal return, exception raise, and escape-continuation
                  ;; jump (the outer set-timer/handler handles the interrupt case).
-                 (guard (e (#t (set-timer 0) (timer-interrupt-handler prev-handler) (raise e)))
+                 (guard (e (#t (set-timer 0)
+                               (timer-interrupt-handler prev-handler)
+                               (jolt-fiber-rearm-preempt!)
+                               (raise e)))
                    (let ((v (thunk))) (set-timer 0) v))))))
       (set-timer 0)
       (timer-interrupt-handler prev-handler)
+      (jolt-fiber-rearm-preempt!)
       (if (eq? r interrupt-sentinel)
           (jolt-throw (jolt-ex-info "Evaluation interrupted" (jolt-hash-map jolt-kw-interrupted #t)))
           r))))

@@ -846,6 +846,28 @@
   (set-timer jolt-fiber-preempt-ticks-global))
 (define (jolt-fiber-disarm-preempt!) (set-timer 0))
 
+;; Hand the timer back to the scheduler after something else borrowed it.
+;;
+;; The one borrower is jolt-run-interruptible (java/concurrency.ss), which saves
+;; the handler, installs one of its own, and arms its own tick. Restoring the
+;; HANDLER is only half of it: the timer is the other half, and a bare
+;; (set-timer 0) on the way out left the fiber running with nothing to preempt it
+;; until its next dispatch — a compute-bound fiber that borrowed the timer once
+;; then pinned its carrier for as long as it liked. That is the starvation window
+;; the head of this section says no setting can open, reachable from ordinary
+;; jolt code through jolt.host/run-interruptible (jolt-ly62).
+;;
+;; Off a fiber it stays disarmed, which is not a fallback but the same rule
+;; jolt-fiber-run follows: a timer over the scheduler would park the carrier's own
+;; loop, and a plain thread has nothing to preempt.
+;;
+;; The caller must restore the handler BEFORE calling this. Arming first would
+;; leave a window where a fiber's quantum can fall due while the borrower's
+;; handler is still installed, and that handler answers a quantum by re-arming
+;; its own tick — so the borrow would silently outlive itself.
+(define (jolt-fiber-rearm-preempt!)
+  (if (jolt-current-fiber) (jolt-fiber-arm-preempt!) (set-timer 0)))
+
 ;; --- monitors (the observable half of swish's, erlang.ss:434) ----------------
 ;; A fiber that dies is otherwise unobservable. fibers-async.ss and sm.ss both
 ;; handle a throwing go body the same way — report it and close the result

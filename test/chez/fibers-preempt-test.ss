@@ -341,6 +341,65 @@
 (ok "10. reading the depth did not re-enter the handler" (not re-entered))
 (ok "10. depth back to 0 after the handler storm" (= 0 (jolt-current-disable-count)))
 
+;; --- 11. handing the timer back leaves the fiber preemptible ----------------
+;; jolt.host/run-interruptible (concurrency.ss) borrows the timer: it saves the
+;; handler, installs one that escapes when an interrupt token is set, and arms a
+;; tick of its own. Restoring the HANDLER on the way out is enough on a thread and
+;; not on a fiber, because the timer is the other half — a bare (set-timer 0)
+;; leaves the fiber running with nothing to preempt it, and only its next dispatch
+;; arms again. So a fiber that calls it and then never parks pins its carrier for
+;; as long as it likes, which is precisely the starvation window the top of
+;; fibers.ss says no setting can open (jolt-ly62).
+;;
+;; ONE carrier, so B has nowhere else to go, and A borrows the timer with a token
+;; nobody ever sets and then spins without parking. B runs only if A was preempted
+;; AFTER run-interruptible returned. Unfixed, B never runs at all.
+(jolt-fiber-pool-reset!)
+(jolt-fiber-carrier-count-set! 1)
+(jolt-fiber-preempt-ticks-set! 20000)
+
+(define ri-stop (box #f))
+(define ri-b-ran (box #f))
+(define ri-returned (box #f))
+(define ri-before (jolt-fiber-preempts))
+(define ri-a
+  (sa-fiber-spawn
+   (lambda ()
+     ;; a token nobody sets: the thunk simply returns and the borrow ends
+     (jolt-run-interruptible (jolt-make-interrupt) (lambda () 42))
+     (set-box! ri-returned #t)
+     (spin-until ri-stop))))
+(define ri-b (sa-fiber-spawn (lambda () (set-box! ri-b-ran #t))))
+(jolt-fiber-ensure-carrier!)
+(define ri-b-ran-while-a-spins?
+  (wait-until (lambda () (unbox ri-b-ran)) 5.0
+              "11. the queued fiber runs after the timer is handed back"))
+(ok "11. A did return from run-interruptible" (unbox ri-returned))
+(ok "11. the spinner was preempted after the borrow ended"
+    (> (jolt-fiber-preempts) ri-before))
+(ok "11. and the queued fiber ran without the spinner yielding"
+    (and ri-b-ran-while-a-spins? (not (unbox ri-stop))))
+(set-box! ri-stop #t)
+(wait-until (lambda () (eq? 'done (jolt-fiber-state ri-a))) 5.0 "11. spinner completes")
+(ok "11. the spinner still completed normally" (eq? 'done (jolt-fiber-state ri-a)))
+;; The borrow must still WORK, or the fix above could be "never install the
+;; handler". A token set before the call makes the first tick escape, and the
+;; escape reaches the fiber as the ordinary interrupted ex-info.
+(define ri-tok (jolt-make-interrupt))
+(jolt-interrupt! ri-tok)
+(ok "11. an interrupt still aborts the thunk on a fiber"
+    (let ((caught (box #f)))
+      (let ((f (sa-fiber-spawn
+                (lambda ()
+                  (guard (e (#t (set-box! caught #t)))
+                    (jolt-run-interruptible
+                     ri-tok
+                     (lambda () (let loop ((i 0)) (if (fx=? i 100000000) i (loop (fx+ i 1)))))))))))
+        (jolt-fiber-ensure-carrier!)
+        (wait-until (lambda () (memq (jolt-fiber-state f) '(done dead))) 20.0
+                    "11. the interrupted fiber finishes")
+        (unbox caught))))
+
 (printf "\nfibers-preempt-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "fibers-preempt-test: PASS — preemptive scheduling\n") (exit 0))
