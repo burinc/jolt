@@ -366,6 +366,54 @@
   (cons "a park, then a wind"     "(go (do (<! ch) (try :a (finally :b))))")
   (cons "a wind, then a park"     "(go (do (try :a (finally :b)) (<! ch)))")))
 
+;; --- 1d. the winds the scan above CANNOT see --------------------------------
+;; What 1c reads is the emitted Scheme, so it only ever sees a wind the BACK END
+;; emitted — `try` and `binding`, which is why both appear in its list and why both
+;; cases there are non-vacuous. A host procedure that TAKES A THUNK and winds around
+;; the call is invisible to it: the emission holds a call and a lambda, and the
+;; dynamic-wind is inside the callee. Verified, not assumed — the emission for a take
+;; inside `locking` contains no "(dynamic-wind" at all, so 1c would pass on it whether
+;; the park were rewritten or not.
+;;
+;; jolt.host/with-monitor (clojure.core/locking, java/concurrency.ss) is the member of
+;; that class that matters, because its wind is what releases the monitor. A cheap park
+;; inside it would be the leak that shape is worst at: the escape skips the release
+;; (jolt-park-unwinding?) and the resume comes back through the fiber thunk with the
+;; wind gone, so nothing ever releases it and every later contender waits forever with
+;; no error anywhere.
+;;
+;; What keeps that from happening is `fn*` being opaque to the pass: `locking` hands its
+;; body over as a thunk, the pass never descends into it, and the park inside falls back
+;; to a capture, which rewinds properly. That is also the only way in — a park inside a
+;; thunk cannot become visible to the pass without the pass descending into fn* — and 1b
+;; already fails the day fn* leaves sm-opaque. Checked by mutation: dropping it fails 1a
+;; and 1b and then makes the emission uncompilable, so this is not the thin end of that
+;; wedge and does not pretend to be.
+;;
+;; What it adds is the CONSEQUENCE, asserted where the answer lives instead of inferred
+;; across two files and a set membership, and — the half nothing else covers — that the
+;; monitor is really RELEASED after a captured park inside it, which is the property
+;; jolt-with-monitor's after-thunk exists for (see the counter case in section 2).
+;; Nesting, as in 1c, not the presence of a monitor: the controls below are the shapes
+;; that must keep their cheap park.
+(define (emits-park? src) (gate-sub? (emit-scheme src) sm-call-take))
+(ev "(def mobj (Object.))")
+;; not vacuous: the pass DID engage on this body, it just declined that site
+(gate-check "1d. a body with a monitor is still CPS'd"
+            (gate-sub? (emit-scheme "(go (do (locking mobj :a) (<! ch)))") "\"__sm-spawn\"") #t)
+(gate-check "1d. and the monitor call is really in the emission"
+            (gate-sub? (emit-scheme "(go (locking mobj (<! ch)))") "\"with-monitor\"") #t)
+;; the invariant
+(gate-check "1d. a park inside locking is NOT rewritten"
+            (emits-park? "(go (locking mobj (<! ch)))") #f)
+(gate-check "1d. nor one nested deeper inside it"
+            (emits-park? "(go (locking mobj (let [v (<! ch)] (inc v))))") #f)
+;; and the control, so the check constrains where the monitor is and not that it exists
+(gate-check "1d. a park AFTER the monitor form still is"
+            (emits-park? "(go (do (locking mobj :a) (<! ch)))") #t)
+(gate-check "1d. and one before it"
+            (emits-park? "(go (do (<! ch) (locking mobj :a)))") #t)
+
 ;; --- 2. the counters, on the :fiber backend ---------------------------------
 (printf "\n== 2. cheap parks vs captures, per park site ==\n")
 ;; A helper the pass cannot see through. Its <! parks by capturing.
@@ -474,6 +522,29 @@
 (gate-check "go-loop: summed" (car r-loop) 6)
 (gate-check "go-loop: no captures" (caddr r-loop) 0)
 (gate-check "go-loop: parked cheaply" (> (cadr r-loop) 0) #t)
+
+;; a park inside `locking`: 1d says the pass declines that site on the emission, and
+;; this says what that buys at run time. The capture rewinds the chain, so the wind is
+;; put back and the monitor is released on the way out — which the second go block
+;; proves by getting the monitor at all. Unfixed, it would still answer 42 and then
+;; wedge the next contender, so the value alone is not the check.
+(define r-lock
+  (fiber-run "locking"
+             (string-append
+              "(clojure.core.async/go"
+              "  (locking mobj (inc (clojure.core.async/<! __ch))))")
+             (list (after-capture "locking" 1 "41"))))
+(gate-check "park inside locking: value" (car r-lock) 42)
+(gate-check "park inside locking: no cheap park" (cadr r-lock) 0)
+(gate-check "park inside locking: one capture" (caddr r-lock) 1)
+(gate-check "park inside locking: the monitor was released"
+            (jolt-pr-str
+             (ev (string-append
+                  "(binding [clojure.core.async/*go-backend* :fiber]"
+                  "  (first (clojure.core.async/alts!!"
+                  "    [(clojure.core.async/go (locking mobj :got))"
+                  "     (clojure.core.async/timeout 10000)])))")))
+            ":got")
 
 ;; --- the PUT side, which nothing here covered (jolt-eo4j) --------------------
 ;; Every parking op above is a take. sm-cps picks __sm-put for >! / >!! the same

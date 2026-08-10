@@ -882,10 +882,22 @@
 ;; same one load-namespace* uses to keep its claim across a park. A raise and
 ;; run-interruptible's escape are REAL exits and answer #f, so those still release.
 ;;
-;; This leans on `locking` being opaque to the CPS pass in clojure.core.async, which
-;; it is because it takes a thunk: a CHEAP park never rewinds, so it would skip this
-;; after-thunk and never come back to it, and the monitor would leak. That is the same
-;; thing parameterize and binding rely on, and sm.ss's invariant names all three.
+;; WHAT THIS AFTER-THUNK RESTS ON, and where it is checked. A CHEAP park (java/sm.ss)
+;; never rewinds: it escapes, skips this after-thunk on the jolt-park-unwinding? test,
+;; and comes back through the fiber thunk with the wind gone — so the release would
+;; never run and the monitor would be held for the life of the process, with every later
+;; contender waiting and no error anywhere. The reason that cannot happen is that
+;; `locking` hands its body over as a THUNK and `fn*` is opaque to the CPS pass, so a
+;; park in there falls back to a capture, which rewinds properly.
+;;
+;; It is the same thing parameterize and binding rely on and sm.ss's invariant names all
+;; three — but this one is invisible to the check sm.ss cites. run-gosm.ss section 1c
+;; scans the EMITTED Scheme for a rewritten park site inside a dynamic-wind, and the wind
+;; here is inside a host procedure the emission merely calls, so nothing textual can see
+;; it. Section 1d is the one that covers this shape: a park inside `locking` is not
+;; rewritten, with controls for the parks either side of the monitor that must stay
+;; cheap, and section 2 checks that the monitor is actually released afterwards by having
+;; a second go block take it.
 (define (jolt-with-monitor obj thunk)
   (let ((m (object-monitor obj)))
     (monitor-enter! m)
