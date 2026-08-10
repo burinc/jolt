@@ -168,7 +168,7 @@
 ;; this line does not report a failed check, it kills the gate with the macro's
 ;; own message, which is the point.
 (ev "(defmacro gosm-boom [] (throw (ex-info \"gosm-boom expanded\" {})))")
-(define x-sqm (go-expansion "(go (list `(user/gosm-boom) (<! ch)))"))
+(define x-sqm (go-expansion "(go (list `(gosm-boom) (<! ch)))"))
 (gate-check "syntax-quote: a macro in the datum is not expanded"
             (gate-sub? x-sqm "gosm-boom") #t)
 
@@ -183,16 +183,19 @@
 ;;
 ;; env-has? is expanded by the PASS (its argument parks, so the form is not
 ;; emitted whole) and reports whether the enclosing let's local was in scope at
-;; expansion time. Under {} it answers false, which is the bug. Named qualified
-;; because this file runs with the current namespace left at clojure.core.async
-;; by the overlay load above, and the def lands in user.
+;; expansion time. Under {} it answers false, which is the bug. Named UNQUALIFIED
+;; on purpose: a macro this gate defines through `ev` has to be visible to the
+;; resolve and macroexpand the very next `ev` performs, which is only true because
+;; jolt-compile-eval-form points the runtime current ns at the ns it compiles in
+;; (jolt-0zy6). It did not, so these read user/env-has? and the overlay load above
+;; left every eval resolving in clojure.core.async.
 (ev "(defmacro env-has? [s x] (list 'vector (contains? &env s) x))")
 ;; the contrast: the public one-argument macroexpand has no env to pass, so it
 ;; sees no locals at all. That is the answer the pass must NOT take.
 (gate-check "&env: the env-less macroexpand sees no locals"
-            (ev "(pr-str (macroexpand '(user/env-has? outer :v)))")
+            (ev "(pr-str (macroexpand '(env-has? outer :v)))")
             "(vector false :v)")
-(define x-env (go-expansion "(go (let [outer 1] (user/env-has? outer (<! ch))))"))
+(define x-env (go-expansion "(go (let [outer 1] (env-has? outer (<! ch))))"))
 (gate-check "&env: the pass expands with the enclosing local in scope"
             (gate-sub? x-env "true") #t)
 (gate-check "&env: and never reports it absent"
@@ -203,11 +206,11 @@
                  "  (clojure.core.async/>!! c :v)"
                  "  (binding [clojure.core.async/*go-backend* :fiber]"
                  "    (pr-str (clojure.core.async/<!! (clojure.core.async/go"
-                 "      (let [outer 1] (user/env-has? outer (<! c))))))))"))
+                 "      (let [outer 1] (env-has? outer (<! c))))))))"))
             "[true :v]")
 ;; the same form outside go — what the pass has to agree with
 (gate-check "&env: the ordinary expansion says the same"
-            (ev "(pr-str (let [outer 1] (user/env-has? outer :v)))")
+            (ev "(pr-str (let [outer 1] (env-has? outer :v)))")
             "[true :v]")
 
 ;; loop* bindings are SEQUENTIAL — analyze-bindings threads each into the env the
@@ -380,9 +383,10 @@
    (list "park through a call" "(go (inc (helper-take c)))" "5" "6")
    (list "park inside try" "(go (try (<! c) (catch Throwable e :caught)))" "5" "5")
    (list "park in a vector literal" "(go (vector (<! c) :b))" "1" "[1 :b]")
-   ;; eval runs with its own current ns and cannot see the local c (nor can it on
-   ;; the JVM) — park through a qualified global instead
-   (list "park through eval" "(go (inc (eval '(clojure.core.async/<! user/evch))))" "5" "6")
+   ;; eval compiles a form of its own and cannot see the local c (nor can it on
+   ;; the JVM) — park through a global instead. Unqualified: eval resolves in the
+   ;; current ns, which is the ns this form compiled in (jolt-0zy6).
+   (list "park through eval" "(go (inc (eval '(clojure.core.async/<! evch))))" "5" "6")
    (list "alts!" "(go (first (alts! [c])))" "5" "5")
    (list "nested go" "(go (<! (go (<! c))))" "4" "4")
    ;; A local shadows a macro for the analyzer, so it has to shadow it for the
@@ -442,8 +446,8 @@
   (fiber-run "binding"
              (string-append
               "(clojure.core.async/go"
-              "  (binding [user/*gosm-x* :inner]"
-              "    (let [v (clojure.core.async/<! __ch)] [v user/*gosm-x*])))")
+              "  (binding [*gosm-x* :inner]"
+              "    (let [v (clojure.core.async/<! __ch)] [v *gosm-x*])))")
              (list (after-capture "binding" 1 "1"))))
 (gate-check "binding survives the park" (jolt-pr-str (car dynv)) "[1 :inner]")
 (gate-check "binding: the park really happened" (caddr dynv) 1)
