@@ -783,15 +783,18 @@
 ;; the precondition locks.ss puts on parking inside jolt-with-mutex at all.
 ;;
 ;; NOT the JEP 491 reimplementation locks.ss rules out. That paragraph is about the
-;; runtime's own locks, of which there are many and all short. There is one object
-;; monitor primitive, and making one lock fiber-aware is not making all of them so.
+;; runtime's own locks, of which there are many and all short. The locks that wrap
+;; code they did not write are countable — the object monitor here, the STM lock
+;; (refs.ss), the delay's force, and ReentrantLock below — and they all reach for the
+;; mechanism in this section. Making those four fiber-aware is not making all of them
+;; so, which is the line that keeps the rest of the runtime on jolt-with-mutex.
 (define monitor-table (make-weak-eq-hashtable))
 (define monitor-table-lock (make-mutex))
 ;; #(bk owner count cv fibers box)
 ;;   bk     the bookkeeping mutex — held across a decision, never across a body
 ;;   owner  the FIBER when a fiber holds it, else the thread's interrupt box
-;;          (current-interrupt-box, the identity the ReentrantLock uses, which is
-;;          safe under fork-inheritance), or #f when free
+;;          (current-interrupt-box, an identity that is safe under
+;;          fork-inheritance), or #f when free
 ;;   count  reentrancy depth for the owner
 ;;   cv     thread waiters; condition-wait releases bk atomically with blocking
 ;;   fibers parked fiber waiters, resumed by the release
@@ -803,10 +806,18 @@
 (define monitor-i-cv 3)
 (define monitor-i-fibers 4)
 (define monitor-i-box 5)
+;; A fresh monitor. Named rather than inlined at the one use site, because
+;; object-monitor is no longer the only thing that needs one:
+;; java.util.concurrent.locks.ReentrantLock is a lock in its own right — (locking
+;; lk …) and (.lock lk) are DIFFERENT locks on the JVM and stay different here,
+;; so it gets its own record rather than the object's — but the hard part it needs
+;; is exactly this (jolt-ga8o). One implementation, two locks.
+(define (make-monitor) (vector (make-mutex) #f 0 (make-condition) '() #f))
+
 (define (object-monitor obj)
   (jolt-with-mutex monitor-table-lock
     (or (hashtable-ref monitor-table obj #f)
-        (let ((m (vector (make-mutex) #f 0 (make-condition) '() #f)))
+        (let ((m (make-monitor)))
           (hashtable-set! monitor-table obj m) m))))
 
 ;; Who is asking. The FIBER when there is one, and this is the field that decides
@@ -875,6 +886,75 @@
              (vector-set! m monitor-i-box (current-interrupt-box))
              (vector-set! m monitor-i-count 1))
             (else (monitor-wait! m) (loop))))))))
+
+;; The same decision without the wait: #t if this context now holds the monitor,
+;; #f if something else does. ReentrantLock.tryLock is the caller, and the reason
+;; it is a variant of monitor-enter! rather than a peek followed by an enter is
+;; that a peek-then-enter is two steps — the monitor could be taken in between
+;; and the "try" would block.
+;;
+;; Note what it does NOT do: take a Chez mutex. That is the whole difference from
+;; the ReentrantLock this replaces, whose failed try had to give a counted lock
+;; back and whose successful one held one for the length of the caller's critical
+;; section. Here bk is dropped before the caller runs a line of its body, so
+;; jolt-locks-held is zero inside the section and the section is preemptible.
+(define (monitor-try-enter! m)
+  (let ((me (monitor-self)))
+    (jolt-with-mutex (vector-ref m monitor-i-bk)
+      (let ((owner (vector-ref m monitor-i-owner)))
+        (cond
+          ((eq? owner me)
+           (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count)))
+           #t)
+          ((not owner)
+           (vector-set! m monitor-i-owner me)
+           (vector-set! m monitor-i-box (current-interrupt-box))
+           (vector-set! m monitor-i-count 1)
+           #t)
+          (else #f))))))
+
+;; The three questions ReentrantLock exposes. All strict eq? against monitor-self,
+;; NOT monitor-owner?: that predicate's second arm exists so a TERMINAL fiber's own
+;; unwind can release what it was holding, and answering a query #t on that basis
+;; would tell a live thread it holds a lock a dead fiber took. Release is lenient
+;; because the alternative is leaking the monitor; a query has no such excuse.
+(define (monitor-held-by-self? m)
+  (jolt-with-mutex (vector-ref m monitor-i-bk)
+    (eq? (vector-ref m monitor-i-owner) (monitor-self))))
+;; getHoldCount is "holds by the CURRENT thread" on the JVM — 0 for anyone else,
+;; not the raw depth.
+(define (monitor-self-count m)
+  (jolt-with-mutex (vector-ref m monitor-i-bk)
+    (if (eq? (vector-ref m monitor-i-owner) (monitor-self))
+        (vector-ref m monitor-i-count)
+        0)))
+(define (monitor-locked? m)
+  (jolt-with-mutex (vector-ref m monitor-i-bk)
+    (and (vector-ref m monitor-i-owner) #t)))
+
+;; One round of a POLLED wait — the bounded and interruptible acquires, which
+;; cannot use monitor-wait! because that has no deadline and no interrupt check.
+;;
+;; On a fiber this yields, and that is the load-bearing part rather than a
+;; politeness: the holder may be a sibling fiber on this very carrier, and
+;; sleeping the carrier is then the one thing that guarantees the wait cannot
+;; succeed — the holder never gets the CPU it needs to reach its release, so the
+;; call runs to its deadline every time however long the deadline is. That is what
+;; a (sleep) poll did here.
+;;
+;; It naps only when the yield came back to an empty run queue, so the nap costs no
+;; queued fiber its turn and the poll does not spin a core for the length of the
+;; timeout. The queue read is unlocked on purpose: it is a hint, and being wrong
+;; either way costs one 1ms nap or one extra yield.
+(define lock-poll-nap (make-time 'time-duration 1000000 0))   ; 1ms
+(define (monitor-poll-round!)
+  (let ((f (jolt-current-fiber)))
+    (cond
+      ((not f) (sleep lock-poll-nap))
+      (else
+       (sa-fiber-yield)
+       (unless (jolt-carrier-head (jolt-fiber-carrier f))
+         (sleep lock-poll-nap))))))
 
 ;; The waiters are taken and cleared under bk so no resume is delivered twice, and
 ;; they are woken OUTSIDE it: sa-fiber-resume takes the carrier's run-queue mutex,
@@ -1347,65 +1427,91 @@
                          (waiting)))))))))))
 
 ;; java.util.concurrent.locks.ReentrantLock — a reentrant mutual-exclusion lock.
-;; State: #(mutex owner-box hold-count). owner-box is the owning thread's interrupt
-;; box (nil if unlocked). The same thread may acquire multiple times (hold count
-;; incremented); each unlock balances one lock — unlock from a non-owner throws.
-(define (make-reentrant-lock) (make-jhost "reentrant-lock" (vector (make-mutex) #f 0)))
+;; State: #(monitor), one MONITOR record of its own (make-monitor above), not the
+;; object's — (locking lk …) and (.lock lk) are different locks on the JVM and stay
+;; different here.
+;;
+;; A MONITOR AND NOT A CHEZ MUTEX, for the reasons set out at jolt-with-monitor and
+;; for the third time in this file (jolt-ga8o, after jolt-3a87 for the monitor and
+;; jolt-pb2s for the STM lock). This held a Chez mutex from .lock to .unlock with
+;; (current-interrupt-box) as the owner, and a ReentrantLock's region is a USER body:
+;; it is as long as the caller's critical section and the caller may park in it. So
+;; both halves of locks.ss's premise are false of it, and it failed both ways.
+;;
+;;   Two fibers on one carrier share a thread and therefore shared that owner, so
+;;   the second one's .lock read the owner as ITS OWN identity, took the reentrant
+;;   arm, and walked into a section the first was halfway through. Measured with one
+;;   carrier and two fibers that lock, park on a channel and unlock: occupancy inside
+;;   the section reached 2. The owner test in .unlock is the same test, so a fiber
+;;   could also release a lock a sibling took, dropping the mutex the sibling was
+;;   still relying on with nothing raised to say so.
+;;
+;;   And the acquire was COUNTED, so jolt-locks-held stayed above zero for the whole
+;;   body and forever if the holder parked in it. The scheduler refuses to preempt
+;;   while that count is non-zero, so every later fiber on that carrier became
+;;   unpreemptible too — the unbounded starvation window the head of fibers.ss says
+;;   no setting can open, reachable from ordinary jolt code.
+;;
+;; Ownership as a field fixes both at once, and it is not a coincidence that it fixes
+;; both: they are one bug seen from two sides, which is that an OS mutex has THREAD
+;; granularity and a fiber is not a thread. A field survives a switch, and no counted
+;; lock is held while the body runs.
+;;
+;; What the bounded and interruptible acquires add on top is a deadline and an
+;; interrupt check, which monitor-wait! has neither of, so those two poll — through
+;; monitor-poll-round!, which yields on a fiber. Sleeping there was the reason a timed
+;; tryLock against a sibling fiber could never succeed: the carrier it slept is the one
+;; the holder needs in order to reach its release.
+(define (make-reentrant-lock) (make-jhost "reentrant-lock" (vector (make-monitor))))
+(define (rlock-monitor self) (vector-ref (jhost-state self) 0))
 (for-each (lambda (nm) (register-class-ctor! nm (lambda _ (make-reentrant-lock))))
           '("ReentrantLock" "java.util.concurrent.locks.ReentrantLock"))
+(define (rlock-interrupted-check! me)
+  (when (unbox me)
+    (set-box! me #f)
+    (jolt-throw (jolt-host-throwable "java.lang.InterruptedException" "lock interrupted"))))
 (register-host-methods! "reentrant-lock"
-  (list (cons "lock" (lambda (self)
-          (let* ((st (jhost-state self)) (mu (vector-ref st 0)) (me (current-interrupt-box)))
-            (if (eq? (vector-ref st 1) me)
-                (vector-set! st 2 (fx+ (vector-ref st 2) 1))
-                (begin (jolt-lock! mu) (vector-set! st 1 me) (vector-set! st 2 1)))
-            jolt-nil)))
-        (cons "unlock" (lambda (self)
-          (let* ((st (jhost-state self)) (me (current-interrupt-box)))
-            (unless (eq? (vector-ref st 1) me)
-              (jolt-throw (jolt-host-throwable "java.lang.IllegalMonitorStateException" "not lock owner")))
-            (vector-set! st 2 (fx- (vector-ref st 2) 1))
-            (when (fx=? 0 (vector-ref st 2))
-              (vector-set! st 1 #f)
-              (jolt-unlock! (vector-ref st 0)))
-            jolt-nil)))
+  ;; An uninterruptible acquire: a fiber contender parks on the monitor's waiter
+  ;; list and a thread waits on its condition. monitor-exit! wakes both.
+  (list (cons "lock" (lambda (self) (monitor-enter! (rlock-monitor self)) jolt-nil))
+        ;; monitor-exit! is where "unlock from a non-owner throws" already lives, and
+        ;; it throws the IllegalMonitorStateException the JVM does.
+        (cons "unlock" (lambda (self) (monitor-exit! (rlock-monitor self)) jolt-nil))
         ;; tryLock() gives up at once; tryLock(timeout, unit) keeps trying until the
         ;; deadline. The timeout used to be discarded, so the bounded form gave up
-        ;; immediately on any lock that happened to be held at that instant.
+        ;; immediately on any lock that happened to be held at that instant; then it
+        ;; was honoured but polled with (sleep), which on a fiber guaranteed it would
+        ;; run to the deadline whenever the holder was a sibling.
         (cons "tryLock" (lambda (self . args)
-          (let* ((st (jhost-state self)) (mu (vector-ref st 0)) (me (current-interrupt-box))
-                 (ms (tu-args->ms args)))
-            (cond ((eq? (vector-ref st 1) me) (vector-set! st 2 (fx+ (vector-ref st 2) 1)) #t)
-                  (else
-                   (let ((deadline (and ms (ms->deadline ms))))
-                     (let attempt ()
-                       (cond ((jolt-lock! mu #f) (vector-set! st 1 me) (vector-set! st 2 1) #t)
-                             ;; Chez has no timed mutex-acquire, so poll: the wait is
-                             ;; bounded by the deadline and each nap is short enough
-                             ;; that the extra latency is not observable.
-                             ((and deadline (time<=? (current-time 'time-utc) deadline))
-                              (sleep (make-time 'time-duration 1000000 0))
-                              (attempt))
-                             (else #f)))))))))
+          (let* ((m (rlock-monitor self))
+                 (ms (tu-args->ms args))
+                 (deadline (and ms (ms->deadline ms))))
+            (let attempt ()
+              (cond ((monitor-try-enter! m) #t)
+                    ;; Chez has no timed acquire, so poll. The wait is bounded by the
+                    ;; deadline; the round yields first so the holder can run.
+                    ((and deadline (time<=? (current-time 'time-utc) deadline))
+                     (monitor-poll-round!)
+                     (attempt))
+                    (else #f))))))
         (cons "lockInterruptibly" (lambda (self)
-          (let* ((st (jhost-state self)) (mu (vector-ref st 0)) (me (current-interrupt-box)))
-            (when (unbox me)
-              (set-box! me #f)
-              (jolt-throw (jolt-host-throwable "java.lang.InterruptedException" "lock interrupted")))
-            (if (eq? (vector-ref st 1) me)
-                (vector-set! st 2 (fx+ (vector-ref st 2) 1))
-                (let loop ()
-                  (when (unbox me)
-                    (set-box! me #f)
-                    (jolt-throw (jolt-host-throwable "java.lang.InterruptedException" "lock interrupted")))
-                  (if (jolt-lock! mu #f)
-                      (begin (vector-set! st 1 me) (vector-set! st 2 1))
-                      (begin (sleep (make-time 'time-duration 10000000 0)) (loop)))))
+          (let ((m (rlock-monitor self))
+                (me (current-interrupt-box)))
+            (rlock-interrupted-check! me)
+            (let loop ()
+              (unless (monitor-try-enter! m)
+                (monitor-poll-round!)
+                (rlock-interrupted-check! me)
+                (loop)))
             jolt-nil)))
-        (cons "isLocked" (lambda (self) (fx>? (vector-ref (jhost-state self) 2) 0)))
-        (cons "getHoldCount" (lambda (self) (vector-ref (jhost-state self) 2)))
-        (cons "isHeldByCurrentThread" (lambda (self)
-          (eq? (vector-ref (jhost-state self) 1) (current-interrupt-box))))))
+        ;; isLocked is "held by ANY thread"; getHoldCount and isHeldByCurrentThread are
+        ;; about the CURRENT one, and the count is 0 rather than the raw depth for a
+        ;; caller that does not hold it. The old versions read the raw fields, so
+        ;; getHoldCount reported the holder's depth to everybody.
+        (cons "isLocked" (lambda (self) (monitor-locked? (rlock-monitor self))))
+        (cons "getHoldCount" (lambda (self) (monitor-self-count (rlock-monitor self))))
+        (cons "isHeldByCurrentThread"
+              (lambda (self) (monitor-held-by-self? (rlock-monitor self))))))
 
 ;; --- main-thread executor ---------------------------------------------------
 ;; Lets a worker thread (e.g. an nREPL eval future) run a thunk on the thread

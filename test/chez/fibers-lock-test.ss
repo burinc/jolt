@@ -542,6 +542,198 @@
 (ok "8c. and the delay still forced"
     (and (eq? 'done (jolt-fiber-state l14-f)) (eq? 'v (jolt-delay-force l14-d))))
 
+;; --- 9. the FOURTH lock that wraps user code: ReentrantLock (jolt-ga8o) --------
+;; java.util.concurrent.locks.ReentrantLock is the last lock in the runtime that
+;; both spans a user body and recorded its owner as the OS THREAD. Sections 1-8
+;; swept the other three; this one was left holding a Chez mutex from .lock to
+;; .unlock with (current-interrupt-box) as the owner, which is precisely the
+;; trapdoor those sections are about, so it failed in the same two ways:
+;;
+;;   - the owner two fibers on one carrier read is the SAME box, so the second
+;;     one's .lock took the reentrant arm and walked into the section. Measured
+;;     occupancy 2, and a fiber could .unlock a lock a sibling took.
+;;   - the counted acquire was held for the whole body, and indefinitely if the
+;;     holder parked inside it, so the carrier's lock count never came back to
+;;     zero and every later fiber on it became unpreemptible.
+;;
+;; A ReentrantLock is NOT the object's monitor — (locking lk …) and (.lock lk) are
+;; distinct locks on the JVM and stay distinct here — so it gets its own monitor
+;; record rather than reusing object-monitor's. What it shares is the mechanism:
+;; ownership is a field, the bookkeeping mutex is held only across the decision,
+;; and a fiber contender parks.
+(jolt-fiber-pool-reset!)
+(jolt-fiber-carrier-count-set! 1)
+(jolt-fiber-preempt-ticks-set! #f)
+
+(define (rl-method nm)
+  (let ((h (hashtable-ref host-methods-tbl "reentrant-lock" #f)))
+    (or (and h (hashtable-ref h nm #f))
+        (error 'rl-method "no such reentrant-lock method" nm))))
+(define (rl-new) ((hashtable-ref class-ctors-tbl "ReentrantLock" #f)))
+(define rl-lock (rl-method "lock"))
+(define rl-unlock (rl-method "unlock"))
+(define rl-trylock (rl-method "tryLock"))
+(define rl-locked? (rl-method "isLocked"))
+(define rl-hold-count (rl-method "getHoldCount"))
+(define rl-mine? (rl-method "isHeldByCurrentThread"))
+
+;; 9a. The exclusion property said directly, in the shape section 1 uses for
+;; `locking`: A takes the lock, parks inside the section, and B must not get in.
+(occ-reset!)
+(trace-reset!)
+(define r1-lk (rl-new))
+(define r1-a-ch (ac-make 1 'fixed #f))
+(define r1-b-ch (ac-make 1 'fixed #f))
+(define (r1-body tag ch)
+  (lambda ()
+    (rl-lock r1-lk)
+    (occ-in!) (note! (string->symbol (string-append tag "-in")))
+    (jolt-fiber-<! ch)
+    (note! (string->symbol (string-append tag "-resumed")))
+    (occ-out!) (note! (string->symbol (string-append tag "-out")))
+    (rl-unlock r1-lk)))
+(define r1-a (sa-fiber-spawn (r1-body "a" r1-a-ch)))
+(define r1-b (sa-fiber-spawn (r1-body "b" r1-b-ch)))
+(sa-fiber-run-all)
+(ok "9a. only one fiber is inside the lock while the other waits" (= 1 occ-max))
+(ok "9a. B never entered while A held it" (equal? '(a-in) (trace-out)))
+(ok "9a. and B WAITED by parking, not by blocking the carrier"
+    (eq? 'parked (jolt-fiber-state r1-b)))
+;; 9b. The count the scheduler reads is back to zero while A is parked holding the
+;; lock — otherwise every later fiber on this carrier is unpreemptible for as long
+;; as A stays away.
+(ok "9b. a parked holder leaves no counted lock on the carrier" (= 0 (jolt-locks-held)))
+;; Let A out; only then does B get in.
+(jolt-async-give r1-a-ch 1)
+(sa-fiber-run-all)
+(jolt-async-give r1-b-ch 2)
+(sa-fiber-run-all)
+(ok "9a. both fibers completed"
+    (and (eq? 'done (jolt-fiber-state r1-a)) (eq? 'done (jolt-fiber-state r1-b))))
+(ok "9a. exclusion held across both parks" (= 1 occ-max))
+(ok "9a. and the bodies did not interleave"
+    (equal? '(a-in a-resumed a-out b-in b-resumed b-out) (trace-out)))
+(ok "9a. the lock is free afterwards" (not (rl-locked? r1-lk)))
+
+;; 9c. A fiber must not be able to release a sibling's lock. Under thread
+;; ownership the sibling's unlock passed the owner test, cleared the owner and
+;; released the OS mutex the holder was relying on — silently.
+(define r2-lk (rl-new))
+(define r2-ch (ac-make 1 'fixed #f))
+(define r2-a (sa-fiber-spawn (lambda () (rl-lock r2-lk) (jolt-fiber-<! r2-ch) (rl-unlock r2-lk))))
+(define r2-threw (box 'unset))
+(define r2-b
+  (sa-fiber-spawn
+   (lambda () (set-box! r2-threw (guard (e (#t 'threw)) (rl-unlock r2-lk) 'released)))))
+(sa-fiber-run-all)
+(ok "9c. a sibling fiber cannot unlock the holder's lock" (eq? 'threw (unbox r2-threw)))
+(ok "9c. so the lock is still held" (rl-locked? r2-lk))
+(jolt-async-give r2-ch 1)
+(sa-fiber-run-all)
+(ok "9c. and the holder still releases it itself"
+    (and (eq? 'done (jolt-fiber-state r2-a)) (not (rl-locked? r2-lk))))
+
+;; 9d/9e. The properties the rewrite must not break, plus the two the JVM answers
+;; differently: getHoldCount is the CURRENT context's count (0 for anyone else)
+;; and isHeldByCurrentThread has to mean the current FIBER.
+(define r3-lk (rl-new))
+(define r3-ch (ac-make 1 'fixed #f))
+(define r3-counts (box '()))
+(define (r3-note! v) (set-box! r3-counts (cons v (unbox r3-counts))))
+(define r3-a
+  (sa-fiber-spawn
+   (lambda ()
+     (rl-lock r3-lk) (r3-note! (list 'depth1 (rl-hold-count r3-lk) (rl-mine? r3-lk)))
+     (rl-lock r3-lk) (r3-note! (list 'depth2 (rl-hold-count r3-lk)))
+     (rl-unlock r3-lk) (r3-note! (list 'back-to-1 (rl-hold-count r3-lk) (rl-locked? r3-lk)))
+     (jolt-fiber-<! r3-ch)
+     (rl-unlock r3-lk) (r3-note! (list 'released (rl-hold-count r3-lk) (rl-locked? r3-lk))))))
+(sa-fiber-run-all)
+(ok "9d. reentrant for the same fiber"
+    (equal? '((depth1 1 #t) (depth2 2) (back-to-1 1 #t)) (reverse (unbox r3-counts))))
+(define r3-other (box 'unset))
+(define r3-b
+  (sa-fiber-spawn
+   (lambda () (set-box! r3-other (list (rl-hold-count r3-lk) (rl-mine? r3-lk))))))
+(sa-fiber-run-all)
+(ok "9e. getHoldCount is 0 for a non-owner and isHeldByCurrentThread is per-fiber"
+    (equal? '(0 #f) (unbox r3-other)))
+(jolt-async-give r3-ch 1)
+(sa-fiber-run-all)
+(ok "9d. and it unwinds to free" (not (rl-locked? r3-lk)))
+
+;; 9f. tryLock with no timeout: #f while a sibling fiber holds it, and a failed
+;; attempt leaves no counted lock behind on the carrier.
+(define r4-lk (rl-new))
+(define r4-ch (ac-make 1 'fixed #f))
+(define r4-a (sa-fiber-spawn (lambda () (rl-lock r4-lk) (jolt-fiber-<! r4-ch) (rl-unlock r4-lk))))
+(define r4-got (box 'unset))
+(define r4-held-after (box 'unset))
+(define r4-b
+  (sa-fiber-spawn
+   (lambda () (set-box! r4-got (rl-trylock r4-lk))
+              (set-box! r4-held-after (jolt-locks-held)))))
+(sa-fiber-run-all)
+(ok "9f. tryLock refuses a lock a sibling fiber holds" (eq? #f (unbox r4-got)))
+(ok "9f. and a refused tryLock counts no lock" (eqv? 0 (unbox r4-held-after)))
+(jolt-async-give r4-ch 1)
+(sa-fiber-run-all)
+(define r4-c (sa-fiber-spawn (lambda () (rl-trylock r4-lk))))
+(sa-fiber-run-all)
+(ok "9f. and takes it once free" (eq? #t (jolt-fiber-result r4-c)))
+
+;; 9g. A BOUNDED wait must be able to succeed when the holder is a sibling fiber
+;; on the same carrier. Real carrier threads, because the point is that waiting
+;; for the timeout must not stop the carrier from running the very fiber whose
+;; release the waiter is waiting for. Polling with (sleep) did exactly that, so
+;; this always answered false however long the timeout was.
+(jolt-fiber-pool-reset!)
+(jolt-fiber-carrier-count-set! 1)
+(define r5-lk (rl-new))
+(define r5-ch (ac-make 1 'fixed #f))
+(define r5-in (box #f))
+(define r5-got (box 'unset))
+(define r5-a
+  (sa-fiber-spawn
+   (lambda () (rl-lock r5-lk) (set-box! r5-in #t) (jolt-fiber-<! r5-ch) (rl-unlock r5-lk))))
+(define r5-b
+  (sa-fiber-spawn (lambda () (set-box! r5-got (rl-trylock r5-lk 3000)))))
+(jolt-fiber-ensure-carrier!)
+(wait-until (lambda () (unbox r5-in)) 5.0 "9g. the holder took the lock")
+(sleep (make-time 'time-duration 100000000 0))   ; 100ms inside the bounded wait
+(ok "9g. the bounded waiter has not got it yet" (eq? 'unset (unbox r5-got)))
+(jolt-async-give r5-ch 1)
+(wait-until (lambda () (not (eq? 'unset (unbox r5-got)))) 10.0 "9g. the bounded wait ends")
+(ok "9g. a timed tryLock succeeds when a sibling fiber releases in time"
+    (eq? #t (unbox r5-got)))
+(ok "9g. the holder completed" (eq? 'done (jolt-fiber-state r5-a)))
+
+;; 9h. Cross-thread still works, which is what the OS mutex was there for: a
+;; plain thread must wait for a lock a parked fiber holds, and must get it once
+;; the fiber leaves.
+(jolt-fiber-pool-reset!)
+(jolt-fiber-carrier-count-set! 1)
+(define r6-lk (rl-new))
+(define r6-ch (ac-make 1 'fixed #f))
+(define r6-in (box #f))
+(define r6-thread-got (box #f))
+(define r6-a
+  (sa-fiber-spawn
+   (lambda () (rl-lock r6-lk) (set-box! r6-in #t) (jolt-fiber-<! r6-ch) (rl-unlock r6-lk))))
+(jolt-fiber-ensure-carrier!)
+(wait-until (lambda () (unbox r6-in)) 5.0 "9h. the fiber took the lock")
+(define r6-t
+  (fork-thread
+   (lambda () (rl-lock r6-lk) (set-box! r6-thread-got #t) (rl-unlock r6-lk))))
+(sleep (make-time 'time-duration 100000000 0))
+(ok "9h. a thread does not enter a lock a parked fiber holds" (not (unbox r6-thread-got)))
+(jolt-async-give r6-ch 1)
+(wait-until (lambda () (unbox r6-thread-got)) 5.0 "9h. the thread gets it once the fiber leaves")
+(thread-join r6-t)
+(ok "9h. the fiber completed" (eq? 'done (jolt-fiber-state r6-a)))
+(ok "9h. and the lock is free" (not (rl-locked? r6-lk)))
+(ok "9h. no lock left counted on this thread" (= 0 (jolt-locks-held)))
+
 (jolt-fiber-pool-reset!)
 
 (printf "\nfibers-lock-test: ~a checks, ~a failure(s)\n" total fails)
