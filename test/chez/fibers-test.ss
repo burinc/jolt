@@ -6,6 +6,12 @@
 ;; that raises with the scheduler surviving and the other fibers still running;
 ;; N fibers round-robin in order; a fiber yielding from 40 frames down.
 ;;
+;; And two properties that only show up with a second thread involved, both
+;; deterministic rather than sampled (sections 7b and 7c): concurrent resumes of
+;; one parked fiber put it on the run queue exactly once, and a fiber's
+;; completion is published under the monitor mutex so its state and its error
+;; can never be observed apart.
+;;
 ;; Numbers as assertions with generous ceilings (pinned by R0's findings):
 ;;   spawn  < 5us     (measured 0.84us)
 ;;   switch: depth-independent (40 frames within 3x of 1) — the property,
@@ -145,6 +151,117 @@
 (ok "resume: double wakeup is a no-op" (eq? (jolt-fiber-state wake-f) 'ready))
 (sa-fiber-run-all)
 (ok "resume: completed" (eq? (jolt-fiber-result wake-f) 'woke))
+
+;; 7b. the SEQUENTIAL double wakeup above is the easy half. The one that matters
+;; is concurrent: two threads that both read 'parked before either writes 'ready
+;; both enqueue, and a second enqueue of a fiber that is already the sole queued
+;; one writes f.next = f. That is not a fiber dispatched twice, it is a run queue
+;; that never drains — the carrier walks the same fiber forever and nothing says
+;; why. So sa-fiber-resume decides and enqueues under the carrier's queue mutex,
+;; in one step.
+;;
+;; The walk below is bounded rather than trusting to terminate, because the bug
+;; is precisely a cycle.
+;;
+;; The resumers are STARTED ONCE and released on a spin barrier, not forked per
+;; round. Forking per round does not reproduce anything: fork-thread costs
+;; microseconds and the window is a couple of instructions, so the first thread
+;; is long finished before the second exists, and the mutation below passes
+;; clean. Pre-started threads spinning on a generation counter do overlap.
+;;
+;; Mutation-checked in that shape: putting the test back outside the lock does
+;; not fail these two checks, it kills the gate — the self-linked queue hands the
+;; same fiber back after it completed and the drain dies with "fiber in
+;; unexpected state with irritant done". Which is the point: unfixed, the symptom
+;; is a scheduler that reports something impossible, with nothing to connect it
+;; to a resume that happened two dispatches earlier.
+(define (rq-length c)
+  (let loop ((f (jolt-carrier-head c)) (n 0))
+    (cond ((not f) n)
+          ((fx>? n 8) n)                      ; a cycle — report it, do not spin
+          (else (loop (jolt-fiber-next f) (fx+ n 1))))))
+
+(define RACE-N 4)
+(define RACE-ROUNDS 400)
+(define race-c (vector-ref jolt-fiber-carriers 0))
+(define race-gen (box 0))
+(define race-target (box #f))
+(define race-done (box 0))
+(define race-done-mu (make-mutex))
+(define race-stop (box #f))
+
+(define race-threads
+  (let loop ((i 0) (acc '()))
+    (if (fx=? i RACE-N)
+        acc
+        (loop (fx+ i 1)
+              (cons (fork-thread
+                     (lambda ()
+                       (let spin ((seen 0))
+                         (cond
+                           ((unbox race-stop) (void))
+                           ((fx>? (unbox race-gen) seen)
+                            (let ((f (unbox race-target)))
+                              (when f (sa-fiber-resume f)))
+                            (jolt-with-mutex race-done-mu
+                              (set-box! race-done (fx+ 1 (unbox race-done))))
+                            (spin (unbox race-gen)))
+                           (else (spin seen))))))
+                    acc)))))
+
+(define race-bad 0)
+(define race-woke 0)
+(do ((r 0 (fx+ r 1))) ((fx=? r RACE-ROUNDS))
+  (let ((f (sa-fiber-spawn (lambda () (jolt-fiber-park!) 'woke))))
+    (sa-fiber-run-all)                        ; runs it up to the park
+    (set-box! race-target f)
+    (set-box! race-done 0)
+    (set-box! race-gen (fx+ 1 (unbox race-gen)))   ; release all RACE-N at once
+    (let await () (unless (fx=? RACE-N (unbox race-done)) (await)))
+    (unless (fx=? 1 (rq-length race-c)) (set! race-bad (fx+ race-bad 1)))
+    (sa-fiber-run-all)
+    (if (eq? 'done (jolt-fiber-state f))
+        (set! race-woke (fx+ race-woke 1))
+        (set! race-bad (fx+ race-bad 1)))))
+(set-box! race-stop #t)
+(set-box! race-gen (fx+ 1 (unbox race-gen)))     ; one last release so they exit
+(for-each thread-join race-threads)
+(ok "concurrent resume: exactly one queue entry, every round" (fx=? 0 race-bad))
+(ok "concurrent resume: every fiber ran once and finished" (fx=? RACE-ROUNDS race-woke))
+
+;; 7c. a fiber's completion is PUBLISHED UNDER THE MONITOR MUTEX.
+;;
+;; jolt-fiber-monitor! reads the state and, when it is already terminal,
+;; delivers the error field inline without looking further. So the two have to
+;; become visible together. They were two unlocked writes in the wrong order —
+;; state first, error second — and a registration landing between them read a
+;; finished fiber with no error and reported a body that threw as a clean
+;; completion, which is the one thing monitoring exists to make visible.
+;;
+;; Racing it is hopeless: the window is two instructions and a stress that spawns
+;; and monitors 400 dying go blocks never lands in it, even with the gap widened
+;; to a millisecond (tried; fibers-monitor-test section 7 says so). So do not
+;; race it — HOLD THE LOCK. If publication really happens under it, a fiber that
+;; dies while this thread owns the mutex cannot become terminal at all; the
+;; carrier blocks until the lock is free and then publishes both fields at once.
+;; That is an assertion about the mechanism rather than a sampling of it, and it
+;; is deterministic.
+;;
+;; Mutation-checked: moving the state write back outside the mutex fails the
+;; first of these three on every run, and would fail it just as surely if the
+;; gap were a single instruction.
+(jolt-lock! jolt-fiber-monitor-mu)
+(define pub-f (sa-fiber-spawn (lambda () (error 'fiber "pub boom"))))
+(define pub-th (fork-thread (lambda () (sa-fiber-run-all))))
+;; let the carrier thread get all the way to the publication point and block
+(let spin ((n 0)) (when (fx<? n 4000000) (spin (fx+ n 1))))
+(ok "publication: not terminal while the monitor lock is held"
+    (not (memq (jolt-fiber-state pub-f) '(done dead))))
+(jolt-unlock! jolt-fiber-monitor-mu)
+(thread-join pub-th)
+(ok "publication: terminal once the lock is released" (eq? 'dead (jolt-fiber-state pub-f)))
+(ok "publication: and the error arrived with the state"
+    (condition? (jolt-fiber-error pub-f)))
 
 ;; 8. yield outside a fiber is a clean error (the vreg is the dispatcher)
 (ok "yield outside a fiber raises"

@@ -442,15 +442,24 @@
 ;;
 ;; The scheduler refuses to preempt while the count is non-zero and retries
 ;; shortly after, so nothing is lost: the preemption lands just past the region.
+;;
+;; ENQUEUEING A FIBER THAT IS ALREADY QUEUED IS NOT A DUPLICATE, IT IS A CYCLE.
+;; If f is the only queued fiber then tail is f, so the first branch writes
+;; f.next = f and the queue never drains again — the carrier dispatches the same
+;; fiber forever. That is why sa-fiber-resume decides and enqueues under this
+;; mutex rather than checking the state first and enqueueing after.
+(define (jolt-fiber-enqueue!/locked c f)
+  (if (jolt-carrier-tail c)
+      (begin (jolt-fiber-next-set! (jolt-carrier-tail c) f)
+             (jolt-carrier-tail-set! c f))
+      (begin (condition-signal (jolt-carrier-cv c))
+             (jolt-carrier-head-set! c f)
+             (jolt-carrier-tail-set! c f))))
+
 (define (jolt-fiber-enqueue! c f)
   (begin
     (jolt-lock! (jolt-carrier-mu c))
-    (if (jolt-carrier-tail c)
-        (begin (jolt-fiber-next-set! (jolt-carrier-tail c) f)
-               (jolt-carrier-tail-set! c f))
-        (begin (condition-signal (jolt-carrier-cv c))
-               (jolt-carrier-head-set! c f)
-               (jolt-carrier-tail-set! c f)))
+    (jolt-fiber-enqueue!/locked c f)
     (jolt-unlock! (jolt-carrier-mu c))))
 
 (define (jolt-fiber-dequeue! c)
@@ -605,10 +614,27 @@
 ;; the fiber's own carrier, never another's). A no-op when the fiber is
 ;; already runnable — a double wakeup (a value and a timeout both firing is
 ;; exactly the R4 alts! commit race) must not corrupt the queue.
+;;
+;; The test and the transition are ONE step, under the carrier's queue mutex.
+;; Written as a check and then an enqueue they are not: two threads that both
+;; read 'parked both enqueue, and a second enqueue of a fiber that is already the
+;; sole queued one writes f.next = f (see jolt-fiber-enqueue!/locked). That is a
+;; queue that never drains, not a fiber dispatched twice.
+;;
+;; Nothing reachable does that today — a channel wake goes through alt-claim!,
+;; which hands a handler to exactly one deliverer, and ldr-end-load! drains its
+;; waiter list under ldr-load-mu — but this is an `sa-` seam that reads as a
+;; general primitive, and the failure it would produce is a silent hang. The
+;; queue mutex is the LAST lock in the order and this path takes nothing else, so
+;; holding it across the decision closes no cycle and costs an acquire the
+;; enqueue was going to pay anyway.
 (define (sa-fiber-resume f)
-  (when (eq? (jolt-fiber-state f) 'parked)
-    (jolt-fiber-state-set! f 'ready)
-    (jolt-fiber-enqueue! (jolt-fiber-carrier f) f)))
+  (let ((c (jolt-fiber-carrier f)))
+    (jolt-lock! (jolt-carrier-mu c))
+    (when (eq? (jolt-fiber-state f) 'parked)
+      (jolt-fiber-state-set! f 'ready)
+      (jolt-fiber-enqueue!/locked c f))
+    (jolt-unlock! (jolt-carrier-mu c))))
 
 ;; (sa-fiber-spawn thunk) -> fiber. Create a fiber running THUNK, place it
 ;; round-robin on a carrier, and make it runnable; return the record.
@@ -830,17 +856,38 @@
            (let ((st (jolt-fiber-state f)))
              (cond
                ;; Already finished: deliver inline, reading the SAME field
-               ;; jolt-fiber-notify-monitors! reads. 'done must not be assumed
-               ;; to mean success — a go body that threw is caught inside the
-               ;; fiber thunk and reaches 'done with its error field set.
+               ;; jolt-fiber-finish! writes, under the SAME mutex it publishes
+               ;; the state through — so "finished" and "with this outcome"
+               ;; are one observation. 'done must not be assumed to mean
+               ;; success: a go body that threw is caught inside the fiber
+               ;; thunk and reaches 'done with its error field set.
                ((or (eq? st 'done) (eq? st 'dead)) (list (jolt-fiber-error f)))
                (else
                 (jolt-fiber-monitors-set! f (cons proc (jolt-fiber-monitors f)))
                 #f))))))
     (when now (proc (car now)))))
 
-;; Called from jolt-fiber-done! / jolt-fiber-dead!, BEFORE they escape to the
-;; scheduler — those never return, so anything after the escape would not run.
+;; (jolt-fiber-finish! f state err) — publish the fiber's completion and hand its
+;; monitors the outcome. Called from jolt-fiber-done! / jolt-fiber-dead!, BEFORE
+;; they escape to the scheduler — those never return, so anything after the
+;; escape would not run.
+;;
+;; THE TERMINAL STATE IS SET HERE, under the same mutex jolt-fiber-monitor! reads
+;; it through, and that is the point of this function rather than a detail of it.
+;; The state is what tells a late registration to deliver inline and the error is
+;; what it delivers, so the two have to become visible together. Set outside the
+;; lock they were two steps in the wrong order: jolt-fiber-dead! marked the fiber
+;; 'dead and only then wrote the condition, so a fiber-monitor call from another
+;; thread landing between them read a finished fiber with no error and reported a
+;; body that threw as a clean completion — which is the one thing monitoring
+;; exists to make visible. Every other field a monitor or a waiting gate reads
+;; (result, error) is written by the caller BEFORE it gets here, for the same
+;; reason: the state publishes them.
+;;
+;; err is the condition for a fiber that DIED, or #f to keep whatever the body
+;; already recorded — jolt-fiber-go-spawn catches a throwing body itself and
+;; writes the field before it returns, so a fiber can reach 'done with an error
+;; and the monitor has to see it.
 ;;
 ;; The list is taken and cleared under the mutex so a monitor cannot fire twice,
 ;; and the monitors themselves run OUTSIDE it: they are user code, they run on
@@ -848,15 +895,23 @@
 ;; monitor deadlock every other fiber's registration. A monitor that raises is
 ;; contained so it cannot stop the remaining ones or corrupt the completion —
 ;; the fiber is already finishing and there is nowhere left to report to.
-(define (jolt-fiber-notify-monitors! f err)
+(define (jolt-fiber-finish! f state err)
   (let ((ms (jolt-with-mutex jolt-fiber-monitor-mu
+              (when err (jolt-fiber-error-set! f err))
+              (jolt-fiber-state-set! f state)
               (let ((ms (jolt-fiber-monitors f)))
                 (jolt-fiber-monitors-set! f '())
                 ms))))
-    (let loop ((ms ms))
-      (unless (null? ms)
-        (guard (e (#t #f)) ((car ms) err))
-        (loop (cdr ms))))))
+    ;; Read AFTER the lock, which is safe for the same reason it was safe to
+    ;; write inside it: the fiber is terminal now, this is the only thread that
+    ;; ever writes the field, and a jolt-fiber-monitor! that got in first took
+    ;; the list with it. So this is the value that call saw, or the one it would
+    ;; have seen.
+    (let ((out (jolt-fiber-error f)))
+      (let loop ((ms ms))
+        (unless (null? ms)
+          (guard (e (#t #f)) ((car ms) out))
+          (loop (cdr ms)))))))
 
 ;; --- the scheduler ----------------------------------------------------------
 ;; Resume (or first-run) fiber f on ITS carrier's thread, returning to the
@@ -988,35 +1043,37 @@
     (else (error 'jolt-fiber-run "fiber in unexpected state"
                  (jolt-fiber-state f)))))
 
-;; Completion paths: mark the fiber, drop the consumed continuation, clear the
-;; current-fiber vreg (the scheduler owns the CPU now — a stale vreg would make
-;; a later yield from a non-fiber context enqueue a dead fiber and invoke the
-;; consumed sched-k), then hand control back to the scheduler — again via the
-;; fiber's OWN carrier, the only one that can be running it. The carrier field
-;; is deliberately NOT cleared: placement is fixed at spawn (R0(d)) and the
+;; Completion paths: settle the fiber's payload, drop the consumed continuation,
+;; PUBLISH the terminal state (jolt-fiber-finish!, which also runs the monitors),
+;; clear the current-fiber vreg (the scheduler owns the CPU now — a stale vreg
+;; would make a later yield from a non-fiber context enqueue a dead fiber and
+;; invoke the consumed sched-k), then hand control back to the scheduler — again
+;; via the fiber's OWN carrier, the only one that can be running it. The carrier
+;; field is deliberately NOT cleared: placement is fixed at spawn (R0(d)) and the
 ;; gates assert on it after completion.
+;;
+;; The state goes LAST of the record writes, because it is what makes the rest
+;; readable from another thread: a monitor registering concurrently, and every
+;; gate that waits on a fiber by polling its state and then reading its result.
 (define (jolt-fiber-done! f r)
-  (jolt-fiber-state-set! f 'done)
   (jolt-fiber-result-set! f r)
   (jolt-fiber-k-set! f #f)
   (jolt-fiber-sm-set! f #f)
   (jolt-fiber-slice-set! f #f)
-  ;; NOT a literal #f: jolt-fiber-go-spawn catches a throwing body inside the
-  ;; fiber thunk (it has to, so it can report and close the go channel), so that
-  ;; fiber finishes NORMALLY and only its error field says otherwise. Reading the
-  ;; field here is what makes a monitor see those, and it is #f for a fiber that
-  ;; genuinely succeeded.
-  (jolt-fiber-notify-monitors! f (jolt-fiber-error f))
+  ;; #f and not a condition: jolt-fiber-go-spawn catches a throwing body inside
+  ;; the fiber thunk (it has to, so it can report and close the go channel), so
+  ;; that fiber finishes NORMALLY and only its error field says otherwise. #f
+  ;; means "keep what the body recorded", which is that condition, or nothing for
+  ;; a fiber that genuinely succeeded.
+  (jolt-fiber-finish! f 'done #f)
   (set-virtual-register! jolt-vreg-current-fiber 0)
   ((jolt-carrier-sched-k (jolt-fiber-carrier f))))
 
 (define (jolt-fiber-dead! f e)
-  (jolt-fiber-state-set! f 'dead)
-  (jolt-fiber-error-set! f e)
   (jolt-fiber-k-set! f #f)
   (jolt-fiber-sm-set! f #f)
   (jolt-fiber-slice-set! f #f)
-  (jolt-fiber-notify-monitors! f e)
+  (jolt-fiber-finish! f 'dead e)
   (set-virtual-register! jolt-vreg-current-fiber 0)
   ((jolt-carrier-sched-k (jolt-fiber-carrier f))))
 
