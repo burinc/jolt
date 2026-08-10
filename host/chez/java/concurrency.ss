@@ -940,21 +940,56 @@
 ;; This BORROWS the timer, and on a fiber the timer belongs to the scheduler: it
 ;; is what preempts a compute-bound fiber so the ones queued behind it on the same
 ;; carrier are not starved. So both halves have to go back, the handler and the
-;; tick. Every exit below used to end with a bare (set-timer 0), which returns the
-;; handler and keeps the tick, and only the fiber's NEXT dispatch arms again — so a
-;; fiber that borrowed the timer once and then never parked pinned its carrier
-;; (jolt-ly62). jolt-fiber-rearm-preempt! puts it back, and does nothing off a
-;; fiber, where there was never anything armed to restore.
+;; tick. It used to end with a bare (set-timer 0), which returns the handler and
+;; keeps the tick, and only the fiber's NEXT dispatch arms again — so a fiber that
+;; borrowed the timer once and then never parked pinned its carrier (jolt-ly62).
+;; jolt-fiber-rearm-preempt! puts it back, and does nothing off a fiber, where
+;; there was never anything armed to restore.
 ;;
 ;; It lives in fibers.ss, which rt.ss loads AFTER this file; the reference resolves
 ;; at call time, the same forward reference async.ss makes to jolt-fiber-go-spawn
 ;; and for the same reason. No fiber can exist before the boot finishes loading.
 ;;
-;; There are two exits, not one: the guard re-raises past the call/cc, so it never
-;; reaches the lines after it and has to hand the timer back itself. The
-;; (set-timer 0) between the thunk and the outer restore stays a plain disarm on
-;; purpose — the borrower's handler is still installed there, and arming a fiber
-;; quantum into it would let the borrow outlive itself.
+;; WHY THE BORROW IS A dynamic-wind AND NOT THREE HAND-WRITTEN EXITS (jolt-1rod).
+;;
+;; It was three: a normal return, a guard for a raise, and the call/cc for its own
+;; interrupt escape. A fiber PARK is a fourth way out and it was none of them — it
+;; escapes through the carrier's sched-k, and timer-interrupt-handler is a setter
+;; write on a per-thread parameter, so a continuation escape does not undo it.
+;; jolt-fiber-install-preempt-handler! runs once per DRAIN rather than per
+;; dispatch, so the borrower's handler then stayed live over every later fiber on
+;; that carrier, and it failed two ways at once:
+;;
+;;   - that handler answers a quantum by re-arming its own tick and returning, so
+;;     nothing on the carrier was preempted again. Measured at a 20,000 tick
+;;     quantum: 0 preemptions in 0.5s behind a fiber parked inside a borrow. That
+;;     is the unbounded starvation window the head of fibers.ss says no setting can
+;;     open, reachable from ordinary jolt code.
+;;   - the handler closes over the call/cc continuation captured in the PARKED
+;;     fiber's stack. A later interrupt! fired it under whichever fiber owned the
+;;     carrier and invoked that continuation: the parked fiber returned from a park
+;;     it never came back from, and the running fiber was abandoned mid-computation
+;;     — 'running for the life of the process, its go channel never closed, every
+;;     reader of it waiting, and no error naming any of it.
+;;
+;; A wind is the answer the rest of the runtime already gives for state that must
+;; survive a park: the after-thunk hands the timer back on the way out and the
+;; before-thunk re-takes it on the way in, so the borrow is SUSPENDED across a park
+;; rather than leaking past it. It is jolt-with-mutex's rule and the opposite of
+;; jolt-with-monitor's, and the difference is what each thing is: a monitor must
+;; still be held when the fiber comes back, the carrier's timer must not.
+;;
+;; The other three exits come out of the same after-thunk, so they are no longer
+;; written separately. And an interrupt raised while the borrower is parked is not
+;; lost — the resume re-arms the borrowed tick, so it lands on the fiber that asked
+;; for it, on its own carrier time.
+;;
+;; WHAT THIS RESTS ON, the same thing jolt-with-monitor's after-thunk rests on: a
+;; CHEAP park (java/sm.ss) never rewinds, so it would fire this after-thunk and
+;; never run the before-thunk again — the borrow would end with the computation
+;; still inside it. It cannot happen because run-interruptible takes its body as a
+;; THUNK and fn* is opaque to the CPS pass, so a park in there falls back to a
+;; capture. run-gosm.ss section 1d is where that argument is checked.
 (define interrupt-check-ticks 100000)   ; ~poll interval; responsive + low overhead
 (define interrupt-sentinel (cons 'jolt 'interrupted))
 (define jolt-kw-interrupted (keyword "jolt" "interrupted"))
@@ -962,29 +997,37 @@
 (define (jolt-interrupt! token) (when (box? token) (set-box! token #t)) jolt-nil)
 (define (jolt-interrupted? token) (and (box? token) (unbox token) #t))
 (define (jolt-run-interruptible token thunk)
-  (let ((prev-handler (timer-interrupt-handler)))
-    (let ((r (call/cc
-               (lambda (k)
-                 (timer-interrupt-handler
-                   (lambda ()
-                     (if (and (box? token) (unbox token))
-                         (k interrupt-sentinel)
-                         (begin (set-timer interrupt-check-ticks) (void)))))
-                 (set-timer interrupt-check-ticks)
-                 ;; guard ensures timer+handler are disarmed on EVERY exit from
-                 ;; the thunk — normal return, exception raise, and escape-continuation
-                 ;; jump (the outer set-timer/handler handles the interrupt case).
-                 (guard (e (#t (set-timer 0)
-                               (timer-interrupt-handler prev-handler)
-                               (jolt-fiber-rearm-preempt!)
-                               (raise e)))
-                   (let ((v (thunk))) (set-timer 0) v))))))
-      (set-timer 0)
-      (timer-interrupt-handler prev-handler)
-      (jolt-fiber-rearm-preempt!)
-      (if (eq? r interrupt-sentinel)
-          (jolt-throw (jolt-ex-info "Evaluation interrupted" (jolt-hash-map jolt-kw-interrupted #t)))
-          r))))
+  ;; Captured ONCE, outside the wind: a before-thunk that re-read it would, on a
+  ;; resume, save the handler the SCHEDULER had put back and restore that on the
+  ;; real exit — the borrow would hand the carrier its own handler a second time
+  ;; and lose whatever an enclosing borrow had installed.
+  (let* ((prev-handler (timer-interrupt-handler))
+         (r (call/cc
+              (lambda (k)
+                (dynamic-wind
+                  (lambda ()
+                    (timer-interrupt-handler
+                      (lambda ()
+                        (if (and (box? token) (unbox token))
+                            (k interrupt-sentinel)
+                            (begin (set-timer interrupt-check-ticks) (void)))))
+                    (set-timer interrupt-check-ticks))
+                  (lambda () (thunk))
+                  ;; Runs on every way out of the body, the park included. Disarm
+                  ;; BEFORE restoring the handler: the other order leaves a window
+                  ;; where the borrowed tick can fall due on the scheduler's
+                  ;; handler, which answers it by preempting.
+                  (lambda ()
+                    (set-timer 0)
+                    (timer-interrupt-handler prev-handler)
+                    ;; Off a fiber, and on a park (the current-fiber vreg is
+                    ;; already cleared by then), this is a plain disarm — which is
+                    ;; what the scheduler wants for the carrier it is about to take
+                    ;; back. On a real exit from a fiber it re-arms the quantum.
+                    (jolt-fiber-rearm-preempt!)))))))
+    (if (eq? r interrupt-sentinel)
+        (jolt-throw (jolt-ex-info "Evaluation interrupted" (jolt-hash-map jolt-kw-interrupted #t)))
+        r)))
 (def-var! "jolt.host" "make-interrupt" jolt-make-interrupt)
 (def-var! "jolt.host" "interrupt!" jolt-interrupt!)
 (def-var! "jolt.host" "interrupted?" jolt-interrupted?)

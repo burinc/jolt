@@ -400,6 +400,106 @@
                     "11. the interrupted fiber finishes")
         (unbox caught))))
 
+;; --- 11b. a PARK inside the borrow gives the timer back too (jolt-1rod) -------
+;; Section 11 covers the borrow ENDING. This one covers the borrow being
+;; suspended, which is a different exit and was not one at all.
+;;
+;; run-interruptible hands the timer back on a normal return, on a raise (its
+;; guard) and on its own interrupt escape (its call/cc). A fiber park is none of
+;; those: it escapes through the carrier's sched-k, and timer-interrupt-handler is
+;; a setter write on a per-thread parameter, so nothing undoes it. The handler is
+;; installed per DRAIN, not per dispatch, so the borrower's handler then stays live
+;; over every later fiber on that carrier.
+;;
+;; That handler answers a quantum by re-arming its own tick and returning, so
+;; nothing on the carrier is ever preempted again — the unbounded starvation
+;; window the head of fibers.ss says no setting can open, reachable from ordinary
+;; jolt code through jolt.host/run-interruptible.
+(jolt-fiber-pool-reset!)
+(jolt-fiber-carrier-count-set! 1)
+(jolt-fiber-preempt-ticks-set! 20000)
+
+(define rp-ch (ac-make 1 'fixed #f))
+(define rp-stop (box #f))
+(define rp-b-handler (box 'unset))
+(define rp-b-ran (box #f))
+(define rp-returned (box #f))
+(define rp-a
+  (sa-fiber-spawn
+   (lambda ()
+     ;; a token nobody sets; the thunk PARKS instead of returning
+     (jolt-run-interruptible (jolt-make-interrupt) (lambda () (jolt-fiber-<! rp-ch)))
+     (set-box! rp-returned #t))))
+(define rp-b
+  (sa-fiber-spawn
+   (lambda ()
+     ;; read on entry: this is the handler the carrier hands the NEXT fiber
+     (set-box! rp-b-handler
+               (if (eq? (timer-interrupt-handler) jolt-fiber-preempt-handler)
+                   'scheduler 'borrowed))
+     (set-box! rp-b-ran #t)
+     (spin-until rp-stop))))
+(jolt-fiber-ensure-carrier!)
+(wait-until (lambda () (unbox rp-b-ran)) 5.0 "11b. the queued fiber runs while A is parked")
+(ok "11b. A parked inside the borrow" (eq? 'parked (jolt-fiber-state rp-a)))
+(ok "11b. the carrier got its own handler back" (eq? 'scheduler (unbox rp-b-handler)))
+(define rp-before (jolt-fiber-preempts))
+(sleep (make-time 'time-duration 300000000 0))   ; 0.3s: many quanta at 20k ticks
+(ok "11b. and the spinner behind it is still preemptible"
+    (> (jolt-fiber-preempts) rp-before))
+
+;; The nastier half. The borrowed handler closes over the call/cc continuation
+;; captured in A's stack, so left installed it fires under B and invokes it: A
+;; returns from a park it never came back from and B is abandoned mid-computation,
+;; state 'running for the life of the process with no error naming any of it.
+;;
+;; An interrupt raised while A is parked belongs to A, and A is not on the CPU, so
+;; it must land when A comes back and nowhere else.
+(define rp-tok2 (jolt-make-interrupt))
+(define rp-ch2 (ac-make 1 'fixed #f))
+(define rp-stop2 (box #f))
+(define rp-c-done (box #f))
+(define rp-a2-caught (box #f))
+(define rp-a2
+  (sa-fiber-spawn
+   (lambda ()
+     (guard (e (#t (set-box! rp-a2-caught #t)))
+       ;; parks, then spins — the spin is what the re-established borrow has to
+       ;; interrupt. A thunk that returned straight after the park would prove
+       ;; only that nothing crashed: there would be nothing left to abort.
+       (jolt-run-interruptible
+        rp-tok2
+        (lambda ()
+          (jolt-fiber-<! rp-ch2)
+          (let loop ((i 0)) (if (fx=? i 1000000000) i (loop (fx+ i 1))))))))))
+(define rp-c
+  (sa-fiber-spawn
+   (lambda () (spin-until rp-stop2) (set-box! rp-c-done #t))))
+(set-box! rp-stop #t)                       ; let B off the carrier first
+(wait-until (lambda () (eq? 'done (jolt-fiber-state rp-b))) 5.0 "11b. B completes")
+(wait-until (lambda () (eq? 'parked (jolt-fiber-state rp-a2))) 5.0 "11b. A2 parks in the borrow")
+(jolt-interrupt! rp-tok2)                   ; fires while C owns the carrier
+(sleep (make-time 'time-duration 300000000 0))
+(ok "11b. an interrupt for a parked fiber does not resume it"
+    (eq? 'parked (jolt-fiber-state rp-a2)))
+(set-box! rp-stop2 #t)
+(wait-until (lambda () (unbox rp-c-done)) 5.0 "11b. the running fiber is not abandoned")
+(ok "11b. the fiber that owned the carrier still finished"
+    (and (unbox rp-c-done) (eq? 'done (jolt-fiber-state rp-c))))
+;; and the interrupt is not lost — the resume re-takes BOTH halves of the borrow,
+;; so the tick falls due inside the borrower's own spin and aborts it there. That
+;; is also what says the before-thunk really re-established the handler: with only
+;; the tick back, the scheduler's handler would preempt the spin forever instead.
+(jolt-async-give rp-ch2 1)
+(wait-until (lambda () (memq (jolt-fiber-state rp-a2) '(done dead))) 20.0 "11b. A2 finishes")
+(ok "11b. the interrupt reaches the borrower on its own resume" (unbox rp-a2-caught))
+
+;; A's own borrow still ends properly once it is fed.
+(jolt-async-give rp-ch 1)
+(wait-until (lambda () (unbox rp-returned)) 5.0 "11b. A returns from the borrow")
+(ok "11b. the parked borrower returned normally"
+    (and (unbox rp-returned) (eq? 'done (jolt-fiber-state rp-a))))
+
 ;; --- 12. a fiber that has committed to park is not preempted (jolt-9d3m) -----
 ;; The channel ops bracket the commit and the switch in disable-interrupts and say
 ;; why: they are ONE transition and a timer landing between them finds the fiber

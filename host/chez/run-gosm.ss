@@ -382,6 +382,14 @@
 ;; wind gone, so nothing ever releases it and every later contender waits forever with
 ;; no error anywhere.
 ;;
+;; jolt.host/run-interruptible is the second member, and it winds the other way round
+;; (jolt-1rod): its after-thunk hands the carrier's timer back on a park and its
+;; before-thunk re-takes it on the resume, so a monitor must still be held when the
+;; fiber returns and the timer must not. A cheap park would break it in the mirror
+;; direction — the borrow would END with the computation still inside it, leaving the
+;; fiber running on the scheduler's quantum inside a region that thinks it owns the
+;; timer. Same protection, same check.
+;;
 ;; What keeps that from happening is `fn*` being opaque to the pass: `locking` hands its
 ;; body over as a thunk, the pass never descends into it, and the park inside falls back
 ;; to a capture, which rewinds properly. That is also the only way in — a park inside a
@@ -413,6 +421,15 @@
             (emits-park? "(go (do (locking mobj :a) (<! ch)))") #t)
 (gate-check "1d. and one before it"
             (emits-park? "(go (do (<! ch) (locking mobj :a)))") #t)
+;; the same three shapes for the other winder in that class
+(ev "(def itok (jolt.host/make-interrupt))")
+(gate-check "1d. a body with a timer borrow is still CPS'd"
+            (gate-sub? (emit-scheme "(go (do (jolt.host/run-interruptible itok (fn [] :a)) (<! ch)))")
+                       "\"__sm-spawn\"") #t)
+(gate-check "1d. a park inside run-interruptible is NOT rewritten"
+            (emits-park? "(go (jolt.host/run-interruptible itok (fn [] (<! ch))))") #f)
+(gate-check "1d. a park AFTER the borrow still is"
+            (emits-park? "(go (do (jolt.host/run-interruptible itok (fn [] :a)) (<! ch)))") #t)
 
 ;; --- 2. the counters, on the :fiber backend ---------------------------------
 (printf "\n== 2. cheap parks vs captures, per park site ==\n")
