@@ -198,10 +198,20 @@
 ;; carries it in pcb-sic and rebuilds it on the far side (erlang.ss:958-968);
 ;; jolt-fiber-sic is that field, and jolt-adjust-interrupts! is that loop.
 ;;
-;; Neither disable-interrupts nor enable-interrupts needs a primitive to read the
-;; count: both RETURN the new one, so a disable/enable pair measures it.
-(define (jolt-current-disable-count)
-  (let ((n (disable-interrupts))) (enable-interrupts) (fx- n 1)))
+;; The count is READ from the thread context, never derived. A disable/enable
+;; pair also answers the question — both primitives return the new count — but a
+;; pair is not a read: the enable is a delivery point for anything deferred
+;; while interrupts were off, and every caller here is on a park path that has
+;; already dropped its finally winders and committed to leaving. Swish reads it
+;; too (erlang.ss:792). The fallback keeps the R1 gate's standalone load of this
+;; file working, where no adapter has been loaded. It is the old derivation, so
+;; it carries the old delivery window — that gate arms a timer like any other
+;; drain does — but it is what this file did everywhere until now, so the
+;; standalone path is no worse than it was and every path with an adapter is
+;; better. Section 10 of the preempt gate is what holds that line.
+(define jolt-current-disable-count
+  (guard (e (#t (lambda () (let ((n (disable-interrupts))) (enable-interrupts) (fx- n 1)))))
+    sa-disable-count))
 (define (jolt-adjust-interrupts! from to)
   (let loop ((n from))
     (cond ((fx>? n to) (enable-interrupts) (loop (fx- n 1)))
@@ -708,8 +718,8 @@
     (when (and (fixnum? v) (fx>=? v jolt-fiber-preempt-ticks-min))
       (set! jolt-fiber-preempt-ticks-global v))))
 (define (jolt-fiber-preempt-ticks-set! n)
-  ;; #f restores the default rather than turning preemption off — there is no off.
-  ;; #f restores the default quantum. There is no "off".
+  ;; #f restores the default quantum rather than turning preemption off. There
+  ;; is no "off": cooperative-only is an unbounded starvation window.
   (when (and n (not (and (fixnum? n) (fx>=? n jolt-fiber-preempt-ticks-min))))
     (error 'jolt-fiber-preempt-ticks-set!
            "preempt ticks must be #f or a fixnum >= jolt-fiber-preempt-ticks-min"
@@ -871,14 +881,18 @@
         ;; Put the carrier back to the interrupt depth this fiber parked at. A
         ;; first run starts at the carrier's own baseline.
         ;;
-        ;; ORDER MATTERS FROM HERE. jolt-current-disable-count enables in order to
-        ;; measure, and that enable can DELIVER a timer deferred by the previous
-        ;; fiber. So the current-fiber register is published only after the depth
-        ;; is settled: a timer arriving during the adjust then finds no fiber and
+        ;; ORDER MATTERS FROM HERE. The adjust ENABLES whenever it is walking the
+        ;; count down (the carrier sits deeper than the fiber parked), and an
+        ;; enable that reaches 0 delivers whatever the previous fiber deferred.
+        ;; So the current-fiber register is published only after the depth is
+        ;; settled: a timer arriving during the adjust then finds no fiber and
         ;; does nothing, instead of preempting a fiber that has not started. That
         ;; case does not merely lose a quantum — the handler would park through a
         ;; continuation captured mid-dispatch, and re-entering jolt-fiber-resume*
         ;; would invoke an already-consumed one-shot continuation.
+        ;; Reading the count is not itself a delivery point (see
+        ;; jolt-current-disable-count); the adjust is, which is why the order is
+        ;; measure, adjust, THEN publish rather than anything else.
         (jolt-adjust-interrupts! (jolt-current-disable-count)
                                  (if (jolt-fiber-k f) (jolt-fiber-sic f) base))
         (set-virtual-register! jolt-vreg-current-fiber f)

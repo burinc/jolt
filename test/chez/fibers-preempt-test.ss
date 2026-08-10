@@ -265,8 +265,61 @@
     (> (jolt-fiber-preempts) lk-before))
 (ok "9. no lock left held on the carrier" (= 0 (jolt-locks-held)))
 
+;; --- 10. reading the interrupt depth is a QUERY, not a delivery point --------
+;; The scheduler asks for the current disable-interrupts depth on every switch,
+;; to carry it across the park (swish's pcb-sic). It used to DERIVE the answer:
+;; both primitives return the new count, so a disable/enable pair tells you what
+;; you started at. But that pair is not a read. An enable that brings the count
+;; back to 0 delivers whatever was deferred while interrupts were off, and every
+;; caller of this is on a park path that has already dropped its finally winders
+;; and committed to leaving — the worst place in the runtime to run an arbitrary
+;; handler. It now reads the thread-context field instead, as swish does.
+;;
+;; The re-entrancy check below is the one that distinguishes the two. A Chez
+;; timer handler runs at disable-count 0 (probed, not assumed), so a handler that
+;; re-arms and then asks for the depth is exactly the shape where the old pair
+;; delivers: the disable defers the new tick and the enable hands it straight
+;; back, re-entering the handler. Mutation-verified by restoring the pair.
 (jolt-fiber-preempt-ticks-set! #f)
 (jolt-fiber-pool-reset!)
+
+(define (derived-depth) (let ((n (disable-interrupts))) (enable-interrupts) (fx- n 1)))
+
+(ok "10. depth reads 0 with interrupts on" (= 0 (jolt-current-disable-count)))
+(ok "10. agrees with the derivation at every depth"
+    (let loop ((k 0) (agree #t))
+      (if (= k 4)
+          (begin (do ((i 0 (+ i 1))) ((= i 4)) (enable-interrupts)) agree)
+          (begin (disable-interrupts)
+                 (loop (+ k 1) (and agree (= (jolt-current-disable-count)
+                                             (derived-depth)
+                                             (+ k 1))))))))
+(ok "10. reading does not disturb the depth"
+    (let ((before (jolt-current-disable-count)))
+      (do ((i 0 (+ i 1))) ((= i 1000)) (jolt-current-disable-count))
+      (and (= before (jolt-current-disable-count)) (= 0 before))))
+
+;; Re-entrancy: arm a fresh tick from inside the handler, THEN read the depth.
+(define re-depth 0)
+(define re-entered #f)
+(define re-in #f)
+(define re-saved (timer-interrupt-handler))
+(timer-interrupt-handler
+ (lambda ()
+   (when re-in (set! re-entered #t))
+   (set! re-in #t)
+   (set! re-depth (+ re-depth 1))
+   (when (< re-depth 3) (set-timer 1))     ; a tick falls due immediately
+   (jolt-current-disable-count)            ; the pair would hand it back here
+   (set! re-in #f)))
+(set-timer 1)
+(let loop ((i 0)) (when (and (fx< i 20000000) (fx< re-depth 3)) (loop (fx+ i 1))))
+(set-timer 0)
+(timer-interrupt-handler re-saved)
+(ok "10. the timer handler actually ran" (>= re-depth 1))
+(ok "10. reading the depth did not re-enter the handler" (not re-entered))
+(ok "10. depth back to 0 after the handler storm" (= 0 (jolt-current-disable-count)))
+
 (printf "\nfibers-preempt-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "fibers-preempt-test: PASS — preemptive scheduling\n") (exit 0))

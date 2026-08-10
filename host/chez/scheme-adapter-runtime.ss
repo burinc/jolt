@@ -471,6 +471,28 @@
 (define (sa-current-winders) (#%$current-winders))
 (define (sa-current-winders-set! w) (#%$current-winders w))
 
+;; (sa-disable-count) -> how many nested disable-interrupts this thread is
+;; inside; 0 when interrupts are on. Chez keeps it in the thread context, and
+;; swish reads it from there (erlang.ss:792, current-disable-count) rather than
+;; deriving it.
+;;
+;; Deriving it is what fibers.ss used to do — (disable-interrupts) returns the
+;; new count, so a disable/enable pair answers the question — and the pair is
+;; NOT equivalent to a read. It momentarily re-enables, and an enable that
+;; brings the count to 0 is a delivery point for anything deferred while
+;; interrupts were off. That put a delivery point inside jolt-fiber-park!, on
+;; the far side of jolt-park-drop-finallys! and with the fiber already committed
+;; to leaving: a Chez timer handler runs at disable-count 0 (probed, not
+;; assumed), so the preempt handler's own park measured from 0 and the pair
+;; enabled right back to it. A read cannot deliver anything. It is also about
+;; cheaper, which matters because the scheduler does this on every switch.
+;;
+;; #3% and not #%, which is swish's spelling too. The safe entry point resolves
+;; the field NAME at run time and costs 10 ns, twice what the disable/enable pair
+;; it replaces costs; the unsafe one compiles to the field access and costs 2 ns.
+;; What #3% gives up is argument checking, and both arguments here are literal.
+(define (sa-disable-count) (#3%$tc-field 'disable-count (#3%$tc)))
+
 
 ;; locks.ss first: fibers.ss uses the counting lock wrapper, and jolt-with-mutex
 ;; is a macro, so it must be defined before this load rather than captured at
