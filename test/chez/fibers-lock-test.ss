@@ -262,7 +262,12 @@
 (wait-until (lambda () (unbox l5-thread-got)) 5.0 "5. the thread gets in once the fiber leaves")
 (thread-join l5-t)
 (ok "5. and it found the monitor empty when it did" (eqv? 0 (unbox l5-thread-saw-occ)))
-(ok "5. the fiber completed" (eq? 'done (jolt-fiber-state l5-a)))
+;; waited for rather than asserted outright, for the reason 9h spells out: an OS
+;; thread waiter runs alongside the carrier, so its progress does not mean the
+;; fiber that let it in has been published 'done yet.
+(define l5-done
+  (wait-until (lambda () (eq? 'done (jolt-fiber-state l5-a))) 5.0 "5. the fiber completed"))
+(ok "5. the fiber completed" l5-done)
 
 ;; --- 6. the properties a monitor already had ----------------------------------
 ;; Regressions, all of them on the fiber that the sections above changed the
@@ -730,7 +735,14 @@
 (jolt-async-give r6-ch 1)
 (wait-until (lambda () (unbox r6-thread-got)) 5.0 "9h. the thread gets it once the fiber leaves")
 (thread-join r6-t)
-(ok "9h. the fiber completed" (eq? 'done (jolt-fiber-state r6-a)))
+;; WAITED FOR, not asserted outright: the waiter here is an OS thread, so it runs
+;; concurrently with the carrier rather than behind it. The fiber's rl-unlock is
+;; what lets the thread in, and the fiber still has to return from its body and be
+;; published 'done after that — a window the thread can win, and did on CI.
+(define r6-done
+  (wait-until (lambda () (eq? 'done (jolt-fiber-state r6-a))) 5.0
+              "9h. the fiber completed"))
+(ok "9h. the fiber completed" r6-done)
 (ok "9h. and the lock is free" (not (rl-locked? r6-lk)))
 (ok "9h. no lock left counted on this thread" (= 0 (jolt-locks-held)))
 
