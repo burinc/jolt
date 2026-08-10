@@ -119,7 +119,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck irvalidate devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck lockcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   certify gambitcheck fibers gosm threadsafety
 TEST-GATES := submodules selfhost ci
@@ -609,6 +609,14 @@ census:
 # contract file lists a name Chez does not provide.
 adaptercheck:
 	@$(CHEZ) --script host/scheme-adapter/chez.ss
+
+# Every lock in the runtime must route through jolt's wrapper, because
+# preemption is refused while one is held and that only works if the runtime can
+# tell. A wrapper nobody is obliged to use decays into the hand-marked scheme it
+# replaced, which is how the previous mechanism kept missing regions. The
+# allowlist records today's unmigrated sites and must only ever shrink.
+lockcheck:
+	@sh host/chez/lock-check.sh
 
 # Makefile dependency selection: explicit Chez overrides must bypass local
 # Makes provisioning so release jobs retain their chosen compiler and libc.
