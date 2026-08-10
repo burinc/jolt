@@ -40,14 +40,16 @@
 (printf "== fiber preemption ==\n")
 
 ;; --- 1. off by default ------------------------------------------------------
-;; OFF by default: preemption can still split any with-mutex region in the
-;; runtime, which loses atom updates (jolt-atc.7). Everything below exercises it
-;; explicitly so the machinery keeps working while that is outstanding.
-(ok "1. preemption is off by default" (not (jolt-fiber-preempt-ticks)))
+;; ON, and the only scheduling path. There is no off switch: cooperative-only is
+;; an unbounded starvation window, and a second path would get a fraction of the
+;; exercise the default one does.
+(ok "1. preemption is on, at the default quantum"
+    (eqv? (jolt-fiber-preempt-ticks) jolt-fiber-preempt-ticks-default))
 (jolt-fiber-preempt-ticks-set! 20000)
 (ok "1. host setter pins a quantum" (eqv? 20000 (jolt-fiber-preempt-ticks)))
 (jolt-fiber-preempt-ticks-set! #f)
-(ok "1. #f turns it off again" (not (jolt-fiber-preempt-ticks)))
+(ok "1. #f restores the default rather than disabling"
+    (eqv? (jolt-fiber-preempt-ticks) jolt-fiber-preempt-ticks-default))
 ;; A quantum below the floor cannot make progress, so it is refused rather than
 ;; allowed to livelock the carrier.
 (ok "1. a quantum below the floor is refused"
@@ -61,7 +63,7 @@
 ;; ONE carrier, so B has nowhere else to go. A spins on a box the driver flips;
 ;; the flag is how the test stops it without ever letting it park.
 ;; Section 2 wants the cooperative failure mode on purpose.
-(jolt-fiber-preempt-ticks-set! #f)
+(jolt-fiber-preempt-ticks-set! 10000000000)
 (jolt-fiber-pool-reset!)
 (jolt-fiber-carrier-count-set! 1)
 
@@ -126,9 +128,9 @@
 (ok "4. preemption did not bump the chan-park counter"
     (= chan-before (jolt-fiber-chan-parks)))
 
-;; --- 5. turning it off again starves again ----------------------------------
+;; --- 5. a long quantum starves again ----------------------------------------
 ;; The knob is read per dispatch rather than latched at pool start.
-(jolt-fiber-preempt-ticks-set! #f)
+(jolt-fiber-preempt-ticks-set! 10000000000)
 (jolt-fiber-pool-reset!)
 (jolt-fiber-carrier-count-set! 1)
 (define off-stop (box #f))
@@ -137,7 +139,7 @@
 (define off-b (sa-fiber-spawn (lambda () (set-box! off-b-ran #t))))
 (jolt-fiber-ensure-carrier!)
 (sleep (make-time 'time-duration 300000000 0))
-(ok "5. with preemption off the queued fiber starves again" (not (unbox off-b-ran)))
+(ok "5. with a long quantum the queued fiber starves again" (not (unbox off-b-ran)))
 (set-box! off-stop #t)
 (wait-until (lambda () (unbox off-b-ran)) 5.0 "5. B runs after A finishes")
 

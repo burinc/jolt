@@ -653,27 +653,17 @@
 ;; makes them rare rather than absent. A rare race in a scheduler is the worst
 ;; kind to ship: it surfaces as an inexplicable hang under load.
 ;;
-;; WHY IT IS STILL OFF, and it is not the races listed above — those are fixed
-;; and the channel stress is clean at the floor with 13k preemptions.
+;; It was off while preemption could still split a lock region. That is fixed:
+;; every lock in the runtime routes through the counting wrapper in locks.ss,
+;; and the handler below refuses to switch a fiber that holds one, retrying
+;; shortly after instead. The reproduction that used to lose an atom update on
+;; every run — four fibers on one carrier, 3000 increments each — is clean at the
+;; quantum floor and at quanta twenty times tighter.
 ;;
-;; jolt's runtime guards its shared state with `with-mutex`, in 235 places. A
-;; park unwinds dynamic-wind, so a preemption inside any of them RELEASES the
-;; mutex, lets another fiber into the section, and re-acquires on resume. The
-;; section is split, not protected. That is not a channel-layer problem to fix
-;; site by site; it is every with-mutex in the runtime.
-;;
-;; Demonstrated, deterministically, on jolt-atom-cas! — a with-mutex around a
-;; test-then-set, reached by an ordinary (swap! a inc). Four fibers on one
-;; carrier, 3000 increments each, quantum at the floor: 11999 of 12000, the same
-;; single lost update on every run. Nothing exotic, and at a quantum the setter
-;; accepts.
-;;
-;; Fixing it means making with-mutex itself preemption-safe, which is one macro
-;; rather than 235 edits, but it has to reconcile two things that pull opposite
-;; ways: the mutex must be re-acquired when a continuation rewinds, while the
-;; interrupt depth must NOT be, because that is carried across the switch by the
-;; sic field instead. Putting both in the same dynamic-wind double-counts the
-;; depth on resume. jolt-atc.7 has the analysis.
+;; There is no off switch. Cooperative-only is not a milder setting, it is an
+;; unbounded starvation window, and a second scheduling path would get a
+;; fraction of the exercise the default one does. Something that wants
+;; effectively cooperative behaviour asks for a very long quantum.
 ;;
 ;; The quantum is measured, not guessed: ticks are polled at calls and loop
 ;; back-edges, so on this machine ~100k ticks is 45us and the default below is
@@ -707,7 +697,7 @@
 ;; is still four orders of magnitude below the default.
 (define jolt-fiber-preempt-ticks-min 100)
 (define jolt-fiber-preempt-ticks-default 1000000)   ; ~0.45ms, measured
-(define jolt-fiber-preempt-ticks-global #f)   ; #f = off; see "WHY IT IS STILL OFF"
+(define jolt-fiber-preempt-ticks-global jolt-fiber-preempt-ticks-default)
 (define (jolt-fiber-preempt-ticks) jolt-fiber-preempt-ticks-global)
 (define (jolt-fiber-preempt-refresh!)
   (let ((v (guard (e (#t #f))
@@ -719,12 +709,12 @@
       (set! jolt-fiber-preempt-ticks-global v))))
 (define (jolt-fiber-preempt-ticks-set! n)
   ;; #f restores the default rather than turning preemption off — there is no off.
-  ;; #f turns preemption OFF; anything else must clear the floor.
+  ;; #f restores the default quantum. There is no "off".
   (when (and n (not (and (fixnum? n) (fx>=? n jolt-fiber-preempt-ticks-min))))
     (error 'jolt-fiber-preempt-ticks-set!
            "preempt ticks must be #f or a fixnum >= jolt-fiber-preempt-ticks-min"
            n jolt-fiber-preempt-ticks-min))
-  (set! jolt-fiber-preempt-ticks-global n)
+  (set! jolt-fiber-preempt-ticks-global (or n jolt-fiber-preempt-ticks-default))
   (guard (e (#t #f))
     (let ((cell (var-cell-lookup "clojure.core.async" "*fiber-preempt-ticks*")))
       (when (and cell (var-cell-defined? cell))
@@ -798,13 +788,10 @@
 ;; of a yield. Per drain still composes with jolt-run-interruptible, which saves
 ;; and restores the handler around its own thunk.
 (define (jolt-fiber-install-preempt-handler!)
-  (when jolt-fiber-preempt-ticks-global
-    (timer-interrupt-handler jolt-fiber-preempt-handler)))
+  (timer-interrupt-handler jolt-fiber-preempt-handler))
 (define (jolt-fiber-arm-preempt!)
-  (let ((ticks jolt-fiber-preempt-ticks-global))
-    (when ticks (set-timer ticks))))
-(define (jolt-fiber-disarm-preempt!)
-  (when jolt-fiber-preempt-ticks-global (set-timer 0)))
+  (set-timer jolt-fiber-preempt-ticks-global))
+(define (jolt-fiber-disarm-preempt!) (set-timer 0))
 
 ;; --- monitors (the observable half of swish's, erlang.ss:434) ----------------
 ;; A fiber that dies is otherwise unobservable. fibers-async.ss and sm.ss both
