@@ -68,6 +68,29 @@
                         (sa-foreign-procedure name args res)))))
          #'(if (eq? (sa-os-family) 'windows) win unx))))))
 
+;; Same, for an entry point that BLOCKS (a pipe read, sigwait). The call must be
+;; __collect_safe: a plain foreign call keeps the thread "active" for the
+;; stop-the-world collector, so a call parked on an idle pipe would freeze every
+;; other thread's GC. The caller owes it one more thing — anything C keeps a
+;; pointer to across the wait has to live in foreign memory, since the collector
+;; is free to move a bytevector while the thread is deactivated.
+(define-syntax jolt-foreign-proc-blocking
+  (lambda (x)
+    (syntax-case x (quote)
+      ((_ name (quote args) (quote res))
+       ;; Same runtime os-family test as jolt-foreign-proc-safe, for the same
+       ;; compile-file reason.
+       (with-syntax
+           ((win #'(guard (e (#t #f))
+                   (sa-load-shared-object #f)
+                   (and (sa-foreign-entry? name)
+                        (sa-foreign-procedure-runtime name (quote args) (quote res) #t))))
+            (unx #'(guard (e (#t #f))
+                   (sa-load-shared-object #f)
+                   (and (sa-foreign-entry? name)
+                        (sa-foreign-procedure-blocking name args res)))))
+         #'(if (eq? (sa-os-family) 'windows) win unx))))))
+
 ;; --- how many processors can this process use ---------------------------------
 ;; Backs jolt.host/available-processors, which Runtime.availableProcessors and
 ;; pmap's look-ahead window read. Each host is asked the question the JVM asks

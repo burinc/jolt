@@ -1067,6 +1067,13 @@
               "        (default (* 16 1024 1024)))\n"
               "    (if trip (or (string->number trip) default) default)))\n"))
           (put-string out "(scheme-start\n  (lambda args\n")
+          ;; Shutdown hooks (`:shutdown` on a jolt.process, jolt.host/
+          ;; add-shutdown-hook) run from Chez's exit-handler, which is a THREAD
+          ;; parameter — so the wrapper has to be installed on the thread that
+          ;; calls (exit), and for an app that is this one. Installed before the
+          ;; guard so the (exit 1) an uncaught throw takes runs the hooks too.
+          ;; The CLI's own twin of this is at the top of jolt-cli-run.
+          (unless library? (put-string out "    (jolt-install-exit-handler!)\n"))
           ;; The prologue (optional native loads + source-root setup) and the -main
           ;; call (or library export publish) run under one guard so a throw in
           ;; either surfaces as jolt-report-throwable + a non-zero exit/return

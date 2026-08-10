@@ -1,10 +1,10 @@
-;; java.lang.ProcessBuilder / java.lang.Process over Chez's open-process-ports.
+;; java.lang.ProcessBuilder / java.lang.Process over posix_spawn.
 ;;
 ;; babashka.process (vendored under jolt.process) is built entirely on the JVM
 ;; ProcessBuilder / Process API; this file provides that surface so the library
-;; runs unmodified. A subprocess is spawned by open-process-ports, which forks a
-;; `/bin/sh -c CMD` and hands back binary stdin/stdout/stderr ports plus the pid.
-;; We drive it as ProcessBuilder does:
+;; runs unmodified. A subprocess is a `/bin/sh -c CMD` spawned with posix_spawn,
+;; handing back binary stdin/stdout/stderr ports plus the pid. We drive it as
+;; ProcessBuilder does:
 ;;
 ;;   - the argv list is shell-quoted and `exec`'d, so the shell performs no word
 ;;     splitting or globbing (matching ProcessBuilder, which execs directly) and
@@ -13,12 +13,15 @@
 ;;   - :env  -> `env -i K=V …` prefix (the env map starts as a copy of the parent
 ;;     environment, so `env -i` reproduces exactly the intended set)
 ;;   - file / discard redirects -> shell `1> 'f'` / `2>> 'f'` / `1>/dev/null`
-;;   - INHERIT -> a posix_spawn spawn path that leaves the inherited fds
-;;     untouched in the child (true fd-level inheritance: isatty holds, stdin
-;;     offsets are shared) and builds pipes only for the non-inherited streams.
-;;     Where that FFI surface is unavailable (Windows machine types), a pump
-;;     thread copying between the pipe and jolt's own stdio remains as
-;;     emulation.
+;;   - INHERIT -> no file action, so the child keeps jolt's real descriptor (true
+;;     fd-level inheritance: isatty holds, stdin offsets are shared); every other
+;;     stream gets a pipe.
+;;
+;; Chez's own open-process-ports is the FALLBACK, for machine types where that
+;; FFI surface is missing (Windows), with a pump thread copying between the pipe
+;; and jolt's stdio to emulate INHERIT. It is not the primary path: its fork
+;; leaves SIGINT ignored in the child, so a subprocess spawned through it cannot
+;; be interrupted with ^C (jolt-a4hs).
 ;;
 ;; Exit status, liveness and signalling go through libc waitpid/kill via FFI. A
 ;; per-process mutex serialises reaping so isAlive/waitFor/exitValue never race a
@@ -308,41 +311,18 @@
     (let loop () (unless (unbox (vector-ref latch 2))
                    (condition-wait (vector-ref latch 1) (vector-ref latch 0)) (loop)))))
 
-;; --- fd-level spawn (Redirect.INHERIT) ---------------------------------------
-;; open-process-ports pipes all three streams unconditionally (its child closes
-;; every other descriptor), so INHERIT through it can only ever be pump
-;; emulation: the child sees a pipe, isatty is false, output detours through
-;; jolt's ports, and stdin reads ahead of what the child consumed. A spawn with
-;; any INHERIT stream therefore goes through posix_spawn instead: a child fd
-;; that gets no file action IS the parent's descriptor — tty answers true,
-;; writes land without an intermediary, successive INHERIT-stdin children share
-;; the read offset — and pipes are built only for the streams that ask for one.
-;; Everything downstream (waitpid reaping, kill, the stream wrappers) is shared
-;; with the pipe path. Where this FFI surface is unavailable (Windows machine
-;; types), the pump emulation below remains the fallback.
-
-;; blocking pipe I/O must be __collect_safe: a plain foreign call keeps the
-;; thread "active" for the stop-the-world collector, so a read parked on an
-;; idle pipe would freeze every other thread's GC. Same nt/eval split as
-;; jolt-foreign-proc-safe (a compiled foreign-procedure is a load-time fasl
-;; relocation that aborts boot on Windows machine types).
-(define-syntax proc-foreign-blocking
-  (lambda (x)
-    (syntax-case x (quote)
-      ((_ name (quote args) (quote res))
-       ;; Decide at RUNTIME, not expansion (same compile-file constraint as
-       ;; rt.ss's jolt-foreign-proc-safe): emit both branches under a runtime
-       ;; os-family test.
-       (with-syntax
-           ((win #'(guard (e (#t #f))
-                   (sa-load-shared-object #f)
-                   (and (sa-foreign-entry? name)
-                        (sa-foreign-procedure-runtime name (quote args) (quote res) #t))))
-            (unx #'(guard (e (#t #f))
-                   (sa-load-shared-object #f)
-                   (and (sa-foreign-entry? name)
-                        (sa-foreign-procedure-blocking name args res)))))
-         #'(if (eq? (sa-os-family) 'windows) win unx))))))
+;; --- fd-level spawn (the primary path) ---------------------------------------
+;; A child fd that gets no file action IS the parent's descriptor — tty answers
+;; true, writes land without an intermediary, successive INHERIT-stdin children
+;; share the read offset — and pipes are built for the streams that ask for one.
+;; open-process-ports can do none of that: it pipes all three streams
+;; unconditionally (its child closes every other descriptor), so INHERIT through
+;; it can only ever be pump emulation, where the child sees a pipe, isatty is
+;; false, output detours through jolt's ports, and stdin reads ahead of what the
+;; child consumed. It also leaves SIGINT ignored in its child. So this is the
+;; path every spawn takes where the FFI surface exists, and the pump emulation
+;; below is what remains where it does not (Windows machine types). Everything
+;; downstream — waitpid reaping, kill, the stream wrappers — is shared.
 
 (define proc-c-pipe  (jolt-foreign-proc-safe "pipe"  '(void*) 'int))
 (define proc-c-close (jolt-foreign-proc-safe "close" '(int)   'int))
@@ -351,8 +331,8 @@
 (define proc-fa-close   (jolt-foreign-proc-safe "posix_spawn_file_actions_addclose" '(void* int) 'int))
 (define proc-fa-destroy (jolt-foreign-proc-safe "posix_spawn_file_actions_destroy"  '(void*) 'int))
 (define proc-c-spawn (jolt-foreign-proc-safe "posix_spawn" '(void* string void* void* void* void*) 'int))
-(define proc-c-read  (proc-foreign-blocking "read"  '(int void* size_t) 'ssize_t))
-(define proc-c-write (proc-foreign-blocking "write" '(int void* size_t) 'ssize_t))
+(define proc-c-read  (jolt-foreign-proc-blocking "read"  '(int void* size_t) 'ssize_t))
+(define proc-c-write (jolt-foreign-proc-blocking "write" '(int void* size_t) 'ssize_t))
 
 (define proc-spawn-fd-ok?
   (and proc-c-pipe proc-c-close proc-fa-init proc-fa-dup2 proc-fa-close
@@ -443,7 +423,8 @@
 ;; file action (the child keeps the parent's descriptor); the rest get pipes.
 ;; Returns (values stdin-port stdout-port stderr-port pid), #f for inherited
 ;; ends. attrp is NULL: signal mask and dispositions are inherited, matching
-;; the pipe path.
+;; the pipe path — so the mask is corrected on this side, around the spawn
+;; itself (see the call below).
 (define (proc-spawn-fd-level sh-cmd inherit-in? inherit-out? inherit-err?)
   (define (mk-pipe)
     (let ((fds (sa-foreign-alloc 8)))
@@ -469,7 +450,10 @@
              (envp (proc-marshal-argv
                     (map (lambda (p) (string-append (car p) "=" (cdr p)))
                          (all-env-pairs))))
-             (rc (proc-c-spawn pidbuf "/bin/sh" fa 0 (car argv) (car envp)))
+             ;; attrp is NULL, so the child inherits this thread's signal mask —
+             ;; which must carry none of jolt's own blocking (concurrency.ss).
+             (rc (jolt-with-empty-sigmask
+                   (lambda () (proc-c-spawn pidbuf "/bin/sh" fa 0 (car argv) (car envp)))))
              (pid (sa-foreign-ref 'int pidbuf 0)))
         (proc-fa-destroy fa)
         (sa-foreign-free fa) (sa-foreign-free pidbuf)
@@ -554,13 +538,24 @@
            (rout (proc-pb-redir-out self))
            (rerr (proc-pb-redir-err self))
            (inherit? (lambda (r) (and (proc-redirect? r) (eq? (proc-redirect-kind r) 'inherit)))))
-      (if (and proc-spawn-fd-ok?
-               (or (inherit? rin) (inherit? rout) (inherit? rerr)))
-          ;; fd-level INHERIT: the child writes the real descriptors directly,
+      ;; posix_spawn drives EVERY spawn where the FFI surface exists, not only the
+      ;; ones with an INHERIT stream — it already pipes each stream that is not
+      ;; inherited, so the two differ in how the child is created, not in what it
+      ;; gets. Chez's fork leaves SIGINT set to SIG_IGN in the child, which no
+      ;; amount of care on this side can undo (it happens between its fork and its
+      ;; exec), and a child that cannot be interrupted by ^C is not what
+      ;; ProcessBuilder hands you anywhere else. That is the system(3) leak the
+      ;; convention exists to avoid, not the convention (jolt-a4hs); through
+      ;; posix_spawn a child's dispositions match a plain shell's exactly.
+      ;; The fork path stays as the fallback for machine types without the FFI,
+      ;; INHERIT emulation and all.
+      (if proc-spawn-fd-ok?
+          ;; An INHERITED stream means the child writes jolt's real descriptors,
           ;; so anything jolt has buffered must land first to keep its order.
           (begin
-            (guard (e (#t #f)) (flush-output-port (current-output-port)))
-            (guard (e (#t #f)) (flush-output-port (current-error-port)))
+            (when (or (inherit? rout) (inherit? rerr))
+              (guard (e (#t #f)) (flush-output-port (current-output-port)))
+              (guard (e (#t #f)) (flush-output-port (current-error-port))))
             (call-with-values
               (lambda () (proc-spawn-fd-level (proc-build-shell-command self)
                                               (inherit? rin) (inherit? rout) (inherit? rerr)))
@@ -575,7 +570,11 @@
                                     child-stdout child-stdin (box '()) (box #f))))
                   (make-jhost "process" pst)))))
           (call-with-values
-            (lambda () (sa-run-process (proc-build-shell-command self) #f))
+            ;; Chez forks for this one, so the child inherits this thread's
+            ;; signal mask just as the posix_spawn path does. (It also leaves
+            ;; SIGINT ignored in the child, which is why this is the fallback.)
+            (lambda () (jolt-with-empty-sigmask
+                         (lambda () (sa-run-process (proc-build-shell-command self) #f))))
             (lambda (child-stdin child-stdout child-stderr pid)
               (let* ((latches (box '()))
                      (pst (vector (make-out-stream child-stdin)
@@ -723,10 +722,10 @@
         (cons "thenApply" (lambda (self f) self))))
 
 ;; --- java.lang.Runtime shutdown hooks ----------------------------------------
-;; addShutdownHook stores Thread hooks run at jolt exit; shell's default :shutdown
-;; registers one to kill the child if jolt dies mid-run. shell derefs before
-;; returning, so in practice the hook is removed (JDK9 onExit path) before exit.
-(define proc-shutdown-hooks (box '()))
+;; addShutdownHook registers a Thread hook to run at jolt exit; babashka.process's
+;; `:shutdown` option registers one to kill the child if jolt dies mid-run.
+;; The registry, the runner and the SIGTERM/SIGHUP watcher all live in
+;; concurrency.ss — these are the JVM-shaped door onto them.
 (define the-jolt-runtime (make-jhost "jolt-runtime" #f))
 
 ;; A String[] / collection of strings -> a Scheme list of strings; a lone String
@@ -763,10 +762,12 @@
 
 (register-host-methods! "jolt-runtime"
   (list (cons "addShutdownHook"
-          (lambda (self hook) (set-box! proc-shutdown-hooks (cons hook (unbox proc-shutdown-hooks))) jolt-nil))
-        (cons "removeShutdownHook"
           (lambda (self hook)
-            (set-box! proc-shutdown-hooks (remq hook (unbox proc-shutdown-hooks))) #t))
+            (jolt-register-shutdown-hook! hook
+              (lambda () (let ((body (jolt-thread-body hook))) (when body (jolt-invoke body)))))
+            jolt-nil))
+        (cons "removeShutdownHook"
+          (lambda (self hook) (jolt-remove-shutdown-hook! hook)))
         (cons "availableProcessors" (lambda (self) (->num (jolt-available-processors))))
         ;; The memory trio, over Chez's own heap accounting: current-memory-bytes
         ;; is what the collector has reserved from the OS (the JVM's totalMemory)

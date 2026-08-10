@@ -691,8 +691,46 @@
 ;; stdin line seam: the clojure.core *in* reader (50-io.clj) drives read-line /
 ;; read / read+string through __stdin-read-line. Return the next line (newline
 ;; stripped) or nil at EOF. Without this, (read-line) and the REPL call nil.
+;;
+;; Waits in `sleep`, NOT inside the read. Chez's blocking read holds the whole
+;; Scheme world while it waits: no other thread runs at all, so a future stopped
+;; ticking and an agent stopped draining the moment the main thread reached a
+;; prompt, and the SIGTERM watcher (concurrency.ss) could not wake to run the
+;; shutdown hooks either. On the JVM those all keep running while a thread sits in
+;; System.in.read(). sleep is collect-safe, so parking THERE and reading only once
+;; the port has something leaves every other thread alive (jolt-p9ua). Backs off
+;; 0.5ms -> 20ms, the shape proc-wait-blocking uses.
+;;
+;; A line already in the buffer costs one char-ready? and no sleep at all, so a
+;; piped read-line loop keeps its throughput: 1326 -> 1386 ns/line, medians of
+;; four 300k-line runs each with the wait compiled out and back in, 1.045x.
+;; Whether the port can answer char-ready? at all is settled ONCE per port rather
+;; than under a guard per line — the guard was most of the cost and took the same
+;; measurement to 1460 ns/line, 1.10x, which is the ceiling rather than a rounding
+;; error. A port that cannot answer reads the old, blocking way.
+;;
+;; char-ready? promises a CHAR, not a whole line, so a writer that sends half a
+;; line and then stalls still parks the world for the remainder — a far smaller
+;; window than "until any input arrives", and the most this port surface offers.
+(define jolt-stdin-poll-step0 500000)          ; 0.5ms, in nanoseconds
+(define jolt-stdin-poll-step-max (* 20 1000000))   ; 20ms
+(define jolt-stdin-poll-port (box #f))         ; the port the answer below is about
+(define jolt-stdin-poll-ok (box #f))
+(define (jolt-stdin-wait-ready! in)
+  (unless (eq? (unbox jolt-stdin-poll-port) in)
+    (set-box! jolt-stdin-poll-ok (guard (_ (#t #f)) (char-ready? in) #t))
+    (set-box! jolt-stdin-poll-port in))
+  (when (unbox jolt-stdin-poll-ok)
+    (let loop ((step jolt-stdin-poll-step0))
+      (unless (char-ready? in)
+        (sleep (make-time 'time-duration step 0))
+        (loop (min jolt-stdin-poll-step-max (* step 2)))))))
+
 (def-var! "clojure.core" "__stdin-read-line"
-  (lambda () (let ((l (get-line (current-input-port)))) (if (eof-object? l) jolt-nil l))))
+  (lambda ()
+    (let ((in (current-input-port)))
+      (jolt-stdin-wait-ready! in)
+      (let ((l (get-line in))) (if (eof-object? l) jolt-nil l)))))
 
 ;; (type f) -> :jolt/file (the tagged-file :jolt/type). Registered through the
 ;; type-arm registry (natives-meta.ss) so the dispatcher picks it up.

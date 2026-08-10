@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Shutdown hooks run** (#571). `Runtime.addShutdownHook` kept a list nothing
+  ever read, so `jolt.process`'s `:shutdown` option — `destroy-tree` and
+  friends — cleaned up nothing on any exit path, and a `SIGTERM` to a jolt
+  program left its child processes running. Hooks now run once per process from
+  a single registry, on normal return, on `System/exit`, on an uncaught throw,
+  and on `SIGTERM`/`SIGHUP`.
+
+  The signals are taken over only once a hook is actually registered, by a
+  thread parked in `sigwait` — Chez runs a `register-signal-handler` handler on
+  the main thread at its next safe point, and the two ways a program usually
+  waits (a `deref` of a promise, a blocking foreign call) never reach one, so
+  that route would have made the process ignore the signal instead of handling
+  it. A program with no hooks is untouched and dies on `SIGTERM` as before. Exit
+  status is 128+signal, as on the JVM.
+
+- **A blocking stdin read no longer stops the rest of the program.** `read-line`
+  and the REPL waited inside Chez's own blocking read, which holds the whole
+  Scheme world: a `future` stopped ticking and an agent stopped draining the
+  moment the main thread reached a prompt, where a JVM keeps both running. The
+  wait now happens in `sleep` and the port is read once it has something. A
+  buffered line costs one `char-ready?` and no sleep, so a piped `read-line` loop
+  keeps its throughput (1326 -> 1386 ns/line, 1.045x).
+
+- **A subprocess can be interrupted with `^C` again.** Children spawned the
+  default way came up with SIGINT set to `SIG_IGN`, so `^C` in a terminal killed
+  your program and left the subprocess running. That is the `system(3)` leak the
+  convention exists to avoid rather than the convention itself — a child's
+  dispositions should match what a plain shell would give it, as they do on the
+  JVM. `posix_spawn` now drives every spawn rather than only the ones redirecting
+  a stream to `:inherit` (it already piped every other stream); Chez's fork,
+  which is where the ignore was set, stays as the fallback for platforms without
+  the FFI surface.
+
+- **A child process no longer inherits jolt's signal mask.** jolt blocks SIGINT
+  in its own threads so `^C` reaches the one parked for it, and now blocks
+  SIGTERM/SIGHUP for the shutdown watcher; both travelled to every child through
+  `posix_spawn`'s null attributes and through Chez's fork. A child that starts
+  with SIGTERM blocked survives the `destroy` a shutdown hook calls, and one with
+  SIGINT blocked ignores `^C`. The mask is emptied for the length of a spawn and
+  put back, so a child gets the default mask the JVM would give it.
+
 ### Added
 
 - **Fibers R3 (jolt-nvpr.4): one waiter protocol for threads and fibers.** A

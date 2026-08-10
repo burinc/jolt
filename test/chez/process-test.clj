@@ -171,6 +171,145 @@
   (check-eq "INHERIT stdin shares the fd offset between children"
             (str/includes? out "SECOND=<CD>") true))
 
+;; --- shutdown hooks -----------------------------------------------------------
+;; Runtime.addShutdownHook is what babashka.process's `:shutdown` option registers,
+;; so if the hooks never run, `:shutdown destroy-tree` cleans up nothing (#571).
+;; A nested jolt, because a hook can only be observed by letting a process exit.
+(let [out (:out (sh [jolt-bin "-e" (str "(.addShutdownHook (Runtime/getRuntime)"
+                                        " (Thread. (fn [] (println \"HOOK\"))))"
+                                        " (println \"MAIN\")")]))]
+  (check-eq "shutdown hook runs when the process exits" (str/split-lines out) ["MAIN" "HOOK"]))
+
+(let [out (:out (sh [jolt-bin "-e" (str "(.addShutdownHook (Runtime/getRuntime)"
+                                        " (Thread. (fn [] (println \"HOOK\"))))"
+                                        " (println \"MAIN\") (System/exit 0)")]))]
+  (check-eq "shutdown hook runs on System/exit" (str/split-lines out) ["MAIN" "HOOK"]))
+
+;; Chez's exit-handler is a THREAD parameter, so a hook registered from a worker
+;; installs the wrapper on that worker and nowhere else. The main thread has to
+;; carry one of its own or this hook would be dropped on the way out.
+(let [out (:out (sh [jolt-bin "-e" (str "(let [t (Thread. (fn [] (.addShutdownHook (Runtime/getRuntime)"
+                                        "                          (Thread. (fn [] (println \"HOOK\"))))))]"
+                                        "  (.start t) (.join t) (println \"MAIN\"))")]))]
+  (check-eq "a hook registered off the main thread still runs" (str/split-lines out) ["MAIN" "HOOK"]))
+
+(let [out (:out (sh [jolt-bin "-e" (str "(let [rt (Runtime/getRuntime)"
+                                        "      h (Thread. (fn [] (println \"HOOK\")))]"
+                                        "  (.addShutdownHook rt h) (.removeShutdownHook rt h)"
+                                        "  (println \"MAIN\"))")]))]
+  (check-eq "a removed shutdown hook does not run" (str/split-lines out) ["MAIN"]))
+
+;; Is a pid still alive? `kill -0` is the portable answer (exit 0 = alive). Run
+;; through `sh` so it is the shell BUILTIN: a standalone kill(1) is not on every
+;; Linux image, and ProcessBuilder.start rejects a program it cannot resolve.
+(defn- pid-alive? [pid]
+  (zero? (:exit (sh ["sh" "-c" (str "kill -0 " pid)] {:err :string}))))
+
+;; SIGTERM to a jolt process must run its shutdown hooks BEFORE it exits — the
+;; whole point of `:shutdown destroy-tree` is that a supervisor's `kill` does not
+;; leave the child tree running (#571). Both spawn paths are covered: the default
+;; (piped stdio, Chez's own fork) and fd-level INHERIT (posix_spawn).
+;;
+;; The nested jolt writes its child's pid out through a shell `$$` — the same
+;; probe the bug report used — so this side can ask whether that exact process
+;; outlived the parent.
+(doseq [[label redirs] [["piped stdio" ""]
+                        ["fd-level INHERIT" " :out :inherit :err :inherit"]]]
+  (let [pidf (str (fs/create-temp-file {:prefix "jp-shutdown-" :suffix ".pid"}))
+        nested (str "(require '[jolt.process :as p])"
+                    " @(p/process [\"sh\" \"-c\" \"echo $$ > \\\"$CHILD_PID_FILE\\\"; sleep 30\"]"
+                    " {:extra-env {\"CHILD_PID_FILE\" \"" pidf "\"}" redirs
+                    "  :shutdown p/destroy-tree})")
+        parent (process [jolt-bin "-e" nested])]
+    ;; the grandchild publishes its pid before it sleeps
+    (loop [n 0]
+      (when (and (< n 200) (str/blank? (slurp pidf)))
+        (Thread/sleep 50)
+        (recur (inc n))))
+    (let [gpid (str/trim (slurp pidf))]
+      (p/destroy parent)
+      ;; poll rather than deref: a regression here is "the parent ignores
+      ;; SIGTERM", and @parent would then hang the gate instead of failing it
+      (loop [n 0] (when (and (< n 60) (p/alive? parent)) (Thread/sleep 50) (recur (inc n))))
+      (when (p/alive? parent) (.destroyForcibly (:proc parent)) (Thread/sleep 200))
+      ;; the hook's kill and the child's death are not instantaneous
+      (loop [n 0] (when (and (< n 40) (pid-alive? gpid)) (Thread/sleep 50) (recur (inc n))))
+      (check-eq (str "SIGTERM runs :shutdown hooks (" label ")")
+                (and (seq gpid) (pid-alive? gpid)) false)
+      (when (pid-alive? gpid) (sh ["sh" "-c" (str "kill -9 " gpid)])))
+    (fs/delete-if-exists pidf)))
+
+;; A jolt sitting at a stdin prompt must still take SIGTERM, hooks and all. It
+;; used to wait INSIDE Chez's blocking read, which holds the whole Scheme world:
+;; nothing else runs, so the watcher could not have woken there (jolt-p9ua).
+;; The nested jolt registers a hook, then blocks on read-line with a pipe stdin
+;; nothing ever writes to.
+;;
+;; Nothing here blocks without a bound: a failure has to report itself, not hang
+;; the gate.
+(let [readyf (str (fs/create-temp-file {:prefix "jp-stdin-" :suffix ".txt"}))
+      hookf (str (fs/create-temp-file {:prefix "jp-stdin-hook-" :suffix ".txt"}))
+      nested (str "(.addShutdownHook (Runtime/getRuntime)"
+                  "  (Thread. (fn [] (spit \"" hookf "\" \"RAN\"))))"
+                  " (spit \"" readyf "\" \"ready\") (read-line)")
+      proc (process [jolt-bin "-e" nested])]
+  (loop [n 0]
+    (when (and (< n 200) (str/blank? (slurp readyf)))
+      (Thread/sleep 50)
+      (recur (inc n))))
+  (p/destroy proc)
+  (loop [n 0] (when (and (< n 60) (p/alive? proc)) (Thread/sleep 50) (recur (inc n))))
+  (check-eq "SIGTERM reaches a jolt parked at a stdin prompt" (p/alive? proc) false)
+  ;; SIGKILL, since a process that survived SIGTERM will survive another one
+  (when (p/alive? proc) (.destroyForcibly (:proc proc)) (Thread/sleep 200))
+  (check-eq "and its shutdown hooks run there too" (slurp hookf) "RAN")
+  (fs/delete-if-exists readyf)
+  (fs/delete-if-exists hookf))
+
+;; Same root cause from the other side: while the main thread waits on stdin the
+;; rest of the program has to keep running. A future stopped ticking the moment a
+;; prompt was reached, which is not what a JVM does with a thread in
+;; System.in.read() (jolt-p9ua).
+(let [tickf (str (fs/create-temp-file {:prefix "jp-ticks-" :suffix ".txt"}))
+      nested (str "(future (dotimes [i 100] (Thread/sleep 50) (spit \"" tickf "\" (str i))))"
+                  " (read-line)")
+      proc (process [jolt-bin "-e" nested])
+      tick (fn [] (let [s (str/trim (slurp tickf))] (when-not (str/blank? s) (parse-long s))))]
+  (loop [n 0] (when (and (< n 200) (nil? (tick))) (Thread/sleep 50) (recur (inc n))))
+  (check-eq "a future runs while the main thread waits on stdin" (some? (tick)) true)
+  ;; and keeps running, rather than getting one tick in before the read parks
+  (let [before (or (tick) 0)]
+    (Thread/sleep 400)
+    (check-eq "and keeps running" (> (or (tick) 0) before) true))
+  (.destroyForcibly (:proc proc))
+  (fs/delete-if-exists tickf))
+
+;; A child must be interruptible by ^C, on every spawn path. Chez's fork leaves
+;; SIGINT set to SIG_IGN in the child — the system(3) leak the convention exists
+;; to avoid, not the convention — so a child spawned the default way could not be
+;; interrupted at all where the JVM's dies (jolt-a4hs). posix_spawn drives both
+;; paths now, and `sh` reports 128+SIGINT when the signal lands.
+(check-eq "a child dies on SIGINT (piped stdio)"
+          (:exit (sh ["sh" "-c" "kill -INT $$"])) 130)
+(check-eq "a child dies on SIGINT (fd-level INHERIT)"
+          (:exit @(process ["sh" "-c" "kill -INT $$"] {:out :string :err :inherit})) 130)
+
+;; jolt blocks signals in its own threads — SIGINT so ^C reaches the thread parked
+;; in park-until-interrupt rather than a worker in a foreign call, SIGTERM/SIGHUP
+;; so the shutdown watcher can take them — and a spawn hands the calling thread's
+;; mask straight to the child. Neither may travel: a child with SIGTERM blocked
+;; survives the very destroy the hook exists to call, and one with SIGINT blocked
+;; ignores ^C (jolt-e5sb).
+(.addShutdownHook (Runtime/getRuntime) (Thread. (fn [] nil)))
+(let [proc (process ["sleep" "10"])]
+  (p/destroy proc)
+  (check-eq "a child spawned after a shutdown hook is still killable" (:exit @proc) 143))
+(check-eq "a child does not inherit jolt's blocked SIGTERM"
+          (:exit @(process ["sh" "-c" "kill -TERM $$"] {:out :string :err :inherit})) 143)
+(jolt.host/block-sigint)
+(check-eq "a child does not inherit jolt's blocked SIGINT"
+          (:exit @(process ["sh" "-c" "kill -INT $$"] {:out :string :err :inherit})) 130)
+
 (if (empty? @failures)
   (println "PROCESS-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))
