@@ -1148,6 +1148,20 @@
   {:suite "atomics" :label "reset-vals! returns [old new]" :expected "[5 9]" :expr "(let [a (atom 5)] (reset-vals! a 9))"}
   {:suite "atomics" :label "compare-and-set! true on match and sets" :expected "[true 6]" :expr "(let [a (atom 5)] [(compare-and-set! a 5 6) (deref a)])"}
   {:suite "atomics" :label "compare-and-set! false on mismatch and no set" :expected "[false 5]" :expr "(let [a (atom 5)] [(compare-and-set! a 0 6) (deref a)])"}
+  ;; The receiver check. swap!/reset! run jolt-need-atom and report the JVM's cast
+  ;; failure; the other three reached a record accessor directly, so a non-atom got
+  ;; a condition naming jolt's own record type ("... is not of type #<record type
+  ;; jolt-atom-v3>") and nil stopped reporting as a NullPointerException, which a
+  ;; catch selecting on it would no longer match.
+  ;; The CLASS is asserted and not just the message, because a raw host condition
+  ;; classes as :object and :object matches EVERY catch clause — so a row that only
+  ;; caught NullPointerException passed on the broken behaviour too.
+  {:suite "atomics" :label "compare-and-set! on a non-atom is the JVM's cast failure" :expected "[\"java.lang.ClassCastException\" \"class clojure.lang.Keyword cannot be cast to class clojure.lang.IAtom\"]" :expr "(try (compare-and-set! :nope 1 2) (catch Throwable e [(.getName (class e)) (.getMessage e)]))"}
+  {:suite "atomics" :label "swap-vals! on a non-atom is the JVM's cast failure" :expected "[\"java.lang.ClassCastException\" \"class clojure.lang.Keyword cannot be cast to class clojure.lang.IAtom\"]" :expr "(try (swap-vals! :nope inc) (catch Throwable e [(.getName (class e)) (.getMessage e)]))"}
+  {:suite "atomics" :label "reset-vals! on a non-atom is the JVM's cast failure" :expected "[\"java.lang.ClassCastException\" \"class clojure.lang.Keyword cannot be cast to class clojure.lang.IAtom\"]" :expr "(try (reset-vals! :nope 1) (catch Throwable e [(.getName (class e)) (.getMessage e)]))"}
+  {:suite "atomics" :label "compare-and-set! on nil is a NullPointerException" :expected "\"java.lang.NullPointerException\"" :expr "(try (compare-and-set! nil 1 2) (catch Throwable e (.getName (class e))))"}
+  {:suite "atomics" :label "swap-vals! on nil is a NullPointerException" :expected "\"java.lang.NullPointerException\"" :expr "(try (swap-vals! nil inc) (catch Throwable e (.getName (class e))))"}
+  {:suite "atomics" :label "reset-vals! on nil is a NullPointerException" :expected "\"java.lang.NullPointerException\"" :expr "(try (reset-vals! nil 1) (catch Throwable e (.getName (class e))))"}
   {:suite "atomics" :label "CAS-retry increments across futures lose no updates (atomic native)" :expected "\"true\"" :expr "(do (let [a (atom 0) done (atom 0) n 4 per 2000 target (* n per)] (dotimes [_ n] (future (dotimes [_ per] (loop [] (let [cur (deref a)] (when-not (compare-and-set! a cur (inc cur)) (recur))))) (swap! done inc))) (loop [w 0] (cond (== (deref done) n) :fin (> w 1000000) :timeout :else (do (Thread/yield) (recur (inc w))))) (str (== (deref a) target))))"}
   ;; shadow-emitted (compiler-review R2 stage 1). Each row binds a local whose
   ;; name is a bare Scheme head the back end emits, in the scope of a construct

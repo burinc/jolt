@@ -50,9 +50,14 @@
        (loop (cddr o) validator (cadr o)))
       (else (loop (cddr o) validator m)))))
 
-;; swap!/reset! reach into the atom record directly, so a non-atom receiver would
-;; raise a raw host error with no class for a catch to select. Name the class the
-;; JVM names (nil is its NullPointerException).
+;; The five mutators reach into the atom record directly, so a non-atom receiver
+;; would raise a raw host error with no class for a catch to select — one naming
+;; jolt's own record type ("is not of type #<record type jolt-atom-v3>"), which
+;; classes as :object and therefore matches EVERY catch clause. Name the class the
+;; JVM names instead (nil is its NullPointerException). Every entry point that can
+;; take a receiver from user code opens with this, BEFORE it validates or reads a
+;; field: compare-and-set! validates the new value first, so the check has to come
+;; ahead of that or the raw error is back.
 (define (jolt-need-atom a)
   (if (jolt-atom? a) a (jolt-cast-throw a "clojure.lang.IAtom")))
 
@@ -107,6 +112,7 @@
 
 ;; compare-and-set! keeps jolt= (value) semantics, done atomically under the lock.
 (define (jolt-compare-and-set! a oldv newv)
+  (jolt-need-atom a)
   (jolt-atom-validate a newv)
   (let ((swapped (jolt-with-mutex (jolt-atom-lock a)
                    (if (jolt= (jolt-atom-val a) oldv)
@@ -116,6 +122,7 @@
     swapped))
 
 (define (jolt-swap-vals! a f . args)
+  (jolt-need-atom a)
   (let retry ()
     (let* ((old (jolt-atom-val a))
            (nv (apply jolt-invoke f old args)))
@@ -125,6 +132,7 @@
           (retry)))))
 
 (define (jolt-reset-vals! a v)
+  (jolt-need-atom a)
   (jolt-atom-validate a v)
   (let ((old (jolt-with-mutex (jolt-atom-lock a)
                (let ((o (jolt-atom-val a))) (jolt-atom-val-set! a v) o))))
