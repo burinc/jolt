@@ -241,15 +241,43 @@
               jolt-nil))))
       (throw-jvm (quote ClassCastException) "set!: not a var")))
 
-;; alter-var-root: atomically apply f to the current root plus args.
+;; alter-var-root: apply f to the current root plus args, atomically.
+;;
+;; ATOMICALLY IS THE CONTRACT, and it used to be only the comment. Var.alterRoot is
+;; `synchronized` on the JVM, so the read, the compute and the write-back are one
+;; step; unlocked, two threads doing (alter-var-root #'n inc) both read the same root
+;; and the second write drops the first's increment. Measured, 8 threads x 400
+;; increments: the root came back short every run.
+;;
+;; The lock is the VAR's own object monitor, which is exactly what
+;; `synchronized (theVar)` means, rather than one global mutex for every var. A global
+;; one would be held across `f`, and f is user code: a thread whose f waits on
+;; another thread that wants to alter a DIFFERENT var would deadlock where the JVM
+;; does not. Per var, that pair is unrelated.
+;;
+;; f runs INSIDE the lock, as it does on the JVM (alterRoot calls fn.applyTo under
+;; the monitor), and so do the validator and the watches, because doReset notifies
+;; under it too. A monitor is now a lock a fiber can hold across a park (jolt-3a87),
+;; so an f that parks is fine here.
+;;
+;; jolt-with-monitor lives in java/concurrency.ss, which rt.ss loads AFTER this file;
+;; the reference resolves at call time, the same forward reference
+;; jolt-run-interruptible makes to fibers.ss and for the same reason — nothing calls
+;; alter-var-root before the boot finishes loading.
+;;
+;; The READ path is deliberately not locked. jolt-asj records the measurement that
+;; rules it out (70 -> 95 ns on the probe), and nothing here needs it: a lost update
+;; is a write racing a write, and var-cell-root-set! is a whole-value field write.
 (define (jolt-alter-var-root v f . args)
-  (let* ((old (var-cell-root v))
-         (new (apply jolt-invoke f old args)))
-    (iref-validate v new)
-    (var-cell-root-set! v new)
-    (var-cell-defined?-set! v #t)
-    (iref-notify v old new)
-    new))
+  (jolt-with-monitor v
+    (lambda ()
+      (let* ((old (var-cell-root v))
+             (new (apply jolt-invoke f old args)))
+        (iref-validate v new)
+        (var-cell-root-set! v new)
+        (var-cell-defined?-set! v #t)
+        (iref-notify v old new)
+        new))))
 
 ;; __local-var: a fresh free-standing var cell (not interned). with-local-vars
 ;; binds these as lexical locals; var-get/var-set read/write the root. Each gets a

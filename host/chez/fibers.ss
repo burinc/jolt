@@ -420,10 +420,16 @@
 ;; changes carrier (R0(d)). The read-and-advance of jolt-fiber-rr happens
 ;; under rr-mu, so concurrent spawns from any thread get a strict, predictable
 ;; rotation (no two spawns reserve the same slot).
+;; ONE read of the global, and n measured from THAT vector. Two reads is what this
+;; was, and jolt-fiber-pool-reset! landing between them makes the second one #f, so
+;; (vector-length #f) raises — or, after a rebuild at a different count, leaves n
+;; disagreeing with v and the vector-ref below out of range. Reset documents "call
+;; only when the fibers are quiescent", so a program that honours the contract cannot
+;; get there; jolt-carrier-total already reads it once, and so does this now.
 (define (jolt-fiber-pick!)
   (jolt-fiber-ensure-carriers!)
-  (let ((v jolt-fiber-carriers)
-        (n (vector-length jolt-fiber-carriers)))
+  (let* ((v jolt-fiber-carriers)
+         (n (vector-length v)))
     (jolt-lock! jolt-fiber-rr-mu)
     (let ((c (vector-ref v (mod jolt-fiber-rr n))))
       (set! jolt-fiber-rr (fx+ jolt-fiber-rr 1))

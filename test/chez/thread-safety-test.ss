@@ -503,6 +503,84 @@
     (loop (fx+ r 1))))
 (ok "10. a colliding procname is always marked ambiguous" (= amb-missed 0))
 
+;; --- 11. the two read-modify-writes the JVM synchronizes ----------------------
+;; Everything above is a shared TABLE. These two are shared SLOTS, and they were
+;; missed for that reason: nothing about them looks like a side table.
+;;
+;; Var.alterRoot and ARef.addWatch are both `synchronized` on the reference, so on
+;; the JVM each is one step. jolt's read the slot, compute, and write it back with
+;; nothing in between, so concurrent callers lose each other's work — and the comment
+;; over jolt-alter-var-root said "atomically" while it did.
+;;
+;; The read paths are deliberately untouched. jolt-asj records the measurement that
+;; rules out locking a var READ (70 -> 95 ns on the probe), and none of this needs it:
+;; a lost update is a write racing a write.
+(printf "\n== 11. alter-var-root and add-watch on one reference ==\n")
+
+;; A dynamic var, because def-dynvar! is the shortest way to a cell with a root, and
+;; the root is the slot under test either way.
+(def-dynvar! "ts11" "*counter*" 0)
+(define ts11-cell (var-cell-lookup "ts11" "*counter*"))
+(define ts11-threads 8)
+(define ts11-per 400)
+(define (ts11-inc x) (+ x 1))
+(ok "11. every alter-var-root thread finished"
+    (run-threads ts11-threads
+                 (lambda (t)
+                   (let loop ((i 0))
+                     (when (fx<? i ts11-per)
+                       (jolt-alter-var-root ts11-cell ts11-inc)
+                       (loop (fx+ i 1)))))
+                 120.0 "11. concurrent alter-var-root"))
+;; The whole check. Unsynchronized, two threads reading the same root and both writing
+;; back read+1 lose one of the two increments.
+(ok "11. alter-var-root loses no update"
+    (= (var-cell-root ts11-cell) (* ts11-threads ts11-per)))
+
+;; The same shape on an atom's watch list. add-watch conses onto the slot it just
+;; read, so two registrations of DIFFERENT keys can leave only one behind — which is
+;; the direction that matters: a watch that was installed and then vanished never
+;; fires and nothing says so.
+(define ts11-atom (jolt-atom-new 0))
+(define ts11-keys 200)
+(define (ts11-key t i) (keyword #f (string-append "w-" (number->string t) "-" (number->string i))))
+(ok "11. every add-watch thread finished"
+    (run-threads ts11-threads
+                 (lambda (t)
+                   (let loop ((i 0))
+                     (when (fx<? i ts11-keys)
+                       (jolt-add-watch ts11-atom (ts11-key t i) (lambda (k r o n) #f))
+                       (loop (fx+ i 1)))))
+                 120.0 "11. concurrent add-watch"))
+(ok "11. add-watch on an atom keeps every watch"
+    (= (length (jolt-atom-watches ts11-atom)) (* ts11-threads ts11-keys)))
+;; And remove-watch is the same slot from the other side: every key goes away, and
+;; nothing that was not asked for goes away with it.
+(ok "11. every remove-watch thread finished"
+    (run-threads ts11-threads
+                 (lambda (t)
+                   (let loop ((i 0))
+                     (when (fx<? i ts11-keys)
+                       (jolt-remove-watch ts11-atom (ts11-key t i))
+                       (loop (fx+ i 1)))))
+                 120.0 "11. concurrent remove-watch"))
+(ok "11. remove-watch on an atom drains the list exactly"
+    (null? (jolt-atom-watches ts11-atom)))
+
+;; What must NOT have changed: a watch still fires, with the right old/new values, and
+;; a validator still refuses. The lock is on the slot, not on the notify — Clojure runs
+;; watches outside the lock too, and holding one across user code would let a watch
+;; deadlock every other registration.
+(define ts11-seen '())
+(define ts11-w (jolt-atom-new 1))
+(jolt-add-watch ts11-w (keyword #f "k") (lambda (k r o n) (set! ts11-seen (cons (cons o n) ts11-seen))))
+(jolt-reset! ts11-w 2)
+(jolt-swap! ts11-w ts11-inc)
+(ok "11. a watch still fires with old and new" (equal? '((1 . 2) (2 . 3)) (reverse ts11-seen)))
+(jolt-remove-watch ts11-w (keyword #f "k"))
+(jolt-reset! ts11-w 9)
+(ok "11. and stops firing once removed" (= 2 (length ts11-seen)))
+
 (printf "\nthread-safety-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "thread-safety-test: PASS — shared side-tables under concurrency\n") (exit 0))

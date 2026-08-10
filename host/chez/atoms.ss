@@ -188,12 +188,25 @@
 ;; remove-watch drops it; both return the reference. set-validator! installs a
 ;; validator and validates the CURRENT value immediately (Clojure throws if it's
 ;; already invalid); get-validator reads the slot.
+;;
+;; An ATOM keeps its watches in a record slot rather than the side tables below, and
+;; that slot needs the same treatment the tables got: rebuilding the list from the
+;; value just read is a read-modify-write, so two threads registering DIFFERENT keys
+;; could leave only one behind. ARef.addWatch and removeWatch are both `synchronized`
+;; on the JVM. Measured, 8 threads x 200 distinct keys: the list came back short.
+;; The atom's own lock, held only across the rebuild — no user code runs inside it, so
+;; this stays one of the short regions locks.ss is about. The NOTIFY still runs
+;; outside, as it does on the JVM: holding a lock across a watch would let one watch
+;; deadlock every other registration.
+;; set-validator! needs none of this: it overwrites a slot rather than deriving the
+;; new value from the old, so there is nothing to lose.
 (define (jolt-watch-add alist key f)
   (cons (cons key f) (remp (lambda (kv) (jolt=2 (car kv) key)) alist)))
 (define (jolt-add-watch a key f)
   (cond
     ((jolt-atom? a)
-     (jolt-atom-watches-set! a (jolt-watch-add (jolt-atom-watches a) key f))
+     (jolt-with-mutex (jolt-atom-lock a)
+       (jolt-atom-watches-set! a (jolt-watch-add (jolt-atom-watches a) key f)))
      a)
     ((iref? a)
      (jolt-with-mutex iref-tbl-mu
@@ -205,8 +218,9 @@
 (define (jolt-remove-watch a key)
   (cond
     ((jolt-atom? a)
-     (jolt-atom-watches-set! a
-       (remp (lambda (kv) (jolt=2 (car kv) key)) (jolt-atom-watches a)))
+     (jolt-with-mutex (jolt-atom-lock a)
+       (jolt-atom-watches-set! a
+         (remp (lambda (kv) (jolt=2 (car kv) key)) (jolt-atom-watches a))))
      a)
     ((iref? a)
      (jolt-with-mutex iref-tbl-mu
