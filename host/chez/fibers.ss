@@ -653,9 +653,27 @@
 ;; makes them rare rather than absent. A rare race in a scheduler is the worst
 ;; kind to ship: it surfaces as an inexplicable hang under load.
 ;;
-;; So preemption stays available and stays off until the stress test is clean at
-;; a tight quantum. jolt-atc.6 tracks that. When it is, this flips and the branch
-;; below goes away.
+;; WHY IT IS STILL OFF, and it is not the races listed above — those are fixed
+;; and the channel stress is clean at the floor with 13k preemptions.
+;;
+;; jolt's runtime guards its shared state with `with-mutex`, in 235 places. A
+;; park unwinds dynamic-wind, so a preemption inside any of them RELEASES the
+;; mutex, lets another fiber into the section, and re-acquires on resume. The
+;; section is split, not protected. That is not a channel-layer problem to fix
+;; site by site; it is every with-mutex in the runtime.
+;;
+;; Demonstrated, deterministically, on jolt-atom-cas! — a with-mutex around a
+;; test-then-set, reached by an ordinary (swap! a inc). Four fibers on one
+;; carrier, 3000 increments each, quantum at the floor: 11999 of 12000, the same
+;; single lost update on every run. Nothing exotic, and at a quantum the setter
+;; accepts.
+;;
+;; Fixing it means making with-mutex itself preemption-safe, which is one macro
+;; rather than 235 edits, but it has to reconcile two things that pull opposite
+;; ways: the mutex must be re-acquired when a continuation rewinds, while the
+;; interrupt depth must NOT be, because that is carried across the switch by the
+;; sic field instead. Putting both in the same dynamic-wind double-counts the
+;; depth on resume. jolt-atc.7 has the analysis.
 ;;
 ;; The quantum is measured, not guessed: ticks are polled at calls and loop
 ;; back-edges, so on this machine ~100k ticks is 45us and the default below is
@@ -664,10 +682,7 @@
 ;; quantum, which at this length is noise.
 ;;
 ;; Turning it on costs about 13% on a yield (215 -> 243 ns), all of it arming and
-;; disarming the timer and independent of the quantum. The non-preemptible-region
-;; counter is left unconditional: it is two virtual-register writes, it is
-;; correct whether or not the timer is armed, and making it conditional would be
-;; one more thing to get wrong when the default flips.
+;; disarming the timer and independent of the quantum.
 ;;
 ;; What preemption does NOT fix: a fiber inside a blocking foreign call cannot
 ;; be preempted, because the timer is only polled in Scheme. Parkable IO
@@ -692,7 +707,7 @@
 ;; is still four orders of magnitude below the default.
 (define jolt-fiber-preempt-ticks-min 100)
 (define jolt-fiber-preempt-ticks-default 1000000)   ; ~0.45ms, measured
-(define jolt-fiber-preempt-ticks-global jolt-fiber-preempt-ticks-default)
+(define jolt-fiber-preempt-ticks-global #f)   ; #f = off; see "WHY IT IS STILL OFF"
 (define (jolt-fiber-preempt-ticks) jolt-fiber-preempt-ticks-global)
 (define (jolt-fiber-preempt-refresh!)
   (let ((v (guard (e (#t #f))
@@ -704,12 +719,12 @@
       (set! jolt-fiber-preempt-ticks-global v))))
 (define (jolt-fiber-preempt-ticks-set! n)
   ;; #f restores the default rather than turning preemption off — there is no off.
-  ;; #f restores the default quantum. There is no "off": see above.
+  ;; #f turns preemption OFF; anything else must clear the floor.
   (when (and n (not (and (fixnum? n) (fx>=? n jolt-fiber-preempt-ticks-min))))
     (error 'jolt-fiber-preempt-ticks-set!
            "preempt ticks must be #f or a fixnum >= jolt-fiber-preempt-ticks-min"
            n jolt-fiber-preempt-ticks-min))
-  (set! jolt-fiber-preempt-ticks-global (or n jolt-fiber-preempt-ticks-default))
+  (set! jolt-fiber-preempt-ticks-global n)
   (guard (e (#t #f))
     (let ((cell (var-cell-lookup "clojure.core.async" "*fiber-preempt-ticks*")))
       (when (and cell (var-cell-defined? cell))
@@ -739,15 +754,15 @@
 ;; counters — run-gosm.ss asserts exact deltas on those, and a preemption is
 ;; neither kind of park.
 (define (jolt-fiber-preempt-handler)
-  (let ((f (jolt-current-fiber))
-        (ticks jolt-fiber-preempt-ticks-global))
+  (let ((f (jolt-current-fiber)))
     (cond
       ;; Off a fiber: mid-park, or between dispatches. A region that must run to
       ;; completion needs no test here — it disabled interrupts, so Chez has not
       ;; delivered this timer yet and will not until the region ends.
-      ((not f)
-       (set-timer ticks)
-       (void))
+      ;; Deliberately does NOT re-arm. The next dispatch arms, and re-arming here
+      ;; would leave a timer running over the scheduler itself, where every
+      ;; delivery is a no-op that costs a handler call.
+      ((not f) (void))
       (else
        (jolt-fiber-bump-preempts! f)
        (jolt-fiber-state-set! f 'ready)
@@ -767,10 +782,13 @@
 ;; of a yield. Per drain still composes with jolt-run-interruptible, which saves
 ;; and restores the handler around its own thunk.
 (define (jolt-fiber-install-preempt-handler!)
-  (timer-interrupt-handler jolt-fiber-preempt-handler))
+  (when jolt-fiber-preempt-ticks-global
+    (timer-interrupt-handler jolt-fiber-preempt-handler)))
 (define (jolt-fiber-arm-preempt!)
-  (set-timer jolt-fiber-preempt-ticks-global))
-(define (jolt-fiber-disarm-preempt!) (set-timer 0))
+  (let ((ticks jolt-fiber-preempt-ticks-global))
+    (when ticks (set-timer ticks))))
+(define (jolt-fiber-disarm-preempt!)
+  (when jolt-fiber-preempt-ticks-global (set-timer 0)))
 
 ;; --- monitors (the observable half of swish's, erlang.ss:434) ----------------
 ;; A fiber that dies is otherwise unobservable. fibers-async.ss and sm.ss both
@@ -837,7 +855,6 @@
 (define (jolt-fiber-run f)
   (let* ((c (jolt-fiber-carrier f))
          (base (jolt-carrier-sic c)))
-    (set-virtual-register! jolt-vreg-current-fiber f)
     (call/1cc
       (lambda (k)
         (jolt-carrier-sched-k-set! c k)
@@ -850,8 +867,21 @@
         (jolt-fiber-slice-restore! (jolt-fiber-slice f))
         ;; Put the carrier back to the interrupt depth this fiber parked at. A
         ;; first run starts at the carrier's own baseline.
+        ;;
+        ;; ORDER MATTERS FROM HERE. jolt-current-disable-count enables in order to
+        ;; measure, and that enable can DELIVER a timer deferred by the previous
+        ;; fiber. So the current-fiber register is published only after the depth
+        ;; is settled: a timer arriving during the adjust then finds no fiber and
+        ;; does nothing, instead of preempting a fiber that has not started. That
+        ;; case does not merely lose a quantum — the handler would park through a
+        ;; continuation captured mid-dispatch, and re-entering jolt-fiber-resume*
+        ;; would invoke an already-consumed one-shot continuation.
         (jolt-adjust-interrupts! (jolt-current-disable-count)
                                  (if (jolt-fiber-k f) (jolt-fiber-sic f) base))
+        (set-virtual-register! jolt-vreg-current-fiber f)
+        ;; Armed LAST, so the only poll between arming and entering the body is
+        ;; the call to jolt-fiber-resume* itself. One poll cannot exhaust a
+        ;; quantum, because jolt-fiber-preempt-ticks-min is far above 1.
         (jolt-fiber-arm-preempt!)
         (jolt-fiber-resume* f)))
     ;; Disarm FIRST: everything below runs on the scheduler, which must never be
