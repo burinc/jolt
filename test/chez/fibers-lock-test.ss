@@ -493,6 +493,55 @@
 (ok "8b. a transaction body holds no counted lock" (eqv? 0 (unbox l11-held)))
 (ok "8b. and the transaction still ran" (eq? 'done (jolt-fiber-state l11-f)))
 
+;; 8c. THE DELAY BODY RUNS ONCE (jolt-232k). Same shape: a park inside the body
+;; released the delay's mutex, the second forcer found realized? still false and
+;; ran the body again, and the two forcers came back with different values from
+;; one delay. Delay.deref is `synchronized` on the JVM, so the second one waits.
+(define l12-runs (box 0))
+(define l12-ch (ac-make 1 'fixed #f))
+(define l12-d
+  (jolt-make-delay
+   (lambda ()
+     (set-box! l12-runs (+ 1 (unbox l12-runs)))
+     (jolt-fiber-<! l12-ch))))
+(define l12-va (box 'none))
+(define l12-vb (box 'none))
+(define l12-a (sa-fiber-spawn (lambda () (set-box! l12-va (jolt-delay-force l12-d)))))
+(sa-fiber-run-all)
+(ok "8c. the first forcer parked inside the delay body"
+    (and (eqv? 1 (unbox l12-runs)) (eq? 'parked (jolt-fiber-state l12-a))))
+(define l12-b (sa-fiber-spawn (lambda () (set-box! l12-vb (jolt-delay-force l12-d)))))
+(sa-fiber-run-all)
+(ok "8c. a second forcer does not enter the body" (eqv? 1 (unbox l12-runs)))
+(ok "8c. it waits" (eq? 'parked (jolt-fiber-state l12-b)))
+(jolt-async-give l12-ch 7)
+(sa-fiber-run-all)
+(let loop ((i 0))
+  (when (and (< i 5) (not (eq? 'done (jolt-fiber-state l12-b))))
+    (sa-fiber-run-all)
+    (loop (+ i 1))))
+(ok "8c. the body ran exactly once" (eqv? 1 (unbox l12-runs)))
+(ok "8c. and both forcers see the same value"
+    (and (eqv? 7 (unbox l12-va)) (eqv? 7 (unbox l12-vb))))
+;; The delay contract the fix must not break: a throwing body is realized WITH its
+;; condition, re-throws on every deref, and never re-runs.
+(define l13-runs (box 0))
+(define l13-d
+  (jolt-make-delay (lambda () (set-box! l13-runs (+ 1 (unbox l13-runs))) (error 'l13 "boom"))))
+(define (l13-force) (guard (e (#t 'threw)) (jolt-delay-force l13-d)))
+(ok "8c. a throwing delay body throws" (eq? 'threw (l13-force)))
+(ok "8c. re-throws on the next deref" (eq? 'threw (l13-force)))
+(ok "8c. and did not re-run" (eqv? 1 (unbox l13-runs)))
+(ok "8c. a delay that threw still reads as realized" (jolt-delay-realized? l13-d))
+;; And the body still holds no counted lock, so a long delay body is preemptible.
+(define l14-held (box #f))
+(define l14-d (jolt-make-delay (lambda () (set-box! l14-held (jolt-locks-held)) 'v)))
+(define l14-f (sa-fiber-spawn (lambda () (jolt-delay-force l14-d))))
+(sa-fiber-run-all)
+(ok "8c. a delay body holds no counted lock" (eqv? 0 (unbox l14-held)))
+(ok "8c. and the delay still forced"
+    (and (eq? 'done (jolt-fiber-state l14-f)) (eq? 'v (jolt-delay-force l14-d))))
+
 (jolt-fiber-pool-reset!)
 
 (printf "\nfibers-lock-test: ~a checks, ~a failure(s)\n" total fails)

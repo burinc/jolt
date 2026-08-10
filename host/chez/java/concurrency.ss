@@ -566,20 +566,51 @@
 ;; (delay body) -> (make-delay (fn [] body)) (overlay macro); force/deref run the
 ;; thunk once under a lock and cache the value (JVM delays are thread-safe). force
 ;; (overlay) is (if (delay? x) (deref x) x), so it works once delay?/deref do.
-(define-record-type jolt-delay (fields thunk (mutable realized?) (mutable value) (mutable exn) mu)
-  (nongenerative jolt-delay-v1))
-(define (jolt-make-delay thunk) (make-jolt-delay thunk #f jolt-nil #f (make-mutex)))
+;; No `mu` field: the delay's lock is its own object monitor, for the reason set out
+;; at jolt-delay-force. A per-delay mutex nothing takes would be worse than none.
+(define-record-type jolt-delay (fields thunk (mutable realized?) (mutable value) (mutable exn))
+  (nongenerative jolt-delay-v2))
+(define (jolt-make-delay thunk) (make-jolt-delay thunk #f jolt-nil #f))
 ;; run the thunk once, like Clojure's Delay: if it throws, cache the exception
 ;; (the delay IS realized) and re-throw it on every deref — do NOT re-run the
 ;; body (so value-fns memoize and there is no cache-stampede / retried side
-;; effect). Store the exception inside the lock, re-raise outside it so the mutex
+;; effect). Store the exception inside the lock, re-raise outside it so the lock
 ;; is always released.
+;;
+;; ONCE IS THE CONTRACT, AND A MUTEX CANNOT KEEP IT (jolt-232k).
+;;
+;; This was jolt-with-mutex on a per-delay mutex around the body. jolt-with-mutex is
+;; a dynamic-wind, so a fiber that PARKS in the body releases the mutex while still
+;; lexically inside it; the next forcer acquired the free mutex, found realized?
+;; still #f, and ran the body AGAIN. Both then wrote the value slot, so @d answered
+;; whichever finished last and the two forcers could come back with different values
+;; from one delay. Measured on (delay (swap! runs inc) (<!! ch)): runs = 2, and the
+;; forcers got 2 and 1. Delay.deref is `synchronized` on the JVM, so the second one
+;; waits — the same reason jolt-3a87 made ownership a field for `locking`.
+;;
+;; So the unrealized path takes the delay's own object monitor. Ownership is a field
+;; and survives the park, so the second forcer waits; a fiber contender PARKS rather
+;; than blocking the carrier the holder may need to finish; and no COUNTED lock is
+;; held while the body runs, so a long delay body is preemptible instead of pinning
+;; its carrier for its whole extent.
+;;
+;; The realized? FAST PATH is not just an optimisation for the monitor's cost, it is
+;; sound on its own and was worth having anyway: the writes are ordered value-then-
+;; realized? and exn-then-realized?, so realized? = #t implies the payload is
+;; published, and a reader that sees it needs no lock at all. Every deref of an
+;; already-forced delay used to take the mutex; now none do.
+;;
+;; Reentrancy is unchanged in observable terms: a delay whose body derefs itself
+;; re-enters the monitor, finds realized? #f and recurses, which is what the JVM does
+;; too (synchronized is reentrant and fn is still non-null).
 (define (jolt-delay-force d)
-  (jolt-with-mutex (jolt-delay-mu d)
-    (unless (jolt-delay-realized? d)
-      (guard (e (#t (jolt-delay-exn-set! d e) (jolt-delay-realized?-set! d #t)))
-        (jolt-delay-value-set! d (jolt-invoke (jolt-delay-thunk d)))
-        (jolt-delay-realized?-set! d #t))))
+  (unless (jolt-delay-realized? d)
+    (jolt-with-monitor d
+      (lambda ()
+        (unless (jolt-delay-realized? d)
+          (guard (e (#t (jolt-delay-exn-set! d e) (jolt-delay-realized?-set! d #t)))
+            (jolt-delay-value-set! d (jolt-invoke (jolt-delay-thunk d)))
+            (jolt-delay-realized?-set! d #t))))))
   (if (jolt-delay-exn d) (raise (jolt-delay-exn d)) (jolt-delay-value d)))
 
 ;; --- deref extension --------------------------------------------------------
