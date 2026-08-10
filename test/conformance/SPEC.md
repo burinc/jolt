@@ -74,7 +74,7 @@ each **non-portable** case by the feature it requires. Cases *not* in the profil
 are **portable** — they must pass on any faithful Clojure.
 
 A runtime's **conformance level** = portable cases + the feature families it
-implements. Current profile (≈2735 portable, ≈167 non-portable):
+implements. Current profile (4296 portable, 215 non-portable):
 
 | Feature | Meaning |
 |---------|---------|
@@ -83,6 +83,7 @@ implements. Current profile (≈2735 portable, ≈167 non-portable):
 | `:concurrency/snapshot` | isolated-heap futures/agents/pmap — captured atoms are snapshotted, not shared |
 | `:host/jvm-interop` | Java classes / `instance?` on host classes / proxy / bean / definterface |
 | `:host/arrays` | Java arrays (`into-array`, `int-array`, …) |
+| `:host/implicit-imports` | names a host class or stdlib namespace without importing/requiring it (`StringWriter`, `clojure.math/sqrt`) — the value agrees with Clojure, the source needs the import spelled out |
 | `:async/core-async` | `clojure.core.async` channels/`go` |
 | `:runtime/eval` | runtime `eval` / `load-string` |
 | `:reader/jolt` | jolt reader features (`#?(:jolt …)`) + syntax-quote literal collapse |

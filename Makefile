@@ -595,6 +595,7 @@ makefilesmoke:
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
 certify:
 	@if command -v clojure >/dev/null 2>&1; then \
+		clojure -M test/conformance/certify.clj --self-test && \
 		clojure -M test/conformance/certify.clj; \
 	else \
 		echo "certify: clojure not on PATH — skipped"; \
