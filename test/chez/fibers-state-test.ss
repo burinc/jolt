@@ -285,6 +285,61 @@
                    (lambda () (car (sa-current-winders)))
                    (lambda () #f))))
 
+;; --- 8. a winder must not re-establish state the dslice already carries -----
+;; A hand-rolled binding frame over a dynamic extent,
+;;     (dynamic-wind (lambda () (dyn-push-frame! pairs)) thunk (lambda () (pop)))
+;; double-applies across a park. jolt-fiber-to-scheduler! saves the slice — which
+;; already holds the pushed frame — BEFORE the escape unwinds; the unwind pops
+;; it; on resume the slice restore puts it back and THEN the continuation rewinds
+;; and the before-thunk pushes a second one. Three sites did this (*agent*,
+;; *compile-files*, and the loader's file/spath frame) and all three were wrong
+;; after any park, with no preemption involved.
+;;
+;; dyn-with-frame is the one correct shape: push ONCE outside the wind, nothing
+;; in the before-thunk, and an ABSOLUTE restore in the after-thunk. Both halves
+;; are checked below, and the broken shape is checked alongside it so this cannot
+;; pass by accident if the helper stops being used.
+(define (dyn-depths make-body)
+  (let ((log '()))
+    (define (note! tag) (set! log (cons (cons tag (length (dyn-binding-stack))) log)))
+    (let* ((c (var-cell-lookup "clojure.core" "*compile-files*"))
+           (f (sa-fiber-spawn
+               (lambda ()
+                 ((make-body c note!))
+                 (note! 'after)))))
+      (jolt-fiber-drain! (jolt-fiber-carrier f))
+      (note! 'parked)
+      (sa-fiber-resume f)
+      (jolt-fiber-drain! (jolt-fiber-carrier f))
+      (reverse log))))
+
+(define (dyn-body-inner note!)
+  (lambda () (note! 'in) (jolt-fiber-park!) (note! 'resumed)))
+
+(define good
+  (dyn-depths (lambda (c note!)
+                (lambda () (dyn-with-frame (list (cons c #t)) (dyn-body-inner note!))))))
+(define bad
+  (dyn-depths (lambda (c note!)
+                (lambda ()
+                  (dynamic-wind
+                   (lambda () (dyn-push-frame! (list (cons c #t))))
+                   (dyn-body-inner note!)
+                   (lambda () (dyn-binding-stack (cdr (dyn-binding-stack)))))))))
+
+(ok "8. dyn-with-frame: depth is the same after a park as before"
+    (= (cdr (assq 'in good)) (cdr (assq 'resumed good))))
+(ok "8. dyn-with-frame: the frame is gone once the extent ends"
+    (= 0 (cdr (assq 'after good))))
+(ok "8. dyn-with-frame: the carrier is clean while the fiber is parked"
+    (= 0 (cdr (assq 'parked good))))
+;; The teeth: the shape dyn-with-frame replaced still double-applies and leaks.
+;; If this ever passes, the hazard is gone by some other route and the helper's
+;; comment needs revisiting — it does not mean the check is obsolete.
+(ok "8. the hand-rolled push/pop shape still double-applies (teeth)"
+    (and (= (+ 1 (cdr (assq 'in bad))) (cdr (assq 'resumed bad)))
+         (= 1 (cdr (assq 'after bad)))))
+
 (printf "\nfibers-state-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "fibers-state-test: PASS — per-fiber dynamic state\n") (exit 0))

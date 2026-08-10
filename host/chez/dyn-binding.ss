@@ -37,6 +37,40 @@
       (loop (cdr p))))
   (dyn-binding-stack (cons pairs (dyn-binding-stack))))
 
+;; (dyn-with-frame pairs thunk) — THE way to scope a binding frame over a
+;; dynamic extent. Three sites used to hand-roll it and all three were wrong
+;; across a park:
+;;
+;;     (dynamic-wind (lambda () (dyn-push-frame! pairs))
+;;                   thunk
+;;                   (lambda () (dyn-binding-stack (cdr (dyn-binding-stack)))))
+;;
+;; jolt-fiber-to-scheduler! saves the fiber's slice — which already contains the
+;; pushed frame — BEFORE the escape unwinds. The unwind pops it. On resume the
+;; slice is restored, putting the frame back, and THEN the continuation rewinds
+;; and that before-thunk pushes a SECOND one. Measured on an ordinary explicit
+;; park, no preemption involved: depth went 1 before the park and 2 after,
+;; leaking a frame past the end of the extent.
+;;
+;; The general rule, which is what the shape below encodes: a winder must not
+;; re-establish state the jolt-dslice already carries. The dslice owns
+;; dyn-binding-stack, so the push happens ONCE, OUTSIDE the dynamic-wind, and
+;; the before-thunk does nothing. A park then costs nothing to get right — the
+;; slice was saved before the after-thunk ran, and restoring it on resume is the
+;; whole recovery.
+;;
+;; The after-thunk restores the stack it found rather than popping one frame.
+;; Absolute, not relative, for the same reason parameterize is written that way:
+;; a relative edit is only correct if the stack is exactly as deep as it was, and
+;; an escape is precisely when it is not.
+(define (dyn-with-frame pairs thunk)
+  (let ((outer (dyn-binding-stack)))
+    (dyn-push-frame! pairs)
+    (dynamic-wind
+      (lambda () #f)
+      thunk
+      (lambda () (dyn-binding-stack outer)))))
+
 ;; --- reading a var -----------------------------------------------------------
 ;; THE GATE, and why every read below opens with it.
 ;;

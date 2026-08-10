@@ -289,10 +289,7 @@
                     (set! agent-star-cell c) c))))
     (if (not cell)
         (thunk)
-        (dynamic-wind
-          (lambda () (dyn-push-frame! (list (cons cell a))))
-          thunk
-          (lambda () (dyn-binding-stack (cdr (dyn-binding-stack))))))))
+        (dyn-with-frame (list (cons cell a)) thunk))))
 
 ;; Enqueue an action and start the worker if the agent is idle. No precondition
 ;; checks — used by the direct send path (after checks), by nested-send release,

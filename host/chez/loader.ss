@@ -392,17 +392,13 @@
                           ((char=? (string-ref path i) #\/)
                            (substring path (+ i 1) (string-length path)))
                           (else (loop (- i 1)))))))
-        (dynamic-wind
-          (lambda ()
-            (let ((frame (list (cons ldr-file-cell path)
-                               (cons ldr-spath-cell name)
-                               (cons ldr-warn-cell (var-cell-root ldr-warn-cell))
-                               (cons ldr-assert-cell (var-cell-root ldr-assert-cell))
-                               (cons ldr-unchecked-cell
-                                     (var-cell-root ldr-unchecked-cell)))))
-              (dyn-push-frame! frame)))
-          thunk
-          (lambda () (dyn-binding-stack (cdr (dyn-binding-stack))))))))
+        (dyn-with-frame
+          (list (cons ldr-file-cell path)
+                (cons ldr-spath-cell name)
+                (cons ldr-warn-cell (var-cell-root ldr-warn-cell))
+                (cons ldr-assert-cell (var-cell-root ldr-assert-cell))
+                (cons ldr-unchecked-cell (var-cell-root ldr-unchecked-cell)))
+          thunk))))
 
 (define (load-jolt-file path)
   (load-jolt-file* path (ldr-read-source path)))
@@ -1025,10 +1021,7 @@
   (let ((cell (var-cell-lookup "clojure.core" "*compile-files*")))
     (if (not cell)
         (thunk)
-        (dynamic-wind
-          (lambda () (dyn-push-frame! (list (cons cell #t))))
-          thunk
-          (lambda () (dyn-binding-stack (cdr (dyn-binding-stack))))))))
+        (dyn-with-frame (list (cons cell #t)) thunk))))
 
 ;; Publish under `dir`, borrowing the AOT cache's discipline: compile to a
 ;; pid-unique temp and rename(2) each file into place, .so last, so a concurrent
