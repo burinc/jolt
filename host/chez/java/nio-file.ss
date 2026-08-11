@@ -245,14 +245,13 @@
           (if r (car r) (throw-jvm (quote IllegalArgumentException) (string-append "No matching method for Path: " method-name))))
         'pass)))
 
-;; instance? java.nio.file.Path, (class p), (str p), value equality + hashing.
-(register-instance-check-arm!
-  (lambda (type-sym val)
-    (if (and (symbol-t? type-sym) (nio-path? val))
-        (let ((n (symbol-t-name type-sym)))
-          (if (or (string=? n "Path") (string=? n "java.nio.file.Path")) #t 'pass))
-        'pass)))
-(register-class-arm! nio-path? (lambda (_) "java.nio.file.Path"))
+;; (str p), value equality + hashing. instance? and (class p) come from the
+;; jhost-tag->fqn rows for these three tags (class-hierarchy.ss) — the same
+;; registry that gives every other shim its class, so extend-protocol on
+;; java.nio.file.Path dispatches on a Path too. A tag-local arm here answered
+;; instance? and class but NOT value-host-tags, which is exactly the drift the
+;; registry exists to prevent: (extend-protocol P java.nio.file.Path …) then
+;; threw "No method" on a value whose (class …) said java.nio.file.Path.
 (register-str-render! nio-path? (lambda (p) (nio-path-str p)))
 (register-eq-arm! (lambda (a b) (and (nio-path? a) (nio-path? b)))
                   (lambda (a b) (string=? (nio-path-str a) (nio-path-str b))))

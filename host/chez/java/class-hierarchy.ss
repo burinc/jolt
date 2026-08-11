@@ -488,6 +488,14 @@
 (jch-register-supers! "java.sql.Date" '("java.util.Date"))
 (jch-register-supers! "java.sql.Timestamp" '("java.util.Date"))
 (jch-register-supers! "java.nio.ByteBuffer" '("java.lang.Comparable"))
+;; java.nio.file (nio-file.ss). The JVM's concrete classes here are private
+;; implementation details (sun.nio.fs.UnixPath, sun.nio.fs.MacOSXFileSystem), so
+;; the shims report the public interface a caller can actually name, the way the
+;; java.io shims report java.io.Reader rather than a subclass.
+(jch-register-supers! "java.nio.file.Path" '("java.lang.Comparable" "java.lang.Iterable" "java.nio.file.Watchable"))
+(jch-register-supers! "java.nio.file.Watchable" '())
+(jch-register-supers! "java.nio.file.FileSystem" '())
+(jch-register-supers! "java.nio.file.PathMatcher" '())
 
 ;; ---- jhost value tag -> FQN (single value-discriminator registry) --------------
 ;; A value-layer shim value (make-jhost tag …) reports its JVM class by this map;
@@ -525,6 +533,10 @@
     ("timezone" . "java.util.TimeZone")
     ("sql-date" . "java.sql.Date")
     ("uri" . "java.net.URI")
+    ;; java.nio.file shims (nio-file.ss)
+    ("nio-path" . "java.nio.file.Path")
+    ("nio-filesystem" . "java.nio.file.FileSystem")
+    ("nio-path-matcher" . "java.nio.file.PathMatcher")
     ("byte-buffer" . "java.nio.ByteBuffer")
     ("arraylist" . "java.util.ArrayList")
     ("linkedlist" . "java.util.LinkedList")
