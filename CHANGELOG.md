@@ -5,6 +5,125 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3] - 2026-08-11
+
+`core.async` names three carriers and jolt has all three now: `io-thread` runs
+its body on a fiber. Three fixes are for things that failed quietly rather than
+loudly, which is what took them so long to find: `System/exit` off the main
+thread did nothing, a stray close paren truncated a file and reported success,
+and the one timer behind every `(timeout ms)` could miss its own deadline by the
+length of the farthest deadline pending. Three more come from making the real
+`clojure.jdbc` run: `with-open` on a `reify`, `(Class/FIELD)` in call position,
+and a protocol extended to a class a library declared.
+
+### Added
+
+- **`io-thread` runs its body on a fiber.** It was an alias for `thread`, so
+  asking for the cheap blocking-shaped carrier got you an OS thread and the
+  `workload` argument to `thread-call` was accepted and ignored. The three names
+  now pick three different things: `thread` is a real OS thread, `go` is the CPS
+  pass on whatever `clojure.core.async/*go-backend*` says, and `io-thread`, which
+  is `(thread-call f :io)`, is a fiber. `:mixed` (the default, as on the JVM) and
+  `:compute` stay OS threads, and any other workload throws rather than quietly
+  running on one of them.
+
+  Neither `thread` nor `io-thread` consults `*go-backend*`, because both name
+  their carrier at the call site. A body that parks releases its carrier, so
+  thousands of `io-thread` bodies cost thousands of stacks rather than thousands
+  of OS threads, and a park works anywhere in the body, including inside a called
+  function, a `try` or a loop, because a fiber parks by capturing its
+  continuation rather than by being rewritten. That is the reason to have
+  `io-thread` as well as `go`.
+
+  What a fiber does not get is an OS thread of its own. Channel operations park,
+  and so does `jolt.socket`, but work that blocks somewhere the runtime cannot
+  see (`Thread/sleep`, a raw fd read, a blocking FFI call) holds its carrier for
+  the duration. `thread` is still the escape for that, and the docstrings say
+  which is which. `go`'s default backend is unchanged. (#583, jolt-579)
+
+### Fixed
+
+- **`System/exit` ends the process from any thread.** It was Chez's `exit`, which
+  unwinds only the calling thread when that thread is not the main one, so off
+  the main thread the call did nothing the process could notice: a worker that
+  decided the program should stop could not stop it, and nothing said it had
+  tried. On the JVM `System.exit` halts the VM from wherever it is called. The
+  boot thread keeps the normal path with its exit handlers; any other thread
+  flushes stdout and stderr by hand and calls libc `_exit`. Not unwinding is
+  right on its own terms too, since the JVM does not run `finally` blocks on
+  `System.exit`. (#582, jolt-7xls)
+
+- **One paren too many is a read error, not a silent truncation.** The two loops
+  that read a file form by form treated a stray close delimiter as end of input,
+  so everything after it was dropped: `jolt run` printed whatever came before the
+  paren and exited 0, and a build emitted an image of those forms and reported
+  success. The JVM raises "Unmatched delimiter: )" and exits 1, and so does jolt
+  now, naming the file and the line and column of the delimiter rather than the
+  start of the file. Found the way you would want to find it, from a test file
+  whose entire body silently did not exist. (#581, jolt-3amm)
+
+- **A `(timeout ms)` closes on its own deadline.** One timer thread serves every
+  `(timeout ms)` in the process, and it slept to the nearest deadline with its
+  mutex released, which left it off its condition variable exactly when a nearer
+  deadline arrived. The wake was dropped and the new timeout did not close until
+  the deadline the timer was already sleeping to, so a `(timeout 100)` created
+  while a `(timeout 3000)` was pending took 3000ms. Every `alts!` timeout guard,
+  every operator built on one, and every fiber parked on one inherited that.
+
+  The same three lines cleared the flag that guards the fork before an idle wait,
+  but a timer that finds nothing pending waits rather than exiting, so the next
+  timeout both signalled the live thread and forked another one that also never
+  exits. 100 sequential `(timeout 1)` calls left 100 live timer threads.
+  (#584, jolt-pe84)
+
+- **`with-open` closes a `reify`.** It had an arm for a `deftype` or `defrecord`
+  that declares `close` and fell through to "no .close method on value" for a
+  `reify` that declares one, even though `(.close x)` on the same value worked.
+  It now goes through the shared interface-method lookup that already handles
+  both. A connection handed out as a `reify` implementing `java.io.Closeable`,
+  which is what `clojure.jdbc` does, could not be used with `with-open` before.
+  (#585)
+
+- **`(Class/FIELD)` in call position reads the field** instead of trying to apply
+  its value, so `(Math/PI)` and `(Integer/MAX_VALUE)` evaluate to the field as
+  they do on Clojure, which reads a parenthesised static member as a field when
+  one exists. It holds for a class a library declares too, which is what
+  `clojure.jdbc` needs for its `(Locale/US)`. The dot form already resolved this
+  ambiguity at runtime; the slash form now gets the same treatment, for a
+  zero-argument call whose head is a qualified non-var symbol. A no-arg static
+  method is still called, and a zero-arg var call is untouched. (#585)
+
+- **`extend-protocol` on a class a library declared now dispatches.** Registering
+  a class made `(class x)` and `instance?` answer for the library's own host
+  values, which was half the point; the other half, dispatching a protocol
+  extended to that class, never worked. Resolving the extended type name to a
+  dispatch tag only recognised classes the runtime models, so a name it did not
+  know was filed under the extending namespace, a tag no value can ever carry,
+  and the extension silently never fired. A dotted name that names no `deftype`
+  is now taken verbatim, which is the tag such a value reports. Simple names are
+  untouched. (#585)
+
+### Internal
+
+- **A hung gate case reports itself instead of wedging the run.** `make test` sat
+  on the socket poller case for over ninety minutes in one local run and said
+  nothing, because the per-case cap needed GNU `timeout` and stock macOS has
+  none. Every host has a cap now (`host/chez/cap.sh`, POSIX sh), and the case
+  itself runs its workload on a spawned thread while the main thread watches a
+  deadline, so a wedge exits 1 naming the round and phase it stopped in. Its old
+  claim that an `alts!!` timeout bounded every read was not a bound at all, since
+  the bound depended on the same machinery the case exists to stress, which the
+  timer fix above is a candidate explanation for. (jolt-8tma)
+
+- **`make certify` names the rows it could not finish**, rather than counting
+  them, and staleness now ignores rows the JVM oracle had no opinion on, so a
+  row that timed out is not evidence that a divergence went away. The
+  `(reduce + (eduction (filter odd?) [1 2 3 4 5]))` row is recorded as flaky,
+  because the JVM's own answer is unspecified: `CollReduce` is extended to both
+  `IReduceInit` and `Iterable`, an Eduction implements both, and which one wins
+  falls out of a hash set ordered by identity hash codes. Twelve consecutive
+  local runs raise; CI returns 9. (jolt-owjl)
+
 ## [0.7.2] - 2026-08-11
 
 A Path answers for the file system it came from, and the java.nio.file shim
@@ -3898,7 +4017,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.3...HEAD
+[0.7.3]: https://github.com/jolt-lang/jolt/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/jolt-lang/jolt/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/jolt-lang/jolt/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jolt-lang/jolt/compare/v0.6.9...v0.7.0
