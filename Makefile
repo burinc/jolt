@@ -67,7 +67,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
-        gambitgen gambitgencheck \
+        gambitgen gambitgencheck grenadinecheck \
         fibersbench dynbench \
         fibersresidue
 
@@ -122,7 +122,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   fnform traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck lockcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
-  certify gambitcheck gambitgencheck fibers gosm threadsafety
+  certify gambitcheck gambitgencheck grenadinecheck fibers gosm threadsafety
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -285,7 +285,7 @@ unit:
 # buildlibsmoke` slower with the prerequisite than without it. The staleness
 # check covers the same inputs build-jolt.ss embeds: the runtime .ss files, the
 # install roots, and the launcher stub. JOLT_FORCE_TESTBIN=1 rebuilds anyway.
-TESTBIN-INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src vendor/grenadine/src vendor/irregex
+TESTBIN-INPUTS := host/chez jolt-core stdlib vendor/fs/src vendor/process/src vendor/grenadine/src vendor/grenadine-generated vendor/irregex
 testbin:
 	@if [ -n "$${JOLT_FORCE_TESTBIN:-}" ] || [ ! -x target/release/jolt ] || \
 	   [ -n "$$(find $(TESTBIN-INPUTS) -type f -newer target/release/jolt -print -quit 2>/dev/null)" ]; then \
@@ -656,6 +656,23 @@ gambitgen:
 # a temp file and diff. A records.ss change that never reached the generated file
 # fails here instead of silently leaving the Gambit host a release behind. Runs
 # on Chez alone, so it gates in CI whether or not gambit is installed.
+# Grenadine ships four namespaces it generates rather than commits, so half the
+# source tree comes from the submodule and half from vendor/grenadine-generated
+# (see the README there). Bumping one without refreshing the other mixes two
+# Grenadine versions, which breaks far from the cause — so it is checked, not
+# documented and hoped for.
+grenadinecheck:
+	@pinned=$$(git -C vendor/grenadine describe --tags --exact-match 2>/dev/null \
+	            || git -C vendor/grenadine rev-parse --short HEAD); \
+	  vendored=$$(cat vendor/grenadine-generated/VERSION 2>/dev/null | tr -d '[:space:]'); \
+	  if [ "$$pinned" = "$$vendored" ]; then \
+	    echo "grenadinecheck: generated sources match the pinned submodule ($$pinned)"; \
+	  else \
+	    echo "grenadinecheck: vendor/grenadine is $$pinned but vendor/grenadine-generated is $$vendored" >&2; \
+	    echo "  refresh the generated sources — see vendor/grenadine-generated/README.md" >&2; \
+	    exit 1; \
+	  fi
+
 gambitgencheck:
 	@out=$$(mktemp -d)/records-gambit.ss; \
 	  GEN_RECORDS_OUT="$$out" $(CHEZ) --script host/gambit/gen-records.ss >/dev/null; \

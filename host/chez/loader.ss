@@ -39,7 +39,10 @@
 ;; bakes first-wins to match). Grenadine ships host adapters alongside its portable
 ;; core, one of them named jolt.deps, so jolt-core has to precede it.
 (define ldr-install-roots
-  '("jolt-core" "stdlib" "vendor/fs/src" "vendor/process/src" "vendor/grenadine/src"))
+  '("jolt-core" "stdlib" "vendor/fs/src" "vendor/process/src" "vendor/grenadine/src"
+    ;; the four namespaces grenadine generates instead of committing — see
+    ;; vendor/grenadine-generated/README.md
+    "vendor/grenadine-generated"))
 
 ;; True when `f` is a file owned by the Jolt runtime (compiler + stdlib) — either
 ;; an embedded-resource key (string or bytevector value) or a path under one of

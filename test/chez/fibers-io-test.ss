@@ -59,7 +59,8 @@
 ;; image.
 (load "host/chez/loader.ss")
 (hashtable-delete! loaded-ns "jolt.ffi")
-(set-source-roots!* '("jolt-core" "stdlib" "vendor/fs/src" "vendor/process/src" "vendor/grenadine/src"))
+(set-source-roots!* '("jolt-core" "stdlib" "vendor/fs/src" "vendor/process/src" "vendor/grenadine/src"
+                      "vendor/grenadine-generated"))
 (load "host/chez/java/ffi.ss")
 
 (define total 0)

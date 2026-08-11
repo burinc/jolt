@@ -12,6 +12,20 @@ transient one, and stops silently continuing without the dependency.
 
 ### Changed
 
+- **Grenadine updated to v0.1.6.** No behaviour change for jolt: the only two
+  namespaces jolt consumes, `grenadine.version` and `grenadine.pom`, differ from
+  v0.1.5 by license and provenance comment headers alone.
+
+  It is not a plain submodule bump, though. From v0.1.6 Grenadine *generates*
+  `basis`, `coordinate`, `expander` and `gitlibs` from pinned upstream sources
+  rather than committing them — its own `.gitignore` lists all four — so the git
+  tree is an incomplete source tree, and jolt loads Clojure straight off
+  `vendor/grenadine/src`. Those four now come from the release's
+  checksum-verified `-src.tar.gz` and live in `vendor/grenadine-generated`; the
+  alternative was running Grenadine's `yq`-and-`git clone` staging step on every
+  build and CI job. `make grenadinecheck` fails if the vendored sources and the
+  pinned submodule name different versions.
+
 - **A Maven dependency that cannot be obtained is now a hard error**, matching
   the reference implementation: tools.deps aborts with "Error building
   classpath. The following artifacts could not be resolved:" and exits 1 for a
