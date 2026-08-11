@@ -29,10 +29,16 @@ from the submodule and half from the tarball coherent rather than a guess.
 
 ## Refreshing on a bump
 
-`VERSION` records the release these came from, and `make grenadinecheck` fails
-if it disagrees with the tag the submodule is pinned to. Bumping the submodule
-without refreshing these files is otherwise silent, and mixing two Grenadine
-versions is exactly the kind of breakage that surfaces far from its cause.
+`VERSION` records the release these came from as `<tag> <sha>`, and
+`make grenadinecheck` fails if the **sha** disagrees with the commit the
+submodule is pinned to. Bumping the submodule without refreshing these files is
+otherwise silent, and mixing two Grenadine versions is exactly the kind of
+breakage that surfaces far from its cause.
+
+The check compares the commit rather than the tag because a submodule checkout
+does not necessarily carry tags — CI's does not, so `git describe` fails there.
+A tag comparison passed on a developer machine and failed on CI, which is the
+wrong way round for a gate.
 
     git -C vendor/grenadine checkout vX.Y.Z
     gh release download vX.Y.Z --repo clojurestar/grenadine \
@@ -41,7 +47,8 @@ versions is exactly the kind of breakage that surfaces far from its cause.
     tar xzf grenadine-X.Y.Z-src.tar.gz
     cp grenadine-X.Y.Z-src/src/grenadine/{basis,coordinate,expander,gitlibs}.cljc \
        vendor/grenadine-generated/grenadine/
-    printf 'vX.Y.Z\n' > vendor/grenadine-generated/VERSION
+    printf 'vX.Y.Z %s\n' "$(git -C vendor/grenadine rev-parse HEAD)" \
+      >> vendor/grenadine-generated/VERSION   # keep the comment header
 
 If a future Grenadine generates a different set, `make grenadinecheck` will not
 catch that on its own — the load will fail with an unresolved namespace, which

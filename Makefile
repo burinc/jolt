@@ -661,14 +661,22 @@ gambitgen:
 # (see the README there). Bumping one without refreshing the other mixes two
 # Grenadine versions, which breaks far from the cause — so it is checked, not
 # documented and hoped for.
+# Compares the COMMIT, not the tag: a submodule checkout does not necessarily
+# carry tags — CI's does not — so `git describe` fails there and a tag
+# comparison would only ever pass on a developer's machine. That is exactly the
+# environment-dependent gate that reads as green where it is never really
+# checked, so the recorded VERSION carries the sha and this reads that.
 grenadinecheck:
-	@pinned=$$(git -C vendor/grenadine describe --tags --exact-match 2>/dev/null \
-	            || git -C vendor/grenadine rev-parse --short HEAD); \
-	  vendored=$$(cat vendor/grenadine-generated/VERSION 2>/dev/null | tr -d '[:space:]'); \
-	  if [ "$$pinned" = "$$vendored" ]; then \
-	    echo "grenadinecheck: generated sources match the pinned submodule ($$pinned)"; \
+	@pinned=$$(git -C vendor/grenadine rev-parse HEAD 2>/dev/null); \
+	  vendored=$$(sed -n 's/^[^#].* //p' vendor/grenadine-generated/VERSION 2>/dev/null | tr -d '[:space:]'); \
+	  tag=$$(sed -n 's/^\([^# ][^ ]*\) .*/\1/p' vendor/grenadine-generated/VERSION 2>/dev/null); \
+	  if [ -z "$$pinned" ]; then \
+	    echo "grenadinecheck: vendor/grenadine is not checked out — run 'git submodule update --init'" >&2; \
+	    exit 1; \
+	  elif [ "$$pinned" = "$$vendored" ]; then \
+	    echo "grenadinecheck: generated sources match the pinned submodule ($$tag $$(echo $$pinned | cut -c1-7))"; \
 	  else \
-	    echo "grenadinecheck: vendor/grenadine is $$pinned but vendor/grenadine-generated is $$vendored" >&2; \
+	    echo "grenadinecheck: vendor/grenadine is at $$pinned but vendor/grenadine-generated records $$vendored ($$tag)" >&2; \
 	    echo "  refresh the generated sources — see vendor/grenadine-generated/README.md" >&2; \
 	    exit 1; \
 	  fi

@@ -1,1 +1,6 @@
-v0.1.6
+# The grenadine release these generated sources were taken from.
+# Two fields: the release tag (for humans) and the commit it points at.
+# grenadinecheck compares the SHA, not the tag — a submodule checkout does not
+# necessarily carry tags (CI's does not), so `git describe` is not available
+# everywhere and a tag comparison fails wherever it is missing.
+v0.1.6 7e16335c449638e00da69db20a6d80e1547c2ee1
