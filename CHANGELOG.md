@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-08-11
+
+A Path answers for the file system it came from, and the java.nio.file shim
+values report their classes through the registry every other shim uses.
+
+### Added
+
+- **`Path.getFileSystem` and `FileSystem.getPath`.** `FileSystems/getDefault`
+  hands back one file-system object rather than a fresh one per call, so
+  `(identical? (FileSystems/getDefault) (.getFileSystem p))` holds the way it
+  does on the JVM, and a file system reached through a path can construct paths
+  itself. That is the shape migratus uses to filter migration files: it takes
+  the file system off a path, asks it for both the candidate path and the glob
+  matcher, and matches the two. Thanks to @sundbp (#574).
+
+### Fixed
+
+- **`extend-protocol` on `java.nio.file.Path` now dispatches.** A Path answered
+  `instance?` and `(class p)` through arms local to the nio shim rather than
+  through the jhost tag registry, and protocol dispatch reads that registry, so
+  `(extend-protocol P java.nio.file.Path …)` threw "No method" on a value whose
+  own `(class …)` said `java.nio.file.Path`. The registry now carries a row for
+  each of the three shims and the tag-local arms are gone, which is also what
+  fixes `(class (FileSystems/getDefault))` answering `:object` and
+  `(instance? java.nio.file.FileSystem fs)` answering false where the JVM
+  answers true. A Path is a Comparable, an Iterable and a Watchable now, as it
+  is on the JVM. (#577, jolt-o9xv)
+
 ## [0.7.1] - 2026-08-11
 
 Dependency resolution tells the truth about a Maven fetch that failed, retries a
@@ -3870,7 +3898,10 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.6.9...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/jolt-lang/jolt/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/jolt-lang/jolt/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/jolt-lang/jolt/compare/v0.6.9...v0.7.0
 [0.6.9]: https://github.com/jolt-lang/jolt/compare/v0.6.8...v0.6.9
 [0.6.8]: https://github.com/jolt-lang/jolt/compare/v0.6.7...v0.6.8
 [0.6.7]: https://github.com/jolt-lang/jolt/compare/v0.6.6...v0.6.7
