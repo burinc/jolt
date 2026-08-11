@@ -14,8 +14,12 @@
 ;;
 ;; This file provides the primitives; the higher-level dataflow API (mult, mix,
 ;; pub/sub, pipeline, map, merge, reduce, …) is a Clojure overlay over them.
-;; go/go-loop/thread are macros (mark-macro!) expanding to go-spawn. Loaded after
-;; concurrency.ss (reuses ms->duration). Requires a threaded Chez build.
+;; `thread` is a macro here (mark-macro!) expanding to thread-spawn. `go` and
+;; `go-loop` are NOT: they live in the overlay, because the CPS pass that decides
+;; a park's representation per site needs &env, macroexpand and resolve, which a
+;; Scheme expander over reader forms does not have. go-spawn — the runtime the
+;; overlay's fallback path emits — stays here. Loaded after concurrency.ss
+;; (reuses ms->duration). Requires a threaded Chez build.
 
 ;; --- buffers ----------------------------------------------------------------
 (define-record-type async-buffer (fields n kind) (nongenerative async-buffer-v1))
@@ -102,7 +106,7 @@
 ;; every other fiber on it (the R3 invariant; the fiber-side registration in
 ;; fibers-async.ss releases before parking).
 (define (alt-claim! h)
-  (with-mutex (alt-handler-fmu h)
+  (jolt-with-mutex (alt-handler-fmu h)
     (and (alt-handler-active? h)
          (begin (alt-handler-active?-set! h #f) #t))))
 
@@ -120,7 +124,7 @@
 ;; because no alts! can run before the boot finishes loading.
 (define jolt-fiber-alt-await-fn #f)
 (define (alt-deliver! h val port)
-  (with-mutex (alt-handler-wmu h)
+  (jolt-with-mutex (alt-handler-wmu h)
     (let ((mb (alt-handler-mailbox h)))
       (vector-set! mb 1 val) (vector-set! mb 2 port) (vector-set! mb 0 #t))
     (let ((w (alt-handler-wake h)))
@@ -277,14 +281,14 @@
     (async-chan-alt-putters-set! ch '())
     (condition-broadcast (async-chan-cv ch)))
   jolt-nil)
-(define (jolt-async-close! ch) (with-mutex (async-chan-mu ch) (ac-close! ch)))
+(define (jolt-async-close! ch) (jolt-with-mutex (async-chan-mu ch) (ac-close! ch)))
 
 ;; >! / >!! — put, blocking. false if closed; nil may not be put. With a
 ;; transducer the value is run through it (one put -> zero or more channel values);
 ;; a `reduced` result closes the channel.
 (define (jolt-async-give ch v)
   (async-check-put! v)
-  (with-mutex (async-chan-mu ch)
+  (jolt-with-mutex (async-chan-mu ch)
     (cond
       ((async-chan-closed? ch) #f)
       ((async-chan-xrf ch)
@@ -344,7 +348,7 @@
 ;; A promise channel PEEKS — its one value stays for every taker.
 ;; When the queue is empty, drains pending alt-putters before parking.
 (define (jolt-async-take ch)
-  (with-mutex (async-chan-mu ch)
+  (jolt-with-mutex (async-chan-mu ch)
     (let loop ()
       (cond ((eq? (async-chan-kind ch) 'promise)
              (cond ((not (ac-qempty? ch)) (ac-peek ch))
@@ -399,7 +403,7 @@
                ac-poll-empty)))
         (else ac-poll-empty)))
 (define (ac-poll! ch)
-  (with-mutex (async-chan-mu ch) (ac-poll!/locked ch)))
+  (jolt-with-mutex (async-chan-mu ch) (ac-poll!/locked ch)))
 
 ;; non-blocking give: 'ok (accepted), 'full (would block), or 'closed.
 ;; ac-try-give!/locked: mutex must already be held.
@@ -438,7 +442,7 @@
           (else 'full)))))))
 (define (ac-try-give! ch v)
   (async-check-put! v)
-  (with-mutex (async-chan-mu ch) (ac-try-give!/locked ch v)))
+  (jolt-with-mutex (async-chan-mu ch) (ac-try-give!/locked ch v)))
 
 ;; offer! / poll! — never block. offer! returns #t/#f(closed) on completion, nil if
 ;; it would block; poll! returns a value, nil (closed+empty), or the ::none sentinel.
@@ -480,7 +484,7 @@
           (else (loop cur (cdr cur))))))
 
 (define (timeout-thread)
-  (mutex-acquire timeout-mu)
+  (jolt-lock! timeout-mu)
   (let loop ()
     (let cleanup ()
       (if (and (pair? timeout-pending) (<= (caar timeout-pending) (now-millis)))
@@ -497,23 +501,23 @@
               (let ((wait-ms (- (caar timeout-pending) (now-millis))))
                 (if (> wait-ms 0)
                     (begin
-                      (mutex-release timeout-mu)
+                      (jolt-unlock! timeout-mu)
                       (sleep (ms->duration wait-ms))
-                      (mutex-acquire timeout-mu)))
+                      (jolt-lock! timeout-mu)))
                 (loop)))))))
 
 ;; (timeout ms) — a channel that closes after ms milliseconds.
 (define (jolt-async-timeout ms)
   (let* ((w (ac-make 0 'unbuffered #f))
          (dl (+ (now-millis) (exact (floor ms)))))
-    (mutex-acquire timeout-mu)
+    (jolt-lock! timeout-mu)
     (let ((head? (timeout-insert! dl w)))
       (when head?
         (condition-signal timeout-cv))
       (unless timeout-running?
         (set! timeout-running? #t)
         (fork-thread timeout-thread))
-      (mutex-release timeout-mu)
+      (jolt-unlock! timeout-mu)
       w)))
 
 ;; (put! ch v [cb [on-caller?]]) — async put, optional completion callback. If the
@@ -573,6 +577,23 @@
 ;; The host setter jolt-fiber-carrier-count-set! writes this same root, so the
 ;; two knobs never disagree. The pool starts once per process.
 (def-var! "clojure.core.async" "*fiber-carrier-count*" jolt-nil)
+;; Preemption quantum, in Chez engine ticks (fibers.ss reads this root; the host
+;; setter jolt-fiber-preempt-ticks-set! writes it, so the two never disagree).
+;; jolt-nil means the built-in default, which is ON at roughly 0.45ms: a
+;; compute-bound go block yields instead of pinning its carrier for as long as
+;; it runs. A fixnum at or above jolt-fiber-preempt-ticks-min pins a different
+;; quantum; anything below the floor, 0 included, is ignored and the default
+;; stands.
+;;
+;; THERE IS NO VALUE THAT TURNS PREEMPTION OFF. Cooperative-only is not a milder
+;; setting, it is an unbounded starvation window: one fiber that never reaches a
+;; channel op starves every other fiber on its carrier, and nothing can migrate
+;; them because a fiber is pinned to its carrier for life. Ask for a very long
+;; quantum if that is what you want. Read at pool start, so set it before the
+;; first :fiber go or between a pool reset and the next one; the host setter
+;; jolt-fiber-preempt-ticks-set! is immediate and refuses an out-of-range value
+;; out loud.
+(def-var! "clojure.core.async" "*fiber-preempt-ticks*" jolt-nil)
 (define (go-backend-current)
   (let ((cell (var-cell-lookup "clojure.core.async" "*go-backend*")))
     (if (and cell (var-cell-defined? cell))
@@ -592,6 +613,10 @@
 
 (define (async-go-spawn-thread thunk)
   (let ((w (ac-make 1 'fixed #f)) (snap (dyn-binding-stack)))
+    ;; BEFORE the fork: a body that finishes first would otherwise publish into a
+    ;; registry with no entry for it, and every later monitor would read the
+    ;; missing entry as "nothing to report" — the clean-completion answer.
+    (go-chan-register! w)
     (fork-thread
      (lambda ()
        (*txn* #f)                          ; go/thread body must not inherit parent's txn
@@ -600,8 +625,95 @@
          (if (car r)
              (when (not (jolt-nil? (cdr r))) (jolt-async-give w (cdr r)))
              (async-report-uncaught! "go/thread body (channel closed)" (cdr r)))
-          (jolt-async-close! w))))
+         (go-chan-finish! w (and (not (car r)) (cdr r))))))
     w))
+
+;; --- monitoring a go block ----------------------------------------------------
+;; A go body that threw and a go body that returned nil are indistinguishable on
+;; the result channel: both close it and both hand the reader nil. This is what
+;; separates them, and it is keyed on the CHANNEL because that is what go returns
+;; — changing go's return value would break every program that reads it.
+;;
+;; ONE REGISTRY FOR EVERY BACKEND, and that is the point rather than a detail.
+;; *go-backend* is read at spawn time off a dynamic binding, so which backend ran
+;; a body is a property of the caller's binding, not of the code that spawned it;
+;; and within the fiber backend, whether the CPS pass could rewrite the body
+;; decides between two spawn paths, which is a property of the body. A monitor
+;; that reported on some of those and answered "clean" for the rest would be
+;; worse than no monitor, because a caller cannot tell from the jolt side which
+;; one it got. sm.ss makes the same argument for its own two spawn paths.
+;;
+;; Completion is published HERE, by every path that terminally closes a go
+;; channel, before the close: a reader woken by the close then finds the monitor
+;; already settled.
+;;
+;; WEAK, and keyed by the channel: a strong table would pin every go channel and
+;; its outcome for the life of the process, which on a server spawning a go per
+;; request is an unbounded leak. A dropped channel takes its entry with it, and
+;; the only thing lost is the ability to monitor a go block nobody holds any more.
+;;
+;; #(done? error monitors) — allocated by the spawn, so a monitor registered on a
+;; channel with no entry (a plain chan, or a go channel whose entry the collector
+;; took) reads as "nothing to report" rather than raising.
+(define go-completions (make-weak-eq-hashtable))
+(define go-completions-mu (make-mutex))
+(define (go-chan-register! ch)
+  (jolt-with-mutex go-completions-mu
+    (hashtable-set! go-completions ch (vector #f #f '()))))
+
+;; Publish the outcome and hand it to whatever is already waiting, then close the
+;; channel. ERR is the throwable, or #f for a body that completed.
+;;
+;; The list is taken and cleared under the lock so a monitor cannot fire twice,
+;; and the monitors themselves run OUTSIDE it: each gives to a channel, taking
+;; that channel's mutex, and the lock order is registry -> channel.
+;;
+;; Each monitor is CONTAINED, and the close is what it protects. These run on the
+;; finishing body's own thread or carrier, and an escape here would take the
+;; jolt-async-close! below with it — leaving the result channel open forever, so
+;; every reader of a go block whose monitor happened to raise would hang. One
+;; monitor must not be able to stop the others either. Nothing left to report to
+;; at this point: the body is already finishing.
+(define (go-chan-finish! ch err)
+  (let ((waiting
+         (jolt-with-mutex go-completions-mu
+           (let ((c (hashtable-ref go-completions ch #f)))
+             (and c
+                  (let ((ms (vector-ref c 2)))
+                    (vector-set! c 0 #t)
+                    (vector-set! c 1 err)
+                    (vector-set! c 2 '())
+                    ms))))))
+    (for-each (lambda (m) (guard (e (#t #f)) (m err))) (or waiting '())))
+  (jolt-async-close! ch))
+
+;; Register PROC on CH's completion. Delivered inline when the body has already
+;; finished — a caller cannot check the state and register in one step from
+;; outside, so without that a body that finished in between would never notify
+;; and the caller would wait forever. The read and the insert are one step under
+;; the mutex go-chan-finish! publishes through, so "finished" and "with this
+;; outcome" are one observation.
+(define (go-chan-monitor! ch proc)
+  (let ((now
+         (jolt-with-mutex go-completions-mu
+           (let ((c (hashtable-ref go-completions ch #f)))
+             (cond
+               ((not c) (list #f))            ; not a go channel: nothing to report
+               ((vector-ref c 0) (list (vector-ref c 1)))
+               (else (vector-set! c 2 (cons proc (vector-ref c 2))) #f))))))
+    (when now (proc (car now)))))
+
+;; (go-monitor ch) -> channel. Yields the throwable if the body died, and
+;; CLOSES (nil) if it completed normally. A promise-style buffered(1) channel, so
+;; the value is there whether the caller takes before or after the body finishes.
+(define (jolt-go-monitor-chan ch)
+  (let ((m (ac-make 1 'fixed #f)))
+    (go-chan-monitor! ch
+      (lambda (err)
+        (when err (jolt-async-give m (jolt-unwrap-throw err)))
+        (jolt-async-close! m)))
+    m))
+(def-var! "clojure.core.async" "go-monitor" jolt-go-monitor-chan)
 
 ;; --- alts! entry point -------------------------------------------------------
 ;; (__do-alts ports priority?) — ports is a jolt vector of channels or [ch val]
@@ -655,7 +767,7 @@
                       (for-each
                         (lambda (entry)
                           (let ((ch (car entry)) (is-put (cdr entry)))
-                            (with-mutex (async-chan-mu ch)
+                            (jolt-with-mutex (async-chan-mu ch)
                               (if is-put
                                   (async-chan-alt-putters-set! ch
                                     (remp (lambda (hp) (eq? (car hp) h))
@@ -675,7 +787,7 @@
                             r)
                           ;; thread waiter: condvar
                           (begin
-                            (with-mutex (alt-handler-wmu h)
+                            (jolt-with-mutex (alt-handler-wmu h)
                               (let ((mb (alt-handler-mailbox h)))
                                 (let wait-loop ()
                                   (unless (vector-ref mb 0)
@@ -693,7 +805,7 @@
                           (let* ((ch (pvec-nth-d port 0 jolt-nil))
                                  (v (pvec-nth-d port 1 jolt-nil))
                                  (res
-                                  (with-mutex (async-chan-mu ch)
+                                  (jolt-with-mutex (async-chan-mu ch)
                                     (let ((ready?
                                            (or (async-chan-closed? ch)
                                                (async-chan-xrf ch)
@@ -723,7 +835,7 @@
                           ;; take from bare channel
                           (let* ((ch port)
                                  (res
-                                  (with-mutex (async-chan-mu ch)
+                                  (jolt-with-mutex (async-chan-mu ch)
                                     (let ((ready?
                                            (or (not (ac-qempty? ch))
                                                (async-chan-closed? ch))))
@@ -745,17 +857,15 @@
                               (else (finish (car res) (cdr res)))))))))))))))
 
 ;; --- macros (expander fns over the reader forms) ----------------------------
-(define cca-go-spawn-sym (jolt-symbol "clojure.core.async" "go-spawn"))
-(define cca-go-sym (jolt-symbol "clojure.core.async" "go"))
+;; go / go-loop are deliberately absent. They used to expand here, to a bare
+;; (go-spawn (fn* [] body…)), and the overlay's defmacro then redefined the same
+;; two vars — so which expansion a form got depended on whether the overlay had
+;; been loaded, and the native pair was dead in every configuration that matters
+;; (the loader drops clojure.core.async from loaded-ns precisely so a require
+;; always pulls the overlay). One definition now, in the overlay, where the CPS
+;; pass can reach &env / macroexpand / resolve.
 (define cca-fn*-sym (jolt-symbol #f "fn*"))
-(define cca-loop-sym (jolt-symbol #f "loop"))
 
-;; (go body...) -> (clojure.core.async/go-spawn (fn* [] body...))
-(define (cca-go-macro . body)
-  (jolt-list cca-go-spawn-sym (apply jolt-list cca-fn*-sym empty-pvec body)))
-;; (go-loop bindings body...) -> (go (loop bindings body...))
-(define (cca-go-loop-macro bindings . body)
-  (jolt-list cca-go-sym (apply jolt-list cca-loop-sym bindings body)))
 ;; (thread body...) — a real OS thread, ALWAYS: unlike go/go-loop it does NOT
 ;; honor *go-backend*, so a blocking body does not silently pin the fiber
 ;; carrier when a :fiber binding is in scope. thread is the documented escape
@@ -790,9 +900,38 @@
 (cca-def! "__offer!" jolt-async-offer!)
 ;; alts! entry point — handler-registration, not poll loop
 (cca-def! "__do-alts" jolt-async-do-alts)
-(cca-def! "go" cca-go-macro)           (mark-macro! "clojure.core.async" "go")
-(cca-def! "go-loop" cca-go-loop-macro) (mark-macro! "clojure.core.async" "go-loop")
 (cca-def! "thread" cca-thread-macro)   (mark-macro! "clojure.core.async" "thread")
+
+;; go / go-loop are defined by the overlay, but the primitives above pre-seed this
+;; namespace, so a bare (clojure.core.async/chan) resolves with no require and a
+;; bare (clojure.core.async/go …) would report "No such var" from a namespace that
+;; visibly exists. Reserve the two names with a stub that says what to do instead.
+;; MARKED a macro, so it raises from the EXPANDER with the body still unevaluated.
+;; As a plain fn the stub was reached as an ordinary call, which evaluates the body
+;; as arguments first: (clojure.core.async/go (swap! a conj :x)) ran the swap! and
+;; then reported that nothing had, and a body that parks —
+;; (clojure.core.async/go (clojure.core.async/<! ch)) on an empty channel — blocked
+;; forever instead of reporting anything at all, which is worse than the "No such
+;; var" this exists to improve on. natives-reader.ss reserves `letfn` with an
+;; unmarked fn, but that stub is unreachable (the analyzer lowers every letfn form
+;; before any macro runs) and this one is not. The overlay's defmacro replaces both
+;; roots and re-marks them.
+;;
+;; The message names a BARE require, not a :refer. Requiring the namespace at all
+;; is what loads the overlay, and whoever reads this wrote the qualified call, so
+;; telling them to refer the name asks them to rewrite a call site that is already
+;; right. (require 'clojure.core.async) makes the very form that raised work.
+(let ((needs-overlay
+       (lambda (nm)
+         (lambda args
+           (jolt-throw
+            (jolt-ex-info
+             (string-append "clojure.core.async/" nm
+                            " is defined by the clojure.core.async overlay: "
+                            "(require 'clojure.core.async) first")
+             (jolt-hash-map)))))))
+  (cca-def! "go" (needs-overlay "go"))           (mark-macro! "clojure.core.async" "go")
+  (cca-def! "go-loop" (needs-overlay "go-loop")) (mark-macro! "clojure.core.async" "go-loop"))
 
 ;; A channel is opaque, but it should still name itself: without these it fell to
 ;; the :object catch-all, so (class ch) was :object and pr printed #object[:object].

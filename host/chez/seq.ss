@@ -64,7 +64,7 @@
 ;; Like force-lazyseq this stays lock-free until jolt-mt? flips (fork-thread shadow).
 (define cseq-lock-init (make-mutex))
 (define (cseq-ensure-lock! s)
-  (with-mutex cseq-lock-init
+  (jolt-with-mutex cseq-lock-init
     (or (cseq-lock s)
         (let ((m (make-mutex))) (cseq-lock-set! s m) m))))
 (define (seq-more s)                  ; force the tail; returns a seq (cseq | jolt-nil)
@@ -76,7 +76,7 @@
     ((not jolt-mt?)
      (if (cseq-forced? s) (cseq-tail s)
          (let ((t ((cseq-tail s)))) (cseq-tail-set! s t) (cseq-forced?-set! s #t) t)))
-    (else (with-mutex (cseq-ensure-lock! s)     ; multi-threaded: always lock
+    (else (jolt-with-mutex (cseq-ensure-lock! s)     ; multi-threaded: always lock
             (if (cseq-forced? s) (cseq-tail s)
                 (let ((t ((cseq-tail s)))) (cseq-tail-set! s t) (cseq-forced?-set! s #t) t))))))
 
@@ -130,10 +130,10 @@
 (define variadic-fixed-arity-tbl (make-weak-eq-hashtable))
 (define variadic-tbl-mu (make-mutex))
 (define (jolt-register-variadic! v proc)
-  (with-mutex variadic-tbl-mu (hashtable-set! variadic-fixed-arity-tbl proc v))
+  (jolt-with-mutex variadic-tbl-mu (hashtable-set! variadic-fixed-arity-tbl proc v))
   proc)
 (define (variadic-fixed-arity-of proc)
-  (with-mutex variadic-tbl-mu (hashtable-ref variadic-fixed-arity-tbl proc #f)))
+  (jolt-with-mutex variadic-tbl-mu (hashtable-ref variadic-fixed-arity-tbl proc #f)))
 ;; The rest binding emitted for every variadic arity. A boxed rest is the seq
 ;; itself; anything else is the ordinary Chez rest list.
 (define (jolt-rest-seq xs)
@@ -654,7 +654,7 @@
 ;; invokable, so the site is classified structurally, not by matching Chez's
 ;; error message text after the fact.
 (define (jolt-proc-arity-name f)
-  (let ((p (hashtable-ref proc-name-tbl f #f)))
+  (let ((p (proc-name-of f)))
     (if p (string-append (car p) "/" (cdr p)) "fn")))
 (define (jolt-arity-error-name name nargs)
   (jolt-throw (jolt-host-throwable "clojure.lang.ArityException"

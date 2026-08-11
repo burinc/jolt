@@ -474,6 +474,48 @@ else
   fails=$((fails + 1))
 fi
 
+# A readiness registration must never be lost. jolt.io-poller drained its pending
+# registrations in two critical sections, so one landing in between was erased
+# before reaching the kqueue/epoll set and the fiber waiting on that fd never
+# resumed — unfixed this workload loses ~11% of its registrations.
+pr_out="$($jolt run test/chez/poller-registration.clj 2>&1)"
+if printf '%s' "$pr_out" | grep -q 'POLLER-REGISTRATION OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: readiness registrations lost under concurrent parking"
+  echo "    $(printf '%s' "$pr_out" | tail -1)"
+  fails=$((fails + 1))
+fi
+
+# Two threads requiring one namespace must load it once, and neither may return
+# from require until it is whole. Nothing serialized load-namespace* before, so
+# both ran the target's top level, and the mark-before-load that terminates a
+# require cycle told the second thread "loaded" while the file was still running.
+# The loader follows JLS 12.4.2 per namespace now; unfixed this reports 7 of 8
+# threads returning early.
+cr_out="$($jolt run test/chez/concurrent-require.clj 2>&1)"
+if printf '%s' "$cr_out" | grep -q 'CONCURRENT-REQUIRE OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: concurrent require of one namespace"
+  echo "    $(printf '%s' "$cr_out" | tail -1)"
+  fails=$((fails + 1))
+fi
+
+# A dynamic var must still read its binding after the read path learned to skip
+# the walk for vars nobody binds (jolt-3bo). The gate is the two push sites that
+# do NOT go through push-thread-bindings — the loader's per-file vars and the
+# agent's *agent* — because the ordinary binding path keeps working when those
+# forget to flag the cell, and the var then silently reads its root.
+db_out="$($jolt run test/chez/dyn-binding.clj 2>&1)"
+if printf '%s' "$db_out" | grep -q 'DYN-BINDING OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: dynamic var binding semantics"
+  printf '%s\n' "$db_out" | tail -4 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # clojure.test extension points (assert-expr / do-report / report) need separate
 # top-level forms — assert-expr must register before `is` expands — so this is a
 # multi-form `jolt run`, not an -e one-liner. The file self-checks its tallies.

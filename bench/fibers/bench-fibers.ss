@@ -437,6 +437,137 @@
     (printf "uneven-completed: ~a\n" (if got #t #f))
     (flush!)))
 
+
+;; --- 2b. cheap park vs continuation park -------------------------------------
+;; The R7 pair. Both arms are the SAME shape — K processes, each spawned with its
+;; own buffered(1) result channel, each parked on a take from ONE shared empty
+;; channel, every fiber record AND result channel retained — so the only
+;; difference between the two numbers is the park mechanism:
+;;
+;;   sm  : the body was CPS'd, so the park stored a resume closure and captured
+;;         nothing (jolt-sm-park!)
+;;   cap : the park captured a continuation, which retains a Chez stack segment
+;;         for as long as the process stays parked (jolt-fiber-to-scheduler!)
+;;
+;; Neither arm can use the real spawn (__sm-spawn / jolt-fiber-go-spawn): both
+;; call jolt-fiber-ensure-carrier!, and a forced full collect cannot run with
+;; carrier threads alive. So each arm replicates its spawn minus that one call and
+;; drains on the calling thread, exactly as mem-fiber-go does.
+;;
+;; These are NOT comparable to mem-fiber-go's figure: that arm has no result
+;; channel. Compare sm against cap, in one run.
+(define (mem-park-pair kind)
+  (define k 10000)
+  (define mem-held '())
+  (define park-ch #f)
+  (define baseline 0)
+  (define live-delta 0)
+  (define fibers '())
+  (jolt-fiber-carrier-count-set! 1)
+  (jolt-fiber-pool-reset!)
+  (collect (collect-maximum-generation))
+  (set! baseline (bytes-allocated))
+  (set! park-ch (jolt-async-chan 1))
+  (set! mem-held (cons park-ch mem-held))
+  (do ((i 0 (fx+ i 1))) ((fx=? i k))
+    (let* ((w (jolt-async-chan 1))
+           (f (if (eq? kind (quote sm))
+                  ;; jolt-sm-fiber-spawn minus ensure-carrier!
+                  (sa-fiber-spawn
+                   (lambda ()
+                     (jolt-sm-drive w (lambda (kk) (jolt-sm-take park-ch kk)))))
+                  ;; jolt-fiber-go-spawn minus ensure-carrier!
+                  (sa-fiber-spawn
+                   (lambda ()
+                     (let ((r (guard (e (#t (cons #f e)))
+                                (cons #t (jolt-fiber-<! park-ch)))))
+                       (if (car r)
+                           (when (not (jolt-nil? (cdr r))) (jolt-async-give w (cdr r)))
+                           (async-report-uncaught! "bench body" (cdr r)))
+                       (jolt-async-close! w)))))))
+      (set! fibers (cons f fibers))
+      (set! mem-held (cons w (cons f mem-held)))))
+  (sa-fiber-run-all)
+  (let ((n-parked (let loop ((l fibers) (n 0))
+                    (cond ((null? l) n)
+                          ((eq? (jolt-fiber-state (car l)) (quote parked))
+                           (loop (cdr l) (fx+ n 1)))
+                          (else (loop (cdr l) n)))))
+        (n-captured (let loop ((l fibers) (n 0))
+                      (cond ((null? l) n)
+                            ((jolt-fiber-k (car l)) (loop (cdr l) (fx+ n 1)))
+                            (else (loop (cdr l) n))))))
+    (collect (collect-maximum-generation))
+    (set! live-delta (- (bytes-allocated) baseline))
+    (printf "backend: ~a-park\n" kind)
+    (printf "count: ~a\n" k)
+    (printf "live-delta: ~a\n" live-delta)
+    (printf "per-live-bytes: ~a\n" (/ (exact->inexact (max 0 live-delta)) k))
+    (printf "parked: ~a/~a\n" n-parked k)
+    ;; the representation, in the same run as the number: a cheap park holds no
+    ;; continuation, a capture holds one for every process
+    (printf "holding-a-continuation: ~a/~a\n" n-captured k)
+    (printf "cheap-parks: ~a\n" (jolt-sm-parks))
+    (printf "captures: ~a\n" (jolt-fiber-chan-parks))
+    (flush!)))
+
+
+;; --- 2c. park/resume round trip: cheap vs continuation ------------------------
+;; One fiber, one carrier, K park/resume round trips. Each iteration: the fiber
+;; parks on an empty channel, this thread delivers a value (the parked alt-taker
+;; takes it directly), and sa-fiber-run-all resumes the fiber.
+;;
+;; The deliver + drain is the SAME harness in both arms, and it dominates — so
+;; these are upper bounds on the park itself, and only the DIFFERENCE between the
+;; two arms is about the park mechanism. Reported both ways rather than pretending
+;; the absolute number is the switch cost.
+(define (park-switch-phase kind)
+  (define k 20000)
+  (define (arm kind)
+    (let* ((ch (jolt-async-chan))
+           (w (jolt-async-chan 1))
+           (f (if (eq? kind (quote sm))
+                  (sa-fiber-spawn
+                   (lambda ()
+                     (jolt-sm-drive
+                      w
+                      (lambda (kk)
+                        (let loop ((i 0))
+                          (if (fx=? i k)
+                              (kk (quote done))
+                              (jolt-sm-take ch (lambda (v) (loop (fx+ i 1))))))))))
+                  (sa-fiber-spawn
+                   (lambda ()
+                     (let loop ((i 0))
+                       (if (fx=? i k)
+                           (quote done)
+                           (begin (jolt-fiber-<! ch) (loop (fx+ i 1))))))))))
+      (sa-fiber-run-all)                    ; run to the first park
+      (let ((t1 (mono-nanos)))
+        (do ((i 0 (fx+ i 1))) ((fx=? i k))
+          (jolt-async-give ch i)
+          (sa-fiber-run-all))
+        (let ((t2 (mono-nanos)))
+          (list (/ (exact->inexact (- t2 t1)) k)
+                (eq? (jolt-fiber-state f) (quote done)))))))
+  ;; ONE arm per process. Run in the same process the second arm read 25% slower
+  ;; than the first whichever order they went in, so the ordering bias was larger
+  ;; than the effect — the memory phases are split for the same reason.
+  (jolt-fiber-carrier-count-set! 1)
+  (jolt-fiber-pool-reset!)
+  (let* ((c0 (jolt-sm-parks))
+         (p0 (jolt-fiber-chan-parks))
+         (r (arm kind))
+         (c1 (jolt-sm-parks))
+         (p1 (jolt-fiber-chan-parks)))
+    (printf "arm: ~a\n" kind)
+    (printf "round-trips: ~a\n" k)
+    (printf "ns-per-round-trip: ~a\n" (car r))
+    (printf "completed: ~a\n" (cadr r))
+    (printf "cheap-parks: ~a\n" (- c1 c0))
+    (printf "captures: ~a\n" (- p1 p0))
+    (flush!)))
+
 ;; --- dispatch ----------------------------------------------------------------
 (let ((phase (and (a 1) (string->symbol (a 1)))))
   (case phase
@@ -446,6 +577,10 @@
     ((mem-baseline)  (mem-baseline))
     ((mem-fiber-raw) (mem-fiber-raw))
     ((mem-fiber-go)  (mem-fiber-go))
+    ((mem-sm-park)   (mem-park-pair (quote sm)))
+    ((mem-cap-park)  (mem-park-pair (quote cap)))
+    ((park-switch-sm)  (park-switch-phase (quote sm)))
+    ((park-switch-cap) (park-switch-phase (quote cap)))
     ((mem-thread)    (mem-thread))
     ((ping-thread)   (ping-phase 'thread #f))
     ((ping-fiber)    (ping-phase 'fiber #f))
@@ -458,6 +593,8 @@
      (printf "usage: bench-fibers.ss <phase> [arg]\n")
      (printf "  spawn-thread K | spawn-fiber K | spawn-fiber-go K\n")
      (printf "  mem-baseline | mem-fiber-raw | mem-fiber-go | mem-thread\n")
+     (printf "  mem-sm-park | mem-cap-park\n")
+     (printf "  park-switch-sm | park-switch-cap\n")
      (printf "  ping-thread | ping-fiber | fanin-thread | fanin-fiber\n")
      (printf "  switch | scaling\n")
      (exit 1))))

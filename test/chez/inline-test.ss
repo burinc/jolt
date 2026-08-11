@@ -20,16 +20,46 @@
   (let-values (((f j) (rdr-read-form str 0 (string-length str))))
     (let ((ctx (make-analyze-ctx ns)))
       (jolt-ce-emit (jolt-ce-run-passes (jolt-ce-analyze ctx f) ctx)))))
-;; the CODE portion of an emission: an anon literal's registration sibling
-;; carries its original SOURCE form, so a gone-from-the-code callee name still
-;; appears verbatim in the registration tail — cut it off before asserting.
+;; The CODE portion of an emission. An anon literal's registration replays its
+;; original SOURCE form, so a callee name that inlining removed from the code is
+;; still there verbatim — drop the registrations before asserting.
+;;
+;; They are a PREAMBLE, not a tail: emit-top-form puts them first, as
+;; (begin <registrations> <code>). Cutting at the first (image-register-fn-form!
+;; and keeping the prefix therefore kept "(begin " and threw the code away, so
+;; every assertion below that used this passed no matter what the code said. It
+;; only surfaced when the registrations grew a (let* …) header binding the shared
+;; constructions, which put the callee's name into the part being kept.
+;;
+;; So match parens instead of scanning for a marker: skip the one balanced form
+;; that follows "(begin " and keep the rest. String literals are opaque to the
+;; scan — the registrations are full of them, and a symbol named ")" would
+;; otherwise unbalance it.
+(define (skip-form s i)
+  (let ((n (string-length s)))
+    (let loop ((i i) (depth 0) (in-str #f))
+      (if (>= i n)
+          i
+          (let ((c (string-ref s i)))
+            (cond
+              (in-str (cond ((char=? c #\\) (loop (+ i 2) depth #t))
+                            ((char=? c #\") (loop (+ i 1) depth #f))
+                            (else (loop (+ i 1) depth #t))))
+              ((char=? c #\") (loop (+ i 1) depth #t))
+              ((char=? c #\() (loop (+ i 1) (+ depth 1) #f))
+              ((char=? c #\)) (if (= depth 1) (+ i 1) (loop (+ i 1) (- depth 1) #f)))
+              (else (loop (+ i 1) depth #f))))))))
+;; Matched against the two shapes the preamble can take and nothing else: a
+;; top-level `do` also emits (begin …, and dropping its first statement would be a
+;; silent hole in whatever asserted on it.
+(define (starts-with? s pre)
+  (and (>= (string-length s) (string-length pre))
+       (string=? (substring s 0 (string-length pre)) pre)))
 (define (code-part s)
-  (let ((marker "(image-register-fn-form!"))
-    (let ((ns (string-length s)) (nm (string-length marker)))
-      (let loop ((i 0))
-        (cond ((> (+ i nm) ns) s)
-              ((string=? (substring s i (+ i nm)) marker) (substring s 0 i))
-              (else (loop (+ i 1))))))))
+  (if (or (starts-with? s "(begin (let* (")
+          (starts-with? s "(begin (image-register-fn-form!"))
+      (substring s (skip-form s 7) (string-length s))   ; 7 = past "(begin "
+      s))
 (define (ev s) (jolt-compile-eval s "u"))
 
 ;; inlining is a closed-world optimization — requires optimize + direct-link.

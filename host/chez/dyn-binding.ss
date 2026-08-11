@@ -21,19 +21,119 @@
 ;; for free (the future shim also installs an explicit snapshot, belt-and-suspenders).
 (define dyn-binding-stack (make-thread-parameter '()))
 
-;; find the innermost (cell . value) pair binding CELL, or #f.
-(define (dyn-find-binding cell)
+;; --- pushing a frame ---------------------------------------------------------
+;; THE one place a frame reaches the stack. Everything else — the loader's
+;; per-file vars, cpath-with-compile-files, the agent's *agent*, and
+;; push-thread-bindings itself — goes through here, so the dyn-bound? flags below
+;; cannot be set in some paths and forgotten in others. (Restoring a whole stack
+;; captured elsewhere, which is what the future/agent/executor conveyance does, is
+;; not a push: those frames were built by a push that already flagged them.)
+;; A hand-rolled loop rather than for-each: this is on every push, and the closure
+;; for-each wants cost a one-var frame ~7 ns of its 140.
+(define (dyn-push-frame! pairs)
+  (let loop ((p pairs))
+    (when (pair? p)
+      (var-cell-dyn-bound?-set! (caar p) #t)
+      (loop (cdr p))))
+  (dyn-binding-stack (cons pairs (dyn-binding-stack))))
+
+;; (dyn-with-frame pairs thunk) — THE way to scope a binding frame over a
+;; dynamic extent. Three sites used to hand-roll it and all three were wrong
+;; across a park:
+;;
+;;     (dynamic-wind (lambda () (dyn-push-frame! pairs))
+;;                   thunk
+;;                   (lambda () (dyn-binding-stack (cdr (dyn-binding-stack)))))
+;;
+;; jolt-fiber-to-scheduler! saves the fiber's slice — which already contains the
+;; pushed frame — BEFORE the escape unwinds. The unwind pops it. On resume the
+;; slice is restored, putting the frame back, and THEN the continuation rewinds
+;; and that before-thunk pushes a SECOND one. Measured on an ordinary explicit
+;; park, no preemption involved: depth went 1 before the park and 2 after,
+;; leaking a frame past the end of the extent.
+;;
+;; The general rule, which is what the shape below encodes: a winder must not
+;; re-establish state the jolt-dslice already carries. The dslice owns
+;; dyn-binding-stack, so the push happens ONCE, OUTSIDE the dynamic-wind, and
+;; the before-thunk does nothing. A park then costs nothing to get right — the
+;; slice was saved before the after-thunk ran, and restoring it on resume is the
+;; whole recovery.
+;;
+;; The after-thunk restores the stack it found rather than popping one frame.
+;; Absolute, not relative, for the same reason parameterize is written that way:
+;; a relative edit is only correct if the stack is exactly as deep as it was, and
+;; an escape is precisely when it is not.
+(define (dyn-with-frame pairs thunk)
+  (let ((outer (dyn-binding-stack)))
+    (dyn-push-frame! pairs)
+    (dynamic-wind
+      (lambda () #f)
+      thunk
+      (lambda () (dyn-binding-stack outer)))))
+
+;; --- reading a var -----------------------------------------------------------
+;; THE GATE, and why every read below opens with it.
+;;
+;; dyn-bound? is Clojure's Var.threadBound. Without it every var reference in
+;; compiled code — every clojure.core/map?, every user fn — crossed the whole
+;; binding stack to discover there was nothing to find, because the stack is
+;; non-empty for the duration of any compile or load and `assq` cannot answer
+;; "absent" early. Measured, counting frames crossed:
+;;
+;;   emitting 120 nested fn literals   2.04M frames, 92.5% of them by lookups that
+;;                                     found nothing, 16 vars ever bound in the
+;;                                     whole process
+;;   compiling clojure/set.clj         194k frames, 99.4% by lookups that found
+;;                                     nothing, 20 vars ever bound
+;;
+;; So the walk was almost entirely spent proving a negative about vars nobody
+;; binds, and the flag answers exactly that in one field read: 6 ns flat against
+;; 1425 ns at depth 512 (bench/dyn-binding, `make dynbench`).
+;;
+;; WHAT MAKES IT SOUND is one invariant: if a cell appears in any frame of THIS
+;; THREAD's stack, its flag is set. Every way a stack comes to be preserves it —
+;; a push flags the frame's cells before publishing it (dyn-push-frame!, the only
+;; one), a pop only removes, and the future / agent / executor / fiber-slice paths
+;; install a stack some earlier push already built. The flag is never cleared, so
+;; nothing can un-flag a cell that is still bound somewhere.
+;;
+;; That is also why it needs no synchronisation. A binding is visible only to the
+;; thread that pushed it and to threads that inherited that stack at fork, and in
+;; both cases the flag write happened before the stack the reader can see. Cells
+;; flagged by an unrelated thread only cost this one a fruitless walk, which is
+;; the direction that is safe. A field write is a whole-value write — the same
+;; argument meta and macro? rest on.
+;;
+;; MONOTONE and process-wide, like the JVM's: a var bound once pays the walk
+;; forever after. That costs the ~16 vars that are genuinely dynamic nothing they
+;; were not already paying.
+;;
+;; What it does NOT do is make a var that IS bound cheap to find: that is still a
+;; walk, and still O(depth). It is 7.5% of the frames above and was not worth a
+;; second mechanism — jolt-3bo records the cumulative index that would kill it and
+;; the measurement that said not to bother yet.
+
+;; The walk itself, ungated, so the two readers below test the flag exactly once.
+;; Testing it in both dyn-find-binding and dyn-binding-value cost a bound var
+;; 8.5 -> 11.3 ns for nothing.
+(define (dyn-walk-frames cell)
   (let loop ((frames (dyn-binding-stack)))
     (and (pair? frames)
          (or (assq cell (car frames))
              (loop (cdr frames))))))
 
+;; the innermost (cell . value) pair binding CELL, or #f
+(define (dyn-find-binding cell)
+  (and (var-cell-dyn-bound? cell) (dyn-walk-frames cell)))
+
 ;; a unique sentinel: distinguishes "no thread binding" from a binding whose
 ;; value happens to be jolt-nil.
 (define dyn-no-binding (list 'no-binding))
+;; No empty-stack check of its own: the walk answers that in one pair?, and the
+;; gate has already turned away every var that is not dynamic.
 (define (dyn-binding-value cell)
-  (if (pair? (dyn-binding-stack))
-      (let ((p (dyn-find-binding cell)))
+  (if (var-cell-dyn-bound? cell)
+      (let ((p (dyn-walk-frames cell)))
         (if p
              (let ((val (cdr p)))
                val)   ; no auto-deref — a var-cell value is the value, like JVM
@@ -51,7 +151,7 @@
                    ;; meta entry = non-dynamic (runtime dynamic vars are tagged
                    ;; via def-dynvar!/def-var-with-meta!; the declare path via
                    ;; set-var-meta!).
-                   (let ((m (hashtable-ref var-meta-table cell #f)))
+                   (let ((m (var-cell-meta cell)))
                      (when (not (and m (jolt-truthy? (jolt-get m (keyword #f "dynamic")))))
                        (jolt-throw
                         (jolt-ex-info
@@ -60,7 +160,7 @@
                          jolt-nil))))
                    (cons (cons cell v) acc))
                  '())))
-    (dyn-binding-stack (cons pairs (dyn-binding-stack)))
+    (dyn-push-frame! pairs)
     jolt-nil))
 
 (define (jolt-pop-thread-bindings)
@@ -83,11 +183,10 @@
       (let ((cells (map (lambda (nm) (var-cell-lookup "clojure.core" nm))
                         '("*warn-on-reflection*" "*assert*" "*unchecked-math*"))))
         (if (for-all values cells) cells 'missing))))
-  (dyn-binding-stack
-    (cons (if (pair? jolt-nsload-cells)
-              (map (lambda (c) (cons c (var-cell-root c))) jolt-nsload-cells)
-              '())
-          (dyn-binding-stack)))
+  (dyn-push-frame!
+    (if (pair? jolt-nsload-cells)
+        (map (lambda (c) (cons c (var-cell-root c))) jolt-nsload-cells)
+        '()))
   jolt-nil)
 (define (jolt-ns-load-vars-pop!)
   (when (pair? (dyn-binding-stack))
@@ -142,29 +241,64 @@
               jolt-nil))))
       (throw-jvm (quote ClassCastException) "set!: not a var")))
 
-;; alter-var-root: atomically apply f to the current root plus args.
+;; alter-var-root: apply f to the current root plus args, atomically.
+;;
+;; ATOMICALLY IS THE CONTRACT, and it used to be only the comment. Var.alterRoot is
+;; `synchronized` on the JVM, so the read, the compute and the write-back are one
+;; step; unlocked, two threads doing (alter-var-root #'n inc) both read the same root
+;; and the second write drops the first's increment. Measured, 8 threads x 400
+;; increments: the root came back short every run.
+;;
+;; The lock is the VAR's own object monitor, which is exactly what
+;; `synchronized (theVar)` means, rather than one global mutex for every var. A global
+;; one would be held across `f`, and f is user code: a thread whose f waits on
+;; another thread that wants to alter a DIFFERENT var would deadlock where the JVM
+;; does not. Per var, that pair is unrelated.
+;;
+;; f runs INSIDE the lock, as it does on the JVM (alterRoot calls fn.applyTo under
+;; the monitor), and so do the validator and the watches, because doReset notifies
+;; under it too. A monitor is now a lock a fiber can hold across a park (jolt-3a87),
+;; so an f that parks is fine here.
+;;
+;; jolt-with-monitor lives in java/concurrency.ss, which rt.ss loads AFTER this file;
+;; the reference resolves at call time, the same forward reference
+;; jolt-run-interruptible makes to fibers.ss and for the same reason — nothing calls
+;; alter-var-root before the boot finishes loading.
+;;
+;; The READ path is deliberately not locked. jolt-asj records the measurement that
+;; rules it out (70 -> 95 ns on the probe), and nothing here needs it: a lost update
+;; is a write racing a write, and var-cell-root-set! is a whole-value field write.
 (define (jolt-alter-var-root v f . args)
-  (let* ((old (var-cell-root v))
-         (new (apply jolt-invoke f old args)))
-    (iref-validate v new)
-    (var-cell-root-set! v new)
-    (var-cell-defined?-set! v #t)
-    (iref-notify v old new)
-    new))
+  (jolt-with-monitor v
+    (lambda ()
+      (let* ((old (var-cell-root v))
+             (new (apply jolt-invoke f old args)))
+        (iref-validate v new)
+        (var-cell-root-set! v new)
+        (var-cell-defined?-set! v #t)
+        (iref-notify v old new)
+        new))))
 
 ;; __local-var: a fresh free-standing var cell (not interned). with-local-vars
 ;; binds these as lexical locals; var-get/var-set read/write the root. Each gets a
 ;; unique name so two locals never compare/hash equal as map keys.
+;; The bump and the read are one step — "two locals never compare/hash equal" is
+;; the whole reason for the counter, and unlocked two threads draw the same
+;; number. See jolt-gensym in converters.ss.
 (define local-var-counter 0)
+(define local-var-mutex (make-mutex))
 (define local-var-meta (jolt-hash-map (keyword #f "dynamic") #t))
 (define (jolt-local-var . args)
-  (set! local-var-counter (fx+ local-var-counter 1))
-  (let ((c (make-var-cell "" (string-append "local-" (number->string local-var-counter))
+  (let ((c (make-var-cell "" (string-append "local-"
+                                            (number->string
+                                             (jolt-with-mutex local-var-mutex
+                                               (set! local-var-counter (fx+ local-var-counter 1))
+                                               local-var-counter)))
                           (if (pair? args) (car args) jolt-nil)
-                          #t)))
+                          #t #f #f #f)))
     ;; Clojure builds these with Var/create + setDynamic, so a local var takes a
     ;; thread binding like any other — tools.reader hands one to with-bindings.
-    (hashtable-set! var-meta-table c local-var-meta)
+    (var-cell-meta-set! c local-var-meta)
     c))
 
 ;; --- chain the var-read paths onto the binding stack -------------------------

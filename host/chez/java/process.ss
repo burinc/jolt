@@ -304,10 +304,10 @@
         (guard (e (#t #f))
           (let loop () (when (proc-copy-chunk src dst) (loop))))
         (when close-dst? (guard (e (#t #f)) (close-port dst)))
-        (with-mutex m (set-box! done #t) (condition-broadcast c))))
+        (jolt-with-mutex m (set-box! done #t) (condition-broadcast c))))
     (vector m c done)))
 (define (proc-latch-wait latch)
-  (with-mutex (vector-ref latch 0)
+  (jolt-with-mutex (vector-ref latch 0)
     (let loop () (unless (unbox (vector-ref latch 2))
                    (condition-wait (vector-ref latch 1) (vector-ref latch 0)) (loop)))))
 
@@ -433,7 +433,7 @@
             (sa-foreign-free fds) p)
           (begin (sa-foreign-free fds)
                  (throw-jvm (quote java.io.IOException) "pipe: cannot allocate")))))
-  (with-mutex proc-spawn-fd-mutex
+  (jolt-with-mutex proc-spawn-fd-mutex
     (let* ((in-p  (and (not inherit-in?)  (mk-pipe)))
            (out-p (and (not inherit-out?) (mk-pipe)))
            (err-p (and (not inherit-err?) (mk-pipe)))
@@ -614,7 +614,7 @@
 (define proc-poll-step-max (* 10 1000000))       ; 10ms, in nanoseconds
 (define (proc-wait-blocking st)
   (let ((code
-          (with-mutex (proc-p-mutex st)
+          (jolt-with-mutex (proc-p-mutex st)
             (or (unbox (proc-p-exit-box st))
                 (let loop ((step 200000))        ; 0.2ms
                   (call-with-values (lambda () (proc-waitpid-once (proc-p-pid st) #t))
@@ -642,7 +642,7 @@
 ;; reported dead AND has its status cached, so a waitFor after it cannot go looking
 ;; for a child that will never be there.
 (define (proc-alive? st)
-  (with-mutex (proc-p-mutex st)
+  (jolt-with-mutex (proc-p-mutex st)
     (if (unbox (proc-p-exit-box st)) #f
         (call-with-values (lambda () (proc-waitpid-once (proc-p-pid st) #t))
           (lambda (rc decoded err)
@@ -674,7 +674,7 @@
               ;; (waitFor timeout unit): babashka always passes MILLISECONDS.
               (proc-wait-timed self (jnum->exact (car args))))))
         (cons "exitValue" (lambda (self)
-          (with-mutex (proc-p-mutex self)
+          (jolt-with-mutex (proc-p-mutex self)
             (or (unbox (proc-p-exit-box self))
                 (call-with-values (lambda () (proc-waitpid-once (proc-p-pid self) #t))
                   (lambda (rc decoded err)

@@ -391,7 +391,22 @@
 ;; expressions in source order (Clojure guarantees left-to-right map-literal eval).
 ;; A pmap is hash-ordered, so record each reader-built map's (k1 v1 k2 v2 ...) form
 ;; sequence in a weak side-table the host contract's form-map-pairs consults.
+;; Both reader side-tables are weak-eq, and a weak-eq table cannot be read
+;; unlocked while another thread writes it: Chez's eq adjust! relinks live cells
+;; in place with $set-tlc-next! (s/library.ss) while a reader may be walking them,
+;; and the reader is unsafe primitive code, so a resize concurrent with a lookup
+;; hangs or faults. Two threads reading source at once is ordinary here (an nREPL
+;; session evaluating while the loader requires, two requires in flight), so both
+;; go through one mutex.
+;;
+;; A mutex and not copy-on-write, unlike records.ss's ctor-tag table: this one is
+;; WRITTEN once per map literal read, so copying per write would be quadratic in
+;; the size of the source being read. The lock is noise against the read + analyze
+;; it sits inside.
+(define rdr-side-mu (make-mutex))
 (define rdr-map-order (make-weak-eq-hashtable))
+(define (rdr-map-order-ref m) (jolt-with-mutex rdr-side-mu (hashtable-ref rdr-map-order m #f)))
+(define (rdr-map-order-set! m es) (jolt-with-mutex rdr-side-mu (hashtable-set! rdr-map-order m es)))
 (define (rdr-make-map es)
   ;; the JVM reader rejects duplicate literal keys before building the map. Guard
   ;; the (cddr kvs) step so an odd-length literal ({:a}) stops here instead of
@@ -404,7 +419,7 @@
                                            (string-append "Duplicate key: " (jolt-pr-str k)))))
         (dupchk (cddr kvs) (pset-conj seen k)))))
   (let ((m (apply jolt-hash-map es)))
-    (when (pair? es) (hashtable-set! rdr-map-order m es))
+    (when (pair? es) (rdr-map-order-set! m es))
     m))
 
 ;; Same guard as rdr-make-map, for the same reason: the JVM reader rejects a
@@ -474,8 +489,8 @@
        ;; jolt-with-meta copies a pmap, giving it a fresh identity the rdr-map-order
        ;; side-table (source key order for left-to-right map-literal eval) loses —
        ;; carry the order entry over to the copy.
-       (let ((order (and (pmap? target) (hashtable-ref rdr-map-order target #f))))
-         (when order (hashtable-set! rdr-map-order c order)))
+       (let ((order (and (pmap? target) (rdr-map-order-ref target))))
+         (when order (rdr-map-order-set! c order)))
        ;; same for the record-literal ctor mark (^:foo #ns.Type[1] copies the form).
        (when (rdr-ctor-call? target) (rdr-mark-ctor-form c))
        c))))
@@ -533,10 +548,18 @@
 ;; fixed arity is the MAX positional used (Clojure: #(do %2 %&) -> [p1 p2 & rest]).
 ;; Param names carry a trailing "#" so a #() inside a syntax-quote still reads them
 ;; as auto-gensyms.
+;; The bump and the read are one step, like every other name counter in the
+;; runtime: unlocked, two threads reading a form at once draw the same number and
+;; the "#" auto-gensym these mint is no longer unique. See jolt-gensym.
 (define rdr-anon-counter 0)
+(define rdr-name-counter-mutex (make-mutex))
 (define (rdr-anon-gensym)
-  (set! rdr-anon-counter (+ rdr-anon-counter 1))
-  (jolt-symbol #f (string-append "p__" (number->string rdr-anon-counter) "#")))
+  (jolt-symbol #f (string-append "p__"
+                                 (number->string
+                                  (jolt-with-mutex rdr-name-counter-mutex
+                                    (set! rdr-anon-counter (+ rdr-anon-counter 1))
+                                    rdr-anon-counter))
+                                 "#")))
 (define (rdr-pct-index nm)               ; % ->1, %& ->'rest, %N ->N, else #f
   (cond ((string=? nm "%") 1)
         ((string=? nm "%&") 'rest)
@@ -556,7 +579,7 @@
     ((rdr-anon-set? f)
      (for-each (lambda (x) (rdr-anon-scan x max-box rest-box)) (seq->list (jolt-get f rdr-kw-value))))
     ((pmap? f)
-     (for-each (lambda (x) (rdr-anon-scan x max-box rest-box)) (or (hashtable-ref rdr-map-order f #f) '())))))
+     (for-each (lambda (x) (rdr-anon-scan x max-box rest-box)) (or (rdr-map-order-ref f) '())))))
 (define (rdr-anon-replace f slots rest-sym)
   (cond
     ((symbol-t? f)
@@ -568,7 +591,7 @@
     ((rdr-anon-set? f)
      (rdr-make-set (map (lambda (x) (rdr-anon-replace x slots rest-sym)) (seq->list (jolt-get f rdr-kw-value)))))
     ((pmap? f)
-     (let ((kv (hashtable-ref rdr-map-order f #f)))
+     (let ((kv (rdr-map-order-ref f)))
        (if kv (rdr-make-map (map (lambda (x) (rdr-anon-replace x slots rest-sym)) kv)) f)))
     (else f)))
 (define (rdr-read-anon-fn s i end)       ; i at the '(' after '#'
@@ -630,9 +653,10 @@
 ;; symbol's name: ordinary code calls a qualified ->name too ((u/->long n) in
 ;; jolt.time), and the data path applies a ctor form, so a name test would try to
 ;; apply an unbound var at read time.
-(define rdr-ctor-forms (make-weak-eq-hashtable))
-(define (rdr-mark-ctor-form v) (hashtable-set! rdr-ctor-forms v #t) v)
-(define (rdr-ctor-call? v) (and (cseq? v) (hashtable-ref rdr-ctor-forms v #f) #t))
+(define rdr-ctor-forms (make-weak-eq-hashtable))   ; under rdr-side-mu, see above
+(define (rdr-mark-ctor-form v) (jolt-with-mutex rdr-side-mu (hashtable-set! rdr-ctor-forms v #t)) v)
+(define (rdr-ctor-call? v)
+  (and (cseq? v) (jolt-with-mutex rdr-side-mu (hashtable-ref rdr-ctor-forms v #f)) #t))
 
 ;; Is v a tagged-literal pmap (#inst/#uuid/#regex/#bigdec at read time)?
 (define (rdr-tagged-form? v)
@@ -646,7 +670,7 @@
    ((rdr-tagged-form? v) v)             ; #inst/#uuid/#regex/#bigdec — keep
    ((and (pmap? v) (eq? (jolt-get v rdr-kw-jolt-type) rdr-kw-jolt-set)) v)  ; #{…} set — keep
    ((pmap? v)
-    (let ((kv (hashtable-ref rdr-map-order v #f)))
+    (let ((kv (rdr-map-order-ref v)))
       (if kv
           (rdr-make-map
            (let loop ((kvs kv))
@@ -1061,8 +1085,12 @@
 
 (define rdr-sq-gensym-counter 0)
 (define (rdr-sq-gensym base)
-  (set! rdr-sq-gensym-counter (fx+ rdr-sq-gensym-counter 1))
-  (jolt-symbol #f (string-append base "__" (number->string rdr-sq-gensym-counter) "__auto")))
+  (jolt-symbol #f (string-append base "__"
+                                 (number->string
+                                  (jolt-with-mutex rdr-name-counter-mutex
+                                    (set! rdr-sq-gensym-counter (fx+ rdr-sq-gensym-counter 1))
+                                    rdr-sq-gensym-counter))
+                                 "__auto")))
 
 ;; special forms / interop heads stay bare in backquote, like the JVM reader
 ;; The one list of names a syntax-quote leaves BARE (not namespace-qualified):
@@ -1173,7 +1201,7 @@
                                     (map (lambda (it) (rdr-sq-lower-part it gsmap))
                                          (vector->list (pvec-v items))))))))
     ((pmap? form)
-     (let ((order (hashtable-ref rdr-map-order form #f)))
+     (let ((order (rdr-map-order-ref form)))
        (let ((pairs (if order
                         (let r ((xs order) (acc '()))
                           (if (null? xs) (reverse acc)
@@ -1264,7 +1292,7 @@
      (let-values (((items changed) (rdr-conv-each (vector->list (pvec-v x)))))
        (if changed (apply jolt-vector items) x)))
     ((pmap? x)
-     (let ((order (hashtable-ref rdr-map-order x #f)))
+     (let ((order (rdr-map-order-ref x)))
        (if order
            (let-values (((kvs changed) (rdr-conv-each order)))
              (if changed (rdr-make-map kvs) x))

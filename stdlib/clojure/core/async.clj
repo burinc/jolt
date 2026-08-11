@@ -1,8 +1,10 @@
 ;; clojure.core.async — higher-level dataflow API over the channel primitives.
 ;;
 ;; The primitives (chan, <!, >!, <!!, >!!, close!, put!, take!, offer!, timeout,
-;; promise-chan, buffer/dropping-buffer/sliding-buffer, go/go-loop/thread, go-spawn)
-;; are provided natively (host/chez/java/async.ss) on real OS threads. This overlay
+;; promise-chan, buffer/dropping-buffer/sliding-buffer, thread, go-spawn) are
+;; provided natively (host/chez/java/async.ss) on real OS threads. go and go-loop
+;; are NOT: they are defined below, because the pass that picks a park's
+;; representation per site needs &env, macroexpand and resolve. This overlay
 ;; adds the portable dataflow operators — alts!, pipe, pipeline, split, reduce,
 ;; transduce, mult, mix, pub/sub, map, merge, and the deprecated map</map>/… —
 ;; ported from clojure.core.async over those primitives. Because go blocks are real
@@ -11,6 +13,419 @@
 
 (ns clojure.core.async
   (:refer-clojure :exclude [reduce transduce into merge map take partition partition-by]))
+
+;; --- go, and the cheap park -------------------------------------------------
+;; go spawns its body on the backend *go-backend* names, read at spawn time.
+;;
+;; A fiber parks by capturing a continuation, and Chez represents that as a stack
+;; segment that stays live for as long as the process is parked. A park the pass
+;; below can SEE does not need one: it rewrites the rest of the body into a
+;; closure, and __sm-take / __sm-put store the closure and switch to the
+;; scheduler without capturing anything (host/chez/java/sm.ss).
+;;
+;; The choice is per PARK SITE, not per body. A park the pass cannot see or cannot
+;; rewrite — inside a called function, inside a try, inside a nested fn, reached
+;; through eval — is left exactly as it is and parks by capturing, which is what
+;; every park does today. So the pass is opportunistic: it can cost a park its
+;; cheap representation, never its correctness. When it has nothing to gain it
+;; returns nil and go expands the way it always has.
+;;
+;; Not covered: alts! / alt! (threading a continuation through the waiter
+;; registration in __do-alts is its own round), and any park inside a try (the
+;; rewrite would have to carry the exception frame explicitly).
+
+;; The park ops, by identity. Resolving the caller's symbol and comparing the VAR
+;; is the only sound test: a user function named <! must be left alone. A macro
+;; that expands to a park is invisible to the pre-scan, which costs it the cheap
+;; park and nothing else.
+;;
+;; <!! and >!! are the same ops as <! and >!: identical on a fiber (parking a
+;; blocking take preserves what it means without holding the carrier) and already
+;; identical on a thread.
+(def ^:private sm-take-var-1 #'clojure.core.async/<!)
+(def ^:private sm-take-var-2 #'clojure.core.async/<!!)
+(def ^:private sm-put-var-1 #'clojure.core.async/>!)
+(def ^:private sm-put-var-2 #'clojure.core.async/>!!)
+
+;; Forms the pass does not look inside. A park in one of them stays where it is;
+;; a park-free one is emitted whole.
+;;
+;; This is clojure.core/special-syms minus the five heads the pass DOES rewrite
+;; (do let* if loop* recur), plus defmacro, import* and syntax-quote. Listing the
+;; rest exhaustively is the point: a special form that falls through to sm-cps's
+;; :else arm is rebuilt as an ordinary application, which evaluates its subforms
+;; as expressions — a silent miscompile. case* / deftype* / reify* are
+;; unreachable today (jolt's `case` expands to let* + if, `reify` to a
+;; (make-reified {...} "iface") call), so they are here to make the fallback true
+;; by construction rather than by accident of how those macros expand.
+;;
+;; syntax-quote is the one head special-syms does not name and jolt still lowers
+;; as a special form, because jolt's reader leaves a backtick as
+;; (syntax-quote datum) for the analyzer while the JVM's reader expands it during
+;; read. So the set to complement is jolt's analyzer `handled`, not the portable
+;; special-syms, and dropping the difference cost `(go (list `(<! ch) :done))` its
+;; meaning: the datum is data, but the :else arm rebuilt it as an application,
+;; CPS'd the (<! ch) inside it into a real take, and syntax-quoted the resulting
+;; gensym — so the channel was drained and the value came back (user/a__257 :done).
+(def ^:private sm-opaque
+  '#{quote syntax-quote try catch finally fn* letfn* set! def defmacro throw var
+     monitor-enter monitor-exit new . & case* deftype* reify* import*})
+
+;; recur inside one of these targets it, not an enclosing loop.
+(def ^:private sm-recur-barrier '#{fn* loop* letfn*})
+
+;; The two heads whose subforms are DATA. sm-children stops at both, so the
+;; walkers never descend into a template.
+(def ^:private sm-quoting '#{quote syntax-quote})
+
+(defn- sm-bail []
+  (throw (ex-info "sm/bail" {::bail true})))
+
+(defn- sm-bail? [e] (boolean (::bail (ex-data e))))
+
+(defn- sm-head [form] (when (seq? form) (first form)))
+
+;; A head as the ANALYZER will read it. A special-form head may arrive
+;; clojure.core-QUALIFIED and still dispatch to the special form: analyze-list*
+;; builds its sf-name from either spelling, because syntax-quote qualifies a
+;; macro like `letfn` whose expansion the analyzer lowers as a special form. So
+;; (clojure.core/let* …) and (let* …) are the same form to the compiler, and this
+;; pass has to agree — matching only the unqualified spelling drops a qualified
+;; let* / try / quote / fn* / recur through to sm-cps's :else arm, where it is
+;; rebuilt as an ordinary application and its subforms are evaluated as
+;; expressions. That evaluates a binding vector, a catch clause, or a quoted
+;; datum, and hoists a park out of a fn body — silently.
+(defn- sm-sf-head
+  [form]
+  (let [h (sm-head form)]
+    (if (and (symbol? h) (= "clojure.core" (namespace h))) (symbol (name h)) h)))
+
+(defn- sm-children
+  "Subforms to walk for a tree predicate. A quoted form has none, and neither
+  does a syntax-quoted one: its subforms are DATA, and the walkers below
+  macroexpand what they descend into, so walking a template ran the expander of
+  every macro named inside a backtick — code the analyzer never expands and the
+  compiler never sees. The predicates would only ever be conservative about it
+  (sm-cps emits a syntax-quote whole through the sm-opaque arm either way), so
+  nothing is lost by stopping, and an expander that throws or has side effects
+  no longer gets to run on a quoted template."
+  [form]
+  (cond
+    (contains? sm-quoting (sm-sf-head form)) nil
+    (seq? form) (seq form)
+    (vector? form) (seq form)
+    (set? form) (seq form)
+    (map? form) (concat (keys form) (vals form))
+    :else nil))
+
+(defn- sm-tree-any? [pred form]
+  (or (pred form)
+      (boolean (some (fn [c] (sm-tree-any? pred c)) (sm-children form)))))
+
+;; :env IS the &env map — local symbol to nil, the shape analyzer.clj's
+;; amp-env-map builds and the one both `resolve` and a macro expect. It is the
+;; pass's only record of what is in scope: sm-bind extends it as continuation
+;; parameters and let* bindings come into scope, so it stays true as the pass
+;; descends, and sm-expand hands it to the expander so a macro sees the scope the
+;; analyzer would have shown it.
+(defn- sm-park-kind
+  "nil, :take or :put — and only when sym resolves to the exact var. A local of
+  the same name shadows it."
+  [ctx sym]
+  (when (and (symbol? sym) (not (contains? (:env ctx) sym)))
+    (let [v (resolve (:env ctx) sym)]
+      (cond
+        (nil? v) nil
+        (or (identical? v sm-take-var-1) (identical? v sm-take-var-2)) :take
+        (or (identical? v sm-put-var-1) (identical? v sm-put-var-2)) :put
+        :else nil))))
+
+(defn- sm-parks? [ctx form]
+  (sm-tree-any? (fn [f] (some? (sm-park-kind ctx (sm-head f)))) form))
+
+;; UNDER THE LOCALS AS &env, which is not a nicety. sm-cps does not merely
+;; classify with the expansion, it REBUILDS the body out of it — every one of the
+;; do / let* / if / loop* / :else arms emits from `ex`. The one-argument
+;; macroexpand has no env and binds &env to {}, so a macro that reads &env
+;; expands one way here and another way when the analyzer reaches it, and the
+;; program that gets compiled inside a park-bearing go body is not the one the
+;; same source compiles to anywhere else. clojure.core/__macroexpand-env
+;; (natives-reader.ss) is the seam that passes it; :env below is that map, kept
+;; current by sm-bind as the pass introduces continuation parameters, so a macro
+;; asking "is this name a local" gets the same answer the analyzer would give.
+;;
+;; A head that names a local is not expanded at all, whatever it resolves to.
+(defn- sm-expand
+  "One macroexpansion step chain, skipping a head that names a local."
+  [ctx form]
+  (if (and (seq? form)
+           (symbol? (sm-head form))
+           (not (contains? (:env ctx) (sm-head form)))
+           (not (contains? sm-opaque (sm-sf-head form))))
+    (clojure.core/__macroexpand-env form (:env ctx))
+    form))
+
+(defn- sm-targets-recur?
+  "A recur that would rebind the loop this pass is rewriting. Expands as it walks:
+  the barrier names are the SPECIAL forms (fn*/loop*/letfn*), so testing them
+  against unexpanded source would miss `loop` and `fn` and mistake an inner loop's
+  recur for this one's — which is a miscompile in either direction."
+  [ctx form]
+  (let [ex (sm-expand ctx form)
+        h (sm-sf-head ex)]
+    (cond
+      (= h 'quote) false
+      (= h 'recur) true
+      (contains? sm-recur-barrier h) false
+      :else (boolean (some (fn [c] (sm-targets-recur? ctx c)) (sm-children ex))))))
+
+;; A form may be emitted whole only if it neither parks NOR carries a recur this
+;; pass owns. The recur half is the trap: in
+;;
+;;   (loop [] (do (<! ch) (if p (recur) :done)))
+;;
+;; the tail is park-free, so emitting it whole looks right — but it would land
+;; inside a continuation closure, where recur targets THAT fn instead of the loop.
+;; Keeping such a form on the spine costs a couple of closures and reaches the
+;; recur.
+(defn- sm-inline-ok? [ctx form]
+  (and (not (sm-parks? ctx form))
+       (or (nil? (:rec ctx)) (not (sm-targets-recur? ctx form)))))
+
+;; nil is the &env value for a local, matching analyzer.clj's amp-env-map — the
+;; JVM maps a local to a compiler binding object, and the consumers that read
+;; &env at all only look at its keys.
+(defn- sm-bind [ctx sym] (update ctx :env assoc sym nil))
+
+(defn- sm-bind* [ctx syms]
+  (loop [c ctx s (seq syms)]
+    (if s (recur (sm-bind c (first s)) (next s)) c)))
+
+(declare sm-cps)
+
+(defn- sm-kont
+  "Bind (fn* [p] <body>) to a fresh name and hand that name to f. A continuation
+  is always a symbol, so both arms of an if can mention it without duplicating
+  its body."
+  [ctx p bodyf f]
+  (let [ks (gensym "k__")]
+    (list 'let* [ks (list 'fn* [p] (bodyf (sm-bind (sm-bind ctx ks) p)))]
+          (f (sm-bind ctx ks) ks))))
+
+(defn- sm-cps-body
+  "CPS a form sequence as an implicit do."
+  [ctx forms k]
+  (cond
+    (empty? forms) (list k nil)
+    (empty? (rest forms)) (sm-cps ctx (first forms) k)
+    (sm-inline-ok? ctx (first forms))
+    (list 'do (first forms) (sm-cps-body ctx (rest forms) k))
+    :else
+    (sm-kont ctx (gensym "v__")
+             (fn [c] (sm-cps-body c (rest forms) k))
+             (fn [c ks] (sm-cps c (first forms) ks)))))
+
+(defn- sm-cps-seq
+  "Evaluate forms left to right, binding each result to a symbol, then hand the
+  symbols to f. Source order is preserved: a park-free form to the left of a
+  parking one is bound BEFORE the park, not after it."
+  [ctx forms f]
+  (letfn [(step [c done todo]
+            (if (empty? todo)
+              (f c done)
+              (let [a (first todo)
+                    s (gensym "a__")]
+                (if (sm-inline-ok? c a)
+                  (list 'let* [s a] (step (sm-bind c s) (conj done s) (rest todo)))
+                  (sm-kont c s
+                           (fn [c2] (step c2 (conj done s) (rest todo)))
+                           (fn [c2 ks] (sm-cps c2 a ks)))))))]
+    (if (every? (fn [a] (sm-inline-ok? ctx a)) forms)
+      (f ctx (vec forms))
+      (step ctx [] forms))))
+
+(defn- sm-cps-let
+  "let* — a park-free init stays a binding; a parking one becomes a continuation
+  parameter, which keeps the shadowing the source had."
+  [ctx pairs body k]
+  (if (empty? pairs)
+    (sm-cps-body ctx body k)
+    (let [b (first pairs)
+          init (second pairs)
+          more (drop 2 pairs)]
+      (if (sm-inline-ok? ctx init)
+        (list 'let* [b init] (sm-cps-let (sm-bind ctx b) more body k))
+        (sm-kont ctx b
+                 (fn [c] (sm-cps-let c more body k))
+                 (fn [c ks] (sm-cps c init ks)))))))
+
+(defn- sm-cps-loop
+  "loop* becomes a letfn* function called in tail position, so a recur chain is a
+  tail call and does not grow the stack across parks.
+
+  The inits bind SEQUENTIALLY under the loop's own names, exactly as sm-cps-let
+  does and as the analyzer reads loop* — analyze-bindings threads each binding
+  into the env the next one is analyzed in, so (loop [a 1 b (inc a)] …) is legal
+  and b's init means the a above it. Evaluating them as a flat argument list
+  instead put every init in the scope OUTSIDE the loop, where that `a` is
+  whatever `a` the enclosing scope happens to have: a compile error if there is
+  none, and silently the wrong value if there is one.
+
+  :rec carries the loop's TAIL continuation as well as its name and arity. A
+  recur compiles to a bare call to lp, which throws away whatever continuation
+  sm-cps was handed, and that is only the same thing as a recur where the
+  continuation in hand IS this one — see the recur arm in sm-cps."
+  [ctx bindings body k]
+  (let [names (vec (take-nth 2 bindings))
+        lp (gensym "lp__")]
+    (letfn [(enter [c]
+              (let [c' (assoc (sm-bind* (sm-bind c lp) names)
+                              :rec {:name lp :n (count names) :k k})]
+                (list 'letfn* [lp (list 'fn* names (sm-cps-body c' body k))]
+                      ;; the names are the let*/continuation bindings built above;
+                      ;; the fn's params shadow them inside the body
+                      (apply list lp names))))
+            (step [c pairs]
+              (if (empty? pairs)
+                (enter c)
+                (let [b (first pairs)
+                      init (second pairs)
+                      more (drop 2 pairs)]
+                  (if (sm-inline-ok? c init)
+                    (list 'let* [b init] (step (sm-bind c b) more))
+                    (sm-kont c b
+                             (fn [c2] (step c2 more))
+                             (fn [c2 ks] (sm-cps c2 init ks)))))))]
+      (step ctx (seq bindings)))))
+
+;; A test that PARKS becomes a continuation parameter; one that does not goes
+;; straight into the if. Routing it through a continuation either way was correct
+;; and cost a closure per if — and since when / cond / case / and / or / if-let
+;; all lower to if, an if-heavy body paid it at every one. Nothing is duplicated
+;; by inlining it: both arms name k, they do not carry it, so each is emitted
+;; once whichever shape the test takes.
+(defn- sm-cps-if
+  [ctx form k]
+  (let [t (second form)
+        arms (drop 2 form)
+        arm (fn [c ts]
+              (list 'if ts
+                    (sm-cps c (first arms) k)
+                    (if (> (count arms) 1)
+                      (sm-cps c (second arms) k)
+                      (list k nil))))]
+    (if (sm-inline-ok? ctx t)
+      (arm ctx t)
+      (let [ts (gensym "t__")]
+        (sm-kont ctx ts
+                 (fn [c] (arm c ts))
+                 (fn [c ks] (sm-cps c t ks)))))))
+
+(defn- sm-cps
+  "Rewrite form so that its value is passed to the continuation named by k."
+  [ctx form k]
+  (if (sm-inline-ok? ctx form)
+    (list k form)
+    (if-not (seq? form)
+      ;; A collection literal holding a park: left whole, parks the old way. Same
+      ;; recur guard as the opaque arm below, and for the same reason — emitted
+      ;; whole, a recur this pass owns lands inside a continuation fn* and targets
+      ;; THAT fn instead of the loop. Only reachable from source the JVM rejects (a
+      ;; recur outside tail position), which is exactly why it is a check and not a
+      ;; comment: the pass may cost a park its cheap representation, never its
+      ;; meaning, and that should hold by construction.
+      (if (and (:rec ctx) (sm-targets-recur? ctx form)) (sm-bail) (list k form))
+      ;; h is the head as WRITTEN (what a park test and a rebuilt application need)
+      ;; and sf is the same head as the analyzer reads it — the two differ only for
+      ;; a clojure.core-qualified special form, and every dispatch below turns on
+      ;; sf so that spelling cannot slip past into the :else arm.
+      (let [ex (sm-expand ctx form)
+            h (sm-head ex)
+            sf (sm-sf-head ex)
+            pk (sm-park-kind ctx h)]
+        (cond
+          pk
+          (sm-cps-seq ctx (vec (rest ex))
+                      (fn [_ args]
+                        (apply list
+                               (if (= pk :take)
+                                 'clojure.core.async/__sm-take
+                                 'clojure.core.async/__sm-put)
+                               (concat args [k]))))
+
+          (= sf 'do) (sm-cps-body ctx (rest ex) k)
+          (= sf 'let*) (sm-cps-let ctx (vec (second ex)) (drop 2 ex) k)
+          (= sf 'if) (sm-cps-if ctx ex k)
+          (= sf 'loop*) (sm-cps-loop ctx (vec (second ex)) (drop 2 ex) k)
+
+          ;; recur is a bare call to the loop fn, which DISCARDS k. That is the
+          ;; right thing only where k is the loop's own tail continuation, and
+          ;; every arm that CPSes a subform hands down a fresh one instead: an
+          ;; application argument, a let* init, a non-final do statement, an if
+          ;; test. Reached through any of those, discarding k threw the rest of
+          ;; the computation away — (loop [i 0] (if (< i 2) (inc (recur (inc i)))
+          ;; (<! ch))) answered the take where the ordinary expansion answers it
+          ;; plus two. Only source the JVM rejects (a recur outside tail
+          ;; position) gets here, which is why nothing caught it; jolt accepts
+          ;; that source, so the two expansions have to agree on what it means.
+          ;; Bail, the same as the collection-literal and opaque arms do for the
+          ;; same reason.
+          (= sf 'recur)
+          (let [rec (:rec ctx)]
+            (when (or (nil? rec)
+                      (not= (count (rest ex)) (:n rec))
+                      (not= k (:k rec)))
+              (sm-bail))
+            (sm-cps-seq ctx (vec (rest ex))
+                        (fn [_ args] (apply list (:name rec) args))))
+
+          ;; A form this pass does not rewrite. Emitting it whole is correct: a
+          ;; park inside it captures a continuation, and that capture includes the
+          ;; pending (k _) frame, so the resume carries on properly.
+          (or (contains? sm-opaque sf) (not (symbol? h)))
+          (if (and (:rec ctx) (sm-targets-recur? ctx ex)) (sm-bail) (list k form))
+
+          :else
+          (sm-cps-seq ctx (vec (rest ex))
+                      (fn [_ args] (list k (apply list h args)))))))))
+
+(defn- sm-cps-go-body
+  "The go body rewritten as (fn* [k] ...), or nil to compile it the way it always
+  was. nil means: nothing here parks where the pass can see it, or the body did
+  something the pass will not guess at."
+  [env body]
+  ;; The scope starts from the ENCLOSING one, not empty, and it is the go macro's
+  ;; own &env — so a `go` written inside a scope whose local shares a name with a
+  ;; macro does not have that local's call expanded as the macro, and a macro the
+  ;; pass expands sees the same locals the analyzer would have shown it.
+  ;; (or env {}) because a top-level go gets nil, and jolt-resolve treats a
+  ;; non-map env as "no locals" — the same answer, said once here instead of at
+  ;; every use.
+  (let [ctx {:env (or env {}) :rec nil}
+        form (if (= 1 (count body)) (first body) (cons 'do body))]
+    (when (and (sm-parks? ctx form)
+               ;; a recur in the body targets the body fn itself, whose arity this
+               ;; pass changes
+               (not (sm-targets-recur? ctx form)))
+      (try
+        (let [k (gensym "k__")]
+          (list 'fn* [k] (sm-cps (sm-bind ctx k) form k)))
+        (catch Throwable e
+          (when-not (sm-bail? e) (throw e))
+          nil)))))
+
+(defmacro go
+  "Spawn body as a process and return a channel carrying its value. Parking ops
+  inside the body — including ones in functions it calls — park the process."
+  [& body]
+  (if-let [f (sm-cps-go-body &env body)]
+    (list 'clojure.core.async/__sm-spawn f)
+    (list 'clojure.core.async/go-spawn (list* 'fn* [] body))))
+
+(defmacro go-loop
+  "(go (loop bindings body...))"
+  [bindings & body]
+  (list 'clojure.core.async/go (list* 'loop bindings body)))
 
 ;; --- alts -------------------------------------------------------------------
 ;; do-alts uses a per-call handler registered on each channel (no poll loop).
@@ -55,8 +470,8 @@
   (do-alts ports opts))
 
 (defn alts!
-  "Like alts!!. In jolt a go block is a real thread, so parking and blocking alts
-  are the same operation."
+  "Like alts!!. Parking and blocking alts are the same operation in jolt: on a
+  thread-backed go both block, and on a fiber both park."
   [ports & {:as opts}]
   (do-alts ports opts))
 

@@ -21,14 +21,23 @@
 ;; (now-uncertain) ns/file:line, so a trace is never misattributed.
 (define source-registry (make-hashtable string-hash string=?))
 
+;; The whole cond is ONE critical section. This runs at load, emitted by the back
+;; end once per def, and namespaces now load in parallel — so two threads
+;; registering the same procname under different namespaces both read #f, both
+;; write their own vector, and neither writes 'ambiguous. The trace then names one
+;; of them with confidence, which is exactly the misattribution the marker exists
+;; to prevent (400 contended pairs missed it 3 times). Reads stay unlocked: this is
+;; a strong hashtable and every read of it is single-key.
+(define source-registry-mu (make-mutex))
 (define (jolt-register-source! procname ns nm file line)
-  (let ((existing (hashtable-ref source-registry procname #f)))
-    (cond
-      ((not existing) (hashtable-set! source-registry procname (vector ns nm file line)))
-      ((and (vector? existing)
-            (or (not (equal? (vector-ref existing 0) ns))
-                (not (equal? (vector-ref existing 1) nm))))
-       (hashtable-set! source-registry procname 'ambiguous))))
+  (jolt-with-mutex source-registry-mu
+    (let ((existing (hashtable-ref source-registry procname #f)))
+      (cond
+        ((not existing) (hashtable-set! source-registry procname (vector ns nm file line)))
+        ((and (vector? existing)
+              (or (not (equal? (vector-ref existing 0) ns))
+                  (not (equal? (vector-ref existing 1) nm))))
+         (hashtable-set! source-registry procname 'ambiguous)))))
   jolt-nil)
 (def-var! "jolt.host" "register-source!" jolt-register-source!)
 
@@ -75,6 +84,19 @@
                 "record-method-dispatch" "protocol-resolve" "devirt-resolve"
                 "list->cseq" "host-static-call" "host-call"))
     h))
+;; The `jolt-` prefix rule is also what BOUNDS A FIBER BACKTRACE, which is not
+;; obvious from here. A throw inside a go body has the whole scheduler below it
+;; on the continuation — jolt-fiber-run, jolt-fiber-drain!, jolt-fiber-resume*,
+;; jolt-fiber-carrier-loop — and every one of those is filtered by that prefix,
+;; so the rendered trace ends at the user's own frames with nothing after them.
+;; Swish needs an explicit boundary marker for this (erlang.ss limit-stack,
+;; a recognisable frame walk-stack stops at); jolt gets it from the naming
+;; convention instead, and more generally, since the rule covers any host frame
+;; rather than one planted spot.
+;;
+;; So this is load-bearing beyond tidiness: narrowing the prefix rule, or letting
+;; a scheduler procedure be named without the prefix, puts carrier internals back
+;; into every go-block trace.
 (define (srcreg-plumbing-name? nm)
   (or (hashtable-ref srcreg-plumbing-names nm #f)
       (and (fx>? (string-length nm) 0) (char=? (string-ref nm 0) #\$))
@@ -356,7 +378,7 @@
 ;; Register the marker table for one eval'd Scheme text; returns the synthetic
 ;; source name to pass make-source-file-descriptor. Once per top-level form.
 (define (jolt-register-eval-marker-table! scm)
-  (mutex-acquire jolt-eval-source-mutex)
+  (jolt-lock! jolt-eval-source-mutex)
   (let ((name (string-append "jolt-eval-src-"
                              (number->string jolt-eval-source-counter))))
     (set! jolt-eval-source-counter (+ jolt-eval-source-counter 1))
@@ -365,7 +387,7 @@
         (when old (hashtable-delete! jolt-eval-marker-registry old))))
     (hashtable-set! jolt-eval-marker-registry name (jolt-marker-table scm))
     (jolt-eval-queue-push! name)
-    (mutex-release jolt-eval-source-mutex)
+    (jolt-unlock! jolt-eval-source-mutex)
     name))
 ;; Resolve an eval-path frame's (name . offset) to a clj line, or #f when the
 ;; name was evicted / never registered or no marker precedes the offset.

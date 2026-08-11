@@ -124,7 +124,7 @@
       (apply jolt-vector (pset-fold x cons '()))
       (jolt-get x hc-kw-value)))
 (define (hc-map-pairs x)
-  (let ((kv (hashtable-ref rdr-map-order x #f)))
+  (let ((kv (rdr-map-order-ref x)))
     (if kv
         ;; reader-built map literal: emit pairs in SOURCE order (kv = k1 v1 k2 v2 …)
         ;; so the analyzer evaluates the values left-to-right.
@@ -228,7 +228,7 @@
 
 ;; Runtime macros: a defmacro is emitted into the prelude as a
 ;; def-var! of its cross-compiled expander fn plus (mark-macro! ns name), so the
-;; var cell is flagged a macro (rt.ss var-macro-table). form-macro? checks the
+;; var cell is flagged a macro (rt.ss var-cell macro? field). form-macro? checks the
 ;; flag; form-expand-1 applies the expander to the unevaluated arg forms (the rest
 ;; of the list), and the analyzer re-analyzes the returned form.
 (define (hc-macro? ctx sym)
@@ -304,7 +304,7 @@
 ;; A var's declared numeric return (^double/^long on its name) -> :double/:long,
 ;; read from its meta. Lets jolt.passes.numeric type a call to it.
 (define (hc-cell-num-ret cell)
-  (let ((m (and cell (hashtable-ref var-meta-table cell #f))))
+  (let ((m (and cell (var-cell-meta cell))))
     (and m (let* ((t (jolt-get m hc-kw-tag))   ; ^double/^long is a symbol; ^"double" a string
                   (s (cond ((symbol-t? t) (symbol-t-name t)) ((string? t) t) (else #f))))
              (cond ((equal? s "double") hc-kw-double)
@@ -380,7 +380,7 @@
           (let ((ns (var-cell-ns c)))
             (when (or (string=? ns cns) (string=? ns "clojure.core"))
               (set! acc (cons (var-cell-name c) acc))))))
-      (hashtable-values var-table))
+      (var-table-cells))
     (list->cseq acc)))
 
 (define (hc-intern! ctx ns-name nm) (declare-var! ns-name nm) jolt-nil)
@@ -394,10 +394,18 @@
 ;; the syntax-quote specials + resolver live in reader.ss (jsq-specials /
 ;; jsq-resolve-symbol), shared with the read-string data path.
 
+;; The bump and the read are one step. This one runs during COMPILATION, which is
+;; now parallel across namespaces, and unlocked two threads draw the same number
+;; — see jolt-gensym in converters.ss.
 (define hc-sq-gensym-counter 0)
+(define hc-sq-gensym-mutex (make-mutex))
 (define (hc-sq-gensym base)
-  (set! hc-sq-gensym-counter (+ hc-sq-gensym-counter 1))
-  (jolt-symbol #f (string-append base "__" (number->string hc-sq-gensym-counter) "__auto")))
+  (jolt-symbol #f (string-append base "__"
+                                 (number->string
+                                  (jolt-with-mutex hc-sq-gensym-mutex
+                                    (set! hc-sq-gensym-counter (+ hc-sq-gensym-counter 1))
+                                    hc-sq-gensym-counter))
+                                 "__auto")))
 
 (define (hc-sym nm) (jolt-symbol #f nm))
 ;; is `x` a non-empty list FORM whose head is the unqualified symbol `nm`?
@@ -542,9 +550,18 @@
 ;; {:params :body :nhints :ret} here (keyed ns/name) as its form is optimized;
 ;; jolt.passes.inline fetches it to splice the body at a call site. The stash is an
 ;; opaque jolt value to the host — IR maps round-tripping through the table.
+;; Shared across compilations on purpose — that is what makes cross-namespace
+;; inlining possible — so it is written from every thread compiling once
+;; namespaces load in parallel. Concurrent inserts into a strong hashtable lose
+;; each other, and a lost stash is an inline that silently does not happen. The
+;; fetch is a single-key read and stays unlocked: it sits at every candidate call
+;; site, and an unlocked read of a strong table is safe (see var-table in rt.ss).
 (define inline-stash-table (make-hashtable string-hash string=?))
+(define inline-stash-mu (make-mutex))
 (define (hc-stash-inline! ctx ns-name nm m)
-  (hashtable-set! inline-stash-table (string-append ns-name "/" nm) m) jolt-nil)
+  (jolt-with-mutex inline-stash-mu
+    (hashtable-set! inline-stash-table (string-append ns-name "/" nm) m))
+  jolt-nil)
 (define (hc-inline-ir ctx ns-name nm)
   (or (hashtable-ref inline-stash-table (string-append ns-name "/" nm) #f) jolt-nil))
 

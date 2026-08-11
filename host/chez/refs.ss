@@ -1,10 +1,15 @@
 ;; refs.ss — Clojure refs and STM for the Chez host.
 ;;
-;; Single global transaction mutex gives correct serializable semantics on
+;; A single global transaction lock gives correct serializable semantics on
 ;; jolt's shared-heap threads — no MVCC needed.  Transactions buffer writes
 ;; in a per-txn log and only commit (write ref values) on success, providing
 ;; rollback on exception.  Watches fire once per changed ref after commit,
 ;; outside the transaction lock, matching JVM semantics.
+;;
+;; The lock IS the isolation, and it is an object MONITOR rather than an OS mutex
+;; because a mutex cannot carry that across a fiber park — see stm-lock below
+;; (jolt-pb2s), and dyn-with-txn for the other half, which is *txn* itself
+;; (jolt-49ay).
 ;;
 ;; Refs participate in the IRef seam (watches/validators/metadata) like
 ;; atom/var/agent.  Loaded after atoms.ss (shares jolt-iref-state-throw and
@@ -25,8 +30,16 @@
 (register-iref-arm! jolt-ref?)
 
 ;; Per-ref min/max history (defaults 0 and 10), stored in weak side tables.
+;; ref-min-history / ref-max-history live in side-tables rather than ref fields.
+;; A Chez hashtable is not thread-safe and STM is concurrent by definition, so
+;; both go through one mutex: unsynchronized mutation corrupts the table and the
+;; damage surfaces as a fault inside the collector, naming nothing. Cold on both
+;; sides — these are only touched by the user-facing getter/setter, never by the
+;; commit path (jolt-ref-history-count is 0; history is not implemented) — so the
+;; lock costs nothing measurable.
 (define ref-min-history-tbl (make-weak-eq-hashtable))
 (define ref-max-history-tbl (make-weak-eq-hashtable))
+(define ref-history-mu (make-mutex))
 
 ;; --- transaction record -------------------------------------------------------
 ;; A per-transaction record, held in the thread-parameter *txn* (#f when
@@ -43,11 +56,101 @@
   (make-jolt-txn (make-eq-hashtable) (make-eq-hashtable) '()))
 
 ;; --- transaction state -------------------------------------------------------
-;; A single global mutex serializes all transactions.  Per-thread *txn* detects
+;; A single global lock serializes all transactions.  Per-thread *txn* detects
 ;; nested dosync (joins the outer transaction) and guards against io!/ref-set/
 ;; alter/commute/ensure outside a transaction.
-(define stm-lock (make-mutex))
+;;
+;; AN OBJECT MONITOR AND NOT A MUTEX, and that is the isolation (jolt-pb2s).
+;;
+;; This was (define stm-lock (make-mutex)) taken through jolt-with-mutex around the
+;; whole transaction body. An OS mutex has THREAD granularity and a fiber is not a
+;; thread, so it cannot carry an invariant across a park — and jolt-with-mutex is a
+;; dynamic-wind, so a fiber that parks inside the body RELEASES it on the way out
+;; and re-acquires it on resume. That is exactly what locks.ss says makes parking
+;; inside jolt-with-mutex safe, and exactly what a transaction cannot survive:
+;; another transaction ran and COMMITTED inside this one's extent, and this one then
+;; committed writes derived from reads that predated it. Measured: a fiber reading
+;; r = 0, parking, and writing read+1 while a second transaction committed r = 100
+;; left r = 1, where the only serializable outcomes are 100 and 101.
+;;
+;; There is nothing downstream to catch it. jolt's STM has no MVCC and no retry —
+;; the lock IS the isolation — so dropping it mid-body drops the only mechanism
+;; there is, silently. And this is a scenario the design commits to rather than one
+;; to rule out: fibers.ss carries *txn* in the per-fiber dynamic slice precisely so
+;; that a fiber parked inside a dosync resumes inside its txn.
+;;
+;; So exclusion is carried the way jolt-3a87 carries an object monitor's: by an
+;; OWNER FIELD keyed on the execution context, which a context switch cannot
+;; disturb because it is not a wind. jolt-with-monitor is that lock already — its
+;; bookkeeping mutex is held only across the enter/exit decision, a fiber contender
+;; PARKS on the monitor's waiter list (never a condition-wait, which would block the
+;; carrier the holder may need in order to reach its commit) and a thread waits on
+;; its condition, and its after-thunk asks jolt-park-unwinding? so a park keeps
+;; ownership. Nothing here has to know any of that; it just has to stop using a
+;; mutex for a region that spans user code.
+;;
+;; The second thing this buys is jolt-d7l5: a monitor holds no COUNTED lock while
+;; the body runs, so a fiber inside a transaction is preemptible again. Under the
+;; mutex it was not, for the whole body, which is reason 3 of the three ways the
+;; monitor itself failed — an unbounded starvation window over arbitrary user code.
+;;
+;; WHAT IT TRADES. Two transactions that today interleave over a park will now
+;; serialize, and a program relying on that interleaving to make progress can
+;; deadlock instead. That is jolt-3a87's call again: a hang is diagnosable and a
+;; lost update is not.
+;;
+;; The lock-order rule the loader rests on is unchanged — a load must never acquire
+;; this lock (loader.ss ldr-libs-update!), which is what keeps stm-lock -> ns_load
+;; acyclic — and it is if anything easier to hold now, since a fiber contender parks
+;; instead of pinning its carrier.
+;;
+;; jolt-with-monitor lives in java/concurrency.ss, which rt.ss loads AFTER this
+;; file; the reference resolves at call time, the same forward reference
+;; jolt-alter-var-root makes from dyn-binding.ss and jolt-run-interruptible makes to
+;; fibers.ss. Nothing runs a transaction before the boot finishes loading.
+(define stm-lock (vector 'stm-lock))
 (define *txn* (make-thread-parameter #f))
+
+;; (dyn-with-txn txn thunk) — scope *txn* over a dynamic extent.
+;;
+;; NOT `parameterize`, and the reason is the rule dyn-binding.ss already states at
+;; dyn-with-frame: a winder must not re-establish state the jolt-dslice already
+;; carries (jolt-49ay). The dslice carries *txn* — that is how a fiber parked inside
+;; a dosync resumes inside its own transaction — and Chez's parameterize is a SWAP:
+;; one thunk is both the wind's before and its after, exchanging the parameter with a
+;; saved slot. jolt-fiber-slice-restore! writes *txn* BEFORE the rewind runs that
+;; swap, so the saved slot came back holding the transaction instead of the outer
+;; nil, and the way out then restored the TRANSACTION. The fiber left its dosync
+;; still inside one, and its next dosync saw (*txn*) non-nil, took the nested arm,
+;; joined the dead transaction, took no lock at all and wrote into a log nobody would
+;; ever commit. Measured with no preemption at all: three parked transactions in a
+;; row committed once; under contention, 396 of 400 dosync calls joined a stale txn
+;; and four transaction objects served four hundred transactions.
+;;
+;; So the same shape dyn-with-frame uses, for the same reason. The set happens ONCE,
+;; outside the wind, so a rewind cannot re-establish anything; and the after-thunk
+;; restores an ABSOLUTE value rather than swapping, so it is right however many times
+;; the extent is left and re-entered. The slice is then the single owner of *txn*
+;; across a switch, which is what fibers.ss says the design is.
+;;
+;; This is the ONLY parameterize the runtime had over a slice-carried parameter. The
+;; others are over parameters the slice does not touch (the reader's mode, the
+;; loader's sinks and flags), where the swap is sound because nothing else writes
+;; them while the extent is unwound.
+;;
+;; Note the after-thunk here DOES fire on a park, which is the opposite of
+;; jolt-with-monitor's just above it in jolt-sync — and the difference is which
+;; mechanism owns the state across the switch. The slice owns *txn*, so letting it
+;; revert and be restored is correct; the monitor owns its ownership field, so a park
+;; must not release it. Both rest on a park being a CAPTURE park that rewinds, which
+;; is what fn* opacity gives dosync (java/sm.ss's invariant; run-gosm.ss checks it).
+(define (dyn-with-txn txn thunk)
+  (let ((outer (*txn*)))
+    (*txn* txn)
+    (dynamic-wind
+      (lambda () #f)
+      thunk
+      (lambda () (*txn* outer)))))
 
 ;; --- in-txn log helpers ------------------------------------------------------
 
@@ -170,13 +273,21 @@
       (let ((txn (make-txn))
             (aborted #f)
             (result #f))
-        (with-mutex stm-lock
-          (parameterize ((*txn* txn))
-            (guard (e (#t (set! aborted #t) (set! result e)))
-              (set! result (jolt-invoke thunk)))
-            (unless aborted
-              (txn-commit! txn))))
-        ;; after with-mutex releases lock and parameterize restores *txn* to #f
+        ;; The body is handed over as a thunk because that is what a monitor takes,
+        ;; and dosync already reaches here as (__sync-call (fn* [] body)) — an fn*,
+        ;; which is opaque to the CPS pass, so a park inside a transaction takes a
+        ;; CAPTURE park and rewinds properly. jolt-with-monitor's after-thunk needs
+        ;; that: a CHEAP park never rewinds, so it would skip the release and leave
+        ;; the transaction lock held for the life of the process.
+        (jolt-with-monitor stm-lock
+          (lambda ()
+            (dyn-with-txn txn
+              (lambda ()
+                (guard (e (#t (set! aborted #t) (set! result e)))
+                  (set! result (jolt-invoke thunk)))
+                (unless aborted
+                  (txn-commit! txn))))))
+        ;; the monitor is released and *txn* is back to #f
         (unless aborted
           (txn-fire-watches! txn)
           ;; dispatch deferred agent sends inside a txn.  Look up send from
@@ -207,15 +318,17 @@
 
 (define (jolt-ref-min-history . args)
   (let ((ref (car args)))
-    (if (= (length args) 2)
-        (begin (hashtable-set! ref-min-history-tbl ref (cadr args)) ref)
-        (hashtable-ref ref-min-history-tbl ref 0))))
+    (jolt-with-mutex ref-history-mu
+      (if (= (length args) 2)
+          (begin (hashtable-set! ref-min-history-tbl ref (cadr args)) ref)
+          (hashtable-ref ref-min-history-tbl ref 0)))))
 
 (define (jolt-ref-max-history . args)
   (let ((ref (car args)))
-    (if (= (length args) 2)
-        (begin (hashtable-set! ref-max-history-tbl ref (cadr args)) ref)
-        (hashtable-ref ref-max-history-tbl ref 10))))
+    (jolt-with-mutex ref-history-mu
+      (if (= (length args) 2)
+          (begin (hashtable-set! ref-max-history-tbl ref (cadr args)) ref)
+          (hashtable-ref ref-max-history-tbl ref 10)))))
 
 ;; --- deref -------------------------------------------------------------------
 ;; Inside a transaction, return the in-txn value from the log (falling back

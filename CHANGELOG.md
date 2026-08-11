@@ -5,6 +5,118 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-08-10
+
+Finishes the fiber backend for `core.async`. A parked `go` process is roughly
+5.5x smaller when the compiler can see where it parks, a compute-bound body no
+longer starves the fibers queued behind it, and every lock a program can hold —
+`locking`, `dosync`, a `delay` being forced, `ReentrantLock` — survives a park
+with exclusion intact. Fibers stay opt-in
+(`clojure.core.async/*go-backend* :fiber`); the default is still `:thread`.
+
+### Added
+
+- **The cheap park: a `go` body pays for a continuation only where it needs
+  one.** A fiber parks by capturing a continuation, which Chez represents as a
+  stack segment that stays live for as long as the process is parked. A CPS pass
+  in `clojure.core.async` now rewrites the rest of the body into a closure where
+  it can see the park, and the channel op stores that closure and switches to the
+  scheduler with no capture at all. Measured in one run, same process shape and
+  retention: 864 B live / 1,244 B peak RSS rewritten, against 4,762 B / 7,368 B
+  captured — 5.5x and 5.9x. Round-trip time is unchanged (903 ns against 858 ns,
+  inside the spread).
+
+  The choice is per **park site**, not per body, with the continuation park as
+  the runtime fallback. A park the pass cannot see or cannot rewrite — inside a
+  called function, inside a `try`, inside a nested `fn`, in an `alts!`, reached
+  through `eval` — is left exactly as written and parks the way every park did
+  before. So the pass is opportunistic: it can cost a park its cheap
+  representation, never its correctness, and nothing about a `go` body needs
+  annotating. Jolt keeps the property the JVM's transform gives up: a parking op
+  does not have to appear lexically in the body.
+
+- **Preemption is the scheduler.** A `go` body that computes without reaching a
+  channel op used to hold its carrier for as long as it ran, and every fiber
+  queued behind it waited — fibers cannot migrate, so nothing could rescue them.
+  Chez polls an engine timer at procedure calls and loop back edges, so a tight
+  arithmetic loop yields like anything else; the quantum is ~0.45 ms.
+  `clojure.core.async/*fiber-preempt-ticks*` sets it, read once when the carrier
+  pool starts. There is no value that turns preemption off — cooperative-only is
+  an unbounded starvation window, so code that wants it asks for a very long
+  quantum instead. A fiber inside a blocking foreign call is not running Scheme
+  and no timer fires for it.
+
+- **`clojure.core.async/go-monitor`** yields the throwable when a `go` body
+  died, and closes when it did not. A body that threw and a body that returned
+  nil were otherwise indistinguishable: both close the result channel and hand
+  the reader nil, with the condition reported to stderr at best. It answers for
+  either backend and for both fiber spawn paths — which backend ran a body
+  follows from the caller's `*go-backend*` binding and which spawn path from
+  whether the CPS pass could rewrite the body, so a monitor that reported on some
+  of those and said "clean" for the rest would be worse than none.
+
+  ```clojure
+  (let [g (a/go (throw (ex-info "boom" {})))]
+    (a/<!! g)                      ;=> nil, same as a body that returned nil
+    (a/<!! (a/go-monitor g)))   ;=> the throwable
+  ```
+
+  A `thread` block's channel answers too — it has the same nil ambiguity and
+  comes from the same spawn. A channel that is not one of those monitors as nil
+  rather than raising.
+
+### Fixed
+
+- **A lock is a lock across a park.** Holding an object monitor, a transaction
+  or a `delay` across a `<!` broke exclusion, in each case because ownership sat
+  in an OS mutex: `locking` was a `dynamic-wind`, so a park released the monitor
+  mid-body and re-took it on resume, and two fibers on one carrier then ran the
+  same body at once — undetected, because same-carrier fibers share the carrier's
+  identity and the owner check took the reentrant arm. `dosync` lost isolation
+  the same way, and `(delay (<!! gate))` ran its body once per forcer that got
+  in, so one delay answered two forcers with different values. Those four locks —
+  object monitors, `dosync`, `delay`, `java.util.concurrent.locks.ReentrantLock`
+  — now carry ownership in a field keyed on the fiber, which survives a context
+  switch. You can hold a monitor across a `<!`, park in the middle of a
+  transaction, and force a `delay` whose body waits on a channel.
+
+  Underneath, every lock in the runtime routes through one counting wrapper and
+  the scheduler refuses to switch a fiber that holds one, re-arming on a short
+  retry so the preemption lands just after the region. A gate checks the routing
+  rather than documenting it.
+
+- **`require` is safe to call from more than one thread.** Nothing serialized a
+  namespace load, so two threads requiring the same namespace both passed the
+  loaded check and both ran its top-level forms — every `def` and every
+  side effect twice. The mark-before-load that terminates a require cycle made it
+  worse across threads: the namespace reads as loaded before its forms run, so
+  the second thread's `require` returned having defined nothing. Loads are
+  serialized per namespace now, following the JVM's class-initialization
+  procedure (JLS 12.4.2) — the same thread re-entering its own in-progress load
+  still proceeds, which is what makes a cycle terminate, and unrelated namespaces
+  still load in parallel.
+
+  The compiler had to be made safe for that first: the emit session's scratch,
+  the per-def cache cells and the hoisted constant pool lived on a process-global
+  unit that two emitting threads traded, so a namespace that compiled cleanly
+  alone died with `variable _kc$81 is not bound`. They are thread-bound vars now,
+  which also unwinds them on a throw, where the old save/restore pair left the
+  unit pointing at an abandoned def's collector.
+
+- **`compare-and-set!`, `swap-vals!` and `reset-vals!` name the class the JVM
+  names.** They skipped the atom check `swap!`/`reset!` run and reached a record
+  accessor, so a non-atom receiver reported jolt's own record type and nil
+  stopped reporting as a `NullPointerException` — which a `catch` selecting on it
+  stopped matching.
+
+- **A dynamic binding the runtime establishes is not doubled by a park.** Three
+  places pushed a binding frame in a `dynamic-wind`'s before thunk — `*agent*`,
+  `*compile-files*`, and the loader's file and source-path frame. A park saves
+  the fiber's slice with the frame already in it, the escape's unwind pops it,
+  and the resume both restores the slice and re-runs the before thunk, so the var
+  ended up bound twice and one frame leaked past the end of its extent. Visible
+  with an ordinary park; no preemption needed.
+
 ## [0.6.9] - 2026-08-10
 
 ### Changed

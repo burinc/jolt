@@ -213,17 +213,19 @@
 (define all-done4
   (wait-until (lambda () (all-done? f4s)) 20.0 "4. all 8 round trips completed"))
 (ok "4. all 8 round trips completed" all-done4)
-;; guarded by all-done4 like the other result reads: a fiber that has not finished
-;; has #f for a result, and reading it unguarded took the whole gate down with
-;; "Exception in string=?: #f is not a string" instead of failing this one check —
-;; which is what a timed-out wait above looks like on a loaded machine.
+;; A fiber that never resumed has #f for a result, and string=? on it RAISES —
+;; which turned an already-reported timeout into a crash that ended the whole
+;; fibers gate and buried the failure. Guard on all-done4 like the other result
+;; reads, and compare only strings; anything else is a failed check, not an
+;; exception.
 (ok "4. every fiber got its own payload"
     (and all-done4
          (let loop ((i 0))
            (or (fx=? i r8-n)
-               (and (string=? (jolt-fiber-result (list-ref f4s i))
-                              (string-append "m" (number->string i)))
-                    (loop (fx+ i 1)))))))
+               (let ((r (jolt-fiber-result (list-ref f4s i))))
+                 (and (string? r)
+                      (string=? r (string-append "m" (number->string i)))
+                      (loop (fx+ i 1))))))))
 
 ;; --- 5. accept parks too -------------------------------------------------------
 (printf "\n== 5. a fiber blocked in accept parks and resumes on a connection ==\n")

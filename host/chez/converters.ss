@@ -178,14 +178,22 @@
        (jolt-symbol (if (jolt-nil? ns) #f ns) nm)))
     (else (throw-jvm (quote ArityException) "Wrong number of args passed to: symbol"))))
 
-;; gensym: per-process counter.
+;; gensym: per-process counter. The bump and the read are ONE step — a bare
+;; (set! c (+ c 1)) followed by a read of c is a read-modify-write, and two
+;; threads that interleave in it draw the same number, which is the one thing
+;; gensym promises they cannot. Macros expand on whatever thread is compiling and
+;; namespaces load in parallel, so this is reachable, and it is the same defect
+;; the analyzer's gen-name has an atomic swap! for.
 (define jolt-gensym-counter 0)
+(define jolt-gensym-mutex (make-mutex))
 (define (jolt-gensym . prefix)
-  (let ((p (if (null? prefix) "G__" (car prefix))))
-    (set! jolt-gensym-counter (+ jolt-gensym-counter 1))
+  (let ((p (if (null? prefix) "G__" (car prefix)))
+        (n (jolt-with-mutex jolt-gensym-mutex
+             (set! jolt-gensym-counter (+ jolt-gensym-counter 1))
+             jolt-gensym-counter)))
     (jolt-symbol #f
                  (string-append (if (string? p) p (jolt-str-render-one p))
-                                (number->string jolt-gensym-counter)))))
+                                (number->string n)))))
 
 ;; a numeric type outside Chez's tower converts through this hook (bigdec).
 (define (jolt-double-slow x) (jolt-num-cast-throw x))

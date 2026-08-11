@@ -18,9 +18,27 @@
 ;; (any cell with that ns), so a namespace that only ever had vars def'd into it
 ;; is still found.
 (define ns-registry (make-hashtable string-hash string=?))
+;; ns-registry-mu covers every MUTATION of ns-registry and every WHOLE-TABLE scan
+;; of it, on the same split rt.ss spells out for var-table: a strong general
+;; hashtable is safe to probe for one key unlocked (a resize publishes a complete
+;; new bucket vector and never rewrites the old one, so the worst an unlocked
+;; reader sees is a stale miss), but hashtable-keys is not — it reads ht-size,
+;; allocates a vector of that length and walks the buckets bounded by both, so a
+;; concurrent intern truncates the result and a concurrent remove-ns leaves
+;; trailing FILL slots that the caller then hands to string-hash.
+;;
+;; Interning is double-checked for the same reason jolt-var is: two threads
+;; racing (create-ns 'foo) on a name that does not exist yet would otherwise each
+;; build their own jns, and find-ns would hand out two objects for one namespace.
+(define ns-registry-mu (make-mutex))
 (define (intern-ns! name)
   (or (hashtable-ref ns-registry name #f)
-      (let ((n (make-jns name))) (hashtable-set! ns-registry name n) n)))
+      (jolt-with-mutex ns-registry-mu
+        (or (hashtable-ref ns-registry name #f)
+            (let ((n (make-jns name))) (hashtable-set! ns-registry name n) n)))))
+;; The lock covers only the snapshot; callers walk the returned vector outside it.
+(define (ns-registry-names)
+  (jolt-with-mutex ns-registry-mu (hashtable-keys ns-registry)))
 (intern-ns! "user")
 (intern-ns! "clojure.core")
 
@@ -29,22 +47,40 @@
 ;; ns/foo. Keyed by (compile-ns . alias). The requires are pre-registered at
 ;; analyze time (compile-eval.ss) — analysis precedes eval, so a runtime require
 ;; no-op is fine. Also drives jolt-ns-aliases below.
+;; ns-map-mu covers every MUTATION of the alias / refer / refer-all / exclude
+;; tables below and every WHOLE-TABLE scan of them. The single-key READS stay
+;; unlocked and that is the whole design: chez-resolve-alias and
+;; chez-resolve-refer sit on the analyzer's symbol-resolution path, which runs
+;; per symbol per form, and a mutex there would be felt on every compile. It is
+;; sound for the same reason var-table's probe is (rt.ss): these are strong
+;; general hashtables, so a resize publishes a complete new bucket vector and an
+;; unlocked reader's worst case is a stale miss.
+;;
+;; The writers are require / use / ns-unalias, which run from whatever thread
+;; loads a namespace — an nREPL session and the main program at once, say — and
+;; unsynchronized inserts into one of these drop mappings, which surfaces as a
+;; symbol that will not resolve in a namespace that plainly refers it.
+(define ns-map-mu (make-mutex))
 (define ns-alias-table (make-hashtable equal-hash equal?))
 (define (chez-register-alias! cns alias target)
-  (hashtable-set! ns-alias-table (cons cns alias) target))
+  (jolt-with-mutex ns-map-mu (hashtable-set! ns-alias-table (cons cns alias) target)))
 (define (chez-resolve-alias cns alias)
   (hashtable-ref ns-alias-table (cons cns alias) #f))
 ;; :refer brings an UNQUALIFIED name into cns, resolving to target-ns/name.
 (define ns-refer-table (make-hashtable equal-hash equal?))
 (define (chez-register-refer! cns name target)
-  (hashtable-set! ns-refer-table (cons cns name) target))
+  (jolt-with-mutex ns-map-mu (hashtable-set! ns-refer-table (cons cns name) target)))
 ;; refer-all (a bare `use`): cns -> list of fully-referred target ns names. A name
 ;; not found per-name resolves to the first refer-all target that defines it.
 (define ns-refer-all-table (make-hashtable equal-hash equal?))
 (define (chez-register-refer-all! cns target)
-  (let ((cur (hashtable-ref ns-refer-all-table cns '())))
-    (unless (member target cur)
-      (hashtable-set! ns-refer-all-table cns (cons target cur)))))
+  ;; read-modify-write of a list, so it is one step: two threads `use`-ing
+  ;; different namespaces into one cns would otherwise each cons onto the value
+  ;; they read and the second write would drop the first's target.
+  (jolt-with-mutex ns-map-mu
+    (let ((cur (hashtable-ref ns-refer-all-table cns '())))
+      (unless (member target cur)
+        (hashtable-set! ns-refer-all-table cns (cons target cur))))))
 ;; :use with :exclude drops names from the refer-all set: (cns . target) ->
 ;; (name -> #t). An excluded name is skipped for that target in the refer-all
 ;; walk, so resolution falls through to an earlier refer-all target (or fails)
@@ -52,11 +88,12 @@
 (define ns-refer-all-exclude-table (make-hashtable equal-hash equal?))
 (define (chez-register-refer-all-excludes! cns target names)
   (when (pair? names)
-    (let ((h (or (hashtable-ref ns-refer-all-exclude-table (cons cns target) #f)
-                 (let ((h (make-hashtable string-hash string=?)))
-                   (hashtable-set! ns-refer-all-exclude-table (cons cns target) h)
-                   h))))
-      (for-each (lambda (n) (hashtable-set! h n #t)) names))))
+    (jolt-with-mutex ns-map-mu
+      (let ((h (or (hashtable-ref ns-refer-all-exclude-table (cons cns target) #f)
+                   (let ((h (make-hashtable string-hash string=?)))
+                     (hashtable-set! ns-refer-all-exclude-table (cons cns target) h)
+                     h))))
+        (for-each (lambda (n) (hashtable-set! h n #t)) names)))))
 (define (chez-refer-all-excluded? cns target name)
   (let ((h (hashtable-ref ns-refer-all-exclude-table (cons cns target) #f)))
     (and h (hashtable-ref h name #f) #t)))
@@ -185,8 +222,8 @@
 
 (define (jolt-all-ns)
   (let ((seen (make-hashtable string-hash string=?)))
-    (vector-for-each (lambda (k) (hashtable-set! seen k #t)) (hashtable-keys ns-registry))
-    (vector-for-each (lambda (c) (hashtable-set! seen (var-cell-ns c) #t)) (hashtable-values var-table))
+    (vector-for-each (lambda (k) (hashtable-set! seen k #t)) (ns-registry-names))
+    (vector-for-each (lambda (c) (hashtable-set! seen (var-cell-ns c) #t)) (var-table-cells))
     (list->cseq (map intern-ns! (vector->list (hashtable-keys seen))))))
 
 ;; ns-publics / ns-map / ns-interns: a {sym -> var-cell} jolt map built by scanning
@@ -194,7 +231,7 @@
 ;; var; ns-publics drops the ones marked ^:private (defn-/def ^:private), like the
 ;; JVM. ns-aliases is an empty map (map? is true).
 (define (var-private? c)
-  (let ((m (hashtable-ref var-meta-table c #f)))
+  (let ((m (var-cell-meta c)))
     (and m (jolt-truthy? (jolt-get m (keyword #f "private"))))))
 (define (ns-vars-pmap-when nm keep?)
   (let ((m (jolt-hash-map)))
@@ -202,7 +239,7 @@
       (lambda (c)
         (when (and (string=? (var-cell-ns c) nm) (var-cell-defined? c) (keep? c))
           (set! m (jolt-assoc m (jolt-symbol #f (var-cell-name c)) c))))
-      (hashtable-values var-table))
+      (var-table-cells))
     m))
 (define (ns-vars-pmap nm) (ns-vars-pmap-when nm (lambda (c) #t)))
 (define (jolt-ns-publics desig) (ns-vars-pmap-when (ns-desig->name desig) (lambda (c) (not (var-private? c)))))
@@ -218,7 +255,7 @@
         (when (string=? (car k) cns)
           (set! m (jolt-assoc m (jolt-symbol #f (cdr k))
                               (intern-ns! (hashtable-ref ns-alias-table k #f))))))
-      (hashtable-keys ns-alias-table))
+      (jolt-with-mutex ns-map-mu (hashtable-keys ns-alias-table)))
     m))
 
 ;; ns-refers: the {sym -> var} referred into `desig` via refer/use, plus the
@@ -243,7 +280,7 @@
            (let* ((target (hashtable-ref ns-refer-table k #f))
                   (c (and target (var-cell-lookup target (cdr k)))))
              (when c (set! m (jolt-assoc m (jolt-symbol #f (cdr k)) c))))))
-       (hashtable-keys ns-refer-table))
+       (jolt-with-mutex ns-map-mu (hashtable-keys ns-refer-table)))
      ;; refer-all: merge all public vars from :refer :all namespaces
      (let ((all-refs (hashtable-ref ns-refer-all-table cns #f)))
        (when all-refs
@@ -348,7 +385,7 @@
     (when c (var-cell-defined?-set! c #f)
             (var-cell-root-set! c (make-jolt-var-unbound (var-cell-ns c) (var-cell-name c))))
     ;; tombstone: block resolution of this name in this ns via refers/all
-    (hashtable-set! ns-refer-table (cons cns nm) 'unmapped))
+    (jolt-with-mutex ns-map-mu (hashtable-set! ns-refer-table (cons cns nm) 'unmapped)))
   jolt-nil)
 
 ;; --- ns runtime fns ---------------------------------------------------------
@@ -371,13 +408,17 @@
 (define (jolt-remove-ns desig)
   (let* ((nm (ns-desig->name desig))
          (n  (jolt-find-ns desig)))            ; the removed Namespace (JVM returns it), or nil
-    (hashtable-delete! ns-registry nm)
-    (hashtable-delete! ns-has-vars-set nm)  ; keep the O(1) index honest, else a
-                                            ; later require of nm would no-op
-    (vector-for-each
-      (lambda (k) (let ((c (hashtable-ref var-table k #f)))
-                    (when (and c (string=? (var-cell-ns c) nm)) (hashtable-delete! var-table k))))
-      (hashtable-keys var-table))
+    (jolt-with-mutex ns-registry-mu (hashtable-delete! ns-registry nm))
+    ;; the sweep is a var-table mutation, so it runs under rt.ss's var-table-mu
+    ;; like every other one — including the hashtable-keys snapshot, which would
+    ;; otherwise be taken while another thread interned into the table.
+    (jolt-with-mutex var-table-mu
+      (hashtable-delete! ns-has-vars-set nm)  ; keep the O(1) index honest, else a
+                                              ; later require of nm would no-op
+      (vector-for-each
+        (lambda (k) (let ((c (hashtable-ref var-table k #f)))
+                      (when (and c (string=? (var-cell-ns c) nm)) (hashtable-delete! var-table k))))
+        (hashtable-keys var-table)))
     n))
 
 ;; intern: create/set a var ns/sym to val (or an unbound cell). Returns the var.
@@ -391,7 +432,7 @@
     (let ((cell (if (pair? vopt) (def-var! nm s (car vopt)) (declare-var! nm s)))
           (m (jolt-meta sym)))
       (unless (jolt-nil? m)
-        (hashtable-set! var-meta-table cell m)
+        (var-cell-meta-set! cell m)
         (var-meta-sync-macro! cell m))
       cell)))
 
@@ -415,7 +456,8 @@
     (chez-register-alias! cns alias target)
     jolt-nil))
 (define (jolt-ns-unalias ns-desig alias-sym)
-  (hashtable-delete! ns-alias-table (cons (ns-desig->name ns-desig) (symbol-t-name alias-sym)))
+  (jolt-with-mutex ns-map-mu
+    (hashtable-delete! ns-alias-table (cons (ns-desig->name ns-desig) (symbol-t-name alias-sym))))
   jolt-nil)
 
 ;; refer: bring the public vars of `ns-sym` into the current ns as unqualified
@@ -441,7 +483,7 @@
           (let ((nm (var-cell-name c)))
             (when (and (or (not only) (member nm only)) (not (member nm excl)))
               (chez-register-refer! cns nm target)))))
-      (hashtable-values var-table))
+      (var-table-cells))
     jolt-nil))
 ;; (:refer-clojure :exclude [names…]) — clojure.core always resolves on Chez, so
 ;; the only thing to track is the EXCLUDE set: an excluded name is not
@@ -449,10 +491,11 @@
 ;; that excludes and defines its own, e.g. core.logic.fd's ==).
 (define ns-core-exclude-table (make-hashtable equal-hash equal?))  ; cns -> (name -> #t)
 (define (chez-register-core-exclude! cns name)
-  (let ((h (or (hashtable-ref ns-core-exclude-table cns #f)
-               (let ((h (make-hashtable string-hash string=?)))
-                 (hashtable-set! ns-core-exclude-table cns h) h))))
-    (hashtable-set! h name #t)))
+  (jolt-with-mutex ns-map-mu
+   (let ((h (or (hashtable-ref ns-core-exclude-table cns #f)
+                (let ((h (make-hashtable string-hash string=?)))
+                  (hashtable-set! ns-core-exclude-table cns h) h))))
+     (hashtable-set! h name #t))))
 (define (chez-core-excluded? cns name)
   (let ((h (hashtable-ref ns-core-exclude-table cns #f)))
     (and h (hashtable-ref h name #f) #t)))
@@ -491,7 +534,7 @@
               (seq->list names)))
   jolt-nil)
 
-;; alter-meta! / reset-meta!: a var's metadata lives in var-meta-table (rt.ss);
+;; alter-meta! / reset-meta!: a var's metadata lives in the cell's meta field;
 ;; any other reference (atom/agent/namespace) uses the identity meta side-table
 ;; jolt-meta reads. A truthy :macro in the new meta marks the var as a macro
 ;; (JVM parity: Var.isMacro reads meta), so re-export idioms that copy a macro's
@@ -500,12 +543,12 @@
 ;; defmacro vars derive :macro rather than storing it.
 (define (var-meta-sync-macro! cell m)
   (when (jolt-truthy? (jolt-get m jolt-kw-var-macro))
-    (hashtable-set! var-macro-table cell #t)))
+    (var-cell-macro?-set! cell #t)))
 (define (jolt-alter-meta! ref f . args)
   (if (var-cell? ref)
-      (let* ((cur (or (hashtable-ref var-meta-table ref #f) (jolt-hash-map)))
+      (let* ((cur (or (var-cell-meta ref) (jolt-hash-map)))
              (new (apply jolt-invoke f cur args)))
-        (hashtable-set! var-meta-table ref new)
+        (var-cell-meta-set! ref new)
         (var-meta-sync-macro! ref new)
         new)
       (let* ((cur (let ((m (jolt-meta ref))) (if (jolt-nil? m) (jolt-hash-map) m)))
@@ -515,7 +558,7 @@
 (define (jolt-reset-meta! ref m)
   (if (var-cell? ref)
       (begin
-        (hashtable-set! var-meta-table ref m)
+        (var-cell-meta-set! ref m)
         (var-meta-sync-macro! ref m))
       (meta-table-set! ref m))
   m)

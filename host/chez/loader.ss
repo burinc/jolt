@@ -147,7 +147,7 @@
      (let-values (((items changed) (ldr-conv-each (vector->list (pvec-v x)))))
        (if changed (rdr-carry-meta x (apply jolt-vector items)) x)))
     ((pmap? x)
-     (let ((order (hashtable-ref rdr-map-order x #f)))
+     (let ((order (rdr-map-order-ref x)))
        (if order
            (let-values (((kvs changed) (ldr-conv-each order)))
              (if changed (rdr-carry-meta x (rdr-make-map kvs)) x))
@@ -267,9 +267,13 @@
 ;; Seeded with every namespace that already has vars at load time — the baked
 ;; prelude/image (clojure.core, clojure.string, jolt.analyzer, …). A `require` of
 ;; one of those then no-ops instead of hunting for a (nonexistent) source file.
+;; ldr-tbl-mu covers every MUTATION of loaded-ns and of the AOT memos below, and
+;; every WHOLE-TABLE scan of them. Single-key reads stay unlocked (strong general
+;; hashtables — see rt.ss's var-table note for why that is sound).
+(define ldr-tbl-mu (make-mutex))
 (define loaded-ns (make-hashtable string-hash string=?))
 (vector-for-each (lambda (c) (hashtable-set! loaded-ns (var-cell-ns c) #t))
-                 (hashtable-values var-table))
+                 (var-table-cells))
 
 ;; clojure.core.async ships native channel primitives (async.ss) AND a Clojure
 ;; overlay (stdlib/clojure/core/async.clj) with the higher-level dataflow API
@@ -279,16 +283,66 @@
 ;; (like clojure.test); the primitives stay defined either way.
 (hashtable-delete! loaded-ns "clojure.core.async")
 
+;; *loaded-libs* is the other half of the loaded set: a clojure.lang.Ref that
+;; tools.namespace and core.typed conj/disj on, and that ns-dedup-loaded? below
+;; reads alongside loaded-ns. A bare read-modify-write of the ref field lost marks
+;; outright once two loads could overlap: both threads read the old set and the
+;; second store dropped the first's symbol, so a
+;; namespace that HAD loaded read as unloaded and ran its top level again on the
+;; next require — the very bug the load protocol below exists to stop, reached
+;; through the other table.
+;;
+;; A LOAD MUST NEVER ACQUIRE stm-lock. jolt-sync holds stm-lock across the whole
+;; body of a transaction (refs.ss), so (dosync (require 'x)) is inside require while
+;; holding it — and if that require parks in step 2, condition-wait releases
+;; ldr-load-mu and NOTHING else, so it sits there holding stm-lock until the load it
+;; is waiting for completes. A loading thread that then needed stm-lock could not
+;; complete, and the two would wait on each other forever:
+;;
+;;   stm-lock -> ns_load   the parked dosync cannot release stm-lock until the load
+;;                         it is waiting for finishes
+;;   ns_load  -> stm-lock  the loader cannot finish without stm-lock
+;;
+;; That is not hypothetical. It reproduces on the rollback path, where a failed load
+;; re-takes this lock to unmark before releasing its claim, and in the window between
+;; claiming a namespace and marking it. So the mark goes through a leaf mutex of our
+;; own that no transaction ever waits on, and the edge ns_load -> stm-lock does not
+;; exist.
+;;
+;; NOT through the ambient transaction's log when there is one, which is what this
+;; did first. It looks like the better answer — transactional, and it takes no lock
+;; at all — and it is wrong twice, because the mark is not the transaction's to own.
+;; A load either happened or it did not, and the file's defs are in the image either
+;; way; an abort that rolls the mark back leaves loaded-ns marked and *loaded-libs*
+;; not, which reads as unloaded and re-runs the whole namespace. And a buffered write
+;; is invisible to ns-dedup-loaded? until commit, so
+;; (dosync (require 'x) (require 'x)) ran x's top level twice.
+;;
+;; What the direct write leaves open is a mark landing while a user transaction that
+;; also writes *loaded-libs* is committing, which costs that namespace one extra
+;; reload. Narrow, one-directional, and the alternatives are a hang or the two bugs
+;; above.
+;;
+;; Call with NO loader mutex held either. A (dosync (require ...)) reaches ldr-tbl-mu
+;; while holding stm-lock, so the loader taking these in the other order would be the
+;; same cycle by another route. Sequential, never nested, is what keeps them apart.
+(define ldr-libs-mu (make-mutex))
+(define (ldr-libs-update! f)
+  (let* ((libs-cell (var-cell-lookup "clojure.core" "*loaded-libs*"))
+         (libs-ref (and libs-cell (var-cell-root libs-cell))))
+    (when (and libs-ref (jolt-ref? libs-ref))
+      (jolt-with-mutex ldr-libs-mu
+        (jolt-ref-val-set! libs-ref (f (jolt-ref-val libs-ref)))))))
+
 ;; Seed *loaded-libs* ref from the initial loaded-ns set (for tools.namespace
 ;; and core.typed which conj/disj on it).  Must happen after the async deletion.
-(let* ((libs-cell (var-cell-lookup "clojure.core" "*loaded-libs*"))
-       (libs-ref (and libs-cell (var-cell-root libs-cell))))
-  (when (and libs-ref (jolt-ref? libs-ref))
-    (vector-for-each
-      (lambda (k) (jolt-ref-val-set! libs-ref
-                     (pset-conj (jolt-ref-val libs-ref)
-                       (jolt-symbol #f k))))
-      (hashtable-keys loaded-ns))))
+(let ((ks (jolt-with-mutex ldr-tbl-mu (hashtable-keys loaded-ns))))
+  (ldr-libs-update!
+    (lambda (s)
+      (let loop ((i 0) (s s))
+        (if (fx=? i (vector-length ks))
+            s
+            (loop (fx+ i 1) (pset-conj s (jolt-symbol #f (vector-ref ks i)))))))))
 
 ;; ns-has-vars? (ns.ss) answers whether a namespace baked into the image after
 ;; the snapshot above — an AOT'd app namespace in a `jolt build` binary — exists
@@ -338,17 +392,13 @@
                           ((char=? (string-ref path i) #\/)
                            (substring path (+ i 1) (string-length path)))
                           (else (loop (- i 1)))))))
-        (dynamic-wind
-          (lambda ()
-            (let ((frame (list (cons ldr-file-cell path)
-                               (cons ldr-spath-cell name)
-                               (cons ldr-warn-cell (var-cell-root ldr-warn-cell))
-                               (cons ldr-assert-cell (var-cell-root ldr-assert-cell))
-                               (cons ldr-unchecked-cell
-                                     (var-cell-root ldr-unchecked-cell)))))
-              (dyn-binding-stack (cons frame (dyn-binding-stack)))))
-          thunk
-          (lambda () (dyn-binding-stack (cdr (dyn-binding-stack))))))))
+        (dyn-with-frame
+          (list (cons ldr-file-cell path)
+                (cons ldr-spath-cell name)
+                (cons ldr-warn-cell (var-cell-root ldr-warn-cell))
+                (cons ldr-assert-cell (var-cell-root ldr-assert-cell))
+                (cons ldr-unchecked-cell (var-cell-root ldr-unchecked-cell)))
+          thunk))))
 
 (define (load-jolt-file path)
   (load-jolt-file* path (ldr-read-source path)))
@@ -641,14 +691,26 @@
   (or (hashtable-ref aot-own-key-memo name #f)
       (let ((f (aot-cacheable-file name)))
         (and f (let ((k (aot-cache-key (ldr-read-source f))))
-                 (hashtable-set! aot-own-key-memo name k)
+                 (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-own-key-memo name k))
                  k)))))
 (define (aot-base-for-own name own) (string-append (aot-cache-subdir) "/"
                                                    (aot-cache-sanitize name) "-" own))
 ;; Fold the dep keys into one integer. Sorted, so the digest doesn't depend on the
 ;; order requires happened to be recorded in.
 (define aot-dep-digest-memo (make-hashtable string-hash string=?))
+;; The in-flight set is one walk's recursion stack — it exists only to stop
+;; aot-dep-digest recursing forever on a require cycle — so it is keyed by THREAD
+;; as well as namespace. Shared across threads it got the question wrong in both
+;; directions once unrelated namespaces could load in parallel: another thread's
+;; mark read here as a cycle and truncated this namespace's digest to its own
+;; hash, which is a different and wrong cache key (an edit two deps down no longer
+;; moves it, so a stale .so hits), and another thread's delete cleared the guard
+;; out from under a walk that really was cyclic, which then recursed until the
+;; stack gave out. Nothing is shared between the walks, so there is nothing here
+;; two threads need to agree on.
 (define aot-dep-inflight (make-hashtable string-hash string=?))
+(define (aot-inflight-key name)
+  (string-append (number->string (get-thread-id)) "\x0;" name))
 (define (aot-ns-digest name)
   ;; a namespace's whole contribution: its own hash folded with its deps'
   (let ((own (aot-own-key name)))
@@ -657,18 +719,20 @@
         (aot-hash-mix (equal-hash own) (aot-dep-digest name own)))))
 (define (aot-dep-digest name own)
   (or (hashtable-ref aot-dep-digest-memo name #f)
-      (if (hashtable-ref aot-dep-inflight name #f)
-          ;; a require cycle: stop at the namespace's own hash. Every namespace on
-          ;; the cycle still contributes it, so an edit anywhere still moves the key.
-          (equal-hash own)
-          (begin
-            (hashtable-set! aot-dep-inflight name #t)
-            (let* ((deps (sort string<? (aot-read-dep-list
-                                          (aot-dep-sidecar (aot-base-for-own name own)))))
-                   (d (fold-left (lambda (h dep) (aot-hash-mix h (aot-ns-digest dep))) 17 deps)))
-              (hashtable-delete! aot-dep-inflight name)
-              (hashtable-set! aot-dep-digest-memo name d)
-              d)))))
+      (let ((ik (aot-inflight-key name)))
+        (if (hashtable-ref aot-dep-inflight ik #f)
+            ;; a require cycle: stop at the namespace's own hash. Every namespace on
+            ;; the cycle still contributes it, so an edit anywhere still moves the key.
+            (equal-hash own)
+            (begin
+              (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-dep-inflight ik #t))
+              (let* ((deps (sort string<? (aot-read-dep-list
+                                            (aot-dep-sidecar (aot-base-for-own name own)))))
+                     (d (fold-left (lambda (h dep) (aot-hash-mix h (aot-ns-digest dep))) 17 deps)))
+                (jolt-with-mutex ldr-tbl-mu
+                  (hashtable-delete! aot-dep-inflight ik)
+                  (hashtable-set! aot-dep-digest-memo name d))
+                d))))))
 ;; The full cache base: own hash, then the dep digest. A namespace with no
 ;; recorded deps (or none cacheable) folds to the digest of the empty list, so the
 ;; suffix is constant for the whole leaf case rather than absent.
@@ -743,7 +807,7 @@
           (aot-write-dep-list! (aot-dep-sidecar (aot-base-for-own name own)) deps)
           ;; this run already computed a digest for `name` from the OLD sidecar;
           ;; drop it so a later require in the same process sees the new deps.
-          (hashtable-delete! aot-dep-digest-memo name)
+          (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-dep-digest-memo name))
           (guard (e (else (aot-info (string-append "compile failed for " name))
                           (delete-file tmp-scm #f) (delete-file tmp-so #f) #f))
             (let ((out (open-output-file tmp-scm 'replace)))
@@ -800,31 +864,32 @@
 
 ;; Mark a namespace as loaded in both the host hashtable and the *loaded-libs* ref.
 (define (ldr-mark-loaded! name)
-  (hashtable-set! loaded-ns name #t)
-  (let* ((libs-cell (var-cell-lookup "clojure.core" "*loaded-libs*"))
-         (libs-ref (and libs-cell (var-cell-root libs-cell))))
-    (when (and libs-ref (jolt-ref? libs-ref))
-      (jolt-ref-val-set! libs-ref
-        (pset-conj (jolt-ref-val libs-ref) (jolt-symbol #f name))))))
+  (jolt-with-mutex ldr-tbl-mu (hashtable-set! loaded-ns name #t))
+  (ldr-libs-update! (lambda (s) (pset-conj s (jolt-symbol #f name)))))
 
 ;; Undo ldr-mark-loaded! — a failed load rolls its mark back so a retry loads.
 (define (ldr-unmark-loaded! name)
-  (hashtable-delete! loaded-ns name)
-  (let* ((libs-cell (var-cell-lookup "clojure.core" "*loaded-libs*"))
-         (libs-ref (and libs-cell (var-cell-root libs-cell))))
-    (when (and libs-ref (jolt-ref? libs-ref))
-      (jolt-ref-val-set! libs-ref
-        (pset-disj (jolt-ref-val libs-ref) (jolt-symbol #f name))))))
+  (jolt-with-mutex ldr-tbl-mu (hashtable-delete! loaded-ns name))
+  (ldr-libs-update! (lambda (s) (pset-disj s (jolt-symbol #f name)))))
 
 ;; Has `name` cleared the loaded-ns / *loaded-libs* dedup? A tools.namespace disj
 ;; from *loaded-libs* forces a reload even though loaded-ns still holds.
+;;
+;; txn-read and not jolt-ref-val, because the disj this is here to honour is a USER
+;; write and a user writes a ref through the STM. tools.namespace disj'ing inside a
+;; (dosync …) should force the reload from the next form onward, not from the
+;; commit. Outside a transaction txn-read IS jolt-ref-val, so the ordinary path is
+;; unchanged, and it acquires nothing, so this stays safe to call under ldr-load-mu
+;; (see ldr-libs-update!'s "a load must never take stm-lock"). The loader's own
+;; marks are not in any log — ldr-libs-update! writes the ref directly, for the
+;; reasons set out there — so this sees them whether a transaction is open or not.
 (define (ns-dedup-loaded? name)
   (let* ((libs-cell (var-cell-lookup "clojure.core" "*loaded-libs*"))
          (libs-ref (and libs-cell (var-cell-root libs-cell))))
     (and (hashtable-ref loaded-ns name #f)
          (or (not libs-ref)
              (not (jolt-ref? libs-ref))
-             (jolt-contains? (jolt-ref-val libs-ref) (jolt-symbol #f name))))))
+             (jolt-contains? (txn-read libs-ref) (jolt-symbol #f name))))))
 
 ;; --- clojure.core/compile + *compile-path* -----------------------------------
 ;; Clojure's `compile` writes a namespace's compiled form under *compile-path* so a
@@ -956,10 +1021,7 @@
   (let ((cell (var-cell-lookup "clojure.core" "*compile-files*")))
     (if (not cell)
         (thunk)
-        (dynamic-wind
-          (lambda () (dyn-binding-stack (cons (list (cons cell #t)) (dyn-binding-stack))))
-          thunk
-          (lambda () (dyn-binding-stack (cdr (dyn-binding-stack))))))))
+        (dyn-with-frame (list (cons cell #t)) thunk))))
 
 ;; Publish under `dir`, borrowing the AOT cache's discipline: compile to a
 ;; pid-unique temp and rename(2) each file into place, .so last, so a concurrent
@@ -1053,6 +1115,281 @@
 (define ldr-reload-all? (make-thread-parameter #f))
 (define ldr-verbose? (make-thread-parameter #f))
 
+;; --- the load protocol (concurrent require) ---------------------------------
+;; Two threads requiring one namespace at once both used to pass the loaded-ns
+;; check and both run its top-level forms, double-running every def and side
+;; effect in the file. The mark-before-load below terminates a require CYCLE, but
+;; only re-entry on ONE thread — to another thread the mark just says "loaded"
+;; while the namespace is still half-built, which is worse than no dedup at all.
+;;
+;; This is JLS 12.4.2, the JVM's class-initialization procedure, over namespaces
+;; instead of classes. It is the design that fits: initialization here is
+;; dynamic, re-entrant, and allowed to be cyclic, which is exactly the shape the
+;; JLS procedure exists for. Its step 3 IS jolt's existing mark-before-load
+;; semantics, so nothing that works today changes; step 2 is the part that was
+;; missing. The steps, and where each one lives:
+;;
+;;   1. acquire the lock                          -> ldr-load-mu
+;;   2. in progress by ANOTHER thread: release,   -> condition-wait, then re-loop
+;;      block until notified, repeat
+;;   3. in progress by THIS thread: release and   -> 'recursive (a require cycle;
+;;      complete normally (recursive request)        the caller sees a partially
+;;                                                   loaded ns, as on the JVM)
+;;   4. already initialized: release, return      -> 'loaded
+;;   6. record in-progress-by-this-thread,        -> 'claimed, and the load then
+;;      release, and initialize WITHOUT the lock     runs unlocked
+;;  11. on success acquire, mark done, NOTIFY ALL -> ldr-end-load!
+;;  12. on failure jolt rolls the mark back so a  -> the guard in load-namespace*
+;;      retry can load, where the JVM marks the      (Clojure's behavior, and the
+;;      class permanently erroneous                  file's existing behavior)
+;;
+;; Per namespace and not one global lock, so unrelated namespaces load in parallel
+;; and a load that blocks only blocks threads wanting THAT namespace. Clojure went
+;; the other way — serialized-require is (locking RT/REQUIRE_LOCK (apply require
+;; args)) — but it is private and its own docstring calls it an "Interim function",
+;; and it serializes every load in the process. Go avoids the question entirely
+;; (package init is one goroutine, sequential, one package at a time, and import
+;; cycles are a compile error); none of that is available here.
+;;
+;; Loading in parallel means COMPILING in parallel, which the compiler had to be
+;; made safe for first: its emit-session scratch (the per-def cache cells and the
+;; hoisted constant pool) lived on one process-global unit and was swapped in and
+;; out around each def, so two threads emitting at once traded collectors and a
+;; namespace that compiled cleanly alone died with "variable _kc$81 is not bound".
+;; Those are thread-bound vars in backend_scheme now, the analyzer's position box is
+;; per compilation, and its gensym counter reads and bumps in one swap!. See
+;; test/chez/concurrent-require.clj, which loads distinct namespaces in parallel for
+;; exactly this reason.
+;;
+;; The JVM's own hazard is that two threads entering a genuine require cycle from
+;; opposite ends deadlock — spec-conformant, and OpenJDK closed JDK-8037567 and
+;; two earlier reports as won't fix. We do not have to inherit the hang: the
+;; owner of each in-flight load is already recorded, so ldr-wait-cycle walks the
+;; wait-for graph and we raise instead. That changes nothing for a program that
+;; works today; it only turns an undiagnosable hang into an error that names both
+;; namespaces and both threads.
+;;
+;; Ownership is by EXECUTION CONTEXT — the fiber when a fiber is loading, the
+;; thread id otherwise (ldr-load-ctx) — which is what makes step 3 a cycle break
+;; rather than a self-deadlock, and it survives a park: a fiber is pinned to its
+;; carrier for life (R0(d)), so a load that parks resumes as the same context and
+;; load-namespace* deliberately keeps the claim across the park rather than
+;; treating the escape as an exit.
+;;
+;; A load CAN park. (require 'x) from a go block on the :fiber backend, where x's
+;; top level does a blocking channel op, is the shape, and it is the only way one
+;; context ever observes another's claim on one carrier — same-carrier fibers do
+;; not run concurrently. Everyone else wanting x then waits in step 2 until the
+;; fiber comes back and finishes, which is the right answer and better than the
+;; pre-protocol behaviour (they read the mark-before-load and returned with x
+;; half-built).
+;;
+;; Thread id alone was not enough for that, because two fibers on one carrier share
+;; one: a sibling fiber read the parked load's claim as its own, took step 3, and
+;; returned with x half-loaded and no error. Nor is it enough to make a sibling
+;; wait, because the wait itself has to be a PARK — a condition-wait would block the
+;; carrier the parked load needs in order to finish. ldr-wait-for-load! picks the
+;; mechanism from the waiter, and the cycle walk keys on the context, so two fibers
+;; deadlocking over each other's loads is reported like any other cycle instead of
+;; hanging.
+;;
+;; One behaviour improves as a side effect: :reload-all over a require cycle used
+;; to recurse forever, because it turns the dedup off for the whole extent and
+;; the mark was then no longer a stopping condition. Step 3 stops it.
+;;
+;; WHAT IS ACTUALLY PROVED, and what each proof rests on. Every transition below
+;; happens under ldr-load-mu, which is what makes single-step reasoning sound: no
+;; other thread can change ldr-loading or ldr-waiting between a check and the write
+;; that follows it.
+;;
+;;   Mutual exclusion   pc = in-body implies you own the claim. Inductive over every
+;;                      transition (claim, wait, recursive, end, escape, re-enter).
+;;                      This is why ldr-assert-claim! refuses re-entry instead of
+;;                      re-taking the claim: re-taking it is a single step that
+;;                      breaks the invariant, putting two threads in one load body.
+;;   No lost wakeup     a blocked waiter always has an owner left to wake it. Rests
+;;                      on the wait committing before the lock drops — condition-wait
+;;                      releases ldr-load-mu atomically with blocking, and a fiber's
+;;                      park sets 'parked and captures its continuation while the
+;;                      lock is still held — so no ldr-end-load! fits between the
+;;                      owner check and the wait, and on ldr-end-load! broadcasting
+;;                      AND resuming from dynamic-wind's after thunk, which runs on
+;;                      every exit. The LOADER's own park is not an exit and is
+;;                      skipped there, which keeps the property rather than weakening
+;;                      it: the owner is still recorded, still the same context, and
+;;                      still on its way back to finish the load and wake everyone.
+;;   Cycle detection    ldr-wait-cycle fires on exactly the waits that would
+;;                      deadlock: it never misses a cycle and never raises on a
+;;                      graph that would still have made progress. Rests on the
+;;                      wait-for graph being FUNCTIONAL (one namespace per blocked
+;;                      context, one owner per namespace) and on the pre-state being
+;;                      acyclic, which holds because every earlier wait was checked.
+;;   No deadlock        the lock graph is acyclic. The one edge that is not the
+;;                      loader's to remove is stm-lock -> the load a parked
+;;                      transaction is waiting for, because jolt-sync holds
+;;                      stm-lock across a whole dosync body. So no load may acquire
+;;                      stm-lock — see ldr-libs-update!, where that cycle was real
+;;                      and hung.
+(define ldr-load-mu (make-mutex))
+(define ldr-load-cv (make-condition))
+(define ldr-loading (make-hashtable string-hash string=?))  ; ns -> the context loading it
+(define ldr-waiting (make-eqv-hashtable))                   ; context -> ns it waits on
+(define ldr-fiber-waiters (make-hashtable string-hash string=?))  ; ns -> parked fibers
+
+;; --- who a load belongs to ---------------------------------------------------
+;; The FIBER when a fiber is loading, and the thread id otherwise. Thread id alone
+;; was wrong in both directions once a load could park, because two fibers on one
+;; carrier share one. Fiber A's load parks; fiber B on the same carrier requires the
+;; same namespace, reads A's claim as its own, takes step 3 and returns with the
+;; namespace half-loaded, silently. A fiber is the finer identity and it is the right
+;; one: step 3 asks "am I already inside this load", and the answer is per execution,
+;; not per OS thread. It is only ever compared and used as a table key, never
+;; dereferenced, so nothing here depends on the fiber record's shape.
+;;
+;; Same-carrier fibers never run concurrently, so B can only ever observe A's claim
+;; while A is PARKED — this is the parked-load case and nothing else.
+(define (ldr-load-ctx) (or (jolt-current-fiber) (get-thread-id)))
+(define (ldr-ctx-str ctx)
+  (if (jolt-fiber? ctx) "a fiber" (string-append "thread " (number->string ctx))))
+
+;; Wait for the load of `name` to end. Call with ldr-load-mu HELD; returns with it
+;; held again, and the caller re-checks — a wakeup is "something changed", never
+;; "the namespace is yours".
+;;
+;; A fiber must not use the condition variable. condition-wait blocks the CARRIER
+;; thread, and the load it is waiting for is very likely parked on that same carrier
+;; (see above), so blocking there is a deadlock, and even when the owner is on
+;; another thread it stalls every unrelated fiber the carrier is running. It parks
+;; instead, and ldr-end-load! resumes it.
+;;
+;; The park is committed while the mutex is still held — jolt-fiber-park! sets
+;; 'parked and captures the continuation, and only the escape past with-mutex's
+;; dynamic-wind releases the lock — so ldr-end-load! cannot run between the
+;; registration and the park, and there is no wakeup to lose. The resume then
+;; re-acquires through the same dynamic-wind's before thunk. That release-on-park /
+;; re-acquire-on-resume is the one thing here that leans on with-mutex being a
+;; dynamic-wind: it is what makes a park inside this critical section safe, and it is
+;; the opposite of what load-namespace*'s own after thunk wants, which is why that
+;; one asks jolt-park-unwinding? and this one must not.
+(define (ldr-wait-for-load! name)
+  (let ((f (jolt-current-fiber)))
+    (if f
+        (begin
+          (hashtable-set! ldr-fiber-waiters name
+                          (cons f (hashtable-ref ldr-fiber-waiters name '())))
+          (jolt-fiber-park!))
+        (condition-wait ldr-load-cv ldr-load-mu))))
+
+;; Call with ldr-load-mu HELD. Would `me` waiting on `name` (owned by `owner`) close
+;; a cycle? Follow owner -> what it waits on -> who owns that -> …; if the chain
+;; reaches `me`, everyone in it is waiting on everyone else. Returns the chain as a
+;; list of (context . ns-it-waits-on) in wait order, or #f if there is no cycle — the
+;; error names every context in it, because a cycle of three reported as two sends
+;; you looking for a two-namespace cycle that isn't there. Bounded so a table
+;; mutated under us can never spin.
+;;
+;; Contexts and not thread ids, which is what extends this to fibers: two fibers on
+;; one carrier that park mid-load waiting on each other are a genuine cycle, and
+;; keyed by thread id they collided in ldr-waiting and the walk could not see it.
+(define (ldr-wait-cycle owner me)
+  (let loop ((t owner) (n 0) (acc '()))
+    (and (fx< n 256)
+         (let ((w (hashtable-ref ldr-waiting t #f)))
+           (and w
+                (let ((o (hashtable-ref ldr-loading w #f))
+                      (acc (cons (cons t w) acc)))
+                  (and o (if (eqv? o me) (reverse acc) (loop o (fx+ n 1) acc)))))))))
+
+;; "thread 3 waits on a/b (held by thread 5), thread 5 waits on …" — the wait-for
+;; chain the caller is about to close, rendered in the order it was walked. Fibers
+;; render as "a fiber" rather than being numbered; the namespaces are what names the
+;; cycle, and a fiber has no id to print.
+(define (ldr-wait-chain-str chain)
+  (let loop ((c chain) (out ""))
+    (if (null? c)
+        out
+        (loop (cdr c)
+              (string-append out (if (string=? out "") "" ", ")
+                             (ldr-ctx-str (caar c))
+                             " waits on " (cdar c))))))
+
+;; -> 'loaded | 'recursive | 'claimed. Steps 1-6.
+(define (ldr-begin-load! name force?)
+  (let ((me (ldr-load-ctx)))
+    (jolt-with-mutex ldr-load-mu
+      (let loop ()
+        (let ((owner (hashtable-ref ldr-loading name #f)))
+          (cond
+            ((and owner (eqv? owner me)) 'recursive)          ; step 3
+            (owner                                            ; step 2
+             (let ((chain (ldr-wait-cycle owner me)))
+               (when chain
+                 (throw-jvm (quote IllegalStateException)
+                   (string-append
+                     "Deadlocked require: " (ldr-ctx-str me)
+                     " is about to wait on " name " (held by "
+                     (ldr-ctx-str owner) "), and " (ldr-wait-chain-str chain)
+                     ", which closes back on " (ldr-ctx-str me) ". "
+                     (number->string (fx+ 1 (length chain)))
+                     " loads entered a require cycle from different ends; break"
+                     " the cycle or require these namespaces from one thread."))))
+             (hashtable-set! ldr-waiting me name)
+             (ldr-wait-for-load! name)
+             (hashtable-delete! ldr-waiting me)
+             (loop))
+            ((and (not force?) (not (ldr-reload-all?)) (ns-dedup-loaded? name))
+             'loaded)                                         ; step 4
+            (else (hashtable-set! ldr-loading name me)        ; step 6
+                  'claimed)))))))
+
+;; Step 11: drop the claim and wake everyone waiting on this namespace. Broadcast
+;; and not signal — the waiters re-check a condition that may not be true for all
+;; of them (a failed load leaves the namespace unloaded, and exactly one of them
+;; should go on to claim it). Parked fibers are woken the same way and for the same
+;; reason: resume them all and let them re-check.
+;;
+;; Both under the lock, so a waiter that has registered but not yet parked cannot be
+;; missed — it registered with the lock held and stays committed to the park until
+;; the escape drops it. The list is cleared as it is drained, so a fiber that goes
+;; on to wait again registers itself afresh and no resume is ever delivered twice.
+;; sa-fiber-resume takes only its carrier's run-queue mutex, which is the last lock
+;; in the order, so calling it from here closes no cycle.
+(define (ldr-end-load! name)
+  (jolt-with-mutex ldr-load-mu
+    (hashtable-delete! ldr-loading name)
+    (let ((fs (hashtable-ref ldr-fiber-waiters name '())))
+      (unless (null? fs)
+        (hashtable-delete! ldr-fiber-waiters name)
+        (for-each sa-fiber-resume fs)))
+    (condition-broadcast ldr-load-cv)))
+
+;; The dynamic-wind before thunk below: the claim must be ours. On first entry it is,
+;; because ldr-begin-load! has just set it, so this is a check and nothing more.
+;;
+;; It re-runs if a continuation captured inside a load escapes and is then re-entered.
+;; A PARK is that, and it is not an exit — the after thunk below keeps the claim
+;; across one, so the resumed load still owns it and this passes.
+;;
+;; Any OTHER re-entry is refused. Re-taking the claim unconditionally looks like the
+;; natural mirror of dropping it on the way out, and it is wrong: the load has ended
+;; by then and another thread can own the namespace, so the re-entering thread would
+;; take the claim out from under a thread that is running the body, and both would be
+;; in it at once. There is no version of that re-entry that keeps "in the body implies
+;; you hold the claim" true, so it is refused rather than papered over.
+(define (ldr-assert-claim! name)
+  (let ((me (ldr-load-ctx)))
+    (jolt-with-mutex ldr-load-mu
+      (let ((owner (hashtable-ref ldr-loading name #f)))
+        (unless (eqv? owner me)
+          (throw-jvm (quote IllegalStateException)
+            (string-append
+              "Re-entered the load of " name " on " (ldr-ctx-str me)
+              ", which no longer holds its claim ("
+              (if owner (string-append (ldr-ctx-str owner) " does")
+                  "the load has already ended")
+              "). A continuation captured inside a load cannot be resumed; the"
+              " namespace would be loaded twice at once.")))))))
+
 ;; load-namespace: load `name`'s source once. Marked loaded BEFORE eval so a
 ;; dependency cycle terminates (Clojure's behavior). force? (a :reload of the
 ;; named lib) bypasses the dedup for THIS load only; ldr-reload-all? bypasses it
@@ -1061,61 +1398,116 @@
 ;; matching Clojure, which marks a lib loaded only after success.
 (define (load-namespace name) (load-namespace* name #f))
 (define (load-namespace* name force?)
-  (let ((was-loaded? (ns-dedup-loaded? name)))
-    (unless (and (not force?) (not (ldr-reload-all?)) was-loaded?)
-      ;; A compiled artifact on the roots wins over the source, like RT.load
-      ;; preferring a .class to its .clj. :reload does NOT bypass it, also like the
-      ;; JVM: the artifact is only offered here when it still matches the source it
-      ;; was built from, so there is nothing stale for a reload to get past.
-      (let* ((file (find-ns-file name))
-             (art (cpath-find-artifact name)))
-        (cond
-          ((or art file)
-           (when (ldr-verbose?)
-             (display (string-append "Loading " name " from " (or art file) "\n")
-                      (current-error-port)))
-           (ldr-mark-loaded! name)            ; mark before load so a cycle terminates
-           (let ((saved (chez-current-ns)))
+  ;; steps 1-6 above: 'loaded and 'recursive are both "complete normally, do
+  ;; nothing"; only 'claimed means this thread owns the load and must run it.
+  (when (eq? 'claimed (ldr-begin-load! name force?))
+    ;; read AFTER claiming, not before: while this thread was waiting in step 2
+    ;; another may have loaded the namespace and then had its own load fail, and
+    ;; a stale #t here would make the guard below skip the rollback.
+    (let ((was-loaded? (ns-dedup-loaded? name))
+          (finished? #f))
+      ;; step 11/12: drop the claim and wake the waiters on EVERY exit. dynamic-wind
+      ;; and not a guard: a guard only sees a raise, and any other way out of the
+      ;; body — a continuation escaping the load — would leave the claim standing,
+      ;; which is a namespace no other thread can ever load and no error to say why.
+      ;; The inner guard in ldr-load-body still rolls the mark back and re-raises, so
+      ;; the throw path is unchanged.
+      ;;
+      ;; A PARK is the one escape that is not an exit, and it has to be told apart
+      ;; from the others. A fiber whose load parks — a top-level (<!! ch) in a
+      ;; namespace required from a go block on the :fiber backend — comes back and
+      ;; carries the load on from the park point, on the SAME thread, because R0(d)
+      ;; pins a fiber to its carrier for life. Treating that as an exit dropped the
+      ;; claim, woke the waiters onto a half-built namespace, and then made the
+      ;; resume die in ldr-assert-claim! with the mark still standing and the
+      ;; rollback stranded in the abandoned guard — so the namespace was wedged
+      ;; loaded-but-empty for the life of the process and every later require of it
+      ;; no-op'd. jolt-park-unwinding? answers that question: cleanup belonging to
+      ;; the real exit does not run on a park.
+      ;;
+      ;; jolt's own try/finally used to consult the same flag and no longer does.
+      ;; The back end now emits a shared marker (values.ss jolt-finally-in) as
+      ;; every finally's before-thunk and the scheduler drops those winders off
+      ;; the chain before it escapes, so a finally never runs on a park in the
+      ;; first place. That trick is not available here, because THIS wind needs a
+      ;; before-thunk of its own: ldr-assert-claim! has to re-run when the fiber
+      ;; resumes. A winder that must rewind cannot be dropped, so it stays on the
+      ;; chain and asks instead. It is the only such site left.
+      ;;
+      ;; And when it IS the real exit, a body that neither finished nor raised
+      ;; (a continuation escaping the load for good) never reached ldr-load-body's
+      ;; guard, so the mark is rolled back here instead. Idempotent against the
+      ;; guard's own rollback on the throw path.
+      (dynamic-wind
+        (lambda () (ldr-assert-claim! name))
+        (lambda () (ldr-load-body name force? was-loaded?) (set! finished? #t))
+        (lambda ()
+          (unless (jolt-park-unwinding?)
+            (unless (or finished? was-loaded?) (ldr-unmark-loaded! name))
+            (ldr-end-load! name)))))))
+
+;; The load itself, run by the one thread that claimed it (never concurrently for
+;; a given name, and never re-entered for it on this thread).
+(define (ldr-load-body name force? was-loaded?)
+  ;; A compiled artifact on the roots wins over the source, like RT.load
+  ;; preferring a .class to its .clj. :reload does NOT bypass it, also like the
+  ;; JVM: the artifact is only offered here when it still matches the source it
+  ;; was built from, so there is nothing stale for a reload to get past.
+  (let* ((file (find-ns-file name))
+         (art (cpath-find-artifact name)))
+    (cond
+      ((or art file)
+       (when (ldr-verbose?)
+         (display (string-append "Loading " name " from " (or art file) "\n")
+                  (current-error-port)))
+       (ldr-mark-loaded! name)            ; mark before load so a cycle terminates
+       (let ((saved (chez-current-ns)))
+         ;; the ns restore is on the way out, not written twice on the two paths
+         ;; that used to reach it — a load leaving *ns* pointing at the file it was
+         ;; part way through is the kind of damage that surfaces three forms later
+         ;; somewhere else, so it happens however the body exits.
+         (dynamic-wind
+           (lambda () #f)
+           (lambda ()
              (guard (e (else
-                         (set-chez-ns! saved)          ; restore ns, then roll the mark back
-                         (unless was-loaded? (ldr-unmark-loaded! name))
+                         (unless was-loaded? (ldr-unmark-loaded! name)) ; roll the mark back
                          (raise e)))
-                (cond
-                  (art (load (cpath-so-file art)))
-                  ;; inside a compile, loading from source also emits the artifact
-                  ;; — RT.load's COMPILE_FILES branch, which is what carries a
-                  ;; compile through to the whole load closure.
-                  ((cpath-compiling-dir file)
-                   => (lambda (dir) (cpath-compile-load name file dir)))
-                  (else (aot-load-or-compile name file force?))))
-              (set-chez-ns! saved)             ; restore the current ns (thread-local)
-              ;; the hook feeds `jolt build`, which needs the SOURCE path; an
-              ;; artifact-only namespace has none to give.
-              (ns-loaded-hook name (or file art))))
-          ;; No source file but the namespace exists in memory (AOT'd into a built
-          ;; binary): it's already defined — mark loaded and move on.
-          ((ns-has-vars? name)
-           (ldr-mark-loaded! name))
-          ;; Same-file namespace (inlined ns form in a Jolt file): registered via
-          ;; intern-ns! in the runtime registry even if no vars bear its ns name yet.
-          ((hashtable-ref ns-registry name #f)
-           (ldr-mark-loaded! name))
-          (else
-            (let ((art (cpath-any-artifact name)))
-              (throw-jvm (quote java.io.FileNotFoundException)
-                (string-append "Could not locate " (ns-name->rel name)
-                               ".jolt (or .clj/.cljc) on the source roots"
-                               (cond
-                                 ((not art) "")
-                                 ;; a build asked for source and there is only an
-                                 ;; artifact — say that, rather than blame the artifact
-                                 ((ldr-source-only?)
-                                  (string-append "; only the compiled " (cpath-so-file art)
-                                                 " is there, and a build emits from source"))
-                                 (else
-                                   (string-append "; " (cpath-so-file art)
-                                                  " was compiled by a different jolt build, or"
-                                                  " a namespace it requires has changed — recompile it"))))))))))))
+               (cond
+                 (art (load (cpath-so-file art)))
+                 ;; inside a compile, loading from source also emits the artifact
+                 ;; — RT.load's COMPILE_FILES branch, which is what carries a
+                 ;; compile through to the whole load closure.
+                 ((cpath-compiling-dir file)
+                  => (lambda (dir) (cpath-compile-load name file dir)))
+                 (else (aot-load-or-compile name file force?)))))
+           (lambda () (set-chez-ns! saved)))   ; the current ns is thread-local
+         ;; the hook feeds `jolt build`, which needs the SOURCE path; an
+         ;; artifact-only namespace has none to give.
+         (ns-loaded-hook name (or file art))))
+      ;; No source file but the namespace exists in memory (AOT'd into a built
+      ;; binary): it's already defined — mark loaded and move on.
+      ((ns-has-vars? name)
+       (ldr-mark-loaded! name))
+      ;; Same-file namespace (inlined ns form in a Jolt file): registered via
+      ;; intern-ns! in the runtime registry even if no vars bear its ns name yet.
+      ((hashtable-ref ns-registry name #f)
+       (ldr-mark-loaded! name))
+      (else
+        (let ((art (cpath-any-artifact name)))
+          (throw-jvm (quote java.io.FileNotFoundException)
+            (string-append "Could not locate " (ns-name->rel name)
+                           ".jolt (or .clj/.cljc) on the source roots"
+                           (cond
+                             ((not art) "")
+                             ;; a build asked for source and there is only an
+                             ;; artifact — say that, rather than blame the artifact
+                             ((ldr-source-only?)
+                              (string-append "; only the compiled " (cpath-so-file art)
+                                             " is there, and a build emits from source"))
+                             (else
+                               (string-append "; " (cpath-so-file art)
+                                              " was compiled by a different jolt build, or"
+                                              " a namespace it requires has changed — recompile it"))))))))))
 
 ;; load-file: load an explicit path (a `run FILE`), in the current ns.
 (define (jolt-load-file path)

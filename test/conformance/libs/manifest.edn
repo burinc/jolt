@@ -296,11 +296,11 @@
 
   {:name "Selmer"
    :paths ["src" "test" "resources"]
-   ;; jolt-crypto supplies java.security.MessageDigest, which the hash: filter
+   ;; jolt-lang/crypto supplies java.security.MessageDigest, which the hash: filter
    ;; calls — the JVM has it built in, jolt gets it from the library. It goes on as
    ;; a real dependency, not a source path, so its :jolt/native libcrypto is loaded.
    :deps ["@data.json/src/main/clojure" "~time/src"]
-   :local-deps ["~jolt-crypto"]
+   :local-deps ["~crypto"]
    ;; core_test does (:require [cheshire.core :refer :all]). Selmer's own source
    ;; resolves cheshire -> data.json -> jsonista at load and is fine on data.json,
    ;; but the test names cheshire outright, and real cheshire wraps Jackson. The
@@ -404,7 +404,7 @@
            "ring-core/test"]
    :test-paths ["ring-core/test"]
    :deps ["@ring-codec/src" "~time/src" "~multipart/src"]
-   :local-deps ["~jolt-crypto"]
+   :local-deps ["~crypto"]
    :extra-deps {crypto-random/crypto-random {:mvn/version "1.2.1"}
                 crypto-equality/crypto-equality {:mvn/version "1.0.1"}}
    ;; The two session/cookie suites are written against clj-time, which is Joda —

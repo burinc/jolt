@@ -412,7 +412,26 @@
          (loop (guard (e (#t #f)) (hc-expand-1 ctx f)) (+ n 1)))
         (else #f)))))
 
-;; Compile + eval ONE already-read form in compile ns `ns`; returns the value.
+;; Compile + eval ONE already-read form in ns `ns`; returns the value.
+;;
+;; `ns` is the form's namespace for BOTH halves of the job: unqualified symbols
+;; are analyzed against it, and the runtime current ns is pointed at it too, so
+;; *ns*, resolve, macroexpand, and anything a macro reads through them agree with
+;; the ns the form compiled in. They used to be able to disagree — the analyzer
+;; took `ns` and the runtime kept whatever the last load left behind — which made
+;; a runtime (defmacro …) intern into `ns` and then be invisible to the very
+;; resolve/macroexpand that would have to find it.
+;;
+;; The switch is NOT restored on the way out. That is deliberate and it is what
+;; makes an (ns …) work: a form is allowed to move the current ns and have the
+;; move outlive it, which is how the loader threads one file's ns through the
+;; rest of that file, and how (eval '(in-ns 'foo)) lands you in foo. A caller
+;; that wants the ambient ns back saves and restores around the call, the way
+;; Clojure's load binds *ns* to itself — ldr-require-ns does, per file. The build
+;; walks (build.ss, emit-image.ss ei-for-each-form) set the ns themselves before
+;; walking a namespace's forms and want it to stay set, so for them this is a
+;; write of the value that is already there.
+;;
 ;; A top-level (do ...) is UNROLLED — each subform compiled+eval'd in turn, like
 ;; Clojure's top-level do — so a runtime defmacro/def in an earlier subform is
 ;; visible (macro flag set, var interned) before a later subform is analyzed.
@@ -427,6 +446,12 @@
       (jolt-compile-eval-form* form ns)
       form))
 (define (jolt-compile-eval-form* form ns)
+  ;; Written with set-chez-ns! and guarded by a difference test, so this is
+  ;; exactly what an (in-ns …) in the form itself would do — including the one
+  ;; case where it does nothing: under a (binding [*ns* …]) the current ns
+  ;; DERIVES from that binding (multimethods.ss chez-current-ns), the caller
+  ;; passed it as `ns` in the first place, and the test is already false.
+  (unless (string=? ns (chez-current-ns)) (set-chez-ns! ns))
   (cond
     ;; thread the current ns: an earlier subform may switch it (ns/in-ns call
     ;; set-chez-ns!), and the next subform must be ANALYZED in that ns so its defs

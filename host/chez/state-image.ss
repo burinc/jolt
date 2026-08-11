@@ -82,7 +82,7 @@
                                                        acc))))))
                                  chain)))
              (v (list->vector fields)))
-        (with-mutex image-record-fields-mutex
+        (jolt-with-mutex image-record-fields-mutex
           (hashtable-set! image-record-fields-tbl rtd v))
         v)))
 ;; A field read that answers #f rather than escaping: an opaque or uninitialized
@@ -158,9 +158,15 @@
                      (when (fx<? i n)
                        (walk (pvec-nth-d x i jolt-nil) (cons (number->string i) path))
                        (loop (fx+ i 1))))))
+                ;; root AND meta: meta is a FIELD of the cell (rt.ss), so fasl-write
+                ;; sees it, so the walk has to. Skipping it let (def ^{:test (fn …)} v)
+                ;; scan clean and then fail the dump on the very same graph, with no
+                ;; path to name — and ^{:test fn} is where deftest puts a test body.
                 ((var-cell? x)
-                 (walk (var-cell-root x)
-                       (cons (string-append "#'" (var-cell-ns x) "/" (var-cell-name x)) path)))
+                 (let ((vp (string-append "#'" (var-cell-ns x) "/" (var-cell-name x))))
+                   (walk (var-cell-root x) (cons vp path))
+                   (let ((m (var-cell-meta x)))
+                     (when m (walk m (cons (string-append vp " meta") path))))))
                 ;; cover val + watches + validator — everything fasl-write sees
                 ((jolt-atom? x)
                  (walk (jolt-atom-val x) (cons "@" path))
@@ -218,7 +224,7 @@
       (h (list 'handler (jolt-invoke (cadr h) x)))
       ((keyword? x) (list 'kw (keyword-t-ns x) (keyword-t-name x)))
       ((procedure? x)
-       (let ((p (hashtable-ref proc-name-tbl x #f)))
+       (let ((p (proc-name-of x)))
          ;; A named fn travels as its var's name. A bare closure has no stable
          ;; identity to write, so it is refused here and reported with its path.
          (and p (list 'fn-ref (car p) (cdr p)))))
@@ -449,7 +455,7 @@
 ;; of the rules.
 (define (image-proc-verdict x)
   (cond
-    ((hashtable-ref proc-name-tbl x #f) 'fn-ref)
+    ((proc-name-of x) 'fn-ref)
     (else (or (image-fnsrc-probe x) 'refuse))))
 
 ;; Recover the LIVE captured values, in REGISTERED free-name order, by munging
@@ -892,21 +898,35 @@
                             (walk (pvec-nth-d x i jolt-nil) (cons (number->string i) path))
                             (loop (fx+ i 1))))
                         #t)))))
+             ;; root AND meta, on both paths. meta is a FIELD of the cell (rt.ss), so
+             ;; fasl-write sees it and the walk has to reach it — same parity rule as
+             ;; the atom below. The rebuilt cell takes the WALKED meta, so a stub or a
+             ;; handled payload inside it is rebuilt like any other reachable value;
+             ;; installing the original would have carried the source graph's objects
+             ;; into the rebuilt one.
              (walk-var-cell
               (lambda (x path)
-                (if (image-rebuild-mode? mode)
-                    (let ((nx (make-var-cell (var-cell-ns x) (var-cell-name x)
-                                             jolt-nil (var-cell-defined? x))))
-                      (hashtable-set! memo x nx)
-                      (var-cell-root-set! nx
-                        (walk (var-cell-root x)
-                              (cons (string-append "#'" (var-cell-ns x) "/" (var-cell-name x)) path)))
-                      nx)
-                    (begin
-                      (hashtable-set! memo x #t)
-                      (walk (var-cell-root x)
-                            (cons (string-append "#'" (var-cell-ns x) "/" (var-cell-name x)) path))
-                      #t))))
+                (let* ((vp (string-append "#'" (var-cell-ns x) "/" (var-cell-name x)))
+                       (mp (cons (string-append vp " meta") path))
+                       (m (var-cell-meta x)))
+                  (if (image-rebuild-mode? mode)
+                      ;; dyn-bound? is NOT carried over: it is a per-process
+                      ;; observation ("someone bound this var here"), not part of
+                      ;; the var's value, and a rebuilt cell has had no bindings.
+                      ;; Copying it in would only cost the rebuilt var its fast
+                      ;; read path, never break it.
+                      (let ((nx (make-var-cell (var-cell-ns x) (var-cell-name x)
+                                               jolt-nil (var-cell-defined? x)
+                                               #f (var-cell-macro? x) #f)))
+                        (hashtable-set! memo x nx)
+                        (var-cell-root-set! nx (walk (var-cell-root x) (cons vp path)))
+                        (var-cell-meta-set! nx (and m (walk m mp)))
+                        nx)
+                      (begin
+                        (hashtable-set! memo x #t)
+                        (walk (var-cell-root x) (cons vp path))
+                        (when m (walk m mp))
+                        #t)))))
              ;; cover val + watches + validator — everything fasl-write sees
              ;; (the scan/dump parity fix)
              (walk-atom
@@ -1372,7 +1392,9 @@
                     (if (jolt-nil? s) acc
                         (loop (jolt-next s) (cons (jolt-first s) acc))))))
         (out '()))
-    (let-values (((ks vs) (hashtable-entries var-table)))
+    (let* ((kv (var-table-entries))          ; snapshot under var-table-mu (rt.ss)
+           (ks (car kv))
+           (vs (cdr kv)))
       (let loop ((i 0))
         (when (fx<? i (vector-length ks))
           (let* ((cell (vector-ref vs i))

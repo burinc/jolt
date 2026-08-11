@@ -27,7 +27,9 @@
 ;; host+overlay combination the production loader always has — because the
 ;; :default shortcut exists only in the overlay's do-alts and has no host seam.
 ;; The overlay is additive (it wraps host seams, never redefines a host
-;; binding), so loading it first changes nothing for the host-seam sections.
+;; binding), so loading it first changes nothing for the host-seam sections. It
+;; is also where `go` and `go-loop` are DEFINED — the host provides go-spawn and
+;; nothing above it — so a gate that wants either must load it, as this one does.
 ;;
 ;; This file never pumps sa-fiber-run-all once the R4 carrier is live (a manual
 ;; pump would race the carrier over the shared queue).

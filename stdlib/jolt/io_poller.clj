@@ -32,6 +32,17 @@
 ;; closes it (both the commit and the wake's state read are serialized by the
 ;; caller's lock; pm is a new leaf in the lock chain: nothing the park path does
 ;; takes the run-queue mutex, and the wake resumes outside pm).
+;;
+;; What this file CANNOT do, and does not have to. The channel ops bracket their
+;; commit and their switch in disable-interrupts, because between the two the fiber
+;; is marked but has not left, and a preemption there takes the commit apart. This
+;; file is Clojure and has no such bracket: wait-fiber commits under pm and switches
+;; after releasing it, so the gap is open here by construction. The scheduler closes
+;; it instead — jolt-fiber-preempt-handler refuses to preempt a fiber that is not
+;; 'running, which is exactly the set of fibers that have committed to a transition
+;; they have not finished (jolt-9d3m, and fibers-preempt-test.ss section 12). So the
+;; order below matters and the interrupt state does not: commit under pm, release,
+;; then switch.
 
 (ns jolt.io-poller
   (:require [jolt.ffi :as ffi]
@@ -129,11 +140,15 @@
 ;; One monitor serializes everything a fiber and the poller thread share:
 ;;   :fds      {fd {:waiters [fiber ...] :ready bool :filt :read|:write}}
 ;;   :pending  {fd filt}   ; registered by a fiber, not yet in the poller's set
-;;   :to-delete #{fd}      ; processed, EV_DELETE/EPOLL_CTL_DEL pending
 ;;   :pipe     [r w]       ; control pipe — registration wake
 ;;   :kq       n           ; the poller's kqueue / epoll fd
+;; The pending EV_DELETE/EPOLL_CTL_DEL set is NOT here: process-events! hands it
+;; straight to poller-loop, which carries it in a loop variable to the next
+;; poller-round. It used to be mirrored into this atom as :to-delete, written on
+;; every round and read by nobody, which made the round's critical section look
+;; like it was protecting something it was not.
 (def ^:private pm (Object.))
-(def ^:private state (atom {:fds {} :pending {} :to-delete #{} :pipe nil :kq nil :started? false}))
+(def ^:private state (atom {:fds {} :pending {} :pipe nil :kq nil :started? false}))
 
 ;; how many times the poller entered its blocking wait — the R8 gate-3 handle
 (def waits (atom 0))
@@ -158,10 +173,24 @@
 ;; ADDs and last round's DELETEs, then blocks in the ONE collect-safe wait with
 ;; that changelist applied atomically. Returns the fds whose events fired.
 (defn- poller-round [kq to-delete]
-  (let [adds (locking pm (:pending @state))]
-    (locking pm (swap! state assoc :pending {} :to-delete #{}))
+  ;; Read AND clear :pending in ONE critical section. As two — read, then clear —
+  ;; a registration landing in between was erased without ever being applied to
+  ;; the kqueue/epoll set, so that fd's readiness was never reported and the fiber
+  ;; waiting on it never resumed. The window is microseconds, which is why it
+  ;; showed up as one fiber of eight failing to finish, once, and never again in
+  ;; isolation; a stress that keeps registrations landing loses ~11% of them.
+  (let [adds (locking pm
+               (let [a (:pending @state)]
+                 (swap! state assoc :pending {})
+                 a))]
+    ;; The changelist is sized to nch, not to a fixed 256. :pending holds one
+    ;; entry per fd and nothing caps it, so a round that drains more than 256
+    ;; registrations wrote past the end of the buffer and then told the kernel to
+    ;; read that many entries — heap corruption, not a dropped registration. The
+    ;; event buffer below is a different thing: 256 is the count passed to
+    ;; kevent/epoll_wait as the most events to report, so it bounds itself.
     (let [nch (+ (count adds) (count to-delete))
-          chbuf (when (and macos? (pos? nch)) (ffi/alloc (* 256 KEVENT-SIZE)))]
+          chbuf (when (and macos? (pos? nch)) (ffi/alloc (* nch KEVENT-SIZE)))]
       (try
         (when chbuf
           (let [i (atom 0)]
@@ -189,7 +218,7 @@
   (locking pm
     (loop [fds fds dels #{} woken []]
       (if (empty? fds)
-        (do (swap! state assoc :to-delete (into (:to-delete @state) dels)) [woken dels])
+        [woken dels]
         (let [fd (first fds)]
           (if (= fd (pipe-read!))
             (do (drain-pipe!) (recur (rest fds) dels woken))

@@ -750,14 +750,22 @@
     (else "Linux")))
 ;; runtime-settable system properties (System/setProperty). A set value wins over
 ;; the built-in defaults below; clearProperty removes it.
+;; Written at RUN time (System/setProperty) from whatever thread calls it, so the
+;; mutations and the whole-table scan take a mutex; the single-key read on the
+;; getProperty path stays unlocked (strong general table — see rt.ss's var-table
+;; note). read-then-write is one step so the returned previous value is the one
+;; this call actually replaced.
+(define sys-prop-mu (make-mutex))
 (define sys-prop-table (make-hashtable string-hash string=?))
 (define (sys-set-property k v)
-  (let ((prev (hashtable-ref sys-prop-table k jolt-nil)))
-    (hashtable-set! sys-prop-table k (if (string? v) v (jolt-str-render-one v)))
-    prev))
+  (jolt-with-mutex sys-prop-mu
+    (let ((prev (hashtable-ref sys-prop-table k jolt-nil)))
+      (hashtable-set! sys-prop-table k (if (string? v) v (jolt-str-render-one v)))
+      prev)))
 (define (sys-clear-property k)
-  (let ((prev (hashtable-ref sys-prop-table k jolt-nil)))
-    (hashtable-delete! sys-prop-table k) prev))
+  (jolt-with-mutex sys-prop-mu
+    (let ((prev (hashtable-ref sys-prop-table k jolt-nil)))
+      (hashtable-delete! sys-prop-table k) prev)))
 ;; java.class.path — jolt's equivalent of the JVM classpath is the resolved
 ;; source roots (project :paths + every dependency's roots), which a project
 ;; command installs with set-source-roots! before it runs anything. Editor
@@ -803,7 +811,7 @@
     (for-each
       (lambda (kv)
         (set! base (jolt-assoc base (car kv) (cdr kv))))
-      (vector->list (hashtable-cells sys-prop-table)))
+      (vector->list (jolt-with-mutex sys-prop-mu (hashtable-cells sys-prop-table))))
     base))
 
 ;; full environment as an alist of (name . value), via env -0 (NUL-separated,

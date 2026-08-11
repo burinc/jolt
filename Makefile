@@ -57,18 +57,18 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
-  gateboot gatebootsmoke httpsfetch infer inline inline-body irvalidate \
+  gateboot gatebootsmoke gosm httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
   traceemit \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
-  values wp ci
+  threadsafety values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck \
-        fibersbench \
+        fibersbench dynbench \
         fibersresidue
 
 default:: build
@@ -120,9 +120,9 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck irvalidate devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck lockcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
-  certify gambitcheck gambitgencheck fibers
+  certify gambitcheck gambitgencheck fibers gosm threadsafety
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -230,6 +230,10 @@ values:
 # *go-backend* opt-in (sections 1-3 through the compiler), and alts! as a wait
 # set (sections 4-7 through the host seam; the :default check loads the
 # overlay).
+# fibers-lock-test.ss is the object-monitor gate (jolt-3a87): `locking` and the
+# bare monitor-enter/monitor-exit halves across a fiber switch. A monitor is the
+# one lock in the runtime that wraps user code, so neither half of locks.ss's
+# premise — short regions, never spanning a park — holds for it.
 fibers:
 	@$(CHEZ) --script test/chez/fibers-test.ss
 	@$(CHEZ) --script test/chez/fibers-state-test.ss
@@ -237,6 +241,17 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-go-test.ss
 	@$(CHEZ) --script test/chez/fibers-pool-test.ss
 	@$(CHEZ) --script test/chez/fibers-io-test.ss
+	@$(CHEZ) --script test/chez/fibers-sm-test.ss
+	@$(CHEZ) --script test/chez/fibers-preempt-test.ss
+	@$(CHEZ) --script test/chez/fibers-lock-test.ss
+	@$(CHEZ) --script test/chez/fibers-monitor-test.ss
+
+# The dynamic-var binding stack (jolt-3bo): lookup cost against binding DEPTH and
+# against the number of vars in one frame, push/pop throughput, and the two
+# workloads the trade-off is judged on — N nested fn literals (deep) and a real
+# namespace compile (wide and shallow). Opt-in, NOT part of make ci.
+dynbench:
+	@sh bench/dyn-binding/run.sh
 
 # Fibers R6 (jolt-nvpr.7): the :thread vs :fiber benchmark harness. Opt-in and
 # NOT part of the gate — benchmarks do not belong in CI. Runs each measurement
@@ -409,6 +424,20 @@ wp:
 # protocol var; the result must match ordinary dispatch.
 devirt:
 	@$(CHEZ) --script host/chez/run-devirt.ss
+
+# Fibers R7 (jolt-nvpr.9): the CPS pass over a go body. Asserts WHICH
+# representation each park site got (on the expansion, and on the cheap-park vs
+# capture counters), that the fallbacks still work, and that both backends give
+# the same values.
+gosm:
+	@$(CHEZ) --script host/chez/run-gosm.ss
+
+# The runtime's shared side-tables under concurrent access (jolt-3907). Scenario 1
+# is a reproducer: with the hasheq caches shared instead of per-thread it faults
+# inside the collector on most runs. test/chez/thread-tables.clj (smoke.sh) covers
+# the same bug class through a core.async pipeline sweep.
+threadsafety:
+	@$(CHEZ) --script test/chez/thread-safety-test.ss
 
 # Native record field reads: a keyword lookup on a statically-known record reads
 # the field by its declared slot (jrec-field-at) instead of jolt-get; the value
@@ -586,6 +615,14 @@ census:
 # contract file lists a name Chez does not provide.
 adaptercheck:
 	@$(CHEZ) --script host/scheme-adapter/chez.ss
+
+# Every lock in the runtime must route through jolt's wrapper, because
+# preemption is refused while one is held and that only works if the runtime can
+# tell. A wrapper nobody is obliged to use decays into the hand-marked scheme it
+# replaced, which is how the previous mechanism kept missing regions. The
+# allowlist records today's unmigrated sites and must only ever shrink.
+lockcheck:
+	@sh host/chez/lock-check.sh
 
 # Makefile dependency selection: explicit Chez overrides must bypass local
 # Makes provisioning so release jobs retain their chosen compiler and libc.

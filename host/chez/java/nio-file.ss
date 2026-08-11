@@ -324,12 +324,16 @@
   (let ((d (let ((d (or dir (nio-tmp-dir))))
              (if (char=? (string-ref d (- (string-length d) 1)) #\/) d (string-append d "/")))))
     (let loop ()
-      (mutex-acquire nio-temp-mutex)
-      (set! nio-temp-counter (+ nio-temp-counter 1))
-      (mutex-release nio-temp-mutex)
-      (let ((full (string-append d (if (string? prefix) prefix "")
-                                 (number->string (now-millis)) "-" (number->string nio-temp-counter)
-                                 (if (string? suffix) suffix ""))))
+      ;; the increment and the read are ONE step. Read after the release and two
+      ;; threads see the same value, so they build the same path — and the
+      ;; file-exists? retry below does not catch it, since neither has created
+      ;; the file yet and the caller that creates it second clobbers the first.
+      (let* ((n (jolt-with-mutex nio-temp-mutex
+                  (set! nio-temp-counter (+ nio-temp-counter 1))
+                  nio-temp-counter))
+             (full (string-append d (if (string? prefix) prefix "")
+                                  (number->string (now-millis)) "-" (number->string n)
+                                  (if (string? suffix) suffix ""))))
         (if (file-exists? (project-relative full)) (loop) full)))))
 
 (let ((files-statics

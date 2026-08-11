@@ -1,0 +1,7 @@
+# host/chez/lock-allowlist.txt — generated. Regenerate with:
+#   sh host/chez/lock-check.sh --regen
+# Lines: <file> <primitive> <count>. A line whose count DROPS is stale
+# and fails the gate, so migrating a site to the wrapper must update this.
+# Empty is the goal and the current state: every acquisition in the runtime
+# routes through host/chez/locks.ss. A monitor counts transitively, through
+# jolt-lock!, so it needs no entry here.

@@ -33,6 +33,9 @@
 ;; loader of rt.ss — boot scripts, gate harnesses, emitted programs — correct
 ;; by construction; a boot file loading it earlier is a harmless re-define.
 (load "host/chez/scheme-adapter-runtime.ss")
+;; Before everything else that locks: jolt-with-mutex is a MACRO, so it has to be
+;; defined before any file that uses it is loaded. It depends on nothing but Chez.
+(load "host/chez/locks.ss")
 (load "host/chez/values.ss")
 (load "host/chez/hasheq.ss")
 ;; Resolve a libc entry point at RUN time; #f when the entry doesn't exist
@@ -271,6 +274,12 @@
 (define jolt-vreg-catch-line 3)  ; the site at the throw a catch clause is handling
 (define jolt-vreg-print-readably 4)  ; the print family's *print-readably* override; 0 = unset
 (define jolt-vreg-current-fiber 0)  ; fibers.ss: the running fiber record, or 0 (fixnum) when not on a fiber
+;; slot 1: fibers.ss jolt-vreg-park-unwinding — a park escape is unwinding this carrier
+;; slot 5: hasheq.ss jolt-vreg-hasheq-caches — this thread's (symbol . string) hasheq tables
+;; slot 7: locks.ss jolt-vreg-locks — how many locks this carrier holds; the
+;;   scheduler refuses to preempt a fiber while it is non-zero
+;; slot 6: fibers.ss jolt-vreg-fiber-winder-base — the winder chain this carrier
+;;   dispatched the running fiber with, so the park's finally walk knows where to stop
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
 ;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic
@@ -362,10 +371,26 @@
 (define jolt-fn-callees-table (make-hashtable string-hash string=?))
 (define (jolt-callsite-key fqn line)
   (string-append fqn ":" (number->string line)))
+;; The four tables above are written by jolt-register-callsite!, which the back
+;; end emits into every compiled namespace and which therefore runs at LOAD —
+;; concurrently, now that namespaces load in parallel. Each add is a
+;; read-modify-write, so unlocked the adds simply lose each other: 8 threads
+;; registering 6000 distinct sites each dropped 297 of 48000. A dropped edge is
+;; a stack-trace reconstruction that stops early rather than a wrong one, but
+;; "incomplete, never invented" is the claim this table makes, and losing entries
+;; to a race is not how it was meant to hold.
+;;
+;; Writes only. The reads below are single-key reads of a STRONG hashtable, which
+;; is safe unlocked for the reasons set out at var-table, and they sit on the
+;; backtrace path where a lock would be pointless anyway. One mutex for all four
+;; because one registration writes up to four of them and they are never read
+;; under it.
+(define jolt-callsite-mu (make-mutex))
 (define (jolt-table-add! tbl key entry)
-  (let ((cur (hashtable-ref tbl key '())))
-    (unless (member entry cur)
-      (hashtable-set! tbl key (cons entry cur)))))
+  (jolt-with-mutex jolt-callsite-mu
+    (let ((cur (hashtable-ref tbl key '())))
+      (unless (member entry cur)
+        (hashtable-set! tbl key (cons entry cur))))))
 (define (jolt-register-callsite! fqn line callee tail?)
   (jolt-table-add! jolt-callsite-table (jolt-callsite-key fqn line) callee)
   (jolt-table-add! jolt-fn-callees-table fqn callee)
@@ -502,14 +527,85 @@
 ;; cell) from a cell lazily materialised by a forward `var-deref` / `(var x)` on a
 ;; not-yet-defined name — `resolve` returns the cell iff defined?.
 ;; ns-unmap clears it. Avoids the (def x nil) edge of probing the root.
-(define-record-type var-cell (fields ns name (mutable root) (mutable defined?)) (nongenerative var-cell-v2))
+;; meta and macro? live IN the cell, not in side-tables keyed by it. They used to
+;; be two eq-hashtables, which a Chez hashtable's lack of thread safety made a
+;; hazard: a def on one thread writing them while another reads is unsynchronized
+;; mutation, and the damage surfaces as a fault inside the collector. A field is
+;; safe (two threads writing one field write a whole value, never a torn
+;; structure) and it is FASTER than the lookup it replaces, which matters because
+;; macro-var? is on the analyzer's hot path.
+;;
+;; dyn-bound? is the "has this var EVER had a thread binding" flag — Clojure's
+;; Var.threadBound, and the whole reason a var read is not O(binding depth). See
+;; dyn-binding.ss, which owns it; it lives here because it has to be a field for
+;; the same reason meta and macro? are.
+(define-record-type var-cell
+  (fields ns name (mutable root) (mutable defined?) (mutable meta) (mutable macro?)
+          (mutable dyn-bound?))
+  (nongenerative var-cell-v4))
 (define var-table (make-hashtable string-hash string=?))
+(define var-table-mu (make-mutex))
+;; var-table-mu covers EVERY mutation of var-table and of ns-has-vars-set below
+;; (jolt-var's insert, declare-var!'s insert, def-var!'s index write, remove-ns's
+;; sweep in ns.ss, the gate harnesses' prune) and every WHOLE-TABLE scan
+;; (var-table-cells / var-table-entries). Single-key reads deliberately take no
+;; lock. The asymmetry is not an oversight, so here is the reasoning in full,
+;; against Chez 10's implementation.
+;;
+;; A STRONG general hashtable — which this is, unlike the weak-eq side-tables
+;; elsewhere in the runtime — never mutates existing structure on the read path or
+;; on a resize. s/newhash.ss: a non-resizing insert is one vector-set! of a
+;; fully-formed list (`(cons (cons x v) bucket)`), an update is one set-cdr! of a
+;; value, and adjust! builds a COMPLETE new bucket vector out of fresh spine
+;; conses, leaving the old one untouched, then publishes it with a single
+;; ht-vec-set!. $gen-hashtable-ref snapshots ht-vec once and takes its mask from
+;; that same vector, so the index cannot be torn. A reader therefore walks a
+;; consistent structure and the worst it can observe is a STALE MISS — which
+;; jolt-var's double-check turns into a lock acquisition and a re-read.
+;;
+;; Measured, 16 threads probing-then-inserting 15k fresh keys each: with writers
+;; unlocked, ~8.6k of 240k entries lost and no crash; with writers serialized and
+;; reads still unlocked, 240k of 240k, repeatably. Lost entries were the real bug
+;; (a vanished cell means the next lookup interns a fresh one and the previous
+;; root is gone), and serializing writers is the whole fix.
+;;
+;; This does NOT generalize to the weak-eq tables. Their adjust! (s/library.ss)
+;; relinks live cells in place with $set-tlc-next! while a reader may be walking
+;; them, and the reader is unsafe primitive code, so an unlocked read there hangs
+;; or faults. That is why those tables take locks (or go per-thread) and this one
+;; does not. Do not "unify" the two policies.
+;;
+;; Locking the single-key read would cost 70 -> 95 ns on a probe, on a path
+;; var-deref hits per var reference at an uncached site. It buys nothing here.
+;;
+;; Interning has to be atomic or two threads racing the same NEW name would each
+;; get their own cell, and a def through one would be invisible through the other.
+;; Double-checked: the hit path (every name after the first) takes no lock, and the
+;; insert re-checks under the lock.
 (define (jolt-var ns name)
   (let ((k (string-append ns "/" name)))
     (or (hashtable-ref var-table k #f)
-        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f)))
-          (hashtable-set! var-table k c)
-          c))))
+        (jolt-with-mutex var-table-mu
+          (or (hashtable-ref var-table k #f)
+              (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f)))
+                (hashtable-set! var-table k c)
+                c))))))
+;; A whole-table scan is the one read that DOES need the lock, and for a different
+;; reason than a rehash: hashtable-keys/values read ht-size, allocate a
+;; zero-filled vector of that length, then walk the buckets bounded by both. A
+;; concurrent insert truncates the result; a concurrent remove-ns leaves trailing
+;; FILL slots, and every caller here immediately does (var-cell-ns c) on each
+;; element, which on a fill 0 is an error that takes down whatever was running.
+;; Measured: 3000 scans racing a grow/shrink writer produced 1.66M slots that were
+;; fill rather than entries.
+;;
+;; The lock covers only the snapshot. Callers iterate the returned vector outside
+;; it, so no caller's body (jolt-assoc, intern-ns!, the image walker) runs under
+;; the lock.
+(define (var-table-cells) (jolt-with-mutex var-table-mu (hashtable-values var-table)))
+(define (var-table-entries)
+  (jolt-with-mutex var-table-mu
+    (let-values (((ks vs) (hashtable-entries var-table))) (cons ks vs))))
 ;; non-creating lookup (resolve / find-var / ns-unmap): #f when absent, so a
 ;; probe never interns an empty cell.
 (define (var-cell-lookup ns name) (hashtable-ref var-table (string-append ns "/" name) #f))
@@ -522,22 +618,36 @@
 ;; JVM-style class name and clojure.spec.alpha's fn-sym can recover the symbol of a
 ;; bare-fn predicate. Weak so GC'd fns drop out. Last def of a given proc wins.
 (define proc-name-tbl (make-weak-eq-hashtable))
+;; The check and the set have to be one atomic step (first def of a proc wins), and
+;; a def can come from any thread — nREPL sessions evaluate on their own.
+;;
+;; The READS take the same mutex, through proc-name-of. Serializing writers alone
+;; would leave the case that actually bites: a hashtable-ref concurrent with a
+;; hashtable-set! that rehashes reads a table mid-move, and the damage surfaces
+;; later inside the collector naming nothing. Every read is cold — printing a fn's
+;; arity name (seq.ss), the image walker (state-image.ss), the class arm
+;; (java/host-class.ss) — so none of them can afford to skip it either.
+(define proc-name-mu (make-mutex))
+(define (proc-name-of v) (jolt-with-mutex proc-name-mu (hashtable-ref proc-name-tbl v #f)))
 (define (def-var! ns name v)
   ;; first def of a given proc wins, so an alias like (def inc' inc) — which binds
   ;; the SAME proc to a second var — doesn't rename inc.
-  (when (and (procedure? v) (not (hashtable-contains? proc-name-tbl v)))
-    (hashtable-set! proc-name-tbl v (cons ns name)))
-  (hashtable-set! ns-has-vars-set ns #t)
+  (when (procedure? v)
+    (jolt-with-mutex proc-name-mu
+      (unless (hashtable-contains? proc-name-tbl v)
+        (hashtable-set! proc-name-tbl v (cons ns name)))))
+  (jolt-with-mutex var-table-mu (hashtable-set! ns-has-vars-set ns #t))
   (let ((c (jolt-var ns name))) (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
 ;; Value-position comparison references compile to the seq.ss chain singletons
 ;; (jolt-lt/gt/le/ge), not to the clojure.core var roots — the roots were later
 ;; re-bound by the checked numeric layer, so def-var! never saw these procs.
 ;; Register them so a stored comparator like (sorted-map-by >) travels as a
 ;; fn-ref (by name) like any other named core fn.
-(hashtable-set! proc-name-tbl jolt-lt (cons "clojure.core" "<"))
-(hashtable-set! proc-name-tbl jolt-gt (cons "clojure.core" ">"))
-(hashtable-set! proc-name-tbl jolt-le (cons "clojure.core" "<="))
-(hashtable-set! proc-name-tbl jolt-ge (cons "clojure.core" ">="))
+(jolt-with-mutex proc-name-mu
+  (hashtable-set! proc-name-tbl jolt-lt (cons "clojure.core" "<"))
+  (hashtable-set! proc-name-tbl jolt-gt (cons "clojure.core" ">"))
+  (hashtable-set! proc-name-tbl jolt-le (cons "clojure.core" "<="))
+  (hashtable-set! proc-name-tbl jolt-ge (cons "clojure.core" ">=")))
 ;; Set of ns-name strings that have at least one var — makes ns-has-vars? O(1)
 ;; instead of scanning the entire var-table per require-miss. Updated in def-var!
 ;; (and wherever vars are removed, though removal is rare).
@@ -613,12 +723,11 @@
 ;; keyed by the cell. jolt-meta (natives-meta.ss) merges it onto {:ns :name},
 ;; which it derives from the cell — so EVERY var (plain def, native-op, declare)
 ;; reports {:ns :name} like Clojure, with the user meta layered on when present.
-(define var-meta-table (make-eq-hashtable))
 (define jolt-kw-var-ns (keyword #f "ns"))
 (define jolt-kw-var-name (keyword #f "name"))
 (define jolt-kw-var-macro (keyword #f "macro"))
 (define (def-var-with-meta! ns name v m)
-  (let ((c (def-var! ns name v))) (hashtable-set! var-meta-table c m) c))
+  (let ((c (def-var! ns name v))) (var-cell-meta-set! c m) c))
 ;; A runtime-defined DYNAMIC var (the *earmuffed* core vars): tagged :dynamic so
 ;; push-thread-bindings accepts it — with no meta entry a var is non-dynamic and
 ;; binding throws, like the JVM.
@@ -628,21 +737,22 @@
 ;; Attach meta to an already-interned var (the declare/no-init emission path:
 ;; (def ^:dynamic *x*) must be bindable before its root is set).
 (define (set-var-meta! ns name m)
-  (hashtable-set! var-meta-table (jolt-var ns name) m))
+  (var-cell-meta-set! (jolt-var ns name) m))
 ;; runtime-macro registry: a var whose root holds a macro
 ;; expander fn is flagged here, so the ON-CHEZ analyzer's form-macro?/form-expand-1
 ;; (host-contract.ss) expand it. The prelude emits each core/stdlib defmacro as a
 ;; def-var! of its (cross-compiled) expander followed by (mark-macro! ns name).
-;; Keyed by cell (eq), like var-meta-table — survives a later (def name ...) that
+;; Kept in the cell, like meta — survives a later (def name ...) that
 ;; replaces the expander but keeps the same cell, matching Clojure (a defmacro IS a
 ;; def whose var carries :macro).
-(define var-macro-table (make-eq-hashtable))
 (define (mark-macro! ns name)
-  (let ((c (jolt-var ns name))) (hashtable-set! var-macro-table c #t) c))
-(define (macro-var? cell) (and cell (hashtable-ref var-macro-table cell #f) #t))
+  (let ((c (jolt-var ns name))) (var-cell-macro?-set! c #t) c))
+(define (macro-var? cell) (and cell (var-cell-macro? cell) #t))
 ;; declare / (def name) with no init: reserve the cell ONLY if absent. An
 ;; existing root is left intact — Clojure's (def x) with no init does not clobber
 ;; a prior binding (do (def x 7) (def x) x) => 7. Returns the cell either way.
+;; Same double-check as jolt-var, and for the same reason: the insert is a
+;; var-table mutation and has to be serialized against jolt-var's.
 (define (declare-var! ns name)
   (let* ((k (string-append ns "/" name))
          (c (hashtable-ref var-table k #f)))
@@ -653,9 +763,13 @@
         ;; declaration-only var stays defined?=#f and resolve/find-var/ns-interns
         ;; miss it in an AOT build. The existing root is left intact.
         (begin (var-cell-defined?-set! c #t) c)
-        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t)))  ; declared => interned/resolvable
-          (hashtable-set! var-table k c)
-          c))))
+        (jolt-with-mutex var-table-mu
+          (let ((c (hashtable-ref var-table k #f)))
+            (if c
+                (begin (var-cell-defined?-set! c #t) c)
+                (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f)))  ; declared => interned/resolvable
+                  (hashtable-set! var-table k c)
+                  c)))))))
 
 ;; regex: defines regex-t + the re-* fns (def-var!'d into
 ;; clojure.core), so it loads after def-var! and before the printer below (which
@@ -996,7 +1110,7 @@
 
 (define (seed-random!)
   (let* ((t (current-time 'time-utc))
-         (n (with-mutex random-seed-mutex
+         (n (jolt-with-mutex random-seed-mutex
               (set! random-seed-counter (+ random-seed-counter 1))
               random-seed-counter))
          (mix (bitwise-xor (time-nanosecond t)
@@ -1298,6 +1412,17 @@
 ;; the jolt-fiber-<! / jolt-fiber->! primitives. Not loaded by the adapter
 ;; runtime (it depends on async.ss).
 (load "host/chez/java/fibers-async.ss")
+
+;; The cheap park (R7, jolt-nvpr.9): __sm-spawn/__sm-take/__sm-put, the ops a
+;; CPS'd go body (the pass in clojure.core.async) calls. A
+;; lexically-parking body stores the rest of the computation as an ordinary
+;; closure in the fiber's SM field, clears k, and switches without capturing a
+;; continuation — no stack segment held while parked. Those two writes are the
+;; whole resume rule: jolt-fiber-resume* takes k when it is set and re-enters
+;; through the thunk when it is clear, which is what puts the driver (and the
+;; body's exception handler) back for a cheap resume. Loaded after
+;; fibers-async.ss (reuses its waiter handler and channel protocol).
+(load "host/chez/java/sm.ss")
 
 ;; BigDecimal: the jbigdec value type + bigdec/decimal?/class/equality/
 ;; printing. Loads LAST so its set!-wraps of jolt-class/jolt=2/the printers sit

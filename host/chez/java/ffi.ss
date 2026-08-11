@@ -126,15 +126,25 @@
 ;; Register it keyed by that entry-point address (a jolt pointer integer) — which
 ;; is what the caller hands to C; free-callable unlocks and drops it. A callback
 ;; left registered lives for the process (the GTK-signal-handler common case).
+;; Both tables are written at RUN time — __ccallable mints a callback and
+;; ffi-export registers a name — from whatever thread does it, so every mutation
+;; takes this mutex. Single-key reads stay unlocked.
+(define ffi-tbl-mu (make-mutex))
 (define ffi-callable-table (make-eqv-hashtable))   ; entry-point addr -> code object
 (define (jolt-ffi-register-callable! co)
   (sa-lock-object co)
   (let ((addr (sa-foreign-callable-entry-point co)))
-    (hashtable-set! ffi-callable-table addr co)
+    (jolt-with-mutex ffi-tbl-mu (hashtable-set! ffi-callable-table addr co))
     addr))
 (define (ffi-free-callable addr)
-  (let* ((a (jnum->exact addr)) (co (hashtable-ref ffi-callable-table a #f)))
-    (when co (sa-unlock-object co) (hashtable-delete! ffi-callable-table a))
+  (let* ((a (jnum->exact addr))
+         (co (jolt-with-mutex ffi-tbl-mu
+               ;; take-and-remove as one step, so two frees of the same address
+               ;; cannot both unlock the object
+               (let ((c (hashtable-ref ffi-callable-table a #f)))
+                 (when c (hashtable-delete! ffi-callable-table a))
+                 c))))
+    (when co (sa-unlock-object co))
     jolt-nil))
 
 ;; --- library exports: name -> entry-point address ---------------------------
@@ -151,7 +161,7 @@
 ;; keyed by integer addresses, where eq? is correct.)
 (define ffi-export-table (make-hashtable string-hash equal?))  ; name(string) -> addr(integer)
 (define (jolt-ffi-register-export! name addr)
-  (hashtable-set! ffi-export-table name addr) addr)
+  (jolt-with-mutex ffi-tbl-mu (hashtable-set! ffi-export-table name addr)) addr)
 ;; lookup for the C stub: name (a Scheme string) -> addr, or 0 if unknown.
 (define (jolt-ffi-lookup-export name)
   (let ((a (hashtable-ref ffi-export-table name #f))) (if a a 0)))

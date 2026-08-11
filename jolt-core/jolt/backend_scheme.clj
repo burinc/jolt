@@ -347,12 +347,29 @@
 ;; def init is being emitted this holds an atom; each site appends a fresh cell name
 ;; (bound to #f in a let wrapping the def, so it persists across calls and is shared
 ;; by every invocation) and resolves into it on first use. nil outside a def (a site
-;; there falls back to a per-call resolve). Lives on the unit (:cache-cells).
+;; there falls back to a per-call resolve).
+;;
+;; THREAD-LOCAL, like every other piece of emit-session scratch in this file
+;; (*fnsrc-counter*, *callsites*, *tail?*, …) and like the reference compiler, which
+;; keeps its whole compilation state in thread-bound Vars. These two lived on the
+;; unit — one object for the whole process — and emit-with-cells swapped them in and
+;; out around each def. That save/restore is a read-modify-write on shared state, so
+;; two threads compiling at once traded collectors: one thread's hoisted constant was
+;; registered into the other's pool, the `let` that should have bound it never saw
+;; it, and a namespace that compiled cleanly alone died with "variable _kc$81 is not
+;; bound". Rebinding also unwinds on a throw, which the reset! pair did not — a
+;; failed emit used to leave the unit pointing at the abandoned def's collector, and
+;; every later def in the process appended cells to it.
+;;
+;; The gensym counter deliberately stays shared on the unit: swap! is atomic, and one
+;; counter per process is what keeps a registered anon-fn name globally unique.
+(def ^:dynamic *cache-cells* nil)
+(def ^:dynamic *const-pool* nil)
 
 ;; Emit a def's init (via the supplied thunk) under a fresh cache-cell collector,
 ;; then wrap the result in a let binding any cells its body registered so they
-;; persist in the def's closure. Saves/restores the outer collector for nested
-;; defs. Used by both the runtime def emit and the direct-link top-level emit.
+;; persist in the def's closure. The binding nests for nested defs and unwinds on a
+;; throw. Used by both the runtime def emit and the direct-link top-level emit.
 ;; Hoist a PURE CONSTANT construction out of its use site: the site emits a bare
 ;; variable read, and the def's wrapper binds it once. The pool is keyed by the
 ;; emitted expression, so a constant appearing at ten sites in one def is built
@@ -371,7 +388,7 @@
 ;;
 ;; Outside a def (no pool) the raw expression is returned unchanged.
 (defn- hoist-const [expr]
-  (let [pool @(:const-pool (cur))]
+  (let [pool *const-pool*]
     (if pool
       (or (get @pool expr)
           (let [nm (fresh-label "_kc$")]
@@ -382,13 +399,9 @@
 (defn- emit-with-cells [emit-thunk]
   (let [cells (atom [])
         pool (atom {})
-        prev @(:cache-cells (cur))
-        prev-pool @(:const-pool (cur))
-        _ (reset! (:cache-cells (cur)) cells)
-        _ (reset! (:const-pool (cur)) pool)
-        raw (emit-thunk)
-        _ (reset! (:cache-cells (cur)) prev)
-        _ (reset! (:const-pool (cur)) prev-pool)
+        raw (binding [*cache-cells* cells
+                      *const-pool* pool]
+              (emit-thunk))
         ;; constants bind eagerly (value first); lazy cache cells start #f. Sorted
         ;; by binding name so a build's output stays deterministic.
         consts (map (fn [p] (str "(" (val p) " " (key p) ")"))
@@ -398,6 +411,90 @@
     (if (seq binds)
       (str "(let (" (str/join " " binds) ") " raw ")")
       raw)))
+
+;; A cache-cell scope for a top-level EXPRESSION (jolt-g3u). Without it the
+;; collector exists only inside a def, so every var / protocol / ctor site in a
+;; bare top-level form resolves PER ACCESS. Measured: a var-ref call at such a
+;; site costs 101-125 ns against 28 ns at a cached site and 11 ns through a local,
+;; and 3M calls do 3M var-table reads against 2 at a cached site. A bare top-level
+;; (loop …) went 120.8 -> 25.1 ns/op with this.
+;;
+;; TWO restrictions, both of which cost real measurements to find.
+;;
+;; Not a def. A direct-link def emits a bare (define …), which cannot sit inside a
+;; let, and both :def paths already wrap their own INIT — the part that repeats.
+;;
+;; And only when the form contains a LOOP (or a self-recurring fn), not merely a
+;; :fn. That looks over-cautious and is not. A cell has to be paid for: the emitted
+;; (var-cell-deref (or c …)) is several times the text of a (var-deref …), and a
+;; top-level form is compiled by Chez every time it is loaded. So the cell wins
+;; only if its site actually runs again, and a loop is the one thing that proves
+;; it will — a top-level fn may never be called. Wrapping on :fn too cost 14% on
+;; `require clojure.test` (0.44 -> 0.50s), verified by switching the wrapper at
+;; runtime inside ONE binary so no build variance was involved, and bought that
+;; path nothing: a namespace being loaded is defs and defmethods whose bodies run
+;; once at load. Confirmed it was the cells and not the const pool by trying a
+;; cells-only variant, which was equally slow.
+;;
+;; Gated on var-cache? for the same reason the :var site is: the seed mint runs
+;; with it OFF and must stay a byte-fixpoint, and this wrapper would otherwise
+;; change mint output through the const pool (which no other flag gates) even
+;; though no cache cell would be registered.
+(def ^:private repeat-ops #{:loop :recur})
+
+;; Keys whose value is PAYLOAD hanging off a node rather than IR under it. They
+;; have to be skipped, and :src-form is not an optimization — it is the difference
+;; between linear and quadratic. Every :fn node carries its whole source form, so a
+;; fn literal written inside another is in both, and walking them all costs the sum
+;; of the subtree sizes. 240 nested literals spent 89 ms of a 90 ms emit right here,
+;; and it showed up as 633k reads of clojure.core/map?, sequential?, vector? and
+;; seq? — this walk's own operations, called O(source size) times per fn.
+;;
+;; Skipping it cannot lose a loop. :src-form is the SOURCE the image rebuilds a
+;; closure from; a loop written in it is already in the IR under :arities, which is
+;; walked. :free-names is a vector of name strings and holds no nodes at all.
+;; Checked rather than asserted: over 247 top-level forms from eight real files the
+;; two walks never disagreed.
+;;
+;; They CAN disagree in one direction, and it is the harmless one. A source form
+;; carrying a map literal that happens to look like IR — (fn [] {:op :loop}) — used
+;; to answer "repeats" off the DATA, and now does not. The wrapper this drives is an
+;; optimization, so the old answer only bought that form some cache cells it could
+;; not use; nothing reads the cells that is not also emitted by the same pass. A
+;; quoted {:op :recur} still answers true, through the :quote node rather than
+;; through :src-form — pre-existing, equally harmless, and left alone.
+(def ^:private node-payload-keys #{:src-form :free-names})
+
+(defn- node-tree-any?
+  "Does any node in this tree satisfy pred? Walks map values and sequential
+  children, which covers every shape the analyzer builds — minus the payload keys
+  above, which hold source and names rather than IR."
+  [pred x]
+  (cond
+    (and (map? x) (:op x) (pred x)) true
+    ;; a :const holds a literal, which cannot contain a loop and can be arbitrarily
+    ;; large (a 10k-element vector literal at top level). Stop rather than walk it.
+    (and (map? x) (= :const (:op x))) false
+    (map? x) (boolean (some (fn [e] (and (not (contains? node-payload-keys (key e)))
+                                         (node-tree-any? pred (val e))))
+                            x))
+    (sequential? x) (boolean (some (fn [v] (node-tree-any? pred v)) x))
+    :else false))
+
+;; Does this top-level form contain something whose body PROVABLY runs more than
+;; once? A loop (or a self-recurring fn) does. A plain :fn does not — it may never
+;; be called, and that distinction is the whole design; see emit-top-cells.
+(defn- top-form-repeats? [node]
+  (node-tree-any? (fn [n] (contains? repeat-ops (:op n))) node))
+
+(defn- emit-top-cells [node emit-thunk]
+  (if (and (var-cache?)
+           ;; never a def: the :def cases already wrap their INIT, which is the
+           ;; part that repeats. A def's remaining pieces run once.
+           (not= :def (:op node))
+           (top-form-repeats? node))
+    (emit-with-cells emit-thunk)
+    (emit-thunk)))
 
 ;; Scheme syntactic keywords. A jolt local with one of these names would, when
 ;; emitted verbatim, shadow the Scheme form in operator position (a local named
@@ -449,7 +546,10 @@
                   "case-lambda"
                   ;; binding + try/finally (emit-try): both thread through
                   ;; dynamic-wind; a binding form and a finally both emit it.
-                  "dynamic-wind"
+                  ;; jolt-finally-in is that dynamic-wind's before-thunk, emitted
+                  ;; by name because the fiber park recognises it with eq? — a
+                  ;; shadowed or inlined copy would make the finally run mid-park.
+                  "dynamic-wind" "jolt-finally-in"
                   ;; host interop (emit-invoke static call, :host-new,
                   ;; :host-static field ref).
                   "host-new" "host-static-call" "host-static-ref"
@@ -623,18 +723,89 @@
 ;; contract (the portable seam the analyzer uses), NOT host-native predicates, so
 ;; this stays host-neutral — the contract walks the host's reader forms.
 (declare emit-quoted)
+
+;; --- sharing the quoted constructions ----------------------------------------
+;; emit-quoted renders a form as the constructor calls that rebuild it, and it
+;; renders a SUBTREE every time it meets one. That is fine for a lone quoted datum
+;; and quadratic for the fnsrc registrations, which are the one caller that emits
+;; forms NESTED INSIDE EACH OTHER: every anon fn registers its whole source form,
+;; and an anon fn written inside another one is part of both, so a chain of depth
+;; N emits O(N^2) text. The CPS pass in clojure.core.async builds exactly that
+;; chain — one closure per park site — and a 240-park go body emitted 5.4 MB of
+;; registrations, which analyze/emit/Chez then each paid for in proportion.
+;;
+;; So the pool hash-conses: a construction is emitted once, bound to a name, and
+;; every later occurrence of the same construction is that name. Because a child's
+;; construction is interned before its parent's is built, the parent is assembled
+;; out of NAMES and costs O(its own arity) rather than O(its subtree) — which is
+;; what turns the total linear. It also collapses the repetition inside one form
+;; (every (jolt-symbol #f "x") in a body is now one object).
+;;
+;; Sharing the VALUES is sound because these are immutable constructions: symbols,
+;; persistent collections and literals. It is the same argument hoist-const makes,
+;; and the values reaching image-register-fn-form! are equal to the ones it got
+;; before, structurally and by every observation the image writer makes of them.
+;;
+;; nil pool (every other caller, and every system namespace) is the identity: the
+;; construction is returned inline, byte for byte as before, so the seed mint and
+;; the core overlay are untouched.
+(def ^:dynamic *quote-pool* nil)
+
+;; Rows already emitted, as [src-form binding-name]. Interning alone made the TEXT
+;; linear but left the WALK quadratic: assembling a parent's construction still
+;; descended through the nested literal it contains, all the way to the leaves,
+;; only to rediscover constructions the pool already had. This stops the descent —
+;; a sub-form that IS an already-emitted literal is that literal's binding name.
+;;
+;; Matched by IDENTITY, which is exact here and costs a pointer compare: analyze-fn
+;; hands a literal's :src-form back as the very object nested inside its parent's
+;; :src-form. Equality would be the obvious alternative and is the wrong tool — a
+;; jolt seq does not cache its hash, so asking whether two forms are equal walks
+;; the subtree this exists to avoid walking. A miss (a form the analyzer had to
+;; rebuild) just descends as before.
+(def ^:dynamic *quote-shared* nil)
+
+(defn- q-shared-name [form]
+  (when-let [rows *quote-shared*]
+    (loop [i 0]
+      (when (< i (count rows))
+        (let [r (nth rows i)]
+          (if (identical? (nth r 0) form) (nth r 1) (recur (inc i))))))))
+
+(defn- q-intern
+  "The text to use at a USE SITE for a construction: the construction itself with
+  no pool, else a binding name, recording the construction once."
+  [expr]
+  (let [pool *quote-pool*]
+    (if (nil? pool)
+      expr
+      (or (get (:by-expr @pool) expr)
+          (let [nm (str "_q$" (count (:order @pool)))]
+            (swap! pool (fn [p] (-> p
+                                    (assoc-in [:by-expr expr] nm)
+                                    (update :order conj [nm expr]))))
+            nm)))))
+
+;; Both sorted renderings below order by EMITTED TEXT, because a set and a map
+;; value have no source order and the host hash order is not stable across Chez
+;; versions (jolt-8479). A pooled subterm renders as a binding name handed out in
+;; traversal order — i.e. in host-hash order — so sorting those would reintroduce
+;; exactly the instability the sort exists to remove. Emit the items unpooled, sort
+;; the real text, and intern only the finished construction.
 (defn- emit-quoted-map [pairs]
   ;; pairs: a jolt vector of [k-form v-form] pairs (form-map-pairs)
-  (str "(jolt-hash-map "
-       (str/join " " (mapcat (fn [p] [(emit-quoted (nth p 0)) (emit-quoted (nth p 1))]) pairs))
-       ")"))
+  (q-intern
+   (str "(jolt-hash-map "
+        (str/join " " (mapcat (fn [p] [(emit-quoted (nth p 0)) (emit-quoted (nth p 1))]) pairs))
+        ")")))
 (defn- emit-quoted-map-value [m]
   ;; A jolt map VALUE (def/symbol metadata is a value, not a reader form). (keys m)
   ;; iterates in host-hash order, which is not stable across Chez versions, so emit
   ;; the pairs sorted by their emitted Scheme text — keeps the seed byte-fixed
   ;; regardless of the host hash (jolt-8479).
-  (let [pairs (sort (map (fn [k] (str (emit-quoted k) " " (emit-quoted (get m k)))) (keys m)))]
-    (str "(jolt-hash-map " (str/join " " pairs) ")")))
+  (let [pairs (binding [*quote-pool* nil]
+                (vec (sort (map (fn [k] (str (emit-quoted k) " " (emit-quoted (get m k)))) (keys m)))))]
+    (q-intern (str "(jolt-hash-map " (str/join " " pairs) ")"))))
 ;; emit-quoted reconstructs both raw reader forms (from :quote) AND plain jolt
 ;; values (def/symbol :meta). Reader forms are walked via the jolt.host form-*
 ;; contract; the native-predicate branches below catch genuine jolt collection
@@ -646,16 +817,26 @@
     (form-literal? form) (emit-const form)
     (form-sym? form)
     (let [m (form-sym-meta form) sns (form-sym-ns form) nm (form-sym-name form)]
-      (if (and m (pos? (count m)))
-        ;; carry reader metadata (^:foo bar) onto the quoted symbol so (meta 'x) sees it
-        (str "(jolt-symbol/meta " (if sns (chez-str-lit sns) "#f") " " (chez-str-lit nm) " "
-             (emit-quoted m) ")")
-        (str "(jolt-symbol " (if sns (chez-str-lit sns) "#f") " " (chez-str-lit nm) ")")))
+      (q-intern
+       (if (and m (pos? (count m)))
+         ;; carry reader metadata (^:foo bar) onto the quoted symbol so (meta 'x) sees it
+         (str "(jolt-symbol/meta " (if sns (chez-str-lit sns) "#f") " " (chez-str-lit nm) " "
+              (emit-quoted m) ")")
+         (str "(jolt-symbol " (if sns (chez-str-lit sns) "#f") " " (chez-str-lit nm) ")"))))
     ;; sort items by emitted text: a set has no source order, and host-hash order
-    ;; is not stable across Chez versions (jolt-8479).
-    (form-set? form) (str "(jolt-hash-set " (str/join " " (sort (map emit-quoted (form-set-items form)))) ")")
-    (form-list? form) (str "(jolt-list " (str/join " " (map emit-quoted (form-elements form))) ")")
-    (form-vec? form) (str "(jolt-vector " (str/join " " (map emit-quoted (form-vec-items form))) ")")
+    ;; is not stable across Chez versions (jolt-8479) — so the items are emitted
+    ;; unpooled, or the sort would be over binding names handed out in that same
+    ;; unstable order. See the pool comment above.
+    (form-set? form)
+    (q-intern (str "(jolt-hash-set "
+                   (str/join " " (binding [*quote-pool* nil]
+                                   (vec (sort (map emit-quoted (form-set-items form))))))
+                   ")"))
+    ;; a fn literal is a list, so this is the only branch that has to ask
+    (form-list? form)
+    (or (q-shared-name form)
+        (q-intern (str "(jolt-list " (str/join " " (map emit-quoted (form-elements form))) ")")))
+    (form-vec? form) (q-intern (str "(jolt-vector " (str/join " " (map emit-quoted (form-vec-items form))) ")"))
     (form-map? form) (emit-quoted-map (form-map-pairs form))
     ;; a quoted #"…" regex value -> reconstruct it (same as the :regex IR leaf).
     (form-regex? form) (str "(jolt-regex " (chez-str-lit (form-regex-source form)) ")")
@@ -670,13 +851,16 @@
     (and (map? form) (= :jolt/tagged (get form :jolt/type)))
     (let [nm (name (get form :tag))
           tsym (if (= \# (first nm)) (subs nm 1) nm)]
-      (str "(jolt-tagged-literal (jolt-symbol #f " (chez-str-lit tsym) ") "
-           (emit-quoted (get form :form)) ")"))
+      (q-intern (str "(jolt-tagged-literal (jolt-symbol #f " (chez-str-lit tsym) ") "
+                     (emit-quoted (get form :form)) ")")))
     ;; plain jolt VALUES (metadata maps and anything nested in them)
     (map? form) (emit-quoted-map-value form)
-    (vector? form) (str "(jolt-vector " (str/join " " (map emit-quoted form)) ")")
-    (set? form) (str "(jolt-hash-set " (str/join " " (sort (map emit-quoted form))) ")")
-    (seq? form) (str "(jolt-list " (str/join " " (map emit-quoted form)) ")")
+    (vector? form) (q-intern (str "(jolt-vector " (str/join " " (map emit-quoted form)) ")"))
+    (set? form) (q-intern (str "(jolt-hash-set "
+                               (str/join " " (binding [*quote-pool* nil]
+                                               (vec (sort (map emit-quoted form)))))
+                               ")"))
+    (seq? form) (q-intern (str "(jolt-list " (str/join " " (map emit-quoted form)) ")"))
     :else (throw (ex-info (str "emit-quoted: unsupported quoted form " (pr-str form)) {}))))
 
 ;; A def's :meta is a jolt map value. Non-empty? (a plain def carries {}).
@@ -844,6 +1028,18 @@
 ;;   (image-register-fn-form! "jfn$…" <quoted fn* form> "ns" <quoted free names>)
 ;; "" when the namespace is system or nothing was collected, so the seed mint
 ;; and any fn-free def emit byte-identically.
+;;
+;; Emitted under a *quote-pool*, which is what keeps this linear. The rows are in
+;; innermost-first order (emit-fn conjes after emitting the body), so a nested
+;; literal's construction is already interned by the time its enclosing literal is
+;; assembled, and the enclosing one costs its own arity instead of its whole
+;; subtree. Without it a chain of N nested literals emitted O(N^2) text — see the
+;; pool comment at emit-quoted. The bindings come out in dependency order for the
+;; same reason, so let* binds them in one pass.
+;;
+;; A row that throws leaves whatever it interned before throwing in the pool, so
+;; the let* can carry a binding nothing references. Dead, valid, and confined to a
+;; path that is already best-effort.
 (defn- fnsrc-flush []
   (if (or (fnsrc-system-ns? *fnsrc-ns*) (empty? @*fnsrc-regs*))
     ""
@@ -852,13 +1048,40 @@
     ;; Such a literal just goes unregistered — its closure refuses at dump
     ;; like any other unregistered fn — rather than failing the whole
     ;; compilation of code that never dumps anything.
-    (str " " (str/join " " (keep (fn [[nm form ns frees]]
-                                   (try
-                                     (str "(image-register-fn-form! " (chez-str-lit nm) " "
-                                          (emit-quoted form) " " (chez-str-lit ns) " "
-                                          (emit-quoted frees) ")")
-                                     (catch Exception _ nil)))
-                                 @*fnsrc-regs*)))))
+    (let [pool (atom {:by-expr {} :order []})
+          ;; the rows in order, each emitted with every EARLIER row available to
+          ;; stop the walk at (see *quote-shared*). Innermost first, so a nested
+          ;; literal is always already there by the time its parent is emitted.
+          ;; reduce and not map: each row's emission depends on the ones before it.
+          out (binding [*quote-pool* pool]
+                (reduce
+                 (fn [acc row]
+                   (let [nm (nth row 0) form (nth row 1) ns (nth row 2) frees (nth row 3)
+                         q (try
+                             (binding [*quote-shared* (:shared acc)]
+                               (let [f (emit-quoted form)]
+                                 [f (str "(image-register-fn-form! " (chez-str-lit nm) " "
+                                         f " " (chez-str-lit ns) " "
+                                         (emit-quoted frees) ")")]))
+                             (catch Exception _ nil))]
+                     (if (nil? q)
+                       acc
+                       (-> acc
+                           (update :calls conj (nth q 1))
+                           (update :shared conj [form (nth q 0)])))))
+                 {:calls [] :shared []}
+                 @*fnsrc-regs*))
+          calls (:calls out)
+          binds (:order @pool)]
+      (cond
+        ;; every row threw: nothing to register, and a let* with no body is not a
+        ;; form at all
+        (empty? calls) ""
+        (empty? binds) (str " " (str/join " " calls))
+        :else
+        (str " (let* ("
+             (str/join " " (map (fn [b] (str "(" (nth b 0) " " (nth b 1) ")")) binds))
+             ") " (str/join " " calls) ")")))))
 
 (defn- emit-fn [node]
   (let [;; a def's DIRECT anonymous init is named by its define, so it keeps the
@@ -1153,7 +1376,7 @@
                           dv (str "(" resolver-name " " (chez-str-lit (:devirt-type node)) " "
                                   (chez-str-lit (:devirt-proto node)) " " (chez-str-lit (:devirt-method node))
                                   " " r ")")
-                          cells @(:cache-cells (cur))
+                          cells *cache-cells*
                           ;; cache the resolved impl in a per-site cell when inside a
                           ;; def; else resolve per call. The cell carries (epoch . fn):
                           ;; each call compares its epoch against jolt-proto-epoch and
@@ -1184,7 +1407,7 @@
                     (let [r (fresh-label "_r$")
                           d (fresh-label "_d$")
                           v (fresh-label "_v$")
-                          cells @(:cache-cells (cur))
+                          cells *cache-cells*
                           proto (chez-str-lit (:proto node))
                           method (chez-str-lit (:method node))
                           apply-args (str/join " " (cons r (rest as)))]
@@ -1333,7 +1556,7 @@
               (not-any? #{"double"} (get shape :tags))))
        (let [s (get (ctor-shapes) (str (:ns fnode) "/" (:name fnode)))
              tag (:type s)
-             cells @(:cache-cells (cur))
+             cells *cache-cells*
              desc-lookup (str "(hashtable-ref chez-tag-desc " (chez-str-lit tag) " #f)")
              cached-desc (if cells
                            (let [c (fresh-label "_cdesc$")]
@@ -1359,11 +1582,37 @@
 ;; (jolt-throw = Scheme `raise` of a &jolt-throw condition); catch lowers to
 ;; `guard`, whose raw binding is unwrapped via jolt-unwrap-throw so the catch var
 ;; receives the jolt value (preserving ex-data/ex-message and the backtrace
-;; identity tag). finally lowers to `dynamic-wind`'s after-thunk, guarded by
-;; jolt-park-unwinding?: it runs on success, on catch and on a real escape, but
-;; NOT while a fiber park is unwinding. A park is not an exit — the computation
-;; resumes — so running the finally there would close a file still in use. Every
-;; other escape, an interrupt abort included, is an exit and still runs it.
+;; identity tag). finally lowers to `dynamic-wind`'s after-thunk, and runs on
+;; success, on catch and on a real escape, but NOT while a fiber park is
+;; unwinding. A park is not an exit — the computation resumes — so running the
+;; finally there would close a file still in use. Every other escape, an
+;; interrupt abort included, is an exit and still runs it.
+;;
+;; The park case is handled by the BEFORE-thunk, which is the shared marker
+;; procedure jolt-finally-in (values.ss) rather than a fresh (lambda () #f) per
+;; site. A park drops exactly the winders carrying that marker before it escapes
+;; (fibers.ss jolt-park-winders), so the after-thunk below never runs on a park
+;; and needs no guard of its own. It used to ask jolt-park-unwinding?, which
+;; cost two procedure calls on every finally exit — and `binding` expands to a
+;; try/finally, so every binding form paid it too.
+;;
+;; This is why the marker must be emitted by NAME and not inlined: the filter
+;; recognises it with eq?.
+;;
+;; THIS IS ALSO THE ONLY dynamic-wind THE BACK END EMITS FOR A jolt FORM, and
+;; that fact is load-bearing elsewhere. The cheap park in host/chez/java/sm.ss
+;; escapes the whole winder chain above the carrier's base and resumes through
+;; the fiber thunk, so it does not rewind: any wind between the CPS driver and a
+;; rewritten park site would have its after-thunk fire mid-computation and its
+;; before-thunk never run again. clojure.core.async's pass keeps that from
+;; happening by treating `try` and `fn*` as opaque — `try` because of this clause,
+;; and `fn*` NOT because it winds. A bare fn* emits a plain lambda, which is what
+;; lets the pass wrap its own continuations around park sites; it is opaque because
+;; the pass cannot see what the thunk is handed to, and a host form that takes one
+;; winds around the call. Emitting a wind for anything else means adding that head
+;; to sm-opaque in the same change, and run-gosm.ss section 1c fails if it does
+;; not: it scans the emission for a rewritten park site inside a wind's extent. See
+;; the invariant note at jolt-sm-park!.
 ;; Both keys optional.
 (defn- emit-try [node]
   (let [core (if-let [cs (:catch-sym node)]
@@ -1387,8 +1636,8 @@
                  body)
                (emit (:body node)))]
     (if-let [fin (:finally node)]
-      (str "(dynamic-wind (lambda () #f) (lambda () " core ")"
-           " (lambda () (if (jolt-park-unwinding?) #f " (emit fin) ")))")
+      (str "(dynamic-wind jolt-finally-in (lambda () " core ")"
+           " (lambda () " (emit fin) "))")
       core)))
 
 ;; Does this IR node emit to an expression that yields a Scheme boolean? Used to
@@ -1498,7 +1747,7 @@
              ;; jolt-var-get throws on a forward-declared var). Outside a def,
              ;; resolve per access.
              :else
-             (let [cells @(:cache-cells (cur))
+             (let [cells *cache-cells*
                    nslit (chez-str-lit (:ns node)) nmlit (chez-str-lit (:name node))]
                (if (and (var-cache?) cells)
                  (let [c (fresh-label "_vc$")]
@@ -1737,14 +1986,16 @@
                 ;; `emit`, whose :def case already wraps cache cells, so the seed stays
                 ;; byte-unchanged. The :def cases bind their own fnsrc context over
                 ;; this one (fresh counter/regs per def) and flush it themselves.
-                (not (direct-link?)) (emit node)
+                ;; emit-top-cells declines a :def itself, so this reaches it only
+                ;; for expressions.
+                (not (direct-link?)) (emit-top-cells node #(emit node))
                 ;; top-level do splices: each statement/ret is itself a top-level form.
                 (= :do (:op node))
                 (str "(begin " (str/join " " (map emit-top-form (:statements node)))
                      (if (empty? (:statements node)) "" " ") (emit-top-form (:ret node)) ")")
                 (and (= :def (:op node)) (not (:no-init node)) (not (dl-opt-out? (:meta node))))
                 (emit-def-cached node)
-                :else (emit node))
+                :else (emit-top-cells node #(emit node)))
           freg (fnsrc-flush)]
       (if (= freg "") scm
           ;; registrations run BEFORE the form: they are static data with no

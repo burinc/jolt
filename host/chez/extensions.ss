@@ -26,7 +26,25 @@
 ;; lookup) cache per call site and guard on that epoch, so a library required
 ;; after a site warmed up invalidates it — the same shape as jolt-proto-epoch.
 
+;; ext-mu covers every MUTATION here: the declare's check-then-create, refine's
+;; read-modify-write of the fields/default, register's provider write, and the
+;; epoch bump. Declarations and registrations come from user namespaces at load,
+;; and namespaces now load in parallel, so all of it runs concurrently.
+;;
+;; Two things break without it, and they are the two the protocol registry and the
+;; multimethod epoch broke in the same way. The declare is check-then-create, so
+;; two threads declaring one point each build their own providers table and a
+;; provider registered through one is invisible through the other. And the epoch
+;; is a `set!` read-modify-write, so a lost bump leaves a warmed call site's cached
+;; resolution never invalidated — the exact staleness the epoch exists to prevent.
+;;
+;; Reads stay unlocked. extension-points-tbl and each providers table are STRONG
+;; hashtables read single-key, which is safe for the reasons set out at var-table,
+;; and jolt-extension-value is the hot path this whole epoch scheme exists to keep
+;; cheap.
+(define ext-mu (make-mutex))
 (define extension-epoch-n 0)
+;; call with ext-mu HELD
 (define (bump-extension-epoch!) (set! extension-epoch-n (fx+ extension-epoch-n 1)))
 
 (define extension-points-tbl (make-hashtable string-hash string=?))
@@ -169,18 +187,23 @@
         (unless (ext-key-kind-ok? key-kind root)
           (ext-bad! (string-append "extension point " (ext-show-id idn) " :root must be a "
                                    key-kind ", got " (jolt-pr-readable root)))))
-      (let ((prior (hashtable-ref extension-points-tbl idn #f)))
-        (cond
-          ((and prior (ext-same-declaration? prior key-kind root fallback hint fields default)) jolt-nil)
-          (prior
-           (ext-bad! (string-append "extension point " (ext-show-id idn)
-                                    " is already declared with a different contract")))
-          (else
-           (hashtable-set! extension-points-tbl idn
-             (make-ext-point idn key-kind root fallback hint fields default
-                             (make-hashtable string-hash string=?)))
-           (bump-extension-epoch!)
-           jolt-nil))))))
+      ;; the probe and the create are ONE step: two threads declaring the same
+      ;; point must not each build a providers table, or a provider registered
+      ;; through one is invisible through the other. ext-bad! throws from inside
+      ;; the mutex, which with-mutex releases on the unwind.
+      (jolt-with-mutex ext-mu
+        (let ((prior (hashtable-ref extension-points-tbl idn #f)))
+          (cond
+            ((and prior (ext-same-declaration? prior key-kind root fallback hint fields default)) jolt-nil)
+            (prior
+             (ext-bad! (string-append "extension point " (ext-show-id idn)
+                                      " is already declared with a different contract")))
+            (else
+             (hashtable-set! extension-points-tbl idn
+               (make-ext-point idn key-kind root fallback hint fields default
+                               (make-hashtable string-hash string=?)))
+             (bump-extension-epoch!)
+             jolt-nil)))))))
 
 (define (ext-point-of id who)
   (let* ((idn (ext-id-str id))
@@ -198,7 +221,12 @@
          (idn (ext-point-id p)))
     (unless (jolt-map? spec)
       (ext-bad! (string-append "refine-extension! " (ext-show-id idn) " spec must be a map")))
-    (let ((new-fields (ext-parse-fields (ext-kw spec "fields") idn))
+    ;; The whole refinement is one critical section: it reads the point's fields
+    ;; and default, merges, and writes both back, so two concurrent refines would
+    ;; otherwise drop one of them and leave the point's default no longer total
+    ;; over its fields.
+    (jolt-with-mutex ext-mu
+     (let ((new-fields (ext-parse-fields (ext-kw spec "fields") idn))
           (new-default (ext-kw spec "default")))
       ;; A field already declared may be repeated only at the same type (an
       ;; idempotent second load); at a different type it is drift.
@@ -225,15 +253,19 @@
           (pmap-fold-fwd new-default (lambda (k v acc) (jolt-assoc1 acc k v))
                          (ext-point-default p)))
         (bump-extension-epoch!)
-        jolt-nil))))
+        jolt-nil)))))
 
 ;; ---- registration + lookup --------------------------------------------------
 (define (jolt-register-extension! id k value)
   (let* ((p (ext-point-of id "register-extension!"))
          (ks (ext-key->string p k)))
     (ext-check-value! (ext-point-id p) (ext-point-fields p) value #f "provider")
-    (hashtable-set! (ext-point-providers p) ks value)
-    (bump-extension-epoch!)
+    ;; the provider write and the epoch bump together: a bump lost to a race is a
+    ;; call site that keeps serving the resolution it cached before this provider
+    ;; existed, with the stamp already saying current, so it never expires
+    (jolt-with-mutex ext-mu
+      (hashtable-set! (ext-point-providers p) ks value)
+      (bump-extension-epoch!))
     jolt-nil))
 
 (define (ext-merge default provider)

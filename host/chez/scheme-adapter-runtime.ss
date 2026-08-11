@@ -432,4 +432,70 @@
 ;; (rt.ss:35 loads this file, and the flat build inlines both). fibers.ss is
 ;; self-contained — it uses only Chez natives, so loading it here, before the
 ;; value layer, is safe.
+
+;; The dynamic-wind chain, for the scheduler's park path. NOT contract names:
+;; these are Chez internals the fiber switch needs and no other target has to
+;; supply — fibers.ss degrades to "change nothing" when sa-winder-in answers #f
+;; for everything, which is what a target without them gets.
+;;
+;; They live HERE rather than in fibers.ss because $primitive access is the
+;; adapter's job: fibers.ss is not target-owned, so the portability gate makes
+;; it route through this file.
+;;
+;; Chez models the chain as a list of records — `winder` for dynamic-wind, with
+;; fields #(in out attachments), and `critical-winder` for parameterize and
+;; friends. The rtd is not exported, so it is recovered by building one winder
+;; and reading its type back.
+(define sa-winder-rtd
+  (guard (e (#t #f))
+    (dynamic-wind (lambda () #f)
+                  (lambda () (record-rtd (car (#%$current-winders))))
+                  (lambda () #f))))
+(define sa-winder-in-ref
+  (guard (e (#t (lambda (r) #f)))
+    (record-accessor sa-winder-rtd 0)))
+
+;; (sa-winder-in w) -> the winder's before-thunk, or #f when W is not a
+;; dynamic-wind winder (a parameterize's critical-winder answers #f).
+(define (sa-winder-in w)
+  (and sa-winder-rtd
+       (eq? (record-rtd w) sa-winder-rtd)
+       (sa-winder-in-ref w)))
+
+;; (sa-current-winders) -> the chain, innermost first.
+;; (sa-current-winders-set! w) -> void. Replaces it wholesale.
+;;
+;; A write must happen in the frame that escapes, NOT inside a guard,
+;; dynamic-wind, with-mutex or parameterize: every one of those restores the
+;; chain on exit and would silently undo it. See jolt-park-drop-finallys!.
+(define (sa-current-winders) (#%$current-winders))
+(define (sa-current-winders-set! w) (#%$current-winders w))
+
+;; (sa-disable-count) -> how many nested disable-interrupts this thread is
+;; inside; 0 when interrupts are on. Chez keeps it in the thread context, and
+;; swish reads it from there (erlang.ss:792, current-disable-count) rather than
+;; deriving it.
+;;
+;; Deriving it is what fibers.ss used to do — (disable-interrupts) returns the
+;; new count, so a disable/enable pair answers the question — and the pair is
+;; NOT equivalent to a read. It momentarily re-enables, and an enable that
+;; brings the count to 0 is a delivery point for anything deferred while
+;; interrupts were off. That put a delivery point inside jolt-fiber-park!, on
+;; the far side of jolt-park-drop-finallys! and with the fiber already committed
+;; to leaving: a Chez timer handler runs at disable-count 0 (probed, not
+;; assumed), so the preempt handler's own park measured from 0 and the pair
+;; enabled right back to it. A read cannot deliver anything. It is also about
+;; cheaper, which matters because the scheduler does this on every switch.
+;;
+;; #3% and not #%, which is swish's spelling too. The safe entry point resolves
+;; the field NAME at run time and costs 10 ns, twice what the disable/enable pair
+;; it replaces costs; the unsafe one compiles to the field access and costs 2 ns.
+;; What #3% gives up is argument checking, and both arguments here are literal.
+(define (sa-disable-count) (#3%$tc-field 'disable-count (#3%$tc)))
+
+
+;; locks.ss first: fibers.ss uses the counting lock wrapper, and jolt-with-mutex
+;; is a macro, so it must be defined before this load rather than captured at
+;; run time the way the sa-* seams are.
+(load "host/chez/locks.ss")
 (load "host/chez/fibers.ss")

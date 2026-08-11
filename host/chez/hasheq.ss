@@ -405,7 +405,32 @@
 ;; Symbol hasheq = Util.hashCombine(Murmur3.hashUnencodedChars(name), Util.hash(ns)).
 ;; JVM caches in _hasheq field. Jolt symbols aren't interned (meta varies),
 ;; so we cache in a weak-eq hashtable keyed by the symbol object.
-(define symbol-hasheq-cache (make-weak-eq-hashtable))
+;; --- the per-thread hasheq caches -------------------------------------------
+;; A symbol's or string's hasheq is cached, because recomputing it is 8-19x the
+;; cost of a lookup (measured: a 12-char key 47 ns vs 5.8 ns, a 48-char key
+;; 109 ns). Keywords do not need this — they carry their hash in the record
+;; (keyword-t-khash) — but a Chez string cannot hold a field, so a table it is.
+;;
+;; The tables are per THREAD, not shared. A Chez hashtable is not thread-safe,
+;; and these are written on every cache MISS from whatever thread is hashing, so
+;; sharing them means unsynchronized concurrent mutation — which corrupts the
+;; table's internals and surfaces later as a fault inside the collector, never as
+;; an error naming the table. Serializing them instead would put a mutex on the
+;; hottest read path in the collection layer.
+;;
+;; A virtual register holds this thread's pair of tables (slot 5, registered in
+;; rt.ss's allocation comment): a vreg read is ~2 ns against ~33 ns for a
+;; thread-parameter, and a freshly forked thread starts every slot at fixnum 0,
+;; which is what "not allocated yet" means here.
+(define jolt-vreg-hasheq-caches 5)
+
+(define (hasheq-caches)
+  (let ((c (virtual-register jolt-vreg-hasheq-caches)))
+    (if (eq? c 0)
+        (let ((v (cons (make-weak-eq-hashtable) (make-weak-eq-hashtable))))
+          (set-virtual-register! jolt-vreg-hasheq-caches v)
+          v)
+        c)))
 
 (define (compute-symbol-hasheq ns name)
   (let ((ns-hash (if (or (jolt-nil? ns) (not ns) (eq? ns '()))
@@ -414,24 +439,23 @@
     (hash-combine (murmur3-hash-unencoded-chars name) ns-hash)))
 
 (define (symbol-hasheq sym)
-  (or (hashtable-ref symbol-hasheq-cache sym #f)
-      (let ((h (compute-symbol-hasheq (symbol-t-ns sym) (symbol-t-name sym))))
-        (hashtable-set! symbol-hasheq-cache sym h)
-        h)))
+  (let ((t (car (hasheq-caches))))
+    (or (hashtable-ref t sym #f)
+        (let ((h (compute-symbol-hasheq (symbol-t-ns sym) (symbol-t-name sym))))
+          (hashtable-set! t sym h)
+          h))))
 
-;; String hasheq cache — same pattern as symbol cache.
-;; JVM caches String.hashCode per object; Jolt strings aren't interned
-;; (they're regular Chez strings), so we cache in a weak-eq hashtable.
-(define string-hasheq-cache (make-weak-eq-hashtable))
-
+;; The JVM caches String.hashCode in the object; jolt strings are plain Chez
+;; strings with nowhere to put it, so they use the per-thread table above.
 (define (compute-string-hasheq s)
   (murmur3-hash-int (java-string-hashcode s)))
 
 (define (string-hasheq s)
-  (or (hashtable-ref string-hasheq-cache s #f)
-      (let ((h (compute-string-hasheq s)))
-        (hashtable-set! string-hasheq-cache s h)
-        h)))
+  (let ((t (cdr (hasheq-caches))))
+    (or (hashtable-ref t s #f)
+        (let ((h (compute-string-hasheq s)))
+          (hashtable-set! t s h)
+          h))))
 
 ;; ============================================================================
 ;; jolt-hasheq — the top-level dispatch (mirrors Util.hasheq)

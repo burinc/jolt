@@ -526,7 +526,7 @@
 ;; atomic; a mutex-held fn deadlocked on the non-recursive Chez mutex there
 ;; (PSL R4 cluster 4).
 (define (atomic-cas! self o n)
-  (with-mutex (atomic-lock self)
+  (jolt-with-mutex (atomic-lock self)
     (if (jolt=2 (unbox (atomic-box self)) o)
         (begin (set-box! (atomic-box self) n) #t) #f)))
 (let ((ref-ctor (lambda args (make-atomic (if (pair? args) (car args) jolt-nil))))
@@ -542,7 +542,7 @@
 (register-host-methods! "atomic"
   (list (cons "get" (lambda (self) (unbox (atomic-box self))))
         (cons "set" (lambda (self v) (set-box! (atomic-box self) v) jolt-nil))
-        (cons "getAndSet" (lambda (self v) (with-mutex (atomic-lock self)
+        (cons "getAndSet" (lambda (self v) (jolt-with-mutex (atomic-lock self)
                             (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) v) o))))
         (cons "compareAndSet" (lambda (self o n) (atomic-cas! self o n)))
         (cons "updateAndGet" (lambda (self f)
@@ -553,17 +553,17 @@
           (let loop ((v (unbox (atomic-box self))))
             (let ((n (jolt-invoke f v)))
               (if (atomic-cas! self v n) v (loop (unbox (atomic-box self))))))))
-        (cons "incrementAndGet" (lambda (self) (with-mutex (atomic-lock self)
+        (cons "incrementAndGet" (lambda (self) (jolt-with-mutex (atomic-lock self)
                                   (let ((n (+ (unbox (atomic-box self)) 1))) (set-box! (atomic-box self) n) n))))
-        (cons "decrementAndGet" (lambda (self) (with-mutex (atomic-lock self)
+        (cons "decrementAndGet" (lambda (self) (jolt-with-mutex (atomic-lock self)
                                   (let ((n (- (unbox (atomic-box self)) 1))) (set-box! (atomic-box self) n) n))))
-        (cons "getAndIncrement" (lambda (self) (with-mutex (atomic-lock self)
+        (cons "getAndIncrement" (lambda (self) (jolt-with-mutex (atomic-lock self)
                                   (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) (+ o 1)) o))))
-        (cons "getAndDecrement" (lambda (self) (with-mutex (atomic-lock self)
+        (cons "getAndDecrement" (lambda (self) (jolt-with-mutex (atomic-lock self)
                                   (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) (- o 1)) o))))
-        (cons "addAndGet" (lambda (self d) (with-mutex (atomic-lock self)
+        (cons "addAndGet" (lambda (self d) (jolt-with-mutex (atomic-lock self)
                             (let ((n (+ (unbox (atomic-box self)) (jnum->exact d)))) (set-box! (atomic-box self) n) n))))
-        (cons "getAndAdd" (lambda (self d) (with-mutex (atomic-lock self)
+        (cons "getAndAdd" (lambda (self d) (jolt-with-mutex (atomic-lock self)
                             (let ((o (unbox (atomic-box self)))) (set-box! (atomic-box self) (+ o (jnum->exact d))) o))))
         (cons "intValue" (lambda (self) (jnum->exact (unbox (atomic-box self)))))
         (cons "longValue" (lambda (self) (jnum->exact (unbox (atomic-box self)))))
@@ -1196,12 +1196,24 @@
       (let ((ns (keyword-t-ns tag)))
         (if (and ns (not (jolt-nil? ns))) (string-append ns "/" (keyword-t-name tag)) (keyword-t-name tag)))
       (jolt-str-render-one tag)))
+;; hsc-mu covers the two global registries below that are written after boot:
+;; this one (reachable from Clojure as clojure.core/__register-class-methods!, so
+;; from a namespace load, which is now parallel) and jolt-class-for-tbl's intern.
+;; Single-key reads of both stay unlocked — strong hashtables, per var-table.
+(define hsc-mu (make-mutex))
+
+;; The probe and the create are ONE step. Split, two threads registering methods
+;; for one tag each built their own inner table and published it over the other's,
+;; so every method in the loser's batch vanished — the same shape as the protocol
+;; registry's type-registry. The member writes go under the same lock, since they
+;; mutate the table this just published.
 (define (register-tagged-methods! tag members)
-  (let* ((key (tag->method-key tag))
-         (h (or (hashtable-ref tagged-methods-tbl key #f)
-                (let ((nh (make-hashtable string-hash string=?)))
-                  (hashtable-set! tagged-methods-tbl key nh) nh))))
-    (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members)))
+  (jolt-with-mutex hsc-mu
+    (let* ((key (tag->method-key tag))
+           (h (or (hashtable-ref tagged-methods-tbl key #f)
+                  (let ((nh (make-hashtable string-hash string=?)))
+                    (hashtable-set! tagged-methods-tbl key nh) nh))))
+      (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members))))
 
 ;; htable arm: dispatch (.method obj a*) through the table's tag method registry;
 ;; an unregistered method falls through (sorted colls are htables too).
@@ -1367,20 +1379,28 @@
 ;; identity, =, and defmethod table keys are stable. Called by the analyzer for
 ;; every class-name symbol (java.util.Date, clojure.lang.Atom) at evaluation time.
 (define jolt-class-for-tbl (make-hashtable string-hash string=?))
+;; Double-checked, like every other interner in the runtime. The hit path — every
+;; class name after the first — is the bare hashtable-ref it always was, which
+;; matters because the analyzer calls this per class-name symbol, and only a
+;; first-ever intern takes the lock. The blast radius of a lost intern is smaller
+;; here than for keywords: the eq-arm below compares jclass by NAME and the hash
+;; arm hashes the name, so a duplicate still answers = and still keys a defmethod
+;; table (new-mm-table is keyed by jolt=). It is the eq?-identity this comment
+;; promises that a race would take away.
 (define (jolt-class-for name)
-  (let ((existing (hashtable-ref jolt-class-for-tbl name #f)))
-    (if existing
-        existing
-        (let ((obj (make-class-obj name)))
-          (hashtable-set! jolt-class-for-tbl name obj)
-          obj))))
+  (or (hashtable-ref jolt-class-for-tbl name #f)
+      (jolt-with-mutex hsc-mu
+        (or (hashtable-ref jolt-class-for-tbl name #f)
+            (let ((obj (make-class-obj name)))
+              (hashtable-set! jolt-class-for-tbl name obj)
+              obj)))))
 (def-var! "jolt.host" "jolt-class-for" jolt-class-for)
 
 (define (class-key x)
   (cond ((jclass? x) (jclass-name x))
         ((string? x) x)
         ;; a deftype/defrecord NAME var holds its ctor; treat it as the class
-        ((procedure? x) (hashtable-ref chez-deftype-ctor-tag x #f))
+        ((procedure? x) (deftype-ctor-tag x))
         (else #f)))
 ;; = compares jclass values by name (stable interning makes this eq?-level);
 ;; strings are no longer = to a jclass — class-key survives for internal
@@ -1958,7 +1978,7 @@
 ;; its positional ctor are one value here.)
 (def-var! "jolt.host" "class-object?"
   (lambda (x) (if (or (jclass? x)
-                      (and (procedure? x) (hashtable-ref chez-deftype-ctor-tag x #f) #t))
+                      (and (procedure? x) (deftype-ctor-tag x) #t))
                   #t #f)))
 ;; nth over the java.util List shims, like RT.nth on a java.util.List.
 ;; This stays a set!-wrap of jolt-nth rather than a registered arm: unlike

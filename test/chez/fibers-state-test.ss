@@ -27,7 +27,8 @@
 ;;   3. A fiber's bindings are intact on resume after other fibers have pushed
 ;;      and popped their own.
 ;;   4. Two fibers on one carrier cannot join each other's transaction: a fiber
-;;      inside a dosync parks, another fiber runs and sees no transaction.
+;;      inside a dosync parks, another fiber runs and sees no transaction — and
+;;      cannot COMMIT one either while the first is still inside its own.
 ;;   5. Spawn conveys the parent's bindings (and does NOT convey its *txn*).
 ;;   6. The current namespace follows the fiber, not the carrier.
 
@@ -111,11 +112,22 @@
 
 ;; --- 4. two fibers on one carrier cannot join each other's transaction ------
 ;; t1 parks INSIDE a dosync (ref-set r 1, park, ref-set r 2). On park the
-;; parameterize unwinds *txn* and with-mutex releases stm-lock, and the slice
-;; swap keeps the carrier's *txn* #f — t2 runs and sees NO transaction; if it
-;; had inherited t1's *txn*, t2's jolt-sync would have joined it (ref-set into
-;; t1's log) instead of starting its own.
+;; parameterize unwinds *txn* and the slice swap keeps the carrier's *txn* #f —
+;; t2 runs and sees NO transaction; if it had inherited t1's *txn*, t2's
+;; jolt-sync would have joined it (ref-set into t1's log) instead of starting
+;; its own. That is the slice property this section is for.
+;;
+;; What t2 CANNOT do is finish. The transaction lock is an object monitor whose
+;; ownership is a field, so t1 keeps it across the park (jolt-pb2s) and t2 parks
+;; contending for it. This section used to assert the opposite — t2's whole
+;; transaction committing r = 9 inside t1's extent, and t1 then committing r = 2
+;; over the top of it — which is the isolation violation itself: t1's write is
+;; derived from a read that predated t2's commit, and the only serializable
+;; outcomes are 2 (t1 then t2, had t2 not committed) and 9 (t1 then t2). So the
+;; two properties are separated here: t2 never joins, and t2 never interleaves.
 (define r (jolt-ref-new 0))
+(define t1-in-txn #f)        ; what t1 reads through its OWN log after resuming
+(define t1-committed-r #f)   ; and what is COMMITTED at that moment
 (define t1
   (sa-fiber-spawn
     (lambda ()
@@ -123,6 +135,9 @@
         (lambda ()
           (jolt-ref-set r 1)
           (jolt-fiber-park!)
+          ;; resumed: the log is t1's own, and nothing has committed underneath it
+          (set! t1-in-txn (jolt-ref-deref r))
+          (set! t1-committed-r (jolt-ref-val r))
           (jolt-ref-set r 2)))
       't1-committed)))
 (sa-fiber-run-all)
@@ -137,12 +152,19 @@
       (jolt-sync (lambda () (jolt-ref-set r 9)))               ; its OWN txn
       (set! txn-log (cons (jolt-txn-running?) txn-log)))))     ; #f — over, not joined
 (sa-fiber-run-all)
-(ok "4. t2 sees no transaction while t1 is parked" (equal? txn-log '(#f #f)))
-(ok "4. t2's own txn committed" (= (jolt-ref-val r) 9))
+(ok "4. t2 sees no transaction while t1 is parked" (equal? txn-log '(#f)))
+(ok "4. and t2 waits for the transaction lock rather than joining"
+    (eq? (jolt-fiber-state t2) 'parked))
+(ok "4. so nothing of t2's is committed inside t1's extent" (= (jolt-ref-val r) 0))
+;; t1 finishes; releasing the lock resumes t2, which commits after it.
 (sa-fiber-resume t1)
 (sa-fiber-run-all)
-(ok "4. t1 resumed inside ITS txn and committed last" (= (jolt-ref-val r) 2))
+(ok "4. t1 resumed inside ITS txn" (= t1-in-txn 1))
+(ok "4. with nothing committed underneath it" (= t1-committed-r 0))
 (ok "4. t1 completed" (eq? (jolt-fiber-state t1) 'done))
+(ok "4. t2 then ran its own txn to the end, still unjoined"
+    (and (eq? (jolt-fiber-state t2) 'done) (equal? txn-log '(#f #f))))
+(ok "4. and the outcome is serializable (t1 then t2)" (= (jolt-ref-val r) 9))
 
 ;; --- 5. spawn conveys the parent's bindings (and NOT its *txn*) ------------
 (define *w* (def-dynvar! "app" "*w*" 0))
@@ -192,6 +214,153 @@
     (equal? ns-log '("app.a" "user" "app.a")))
 (ok "6. carrier ns restored to the scheduler's after the round"
     (string=? (chez-current-ns) "user"))
+
+;; --- 7. the park drops jolt finallys and NOTHING else -----------------------
+;; A park escape unwinds the fiber's dynamic-wind chain. jolt-park-drop-finallys!
+;; (fibers.ss) removes exactly the winders the back end emitted for a `finally`,
+;; recognised by their before-thunk being the shared jolt-finally-in marker, and
+;; leaves every other winder to unwind normally.
+;;
+;; Both halves have teeth, and the SECOND is the one with real consequences:
+;;
+;;   - drop too little and a finally runs mid-park, closing a file the fiber is
+;;     still using. That is what the flag used to prevent.
+;;   - drop too much and a with-mutex does not release on the park, so the fiber
+;;     parks HOLDING the lock. loader.ss's ldr-wait-for-load! deliberately parks
+;;     inside ldr-load-mu and relies on with-mutex's dynamic-wind releasing it
+;;     and re-acquiring on resume; dropping that winder wedges every later
+;;     require in the process. Chez tags with-mutex as the same `winder` record
+;;     type as a finally, so nothing but the marker distinguishes them — which is
+;;     exactly why this check exists.
+;;
+;; A parameterize is checked alongside it: it has to unwind so the next fiber on
+;; the carrier does not inherit the parked fiber's value, and has to be back in
+;; force when the fiber resumes.
+(define w-log '())
+(define (w-say x) (set! w-log (cons x w-log)))
+(define w-mu (make-mutex))
+(define w-param (make-parameter 'scheduler))
+;; Probed from ANOTHER THREAD, and that is not incidental: Chez mutexes are
+;; recursive, so the thread running the drain can re-acquire a mutex it is
+;; already holding and would report "free" even when the parked fiber still owns
+;; it — the exact deadlock this check exists to catch would pass silently.
+(define (w-mutex-free?)
+  (let ((free? #f))
+    (thread-join
+     (fork-thread
+      (lambda ()
+        (set! free? (if (mutex-acquire w-mu #f)
+                        (begin (mutex-release w-mu) #t)
+                        #f)))))
+    free?))
+
+(define w-fiber
+  (sa-fiber-spawn
+   (lambda ()
+     (parameterize ((w-param 'fiber))
+       (with-mutex w-mu
+         (dynamic-wind
+          jolt-finally-in                       ; the marker the back end emits
+          (lambda ()
+            (w-say (list 'before-park (w-param)))
+            ;; jolt-fiber-park! and NOT sa-fiber-yield: yield re-enqueues, so a
+            ;; one-fiber drain would resume it in the same pass and run to
+            ;; completion before the park could be observed at all.
+            (jolt-fiber-park!)
+            (w-say (list 'after-park (w-param)))
+            'ok)
+          (lambda () (w-say 'FINALLY))))))))
+
+;; run until the fiber parks in the yield
+(jolt-fiber-drain! (jolt-fiber-carrier w-fiber))
+(define w-at-park (reverse w-log))
+(ok "7. finally did NOT run on the park"
+    (not (memq 'FINALLY w-at-park)))
+(ok "7. with-mutex DID release on the park (loader.ss depends on this)"
+    (w-mutex-free?))
+(ok "7. parameterize DID unwind on the park"
+    (eq? (w-param) 'scheduler))
+
+;; resume: a parked fiber is only runnable again through sa-fiber-resume
+(sa-fiber-resume w-fiber)
+(jolt-fiber-drain! (jolt-fiber-carrier w-fiber))
+(define w-final (reverse w-log))
+(ok "7. fiber resumed inside its own parameterize"
+    (equal? (cadr w-final) '(after-park fiber)))
+(ok "7. finally ran exactly once, at the real exit"
+    (= 1 (length (filter (lambda (x) (eq? x 'FINALLY)) w-final))))
+(ok "7. mutex released again after the real exit" (w-mutex-free?))
+(ok "7. carrier parameter back to the scheduler's after the round"
+    (eq? (w-param) 'scheduler))
+
+;; The marker is matched with eq?, so it must be ONE shared procedure. A fresh
+;; (lambda () #f) per site would compare unequal and the finally would run
+;; mid-park again — silently, with every test above still passing except this.
+(ok "7. a non-marker dynamic-wind is not mistaken for a finally"
+    (not (jolt-finally-winder?
+          (dynamic-wind (lambda () #f)
+                        (lambda () (car (sa-current-winders)))
+                        (lambda () #f)))))
+(ok "7. a marker dynamic-wind IS recognised"
+    (jolt-finally-winder?
+     (dynamic-wind jolt-finally-in
+                   (lambda () (car (sa-current-winders)))
+                   (lambda () #f))))
+
+;; --- 8. a winder must not re-establish state the dslice already carries -----
+;; A hand-rolled binding frame over a dynamic extent,
+;;     (dynamic-wind (lambda () (dyn-push-frame! pairs)) thunk (lambda () (pop)))
+;; double-applies across a park. jolt-fiber-to-scheduler! saves the slice — which
+;; already holds the pushed frame — BEFORE the escape unwinds; the unwind pops
+;; it; on resume the slice restore puts it back and THEN the continuation rewinds
+;; and the before-thunk pushes a second one. Three sites did this (*agent*,
+;; *compile-files*, and the loader's file/spath frame) and all three were wrong
+;; after any park, with no preemption involved.
+;;
+;; dyn-with-frame is the one correct shape: push ONCE outside the wind, nothing
+;; in the before-thunk, and an ABSOLUTE restore in the after-thunk. Both halves
+;; are checked below, and the broken shape is checked alongside it so this cannot
+;; pass by accident if the helper stops being used.
+(define (dyn-depths make-body)
+  (let ((log '()))
+    (define (note! tag) (set! log (cons (cons tag (length (dyn-binding-stack))) log)))
+    (let* ((c (var-cell-lookup "clojure.core" "*compile-files*"))
+           (f (sa-fiber-spawn
+               (lambda ()
+                 ((make-body c note!))
+                 (note! 'after)))))
+      (jolt-fiber-drain! (jolt-fiber-carrier f))
+      (note! 'parked)
+      (sa-fiber-resume f)
+      (jolt-fiber-drain! (jolt-fiber-carrier f))
+      (reverse log))))
+
+(define (dyn-body-inner note!)
+  (lambda () (note! 'in) (jolt-fiber-park!) (note! 'resumed)))
+
+(define good
+  (dyn-depths (lambda (c note!)
+                (lambda () (dyn-with-frame (list (cons c #t)) (dyn-body-inner note!))))))
+(define bad
+  (dyn-depths (lambda (c note!)
+                (lambda ()
+                  (dynamic-wind
+                   (lambda () (dyn-push-frame! (list (cons c #t))))
+                   (dyn-body-inner note!)
+                   (lambda () (dyn-binding-stack (cdr (dyn-binding-stack)))))))))
+
+(ok "8. dyn-with-frame: depth is the same after a park as before"
+    (= (cdr (assq 'in good)) (cdr (assq 'resumed good))))
+(ok "8. dyn-with-frame: the frame is gone once the extent ends"
+    (= 0 (cdr (assq 'after good))))
+(ok "8. dyn-with-frame: the carrier is clean while the fiber is parked"
+    (= 0 (cdr (assq 'parked good))))
+;; The teeth: the shape dyn-with-frame replaced still double-applies and leaks.
+;; If this ever passes, the hazard is gone by some other route and the helper's
+;; comment needs revisiting — it does not mean the check is obsolete.
+(ok "8. the hand-rolled push/pop shape still double-applies (teeth)"
+    (and (= (+ 1 (cdr (assq 'in bad))) (cdr (assq 'resumed bad)))
+         (= 1 (cdr (assq 'after bad)))))
 
 (printf "\nfibers-state-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)

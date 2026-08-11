@@ -775,6 +775,29 @@
            (eq? (jolt-get (jolt-nth f 0) (jolt-keyword "disposition") jolt-nil)
                 (jolt-keyword "would-stub")))))
 
+;; A var's meta is a FIELD of the cell, so fasl-write sees it and the walk has to
+;; reach it. It did not, so a var carrying ^{:test (fn …)} — which is where deftest
+;; puts a test body — scanned clean and then failed the dump on the same graph, at
+;; <unknown>. Both halves are asserted: the scan finds it, and the path names it.
+(jolt-compile-eval "(def r7metafn 41)" "r7.meta")
+(let ((cell (jolt-var "r7.meta" "r7metafn")))
+  (var-cell-meta-set! cell (jolt-hash-map (jolt-keyword "test") stub-port))
+  (let ((f (jolt-image-scan cell)))
+    (ok "scan reaches an unwritable object in a var's META"
+        (and (fx=? 1 (jolt-count f))
+             (str-contains? (jolt-get (jolt-nth f 0) (jolt-keyword "path") jolt-nil)
+                            "#'r7.meta/r7metafn meta"))))
+  (var-cell-meta-set! cell jolt-nil))
+;; and the writable case still round-trips the meta through a rebuild
+(jolt-compile-eval "(def ^{:doc \"d\" :my {:a [1 2]}} r7metaok 41)" "r7.meta")
+(jolt-image-write! tmp (jolt-var "r7.meta" "r7metaok") jolt-nil)
+(let ((c (jolt-image-read tmp)))
+  (ok "a var cell's meta survives the image round trip"
+      (and (var-cell? c)
+           (equal? "d" (jolt-get (var-cell-meta c) (jolt-keyword "doc") jolt-nil))
+           (fx=? 2 (jolt-count (jolt-get (jolt-get (var-cell-meta c) (jolt-keyword "my") jolt-nil)
+                                         (jolt-keyword "a") jolt-nil))))))
+
 ;; world: stub by default, listed with its var, resolved in place
 (jolt-compile-eval "(def cfg {:name \"app\" :log nil})" "r6.world")
 (let ((cell (jolt-var "r6.world" "cfg")))

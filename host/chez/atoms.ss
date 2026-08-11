@@ -50,9 +50,14 @@
        (loop (cddr o) validator (cadr o)))
       (else (loop (cddr o) validator m)))))
 
-;; swap!/reset! reach into the atom record directly, so a non-atom receiver would
-;; raise a raw host error with no class for a catch to select. Name the class the
-;; JVM names (nil is its NullPointerException).
+;; The five mutators reach into the atom record directly, so a non-atom receiver
+;; would raise a raw host error with no class for a catch to select — one naming
+;; jolt's own record type ("is not of type #<record type jolt-atom-v3>"), which
+;; classes as :object and therefore matches EVERY catch clause. Name the class the
+;; JVM names instead (nil is its NullPointerException). Every entry point that can
+;; take a receiver from user code opens with this, BEFORE it validates or reads a
+;; field: compare-and-set! validates the new value first, so the check has to come
+;; ahead of that or the raw error is back.
 (define (jolt-need-atom a)
   (if (jolt-atom? a) a (jolt-cast-throw a "clojure.lang.IAtom")))
 
@@ -79,7 +84,7 @@
 ;; CAS the val from `old` to `nv` by identity (eq?), atomically. Returns #t on
 ;; success. The compute step (f) runs outside this, so we re-check under the lock.
 (define (jolt-atom-cas! a old nv)
-  (with-mutex (jolt-atom-lock a)
+  (jolt-with-mutex (jolt-atom-lock a)
     (if (eq? (jolt-atom-val a) old)
         (begin (jolt-atom-val-set! a nv) #t)
         #f)))
@@ -100,15 +105,16 @@
 (define (jolt-reset! a v)
   (jolt-need-atom a)
   (jolt-atom-validate a v)
-  (let ((old (with-mutex (jolt-atom-lock a)
+  (let ((old (jolt-with-mutex (jolt-atom-lock a)
                (let ((o (jolt-atom-val a))) (jolt-atom-val-set! a v) o))))
     (jolt-atom-notify a old v)
     v))
 
 ;; compare-and-set! keeps jolt= (value) semantics, done atomically under the lock.
 (define (jolt-compare-and-set! a oldv newv)
+  (jolt-need-atom a)
   (jolt-atom-validate a newv)
-  (let ((swapped (with-mutex (jolt-atom-lock a)
+  (let ((swapped (jolt-with-mutex (jolt-atom-lock a)
                    (if (jolt= (jolt-atom-val a) oldv)
                        (begin (jolt-atom-val-set! a newv) #t)
                        #f))))
@@ -116,6 +122,7 @@
     swapped))
 
 (define (jolt-swap-vals! a f . args)
+  (jolt-need-atom a)
   (let retry ()
     (let* ((old (jolt-atom-val a))
            (nv (apply jolt-invoke f old args)))
@@ -125,8 +132,9 @@
           (retry)))))
 
 (define (jolt-reset-vals! a v)
+  (jolt-need-atom a)
   (jolt-atom-validate a v)
-  (let ((old (with-mutex (jolt-atom-lock a)
+  (let ((old (jolt-with-mutex (jolt-atom-lock a)
                (let ((o (jolt-atom-val a))) (jolt-atom-val-set! a v) o))))
     (jolt-atom-notify a old v)
     (jolt-vector old v)))
@@ -142,13 +150,45 @@
 (define (iref? r)
   (let loop ((as iref-arms))
     (cond ((null? as) #f) (((car as) r) #t) (else (loop (cdr as))))))
+;; Watches and validators for the IRefs that are NOT atoms (vars, refs) live in
+;; side-tables — an atom keeps its own in the record. A Chez hashtable is not
+;; thread-safe, and add-watch/set-validator! can be called from any thread while
+;; def-var! reads both tables on EVERY def, so both go through one mutex.
+;;
+;; The read side keeps a lock-free fast path, because the read side is the hot
+;; one: iref-writes counts the add-watch / set-validator! calls that put an entry
+;; in either table, so a program that watches nothing pays one box read instead of
+;; two weak-table probes per def — cheaper than before the lock. It is a call
+;; COUNT, not a live-entry count: nothing decrements it, so once a watch has
+;; existed the fast path is off for good even if remove-watch took it away again.
+;; That direction is the safe one, and it is why remove-watch does not bump — it
+;; can only shrink an entry some earlier bump already accounted for.
+;;
+;; The bump is inside the mutex and BEFORE the table write, which is what makes
+;; the fast path sound: a def-var! racing an add-watch either misses the bump and
+;; the entry both (the watch was not registered yet) or sees the bump and takes
+;; the lock, where it finds whatever the writer left. Bumping after the write
+;; would leave a window where the entry is in the table and iref-any? still reads
+;; 0, and that def would silently skip validation and notification. A fixnum box
+;; read cannot tear.
 (define iref-watch-tbl (make-weak-eq-hashtable))
 (define iref-validator-tbl (make-weak-eq-hashtable))
+(define iref-tbl-mu (make-mutex))
+(define iref-writes (box 0))
+(define (iref-any?) (not (eqv? 0 (unbox iref-writes))))
+;; call with iref-tbl-mu HELD — the read-modify-write is not atomic on its own.
+(define (iref-tbl-bump!) (set-box! iref-writes (fx+ 1 (unbox iref-writes))))
+(define (iref-watches-of r)
+  (if (iref-any?) (jolt-with-mutex iref-tbl-mu (hashtable-ref iref-watch-tbl r '())) '()))
+(define (iref-validator-of r)
+  (if (iref-any?)
+      (jolt-with-mutex iref-tbl-mu (hashtable-ref iref-validator-tbl r jolt-nil))
+      jolt-nil))
 (define (iref-notify r old new)
   (for-each (lambda (kv) (jolt-invoke (cdr kv) (car kv) r old new))
-            (reverse (hashtable-ref iref-watch-tbl r '()))))
+            (reverse (iref-watches-of r))))
 (define (iref-validate r v)
-  (let ((vf (hashtable-ref iref-validator-tbl r jolt-nil)))
+  (let ((vf (iref-validator-of r)))
     (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke vf v)))
       (jolt-iref-state-throw))))
 
@@ -156,26 +196,44 @@
 ;; remove-watch drops it; both return the reference. set-validator! installs a
 ;; validator and validates the CURRENT value immediately (Clojure throws if it's
 ;; already invalid); get-validator reads the slot.
+;;
+;; An ATOM keeps its watches in a record slot rather than the side tables below, and
+;; that slot needs the same treatment the tables got: rebuilding the list from the
+;; value just read is a read-modify-write, so two threads registering DIFFERENT keys
+;; could leave only one behind. ARef.addWatch and removeWatch are both `synchronized`
+;; on the JVM. Measured, 8 threads x 200 distinct keys: the list came back short.
+;; The atom's own lock, held only across the rebuild — no user code runs inside it, so
+;; this stays one of the short regions locks.ss is about. The NOTIFY still runs
+;; outside, as it does on the JVM: holding a lock across a watch would let one watch
+;; deadlock every other registration.
+;; set-validator! needs none of this: it overwrites a slot rather than deriving the
+;; new value from the old, so there is nothing to lose.
 (define (jolt-watch-add alist key f)
   (cons (cons key f) (remp (lambda (kv) (jolt=2 (car kv) key)) alist)))
 (define (jolt-add-watch a key f)
   (cond
     ((jolt-atom? a)
-     (jolt-atom-watches-set! a (jolt-watch-add (jolt-atom-watches a) key f))
+     (jolt-with-mutex (jolt-atom-lock a)
+       (jolt-atom-watches-set! a (jolt-watch-add (jolt-atom-watches a) key f)))
      a)
     ((iref? a)
-     (hashtable-set! iref-watch-tbl a (jolt-watch-add (hashtable-ref iref-watch-tbl a '()) key f))
+     (jolt-with-mutex iref-tbl-mu
+       (iref-tbl-bump!)
+       (hashtable-set! iref-watch-tbl a
+         (jolt-watch-add (hashtable-ref iref-watch-tbl a '()) key f)))
      a)
     (else (throw-jvm (quote ClassCastException) "add-watch: not a watchable reference"))))
 (define (jolt-remove-watch a key)
   (cond
     ((jolt-atom? a)
-     (jolt-atom-watches-set! a
-       (remp (lambda (kv) (jolt=2 (car kv) key)) (jolt-atom-watches a)))
+     (jolt-with-mutex (jolt-atom-lock a)
+       (jolt-atom-watches-set! a
+         (remp (lambda (kv) (jolt=2 (car kv) key)) (jolt-atom-watches a))))
      a)
     ((iref? a)
-     (hashtable-set! iref-watch-tbl a
-       (remp (lambda (kv) (jolt=2 (car kv) key)) (hashtable-ref iref-watch-tbl a '())))
+     (jolt-with-mutex iref-tbl-mu
+       (hashtable-set! iref-watch-tbl a
+         (remp (lambda (kv) (jolt=2 (car kv) key)) (hashtable-ref iref-watch-tbl a '()))))
      a)
     (else (throw-jvm (quote ClassCastException) "remove-watch: not a watchable reference"))))
 (define (jolt-set-validator! a f)
@@ -188,12 +246,14 @@
       ((iref? a)
        (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke vf (jolt-deref a))))
          (jolt-iref-state-throw))
-       (hashtable-set! iref-validator-tbl a vf))
+       (jolt-with-mutex iref-tbl-mu
+         (iref-tbl-bump!)
+         (hashtable-set! iref-validator-tbl a vf)))
       (else (throw-jvm (quote ClassCastException) "set-validator!: not a reference")))
     jolt-nil))
 (define (jolt-get-validator a)
   (cond ((jolt-atom? a) (jolt-atom-validator a))
-        ((iref? a) (hashtable-ref iref-validator-tbl a jolt-nil))
+        ((iref? a) (iref-validator-of a))
         (else jolt-nil)))
 
 ;; vars are watchable IRefs: a root change (def / var-set on the root /
@@ -204,8 +264,9 @@
 (set! def-var!
   (lambda (ns name v)
     (let ((c (jolt-var ns name)))
-      (if (or (pair? (hashtable-ref iref-watch-tbl c '()))
-              (not (jolt-nil? (hashtable-ref iref-validator-tbl c jolt-nil))))
+      (if (and (iref-any?)
+               (or (pair? (iref-watches-of c))
+                   (not (jolt-nil? (iref-validator-of c)))))
           (let ((old (var-cell-root c)))
             (iref-validate c v)
             (let ((r (def-var!-pre-iref ns name v)))

@@ -75,7 +75,7 @@
   ;; (schema's record*/class-schema hold the type as a value, not a literal symbol).
   (let* ((type-sym (cond ((jclass? type-sym0) (jclass-name type-sym0))
                          ((and (procedure? type-sym0)
-                               (hashtable-ref chez-deftype-ctor-tag type-sym0 #f)))
+                               (deftype-ctor-tag type-sym0)))
                          (else type-sym0)))
          (ts (if (and (string? type-sym)
                      (or (= 0 (string-length type-sym))

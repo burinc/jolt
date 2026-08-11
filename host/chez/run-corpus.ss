@@ -50,11 +50,15 @@
 (define zj-type-base (zj-snap type-registry))
 (define zj-ghier (var-cell-lookup "clojure.core" "global-hierarchy"))
 (define (zj-reset!)
-  (vector-for-each (lambda (k) (unless (hashtable-ref zj-base k #f) (hashtable-delete! var-table k)))
-                   (hashtable-keys var-table))
+  ;; a var-table mutation, so it takes var-table-mu like every other one (rt.ss).
+  ;; This harness is single-threaded, but the invariant is easier to keep if it
+  ;; has no exceptions.
+  (jolt-with-mutex var-table-mu
+    (vector-for-each (lambda (k) (unless (hashtable-ref zj-base k #f) (hashtable-delete! var-table k)))
+                     (hashtable-keys var-table)))
   (for-each (lambda (cr) (unless (eq? (var-cell-root (car cr)) (cdr cr))
                            (var-cell-root-set! (car cr) (cdr cr)))) zj-roots)
-  (zj-prune! ns-registry zj-ns-base)
+  (jolt-with-mutex ns-registry-mu (zj-prune! ns-registry zj-ns-base))  ; same rule as var-table (ns.ss)
   (zj-prune! type-registry zj-type-base)
   (hashtable-clear! ns-alias-table)
   (hashtable-clear! ns-refer-table)
