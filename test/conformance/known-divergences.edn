@@ -535,6 +535,12 @@
    {:suite "multimethods / hierarchies", :label "explicit :hierarchy", :category :permissive}
    {:suite "permissive / keys on pair vector", :label "keys works on vector of pairs", :category :permissive}
 
+   ;; An Eduction is IReduceInit but not IReduce, so the JVM's one-argument reduce
+   ;; casts it and raises; jolt's reduce draws the first element from the eduction
+   ;; itself and folds the rest. The same superset as count over an eduction, which
+   ;; the :permissive note already names.
+   {:suite "seq / lazy over infinite", :label "eduction reduces", :category :permissive}
+
    ;; with-open closes anything carrying a :close fn; the JVM demands a member
    ;; named close and raises on a map. line-seq and file-seq are the same shape:
    ;; jolt duck-types the reader and takes a path string, where the JVM insists on
