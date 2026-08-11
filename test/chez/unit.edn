@@ -955,6 +955,16 @@
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1 (map inc)) p (future (a/>!! c 1) (a/>!! c 2) (a/>!! c 3) :done)] (Thread/sleep 100) (let [parked (not (realized? p)) v1 (a/<!! c) v2 (a/<!! c) v3 (a/<!! c) result @p] [parked v1 v2 v3 result])))" :expected "[true 2 3 4 :done]"}
   ;; Stage B — pending rendezvous put parks until consumed (does NOT complete on close)
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) p (future (a/>!! c :v))] (Thread/sleep 50) (a/close! c) [(a/<!! c) @p]))" :expected "[:v true]"}
+  ;; io-thread is the FIBER carrier (jolt-579): the three names pick the three
+  ;; things — thread an OS thread, io-thread a fiber, go the CPS pass — and
+  ;; jolt.host/fiber? is the runtime's own answer, the same read <! dispatches on.
+  ;; The carrier assertions are here as well as in the io-thread gate because this
+  ;; is the only one that goes through the production loader end to end.
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) [(a/<!! (a/io-thread (+ 1 2))) (a/<!! (a/io-thread (jolt.host/fiber?))) (a/<!! (a/thread (jolt.host/fiber?))) (a/<!! (a/thread-call (fn [] (jolt.host/fiber?)) :compute))])" :expected "[3 true false false]"}
+  ;; a park several frames deep in an io-thread body, and a nil body just closes
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (defn iot-take [c] (a/<!! c)) (let [c (a/chan) g (a/io-thread (iot-take c))] (a/>!! c :deep) [(a/<!! g) (a/<!! (a/io-thread nil))]))" :expected "[:deep nil]"}
+  ;; an unknown workload is refused rather than quietly run on some carrier
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (try (a/thread-call (fn [] 1) :bogus) :no-throw (catch IllegalArgumentException e (ex-message e))))" :expected "\"Invalid workload :bogus — expected :io, :compute or :mixed\""}
   ;; Stage C — pattern-driven tz offset parse applies offset
   {:suite "insttime" :expr "(.getTime (.parse (java.text.SimpleDateFormat. \"yyyy-MM-dd'T'HH:mm:ssX\") \"2024-01-01T00:00:00+05\"))" :expected "1704049200000"}
   {:suite "insttime" :expr "(.getTime (.parse (java.text.SimpleDateFormat. \"yyyy-MM-dd'T'HH:mm:ssX\") \"2024-01-01T00:00:00Z\"))" :expected "1704067200000"}
