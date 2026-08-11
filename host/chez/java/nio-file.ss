@@ -1,5 +1,5 @@
 ;; nio-file.ss — java.nio.file shim, part 1: the Path value + Paths / Path / of
-;; construction, FileSystems.getPathMatcher glob/regex matching, and the
+;; construction, FileSystems path construction and glob/regex matching, and the
 ;; File<->Path bridge. babashka.fs is built entirely on java.nio.file, so this
 ;; is the substrate it runs on.
 ;;
@@ -103,6 +103,7 @@
 (define (make-nio-path s) (make-jhost "nio-path" (if (string? s) s (npath-string-of s))))
 (define (nio-path? x) (and (jhost? x) (string=? (jhost-tag x) "nio-path")))
 (define (nio-path-str p) (jhost-state p))
+(define default-nio-filesystem (make-jhost "nio-filesystem" #f))
 
 ;; A path string of any value: a Path -> its string, a File -> its path, else str.
 (define (npath-string-of x)
@@ -141,6 +142,7 @@
                                                (make-nio-path (list-ref segs i)))))
       ((string=? name "getNameCount")  (list (length (npath-segs s))))
       ((string=? name "getRoot")       (list (if (npath-absolute? s) (make-nio-path "/") jolt-nil)))
+      ((string=? name "getFileSystem") (list default-nio-filesystem))
       ((string=? name "normalize")     (list (make-nio-path (npath-normalize s))))
       ((string=? name "resolve")       (list (npath-resolve self (car rest))))
       ((string=? name "resolveSibling")(list (let ((par (npath-parent s)))
@@ -220,12 +222,13 @@
 
 (register-host-methods! "nio-filesystem"
   (list (cons "getPathMatcher" (lambda (self spec) (npath-make-matcher (npath-string-of spec))))
+        (cons "getPath" (lambda (self first . more) (apply npath-get first more)))
         (cons "getSeparator" (lambda (self) "/"))))
 
 ;; ---- construction statics + File bridge -------------------------------------
 (let ((paths-statics (list (cons "get" npath-get)))
       (path-statics  (list (cons "of" npath-get)))
-      (fs-statics    (list (cons "getDefault" (lambda () (make-jhost "nio-filesystem" #f))))))
+      (fs-statics    (list (cons "getDefault" (lambda () default-nio-filesystem)))))
   (register-class-statics! "Paths" paths-statics)
   (register-class-statics! "java.nio.file.Paths" paths-statics)
   (register-class-statics! "Path" path-statics)
