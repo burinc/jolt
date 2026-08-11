@@ -468,6 +468,50 @@
 (def ^:private max-redirects 5)
 (def ^:private redirect-codes #{301 302 303 307 308})
 
+;; --- outcome classification ---------------------------------------------------
+;; A fetch used to answer one bit, and the caller (jolt.deps) printed "not found"
+;; for it. Only ONE of the ways a fetch fails means that. The rest — a reset, a
+;; TLS failure, a timeout, a 503 — say nothing about whether the artifact exists,
+;; and reporting them as absent sent people looking for a missing dependency that
+;; was published years ago. So an outcome names its reason:
+;;
+;;   :ok         2xx, body written
+;;   :not-found  the repo answered, definitively, that it does not have this
+;;   :retryable  a transient condition; the same request may well succeed
+;;   :failed     a real failure that retrying cannot fix (cert, parse, 403)
+;;
+;; The split matters twice: it decides what to retry, and it decides what the
+;; user is told.
+(defn- classify-status [status]
+  (cond
+    (<= 200 status 299)               :ok
+    (or (= status 404) (= status 410)) :not-found
+    ;; 408 request timeout, 429 rate limited, 5xx server-side — the statuses a
+    ;; retry exists for. Central and Clojars serve these under load.
+    (or (= status 408) (= status 429) (<= 500 status 599)) :retryable
+    ;; 401/403 and the rest: the repo answered and it was not a "no such
+    ;; artifact". Retrying cannot help and neither can looking for a typo.
+    :else                             :failed))
+
+(def ^:private max-attempts 3)
+;; Backoff between attempts. Deliberately short: this sits in front of a
+;; developer waiting on a build, and the failures it covers (a reset, a brief
+;; 503) clear in well under a second. A long backoff would trade a rare recovery
+;; for a guaranteed stall on the genuinely-down case.
+(def ^:private retry-backoff-ms [200 600])
+
+(defn- with-retries
+  "Call ATTEMPT until it returns a non-:retryable outcome, at most max-attempts
+  times. Returns the last outcome — still :retryable when the cap is reached, so
+  the caller reports 'could not fetch' rather than 'not found'."
+  [attempt]
+  (loop [n 1]
+    (let [r (attempt)]
+      (if (or (not= :retryable (:outcome r)) (>= n max-attempts))
+        r
+        (do (when-let [ms (nth retry-backoff-ms (dec n) nil)] (Thread/sleep ms))
+            (recur (inc n)))))))
+
 (defn- fetch-once [url out-path]
   (let [{:keys [host port path]} (parse-url url)
         st (tls-connect host port)]
@@ -479,28 +523,43 @@
           (and (redirect-codes status) loc)
           {:redirect (resolve-location {:host host :port port} loc)}
           ;; a Content-Length that disagrees with the body we read means the
-          ;; transfer was cut short — treat it as a failure, don't write a
-          ;; truncated jar.
+          ;; transfer was cut short — don't write a truncated jar, and don't call
+          ;; it absent: a mid-body drop is the clearest retry candidate there is.
           (and (<= 200 status 299) content-length (not= content-length (alength body)))
-          {:result false}
-          (<= 200 status 299) (do (write-bytes-to-file out-path body) {:result true})
-          :else {:result false}))
+          {:outcome :retryable :status status :error "truncated body"}
+          (<= 200 status 299) (do (write-bytes-to-file out-path body) {:outcome :ok :status status})
+          :else {:outcome (classify-status status) :status status}))
       (finally (tls-close st)))))
 
-(defn fetch
+(defn fetch*
   "GET `url` (HTTPS only) over a cert-verified TLS connection and write the
-  response body as raw bytes to `out-path`. Follows up to 5 redirects. Returns
-  true on a 2xx final status, false/nil on any failure (DNS, connect, TLS,
-  cert, parse, non-2xx). A failed fetch never leaves a partial file."
+  response body as raw bytes to `out-path`. Follows up to 5 redirects, and
+  retries a transient failure up to `max-attempts` times.
+
+  Returns {:outcome :ok|:not-found|:retryable|:failed, :status n, :error s}.
+  Only :ok wrote a file; a failed fetch never leaves a partial one."
   [url out-path]
-  (try
-    (if-not (ensure-native!) false
-            (loop [u url redirects 0]
-              (let [r (fetch-once u out-path)]
-                (cond
-                  (:redirect r) (if (>= redirects max-redirects)
-                                  false
-                                  (recur (:redirect r) (inc redirects)))
-                  (contains? r :result) (:result r)
-                  :else false))))
-    (catch :default _ false)))
+  (if-not (ensure-native!)
+    {:outcome :failed :error "the native TLS transport could not be loaded"}
+    (with-retries
+      (fn []
+        ;; The catch stays — a fetch must not escape into dependency resolution
+        ;; — but the condition is CARRIED now instead of discarded, so the
+        ;; warning can name what went wrong. A connect/TLS/parse throw is
+        ;; transient far more often than not, so it retries.
+        (try
+          (loop [u url redirects 0]
+            (let [r (fetch-once u out-path)]
+              (cond
+                (:redirect r) (if (>= redirects max-redirects)
+                                {:outcome :failed :error "too many redirects"}
+                                (recur (:redirect r) (inc redirects)))
+                :else r)))
+          (catch :default e
+            {:outcome :retryable :error (or (ex-message e) (str e))}))))))
+
+(defn fetch
+  "GET `url` to `out-path`; true when the body was written. The boolean face of
+  `fetch*`, kept for callers that only need to know whether it worked."
+  [url out-path]
+  (= :ok (:outcome (fetch* url out-path))))

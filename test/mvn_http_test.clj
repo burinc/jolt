@@ -14,6 +14,9 @@
 (def parse-response   (var jolt.mvn-http/parse-response))
 (def dechunk          (var jolt.mvn-http/dechunk))
 (def ctl-free?        (var jolt.mvn-http/ctl-free?))
+(def classify-status  (var jolt.mvn-http/classify-status))
+(def with-retries     (var jolt.mvn-http/with-retries))
+(def max-attempts     @(var jolt.mvn-http/max-attempts))
 
 (def ^:private fails (atom []))
 (defn- ok= [expected actual label]
@@ -75,7 +78,55 @@
   (let [r (parse-response (bytes-of "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"))]
     (ok= "hello" (String. ^bytes (:body r) "ISO-8859-1") "parse-response chunked body")
     (ok= nil (:content-length r) "parse-response chunked ignores content-length"))
-  (throws #(parse-response (bytes-of "no header terminator here")) "parse-response no terminator throws"))
+  (throws #(parse-response (bytes-of "no header terminator here")) "parse-response no terminator throws")
+
+  ;; --- outcome classification (jolt-ktiz.1, .5, .6) --------------------------
+  ;; The whole point of the round: a fetch that failed must say WHY, because
+  ;; deps.clj prints "not found" and only one of these means that. Pure, so it
+  ;; is checked here rather than against a live repo.
+  (ok= :ok        (classify-status 200) "classify 200 -> ok")
+  (ok= :ok        (classify-status 299) "classify 299 -> ok")
+  (ok= :not-found (classify-status 404) "classify 404 -> not-found")
+  (ok= :not-found (classify-status 410) "classify 410 -> not-found")
+  ;; the statuses a retry exists for; treating these as absent is jolt-ktiz.5
+  (ok= :retryable (classify-status 408) "classify 408 -> retryable")
+  (ok= :retryable (classify-status 429) "classify 429 -> retryable")
+  (ok= :retryable (classify-status 500) "classify 500 -> retryable")
+  (ok= :retryable (classify-status 502) "classify 502 -> retryable")
+  (ok= :retryable (classify-status 503) "classify 503 -> retryable")
+  (ok= :retryable (classify-status 504) "classify 504 -> retryable")
+  ;; a repo that refuses us is not a repo that lacks the artifact, and no number
+  ;; of retries changes either
+  (ok= :failed    (classify-status 401) "classify 401 -> failed")
+  (ok= :failed    (classify-status 403) "classify 403 -> failed")
+  (ok= :failed    (classify-status 418) "classify 418 -> failed")
+
+  ;; --- retry policy (jolt-ktiz.2) --------------------------------------------
+  ;; Driven through an injectable attempt fn so the gate stays network-free.
+  ;; A :retryable outcome is retried up to the cap; anything else is final.
+  (let [calls (atom 0)
+        attempt (fn [outcomes] (fn [] (let [n @calls] (swap! calls inc) (nth outcomes n {:outcome :failed}))))]
+    (reset! calls 0)
+    (ok= :ok (:outcome (with-retries (attempt [{:outcome :retryable} {:outcome :retryable} {:outcome :ok}])))
+         "retry: succeeds on the third attempt")
+    (ok= 3 @calls "retry: took exactly three attempts")
+
+    (reset! calls 0)
+    (ok= :not-found (:outcome (with-retries (attempt [{:outcome :not-found} {:outcome :ok}])))
+         "retry: a 404 is final, not retried")
+    (ok= 1 @calls "retry: not-found took one attempt")
+
+    (reset! calls 0)
+    (ok= :failed (:outcome (with-retries (attempt [{:outcome :failed} {:outcome :ok}])))
+         "retry: a hard failure is final, not retried")
+    (ok= 1 @calls "retry: failed took one attempt")
+
+    ;; exhausting the cap reports the LAST outcome, still :retryable, so the
+    ;; caller can say "could not fetch after N attempts" rather than "not found"
+    (reset! calls 0)
+    (ok= :retryable (:outcome (with-retries (attempt (repeat 9 {:outcome :retryable}))))
+         "retry: gives up as retryable, never as not-found")
+    (ok= max-attempts @calls "retry: stops at the attempt cap")))
 
 (defn -main [& _]
   (run)

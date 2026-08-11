@@ -55,6 +55,42 @@
   false)
 (defn- info [& xs] (when (or *verbose* (getenv "JOLT_DEBUG")) (apply warn xs)))
 
+;; --- deps that could not be resolved ------------------------------------------
+;; A Maven dep whose download failed used to leave procurement with no root, and
+;; the expansion treats no-root as {:manifest :none} — contributing nothing,
+;; exactly like the DELIBERATELY tolerant case of a jar with no jolt-loadable
+;; source. So a declared dependency silently left the classpath and the program
+;; failed later somewhere that never mentioned it: a transient fetch failure for
+;; org.clojure/spec.alpha surfaced as 55 "connect refused" errors in an nREPL
+;; suite, because orchard needed it and never loaded.
+;;
+;; UNRESOLVABLE IS NOW FATAL, which is what the reference implementation does.
+;; tools.deps aborts with "Error building classpath. The following artifacts
+;; could not be resolved: …" and exits 1, for a missing artifact and for an
+;; unreachable repository alike — verified against Clojure CLI 1.12.5.1654.
+;; jolt already did this for GIT deps (a tag that does not exist throws); Maven
+;; was the outlier.
+;;
+;; Note what is NOT affected: a jar that downloaded fine and simply carries no
+;; jolt-loadable source still contributes nothing, quietly. That is a different
+;; condition — the artifact resolved — and plenty of JVM-only jars are declared
+;; transitively. Only a failure to OBTAIN the artifact is fatal.
+;;
+;; Collected rather than thrown at the first failure, so the message names every
+;; unresolvable dep at once the way tools.deps' does, instead of making you fix
+;; them one build at a time.
+(def ^:private ^:dynamic *unresolvable* nil)
+(defn- note-unresolvable! [coord version detail]
+  (when *unresolvable*
+    (swap! *unresolvable* conj {:coord coord :version version :detail detail})))
+(defn- fail-unresolvable! []
+  (when-let [missed (some-> *unresolvable* deref seq)]
+    (throw (ex-info
+            (str "Error building classpath. The following artifacts could not be resolved:\n"
+                 (str/join "\n" (map #(str "  " (:coord %) " " (:version %) " — " (:detail %))
+                                     missed)))
+            {:unresolved (mapv #(select-keys % [:coord :version :detail]) missed)}))))
+
 (defn- read-edn [path]
   (when (file-exists? path)
     (try (edn/read-string (slurp path))
@@ -366,18 +402,40 @@
       (if (and (not legacy) (file-exists? jar))
         (do (info "using " jar-name " from the local Maven repository")
             (extract-jar! jar dir))
-        (loop [repos *mvn-repos*]
+        ;; ERRORS carries the repos that failed for a reason OTHER than "no such
+        ;; artifact". Every repo answering 404 is a real "not found" and says so;
+        ;; a reset or a 503 is not, and reporting it as absent sent people
+        ;; looking for a dependency that was published years ago. Either way the
+        ;; dep is unresolvable and resolution will abort — the distinction is
+        ;; what the message says, and whether a retry was even attempted.
+        (loop [repos *mvn-repos* errors []]
           (if (empty? repos)
-            (do (warn "maven dep " coord " " version " not found (tried " (str/join ", " *mvn-repos*) ")") nil)
-            (if (do (sh (str "mkdir -p " (pr-str (if legacy dir (str (m2-repo-dir) "/" vdir-rel)))))
-                    (http/fetch (str (first repos) "/" vdir-rel "/" jar-name) jar))
-              (do (info "fetching " coord " " version)
-                  (let [d (extract-jar! jar dir)]
-                    ;; legacy layout never keeps the jar; the m2 layout does —
-                    ;; that IS the sharing.
-                    (when legacy (sh (str "rm -f " (pr-str jar))))
-                    d))
-              (recur (rest repos)))))))))
+            (do (note-unresolvable!
+                 coord version
+                 (if (seq errors)
+                   ;; a reset, a 503, a TLS failure: the repos never told us
+                   ;; whether they have it, so do not claim they said no
+                   (str "could not be fetched: " (str/join "; " errors))
+                   (str "not found in any repository (tried "
+                        (str/join ", " *mvn-repos*) ")")))
+                nil)
+            (let [repo (first repos)
+                  _ (sh (str "mkdir -p " (pr-str (if legacy dir (str (m2-repo-dir) "/" vdir-rel)))))
+                  r (http/fetch* (str repo "/" vdir-rel "/" jar-name) jar)]
+              (if (= :ok (:outcome r))
+                (do (info "fetching " coord " " version)
+                    (let [d (extract-jar! jar dir)]
+                      ;; legacy layout never keeps the jar; the m2 layout does —
+                      ;; that IS the sharing.
+                      (when legacy (sh (str "rm -f " (pr-str jar))))
+                      d))
+                (recur (rest repos)
+                       (if (= :not-found (:outcome r))
+                         errors
+                         (conj errors (str repo " — "
+                                           (or (:error r)
+                                               (when (:status r) (str "HTTP " (:status r)))
+                                               (name (:outcome r)))))))))))))))
 
 (defn- raw-pom-deps-from
   "Transitive deps read from a pom.xml — as a deps map so the expansion walks
@@ -769,7 +827,11 @@
   dep-tree-lines renders and trace-edn-string writes out."
   ([deps base-dir] (resolve-deps deps base-dir nil))
   ([deps base-dir {:keys [override-deps default-deps trace?]}]
-   (binding [*procure-memo* (or *procure-memo* (atom {}))]
+   ;; A nested resolve-deps inherits the outer atom, so the summary is printed
+   ;; ONCE by whichever frame created it rather than once per level.
+   (let [outermost? (nil? *unresolvable*)]
+   (binding [*procure-memo* (or *procure-memo* (atom {}))
+             *unresolvable* (or *unresolvable* (atom []))]
      (let [abs #(absolutize-local % base-dir)
            top (filter-deps deps base-dir)
            override-deps (some->> override-deps (map (fn [[l c]] [l (abs c)])) (into {}))
@@ -792,6 +854,7 @@
                            (let [info (ext/coord-info lib coord)]
                              (when (:root info) (assoc info :lib lib)))))
                        (:order expansion))]
+       (when outermost? (fail-unresolvable!))
        {:roots (vec (mapcat (fn [{:keys [root manifest edn]}]
                               (if (= manifest :deps-edn)
                                 (map #(abspath root %) (or (:paths edn) ["src"]))
@@ -803,7 +866,7 @@
         ;; caller warns with the lib names.
         :prep (vec (keep (fn [{:keys [lib edn]}] (when (:deps/prep-lib edn) lib)) infos))
         :libs libmap
-        :trace (:trace expansion)}))))
+        :trace (:trace expansion)})))))
 
 ;; --- dependency tree --------------------------------------------------------
 ;; The trace is a flat log of expansion decisions in traversal order; the tree is

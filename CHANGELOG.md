@@ -5,7 +5,62 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.0] - 2026-08-10
+## [0.7.1] - 2026-08-11
+
+Dependency resolution tells the truth about a Maven fetch that failed, retries a
+transient one, and stops silently continuing without the dependency.
+
+### Changed
+
+- **Grenadine updated to v0.1.6.** No behaviour change for jolt: the only two
+  namespaces jolt consumes, `grenadine.version` and `grenadine.pom`, differ from
+  v0.1.5 by license and provenance comment headers alone.
+
+  It is not a plain submodule bump, though. From v0.1.6 Grenadine *generates*
+  `basis`, `coordinate`, `expander` and `gitlibs` from pinned upstream sources
+  rather than committing them — its own `.gitignore` lists all four — so the git
+  tree is an incomplete source tree, and jolt loads Clojure straight off
+  `vendor/grenadine/src`. Those four now come from the release's
+  checksum-verified `-src.tar.gz` and live in `vendor/grenadine-generated`; the
+  alternative was running Grenadine's `yq`-and-`git clone` staging step on every
+  build and CI job. `make grenadinecheck` fails if the vendored sources and the
+  pinned submodule name different versions.
+
+- **A Maven dependency that cannot be obtained is now a hard error**, matching
+  the reference implementation: tools.deps aborts with "Error building
+  classpath. The following artifacts could not be resolved:" and exits 1 for a
+  missing artifact and an unreachable repository alike (checked against Clojure
+  CLI 1.12.5.1654), and jolt already did this for a git dep whose tag does not
+  exist. Maven was the outlier — it warned and carried on with the dependency
+  missing from the classpath. Every unresolvable dep is named in one message,
+  as tools.deps does, rather than one build at a time.
+
+  Unaffected: a jar that downloads fine and carries no jolt-loadable source
+  still contributes nothing, quietly. That is a different condition — the
+  artifact resolved — and JVM-only jars turn up as transitive deps routinely.
+  Only failing to *obtain* an artifact is fatal.
+
+### Fixed
+
+- **"not found" no longer means "something went wrong".** `jolt.mvn-http/fetch`
+  answered one bit, so a 404 was indistinguishable from a connection reset, a
+  TLS failure, a timeout, a truncated body, a 429 or a 503 — and `jolt.deps`
+  reported all of them as `maven dep X V not found`. A fetch now classifies its
+  outcome (`:ok` / `:not-found` / `:retryable` / `:failed`), and the message
+  distinguishes "not found in any repository" from "could not be fetched:
+  <repo> — <reason>", naming the underlying error instead of discarding it.
+
+  This is not hypothetical: the v0.7.0 release run reported
+  `org.clojure/spec.alpha 0.5.238 not found` for an artifact that returns HTTP
+  200 from Central. The dependency vanished from the classpath, orchard failed
+  to load, and the nREPL suite reported it as 55 identical "connect refused"
+  errors that never mentioned a dependency.
+
+- **A transient Maven fetch is retried**, three attempts with a short backoff,
+  and only for conditions a retry can fix — a 408, a 429, a 5xx, a truncated
+  body, or a connect/TLS error. A 404 and a 403 are final and cost exactly one
+  attempt. There was no retry at all before, so a single packet-loss event
+  failed a whole resolution.
 
 Finishes the fiber backend for `core.async`. A parked `go` process is roughly
 5.5x smaller when the compiler can see where it parks, a compute-bound body no
