@@ -926,7 +926,7 @@
 
 ;; (jolt-fiber-monitor! f proc) -> void. Register PROC on fiber F.
 ;;
-;; The FIBER-level primitive. clojure.core.async's fiber-monitor does not come
+;; The FIBER-level primitive. clojure.core.async's go-monitor does not come
 ;; through here: it is keyed on the go CHANNEL (async.ss go-chan-monitor!) so it
 ;; can answer for a thread-backed body too, which this cannot — there is no fiber
 ;; to register on. Gated directly by fibers-test.ss 7c, both arms.
@@ -963,7 +963,7 @@
 ;; The state is what tells a late registration to deliver inline and the error is
 ;; what it delivers, so the two have to become visible together. Set outside the
 ;; lock they were two steps in the wrong order: jolt-fiber-dead! marked the fiber
-;; 'dead and only then wrote the condition, so a fiber-monitor call from another
+;; 'dead and only then wrote the condition, so a registration from another
 ;; thread landing between them read a finished fiber with no error and reported a
 ;; body that threw as a clean completion — which is the one thing monitoring
 ;; exists to make visible. Every other field a monitor or a waiting gate reads

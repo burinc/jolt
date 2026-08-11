@@ -283,7 +283,7 @@
 ;; terminal yet, because the check above just said so and the carrier is blocked
 ;; on this very mutex. Chez mutexes are recursive per thread, so the registration
 ;; takes the lock this thread already owns. Covers the fiber-level primitive
-;; directly — clojure.core.async's fiber-monitor is keyed on the go CHANNEL now
+;; directly — clojure.core.async's go-monitor is keyed on the go CHANNEL now
 ;; (async.ss go-chan-monitor!, so it can answer for a thread-backed body too) and
 ;; no longer reaches this one.
 (define pub-seen (box 'unset))

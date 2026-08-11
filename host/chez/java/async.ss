@@ -703,7 +703,7 @@
                (else (vector-set! c 2 (cons proc (vector-ref c 2))) #f))))))
     (when now (proc (car now)))))
 
-;; (fiber-monitor ch) -> channel. Yields the throwable if the body died, and
+;; (go-monitor ch) -> channel. Yields the throwable if the body died, and
 ;; CLOSES (nil) if it completed normally. A promise-style buffered(1) channel, so
 ;; the value is there whether the caller takes before or after the body finishes.
 (define (jolt-go-monitor-chan ch)
@@ -713,7 +713,7 @@
         (when err (jolt-async-give m (jolt-unwrap-throw err)))
         (jolt-async-close! m)))
     m))
-(def-var! "clojure.core.async" "fiber-monitor" jolt-go-monitor-chan)
+(def-var! "clojure.core.async" "go-monitor" jolt-go-monitor-chan)
 
 ;; --- alts! entry point -------------------------------------------------------
 ;; (__do-alts ports priority?) — ports is a jolt vector of channels or [ch val]

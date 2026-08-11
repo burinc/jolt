@@ -3,7 +3,7 @@
 ;;
 ;; Before this, a go body that threw and a go body that returned nil were
 ;; indistinguishable: both reported to async-report-uncaught! at best, closed
-;; the result channel, and gave the reader nil. (fiber-monitor g) yields the
+;; the result channel, and gave the reader nil. (go-monitor g) yields the
 ;; throwable if the body died and closes (nil) if it did not.
 ;;
 ;; Loads the host runtime plus the async overlay, the same combination
@@ -29,7 +29,7 @@
         (let ((c (read-char p)))
           (if (eof-object? c) (list->string (reverse acc)) (loop (cons c acc))))))))
 (jolt-load-string overlay-src)
-(ev "(require '[clojure.core.async :refer [chan go <! >!! <!! timeout *go-backend* fiber-monitor]])")
+(ev "(require '[clojure.core.async :refer [chan go <! >!! <!! timeout *go-backend* go-monitor]])")
 
 (printf "== fiber monitors ==\n")
 
@@ -40,8 +40,8 @@
 (binding [*go-backend* :fiber]
   (let [boom (go (throw (ex-info \"boom\" {:k 1})))
         nily (go nil)
-        bm   (<!! (fiber-monitor boom))
-        nm   (<!! (fiber-monitor nily))]
+        bm   (<!! (go-monitor boom))
+        nm   (<!! (go-monitor nily))]
     [(<!! boom) (<!! nily) (ex-message bm) (ex-data bm) (nil? nm)]))"))
 (ok "1. both bodies give nil on the go channel"
     (and (jolt-nil? (jv-nth r1 0)) (jolt-nil? (jv-nth r1 1))))
@@ -55,7 +55,7 @@
 (define r2 (ev "
 (binding [*go-backend* :fiber]
   (let [g (go 42)]
-    [(<!! g) (nil? (<!! (fiber-monitor g)))]))"))
+    [(<!! g) (nil? (<!! (go-monitor g)))]))"))
 (ok "2. the value still lands on the go channel" (jolt=2 (jv-nth r2 0) 42))
 (ok "2. a successful body monitors as nil" (jolt-truthy? (jv-nth r2 1)))
 
@@ -68,15 +68,15 @@
 (binding [*go-backend* :fiber]
   (let [g (go (throw (ex-info \"late\" {})))]
     (Thread/sleep 300)
-    (ex-message (<!! (fiber-monitor g)))))"))
+    (ex-message (<!! (go-monitor g)))))"))
 (ok "3. a monitor registered after death still resolves" (jolt=2 r3 "late"))
 
 ;; --- 4. two monitors on one fiber both fire ---------------------------------
 (define r4 (ev "
 (binding [*go-backend* :fiber]
   (let [g  (go (throw (ex-info \"twice\" {})))
-        m1 (fiber-monitor g)
-        m2 (fiber-monitor g)]
+        m1 (go-monitor g)
+        m2 (go-monitor g)]
     [(ex-message (<!! m1)) (ex-message (<!! m2))]))"))
 (ok "4. every registered monitor fires"
     (and (jolt=2 (jv-nth r4 0) "twice") (jolt=2 (jv-nth r4 1) "twice")))
@@ -90,7 +90,7 @@
         g (go (let [v (<! c)] (throw (ex-info \"after park\" {:v v}))))]
     (Thread/sleep 200)
     (>!! c :go)
-    (ex-message (<!! (fiber-monitor g)))))"))
+    (ex-message (<!! (go-monitor g)))))"))
 (ok "5. a throw after a park is reported" (jolt=2 r5 "after park"))
 
 ;; --- 6. the :thread backend reports the same way ----------------------------
@@ -104,8 +104,8 @@
 (binding [*go-backend* :thread]
   (let [g    (go 7)
         boom (go (throw (ex-info \"thread boom\" {:t 1})))
-        bm   (<!! (fiber-monitor boom))]
-    [(<!! g) (nil? (<!! (fiber-monitor g))) (<!! boom) (ex-message bm) (ex-data bm)]))"))
+        bm   (<!! (go-monitor boom))]
+    [(<!! g) (nil? (<!! (go-monitor g))) (<!! boom) (ex-message bm) (ex-data bm)]))"))
 (ok "6. a thread-backend go still returns its value" (jolt=2 (jv-nth r6 0) 7))
 (ok "6. a thread-backend body that succeeded monitors as nil"
     (jolt-truthy? (jv-nth r6 1)))
@@ -123,13 +123,13 @@
 (binding [*go-backend* :thread]
   (let [g (go (throw (ex-info \"late thread\" {})))]
     (Thread/sleep 300)
-    (ex-message (<!! (fiber-monitor g)))))") "late thread"))
+    (ex-message (<!! (go-monitor g)))))") "late thread"))
 
 ;; A channel that is not a go channel has no completion to report, which is a
 ;; different thing from a body that completed cleanly, but nil is the only
 ;; honest answer for it and it must not raise.
 (ok "6. monitoring a plain channel degrades to nil"
-    (jolt-truthy? (ev "(nil? (<!! (fiber-monitor (chan))))")))
+    (jolt-truthy? (ev "(nil? (<!! (go-monitor (chan))))")))
 
 ;; --- 6b. the same body, both backends, same verdict --------------------------
 ;; The invariant stated directly: run one body on each backend and require the
@@ -139,7 +139,7 @@
 (let [run (fn [backend]
             (binding [*go-backend* backend]
               (let [g (go (throw (ex-info \"same\" {})))]
-                (ex-message (<!! (fiber-monitor g))))))]
+                (ex-message (<!! (go-monitor g))))))]
   [(run :fiber) (run :thread)])"))
 (ok "6b. both backends report a dying body identically"
     (and (jolt=2 (jv-nth r6b 0) "same") (jolt=2 (jv-nth r6b 1) "same")))
@@ -166,13 +166,13 @@
       (let [c (chan 1)
             _ (>!! c :v)
             g (go (let [v (<! c)] (throw (ex-info \"race\" {:v v}))))
-            m (<!! (fiber-monitor g))]
+            m (<!! (go-monitor g))]
         (recur (inc i) (if (nil? m) (inc clean) clean))))))"))
 (ok "7. a rewritten body's death is never reported as a clean completion"
     (jolt=2 r7 0))
 
 ;; --- 8. a raising monitor is contained -------------------------------------
-;; Not reachable from the jolt surface — the only proc fiber-monitor registers is
+;; Not reachable from the jolt surface — the only proc go-monitor registers is
 ;; the one that fills its own channel — so this drives the registry directly.
 ;; What it protects is the CLOSE: an escape out of the notify loop would skip
 ;; go-chan-finish!'s jolt-async-close!, and every reader of that go block would

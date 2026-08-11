@@ -177,7 +177,7 @@
     w))
 
 ;; Monitoring a go block is backend-neutral and lives with the go surface in
-;; async.ss (go-chan-register! / go-chan-finish! / the fiber-monitor var). It
+;; async.ss (go-chan-register! / go-chan-finish! / the go-monitor var). It
 ;; used to be here, keyed channel -> FIBER, which is why it had nothing to say
 ;; about a thread-backed body. jolt-fiber-monitor! (fibers.ss) is still the
 ;; fiber-level primitive and is what the scheduler gates read.
