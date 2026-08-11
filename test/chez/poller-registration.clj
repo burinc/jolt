@@ -25,11 +25,13 @@
 ;; main thread parked in a condition wait, poller thread in kevent — and reported
 ;; nothing (jolt-8tma). Hence the watchdog: the MAIN thread does nothing but
 ;; watch a deadline, and the workload runs on a spawned thread, so a wedge fails
-;; the case and names the round and phase it stopped in. That way round, not the
-;; other, because System/exit on a spawned thread only unwinds that thread on
-;; this host (jolt-7xls) — a watchdog anywhere but the main thread can describe a
-;; hang and not end it. What made that one run wedge is still unknown; this is
-;; what will say where it was the next time.
+;; the case and names the round and phase it stopped in. That way round because
+;; the watcher must be the one thread that cannot be what wedges — every socket,
+;; fiber and channel in this case belongs to the workload. (It was also the only
+;; way round that worked when this was written: System/exit on a spawned thread
+;; unwound that thread and left the process running, which is jolt-7xls, fixed
+;; since.) What made that one run wedge is still unknown; this is what will say
+;; where it was the next time.
 (require '[jolt.socket])
 (require '[clojure.core.async :as a])
 
