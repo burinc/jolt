@@ -535,6 +535,18 @@
    {:suite "multimethods / hierarchies", :label "explicit :hierarchy", :category :permissive}
    {:suite "permissive / keys on pair vector", :label "keys works on vector of pairs", :category :permissive}
 
+   ;; (reduce + (eduction …)) with no init. jolt folds it; the JVM's answer is
+   ;; UNSPECIFIED, so this row is :flaky rather than a divergence either way.
+   ;; clojure.core.protocols/CollReduce is extended to both IReduceInit and
+   ;; Iterable, and an Eduction implements both, so find-protocol-impl reduces
+   ;; `pref` over (supers Eduction) — a hash SET — and pref keeps whichever of two
+   ;; unrelated interfaces it sees first. Iterable wins and the row answers 9;
+   ;; IReduceInit wins and the 2-arity casts to IReduce, which an Eduction is not,
+   ;; and it raises ClassCastException. Which one that is falls out of Class
+   ;; identity hash codes: every local run here picks IReduceInit and CI picks
+   ;; Iterable, so allowlisting it as a plain divergence fails one of the two.
+   {:suite "seq / lazy over infinite", :label "eduction reduces", :category :permissive, :flaky true}
+
    ;; with-open closes anything carrying a :close fn; the JVM demands a member
    ;; named close and raises on a map. line-seq and file-seq are the same shape:
    ;; jolt duck-types the reader and takes a path string, where the JVM insists on

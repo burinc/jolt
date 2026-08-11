@@ -75,12 +75,17 @@
 ;; conditional (e.g. `#?(:cljs …)` with no :clj branch) reads as "no form" — an
 ;; eof marker mid-source — and must be skipped, not treated as end of file, or a
 ;; namespace's forms after it are silently dropped. Mirrors load-jolt-file.
+;; rdr-read-top for the same reason load-jolt-file* uses it: a stray close
+;; delimiter parks the position, which the no-progress arm below reads as end of
+;; input, so a build would emit an image of everything BEFORE the bad paren and
+;; report success. It has to be the same read error the loader raises, or `jolt
+;; build` and `jolt run` disagree about what a file contains (jolt-3amm).
 (define (ei-read-all src)
   (let ((end (string-length src)))
     (let loop ((i 0) (acc '()))
       (if (>= i end)
           (reverse acc)
-          (let-values (((form j) (rdr-read-form src i end)))
+          (let-values (((form j) (rdr-read-top src i end)))
             (if (> j i)
                 (loop j (if (rdr-eof? form) acc (cons form acc)))
                 (reverse acc)))))))

@@ -612,6 +612,29 @@ if printf '%s' "$pos_err" | grep -q '^  trace:'; then
   echo "--- got ---"; echo "$pos_err"; exit 1
 fi
 
+# The build reads a namespace's forms through its own read-all, which had the same
+# stray-close-delimiter blindness the loader did: the position parks on the paren,
+# the loop reads that as end of input, and the image is emitted from the forms
+# BEFORE it — a successful build of a program missing everything after the typo.
+echo "build smoke: a stray close paren fails the build"
+stray="$(dirname "$out")/stray"; mkdir -p "$stray/src/app"
+printf '{}\n' > "$stray/deps.edn"
+{ echo '(ns app.core)'
+  echo ''
+  echo '(defn -main [& _]'
+  echo '  (println :a)))'
+  echo ''
+  echo '(defn unreachable [] :nope)'
+} > "$stray/src/app/core.clj"
+stray_err="$(JOLT_PWD="$stray" "$joltabs" build -m app.core -o "$(dirname "$out")/stray-bin" 2>&1 || true)"
+if ! printf '%s' "$stray_err" | grep -q 'Unmatched delimiter'; then
+  echo "  FAIL: build did not report the stray close paren"
+  echo "--- got ---"; echo "$stray_err"; exit 1
+fi
+if [ -x "$(dirname "$out")/stray-bin" ]; then
+  echo "  FAIL: build produced a binary from a file it could not read"; exit 1
+fi
+
 # A set literal mixing an auto keyword with a plain one of the same alias text
 # must BUILD. ::o/x and :o/x are distinct, but the require scan reads in scan mode,
 # where an unresolved alias keeps its text, so both read as :o/x — and the
