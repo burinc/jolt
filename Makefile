@@ -54,7 +54,7 @@ export LIBRARY_PATH := $(subst $(space),:,$(strip $(CHEZSCHEME-LIB-DIRS)))$(if $
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
-  aotcacheperf aotcachesmoke aotfingerprint buildlibsmoke buildsmoke \
+  aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
   gateboot gatebootsmoke gosm httpsfetch infer inline inline-body irvalidate \
@@ -122,7 +122,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   fnform traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck lockcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
-  certify gambitcheck gambitgencheck grenadinecheck fibers gosm threadsafety
+  certify gambitcheck gambitgencheck grenadinecheck fibers gosm asynctimer threadsafety
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -250,6 +250,14 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-lock-test.ss
 	@$(CHEZ) --script test/chez/fibers-monitor-test.ss
 	@$(CHEZ) --script test/chez/async-io-thread-test.ss
+
+# The one (timeout ms) timer thread (jolt-pe84): a timeout closes on its own
+# deadline however far away the pending ones are, and the thread is forked once.
+# Both were broken by the same three lines — a sleep that left the timer off its
+# condition variable dropped the wake for a nearer deadline, and a fork guard
+# cleared before an idle wait forked a second immortal timer per call.
+asynctimer:
+	@$(CHEZ) --script test/chez/async-timer-test.ss
 
 # The dynamic-var binding stack (jolt-3bo): lookup cost against binding DEPTH and
 # against the number of vars in one frame, push/pop throughput, and the two
