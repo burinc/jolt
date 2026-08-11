@@ -27,8 +27,11 @@ jolt_bin="${JOLT_BIN:-bin/jolt}"
 # read the process group — under a plain `timeout` that case dies with no output on
 # Linux while still passing on macOS. --foreground leaves the group alone.
 #
-# coreutils' timeout is not on a stock macOS, so fall back to running uncapped rather
-# than skipping the case or hard-failing the gate on a missing tool.
+# coreutils' timeout is not on a stock macOS, and falling back to running UNCAPPED
+# there meant the one host most likely to run this by hand was the one host where a
+# hang could not report itself: a `make test` here sat on the poller-registration
+# case for over ninety minutes behind a one-line note nobody was watching for
+# (jolt-8tma). cap.sh is the same cap in POSIX sh, so every host has one.
 smoke_timeout="${JOLT_SMOKE_TIMEOUT:-120}"
 if [ "$smoke_timeout" = "0" ]; then
   jolt_timeout=""
@@ -40,8 +43,7 @@ else
     fi
   done
   if [ -z "${jolt_timeout:-}" ]; then
-    jolt_timeout=""
-    echo "  note: no timeout(1) with --foreground — a hung case will block instead of failing"
+    jolt_timeout="sh $root/host/chez/cap.sh $smoke_timeout"
   fi
 fi
 jolt="$jolt_timeout $jolt"
@@ -486,6 +488,29 @@ else
   echo "    $(printf '%s' "$pr_out" | tail -1)"
   fails=$((fails + 1))
 fi
+
+# One paren too many must FAIL the file, not truncate it. The loader read forms
+# with the non-top-level reader, which parks on a stray `)` rather than raising,
+# and the loop read a parked position as end of input: everything after the paren
+# was dropped and the run exited 0. A test file that lost its entire body that way
+# still looked like a pass, which is how this was found (jolt-3amm).
+stray_dir="$(mktemp -d)"
+printf '(println "before")\n)\n(println "after")\n' > "$stray_dir/stray.clj"
+stray_out="$($jolt run "$stray_dir/stray.clj" 2>&1)"; stray_st=$?
+if [ "$stray_st" != "0" ] && printf '%s' "$stray_out" | grep -q 'Unmatched delimiter'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a stray close paren should fail the load, not drop the rest of the file"
+  echo "    exit $stray_st: $(printf '%s' "$stray_out" | tail -1)"
+  fails=$((fails + 1))
+fi
+if printf '%s' "$stray_out" | grep -q 'after'; then
+  echo "  FAIL: forms after the stray paren ran anyway"
+  fails=$((fails + 1))
+else
+  pass=$((pass + 1))
+fi
+rm -rf "$stray_dir"
 
 # Two threads requiring one namespace must load it once, and neither may return
 # from require until it is whole. Nothing serialized load-namespace* before, so
