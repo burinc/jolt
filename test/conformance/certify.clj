@@ -345,13 +345,30 @@
         (println (format "  [%s] %s\n      expected: %s\n      %s"
                          (:suite row) (:label row) (:expected row) detail))))
 
+    ;; A row that timed out asserted NOTHING on this run, and the budget is
+    ;; wall-clock on a shared JVM: future-cancel is best-effort, so an earlier
+    ;; runaway keeps its thread (and its allocation) for the rest of the run and
+    ;; can push a later row over the budget on a slower or busier machine. That
+    ;; makes the set environment-dependent, which is why every timed-out row is
+    ;; named here rather than left as a count, and why staleness below ignores
+    ;; them: an allowlist entry for a row the oracle never finished is not
+    ;; evidence the divergence went away.
+    (when (pos? (cnt :timeout))
+      (println (format "\n=== rows the oracle did not finish in %dms (no opinion this run) ===" case-timeout-ms))
+      (doseq [{:keys [row]} (sort-by (comp (juxt :suite :label) :row) (get by :timeout))]
+        (println (format "  [%s] %s\n      actual: %s" (:suite row) (:label row) (:actual row)))))
+
     ;; Partition the rows the JVM has an opinion on into known (allowlisted) vs NEW.
     (let [flagged (concat (get by :divergent []) (get by :throws-mismatch []) (get by :jvm-raises []))
           key-of (fn [{:keys [row]}] [(:suite row) (:label row)])
           new? (fn [r] (let [k (key-of r)] (and (not (known k)) (not (flaky k)))))
           news (filter new? flagged)
           flagged-keys (set (map key-of flagged))
-          stale (clojure.set/difference known flagged-keys)]
+          ;; Rows the oracle had no opinion on: it never ran them to a value, so
+          ;; they are evidence of nothing in either direction.
+          silent-keys (set (map key-of (concat (get by :timeout []) (get by :read-error [])
+                                               (get by :uncertifiable []))))
+          stale (clojure.set/difference known flagged-keys silent-keys)]
       (println (format "\n  allowlist: %d entries (%d flaky); %d of %d divergences known, %d NEW, %d stale"
                        (+ (count known) (count flaky)) (count flaky)
                        (- (count flagged) (count news)) (count flagged) (count news) (count stale)))
