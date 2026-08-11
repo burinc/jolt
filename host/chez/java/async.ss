@@ -453,34 +453,51 @@
   (let ((r (ac-poll! ch))) (if (eq? r ac-poll-empty) cca-none r)))
 
 ;; --- shared timeout timer ---------------------------------------------------
-;; One timer thread serves all (timeout ms) calls — no per-call OS thread.
+;; ONE timer thread serves all (timeout ms) calls — no per-call OS thread.
 ;; Pending timeouts are kept as a sorted list of (deadline-ms . channel) by
-;; ascending deadline. The timer thread sleeps until the nearest deadline,
-;; closes expired channels, and repeats. Inserting a new earliest deadline
-;; signals the condition to wake a sleeping timer.
+;; ascending deadline. The timer closes every channel whose deadline has passed,
+;; then waits for the nearest remaining one; an insert that becomes the HEAD
+;; signals timeout-cv, because that is exactly when the deadline it is waiting
+;; for changed.
+;;
+;; THE WAIT IS A TIMED condition-wait HELD UNDER timeout-mu, AND THE THREAD IS
+;; FORKED ONCE. Both were otherwise, and each was a bug (jolt-pe84):
+;;
+;;   * The timer used to release timeout-mu and `sleep` to the nearest deadline,
+;;     so it was not on timeout-cv when a nearer deadline arrived. The signal
+;;     went nowhere and the new timeout did not fire until the deadline the timer
+;;     was already sleeping to: a (timeout 100) created while a (timeout 3000)
+;;     was pending took 3000ms to close. condition-wait releases the mutex
+;;     atomically with committing to the wait, so an insert can no longer slip
+;;     between the deadline read and the wait on it.
+;;   * timeout-running? used to be cleared before the idle wait, but a timer that
+;;     finds the list empty waits rather than exiting — so the next insert both
+;;     signalled the live thread AND forked another one, and every timer ever
+;;     forked stays alive forever. 100 sequential (timeout 1) calls left 100
+;;     timer threads. The flag now means "the one timer thread exists", which
+;;     once true never stops being true.
 (define timeout-mu (make-mutex))
 (define timeout-cv (make-condition))
 (define timeout-pending '())       ; ((deadline-ms . channel) ...) sorted asc
-(define timeout-running? #f)
+(define timeout-running? #f)       ; the one timer thread has been forked
 
+;; -> #t iff the new entry is the HEAD of the list, i.e. the caller must signal.
 (define (timeout-insert! deadline-ms ch)
   (let loop ((prev '()) (cur timeout-pending))
     (cond ((null? cur)
            (let ((entry (cons deadline-ms ch)))
              (if (null? prev)
                  (set! timeout-pending (list entry))
-                 (begin (set-cdr! prev (list entry))
-                        (set! timeout-pending
-                          (let restore ((h timeout-pending)) h)))))
-           #t)  ; inserted at end (or only entry)
+                 (set-cdr! prev (list entry))))
+           ;; The end is the head only when the list was empty. Appending behind
+           ;; an existing entry leaves the timer's next wake correct as it is.
+           (null? prev))
           ((< deadline-ms (caar cur))
            (let ((entry (cons deadline-ms ch)))
              (if (null? prev)
                  (set! timeout-pending (cons entry cur))
-                 (begin (set-cdr! prev (cons entry cur))
-                        (set! timeout-pending
-                          (let restore ((h timeout-pending)) h))))
-             (null? prev)))  ; #t iff inserted at head
+                 (set-cdr! prev (cons entry cur))))
+           (null? prev))
           (else (loop cur (cdr cur))))))
 
 (define (timeout-thread)
@@ -492,33 +509,28 @@
             (jolt-async-close! (cdar timeout-pending))
             (set! timeout-pending (cdr timeout-pending))
             (cleanup))
-          (if (null? timeout-pending)
-              (begin
-                (set! timeout-running? #f)
+          (begin
+            (if (null? timeout-pending)
                 (condition-wait timeout-cv timeout-mu)
-                (set! timeout-running? #t)
-                (loop))
-              (let ((wait-ms (- (caar timeout-pending) (now-millis))))
-                (if (> wait-ms 0)
-                    (begin
-                      (jolt-unlock! timeout-mu)
-                      (sleep (ms->duration wait-ms))
-                      (jolt-lock! timeout-mu)))
-                (loop)))))))
+                (let ((wait-ms (- (caar timeout-pending) (now-millis))))
+                  (when (> wait-ms 0)
+                    (condition-wait timeout-cv timeout-mu (ms->duration wait-ms)))))
+            ;; Either deadline or signal, the answer is the same: re-read the
+            ;; head. A spurious wake costs one trip through cleanup.
+            (loop))))))
 
 ;; (timeout ms) — a channel that closes after ms milliseconds.
 (define (jolt-async-timeout ms)
   (let* ((w (ac-make 0 'unbuffered #f))
          (dl (+ (now-millis) (exact (floor ms)))))
     (jolt-lock! timeout-mu)
-    (let ((head? (timeout-insert! dl w)))
-      (when head?
-        (condition-signal timeout-cv))
-      (unless timeout-running?
-        (set! timeout-running? #t)
-        (fork-thread timeout-thread))
-      (jolt-unlock! timeout-mu)
-      w)))
+    (when (timeout-insert! dl w)
+      (condition-signal timeout-cv))
+    (unless timeout-running?
+      (set! timeout-running? #t)
+      (fork-thread timeout-thread))
+    (jolt-unlock! timeout-mu)
+    w))
 
 ;; (put! ch v [cb [on-caller?]]) — async put, optional completion callback. If the
 ;; put completes immediately and on-caller? (default #t), the callback runs on the

@@ -965,6 +965,13 @@
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (defn iot-take [c] (a/<!! c)) (let [c (a/chan) g (a/io-thread (iot-take c))] (a/>!! c :deep) [(a/<!! g) (a/<!! (a/io-thread nil))]))" :expected "[:deep nil]"}
   ;; an unknown workload is refused rather than quietly run on some carrier
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (try (a/thread-call (fn [] 1) :bogus) :no-throw (catch IllegalArgumentException e (ex-message e))))" :expected "\"Invalid workload :bogus — expected :io, :compute or :mixed\""}
+  ;; a timeout closes on ITS OWN deadline, not on the nearest pending one's
+  ;; (jolt-pe84). One thread serves every (timeout ms); it used to sleep to the
+  ;; nearest deadline with its mutex released, so it was not on the condition
+  ;; variable when a nearer deadline arrived and the wake was dropped — this
+  ;; 50ms one took the 30s one's deadline. A park on a timeout is the shape
+  ;; every alts! guard has, so the bound is the interesting part, both ways.
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [far (a/timeout 30000) t0 (System/currentTimeMillis) _ (a/<!! (a/timeout 50)) el (- (System/currentTimeMillis) t0)] [(>= el 40) (< el 5000)]))" :expected "[true true]"}
   ;; Stage C — pattern-driven tz offset parse applies offset
   {:suite "insttime" :expr "(.getTime (.parse (java.text.SimpleDateFormat. \"yyyy-MM-dd'T'HH:mm:ssX\") \"2024-01-01T00:00:00+05\"))" :expected "1704049200000"}
   {:suite "insttime" :expr "(.getTime (.parse (java.text.SimpleDateFormat. \"yyyy-MM-dd'T'HH:mm:ssX\") \"2024-01-01T00:00:00Z\"))" :expected "1704067200000"}
