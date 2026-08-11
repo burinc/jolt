@@ -1,8 +1,10 @@
 ;; clojure.core.async — higher-level dataflow API over the channel primitives.
 ;;
 ;; The primitives (chan, <!, >!, <!!, >!!, close!, put!, take!, offer!, timeout,
-;; promise-chan, buffer/dropping-buffer/sliding-buffer, thread, go-spawn) are
-;; provided natively (host/chez/java/async.ss) on real OS threads. go and go-loop
+;; promise-chan, buffer/dropping-buffer/sliding-buffer, thread, go-spawn,
+;; fiber-spawn) are provided natively (host/chez/java/async.ss); everything but
+;; fiber-spawn (which is io-thread's carrier — see thread-call below) runs on real
+;; OS threads. go and go-loop
 ;; are NOT: they are defined below, because the pass that picks a park's
 ;; representation per site needs &env, macroexpand and resolve. This overlay
 ;; adds the portable dataflow operators — alts!, pipe, pipeline, split, reduce,
@@ -484,16 +486,53 @@
 
 ;; --- thread variants --------------------------------------------------------
 
+;; Three carriers, three names, no options — the choice is the call you write:
+;; thread is a real OS thread, io-thread is a fiber, go is the CPS pass on
+;; whatever *go-backend* names. So workload is not a hint here, it selects:
+;;
+;;   :io       a FIBER. Cheap enough to have thousands of, and a park releases
+;;             the carrier — which is what the JVM buys with a virtual thread.
+;;   :mixed    a real OS thread (the default, as on the JVM).
+;;   :compute  a real OS thread.
+;;
+;; :compute is a thread rather than a fiber deliberately, even though preemption
+;; means a compute-bound fiber no longer starves its carrier's queue: fibers are
+;; capped at the carrier count, so N compute bodies on N carriers leave nothing to
+;; run the io-thread bodies that are ready. A thread per compute body is what the
+;; caller asked for by saying :compute.
+;;
+;; What a fiber does NOT get is an OS thread of its own, so a body that blocks
+;; SOMEWHERE THE RUNTIME DOES NOT KNOW ABOUT pins its carrier for the duration.
+;; Channel ops park, and so does jolt.socket (R8: an EAGAIN registers with the
+;; io-poller and parks). Thread/sleep, a blocking read on a raw fd, and an FFI
+;; call that blocks do not — they hold the carrier's OS thread. Use thread for
+;; those; that is what it is for.
 (defn thread-call
-  "Executes f in another thread, returning a channel that receives f's result then
-  closes. Always a real OS thread — thread is the documented escape for blocking
-  work and does NOT honor *go-backend* (unlike go/go-loop)."
-  ([f] (clojure.core.async/thread-spawn f))
-  ([f _workload] (clojure.core.async/thread-spawn f)))
+  "Executes f elsewhere, returning a channel that receives f's result then closes.
+  workload says what f does and picks the carrier: :io runs f on a fiber
+  (blocking-shaped I/O, parks instead of holding a thread), :mixed (the default)
+  and :compute run it on a real OS thread. No workload honors *go-backend* —
+  unlike go/go-loop, thread-call's carrier is fixed by the call site."
+  ([f] (thread-call f :mixed))
+  ([f workload]
+   (case workload
+     :io (clojure.core.async/fiber-spawn f)
+     (:mixed :compute) (clojure.core.async/thread-spawn f)
+     (throw (IllegalArgumentException.
+              (str "Invalid workload " (pr-str workload)
+                   " — expected :io, :compute or :mixed"))))))
 
 (defmacro io-thread
-  "Executes body in another thread, returning a channel that receives the result
-  then closes."
+  "Executes body on a FIBER, returning a channel that receives the result then
+  closes. For blocking-shaped I/O: a channel op or a jolt.socket read that would
+  block parks the fiber and frees its carrier for other work, so thousands of
+  these cost thousands of stacks rather than thousands of OS threads. A park works
+  anywhere in the body — inside a called function, a try, a loop — because a fiber
+  parks by capturing its continuation, not by being rewritten.
+
+  Use thread instead when the body blocks in a way the runtime cannot see
+  (Thread/sleep, a raw fd read, a blocking FFI call): that pins the fiber's
+  carrier, and a real OS thread is the escape."
   [& body]
   `(thread-call (fn [] ~@body) :io))
 

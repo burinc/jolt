@@ -234,6 +234,10 @@ values:
 # bare monitor-enter/monitor-exit halves across a fiber switch. A monitor is the
 # one lock in the runtime that wraps user code, so neither half of locks.ss's
 # premise — short regions, never spanning a park — holds for it.
+# async-io-thread-test.ss is the io-thread gate (jolt-579): core.async's third
+# carrier. It runs with the pool pinned to ONE carrier, which is what makes "8
+# bodies parked at the same time, all of them resuming" mean that a fiber released
+# its carrier rather than held it.
 fibers:
 	@$(CHEZ) --script test/chez/fibers-test.ss
 	@$(CHEZ) --script test/chez/fibers-state-test.ss
@@ -245,6 +249,7 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-preempt-test.ss
 	@$(CHEZ) --script test/chez/fibers-lock-test.ss
 	@$(CHEZ) --script test/chez/fibers-monitor-test.ss
+	@$(CHEZ) --script test/chez/async-io-thread-test.ss
 
 # The dynamic-var binding stack (jolt-3bo): lookup cost against binding DEPTH and
 # against the number of vars in one frame, push/pop throughput, and the two

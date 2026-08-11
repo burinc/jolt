@@ -601,15 +601,33 @@
           (if (eq? bv dyn-no-binding) (var-cell-root cell) bv))
         jolt-go-backend-thread)))
 
-;; The R4 dispatcher: go/go-loop/go-spawn go through here and honor the var;
-;; thread/thread-call keep a real OS thread regardless (the documented escape
-;; for blocking work — a fiber would pin its carrier). jolt-fiber-go-spawn is
-;; defined in fibers-async.ss, which loads after this file; the reference
+;; The R4 dispatcher: go/go-loop/go-spawn go through here and honor the var.
+;; Nothing else does — thread is always an OS thread and io-thread is always a
+;; fiber, because both name their carrier at the call site (see async-fiber-spawn
+;; below and the workload table in the overlay's thread-call). jolt-fiber-go-spawn
+;; is defined in fibers-async.ss, which loads after this file; the reference
 ;; resolves at call time, before any :fiber spawn can happen.
 (define (async-go-spawn thunk)
   (if (eq? (go-backend-current) jolt-go-backend-fiber)
       (jolt-fiber-go-spawn thunk)
       (async-go-spawn-thread thunk)))
+
+;; (fiber-spawn thunk) — ALWAYS a fiber, whatever *go-backend* says. This is the
+;; other half of the thread-spawn bargain: thread-spawn asks for an OS thread by
+;; name and gets one, so asking for a fiber by name has to work the same way, and
+;; io-thread (the overlay's thread-call :io) is what asks. A dispatcher would make
+;; io-thread mean "a fiber, unless someone above me bound *go-backend* :thread",
+;; and there is nothing a caller could do with that.
+;;
+;; No CPS pass here — the body parks by capturing a continuation, which is exactly
+;; what a blocking-shaped body wants: a park works anywhere, including inside a
+;; called function, a try or a loop the pass cannot rewrite. That is the
+;; difference from go, not an omission.
+;;
+;; Same forward reference as async-go-spawn: jolt-fiber-go-spawn is defined in
+;; fibers-async.ss, which loads after this file, and resolves at call time.
+(define (async-fiber-spawn thunk)
+  (jolt-fiber-go-spawn thunk))
 
 (define (async-go-spawn-thread thunk)
   (let ((w (ac-make 1 'fixed #f)) (snap (dyn-binding-stack)))
@@ -895,6 +913,9 @@
 ;; thread-spawn: always a real OS thread, whatever *go-backend* says (thread
 ;; is the documented escape; the go macro dispatches, thread must not).
 (cca-def! "thread-spawn" async-go-spawn-thread)
+;; fiber-spawn: always a fiber, whatever *go-backend* says — what the overlay's
+;; io-thread / (thread-call f :io) spawns through.
+(cca-def! "fiber-spawn" async-fiber-spawn)
 ;; non-blocking primitives also used by the Clojure overlay and external callers.
 (cca-def! "__poll!" jolt-async-poll!)
 (cca-def! "__offer!" jolt-async-offer!)

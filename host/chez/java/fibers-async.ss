@@ -136,7 +136,9 @@
 ;; --- R4: go on fibers, and alts! as a wait set (epic jolt-nvpr.5) -------------
 ;;
 ;; jolt-fiber-go-spawn is the :fiber backend of clojure.core.async/go-spawn
-;; (the dispatcher lives in async.ss; thread stays the :thread backend). It
+;; (the dispatcher lives in async.ss; thread stays the :thread backend), and
+;; since jolt-579 it is also what clojure.core.async/fiber-spawn — io-thread's
+;; carrier — reaches unconditionally, no dispatch involved. It
 ;; spawns the body as a fiber on the R5 carrier pool — N OS threads, each
 ;; looping drain-then-park (fibers.ss). Parking inside the body works ACROSS
 ;; function boundaries, which the JVM's state-machine go structurally cannot
