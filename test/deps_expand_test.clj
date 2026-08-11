@@ -215,6 +215,41 @@
 ;; a dash opens a sub-list, which sorts under an integer in the same position
 (lt "1.0-1" "1.0.1")
 
+;;;; unresolvable Maven deps abort resolution (jolt-ktiz.3, jolt-ktiz.7)
+;;
+;; The behaviour change worth pinning: a dep that could not be OBTAINED used to
+;; leave procurement with no root, which the expansion treats exactly like a jar
+;; that carries no jolt source — contributing nothing, silently. tools.deps
+;; aborts ("Error building classpath. The following artifacts could not be
+;; resolved:", exit 1) for a missing artifact and an unreachable repository
+;; alike, verified against Clojure CLI 1.12.5.1654, and jolt already did it for
+;; git deps. Offline: drives the registry directly rather than a real fetch.
+(let [note (var jolt.deps/note-unresolvable!)
+      fail (var jolt.deps/fail-unresolvable!)
+      unres (var jolt.deps/*unresolvable*)]
+  ;; nothing recorded: resolution proceeds
+  (is= "no unresolvable deps does not throw" true
+       (with-bindings {unres (atom [])} (fail) true))
+  ;; one recorded: throws, and the message names the coordinate and the reason
+  (let [msg (with-bindings {unres (atom [])}
+              (note 'org.clojure/spec.alpha "0.5.238" "could not be fetched: reset")
+              (try (fail) nil (catch :default e (ex-message e))))]
+    (is= "an unresolvable dep aborts resolution" true (some? msg))
+    (is= "the message names the coordinate" true
+         (str/includes? (str msg) "org.clojure/spec.alpha 0.5.238"))
+    (is= "the message keeps the reason, not a generic 'not found'" true
+         (str/includes? (str msg) "could not be fetched: reset"))
+    (is= "the message is the tools.deps one" true
+         (str/includes? (str msg) "could not be resolved")))
+  ;; every failure is reported together, not one build at a time
+  (let [msg (with-bindings {unres (atom [])}
+              (note 'a/one "1.0" "not found in any repository (tried r1)")
+              (note 'b/two "2.0" "could not be fetched: 503")
+              (try (fail) nil (catch :default e (ex-message e))))]
+    (is= "both unresolvable deps are named at once" true
+         (and (str/includes? (str msg) "a/one 1.0")
+              (str/includes? (str msg) "b/two 2.0")))))
+
 (println (str "deps-expand: " (- @checks @failures) "/" @checks " passed"))
 (when (pos? @failures)
   (System/exit 1))
