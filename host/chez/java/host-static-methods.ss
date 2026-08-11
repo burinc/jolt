@@ -288,7 +288,9 @@
         ;; millisecond-granular, so any interval under a millisecond timed as 0.
         ;; jolt-mono-nanos (rt.ss) is Chez's 'time-monotonic clock, which is both.
         (cons "nanoTime" (lambda () (->num (jolt-mono-nanos))))
-        (cons "exit" (lambda args (exit (if (null? args) 0 (jnum->exact (car args))))))
+        ;; jolt-exit-process (rt.ss), not Chez's exit: this has to end the PROCESS
+        ;; from whichever thread called it, the way System.exit does.
+        (cons "exit" (lambda args (jolt-exit-process (if (null? args) 0 (jnum->exact (car args))))))
         ;; System/gc -> a full Chez collection (so weak references clear and their
         ;; guardians fire); Runtime.gc() routes here too.
         (cons "gc" (lambda _

@@ -94,6 +94,35 @@
                         (sa-foreign-procedure-blocking name args res)))))
          #'(if (eq? (sa-os-family) 'windows) win unx))))))
 
+;; --- process-wide exit --------------------------------------------------------
+;; System.exit halts the VM from ANY thread on the JVM. Chez's exit unwinds only
+;; the CALLING thread, so off the main thread it was a silent no-op as far as the
+;; process was concerned: a worker that decided the program should stop could not
+;; stop it, and nothing said it had tried (jolt-7xls). A watchdog thread is the
+;; shape that wants this — it can describe the hang it found and not end it.
+;;
+;; The boot thread keeps the normal path, exit handlers and all, including the
+;; stdout/stderr flush cli-core installs as one. Any other thread flushes those
+;; same two ports by hand and calls libc _exit. _exit rather than exit: the C exit
+;; runs atexit handlers and flushes C stdio from a thread the C runtime is not
+;; expecting it from, and jolt's buffered output is Chez's, not stdio's, so the
+;; handlers buy nothing here and can deadlock. Skipping the unwind is right on its
+;; own terms too — the JVM does not run finally blocks on System.exit either.
+;;
+;; jolt-foreign-proc-safe answers #f where the entry does not resolve, and then
+;; this is exactly what it was before: an exit that only the boot thread can act
+;; on. Nothing depends on the hard path existing, so a host without _exit degrades
+;; rather than failing to boot.
+(define jolt-boot-thread-id (get-thread-id))
+(define jolt-c-exit (jolt-foreign-proc-safe "_exit" '(int) 'void))
+(define (jolt-exit-process code)
+  (if (or (eqv? (get-thread-id) jolt-boot-thread-id) (not jolt-c-exit))
+      (exit code)
+      (begin
+        (guard (_ (#t #f)) (flush-output-port (current-output-port)))
+        (guard (_ (#t #f)) (flush-output-port (current-error-port)))
+        (jolt-c-exit code))))
+
 ;; --- how many processors can this process use ---------------------------------
 ;; Backs jolt.host/available-processors, which Runtime.availableProcessors and
 ;; pmap's look-ahead window read. Each host is asked the question the JVM asks

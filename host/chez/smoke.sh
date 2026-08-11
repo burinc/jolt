@@ -476,6 +476,37 @@ else
   fails=$((fails + 1))
 fi
 
+# System/exit ends the PROCESS from whichever thread calls it, with that thread's
+# status, the way System.exit does on the JVM (checked against Clojure 1.12.3).
+# Chez's exit unwinds only the calling thread, so this used to be a silent no-op
+# off the main thread: the program carried on and nothing said a thread had asked
+# it to stop. A watchdog is the shape that wants it — it could name the hang it
+# found and not end it (jolt-7xls).
+ex_dir="$(mktemp -d)"
+{ echo '(.start (Thread. (fn [] (Thread/sleep 100) (println "child exiting") (System/exit 3))))'
+  echo '(Thread/sleep 5000)'
+  echo '(println "MAIN STILL ALIVE")'
+} > "$ex_dir/x.clj"
+ex_out="$($jolt run "$ex_dir/x.clj" 2>&1)"; ex_st=$?
+if [ "$ex_st" = "3" ] && ! printf '%s' "$ex_out" | grep -q 'MAIN STILL ALIVE'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: System/exit on a spawned thread should end the process with its status"
+  echo "    exit $ex_st: $(printf '%s' "$ex_out" | tail -1)"
+  fails=$((fails + 1))
+fi
+# Its own buffered output survives: the hard exit does not run Chez's exit
+# handlers, so it owes the flush they would have done.
+printf '(.start (Thread. (fn [] (print "partial-line") (System/exit 4))))\n(Thread/sleep 5000)\n' > "$ex_dir/y.clj"
+exf_out="$($jolt run "$ex_dir/y.clj" 2>&1)"; exf_st=$?
+if [ "$exf_st" = "4" ] && [ "$exf_out" = "partial-line" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: unflushed output from an exiting thread was lost (exit $exf_st, got \`$exf_out\`)"
+  fails=$((fails + 1))
+fi
+rm -rf "$ex_dir"
+
 # A readiness registration must never be lost. jolt.io-poller drained its pending
 # registrations in two critical sections, so one landing in between was erased
 # before reaching the kqueue/epoll set and the fiber waiting on that fd never
