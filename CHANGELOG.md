@@ -57,8 +57,8 @@ with exclusion intact. Fibers stay opt-in
 
   ```clojure
   (let [g (a/go (throw (ex-info "boom" {})))]
-    (a/<!! g)                      ;=> nil, same as a body that returned nil
-    (a/<!! (a/go-monitor g)))   ;=> the throwable
+    (a/<!! g)                    ;=> nil, same as a body that returned nil
+    (a/<!! (a/go-monitor g)))    ;=> the throwable
   ```
 
   A `thread` block's channel answers too — it has the same nil ambiguity and
