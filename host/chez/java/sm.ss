@@ -171,7 +171,7 @@
         ;; a failure while reporting or closing must still mark the fiber dead
         (guard (_ (#t (jolt-fiber-dead! f e)))
           (async-report-uncaught! "go/fiber body (channel closed)" e)
-          (jolt-async-close! w))
+          (go-chan-finish! w e))            ; publishes the failure, then closes w
         (jolt-fiber-dead! f e))
       (lambda ()
         (let ((step (jolt-fiber-sm f)))
@@ -187,7 +187,7 @@
 ;; not a channel value).
 (define (jolt-sm-finish! w f v)
   (when (not (jolt-nil? v)) (jolt-async-give w v))
-  (jolt-async-close! w)
+  (go-chan-finish! w #f)                    ; completed: no throwable, then closes w
   (jolt-fiber-done! f v))
 
 ;; The terminal continuation on a thread: every CPS call is a tail call, so
@@ -212,20 +212,19 @@
 ;; takes the capture), but the line is not needed either way: sa-fiber-spawn
 ;; builds the child's slice with txn #f by construction, and jolt-fiber-run
 ;; restores that slice before the first entry.
-;; The channel->fiber registration has to happen HERE TOO, not only in
+;; The monitor registration has to happen HERE TOO, not only in
 ;; jolt-fiber-go-spawn: a go body the CPS pass could transform is spawned by
 ;; this function instead, and which of the two runs is a property of the body
 ;; (whether every park site was rewritable), not something the caller chose. A
 ;; monitor that worked on one and silently answered nil on the other would be
 ;; worse than no monitor at all, because the difference is invisible from the
-;; jolt side. jolt-go-chan-fiber-set! lives in fibers-async.ss, which rt.ss
-;; loads before this file.
+;; jolt side. go-chan-register! lives in async.ss, which rt.ss loads first.
 (define (jolt-sm-fiber-spawn body-fn)
   (let ((w (ac-make 1 'fixed #f)))
-    (jolt-go-chan-fiber-set! w
-      (sa-fiber-spawn
-       (lambda ()
-         (jolt-sm-drive w body-fn))))
+    (go-chan-register! w)
+    (sa-fiber-spawn
+     (lambda ()
+       (jolt-sm-drive w body-fn)))
     (jolt-fiber-ensure-carrier!)
     w))
 

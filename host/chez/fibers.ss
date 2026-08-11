@@ -926,6 +926,11 @@
 
 ;; (jolt-fiber-monitor! f proc) -> void. Register PROC on fiber F.
 ;;
+;; The FIBER-level primitive. clojure.core.async's fiber-monitor does not come
+;; through here: it is keyed on the go CHANNEL (async.ss go-chan-monitor!) so it
+;; can answer for a thread-backed body too, which this cannot — there is no fiber
+;; to register on. Gated directly by fibers-test.ss 7c, both arms.
+;;
 ;; A fiber that has ALREADY finished calls PROC inline rather than dropping it.
 ;; Without that, monitoring is a race nobody can win: the caller cannot check
 ;; the state and register atomically from outside, so a fiber that died between

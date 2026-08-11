@@ -278,11 +278,30 @@
 (let spin ((n 0)) (when (fx<? n 4000000) (spin (fx+ n 1))))
 (ok "publication: not terminal while the monitor lock is held"
     (not (memq (jolt-fiber-state pub-f) '(done dead))))
+;; Registered from inside the held region, which is the QUEUEING arm of
+;; jolt-fiber-monitor! and deterministic here: the fiber provably cannot be
+;; terminal yet, because the check above just said so and the carrier is blocked
+;; on this very mutex. Chez mutexes are recursive per thread, so the registration
+;; takes the lock this thread already owns. Covers the fiber-level primitive
+;; directly — clojure.core.async's fiber-monitor is keyed on the go CHANNEL now
+;; (async.ss go-chan-monitor!, so it can answer for a thread-backed body too) and
+;; no longer reaches this one.
+(define pub-seen (box 'unset))
+(jolt-fiber-monitor! pub-f (lambda (err) (set-box! pub-seen err)))
+(ok "publication: a monitor registered before the finish has not fired yet"
+    (eq? 'unset (unbox pub-seen)))
 (jolt-unlock! jolt-fiber-monitor-mu)
 (thread-join pub-th)
 (ok "publication: terminal once the lock is released" (eq? 'dead (jolt-fiber-state pub-f)))
 (ok "publication: and the error arrived with the state"
     (condition? (jolt-fiber-error pub-f)))
+(ok "publication: the queued monitor fired with that same condition"
+    (eq? (unbox pub-seen) (jolt-fiber-error pub-f)))
+;; The already-finished arm: registering on a terminal fiber delivers inline.
+(define pub-late (box 'unset))
+(jolt-fiber-monitor! pub-f (lambda (err) (set-box! pub-late err)))
+(ok "publication: a monitor registered after the finish delivers inline"
+    (eq? (unbox pub-late) (jolt-fiber-error pub-f)))
 
 ;; 8. yield outside a fiber is a clean error (the vreg is the dispatcher)
 (ok "yield outside a fiber raises"

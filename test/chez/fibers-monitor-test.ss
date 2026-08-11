@@ -93,18 +93,56 @@
     (ex-message (<!! (fiber-monitor g)))))"))
 (ok "5. a throw after a park is reported" (jolt=2 r5 "after park"))
 
-;; --- 6. the :thread backend answers nil rather than erroring ----------------
-;; Only the fiber backend has a fiber to monitor. Monitoring anything else has
-;; to degrade to "not monitorable" (a closed channel), not raise, or callers
-;; would have to know which backend produced the channel.
+;; --- 6. the :thread backend reports the same way ----------------------------
+;; WHICH BACKEND RAN THE BODY IS NOT THE CALLER'S BUSINESS. *go-backend* is read
+;; at spawn time off a dynamic binding, so a library's go runs on whichever
+;; backend its caller established, and a monitor that answered "clean" for a
+;; thread-backed body that threw is the exact failure this whole file exists to
+;; close — reported as a clean completion, invisible from the jolt side. Same
+;; argument sm.ss makes for registering both fiber spawn paths, one level up.
 (define r6 (ev "
 (binding [*go-backend* :thread]
-  (let [g (go 7)]
-    [(<!! g) (nil? (<!! (fiber-monitor g)))]))"))
+  (let [g    (go 7)
+        boom (go (throw (ex-info \"thread boom\" {:t 1})))
+        bm   (<!! (fiber-monitor boom))]
+    [(<!! g) (nil? (<!! (fiber-monitor g))) (<!! boom) (ex-message bm) (ex-data bm)]))"))
 (ok "6. a thread-backend go still returns its value" (jolt=2 (jv-nth r6 0) 7))
-(ok "6. monitoring it degrades to nil, not an error" (jolt-truthy? (jv-nth r6 1)))
+(ok "6. a thread-backend body that succeeded monitors as nil"
+    (jolt-truthy? (jv-nth r6 1)))
+(ok "6. a thread-backend body that threw still gives nil on the go channel"
+    (jolt-nil? (jv-nth r6 2)))
+(ok "6. and its monitor reports the throwable"
+    (jolt=2 (jv-nth r6 3) "thread boom"))
+(ok "6. with ex-data intact, so it is the original"
+    (jolt=2 (jv-nth r6 4) (jolt-hash-map (keyword #f "t") 1)))
+
+;; Registering after a thread-backed body died resolves inline, as it does on a
+;; fiber (section 3) — the caller cannot check and register in one step.
+(ok "6. a late monitor on a dead thread-backed body still resolves"
+    (jolt=2 (ev "
+(binding [*go-backend* :thread]
+  (let [g (go (throw (ex-info \"late thread\" {})))]
+    (Thread/sleep 300)
+    (ex-message (<!! (fiber-monitor g)))))") "late thread"))
+
+;; A channel that is not a go channel has no completion to report, which is a
+;; different thing from a body that completed cleanly, but nil is the only
+;; honest answer for it and it must not raise.
 (ok "6. monitoring a plain channel degrades to nil"
     (jolt-truthy? (ev "(nil? (<!! (fiber-monitor (chan))))")))
+
+;; --- 6b. the same body, both backends, same verdict --------------------------
+;; The invariant stated directly: run one body on each backend and require the
+;; monitors to agree. A regression that reintroduces a backend-specific answer
+;; fails here even if it slipped past the cases above.
+(define r6b (ev "
+(let [run (fn [backend]
+            (binding [*go-backend* backend]
+              (let [g (go (throw (ex-info \"same\" {})))]
+                (ex-message (<!! (fiber-monitor g))))))]
+  [(run :fiber) (run :thread)])"))
+(ok "6b. both backends report a dying body identically"
+    (and (jolt=2 (jv-nth r6b 0) "same") (jolt=2 (jv-nth r6b 1) "same")))
 
 ;; --- 7. a CPS'd body that dies is reported too ------------------------------
 ;; Section 5 covers a throw after a real park, which reaches jolt-fiber-dead!
@@ -132,6 +170,23 @@
         (recur (inc i) (if (nil? m) (inc clean) clean))))))"))
 (ok "7. a rewritten body's death is never reported as a clean completion"
     (jolt=2 r7 0))
+
+;; --- 8. a raising monitor is contained -------------------------------------
+;; Not reachable from the jolt surface — the only proc fiber-monitor registers is
+;; the one that fills its own channel — so this drives the registry directly.
+;; What it protects is the CLOSE: an escape out of the notify loop would skip
+;; go-chan-finish!'s jolt-async-close!, and every reader of that go block would
+;; wait forever on a channel nothing will ever close again.
+(define m8-ch (ac-make 1 'fixed #f))
+(define m8-seen (box 'unset))
+(go-chan-register! m8-ch)
+(go-chan-monitor! m8-ch (lambda (err) (error 'monitor "monitor blew up")))
+(go-chan-monitor! m8-ch (lambda (err) (set-box! m8-seen err)))
+(define m8-finished
+  (guard (e (#t #f)) (go-chan-finish! m8-ch 'the-error) #t))
+(ok "8. a raising monitor does not escape the finish" m8-finished)
+(ok "8. the other monitor still fired" (eq? 'the-error (unbox m8-seen)))
+(ok "8. and the result channel is still closed" (async-chan-closed? m8-ch))
 
 (printf "\nfibers-monitor-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)

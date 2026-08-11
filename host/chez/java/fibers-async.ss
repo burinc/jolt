@@ -154,64 +154,33 @@
 ;; the same rule async-go-spawn-thread enforces for threads).
 (define (jolt-fiber-go-spawn thunk)
   (let ((w (ac-make 1 'fixed #f)))
-    (jolt-go-chan-fiber-set! w
-      (sa-fiber-spawn
-       (lambda ()
-         (*txn* #f)
-         (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
-           (if (car r)
-               (when (not (jolt-nil? (cdr r))) (jolt-async-give w (cdr r)))
-               (begin
-                 (async-report-uncaught! "go/fiber body (channel closed)" (cdr r))
-                 ;; Record it so a monitor can see it. This guard is what keeps a
-                 ;; throwing body from killing the fiber, which is right — the
-                 ;; channel still has to be closed — but it also means the fiber
-                 ;; reaches jolt-fiber-done! looking like a success, and without
-                 ;; this the failure would be unobservable. The sm backend
-                 ;; (sm.ss jolt-sm-drive) reaches jolt-fiber-dead! instead, which
-                 ;; sets the same field, so both backends report alike.
-                 (jolt-fiber-error-set! (jolt-current-fiber) (cdr r))))
-           (jolt-async-close! w)))))
+    (go-chan-register! w)                     ; before the spawn — see async.ss
+    (sa-fiber-spawn
+     (lambda ()
+       (*txn* #f)
+       (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
+         (if (car r)
+             (when (not (jolt-nil? (cdr r))) (jolt-async-give w (cdr r)))
+             (begin
+               (async-report-uncaught! "go/fiber body (channel closed)" (cdr r))
+               ;; Record it on the FIBER as well as on the channel. This guard is
+               ;; what keeps a throwing body from killing the fiber, which is
+               ;; right — the channel still has to be closed — but it also means
+               ;; the fiber reaches jolt-fiber-done! looking like a success, and
+               ;; a gate asking the fiber directly would read the failure as a
+               ;; clean run. The sm backend (sm.ss jolt-sm-drive) reaches
+               ;; jolt-fiber-dead! instead, which sets the same field.
+               (jolt-fiber-error-set! (jolt-current-fiber) (cdr r))))
+         ;; closes w, after publishing the outcome to the channel's monitors
+         (go-chan-finish! w (and (not (car r)) (cdr r))))))
     (jolt-fiber-ensure-carrier!)
     w))
 
-;; --- monitoring a go block --------------------------------------------------
-;; go returns its result CHANNEL, not the fiber, so a caller has no handle to
-;; monitor. Rather than change what go returns (every existing program reads
-;; that channel), the channel is mapped to its fiber here.
-;;
-;; WEAK, and keyed by the channel: a strong table would pin every go channel and
-;; every fiber it ever ran for the life of the process, which on a server
-;; spawning a go per request is an unbounded leak. A dropped channel takes its
-;; entry with it, and the only thing lost is the ability to monitor a go block
-;; nobody holds a handle to any more.
-(define jolt-go-chan-fibers (make-weak-eq-hashtable))
-(define jolt-go-chan-fibers-mu (make-mutex))
-(define (jolt-go-chan-fiber-set! ch f)
-  (jolt-with-mutex jolt-go-chan-fibers-mu (hashtable-set! jolt-go-chan-fibers ch f)))
-(define (jolt-go-chan-fiber ch)
-  (jolt-with-mutex jolt-go-chan-fibers-mu (hashtable-ref jolt-go-chan-fibers ch #f)))
-
-;; (fiber-monitor ch) -> channel. Yields the throwable if the go body died, and
-;; CLOSES (nil) if it completed normally — which is what makes a throwing body
-;; distinguishable from one that returned nil, the whole point of this.
-;;
-;; A promise-style buffered(1) channel, so the value is there whether the caller
-;; takes before or after the fiber finishes. Answers a closed channel for a
-;; :thread-backend go or an unknown channel, so callers get nil rather than an
-;; error for "not monitorable".
-(define (jolt-fiber-monitor-chan ch)
-  (let ((m (ac-make 1 'fixed #f))
-        (f (jolt-go-chan-fiber ch)))
-    (if (not f)
-        (jolt-async-close! m)
-        (jolt-fiber-monitor!
-         f
-         (lambda (err)
-           (when err (jolt-async-give m (jolt-unwrap-throw err)))
-           (jolt-async-close! m))))
-    m))
-(def-var! "clojure.core.async" "fiber-monitor" jolt-fiber-monitor-chan)
+;; Monitoring a go block is backend-neutral and lives with the go surface in
+;; async.ss (go-chan-register! / go-chan-finish! / the fiber-monitor var). It
+;; used to be here, keyed channel -> FIBER, which is why it had nothing to say
+;; about a thread-backed body. jolt-fiber-monitor! (fibers.ss) is still the
+;; fiber-level primitive and is what the scheduler gates read.
 
 ;; The R3 park, generalized to return the handler's mailbox (value + port) —
 ;; the alts! fiber await needs the port; <! / >! need only the value.

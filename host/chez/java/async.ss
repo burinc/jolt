@@ -613,6 +613,10 @@
 
 (define (async-go-spawn-thread thunk)
   (let ((w (ac-make 1 'fixed #f)) (snap (dyn-binding-stack)))
+    ;; BEFORE the fork: a body that finishes first would otherwise publish into a
+    ;; registry with no entry for it, and every later monitor would read the
+    ;; missing entry as "nothing to report" — the clean-completion answer.
+    (go-chan-register! w)
     (fork-thread
      (lambda ()
        (*txn* #f)                          ; go/thread body must not inherit parent's txn
@@ -621,8 +625,95 @@
          (if (car r)
              (when (not (jolt-nil? (cdr r))) (jolt-async-give w (cdr r)))
              (async-report-uncaught! "go/thread body (channel closed)" (cdr r)))
-          (jolt-async-close! w))))
+         (go-chan-finish! w (and (not (car r)) (cdr r))))))
     w))
+
+;; --- monitoring a go block ----------------------------------------------------
+;; A go body that threw and a go body that returned nil are indistinguishable on
+;; the result channel: both close it and both hand the reader nil. This is what
+;; separates them, and it is keyed on the CHANNEL because that is what go returns
+;; — changing go's return value would break every program that reads it.
+;;
+;; ONE REGISTRY FOR EVERY BACKEND, and that is the point rather than a detail.
+;; *go-backend* is read at spawn time off a dynamic binding, so which backend ran
+;; a body is a property of the caller's binding, not of the code that spawned it;
+;; and within the fiber backend, whether the CPS pass could rewrite the body
+;; decides between two spawn paths, which is a property of the body. A monitor
+;; that reported on some of those and answered "clean" for the rest would be
+;; worse than no monitor, because a caller cannot tell from the jolt side which
+;; one it got. sm.ss makes the same argument for its own two spawn paths.
+;;
+;; Completion is published HERE, by every path that terminally closes a go
+;; channel, before the close: a reader woken by the close then finds the monitor
+;; already settled.
+;;
+;; WEAK, and keyed by the channel: a strong table would pin every go channel and
+;; its outcome for the life of the process, which on a server spawning a go per
+;; request is an unbounded leak. A dropped channel takes its entry with it, and
+;; the only thing lost is the ability to monitor a go block nobody holds any more.
+;;
+;; #(done? error monitors) — allocated by the spawn, so a monitor registered on a
+;; channel with no entry (a plain chan, or a go channel whose entry the collector
+;; took) reads as "nothing to report" rather than raising.
+(define go-completions (make-weak-eq-hashtable))
+(define go-completions-mu (make-mutex))
+(define (go-chan-register! ch)
+  (jolt-with-mutex go-completions-mu
+    (hashtable-set! go-completions ch (vector #f #f '()))))
+
+;; Publish the outcome and hand it to whatever is already waiting, then close the
+;; channel. ERR is the throwable, or #f for a body that completed.
+;;
+;; The list is taken and cleared under the lock so a monitor cannot fire twice,
+;; and the monitors themselves run OUTSIDE it: each gives to a channel, taking
+;; that channel's mutex, and the lock order is registry -> channel.
+;;
+;; Each monitor is CONTAINED, and the close is what it protects. These run on the
+;; finishing body's own thread or carrier, and an escape here would take the
+;; jolt-async-close! below with it — leaving the result channel open forever, so
+;; every reader of a go block whose monitor happened to raise would hang. One
+;; monitor must not be able to stop the others either. Nothing left to report to
+;; at this point: the body is already finishing.
+(define (go-chan-finish! ch err)
+  (let ((waiting
+         (jolt-with-mutex go-completions-mu
+           (let ((c (hashtable-ref go-completions ch #f)))
+             (and c
+                  (let ((ms (vector-ref c 2)))
+                    (vector-set! c 0 #t)
+                    (vector-set! c 1 err)
+                    (vector-set! c 2 '())
+                    ms))))))
+    (for-each (lambda (m) (guard (e (#t #f)) (m err))) (or waiting '())))
+  (jolt-async-close! ch))
+
+;; Register PROC on CH's completion. Delivered inline when the body has already
+;; finished — a caller cannot check the state and register in one step from
+;; outside, so without that a body that finished in between would never notify
+;; and the caller would wait forever. The read and the insert are one step under
+;; the mutex go-chan-finish! publishes through, so "finished" and "with this
+;; outcome" are one observation.
+(define (go-chan-monitor! ch proc)
+  (let ((now
+         (jolt-with-mutex go-completions-mu
+           (let ((c (hashtable-ref go-completions ch #f)))
+             (cond
+               ((not c) (list #f))            ; not a go channel: nothing to report
+               ((vector-ref c 0) (list (vector-ref c 1)))
+               (else (vector-set! c 2 (cons proc (vector-ref c 2))) #f))))))
+    (when now (proc (car now)))))
+
+;; (fiber-monitor ch) -> channel. Yields the throwable if the body died, and
+;; CLOSES (nil) if it completed normally. A promise-style buffered(1) channel, so
+;; the value is there whether the caller takes before or after the body finishes.
+(define (jolt-go-monitor-chan ch)
+  (let ((m (ac-make 1 'fixed #f)))
+    (go-chan-monitor! ch
+      (lambda (err)
+        (when err (jolt-async-give m (jolt-unwrap-throw err)))
+        (jolt-async-close! m)))
+    m))
+(def-var! "clojure.core.async" "fiber-monitor" jolt-go-monitor-chan)
 
 ;; --- alts! entry point -------------------------------------------------------
 ;; (__do-alts ports priority?) — ports is a jolt vector of channels or [ch val]
