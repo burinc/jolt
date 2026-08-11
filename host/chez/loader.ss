@@ -440,9 +440,16 @@
                                           (jolt-aot-capture))))
       (ldr-with-file-vars path
         (lambda ()
+          ;; rdr-read-top, not rdr-read-form: a stray close delimiter is a READ
+          ;; ERROR at a file's top level, and only the top-level entry says so.
+          ;; rdr-read-form leaves the position where it found the `)`, and the
+          ;; (> j i) guard below reads no progress as end of input — so one extra
+          ;; paren silently DROPPED the rest of the file and the run exited 0.
+          ;; A test file that lost its whole body that way still looked like a
+          ;; pass. The JVM raises "Unmatched delimiter: )" here (jolt-3amm).
           (let loop ((i 0))
             (when (< i end)
-              (let-values (((form j) (rdr-read-form src i end)))
+              (let-values (((form j) (rdr-read-top src i end)))
                 (when (> j i)
                   (unless (rdr-eof? form)
                     (when (getenv "JOLT_TRACE_LOAD")

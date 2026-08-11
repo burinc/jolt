@@ -1326,9 +1326,11 @@
     (when (and (< k end)
                 (let ((c (string-ref s k)))
                   (or (char=? c #\)) (char=? c #\]) (char=? c #\}))))
-      (jolt-throw (jolt-ex-info (string-append "Unmatched delimiter: "
-                                               (string (string-ref s k)))
-                                empty-pmap)))
+      ;; through rdr-error, so the report names the file and the line:col of the
+      ;; delimiter itself. The loader reads every top-level form through here, and
+      ;; "Unmatched delimiter: )" pointing at 1:1 of a 600-line file says only that
+      ;; the file is unbalanced somewhere.
+      (rdr-error s k (string-append "Unmatched delimiter: " (string (string-ref s k)))))
     (let-values (((form j) (rdr-read-form s k end)))
       (when (rdr-splice-t? form)
         (jolt-throw (jolt-ex-info
