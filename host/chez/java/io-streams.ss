@@ -15,7 +15,24 @@
 ;; __close so the new readers/streams flow through slurp / line-seq / with-open.
 
 ;; --- byte input stream ------------------------------------------------------
-(define (in-stream-port self) (vector-ref (jhost-state self) 0))
+;; The port is resolved through here rather than read straight out of the slot so
+;; System/in can hold the SYMBOL 'stdin and open the process's standard input on
+;; first use — the same live-resolution port-writer uses for 'out / 'err. A
+;; program that never touches System/in never opens a second handle on fd 0.
+;; Under a mutex because there must be exactly ONE port on fd 0: two threads each
+;; opening their own would each buffer ahead, and whichever read first would eat
+;; input the other never sees.
+(define jolt-stdin-port-mu (make-mutex))
+(define jolt-stdin-port-memo #f)
+(define (jolt-stdin-binary-port)
+  (unless jolt-stdin-port-memo
+    (jolt-with-mutex jolt-stdin-port-mu
+      (unless jolt-stdin-port-memo
+        (set! jolt-stdin-port-memo (standard-input-port (buffer-mode block))))))
+  jolt-stdin-port-memo)
+(define (in-stream-port self)
+  (let ((p (vector-ref (jhost-state self) 0)))
+    (if (eq? p 'stdin) (jolt-stdin-binary-port) p)))
 (define (make-in-stream port) (make-jhost "in-stream" (vector port)))
 (define (in-stream? x) (and (jhost? x) (string=? (jhost-tag x) "in-stream")))
 (register-host-methods! "in-stream"
@@ -266,6 +283,42 @@
     (make-jhost "print-stream"
                 (vector out (and (pair? rest) (jolt-truthy? (car rest)))))))
 
+;; --- System/in, System/out, System/err ---------------------------------------
+;; The three streams the JVM hands every program. jolt had out and err as bare
+;; port-writers and no `in` at all, so a namespace that read stdin the ordinary
+;; ported way — (slurp System/in), (io/reader System/in), (io/copy System/in
+;; System/out) — failed to LOAD: "No matching field or method: System/in".
+;;
+;; System.in is a java.io.InputStream, so it is an in-stream over a binary port on
+;; fd 0 and not a transcoded view of (current-input-port): an InputStream is
+;; bytes, and (io/copy System/in out) has to come out byte-identical for input
+;; that isn't UTF-8 text. That port is separate from the textual one (read-line)
+;; reads, so a program should use one or the other and not interleave them — the
+;; two buffer independently.
+;;
+;; System.out and System.err are java.io.PrintStreams, NOT the java.io.PrintWriter
+;; *out* is; ported code branches on the class and hands them to anything taking
+;; an OutputStream. They wrap the process port-writers registered in
+;; host-static-classes.ss, which is where the underlying ports resolve.  autoFlush
+;; is on, as it is for the JVM's two.
+(define system-in-stream (make-jhost "in-stream" (vector 'stdin)))
+(define (sys-set-in! v)
+  (for-each (lambda (c) (vector-set! (mutable-static-cell c "in" #t) 0 v))
+            '("System" "java.lang.System"))
+  jolt-nil)
+(register-class-statics! "System"
+  (list (cons "in" system-in-stream)
+        (cons "setIn" (lambda (v) (sys-set-in! v)))))
+(sys-set-in! system-in-stream)
+;; io.ss's read-line compares the cell against this to decide whether System/in
+;; has been replaced; it could not build the stream itself (no byte streams yet).
+;; The default keeps the tuned textual path there — char-ready? polling and
+;; fiber-friendly parking — and only a replacement is read through .read.
+(set! stdin-default-stream system-in-stream)
+(for-each (lambda (p)
+            (sys-set-stream! (car p) (make-jhost "print-stream" (vector (cdr p) #t))))
+          (list (cons "out" system-out-writer) (cons "err" system-err-writer)))
+
 (reg-ctor! '("ByteArrayOutputStream" "java.io.ByteArrayOutputStream")
   (lambda _
     (call-with-values open-bytevector-output-port
@@ -343,8 +396,7 @@
              (jolt-close target) jolt-nil)
             ;; the StringWriter / PrintWriter family (io.ss) accumulates through
             ;; its own .write method.
-            ((and (jhost? target)
-                  (member (jhost-tag target) '("writer" "file-writer" "port-writer" "print-writer")))
+            ((and (jhost? target) (text-sink-tag? (jhost-tag target)))
              (record-method-dispatch target "write" (jolt-list (jolt-str-render-one content)))
              (jolt-close target) jolt-nil)
             (else (apply prev target content opts)))))
@@ -378,9 +430,36 @@
            (make-out-stream (open-file-output-port (path-of x)
                               (if append? (file-options no-fail no-truncate append) (file-options no-fail))
                               (buffer-mode block)))))
+        ;; System/out and System/err are already byte streams — pass them through,
+        ;; the way an out-stream passes through.
+        ((and (jhost? x) (text-sink-tag? (jhost-tag x))) x)
         (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as an OutputStream.")))))
 (def-var! "clojure.java.io" "input-stream" jio-input-stream)
 (def-var! "clojure.java.io" "output-stream" jio-output-stream)
+
+;; io/reader and io/writer over a BYTE stream are an InputStreamReader and an
+;; OutputStreamWriter on the JVM: the bytes, decoded / encoded. io.ss's coercions
+;; predate the byte streams in this file and knew neither, so (io/reader
+;; System/in) — the ordinary ported way to read stdin — and (io/writer
+;; (FileOutputStream. f)) both raised "Cannot open <…> as a Reader/Writer".
+;; A value that is already a reader/writer passes through, as io/reader and
+;; io/writer do for every other reader/writer.
+(let ((prev jolt-io-reader))
+  (set! jolt-io-reader
+        (lambda (x)
+          (if (in-stream? x)
+              (make-char-reader (transcoded-port (in-stream-port x) utf8-tx))
+              (prev x)))))
+(let ((prev jolt-io-writer))
+  (set! jolt-io-writer
+        (lambda (x)
+          (cond ((char-writer? x) x)
+                ((out-stream? x) (make-char-writer (transcoded-port (out-stream-sink-port x) utf8-tx)))
+                ((and (jhost? x) (text-sink-tag? (jhost-tag x))) x)
+                (else (prev x))))))
+;; re-bound: the clojure.java.io vars hold the VALUE these names had when io.ss
+;; ran, so a set! above would not reach them.
+(def-var! "clojure.java.io" "writer" jolt-io-writer)
 
 ;; io/make-parents: create the parent directories of the last path segment.
 (define (jio-make-parents . args)
@@ -429,7 +508,7 @@
      (put-bytevector (out-stream-port output)
                      (or (input-bytes input) (string->utf8 (input-text input)))))
     ((char-writer? output) (put-string (char-writer-port output) (input-text input)))
-    ((and (jhost? output) (member (jhost-tag output) '("writer" "file-writer" "port-writer" "print-writer")))
+    ((and (jhost? output) (text-sink-tag? (jhost-tag output)))
      (record-method-dispatch output "write" (list->cseq (list (input-text input)))))
     ((or (jfile? output) (string? output))
      ;; a string INPUT is its characters (io/copy's text source), never a filename

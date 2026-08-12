@@ -729,11 +729,40 @@
         (jolt-pause-ms step)
         (loop (min jolt-stdin-poll-step-max (* step 2)))))))
 
+;; read-line reads System/in, so System/setIn has to redirect it — that is how a
+;; test fixture or a REPL harness feeds a program its input.
+;;
+;; The stream System/in holds by DEFAULT is built by io-streams.ss, which owns the
+;; byte streams and loads after this file; it fills stdin-default-stream in when it
+;; does. The comparison is by identity and the cell is resolved once, so the
+;; default path costs one vector-ref and one eq? per line — this loop is tuned
+;; (see jolt-stdin-wait-ready! above) and a per-line hashtable lookup would show.
+;; Until io-streams.ss runs, the cell holds nil and nothing matches #f, so the
+;; default branch is taken either way.
+(define stdin-default-stream #f)
+(define stdin-cell (mutable-static-cell "System" "in" #t))
+;; A replaced System/in is read a byte at a time through its own .read; \n ends a
+;; line and the \r of a CRLF is dropped, as readLine does.
+(define (stdin-read-line-from v)
+  (let loop ((acc '()))
+    (let ((b (record-method-dispatch v "read" jolt-nil)))
+      (cond
+        ((or (jolt-nil? b) (not (number? b)) (< (jnum->exact b) 0))
+         (if (null? acc) jolt-nil (stdin-line->string acc)))
+        ((= (jnum->exact b) 10) (stdin-line->string acc))
+        (else (loop (cons (bitwise-and (jnum->exact b) #xff) acc)))))))
+(define (stdin-line->string acc)      ; acc is reversed, so the \r is at the head
+  (utf8->string (u8-list->bytevector (reverse (if (and (pair? acc) (= (car acc) 13))
+                                                  (cdr acc)
+                                                  acc)))))
 (def-var! "clojure.core" "__stdin-read-line"
   (lambda ()
-    (let ((in (current-input-port)))
-      (jolt-stdin-wait-ready! in)
-      (let ((l (get-line in))) (if (eof-object? l) jolt-nil l)))))
+    (let ((v (vector-ref stdin-cell 0)))
+      (if (eq? v stdin-default-stream)
+          (let ((in (current-input-port)))
+            (jolt-stdin-wait-ready! in)
+            (let ((l (get-line in))) (if (eof-object? l) jolt-nil l)))
+          (stdin-read-line-from v)))))
 
 ;; (type f) -> :jolt/file (the tagged-file :jolt/type). Registered through the
 ;; type-arm registry (natives-meta.ss) so the dispatcher picks it up.
@@ -767,8 +796,8 @@
   (cond
     ((jolt-nil? x) jolt-nil)
     ((and (jhost? x) (or (pushback-reader-tag? (jhost-tag x))
-                         (member (jhost-tag x) '("string-reader" "writer"
-                                                 "file-writer" "port-writer" "print-writer"))))
+                         (text-sink-tag? (jhost-tag x))
+                         (string=? (jhost-tag x) "string-reader")))
      (record-method-dispatch x "close" jolt-nil) jolt-nil)
     ;; a library's stream shim (tagged-table) closes via its registered .close
     ;; method (a no-op for in-memory streams); absent method -> no-op.

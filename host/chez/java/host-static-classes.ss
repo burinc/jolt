@@ -233,10 +233,50 @@
 
 ;; ---- StringWriter -----------------------------------------------------------
 ;; Writer.write(int) writes the CHAR for that code; append(char) appends the char.
-(define (writer-piece x) (if (number? x) (string (integer->char (jnum->exact x))) (render-piece x)))
+;; What one value puts into a stream. A number is the CHARACTER with that code
+;; (write(int) writes one unit, not the digits). A char[] is its characters —
+;; every write and print overload that takes one is defined that way, and it used
+;; to render as "#object[[C …]" straight into the stream. A byte[] is NOT handled
+;; here: print/println have no byte[] overload on the JVM and fall to
+;; print(Object), so it renders as an object, and only write puts its bytes out.
+(define (char-array-arg? x) (and (jolt-array? x) (eq? (jolt-array-kind x) 'char)))
+(define (byte-array-arg? x) (and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)))
+(define (char-array->string x)
+  (list->string (map (lambda (c) (if (char? c) c (integer->char (jnum->exact c))))
+                     (vector->list (jolt-array-vec x)))))
+(define (writer-piece x)
+  (cond ((number? x) (string (integer->char (jnum->exact x))))
+        ((char-array-arg? x) (char-array->string x))
+        (else (render-piece x))))
+;; What a .write argument puts into a stream: writer-piece, plus the byte[] whose
+;; CONTENT write is defined to emit — (.write System/out (.getBytes s)) is how
+;; ported code writes raw output, and it used to put "#object[[B …]" in the
+;; stream. Bytes decode as UTF-8, the encoding jolt renders in.
+;;
+;; With (off len) it is the JVM's 3-arg write over a region. A byte[] is sliced
+;; BEFORE decoding, since the offsets are byte offsets and slicing the decoded
+;; string would cut multi-byte characters in the wrong places. Out-of-range ends
+;; clamp rather than raise: a stream write is not the place to turn a caller's
+;; off-by-one into a crash mid-output.
+(define (writer-piece-range x rest)
+  (if (and (pair? rest) (pair? (cdr rest)))
+      (let ((off (max 0 (jnum->exact (car rest))))
+            (len (max 0 (jnum->exact (cadr rest)))))
+        (if (byte-array-arg? x)
+            (let* ((bv (na-bytearray->bv x))
+                   (start (min off (bytevector-length bv)))
+                   (end (min (bytevector-length bv) (+ start len)))
+                   (sub (make-bytevector (- end start))))
+              (bytevector-copy! bv start sub 0 (- end start))
+              (utf8->string sub))
+            (let* ((s (writer-piece x))
+                   (start (min off (string-length s)))
+                   (end (min (string-length s) (+ start len))))
+              (substring s start end))))
+      (if (byte-array-arg? x) (utf8->string (na-bytearray->bv x)) (writer-piece x))))
 (register-class-ctor! "StringWriter" (lambda args (make-jhost "writer" (vector ""))))
 (register-host-methods! "writer"
-  (list (cons "write" (lambda (self x) (sb-set! self (string-append (sb-str self) (writer-piece x))) jolt-nil))
+  (list (cons "write" (lambda (self x . rest) (sb-set! self (string-append (sb-str self) (writer-piece-range x rest))) jolt-nil))
         (cons "append" (lambda (self x . rest) (sb-set! self (string-append (sb-str self) (append-text x rest))) self))
         (cons "flush" (lambda (self) jolt-nil))
         (cons "close" (lambda (self) jolt-nil))
@@ -253,7 +293,7 @@
 (define (fw-append! self s) (vector-set! (jhost-state self) 1 (string-append (fw-buf self) s)))
 (define (fw-flush! self) (jolt-spit (fw-path self) (fw-buf self)))  ; jolt-spit: io.ss
 (register-host-methods! "file-writer"
-  (list (cons "write" (lambda (self x) (fw-append! self (writer-piece x)) jolt-nil))
+  (list (cons "write" (lambda (self x . rest) (fw-append! self (writer-piece-range x rest)) jolt-nil))
         (cons "append" (lambda (self x . rest) (fw-append! self (append-text x rest)) self))
         (cons "flush" (lambda (self) (fw-flush! self) jolt-nil))
         (cons "close" (lambda (self) (fw-flush! self) jolt-nil))
@@ -270,16 +310,28 @@
 ;; real stdout, so rewrite-clj's (z/print) — which writes via *out* — escaped the
 ;; capture. A stored port object (should any other code make a port-writer) is used
 ;; as-is.
+;;
+;; 'stdout / 'stderr are the other half of that: the PROCESS streams, resolved
+;; once at startup and never again. They back System/out and System/err, which
+;; the JVM does NOT route through *out* — a with-out-str captures (print …) and
+;; leaves (.println System/out …) going to the terminal. Resolving them live
+;; through (current-output-port) like 'out made jolt capture both, so a library
+;; that deliberately writes past the capture (a progress bar, a prompt, a logger
+;; writing to the real stderr) had its output swallowed into the string instead.
+(define port-writer-stdout (current-output-port))
+(define port-writer-stderr (current-error-port))
 (define (port-writer-port self)
   (let ((p (vector-ref (jhost-state self) 0)))
     (cond ((eq? p 'out) (current-output-port))
           ((eq? p 'err) (current-error-port))
+          ((eq? p 'stdout) port-writer-stdout)
+          ((eq? p 'stderr) port-writer-stderr)
           (else p))))
 ;; print / println / printf are PrintStream's, and System/out is a port-writer, so
 ;; ported code writing (.println System/out …) lands here. println with no argument
 ;; is the bare newline, as on the JVM.
 (register-host-methods! "port-writer"
-  (list (cons "write" (lambda (self x) (display (writer-piece x) (port-writer-port self)) jolt-nil))
+  (list (cons "write" (lambda (self x . rest) (display (writer-piece-range x rest) (port-writer-port self)) jolt-nil))
         (cons "append" (lambda (self x . rest) (display (append-text x rest) (port-writer-port self)) self))
         (cons "print" (lambda (self x) (display (writer-piece x) (port-writer-port self)) jolt-nil))
         (cons "println" (lambda (self . xs)
@@ -294,25 +346,29 @@
 (def-dynvar! "clojure.core" "*err*" (make-jhost "port-writer" (vector 'err)))
 
 ;; System/out and System/err — the process's own streams, so unlike *out*/*err*
-;; they are NOT affected by a (binding [*out* …]), matching the JVM. Ported code
-;; writes to them directly ((.println System/out …)); they are the same
-;; port-writers *out*/*err* root to, since jolt models a stream and a writer the
-;; same way.
+;; they are NOT affected by a (binding [*out* …]) or a with-out-str, matching the
+;; JVM. Ported code writes to them directly ((.println System/out …)). They are
+;; port-writers over the 'stdout / 'stderr ports resolved at startup; io-streams.ss
+;; then wraps each in the PrintStream shim, because on the JVM System.out is a
+;; java.io.PrintStream and not the java.io.PrintWriter *out* is, and libraries
+;; branch on that class.
 ;;
 ;; They live in the MUTABLE static cells rather than the plain statics table,
 ;; because setOut/setErr replace them wholesale — clojure.tools.logging's
 ;; log-capture! points them at a PrintStream over a proxy so every write becomes a
 ;; log record. Both spellings get the cell, since a read resolves the class name as
 ;; written.
+(define system-out-writer (make-jhost "port-writer" (vector 'stdout)))
+(define system-err-writer (make-jhost "port-writer" (vector 'stderr)))
 (register-class-statics! "System"
-  (list (cons "out" (make-jhost "port-writer" (vector 'out)))
-        (cons "err" (make-jhost "port-writer" (vector 'err)))))
+  (list (cons "out" system-out-writer)
+        (cons "err" system-err-writer)))
 (define (sys-set-stream! member v)
   (for-each (lambda (c) (vector-set! (mutable-static-cell c member #t) 0 v))
             '("System" "java.lang.System"))
   jolt-nil)
-(for-each (lambda (m) (sys-set-stream! m (make-jhost "port-writer" (vector (string->symbol m)))))
-          '("out" "err"))
+(sys-set-stream! "out" system-out-writer)
+(sys-set-stream! "err" system-err-writer)
 (register-class-statics! "System"
   (list (cons "setOut" (lambda (v) (sys-set-stream! "out" v)))
         (cons "setErr" (lambda (v) (sys-set-stream! "err" v)))))
@@ -344,7 +400,11 @@
 (register-class-ctor! "java.io.PrintWriter"
   (lambda args (make-jhost "print-writer" (vector (if (pair? args) (car args) jolt-nil)))))
 (register-host-methods! "print-writer"
-  (list (cons "write" (lambda (self x . rest) (pw-forward (vector-ref (jhost-state self) 0) (append-text x rest)) jolt-nil))
+  ;; write takes (buf off len) and renders an int as its character; append takes
+  ;; (csq start end) and renders everything as text. Sharing append-text between
+  ;; them read the 3-arg write's LENGTH as an end index and printed (.write w 65)
+  ;; as "65" rather than "A".
+  (list (cons "write" (lambda (self x . rest) (pw-forward (vector-ref (jhost-state self) 0) (writer-piece-range x rest)) jolt-nil))
         (cons "print" (lambda (self x) (pw-forward (vector-ref (jhost-state self) 0) (render-piece x)) jolt-nil))
         (cons "append" (lambda (self x . rest) (pw-forward (vector-ref (jhost-state self) 0) (append-text x rest)) self))
         (cons "flush" (lambda (self) jolt-nil))
@@ -361,8 +421,8 @@
 (define (jolt-print-writer-on flush-fn close-fn)
   (make-jhost "print-writer-on" (vector (box "") flush-fn close-fn)))
 (register-host-methods! "print-writer-on"
-  (list (cons "write" (lambda (self x) (set-box! (pwo-buf self)
-                                  (string-append (unbox (pwo-buf self)) (writer-piece x))) jolt-nil))
+  (list (cons "write" (lambda (self x . rest) (set-box! (pwo-buf self)
+                                  (string-append (unbox (pwo-buf self)) (writer-piece-range x rest))) jolt-nil))
         (cons "append" (lambda (self x . rest) (set-box! (pwo-buf self)
                                   (string-append (unbox (pwo-buf self)) (append-text x rest))) self))
         (cons "flush" (lambda (self)

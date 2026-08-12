@@ -122,6 +122,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   fnform traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck lockcheck parkcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
+  systemstreams \
   certify gambitcheck gambitgencheck grenadinecheck fibers gosm asynctimer threadsafety
 TEST-GATES := submodules selfhost ci
 
@@ -831,6 +832,12 @@ devbootsmoke: devboot
 # check that two runtimes sharing a version string still key separately.
 aotcachesmoke: testbin
 	@sh test/chez/aot-cache-smoke.sh
+
+# System/in, System/out, System/err: the process streams and the classes the JVM
+# reports for them. Needs a real pipe on stdin, so it is a script rather than a
+# corpus row.
+systemstreams:
+	@sh test/chez/system-streams-smoke.sh
 
 # Smoke test: clojure.core/compile writes artifacts under *compile-path* and a
 # later PROCESS loads them — including with the source removed, which is the point
