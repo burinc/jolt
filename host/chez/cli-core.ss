@@ -132,14 +132,13 @@
 ;; `build` — the script driver loads the build driver from the repo, the
 ;; standalone binary materializes its bundled boots/stub (build.ss itself is
 ;; already inlined there).
-;; Read all of stdin as a string (a `-` program / expression source).
+;; Read all of stdin as a string (a `-` program / expression source). Through the
+;; one port jolt opens on fd 0 (io-streams.ss), the same one System/in and
+;; read-line read: a second port on that descriptor buffers ahead on its own, and
+;; the program source would take input the program then went looking for.
 (define (jolt-read-all-stdin)
-  (let ((out (open-output-string)) (in (current-input-port)))
-    (let loop ()
-      (let ((c (read-char in)))
-        (if (eof-object? c)
-            (get-output-string out)
-            (begin (write-char c out) (loop)))))))
+  (let ((bv (get-bytevector-all (jolt-stdin-binary-port))))
+    (if (eof-object? bv) "" (utf8->string bv))))
 
 ;; Evaluate EXPR (a string of one-or-more forms) with *command-line-args* bound
 ;; to app-args. print? echoes the final value (blank for nil), as `-e` does; a

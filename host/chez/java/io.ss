@@ -717,81 +717,8 @@
 ;; str of a jfile is its path (Clojure's File.toString).
 (register-str-render! jfile? jfile-path)
 
-;; stdin line seam: the clojure.core *in* reader (50-io.clj) drives read-line /
-;; read / read+string through __stdin-read-line. Return the next line (newline
-;; stripped) or nil at EOF. Without this, (read-line) and the REPL call nil.
-;;
-;; Waits in `sleep`, NOT inside the read. Chez's blocking read holds the whole
-;; Scheme world while it waits: no other thread runs at all, so a future stopped
-;; ticking and an agent stopped draining the moment the main thread reached a
-;; prompt, and the SIGTERM watcher (concurrency.ss) could not wake to run the
-;; shutdown hooks either. On the JVM those all keep running while a thread sits in
-;; System.in.read(). sleep is collect-safe, so parking THERE and reading only once
-;; the port has something leaves every other thread alive (jolt-p9ua). Backs off
-;; 0.5ms -> 20ms, the shape proc-wait-blocking uses.
-;;
-;; A line already in the buffer costs one char-ready? and no sleep at all, so a
-;; piped read-line loop keeps its throughput: 1326 -> 1386 ns/line, medians of
-;; four 300k-line runs each with the wait compiled out and back in, 1.045x.
-;; Whether the port can answer char-ready? at all is settled ONCE per port rather
-;; than under a guard per line — the guard was most of the cost and took the same
-;; measurement to 1460 ns/line, 1.10x, which is the ceiling rather than a rounding
-;; error. A port that cannot answer reads the old, blocking way.
-;;
-;; char-ready? promises a CHAR, not a whole line, so a writer that sends half a
-;; line and then stalls still parks the world for the remainder — a far smaller
-;; window than "until any input arrives", and the most this port surface offers.
-(define jolt-stdin-poll-step0 1)               ; 1ms
-(define jolt-stdin-poll-step-max 20)          ; 20ms
-(define jolt-stdin-poll-port (box #f))         ; the port the answer below is about
-(define jolt-stdin-poll-ok (box #f))
-(define (jolt-stdin-wait-ready! in)
-  (unless (eq? (unbox jolt-stdin-poll-port) in)
-    (set-box! jolt-stdin-poll-ok (guard (_ (#t #f)) (char-ready? in) #t))
-    (set-box! jolt-stdin-poll-port in))
-  (when (unbox jolt-stdin-poll-ok)
-    (let loop ((step jolt-stdin-poll-step0))
-      (unless (char-ready? in)
-        ;; jolt-pause-ms and not (sleep): on a fiber this parks for the step and
-        ;; gives the carrier up, so (read-line) from a go block no longer stops
-        ;; every other fiber placed on that carrier until input arrives.
-        (jolt-pause-ms step)
-        (loop (min jolt-stdin-poll-step-max (* step 2)))))))
-
-;; read-line reads System/in, so System/setIn has to redirect it — that is how a
-;; test fixture or a REPL harness feeds a program its input.
-;;
-;; The stream System/in holds by DEFAULT is built by io-streams.ss, which owns the
-;; byte streams and loads after this file; it fills stdin-default-stream in when it
-;; does. The comparison is by identity and the cell is resolved once, so the
-;; default path costs one vector-ref and one eq? per line — this loop is tuned
-;; (see jolt-stdin-wait-ready! above) and a per-line hashtable lookup would show.
-;; Until io-streams.ss runs, the cell holds nil and nothing matches #f, so the
-;; default branch is taken either way.
-(define stdin-default-stream #f)
-(define stdin-cell (mutable-static-cell "System" "in" #t))
-;; A replaced System/in is read a byte at a time through its own .read; \n ends a
-;; line and the \r of a CRLF is dropped, as readLine does.
-(define (stdin-read-line-from v)
-  (let loop ((acc '()))
-    (let ((b (record-method-dispatch v "read" jolt-nil)))
-      (cond
-        ((or (jolt-nil? b) (not (number? b)) (< (jnum->exact b) 0))
-         (if (null? acc) jolt-nil (stdin-line->string acc)))
-        ((= (jnum->exact b) 10) (stdin-line->string acc))
-        (else (loop (cons (bitwise-and (jnum->exact b) #xff) acc)))))))
-(define (stdin-line->string acc)      ; acc is reversed, so the \r is at the head
-  (utf8->string (u8-list->bytevector (reverse (if (and (pair? acc) (= (car acc) 13))
-                                                  (cdr acc)
-                                                  acc)))))
-(def-var! "clojure.core" "__stdin-read-line"
-  (lambda ()
-    (let ((v (vector-ref stdin-cell 0)))
-      (if (eq? v stdin-default-stream)
-          (let ((in (current-input-port)))
-            (jolt-stdin-wait-ready! in)
-            (let ((l (get-line in))) (if (eof-object? l) jolt-nil l)))
-          (stdin-read-line-from v)))))
+;; The stdin line seam (__stdin-read-line, the *in* reader's source) lives in
+;; io-streams.ss, next to the System/in stream it reads.
 
 ;; (type f) -> :jolt/file (the tagged-file :jolt/type). Registered through the
 ;; type-arm registry (natives-meta.ss) so the dispatcher picks it up.

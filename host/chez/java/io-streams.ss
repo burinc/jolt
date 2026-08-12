@@ -18,10 +18,13 @@
 ;; The port is resolved through here rather than read straight out of the slot so
 ;; System/in can hold the SYMBOL 'stdin and open the process's standard input on
 ;; first use — the same live-resolution port-writer uses for 'out / 'err. A
-;; program that never touches System/in never opens a second handle on fd 0.
-;; Under a mutex because there must be exactly ONE port on fd 0: two threads each
-;; opening their own would each buffer ahead, and whichever read first would eat
-;; input the other never sees.
+;; program that never touches System/in never opens a handle on fd 0.
+;;
+;; This is the ONLY port jolt opens on fd 0, and everything that reads standard
+;; input goes through it: System/in itself, the *in* reader below it, and the `-`
+;; program source in cli-core.ss. A second port on the same descriptor buffers
+;; ahead on its own, and whichever read first would eat input the other never
+;; sees. Memoized under a mutex for the same reason across threads.
 (define jolt-stdin-port-mu (make-mutex))
 (define jolt-stdin-port-memo #f)
 (define (jolt-stdin-binary-port)
@@ -46,16 +49,24 @@
                  ;; return has to distinguish 0xff from end-of-stream.
                  (let ((b (get-u8 port))) (if (eof-object? b) -1 (->num b)))
                  ;; read(buf …) fills a byte-array, whose elements ARE signed.
+                 ;; Returns as soon as ANY byte is there, which is the JVM's
+                 ;; contract ("blocks until at least one byte is available") and
+                 ;; not "until the buffer is full": filling it first hung a read
+                 ;; over a pipe or a terminal, where the rest of the buffer only
+                 ;; arrives after whatever the program does with these bytes.
                  (let* ((buf (car rest))
                         (vec (jolt-array-vec buf))
                         (off (if (>= (length rest) 3) (jnum->exact (cadr rest)) 0))
-                        (len (if (>= (length rest) 3) (jnum->exact (caddr rest)) (vector-length vec))))
-                   (let loop ((i 0))
-                     (if (>= i len) (->num i)
-                         (let ((b (get-u8 port)))
-                           (if (eof-object? b)
-                               (if (= i 0) -1 (->num i))
-                               (begin (vector-set! vec (+ off i) (na-u8->byte b)) (loop (+ i 1))))))))))))
+                        (len (if (>= (length rest) 3) (jnum->exact (caddr rest)) (vector-length vec)))
+                        (tmp (make-bytevector (max len 1)))
+                        (n (if (<= len 0) 0 (get-bytevector-some! port tmp 0 len))))
+                   (cond
+                     ((<= len 0) (->num 0))
+                     ((eof-object? n) -1)
+                     (else (let loop ((i 0))
+                             (if (>= i n) (->num n)
+                                 (begin (vector-set! vec (+ off i) (na-u8->byte (bytevector-u8-ref tmp i)))
+                                        (loop (+ i 1))))))))))))
    (cons "readAllBytes" (lambda (self) (let ((bv (get-bytevector-all (in-stream-port self))))
                                          (na-byte-array (if (eof-object? bv) (make-bytevector 0) bv)))))
    (cons "skip" (lambda (self n) (let ((bv (get-bytevector-n (in-stream-port self) (jnum->exact n))))
@@ -292,9 +303,8 @@
 ;; System.in is a java.io.InputStream, so it is an in-stream over a binary port on
 ;; fd 0 and not a transcoded view of (current-input-port): an InputStream is
 ;; bytes, and (io/copy System/in out) has to come out byte-identical for input
-;; that isn't UTF-8 text. That port is separate from the textual one (read-line)
-;; reads, so a program should use one or the other and not interleave them — the
-;; two buffer independently.
+;; that isn't UTF-8 text. It is also the one place standard input is read from —
+;; see the *in* seam below.
 ;;
 ;; System.out and System.err are java.io.PrintStreams, NOT the java.io.PrintWriter
 ;; *out* is; ported code branches on the class and hands them to anything taking
@@ -310,14 +320,152 @@
   (list (cons "in" system-in-stream)
         (cons "setIn" (lambda (v) (sys-set-in! v)))))
 (sys-set-in! system-in-stream)
-;; io.ss's read-line compares the cell against this to decide whether System/in
-;; has been replaced; it could not build the stream itself (no byte streams yet).
-;; The default keeps the tuned textual path there — char-ready? polling and
-;; fiber-friendly parking — and only a replacement is read through .read.
-(set! stdin-default-stream system-in-stream)
 (for-each (lambda (p)
             (sys-set-stream! (car p) (make-jhost "print-stream" (vector (cdr p) #t))))
           (list (cons "out" system-out-writer) (cons "err" system-err-writer)))
+
+;; --- *in*: the reader over System/in ----------------------------------------
+;; The JVM stacks the two rather than putting them side by side — System.in is the
+;; byte stream, and *in* is a Reader built over it (RT.in is a
+;; LineNumberingPushbackReader over an InputStreamReader over System.in) — so
+;; read-line ultimately pulls its bytes out of System.in. jolt has the same shape:
+;; the clojure.core *in* reader (50-io.clj) drives read-line / read / read+string
+;; through this one seam, and this seam reads System/in.
+;;
+;; Standard input is therefore buffered in exactly one place, the Chez port on
+;; fd 0, which is the layer the JVM's BufferedInputStream is. What jolt does not
+;; add is the JVM's SECOND buffer: an InputStreamReader decodes into 8K of its
+;; own, which is why (.read System/in) after a (read-line) answers -1 there with
+;; the rest of stdin sitting inside the reader. Nothing here reads past the line
+;; it returns, so that same read answers the next byte of the input.
+;;
+;; The other difference is that System/setIn redirects read-line, because the
+;; stream is read out of the static on every line. The JVM builds *in* over
+;; whatever System.in was at RT class-init, so a later setIn does not reach it and
+;; with-in-str is the only way to feed read-line. Both differences are supersets:
+;; on the JVM, mixing the two loses input and redirecting read-line is impossible.
+;;
+;; Waits in a nap, NOT inside the read. Chez's blocking read holds the whole
+;; Scheme world while it waits: no other thread runs at all, so a future stopped
+;; ticking and an agent stopped draining the moment the main thread reached a
+;; prompt, and the SIGTERM watcher (concurrency.ss) could not wake to run the
+;; shutdown hooks either. On the JVM those all keep running while a thread sits in
+;; System.in.read(). The nap is collect-safe, so parking THERE and reading only
+;; once the port has something leaves every other thread alive (jolt-p9ua). Backs
+;; off 1ms -> 20ms, the shape proc-wait-blocking uses.
+;;
+;; Whether a port can answer input-port-ready? at all is settled ONCE per port
+;; rather than under a guard per line — the guard was most of the cost when this
+;; was measured. A port that cannot answer (a custom port, e.g. a pipe) reads the
+;; blocking way. input-port-ready? and not char-ready?, which is textual only.
+(define jolt-stdin-poll-step0 1)              ; 1ms
+(define jolt-stdin-poll-step-max 20)          ; 20ms
+(define jolt-stdin-poll-port (box #f))        ; the port the answer below is about
+(define jolt-stdin-poll-ok (box #f))
+(define (jolt-stdin-wait-ready! in)
+  (unless (eq? (unbox jolt-stdin-poll-port) in)
+    (set-box! jolt-stdin-poll-ok (guard (_ (#t #f)) (input-port-ready? in) #t))
+    (set-box! jolt-stdin-poll-port in))
+  (when (unbox jolt-stdin-poll-ok)
+    (let loop ((step jolt-stdin-poll-step0))
+      (unless (input-port-ready? in)
+        ;; jolt-pause-ms and not (sleep): on a fiber this parks for the step and
+        ;; gives the carrier up, so (read-line) from a go block no longer stops
+        ;; every other fiber placed on that carrier until input arrives.
+        (jolt-pause-ms step)
+        (loop (min jolt-stdin-poll-step-max (* step 2)))))))
+
+;; readLine ends a line on \n, on \r, or on \r\n. A \r ends the line at once; the
+;; \n that may follow is taken then and there when the stream already has it, and
+;; otherwise left for the next read to skip. Waiting to see whether one follows
+;; would keep a terminal's last line from being returned until the user typed
+;; something more, which is why BufferedReader keeps this flag; taking the byte
+;; when it IS there keeps a stray \n out of what (.read System/in) sees next. The
+;; flag names the stream it belongs to, so a System/setIn between the two halves
+;; of a CRLF cannot make the new stream swallow a leading newline.
+(define stdin-pending-lf (box #f))
+(define stdin-cell (mutable-static-cell "System" "in" #t))
+(define stdin-line-cap0 128)
+
+;; The first byte of a line, minus the \n owed by a \r that ended the last one.
+(define (stdin-first-byte v get)
+  (if (eq? (unbox stdin-pending-lf) v)
+      (begin (set-box! stdin-pending-lf #f)
+             (let ((b (get))) (if (eqv? b 10) (get) b)))
+      (get)))
+(define (stdin-line-string buf i)
+  (let ((out (make-bytevector i)))
+    (bytevector-copy! buf 0 out 0 i)
+    (utf8->string out)))
+
+;; The \n of a CRLF, when the port can say it is already sitting there. A port
+;; that cannot answer, or that has nothing yet, leaves it to the flag: peeking
+;; would block, and blocking here is what this must not do.
+(define (stdin-take-crlf! v port)
+  (if (and (unbox jolt-stdin-poll-ok)
+           (eq? (unbox jolt-stdin-poll-port) port)
+           (input-port-ready? port))
+      (when (eqv? (lookahead-u8 port) 10) (get-u8 port))
+      (set-box! stdin-pending-lf v)))
+
+;; System/in is an ordinary in-stream, so its bytes come straight off the port.
+;; The dispatched twin below is the same loop over .read; kept apart because this
+;; one is the one a piped read-line loop runs a million times, and reading the
+;; byte through a passed-in procedure instead of inline costs it a quarter.
+(define (stdin-line-from-port v port)
+  (jolt-stdin-wait-ready! port)
+  (let loop ((b (stdin-first-byte v (lambda () (get-u8 port))))
+             (buf (make-bytevector stdin-line-cap0))
+             (cap stdin-line-cap0)
+             (i 0))
+    (cond
+      ((eof-object? b) (if (fx=? i 0) jolt-nil (stdin-line-string buf i)))
+      ((fx=? b 10) (stdin-line-string buf i))
+      ((fx=? b 13) (stdin-take-crlf! v port) (stdin-line-string buf i))
+      ((fx=? i cap)
+       (let ((grown (make-bytevector (fx* cap 2))))
+         (bytevector-copy! buf 0 grown 0 cap)
+         (bytevector-u8-set! grown i b)
+         (loop (get-u8 port) grown (fx* cap 2) (fx+ i 1))))
+      (else
+        (bytevector-u8-set! buf i b)
+        (loop (get-u8 port) buf cap (fx+ i 1))))))
+
+;; Anything else System/setIn was handed — a proxy, a library's stream shim — is
+;; read through its own .read, so an override is seen. One byte at a time, so the
+;; line takes nothing the caller did not ask for.
+(define (stream-read-byte v)
+  (let ((b (record-method-dispatch v "read" jolt-nil)))
+    (if (or (jolt-nil? b) (not (number? b)) (< (jnum->exact b) 0))
+        (eof-object)
+        (bitwise-and (jnum->exact b) #xff))))
+(define (stdin-line-from-stream v)
+  (let ((get (lambda () (stream-read-byte v))))
+    (let loop ((b (stdin-first-byte v get))
+               (buf (make-bytevector stdin-line-cap0))
+               (cap stdin-line-cap0)
+               (i 0))
+      (cond
+        ((eof-object? b) (if (fx=? i 0) jolt-nil (stdin-line-string buf i)))
+        ((fx=? b 10) (stdin-line-string buf i))
+        ((fx=? b 13) (set-box! stdin-pending-lf v) (stdin-line-string buf i))
+        ((fx=? i cap)
+         (let ((grown (make-bytevector (fx* cap 2))))
+           (bytevector-copy! buf 0 grown 0 cap)
+           (bytevector-u8-set! grown i b)
+           (loop (get) grown (fx* cap 2) (fx+ i 1))))
+        (else
+          (bytevector-u8-set! buf i b)
+          (loop (get) buf cap (fx+ i 1)))))))
+
+;; The next line of System/in, its terminator stripped, or nil at end of input.
+;; Without this seam (read-line) and the REPL call nil.
+(def-var! "clojure.core" "__stdin-read-line"
+  (lambda ()
+    (let ((v (vector-ref stdin-cell 0)))
+      (if (in-stream? v)
+          (stdin-line-from-port v (in-stream-port v))
+          (stdin-line-from-stream v)))))
 
 (reg-ctor! '("ByteArrayOutputStream" "java.io.ByteArrayOutputStream")
   (lambda _
@@ -331,11 +479,28 @@
       (make-char-writer (transcoded-port (open-file-output-port (path-of src)
                           (if append? (file-options no-fail no-truncate append) (file-options no-fail))
                           (buffer-mode block)) utf8-tx)))))
-;; InputStreamReader / OutputStreamWriter take ownership of the wrapped byte
-;; stream's port and transcode it (UTF-8 default; an explicit charset is honored
-;; only as UTF-8 here).
+;; InputStreamReader / OutputStreamWriter decode / encode the wrapped byte stream
+;; (UTF-8 default; an explicit charset is honored only as UTF-8 here).
+;;
+;; A byte port that pulls each block through the stream's OWN read method,
+;; whatever kind of stream it is. Dispatching rather than transcoding the
+;; stream's port directly is what lets a proxy's override see the read, and it
+;; leaves the wrapped stream OPEN — R6RS transcoded-port takes ownership of the
+;; port it is given, so (io/reader System/in) used to take standard input away
+;; from System/in, and from read-line with it, the moment it was called.
+(define (in-stream-source-port in)
+  (make-custom-binary-input-port
+   "stream-source"
+   (lambda (bv start count)
+     (let* ((arr (na-byte-array (make-bytevector count)))
+            (n (jnum->exact (record-method-dispatch in "read"
+                              (list->cseq (list arr (->num 0) (->num count)))))))
+       (if (<= n 0)
+           0                                   ; the custom-port way of saying EOF
+           (begin (bytevector-copy! (na-bytearray->bv arr) 0 bv start n) n))))
+   #f #f (lambda () #f)))
 (reg-ctor! '("InputStreamReader" "java.io.InputStreamReader")
-  (lambda (in . _) (make-char-reader (transcoded-port (in-stream-port in) utf8-tx))))
+  (lambda (in . _) (make-char-reader (transcoded-port (in-stream-source-port in) utf8-tx))))
 ;; A byte port that hands each encoded block to the stream's OWN write method,
 ;; whatever kind of stream it is — a port-backed out-stream, a PrintStream, or a
 ;; proxy over one. Dispatching rather than writing to the stream's port directly
@@ -453,7 +618,7 @@
   (set! jolt-io-reader
         (lambda (x)
           (if (in-stream? x)
-              (make-char-reader (transcoded-port (in-stream-port x) utf8-tx))
+              (make-char-reader (transcoded-port (in-stream-source-port x) utf8-tx))
               (prev x)))))
 (let ((prev jolt-io-writer))
   (set! jolt-io-writer
@@ -513,6 +678,13 @@
      (put-bytevector (out-stream-port output)
                      (or (input-bytes input) (string->utf8 (input-text input)))))
     ((char-writer? output) (put-string (char-writer-port output) (input-text input)))
+    ;; A PrintStream is a java.io.OutputStream, so a byte source reaches it byte
+    ;; for byte — (io/copy System/in System/out) is the cat. The other text sinks
+    ;; are java.io.Writers and take characters, as they do on the JVM.
+    ((print-stream? output)
+     (let ((bv (input-bytes input)))
+       (record-method-dispatch output "write"
+         (list->cseq (list (if bv (na-bv->bytearray bv) (input-text input)))))))
     ((and (jhost? output) (text-sink-tag? (jhost-tag output)))
      (record-method-dispatch output "write" (list->cseq (list (input-text input)))))
     ((or (jfile? output) (string? output))

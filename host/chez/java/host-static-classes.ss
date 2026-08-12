@@ -249,32 +249,38 @@
   (cond ((number? x) (string (integer->char (jnum->exact x))))
         ((char-array-arg? x) (char-array->string x))
         (else (render-piece x))))
-;; What a .write argument puts into a stream: writer-piece, plus the byte[] whose
-;; CONTENT write is defined to emit — (.write System/out (.getBytes s)) is how
+;; The bytes a byte[] .write argument carries, with the JVM's 3-arg (off len)
+;; region applied. Out-of-range ends clamp rather than raise: a stream write is
+;; not the place to turn a caller's off-by-one into a crash mid-output.
+(define (byte-array-range x rest)
+  (let ((bv (na-bytearray->bv x)))
+    (if (and (pair? rest) (pair? (cdr rest)))
+        (let* ((off (max 0 (jnum->exact (car rest))))
+               (len (max 0 (jnum->exact (cadr rest))))
+               (start (min off (bytevector-length bv)))
+               (end (min (bytevector-length bv) (+ start len)))
+               (sub (make-bytevector (- end start))))
+          (bytevector-copy! bv start sub 0 (- end start))
+          sub)
+        bv)))
+;; What a .write argument puts into a TEXT sink: writer-piece, plus the byte[]
+;; whose CONTENT write is defined to emit — (.write w (.getBytes s)) is how
 ;; ported code writes raw output, and it used to put "#object[[B …]" in the
-;; stream. Bytes decode as UTF-8, the encoding jolt renders in.
-;;
-;; With (off len) it is the JVM's 3-arg write over a region. A byte[] is sliced
-;; BEFORE decoding, since the offsets are byte offsets and slicing the decoded
-;; string would cut multi-byte characters in the wrong places. Out-of-range ends
-;; clamp rather than raise: a stream write is not the place to turn a caller's
-;; off-by-one into a crash mid-output.
+;; stream. Bytes decode as UTF-8, the encoding jolt renders in; they are sliced
+;; before decoding, since the offsets are byte offsets and cutting the decoded
+;; string would land in the middle of a multi-byte character. A sink with a real
+;; descriptor under it takes the bytes themselves — see pw-write-bytes! below.
 (define (writer-piece-range x rest)
-  (if (and (pair? rest) (pair? (cdr rest)))
-      (let ((off (max 0 (jnum->exact (car rest))))
-            (len (max 0 (jnum->exact (cadr rest)))))
-        (if (byte-array-arg? x)
-            (let* ((bv (na-bytearray->bv x))
-                   (start (min off (bytevector-length bv)))
-                   (end (min (bytevector-length bv) (+ start len)))
-                   (sub (make-bytevector (- end start))))
-              (bytevector-copy! bv start sub 0 (- end start))
-              (utf8->string sub))
-            (let* ((s (writer-piece x))
-                   (start (min off (string-length s)))
-                   (end (min (string-length s) (+ start len))))
-              (substring s start end))))
-      (if (byte-array-arg? x) (utf8->string (na-bytearray->bv x)) (writer-piece x))))
+  (cond
+    ((byte-array-arg? x) (utf8->string (byte-array-range x rest)))
+    ((and (pair? rest) (pair? (cdr rest)))
+     (let* ((s (writer-piece x))
+            (off (max 0 (jnum->exact (car rest))))
+            (len (max 0 (jnum->exact (cadr rest))))
+            (start (min off (string-length s)))
+            (end (min (string-length s) (+ start len))))
+       (substring s start end)))
+    (else (writer-piece x))))
 ;; Same accumulator as StringBuilder, and for the same reason: writing to a
 ;; StringWriter a piece at a time — which is what printStackTrace and every
 ;; print-to-a-writer path does — used to copy the whole buffer per write.
@@ -331,11 +337,49 @@
           ((eq? p 'stdout) port-writer-stdout)
           ((eq? p 'stderr) port-writer-stderr)
           (else p))))
+
+;; The process streams also have a BYTE path. System/out and System/err are
+;; java.io.PrintStreams — OutputStreams — so bytes written to one have to reach
+;; the descriptor as they are, and (io/copy System/in System/out) is the cat.
+;; Decoding them as UTF-8 first replaced every byte that was not text with U+FFFD.
+;; Chez's process port is textual and re-encodes whatever it is given, so the
+;; bytes go out through a second port on the same descriptor. That port is
+;; UNBUFFERED and the textual one is flushed ahead of it, so the two stay in the
+;; order they were written even when stdout is a pipe.
+;;
+;; Only the real process stream takes this path: with-out-str resolves 'out to a
+;; string port, which can only take characters, so a byte[] written there decodes
+;; as before.
+(define pw-byte-port-mu (make-mutex))
+(define pw-stdout-bytes (box #f))
+(define pw-stderr-bytes (box #f))
+(define (pw-byte-port-memo cell open)
+  (unless (unbox cell)
+    (jolt-with-mutex pw-byte-port-mu
+      (unless (unbox cell) (set-box! cell (open (buffer-mode none))))))
+  (unbox cell))
+(define (pw-byte-port port)
+  (cond ((eq? port port-writer-stdout) (pw-byte-port-memo pw-stdout-bytes standard-output-port))
+        ((eq? port port-writer-stderr) (pw-byte-port-memo pw-stderr-bytes standard-error-port))
+        (else #f)))
+;; Writes bv to the descriptor behind a process stream; #f when there is none, so
+;; the caller falls back to writing it as text.
+(define (pw-write-bytes! self bv)
+  (let* ((port (port-writer-port self))
+         (bp (pw-byte-port port)))
+    (and bp
+         (begin (flush-output-port port)
+                (put-bytevector bp bv)
+                #t))))
 ;; print / println / printf are PrintStream's, and System/out is a port-writer, so
 ;; ported code writing (.println System/out …) lands here. println with no argument
 ;; is the bare newline, as on the JVM.
 (register-host-methods! "port-writer"
-  (list (cons "write" (lambda (self x . rest) (display (writer-piece-range x rest) (port-writer-port self)) jolt-nil))
+  (list (cons "write" (lambda (self x . rest)
+                        (unless (and (byte-array-arg? x)
+                                     (pw-write-bytes! self (byte-array-range x rest)))
+                          (display (writer-piece-range x rest) (port-writer-port self)))
+                        jolt-nil))
         (cons "append" (lambda (self x . rest) (display (append-text x rest) (port-writer-port self)) self))
         (cons "print" (lambda (self x) (display (writer-piece x) (port-writer-port self)) jolt-nil))
         (cons "println" (lambda (self . xs)

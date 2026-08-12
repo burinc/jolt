@@ -6,6 +6,11 @@
 # through it ("No matching field or method: System/in") failed to load. The
 # streams also have to report the classes the JVM's do — System.out is a
 # PrintStream, not the PrintWriter *out* is — because libraries branch on that.
+#
+# The stacking matters as much as the classes. The JVM builds *in* as a Reader
+# over System.in and *out* as a PrintWriter over System.out, so a program that
+# uses both sees one stream; jolt read standard input through a second port of
+# its own, and the two buffered independently (jolt-6wad).
 
 set -e
 
@@ -94,6 +99,100 @@ check i2 "$(run '(System/setIn (java.io.ByteArrayInputStream. (.getBytes "xy")))
 
 # --- (j) the default System/in is restored-able and reads real stdin ---------
 check j "$(run '(let [orig System/in] (System/setIn (java.io.ByteArrayInputStream. (.getBytes ""))) (System/setIn orig) (println (slurp System/in)))' 'back')" "back"
+
+# --- (m) *in* reads THROUGH System/in: one buffer, not two -------------------
+# The JVM stacks them (RT.in is a Reader over System.in) and jolt has the same
+# shape, so read-line and the stream agree on where the input is up to. They used
+# to be two ports on fd 0 buffering independently, and whichever read first ate
+# input the other never saw. jolt goes one better than the JVM here: nothing is
+# read past the line returned, where an InputStreamReader decodes into 8K of its
+# own and leaves (.read System/in) answering -1 with the rest of stdin inside it.
+check m1 "$(run '(println (pr-str [(read-line) (.read System/in) (read-line)]))' 'alpha
+beta
+')" "[\"alpha\" 98 \"eta\"]"
+# and the other way round: a byte taken first, then the rest of that line
+check m2 "$(run '(println (pr-str [(.read System/in) (read-line)]))' 'abc
+')" "[97 \"bc\"]"
+# slurp / readAllBytes pick up exactly where read-line stopped
+check m3 "$(run '(println (pr-str [(read-line) (slurp System/in)]))' 'one
+two
+three
+')" "[\"one\" \"two\nthree\n\"]"
+check m4 "$(run '(println (pr-str [(read-line) (String. (.readAllBytes System/in))]))' 'head
+tail
+')" "[\"head\" \"tail\n\"]"
+# a replaced stream is read the same way — through its own .read, one byte at a
+# time, so setIn does not reintroduce a second buffer either
+check m5 "$(run '(do (System/setIn (java.io.ByteArrayInputStream. (.getBytes "redirected\nsecond\n"))) (println (pr-str [(read-line) (.read System/in) (read-line)])))')" "[\"redirected\" 115 \"econd\"]"
+# with-in-str still wins over both: it rebinds *in*, which is not System/in
+check m6 "$(run '(println (pr-str [(with-in-str "from-string" (read-line)) (read-line)]))' 'from-stdin
+')" "[\"from-string\" \"from-stdin\"]"
+
+# --- (n) the three line terminators readLine has -----------------------------
+# \n, \r, and \r\n all end a line (JVM: (read-line) over "a\rb\nc\r\nd\n" is
+# a, b, c, d). jolt used to end a line on \n alone, so a \r came back inside the
+# string and a CR-only file read as one enormous line.
+check n1 "$(run '(println (pr-str [(read-line) (read-line) (read-line) (read-line) (read-line)]))' 'a
+b
+c
+d
+')" "[\"a\" \"b\" \"c\" \"d\" nil]"
+check n2 "$(run '(println (pr-str [(read-line) (read-line) (read-line)]))' "$(printf 'a\rb\r\nc')")" "[\"a\" \"b\" \"c\"]"
+# a CRLF is one terminator, so the stream's next byte is the one after it, not a
+# stray \n left behind for (.read System/in)
+check n3 "$(run '(println (pr-str [(read-line) (.read System/in) (read-line)]))' "$(printf 'a\r\nbc\n')")" "[\"a\" 98 \"c\"]"
+# a line longer than the reader's initial 128-byte buffer, and a multi-byte
+# character that must not be cut where the buffer grows
+n4_long=""
+while [ "${#n4_long}" -lt 200 ]; do n4_long="${n4_long}xxxxxxxxxx"; done
+check n4 "$(run '(let [l (read-line)] (println (pr-str [(count l) (subs l 200 203)])))' "${n4_long}héllo
+")" "[205 \"hél\"]"
+
+# a stream that is not one of jolt's own — a proxy over java.io.InputStream — is
+# read through its .read, so the override is what feeds read-line, and the CRLF
+# it cannot peek at is carried to the next line by the flag rather than coming
+# back as an empty one
+check n5 "$(run '(do (def bs (atom (seq (.getBytes "px\r\ny\n")))) (System/setIn (proxy [java.io.InputStream] [] (read [] (if-let [s @bs] (let [b (first s)] (swap! bs next) (bit-and b 255)) -1)))) (println (pr-str [(read-line) (read-line) (read-line)])))')" "[\"px\" \"y\" nil]"
+
+# --- (o) a Reader over System/in does not take the stream away ---------------
+# R6RS transcoded-port takes ownership of the port it wraps, so building the
+# reader used to CLOSE standard input: the next read of System/in — or the next
+# read-line, which is the same port — died on a closed port. The reader pulls
+# through the stream's own .read now, which is also what lets a proxy's override
+# be seen. It does buffer ahead, exactly as the JVM's InputStreamReader does, so
+# read-line after it correctly sees end of input rather than an error.
+check o "$(run '(let [r (clojure.java.io/reader System/in)] (println (pr-str [(.readLine r) (read-line)])))' 'one
+two
+')" "[\"one\" nil]"
+
+# --- (p) io/copy System/in -> System/out is byte-exact ------------------------
+# A PrintStream is an OutputStream, so the cat has to come out byte for byte.
+# Routing it through the text sink decoded the bytes as UTF-8 first and replaced
+# every one that was not text with U+FFFD.
+check p "$(printf '\000\377\376A' | JOLT_QUIET=1 "$jolt" -e '(clojure.java.io/copy System/in System/out) (flush)' 2>/dev/null | od -An -tx1 | tr -d ' \n')" "00fffe41"
+# raw bytes and printed text reach the descriptor in the order they were written
+check p2 "$(run '(do (print "A") (.write System/out (.getBytes "B")) (print "C") (flush))')" "ABC"
+# a byte[] written to a captured *out* is still text — a string port has no bytes
+check p3 "$(run '(println (pr-str (with-out-str (.write *out* (.getBytes "hi")))))')" "\"hi\""
+
+# --- (q) InputStream.read(buf off len) returns as soon as a byte is there -----
+# The JVM blocks "until at least one byte is available", not until the buffer is
+# full; filling it first hung on a pipe whose writer was waiting for a response.
+# The writer sends five bytes and then just holds the pipe open, so this is a
+# question about blocking and not a race against startup: filling the buffer
+# first cannot answer until the writer gives up, and returning what arrived
+# answers at once.
+q_fifo="${TMPDIR:-/tmp}/jolt-sysin-q-$$"
+rm -f "$q_fifo" "$q_fifo.pid"
+mkfifo "$q_fifo"
+# started from a subshell that exits at once, so this shell has no job to report
+# when the writer is killed below
+( { printf 'abcde'; sleep 30; } > "$q_fifo" & echo $! > "$q_fifo.pid" )
+check q "$(JOLT_QUIET=1 "$jolt" -e '(let [b (byte-array 4096) n (.read System/in b 0 4096)] (println (pr-str [n (String. b 0 n)])))' < "$q_fifo" 2>/dev/null | tail -1)" "[5 \"abcde\"]"
+kill "$(cat "$q_fifo.pid")" 2>/dev/null || true
+rm -f "$q_fifo" "$q_fifo.pid"
+# it still reports -1 at end of input, and fills across several calls
+check q2 "$(run '(let [b (byte-array 8)] (println (pr-str [(.read System/in b 0 8) (String. b 0 3) (.read System/in b 0 8)])))' 'xyz')" "[3 \"xyz\" -1]"
 
 echo ""
 echo "system-streams smoke: $pass passed, $fails failed"
