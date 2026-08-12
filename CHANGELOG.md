@@ -5,6 +5,119 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.6] - 2026-08-12
+
+Standard input, and what a stream is willing to say about itself. `System/in` did
+not exist, so a namespace that read stdin the way ported code does failed to
+load; adding it exposed that jolt was reading fd 0 through two ports that
+buffered independently, which is not how the JVM stacks them. Following that
+through the io layer turned up the rest: line endings `readLine` handles and jolt
+did not, a reader that closed the stream it was built over, a read that waited for
+a buffer to fill rather than for input to arrive, and `available()` answering 0 for
+everything — which java.io permits, and which quietly makes every loop written
+around it a loop that never runs. Text accumulation was also quadratic, in a way
+that showed up as seconds on a large JSON value.
+
+### Fixed
+
+- **`System/in` exists.** A namespace that read standard input the ordinary
+  ported way — `(slurp System/in)`, `(io/reader System/in)`,
+  `(io/copy System/in System/out)` — failed to load outright with "No matching
+  field or method: System/in". `System/setIn` replaces it, and unlike the JVM
+  that also redirects `read-line`, which is otherwise only reachable through
+  `with-in-str`.
+
+- **`read-line` and `System/in` are the same stream.** They were two ports on
+  fd 0, each buffering ahead on its own, so whichever read first ate input the
+  other never saw. `*in*` is a Reader over `System/in` now, the way the JVM
+  builds it, and nothing is read past the line returned:
+
+  ```clojure
+  ;; stdin: "alpha\nbeta\n"
+  [(read-line) (.read System/in) (read-line)]
+  ;; before  ["alpha" 98 "eta"] or ["alpha" -1 nil], depending on what buffered first
+  ;; after   ["alpha" 98 "eta"]  ; the JVM answers -1 here, from its reader's own 8K buffer
+  ```
+
+- **`read-line` ends a line the way `readLine` does** — on `\r` and on `\r\n`,
+  not on `\n` alone. A CRLF file came back with the `\r` inside each string, and
+  a CR-only file read as one enormous line.
+
+- **`(io/reader System/in)` no longer takes standard input away.** R6RS
+  `transcoded-port` takes ownership of the port it wraps, so building the reader
+  closed fd 0 underneath both it and `read-line`.
+
+- **`InputStream.read(buf off len)` returns as soon as a byte is there**, which
+  is the JVM's contract, rather than waiting for the buffer to fill. A read over
+  a pipe or a terminal hung whenever the rest of the buffer was only going to
+  arrive after the program did something with these bytes.
+
+- **`available()` answers a real byte count.** Every stream reported 0. That is a
+  legal JVM answer — java.io documents it as an estimate — but it leaves
+  `(pos? (.available in))` false forever, so the loop written to drain what has
+  arrived never runs an iteration. A file, a byte array and a piped stream now
+  answer their exact remainder; a pipe, a terminal and a socket answer the
+  kernel's count, from the same `ioctl(FIONREAD)` the JVM asks. This covers
+  `jolt.socket`'s streams as well, whose entry in the known-divergences list is
+  gone rather than rewritten.
+
+- **A file read while a macro expands invalidates the AOT cache.** (#576) The key
+  covered a namespace's own source and the namespaces it requires, so a macro
+  that slurped a resource — a SQL migration, a template — kept its old expansion
+  after that file changed, and the binary shipped the stale text. Resources a
+  compile reads are part of the key now, including ones that were missing and
+  have since appeared.
+
+- **A closed stream raises `java.io.IOException`** from `read`, `readAllBytes`,
+  `skip` and `available`, rather than a classless host error that no
+  `(catch java.io.IOException …)` could see. A closed socket raises
+  `java.net.SocketException`, as Java's does.
+
+### Changed
+
+- **`System/out` and `System/err` are the `java.io.PrintStream`s they are on the
+  JVM.** They reported `java.io.PrintWriter` — `*out*`'s class, not theirs — and
+  answered false to `(instance? java.io.OutputStream System/out)`, which is what
+  ported code branches on before handing them to anything taking a stream.
+
+- **A `with-out-str` no longer captures what is written to `System/out`.** The
+  two are different objects on the JVM and a program writing deliberately past a
+  capture — a prompt, a progress bar, a logger aimed at the real stderr — had its
+  output swallowed into the string. `*out*` is unaffected; that is what
+  `with-out-str` captures.
+
+- **`(io/copy System/in System/out)` is byte for byte.** A `PrintStream` is an
+  `OutputStream`, and routing the copy through the text sink decoded the bytes as
+  UTF-8 first, replacing every byte that was not text with U+FFFD.
+
+### Performance
+
+- **Accumulating text a piece at a time is linear.** `StringBuilder.append` did
+  `(string-append (whole buffer) piece)`, so building an n-character string cost
+  O(n²); `StringWriter.write` and `PrintWriter`'s write-through to either had the
+  same shape. It showed up wherever text is built up incrementally: data.json
+  reads a quoted string one character at a time, and an 88KB JSON string value
+  took 623ms to parse against 30ms for the same bytes spread over many short
+  values. That case now reads in 200ms and writes in 89ms, from 623ms and 672ms.
+
+- **`read-line` over piped stdin is 3.6x faster**, 3372 → 940 ns/line over 300k
+  lines. `(current-input-port)` is Chez's console port and reads a character at a
+  time; the port `System/in` already had reads the descriptor in blocks.
+
+### Internal
+
+- The runtime can bind a variadic C function. `jolt-foreign-proc-safe` takes a
+  calling convention, the same `(__varargs_after n)` `jolt.ffi`'s `:varargs`
+  marker emits for a library binding. Binding `ioctl` fixed-arity is what makes
+  Apple arm64 return success with the out-parameter untouched, and that is a
+  property of the binding rather than a limit of the FFI.
+
+- Two gates were fixed rather than worked around: a Chez port over a socket
+  answers `#t` to `port-has-port-length?` and then raises ESPIPE, so `available`
+  asks by trying; and `state-image-test` named its temporary image with
+  `(random 100000)`, which is the same number on every run, so two concurrent
+  runs deleted each other's file.
+
 ## [0.7.5] - 2026-08-12
 
 Everything here is one subject: what a fiber may do with the thread it is running
@@ -4149,6 +4262,7 @@ Clojure-compatible standard library.
   install script.
 
 [Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.5...HEAD
+[0.7.6]: https://github.com/jolt-lang/jolt/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/jolt-lang/jolt/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/jolt-lang/jolt/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/jolt-lang/jolt/compare/v0.7.2...v0.7.3
