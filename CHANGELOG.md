@@ -5,11 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.5] - 2026-08-12
 
-The 0.7.4 deadlock had a sibling one lock over, in the loader, and both were
-instances of a rule the runtime stated two contradictory ways. The rule now has
-one form, and it is checked instead of documented.
+Everything here is one subject: what a fiber may do with the thread it is running
+on. The 0.7.4 deadlock turned out to have a sibling one lock over, in the loader,
+and both were instances of a rule the runtime stated in two contradictory ways.
+Looking for the rest of that family found the opposite failure as well, and a
+larger one: a `go` block that waited for almost anything — a promise, a future, an
+agent, a thread, a latch, a subprocess — stopped every other fiber sharing its
+carrier, and could deadlock outright. Two rules now, both checked at build time and
+at run time rather than described in a comment: a fiber never leaves the CPU while
+holding one of the runtime's locks, and a fiber never blocks the thread it runs on.
 
 ### Fixed
 
@@ -4142,7 +4148,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.4...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.5...HEAD
+[0.7.5]: https://github.com/jolt-lang/jolt/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/jolt-lang/jolt/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/jolt-lang/jolt/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/jolt-lang/jolt/compare/v0.7.1...v0.7.2
