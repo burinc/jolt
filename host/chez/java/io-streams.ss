@@ -61,16 +61,54 @@
 ;; is ready keeps whatever it has buffered, because a lookahead there would
 ;; block, and blocking is the one thing available must not do.
 ;;
-;; Two consequences of counting through the port rather than asking the kernel,
-;; which is what the JVM does (ioctl FIONREAD, and ioctl is variadic, so it is
-;; not reachable through the FFI on arm64). The answer for a pipe is capped by
-;; the port's buffer — 4096, where the JVM reports the whole 65536 a pipe holds —
-;; so it under-promises rather than over-promises, which is the safe direction
-;; for a caller sizing a read. And the probe does perform a read(2): the bytes
-;; move from the kernel into the port, still readable through this stream, but no
-;; longer there for a descriptor handed to a subprocess.
+;; The lookahead is the LAST resort. A descriptor is asked directly first —
+;; ioctl(FIONREAD), the same syscall the JVM's available() makes — which is both
+;; exact and free of side effects. Filling the buffer is a real read(2): the
+;; bytes move from the kernel into the port, still readable through this stream
+;; but no longer there for a descriptor handed to a subprocess, and the answer
+;; is capped by the buffer. That is where a target without ioctl ends up.
 (define (port-buffered port)
   (fx- (port-input-size port) (port-input-index port)))
+
+;; FIONREAD — the kernel's own count of what can be read from a descriptor, the
+;; same question the JVM's available() asks. It is the only way to answer for a
+;; pipe or a terminal: those have no length, so everything else jolt can see is
+;; what it has already buffered.
+;;
+;; ioctl is (int fd, unsigned long request, ...), and the binding says so. A
+;; fixed-arity one puts the third argument in a register where Apple arm64's
+;; callee reads the stack, and the call then returns SUCCESS with the
+;; out-parameter untouched — a wrong count that looks like a right one.
+;;
+;; Resolved once and lazily, and #f when there is no ioctl to call: available
+;; falls back to what it can see itself, which is what every platform without
+;; this syscall gets.
+(define fionread-request
+  (if (eq? (sa-os-family) 'macos) #x4004667F #x541B))
+(define fionread-fn 'unresolved)
+(define (fionread-proc)
+  (when (eq? fionread-fn 'unresolved)
+    ;; a duplicate on a race is the same procedure, so this needs no lock
+    (set! fionread-fn
+          (and (not (eq? (sa-os-family) 'windows))
+               (jolt-foreign-proc-safe (__varargs_after 2) "ioctl" '(int unsigned-long void*) 'int))))
+  fionread-fn)
+
+;; The count for PORT's descriptor, or #f when it cannot be had — no ioctl, no
+;; descriptor behind the port, or a descriptor that does not answer FIONREAD (a
+;; regular file on macOS says ENOTTY).
+(define (port-fionread port)
+  (let ((f (fionread-proc))
+        (fd (guard (_ (#t #f)) (port-file-descriptor port))))
+    (and f fd (fixnum? fd) (fx>=? fd 0)
+         (let* ((out (sa-foreign-alloc 4))
+                (n (guard (_ (#t #f))
+                     (sa-foreign-set! 'int out 0 0)
+                     (and (>= (f fd fionread-request out) 0)
+                          (let ((c (sa-foreign-ref 'int out 0)))
+                            (and (>= c 0) c))))))
+           (sa-foreign-free out)
+           n))))
 ;; What is left of a seekable source, or #f when it is not one. The two
 ;; predicates are not a promise: a port over a SOCKET descriptor answers #t to
 ;; both and then raises ESPIPE ("illegal seek") from port-position, so this asks
@@ -88,6 +126,9 @@
       ;; and what an earlier read already pulled into the port's buffer
       (p (+ (port-buffered port) (pipe-available p)))
       ((port-remaining port) => values)
+      ;; the kernel's count plus whatever was already pulled out of it into the
+      ;; port's buffer — the bytes live in two places, as they do for a pipe
+      ((port-fionread port) => (lambda (n) (+ (port-buffered port) n)))
       ((fx>? (port-buffered port) 0) (port-buffered port))
       ((guard (_ (#t #f)) (input-port-ready? port))
        (lookahead-u8 port)
