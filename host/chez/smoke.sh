@@ -520,6 +520,21 @@ else
   fails=$((fails + 1))
 fi
 
+# One monitor, contended by a real thread and by fibers at once (jolt-dfuo). This
+# case lives HERE rather than in `make fibers` because a regression wedges every
+# thread in the process, so the report has to come from outside it: the per-case
+# cap above turns the wedge into a named failing case, which is the whole reason
+# cap.sh exists (jolt-8tma). The case checks exclusion as well as liveness — its
+# counter is a plain array element, so a lost increment is a lost monitor.
+mc_out="$($jolt run test/chez/monitor-contention.clj 2>&1)"
+if printf '%s' "$mc_out" | grep -q 'MONITOR-CONTENTION OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a monitor contended by a thread and fibers did not complete"
+  echo "    $(printf '%s' "$mc_out" | tail -1)"
+  fails=$((fails + 1))
+fi
+
 # One paren too many must FAIL the file, not truncate it. The loader read forms
 # with the non-top-level reader, which parks on a stray `)` rather than raising,
 # and the loop read a parked position as end of input: everything after the paren

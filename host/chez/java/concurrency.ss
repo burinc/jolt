@@ -774,13 +774,33 @@
 ;; A contender WAITS, and how it waits depends on what it is. A fiber parks on the
 ;; monitor's own waiter list and the release resumes it — never a condition-wait,
 ;; which would block the carrier that may be the very thing the holder needs in order
-;; to reach its release. A thread waits on the condition variable. This is the shape
-;; loader.ss already uses for its load claims (ldr-load-mu / ldr-load-cv /
-;; ldr-fiber-waiters) and it rests on the same two facts: the registration and the
-;; commit-to-park both happen under the bookkeeping lock that the release also takes,
-;; so no wakeup can be lost, and the only park inside that lock is this wait, which
-;; gives the lock up on the way out — so no fiber is ever parked HOLDING it, which is
-;; the precondition locks.ss puts on parking inside jolt-with-mutex at all.
+;; to reach its release. A thread waits on the condition variable. Both are woken by
+;; the release, and neither can lose a wakeup, because the registration happens under
+;; the bookkeeping lock that the release also takes.
+;;
+;; WHERE THE FIBER'S SWITCH HAPPENS, and why it is not inside bk (jolt-dfuo). The
+;; fiber registers itself and commits to 'parked under bk, and then bk is RELEASED and
+;; the switch runs outside it. It used to park inside the region and lean on
+;; jolt-with-mutex being a dynamic-wind to release on the way out and re-acquire on
+;; the resume. That reading of locks.ss's precondition was too weak: it is not "no
+;; fiber is parked while HOLDING bk", it is that no fiber on the carrier may be
+;; holding bk while this one is off the CPU, because the re-acquire runs from Chez's
+;; rewind, on the carrier thread, at the interrupt depth the fiber parked at, and the
+;; carrier can do nothing else until it succeeds. A monitor's bk does not satisfy
+;; that: several fibers on one carrier, plus any number of threads, all pass through
+;; this region for the same monitor. Measured: one OS thread and eight fibers taking
+;; the same monitor in a loop wedged the whole process in 1 run of 12, with bk left
+;; held by a carrier whose fiber had parked in the wait and every other carrier
+;; blocked in that re-acquire (the process it wedged was `make test`, jolt-8tma).
+;;
+;; Committing under the lock and switching outside it is what the channel waiters
+;; (java/fibers-async.ss jolt-fiber-<!) and jolt.io-poller/wait-fiber already do, for
+;; this reason. It also needs no interrupt disable: the window between the release and
+;; the switch belongs to a fiber that is already 'parked, and
+;; jolt-fiber-preempt-handler refuses to preempt a fiber that is not 'running.
+;;
+;; loader.ss's load claims (ldr-load-mu / ldr-load-cv / ldr-fiber-waiters) still have
+;; the older shape and the same exposure; jolt-04ee tracks it.
 ;;
 ;; NOT the JEP 491 reimplementation locks.ss rules out. That paragraph is about the
 ;; runtime's own locks, of which there are many and all short. The locks that wrap
@@ -854,38 +874,57 @@
              (memq (jolt-fiber-state owner) '(done dead))
              #t))))
 
-;; Call with bk HELD; returns with it held again, and the caller RE-CHECKS — a wakeup
-;; means "something changed", never "the monitor is yours".
+;; Call with bk HELD. Two different answers, because the two contenders wait in
+;; different places:
 ;;
-;; A fiber must not use the condition variable. condition-wait blocks the carrier
-;; thread, and the holder may be a fiber on that same carrier, so blocking there is a
-;; deadlock; even when the holder is elsewhere it stalls every unrelated fiber the
-;; carrier is running. It parks, and monitor-exit! resumes it. The park is committed
-;; while bk is still held — jolt-fiber-park! sets 'parked and captures the
-;; continuation, and only the escape past jolt-with-mutex's dynamic-wind releases bk
-;; — so no release can fit between the registration and the park, and the resume
-;; re-acquires bk through the same wind's before thunk.
+;;   a THREAD waits here, on the condition variable, which releases bk atomically
+;;   with blocking and holds it again on return. Answers #f: bk is held, and the
+;;   caller re-checks under it — a wakeup means "something changed", never "the
+;;   monitor is yours".
+;;
+;;   a FIBER must not touch the condition variable (condition-wait would block the
+;;   carrier, and the holder may be a fiber on that same carrier). It registers on the
+;;   monitor's waiter list and COMMITS to 'parked, both under bk so monitor-exit!
+;;   cannot run between them and no wakeup can be lost. It answers ITSELF, and the
+;;   caller switches it out AFTER bk is released: the park must not happen inside this
+;;   region, or the resume's re-acquire deadlocks the carrier (see the header,
+;;   jolt-dfuo).
 (define (monitor-wait! m)
   (let ((f (jolt-current-fiber)))
     (if f
         (begin
           (vector-set! m monitor-i-fibers (cons f (vector-ref m monitor-i-fibers)))
-          (jolt-fiber-park!))
-        (condition-wait (vector-ref m monitor-i-cv) (vector-ref m monitor-i-bk)))))
+          (jolt-fiber-state-set! f 'parked)
+          f)
+        (begin
+          (condition-wait (vector-ref m monitor-i-cv) (vector-ref m monitor-i-bk))
+          #f))))
 
+;; The decision is made under bk; a fiber's SWITCH is made outside it, and then the
+;; whole decision is retaken, because a resume says only that something changed.
 (define (monitor-enter! m)
   (let ((me (monitor-self)))
-    (jolt-with-mutex (vector-ref m monitor-i-bk)
-      (let loop ()
-        (let ((owner (vector-ref m monitor-i-owner)))
-          (cond
-            ((eq? owner me)
-             (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count))))
-            ((not owner)
-             (vector-set! m monitor-i-owner me)
-             (vector-set! m monitor-i-box (current-interrupt-box))
-             (vector-set! m monitor-i-count 1))
-            (else (monitor-wait! m) (loop))))))))
+    (let retake ()
+      (let ((park
+             (jolt-with-mutex (vector-ref m monitor-i-bk)
+               (let loop ()
+                 (let ((owner (vector-ref m monitor-i-owner)))
+                   (cond
+                     ((eq? owner me)
+                      (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count)))
+                      #f)
+                     ((not owner)
+                      (vector-set! m monitor-i-owner me)
+                      (vector-set! m monitor-i-box (current-interrupt-box))
+                      (vector-set! m monitor-i-count 1)
+                      #f)
+                     ;; a thread's wait ends under this same bk, so it loops HERE;
+                     ;; a fiber comes back out to be switched out below.
+                     (else (let ((f (monitor-wait! m)))
+                             (if f f (loop))))))))))
+        (when park
+          (jolt-fiber-to-scheduler! park)
+          (retake))))))
 
 ;; The same decision without the wait: #t if this context now holds the monitor,
 ;; #f if something else does. ReentrantLock.tryLock is the caller, and the reason
