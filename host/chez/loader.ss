@@ -1308,7 +1308,7 @@
                           (cons f (hashtable-ref ldr-fiber-waiters name '())))
           (jolt-fiber-state-set! f 'parked)
           jolt-lock-parked)
-        (begin (condition-wait ldr-load-cv ldr-load-mu) #f))))
+        (begin (jolt-condition-wait ldr-load-cv ldr-load-mu) #f))))
 
 ;; Call with ldr-load-mu HELD. Would `me` waiting on `name` (owned by `owner`) close
 ;; a cycle? Follow owner -> what it waits on -> who owns that -> …; if the chain

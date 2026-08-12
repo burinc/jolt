@@ -14,7 +14,17 @@
 # one tightened quantum at a time. So the obligation is checked here rather than
 # documented and hoped for.
 #
-# The scan covers the three mutex PRIMITIVES and nothing else. It used to also
+# condition-wait is scanned for the SAME reason one lock over (jolt-x1no). It
+# blocks the calling thread, and on a carrier that is every fiber placed on it,
+# so a fiber reaching one stops siblings it cannot see — and if the thing that
+# would end the wait is one of them, forever. The runtime has two waits now:
+# jolt-condition-wait, which refuses on a fiber, and jolt-cv-wait, which parks a
+# fiber and blocks a thread. Both live in locks.ss, so a bare condition-wait
+# anywhere else is a site that has not chosen, which is how twelve of them came
+# to block: each one was correct for the threads it was written for and nobody
+# revisited them when fibers arrived.
+#
+# The scan covers the mutex PRIMITIVES and condition-wait, and nothing else. It used to also
 # scan monitor-enter!/monitor-exit! by name, because jolt-with-monitor is the
 # user-facing `locking` and therefore jolt's analogue of the `synchronized` case
 # that pinned Loom's virtual threads until JEP 491. Those two now take their
@@ -48,16 +58,28 @@ SANCTIONED='host/chez/locks.ss'
 # space or a close paren, which is the spelling every site happens to use, so the
 # hole only opened for someone wrapping a long lock expression. That is exactly
 # the quiet kind: the gate would have gone on reporting zero.
-PRIMS='(mutex-acquire|mutex-release|with-mutex)'
+PRIMS='(mutex-acquire|mutex-release|with-mutex|condition-wait)'
+
+# COMMENTS ARE NOT CODE, and this gate reads text rather than data, so it has to
+# say so. Everything from the first `;` on a line is dropped before matching, with
+# line numbers preserved so a hit still reports its own line. Without it the header
+# of any file that DISCUSSES one of these primitives becomes a finding — which
+# condition-wait made immediate, since the rule about it is written out in prose in
+# three files. The residual hole is a `;` inside a string literal ahead of a real
+# call on the same line, which would hide that call; there is no such line, and the
+# alternative is reading Scheme as data, which is what host/chez/park-lock-check.ss
+# does for the check that needs structure.
+strip_comments() { sed 's/;.*//' "$1"; }
 
 scan() {
   for f in host/chez/*.ss host/chez/java/*.ss; do
     case " $SANCTIONED " in *" $f "*) continue ;; esac
-    grep -nE "\\($PRIMS([^a-zA-Z0-9!?*<>=/-]|\$)" "$f" 2>/dev/null \
+    strip_comments "$f" \
+      | grep -nE "\\($PRIMS([^a-zA-Z0-9!?*<>=/-]|\$)" 2>/dev/null \
       | while IFS=: read -r ln _; do
           # the matched fragment is "(<prim><delimiter>"; the second grep pulls
           # the name back out of it, whatever the delimiter turned out to be
-          op=$(sed -n "${ln}p" "$f" \
+          op=$(strip_comments "$f" | sed -n "${ln}p" \
                  | grep -oE "\\($PRIMS([^a-zA-Z0-9!?*<>=/-]|\$)" | head -1 \
                  | grep -oE "$PRIMS" | head -1)
           [ -n "$op" ] && echo "$f $op"

@@ -233,3 +233,148 @@
           (begin (jolt-fiber-to-scheduler! (jolt-current-fiber))
                  (retake))
           r))))
+
+;; --- blocking, and who is allowed to do it ----------------------------------
+;; The rule above is about a fiber that leaves the CPU while holding a lock. This
+;; is its mirror image, and it was a bug of its own (jolt-x1no):
+;;
+;;   a fiber must never block its carrier.
+;;
+;; condition-wait blocks the THREAD. On a carrier that is every fiber placed on it,
+;; and a fiber cannot migrate away, so the wait also blocks whatever the carrier
+;; would have run — including, often enough, the very thing that would have ended
+;; the wait. Measured on one carrier: fiber A does (deref a-promise), fiber B
+;; delivers it, and neither ever finishes. With more carriers the same code is a
+;; stall rather than a deadlock, which is worse to diagnose, not better.
+;;
+;; So the runtime has two waits, and they are not interchangeable:
+;;
+;;   jolt-condition-wait   for a THREAD. Refuses on a fiber, by name, instead of
+;;                         quietly taking its carrier away.
+;;   jolt-cv-wait          for either. A thread blocks; a fiber parks and is
+;;                         resumed by the wake.
+;;
+;; The loader and the object monitor already chose per waiter by hand, which is why
+;; those two were not affected. Everything else in the runtime blocked
+;; unconditionally: promise and future deref, agent await, Thread.join,
+;; CountDownLatch.await, a task Future's get, a piped stream read, and waiting on a
+;; subprocess. All of those are reachable from a go block on the fiber backend.
+(define (jolt-blocking-refuse who)
+  (error who
+    (string-append
+     "a fiber cannot block its carrier on a condition variable: it would stop every"
+     " other fiber placed on that carrier, including whatever would have ended this"
+     " wait. Use jolt-cv-wait (host/chez/locks.ss), which parks a fiber and blocks"
+     " a thread.")))
+
+;; Chez's condition-wait for the paths that are only ever reached by a real thread —
+;; a carrier's own idle wait, the timer thread, an executor worker, the thread arm
+;; inside a jolt-cv-wait or jolt-lock-wait decision. The check is what makes "only
+;; ever reached by a thread" a fact rather than an intention: every one of these was
+;; documented as thread-only, and the four that were wrong about it were found by
+;; asking rather than by reading.
+(define jolt-condition-wait
+  (case-lambda
+    ((cv mu)
+     (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
+     (condition-wait cv mu))
+    ((cv mu abs-time)
+     (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
+     (condition-wait cv mu abs-time))))
+
+;; --- waiting for a condition, from a thread OR a fiber ----------------------
+;; (jolt-cv-wait mu cv deadline decide) -> whatever decide returns
+;;
+;; decide runs with mu HELD and is passed one argument, whether the deadline has
+;; passed. It answers jolt-cv-again to wait for a change, or any other value to
+;; finish. deadline is epoch milliseconds, or #f for an unbounded wait.
+;;
+;; This is jolt-lock-wait with the two waiter kinds filled in, so it inherits the
+;; properties that primitive exists for: the switch happens with mu released, the
+;; registration and the 'parked commit happen under the mu the waker must take so
+;; no wakeup is lost, and the decision is RETAKEN rather than resumed into — which
+;; is what makes a spurious wake harmless and is why decide must be re-runnable.
+;;
+;; WHERE THE PARKED FIBERS LIVE. In a table keyed by the condition variable, not in
+;; a field on each waitable, because the waitables are a future record, a promise
+;; record, an agent record, four different jhost vectors, a pipe and a process
+;; latch. Keying on the condition they already have means none of those shapes
+;; change. The table's own mutex is a leaf — taken around one hashtable operation
+;; with nothing inside it — so it cannot be part of a cycle, the same argument
+;; object-monitor's table lock rests on.
+;;
+;; THE DEADLINE IS THE CLOCK, NOT A FLAG, and that is what closes the race a timed
+;; park would otherwise have. A fiber has nothing to wake it at the deadline, so one
+;; is registered with the shared timer (java/async.ss) to poke this condition. If
+;; that poke lands before the fiber parks, there is nothing to resume — which would
+;; be a fiber parked forever if "timed out" were a flag the timer set. It is not:
+;; decide reads the clock, and the timer fires at the deadline, so any decide that
+;; runs after the timer has fired already sees the deadline as passed and does not
+;; park at all. The poke is only ever a wakeup, never information.
+;;
+;; A thread needs no such registration — its condition-wait takes the deadline
+;; directly — so it does not pay for one.
+(define jolt-cv-again (list 'jolt-cv-again))
+
+(define jolt-cv-waiters (make-weak-eq-hashtable))   ; condition -> parked fibers
+(define jolt-cv-waiters-mu (make-mutex))
+
+(define (jolt-cv-register! cv f)
+  (jolt-with-mutex jolt-cv-waiters-mu
+    (hashtable-set! jolt-cv-waiters cv
+                    (cons f (hashtable-ref jolt-cv-waiters cv '())))))
+
+;; Drained as it is read, so a fiber that goes on to wait again registers itself
+;; afresh and no resume is ever delivered twice.
+(define (jolt-cv-take-waiters! cv)
+  (jolt-with-mutex jolt-cv-waiters-mu
+    (let ((fs (hashtable-ref jolt-cv-waiters cv '())))
+      (unless (null? fs) (hashtable-delete! jolt-cv-waiters cv))
+      fs)))
+
+;; (jolt-cv-wake! cv) — call with mu HELD, after changing the state decide reads.
+;; The replacement for a bare condition-broadcast on any condition a fiber can wait
+;; on: it wakes both kinds of waiter, and a waker that forgets the fiber half would
+;; leave them parked with nothing to resume them.
+;;
+;; Broadcast and not signal, for the reason the loader gives: waiters re-check a
+;; condition that may be true for only one of them, so exactly one of them getting
+;; the wake is not something the waker can decide.
+;;
+;; Resuming while mu is held is deliberate and safe. sa-fiber-resume only enqueues,
+;; on the resumed fiber's own carrier, taking that carrier's run-queue mutex, which
+;; is last in the order. The resumed fiber's retake will block on mu for as long as
+;; this critical section lasts — and no longer, because a lock in this runtime can
+;; no longer be held across a park at all, so every holder of mu is running and
+;; releases in bounded time.
+(define (jolt-cv-wake! cv)
+  (condition-broadcast cv)
+  (let ((fs (jolt-cv-take-waiters! cv)))
+    (unless (null? fs) (for-each sa-fiber-resume fs))))
+
+;; Absolute epoch millis -> the absolute time object Chez's condition-wait wants.
+(define (jolt-millis->time ms)
+  (make-time 'time-utc (* 1000000 (mod ms 1000)) (div ms 1000)))
+
+(define (jolt-cv-wait mu cv deadline decide)
+  ;; Registered OUTSIDE mu, and only for a fiber. Outside because the timer's
+  ;; thunks run with timeout-mu released but registering takes it, so doing this
+  ;; under mu would order mu above timeout-mu here and below it there.
+  (when (and deadline (jolt-current-fiber))
+    (jolt-timer-at! deadline (lambda () (jolt-with-mutex mu (jolt-cv-wake! cv)))))
+  (jolt-lock-wait mu
+    (lambda ()
+      (let loop ()
+        (let ((r (decide (and deadline (>= (now-millis) deadline)))))
+          (cond
+            ((not (eq? r jolt-cv-again)) r)
+            ((jolt-current-fiber)
+             => (lambda (f)
+                  (jolt-cv-register! cv f)
+                  (jolt-fiber-state-set! f 'parked)
+                  jolt-lock-parked))
+            (else
+             (if deadline
+                 (jolt-condition-wait cv mu (jolt-millis->time deadline))
+                 (jolt-condition-wait cv mu))
+             (loop))))))))

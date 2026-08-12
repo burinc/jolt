@@ -304,12 +304,15 @@
         (guard (e (#t #f))
           (let loop () (when (proc-copy-chunk src dst) (loop))))
         (when close-dst? (guard (e (#t #f)) (close-port dst)))
-        (jolt-with-mutex m (set-box! done #t) (condition-broadcast c))))
+        (jolt-with-mutex m (set-box! done #t) (jolt-cv-wake! c))))
     (vector m c done)))
+;; A fiber waiting for a subprocess's output collector PARKS. Blocking the carrier
+;; would stop every other fiber on it for the life of the subprocess, which is
+;; exactly the kind of wait a go block is the natural place for (jolt-x1no).
 (define (proc-latch-wait latch)
-  (jolt-with-mutex (vector-ref latch 0)
-    (let loop () (unless (unbox (vector-ref latch 2))
-                   (condition-wait (vector-ref latch 1) (vector-ref latch 0)) (loop)))))
+  (jolt-cv-wait (vector-ref latch 0) (vector-ref latch 1) #f
+    (lambda (_timed-out?)
+      (if (unbox (vector-ref latch 2)) #t jolt-cv-again))))
 
 ;; --- fd-level spawn (the primary path) ---------------------------------------
 ;; A child fd that gets no file action IS the parent's descriptor — tty answers

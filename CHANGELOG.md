@@ -29,6 +29,30 @@ one form, and it is checked instead of documented.
   object monitor, which is what `synchronized` is on the JVM, so two concurrent
   restarts still serialize and the error a healthy agent reports is unchanged.
 
+- **Blocking from a `go` block on the fiber backend no longer stops the other
+  fibers sharing its carrier, and no longer deadlocks.** `@a-promise`, `@a-future`
+  and their timed forms, `await` on an agent, `.join` on a thread,
+  `CountDownLatch.await`, `.get` and `.awaitTermination` on an executor, reading a
+  piped stream, and waiting on a subprocess all waited by blocking the carrier
+  thread. A carrier runs many fibers and a fiber cannot move to another one, so
+  such a wait also stopped every fiber placed behind it — including, frequently,
+  the one that would have ended the wait. Two fibers on one carrier, one deref'ing
+  a promise the other delivers, hung forever. With more carriers the same code
+  merely stalled, which is harder to see and no more correct.
+
+  Each of those waits now parks the fiber and is resumed by whatever ends the
+  wait; a real thread still blocks, which is what a thread should do. Timed waits
+  park with a deadline registered against the runtime's one timer thread. The
+  loader and `locking` were already doing this, which is why they were not
+  affected, and that is now the only way the runtime knows how to wait: a bare
+  `condition-wait` outside the file that defines the two is a build failure.
+  (jolt-x1no)
+
+  One related case is deliberately unchanged: `Thread/sleep` in a `go` block still
+  occupies its carrier for the duration, matching what it does in a JVM
+  `core.async` go block. It cannot deadlock, since it always makes progress, and
+  jolt has a gate asserting that behaviour on purpose.
+
 ### Changed
 
 - **A fiber can no longer leave the CPU while its carrier holds one of the
