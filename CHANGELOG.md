@@ -5,6 +5,50 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The 0.7.4 deadlock had a sibling one lock over, in the loader, and both were
+instances of a rule the runtime stated two contradictory ways. The rule now has
+one form, and it is checked instead of documented.
+
+### Fixed
+
+- **A `require` that has to wait no longer risks wedging the process.** A
+  namespace whose top level blocks, required at the same time by several fibers
+  and by a thread, could stop everything: a waiting fiber parked inside the short
+  critical section that guards the loader's per-namespace claims, which leaves a
+  blocking re-acquire of that lock attached to the fiber's resume. That re-acquire
+  runs inside the scheduler, on the carrier thread, and the carrier can do nothing
+  else until it succeeds, so every fiber on it waits behind a lock that every
+  other load also passes through. Same shape as the object monitor fixed in 0.7.4,
+  found by looking for it rather than by hitting it. (jolt-04ee)
+
+- **`restart-agent` no longer runs the agent's validator while holding the
+  agent's lock.** A validator is user code and may block, which would have
+  released the lock half way through the restart. It now runs inside the agent's
+  object monitor, which is what `synchronized` is on the JVM, so two concurrent
+  restarts still serialize and the error a healthy agent reports is unchanged.
+
+### Changed
+
+- **A fiber can no longer leave the CPU while its carrier holds one of the
+  runtime's locks, and that is now enforced rather than described.** The scheduler
+  already refused to *preempt* a fiber holding a lock, but a voluntary park was
+  allowed subject to a condition about every other user of that lock on the same
+  carrier, which no individual site can check and no reviewer can see. Three bugs
+  arrived through that gap, the last two of them process-wide deadlocks. There is
+  one rule now, it covers both kinds of switch, and it is checked in two places:
+  at the switch itself, where breaking it raises an error naming the rule instead
+  of stopping the process with no output, and over the whole runtime as a build
+  gate that reads the code and rejects the shape before it can run. Waiting for
+  state a lock guards, which is what the exception existed for, is a single
+  primitive that the object monitor, `ReentrantLock`, the loader, the channel
+  waiters and the IO poller all share. (jolt-h9nq)
+
+  For anyone who hit the 0.7.4 class of failure: the symptom to expect from a
+  regression now is an error mentioning that a fiber cannot leave the CPU while a
+  lock is held, rather than a silent hang.
+
 ## [0.7.4] - 2026-08-12
 
 One fix, and it is a deadlock: a monitor contended by a real thread and by fibers

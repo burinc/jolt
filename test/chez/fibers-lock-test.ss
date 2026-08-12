@@ -748,6 +748,156 @@
 
 (jolt-fiber-pool-reset!)
 
+;; --- 10. the rule the four sections above are instances of (jolt-h9nq) ---------
+;; Everything above fixes one lock at a time. This section is the rule itself:
+;;
+;;   a fiber never leaves the CPU while its carrier holds a counted lock.
+;;
+;; It used to have an exception for a voluntary park, licensed by a precondition
+;; about every OTHER user of the mutex on the same carrier — which no site can check
+;; and no reviewer can see. Three bugs arrived through it (jolt-3a87 the monitor,
+;; jolt-dfuo again, jolt-04ee the loader). What the exception was for is waiting on
+;; state a lock guards, and that never needed one: commit under the lock, switch
+;; outside it, retake the decision. jolt-lock-wait is that, and 10d/10e are it
+;; working for both kinds of contender.
+;;
+;; WHY THIS IS ASSERTED AS A RAISE. The failure it replaces is a process that stops
+;; dead with no error and no output on some fraction of runs. So the check is not
+;; "the wedge no longer happens" (unobservable, and how jolt-04ee sat unreproduced);
+;; it is that the violation is REPORTED, at the park, naming the rule.
+(jolt-fiber-carrier-count-set! 1)
+(jolt-fiber-preempt-ticks-set! #f)
+
+;; 10a. the check itself, on this thread, where the count is readable.
+(define (string-contains? s sub)
+  (let ((ls (string-length s)) (lb (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i lb) ls) #f)
+            ((string=? (substring s i (+ i lb)) sub) #t)
+            (else (loop (+ i 1)))))))
+(define (raises-lock-rule? thunk)
+  (guard (e (#t (let ((m (guard (_ (#t "")) (condition-message e))))
+                  (and (string? m) (string-contains? m "cannot leave the CPU")))))
+    (thunk)
+    #f))
+(define l10-mu (make-mutex))
+(ok "10a. the assertion passes when no lock is held"
+    (not (raises-lock-rule? (lambda () (jolt-locks-assert-none! 'test)))))
+(ok "10a. and raises while one is"
+    (jolt-with-mutex l10-mu
+      (raises-lock-rule? (lambda () (jolt-locks-assert-none! 'test)))))
+(ok "10a. the region still released it" (mutex-acquire l10-mu #f))
+(mutex-release l10-mu)
+(ok "10a. and left nothing counted on this thread" (= 0 (jolt-locks-held)))
+
+;; 10b. the shape itself: a fiber parking inside a counted region. This is the
+;; pre-fix loader and the pre-fix monitor, reduced to the two lines they had in
+;; common. It must raise rather than wedge, and the carrier must be usable
+;; afterwards — the raise unwinds through the region, so the mutex is released and
+;; the count given back, and 10c is that stated as behaviour rather than inferred.
+(define l10-mu2 (make-mutex))
+(define l10-ch (ac-make 1 'fixed #f))
+(define l10-bad
+  (sa-fiber-spawn
+   (lambda ()
+     (jolt-with-mutex l10-mu2
+       (jolt-fiber-<! l10-ch)))))
+(jolt-fiber-ensure-carrier!)
+(define l10-died
+  (wait-until (lambda () (memq (jolt-fiber-state l10-bad) '(done dead))) 5.0
+              "10b. a fiber parking inside a counted lock ended"))
+(ok "10b. a fiber parking inside a counted lock does not wedge" l10-died)
+(ok "10b. it died rather than completing" (eq? 'dead (jolt-fiber-state l10-bad)))
+(ok "10b. and the error names the rule"
+    (and (condition? (jolt-fiber-error l10-bad))
+         (raises-lock-rule? (lambda () (raise (jolt-fiber-error l10-bad))))))
+(ok "10b. the mutex it parked inside is free" (mutex-acquire l10-mu2 #f))
+(mutex-release l10-mu2)
+
+;; 10c. the carrier recovered. A stale lock count would leave EVERY later fiber on
+;; this carrier unable to park (and unpreemptible), so a fiber that parks and is
+;; resumed normally afterwards is the check that the failure was contained.
+(define l10-ch2 (ac-make 1 'fixed #f))
+(define l10-after
+  (sa-fiber-spawn (lambda () (jolt-fiber-<! l10-ch2))))
+(sleep (make-time 'time-duration 50000000 0))
+(jolt-async-give l10-ch2 'ok)
+(define l10-recovered
+  (wait-until (lambda () (eq? 'done (jolt-fiber-state l10-after))) 5.0
+              "10c. the carrier still runs fibers afterwards"))
+(ok "10c. the carrier still parks and resumes fibers afterwards" l10-recovered)
+
+;; 10d. jolt-lock-wait from a FIBER: the sanctioned way to do what 10b cannot.
+;; Asserted on the three properties the hand-rolled copies each got wrong somewhere:
+;; the decision is retaken (decide runs more than once), the lock is FREE while the
+;; fiber is parked (this is the property whose absence deadlocks the carrier), and
+;; the answer comes back from the retake.
+(define l10-wmu (make-mutex))
+(define l10-ready (box #f))
+(define l10-runs (box 0))
+(define l10-waiter (box #f))
+(define l10-free-while-parked (box 'unset))
+(define l10-lw
+  (sa-fiber-spawn
+   (lambda ()
+     (jolt-lock-wait l10-wmu
+       (lambda ()
+         (set-box! l10-runs (+ 1 (unbox l10-runs)))
+         (cond
+           ((unbox l10-ready) 'got-it)
+           (else (set-box! l10-waiter (jolt-current-fiber))
+                 (jolt-fiber-state-set! (jolt-current-fiber) 'parked)
+                 jolt-lock-parked)))))))
+(jolt-fiber-ensure-carrier!)
+(wait-until (lambda () (eq? 'parked (jolt-fiber-state l10-lw))) 5.0
+            "10d. the fiber committed to its park")
+;; the whole point: another context can take the mutex while the waiter is parked
+(set-box! l10-free-while-parked (and (mutex-acquire l10-wmu #f) #t))
+(when (eq? #t (unbox l10-free-while-parked))
+  (set-box! l10-ready #t)
+  (mutex-release l10-wmu))
+(sa-fiber-resume (unbox l10-waiter))
+(define l10-lw-done
+  (wait-until (lambda () (eq? 'done (jolt-fiber-state l10-lw))) 5.0
+              "10d. the resumed fiber retook the decision"))
+(ok "10d. jolt-lock-wait releases the lock while the fiber is parked"
+    (eq? #t (unbox l10-free-while-parked)))
+(ok "10d. the resumed fiber came back and finished" l10-lw-done)
+(ok "10d. it retook the whole decision rather than resuming into it"
+    (>= (unbox l10-runs) 2))
+(ok "10d. and returned the decision" (eq? 'got-it (jolt-fiber-result l10-lw)))
+
+;; 10e. jolt-lock-wait from a THREAD, which must never reach the sentinel: it waits
+;; on a condition variable inside decide, loops there, and answers a real value. One
+;; function, both contenders, and the difference is one branch.
+(define l10-tmu (make-mutex))
+(define l10-tcv (make-condition))
+(define l10-tstate (box #f))
+(define l10-tanswer (box 'unset))
+(define l10-tparked (box #f))
+(define l10-t
+  (fork-thread
+   (lambda ()
+     (set-box! l10-tanswer
+       (jolt-lock-wait l10-tmu
+         (lambda ()
+           (let loop ()
+             (cond
+               ((unbox l10-tstate) 'thread-got-it)
+               (else (set-box! l10-tparked #t)
+                     (condition-wait l10-tcv l10-tmu)
+                     (loop))))))))))
+(wait-until (lambda () (unbox l10-tparked)) 5.0 "10e. the thread reached its wait")
+(jolt-with-mutex l10-tmu
+  (set-box! l10-tstate #t)
+  (condition-broadcast l10-tcv))
+(thread-join l10-t)
+(ok "10e. a thread through the same primitive answers without parking"
+    (eq? 'thread-got-it (unbox l10-tanswer)))
+(ok "10e. and left nothing counted on this thread" (= 0 (jolt-locks-held)))
+
+(jolt-fiber-pool-reset!)
+
 (printf "\nfibers-lock-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "fibers-lock-test: PASS — monitors across a fiber switch\n") (exit 0))

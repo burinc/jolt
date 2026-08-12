@@ -535,6 +535,24 @@ else
   fails=$((fails + 1))
 fi
 
+# The same shape one lock over: a namespace whose load PARKS, required at once by
+# fibers spread across eight carriers and by a thread (jolt-04ee). Here for the same
+# reason as the case above — a regression used to wedge the process, so the cap is
+# the report — and at eight carriers for the same reason too, since the hazard needs
+# several of them rewinding parked waiters at once. concurrent-require.clj covers the
+# parked load in depth but pins ONE carrier, which is the configuration where this
+# cannot happen. Now that the rule is checked at the switch, a regression fails this
+# deterministically (16 of 17 askers, verified by reverting the loader) rather than
+# on some fraction of runs.
+rc_out="$($jolt run test/chez/require-contention.clj 2>&1)"
+if printf '%s' "$rc_out" | grep -q 'REQUIRE-CONTENTION OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a parked load contended by fibers on many carriers and a thread"
+  echo "    $(printf '%s' "$rc_out" | tail -1)"
+  fails=$((fails + 1))
+fi
+
 # One paren too many must FAIL the file, not truncate it. The loader read forms
 # with the non-top-level reader, which parks on a stray `)` rather than raising,
 # and the loop read a parked position as end of input: everything after the paren

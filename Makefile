@@ -120,7 +120,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck lockcheck irvalidate devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck lockcheck parkcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   certify gambitcheck gambitgencheck grenadinecheck fibers gosm asynctimer threadsafety
 TEST-GATES := submodules selfhost ci
@@ -636,6 +636,17 @@ adaptercheck:
 # allowlist records today's unmigrated sites and must only ever shrink.
 lockcheck:
 	@sh host/chez/lock-check.sh
+
+# The other half of the same rule: a fiber never leaves the CPU while its carrier
+# holds a counted lock. lockcheck above proves the runtime can TELL that a lock is
+# held; this one proves nothing parks while one is. It reads every host .ss as data,
+# closes "can park" over the call graph, and fails on a call to anything in that
+# closure from inside a jolt-with-mutex region — which is what the previous lexical
+# scan could not see, because the park was one call past the region (jolt-04ee). It
+# also fails if a switch point stops calling the runtime assertion, so the two
+# halves cannot be removed independently.
+parkcheck:
+	@sh host/chez/park-lock-check.sh
 
 # Makefile dependency selection: explicit Chez overrides must bypass local
 # Makes provisioning so release jobs retain their chosen compiler and libc.

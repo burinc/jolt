@@ -1219,10 +1219,13 @@
 ;;                      breaks the invariant, putting two threads in one load body.
 ;;   No lost wakeup     a blocked waiter always has an owner left to wake it. Rests
 ;;                      on the wait committing before the lock drops — condition-wait
-;;                      releases ldr-load-mu atomically with blocking, and a fiber's
-;;                      park sets 'parked and captures its continuation while the
-;;                      lock is still held — so no ldr-end-load! fits between the
-;;                      owner check and the wait, and on ldr-end-load! broadcasting
+;;                      releases ldr-load-mu atomically with blocking, and a fiber
+;;                      registers itself and sets its own state to 'parked while the
+;;                      lock is still held (its SWITCH is outside the lock, which is
+;;                      a separate matter and jolt-lock-wait's; what this property
+;;                      needs is the commit, not the switch) — so no ldr-end-load!
+;;                      fits between the owner check and the wait, and on
+;;                      ldr-end-load! broadcasting
 ;;                      AND resuming from dynamic-wind's after thunk, which runs on
 ;;                      every exit. The LOADER's own park is not an exit and is
 ;;                      skipped there, which keeps the property rather than weakening
@@ -1234,8 +1237,14 @@
 ;;                      wait-for graph being FUNCTIONAL (one namespace per blocked
 ;;                      context, one owner per namespace) and on the pre-state being
 ;;                      acyclic, which holds because every earlier wait was checked.
-;;   No deadlock        the lock graph is acyclic. The one edge that is not the
-;;                      loader's to remove is stm-lock -> the load a parked
+;;   No deadlock        the lock graph is acyclic, and the edge that is hardest to
+;;                      see is the one a park used to add: a fiber parked inside this
+;;                      critical section left a blocking re-acquire of ldr-load-mu on
+;;                      its resume, which runs in the scheduler and puts every fiber
+;;                      on that carrier behind it. That edge is gone rather than
+;;                      argued about — the switch happens with the lock released, and
+;;                      locks.ss checks it at both switch points (jolt-04ee). The one
+;;                      edge that is not the loader's to remove is stm-lock -> the load a parked
 ;;                      transaction is waiting for, because jolt-sync holds
 ;;                      stm-lock across a whole dosync body. So no load may acquire
 ;;                      stm-lock — see ldr-libs-update!, where that cycle was real
@@ -1262,9 +1271,11 @@
 (define (ldr-ctx-str ctx)
   (if (jolt-fiber? ctx) "a fiber" (string-append "thread " (number->string ctx))))
 
-;; Wait for the load of `name` to end. Call with ldr-load-mu HELD; returns with it
-;; held again, and the caller re-checks — a wakeup is "something changed", never
-;; "the namespace is yours".
+;; Wait for the load of `name` to end. Runs inside jolt-lock-wait's decision, so
+;; ldr-load-mu is HELD. Answers #f when the wait is over and the caller should
+;; re-check under the lock, or jolt-lock-parked when this fiber has committed to a
+;; park that jolt-lock-wait will perform once it has released the lock. A wakeup is
+;; "something changed", never "the namespace is yours", either way.
 ;;
 ;; A fiber must not use the condition variable. condition-wait blocks the CARRIER
 ;; thread, and the load it is waiting for is very likely parked on that same carrier
@@ -1272,23 +1283,32 @@
 ;; another thread it stalls every unrelated fiber the carrier is running. It parks
 ;; instead, and ldr-end-load! resumes it.
 ;;
-;; The park is committed while the mutex is still held — jolt-fiber-park! sets
-;; 'parked and captures the continuation, and only the escape past with-mutex's
-;; dynamic-wind releases the lock — so ldr-end-load! cannot run between the
-;; registration and the park, and there is no wakeup to lose. The resume then
-;; re-acquires through the same dynamic-wind's before thunk. That release-on-park /
-;; re-acquire-on-resume is the one thing here that leans on with-mutex being a
-;; dynamic-wind: it is what makes a park inside this critical section safe, and it is
-;; the opposite of what load-namespace*'s own after thunk wants, which is why that
-;; one asks jolt-park-unwinding? and this one must not.
+;; NO WAKEUP IS LOST, and the reason is the registration and the 'parked commit both
+;; happening under ldr-load-mu, which ldr-end-load! must take: a release either lands
+;; before them and is seen by the re-check, or after them and finds a fiber to resume.
+;; The SWITCH is the one part that happens outside the lock (jolt-04ee). It used to
+;; happen right here, inside the critical section, leaning on jolt-with-mutex being a
+;; dynamic-wind to release the lock on the way out and re-acquire it on the resume.
+;; That is not safe, for the reason host/chez/locks.ss now states as a rule: the
+;; re-acquire runs from Chez's rewind, on the carrier thread, at the interrupt depth
+;; the fiber parked at, and the carrier can do nothing else until it succeeds — so the
+;; park attaches a blocking acquire to a point in the scheduler, and every fiber on
+;; that carrier is behind it. Every fiber and thread requiring any namespace passes
+;; through this same region, so the precondition that would have licensed it does not
+;; hold here any more than it held for the object monitor (jolt-3a87, jolt-dfuo).
+;;
+;; Committing here and switching there is also what keeps load-namespace*'s after
+;; thunk honest: the escape is still a park and still not an exit, so that one still
+;; asks jolt-park-unwinding? and keeps the claim across it.
 (define (ldr-wait-for-load! name)
   (let ((f (jolt-current-fiber)))
     (if f
         (begin
           (hashtable-set! ldr-fiber-waiters name
                           (cons f (hashtable-ref ldr-fiber-waiters name '())))
-          (jolt-fiber-park!))
-        (condition-wait ldr-load-cv ldr-load-mu))))
+          (jolt-fiber-state-set! f 'parked)
+          jolt-lock-parked)
+        (begin (condition-wait ldr-load-cv ldr-load-mu) #f))))
 
 ;; Call with ldr-load-mu HELD. Would `me` waiting on `name` (owned by `owner`) close
 ;; a cycle? Follow owner -> what it waits on -> who owns that -> …; if the chain
@@ -1323,34 +1343,50 @@
                              (ldr-ctx-str (caar c))
                              " waits on " (cdar c))))))
 
+;; Every way out of the decision below leaves the wait-for graph as it found it.
+;; Deleting on the way out rather than immediately after each wait is what lets the
+;; entry STAND while this context is parked, which is the point of recording it: a
+;; cycle is only visible to another context's walk if the waits in it are all on the
+;; table at once. A delete with nothing to delete is a no-op, so the first-iteration
+;; exits (steps 3 and 4) cost one lookup and say what they mean.
+(define (ldr-decided! me v) (hashtable-delete! ldr-waiting me) v)
+
 ;; -> 'loaded | 'recursive | 'claimed. Steps 1-6.
+;;
+;; The whole decision is jolt-lock-wait's `decide`: it runs under ldr-load-mu, and a
+;; fiber that has to wait answers jolt-lock-parked, is switched out with the lock
+;; RELEASED, and then runs this again from the top. Retaking it rather than resuming
+;; into the middle of it is the same thing step 2 always did on a thread's wakeup —
+;; the loop below — and it is now the same code path for both contenders.
 (define (ldr-begin-load! name force?)
   (let ((me (ldr-load-ctx)))
-    (jolt-with-mutex ldr-load-mu
-      (let loop ()
-        (let ((owner (hashtable-ref ldr-loading name #f)))
-          (cond
-            ((and owner (eqv? owner me)) 'recursive)          ; step 3
-            (owner                                            ; step 2
-             (let ((chain (ldr-wait-cycle owner me)))
-               (when chain
-                 (throw-jvm (quote IllegalStateException)
-                   (string-append
-                     "Deadlocked require: " (ldr-ctx-str me)
-                     " is about to wait on " name " (held by "
-                     (ldr-ctx-str owner) "), and " (ldr-wait-chain-str chain)
-                     ", which closes back on " (ldr-ctx-str me) ". "
-                     (number->string (fx+ 1 (length chain)))
-                     " loads entered a require cycle from different ends; break"
-                     " the cycle or require these namespaces from one thread."))))
-             (hashtable-set! ldr-waiting me name)
-             (ldr-wait-for-load! name)
-             (hashtable-delete! ldr-waiting me)
-             (loop))
-            ((and (not force?) (not (ldr-reload-all?)) (ns-dedup-loaded? name))
-             'loaded)                                         ; step 4
-            (else (hashtable-set! ldr-loading name me)        ; step 6
-                  'claimed)))))))
+    (jolt-lock-wait ldr-load-mu
+      (lambda ()
+        (let loop ()
+          (let ((owner (hashtable-ref ldr-loading name #f)))
+            (cond
+              ((and owner (eqv? owner me))                    ; step 3
+               (ldr-decided! me 'recursive))
+              (owner                                          ; step 2
+               (let ((chain (ldr-wait-cycle owner me)))
+                 (when chain
+                   (throw-jvm (quote IllegalStateException)
+                     (string-append
+                       "Deadlocked require: " (ldr-ctx-str me)
+                       " is about to wait on " name " (held by "
+                       (ldr-ctx-str owner) "), and " (ldr-wait-chain-str chain)
+                       ", which closes back on " (ldr-ctx-str me) ". "
+                       (number->string (fx+ 1 (length chain)))
+                       " loads entered a require cycle from different ends; break"
+                       " the cycle or require these namespaces from one thread."))))
+               (hashtable-set! ldr-waiting me name)
+               ;; a thread's wait ends under this lock, so it loops HERE; a fiber
+               ;; answers jolt-lock-parked and comes back in at the top.
+               (or (ldr-wait-for-load! name) (loop)))
+              ((and (not force?) (not (ldr-reload-all?)) (ns-dedup-loaded? name))
+               (ldr-decided! me 'loaded))                     ; step 4
+              (else (hashtable-set! ldr-loading name me)      ; step 6
+                    (ldr-decided! me 'claimed)))))))))
 
 ;; Step 11: drop the claim and wake everyone waiting on this namespace. Broadcast
 ;; and not signal — the waiters re-check a condition that may not be true for all
