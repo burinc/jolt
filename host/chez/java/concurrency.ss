@@ -459,23 +459,46 @@
 ;; new-state must pass the validator (else the agent stays failed); :clear-actions
 ;; discards the held queue, otherwise the queued actions resume. Watchers are NOT
 ;; notified (per the JVM contract).
+;; THE VALIDATOR IS USER CODE, so it does not run under the bookkeeping mutex.
+;; Agent.restart is `synchronized` on the JVM and its whole body — the error check,
+;; the validate, and the writes — is one critical section. A mutex cannot be that
+;; section here: a validator that parks would have it released mid-way by the unwind
+;; (and now raises instead, see locks.ss). So the section is the agent's own OBJECT
+;; MONITOR, which is what `synchronized` is, and which tolerates a park because
+;; ownership is a field rather than an OS mutex. The bookkeeping mutex stays for what
+;; it is for — the field reads and writes, with no user code between an acquire and
+;; its release.
+;;
+;; Both properties the one big mutex was providing survive. Two concurrent restarts
+;; still serialize, on the monitor, so the JVM's "the second is told the agent does
+;; not need a restart" still holds; and the error check still precedes the validate,
+;; so which of the two errors a healthy agent with an invalid value reports is
+;; unchanged. Validating before taking anything would have reversed that, and
+;; re-checking under a re-taken mutex would have let two restarts through.
+;;
+;; Same choice and the same reason as the object monitor (jolt-3a87), the delay
+;; (jolt-232k) and the transaction (jolt-pb2s): the locks in this runtime that wrap
+;; code they did not write are the ones that cannot be OS mutexes.
 (define (jolt-agent-restart a new-state . opts)
   (let ((clear? (and (pair? opts) (keyword-t? (car opts))
                      (string=? (keyword-t-name (car opts)) "clear-actions")
                      (pair? (cdr opts)) (eq? (cadr opts) #t))))
-    (jolt-with-mutex (jolt-agent-mu a)
-      (when (jolt-nil? (jolt-agent-err a))
-        (jolt-throw (jolt-host-throwable "java.lang.RuntimeException"
-                                         "Agent does not need a restart")))
-      (let ((vf (jolt-agent-validator a)))
-        (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke vf new-state)))
-          (jolt-iref-state-throw)))
-      (jolt-agent-state-set! a new-state)
-      (jolt-agent-err-set! a jolt-nil)
-      (cond (clear? (jagent-q-clear! a))
-            ((and (not (jagent-q-empty? a)) (not (jolt-agent-running? a)))
-             (jolt-agent-running?-set! a #t)
-             (fork-thread (lambda () (*txn* #f) (jolt-agent-worker a)))))))
+    (jolt-with-monitor a
+      (lambda ()
+        (jolt-with-mutex (jolt-agent-mu a)
+          (when (jolt-nil? (jolt-agent-err a))
+            (jolt-throw (jolt-host-throwable "java.lang.RuntimeException"
+                                             "Agent does not need a restart"))))
+        (let ((vf (jolt-agent-validator a)))
+          (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke vf new-state)))
+            (jolt-iref-state-throw)))
+        (jolt-with-mutex (jolt-agent-mu a)
+          (jolt-agent-state-set! a new-state)
+          (jolt-agent-err-set! a jolt-nil)
+          (cond (clear? (jagent-q-clear! a))
+                ((and (not (jagent-q-empty? a)) (not (jolt-agent-running? a)))
+                 (jolt-agent-running?-set! a #t)
+                 (fork-thread (lambda () (*txn* #f) (jolt-agent-worker a)))))))))
   a)
 
 ;; --- taps (tap>/add-tap/remove-tap) -----------------------------------------
@@ -799,8 +822,12 @@
 ;; the switch belongs to a fiber that is already 'parked, and
 ;; jolt-fiber-preempt-handler refuses to preempt a fiber that is not 'running.
 ;;
-;; loader.ss's load claims (ldr-load-mu / ldr-load-cv / ldr-fiber-waiters) still have
-;; the older shape and the same exposure; jolt-04ee tracks it.
+;; It is not open-coded here any more. Five sites needed this protocol and four of
+;; them had written it out, which is four chances to write a fifth — and loader.ss's
+;; load claims were that fifth (jolt-04ee). It is now jolt-lock-wait in
+;; host/chez/locks.ss, where the rule it keeps is also stated: a fiber never leaves
+;; the CPU while its carrier holds a counted lock, checked at both switch points, so
+;; breaking it raises at the park instead of wedging the process.
 ;;
 ;; NOT the JEP 491 reimplementation locks.ss rules out. That paragraph is about the
 ;; runtime's own locks, of which there are many and all short. The locks that wrap
@@ -885,46 +912,45 @@
 ;;   a FIBER must not touch the condition variable (condition-wait would block the
 ;;   carrier, and the holder may be a fiber on that same carrier). It registers on the
 ;;   monitor's waiter list and COMMITS to 'parked, both under bk so monitor-exit!
-;;   cannot run between them and no wakeup can be lost. It answers ITSELF, and the
-;;   caller switches it out AFTER bk is released: the park must not happen inside this
-;;   region, or the resume's re-acquire deadlocks the carrier (see the header,
-;;   jolt-dfuo).
+;;   cannot run between them and no wakeup can be lost. It answers jolt-lock-parked,
+;;   which is jolt-lock-wait's instruction to release bk and switch it out THERE: the
+;;   park must not happen inside this region, or the resume's re-acquire deadlocks the
+;;   carrier (see the header, jolt-dfuo).
 (define (monitor-wait! m)
   (let ((f (jolt-current-fiber)))
     (if f
         (begin
           (vector-set! m monitor-i-fibers (cons f (vector-ref m monitor-i-fibers)))
           (jolt-fiber-state-set! f 'parked)
-          f)
+          jolt-lock-parked)
         (begin
           (condition-wait (vector-ref m monitor-i-cv) (vector-ref m monitor-i-bk))
           #f))))
 
 ;; The decision is made under bk; a fiber's SWITCH is made outside it, and then the
-;; whole decision is retaken, because a resume says only that something changed.
+;; whole decision is retaken, because a resume says only that something changed. All
+;; three of those are jolt-lock-wait (host/chez/locks.ss), which is this protocol
+;; named once rather than open-coded at each of the sites that needs it.
 (define (monitor-enter! m)
   (let ((me (monitor-self)))
-    (let retake ()
-      (let ((park
-             (jolt-with-mutex (vector-ref m monitor-i-bk)
-               (let loop ()
-                 (let ((owner (vector-ref m monitor-i-owner)))
-                   (cond
-                     ((eq? owner me)
-                      (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count)))
-                      #f)
-                     ((not owner)
-                      (vector-set! m monitor-i-owner me)
-                      (vector-set! m monitor-i-box (current-interrupt-box))
-                      (vector-set! m monitor-i-count 1)
-                      #f)
-                     ;; a thread's wait ends under this same bk, so it loops HERE;
-                     ;; a fiber comes back out to be switched out below.
-                     (else (let ((f (monitor-wait! m)))
-                             (if f f (loop))))))))))
-        (when park
-          (jolt-fiber-to-scheduler! park)
-          (retake))))))
+    (jolt-lock-wait (vector-ref m monitor-i-bk)
+      (lambda ()
+        (let loop ()
+          (let ((owner (vector-ref m monitor-i-owner)))
+            (cond
+              ((eq? owner me)
+               (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count)))
+               #f)
+              ((not owner)
+               (vector-set! m monitor-i-owner me)
+               (vector-set! m monitor-i-box (current-interrupt-box))
+               (vector-set! m monitor-i-count 1)
+               #f)
+              ;; a thread's wait ends under this same bk, so it loops HERE; a fiber
+              ;; answers jolt-lock-parked and jolt-lock-wait retakes this decision
+              ;; from the top once something has resumed it.
+              (else (or (monitor-wait! m) (loop))))))))
+    (void)))
 
 ;; The same decision without the wait: #t if this context now holds the monitor,
 ;; #f if something else does. ReentrantLock.tryLock is the caller, and the reason

@@ -103,6 +103,11 @@
   ;; unreachable, both ops check before they touch the channel; kept because this
   ;; is the point the invariant is actually load-bearing
   (jolt-sm-check-driver! 'jolt-sm-park! f)
+  ;; The other switch point, and the same invariant (locks.ss). A cheap park is
+  ;; the worse of the two to break it from: it does not rewind, so a lock the
+  ;; escape released is never retaken, and the resumed step runs on believing it
+  ;; still holds one.
+  (jolt-locks-assert-none! 'jolt-sm-park!)
   (jolt-fiber-bump-sm-parks! f)
   (jolt-fiber-sm-set! f resume)
   (jolt-fiber-k-set! f #f)

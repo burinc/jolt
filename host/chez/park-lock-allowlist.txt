@@ -1,0 +1,8 @@
+# host/chez/park-lock-allowlist.txt — generated. Regenerate with:
+#   sh host/chez/park-lock-check.sh --regen
+# Lines: <file> <definition> <kind> <callee> <count>, for a call made from
+# inside a jolt-with-mutex region. kind `park` is a callee that can reach
+# one of the runtime's park primitives; kind `user-code` is a call into code
+# the lock did not write. A count that DROPS is stale and fails the gate, so
+# fixing a site must update this file. Empty is the goal and the current
+# state: no fiber leaves the CPU while its carrier holds a counted lock.

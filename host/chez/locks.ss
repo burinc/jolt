@@ -76,26 +76,49 @@
 ;; lock-check.sh requires the explicit name, so the migration is visible and the
 ;; count can only go down.
 ;;
-;; WHEN A FIBER MAY PARK INSIDE THE BODY. It is legal, and loader.ss's
-;; ldr-wait-for-load! depends on it: the after-thunk releases on the way out and
-;; the before-thunk re-acquires when the continuation is resumed, so the lock is
-;; not held across the park. What that costs is a blocking mutex-acquire on the
-;; RESUME — run from Chez's rewind, on the carrier thread, at the interrupt depth
-;; the fiber parked at, where the preemption timer is not polled and the carrier
-;; can do nothing else until it succeeds. So the precondition is not "the region
-;; is short", it is:
+;; A FIBER MAY NOT PARK INSIDE THE BODY, and that is a rule rather than a
+;; guideline: the count above is what the preempt handler reads to refuse an
+;; INVOLUNTARY switch, and a voluntary one is not different in kind. So there is
+;; one rule, and it covers both:
 ;;
-;;   a fiber may park inside jolt-with-mutex only if no fiber on its carrier can
-;;   be holding m while this one is off the CPU.
+;;   a fiber never leaves the CPU while its carrier holds a counted lock.
 ;;
-;; ldr-load-mu satisfies it because the only park inside that critical section is
-;; the wait itself, which gives the lock up on the way out, so a sibling fiber
-;; can never be parked holding it. A mutex a fiber can hold across a park would
-;; deadlock the carrier instead: the holder is queued behind the resume that is
-;; blocked waiting for it, and a fiber cannot migrate off its carrier to escape.
-;; A CHEAP park (java/sm.ss) is not allowed here at all — it never rewinds, so
-;; the lock would be released and never retaken. The CPS pass keeps them apart by
-;; treating every form that takes a thunk as opaque; see jolt-sm-park!.
+;; jolt-locks-assert-none! below is that rule, and every switch point calls it —
+;; jolt-fiber-to-scheduler! (which is yield, park, and the preemption) and
+;; jolt-sm-park! (the cheap park). So a violation raises at the park instead of
+;; wedging a process with no error and no output.
+;;
+;; IT USED TO BE AN EXCEPTION, which is how the same bug arrived three times
+;; (jolt-3a87, jolt-dfuo, jolt-04ee). Parking inside the body was legal,
+;; licensed by dynamic-wind: the after-thunk releases on the way out and the
+;; before-thunk re-acquires when the continuation is resumed, so the lock is not
+;; held ACROSS the park. What that reading leaves out is WHERE the re-acquire
+;; runs. It runs from Chez's rewind, on the carrier thread, at the interrupt
+;; depth the fiber parked at, where the preemption timer is not polled, the
+;; carrier can do nothing else until it succeeds, and nothing can make it give
+;; up. So a park does not merely release a lock and retake it. It attaches a
+;; blocking acquire to a point in the SCHEDULER, and the wait edge that creates
+;; belongs to every fiber on that carrier, not to the one that parked.
+;;
+;; The precondition that makes that safe is non-local to match: no fiber on the
+;; carrier may be holding m while this one is off the CPU. A parking site cannot
+;; check that, and a reviewer cannot see it, because it is a statement about
+;; every OTHER user of m that shares the carrier. For the object monitor it was
+;; read as the weaker "no fiber is parked while HOLDING m", which is true and
+;; insufficient; one run in twelve of a contended monitor wedged the whole
+;; process, and one of those was a ninety-minute `make test` (jolt-8tma). The
+;; rule above is the same guarantee with nothing left to read wrong, and unlike
+;; the precondition it replaces it is checkable — at the switch, and statically
+;; over the whole runtime (host/chez/park-lock-check.ss).
+;;
+;; WAITING FOR STATE THIS LOCK GUARDS is what the exception existed for, and it
+;; never needed one: commit under the lock, switch outside it. That is
+;; jolt-lock-wait, below.
+;;
+;; A CHEAP park (java/sm.ss) was never allowed here even under the old reading —
+;; it does not rewind, so the lock would be released and never retaken. The CPS
+;; pass keeps them apart by treating every form that takes a thunk as opaque;
+;; see jolt-sm-park!.
 (define-syntax jolt-with-mutex
   (syntax-rules ()
     ((_ m e1 e2 ...)
@@ -121,3 +144,92 @@
        (unless got (jolt-locks-exit!))
        got))))
 (define (jolt-unlock! mu) (mutex-release mu) (jolt-locks-exit!))
+
+;; --- the invariant, checked where it can be broken ---------------------------
+;; (jolt-locks-assert-none! who) — raise unless this carrier holds no counted
+;; lock. Called by every switch point rather than by the sites that park, and
+;; that placement is the point: there are two switch points and a growing number
+;; of parking sites, and the ones that go wrong are the ones nobody thought of as
+;; parking sites at all (a `locking` body, a validator, a load that waits).
+;;
+;; Complete for parks that HAPPEN, in a way the static check cannot be: it does
+;; not care whether the park is lexically inside the region, one call away
+;; (jolt-04ee), or inside user code the lock never wrote (jolt-3a87). If a fiber
+;; is about to leave the CPU with a lock held, this is on the path.
+;;
+;; It RAISES, and the alternative is worth naming: the failure it replaces is a
+;; process that stops dead with no error and no output, on some fraction of runs,
+;; needing a sampling profiler to diagnose. Raising costs the fiber (its guard
+;; marks it dead) and reports the invariant, the count, and a stack. That trade
+;; is not close. The check runs before the caller's first mutation at both sites,
+;; so the raise leaves the switch untaken rather than half-taken.
+;;
+;; Always on, never behind a flag: a check that is off in the build people ship is
+;; not a check, and the cost is one virtual-register read and a fixnum compare
+;; against a switch that costs ~136 ns. Measured rather than asserted, on
+;; bench/fibers: the scheduler yield+slice figure spans 135.8-137.7 ns over three
+;; runs with the check and reads 136.6 ns without it, so it is inside the
+;; run-to-run spread; channel ping-pong and fan-in move the same way.
+(define (jolt-locks-assert-none! who)
+  (let ((n (jolt-locks-held)))
+    (when (fx>? n 0)
+      (error who
+        (string-append
+         "a fiber cannot leave the CPU while its carrier holds a counted lock ("
+         (number->string n)
+         " held). Commit under the lock and switch outside it — jolt-lock-wait,"
+         " host/chez/locks.ss.")))))
+
+;; --- waiting for state a lock guards ----------------------------------------
+;; (jolt-lock-wait mu decide) -> whatever decide returns
+;;
+;; The one sanctioned way for a fiber to wait on state that a mutex guards, and
+;; the protocol five sites had hand-rolled between them: the channel waiters
+;; (java/fibers-async.ss, java/sm.ss), the object monitor and ReentrantLock
+;; (java/concurrency.ss), jolt.io-poller/wait-fiber, and the load claims in
+;; loader.ss — which is the one that got it wrong (jolt-04ee). Four correct
+;; copies of an unnamed protocol are four chances to write a fifth.
+;;
+;; decide runs with mu HELD and answers either
+;;
+;;   jolt-lock-parked   "I have registered myself where my waker will look and
+;;                       set my own state to 'parked. Switch me out, and call me
+;;                       again when something resumes me."
+;;   anything else       the decision, returned to the caller as-is.
+;;
+;; Three properties, and each one is where a hand-rolled copy can go wrong:
+;;
+;;   THE SWITCH IS OUTSIDE mu, so no resume carries a mutex re-acquire and the
+;;   invariant above holds by construction. It is also lexically outside the
+;;   jolt-with-mutex below, which is what the static check reads, so every caller
+;;   inherits a shape that check can see through.
+;;
+;;   NO WAKEUP CAN BE LOST, because registering and committing to 'parked both
+;;   happen under the same mu the waker must take. A resume landing in the window
+;;   between the release and the switch finds the fiber 'parked, moves it to
+;;   'ready and enqueues it; the switch then stores its continuation and the
+;;   carrier dispatches it. A preemption in that window is refused, because
+;;   jolt-fiber-preempt-handler refuses to preempt a fiber that is not 'running —
+;;   which is why this needs no interrupt disable of its own.
+;;
+;;   THE DECISION IS RETAKEN, not resumed into. A wakeup means something changed,
+;;   never "it is yours", so decide runs again from the top with mu held. That is
+;;   also why decide must be safe to run more than once.
+;;
+;; A THREAD needs none of this and is not sent a different way: inside decide it
+;; waits on a condition variable, which releases mu atomically with blocking and
+;; holds it again on return, loops there, and answers a real value — so it never
+;; reaches the branch below. One function serves both contenders and the entire
+;; difference between them is that one branch.
+(define jolt-lock-parked (list 'jolt-lock-parked))   ; unique; never a decision
+
+(define (jolt-lock-wait mu decide)
+  (let retake ()
+    (let ((r (jolt-with-mutex mu (decide))))
+      (if (eq? r jolt-lock-parked)
+          ;; mu is released here. jolt-current-fiber still answers this fiber —
+          ;; the switch is what clears that register — and the state it needs is
+          ;; already 'parked, set by decide under mu.
+          (begin (jolt-fiber-to-scheduler! (jolt-current-fiber))
+                 (retake))
+          r))))

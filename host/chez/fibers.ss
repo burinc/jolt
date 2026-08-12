@@ -562,6 +562,13 @@
 ;; can never hand a fiber to the wrong scheduler). The fiber's state is set by
 ;; the caller BEFORE the switch (yield -> 'ready + enqueue; park -> 'parked).
 (define (jolt-fiber-to-scheduler! f)
+  ;; The invariant locks.ss states: no counted lock may be held here. Checked at
+  ;; the switch and not at the parking sites, because this is where every one of
+  ;; them arrives — yield, park, the preemption, the channel waiters, the object
+  ;; monitor, the poller, a load that waits — and because the sites that break it
+  ;; are the ones nobody counted as parking sites. Before the first mutation, so
+  ;; a violation leaves the switch untaken.
+  (jolt-locks-assert-none! 'jolt-fiber-to-scheduler!)
   (set-virtual-register! jolt-vreg-current-fiber 0)
   (call/1cc
     (lambda (k)
