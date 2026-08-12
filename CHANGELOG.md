@@ -5,6 +5,47 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] - 2026-08-12
+
+One fix, and it is a deadlock: a monitor contended by a real thread and by fibers
+at the same time could stop the whole process. It is what wedged a `make test` for
+ninety minutes, and it is not the timer the 0.7.3 notes guessed at, so that note
+is corrected as well.
+
+### Fixed
+
+- **`locking` on an object contended by a thread and by fibers no longer
+  deadlocks.** One OS thread and eight fibers taking the same monitor in a loop
+  wedged the process in one run of twelve. Every thread ended up parked, with
+  nothing left in a poller or a timer and nothing runnable, so there was no error
+  and no output: the process simply stopped. `dosync`, a `delay` being forced and
+  `ReentrantLock` all take the same monitor and were exposed the same way, and
+  nothing about the program has to mention fibers beyond running a `go` block on
+  them.
+
+  A waiting fiber parked *inside* the short critical section that guards the
+  monitor's own bookkeeping, relying on that section being a `dynamic-wind` to
+  release the lock on the way out and re-acquire it on the resume. The rule for
+  parking inside one of those sections is stronger than that: no fiber on the
+  carrier may be holding the lock while this one is off the CPU, because the
+  re-acquire runs from Chez's rewind, on the carrier thread, at the interrupt
+  depth the fiber parked at, where the carrier can do nothing else until it
+  succeeds. A monitor's bookkeeping lock cannot satisfy that, since every fiber on
+  the carrier and every thread passes through the section for the same monitor.
+
+  The fiber now registers itself and commits to parked under that lock, and the
+  switch happens outside it, after which the decision is retaken from the start,
+  because a resume only ever means that something changed. That is what the
+  channel waiters and the IO poller already did. The thread side is unchanged.
+  (#586, jolt-dfuo)
+
+- **The 0.7.3 note on the ninety-minute `make test` wedge was wrong** about the
+  cause and is corrected: the `(timeout ms)` timer fixed in that release cannot
+  produce it. The case it wedged on creates its timeouts in increasing deadline
+  order, so every insert lands at the tail of the timer's pending list and neither
+  timer bug can fire there. The wedge was the monitor above, which reproduces with
+  no sockets, no poller and no timeouts at all. (jolt-8tma)
+
 ## [0.7.3] - 2026-08-11
 
 `core.async` names three carriers and jolt has all three now: `io-thread` runs
@@ -4023,7 +4064,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.4...HEAD
+[0.7.4]: https://github.com/jolt-lang/jolt/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/jolt-lang/jolt/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/jolt-lang/jolt/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/jolt-lang/jolt/compare/v0.7.0...v0.7.1
