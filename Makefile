@@ -59,7 +59,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
   gateboot gatebootsmoke gosm httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
+  narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
   threadsafety values wp ci
@@ -872,3 +872,10 @@ aotcacheperf:
 # on loaded CI. See the header of the script for how to read the numbers.
 printperf:
 	@$(CHEZ) --script test/chez/print-throughput.ss
+
+# StringBuilder.append must stay amortised O(1). Asserts a SCALING RATIO rather
+# than a wall-clock floor — 4x the appends should cost ~4x, not ~16x — so unlike
+# the probes above it is meaningful on a loaded machine. Still manual, to keep
+# the default gate free of timing. See the script header.
+sbperf:
+	@$(CHEZ) --script test/chez/string-builder-perf.ss

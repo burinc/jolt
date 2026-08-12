@@ -147,11 +147,12 @@
 (register-class-ctor! "StringBuilder"
   (lambda args (make-jhost "string-builder"
     ;; a numeric first arg is a CAPACITY hint, not content.
-    (vector (if (and (pair? args) (not (number? (car args)))) (render-piece (car args)) "")))))
+    (vector (if (and (pair? args) (not (number? (car args)))) (render-piece (car args)) "")
+            '() 0))))
 (register-host-methods! "string-builder"
-  (list (cons "append" (lambda (self x . rest) (sb-set! self (string-append (sb-str self) (append-text x rest))) self))
+  (list (cons "append" (lambda (self x . rest) (sb-append! self (append-text x rest)) self))
         (cons "toString" (lambda (self) (sb-str self)))
-        (cons "length" (lambda (self) (->num (string-length (sb-str self)))))
+        (cons "length" (lambda (self) (->num (sb-length self))))
         (cons "charAt" (lambda (self i) (string-ref (sb-str self) (jnum->exact i))))
         (cons "setLength" (lambda (self n)
                             (let ((cur (sb-str self)) (n (jnum->exact n)))
@@ -159,7 +160,7 @@
                                                 (substring cur 0 n)
                                                 (string-append cur (make-string (- n (string-length cur)) #\nul)))))
                             jolt-nil))
-        (cons "isEmpty" (lambda (self) (= 0 (string-length (sb-str self)))))
+        (cons "isEmpty" (lambda (self) (= 0 (sb-length self))))
         (cons "substring" (lambda (self start . rest)
                             (let* ((cur (sb-str self)) (s (jnum->exact start))
                                    (e (if (null? rest) (string-length cur) (jnum->exact (car rest)))))
@@ -228,7 +229,7 @@
     (if (and (sb-jhost? val) (symbol-t? type-sym))
         (jch-isa? "java.lang.StringBuilder" (symbol-t-name type-sym))
         'pass)))
-(register-count-arm! sb-jhost? (lambda (x) (string-length (sb-str x))))
+(register-count-arm! sb-jhost? (lambda (x) (sb-length x)))
 (register-seq-arm! sb-jhost? (lambda (x) (jolt-seq (sb-str x))))
 
 ;; ---- StringWriter -----------------------------------------------------------
@@ -274,10 +275,13 @@
                    (end (min (string-length s) (+ start len))))
               (substring s start end))))
       (if (byte-array-arg? x) (utf8->string (na-bytearray->bv x)) (writer-piece x))))
-(register-class-ctor! "StringWriter" (lambda args (make-jhost "writer" (vector ""))))
+;; Same accumulator as StringBuilder, and for the same reason: writing to a
+;; StringWriter a piece at a time — which is what printStackTrace and every
+;; print-to-a-writer path does — used to copy the whole buffer per write.
+(register-class-ctor! "StringWriter" (lambda args (make-jhost "writer" (vector "" '() 0))))
 (register-host-methods! "writer"
-  (list (cons "write" (lambda (self x . rest) (sb-set! self (string-append (sb-str self) (writer-piece-range x rest))) jolt-nil))
-        (cons "append" (lambda (self x . rest) (sb-set! self (string-append (sb-str self) (append-text x rest))) self))
+  (list (cons "write" (lambda (self x . rest) (sb-append! self (writer-piece-range x rest)) jolt-nil))
+        (cons "append" (lambda (self x . rest) (sb-append! self (append-text x rest)) self))
         (cons "flush" (lambda (self) jolt-nil))
         (cons "close" (lambda (self) jolt-nil))
         (cons "toString" (lambda (self) (sb-str self)))))
@@ -387,7 +391,7 @@
      (display s (port-writer-port target)))
     ((and (jhost? target) (memv #t (list (string=? (jhost-tag target) "writer")
                                          (string=? (jhost-tag target) "string-builder"))))
-     (sb-set! target (string-append (sb-str target) s)))
+     (sb-append! target s))
     ;; every other host writer knows how to write itself — a file-backed writer, an
     ;; OutputStreamWriter, a nested PrintWriter. Naming them one by one left
     ;; (PrintWriter. (io/writer f)) falling through to the pprint protocol below,
