@@ -410,6 +410,16 @@
    :jvm "blocks forever (the failed agent never runs the latch action)"
    :jolt "throws RuntimeException \"Agent is failed, needs restart\""
    :note "await entered on an ALREADY-failed agent throws identically on both. jolt returning normally (pre-R4) was the silent-success worst case."}
+  ;; available() over a PIPE counts through the port rather than asking the
+  ;; kernel: the JVM uses ioctl FIONREAD, and ioctl is variadic, so it is not
+  ;; reachable through the FFI on arm64. A seekable source — a file, a redirect,
+  ;; a byte array — answers its exact remainder on both, as does a piped stream,
+  ;; whose queue jolt owns. Pinned by test/chez/system-streams-smoke.sh (r1-r6).
+  {:category :host-model
+   :behavior "(.available System/in) with more than 4096 bytes waiting in a pipe"
+   :jvm "the pipe's whole count, up to the 65536 one holds"
+   :jolt "4096 — the port's buffer, filled by one lookahead that consumes nothing"
+   :note "Both are legal estimates and jolt's under-promises, which is the safe direction for a caller sizing a read. It is also a read(2): the bytes move into the port, still readable through the stream but no longer there for a descriptor handed to a subprocess."}
   ;; *in* is a Reader over System/in on both, but the JVM's InputStreamReader
   ;; decodes into 8K of its own, so the first (read-line) pulls the whole of a
   ;; small stdin into the reader and the stream underneath reads as exhausted.

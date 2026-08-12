@@ -194,6 +194,26 @@ rm -f "$q_fifo" "$q_fifo.pid"
 # it still reports -1 at end of input, and fills across several calls
 check q2 "$(run '(let [b (byte-array 8)] (println (pr-str [(.read System/in b 0 8) (String. b 0 3) (.read System/in b 0 8)])))' 'xyz')" "[3 \"xyz\" -1]"
 
+# --- (r) available() is a real byte count ------------------------------------
+# It used to answer 0 for every stream. That is a legal JVM answer ("an
+# estimate"), but it leaves (pos? (.available in)) false forever, so the loop
+# that drains what has arrived never runs. A seekable source answers its exact
+# remainder, as FileInputStream and ByteArrayInputStream do; a pipe answers what
+# is really there, by filling the port's buffer with a lookahead that consumes
+# nothing. All four of these agree with the JVM value for value.
+check r1 "$(run '(let [b (java.io.ByteArrayInputStream. (.getBytes "hello"))] (println (pr-str [(.available b) (do (.read b) (.available b)) (do (.readAllBytes b) (.available b))])))')" "[5 4 0]"
+check r2 "$(run '(let [o (java.io.PipedOutputStream.) i (java.io.PipedInputStream. o)] (.write o (.getBytes "abcdef")) (println (pr-str [(.available i) (do (.read i) (.available i)) (do (.write o (.getBytes "gh")) (.available i))])))')" "[6 5 7]"
+check r3 "$(run '(println (pr-str [(.available System/in) (do (.read System/in) (.available System/in))]))' 'abcdefgh
+')" "[9 8]"
+# a file, whether opened directly or redirected onto stdin, knows its remainder
+check r4 "$(run '(let [f (java.io.FileInputStream. "README.md")] (println (pr-str [(> (.available f) 1000) (let [a (.available f)] (.read f) (- a (.available f)))])))')" "[true 1]"
+check r5 "$(JOLT_QUIET=1 "$jolt" -e '(println (.available System/in))' < README.md 2>/dev/null | tail -1)" "$(wc -c < README.md | tr -d ' ')"
+# which makes the drain idiom work — this read one byte, or nothing at all
+check r6 "$(run '(let [n (.available System/in) b (byte-array n)] (.read System/in b 0 n) (println (String. b)))' 'drain-me')" "drain-me"
+# a closed stream raises the JVM IOException rather than a classless host error
+check r7 "$(run '(let [b (java.io.ByteArrayInputStream. (.getBytes "hi"))] (.close b) (println (try (.available b) (catch java.io.IOException e (.getMessage e)))))')" "Stream closed"
+check r8 "$(run '(let [o (java.io.PipedOutputStream.) i (java.io.PipedInputStream. o)] (.close i) (println (try (.available i) (catch java.io.IOException e (.getMessage e)))))')" "Pipe closed"
+
 echo ""
 echo "system-streams smoke: $pass passed, $fails failed"
 [ "$fails" -eq 0 ]

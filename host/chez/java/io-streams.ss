@@ -38,11 +38,59 @@
     (if (eq? p 'stdin) (jolt-stdin-binary-port) p)))
 (define (make-in-stream port) (make-jhost "in-stream" (vector port)))
 (define (in-stream? x) (and (jhost? x) (string=? (jhost-tag x) "in-stream")))
+
+;; The port behind a stream, or the JVM's IOException when it has been closed.
+;; Reading a closed Chez port raises a classless host error instead, which no
+;; (catch java.io.IOException …) can see and which prints with no class on it.
+;; A piped stream does not close its port (it marks the shared pipe), so this
+;; leaves those to pipe-read!'s own "Pipe closed".
+(define (in-stream-live-port self)
+  (let ((port (in-stream-port self)))
+    (if (port-closed? port) (io-throw "Stream closed") port)))
+
+;; InputStream.available: how many bytes can be read without blocking. jolt
+;; answered 0, which the JVM's contract permits ("an estimate") but which leaves
+;; (pos? (.available in)) false forever, so a loop written to drain what has
+;; arrived never runs a single iteration.
+;;
+;; A seekable source knows its remainder exactly, and that is what
+;; FileInputStream and ByteArrayInputStream answer. A pipe or a terminal has no
+;; length, so the count is what Chez has buffered — and when the buffer is empty
+;; but the descriptor is ready, one lookahead fills it: that consumes nothing and
+;; turns the kernel's read into a real count. A port that cannot say whether it
+;; is ready keeps whatever it has buffered, because a lookahead there would
+;; block, and blocking is the one thing available must not do.
+;;
+;; Two consequences of counting through the port rather than asking the kernel,
+;; which is what the JVM does (ioctl FIONREAD, and ioctl is variadic, so it is
+;; not reachable through the FFI on arm64). The answer for a pipe is capped by
+;; the port's buffer — 4096, where the JVM reports the whole 65536 a pipe holds —
+;; so it under-promises rather than over-promises, which is the safe direction
+;; for a caller sizing a read. And the probe does perform a read(2): the bytes
+;; move from the kernel into the port, still readable through this stream, but no
+;; longer there for a descriptor handed to a subprocess.
+(define (port-buffered port)
+  (fx- (port-input-size port) (port-input-index port)))
+(define (in-stream-available self)
+  (let ((port (in-stream-live-port self))
+        (p (piped-pipe self)))
+    (cond
+      ;; a piped stream holds its bytes in two places: what the writer has queued
+      ;; and what an earlier read already pulled into the port's buffer
+      (p (+ (port-buffered port) (pipe-available p)))
+      ((and (port-has-port-length? port) (port-has-port-position? port))
+       (max 0 (- (port-length port) (port-position port))))
+      ((fx>? (port-buffered port) 0) (port-buffered port))
+      ((guard (_ (#t #f)) (input-port-ready? port))
+       (lookahead-u8 port)
+       (port-buffered port))
+      (else 0))))
+
 (register-host-methods! "in-stream"
   (list
    (cons "read"
          (lambda (self . rest)
-           (let ((port (in-stream-port self)))
+           (let ((port (in-stream-live-port self)))
              (if (null? rest)
                  ;; InputStream.read() returns the byte as an UNSIGNED int 0..255
                  ;; (-1 at EOF) — the one place a byte is not signed, because the
@@ -67,11 +115,11 @@
                              (if (>= i n) (->num n)
                                  (begin (vector-set! vec (+ off i) (na-u8->byte (bytevector-u8-ref tmp i)))
                                         (loop (+ i 1))))))))))))
-   (cons "readAllBytes" (lambda (self) (let ((bv (get-bytevector-all (in-stream-port self))))
+   (cons "readAllBytes" (lambda (self) (let ((bv (get-bytevector-all (in-stream-live-port self))))
                                          (na-byte-array (if (eof-object? bv) (make-bytevector 0) bv)))))
-   (cons "skip" (lambda (self n) (let ((bv (get-bytevector-n (in-stream-port self) (jnum->exact n))))
+   (cons "skip" (lambda (self n) (let ((bv (get-bytevector-n (in-stream-live-port self) (jnum->exact n))))
                                    (->num (if (eof-object? bv) 0 (bytevector-length bv))))))
-   (cons "available" (lambda (self) (->num 0)))
+   (cons "available" (lambda (self) (->num (in-stream-available self))))
    ;; A piped stream marks its shared pipe instead of closing the Chez port: a
    ;; read after close has to raise the JVM's IOException, and a closed Chez port
    ;; raises a classless host error before the port's own reader is consulted.
@@ -795,12 +843,12 @@
   (nongenerative jpipe-v1))
 (define (new-jpipe) (make-jpipe (make-mutex) (make-condition) '() 0 #f #f))
 
-(define (pipe-io-throw msg) (jolt-throw (jolt-host-throwable "java.io.IOException" msg)))
+(define (io-throw msg) (jolt-throw (jolt-host-throwable "java.io.IOException" msg)))
 
 (define (pipe-write! p bv start count)
   (jolt-with-mutex (jpipe-mu p)
-    (when (jpipe-rclosed? p) (pipe-io-throw "Read end dead"))
-    (when (jpipe-wclosed? p) (pipe-io-throw "Pipe closed"))
+    (when (jpipe-rclosed? p) (io-throw "Read end dead"))
+    (when (jpipe-wclosed? p) (io-throw "Pipe closed"))
     (let ((chunk (make-bytevector count)))
       (bytevector-copy! bv start chunk 0 count)
       (jpipe-chunks-set! p (append (jpipe-chunks p) (list chunk)))
@@ -815,7 +863,7 @@
   (jolt-cv-wait (jpipe-mu p) (jpipe-cv p) #f
     (lambda (_timed-out?)
       (cond
-        ((jpipe-rclosed? p) (pipe-io-throw "Pipe closed"))
+        ((jpipe-rclosed? p) (io-throw "Pipe closed"))
         ((pair? (jpipe-chunks p))
          (let* ((head (car (jpipe-chunks p)))
                 (avail (- (bytevector-length head) (jpipe-pos p)))
@@ -827,6 +875,17 @@
            n))
         ((jpipe-wclosed? p) 0)                      ; writer done: end of stream
         (else jolt-cv-again)))))
+
+;; PipedInputStream.available: what the writer has queued and the reader has not
+;; taken yet. The queue IS the buffer here, so this is exact rather than an
+;; estimate.
+(define (pipe-available p)
+  (jolt-with-mutex (jpipe-mu p)
+    (when (jpipe-rclosed? p) (io-throw "Pipe closed"))
+    (let loop ((cs (jpipe-chunks p)) (n 0))
+      (if (null? cs)
+          (max 0 (- n (jpipe-pos p)))
+          (loop (cdr cs) (+ n (bytevector-length (car cs))))))))
 
 (define (pipe-close-write! p)
   (jolt-with-mutex (jpipe-mu p)
@@ -848,7 +907,7 @@
 ;; buffer rather than one adopting the other's.
 (define (pipe-connect! a b)
   (let ((ca (piped-cell a)) (cb (piped-cell b)))
-    (unless (and ca cb) (pipe-io-throw "Not a piped stream"))
+    (unless (and ca cb) (io-throw "Not a piped stream"))
     (let ((shared (unbox ca)))
       (set-box! cb shared))))
 
