@@ -614,30 +614,46 @@
 ;; proc-wait-timed already polls for exactly this reason; this is the last caller
 ;; that did not. Backs off 0.2ms -> 10ms so a short-lived child is still reaped
 ;; promptly while a long-lived one costs ~100 wakeups a second.
-(define proc-poll-step-max (* 10 1000000))       ; 10ms, in nanoseconds
+(define proc-poll-step-max 10)                   ; 10ms
+;; ONE reap attempt, under the mutex. -> the exit status, or #f meaning "ask again".
+;; The mutex is what stops two callers reaping the same child at once, and one
+;; attempt is all it has to cover: the exit-box is written under it and read under
+;; it, so a caller that loses the race sees the winner's answer on its next pass.
+(define (proc-reap-once st)
+  (jolt-with-mutex (proc-p-mutex st)
+    (or (unbox (proc-p-exit-box st))
+        (call-with-values (lambda () (proc-waitpid-once (proc-p-pid st) #t))
+          (lambda (rc decoded err)
+            (cond
+              ((and decoded (= rc (proc-p-pid st)))
+               (set-box! (proc-p-exit-box st) decoded) decoded)
+              ;; another caller reaped it between our check and our wait
+              ((unbox (proc-p-exit-box st)))
+              ;; still running (WNOHANG rc = 0), or merely interrupted: both mean
+              ;; "ask again", which is #f here and a pause in the caller.
+              ((or (= rc 0) (and (< rc 0) (= err proc-EINTR))) #f)
+              ;; unwaitable (ECHILD) or waitpid unavailable — no number of retries
+              ;; changes that.
+              (else (let ((c (proc-lost-status st)))
+                      (set-box! (proc-p-exit-box st) c) c))))))))
+
+;; THE PAUSE IS OUTSIDE THE MUTEX, and the loop is out here with it. This used to
+;; hold proc-p-mutex across the entire poll, which is for as long as the child runs.
+;; Two things were wrong with that and the second is the sharper: a counted lock held
+;; for an unbounded time makes the whole CARRIER unpreemptible, because the scheduler
+;; refuses to preempt a fiber while its carrier holds one — so a `.waitFor` from a go
+;; block froze every fiber on that carrier for the life of the subprocess, out of
+;; reach of even the preemption that is supposed to be the backstop. And the pause
+;; itself slept the carrier, so a fiber could not have parked in there anyway
+;; (jolt-x1no). Now the lock covers one waitpid attempt, and jolt-pause-ms parks a
+;; fiber between attempts while a thread sleeps.
 (define (proc-wait-blocking st)
   (let ((code
-          (jolt-with-mutex (proc-p-mutex st)
-            (or (unbox (proc-p-exit-box st))
-                (let loop ((step 200000))        ; 0.2ms
-                  (call-with-values (lambda () (proc-waitpid-once (proc-p-pid st) #t))
-                    (lambda (rc decoded err)
-                      (cond
-                        ((and decoded (= rc (proc-p-pid st)))
-                         (set-box! (proc-p-exit-box st) decoded) decoded)
-                        ;; another caller reaped it between our check and our wait
-                        ((unbox (proc-p-exit-box st)))
-                        ;; still running (WNOHANG rc = 0), or merely interrupted:
-                        ;; both mean "ask again", after a short wait.
-                        ((or (= rc 0) (and (< rc 0) (= err proc-EINTR)))
-                         (sleep (make-time 'time-duration step 0))
-                         (loop (if (< step proc-poll-step-max)
-                                   (min proc-poll-step-max (* step 2))
-                                   proc-poll-step-max)))
-                        ;; unwaitable (ECHILD) or waitpid unavailable — no number of
-                        ;; retries changes that.
-                        (else (let ((c (proc-lost-status st)))
-                                (set-box! (proc-p-exit-box st) c) c))))))))))
+          (let loop ((step 1))                   ; 1ms
+            (or (proc-reap-once st)
+                (begin
+                  (jolt-pause-ms step)
+                  (loop (min proc-poll-step-max (* step 2))))))))
     (for-each proc-latch-wait (unbox (proc-p-inherit-latches st)))
     code))
 
@@ -699,7 +715,8 @@
     (let loop ((remaining ms))
       (cond ((not (proc-alive? st)) #t)
             ((<= remaining 0) #f)
-            (else (sleep (make-time 'time-duration (* step 1000000) 0))
+            ;; a fiber parks for the step rather than sleeping its carrier
+            (else (jolt-pause-ms step)
                   (loop (- remaining step)))))))
 
 ;; --- java.lang.ProcessHandle (destroy-tree) ----------------------------------
