@@ -8,9 +8,9 @@
   InetAddress and the socket stream classes with the host class registry.
 
   Deliberate divergences from the JVM (test/conformance/known-divergences.edn):
-  .available is capped by its peek window, a recv error reads as EOF (-1)
-  rather than throwing, .connect ignores its timeout argument (always
-  blocking), and toString formats are approximate. IPv4 only."
+  a recv error reads as EOF (-1) rather than throwing, .connect ignores its
+  timeout argument (always blocking), and toString formats are approximate.
+  IPv4 only."
   (:require [jolt.ffi :as ffi]
             [jolt.io-poller :as poller]
             [clojure.string :as str]))
@@ -30,6 +30,11 @@
 (ffi/defcfn c-recv        "recv"        [:int :pointer :size_t :int] :ssize_t :blocking)
 (ffi/defcfn c-send        "send"        [:int :pointer :size_t :int] :ssize_t :blocking)
 (ffi/defcfn c-close       "close"       [:int] :int)
+;; ioctl is (int fd, unsigned long request, ...) — the :varargs marker puts the
+;; third argument where the callee's va_list reads it. Binding it fixed-arity
+;; instead is what makes Apple arm64 return SUCCESS with the out-parameter
+;; untouched, since variadic arguments travel on the stack there.
+(ffi/defcfn c-ioctl       "ioctl"       [:int :ulong :varargs :pointer] :int)
 (ffi/defcfn c-inet-addr   "inet_addr"   [:pointer] :uint)
 (ffi/defcfn c-gethostbyname "gethostbyname" [:pointer] :pointer :blocking)
 
@@ -43,7 +48,7 @@
 (def ^:private so-reuse     (if macos? 4 2))
 (def ^:private so-nosigpipe 0x1022)
 (def ^:private msg-nosignal (if macos? 0 0x4000))
-(def ^:private msg-peek 2)
+(def ^:private fionread (if macos? 0x4004667F 0x541B))
 
 ;; -- sockaddr helpers ---------------------------------------------------------
 
@@ -280,44 +285,26 @@
       {:n n :bytes (ffi/read-array buf n)}
       {:n -1 :bytes nil})))
 
-;; InputStream.available. The JVM asks the kernel through ioctl(FIONREAD), which
-;; is out of reach: ioctl is variadic, and on Apple's arm64 ABI a variadic
-;; argument travels on the stack where the FFI puts it in a register — the call
-;; then RETURNS SUCCESS with the out-parameter untouched, which is a wrong count
-;; that looks like a right one. (It happens to work on Linux aarch64, where
-;; variadic and named arguments are passed alike. One platform's silent lie is
-;; enough to keep the whole approach out.)
-;;
-;; MSG_PEEK reports what has arrived and consumes none of it, and it is correct
-;; on both. Never waits: every fd here is O_NONBLOCK (guard-fd!), so a peek with
-;; nothing there is EAGAIN, and this deliberately bypasses io-call, whose whole
-;; job is to wait for readiness.
-;;
-;; The answer is capped by the window — java.io documents available as an
-;; estimate, and this is the same bound the byte streams over Chez ports report
-;; (their port buffer). It under-promises, which is the safe direction for a
-;; caller sizing a read.
-(def ^:private peek-window 4096)
-
+;; InputStream.available — the same question the JVM asks, through the same
+;; syscall: ioctl(fd, FIONREAD, &n) reports what has arrived without reading it
+;; or waiting for more. The binding is what has to be right; see c-ioctl above.
 (defn- socket-available [self]
   ;; Closed is an error on both, and here it is a KNOWN one — the socket carries
   ;; the flag — so it raises rather than answering, where a recv error can only
-  ;; read as EOF. Java raises SocketException, a subclass of this, so ported code
-  ;; catching java.io.IOException sees it on either. Peeking is also not an
+  ;; read as EOF. SocketException is the class Java raises and a subclass of
+  ;; IOException, so a catch of either sees it. Asking the kernel is also not an
   ;; option once the fd is closed: the number is free to be reused by the next
   ;; socket, and the count would be somebody else's.
   (when (jolt.host/ref-get (jolt.host/ref-get self :socket) :closed?)
-    (throw (java.io.IOException. "Socket closed")))
+    (throw (java.net.SocketException. "Socket closed")))
   (let [fd (jolt.host/ref-get self :fd)
-        buf (ffi/alloc peek-window)]
+        out (ffi/alloc 4)]
     (try
-      (loop []
-        (let [n (c-recv fd buf peek-window msg-peek)]
-          (cond
-            (pos? n) n
-            (and (neg? n) (poller/eintr?)) (recur)
-            :else 0)))
-      (finally (ffi/free buf)))))
+      (ffi/write out :int 0 0)
+      ;; a failed ioctl reads as "nothing there", the way a failed recv reads as
+      ;; EOF — errno is not reachable to say more
+      (if (neg? (c-ioctl fd fionread out)) 0 (max 0 (ffi/read out :int 0)))
+      (finally (ffi/free out)))))
 
 (def ^:private socket-input-stream-methods
   {"read"

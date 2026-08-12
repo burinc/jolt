@@ -168,11 +168,12 @@
     (.close (.getInputStream conn))
     (check-eq "stream close closes socket" (.isClosed conn) true)))
 
-;; available() is a real byte count. It answered 0 always, which java.io permits
-;; ("an estimate") but which leaves (pos? (.available in)) false forever. The
-;; JVM asks ioctl(FIONREAD); ioctl is variadic and an FFI cannot express that, so
-;; this peeks with MSG_PEEK instead — same answer, consumes nothing, and never
-;; waits because every fd here is O_NONBLOCK. The JVM prints [0 14 9 0] for this.
+;; available() is a real byte count, from the same ioctl(FIONREAD) the JVM asks.
+;; It answered 0 always, which java.io permits ("an estimate") but which leaves
+;; (pos? (.available in)) false forever. ioctl is variadic, and binding it
+;; fixed-arity is what made it look unreachable: on Apple arm64 the call returns
+;; SUCCESS with the out-parameter untouched. jolt.ffi's :varargs marker puts the
+;; argument where the callee reads it. The JVM prints [0 14 9 0] for this.
 (with-pair
   (fn [server client conn]
     (let [in (.getInputStream conn)
@@ -190,17 +191,17 @@
       (.read in (byte-array 64) 0 64)
       (check-eq "available is 0 once drained" (.available in) 0))))
 
-;; the peek window caps the answer — 4096, the same bound the byte streams over
-;; Chez ports report. The JVM says 20000 here (known-divergences).
+;; and it is not bounded by any buffer of jolt's — the kernel's whole count,
+;; which is what the JVM answers here too
 (with-pair
   (fn [server client conn]
     (let [in (.getInputStream conn)]
       (.write (.getOutputStream client) (byte-array 20000) 0 20000)
       (loop [tries 0]
-        (when (and (< (.available in) 4096) (< tries 100))
+        (when (and (< (.available in) 20000) (< tries 100))
           (Thread/sleep 10)
           (recur (inc tries))))
-      (check-eq "available caps at the peek window" (.available in) 4096))))
+      (check-eq "available counts past any buffer" (.available in) 20000))))
 
 ;; a peer that closed leaves its bytes readable, and the count with them
 (let [server (java.net.ServerSocket. 0)
@@ -218,16 +219,17 @@
   (check-eq "available at end of stream" (.available in) 0)
   (.close conn) (.close server))
 
-;; and a CLOSED socket raises, as Java's SocketException does. Peeking a closed
-;; fd would be worse than wrong: the number is free to be reused by the next
-;; socket, so the count would be somebody else's.
+;; and a CLOSED socket raises SocketException, as Java's does. Asking the kernel
+;; about a closed fd would be worse than wrong: the number is free to have been
+;; reused by the next socket, so the count would be somebody else's.
 (with-pair
   (fn [server client conn]
     (let [in (.getInputStream conn)]
       (.close conn)
       (check-eq "available on a closed socket"
-                (try (.available in) (catch java.io.IOException e (.getMessage e)))
-                "Socket closed"))))
+                (try (.available in)
+                     (catch java.io.IOException e [(class e) (.getMessage e)]))
+                [java.net.SocketException "Socket closed"]))))
 
 (if (empty? @failures)
   (println "SOCKET-TEST OK")
