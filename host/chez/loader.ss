@@ -509,6 +509,18 @@
                 (fxlogand (fx* (fxlogxor h (char->integer (string-ref s i)))
                                16777619)
                           #xFFFFFFFF))))))
+;; The same hash over BYTES. A file a compile read is whatever the program said it
+;; was — a .sql migration, an .edn config, a PNG — so it cannot be decoded as text
+;; first; the third would raise.
+(define (aot-bytes-hash bv)
+  (let ((n (bytevector-length bv)))
+    (let loop ((i 0) (h 2166136261))
+      (if (fx=? i n)
+          h
+          (loop (fx+ i 1)
+                (fxlogand (fx* (fxlogxor h (bytevector-u8-ref bv i))
+                               16777619)
+                          #xFFFFFFFF))))))
 (define (aot-source-fingerprint)
   (let loop ((dirs aot-runtime-source-dirs) (h 17) (n 0))
     (if (null? dirs)
@@ -680,6 +692,56 @@
         (filter (lambda (s) (fx>? (string-length s) 0))
                 (bld-string-lines-like (read-file-string path))))
       '()))
+;; --- files read at compile time ----------------------------------------------
+;; The same argument as the dependency closure, for the other thing a compile can
+;; bake in. A macro that slurps a SQL migration embeds that file's CONTENTS in the
+;; artifact; keying on the .clj alone left every consumer serving the previous
+;; build's statements out of the cache, with nothing to notice — the .clj is
+;; untouched, so its hash still matches (jolt#576).
+;;
+;; The reads are RECORDED during the compile, the way the requires are: io.ss's
+;; io-file-read-sink is bound around the capture load and every user-facing read
+;; (slurp, io/reader, io/input-stream, io/resource, Files/read*) announces its
+;; path. That covers a path spelled any of the ways a program can spell one,
+;; without the loader having to know which.
+;;
+;; The sidecar is written only when the namespace actually read something, so the
+;; ordinary namespace carries no extra file — and it is DELETED when a recompile
+;; reads nothing, since it is named by the own hash and a stale one would
+;; otherwise still be found under an unchanged source.
+(define (aot-res-sidecar base) (string-append base ".res"))
+(define (aot-write-res-list! path paths)
+  (if (null? paths)
+      (guard (e (else #f)) (delete-file path #f))
+      (aot-write-dep-list! path paths)))
+;; What one recorded file contributes: its length and content, or 0 when it isn't
+;; there. ABSENT has to be a value of its own rather than "no contribution":
+;; (io/resource "003.sql") answering nil is a compile-time answer, and adding the
+;; file has to move the key. An empty file hashes to something else (the fold of a
+;; zero length with FNV's basis), so the two never collide.
+(define (aot-file-digest path)
+  (guard (e (else 0))
+    (if (file-exists? path)
+        (let ((bv (read-file-bytes path)))
+          (aot-hash-mix (bytevector-length bv) (aot-bytes-hash bv)))
+        0)))
+;; The PATH is folded alongside its content, so gaining or losing an entry moves
+;; the digest even when the contents happen to coincide. Sorted, like the deps, so
+;; the result doesn't depend on the order the reads happened to be recorded in.
+(define (aot-res-fold paths)
+  (fold-left (lambda (h p)
+               (aot-hash-mix (aot-hash-mix h (aot-content-hash p)) (aot-file-digest p)))
+             17 (sort string<? paths)))
+;; A dependency's recorded reads, for the transitive fold. Memoized per process
+;; like the dep digest — a namespace required from several places is hashed once.
+(define aot-res-digest-memo (make-hashtable string-hash string=?))
+(define (aot-res-digest name own)
+  (or (hashtable-ref aot-res-digest-memo name #f)
+      (let ((d (aot-res-fold (aot-read-dep-list
+                               (aot-res-sidecar (aot-base-for-own name own))))))
+        (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-res-digest-memo name d))
+        d)))
+
 ;; local line splitter — build.ss's is not loaded on the run path.
 (define (bld-string-lines-like s)
   (let ((n (string-length s)))
@@ -722,11 +784,13 @@
 (define (aot-inflight-key name)
   (string-append (number->string (get-thread-id)) "\x0;" name))
 (define (aot-ns-digest name)
-  ;; a namespace's whole contribution: its own hash folded with its deps'
+  ;; a namespace's whole contribution: its own hash, the files its compile read,
+  ;; and its deps'. All three so a change anywhere below reaches every consumer.
   (let ((own (aot-own-key name)))
     (if (not own)
         0
-        (aot-hash-mix (equal-hash own) (aot-dep-digest name own)))))
+        (aot-hash-mix (aot-hash-mix (equal-hash own) (aot-res-digest name own))
+                      (aot-dep-digest name own)))))
 (define (aot-dep-digest name own)
   (or (hashtable-ref aot-dep-digest-memo name #f)
       (let ((ik (aot-inflight-key name)))
@@ -743,14 +807,17 @@
                   (hashtable-delete! aot-dep-inflight ik)
                   (hashtable-set! aot-dep-digest-memo name d))
                 d))))))
-;; The full cache base: own hash, then the dep digest. A namespace with no
-;; recorded deps (or none cacheable) folds to the digest of the empty list, so the
-;; suffix is constant for the whole leaf case rather than absent.
-(define (aot-base-full name own deps)
+;; The full cache base: own hash, then the dep digest folded with the digest of
+;; the files this compile read. A namespace with no recorded deps or reads (or
+;; none cacheable) folds to the digest of the empty list, so the suffix is
+;; constant for the whole leaf case rather than absent.
+(define (aot-base-full name own deps res)
   (string-append (aot-base-for-own name own) "-"
                  (number->string
-                   (fold-left (lambda (h dep) (aot-hash-mix h (aot-ns-digest dep))) 17
-                              (sort string<? deps))
+                   (aot-hash-mix
+                     (fold-left (lambda (h dep) (aot-hash-mix h (aot-ns-digest dep))) 17
+                                (sort string<? deps))
+                     (aot-res-fold res))
                    16)))
 ;; Tee the per-form emitted Scheme (compile-eval.ss jolt-aot-capture) while running
 ;; the normal load loop, so a cache miss reproduces the EXACT interleaved analyze
@@ -799,25 +866,34 @@
 ;; would strand the fasl — the next run computes the key WITH deps and misses it,
 ;; paying a second compile for every namespace that requires anything.
 (define (aot-compile-and-cache name file src own)
-  (let ((sink (aot-new-dep-sink)))
-    (let ((captured (parameterize ((aot-dep-sink sink)) (aot-capture-load file src))))
+  (let ((sink (aot-new-dep-sink))
+        ;; the files this compile reads, collected the same way and for the same
+        ;; reason (io.ss io-file-read-sink). A nested require binds its own, so a
+        ;; dependency's reads are recorded against the dependency.
+        (res-sink (vector '())))
+    (let ((captured (parameterize ((aot-dep-sink sink) (io-file-read-sink res-sink))
+                      (aot-capture-load file src))))
       (unless (and (string? captured) (fx>? (string-length captured) 0))
         (aot-info (string-append "nothing captured for " name ", not caching")))
       (when (and (string? captured) (fx>? (string-length captured) 0))
         (let* ((deps (filter aot-cacheable-file (vector-ref sink 0)))
-               (base (aot-base-full name own deps))
+               (res (vector-ref res-sink 0))
+               (base (aot-base-full name own deps res))
                (scm (string-append base ".scm"))
                (so  (string-append base ".so"))
                (pid (number->string (get-process-id)))
                (tmp-scm (string-append base ".tmp" pid ".scm"))
                (tmp-so  (string-append base ".tmp" pid ".so")))
           (aot-mkdir-p (path-parent base))
-          ;; the sidecar is named by the own hash alone, so the next run can read
-          ;; it back before it is able to compute the full key.
+          ;; the sidecars are named by the own hash alone, so the next run can read
+          ;; them back before it is able to compute the full key.
           (aot-write-dep-list! (aot-dep-sidecar (aot-base-for-own name own)) deps)
-          ;; this run already computed a digest for `name` from the OLD sidecar;
-          ;; drop it so a later require in the same process sees the new deps.
-          (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-dep-digest-memo name))
+          (aot-write-res-list! (aot-res-sidecar (aot-base-for-own name own)) res)
+          ;; this run already computed digests for `name` from the OLD sidecars;
+          ;; drop them so a later require in the same process sees the new ones.
+          (jolt-with-mutex ldr-tbl-mu
+            (hashtable-delete! aot-dep-digest-memo name)
+            (hashtable-delete! aot-res-digest-memo name))
           (guard (e (else (aot-info (string-append "compile failed for " name))
                           (delete-file tmp-scm #f) (delete-file tmp-so #f) #f))
             (let ((out (open-output-file tmp-scm 'replace)))
@@ -854,23 +930,25 @@
            ;; no fingerprint = we can't tell this runtime from another one, so
            ;; there is no key that would be safe to reuse.
            (aot-runtime-fingerprint))
-      ;; the deps this ns's own load records belong to IT, not to whoever is
-      ;; requiring it — bind a fresh sink so a nested load can't append to the
-      ;; enclosing one. A hit binds #f: the fasl it loads re-runs the requires,
-      ;; and those are already described by this namespace's own sidecar.
+      ;; the deps and reads this ns's own load records belong to IT, not to
+      ;; whoever is requiring it — bind fresh sinks so a nested load can't append
+      ;; to the enclosing one. A hit binds #f on both: the fasl it loads re-runs
+      ;; the requires and re-does the reads, and those are already described by
+      ;; this namespace's own sidecars.
       (let* ((src (ldr-read-source file))
              (own (aot-cache-key src))
+             (obase (aot-base-for-own name own))
              (base (aot-base-full name own
-                                  (aot-read-dep-list
-                                    (aot-dep-sidecar (aot-base-for-own name own)))))
+                                  (aot-read-dep-list (aot-dep-sidecar obase))
+                                  (aot-read-dep-list (aot-res-sidecar obase))))
              (so (string-append base ".so")))
         (if (file-exists? so)
             (begin (aot-info (string-append "hit " name))
-                   (parameterize ((aot-dep-sink #f))
+                   (parameterize ((aot-dep-sink #f) (io-file-read-sink #f))
                      (aot-safe-load-or-recompile name file src own base)))
             (begin (aot-info (string-append "miss " name))
                    (aot-compile-and-cache name file src own))))
-      (parameterize ((aot-dep-sink #f)) (load-jolt-file file))))
+      (parameterize ((aot-dep-sink #f) (io-file-read-sink #f)) (load-jolt-file file))))
 
 ;; Mark a namespace as loaded in both the host hashtable and the *loaded-libs* ref.
 (define (ldr-mark-loaded! name)

@@ -407,6 +407,141 @@ else
   fails=$((fails+1))
 fi
 
+# --- Phase 5: files read at compile time invalidate their reader --------------
+# A macro that slurps an external file bakes that file's CONTENTS into the
+# artifact, exactly the way it bakes a macro expansion. The key folded in the
+# source and the required namespaces but nothing the compile read, so editing an
+# embedded SQL migration (and nothing else) left every consumer serving the old
+# statements out of the cache — silently, since the .clj is untouched and its
+# hash still matches (jolt#576).
+
+# (p) slurp of a path at macro-expansion time
+p="$tmp/p"; mkdir -p "$p/src/proj"
+printf 'v1' > "$p/mig.sql"
+cat > "$p/src/proj/core.clj" <<CLJ
+(ns proj.core)
+(defmacro embed [] (slurp "$p/mig.sql"))
+(defn run [] (embed))
+CLJ
+prun() {
+  JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'proj/proj {:local/root \"$p\"}}})
+    (require 'proj.core) (println (proj.core/run))" 2>/dev/null | tail -1
+}
+p_cold="$(prun)"
+printf 'v2' > "$p/mig.sql"
+p_warm="$(prun)"
+if [ "$p_cold" = "v1" ] && [ "$p_warm" = "v2" ]; then
+  echo "PASS: (p) slurped file edit invalidated its reader (v1 -> v2)"; pass=$((pass+1))
+else
+  echo "FAIL: (p) cold='$p_cold' (want v1) after-resource-edit='$p_warm' (want v2)"; fails=$((fails+1))
+fi
+
+# (q) io/resource — the classpath spelling, resolved against the source roots
+q="$tmp/q"; mkdir -p "$q/src/proj" "$q/resources"
+printf '{:paths ["src" "resources"]}' > "$q/deps.edn"
+printf 'r1' > "$q/resources/mig.sql"
+cat > "$q/src/proj/core.clj" <<'CLJ'
+(ns proj.core (:require [clojure.java.io :as io]))
+(defmacro embed [] (slurp (io/resource "mig.sql")))
+(defn run [] (embed))
+CLJ
+qrun() {
+  JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'proj/proj {:local/root \"$q\"}}})
+    (require 'proj.core) (println (proj.core/run))" 2>/dev/null | tail -1
+}
+q_cold="$(qrun)"
+printf 'r2' > "$q/resources/mig.sql"
+q_warm="$(qrun)"
+if [ "$q_cold" = "r1" ] && [ "$q_warm" = "r2" ]; then
+  echo "PASS: (q) io/resource edit invalidated its reader (r1 -> r2)"; pass=$((pass+1))
+else
+  echo "FAIL: (q) cold='$q_cold' (want r1) after-resource-edit='$q_warm' (want r2)"; fails=$((fails+1))
+fi
+
+# (q2) a resource that did not exist yet — adding one (a new migration) has to
+# invalidate the namespace that probed for it and found nothing.
+printf '(ns proj.opt (:require [clojure.java.io :as io]))\n(defmacro embed [] (if-let [u (io/resource "opt.sql")] (slurp u) "none"))\n(defn run [] (embed))\n' > "$q/src/proj/opt.clj"
+q2run() {
+  JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'proj/proj {:local/root \"$q\"}}})
+    (require 'proj.opt) (println (proj.opt/run))" 2>/dev/null | tail -1
+}
+q2_cold="$(q2run)"
+printf 'appeared' > "$q/resources/opt.sql"
+q2_warm="$(q2run)"
+if [ "$q2_cold" = "none" ] && [ "$q2_warm" = "appeared" ]; then
+  echo "PASS: (q2) an added resource invalidated the ns that probed for it"; pass=$((pass+1))
+else
+  echo "FAIL: (q2) cold='$q2_cold' (want none) after-add='$q2_warm' (want appeared)"; fails=$((fails+1))
+fi
+
+# (r) the read happens while compiling the CONSUMER (the macro lives one
+# namespace away), so the resource belongs to the consumer's key, and editing it
+# has to move that key even though neither .clj changed.
+r="$tmp/r"; mkdir -p "$r/src/chain"
+printf 'w1' > "$r/mig.sql"
+cat > "$r/src/chain/mac.clj" <<CLJ
+(ns chain.mac)
+(defmacro embed [] (slurp "$r/mig.sql"))
+CLJ
+cat > "$r/src/chain/top.clj" <<'CLJ'
+(ns chain.top (:require [chain.mac :as m]))
+(defn run [] (m/embed))
+CLJ
+rrun() {
+  JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'chain/chain {:local/root \"$r\"}}})
+    (require 'chain.top) (println (chain.top/run))" 2>/dev/null | tail -1
+}
+r_cold="$(rrun)"
+printf 'w2' > "$r/mig.sql"
+r_warm="$(rrun)"
+if [ "$r_cold" = "w1" ] && [ "$r_warm" = "w2" ]; then
+  echo "PASS: (r) cross-namespace macro read invalidated the consumer (w1 -> w2)"; pass=$((pass+1))
+else
+  echo "FAIL: (r) cold='$r_cold' (want w1) after-resource-edit='$r_warm' (want w2)"; fails=$((fails+1))
+fi
+
+# (s) a resource baked into a REQUIRED namespace's own artifact propagates
+# through the chain the way an edit to that namespace's source does: deep.low
+# expands the slurp into its OWN .so, and deep.top's key has to fold that in.
+s="$tmp/s"; mkdir -p "$s/src/deep"
+printf 'd1' > "$s/mig.sql"
+cat > "$s/src/deep/low.clj" <<CLJ
+(ns deep.low)
+(defmacro mig [] (slurp "$s/mig.sql"))
+(def payload (mig))
+CLJ
+cat > "$s/src/deep/top.clj" <<'CLJ'
+(ns deep.top (:require [deep.low :as l]))
+(defn run [] l/payload)
+CLJ
+srun() {
+  JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'deep/deep {:local/root \"$s\"}}})
+    (require 'deep.top) (println (deep.top/run))" 2>/dev/null | tail -1
+}
+s_cold="$(srun)"
+printf 'd2' > "$s/mig.sql"
+s_warm="$(srun)"
+if [ "$s_cold" = "d1" ] && [ "$s_warm" = "d2" ]; then
+  echo "PASS: (s) a required ns's resource edit reached the chain (d1 -> d2)"; pass=$((pass+1))
+else
+  echo "FAIL: (s) cold='$s_cold' (want d1) after-resource-edit='$s_warm' (want d2)"; fails=$((fails+1))
+fi
+
+# (t) a namespace that reads nothing writes no resource sidecar — the record is
+# per-namespace, not a global list every artifact then keys on.
+t_res="$(find "$cache" -name 'mylib.core-*.res' 2>/dev/null | wc -l | tr -d ' ')"
+p_res="$(find "$cache" -name 'proj.core-*.res' 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$t_res" = "0" ] && [ "$p_res" -ge 1 ]; then
+  echo "PASS: (t) resource sidecars are per-namespace ($p_res for readers, 0 for mylib.core)"; pass=$((pass+1))
+else
+  echo "FAIL: (t) mylib.core sidecars=$t_res (want 0), proj.core sidecars=$p_res (want >=1)"; fails=$((fails+1))
+fi
+
 # Phase 4 (cold-vs-warm speedup) lives in aot-cache-perf.sh — a timing
 # measurement doesn't belong in this deterministic correctness gate.
 

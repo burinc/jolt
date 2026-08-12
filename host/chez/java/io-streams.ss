@@ -413,13 +413,18 @@
 
 ;; --- clojure.java.io: byte streams + copy / make-parents / delete-file -------
 ;; input-stream/output-stream now yield real byte streams (were char reader/writer).
+;; the file branches announce themselves to the AOT cache (io-note-file-read!,
+;; io.ss): opening a resource for reading at compile time is a read like a slurp.
+(define (jio-open-in-file p)
+  (io-note-file-read! p)
+  (make-in-stream (open-file-input-port p (file-options) (buffer-mode block))))
 (define (jio-input-stream x)
   (cond ((in-stream? x) x)
-        ((jfile? x) (make-in-stream (open-file-input-port (jfile-fs x) (file-options) (buffer-mode block))))
+        ((jfile? x) (jio-open-in-file (jfile-fs x)))
         ((and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)) (make-in-stream (open-bytevector-input-port (na-bytearray->bv x))))
         ((bytevector? x) (make-in-stream (open-bytevector-input-port x)))
-        ((and (jhost? x) (string=? (jhost-tag x) "url")) (make-in-stream (open-file-input-port (url-strip-scheme (url-spec x)) (file-options) (buffer-mode block))))
-        ((string? x) (make-in-stream (open-file-input-port (project-relative x) (file-options) (buffer-mode block))))
+        ((and (jhost? x) (string=? (jhost-tag x) "url")) (jio-open-in-file (url-strip-scheme (url-spec x))))
+        ((string? x) (jio-open-in-file (project-relative x)))
         (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as an InputStream.")))))
 (define (jio-output-stream x . rest)
   (cond ((out-stream? x) x)

@@ -514,7 +514,35 @@
           (if r (car r) (apply %io-host-call method target args)))
         (apply %io-host-call method target args))))
 
+;; --- the files a load READ ---------------------------------------------------
+;; Every file the io layer opens on behalf of USER code announces itself here.
+;;
+;; The AOT cache (loader.ss) binds the sink while it compiles a namespace: a
+;; macro that slurps an external file bakes that file's CONTENTS into the
+;; artifact exactly the way it bakes a macro expansion, so the file belongs in the
+;; cache key. Keying on the .clj alone left an edited SQL migration serving the
+;; previous build's statements out of the cache, silently — the namespace source
+;; is untouched, so its hash still matches (jolt#576).
+;;
+;; A file that does NOT exist is announced too. (io/resource "migrations/003.sql")
+;; answering nil is a compile-time answer like any other, and it stops being the
+;; right one the moment someone adds the file.
+;;
+;; It lives here rather than beside the cache because rt.ss is loaded in contexts
+;; that never load loader.ss (bootstrap, devboot, the .ss unit tests), and the io
+;; layer must not reference a name those don't have. Unbound (#f) in every
+;; ordinary run — the cost off the compile path is one thread-parameter read.
+(define io-file-read-sink (make-thread-parameter #f))
+(define (io-note-file-read! path)
+  (let ((sink (io-file-read-sink)))
+    (when (and (vector? sink) (string? path)
+               (not (member path (vector-ref sink 0))))
+      (vector-set! sink 0 (cons path (vector-ref sink 0))))))
+
 ;; --- slurp / spit / flush ---------------------------------------------------
+;; NOT announced: the loader reads namespace SOURCE through this too, and those
+;; are described by the cache key already. slurp-path / io/resource / io/reader —
+;; the entry points user code reaches — announce for themselves.
 (define (read-file-string path)
   (with-port (open-input-file path)
     (lambda (p) (let ((s (get-string-all p))) (if (eof-object? s) "" s)))))
@@ -589,6 +617,7 @@
 ;; a file by slurping and catching FNF. A raw Chez open-input-file condition is not
 ;; catchable as that class, so the caller's fallback never runs.
 (define (slurp-path path)
+  (io-note-file-read! path)
   (unless (file-exists? path)
     (throw-jvm (quote java.io.FileNotFoundException)
                (string-append path " (No such file or directory)")))
@@ -832,12 +861,15 @@
 (define (jolt-io-reader x)
   (cond
     ((reader-jhost? x) x)
-    ((jfile? x) (host-new "StringReader" (read-file-string (jfile-fs x))))
+    ((jfile? x) (io-note-file-read! (jfile-fs x))
+                (host-new "StringReader" (read-file-string (jfile-fs x))))
     ((embedded-res? x)
      (let ((c (embedded-res-content x)))
        (host-new "StringReader" (if (bytevector? c) (utf8->string c) c))))
     ((url-jhost? x) (host-new "StringReader" (url-content x)))
-    ((string? x) (host-new "StringReader" (read-file-string (project-relative x))))
+    ((string? x) (let ((p (project-relative x)))
+                   (io-note-file-read! p)
+                   (host-new "StringReader" (read-file-string p))))
     ((or (cseq? x) (empty-list-t? x) (pvec? x))
      (host-new "StringReader" (seq-source->string x)))
     ;; anything else is not a source, and quietly rendering it would read as empty
@@ -898,15 +930,25 @@
                   rel)))
     (make-url (string-append "file:" (jfile-abs rel)))))
 
+;; Every candidate probed is announced to the AOT cache (io-note-file-read!),
+;; not just the one that answered — including the ones that were not there. Which
+;; root wins is part of the answer, so a file appearing at an EARLIER root has to
+;; invalidate; and a lookup that found nothing at all has to invalidate when the
+;; resource is finally added (a new migration is exactly that). An embedded
+;; resource is baked into the binary and covered by the runtime fingerprint, so it
+;; contributes nothing here.
 (define (jolt-io-resource name)
   (let* ((nm (jolt-str-render-one name))
          (emb (hashtable-ref embedded-resources nm #f)))
     (if emb (make-embedded-res nm emb)
         (let loop ((roots (get-source-roots)))
-          (cond ((null? roots) jolt-nil)
-                ((file-exists? (string-append (car roots) "/" nm))
-                 (resource-file-url (car roots) nm))
-                (else (loop (cdr roots))))))))
+          (if (null? roots)
+              jolt-nil
+              (let ((cand (string-append (car roots) "/" nm)))
+                (io-note-file-read! cand)
+                (if (file-exists? cand)
+                    (resource-file-url (car roots) nm)
+                    (loop (cdr roots)))))))))
 (def-var! "clojure.java.io" "resource" jolt-io-resource)
 ;; as-url honors a library-registered URL class (e.g. jolt-lang/http-client's full
 ;; java.net.URL shim) so io/as-url and (URL. spec) agree; else the file-only jhost.
