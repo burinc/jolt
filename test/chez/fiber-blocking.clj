@@ -101,6 +101,36 @@
   (send ag (fn [s] (deref p) (inc s)))
   (probe :agent-await (fn [] (await ag) :drained) #(deliver p :go)))
 
+;; 13. .waitFor on a subprocess. Not a condition-variable wait at all — there is
+;; nothing to attach one to, so it polls waitpid — but the same hazard and the worst
+;; version of it: the poll slept the carrier, unboundedly, for the whole life of the
+;; child, AND it held the per-process mutex the whole time, which makes the carrier
+;; unpreemptible too (the scheduler refuses to preempt a fiber whose carrier holds a
+;; counted lock). So this one was out of reach of even the preemption backstop.
+;;
+;; Asserted as ORDER rather than through `probe`, because there is no releaser: the
+;; sibling fiber queued behind the waiter must reach the channel FIRST, while the
+;; child is still running.
+(let [order (a/chan 4)
+      p (.start (ProcessBuilder. ["sh" "-c" "sleep 0.4"]))
+      fs (binding [a/*go-backend* :fiber]
+           [(a/go (let [c (.waitFor p)] (a/>!! order [:waited c])))
+            (a/go (a/>!! order :sibling-ran))])
+      [v port] (a/alts!! [order (a/timeout case-timeout-ms)])]
+  (swap! results conj [:waitfor-yields (if (= port order) v :HUNG)])
+  (mapv a/<!! fs))
+
+;; 14. read-line, whose stdin readiness poll had the same shape. stdin is not
+;; readable under the harness, so this checks the part that is testable here: a
+;; fiber blocked in it does not stop the sibling behind it. The reader is left
+;; parked; the case is over once the sibling has run.
+(let [order (a/chan 4)]
+  (binding [a/*go-backend* :fiber]
+    (a/go (read-line) :read)
+    (a/go (a/>!! order :sibling-ran)))
+  (let [[v port] (a/alts!! [order (a/timeout case-timeout-ms)])]
+    (swap! results conj [:read-line-yields (if (= port order) v :HUNG)])))
+
 (def expected
   {:promise :delivered
    :promise-timed :delivered
@@ -114,7 +144,8 @@
    :executor-await true
    :piped-read 65
    :agent-await :drained
-})
+   :waitfor-yields :sibling-ran
+   :read-line-yields :sibling-ran})
 
 (let [got (into {} @results)
       bad (remove (fn [[k v]] (= v (get expected k))) (seq got))

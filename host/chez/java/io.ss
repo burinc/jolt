@@ -712,8 +712,8 @@
 ;; char-ready? promises a CHAR, not a whole line, so a writer that sends half a
 ;; line and then stalls still parks the world for the remainder — a far smaller
 ;; window than "until any input arrives", and the most this port surface offers.
-(define jolt-stdin-poll-step0 500000)          ; 0.5ms, in nanoseconds
-(define jolt-stdin-poll-step-max (* 20 1000000))   ; 20ms
+(define jolt-stdin-poll-step0 1)               ; 1ms
+(define jolt-stdin-poll-step-max 20)          ; 20ms
 (define jolt-stdin-poll-port (box #f))         ; the port the answer below is about
 (define jolt-stdin-poll-ok (box #f))
 (define (jolt-stdin-wait-ready! in)
@@ -723,7 +723,10 @@
   (when (unbox jolt-stdin-poll-ok)
     (let loop ((step jolt-stdin-poll-step0))
       (unless (char-ready? in)
-        (sleep (make-time 'time-duration step 0))
+        ;; jolt-pause-ms and not (sleep): on a fiber this parks for the step and
+        ;; gives the carrier up, so (read-line) from a go block no longer stops
+        ;; every other fiber placed on that carrier until input arrives.
+        (jolt-pause-ms step)
         (loop (min jolt-stdin-poll-step-max (* step 2)))))))
 
 (def-var! "clojure.core" "__stdin-read-line"

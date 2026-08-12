@@ -48,6 +48,16 @@ one form, and it is checked instead of documented.
   `condition-wait` outside the file that defines the two is a build failure.
   (jolt-x1no)
 
+  The same went for the two waits that poll rather than wait on a condition,
+  because there is nothing for them to wait on: `.waitFor` on a subprocess and the
+  stdin readiness check behind `read-line`. Both slept the carrier between probes,
+  for as long as the child ran or until input arrived. `.waitFor` was the worst
+  case in the runtime, because it also held the per-process lock for that whole
+  time, and a carrier holding one of the runtime's locks is not preemptible either
+  — so a `.waitFor` in a `go` block froze every fiber on its carrier beyond the
+  reach of even the preemption that is supposed to be the backstop. It now holds
+  that lock for one `waitpid` attempt and parks between attempts.
+
   One related case is deliberately unchanged: `Thread/sleep` in a `go` block still
   occupies its carrier for the duration, matching what it does in a JVM
   `core.async` go block. It cannot deadlock, since it always makes progress, and

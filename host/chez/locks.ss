@@ -353,8 +353,39 @@
     (unless (null? fs) (for-each sa-fiber-resume fs))))
 
 ;; Absolute epoch millis -> the absolute time object Chez's condition-wait wants.
+;; Floored to an exact integer first: make-time will not take a flonum field, and a
+;; deadline arriving as one is a caller's arithmetic, not something to trust.
 (define (jolt-millis->time ms)
-  (make-time 'time-utc (* 1000000 (mod ms 1000)) (div ms 1000)))
+  (let ((ms (exact (floor ms))))
+    (make-time 'time-utc (* 1000000 (mod ms 1000)) (div ms 1000))))
+
+;; (jolt-pause-ms ms) — pause THIS execution context for ms, whatever it is: a
+;; thread sleeps, and a fiber parks until the deadline and gives its carrier up in
+;; the meantime.
+;;
+;; For the runtime's own POLL LOOPS, which wait on something no condition variable
+;; can be attached to — a waitpid, a char-ready? on stdin. A poll that sleeps stops
+;; every fiber on the carrier for each nap, and since these loops run until an
+;; external event happens, that is unbounded: a (.waitFor p) from a go block
+;; occupied its carrier for the whole life of the subprocess. ReentrantLock's
+;; bounded tryLock had the same shape and was already fixed to yield instead, for
+;; the same reason; this is that fix with the carrier actually released rather than
+;; merely handed on.
+;;
+;; NOT for Thread/sleep, which is a user-facing request to sleep a thread, matches
+;; a JVM core.async go block as it stands, and has a gate asserting it.
+;;
+;; The mutex and condition are private and fresh, so nothing else can signal them:
+;; the timer's wake is the only one, and the retake's own clock read is what decides
+;; the pause is over. That makes this a park with a deadline expressed in the one
+;; wait protocol the runtime has, rather than a second one written by hand.
+(define (jolt-pause-ms ms)
+  (if (jolt-current-fiber)
+      (let ((mu (make-mutex)) (cv (make-condition)))
+        (jolt-cv-wait mu cv (+ (now-millis) ms)
+          (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))
+        (void))
+      (sleep (ms->duration ms))))
 
 (define (jolt-cv-wait mu cv deadline decide)
   ;; Registered OUTSIDE mu, and only for a fiber. Outside because the timer's
