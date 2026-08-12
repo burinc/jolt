@@ -302,7 +302,7 @@
                     (let ((r (ac-xrf-apply ch v)))
                       (when (jolt-reduced? r) (ac-close! ch))
                       #t))
-                   (else (condition-wait (async-chan-cv ch) (async-chan-mu ch)) (loop))))
+                   (else (jolt-condition-wait (async-chan-cv ch) (async-chan-mu ch)) (loop))))
            ;; Unbuffered with xform: apply immediately (output goes to rendezvous queue)
            (let ((r (ac-xrf-apply ch v)))
              (when (jolt-reduced? r) (ac-close! ch))
@@ -322,14 +322,14 @@
                  (cond ((async-chan-closed? ch) #f)
                        ((< (ac-qlen ch) (async-chan-cap ch))
                         (ac-qpush! ch (cons v #f)) (ac-notify! ch) #t)
-                       (else (condition-wait (async-chan-cv ch) (async-chan-mu ch)) (loop))))
+                       (else (jolt-condition-wait (async-chan-cv ch) (async-chan-mu ch)) (loop))))
                (let ((box (vector #f)))                        ; unbuffered: rendezvous
                  (ac-qpush! ch (cons v box))
                  (ac-notify! ch)
                   (let loop ()
                    (if (vector-ref box 0)
                        #t
-                       (begin (condition-wait (async-chan-cv ch) (async-chan-mu ch)) (loop))))))))))))
+                       (begin (jolt-condition-wait (async-chan-cv ch) (async-chan-mu ch)) (loop))))))))))))
 
 ;; remove + return the head value, waking a parked rendezvous putter.
 (define (ac-take-head! ch)
@@ -378,7 +378,7 @@
 ;; unbuffered channel can see that a taker is ready.
 (define (ac-take-wait ch)
   (async-chan-takew-set! ch (fx+ 1 (async-chan-takew ch)))
-  (condition-wait (async-chan-cv ch) (async-chan-mu ch))
+  (jolt-condition-wait (async-chan-cv ch) (async-chan-mu ch))
   (async-chan-takew-set! ch (fx- (async-chan-takew ch) 1)))
 
 ;; non-blocking take for alts!/poll!: a value, jolt-nil (closed+empty), or ac-poll-empty.
@@ -452,13 +452,27 @@
 (define (jolt-async-poll! ch)
   (let ((r (ac-poll! ch))) (if (eq? r ac-poll-empty) cca-none r)))
 
-;; --- shared timeout timer ---------------------------------------------------
-;; ONE timer thread serves all (timeout ms) calls — no per-call OS thread.
-;; Pending timeouts are kept as a sorted list of (deadline-ms . channel) by
-;; ascending deadline. The timer closes every channel whose deadline has passed,
-;; then waits for the nearest remaining one; an insert that becomes the HEAD
-;; signals timeout-cv, because that is exactly when the deadline it is waiting
-;; for changed.
+;; --- the shared timer -------------------------------------------------------
+;; ONE timer thread serves every deadline in the runtime — no per-call OS thread.
+;; Pending entries are kept as a sorted list of (deadline-ms . thunk) by ascending
+;; deadline. The timer runs every thunk whose deadline has passed, then waits for
+;; the nearest remaining one; an insert that becomes the HEAD signals timeout-cv,
+;; because that is exactly when the deadline it is waiting for changed.
+;;
+;; A THUNK AND NOT A CHANNEL. (timeout ms) is one caller and closes a channel;
+;; the other is a fiber in a timed wait on a condition variable, which needs
+;; waking at the deadline (jolt-cv-wait, host/chez/locks.ss). Nothing about a
+;; deadline is specific to channels, and a second timer thread for the second
+;; kind of deadline would be a second thing to get wrong — this one already had
+;; two bugs of its own (jolt-pe84).
+;;
+;; THE THUNKS RUN OUTSIDE timeout-mu. They used to run under it, which was
+;; survivable while the only thunk was a channel close, and is not survivable in
+;; general: a thunk that takes a lock while the timer holds timeout-mu puts
+;; timeout-mu above that lock in the order, and any code that registers a deadline
+;; while holding it closes a cycle. Collecting the due entries under the lock and
+;; running them after it is released means the timer holds nothing while calling
+;; out, so registering a deadline from inside any critical section stays safe.
 ;;
 ;; THE WAIT IS A TIMED condition-wait HELD UNDER timeout-mu, AND THE THREAD IS
 ;; FORKED ONCE. Both were otherwise, and each was a bug (jolt-pe84):
@@ -478,14 +492,14 @@
 ;;     once true never stops being true.
 (define timeout-mu (make-mutex))
 (define timeout-cv (make-condition))
-(define timeout-pending '())       ; ((deadline-ms . channel) ...) sorted asc
+(define timeout-pending '())       ; ((deadline-ms . thunk) ...) sorted asc
 (define timeout-running? #f)       ; the one timer thread has been forked
 
 ;; -> #t iff the new entry is the HEAD of the list, i.e. the caller must signal.
-(define (timeout-insert! deadline-ms ch)
+(define (timeout-insert! deadline-ms thunk)
   (let loop ((prev '()) (cur timeout-pending))
     (cond ((null? cur)
-           (let ((entry (cons deadline-ms ch)))
+           (let ((entry (cons deadline-ms thunk)))
              (if (null? prev)
                  (set! timeout-pending (list entry))
                  (set-cdr! prev (list entry))))
@@ -493,43 +507,62 @@
            ;; an existing entry leaves the timer's next wake correct as it is.
            (null? prev))
           ((< deadline-ms (caar cur))
-           (let ((entry (cons deadline-ms ch)))
+           (let ((entry (cons deadline-ms thunk)))
              (if (null? prev)
                  (set! timeout-pending (cons entry cur))
                  (set-cdr! prev (cons entry cur))))
            (null? prev))
           (else (loop cur (cdr cur))))))
 
+;; Everything due, removed from the list, newest deadline last. Called with
+;; timeout-mu held; answers '() after waiting when nothing is due yet, so the
+;; caller's loop is "collect, release, run, repeat".
+(define (timeout-collect-due!)
+  (let due ((acc '()))
+    (cond
+      ((and (pair? timeout-pending) (<= (caar timeout-pending) (now-millis)))
+       (let ((entry (car timeout-pending)))
+         (set! timeout-pending (cdr timeout-pending))
+         (due (cons (cdr entry) acc))))
+      ((pair? acc) (reverse acc))
+      (else
+       (if (null? timeout-pending)
+           (jolt-condition-wait timeout-cv timeout-mu)
+           (let ((wait-ms (- (caar timeout-pending) (now-millis))))
+             (when (> wait-ms 0)
+               (jolt-condition-wait timeout-cv timeout-mu (ms->duration wait-ms)))))
+       ;; Either deadline or signal, the answer is the same: come back and re-read
+       ;; the head. A spurious wake costs one empty trip.
+       '()))))
+
 (define (timeout-thread)
-  (jolt-lock! timeout-mu)
   (let loop ()
-    (let cleanup ()
-      (if (and (pair? timeout-pending) (<= (caar timeout-pending) (now-millis)))
-          (begin
-            (jolt-async-close! (cdar timeout-pending))
-            (set! timeout-pending (cdr timeout-pending))
-            (cleanup))
-          (begin
-            (if (null? timeout-pending)
-                (condition-wait timeout-cv timeout-mu)
-                (let ((wait-ms (- (caar timeout-pending) (now-millis))))
-                  (when (> wait-ms 0)
-                    (condition-wait timeout-cv timeout-mu (ms->duration wait-ms)))))
-            ;; Either deadline or signal, the answer is the same: re-read the
-            ;; head. A spurious wake costs one trip through cleanup.
-            (loop))))))
+    (let ((due (jolt-with-mutex timeout-mu (timeout-collect-due!))))
+      (for-each (lambda (fire)
+                  ;; One thunk must not be able to stop the timer for everything
+                  ;; else. A channel close cannot raise; a wake takes a lock it does
+                  ;; not own the discipline of, so this is the seam where a bug in
+                  ;; somebody else's deadline stays theirs.
+                  (guard (e (#t #f)) (fire)))
+                due)
+      (loop))))
+
+;; (jolt-timer-at! deadline-ms thunk) — run thunk on the timer thread once the
+;; epoch-millisecond deadline has passed. The one deadline facility in the runtime.
+(define (jolt-timer-at! deadline-ms thunk)
+  (jolt-lock! timeout-mu)
+  (when (timeout-insert! deadline-ms thunk)
+    (condition-signal timeout-cv))
+  (unless timeout-running?
+    (set! timeout-running? #t)
+    (fork-thread timeout-thread))
+  (jolt-unlock! timeout-mu))
 
 ;; (timeout ms) — a channel that closes after ms milliseconds.
 (define (jolt-async-timeout ms)
-  (let* ((w (ac-make 0 'unbuffered #f))
-         (dl (+ (now-millis) (exact (floor ms)))))
-    (jolt-lock! timeout-mu)
-    (when (timeout-insert! dl w)
-      (condition-signal timeout-cv))
-    (unless timeout-running?
-      (set! timeout-running? #t)
-      (fork-thread timeout-thread))
-    (jolt-unlock! timeout-mu)
+  (let ((w (ac-make 0 'unbuffered #f)))
+    (jolt-timer-at! (+ (now-millis) (exact (floor ms)))
+                    (lambda () (jolt-async-close! w)))
     w))
 
 ;; (put! ch v [cb [on-caller?]]) — async put, optional completion callback. If the
@@ -821,7 +854,7 @@
                               (let ((mb (alt-handler-mailbox h)))
                                 (let wait-loop ()
                                   (unless (vector-ref mb 0)
-                                    (condition-wait (alt-handler-wcv h) (alt-handler-wmu h))
+                                    (jolt-condition-wait (alt-handler-wcv h) (alt-handler-wmu h))
                                     (wait-loop)))))
                             (unregister!)
                             (let ((mb (alt-handler-mailbox h)))

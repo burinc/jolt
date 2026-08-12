@@ -1248,7 +1248,7 @@
     (cond
       ((jolt-carrier-stop? c) (jolt-unlock! (jolt-carrier-mu c)) (void))
       ((jolt-carrier-head c) (jolt-unlock! (jolt-carrier-mu c)) (loop))
-      (else (condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c))
+      (else (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c))
             (jolt-unlock! (jolt-carrier-mu c))
             (loop)))))
 

@@ -548,15 +548,16 @@
     (let ((chunk (make-bytevector count)))
       (bytevector-copy! bv start chunk 0 count)
       (jpipe-chunks-set! p (append (jpipe-chunks p) (list chunk)))
-      (condition-broadcast (jpipe-cv p))))
+      (jolt-cv-wake! (jpipe-cv p))))
   count)
 
-;; Blocks while the pipe is empty and the writer is still open. condition-wait
-;; releases the mutex and deactivates the thread, so a writer can run and the
-;; collector is not held up by a parked reader.
+;; Waits while the pipe is empty and the writer is still open. A THREAD blocks,
+;; which releases the mutex so a writer can run; a FIBER parks, because blocking
+;; its carrier would stop every other fiber on it until the writer wrote — and if
+;; the writer is a fiber on that same carrier, forever (jolt-x1no).
 (define (pipe-read! p bv start count)
-  (jolt-with-mutex (jpipe-mu p)
-    (let loop ()
+  (jolt-cv-wait (jpipe-mu p) (jpipe-cv p) #f
+    (lambda (_timed-out?)
       (cond
         ((jpipe-rclosed? p) (pipe-io-throw "Pipe closed"))
         ((pair? (jpipe-chunks p))
@@ -569,16 +570,16 @@
                (jpipe-pos-set! p (+ (jpipe-pos p) n)))
            n))
         ((jpipe-wclosed? p) 0)                      ; writer done: end of stream
-        (else (condition-wait (jpipe-cv p) (jpipe-mu p)) (loop))))))
+        (else jolt-cv-again)))))
 
 (define (pipe-close-write! p)
   (jolt-with-mutex (jpipe-mu p)
     (jpipe-wclosed?-set! p #t)
-    (condition-broadcast (jpipe-cv p))))
+    (jolt-cv-wake! (jpipe-cv p))))
 (define (pipe-close-read! p)
   (jolt-with-mutex (jpipe-mu p)
     (jpipe-rclosed?-set! p #t)
-    (condition-broadcast (jpipe-cv p))))
+    (jolt-cv-wake! (jpipe-cv p))))
 
 ;; The shared pipe behind a stream, or #f when it is an ordinary file/array stream.
 (define (piped-cell x)

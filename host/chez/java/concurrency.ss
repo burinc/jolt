@@ -23,6 +23,11 @@
          (nanos (* (remainder ms* 1000) 1000000)))
     (make-time 'time-duration nanos secs)))
 (define (ms->deadline ms) (add-duration (current-time 'time-utc) (ms->duration ms)))
+;; The same deadline as an absolute epoch millisecond count, which is the form
+;; jolt-cv-wait takes: a thread's condition-wait wants a Chez time object, but a
+;; fiber's deadline has to be comparable against the clock, and against the entries
+;; in the shared timer. One conversion, so the two cannot drift apart.
+(define (ms->deadline-millis ms) (+ (now-millis) (exact (floor ms))))
 
 ;; --- java.util.concurrent.TimeUnit ------------------------------------------
 ;; A TimeUnit is a scale, so each constant is an object carrying its name and its
@@ -101,7 +106,7 @@
              (jolt-future-ok?-set! f (car r))
              (jolt-future-payload-set! f (cdr r))
              (jolt-future-done?-set! f #t))
-           (condition-broadcast (jolt-future-cv f))))))
+           (jolt-cv-wake! (jolt-future-cv f))))))
     f))
 
 ;; Final value of a settled future (called OUTSIDE the lock): wrap a captured
@@ -117,24 +122,30 @@
                           (jolt-str-render-one cause)
                           cause))))))
 
+;; jolt-cv-wait and not a bare condition-wait, here and at every other wait in this
+;; file: @a-future from a go block used to block the fiber's CARRIER, so every other
+;; fiber on it stopped until the future settled, and if the thing that would settle
+;; it was itself a fiber on that carrier the two deadlocked (jolt-x1no). A fiber
+;; parks now and the settle resumes it; a thread still blocks, which is what a
+;; thread should do.
 (define (jolt-future-deref f)
-  (jolt-with-mutex (jolt-future-mu f)
-    (let loop ()
-      (unless (jolt-future-done? f)
-        (condition-wait (jolt-future-cv f) (jolt-future-mu f))
-        (loop))))
+  (jolt-cv-wait (jolt-future-mu f) (jolt-future-cv f) #f
+    (lambda (_timed-out?)
+      (if (jolt-future-done? f) #t jolt-cv-again)))
   (jolt-future-finish f))
 
 ;; (deref f timeout-ms timeout-val): wait up to timeout-ms; return timeout-val if
 ;; it has not settled by the absolute deadline.
 (define (jolt-future-deref-timed f ms timeout-val)
-  (let* ((deadline (ms->deadline ms))
-         (settled (jolt-with-mutex (jolt-future-mu f)
-                    (let loop ()
-                      (cond ((jolt-future-done? f) #t)
-                            ((condition-wait (jolt-future-cv f) (jolt-future-mu f) deadline)
-                             (loop))                       ; woken — recheck
-                            (else (jolt-future-done? f))))))) ; timed out: final check
+  (let ((settled (jolt-cv-wait (jolt-future-mu f) (jolt-future-cv f)
+                               (ms->deadline-millis ms)
+                   (lambda (timed-out?)
+                     ;; done? FIRST on both paths: a future that settled as the
+                     ;; deadline passed is not a timeout, which is the re-check the
+                     ;; old (else (jolt-future-done? f)) arm was there for.
+                     (cond ((jolt-future-done? f) #t)
+                           (timed-out? #f)
+                           (else jolt-cv-again))))))
     (if settled (jolt-future-finish f) timeout-val)))
 
 ;; future-cancel: the running thread can't be interrupted, but the future object
@@ -146,7 +157,7 @@
                          #f
                          (begin (jolt-future-cancelled?-set! f #t)
                                 (jolt-future-done?-set! f #t)
-                                (condition-broadcast (jolt-future-cv f))
+                                (jolt-cv-wake! (jolt-future-cv f))
                                 #t)))))
     cancelled))
 
@@ -179,27 +190,24 @@
                        #f
                        (begin (jolt-promise-value-set! p v)
                               (jolt-promise-delivered?-set! p #t)
-                              (condition-broadcast (jolt-promise-cv p))
+                              (jolt-cv-wake! (jolt-promise-cv p))
                               #t)))))
         (if won p jolt-nil))
       (jolt-throw (jolt-ex-info "deliver requires a promise" (jolt-hash-map)))))
 
 (define (jolt-promise-deref p)
-  (jolt-with-mutex (jolt-promise-mu p)
-    (let loop ()
-      (unless (jolt-promise-delivered? p)
-        (condition-wait (jolt-promise-cv p) (jolt-promise-mu p))
-        (loop))))
+  (jolt-cv-wait (jolt-promise-mu p) (jolt-promise-cv p) #f
+    (lambda (_timed-out?)
+      (if (jolt-promise-delivered? p) #t jolt-cv-again)))
   (jolt-promise-value p))
 
 (define (jolt-promise-deref-timed p ms timeout-val)
-  (let* ((deadline (ms->deadline ms))
-         (got (jolt-with-mutex (jolt-promise-mu p)
-                (let loop ()
-                  (cond ((jolt-promise-delivered? p) #t)
-                        ((condition-wait (jolt-promise-cv p) (jolt-promise-mu p) deadline)
-                         (loop))
-                        (else (jolt-promise-delivered? p)))))))
+  (let ((got (jolt-cv-wait (jolt-promise-mu p) (jolt-promise-cv p)
+                           (ms->deadline-millis ms)
+               (lambda (timed-out?)
+                 (cond ((jolt-promise-delivered? p) #t)
+                       (timed-out? #f)
+                       (else jolt-cv-again))))))
     (if got (jolt-promise-value p) timeout-val)))
 
 ;; --- agents (async, per-agent serialized dispatch) --------------------------
@@ -327,7 +335,7 @@
     (let ((act (jolt-with-mutex (jolt-agent-mu a)
                  (if (or (not (jolt-nil? (jolt-agent-err a))) (jagent-q-empty? a))
                      (begin (jolt-agent-running?-set! a #f)
-                            (condition-broadcast (jolt-agent-cv a)) #f)
+                            (jolt-cv-wake! (jolt-agent-cv a)) #f)
                      (jagent-q-pop! a)))))
       (when act
         (parameterize ((*agent-nested* (box '())))
@@ -352,7 +360,7 @@
                   (when (eq? (jolt-agent-err-mode a) 'fail)
                     (jolt-with-mutex (jolt-agent-mu a)
                       (jolt-agent-err-set! a err)
-                      (condition-broadcast (jolt-agent-cv a)))))
+                      (jolt-cv-wake! (jolt-agent-cv a)))))
                 (jolt-release-pending-sends))))   ; success: flush nested sends
         (loop)))))
 
@@ -398,19 +406,20 @@
   (jolt-throw (jolt-host-throwable "java.lang.RuntimeException"
                                    "Agent is failed, needs restart"
                                    (jolt-agent-err a))))
+;; The err check runs on every pass rather than once before the wait and once after
+;; it, which is the same two cases the retake makes one: the agent failed before we
+;; got here, or it failed while we waited (the worker halts and wakes us). Either
+;; way the JVM throws on a failed agent rather than returning normally.
 (define (jolt-agent-await . agents)
   (jolt-agent-await-check)
   (for-each
     (lambda (a)
-      (jolt-with-mutex (jolt-agent-mu a)
-        (unless (jolt-nil? (jolt-agent-err a)) (jolt-agent-failed-throw a))
-        (let loop ()
-          (when (and (jolt-nil? (jolt-agent-err a))
-                     (or (jolt-agent-running? a) (not (jagent-q-empty? a))))
-            (condition-wait (jolt-agent-cv a) (jolt-agent-mu a)) (loop)))
-        ;; the agent failed while we waited (worker halted + broadcast): the JVM
-        ;; throws on a failed agent, so re-check rather than returning normally.
-        (unless (jolt-nil? (jolt-agent-err a)) (jolt-agent-failed-throw a))))
+      (jolt-cv-wait (jolt-agent-mu a) (jolt-agent-cv a) #f
+        (lambda (_timed-out?)
+          (cond
+            ((not (jolt-nil? (jolt-agent-err a))) (jolt-agent-failed-throw a))
+            ((or (jolt-agent-running? a) (not (jagent-q-empty? a))) jolt-cv-again)
+            (else #t)))))
     agents)
   jolt-nil)
 (define (jolt-agent-await-for ms . agents)
@@ -418,26 +427,25 @@
     (jolt-throw (jolt-host-throwable "java.lang.IllegalStateException" "await-for in transaction")))
   (when (jolt-in-agent-action?)
     (jolt-throw (jolt-host-throwable "java.lang.Exception" "Can't await in agent action")))
-  (let ((deadline (ms->deadline ms)) (ok #t))
+  (let ((deadline (ms->deadline-millis ms)) (ok #t))
     (for-each
       (lambda (a)
         (when ok
-          (jolt-with-mutex (jolt-agent-mu a)
-            (unless (jolt-nil? (jolt-agent-err a)) (jolt-agent-failed-throw a))
-            (let loop ()
-              (when (and (jolt-nil? (jolt-agent-err a))
-                         (or (jolt-agent-running? a) (not (jagent-q-empty? a))))
-                (if (condition-wait (jolt-agent-cv a) (jolt-agent-mu a) deadline)
-                    (loop)
-                    ;; re-check the drain predicate on a wakeup-at-deadline race:
-                    ;; a drain that completed as the deadline hit is not a timeout
-                    (when (and (jolt-nil? (jolt-agent-err a))
-                               (or (jolt-agent-running? a) (not (jagent-q-empty? a))))
-                      (set! ok #f)))))
-            ;; failure during the wait throws (JVM parity); only a clean drain or
-            ;; a genuine timeout returns.
-            (unless (or (not ok) (jolt-nil? (jolt-agent-err a)))
-              (jolt-agent-failed-throw a)))))
+          (unless
+            (jolt-cv-wait (jolt-agent-mu a) (jolt-agent-cv a) deadline
+              (lambda (timed-out?)
+                (cond
+                  ;; DRAINED is tested before the deadline on purpose: a drain that
+                  ;; completed as the deadline hit is not a timeout. Failure during
+                  ;; the wait throws here, as it did before (JVM parity).
+                  ((not (or (jolt-agent-running? a) (not (jagent-q-empty? a))))
+                   (if (jolt-nil? (jolt-agent-err a)) #t (jolt-agent-failed-throw a)))
+                  ;; ...and a genuine timeout answers #f without throwing, even for
+                  ;; an agent that failed, which is what the old arm ordering did.
+                  (timed-out? #f)
+                  ((not (jolt-nil? (jolt-agent-err a))) (jolt-agent-failed-throw a))
+                  (else jolt-cv-again))))
+            (set! ok #f))))
       agents)
     ok))
 
@@ -553,7 +561,7 @@
            (jolt-tap-queue-out-set! tapq (cdr (jolt-tap-queue-out tapq)))
            (jolt-tap-queue-len-set! tapq (fx- (jolt-tap-queue-len tapq) 1))
            v))
-        (else (condition-wait (jolt-tap-queue-cv tapq) (jolt-tap-queue-mu tapq)) (loop))))))
+        (else (jolt-condition-wait (jolt-tap-queue-cv tapq) (jolt-tap-queue-mu tapq)) (loop))))))
 
 ;; The delivery thread starts lazily on the first add-tap/tap>, like the JVM's
 ;; `(delay (doto (Thread. …) (.start)))`.
@@ -924,7 +932,7 @@
           (jolt-fiber-state-set! f 'parked)
           jolt-lock-parked)
         (begin
-          (condition-wait (vector-ref m monitor-i-cv) (vector-ref m monitor-i-bk))
+          (jolt-condition-wait (vector-ref m monitor-i-cv) (vector-ref m monitor-i-bk))
           #f))))
 
 ;; The decision is made under bk; a fiber's SWITCH is made outside it, and then the
@@ -1290,7 +1298,7 @@
                 (let ((th (vector-ref st 0))) (when th (jolt-invoke th))))
               (jolt-with-mutex (vector-ref st 2)
                  (vector-set! st 1 #t)
-                 (condition-broadcast (vector-ref st 3)))))
+                 (jolt-cv-wake! (vector-ref st 3)))))
             jolt-nil)))
         (cons "run" (lambda (self) (let ((th (vector-ref (jhost-state self) 0))) (when th (jolt-invoke th))) jolt-nil))
         ;; join() and join(0) wait indefinitely; join(ms) waits at most ms and
@@ -1306,17 +1314,16 @@
             (when (and ms (negative? ms))
               (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
                                                "timeout value is negative")))
-            (jolt-with-mutex (vector-ref st 2)
-              (if (or (not ms) (= ms 0))
-                  (let loop () (when (jthread-alive? st)
-                                 (condition-wait (vector-ref st 3) (vector-ref st 2))
-                                 (loop)))
-                  ;; An absolute deadline, so a spurious wakeup resumes waiting for
-                  ;; what is LEFT of the timeout rather than restarting it.
-                  (let ((deadline (ms->deadline ms)))
-                    (let loop () (when (jthread-alive? st)
-                                   (when (condition-wait (vector-ref st 3) (vector-ref st 2) deadline)
-                                     (loop))))))))
+            ;; An absolute deadline, so a spurious wakeup resumes waiting for what
+            ;; is LEFT of the timeout rather than restarting it. A joining FIBER
+            ;; parks: blocking its carrier would stop every other fiber on it until
+            ;; the thread it joins exits.
+            (jolt-cv-wait (vector-ref st 2) (vector-ref st 3)
+                          (and ms (not (= ms 0)) (ms->deadline-millis ms))
+              (lambda (timed-out?)
+                (cond ((not (jthread-alive? st)) #t)
+                      (timed-out? #f)
+                      (else jolt-cv-again)))))
           jolt-nil))
         (cons "isAlive" (lambda (self) (jthread-alive? (jhost-state self))))
         (cons "interrupt" (lambda (self . _) (set-box! (vector-ref (jhost-state self) 4) #t) jolt-nil))
@@ -1331,7 +1338,7 @@
           (let ((st (jhost-state self)))
             (jolt-with-mutex (vector-ref st 1)
               (when (> (vector-ref st 0) 0) (vector-set! st 0 (- (vector-ref st 0) 1)))
-              (when (= (vector-ref st 0) 0) (condition-broadcast (vector-ref st 2)))))
+              (when (= (vector-ref st 0) 0) (jolt-cv-wake! (vector-ref st 2)))))
           jolt-nil))
         ;; await() waits indefinitely and is void; await(timeout, unit) waits at most
         ;; that long and answers whether the count reached zero. The timeout used to
@@ -1340,20 +1347,16 @@
         (cons "await" (lambda (self . args)
           (let ((st (jhost-state self))
                 (ms (tu-args->ms args)))
-            (jolt-with-mutex (vector-ref st 1)
-              (if (not ms)
-                  (begin
-                    (let loop () (when (> (vector-ref st 0) 0)
-                                   (condition-wait (vector-ref st 2) (vector-ref st 1))
-                                   (loop)))
-                    jolt-nil)
-                  ;; absolute deadline, so a spurious wakeup resumes waiting for what
-                  ;; is left of the timeout rather than restarting it
-                  (let ((deadline (ms->deadline ms)))
-                    (let loop ()
-                      (cond ((<= (vector-ref st 0) 0) #t)
-                            ((condition-wait (vector-ref st 2) (vector-ref st 1) deadline) (loop))
-                            (else (<= (vector-ref st 0) 0))))))))))
+            ;; absolute deadline, so a spurious wakeup resumes waiting for what is
+            ;; left of the timeout rather than restarting it
+            (let ((reached (jolt-cv-wait (vector-ref st 1) (vector-ref st 2)
+                                         (and ms (ms->deadline-millis ms))
+                             (lambda (timed-out?)
+                               (cond ((<= (vector-ref st 0) 0) #t)
+                                     (timed-out? #f)
+                                     (else jolt-cv-again))))))
+              ;; await() is void; await(timeout, unit) answers whether it reached zero
+              (if ms reached jolt-nil)))))
          (cons "getCount" (lambda (self) (vector-ref (jhost-state self) 0)))))
 
 ;; --- java.util.concurrent.ExecutorService / Executors ----------------------
@@ -1370,7 +1373,7 @@
       (jolt-with-mutex (vector-ref st 3)
         (unless (vector-ref st 2) (vector-set! st 1 r))
         (vector-set! st 0 #t)
-        (condition-broadcast (vector-ref st 4))))))
+        (jolt-cv-wake! (vector-ref st 4))))))
 (register-host-methods! "j-future"
   ;; get() waits for the task; get(timeout, unit) gives up at the deadline and throws
   ;; TimeoutException, like the JVM. The timeout used to be discarded, so the bounded
@@ -1378,18 +1381,12 @@
   (list (cons "get" (lambda (self . args)
           (let* ((st (jhost-state self))
                  (ms (tu-args->ms args))
-                 (done (jolt-with-mutex (vector-ref st 3)
-                         (if (not ms)
-                             (begin
-                               (let loop () (unless (vector-ref st 0)
-                                              (condition-wait (vector-ref st 4) (vector-ref st 3))
-                                              (loop)))
-                               #t)
-                             (let ((deadline (ms->deadline ms)))
-                               (let loop ()
-                                 (cond ((vector-ref st 0) #t)
-                                       ((condition-wait (vector-ref st 4) (vector-ref st 3) deadline) (loop))
-                                       (else (vector-ref st 0)))))))))
+                 (done (jolt-cv-wait (vector-ref st 3) (vector-ref st 4)
+                                     (and ms (ms->deadline-millis ms))
+                         (lambda (timed-out?)
+                           (cond ((vector-ref st 0) #t)
+                                 (timed-out? #f)
+                                 (else jolt-cv-again))))))
             (cond ((not done)
                    (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException"
                                                     "timed out waiting for the task")))
@@ -1424,12 +1421,12 @@
                                         (set-car! q (cdr out))
                                         (car out)))
                                      ((vector-ref st 0) #f)   ; shutdown + empty -> exit
-                                     (else (condition-wait (vector-ref st 3) (vector-ref st 2)) (poll))))))))
+                                     (else (jolt-condition-wait (vector-ref st 3) (vector-ref st 2)) (poll))))))))
                 (if job
                     (begin (job) (loop))
                     (jolt-with-mutex (vector-ref st 2)
                       (vector-set! st 4 (fx- (vector-ref st 4) 1))
-                      (condition-broadcast (vector-ref st 3))))))))
+                      (jolt-cv-wake! (vector-ref st 3))))))))
           (spawn (- k 1))))
       self)))
 (define (executor-enqueue! self job)
@@ -1437,7 +1434,7 @@
     (jolt-with-mutex (vector-ref st 2)
       (let ((q (unbox (vector-ref st 1))))
         (set-cdr! q (cons job (cdr q))))
-      (condition-broadcast (vector-ref st 3)))))
+      (jolt-cv-wake! (vector-ref st 3)))))
 (let ((single (lambda _ (make-executor 1)))
       (fixed  (lambda (n . _) (make-executor (max 1 (jnum->exact n)))))
       ;; per-task / cached / virtual: enough workers to not serialize; a generous
@@ -1464,11 +1461,11 @@
                 (jolt-invoke thunk)))))
           jolt-nil))
         (cons "shutdown" (lambda (self) (let ((st (jhost-state self)))
-          (vector-set! st 0 #t) (jolt-with-mutex (vector-ref st 2) (condition-broadcast (vector-ref st 3)))) jolt-nil))
+          (vector-set! st 0 #t) (jolt-with-mutex (vector-ref st 2) (jolt-cv-wake! (vector-ref st 3)))) jolt-nil))
         (cons "shutdownNow" (lambda (self) (let ((st (jhost-state self)))
-          (vector-set! st 0 #t) (jolt-with-mutex (vector-ref st 2) (condition-broadcast (vector-ref st 3)))) (jolt-vector)))
+          (vector-set! st 0 #t) (jolt-with-mutex (vector-ref st 2) (jolt-cv-wake! (vector-ref st 3)))) (jolt-vector)))
         (cons "close" (lambda (self) (let ((st (jhost-state self)))
-          (vector-set! st 0 #t) (jolt-with-mutex (vector-ref st 2) (condition-broadcast (vector-ref st 3)))) jolt-nil))
+          (vector-set! st 0 #t) (jolt-with-mutex (vector-ref st 2) (jolt-cv-wake! (vector-ref st 3)))) jolt-nil))
         (cons "isShutdown" (lambda (self) (vector-ref (jhost-state self) 0)))
         (cons "isTerminated" (lambda (self) (let* ((st (jhost-state self)) (q (unbox (vector-ref st 1))))
           (and (vector-ref st 0) (null? (car q)) (null? (cdr q)) (fx=? 0 (vector-ref st 4))))))
@@ -1478,18 +1475,18 @@
         (cons "awaitTermination" (lambda (self ms . rest)
           (let* ((st (jhost-state self))
                  (deadline (+ (now-millis) (tu->ms ms (if (null? rest) #f (car rest))))))
-            ;; check under the mutex, but SLEEP OUTSIDE it — a worker's exit
-            ;; decrement needs this mutex, so sleeping while holding it starves
-            ;; the very transition awaited (the wait always rode to deadline).
-            (let waiting ()
-              (let ((done (jolt-with-mutex (vector-ref st 2)
-                            (and (vector-ref st 0) (fx=? 0 (vector-ref st 4))))))
-                (cond (done #t)
-                      ((> (now-millis) deadline) #f)
-                      (else
-                       (let ((remaining (- deadline (now-millis))))
-                         (sleep (ms->duration (max 10 (min remaining 100))))
-                         (waiting)))))))))))
+            ;; A WAIT AND NOT A POLL. This used to check under the mutex and sleep
+            ;; outside it in 10-100ms steps, because sleeping while HOLDING the mutex
+            ;; starves the worker exit it waits for. A condition wait releases the
+            ;; mutex atomically with blocking, so it needs neither the poll nor the
+            ;; care: the workers already broadcast this condition as each one exits,
+            ;; and shutdown broadcasts it too. It also stops a fiber calling this from
+            ;; sleeping its carrier in 100ms chunks.
+            (jolt-cv-wait (vector-ref st 2) (vector-ref st 3) deadline
+              (lambda (timed-out?)
+                (cond ((and (vector-ref st 0) (fx=? 0 (vector-ref st 4))) #t)
+                      (timed-out? #f)
+                      (else jolt-cv-again)))))))))
 
 ;; java.util.concurrent.locks.ReentrantLock — a reentrant mutual-exclusion lock.
 ;; State: #(monitor), one MONITOR record of its own (make-monitor above), not the
@@ -1635,11 +1632,12 @@
         (if (not job)
             (jolt-invoke thunk)         ; no pump (or stopped) — inline, like -M:run
             (begin
-              (jolt-with-mutex (jolt-main-job-mu job)
-                (let wait ()
-                  (unless (jolt-main-job-done? job)
-                    (condition-wait (jolt-main-job-cv job) (jolt-main-job-mu job))
-                    (wait))))
+              ;; A fiber parks here: the pump is another thread, but blocking the
+              ;; carrier would stop every other fiber on it for as long as the main
+              ;; thread takes to run the job.
+              (jolt-cv-wait (jolt-main-job-mu job) (jolt-main-job-cv job) #f
+                (lambda (_timed-out?)
+                  (if (jolt-main-job-done? job) #t jolt-cv-again)))
               (if (jolt-main-job-ok? job)
                   (jolt-main-job-val job)
                   (raise (jolt-main-job-val job))))))))
@@ -1722,7 +1720,7 @@
                   (jolt-main-job-ok?-set! job (car r))
                   (jolt-main-job-val-set! job (cdr r))
                   (jolt-main-job-done?-set! job #t)
-                  (condition-broadcast (jolt-main-job-cv job))))
+                  (jolt-cv-wake! (jolt-main-job-cv job))))
               ;; idle: sleep — an interrupt-checked syscall — so a pending ^C fires.
               (sleep (ms->duration jolt-park-poll-ms)))
           (loop))))
@@ -1754,7 +1752,7 @@
                           ;; critical section so no job can be enqueued after.
                           (set-box! jolt-main-pump-active #f)
                           #f)
-                         (else (condition-wait jolt-main-queue-cv jolt-main-queue-mu)
+                         (else (jolt-condition-wait jolt-main-queue-cv jolt-main-queue-mu)
                                (wait)))))))
           (when job
             (let ((r (dynamic-wind
@@ -1767,7 +1765,7 @@
                 (jolt-main-job-ok?-set! job (car r))
                 (jolt-main-job-val-set! job (cdr r))
                 (jolt-main-job-done?-set! job #t)
-                (condition-broadcast (jolt-main-job-cv job))))
+                (jolt-cv-wake! (jolt-main-job-cv job))))
             (loop)))))
     (lambda ()
       (jolt-with-mutex jolt-main-queue-mu (set-box! jolt-main-pump-active #f))))

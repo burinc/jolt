@@ -535,6 +535,23 @@ else
   fails=$((fails + 1))
 fi
 
+# A fiber must never block its carrier (jolt-x1no). Twelve waits — promise and
+# future deref, Thread.join, CountDownLatch.await, a task Future's get,
+# awaitTermination, a piped stream read, agent await — each exercised by two fibers
+# on ONE carrier: a waiter and, behind it in the queue, the releaser that ends the
+# wait. If the waiter blocks instead of parking, the releaser never runs at all, so
+# every case is a hang rather than a stall. Three of them have no releaser and check
+# the other half, that a fiber parked with a DEADLINE is woken at it. Unfixed this
+# reports 12 of 12.
+fb_out="$($jolt run test/chez/fiber-blocking.clj 2>&1)"
+if printf '%s' "$fb_out" | grep -q 'FIBER-BLOCKING OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a fiber blocked its carrier on a condition variable"
+  echo "    $(printf '%s' "$fb_out" | tail -1)"
+  fails=$((fails + 1))
+fi
+
 # The same shape one lock over: a namespace whose load PARKS, required at once by
 # fibers spread across eight carriers and by a thread (jolt-04ee). Here for the same
 # reason as the case above — a regression used to wedge the process, so the cap is
