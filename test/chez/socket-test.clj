@@ -168,6 +168,69 @@
     (.close (.getInputStream conn))
     (check-eq "stream close closes socket" (.isClosed conn) true)))
 
+;; available() is a real byte count, from the same ioctl(FIONREAD) the JVM asks.
+;; It answered 0 always, which java.io permits ("an estimate") but which leaves
+;; (pos? (.available in)) false forever. ioctl is variadic, and binding it
+;; fixed-arity is what made it look unreachable: on Apple arm64 the call returns
+;; SUCCESS with the out-parameter untouched. jolt.ffi's :varargs marker puts the
+;; argument where the callee reads it. The JVM prints [0 14 9 0] for this.
+(with-pair
+  (fn [server client conn]
+    (let [in (.getInputStream conn)
+          msg (.getBytes "hello over tcp" "UTF-8")]
+      (check-eq "available before anything is sent" (.available in) 0)
+      (.write (.getOutputStream client) msg 0 (alength msg))
+      ;; loopback delivery is not instant; wait for it rather than assume it
+      (loop [tries 0]
+        (when (and (zero? (.available in)) (< tries 100))
+          (Thread/sleep 10)
+          (recur (inc tries))))
+      (check-eq "available counts what arrived" (.available in) 14)
+      (.read in (byte-array 5) 0 5)
+      (check-eq "available drops by what was read" (.available in) 9)
+      (.read in (byte-array 64) 0 64)
+      (check-eq "available is 0 once drained" (.available in) 0))))
+
+;; and it is not bounded by any buffer of jolt's — the kernel's whole count,
+;; which is what the JVM answers here too
+(with-pair
+  (fn [server client conn]
+    (let [in (.getInputStream conn)]
+      (.write (.getOutputStream client) (byte-array 20000) 0 20000)
+      (loop [tries 0]
+        (when (and (< (.available in) 20000) (< tries 100))
+          (Thread/sleep 10)
+          (recur (inc tries))))
+      (check-eq "available counts past any buffer" (.available in) 20000))))
+
+;; a peer that closed leaves its bytes readable, and the count with them
+(let [server (java.net.ServerSocket. 0)
+      client (java.net.Socket. "127.0.0.1" (.getLocalPort server))
+      conn   (.accept server)
+      in     (.getInputStream conn)]
+  (.write (.getOutputStream client) (.getBytes "tail" "UTF-8") 0 4)
+  (.close client)
+  (loop [tries 0]
+    (when (and (zero? (.available in)) (< tries 100))
+      (Thread/sleep 10)
+      (recur (inc tries))))
+  (check-eq "available after the peer closed" (.available in) 4)
+  (.read in (byte-array 8) 0 8)
+  (check-eq "available at end of stream" (.available in) 0)
+  (.close conn) (.close server))
+
+;; and a CLOSED socket raises SocketException, as Java's does. Asking the kernel
+;; about a closed fd would be worse than wrong: the number is free to have been
+;; reused by the next socket, so the count would be somebody else's.
+(with-pair
+  (fn [server client conn]
+    (let [in (.getInputStream conn)]
+      (.close conn)
+      (check-eq "available on a closed socket"
+                (try (.available in)
+                     (catch java.io.IOException e [(class e) (.getMessage e)]))
+                [java.net.SocketException "Socket closed"]))))
+
 (if (empty? @failures)
   (println "SOCKET-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))

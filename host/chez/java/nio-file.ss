@@ -272,6 +272,7 @@
         (let ((n (file-length port))) (close-port port) n))))
 
 (define (nio-read-bv fp)
+  (io-note-file-read! fp)          ; a compile-time read belongs in the AOT key (io.ss)
   (let ((port (open-file-input-port fp)))
     (let ((bv (get-bytevector-all port)))
       (close-port port)
@@ -351,7 +352,9 @@
         (cons "deleteIfExists"(lambda (p) (nio-delete1 (nfp p) #t)))
         (cons "readAllBytes"  (lambda (p) (na-bv->bytearray (nio-read-bv (nfp p)))))
         (cons "readAllLines"  (lambda (p . _) (nio-read-lines (nfp p))))
-        (cons "newInputStream"(lambda (p . _) (make-in-stream (open-file-input-port (nfp p)))))
+        (cons "newInputStream"(lambda (p . _) (let ((fp (nfp p)))
+                                                (io-note-file-read! fp)
+                                                (make-in-stream (open-file-input-port fp)))))
         (cons "createTempFile"      (lambda args (nio-files-create-temp args #f)))
         (cons "createTempDirectory" (lambda args (nio-files-create-temp args #t))))))
   (set! files-accum (append files-accum files-statics)))

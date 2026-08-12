@@ -261,7 +261,9 @@
             "java.util.List" "java.util.Set" "java.util.Collection" "java.util.Map"
             "java.util.Iterator" "java.lang.Iterable" "java.lang.CharSequence"
             "java.lang.Appendable" "java.lang.Comparable" "java.lang.Runnable"
-            "java.util.concurrent.Callable" "java.io.Serializable"))
+            "java.util.concurrent.Callable" "java.io.Serializable"
+            "java.lang.AutoCloseable" "java.io.Closeable" "java.io.Flushable"
+            "java.lang.Readable"))
 
 ;; ---- seed the built-in graph: direct supers only, faithful to the JVM ---------
 ;; core clojure.lang interfaces
@@ -396,15 +398,28 @@
 (jch-register-supers! "java.lang.Throwable" '())
 (jch-register-supers! "java.lang.Byte" '("java.lang.Number"))
 (jch-register-supers! "java.lang.Short" '("java.lang.Number"))
-(jch-register-supers! "java.io.InputStream" '())
-(jch-register-supers! "java.io.OutputStream" '())
-(jch-register-supers! "java.io.Reader" '())
-(jch-register-supers! "java.io.Writer" '())
+;; java.lang.AutoCloseable / java.io.Closeable / java.io.Flushable — the
+;; interfaces the stream taxonomy actually implements. with-open and every
+;; (instance? java.io.Closeable x) branch reads them, and a stream that reported
+;; no interface at all answered false to a question the JVM answers true.
+(jch-register-supers! "java.lang.AutoCloseable" '())
+(jch-register-supers! "java.io.Closeable" '("java.lang.AutoCloseable"))
+(jch-register-supers! "java.io.Flushable" '())
+(jch-register-supers! "java.io.InputStream" '("java.io.Closeable"))
+(jch-register-supers! "java.io.OutputStream" '("java.io.Closeable" "java.io.Flushable"))
+(jch-register-supers! "java.io.Reader" '("java.io.Closeable" "java.lang.Readable"))
+(jch-register-supers! "java.lang.Readable" '())
+(jch-register-supers! "java.io.Writer" '("java.io.Closeable" "java.io.Flushable" "java.lang.Appendable"))
 (jch-register-supers! "java.io.File" '())
 (jch-register-supers! "java.io.StringReader" '("java.io.Reader"))
 (jch-register-supers! "java.io.PushbackReader" '("java.io.Reader"))
 (jch-register-supers! "clojure.lang.LineNumberingPushbackReader" '("java.io.PushbackReader"))
 (jch-register-supers! "java.io.PrintWriter" '("java.io.Writer"))
+;; System/out and System/err are PrintStreams — byte streams, not the PrintWriter
+;; *out* is. Ported code branches on that (instance? java.io.PrintStream x) and
+;; hands them to anything taking an OutputStream.
+(jch-register-supers! "java.io.FilterOutputStream" '("java.io.OutputStream"))
+(jch-register-supers! "java.io.PrintStream" '("java.io.FilterOutputStream" "java.lang.Appendable"))
 (jch-register-supers! "java.io.OutputStreamWriter" '("java.io.Writer"))
 (jch-register-supers! "java.io.FileWriter" '("java.io.OutputStreamWriter"))
 (jch-register-supers! "java.io.InputStreamReader" '("java.io.Reader"))
@@ -546,6 +561,11 @@
     ;; io writer/reader shims: *out* is a PrintWriter like the JVM REPL's
     ("port-writer" . "java.io.PrintWriter")
     ("print-writer" . "java.io.PrintWriter")
+    ;; …and System/out is a PrintStream, which is a different class from a
+    ;; different branch of the taxonomy. The shim (io-streams.ss) had no row here,
+    ;; so every PrintStream reported (class x) => :object and answered false to
+    ;; (instance? java.io.OutputStream x).
+    ("print-stream" . "java.io.PrintStream")
     ("file-writer" . "java.io.FileWriter")
     ("writer" . "java.io.StringWriter")
     ("string-reader" . "java.io.StringReader")
@@ -576,6 +596,17 @@
 (define (pushback-reader-tag? t)
   (or (string=? t "pushback-reader")
       (string=? t "line-numbering-pushback-reader")))
+
+;; The jhost text sinks: values that take text through their own .write method —
+;; a StringWriter, a FileWriter, the process port-writers, a PrintWriter, a
+;; PrintStream. spit, io/copy and with-open's close all ask this, and for the same
+;; reason as above: the set grew a fifth tag when System/out became a PrintStream,
+;; and three hand-copied literal lists is how one of them silently stops accepting
+;; a value the other two do ((io/copy in System/out) -> "unsupported output type").
+(define (text-sink-tag? t)
+  (or (string=? t "writer") (string=? t "file-writer")
+      (string=? t "port-writer") (string=? t "print-writer")
+      (string=? t "print-stream")))
 ;; the protocol-dispatch / instance? tag list for a jhost value's tag, or #f.
 (define (jhost-value-tags tag)
   (let ((fqn (hashtable-ref jhost-tag->fqn tag #f)))

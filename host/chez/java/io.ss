@@ -514,7 +514,35 @@
           (if r (car r) (apply %io-host-call method target args)))
         (apply %io-host-call method target args))))
 
+;; --- the files a load READ ---------------------------------------------------
+;; Every file the io layer opens on behalf of USER code announces itself here.
+;;
+;; The AOT cache (loader.ss) binds the sink while it compiles a namespace: a
+;; macro that slurps an external file bakes that file's CONTENTS into the
+;; artifact exactly the way it bakes a macro expansion, so the file belongs in the
+;; cache key. Keying on the .clj alone left an edited SQL migration serving the
+;; previous build's statements out of the cache, silently — the namespace source
+;; is untouched, so its hash still matches (jolt#576).
+;;
+;; A file that does NOT exist is announced too. (io/resource "migrations/003.sql")
+;; answering nil is a compile-time answer like any other, and it stops being the
+;; right one the moment someone adds the file.
+;;
+;; It lives here rather than beside the cache because rt.ss is loaded in contexts
+;; that never load loader.ss (bootstrap, devboot, the .ss unit tests), and the io
+;; layer must not reference a name those don't have. Unbound (#f) in every
+;; ordinary run — the cost off the compile path is one thread-parameter read.
+(define io-file-read-sink (make-thread-parameter #f))
+(define (io-note-file-read! path)
+  (let ((sink (io-file-read-sink)))
+    (when (and (vector? sink) (string? path)
+               (not (member path (vector-ref sink 0))))
+      (vector-set! sink 0 (cons path (vector-ref sink 0))))))
+
 ;; --- slurp / spit / flush ---------------------------------------------------
+;; NOT announced: the loader reads namespace SOURCE through this too, and those
+;; are described by the cache key already. slurp-path / io/resource / io/reader —
+;; the entry points user code reaches — announce for themselves.
 (define (read-file-string path)
   (with-port (open-input-file path)
     (lambda (p) (let ((s (get-string-all p))) (if (eof-object? s) "" s)))))
@@ -589,6 +617,7 @@
 ;; a file by slurping and catching FNF. A raw Chez open-input-file condition is not
 ;; catchable as that class, so the caller's fallback never runs.
 (define (slurp-path path)
+  (io-note-file-read! path)
   (unless (file-exists? path)
     (throw-jvm (quote java.io.FileNotFoundException)
                (string-append path " (No such file or directory)")))
@@ -688,52 +717,8 @@
 ;; str of a jfile is its path (Clojure's File.toString).
 (register-str-render! jfile? jfile-path)
 
-;; stdin line seam: the clojure.core *in* reader (50-io.clj) drives read-line /
-;; read / read+string through __stdin-read-line. Return the next line (newline
-;; stripped) or nil at EOF. Without this, (read-line) and the REPL call nil.
-;;
-;; Waits in `sleep`, NOT inside the read. Chez's blocking read holds the whole
-;; Scheme world while it waits: no other thread runs at all, so a future stopped
-;; ticking and an agent stopped draining the moment the main thread reached a
-;; prompt, and the SIGTERM watcher (concurrency.ss) could not wake to run the
-;; shutdown hooks either. On the JVM those all keep running while a thread sits in
-;; System.in.read(). sleep is collect-safe, so parking THERE and reading only once
-;; the port has something leaves every other thread alive (jolt-p9ua). Backs off
-;; 0.5ms -> 20ms, the shape proc-wait-blocking uses.
-;;
-;; A line already in the buffer costs one char-ready? and no sleep at all, so a
-;; piped read-line loop keeps its throughput: 1326 -> 1386 ns/line, medians of
-;; four 300k-line runs each with the wait compiled out and back in, 1.045x.
-;; Whether the port can answer char-ready? at all is settled ONCE per port rather
-;; than under a guard per line — the guard was most of the cost and took the same
-;; measurement to 1460 ns/line, 1.10x, which is the ceiling rather than a rounding
-;; error. A port that cannot answer reads the old, blocking way.
-;;
-;; char-ready? promises a CHAR, not a whole line, so a writer that sends half a
-;; line and then stalls still parks the world for the remainder — a far smaller
-;; window than "until any input arrives", and the most this port surface offers.
-(define jolt-stdin-poll-step0 1)               ; 1ms
-(define jolt-stdin-poll-step-max 20)          ; 20ms
-(define jolt-stdin-poll-port (box #f))         ; the port the answer below is about
-(define jolt-stdin-poll-ok (box #f))
-(define (jolt-stdin-wait-ready! in)
-  (unless (eq? (unbox jolt-stdin-poll-port) in)
-    (set-box! jolt-stdin-poll-ok (guard (_ (#t #f)) (char-ready? in) #t))
-    (set-box! jolt-stdin-poll-port in))
-  (when (unbox jolt-stdin-poll-ok)
-    (let loop ((step jolt-stdin-poll-step0))
-      (unless (char-ready? in)
-        ;; jolt-pause-ms and not (sleep): on a fiber this parks for the step and
-        ;; gives the carrier up, so (read-line) from a go block no longer stops
-        ;; every other fiber placed on that carrier until input arrives.
-        (jolt-pause-ms step)
-        (loop (min jolt-stdin-poll-step-max (* step 2)))))))
-
-(def-var! "clojure.core" "__stdin-read-line"
-  (lambda ()
-    (let ((in (current-input-port)))
-      (jolt-stdin-wait-ready! in)
-      (let ((l (get-line in))) (if (eof-object? l) jolt-nil l)))))
+;; The stdin line seam (__stdin-read-line, the *in* reader's source) lives in
+;; io-streams.ss, next to the System/in stream it reads.
 
 ;; (type f) -> :jolt/file (the tagged-file :jolt/type). Registered through the
 ;; type-arm registry (natives-meta.ss) so the dispatcher picks it up.
@@ -767,8 +752,8 @@
   (cond
     ((jolt-nil? x) jolt-nil)
     ((and (jhost? x) (or (pushback-reader-tag? (jhost-tag x))
-                         (member (jhost-tag x) '("string-reader" "writer"
-                                                 "file-writer" "port-writer" "print-writer"))))
+                         (text-sink-tag? (jhost-tag x))
+                         (string=? (jhost-tag x) "string-reader")))
      (record-method-dispatch x "close" jolt-nil) jolt-nil)
     ;; a library's stream shim (tagged-table) closes via its registered .close
     ;; method (a no-op for in-memory streams); absent method -> no-op.
@@ -803,12 +788,15 @@
 (define (jolt-io-reader x)
   (cond
     ((reader-jhost? x) x)
-    ((jfile? x) (host-new "StringReader" (read-file-string (jfile-fs x))))
+    ((jfile? x) (io-note-file-read! (jfile-fs x))
+                (host-new "StringReader" (read-file-string (jfile-fs x))))
     ((embedded-res? x)
      (let ((c (embedded-res-content x)))
        (host-new "StringReader" (if (bytevector? c) (utf8->string c) c))))
     ((url-jhost? x) (host-new "StringReader" (url-content x)))
-    ((string? x) (host-new "StringReader" (read-file-string (project-relative x))))
+    ((string? x) (let ((p (project-relative x)))
+                   (io-note-file-read! p)
+                   (host-new "StringReader" (read-file-string p))))
     ((or (cseq? x) (empty-list-t? x) (pvec? x))
      (host-new "StringReader" (seq-source->string x)))
     ;; anything else is not a source, and quietly rendering it would read as empty
@@ -869,15 +857,25 @@
                   rel)))
     (make-url (string-append "file:" (jfile-abs rel)))))
 
+;; Every candidate probed is announced to the AOT cache (io-note-file-read!),
+;; not just the one that answered — including the ones that were not there. Which
+;; root wins is part of the answer, so a file appearing at an EARLIER root has to
+;; invalidate; and a lookup that found nothing at all has to invalidate when the
+;; resource is finally added (a new migration is exactly that). An embedded
+;; resource is baked into the binary and covered by the runtime fingerprint, so it
+;; contributes nothing here.
 (define (jolt-io-resource name)
   (let* ((nm (jolt-str-render-one name))
          (emb (hashtable-ref embedded-resources nm #f)))
     (if emb (make-embedded-res nm emb)
         (let loop ((roots (get-source-roots)))
-          (cond ((null? roots) jolt-nil)
-                ((file-exists? (string-append (car roots) "/" nm))
-                 (resource-file-url (car roots) nm))
-                (else (loop (cdr roots))))))))
+          (if (null? roots)
+              jolt-nil
+              (let ((cand (string-append (car roots) "/" nm)))
+                (io-note-file-read! cand)
+                (if (file-exists? cand)
+                    (resource-file-url (car roots) nm)
+                    (loop (cdr roots)))))))))
 (def-var! "clojure.java.io" "resource" jolt-io-resource)
 ;; as-url honors a library-registered URL class (e.g. jolt-lang/http-client's full
 ;; java.net.URL shim) so io/as-url and (URL. spec) agree; else the file-only jhost.

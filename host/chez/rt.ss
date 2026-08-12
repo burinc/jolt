@@ -69,6 +69,24 @@
                    (sa-load-shared-object #f)
                    (and (sa-foreign-entry? name)
                         (sa-foreign-procedure name args res)))))
+         #'(if (eq? (sa-os-family) 'windows) win unx)))
+      ;; With a calling convention — (__varargs_after n) for a VARIADIC C
+      ;; function like ioctl or fcntl. The convention is what puts the variadic
+      ;; arguments where the callee's va_list reads them: Apple arm64 passes
+      ;; them on the stack, and a fixed-arity binding leaves them in registers,
+      ;; so the call returns SUCCESS having read whatever was on the stack.
+      ;; The Windows branch drops it — x64 passes variadic and named arguments
+      ;; alike there, and the runtime (eval) construction has no slot for one.
+      ((_ conv name (quote args) (quote res))
+       (with-syntax
+           ((win #'(guard (e (#t #f))
+                   (sa-load-shared-object #f)
+                   (and (sa-foreign-entry? name)
+                        (sa-foreign-procedure-runtime name (quote args) (quote res) #f))))
+            (unx #'(guard (e (#t #f))
+                   (sa-load-shared-object #f)
+                   (and (sa-foreign-entry? name)
+                        (sa-foreign-procedure conv name args res)))))
          #'(if (eq? (sa-os-family) 'windows) win unx))))))
 
 ;; Same, for an entry point that BLOCKS (a pipe read, sigwait). The call must be

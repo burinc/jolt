@@ -59,7 +59,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
   gateboot gatebootsmoke gosm httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  narrow numeric numwp oparity pic protoret printperf remint sci selfhost shakelocal \
+  narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
   threadsafety values wp ci
@@ -122,6 +122,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
   fnform traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck lockcheck parkcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
+  systemstreams \
   certify gambitcheck gambitgencheck grenadinecheck fibers gosm asynctimer threadsafety
 TEST-GATES := submodules selfhost ci
 
@@ -832,6 +833,12 @@ devbootsmoke: devboot
 aotcachesmoke: testbin
 	@sh test/chez/aot-cache-smoke.sh
 
+# System/in, System/out, System/err: the process streams and the classes the JVM
+# reports for them. Needs a real pipe on stdin, so it is a script rather than a
+# corpus row.
+systemstreams:
+	@sh test/chez/system-streams-smoke.sh
+
 # Smoke test: clojure.core/compile writes artifacts under *compile-path* and a
 # later PROCESS loads them — including with the source removed, which is the point
 # of compiling. Needs the built binary; each phase is its own jolt run.
@@ -865,3 +872,10 @@ aotcacheperf:
 # on loaded CI. See the header of the script for how to read the numbers.
 printperf:
 	@$(CHEZ) --script test/chez/print-throughput.ss
+
+# StringBuilder.append must stay amortised O(1). Asserts a SCALING RATIO rather
+# than a wall-clock floor — 4x the appends should cost ~4x, not ~16x — so unlike
+# the probes above it is meaningful on a loaded machine. Still manual, to keep
+# the default gate free of timing. See the script header.
+sbperf:
+	@$(CHEZ) --script test/chez/string-builder-perf.ss

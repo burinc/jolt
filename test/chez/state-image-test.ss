@@ -27,7 +27,12 @@
       (set! fails (+ fails 1))
       (printf "FAIL: ~a\n  expected: ~a\n  actual:   ~a\n" name expect got))))
 
-(define tmp (string-append "/tmp/jolt-image-test-" (number->string (fx+ 1 (random 100000))) ".jimg"))
+;; Keyed by PID, the way aot-fingerprint-test.ss does it. (random 100000) is not
+;; random across PROCESSES — Chez seeds its generator the same way every start,
+;; so every run of this file picked the identical name and two concurrent runs
+;; deleted each other's image ("image: no such file", from whichever lost).
+(define tmp (string-append "/tmp/jolt-image-test-" (number->string (get-process-id)) ".jimg"))
+(define refstub-tmp (string-append "/tmp/jolt-image-refstub-" (number->string (get-process-id)) ".txt"))
 (define (cleanup!) (when (file-exists? tmp) (delete-file tmp)))
 
 ;; --- Chez substrate the format depends on ------------------------------------
@@ -824,7 +829,7 @@
 ;; a stub inside a REF's val resolves through the in-place substitution walk
 ;; (the walk previously passed refs through untouched — resolved stubs never
 ;; landed inside a ref)
-(let ((sp (open-file-output-port "/tmp/jolt-image-refstub.txt" (file-options no-fail))))
+(let ((sp (open-file-output-port refstub-tmp (file-options no-fail))))
   (jolt-compile-eval "(def holder nil)" "r11.world")
   (let ((cell (jolt-var "r11.world" "holder")))
     (var-cell-root-set! cell (jolt-ref-new sp)))
@@ -841,7 +846,7 @@
                  (equal? "PORT-AGAIN"
                          (jolt-ref-val (var-cell-root (jolt-var "r11.world" "holder")))))))))
   (close-port sp)
-  (delete-file "/tmp/jolt-image-refstub.txt"))
+  (delete-file refstub-tmp))
 
 ;; resolver pre-registered: the stub never materializes
 ;; kind strings match the STUBBED OBJECT's class (a port's, here), so a

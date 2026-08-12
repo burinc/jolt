@@ -353,15 +353,6 @@
    :jvm "returns a MemoryMXBean reporting heap/non-heap usage, GC counts, and more"
    :jolt "absent; the call raises \"No matching method getMemoryMXBean\""
    :note "Runtime.totalMemory/freeMemory/maxMemory ARE present over Chez's collector accounting. What is missing is JMX itself. Affects criterium's benchmark reporting, not its timing."}
-  ;; jolt.socket (stdlib, require-gated): java.net.Socket over POSIX fds. The
-  ;; stream's available() would need ioctl(FIONREAD), and ioctl is variadic —
-  ;; variadic C calls through the FFI are unsafe on arm64 — so it answers 0.
-  ;; InputStream.available()=0 is a legal Java answer callers must handle anyway.
-  {:category :host-model
-   :behavior "(.available (.getInputStream socket)) — requires (require 'jolt.socket)"
-   :jvm "the number of bytes readable without blocking"
-   :jolt "always 0"
-   :note "FIONREAD needs ioctl, which is variadic and so FFI-unsafe on arm64. Loop-on-read code is unaffected; code that polls available() to avoid blocking will block."}
   ;; A recv error reads as EOF: errno is not reachable through the FFI, so
   ;; ECONNRESET (Java: SocketException) cannot be told from EINTR (Java: retry).
   {:category :host-model
@@ -410,6 +401,24 @@
    :jvm "blocks forever (the failed agent never runs the latch action)"
    :jolt "throws RuntimeException \"Agent is failed, needs restart\""
    :note "await entered on an ALREADY-failed agent throws identically on both. jolt returning normally (pre-R4) was the silent-success worst case."}
+  ;; *in* is a Reader over System/in on both, but the JVM's InputStreamReader
+  ;; decodes into 8K of its own, so the first (read-line) pulls the whole of a
+  ;; small stdin into the reader and the stream underneath reads as exhausted.
+  ;; jolt reads exactly the line it returns, so the two agree on where the input
+  ;; is up to. Pinned by test/chez/system-streams-smoke.sh (m1-m4).
+  {:category :host-model
+   :behavior "(.read System/in) after a (read-line)"
+   :jvm "-1 — the reader on top of System.in has already buffered the rest"
+   :jolt "the next byte of the input"
+   :note "A superset: mixing the two loses input on the JVM. jolt's only buffer for standard input is the one port on fd 0, which is the layer the JVM's BufferedInputStream is; what it does not add is the reader's second buffer."}
+  ;; RT.in is built over whatever System.in was at class-init, so the JVM's
+  ;; read-line cannot be redirected after startup. jolt reads the static every
+  ;; line, which is what makes a test fixture's setIn work.
+  {:category :host-model
+   :behavior "(System/setIn s) followed by (read-line)"
+   :jvm "reads the ORIGINAL stdin — *in* was bound over System.in at RT class-init"
+   :jolt "reads s"
+   :note "A superset: on the JVM with-in-str is the only way to feed read-line. Reading the static per line costs one vector-ref."}
   ;; InetSocketAddress.toString is host:port; the JVM renders hostname/ip:port.
   {:category :host-model
    :behavior "(str (java.net.InetSocketAddress. \"127.0.0.1\" 80)) — requires (require 'jolt.socket)"
