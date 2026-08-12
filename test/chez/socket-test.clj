@@ -168,6 +168,67 @@
     (.close (.getInputStream conn))
     (check-eq "stream close closes socket" (.isClosed conn) true)))
 
+;; available() is a real byte count. It answered 0 always, which java.io permits
+;; ("an estimate") but which leaves (pos? (.available in)) false forever. The
+;; JVM asks ioctl(FIONREAD); ioctl is variadic and an FFI cannot express that, so
+;; this peeks with MSG_PEEK instead — same answer, consumes nothing, and never
+;; waits because every fd here is O_NONBLOCK. The JVM prints [0 14 9 0] for this.
+(with-pair
+  (fn [server client conn]
+    (let [in (.getInputStream conn)
+          msg (.getBytes "hello over tcp" "UTF-8")]
+      (check-eq "available before anything is sent" (.available in) 0)
+      (.write (.getOutputStream client) msg 0 (alength msg))
+      ;; loopback delivery is not instant; wait for it rather than assume it
+      (loop [tries 0]
+        (when (and (zero? (.available in)) (< tries 100))
+          (Thread/sleep 10)
+          (recur (inc tries))))
+      (check-eq "available counts what arrived" (.available in) 14)
+      (.read in (byte-array 5) 0 5)
+      (check-eq "available drops by what was read" (.available in) 9)
+      (.read in (byte-array 64) 0 64)
+      (check-eq "available is 0 once drained" (.available in) 0))))
+
+;; the peek window caps the answer — 4096, the same bound the byte streams over
+;; Chez ports report. The JVM says 20000 here (known-divergences).
+(with-pair
+  (fn [server client conn]
+    (let [in (.getInputStream conn)]
+      (.write (.getOutputStream client) (byte-array 20000) 0 20000)
+      (loop [tries 0]
+        (when (and (< (.available in) 4096) (< tries 100))
+          (Thread/sleep 10)
+          (recur (inc tries))))
+      (check-eq "available caps at the peek window" (.available in) 4096))))
+
+;; a peer that closed leaves its bytes readable, and the count with them
+(let [server (java.net.ServerSocket. 0)
+      client (java.net.Socket. "127.0.0.1" (.getLocalPort server))
+      conn   (.accept server)
+      in     (.getInputStream conn)]
+  (.write (.getOutputStream client) (.getBytes "tail" "UTF-8") 0 4)
+  (.close client)
+  (loop [tries 0]
+    (when (and (zero? (.available in)) (< tries 100))
+      (Thread/sleep 10)
+      (recur (inc tries))))
+  (check-eq "available after the peer closed" (.available in) 4)
+  (.read in (byte-array 8) 0 8)
+  (check-eq "available at end of stream" (.available in) 0)
+  (.close conn) (.close server))
+
+;; and a CLOSED socket raises, as Java's SocketException does. Peeking a closed
+;; fd would be worse than wrong: the number is free to be reused by the next
+;; socket, so the count would be somebody else's.
+(with-pair
+  (fn [server client conn]
+    (let [in (.getInputStream conn)]
+      (.close conn)
+      (check-eq "available on a closed socket"
+                (try (.available in) (catch java.io.IOException e (.getMessage e)))
+                "Socket closed"))))
+
 (if (empty? @failures)
   (println "SOCKET-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))

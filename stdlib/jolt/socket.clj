@@ -8,9 +8,9 @@
   InetAddress and the socket stream classes with the host class registry.
 
   Deliberate divergences from the JVM (test/conformance/known-divergences.edn):
-  .available answers 0, a recv error reads as EOF (-1) rather than throwing,
-  .connect ignores its timeout argument (always blocking), and toString
-  formats are approximate. IPv4 only."
+  .available is capped by its peek window, a recv error reads as EOF (-1)
+  rather than throwing, .connect ignores its timeout argument (always
+  blocking), and toString formats are approximate. IPv4 only."
   (:require [jolt.ffi :as ffi]
             [jolt.io-poller :as poller]
             [clojure.string :as str]))
@@ -43,6 +43,7 @@
 (def ^:private so-reuse     (if macos? 4 2))
 (def ^:private so-nosigpipe 0x1022)
 (def ^:private msg-nosignal (if macos? 0 0x4000))
+(def ^:private msg-peek 2)
 
 ;; -- sockaddr helpers ---------------------------------------------------------
 
@@ -279,6 +280,45 @@
       {:n n :bytes (ffi/read-array buf n)}
       {:n -1 :bytes nil})))
 
+;; InputStream.available. The JVM asks the kernel through ioctl(FIONREAD), which
+;; is out of reach: ioctl is variadic, and on Apple's arm64 ABI a variadic
+;; argument travels on the stack where the FFI puts it in a register — the call
+;; then RETURNS SUCCESS with the out-parameter untouched, which is a wrong count
+;; that looks like a right one. (It happens to work on Linux aarch64, where
+;; variadic and named arguments are passed alike. One platform's silent lie is
+;; enough to keep the whole approach out.)
+;;
+;; MSG_PEEK reports what has arrived and consumes none of it, and it is correct
+;; on both. Never waits: every fd here is O_NONBLOCK (guard-fd!), so a peek with
+;; nothing there is EAGAIN, and this deliberately bypasses io-call, whose whole
+;; job is to wait for readiness.
+;;
+;; The answer is capped by the window — java.io documents available as an
+;; estimate, and this is the same bound the byte streams over Chez ports report
+;; (their port buffer). It under-promises, which is the safe direction for a
+;; caller sizing a read.
+(def ^:private peek-window 4096)
+
+(defn- socket-available [self]
+  ;; Closed is an error on both, and here it is a KNOWN one — the socket carries
+  ;; the flag — so it raises rather than answering, where a recv error can only
+  ;; read as EOF. Java raises SocketException, a subclass of this, so ported code
+  ;; catching java.io.IOException sees it on either. Peeking is also not an
+  ;; option once the fd is closed: the number is free to be reused by the next
+  ;; socket, and the count would be somebody else's.
+  (when (jolt.host/ref-get (jolt.host/ref-get self :socket) :closed?)
+    (throw (java.io.IOException. "Socket closed")))
+  (let [fd (jolt.host/ref-get self :fd)
+        buf (ffi/alloc peek-window)]
+    (try
+      (loop []
+        (let [n (c-recv fd buf peek-window msg-peek)]
+          (cond
+            (pos? n) n
+            (and (neg? n) (poller/eintr?)) (recur)
+            :else 0)))
+      (finally (ffi/free buf)))))
+
 (def ^:private socket-input-stream-methods
   {"read"
    (fn
@@ -304,7 +344,7 @@
                 (let [{:keys [n bytes]} (do-recv fd buf len)]
                   (if (pos? n) (do (dotimes [i n] (aset b (+ off i) (nth bytes i))) n) -1))
                 (finally (ffi/free buf))))))))
-   "available" (fn [self] 0)
+   "available" (fn [self] (socket-available self))
    "close"     (fn [self] (socket-close! (jolt.host/ref-get self :socket)))})
 
 ;; -- SocketOutputStream ------------------------------------------------------

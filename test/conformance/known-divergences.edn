@@ -354,14 +354,19 @@
    :jolt "absent; the call raises \"No matching method getMemoryMXBean\""
    :note "Runtime.totalMemory/freeMemory/maxMemory ARE present over Chez's collector accounting. What is missing is JMX itself. Affects criterium's benchmark reporting, not its timing."}
   ;; jolt.socket (stdlib, require-gated): java.net.Socket over POSIX fds. The
-  ;; stream's available() would need ioctl(FIONREAD), and ioctl is variadic —
-  ;; variadic C calls through the FFI are unsafe on arm64 — so it answers 0.
-  ;; InputStream.available()=0 is a legal Java answer callers must handle anyway.
+  ;; count comes from a non-consuming MSG_PEEK rather than the JVM's
+  ;; ioctl(FIONREAD): ioctl is variadic, and on Apple's arm64 ABI a variadic
+  ;; argument travels on the stack where an FFI puts it in a register, so the
+  ;; call returns SUCCESS with the out-parameter untouched. Measured both ways —
+  ;; correct on Linux aarch64, silently wrong on Darwin arm64, and one platform
+  ;; answering a wrong count that looks right is enough to keep it out. What the
+  ;; peek costs is a bound: the same 4096 the byte streams over Chez ports report.
+  ;; Pinned by test/chez/socket-test.clj.
   {:category :host-model
-   :behavior "(.available (.getInputStream socket)) — requires (require 'jolt.socket)"
-   :jvm "the number of bytes readable without blocking"
-   :jolt "always 0"
-   :note "FIONREAD needs ioctl, which is variadic and so FFI-unsafe on arm64. Loop-on-read code is unaffected; code that polls available() to avoid blocking will block."}
+   :behavior "(.available (.getInputStream socket)) with more than 4096 bytes queued — requires (require 'jolt.socket)"
+   :jvm "the whole queued count"
+   :jolt "4096 — the peek window"
+   :note "Both are legal estimates (java.io documents available as one) and jolt's under-promises, which is the safe direction for a caller sizing a read. Under the window the two agree exactly, including across a peer's close; a closed socket raises on both."}
   ;; A recv error reads as EOF: errno is not reachable through the FFI, so
   ;; ECONNRESET (Java: SocketException) cannot be told from EINTR (Java: retry).
   {:category :host-model
