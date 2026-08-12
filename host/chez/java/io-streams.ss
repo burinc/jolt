@@ -71,6 +71,15 @@
 ;; longer there for a descriptor handed to a subprocess.
 (define (port-buffered port)
   (fx- (port-input-size port) (port-input-index port)))
+;; What is left of a seekable source, or #f when it is not one. The two
+;; predicates are not a promise: a port over a SOCKET descriptor answers #t to
+;; both and then raises ESPIPE ("illegal seek") from port-position, so this asks
+;; by trying rather than by asking.
+(define (port-remaining port)
+  (guard (_ (#t #f))
+    (and (port-has-port-length? port)
+         (port-has-port-position? port)
+         (max 0 (- (port-length port) (port-position port))))))
 (define (in-stream-available self)
   (let ((port (in-stream-live-port self))
         (p (piped-pipe self)))
@@ -78,8 +87,7 @@
       ;; a piped stream holds its bytes in two places: what the writer has queued
       ;; and what an earlier read already pulled into the port's buffer
       (p (+ (port-buffered port) (pipe-available p)))
-      ((and (port-has-port-length? port) (port-has-port-position? port))
-       (max 0 (- (port-length port) (port-position port))))
+      ((port-remaining port) => values)
       ((fx>? (port-buffered port) 0) (port-buffered port))
       ((guard (_ (#t #f)) (input-port-ready? port))
        (lookahead-u8 port)
