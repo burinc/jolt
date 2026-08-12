@@ -112,8 +112,14 @@ and a protocol extended to a class a library declared.
   itself runs its workload on a spawned thread while the main thread watches a
   deadline, so a wedge exits 1 naming the round and phase it stopped in. Its old
   claim that an `alts!!` timeout bounded every read was not a bound at all, since
-  the bound depended on the same machinery the case exists to stress, which the
-  timer fix above is a candidate explanation for. (jolt-8tma)
+  the bound depended on the same machinery the case exists to stress. (jolt-8tma)
+
+  What made that run wedge is now known, and it is not the timer above: a monitor
+  contended by a real thread and by fibers at the same time can deadlock the whole
+  process, because `monitor-wait!` parks a fiber inside the critical section that
+  guards the monitor's own book-keeping. Filed as jolt-dfuo with a twenty-line
+  repro that needs no sockets. The watchdog added here cannot report that one,
+  since it takes every thread including the watchdog.
 
 - **`make certify` names the rows it could not finish**, rather than counting
   them, and staleness now ignores rows the JVM oracle had no opinion on, so a
