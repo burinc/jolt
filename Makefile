@@ -56,6 +56,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
+  readscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
   gateboot gatebootsmoke gosm httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
@@ -115,7 +116,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit grenadine mvnhttp depssmoke depsunit \
+CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling depssmoke depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi \
   transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
@@ -361,6 +362,15 @@ libconformance: testbin
 # network, no OpenSSL — runs in the default gate.
 mvnhttp:
 	@bin/jolt run test/mvn_http_test.clj
+
+# Reading a source file form by form off a java.io reader must cost time LINEAR
+# in the source. It was quadratic until v0.7.7 (37s to read clojure/core.clj,
+# against the JVM's 0.06s) and nothing caught it, because the corpus rows about
+# reading are all about the VALUES a read produces. Asserts the 1x-vs-4x ratio
+# measured inside ONE process, so it judges the shape and not the machine.
+# Takes the built binary: script mode would measure the same ratio far slower.
+readscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/read_scaling_test.clj
 
 # deps.edn alias + CLI semantics (tools.deps args-map keys, -X/-T/-Sdeps, the
 # user deps.edn chain, jar/git coordinates) through the real CLI, over local
