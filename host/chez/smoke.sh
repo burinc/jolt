@@ -1218,5 +1218,14 @@ check '(let [u (str (random-uuid))] [(count u) (nth u 14) (contains? #{\8 \9 \a 
 # than asserting the wrong thing.
 check '(do (require (quote jolt.nrepl)) (if jolt.nrepl/windows? :close-on-exec (let [fd (jolt.nrepl/listen-socket 0) flags (jolt.nrepl/c-fcntl fd 1 0)] (jolt.nrepl/c-close fd) (if (pos? (bit-and flags 1)) :close-on-exec :inheritable))))' ':close-on-exec'
 
+# jolt.ffi/load-library's per-OS map form — documented since the FFI docs
+# existed, implemented only in 0.7.10 (it rendered the map to a string and
+# dlopen'd garbage). The spec map names a library present on both gate
+# platforms (libsqlite3 ships with macOS and the Ubuntu runners); a map with
+# no entry for the running platform must raise naming the missing key, not
+# silently load nothing.
+check '(do (require (quote jolt.ffi)) (jolt.ffi/load-library {:darwin "libsqlite3.0.dylib" :linux "libsqlite3.so.0" :windows "winsqlite3.dll"}) :map-form-ok)' ':map-form-ok'
+check '(do (require (quote jolt.ffi)) (try (jolt.ffi/load-library {:no-such-os "x.so"}) :no-raise (catch Exception e (if (clojure.string/includes? (ex-message e) "entry in the per-OS spec") :named-raise :wrong-message))))' ':named-raise'
+
 echo "cli smoke: $pass passed, $fails failed"
 [ "$fails" -eq 0 ]
