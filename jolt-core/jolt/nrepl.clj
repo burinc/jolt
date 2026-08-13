@@ -69,7 +69,7 @@
     ;; fixed/variadic boundary; a fixed-arity binding silently corrupts the
     ;; stack-passed argument on Apple arm64. POSIX only — Windows controls
     ;; inheritance with HANDLE_FLAG_INHERIT, not FD_CLOEXEC.
-    (ffi/defcfn c-fcntl-set "fcntl" [:int :int :varargs :int] :int)))
+    (ffi/defcfn c-fcntl     "fcntl" [:int :int :varargs :int] :int)))
 
 (def ^:private AF-INET 2)
 (def ^:private SOCK-STREAM 1)
@@ -116,7 +116,7 @@
   F_SETFD is 2 and FD_CLOEXEC is 1 on both macOS and Linux."
   [fd]
   (when-not windows?
-    (try (c-fcntl-set fd 2 1) (catch Throwable _ nil)))
+    (try (c-fcntl fd 2 1) (catch Throwable _ nil)))
   fd)
 
 (defn- listen-socket [port]
