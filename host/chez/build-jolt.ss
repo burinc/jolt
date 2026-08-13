@@ -366,22 +366,6 @@
       ldr-install-roots)
     (reverse out)))
 
-;; Emit one ns's own forms to its .scm under the build dir. The emit machinery
-;; captures the ns in isolation under its own ei-fresh-unit!, so the fasl holds
-;; ONLY that ns's forms (loader.ss:~432 nested-load bug discipline).
-(define (jb-emit-stdlib-scm! name abs scm)
-  (let ((src (ldr-read-source abs)) (outp (open-output-file scm 'replace)))
-    (put-string outp (string-append "\n;; --- AOT stdlib " name " ---\n"))
-    (parameterize ((rdr-source-file abs))
-      (put-string outp "(jolt-ns-load-vars-push!)\n")
-      (for-each (lambda (s) (put-string outp s) (put-string outp "\n"))
-                (bld-ns-prelude name src))
-      (for-each (lambda (s) (put-string outp s) (put-string outp "\n"))
-                (bld-emit-ns name src))
-      (put-string outp "(jolt-ns-load-vars-pop!)\n"))
-    (put-string outp (string-append "(ldr-mark-loaded! " (ei-str-lit name) ")\n"))
-    (close-port outp)))
-
 ;; ONE batch compile of every emitted stdlib .scm, in a FRESH Chez that has the
 ;; SAME runtime preamble loaded as build-jolt's own header. The emitted Scheme
 ;; references runtime MACROS — jolt-n-, jolt-n+, jolt-n*, jolt-n-div, jolt-n-min
@@ -437,31 +421,51 @@
       (close-port p))
     (bld-system (string-append bld-chez " --script '" cs "'"))))
 
-;; Emit the per-ns Scheme with the same dynamic-wind profile as jb-emit-cli-ns.
-(define (jb-emit-stdlib-ns! name abs scm)
-  (dynamic-wind
-    (lambda ()
-      (ei-fresh-unit!)
-      ((var-deref "jolt.backend-scheme" "set-prelude-mode!") #t)
-      (set-optimize! #t) (set-release! #t)
-      ((var-deref "jolt.backend-scheme" "set-var-cache!") #t))
-    (lambda () (jb-emit-stdlib-scm! name abs scm))
-    (lambda ()
-      (set-optimize! #f) (set-release! #f)
-      ((var-deref "jolt.backend-scheme" "set-var-cache!") #f)
-      (ei-clear-cached!))))
+;; Capture one ns's emitted Scheme to its .scm. aot-capture-load evaluates the
+;; FILE through the normal load loop while teeing the per-form Scheme — the SAME
+;; path the on-disk AOT cache (aot-compile-and-cache) and clojure.core/compile
+;; (cpath-compile-load) use — so the captured string INCLUDES the ns form's
+;; requires. bld-emit-ns (whole-program APP emission) drops requires, since in an
+;; app image every dep is already present; an on-demand fasl is different —
+;; requiring jolt.fs loads its fasl but babashka.fs never arrives, leaving every
+;; proxied var unbound. aot-capture-load evals the file directly (re-evaluation
+;; at build time is fine; defonce guards hold), tees ONLY this file's forms
+;; (loader.ss:438 nested-capture discipline keeps a nested require out of this
+;; capture), and runs under the process's own compile settings — no
+;; prelude-mode/optimize/release/var-cache dynamic-wind, matching what the
+;; binary's own cache-miss path would produce at runtime. A capture returning a
+;; non-string or empty string is a BUILD FAILURE (reported), not a skip —
+;; matching cpath-compile-load's guard. A load EXCEPTION is a skip.
+(define (jb-capture-stdlib-scm! name abs scm)
+  (let ((captured-or-skip
+          (guard (e (else
+                      (let ((msg (guard (_ (#t "(unprintable)"))
+                                  (let ((m ((var-deref "jolt.host" "condition-message") e)))
+                                    (and (string? m) m)))))
+                        (display (string-append "build-jolt: stdlib-fasl FAILED " name ": " msg "\n")
+                                 (current-error-port))
+                        (cons 'skip (string-append "load failed: " msg)))))
+            (cons 'ok (aot-capture-load abs (ldr-read-source abs))))))
+    (cond
+      ((eq? (car captured-or-skip) 'skip) (cons 'skip (cdr captured-or-skip)))
+      ((or (not (string? (cdr captured-or-skip)))
+           (fx=? (string-length (cdr captured-or-skip)) 0))
+       ;; empty capture for a real ns is a build failure — escapes this function
+       ;; (no guard here) so it aborts the build rather than silently skipping.
+       (error 'build-jolt
+         (string-append "stdlib-fasl capture produced no code for " name)))
+      (else
+       (let ((outp (open-output-file scm 'replace)))
+         (put-string outp (cdr captured-or-skip))
+         (close-port outp))
+       'ok))))
 
-;; Load+emit+compile every candidate ns to its own fasl. Returns two values: the
-;; list of (name . fasl-path) that compiled OK (in load order), and the list of
-;; (name . reason) that were skipped. A ns that fails to LOAD standalone (needs an
-;; optional library, or its top level wedges the build) is skipped with a reason,
-;; NOT silently dropped — it lands in the manifest. A ns that LOADS but fails to
-;; EMIT (bld-emit-ns is strict) is a build failure, same as an app build.
+;; Capture (aot-capture-load) every candidate ns to its own fasl, then ONE batch
+;; compile. Returns two values: (name . so) that captured OK (in load order) and
+;; (name . reason) that were skipped. A manifest-declared skip is never
+;; load-attempted. A load exception is a skip with a reason; an empty capture is
+;; a build failure (see jb-capture-stdlib-scm!).
 (define (jb-compile-stdlib-fasls!)
-  ;; Manifest-declared skips are EXCLUDED from the batch compile: a skip whose
-  ;; emitted .scm Chez rejects (jolt.io-poller, whose foreign-procedure form
-  ;; renders an empty () arg list) would otherwise kill the single batch
-  ;; bld-system. Their verified reason is carried straight through.
   (define-values (man-embed man-skips) (jb-read-stdlib-manifest))
   (bld-system (string-append "mkdir -p '" jb-stdlib-dir "'"))
   (let ((order '()) (to-compile '()) (skips (reverse man-skips)))
@@ -474,25 +478,20 @@
                  (so (string-append jb-stdlib-dir "/" san ".so")))
             (if (assoc name skips)
                 ;; manifest-declared skip — already in skips with its verified
-                ;; reason; do not load-attempt (a load failure here would
-                ;; duplicate the ns in skips and never reach the batch compile).
-                ;; jb-emit-stdlib-fasls! prints all skips once at the end.
+                ;; reason; do not load-attempt. jb-emit-stdlib-fasls! prints
+                ;; all skips once at the end.
                 (if #f #f)
-                (guard (e (else
-                            (let ((msg (guard (_ (#t "(unprintable)"))
-                                        (let ((m ((var-deref "jolt.host" "condition-message") e)))
-                                          (and (string? m) m)))))
-                              (display (string-append "build-jolt: stdlib-fasl FAILED " name ": " msg "\n")
-                                       (current-error-port))
-                              (set! skips (cons (cons name (string-append "load failed: " msg)) skips)))))
-                  (load-namespace name)
-                  (jb-emit-stdlib-ns! name abs scm)
-                  (set! order (cons (cons name so) order))
-                  (set! to-compile (cons (cons scm so) to-compile))))))
+                (let ((r (jb-capture-stdlib-scm! name abs scm)))
+                  (cond
+                    ((eq? r 'ok)
+                     (set! order (cons (cons name so) order))
+                     (set! to-compile (cons (cons scm so) to-compile)))
+                    ((pair? r)
+                     (set! skips (cons (cons name (cdr r)) skips))))))))
         (jb-stdlib-candidates))
       (set-ns-loaded-hook! (lambda (name file) #f)))
     ;; ONE batch compile with the runtime preamble loaded (see jb-compile-stdlib-sos!).
-    ;; A failure here is a BUILD FAILURE — emitted Scheme must compile once the
+    ;; A failure here is a BUILD FAILURE — captured Scheme must compile once the
     ;; macro environment is present.
     (jb-compile-stdlib-sos! (reverse to-compile))
     (values (reverse order) (reverse skips))))

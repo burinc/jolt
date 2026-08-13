@@ -85,6 +85,29 @@ else
   echo "FAIL: (e) manifest does not list clojure.test"; fails=$((fails+1))
 fi
 
+# (f) a dep NOT in the eager CLI image arrives via its OWN fasl, not source.
+# jolt.fs proxies babashka.fs; nothing in the CLI image requires either, so if
+# the fasl dropped the ns form's require (the bld-emit-ns regression this gates),
+# babashka.fs never loads and every proxied var is unbound. This slipped past
+# (a)-(d) because clojure.test/jolt.time deps happen to sit in the image.
+debug_f="$(JOLT_DEBUG=1 "$jolt" -e "(require '[jolt.fs :as fs])" 2>&1)"
+out_f="$("$jolt" -e '(require (quote [jolt.fs :as fs])) (println "SMOKE_FS" (str (fs/absolute? "/x")))' 2>&1)"
+if printf '%s\n' "$debug_f" | grep -q '\[jolt.aot\] embedded jolt.fs' \
+   && printf '%s\n' "$debug_f" | grep -q '\[jolt.aot\] embedded babashka.fs'; then
+  echo "PASS: (f1) JOLT_DEBUG shows both embedded jolt.fs and babashka.fs"; pass=$((pass+1))
+else
+  echo "FAIL: (f1) dep did not arrive via its own fasl"
+  printf '%s\n' "$debug_f" | grep '\[jolt.aot\]' | head
+  fails=$((fails+1))
+fi
+if printf '%s' "$out_f" | grep -q 'SMOKE_FS true'; then
+  echo "PASS: (f2) fs/absolute? runs (babashka.fs loaded via fasl)"; pass=$((pass+1))
+else
+  echo "FAIL: (f2) fs/absolute? did not run (babashka.fs unbound?)"
+  printf '%s\n' "$out_f" | tail -5
+  fails=$((fails+1))
+fi
+
 echo
 echo "stdlib-fasl smoke: $pass passed, $fails failed"
 [ "$fails" -eq 0 ]
