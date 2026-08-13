@@ -928,6 +928,193 @@
         :libs libmap
         :trace (:trace expansion)})))))
 
+;; --- resolved-roots cache (.jolt/cpcache) -----------------------------------
+;; tools.deps calls this .cpcache: the resolved classpath keyed on a content
+;; hash of the inputs, so a warm run skips dep-graph expansion (POM parsing,
+;; version selection, gitlib probing) entirely. The key folds in everything the
+;; expansion reads, so changing any of it misses automatically:
+;;   - the project deps.edn bytes
+;;   - the user deps.edn bytes, or an explicit "absent/skipped" marker
+;;     (JOLT_NO_USER_DEPS / :repro?)
+;;   - the active alias set (-M:alias must not share a no-alias entry)
+;;   - the runtime version (the same source the AOT cache keys on)
+;;   - every :local/root dep's deps.edn bytes (editing a local dep invalidates)
+;; Gated the same way the AOT namespace cache is: JOLT_AOT_CACHE. The dev
+;; bin/jolt exports JOLT_AOT_CACHE=0, so source-mode dev never caches — a
+;; volatile compiler re-expands every run, same posture as a fasl cache would
+;; take. No gate (e.g. a non-binary running with the cache explicitly off) means
+;; we cannot safely tell one runtime from another, so the cache stays off.
+;;
+;; The cache sits AFTER fetch/resolution: a miss runs the full resolve-deps
+;; (which fetches missing deps over the network) and then writes; a hit never
+;; touches the network. On a hit every cached path is checked to still exist on
+;; disk — a pruned gitlib checkout or a deleted jar/extraction is a miss, not an
+;; error. A corrupt or unreadable cache file is a miss too, never an error.
+
+(defn- cpcache-enabled?
+  "Same posture as the AOT namespace cache: ON by default, OFF under
+  JOLT_AOT_CACHE=0/false/no/off (which the dev bin/jolt sets). Reachable from
+  Clojure because the host already reads it, so no new host seam is needed."
+  []
+  (let [e (getenv "JOLT_AOT_CACHE")]
+    (if (and (string? e) (pos? (count e)))
+      (not (#{"0" "false" "no" "off"} (str/lower-case e)))
+      true)))
+
+(defn- slurp-quiet
+  "slurp that returns nil for a missing file instead of throwing, for the cache
+  key (a deleted local deps.edn folds in as empty, which still moves the key)."
+  [p]
+  (when (file-exists? p) (slurp p)))
+
+(defn- cpcache-file-key
+  "Filename-safe key for the cache entry: jolt's own hash of the material. The
+  hash only NAMES the file — a collision cannot serve a wrong entry, because
+  cpcache-hit? requires the stored material to equal the current one exactly.
+  That equality is also what makes the key content-exact (a same-length edit
+  moves it), the trap a sampled or truncated hash walks into. No subprocess, no
+  temp file: an earlier draft shelled to shasum, which minimal Linux images may
+  not carry and which costs a spawn on the path this cache exists to shave."
+  [material]
+  (str "k" (bit-and (hash material) 0x7fffffff)))
+
+(defn- local-deps-edn-paths
+  "The deps.edn files of every :local/root coordinate reachable from `deps`
+  (absolutized against base-dir), transitively. Each local dep's own :local/root
+  deps are followed so a whole local subgraph folds into the cache key; a jar or
+  missing deps.edn contributes nothing. The walk is bounded by the set of dirs
+  visited, so a local cycle terminates."
+  [deps base-dir]
+  (letfn [(locals-in [m dir]
+            (when-let [ds (:deps m)]
+              (keep (fn [[_ spec]]
+                      (when-let [r (:local/root spec)]
+                        (abspath dir r)))
+                    ds)))
+          (walk [queue seen acc]
+            (lazy-seq
+              (if-let [dir (first queue)]
+                (if (contains? seen dir)
+                  (walk (rest queue) seen acc)
+                  (let [seen (conj seen dir)
+                        dep-edn (str dir "/deps.edn")
+                        ;; a local dep without a deps.edn (bare source dir, a jar)
+                        ;; contributes nothing to the key — its roots are its own.
+                        m (read-edn dep-edn)
+                        acc (if m (conj acc dep-edn) acc)
+                        next (or (locals-in m dir) [])]
+                    (walk (concat (rest queue) next) seen acc)))
+                acc)))]
+    (vec (walk (locals-in {:deps deps} base-dir) #{} []))))
+
+(defn- cpcache-material
+  "Everything the expansion reads, as one string — the cache entry stores this
+  verbatim and a hit requires exact equality against it. project-edn-bytes is
+  the project deps.edn as a string (already read by the caller); user-edn-bytes
+  is the user deps.edn as a string, or a fixed marker when it is skipped
+  (JOLT_NO_USER_DEPS / :repro?) or absent. alias-kws is the active alias set.
+  Each :local/root dep's deps.edn CONTENT is folded in — its length alone once
+  was, and a same-length edit (one version digit for another) then kept serving
+  the stale entry."
+  [project-edn-bytes user-edn-bytes alias-kws local-dep-edns runtime-version]
+  (str (count project-edn-bytes) ":" project-edn-bytes
+       "|" (count user-edn-bytes) ":" user-edn-bytes
+       "|" (pr-str (vec (sort alias-kws)))
+       "|" runtime-version
+       ;; the environment-dependent artifact roots resolution materializes into:
+       ;; a run pointed at a different gitlibs/jarlibs (JOLT_GITLIBS — the
+       ;; deps-alias smoke's retry scenarios do exactly this) or a different
+       ;; HOME (the ~/.m2 and ~/.jolt defaults) must not share an entry whose
+       ;; cached roots point into the old location.
+       "|" (gitlibs-dir)
+       "|" (or (getenv "JOLT_JARLIBS") "")
+       "|" (or (getenv "HOME") "")
+       "|" (str/join "|" (for [p (sort local-dep-edns)]
+                           (let [b (or (slurp-quiet p) "")]
+                             (str p "=" (count b) ":" b))))))
+(defn- cpcache-dir
+  "The project-local cache dir, under the project's .jolt/ state dir."
+  [project-dir]
+  (str project-dir "/.jolt/cpcache"))
+
+(defn- cached-paths
+  "Every filesystem path a cached resolution depends on at run time — the roots
+  that were resolved, plus the source-tree roots a :local/root dep (or the
+  project itself) declared. A missing one means the cache is stale: a pruned
+  gitlib checkout, a deleted jar, or a removed local dep dir."
+  [resolved]
+  (let [roots (:roots resolved)
+        project-roots (:project-roots resolved)
+        ;; natives are on-disk extractions too — a pruned one must miss, not
+        ;; hand the runtime a dangling dylib path.
+        natives (:natives resolved)]
+    (vec (distinct (concat roots project-roots natives)))))
+
+(defn- cpcache-hit?
+  "Read and validate the cache file named by `k`: returns the cached value when
+  the file parses, its stored :material EQUALS `material` (the hash in the
+  filename only names the entry — equality is what rules a collision out), and
+  every cached path still exists. A corrupt/unreadable file is a miss, never an
+  error."
+  [project-dir k material]
+  (let [f (str (cpcache-dir project-dir) "/" k ".edn")]
+    (when (file-exists? f)
+      (when-let [cached (try (edn/read-string (slurp f))
+                             (catch :default _ nil))]
+        (when (= (:material cached) material)
+          (if (every? file-exists? (cached-paths (:value cached)))
+            (:value cached)
+            (do (info "cpcache miss (a cached path no longer exists)")
+                (sh (str "rm -f " (pr-str f)))    ; stale — don't re-strike
+                nil)))))))
+
+(defn- cpcache-write!
+  "Write `resolved` to the cache atomically (temp + rename), so a reader never
+  sees a half-written file. A write failure (read-only dir, full disk) is a
+  quiet miss: the cache is best-effort, the resolution already succeeded."
+  [project-dir k material resolved]
+  (let [dir (cpcache-dir project-dir)
+        f (str dir "/" k ".edn")
+        stage (str f ".part-" (System/currentTimeMillis) "-" (rand-int 100000))]
+    (sh (str "mkdir -p " (pr-str dir)))
+    (try
+      (spit stage (pr-str {:material material :value resolved}))
+      ;; rename is atomic on POSIX; mv across the same dir never copies.
+      (when-not (zero? (sh (str "mv " (pr-str stage) " " (pr-str f))))
+        (sh (str "rm -f " (pr-str stage))))
+      (catch :default _
+         (sh (str "rm -f " (pr-str stage)))))))
+
+(declare user-deps-path)   ; defined below with the deps.edn readers
+
+(defn- resolve-deps-cached
+  "resolve-deps wrapped in the .jolt/cpcache cache. On a hit the cached result
+  (the resolve-deps return map) is returned without expanding the graph or
+  touching the network; on a miss the full expansion runs (which fetches missing
+  deps) and the result is written. The cache is OFF when JOLT_AOT_CACHE is off
+  (the dev bin/jolt posture) or when trace? is set — a trace is a one-off query
+  (-Stree/-Strace), not the resolution a run reuses, so it never caches and a
+  cached run never serves one. Emits the JOLT_DEBUG-gated hit/miss lines."
+  [project-dir deps alias-kws repro? opts]
+  (if (and (cpcache-enabled?) (not (:trace? opts)))
+    (let [proj-bytes (or (slurp-quiet (str project-dir "/deps.edn")) "")
+          skip-user? (or repro? (getenv "JOLT_NO_USER_DEPS"))
+          user-path (user-deps-path)
+          user-bytes (if skip-user?
+                        "::no-user-deps::"
+                        (or (slurp-quiet user-path) "::absent::"))
+          runtime-version (jolt.host/jolt-version)
+          local-edns (local-deps-edn-paths deps project-dir)
+          material (cpcache-material proj-bytes user-bytes alias-kws local-edns runtime-version)
+          k (cpcache-file-key material)]
+      (if-let [cached (cpcache-hit? project-dir k material)]
+        (do (info "cpcache hit") cached)
+        (let [r (resolve-deps deps project-dir opts)]
+          (info "cpcache miss")
+          (cpcache-write! project-dir k material r)
+          r)))
+    (resolve-deps deps project-dir opts)))
+
 ;; --- dependency tree --------------------------------------------------------
 ;; The trace is a flat log of expansion decisions in traversal order; the tree is
 ;; that log re-hung on the paths the nodes were reached by. Rendering follows
@@ -1068,21 +1255,21 @@
          all-deps (merge (or (:replace-deps argmap) (:deps argmap)
                              (if tool? {} (:deps edn)))
                          (:extra-deps argmap))
-         ;; :cp (the CLI's -Scp) supplies the roots outright, so the dependency
-         ;; graph is never expanded and nothing is fetched. The deps.edn chain is
-         ;; still read and the aliases still combine — that is only file reads,
-         ;; and an alias's :main-opts / :exec-fn and the project's :tasks come
-         ;; from there. tools.deps' --skip-cp draws the line in the same place:
-         ;; the merged edn and argmap, without calc-basis.
-         {dep-roots :roots dep-natives :natives prep-libs :prep dep-trace :trace}
-         (when-not cp
-           (binding [*mvn-local-repo* (when-let [r (:mvn/local-repo edn)]
-                                        (abspath project-dir r))
-                     *mvn-repos* (mvn-repo-urls edn)]
-             (resolve-deps all-deps project-dir
-                           {:override-deps (:override-deps argmap)
-                            :default-deps (:default-deps argmap)
-                            :trace? trace?})))
+          ;; :cp (the CLI's -Scp) supplies the roots outright, so the dependency
+          ;; graph is never expanded and nothing is fetched. The deps.edn chain is
+          ;; still read and the aliases still combine — that is only file reads,
+          ;; and an alias's :main-opts / :exec-fn and the project's :tasks come
+          ;; from there. tools.deps' --skip-cp draws the line in the same place:
+          ;; the merged edn and argmap, without calc-basis.
+          {dep-roots :roots dep-natives :natives prep-libs :prep dep-trace :trace}
+          (when-not cp
+            (binding [*mvn-local-repo* (when-let [r (:mvn/local-repo edn)]
+                                         (abspath project-dir r))
+                      *mvn-repos* (mvn-repo-urls edn)]
+              (resolve-deps-cached project-dir all-deps alias-kws repro?
+                                   {:override-deps (:override-deps argmap)
+                                    :default-deps (:default-deps argmap)
+                                    :trace? trace?})))
          _ (when (seq prep-libs)
              (warn "deps declare :deps/prep-lib steps jolt does not run "
                    "(their compiled/generated assets will be missing): "
