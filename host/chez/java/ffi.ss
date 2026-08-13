@@ -15,14 +15,120 @@
 ;; (jolt.ffi/load-library name) loads a .so/.dylib by name (resolved by the OS
 ;; loader against the standard search paths). A library typically calls this once
 ;; at load with a platform-specific name. (load-library) with no name (or #f)
-;; loads the running process's own symbols (libc, sockets).
+;; makes the running process's own symbols (libc, sockets) resolvable.
+;;
+;; NEITHER form may call (sa-load-shared-object #f) any more: Chez resolves
+;; foreign-entry most-recently-loaded first, and re-loading the process-global
+;; handle RE-PROMOTES it above every :jolt/native loaded so far — which is how
+;; Apple's /usr/lib/libboringssl.dylib (a global-namespace resident that exports
+;; the whole EVP_* set) came to serve jolt-lang/crypto's OpenSSL bindings and
+;; abort in digest_update. The boot already loaded the global handle once
+;; (jolt-foreign-proc-safe, rt.ss); process symbols resolve through that without
+;; any reload. A NAMED library goes through the scoped loader below — RTLD_LOCAL
+;; + a registered handle — so its symbols are reachable by its own defcfns and
+;; invisible to everyone else's.
 (define (ffi-load-library . args)
-  (if (or (null? args) (jolt-nil? (car args)))
-      (begin (sa-load-shared-object #f) jolt-nil)
-      (begin (sa-load-shared-object (jolt-str-render-one (car args))) jolt-nil)))
+  (cond
+    ((or (null? args) (jolt-nil? (car args)))
+     jolt-nil)                                   ; boot's global handle suffices
+    ;; The documented per-OS map spec — {:darwin "…" :linux "…" :windows "…"} —
+    ;; select this platform's entry. (It was documented but never implemented:
+    ;; the map rendered to a string and dlopen'd garbage; surfaced auditing the
+    ;; scoped-resolution change.) A map with no entry for this platform raises,
+    ;; naming the platform, rather than silently loading nothing.
+    ((jolt-map? (car args))
+     (let* ((key (case (sa-os-family)
+                   ((macos) "darwin") ((windows) "windows") (else "linux")))
+            (name (jolt-get-dispatch (car args) (keyword #f key) jolt-nil)))
+       (when (jolt-nil? name)
+         (jolt-throw (jolt-ex-info
+                       (string-append "jolt.ffi/load-library: no :" key
+                                      " entry in the per-OS spec")
+                       (car args))))
+       (jolt-ffi-load-native (jolt-str-render-one name))
+       jolt-nil))
+    (else (jolt-ffi-load-native (jolt-str-render-one (car args))) jolt-nil)))
 
+;; Loadable without mutating resolution state: probe with a LOCAL dlopen through
+;; the scoped loader (registering the handle — a probe that succeeds will be
+;; followed by use). The old form side-effected the GLOBAL namespace to answer
+;; a yes/no question.
 (define (ffi-loaded? name)
-  (guard (e (#t #f)) (sa-load-shared-object (jolt-str-render-one name)) #t))
+  (if (jolt-ffi-load-native (jolt-str-render-one name)) #t #f))
+
+;; --- scoped native libraries: dlopen RTLD_LOCAL + per-handle dlsym ----------
+;; A :jolt/native library's symbols must NEVER depend on the process-global
+;; foreign-entry search order. Chez resolves foreign-entry most-recently-loaded
+;; first, so the OS's own libs (Apple's /usr/lib/libboringssl.dylib EXPORTS
+;; EVP_*!) would shadow a library's intended native once anything re-promotes the
+;; global handle (the embedded-fasl fetch did exactly that — fix/ffi-scoped-natives).
+;; Instead a declared native is dlopen'd RTLD_LOCAL — its symbols never enter the
+;; global namespace at all — and a defcfn resolves by dlsym against the loaded
+;; handles (declaration order) BEFORE falling back to today's global name
+;; resolution (libc, app-local symbols, :process natives). The guarantee is
+;; one-way: a declared native shadows the global namespace for ITS OWN defcfns,
+;; which is the property jolt-lang/crypto needs so its OpenSSL EVP_* binds reach
+;; the right library, not Apple's BoringSSL. defcfn's surface syntax is unchanged;
+;; only resolution semantics move.
+;;
+;; Windows (NT) keeps its current path: LoadLibrary does not merge a module's
+;; symbols into a global namespace the way RTLD_GLOBAL does, so the registry
+;; holds no handles there and defcfn falls back to global name resolution exactly
+;; as before.
+;; dlopen/dlsym/dlclose resolve through the boot-loaded process-global handle
+;; (libSystem on darwin, libdl/libc on linux) — never the natives themselves.
+(define ffi-dlopen  (jolt-foreign-proc-safe "dlopen"  '(string int) 'void*))
+(define ffi-dlsym   (jolt-foreign-proc-safe "dlsym"   '(void* string) 'void*))
+(define ffi-dlclose (jolt-foreign-proc-safe "dlclose" '(void*) 'int))
+;; RTLD flag values differ by OS (macos values (VERIFY by probe before trusting): NOW=#x2 LAZY=#x1 LOCAL=#x4
+;; GLOBAL=#x100; linux/BSD NOW=2 LAZY=1 LOCAL=0 GLOBAL=0x100). RTLD_LOCAL =
+;; "do not make this object's symbols available for global resolution" — the
+;; isolation guarantee. Verified cross-platform by the flag probe (podman/linux).
+(define ffi-rtld-flags
+  (bitwise-ior 2                                  ; RTLD_NOW on every POSIX host
+                (if (eq? (sa-os-family) 'macos) 4 0)))  ; RTLD_LOCAL: darwin 4, else 0
+;; Registry: an ordered list of handles (declaration order — what deps.clj's
+;; first-inclusion order hands load-natives!) and a path set so the same .so is
+;; not dlopen'd twice. Mutated only from load-natives!/jolt-build-load-native,
+;; but guarded anyway in case a repl loads a native lazily.
+(define ffi-native-mu (make-mutex))
+(define ffi-native-handles (vector #f))   ; cell[0] = list of handles, oldest first
+(define ffi-native-paths (make-hashtable string-hash equal?))  ; path(string) -> #t
+;; dlopen `path` RTLD_LOCAL and record the handle. Returns the handle (a positive
+;; integer) on success, #f on failure, or #t on Windows (loaded globally, not
+;; registered — defcfn resolves globally there as before). A repeat load of an
+;; already-registered path is a no-op success.
+(define (jolt-ffi-load-native path)
+  (cond
+    ((eq? (sa-os-family) 'windows)
+     (guard (e (#t #f)) (sa-load-shared-object path) #t))
+    ((not ffi-dlopen) #f)
+    (else
+     (jolt-with-mutex ffi-native-mu
+       (cond
+         ((hashtable-ref ffi-native-paths path #f) #t)   ; already loaded
+         (else
+          (let ((h (ffi-dlopen path ffi-rtld-flags)))
+             (cond
+              ((and h (integer? h) (positive? h))
+               (hashtable-set! ffi-native-paths path #t)
+               (vector-set! ffi-native-handles 0
+                            (append (or (vector-ref ffi-native-handles 0) '()) (list h)))
+               h)
+              (else #f)))))))))
+;; dlsym `sym` across the registered native handles in declaration order. Returns
+;; the address (positive integer) of the first hit, or #f when no handle has it
+;; — the emitter then falls back to global name resolution. #f on Windows (no
+;; registered handles).
+(define (jolt-ffi-dlsym-native sym)
+  (if (or (eq? (sa-os-family) 'windows) (not ffi-dlsym))
+      #f
+      (let loop ((hs (or (vector-ref ffi-native-handles 0) '())))
+        (cond
+          ((null? hs) #f)
+          (else
+           (let ((a (ffi-dlsym (car hs) sym)))
+             (if (and a (integer? a) (positive? a)) a (loop (cdr hs)))))))))
 
 ;; --- foreign type keywords ---------------------------------------------------
 ;; The keyword type names jolt.ffi accepts (in foreign-fn signatures and the
@@ -176,17 +282,24 @@
 ;; launcher, which loads them at startup (load-shared-object isn't part of the
 ;; saved heap, so it must run in the built process, not at heap build). process?
 ;; loads the running binary's own symbols (libc sockets); otherwise try each
-;; platform candidate in turn and fail unless the spec is optional.
+;; platform candidate in turn and fail unless the spec is optional. A file native
+;; is loaded RTLD_LOCAL + registered via jolt-ffi-load-native so its defcfns
+;; resolve from the handle, isolated from the global namespace; only when dlopen
+;; is unavailable on the host does it fall back to the global sa-load-shared-object.
 (define (jolt-build-load-native cands optional? process?)
   (if process?
-      (begin (sa-load-shared-object #f) #t)
+      ;; :process natives want the executable's own symbols — already resolvable
+      ;; through the boot-time global load; re-loading #f would re-promote the
+      ;; global handle over every scoped native (the bug this file exists to end).
+      #t
       (let loop ((cs cands))
         (cond
           ((null? cs)
            (unless optional?
              (error 'jolt-build "required native library not found" cands))
            #f)
-          ((guard (e (#t #f)) (sa-load-shared-object (car cs)) #t) #t)
+          ;; RTLD_LOCAL + register; #t when it took (handle or Windows-global).
+          ((jolt-ffi-load-native (car cs)) #t)
           (else (loop (cdr cs)))))))
 
 ;; --- expose under jolt.ffi ---------------------------------------------------
@@ -194,6 +307,8 @@
 (def-var! "jolt.ffi" "register-export" jolt-ffi-register-export!)
 (def-var! "jolt.ffi" "load-library" ffi-load-library)
 (def-var! "jolt.ffi" "loaded?" (lambda (n) (if (ffi-loaded? n) #t #f)))
+(def-var! "jolt.ffi" "load-native" jolt-ffi-load-native)
+(def-var! "jolt.ffi" "dlsym-native" jolt-ffi-dlsym-native)
 (def-var! "jolt.ffi" "alloc" ffi-alloc)
 (def-var! "jolt.ffi" "free" ffi-free)
 (def-var! "jolt.ffi" "read" ffi-read)

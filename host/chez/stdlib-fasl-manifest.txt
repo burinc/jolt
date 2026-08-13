@@ -52,6 +52,7 @@ jolt.infix.math.bit-shuffling
 jolt.infix.math.constants
 jolt.infix.math.core
 jolt.infix.math.trig
+jolt.io-poller
 jolt.nrepl
 jolt.parser
 jolt.parser.basic
@@ -71,7 +72,6 @@ jolt.time.temporal
 jolt.time.util
 jolt.time.year
 jolt.util
-skip jolt.io-poller — emitted .scm contains an empty () arg list in a foreign-procedure form that Chez rejects at compile-file time; loads fine from source at runtime
 skip glojure.deps — requires glojure/deps/host.{jolt,clj,cljc} which is absent from the install roots at build time
 skip grenadine.host.glojure — top level references an unqualified `strings` symbol that does not resolve in the build image
 skip grenadine.cli — requires grenadine/build_info.{jolt,clj,cljc} (generated at release packaging), absent in a dev build

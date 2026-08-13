@@ -1043,12 +1043,14 @@
   project itself) declared. A missing one means the cache is stale: a pruned
   gitlib checkout, a deleted jar, or a removed local dep dir."
   [resolved]
+  ;; roots only: :natives entries are the :jolt/native DESCRIPTOR maps from
+  ;; dep deps.edn files, not paths — validating them as paths threw off the
+  ;; hit path and took Selmer's whole suite down (the fleet gate caught it).
+  ;; String-filtered so a future shape change in the result can never turn
+  ;; validation into a crash again.
   (let [roots (:roots resolved)
-        project-roots (:project-roots resolved)
-        ;; natives are on-disk extractions too — a pruned one must miss, not
-        ;; hand the runtime a dangling dylib path.
-        natives (:natives resolved)]
-    (vec (distinct (concat roots project-roots natives)))))
+        project-roots (:project-roots resolved)]
+    (vec (filter string? (distinct (concat roots project-roots))))))
 
 (defn- cpcache-hit?
   "Read and validate the cache file named by `k`: returns the cached value when
@@ -1058,15 +1060,20 @@
   error."
   [project-dir k material]
   (let [f (str (cpcache-dir project-dir) "/" k ".edn")]
-    (when (file-exists? f)
-      (when-let [cached (try (edn/read-string (slurp f))
-                             (catch :default _ nil))]
-        (when (= (:material cached) material)
-          (if (every? file-exists? (cached-paths (:value cached)))
-            (:value cached)
-            (do (info "cpcache miss (a cached path no longer exists)")
-                (sh (str "rm -f " (pr-str f)))    ; stale — don't re-strike
-                nil)))))))
+    ;; ONE guard around parse AND validation: the corrupt-is-a-miss contract
+    ;; has to hold for anything a cache file can make this code do, not just
+    ;; for read-string — an unexpected shape in a cached value threw from the
+    ;; path check and turned every run in the project into the error.
+    (try
+      (when (file-exists? f)
+        (when-let [cached (edn/read-string (slurp f))]
+          (when (= (:material cached) material)
+            (if (every? file-exists? (cached-paths (:value cached)))
+              (:value cached)
+              (do (info "cpcache miss (a cached path no longer exists)")
+                  (sh (str "rm -f " (pr-str f)))    ; stale — don't re-strike
+                  nil)))))
+      (catch :default _ nil))))
 
 (defn- cpcache-write!
   "Write `resolved` to the cache atomically (temp + rename), so a reader never

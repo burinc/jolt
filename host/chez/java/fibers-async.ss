@@ -252,11 +252,31 @@
 ;;     park" invariant.
 (def-var! "jolt.host" "fiber?" (lambda () (if (jolt-current-fiber) #t #f)))
 (def-var! "jolt.host" "current-fiber" (lambda () (or (jolt-current-fiber) jolt-nil)))
-(def-var! "jolt.host" "fiber-park-commit!" (lambda () (jolt-fiber-state-set! (jolt-current-fiber) 'parked)))
+;; The commit DISABLES INTERRUPTS before marking 'parked, and the switch seam
+;; below re-enables after the fiber resumes — the exact shape jolt-fiber-park!
+;; uses, for the exact reason its comment gives: a preemption timer landing
+;; between the 'parked mark and the switch runs with the fiber already marked.
+;; The bare mark lost ONE wakeup in a way that took a stress gate to see: a
+;; poller event can fire the instant its EV_ADD applies, so the wake's
+;; sa-fiber-resume raced into that window, read 'parked, and spent the resume
+;; on a fiber still running toward its switch — which then parked for real with
+;; nobody left to wake it. One fiber of eight lost, rarely, under load
+;; (poller-registration's LOST 1 of 8). Chez defers a timer that fires in a
+;; disabled region, and jolt-fiber-to-scheduler! saves/restores the disable
+;; count across the switch (jolt-fiber-sic), so the pairing below is safe on
+;; both sides of the park. These two seams are a COMMIT/SWITCH PAIR: a caller
+;; that commits must switch (wait-fiber does; nothing else calls them).
+(def-var! "jolt.host" "fiber-park-commit!"
+  (lambda ()
+    (disable-interrupts)
+    (jolt-fiber-state-set! (jolt-current-fiber) 'parked)))
 ;; jolt-fiber-to-scheduler! takes the fiber (it clears the current-fiber vreg
 ;; before capturing, so the record has to be passed in, not read afterwards).
 (def-var! "jolt.host" "fiber-to-scheduler!"
-  (lambda () (jolt-fiber-to-scheduler! (jolt-current-fiber))))
+  (lambda ()
+    (jolt-fiber-to-scheduler! (jolt-current-fiber))
+    ;; balances fiber-park-commit!'s disable, on resume — see jolt-fiber-park!.
+    (enable-interrupts)))
 (def-var! "jolt.host" "fiber-resume" sa-fiber-resume)
 ;; Unguarded full collect for the R8 gate: System/gc swallows Chez's
 ;; "cannot collect when multiple threads are active" refusal (the JVM-faithful

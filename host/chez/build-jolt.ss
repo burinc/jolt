@@ -152,8 +152,15 @@
 ;; Materialize the bundled Chez boots + launcher stub (cc-linked into this binary
 ;; as C arrays) into the embedded-bytes store, so build-self-contained can spill
 ;; them. Done lazily on `build` only.
+;;
+;; No (sa-load-shared-object #f): the boot loaded the process-global handle once,
+;; which is enough to resolve the jolt_* C-array symbols exported by THIS binary.
+;; Re-loading would re-promote the global handle to the head of Chez's
+;; foreign-entry search order and outrank any user native loaded before a `build`
+;; invocation that loads an embedded fasl — the same class of hazard the
+;; launcher's jolt-stdlib-fasl-fetch had. `build` runs in the SAME process as the
+;; user's app, so it cannot safely reorder foreign-entry either.
 (define (jolt-materialize-bundles!)
-  (sa-load-shared-object #f)
   (let ((memcpy (sa-foreign-procedure \"memcpy\" (u8* uptr uptr) void*)))
     (for-each
       (lambda (spec)
