@@ -100,9 +100,17 @@
 ;; sa-foreign-entry-address (foreign-entry) returns an integer address, so
 ;; base+offset is plain arithmetic. Same memcpy pattern as the launcher's
 ;; jolt-materialize-bundles!.
+;;
+;; No (sa-load-shared-object #f) here: the boot already loaded the process-global
+;; handle once, which makes jolt_stdlib_fasls (an exported symbol of THIS binary)
+;; resolvable. Re-loading re-promotes the global handle to the head of Chez's
+;; foreign-entry search order (most-recently-loaded first), so it outranks every
+;; explicitly loaded native — after any fetch, an EVP_* bind resolves to Apple's
+;; BoringSSL in /usr/lib and jolt.ffi's defcfn caches that bad fp forever
+;; (jolt-lang/crypto, Selmer's hash filter). The same hazard exists in the
+;; launcher's jolt-materialize-bundles! (build-jolt.ss).
 (define (jolt-stdlib-fasl-fetch offset length)
   (guard (e (else #f))
-    (sa-load-shared-object #f)
     (let* ((base (sa-foreign-entry-address "jolt_stdlib_fasls"))
            (bv (make-bytevector length))
            (memcpy (sa-foreign-procedure "memcpy" (u8* uptr uptr) void*)))

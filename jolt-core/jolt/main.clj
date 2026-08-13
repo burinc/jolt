@@ -29,7 +29,12 @@
           (jolt.ffi/load-library)
           (let [c (get spec plat)
                 cands (if (string? c) [c] (vec c))
-                hit (some #(when (jolt.ffi/loaded? %) %) cands)]
+                ;; Load the native RTLD_LOCAL and register its handle, so the
+                ;; spec's defcfns resolve from the handle (isolated from the
+                ;; process-global namespace) rather than depending on global
+                ;; foreign-entry search order. load-native returns #t on success
+                ;; (a handle, or Windows-global), #f when no candidate opens.
+                hit (some #(when (jolt.ffi/load-native %) %) cands)]
             ;; A :static spec has no runtime shared object (it's linked into a
             ;; built binary), so an interpreted `run`/`repl` has nothing to load —
             ;; skip it rather than fail. Its foreign calls only resolve in a static

@@ -947,8 +947,20 @@
       ;; evaluate to a callable closure before the shared library is loaded —
       ;; critical for :optional :jolt/native libs whose load-object runs in the
       ;; scheme-start launcher, after the heap is already built.
-      (str "(let ((p #f)) (lambda (" (str/join " " params) ") "
-           "((or p (begin (set! p " fp ") p)) " (str/join " " params) ")))"))))
+      ;;
+      ;; Scoped resolution: dlsym the symbol against the RTLD_LOCAL handles a
+      ;; :jolt/native library registered, and build the foreign-procedure FROM THE
+      ;; ADDRESS on a hit (Chez accepts a runtime integer address in the entry
+      ;; position). Falls back to fp (global name resolution) when no handle has
+      ;; the symbol. Skipped for :varargs bindings — those are libc functions
+      ;; (fcntl/ioctl) that resolve globally as process symbols, and address +
+      ;; (__varargs_after n) is untested. defcfn's surface syntax is unchanged.
+      (let [scoped (if vi "#f"
+                     (str "(let ((a (jolt-ffi-dlsym-native " (chez-str-lit (:csym node)) "))) "
+                          "(and a (foreign-procedure a (" (str/join " " (map ffi-type->chez types)) ") "
+                          (ffi-type->chez (:rettype node)) ")))"))]
+        (str "(let ((p #f)) (lambda (" (str/join " " params) ") "
+             "((or p (begin (set! p (or " scoped " " fp ")) p)) " (str/join " " params) ")))")))))
 
 ;; jolt.ffi/__ccallable -> a Chez foreign-callable wrapping the emitted jolt fn,
 ;; locked + registered (jolt-ffi-register-callable!, host/chez/java/ffi.ss) so the
