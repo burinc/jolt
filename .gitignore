@@ -22,3 +22,4 @@ test/_*.janet
 
 # generated gambit profile boots (host/gambit/boot.ss is the source of order)
 host/gambit/boot-*.ss
+.jolt/
