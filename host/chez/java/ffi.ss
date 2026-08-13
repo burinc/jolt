@@ -28,9 +28,26 @@
 ;; + a registered handle — so its symbols are reachable by its own defcfns and
 ;; invisible to everyone else's.
 (define (ffi-load-library . args)
-  (if (or (null? args) (jolt-nil? (car args)))
-      jolt-nil                                   ; boot's global handle suffices
-      (begin (jolt-ffi-load-native (jolt-str-render-one (car args))) jolt-nil)))
+  (cond
+    ((or (null? args) (jolt-nil? (car args)))
+     jolt-nil)                                   ; boot's global handle suffices
+    ;; The documented per-OS map spec — {:darwin "…" :linux "…" :windows "…"} —
+    ;; select this platform's entry. (It was documented but never implemented:
+    ;; the map rendered to a string and dlopen'd garbage; surfaced auditing the
+    ;; scoped-resolution change.) A map with no entry for this platform raises,
+    ;; naming the platform, rather than silently loading nothing.
+    ((jolt-map? (car args))
+     (let* ((key (case (sa-os-family)
+                   ((macos) "darwin") ((windows) "windows") (else "linux")))
+            (name (jolt-get-dispatch (car args) (keyword #f key) jolt-nil)))
+       (when (jolt-nil? name)
+         (jolt-throw (jolt-ex-info
+                       (string-append "jolt.ffi/load-library: no :" key
+                                      " entry in the per-OS spec")
+                       (car args))))
+       (jolt-ffi-load-native (jolt-str-render-one name))
+       jolt-nil))
+    (else (jolt-ffi-load-native (jolt-str-render-one (car args))) jolt-nil)))
 
 ;; Loadable without mutating resolution state: probe with a LOCAL dlopen through
 ;; the scoped loader (registering the handle — a probe that succeeds will be
