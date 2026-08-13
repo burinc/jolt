@@ -181,6 +181,7 @@
     ;; JOLT_TRACE at RUNTIME (the env is unset at heap-build), before any app ns
     ;; compiles, so a `-M:run` traces the app's own code.
     (jolt-trace-init-from-env!)
+    (jolt-stdlib-fasls-attach! '" (jb-stdlib-index-str) ")
     ;; shared dispatch (cli-core.ss, inlined via the runtime manifest): the -e
     ;; arm, end-of-options, and uncaught reporting are the same code the script
     ;; driver runs — the launcher once carried a stale fork of the -e arm.
@@ -249,6 +250,327 @@
           ((var-deref "jolt.backend-scheme" "set-var-cache!") #f)
           (ei-clear-cached!))))))
 
+;; --- AOT the install-owned stdlib namespaces as embedded fasls --------------
+;; install-owned source (jolt-core/, stdlib/, ...) is excluded from the on-disk AOT
+;; cache (aot-load-or-compile's `(not (ldr-install-file? file))` guard), so every
+;; `(require 'clojure.test)` recompiled ~671 lines from source on EACH process
+;; start. Instead: load each remaining install-owned namespace HERE, emit its
+;; Scheme, compile it to a fasl in a FRESH Chez with the release profile, and bake
+;; the bytes into flat.ss as `(register-embedded-fasl! "<ns>" <bytevector>)`. At
+;; require time the loader finds the embedded fasl for an install-owned ns and
+;; loads it via load-compiled-from-port instead of recompiling.
+
+(define jb-stdlib-manifest-path "host/chez/stdlib-fasl-manifest.txt")
+
+;; Shared profile boolean renderer (also used by the flat.ss compile step below).
+;; Defined here, before jb-compile-stdlib-so!, because the stdlib fasl compile
+;; runs during flat.ss emission — earlier than the step-2 compile block that
+;; once held the only definition.
+(define jb-bool (lambda (b) (if b "#t" "#f")))
+
+;; Filled by jb-emit-stdlib-fasls! during flat.ss emission: the single blob path
+;; (xxd'd into the binary as jolt_stdlib_fasls in step 3) and the (ns offset
+;; length) index (baked into flat.ss via the launcher's jolt-stdlib-fasls-attach!
+;; call). #f / () until then.
+(define jb-stdlib-blob-path #f)
+(define jb-stdlib-index '())
+
+;; Render jb-stdlib-index as a Scheme source list for the launcher's attach call:
+;; (("clojure.test" 0 123456) ...). This literal is the only thing baked into
+;; flat.ss for the stdlib fasls — small, regardless of how big the blob is.
+(define (jb-stdlib-index-str)
+  (string-append "("
+    (apply string-append
+      (map (lambda (e)
+             (string-append "(" (ei-str-lit (car e)) " "
+                            (number->string (cadr e)) " "
+                            (number->string (caddr e)) ")"))
+           jb-stdlib-index))
+    ")"))
+
+;; Parse the manifest into (values embedded-names skip-alist). Skip lines look
+;; like "skip <ns> — <reason>"; the alist entry is (ns . reason). The reason is
+;; what jb-compile-stdlib-fasls! reports and the manifest author verified, and
+;; the ns drives compile EXCLUSION: a skip is not even load-attempted, so a ns
+;; whose emitted .scm Chez rejects cannot kill the batch compile.
+(define (jb-read-stdlib-manifest)
+  (let loop ((lines (bld-file-lines jb-stdlib-manifest-path))
+             (names '()) (skips '()))
+    (if (null? lines)
+        (values (reverse names) (reverse skips))
+        (let* ((ln (car lines)) (n (string-length ln)))
+          (cond
+            ((or (string=? ln "") (char=? (string-ref ln 0) #\#))
+             (loop (cdr lines) names skips))
+            ((and (>= n 5) (string=? (substring ln 0 5) "skip "))
+             (let* ((rest (substring ln 5 n)) (di (jb-str-index rest " — ")))
+               (loop (cdr lines) names
+                     (cons (if di
+                               (cons (substring rest 0 di)
+                                     (substring rest (+ di 3) (string-length rest)))
+                               (cons rest ""))
+                           skips))))
+            (else (loop (cdr lines) (cons ln names) skips)))))))
+
+(define (jb-stdlib-manifest-check! discovered)
+  (define-values (man-names man-skips) (jb-read-stdlib-manifest))
+  (let ((man-keys (sort string<? (append man-names (map car man-skips))))
+        (disc-keys (sort string<? discovered)))
+    (unless (and (= (length man-keys) (length disc-keys))
+                 (equal? man-keys disc-keys))
+      (error 'build-jolt
+        (string-append
+          "stdlib-fasl manifest drift — discovered set does not match "
+          jb-stdlib-manifest-path "\n"
+          "  discovered (" (number->string (length disc-keys)) "): "
+          (apply string-append (map (lambda (n) (string-append n " ")) disc-keys)) "\n"
+          "  manifest   (" (number->string (length man-keys)) "): "
+          (apply string-append (map (lambda (n) (string-append n " ")) man-keys)) "\n"
+          "  Edit the manifest to match the discovered set.")))))
+
+(define (jb-strip-source-ext rel)
+  (let loop ((es ldr-source-exts))
+    (and (pair? es)
+         (let* ((suf (car es)) (m (string-length suf)) (n (string-length rel)))
+           (if (and (>= n m) (string=? (substring rel (- n m) n) suf))
+               (substring rel 0 (- n m))
+               (loop (cdr es)))))))
+
+;; Discover every install-owned source ns in first-root-wins order, dropping ones
+;; already loaded (image + CLI closure). Returns ((name . abspath) ...) in walk
+;; order. Same walk + ldr-source-path? + first-root-wins discipline as
+;; jb-emit-source-embeds.
+(define (jb-stdlib-candidates)
+  (let ((seen (make-hashtable string-hash string=?)) (out '()))
+    (for-each
+      (lambda (root)
+        (for-each
+          (lambda (rp)
+            (let* ((rel (car rp)) (abs (cdr rp)) (core (jb-strip-source-ext rel)))
+              (when (and core (ldr-source-path? rel) (not (hashtable-ref seen core #f)))
+                (hashtable-set! seen core #t)
+                (let ((ns (jb-ns-from-rel core)))
+                  ;; A file under clojure/core/ named 10-seq.clj derives the ns
+                  ;; name clojure.core.10-seq, but that is a clojure.core OVERLAY
+                  ;; SHARD (its ns form is (ns clojure.core)), not a standalone
+                  ;; namespace: load-namespace would fail to find it (ns-name->rel
+                  ;; munges the dash to an underscore) and there is nothing to
+                  ;; AOT — it is already in the image as part of clojure.core.
+                  ;; Drop a candidate whose derived name does not round-trip to a
+                  ;; findable source file.
+                  (unless (or (hashtable-ref loaded-ns ns #f)
+                              (member ns '("jolt.main" "jolt.deps"))
+                              (not (find-ns-file ns)))
+                    (set! out (cons (cons ns abs) out)))))))
+          (bld-walk-files root "" '())))
+      ldr-install-roots)
+    (reverse out)))
+
+;; ONE batch compile of every emitted stdlib .scm, in a FRESH Chez that has the
+;; SAME runtime preamble loaded as build-jolt's own header. The emitted Scheme
+;; references runtime MACROS — jolt-n-, jolt-n+, jolt-n*, jolt-n-div, jolt-n-min
+;; are define-syntax in seq.ss — which a bare (import (chezscheme)) leaves as
+;; top-level variable references, so a fasl compiled that way throws "variable
+;; jolt-n- is not bound" the moment a loaded namespace does arithmetic. Loading
+;; the preamble (rt.ss loads seq.ss) gives compile-file the macro environment
+;; the Scheme was produced under. The on-disk AOT cache never hits this because
+;; loader.ss compiles emitted Scheme IN-PROCESS (sa-compile-file) with the
+;; runtime already loaded.
+;;
+;; PAIRS is a list of (scm . so) in load order. The script loads the preamble,
+;; THEN the xpatch (cross only — the runtime must load as host-executed code
+;; first, the xpatch then retargets compile-file's code generation for the
+;; .scm files), sets the per-profile flags mirrored from the flat.ss compile
+;; step, and compile-file's every .scm -> .so. A compile failure here is a BUILD
+;; FAILURE (not a skip): with the macro environment present there is no
+;; legitimate reason emitted Scheme should fail to compile.
+(define (jb-compile-stdlib-sos! pairs)
+  (let ((cs (string-append jb-stdlib-dir "/compile-all.ss")))
+    (let ((p (open-output-file cs 'replace)))
+      (put-string p
+        (string-append
+          "(import (chezscheme))\n"
+          ;; runtime preamble — mirror build-jolt.ss's own header (lines 27-43)
+          ;; exactly, so the macro environment matches what emitted the Scheme.
+          "(load \"host/chez/scheme-adapter-runtime.ss\")\n"
+          "(load \"host/chez/rt.ss\")\n"
+          "(set-chez-ns! \"clojure.core\")\n"
+          "(load \"host/chez/seed/prelude.ss\")\n"
+          "(load \"host/chez/post-prelude.ss\")\n"
+          "(set-chez-ns! \"user\")\n"
+          "(load \"host/chez/host-contract.ss\")\n"
+          "(load \"host/chez/seed/image.ss\")\n"
+          "(load \"host/chez/compile-eval.ss\")\n"
+          "(load \"host/chez/cli-core.ss\")\n"
+          "(load \"host/chez/png.ss\")\n"
+          "(load \"host/chez/loader.ss\")\n"
+          "(load \"host/chez/java/ffi.ss\")\n"
+          (if (bld-cross?) (string-append "(load " (ei-str-lit (bld-xpatch)) ")\n") "")
+          ;; per-profile flags, mirrored from the flat.ss compile step.
+          "(optimize-level " (if jb-release? "2" "0") ")\n"
+          "(generate-inspector-information " (jb-bool (not jb-release?)) ")\n"
+          "(generate-procedure-source-information " (jb-bool (not jb-release?)) ")\n"
+          "(debug-on-exception " (jb-bool (not jb-release?)) ")\n"
+          "(fasl-compressed " (jb-bool jb-release?) ")\n"
+          (apply string-append
+            (map (lambda (sp)
+                   (string-append "(compile-file "
+                     (ei-str-lit (car sp)) " "
+                     (ei-str-lit (cdr sp)) ")\n"))
+                 pairs))))
+      (close-port p))
+    (bld-system (string-append bld-chez " --script '" cs "'"))))
+
+;; Capture one ns's emitted Scheme to its .scm. aot-capture-load evaluates the
+;; FILE through the normal load loop while teeing the per-form Scheme — the SAME
+;; path the on-disk AOT cache (aot-compile-and-cache) and clojure.core/compile
+;; (cpath-compile-load) use — so the captured string INCLUDES the ns form's
+;; requires. bld-emit-ns (whole-program APP emission) drops requires, since in an
+;; app image every dep is already present; an on-demand fasl is different —
+;; requiring jolt.fs loads its fasl but babashka.fs never arrives, leaving every
+;; proxied var unbound. aot-capture-load evals the file directly (re-evaluation
+;; at build time is fine; defonce guards hold), tees ONLY this file's forms
+;; (loader.ss:438 nested-capture discipline keeps a nested require out of this
+;; capture), and runs under the process's own compile settings — no
+;; prelude-mode/optimize/release/var-cache dynamic-wind, matching what the
+;; binary's own cache-miss path would produce at runtime. A capture returning a
+;; non-string or empty string is a BUILD FAILURE (reported), not a skip —
+;; matching cpath-compile-load's guard. A load EXCEPTION is a skip.
+(define (jb-capture-stdlib-scm! name abs scm)
+  (let ((captured-or-skip
+          (guard (e (else
+                      (let ((msg (guard (_ (#t "(unprintable)"))
+                                  (let ((m ((var-deref "jolt.host" "condition-message") e)))
+                                    (and (string? m) m)))))
+                        (display (string-append "build-jolt: stdlib-fasl FAILED " name ": " msg "\n")
+                                 (current-error-port))
+                        (cons 'skip (string-append "load failed: " msg)))))
+            (cons 'ok (aot-capture-load abs (ldr-read-source abs))))))
+    (cond
+      ((eq? (car captured-or-skip) 'skip) (cons 'skip (cdr captured-or-skip)))
+      ((or (not (string? (cdr captured-or-skip)))
+           (fx=? (string-length (cdr captured-or-skip)) 0))
+       ;; empty capture for a real ns is a build failure — escapes this function
+       ;; (no guard here) so it aborts the build rather than silently skipping.
+       (error 'build-jolt
+         (string-append "stdlib-fasl capture produced no code for " name)))
+      (else
+       (let ((outp (open-output-file scm 'replace)))
+         (put-string outp (cdr captured-or-skip))
+         (close-port outp))
+       'ok))))
+
+;; Capture (aot-capture-load) every candidate ns to its own fasl, then ONE batch
+;; compile. Returns two values: (name . so) that captured OK (in load order) and
+;; (name . reason) that were skipped. A manifest-declared skip is never
+;; load-attempted. A load exception is a skip with a reason; an empty capture is
+;; a build failure (see jb-capture-stdlib-scm!).
+(define (jb-compile-stdlib-fasls!)
+  (define-values (man-embed man-skips) (jb-read-stdlib-manifest))
+  (bld-system (string-append "mkdir -p '" jb-stdlib-dir "'"))
+  (let ((order '()) (to-compile '()) (skips (reverse man-skips)))
+    (parameterize ((ldr-source-only? #t))
+      (set-ns-loaded-hook! (lambda (name file) #f))
+      (for-each
+        (lambda (nf)
+          (let* ((name (car nf)) (abs (cdr nf)) (san (jb-sanitize name))
+                 (scm (string-append jb-stdlib-dir "/" san ".scm"))
+                 (so (string-append jb-stdlib-dir "/" san ".so")))
+            (if (assoc name skips)
+                ;; manifest-declared skip — already in skips with its verified
+                ;; reason; do not load-attempt. jb-emit-stdlib-fasls! prints
+                ;; all skips once at the end.
+                (if #f #f)
+                (let ((r (jb-capture-stdlib-scm! name abs scm)))
+                  (cond
+                    ((eq? r 'ok)
+                     (set! order (cons (cons name so) order))
+                     (set! to-compile (cons (cons scm so) to-compile)))
+                    ((pair? r)
+                     (set! skips (cons (cons name (cdr r)) skips))))))))
+        (jb-stdlib-candidates))
+      (set-ns-loaded-hook! (lambda (name file) #f)))
+    ;; ONE batch compile with the runtime preamble loaded (see jb-compile-stdlib-sos!).
+    ;; A failure here is a BUILD FAILURE — captured Scheme must compile once the
+    ;; macro environment is present.
+    (jb-compile-stdlib-sos! (reverse to-compile))
+    (values (reverse order) (reverse skips))))
+
+;; Compile the stdlib fasls (jb-compile-stdlib-fasls!, unchanged), concatenate
+;; them into ONE blob file, and record an index of (ns offset length) into
+;; jb-stdlib-index. The blob is xxd'd into the binary as the C array
+;; jolt_stdlib_fasls (step 3, below); the index — small — is the ONLY thing baked
+;; into flat.ss for the stdlib, via the launcher's jolt-stdlib-fasls-attach! call.
+;; Putting the multi-MB fasl bytes into flat.ss as boot-image literals regresses
+;; startup (the hard floor), and ei-bytes-lit corrupts them anyway — it round-
+;; trips through utf8->string, which arbitrary binary does not survive. Runs the
+;; manifest drift check. Called inside the flat.ss emit block, before the
+;; launcher (which renders jb-stdlib-index) and before step 3 (which xxd's the
+;; blob).
+(define (jb-emit-stdlib-fasls! out)
+  (define-values (embedded skips) (jb-compile-stdlib-fasls!))
+  (jb-stdlib-manifest-check! (append (map car embedded) (map car skips)))
+  (set! jb-stdlib-blob-path (string-append jb-build "/stdlib_fasls.blob"))
+  (let ((outp (open-file-output-port jb-stdlib-blob-path (file-options no-fail) (buffer-mode block)))
+        (index '())
+        (total 0))
+    (for-each
+      (lambda (nf)
+        (let* ((name (car nf)) (bv (read-file-bytes (cdr nf))) (len (bytevector-length bv)))
+          (put-bytevector outp bv)
+          (set! index (cons (list name total len) index))
+          (set! total (+ total len))))
+      embedded)
+    ;; Empty blob (every candidate skipped): keep the C array non-degenerate so
+    ;; the symbol is well-defined and the link is unconditional. The index stays
+    ;; empty, so nothing derefs it — behavior is exactly today's source path.
+    (when (fx=? total 0)
+      (put-bytevector outp (bytevector 0)))
+    (close-port outp)
+    (set! jb-stdlib-index (reverse index)))
+  (put-string out "\n;; === embedded stdlib fasls (per-namespace, in one C-array blob) ===\n")
+  (for-each
+    (lambda (s)
+      (display (string-append "build-jolt: stdlib-fasl skip " (car s) " — " (cdr s) "\n")))
+    skips))
+
+(define jb-stdlib-dir (string-append jb-build "/stdlib"))
+
+;; index of needle in s, or #f
+(define (jb-str-index s needle)
+  (let ((n (string-length s)) (m (string-length needle)))
+    (let loop ((i 0))
+      (cond ((> (+ i m) n) #f)
+            ((string=? (substring s i (+ i m)) needle) i)
+            (else (loop (+ i 1)))))))
+
+(define (jb-demunge-seg s)
+  (list->string (map (lambda (c) (if (char=? c #\_) #\- c)) (string->list s))))
+
+;; Inverse of ns-name->rel for a root-relative path WITH its extension stripped:
+;; split on '/' and '.', unmunge each segment '_'->'-', join with '.'.
+;; "jolt/backend_scheme" -> "jolt.backend-scheme".
+(define (jb-ns-from-rel core)
+  (let loop ((cs (string->list core)) (seg '()) (segs '()))
+    (cond
+      ((null? cs)
+       (let ((all (reverse (cons (list->string (reverse seg)) segs))))
+         (let join ((xs all) (acc ""))
+           (if (null? xs)
+               acc
+               (let ((piece (jb-demunge-seg (car xs))))
+                 (join (cdr xs)
+                       (if (string=? acc "") piece (string-append acc "." piece))))))))
+      ((or (char=? (car cs) #\/ ) (char=? (car cs) #\.))
+       (loop (cdr cs) '() (cons (list->string (reverse seg)) segs)))
+      (else (loop (cdr cs) (cons (car cs) seg) segs)))))
+
+;; Filesystem-safe form of an ns name for per-ns .scm/.so under the build dir.
+(define (jb-sanitize name)
+  (list->string
+    (map (lambda (c) (cond ((char=? c #\.) #\_) ((char=? c #\/) #\_) (else c)))
+         (string->list name))))
+
 (display "build-jolt: emitting flat source\n")
 (let ((out (open-output-file jb-flat-ss 'replace)))
   ;; Bake the version FIRST: rt.ss's jolt-version-string probes this binding via
@@ -302,6 +624,11 @@
   ;; ~380ms analyze/emit cost on EVERY process start.
   (put-string out "\n;; === AOT jolt.main + jolt.deps (emitted Scheme) ===\n")
   (jb-emit-cli-ns out)
+  ;; Embedded stdlib fasls: load+emit+compile each remaining install-owned ns and
+  ;; bake its fasl as register-embedded-fasl!, so a require loads compiled code
+  ;; instead of recompiling from source. MUST run before flat.ss is written (it
+  ;; emits into out) and before the fingerprint step (bytes are part of the hash).
+  (jb-emit-stdlib-fasls! out)
   (put-string out "\n;; === jolt launcher ===\n")
   (jb-emit-launcher out)
   (close-port out))
@@ -335,7 +662,6 @@
 ;; jolt building (non-eval) apps, where no Chez is available.
 (define jb-flat-so (string-append jb-build "/flat.so"))
 (define jb-boot (string-append jb-build "/jolt.boot"))
-(define jb-bool (lambda (b) (if b "#t" "#f")))
 (display (string-append "build-jolt: compiling (" jb-profile " profile)\n"))
 (let ((cs (string-append jb-build "/compile.ss")))
   (let ((p (open-output-file cs 'replace)))
@@ -379,6 +705,13 @@
 (jb-c-array (string-append (bld-csv-dir) "/scheme.h") (string-append jb-build "/schemeh_data.h") "jolt_scheme_h")
 (jb-c-array (string-append (bld-csv-dir) "/libkernel.a") (string-append jb-build "/libkernel_data.h") "jolt_libkernel_a")
 (jb-c-array "host/chez/stub/launcher.c" (string-append jb-build "/launcherc_data.h") "jolt_launcher_c")
+;; The embedded stdlib fasl blob (one concatenated .so per install-owned ns).
+;; jb-emit-stdlib-fasls! wrote it during flat.ss emission; it is absent only when
+;; that step never ran, which never happens in a real build. A 1-byte placeholder
+;; keeps the symbol non-degenerate when every candidate was skipped (empty index,
+;; so nothing derefs it).
+(when (and jb-stdlib-blob-path (file-exists? jb-stdlib-blob-path))
+  (jb-c-array jb-stdlib-blob-path (string-append jb-build "/stdlib_fasls_data.h") "jolt_stdlib_fasls"))
 
 (define jb-main-c (string-append jb-build "/main.c"))
 (let ((mc (open-output-file jb-main-c 'replace)))
@@ -392,6 +725,7 @@
       "#include \"schemeh_data.h\"\n"
       "#include \"libkernel_data.h\"\n"
       "#include \"launcherc_data.h\"\n"
+      "#include \"stdlib_fasls_data.h\"\n"
       "int main(int argc, char *argv[]) {\n"
       "  Sscheme_init(0);\n"
       "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, jolt_boot_len);\n"

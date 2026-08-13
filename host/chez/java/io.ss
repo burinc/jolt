@@ -67,6 +67,55 @@
   (let ((v (hashtable-ref embedded-resources name #f)))
     (and (bytevector? v) v)))
 
+;; Embedded compiled fasls for install-owned stdlib namespaces. build-jolt bakes
+;; one fasl per namespace into the binary so a require loads the compiled code
+;; instead of recompiling from source on every process start. Same seam and
+;; locking discipline as register-embedded-resource! (written only at heap-build
+;; time, single-threaded before scheme-start; read at runtime by single-key
+;; hashtable-ref, safe on strong-general hashtables). Keyed by ns name, not path.
+;;
+;; Two ways in. register-embedded-fasl! is the explicit registry: tests and other
+;; embedders can hand a bytevector directly. The built binary does NOT bake the
+;; (multi-MB) fasl bytes as boot-image literals — that regresses startup, since a
+;; flat.ss literal re-materializes at every Sbuild_heap. Instead build-jolt xxd's
+;; one concatenated blob into the linked binary as the C array jolt_stdlib_fasls
+;; (-rdynamic exports it) and records an index of (ns offset length) triples; the
+;; launcher calls jolt-stdlib-fasls-attach! with that index before any require.
+;; jolt-embedded-fasl then memcpy's the slice out of the C array on demand — once
+;; per ns per process, never cached.
+(define embedded-fasls (make-hashtable string-hash string=?))
+(define (register-embedded-fasl! name bv) (hashtable-set! embedded-fasls name bv))
+;; ns-name -> (offset . length) into the linked jolt_stdlib_fasls C array.
+;; Populated once by the launcher's jolt-stdlib-fasls-attach!; empty in every
+;; path that carries no such array (dev bin/jolt, devcache, app binaries).
+(define embedded-fasl-index (make-hashtable string-hash string=?))
+(define (jolt-stdlib-fasls-attach! index)
+  (for-each (lambda (entry)
+              (hashtable-set! embedded-fasl-index (car entry)
+                              (cons (cadr entry) (caddr entry))))
+            index))
+;; memcpy `length` bytes at `offset` out of the jolt_stdlib_fasls C array into a
+;; fresh bytevector. #f when the symbol is absent (dev/devcache/apps carry no such
+;; array) or the fetch raises, so the caller falls back to today's source path.
+;; sa-foreign-entry-address (foreign-entry) returns an integer address, so
+;; base+offset is plain arithmetic. Same memcpy pattern as the launcher's
+;; jolt-materialize-bundles!.
+(define (jolt-stdlib-fasl-fetch offset length)
+  (guard (e (else #f))
+    (sa-load-shared-object #f)
+    (let* ((base (sa-foreign-entry-address "jolt_stdlib_fasls"))
+           (bv (make-bytevector length))
+           (memcpy (sa-foreign-procedure "memcpy" (u8* uptr uptr) void*)))
+      (memcpy bv (+ base offset) length)
+      bv)))
+(define (jolt-embedded-fasl name)
+  (let ((v (hashtable-ref embedded-fasls name #f)))
+    (cond
+      ((bytevector? v) v)
+      (else
+       (let ((ol (hashtable-ref embedded-fasl-index name #f)))
+         (and ol (jolt-stdlib-fasl-fetch (car ol) (cdr ol))))))))
+
 ;; --- with-port: open a port, do work, close on success or throw ----------------
 (define (with-port port proc)
   (guard (e (#t (guard (_ (#t #f)) (close-port port)) (raise e)))
