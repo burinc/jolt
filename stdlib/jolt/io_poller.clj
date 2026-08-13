@@ -119,6 +119,25 @@
     (ffi/read buf :uptr (* i KEVENT-SIZE))
     (ffi/read buf :uint (+ (* i EPOLL-EVENT-SIZE) 4))))
 
+;; Diagnosis counters (debug-state): kevent reports a changelist entry it could
+;; not process — an EV_DELETE for an already-closed fd is the common one — as an
+;; EV_ERROR (#x4000) EVENT in the eventlist rather than failing the call, and
+;; ev-fd's caller would otherwise treat that error entry as readiness for
+;; whatever socket currently owns the reused fd number. stale-consumes counts
+;; wait-fiber fast-path hits on a ready flag left by a PREVIOUS owner of the fd
+;; (:fds entries are never removed, so a one-read socket leaves ready=true
+;; behind forever).
+(def ^:private ev-errors (atom 0))
+(def ^:private stale-consumes (atom 0))
+;; flags is a u16 at offset 10 and the FFI reads no 16-bit type: read the u32 at
+;; offset 8 (little-endian: filter in the low half, flags in the high half) and
+;; test EV_ERROR (#x4000) against the high half.
+(defn- ev-error? [buf i]
+  (and macos?
+       (pos? (bit-and (unsigned-bit-shift-right
+                        (ffi/read buf :uint (+ (* i KEVENT-SIZE) 8)) 16)
+                      0x4000))))
+
 (defn- kevent-put! [buf i fd filt flags]
   (let [o (* i KEVENT-SIZE)]
     (ffi/write buf :uptr o fd)
@@ -208,7 +227,10 @@
                                 (c-epoll-wait kq evbuf 256 -1))]
               (if (neg? n) []
                   (loop [i 0 acc []]
-                    (if (< i n) (recur (inc i) (conj acc (ev-fd evbuf i))) acc))))
+                    (if (< i n)
+                      (do (when (ev-error? evbuf i) (swap! ev-errors inc))
+                          (recur (inc i) (conj acc (ev-fd evbuf i))))
+                      acc))))
             (finally (ffi/free evbuf))))
         (finally (when chbuf (ffi/free chbuf)))))))
 
@@ -237,6 +259,43 @@
           (doseq [f woken] (jolt.host/fiber-resume f))
           (recur new-del))
         (recur #{})))))
+
+;; The fd's story ends with its socket. Drop the table entry and any pending
+;; registration, and wake anything still parked on it: the kernel auto-removes
+;; a closed fd from the kqueue/epoll set, so no event is coming for a parked
+;; reader — a close racing a parked read otherwise sleeps forever. The woken
+;; read sees EBADF/EOF and surfaces through the normal error path. This also
+;; means a REUSED fd number always starts with a fresh entry: a previous
+;; owner's ready=true tombstone (set by its final event, consumable only by a
+;; next wait that never came) made every new socket's first wait skip its park
+;; and re-register — one extra wake/park race per socket per round, which is
+;; the amplification that made the park-commit race observable at all.
+(defn forget! [fd]
+  (let [woken (locking pm
+                (let [e (get-in @state [:fds fd])]
+                  (swap! state update :pending dissoc fd)
+                  (swap! state update :fds dissoc fd)
+                  (:waiters e)))]
+    (doseq [f woken] (jolt.host/fiber-resume f))))
+
+;; A point-in-time classification of the poller's table, for a stress gate to
+;; print WHEN it loses a wakeup — which of the stages lost it is otherwise
+;; unrecoverable after the sockets close. Cheap and lock-free on purpose: one
+;; atom read; the caller is already in a failure path.
+;;   :pending entries  -> registered, never drained into the kernel set
+;;   ready=false + waiters>0 -> in the kernel set (or add failed silently),
+;;                              event never fired
+;;   ready=true + waiters=0  -> event fired and waiters were collected; the
+;;                              fiber resume was lost after that
+(defn debug-state []
+  (let [s @state]
+    {:pending (:pending s)
+     :waits @waits
+     :ev-errors @ev-errors
+     :stale-consumes @stale-consumes
+     :fds (into {} (map (fn [[fd e]]
+                          [fd {:ready (:ready e) :waiters (count (:waiters e))}])
+                        (:fds s)))}))
 
 (defn- ensure-started! []
   ;; under pm. One poller thread per process, started on the first fiber wait.
@@ -269,7 +328,8 @@
                 (ensure-started!)
                 (let [e (get-in @state [:fds fd])]
                   (if (and e (:ready e))
-                    (do (swap! state assoc-in [:fds fd :ready] false) false)
+                    (do (swap! stale-consumes inc)
+                        (swap! state assoc-in [:fds fd :ready] false) false)
                     (do (swap! state assoc-in [:fds fd]
                                {:waiters (conj (or (:waiters e) []) (jolt.host/current-fiber))
                                 :ready false :filt filt})

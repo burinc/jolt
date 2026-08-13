@@ -194,7 +194,12 @@
 (defn- socket-close! [self]
   (when-not (jolt.host/ref-get self :closed?)
     (jolt.host/ref-put! self :closed? true)
-    (c-close (jolt.host/ref-get self :fd)))
+    (let [fd (jolt.host/ref-get self :fd)]
+      (c-close fd)
+      ;; close first, then forget: forget! wakes any reader still parked on the
+      ;; fd (no event is coming — close removed it from the kernel set), and a
+      ;; woken read must see EBADF, not EAGAIN-and-repark on a dying socket.
+      (poller/forget! fd)))
   nil)
 
 (defn- socket-connect! [self endpoint]
@@ -419,7 +424,9 @@
    (fn [self]
      (when-not (jolt.host/ref-get self :closed?)
        (jolt.host/ref-put! self :closed? true)
-       (c-close (jolt.host/ref-get self :fd)))
+       (let [fd (jolt.host/ref-get self :fd)]
+         (c-close fd)
+         (poller/forget! fd)))   ; see socket-close!
      nil)
 
    "isClosed"     (fn [self] (boolean (jolt.host/ref-get self :closed?)))

@@ -33,6 +33,7 @@
 ;; since.) What made that one run wedge is still unknown; this is what will say
 ;; where it was the next time.
 (require '[jolt.socket])
+(require '[jolt.io-poller])
 (require '[clojure.core.async :as a])
 
 (def rounds 40)
@@ -67,6 +68,12 @@
     (let [got (doall (for [[i o] (map-indexed vector outs)]
                        (do (at! (str "collecting " i " of " per))
                            (first (a/alts!! [o (a/timeout 2000)])))))]
+      ;; Classify a loss BEFORE the closes tear the evidence down: the poller
+      ;; table snapshot (jolt.io-poller/debug-state) says which stage dropped
+      ;; the wakeup — still :pending (never drained), waiters parked with no
+      ;; event (kernel set), or ready-with-no-waiters (resume lost).
+      (when (< (count (filter #(= "x" %) got)) per)
+        (println "POLLER-DEBUG" (pr-str (jolt.io-poller/debug-state))))
       (at! :closing)
       (doseq [c clients] (.close c))
       (doseq [s srvs] (.close s))
