@@ -47,6 +47,15 @@
     "syntax-quote" "var" "letfn*" "set!" "defmacro"
     "monitor-enter" "monitor-exit"})
 
+;; ...of which these dispatch ONLY namespace-qualified. `syntax-quote` names no
+;; Clojure special form — it is jolt's marker for a `, which the reader always
+;; emits as clojure.core/syntax-quote. Letting the bare name dispatch reserved it
+;; against every program: a var or local called syntax-quote compiled into a
+;; syntax-quote of its first argument instead of a call (edamame names its own
+;; resolver that). The qualified spelling is unreachable from user source in
+;; practice, and matches how the reader spells ~ and ~@.
+(def ^:private qualified-only #{"syntax-quote"})
+
 (defn- uncompilable [why]
   (throw (str "jolt/uncompilable: " why)))
 
@@ -1044,7 +1053,8 @@
             ;; namespace-qualifies a macro like `letfn` to `clojure.core/letfn`
             ;; (matching Clojure, where it is a macro), so a macro-emitted
             ;; (clojure.core/letfn …) must still dispatch to the special form.
-            sf-name (or hname
+            ;; A `qualified-only` head is the reverse: bare, it is just a name.
+            sf-name (or (when-not (contains? qualified-only hname) hname)
                         (when (and (form-sym? head)
                                    (= "clojure.core" (form-sym-ns head))
                                    (contains? handled (form-sym-name head)))

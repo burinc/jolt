@@ -550,12 +550,66 @@
 ;; Drain a jhost reader (StringReader / PushbackReader): read code units from the
 ;; current position to EOF (-1) and assemble the string. Used by slurp; advances
 ;; the reader, as on the JVM.
-(define (drain-reader r)
+;;
+;; The generic way to do that is one record-method-dispatch per CODE UNIT, which
+;; is a quarter-million dispatches for a 250KB source — and `read` over a host
+;; reader drains, parses one form and pushes the tail back, so a caller reading a
+;; file form by form pays that per FORM. Reading clojure/core.clj through
+;; (read {:eof …} rdr) took 37s that way, against the JVM's 0.06s. These readers
+;; are string-backed, so take the remaining text in one substring when the shape
+;; allows and keep the dispatch loop for everything else (a char-reader over a
+;; Chez port, a library's own reader shim).
+(define (string-reader-jhost? x)
+  (and (jhost? x) (string=? (jhost-tag x) "string-reader")))
+
+;; the code units already pushed back, in the order a read would hand them out
+(define (pbr-pushed-string r)
+  (let loop ((ps (vector-ref (jhost-state r) 1)) (acc '()))
+    (if (null? ps)
+        (list->string (reverse acc))
+        (loop (cdr ps) (cons (integer->char (jnum->exact (car ps))) acc)))))
+
+;; A line-numbering reader folds \r\n and a lone \r to one \n and counts a line
+;; for each, one character at a time (pbr-read-translated). A bulk drain has to
+;; leave exactly the state that loop would have: same text, same line/column, and
+;; the same "a \n right after this \r is already counted" flag.
+(define (pbr-fold-and-count! st s)
+  (let ((n (string-length s)))
+    (let loop ((i 0) (acc '()) (line (vector-ref st 3)) (col (vector-ref st 4))
+               (skip-lf (vector-ref st 5)))
+      (if (fx>=? i n)
+          (begin (vector-set! st 3 line) (vector-set! st 4 col) (vector-set! st 5 skip-lf)
+                 (list->string (reverse acc)))
+          (let ((c (string-ref s i)))
+            (cond
+              ((and skip-lf (char=? c #\newline)) (loop (fx+ i 1) acc line col #f))
+              ((or (char=? c #\return) (char=? c #\newline))
+               (loop (fx+ i 1) (cons #\newline acc) (fx+ line 1) 0 (char=? c #\return)))
+              (else (loop (fx+ i 1) (cons c acc) line (fx+ col 1) #f))))))))
+
+(define (drain-reader-by-dispatch r)
   (let loop ((acc '()))
     (let ((u (record-method-dispatch r "read" jolt-nil)))
       (if (or (jolt-nil? u) (and (number? u) (< u 0)))
           (list->string (reverse acc))
           (loop (cons (integer->char (exact (truncate u))) acc))))))
+
+(define (drain-reader r)
+  (cond
+    ;; a StringReader: the rest of its string, in one copy
+    ((string-reader-jhost? r)
+     (let* ((s (sr-s r)) (p (sr-pos r)) (n (string-length s)))
+       (if (fx>=? p n) "" (begin (sr-pos! r n) (substring s p n)))))
+    ;; a PushbackReader over one: the pushback buffer (which sits ABOVE the
+    ;; translation, so it is handed back raw) then the wrapped reader's rest
+    ((and (jhost? r) (pushback-reader-tag? (jhost-tag r))
+          (string-reader-jhost? (vector-ref (jhost-state r) 0)))
+     (let* ((st (jhost-state r))
+            (pushed (pbr-pushed-string r))
+            (rest (drain-reader (vector-ref st 0))))
+       (vector-set! st 1 '())
+       (string-append pushed (if (vector-ref st 2) (pbr-fold-and-count! st rest) rest))))
+    (else (drain-reader-by-dispatch r))))
 
 (define (reader-jhost? x)
   (and (jhost? x)
@@ -570,14 +624,47 @@
     ((pushback-reader-tag? (jhost-tag r))
      (vector-set! (jhost-state r) 0 (host-new "StringReader" s))
      (vector-set! (jhost-state r) 1 '()))))
-;; Read ONE form from a host reader (StringReader/PushbackReader): drain the
-;; remaining chars, parse one form, push the tail back. -> (values form found?).
-;; (read r) over a java.io reader — cuerdas' interpolation reads this way.
+;; The StringReader a host reader ultimately reads out of, when it has one and
+;; nothing sits between the caller and it: -> (values string-reader ln-state),
+;; where ln-state is the pushback reader's own state vector for the line-numbering
+;; subclass (whose counters a read has to advance) and #f otherwise. Characters
+;; pushed back sit ABOVE the string and would be skipped by an index read, so a
+;; non-empty pushback buffer declines — (values #f #f).
+(define (host-reader-string-cursor r)
+  (cond
+    ((string-reader-jhost? r) (values r #f))
+    ((and (jhost? r) (pushback-reader-tag? (jhost-tag r))
+          (null? (vector-ref (jhost-state r) 1))
+          (string-reader-jhost? (vector-ref (jhost-state r) 0)))
+     (values (vector-ref (jhost-state r) 0)
+             (and (vector-ref (jhost-state r) 2) (jhost-state r))))
+    (else (values #f #f))))
+
+;; Read ONE form from a host reader (StringReader/PushbackReader), advancing it
+;; past exactly that form. -> (values form found?). (read r) over a java.io reader
+;; — cuerdas' interpolation reads this way, and so does anything reading a source
+;; file form by form.
+;;
+;; A string-backed reader parses AT its current index and moves the index; the
+;; drain-parse-refill fallback below re-materializes the whole remaining input per
+;; form, which is quadratic over a file. The fallback still covers a char-reader
+;; over a Chez port, a library's own reader shim, and a reader with pushback.
 (define (host-reader-read-form r)
-  (let* ((s (drain-reader r)) (pr (jolt-parse-next s)))
-    (if (jolt-nil? pr)
-        (begin (reader-refill! r "") (values jolt-nil #f))
-        (begin (reader-refill! r (jolt-nth pr 1)) (values (jolt-nth pr 0) #t)))))
+  (let-values (((sr lnst) (host-reader-string-cursor r)))
+    (if sr
+        (let* ((s (sr-s sr)) (i (sr-pos sr)) (pr (rdr-parse-at s i)))
+          (if (not pr)
+              (begin (sr-pos! sr (string-length s)) (values jolt-nil #f))
+              (let ((j (cdr pr)))
+                ;; the line-numbering reader counts what a char-by-char read would
+                ;; have counted over the span this form consumed
+                (when lnst (pbr-fold-and-count! lnst (substring s i j)))
+                (sr-pos! sr j)
+                (values (car pr) #t))))
+        (let* ((s (drain-reader r)) (pr (jolt-parse-next s)))
+          (if (jolt-nil? pr)
+              (begin (reader-refill! r "") (values jolt-nil #f))
+              (begin (reader-refill! r (jolt-nth pr 1)) (values (jolt-nth pr 0) #t)))))))
 
 ;; clojure.edn/read over a reader: drain the jhost reader to a string and read the
 ;; first EDN form (read-string). Re-asserted over the prelude in post-prelude.ss.

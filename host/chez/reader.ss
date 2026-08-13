@@ -887,12 +887,19 @@
             ;; syntax-quote of a self-evaluating literal collapses to the literal at
             ;; READ time (Clojure's reader), so nested backticks over a literal are
             ;; inert: ``42 reads as 42, ```"meow" as "meow".
+            ;;
+            ;; The marker is clojure.core-QUALIFIED, for the same reason ~ and ~@
+            ;; below are: it is a name jolt invents, and a bare one would reserve
+            ;; `syntax-quote` against every program that wants it. The JVM has no
+            ;; special form of this name (its reader expands ` outright), so a var
+            ;; or local called syntax-quote is legal there and must stay legal here
+            ;; — edamame names its own resolver that and :refers it in.
             ((char=? c #\`)
              (let-values (((form j) (rdr-read-form s (+ i 1) end)))
                (when (rdr-eof? form) (rdr-error s i "EOF after `"))
                (values (if (rdr-self-eval-literal? form)
                            form
-                           (jolt-list (jolt-symbol #f "syntax-quote") form))
+                           (jolt-list (jolt-symbol "clojure.core" "syntax-quote") form))
                        j)))
             ((char=? c #\@) (rdr-wrap s (+ i 1) end (jolt-symbol "clojure.core" "deref")))
             ;; ~ / ~@ read as clojure.core/unquote(-splicing), like the JVM reader —
@@ -1097,8 +1104,11 @@
 ;; the special-form heads plus the reader-macro markers. Shared by the data path
 ;; (rdr-sq-symbol) and the compile path (host-contract.ss hc-sq-symbol), so a
 ;; special added here is honored by both `read-string and a compiled `.
+;; NOT here: "syntax-quote". It names no Clojure special form, so `syntax-quote
+;; qualifies to the current ns like any other symbol; jolt's own ` marker is
+;; already clojure.core-qualified and so is never a candidate for qualification.
 (define jsq-specials
-  '("quote" "syntax-quote" "unquote" "unquote-splicing" "do" "if" "def"
+  '("quote" "unquote" "unquote-splicing" "do" "if" "def"
     "fn*" "let*" "loop*" "recur" "throw" "try" "set!" "var" "new" "."
     "&" "catch" "finally" "case*" "letfn*" "monitor-enter" "monitor-exit"
     "reify*" "deftype*"))
@@ -1234,13 +1244,15 @@
 (define (rdr-syntax-quote-lower form)
   (rdr-sq-lower form (make-hashtable string-hash string=?)))
 
-;; Check if a cseq form is (syntax-quote ...) — the raw form the reader emits for `.
+;; Check if a cseq form is (clojure.core/syntax-quote ...) — the raw form the
+;; reader emits for `. The qualification is the point: a BARE (syntax-quote x) is
+;; an ordinary call to whatever the program means by that name, not a marker.
 (define (rdr-syntax-quote-form? x)
   (and (cseq? x)
        (let ((h (seq-first x)))
          (and (symbol-t? h) (string=? (symbol-t-name h) "syntax-quote")
               (let ((ns (symbol-t-ns h)))
-                (or (jolt-nil? ns) (null? ns) (not ns)))))))
+                (and (string? ns) (string=? ns "clojure.core")))))))
 
 ;; rdr-un-datafy: reverse rdr-datafy. (quote x) → x, (clojure.core/vector ...)
 ;; → vector, (clojure.core/list ...) → list. pmap args (from jolt-hash-map) are
@@ -1381,6 +1393,17 @@
       (if (rdr-eof? form)
           jolt-nil
           (jolt-vector (rdr-form->data form) (substring s j end))))))
+
+;; The same read, at an INDEX into s rather than off the front: (form . next-index),
+;; or #f when only whitespace/comments remain. Handing back an index instead of the
+;; rest of the string is what keeps a caller that reads a source file form by form
+;; linear — jolt-parse-next copies the whole remaining input on every call, and a
+;; host reader read that way (java/io.ss host-reader-read-form) was quadratic.
+;; Scheme-level, for that one caller: the jolt-visible __parse-next is unchanged.
+(define (rdr-parse-at s i)
+  (let ((end (string-length s)))
+    (let-values (((form j) (rdr-read-top s i end)))
+      (and (not (rdr-eof? form)) (cons (rdr-form->data form) j)))))
 
 ;; __read-tagged: apply a built-in data reader to an already-read form. The tag
 ;; is the :#name keyword the reader produced; #uuid/#inst reuse the inst-time ctors.

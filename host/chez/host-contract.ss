@@ -186,8 +186,11 @@
 ;; `eval` is NOT here: it is a clojure.core FUNCTION on the spine (compile-eval.ss
 ;; def-var!s it), so it must resolve as an ordinary var, not punt.
 ;; `defmacro` stays special — the spine intercepts it before analysis.
+;; `syntax-quote` is NOT here: jolt's ` marker is clojure.core-qualified, and the
+;; bare name reserves nothing (no Clojure special form goes by it), so a program
+;; is free to define one — reserving it silently miscompiled every call.
 (define hc-special-names
-  '("quote" "syntax-quote" "unquote" "unquote-splicing" "do" "if" "def"
+  '("quote" "unquote" "unquote-splicing" "do" "if" "def"
     "defmacro" "fn*" "let*" "loop*" "recur" "throw" "try" "set!" "new"
     "." "gen-class" "monitor-enter" "monitor-exit" "letfn"))
 (define (hc-interop-head? name)
