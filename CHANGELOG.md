@@ -5,6 +5,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.8] - 2026-08-12
+
+Two things that only show up when something else goes wrong. A dependency fetch
+that failed reported the dependency as missing, which is the wrong place to look;
+and an nREPL's listening socket was inherited by every subprocess, so the port
+outlived the server holding it.
+
+### Fixed
+
+- **A failed `git ls-remote` is no longer reported as a missing tag.** Every
+  non-zero exit collapsed into "not found", so a reset, a rate limit or an
+  unreachable host read as *this tag does not exist* — sending you to the
+  repository and the pin instead of to the fetch. It now says which happened, and
+  carries git's own message:
+
+  ```
+  git dep: could not list <url> (git ls-remote exited 128: fatal: '<path>' does
+  not appear to be a git repository)
+  ```
+
+  A tag the repository genuinely lacks still reports "tag not found", unchanged.
+  This is the distinction the Maven path already made, for the same reason.
+
+- **The nREPL listen socket no longer survives into child processes.** Without
+  close-on-exec, every subprocess spawned from a process running an nREPL
+  inherited a duplicate of the listening socket, and the port stayed bound for as
+  long as any of them lived — so killing the server left the next start unable to
+  bind its nREPL, against a server that was already gone. `SOCK_CLOEXEC` on Linux
+  so the descriptor is never briefly inheritable, `fcntl` `F_SETFD` elsewhere on
+  POSIX, and neither on Windows, which controls inheritance with
+  `HANDLE_FLAG_INHERIT`.
+
 ## [0.7.7] - 2026-08-12
 
 Reading. Running [edamame](https://github.com/borkdude/edamame)'s own test suite
