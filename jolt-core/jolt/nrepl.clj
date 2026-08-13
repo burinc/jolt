@@ -64,10 +64,17 @@
   (do
     (ffi/defcfn c-recv  "recv"  [:int :pointer :size_t :int] :ssize_t :blocking)
     (ffi/defcfn c-send  "send"  [:int :pointer :size_t :int] :ssize_t :blocking)
-    (ffi/defcfn c-close "close" [:int] :int)))
+    (ffi/defcfn c-close "close" [:int] :int)
+    ;; fcntl is variadic (int fd, int cmd, ...). The :varargs marker sits at the
+    ;; fixed/variadic boundary; a fixed-arity binding silently corrupts the
+    ;; stack-passed argument on Apple arm64. POSIX only — Windows controls
+    ;; inheritance with HANDLE_FLAG_INHERIT, not FD_CLOEXEC.
+    (ffi/defcfn c-fcntl-set "fcntl" [:int :int :varargs :int] :int)))
 
 (def ^:private AF-INET 2)
 (def ^:private SOCK-STREAM 1)
+;; Linux can ask socket(2) for close-on-exec directly; macOS and Windows cannot.
+(def ^:private sock-cloexec (if (or macos? windows?) 0 0x80000))
 ;; SOL_SOCKET / SO_REUSEADDR: 0xffff / 4 on macOS and Windows, 1 / 2 on Linux.
 (def ^:private sol-socket (if (or macos? windows?) 0xffff 1))
 (def ^:private so-reuse   (if (or macos? windows?) 4 2))
@@ -94,16 +101,37 @@
     (ffi/write sa :uint8 4 127) (ffi/write sa :uint8 7 1)   ; 127.0.0.1
     sa))
 
+(defn- close-on-exec!
+  "Mark the listen fd so a child process does not inherit it.
+
+  Without this every subprocess spawned from a process running an nREPL holds a
+  duplicate of the listening socket, and the port stays bound for as long as any
+  of them lives. Seen directly: a veriframe server with four Prolog sessions
+  showed `jolt` and four `swipl` all holding 127.0.0.1:7888 on fd 10, so killing
+  the server left the port bound by engine subprocesses and the next start could
+  not bind its nREPL.
+
+  Best effort, and POSIX only: failing to set it costs inheritance, not
+  correctness, and Windows has no FD_CLOEXEC (it uses HANDLE_FLAG_INHERIT).
+  F_SETFD is 2 and FD_CLOEXEC is 1 on both macOS and Linux."
+  [fd]
+  (when-not windows?
+    (try (c-fcntl-set fd 2 1) (catch Throwable _ nil)))
+  fd)
+
 (defn- listen-socket [port]
   (ensure-winsock!)                                          ; no-op off Windows
-  (let [fd (c-socket AF-INET SOCK-STREAM 0)]
+  ;; SOCK_CLOEXEC where the platform has it, so the fd is never briefly
+  ;; inheritable between socket() and fcntl(). Linux only; macOS relies on the
+  ;; fcntl below, and Windows on neither.
+  (let [fd (c-socket AF-INET (bit-or SOCK-STREAM sock-cloexec) 0)]
     (when (neg? fd) (throw (ex-info "socket() failed" {})))
     (let [opt (ffi/alloc 4)] (ffi/write opt :int 0 1) (c-setsockopt fd sol-socket so-reuse opt 4) (ffi/free opt))
     (let [sa (make-sockaddr port)]
       (when (neg? (c-bind fd sa 16)) (c-close fd) (ffi/free sa) (throw (ex-info (str "bind() failed on port " port) {})))
       (ffi/free sa))
     (when (neg? (c-listen fd 16)) (c-close fd) (throw (ex-info "listen() failed" {})))
-    fd))
+    (close-on-exec! fd)))
 
 ;; bytes flow as latin1 strings on the wire (1 char = 1 byte). Text fields that
 ;; may carry unicode (code / value / out) convert at the boundary.
