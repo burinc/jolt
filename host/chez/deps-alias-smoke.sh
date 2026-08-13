@@ -522,6 +522,36 @@ case "$out" in
   *) check "short sha not matching the tag errors" "sha/tag mismatch error" "$(printf '%s' "$out" | head -1)" ;;
 esac
 
+# "the tag is not there" and "we could not go look" are different answers, and
+# saying the first when the second happened sends you to the repo and the pin
+# instead of to the fetch. The v0.7.7 release failed exactly this way: a
+# transient `git ls-remote` failure against github reported a tag that had
+# existed for two weeks as missing. Both cases are offline here — a real repo
+# without the tag, and a URL that is not a repo at all.
+cat > "$tmp/gitproj/deps.edn" <<EOF
+{:paths ["src"]
+ :deps {local/gitdep {:git/url "file://$tmp/gitrepo" :git/tag "v9.9" :git/sha "$short"}}}
+EOF
+out="$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS="$tmp/gitlibs-notag" "$JOLT" run -m gapp 2>&1)"
+case "$out" in
+  *"tag v9.9 not found"*) check "a tag the repo does not have is reported as not found" ok ok ;;
+  *) check "a tag the repo does not have is reported as not found" "tag v9.9 not found" "$(printf '%s' "$out" | head -2)" ;;
+esac
+
+mkdir -p "$tmp/notarepo"
+cat > "$tmp/gitproj/deps.edn" <<EOF
+{:paths ["src"]
+ :deps {local/gitdep {:git/url "file://$tmp/notarepo" :git/tag "v1.0" :git/sha "$short"}}}
+EOF
+out="$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS="$tmp/gitlibs-noremote" "$JOLT" run -m gapp 2>&1)"
+case "$out" in
+  *"not found"*) check "a failed ls-remote is not reported as a missing tag" \
+                       "a fetch failure, not 'not found'" "$(printf '%s' "$out" | head -2)" ;;
+  *"could not list"*) check "a failed ls-remote is not reported as a missing tag" ok ok ;;
+  *) check "a failed ls-remote is not reported as a missing tag" \
+           "could not list …" "$(printf '%s' "$out" | head -2)" ;;
+esac
+
 # git cache integrity: only a finished checkout counts as cached. An interrupted
 # fetch used to leave the pre-created sha directory behind empty, and every later
 # run took it for a valid checkout — the dep contributed no source root and the
