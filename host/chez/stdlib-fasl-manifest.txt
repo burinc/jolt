@@ -1,0 +1,77 @@
+# stdlib-fasl-manifest.txt — embedded stdlib fasl embedding policy.
+#
+# Each install-owned stdlib namespace that is NOT already in the runtime image
+# or the CLI closure is compiled to a fasl and concatenated into one blob
+# (jolt_stdlib_fasls) linked into the binary; a require then loads the compiled
+# code instead of recompiling from source on every process start.
+#
+# One ns name per line to EMBED. A ns that cannot be compiled standalone (an
+# optional native library it needs at load time, a top level that spawns a
+# thread or blocks the build) is recorded here instead:
+#
+#   skip <ns> — <verified reason>
+#
+# build-jolt fails on drift between this manifest and the discovered set, so the
+# two can never silently diverge. clojure.test MUST be in the embedded set.
+babashka.fs
+babashka.process
+babashka.process.pprint
+clojure.core.async
+clojure.core.async.lab
+clojure.core.protocols
+clojure.data
+clojure.datafy
+clojure.instant
+clojure.java.browse
+clojure.java.javadoc
+clojure.java.shell
+clojure.main
+clojure.sci.host-stubs
+clojure.sci.io-stubs
+clojure.sci.lang-stubs
+clojure.stacktrace
+clojure.test
+clojure.zip
+clojurestar.deps
+grenadine.basis
+grenadine.coordinate
+grenadine.core
+grenadine.gitlibs
+grenadine.graph
+grenadine.lock
+grenadine.repo
+grenadine.runtime
+grenadine.source
+jolt.fs
+jolt.image
+jolt.infix
+jolt.infix.core
+jolt.infix.grammar
+jolt.infix.math
+jolt.infix.math.bit-shuffling
+jolt.infix.math.constants
+jolt.infix.math.core
+jolt.infix.math.trig
+jolt.nrepl
+jolt.parser
+jolt.parser.basic
+jolt.parser.collections
+jolt.parser.combinators
+jolt.parser.monad
+jolt.parser.position
+jolt.process
+jolt.socket
+jolt.time.amount
+jolt.time.base
+jolt.time.enums
+jolt.time.impl
+jolt.time.instant
+jolt.time.local
+jolt.time.temporal
+jolt.time.util
+jolt.time.year
+jolt.util
+skip jolt.io-poller — emitted .scm contains an empty () arg list in a foreign-procedure form that Chez rejects at compile-file time; loads fine from source at runtime
+skip glojure.deps — requires glojure/deps/host.{jolt,clj,cljc} which is absent from the install roots at build time
+skip grenadine.host.glojure — top level references an unqualified `strings` symbol that does not resolve in the build image
+skip grenadine.cli — requires grenadine/build_info.{jolt,clj,cljc} (generated at release packaging), absent in a dev build

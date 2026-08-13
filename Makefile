@@ -117,7 +117,7 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling depssmoke depsunit \
-  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi \
+  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi stdlibfasl \
   transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform traceemit traceeval degradedbacktrace \
@@ -406,6 +406,14 @@ jolt: selfhost jolt-release jolt-debug
 # Self-build smoke: the distributed jolt compiles an app with Chez + cc removed.
 joltsmoke:
 	@sh host/chez/jolt-selfbuild-smoke.sh
+
+# The embedded per-namespace stdlib fasls (R1): assert that a built jolt serves
+# clojure.test (and jolt.time) from the compiled fasl blob rather than
+# recompiling from source, that the aot-info line fires (non-vacuous), and that a
+# real deftest + LocalDate expression run through the binary. Depends on
+# jolt-release having run.
+stdlibfasl: testbin
+	@sh host/chez/stdlib-fasl-smoke.sh
 
 # SCI conformance: load borkdude/sci's source through jolt (floor-gated).
 sci:

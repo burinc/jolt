@@ -921,34 +921,73 @@
                   (delete-file scm #f))
                 (aot-compile-and-cache name file src own)))
       (load so))))
-;; Dispatch for load-namespace*: cache hit (load .so) / miss (compile+cache) /
-;; bypass (plain load). `file` is the resolved on-disk path. force? (:reload) and
-;; ldr-reload-all? bypass entirely — live editing must win over a stale cache.
+;; Load an embedded compiled fasl for `name` if one was baked into this binary.
+;; The release jolt embeds one fasl per install-owned stdlib namespace so a
+;; require never recompiles from source on process start. The embedded bytes
+;; are produced by the same runtime that consumes them (build-jolt compiles them
+;; in a fresh Chez over this same runtime image), so there is no fingerprint
+;; check here — unlike the on-disk AOT cache, an embedded fasl cannot be stale
+;; relative to the binary it ships in. A guard falls back to the caller's source
+;; path: the bytes are baked (never truncated by a killed write), but a guard
+;; beats a dead binary. Returns #t when the embedded fasl was loaded, else #f.
+ (define (jolt-load-embedded-fasl! name)
+   (and (not (ldr-source-only?))
+        (let ((bv (jolt-embedded-fasl name)))
+          (and bv
+               (begin
+                 (aot-info (string-append "embedded " name))
+                 ;; Make success explicit: load-compiled-from-port returns the
+                 ;; fasl's LAST expression value, which can be #f for a ns whose
+                 ;; final form evaluates to nil/false. A #f read as "failed" so
+                 ;; the caller reloaded the namespace from source ON TOP of the
+                 ;; already-loaded fasl — the override-replay bug class at
+                 ;; loader.ss:~432. #t is the real success signal.
+                 (guard (e (else #f))
+                   (load-compiled-from-port (open-bytevector-input-port bv))
+                   #t))))))
+
+;; Dispatch for load-namespace*: embedded fasl (install-owned ns in a built
+;; binary) / cache hit (load .so) / miss (compile+cache) / bypass (plain load).
+;; `file` is the resolved on-disk path. force? (:reload) and ldr-reload-all?
+;; bypass the cache and the embedded branch alike — live editing must win over
+;; either a stale cache or a stale embedded fasl. ldr-source-only? is honored so
+;; the build driver (jb-emit-cli-ns) keeps loading source to emit it.
 (define (aot-load-or-compile name file force?)
-  (if (and (aot-cache-enabled?) (not force?) (not (ldr-reload-all?))
-           (not (ldr-install-file? file))
-           ;; no fingerprint = we can't tell this runtime from another one, so
-           ;; there is no key that would be safe to reuse.
-           (aot-runtime-fingerprint))
-      ;; the deps and reads this ns's own load records belong to IT, not to
-      ;; whoever is requiring it — bind fresh sinks so a nested load can't append
-      ;; to the enclosing one. A hit binds #f on both: the fasl it loads re-runs
-      ;; the requires and re-does the reads, and those are already described by
-      ;; this namespace's own sidecars.
-      (let* ((src (ldr-read-source file))
-             (own (aot-cache-key src))
-             (obase (aot-base-for-own name own))
-             (base (aot-base-full name own
-                                  (aot-read-dep-list (aot-dep-sidecar obase))
-                                  (aot-read-dep-list (aot-res-sidecar obase))))
-             (so (string-append base ".so")))
-        (if (file-exists? so)
-            (begin (aot-info (string-append "hit " name))
-                   (parameterize ((aot-dep-sink #f) (io-file-read-sink #f))
-                     (aot-safe-load-or-recompile name file src own base)))
-            (begin (aot-info (string-append "miss " name))
-                   (aot-compile-and-cache name file src own))))
-      (parameterize ((aot-dep-sink #f) (io-file-read-sink #f)) (load-jolt-file file))))
+  (cond
+    ;; install-owned + an embedded fasl baked in: load the compiled code.
+    ;; Sinks are #f like a cache hit: the fasl re-runs its own requires and
+    ;; reads, which the bytes already describe, so there is nothing to capture.
+    ((and (not force?) (not (ldr-reload-all?))
+          (ldr-install-file? file)
+          (jolt-embedded-fasl name))
+     (parameterize ((aot-dep-sink #f) (io-file-read-sink #f))
+       (unless (jolt-load-embedded-fasl! name)
+         ;; embedded fasl registered but failed to load: fall back to source.
+         (load-jolt-file file))))
+    ((and (aot-cache-enabled?) (not force?) (not (ldr-reload-all?))
+          (not (ldr-install-file? file))
+          ;; no fingerprint = we can't tell this runtime from another one, so
+          ;; there is no key that would be safe to reuse.
+          (aot-runtime-fingerprint))
+     ;; the deps and reads this ns's own load records belong to IT, not to
+     ;; whoever is requiring it — bind fresh sinks so a nested load can't append
+     ;; to the enclosing one. A hit binds #f on both: the fasl it loads re-runs
+     ;; the requires and re-does the reads, and those are already described by
+     ;; this namespace's own sidecars.
+     (let* ((src (ldr-read-source file))
+            (own (aot-cache-key src))
+            (obase (aot-base-for-own name own))
+            (base (aot-base-full name own
+                                 (aot-read-dep-list (aot-dep-sidecar obase))
+                                 (aot-read-dep-list (aot-res-sidecar obase))))
+            (so (string-append base ".so")))
+       (if (file-exists? so)
+           (begin (aot-info (string-append "hit " name))
+                  (parameterize ((aot-dep-sink #f) (io-file-read-sink #f))
+                    (aot-safe-load-or-recompile name file src own base)))
+           (begin (aot-info (string-append "miss " name))
+                  (aot-compile-and-cache name file src own)))))
+    (else (parameterize ((aot-dep-sink #f) (io-file-read-sink #f)) (load-jolt-file file)))))
 
 ;; Mark a namespace as loaded in both the host hashtable and the *loaded-libs* ref.
 (define (ldr-mark-loaded! name)
