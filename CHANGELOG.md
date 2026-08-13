@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.9] - 2026-08-13
+
+A dependency fetch that hits a network blip now tries again instead of failing
+the build.
+
+### Fixed
+
+- **The git dependency steps retry a transient failure.** `git ls-remote`,
+  `git clone` and `git submodule update` talk to a remote, and a remote fails
+  transiently more often than not — a reset, a rate limit, a DNS blip. Any one of
+  those failed the whole resolution, and with it the build. They now retry up to
+  three times with a short backoff, the way the HTTPS fetch already did, and the
+  error names the attempts when it gives up:
+
+  ```
+  git dep: could not list <url> (git ls-remote exited 128 after 3 attempts: …)
+  ```
+
+  `git checkout` and the publish rename are unchanged: they are local, so
+  retrying them would hide a real failure rather than survive a flake.
+
+### Internal
+
+- The nREPL listen socket's close-on-exec is now checked by the CLI smoke,
+  reading `fcntl(F_GETFD)` on an ephemeral port. It asserts the property rather
+  than one mechanism, so each platform covers the path it relies on.
+
 ## [0.7.8] - 2026-08-12
 
 Two things that only show up when something else goes wrong. A dependency fetch
