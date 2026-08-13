@@ -35,15 +35,28 @@
 (defn- getenv [n] (let [v (jolt.host/getenv n)] (when-not (str/blank? v) v)))
 (defn- file-exists? [p] (jolt.host/file-exists? p))
 (defn- sh [cmd] (jolt.host/sh cmd))           ; exit code, inherits stdout/stderr
+(defn- sh-out*
+  "Run a shell command, capturing stdout and stderr separately:
+  {:exit n :out s :err s}. Captures through temp files (jolt.host/sh inherits
+  stdio). Use this wherever \"the command failed\" and \"the command ran and
+  found nothing\" are different answers to the caller — sh-out below collapses
+  them, which is only right when they mean the same thing."
+  [cmd]
+  (let [stamp (str (System/currentTimeMillis) "-" (rand-int 100000))
+        out-f (str "/tmp/jolt-deps-" stamp ".out")
+        err-f (str "/tmp/jolt-deps-" stamp ".err")
+        code (sh (str cmd " > " (pr-str out-f) " 2> " (pr-str err-f)))
+        read-f (fn [p] (when (file-exists? p) (str/trim (slurp p))))
+        r {:exit code :out (read-f out-f) :err (read-f err-f)}]
+    (sh (str "rm -f " (pr-str out-f) " " (pr-str err-f)))
+    r))
+
 (defn- sh-out
   "Run a shell command, returning its trimmed stdout, or nil on a non-zero
-  exit. Captures through a temp file (jolt.host/sh inherits stdio)."
+  exit — for callers to which a failure and an empty result mean the same."
   [cmd]
-  (let [tmp (str "/tmp/jolt-deps-" (System/currentTimeMillis) "-" (rand-int 100000) ".out")
-        code (sh (str cmd " > " (pr-str tmp) " 2>/dev/null"))
-        out (when (file-exists? tmp) (str/trim (slurp tmp)))]
-    (sh (str "rm -f " (pr-str tmp)))
-    (when (zero? code) out)))
+  (let [{:keys [exit out]} (sh-out* cmd)]
+    (when (zero? exit) out)))
 (defn- warn [& xs] (binding [*out* *err*] (println (str "[jolt.deps] " (apply str xs)))))
 ;; Progress / informational lines (fetching, using-cache, skipping, added-natives)
 ;; print only when JOLT_DEBUG is set — otherwise a routine run (e.g. a ys-generated
@@ -161,10 +174,23 @@
                       (let [[commit obj] (str/split (str/trim (slurp cache)) #"\s+")]
                         (when obj [commit (when (not= obj "-") obj)])))]
       cached
-      (when-let [out (sh-out (str "git ls-remote " (pr-str url) " "
-                                  (pr-str (str "refs/tags/" tag)) " "
-                                  (pr-str (str "refs/tags/" tag "^{}"))))]
-        (let [lines (str/split-lines out)
+      ;; "the tag is not there" and "we could not go look" are different answers.
+      ;; Collapsing them reported a transient ls-remote failure — a reset, a rate
+      ;; limit, an unreachable host — as a tag that does not exist, which sends
+      ;; the reader to the repository and the pin instead of to the fetch. (The
+      ;; v0.7.7 release failed this way against a tag two weeks old.) Same
+      ;; distinction the Maven path makes below, and for the same reason.
+      (let [{:keys [exit out err]} (sh-out* (str "git ls-remote " (pr-str url) " "
+                                                 (pr-str (str "refs/tags/" tag)) " "
+                                                 (pr-str (str "refs/tags/" tag "^{}"))))]
+        (when-not (zero? exit)
+          (throw (ex-info (str "git dep: could not list " url " (git ls-remote exited "
+                               exit (when-not (str/blank? err)
+                                      (str ": " (first (str/split-lines err))))
+                               ")")
+                          {:type :jolt.deps/git-ls-remote-failed
+                           :url url :tag tag :exit exit :err err})))
+        (let [lines (str/split-lines (or out ""))
               parse (fn [suffix]
                       (some (fn [l] (let [[sha ref] (str/split l #"\s+")]
                                       (when (and ref (str/ends-with? ref suffix)) sha)))
