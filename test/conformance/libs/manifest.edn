@@ -145,6 +145,20 @@
    ;; syntax-quote is data on the JVM, a form on jolt); see known-divergences.edn
    :expect {:tests 50 :pass 884 :fail 3 :error 0}}
 
+  {:name "edamame"
+   :paths ["src" "resources" "test"]
+   :deps ["@tools.reader/src/main/clojure" "@ordered/src"]
+   ;; The suite requires cljs.tagged-literals and cljs.test on the :clj branch;
+   ;; jolt drops org.clojure/clojurescript from any dependency graph on purpose,
+   ;; so those come from a stub. See the shim files for what they stand in for.
+   :shims ["!test/conformance/libs/shims/clojurescript"]
+   :extra-deps {io.github.borkdude/deflet {:mvn/version "0.1.0"}}
+   ;; parse-clojure-core is a benchmark as much as a test: it re-reads
+   ;; test-resources/clojure/core.clj 20 times through each of six readers, which
+   ;; is where all but ~10s of the run goes (~4.5 min here).
+   :timeout 1200
+   :expect {:tests 50 :pass 351 :fail 0 :error 0}}
+
   {:name "tools.namespace"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]

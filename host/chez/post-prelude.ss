@@ -153,7 +153,10 @@
 ;; the overlay's IReader protocol only covers the reify map-reader, so a (read
 ;; pushback-reader) — cuerdas' string interpolation — would miss. Intercept a host
 ;; reader; everything else (the *in* reify) delegates to the overlay.
-(let ((ov-read (var-deref "clojure.core" "read")))
+;; The 2-arity is Clojure's (read opts stream): :eof in opts is the end-of-input
+;; value, and its ABSENCE is what makes EOF throw — {:eof nil} reads nil at EOF.
+(let ((ov-read (var-deref "clojure.core" "read"))
+      (kw-eof (keyword #f "eof")))
   (def-var! "clojure.core" "read"
     (case-lambda
       (() (jolt-invoke ov-read))
@@ -162,18 +165,48 @@
            (let-values (((form found?) (host-reader-read-form stream)))
              (if found? form (jolt-throw (jolt-ex-info "EOF while reading" empty-pmap))))
            (jolt-invoke ov-read stream)))
+      ((opts stream)
+       (if (reader-jhost? stream)
+           (let-values (((form found?) (host-reader-read-form stream)))
+             (cond (found? form)
+                   ((and (pmap? opts) (jolt-contains? opts kw-eof)) (jolt-get opts kw-eof))
+                   (else (jolt-throw (jolt-ex-info "EOF while reading" empty-pmap)))))
+           (jolt-invoke ov-read opts stream)))
       ((stream e? ev)
        (if (reader-jhost? stream)
            (let-values (((form found?) (host-reader-read-form stream)))
              (cond (found? form)
                    ((jolt-truthy? e?) (jolt-throw (jolt-ex-info "EOF while reading" empty-pmap)))
                    (else ev)))
-           (jolt-invoke ov-read stream e? ev))))))
-(let ((ov-rps (var-deref "clojure.core" "read+string")))
+           (jolt-invoke ov-read stream e? ev)))
+      ;; the 4th argument is the JVM reader's recursive? bookkeeping, not ours
+      ((stream e? ev recursive?)
+       (jolt-invoke (var-deref "clojure.core" "read") stream e? ev)))))
+
+;; read-line reads the line off whatever *in* holds, and *in* may hold a HOST
+;; reader rather than the overlay's reify — tools.reader's own read-line does
+;; (binding [*in* rdr] (clojure.core/read-line)) for a LineNumberingPushbackReader.
+;; On the JVM that call is (.readLine *in*), so route a host reader to its own
+;; readLine method; a reader that has none raises there, as it does on the JVM.
+(let ((ov-read-line (var-deref "clojure.core" "read-line")))
+  (def-var! "clojure.core" "read-line"
+    (lambda ()
+      (let ((in (var-deref "clojure.core" "*in*")))
+        (if (reader-jhost? in)
+            (record-method-dispatch in "readLine" jolt-nil)
+            (jolt-invoke ov-read-line))))))
+(let ((ov-rps (var-deref "clojure.core" "read+string"))
+      (kw-eof (keyword #f "eof")))
   (def-var! "clojure.core" "read+string"
     (case-lambda
       (() (jolt-invoke ov-rps))
       ((stream) (jolt-invoke (var-deref "clojure.core" "read+string") stream #t jolt-nil))
+      ((opts stream)
+       (if (and (pmap? opts) (jolt-contains? opts kw-eof))
+           (jolt-invoke (var-deref "clojure.core" "read+string") stream #f (jolt-get opts kw-eof))
+           (jolt-invoke (var-deref "clojure.core" "read+string") stream #t jolt-nil)))
+      ((stream e? ev recursive?)
+       (jolt-invoke (var-deref "clojure.core" "read+string") stream e? ev))
       ((stream e? ev)
        (if (reader-jhost? stream)
            (let* ((s (drain-reader stream)) (pr (jolt-parse-next s)))

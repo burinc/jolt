@@ -897,7 +897,25 @@
         ;; 1-based, like clojure.lang.LineNumberingPushbackReader's own +1 over the
         ;; underlying LineNumberReader. A plain PushbackReader counts nothing.
         (cons "getLineNumber" (lambda (self) (->num (+ 1 (vector-ref (jhost-state self) 3)))))
-        (cons "getColumnNumber" (lambda (self) (->num (vector-ref (jhost-state self) 4))))))
+        (cons "getColumnNumber" (lambda (self) (->num (vector-ref (jhost-state self) 4))))
+        ;; readLine: the next line without its terminator, nil at EOF. On the JVM
+        ;; only the line-numbering subclass has it (from its BufferedReader half);
+        ;; the shared method table gives it to the plain PushbackReader as well,
+        ;; which is a superset with one reasonable meaning. Goes through this
+        ;; table's own `read`, so the pushback buffer and the \r\n folding above
+        ;; are both honored rather than re-implemented.
+        (cons "readLine"
+          (lambda (self)
+            (let loop ((acc '()))
+              (let* ((u (read-unit self))
+                     (n (and (number? u) (jnum->exact u))))
+                (cond
+                  ((or (jolt-nil? u) (and n (< n 0)))
+                   (if (null? acc) jolt-nil (list->string (reverse acc))))
+                  ((eqv? n 10)
+                   (list->string (reverse (if (and (pair? acc) (char=? (car acc) #\return))
+                                              (cdr acc) acc))))
+                  (else (loop (cons (integer->char n) acc))))))))))
 ;; The line-numbering subclass IS a PushbackReader — same methods, same table.
 ;; Only the class it reports differs (see make-lnpbr).
 (alias-host-methods! "line-numbering-pushback-reader" "pushback-reader")
@@ -1470,8 +1488,18 @@
                     (and (jhost? val) (pushback-reader-tag? (jhost-tag val))))
                    ((string=? iface "StringReader")
                     (and (jhost? val) (string=? (jhost-tag val) "string-reader")))
-                   ((or (string=? iface "Reader") (string=? iface "BufferedReader"))
-                    (reader-jhost? val))
+                   ((string=? iface "Reader") (reader-jhost? val))
+                   ;; ...but a PushbackReader is NOT a BufferedReader: on the JVM
+                   ;; it extends FilterReader, and library code branches on the
+                   ;; difference — tools.reader's read-line routes a BufferedReader
+                   ;; through *in* and reads anything else char by char. What
+                   ;; io/reader hands back is an in-memory StringReader here and a
+                   ;; BufferedReader on the JVM, so the string-reader tag keeps
+                   ;; answering true; a bare (java.io.StringReader. s) shares that
+                   ;; tag and answers with it (known-divergences, :host-model).
+                   ((string=? iface "BufferedReader")
+                    (and (reader-jhost? val)
+                         (not (and (jhost? val) (pushback-reader-tag? (jhost-tag val))))))
                    (else 'none))))
         (if (eq? hit 'none) 'pass (if hit #t #f)))))))
 

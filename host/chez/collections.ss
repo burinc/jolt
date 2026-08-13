@@ -478,6 +478,25 @@
 (define (register-conj-arm! pred handler)
   (set! jolt-conj1-arms (cons (cons pred handler) jolt-conj1-arms)))
 
+;; Assoc every entry of `x` into map `m`, in x's own seq order. jolt models a map
+;; entry as a 2-element vector, so that is the shape each element must have — the
+;; JVM casts to java.util.Map$Entry here and this reports the same failure.
+;; jolt-seq / seq-first / seq-more live in seq.ss, which rt.ss loads after this
+;; file; forward references resolved at call time (cf. jolt-get-dispatch).
+(define (conj-map-entries m x)
+  (let loop ((s (jolt-seq x)) (acc m))
+    (if (jolt-nil? s)
+        acc
+        (let ((e (seq-first s)))
+          (if (and (pvec? e) (fx=? 2 (pvec-count e)))
+              (loop (jolt-seq (seq-more s))
+                    (pmap-assoc acc (pvec-nth-d e 0 jolt-nil) (pvec-nth-d e 1 jolt-nil)))
+              (jolt-throw
+               (jolt-host-throwable
+                "java.lang.ClassCastException"
+                (string-append "class " (guard (c (#t "?")) (jolt-class-name e))
+                               " cannot be cast to class java.util.Map$Entry"))))))))
+
 (define (jolt-conj1 coll x)
   (cond ((pvec? coll) (pvec-conj coll x))   ; nil is a valid vector/set element
         ((pset? coll) (pset-conj coll x))
@@ -486,12 +505,26 @@
         ;; Cons) — list?-preserving.
         ((cseq? coll) (if (cseq-list? coll) (cseq-list x coll) (cseq-realized x coll)))
         ((empty-list-t? coll) (cseq-list x jolt-nil))
+        ;; conj onto a map takes a map ENTRY, a [k v] pair, or anything that seqs
+        ;; INTO entries — which is what makes a record, a sorted map, another
+        ;; native map and a bare seq of entries all work, since each of those seqs
+        ;; into entries. Same shape as the JVM's APersistentMap.cons: the entry and
+        ;; vector cases, then RT.seq and assoc each entry in turn. Asking "does it
+        ;; seq into entries" rather than "is it one of the map types I know" is
+        ;; what keeps conj from disagreeing with map? about what a map is: a record
+        ;; answers true to map? and used to be rejected here.
         ((pmap? coll)
          (cond ((jolt-nil? x) coll)                                   ; (conj m nil) = m
-               ((pmap? x) (pmap-fold-fwd x (lambda (k v m) (pmap-assoc m k v)) coll))   ; merge in x's order
-               ((and (pvec? x) (fx=? 2 (pvec-count x)))
-                (pmap-assoc coll (pvec-nth-d x 0 jolt-nil) (pvec-nth-d x 1 jolt-nil)))
-               (else (throw-jvm (quote IllegalArgumentException) "conj on a map expects a [k v] pair or a map"))))
+               ((pmap? x) (pmap-fold-fwd x (lambda (k v m) (pmap-assoc m k v)) coll))   ; fast path, same rule
+               ;; a vector on the right is one ENTRY, so it must be a pair — never
+               ;; a sequence of entries. The JVM says so by name.
+               ((pvec? x)
+                (if (fx=? 2 (pvec-count x))
+                    (pmap-assoc coll (pvec-nth-d x 0 jolt-nil) (pvec-nth-d x 1 jolt-nil))
+                    (throw-jvm (quote IllegalArgumentException) "Vector arg to map conj must be a pair")))
+               ;; jolt-seq raises the JVM's own "Don't know how to create ISeq
+               ;; from: X" for a value that is not seqable at all.
+               (else (conj-map-entries coll x))))
         (else (let loop ((as jolt-conj1-arms))
                 (cond ((null? as)
                        (cond ((rec-coll-method coll "cons") => (lambda (m) (jolt-invoke m coll x)))

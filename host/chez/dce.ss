@@ -88,6 +88,9 @@
   '("clojure.core/identity" "clojure.core/isa?" "clojure.core/line-seq"
     "clojure.core/make-hierarchy" "clojure.core/read" "clojure.core/read-string"
     "clojure.core/read+string" "clojure.core/realized?" "clojure.core/reset!"
+    ;; post-prelude's read-line wrapper routes a host reader in *in* to its own
+    ;; readLine and closes over the overlay version for the reify reader
+    "clojure.core/read-line"
     "clojure.core/send"
     ;; the LispReader$StringReader shim (host-static-methods.ss) pulls the literal
     ;; off the reader it is handed, a line at a time, through the IReader method

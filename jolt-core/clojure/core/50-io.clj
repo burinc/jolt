@@ -98,18 +98,34 @@
 
 (defn read
   "Reads the next object from stream (defaults to *in*). At EOF, throws —
-  or returns eof-value when eof-error? is false."
+  or returns eof-value when eof-error? is false.
+
+  The 2-arity is Clojure's opts-map form, (read opts stream): an :eof key in
+  opts is the value returned at end of input, and its ABSENCE (not a nil value)
+  is what makes EOF throw. The remaining opts keys the JVM reads — :read-cond,
+  :features, :readers — are the reader's, not this function's; jolt's reader
+  resolves conditionals and tags itself, so they are accepted and ignored.
+  The 4-arity's recursive? flag is likewise the JVM reader's own bookkeeping."
   ([] (read *in*))
   ([stream]
    (let [v (-read-form stream)]
      (if (= v reader-eof)
        (throw (ex-info "EOF while reading" {}))
        v)))
+  ([opts stream]
+   (let [v (-read-form stream)]
+     (if (= v reader-eof)
+       (if (contains? opts :eof)
+         (get opts :eof)
+         (throw (ex-info "EOF while reading" {})))
+       v)))
   ([stream eof-error? eof-value]
    (let [v (-read-form stream)]
      (if (= v reader-eof)
        (if eof-error? (throw (ex-info "EOF while reading" {})) eof-value)
-       v))))
+       v)))
+  ([stream eof-error? eof-value _recursive?]
+   (read stream eof-error? eof-value)))
 
 (defmacro with-in-str
   "Evaluates body with *in* bound to a fresh reader over string s."
@@ -118,9 +134,17 @@
      ~@body))
 
 (defn read+string
+  "Like read, plus the exact text consumed, as [form text]. Carries the same
+  arity set as read, opts map included."
   ([] (read+string *in*))
   ([stream] (read+string stream true nil))
+  ([opts stream]
+   (if (contains? opts :eof)
+     (-read+string stream false (get opts :eof))
+     (-read+string stream true nil)))
   ([stream eof-error? eof-value]
+   (-read+string stream eof-error? eof-value))
+  ([stream eof-error? eof-value _recursive?]
    (-read+string stream eof-error? eof-value)))
 
 (defn line-seq

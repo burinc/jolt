@@ -239,9 +239,18 @@
   {:suite "interop / Thread" :label "Thread with no target" :expected "[false nil nil]" :actual "(let [t (Thread.)] [(.isAlive t) (.run t) (do (.start t) (.join t) nil)])" :portability :jvm}
   {:suite "interop / Thread" :label "class of a Thread instance" :expected "java.lang.Thread" :actual "(class (Thread.))" :portability :jvm}
   {:suite "interop / Thread" :label "a Thread is a Runnable" :expected "true" :actual "(instance? java.lang.Runnable (Thread.))" :portability :jvm}
-  {:suite "syntax-quote / classes" :label "imported class qualifies to its FQN" :expected "(quote java.lang.Thread)" :actual "(syntax-quote Thread)" :portability :jvm}
-  {:suite "syntax-quote / classes" :label "String qualifies to java.lang.String" :expected "(quote java.lang.String)" :actual "(syntax-quote String)" :portability :jvm}
-  {:suite "syntax-quote / classes" :label "class tag in metadata qualifies" :expected "(quote java.lang.Thread)" :actual "(-> (syntax-quote ^Thread []) meta :tag)" :portability :jvm}
+  {:suite "syntax-quote / classes" :label "imported class qualifies to its FQN" :expected "(quote java.lang.Thread)" :actual "`Thread" :portability :jvm}
+  {:suite "syntax-quote / classes" :label "String qualifies to java.lang.String" :expected "(quote java.lang.String)" :actual "`String" :portability :jvm}
+  {:suite "syntax-quote / classes" :label "class tag in metadata qualifies" :expected "(quote java.lang.Thread)" :actual "(-> `^Thread [] meta :tag)" :portability :jvm}
+  ;; `syntax-quote` is jolt's own marker for a ` (the reader emits one, the
+  ;; analyzer lowers it) — it is NOT a Clojure special form, so the name stays
+  ;; available to programs. It used to be reserved, and a var or local named
+  ;; syntax-quote was silently miscompiled into a syntax-quote of its first
+  ;; argument (edamame names its own resolver that, and :refers it).
+  {:suite "reader / syntax-quote is not a reserved name" :label "a local named syntax-quote is an ordinary local" :expected "[:local 1 2]" :actual "(let [syntax-quote (fn [a b] [:local a b])] (syntax-quote 1 2))" :portability :common}
+  {:suite "reader / syntax-quote is not a reserved name" :label "a var named syntax-quote is an ordinary var" :expected "[:fn 1 2 3]" :actual "(do (ns sqg.ns) (clojure.core/defn syntax-quote [a b c] [:fn a b c]) (syntax-quote 1 2 3))" :portability :common}
+  {:suite "reader / syntax-quote is not a reserved name" :label "and it can be referred into another namespace" :expected "[:fn 1 2]" :actual "(do (ns sqa.ns) (clojure.core/defn syntax-quote [a b] [:fn a b]) (ns sqb.ns) (clojure.core/refer (quote sqa.ns)) (syntax-quote 1 2))" :portability :common}
+  {:suite "reader / syntax-quote is not a reserved name" :label "`syntax-quote qualifies to the current ns like any other symbol" :expected "\"(quote sqr.ns/syntax-quote)\"" :actual "(do (ns sqr.ns) (clojure.core/pr-str (clojure.core/read-string \"`syntax-quote\")))" :portability :common}
   {:suite "defmacro / metadata" :label "name metadata lands on the macro var" :expected "true" :actual "(do (defmacro ^:foo mdm1 [x] (list x)) (:foo (meta (var mdm1))))" :portability :jvm}
   {:suite "defmacro / metadata" :label "docstring lands on the macro var" :expected "\"the doc\"" :actual "(do (defmacro mdm2 \"the doc\" [x] (list x)) (:doc (meta (var mdm2))))" :portability :jvm}
   {:suite "defmacro / metadata" :label "attr-map lands on the macro var" :expected "42" :actual "(do (defmacro mdm3 {:attr 42} [x] (list x)) (:attr (meta (var mdm3))))" :portability :jvm}
@@ -845,6 +854,47 @@
   {:suite "interop / StringReader & StringBuilder" :label "line terminators normalize to \\n" :expected "\"a\\nb\\nc\\nd\"" :actual "(let [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"a\\r\\nb\\rc\\nd\"))] (loop [acc []] (let [c (.read r)] (if (neg? c) (apply str acc) (recur (conj acc (char c)))))))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "getLineNumber counts them, 1-based" :expected "3" :actual "(let [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"a\\r\\nb\\rc\"))] (dotimes [_ 4] (.read r)) (.getLineNumber r))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "pushback sits above the line count, so an unread \\n is not recounted" :expected "[2 2 \\newline]" :actual "(let [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"ab\\ncd\"))] (dotimes [_ 3] (.read r)) (let [n (.getLineNumber r)] (.unread r (int \\newline)) [n (.getLineNumber r) (char (.read r))]))" :portability :jvm}
+  ;; read over a HOST reader (a java.io PushbackReader, not the *in* reify): the
+  ;; opts-map arity is what tools.reader-shaped code calls, (read {:eof v} rdr).
+  {:suite "interop / read over a host reader" :label "(read opts stream) reads a form" :expected "(quote (+ 1 2))" :actual "(read {:eof :the-end} (java.io.PushbackReader. (java.io.StringReader. \"(+ 1 2) 7\")))" :portability :jvm}
+  {:suite "interop / read over a host reader" :label ":eof is the value at end of input" :expected ":the-end" :actual "(read {:eof :the-end} (java.io.PushbackReader. (java.io.StringReader. \"   \")))" :portability :jvm}
+  ;; it is the ABSENCE of :eof that throws, not a nil value under it
+  {:suite "interop / read over a host reader" :label "opts without :eof still throws at end of input" :expected "\"EOF while reading\"" :actual "(try (read {} (java.io.PushbackReader. (java.io.StringReader. \"  \"))) (catch Exception e (ex-message e)))" :portability :jvm}
+  {:suite "interop / read over a host reader" :label "{:eof nil} reads nil at end of input" :expected "nil" :actual "(read {:eof nil} (java.io.PushbackReader. (java.io.StringReader. \"  \")))" :portability :jvm}
+  {:suite "interop / read over a host reader" :label "successive opts reads advance the reader" :expected "[1 2 :E]" :actual "(let [r (java.io.PushbackReader. (java.io.StringReader. \"1 2\"))] [(read {:eof :E} r) (read {:eof :E} r) (read {:eof :E} r)])" :portability :jvm}
+  {:suite "interop / read over a host reader" :label "the 4-arity reads like the 3-arity (the recursive? flag is not ours)" :expected "[:x (quote (+ 1 2))]" :actual "[(read (java.io.PushbackReader. (java.io.StringReader. \"  \")) false :x true) (read (java.io.PushbackReader. (java.io.StringReader. \"(+ 1 2)\")) true nil true)]" :portability :jvm}
+  ;; A pushback reader is a Reader, never a BufferedReader — on the JVM it extends
+  ;; FilterReader — and library code branches on the difference (tools.reader's
+  ;; read-line routes a BufferedReader through *in* and reads any other reader
+  ;; char by char). What io/reader hands back is a BufferedReader on both.
+  {:suite "interop / reader class identity" :label "a pushback reader is a Reader but not a BufferedReader" :expected "[true false false]" :actual "(let [p (java.io.PushbackReader. (java.io.StringReader. \"x\"))] [(instance? java.io.Reader p) (instance? java.io.BufferedReader p) (instance? java.io.BufferedReader (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"x\")))])" :portability :jvm}
+  {:suite "interop / reader class identity" :label "what io/reader hands back is a BufferedReader" :expected "true" :actual "(do (require (quote [clojure.java.io :as io])) (instance? java.io.BufferedReader (io/reader (java.io.StringReader. \"x\"))))" :portability :jvm}
+  ;; ...and a read advances the reader past exactly that form, so successive reads
+  ;; walk the source and whatever is left is still there for slurp. (jolt reads a
+  ;; string-backed reader at an index rather than draining and re-wrapping it —
+  ;; these are the observable consequences of doing that right.)
+  {:suite "interop / read over a host reader" :label "successive reads walk the forms in order" :expected "(quote [(a 1) [b 2] {:c 3} :d])" :actual "(let [r (java.io.PushbackReader. (java.io.StringReader. \"(a 1) [b 2] {:c 3} :d\"))] (vec (take-while (fn [x] (not= :E x)) (repeatedly (fn [] (read {:eof :E} r))))))" :portability :jvm}
+  {:suite "interop / read over a host reader" :label "what a read did not consume is still there to slurp" :expected "[(quote (a 1)) \" tail text\"]" :actual "(let [r (java.io.PushbackReader. (java.io.StringReader. \"(a 1) tail text\"))] [(read r) (slurp r)])" :portability :jvm}
+  {:suite "interop / read over a host reader" :label "a line-numbering reader counts the lines a read consumed, not the whole source" :expected "[1 (quote (a)) 1 (quote (b)) 2]" :actual "(let [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"(a)\\n(b)\\n(c)\"))] [(.getLineNumber r) (read r) (.getLineNumber r) (read r) (.getLineNumber r)])" :portability :jvm}
+  ;; ...and each form is stamped with ITS OWN line, not the first. (Reading at an
+  ;; index rather than off a freshly-substringed tail is what makes that possible:
+  ;; the position cursor only advances when every read sees the same source string.)
+  {:suite "interop / read over a host reader" :label "a line-numbering reader stamps each form with its own line" :expected "[{:line 1 :column 1} {:line 2 :column 1} {:line 3 :column 1}]" :actual "(let [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"(a)\\n(b)\\n(c)\"))] (mapv (fn [_] (select-keys (meta (read r)) [:line :column])) [1 2 3]))" :portability :jvm}
+  ;; read-line reads the line off whatever *in* holds. On the JVM that is
+  ;; (.readLine *in*), so a LineNumberingPushbackReader works and a plain
+  ;; PushbackReader — which has no readLine — is a cast error. tools.reader's own
+  ;; read-line routes through *in* for the line-numbering one.
+  ;; read+string carries read's whole arity set, opts map included. The JVM casts
+  ;; its stream to a LineNumberingPushbackReader, so these rows use one.
+  {:suite "interop / read over a host reader" :label "read+string takes the opts arity too" :expected "[(quote (+ 1 2)) \"(+ 1 2)\"]" :actual "(read+string {:eof :E} (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"(+ 1 2) x\")))" :portability :jvm}
+  {:suite "interop / read over a host reader" :label "read+string :eof yields [v \"\"] at end of input" :expected "[:E \"\"]" :actual "(read+string {:eof :E} (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"  \")))" :portability :jvm}
+  ;; (the JVM's read+string wraps its EOF in a RuntimeException whose message
+  ;;  carries the class name, so match the text rather than the whole message)
+  {:suite "interop / read over a host reader" :label "read+string without :eof throws at end of input" :expected "true" :actual "(try (read+string {} (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"  \"))) false (catch Exception e (boolean (re-find #\"EOF while reading\" (ex-message e)))))" :portability :jvm}
+  {:suite "interop / read over a host reader" :label "read+string's 4-arity reads like its 3-arity" :expected "[:x \"\"]" :actual "(read+string (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"  \")) false :x true)" :portability :jvm}
+  {:suite "interop / read-line over a host reader" :label "*in* bound to a LineNumberingPushbackReader yields lines, then nil" :expected "[\"a\" \"b\" nil]" :actual "(binding [*in* (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"a\\nb\\n\"))] [(read-line) (read-line) (read-line)])" :portability :jvm}
+  {:suite "interop / read-line over a host reader" :label ".readLine is a method of the line-numbering reader" :expected "[\"a\" \"b\" nil]" :actual "(let [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"a\\nb\\n\"))] [(.readLine r) (.readLine r) (.readLine r)])" :portability :jvm}
+  {:suite "interop / read-line over a host reader" :label "a read leaves the rest of its line for read-line" :expected "[(quote (+ 1 2)) \" rest of line\"]" :actual "(let [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"(+ 1 2) rest of line\\nnext\\n\"))] [(read r) (binding [*in* r] (read-line))])" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "char-array of string" :expected "true" :actual "(instance? (Class/forName \"[C\") (char-array \"ab\"))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "reader over char[]" :expected "97" :actual "(do (require (quote clojure.java.io)) (.read (clojure.java.io/reader (char-array \"abc\"))))" :portability :jvm}
   ;; nil is not a source. io/reader used to render it and hand back a reader over
@@ -4016,6 +4066,18 @@
   {:suite "host interop / clojure.lang.Util" :label "Util/hash is Java hashCode" :expected "120" :actual "(clojure.lang.Util/hash \"x\")" :portability :jvm}
   {:suite "deftype / IObj metadata" :label "deftype meta/withMeta govern (meta x)" :expected "{:a 1}" :actual "(do (deftype Sm [m] clojure.lang.IObj (meta [_] m) (withMeta [_ n] (Sm. n))) (meta (Sm. {:a 1})))" :portability :jvm}
   {:suite "collections / disj" :label "disj of nil is nil" :expected "nil" :actual "(disj nil :a)" :portability :common}
+  ;; conj onto a map takes any MAP on the right, not only a native one: a record IS
+  ;; an IPersistentMap, and so is a sorted map. The result is a plain map — conj
+  ;; adds to the LEFT collection, so the record-ness does not travel.
+  {:suite "collections / conj a map onto a map" :label "a record's fields conj in, and the result is a plain map" :expected "[{:z 1 :a 1 :b 2} false]" :actual "(do (ns cjr.ns) (clojure.core/defrecord Rc [a b]) (clojure.core/let [m (clojure.core/conj {:z 1} (cjr.ns/->Rc 1 2))] [m (clojure.core/record? m)]))" :portability :common}
+  {:suite "collections / conj a map onto a map" :label "merge takes a record on the right too" :expected "{:z 1 :a 1 :b 2}" :actual "(do (ns mgr.ns) (clojure.core/defrecord Rm [a b]) (clojure.core/merge {:z 1} (mgr.ns/->Rm 1 2)))" :portability :common}
+  {:suite "collections / conj a map onto a map" :label "conj onto a record keeps it a record" :expected "[true 3]" :actual "(do (ns cjq.ns) (clojure.core/defrecord Rq [a b]) (clojure.core/let [r (clojure.core/conj (cjq.ns/->Rq 1 2) {:c 3})] [(clojure.core/record? r) (:c r)]))" :portability :common}
+  {:suite "collections / conj a map onto a map" :label "a sorted map conjs in" :expected "{:z 1 :a 1 :b 2}" :actual "(conj {:z 1} (sorted-map :a 1 :b 2))" :portability :common}
+  {:suite "collections / conj a map onto a map" :label "a map entry conjs in" :expected "{:z 1 :a 1}" :actual "(conj {:z 1} (first {:a 1}))" :portability :common}
+  {:suite "collections / conj a map onto a map" :label "a seq of map entries conjs in" :expected "{:z 1 :a 1 :b 2}" :actual "(conj {:z 1} (seq (sorted-map :a 1 :b 2)))" :portability :common}
+  ;; a vector on the right is a map ENTRY, so it must be a pair — never a sequence
+  ;; of entries. The JVM says so by name.
+  {:suite "collections / conj a map onto a map" :label "a non-pair vector is rejected as an entry" :expected "[\"Vector arg to map conj must be a pair\" \"Vector arg to map conj must be a pair\"]" :actual "(mapv (fn [v] (try (conj {:z 1} v) (catch IllegalArgumentException e (ex-message e)))) [[:a 1 2] [[:a 1]]])" :portability :common}
   {:suite "special forms / qualified" :label "clojure.core-qualified special form (from syntax-quote)" :expected "[:g 9]" :actual "(clojure.core/letfn [(g [x] [:g x])] (g 9))" :portability :common}
   {:suite "symbols / interning" :label "(str sym) is the symbol's interned name (identity-stable)" :expected "[true true]" :actual "(let [s (quote ?a)] [(identical? (name s) (str s)) (= (str s) \"?a\")])" :portability :common}
   {:suite "symbols / interning" :label "equal symbols share an interned name string" :expected "true" :actual "(let [a (quote ?foo) b (quote ?foo)] (identical? (name a) (name b)))" :portability :common}

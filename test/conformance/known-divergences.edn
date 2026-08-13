@@ -262,6 +262,49 @@
    :jvm "throws unless {:read-cond :allow}"
    :jolt "reads the matching branch by default"
    :note "jolt is single-platform-ish; conditionals always resolve. Deliberate."}
+  ;; read-line is (.readLine *in*) on the JVM, so a reader without that method —
+  ;; a plain java.io.PushbackReader, which extends FilterReader — is a cast error
+  ;; there. jolt's two pushback readers share one method table (so the two cannot
+  ;; drift), and readLine on a pushback reader has exactly one meaning, so it
+  ;; answers instead. The line-numbering reader, which is what tools.reader binds,
+  ;; agrees with the JVM (corpus, "interop / read-line over a host reader").
+  {:category :permissive
+   :behavior "(binding [*in* (java.io.PushbackReader. …)] (read-line))"
+   :jvm "throws ClassCastException — PushbackReader is not a BufferedReader"
+   :jolt "the next line"
+   :note "Widening only. Anything that works on the JVM works here."}
+  ;; the JVM records a read form's position only when the reader is a
+  ;; LineNumberingPushbackReader; jolt has one reader path, which is always
+  ;; positioned. Widening, and the position is right either way — the
+  ;; line-numbering case agrees with the JVM exactly (corpus, "interop / read over
+  ;; a host reader").
+  {:category :reader-model
+   :behavior "(meta (read a-plain-java.io.PushbackReader)) on a list form"
+   :jvm "nil"
+   :jolt "{:line N :column M}"
+   :note "No unpositioned reader variant exists here to fall back to."}
+  ;; a read stops at the end of the FORM; the JVM's LispReader consumes the
+  ;; character that terminated a bare token as part of scanning it. Only visible
+  ;; through .getLineNumber between two reads, and only for a token that ends at a
+  ;; newline rather than a delimiter — (read) of "(a)\n(b)" agrees exactly
+  ;; (corpus, "interop / read over a host reader").
+  {:category :reader-model
+   :behavior "(.getLineNumber lnpbr) after reading the bare token on line 1 of \"1\\n2\\n\""
+   :jvm "2 — the newline that ended the token was consumed with it"
+   :jolt "1 — the reader stopped at the end of the token"
+   :note "Extent of a token read, not a counting error: the next read still returns the next form, and a delimited form counts identically."}
+  ;; io/reader hands back an in-memory java.io.StringReader here (the full Reader
+  ;; contract, mark/reset and pushback included) where the JVM hands back a
+  ;; BufferedReader. Library code branches on (instance? BufferedReader r) —
+  ;; tools.reader's read-line does — so that check has to hold for what io/reader
+  ;; returns, and a directly-constructed StringReader shares the tag and answers
+  ;; with it. A PushbackReader does NOT (corpus, "interop / reader class
+  ;; identity"), which is the case that actually misroutes.
+  {:category :host-model
+   :behavior "(instance? java.io.BufferedReader (java.io.StringReader. \"x\"))"
+   :jvm "false"
+   :jolt "true"
+   :note "io/reader's result and a bare StringReader are one jhost tag; the BufferedReader answer belongs to the former. Widening only, and only for readers."}
   ;; a backquoted bare class name qualifies to clojure.core, not java.lang (class model).
   {:category :host-model
    :behavior "`String (syntax-quote of a bare class name)"
@@ -269,13 +312,16 @@
    :jolt "clojure.core/String"
    :note "A consequence of the class model — a class name is not a java.lang-resolved token in syntax-quote."}
   ;; On the JVM syntax-quote is purely a reader macro, so nothing of it survives a
-  ;; read. jolt's compile-path reader emits (syntax-quote form) and the analyzer
-  ;; lowers it, which is invisible except when the form is itself quoted. The data
-  ;; path (read-string / read) does expand at read time and agrees with the JVM.
+  ;; read. jolt's compile-path reader emits (clojure.core/syntax-quote form) and
+  ;; the analyzer lowers it, which is invisible except when the form is itself
+  ;; quoted. The data path (read-string / read) does expand at read time and
+  ;; agrees with the JVM. The marker is qualified precisely so it reserves nothing:
+  ;; a bare `syntax-quote` is an ordinary name a program may define (corpus,
+  ;; "reader / syntax-quote is not a reserved name").
   {:category :reader-model
    :behavior "'`foo/bar in source — a quoted syntax-quote"
    :jvm "(quote foo/bar) — the reader has already expanded it"
-   :jolt "(syntax-quote foo/bar) — the analyzer expands it"
+   :jolt "(clojure.core/syntax-quote foo/bar) — the analyzer expands it"
    :note "(read-string \"`foo/bar\") agrees with the JVM; only a syntax-quote quoted in compiled source differs. Surfaces in clojure.tools.reader's read-syntax-quote suite."}
   ;; the reader stamps a position on list forms for error reporting, and quote takes
   ;; it back off so a quoted list literal stays a constant rather than an allocating
