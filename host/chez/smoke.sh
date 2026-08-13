@@ -1201,5 +1201,22 @@ check '(.nextLong (java.util.Random. 12345))' '6674089274190705457'
 check_no '(dotimes [_ 100] (random-uuid))' 'no OS entropy'
 check '(let [u (str (random-uuid))] [(count u) (nth u 14) (contains? #{\8 \9 \a \b} (nth u 19))])' '[36 \4 true]'
 
+# The nREPL listen socket must be close-on-exec. Without it every subprocess
+# spawned from a process running an nREPL inherits a duplicate, and the port
+# stays bound for as long as any of them lives — so killing the server leaves the
+# next start unable to bind, against a server that is already gone. Nothing else
+# checked it, and the failure surfaces much later as a port that outlived its
+# server, which nobody attributes to the right change.
+#
+# Asks the descriptor itself — fcntl(F_GETFD) & FD_CLOEXEC — on an ephemeral
+# port, so no subprocess and no fixed port number are involved. It asserts the
+# PROPERTY, not one mechanism: macOS reaches it through the fcntl in
+# close-on-exec! (verified: removing that call turns this red here), Linux
+# through SOCK_CLOEXEC on socket() as well, so each platform checks the path it
+# actually relies on. POSIX only — Windows has no FD_CLOEXEC (it controls
+# inheritance with HANDLE_FLAG_INHERIT), so there this asserts nothing rather
+# than asserting the wrong thing.
+check '(do (require (quote jolt.nrepl)) (if jolt.nrepl/windows? :close-on-exec (let [fd (jolt.nrepl/listen-socket 0) flags (jolt.nrepl/c-fcntl fd 1 0)] (jolt.nrepl/c-close fd) (if (pos? (bit-and flags 1)) :close-on-exec :inheritable))))' ':close-on-exec'
+
 echo "cli smoke: $pass passed, $fails failed"
 [ "$fails" -eq 0 ]

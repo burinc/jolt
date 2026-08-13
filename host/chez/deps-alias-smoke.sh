@@ -552,6 +552,51 @@ case "$out" in
            "could not list …" "$(printf '%s' "$out" | head -2)" ;;
 esac
 
+# ...and a transient one is retried rather than reported. A `git` shim ahead of
+# the real one on PATH fails the first ls-remote the way a reset does, then gets
+# out of the way — so the dep resolves only if the failure was retried. The
+# counter file is what makes it observable: an unretried run leaves it at 1.
+mkdir -p "$tmp/fakebin"
+cat > "$tmp/fakebin/git" <<'SHIM'
+#!/bin/sh
+# Count ls-remote invocations; fail the first one, delegate the rest.
+for a in "$@"; do
+  if [ "$a" = "ls-remote" ]; then
+    n=$(cat "$FAKE_GIT_COUNT" 2>/dev/null || echo 0)
+    n=$((n+1)); printf '%s' "$n" > "$FAKE_GIT_COUNT"
+    if [ "$n" -le "${FAKE_GIT_FAILS:-1}" ]; then
+      echo "fatal: unable to access: Connection reset by peer" >&2
+      exit 128
+    fi
+    break
+  fi
+done
+exec "$REAL_GIT" "$@"
+SHIM
+chmod +x "$tmp/fakebin/git"
+export REAL_GIT="$(command -v git)"
+cat > "$tmp/gitproj/deps.edn" <<EOF
+{:paths ["src"]
+ :deps {local/gitdep {:git/url "file://$tmp/gitrepo" :git/tag "v1.0" :git/sha "$short"}}}
+EOF
+export FAKE_GIT_COUNT="$tmp/fakegit.count"; : > "$FAKE_GIT_COUNT"
+check "a transient ls-remote failure is retried" "git dep: tagged" \
+      "$(PATH="$tmp/fakebin:$PATH" FAKE_GIT_FAILS=1 JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 \
+         JOLT_GITLIBS="$tmp/gitlibs-retry" "$JOLT" run -m gapp 2>&1 | tail -1)"
+check "  and the retry actually happened (ls-remote ran twice)" "2" "$(cat "$FAKE_GIT_COUNT")"
+
+# The cap is real: a failure that outlasts it reports, it does not spin.
+: > "$FAKE_GIT_COUNT"
+out="$(PATH="$tmp/fakebin:$PATH" FAKE_GIT_FAILS=99 JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 \
+       JOLT_GITLIBS="$tmp/gitlibs-retry2" "$JOLT" run -m gapp 2>&1)"
+case "$out" in
+  *"could not list"*) check "a persistent ls-remote failure reports after the cap" ok ok ;;
+  *) check "a persistent ls-remote failure reports after the cap" "could not list …" \
+           "$(printf '%s' "$out" | head -2)" ;;
+esac
+check "  and it stopped at the attempt cap" "3" "$(cat "$FAKE_GIT_COUNT")"
+unset REAL_GIT FAKE_GIT_COUNT
+
 # git cache integrity: only a finished checkout counts as cached. An interrupted
 # fetch used to leave the pre-created sha directory behind empty, and every later
 # run took it for a valid checkout — the dep contributed no source root and the

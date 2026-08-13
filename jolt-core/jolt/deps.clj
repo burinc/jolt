@@ -58,6 +58,32 @@
   (let [{:keys [exit out]} (sh-out* cmd)]
     (when (zero? exit) out)))
 (defn- warn [& xs] (binding [*out* *err*] (println (str "[jolt.deps] " (apply str xs)))))
+
+;; --- retrying the network steps ---------------------------------------------
+;; A git command that talks to a remote fails transiently more often than not — a
+;; reset, a rate limit, a DNS blip — and the cost of finding out is one more
+;; round trip. The HTTPS fetch already works this way (jolt/mvn_http.clj); these
+;; are the git-side equivalents, and they matter for the same reason: a flake
+;; here fails a whole build, and a release with it.
+(def ^:private net-attempts 3)
+;; Deliberately short, same reasoning as the fetch's: this sits in front of a
+;; developer waiting on a build, and the failures it covers clear in well under a
+;; second. A long backoff trades a rare recovery for a guaranteed stall on the
+;; genuinely-unreachable case.
+(def ^:private net-backoff-ms [200 600])
+
+(defn- with-net-retries
+  "Call ATTEMPT until `ok?` accepts its result, at most net-attempts times, with
+  a short backoff between. Returns the LAST result either way — still a failing
+  one when the cap is reached, so the caller reports the failure it actually got
+  rather than treating the cap as a different kind of answer."
+  [ok? attempt]
+  (loop [n 1]
+    (let [r (attempt)]
+      (if (or (ok? r) (>= n net-attempts))
+        r
+        (do (when-let [ms (nth net-backoff-ms (dec n) nil)] (Thread/sleep ms))
+            (recur (inc n)))))))
 ;; Progress / informational lines (fetching, using-cache, skipping, added-natives)
 ;; print only when JOLT_DEBUG is set — otherwise a routine run (e.g. a ys-generated
 ;; program pulling a native-declaring lib) barfs them on every invocation. Genuine
@@ -180,16 +206,19 @@
       ;; the reader to the repository and the pin instead of to the fetch. (The
       ;; v0.7.7 release failed this way against a tag two weeks old.) Same
       ;; distinction the Maven path makes below, and for the same reason.
-      (let [{:keys [exit out err]} (sh-out* (str "git ls-remote " (pr-str url) " "
-                                                 (pr-str (str "refs/tags/" tag)) " "
-                                                 (pr-str (str "refs/tags/" tag "^{}"))))]
+      (let [{:keys [exit out err]}
+            (with-net-retries #(zero? (:exit %))
+              #(sh-out* (str "git ls-remote " (pr-str url) " "
+                             (pr-str (str "refs/tags/" tag)) " "
+                             (pr-str (str "refs/tags/" tag "^{}")))))]
         (when-not (zero? exit)
           (throw (ex-info (str "git dep: could not list " url " (git ls-remote exited "
-                               exit (when-not (str/blank? err)
-                                      (str ": " (first (str/split-lines err))))
+                               exit " after " net-attempts " attempts"
+                               (when-not (str/blank? err)
+                                 (str ": " (first (str/split-lines err))))
                                ")")
                           {:type :jolt.deps/git-ls-remote-failed
-                           :url url :tag tag :exit exit :err err})))
+                           :url url :tag tag :exit exit :err err :attempts net-attempts})))
         (let [lines (str/split-lines (or out ""))
               parse (fn [suffix]
                       (some (fn [l] (let [[sha ref] (str/split l #"\s+")]
@@ -262,13 +291,18 @@
         fail (fn [msg data] (scrub) (throw (ex-info msg (merge {:url url :sha sha} data))))]
     (info "fetching " url " @ " (subs sha 0 (min 12 (count sha))))
     (sh (str "mkdir -p " (pr-str repo-dir)))
-    (when-not (zero? (sh (str "git clone --quiet " (pr-str url) " " (pr-str stage))))
-      (fail (str "git clone failed: " url) nil))
+    ;; the clone talks to the remote, so it gets the same bounded retry the tag
+    ;; listing does — scrubbing first, since a failed clone leaves a partial
+    ;; staging dir that the next attempt would refuse to clone into.
+    (when-not (zero? (with-net-retries zero? (fn [] (scrub) (sh (str "git clone --quiet " (pr-str url) " " (pr-str stage))))))
+      (fail (str "git clone failed after " net-attempts " attempts: " url) nil))
+    ;; local, so no retry: the objects are already in the staging clone.
     (when-not (zero? (sh (str "git -C " (pr-str stage) " checkout --quiet " (pr-str sha))))
       (fail (str "git checkout failed: " sha " in " url) nil))
-    ;; submodules are pinned in the checkout; pull them if the dep uses any.
-    (when-not (zero? (sh (str "git -C " (pr-str stage) " submodule update --init --recursive --quiet")))
-      (fail (str "git submodule update failed for " url) nil))
+    ;; submodules are pinned in the checkout; pull them if the dep uses any. This
+    ;; one fetches too, and is idempotent, so it retries in place.
+    (when-not (zero? (with-net-retries zero? #(sh (str "git -C " (pr-str stage) " submodule update --init --recursive --quiet"))))
+      (fail (str "git submodule update failed after " net-attempts " attempts for " url) nil))
     (sh (str "touch " (pr-str (str stage "/.jolt-git-ok"))))
     (if (checkout-complete? dir)
       (do (scrub) dir)                    ; another process published it first
