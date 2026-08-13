@@ -720,15 +720,82 @@
                   (loop (- remaining step)))))))
 
 ;; --- java.lang.ProcessHandle (destroy-tree) ----------------------------------
-;; jolt does not track process trees, so descendants is always empty; destroy-tree
-;; then reduces to destroying the process itself. descendants returns an empty
-;; collection whose .iterator flows through the generic make-jiterator path, so
-;; (iterator-seq (.iterator (.descendants h))) yields nothing.
+;; descendants asks the OS for the live tree under a pid — jolt tracks nothing
+;; itself. Darwin: libproc's proc_listchildpids per pid (returns a COUNT of
+;; pid_t entries; the size argument is in BYTES — probed, jolt-hpdu). Linux: one
+;; pass over /proc/*/stat building ppid -> pids, then a walk from the root.
+;; Windows (no arm here) and a missing entry point answer empty — the old
+;; behavior, where destroy-tree reduces to destroy. babashka.process's
+;; destroy-tree destroys (cons handle descendants), so a real answer here is
+;; what makes killing a wrapper also kill the work it spawned: `lake env repl`
+;; killed via :shutdown destroy-tree used to leave the repl grandchild running
+;; as an orphan.
+(define proc-listchildpids
+  (and (eq? (sa-os-family) 'macos)
+       (jolt-foreign-proc-safe "proc_listchildpids" '(int u8* int) 'int)))
+
+;; Direct children via libproc. A count equal to the capacity may be a truncated
+;; answer: retry doubled, up to a cap no real tree reaches.
+(define (proc-children-darwin pid)
+  (let loop ((cap 256))
+    (let* ((buf (make-bytevector (* cap 4) 0))
+           (n (proc-listchildpids pid buf (* cap 4))))
+      (cond ((or (not (fixnum? n)) (<= n 0)) '())
+            ((and (>= n cap) (<= cap 65536)) (loop (* cap 2)))
+            (else (let col ((i 0) (acc '()))
+                    (if (= i n) acc
+                        (col (+ i 1) (cons (bytevector-s32-native-ref buf (* i 4)) acc)))))))))
+
+;; Linux: /proc/<pid>/stat is "pid (comm) state ppid ..." and comm may contain
+;; spaces and ')', so the ppid is parsed after the LAST ')'. Each read is
+;; guarded — a process is free to exit between the listing and the read.
+(define (proc-linux-ppid-map)
+  (let ((tbl (make-eqv-hashtable)))
+    (for-each
+      (lambda (name)
+        (let ((pid (string->number name)))
+          (when (fixnum? pid)
+            (guard (e (#t #f))
+              (let* ((s (call-with-port (open-input-file (string-append "/proc/" name "/stat"))
+                          get-string-all))
+                     (rp (let scan ((i (- (string-length s) 1)))
+                           (cond ((< i 0) #f)
+                                 ((char=? (string-ref s i) #\)) i)
+                                 (else (scan (- i 1))))))
+                     (ppid (and rp
+                                (let ((parts (filter (lambda (t) (> (string-length t) 0))
+                                                     (str-literal-split
+                                                       (substring s (+ rp 1) (string-length s)) " "))))
+                                  (and (pair? parts) (pair? (cdr parts))
+                                       (string->number (cadr parts)))))))
+                (when (fixnum? ppid)
+                  (hashtable-set! tbl ppid (cons pid (hashtable-ref tbl ppid '())))))))))
+      (guard (e (#t '())) (directory-list "/proc")))
+    tbl))
+
+;; All live descendants of pid, depth-first. State is per-call (nothing shared
+;; across threads); the seen set stops a walk that pid reuse made cyclic.
+(define (proc-descendants pid)
+  (let ((kids (cond (proc-listchildpids proc-children-darwin)
+                    ((eq? (sa-os-family) 'linux)
+                     (let ((tbl (proc-linux-ppid-map)))
+                       (lambda (p) (hashtable-ref tbl p '()))))
+                    (else (lambda (p) '()))))
+        (seen (make-eqv-hashtable)))
+    (let walk ((frontier (kids pid)) (acc '()))
+      (cond ((null? frontier) (reverse acc))
+            ((hashtable-ref seen (car frontier) #f) (walk (cdr frontier) acc))
+            (else
+             (hashtable-set! seen (car frontier) #t)
+             (walk (append (kids (car frontier)) (cdr frontier))
+                   (cons (car frontier) acc)))))))
+
 (define (make-proc-handle pid) (make-jhost "process-handle" pid))
 (register-host-methods! "process-handle"
   (list (cons "destroy" (lambda (self) (when proc-kill (proc-kill (jhost-state self) proc-SIGTERM)) #t))
         (cons "pid"     (lambda (self) (->num (jhost-state self))))
-        (cons "descendants" (lambda (self) (jolt-vector)))))
+        (cons "descendants" (lambda (self)
+          (apply jolt-vector (map make-proc-handle (proc-descendants (jhost-state self))))))))
 
 ;; --- CompletableFuture (Process.onExit().thenRun(f)) -------------------------
 ;; A minimal one-shot: thenRun spawns a thread that waits for the process to exit

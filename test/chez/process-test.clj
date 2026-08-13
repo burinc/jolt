@@ -239,6 +239,31 @@
       (when (pid-alive? gpid) (sh ["sh" "-c" (str "kill -9 " gpid)])))
     (fs/delete-if-exists pidf)))
 
+;; --- descendants / destroy-tree over a real grandchild (jolt-hpdu) -----------
+;; ProcessHandle.descendants was hardcoded empty, so destroy-tree WAS destroy:
+;; killing a wrapper left whatever the wrapper spawned running (a `lake env repl`
+;; wrapper's repl survived as a 4.8GB orphan). The direct child here is a sh that
+;; publishes its background sleep's pid ($!) and waits, so the sleep is a genuine
+;; grandchild: descendants must see it, and destroy-tree must kill it.
+(let [pidf (str (fs/create-temp-file {:prefix "jp-desc-" :suffix ".pid"}))
+      p (process ["sh" "-c" (str "sleep 30 & echo $! > " pidf "; wait")])]
+  (loop [n 0]
+    (when (and (< n 200) (str/blank? (slurp pidf)))
+      (Thread/sleep 50)
+      (recur (inc n))))
+  (let [gpid (str/trim (slurp pidf))
+        handles (iterator-seq (.iterator (.descendants (.toHandle (:proc p)))))]
+    (check-eq "descendants sees the grandchild"
+              (boolean (some #(= (str (.pid %)) gpid) handles)) true)
+    (p/destroy-tree p)
+    (loop [n 0] (when (and (< n 60) (pid-alive? gpid)) (Thread/sleep 50) (recur (inc n))))
+    (check-eq "destroy-tree kills the grandchild"
+              (and (seq gpid) (pid-alive? gpid)) false)
+    (when (pid-alive? gpid) (sh ["sh" "-c" (str "kill -9 " gpid)]))
+    (loop [n 0] (when (and (< n 60) (p/alive? p)) (Thread/sleep 50) (recur (inc n))))
+    (check-eq "destroy-tree kills the direct child" (p/alive? p) false))
+  (fs/delete-if-exists pidf))
+
 ;; A jolt sitting at a stdin prompt must still take SIGTERM, hooks and all. It
 ;; used to wait INSIDE Chez's blocking read, which holds the whole Scheme world:
 ;; nothing else runs, so the watcher could not have woken there (jolt-p9ua).
