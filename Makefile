@@ -116,7 +116,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling depssmoke depsunit \
+CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling depssmoke depscpcache depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi stdlibfasl \
   transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
@@ -377,6 +377,12 @@ readscaling: testbin
 # fixture projects in test/chez/deps-alias/. Offline.
 depssmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/deps-alias-smoke.sh
+
+# The resolved-roots cache (.jolt/cpcache): a warm run reuses a project's final
+# dependency resolution instead of re-expanding the graph. Offline throwaway
+# project in a temp dir; gates the cache key, invalidation, and dev posture.
+depscpcache: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/deps-cpcache-smoke.sh
 
 # Shared Grenadine dependency-expansion integration tests: exclusions, version
 # selection, orphan cutting, and the Maven version comparator, driven through
