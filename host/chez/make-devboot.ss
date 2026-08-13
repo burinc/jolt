@@ -104,10 +104,12 @@
                     (ei-bytes-lit (read-file-string abs)) ")\n")))))
           (bld-walk-files root "" '())))
       ldr-install-roots))
-  ;; Preload jolt.main + jolt.deps into the image.
-  (put-string out "\n;; === AOT jolt.main + jolt.deps ===\n")
-  (put-string out "(load-namespace \"jolt.main\")\n")
-  (put-string out "(load-namespace \"jolt.deps\")\n")
+  ;; AOT jolt.main + jolt.deps (and their on-demand Clojure closure) into the image
+  ;; as emitted Scheme — the SAME path build-jolt.ss uses (bld-emit-cli-aot), so the
+  ;; CLI closure is compiled here, not recompiled from source on every dev invocation.
+  ;; The old top-level (load-namespace …) forms re-executed at every Sbuild_heap and
+  ;; cost ~1.3s/invocation. bld-emit-cli-aot emits the section marker + per-ns Scheme.
+  (bld-emit-cli-aot out)
   (close-port out))
 
 ;; --- write input list (before compile, so the list is always consistent) ------

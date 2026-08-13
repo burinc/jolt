@@ -111,6 +111,40 @@ else
 fi
 rm -rf "$projdir"
 
+# (f) guard the CLI-AOT regression. The dev boot cache must AOT the CLI closure
+# (jolt.main + jolt.deps + their on-demand Clojure requires) into flat.ss as
+# emitted Scheme, NOT as top-level (load-namespace …) forms — those re-execute at
+# every Sbuild_heap and recompile the whole CLI closure from source on every dev
+# invocation (~1.3s). The release build (build-jolt.ss) has always done this AOT;
+# make-devboot must share the same bld-emit-cli-aot path. This asserts on the
+# EMITTED flat.ss text so the tail coming back fails here without adding a full
+# ~90s `make devboot` to the ci gate.
+echo "=== (f) flat.ss CLI-AOT section ==="
+flat_ss="target/dev/flat.ss"
+if [ -f "$flat_ss" ]; then
+  # must contain the CLI-AOT section marker bld-emit-cli-aot writes.
+  if grep -q '=== AOT jolt.main + jolt.deps (emitted Scheme) ===' "$flat_ss"; then
+    echo "  PASS: CLI-AOT section marker present in flat.ss"
+    pass=$((pass + 1))
+  else
+    echo "  FAIL: CLI-AOT section marker missing from flat.ss (bld-emit-cli-aot did not run?)"
+    fails=$((fails + 1))
+  fi
+  # must NOT contain a top-level (load-namespace "jolt.main"/"jolt.deps") line.
+  # cli-core.ss's inlined copy is INDENTED (inside jolt-cli-run's body), so the
+  # column-0 anchor skips it; only a regression that re-adds the tail matches.
+  if grep -nE '^\(load-namespace "jolt\.(main|deps)"\)$' "$flat_ss" >/dev/null; then
+    echo "  FAIL: flat.ss has a top-level (load-namespace \"jolt.main\"/\"jolt.deps\") — CLI closure not AOT'd"
+    grep -nE '^\(load-namespace "jolt\.(main|deps)"\)$' "$flat_ss" | head | sed 's/^/    /'
+    fails=$((fails + 1))
+  else
+    echo "  PASS: no top-level load-namespace for the CLI closure in flat.ss"
+    pass=$((pass + 1))
+  fi
+else
+  echo "  SKIP: $flat_ss does not exist (run 'make devboot' first); CLI-AOT text assertion not run"
+fi
+
 echo ""
 echo "devboot smoke: $pass passed, $fails failed"
 [ "$fails" -eq 0 ]
