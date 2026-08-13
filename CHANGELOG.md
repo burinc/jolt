@@ -5,6 +5,90 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.7] - 2026-08-12
+
+Reading. Running [edamame](https://github.com/borkdude/edamame)'s own test suite
+turned up a name jolt had quietly reserved — `syntax-quote`, which is not a
+Clojure special form, and which edamame happens to call its own resolver — plus
+three gaps in `read`/`read-line` over a `java.io` reader and a `conj` that
+rejected a record it agreed was a map. Fixing the `read` arity then exposed what
+had been hiding behind it: reading a source file form by form was quadratic, at
+674x the JVM's time on `clojure/core.clj`.
+
+### Fixed
+
+- **`syntax-quote` is not a reserved name.** jolt's reader lowers `` ` `` to a
+  marker form that the analyzer expands, and that marker used to be spelled with
+  the bare symbol `syntax-quote` — which the analyzer dispatched as a special
+  form, and special forms are deliberately not shadowable. So a var or a local of
+  that name was compiled into a syntax-quote of its first argument instead of a
+  call, silently producing a wrong value rather than an error:
+
+  ```clojure
+  (defn syntax-quote [a b c] [:fn a b c])
+  (syntax-quote 1 2 3)
+  ;; was => 1          (the arguments were dropped)
+  ;; now => [:fn 1 2 3]
+  ```
+
+  The marker is now `clojure.core`-qualified, the way `~` and `~@` already read as
+  `clojure.core/unquote` and `clojure.core/unquote-splicing`. `` `syntax-quote ``
+  also qualifies to the current namespace now, like any other symbol.
+
+- **`read` takes an options map.** The `(read opts stream)` and
+  `(read stream eof-error? eof-value recursive?)` arities were missing, and so
+  were the matching two on `read+string`. `{:eof v}` is the value returned at end
+  of input, and it is the key's *absence* — not a nil value under it — that
+  throws.
+
+  ```clojure
+  (read {:eof :done} rdr)   ; was: Wrong number of args (2) passed to: clojure.core/read
+  ```
+
+- **`read-line` reads from whatever `*in*` holds.** It went through a protocol
+  only jolt's own `*in*` implements, so binding `*in*` to a `java.io` reader —
+  which is exactly what `clojure.tools.reader`'s `read-line` does for a
+  `LineNumberingPushbackReader` — threw `No method -read-line`. That reader also
+  had no `.readLine` of its own.
+
+- **`conj` and `merge` accept a record on the right.** A record *is* a map, and
+  `(map? a-record)` said so, but `(conj {:a 1} a-record)` raised "conj on a map
+  expects a [k v] pair or a map". `conj` now asks whether the right-hand side seqs
+  into entries — the question the JVM asks — so records, sorted maps and a bare
+  seq of map entries all work, and a non-pair vector and a non-seqable both report
+  what the JVM reports.
+
+- **A `PushbackReader` is not a `BufferedReader`.** `instance?` answered true for
+  every reader, so library code branching on the difference took the wrong path.
+
+- **Each form read from a reader carries its own line.** Every form read through
+  `(read rdr)` used to be stamped `{:line 1 :column 1}`, because each read reparsed
+  a fresh copy of the remaining source. A `LineNumberingPushbackReader` now reports
+  the same positions the JVM does.
+
+### Performance
+
+- **Reading a source file form by form is no longer quadratic.** Each `read` off a
+  `java.io` reader drained the *entire* remaining reader — one method dispatch per
+  character, a quarter-million of them for a 250KB file — parsed one form, and
+  pushed the tail back as a new reader. A string-backed reader now parses at its
+  own index and advances. Reading `clojure/core.clj` (263KB, 697 top-level forms),
+  with JVM Clojure 1.12.5 for scale:
+
+  | reader | 0.7.6 | 0.7.7 | JVM |
+  | --- | --- | --- | --- |
+  | `java.io.PushbackReader` | 37764 ms | 27 ms | 31 ms |
+  | `clojure.lang.LineNumberingPushbackReader` | 41953 ms | 32 ms | 23 ms |
+
+  `slurp`, `line-seq` and `clojure.edn/read` over a reader take the same bulk path
+  and get the same relief.
+
+### Library conformance
+
+| library | before | after |
+| --- | --- | --- |
+| edamame | did not load | **50 tests, 351 pass**, 0 fail, 0 error |
+
 ## [0.7.6] - 2026-08-12
 
 Standard input, and what a stream is willing to say about itself. `System/in` did
