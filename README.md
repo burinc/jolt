@@ -278,6 +278,17 @@ out — keeping everything, and reporting which library is responsible — when 
 code resolves vars by name at runtime (`eval`/`resolve`/`ns-resolve`/…). See
 [deps.edn internals](https://jolt-lang.github.io/docs/tools-deps.html) and [RFC 0007](https://jolt-lang.github.io/docs/rfc/0007-compilation-modes-and-binary-output.html).
 
+Built executables contain an optional startup profiler. Set
+`JOLT_STARTUP_PROFILE=1` when launching one to write per-stage wall time,
+process CPU time, collection counts, reclaimed bytes, and current heap size to
+standard error. Markers cover the native boot loader, Jolt runtime files, each
+application namespace, and `-main`; normal launches leave the profiler disabled
+and silent.
+
+```bash
+JOLT_STARTUP_PROFILE=1 ./myapp arg1 arg2
+```
+
 This needs Chez's kernel development files (`libkernel.a`, `scheme.h`) and a C
 compiler. They come with a from-source Chez install; a distro `chezscheme`
 package ships only the runtime, so `build` won't link a binary there.

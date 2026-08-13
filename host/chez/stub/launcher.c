@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -56,8 +57,37 @@ static int open_self(const char *path) { return open(path, O_RDONLY); }
 #define JOLT_MAGIC "JOLTBOOT"
 #define JOLT_MAGIC_LEN 8
 #define JOLT_TRAILER_LEN 16 /* u64 length + 8-byte magic */
+static double monotonic_ms(void) {
+#if defined(_WIN32)
+  LARGE_INTEGER frequency;
+  LARGE_INTEGER counter;
+  QueryPerformanceFrequency(&frequency);
+  QueryPerformanceCounter(&counter);
+  return (double)counter.QuadPart * 1000.0 / (double)frequency.QuadPart;
+#else
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (double)now.tv_sec * 1000.0 + (double)now.tv_nsec / 1000000.0;
+#endif
+}
+
+static void startup_profile_mark(int enabled, double started, double *last,
+                                 const char *label) {
+  if (enabled) {
+    double now = monotonic_ms();
+    fprintf(stderr,
+            "jolt startup: [profile] native %-22s %9.3f ms"
+            "   (cumulative %9.3f ms)\n",
+            label, now - *last, now - started);
+    *last = now;
+  }
+}
+
 
 int main(int argc, char *argv[]) {
+  int startup_profile = getenv("JOLT_STARTUP_PROFILE") != NULL;
+  double startup_started = startup_profile ? monotonic_ms() : 0.0;
+  double startup_last = startup_started;
   char path[4096];
   if (self_path(path, (uint32_t)sizeof(path)) != 0) {
     fprintf(stderr, "jolt: cannot resolve own executable path\n");
@@ -98,6 +128,8 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   fclose(f);
+  startup_profile_mark(startup_profile, startup_started, &startup_last,
+                       "locate boot payload");
 
   int fd = open_self(path);
   if (fd < 0) {
@@ -106,10 +138,20 @@ int main(int argc, char *argv[]) {
   }
 
   Sscheme_init(0);
+  startup_profile_mark(startup_profile, startup_started, &startup_last,
+                       "Sscheme_init");
   /* final arg: close the fd when the boot is consumed */
   Sregister_boot_file_fd_region("jolt", fd, (iptr)boot_off, (iptr)boot_len, 1);
+  startup_profile_mark(startup_profile, startup_started, &startup_last,
+                       "register boot payload");
   Sbuild_heap(0, 0);
+  startup_profile_mark(startup_profile, startup_started, &startup_last,
+                       "Sbuild_heap");
   int status = Sscheme_start(argc, (const char **)argv);
+  startup_profile_mark(startup_profile, startup_started, &startup_last,
+                       "Sscheme_start");
   Sscheme_deinit();
+  startup_profile_mark(startup_profile, startup_started, &startup_last,
+                       "Sscheme_deinit");
   return status;
 }
