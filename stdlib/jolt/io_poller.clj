@@ -68,11 +68,6 @@
 
 ;; -- syscalls -----------------------------------------------------------------
 (ffi/defcfn c-fcntl "fcntl" [:int :int :varargs :int] :int)
-;; macOS exposes the errno slot via __error, Linux via __errno_location. The
-;; foreign-procedure form is created lazily on first call (emit-ffi-fn), so
-;; declaring both is safe; errno picks the live one per platform.
-(ffi/defcfn c-errno-loc "__errno_location" [] :pointer)
-(ffi/defcfn c-error-loc "__error" [] :pointer)
 (ffi/defcfn c-close "close" [:int] :int)
 (ffi/defcfn c-pipe "pipe" [:pointer] :int)
 (ffi/defcfn c-write "write" [:int :pointer :size_t] :ssize_t)
@@ -88,7 +83,7 @@
 (ffi/defcfn c-epoll-wait "epoll_wait" [:int :pointer :int :int] :int :blocking)
 
 ;; -- fd helpers (the socket layer's syscall surface) ---------------------------
-(defn errno [] (ffi/read (if macos? (c-error-loc) (c-errno-loc)) :int 0))
+(defn errno [] (ffi/errno))
 (defn eagain? [] (= EAGAIN (errno)))
 (defn eintr? [] (= EINTR (errno)))
 (defn connect-pending? [e] (or (= EINPROGRESS e) (= EALREADY e)))
