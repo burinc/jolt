@@ -1482,7 +1482,7 @@
         (begin
           ;; sliced so the deadline is checked even when no wakeup ever comes;
           ;; each slice returns #f and the caller re-checks the owner first.
-          (when (and deadline (>= (real-time) deadline))
+          (when (and deadline (>= (sa-real-time-ms) deadline))
             (ldr-watchdog-raise! (ldr-load-ctx) name))
           (jolt-condition-wait ldr-load-cv ldr-load-mu ldr-wait-slice)
           #f))))
@@ -1537,7 +1537,7 @@
 ;; the loop below — and it is now the same code path for both contenders.
 (define (ldr-begin-load! name force?)
   (let ((me (ldr-load-ctx))
-        (deadline (and (> ldr-wait-limit-ms 0) (+ (real-time) ldr-wait-limit-ms))))
+        (deadline (and (> ldr-wait-limit-ms 0) (+ (sa-real-time-ms) ldr-wait-limit-ms))))
     (jolt-lock-wait ldr-load-mu
       (lambda ()
         (let loop ()
