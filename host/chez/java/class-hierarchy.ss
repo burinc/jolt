@@ -616,6 +616,26 @@
 (def-var! "jolt.host" "register-class-supers!"
   (lambda (name supers) (jch-register-supers! name (seq->list supers)) jolt-nil))
 
+;; the ONE superclass edge for Class.getSuperclass: the first direct super that
+;; is not an interface, else java.lang.Object for a known concrete class. #f for
+;; Object itself, for interfaces (the JVM's null), and for names the graph does
+;; not model — the caller decides what unknown means (the reflection surface
+;; answers nil there, a recorded divergence for statics-only shims like Math).
+(define (jch-superclass name)
+  (cond
+    ((string=? name "java.lang.Object") #f)
+    ((jch-interface? name) #f)
+    ((not (jch-known? name)) #f)
+    (else
+     ;; prefer a concrete super over Object wherever it sits in the row —
+     ;; a row may list Object ahead of an abstract base.
+     (let loop ((ss (jch-direct-supers name)))
+       (cond ((null? ss) "java.lang.Object")
+             ((or (jch-interface? (car ss))
+                  (string=? (car ss) "java.lang.Object"))
+              (loop (cdr ss)))
+             (else (car ss)))))))
+
 ;; transitive ancestry rooted at Object for a concrete class; an interface's chain
 ;; has no Object (its getSuperclass is null). '() for Object itself.
 (define (jch-ancestors-rooted name)

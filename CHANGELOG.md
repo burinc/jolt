@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Minimal Class reflection.** `.getSuperclass`, `.getInterfaces`,
+  `.isAssignableFrom`, and `.isInterface` answer from the one modeled class
+  graph — so the exception chain walks to `Object`, an interface's
+  superclass is nil, and a defrecord reflects like any modeled class. A dot
+  form on a class token whose static member doesn't exist now falls back to
+  the `java.lang.Class` instance methods on the class object, the way JVM
+  Clojure resolves `(.getName String)` — which also makes
+  `(.isAssignableFrom Object …)` reachable. `getSuperclass` on a
+  statics-only shim (`Math`) answers nil where the JVM answers `Object`;
+  tracked.
+
 - **`jolt.ffi/errno` and `errno-message`: a public, thread-correct errno.**
   errno is a per-thread slot behind a libc function (`__error` on macOS,
   `__errno_location` on Linux, `_errno` on Windows); the accessor reads the
