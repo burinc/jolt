@@ -5,6 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.11] - 2026-08-14
+
+Vectors grew a tree. Concatenating and slicing persistent vectors is
+structural now — `(into vec vec)` and `subvec` are O(log n) instead of
+rebuilding element by element — and built binaries can explain their own
+startup. A dependency resolution that failed halfway can no longer be cached
+as if it had succeeded.
+
+### Added
+
+- **RRB vectors.** The persistent vector supports O(log n) structural
+  concatenation and slicing (an RRB tree behind the existing vector), with a
+  `clojure.core.rrb-vector` overlay (`catvec`/`subvec`) for code using the
+  library API. `(into vec vec)` and `clojure.core/subvec` route through the
+  structural ops, so both are logarithmic in the vector size. Complexity
+  gates pin the class at the raw-op level (`make rrbscaling`) and through
+  core (`make vecscaling`) — an element-by-element rebuild coming back fails
+  the build, not a benchmark eyeball.
+
+- **Startup profiler for built binaries.** `JOLT_STARTUP_PROFILE=1 ./myapp`
+  writes per-stage wall time — native boot, runtime files, each namespace,
+  `-main` — with no measurable cost when disabled (the default).
+
+- **Load watchdog.** A namespace-load claim wait past its limit (default
+  120s; `JOLT_LOAD_WAIT_LIMIT_SECS` overrides, 0 disables) raises with the
+  full claim table — which namespaces are loading, which threads are waiting
+  on them — instead of hanging silently.
+
+### Fixed
+
+- **A degraded resolution is never cached.** A Maven or local jar that could
+  not be extracted (no `unzip` in the environment, full disk) only warned,
+  resolved the project *without* that dependency's source, and wrote the
+  result to `.jolt/cpcache` — where it kept being served after the
+  environment was fixed, until the project's `.jolt` was deleted by hand.
+  Extraction failures now collect into the same "artifacts could not be
+  resolved" report as fetch failures and abort the resolution, so nothing
+  degraded is ever written. The cache key also folds `JOLT_MVNLIBS` /
+  `JOLT_LOCAL_REPO` / `GRENADINE_LOCAL_REPOSITORY`: they move where
+  extractions live, and the old location usually still exists, so validating
+  that cached paths exist could not catch the switch.
+
 ## [0.7.10] - 2026-08-13
 
 Startup, twice over. A binary that took 1.7 seconds to start a two-dependency
