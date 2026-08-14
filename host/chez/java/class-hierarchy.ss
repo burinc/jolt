@@ -396,6 +396,11 @@
 (jch-register-supers! "java.lang.Object" '())
 (jch-register-supers! "java.lang.Class" '())
 (jch-register-supers! "java.lang.Throwable" '())
+;; statics-only shims (no value ever carries these tags, so the rows cannot
+;; shift protocol dispatch) — present so Class.getSuperclass answers Object
+;; as the JVM does, jolt-of08.8
+(jch-register-supers! "java.lang.Math" '())
+(jch-register-supers! "java.lang.System" '())
 (jch-register-supers! "java.lang.Byte" '("java.lang.Number"))
 (jch-register-supers! "java.lang.Short" '("java.lang.Number"))
 ;; java.lang.AutoCloseable / java.io.Closeable / java.io.Flushable — the
