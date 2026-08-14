@@ -118,7 +118,7 @@ install: build
 
 CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling depssmoke depscpcache depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi stdlibfasl \
-  transient stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
+  transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck lockcheck parkcheck irvalidate devbootsmoke \
@@ -439,6 +439,14 @@ ffi:
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
 	@$(CHEZ) --script test/chez/transient-test.ss
+
+# RRB vector: catvec/slice against a list model with structural invariants
+# (seeded sequences, seed printed on failure), and the n-vs-4n complexity
+# ratio measured in one process.
+rrbprop:
+	@$(CHEZ) --script test/chez/rrb-property-test.ss
+rrbscaling:
+	@$(CHEZ) --script test/chez/rrb-scaling-test.ss
 
 # State images: value-graph round-trip through jolt.image, plus the Chez fasl
 # behaviour the format assumes (machine-independence, what fasl refuses).

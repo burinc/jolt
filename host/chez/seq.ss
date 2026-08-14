@@ -772,8 +772,8 @@
 (define (na-chunk-first s)
   (let ((vb (na-vblock s)))
     (if vb
-        (let* ((pv (car vb)) (i (cseq-ci s)) (end (cdr vb)) (len (fx- end i))
-               (node (pv-chunk-for pv i)) (off (fxand i pv-mask)))
+        (let*-values (((pv) (car vb)) ((i) (cseq-ci s)) ((end) (cdr vb)) ((len) (fx- end i))
+                      ((node off) (pv-leaf-for pv i)))
           (if (fx<=? (fx+ off len) (vector-length node))
               (make-pvec (vec-copy-range node off (fx+ off len)))
               (let ((out (make-vector len)))
@@ -806,9 +806,9 @@
 ;; Leaf resolution mirrors na-chunk-first exactly: one contiguous leaf when the
 ;; block is 32-aligned, per-index reads for the rare window crossing a leaf.
 (define (na-chunk-map-first s g)
-  (let* ((vb (na-vblock s)) (pv (car vb)) (i (cseq-ci s)) (end (cdr vb))
-         (len (fx- end i)) (out (make-vector len))
-         (node (pv-chunk-for pv i)) (off (fxand i pv-mask)))
+  (let*-values (((vb) (na-vblock s)) ((pv) (car vb)) ((i) (cseq-ci s)) ((end) (cdr vb))
+                ((len) (fx- end i)) ((out) (make-vector len))
+                ((node off) (pv-leaf-for pv i)))
     (if (fx<=? (fx+ off len) (vector-length node))
         (let loop ((j 0))
           (if (fx<? j len)
@@ -821,10 +821,10 @@
 ;; Returns the kept-elements chunk pvec, or #f when the whole block is rejected
 ;; (so the caller recurses straight into chunk-rest, emitting no empty cell).
 (define (na-chunk-filter-first s tp keep)
-  (let* ((vb (na-vblock s)) (pv (car vb)) (i (cseq-ci s)) (end (cdr vb))
-         (len (fx- end i)) (out (make-vector len))
-         (node (pv-chunk-for pv i)) (off (fxand i pv-mask))
-         (aligned? (fx<=? (fx+ off len) (vector-length node))))
+  (let*-values (((vb) (na-vblock s)) ((pv) (car vb)) ((i) (cseq-ci s)) ((end) (cdr vb))
+                ((len) (fx- end i)) ((out) (make-vector len))
+                ((node off) (pv-leaf-for pv i))
+                ((aligned?) (fx<=? (fx+ off len) (vector-length node))))
     (let loop ((j 0) (w 0))
       (if (fx<? j len)
           (let ((x (if aligned? (vector-ref node (fx+ off j)) (pvec-nth-d pv (fx+ i j) jolt-nil))))
@@ -926,9 +926,8 @@
           (cond ((jolt-reduced? acc) acc)
                 ((fx>=? i n) acc)
                 (else
-                 (let* ((chunk (pv-chunk-for v i))
-                        (clen (vector-length chunk))
-                        (offset (fxand i pv-mask)))
+                 (let*-values (((chunk offset) (pv-leaf-for v i))
+                        ((clen) (vector-length chunk)))
                    (let inner ((j offset) (k i) (acc acc))
                      (cond ((jolt-reduced? acc) acc)
                            ((fx>=? j clen) (outer k acc))
@@ -937,9 +936,8 @@
           (cond ((jolt-reduced? acc) acc)
                 ((fx>=? i n) acc)
                 (else
-                 (let* ((chunk (pv-chunk-for v i))
-                        (clen (vector-length chunk))
-                        (offset (fxand i pv-mask)))
+                 (let*-values (((chunk offset) (pv-leaf-for v i))
+                        ((clen) (vector-length chunk)))
                    (let inner ((j offset) (k i) (acc acc))
                      (cond ((jolt-reduced? acc) acc)
                            ((fx>=? j clen) (outer k acc))
