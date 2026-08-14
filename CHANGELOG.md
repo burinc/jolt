@@ -5,6 +5,112 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.10] - 2026-08-13
+
+Startup, twice over. A binary that took 1.7 seconds to start a two-dependency
+project now takes 0.17s, and a regex-heavy application binary no longer pays
+for patterns it never matches — one profiled CLI spent 372ms of its 660ms
+launch compiling two HTTP Link-header patterns its command path never used.
+Native libraries now load scoped, closing a symbol-shadowing regression that
+flipped crypto to the wrong SSL library. `resolve` returns classes, reader
+conditionals match `:bb`, and `destroy-tree` actually destroys the tree.
+
+### Performance
+
+- **Stdlib namespaces load precompiled.** Install-owned namespaces (clojure.test,
+  jolt.time, jolt.nrepl, jolt.fs, …) were excluded from the AOT cache, so every
+  require recompiled them from source on every process start — +0.35s for
+  clojure.test, +1.3s for the jolt.time base namespaces in any project using the
+  time library. The binary now carries one compiled fasl per namespace in a
+  linked blob; a require memcpy's the slice out and loads it. Requires that cost
+  0.3–1.4s are now at the floor. The embedded set is pinned in
+  `host/chez/stdlib-fasl-manifest.txt`, and drift fails the build. Binary +1MB;
+  startup floor and memory unchanged.
+
+- **Project dependency resolution is cached.** A warm run re-expanded the whole
+  dependency graph — POM parsing, version selection, gitlib probing — on every
+  invocation. The final resolution is now cached under the project's
+  `.jolt/cpcache`, keyed on the content of everything the expansion reads: the
+  project and user deps.edn, the active alias set, every `:local/root` dep's
+  deps.edn, and the artifact-root environment (`JOLT_GITLIBS` and friends). A
+  hit validates that every cached path still exists, so a pruned gitlib
+  re-expands instead of erroring; `-Stree`/`-Strace`/`-Scp` never touch it.
+  Warm `jolt -e nil` in a project: 0.38s → 0.14s.
+
+- **Regex engines compile lazily.** `re-pattern` built two engines per pattern
+  at construction: a throwaway DFA compile used only to count capture groups —
+  the expensive one on alternation-heavy patterns — and then the real
+  backtracking engine. Construction now only parses (a malformed pattern still
+  throws `PatternSyntaxException` right there, like the JVM), and the engine
+  builds at first match, chosen from the parsed pattern, so a capturing pattern
+  builds exactly one engine and a pattern that is never matched never compiles.
+  A namespace of `def`'d patterns loads for the price of parsing: the profiled
+  Link-header pair went from 1.25ms to 23µs at construction, and to nothing at
+  all when the middleware holding them isn't exercised.
+
+- **The dev boot cache no longer recompiles the CLI on every invocation**
+  (contributors only): `make devboot`'s image AOTs jolt.main + jolt.deps the
+  same way the release build does. Dev `bin/jolt` 1.65s → 0.25s.
+
+### Changed
+
+- **Reader conditionals match `:bb`.** The feature set is now
+  `:jolt :bb :clj :default`, like babashka's own `:bb :clj`: a library's `:bb`
+  branch solves the same non-JVM problems jolt has — no reflection, no JVM-only
+  classes — and is listed ahead of `:clj` precisely so a bb-like host takes it.
+  Previously every such branch was unreachable. A `:jolt` branch placed before
+  `:bb`/`:clj` still overrides both. Where babashka's own model differs from
+  jolt's (bb represents classes as symbols in hierarchies and is lenient where
+  jolt throws like the JVM), jolt keeps the JVM shape; the divergence entry in
+  known-divergences spells this out. `jolt.fs` now defines `list-dir` itself —
+  the vendored babashka.fs leaves it to bb's built-in on a `:bb` host.
+
+### Fixed
+
+- **Native libraries load scoped, and FFI symbol resolution is deterministic.**
+  Chez resolves a foreign name against shared objects most-recently-loaded
+  first, and re-loading the process-global handle re-promoted it — on macOS
+  that flipped every `EVP_*` to Apple's BoringSSL, breaking jolt-crypto against
+  the OpenSSL it had verified against. `jolt.ffi/load-library` now dlopens
+  `RTLD_LOCAL` and resolves symbols per handle, declared `:jolt/native`
+  libraries before the global namespace, so a library gets the symbols of the
+  object it named. The per-OS map form of `load-library`
+  (`{:mac "libx.dylib" :linux "libx.so"}`) works as documented and a missing
+  platform key raises naming it; both are gated in the CLI smoke. Site FFI docs
+  describe the resolution order.
+
+- **A poller readiness registration can no longer be lost.** The io-poller
+  drained pending registrations in two critical sections, so a registration
+  landing between them was erased before reaching the kernel set — one fiber in
+  a thousand parked forever. The drain is one critical section now, a parking
+  fiber commits under the poller lock with interrupts disabled, closing a
+  socket forgets its fd (a reused descriptor inherited stale ready-flags), and
+  `jolt.io-poller/debug-state` classifies any future loss at the stage that
+  dropped it. Gated by a registration-storm smoke that fails on the first lost
+  wakeup.
+
+- **`resolve` and `ns-resolve` return the class for a class mapping**, like the
+  JVM: `(resolve 'String)` is the class `java.lang.String`, `(= (resolve 'X) X)`
+  holds for dotted names, imported short names, and deftype names, and a var
+  that merely holds a class — `(def MyCls String)` — still resolves to the var.
+  Tooling that classifies resolution results with `class?` (typed.cljc.analyzer
+  does) now works unpatched. A macro that splices the result —
+  `` `(instance? ~(resolve sym) x) `` — compiles in call position and inside
+  quoted structure, the way spliced vars always did.
+
+- **`destroy-tree` destroys the tree.** `ProcessHandle.descendants` was
+  hardcoded empty, so babashka.process's `destroy-tree` quietly reduced to
+  `destroy`: killing a wrapper (`lake env repl`, a shell around the real work)
+  orphaned whatever the wrapper had spawned — observed in the wild as a repl
+  holding 4.8GB, reparented to init, unreachable but alive. descendants now asks
+  the OS for the live tree: `proc_listchildpids` on macOS, one `/proc/*/stat`
+  pass on Linux. Windows still answers empty.
+
+### Internal
+
+- A `vecops` benchmark suite records the vector concat/slice axis (pairwise
+  `into`, `subvec` windows, split-rejoin) ahead of the RRB work.
+
 ## [0.7.9] - 2026-08-13
 
 A dependency fetch that hits a network blip now tries again instead of failing
