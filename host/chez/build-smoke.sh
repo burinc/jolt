@@ -63,6 +63,22 @@ if [ "$got" != "$want" ]; then
   exit 1
 fi
 
+# Startup profiling is one opt-in switch on the same binary. The ordinary run
+# above is exact-output proof that it stays silent by default; an enabled run
+# spans the native heap loader, app namespace initialization, and -main.
+profiled="$(cd / && JOLT_STARTUP_PROFILE=1 "$out" alpha bb ccc 2>&1)"
+for marker in \
+  'jolt startup: [profile] native Sbuild_heap' \
+  'jolt startup: [profile] scheme namespace app.core' \
+  'jolt startup: [profile] scheme entry -main'
+do
+  if ! printf '%s\n' "$profiled" | grep -Fq "$marker"; then
+    echo "  FAIL: startup profile missing marker: $marker"
+    echo "--- got ----"; echo "$profiled"
+    exit 1
+  fi
+done
+
 # --- release now defaults to direct-linking + whole-program inference ------------
 # A plain `jolt build` (release, no flags) must direct-link app->app calls (the
 # throughput lever the perf audit identified) AND run wp-infer — both were opt-in

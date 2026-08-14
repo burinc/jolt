@@ -219,6 +219,64 @@
     ;; editor (ncurses + terminfo), threads, dlopen, libuuid, and clock_gettime.
     (else "-llz4 -lz -lncurses -ltinfo -ldl -lm -lpthread -luuid -lrt")))
 
+;; --- optional built-binary startup profile ----------------------------------
+;; JOLT_STARTUP_PROFILE=1 reports wall time, process CPU, collections,
+;; reclaimed GC bytes, and current heap size at coarse runtime/app boundaries.
+;; The definitions use Chez primitives only, so they can run before Jolt's runtime is initialized.
+;; Calls stay in every built image but return immediately when the variable is
+;; absent; this keeps one binary usable for normal runs and startup diagnosis.
+(define (bld-emit-startup-profile-preamble out)
+  (put-string out
+    "(define jolt-startup-profile? (and (getenv \"JOLT_STARTUP_PROFILE\") #t))\n\
+(define jolt-startup-profile-start-real\n\
+  (and jolt-startup-profile? (real-time)))\n\
+(define jolt-startup-profile-last-real jolt-startup-profile-start-real)\n\
+(define jolt-startup-profile-last-cpu\n\
+  (and jolt-startup-profile? (cpu-time)))\n\
+(define jolt-startup-profile-initial-stats\n\
+  (and jolt-startup-profile? (statistics)))\n\
+(define jolt-startup-profile-last-collections\n\
+  (and jolt-startup-profile?\n\
+       (sstats-gc-count jolt-startup-profile-initial-stats)))\n\
+(define jolt-startup-profile-last-gc-bytes\n\
+  (and jolt-startup-profile?\n\
+       (sstats-gc-bytes jolt-startup-profile-initial-stats)))\n\
+(define (jolt-startup-profile-mark! label)\n\
+  (when jolt-startup-profile?\n\
+    (let* ((now-real (real-time))\n\
+           (now-cpu (cpu-time))\n\
+           (now-stats (statistics))\n\
+           (now-collections (sstats-gc-count now-stats))\n\
+           (now-gc-bytes (sstats-gc-bytes now-stats)))\n\
+      (display\n\
+        (string-append\n\
+          \"jolt startup: [profile] scheme \" label\n\
+          \"   wall \" (number->string (- now-real jolt-startup-profile-last-real)) \" ms\"\n\
+          \"   cpu \" (number->string (- now-cpu jolt-startup-profile-last-cpu)) \" ms\"\n\
+          \"   gc \" (number->string (- now-collections jolt-startup-profile-last-collections))\n\
+          \"   gc-reclaimed \" (number->string (- now-gc-bytes jolt-startup-profile-last-gc-bytes)) \" bytes\"\n\
+          \"   heap \" (number->string (current-memory-bytes)) \" bytes\"\n\
+          \"   (cumulative \" (number->string (- now-real jolt-startup-profile-start-real)) \" ms)\\n\")\n\
+        (current-error-port))\n\
+      (let ((after-stats (statistics)))\n\
+        (set! jolt-startup-profile-last-real (real-time))\n\
+        (set! jolt-startup-profile-last-cpu (cpu-time))\n\
+        (set! jolt-startup-profile-last-collections (sstats-gc-count after-stats))\n\
+        (set! jolt-startup-profile-last-gc-bytes (sstats-gc-bytes after-stats))))))\n"))
+
+(define (bld-startup-profile-form label)
+  (string-append "(jolt-startup-profile-mark! " (ei-str-lit label) ")"))
+
+(define (bld-emit-startup-profile-mark! out label)
+  (put-string out (bld-startup-profile-form label))
+  (put-string out "\n"))
+
+(define (bld-runtime-entry-label entry)
+  (cond
+    ((symbol? entry) (symbol->string entry))
+    ((bld-load-path entry) => (lambda (path) path))
+    (else entry)))
+
 ;; --- runtime manifest (mirrors host/chez/cli.ss's load order) ---------------
 ;; A line is either literal Scheme text to inline, or a tag whose emission the build
 ;; controls: 'prelude (the clojure.core blob, replaced by the shaken core under
@@ -313,16 +371,34 @@
 ;; closed AOT app that never compiles from source) omits 'image + 'compile-eval —
 ;; the analyzer/back end are dead weight in the binary (~0.8MB).
 (define (bld-emit-runtime out drop-compiler? core-strs)
+  (bld-emit-startup-profile-preamble out)
+  (bld-emit-startup-profile-mark! out "runtime begin")
   (for-each
     (lambda (entry)
-      (cond
-        ((eq? entry 'prelude)
-         (if core-strs
-             (for-each (lambda (s) (put-string out s) (put-string out "\n")) core-strs)
-             (bld-inline-line (cdr (assq 'prelude bld-tagged-loads)) out 0)))
-        ((memq entry '(image compile-eval))
-         (unless drop-compiler? (bld-inline-line (cdr (assq entry bld-tagged-loads)) out 0)))
-        (else (bld-inline-line entry out 0))))
+      (let ((emitted?
+              (cond
+                ((eq? entry 'prelude)
+                 (if core-strs
+                     (begin
+                       (for-each (lambda (s) (put-string out s) (put-string out "\n"))
+                                 core-strs)
+                       #t)
+                     (begin
+                       (bld-inline-line (cdr (assq 'prelude bld-tagged-loads)) out 0)
+                       #t)))
+                ((memq entry '(image compile-eval))
+                 (if drop-compiler?
+                     #f
+                     (begin
+                       (bld-inline-line (cdr (assq entry bld-tagged-loads)) out 0)
+                       #t)))
+                (else
+                 (bld-inline-line entry out 0)
+                 #t))))
+        (when emitted?
+          (bld-emit-startup-profile-mark!
+            out
+            (string-append "runtime " (bld-runtime-entry-label entry))))))
     bld-runtime-manifest))
 
 ;; --- app emission -----------------------------------------------------------
@@ -991,45 +1067,55 @@
                 ;; form too (no-op unless the app registered data readers).
                 (parameterize ((ei-emit-form-hook
                                 (lambda (form) (if data-readers-active (ldr-apply-readers form) form))))
-                (if tree-shake?
-                    (dce-shake
-                      (dce-blob-records "host/chez/seed/prelude.ss")
-                      (apply append
-                        (map (lambda (nf)
-                               ;; ns-prelude forms (always kept, no fqn/refs) set the
-                               ;; ns + register aliases before this ns's forms; dce
-                               ;; keeps original order.
-                               (let ((src (ldr-read-source (cdr nf))))
-                                 (jolt-enter-file! (cdr nf))   ; name the file on a failure
-                                 (parameterize ((rdr-source-file (cdr nf)))
-                                   ;; RT.load-parity bracket (dyn-binding.ss): the
-                                   ;; ns's replayed forms run under fresh
-                                   ;; *warn-on-reflection*/*assert* bindings.
-                                   (append
-                                     (list (dce-rec #t #f '() "(jolt-ns-load-vars-push!)"))
-                                     (map (lambda (s) (dce-rec #t #f '() s))
-                                          (bld-ns-prelude (car nf) src))
-                                     (ei-emit-ns-records (car nf) src)
-                                     (list (dce-rec #t #f '() "(jolt-ns-load-vars-pop!)"))))))
-                             ordered))
-                      (string-append entry-ns "/-main"))
-                    (values #f
-                            (apply append
-                              (map (lambda (nf)
-                                     (let ((src (ei-timed "emit: read source"
-                                                  (lambda () (ldr-read-source (cdr nf))))))
-                                       (jolt-enter-file! (cdr nf))   ; name the file on a failure
-                                       (parameterize ((rdr-source-file (cdr nf)))
-                                         ;; RT.load-parity bracket, matching the
-                                         ;; tree-shake path above.
-                                         (append (list "(jolt-ns-load-vars-push!)")
-                                                 (ei-timed "emit: ns-prelude"
-                                                   (lambda () (bld-ns-prelude (car nf) src)))
-                                                 (ei-timed "emit: per-ns total"
-                                                   (lambda () (bld-emit-ns (car nf) src)))
-                                                 (list "(jolt-ns-load-vars-pop!)")))))
-                                   ordered))
-                            #f))))
+                  (if tree-shake?
+                      (dce-shake
+                        (dce-blob-records "host/chez/seed/prelude.ss")
+                        (apply append
+                          (map (lambda (nf)
+                                 ;; ns-prelude forms (always kept, no fqn/refs) set the
+                                 ;; ns + register aliases before this ns's forms; dce
+                                 ;; keeps original order.
+                                 (let* ((src (ldr-read-source (cdr nf)))
+                                        (profile-form
+                                          (bld-startup-profile-form
+                                            (string-append "namespace " (car nf)))))
+                                   (jolt-enter-file! (cdr nf))   ; name the file on a failure
+                                   (parameterize ((rdr-source-file (cdr nf)))
+                                     ;; RT.load-parity bracket (dyn-binding.ss): the
+                                     ;; ns's replayed forms run under fresh
+                                     ;; *warn-on-reflection*/*assert* bindings.
+                                     (append
+                                       (list (dce-rec #t #f '() "(jolt-ns-load-vars-push!)"))
+                                       (map (lambda (s) (dce-rec #t #f '() s))
+                                            (bld-ns-prelude (car nf) src))
+                                       (ei-emit-ns-records (car nf) src)
+                                       (list
+                                         (dce-rec #t #f '() "(jolt-ns-load-vars-pop!)")
+                                         (dce-rec #t #f '() profile-form))))))
+                               ordered))
+                        (string-append entry-ns "/-main"))
+                      (values
+                        #f
+                        (apply append
+                          (map (lambda (nf)
+                                 (let ((src (ei-timed "emit: read source"
+                                              (lambda () (ldr-read-source (cdr nf))))))
+                                   (jolt-enter-file! (cdr nf))   ; name the file on a failure
+                                   (parameterize ((rdr-source-file (cdr nf)))
+                                     ;; RT.load-parity bracket, matching the
+                                     ;; tree-shake path above.
+                                     (append
+                                       (list "(jolt-ns-load-vars-push!)")
+                                       (ei-timed "emit: ns-prelude"
+                                         (lambda () (bld-ns-prelude (car nf) src)))
+                                       (ei-timed "emit: per-ns total"
+                                         (lambda () (bld-emit-ns (car nf) src)))
+                                       (list
+                                         "(jolt-ns-load-vars-pop!)"
+                                         (bld-startup-profile-form
+                                           (string-append "namespace " (car nf))))))))
+                               ordered))
+                        #f))))
               (lambda ()
                 (set-optimize! #f)
                 (set-release! #f)
@@ -1097,8 +1183,10 @@
           ;; foreign-procedure evals (a library's defcfn) and (slurp (io/resource …))
           ;; reads. So the libraries must be loaded and resources resolvable by the
           ;; time those forms run, not later in the scheme-start launcher.
+          (bld-emit-startup-profile-mark! out "app image begin")
           (put-string out "\n;; === native libraries (required) ===\n")
           (bld-emit-natives out natives 'required)
+          (bld-emit-startup-profile-mark! out "required native libraries")
           (put-string out "\n;; === embedded resources ===\n")
           (bld-emit-embeds out embed-dirs)
            (bld-emit-data-readers out)
@@ -1110,6 +1198,7 @@
                              (fold-left (lambda (s r) (string-append s (ei-str-lit r) " ")) ""
                                         (get-source-roots))
                              "))\n"))
+          (bld-emit-startup-profile-mark! out "embedded resources and source roots")
           ;; Pre-register every app namespace in ns-registry BEFORE any app form
           ;; runs, so a boot-time (require 'x) of an AOT'd namespace no-ops (the
           ;; loader's ns-registry arm) instead of hunting for absent source. Needed
@@ -1120,7 +1209,9 @@
           (put-string out "\n;; === app namespace pre-registration ===\n")
           (for-each (lambda (p) (put-string out (string-append "(intern-ns! " (ei-str-lit (car p)) ")\n")))
                     ordered)
+          (bld-emit-startup-profile-mark! out "app namespace registration")
           (put-string out "\n;; === app ===\n")
+          (bld-emit-startup-profile-mark! out "app namespaces begin")
           (for-each (lambda (s) (put-string out s) (put-string out "\n")) app-strs)
           ;; The launcher runs as Chez's scheme-start (so argv reaches -main —
           ;; top-level boot forms run during heap build, before args are set), and
@@ -1139,6 +1230,7 @@
               "        (default (* 16 1024 1024)))\n"
               "    (if trip (or (string->number trip) default) default)))\n"))
           (put-string out "(scheme-start\n  (lambda args\n")
+          (bld-emit-startup-profile-mark! out "scheme-start begin")
           ;; Shutdown hooks (`:shutdown` on a jolt.process, jolt.host/
           ;; add-shutdown-hook) run from Chez's exit-handler, which is a THREAD
           ;; parameter — so the wrapper has to be installed on the thread that
@@ -1164,6 +1256,7 @@
                              (fold-left (lambda (s r) (string-append s (ei-str-lit r) " ")) "" (bld-strs ext-roots))
                              "))\n"
                              "                  " (ldr-install-roots-str) ")))\n"))
+          (bld-emit-startup-profile-mark! out "scheme-start setup")
           (if library?
               (put-string out (bld-library-launcher-body))
               (put-string out (string-append
@@ -1188,7 +1281,10 @@
                             "        (when (and maincell (var-cell-defined? maincell))\n"
                             "          (with-exception-handler\n"
                             "            (lambda (c) (when (serious-condition? c) (jolt-capture-fault! c)) (raise-continuable c))\n"
-                            "            (lambda () (apply jolt-invoke (var-cell-root maincell) args))))))\n"
+                            "            (lambda ()\n"
+                            "              (let ((jolt-main-result (apply jolt-invoke (var-cell-root maincell) args)))\n"
+                            "                " (bld-startup-profile-form "entry -main") "\n"
+                            "                jolt-main-result))))))\n"
                             "    (exit 0)))\n")))
           (close-port out))
         (ei-mark! "write flat.ss")
