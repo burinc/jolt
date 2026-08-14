@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`jolt.scheme`: the Scheme escape hatch.** Call a host Scheme procedure
+  by name (`call`, `proc`, `defsfn`) or evaluate Scheme text
+  (`eval-string`) from any jolt program. The contract is raw — numbers,
+  strings, booleans and chars are shared representations; everything else
+  crosses as whatever it is on the other side, and host values round-trip
+  opaquely. Host-specific by design, and resolution happens at run time,
+  so a tree-shaken binary reports a shaken-out binding as a catchable
+  "no top-level Scheme binding" error rather than a silent nil.
+
 - **System properties libraries actually sniff.** `os.arch` answers in the
   JVM's spelling (`aarch64`/`amd64`), `user.name` comes from the
   environment, and `os.version` reports the macOS product version
