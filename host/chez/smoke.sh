@@ -883,6 +883,23 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.fibers — the public lower-level fiber API (spawn/join/monitor!, states,
+# knobs) over the carrier pool. Self-checks, one marker; same capture rules as
+# the socket gate above.
+fib_out="$($jolt run test/chez/jolt-fibers-test.clj 2>&1)"
+if printf '%s' "$fib_out" | grep -q 'JOLT-FIBERS-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.fibers"
+  if printf '%s\n' "$fib_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$fib_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$fib_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$fib_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # jolt.process — the stdlib sub-process API against real programs (capture, pipes,
 # stdin, :dir/:env, exit codes, signals). The file self-checks and prints a marker.
 #
