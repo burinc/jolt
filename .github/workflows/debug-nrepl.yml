@@ -1,0 +1,63 @@
+name: debug-nrepl-fleet
+on:
+  push:
+    branches: [debug/nrepl-fleet]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: jolt
+          ref: fix/load-claim-watchdog
+          submodules: recursive
+      - uses: actions/checkout@v5
+        with: { repository: jolt-lang/nrepl, path: nrepl }
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev libncurses-dev uuid-dev xxd
+      - name: Cache Chez Scheme
+        id: cache-chez
+        uses: actions/cache@v4
+        with:
+          path: /opt/chez
+          key: chez-${{ runner.os }}-${{ env.ImageOS }}-v10.4.1-x11off
+      - name: Build Chez Scheme from source
+        if: steps.cache-chez.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v10.4.1 https://github.com/cisco/ChezScheme.git /tmp/chez-src
+          cd /tmp/chez-src
+          ./configure --installprefix=/opt/chez --threads --disable-x11
+          make -j"$(nproc)"
+          sudo make install
+          sudo chown -R "$USER" /opt/chez
+      - name: Put chez on PATH
+        run: |
+          printf '#!/bin/sh\nexec /opt/chez/bin/scheme "$@"\n' > /opt/chez/bin/chez
+          chmod +x /opt/chez/bin/chez
+          echo '/opt/chez/bin' >> "$GITHUB_PATH"
+      - name: Build jolt with the watchdog
+        run: |
+          set -eu
+          cd jolt && make testbin && ./target/release/jolt --version
+      - name: Trigger the wedge, watchdog armed
+        run: |
+          set +e
+          set -u
+          cd nrepl
+          for i in 1 2; do
+            rm -rf .jolt .nrepl-port ~/.jolt ~/.m2
+            mkdir -p ~/.m2/repository/cider/orchard/0.44.0 ~/.m2/repository/compliment/compliment/0.8.0 ~/.m2/repository/org/clojure/spec.alpha/0.5.238
+            curl -sf -o ~/.m2/repository/cider/orchard/0.44.0/orchard-0.44.0.jar https://repo.clojars.org/cider/orchard/0.44.0/orchard-0.44.0.jar
+            curl -sf -o ~/.m2/repository/cider/orchard/0.44.0/orchard-0.44.0.pom https://repo.clojars.org/cider/orchard/0.44.0/orchard-0.44.0.pom
+            curl -sf -o ~/.m2/repository/compliment/compliment/0.8.0/compliment-0.8.0.jar https://repo.clojars.org/compliment/compliment/0.8.0/compliment-0.8.0.jar
+            curl -sf -o ~/.m2/repository/compliment/compliment/0.8.0/compliment-0.8.0.pom https://repo.clojars.org/compliment/compliment/0.8.0/compliment-0.8.0.pom
+            curl -sf -o ~/.m2/repository/org/clojure/spec.alpha/0.5.238/spec.alpha-0.5.238.jar https://repo1.maven.org/maven2/org/clojure/spec.alpha/0.5.238/spec.alpha-0.5.238.jar
+            curl -sf -o ~/.m2/repository/org/clojure/spec.alpha/0.5.238/spec.alpha-0.5.238.pom https://repo1.maven.org/maven2/org/clojure/spec.alpha/0.5.238/spec.alpha-0.5.238.pom
+            JOLT_PWD="$PWD" JOLT_LOAD_WAIT_LIMIT_SECS=45 timeout 400 ../jolt/target/release/jolt -M:test </dev/null > /tmp/run$i.log 2>&1
+            rc=$?
+            echo "RUN #$i rc=$rc :: $(grep -E 'Ran [0-9]+ tests' /tmp/run$i.log | tail -1)"
+            grep -B2 -A25 "Load watchdog" /tmp/run$i.log | head -45
+          done

@@ -1388,6 +1388,60 @@
 (define (ldr-ctx-str ctx)
   (if (jolt-fiber? ctx) "a fiber" (string-append "thread " (number->string ctx))))
 
+;; --- the load watchdog -------------------------------------------------------
+;; How long a THREAD may wait for another context's load before the wait is
+;; declared a deadlock and raised with the whole claim state. The require-cycle
+;; walk above only sees load-edges; a load that parks on something that is NOT a
+;; load — a channel take, a promise — while holding its claim closes a cycle the
+;; walk cannot see, and the process used to wedge silently forever (the v0.7.10
+;; first-cold-run wedge). 120s is 6x the slowest whole-chain cold compile
+;; measured on CI runners; JOLT_LOAD_WAIT_LIMIT_SECS overrides, 0 disables.
+;; Fiber waiters park instead of blocking and are not covered here; a parked
+;; fiber's carrier keeps running, so a fiber-side wedge starves one fiber, not
+;; the process.
+(define ldr-wait-limit-ms
+  (let ((s (getenv "JOLT_LOAD_WAIT_LIMIT_SECS")))
+    (* 1000 (if s (or (string->number s) 120) 120))))
+(define ldr-wait-slice (make-time 'time-duration 0 15))
+
+;; under ldr-load-mu: every claim and every waiter, one line each
+(define (ldr-claims-str)
+  (let ((out ""))
+    (vector-for-each
+      (lambda (ns)
+        (set! out (string-append out "  load " ns " held by "
+                                 (ldr-ctx-str (hashtable-ref ldr-loading ns #f)) "
+")))
+      (hashtable-keys ldr-loading))
+    (vector-for-each
+      (lambda (ctx)
+        (set! out (string-append out "  " (ldr-ctx-str ctx) " waits on "
+                                 (hashtable-ref ldr-waiting ctx "?") "
+")))
+      (hashtable-keys ldr-waiting))
+    (vector-for-each
+      (lambda (ns)
+        (set! out (string-append out "  " (number->string
+                                            (length (hashtable-ref ldr-fiber-waiters ns '())))
+                                 " fiber(s) parked on " ns "
+")))
+      (hashtable-keys ldr-fiber-waiters))
+    (if (string=? out "") "  (no claims recorded)
+" out)))
+
+(define (ldr-watchdog-raise! me name)
+  (let ((owner (hashtable-ref ldr-loading name #f)))
+    (hashtable-delete! ldr-waiting me)
+    (throw-jvm (quote IllegalStateException)
+      (string-append
+        "Load watchdog: " (ldr-ctx-str me) " waited more than "
+        (number->string (quotient ldr-wait-limit-ms 1000)) "s for the load of "
+        name " (held by " (if owner (ldr-ctx-str owner) "nobody — claim vanished")
+        "). A load is stuck holding its claim while waiting on something that is"
+        " not a load, which the require-cycle detector cannot see. Claim state:
+"
+        (ldr-claims-str)))))
+
 ;; Wait for the load of `name` to end. Runs inside jolt-lock-wait's decision, so
 ;; ldr-load-mu is HELD. Answers #f when the wait is over and the caller should
 ;; re-check under the lock, or jolt-lock-parked when this fiber has committed to a
@@ -1417,7 +1471,7 @@
 ;; Committing here and switching there is also what keeps load-namespace*'s after
 ;; thunk honest: the escape is still a park and still not an exit, so that one still
 ;; asks jolt-park-unwinding? and keeps the claim across it.
-(define (ldr-wait-for-load! name)
+(define (ldr-wait-for-load! name deadline)
   (let ((f (jolt-current-fiber)))
     (if f
         (begin
@@ -1425,7 +1479,13 @@
                           (cons f (hashtable-ref ldr-fiber-waiters name '())))
           (jolt-fiber-state-set! f 'parked)
           jolt-lock-parked)
-        (begin (jolt-condition-wait ldr-load-cv ldr-load-mu) #f))))
+        (begin
+          ;; sliced so the deadline is checked even when no wakeup ever comes;
+          ;; each slice returns #f and the caller re-checks the owner first.
+          (when (and deadline (>= (sa-real-time-ms) deadline))
+            (ldr-watchdog-raise! (ldr-load-ctx) name))
+          (jolt-condition-wait ldr-load-cv ldr-load-mu ldr-wait-slice)
+          #f))))
 
 ;; Call with ldr-load-mu HELD. Would `me` waiting on `name` (owned by `owner`) close
 ;; a cycle? Follow owner -> what it waits on -> who owns that -> …; if the chain
@@ -1476,7 +1536,8 @@
 ;; into the middle of it is the same thing step 2 always did on a thread's wakeup —
 ;; the loop below — and it is now the same code path for both contenders.
 (define (ldr-begin-load! name force?)
-  (let ((me (ldr-load-ctx)))
+  (let ((me (ldr-load-ctx))
+        (deadline (and (> ldr-wait-limit-ms 0) (+ (sa-real-time-ms) ldr-wait-limit-ms))))
     (jolt-lock-wait ldr-load-mu
       (lambda ()
         (let loop ()
@@ -1499,7 +1560,7 @@
                (hashtable-set! ldr-waiting me name)
                ;; a thread's wait ends under this lock, so it loops HERE; a fiber
                ;; answers jolt-lock-parked and comes back in at the top.
-               (or (ldr-wait-for-load! name) (loop)))
+               (or (ldr-wait-for-load! name deadline) (loop)))
               ((and (not force?) (not (ldr-reload-all?)) (ns-dedup-loaded? name))
                (ldr-decided! me 'loaded))                     ; step 4
               (else (hashtable-set! ldr-loading name me)      ; step 6

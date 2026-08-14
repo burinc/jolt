@@ -117,5 +117,27 @@
 (ok ":varargs with :blocking rejects"
     (rejects? "(jolt.ffi/__cfn \"recv\" [:int :varargs :int] :int :blocking)"))
 
+;; The EMITTED code for a :blocking binding carries __collect_safe on BOTH
+;; resolution branches — the global-name fallback AND the scoped dlsym-address
+;; branch. The scoped branch dropped it in v0.7.10: every :blocking socket call
+;; in a process with any registered native handle was built without the
+;; convention, and a GC while one blocked froze the whole VM (the first-cold-run
+;; fleet wedge, bisected to the scoped-FFI merge and cured by restoring the
+;; convention). Asserting the emission pins the regression deterministically —
+;; the behavioral shape needs a cold heap and real GC pressure to fire.
+(define (emitted-for s)
+  (jolt-analyze-emit-form (jolt-read-string s) "user"))
+(define (contains-str? hay needle)
+  (let ((hl (string-length hay)) (nl (string-length needle)))
+    (let loop ((i 0))
+      (cond ((> (+ i nl) hl) #f)
+            ((string=? (substring hay i (+ i nl)) needle) #t)
+            (else (loop (+ i 1)))))))
+(let ((e (emitted-for "(jolt.ffi/__cfn \"recv\" [:int :pointer :size_t :int] :ssize_t :blocking)")))
+  (ok ":blocking emits the collect-safe global fallback"
+      (contains-str? e "sa-foreign-procedure-blocking"))
+  (ok ":blocking emits the collect-safe scoped branch"
+      (contains-str? e "(foreign-procedure __collect_safe a")))
+
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))
