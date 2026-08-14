@@ -440,12 +440,25 @@
     (do (sh (str "touch " (pr-str (str dir "/.jolt-ok")))) dir)
     (do (warn "failed to extract " jar) nil)))
 
+(defn- extract-or-note!
+  "extract-jar! that records a failed extraction as an unresolvable artifact.
+  The jar is on disk but its source cannot be materialized (unzip missing, disk
+  full) — a failure to OBTAIN the artifact, not a skip. Left silent, the
+  resolution completes without the dep's root and the cpcache persists the
+  degraded roots until the project's .jolt is deleted by hand."
+  [jar dir coord version]
+  (or (extract-jar! jar dir)
+      (do (note-unresolvable! coord version
+                              (str jar " could not be extracted (is unzip installed?)"))
+          nil)))
+
 (defn- ensure-maven
   "Ensure coord@version's JAR is in the local Maven repository (reusing one the
   JVM toolchain already fetched; downloading from Clojars then Central when
   absent) and extract its source beside it. Re-extracts when the jar is newer
-  than the last extraction. Returns the extraction dir, or nil if no repo has the
-  artifact / extraction failed (a non-fatal skip)."
+  than the last extraction. Returns the extraction dir, or nil after recording
+  the artifact as unresolvable (absent from every repo, fetch failures, or a
+  failed extraction) — the expansion reports every one and aborts at its end."
   [coord version]
   (let [group (mvn-group coord) artifact (name coord)
         vdir-rel (str (str/replace group "." "/") "/" artifact "/" version)
@@ -461,7 +474,7 @@
       dir
       (if (and (not legacy) (file-exists? jar))
         (do (info "using " jar-name " from the local Maven repository")
-            (extract-jar! jar dir))
+            (extract-or-note! jar dir coord version))
         ;; ERRORS carries the repos that failed for a reason OTHER than "no such
         ;; artifact". Every repo answering 404 is a real "not found" and says so;
         ;; a reset or a 503 is not, and reporting it as absent sent people
@@ -484,7 +497,7 @@
                   r (http/fetch* (str repo "/" vdir-rel "/" jar-name) jar)]
               (if (= :ok (:outcome r))
                 (do (info "fetching " coord " " version)
-                    (let [d (extract-jar! jar dir)]
+                    (let [d (extract-or-note! jar dir coord version)]
                       ;; legacy layout never keeps the jar; the m2 layout does —
                       ;; that IS the sharing.
                       (when legacy (sh (str "rm -f " (pr-str jar))))
@@ -781,7 +794,7 @@
           ;; jar is newer than the extraction, like a Maven jar.
           (let [dir (jar-extraction-dir path)]
             (if (or (cache-fresh? dir path false)
-                    (extract-jar! path dir))
+                    (extract-or-note! path dir lib path))
               (let [pom (sh-out (str "find " (pr-str dir) "/META-INF -name pom.xml -print -quit 2>/dev/null"))]
                 {:root dir :manifest :mvn :pom (when (and pom (not (str/blank? pom))) pom)})
               {:root nil :manifest :none}))
@@ -1023,11 +1036,16 @@
        "|" runtime-version
        ;; the environment-dependent artifact roots resolution materializes into:
        ;; a run pointed at a different gitlibs/jarlibs (JOLT_GITLIBS — the
-       ;; deps-alias smoke's retry scenarios do exactly this) or a different
-       ;; HOME (the ~/.m2 and ~/.jolt defaults) must not share an entry whose
-       ;; cached roots point into the old location.
+       ;; deps-alias smoke's retry scenarios do exactly this), a different
+       ;; HOME (the ~/.m2 and ~/.jolt defaults), or a moved Maven repo
+       ;; (JOLT_MVNLIBS / JOLT_LOCAL_REPO / GRENADINE_LOCAL_REPOSITORY) must
+       ;; not share an entry whose cached roots point into the old location —
+       ;; the old paths usually still exist, so validation alone won't miss.
        "|" (gitlibs-dir)
        "|" (or (getenv "JOLT_JARLIBS") "")
+       "|" (or (getenv "JOLT_MVNLIBS") "")
+       "|" (or (getenv "JOLT_LOCAL_REPO") "")
+       "|" (or (getenv "GRENADINE_LOCAL_REPOSITORY") "")
        "|" (or (getenv "HOME") "")
        "|" (str/join "|" (for [p (sort local-dep-edns)]
                            (let [b (or (slurp-quiet p) "")]
