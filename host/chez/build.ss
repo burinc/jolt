@@ -284,11 +284,18 @@
           (else (read-file-string path)))))
 
 (define (bld-string-lines s)
+  ;; a line drops its trailing \r: a CRLF checkout (Windows git autocrlf) must
+  ;; parse identically to an LF one — the stdlib-fasl manifest read through
+  ;; here failed set-equality on Windows with every name carrying \r.
   (let ((n (string-length s)))
+    (define (slice start end)
+      (let ((end (if (and (> end start) (char=? (string-ref s (- end 1)) #\return))
+                     (- end 1) end)))
+        (substring s start end)))
     (let loop ((i 0) (start 0) (acc '()))
-      (cond ((>= i n) (reverse (if (> i start) (cons (substring s start i) acc) acc)))
+      (cond ((>= i n) (reverse (if (> i start) (cons (slice start i) acc) acc)))
             ((char=? (string-ref s i) #\newline)
-             (loop (+ i 1) (+ i 1) (cons (substring s start i) acc)))
+             (loop (+ i 1) (+ i 1) (cons (slice start i) acc)))
             (else (loop (+ i 1) start acc))))))
 
 (define (bld-file-lines path) (bld-string-lines (bld-source-string path)))
