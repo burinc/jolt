@@ -982,14 +982,23 @@
 ;; falls back to a copy-on-write wrapper for other targets (lists, sorted colls,
 ;; nil), so those keep the old per-step jolt-conj behaviour.
 (define (jolt-into to from)
-  ;; only an editable collection rides the transient path; anything else
-  ;; (PersistentQueue, sorted colls, seqs) folds through conj, like RT's
-  ;; instanceof IEditableCollection split.
-  (if (or (pvec? to) (pmap? to) (pset? to))
-      (meta-carry to
-        (jolt-persistent! (reduce-seq (lambda (t x) (jolt-conj! t x)) (jolt-transient-new to) (jolt-seq from))))
-      (meta-carry to
-        (reduce-seq (lambda (acc x) (jolt-conj1 acc x)) to (jolt-seq from)))))
+  (cond
+    ;; two non-empty vectors: O(log n) RRB concatenation instead of a linear
+    ;; element fold. Empty operands fall through — pvec-catvec answers those
+    ;; with an INPUT identity, which would surface `from` (and any metadata
+    ;; riding on it) as the result instead of `to`'s value with `to`'s meta.
+    ((and (pvec? to) (pvec? from)
+          (fx>? (pvec-cnt to) 0) (fx>? (pvec-cnt from) 0))
+     (meta-carry to (pvec-catvec to from)))
+    ;; only an editable collection rides the transient path; anything else
+    ;; (PersistentQueue, sorted colls, seqs) folds through conj, like RT's
+    ;; instanceof IEditableCollection split.
+    ((or (pvec? to) (pmap? to) (pset? to))
+     (meta-carry to
+       (jolt-persistent! (reduce-seq (lambda (t x) (jolt-conj! t x)) (jolt-transient-new to) (jolt-seq from)))))
+    (else
+     (meta-carry to
+       (reduce-seq (lambda (acc x) (jolt-conj1 acc x)) to (jolt-seq from))))))
 
 (define (range-from n) (cseq-lazy n (lambda () (range-from (+ n 1)))))
 ;; A bounded range is a real chunked-seq, like clojure.lang.LongRange: eager, with
