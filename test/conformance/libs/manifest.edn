@@ -306,7 +306,9 @@
    ;; org.apache.commons.lang.StringEscapeUtils, supplied by the preloaded
    ;; jolt.shim.commons-lang shim. No residue.
    :preload ["jolt.shim.commons-lang"]
-   :expect {:tests 94 :pass 182 :fail 0 :error 0}}
+   ;; two assertions exist only on the suite's :clj branches; the :bb branches
+   ;; jolt now reads skip them. Same test count, nothing fails.
+   :expect {:tests 94 :pass 180 :fail 0 :error 0}}
 
   {:name "Selmer"
    :paths ["src" "test" "resources"]
@@ -403,6 +405,14 @@
    ;; the test runs over different data. :every parsing and registry references
    ;; themselves agree with 1.12.5 exactly on literal inputs, checked directly.
    ;; That is the same family as test.check's :tolerance, not a malli bug.
+   ;;
+   ;; The tally below is the mk-am wall: fipp's clojure.core.rrb-vector chain
+   ;; reaches Clojure's private ArrayManager machinery, which jolt cannot
+   ;; supply, and since the AOT cache stopped masking it the malli.dev/virhe
+   ;; namespaces (and everything requiring them) fail to load. The RRB vector
+   ;; work ships a native-backed clojure.core.rrb-vector that replaces the jar
+   ;; (branch feat/rrb-vector); when it lands this row goes back to the full
+   ;; suite. Until then what still loads runs exactly as before.
    :expect {:tests 209 :pass 12059 :fail 149 :error 76 :load-fail 8}}
 
   ;; ---------------------------------------------------------- web
@@ -490,8 +500,10 @@
    ;; to Long/Double (:integer-box-model), the specialized seq classes to
    ;; PersistentList/LazySeq (:seq-type-model), and subvec has no class of its own —
    ;; which lasertag derives from a sample value, so it reads every vector as a
-   ;; subvec. All recorded in known-divergences.edn.
-   :expect {:tests 58 :pass 46 :fail 12 :error 0}}
+   ;; subvec. All recorded in known-divergences.edn. Two rows are the suite's
+   ;; :bb branches asserting babashka's host model (sci.impl.fns classnames, a
+   ;; :lambda-free tag set); jolt answers with the real defining class.
+   :expect {:tests 58 :pass 44 :fail 14 :error 0}}
 
   {:name "tools.logging"
    :paths ["src/main/clojure" "src/test/clojure"]
@@ -514,7 +526,10 @@
   {:name "tick"
    :paths ["src" "test"]
    :deps ["~time/src" "@spec.alpha/src/main/clojure"]
-   :expect {:tests 67 :pass 723 :fail 0 :error 0}}
+   ;; the one failure is the suite's :bb branch asserting babashka's
+   ;; English-only locale rendering ("3030-May-03" under Locale/FRENCH); jolt
+   ;; renders the correct French "mai" through the time library.
+   :expect {:tests 67 :pass 722 :fail 1 :error 0}}
 
   ;; ---------------------------------------------------------- skipped
   {:name "process"

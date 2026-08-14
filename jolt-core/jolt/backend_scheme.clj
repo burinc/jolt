@@ -13,7 +13,8 @@
                                form-literal? form-elements form-vec-items
                                form-map-pairs form-set-items form-char-code
                                form-regex? form-regex-source
-                               form-inst? form-inst-source form-uuid? form-uuid-source]]
+                               form-inst? form-inst-source form-uuid? form-uuid-source
+                               form-class-value? form-class-value-name]]
             [jolt.passes.types :as types]
             [jolt.passes.numeric :as numeric]
             [jolt.op-registry :as op-registry]
@@ -844,6 +845,9 @@
     ;; (which builds the Date/UUID at read time, so a quoted/macro form carries the
     ;; value, not the raw tagged form). Same emit as the :inst / :uuid IR leaves.
     (form-inst? form) (str "(jolt-inst-from-string " (chez-str-lit (form-inst-source form)) ")")
+    ;; a Class value inside quoted structure (a macro spliced (resolve 'C) under
+    ;; a quote) reconstructs through the interner, like #inst/#uuid.
+    (form-class-value? form) (str "(jolt-class-for " (chez-str-lit (form-class-value-name form)) ")")
     (form-uuid? form) (str "(jolt-uuid-from-string " (chez-str-lit (form-uuid-source form)) ")")
     ;; a quoted custom #tag with no registered reader -> a tagged-literal value
     ;; (Clojure's reader builds a TaggedLiteral), not the raw reader map. The tag is

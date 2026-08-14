@@ -1664,4 +1664,10 @@
   {:suite "regex-lazy" :expr "(let [r (re-pattern \"x(y)+z\")] [(jolt.host/regex-compiled? r) (some? (re-find r \"wxyyz!\")) (jolt.host/regex-compiled? r)])" :expected "[false true true]"}
   {:suite "regex-lazy" :expr "(let [r #\"a[bc]d\"] [(jolt.host/regex-compiled? r) (re-matches r \"abd\") (jolt.host/regex-compiled? r)])" :expected "[false \"abd\" true]"}
   {:suite "regex-lazy" :expr "(let [r (re-pattern \"q(w)e\")] [(pr-str r) (str r) (jolt.host/regex-compiled? r)])" :expected "[\"#\\\"q(w)e\\\"\" \"q(w)e\" false]"}
+
+  ;; a macro can splice a live class value — (resolve 'C) returns the class —
+  ;; into call position, quote position, and nested quoted structure.
+  {:suite "spliced-class" :expr "(do (defmacro scv1 [] (list 'quote (resolve 'java.lang.Throwable))) (class? (scv1)))" :expected "true"}
+  {:suite "spliced-class" :expr "(do (defmacro scv2 [] `(instance? ~(resolve 'Throwable) (ex-info \"x\" {}))) (scv2))" :expected "true"}
+  {:suite "spliced-class" :expr "(do (defmacro scv3 [] `(quote (a ~(resolve 'String) b))) (= java.lang.String (second (scv3))))" :expected "true"}
 ]

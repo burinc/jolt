@@ -30,6 +30,7 @@
                                form-uuid-value? form-uuid-value-source
                                form-ns-value? form-ns-value-name
                                form-var-value? form-var-value-ns form-var-value-name
+                               form-class-value? form-class-value-name
                                unchecked-math? allow-unresolved-vars?
                                form-macro? form-expand-1 resolve-global resolvable-names
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
@@ -1278,4 +1279,9 @@
      ;; splices it, e.g. core.contracts' defcurry-from) -> a :the-var reference,
      ;; same as (var ns/name); the back end emits (jolt-var ns name).
      (form-var-value? form) (the-var (form-var-value-ns form) (form-var-value-name form))
+     ;; a live Class value spliced the same way — resolve returns the class for
+     ;; a class mapping, so `~(resolve sym) lands one in the expansion. It
+     ;; compiles to the interner call the class symbol itself compiles to.
+     (form-class-value? form) (invoke (var-ref "jolt.host" "jolt-class-for")
+                                      [(const (form-class-value-name form))])
      :else (uncompilable "unsupported form"))))

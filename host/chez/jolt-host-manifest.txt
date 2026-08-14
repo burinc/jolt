@@ -83,6 +83,8 @@ form-uuid-source
 form-uuid-value-source
 form-uuid-value?
 form-uuid?
+form-class-value-name
+form-class-value?
 form-var-value-name
 form-var-value-ns
 form-var-value?
