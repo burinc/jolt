@@ -78,8 +78,8 @@ else
   fails=$((fails+1))
 fi
 
-# (e) the manifest lists clojure.test
-if grep -q '^clojure.test$' host/chez/stdlib-fasl-manifest.txt; then
+# (e) the manifest lists clojure.test (tr -d: a CRLF checkout must still match)
+if tr -d '\r' < host/chez/stdlib-fasl-manifest.txt | grep -qx 'clojure.test'; then
   echo "PASS: (e) manifest lists clojure.test"; pass=$((pass+1))
 else
   echo "FAIL: (e) manifest does not list clojure.test"; fails=$((fails+1))
