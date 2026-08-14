@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`jolt.ffi/errno` and `errno-message`: a public, thread-correct errno.**
+  errno is a per-thread slot behind a libc function (`__error` on macOS,
+  `__errno_location` on Linux, `_errno` on Windows); the accessor reads the
+  calling thread's slot, so it is right under threads and under fibers
+  (whose syscall and read share a carrier thread). `jolt.io-poller` now
+  reads through it instead of binding the platform pair privately —
+  downstream FFI code no longer has to rediscover that dance. Read it
+  immediately after the failing call; the docstring says why.
+
 - **`jolt.fibers`: the fiber primitive as a public API**, side by side with
   core.async. `spawn` runs a body on the carrier pool and returns the fiber
   handle; `join` waits for its value (parking on a fiber, blocking on a
