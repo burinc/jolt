@@ -56,6 +56,11 @@
 (check-eq "Throwable assignable from ex-info's class"
           (.isAssignableFrom Throwable clojure.lang.ExceptionInfo) true)
 
+;; statics-only shims sit in the graph too (jolt-of08.8): no value carries
+;; their tags, but getSuperclass must answer Object as the JVM does
+(check-eq "Math's superclass" (.getSuperclass Math) Object)
+(check-eq "System's superclass" (.getSuperclass System) Object)
+
 ;; a defrecord grafts into the graph and reflects like any modeled class
 (defrecord ReflectProbe [x])
 (check-eq "record class assignable to IPersistentMap"
