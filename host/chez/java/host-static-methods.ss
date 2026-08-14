@@ -750,6 +750,44 @@
     ((macos) "Mac OS X")
     ((windows) "Windows")
     (else "Linux")))
+;; os.arch in the JVM's spelling — libraries parse these exact strings
+;; (aarch64/amd64), not Chez's. An unrecognized arch answers the host tag,
+;; which is at least truthful.
+(define sys-os-arch
+  (case (sa-arch)
+    ((arm64) "aarch64")
+    ((x86-64) "amd64")
+    ((i386) "x86")
+    (else (sa-host-tag))))
+;; user.name: the login name from the environment, as the JVM reports it.
+(define (sys-user-name)
+  (or (getenv "USER") (getenv "LOGNAME") (getenv "USERNAME") jolt-nil))
+;; os.version, computed once on first read: the macOS PRODUCT version
+;; (sw_vers, what the JVM reports there — the kernel release is the wrong
+;; number for "which macOS is this"), the kernel release elsewhere. Windows
+;; has neither command: nil. A failed probe caches "" so it is not retried.
+(define sys-os-version-cache #f)
+(define (sys-os-version-probe cmd)
+  (guard (e (#t #f))
+    (call-with-values
+      (lambda () (sa-run-process cmd (native-transcoder)))
+      (lambda (stdin stdout stderr pid)
+        (let ((s (get-line stdout)))
+          (close-port stdin) (close-port stdout) (close-port stderr)
+          (and (string? s) (> (string-length s) 0) s))))))
+(define (sys-os-version)
+  (cond
+    (sys-os-version-cache
+     (if (string=? sys-os-version-cache "") jolt-nil sys-os-version-cache))
+    ((eq? (sa-os-family) 'windows) jolt-nil)
+    (else
+     (let ((v (or (if (eq? (sa-os-family) 'macos)
+                      (sys-os-version-probe "sw_vers -productVersion")
+                      #f)
+                  (sys-os-version-probe "uname -r")
+                  "")))
+       (set! sys-os-version-cache v)
+       (if (string=? v "") jolt-nil v)))))
 ;; runtime-settable system properties (System/setProperty). A set value wins over
 ;; the built-in defaults below; clearProperty removes it.
 ;; Written at RUN time (System/setProperty) from whatever thread calls it, so the
@@ -791,6 +829,9 @@
          (set-val (hashtable-ref sys-prop-table k #f)))
     (cond (set-val set-val)
           ((string=? k "os.name") sys-os-name)
+          ((string=? k "os.arch") sys-os-arch)
+          ((string=? k "os.version") (sys-os-version))
+          ((string=? k "user.name") (sys-user-name))
           ((string=? k "jolt.version") (jolt-version-string))
           ((string=? k "line.separator") "\n")
           ((string=? k "file.separator") "/")
@@ -805,11 +846,18 @@
           ((pair? dflt) (car dflt))
           (else jolt-nil))))
 (define (sys-properties-map)
-  (let ((base (jolt-hash-map "os.name" sys-os-name "line.separator" "\n" "file.separator" "/"
+  (let ((base (jolt-hash-map "os.name" sys-os-name "os.arch" sys-os-arch
+                             "line.separator" "\n" "file.separator" "/"
                              "path.separator" ":" "java.class.path" (sys-class-path)
                              "jolt.version" (jolt-version-string)
                              "user.dir" (jolt-user-dir) "user.home" (or (getenv "HOME") "")
                              "java.io.tmpdir" (or (getenv "TMPDIR") "/tmp"))))
+    ;; keys whose value can be absent join only when they answer — a JVM
+    ;; Properties never holds a nil value
+    (let ((v (sys-os-version)))
+      (unless (jolt-nil? v) (set! base (jolt-assoc base "os.version" v))))
+    (let ((v (sys-user-name)))
+      (unless (jolt-nil? v) (set! base (jolt-assoc base "user.name" v))))
     (for-each
       (lambda (kv)
         (set! base (jolt-assoc base (car kv) (cdr kv))))

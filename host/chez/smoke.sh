@@ -883,6 +883,22 @@ else
   fails=$((fails + 1))
 fi
 
+# System properties — the JVM-standard keys (os.arch in JVM spelling,
+# user.name, os.version) plus the deliberate nils. Self-checks, one marker.
+props_out="$($jolt run test/chez/sysprops-test.clj 2>&1)"
+if printf '%s' "$props_out" | grep -q 'SYSPROPS-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: system properties"
+  if printf '%s\n' "$props_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$props_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$props_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$props_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # Class reflection — getSuperclass/getInterfaces/isAssignableFrom/isInterface
 # over the jch graph, and the static-miss fallback to Class instance methods
 # (JVM Clojure's (.getName String) shape). Self-checks, one marker.

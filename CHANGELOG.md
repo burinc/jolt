@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **System properties libraries actually sniff.** `os.arch` answers in the
+  JVM's spelling (`aarch64`/`amd64`), `user.name` comes from the
+  environment, and `os.version` reports the macOS product version
+  (`sw_vers`, what the JVM says there) or the kernel release on Linux —
+  each also present in `(System/getProperties)`. `java.version` stays nil
+  deliberately: jolt has no JDK to report, and claiming one would activate
+  JVM-only code paths in libraries that parse it.
+
 - **Minimal Class reflection.** `.getSuperclass`, `.getInterfaces`,
   `.isAssignableFrom`, and `.isInterface` answer from the one modeled class
   graph — so the exception chain walks to `Object`, an interface's
