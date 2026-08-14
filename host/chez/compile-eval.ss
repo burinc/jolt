@@ -538,3 +538,39 @@
 (def-var! "clojure.core" "eval"
   (lambda (form) (jolt-compile-eval-form form (chez-current-ns))))
 (def-var! "clojure.core" "load-string" jolt-load-string)
+
+;; --- jolt.scheme: the Scheme escape hatch (epic jolt-of08.6) ------------------
+;; stdlib/jolt/scheme.clj is a thin veneer over these two. The contract is RAW:
+;; nothing is marshaled in either direction — numbers, strings, booleans and
+;; chars are shared representations anyway; everything else crosses as whatever
+;; it is on the other side, and the docs say so. Host-specific by design.
+;;
+;; scheme-proc resolves a top-level Scheme binding at CALL time, through the
+;; adapter's global-reflection seam (sa-baked-global — portcheck pins the raw
+;; top-level-value/bound? primitives to scheme-adapter-runtime.ss). Its #f
+;; sentinel conflates "unbound" with "bound to #f", which is fine here: this
+;; fetches PROCEDURES, and a procedure is never #f. An unbound name answers a
+;; catchable ex-info rather than Chez's raw error, because "you typo'd the
+;; primitive" is the hatch's everyday failure — and in a tree-shaken binary it
+;; is also how a shaken-out primitive reports itself.
+(def-var! "jolt.host" "scheme-proc"
+  (lambda (name)
+    (let ((sym (string->symbol (jolt-need-string name))))
+      (let ((v (sa-baked-global sym)))
+        (or v
+            (jolt-throw (jolt-ex-info
+                         (string-append "no top-level Scheme binding: "
+                                        (symbol->string sym))
+                         (jolt-hash-map (jolt-keyword "name")
+                                        (symbol->string sym)))))))))
+;; scheme-eval-string reads SCHEME text with the Scheme reader (not jolt's) and
+;; evaluates every form, returning the last value; definitions persist in the
+;; interaction environment, where the runtime itself lives.
+(def-var! "jolt.host" "scheme-eval-string"
+  (lambda (s)
+    (let ((p (open-input-string (jolt-need-string s))))
+      (let loop ((last jolt-nil))
+        (let ((form (read p)))
+          (if (eof-object? form)
+              last
+              (loop (eval form))))))))

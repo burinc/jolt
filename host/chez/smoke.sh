@@ -883,6 +883,22 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.scheme — the Scheme escape hatch (call/proc/eval-string/defsfn, raw
+# value contract, catchable errors). Self-checks, one marker.
+scm_out="$($jolt run test/chez/jolt-scheme-test.clj 2>&1)"
+if printf '%s' "$scm_out" | grep -q 'JOLT-SCHEME-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.scheme"
+  if printf '%s\n' "$scm_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$scm_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$scm_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$scm_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # System properties — the JVM-standard keys (os.arch in JVM spelling,
 # user.name, os.version) plus the deliberate nils. Self-checks, one marker.
 props_out="$($jolt run test/chez/sysprops-test.clj 2>&1)"

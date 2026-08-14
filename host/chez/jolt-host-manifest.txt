@@ -169,6 +169,8 @@ resolve-global
 run-expr-string
 run-interruptible
 run-main-pump
+scheme-eval-string
+scheme-proc
 scheme-version
 set-field!
 set-instant-ctor!

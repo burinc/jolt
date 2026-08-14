@@ -63,6 +63,7 @@ jolt.parser.combinators
 jolt.parser.monad
 jolt.parser.position
 jolt.process
+jolt.scheme
 jolt.socket
 jolt.time.amount
 jolt.time.base
