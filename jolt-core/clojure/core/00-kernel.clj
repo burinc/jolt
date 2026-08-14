@@ -43,8 +43,11 @@
      (when (or (< s 0) (< e s) (< (count v) e))
        (throw (jolt.host/throwable "java.lang.IndexOutOfBoundsException"
                                     (str "subvec index out of range: " s " " e))))
-     (loop [i s acc []]
-       (if (< i e) (recur (inc i) (conj acc (nth v i))) acc)))))
+     ;; O(log n) structural slice. A full-range slice returns v itself; the
+     ;; JVM's subvec always answers with a fresh nil-meta view, so shed any
+     ;; metadata the identity return would carry along.
+     (let [r (jolt.host/slice v s e)]
+       (if (and (identical? r v) (meta v)) (with-meta r nil) r)))))
 
 (defn mapv [f & colls] (vec (apply map f colls)))
 

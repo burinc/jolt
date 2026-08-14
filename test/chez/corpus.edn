@@ -1506,6 +1506,10 @@
   {:suite "map / strictness (throws like Clojure)" :label "subvec out of range" :expected :throws :actual "(subvec [0 1 2 3] 1 5)" :portability :common}
   {:suite "map / strictness (throws like Clojure)" :label "subvec start>end" :expected :throws :actual "(subvec [0 1 2 3] 3 2)" :portability :common}
   {:suite "map / strictness (throws like Clojure)" :label "subvec ok" :expected "[1 2]" :actual "(subvec [0 1 2 3] 1 3)" :portability :common}
+  {:suite "vector / structural ops meta" :label "subvec full range value" :expected "[1 2 3]" :actual "(subvec (with-meta [1 2 3] {:a 1}) 0 3)" :portability :common}
+  {:suite "vector / structural ops meta" :label "subvec full range sheds meta" :expected "nil" :actual "(meta (subvec (with-meta [1 2 3] {:a 1}) 0 3))" :portability :common}
+  {:suite "vector / structural ops meta" :label "into carries only to's meta" :expected "{:a 1}" :actual "(meta (into (with-meta [1] {:a 1}) (with-meta [2] {:b 2})))" :portability :common}
+  {:suite "vector / structural ops meta" :label "into empty to never takes from's meta" :expected "nil" :actual "(meta (into [] (with-meta [1 2] {:b 2})))" :portability :common}
   {:suite "map / strictness (throws like Clojure)" :label "min-key empty" :expected :throws :actual "(apply min-key identity [])" :portability :common}
   {:suite "map / strictness (throws like Clojure)" :label "merge empty vector" :expected :throws :actual "(merge {} [])" :portability :common}
   {:suite "map / strictness (throws like Clojure)" :label "merge 1-elem vector" :expected :throws :actual "(merge {} [:foo])" :portability :common}

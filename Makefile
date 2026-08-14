@@ -56,7 +56,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling \
+  readscaling vecscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
   gateboot gatebootsmoke gosm httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
@@ -116,7 +116,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling depssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling depssmoke depscpcache depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
@@ -371,6 +371,11 @@ mvnhttp:
 # Takes the built binary: script mode would measure the same ratio far slower.
 readscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/read_scaling_test.clj
+
+# (into vec vec) and subvec stay O(log n) through core — the raw pvec ops have
+# rrbscaling; this catches core falling back to an element-by-element rebuild.
+vecscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/vec_scaling_test.clj
 
 # deps.edn alias + CLI semantics (tools.deps args-map keys, -X/-T/-Sdeps, the
 # user deps.edn chain, jar/git coordinates) through the real CLI, over local
