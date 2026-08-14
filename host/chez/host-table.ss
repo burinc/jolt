@@ -45,6 +45,10 @@
 ;; map-entry constructor: a 2-elem entry-flagged pvec (map-entry? true, vector?
 ;; false), so sorted-map seq/first produce real map entries that key/val accept.
 (def-var! "jolt.host" "map-entry" make-map-entry)
+;; O(log n) RRB concat / slice over pvec (collections.ss). The stdlib
+;; clojure.core.rrb-vector ns is a thin Clojure layer over these two.
+(def-var! "jolt.host" "catvec" pvec-catvec)
+(def-var! "jolt.host" "slice" pvec-slice)
 ;; The stored entry for k, or nil — the native map's Associative.entryAt. The
 ;; entry's key is the key the MAP holds, which is jolt= to the one probed with but
 ;; is the only one carrying the element's metadata; clojure.core/find reads it.

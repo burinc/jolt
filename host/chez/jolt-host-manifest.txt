@@ -19,6 +19,7 @@ bytes-allocated
 call-on-main-thread
 call-on-main-thread-async
 callable-host?
+catvec
 chez-number-literal
 class-ancestors
 class-bases
@@ -166,6 +167,7 @@ set-static-field!
 set-var!
 sh
 sh-out
+slice
 source-roots
 stash-inline!
 static-member

@@ -1670,4 +1670,29 @@
   {:suite "spliced-class" :expr "(do (defmacro scv1 [] (list 'quote (resolve 'java.lang.Throwable))) (class? (scv1)))" :expected "true"}
   {:suite "spliced-class" :expr "(do (defmacro scv2 [] `(instance? ~(resolve 'Throwable) (ex-info \"x\" {}))) (scv2))" :expected "true"}
   {:suite "spliced-class" :expr "(do (defmacro scv3 [] `(quote (a ~(resolve 'String) b))) (= java.lang.String (second (scv3))))" :expected "true"}
+
+  ;; clojure.core.rrb-vector — catvec/subvec semantics over the native RRB pvec.
+  ;; (JVM core.rrb-vector is not on the corpus classpath, so these are jolt-only.)
+  {:suite "rrb-vector" :expr "(require '[clojure.core.rrb-vector :as rrb]) (= (rrb/catvec [1 2 3] [4 5 6]) (into [1 2 3] [4 5 6]))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (rrb/catvec) []))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (rrb/catvec [1 2]) [1 2]))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (rrb/catvec [1 2] [3 4] [5 6]) [1 2 3 4 5 6]))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (rrb/catvec [1 2 3 4] [5 6] [7 8] [9 10]) [1 2 3 4 5 6 7 8 9 10]))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (apply rrb/catvec (mapv vector (range 6))) [0 1 2 3 4 5]))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (rrb/subvec [0 1 2 3 4 5 6 7 8 9] 3 7) [3 4 5 6]))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (rrb/subvec [0 1 2 3 4] 2) [2 3 4]))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (rrb/subvec [1 2 3 4 5 6 7 8 9 0] 0 10) [1 2 3 4 5 6 7 8 9 0]))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (rrb/subvec [1 2 3] 1 1) []))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (vector? (rrb/catvec (vec (range 100)) (vec (range 100)))))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (seq (rrb/catvec [1 2] [3 4])) '(1 2 3 4)))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (reduce + 0 (rrb/catvec [1 2 3] [4 5 6])) 21))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (reduce + 0 (rrb/subvec (vec (range 1000)) 0 1000)) (reduce + 0 (range 1000))))" :expected "true"}
+  ;; an RRB'd vector (relaxed root) must equal and hash equal to its classic twin.
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (let [c (rrb/catvec (vec (range 64)) (vec (range 64 128))) k (vec (range 128))] (and (= c k) (= (hash c) (hash k)) (= (.hashCode c) (.hashCode k)))))" :expected "true"}
+  ;; nth over a catvec result is element-correct across the join (relaxed leaves).
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (let [c (rrb/catvec (vec (range 50)) (vec (range 50 100)))] (every? true? (map #(= %2 (nth c %1)) (range 100) (range 100)))))" :expected "true"}
+  ;; vector-of coerces per element type where a cast exists; stores a plain vector.
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (rrb/vector-of :long 1 2 3) [1 2 3]))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (map type (rrb/vector-of :double 1 2 3)) (repeat 3 Double)))" :expected "true"}
+  {:suite "rrb-vector" :expr "(do (require '[clojure.core.rrb-vector :as rrb]) (= (rrb/vector-of :long) []))" :expected "true"}
 ]
