@@ -408,14 +408,12 @@
    ;;
    ;; Two things shape the tally below. The suite :bb-gates roughly half its
    ;; assertions (babashka runs the reduced set, and jolt reads :bb branches
-   ;; now), which is where pass 12059 -> 6603 went — fail and error shrank
-   ;; proportionally. And 7 of the 8 load failures are the mk-am wall: fipp's
-   ;; clojure.core.rrb-vector chain reaches Clojure's private ArrayManager
-   ;; machinery, which jolt cannot supply. The RRB work ships a native-backed
-   ;; clojure.core.rrb-vector that replaces the jar (branch feat/rrb-vector);
-   ;; when it lands those namespaces come back. The 8th is jsonista/cheshire,
-   ;; i.e. Jackson.
-   :expect {:tests 209 :pass 6603 :fail 55 :error 34 :load-fail 8}}
+   ;; now) — that is where the old 12059 passes went, with fail and error
+   ;; shrinking proportionally. And the one load failure is malli.util-test's
+   ;; cheshire, i.e. Jackson. The native-backed clojure.core.rrb-vector
+   ;; replaced the jar here, which is what brought the fipp/virhe chain (ten
+   ;; namespaces) back from the old mk-am load-fail wall.
+   :expect {:tests 219 :pass 6737 :fail 55 :error 35 :load-fail 1}}
 
   ;; ---------------------------------------------------------- web
   {:name "ring-codec"
