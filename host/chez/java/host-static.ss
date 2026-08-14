@@ -389,6 +389,20 @@
         (string-append "No such var: " class "/" member)
         (unknown-class-message class))))
 
+;; JVM Clojure resolves (.getName String) — an instance member on a class
+;; token — as a call on the java.lang.Class OBJECT when the class has no such
+;; static. Mirror it: a static-member miss consults the Class instance table
+;; (the "class" tag) and applies the method to the interned class object. Only
+;; the miss paths reach here, so a real static always wins; the unknown-class
+;; arm additionally requires jch-known?, so a typo'd class name still reports
+;; Unknown class instead of answering reflection calls. jolt-class-for is
+;; defined in host-static-classes.ss (loads after us) — resolved at call time.
+(define (class-instance-fallback class member)
+  (let ((h (hashtable-ref host-methods-tbl "class" #f)))
+    (and h
+         (let ((m (hashtable-ref h member #f)))
+           (and m (lambda args (apply m (jolt-class-for class) args)))))))
+
 (define (host-static-ref class member)
   (let ((cell (mutable-static-cell class member #f)))
     (if cell
@@ -396,12 +410,15 @@
         (let ((h (lookup-class class-statics-tbl class)))
           (if h
               (let ((v (hashtable-ref h member #f)))
-                (if v v (throw-jvm (quote IllegalArgumentException) (string-append "No matching field or method: " class "/" member))))
+                (or v
+                    (class-instance-fallback class member)
+                    (throw-jvm (quote IllegalArgumentException) (string-append "No matching field or method: " class "/" member))))
               ;; class miss — autoload a provider (the java.time base, or a
               ;; first-party library that installs the class) and retry once
               (if (or (jt-try-autoload! class) (lib-try-autoload! class))
                   (host-static-ref class member)
-                  (throw-jvm (quote IllegalArgumentException) (static-miss-message class member))))))))
+                  (or (and (jch-known? class) (class-instance-fallback class member))
+                      (throw-jvm (quote IllegalArgumentException) (static-miss-message class member)))))))))
 
 (define (host-static-call class member . args)
   (apply (host-static-ref class member) args))

@@ -1580,6 +1580,27 @@
         ;; Class.isInstance(o) == (instance? class o); core.logic's deftype .equals
         ;; uses (.. this getClass (isInstance o)).
         (cons "isInstance" (lambda (self o) (if (instance-check self o) #t #f)))
+        ;; --- reflection over the jch graph (epic jolt-of08.3) -----------------
+        ;; getSuperclass: the graph's class edge — nil for Object, for an
+        ;; interface (the JVM's null), and for a name the graph does not model
+        ;; (statics-only shims like Math; recorded divergence).
+        (cons "getSuperclass" (lambda (self)
+                                (let ((s (jch-superclass (jclass-name self))))
+                                  (if s (jolt-class-for s) jolt-nil))))
+        ;; getInterfaces: the DIRECT super-interfaces, as a seqable of Class
+        ;; values (the JVM's Class[] surfaces to Clojure as a seq anyway).
+        (cons "getInterfaces" (lambda (self)
+                                (list->cseq
+                                 (map jolt-class-for
+                                      (filter jch-interface?
+                                              (jch-direct-supers (jclass-name self)))))))
+        (cons "isInterface" (lambda (self) (if (jch-interface? (jclass-name self)) #t #f)))
+        ;; isAssignableFrom: the graph's isa?, JVM argument order — self is the
+        ;; wanted supertype. class-key so a deftype ctor or a name string on
+        ;; either side answers too.
+        (cons "isAssignableFrom" (lambda (self other)
+                                   (let ((ka (class-key self)) (kb (class-key other)))
+                                     (if (and ka kb (jch-isa? kb ka)) #t #f))))
         (cons "getConstructors" (lambda (self) (class-constructors self)))
         (cons "getDeclaredConstructors" (lambda (self) (class-constructors self)))
         (cons "getClass" (lambda (self) (make-class-obj "java.lang.Class")))))

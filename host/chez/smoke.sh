@@ -883,6 +883,23 @@ else
   fails=$((fails + 1))
 fi
 
+# Class reflection — getSuperclass/getInterfaces/isAssignableFrom/isInterface
+# over the jch graph, and the static-miss fallback to Class instance methods
+# (JVM Clojure's (.getName String) shape). Self-checks, one marker.
+refl_out="$($jolt run test/chez/class-reflect-test.clj 2>&1)"
+if printf '%s' "$refl_out" | grep -q 'CLASS-REFLECT-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: class reflection"
+  if printf '%s\n' "$refl_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$refl_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$refl_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$refl_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # jolt.ffi errno — the public thread-correct errno accessor (per-platform
 # thread-local slot; ENOENT/EBADF after failing syscalls, from threads and
 # fibers). Self-checks, one marker; same capture rules as the socket gate.
