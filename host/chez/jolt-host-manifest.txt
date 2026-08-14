@@ -145,6 +145,7 @@ record-type?
 ref-get
 ref-put!
 refine-extension!
+regex-compiled?
 register-class-supers!
 register-extension!
 register-extension-point!

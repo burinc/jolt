@@ -1656,4 +1656,12 @@
   {:suite "printing / str of a deftype" :expr "(do (defrecord Rc [a]) (deftype Dt [a]) [(str (->Rc 1)) (str (->Dt 1))])" :expected "[\"user.Rc{:a 1}\" \"user.Dt{:a 1}\"]"}
   ;; a declared toString still wins, collection shape or not
   {:suite "printing / str of a deftype" :expr "(do (deftype Sqt [v] clojure.lang.ISeq (seq [_] (seq v)) (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v))) (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil) (cons [_ o] (cons o (seq v))) Object (toString [_] \"MINE\")) (str (->Sqt [1 2])))" :expected "\"MINE\""}
+
+  ;; regex engines build lazily: construction only parses (a namespace of def'd
+  ;; patterns loads without compiling any of them), the first match compiles
+  ;; once, and a malformed pattern still throws at re-pattern like the JVM
+  ;; (pinned by the corpus PatternSyntaxException rows).
+  {:suite "regex-lazy" :expr "(let [r (re-pattern \"x(y)+z\")] [(jolt.host/regex-compiled? r) (some? (re-find r \"wxyyz!\")) (jolt.host/regex-compiled? r)])" :expected "[false true true]"}
+  {:suite "regex-lazy" :expr "(let [r #\"a[bc]d\"] [(jolt.host/regex-compiled? r) (re-matches r \"abd\") (jolt.host/regex-compiled? r)])" :expected "[false \"abd\" true]"}
+  {:suite "regex-lazy" :expr "(let [r (re-pattern \"q(w)e\")] [(pr-str r) (str r) (jolt.host/regex-compiled? r)])" :expected "[\"#\\\"q(w)e\\\"\" \"q(w)e\" false]"}
 ]

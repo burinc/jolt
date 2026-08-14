@@ -22,18 +22,26 @@
 (load "vendor/irregex/irregex.scm")
 
 
-;; A jolt regex value: the source string (for printing / str) + the compiled
-;; irregex. regex? recognizes it; the printer renders #"source".
-(define-record-type regex-t (fields source irx) (nongenerative jolt-regex-v1))
+;; A jolt regex value: the source string (for printing / str) + the LAZILY
+;; compiled irregex. regex? recognizes it; the printer renders #"source".
+;; Construction parses the pattern — a malformed pattern throws
+;; PatternSyntaxException at re-pattern, like the JVM — but the engine build
+;; waits for the first match: a namespace full of `def`'d patterns loads for
+;; the price of parsing, and a pattern that is never matched never compiles.
+;; (An HTTP-client middleware regex measured at hundreds of ms of app startup
+;; on one host motivated this; the cost now lands on first use or never.)
+;; The irx-cell starts #f and is filled through regex-t-irx below; the fill is
+;; a single store of an interned value, so a racing double-fill is benign.
+(define-record-type regex-t (fields source (mutable irx-cell)) (nongenerative jolt-regex-v2))
 ;; A capturing pattern is compiled with irregex's BACKTRACKING matcher ('backtrack),
 ;; not its DFA. java.util.regex is itself a leftmost-first backtracking engine, so
 ;; this matches the JVM's submatch semantics; irregex's DFA is POSIX leftmost-longest
 ;; and, worse, leaks a non-participating alternation group's capture (e.g.
 ;; #"(?:([0-9])|([0-9])r([0-9]+))" on "2r11" left group 1 = "2"), which broke
 ;; tools.reader's number reader. Non-capturing patterns keep the fast DFA — with no
-;; groups to read, its whole-match result is all a caller sees. The count comes from
-;; a first cheap compile; a capturing pattern is recompiled once (patterns compile
-;; once and cache in the regex-t).
+;; groups to read, its whole-match result is all a caller sees. Which engine a
+;; pattern needs is read off its SRE (sre-count-submatches below), so each
+;; pattern builds exactly one engine, at first use.
 
 ;; Compile a Java/Clojure pattern string → a regex-t. The pattern is parsed into an
 ;; irregex SRE via regex-translate.ss's java-pattern->sre, which handles the full
@@ -66,31 +74,72 @@
 (define (condition-message-of e)
   (if (and (condition? e) (message-condition? e)) (condition-message e) "Unsupported pattern"))
 
-(define (cached-regex-entry source)
-  "Return (count . irx) for source, compiling if needed."
-  ;; dynamic-wind, not a bare release: a pattern that fails to compile used to
-  ;; leave the mutex held, so the next thread to compile ANY regex blocked forever.
+;; capturing groups in an SRE — the translator emits (submatch …) for plain
+;; groups and (=> name …) for named ones; counting the SRE directly picks the
+;; engine without a throwaway compile.
+(define (sre-count-submatches sre)
+  (let walk ((x sre) (n 0))
+    (cond ((pair? x)
+           (let ((n (if (memq (car x) '(submatch submatch-named =>)) (+ n 1) n)))
+             (let lp ((xs (cdr x)) (n n))
+               (if (pair? xs) (lp (cdr xs) (walk (car xs) n)) n))))
+          ((vector? x) (let lp ((i 0) (n n))
+                         (if (< i (vector-length x)) (lp (+ i 1) (walk (vector-ref x i) n)) n)))
+          (else n))))
+
+;; Two cache stages per source, both under the mutex (dynamic-wind, not a bare
+;; release: a pattern that fails used to leave the mutex held, blocking every
+;; later compile). 'parsed holds the validated SRE; 'irx the built engine.
+(define (regex-parsed-entry source)
   (jolt-lock! regex-cache-mutex)
   (dynamic-wind
     (lambda () #f)
     (lambda ()
-      (let ((entry (hashtable-ref regex-cache source #f)))
-        (or entry
-            (let ((entry (guard (e (#t (regex-syntax-error source e)))
-                           (let-values (((sre opts) (java-pattern->sre source)))
-                             (let* ((irx (apply irregex sre opts))
-                                    (has-caps? (sre-has-backref? sre))
-                                    (count (irregex-num-submatches irx)))
-                               (if (or has-caps? (> count 0))
-                                   (cons count (apply irregex sre 'backtrack opts))
-                                   (cons 0 irx)))))))
-              (hashtable-set! regex-cache source entry)
-              entry))))
+      (or (hashtable-ref regex-cache source #f)
+          (let ((entry (guard (e (#t (regex-syntax-error source e)))
+                         (let-values (((sre opts) (java-pattern->sre source)))
+                           (vector 'parsed sre opts
+                                   (or (sre-has-backref? sre)
+                                       (> (sre-count-submatches sre) 0)))))))
+            (hashtable-set! regex-cache source entry)
+            entry)))
     (lambda () (jolt-unlock! regex-cache-mutex))))
 
+;; the built engine for source, compiling once on first demand. A capturing
+;; pattern gets irregex's BACKTRACKING matcher (see the engine note above); a
+;; group-free one keeps the fast DFA. An engine-build failure on an SRE the
+;; parser accepted still surfaces as PatternSyntaxException, just at first use.
+(define (regex-compiled-irx source)
+  (let ((entry (regex-parsed-entry source)))
+    (if (eq? (vector-ref entry 0) 'irx)
+        (vector-ref entry 1)
+        (begin
+          (jolt-lock! regex-cache-mutex)
+          (dynamic-wind
+            (lambda () #f)
+            (lambda ()
+              (let ((entry (hashtable-ref regex-cache source #f)))
+                (if (and entry (eq? (vector-ref entry 0) 'irx))
+                    (vector-ref entry 1)
+                    (let* ((sre (vector-ref entry 1)) (opts (vector-ref entry 2))
+                           (irx (guard (e (#t (regex-syntax-error source e)))
+                                  (if (vector-ref entry 3)
+                                      (apply irregex sre 'backtrack opts)
+                                      (apply irregex sre opts)))))
+                      (hashtable-set! regex-cache source (vector 'irx irx))
+                      irx))))
+            (lambda () (jolt-unlock! regex-cache-mutex)))))))
+
 (define (jolt-regex source)
-  (let ((entry (cached-regex-entry source)))
-    (make-regex-t source (cdr entry))))
+  (regex-parsed-entry source)        ; eager syntax validation, no engine build
+  (make-regex-t source #f))
+
+;; every reader of a regex's engine comes through here; first read compiles.
+(define (regex-t-irx r)
+  (or (regex-t-irx-cell r)
+      (let ((irx (regex-compiled-irx (regex-t-source r))))
+        (regex-t-irx-cell-set! r irx)
+        irx)))
 
 (define (jolt-regex? x) (regex-t? x))
 (define (jolt-re-pattern x) (if (regex-t? x) x (jolt-regex x)))
@@ -280,3 +329,7 @@
 (def-var! "clojure.core" "re-matcher" jolt-re-matcher)
 (def-var! "clojure.core" "re-groups" jolt-re-groups)
 (def-var! "clojure.core" "regex?" jolt-regex?)
+;; test probe: has this pattern's engine been built yet? The lazy-compile gate
+;; asserts a fresh pattern answers false and a matched one true.
+(def-var! "jolt.host" "regex-compiled?"
+  (lambda (x) (if (and (regex-t? x) (regex-t-irx-cell x)) #t #f)))
