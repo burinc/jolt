@@ -159,6 +159,18 @@
                    " (= (vec (range 5000)) (jolt.host/image-read \"" tmp "\")))")
     "true")
 
+;; RRB: a catvec result with a relaxed root dump/restore — the rrbnode record
+;; is an image-format surface (chez-rrbnode-v1, raw-travel). The split is 63+65
+;; deliberately: 64+64 rebalances to a fully classic trie (probed), so only a
+;; misaligned seam actually produces the relaxed root this case exists to cover.
+;; Uses jolt.host/catvec directly: the gate harness stops before loader.ss, so
+;; a (require 'clojure.core.rrb-vector) is alias-only and cannot load the ns.
+(is "relaxed-root RRB vector round-trips (element equality after restore)"
+    (string-append "(let [c (jolt.host/catvec (vec (range 63)) (vec (range 63 128)))]"
+                   " (jolt.host/image-write! \"" tmp "\" c)"
+                   " (= c (jolt.host/image-read \"" tmp "\")))")
+    "true")
+
 ;; metadata rides along
 (is "metadata preserved"
     (string-append "(do (jolt.host/image-write! \"" tmp "\" (with-meta [1] {:m 1}))"

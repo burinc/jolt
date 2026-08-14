@@ -70,14 +70,61 @@
 
 (define (pv-tailoff cnt)
   (if (fx<? cnt pv-width) 0 (fxsll (fxsra (fx- cnt 1) pv-bits) pv-bits)))
+
+;; --- RRB relaxed nodes -------------------------------------------------------
+;; catvec/slice (below) produce RELAXED branch nodes: children needn't be full,
+;; so radix addressing gives way to a size-table search. A relaxed node is a
+;; dedicated record — a regular branch is a Scheme vector of children and a leaf
+;; is a chunk of ELEMENTS (which can themselves be Scheme vectors), so a record
+;; is the only representation whose discrimination is total: rrbnode? and
+;; vector? are disjoint, and a value is only ever treated as a node at level>0.
+;; sizes are CUMULATIVE subtree counts (sizes[k] = elements in children 0..k).
+;;
+;; Invariants:
+;;  - a pvec whose root is a plain vector is a CLASSIC PersistentVector trie
+;;    (full 32-wide leaves, 32-aligned tailoff) — every pre-RRB invariant holds
+;;    and every pre-RRB code path runs unchanged;
+;;  - a pvec whose root is an rrbnode may be arbitrary: the size tables are
+;;    authoritative and the tail is the last 0..32 elements (tailoff is
+;;    cnt - tail length, NOT the aligned formula);
+;;  - inside an RRB trie a plain-vector branch means LEFTWISE DENSE (all but
+;;    the last child fully dense), so radix addressing on a subtree-relative
+;;    index is valid from that node down.
+(define-record-type rrbnode (fields sizes children) (nongenerative chez-rrbnode-v1))
+
+;; first child whose cumulative size exceeds i (linear over <=32 slots)
+(define (rrb-find-child sizes i)
+  (let loop ((k 0))
+    (if (fx<=? (vector-ref sizes k) i) (loop (fx+ k 1)) k)))
+
+(define (pv-tailoff-of p) (fx- (pvec-cnt p) (vector-length (pvec-tail p))))
+
+;; leaf resolution: the chunk holding index i and i's offset within it. The
+;; classic trie keeps its radix descent (one rrbnode? test per level is the only
+;; added cost); a relaxed node switches to its size table and subtree-relative
+;; addressing from there down. At level 0 the low 5 bits are the offset for
+;; both absolute (classic) and relative (leftwise-dense subtree) indices.
+(define (pv-leaf-for p i)
+  (let ((tailoff (pv-tailoff-of p)))
+    (if (fx>=? i tailoff)
+        (values (pvec-tail p) (fx- i tailoff))
+        (let loop ((node (pvec-root p)) (level (pvec-shift p)) (i i))
+          (cond
+            ((fx=? level 0) (values node (fxand i pv-mask)))
+            ((rrbnode? node)
+             ;; a relaxed node below dense ancestors receives an unmasked index;
+             ;; its in-subtree part is the low level+5 bits (dense ancestors are
+             ;; aligned), and masking a subtree-relative index is the identity.
+             (let* ((i (fxand i (fx- (fxsll 1 (fx+ level pv-bits)) 1)))
+                    (sizes (rrbnode-sizes node))
+                    (k (rrb-find-child sizes i))
+                    (sub (if (fx=? k 0) i (fx- i (vector-ref sizes (fx- k 1))))))
+               (loop (vector-ref (rrbnode-children node) k) (fx- level pv-bits) sub)))
+            (else (loop (vector-ref node (fxand (fxsra i level) pv-mask))
+                        (fx- level pv-bits) i)))))))
 ;; the 32-chunk Scheme vector holding index i (the tail or a trie leaf)
 (define (pv-chunk-for p i)
-  (if (fx>=? i (pv-tailoff (pvec-cnt p)))
-      (pvec-tail p)
-      (let loop ((node (pvec-root p)) (level (pvec-shift p)))
-        (if (fx>? level 0)
-            (loop (vector-ref node (fxand (fxsra i level) pv-mask)) (fx- level pv-bits))
-            node))))
+  (let-values (((chunk off) (pv-leaf-for p i))) chunk))
 
 ;; jolt models every number as a double, so vector indices arrive as flonums —
 ;; coerce an integer-valued index to a Scheme fixnum before bounds math.
@@ -86,7 +133,7 @@
 (define (pvec-nth-d p i d)
   (let ((i (->idx i)))
     (if (and (fixnum? i) (fx>=? i 0) (fx<? i (pvec-cnt p)))
-        (vector-ref (pv-chunk-for p i) (fxand i pv-mask))
+        (let-values (((chunk off) (pv-leaf-for p i))) (vector-ref chunk off))
         d)))
 
 ;; new-path: wrap a node in single-child nodes up `level` bits.
@@ -103,35 +150,59 @@
                       (pv-new-path (fx- level pv-bits) tail-node)))))))
 (define (pvec-conj p x)
   (let ((cnt (pvec-cnt p)) (shift (pvec-shift p)))
-    (if (fx<? (fx- cnt (pv-tailoff cnt)) pv-width)
-        ;; room in the tail
-        (mk-pvec (fx+ cnt 1) shift (pvec-root p) (vec-snoc (pvec-tail p) x) #f)
-        ;; tail full: push it into the trie, start a fresh tail
-        (let ((tail-node (pvec-tail p)))
-          (if (fx>? (fxsra cnt pv-bits) (fxsll 1 shift))
-              ;; root overflow: grow the trie a level
-              (mk-pvec (fx+ cnt 1) (fx+ shift pv-bits)
-                       (vector (pvec-root p) (pv-new-path shift tail-node))
-                       (vector x) #f)
-              (mk-pvec (fx+ cnt 1) shift
-                       (pv-push-tail cnt shift (pvec-root p) tail-node)
-                       (vector x) #f))))))
+    (cond
+      ((fx<? (vector-length (pvec-tail p)) pv-width)
+       ;; room in the tail (classic and RRB alike)
+       (mk-pvec (fx+ cnt 1) shift (pvec-root p) (vec-snoc (pvec-tail p) x) #f))
+      ((rrbnode? (pvec-root p))
+       ;; tail full under a relaxed root: push it down the rightmost spine
+       (let* ((tail-node (pvec-tail p))
+              (pushed (rrb-push-leaf (pvec-root p) shift tail-node)))
+         (if pushed
+             (mk-pvec (fx+ cnt 1) shift pushed (vector x) #f)
+             (let ((trie-cnt (fx- cnt pv-width)))   ; count already in the trie
+               (mk-pvec (fx+ cnt 1) (fx+ shift pv-bits)
+                        (make-rrbnode (vector trie-cnt cnt)
+                                      (vector (pvec-root p) (pv-new-path shift tail-node)))
+                        (vector x) #f)))))
+      (else
+       ;; tail full: push it into the classic trie, start a fresh tail
+       (let ((tail-node (pvec-tail p)))
+         (if (fx>? (fxsra cnt pv-bits) (fxsll 1 shift))
+             ;; root overflow: grow the trie a level
+             (mk-pvec (fx+ cnt 1) (fx+ shift pv-bits)
+                      (vector (pvec-root p) (pv-new-path shift tail-node))
+                      (vector x) #f)
+             (mk-pvec (fx+ cnt 1) shift
+                      (pv-push-tail cnt shift (pvec-root p) tail-node)
+                      (vector x) #f)))))))
 
 (define (pv-assoc-trie level node i x)
-  (if (fx=? level 0)
-      (vec-set node (fxand i pv-mask) x)
-      (let ((subidx (fxand (fxsra i level) pv-mask)))
-        (vec-set node subidx (pv-assoc-trie (fx- level pv-bits) (vector-ref node subidx) i x)))))
+  (cond
+    ((fx=? level 0) (vec-set node (fxand i pv-mask) x))
+    ((rrbnode? node)
+     (let* ((i (fxand i (fx- (fxsll 1 (fx+ level pv-bits)) 1)))   ; see pv-leaf-for
+            (sizes (rrbnode-sizes node))
+            (k (rrb-find-child sizes i))
+            (sub (if (fx=? k 0) i (fx- i (vector-ref sizes (fx- k 1)))))
+            (children (rrbnode-children node)))
+       (make-rrbnode sizes
+                     (vec-set children k
+                              (pv-assoc-trie (fx- level pv-bits) (vector-ref children k) sub x)))))
+    (else
+     (let ((subidx (fxand (fxsra i level) pv-mask)))
+       (vec-set node subidx (pv-assoc-trie (fx- level pv-bits) (vector-ref node subidx) i x))))))
 (define (pvec-assoc p i x)            ; i in [0,count]; =count appends
   (let ((i (->idx i)) (cnt (pvec-cnt p)))
     (cond
       ((fx=? i cnt) (pvec-conj p x))
       ((and (fx>=? i 0) (fx<? i cnt))
-       (if (fx>=? i (pv-tailoff cnt))
-           (mk-pvec cnt (pvec-shift p) (pvec-root p)
-                    (vec-set (pvec-tail p) (fxand i pv-mask) x) #f)
-           (mk-pvec cnt (pvec-shift p)
-                    (pv-assoc-trie (pvec-shift p) (pvec-root p) i x) (pvec-tail p) #f)))
+       (let ((tailoff (pv-tailoff-of p)))
+         (if (fx>=? i tailoff)
+             (mk-pvec cnt (pvec-shift p) (pvec-root p)
+                      (vec-set (pvec-tail p) (fx- i tailoff) x) #f)
+             (mk-pvec cnt (pvec-shift p)
+                      (pv-assoc-trie (pvec-shift p) (pvec-root p) i x) (pvec-tail p) #f))))
       (else (jolt-throw (jolt-host-throwable "java.lang.IndexOutOfBoundsException" "vector index out of bounds"))))))
 (define (pvec-peek p)
   (let ((n (pvec-cnt p))) (if (fx=? n 0) jolt-nil (pvec-nth-d p (fx- n 1) jolt-nil))))
@@ -151,8 +222,11 @@
     (cond
       ((fx=? cnt 0) (jolt-throw (jolt-host-throwable "java.lang.IllegalStateException" "Can't pop empty vector")))
       ((fx=? cnt 1) empty-pvec)
-      ((fx>? (fx- cnt (pv-tailoff cnt)) 1)
+      ((fx>? (vector-length (pvec-tail p)) 1)
        (mk-pvec (fx- cnt 1) shift (pvec-root p) (vec-drop-last (pvec-tail p)) #f))
+      ((rrbnode? (pvec-root p))
+       ;; relaxed trie: pop is a slice — O(log n) via the take machinery
+       (pvec-slice p 0 (fx- cnt 1)))
       (else
        (let* ((new-tail (pv-chunk-for p (fx- cnt 2)))
               (popped (pv-pop-tail cnt shift (pvec-root p)))
@@ -180,15 +254,375 @@
   (let* ((cnt (pvec-cnt p)) (out (make-vector cnt)))
     (let loop ((i 0))
       (if (fx<? i cnt)
-          (let* ((chunk (pv-chunk-for p i)) (clen (vector-length chunk)))
-            (let cloop ((j 0) (k i))
-              (if (and (fx<? j clen) (fx<? k cnt))
-                  (begin (vector-set! out k (vector-ref chunk j)) (cloop (fx+ j 1) (fx+ k 1)))
-                  (loop k))))
+          (let-values (((chunk off) (pv-leaf-for p i)))
+            (let ((run (fxmin (fx- (vector-length chunk) off) (fx- cnt i))))
+              (let cloop ((j 0))
+                (if (fx<? j run)
+                    (begin (vector-set! out (fx+ i j) (vector-ref chunk (fx+ off j))) (cloop (fx+ j 1)))
+                    (loop (fx+ i run))))))
           out))))
 (define (jolt-vector . xs) (make-pvec (list->vector xs)))
 (define (make-map-entry k v) (make-pvec (vector k v) #t))
 (define (jolt-map-entry? x) (and (pvec? x) (pvec-ent x) #t))
+
+;; ============================================================================
+;; RRB concat / slice — O(log n) pvec-catvec and pvec-slice
+;;
+;; The concat/rebalance plan, size-table search, and take/drop node surgery are
+;; ported from Racket's treelist (racket/collects/racket/treelist.rkt, MIT or
+;; Apache-2.0), adapted to this file's node shapes: leaves are element chunks,
+;; regular branches are Scheme vectors, relaxed branches are rrbnode records,
+;; and the vector keeps Clojure's tail (treelist has none; the tail seam
+;; follows clojure/core.rrb-vector, with L'orange's RRB thesis arbitrating).
+;; Levels are in SHIFT BITS like the rest of this file: leaves at 0, a node's
+;; children one pv-bits step down.
+;; ============================================================================
+
+;; children of a slot, viewing a leaf as a chunk of "children" (its elements)
+(define (rrb-slot-children n) (if (rrbnode? n) (rrbnode-children n) n))
+(define (rrb-nslots n) (vector-length (rrb-slot-children n)))
+(define (rrb-first-child n) (vector-ref (rrb-slot-children n) 0))
+(define (rrb-last-child n)
+  (let ((cs (rrb-slot-children n))) (vector-ref cs (fx- (vector-length cs) 1))))
+
+(define (vec-append a b)
+  (let* ((na (vector-length a)) (nb (vector-length b)) (out (make-vector (fx+ na nb))))
+    (let loop ((i 0)) (when (fx<? i na) (vector-set! out i (vector-ref a i)) (loop (fx+ i 1))))
+    (let loop ((i 0)) (when (fx<? i nb) (vector-set! out (fx+ na i) (vector-ref b i)) (loop (fx+ i 1))))
+    out))
+(define (vec-drop-first v) (vec-copy-range v 1 (vector-length v)))
+
+;; elements in a subtree
+(define (rrb-subtree-count node level)
+  (cond
+    ((fx=? level 0) (vector-length node))
+    ((rrbnode? node)
+     (let ((sizes (rrbnode-sizes node))) (vector-ref sizes (fx- (vector-length sizes) 1))))
+    (else
+     ;; leftwise dense: all but the last child are full for their level
+     (fx+ (fxsll (fx- (vector-length node) 1) level)
+          (rrb-subtree-count (rrb-last-child node) (fx- level pv-bits))))))
+
+;; build a branch at `level` from a children vector: leftwise-dense children
+;; stay a plain radix-addressed vector, anything else gets a size table.
+(define (rrb-mk-node children level)
+  (if (fx=? level 0)
+      children
+      (let* ((n (vector-length children))
+             (sizes (make-vector n))
+             (mask (fx- (fxsll 1 level) 1)))
+        (let loop ((i 0) (sum 0) (dense? #t))
+          (if (fx<? i n)
+              (let ((new-sum (fx+ sum (rrb-subtree-count (vector-ref children i) (fx- level pv-bits)))))
+                (vector-set! sizes i new-sum)
+                (loop (fx+ i 1) new-sum (and dense? (fx=? 0 (fxand sum mask)))))
+              (if dense? children (make-rrbnode sizes children)))))))
+
+;; push a full 32-wide tail leaf down the rightmost spine of a relaxed trie;
+;; #f when every node on the spine is full (caller grows the root).
+(define (rrb-push-leaf node level leaf)
+  (cond
+    ((fx=? level pv-bits)
+     (if (fx<? (rrb-nslots node) pv-width)
+         (rrb-mk-node (vec-snoc (rrb-slot-children node) leaf) level)
+         #f))
+    (else
+     (let* ((cs (rrb-slot-children node)) (n (vector-length cs))
+            (pushed (and (fx>? n 0)
+                         (rrb-push-leaf (vector-ref cs (fx- n 1)) (fx- level pv-bits) leaf))))
+       (cond
+         (pushed (rrb-mk-node (vec-set cs (fx- n 1) pushed) level))
+         ((fx<? n pv-width)
+          (rrb-mk-node (vec-snoc cs (pv-new-path (fx- level pv-bits) leaf)) level))
+         (else #f))))))
+
+;; --- concat ------------------------------------------------------------------
+(define (rrb-merge-nodes left center-slots right)
+  (vec-append (if left (vec-drop-last (rrb-slot-children left)) (vector))
+              (vec-append center-slots
+                          (if right (vec-drop-first (rrb-slot-children right)) (vector)))))
+
+;; redistribution plan over slots that temporarily exceed 32 children:
+;; #f when already within ceil(count/32)+2 slots (the RRB search-step bound).
+(define (rrb-concat-plan slots)
+  (let* ((n (vector-length slots))
+         (plan (make-vector n))
+         (child-count (let loop ((i 0) (c 0))
+                        (if (fx<? i n)
+                            (let ((sz (rrb-nslots (vector-ref slots i))))
+                              (vector-set! plan i sz)
+                              (loop (fx+ i 1) (fx+ c sz)))
+                            c)))
+         (optimal (fxquotient (fx+ child-count pv-width -1) pv-width))
+         (target (fx+ optimal 2)))
+    (if (fx>=? target n) #f (rrb-distribute plan target n))))
+
+(define (rrb-distribute plan target count)
+  (let loop ((count count) (node-idx 0))
+    (if (fx>=? target count)
+        (vec-take plan count)
+        (let* ((init-i (let short ((i node-idx))
+                         (if (fx<? (vector-ref plan i) (fx- pv-width 1)) i (short (fx+ i 1)))))
+               (i (let dist ((i init-i) (r (vector-ref plan init-i)))
+                    (if (fx=? r 0)
+                        i
+                        (let ((min-size (fxmin (fx+ r (vector-ref plan (fx+ i 1))) pv-width)))
+                          (vector-set! plan i min-size)
+                          (dist (fx+ i 1)
+                                (fx- (fx+ r (vector-ref plan (fx+ i 1))) min-size)))))))
+          ;; one slot was absorbed: close the gap
+          (let move ((j i))
+            (when (fx<? j (fx- count 1))
+              (vector-set! plan j (vector-ref plan (fx+ j 1))) (move (fx+ j 1))))
+          (loop (fx- count 1) (fxmax 0 (fx- i 1)))))))
+
+(define (rrb-exec-plan slots plan sl)     ; sl = the slots' own level
+  (if (not plan)
+      slots
+      (let* ((ns (vector-length slots))
+             (flat-size (let loop ((i 0) (s 0))
+                          (if (fx<? i ns) (loop (fx+ i 1) (fx+ s (rrb-nslots (vector-ref slots i)))) s)))
+             (flat (make-vector flat-size)))
+        (let fill ((i 0) (k 0))
+          (when (fx<? i ns)
+            (let* ((cs (rrb-slot-children (vector-ref slots i))) (n (vector-length cs)))
+              (let cp ((j 0)) (when (fx<? j n) (vector-set! flat (fx+ k j) (vector-ref cs j)) (cp (fx+ j 1))))
+              (fill (fx+ i 1) (fx+ k n)))))
+        (let* ((np (vector-length plan)) (out (make-vector np)))
+          (let build ((i 0) (sum 0))
+            (if (fx<? i np)
+                (let ((w (vector-ref plan i)))
+                  (vector-set! out i (rrb-mk-node (vec-copy-range flat sum (fx+ sum w)) sl))
+                  (build (fx+ i 1) (fx+ sum w)))
+                out))))))
+
+;; merge `left`'s children (but its last), `center`'s, and `right`'s (but its
+;; first) into <=32-slot nodes; -> (values node level), growing a level when
+;; the redistributed slots still exceed one node.
+(define (rrb-rebalance left center right level level-c)
+  (let* ((sl (fx- level pv-bits))
+         (center-slots (if (fx<? level-c level) (vector center) (rrb-slot-children center)))
+         (all-slots (rrb-merge-nodes left center-slots right))
+         (plan (rrb-concat-plan all-slots))
+         (slots (rrb-exec-plan all-slots plan sl)))
+    (if (fx<=? (vector-length slots) pv-width)
+        (values (rrb-mk-node slots level) level)
+        (let ((nl (vec-take slots pv-width))
+              (nr (vec-copy-range slots pv-width (vector-length slots))))
+          (values (rrb-mk-node (vector (rrb-mk-node nl level) (rrb-mk-node nr level))
+                               (fx+ level pv-bits))
+                  (fx+ level pv-bits))))))
+
+;; concatenate two subtrees; -> (values node level)
+(define (rrb-concat-subtree left ls right rs)
+  (cond
+    ((fx>? ls rs)
+     (let-values (((mid ml) (rrb-concat-subtree (rrb-last-child left) (fx- ls pv-bits) right rs)))
+       (rrb-rebalance left mid #f ls ml)))
+    ((fx<? ls rs)
+     (let-values (((mid ml) (rrb-concat-subtree left ls (rrb-first-child right) (fx- rs pv-bits))))
+       (rrb-rebalance #f mid right rs ml)))
+    ((fx=? ls 0)
+     (if (fx<=? (fx+ (vector-length left) (vector-length right)) pv-width)
+         (values (vec-append left right) 0)
+         (values (rrb-mk-node (vector left right) pv-bits) pv-bits)))
+    (else
+     (let-values (((mid ml) (rrb-concat-subtree (rrb-last-child left) (fx- ls pv-bits)
+                                                (rrb-first-child right) (fx- rs pv-bits))))
+       (rrb-rebalance left mid right ls ml)))))
+
+;; --- take / drop -------------------------------------------------------------
+;; keep elements [0, i] of the subtree (i relative, inclusive)
+(define (rrb-take-node node level i)
+  (cond
+    ((fx=? level 0) (vec-take node (fx+ (fxand i pv-mask) 1)))
+    ((rrbnode? node)
+     (let* ((i (fxand i (fx- (fxsll 1 (fx+ level pv-bits)) 1)))   ; see pv-leaf-for
+            (sizes (rrbnode-sizes node))
+            (k (rrb-find-child sizes i))
+            (sub (if (fx=? k 0) i (fx- i (vector-ref sizes (fx- k 1)))))
+            (children (rrbnode-children node))
+            (new-child (rrb-take-node (vector-ref children k) (fx- level pv-bits) sub))
+            (new-children (vec-take children (fx+ k 1))))
+       (vector-set! new-children k new-child)
+       (if (fx=? (vector-length new-children) 1)
+           new-children                       ; a single child radix-addresses as slot 0
+           (let ((new-sizes (vec-take sizes (fx+ k 1))))
+             (vector-set! new-sizes k (fx+ i 1))
+             (make-rrbnode new-sizes new-children)))))
+    (else
+     (let* ((k (fxand (fxsra i level) pv-mask))
+            (new-child (rrb-take-node (vector-ref node k) (fx- level pv-bits) i))
+            (new-children (vec-take node (fx+ k 1))))
+       (vector-set! new-children k new-child)
+       new-children))))                       ; prefix children untouched => stays leftwise dense
+
+;; drop the first i elements of the subtree (i relative)
+(define (rrb-drop-node node level i)
+  (cond
+    ((fx=? level 0) (vec-copy-range node (fxand i pv-mask) (vector-length node)))
+    ((rrbnode? node)
+     (let* ((i (fxand i (fx- (fxsll 1 (fx+ level pv-bits)) 1)))   ; see pv-leaf-for
+            (sizes (rrbnode-sizes node))
+            (k (rrb-find-child sizes i))
+            (sub (if (fx=? k 0) i (fx- i (vector-ref sizes (fx- k 1)))))
+            (children (rrbnode-children node))
+            (new-child (rrb-drop-node (vector-ref children k) (fx- level pv-bits) sub))
+            (new-children (vec-copy-range children k (vector-length children))))
+       (vector-set! new-children 0 new-child)
+       (if (fx=? (vector-length new-children) 1)
+           new-children
+           (let* ((old-len (vector-length sizes))
+                  (new-len (fx- old-len k))
+                  (new-sizes (make-vector new-len)))
+             (let loop ((j 0))
+               (when (fx<? j new-len)
+                 (vector-set! new-sizes j (fx- (vector-ref sizes (fx+ k j)) i))
+                 (loop (fx+ j 1))))
+             (make-rrbnode new-sizes new-children)))))
+    (else
+     (let* ((k (fxand (fxsra i level) pv-mask))
+            (new-child (rrb-drop-node (vector-ref node k) (fx- level pv-bits) i))
+            (new-children (vec-copy-range node k (vector-length node)))
+            (new-len (vector-length new-children)))
+       (vector-set! new-children 0 new-child)
+       (if (fx=? new-len 1)
+           new-children
+           (let ((size0 (rrb-subtree-count new-child (fx- level pv-bits)))
+                 (step (fxsll 1 level)))
+             (if (fx=? size0 step)
+                 new-children                 ; dropped whole subtrees: still leftwise dense
+                 (let ((new-sizes (make-vector new-len)))
+                   (let loop ((j 0))
+                     (when (fx<? j (fx- new-len 1))
+                       (vector-set! new-sizes j (fx+ size0 (fx* j step)))
+                       (loop (fx+ j 1))))
+                   (vector-set! new-sizes (fx- new-len 1)
+                                (fx+ size0 (fx* (fx- new-len 2) step)
+                                     (rrb-subtree-count (vector-ref new-children (fx- new-len 1))
+                                                        (fx- level pv-bits))))
+                   (make-rrbnode new-sizes new-children)))))))))
+
+;; collapse single-child levels; -> (values node level)
+(define (rrb-squash node level)
+  (if (and (fx>? level 0) (fx=? (rrb-nslots node) 1))
+      (rrb-squash (rrb-first-child node) (fx- level pv-bits))
+      (values node level)))
+
+;; --- pvec boundary -----------------------------------------------------------
+;; the whole vector (tail folded in) as one subtree; -> (values root level)
+(define (pvec->rrb-tree p)
+  (let ((tail (pvec-tail p)) (tailoff (pv-tailoff-of p)))
+    (cond
+      ((fx=? tailoff 0) (values tail 0))
+      ((fx=? (vector-length tail) 0) (values (pvec-root p) (pvec-shift p)))
+      (else (rrb-concat-subtree (pvec-root p) (pvec-shift p) tail 0)))))
+
+;; is this subtree a full classic trie (32-aligned count, plain rightmost
+;; spine)? Plain multi-child nodes are leftwise dense by construction, so a
+;; plain spine + aligned total means every leaf is full and radix-addressed.
+(define (rrb-classic-tree? node level cnt)
+  (and (fx=? 0 (fxand cnt pv-mask))
+       (let spine ((n node) (l level))
+         (cond ((fx=? l 0) #t)
+               ((rrbnode? n) #f)
+               (else (spine (rrb-last-child n) (fx- l pv-bits)))))))
+
+;; classic emission: pull the rightmost leaf back out as the tail so every
+;; classic invariant (tail 1..32, aligned tailoff, full leaves) holds.
+(define (rrb-tree->classic-pvec root level cnt)
+  (let* ((new-tail (let last ((n root) (l level))
+                     (if (fx=? l 0) n (last (rrb-last-child n) (fx- l pv-bits)))))
+         (popped (pv-pop-tail cnt level root))
+         (new-root (or popped pv-empty-node)))
+    (if (and (fx>? level pv-bits) (fx<? (vector-length new-root) 2))
+        (mk-pvec cnt (fx- level pv-bits)
+                 (if (fx=? 0 (vector-length new-root)) pv-empty-node (vector-ref new-root 0))
+                 new-tail #f)
+        (mk-pvec cnt level new-root new-tail #f))))
+
+;; force a size table onto a plain (leftwise-dense) root: a plain-rooted pvec
+;; promises the FULL classic invariants, which a partial last leaf breaks.
+(define (rrb-force-relaxed root level)
+  (if (rrbnode? root)
+      root
+      (let* ((n (vector-length root)) (sizes (make-vector n)))
+        (let loop ((i 0) (sum 0))
+          (if (fx<? i n)
+              (let ((s (fx+ sum (rrb-subtree-count (vector-ref root i) (fx- level pv-bits)))))
+                (vector-set! sizes i s) (loop (fx+ i 1) s))
+              (make-rrbnode sizes root))))))
+
+(define (rrb-tree->pvec root level cnt)
+  (cond
+    ((fx=? cnt 0) empty-pvec)
+    ((fx=? level 0) (mk-pvec cnt pv-bits pv-empty-node root #f))   ; bare leaf: tail-only
+    ((rrb-classic-tree? root level cnt) (rrb-tree->classic-pvec root level cnt))
+    (else (mk-pvec cnt level (rrb-force-relaxed root level) (vector) #f))))
+
+;; --- public entry points -----------------------------------------------------
+(define (pvec-copy-into! out at p)
+  (let ((cnt (pvec-cnt p)))
+    (let loop ((i 0))
+      (when (fx<? i cnt)
+        (let-values (((chunk off) (pv-leaf-for p i)))
+          (let ((run (fxmin (fx- (vector-length chunk) off) (fx- cnt i))))
+            (let cp ((j 0))
+              (when (fx<? j run)
+                (vector-set! out (fx+ at (fx+ i j)) (vector-ref chunk (fx+ off j)))
+                (cp (fx+ j 1))))
+            (loop (fx+ i run))))))))
+
+;; O(log n) structural concatenation
+(define (pvec-catvec a b)
+  (let ((ca (pvec-cnt a)) (cb (pvec-cnt b)))
+    (cond
+      ((fx=? ca 0) b)
+      ((fx=? cb 0) a)
+      ((fx<=? (fx+ ca cb) pv-width)
+       (let ((out (make-vector (fx+ ca cb))))
+         (pvec-copy-into! out 0 a)
+         (pvec-copy-into! out ca b)
+         (mk-pvec (fx+ ca cb) pv-bits pv-empty-node out #f)))
+      (else
+       (let*-values (((ra la) (pvec->rrb-tree a))
+                     ((rb lb) (pvec->rrb-tree b))
+                     ((root level) (rrb-concat-subtree ra la rb lb)))
+         (rrb-tree->pvec root level (fx+ ca cb)))))))
+
+;; O(log n) structural slice [start, end)
+(define (pvec-slice p start end)
+  (let ((start (->idx start)) (end (->idx end)) (cnt (pvec-cnt p)))
+    (cond
+      ((or (not (fixnum? start)) (not (fixnum? end))
+           (fx<? start 0) (fx>? end cnt) (fx>? start end))
+       (jolt-throw (jolt-host-throwable "java.lang.IndexOutOfBoundsException" "slice index out of bounds")))
+      ((and (fx=? start 0) (fx=? end cnt)) p)
+      ((fx=? start end) empty-pvec)
+      ((fx<=? (fx- end start) pv-width)
+       ;; small windows flatten to a tail-only classic vector
+       (let* ((n (fx- end start)) (out (make-vector n)))
+         (let loop ((i start))
+           (when (fx<? i end)
+             (let-values (((chunk off) (pv-leaf-for p i)))
+               (let ((run (fxmin (fx- (vector-length chunk) off) (fx- end i))))
+                 (let cp ((j 0))
+                   (when (fx<? j run)
+                     (vector-set! out (fx+ (fx- i start) j) (vector-ref chunk (fx+ off j)))
+                     (cp (fx+ j 1))))
+                 (loop (fx+ i run))))))
+         (mk-pvec n pv-bits pv-empty-node out #f)))
+      (else
+       (let-values (((root level) (pvec->rrb-tree p)))
+         (let*-values (((root level) (if (fx=? end cnt)
+                                         (values root level)
+                                         (let ((r (rrb-take-node root level (fx- end 1))))
+                                           (rrb-squash r level))))
+                       ((root level) (if (fx=? start 0)
+                                         (values root level)
+                                         (let ((r (rrb-drop-node root level start)))
+                                           (rrb-squash r level)))))
+           (rrb-tree->pvec root level (fx- end start))))))))
 
 ;; ============================================================================
 ;; bitmap HAMT — keys hashed by jolt-hash, leaves compared by jolt=
@@ -616,7 +1050,7 @@
        (cond ((jolt-nil? coll) jolt-nil)          ; RT.nth(nil, i) is nil at any index
       ((pvec? coll) (let ((cnt (pvec-count coll)))
                               (if (and (fixnum? i) (fx>=? i 0) (fx<? i cnt))
-                                  (vector-ref (pv-chunk-for coll i) (fxand i pv-mask))
+                                  (let-values (((chunk off) (pv-leaf-for coll i))) (vector-ref chunk off))
                                   (jolt-throw (jolt-host-throwable "java.lang.IndexOutOfBoundsException" "index out of bounds")))))
              ((string? coll) (if (and (fx>=? i 0) (fx<? i (string-length coll))) (string-ref coll i)
                                  (jolt-throw (jolt-host-throwable "java.lang.IndexOutOfBoundsException" "index out of bounds"))))
@@ -805,17 +1239,22 @@
 (define (jolt-coll=? a b)
   (cond
     ((and (pvec? a) (pvec? b))
+     ;; leaf-run lockstep: a's and b's leaves needn't align (RRB tries have
+     ;; partial leaves), so each stride is the min of both remaining runs.
+     ;; Classic vectors take full-32 strides exactly as before.
      (let ((na (pvec-count a)))
        (and (fx=? na (pvec-count b))
             (let loop ((i 0))
               (if (fx=? i na) #t
-                  (let* ((ca (pv-chunk-for a i))
-                         (cb (pv-chunk-for b i))
-                         (clen (vector-length ca)))
-                    (let cloop ((j 0) (k i))
-                      (if (fx>=? j clen) (loop k)
-                          (and (jolt= (vector-ref ca j) (vector-ref cb j))
-                               (cloop (fx+ j 1) (fx+ k 1)))))))))))
+                  (let*-values (((ca oa) (pv-leaf-for a i))
+                                ((cb ob) (pv-leaf-for b i)))
+                    (let ((run (fxmin (fx- (vector-length ca) oa)
+                                      (fx- (vector-length cb) ob)
+                                      (fx- na i))))
+                      (let cloop ((j 0))
+                        (if (fx>=? j run) (loop (fx+ i run))
+                            (and (jolt= (vector-ref ca (fx+ oa j)) (vector-ref cb (fx+ ob j)))
+                                 (cloop (fx+ j 1))))))))))))
     ((and (pmap? a) (pmap? b))
      (and (fx=? (pmap-cnt a) (pmap-cnt b))
           (pmap-fold a (lambda (k v ok) (and ok (jolt= (pmap-get b k pmap-absent) v))) #t)))

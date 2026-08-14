@@ -19,6 +19,7 @@ babashka.process.pprint
 clojure.core.async
 clojure.core.async.lab
 clojure.core.protocols
+clojure.core.rrb-vector
 clojure.data
 clojure.datafy
 clojure.instant
