@@ -363,6 +363,19 @@
   {:suite "ns" :expr "(nil? (find-ns 'does.not.exist))" :expected "true"}
   {:suite "ns" :expr "(var? (resolve '+))" :expected "true"}
   {:suite "ns" :expr "(nil? (resolve 'totally-undefined-xyz))" :expected "true"}
+  ;; resolve returns the CLASS for a class mapping, like the JVM (a ns mapping
+  ;; is a var or a Class); a user var merely holding a class stays a var.
+  {:suite "ns" :expr "(class? (resolve 'String))" :expected "true"}
+  {:suite "ns" :expr "(= (resolve 'String) String)" :expected "true"}
+  {:suite "ns" :expr "(= (resolve 'java.util.Map) java.util.Map)" :expected "true"}
+  {:suite "ns" :expr "(class? (ns-resolve *ns* 'String))" :expected "true"}
+  {:suite "ns" :expr "(nil? (resolve 'NoSuchClassXyz))" :expected "true"}
+  {:suite "ns" :expr "(do (def rzc-alias String) (var? (resolve 'rzc-alias)))" :expected "true"}
+  {:suite "ns" :expr "(do (deftype RzResT [a]) (class? (resolve 'RzResT)))" :expected "true"}
+  ;; reader conditionals match :bb (ahead of :clj, like babashka); clause order
+  ;; still wins when :clj is listed first.
+  {:suite "reader-features" :expr "#?(:bb :bb-branch :clj :clj-branch)" :expected ":bb-branch"}
+  {:suite "reader-features" :expr "#?(:clj :clj-first :bb :bb-second)" :expected ":clj-first"}
   {:suite "ns" :expr "(do (def npv 1) (some? (get (ns-publics 'user) 'npv)))" :expected "true"}
   {:suite "ns" :expr "(do (def nmv 1) (some? (get (ns-map 'user) 'nmv)))" :expected "true"}
   {:suite "ns" :expr "(map? (ns-aliases 'clojure.core))" :expected "true"}

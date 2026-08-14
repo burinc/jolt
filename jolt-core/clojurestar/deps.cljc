@@ -1,9 +1,11 @@
 (ns clojurestar.deps
   "Dialect-neutral dynamic dependency loading."
   (:require
-   #?(:bb [babashka.deps :as implementation]
+   ;; :jolt ahead of :bb — jolt's reader matches both, and this facade must
+   ;; bind to jolt.deps there, not babashka.deps.
+   #?(:jolt [jolt.deps :as implementation]
+      :bb [babashka.deps :as implementation]
       :glj [glojure.deps :as implementation]
-      :jolt [jolt.deps :as implementation]
       :lg [let-go.deps :as implementation]
       :clj [grenadine.jvm :as implementation])))
 
