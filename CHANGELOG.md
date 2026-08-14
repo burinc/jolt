@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`jolt.fibers`: the fiber primitive as a public API**, side by side with
+  core.async. `spawn` runs a body on the carrier pool and returns the fiber
+  handle; `join` waits for its value (parking on a fiber, blocking on a
+  thread; optional timeout) and rethrows the body's error; `monitor!`
+  observes completion race-free (a finished fiber fires the callback
+  inline); `state`, `fiber?`, `current-fiber`, `in-fiber?`, `yield`, and the
+  pool knobs (`carrier-count`/`set-carrier-count!`,
+  `preempt-ticks`/`set-preempt-ticks!`) round it out. Channel ops and
+  `deref` inside a spawned body park exactly as they do in a `:fiber` go
+  block. The gate (`test/chez/jolt-fibers-test.clj`, in `make smoke`) covers
+  spawn/join/monitor semantics, error and binding conveyance, parked-state
+  observation, and the knob floors.
+
 ## [0.7.11] - 2026-08-14
 
 Vectors grew a tree. Concatenating and slicing persistent vectors is

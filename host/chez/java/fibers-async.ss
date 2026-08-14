@@ -283,3 +283,58 @@
 ;; guarded no-op), but the gate must SEE that refusal when the poller's blocking
 ;; wait is not collect-safe — a collect that fails proves it.
 (def-var! "jolt.host" "gc-full!" (lambda () (sa-gc-collect)))
+
+;; --- jolt.fibers: the public lower-level API (epic jolt-of08.1) ---------------
+;; stdlib/jolt/fibers.clj is a thin veneer over these seams. spawn mirrors
+;; jolt-fiber-go-spawn — convey the slice, never *txn*, ensure the pool — but
+;; returns the FIBER, not a channel, and runs the body UNGUARDED: a throw lands
+;; in jolt-fiber-dead! per the R1 contract (state 'dead, error recorded,
+;; monitors fired), which is exactly what join/monitor! read. The raw park
+;; protocol (fiber-park-commit!/fiber-to-scheduler!) stays out of the public
+;; namespace — its commit/switch discipline belongs to the poller.
+(def-var! "jolt.host" "fiber-spawn"
+  (lambda (f)
+    (let ((fib (sa-fiber-spawn (lambda () (*txn* #f) (jolt-invoke f)))))
+      (jolt-fiber-ensure-carrier!)
+      fib)))
+(def-var! "jolt.host" "fiber-instance?" (lambda (x) (if (jolt-fiber? x) #t #f)))
+(def-var! "jolt.host" "fiber-yield" (lambda () (sa-fiber-yield) jolt-nil))
+;; The callback gets what a jolt catch would bind: the unwrapped error for a
+;; fiber that died, nil for a clean completion.
+(def-var! "jolt.host" "fiber-monitor!"
+  (lambda (fib cb)
+    (jolt-fiber-monitor! fib
+      (lambda (err) (jolt-invoke cb (if err (jolt-unwrap-throw err) jolt-nil))))
+    jolt-nil))
+(def-var! "jolt.host" "fiber-state"
+  (lambda (fib) (jolt-keyword (symbol->string (jolt-fiber-state fib)))))
+;; Meaningful only once the fiber is terminal — join reads it from inside the
+;; monitor callback, after jolt-fiber-finish! published state and payload
+;; together.
+(def-var! "jolt.host" "fiber-result" (lambda (fib) (jolt-fiber-result fib)))
+(def-var! "jolt.host" "fiber-carrier-count" (lambda () (jolt-fiber-carrier-count)))
+;; nil restores the machine default; validated here (like the preempt seam) so
+;; the caller gets a catchable ex-info, not a Scheme error.
+(def-var! "jolt.host" "fiber-carrier-count-set!"
+  (lambda (n)
+    (let ((n (if (jolt-nil? n) #f n)))
+      (unless (or (not n) (and (fixnum? n) (fx>? n 0)))
+        (jolt-throw (jolt-ex-info "carrier count must be nil or a positive int"
+                                  (jolt-hash-map (jolt-keyword "given") (if n n jolt-nil)))))
+      (jolt-fiber-carrier-count-set! n)
+      jolt-nil)))
+(def-var! "jolt.host" "fiber-preempt-ticks" (lambda () jolt-fiber-preempt-ticks-global))
+;; Validated here rather than deferring to jolt-fiber-preempt-ticks-set!'s
+;; Scheme error so the caller gets a catchable ex-info naming the floor.
+;; nil restores the default quantum — there is no "off" (fibers.ss).
+(def-var! "jolt.host" "fiber-preempt-ticks-set!"
+  (lambda (n)
+    (let ((n (if (jolt-nil? n) #f n)))
+      (unless (or (not n) (and (fixnum? n) (fx>=? n jolt-fiber-preempt-ticks-min)))
+        (jolt-throw (jolt-ex-info
+                     (string-append "preempt ticks must be nil or an int >= "
+                                    (number->string jolt-fiber-preempt-ticks-min))
+                     (jolt-hash-map (jolt-keyword "floor") jolt-fiber-preempt-ticks-min
+                                    (jolt-keyword "given") (if n n jolt-nil)))))
+      (jolt-fiber-preempt-ticks-set! n)
+      jolt-nil)))

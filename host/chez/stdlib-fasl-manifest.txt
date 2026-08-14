@@ -43,6 +43,7 @@ grenadine.lock
 grenadine.repo
 grenadine.runtime
 grenadine.source
+jolt.fibers
 jolt.fs
 jolt.image
 jolt.infix
