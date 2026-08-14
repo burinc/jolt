@@ -80,6 +80,12 @@
 (define (hc-var-value? x) (var-cell? x))
 (define (hc-var-value-ns x) (var-cell-ns x))
 (define (hc-var-value-name x) (var-cell-name x))
+;; a live CLASS value spliced into a form by a macro — (resolve 'Throwable)
+;; hands back the class, and `~(resolve sym)` embeds it in the expansion. It
+;; re-evaluates through the jolt-class-for interner, the same value the class
+;; symbol itself compiles to.
+(define (hc-class-value? x) (jclass? x))
+(define (hc-class-value-name x) (jclass-name x))
 
 ;; *unchecked-math* read at compile time: when truthy (a file's (set!
 ;; *unchecked-math* …)), the analyzer rewrites +/-/*/inc/dec to their wrapping
@@ -608,6 +614,8 @@
   (def-var! "jolt.host" "form-var-value?" hc-var-value?)
   (def-var! "jolt.host" "form-var-value-ns" hc-var-value-ns)
   (def-var! "jolt.host" "form-var-value-name" hc-var-value-name)
+  (def-var! "jolt.host" "form-class-value?" hc-class-value?)
+  (def-var! "jolt.host" "form-class-value-name" hc-class-value-name)
   (def-var! "jolt.host" "unchecked-math?" hc-unchecked-math?)
   (def-var! "jolt.host" "allow-unresolved-vars?" hc-allow-unresolved-vars?)
   (def-var! "jolt.host" "form-bigdec?" hc-bigdec?)
