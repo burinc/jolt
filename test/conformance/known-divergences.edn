@@ -6,7 +6,7 @@
   :host-model
   "no JVM host: classes->name strings, type->symbol, *in* is a map, inline-impl extenders, duck-typed with-open close",
   :reader-model
-  "jolt reader features (:jolt) + syntax-quote literal collapse (spec 2.4 S25); map source-order preserved. #=(...) reads as inert data (never evaluates, regardless of *read-eval*); nested #() literals read where the JVM rejects them.",
+  "jolt reader features (:jolt :bb) + syntax-quote literal collapse (spec 2.4 S25); map source-order preserved. #=(...) reads as inert data (never evaluates, regardless of *read-eval*); nested #() literals read where the JVM rejects them.",
   :printer-model
   "jolt printer renders transients/atoms/print-method overrides differently from JVM #object",
   :strictness
@@ -232,6 +232,12 @@
    :jvm "throws: No reader function for tag foo/bar"
    :jolt "#foo/bar 5 (a tagged literal)"
    :note "The default data-reader tags rather than throwing, like #= reads as data. clojure.edn still throws on an unknown tag."}
+  ;; reader conditionals match :bb, ahead of :clj when the clause is listed first.
+  {:category :reader-model
+   :behavior "#?(:bb 1 :clj 2)"
+   :jvm "2 (:bb is not a JVM feature)"
+   :jolt "1"
+   :note "jolt's feature set is {:jolt :bb :clj :default}, like babashka's {:bb :clj}. A library's :bb branch solves the same non-JVM problems jolt has (no reflection, no JVM-only classes) and is listed ahead of :clj precisely so a bb-like host takes it."}
   ;; read-string of an empty string returns nil (JVM throws EOF).
   {:category :permissive
    :behavior "(read-string \"\")"

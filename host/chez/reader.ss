@@ -607,13 +607,16 @@
                                (if rest-sym (list (jolt-symbol #f "&") rest-sym) '()))))
           (values (jolt-list (jolt-symbol #f "fn*") (apply jolt-vector params) body) j))))))
 
-;; reader conditionals: jolt's feature set is {:jolt :clj :default};
+;; reader conditionals: jolt's feature set is {:jolt :bb :clj :default};
 ;; the FIRST clause whose feature key is in the set wins (clause order, like
 ;; Clojure). jolt is a Clojure/JVM-compatible host — it emulates clojure.lang.*
 ;; and java.* interop — so it reads the :clj branch of a .cljc library (the JVM
-;; code path its host shims target), not the :cljs one. A library can still
-;; override with a :jolt-specific branch (place it before :clj).
-(define rdr-features '("jolt" "clj" "default"))
+;; code path its host shims target), not the :cljs one. :bb is also in the set,
+;; like babashka itself: a library's :bb branch solves the same non-JVM problems
+;; jolt has (no reflection, no JVM-only classes), and libraries list it ahead of
+;; :clj precisely so a bb-like host takes it. A library can still override with
+;; a :jolt-specific branch (place it before :bb/:clj).
+(define rdr-features '("jolt" "bb" "clj" "default"))
 (define (rdr-feature? kw)
   (and (keyword? kw) (jolt-nil? (let ((n (keyword-t-ns kw))) (if n n jolt-nil)))
        (and (member (keyword-t-name kw) rdr-features) #t)))

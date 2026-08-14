@@ -4,6 +4,10 @@
 clojure.core-test.abs 1 0
 clojure.core-test.bigint 1 0
 clojure.core-test.byte 1 0
+# descendants: the suite's :bb branch expects class-as-SYMBOL in hierarchies
+# (babashka's model); jolt derives with the class VALUE like the JVM, so the
+# three set-equality rows miss. See the class model notes in known-divergences.
+clojure.core-test.descendants 3 0
 # char: the suite's "4+ byte characters" case is host-dependent — it expects a
 # throw on the JVM but the character itself on jank and basilisp, which index
 # strings by code point as jolt does. jolt has no branch there so it takes
@@ -12,7 +16,7 @@ clojure.core-test.byte 1 0
 clojure.core-test.char 1 0
 clojure.core-test.dec 1 0
 clojure.core-test.double-qmark 3 0
-clojure.core-test.eq 2 0
+clojure.core-test.eq 1 0
 clojure.core-test.float 1 0
 clojure.core-test.inc 1 0
 clojure.core-test.int-qmark 3 0
@@ -20,8 +24,10 @@ clojure.core-test.lazy-seq 1 2
 clojure.core-test.minus 2 0
 clojure.core-test.mod 18 0
 clojure.core-test.neg-int-qmark 1 0
-clojure.core-test.not-eq 3 0
-clojure.core-test.num 2 0
+clojure.core-test.not-eq 1 0
+# num: the suite's :bb branch asserts (num nil) => nil (babashka leniency);
+# jolt throws like the JVM. The other numeric rows now match through :bb.
+clojure.core-test.num 0 1
 clojure.core-test.parse-uuid 3 0
 clojure.core-test.peek 1 0
 clojure.core-test.plus 11 0

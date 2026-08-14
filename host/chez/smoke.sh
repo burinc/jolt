@@ -160,6 +160,11 @@ check '(->> (range 10) (filter even?) (map (fn [x] (* x x))) (reduce +))' '120'
 check '(let [{:keys [a b] :or {b 99}} {:a 1}] [a b])' '[1 99]'
 check '(map inc [1 2 3])' '(2 3 4)'
 check '(require [clojure.string :as s]) (s/upper-case "hello")' '"HELLO"'
+# reader conditionals match :bb ahead of :clj (like babashka); clause order wins
+check '#?(:bb :bb-branch :clj :clj-branch)' ':bb-branch'
+check '#?(:clj :clj-first :bb :bb-second)' ':clj-first'
+# resolve returns the class for a class mapping, the var for a var
+check '[(class? (resolve (quote String))) (= (resolve (quote java.util.Map)) java.util.Map) (var? (resolve (quote map)))]' '[true true true]'
 # The source a binary serves for a namespace is jolt's own, not a same-named one
 # from a later install root — the vendored Grenadine ships a jolt.deps facade for
 # embedders. Roots are first-wins and the bake matches, but only for source: the

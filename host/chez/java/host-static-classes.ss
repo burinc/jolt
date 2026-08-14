@@ -2266,3 +2266,50 @@
 (for-each
   (lambda (nm) (def-var! "clojure.core" nm (jolt-class-for nm)))
   class-fqn-list)
+
+;; --- resolve/ns-resolve return the Class for a class mapping ------------------
+;; A JVM ns mapping is a var or a Class, and resolve hands back whichever the
+;; symbol names. jolt's base resolve (ns.ss) is var-only, so it re-registers here
+;; with two class-aware layers on top:
+;;   - a resolved var that IS the class model's registration for its own name —
+;;     a class-token var (String, java.lang.Long) or a deftype/defrecord name var
+;;     holding its ctor — resolves through to the class value. A user var that
+;;     merely holds a class ((def MyCls String)) keeps resolving to the var,
+;;     which is what the JVM's def would produce. The name must match the class
+;;     (FQN or simple), so ->Rec ctor vars stay vars.
+;;   - an unresolved symbol classifies exactly as the analyzer's
+;;     hc-resolve-global :class branches do, through the same jolt-class-for
+;;     interner, so (= (resolve 'X) X) holds for every class form: dotted names
+;;     (java.util.Map), registered short names (an :import), deftype simple names.
+(define (rsv-registration-class c)
+  (let* ((root (var-cell-root c))
+         (cn (cond ((jclass? root) (jclass-name root))
+                   ((procedure? root) (deftype-ctor-tag root))
+                   (else #f))))
+    (and cn
+         (let ((nm (var-cell-name c)))
+           (and (or (string=? nm cn) (string=? nm (hsc-last-segment cn)))
+                root)))))
+(define (rsv-class-for-name nm)
+  (cond ((hc-fq-class-name? nm) (jolt-class-for nm))
+        ((and (fx>? (string-length nm) 0) (char-upper-case? (string-ref nm 0)))
+         (cond ((host-class-has-statics? nm) (jolt-class-for nm))
+               ((chez-deftype-simple->tag nm) => jolt-class-for)
+               (else #f)))
+        (else #f)))
+(define (rsv-through v sym)
+  (cond ((jolt-nil? v)
+         (or (and (symbol-t? sym) (not (string? (symbol-t-ns sym)))
+                  (rsv-class-for-name (symbol-t-name sym)))
+             jolt-nil))
+        ((rsv-registration-class v))
+        (else v)))
+(def-var! "clojure.core" "resolve"
+  (case-lambda
+    ((sym) (rsv-through (jolt-resolve sym) sym))
+    ;; the &env arity: a local named sym answers nil, never a class
+    ((env sym) (if (and (pmap? env) (pmap-contains? env sym))
+                   jolt-nil
+                   (rsv-through (jolt-resolve env sym) sym)))))
+(def-var! "clojure.core" "ns-resolve"
+  (lambda (ns-desig sym) (rsv-through (jolt-ns-resolve ns-desig sym) sym)))

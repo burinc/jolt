@@ -104,8 +104,11 @@
       pkey `(instance-check ~pkey ~x)
       (and (symbol? t)
            (when-let [v (clojure.core/resolve t)]
-             (and (clojure.core/bound? v)
-                  (jolt.host/class-object? (clojure.core/var-get v)))))
+             ;; resolve hands back the class itself for a class mapping; a var
+             ;; may still hold one ((def C SomeClass) — resolve keeps the var).
+             (or (jolt.host/class-object? v)
+                 (and (clojure.core/bound? v)
+                      (jolt.host/class-object? (clojure.core/var-get v))))))
       `(instance-check ~t ~x)
       :else `(instance-check (quote ~t) ~x))))
 
