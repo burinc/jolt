@@ -67,6 +67,17 @@ conditionals match `:bb`, and `destroy-tree` actually destroys the tree.
 
 ### Fixed
 
+- **A `:blocking` foreign call resolved through a scoped handle keeps
+  collect-safety.** The scoped-resolution path introduced in this release built
+  the foreign procedure from the dlsym address without `__collect_safe`, so in
+  a process with any registered native handle every `:blocking` socket call
+  lost the convention on Linux (dlsym through a handle also resolves libc
+  symbols via its dependency scope). A garbage collection while one of them
+  blocked then waited forever, and every other thread parked behind it — a
+  silent, zero-CPU freeze of the whole VM, most likely on a first run with
+  cold caches, where compilation keeps the collector busy. Both resolution
+  branches now carry the convention, and the FFI gate asserts it in the
+  emitted code.
 - **Native libraries load scoped, and FFI symbol resolution is deterministic.**
   Chez resolves a foreign name against shared objects most-recently-loaded
   first, and re-loading the process-global handle re-promoted it — on macOS
