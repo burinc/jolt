@@ -111,11 +111,14 @@
         (hashtable-delete! type-registry k)
         (hashtable-delete! type-method-index k)))
     (hashtable-keys type-registry))
-  ;; a tag can reach the index without reaching the tree only if the two ever
-  ;; diverge; sweep it on the same rule so a leak cannot outlive the prune.
+  ;; a tag can reach a derived table without reaching the tree only if they ever
+  ;; diverge; sweep both on the same rule so a leak cannot outlive the prune.
   (vector-for-each
     (lambda (k) (unless (keep? k) (hashtable-delete! type-method-index k)))
-    (hashtable-keys type-method-index)))
+    (hashtable-keys type-method-index))
+  (vector-for-each
+    (lambda (k) (unless (keep? k) (hashtable-delete! type-class-memo k)))
+    (hashtable-keys type-class-memo)))
 ;; Global protocol epoch: bumped on EVERY register-protocol-method. A per-site
 ;; inline cache (the PIC the back end emits) tags itself with the epoch at
 ;; populate time; a later extension (a new bump) invalidates it so a cached
@@ -202,7 +205,7 @@
 ;; (instance? clojure.lang.ILookup x), (instance? some.ns.SomeProtocol x). Exact
 ;; first (a host-interface key is spelled the same), then match each of the type's
 ;; protocol keys as an interface name.
-(define (type-implements-class? type-tag qname)
+(define (type-implements-class?-uncached type-tag qname)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti
          (or (and (hashtable-ref ti qname #f) #t)
@@ -211,6 +214,32 @@
                  (and (fx< i n)
                       (or (proto-class-match? (vector-ref ks i) qname)
                           (loop (fx+ i 1))))))))))
+;; …and memoized per (type-tag, class-name), because that walk is not cheap and
+;; instance? asks it repeatedly with the same pair. Every candidate key is run
+;; through proto-class-match?, which re-derives BOTH sides' interface names —
+;; string munging and allocation per protocol, per call — on top of the usual
+;; snapshot-under-the-mutex. Measured at 1.8us per (instance? SomeProtocol x)
+;; against 140ns for satisfies? answering the same question.
+;;
+;; Guarded by the same epoch pair as the descriptor ifc cache: an extend-type can
+;; add a protocol and a class registration can change what an interface name
+;; resolves to, and both only ever increase. Nested tag -> qname -> (epoch . bool)
+;; so a hit is two refs and no allocation.
+(define type-class-memo (make-hashtable string-hash string=?))
+(define type-class-memo-mu (make-mutex))
+(define (type-implements-class? type-tag qname)
+  (let* ((epoch (jrdesc-ifc-epoch))
+         (inner (hashtable-ref type-class-memo type-tag #f))
+         (hit (and inner (hashtable-ref inner qname #f))))
+    (if (and hit (fx=? (car hit) epoch))
+        (cdr hit)
+        (let ((v (type-implements-class?-uncached type-tag qname)))
+          (jolt-with-mutex type-class-memo-mu
+            (let ((i2 (or (hashtable-ref type-class-memo type-tag #f)
+                          (let ((h (make-hashtable string-hash string=?)))
+                            (hashtable-set! type-class-memo type-tag h) h))))
+              (hashtable-set! i2 qname (cons epoch v))))
+          v))))
 ;; True when a deftype/record/reify instance DECLARES a method by this name (an
 ;; inline protocol impl), so clojure.core can prefer it over generic collection
 ;; behavior — e.g. (empty priority-map) must use the type's own empty, not return

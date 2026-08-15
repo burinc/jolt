@@ -1284,7 +1284,11 @@
   (vector-for-each
     (lambda (k)
       (unless (keep? k) (hashtable-delete! type-method-index k)))
-    (hashtable-keys type-method-index)))
+    (hashtable-keys type-method-index))
+  (vector-for-each
+    (lambda (k)
+      (unless (keep? k) (hashtable-delete! type-class-memo k)))
+    (hashtable-keys type-class-memo)))
 
 (define jolt-proto-epoch 0)
 
@@ -1365,7 +1369,7 @@
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti (hashtable-ref ti proto #f) #t)))
 
-(define (type-implements-class? type-tag qname)
+(define (type-implements-class?-uncached type-tag qname)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti
          (or (and (hashtable-ref ti qname #f) #t)
@@ -1375,6 +1379,27 @@
                  (and (fx< i n)
                       (or (proto-class-match? (vector-ref ks i) qname)
                           (loop (fx+ i 1))))))))))
+
+(define type-class-memo
+  (make-hashtable string-hash string=?))
+
+(define type-class-memo-mu (make-mutex))
+
+(define (type-implements-class? type-tag qname)
+  (let* ((epoch (jrdesc-ifc-epoch))
+         (inner (hashtable-ref type-class-memo type-tag #f))
+         (hit (and inner (hashtable-ref inner qname #f))))
+    (if (and hit (fx=? (car hit) epoch))
+        (cdr hit)
+        (let ((v (type-implements-class?-uncached type-tag qname)))
+          (jolt-with-mutex
+            type-class-memo-mu
+            (let ((i2 (or (hashtable-ref type-class-memo type-tag #f)
+                          (let ((h (make-hashtable string-hash string=?)))
+                            (hashtable-set! type-class-memo type-tag h)
+                            h))))
+              (hashtable-set! i2 qname (cons epoch v))))
+          v))))
 
 (def-var!
   "jolt.host"

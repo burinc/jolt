@@ -1727,6 +1727,13 @@
   ;; a keyword has no Scheme reading — macroexpansion refuses it
   {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (try (eval '(jolt.scheme/scheme (list :kw))) :no-throw (catch Exception e :threw)))" :expected ":threw"}
 
+  ;; instance? on a protocol is memoized per (type, class-name) under the proto
+  ;; epoch — an extend-protocol AFTER the first query must flip the answer, not
+  ;; serve the cached false.
+  {:suite "records" :label "instance? sees a later extend-protocol"
+   :expr "(do (defprotocol MemoP (mp [_])) (deftype MemoT [v]) (let [t (->MemoT 1) before (instance? user.MemoP t)] (extend-protocol MemoP MemoT (mp [_] 2)) [before (instance? user.MemoP t) (satisfies? MemoP t) (mp t)]))"
+   :expected "[false true true 2]"}
+
   ;; a wrong-arity positional-ctor call is an ArityException naming the ctor var
   ;; (JVM: "Wrong number of args (N) passed to: ns/->Name"); unit-only because the
   ;; certify oracle's eval context munges the JVM-side ctor name.
