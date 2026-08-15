@@ -5,6 +5,92 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.13] - 2026-08-15
+
+A performance patch. A structural sweep hunted the runtime, stdlib, and
+interop layer for super-linear algorithms on user-reachable paths; every
+confirmed one is fixed below, and each fix ships with a CI gate that
+measures the complexity shape in-process, so none of them can quietly
+come back. The browser REPL also boots again.
+
+### Fixed
+
+- **The Gambit web REPL boots again.** Runtime work in recent releases
+  had broken every freshly built JS bundle at boot: the keyword interner
+  started taking its table lock through `jolt-with-mutex`, a Chez macro
+  the Gambit shims never defined, so the bundle died at the first keyword
+  intern (and the failure looked like a silent hang in the worker). The
+  shim exists now and is reentrant — Chez mutexes are recursive,
+  SRFI-18's are not — and the Gambit var-cell record caught up with the
+  Chez layout it had drifted two versions behind (`^:dynamic` seed vars
+  bound instead of throwing non-dynamic). A new `gambitboot` gate runs
+  the full-profile boot on gsi so a Chez-only name reaching shared code
+  fails CI instead of shipping a hung REPL.
+
+### Performance
+
+- **Printing a collection is linear in the output.** The join under both
+  printers was a right-fold of `string-append`, so every element's copy
+  cost was the whole remaining suffix — `pr-str` of a 16k-element vector
+  went from 104ms to 10ms, and the same fix covers records, sorted
+  collections, and the Gambit host.
+
+- **Piped streams write in O(1) per chunk.** The pipe buffer was a plain
+  list re-copied on every write, under the pipe mutex — the
+  `ring.util.io/piped-input-stream` path. 8k chunks: 122ms to 15ms, and
+  `.available` is a running counter now.
+
+- **`chunk-buffer` appends in O(1)** (a vector sized by cap plus a fill
+  count; filling one was O(n²) with the cap argument ignored). 16k
+  appends: 500ms to 1ms. Appending past cap grows — the JVM throws
+  there; growth is the documented jolt superset.
+
+- **Reader drains are linear.** `read-line` and `read` under
+  `with-in-str` (and `*in*`) re-copied — and `read` re-parsed — the whole
+  remaining input per item. The readers keep a cursor now; draining 8k
+  lines went from 888ms to 9ms.
+
+- **`clojure.test` starts running bodies immediately.** The run loop
+  re-filtered the whole registered-test list once per namespace, and
+  `run-all-tests` re-scanned the registry per loaded namespace —
+  O(namespaces × tests) before a single assertion ran. Grouped once now,
+  registration order preserved.
+
+- **`refer`, `:use`, `ns-publics`, `ns-map`, and `all-ns` stopped
+  scanning the image.** Each call walked every interned var in the
+  process, so one `(:use …)` cost O(total vars) and a program load paid
+  it per namespace. The var table now keeps a per-namespace index in
+  lockstep; a three-var namespace's `ns-publics` costs the same whether
+  the image holds a hundred vars or a hundred thousand.
+
+- **`clojure.set/intersection` walks its smaller argument** (the
+  reference's swap): intersecting a 100k-element set with a 3-element
+  one cost the big side — measured 25930ms vs 1ms across 200 calls —
+  and now costs the small one.
+
+- **Deque interop is O(1) at the front.** `ArrayDeque`/`LinkedList`
+  `poll`/`pop`/`removeFirst`/`addFirst`/`push` shifted the whole backing
+  array, so the standard worklist idiom (and tools.reader's
+  `.remove(0)`) was quadratic; the backing carries a head offset now.
+  `StringTokenizer` iterates in O(1) per token instead of O(tokens).
+
+- **core.async `timeout` arming is O(log pending)** — a binary min-heap
+  replaces the sorted-list insert that made arming a burst of k timers
+  O(k²). `.split` with a positive limit no longer recounts its output
+  per part, `ReferenceQueue` and the main-thread job queue enqueue by
+  cons, and `cl-format` reuses its compiled format string across calls
+  instead of recompiling per call (`pprint`'s per-character buffer
+  measure is O(1) too).
+
+### Internal
+
+- Six new scaling gates in CI — `pipescaling`, `chunkscaling`,
+  `printscaling`, `ioscaling`, `hotscaling`, `gambitboot` — plus a
+  linearity pin on the tree-shaker's reachability walk. All measure a
+  shape inside one process (1x-vs-4x ratios or shape independence),
+  never an absolute time, so they judge the algorithm and not the
+  machine.
+
 ## [0.7.12] - 2026-08-15
 
 Fibers are a public API now, Scheme is one require away, and the class
