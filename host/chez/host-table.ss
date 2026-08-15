@@ -218,11 +218,9 @@
 ;; sorted-map prints "{k v, k v}" (", " between pairs) like the pmap arm.
 (define (sorted-map-render sc render)
   (string-append "{"
-    (let loop ((es (seq->list (sc-call sc kw-op-seq))) (first #t) (acc ""))
-      (if (null? es) acc
-          (loop (cdr es) #f
-                (string-append acc (if first "" ", ")
-                               (render (jolt-nth (car es) 0)) " " (render (jolt-nth (car es) 1))))))
+    (jolt-str-join-comma
+      (map (lambda (e) (string-append (render (jolt-nth e 0)) " " (render (jolt-nth e 1))))
+           (seq->list (sc-call sc kw-op-seq))))
     "}"))
 (define (sorted-set-render sc render)
   (string-append "#{" (jolt-str-join (map render (seq->list (sc-call sc kw-op-seq)))) "}"))

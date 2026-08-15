@@ -243,16 +243,20 @@
               records)
     (values edges roots)))
 
-;; Closure of roots over edges -> a reached set (hashtable fqn -> #t).
+;; Closure of roots over edges -> a reached set (hashtable fqn -> #t). The append
+;; copies only the visited node's OWN edge list and shares (cdr work) — append
+;; copies every argument but its last — so the walk is O(V+E) total. New work
+;; goes in front, so the order is depth-first; order is irrelevant to the closure.
+;; Linearity is pinned by the scaling check in run-dce-refs.ss.
 (define (dce-reachable edges roots)
   (let ((reached (make-hashtable string-hash string=?)))
-    (let bfs ((work roots))
+    (let dfs ((work roots))
       (unless (null? work)
         (let ((fq (car work)))
           (if (hashtable-ref reached fq #f)
-              (bfs (cdr work))
+              (dfs (cdr work))
               (begin (hashtable-set! reached fq #t)
-                     (bfs (append (or (hashtable-ref edges fq #f) '()) (cdr work))))))))
+                     (dfs (append (or (hashtable-ref edges fq #f) '()) (cdr work))))))))
     reached))
 
 (define (dce-rec-reached? r reached)

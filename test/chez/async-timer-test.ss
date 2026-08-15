@@ -43,7 +43,9 @@
 ;; Read the timer's state the way the timer writes it. The entry for a closed
 ;; channel is removed under timeout-mu BEFORE the mutex drops, so by the time a
 ;; take has returned and this can acquire it, a fired timeout is already gone.
-(define (pending-count) (jolt-with-mutex timeout-mu (length timeout-pending)))
+;; the pending store is a binary min-heap now (async.ss timeout-heap); its live
+;; count is the heap fill, read under the same lock as before.
+(define (pending-count) (jolt-with-mutex timeout-mu timeout-heap-n))
 
 (printf "== the shared (timeout ms) timer ==\n")
 

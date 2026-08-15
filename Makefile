@@ -56,7 +56,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling vecscaling \
+  readscaling vecscaling pipescaling chunkscaling printscaling ioscaling hotscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
   gateboot gatebootsmoke gosm httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
@@ -116,7 +116,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling depssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling ioscaling hotscaling depssmoke depscpcache depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
@@ -124,7 +124,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscali
   inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck lockcheck parkcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
-  certify gambitcheck gambitgencheck grenadinecheck fibers gosm asynctimer threadsafety
+  certify gambitcheck gambitgencheck gambitboot grenadinecheck fibers gosm asynctimer threadsafety
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -376,6 +376,37 @@ readscaling: testbin
 # rrbscaling; this catches core falling back to an element-by-element rebuild.
 vecscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/vec_scaling_test.clj
+
+# A piped-stream write costs O(1), not O(chunks-queued): the jpipe buffer was a
+# plain list re-copied per write, so piping N chunks cost O(N^2) cons work under
+# the pipe mutex (the ring.util.io/piped-input-stream path). 1x-vs-4x in-process
+# ratio, like readscaling.
+pipescaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/pipe_scaling_test.clj
+
+# chunk-append (the clojure.core chunk-builder API) costs O(1) amortized per
+# item, not O(items-buffered) — filling a chunk-buffer was O(n^2) via a
+# re-copied item list, and the cap argument was ignored.
+chunkscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/chunk_scaling_test.clj
+
+# Printing a collection costs O(printed length): jolt-str-join was a right-fold
+# of string-append (each element re-copied the whole joined suffix), on every
+# pr-str/str/prn of any collection, record, or sorted coll.
+printscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/print_scaling_test.clj
+
+# Draining *in* / with-in-str by lines or forms costs O(input), not
+# O(input x items): the IReader buffer atoms re-copied (and read re-parsed) the
+# whole remaining input per item until the [string offset] cursor rework.
+ioscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/io_scaling_test.clj
+
+# The 2026-08 sweep's remaining hot-path shapes in one gate: split-with-limit,
+# core.async timeout arming, ArrayDeque/StringTokenizer draining, ns-publics/
+# refer var-table independence, set/intersection smaller-side walk.
+hotscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/hotpath_scaling_test.clj
 
 # deps.edn alias + CLI semantics (tools.deps args-map keys, -X/-T/-Sdeps, the
 # user deps.edn chain, jar/git coordinates) through the real CLI, over local
@@ -792,6 +823,23 @@ gambitprofile:
 		"$(GAMBIT_GSI)" host/gambit/profile-test.ss; \
 	else \
 		echo "gambitprofile: gambit-scheme not installed (brew) — skipped"; \
+	fi
+
+# The full-profile boot comes up on gsi: the js and gsi targets share the boot,
+# and NOTHING else runs its top level end to end — the shipped web REPL hung at
+# boot for a week of commits (unbound jolt-with-mutex at the first keyword
+# intern) while every other gambit gate stayed green. Skipped, like the other
+# gambit gates, when gambit-scheme is absent.
+gambitboot:
+	@if [ -x "$(GAMBIT_GSI)" ]; then \
+	  $(CHEZ) --script host/gambit/gen-boot.ss full; \
+	  out=$$(cd host/gambit && "$(GAMBIT_GSI)" boot-probe.scm < /dev/null 2>&1); \
+	  case "$$out" in \
+	    *BOOT-OK*) echo "gambitboot: full-profile boot OK on gsi";; \
+	    *) printf '%s\n' "$$out" | tail -20; echo "gambitboot: FAILED — full-profile boot did not reach BOOT-OK" >&2; exit 1;; \
+	  esac; \
+	else \
+	  echo "gambitboot: gambit-scheme not installed (brew) — skipped"; \
 	fi
 
 # The browser bundle: the whole stack (kernel + seed + compiler + a queue-polling

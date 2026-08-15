@@ -1605,7 +1605,22 @@
 
 (define jolt-main-queue-mu (make-mutex))
 (define jolt-main-queue-cv (make-condition))
-(define jolt-main-queue '())            ; FIFO of jolt-main-job, guarded by mu
+;; FIFO of jolt-main-job as a front/rear two-list queue, guarded by mu: enqueue
+;; is one cons where a single list re-copied per (append q (list j)) cost
+;; O(depth) under the mutex. Callers hold jolt-main-queue-mu for both ops.
+(define jolt-main-queue '())            ; dequeue end, oldest first
+(define jolt-main-queue-rear '())       ; enqueue end, newest first
+(define (jolt-main-enqueue! j)
+  (set! jolt-main-queue-rear (cons j jolt-main-queue-rear)))
+;; next job or #f, rebalancing rear->front when the front drains.
+(define (jolt-main-dequeue!)
+  (when (and (null? jolt-main-queue) (pair? jolt-main-queue-rear))
+    (set! jolt-main-queue (reverse jolt-main-queue-rear))
+    (set! jolt-main-queue-rear '()))
+  (and (not (null? jolt-main-queue))
+       (let ((j (car jolt-main-queue)))
+         (set! jolt-main-queue (cdr jolt-main-queue))
+         j)))
 (define jolt-main-pump-active (box #f)) ; #t while run-main-pump owns this thread
 (define jolt-main-pump-stop (box #f))   ; set by stop-main-pump to drain + exit
 ;; thread-local: this thread is the pump, mid-thunk → nested calls run inline.
@@ -1626,7 +1641,7 @@
                    (and (unbox jolt-main-pump-active)
                         (let ((j (make-jolt-main-job thunk #f #f jolt-nil
                                                      (make-mutex) (make-condition))))
-                          (set! jolt-main-queue (append jolt-main-queue (list j)))
+                          (jolt-main-enqueue! j)
                           (condition-signal jolt-main-queue-cv)
                           j)))))
         (if (not job)
@@ -1656,7 +1671,7 @@
                    (and (unbox jolt-main-pump-active)
                         (let ((j (make-jolt-main-job thunk #f #f jolt-nil
                                                      (make-mutex) (make-condition))))
-                          (set! jolt-main-queue (append jolt-main-queue (list j)))
+                          (jolt-main-enqueue! j)
                           (condition-signal jolt-main-queue-cv)
                           #t)))))
         (unless enq (jolt-invoke thunk))
@@ -1700,11 +1715,7 @@
     (lambda () #f)
     (lambda ()
       (let loop ()
-        (let ((job (jolt-with-mutex jolt-main-queue-mu
-                     (and (not (null? jolt-main-queue))
-                          (let ((j (car jolt-main-queue)))
-                            (set! jolt-main-queue (cdr jolt-main-queue))
-                            j)))))
+        (let ((job (jolt-with-mutex jolt-main-queue-mu (jolt-main-dequeue!))))
           (if job
               ;; run the job on THIS (main) thread — a UI event loop blocks here
               ;; for its lifetime; the mutex is released so other threads keep
@@ -1743,10 +1754,7 @@
         (let ((job (jolt-with-mutex jolt-main-queue-mu
                      (let wait ()
                        (cond
-                         ((not (null? jolt-main-queue))
-                          (let ((j (car jolt-main-queue)))
-                            (set! jolt-main-queue (cdr jolt-main-queue))
-                            j))
+                         ((jolt-main-dequeue!) => values)
                          ((unbox jolt-main-pump-stop)
                           ;; drain done, told to exit — clear active in the same
                           ;; critical section so no job can be enqueued after.

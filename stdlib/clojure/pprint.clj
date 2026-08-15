@@ -267,10 +267,19 @@
       :else (recur (:parent child)))))
 
 (defn- buffer-length [l]
-  (let [l (seq l)]
-    (if l
-      (- (:end-pos (last l)) (:start-pos (first l)))
-      0)))
+  ;; l is usually the token VECTOR (write-line rebuilds it with (into [] ...)),
+  ;; where peek is O(1) — and tokens-fit? runs this on every appended token, so
+  ;; (last l) was a margin-sized walk on every pprint character. linear-nl?
+  ;; also passes tail SECTIONS as seqs; those take the walking branch, as
+  ;; before (peek on a seq is not defined).
+  (if (vector? l)
+    (if (pos? (count l))
+      (- (:end-pos (peek l)) (:start-pos (nth l 0)))
+      0)
+    (let [l (seq l)]
+      (if l
+        (- (:end-pos (last l)) (:start-pos (first l)))
+        0))))
 
 (deftype buffer-blob :data :trailing-white-space :start-pos :end-pos)
 (deftype nl-t :type :logical-block :start-pos :end-pos)
@@ -738,6 +747,7 @@
 ;;======================================================================
 
 (declare ^{:arglists '([format-str])} compile-format)
+(declare ^{:arglists '([format-str])} cached-compile)
 (declare ^{:arglists '([stream format args] [format args])} execute-format)
 (declare ^{:arglists '([s])} init-navigator)
 
@@ -745,7 +755,11 @@
   "A Common Lisp compatible format function. If writer is nil, returns the
   formatted string; if true, prints to *out*; otherwise writes to writer."
   [writer format-in & args]
-  (let [compiled-format (if (string? format-in) (compile-format format-in) format-in)
+  ;; cached-compile, not compile-format: compiling a directive-dense format
+  ;; string is O(length^2) in subs copies, and a cl-format in a loop re-paid it
+  ;; per call. The memo already existed for the formatter macros; route the
+  ;; function through it too.
+  (let [compiled-format (if (string? format-in) (cached-compile format-in) format-in)
         navigator (init-navigator args)]
     (execute-format writer compiled-format navigator)))
 

@@ -110,6 +110,71 @@
            (loop-refs (cdr refs)))
            (else (loop-refs (cdr refs))))))))
 
+;; --- dce-reachable: closure correctness + linear scaling ---------------------
+;; Correctness on a small graph with a diamond (a->b->d, a->c->d) and a back edge
+;; (d->a): every node reached once, and the cycle terminates instead of looping.
+(let ((edges (make-hashtable string-hash string=?)))
+  (hashtable-set! edges "a" '("b" "c"))
+  (hashtable-set! edges "b" '("d"))
+  (hashtable-set! edges "c" '("d"))
+  (hashtable-set! edges "d" '("a"))
+  (let ((r (dce-reachable edges '("a"))))
+    (gate-check "reachable: diamond+cycle closure" (hashtable-size r) 4)
+    (gate-check "reachable: leaf node reached" (hashtable-ref r "d" #f) #t))
+  (let ((r2 (dce-reachable edges '("d" "zz"))))
+    (gate-check "reachable: root without edges still reached" (hashtable-ref r2 "zz" #f) #t)
+    (gate-check "reachable: cycle back-edge closure" (hashtable-size r2) 5)))
+
+;; Scaling: the walk must stay O(V+E) — in particular, INDEPENDENT of the live
+;; work-list length. A wide graph (root -> V children, each child -> sink) keeps
+;; V entries on the work list; a chain of 2V nodes keeps ~1. Node and edge
+;; counts are comparable, so a correct walk costs the same on both (ratio ~1,
+;; and cache/GC pressure cancels out — a plain 1x-vs-4x size ratio measured
+;; 6-8x here from memory effects alone). A bad rewrite that copies the
+;; REMAINING work per visit is O(work-list^2): ~V^2/2 copies on the wide graph
+;; and nothing extra on the chain, so the ratio explodes (~250x at this V).
+;; Judged best-of-3 within this one process; V is small enough that a REGRESSED
+;; walk (~112M copies) still finishes and fails rather than hanging the gate.
+(define (dce-gate-wide-graph v)
+  (let ((edges (make-hashtable string-hash string=?)))
+    (hashtable-set! edges "root"
+      (let loop ((i 0) (acc '()))
+        (if (fx=? i v) acc (loop (fx+ i 1) (cons (string-append "c" (number->string i)) acc)))))
+    (let loop ((i 0))
+      (unless (fx=? i v)
+        (hashtable-set! edges (string-append "c" (number->string i)) (list "sink"))
+        (loop (fx+ i 1))))
+    edges))
+(define (dce-gate-chain-graph n)
+  (let ((edges (make-hashtable string-hash string=?)))
+    (let loop ((i 0))
+      (unless (fx=? i n)
+        (hashtable-set! edges (string-append "c" (number->string i))
+                        (list (string-append "c" (number->string (fx+ i 1)))))
+        (loop (fx+ i 1))))
+    edges))
+;; No explicit GC before timing (collect is Chez-only and portcheck-blocked):
+;; a collection landing inside one run is absorbed by the best-of-3 minimum.
+(define (dce-gate-reach-ms edges root want)
+  (let ((t0 (current-time 'time-monotonic)))
+    (let ((r (dce-reachable edges (list root))))
+      (let ((t1 (current-time 'time-monotonic)))
+        (gate-check "reachable: closure size" (hashtable-size r) want)
+        (+ (* 1000.0 (- (time-second t1) (time-second t0)))
+           (/ (- (time-nanosecond t1) (time-nanosecond t0)) 1000000.0))))))
+(define (dce-gate-best-of k thunk)
+  (let loop ((i 1) (best (thunk)))
+    (if (fx=? i k) best (loop (fx+ i 1) (min best (thunk))))))
+(let* ((v1 15000)
+       (wide (dce-gate-wide-graph v1))          ; v1+2 nodes, work list ~v1 deep
+       (chain (dce-gate-chain-graph (* 2 v1)))  ; 2*v1+1 nodes, work list ~1 deep
+       (tw (dce-gate-best-of 3 (lambda () (dce-gate-reach-ms wide "root" (+ v1 2)))))
+       (tc (max 0.05 (dce-gate-best-of 3 (lambda () (dce-gate-reach-ms chain "c0" (+ (* 2 v1) 1))))))
+       (ratio (/ tw tc)))
+  (printf "dce-reachable work-list independence: wide ~ams, chain ~ams, ratio ~a (independent ~~1, work-list-copying ~~250, ceiling 5)\n"
+          tw tc ratio)
+  (gate-check "reachable: cost independent of work-list depth" (<= ratio 5.0) #t))
+
 ;; --- dce-bail-refs / dce-compile-refs existence gate -------------------------
 ;; Every name in the hand-maintained bail/compile lists must resolve to a runtime
 ;; binding. A stale entry (one that no longer exists in the runtime) fails here

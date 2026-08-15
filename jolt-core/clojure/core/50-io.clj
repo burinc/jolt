@@ -9,9 +9,12 @@
 ;; over one atom-held buffer, so (read) consumes its form and a following
 ;; (read-line) returns the REST of that line — as in Clojure.
 ;;
-;; Forms are parsed by the host seam __parse-next (one form + the rest of the
-;; string, nil when only whitespace remains). Known wart shared with that
-;; contract: input that is only a comment reads as nil rather than EOF.
+;; Forms are parsed by the host seam __parse-next-from (one form + the index
+;; just past it, nil when only whitespace remains). The readers hold a CURSOR
+;; into their input rather than the shrinking rest of the string: re-copied
+;; tails made line/form drains O(input x items) (`make ioscaling` gates the
+;; shape). Known wart shared with the parse contract: input that is only a
+;; comment reads as nil rather than EOF.
 
 (def ^:private reader-eof :jolt/reader-eof)
 
@@ -30,65 +33,76 @@
 (defn __string-reader
   "A reader over string s (the with-in-str expansion calls this)."
   [s]
-  (let [buf (atom s)]
+  (let [pos (atom 0)]
     (reify IReader
       (-read-line [_]
-        (let [cur @buf]
-          (when (pos? (count cur))
-            (let [i (str-find "\n" cur)]
+        (let [p @pos]
+          (when (< p (count s))
+            (let [i (str-find "\n" s p)]
               (if (nil? i)
-                (do (reset! buf "") cur)
-                (do (reset! buf (subs cur (inc i))) (subs cur 0 i)))))))
+                (do (reset! pos (count s)) (subs s p))
+                (do (reset! pos (inc i)) (subs s p i)))))))
       (-read-form [_]
-        (let [r (__parse-next @buf)]
+        (let [r (__parse-next-from s @pos)]
           (if (nil? r)
             reader-eof
-            (do (reset! buf (nth r 1)) (nth r 0)))))
+            (do (reset! pos (nth r 1)) (nth r 0)))))
       (-read+string [_ eof-error? eof-value]
-        (let [s @buf
-              r (__parse-next s)]
+        (let [p @pos
+              r (__parse-next-from s p)]
           (if (nil? r)
             (if eof-error?
               (throw (ex-info "EOF while reading" {}))
               [eof-value ""])
-            (do (reset! buf (nth r 1))
-                [(nth r 0) (subs s 0 (- (count s) (count (nth r 1))))])))))))
+            (do (reset! pos (nth r 1))
+                [(nth r 0) (subs s p (nth r 1))])))))))
 
-;; Real stdin, with a leftover buffer shared by read and read-line.
-(def ^:private stdin-buf (atom ""))
+;; Real stdin: a leftover [buffer cursor] shared by read and read-line. When a
+;; parse needs another line, the consumed prefix is dropped as the line is
+;; appended, so the buffer only ever holds the unread tail — a single form
+;; still arriving pays a copy and a re-parse per line (the parse seam is not
+;; incremental), but cost is bounded by that form, never the whole session.
+(def ^:private stdin-buf (atom ["" 0]))
 
 (def ^:dynamic *in*
   (reify IReader
     (-read-line [_]
-      (let [cur @stdin-buf]
-        (if (pos? (count cur))
-          (let [i (str-find "\n" cur)]
+      (let [sp @stdin-buf
+            s (nth sp 0)
+            p (nth sp 1)]
+        (if (< p (count s))
+          (let [i (str-find "\n" s p)]
             (if (nil? i)
-              (do (reset! stdin-buf "") cur)
-              (do (reset! stdin-buf (subs cur (inc i))) (subs cur 0 i))))
+              (do (reset! stdin-buf ["" 0]) (subs s p))
+              (do (reset! stdin-buf [s (inc i)]) (subs s p i))))
           (__stdin-read-line))))
     (-read-form [_]
       (loop []
-        (let [r (__parse-next @stdin-buf)]
+        (let [sp @stdin-buf
+              s (nth sp 0)
+              p (nth sp 1)
+              r (__parse-next-from s p)]
           (if (nil? r)
             (let [line (__stdin-read-line)]
               (if (nil? line)
                 reader-eof
-                (do (swap! stdin-buf (fn [b] (str b line "\n"))) (recur))))
-            (do (reset! stdin-buf (nth r 1)) (nth r 0))))))
+                (do (reset! stdin-buf [(str (subs s p) line "\n") 0]) (recur))))
+            (do (reset! stdin-buf [s (nth r 1)]) (nth r 0))))))
     (-read+string [_ eof-error? eof-value]
       (loop []
-        (let [s @stdin-buf
-              r (__parse-next s)]
+        (let [sp @stdin-buf
+              s (nth sp 0)
+              p (nth sp 1)
+              r (__parse-next-from s p)]
           (if (nil? r)
             (let [line (__stdin-read-line)]
               (if (nil? line)
                 (if eof-error?
                   (throw (ex-info "EOF while reading" {}))
                   [eof-value ""])
-                (do (swap! stdin-buf (fn [b] (str b line "\n"))) (recur))))
-            (do (reset! stdin-buf (nth r 1))
-                [(nth r 0) (subs s 0 (- (count s) (count (nth r 1))))])))))))
+                (do (reset! stdin-buf [(str (subs s p) line "\n") 0]) (recur))))
+            (do (reset! stdin-buf [s (nth r 1)])
+                [(nth r 0) (subs s p (nth r 1))])))))))
 
 (defn read-line
   "Reads the next line from the stream that is the current value of *in*.

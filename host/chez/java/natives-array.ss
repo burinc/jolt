@@ -172,10 +172,31 @@
 ;; appended items, chunk seals them into a pvec chunk, and chunk-cons prepends that
 ;; chunk onto a rest seq as a real ChunkedCons (cseq-chunked) — empty chunk == just
 ;; the rest, like clojure.core/chunk-cons.
-(define-record-type jolt-chunkbuf (fields (mutable items)) (nongenerative jolt-chunkbuf-v1))
-(define (na-chunk-buffer cap) (make-jolt-chunkbuf '()))
-(define (na-chunk-append b x) (jolt-chunkbuf-items-set! b (append (jolt-chunkbuf-items b) (list x))) b)
-(define (na-chunk b) (make-pvec (list->vector (jolt-chunkbuf-items b))))
+;; The buffer is a vector sized by cap (32 everywhere in core) + a fill count, so
+;; an append is one vector-set! — it was a per-item (append items (list x)) list
+;; copy, O(n^2) over a chunk's life with cap ignored (`make chunkscaling` gates
+;; the shape). Appends past cap grow the vector: the JVM ChunkBuffer throws
+;; there, and growing is the documented jolt superset (test/chez/unit.edn
+;; "chunk-builder overflow"). Sealing copies, so the buffer stays appendable
+;; after chunk — matching the list implementation, where the JVM nulls it.
+(define-record-type jolt-chunkbuf (fields (mutable vec) (mutable cnt)) (nongenerative jolt-chunkbuf-v2))
+(define (na-chunk-buffer cap)
+  (make-jolt-chunkbuf (make-vector (if (and (fixnum? cap) (fx>? cap 0)) cap 32)) 0))
+(define (na-chunk-append b x)
+  (let ((v (jolt-chunkbuf-vec b)) (n (jolt-chunkbuf-cnt b)))
+    (let ((v (if (fx=? n (vector-length v))
+                 (let ((w (make-vector (fx* 2 n))))
+                   (let copy ((i 0)) (when (fx<? i n) (vector-set! w i (vector-ref v i)) (copy (fx+ i 1))))
+                   (jolt-chunkbuf-vec-set! b w)
+                   w)
+                 v)))
+      (vector-set! v n x)
+      (jolt-chunkbuf-cnt-set! b (fx+ n 1))))
+  b)
+(define (na-chunk b)
+  (let* ((n (jolt-chunkbuf-cnt b)) (v (jolt-chunkbuf-vec b)) (out (make-vector n)))
+    (let copy ((i 0)) (when (fx<? i n) (vector-set! out i (vector-ref v i)) (copy (fx+ i 1))))
+    (make-pvec out)))
 (define (na-chunk-cons chunk rest)
   (if (fx=? 0 (pvec-count chunk)) rest (cseq-chunked chunk 0 rest)))
 

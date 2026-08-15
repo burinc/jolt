@@ -1430,8 +1430,18 @@
                                  (substring nm 1 (string-length nm)) nm)))
                   (jolt-throw (jolt-ex-info (string-append "No reader function for tag " bare) empty-pmap))))))))
 
+;; The jolt seam for rdr-parse-at: [form next-index] at an index into s, or nil
+;; when only whitespace/comments remain. The IReader cursors in clojure.core
+;; (50-io.clj) read at their offset through this, so draining a string form by
+;; form stays linear — __parse-next below returns [form rest-of-string] and
+;; copies the whole remaining input per call; it is kept for compatibility.
+(define (jolt-parse-next-from s i)
+  (let ((r (rdr-parse-at s i)))
+    (if r (jolt-vector (car r) (cdr r)) jolt-nil)))
+
 (def-var! "clojure.core" "read-string" jolt-read-string)
 (def-var! "clojure.core" "__parse-next" jolt-parse-next)
+(def-var! "clojure.core" "__parse-next-from" jolt-parse-next-from)
 (def-var! "clojure.core" "__read-tagged" jolt-read-tagged)
 ;; __read-form-raw: the read form WITHOUT building values — set/tagged literals
 ;; stay FORMS. clojure.edn reads this so it applies a #tag through its :readers/

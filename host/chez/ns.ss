@@ -223,7 +223,9 @@
 (define (jolt-all-ns)
   (let ((seen (make-hashtable string-hash string=?)))
     (vector-for-each (lambda (k) (hashtable-set! seen k #t)) (ns-registry-names))
-    (vector-for-each (lambda (c) (hashtable-set! seen (var-cell-ns c) #t)) (var-table-cells))
+    ;; the ns-cells index's keys ARE the namespaces with interned vars — the
+    ;; whole-table cell scan this replaces cost O(total vars) per all-ns call
+    (vector-for-each (lambda (k) (hashtable-set! seen k #t)) (ns-index-names))
     (list->cseq (map intern-ns! (vector->list (hashtable-keys seen))))))
 
 ;; ns-publics / ns-map / ns-interns: a {sym -> var-cell} jolt map built by scanning
@@ -234,12 +236,14 @@
   (let ((m (var-cell-meta c)))
     (and m (jolt-truthy? (jolt-get m (keyword #f "private"))))))
 (define (ns-vars-pmap-when nm keep?)
+  ;; the namespace's own bucket (rt.ss ns-cells-index): O(vars in nm), where a
+  ;; var-table-cells scan cost O(every var in the image) per call
   (let ((m (jolt-hash-map)))
-    (vector-for-each
+    (for-each
       (lambda (c)
-        (when (and (string=? (var-cell-ns c) nm) (var-cell-defined? c) (keep? c))
+        (when (and (var-cell-defined? c) (keep? c))
           (set! m (jolt-assoc m (jolt-symbol #f (var-cell-name c)) c))))
-      (var-table-cells))
+      (ns-cells-list nm))
     m))
 (define (ns-vars-pmap nm) (ns-vars-pmap-when nm (lambda (c) #t)))
 (define (jolt-ns-publics desig) (ns-vars-pmap-when (ns-desig->name desig) (lambda (c) (not (var-private? c)))))
@@ -415,6 +419,7 @@
     (jolt-with-mutex var-table-mu
       (hashtable-delete! ns-has-vars-set nm)  ; keep the O(1) index honest, else a
                                               ; later require of nm would no-op
+      (hashtable-delete! ns-cells-index nm)   ; and the ns->cells bucket with it
       (vector-for-each
         (lambda (k) (let ((c (hashtable-ref var-table k #f)))
                       (when (and c (string=? (var-cell-ns c) nm)) (hashtable-delete! var-table k))))
@@ -477,13 +482,16 @@
                 ((string=? (keyword-t-name k) "only")    (set! only (names)))
                 ((string=? (keyword-t-name k) "exclude") (set! excl (names)))))))
         (loop (cddr a))))
-    (vector-for-each
+    ;; the target's own bucket (rt.ss ns-cells-index): a refer walked EVERY
+    ;; interned var in the image before, so each (:use ...)/(refer ...) cost
+    ;; O(total vars) and a program load O(namespaces x total vars)
+    (for-each
       (lambda (c)
-        (when (and (string=? (var-cell-ns c) target) (var-cell-defined? c))
+        (when (var-cell-defined? c)
           (let ((nm (var-cell-name c)))
             (when (and (or (not only) (member nm only)) (not (member nm excl)))
               (chez-register-refer! cns nm target)))))
-      (var-table-cells))
+      (ns-cells-list target))
     jolt-nil))
 ;; (:refer-clojure :exclude [names…]) — clojure.core always resolves on Chez, so
 ;; the only thing to track is the EXCLUDE set: an excluded name is not

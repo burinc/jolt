@@ -424,12 +424,18 @@
 ;; cell) from a cell lazily materialised by a forward `var-deref` / `(var x)` on a
 ;; not-yet-defined name — `resolve` returns the cell iff defined?.
 ;; ns-unmap clears it. Avoids the (def x nil) edge of probing the root.
-(define-record-type var-cell (fields ns name (mutable root) (mutable defined?)) (nongenerative var-cell-v2))
+;; Mirrors host/chez/rt.ss var-cell-v4 field for field: shared chez files
+;; (ns.ss meta/macro?, dyn-binding.ss dyn-bound?) read these accessors, so the
+;; two hosts' cells must not drift (this one sat at v2 while chez moved twice).
+(define-record-type var-cell
+  (fields ns name (mutable root) (mutable defined?) (mutable meta) (mutable macro?)
+          (mutable dyn-bound?))
+  (nongenerative var-cell-v4))
 (define var-table (make-hashtable string-hash string=?))
 (define (jolt-var ns name)
   (let ((k (string-append ns "/" name)))
     (or (hashtable-ref var-table k #f)
-        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f)))
+        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f)))
           (hashtable-set! var-table k c)
           c))))
 ;; non-creating lookup (resolve / find-var / ns-unmap): #f when absent, so a
@@ -484,12 +490,16 @@
 ;; keyed by the cell. jolt-meta (natives-meta.ss) merges it onto {:ns :name},
 ;; which it derives from the cell — so EVERY var (plain def, native-op, declare)
 ;; reports {:ns :name} like Clojure, with the user meta layered on when present.
-(define var-meta-table (make-eq-hashtable))
+;; Meta and the macro flag live IN the cell (var-cell-v4 fields), matching
+;; chez: the shared files read and write the fields directly (dyn-binding.ss's
+;; dynamic check reads meta, ns.ss's alter-meta! sync writes macro?), so the
+;; eq-side-tables this file used to keep were invisible to them — a var defined
+;; ^:dynamic through the seed still threw "non-dynamic" at the first binding.
 (define jolt-kw-var-ns (keyword #f "ns"))
 (define jolt-kw-var-name (keyword #f "name"))
 (define jolt-kw-var-macro (keyword #f "macro"))
 (define (def-var-with-meta! ns name v m)
-  (let ((c (def-var! ns name v))) (hashtable-set! var-meta-table c m) c))
+  (let ((c (def-var! ns name v))) (var-cell-meta-set! c m) c))
 ;; A runtime-defined DYNAMIC var (the *earmuffed* core vars): tagged :dynamic so
 ;; push-thread-bindings accepts it — with no meta entry a var is non-dynamic and
 ;; binding throws, like the JVM.
@@ -499,18 +509,17 @@
 ;; Attach meta to an already-interned var (the declare/no-init emission path:
 ;; (def ^:dynamic *x*) must be bindable before its root is set).
 (define (set-var-meta! ns name m)
-  (hashtable-set! var-meta-table (jolt-var ns name) m))
-;; runtime-macro registry: a var whose root holds a macro
-;; expander fn is flagged here, so the ON-CHEZ analyzer's form-macro?/form-expand-1
-;; (host-contract.ss) expand it. The prelude emits each core/stdlib defmacro as a
-;; def-var! of its (cross-compiled) expander followed by (mark-macro! ns name).
-;; Keyed by cell (eq), like var-meta-table — survives a later (def name ...) that
-;; replaces the expander but keeps the same cell, matching Clojure (a defmacro IS a
-;; def whose var carries :macro).
-(define var-macro-table (make-eq-hashtable))
+  (var-cell-meta-set! (jolt-var ns name) m))
+;; runtime-macro flag: a var whose root holds a macro expander fn, so the
+;; analyzer's form-macro?/form-expand-1 (host-contract.ss) expand it. The
+;; prelude emits each core/stdlib defmacro as a def-var! of its expander
+;; followed by (mark-macro! ns name). The flag is the cell's macro? FIELD —
+;; shared ns.ss (alter-meta! :macro sync) writes it directly, so a side table
+;; here would miss those writes. The field survives a later (def name ...) that
+;; replaces the expander but keeps the same cell, matching Clojure.
 (define (mark-macro! ns name)
-  (let ((c (jolt-var ns name))) (hashtable-set! var-macro-table c #t) c))
-(define (macro-var? cell) (and cell (hashtable-ref var-macro-table cell #f) #t))
+  (let ((c (jolt-var ns name))) (var-cell-macro?-set! c #t) c))
+(define (macro-var? cell) (and cell (var-cell-macro? cell) #t))
 ;; declare / (def name) with no init: reserve the cell ONLY if absent. An
 ;; existing root is left intact — Clojure's (def x) with no init does not clobber
 ;; a prior binding (do (def x 7) (def x) x) => 7. Returns the cell either way.
@@ -524,7 +533,7 @@
         ;; declaration-only var stays defined?=#f and resolve/find-var/ns-interns
         ;; miss it in an AOT build. The existing root is left intact.
         (begin (var-cell-defined?-set! c #t) c)
-        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t)))  ; declared => interned/resolvable
+        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f)))  ; declared => interned/resolvable
           (hashtable-set! var-table k c)
           c))))
 
@@ -633,13 +642,23 @@
 ;; quotes), chars as `\c`/`\newline`, collections recursively. NOTE: maps/sets
 ;; render in HAMT-iteration order, which is not a stable insertion order —
 ;; so unordered values are compared via `=` (true/false), not printed form.
-(define (jolt-str-join strs)
+;; One pass through a string port: a right-fold of string-append re-copied the
+;; whole joined suffix per element — O(n*L) on every collection render (same
+;; fix as host/chez/rt.ss, in Gambit's port idiom).
+(define (jolt-str-join-sep strs sep)
   (cond ((null? strs) "") ((null? (cdr strs)) (car strs))
-        (else (string-append (car strs) " " (jolt-str-join (cdr strs))))))
+        (else
+         (let ((op (open-output-string)))
+           (display (car strs) op)
+           (let loop ((r (cdr strs)))
+             (unless (null? r)
+               (display sep op)
+               (display (car r) op)
+               (loop (cdr r))))
+           (get-output-string op)))))
+(define (jolt-str-join strs) (jolt-str-join-sep strs " "))
 ;; map ENTRIES join with ", " like the reference printer: {:a 1, :b 2}
-(define (jolt-str-join-comma strs)
-  (cond ((null? strs) "") ((null? (cdr strs)) (car strs))
-        (else (string-append (car strs) ", " (jolt-str-join-comma (cdr strs))))))
+(define (jolt-str-join-comma strs) (jolt-str-join-sep strs ", "))
 (define (jolt-char->string c)
   (if (jolt-pr-readable?)
       (string-append "\\" (case c ((#\newline) "newline") ((#\space) "space") ((#\tab) "tab")
