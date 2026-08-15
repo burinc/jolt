@@ -26,10 +26,12 @@
     ;; per-type number classes, like the JVM: integer -> Long, flonum -> Double,
     ;; exact non-integer -> Ratio.
     ((and (number? x) (flonum? x)) "java.lang.Double")
-    ((and (number? x) (fixnum? x)) "java.lang.Long")
-    ;; a bignum is the JVM's clojure.lang.BigInt — the class a value of this
-    ;; magnitude has there (big literals, *' promotion). Issue #627.
-    ((and (number? x) (exact? x) (integer? x)) "clojure.lang.BigInt")
+    ;; split at the long range (jolt-bigint-print?'s boundary, shared with the
+    ;; printer's N suffix), not the 61-bit fixnum range: Long/MAX_VALUE is a
+    ;; Chez bignum but a JVM Long. Beyond long is the JVM's BigInt — the class
+    ;; a value of that magnitude has there (big literals, *' promotion). #627.
+    ((and (number? x) (exact? x) (integer? x))
+     (if (jolt-bigint-print? x) "clojure.lang.BigInt" "java.lang.Long"))
     ((and (number? x) (exact? x) (rational? x)) "clojure.lang.Ratio")
     ((number? x) "java.lang.Number")
     ((string? x) "java.lang.String")

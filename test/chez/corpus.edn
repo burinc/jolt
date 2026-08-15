@@ -4903,5 +4903,10 @@
   {:suite "numbers / integer classes" :label "a small integer is not a BigInt" :expected "false" :actual "(instance? clojure.lang.BigInt 21)" :portability :jvm}
   {:suite "numbers / integer classes" :label "a small integer is a Long" :expected "[\"java.lang.Long\" true]" :actual "[(.getName (class 21)) (instance? Long 21)]" :portability :jvm}
   {:suite "numbers / integer classes" :label "a big literal is a BigInt" :expected "\"clojure.lang.BigInt\"" :actual "(.getName (class 1208925819614629174706176))" :portability :jvm}
+  ;; the boundary is the LONG RANGE, not Chez's 61-bit fixnum range: Long/MAX
+  ;; and Long/MIN are Chez bignums but JVM Longs (tools.reader asserts these)
+  {:suite "numbers / integer classes" :label "Long/MAX_VALUE is a Long" :expected "[\"java.lang.Long\" true false]" :actual "[(.getName (class 9223372036854775807)) (instance? Long 9223372036854775807) (instance? clojure.lang.BigInt 9223372036854775807)]" :portability :jvm}
+  {:suite "numbers / integer classes" :label "Long/MIN_VALUE is a Long" :expected "[\"java.lang.Long\" true]" :actual "[(.getName (class -9223372036854775808)) (instance? Long -9223372036854775808)]" :portability :jvm}
+  {:suite "numbers / integer classes" :label "one past Long/MAX is a BigInt" :expected "[\"clojure.lang.BigInt\" false]" :actual "[(.getName (class 9223372036854775808)) (instance? Long 9223372036854775808)]" :portability :jvm}
   {:suite "numbers / integer classes" :label "a bignum is a BigInt and a Number, not a Long" :expected "[true true false]" :actual "[(instance? clojure.lang.BigInt 1208925819614629174706176) (instance? java.lang.Number 1208925819614629174706176) (instance? Long 1208925819614629174706176)]" :portability :jvm}
 ]

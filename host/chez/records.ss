@@ -1152,14 +1152,18 @@
   ;; exact ratio -> Ratio, exact integer -> Long.
   (cond ((flonum? obj) '("Double" "Float" "Number" "Object"))
         ((and (number? obj) (exact? obj) (not (integer? obj))) '("Ratio" "Number" "Object"))
-        ;; exact integers split by magnitude (issue #627): a fixnum is a Long,
-        ;; plus the JVM-int breadth ported code checks for (Integer); a bignum
-        ;; is what the JVM boxes as clojure.lang.BigInt. The BigInteger tag
-        ;; stays on bignums — jolt's one big representation serves both
-        ;; classes, a documented superset. A fixnum is NEITHER: (instance?
-        ;; BigInt 21) is false on the JVM and now here.
-        ((and (number? obj) (fixnum? obj)) '("Long" "Integer" "Number" "Object"))
-        ((and (number? obj) (bignum? obj)) '("BigInt" "BigInteger" "Number" "Object"))
+        ;; exact integers split at the LONG RANGE (issue #627), the same
+        ;; boundary the printer's N suffix uses — NOT the fixnum range: Chez
+        ;; fixnums are 61-bit, so Long/MAX_VALUE is a Chez bignum that must
+        ;; still be a Long (tools.reader asserts it). In range: Long, plus the
+        ;; JVM-int breadth ported code checks for (Integer). Beyond: what the
+        ;; JVM boxes as clojure.lang.BigInt, with the BigInteger tag kept —
+        ;; jolt's one big representation serves both classes, a documented
+        ;; superset. (instance? BigInt 21) is false on the JVM and now here.
+        ((and (number? obj) (exact? obj) (integer? obj))
+         (if (jolt-bigint-print? obj)
+             '("BigInt" "BigInteger" "Number" "Object")
+             '("Long" "Integer" "Number" "Object")))
         ((number? obj) '("Number" "Object"))
         ((string? obj) '("String" "CharSequence" "Object"))
         ((boolean? obj) '("Boolean" "Object"))
