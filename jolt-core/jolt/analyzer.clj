@@ -234,8 +234,13 @@
 
 (defn- analyze-arity [ctx pvec body env fn-name]
   (let [pp (parse-params ctx (vec (form-vec-items pvec)))
-        fixed (uniquify-params (:fixed pp))
         rst (:rest pp)
+        ;; uniquify over fixed AND rest together: the rest param shares the one
+        ;; Scheme formal list ((lambda (a b . r))), so a positional duplicating
+        ;; it ([_ x & _]) must rename too. The rest is the last occurrence and
+        ;; always keeps its name, so only fixed slots ever change.
+        fixed (let [u (uniquify-params (cond-> (vec (:fixed pp)) rst (conj rst)))]
+                (if rst (subvec u 0 (dec (count u))) u))
         ;; Always a recur target, variadic included: the back end gives the rest
         ;; param an ordinary positional slot (holding the collected seq), so recur
         ;; is a self-call carrying the rest seq directly — Clojure semantics.

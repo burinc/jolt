@@ -4877,4 +4877,11 @@
   {:suite "ns / resolve-class" :label "an unknown bare capitalized name is nil" :expected "true" :actual "(nil? (resolve 'NoSuchClassXyz))" :portability :jvm}
   {:suite "ns / resolve-class" :label "a var merely holding a class stays a var" :expected "true" :actual "(do (def rzc-corpus-alias String) (var? (resolve 'rzc-corpus-alias)))" :portability :jvm}
   {:suite "ns / resolve-class" :label "resolve of a deftype name is its class" :expected "true" :actual "(do (deftype RzCorpT [a]) (class? (resolve 'RzCorpT)))" :portability :jvm}
+  ;; A rest param can duplicate a positional (both _, typically). Chez rejects
+  ;; duplicate formals, so every earlier occurrence renames — including against
+  ;; the rest binder, which is the last occurrence and keeps the name (jolt-n6o4).
+  {:suite "fn / duplicate params" :label "_ as a positional and the rest param" :expected ":ok" :actual "((fn [_ x & _] x) 1 :ok)" :portability :jvm}
+  {:suite "fn / duplicate params" :label "two positional _ plus a _ rest param" :expected ":ok" :actual "((fn [_ _ x & _] x) 1 2 :ok 4 5)" :portability :jvm}
+  {:suite "fn / duplicate params" :label "the rest binding wins as the last occurrence" :expected "'(3 4)" :actual "((fn [_ _ & _] _) 1 2 3 4)" :portability :jvm}
+  {:suite "fn / duplicate params" :label "positional duplicates still bind the last" :expected "2" :actual "((fn [x x] x) 1 2)" :portability :jvm}
 ]
