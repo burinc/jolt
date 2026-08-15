@@ -12,7 +12,8 @@
 	url = https://github.com/babashka/fs.git
 [submodule "vendor/process"]
 	path = vendor/process
-	url = https://github.com/babashka/process
+	url = https://github.com/jolt-lang/process
+	branch = jolt
 [submodule "vendor/grenadine"]
 	path = vendor/grenadine
 	url = https://github.com/clojurestar/grenadine.git

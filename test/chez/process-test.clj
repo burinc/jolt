@@ -64,6 +64,14 @@
   (check-eq "deref out" (:out res) "derefed\n")
   (check-eq "deref exit" (:exit res) 0))
 
+;; timed deref honours the timeout BOTH ways (jolt-go9n): a live process answers
+;; the timeout value, a finished one its map — and neither throws a cast error
+;; (jolt takes the vendored :jolt splice arm, not bb's empty one).
+(let [slow (process ["sleep" "30"])]
+  (check-eq "timed deref times out" (deref slow 150 :timed-out) :timed-out)
+  (p/destroy slow))
+(check-eq "timed deref after exit" (:exit (deref (process ["true"]) 5000 :hung)) 0)
+
 ;; :out to a file
 (let [tmp (str (fs/create-temp-file {:prefix "jp-" :suffix ".txt"}))]
   @(process ["echo" "to-file"] {:out tmp})
