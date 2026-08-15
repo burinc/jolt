@@ -26,7 +26,10 @@
     ;; per-type number classes, like the JVM: integer -> Long, flonum -> Double,
     ;; exact non-integer -> Ratio.
     ((and (number? x) (flonum? x)) "java.lang.Double")
-    ((and (number? x) (exact? x) (integer? x)) "java.lang.Long")
+    ((and (number? x) (fixnum? x)) "java.lang.Long")
+    ;; a bignum is the JVM's clojure.lang.BigInt — the class a value of this
+    ;; magnitude has there (big literals, *' promotion). Issue #627.
+    ((and (number? x) (exact? x) (integer? x)) "clojure.lang.BigInt")
     ((and (number? x) (exact? x) (rational? x)) "clojure.lang.Ratio")
     ((number? x) "java.lang.Number")
     ((string? x) "java.lang.String")
@@ -49,8 +52,10 @@
     ;; internal :vector/:set/… type keyword), so class-based dispatch — e.g. a
     ;; defmulti on [(class a) (class b)] — sees a real clojure.lang.* class.
     ((jns? x) "clojure.lang.Namespace")
-    ;; a map entry is a pvec with the entry flag; the JVM class is MapEntry
+    ;; a map entry is a pvec with the entry kind; the JVM class is MapEntry
     ((jolt-map-entry? x) "clojure.lang.MapEntry")
+    ;; a subvec view is a pvec with the subvec kind (issue #629)
+    ((jolt-subvec-view? x) "clojure.lang.APersistentVector$SubVector")
     ((pvec? x) "clojure.lang.PersistentVector")
     ((pset? x) "clojure.lang.PersistentHashSet")
     ;; array mode (insertion-ordered, small literal maps) is PersistentArrayMap;

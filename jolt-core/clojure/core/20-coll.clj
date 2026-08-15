@@ -517,7 +517,10 @@
     (nil? coll) nil
     (vector? coll)
       (if (zero? (count coll)) (throw "Can't pop empty vector")
-        (subvec coll 0 (dec (count coll))))
+        ;; the pop primitive, NOT subvec: subvec stamps its result as a
+        ;; SubVector (issue #629), and popping a plain vector must answer a
+        ;; plain vector — jolt.host/pop preserves the input's class and meta.
+        (jolt.host/pop coll))
     (seq? coll)
       (if (nil? (seq coll)) (throw "Can't pop empty list")
         (rest coll))

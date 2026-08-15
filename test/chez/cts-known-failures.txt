@@ -2,7 +2,7 @@
 # The gate fails on any per-namespace change, worse OR better; regenerate
 # with: JOLT_CTS_WRITE_BASELINE=1 host/chez/cts.sh
 clojure.core-test.abs 1 0
-clojure.core-test.bigint 1 0
+clojure.core-test.bigint 3 0
 clojure.core-test.byte 1 0
 # descendants: the suite's :bb branch expects class-as-SYMBOL in hierarchies
 # (babashka's model); jolt derives with the class VALUE like the JVM, so the

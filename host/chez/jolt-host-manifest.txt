@@ -9,6 +9,7 @@
 #     | sed -E 's/.*"jolt.host" "([^"]+)".*/\1/' | LC_ALL=C sort -u
 add-shutdown-hook
 allow-unresolved-vars?
+as-subvec
 array-value?
 available-processors
 backtrace-string
@@ -146,6 +147,7 @@ monitor-exit
 mono-nanos
 munge-name
 park-until-interrupt
+pop
 protocol-key-of
 protocol-methods
 proxy-super-call

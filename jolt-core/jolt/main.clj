@@ -190,6 +190,10 @@
                              (vec (drop-end-of-options app-args))
                              print?))
 
+;; A FILE argument of "-" means stdin, like bb/ys and most CLIs; map it to
+;; /dev/stdin, which load-file reads.
+(defn- file-arg [x] (if (= "-" x) "/dev/stdin" x))
+
 ;; main-opts is a vector like ["-m" "app.core"] or ["-e" "(prn :hi)"] (optionally
 ;; with trailing args). The user-supplied extra args are appended, so an alias's
 ;; :main-opts and the command line combine exactly like the clj CLI, which
@@ -199,15 +203,21 @@
     (cond
       (= "-m" (first opts)) (run-ns (second opts) (drop 2 opts))
       (= "-e" (first opts)) (eval-expr-string (second opts) (drop 2 opts) true)
+      ;; clojure.main: a bare non-option first arg is a script path and the
+      ;; rest is *command-line-args* — `jolt -M file.clj a b`, or an alias
+      ;; whose :main-opts name a script. Same load shape as `run FILE`.
+      (and (string? (first opts))
+           (seq (first opts))
+           (not (str/starts-with? (first opts) "-")))
+      (do (push-thread-bindings
+            {#'clojure.core/*command-line-args* (seq (drop-end-of-options (rest opts)))})
+          (load-file (file-arg (first opts)))
+          nil)
       :else (throw (ex-info (str "unsupported :main-opts " (pr-str (vec opts))) {})))))
 
 (defn- parse-aliases [s]            ; "-M:a:b" / ":a:b" -> [:a :b]
   (let [s (if (str/starts-with? s "-") (subs s 2) s)]
     (->> (str/split s #":") (remove str/blank?) (map keyword) vec)))
-
-;; A FILE argument of "-" means stdin, like bb/ys and most CLIs; map it to
-;; /dev/stdin, which load-file reads.
-(defn- file-arg [x] (if (= "-" x) "/dev/stdin" x))
 
 ;; Does a bare argv token name a file to run (rather than a deps.edn task)? A "-"
 ;; (stdin), an existing file, or a *.jolt/*.clj/*.cljc/*.cljs path. .jolt is the
