@@ -1723,4 +1723,11 @@
   {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (jolt.scheme/scheme (let loop ((i 0) (acc 0)) (if (fx=? i 5) acc (loop (fx+ i 1) (fx+ acc i))))))" :expected "10"}
   ;; a keyword has no Scheme reading — macroexpansion refuses it
   {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (try (eval '(jolt.scheme/scheme (list :kw))) :no-throw (catch Exception e :threw)))" :expected ":threw"}
+
+  ;; a wrong-arity positional-ctor call is an ArityException naming the ctor var
+  ;; (JVM: "Wrong number of args (N) passed to: ns/->Name"); unit-only because the
+  ;; certify oracle's eval context munges the JVM-side ctor name.
+  {:suite "records" :label "ctor wrong arity throws ArityException"
+   :expr "(do (defrecord CtorAr [x y]) (try (apply ->CtorAr [1]) (catch clojure.lang.ArityException e [(instance? IllegalArgumentException e) (ex-message e)])))"
+   :expected "[true \"Wrong number of args (1) passed to: user/->CtorAr\"]"}
 ]

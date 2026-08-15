@@ -551,19 +551,24 @@
     ((jrec-coll-print-shape r) => (lambda (shape) (jrec-coll-pr r shape)))
     (else (jrec-field-pr r))))
 (define (jrec-field-pr r)
-  (let ((fkeys (jrdesc-fkeys (jrec-desc r))))
-    (string-append "#" (jrec-tag r) "{"
-      (let ((n (vector-length fkeys)))
-        (let loop ((i 0) (first #t) (acc ""))
-          (if (= i n)
-              (let ((ext (jrec-ext r)))
-                (if (jolt-nil? ext) acc
-                    (let eloop ((es (jrec-ext-pairs ext)) (first first) (acc acc))
-                      (if (null? es) acc
-                          (eloop (cdr es) #f
-                                 (string-append acc (if first "" ", ")
-                                   (jolt-pr-readable (caar es)) " " (jolt-pr-readable (cdar es))))))))
-              (loop (+ i 1) #f
-                    (string-append acc (if first "" ", ")
-                      (jolt-pr-readable (vector-ref fkeys i)) " " (jolt-pr-readable (jrec-field-ref r i)))))))
-      "}")))
+  ;; one "k v" string per entry, joined once: the extension map is unbounded
+  ;; (any non-field key assoc'd on lands there), and appending each entry to a
+  ;; growing accumulator is quadratic in the entry count.
+  (let* ((fkeys (jrdesc-fkeys (jrec-desc r)))
+         (n (vector-length fkeys))
+         (entry-strs
+          (let loop ((i 0) (acc '()))
+            (if (= i n)
+                (let ((ext (jrec-ext r)))
+                  (reverse
+                   (if (jolt-nil? ext) acc
+                       (fold-left (lambda (a p)
+                                    (cons (string-append (jolt-pr-readable (car p)) " "
+                                                         (jolt-pr-readable (cdr p)))
+                                          a))
+                                  acc (jrec-ext-pairs ext)))))
+                (loop (+ i 1)
+                      (cons (string-append (jolt-pr-readable (vector-ref fkeys i)) " "
+                                           (jolt-pr-readable (jrec-field-ref r i)))
+                            acc))))))
+    (string-append "#" (jrec-tag r) "{" (jolt-str-join-comma entry-strs) "}")))

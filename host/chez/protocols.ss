@@ -334,11 +334,15 @@
                  (when old-desc (jrdesc-ptable-set! old-desc #f)))
                (hashtable-set! chez-tag-desc tag desc)))
          (nf (length kws))
+         ;; the ctor var's name, baked at definition (the JVM ArityException
+         ;; names the positional ctor: "… passed to: ns/->Name").
+         (ctor-name (string-append (chez-current-ns) "/->" (symbol-t-name name-sym)))
            (ctor (lambda args
                    ;; validate arg count — must match declared field count exactly
                    (when (not (= (length args) nf))
-                     (jolt-throw (str "Wrong number of args (" (length args) ") passed to: "
-                                      (jrec-tag (make-jrec desc (make-vector 0 jolt-nil) jolt-nil)))))
+                     (throw-jvm (quote ArityException)
+                       (string-append "Wrong number of args (" (number->string (length args))
+                                      ") passed to: " ctor-name)))
                    (let ((v (make-vector nf jolt-nil)))
                      (let loop ((as args) (i 0))
                        (if (null? as) (make-jrec desc v jolt-nil)

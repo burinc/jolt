@@ -308,27 +308,55 @@
 
 ;; --- history ops -------------------------------------------------------------
 ;; On the JVM these control how many prior values a ref keeps for snapshot
-;; isolation.  Our serialized transactions need no history, so ref-history-count
-;; returns 0; the 2-arity setter forms store min/max on the ref's side table
-;; and return the ref.  ref-history-count is the ONLY one that MUST run
-;; outside a transaction (the JVM's LockingTransaction/Ref returns the
-;; configured count unconditionally).
+;; isolation: a reader in a transaction that started before a writer committed
+;; is served an older value out of the history chain instead of retrying.
+;;
+;; jolt's transactions are SERIALIZED by stm-lock, so there is no such reader —
+;; a transaction never observes a commit inside its own extent, which is what
+;; the history chain exists to paper over. There is therefore nothing to store
+;; and nothing for the commit path to store it in, and ref-history-count is 0
+;; where the JVM reports the chain's length (recorded as an accepted
+;; :concurrency-model divergence, not a gap to close).
+;;
+;; The min/max settings themselves stay a faithful GETTER/SETTER pair — the
+;; getter returns what the setter stored (defaults 0 and 10, as on the JVM) and
+;; the setter returns the ref — so code that tunes a ref keeps working and reads
+;; back what it set. They just do not feed a mechanism jolt has.
+;;
+;; case-lambda rather than a rest-arg: a rest-arg accepted ANY arg count and
+;; silently took the getter branch for 3+ (so (ref-min-history r 1 2) read the
+;; value instead of raising), and (ref-min-history) died in `car` with a raw
+;; host error that carried no class, so no catch clause could select it.
+;; nil and a wrong type are different answers on the JVM, because the ^Ref hint
+;; makes these an interface call: a null target is a NullPointerException, a
+;; non-Ref is the cast failure. jolt-class-name itself raises on nil, so the nil
+;; arm has to come first regardless.
+(define (ref-history-arg-check ref)
+  (cond
+    ((jolt-ref? ref) #t)
+    ((jolt-nil? ref)
+     (throw-jvm (quote NullPointerException)
+                "Cannot invoke \"clojure.lang.Ref\" method because \"ref\" is null"))
+    (else
+     (jolt-throw (jolt-host-throwable
+                  "java.lang.ClassCastException"
+                  (string-append "class " (jolt-class-name ref)
+                                 " cannot be cast to class clojure.lang.Ref"))))))
 (define (jolt-ref-history-count ref)
+  (ref-history-arg-check ref)
   0)
 
-(define (jolt-ref-min-history . args)
-  (let ((ref (car args)))
-    (jolt-with-mutex ref-history-mu
-      (if (= (length args) 2)
-          (begin (hashtable-set! ref-min-history-tbl ref (cadr args)) ref)
-          (hashtable-ref ref-min-history-tbl ref 0)))))
-
-(define (jolt-ref-max-history . args)
-  (let ((ref (car args)))
-    (jolt-with-mutex ref-history-mu
-      (if (= (length args) 2)
-          (begin (hashtable-set! ref-max-history-tbl ref (cadr args)) ref)
-          (hashtable-ref ref-max-history-tbl ref 10)))))
+(define (make-ref-history-op tbl default)
+  (case-lambda
+    ((ref)
+     (ref-history-arg-check ref)
+     (jolt-with-mutex ref-history-mu (hashtable-ref tbl ref default)))
+    ((ref n)
+     (ref-history-arg-check ref)
+     (jolt-with-mutex ref-history-mu (hashtable-set! tbl ref n))
+     ref)))
+(define jolt-ref-min-history (make-ref-history-op ref-min-history-tbl 0))
+(define jolt-ref-max-history (make-ref-history-op ref-max-history-tbl 10))
 
 ;; --- deref -------------------------------------------------------------------
 ;; Inside a transaction, return the in-txn value from the log (falling back

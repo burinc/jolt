@@ -733,32 +733,34 @@
     (else (jrec-field-pr r))))
 
 (define (jrec-field-pr r)
-  (let ((fkeys (jrdesc-fkeys (jrec-desc r))))
+  (let* ((fkeys (jrdesc-fkeys (jrec-desc r)))
+         (n (vector-length fkeys))
+         (entry-strs (let loop ((i 0) (acc '()))
+                       (if (= i n)
+                           (let ((ext (jrec-ext r)))
+                             (reverse
+                               (if (jolt-nil? ext)
+                                   acc
+                                   (fold-left
+                                     (lambda (a p)
+                                       (cons
+                                         (string-append
+                                           (jolt-pr-readable (car p))
+                                           " "
+                                           (jolt-pr-readable (cdr p)))
+                                         a))
+                                     acc
+                                     (jrec-ext-pairs ext)))))
+                           (loop
+                             (+ i 1)
+                             (cons
+                               (string-append
+                                 (jolt-pr-readable (vector-ref fkeys i))
+                                 " "
+                                 (jolt-pr-readable (jrec-field-ref r i)))
+                               acc))))))
     (string-append "#" (jrec-tag r) "{"
-      (let ((n (vector-length fkeys)))
-        (let loop ((i 0) (first #t) (acc ""))
-          (if (= i n)
-              (let ((ext (jrec-ext r)))
-                (if (jolt-nil? ext)
-                    acc
-                    (let eloop ((es (jrec-ext-pairs ext))
-                                (first first)
-                                (acc acc))
-                      (if (null? es)
-                          acc
-                          (eloop
-                            (cdr es)
-                            #f
-                            (string-append acc (if first "" ", ")
-                              (jolt-pr-readable (caar es)) " "
-                              (jolt-pr-readable (cdar es))))))))
-              (loop
-                (+ i 1)
-                #f
-                (string-append acc (if first "" ", ")
-                  (jolt-pr-readable (vector-ref fkeys i)) " "
-                  (jolt-pr-readable (jrec-field-ref r i)))))))
-      "}")))
+      (jolt-str-join-comma entry-strs) "}")))
 
 (register-eq-arm!
   (lambda (a b) (or (jrec? a) (jrec? b)))
@@ -1451,17 +1453,19 @@
                 (when old-desc (jrdesc-ptable-set! old-desc #f)))
               (hashtable-set! chez-tag-desc tag desc)))
          (nf (length kws))
+         (ctor-name (string-append
+                      (chez-current-ns)
+                      "/->"
+                      (symbol-t-name name-sym)))
          (ctor (lambda args
                  (when (not (= (length args) nf))
-                   (jolt-throw
-                     (str "Wrong number of args ("
-                          (length args)
-                          ") passed to: "
-                          (jrec-tag
-                            (make-jrec
-                              desc
-                              (make-vector 0 jolt-nil)
-                              jolt-nil)))))
+                   (throw-jvm
+                     'ArityException
+                     (string-append
+                       "Wrong number of args ("
+                       (number->string (length args))
+                       ") passed to: "
+                       ctor-name)))
                  (let ((v (make-vector nf jolt-nil)))
                    (let loop ((as args) (i 0))
                      (if (null? as)
