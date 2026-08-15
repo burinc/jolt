@@ -56,7 +56,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling vecscaling \
+  readscaling vecscaling pipescaling chunkscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
   gateboot gatebootsmoke gosm httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
@@ -116,7 +116,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling depssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling depssmoke depscpcache depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
@@ -376,6 +376,19 @@ readscaling: testbin
 # rrbscaling; this catches core falling back to an element-by-element rebuild.
 vecscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/vec_scaling_test.clj
+
+# A piped-stream write costs O(1), not O(chunks-queued): the jpipe buffer was a
+# plain list re-copied per write, so piping N chunks cost O(N^2) cons work under
+# the pipe mutex (the ring.util.io/piped-input-stream path). 1x-vs-4x in-process
+# ratio, like readscaling.
+pipescaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/pipe_scaling_test.clj
+
+# chunk-append (the clojure.core chunk-builder API) costs O(1) amortized per
+# item, not O(items-buffered) — filling a chunk-buffer was O(n^2) via a
+# re-copied item list, and the cap argument was ignored.
+chunkscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/chunk_scaling_test.clj
 
 # deps.edn alias + CLI semantics (tools.deps args-map keys, -X/-T/-Sdeps, the
 # user deps.edn chain, jar/git coordinates) through the real CLI, over local

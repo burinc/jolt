@@ -886,11 +886,27 @@
 ;; extra state slot holds a box carrying the shared pipe: connect makes both ends
 ;; point at one, and close marks it rather than closing the port.
 (define-record-type jpipe
-  ;; chunks is a queue of bytevectors oldest-first, with `pos` bytes of the head
-  ;; already handed out.
-  (fields mu cv (mutable chunks) (mutable pos) (mutable wclosed?) (mutable rclosed?))
-  (nongenerative jpipe-v1))
-(define (new-jpipe) (make-jpipe (make-mutex) (make-condition) '() 0 #f #f))
+  ;; The chunk queue is a front/rear list pair — the standard amortized-O(1)
+  ;; two-list queue. front holds bytevectors oldest-first (the dequeue end, with
+  ;; `pos` bytes of its head already handed out); rear holds newly written chunks
+  ;; newest-first and reverses onto front when front drains. A write is one cons,
+  ;; where a single `chunks` list re-copied per write cost O(N^2) over N writes —
+  ;; under the pipe mutex (`make pipescaling` gates the shape). nbytes counts
+  ;; what is queued and unread, so available is O(1).
+  (fields mu cv (mutable front) (mutable rear) (mutable pos) (mutable nbytes)
+          (mutable wclosed?) (mutable rclosed?))
+  (nongenerative jpipe-v2))
+(define (new-jpipe) (make-jpipe (make-mutex) (make-condition) '() '() 0 0 #f #f))
+
+;; the queue's dequeue end, rebalancing rear->front when front has drained.
+(define (jpipe-front! p)
+  (let ((f (jpipe-front p)))
+    (if (pair? f)
+        f
+        (let ((f (reverse (jpipe-rear p))))
+          (jpipe-front-set! p f)
+          (jpipe-rear-set! p '())
+          f))))
 
 (define (io-throw msg) (jolt-throw (jolt-host-throwable "java.io.IOException" msg)))
 
@@ -900,7 +916,8 @@
     (when (jpipe-wclosed? p) (io-throw "Pipe closed"))
     (let ((chunk (make-bytevector count)))
       (bytevector-copy! bv start chunk 0 count)
-      (jpipe-chunks-set! p (append (jpipe-chunks p) (list chunk)))
+      (jpipe-rear-set! p (cons chunk (jpipe-rear p)))
+      (jpipe-nbytes-set! p (+ (jpipe-nbytes p) count))
       (jolt-cv-wake! (jpipe-cv p))))
   count)
 
@@ -913,28 +930,26 @@
     (lambda (_timed-out?)
       (cond
         ((jpipe-rclosed? p) (io-throw "Pipe closed"))
-        ((pair? (jpipe-chunks p))
-         (let* ((head (car (jpipe-chunks p)))
+        ((pair? (jpipe-front! p))
+         (let* ((head (car (jpipe-front p)))
                 (avail (- (bytevector-length head) (jpipe-pos p)))
                 (n (min avail count)))
            (bytevector-copy! head (jpipe-pos p) bv start n)
            (if (= n avail)
-               (begin (jpipe-chunks-set! p (cdr (jpipe-chunks p))) (jpipe-pos-set! p 0))
+               (begin (jpipe-front-set! p (cdr (jpipe-front p))) (jpipe-pos-set! p 0))
                (jpipe-pos-set! p (+ (jpipe-pos p) n)))
+           (jpipe-nbytes-set! p (- (jpipe-nbytes p) n))
            n))
         ((jpipe-wclosed? p) 0)                      ; writer done: end of stream
         (else jolt-cv-again)))))
 
 ;; PipedInputStream.available: what the writer has queued and the reader has not
 ;; taken yet. The queue IS the buffer here, so this is exact rather than an
-;; estimate.
+;; estimate — the running byte count writes maintain and reads drain.
 (define (pipe-available p)
   (jolt-with-mutex (jpipe-mu p)
     (when (jpipe-rclosed? p) (io-throw "Pipe closed"))
-    (let loop ((cs (jpipe-chunks p)) (n 0))
-      (if (null? cs)
-          (max 0 (- n (jpipe-pos p)))
-          (loop (cdr cs) (+ n (bytevector-length (car cs))))))))
+    (jpipe-nbytes p)))
 
 (define (pipe-close-write! p)
   (jolt-with-mutex (jpipe-mu p)
