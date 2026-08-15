@@ -1022,8 +1022,11 @@
   {:suite "hasheq-cache" :expr "(let [v [1 2 3] h1 (hash v) h2 (hash v)] (= h1 h2))" :expected "true"}
   {:suite "hasheq-cache" :expr "(let [s \"hello\" h1 (hash s) h2 (hash s)] (= h1 h2))" :expected "true"}
   ;; Stage C — positional ctor throws on wrong arity
- {:suite "records-ctor-arity" :expr "(do (defrecord ArC9 [x y]) (try (->ArC9 1) (catch Exception e :arity-throw)))" :expected ":arity-throw"}
- {:suite "records-ctor-arity" :expr "(do (defrecord ArC9b [x y]) (try (->ArC9b 1 2 3) (catch Exception e :arity-throw)))" :expected ":arity-throw"}
+ ;; the CLASS, not merely that something was thrown: a raw host error carries no
+ ;; class and (catch Exception ...) matches one anyway, so a bare :arity-throw
+ ;; row passes while the ctor is raising an unbound-variable error.
+ {:suite "records-ctor-arity" :expr "(do (defrecord ArC9 [x y]) (try (->ArC9 1) (catch clojure.lang.ArityException e :arity-throw)))" :expected ":arity-throw"}
+ {:suite "records-ctor-arity" :expr "(do (defrecord ArC9b [x y]) (try (->ArC9b 1 2 3) (catch clojure.lang.ArityException e :arity-throw)))" :expected ":arity-throw"}
  {:suite "records-ctor-arity" :expr "(do (defrecord ArC9c [x y]) (->ArC9c 1 2))" :expected "#user.ArC9c{:x 1, :y 2}"}
  ;; Stage C — assoc applies ^double coercion on record fields
  {:suite "records-assoc-double" :expr "(do (deftype DblC10 [^double x]) (.getName (class (.-x (assoc (->DblC10 1) :x 2)))))" :expected "\"java.lang.Double\""}
@@ -1723,4 +1726,18 @@
   {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (jolt.scheme/scheme (let loop ((i 0) (acc 0)) (if (fx=? i 5) acc (loop (fx+ i 1) (fx+ acc i))))))" :expected "10"}
   ;; a keyword has no Scheme reading — macroexpansion refuses it
   {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (try (eval '(jolt.scheme/scheme (list :kw))) :no-throw (catch Exception e :threw)))" :expected ":threw"}
+
+  ;; instance? on a protocol is memoized per (type, class-name) under the proto
+  ;; epoch — an extend-protocol AFTER the first query must flip the answer, not
+  ;; serve the cached false.
+  {:suite "records" :label "instance? sees a later extend-protocol"
+   :expr "(do (defprotocol MemoP (mp [_])) (deftype MemoT [v]) (let [t (->MemoT 1) before (instance? user.MemoP t)] (extend-protocol MemoP MemoT (mp [_] 2)) [before (instance? user.MemoP t) (satisfies? MemoP t) (mp t)]))"
+   :expected "[false true true 2]"}
+
+  ;; a wrong-arity positional-ctor call is an ArityException naming the ctor var
+  ;; (JVM: "Wrong number of args (N) passed to: ns/->Name"); unit-only because the
+  ;; certify oracle's eval context munges the JVM-side ctor name.
+  {:suite "records" :label "ctor wrong arity throws ArityException"
+   :expr "(do (defrecord CtorAr [x y]) (try (apply ->CtorAr [1]) (catch clojure.lang.ArityException e [(instance? IllegalArgumentException e) (ex-message e)])))"
+   :expected "[true \"Wrong number of args (1) passed to: user/->CtorAr\"]"}
 ]

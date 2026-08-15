@@ -22,6 +22,16 @@
     ;; the count comes back with the render so verifying costs no extra pass
     (count s)))
 
+;; a record's #ns.Name{...} form joins its entries the same one-pass way; the
+;; extension map is unbounded (any non-field key assoc'd on lands there), so a
+;; per-entry append to a growing accumulator (jrec-field-pr, records.ss) would
+;; be quadratic in the entry count.
+(defrecord ExtRec [])
+
+(defn- render-rec [n]
+  (let [r (reduce (fn [r i] (assoc r (keyword (str "k" i)) i)) (->ExtRec) (range n))]
+    (count (pr-str r))))
+
 (defn- timed [f]
   (let [t (System/currentTimeMillis)
         v (f)]
@@ -62,6 +72,21 @@
                           "jolt-str-join is re-copying the joined suffix per element "
                           "(host/chez/rt.ss, host/gambit/rt-core.ss, or sorted-map-render in host-table.ss)."))
             (System/exit 1))
-        (println "print-scaling: passed")))))
+        (println "print-scaling: passed"))))
+  ;; the record arm, judged the same way
+  (when-not (= (pr-str (assoc (->ExtRec) :b 2 :a 1)) "#print-scaling-test.ExtRec{:b 2, :a 1}")
+    (println (str "FAIL print-scaling: wrong record rendering — " (pr-str (assoc (->ExtRec) :b 2 :a 1))))
+    (System/exit 1))
+  (let [t1 (max 1 (best-of 3 #(render-rec n1)))
+        t4 (best-of 3 #(render-rec (* factor n1)))
+        ratio (double (/ t4 t1))]
+    (println (format "print-scaling: record %d entries %dms, %d entries %dms, ratio %.2f (linear ~%.1f, quadratic ~%.1f, ceiling %.1f)"
+                     n1 t1 (* factor n1) t4 ratio
+                     (double factor) (double (* factor factor)) max-ratio))
+    (if (> ratio max-ratio)
+      (do (println (str "FAIL print-scaling: record rendering scaled worse than linearly in the entry count. "
+                        "jrec-field-pr is appending each entry to a growing accumulator (host/chez/records.ss)."))
+          (System/exit 1))
+      (println "print-scaling: passed"))))
 
 (-main)

@@ -4331,6 +4331,13 @@
   {:suite "refs / ref-min-history-setter" :label "ref-min-history setter stores value and returns ref" :expected "[5 20]" :actual "(let [r (ref 0)] [(ref-min-history (ref-min-history r 5)) (ref-max-history (ref-max-history r 20))])" :portability :common}
   {:suite "refs / ref-min-history-reader" :label "ref-min-history reader returns stored default" :expected "0" :actual "(ref-min-history (ref 0))" :portability :common}
   {:suite "refs / ref-max-history-reader" :label "ref-max-history reader returns stored default" :expected "10" :actual "(ref-max-history (ref 0))" :portability :common}
+  ;; the history fns are a getter/setter pair with the JVM's arity and type
+  ;; contract: 1 or 2 args only, a Ref target, nil is an NPE not a cast failure.
+  {:suite "refs / ref-history-arity-0" :label "no args is an ArityException" :expected ":arity" :actual "(try (ref-min-history) (catch clojure.lang.ArityException e :arity))" :portability :common}
+  {:suite "refs / ref-history-arity-3" :label "three args is an ArityException" :expected ":arity" :actual "(try (ref-min-history (ref 0) 1 2) (catch clojure.lang.ArityException e :arity))" :portability :common}
+  {:suite "refs / ref-history-non-ref" :label "a non-ref target is a ClassCastException" :expected ":cce" :actual "(try (ref-min-history 5) (catch ClassCastException e :cce))" :portability :common}
+  {:suite "refs / ref-history-nil" :label "a nil target is a NullPointerException" :expected ":npe" :actual "(try (ref-max-history nil) (catch NullPointerException e :npe))" :portability :common}
+  {:suite "refs / ref-history-max-arity-0" :label "ref-max-history no args is an ArityException" :expected ":arity" :actual "(try (ref-max-history) (catch clojure.lang.ArityException e :arity))" :portability :common}
   {:suite "conformance / taps" :label "tap> enqueues and returns true" :expected "true" :actual "(tap> 1)" :portability :jvm}
   {:suite "conformance / agents" :label "error-mode defaults to :fail" :expected ":fail" :actual "(error-mode (agent 0))" :portability :jvm}
   {:suite "conformance / agents" :label ":error-handler opts imply :continue" :expected ":continue" :actual "(error-mode (agent 0 :error-handler (fn [_ _])))" :portability :jvm}

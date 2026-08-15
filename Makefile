@@ -739,16 +739,17 @@ certify:
 GAMBIT_GSI := $(shell brew --prefix gambit-scheme 2>/dev/null)/bin/gsi
 GAMBIT_GSC := $(shell brew --prefix gambit-scheme 2>/dev/null)/bin/gsc
 
-# host/gambit/records-gambit.ss is GENERATED from host/chez/records.ss (the
+# host/gambit/records-gambit.ss is GENERATED from the four host/chez records
+# files — records.ss, records-coll.ss, protocols.ss, records-dispatch.ss — (the
 # define-jrec-family phase wall — see gen-records.ss). Regenerate after every
-# records.ss change.
+# change to any of them.
 gambitgen:
 	$(CHEZ) --script host/gambit/gen-records.ss
 
 # ...and this is what makes that an invariant rather than a note: regenerate into
-# a temp file and diff. A records.ss change that never reached the generated file
-# fails here instead of silently leaving the Gambit host a release behind. Runs
-# on Chez alone, so it gates in CI whether or not gambit is installed.
+# a temp file and diff. A records-file change that never reached the generated
+# file fails here instead of silently leaving the Gambit host a release behind.
+# Runs on Chez alone, so it gates in CI whether or not gambit is installed.
 # Grenadine ships four namespaces it generates rather than commits, so half the
 # source tree comes from the submodule and half from vendor/grenadine-generated
 # (see the README there). Bumping one without refreshing the other mixes two
@@ -778,7 +779,7 @@ gambitgencheck:
 	@out=$$(mktemp -d)/records-gambit.ss; \
 	  GEN_RECORDS_OUT="$$out" $(CHEZ) --script host/gambit/gen-records.ss >/dev/null; \
 	  if diff -q "$$out" host/gambit/records-gambit.ss >/dev/null; then \
-	    echo "gambitgencheck: records-gambit.ss is current with records.ss"; \
+	    echo "gambitgencheck: records-gambit.ss is current with the records files"; \
 	  else \
 	    echo "gambitgencheck: host/gambit/records-gambit.ss is STALE — run 'make gambitgen'" >&2; \
 	    diff -u host/gambit/records-gambit.ss "$$out" | head -40 >&2; \

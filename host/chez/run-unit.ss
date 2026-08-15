@@ -67,7 +67,9 @@
   (for-each (lambda (cr) (unless (eq? (var-cell-root (car cr)) (cdr cr))
                            (var-cell-root-set! (car cr) (cdr cr)))) zj-roots)
   (jolt-with-mutex ns-registry-mu (zj-prune! ns-registry zj-ns-base))  ; same rule as var-table (ns.ss)
-  (zj-prune! type-registry zj-type-base)
+  ; the protocol tree AND its by-method index, through the one entry
+  ; point that keeps them in step (protocols.ss)
+  (prune-type-registry! (lambda (k) (hashtable-ref zj-type-base k #f)))
   ;; roll back the loader dedup — a row's require must reload for the next row,
   ;; since the vars it defined were just pruned from var-table
   (vector-for-each (lambda (k) (unless (hashtable-ref zj-loaded-base k #f)

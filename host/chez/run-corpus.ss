@@ -60,7 +60,9 @@
   (for-each (lambda (cr) (unless (eq? (var-cell-root (car cr)) (cdr cr))
                            (var-cell-root-set! (car cr) (cdr cr)))) zj-roots)
   (jolt-with-mutex ns-registry-mu (zj-prune! ns-registry zj-ns-base))  ; same rule as var-table (ns.ss)
-  (zj-prune! type-registry zj-type-base)
+  ; the protocol tree AND its by-method index, through the one entry
+  ; point that keeps them in step (protocols.ss)
+  (prune-type-registry! (lambda (k) (hashtable-ref zj-type-base k #f)))
   (hashtable-clear! ns-alias-table)
   (hashtable-clear! ns-refer-table)
   (hashtable-clear! ns-refer-all-table)
