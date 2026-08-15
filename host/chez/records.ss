@@ -490,13 +490,26 @@
                 (or (= i n)
                     (and (jolt=2 (jrec-field-ref a i) (jrec-field-ref b i)) (loop (+ i 1)))))))
        (jrec-ext=? (jrec-ext a) (jrec-ext b))))
+;; The class-hash half of a record's hash is a murmur over the type tag, so it
+;; is a per-TYPE constant — but it was recomputed on every hash of every
+;; instance, walking the tag's characters each time. A symbol's hasheq is cached
+;; by identity for exactly this reason (symbol-hasheq, hasheq.ss); this is the
+;; same cache keyed by descriptor. Weak, so a redefined type's descriptor stays
+;; collectable; no epoch guard because a descriptor's tag never changes.
+(define jrdesc-class-hash-tbl (make-weak-eq-hashtable))
+(define jrdesc-class-hash-mu (make-mutex))
+(define (jrdesc-class-hash d)
+  (or (hashtable-ref jrdesc-class-hash-tbl d #f)
+      (let ((h (compute-symbol-hasheq #f (jrdesc-tag d))))
+        (jolt-with-mutex jrdesc-class-hash-mu (hashtable-set! jrdesc-class-hash-tbl d h))
+        h)))
 (define (jrec-hash r)
   ;; JVM defrecord hasheq: (bit-xor class-hash map-hasheq)
   ;; class-hash = (hash classname-symbol).
   ;; Jolt symbols store qualified names as a single flat string (e.g. "user.Point")
   ;; with ns=#f, so class-hash = compute-symbol-hasheq(#f, tag).
   ;; map-hasheq = Murmur3.hashUnordered over fields+ext entries
-  (let* ((class-hash (compute-symbol-hasheq #f (jrec-tag r)))
+  (let* ((class-hash (jrdesc-class-hash (jrec-desc r)))
          (fkeys (jrdesc-fkeys (jrec-desc r)))
          (n (jrec-nfields r))
          (result (let loop ((i 0) (acc 0) (cnt 0))

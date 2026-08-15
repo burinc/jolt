@@ -670,8 +670,20 @@
                          (loop (+ i 1)))))))
        (jrec-ext=? (jrec-ext a) (jrec-ext b))))
 
+(define jrdesc-class-hash-tbl (make-weak-eq-hashtable))
+
+(define jrdesc-class-hash-mu (make-mutex))
+
+(define (jrdesc-class-hash d)
+  (or (hashtable-ref jrdesc-class-hash-tbl d #f)
+      (let ((h (compute-symbol-hasheq #f (jrdesc-tag d))))
+        (jolt-with-mutex
+          jrdesc-class-hash-mu
+          (hashtable-set! jrdesc-class-hash-tbl d h))
+        h)))
+
 (define (jrec-hash r)
-  (let* ((class-hash (compute-symbol-hasheq #f (jrec-tag r)))
+  (let* ((class-hash (jrdesc-class-hash (jrec-desc r)))
          (fkeys (jrdesc-fkeys (jrec-desc r)))
          (n (jrec-nfields r))
          (result (let loop ((i 0) (acc 0) (cnt 0))
@@ -819,7 +831,8 @@
              ((jch-isa? tag "clojure.lang.IPersistentMap") 'map)
              (else #f)))
       (jch-isa? tag "java.lang.CharSequence") record?
-      (and (not record?) (tag-declares-coll-iface? tag)))))
+      (and (not record?) (tag-declares-coll-iface? tag))
+      (and (not record?) (tag-declares-sequential? tag)))))
 
 (define (jrdesc-ifc-of x)
   (let* ((d (jrec-desc x)) (c (jrdesc-ifc d)))
@@ -883,19 +896,20 @@
 (define (jrec-declares-coll-iface? x)
   (and (jrec? x) (vector-ref (jrdesc-ifc-of x) 4)))
 
+(define (tag-declares-sequential? tag)
+  (let ((ti (hashtable-ref type-registry tag #f)))
+    (and ti
+         (let loop ((ps (vector->list
+                          (jolt-with-mutex
+                            rec-tbl-mu
+                            (hashtable-keys ti)))))
+           (cond
+             ((null? ps) #f)
+             ((string=? (jch-last-segment (car ps)) "Sequential") #t)
+             (else (loop (cdr ps))))))))
+
 (define (jrec-sequential-decl? x)
-  (and (jrec? x)
-       (not (jrec-record? x))
-       (let ((ti (hashtable-ref type-registry (jrec-tag x) #f)))
-         (and ti
-              (let loop ((ps (vector->list
-                               (jolt-with-mutex
-                                 rec-tbl-mu
-                                 (hashtable-keys ti)))))
-                (cond
-                  ((null? ps) #f)
-                  ((string=? (jch-last-segment (car ps)) "Sequential") #t)
-                  (else (loop (cdr ps)))))))))
+  (and (jrec? x) (vector-ref (jrdesc-ifc-of x) 5)))
 
 (define (seq-eq-candidate? x)
   (or (jolt-sequential? x)

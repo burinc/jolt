@@ -115,7 +115,12 @@
                        (else #f)))
             (jch-isa? tag "java.lang.CharSequence")
             record?
-            (and (not record?) (tag-declares-coll-iface? tag)))))
+            (and (not record?) (tag-declares-coll-iface? tag))
+            ;; slot 5: declares clojure.lang.Sequential. Derived here with the
+            ;; rest because it is asked on the EQUALITY path — every (= record x)
+            ;; consults it for both operands — and answering it from the protocol
+            ;; table meant a mutex and a key-vector allocation per comparison.
+            (and (not record?) (tag-declares-sequential? tag)))))
 (define (jrdesc-ifc-of x)
   (let* ((d (jrec-desc x))
          (c (jrdesc-ifc d)))
@@ -187,14 +192,18 @@
 ;; side's .equiv tests `instanceof Sequential` and then compares element-wise —
 ;; so it governs (= some-vector an-eduction) in both directions. Records are
 ;; excluded: a defrecord is a map, not a sequential.
+;;
+;; Keyed by TAG, like tag-declares-coll-iface? beside it, so jrdesc-derive-ifc
+;; answers it once per type per epoch instead of once per comparison.
+(define (tag-declares-sequential? tag)
+  (let ((ti (hashtable-ref type-registry tag #f)))
+    (and ti
+         (let loop ((ps (vector->list (jolt-with-mutex rec-tbl-mu (hashtable-keys ti)))))
+           (cond ((null? ps) #f)
+                 ((string=? (jch-last-segment (car ps)) "Sequential") #t)
+                 (else (loop (cdr ps))))))))
 (define (jrec-sequential-decl? x)
-  (and (jrec? x) (not (jrec-record? x))
-       (let ((ti (hashtable-ref type-registry (jrec-tag x) #f)))
-         (and ti
-              (let loop ((ps (vector->list (jolt-with-mutex rec-tbl-mu (hashtable-keys ti)))))
-                (cond ((null? ps) #f)
-                      ((string=? (jch-last-segment (car ps)) "Sequential") #t)
-                      (else (loop (cdr ps)))))))))
+  (and (jrec? x) (vector-ref (jrdesc-ifc-of x) 5)))
 ;; Both sides must be seq-comparable for the element-wise path; anything else
 ;; (a number, a map, a bare deftype) is simply not equal to a sequential.
 (define (seq-eq-candidate? x)
