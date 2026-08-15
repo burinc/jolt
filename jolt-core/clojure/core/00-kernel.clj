@@ -50,6 +50,15 @@
      (let [r (jolt.host/as-subvec (jolt.host/slice v s e))]
        (if (and (identical? r v) (meta v)) (with-meta r nil) r)))))
 
+;; Deliberately NOT Clojure's transient fold — (persistent! (reduce (fn [v o]
+;; (conj! v (f o))) (transient []) coll)). That is faster on the JVM and slower
+;; here: measured 5053ns against 2298ns for this body over 32 elements, in one
+;; binary. The same fold written INLINE (with inc in place of f) runs 1499ns, so
+;; the cost is not the fold — it appears only when the element fn arrives as a
+;; parameter, and a bare call through a parameter measures just 20.7ns against
+;; 14.6ns direct, which does not account for the gap. Unexplained; the numbers
+;; are reproducible and that is why this stays. Worth re-deriving before anyone
+;; "fixes" this to match Clojure.
 (defn mapv [f & colls] (vec (apply map f colls)))
 
 (defn update [m k f & args] (assoc m k (apply f (get m k) args)))
