@@ -9,10 +9,16 @@
 ;; The case fns and the searches take any Object s through its toString, like
 ;; the reference ((upper-case :kw) is ":KW", (capitalize 1) is "1"); nil throws
 ;; like calling a method on null.
+;; A string is already its own toString, and it is what essentially every caller
+;; passes. Taking the .toString anyway sent it through the whole method-dispatch
+;; arm chain to reach the String surface — ~550ns on top of a ~40ns
+;; string-upcase, so (upper-case "sel") spent more than 90% of its time deciding
+;; how to dispatch. Every fn in this namespace coerces through here.
 (defn- to-str [s]
-  (if (nil? s)
-    (throw (new NullPointerException "s"))
-    (.toString s)))
+  (cond
+    (string? s) s
+    (nil? s) (throw (new NullPointerException "s"))
+    :else (.toString s)))
 (defn capitalize
   [s]
   (let [s (to-str s)]
