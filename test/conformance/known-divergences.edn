@@ -529,6 +529,7 @@
   {:suite "integer-box-model / narrow int class collapses to Long", :label "byte class", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "short class", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "int class", :category :integer-box-model}
+  {:suite "integer-box-model / narrow int class collapses to Long", :label "bigint of a small value collapses", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Byte is false", :category :integer-box-model}
     {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Long is true", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "float class collapses to Double", :category :integer-box-model}

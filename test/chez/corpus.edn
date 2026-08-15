@@ -3403,6 +3403,11 @@
   {:suite "integer-box-model / narrow int class collapses to Long" :label "byte class" :expected "java.lang.Long" :actual "(class (byte 5))" :portability :common}
   {:suite "integer-box-model / narrow int class collapses to Long" :label "short class" :expected "java.lang.Long" :actual "(class (short 5))" :portability :common}
   {:suite "integer-box-model / narrow int class collapses to Long" :label "int class" :expected "java.lang.Long" :actual "(class (int 5))" :portability :common}
+  ;; bigint coercion joins the collapse: Chez normalizes small bignums away, so
+  ;; (bigint small) IS the fixnum — Long, not BigInt (the cts bigint baseline
+  ;; records the two upstream assertions this fails). Bignum-magnitude values
+  ;; class as BigInt (issue #627).
+  {:suite "integer-box-model / narrow int class collapses to Long" :label "bigint of a small value collapses" :expected "[java.lang.Long false]" :actual "[(class (bigint 21)) (instance? clojure.lang.BigInt (bigint 21))]" :portability :common}
   {:suite "integer-box-model / narrow int class collapses to Long" :label "instance? Byte is false" :expected "false" :actual "(instance? Byte (byte 5))" :portability :common}
   {:suite "integer-box-model / narrow int class collapses to Long" :label "instance? Long is true" :expected "true" :actual "(instance? Long (byte 5))" :portability :common}
   ;; The float side of the same collapse, and the permissive instance? that goes
