@@ -49,6 +49,16 @@
 ;; clojure.core.rrb-vector ns is a thin Clojure layer over these two.
 (def-var! "jolt.host" "catvec" pvec-catvec)
 (def-var! "jolt.host" "slice" pvec-slice)
+;; the class stamp clojure.core/subvec applies to a slice result (issue #629):
+;; a non-empty subvec is clojure.lang.APersistentVector$SubVector, an empty one
+;; is RT.subvec's PersistentVector.EMPTY. slice itself stays unstamped — pop
+;; and the rrb-vector overlay slice without changing class.
+(def-var! "jolt.host" "as-subvec" pvec-as-subvec)
+;; the stack pop primitive (the "pop" op's jolt-pop), for clojure.core/pop's
+;; var body — its vector arm used to slice via subvec, which would now stamp
+;; a plain vector's pop as a SubVector. jolt-pop also carries meta, as
+;; PersistentVector.pop does.
+(def-var! "jolt.host" "pop" jolt-pop)
 ;; The stored entry for k, or nil — the native map's Associative.entryAt. The
 ;; entry's key is the key the MAP holds, which is jolt= to the one probed with but
 ;; is the only one carrying the element's metadata; clojure.core/find reads it.

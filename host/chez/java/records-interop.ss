@@ -90,8 +90,11 @@
 (define (case-string tname val)
   (cond
     ((member tname '("Number" "java.lang.Number")) (number? val))
+    ;; fixnum only: a bignum is the JVM's BigInt, which is not a Long — the
+    ;; broad exact-integer? match answered (instance? Long big) true (issue
+    ;; #627); bignums answer through their BigInt/BigInteger tags instead.
     ((member tname '("Long" "java.lang.Long" "Integer" "java.lang.Integer"))
-     (and (number? val) (exact? val) (integer? val)))
+     (and (number? val) (fixnum? val)))
     ((member tname '("Double" "java.lang.Double" "Float" "java.lang.Float")) (and (number? val) (flonum? val)))
     ((member tname '("Ratio" "clojure.lang.Ratio")) (and (number? val) (exact? val) (rational? val) (not (integer? val))))
     ((member tname '("String" "java.lang.String" "CharSequence" "java.lang.CharSequence")) (string? val))

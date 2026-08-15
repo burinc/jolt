@@ -67,6 +67,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`subvec` answers the JVM's `SubVector` class (#629).** A non-empty
+  `subvec` is `clojure.lang.APersistentVector$SubVector` — extending
+  `APersistentVector` in the modeled hierarchy, so every vector check
+  holds while concrete-class dispatch distinguishes it, exactly as on the
+  JVM — and it stays one under `conj`/`assoc`/`pop`, while rebuilds, an
+  empty range, and popping a plain vector answer `PersistentVector`. The
+  representation is unchanged: still the RRB structural slice, which
+  (unlike the JVM's view) does not retain the backing vector. One shared
+  vector representation carries a kind, the same seam map entries already
+  used.
+
+- **Integer classes are value-sensitive (#627).** `(instance?
+  clojure.lang.BigInt 21)` and `(instance? java.math.BigInteger 21)` were
+  true for every integer; now a fixnum is a `Long` (and an `Integer` —
+  the documented breadth) and neither big class, while a bignum answers
+  `clojure.lang.BigInt` from `class` and `instance?` — the class the
+  JVM's promotion produces — and is no longer a `Long`. A bignum still
+  answers `BigInteger` (one big representation serves both classes), the
+  remaining documented superset.
+
 - **`_` as both a positional and the rest parameter compiles.** `(fn [_ x
   & _] …)` — legal Clojure, the later binder wins — was rejected with
   "invalid parameter list": the duplicate-parameter rename ran over the

@@ -1152,7 +1152,15 @@
   ;; exact ratio -> Ratio, exact integer -> Long.
   (cond ((flonum? obj) '("Double" "Float" "Number" "Object"))
         ((and (number? obj) (exact? obj) (not (integer? obj))) '("Ratio" "Number" "Object"))
-        ((number? obj) '("Long" "Integer" "BigInteger" "BigInt" "Number" "Object"))
+        ;; exact integers split by magnitude (issue #627): a fixnum is a Long,
+        ;; plus the JVM-int breadth ported code checks for (Integer); a bignum
+        ;; is what the JVM boxes as clojure.lang.BigInt. The BigInteger tag
+        ;; stays on bignums — jolt's one big representation serves both
+        ;; classes, a documented superset. A fixnum is NEITHER: (instance?
+        ;; BigInt 21) is false on the JVM and now here.
+        ((and (number? obj) (fixnum? obj)) '("Long" "Integer" "Number" "Object"))
+        ((and (number? obj) (bignum? obj)) '("BigInt" "BigInteger" "Number" "Object"))
+        ((number? obj) '("Number" "Object"))
         ((string? obj) '("String" "CharSequence" "Object"))
         ((boolean? obj) '("Boolean" "Object"))
         ((char? obj) (jch-tags "java.lang.Character"))
@@ -1162,6 +1170,10 @@
         ;; class tags are clojure.lang.MapEntry's (which include APersistentVector,
         ;; so vector checks still hold) plus java.util.Map$Entry.
         ((jolt-map-entry? obj) (jch-tags "clojure.lang.MapEntry"))
+        ;; a subvec view dispatches as the JVM's SubVector: through
+        ;; APersistentVector every vector check holds, but an extend-protocol
+        ;; on the concrete PersistentVector does NOT catch it (issue #629)
+        ((jolt-subvec-view? obj) (jch-tags "clojure.lang.APersistentVector$SubVector"))
         ((pvec? obj) (jch-tags "clojure.lang.PersistentVector"))
         ((pmap? obj) (if (pmap-order obj)
                         (jch-tags "clojure.lang.PersistentArrayMap")

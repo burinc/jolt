@@ -187,12 +187,6 @@
    :jvm "VerifyError at the defn (UnresolvedVarExpr emits nothing)"
    :jolt "42 — the unresolved name compiles to a late-bound var-ref"
    :note "Deliberate. The JVM's UnresolvedVarExpr is unusable in every position; jolt implements the flag's intent."}
-  ;; subvec copies its slice (O(n)) instead of sharing the source vector's tail (JVM O(1)).
-  {:category :impl-detail
-   :behavior "subvec allocates an O(n) copy"
-   :jvm "O(1) subview sharing the source vector"
-   :jolt "O(n) copy"
-   :note "Performance only; values are identical. Deferred this round."}
   ;; defn attaches :arglists to the var (like the JVM); a clojure.core fn jolt
   ;; models as a host native-op (map/reduce/+/…) is def-var!'d directly, not via
   ;; defn, so it carries no :arglists. Overlay defns and all user defns do. jolt-ox7c.29
@@ -359,13 +353,7 @@
    :behavior "(class (float 1.5)), (instance? Float 1.5)"
    :jvm "java.lang.Float, false"
    :jolt "java.lang.Double, true"
-   :note "Chez has one flonum. instance? is deliberately permissive for Float/Double and Integer/Long/BigInt/BigInteger — a value answers to every check its magnitude could satisfy — while Short and Byte stay false. That is a superset of the checks portable code writes; it does NOT follow (supers (class x)), which reports the single collapsed class."}
-  ;; subvec returns a plain vector, so it has no class of its own.
-  {:category :seq-type-model
-   :behavior "(class (subvec [1 2 3 4 5] 1 3))"
-   :jvm "clojure.lang.APersistentVector$SubVector"
-   :jolt "clojure.lang.PersistentVector"
-   :note "jolt's subvec is a vector, not a view class. A library that derives the subvec class from a sample value — lasertag does — then sees every vector as a subvec. Values and behavior are identical; only the class differs."}
+   :note "Chez has one flonum. instance? is deliberately permissive for Float/Double and Integer/Long — a value answers to both spellings of its collapsed class — while Short and Byte stay false. Since #627 the big classes are value-sensitive: BigInt/BigInteger answer only for bignums (which also class as clojure.lang.BigInt), Long/Integer only for fixnums, matching the JVM. A bignum still answers BigInteger (one big representation serves both classes; the JVM says false) — the remaining superset."}
   ;; (.getStackTrace (Thread/currentThread)) is empty. jolt does proper tail calls,
   ;; so the frames a caller-naming API wants are the ones TCO has already erased —
   ;; (defn f [x y] (g x y)) leaves no f frame to find. jolt reports a backtrace for a
@@ -535,7 +523,6 @@
   {:suite "seq-type-model / specialized seq classes collapse", :label "keys", :category :seq-type-model}
   {:suite "seq-type-model / specialized seq classes collapse", :label "rseq", :category :seq-type-model}
   {:suite "seq-type-model / specialized seq classes collapse", :label "sort", :category :seq-type-model}
-  {:suite "seq-type-model / specialized seq classes collapse", :label "subvec", :category :seq-type-model}
   {:suite "seq-type-model / specialized seq classes collapse", :label "drop over a vector", :category :seq-type-model}
   {:suite "chunking-model / unchunked realization granularity", :label "mapcat is fully lazy at construction", :category :chunking-model}
   {:suite "chunking-model / unchunked realization granularity", :label "dedupe is fully lazy at construction", :category :chunking-model}
@@ -546,8 +533,6 @@
     {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Long is true", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "float class collapses to Double", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Float is true", :category :integer-box-model}
-  {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? BigInt is true for any integer", :category :integer-box-model}
-  {:suite "seq-type-model / subvec has no class of its own", :label "subvec class", :category :seq-type-model}
     ;; naa9: vswap! is a macro on the JVM (:macro true) for inline performance;
    ;; jolt implements it as a regular function. Semantics are equivalent — the
    ;; JVM macro is a perf inline, not a semantic difference.

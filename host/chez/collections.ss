@@ -58,6 +58,27 @@
 (define (mk-pvec cnt shift root tail ent)
   (%mk-pvec cnt shift root tail ent 0))
 
+;; `ent` is the vector's KIND, not just the entry flag: #f = plain vector,
+;; #t = map entry (above), 'subvec = a subvec view (class
+;; clojure.lang.APersistentVector$SubVector — issue #629). One shared
+;; representation; only the class answer and its jch tags differ. Readers must
+;; test the kind explicitly, never truthiness.
+;;
+;; The kind a modifying op's result carries: an entry decays to a plain vector
+;; (documented above), a subvec stays a subvec — the JVM's SubVector answers
+;; cons/assocN/pop with a SubVector.
+(define (pv-derived-ent p) (let ((e (pvec-ent p))) (if (eq? e #t) #f e)))
+;; same structure, same cached hash, a different kind (fresh identity: the meta
+;; side-table keys by identity, and a subvec is a fresh nil-meta view anyway)
+(define (pvec-with-ent p e)
+  (if (eq? (pvec-ent p) e)
+      p
+      (%mk-pvec (pvec-cnt p) (pvec-shift p) (pvec-root p) (pvec-tail p) e (pvec-hasheq p))))
+;; the public subvec stamp: a non-empty slice is a SubVector; an empty one is
+;; RT.subvec's PersistentVector.EMPTY, so it stays plain
+(define (pvec-as-subvec r)
+  (if (and (pvec? r) (fx>? (pvec-cnt r) 0)) (pvec-with-ent r 'subvec) r))
+
 ;; trailing helpers over Scheme vectors used by the trie
 (define (vec-snoc v x)                 ; copy v with x appended
   (let* ((n (vector-length v)) (out (make-vector (fx+ n 1))))
@@ -153,18 +174,18 @@
     (cond
       ((fx<? (vector-length (pvec-tail p)) pv-width)
        ;; room in the tail (classic and RRB alike)
-       (mk-pvec (fx+ cnt 1) shift (pvec-root p) (vec-snoc (pvec-tail p) x) #f))
+       (mk-pvec (fx+ cnt 1) shift (pvec-root p) (vec-snoc (pvec-tail p) x) (pv-derived-ent p)))
       ((rrbnode? (pvec-root p))
        ;; tail full under a relaxed root: push it down the rightmost spine
        (let* ((tail-node (pvec-tail p))
               (pushed (rrb-push-leaf (pvec-root p) shift tail-node)))
          (if pushed
-             (mk-pvec (fx+ cnt 1) shift pushed (vector x) #f)
+             (mk-pvec (fx+ cnt 1) shift pushed (vector x) (pv-derived-ent p))
              (let ((trie-cnt (fx- cnt pv-width)))   ; count already in the trie
                (mk-pvec (fx+ cnt 1) (fx+ shift pv-bits)
                         (make-rrbnode (vector trie-cnt cnt)
                                       (vector (pvec-root p) (pv-new-path shift tail-node)))
-                        (vector x) #f)))))
+                        (vector x) (pv-derived-ent p))))))
       (else
        ;; tail full: push it into the classic trie, start a fresh tail
        (let ((tail-node (pvec-tail p)))
@@ -172,10 +193,10 @@
              ;; root overflow: grow the trie a level
              (mk-pvec (fx+ cnt 1) (fx+ shift pv-bits)
                       (vector (pvec-root p) (pv-new-path shift tail-node))
-                      (vector x) #f)
+                      (vector x) (pv-derived-ent p))
              (mk-pvec (fx+ cnt 1) shift
                       (pv-push-tail cnt shift (pvec-root p) tail-node)
-                      (vector x) #f)))))))
+                      (vector x) (pv-derived-ent p))))))))
 
 (define (pv-assoc-trie level node i x)
   (cond
@@ -200,9 +221,9 @@
        (let ((tailoff (pv-tailoff-of p)))
          (if (fx>=? i tailoff)
              (mk-pvec cnt (pvec-shift p) (pvec-root p)
-                      (vec-set (pvec-tail p) (fx- i tailoff) x) #f)
+                      (vec-set (pvec-tail p) (fx- i tailoff) x) (pv-derived-ent p))
              (mk-pvec cnt (pvec-shift p)
-                      (pv-assoc-trie (pvec-shift p) (pvec-root p) i x) (pvec-tail p) #f))))
+                      (pv-assoc-trie (pvec-shift p) (pvec-root p) i x) (pvec-tail p) (pv-derived-ent p)))))
       (else (jolt-throw (jolt-host-throwable "java.lang.IndexOutOfBoundsException" "vector index out of bounds"))))))
 (define (pvec-peek p)
   (let ((n (pvec-cnt p))) (if (fx=? n 0) jolt-nil (pvec-nth-d p (fx- n 1) jolt-nil))))
@@ -223,10 +244,11 @@
       ((fx=? cnt 0) (jolt-throw (jolt-host-throwable "java.lang.IllegalStateException" "Can't pop empty vector")))
       ((fx=? cnt 1) empty-pvec)
       ((fx>? (vector-length (pvec-tail p)) 1)
-       (mk-pvec (fx- cnt 1) shift (pvec-root p) (vec-drop-last (pvec-tail p)) #f))
+       (mk-pvec (fx- cnt 1) shift (pvec-root p) (vec-drop-last (pvec-tail p)) (pv-derived-ent p)))
       ((rrbnode? (pvec-root p))
-       ;; relaxed trie: pop is a slice — O(log n) via the take machinery
-       (pvec-slice p 0 (fx- cnt 1)))
+       ;; relaxed trie: pop is a slice — O(log n) via the take machinery;
+       ;; re-stamp the kind the slice result should carry (slice is unstamped)
+       (pvec-with-ent (pvec-slice p 0 (fx- cnt 1)) (pv-derived-ent p)))
       (else
        (let* ((new-tail (pv-chunk-for p (fx- cnt 2)))
               (popped (pv-pop-tail cnt shift (pvec-root p)))
@@ -234,8 +256,8 @@
          (if (and (fx>? shift pv-bits) (fx<? (vector-length new-root) 2))
              (mk-pvec (fx- cnt 1) (fx- shift pv-bits)
                       (if (fx=? 0 (vector-length new-root)) pv-empty-node (vector-ref new-root 0))
-                      new-tail #f)
-             (mk-pvec (fx- cnt 1) shift new-root new-tail #f)))))))
+                      new-tail (pv-derived-ent p))
+             (mk-pvec (fx- cnt 1) shift new-root new-tail (pv-derived-ent p))))))))
 
 (define empty-pvec (mk-pvec 0 pv-bits pv-empty-node (vector) #f))
 ;; build a trie pvec from a flat Scheme vector (the public constructor).
@@ -263,7 +285,8 @@
           out))))
 (define (jolt-vector . xs) (make-pvec (list->vector xs)))
 (define (make-map-entry k v) (make-pvec (vector k v) #t))
-(define (jolt-map-entry? x) (and (pvec? x) (pvec-ent x) #t))
+(define (jolt-map-entry? x) (and (pvec? x) (eq? (pvec-ent x) #t)))
+(define (jolt-subvec-view? x) (and (pvec? x) (eq? (pvec-ent x) (quote subvec))))
 
 ;; ============================================================================
 ;; RRB concat / slice — O(log n) pvec-catvec and pvec-slice

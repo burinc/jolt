@@ -293,6 +293,11 @@
 (jch-register-supers! "clojure.lang.APersistentVector" '("clojure.lang.IPersistentVector" "java.util.List"))
 (jch-register-supers! "clojure.lang.PersistentVector" '("clojure.lang.APersistentVector" "clojure.lang.IObj"
                                                         "java.util.List" "java.lang.Comparable"))
+;; subvec's view class (issue #629): an APersistentVector, so every vector
+;; check holds; not a PersistentVector, so concrete-class dispatch doesn't
+(jch-register-supers! "clojure.lang.APersistentVector$SubVector"
+                      '("clojure.lang.APersistentVector" "clojure.lang.IObj"
+                        "java.util.List" "java.lang.Comparable"))
 (jch-register-supers! "clojure.lang.APersistentMap" '("clojure.lang.IPersistentMap" "java.util.Map"))
 (jch-register-supers! "clojure.lang.PersistentArrayMap" '("clojure.lang.APersistentMap" "clojure.lang.IObj"))
 (jch-register-supers! "clojure.lang.PersistentHashMap" '("clojure.lang.APersistentMap" "clojure.lang.IObj"))
