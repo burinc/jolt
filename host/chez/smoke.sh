@@ -163,6 +163,19 @@ check '(require [clojure.string :as s]) (s/upper-case "hello")' '"HELLO"'
 # reader conditionals match :bb ahead of :clj (like babashka); clause order wins
 check '#?(:bb :bb-branch :clj :clj-branch)' ':bb-branch'
 check '#?(:clj :clj-first :bb :bb-second)' ':clj-first'
+# -M with a bare script path runs it the way clojure.main does: the file loads,
+# the remaining args become *command-line-args* (jolt-s9zc).
+mfile_dir="$(mktemp -d)"
+printf '(println (str "script-ran:" (pr-str *command-line-args*)))' > "$mfile_dir/script.clj"
+mfile_out="$($jolt -M "$mfile_dir/script.clj" a b 2>&1 | tail -1)"
+if [ "$mfile_out" = 'script-ran:("a" "b")' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: -M script path"
+  echo "    want \`script-ran:(\"a\" \"b\")\` got \`$mfile_out\`"
+  fails=$((fails + 1))
+fi
+rm -rf "$mfile_dir"
 # resolve returns the class for a class mapping, the var for a var
 check '[(class? (resolve (quote String))) (= (resolve (quote java.util.Map)) java.util.Map) (var? (resolve (quote map)))]' '[true true true]'
 # The source a binary serves for a namespace is jolt's own, not a same-named one
