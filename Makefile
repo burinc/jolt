@@ -124,7 +124,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscali
   inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck lockcheck parkcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
-  certify gambitcheck gambitgencheck grenadinecheck fibers gosm asynctimer threadsafety
+  certify gambitcheck gambitgencheck gambitboot grenadinecheck fibers gosm asynctimer threadsafety
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -817,6 +817,23 @@ gambitprofile:
 		"$(GAMBIT_GSI)" host/gambit/profile-test.ss; \
 	else \
 		echo "gambitprofile: gambit-scheme not installed (brew) — skipped"; \
+	fi
+
+# The full-profile boot comes up on gsi: the js and gsi targets share the boot,
+# and NOTHING else runs its top level end to end — the shipped web REPL hung at
+# boot for a week of commits (unbound jolt-with-mutex at the first keyword
+# intern) while every other gambit gate stayed green. Skipped, like the other
+# gambit gates, when gambit-scheme is absent.
+gambitboot:
+	@if [ -x "$(GAMBIT_GSI)" ]; then \
+	  $(CHEZ) --script host/gambit/gen-boot.ss full; \
+	  out=$$(cd host/gambit && "$(GAMBIT_GSI)" boot-probe.scm < /dev/null 2>&1); \
+	  case "$$out" in \
+	    *BOOT-OK*) echo "gambitboot: full-profile boot OK on gsi";; \
+	    *) printf '%s\n' "$$out" | tail -20; echo "gambitboot: FAILED — full-profile boot did not reach BOOT-OK" >&2; exit 1;; \
+	  esac; \
+	else \
+	  echo "gambitboot: gambit-scheme not installed (brew) — skipped"; \
 	fi
 
 # The browser bundle: the whole stack (kernel + seed + compiler + a queue-polling

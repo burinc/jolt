@@ -439,7 +439,8 @@
   (let loop ((n (string-length s)))
     (cond ((= n 0) "")
           ((memv (string-ref s (- n 1)) '(#
-ewline #eturn)) (loop (- n 1)))
+ewline #
+eturn)) (loop (- n 1)))
           (else (substring s 0 n)))))
 
 (define (condition? x)
@@ -462,12 +463,26 @@ ewline #eturn)) (loop (- n 1)))
   (if (pair? rest) (mutex-lock! m (car rest)) (mutex-lock! m)))
 (define (mutex-release m) (mutex-unlock! m))
 
+;; jolt-with-mutex is Chez locks.ss's carrier-aware with-mutex. This host has
+;; no fiber carriers, so it is lock/unlock — defined HERE because shared chez
+;; files run it at boot (values.ss interns its first keyword under the
+;; keyword-table lock) and records-gambit.ss uses it in dispatch paths.
+;; REENTRANT, because Chez mutexes are recursive and SRFI-18's are not: code
+;; that relocks a mutex it holds (the interner does, first thing at boot) is
+;; correct on Chez and a self-deadlock here unless the held case runs inline.
+(define (jwm-call mu thunk)
+  (if (eq? (mutex-state mu) (current-thread))
+      (thunk)
+      (dynamic-wind (lambda () (mutex-lock! mu))
+                    thunk
+                    (lambda () (mutex-unlock! mu)))))
+(define-syntax jolt-with-mutex
+  (syntax-rules ()
+    ((_ m e1 e2 ...) (jwm-call m (lambda () e1 e2 ...)))))
+
 (define-syntax with-mutex
   (syntax-rules ()
-    ((_ m body ...)
-     (dynamic-wind (lambda () (mutex-lock! m))
-                   (lambda () body ...)
-                   (lambda () (mutex-unlock! m))))))
+    ((_ m e1 e2 ...) (jwm-call m (lambda () e1 e2 ...)))))
 
 (define (make-thread-parameter init) (make-parameter init))
 
