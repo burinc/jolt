@@ -1316,11 +1316,15 @@
 (load "host/chez/java/class-hierarchy.ss")
 
 ;; records + protocols: defrecord/deftype/defprotocol/
-;; extend-type/reify. A jrec record type set!-extended into the collection
-;; dispatchers + a protocol registry. After multimethods.ss (chez-current-ns) and
-;; the dispatchers/printers it wraps (collections/seq/values/converters/printing/
-;; transients).
+;; extend-type/reify. Four files, order load-bearing: the jrec layout, its arms
+;; on the collection dispatchers, the protocol registry + resolution, and the
+;; .method interop dispatcher. After multimethods.ss (chez-current-ns) and the
+;; dispatchers/printers the arms wrap (collections/seq/values/converters/
+;; printing/transients).
 (load "host/chez/records.ss")
+(load "host/chez/records-coll.ss")
+(load "host/chez/protocols.ss")
+(load "host/chez/records-dispatch.ss")
 (load "host/chez/java/records-interop.ss")   ; exception hierarchy + instance-check taxonomy
 
 ;; metadata: meta / with-meta over an identity-keyed

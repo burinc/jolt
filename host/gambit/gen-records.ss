@@ -1,5 +1,6 @@
-;; gen-records.ss — generate host/gambit/records-gambit.ss from
-;; host/chez/records.ss. Run on CHEZ via `make gambitgen`:
+;; gen-records.ss — generate host/gambit/records-gambit.ss from the four
+;; host/chez records files (records.ss, records-coll.ss, protocols.ss,
+;; records-dispatch.ss). Run on CHEZ via `make gambitgen`:
 ;;   chez --script host/gambit/gen-records.ss
 ;;
 ;; WHY: records.ss's define-jrec-family is a PROCEDURAL transformer whose body
@@ -18,7 +19,12 @@
 ;; Gambit does not read Chez-style brackets — emit parens only.
 (print-brackets #f)
 
-(define src "host/chez/records.ss")
+;; The records subsystem is four chez files, concatenated here in their rt.ss
+;; load order — the single gambit include preserves the total form order.
+(define srcs '("host/chez/records.ss"
+               "host/chez/records-coll.ss"
+               "host/chez/protocols.ss"
+               "host/chez/records-dispatch.ss"))
 ;; GEN_RECORDS_OUT redirects the write, which is what `make gambitgencheck` uses
 ;; to generate into a temp file and diff against the committed one.
 (define out (or (getenv "GEN_RECORDS_OUT") "host/gambit/records-gambit.ss"))
@@ -30,13 +36,13 @@
         (let ((x (read)))
           (if (eof-object? x) (reverse acc) (loop (cons x acc))))))))
 
-(define forms (read-all src))
+(define forms (apply append (map read-all srcs)))
 
 ;; the transformer lambda from (define-syntax define-jrec-family (lambda (x) ...))
 (define transformer
   (let loop ((fs forms))
     (cond
-      ((null? fs) (error 'gen-records "define-jrec-family not found in" src))
+      ((null? fs) (error 'gen-records "define-jrec-family not found in" srcs))
       ((and (pair? (car fs))
             (eq? (caar fs) 'define-syntax)
             (eq? (cadar fs) 'define-jrec-family))
@@ -49,10 +55,11 @@
   (syntax->datum (transformer (datum->syntax #'here form))))
 
 (define port (open-output-file out 'replace))
-(put-string port ";; records-gambit.ss — GENERATED from host/chez/records.ss by\n")
-(put-string port ";; host/gambit/gen-records.ss (make gambitgen). Do not edit; regenerate\n")
-(put-string port ";; when records.ss changes. The define-jrec-family transformer is\n")
-(put-string port ";; expansion-phase-hostile on Gambit; its uses are pre-expanded here.\n\n")
+(put-string port ";; records-gambit.ss — GENERATED from host/chez/{records,records-coll,\n")
+(put-string port ";; protocols,records-dispatch}.ss by host/gambit/gen-records.ss (make\n")
+(put-string port ";; gambitgen). Do not edit; regenerate when any of the four changes. The\n")
+(put-string port ";; define-jrec-family transformer is expansion-phase-hostile on Gambit;\n")
+(put-string port ";; its uses are pre-expanded here.\n\n")
 (for-each
   (lambda (f)
     (cond

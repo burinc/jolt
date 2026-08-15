@@ -1,7 +1,8 @@
-;; records-gambit.ss — GENERATED from host/chez/records.ss by
-;; host/gambit/gen-records.ss (make gambitgen). Do not edit; regenerate
-;; when records.ss changes. The define-jrec-family transformer is
-;; expansion-phase-hostile on Gambit; its uses are pre-expanded here.
+;; records-gambit.ss — GENERATED from host/chez/{records,records-coll,
+;; protocols,records-dispatch}.ss by host/gambit/gen-records.ss (make
+;; gambitgen). Do not edit; regenerate when any of the four changes. The
+;; define-jrec-family transformer is expansion-phase-hostile on Gambit;
+;; its uses are pre-expanded here.
 
 (define-record-type (jrdesc make-jrdesc-rec jrdesc?)
   (fields tag fkeys index (mutable ptable))
