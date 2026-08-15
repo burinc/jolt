@@ -928,13 +928,23 @@
 ;; quotes), chars as `\c`/`\newline`, collections recursively. NOTE: maps/sets
 ;; render in HAMT-iteration order, which is not a stable insertion order —
 ;; so unordered values are compared via `=` (true/false), not printed form.
-(define (jolt-str-join strs)
+;; One pass through a string port: a right-fold of string-append re-copied the
+;; whole joined suffix per element — O(n*L) on every collection render, and a
+;; recursion as deep as the list (`make printscaling` gates the shape).
+(define (jolt-str-join-sep strs sep)
   (cond ((null? strs) "") ((null? (cdr strs)) (car strs))
-        (else (string-append (car strs) " " (jolt-str-join (cdr strs))))))
+        (else
+         (let-values (((op get) (open-string-output-port)))
+           (put-string op (car strs))
+           (let loop ((r (cdr strs)))
+             (unless (null? r)
+               (put-string op sep)
+               (put-string op (car r))
+               (loop (cdr r))))
+           (get)))))
+(define (jolt-str-join strs) (jolt-str-join-sep strs " "))
 ;; map ENTRIES join with ", " like the reference printer: {:a 1, :b 2}
-(define (jolt-str-join-comma strs)
-  (cond ((null? strs) "") ((null? (cdr strs)) (car strs))
-        (else (string-append (car strs) ", " (jolt-str-join-comma (cdr strs))))))
+(define (jolt-str-join-comma strs) (jolt-str-join-sep strs ", "))
 (define (jolt-char->string c)
   (if (jolt-pr-readable?)
       (string-append "\\" (case c ((#\newline) "newline") ((#\space) "space") ((#\tab) "tab")

@@ -411,8 +411,10 @@
 (define (str-reverse-b s) (list->string (reverse (string->list s))))
 
 ;; (str-find needle haystack) -> exact int index of first occurrence, or nil.
-(define (str-find needle s)
-  (let ((i (str-index-of s needle 0)))
+;; optional third arg: search from that index (the IReader cursors use it so a
+;; line drain does not re-copy the tail just to search it).
+(define (str-find needle s . opt)
+  (let ((i (str-index-of s needle (if (pair? opt) (car opt) 0))))
     (if (fx<? i 0) jolt-nil i)))
 
 ;; (str-join coll [sep]) -> stringify each element (Clojure str), join by sep.

@@ -56,7 +56,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling vecscaling pipescaling chunkscaling \
+  readscaling vecscaling pipescaling chunkscaling printscaling ioscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
   gateboot gatebootsmoke gosm httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
@@ -116,7 +116,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling depssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling ioscaling depssmoke depscpcache depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
@@ -389,6 +389,18 @@ pipescaling: testbin
 # re-copied item list, and the cap argument was ignored.
 chunkscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/chunk_scaling_test.clj
+
+# Printing a collection costs O(printed length): jolt-str-join was a right-fold
+# of string-append (each element re-copied the whole joined suffix), on every
+# pr-str/str/prn of any collection, record, or sorted coll.
+printscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/print_scaling_test.clj
+
+# Draining *in* / with-in-str by lines or forms costs O(input), not
+# O(input x items): the IReader buffer atoms re-copied (and read re-parsed) the
+# whole remaining input per item until the [string offset] cursor rework.
+ioscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/io_scaling_test.clj
 
 # deps.edn alias + CLI semantics (tools.deps args-map keys, -X/-T/-Sdeps, the
 # user deps.edn chain, jar/git coordinates) through the real CLI, over local
