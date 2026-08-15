@@ -1708,4 +1708,19 @@
   ;; Appending past the declared cap grows the buffer — a jolt superset (the JVM
   ;; ChunkBuffer throws); portable rows are in the corpus ("chunk-builder API").
   {:suite "chunk-builder overflow" :expr "(let [b (chunk-buffer 2)] (dotimes [i 5] (chunk-append b i)) (let [c (chunk b)] [(count c) (nth c 4)]))" :expected "[5 4]"}
+
+  ;; (scheme ...) — inline Scheme, do-shaped: jolt READS the body (so booleans,
+  ;; chars, and vectors are written in jolt spellings and rendered to Scheme),
+  ;; multiple forms behave like (begin ...) with define splicing, and the last
+  ;; form's value returns on jolt.scheme's raw crossing contract.
+  {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (jolt.scheme/scheme (+ 1 2)))" :expected "3"}
+  {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (jolt.scheme/scheme 1 2 3))" :expected "3"}
+  {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (jolt.scheme/scheme (define sm-probe-x 40) (fx+ sm-probe-x 2)))" :expected "42"}
+  {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (jolt.scheme/scheme (if true (string-length \"abc\") 0)))" :expected "3"}
+  {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (jolt.scheme/scheme (if false 1 (char->integer \\A))))" :expected "65"}
+  {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (jolt.scheme/scheme (vector-length [1 2 3])))" :expected "3"}
+  {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (jolt.scheme/scheme (symbol->string (car '(alpha beta)))))" :expected "\"alpha\""}
+  {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (jolt.scheme/scheme (let loop ((i 0) (acc 0)) (if (fx=? i 5) acc (loop (fx+ i 1) (fx+ acc i))))))" :expected "10"}
+  ;; a keyword has no Scheme reading — macroexpansion refuses it
+  {:suite "scheme-macro" :expr "(do (require 'jolt.scheme) (try (eval '(jolt.scheme/scheme (list :kw))) :no-throw (catch Exception e :threw)))" :expected ":threw"}
 ]

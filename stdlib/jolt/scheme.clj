@@ -41,3 +41,59 @@
   (defsfn fx+ \"fx+\") then (fx+ 1 2). Resolution happens at load time."
   [name scheme-name]
   (list 'def name (list 'jolt.scheme/proc scheme-name)))
+
+;; --- (scheme ...): inline Scheme, do-shaped ----------------------------------
+;; The body is READ BY JOLT (the two syntaxes share the s-expression family),
+;; so Scheme spellings jolt's reader rejects are written in jolt spellings and
+;; rendered across: true/false -> #t/#f, \\A -> #\\A, [1 2 3] -> the datum
+;; vector #(1 2 3), nil -> jolt-nil (the runtime's nil value, a bound host
+;; global). Strings, numbers, and ratios print compatibly. Keywords, maps, and
+;; sets have no Scheme reading and are refused at macroexpansion. Reader sugar
+;; that expands to clojure.core calls (@x, syntax-quote) lands as unbound
+;; Scheme names — write (unquote ...) longhand or avoid it.
+
+(def ^:private scheme-char-names
+  {\newline "#\\newline" \space "#\\space" \tab "#\\tab"
+   \return "#\\return" \backspace "#\\backspace" \formfeed "#\\page"})
+
+(defn- form->scheme
+  "Render a jolt-read form as Scheme source text. quoted? tracks whether f
+  sits inside (quote ...)/(quasiquote ...) — it decides only how a VECTOR
+  renders: #(...) is a datum, not an expression, in R6RS, so an expression
+  position gets (quote #(...)) and a datum position the bare literal.
+  (unquote ...) under quasiquote re-enters expression position."
+  ([f] (form->scheme f false))
+  ([f quoted?]
+   (cond
+     (true? f)    "#t"
+     (false? f)   "#f"
+     (nil? f)     "jolt-nil"
+     (symbol? f)  (str f)
+     (string? f)  (pr-str f)
+     (char? f)    (or (get scheme-char-names f) (str "#\\" f))
+     (number? f)  (pr-str f)
+     (vector? f)  (let [datum (str "#(" (apply str (interpose " " (map (fn [x] (form->scheme x true)) f))) ")")]
+                    (if quoted? datum (str "(quote " datum ")")))
+     (seq? f)
+     (let [head (first f)]
+       (cond
+         (and (not quoted?) (= 2 (count f)) (or (= head 'quote) (= head 'quasiquote)))
+         (str "(" head " " (form->scheme (second f) true) ")")
+         (and quoted? (= 2 (count f)) (or (= head 'unquote) (= head 'unquote-splicing)))
+         (str "(" head " " (form->scheme (second f) false) ")")
+         :else
+         (str "(" (apply str (interpose " " (map (fn [x] (form->scheme x quoted?)) f))) ")")))
+     :else (throw (ex-info (str "form has no Scheme rendering: " (pr-str f)
+                                (when (keyword? f) " (keywords are not Scheme syntax)"))
+                           {:form f})))))
+
+(defmacro scheme
+  "Inline Scheme. The body forms are rendered to Scheme source at
+  macroexpansion (see the spellings note above) and evaluated with the host's
+  eval — multiple forms behave like (begin ...), so a define splices into the
+  interaction environment and the LAST form's value is returned, as with do.
+  Values cross on this namespace's raw contract."
+  [& forms]
+  (if (empty? forms)
+    nil
+    (list 'jolt.scheme/eval-string (form->scheme (cons 'begin forms)))))
