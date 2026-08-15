@@ -10,7 +10,13 @@
 (defn intersection
   ([s1] s1)
   ([s1 s2]
-   (reduce (fn [acc item] (if (contains? s2 item) acc (disj acc item))) s1 s1))
+   ;; walk the SMALLER side (the reference's swap): probing is O(1) either way,
+   ;; but the reduce walks and rebuilds from its first argument, so
+   ;; intersecting a million-element set with a three-element one must cost 3,
+   ;; not a million.
+   (if (< (count s2) (count s1))
+     (recur s2 s1)
+     (reduce (fn [acc item] (if (contains? s2 item) acc (disj acc item))) s1 s1)))
   ([s1 s2 & sets] (reduce intersection (intersection s1 s2) sets)))
 
 (defn difference

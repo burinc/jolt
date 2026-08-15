@@ -63,6 +63,7 @@
   (jolt-with-mutex var-table-mu
     (vector-for-each (lambda (k) (unless (hashtable-ref zj-base k #f) (hashtable-delete! var-table k)))
                      (hashtable-keys var-table)))
+  (rebuild-ns-cells-index!)   ; the prune bypassed the ns->cells buckets (rt.ss)
   (for-each (lambda (cr) (unless (eq? (var-cell-root (car cr)) (cdr cr))
                            (var-cell-root-set! (car cr) (cdr cr)))) zj-roots)
   (jolt-with-mutex ns-registry-mu (zj-prune! ns-registry zj-ns-base))  ; same rule as var-table (ns.ss)

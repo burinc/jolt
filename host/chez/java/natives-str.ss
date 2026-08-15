@@ -431,8 +431,9 @@
 (define (re-split irx s limit)
   (let* ((s (jolt-need-str s))
          (len (string-length s)))
-    (let loop ((start 0) (last 0) (out '()))
-      (if (and limit (fx>=? (length out) (fx- limit 1)))
+    ;; nout counts out — (length out) per part made a limited split O(parts^2)
+    (let loop ((start 0) (last 0) (out '()) (nout 0))
+      (if (and limit (fx>=? nout (fx- limit 1)))
           (reverse (cons (substring s last len) out))
           (let ((m (and (fx<=? start len) (irx-search-from irx s start))))
             (if (not m)
@@ -445,11 +446,10 @@
                           ;; Emit the segment from last to this match point, skip
                           ;; leading empty (JVM semantics for zero-width splits).
                           (let ((seg (substring s last ms)))
-                            (loop (fx+ start 1) me
-                                  (if (and (string=? seg "") (null? out))
-                                      out
-                                      (cons seg out)))))
-                      (loop me me (cons (substring s last ms) out))))))))))
+                            (if (and (string=? seg "") (null? out))
+                                (loop (fx+ start 1) me out nout)
+                                (loop (fx+ start 1) me (cons seg out) (fx+ nout 1)))))
+                      (loop me me (cons (substring s last ms) out) (fx+ nout 1))))))))))
 
 ;; JVM split semantics over re-split, shared by String.split and Pattern.split:
 ;;   limit > 0   at most `limit` parts, the last left unsplit

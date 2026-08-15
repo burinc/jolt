@@ -492,27 +492,59 @@
 ;;     once true never stops being true.
 (define timeout-mu (make-mutex))
 (define timeout-cv (make-condition))
-(define timeout-pending '())       ; ((deadline-ms . thunk) ...) sorted asc
+;; Pending timeouts as a binary min-heap on deadline — #(deadline . thunk)
+;; entries in timeout-heap[0..n), guarded by timeout-mu like the sorted list it
+;; replaces. The list insert walked O(k) per (timeout ms) with k pending —
+;; O(k^2) to arm a burst — and the consumer only ever takes the MIN, which is
+;; the heap's O(log k) case. Entries with EQUAL deadlines pop in arbitrary
+;; order; they were already batched into one collect, so nothing promised an
+;; order between them.
+(define timeout-heap (make-vector 64 #f))
+(define timeout-heap-n 0)
 (define timeout-running? #f)       ; the one timer thread has been forked
 
-;; -> #t iff the new entry is the HEAD of the list, i.e. the caller must signal.
+(define (theap-less? a b) (< (car a) (car b)))
+(define (theap-min) (and (fx>? timeout-heap-n 0) (vector-ref timeout-heap 0)))
+(define (theap-insert! entry)
+  (when (fx=? timeout-heap-n (vector-length timeout-heap))
+    (let ((w (make-vector (fx* 2 timeout-heap-n) #f)))
+      (do ((i 0 (fx+ i 1))) ((fx=? i timeout-heap-n)) (vector-set! w i (vector-ref timeout-heap i)))
+      (set! timeout-heap w)))
+  (let sift ((i timeout-heap-n))
+    (if (fx=? i 0)
+        (vector-set! timeout-heap 0 entry)
+        (let* ((p (fxquotient (fx- i 1) 2)) (pv (vector-ref timeout-heap p)))
+          (if (theap-less? entry pv)
+              (begin (vector-set! timeout-heap i pv) (sift p))
+              (vector-set! timeout-heap i entry)))))
+  (set! timeout-heap-n (fx+ timeout-heap-n 1)))
+(define (theap-pop-min!)
+  (let ((top (vector-ref timeout-heap 0))
+        (n (fx- timeout-heap-n 1)))
+    (set! timeout-heap-n n)
+    (let ((item (vector-ref timeout-heap n)))
+      (vector-set! timeout-heap n #f)
+      (when (fx>? n 0)
+        (let sift ((i 0))
+          (let* ((l (fx+ (fx* 2 i) 1))
+                 (r (fx+ l 1))
+                 (m (if (and (fx<? l n) (theap-less? (vector-ref timeout-heap l) item)) l i))
+                 (m (if (and (fx<? r n)
+                             (theap-less? (vector-ref timeout-heap r)
+                                          (if (fx=? m i) item (vector-ref timeout-heap m))))
+                        r m)))
+            (if (fx=? m i)
+                (vector-set! timeout-heap i item)
+                (begin (vector-set! timeout-heap i (vector-ref timeout-heap m)) (sift m)))))))
+    top))
+
+;; -> #t iff the new entry became the earliest deadline, i.e. the caller must
+;; signal the timer to re-read its wake time (same contract as the old list:
+;; empty, or strictly earlier than the previous minimum).
 (define (timeout-insert! deadline-ms thunk)
-  (let loop ((prev '()) (cur timeout-pending))
-    (cond ((null? cur)
-           (let ((entry (cons deadline-ms thunk)))
-             (if (null? prev)
-                 (set! timeout-pending (list entry))
-                 (set-cdr! prev (list entry))))
-           ;; The end is the head only when the list was empty. Appending behind
-           ;; an existing entry leaves the timer's next wake correct as it is.
-           (null? prev))
-          ((< deadline-ms (caar cur))
-           (let ((entry (cons deadline-ms thunk)))
-             (if (null? prev)
-                 (set! timeout-pending (cons entry cur))
-                 (set-cdr! prev (cons entry cur))))
-           (null? prev))
-          (else (loop cur (cdr cur))))))
+  (let ((prev-min (theap-min)))
+    (theap-insert! (cons deadline-ms thunk))
+    (or (not prev-min) (< deadline-ms (car prev-min)))))
 
 ;; Everything due, removed from the list, newest deadline last. Called with
 ;; timeout-mu held; answers '() after waiting when nothing is due yet, so the
@@ -520,19 +552,18 @@
 (define (timeout-collect-due!)
   (let due ((acc '()))
     (cond
-      ((and (pair? timeout-pending) (<= (caar timeout-pending) (now-millis)))
-       (let ((entry (car timeout-pending)))
-         (set! timeout-pending (cdr timeout-pending))
-         (due (cons (cdr entry) acc))))
+      ((let ((m (theap-min))) (and m (<= (car m) (now-millis))))
+       (due (cons (cdr (theap-pop-min!)) acc)))
       ((pair? acc) (reverse acc))
       (else
-       (if (null? timeout-pending)
-           (jolt-condition-wait timeout-cv timeout-mu)
-           (let ((wait-ms (- (caar timeout-pending) (now-millis))))
-             (when (> wait-ms 0)
-               (jolt-condition-wait timeout-cv timeout-mu (ms->duration wait-ms)))))
+       (let ((m (theap-min)))
+         (if (not m)
+             (jolt-condition-wait timeout-cv timeout-mu)
+             (let ((wait-ms (- (car m) (now-millis))))
+               (when (> wait-ms 0)
+                 (jolt-condition-wait timeout-cv timeout-mu (ms->duration wait-ms))))))
        ;; Either deadline or signal, the answer is the same: come back and re-read
-       ;; the head. A spurious wake costs one empty trip.
+       ;; the min. A spurious wake costs one empty trip.
        '()))))
 
 (define (timeout-thread)

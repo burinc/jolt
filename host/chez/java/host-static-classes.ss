@@ -9,37 +9,69 @@
 ;; .add amortizes O(1) and .get is O(1) (a list backing made both O(n)). medley's
 ;; stateful transducers (window / partition-between) build one with .add / .size /
 ;; .toArray / .clear / .remove. (ArrayList.) | (ArrayList. n) | (ArrayList. coll).
+;; State: #(backing-vector count head). Logical index i lives at physical
+;; head+i. The head offset makes FRONT operations O(1) — removeFirst/poll/pop
+;; advance head, addFirst/push retreat into head slack — where shifting the
+;; whole vector made the standard deque worklist idiom (.poll + .add, or
+;; tools.reader's .remove(0) on its pending-splice LinkedList) O(n^2). When an
+;; append finds the physical end full it compacts into the head slack if that
+;; is at least half the buffer (each compacted element was paid for by a prior
+;; front-removal, so appends stay amortized O(1)), and grows otherwise.
 (define al-min-cap 8)
 (define (al-vec self) (vector-ref (jhost-state self) 0))
 (define (al-cnt self) (vector-ref (jhost-state self) 1))
 (define (al-cnt! self n) (vector-set! (jhost-state self) 1 n))
+(define (al-head self) (vector-ref (jhost-state self) 2))
+(define (al-head! self h) (vector-set! (jhost-state self) 2 h))
+(define (al-ref self i) (vector-ref (al-vec self) (fx+ (al-head self) i)))
+(define (al-set! self i x) (vector-set! (al-vec self) (fx+ (al-head self) i) x))
 (define (make-arraylist xs)               ; xs: a Scheme list of initial elements
   (let* ((n (length xs)) (cap (fxmax al-min-cap n)) (v (make-vector cap jolt-nil)))
     (let loop ((i 0) (xs xs)) (when (pair? xs) (vector-set! v i (car xs)) (loop (fx+ i 1) (cdr xs))))
-    (make-jhost "arraylist" (vector v n))))
-(define (al-ensure! self need)            ; grow the backing vector (doubling) to fit `need`
-  (let ((v (al-vec self)))
-    (when (fx>? need (vector-length v))
-      (let grow ((cap (fxmax al-min-cap (vector-length v))))
-        (if (fx<? cap need) (grow (fx* cap 2))
-            (let ((nv (make-vector cap jolt-nil)))
-              (let cp ((i 0)) (when (fx<? i (al-cnt self)) (vector-set! nv i (vector-ref v i)) (cp (fx+ i 1))))
-              (vector-set! (jhost-state self) 0 nv)))))))
+    (make-jhost "arraylist" (vector v n 0))))
+;; room for one more element at the physical tail: compact into head slack or
+;; grow (doubling), either way head returns to 0.
+(define (al-ensure-tail! self)
+  (let* ((v (al-vec self)) (n (al-cnt self)) (h (al-head self)))
+    (when (fx=? (fx+ h n) (vector-length v))
+      (if (fx>=? h n)
+          (begin
+            (do ((i 0 (fx+ i 1))) ((fx=? i n)) (vector-set! v i (vector-ref v (fx+ h i))))
+            (do ((i n (fx+ i 1))) ((fx=? i (fx+ h n))) (vector-set! v i jolt-nil))
+            (al-head! self 0))
+          (let ((nv (make-vector (fxmax al-min-cap (fx* 2 (vector-length v))) jolt-nil)))
+            (do ((i 0 (fx+ i 1))) ((fx=? i n)) (vector-set! nv i (vector-ref v (fx+ h i))))
+            (vector-set! (jhost-state self) 0 nv)
+            (al-head! self 0))))))
 (define (al-push! self x)
-  (let ((n (al-cnt self))) (al-ensure! self (fx+ n 1)) (vector-set! (al-vec self) n x) (al-cnt! self (fx+ n 1))))
-(define (al-insert-at! self i x)
+  (al-ensure-tail! self)
   (let ((n (al-cnt self)))
-    (al-ensure! self (fx+ n 1))
-    (let ((v (al-vec self)))
-      (let shift ((j n)) (when (fx>? j i) (vector-set! v j (vector-ref v (fx- j 1))) (shift (fx- j 1))))
-      (vector-set! v i x) (al-cnt! self (fx+ n 1)))))
+    (vector-set! (al-vec self) (fx+ (al-head self) n) x)
+    (al-cnt! self (fx+ n 1))))
+(define (al-insert-at! self i x)
+  (let ((n (al-cnt self)) (h (al-head self)))
+    (if (and (fx=? i 0) (fx>? h 0))
+        (begin (al-head! self (fx- h 1))
+               (vector-set! (al-vec self) (fx- h 1) x)
+               (al-cnt! self (fx+ n 1)))
+        (begin
+          (al-ensure-tail! self)
+          (let ((v (al-vec self)) (h (al-head self)))
+            (let shift ((j (fx+ h n))) (when (fx>? j (fx+ h i)) (vector-set! v j (vector-ref v (fx- j 1))) (shift (fx- j 1))))
+            (vector-set! v (fx+ h i) x) (al-cnt! self (fx+ n 1)))))))
 (define (al-remove-at! self i)
-  (let ((n (al-cnt self)) (v (al-vec self)))
-    (let shift ((j i)) (when (fx<? j (fx- n 1)) (vector-set! v j (vector-ref v (fx+ j 1))) (shift (fx+ j 1))))
-    (vector-set! v (fx- n 1) jolt-nil) (al-cnt! self (fx- n 1))))
-(define (al->list self)                   ; first `count` elements as a Scheme list
-  (let ((v (al-vec self)))
-    (let loop ((i (fx- (al-cnt self) 1)) (acc '())) (if (fx<? i 0) acc (loop (fx- i 1) (cons (vector-ref v i) acc))))))
+  (let ((n (al-cnt self)) (v (al-vec self)) (h (al-head self)))
+    (if (fx=? i 0)
+        (begin (vector-set! v h jolt-nil)
+               (al-cnt! self (fx- n 1))
+               ;; empty resets head so a drained deque reuses the whole buffer
+               (al-head! self (if (fx=? n 1) 0 (fx+ h 1))))
+        (begin
+          (let shift ((j (fx+ h i))) (when (fx<? j (fx+ h (fx- n 1))) (vector-set! v j (vector-ref v (fx+ j 1))) (shift (fx+ j 1))))
+          (vector-set! v (fx+ h (fx- n 1)) jolt-nil) (al-cnt! self (fx- n 1))))))
+(define (al->list self)                   ; the `count` live elements as a Scheme list
+  (let ((v (al-vec self)) (h (al-head self)))
+    (let loop ((i (fx- (al-cnt self) 1)) (acc '())) (if (fx<? i 0) acc (loop (fx- i 1) (cons (vector-ref v (fx+ h i)) acc))))))
 (register-class-ctor! "ArrayList"
   (lambda args
     (cond ((null? args) (make-arraylist '()))
@@ -66,16 +98,16 @@
                        (let loop ((xs (seq->list (jolt-seq coll))) (k i))
                          (if (null? xs) (pair? (seq->list (jolt-seq coll)))
                              (begin (al-insert-at! self k (car xs)) (loop (cdr xs) (fx+ k 1))))))))
-    (cons "get" (lambda (self i) (vector-ref (al-vec self) (jnum->exact i))))
+    (cons "get" (lambda (self i) (al-ref self (jnum->exact i))))
     (cons "set" (lambda (self i x)
-                  (let* ((idx (jnum->exact i)) (old (vector-ref (al-vec self) idx)))
-                    (vector-set! (al-vec self) idx x) old)))
+                  (let* ((idx (jnum->exact i)) (old (al-ref self idx)))
+                    (al-set! self idx x) old)))
     (cons "size" (lambda (self) (->num (al-cnt self))))
     (cons "isEmpty" (lambda (self) (fx=? 0 (al-cnt self))))
     (cons "remove" (lambda (self i)
-                     (let* ((idx (jnum->exact i)) (old (vector-ref (al-vec self) idx)))
+                     (let* ((idx (jnum->exact i)) (old (al-ref self idx)))
                        (al-remove-at! self idx) old)))
-    (cons "clear" (lambda (self) (vector-set! (jhost-state self) 0 (make-vector al-min-cap jolt-nil)) (al-cnt! self 0) jolt-nil))
+    (cons "clear" (lambda (self) (vector-set! (jhost-state self) 0 (make-vector al-min-cap jolt-nil)) (al-cnt! self 0) (al-head! self 0) jolt-nil))
     (cons "contains" (lambda (self x) (and (memp (lambda (e) (jolt=2 e x)) (al->list self)) #t)))
     (cons "toArray" (lambda (self . _) (apply jolt-vector (al->list self))))
     (cons "iterator" (lambda (self) (make-jiterator (list->cseq (al->list self)))))
@@ -85,8 +117,8 @@
 ;; java.util.LinkedList: the ArrayList backing plus the Deque surface
 ;; (addFirst/addLast/removeFirst/removeLast/getFirst/getLast/peek/push/pop).
 ;; tools.reader holds pending splice forms in one and (seq)s / .remove(0)s it.
-(define (al-first self) (vector-ref (al-vec self) 0))
-(define (al-last self) (vector-ref (al-vec self) (fx- (al-cnt self) 1)))
+(define (al-first self) (al-ref self 0))
+(define (al-last self) (al-ref self (fx- (al-cnt self) 1)))
 (define linkedlist-methods
   (append arraylist-methods
     (list
@@ -734,17 +766,24 @@
 ;; pressure — its SoftCache evicts more eagerly than the JVM's, but it is genuine
 ;; GC eviction, not an unbounded strong cache. Immediates like fixnums/keywords
 ;; are never collected.)
-;; ref-queue state: #(guardian pending-list); reference state: #(weak-pair queue enqueued?).
+;; ref-queue state: #(guardian pending-front pending-rear) — the pending refs as
+;; a front/rear two-list queue (rq-add! is one cons; the old single list was
+;; re-copied per append, O(n^2) across a mass eviction's pump).
+;; reference state: #(weak-pair queue enqueued?).
 (define (rq-guardian-of q) (vector-ref (jhost-state q) 0))
 (define (rq-add! q ref)
-  (let ((st (jhost-state q))) (vector-set! st 1 (append (vector-ref st 1) (list ref)))))
-(define (rq-pump! q)                                  ; drain GC-reclaimed refs onto the list
+  (let ((st (jhost-state q))) (vector-set! st 2 (cons ref (vector-ref st 2)))))
+(define (rq-pump! q)                                  ; drain GC-reclaimed refs onto the queue
   (let loop ()
     (let ((rep ((rq-guardian-of q)))) (when rep (rq-add! q rep) (loop)))))
 (define (rq-poll q)
   (rq-pump! q)
-  (let* ((st (jhost-state q)) (l (vector-ref st 1)))
-    (if (null? l) jolt-nil (begin (vector-set! st 1 (cdr l)) (car l)))))
+  (let ((st (jhost-state q)))
+    (when (and (null? (vector-ref st 1)) (pair? (vector-ref st 2)))
+      (vector-set! st 1 (reverse (vector-ref st 2)))
+      (vector-set! st 2 '()))
+    (let ((l (vector-ref st 1)))
+      (if (null? l) jolt-nil (begin (vector-set! st 1 (cdr l)) (car l))))))
 (define (a-ref-queue? x) (and (jhost? x) (string=? (jhost-tag x) "ref-queue")))
 (define (make-reference v rest)
   (let* ((rq (if (pair? rest) (car rest) jolt-nil))
@@ -762,7 +801,7 @@
           (let* ((st (jhost-state self)) (rq (vector-ref st 1)))
             (if (vector-ref st 2) #f
                 (begin (vector-set! st 2 #t) (when (a-ref-queue? rq) (rq-add! rq self)) #t)))))))
-(for-each (lambda (nm) (register-class-ctor! nm (lambda _ (make-jhost "ref-queue" (vector (make-guardian) '())))))
+(for-each (lambda (nm) (register-class-ctor! nm (lambda _ (make-jhost "ref-queue" (vector (make-guardian) '() '())))))
           '("ReferenceQueue" "java.lang.ref.ReferenceQueue"))
 (register-host-methods! "ref-queue"
   (list (cons "poll" (lambda (self . _) (rq-poll self)))
@@ -929,26 +968,29 @@
             ((memv (car chars) dset)
              (loop (cdr chars) '() (if (null? cur) toks (cons (list->string (reverse cur)) toks))))
             (else (loop (cdr chars) (cons (car chars) cur) toks))))))
+;; state: #(token-VECTOR pos) — length/list-ref per token made a full drain
+;; O(tokens^2); a vector makes every method O(1).
+(define (st-toks self) (vector-ref (jhost-state self) 0))
+(define (st-pos self) (vector-ref (jhost-state self) 1))
+(define (st-next! self)
+  (let ((toks (st-toks self)) (p (st-pos self)))
+    (if (fx<? p (vector-length toks))
+        (begin (vector-set! (jhost-state self) 1 (fx+ p 1)) (vector-ref toks p))
+        (jolt-throw (jolt-host-throwable "java.util.NoSuchElementException" "no more tokens")))))
+(define (st-more? self) (fx<? (st-pos self) (vector-length (st-toks self))))
 (register-class-ctor! "StringTokenizer"
   (lambda (s . delims) (make-jhost "string-tokenizer"
-    (vector (tokenize (if (string? s) s (jolt-str-render-one s))
-                      (if (null? delims) " \t\n\r\f" (car delims))) 0))))
+    (vector (list->vector
+             (tokenize (if (string? s) s (jolt-str-render-one s))
+                       (if (null? delims) " \t\n\r\f" (car delims)))) 0))))
 (register-host-methods! "string-tokenizer"
-  (list (cons "hasMoreTokens" (lambda (self) (< (vector-ref (jhost-state self) 1) (length (vector-ref (jhost-state self) 0)))))
-        (cons "countTokens" (lambda (self) (->num (- (length (vector-ref (jhost-state self) 0)) (vector-ref (jhost-state self) 1)))))
-        (cons "nextToken" (lambda (self)
-                            (let ((toks (vector-ref (jhost-state self) 0)) (p (vector-ref (jhost-state self) 1)))
-                              (if (< p (length toks))
-                                  (begin (vector-set! (jhost-state self) 1 (+ p 1)) (list-ref toks p))
-                                  (jolt-throw (jolt-host-throwable "java.util.NoSuchElementException" "no more tokens"))))))
+  (list (cons "hasMoreTokens" st-more?)
+        (cons "countTokens" (lambda (self) (->num (fx- (vector-length (st-toks self)) (st-pos self)))))
+        (cons "nextToken" st-next!)
         ;; StringTokenizer implements java.util.Enumeration — enumeration-seq drives
         ;; it through these, so alias them onto the token methods.
-        (cons "hasMoreElements" (lambda (self) (< (vector-ref (jhost-state self) 1) (length (vector-ref (jhost-state self) 0)))))
-        (cons "nextElement" (lambda (self)
-                              (let ((toks (vector-ref (jhost-state self) 0)) (p (vector-ref (jhost-state self) 1)))
-                                (if (< p (length toks))
-                                    (begin (vector-set! (jhost-state self) 1 (+ p 1)) (list-ref toks p))
-                                    (jolt-throw (jolt-host-throwable "java.util.NoSuchElementException" "no more tokens"))))))))
+        (cons "hasMoreElements" st-more?)
+        (cons "nextElement" st-next!)))
 
 ;; ---- String / BigInteger / MapEntry constructors ----------------------------
 ;; (String. bytes [charset]) decodes bytes (a bytevector OR a jolt byte-array)

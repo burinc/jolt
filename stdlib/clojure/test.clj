@@ -525,10 +525,15 @@
 ;; means all.
 (defn- run-selected [ns-set]
   (let [ts (filter selected?
-                   (if ns-set (filter (fn [t] (contains? ns-set (:ns t))) @registry) @registry))]
+                   (if ns-set (filter (fn [t] (contains? ns-set (:ns t))) @registry) @registry))
+        ;; grouped once: re-filtering the whole list per namespace made the
+        ;; loop O(namespaces x tests) before a single body ran. distinct keeps
+        ;; the namespace ORDER (group-by's map order does not survive >8 keys),
+        ;; and group-by keeps registration order within each group.
+        by-ns (group-by :ns ts)]
     (doseq [n (distinct (map :ns ts))]
       (wrap-fixtures (get @once-fixtures n [])
-        (fn [] (doseq [t ts :when (= n (:ns t))] (run-one t))))))
+        (fn [] (doseq [t (get by-ns n)] (run-one t))))))
   nil)
 
 ;; Tests attached to a namespace's vars via :test metadata but never registered
@@ -536,8 +541,11 @@
 ;; suite that interns test vars directly (yamltest-style intern + vary-meta)
 ;; must be visible to (run-tests 'ns) too. deftest'd vars also carry :test
 ;; meta, so names already in the registry are excluded.
-(defn- interned-tests [n]
-  (let [known (set (map :name (filter #(= n (:ns %)) @registry)))]
+;; registered-by-ns is (group-by :ns @registry), built ONCE by the caller —
+;; run-all-tests hands every loaded namespace through here, and a fresh
+;; whole-registry scan per namespace was O(namespaces x tests).
+(defn- interned-tests [n registered-by-ns]
+  (let [known (set (map :name (get registered-by-ns n)))]
     (->> (ns-interns n)
          (keep (fn [[s v]]
                  (when-let [t (:test (meta v))]
@@ -559,11 +567,12 @@
     (run-selected ns-set)
     ;; interned (:test meta) tests discovered up front and run inside the same
     ;; :once fixtures as registered tests, matching JVM test-ns.
-    (doseq [n ns-syms
-            :let [its (interned-tests n)]
-            :when (seq its)]
-      (wrap-fixtures (get @once-fixtures n [])
-        (fn [] (doseq [t its] (run-one t)))))
+    (let [reg-by-ns (group-by :ns @registry)]
+      (doseq [n ns-syms
+              :let [its (interned-tests n reg-by-ns)]
+              :when (seq its)]
+        (wrap-fixtures (get @once-fixtures n [])
+          (fn [] (doseq [t its] (run-one t))))))
     (let [r @counters
           d {:type :summary
              :test  (- (:test r)  (:test before))

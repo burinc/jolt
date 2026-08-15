@@ -629,6 +629,36 @@
 ;; get their own cell, and a def through one would be invisible through the other.
 ;; Double-checked: the hit path (every name after the first) takes no lock, and the
 ;; insert re-checks under the lock.
+;; ns -> hashtable(name -> cell): the per-namespace index of var-table, kept in
+;; lockstep with it under var-table-mu (both insert sites below, remove-ns's
+;; sweep in ns.ss, and rebuild-ns-cells-index! for the gate harnesses' prune).
+;; refer / ns-publics / ns-map / all-ns answer from a bucket instead of
+;; scanning every interned var in the image — the scan made ONE refer cost
+;; O(total vars) and a program load O(namespaces x total vars). The hotscaling
+;; gate pins the shape (a tiny ns's ns-publics is independent of image size).
+(define ns-cells-index (make-hashtable string-hash string=?))
+(define (ns-cells-add! c)                ; caller holds var-table-mu
+  (let* ((ns (var-cell-ns c))
+         (b (or (hashtable-ref ns-cells-index ns #f)
+                (let ((b (make-hashtable string-hash string=?)))
+                  (hashtable-set! ns-cells-index ns b)
+                  b))))
+    (hashtable-set! b (var-cell-name c) c)))
+;; a LOCKED snapshot of one namespace's cells (like var-table-cells, the lock
+;; covers only the snapshot — callers iterate outside it).
+(define (ns-cells-list ns)
+  (jolt-with-mutex var-table-mu
+    (let ((b (hashtable-ref ns-cells-index ns #f)))
+      (if b (vector->list (hashtable-values b)) '()))))
+(define (ns-index-names)
+  (jolt-with-mutex var-table-mu (hashtable-keys ns-cells-index)))
+;; the gate harnesses prune var-table wholesale by KEY; they call this after,
+;; instead of teaching the prune loop about buckets.
+(define (rebuild-ns-cells-index!)
+  (jolt-with-mutex var-table-mu
+    (hashtable-clear! ns-cells-index)
+    (vector-for-each ns-cells-add! (hashtable-values var-table))))
+
 (define (jolt-var ns name)
   (let ((k (string-append ns "/" name)))
     (or (hashtable-ref var-table k #f)
@@ -636,6 +666,7 @@
           (or (hashtable-ref var-table k #f)
               (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f)))
                 (hashtable-set! var-table k c)
+                (ns-cells-add! c)
                 c))))))
 ;; A whole-table scan is the one read that DOES need the lock, and for a different
 ;; reason than a rehash: hashtable-keys/values read ht-size, allocate a
@@ -816,6 +847,7 @@
                 (begin (var-cell-defined?-set! c #t) c)
                 (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f)))  ; declared => interned/resolvable
                   (hashtable-set! var-table k c)
+                  (ns-cells-add! c)
                   c)))))))
 
 ;; regex: defines regex-t + the re-* fns (def-var!'d into
