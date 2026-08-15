@@ -5,7 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.12] - 2026-08-15
+
+Fibers are a public API now, Scheme is one require away, and the class
+model tells the truth in both directions: `subvec` and bignums answer
+their JVM classes, reflection walks a real hierarchy, and a fistful of
+field reports — fn parameter lists, `-M` scripts, timed process derefs,
+errno — closed along the way.
 
 ### Added
 
