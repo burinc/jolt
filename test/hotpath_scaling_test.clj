@@ -120,6 +120,44 @@
       (println "FAIL hotpath set-shape: intersection is walking its larger argument (set.clj)")
       (swap! failures inc)))
 
+  ;; protocol-count shape independence: a record collection op looks for a
+  ;; declared impl before falling back to the record behaviour, and that lookup
+  ;; used to snapshot the type's protocol keys under a mutex and probe each one
+  ;; — so count/contains?/seq on a record got slower the more protocols its type
+  ;; implemented, while answering "none declared" every time. Two records with
+  ;; identical fields, one implementing 1 protocol and one implementing 8: the
+  ;; per-op cost must not track the protocol count.
+  (let [reps 40000
+        one (eval '(do (ns proto-shape-ns)
+                       (defrecord POne [x y z])
+                       (defprotocol PA (pa [_]))
+                       (extend-protocol PA POne (pa [_] 1))
+                       (->POne 1 2 3)))
+        many (eval '(do (ns proto-shape-ns)
+                        (defrecord PMany [x y z])
+                        (defprotocol PB (pb [_])) (defprotocol PC (pc [_]))
+                        (defprotocol PD (pd [_])) (defprotocol PE (pe [_]))
+                        (defprotocol PF (pf [_])) (defprotocol PG (pg [_]))
+                        (defprotocol PH (ph [_])) (defprotocol PI (pi* [_]))
+                        (extend-protocol PB PMany (pb [_] 1))
+                        (extend-protocol PC PMany (pc [_] 1))
+                        (extend-protocol PD PMany (pd [_] 1))
+                        (extend-protocol PE PMany (pe [_] 1))
+                        (extend-protocol PF PMany (pf [_] 1))
+                        (extend-protocol PG PMany (pg [_] 1))
+                        (extend-protocol PH PMany (ph [_] 1))
+                        (extend-protocol PI PMany (pi* [_] 1))
+                        (->PMany 1 2 3)))
+        _ (when-not (and (= 3 (count one)) (= 3 (count many))
+                         (contains? one :x) (contains? many :x))
+            (println "FAIL hotpath proto-shape: record ops answered wrong")
+            (System/exit 1))
+        probe (fn [r] #(dotimes [_ reps] (do (count r) (contains? r :x) (seq r))))
+        t1 (max 1 (best-of 3 (probe one)))
+        t8 (best-of 3 (probe many))]
+    (judge "proto-shape" t1 t8 3.0
+           "record collection ops are re-walking the type's protocol table (find-method-any-protocol, protocols.ss) — 8 protocols cost more than 1"))
+
   (if (pos? @failures)
     (do (println (str "hotpath-scaling: " @failures " section(s) failed"))
         (System/exit 1))

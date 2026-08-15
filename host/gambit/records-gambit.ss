@@ -1238,6 +1238,40 @@
 
 (define type-registry (make-hashtable string-hash string=?))
 
+(define type-method-index
+  (make-hashtable string-hash string=?))
+
+(define (tmi-add! type-tag proto method fn)
+  (let* ((mi (or (hashtable-ref type-method-index type-tag #f)
+                 (let ((h (make-hashtable string-hash string=?)))
+                   (hashtable-set! type-method-index type-tag h)
+                   h)))
+         (entries (hashtable-ref mi method '())))
+    (hashtable-set!
+      mi
+      method
+      (if (assoc proto entries)
+          (map (lambda (p)
+                 (if (string=? (car p) proto) (cons proto fn) p))
+               entries)
+          (append entries (list (cons proto fn)))))))
+
+(define (tmi-entries type-tag method)
+  (let ((mi (hashtable-ref type-method-index type-tag #f)))
+    (if mi (hashtable-ref mi method '()) '())))
+
+(define (prune-type-registry! keep?)
+  (vector-for-each
+    (lambda (k)
+      (unless (keep? k)
+        (hashtable-delete! type-registry k)
+        (hashtable-delete! type-method-index k)))
+    (hashtable-keys type-registry))
+  (vector-for-each
+    (lambda (k)
+      (unless (keep? k) (hashtable-delete! type-method-index k)))
+    (hashtable-keys type-method-index)))
+
 (define jolt-proto-epoch 0)
 
 (define proto-method-keys
@@ -1274,7 +1308,8 @@
                    (let ((h (make-hashtable string-hash string=?)))
                      (hashtable-set! ti proto h)
                      h))))
-      (hashtable-set! pi method fn)))
+      (hashtable-set! pi method fn)
+      (tmi-add! type-tag proto method fn)))
   (let ((desc (hashtable-ref chez-tag-desc type-tag #f)))
     (when desc
       (let ((k (intern-pm-key proto method)))
@@ -1295,17 +1330,8 @@
            (and pi (hashtable-ref pi method #f))))))
 
 (define (find-method-any-protocol type-tag method)
-  (let ((ti (hashtable-ref type-registry type-tag #f)))
-    (and ti
-         (let* ((ks (jolt-with-mutex rec-tbl-mu (hashtable-keys ti)))
-                (n (vector-length ks)))
-           (let loop ((i 0))
-             (and (fx< i n)
-                  (let ((f (hashtable-ref
-                             (hashtable-ref ti (vector-ref ks i) #f)
-                             method
-                             #f)))
-                    (or f (loop (fx+ i 1))))))))))
+  (let ((entries (tmi-entries type-tag method)))
+    (and (pair? entries) (cdar entries))))
 
 (define (proc-accepts? f n)
   (and (procedure? f)
@@ -1313,20 +1339,13 @@
 
 (define (find-method-any-protocol-arity type-tag method
          nargs)
-  (let ((ti (hashtable-ref type-registry type-tag #f)))
-    (and ti
-         (let* ((ks (jolt-with-mutex rec-tbl-mu (hashtable-keys ti)))
-                (n (vector-length ks)))
-           (let loop ((i 0) (fallback #f))
-             (if (fx>= i n)
-                 fallback
-                 (let ((f (hashtable-ref
-                            (hashtable-ref ti (vector-ref ks i) #f)
-                            method
-                            #f)))
-                   (cond
-                     ((and f (proc-accepts? f nargs)) f)
-                     (else (loop (fx+ i 1) (or fallback f)))))))))))
+  (let ((entries (tmi-entries type-tag method)))
+    (and (pair? entries)
+         (let loop ((es entries))
+           (cond
+             ((null? es) (cdar entries))
+             ((proc-accepts? (cdar es) nargs) (cdar es))
+             (else (loop (cdr es))))))))
 
 (define (type-satisfies? type-tag proto)
   (let ((ti (hashtable-ref type-registry type-tag #f)))

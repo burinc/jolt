@@ -1022,8 +1022,11 @@
   {:suite "hasheq-cache" :expr "(let [v [1 2 3] h1 (hash v) h2 (hash v)] (= h1 h2))" :expected "true"}
   {:suite "hasheq-cache" :expr "(let [s \"hello\" h1 (hash s) h2 (hash s)] (= h1 h2))" :expected "true"}
   ;; Stage C — positional ctor throws on wrong arity
- {:suite "records-ctor-arity" :expr "(do (defrecord ArC9 [x y]) (try (->ArC9 1) (catch Exception e :arity-throw)))" :expected ":arity-throw"}
- {:suite "records-ctor-arity" :expr "(do (defrecord ArC9b [x y]) (try (->ArC9b 1 2 3) (catch Exception e :arity-throw)))" :expected ":arity-throw"}
+ ;; the CLASS, not merely that something was thrown: a raw host error carries no
+ ;; class and (catch Exception ...) matches one anyway, so a bare :arity-throw
+ ;; row passes while the ctor is raising an unbound-variable error.
+ {:suite "records-ctor-arity" :expr "(do (defrecord ArC9 [x y]) (try (->ArC9 1) (catch clojure.lang.ArityException e :arity-throw)))" :expected ":arity-throw"}
+ {:suite "records-ctor-arity" :expr "(do (defrecord ArC9b [x y]) (try (->ArC9b 1 2 3) (catch clojure.lang.ArityException e :arity-throw)))" :expected ":arity-throw"}
  {:suite "records-ctor-arity" :expr "(do (defrecord ArC9c [x y]) (->ArC9c 1 2))" :expected "#user.ArC9c{:x 1, :y 2}"}
  ;; Stage C — assoc applies ^double coercion on record fields
  {:suite "records-assoc-double" :expr "(do (deftype DblC10 [^double x]) (.getName (class (.-x (assoc (->DblC10 1) :x 2)))))" :expected "\"java.lang.Double\""}

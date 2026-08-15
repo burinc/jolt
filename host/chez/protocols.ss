@@ -64,6 +64,58 @@
 ;; (keyed by an interned proto-method identity) so protocol-resolve's record
 ;; branch resolves by descriptor identity instead of re-walking this string tree.
 (define type-registry (make-hashtable string-hash string=?))
+;; type-tag -> (method-name -> ((proto . fn) ...)), the SAME impls the tree above
+;; holds, indexed by method name instead of by protocol.
+;;
+;; "Which protocol declares this method?" is the question every collection op on
+;; a record asks (count/contains?/conj/assoc/seq each look for a declared impl
+;; before falling back to the record behaviour), and answering it from the tree
+;; means snapshotting the type's protocol keys under the registry mutex and
+;; probing each one — a lock, a vector allocation, and a string hash per
+;; protocol, per operation. For a plain defrecord the answer is always "none",
+;; so that whole walk is spent to conclude nothing. Measured on a record
+;; implementing three protocols, 300k ops: count 90ms vs 32ms for the same
+;; record with no protocols, contains? 161 vs 31, seq 415 vs 105 — i.e. the walk,
+;; not the operation, was the cost, and it grew with the type's protocol count.
+;;
+;; Maintained HERE, at the one place impls are written, under the same mutex —
+;; so it cannot drift from the tree — and read with a single unlocked
+;; hashtable-ref on the same terms as the rest of this registry (strong tables,
+;; consistent structure, a stale miss the worst outcome).
+;;
+;; The alist per method preserves registration order, which makes the "any
+;; protocol" answer deterministic rather than dependent on hashtable iteration
+;; order; a re-registration of the same (type, proto, method) replaces its entry
+;; in place instead of shadowing it.
+(define type-method-index (make-hashtable string-hash string=?))
+(define (tmi-add! type-tag proto method fn)
+  (let* ((mi (or (hashtable-ref type-method-index type-tag #f)
+                 (let ((h (make-hashtable string-hash string=?)))
+                   (hashtable-set! type-method-index type-tag h) h)))
+         (entries (hashtable-ref mi method '())))
+    (hashtable-set! mi method
+      (if (assoc proto entries)
+          (map (lambda (p) (if (string=? (car p) proto) (cons proto fn) p)) entries)
+          (append entries (list (cons proto fn)))))))
+(define (tmi-entries type-tag method)
+  (let ((mi (hashtable-ref type-method-index type-tag #f)))
+    (if mi (hashtable-ref mi method '()) '())))
+;; Prune both tables together. The per-case harnesses (run-corpus.ss/run-unit.ss)
+;; drop every type a case defined; pruning the tree alone would leave this index
+;; answering for types that no longer exist, so the two are pruned through one
+;; entry point rather than by remembering to do both.
+(define (prune-type-registry! keep?)
+  (vector-for-each
+    (lambda (k)
+      (unless (keep? k)
+        (hashtable-delete! type-registry k)
+        (hashtable-delete! type-method-index k)))
+    (hashtable-keys type-registry))
+  ;; a tag can reach the index without reaching the tree only if the two ever
+  ;; diverge; sweep it on the same rule so a leak cannot outlive the prune.
+  (vector-for-each
+    (lambda (k) (unless (keep? k) (hashtable-delete! type-method-index k)))
+    (hashtable-keys type-method-index)))
 ;; Global protocol epoch: bumped on EVERY register-protocol-method. A per-site
 ;; inline cache (the PIC the back end emits) tags itself with the epoch at
 ;; populate time; a later extension (a new bump) invalidates it so a cached
@@ -101,7 +153,9 @@
                    (let ((h (make-hashtable string-hash string=?))) (hashtable-set! type-registry type-tag h) h)))
            (pi (or (hashtable-ref ti proto #f)
                    (let ((h (make-hashtable string-hash string=?))) (hashtable-set! ti proto h) h))))
-      (hashtable-set! pi method fn)))
+      (hashtable-set! pi method fn)
+      ;; the by-method index of the same impl, inside the same critical section
+      (tmi-add! type-tag proto method fn)))
   ;; mirror onto the type's descriptor ptable (record types only — a host tag
   ;; like "String"/"Object" has no desc). A re-def invalidated the old desc's
   ;; ptable (set it to #f), and this call populates the new desc's ptable.
@@ -122,16 +176,12 @@
 (define (find-protocol-method type-tag proto method)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti (let ((pi (hashtable-ref ti proto #f))) (and pi (hashtable-ref pi method #f))))))
+;; The impl for METHOD under any protocol this type implements — one ref into
+;; the by-method index, first registration wins. This is the hot one (every
+;; record collection op asks it), so it neither locks nor allocates.
 (define (find-method-any-protocol type-tag method)
-  (let ((ti (hashtable-ref type-registry type-tag #f)))
-    (and ti
-         ;; snapshot under the lock — a bare hashtable-keys racing a registration
-         ;; returns FILL slots, and the ref below would then be given 0
-         (let* ((ks (jolt-with-mutex rec-tbl-mu (hashtable-keys ti))) (n (vector-length ks)))
-           (let loop ((i 0))
-             (and (fx< i n)
-                  (let ((f (hashtable-ref (hashtable-ref ti (vector-ref ks i) #f) method #f)))
-                    (or f (loop (fx+ i 1))))))))))
+  (let ((entries (tmi-entries type-tag method)))
+    (and (pair? entries) (cdar entries))))
 ;; A deftype can implement a method NAME at two arities from two interfaces (e.g.
 ;; data.priority-map's seq: Seqable.seq[this] and Sorted.seq[this ascending]),
 ;; registered under different protocols. Pick the impl whose procedure accepts
@@ -139,15 +189,12 @@
 (define (proc-accepts? f n)
   (and (procedure? f) (bitwise-bit-set? (procedure-arity-mask f) n)))
 (define (find-method-any-protocol-arity type-tag method nargs)
-  (let ((ti (hashtable-ref type-registry type-tag #f)))
-    (and ti
-         (let* ((ks (jolt-with-mutex rec-tbl-mu (hashtable-keys ti))) (n (vector-length ks)))
-           (let loop ((i 0) (fallback #f))
-             (if (fx>= i n)
-                 fallback
-                 (let ((f (hashtable-ref (hashtable-ref ti (vector-ref ks i) #f) method #f)))
-                   (cond ((and f (proc-accepts? f nargs)) f)
-                         (else (loop (fx+ i 1) (or fallback f)))))))))))
+  (let ((entries (tmi-entries type-tag method)))
+    (and (pair? entries)
+         (let loop ((es entries))
+           (cond ((null? es) (cdar entries))          ; no arity match — any impl
+                 ((proc-accepts? (cdar es) nargs) (cdar es))
+                 (else (loop (cdr es))))))))
 (define (type-satisfies? type-tag proto)
   (let ((ti (hashtable-ref type-registry type-tag #f)))
     (and ti (hashtable-ref ti proto #f) #t)))
