@@ -101,6 +101,23 @@
       (cond ((fx>? (fx+ i nlen) slen) -1)
             ((char-by-char-match? s i needle nlen) i)
             (else (loop (fx+ i 1)))))))
+;; single-char search with no needle allocation — (.indexOf s (int 59)) used to
+;; build a 1-char string through number->exact->truncate->integer->char->string
+;; per call (~160ns); honeysql's suspicious? transducer does two per entity.
+(define (str-char-index s c from)
+  (let ((n (string-length s)))
+    (let loop ((i (max 0 from)))
+      (cond ((fx>=? i n) -1)
+            ((char=? (string-ref s i) c) i)
+            (else (loop (fx+ i 1)))))))
+;; a needle that is a char code (fixnum) or a char scans directly
+(define (str-index-of-any s needle from)
+  (cond ((fixnum? needle)
+         (if (and (fx>=? needle 0) (fx<=? needle #x10FFFF))
+             (str-char-index s (integer->char needle) from)
+             (str-index-of s (str-needle needle) from)))
+        ((char? needle) (str-char-index s needle from))
+        (else (str-index-of s (str-needle needle) from))))
 (define (str-last-index-of s needle)
   (let ((nlen (string-length needle)) (slen (string-length s)))
     (let loop ((i (fx- slen nlen)) (found -1))
@@ -119,7 +136,16 @@
 ;; literal replace-all (JVM String.replace(CharSequence,CharSequence)).
 (define (str-replace-literal s a b)
   (let ((alen (string-length a)) (slen (string-length s)))
-    (if (fx=? alen 0) s
+    (if (fx=? alen 0)
+        ;; JVM String.replace with an empty match inserts the replacement at
+        ;; every position 0..slen: "" -> "b", "aaa" -> "bababab".
+        (let ((op (open-output-string)))
+          (let loop ((i 0))
+            (if (fx>? i slen)
+                (get-output-string op)
+                (begin (display b op)
+                       (when (fx<? i slen) (write-char (string-ref s i) op))
+                       (loop (fx+ i 1))))))
         (let ((first-match (str-index-of s a 0)))
           (if (fx<? first-match 0) s
               (let ((op (open-output-string)))
@@ -262,13 +288,23 @@
 
 (define (jolt-string-method method s rest)
   (define (arg n) (list-ref rest n))
-  (cond
+   (cond
+    ;; hot-first: length/charAt/indexOf/startsWith dominate library interop
+    ;; (honeysql, string codecs); a miss at the bottom of the chain cost ~100ns
+    ;; per call in the string arm. Order is behavior-neutral, keep it stable.
+    ((string=? method "length") (string-length s))   ; exact int (= JVM)
+    ((string=? method "charAt") (string-ref s (jolt->idx (arg 0))))
     ((string=? method "toString") s)
+    ((string=? method "indexOf")
+     (str-index-of-any s (arg 0)
+                   (if (fx>? (length rest) 1) (jolt->idx (arg 1)) 0)))
+    ((string=? method "startsWith")
+     (let ((p (arg 0))) (and (fx>=? (string-length s) (string-length p))
+                             (string=? (substring s 0 (string-length p)) p))))
     ((string=? method "hashCode") (java-string-hash s))
     ((string=? method "toLowerCase") (string-downcase s))
     ((string=? method "toUpperCase") (string-upcase s))
     ((string=? method "trim") (str-trim s))
-    ((string=? method "length") (string-length s))   ; exact int (= JVM)
     ((string=? method "isEmpty") (fx=? (string-length s) 0))
     ((string=? method "isBlank")
      (let blank ((i 0))
@@ -279,20 +315,13 @@
      (let ((n (jolt->idx (arg 0))))
        (if (fx<=? n 0) ""
            (apply string-append (let rep ((i n) (a '())) (if (fx=? i 0) a (rep (fx- i 1) (cons s a))))))))
-    ((string=? method "charAt") (string-ref s (jolt->idx (arg 0))))
     ((string=? method "codePointAt")
      (char->integer (string-ref s (jolt->idx (arg 0)))))
     ((string=? method "substring")
      (substring s (jolt->idx (arg 0))
                 (if (fx>? (length rest) 1) (jolt->idx (arg 1)) (string-length s))))
-    ((string=? method "indexOf")
-     (str-index-of s (str-needle (arg 0))
-                   (if (fx>? (length rest) 1) (jolt->idx (arg 1)) 0)))
     ((string=? method "lastIndexOf")
      (str-last-index-of s (str-needle (arg 0))))
-    ((string=? method "startsWith")
-     (let ((p (arg 0))) (and (fx>=? (string-length s) (string-length p))
-                             (string=? (substring s 0 (string-length p)) p))))
     ((string=? method "endsWith")
      (let ((p (arg 0)) (slen (string-length s)))
        (and (fx>=? slen (string-length p))
@@ -417,11 +446,78 @@
   (let ((i (str-index-of s needle (if (pair? opt) (car opt) 0))))
     (if (fx<? i 0) jolt-nil i)))
 
+;; --- native one-shots for clojure.string's hot wrappers ----------------------
+;; The prelude's compiled wrappers chain overlay calls per invocation
+;; (to-str -> count -> subs -> = is 4-5 var derefs plus a substring ALLOCATION),
+;; ~400-500ns where the substrate is ~40ns; honeysql's format path calls
+;; starts-with?/includes? several times per entity formatted. These single-proc
+;; versions carry the wrapper's exact semantics (NPE on nil args, s coerced via
+;; toString, substr raw) and allocate nothing. post-prelude.ss installs them
+;; over the prelude-baked vars.
+(define (str-coerce s)
+  (cond ((string? s) s)
+        ((jolt-nil? s) (throw-jvm 'NullPointerException "s"))
+        (else (record-method-dispatch s "toString" jolt-nil))))
+;; JVM starts-with?/ends-with? pass substr straight to .startsWith/.endsWith —
+;; anything but a String is a ClassCastException (nil is an NPE).
+(define (str-need-substr p)
+  (cond ((string? p) p)
+        ((jolt-nil? p) (throw-jvm 'NullPointerException "substr"))
+        (else (throw-jvm 'ClassCastException
+                         (string-append "class " (jolt-class-name p)
+                                        " cannot be cast to class java.lang.String")))))
+(define (str-starts-with? s p)
+  (let ((p (str-need-substr p))
+        (s (str-coerce s)))
+    (and (fx>=? (string-length s) (string-length p))
+         (let loop ((i 0))
+           (or (fx=? i (string-length p))
+               (and (char=? (string-ref s i) (string-ref p i))
+                    (loop (fx+ i 1))))))))
+(define (str-ends-with? s p)
+  (let* ((p (str-need-substr p))
+         (s (str-coerce s))
+         (n (string-length s)))
+    (let ((m (string-length p)))
+      (and (fx>=? n m)
+           (let loop ((i 0))
+             (or (fx=? i m)
+                 (and (char=? (string-ref s (fx+ (fx- n m) i)) (string-ref p i))
+                      (loop (fx+ i 1)))))))))
+(define (str-includes? s p)
+  (fx>=? (str-index-of-any (str-coerce s) (if (jolt-nil? p) (throw-jvm 'NullPointerException "value") p) 0) 0))
+(define (str-index-of* s v . opt)
+  (let* ((s (str-coerce s))
+         (n (string-length s))
+         (from (if (pair? opt)
+                   (min (max 0 (jnum->exact (car opt))) n)
+                   0))
+         (i (str-index-of-any s v from)))
+    (if (fx<? i 0) jolt-nil i)))
+(define (str-upper-c s) (str-upper (str-coerce s)))
+(define (str-lower-c s) (str-lower (str-coerce s)))
+
 ;; (str-join coll [sep]) -> stringify each element (Clojure str), join by sep.
 ;; str-join-strs (defined below) does the join; here we just render each element.
+;; One seq walk, no intermediate list when the coll is 0/1 elements (the common
+;; case for entity/column joining): the old map-over-seq->list tripled the walks
+;; and cost ~260ns for a single-element join.
 (define (str-join coll . opt)
   (let ((sep (if (pair? opt) (jolt-str-render-one (car opt)) "")))
-    (str-join-strs (map jolt-str-render-one (seq->list coll)) sep)))
+    (let ((s (jolt-seq coll)))
+      (if (jolt-nil? s)
+          ""
+          (let ((f (jolt-str-render-one (seq-first s)))
+                (r (jolt-seq (seq-more s))))
+            (if (jolt-nil? r)
+                f
+                (str-join-strs
+                 (cons f (let loop ((r r))
+                           (if (jolt-nil? r)
+                               '()
+                               (cons (jolt-str-render-one (seq-first r))
+                                     (loop (jolt-seq (seq-more r)))))))
+                 sep)))))))
 
 ;; (re-split irx s limit) -> parts, splitting at each match. Keeps interior AND
 ;; trailing empty strings (the clojure.string wrapper drops trailing for limit 0);

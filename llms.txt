@@ -1,0 +1,103 @@
+# Jolt (repository)
+
+> Jolt is a Clojure implementation on Scheme: it reads Clojure source, analyzes
+> it to a host-neutral IR, emits Scheme, and runs it on Chez (default) or on
+> Gambit compiled to JavaScript. The compiler is self-hosted — written in Clojure
+> and compiling itself. This file orients a coding agent working inside a clone;
+> the user-facing index is at https://jolt-lang.github.io/llms.txt
+
+## There is no JVM here
+
+Jolt targets Clojure semantics, and most portable Clojure runs unchanged, but
+nothing below the language is a JVM. Do not reason about JVM behaviour when
+debugging jolt code:
+
+- **No Java interop.** No reflection, no `gen-class`, no `proxy`. Interop syntax
+  (`Class.`, `Class/staticMethod`, `.method`) resolves against a hand-written
+  subset of `java.*` implemented in Scheme under `host/chez/java/`. A class token
+  is a name, not a loaded class.
+- **The `java.*` shims are convincing but shallow.** A shim implements its JVM
+  counterpart's API; it does not bring the JVM's runtime with it. There are no
+  classloaders, no JVM GC or heap tuning, and no JVM process-lifetime rules — a
+  `java.lang.Thread` does not keep the process alive after the main thread
+  returns, and `.setDaemon` is accepted and ignored. If a diagnosis depends on
+  JVM runtime semantics, the diagnosis is wrong.
+- **Strings are codepoint-indexed** Chez strings. `(count "😀")` is 1, not 2.
+- **Regexes** compile through vendored irregex, not `java.util.regex`.
+- **`clojure.core` coverage is broad but not total.** A namespace can load with a
+  few functions unimplemented.
+- **C libraries** are reached through `jolt.ffi` (`foreign-fn`/`defcfn`), not JNI.
+
+The full list is in README.md and in `test/conformance/known-divergences.edn`,
+which is the gated registry: `make certify` fails on a new unlisted divergence
+and on a stale entry.
+
+## Read first
+
+- [README.md](README.md): what jolt is, install, run, the CLI surface, and the
+  full "Differences from Clojure" section.
+- [CONTRIBUTING.md](CONTRIBUTING.md): building from source, the seed and
+  re-minting, architecture, Scheme backends, test gates.
+- [test/conformance/known-divergences.edn](test/conformance/known-divergences.edn):
+  every tracked jolt-vs-JVM divergence, with a `:legend` explaining each category.
+- [CHANGELOG.md](CHANGELOG.md): release history.
+
+## Repository layout
+
+- `host/chez/*.ss`: the Chez runtime — value model, persistent collections, seqs,
+  vars/namespaces, reader, host interop. `host/chez/java/` holds the `java.*`
+  shims. `host/chez/seed/` is the checked-in bootstrap seed.
+- `host/gambit/`: the same overlay on Gambit (second target, also the browser
+  build). `host/scheme-adapter/CONTRACT.txt` is the contract between them.
+- `jolt-core/jolt/*.clj`: the compiler — reader, analyzer, IR, backend, plus
+  `jolt.main` and `jolt.deps`. Baked into the seed.
+- `jolt-core/clojure/core/NN-*.clj`: `clojure.core`, in dependency-ordered tiers.
+  Baked into the seed.
+- `stdlib/`: the rest of the standard library, loaded off the source roots.
+- `test/`: `test/chez/corpus.edn` is the host-neutral conformance corpus (expected
+  values sourced from reference JVM Clojure); `test/conformance/` holds the spec,
+  the JVM oracle, and the divergence registry.
+- `bin/jolt`: the launcher — run jolt from a clone. (`bin/joltc` is a
+  compatibility shim that execs it.)
+- `Makefile`: every gate and build target.
+
+## Commands
+
+- `bin/jolt -e EXPR`: evaluate an expression from a clone.
+- `make test`: the full gate. Individual gates: `corpus`, `unit`, `selfhost`,
+  `smoke`, `sci`, `ffi`, `transient`, `certify`, `libconformance`.
+- `make remint`: re-mint the bootstrap seed to a byte-fixpoint. Required after
+  any change to the reader, the analyzer/IR/backend, `clojure.core`, or one of
+  the seven seed-embedded stdlib namespaces.
+- `make build`: the standalone `target/release/jolt` binary.
+
+## Gotchas that cost time
+
+- **A seed change without `make remint` silently no-ops.** The checked-in seed
+  still carries the old code, and rebuilding the binary does not help. This
+  covers `host/chez/reader.ss`, `jolt-core/**`, and the seven `stdlib/`
+  namespaces listed in `ei-prelude-ns-files` (`host/chez/emit-image.ss`):
+  `clojure.string`, `clojure.walk`, `clojure.template`, `clojure.edn`,
+  `clojure.set`, `clojure.pprint`, `clojure.repl`.
+- **`make test | tail` reports `tail`'s exit code**, so a failed gate reads as
+  green. Capture the make status inside the log instead.
+- **Gambit host files are generated** from their Chez counterparts (for example
+  `records-gambit.ss` from `records.ss`). Run `make gambitgen` after editing the
+  source; `make gambitgencheck` gates the drift.
+- **A new `jolt.host` `def-var!` needs a `jolt-host-manifest.txt` line.** Run
+  `make manifestcheck` after touching that seam.
+- **Documentation does not live in this repo.** Only `README.md`,
+  `CONTRIBUTING.md`, `CHANGELOG.md`, and this file. User-facing pages go to the
+  site repo (`jolt-lang/jolt-lang.github.io`, `resources/md/` plus a row in
+  `resources/docpages.edn`).
+
+## Optional
+
+- [Language specification](https://jolt-lang.github.io/docs/spec/README.html):
+  per-form and per-function coverage.
+- [RFCs](https://jolt-lang.github.io/docs/rfc/README.html): design notes for
+  transients, type hints, inference, compilation modes, program images, and the
+  portable Scheme layer.
+- [Module map](https://jolt-lang.github.io/docs/MODULES.html) and
+  [seed & overlay registry](https://jolt-lang.github.io/docs/seed-overlay-registry.html):
+  per-file breakdown of the runtime and the seed.

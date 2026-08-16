@@ -586,6 +586,16 @@
   {:suite "str" :expr "(vec (.split (java.util.regex.Pattern/compile \",\") \"q1,q2,,,\" -1))" :expected "[\"q1\" \"q2\" \"\" \"\" \"\"]"}
   {:suite "str" :expr "(vec (.split (java.util.regex.Pattern/compile \":\") \"a::b\"))" :expected "[\"a\" \"\" \"b\"]"}
   {:suite "str" :expr "(.frobnicate \"abc\")" :expected :throws}
+  ;; the priority-6 string arm (records-dispatch.ss) hoists string receivers
+  ;; ahead of the dotform/collection arms. These pin the shapes that hoist
+  ;; could have changed: .getClass must still outrank it (the string arm has
+  ;; no getClass case), a dashed field read must stay a FIELD miss (the
+  ;; no-method-throw dash-stripping message, not a method one), and Object
+  ;; methods must answer as before.
+  {:suite "str" :expr "(.getSimpleName (.getClass \"x\"))" :expected "\"String\""}
+  {:suite "str" :expr "(.-f \"s\")" :expected :throws}
+  {:suite "str" :expr "(try (.-f \"s\") (catch Exception e (.getMessage e)))" :expected "\"No matching field found: f for class java.lang.String\""}
+  {:suite "str" :expr "[(.equals \"a\" \"a\") (.equals \"a\" \"b\") (.equals \"a\" :a)]" :expected "[true false false]"}
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/upper-case \"abc\"))" :expected "\"ABC\""}
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/lower-case \"ABC\"))" :expected "\"abc\""}
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/capitalize \"hello\"))" :expected "\"Hello\""}
@@ -614,6 +624,16 @@
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/index-of \"abc\" \"b\"))" :expected "1"}
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (nil? (s/index-of \"abc\" \"z\")))" :expected "true"}
   {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/trim-newline \"abc\\n\\n\"))" :expected "\"abc\""}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/index-of \"abc\" \\b))" :expected "1"}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (nil? (s/index-of \"abc\" \\z)))" :expected "true"}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (nil? (s/index-of \"abc\" \\b 2)))" :expected "true"}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/replace \"aaa\" \"\" \"b\"))" :expected "\"bababab\""}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/replace \"abc\" \"\" \"-\"))" :expected "\"-a-b-c-\""}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/replace \"\" \"\" \"b\"))" :expected "\"b\""}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/replace \"a-b-c\" \"-\" \"_\"))" :expected "\"a_b_c\""}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/starts-with? \"abc\" nil))" :expected :throws}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/ends-with? \"abc\" 5))" :expected :throws}
+  {:suite "strns" :expr "(do (require (quote [clojure.string :as s])) (s/includes? \"abc\" nil))" :expected :throws}
   {:suite "type" :expr "(type 5)" :expected "java.lang.Long"}
   {:suite "type" :expr "(type 5.0)" :expected "java.lang.Double"}
   {:suite "type" :expr "(type (/ 10 2))" :expected "java.lang.Long"}
@@ -719,6 +739,11 @@
   {:suite "hostshim" :expr "(do (__register-class-ctor! \"Box2\" (fn [v] (let [t (jolt.host/tagged-table :my/box2)] (jolt.host/ref-put! t :v v) t))) (__register-class-methods! :my/box2 {\"add\" (fn [self n] (+ n (jolt.host/ref-get self :v)))}) (.add (Box2. 10) 5))" :expected "15"}
   {:suite "hostshim" :expr "(do (__register-class-ctor! \"Box3\" (fn [] (jolt.host/tagged-table :my/box3))) (__register-instance-check! (fn [cn val] (if (= cn \"Box3\") (= :my/box3 (jolt.host/ref-get val :jolt/type)) nil))) (instance? Box3 (Box3.)))" :expected "true"}
   {:suite "hostshim" :expr "(do (__register-class-ctor! \"Box4\" (fn [] (jolt.host/tagged-table :my/box4))) (__register-instance-check! (fn [cn val] (if (= cn \"Box4\") (= :my/box4 (jolt.host/ref-get val :jolt/type)) nil))) (instance? Box4 \"not-a-box\"))" :expected "false"}
+  ;; eq-fast-probes: an arm may not claim keyword/string keys — pmap-fast-get
+  ;; answers those without consulting the arms, so such an arm would be silently
+  ;; skipped by map lookups.
+  {:suite "hostshim" :expr "(__register-eq! (fn [a b] (or (keyword? a) (keyword? b))) (fn [a b] false))" :expected :throws}
+  {:suite "hostshim" :expr "(__register-eq! (fn [a b] (or (string? a) (string? b))) (fn [a b] false))" :expected :throws}
   {:suite "hostshim" :expr "(jolt.host/table? (jolt.host/tagged-table :t))" :expected "true"}
   {:suite "hostshim" :expr "(jolt.host/table? \"x\")" :expected "false"}
   ;; telemetry — the observability primitives off Chez's clocks and collector.

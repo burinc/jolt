@@ -2191,6 +2191,8 @@
 
 (define arm-priority-getclass 5)
 
+(define arm-priority-string 6)
+
 (define arm-priority-dotform 30)
 
 (define arm-priority-date 40)
@@ -2211,6 +2213,16 @@
         (record-method-dispatch-base obj method-name rest-args)
         (let ((r ((cdar as) obj method-name rest-args)))
           (if (eq? r 'pass) (loop (cdr as)) r)))))
+
+(register-method-arm!
+  arm-priority-string
+  (lambda (obj method-name rest-args)
+    (if (string? obj)
+        (jolt-string-method
+          method-name
+          obj
+          (if (jolt-nil? rest-args) '() (seq->list rest-args)))
+        'pass)))
 
 (register-method-arm!
   arm-priority-getclass

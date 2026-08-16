@@ -121,7 +121,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscali
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck portcheck adaptercheck lockcheck parkcheck irvalidate devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
   certify gambitcheck gambitgencheck gambitboot grenadinecheck fibers gosm asynctimer threadsafety
@@ -688,6 +688,30 @@ shakelocal: testbin
 # this diffs them so a load added to one but not the other fails the gate.
 manifestcheck:
 	@sh host/chez/manifest-check.sh
+
+# README truncation guard. Tools that feed the README to a model cut it at a byte
+# budget (15000 is a common default) with no marker, so anything past the cut is
+# not "further down the page", it is absent. When "Differences from Clojure" sat
+# at the 19KB mark a reader saw the java.* shims, never saw what they are not,
+# and reasoned about JVM daemon threads for the rest of a task. So the section
+# has to END inside the budget, not begin near it. 12000 leaves room for a 12KB
+# cut and for the section to grow.
+README-DIFF-CEILING := 12000
+readmecheck:
+	@end=$$(LC_ALL=C awk '/^## Differences from Clojure$$/ {seen=1; next} \
+	                      seen && /^## / {print off; found=1; exit} \
+	                      {off += length($$0) + 1} \
+	                      END {if (!found) print (seen ? off : -1)}' README.md); \
+	 if [ "$$end" -lt 0 ]; then \
+	   echo "readmecheck: README.md has no '## Differences from Clojure' section" >&2; exit 1; fi; \
+	 if [ "$$end" -gt $(README-DIFF-CEILING) ]; then \
+	   echo "readmecheck: 'Differences from Clojure' ends at byte $$end, past the $(README-DIFF-CEILING) ceiling." >&2; \
+	   echo "  A truncating fetch would cut it. Move it earlier or shorten what precedes it;" >&2; \
+	   echo "  contributor-facing prose belongs in CONTRIBUTING.md." >&2; exit 1; fi; \
+	 for f in CONTRIBUTING.md llms.txt; do \
+	   [ -f "$$f" ] || { echo "readmecheck: $$f is missing (README links to it)" >&2; exit 1; }; \
+	 done; \
+	 echo "readmecheck: divergences end at byte $$end (ceiling $(README-DIFF-CEILING))"
 
 # PSL R1 portability lint gate: fails when a blocklisted Chez-only identifier
 # appears in a host file that is not allowlisted for it (and on stale allowlist

@@ -3094,6 +3094,11 @@
   {:suite "clojure.string" :label "starts-with?" :expected "true" :actual "(do (require (quote [clojure.string :as s])) (s/starts-with? \"hello\" \"he\"))" :portability :common}
   {:suite "clojure.string" :label "ends-with?" :expected "true" :actual "(do (require (quote [clojure.string :as s])) (s/ends-with? \"hello\" \"lo\"))" :portability :common}
   {:suite "clojure.string" :label "replace" :expected "\"hexxo\"" :actual "(do (require (quote [clojure.string :as s])) (s/replace \"hello\" \"l\" \"x\"))" :portability :common}
+  {:suite "clojure.string" :label "index-of with a char needle" :expected "1" :actual "(do (require (quote [clojure.string :as s])) (s/index-of \"abc\" \\b))" :portability :common}
+  {:suite "clojure.string" :label "index-of char needle miss is nil" :expected "true" :actual "(do (require (quote [clojure.string :as s])) (nil? (s/index-of \"abc\" \\z)))" :portability :common}
+  {:suite "clojure.string" :label "replace with an empty match inserts at every position" :expected "\"bababab\"" :actual "(do (require (quote [clojure.string :as s])) (s/replace \"aaa\" \"\" \"b\"))" :portability :common}
+  {:suite "clojure.string" :label "replace empty match on empty input inserts once" :expected "\"b\"" :actual "(do (require (quote [clojure.string :as s])) (s/replace \"\" \"\" \"b\"))" :portability :common}
+  {:suite "host-interop / literal replace" :label "String.replace with an empty match inserts at every position" :expected "\"bababab\"" :actual "(.replace \"aaa\" \"\" \"b\")" :portability :jvm}
   {:suite "clojure.string" :label "reverse" :expected "\"cba\"" :actual "(do (require (quote [clojure.string :as s])) (s/reverse \"abc\"))" :portability :common}
   {:suite "clojure.string" :label "index-of" :expected "2" :actual "(do (require (quote [clojure.string :as s])) (s/index-of \"hello\" \"l\"))" :portability :common}
   {:suite "string / subs strictness" :label "subs basic" :expected "\"bcd\"" :actual "(subs \"abcde\" 1 4)" :portability :common}

@@ -168,17 +168,27 @@
 ;; handler returns the #t/#f result. Arms are checked before the base scalar/coll
 ;; cases; the entry is stable.
 ;;
-;; Only the fixnum and flonum pairs are subject to the invariant. jolt=2's third
-;; fast clause — (eq? a b) on a non-number — legitimately short-circuits every
-;; type including records, so the usual either-arg-is-my-type predicate stays
-;; legal even though it matches those. Probes pair DISTINCT values so they land
-;; on the numeric clauses rather than that identity one.
-(define eq-fast-probes (list (cons 0 1) (cons 1.5 2.5)))
+;; The pairs a fast path answers without consulting the arms are subject to the
+;; invariant: jolt=2's fixnum/flonum clauses, and pmap-fast-get's (collections.ss)
+;; direct eq?/string=? compares on keyword and string keys — an arm claiming those
+;; types would be silently skipped by map lookups (hash-fast-probes already guards
+;; the same types for the jolt-hash fast path). jolt=2's third fast clause —
+;; (eq? a b) on a non-number — legitimately short-circuits every type including
+;; records, so the usual either-arg-is-my-type predicate stays legal even though
+;; it matches those. Probes pair DISTINCT values so they land on the value
+;; clauses rather than that identity one.
+;; A thunk (like hash-fast-probes): (keyword …) needs compute-keyword-hasheq,
+;; defined in hasheq.ss which loads after this file — the probes are evaluated
+;; at registration time, when the whole runtime is loaded.
+(define (eq-fast-probes)
+  (list (cons 0 1) (cons 1.5 2.5)
+        (cons (keyword #f "a") (keyword #f "b"))
+        (cons "s1" "s2")))
 (define (eq-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who
                            (lambda (probe) (pred (car probe) (cdr probe)))
-                           eq-fast-probes
-                           "the jolt=2 fixnum/flonum fast path"))
+                           (eq-fast-probes)
+                           "the jolt=2 / pmap-fast-get fast paths"))
 (define jolt-eq-arms '())
 (define (register-eq-arm! pred handler)
   (eq-arm-reject-fast-type! 'register-eq-arm! pred)

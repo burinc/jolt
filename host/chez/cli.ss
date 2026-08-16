@@ -34,6 +34,7 @@
 (set-chez-ns! "clojure.core")
 (load "host/chez/seed/prelude.ss")
 (load "host/chez/post-prelude.ss")
+(load "host/chez/post-prelude-str.ss")
 (set-chez-ns! "user")
 (load "host/chez/host-contract.ss")
 (load "host/chez/seed/image.ss")

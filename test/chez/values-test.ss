@@ -94,11 +94,21 @@
 (ok "hash guard allows symbol" (not (raises? (lambda () (hash-arm-reject-fast-type! 'test symbol-t?)))))
 (ok "pr guard still rejects char" (raises? (lambda () (pr-arm-reject-fast-type! 'test char?))))
 
-;; eq's identity clause legitimately short-circuits every non-number type, so a
-;; single-sided claim on one is not subject to the invariant
+;; pmap-fast-get (collections.ss) answers keyword and string key pairs without
+;; consulting the arms — same class of bypass as jolt=2's fixnum/flonum clauses
+;; — so an arm claiming either type would be silently skipped by map lookups.
+(ok "eq arm rejects keyword pair"
+    (raises? (lambda () (register-eq-arm! (lambda (a b) (or (keyword-t? a) (keyword-t? b)))
+                                          (lambda (a b) #t)))))
+(ok "eq arm rejects string pair"
+    (raises? (lambda () (register-eq-arm! (lambda (a b) (or (string? a) (string? b)))
+                                          (lambda (a b) #t)))))
+;; symbols stay off every eq fast path, so the either-arg shape is still legal
+;; there: eq's identity clause legitimately short-circuits every non-number type,
+;; and a single-sided claim is not subject to the invariant.
 (ok "eq guard allows either-arg shape"
     (not (raises? (lambda () (eq-arm-reject-fast-type!
-                              'test (lambda (a b) (or (string? a) (string? b))))))))
+                              'test (lambda (a b) (or (symbol-t? a) (symbol-t? b))))))))
 
 ;; and a real arm on a type off the fast path still registers and is consulted
 (ok "hash arm on a plain type registers"
