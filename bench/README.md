@@ -30,6 +30,7 @@ absolute reference.
 | `loop-recur` | tight `loop`/`recur` + per-iteration integer arith (`mod`, `quot`, `bit-xor`) | numeric pass (primitive long loop counters), loop codegen | CLBG-style |
 | `seqs` | lazy-seq + HOF pipelines (`map`/`filter`/`reduce`, `every?`, `iterate`/`take`, `mapcat`) | lazy-seq cell allocation, per-element call overhead | CLBG-style |
 | `transducers` | transducer pipelines (`comp` of `map`/`filter`/`take`) | transducer machinery, `reduce` fast paths | CLBG-style |
+| `sorted-access` | reads a collection's structure can answer without walking: `count`/`drop` on a vector seq, `rseq`, `first` on a sorted map/set | shape-answered reads (Counted / IDrop / leftmost-node), not traversal | — |
 
 ## Scorecard
 
@@ -52,6 +53,16 @@ default build ships). Times are the mean of 3 runs after warmup, in ms.
 | `mono-dispatch` | **2.7×** | 2.7× | 38.3 | 14.3 | monomorphic protocol dispatch |
 | `transducers` | **4.2×** | 4.3× | 136.0 | 32.2 | transducer pipelines |
 | `arrays` | **6.3×** | 6.4× | 230.7 | 36.9 | primitive `double-array` throughput |
+| `sorted-access` | **11.7×** | — | 142.8 | 12.2 | shape-answered collection reads |
+
+`sorted-access` exists because every operation in it used to be a full traversal
+here while the reference answers it from the collection's shape — and none of
+that is visible to a value test, since the answers were correct all along. Over
+200k elements `(count (seq v))` was 18.8ms against 166ns, `(rseq v)` 19.8ms
+against 209ns, and `(first sorted-map)` 190ms against 416ns. Its collections are
+built OUTSIDE the timed region: constructing a sorted map is a separate and much
+larger gap (~126×, bead jolt-r8tz.7) that otherwise drowns out the reads this
+measures. `test/complexity_test.clj` gates the same properties pass/fail.
 
 `opt` and `release` track each other closely across the suite — the plain
 `jolt build` picks up most of the win.
