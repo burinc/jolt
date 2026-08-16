@@ -262,13 +262,23 @@
 
 (define (jolt-string-method method s rest)
   (define (arg n) (list-ref rest n))
-  (cond
+   (cond
+    ;; hot-first: length/charAt/indexOf/startsWith dominate library interop
+    ;; (honeysql, string codecs); a miss at the bottom of the chain cost ~100ns
+    ;; per call in the string arm. Order is behavior-neutral, keep it stable.
+    ((string=? method "length") (string-length s))   ; exact int (= JVM)
+    ((string=? method "charAt") (string-ref s (jolt->idx (arg 0))))
     ((string=? method "toString") s)
+    ((string=? method "indexOf")
+     (str-index-of s (str-needle (arg 0))
+                   (if (fx>? (length rest) 1) (jolt->idx (arg 1)) 0)))
+    ((string=? method "startsWith")
+     (let ((p (arg 0))) (and (fx>=? (string-length s) (string-length p))
+                             (string=? (substring s 0 (string-length p)) p))))
     ((string=? method "hashCode") (java-string-hash s))
     ((string=? method "toLowerCase") (string-downcase s))
     ((string=? method "toUpperCase") (string-upcase s))
     ((string=? method "trim") (str-trim s))
-    ((string=? method "length") (string-length s))   ; exact int (= JVM)
     ((string=? method "isEmpty") (fx=? (string-length s) 0))
     ((string=? method "isBlank")
      (let blank ((i 0))
@@ -279,20 +289,13 @@
      (let ((n (jolt->idx (arg 0))))
        (if (fx<=? n 0) ""
            (apply string-append (let rep ((i n) (a '())) (if (fx=? i 0) a (rep (fx- i 1) (cons s a))))))))
-    ((string=? method "charAt") (string-ref s (jolt->idx (arg 0))))
     ((string=? method "codePointAt")
      (char->integer (string-ref s (jolt->idx (arg 0)))))
     ((string=? method "substring")
      (substring s (jolt->idx (arg 0))
                 (if (fx>? (length rest) 1) (jolt->idx (arg 1)) (string-length s))))
-    ((string=? method "indexOf")
-     (str-index-of s (str-needle (arg 0))
-                   (if (fx>? (length rest) 1) (jolt->idx (arg 1)) 0)))
     ((string=? method "lastIndexOf")
      (str-last-index-of s (str-needle (arg 0))))
-    ((string=? method "startsWith")
-     (let ((p (arg 0))) (and (fx>=? (string-length s) (string-length p))
-                             (string=? (substring s 0 (string-length p)) p))))
     ((string=? method "endsWith")
      (let ((p (arg 0)) (slen (string-length s)))
        (and (fx>=? slen (string-length p))
@@ -416,6 +419,51 @@
 (define (str-find needle s . opt)
   (let ((i (str-index-of s needle (if (pair? opt) (car opt) 0))))
     (if (fx<? i 0) jolt-nil i)))
+
+;; --- native one-shots for clojure.string's hot wrappers ----------------------
+;; The prelude's compiled wrappers chain overlay calls per invocation
+;; (to-str -> count -> subs -> = is 4-5 var derefs plus a substring ALLOCATION),
+;; ~400-500ns where the substrate is ~40ns; honeysql's format path calls
+;; starts-with?/includes? several times per entity formatted. These single-proc
+;; versions carry the wrapper's exact semantics (NPE on nil args, s coerced via
+;; toString, substr raw) and allocate nothing. post-prelude.ss installs them
+;; over the prelude-baked vars.
+(define (str-coerce s)
+  (cond ((string? s) s)
+        ((jolt-nil? s) (throw-jvm 'NullPointerException "s"))
+        (else (record-method-dispatch s "toString" jolt-nil))))
+(define (str-starts-with? s p)
+  (if (jolt-nil? p) (throw-jvm 'NullPointerException "substr"))
+  (let ((s (str-coerce s)))
+    (and (string? p)
+         (fx>=? (string-length s) (string-length p))
+         (let loop ((i 0))
+           (or (fx=? i (string-length p))
+               (and (char=? (string-ref s i) (string-ref p i))
+                    (loop (fx+ i 1))))))))
+(define (str-ends-with? s p)
+  (if (jolt-nil? p) (throw-jvm 'NullPointerException "substr"))
+  (let* ((s (str-coerce s))
+         (n (string-length s)))
+    (and (string? p)
+         (let ((m (string-length p)))
+           (and (fx>=? n m)
+                (let loop ((i 0))
+                  (or (fx=? i m)
+                       (and (char=? (string-ref s (fx+ (fx- n m) i)) (string-ref p i))
+                            (loop (fx+ i 1))))))))))
+(define (str-includes? s p)
+  (fx>=? (str-index-of (str-coerce s) (str-needle (if (jolt-nil? p) (throw-jvm 'NullPointerException "value") p)) 0) 0))
+(define (str-index-of* s v . opt)
+  (let* ((s (str-coerce s))
+         (n (string-length s))
+         (from (if (pair? opt)
+                   (min (max 0 (jnum->exact (car opt))) n)
+                   0))
+         (i (str-index-of s (str-needle v) from)))
+    (if (fx<? i 0) jolt-nil i)))
+(define (str-upper-c s) (str-upper (str-coerce s)))
+(define (str-lower-c s) (str-lower (str-coerce s)))
 
 ;; (str-join coll [sep]) -> stringify each element (Clojure str), join by sep.
 ;; str-join-strs (defined below) does the join; here we just render each element.

@@ -304,3 +304,21 @@
     ("set?" . "clojure.lang.IPersistentSet")
     ("associative?" . "clojure.lang.Associative")
     ("sequential?" . "clojure.lang.Sequential")))
+
+;; --- hot-path natives over prelude-baked Clojure wrappers --------------------
+;; clojure.string's wrappers are compiled into the seed prelude as chained
+;; overlay calls (to-str -> count -> subs -> =, ~400-500ns/call, allocating a
+;; substring per invocation) over the ~40ns natives. Replace the vars with
+;; single-proc natives (natives-str.ss) carrying the same semantics. Calls
+;; already compiled against these vars pick the new values up through the var
+;; cells, so no remint is needed.
+(def-var! "clojure.string" "starts-with?" str-starts-with?)
+(def-var! "clojure.string" "ends-with?" str-ends-with?)
+(def-var! "clojure.string" "includes?" str-includes?)
+(def-var! "clojure.string" "index-of" str-index-of*)
+(def-var! "clojure.string" "upper-case" str-upper-c)
+(def-var! "clojure.string" "lower-case" str-lower-c)
+;; ident?: the overlay's (or (keyword? x) (symbol? x)) pays two overlay var
+;; calls (~130ns) for two native predicates; dispatch-heavy code (honeysql's
+;; format-selectable-dsl) calls it per branch. One native closure.
+(def-var! "clojure.core" "ident?" (lambda (x) (or (keyword-t? x) (symbol-t? x))))
