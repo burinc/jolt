@@ -41,19 +41,46 @@
 (define (cseq-realized head tail) (make-cseq head tail #t #f #f 0 #f #f))   ; tail already a seq
 (define (cseq-lazy head tail-thunk) (make-cseq head tail-thunk #f #f #f 0 #f #f))
 (define (cseq-list head tail) (make-cseq head tail #t #t #f 0 #f #f))       ; a PersistentList node
-(define (cseq-vec head tail-thunk v i) (make-cseq head tail-thunk #f #f v i #f #f)) ; vector-backed
+;; vector-backed: like a ChunkedCons, its tail follows from (v, i+1), so it
+;; carries no thunk either — see cseq-cvec-more.
+(define (cseq-vec head v i) (make-cseq head #f #f #f v i #f #f))
 ;; A ChunkedCons cell over a standalone chunk pvec: head is chunk[i], walking
 ;; (seq-more) advances within the chunk and then continues into `rest`. `rest` is
 ;; the already-coerced after-chunk seq (cseq | jolt-nil | a jolt-lazyseq), held in
 ;; crest for chunk-rest/chunk-next and forced lazily by the tail thunk at the chunk
 ;; boundary so a chunked map over an infinite chunked source stays productive.
+;; NO TAIL THUNK. A cell that carries cvec knows its own tail from its own
+;; fields — the next index in the same chunk, or the after-chunk rest at the
+;; boundary — and every element of that chunk was already realized when the
+;; chunk was built. So the tail is a pure function of the cell, computed on
+;; demand by cseq-cvec-more below, and the lazy-seq machinery is skipped
+;; entirely: nothing to allocate for the tail, nothing to memoize, nothing for a
+;; concurrent reader to observe half-published.
+;;
+;; This is the granularity Clojure uses. Its chunked map wraps one Object[32] in
+;; a single ChunkedCons under a single LazySeq node, and stepping WITHIN the
+;; chunk is ChunkedCons.next() -> new ChunkedCons(chunk.dropFirst(), _more), a
+;; pure computation. jolt used to allocate a closure per element and then have
+;; seq-more publish it back through two mutable-field writes — i.e. it paid
+;; lazy-seq memoization per ELEMENT where Clojure pays it per CHUNK, which is
+;; why chunking bought nothing here (a chunkable source cost the same 86 ns/elem
+;; as an unchunkable one, where the JVM gets 2.9x out of it).
 (define (cseq-chunked chunk i rest)
-  (make-cseq (pvec-nth-d chunk i jolt-nil)
-             (lambda () (let ((i1 (fx+ i 1)))
-                          (if (fx<? i1 (pvec-count chunk))
-                              (cseq-chunked chunk i1 rest)
-                              (jolt-seq rest))))
-              #f #f chunk i rest #f))
+  (make-cseq (pvec-nth-d chunk i jolt-nil) #f #f #f chunk i rest #f))
+;; The tail of a cvec-bearing cell. Two shapes share the field: a ChunkedCons
+;; (crest set — cvec is a standalone <=32 chunk, and the after-chunk seq follows)
+;; and a vector-backed index seq (crest #f — cvec is the whole backing vector).
+;; FORCE? distinguishes Clojure's next() from its more(): at a chunk boundary
+;; next() runs chunkedMore().seq() and realizes what follows, while more()
+;; returns _more untouched. Getting that wrong makes (rest s) realize the next
+;; chunk, which is a laziness regression a value test would never catch.
+(define (cseq-cvec-more s force?)
+  (let ((v (cseq-cvec s)) (i1 (fx+ (cseq-ci s) 1)) (cr (cseq-crest s)))
+    (if cr
+        (if (fx<? i1 (pvec-count v))
+            (cseq-chunked v i1 cr)
+            (if force? (jolt-seq cr) cr))
+        (vec->seq v i1))))
 (define (seq-first s) (cseq-head s))
 ;; guards lazy creation of a cell's tail mutex on the multi-threaded path (mirrors
 ;; force-lazyseq's lock-init). A cseq cell is shared across threads once its owning
@@ -72,13 +99,23 @@
   ;; tail/forced? stores below are unordered, so a lock-free reader on ARM64 can see
   ;; forced?#t with tail still the thunk-procedure. So once jolt-mt? flips, every
   ;; access goes through the per-cell mutex, reads included (mirrors force-lazyseq).
+  ;; A cvec cell has no thunk: its tail follows from its own fields, so it is
+  ;; COMPUTED here rather than run. It is still memoized, which is where this
+  ;; beats the reference implementation — Clojure's ChunkedCons.next() rebuilds a
+  ;; ChunkedCons + an ArrayChunk on every traversal, so re-walking a retained seq
+  ;; costs it the same as the first walk. Dropping the closure without dropping
+  ;; the memo gets the first walk's saving AND keeps re-walks cheap: measured
+  ;; over 100k, first walk 80 -> 58 ns/elem, re-walk unchanged at ~23 (going
+  ;; memo-free the way Clojure does took re-walks to ~42).
   (cond
     ((not jolt-mt?)
      (if (cseq-forced? s) (cseq-tail s)
-         (let ((t ((cseq-tail s)))) (cseq-tail-set! s t) (cseq-forced?-set! s #t) t)))
+         (let ((t (if (cseq-cvec s) (cseq-cvec-more s #t) ((cseq-tail s)))))
+           (cseq-tail-set! s t) (cseq-forced?-set! s #t) t)))
     (else (jolt-with-mutex (cseq-ensure-lock! s)     ; multi-threaded: always lock
             (if (cseq-forced? s) (cseq-tail s)
-                (let ((t ((cseq-tail s)))) (cseq-tail-set! s t) (cseq-forced?-set! s #t) t))))))
+                (let ((t (if (cseq-cvec s) (cseq-cvec-more s #t) ((cseq-tail s)))))
+                  (cseq-tail-set! s t) (cseq-forced?-set! s #t) t))))))
 
 ;; The empty seq (Clojure's empty list ()), distinct from nil. The (unused) field
 ;; defeats Chez's interning of fieldless records, so an empty list carrying
@@ -142,7 +179,7 @@
       (list->cseq xs)))
 (define (vec->seq v i)                 ; chunked index seq over a persistent vector
   (if (fx>=? i (pvec-count v)) jolt-nil
-      (cseq-vec (pvec-nth-d v i jolt-nil) (lambda () (vec->seq v (fx+ i 1))) v i)))
+      (cseq-vec (pvec-nth-d v i jolt-nil) v i)))
 (define (str->seq s i)
   (if (fx>=? i (string-length s)) jolt-nil
       (cseq-lazy (string-ref s i) (lambda () (str->seq s (fx+ i 1))))))
@@ -198,6 +235,14 @@
   (let ((s (jolt-seq x)))
     (cond
       ((jolt-nil? s) jolt-empty-list)
+      ;; A cvec cell's tail is already realized, so rest hands it back directly
+      ;; rather than wrapping a lazy-seq around a value that is simply present.
+      ;; force? #f is the whole point: at a chunk boundary this returns the
+      ;; after-chunk seq WITHOUT seq-ing it, which is Clojure's more() (next()
+      ;; forces, more() does not) — forcing here would make (rest s) realize the
+      ;; following chunk.
+      ((cseq-cvec s) (let ((m (cseq-cvec-more s #f)))
+                       (if (jolt-nil? m) jolt-empty-list m)))
       ((cseq-forced? s) (let ((m (cseq-tail s))) (if (jolt-nil? m) jolt-empty-list m)))
       ;; the lazyseq forces to a seq (cseq | nil); an empty realized lazyseq is
       ;; still a sequence value, printing "()" (see lazy-bridge.ss), so (rest s)
