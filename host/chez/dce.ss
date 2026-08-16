@@ -95,8 +95,11 @@
     ;; the LispReader$StringReader shim (host-static-methods.ss) pulls the literal
     ;; off the reader it is handed, a line at a time, through the IReader method
     "clojure.core/-read-line"
-    ;; post-prelude taxonomy wrappers close over the overlay versions
-    "clojure.core/ifn?" "clojure.core/seqable?" "clojure.core/inst-ms"
+     ;; post-prelude taxonomy wrappers close over the overlay versions
+     "clojure.core/ifn?" "clojure.core/seqable?" "clojure.core/inst-ms"
+     ;; post-prelude's native sequential? closes over the overlay version for
+     ;; the exotic-value fallback
+     "clojure.core/sequential?"
     ;; the fn print form wraps the overlay __print1
     "clojure.core/__print1"
     ;; the multimethod dispatch cache resolves the hierarchy value per call

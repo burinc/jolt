@@ -293,6 +293,7 @@
     "(set-chez-ns! \"clojure.core\")"
     'prelude
     "(load \"host/chez/post-prelude.ss\")"
+    "(load \"host/chez/post-prelude-str.ss\")"
     "(set-chez-ns! \"user\")"
     "(load \"host/chez/host-contract.ss\")"
     'image

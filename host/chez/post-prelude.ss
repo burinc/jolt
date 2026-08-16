@@ -305,35 +305,10 @@
     ("associative?" . "clojure.lang.Associative")
     ("sequential?" . "clojure.lang.Sequential")))
 
-;; --- hot-path natives over prelude-baked Clojure wrappers --------------------
-;; clojure.string's wrappers are compiled into the seed prelude as chained
-;; overlay calls (to-str -> count -> subs -> =, ~400-500ns/call, allocating a
-;; substring per invocation) over the ~40ns natives. Replace the vars with
-;; single-proc natives (natives-str.ss) carrying the same semantics. Calls
-;; already compiled against these vars pick the new values up through the var
-;; cells, so no remint is needed.
-(def-var! "clojure.string" "starts-with?" str-starts-with?)
-(def-var! "clojure.string" "ends-with?" str-ends-with?)
-(def-var! "clojure.string" "includes?" str-includes?)
-(def-var! "clojure.string" "index-of" str-index-of*)
-(def-var! "clojure.string" "upper-case" str-upper-c)
-(def-var! "clojure.string" "lower-case" str-lower-c)
 ;; ident?: the overlay's (or (keyword? x) (symbol? x)) pays two overlay var
 ;; calls (~130ns) for two native predicates; dispatch-heavy code (honeysql's
 ;; format-selectable-dsl) calls it per branch. One native closure.
 (def-var! "clojure.core" "ident?" (lambda (x) (or (keyword-t? x) (symbol-t? x))))
-;; clojure.string/replace with a STRING pattern and STRING replacement is a
-;; literal replace-all (JVM semantics) — the common "-" -> "_" / quoting case.
-;; The overlay replace routes through to-str + str-replace-all's pattern-type
-;; dispatch (~400ns); route the literal case straight to the native scan.
-(let ((ov-replace (var-deref "clojure.string" "replace")))
-  (def-var! "clojure.string" "replace"
-    (case-lambda
-      ((s match replacement)
-       (if (and (string? match) (string? replacement))
-           (str-replace-literal (str-coerce s) match replacement)
-           (jolt-invoke ov-replace s match replacement)))
-      ((s match f) (jolt-invoke ov-replace s match f)))))
 ;; sequential?: the overlay's (or (vector? x) (seq? x)) routes EVERY call through
 ;; two overlay fn invocations (var deref + jolt-invoke each, ~250ns on a pmap —
 ;; and map destructuring expands to a sequential? test per binding form, so

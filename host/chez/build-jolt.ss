@@ -29,6 +29,7 @@
 (set-chez-ns! "clojure.core")
 (load "host/chez/seed/prelude.ss")
 (load "host/chez/post-prelude.ss")
+(load "host/chez/post-prelude-str.ss")
 (set-chez-ns! "user")
 (load "host/chez/host-contract.ss")
 (load "host/chez/seed/image.ss")
@@ -341,9 +342,10 @@
           "(load \"host/chez/scheme-adapter-runtime.ss\")\n"
           "(load \"host/chez/rt.ss\")\n"
           "(set-chez-ns! \"clojure.core\")\n"
-          "(load \"host/chez/seed/prelude.ss\")\n"
-          "(load \"host/chez/post-prelude.ss\")\n"
-          "(set-chez-ns! \"user\")\n"
+           "(load \"host/chez/seed/prelude.ss\")\n"
+           "(load \"host/chez/post-prelude.ss\")\n"
+           "(load \"host/chez/post-prelude-str.ss\")\n"
+           "(set-chez-ns! \"user\")\n"
           "(load \"host/chez/host-contract.ss\")\n"
           "(load \"host/chez/seed/image.ss\")\n"
           "(load \"host/chez/compile-eval.ss\")\n"

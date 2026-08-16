@@ -28,6 +28,7 @@
 (set-chez-ns! "clojure.core")
 (load bs-seed-prelude)
 (load "host/chez/post-prelude.ss")
+(load "host/chez/post-prelude-str.ss")
 (set-chez-ns! "user")
 (load "host/chez/host-contract.ss")
 (load bs-seed-image)
