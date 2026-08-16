@@ -1136,7 +1136,16 @@
         (else (jolt-str-render-one x))))
 (define (str-replace-literal s a b)
   (let ((alen (string-length a)) (slen (string-length s)))
-    (if (fx=? alen 0) s
+    (if (fx=? alen 0)
+        ;; JVM String.replace with an empty match inserts the replacement at
+        ;; every position 0..slen: "" -> "b", "aaa" -> "bababab".
+        (let ((op (open-output-string)))
+          (let loop ((i 0))
+            (if (fx>? i slen)
+                (get-output-string op)
+                (begin (display b op)
+                       (if (fx<? i slen) (write-char (string-ref s i) op))
+                       (loop (fx+ i 1))))))
         (let ((op (open-output-string)))
           (let loop ((i 0))
             (if (fx>? (fx+ i alen) slen)

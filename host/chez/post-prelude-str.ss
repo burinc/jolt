@@ -27,5 +27,4 @@
       ((s match replacement)
        (if (and (string? match) (string? replacement))
            (str-replace-literal (str-coerce s) match replacement)
-           (jolt-invoke ov-replace s match replacement)))
-      ((s match f) (jolt-invoke ov-replace s match f)))))
+           (jolt-invoke ov-replace s match replacement))))))
