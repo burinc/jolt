@@ -101,6 +101,23 @@
       (cond ((fx>? (fx+ i nlen) slen) -1)
             ((char-by-char-match? s i needle nlen) i)
             (else (loop (fx+ i 1)))))))
+;; single-char search with no needle allocation — (.indexOf s (int 59)) used to
+;; build a 1-char string through number->exact->truncate->integer->char->string
+;; per call (~160ns); honeysql's suspicious? transducer does two per entity.
+(define (str-char-index s c from)
+  (let ((n (string-length s)))
+    (let loop ((i (max 0 from)))
+      (cond ((fx>=? i n) -1)
+            ((char=? (string-ref s i) c) i)
+            (else (loop (fx+ i 1)))))))
+;; a needle that is a char code (fixnum) or a char scans directly
+(define (str-index-of-any s needle from)
+  (cond ((fixnum? needle)
+         (if (and (fx>=? needle 0) (fx<=? needle #x10FFFF))
+             (str-char-index s (integer->char needle) from)
+             (str-index-of s (str-needle needle) from)))
+        ((char? needle) (str-char-index s needle from))
+        (else (str-index-of s (str-needle needle) from))))
 (define (str-last-index-of s needle)
   (let ((nlen (string-length needle)) (slen (string-length s)))
     (let loop ((i (fx- slen nlen)) (found -1))
@@ -270,7 +287,7 @@
     ((string=? method "charAt") (string-ref s (jolt->idx (arg 0))))
     ((string=? method "toString") s)
     ((string=? method "indexOf")
-     (str-index-of s (str-needle (arg 0))
+     (str-index-of-any s (arg 0)
                    (if (fx>? (length rest) 1) (jolt->idx (arg 1)) 0)))
     ((string=? method "startsWith")
      (let ((p (arg 0))) (and (fx>=? (string-length s) (string-length p))
@@ -453,23 +470,39 @@
                        (and (char=? (string-ref s (fx+ (fx- n m) i)) (string-ref p i))
                             (loop (fx+ i 1))))))))))
 (define (str-includes? s p)
-  (fx>=? (str-index-of (str-coerce s) (str-needle (if (jolt-nil? p) (throw-jvm 'NullPointerException "value") p)) 0) 0))
+  (fx>=? (str-index-of-any (str-coerce s) (if (jolt-nil? p) (throw-jvm 'NullPointerException "value") p) 0) 0))
 (define (str-index-of* s v . opt)
   (let* ((s (str-coerce s))
          (n (string-length s))
          (from (if (pair? opt)
                    (min (max 0 (jnum->exact (car opt))) n)
                    0))
-         (i (str-index-of s (str-needle v) from)))
+         (i (str-index-of-any s v from)))
     (if (fx<? i 0) jolt-nil i)))
 (define (str-upper-c s) (str-upper (str-coerce s)))
 (define (str-lower-c s) (str-lower (str-coerce s)))
 
 ;; (str-join coll [sep]) -> stringify each element (Clojure str), join by sep.
 ;; str-join-strs (defined below) does the join; here we just render each element.
+;; One seq walk, no intermediate list when the coll is 0/1 elements (the common
+;; case for entity/column joining): the old map-over-seq->list tripled the walks
+;; and cost ~260ns for a single-element join.
 (define (str-join coll . opt)
   (let ((sep (if (pair? opt) (jolt-str-render-one (car opt)) "")))
-    (str-join-strs (map jolt-str-render-one (seq->list coll)) sep)))
+    (let ((s (jolt-seq coll)))
+      (if (jolt-nil? s)
+          ""
+          (let ((f (jolt-str-render-one (seq-first s)))
+                (r (jolt-seq (seq-more s))))
+            (if (jolt-nil? r)
+                f
+                (str-join-strs
+                 (cons f (let loop ((r r))
+                           (if (jolt-nil? r)
+                               '()
+                               (cons (jolt-str-render-one (seq-first r))
+                                     (loop (jolt-seq (seq-more r)))))))
+                 sep)))))))
 
 ;; (re-split irx s limit) -> parts, splitting at each match. Keeps interior AND
 ;; trailing empty strings (the clojure.string wrapper drops trailing for limit 0);

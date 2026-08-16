@@ -322,6 +322,18 @@
 ;; calls (~130ns) for two native predicates; dispatch-heavy code (honeysql's
 ;; format-selectable-dsl) calls it per branch. One native closure.
 (def-var! "clojure.core" "ident?" (lambda (x) (or (keyword-t? x) (symbol-t? x))))
+;; clojure.string/replace with a STRING pattern and STRING replacement is a
+;; literal replace-all (JVM semantics) — the common "-" -> "_" / quoting case.
+;; The overlay replace routes through to-str + str-replace-all's pattern-type
+;; dispatch (~400ns); route the literal case straight to the native scan.
+(let ((ov-replace (var-deref "clojure.string" "replace")))
+  (def-var! "clojure.string" "replace"
+    (case-lambda
+      ((s match replacement)
+       (if (and (string? match) (string? replacement))
+           (str-replace-literal (str-coerce s) match replacement)
+           (jolt-invoke ov-replace s match replacement)))
+      ((s match f) (jolt-invoke ov-replace s match f)))))
 ;; sequential?: the overlay's (or (vector? x) (seq? x)) routes EVERY call through
 ;; two overlay fn invocations (var deref + jolt-invoke each, ~250ns on a pmap —
 ;; and map destructuring expands to a sequential? test per binding form, so
