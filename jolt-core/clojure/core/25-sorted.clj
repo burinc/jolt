@@ -211,6 +211,15 @@
     (tree-collect (nd-right t) proj
                   (conj (tree-collect (nd-left t) proj acc) (proj t)))))
 
+;; NOTE the seq below stays EAGER on purpose. A lazy in-order walk (the reference's
+;; stack-based PersistentTreeMap$Seq) makes first/take O(log n) but costs 1.5x on a
+;; FULL walk here, because jolt's per-cell overhead is higher than the JVM's and the
+;; explicit stack allocates per node — measured 108ms -> 164ms over 200k even with
+;; the walk chunked 32 at a time (larger chunks were worse still: 175ms at 128,
+;; 179ms at 512). Routing `first` to the spine walk above gets the headline case
+;; without that trade. Making take/subseq lazy too needs the per-cell cost down
+;; first — bead jolt-r8tz.7.
+
 (defn- make-sorted [tag tree cnt cmp cmp-fn ops]
   (-> (jolt.host/tagged-table tag)
       (jolt.host/ref-put! :tree tree)
@@ -222,6 +231,14 @@
 ;; entries as a vector (ascending), the materialized form seq/rseq/subseq use.
 (defn- sc-entries [sc proj]
   (tree-collect (sfield sc :tree) proj []))
+
+;; The leftmost and rightmost nodes of the tree, found by following one spine.
+;; `first` and `peek` used to run the whole tree into a vector and take an end of
+;; it, which is O(n) for a question the shape answers in O(log n) — 190ms against
+;; the reference's 0.4us over 200k entries. Clojure reaches these through
+;; PersistentTreeMap.min()/max(), which are exactly these two walks.
+(defn- nd-leftmost [n] (if-let [l (nd-left n)] (recur l) n))
+(defn- nd-rightmost [n] (if-let [r (nd-right n)] (recur r) n))
 
 ;; --- sorted-map ops ---------------------------------------------------------
 ;; a real map-entry (map-entry? true), so key/val/seq destructuring work like a
@@ -304,7 +321,7 @@
    :entries  (fn [sm] (sc-entries sm map-entry))
    :seq      (fn [sm] (seq (sc-entries sm map-entry)))
    :rseq     (fn [sm] (seq (vec (reverse (sc-entries sm map-entry)))))
-   :first    (fn [sm] (first (sc-entries sm map-entry)))
+   :first    (fn [sm] (when-let [t (sfield sm :tree)] (map-entry (nd-leftmost t))))
    :get      sm-get
    :entry-at sm-entry-at
    :contains (fn [sm k] (not (nil? (tree-lookup (sfield sm :tree) (the-cmp sm) k))))
@@ -318,7 +335,7 @@
    :entries  (fn [ss] (sc-entries ss nd-key))
    :seq      (fn [ss] (seq (sc-entries ss nd-key)))
    :rseq     (fn [ss] (seq (vec (reverse (sc-entries ss nd-key)))))
-   :first    (fn [ss] (first (sc-entries ss nd-key)))
+   :first    (fn [ss] (when-let [t (sfield ss :tree)] (nd-key (nd-leftmost t))))
    :get      ss-get
    :contains (fn [ss x] (not (nil? (tree-lookup (sfield ss :tree) (the-cmp ss) x))))
    :conj     ss-conj-many

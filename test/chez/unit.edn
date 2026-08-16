@@ -1740,4 +1740,19 @@
   {:suite "records" :label "ctor wrong arity throws ArityException"
    :expr "(do (defrecord CtorAr [x y]) (try (apply ->CtorAr [1]) (catch clojure.lang.ArityException e [(instance? IllegalArgumentException e) (ex-message e)])))"
    :expected "[true \"Wrong number of args (1) passed to: user/->CtorAr\"]"}
+
+  ;; A vector-backed seq answers count and drop from its backing vector instead
+  ;; of walking it — PersistentVector$ChunkedSeq is Counted and IDrop on the JVM.
+  ;; (count (seq 1M-vector)) was 18.8ms against the reference's 166ns.
+  ;; The cons rows matter: RT.countFrom stops at the FIRST countable cell, so a
+  ;; few plain cells in front of a vector-backed one must still reach the O(1)
+  ;; answer rather than falling back to a full walk.
+  {:suite "seq" :label "count of a vector seq" :expr "(count (seq (vec (range 100))))" :expected "100"}
+  {:suite "seq" :label "count through cons onto a vector seq" :expr "(count (cons :x (cons :y (seq (vec (range 100))))))" :expected "102"}
+  {:suite "seq" :label "count of rest of a vector seq" :expr "(count (rest (seq (vec (range 100)))))" :expected "99"}
+  {:suite "seq" :label "count of a chunked map result still walks" :expr "(count (map inc (vec (range 100))))" :expected "100"}
+  {:suite "seq" :label "drop from a vector seq" :expr "(= (drop 90 (seq (vec (range 100)))) (range 90 100))" :expected "true"}
+  {:suite "seq" :label "drop past the end of a vector seq" :expr "(pr-str (drop 200 (seq (vec (range 100)))))" :expected "\"()\""}
+  {:suite "seq" :label "drop 0 keeps the whole vector seq" :expr "(= (drop 0 (seq (vec (range 100)))) (range 100))" :expected "true"}
+  {:suite "seq" :label "drop through cons onto a vector seq" :expr "(= (drop 2 (cons :x (cons :y (seq (vec (range 5)))))) (range 5))" :expected "true"}
 ]

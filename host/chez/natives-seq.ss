@@ -243,9 +243,28 @@
 (def-var! "clojure.core" "identical?" jolt-identical?)
 
 ;; rseq: vectors + sorted colls only (Clojure), the reverse of the ascending seq.
+;; Clojure's contract is explicit that this is CONSTANT time ("Returns, in
+;; constant time, a seq of the items in rev ... in reverse order") — it hands back
+;; a reverse view, APersistentVector$RSeq. jolt materialized the whole collection
+;; into a list, reversed it and rebuilt a seq: O(n) time and O(n) garbage for an
+;; operation whose whole point is that it is free. Over 200k elements that was
+;; 19.8ms against 209ns.
+;;
+;; A vector walks its indices downward instead, one lazy cell at a time. NOTE the
+;; cell is a plain lazy cell and deliberately NOT a cvec-backed one: cvec/ci mean
+;; "vector-backed, ASCENDING from ci" and drive the O(1) count/drop and the
+;; vec-reduce fast paths, so a descending seq wearing those fields would make all
+;; three answer for the wrong direction.
+(define (vec->rseq v i)
+  (if (fx<? i 0)
+      jolt-nil
+      (cseq-lazy (pvec-nth-d v i jolt-nil) (lambda () (vec->rseq v (fx- i 1))))))
 (define (jolt-rseq coll)
   (cond
-    ((or (pvec? coll) (htable-sorted? coll))
+    ((pvec? coll)
+     (let ((n (pvec-count coll)))
+       (if (fx=? n 0) jolt-nil (vec->rseq coll (fx- n 1)))))
+    ((htable-sorted? coll)
      (list->cseq (reverse (seq->list (jolt-seq coll)))))
     ;; a deftype/record implementing clojure.lang.Reversible (rseq) — e.g.
     ;; data.priority-map — drives rseq through its own method.

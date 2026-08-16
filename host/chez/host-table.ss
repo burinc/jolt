@@ -95,6 +95,7 @@
 (define kw-cmp-fn (keyword #f "cmp-fn"))
 (define kw-op-count (keyword #f "count"))
 (define kw-op-seq (keyword #f "seq"))
+(define kw-op-first (keyword #f "first"))
 (define kw-op-get (keyword #f "get"))
 (define kw-op-contains (keyword #f "contains"))
 (define kw-op-assoc (keyword #f "assoc"))
@@ -111,6 +112,16 @@
 
 ;; --- extend the collection dispatchers with a sorted arm ---------------------
 (register-seq-arm! htable-sorted? (lambda (x) (sc-call x kw-op-seq)))
+;; first on a sorted collection answers from the tree's leftmost node — the :first
+;; op is an O(log n) spine walk (25-sorted.clj). Without this arm it went through
+;; the generic (seq-first (jolt-seq x)), and the :seq op materializes the WHOLE
+;; tree into a vector before the head can be read: 190ms against the reference's
+;; 0.4us over 200k entries. Clojure answers the same question through
+;; PersistentTreeMap.min(). The generic path stays for everything else, so
+;; take/subseq still pay the materialization (bead jolt-r8tz.7).
+(define %h-first jolt-first)
+(set! jolt-first
+  (lambda (x) (if (htable-sorted? x) (sc-call x kw-op-first) (%h-first x))))
 (register-count-arm! htable-sorted?
   (lambda (coll) (sc-call coll kw-op-count)))
 (register-get-arm! htable-sorted? (lambda (coll k d) (sc-call coll kw-op-get k d)))
