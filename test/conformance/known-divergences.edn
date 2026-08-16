@@ -483,7 +483,24 @@
    :behavior "(str (java.net.InetSocketAddress. \"127.0.0.1\" 80)) — requires (require 'jolt.socket)"
    :jvm "\"/127.0.0.1:80\" (hostname null for a literal; \"localhost/127.0.0.1:80\" for a name)"
    :jolt "\"127.0.0.1:80\""
-   :note "jolt does not resolve in the InetSocketAddress constructor (the JVM does), so the hostname/ip split doesn't exist to render. Socket/ServerSocket toString follow the JVM shape."}]
+   :note "jolt does not resolve in the InetSocketAddress constructor (the JVM does), so the hostname/ip split doesn't exist to render. Socket/ServerSocket toString follow the JVM shape."}
+  ;; Process lifetime is Chez's, not the JVM's. A java.lang.Thread is a real OS
+  ;; thread over fork-thread, but Chez exits when the main thread returns and does
+  ;; not wait for the others — so every jolt thread behaves as a JVM DAEMON thread,
+  ;; and .setDaemon has nothing to switch (it is accepted and ignored rather than
+  ;; raising, since the daemon case is the one jolt already implements). Not a
+  ;; corpus row: the divergence is in whether the process exits, which a corpus row
+  ;; evaluating an expression cannot observe.
+  ;;
+  ;; This one misleads specifically because the shim is otherwise faithful — code
+  ;; that starts a worker and returns from -main looks correct and silently drops
+  ;; the worker. Join the thread (or block the main thread on a latch/promise) to
+  ;; keep it alive.
+  {:category :host-model
+   :behavior "(.start (Thread. f)) as the last act of a program, without a join"
+   :jvm "the process stays up until f returns — a non-daemon thread holds it open"
+   :jolt "the process exits when the main thread returns; f may never finish"
+   :note "Inherent to Chez's thread model. .setDaemon is a no-op because every thread is already a daemon. Explicit .join / a latch / a deref of a promise all work."}]
  :entries
  [;; SimpleDateFormat with no Locale answers for ROOT in jolt but the machine's
   ;; DEFAULT locale on the JVM ("March|Mar|Saturday|Sat" under en), so this row's
