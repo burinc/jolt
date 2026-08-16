@@ -5,6 +5,127 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.14] - 2026-08-16
+
+A collections release. The theme running through it is operations that were
+answering a question the data structure could already answer, by walking
+instead — `count` and `drop` on a vector-backed seq, `rseq`, `first` on a
+sorted collection, and, underneath the whole transient surface, a `persistent!`
+that rebuilt the trie it had just been handed. None of it was visible to a
+value test: the answers were correct all along, just derived the long way.
+Every fix below is what the reference implementation already does. The ones
+that changed a complexity class ship with a gate that measures the shape in
+one process, so they cannot quietly come back; the constant-factor ones are
+tracked in the benchmark suite instead, because a constant has no shape to
+assert and a gate calibrating one operation against another flakes on shared
+CI machines rather than catching anything.
+
+### Added
+
+- **`jolt.scheme`: a `(scheme ...)` macro for inline Scheme.** The body is
+  written as Scheme but read by jolt, rendered to Scheme source at
+  macroexpansion and evaluated through the existing eval-string seam; multiple
+  forms wrap in `(begin ...)` so `define` splices and the last form's value
+  returns. The renderer owns the spellings jolt's reader owns (`true`/`false`,
+  chars, vectors, `nil`); keywords, maps and sets have no Scheme reading and
+  are refused at macroexpansion rather than mistranslated.
+
+### Performance
+
+- **Transients build the map instead of deferring it.** A transient map or set
+  was a Chez hashtable, so `persistent!` folded every entry back through the
+  HAMT insert and rebuilt the trie from scratch — the transient did not avoid
+  the path-copying build, it deferred it and added a hashtable on top. Writes
+  now claim each node on their path into an editable copy and mutate in place,
+  and `persistent!` freezes only the claimed spine, keeping untouched subtrees
+  by pointer. Over 200k entries: `(into {} m)` 324 → 85 ms, `(into #{} v)`
+  270 → 72 ms, an `assoc!` loop 306 → 77 ms; over 20k, `(frequencies v)`
+  27 → 11 ms.
+
+  `PersistentHashMap` does this with a per-node edit token. That is not
+  available here — the node record's layout is image-format surface, since a
+  dumped map's node tree is written raw, so adding a field to it would stop
+  released images restoring. A separate editable node type answers the same
+  question with a type test and gives a stronger guarantee: such a node is
+  only ever reachable from the transient that created it, so the immutable
+  node functions are untouched.
+
+  Reading a live transient is about 1.25x slower as a result, because a
+  hashtable probe beats a HAMT walk — which was equally true of the persistent
+  map all along. The editable walk measures within 1.4% of the existing
+  persistent one.
+
+- **`count`, `drop`, `rseq` and `first` answer from the shape.** On a 200k
+  collection: `(count (seq v))` 18.8 ms → below timer resolution, `(drop k
+  (seq v))` 18.5 ms → 1 µs, `(rseq v)` 19.8 ms → 0, `(first sorted-map)`
+  190 ms → 4 µs and flat in n, `(first sorted-set)` 94 ms → 4 µs. Each has a
+  structural counterpart in the reference: `PersistentVector$ChunkedSeq`
+  implements `Counted` and `IDrop`, `RT.countFrom` short-circuits on the first
+  `Counted` cell, `rseq` documents constant time, and `PersistentTreeMap.min()`
+  walks one spine.
+
+- **`nth` tests the vector case first.** `jolt-nth` was wrapped four times with
+  the array shim outermost, so a plain vector read paid four type probes and
+  three chained calls before reaching the vector arm; `RT.nth` tests `Indexed`
+  first and returns. 34.3 → 16.0 ns on a small vector, 27.2 → 9.7 ns with a
+  default. Small vectors are the shape that matters — tree nodes and tuples
+  are five elements, and `nth` was 20% of the time in red-black tree code.
+
+- **`keep`, `map-indexed` and `keep-indexed` preserve chunks**, like their
+  siblings already did, so they realize a chunk at a time rather than an
+  element at a time.
+
+- **`set` builds through a transient and returns an existing set unchanged.**
+  It was `(apply hash-set (seq coll))`: it rebuilt an existing set element by
+  element and never used a transient. 200k: `(set v)` 204 → 73 ms,
+  `(set already-a-set)` 137 → 0 ms.
+
+- **Record collection ops stop recomputing a per-type constant per instance.**
+  Every one asked "does this type declare an impl?" by snapshotting the
+  protocol keys under a mutex and probing each, concluding "none" every time
+  for a plain defrecord and getting slower the more protocols the type had. A
+  by-method index answers it with one unlocked ref, and three further per-type
+  answers cache on the descriptor. On a 3-protocol record: `count` 82 → 37 ms,
+  `contains?` 144 → 44 ms, `seq` 373 → 142 ms, `instance?` on a protocol
+  362 → 234 ms.
+
+- **`clojure.string` skips method dispatch for an argument that is already a
+  string.** `to-str`, which every fn in the namespace coerces through, called
+  `.toString` unconditionally. The wrapper cost 552 → 348 ns; `(upper-case
+  "sel")` was spending over 90% of its time deciding how to dispatch.
+
+- **Vector-backed and chunked seq cells no longer allocate a per-element tail
+  closure.**
+
+### Fixed
+
+- **A wrong-arity record constructor names its class.** It raised through a
+  Scheme binding that is unbound in that layer, so it died as "variable str is
+  not bound" with no class rather than the JVM's `ArityException`. The existing
+  tests only asserted "some exception", and a classless host error satisfies
+  `(catch Exception e ...)`, which is why it survived; they assert the class now.
+
+- **Printing a record is no longer quadratic in its extension-map size.** Each
+  entry was appended to a growing accumulator. Comparing 4000 against 16000
+  entries: 12.67x before, 4.50x after.
+
+- **`ref-min-history` / `ref-max-history` argument handling.** They took a
+  rest-arg, so three or more arguments silently read instead of raising, a
+  missing target died in the Scheme layer with a classless error, and a
+  non-Ref target returned the default. They now raise `ArityException`,
+  `ClassCastException` and `NullPointerException` to match.
+
+- **Transient map promotion is one-way.** A transient that grew past the
+  array-map threshold and was then shrunk back below it came down an array
+  map, because the mode was decided at `persistent!` from the final count. The
+  reference promotes on the way up and never returns.
+
+- **`with-meta` returns the value itself when the metadata is unchanged.** The
+  JVM compares metadata by identity, not by `=`, and returns `this` on a match,
+  so `(identical? v (with-meta v nil))` is true for a value with no metadata;
+  jolt always allocated. This is what made the reference's `set` fast path
+  unusable here.
+
 ## [0.7.13] - 2026-08-15
 
 A performance patch. A structural sweep hunted the runtime, stdlib, and
