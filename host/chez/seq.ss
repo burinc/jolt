@@ -1103,13 +1103,24 @@
                     ((or (fx<=? n 0) (jolt-nil? s)) jolt-empty-list)
                     ((fx=? n 1) (cseq-lazy (seq-first s) (lambda () jolt-empty-list)))
                     (else (cseq-lazy (seq-first s) (lambda () (loop (fx- n 1) (jolt-seq (seq-more s)))))))))))))))
+;; Dropping from a vector-backed cell is an index jump, not a walk: the result is
+;; the same backing vector seen from further along. PersistentVector$ChunkedSeq
+;; implements IDrop on the JVM for exactly this, and it is the difference between
+;; 625ns and 18.5ms when dropping a million elements. As with count, the step
+;; loop re-checks per cell so a few plain cells in front of a vector-backed one
+;; still reach the jump.
 (define (jolt-drop n coll)
   (jolt-make-lazy-seq
    (lambda ()
      (jolt-seq
       (let loop ((n (->idx n)) (s (jolt-seq coll)))
-        (if (or (fx<=? n 0) (jolt-nil? s)) (if (jolt-nil? s) jolt-empty-list s)
-            (loop (fx- n 1) (jolt-seq (seq-more s)))))))))
+        (cond
+          ((jolt-nil? s) jolt-empty-list)
+          ((fx<=? n 0) s)
+          ((and (cseq-cvec s) (not (cseq-crest s)))
+           (let ((v (cseq-cvec s)) (i (fx+ (cseq-ci s) n)))
+             (if (fx>=? i (pvec-count v)) jolt-empty-list (vec->seq v i))))
+          (else (loop (fx- n 1) (jolt-seq (seq-more s))))))))))
 
 ;; (iterate f x) — x, (f x), (f (f x)), … as ONE lazy cell per element.
 ;; The overlay spelling, (cons x (lazy-seq (iterate f (f x)))), costs two records

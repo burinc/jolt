@@ -1125,8 +1125,28 @@
         ((pset? coll) (pset-count coll))
         ((string? coll) (string-length coll))
         ((or (jolt-nil? coll) (empty-list-t? coll)) 0)
-        ((cseq? coll) (let loop ((s coll) (n 0))
-                        (if (jolt-nil? s) n (loop (jolt-seq (seq-more s)) (fx+ n 1)))))
+        ;; A vector-backed cell knows how many elements remain without walking
+        ;; them: its backing vector's count less its own index. The JVM says the
+        ;; same thing by having PersistentVector$ChunkedSeq implement Counted,
+        ;; and RT.countFrom stops the moment it reaches a Counted cell —
+        ;; `if(s instanceof Counted) return i + s.count()` — which is why the
+        ;; walk below mirrors that shape rather than testing only the head: a
+        ;; cons onto a vector seq gives plain cells in front of a countable one,
+        ;; and those few steps should still end in the O(1) answer.
+        ;;
+        ;; Walking instead made (count (seq v)) linear where the reference is
+        ;; constant: 18.8ms against 166ns over a million elements.
+        ;;
+        ;; Only the crest-#f shape qualifies. A ChunkedCons (crest set) is a
+        ;; standalone chunk followed by an arbitrary, possibly lazy rest, so its
+        ;; length is not known without forcing — ChunkedCons is deliberately not
+        ;; Counted on the JVM either.
+        ((cseq? coll)
+         (let loop ((s coll) (n 0))
+           (cond ((jolt-nil? s) n)
+                 ((and (cseq-cvec s) (not (cseq-crest s)))
+                  (fx+ n (fx- (pvec-count (cseq-cvec s)) (cseq-ci s))))
+                 (else (loop (jolt-seq (seq-more s)) (fx+ n 1))))))
         (else (let loop ((as jolt-count-arms))
                 (cond ((null? as) (jolt-count-base coll))
                       (((caar as) coll) ((cdar as) coll))
