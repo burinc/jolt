@@ -302,6 +302,7 @@
 ;; both sit just above jfile at 42). Values are unchanged from the prior magic
 ;; numbers — this is a readability rename only.
 (define arm-priority-getclass 5)      ; .getClass — universal Object method, first
+(define arm-priority-string 6)       ; string receivers — the base's string? case hoisted
 (define arm-priority-dotform 30)      ; -field accessor + dot-form method dispatch
 (define arm-priority-date 40)         ; java.util.Date (jinst) method surface
 (define arm-priority-file 41)         ; java.io.File (jfile) methods
@@ -315,6 +316,22 @@
         (record-method-dispatch-base obj method-name rest-args)
         (let ((r ((cdar as) obj method-name rest-args)))
           (if (eq? r 'pass) (loop (cdr as)) r)))))
+
+;; Strings are the most common interop receiver in library code (honeysql's
+;; format path alone is .charAt/.length/.indexOf/.toString per entity), and the
+;; base's string? case sat BELOW every arm — each call walked getclass, dotform
+;; (whose let* seq->list-converts the rest args even to pass), date/file/regex/
+;; nio/htable/host-type before reaching it. Claim string receivers right after
+;; getClass so they pay one type test instead. Same handler as the base case —
+;; jolt-string-method — so an unknown method throws the identical error, and a
+;; non-string still 'passes on unchanged.
+(register-method-arm! arm-priority-string
+  (lambda (obj method-name rest-args)
+    (if (string? obj)
+        (jolt-string-method method-name obj
+                            (if (jolt-nil? rest-args) '() (seq->list rest-args)))
+        'pass)))
+
 
 ;; (.getClass x): a universal Object method reached by EVERY value before any
 ;; per-type arm — the class token for the value (jolt has no Class objects; the
