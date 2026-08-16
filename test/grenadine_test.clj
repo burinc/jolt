@@ -1,5 +1,7 @@
 (ns grenadine-test
-  (:require [grenadine.graph :as graph]
+  (:require [clojurestar.deps :as portable-deps]
+            [grenadine.graph :as graph]
+            [grenadine.require-deps :as required]
             [jolt.deps :as deps]))
 
 (defn- coord
@@ -127,6 +129,55 @@
                    </project>"}
                  'demo/unresolved))
   (throw (ex-info "an unresolvable ${property} should degrade to nil, not deps" {})))
+
+(let [seen (atom [])]
+  (with-redefs-fn
+    {(var jolt.deps/prepare-required!)
+     (fn [coordinate options]
+       (swap! seen conj [(:coordinate coordinate) options])
+       'grenadine.graph)}
+    (fn []
+      (when-not
+       (nil?
+        (portable-deps/require-deps
+         {:cache-dir "/cache"}
+         '["gist:ingydotnet/f70409675d234aa4f2fe379cd975a4f5"
+           :as required-graph]
+         '["mvn:example/library@1.0.0/example.library"
+           :refer [resolve-graph]]))
+       (throw (ex-info "require-deps must return nil" {})))
+      (when-not
+       (= ["gist:ingydotnet/f70409675d234aa4f2fe379cd975a4f5"
+          "mvn:example/library@1.0.0/example.library"]
+          (mapv first @seen))
+       (throw (ex-info "require-deps did not preserve libspec order"
+                       {:seen @seen})))
+      (when-not (and (resolve 'required-graph/resolve-graph)
+                     (resolve 'resolve-graph))
+        (throw (ex-info "require-deps did not apply :as and :refer" {}))))))
+
+(let [caller (ns-name *ns*)
+      path (str (System/getProperty "java.io.tmpdir")
+                "/jolt-require-deps-gist.clj")
+      source "(ns require-deps-gist-fixture)\n(def value 42)\n"
+      coordinate {:provider :gist
+                  :coordinate "gist:fixture/deadbeef"
+                  :identity [:gist "fixture" "deadbeef" nil nil]}]
+  (spit path source)
+  (try
+    (with-redefs-fn
+      {(var required/acquire-gist!)
+       (fn [_host _options _coordinate]
+         {:path path :source source})}
+      (fn []
+        (deps/prepare-required! coordinate {})
+        (when-not (= caller (ns-name *ns*))
+          (throw (ex-info "require-deps leaked the loaded Gist namespace"
+                          {:expected caller :actual (ns-name *ns*)})))
+        (when-not (= 42 @(resolve 'require-deps-gist-fixture/value))
+          (throw (ex-info "require-deps did not load the Gist namespace" {})))))
+    (finally
+      (.delete (java.io.File. path)))))
 
 ;; ...and a degraded lib still reports whatever pom.xml its jar carries.
 (let [pom (str (System/getProperty "java.io.tmpdir") "/jolt-grenadine-fallback.xml")]

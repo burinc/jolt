@@ -23,10 +23,15 @@
             [clojure.string :as str]
             [grenadine.expander :as expander]
             [grenadine.pom :as grenadine.pom]
+            [grenadine.require-deps :as required]
             [grenadine.version :as grenadine.version]
             [jolt.deps.edn :as dedn]
             [jolt.deps.ext :as ext]
+            [jolt.fs :as fs]
             [jolt.mvn-http :as http]))
+
+(defonce ^:private required-state
+  (atom {:coordinates {} :namespaces {}}))
 
 ;; --- small host seams -------------------------------------------------------
 ;; An env var set to the empty string reads as UNSET — `FOO= cmd` is the usual
@@ -1408,3 +1413,70 @@
        (info "added deps declare :jolt/native libraries (not auto-loaded): "
              (pr-str (dedup-by native-key natives))))
      added)))
+
+(defn- required-host
+  []
+  {:home-dir #(getenv "HOME")
+   :file-exists? file-exists?
+   :mkdirs! #(do (fs/create-dirs %) nil)
+   :delete! #(do (fs/delete-if-exists %) nil)
+   :read-text slurp
+   :download! http/fetch
+   :atomic-move!
+   #(do (fs/move %1 %2 {:replace-existing true :atomic-move true}) nil)})
+
+(defn- read-first-form
+  [source]
+  (binding [*read-eval* false]
+    (read-string source)))
+
+(defn- loaded-namespace
+  [identity]
+  (get-in @required-state [:coordinates identity]))
+
+(defn- load-required!
+  [coordinate namespace-symbol load!]
+  (let [identity (:identity coordinate)
+        loaded-coordinate (get-in @required-state
+                                  [:namespaces namespace-symbol])]
+    (cond
+      (= identity (:identity loaded-coordinate)) namespace-symbol
+      loaded-coordinate
+      (required/namespace-conflict! namespace-symbol loaded-coordinate coordinate)
+      :else
+      (do
+        (load!)
+        (swap! required-state
+               (fn [state]
+                 (-> state
+                     (assoc-in [:coordinates identity] namespace-symbol)
+                     (assoc-in [:namespaces namespace-symbol] coordinate))))
+        namespace-symbol))))
+
+(defn prepare-required!
+  "Internal hook used by clojurestar.deps/require-deps."
+  [coordinate options]
+  (or
+   (loaded-namespace (:identity coordinate))
+   (case (:provider coordinate)
+     :mvn
+     (load-required!
+      coordinate (:namespace coordinate)
+      #(do
+         (add-deps
+          (cond-> {:deps {(:lib coordinate)
+                          {:mvn/version (:version coordinate)}}}
+            (:mvn/local-repo options)
+            (assoc :mvn/local-repo (:mvn/local-repo options))))
+         (require (:namespace coordinate))))
+
+     :gist
+     (let [{:keys [path source]}
+           (required/acquire-gist! (required-host) options coordinate)
+           namespace-symbol
+           (required/gist-namespace coordinate (read-first-form source))]
+       (load-required! coordinate namespace-symbol
+                       #(let [caller (ns-name *ns*)]
+                          (try
+                            (load-file path)
+                            (finally (in-ns caller)))))))))

@@ -13,7 +13,6 @@
 #
 # build-jolt fails on drift between this manifest and the discovered set, so the
 # two can never silently diverge. clojure.test MUST be in the embedded set.
-babashka.fs
 babashka.process
 babashka.process.pprint
 clojure.core.async
@@ -44,7 +43,6 @@ grenadine.repo
 grenadine.runtime
 grenadine.source
 jolt.fibers
-jolt.fs
 jolt.image
 jolt.infix
 jolt.infix.core
@@ -74,7 +72,6 @@ jolt.time.local
 jolt.time.temporal
 jolt.time.util
 jolt.time.year
-jolt.util
 skip glojure.deps — requires glojure/deps/host.{jolt,clj,cljc} which is absent from the install roots at build time
 skip grenadine.host.glojure — top level references an unqualified `strings` symbol that does not resolve in the build image
 skip grenadine.cli — requires grenadine/build_info.{jolt,clj,cljc} (generated at release packaging), absent in a dev build
