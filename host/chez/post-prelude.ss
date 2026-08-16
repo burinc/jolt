@@ -322,3 +322,22 @@
 ;; calls (~130ns) for two native predicates; dispatch-heavy code (honeysql's
 ;; format-selectable-dsl) calls it per branch. One native closure.
 (def-var! "clojure.core" "ident?" (lambda (x) (or (keyword-t? x) (symbol-t? x))))
+;; sequential?: the overlay's (or (vector? x) (seq? x)) routes EVERY call through
+;; two overlay fn invocations (var deref + jolt-invoke each, ~250ns on a pmap —
+;; and map destructuring expands to a sequential? test per binding form, so
+;; honeysql's format path paid it per clause). One native closure: the fast
+;; native types answer directly; concrete non-sequential natives answer #f
+;; without touching the overlay; only exotic values fall through to it.
+(let ((prev (var-deref "clojure.core" "sequential?")))
+  (def-var! "clojure.core" "sequential?"
+    (lambda (x)
+      (cond ((pvec? x) #t)
+            ((cseq? x) #t)
+            ((jolt-lazyseq? x) #t)
+            ((empty-list-t? x) #t)
+            ((jolt-queue? x) #t)
+            ((jrec-iface-pred? x "clojure.lang.Sequential") #t)
+            ((or (pmap? x) (pset? x) (string? x) (symbol-t? x) (keyword-t? x)
+                 (number? x) (char? x) (boolean? x) (jolt-nil? x) (procedure? x))
+             #f)
+            (else (jolt-invoke1 prev x))))))

@@ -1003,6 +1003,39 @@
         (make-pmap r (fx- (pmap-cnt m) 1) (if ord (remove-key ord k) #f))
         m)))
 (define (pmap-get m k default) (node-get (pmap-root m) 0 (key-hash k) k default))
+;; Flattened hot lookup for the key types that dominate real lookups (keyword,
+;; fixnum, string). The layered path above costs ~40ns/call: case-lambda ->
+;; dispatch -> pmap? -> pmap-get -> key-hash -> jolt-hasheq cond -> node-get ->
+;; bitpos/chunk/arr-index/popcount -> VARIADIC jolt= (a rest-list alloc) ->
+;; jolt=2 type walk. Everything here is one procedure so cp0 inlines the local
+;; helpers (bitpos/arr-index/popcount) and the record preds/accessors; the key
+;; compare is specialized (keyword eq? / fixnum = / string string=?) instead of
+;; the generic jolt= walk. Anything else (bignum-keyed, symbolic, heterogeneous
+;; hashes) falls to pmap-get. Semantics identical to node-get.
+(define (pmap-fast-get m k d)
+  (let ((h (cond ((keyword-t? k) (keyword-t-khash k))
+                 ((fixnum? k) (murmur3-hash-long-flat k))
+                 ((string? k) (string-hasheq k))
+                 (else #f))))
+    (if (and h (fixnum? h))
+        (let ((h (fxand h hmask)))
+          (let lp ((node (pmap-root m)) (shift 0))
+            (let* ((bit (fxsll 1 (fxand (fxsra h shift) 31)))
+                   (bm (hnode-bm node)))
+              (if (fx=? 0 (fxand bm bit)) d
+                  (let ((child (vector-ref (hnode-arr node)
+                                           (fxbit-count (fxand bm (fx- bit 1))))))
+                    (cond ((hnode? child) (lp child (fx+ shift 5)))
+                          ((hcoll? child)
+                           (let ((p (assoc-jolt k (hcoll-alist child)))) (if p (cdr p) d)))
+                          ((let ((ck (car child)))
+                             (cond ((keyword-t? ck) (and (keyword-t? k) (eq? ck k)))
+                                   ((fixnum? ck) (and (fixnum? k) (fx=? ck k)))
+                                   ((string? ck) (and (string? k) (string=? ck k)))
+                                   (else (jolt=2 ck k))))
+                           (cdr child))
+                          (else d)))))))
+        (pmap-get m k d))))
 ;; the stored (key . value) pair, or #f — `find` builds its entry from this so the
 ;; entry's key is the map's own key object, not the equal one probed with.
 (define (pmap-entry-at m k) (node-entry (pmap-root m) 0 (key-hash k) k))
@@ -1200,7 +1233,7 @@
 ;; jrec? / jrec-ref live in records.ss (loaded later); these are forward references
 ;; resolved at call time. Check concrete types first, then records, then arms.
 (define (jolt-get-dispatch coll k d)
-  (cond ((pmap? coll) (pmap-get coll k d))
+  (cond ((pmap? coll) (pmap-fast-get coll k d))
         ((pvec? coll) (pvec-nth-d coll k d))
         ((pset? coll) (pset-get coll k d))
         ((jrec? coll) (jrec-ref coll k d))
@@ -1210,8 +1243,12 @@
                       (else (loop (cdr as))))))))
 (define jolt-get
   (case-lambda
-    ((coll k) (jolt-get-dispatch coll k jolt-nil))
-    ((coll k d) (jolt-get-dispatch coll k d))))
+    ;; pmap is the dominant receiver: keep its path to one call (the arm holds
+    ;; the pmap? test inline; everything else pays jolt-get-dispatch's walk).
+    ((coll k)
+     (if (pmap? coll) (pmap-fast-get coll k jolt-nil) (jolt-get-dispatch coll k jolt-nil)))
+    ((coll k d)
+     (if (pmap? coll) (pmap-fast-get coll k d) (jolt-get-dispatch coll k d)))))
 
 ;; A deftype implementing a clojure.lang collection interface (Indexed/Counted/
 ;; Associative/ILookup/ISeq/IPersistentCollection) carries the interface method
