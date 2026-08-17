@@ -300,10 +300,14 @@
                         (jch-tags "clojure.lang.PersistentArrayMap")
                         (jch-tags "clojure.lang.PersistentHashMap")))
         ((pset? obj) (jch-tags "clojure.lang.PersistentHashSet"))
-        ;; jolt models every seq as a list (no distinct LazySeq), so a seq also
-        ;; reports PersistentList / IPersistentList / IPersistentStack — extend-protocol
-        ;; clojure.lang.IPersistentList (algo.monads' writer monad) dispatches on one.
-        ((or (cseq? obj) (empty-list-t? obj)) (jch-tags "clojure.lang.PersistentList"))
+        ;; A seq dispatches as the concrete class its flavor says it is — the same
+        ;; answer (class …) gives, read from the same table (host-class.ss
+        ;; cseq-class-name, a forward reference resolved at dispatch time). So
+        ;; extend-protocol clojure.lang.IPersistentList (algo.monads' writer monad)
+        ;; catches a real list, and an extend-protocol on the concrete
+        ;; PersistentList no longer also swallows every vector seq and map seq.
+        ((cseq? obj) (jch-tags (cseq-class-name obj)))
+        ((empty-list-t? obj) (jch-tags "clojure.lang.PersistentList$EmptyList"))
         ;; a lazy seq (map/filter/… result) is clojure.lang.LazySeq: a Sequential
         ;; ISeq, but not a PersistentList — matching the JVM so extend-protocol /
         ;; instance? on a deferred seq dispatch like an eager one where they should.

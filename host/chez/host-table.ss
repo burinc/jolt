@@ -111,7 +111,21 @@
 (define (sc-call sc op-kw . args) (apply jolt-invoke (sc-op sc op-kw) sc args))
 
 ;; --- extend the collection dispatchers with a sorted arm ---------------------
-(register-seq-arm! htable-sorted? (lambda (x) (sc-call x kw-op-seq)))
+;; A sorted coll's seq is clojure.lang.PersistentTreeMap$Seq, and the :seq op hands
+;; back a seq over the vector it materialized the tree into — which is flavored as
+;; a vector's own ChunkedSeq. Re-labelling it is O(1) and copies nothing: a
+;; vector-backed cell derives its whole tail from (cvec, ci) and propagates its
+;; flavor down, so one fresh cell over the SAME backing vector re-labels the entire
+;; chain. Any other shape is left as it is rather than guessed at.
+(register-seq-arm! htable-sorted?
+  (lambda (x)
+    (let ((s (sc-call x kw-op-seq)))
+      (if (and (cseq? s) (cseq-cvec s) (not (cseq-crest s)))
+          ;; a sorted SET seqs as the keys of its backing tree, so it is a KeySeq
+          ;; there and not a $Seq — PersistentTreeSet.seq is RT.keys(impl.seq()).
+          (vec->seq/k (cseq-cvec s) (cseq-ci s)
+                      (if (htable-sorted-set? x) sk-key-seq sk-treemap-seq))
+          s))))
 ;; first on a sorted collection answers from the tree's leftmost node — the :first
 ;; op is an O(log n) spine walk (25-sorted.clj). Without this arm it went through
 ;; the generic (seq-first (jolt-seq x)), and the :seq op materializes the WHOLE

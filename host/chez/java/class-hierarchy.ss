@@ -251,6 +251,7 @@
             "clojure.lang.Reversible" "clojure.lang.Indexed" "clojure.lang.Counted"
             "clojure.lang.Named" "clojure.lang.Fn" "clojure.lang.IFn"
             "clojure.lang.IPersistentCollection" "clojure.lang.ISeq"
+            "clojure.lang.IChunkedSeq"
             "clojure.lang.Associative" "clojure.lang.ILookup"
             "clojure.lang.IPersistentStack" "clojure.lang.IPersistentVector"
             "clojure.lang.IPersistentMap" "clojure.lang.IPersistentSet"
@@ -269,6 +270,9 @@
 ;; core clojure.lang interfaces
 (jch-register-supers! "clojure.lang.IPersistentCollection" '("clojure.lang.Seqable"))
 (jch-register-supers! "clojure.lang.ISeq" '("clojure.lang.IPersistentCollection"))
+;; the interface chunk-first / chunk-rest are the contract of — a chunked seq is a
+;; Sequential ISeq that can also hand out a whole block at a time
+(jch-register-supers! "clojure.lang.IChunkedSeq" '("clojure.lang.ISeq" "clojure.lang.Sequential"))
 (jch-register-supers! "clojure.lang.Associative" '("clojure.lang.IPersistentCollection" "clojure.lang.ILookup"))
 (jch-register-supers! "clojure.lang.IPersistentStack" '("clojure.lang.IPersistentCollection"))
 (jch-register-supers! "clojure.lang.IPersistentVector" '("clojure.lang.Associative" "clojure.lang.Sequential"
@@ -310,6 +314,50 @@
 (jch-register-supers! "clojure.lang.PersistentList$EmptyList" '("clojure.lang.PersistentList"))
 (jch-register-supers! "clojure.lang.LazySeq" '("clojure.lang.ISeq" "clojure.lang.Sequential" "java.util.List" "clojure.lang.IObj"))
 (jch-register-supers! "clojure.lang.Cons" '("clojure.lang.ASeq"))
+;; ---- the concrete seq classes -------------------------------------------------
+;; One record backs every seq on this host, so which of these a value IS comes from
+;; the cell's flavor tag (seq.ss sk-*, mapped to these names in host-class.ss).
+;; Each row lists what the JVM class extends, MINUS any interface jolt does not
+;; actually honor for that flavor — the graph answers instance?, counted?,
+;; ancestors and protocol dispatch alike, so a row that overclaims turns one wrong
+;; answer into four. Each omission is called out where it happens.
+;;
+;; IChunkedSeq is NOT listed on any row here. Which flavors chunk is stated once, by
+;; sk-chunked? in seq.ss (the tier that implements chunk-first/chunk-rest), and
+;; host-class.ss grafts the interface onto exactly those flavors' classes — so
+;; chunked-seq? and (instance? IChunkedSeq x) cannot answer differently.
+;;
+;; A vector's own seq: Counted is real here — jolt-count reads (pvec-count - ci)
+;; without walking, exactly what Counted promises (collections.ss jolt-count).
+(jch-register-supers! "clojure.lang.PersistentVector$ChunkedSeq"
+                      '("clojure.lang.ASeq" "clojure.lang.Counted"))
+;; A standalone chunk plus an arbitrary, possibly lazy rest. NOT Counted — its
+;; length is unknown without forcing, and ChunkedCons is not Counted on the JVM either.
+(jch-register-supers! "clojure.lang.ChunkedCons" '("clojure.lang.ASeq"))
+;; Array and string seqs are realized cell chains here, not indexed views, so
+;; count walks them: IndexedSeq (which extends Counted) is deliberately NOT
+;; claimed. The JVM's are Counted; jolt answers counted? false rather than
+;; promising an O(1) count it would then have to fake.
+(jch-register-supers! "clojure.lang.ArraySeq" '("clojure.lang.ASeq"))
+(for-each (lambda (prim) (jch-register-supers! (string-append "clojure.lang.ArraySeq$ArraySeq_" prim)
+                                               '("clojure.lang.ArraySeq")))
+          '("int" "long" "short" "double" "float" "boolean" "byte" "char"))
+(jch-register-supers! "clojure.lang.StringSeq" '("clojure.lang.ASeq"))
+;; rseq is a lazy descending walk, so likewise not Counted (the JVM's RSeq is).
+(jch-register-supers! "clojure.lang.APersistentVector$RSeq" '("clojure.lang.ASeq"))
+;; The map/set seq views. PersistentArrayMap$Seq is Counted on the JVM; jolt
+;; materializes it into a cell chain, so it is not claimed here either.
+(jch-register-supers! "clojure.lang.PersistentArrayMap$Seq" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.PersistentHashMap$NodeSeq" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.PersistentTreeMap$Seq" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.APersistentMap$KeySeq" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.APersistentMap$ValSeq" '("clojure.lang.ASeq"))
+;; A bounded range chunks by 32 like the JVM's (sk-chunked? says so, and the
+;; interface is grafted on from there). NOT Counted, though the JVM's is: jolt's
+;; range is one chunk followed by a lazy continuation, so it cannot answer its own
+;; length without realizing the whole thing.
+(jch-register-supers! "clojure.lang.LongRange" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.Iterate" '("clojure.lang.ASeq"))
 (jch-register-supers! "clojure.lang.PersistentQueue" '("clojure.lang.IPersistentList" "clojure.lang.IPersistentCollection" "java.util.Collection"))
 ;; scalars / named / callable
 (jch-register-supers! "clojure.lang.Keyword" '("clojure.lang.IFn" "clojure.lang.Named" "java.lang.Comparable"))

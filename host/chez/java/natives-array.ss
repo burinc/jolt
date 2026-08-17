@@ -16,6 +16,17 @@
     ((float) "[F") ((boolean) "[Z") ((byte) "[B") ((char) "[C")
     (else "[Ljava.lang.Object;")))
 
+;; …and the matching seq flavor. The JVM gives an array's seq its own class per
+;; element type (ArraySeq$ArraySeq_int for an int[], plain ArraySeq for an
+;; Object[]), so the seq arm below labels the chain from the array's kind exactly
+;; the way na-array-class-name labels the array itself.
+(define (na-seq-kind arr)
+  (case (jolt-array-kind arr)
+    ((int) sk-array-int) ((long) sk-array-long) ((short) sk-array-short)
+    ((double) sk-array-double) ((float) sk-array-float) ((boolean) sk-array-bool)
+    ((byte) sk-array-byte) ((char) sk-array-char)
+    (else sk-array-seq)))
+
 (define (na-idx i) (if (and (number? i) (not (exact? i))) (exact (floor i)) (jolt-need-num i)))
 
 ;; A double/float jolt-array is backed by a Chez FLVECTOR (unboxed flonums); every
@@ -202,7 +213,8 @@
 
 ;; --- extend the collection dispatchers to see a jolt-array ------------------
 (register-count-arm! jolt-array? (lambda (c) (ja-len (jolt-array-vec c))))
-(register-seq-arm! jolt-array? (lambda (c) (list->cseq (ja->list (jolt-array-vec c)))))
+(register-seq-arm! jolt-array?
+  (lambda (c) (list->cseq/k (ja->list (jolt-array-vec c)) (na-seq-kind c))))
 (define %na-nth jolt-nth)
 ;; RT.nth tests Indexed first and returns; this is the OUTERMOST jolt-nth
 ;; wrapper (natives-array loads last of the set! chain), so a pvec receiver

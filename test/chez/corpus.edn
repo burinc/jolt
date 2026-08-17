@@ -3391,21 +3391,43 @@
   {:suite "chunked-seq / over a vector" :label "chunked-seq? false for a list seq" :expected "false" :actual "(chunked-seq? (seq (list 1 2 3)))" :portability :common}
   {:suite "chunked-seq / over a vector" :label "chunk-first contents + chunk-rest boundary" :expected "[32 0 31 32]" :actual "(let [s (seq (vec (range 50))) c (chunk-first s)] [(count c) (nth c 0) (nth c 31) (first (chunk-rest s))])" :portability :common}
   {:suite "chunked-seq / over a vector" :label "chunk-first window past the first block" :expected "[32 33 34 35 36 37 38 39]" :actual "(vec (chunk-first (chunk-rest (seq (vec (range 40))))))" :portability :common}
-  ;; --- seq-type-model divergences (allowlisted): jolt models every seq as
-  ;; PersistentList (eager) or LazySeq (deferred); JVM reifies a specialized class
-  ;; per producer. Values + laziness are correct, only (class …) differs. jolt-aei7.
-  {:suite "seq-type-model / specialized seq classes collapse" :label "cons over a vector" :expected "clojure.lang.PersistentList" :actual "(class (cons 1 [2 3]))" :portability :common}
-  {:suite "seq-type-model / specialized seq classes collapse" :label "iterate" :expected "clojure.lang.PersistentList" :actual "(class (iterate inc 0))" :portability :common}
-  {:suite "seq-type-model / specialized seq classes collapse" :label "range" :expected "clojure.lang.PersistentList" :actual "(class (range 5))" :portability :common}
-  {:suite "seq-type-model / specialized seq classes collapse" :label "repeat" :expected "clojure.lang.LazySeq" :actual "(class (repeat 3 :x))" :portability :common}
-  {:suite "seq-type-model / specialized seq classes collapse" :label "cycle" :expected "clojure.lang.LazySeq" :actual "(class (cycle [1 2]))" :portability :common}
-  {:suite "seq-type-model / specialized seq classes collapse" :label "vector seq" :expected "clojure.lang.PersistentList" :actual "(class (seq [1 2 3]))" :portability :common}
-  {:suite "seq-type-model / specialized seq classes collapse" :label "string seq" :expected "clojure.lang.PersistentList" :actual "(class (seq \"abc\"))" :portability :common}
-  {:suite "seq-type-model / specialized seq classes collapse" :label "keys" :expected "clojure.lang.PersistentList" :actual "(class (keys {:a 1 :b 2}))" :portability :common}
-  {:suite "seq-type-model / specialized seq classes collapse" :label "rseq" :expected "clojure.lang.PersistentList" :actual "(class (rseq [1 2 3]))" :portability :common}
-  {:suite "seq-type-model / specialized seq classes collapse" :label "sort" :expected "clojure.lang.PersistentList" :actual "(class (sort [3 1 2]))" :portability :common}
-  {:suite "seq-type-model / specialized seq classes collapse" :label "subvec" :expected "clojure.lang.APersistentVector$SubVector" :actual "(class (subvec [1 2 3] 1))" :portability :jvm}
-  {:suite "seq-type-model / specialized seq classes collapse" :label "drop over a vector" :expected "clojure.lang.LazySeq" :actual "(class (drop 1 [1 2 3]))" :portability :common}
+  ;; --- seq-type-model: a seq reports the concrete clojure.lang class of whatever
+  ;; produced it, like the JVM. One cseq record backs them all, and the cell carries
+  ;; a flavor tag that names its class (host/chez/seq.ss sk-*, mapped in
+  ;; java/host-class.ss). Every expected value below is the JVM's own answer.
+  {:suite "seq-type-model / specialized seq classes" :label "iterate" :expected "clojure.lang.Iterate" :actual "(class (iterate inc 0))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "range" :expected "clojure.lang.LongRange" :actual "(class (range 5))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "unbounded range is Iterate" :expected "clojure.lang.Iterate" :actual "(class (range))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "vector seq" :expected "clojure.lang.PersistentVector$ChunkedSeq" :actual "(class (seq [1 2 3]))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "rest of a vector seq" :expected "clojure.lang.PersistentVector$ChunkedSeq" :actual "(class (rest [1 2 3]))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "string seq" :expected "clojure.lang.StringSeq" :actual "(class (seq \"abc\"))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "rest of a string seq" :expected "clojure.lang.StringSeq" :actual "(class (rest \"abc\"))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "keys" :expected "clojure.lang.APersistentMap$KeySeq" :actual "(class (keys {:a 1 :b 2}))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "vals" :expected "clojure.lang.APersistentMap$ValSeq" :actual "(class (vals {:a 1 :b 2}))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "set seq is a KeySeq" :expected "clojure.lang.APersistentMap$KeySeq" :actual "(class (seq #{1 2}))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "array-map seq" :expected "clojure.lang.PersistentArrayMap$Seq" :actual "(class (seq {:a 1}))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "hash-map seq" :expected "clojure.lang.PersistentHashMap$NodeSeq" :actual "(class (seq (hash-map :a 1 :b 2 :c 3 :d 4 :e 5 :f 6 :g 7 :h 8 :i 9)))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "sorted-map seq" :expected "clojure.lang.PersistentTreeMap$Seq" :actual "(class (seq (sorted-map :a 1)))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "rseq" :expected "clojure.lang.APersistentVector$RSeq" :actual "(class (rseq [1 2 3]))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "sort" :expected "clojure.lang.ArraySeq" :actual "(class (sort [3 1 2]))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "subvec" :expected "clojure.lang.APersistentVector$SubVector" :actual "(class (subvec [1 2 3] 1))" :portability :jvm}
+  {:suite "seq-type-model / specialized seq classes" :label "a list is a PersistentList" :expected "clojure.lang.PersistentList" :actual "(class (list 1 2))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "rest of a list is a PersistentList" :expected "clojure.lang.PersistentList" :actual "(class (rest (list 1 2)))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "a vector seq is not a list" :expected "false" :actual "(list? (seq [1 2]))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "rest of a list is a list" :expected "true" :actual "(list? (rest (list 1 2)))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "a vector seq is counted" :expected "true" :actual "(counted? (seq [1 2]))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "a vector seq is not an IPersistentList" :expected "false" :actual "(instance? clojure.lang.IPersistentList (seq [1 2]))" :portability :jvm}
+  {:suite "seq-type-model / specialized seq classes" :label "a vector seq is an IChunkedSeq" :expected "true" :actual "(instance? clojure.lang.IChunkedSeq (seq [1 2]))" :portability :jvm}
+  {:suite "seq-type-model / specialized seq classes" :label "chunked-seq? agrees with IChunkedSeq" :expected "true" :actual "(= (chunked-seq? (seq [1 2])) (instance? clojure.lang.IChunkedSeq (seq [1 2])))" :portability :jvm}
+  ;; --- seq-type-model divergences that REMAIN: these three producers are still
+  ;; modelled as a plain list or lazy seq rather than reifying their own class, so
+  ;; (class …) differs from the JVM (values + laziness are correct). cons wants
+  ;; clojure.lang.Cons, repeat clojure.lang.Repeat, cycle clojure.lang.Cycle, and
+  ;; (drop 1 a-vector) is a PersistentVector$ChunkedSeq there. jolt-aei7.
+  {:suite "seq-type-model / remaining class collapse" :label "cons over a vector" :expected "clojure.lang.PersistentList" :actual "(class (cons 1 [2 3]))" :portability :common}
+  {:suite "seq-type-model / remaining class collapse" :label "repeat" :expected "clojure.lang.LazySeq" :actual "(class (repeat 3 :x))" :portability :common}
+  {:suite "seq-type-model / remaining class collapse" :label "cycle" :expected "clojure.lang.LazySeq" :actual "(class (cycle [1 2]))" :portability :common}
+  {:suite "seq-type-model / remaining class collapse" :label "drop over a vector" :expected "clojure.lang.LazySeq" :actual "(class (drop 1 [1 2 3]))" :portability :common}
   ;; --- chunking-model realization granularity (JVM-matching): a vector's seq is
   ;; chunked, so forcing one element of (map f a-vector) realizes the whole first
   ;; 32-block, like the JVM.

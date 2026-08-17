@@ -100,6 +100,9 @@
      ;; post-prelude's native sequential? closes over the overlay version for
      ;; the exotic-value fallback
      "clojure.core/sequential?"
+     ;; …and its native counted? does the same for sorted colls, records and
+     ;; deftypes that declare clojure.lang.Counted
+     "clojure.core/counted?"
     ;; the fn print form wraps the overlay __print1
     "clojure.core/__print1"
     ;; the multimethod dispatch cache resolves the hierarchy value per call

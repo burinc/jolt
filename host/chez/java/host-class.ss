@@ -19,6 +19,78 @@
 (define jolt-class-arms '())
 (define (register-class-arm! pred handler)
   (set! jolt-class-arms (cons (cons pred handler) jolt-class-arms)))
+
+;; ---- seq flavor -> JVM class --------------------------------------------------
+;; The one place the sk-* tags a cseq cell carries (seq.ss) become clojure.lang.*
+;; names. Everything that asks "what class is this seq" — (class …) below, protocol
+;; dispatch's value-host-tags, instance?, counted? — reads THIS vector, so the
+;; answers cannot drift apart the way two hand-kept conds did: (class (seq [1 2]))
+;; said PersistentList while (list? (seq [1 2])) said false.
+;;
+;; Indexed by kind, sized from sk-count, so adding a flavor in seq.ss is a
+;; compile-time-obvious one-line addition here and nothing else.
+(define seq-kind-class-v
+  (let ((v (make-vector sk-count "clojure.lang.Cons")))
+    (vector-set! v sk-cons          "clojure.lang.Cons")
+    (vector-set! v sk-list          "clojure.lang.PersistentList")
+    (vector-set! v sk-chunked-seq   "clojure.lang.PersistentVector$ChunkedSeq")
+    (vector-set! v sk-chunked-cons  "clojure.lang.ChunkedCons")
+    (vector-set! v sk-string-seq    "clojure.lang.StringSeq")
+    (vector-set! v sk-rseq          "clojure.lang.APersistentVector$RSeq")
+    (vector-set! v sk-arraymap-seq  "clojure.lang.PersistentArrayMap$Seq")
+    (vector-set! v sk-hashmap-seq   "clojure.lang.PersistentHashMap$NodeSeq")
+    (vector-set! v sk-treemap-seq   "clojure.lang.PersistentTreeMap$Seq")
+    (vector-set! v sk-key-seq       "clojure.lang.APersistentMap$KeySeq")
+    (vector-set! v sk-val-seq       "clojure.lang.APersistentMap$ValSeq")
+    (vector-set! v sk-long-range    "clojure.lang.LongRange")
+    (vector-set! v sk-iterate       "clojure.lang.Iterate")
+    (vector-set! v sk-array-seq     "clojure.lang.ArraySeq")
+    (vector-set! v sk-array-int     "clojure.lang.ArraySeq$ArraySeq_int")
+    (vector-set! v sk-array-long    "clojure.lang.ArraySeq$ArraySeq_long")
+    (vector-set! v sk-array-short   "clojure.lang.ArraySeq$ArraySeq_short")
+    (vector-set! v sk-array-double  "clojure.lang.ArraySeq$ArraySeq_double")
+    (vector-set! v sk-array-float   "clojure.lang.ArraySeq$ArraySeq_float")
+    (vector-set! v sk-array-bool    "clojure.lang.ArraySeq$ArraySeq_boolean")
+    (vector-set! v sk-array-byte    "clojure.lang.ArraySeq$ArraySeq_byte")
+    (vector-set! v sk-array-char    "clojure.lang.ArraySeq$ArraySeq_char")
+    v))
+;; One vector-ref. This sits on the protocol-dispatch path for every seq argument,
+;; which is why the flavor is a fixnum index and not a name to be looked up.
+(define (cseq-class-name s) (vector-ref seq-kind-class-v (cseq-kind s)))
+
+;; Graft clojure.lang.IChunkedSeq onto exactly the flavors that chunk. sk-chunked?
+;; (seq.ss) is the single statement of which those are, because that tier is what
+;; implements chunk-first/chunk-rest; deriving the interface from it here is what
+;; keeps (chunked-seq? x) and (instance? IChunkedSeq x) from ever disagreeing.
+(let loop ((k 0))
+  (when (fx<? k sk-count)
+    (when (sk-chunked? k)
+      (jch-register-supers! (vector-ref seq-kind-class-v k) '("clojure.lang.IChunkedSeq")))
+    (loop (fx+ k 1))))
+
+;; Which flavors are Counted, derived FROM the graph rather than listed again — the
+;; rows in class-hierarchy.ss are the only statement of it, so counted? cannot
+;; disagree with instance? or ancestors. Memoized per kind behind the graph's
+;; generation counter: the graph is extensible (a library can graft supers onto a
+;; class at any time), and a cached answer computed against the old graph must not
+;; outlive it. Steady state is two fixnum compares and a vector-ref.
+(define seq-kind-counted-v #f)
+(define seq-kind-counted-epoch -1)
+(define (seq-kind-counted-vec)
+  (if (and seq-kind-counted-v (fx=? seq-kind-counted-epoch jch-graph-epoch))
+      seq-kind-counted-v
+      (let ((v (make-vector sk-count #f))
+            (epoch jch-graph-epoch))    ; read BEFORE the walk, like jch-closure
+        (let loop ((k 0))
+          (when (fx<? k sk-count)
+            (vector-set! v k (and (jch-isa? (vector-ref seq-kind-class-v k)
+                                            "clojure.lang.Counted")
+                                  #t))
+            (loop (fx+ k 1))))
+        (set! seq-kind-counted-epoch epoch)
+        (set! seq-kind-counted-v v)
+        v)))
+(define (cseq-counted? s) (vector-ref (seq-kind-counted-vec) (cseq-kind s)))
 (define (jolt-class-base x)
   (cond
     ((jolt-nil? x) jolt-nil)
@@ -66,7 +138,8 @@
                    "clojure.lang.PersistentHashMap"))
     ((jolt-lazyseq? x) "clojure.lang.LazySeq")
     ((empty-list-t? x) "clojure.lang.PersistentList$EmptyList")
-    ((cseq? x) "clojure.lang.PersistentList")
+    ;; …whichever concrete seq class this cell's flavor says it is
+    ((cseq? x) (cseq-class-name x))
     (else (jolt-str-render-one (jolt-type x)))))
 ;; the class NAME of x (string), or nil for nil. (class x) wraps it in a Class
 ;; value (make-class-obj, host-static-classes.ss) so it renders like a JVM Class

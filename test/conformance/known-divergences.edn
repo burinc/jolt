@@ -543,17 +543,15 @@
   {:suite "untested / chunk family (eager equivalents) + cat",
    :label "chunk round-trip",
    :category :host-model}
-  {:suite "seq-type-model / specialized seq classes collapse", :label "cons over a vector", :category :seq-type-model}
-  {:suite "seq-type-model / specialized seq classes collapse", :label "iterate", :category :seq-type-model}
-  {:suite "seq-type-model / specialized seq classes collapse", :label "range", :category :seq-type-model}
-  {:suite "seq-type-model / specialized seq classes collapse", :label "repeat", :category :seq-type-model}
-  {:suite "seq-type-model / specialized seq classes collapse", :label "cycle", :category :seq-type-model}
-  {:suite "seq-type-model / specialized seq classes collapse", :label "vector seq", :category :seq-type-model}
-  {:suite "seq-type-model / specialized seq classes collapse", :label "string seq", :category :seq-type-model}
-  {:suite "seq-type-model / specialized seq classes collapse", :label "keys", :category :seq-type-model}
-  {:suite "seq-type-model / specialized seq classes collapse", :label "rseq", :category :seq-type-model}
-  {:suite "seq-type-model / specialized seq classes collapse", :label "sort", :category :seq-type-model}
-  {:suite "seq-type-model / specialized seq classes collapse", :label "drop over a vector", :category :seq-type-model}
+  ;; A seq now reports the concrete clojure.lang class of whatever produced it
+  ;; (vector seq, string seq, keys, vals, rseq, sort, range, iterate, the map/set
+  ;; seq views), so those rows certify. These four producers are still modelled as a
+  ;; plain list or lazy seq and keep their own class: cons wants clojure.lang.Cons,
+  ;; repeat Repeat, cycle Cycle, and (drop 1 a-vector) is a ChunkedSeq on the JVM.
+  {:suite "seq-type-model / remaining class collapse", :label "cons over a vector", :category :seq-type-model}
+  {:suite "seq-type-model / remaining class collapse", :label "repeat", :category :seq-type-model}
+  {:suite "seq-type-model / remaining class collapse", :label "cycle", :category :seq-type-model}
+  {:suite "seq-type-model / remaining class collapse", :label "drop over a vector", :category :seq-type-model}
   {:suite "chunking-model / unchunked realization granularity", :label "mapcat is fully lazy at construction", :category :chunking-model}
   {:suite "chunking-model / unchunked realization granularity", :label "dedupe is fully lazy at construction", :category :chunking-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "byte class", :category :integer-box-model}
