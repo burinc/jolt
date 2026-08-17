@@ -122,7 +122,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscali
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck irvalidate devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
   certify gambitcheck gambitgencheck gambitboot grenadinecheck fibers gosm asynctimer threadsafety
@@ -757,6 +757,15 @@ lockcheck:
 # halves cannot be removed independently.
 parkcheck:
 	@sh host/chez/park-lock-check.sh
+
+# jolt.host/sh is Chez's `system`, which is cmd.exe on Windows: `mkdir -p a/b`
+# there creates a directory named `-p`, and mv/rm/touch/test/find are not
+# commands at all. So the resolver does its filesystem work through filesystem
+# calls, and the shell is left for git and unzip, which are real programs. The
+# two spellings look alike in the source, so the rule is checked rather than
+# remembered.
+shelloutcheck:
+	@sh host/chez/shellout-check.sh
 
 # Makefile dependency selection: explicit Chez overrides must bypass local
 # Makes provisioning so release jobs retain their chosen compiler and libc.

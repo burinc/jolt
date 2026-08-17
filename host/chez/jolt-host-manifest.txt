@@ -34,7 +34,8 @@ cpu-nanos
 current-memory-bytes
 current-fiber
 deftype-ctor-class
-delete-file
+delete-file!
+delete-tree!
 directory?
 enable-trace!
 entry-at
@@ -57,6 +58,7 @@ fiber-to-scheduler!
 fiber-yield
 fiber?
 file-exists?
+file-mtime
 find-var
 form-bigdec-source
 form-bigdec-value-source
@@ -134,6 +136,7 @@ jolt-class-for
 jolt-version
 jrec-method?
 late-bind?
+list-dir
 list?
 load-namespace
 locale-name
@@ -142,6 +145,7 @@ make-interrupt
 make-thread-local
 map-entry
 maximum-memory-bytes
+mkdirs!
 monitor-enter
 monitor-exit
 mono-nanos
@@ -165,6 +169,7 @@ register-class-supers!
 register-extension!
 register-extension-point!
 register-source!
+rename-file!
 resolvable-names
 resolve-class-hint
 resolve-global
@@ -186,6 +191,7 @@ source-roots
 stash-inline!
 static-member
 stop-main-pump
+symlink?
 table?
 tagged-table
 thread-id

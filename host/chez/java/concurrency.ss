@@ -2022,7 +2022,6 @@
 (def-var! "jolt.host" "add-shutdown-hook" jolt-add-shutdown-hook)
 (def-var! "jolt.host" "block-sigint" (lambda () (jolt-set-sigint-blocked #t)))
 (def-var! "jolt.host" "park-until-interrupt" jolt-park-until-interrupt)
-(def-var! "jolt.host" "delete-file" delete-file)
 
 ;; reference types report their JVM classes and answer the IDeref/IRef taxonomy
 ;; ((class (agent 1)) is clojure.lang.Agent; derefables are IDeref; the mutable

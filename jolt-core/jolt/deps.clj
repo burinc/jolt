@@ -35,28 +35,57 @@
 (defn- getenv [n] (let [v (jolt.host/getenv n)] (when-not (str/blank? v) v)))
 (defn- file-exists? [p] (jolt.host/file-exists? p))
 (defn- sh [cmd] (jolt.host/sh cmd))           ; exit code, inherits stdout/stderr
+
+;; The filesystem seams. These used to be shell commands (`mkdir -p`, `mv`,
+;; `rm -f`, `rm -rf`, `test -nt`, `find`), which is a POSIX assumption jolt.host/sh
+;; does not carry: on Windows it runs the string through cmd.exe, where `mkdir -p
+;; a/b` creates a directory named `-p` and the rest are not commands at all. Every
+;; one of these is now a filesystem call, so the only subprocesses left in this
+;; namespace are the two real external programs, git and unzip.
+(defn- mkdirs! [p] (jolt.host/mkdirs! p))     ; mkdir -p; true if p ends up a dir
+(defn- rm-f [p] (jolt.host/delete-file! p))   ; absent is success
+(defn- rm-rf [p] (jolt.host/delete-tree! p))
+(defn- mv! [from to] (jolt.host/rename-file! from to))
+(defn- file-mtime [p] (jolt.host/file-mtime p))   ; epoch ms, 0 when absent
+(defn- touch! [p] (spit p ""))                ; the markers are all empty files
+
+(defn- find-file
+  "Walk `dir` for the first entry whose NAME satisfies `pred`, returning its
+  full path, or nil. Every name at a level is checked before any subdirectory
+  below it is descended into, and a symlinked directory is not followed — as
+  the `find … -print -quit` this replaces did not."
+  [dir pred]
+  (let [full #(str dir "/" %)]
+    (when-let [entries (seq (jolt.host/list-dir dir))]
+      (or (some #(when (pred %) (full %)) entries)
+          (some #(let [p (full %)]
+                   (when (and (jolt.host/directory? p) (not (jolt.host/symlink? p)))
+                     (find-file p pred)))
+                entries)))))
+
+(defn- tmp-dir
+  "A directory for scratch files. /tmp is not universal — Windows has no such
+  path, and %TEMP% is where a temporary file goes there."
+  []
+  (let [d (or (getenv "TMPDIR") (getenv "TEMP") (getenv "TMP") "/tmp")]
+    (str/replace d #"[/\\]+$" "")))
+
 (defn- sh-out*
   "Run a shell command, capturing stdout and stderr separately:
   {:exit n :out s :err s}. Captures through temp files (jolt.host/sh inherits
-  stdio). Use this wherever \"the command failed\" and \"the command ran and
-  found nothing\" are different answers to the caller — sh-out below collapses
-  them, which is only right when they mean the same thing."
+  stdio), which is also how a command's output gets discarded portably — there
+  is no /dev/null to redirect to everywhere jolt runs."
   [cmd]
   (let [stamp (str (System/currentTimeMillis) "-" (rand-int 100000))
-        out-f (str "/tmp/jolt-deps-" stamp ".out")
-        err-f (str "/tmp/jolt-deps-" stamp ".err")
+        out-f (str (tmp-dir) "/jolt-deps-" stamp ".out")
+        err-f (str (tmp-dir) "/jolt-deps-" stamp ".err")
         code (sh (str cmd " > " (pr-str out-f) " 2> " (pr-str err-f)))
         read-f (fn [p] (when (file-exists? p) (str/trim (slurp p))))
         r {:exit code :out (read-f out-f) :err (read-f err-f)}]
-    (sh (str "rm -f " (pr-str out-f) " " (pr-str err-f)))
+    (rm-f out-f)
+    (rm-f err-f)
     r))
 
-(defn- sh-out
-  "Run a shell command, returning its trimmed stdout, or nil on a non-zero
-  exit — for callers to which a failure and an empty result mean the same."
-  [cmd]
-  (let [{:keys [exit out]} (sh-out* cmd)]
-    (when (zero? exit) out)))
 (defn- warn [& xs] (binding [*out* *err*] (println (str "[jolt.deps] " (apply str xs)))))
 
 ;; --- retrying the network steps ---------------------------------------------
@@ -229,7 +258,7 @@
               commit (or peeled obj)
               obj (when (and peeled obj (not= peeled obj)) obj)]
           (when commit
-            (sh (str "mkdir -p " (pr-str (str (gitlibs-dir) "/tags/" (sanitize url)))))
+            (mkdirs! (str (gitlibs-dir) "/tags/" (sanitize url)))
             (spit cache (str commit " " (or obj "-")))
             [commit obj]))))))
 
@@ -287,10 +316,10 @@
   [url sha repo-dir]
   (let [dir (str repo-dir "/" sha)
         stage (str repo-dir "/.part-" sha "-" (System/currentTimeMillis) "-" (rand-int 100000))
-        scrub #(sh (str "rm -rf " (pr-str stage)))
+        scrub #(rm-rf stage)
         fail (fn [msg data] (scrub) (throw (ex-info msg (merge {:url url :sha sha} data))))]
     (info "fetching " url " @ " (subs sha 0 (min 12 (count sha))))
-    (sh (str "mkdir -p " (pr-str repo-dir)))
+    (mkdirs! repo-dir)
     ;; the clone talks to the remote, so it gets the same bounded retry the tag
     ;; listing does — scrubbing first, since a failed clone leaves a partial
     ;; staging dir that the next attempt would refuse to clone into.
@@ -303,13 +332,13 @@
     ;; one fetches too, and is idempotent, so it retries in place.
     (when-not (zero? (with-net-retries zero? #(sh (str "git -C " (pr-str stage) " submodule update --init --recursive --quiet"))))
       (fail (str "git submodule update failed after " net-attempts " attempts for " url) nil))
-    (sh (str "touch " (pr-str (str stage "/.jolt-git-ok"))))
+    (touch! (str stage "/.jolt-git-ok"))
     (if (checkout-complete? dir)
       (do (scrub) dir)                    ; another process published it first
       (do
         ;; clears the incomplete remains of an interrupted in-place clone
-        (sh (str "rm -rf " (pr-str dir)))
-        (when-not (zero? (sh (str "mv " (pr-str stage) " " (pr-str dir))))
+        (rm-rf dir)
+        (when-not (mv! stage dir)
           (fail (str "git checkout could not be moved into the cache: " dir) {:dir dir}))
         dir))))
 
@@ -390,8 +419,7 @@
   (if (file-exists? target)
     target
     (do
-      (sh (str "mkdir -p "
-               (pr-str (subs target 0 (str/last-index-of target "/")))))
+      (mkdirs! (subs target 0 (str/last-index-of target "/")))
       (loop [repos *mvn-repos*]
         (when-let [repo (first repos)]
           (if (http/fetch (str repo "/" relative) target)
@@ -415,16 +443,16 @@
 (defn- cache-fresh?
   "Is the extraction at `dir` still valid for `jar`? The `.jolt-ok` marker is
   written after a successful unzip; it is stale once the jar is rebuilt/refetched
-  (a SNAPSHOT, or the same coord re-installed into ~/.m2). A POSIX `test -nt`
-  re-extracts when the jar is newer than the marker. The legacy JOLT_MVNLIBS
-  layout keeps no jar, so its extraction is the only copy — trust it. A jar that
-  has since vanished (m2 pruned) also leaves the extraction as the last good copy."
+  (a SNAPSHOT, or the same coord re-installed into ~/.m2), so a jar whose mtime
+  is later than the marker's re-extracts. The legacy JOLT_MVNLIBS layout keeps
+  no jar, so its extraction is the only copy — trust it. A jar that has since
+  vanished (m2 pruned) also leaves the extraction as the last good copy."
   [dir jar legacy]
   (let [ok (str dir "/.jolt-ok")]
     (and (file-exists? ok)
          (or legacy
              (not (file-exists? jar))
-             (not (zero? (sh (str "test " (pr-str jar) " -nt " (pr-str ok)))))))))
+             (<= (file-mtime jar) (file-mtime ok))))))
 
 (defn- extract-jar!
   "Unzip `jar` into `dir` (overwriting), marking `.jolt-ok` only on success so a
@@ -434,10 +462,10 @@
   skip). The jar may live inside `dir` (the legacy JOLT_MVNLIBS layout), so `dir`
   is not wiped."
   [jar dir]
-  (sh (str "mkdir -p " (pr-str dir)))
-  (sh (str "rm -f " (pr-str (str dir "/.jolt-ok"))))
+  (mkdirs! dir)
+  (rm-f (str dir "/.jolt-ok"))
   (if (zero? (sh (str "unzip -o -q " (pr-str jar) " -d " (pr-str dir))))
-    (do (sh (str "touch " (pr-str (str dir "/.jolt-ok")))) dir)
+    (do (touch! (str dir "/.jolt-ok")) dir)
     (do (warn "failed to extract " jar) nil)))
 
 (defn- extract-or-note!
@@ -493,14 +521,14 @@
                         (str/join ", " *mvn-repos*) ")")))
                 nil)
             (let [repo (first repos)
-                  _ (sh (str "mkdir -p " (pr-str (if legacy dir (str (m2-repo-dir) "/" vdir-rel)))))
+                  _ (mkdirs! (if legacy dir (str (m2-repo-dir) "/" vdir-rel)))
                   r (http/fetch* (str repo "/" vdir-rel "/" jar-name) jar)]
               (if (= :ok (:outcome r))
                 (do (info "fetching " coord " " version)
                     (let [d (extract-or-note! jar dir coord version)]
                       ;; legacy layout never keeps the jar; the m2 layout does —
                       ;; that IS the sharing.
-                      (when legacy (sh (str "rm -f " (pr-str jar))))
+                      (when legacy (rm-f jar))
                       d))
                 (recur (rest repos)
                        (if (= :not-found (:outcome r))
@@ -573,8 +601,7 @@
   it contributes nothing to run and its transitive deps are the cljs/JVM toolchain,
   so the walk skips it rather than dragging in that whole subtree."
   [root]
-  (zero? (sh (str "find " (pr-str root)
-                  " \\( -name '*.clj' -o -name '*.cljc' \\) -print -quit 2>/dev/null | grep -q ."))))
+  (boolean (find-file root #(or (str/ends-with? % ".clj") (str/ends-with? % ".cljc")))))
 
 ;; --- coordinate skips + normalization ----------------------------------------
 ;; jolt IS Clojure, so org.clojure/clojure is intrinsic; jolt has no
@@ -795,8 +822,8 @@
           (let [dir (jar-extraction-dir path)]
             (if (or (cache-fresh? dir path false)
                     (extract-or-note! path dir lib path))
-              (let [pom (sh-out (str "find " (pr-str dir) "/META-INF -name pom.xml -print -quit 2>/dev/null"))]
-                {:root dir :manifest :mvn :pom (when (and pom (not (str/blank? pom))) pom)})
+              (let [pom (find-file (str dir "/META-INF") #(= % "pom.xml"))]
+                {:root dir :manifest :mvn :pom pom})
               {:root nil :manifest :none}))
           (manifest-info path))))))
 
@@ -827,8 +854,11 @@
    (:mvn/version x)
    (:mvn/version y)))
 
+;; sh-out* rather than sh: this asks a question whose "no" arrives as both a
+;; non-zero exit and a message on stderr, and the 2>/dev/null that used to
+;; silence it is a POSIX path, not a portable way to discard output.
 (defn- git-ancestor? [dir a b]
-  (zero? (sh (str "git -C " (pr-str dir) " merge-base --is-ancestor " a " " b " 2>/dev/null"))))
+  (zero? (:exit (sh-out* (str "git -C " (pr-str dir) " merge-base --is-ancestor " a " " b)))))
 
 (defmethod ext/compare-versions [:git :git] [lib x y]
   (let [xi (git-info lib x) yi (git-info lib y)
@@ -1089,7 +1119,7 @@
             (if (every? file-exists? (cached-paths (:value cached)))
               (:value cached)
               (do (info "cpcache miss (a cached path no longer exists)")
-                  (sh (str "rm -f " (pr-str f)))    ; stale — don't re-strike
+                  (rm-f f)                         ; stale — don't re-strike
                   nil)))))
       (catch :default _ nil))))
 
@@ -1101,14 +1131,14 @@
   (let [dir (cpcache-dir project-dir)
         f (str dir "/" k ".edn")
         stage (str f ".part-" (System/currentTimeMillis) "-" (rand-int 100000))]
-    (sh (str "mkdir -p " (pr-str dir)))
+    (mkdirs! dir)
     (try
       (spit stage (pr-str {:material material :value resolved}))
-      ;; rename is atomic on POSIX; mv across the same dir never copies.
-      (when-not (zero? (sh (str "mv " (pr-str stage) " " (pr-str f))))
-        (sh (str "rm -f " (pr-str stage))))
+      ;; rename within one directory is atomic and never copies.
+      (when-not (mv! stage f)
+        (rm-f stage))
       (catch :default _
-         (sh (str "rm -f " (pr-str stage)))))))
+         (rm-f stage)))))
 
 (declare user-deps-path)   ; defined below with the deps.edn readers
 
