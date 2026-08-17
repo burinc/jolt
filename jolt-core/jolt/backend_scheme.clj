@@ -74,7 +74,28 @@
       (= m "substring")   (when (= argc 2)
                             (str "(substring " t " (jolt->idx " a0 ") (jolt->idx " a1 "))"))
       (= m "replace")     (when (= argc 2)
-                            (str "(str-replace-literal " t " (str-needle " a0 ") (str-needle " a1 "))"))
+                             (str "(str-replace-literal " t " (str-needle " a0 ") (str-needle " a1 "))"))
+      :else nil)))
+
+;; Direct emission for (.m target …) whose target is PROVEN a keyword
+;; (:target-type :kw, from a ^clojure.lang.Keyword hint or a keyword literal).
+;; Mirrors the keyword arm of record-method-dispatch (records-dispatch.ss)
+;; method-for-method, body-for-body — no dispatch walk, no rest-args vector.
+;; Chez-only, guarded at the emit site like the string path. A wrong hint (a
+;; non-keyword at runtime) fails in the record accessor, the same contract a
+;; wrong ^String hint has.
+(defn- keyword-direct-emit [m argc t args]
+  (let [a0 (first args)]
+    (cond
+      (= m "sym")          (when (= argc 0)
+                             (str "(jolt-symbol (keyword-t-ns " t ") (keyword-t-name " t "))"))
+      (= m "getName")      (when (= argc 0) (str "(keyword-t-name " t ")"))
+      (= m "getNamespace") (when (= argc 0) (str "(or (keyword-t-ns " t ") jolt-nil)"))
+      (= m "toString")     (when (= argc 0)
+                             (str "(string-append \":\" (if (keyword-t-ns " t ") (string-append (keyword-t-ns " t ") \"/\") \"\") (keyword-t-name " t "))"))
+      (= m "hashCode")     (when (= argc 0)
+                             (str "(jolt-s32 (+ (java-symbol-hash (keyword-t-name " t ") (keyword-t-ns " t ")) #x9e3779b9))"))
+      (= m "equals")       (when (= argc 1) (str "(eq? " t " " a0 ")"))
       :else nil)))
 
 ;; The current compilation-unit context (jolt.passes.types unit). ALL emit-session
@@ -1889,8 +1910,11 @@
                       chez? (not= :gambit (target))
                       t (emit (:target node))
                       args (map emit (:args node))
-                      direct (when (and chez? (= :str (:target-type node)))
-                               (string-direct-emit m (count args) t args))]
+                      direct (when chez?
+                               (or (when (= :str (:target-type node))
+                                     (string-direct-emit m (count args) t args))
+                                   (when (= :kw (:target-type node))
+                                     (keyword-direct-emit m (count args) t args))))]
                   (if direct direct
                       (if (supported-host-methods m)
                         (str "(jolt-host-call " (chez-str-lit m) " " t

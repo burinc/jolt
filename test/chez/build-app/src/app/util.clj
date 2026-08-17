@@ -29,6 +29,13 @@
 ;; source roots, so the runtime class-miss autoload can't fire there.
 (defn zdt-class [] java.time.ZonedDateTime)
 
+;; Proven-keyword interop: honeysql's kw->sym is (.sym ^clojure.lang.Keyword k)
+;; on its :clj branch. The hint proves the target a keyword, so the built binary
+;; must lower .sym to the inline (jolt-symbol (keyword-t-ns t) (keyword-t-name t))
+;; — no record-method-dispatch walk, no jolt-vector rest-args. build-smoke greps
+;; flat.ss for that emission shape and the ABSENCE of a keyword .sym dispatch.
+(defn kwsym [^clojure.lang.Keyword k] (.sym k))
+
 ;; ^:redef / ^:dynamic opt out of direct-linking even with it on by default (the
 ;; release default now), so the built binary can still redef/bind them at runtime.
 (def ^:redef redef-fn (fn [] :original))

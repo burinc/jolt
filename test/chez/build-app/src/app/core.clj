@@ -24,6 +24,9 @@
   (when (= (first args) "--strd")
     (println "strd:" (util/strd-prefix "sy") (util/strd-prefix "no") (util/strd-find "a-b")
              (util/strd-rep "aa") (util/strd-rep "cc")))
+  ;; --kwsym: proven-keyword interop — (.sym k) on a ^clojure.lang.Keyword param.
+  (when (= (first args) "--kwsym")
+    (println "kwsym:" (util/kwsym :ns/qual) (util/kwsym :plain)))
   ;; --redef: with direct-link the release default, ^:redef/:dynamic must still
   ;; opt out so runtime redefinition / binding take effect in the built binary.
   (when (= (first args) "--redef")

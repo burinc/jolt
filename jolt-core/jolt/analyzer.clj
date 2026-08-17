@@ -126,6 +126,9 @@
 (defn- str-tag? [t]
   (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
     (or (= s "String") (= s "java.lang.String"))))
+(defn- kw-tag? [t]
+  (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
+    (or (= s "Keyword") (= s "clojure.lang.Keyword"))))
 (defn- hint-of [ctx sym]
   (let [m (form-sym-meta sym)]
     (cond
@@ -134,6 +137,7 @@
       :else (let [t (get m :tag)]
               (cond (and t (record-type? ctx t)) :struct
                     (str-tag? t) :str
+                    (kw-tag? t) :kw
                     :else nil)))))
 (defn- add-hint [env nm h]
   (if h (assoc env :hints (assoc (:hints env) nm h)) env))
@@ -762,6 +766,16 @@
             (and (= :const (:op target)) (string? (:val target))))
     :str))
 
+;; Same seam for keywords: honeysql's kw->sym is (.sym ^clojure.lang.Keyword k)
+;; on its :clj branch, so the hint proves the target and the backend emits the
+;; keyword arm inline. Sources mirror str-target-type: the ^Keyword tag, a
+;; :kw-hinted binding, or a keyword literal.
+(defn- kw-target-type [raw target]
+  (when (or (and (form-sym? raw) (kw-tag? (get (form-sym-meta raw) :tag)))
+            (= :kw (:hint target))
+            (and (= :const (:op target)) (keyword? (:val target))))
+    :kw))
+
 (defn- analyze-host-call [ctx hname items env]
   (when (< (count items) 2)
     (throw (str "Malformed member expression, expecting (.method target ...): " hname)))
@@ -771,7 +785,8 @@
              :method (subs hname 1)
              :target target
              :args (mapv #(analyze ctx % env) (drop 2 items))}
-      (str-target-type raw target) (assoc :target-type :str))))
+      (str-target-type raw target) (assoc :target-type :str)
+      (kw-target-type raw target) (assoc :target-type :kw))))
 
 ;; A constructor head: `Class.` — a symbol ending in "." (but not the member
 ;; access `.method` / `..` forms). `(Class. args*)` builds an instance.

@@ -3104,6 +3104,12 @@
   {:suite "host-interop / proven string target" :label "literal target methods" :expected "[5 true \"AB\" 99162322]" :actual "[(.length \"hello\") (.isEmpty \"\") (.toUpperCase \"ab\") (.hashCode \"hello\")]" :portability :common}
   {:suite "host-interop / proven string target" :label "^String param hint routes to the direct natives" :expected "[1 \"-b\" true]" :actual "((fn [^String s] [(.indexOf s 45) (.substring s 1 3) (.endsWith s \"-c\")]) \"a-b-c\")" :portability :common}
   {:suite "host-interop / proven string target" :label "call-site ^String tag on a local" :expected "3" :actual "(let [s \"abc\"] (.length ^String s))" :portability :common}
+  ;; (.m keyword-target …) with a proven-keyword target (literal or ^Keyword
+  ;; hint) emits the keyword arm inline — the honeysql kw->sym shape. :expected is
+  ;; evaluated as code (corpus convention), so symbol results carry '.
+  {:suite "host-interop / proven keyword target" :label "literal .sym keeps the ns" :expected "'ns/qual" :actual "(.sym :ns/qual)" :portability :common}
+  {:suite "host-interop / proven keyword target" :label "^Keyword param hint routes to the direct arm" :expected "['x/y \"y\" \"x\"]" :actual "((fn [^clojure.lang.Keyword k] [(.sym k) (.getName k) (.getNamespace k)]) :x/y)" :portability :common}
+  {:suite "host-interop / proven keyword target" :label "call-site ^Keyword tag on a local" :expected "'a/b" :actual "(let [k :a/b] (.sym ^clojure.lang.Keyword k))" :portability :common}
   {:suite "clojure.string" :label "reverse" :expected "\"cba\"" :actual "(do (require (quote [clojure.string :as s])) (s/reverse \"abc\"))" :portability :common}
   {:suite "clojure.string" :label "index-of" :expected "2" :actual "(do (require (quote [clojure.string :as s])) (s/index-of \"hello\" \"l\"))" :portability :common}
   {:suite "string / subs strictness" :label "subs basic" :expected "\"bcd\"" :actual "(subs \"abcde\" 1 4)" :portability :common}

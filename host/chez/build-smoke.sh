@@ -118,6 +118,21 @@ if ! grep -q 'str-starts-with?' "$out.noop.build/flat.ss"; then
   echo "  FAIL: str-target lowering depended on the wp fixpoint (str-ret table is per-form)"; exit 1
 fi
 
+# The :kw stamp on interop targets: app.util/kwsym's (.sym k) is proven a keyword
+# by the ^clojure.lang.Keyword param hint (honeysql's kw->sym shape), so flat.ss
+# must carry the inline keyword arm for kwsym's param and NO record-method-dispatch
+# "sym". The negative grep anchors "sym" right after the target so clojure.pprint's
+# record-method-dispatch this "-fields" lines (which merely contain a symbol named
+# sym elsewhere) don't false-positive; the positive one matches kwsym's exact
+# emission (the bare (jolt-symbol (keyword-t-ns …)) shape also appears in the
+# runtime section, so it alone would not prove the stamp fired).
+if ! grep -qF '(jolt-symbol (keyword-t-ns k) (keyword-t-name k))' "$out.build/flat.ss"; then
+  echo "  FAIL: kw-target .sym did not lower to the inline keyword arm"; exit 1
+fi
+if grep -qE 'record-method-dispatch [^ ()]+"sym"' "$out.build/flat.ss"; then
+  echo "  FAIL: kw-target .sym still routes through record-method-dispatch"; exit 1
+fi
+
 # Lib-provided host classes: app.util/zdt-class references java.time.ZonedDateTime
 # (a jolt-lang/time class). The build scan must pull the provider's install ns —
 # src-provider/jolt/time.clj is the on-roots stand-in — into flat.ss, because a
@@ -169,6 +184,13 @@ got_strd="$(cd / && "$out" --strd 2>&1)"
 if ! printf '%s' "$got_strd" | grep -q '^strd: true false 1 true false$'; then
   echo "  FAIL: :str-stamped interop output — want 'strd: true false 1 true false'"
   echo "--- got ----"; echo "$got_strd"; exit 1
+fi
+
+# Same runtime-shape check for the :kw-stamped interop (app.util/kwsym).
+got_kwsym="$(cd / && "$out" --kwsym 2>&1)"
+if ! printf '%s' "$got_kwsym" | grep -q '^kwsym: ns/qual plain$'; then
+  echo "  FAIL: :kw-stamped interop output — want 'kwsym: ns/qual plain'"
+  echo "--- got ----"; echo "$got_kwsym"; exit 1
 fi
 
 # Portable embed: remove the build-time source tree and run from / — the
