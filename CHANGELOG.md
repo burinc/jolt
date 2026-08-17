@@ -5,6 +5,52 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+An interop-dispatch release in the making. The theme: a `.method` call on a
+string — `indexOf`, `toUpperCase`, `startsWith` — is the innermost loop of
+:clj-fast-path libraries like honeysql, and every one of those calls was paying
+the full generic record-dispatch walk plus a rest-args vector it didn't need.
+The entries below remove that cost where the target provably is a string, and
+take the loose ends the campaign surfaced in `clojure.string` with it.
+
+### Performance
+
+- **Proven-string interop emits the native call inline.** When the analyzer or
+  the whole-program type pass can prove a `.method` target is a string — a
+  `^String` hint, a string literal, or inference through `str`/`name`/`subs`/
+  `clojure.string` returns — the compiler emits the Chez string native directly
+  for the 16 hottest method/arity combinations (`indexOf`, `charAt`,
+  `toUpperCase`, `startsWith`, `substring`, …): no `record-method-dispatch`
+  walk, no argument vector. Anything unproven, on any other target type,
+  dispatches exactly as before. A hinted `.indexOf` drops 145ns → 26ns; an
+  inference-proven one with no hint in sight, 139ns → 19ns. On honeysql's
+  entity formatting (two `.indexOf` per entity) the 1M-call bench falls
+  4.6s → 3.2s.
+- **`clojure.string` predicates are single-procedure natives.**
+  `starts-with?`/`ends-with?`/`includes?`/`index-of` and `upper-case`/
+  `lower-case` were prelude wrappers that coerced, counted and substringed
+  before comparing; each is now one native procedure. `upper-case` on a
+  keyword argument: 383ns → 43ns.
+- **Keyword/fixnum/string map lookups resolve in one procedure.** The
+  persistent-map fast path for the three common key types no longer re-enters
+  the generic equality machinery per probe.
+- **`clojure.string/replace` with a string pattern lowers to a literal scan.**
+  No regex machinery is built for a plain-string match (honeysql's per-entity
+  `"-"` → `"_"` rename), and `index-of` accepts a char or code point without
+  materializing a one-character string. `str/join` walks the collection once
+  and skips the intermediate list for 0/1-element collections.
+- **`sequential?` is a native**, not two overlay calls deep.
+
+### Fixed
+
+- **`(str/replace "aaa" "" "b")` is `"bababab"`.** An empty string pattern now
+  inserts the replacement at every position, as on the JVM, instead of
+  returning the input unchanged.
+- **`starts-with?`/`ends-with?` with a `nil` or non-string prefix** throw the
+  JVM's `NullPointerException`/`ClassCastException` rather than a Scheme type
+  error, so `ex-data`-driven handling sees the expected shape.
+
 ## [0.7.14] - 2026-08-16
 
 A collections release. The theme running through it is operations that were
@@ -4875,7 +4921,7 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.5...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.14...HEAD
 [0.7.6]: https://github.com/jolt-lang/jolt/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/jolt-lang/jolt/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/jolt-lang/jolt/compare/v0.7.3...v0.7.4
