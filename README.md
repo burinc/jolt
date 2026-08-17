@@ -71,6 +71,43 @@ so they can neither run nor build — clone the repo instead.
 
 Then `jolt -e '(+ 1 2)'`.
 
+Running from source has no build step. The bootstrap seed
+(`host/chez/seed/{prelude,image}.ss`) is checked in, so a fresh clone runs
+immediately:
+
+```bash
+git clone --recurse-submodules https://github.com/jolt-lang/jolt.git
+cd jolt
+bin/jolt -e '(+ 1 2)'        # => 3
+```
+
+The `--recurse-submodules` matters: jolt vendors its regex engine, its Maven
+resolver, and its test suites as git submodules. In a checkout that's missing
+them (a plain `git clone`, or after pulling a commit that adds one), fetch them
+with:
+
+```bash
+git submodule update --init --recursive
+```
+
+`bin/jolt` needs a **threaded Chez Scheme 10.x**. It first honors `JOLT_CHEZ`,
+then reuses a 10.x Chez already provisioned under `.cache/local` by `make`, and
+finally searches `PATH` for `chez` or `chezscheme`. `make` provisions its own
+10.4.1 when `PATH` has a different version and exports `JOLT_CHEZ` so both halves
+of a build agree.
+
+Note that GitHub's auto-generated "Source code (zip/tar.gz)" archives on the
+releases page do **not** contain submodules, so they can't run or build —
+clone the repo instead (or grab a prebuilt binary from the same page).
+
+After changing a compiler source — the reader (`host/chez/reader.ss`), the
+analyzer/IR/backend (`jolt-core/jolt/*.clj`), or the `clojure.core` overlay
+(`jolt-core/clojure/core/*.clj`) — re-mint the seed:
+
+```bash
+make remint                   # iterates host/chez/bootstrap.ss to a byte-fixpoint
+```
+
 Resolving a project's `deps.edn` needs `git` for git deps, and OpenSSL
 (`libssl`/`libcrypto`, loaded via FFI) plus `unzip` for Maven deps — jolt
 downloads and resolves those itself, with no `curl` and no Java. A dependency

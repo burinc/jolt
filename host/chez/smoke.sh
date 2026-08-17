@@ -1265,6 +1265,20 @@ else
   fails=$((fails + 1))
 fi
 
+# bin/jolt changes to the checkout before loading the CLI. A relative script
+# still names a file in the directory from which the user invoked it, carried
+# across that chdir as JOLT_PWD.
+relative_script_dir="$(mktemp -d)"
+printf '(println "relative-script-ok")\n' > "$relative_script_dir/probe.clj"
+relative_script_out="$(cd "$relative_script_dir" && "$root/bin/jolt" probe.clj 2>/dev/null | tail -1)"
+if [ "$relative_script_out" = "relative-script-ok" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: script-mode bin/jolt relative file — got \`$relative_script_out\`"
+  fails=$((fails + 1))
+fi
+rm -rf "$relative_script_dir"
+
 # bare-directory build: the standalone binary must build an app with NO jolt
 # checkout on disk (embedded runtime sources only). The v0.4.0 release smoke
 # failed on all three platforms because the flat.ss inliner missed the

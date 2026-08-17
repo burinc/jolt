@@ -191,8 +191,15 @@
                              print?))
 
 ;; A FILE argument of "-" means stdin, like bb/ys and most CLIs; map it to
-;; /dev/stdin, which load-file reads.
-(defn- file-arg [x] (if (= "-" x) "/dev/stdin" x))
+;; /dev/stdin, which load-file reads. Relative paths belong to the project
+;; directory. This differs from the process directory for the development
+;; launcher: bin/jolt cd's to its checkout and carries the caller's directory in
+;; JOLT_PWD so its host Scheme files remain findable.
+(defn- file-arg [x]
+  (cond
+    (= "-" x) "/dev/stdin"
+    (str/starts-with? x "/") x
+    :else (str (project-dir) "/" x)))
 
 ;; main-opts is a vector like ["-m" "app.core"] or ["-e" "(prn :hi)"] (optionally
 ;; with trailing args). The user-supplied extra args are appended, so an alias's
