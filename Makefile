@@ -256,6 +256,7 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-go-test.ss
 	@$(CHEZ) --script test/chez/fibers-pool-test.ss
 	@$(CHEZ) --script test/chez/fibers-io-test.ss
+	@$(CHEZ) --script test/chez/fibers-process-io-test.ss
 	@$(CHEZ) --script test/chez/fibers-sm-test.ss
 	@$(CHEZ) --script test/chez/fibers-preempt-test.ss
 	@$(CHEZ) --script test/chez/fibers-lock-test.ss

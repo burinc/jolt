@@ -59,6 +59,127 @@
 ;; concurrency.ss uses for the SIG_BLOCK numerics.
 (define proc-SIGCHLD (if (eq? (sa-os-family) 'macos) 20 17))
 
+;; EAGAIN/EWOULDBLOCK, for the R8-style non-blocking pipe read/write retry
+;; loop (proc-fd-input-port / proc-fd-output-port below). Genuinely
+;; platform-dependent, unlike proc-EINTR -- same os-family test process.ss
+;; already uses for proc-SIGCHLD.
+(define proc-EAGAIN (if (eq? (sa-os-family) 'macos) 35 11))
+
+;; fcntl(F_GETFL)/(F_SETFL) for setting a pipe fd non-blocking, mirroring
+;; stdlib/jolt/io_poller.clj's own private c-fcntl binding
+;; (io_poller.clj:59-63,70) at the Scheme level. fcntl(2) is C-variadic;
+;; F_GETFL is called with NO variadic argument (plain 2-arg binding is
+;; correct). F_SETFL is ALWAYS called with one variadic argument (the new
+;; flags value) and REQUIRES the (__varargs_after 2) calling-convention
+;; token -- "2" is the count of fixed/named params before the first true
+;; variadic arg. Without this marker, F_SETFL on Apple arm64 returns
+;; success but silently fails to apply the flags (verified by
+;; test/chez/ffi-binding-test.ss:82-104, which proves the identical fix
+;; via the Clojure FFI :varargs marker on a real socket with F_SETFL
+;; before/after flags readback). Mirrors stdlib/jolt/ffi.clj's own
+;; :varargs marker (io_poller.clj's `(ffi/defcfn c-fcntl "fcntl"
+;; [:int :int :varargs :int] :int)`), exposed here as the raw Scheme-level
+;; jolt-foreign-proc-safe 4-arg form (rt.ss:73-88) -- a Chez/Apple-ABI
+;; feature, not a jolt invention.
+(define proc-fcntl-get (jolt-foreign-proc-safe "fcntl" '(int int) 'int))
+(define proc-fcntl-set (jolt-foreign-proc-safe (__varargs_after 2) "fcntl" '(int int int) 'int))
+(define proc-F-GETFL 3)
+(define proc-F-SETFL 4)
+(define proc-O-NONBLOCK (if (eq? (sa-os-family) 'macos) #x4 #x800))
+
+;; Nothing here happens without a working fcntl and a readable errno: a pipe
+;; set non-blocking whose EAGAIN cannot be recognised reads as EOF instead
+;; (the (else 0) branch in proc-fd-input-port), which is worse than a blocking
+;; pipe. So the whole R8 extension is gated on the three bindings, and the
+;; degradation when one is missing is "no parking" — the pipes stay blocking
+;; and EAGAIN never arrives. Deliberately NOT folded into
+;; proc-spawn-fd-ok?: that gate decides posix_spawn vs Chez's fork, and the
+;; fork path leaves SIGINT at SIG_IGN in the child (see the comment above
+;; proc-spawn-fd-mutex). Correct child signal dispositions are not worth
+;; trading for O_NONBLOCK.
+(define proc-nonblock-ok? (and proc-fcntl-get proc-fcntl-set proc-errno-loc #t))
+
+(define (proc-set-nonblocking! fd)
+  (when proc-nonblock-ok?
+    (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
+      ;; A negative flags value means F_GETFL itself failed -- don't hand that
+      ;; straight to F_SETFL: (fxior -1 proc-O-NONBLOCK) is still negative, and
+      ;; the kernel would mask it down, silently leaving the fd blocking with
+      ;; no diagnostic that anything went wrong.
+      (when (>= flags 0)
+        (proc-fcntl-set fd proc-F-SETFL (fxior flags proc-O-NONBLOCK))))))
+
+;; jolt.socket is the only thing in the tree that requires jolt.io-poller, so a
+;; program that drives subprocesses from fibers without ever touching a socket
+;; — a build-tool wrapper, a shell pipeline — would find wait-ready unbound and
+;; take the blocking fallback below, pinning its carrier: exactly the starvation
+;; this whole file's R8 extension exists to remove. Autoload the poller instead,
+;; at the one moment it is known to be needed, and only when there IS a fiber to
+;; park: a plain thread keeps the cheaper blocking read rather than paying a
+;; private kqueue/epoll per wait.
+;;
+;; Safe from inside a port read even though a load can park and can race another
+;; thread's: loader.ss's claim protocol owns both cases (ldr-begin-load! steps
+;; 2-3), and leaning on it rather than on a latch of our own is what makes the
+;; CONCURRENT case come out right. Two fibers on two carriers reach their first
+;; EAGAIN at once routinely -- it is the ordinary shape of "read several
+;; subprocesses from go blocks", the thing this whole extension is for. A
+;; boolean "already tried" latch set before the load would let the second fiber
+;; skip straight past it, find the var still unbound because the first is only
+;; part way through, and take the blocking fallback -- clearing O_NONBLOCK on
+;; its own fd for good, so that one port never parks again for the life of the
+;; process. Calling load-namespace instead makes the second fiber WAIT on the
+;; first's claim (fiber-aware, via jolt-lock-parked, so it parks rather than
+;; pinning), then find a fully built namespace. Already-loaded is a hashtable
+;; lookup, and we only get here when the var is unbound anyway.
+;;
+;; The one thing the loader cannot decide for us is a load that FAILS
+;; (jolt.io-poller off the source roots in a trimmed install): the loader rolls
+;; its own mark back on a throw, deliberately, so a retry can work. Nothing
+;; about the next EAGAIN will have changed, though, so record the failure here
+;; and stop asking.
+(define proc-poller-load-failed #f)
+(define (proc-poller-autoload!)
+  (unless proc-poller-load-failed
+    (guard (e (#t (set! proc-poller-load-failed #t) #f))
+      (load-namespace "jolt.io-poller"))))
+
+;; Bridge to jolt.io-poller/wait-ready: var-deref never throws for a
+;; missing var -- jolt-var auto-vivifies a jolt-var-unbound placeholder
+;; instead (rt.ss:662-669), checkable via the record type's own
+;; predicate. Off a fiber an unbound var stays unbound (see
+;; proc-poller-autoload! above for why the load is fiber-only) and this
+;; returns #f, so the caller falls back to a real blocking wait it
+;; implements itself (the EAGAIN branches in
+;; proc-fd-input-port/proc-fd-output-port below -- a bare 0-byte return
+;; there would misread as EOF, since the pipe fd is genuinely
+;; non-blocking by then). On a fiber the same #f is only reachable when
+;; the autoload itself failed.
+(define (proc-poller-wait-ready fd filt-kw)
+  (let* ((f0 (var-deref "jolt.io-poller" "wait-ready"))
+         (f (if (and (jolt-var-unbound? f0) (jolt-current-fiber))
+                (begin (proc-poller-autoload!)
+                       (var-deref "jolt.io-poller" "wait-ready"))
+                f0)))
+    (if (jolt-var-unbound? f)
+        #f
+        (begin (jolt-invoke2 f fd filt-kw) #t))))
+
+;; Bridge to jolt.io-poller/forget!, same shape as proc-poller-wait-ready above.
+;; A closed fd is auto-removed from the kernel's kqueue/epoll set, so no
+;; event is ever coming for a fiber still parked on it -- without telling
+;; the poller to drop its registration, that fiber sleeps forever, and a
+;; leaked ready=true tombstone in the poller's shared :fds table (keyed by
+;; bare fd integer, shared with jolt.socket) can then be consumed by a
+;; REUSED fd number belonging to an unrelated later socket. Mirrors
+;; jolt.socket's socket-close! (stdlib/jolt/socket.clj), which does the
+;; identical close-then-forget for the same reason. Same unbound-var guard
+;; as proc-poller-wait-ready, and no autoload: a poller that was never loaded
+;; holds no registration for this fd, so there is nothing to forget.
+(define (proc-poller-forget! fd)
+  (let ((f (var-deref "jolt.io-poller" "forget!")))
+    (unless (jolt-var-unbound? f) (jolt-invoke1 f fd))))
+
 ;; A jolt that spawns children has to be able to reap them, so SIGCHLD must not be
 ;; left at an INHERITED SIG_IGN: with that disposition the kernel reaps every child
 ;; itself and waitpid can only ever fail with ECHILD, making exit statuses
@@ -337,6 +458,10 @@
 (define proc-c-read  (jolt-foreign-proc-blocking "read"  '(int void* size_t) 'ssize_t))
 (define proc-c-write (jolt-foreign-proc-blocking "write" '(int void* size_t) 'ssize_t))
 
+;; What posix_spawn-with-pipes needs, and nothing more. The R8 fiber-parking
+;; extension's own bindings (fcntl, errno) are gated separately by
+;; proc-nonblock-ok? above: losing parking is a performance story, losing this
+;; path means falling back to Chez's fork with SIGINT ignored in the child.
 (define proc-spawn-fd-ok?
   (and proc-c-pipe proc-c-close proc-fa-init proc-fa-dup2 proc-fa-close
        proc-fa-destroy proc-c-spawn proc-c-read proc-c-write #t))
@@ -366,32 +491,116 @@
   (for-each sa-foreign-free (cdr m))
   (sa-foreign-free (car m)))
 
-;; binary ports over the raw pipe fds. EINTR is retried; any other read error
-;; reads as EOF (the child is gone and the pipe with it). A short write returns
-;; its count and Chez's port machinery re-calls for the rest.
+;; binary ports over the raw pipe fds. EINTR is retried; EAGAIN parks the
+;; current fiber (or blocks this thread) via jolt.io-poller when it's loaded
+;; -- symmetric on both sides below: proc-fd-input-port waits on :read,
+;; proc-fd-output-port waits on :write, over the same mk-pipe-created
+;; non-blocking fd and the same proc-poller-wait-ready bridge. When no poller is
+;; loaded, EAGAIN clears O_NONBLOCK on this fd (fd is genuinely non-blocking
+;; now per mk-pipe above, so a no-poller EAGAIN is a live "not ready yet"
+;; signal, not a real failure) and falls through to a real blocking
+;; proc-c-read/proc-c-write from then on -- exact behavioral parity with a
+;; plain blocking fd once triggered, verified standalone: a blocked
+;; read/write genuinely waits rather than busy-looping or returning a
+;; spurious result. Any OTHER error still ends the port, but the two sides
+;; report it differently -- pre-existing asymmetry, unchanged by this: the
+;; read side reads it as EOF (0, the child is gone and the pipe with it);
+;; the write side raises (child gone, `error 'process "write to child
+;; failed"`). A short write returns its count and Chez's port machinery
+;; re-calls for the rest.
+;;
+;; The `closed?` box each port allocates alongside its buf is what makes the
+;; close proc safe against a fiber PARKED in that retry loop. Close is three
+;; steps -- free buf, close fd, forget the fd -- and the third wakes any parked
+;; waiter through jolt.io-poller. That wake is ASYNCHRONOUS: jolt.host's
+;; fiber-resume -> sa-fiber-resume (host/chez/fibers.ss) only flips the fiber to
+;; 'ready and enqueues it on its carrier's run queue; the fiber's continuation
+;; runs later, on the carrier thread. Between the wake and that continuation
+;; there is a real scheduling gap, and by then buf is already free()d
+;; (sa-foreign-free is a bare foreign-free -- no pooling, no quarantine) and fd
+;; is already closed. A closed fd number is immediately eligible for reuse by
+;; ANY concurrent pipe/socket/open/accept anywhere in the process -- POSIX hands
+;; out the lowest free number, and jolt.process exists to support many
+;; concurrent spawns -- so without the flag the woken fiber's (retry) calls
+;; proc-c-read/proc-c-write with a fd that is valid again but belongs to
+;; something else entirely, handing the kernel a pointer into freed memory. That
+;; stale retry could also re-register the reused fd with jolt.io-poller,
+;; cross-talking with its new owner's registration. proc-spawn-fd-mutex does not
+;; help: it covers only the pipe()-through-posix_spawn sequence, not close and
+;; not fd allocation in general.
+;;
+;; So the close proc sets closed? FIRST, before it frees, closes, or forgets,
+;; and the retry loop tests it at the TOP of EVERY iteration -- the first one
+;; included, not just the one after a park. The ordering is what makes that test
+;; sound rather than hopeful: set-box! happens before proc-poller-forget!, which
+;; reaches sa-fiber-resume, which takes and releases the carrier's mutex to
+;; enqueue the fiber; the carrier thread takes that SAME mutex in
+;; jolt-fiber-dequeue! before it can run the fiber at all. A release/acquire
+;; pair on one mutex, so the #t is published to the woken fiber -- it cannot
+;; observe a stale #f, and it cannot have cached the read across the park, since
+;; the park sits behind proc-poller-wait-ready's opaque var-deref'd call. Same
+;; box/set-box!/unbox shape concurrency.ss uses for its own cross-thread flag
+;; (agents-shutdown?).
+;;
+;; Each side short-circuits the way it already reports a dead pipe: the read
+;; side returns 0 (the `(else 0)` EOF convention below), the write side raises
+;; (the `error 'process` convention below) -- with its own message, so a port
+;; closed under a parked write is not misreported as a failing child.
+;;
+;; Deliberately NOT covered: a close racing a syscall already IN FLIGHT on
+;; another thread rather than parked. That caller read fd and buf before any
+;; flag could be set, so no flag can help it; it is a pre-existing hazard of
+;; closing a port other threads are actively using, not something this adds.
+;;
+;; Also NOT covered: a fiber that has decided to call proc-poller-wait-ready but
+;; has not yet registered when close runs -- forget! finds nothing to drop,
+;; then the fiber registers on an already-dead fd. That is a strand (a hang),
+;; not a use-after-free; closing it needs coordination on the jolt.io-poller
+;; side (a register/forget race), left out of scope here. Pre-existing,
+;; not introduced by this fix.
 (define proc-fd-buf-size 32768)
 (define (proc-fd-input-port fd)
-  (let ((buf (sa-foreign-alloc proc-fd-buf-size)))
+  (let ((buf (sa-foreign-alloc proc-fd-buf-size))
+        (closed? (box #f)))
     (make-custom-binary-input-port
       (string-append "process-fd-" (number->string fd))
       (lambda (bv start n)
         (let ((want (min n proc-fd-buf-size)))
           (let retry ()
-            (let ((got (proc-c-read fd buf want)))
-              (cond
-                ((> got 0)
-                 (let loop ((i 0))
-                   (when (< i got)
-                     (bytevector-u8-set! bv (+ start i) (sa-foreign-ref 'unsigned-8 buf i))
-                     (loop (+ i 1))))
-                 got)
-                ((= got 0) 0)
-                ((= (proc-errno) proc-EINTR) (retry))
-                (else 0))))))
+            ;; Top of EVERY iteration, first one included: a fiber woken by the
+            ;; close proc's proc-poller-forget! resumes HERE, and buf is freed and fd
+            ;; closed (possibly reused) by then. Read as EOF without touching
+            ;; either -- same answer the (else 0) branch below would give for a
+            ;; closed fd's EBADF, reached without the syscall.
+            (if (unbox closed?)
+                0
+                (let ((got (proc-c-read fd buf want)))
+                  (cond
+                    ((> got 0)
+                     (let loop ((i 0))
+                       (when (< i got)
+                         (bytevector-u8-set! bv (+ start i) (sa-foreign-ref 'unsigned-8 buf i))
+                         (loop (+ i 1))))
+                     got)
+                    ((= got 0) 0)
+                    ((= (proc-errno) proc-EINTR) (retry))
+                    ((= (proc-errno) proc-EAGAIN)
+                     (if (proc-poller-wait-ready fd (jolt-keyword "read"))
+                         (retry)
+                         (begin
+                           (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
+                             (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
+                           (retry))))
+                    (else 0)))))))
       #f #f
-      (lambda () (sa-foreign-free buf) (proc-c-close fd)))))
+      ;; closed? goes up BEFORE the free/close/forget below, so it is already #t
+      ;; on the far side of the carrier-mutex handoff every woken fiber crosses.
+      (lambda ()
+        (set-box! closed? #t)
+        (sa-foreign-free buf) (proc-c-close fd) (proc-poller-forget! fd)))))
 (define (proc-fd-output-port fd)
-  (let ((buf (sa-foreign-alloc proc-fd-buf-size)))
+  (let ((buf (sa-foreign-alloc proc-fd-buf-size))
+        (closed? (box #f)))
     (make-custom-binary-output-port
       (string-append "process-fd-" (number->string fd))
       (lambda (bv start n)
@@ -401,13 +610,31 @@
               (sa-foreign-set! 'unsigned-8 buf i (bytevector-u8-ref bv (+ start i)))
               (loop (+ i 1))))
           (let retry ()
-            (let ((wrote (proc-c-write fd buf want)))
-              (cond
-                ((>= wrote 0) wrote)
-                ((= (proc-errno) proc-EINTR) (retry))
-                (else (error 'process "write to child failed" fd)))))))
+            ;; Top of EVERY iteration, first one included -- the read side's
+            ;; twin, and the branch a fiber woken by the close proc lands on.
+            ;; Raises rather than returning a count, matching the (else ...)
+            ;; convention below; its own message because the child is fine here,
+            ;; the port under this write is not.
+            (if (unbox closed?)
+                (error 'process "write to closed pipe" fd)
+                (let ((wrote (proc-c-write fd buf want)))
+                  (cond
+                    ((>= wrote 0) wrote)
+                    ((= (proc-errno) proc-EINTR) (retry))
+                    ((= (proc-errno) proc-EAGAIN)
+                     (if (proc-poller-wait-ready fd (jolt-keyword "write"))
+                         (retry)
+                         (begin
+                           (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
+                             (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
+                           (retry))))
+                    (else (error 'process "write to child failed" fd))))))))
       #f #f
-      (lambda () (sa-foreign-free buf) (proc-c-close fd)))))
+      ;; closed? goes up BEFORE the free/close/forget below, so it is already #t
+      ;; on the far side of the carrier-mutex handoff every woken fiber crosses.
+      (lambda ()
+        (set-box! closed? #t)
+        (sa-foreign-free buf) (proc-c-close fd) (proc-poller-forget! fd)))))
 
 ;; What the API hands back for a stream that was INHERITED: the JVM's null
 ;; streams. Reads are at EOF from the start; writes are accepted and dropped.
@@ -416,10 +643,17 @@
 (define (proc-null-output-port)
   (make-custom-binary-output-port "process-null" (lambda (bv start n) n) #f #f #f))
 
-;; The pipe fds are not close-on-exec (fcntl/ioctl are variadic, which the FFI
-;; cannot call safely on arm64), so a concurrent spawn's child could inherit
-;; them and hold a read end open past this child's exit. Exclusion by mutex
-;; instead: no other fd-level spawn runs between pipe() and posix_spawn.
+;; The pipe fds are not close-on-exec: macOS has no pipe2()/O_CLOEXEC (unlike
+;; Linux), so FD_CLOEXEC can only be applied with a SEPARATE fcntl(F_SETFD)
+;; call after pipe() returns -- and that leaves a window, between pipe() and
+;; that fcntl call, where a concurrent spawn's child could still inherit the
+;; fd and hold a read end open past this child's exit. This is true even now
+;; that this file has a working arm64 fcntl binding (proc-fcntl-get/-set
+;; above, via the (__varargs_after 2) marker): a working fcntl fixes whether
+;; we CAN make the F_SETFD call safely, not the fact that pipe() and
+;; F_SETFD are still two separate syscalls with a gap between them. Exclusion
+;; by mutex instead: no other fd-level spawn runs between pipe() and
+;; posix_spawn.
 (define proc-spawn-fd-mutex (make-mutex))
 
 ;; Spawn `/bin/sh -c sh-cmd` with fd-level stdio: an inherited stream gets no
@@ -429,54 +663,94 @@
 ;; the pipe path — so the mask is corrected on this side, around the spawn
 ;; itself (see the call below).
 (define (proc-spawn-fd-level sh-cmd inherit-in? inherit-out? inherit-err?)
-  (define (mk-pipe)
+  ;; nonblocking-read? / nonblocking-write? -- set O_NONBLOCK unconditionally
+  ;; on the PARENT's own RETAINED end at creation (never poller-gated), so
+  ;; the retry loops below
+  ;; (proc-fd-input-port / proc-fd-output-port) can park a fiber on EAGAIN
+  ;; instead of pinning the carrier. Which end is "the parent's own" is
+  ;; per-role and asymmetric: for out-p/err-p the parent keeps the read end
+  ;; (car) and the child gets the write end (cdr) via dup2, so only
+  ;; nonblocking-read? applies; in-p is the mirror image -- the CHILD gets
+  ;; the read end (dup2'd to its own stdin) and the PARENT keeps the write
+  ;; end (cdr, feeding proc-fd-output-port), so only nonblocking-write?
+  ;; applies. Per POSIX, dup2/dup/fork-duplicated descriptors share file
+  ;; status flags -- including O_NONBLOCK -- via the shared open file
+  ;; description; only per-descriptor flags like FD_CLOEXEC are NOT shared
+  ;; (verified standalone: a dup()'d fd inherits O_NONBLOCK from the fd it
+  ;; was dup'd from). So flipping O_NONBLOCK on the end that gets dup2'd into
+  ;; the child would silently change the CHILD's own stdio behavior, not just
+  ;; the parent's -- a non-blocking in-p read end makes the child's own
+  ;; stdin reads see spurious EAGAIN; a non-blocking out-p/err-p write end
+  ;; would do the same to the child's own stdout/stderr writes. Each of the
+  ;; three pipes below only ever sets non-blocking on the end the parent
+  ;; itself retains.
+  (define (mk-pipe nonblocking-read? nonblocking-write?)
     (let ((fds (sa-foreign-alloc 8)))
       (if (= 0 (proc-c-pipe fds))
           (let ((p (cons (sa-foreign-ref 'int fds 0) (sa-foreign-ref 'int fds 4))))
-            (sa-foreign-free fds) p)
+            (sa-foreign-free fds)
+            (when nonblocking-read? (proc-set-nonblocking! (car p)))
+            (when nonblocking-write? (proc-set-nonblocking! (cdr p)))
+            p)
           (begin (sa-foreign-free fds)
                  (throw-jvm (quote java.io.IOException) "pipe: cannot allocate")))))
-  (jolt-with-mutex proc-spawn-fd-mutex
-    (let* ((in-p  (and (not inherit-in?)  (mk-pipe)))
-           (out-p (and (not inherit-out?) (mk-pipe)))
-           (err-p (and (not inherit-err?) (mk-pipe)))
-           (fa (sa-foreign-alloc 128))
-           (pidbuf (sa-foreign-alloc 8)))
-      (proc-fa-init fa)
-      (when in-p  (proc-fa-dup2 fa (car in-p) 0)
-                  (proc-fa-close fa (car in-p)) (proc-fa-close fa (cdr in-p)))
-      (when out-p (proc-fa-dup2 fa (cdr out-p) 1)
-                  (proc-fa-close fa (cdr out-p)) (proc-fa-close fa (car out-p)))
-      (when err-p (proc-fa-dup2 fa (cdr err-p) 2)
-                  (proc-fa-close fa (cdr err-p)) (proc-fa-close fa (car err-p)))
-      (let* ((argv (proc-marshal-argv (list "/bin/sh" "-c" sh-cmd)))
-             (envp (proc-marshal-argv
-                    (map (lambda (p) (string-append (car p) "=" (cdr p)))
-                         (all-env-pairs))))
-             ;; attrp is NULL, so the child inherits this thread's signal mask —
-             ;; which must carry none of jolt's own blocking (concurrency.ss).
-             (rc (jolt-with-empty-sigmask
-                   (lambda () (proc-c-spawn pidbuf "/bin/sh" fa 0 (car argv) (car envp)))))
-             (pid (sa-foreign-ref 'int pidbuf 0)))
-        (proc-fa-destroy fa)
-        (sa-foreign-free fa) (sa-foreign-free pidbuf)
-        (proc-free-argv argv) (proc-free-argv envp)
-        ;; parent side: the child's pipe ends close unconditionally; on a failed
-        ;; spawn the parent ends close too, before the throw.
-        (when in-p  (proc-c-close (car in-p)))
-        (when out-p (proc-c-close (cdr out-p)))
-        (when err-p (proc-c-close (cdr err-p)))
-        (if (= rc 0)
-            (values (and in-p  (proc-fd-output-port (cdr in-p)))
-                    (and out-p (proc-fd-input-port (car out-p)))
-                    (and err-p (proc-fd-input-port (car err-p)))
-                    pid)
-            (begin
-              (when in-p  (proc-c-close (cdr in-p)))
-              (when out-p (proc-c-close (car out-p)))
-              (when err-p (proc-c-close (car err-p)))
-              (throw-jvm (quote java.io.IOException)
-                (string-append "posix_spawn failed (errno " (number->string rc) ")"))))))))
+  ;; spawn-locked hands back RAW FDS and the ports are built after it returns,
+  ;; not inside. proc-fd-input-port / proc-fd-output-port can park now (an EAGAIN on
+  ;; a fiber waits on jolt.io-poller, and the first such wait may autoload it),
+  ;; and a park inside a jolt-with-mutex region is the deadlock shape
+  ;; test/parkcheck refuses outright -- host/chez/locks.ss. Only their
+  ;; read!/write! callbacks can actually reach a park, and those run when
+  ;; someone reads the port rather than here, so nothing was wrong before; but
+  ;; the lock has no reason to span the construction either, and its own
+  ;; contract is pipe() through posix_spawn and nothing else. Narrowing it makes
+  ;; the call graph say what is true instead of asking for an exemption.
+  (define (spawn-locked)
+    (jolt-with-mutex proc-spawn-fd-mutex
+      (let* ((in-p  (and (not inherit-in?)  (mk-pipe #f #t)))
+             (out-p (and (not inherit-out?) (mk-pipe #t #f)))
+             (err-p (and (not inherit-err?) (mk-pipe #t #f)))
+             (fa (sa-foreign-alloc 128))
+             (pidbuf (sa-foreign-alloc 8)))
+        (proc-fa-init fa)
+        (when in-p  (proc-fa-dup2 fa (car in-p) 0)
+                    (proc-fa-close fa (car in-p)) (proc-fa-close fa (cdr in-p)))
+        (when out-p (proc-fa-dup2 fa (cdr out-p) 1)
+                    (proc-fa-close fa (cdr out-p)) (proc-fa-close fa (car out-p)))
+        (when err-p (proc-fa-dup2 fa (cdr err-p) 2)
+                    (proc-fa-close fa (cdr err-p)) (proc-fa-close fa (car err-p)))
+        (let* ((argv (proc-marshal-argv (list "/bin/sh" "-c" sh-cmd)))
+               (envp (proc-marshal-argv
+                      (map (lambda (p) (string-append (car p) "=" (cdr p)))
+                           (all-env-pairs))))
+               ;; attrp is NULL, so the child inherits this thread's signal mask —
+               ;; which must carry none of jolt's own blocking (concurrency.ss).
+               (rc (jolt-with-empty-sigmask
+                     (lambda () (proc-c-spawn pidbuf "/bin/sh" fa 0 (car argv) (car envp)))))
+               (pid (sa-foreign-ref 'int pidbuf 0)))
+          (proc-fa-destroy fa)
+          (sa-foreign-free fa) (sa-foreign-free pidbuf)
+          (proc-free-argv argv) (proc-free-argv envp)
+          ;; parent side: the child's pipe ends close unconditionally; on a failed
+          ;; spawn the parent ends close too, before the throw.
+          (when in-p  (proc-c-close (car in-p)))
+          (when out-p (proc-c-close (cdr out-p)))
+          (when err-p (proc-c-close (cdr err-p)))
+          (if (= rc 0)
+              (vector (and in-p  (cdr in-p))
+                      (and out-p (car out-p))
+                      (and err-p (car err-p))
+                      pid)
+              (begin
+                (when in-p  (proc-c-close (cdr in-p)))
+                (when out-p (proc-c-close (car out-p)))
+                (when err-p (proc-c-close (car err-p)))
+                (throw-jvm (quote java.io.IOException)
+                  (string-append "posix_spawn failed (errno " (number->string rc) ")"))))))))
+  (let ((fds (spawn-locked)))
+    (values (let ((fd (vector-ref fds 0))) (and fd (proc-fd-output-port fd)))
+            (let ((fd (vector-ref fds 1))) (and fd (proc-fd-input-port fd)))
+            (let ((fd (vector-ref fds 2))) (and fd (proc-fd-input-port fd)))
+            (vector-ref fds 3))))
 
 ;; --- java.lang.Process -------------------------------------------------------
 ;; state: #(stdin-os stdout-is stderr-is pid exit-box cmd mutex stdout-port
