@@ -437,5 +437,8 @@
       (fn stop []
         (when (compare-and-set! stopped false true)
           (c-close fd)
-          (jolt.host/delete-file ".nrepl-port"))
+          ;; delete-file!, not the raw Chez delete-file this used to call: that
+          ;; one RAISES when the file is already gone, so a stop after someone
+          ;; cleaned the port file up threw out of the shutdown path.
+          (jolt.host/delete-file! ".nrepl-port"))
         nil))))

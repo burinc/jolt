@@ -119,6 +119,21 @@ uniform per-call overhead. Those are here too.
 
 ### Fixed
 
+- **The dependency resolver does its filesystem work on Windows.** Every
+  `mkdir -p`, `mv`, `rm`, `touch`, `test -nt` and `find` in `jolt.deps` went
+  through `jolt.host/sh`, which is `cmd.exe` on Windows: `mkdir` there has no
+  `-p` and takes a list of paths, so every run created a directory literally
+  named `-p` in the working directory, and mv/rm/touch/test/find are not
+  commands at all. Running `jolt` in any directory left that `-p` behind plus a
+  `.jolt/cpcache` full of `.part-` files the failed `mv` never published, and
+  the classpath cache could never hit, so a warm run re-resolved from scratch
+  and dropped one more file. Maven jar extraction and git checkout publishing
+  failed the same way. All of it is filesystem calls now (new `jolt.host`
+  seams: `mkdirs!`, `rename-file!`, `delete-file!`, `delete-tree!`,
+  `file-mtime`, `list-dir`, `symlink?`), the captured-output temp files follow
+  `%TEMP%` where there is no `/tmp`, and the `shelloutcheck` gate holds the
+  line: only `git` and `unzip`, which are real external programs, may reach the
+  shell.
 - **`jolt build` finds host classes a dependency provides.** The
   require-graph scan never looked at class references inside the closure, so a
   program using a lib-provided host class (`java.util.Locale`,

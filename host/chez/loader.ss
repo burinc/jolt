@@ -1920,6 +1920,63 @@
 (def-var! "jolt.host" "directory?" (lambda (p) (if (file-directory? p) #t #f)))
 (def-var! "jolt.host" "getenv" (lambda (n) (let ((v (getenv n))) (if v v jolt-nil))))
 
+;; --- filesystem primitives (jolt.host) --------------------------------------
+;; jolt.deps did its filesystem work by shelling out: `mkdir -p`, `mv`, `rm -f`,
+;; `rm -rf`, `test -nt`, `find`. jolt-sh is Chez's `system`, which on Windows
+;; runs the string through cmd.exe, where none of those mean what they mean on
+;; POSIX — cmd's `mkdir` has no `-p` and takes a list of paths, so `mkdir -p
+;; a/b` silently creates a directory literally NAMED `-p` alongside a/b, and
+;; mv/rm/test/find are not commands at all. That left every Windows run
+;; littering the project with a `-p` dir and `.part-` files the failed `mv`
+;; never published, and the classpath cache never hit. Same failure the AOT
+;; cache hit (aot-mkdir-p above); these are the native equivalents, so the
+;; resolver never spawns a shell for something the filesystem API does. Only
+;; git and unzip stay subprocesses — those are real external programs.
+;;
+;; A Windows path can arrive with backslashes (a %TEMP%- or %HOME%-derived one
+;; does), and the separator-splitting walks below know only "/" — which Windows
+;; accepts everywhere anyway. POSIX keeps the path verbatim: there a backslash
+;; is an ordinary character in a filename, not a separator.
+(define (host-fs-path p)
+  (if (eq? (sa-os-family) 'windows)
+      (list->string (map (lambda (c) (if (char=? c #\\) #\/ c)) (string->list p)))
+      p))
+(def-var! "jolt.host" "mkdirs!"
+  (lambda (p) (if (mkdirs! (host-fs-path p)) #t #f)))
+;; `rm -f`: an absent path is success, not failure.
+(def-var! "jolt.host" "delete-file!"
+  (lambda (p)
+    (let ((p (host-fs-path p)))
+      (if (file-exists? p) (if (delete-path! p) #t #f) #t))))
+;; `rm -rf`, reusing the AOT cache's pruner (which does not follow symlinks).
+(def-var! "jolt.host" "delete-tree!"
+  (lambda (p)
+    (let ((p (host-fs-path p)))
+      (aot-delete-tree p)
+      (if (file-exists? p) #f #t))))
+;; `mv` within one filesystem: rename(2), which is the atomicity the publish
+;; steps (a staged cache entry, a staged git checkout) depend on.
+(def-var! "jolt.host" "rename-file!"
+  (lambda (from to)
+    (guard (e (#t #f)) (rename-file (host-fs-path from) (host-fs-path to)) #t)))
+;; last-modified in epoch milliseconds, 0 when absent — what `test -nt` compared.
+(def-var! "jolt.host" "file-mtime"
+  (lambda (p)
+    (let ((p (host-fs-path p)))
+      (if (file-exists? p) (sa-file-mtime-ms p) 0))))
+;; directory entries (names only), nil when p is not a directory — the pieces a
+;; `find` walk is built from on the Clojure side.
+(def-var! "jolt.host" "list-dir"
+  (lambda (p)
+    (let ((p (host-fs-path p)))
+      (if (file-directory? p)
+          (guard (e (#t jolt-nil)) (list->cseq (directory-list p)))
+          jolt-nil))))
+;; …and whether it is a symlink, so that walk can decline to follow one, as
+;; `find` does by default.
+(def-var! "jolt.host" "symlink?"
+  (lambda (p) (if (file-symbolic-link? (host-fs-path p)) #t #f)))
+
 ;; jolt version string — one source (jolt-version-string, rt.ss): the baked
 ;; release tag in a binary, $JOLT_VERSION under bin/jolt, else "dev".
 (def-var! "jolt.host" "jolt-version" (lambda () (jolt-version-string)))
