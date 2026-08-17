@@ -59,6 +59,53 @@
 ;; concurrency.ss uses for the SIG_BLOCK numerics.
 (define proc-SIGCHLD (if (eq? (sa-os-family) 'macos) 20 17))
 
+;; EAGAIN/EWOULDBLOCK, for the R8-style non-blocking pipe read/write retry
+;; loop (proc-fd-input-port / proc-fd-output-port below). Genuinely
+;; platform-dependent, unlike proc-EINTR -- same os-family test process.ss
+;; already uses for proc-SIGCHLD.
+(define proc-EAGAIN (if (eq? (sa-os-family) 'macos) 35 11))
+
+;; fcntl(F_GETFL)/(F_SETFL) for setting a pipe fd non-blocking, mirroring
+;; stdlib/jolt/io_poller.clj's own private c-fcntl binding
+;; (io_poller.clj:59-63,70) at the Scheme level. fcntl(2) is C-variadic;
+;; F_GETFL is called with NO variadic argument (plain 2-arg binding is
+;; correct). F_SETFL is ALWAYS called with one variadic argument (the new
+;; flags value) and REQUIRES the (__varargs_after 2) calling-convention
+;; token -- "2" is the count of fixed/named params before the first true
+;; variadic arg. Without this marker, F_SETFL on Apple arm64 returns
+;; success but silently fails to apply the flags (verified by
+;; test/chez/ffi-binding-test.ss:82-104, which proves the identical fix
+;; via the Clojure FFI :varargs marker on a real socket with F_SETFL
+;; before/after flags readback). Mirrors stdlib/jolt/ffi.clj's own
+;; :varargs marker (io_poller.clj's `(ffi/defcfn c-fcntl "fcntl"
+;; [:int :int :varargs :int] :int)`), exposed here as the raw Scheme-level
+;; jolt-foreign-proc-safe 4-arg form (rt.ss:73-88) -- a Chez/Apple-ABI
+;; feature, not a jolt invention.
+(define proc-fcntl-get (jolt-foreign-proc-safe "fcntl" '(int int) 'int))
+(define proc-fcntl-set (jolt-foreign-proc-safe (__varargs_after 2) "fcntl" '(int int int) 'int))
+(define proc-F-GETFL 3)
+(define proc-F-SETFL 4)
+(define proc-O-NONBLOCK (if (eq? (sa-os-family) 'macos) #x4 #x800))
+
+(define (set-nonblocking! fd)
+  (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
+    (proc-fcntl-set fd proc-F-SETFL (fxior flags proc-O-NONBLOCK))))
+
+;; Bridge to jolt.io-poller/wait-ready: var-deref never throws for a
+;; missing var -- jolt-var auto-vivifies a jolt-var-unbound placeholder
+;; instead (rt.ss:662-669), checkable via the record type's own
+;; predicate. So when jolt.process is used standalone, without
+;; jolt.socket/jolt.io-poller ever loaded, this returns #f and the
+;; caller falls back to a real blocking wait it implements itself (the
+;; EAGAIN branches in proc-fd-input-port/proc-fd-output-port below --
+;; a bare 0-byte return there would misread as EOF, since the pipe fd
+;; is genuinely non-blocking by then).
+(define (poller-wait-ready fd filt-kw)
+  (let ((f (var-deref "jolt.io-poller" "wait-ready")))
+    (if (jolt-var-unbound? f)
+        #f
+        (begin (jolt-invoke2 f fd filt-kw) #t))))
+
 ;; A jolt that spawns children has to be able to reap them, so SIGCHLD must not be
 ;; left at an INHERITED SIG_IGN: with that disposition the kernel reaps every child
 ;; itself and waitpid can only ever fail with ECHILD, making exit statuses
