@@ -199,3 +199,11 @@
 ;; success-type checker, provably numeric) — the registry's :num-result? set.
 (def num-ret-fns op-registry/num-result-ops)
 (def vector-ret-fns #{"vec" "vector" "mapv" "filterv" "subvec"})
+;; fns whose result is ALWAYS a string (they throw rather than return a
+;; non-string), so a (.m f-expr …) interop target types :str and emits the
+;; string native directly. Per-namespace: clojure.core/replace is polymorphic,
+;; clojure.string/replace is always a string.
+(def str-ret-fns #{"str" "name" "subs" "pr-str" "format"})
+(def string-ns-ret-fns
+  #{"upper-case" "lower-case" "capitalize" "trim" "triml" "trimr" "trim-newline"
+    "reverse" "replace" "replace-first" "join" "escape"})

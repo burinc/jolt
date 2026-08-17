@@ -14,7 +14,8 @@
              [velem selem sfields vec-type? set-type? struct-type? mk-vec mk-set
               mk-struct union-cap scalar-t? union-type? umembers union-of merge-fields
               join-t join type-depth cap struct-safe? field-type type-shape
-              mark-struct truthy-type? num-ret-fns vector-ret-fns nilable? strip-nilable]]))
+              mark-struct truthy-type? num-ret-fns vector-ret-fns
+              str-ret-fns string-ns-ret-fns nilable? strip-nilable]]))
 
 ;; --- engine state ------------------------------------------------------------
 ;; The walk threads an immutable `env` (mk-env) instead of reading scattered
@@ -239,13 +240,18 @@
                                 pmr (when pm (get @(:pm-rets (:unit env)) (str (nth pm 0) "/" (nth pm 1))))]
                             (if (and pmr (not= pmr :any))
                               pmr
-                              (let [nm (and (= "clojure.core" (get fnode :ns)) (get fnode :name))]
+                              (let [nm (when (contains? #{"clojure.core" "clojure.string"} (get fnode :ns))
+                                         (get fnode :name))]
                                 (cond (nil? nm) :any
                                       (contains? num-ret-fns nm) :num
                                       (contains? vector-ret-fns nm) (mk-vec :any)
+                                      ;; the always-string set is per-ns: core/replace
+                                      ;; is polymorphic, string/replace is a string
+                                      (and (= "clojure.core" (get fnode :ns)) (contains? str-ret-fns nm)) :str
+                                      (and (= "clojure.string" (get fnode :ns)) (contains? string-ns-ret-fns nm)) :str
                                       :else :any))))))))
       (= op :host) (let [nm (get fnode :name)]
-                     (cond (contains? num-ret-fns nm) :num
+                    (cond (contains? num-ret-fns nm) :num
                            (contains? vector-ret-fns nm) (mk-vec :any)
                            :else :any))
       ;; `defn` names its fn, so a self-recursive call resolves through that name as
@@ -849,6 +855,18 @@
             n (if (get node :catch-body) (assoc n :catch-body (nth (infer (get node :catch-body) tenv env) 1)) n)
             n (if (get node :finally) (assoc n :finally (nth (infer (get node :finally) tenv env) 1)) n)]
         [:any n])
+      (= op :host-call)
+      ;; interop: infer the children (the default arm skips whole subtrees), and
+      ;; stamp :target-type :str when the target PROVES a string — a local typed
+      ;; :str by tenv, a str-ret call (str/name/subs/clojure.string fns), or a
+      ;; param typed :str by the whole-program fixpoint. The back end then emits
+      ;; the string native directly. The analyzer's hint stamp already sets
+      ;; :target-type; this only adds, never removes — a hint is a user contract
+      ;; inference won't second-guess.
+      (let [tr (infer (get node :target) tenv env)
+            ars (mapv (fn [a] (infer a tenv env)) (get node :args))
+            n (assoc node :target (nth tr 1) :args (mapv (fn [r] (nth r 1)) ars))]
+        [:any (if (= :str (nth tr 0)) (assoc n :target-type :str) n)])
       :else [:any node])))
 
 (defn- infer-top [node env] (nth (infer node {} env) 1))

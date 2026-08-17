@@ -9,6 +9,13 @@
 ;; lowers * to fl*. build-smoke greps flat.ss for the fl-op (proves wp-infer ran).
 (defn area [r] (* r r))
 
+;; Unhinted string interop: the target (str x) types :str per-form (the str-ret
+;; table), so the built binary lowers .startsWith/.indexOf to the string natives
+;; inline — build-smoke greps flat.ss for str-starts-with? and the ABSENCE of a
+;; record-method-dispatch "startsWith" (proves the :str stamp emitted directly).
+(defn strd-prefix [x] (.startsWith (str x) "s"))
+(defn strd-find [x] (.indexOf (str x) (int 45)))
+
 ;; ^:redef / ^:dynamic opt out of direct-linking even with it on by default (the
 ;; release default now), so the built binary can still redef/bind them at runtime.
 (def ^:redef redef-fn (fn [] :original))

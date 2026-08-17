@@ -103,6 +103,21 @@ if [ "$default_fl" -le "$noop_fl" ]; then
   echo "  FAIL: wp-infer added no fl-ops to the release build (default=$default_fl noop=$noop_fl)"; exit 1
 fi
 
+# The :str stamp on interop targets: app.util/strd-prefix's (.startsWith (str x) …)
+# is unhinted — the target types :str from the str-ret table (per-form inference,
+# no fixpoint needed), so flat.ss carries the inline native and NO
+# record-method-dispatch "startsWith" anywhere. Runtime shape is asserted below
+# via --strd; this is the emit-level proof.
+if ! grep -q 'str-starts-with?' "$out.build/flat.ss"; then
+  echo "  FAIL: str-target .startsWith did not lower to the string native"; exit 1
+fi
+if grep -q 'record-method-dispatch.*startsWith' "$out.build/flat.ss"; then
+  echo "  FAIL: str-target .startsWith still routes through record-method-dispatch"; exit 1
+fi
+if ! grep -q 'str-starts-with?' "$out.noop.build/flat.ss"; then
+  echo "  FAIL: str-target lowering depended on the wp fixpoint (str-ret table is per-form)"; exit 1
+fi
+
 # --no-direct-link opts back out of the release default: the app->app call must
 # NOT lower to a jv$ binding (stays var-routed, dynamically linked).
 if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out.nodl" --no-direct-link >/dev/null 2>&1; then
@@ -131,6 +146,14 @@ got_rd="$(cd / && "$out" --redef 2>&1)"
 if ! printf '%s' "$got_rd" | grep -q '^redef: :patched$'    || ! printf '%s' "$got_rd" | grep -q '^dyn: :bound$'; then
   echo "  FAIL: ^:redef/:dynamic opt-out — want 'redef: :patched' and 'dyn: :bound' lines"
   echo "--- got ----"; echo "$got_rd"; exit 1
+fi
+
+# The :str-stamped interop answers at runtime with the same values the generic
+# dispatch would (the emit-level proof is the flat.ss grep above).
+got_strd="$(cd / && "$out" --strd 2>&1)"
+if ! printf '%s' "$got_strd" | grep -q '^strd: true false 1$'; then
+  echo "  FAIL: :str-stamped interop output — want 'strd: true false 1'"
+  echo "--- got ----"; echo "$got_strd"; exit 1
 fi
 
 # Portable embed: remove the build-time source tree and run from / — the
