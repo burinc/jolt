@@ -189,6 +189,18 @@
       (required/cache-root host {}))
     (throw (ex-info "require-deps did not use Jolt's Gitlibs directory" {}))))
 
+(let [revision "0123456789abcdef0123456789abcdef01234567"
+      base "gist:ingydotnet/f70409675d234aa4f2fe379cd975a4f5/"
+      suffix (required/parse-coordinate (str base "mathy.clj@" revision))
+      slash (required/parse-coordinate (str base revision "/mathy.clj"))]
+  (when-not (= (:identity suffix) (:identity slash))
+    (throw (ex-info "pinned Gist coordinate forms have different identities"
+                    {:suffix suffix :slash slash})))
+  (when-not (= (required/gist-raw-url suffix)
+               (required/gist-raw-url slash))
+    (throw (ex-info "pinned Gist coordinate forms have different raw URLs"
+                    {:suffix suffix :slash slash}))))
+
 (let [caller (ns-name *ns*)
       path (str (System/getProperty "java.io.tmpdir")
                 "/jolt-require-deps-gist.clj")

@@ -62,6 +62,8 @@ Literal dependency vectors need no quote; quoted vectors remain supported for
 compatibility. Maven and Gist coordinates support `:as` and explicit `:refer`
 imports. An optional leading map accepts `:mvn/local-repo` and `:gitlibs/dir`;
 `:cache-dir` remains a compatibility alias for the Gist cache root.
+A pinned Gist file accepts either `gist:<owner>/<id>/<file>@<revision>` or
+`gist:<owner>/<id>/<revision>/<file>`; both forms use the same cache entry.
 The explicit Maven option takes precedence over `JOLT_MAVEN_REPOSITORY`, which
 takes precedence over `GRENADINE_MAVEN_REPOSITORY`. For Gist dependencies,
 `JOLT_GITLIBS_DIR` takes precedence over `GRENADINE_GITLIBS_DIR`, then
