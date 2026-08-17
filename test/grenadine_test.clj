@@ -74,20 +74,16 @@
     (let [raw (@#'deps/effective-pom-deps
                'demo/child {:mvn/version "1"})
           filtered (into {} (@#'deps/filter-deps raw "."))]
-      ;; Clojure itself is pruned — jolt IS Clojure, and putting the artifact's
-      ;; source on the roots would shadow core. Its spec children are NOT pruned:
-      ;; spec.alpha and core.specs.alpha are part of core on neither host, and on
-      ;; the JVM they arrive with the Clojure coordinate. Versions are read off the
-      ;; declared Clojure's own POM; this fixture redefines pom-text and so has no
-      ;; POM for clojure 1.9.0, which exercises the fallback — hence asserting on
-      ;; which libs appear rather than on their versions.
+      ;; Clojure itself is terminal — jolt IS Clojure, and putting the artifact's
+      ;; source on the roots would shadow core. Its transitive subtree is skipped
+      ;; with it; spec libraries are resolved only when explicitly declared.
       (when-not (and (= {:mvn/version "2"} (get filtered 'demo/managed))
                      (nil? (get filtered 'org.clojure/clojure))
-                     (contains? filtered 'org.clojure/spec.alpha)
-                     (contains? filtered 'org.clojure/core.specs.alpha))
+                     (nil? (get filtered 'org.clojure/spec.alpha))
+                     (nil? (get filtered 'org.clojure/core.specs.alpha)))
         (throw
-         (ex-info (str "Jolt did not use Grenadine's effective POM, prune Clojure, "
-                       "or carry Clojure's spec dependencies")
+         (ex-info (str "Jolt did not use Grenadine's effective POM or treat "
+                       "Clojure as a terminal host dependency")
                   {:raw raw :filtered filtered}))))))
 
 ;;;; A POM Grenadine cannot model degrades to the jar's own pom.xml rather than
