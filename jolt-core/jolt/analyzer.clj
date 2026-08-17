@@ -120,9 +120,15 @@
 ;; map) and ^TypeName where TypeName is a defrecord/deftype (its instances are
 ;; tagged :jolt/deftype, not :jolt/type, so a raw get is correct). ^String
 ;; resolves to :str (the :host-call direct string-native path, str-target-type
-;; below). Every other hint (^long, ...) parses and is ignored, as before.
-;; Every :hint consumer equality-checks :struct, so a :str hint is inert to the
-;; struct machinery.
+;; below), and ^clojure.lang.Keyword to :kw (the keyword arm of the same path).
+;; Every other hint (^long, ...) parses and is ignored, as before.
+;;
+;; Both new values are inert to the struct machinery: every consumer that ACTS on
+;; a hint equality-checks :struct (backend_scheme.clj's field-access and 1-arg
+;; lookup sites). The one consumer that does not is passes/inline.clj, which
+;; tests truthiness — but only to copy a hint from an inlined call onto the local
+;; it was bound to, which is propagation, not interpretation, and is what a :str
+;; or :kw hint wants anyway.
 (defn- str-tag? [t]
   (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
     (or (= s "String") (= s "java.lang.String"))))

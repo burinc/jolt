@@ -84,6 +84,21 @@
 ;; Chez-only, guarded at the emit site like the string path. A wrong hint (a
 ;; non-keyword at runtime) fails in the record accessor, the same contract a
 ;; wrong ^String hint has.
+;;
+;; `t` is spliced MORE THAN ONCE by sym, toString and hashCode, so it must be an
+;; expression that is free to re-evaluate. It always is: the analyzer stamps
+;; :target-type only for a tagged SYMBOL, a :hint-carrying local (analyzer.clj's
+;; hints ride on :local nodes), or a literal — so `t` is an identifier or a
+;; constant, never a call. A future stamp source that admits a compound target
+;; has to bind t to a temporary first, or these three arms silently evaluate it
+;; two and three times.
+;;
+;; Note this path is NOT what honeysql's kw->sym reaches, despite being the shape
+;; that motivated it. jolt's reader advertises :bb (reader.ss rdr-features), and
+;; honeysql orders its conditional #?(:bb … :clj (.sym ^Keyword k)) with :bb
+;; first at all three of its .sym sites, so jolt takes the pure-Clojure branch
+;; and never sees the interop. It fires for code that writes .sym unconditionally
+;; or puts :clj first.
 (defn- keyword-direct-emit [m argc t args]
   (let [a0 (first args)]
     (cond
@@ -1902,10 +1917,10 @@
     :the-ns (str "(intern-ns! " (chez-str-lit (:name node)) ")")
      ;; (.method target arg*) -> jolt-host-call for an rt-shimmed method, else
      ;; record-method-dispatch (a reify/record protocol method). A target PROVEN
-     ;; a string (:target-type :str) on the Chez target emits the string native
-     ;; directly (string-direct-emit) — no dispatch walk, no rest-args vector.
-     ;; chez? is bound before t: `target` (the host predicate) must not be
-     ;; shadowed yet when it is called.
+     ;; a string (:target-type :str) or a keyword (:kw) on the Chez target emits
+     ;; that native directly — no dispatch walk, no rest-args vector. The emitted
+     ;; target is bound as `t` rather than `target` so the host predicate
+     ;; `(target)` stays reachable in this scope.
      :host-call (let [m (:method node)
                       chez? (not= :gambit (target))
                       t (emit (:target node))
