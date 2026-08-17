@@ -10,7 +10,8 @@
 ;;   - a fiber is bound to its carrier (an OS thread of the pool) for life;
 ;;     a blocking foreign call or Thread/sleep in a body pins that carrier
 ;;     and strands the fibers queued behind it. Park-capable waits — channel
-;;     ops, deref, jolt.socket IO — are the ones to use inside a body.
+;;     ops, deref, jolt.socket IO, jolt.process subprocess pipe IO — are the
+;;     ones to use inside a body.
 ;;   - spawn conveys the caller's dynamic bindings; *txn* never conveys (a
 ;;     child cannot join the parent's STM transaction).
 ;;   - a body that throws kills its fiber: join rethrows the original error,

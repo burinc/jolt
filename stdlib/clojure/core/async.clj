@@ -503,10 +503,11 @@
 ;;
 ;; What a fiber does NOT get is an OS thread of its own, so a body that blocks
 ;; SOMEWHERE THE RUNTIME DOES NOT KNOW ABOUT pins its carrier for the duration.
-;; Channel ops park, and so does jolt.socket (R8: an EAGAIN registers with the
-;; io-poller and parks). Thread/sleep, a blocking read on a raw fd, and an FFI
-;; call that blocks do not — they hold the carrier's OS thread. Use thread for
-;; those; that is what it is for.
+;; Channel ops park, and so do jolt.socket's reads and writes and jolt.process's
+;; subprocess pipe reads and writes (R8: an EAGAIN registers with the io-poller
+;; and parks). Thread/sleep, a blocking read on a raw fd you opened yourself, and
+;; an FFI call that blocks do not — they hold the carrier's OS thread. Use thread
+;; for those; that is what it is for.
 (defn thread-call
   "Executes f elsewhere, returning a channel that receives f's result then closes.
   workload says what f does and picks the carrier: :io runs f on a fiber
