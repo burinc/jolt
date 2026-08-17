@@ -42,6 +42,29 @@ Read it before assuming a JVM behaviour holds.
 
 Machine-readable index for coding agents: [`llms.txt`](llms.txt).
 
+Jolt supplies `org.clojure/clojure` and `org.clojure/clojurescript` itself, so
+those libraries are terminal when encountered transitively: their artifacts
+and dependency trees are not acquired. Explicitly declared
+`org.clojure/spec.alpha` and `org.clojure/core.specs.alpha` dependencies remain
+ordinary dependencies.
+
+Code can acquire and import dependencies while it runs with the portable
+`clojurestar.deps/require-deps` macro:
+
+```clojure
+(require '[clojurestar.deps :refer [require-deps]])
+
+(require-deps
+ ["mvn:dev.weavejester/medley@1.10.0/medley.core" :as medley])
+```
+
+Literal dependency vectors need no quote; quoted vectors remain supported for
+compatibility. Maven and Gist coordinates support `:as` and explicit `:refer`
+imports. An optional leading map accepts `:mvn/local-repo` and `:cache-dir`.
+The explicit Maven option takes precedence over `JOLT_MAVEN_REPOSITORY`, which
+takes precedence over `GRENADINE_MAVEN_REPOSITORY`. For Gist dependencies,
+`JOLT_GITLIBS_CACHE` takes precedence over `GRENADINE_GITLIBS_CACHE`.
+
 ## Install
 
 Prebuilt binaries are self-contained — runtime, compiler, and stdlib in one
