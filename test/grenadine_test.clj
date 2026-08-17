@@ -156,6 +156,18 @@
                      (resolve 'resolve-graph))
         (throw (ex-info "require-deps did not apply :as and :refer" {}))))))
 
+(let [repository-dir @#'deps/m2-repo-dir]
+  (when-not
+   (= "/project/explicit"
+      (repository-dir "/project/explicit" "environment" "legacy" "/home/user"
+                      "/project"))
+    (throw (ex-info "explicit Maven repository did not take precedence" {})))
+  (when-not
+   (= "/project/environment"
+      (repository-dir nil "environment" "legacy" "/home/user" "/project"))
+    (throw (ex-info "relative Grenadine repository did not use the project directory"
+                    {}))))
+
 (let [caller (ns-name *ns*)
       path (str (System/getProperty "java.io.tmpdir")
                 "/jolt-require-deps-gist.clj")

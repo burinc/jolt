@@ -385,13 +385,17 @@
 (defn- m2-repo-dir
   "The local Maven repository dir. An explicit :mvn/local-repo wins, followed
   by Grenadine's environment setting, Jolt's legacy override, then the standard
-  ~/.m2/repository."
+  ~/.m2/repository. Relative environment overrides resolve against JOLT_PWD,
+  matching :mvn/local-repo and every other project-relative path."
   ([] (m2-repo-dir *mvn-local-repo*
                    (getenv "GRENADINE_LOCAL_REPOSITORY")
                    (getenv "JOLT_LOCAL_REPO")
-                   (getenv "HOME")))
-  ([cfg grenadine-override jolt-override home]
-   (or cfg grenadine-override jolt-override
+                   (getenv "HOME")
+                   (or (getenv "JOLT_PWD") ".")))
+  ([cfg grenadine-override jolt-override home base]
+   (or cfg
+       (when grenadine-override (abspath base grenadine-override))
+       (when jolt-override (abspath base jolt-override))
        (str (or home ".") "/.m2/repository"))))
 
 (def ^:private default-mvn-repos
