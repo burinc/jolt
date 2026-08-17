@@ -87,18 +87,27 @@
 (define proc-F-SETFL 4)
 (define proc-O-NONBLOCK (if (eq? (sa-os-family) 'macos) #x4 #x800))
 
-;; Deliberately unprefixed (no `proc-` prefix, unlike every other definition
-;; in this file): a bridge point meant to be reachable beyond this file, not
-;; a private proc-* helper. Don't rename it into collision with the
-;; naming-shadow hazard this file's own header documents (line ~40-42).
-(define (set-nonblocking! fd)
-  (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
-    ;; A negative flags value means F_GETFL itself failed -- don't hand that
-    ;; straight to F_SETFL: (fxior -1 proc-O-NONBLOCK) is still negative, and
-    ;; the kernel would mask it down, silently leaving the fd blocking with
-    ;; no diagnostic that anything went wrong.
-    (when (>= flags 0)
-      (proc-fcntl-set fd proc-F-SETFL (fxior flags proc-O-NONBLOCK)))))
+;; Nothing here happens without a working fcntl and a readable errno: a pipe
+;; set non-blocking whose EAGAIN cannot be recognised reads as EOF instead
+;; (the (else 0) branch in proc-fd-input-port), which is worse than a blocking
+;; pipe. So the whole R8 extension is gated on the three bindings, and the
+;; degradation when one is missing is "no parking" — the pipes stay blocking
+;; and EAGAIN never arrives. Deliberately NOT folded into
+;; proc-spawn-fd-ok?: that gate decides posix_spawn vs Chez's fork, and the
+;; fork path leaves SIGINT at SIG_IGN in the child (see the comment above
+;; proc-spawn-fd-mutex). Correct child signal dispositions are not worth
+;; trading for O_NONBLOCK.
+(define proc-nonblock-ok? (and proc-fcntl-get proc-fcntl-set proc-errno-loc #t))
+
+(define (proc-set-nonblocking! fd)
+  (when proc-nonblock-ok?
+    (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
+      ;; A negative flags value means F_GETFL itself failed -- don't hand that
+      ;; straight to F_SETFL: (fxior -1 proc-O-NONBLOCK) is still negative, and
+      ;; the kernel would mask it down, silently leaving the fd blocking with
+      ;; no diagnostic that anything went wrong.
+      (when (>= flags 0)
+        (proc-fcntl-set fd proc-F-SETFL (fxior flags proc-O-NONBLOCK))))))
 
 ;; Bridge to jolt.io-poller/wait-ready: var-deref never throws for a
 ;; missing var -- jolt-var auto-vivifies a jolt-var-unbound placeholder
@@ -109,16 +118,13 @@
 ;; EAGAIN branches in proc-fd-input-port/proc-fd-output-port below --
 ;; a bare 0-byte return there would misread as EOF, since the pipe fd
 ;; is genuinely non-blocking by then).
-;; poller-wait-ready and poller-forget! below are ALSO deliberately
-;; unprefixed, same reason as set-nonblocking! above: bridge points, not
-;; private proc-* helpers.
-(define (poller-wait-ready fd filt-kw)
+(define (proc-poller-wait-ready fd filt-kw)
   (let ((f (var-deref "jolt.io-poller" "wait-ready")))
     (if (jolt-var-unbound? f)
         #f
         (begin (jolt-invoke2 f fd filt-kw) #t))))
 
-;; Bridge to jolt.io-poller/forget!, same shape as poller-wait-ready above.
+;; Bridge to jolt.io-poller/forget!, same shape as proc-poller-wait-ready above.
 ;; A closed fd is auto-removed from the kernel's kqueue/epoll set, so no
 ;; event is ever coming for a fiber still parked on it -- without telling
 ;; the poller to drop its registration, that fiber sleeps forever, and a
@@ -127,9 +133,9 @@
 ;; REUSED fd number belonging to an unrelated later socket. Mirrors
 ;; jolt.socket's socket-close! (stdlib/jolt/socket.clj), which does the
 ;; identical close-then-forget for the same reason. Same unbound-var guard
-;; as poller-wait-ready: when jolt.io-poller was never loaded, forget! has
+;; as proc-poller-wait-ready: when jolt.io-poller was never loaded, forget! has
 ;; nothing to forget and this is a no-op.
-(define (poller-forget! fd)
+(define (proc-poller-forget! fd)
   (let ((f (var-deref "jolt.io-poller" "forget!")))
     (unless (jolt-var-unbound? f) (jolt-invoke1 f fd))))
 
@@ -411,10 +417,13 @@
 (define proc-c-read  (jolt-foreign-proc-blocking "read"  '(int void* size_t) 'ssize_t))
 (define proc-c-write (jolt-foreign-proc-blocking "write" '(int void* size_t) 'ssize_t))
 
+;; What posix_spawn-with-pipes needs, and nothing more. The R8 fiber-parking
+;; extension's own bindings (fcntl, errno) are gated separately by
+;; proc-nonblock-ok? above: losing parking is a performance story, losing this
+;; path means falling back to Chez's fork with SIGINT ignored in the child.
 (define proc-spawn-fd-ok?
   (and proc-c-pipe proc-c-close proc-fa-init proc-fa-dup2 proc-fa-close
-       proc-fa-destroy proc-c-spawn proc-c-read proc-c-write
-       proc-fcntl-get proc-fcntl-set proc-errno-loc #t))
+       proc-fa-destroy proc-c-spawn proc-c-read proc-c-write #t))
 
 ;; marshal a string list into a NULL-terminated char**; returns (array . cstrs)
 ;; so the caller can free every allocation once posix_spawn has copied them.
@@ -445,7 +454,7 @@
 ;; current fiber (or blocks this thread) via jolt.io-poller when it's loaded
 ;; -- symmetric on both sides below: proc-fd-input-port waits on :read,
 ;; proc-fd-output-port waits on :write, over the same mk-pipe-created
-;; non-blocking fd and the same poller-wait-ready bridge. When no poller is
+;; non-blocking fd and the same proc-poller-wait-ready bridge. When no poller is
 ;; loaded, EAGAIN clears O_NONBLOCK on this fd (fd is genuinely non-blocking
 ;; now per mk-pipe above, so a no-poller EAGAIN is a live "not ready yet"
 ;; signal, not a real failure) and falls through to a real blocking
@@ -482,13 +491,13 @@
 ;; So the close proc sets closed? FIRST, before it frees, closes, or forgets,
 ;; and the retry loop tests it at the TOP of EVERY iteration -- the first one
 ;; included, not just the one after a park. The ordering is what makes that test
-;; sound rather than hopeful: set-box! happens before poller-forget!, which
+;; sound rather than hopeful: set-box! happens before proc-poller-forget!, which
 ;; reaches sa-fiber-resume, which takes and releases the carrier's mutex to
 ;; enqueue the fiber; the carrier thread takes that SAME mutex in
 ;; jolt-fiber-dequeue! before it can run the fiber at all. A release/acquire
 ;; pair on one mutex, so the #t is published to the woken fiber -- it cannot
 ;; observe a stale #f, and it cannot have cached the read across the park, since
-;; the park sits behind poller-wait-ready's opaque var-deref'd call. Same
+;; the park sits behind proc-poller-wait-ready's opaque var-deref'd call. Same
 ;; box/set-box!/unbox shape concurrency.ss uses for its own cross-thread flag
 ;; (agents-shutdown?).
 ;;
@@ -502,7 +511,7 @@
 ;; flag could be set, so no flag can help it; it is a pre-existing hazard of
 ;; closing a port other threads are actively using, not something this adds.
 ;;
-;; Also NOT covered: a fiber that has decided to call poller-wait-ready but
+;; Also NOT covered: a fiber that has decided to call proc-poller-wait-ready but
 ;; has not yet registered when close runs -- forget! finds nothing to drop,
 ;; then the fiber registers on an already-dead fd. That is a strand (a hang),
 ;; not a use-after-free; closing it needs coordination on the jolt.io-poller
@@ -518,7 +527,7 @@
         (let ((want (min n proc-fd-buf-size)))
           (let retry ()
             ;; Top of EVERY iteration, first one included: a fiber woken by the
-            ;; close proc's poller-forget! resumes HERE, and buf is freed and fd
+            ;; close proc's proc-poller-forget! resumes HERE, and buf is freed and fd
             ;; closed (possibly reused) by then. Read as EOF without touching
             ;; either -- same answer the (else 0) branch below would give for a
             ;; closed fd's EBADF, reached without the syscall.
@@ -535,7 +544,7 @@
                     ((= got 0) 0)
                     ((= (proc-errno) proc-EINTR) (retry))
                     ((= (proc-errno) proc-EAGAIN)
-                     (if (poller-wait-ready fd (jolt-keyword "read"))
+                     (if (proc-poller-wait-ready fd (jolt-keyword "read"))
                          (retry)
                          (begin
                            (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
@@ -547,7 +556,7 @@
       ;; on the far side of the carrier-mutex handoff every woken fiber crosses.
       (lambda ()
         (set-box! closed? #t)
-        (sa-foreign-free buf) (proc-c-close fd) (poller-forget! fd)))))
+        (sa-foreign-free buf) (proc-c-close fd) (proc-poller-forget! fd)))))
 (define (proc-fd-output-port fd)
   (let ((buf (sa-foreign-alloc proc-fd-buf-size))
         (closed? (box #f)))
@@ -572,7 +581,7 @@
                     ((>= wrote 0) wrote)
                     ((= (proc-errno) proc-EINTR) (retry))
                     ((= (proc-errno) proc-EAGAIN)
-                     (if (poller-wait-ready fd (jolt-keyword "write"))
+                     (if (proc-poller-wait-ready fd (jolt-keyword "write"))
                          (retry)
                          (begin
                            (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
@@ -584,7 +593,7 @@
       ;; on the far side of the carrier-mutex handoff every woken fiber crosses.
       (lambda ()
         (set-box! closed? #t)
-        (sa-foreign-free buf) (proc-c-close fd) (poller-forget! fd)))))
+        (sa-foreign-free buf) (proc-c-close fd) (proc-poller-forget! fd)))))
 
 ;; What the API hands back for a stream that was INHERITED: the JVM's null
 ;; streams. Reads are at EOF from the start; writes are accepted and dropped.
@@ -639,8 +648,8 @@
       (if (= 0 (proc-c-pipe fds))
           (let ((p (cons (sa-foreign-ref 'int fds 0) (sa-foreign-ref 'int fds 4))))
             (sa-foreign-free fds)
-            (when nonblocking-read? (set-nonblocking! (car p)))
-            (when nonblocking-write? (set-nonblocking! (cdr p)))
+            (when nonblocking-read? (proc-set-nonblocking! (car p)))
+            (when nonblocking-write? (proc-set-nonblocking! (cdr p)))
             p)
           (begin (sa-foreign-free fds)
                  (throw-jvm (quote java.io.IOException) "pipe: cannot allocate")))))
