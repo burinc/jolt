@@ -58,6 +58,13 @@
 ;;      the write-side twin of check 1, closing the permanent-gate coverage
 ;;      gap the write path (EAGAIN branch + fcntl fallback, symmetric with the
 ;;      read side) had until now.
+;;   9. closing a pipe-WRITE port while a fiber is parked on it makes the woken
+;;      fiber take the port's closed? short-circuit, rather than re-running
+;;      proc-c-write against a fd the close proc has already closed (and that
+;;      the kernel may already have reassigned to an unrelated
+;;      pipe/socket/open) with a buf it has already free()d. Check 7's twin one
+;;      level deeper: check 7 asserts the woken fiber is not STRANDED, this one
+;;      asserts WHICH path it takes once woken.
 ;;
 ;; Watchdog: the whole workload (all 6 checks) runs on a forked thread; this
 ;; script's main thread does nothing but watch a hard-coded deadline. A wedge
@@ -127,8 +134,8 @@
       (let ((p (open-output-string))) (display-condition e p) (get-output-string p))
       (format "~s" e)))
 
-;; A plain, dependency-free substring search — used once, on check 6's captured
-;; subprocess stdout.
+;; A plain, dependency-free substring search — used on check 6's captured
+;; subprocess stdout and, since check 9, on captured condition messages too.
 (define (string-contains-substr? s sub)
   (let ((ls (string-length s)) (lsub (string-length sub)))
     (let loop ((i 0))
@@ -171,7 +178,9 @@
        (np-out #f) (np-err #f) (np-exit #f)
        (read-thunk-7 #f) (f7 #f) (f7-parked #f) (f7-unparked #f) (f7-result #f)
        (r8-payload-len #f) (write-thunk-8 #f) (f8w #f) (f8sib #f)
-       (f8w-parked #f) (f8sib-done #f) (r8-total #f) (f8w-done #f))
+       (f8w-parked #f) (f8sib-done #f) (r8-total #f) (f8w-done #f)
+       (r9-payload-len #f) (write-thunk-9 #f) (f9 #f) (f9-parked #f)
+       (f9-done #f) (f9-result #f))
   (at! "requiring jolt.process + jolt.io-poller")
   (ev "(require 'jolt.process)")
   ;; Checks 1-5 need REAL parking, which needs jolt.io-poller genuinely
@@ -416,6 +425,14 @@
     (wait-until (lambda () (eq? (jolt-fiber-state f7) 'done)) 5.0 "7. the unparked read finished"))
   (ok "7. the fiber finished cleanly (closed-fd read reads as EOF, not a hang or a crash)"
       (and f7-result (string? (jolt-fiber-result f7))))
+  ;; Pin the read side's closed-case convention: EOF, i.e. an empty payload.
+  ;; Note this cannot tell the two ways of GETTING there apart, and no
+  ;; value-based assertion can: the read side's closed? short-circuit and its
+  ;; "any other errno -> 0" branch both answer 0/EOF by construction, so they
+  ;; are indistinguishable to a caller. Check 9 asserts the shared mechanism on
+  ;; the write side, where the two paths raise distinguishable conditions.
+  (ok "7. the closed-port read reported EOF (empty payload), not partial or garbage data"
+      (and f7-result (equal? "" (jolt-fiber-result f7))))
   (ev "(jolt.process/destroy p7)")
   (ev "(deref p7 5000 :reap-timeout)")
 
@@ -458,6 +475,54 @@
       (and f8w-done (eqv? (jolt-fiber-result f8w) r8-payload-len)))
   (ok "8. the drain side received the full payload byte-for-byte" (eqv? r8-total r8-payload-len))
   (ev "(deref p8 5000 :reap-timeout)")
+
+  ;; --- 9. a close under a PARKED write short-circuits on the closed? flag ---
+  (at! "9. close-while-parked-write (closed short-circuit)")
+  (printf "\n== 9. closing a pipe-write port while a fiber is parked on it takes the closed short-circuit ==\n")
+  ;; Check 8's fill-the-pipe setup, minus the drain: cat's own stdout is never
+  ;; read here, so cat stops consuming stdin and the write stays parked until
+  ;; the close below wakes it. What this adds over check 7 is WHICH path the
+  ;; woken fiber then takes, and the two candidates are told apart by the
+  ;; condition each raises:
+  ;;   "write to closed pipe"  -- the closed? test at the top of the retry loop
+  ;;       fired and proc-c-write was never called. The fix's own path.
+  ;;   "write to child failed" -- the retry re-ran proc-c-write against a fd the
+  ;;       close proc had already closed (and that the kernel is free to hand
+  ;;       straight to an unrelated pipe/socket/open, since POSIX reuses the
+  ;;       lowest free number) passing a buf the close proc had already
+  ;;       free()d. That is the use-after-free the flag exists to prevent, and
+  ;;       it is exactly what this check observes when the flag is removed.
+  ;; So this is a direct assertion on the mechanism, not on "nothing crashed" —
+  ;; and it needs no timing race to be deterministic, because the fiber cannot
+  ;; run at all until the close proc has already set the flag and woken it.
+  (set! r9-payload-len (* 2 1024 1024))
+  (ev "(def p9 (jolt.process/process [\"cat\"]))")
+  (ev "(def p9-in (:in p9))")
+  (ev (string-append "(def p9-payload (byte-array " (number->string r9-payload-len) "))"))
+  (set! write-thunk-9
+    (ev "(fn [] (.write p9-in p9-payload 0 (alength p9-payload)) (.flush p9-in) :never-raised)"))
+  ;; guard inside the fiber thunk so the raise becomes this fiber's RESULT: an
+  ;; unguarded raise ends the fiber through jolt-fiber-dead! instead, and the
+  ;; message is the whole point of the check.
+  (set! f9 (sa-fiber-spawn (lambda () (guard (e (#t (render-condition e))) (write-thunk-9)))))
+  (set! f9-parked
+    (wait-until (lambda () (eq? (jolt-fiber-state f9) 'parked)) 15.0
+                "9. the pipe-write fiber parked (the pipe filled)"))
+  (ok "9. the oversized write parked the fiber once the pipe filled" f9-parked)
+  (ev "(.close p9-in)")
+  (set! f9-done
+    (wait-until (lambda () (eq? (jolt-fiber-state f9) 'done)) 10.0
+                "9. the parked write left 'parked after the port closed"))
+  (ok "9. closing the port unparked the parked write within the bound" f9-done)
+  (set! f9-result (and f9-done (jolt-fiber-result f9)))
+  (ok "9. the woken retry took the CLOSED short-circuit (proc-c-write never re-ran on the closed fd)"
+      (and (string? f9-result) (string-contains-substr? f9-result "write to closed pipe")))
+  (ok "9. and did NOT reach the real-write error path (no syscall on the freed buf / closed fd)"
+      (and (string? f9-result) (not (string-contains-substr? f9-result "write to child failed"))))
+  (unless (and (string? f9-result) (string-contains-substr? f9-result "write to closed pipe"))
+    (printf "  check 9 fiber result: ~s\n" f9-result))
+  (ev "(jolt.process/destroy p9)")
+  (ev "(deref p9 5000 :reap-timeout)")
 
   (printf "\nfibers-process-io: ~a checks, ~a failures\n" total fails)
   (set-box! outcome (if (zero? fails) 'ok 'failed))))

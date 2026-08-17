@@ -458,36 +458,99 @@
 ;; the write side raises (child gone, `error 'process "write to child
 ;; failed"`). A short write returns its count and Chez's port machinery
 ;; re-calls for the rest.
+;;
+;; The `closed?` box each port allocates alongside its buf is what makes the
+;; close proc safe against a fiber PARKED in that retry loop. Close is three
+;; steps -- free buf, close fd, forget the fd -- and the third wakes any parked
+;; waiter through jolt.io-poller. That wake is ASYNCHRONOUS: jolt.host's
+;; fiber-resume -> sa-fiber-resume (host/chez/fibers.ss) only flips the fiber to
+;; 'ready and enqueues it on its carrier's run queue; the fiber's continuation
+;; runs later, on the carrier thread. Between the wake and that continuation
+;; there is a real scheduling gap, and by then buf is already free()d
+;; (sa-foreign-free is a bare foreign-free -- no pooling, no quarantine) and fd
+;; is already closed. A closed fd number is immediately eligible for reuse by
+;; ANY concurrent pipe/socket/open/accept anywhere in the process -- POSIX hands
+;; out the lowest free number, and jolt.process exists to support many
+;; concurrent spawns -- so without the flag the woken fiber's (retry) calls
+;; proc-c-read/proc-c-write with a fd that is valid again but belongs to
+;; something else entirely, handing the kernel a pointer into freed memory. That
+;; stale retry could also re-register the reused fd with jolt.io-poller,
+;; cross-talking with its new owner's registration. proc-spawn-fd-mutex does not
+;; help: it covers only the pipe()-through-posix_spawn sequence, not close and
+;; not fd allocation in general.
+;;
+;; So the close proc sets closed? FIRST, before it frees, closes, or forgets,
+;; and the retry loop tests it at the TOP of EVERY iteration -- the first one
+;; included, not just the one after a park. The ordering is what makes that test
+;; sound rather than hopeful: set-box! happens before poller-forget!, which
+;; reaches sa-fiber-resume, which takes and releases the carrier's mutex to
+;; enqueue the fiber; the carrier thread takes that SAME mutex in
+;; jolt-fiber-dequeue! before it can run the fiber at all. A release/acquire
+;; pair on one mutex, so the #t is published to the woken fiber -- it cannot
+;; observe a stale #f, and it cannot have cached the read across the park, since
+;; the park sits behind poller-wait-ready's opaque var-deref'd call. Same
+;; box/set-box!/unbox shape concurrency.ss uses for its own cross-thread flag
+;; (agents-shutdown?).
+;;
+;; Each side short-circuits the way it already reports a dead pipe: the read
+;; side returns 0 (the `(else 0)` EOF convention below), the write side raises
+;; (the `error 'process` convention below) -- with its own message, so a port
+;; closed under a parked write is not misreported as a failing child.
+;;
+;; Deliberately NOT covered: a close racing a syscall already IN FLIGHT on
+;; another thread rather than parked. That caller read fd and buf before any
+;; flag could be set, so no flag can help it; it is a pre-existing hazard of
+;; closing a port other threads are actively using, not something this adds.
+;;
+;; Also NOT covered: a fiber that has decided to call poller-wait-ready but
+;; has not yet registered when close runs -- forget! finds nothing to drop,
+;; then the fiber registers on an already-dead fd. That is a strand (a hang),
+;; not a use-after-free; closing it needs coordination on the jolt.io-poller
+;; side (a register/forget race), left out of scope here. Pre-existing,
+;; not introduced by this fix.
 (define proc-fd-buf-size 32768)
 (define (proc-fd-input-port fd)
-  (let ((buf (sa-foreign-alloc proc-fd-buf-size)))
+  (let ((buf (sa-foreign-alloc proc-fd-buf-size))
+        (closed? (box #f)))
     (make-custom-binary-input-port
       (string-append "process-fd-" (number->string fd))
       (lambda (bv start n)
         (let ((want (min n proc-fd-buf-size)))
           (let retry ()
-            (let ((got (proc-c-read fd buf want)))
-              (cond
-                ((> got 0)
-                 (let loop ((i 0))
-                   (when (< i got)
-                     (bytevector-u8-set! bv (+ start i) (sa-foreign-ref 'unsigned-8 buf i))
-                     (loop (+ i 1))))
-                 got)
-                ((= got 0) 0)
-                ((= (proc-errno) proc-EINTR) (retry))
-                ((= (proc-errno) proc-EAGAIN)
-                 (if (poller-wait-ready fd (jolt-keyword "read"))
-                     (retry)
-                     (begin
-                       (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
-                         (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
-                       (retry))))
-                (else 0))))))
+            ;; Top of EVERY iteration, first one included: a fiber woken by the
+            ;; close proc's poller-forget! resumes HERE, and buf is freed and fd
+            ;; closed (possibly reused) by then. Read as EOF without touching
+            ;; either -- same answer the (else 0) branch below would give for a
+            ;; closed fd's EBADF, reached without the syscall.
+            (if (unbox closed?)
+                0
+                (let ((got (proc-c-read fd buf want)))
+                  (cond
+                    ((> got 0)
+                     (let loop ((i 0))
+                       (when (< i got)
+                         (bytevector-u8-set! bv (+ start i) (sa-foreign-ref 'unsigned-8 buf i))
+                         (loop (+ i 1))))
+                     got)
+                    ((= got 0) 0)
+                    ((= (proc-errno) proc-EINTR) (retry))
+                    ((= (proc-errno) proc-EAGAIN)
+                     (if (poller-wait-ready fd (jolt-keyword "read"))
+                         (retry)
+                         (begin
+                           (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
+                             (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
+                           (retry))))
+                    (else 0)))))))
       #f #f
-      (lambda () (sa-foreign-free buf) (proc-c-close fd) (poller-forget! fd)))))
+      ;; closed? goes up BEFORE the free/close/forget below, so it is already #t
+      ;; on the far side of the carrier-mutex handoff every woken fiber crosses.
+      (lambda ()
+        (set-box! closed? #t)
+        (sa-foreign-free buf) (proc-c-close fd) (poller-forget! fd)))))
 (define (proc-fd-output-port fd)
-  (let ((buf (sa-foreign-alloc proc-fd-buf-size)))
+  (let ((buf (sa-foreign-alloc proc-fd-buf-size))
+        (closed? (box #f)))
     (make-custom-binary-output-port
       (string-append "process-fd-" (number->string fd))
       (lambda (bv start n)
@@ -497,20 +560,31 @@
               (sa-foreign-set! 'unsigned-8 buf i (bytevector-u8-ref bv (+ start i)))
               (loop (+ i 1))))
           (let retry ()
-            (let ((wrote (proc-c-write fd buf want)))
-              (cond
-                ((>= wrote 0) wrote)
-                ((= (proc-errno) proc-EINTR) (retry))
-                ((= (proc-errno) proc-EAGAIN)
-                 (if (poller-wait-ready fd (jolt-keyword "write"))
-                     (retry)
-                     (begin
-                       (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
-                         (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
-                       (retry))))
-                (else (error 'process "write to child failed" fd)))))))
+            ;; Top of EVERY iteration, first one included -- the read side's
+            ;; twin, and the branch a fiber woken by the close proc lands on.
+            ;; Raises rather than returning a count, matching the (else ...)
+            ;; convention below; its own message because the child is fine here,
+            ;; the port under this write is not.
+            (if (unbox closed?)
+                (error 'process "write to closed pipe" fd)
+                (let ((wrote (proc-c-write fd buf want)))
+                  (cond
+                    ((>= wrote 0) wrote)
+                    ((= (proc-errno) proc-EINTR) (retry))
+                    ((= (proc-errno) proc-EAGAIN)
+                     (if (poller-wait-ready fd (jolt-keyword "write"))
+                         (retry)
+                         (begin
+                           (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
+                             (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
+                           (retry))))
+                    (else (error 'process "write to child failed" fd))))))))
       #f #f
-      (lambda () (sa-foreign-free buf) (proc-c-close fd) (poller-forget! fd)))))
+      ;; closed? goes up BEFORE the free/close/forget below, so it is already #t
+      ;; on the far side of the carrier-mutex handoff every woken fiber crosses.
+      (lambda ()
+        (set-box! closed? #t)
+        (sa-foreign-free buf) (proc-c-close fd) (poller-forget! fd)))))
 
 ;; What the API hands back for a stream that was INHERITED: the JVM's null
 ;; streams. Reads are at EOF from the start; writes are accepted and dropped.
