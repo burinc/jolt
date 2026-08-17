@@ -224,6 +224,30 @@
     (finally
       (.delete (java.io.File. path)))))
 
+(let [caller (ns-name *ns*)
+      path (str (System/getProperty "java.io.tmpdir")
+                "/jolt-require-deps-github.clj")
+      source "(ns require-deps-github-fixture)\n(def value 42)\n"
+      coordinate
+      (required/parse-coordinate
+       "github:fixture/library/blob/0123456789abcdef0123456789abcdef01234567/src/github_fixture.clj")]
+  (spit path source)
+  (try
+    (with-redefs-fn
+      {(var required/acquire-github!)
+       (fn [_host _options _coordinate]
+         {:path path :source source})}
+      (fn []
+        (deps/prepare-required! coordinate {})
+        (when-not (= caller (ns-name *ns*))
+          (throw (ex-info "require-deps leaked the GitHub namespace"
+                          {:expected caller :actual (ns-name *ns*)})))
+        (when-not (= 42 @(resolve 'require-deps-github-fixture/value))
+          (throw (ex-info "require-deps did not load the GitHub namespace"
+                          {})))))
+    (finally
+      (.delete (java.io.File. path)))))
+
 ;; ...and a degraded lib still reports whatever pom.xml its jar carries.
 (let [pom (str (System/getProperty "java.io.tmpdir") "/jolt-grenadine-fallback.xml")]
   (spit pom "<project><dependencies>

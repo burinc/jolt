@@ -59,15 +59,20 @@ Code can acquire and import dependencies while it runs with the portable
 ```
 
 Literal dependency vectors need no quote; quoted vectors remain supported for
-compatibility. Maven and Gist coordinates support `:as` and explicit `:refer`
+compatibility. Maven, Gist, and GitHub source-file coordinates support `:as` and explicit `:refer`
 imports. An optional leading map accepts `:mvn/local-repo` and `:gitlibs/dir`;
-`:cache-dir` remains a compatibility alias for the Gist cache root.
+`:cache-dir` remains a compatibility alias for the source-file cache root.
 A pinned Gist file accepts either `gist:<owner>/<id>/<file>@<revision>` or
 `gist:<owner>/<id>/<revision>/<file>`; both forms use the same cache entry.
+A GitHub source file accepts either
+`github:<owner>/<repo>/<ref>/<path.clj|cljc>` or the equivalent
+`github:<owner>/<repo>/blob/<ref>/<path.clj|cljc>` form. Refs occupy one path
+segment; full commit SHAs reuse persistent cache while named refs refresh in a
+new process. Selected files must be self-contained and begin with an `ns` form.
 The explicit Maven option takes precedence over `JOLT_MAVEN_REPOSITORY`, which
-takes precedence over `GRENADINE_MAVEN_REPOSITORY`. For Gist dependencies,
+takes precedence over `GRENADINE_MAVEN_REPOSITORY`. For Gist and GitHub source dependencies,
 `JOLT_GITLIBS_DIR` takes precedence over `GRENADINE_GITLIBS_DIR`, then
-`GITLIBS`; Gist source lives under `gist/` in that effective root.
+`GITLIBS`; source lives under `gist/` or `github/` in that effective root.
 
 ## Install
 
