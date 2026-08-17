@@ -183,6 +183,12 @@
     (throw (ex-info "relative Grenadine repository did not use the project directory"
                     {}))))
 
+(let [host (@#'deps/required-host)]
+  (when-not
+   (= ((:gitlibs-dir host))
+      (required/cache-root host {}))
+    (throw (ex-info "require-deps did not use Jolt's Gitlibs directory" {}))))
+
 (let [caller (ns-name *ns*)
       path (str (System/getProperty "java.io.tmpdir")
                 "/jolt-require-deps-gist.clj")

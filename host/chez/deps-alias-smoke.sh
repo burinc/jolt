@@ -462,7 +462,7 @@ cat > "$tmp/gitproj/deps.edn" <<EOF
  :deps {local/gitdep {:git/url "file://$tmp/gitrepo" :git/tag "v1.0" :git/sha "$short"}}}
 EOF
 check ":git/tag + short sha resolves" "git dep: tagged" \
-      "$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_CACHE="$tmp/gitlibs" "$JOLT" run -m gapp 2>&1 | tail -1)"
+      "$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_DIR="$tmp/gitlibs" "$JOLT" run -m gapp 2>&1 | tail -1)"
 
 # An annotated tag carries two shas: the tag object's own, and the commit it
 # peels to. `git ls-remote` prints the tag object for refs/tags/X, so that is
@@ -479,7 +479,7 @@ cat > "$tmp/gitproj/deps.edn" <<EOF
  :deps {local/gitdep {:git/url "file://$tmp/gitrepo" :git/tag "v1.0" :git/sha "$tagobj"}}}
 EOF
 check ":git/tag + annotated tag object sha resolves" "git dep: tagged" \
-      "$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_CACHE="$tmp/gitlibs-tagobj" "$JOLT" run -m gapp 2>&1 | tail -1)"
+      "$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_DIR="$tmp/gitlibs-tagobj" "$JOLT" run -m gapp 2>&1 | tail -1)"
 
 # The legacy tools.deps spellings, :sha and :tag, still appear in deps.edn files
 # in the wild — malli's spec-alpha2 dependency is written {:git/url … :sha …} —
@@ -491,13 +491,13 @@ cat > "$tmp/gitproj/deps.edn" <<EOF
  :deps {local/gitdep {:git/url "file://$tmp/gitrepo" :sha "$legacy_sha"}}}
 EOF
 check "the legacy :sha spelling resolves" "git dep: tagged" \
-      "$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_CACHE="$tmp/gitlibs-legacy" "$JOLT" run -m gapp 2>&1 | tail -1)"
+      "$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_DIR="$tmp/gitlibs-legacy" "$JOLT" run -m gapp 2>&1 | tail -1)"
 cat > "$tmp/gitproj/deps.edn" <<EOF
 {:paths ["src"]
  :deps {local/gitdep {:git/url "file://$tmp/gitrepo" :tag "v1.0" :sha "$short"}}}
 EOF
 check "the legacy :tag + :sha pair resolves" "git dep: tagged" \
-      "$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_CACHE="$tmp/gitlibs-legacy2" "$JOLT" run -m gapp 2>&1 | tail -1)"
+      "$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_DIR="$tmp/gitlibs-legacy2" "$JOLT" run -m gapp 2>&1 | tail -1)"
 
 # and not off a stale tag cache: an older jolt recorded only the commit, so a
 # one-token cache file must be re-resolved rather than trusted — otherwise the
@@ -512,12 +512,12 @@ stalesan="$(printf '%s' "file://$tmp/gitrepo" | sed 's/[^A-Za-z0-9.-]/_/g')"
 mkdir -p "$tmp/gitlibs-stale/tags/$stalesan"
 git -C "$tmp/gitrepo" rev-parse "v1.0^{}" > "$tmp/gitlibs-stale/tags/$stalesan/v1.0"
 check "a legacy one-token tag cache is re-resolved" "git dep: tagged" \
-      "$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_CACHE="$tmp/gitlibs-stale" "$JOLT" run -m gapp 2>&1 | tail -1)"
+      "$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_DIR="$tmp/gitlibs-stale" "$JOLT" run -m gapp 2>&1 | tail -1)"
 cat > "$tmp/gitproj/deps.edn" <<EOF
 {:paths ["src"]
  :deps {local/gitdep {:git/url "file://$tmp/gitrepo" :git/tag "v1.0" :git/sha "deadbee"}}}
 EOF
-out="$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_CACHE="$tmp/gitlibs2" "$JOLT" run -m gapp 2>&1)"
+out="$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_DIR="$tmp/gitlibs2" "$JOLT" run -m gapp 2>&1)"
 case "$out" in
   *"does not match tag"*) check "short sha not matching the tag errors" ok ok ;;
   *) check "short sha not matching the tag errors" "sha/tag mismatch error" "$(printf '%s' "$out" | head -1)" ;;
@@ -533,7 +533,7 @@ cat > "$tmp/gitproj/deps.edn" <<EOF
 {:paths ["src"]
  :deps {local/gitdep {:git/url "file://$tmp/gitrepo" :git/tag "v9.9" :git/sha "$short"}}}
 EOF
-out="$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_CACHE="$tmp/gitlibs-notag" "$JOLT" run -m gapp 2>&1)"
+out="$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_DIR="$tmp/gitlibs-notag" "$JOLT" run -m gapp 2>&1)"
 case "$out" in
   *"tag v9.9 not found"*) check "a tag the repo does not have is reported as not found" ok ok ;;
   *) check "a tag the repo does not have is reported as not found" "tag v9.9 not found" "$(printf '%s' "$out" | head -2)" ;;
@@ -544,7 +544,7 @@ cat > "$tmp/gitproj/deps.edn" <<EOF
 {:paths ["src"]
  :deps {local/gitdep {:git/url "file://$tmp/notarepo" :git/tag "v1.0" :git/sha "$short"}}}
 EOF
-out="$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_CACHE="$tmp/gitlibs-noremote" "$JOLT" run -m gapp 2>&1)"
+out="$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_DIR="$tmp/gitlibs-noremote" "$JOLT" run -m gapp 2>&1)"
 case "$out" in
   *"not found"*) check "a failed ls-remote is not reported as a missing tag" \
                        "a fetch failure, not 'not found'" "$(printf '%s' "$out" | head -2)" ;;
@@ -583,13 +583,13 @@ EOF
 export FAKE_GIT_COUNT="$tmp/fakegit.count"; : > "$FAKE_GIT_COUNT"
 check "a transient ls-remote failure is retried" "git dep: tagged" \
       "$(PATH="$tmp/fakebin:$PATH" FAKE_GIT_FAILS=1 JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 \
-         JOLT_GITLIBS_CACHE="$tmp/gitlibs-retry" "$JOLT" run -m gapp 2>&1 | tail -1)"
+         JOLT_GITLIBS_DIR="$tmp/gitlibs-retry" "$JOLT" run -m gapp 2>&1 | tail -1)"
 check "  and the retry actually happened (ls-remote ran twice)" "2" "$(cat "$FAKE_GIT_COUNT")"
 
 # The cap is real: a failure that outlasts it reports, it does not spin.
 : > "$FAKE_GIT_COUNT"
 out="$(PATH="$tmp/fakebin:$PATH" FAKE_GIT_FAILS=99 JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 \
-       JOLT_GITLIBS_CACHE="$tmp/gitlibs-retry2" "$JOLT" run -m gapp 2>&1)"
+       JOLT_GITLIBS_DIR="$tmp/gitlibs-retry2" "$JOLT" run -m gapp 2>&1)"
 case "$out" in
   *"could not list"*) check "a persistent ls-remote failure reports after the cap" ok ok ;;
   *) check "a persistent ls-remote failure reports after the cap" "could not list …" \
@@ -610,9 +610,9 @@ cat > "$tmp/gitproj/deps.edn" <<EOF
 EOF
 mkdir -p "$tmp/gitlibs3/$san/$sha"
 check "an empty cached checkout is re-fetched" "git dep: tagged" \
-      "$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_CACHE="$tmp/gitlibs3" "$JOLT" run -m gapp 2>&1 | tail -1)"
+      "$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_DIR="$tmp/gitlibs3" "$JOLT" run -m gapp 2>&1 | tail -1)"
 # and the re-fetch is durable: the second run reuses it without cloning again
-out="$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_DEBUG=1 JOLT_GITLIBS_CACHE="$tmp/gitlibs3" "$JOLT" run -m gapp 2>&1)"
+out="$(JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_DEBUG=1 JOLT_GITLIBS_DIR="$tmp/gitlibs3" "$JOLT" run -m gapp 2>&1)"
 case "$out" in
   *fetching*) check "a complete checkout is reused" "no re-fetch" "$(printf '%s' "$out" | grep fetching)" ;;
   *) check "a complete checkout is reused" ok ok ;;
@@ -623,7 +623,7 @@ cat > "$tmp/gitproj/deps.edn" <<EOF
 {:paths ["src"]
  :deps {local/gitdep {:git/url "file://$tmp/not-a-repo" :git/sha "$sha"}}}
 EOF
-JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_CACHE="$tmp/gitlibs4" "$JOLT" run -m gapp >/dev/null 2>&1
+JOLT_PWD="$tmp/gitproj" JOLT_QUIET=1 JOLT_GITLIBS_DIR="$tmp/gitlibs4" "$JOLT" run -m gapp >/dev/null 2>&1
 check "a failed fetch caches no checkout" "" \
       "$(find "$tmp/gitlibs4" -mindepth 2 -maxdepth 2 2>/dev/null)"
 

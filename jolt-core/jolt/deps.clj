@@ -8,9 +8,9 @@
 
   The deps walk is breadth-first so a top-level coordinate registers before any
   transitive one (a top-level pin wins). Git deps reuse an existing
-  tools.gitlibs checkout ($GRENADINE_GITLIBS_CACHE / $GITLIBS / ~/.gitlibs)
+  tools.gitlibs checkout ($GRENADINE_GITLIBS_DIR / $GITLIBS / ~/.gitlibs)
   when the JVM toolchain already fetched them, else clone into a sha-immutable
-  cache ($JOLT_GITLIBS_CACHE, else a jolt/ subdir of the shared cache) across
+  cache ($JOLT_GITLIBS_DIR, else a jolt/ subdir of the shared cache) across
   projects.
   Maven POMs and jars live in the standard local repository
   (~/.m2/repository; :mvn/local-repo in deps.edn relocates it like tools.deps,
@@ -177,11 +177,11 @@
 ;; --- git cache --------------------------------------------------------------
 ;; jolt's own clone cache. $GITLIBS (the tools.gitlibs location knob) is
 ;; respected for WHERE the cache lives — under a jolt/ subdir so tools.gitlibs'
-;; own _repos/ and libs/ namespaces are never written to. JOLT_GITLIBS_CACHE
+;; own _repos/ and libs/ namespaces are never written to. JOLT_GITLIBS_DIR
 ;; pins an exact directory.
 (defn- gitlibs-dir
-  ([] (gitlibs-dir (getenv "JOLT_GITLIBS_CACHE")
-                   (getenv "GRENADINE_GITLIBS_CACHE")
+  ([] (gitlibs-dir (getenv "JOLT_GITLIBS_DIR")
+                   (getenv "GRENADINE_GITLIBS_DIR")
                    (getenv "GITLIBS")
                    (getenv "HOME")))
   ([jolt-cache grenadine-cache gitlibs home]
@@ -206,7 +206,7 @@
   corrupt, so jolt's own fetches go to its cache below."
   [lib sha]
   (when (and lib (namespace lib))
-    (let [base (or (getenv "GRENADINE_GITLIBS_CACHE")
+    (let [base (or (getenv "GRENADINE_GITLIBS_DIR")
                    (getenv "GITLIBS")
                    (str (or (getenv "HOME") ".") "/.gitlibs"))
           dir (str base "/libs/" (namespace lib) "/" (name lib) "/" sha)]
@@ -1051,7 +1051,7 @@
        "|" (pr-str (vec (sort alias-kws)))
        "|" runtime-version
        ;; the environment-dependent artifact roots resolution materializes into:
-       ;; a run pointed at a different gitlibs/jarlibs (JOLT_GITLIBS_CACHE — the
+       ;; a run pointed at a different gitlibs/jarlibs (JOLT_GITLIBS_DIR — the
        ;; deps-alias smoke's retry scenarios do exactly this), a different
        ;; HOME (the ~/.m2 and ~/.jolt defaults), or a moved Maven repo
        ;; (JOLT_MVNLIBS / JOLT_MAVEN_REPOSITORY /
@@ -1399,6 +1399,7 @@
 (defn- required-host
   []
   {:home-dir #(getenv "HOME")
+   :gitlibs-dir gitlibs-dir
    :file-exists? file-exists?
    :mkdirs! #(do (fs/create-dirs %) nil)
    :delete! #(do (fs/delete-if-exists %) nil)

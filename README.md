@@ -60,10 +60,12 @@ Code can acquire and import dependencies while it runs with the portable
 
 Literal dependency vectors need no quote; quoted vectors remain supported for
 compatibility. Maven and Gist coordinates support `:as` and explicit `:refer`
-imports. An optional leading map accepts `:mvn/local-repo` and `:cache-dir`.
+imports. An optional leading map accepts `:mvn/local-repo` and `:gitlibs/dir`;
+`:cache-dir` remains a compatibility alias for the Gist cache root.
 The explicit Maven option takes precedence over `JOLT_MAVEN_REPOSITORY`, which
 takes precedence over `GRENADINE_MAVEN_REPOSITORY`. For Gist dependencies,
-`JOLT_GITLIBS_CACHE` takes precedence over `GRENADINE_GITLIBS_CACHE`.
+`JOLT_GITLIBS_DIR` takes precedence over `GRENADINE_GITLIBS_DIR`, then
+`GITLIBS`; Gist source lives under `gist/` in that effective root.
 
 ## Install
 
