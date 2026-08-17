@@ -17,11 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on `EAGAIN` registers readiness with `jolt.io-poller` and parks the
   current fiber — the carrier runs other fibers meanwhile, and blocks on a
   private `kevent`/`epoll_wait` exactly as before when there is no fiber
-  (jolt.process's own no-poller fallback keeps working standalone). A
-  working `fcntl` binding for Apple arm64 is what makes the non-blocking fd
-  viable at all: `F_SETFL` is C-variadic, and without the
-  `(__varargs_after 2)` calling-convention marker it reports success but
-  silently never applies the flags. Closing a pipe port now also tells
+  (jolt.process's own no-poller fallback keeps working standalone). A fiber
+  that is about to park autoloads `jolt.io-poller` if nothing else has
+  required it, which is what makes this reach the programs that motivated
+  it: `jolt.socket` was the only namespace in the tree that pulls the
+  poller in, so a build-tool wrapper or shell pipeline driving subprocesses
+  from `go` blocks without ever opening a socket would otherwise have found
+  the poller absent and taken the blocking fallback — pinning its carrier,
+  the exact starvation this removes. A plain thread does not autoload it and
+  keeps the cheaper blocking read. A working `fcntl` binding for Apple arm64
+  is what makes the non-blocking fd viable at all: `F_SETFL` is C-variadic,
+  and without the `(__varargs_after 2)` calling-convention marker it reports
+  success but silently never applies the flags. Missing `fcntl` or `errno`
+  bindings cost only the parking, not the `posix_spawn` path itself, whose
+  fallback to Chez's `fork` leaves `SIGINT` ignored in the child. Closing a
+  pipe port now also tells
   `jolt.io-poller` to forget the fd, mirroring the socket fix below: a
   closed fd is auto-dropped from the kernel's kqueue/epoll set, so a fiber
   still parked on it would otherwise wait forever for an event that is

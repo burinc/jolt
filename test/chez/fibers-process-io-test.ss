@@ -10,10 +10,13 @@
 ;; ask jolt.io-poller to wait for readiness — parking the fiber when there is a
 ;; current fiber, blocking this thread when there is not. Same user-facing
 ;; jolt.process code either way. The retry loop also has a THIRD branch neither
-;; socket.clj nor fibers-io-test.ss needs: when jolt.io-poller was never
-;; required at all (jolt.process is usable standalone), EAGAIN clears
-;; O_NONBLOCK on the fd and falls through to a real blocking read/write —
-;; behaviorally identical to the pre-R8-extension code, once triggered.
+;; socket.clj nor fibers-io-test.ss needs: off a fiber, when jolt.io-poller was
+;; never required at all (jolt.process is usable standalone, and jolt.socket is
+;; the only ns in the tree that requires the poller), EAGAIN clears O_NONBLOCK
+;; on the fd and falls through to a real blocking read/write — behaviorally
+;; identical to the pre-R8-extension code, once triggered. ON a fiber that same
+;; state autoloads the poller instead, since falling back there is precisely the
+;; carrier-pinning this file exists to rule out.
 ;;
 ;; Gate checks, in order:
 ;;   1. a fiber reading a subprocess pipe with nothing written yet PARKS, and a
@@ -26,7 +29,7 @@
 ;;      asserts for sockets — this is the same poller, so this is really a
 ;;      belt-and-suspenders repeat of it via a different registration path,
 ;;      worth asserting explicitly since jolt.process is a distinct caller of
-;;      poller-wait-ready from jolt.socket).
+;;      proc-poller-wait-ready from jolt.socket).
 ;;   4. N fibers (N picked below, see the note at its definition), each reading
 ;;      its OWN subprocess's pipe, all on ONE carrier: all N park at once, then
 ;;      all N complete with their own payload — real parking, not serialized
@@ -36,11 +39,16 @@
 ;;      extension does not leak into or change the non-fiber path every
 ;;      existing jolt.process caller (process-test.clj, babashka.process
 ;;      itself) depends on.
-;;   6. the no-poller fallback: a FRESH Chez process that requires jolt.process
-;;      but never jolt.io-poller (so poller-wait-ready's var-deref finds it
-;;      genuinely unbound, not just un-invoked) still blocks correctly on a
-;;      pipe read — not a spurious short-read/EOF on the first EAGAIN, and not
-;;      a busy spin. No analog in fibers-io-test.ss: sockets always require
+;;   6. a FRESH Chez process that requires jolt.process but never
+;;      jolt.io-poller (so proc-poller-wait-ready's var-deref finds it genuinely
+;;      unbound, not just un-invoked) gets BOTH halves of the choice right: off a
+;;      fiber it blocks correctly and leaves the poller unloaded — not a spurious
+;;      short-read/EOF on the first EAGAIN, not a busy spin, and not a private
+;;      kqueue per wait either; on a fiber it autoloads the poller and genuinely
+;;      parks, with a sibling on the same carrier proving it. That fiber half is
+;;      the one that reproduces jolt-641 in full if the autoload is removed, and
+;;      it is the shape of every subprocess-driving fiber program that never
+;;      opens a socket. No analog in fibers-io-test.ss: sockets always require
 ;;      jolt.io-poller by construction, so this state is only reachable through
 ;;      jolt.process. Runs the probe as a genuinely separate `chez --script`
 ;;      subprocess (see check 6 below) — jolt-var auto-vivifies an unbound
@@ -66,7 +74,7 @@
 ;;      level deeper: check 7 asserts the woken fiber is not STRANDED, this one
 ;;      asserts WHICH path it takes once woken.
 ;;
-;; Watchdog: the whole workload (all 6 checks) runs on a forked thread; this
+;; Watchdog: the whole workload (all 9 checks) runs on a forked thread; this
 ;; script's main thread does nothing but watch a hard-coded deadline. A wedge
 ;; anywhere in the workload — including a raw blocking spawn/read call that
 ;; isn't wrapped in wait-until's own per-check bound — fails the gate loudly
@@ -154,9 +162,11 @@
 ;; Measured real runtime (5 repeated runs, this machine): ~8.5-12.5s total —
 ;; roughly 3.2s for this file's own gate-boot+loader+ffi load plus requiring
 ;; jolt.process/jolt.io-poller, ~1.9s for checks 1-5 combined (real subprocess
-;; spawns, N=6 of them in check 4), and ~3.4s for check 6's nested Chez
+;; spawns, N=6 of them in check 4), and ~5.5s for check 6's nested Chez
 ;; subprocess (which repeats the same gate-boot+loader+ffi+require cost, plus
-;; its own 0.3s delayed read). hang-secs is ~10x the slowest observed run —
+;; the 0.3s delayed read of its thread half and the 2s one of its fiber half —
+;; long enough that the fiber is provably still parked when the sibling's own
+;; progress is read). hang-secs is ~10x the slowest observed run —
 ;; generous for a slower CI machine, still bounded: anything that reaches it
 ;; is wedged, not slow.
 (define hang-secs 120.0)
@@ -335,15 +345,28 @@
         (ev "(jolt.process/shell \"true\")")
         #t))
 
-  ;; --- 6. the no-poller fallback path -----------------------------------------
-  (at! "6. no-poller fallback (nested chez subprocess)")
-  (printf "\n== 6. the no-poller fallback: jolt.process usable standalone, jolt.io-poller never required ==\n")
+  ;; --- 6. jolt.io-poller reachability, with nobody having required it --------
+  (at! "6. poller autoload + off-fiber fallback (nested chez subprocess)")
+  (printf "\n== 6. jolt.process standalone: a fiber autoloads jolt.io-poller, a thread keeps the blocking fallback ==\n")
   ;; This process already required jolt.io-poller for checks 1-5 (jolt-var
   ;; auto-vivifies an unbound placeholder for a never-required ns, so once a
   ;; require has happened for real there is no way back within this process).
   ;; So this check runs the probe in a genuinely fresh `chez --script`
   ;; subprocess that requires jolt.process and nothing else, and reports its
   ;; own verdict on stdout.
+  ;;
+  ;; The probe covers both halves of proc-poller-wait-ready's choice, in the
+  ;; one order that can observe them: OFF a fiber first, where the poller must
+  ;; stay unloaded and the read must fall back to a real blocking read; then ON
+  ;; a fiber, where the poller must autoload and the read must genuinely park.
+  ;; Reversed, the fiber half would leave the poller loaded and the thread half
+  ;; could no longer tell "did not autoload" from "someone else had".
+  ;;
+  ;; jolt.socket is the only ns in the tree that requires jolt.io-poller, so
+  ;; this is the shape every subprocess-driving fiber program that never opens
+  ;; a socket is in — a build-tool wrapper, a shell pipeline. Without the
+  ;; autoload the fiber half here pins its carrier and jolt-641 reproduces in
+  ;; full on top of everything else in this file.
   (set! repo-dir (current-directory))
   (set! no-poller-script (string-append
     "(import (chezscheme))\n"
@@ -362,22 +385,52 @@
     "      (cond ((pred) #t)\n"
     "            ((> (now-secs) deadline) #f)\n"
     "            (else (sleep (make-time 'time-duration 1000000 0)) (loop))))))\n"
+    "(define (poller-loaded?) (not (jolt-var-unbound? (var-deref \"jolt.io-poller\" \"wait-ready\"))))\n"
     ;; deliberately never requires jolt.io-poller
     "(ev \"(require 'jolt.process)\")\n"
-    "(jolt-fiber-carrier-count-set! 1)\n"
+    "(define pre (poller-loaded?))\n"
+    ;; -- off a fiber: the blocking fallback, and no autoload --
+    "(ev \"(def np1 (jolt.process/process [\\\"sh\\\" \\\"-c\\\" \\\"sleep 0.3; printf npo\\\"]))\")\n"
+    "(define t1 (mono-nanos))\n"
+    "(define r1 (ev \"(let [b (byte-array 64) n (.read (:out np1) b 0 64)] (String. b 0 n \\\"UTF-8\\\"))\"))\n"
+    "(define el1 (/ (exact->inexact (- (mono-nanos) t1)) 1000000.0))\n"
+    "(define mid (poller-loaded?))\n"
+    ;; -- on a fiber: the autoload, and real parking with a sibling progressing --
+    ;; TWO carriers and TWO readers, not one of each, because the concurrent
+    ;; autoload is the case with a wrong answer available: both readers reach
+    ;; their first EAGAIN at once, and a "have we tried yet" latch in
+    ;; proc-poller-autoload! would let the second one past it while the first is
+    ;; still loading, so the second finds the var unbound, takes the blocking
+    ;; fallback, and clears O_NONBLOCK on its own fd for good. That shows up
+    ;; here as ONE of the two readers stuck 'running instead of 'parked, which
+    ;; is exactly what parked2 catches. Two carriers is also the smallest pool
+    ;; that can host both readers at once, which is what makes them race at all.
+    "(jolt-fiber-carrier-count-set! 2)\n"
     "(jolt-fiber-pool-reset!)\n"
     "(jolt-fiber-ensure-carrier!)\n"
-    "(ev \"(def np-proc (jolt.process/process [\\\"sh\\\" \\\"-c\\\" \\\"sleep 0.3; printf npo\\\"]))\")\n"
-    "(ev \"(def np-out (:out np-proc))\")\n"
-    "(define read-thunk (ev \"(fn [] (let [b (byte-array 64) n (.read np-out b 0 64)] (String. b 0 n \\\"UTF-8\\\")))\"))\n"
-    "(define t0 (mono-nanos))\n"
-    "(define f (sa-fiber-spawn read-thunk))\n"
-    "(define done (wait-until (lambda () (eq? (jolt-fiber-state f) 'done)) 15.0))\n"
-    "(define el (/ (exact->inexact (- (mono-nanos) t0)) 1000000.0))\n"
-    "(define r (jolt-fiber-result f))\n"
-    "(if (and done (string? r) (string=? r \"npo\") (> el 150.0))\n"
-    "    (begin (printf \"NO-POLLER-PROBE OK elapsed=~,1fms\\n\" el) (exit 0))\n"
-    "    (begin (printf \"NO-POLLER-PROBE FAIL done=~a result=~a elapsed=~,1fms\\n\" done r el) (exit 1)))\n"))
+    "(ev \"(def np2s (mapv (fn [i] (jolt.process/process [\\\"sh\\\" \\\"-c\\\" \\\"sleep 2; printf npf\\\"])) (range 2)))\")\n"
+    "(ev \"(def np2-outs (mapv :out np2s))\")\n"
+    "(define read-thunk (ev \"(fn [i] (let [s (nth np2-outs i) b (byte-array 64) n (.read s b 0 64)] (String. b 0 n \\\"UTF-8\\\")))\"))\n"
+    "(define fs (list (sa-fiber-spawn (lambda () (read-thunk 0)))\n"
+    "                 (sa-fiber-spawn (lambda () (read-thunk 1)))))\n"
+    "(define (all-state? st) (lambda () (andmap (lambda (f) (eq? (jolt-fiber-state f) st)) fs)))\n"
+    "(define parked2 (wait-until (all-state? 'parked) 8.0))\n"
+    ;; a third body on a pool both of whose carriers are hosting a pipe read
+    "(define sib (sa-fiber-spawn (lambda () 606)))\n"
+    "(define sib-ran (and (wait-until (lambda () (eq? (jolt-fiber-state sib) 'done)) 5.0)\n"
+    "                     ((all-state? 'parked))))\n"
+    "(define post (poller-loaded?))\n"
+    "(define done2 (wait-until (all-state? 'done) 15.0))\n"
+    "(define r2 (map jolt-fiber-result fs))\n"
+    "(if (and (not pre) (string? r1) (string=? r1 \"npo\") (> el1 150.0) (not mid)\n"
+    "         parked2 sib-ran post done2 (equal? r2 (list \"npf\" \"npf\")))\n"
+    "    (begin (printf \"NO-POLLER-PROBE OK thread-read=~,1fms\\n\" el1) (exit 0))\n"
+    "    (begin (printf (string-append \"NO-POLLER-PROBE FAIL pre=~a r1=~a el1=~,1fms mid=~a\"\n"
+    "                                  \" parked2=~a sib-ran=~a post=~a done2=~a r2=~s\"\n"
+    "                                  \" states=~a\\n\")\n"
+    "                   pre r1 el1 mid parked2 sib-ran post done2 r2\n"
+    "                   (map jolt-fiber-state fs))\n"
+    "           (exit 1)))\n"))
   (set! no-poller-path
     (string-append "/tmp/jolt-fibers-process-io-no-poller-probe-" (number->string (get-process-id)) ".ss"))
   (let ((p (open-output-file no-poller-path 'replace)))
@@ -390,13 +443,13 @@
   (set! np-out (ev "(:out np-result)"))
   (set! np-err (ev "(:err np-result)"))
   (set! np-exit (ev "(:exit np-result)"))
-  (ok "6. the no-poller subprocess exited 0"
+  (ok "6. the standalone-jolt.process subprocess exited 0"
       (eqv? np-exit 0))
-  (ok "6. the no-poller subprocess reported a genuine blocking read (correct payload, waited for it)"
+  (ok "6. off a fiber it fell back to a real blocking read and left jolt.io-poller unloaded; on a fiber it autoloaded the poller and genuinely parked"
       (and (string? np-out) (string-contains-substr? np-out "NO-POLLER-PROBE OK")))
   (unless (and (eqv? np-exit 0) (string? np-out) (string-contains-substr? np-out "NO-POLLER-PROBE OK"))
-    (printf "  no-poller subprocess stdout: ~a\n" np-out)
-    (printf "  no-poller subprocess stderr: ~a\n" np-err))
+    (printf "  standalone subprocess stdout: ~a\n" np-out)
+    (printf "  standalone subprocess stderr: ~a\n" np-err))
   (guard (e (#t #f)) (delete-file no-poller-path))
 
   ;; --- 7. closing a port while parked on its read must not strand the fiber -

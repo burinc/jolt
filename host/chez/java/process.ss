@@ -109,17 +109,58 @@
       (when (>= flags 0)
         (proc-fcntl-set fd proc-F-SETFL (fxior flags proc-O-NONBLOCK))))))
 
+;; jolt.socket is the only thing in the tree that requires jolt.io-poller, so a
+;; program that drives subprocesses from fibers without ever touching a socket
+;; — a build-tool wrapper, a shell pipeline — would find wait-ready unbound and
+;; take the blocking fallback below, pinning its carrier: exactly the starvation
+;; this whole file's R8 extension exists to remove. Autoload the poller instead,
+;; at the one moment it is known to be needed, and only when there IS a fiber to
+;; park: a plain thread keeps the cheaper blocking read rather than paying a
+;; private kqueue/epoll per wait.
+;;
+;; Safe from inside a port read even though a load can park and can race another
+;; thread's: loader.ss's claim protocol owns both cases (ldr-begin-load! steps
+;; 2-3), and leaning on it rather than on a latch of our own is what makes the
+;; CONCURRENT case come out right. Two fibers on two carriers reach their first
+;; EAGAIN at once routinely -- it is the ordinary shape of "read several
+;; subprocesses from go blocks", the thing this whole extension is for. A
+;; boolean "already tried" latch set before the load would let the second fiber
+;; skip straight past it, find the var still unbound because the first is only
+;; part way through, and take the blocking fallback -- clearing O_NONBLOCK on
+;; its own fd for good, so that one port never parks again for the life of the
+;; process. Calling load-namespace instead makes the second fiber WAIT on the
+;; first's claim (fiber-aware, via jolt-lock-parked, so it parks rather than
+;; pinning), then find a fully built namespace. Already-loaded is a hashtable
+;; lookup, and we only get here when the var is unbound anyway.
+;;
+;; The one thing the loader cannot decide for us is a load that FAILS
+;; (jolt.io-poller off the source roots in a trimmed install): the loader rolls
+;; its own mark back on a throw, deliberately, so a retry can work. Nothing
+;; about the next EAGAIN will have changed, though, so record the failure here
+;; and stop asking.
+(define proc-poller-load-failed #f)
+(define (proc-poller-autoload!)
+  (unless proc-poller-load-failed
+    (guard (e (#t (set! proc-poller-load-failed #t) #f))
+      (load-namespace "jolt.io-poller"))))
+
 ;; Bridge to jolt.io-poller/wait-ready: var-deref never throws for a
 ;; missing var -- jolt-var auto-vivifies a jolt-var-unbound placeholder
 ;; instead (rt.ss:662-669), checkable via the record type's own
-;; predicate. So when jolt.process is used standalone, without
-;; jolt.socket/jolt.io-poller ever loaded, this returns #f and the
-;; caller falls back to a real blocking wait it implements itself (the
-;; EAGAIN branches in proc-fd-input-port/proc-fd-output-port below --
-;; a bare 0-byte return there would misread as EOF, since the pipe fd
-;; is genuinely non-blocking by then).
+;; predicate. Off a fiber an unbound var stays unbound (see
+;; proc-poller-autoload! above for why the load is fiber-only) and this
+;; returns #f, so the caller falls back to a real blocking wait it
+;; implements itself (the EAGAIN branches in
+;; proc-fd-input-port/proc-fd-output-port below -- a bare 0-byte return
+;; there would misread as EOF, since the pipe fd is genuinely
+;; non-blocking by then). On a fiber the same #f is only reachable when
+;; the autoload itself failed.
 (define (proc-poller-wait-ready fd filt-kw)
-  (let ((f (var-deref "jolt.io-poller" "wait-ready")))
+  (let* ((f0 (var-deref "jolt.io-poller" "wait-ready"))
+         (f (if (and (jolt-var-unbound? f0) (jolt-current-fiber))
+                (begin (proc-poller-autoload!)
+                       (var-deref "jolt.io-poller" "wait-ready"))
+                f0)))
     (if (jolt-var-unbound? f)
         #f
         (begin (jolt-invoke2 f fd filt-kw) #t))))
@@ -133,8 +174,8 @@
 ;; REUSED fd number belonging to an unrelated later socket. Mirrors
 ;; jolt.socket's socket-close! (stdlib/jolt/socket.clj), which does the
 ;; identical close-then-forget for the same reason. Same unbound-var guard
-;; as proc-poller-wait-ready: when jolt.io-poller was never loaded, forget! has
-;; nothing to forget and this is a no-op.
+;; as proc-poller-wait-ready, and no autoload: a poller that was never loaded
+;; holds no registration for this fd, so there is nothing to forget.
 (define (proc-poller-forget! fd)
   (let ((f (var-deref "jolt.io-poller" "forget!")))
     (unless (jolt-var-unbound? f) (jolt-invoke1 f fd))))
@@ -653,47 +694,63 @@
             p)
           (begin (sa-foreign-free fds)
                  (throw-jvm (quote java.io.IOException) "pipe: cannot allocate")))))
-  (jolt-with-mutex proc-spawn-fd-mutex
-    (let* ((in-p  (and (not inherit-in?)  (mk-pipe #f #t)))
-           (out-p (and (not inherit-out?) (mk-pipe #t #f)))
-           (err-p (and (not inherit-err?) (mk-pipe #t #f)))
-           (fa (sa-foreign-alloc 128))
-           (pidbuf (sa-foreign-alloc 8)))
-      (proc-fa-init fa)
-      (when in-p  (proc-fa-dup2 fa (car in-p) 0)
-                  (proc-fa-close fa (car in-p)) (proc-fa-close fa (cdr in-p)))
-      (when out-p (proc-fa-dup2 fa (cdr out-p) 1)
-                  (proc-fa-close fa (cdr out-p)) (proc-fa-close fa (car out-p)))
-      (when err-p (proc-fa-dup2 fa (cdr err-p) 2)
-                  (proc-fa-close fa (cdr err-p)) (proc-fa-close fa (car err-p)))
-      (let* ((argv (proc-marshal-argv (list "/bin/sh" "-c" sh-cmd)))
-             (envp (proc-marshal-argv
-                    (map (lambda (p) (string-append (car p) "=" (cdr p)))
-                         (all-env-pairs))))
-             ;; attrp is NULL, so the child inherits this thread's signal mask —
-             ;; which must carry none of jolt's own blocking (concurrency.ss).
-             (rc (jolt-with-empty-sigmask
-                   (lambda () (proc-c-spawn pidbuf "/bin/sh" fa 0 (car argv) (car envp)))))
-             (pid (sa-foreign-ref 'int pidbuf 0)))
-        (proc-fa-destroy fa)
-        (sa-foreign-free fa) (sa-foreign-free pidbuf)
-        (proc-free-argv argv) (proc-free-argv envp)
-        ;; parent side: the child's pipe ends close unconditionally; on a failed
-        ;; spawn the parent ends close too, before the throw.
-        (when in-p  (proc-c-close (car in-p)))
-        (when out-p (proc-c-close (cdr out-p)))
-        (when err-p (proc-c-close (cdr err-p)))
-        (if (= rc 0)
-            (values (and in-p  (proc-fd-output-port (cdr in-p)))
-                    (and out-p (proc-fd-input-port (car out-p)))
-                    (and err-p (proc-fd-input-port (car err-p)))
-                    pid)
-            (begin
-              (when in-p  (proc-c-close (cdr in-p)))
-              (when out-p (proc-c-close (car out-p)))
-              (when err-p (proc-c-close (car err-p)))
-              (throw-jvm (quote java.io.IOException)
-                (string-append "posix_spawn failed (errno " (number->string rc) ")"))))))))
+  ;; spawn-locked hands back RAW FDS and the ports are built after it returns,
+  ;; not inside. proc-fd-input-port / proc-fd-output-port can park now (an EAGAIN on
+  ;; a fiber waits on jolt.io-poller, and the first such wait may autoload it),
+  ;; and a park inside a jolt-with-mutex region is the deadlock shape
+  ;; test/parkcheck refuses outright -- host/chez/locks.ss. Only their
+  ;; read!/write! callbacks can actually reach a park, and those run when
+  ;; someone reads the port rather than here, so nothing was wrong before; but
+  ;; the lock has no reason to span the construction either, and its own
+  ;; contract is pipe() through posix_spawn and nothing else. Narrowing it makes
+  ;; the call graph say what is true instead of asking for an exemption.
+  (define (spawn-locked)
+    (jolt-with-mutex proc-spawn-fd-mutex
+      (let* ((in-p  (and (not inherit-in?)  (mk-pipe #f #t)))
+             (out-p (and (not inherit-out?) (mk-pipe #t #f)))
+             (err-p (and (not inherit-err?) (mk-pipe #t #f)))
+             (fa (sa-foreign-alloc 128))
+             (pidbuf (sa-foreign-alloc 8)))
+        (proc-fa-init fa)
+        (when in-p  (proc-fa-dup2 fa (car in-p) 0)
+                    (proc-fa-close fa (car in-p)) (proc-fa-close fa (cdr in-p)))
+        (when out-p (proc-fa-dup2 fa (cdr out-p) 1)
+                    (proc-fa-close fa (cdr out-p)) (proc-fa-close fa (car out-p)))
+        (when err-p (proc-fa-dup2 fa (cdr err-p) 2)
+                    (proc-fa-close fa (cdr err-p)) (proc-fa-close fa (car err-p)))
+        (let* ((argv (proc-marshal-argv (list "/bin/sh" "-c" sh-cmd)))
+               (envp (proc-marshal-argv
+                      (map (lambda (p) (string-append (car p) "=" (cdr p)))
+                           (all-env-pairs))))
+               ;; attrp is NULL, so the child inherits this thread's signal mask —
+               ;; which must carry none of jolt's own blocking (concurrency.ss).
+               (rc (jolt-with-empty-sigmask
+                     (lambda () (proc-c-spawn pidbuf "/bin/sh" fa 0 (car argv) (car envp)))))
+               (pid (sa-foreign-ref 'int pidbuf 0)))
+          (proc-fa-destroy fa)
+          (sa-foreign-free fa) (sa-foreign-free pidbuf)
+          (proc-free-argv argv) (proc-free-argv envp)
+          ;; parent side: the child's pipe ends close unconditionally; on a failed
+          ;; spawn the parent ends close too, before the throw.
+          (when in-p  (proc-c-close (car in-p)))
+          (when out-p (proc-c-close (cdr out-p)))
+          (when err-p (proc-c-close (cdr err-p)))
+          (if (= rc 0)
+              (vector (and in-p  (cdr in-p))
+                      (and out-p (car out-p))
+                      (and err-p (car err-p))
+                      pid)
+              (begin
+                (when in-p  (proc-c-close (cdr in-p)))
+                (when out-p (proc-c-close (car out-p)))
+                (when err-p (proc-c-close (car err-p)))
+                (throw-jvm (quote java.io.IOException)
+                  (string-append "posix_spawn failed (errno " (number->string rc) ")"))))))))
+  (let ((fds (spawn-locked)))
+    (values (let ((fd (vector-ref fds 0))) (and fd (proc-fd-output-port fd)))
+            (let ((fd (vector-ref fds 1))) (and fd (proc-fd-input-port fd)))
+            (let ((fd (vector-ref fds 2))) (and fd (proc-fd-input-port fd)))
+            (vector-ref fds 3))))
 
 ;; --- java.lang.Process -------------------------------------------------------
 ;; state: #(stdin-os stdout-is stderr-is pid exit-box cmd mutex stdout-port
