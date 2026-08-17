@@ -133,6 +133,22 @@ if grep -qE 'record-method-dispatch [^ ()]+"sym"' "$out.build/flat.ss"; then
   echo "  FAIL: kw-target .sym still routes through record-method-dispatch"; exit 1
 fi
 
+# The :sb stamp: app.util/sbjoin binds (StringBuilder.) to a let local with NOTHING
+# hinted in the source, so this proves init-proves-hint fired and not just the
+# explicit-tag path. flat.ss must carry the inline sb-append!/sb-str emission for
+# that local and route no "append"/"toString" on it through the jhost method table.
+# The negative grep anchors the method name right after the target so unrelated
+# record-method-dispatch lines elsewhere in the closure cannot false-positive.
+if ! grep -qF '(sb-append! sb (render-piece' "$out.build/flat.ss"; then
+  echo "  FAIL: sb-target .append did not lower to the inline sb-append!"; exit 1
+fi
+if ! grep -qF '(sb-str sb)' "$out.build/flat.ss"; then
+  echo "  FAIL: sb-target .toString did not lower to the inline sb-str"; exit 1
+fi
+if grep -qE 'record-method-dispatch [^ ()]+"append"' "$out.build/flat.ss"; then
+  echo "  FAIL: sb-target .append still routes through record-method-dispatch"; exit 1
+fi
+
 # Lib-provided host classes: app.util/zdt-class references java.time.ZonedDateTime
 # (a jolt-lang/time class). The build scan must pull the provider's install ns —
 # src-provider/jolt/time.clj is the on-roots stand-in — into flat.ss, because a
@@ -191,6 +207,15 @@ got_kwsym="$(cd / && "$out" --kwsym 2>&1)"
 if ! printf '%s' "$got_kwsym" | grep -q '^kwsym: ns/qual plain$'; then
   echo "  FAIL: :kw-stamped interop output — want 'kwsym: ns/qual plain'"
   echo "--- got ----"; echo "$got_kwsym"; exit 1
+fi
+
+# Same runtime-shape check for the :sb-stamped interop (app.util/sbjoin): the
+# separator logic, the empty case, and the single-element case all have to survive
+# the inline lowering, since append's fluent return is what the reduce threads.
+got_sbjoin="$(cd / && "$out" --sbjoin 2>&1)"
+if ! printf '%s' "$got_sbjoin" | grep -q '^sbjoin: a\.b\.c  x$'; then
+  echo "  FAIL: :sb-stamped interop output — want 'sbjoin: a.b.c  x'"
+  echo "--- got ----"; echo "$got_sbjoin"; exit 1
 fi
 
 # Portable embed: remove the build-time source tree and run from / — the

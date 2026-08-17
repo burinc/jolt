@@ -3110,6 +3110,16 @@
   {:suite "host-interop / proven keyword target" :label "literal .sym keeps the ns" :expected "'ns/qual" :actual "(.sym :ns/qual)" :portability :common}
   {:suite "host-interop / proven keyword target" :label "^Keyword param hint routes to the direct arm" :expected "['x/y \"y\" \"x\"]" :actual "((fn [^clojure.lang.Keyword k] [(.sym k) (.getName k) (.getNamespace k)]) :x/y)" :portability :common}
   {:suite "host-interop / proven keyword target" :label "call-site ^Keyword tag on a local" :expected "'a/b" :actual "(let [k :a/b] (.sym ^clojure.lang.Keyword k))" :portability :common}
+  ;; (.m sb …) with a proven StringBuilder target (a local bound to
+  ;; (StringBuilder.), or a ^StringBuilder hint) emits the accessor inline.
+  {:suite "host-interop / proven StringBuilder target" :label "unhinted let-bound builder" :expected "\"ab\"" :actual "(let [sb (StringBuilder.)] (.append sb \"a\") (.append sb \"b\") (.toString sb))" :portability :common}
+  ;; nil is deliberately NOT in this chain: on the JVM (.append sb nil) is a
+  ;; reflection ambiguity (String/Object/char[]/CharSequence all match) and raises
+  ;; IllegalArgumentException, while jolt accepts it and renders "null" like
+  ;; append(Object) would. jolt is a strict superset there and the generic path
+  ;; already behaved this way, so the nil case is pinned in unit.edn instead.
+  {:suite "host-interop / proven StringBuilder target" :label "append is fluent and renders numbers and chars" :expected "[\"a1c\" 3]" :actual "(let [sb (StringBuilder.)] (.append (.append (.append sb \"a\") 1) \\c) [(.toString sb) (.length sb)])" :portability :common}
+  {:suite "host-interop / proven StringBuilder target" :label "^StringBuilder param hint" :expected "\"p-x\"" :actual "((fn [^StringBuilder b] (.append b \"x\") (.toString b)) (StringBuilder. \"p-\"))" :portability :common}
   {:suite "clojure.string" :label "reverse" :expected "\"cba\"" :actual "(do (require (quote [clojure.string :as s])) (s/reverse \"abc\"))" :portability :common}
   {:suite "clojure.string" :label "index-of" :expected "2" :actual "(do (require (quote [clojure.string :as s])) (s/index-of \"hello\" \"l\"))" :portability :common}
   {:suite "string / subs strictness" :label "subs basic" :expected "\"bcd\"" :actual "(subs \"abcde\" 1 4)" :portability :common}

@@ -36,6 +36,21 @@
 ;; flat.ss for that emission shape and the ABSENCE of a keyword .sym dispatch.
 (defn kwsym [^clojure.lang.Keyword k] (.sym k))
 
+;; Proven-StringBuilder interop: the shape honey.sql.util/join has, and every
+;; string-building loop in Clojure — a let-bound (StringBuilder.) with NO hint in
+;; the source, appended to in a reduce. init-proves-hint supplies the :sb stamp, so
+;; the built binary must lower .append/.toString to the inline sb-append!/sb-str
+;; instead of the jhost method-table walk. build-smoke greps flat.ss for that shape
+;; and for the ABSENCE of a record-method-dispatch "append".
+(defn sbjoin [sep parts]
+  (let [sb (StringBuilder.)]
+    (reduce (fn [first? p]
+              (when-not first? (.append sb sep))
+              (.append sb p)
+              false)
+            true parts)
+    (.toString sb)))
+
 ;; ^:redef / ^:dynamic opt out of direct-linking even with it on by default (the
 ;; release default now), so the built binary can still redef/bind them at runtime.
 (def ^:redef redef-fn (fn [] :original))

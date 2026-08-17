@@ -113,6 +113,37 @@
       (= m "equals")       (when (= argc 1) (str "(eq? " t " " a0 ")"))
       :else nil)))
 
+;; Direct emission for (.m target …) whose target is PROVEN a StringBuilder
+;; (:target-type :sb — a ^StringBuilder tag, a local bound to (StringBuilder.),
+;; or a constructor in target position). This is the most expensive interop shape
+;; jolt had: a jhost method call hashes the tag STRING to find the method table,
+;; hashes the method name to find the handler, converts the jolt-vector of rest
+;; args back to a list for `apply`, and hands them to a shim lambda that takes a
+;; further rest list — 270 ns for a 0-arg method and 500 ns for (.append sb "a"),
+;; where sb-append! itself is three vector-set!s.
+;;
+;; Bodies match host-static-methods.ss's own accessors exactly, so a mixed program
+;; that reaches the generic path for an untyped target sees identical behavior. In
+;; particular append RETURNS THE BUILDER (the JVM's fluent contract, which is what
+;; makes (-> sb (.append a) (.append b)) work), so `t` is spliced twice and, as
+;; with the keyword table, that is only sound because the analyzer stamps :sb for
+;; identifiers and constructor calls alone. A constructor in target position is the
+;; one compound case, and it is bound to a let by emit-let before reaching here.
+;;
+;; append's 3-arg (x, start, end) form and setLength/insert/delete are left to the
+;; generic path: they are not hot and the range checks are worth more than the
+;; nanoseconds.
+(defn- sb-direct-emit [m argc t args]
+  (let [a0 (first args)]
+    (cond
+      (= m "append")    (when (= argc 1)
+                          (str "(begin (sb-append! " t " (render-piece " a0 ")) " t ")"))
+      (= m "toString")  (when (= argc 0) (str "(sb-str " t ")"))
+      (= m "length")    (when (= argc 0) (str "(->num (sb-length " t "))"))
+      (= m "isEmpty")   (when (= argc 0) (str "(fx=? (sb-length " t ") 0)"))
+      (= m "charAt")    (when (= argc 1) (str "(string-ref (sb-str " t ") (jolt->idx " a0 "))"))
+      :else nil)))
+
 ;; The current compilation-unit context (jolt.passes.types unit). ALL emit-session
 ;; state — the mode flags, the direct-link name registries, the record-ctor shape
 ;; registry, the gensym counter and the per-site cache cells — lives on it, read
@@ -629,6 +660,17 @@
                   ;; record/reify protocol-method dispatch (:host-call fallback
                   ;; for any .method not in supported-host-methods).
                   "record-method-dispatch"
+                  ;; proven-target interop natives (string-direct-emit,
+                  ;; keyword-direct-emit, sb-direct-emit). These are bare heads a
+                  ;; user local could shadow and the "jolt-" prefix net does not
+                  ;; catch them, so they are enumerated per the invariant above:
+                  ;; (let [str-trim (fn [_] :shadowed)] (.trim ^String s)) would
+                  ;; otherwise emit a call to the local.
+                  "str-trim" "str-needle" "str-starts-with?" "str-ends-with?"
+                  "str-index-of" "str-index-of-any" "str-replace-literal"
+                  "java-string-hash" "java-symbol-hash"
+                  "keyword-t-ns" "keyword-t-name"
+                  "sb-append!" "sb-str" "sb-length" "render-piece" "->num"
                   ;; cell-cached var deref (the whole-program var-cache? path).
                   "var-cell-deref"
                   ;; devirt cached-desc lookup (emit-invoke ctor inlining).
@@ -1929,7 +1971,9 @@
                                (or (when (= :str (:target-type node))
                                      (string-direct-emit m (count args) t args))
                                    (when (= :kw (:target-type node))
-                                     (keyword-direct-emit m (count args) t args))))]
+                                     (keyword-direct-emit m (count args) t args))
+                                   (when (= :sb (:target-type node))
+                                     (sb-direct-emit m (count args) t args))))]
                   (if direct direct
                       (if (supported-host-methods m)
                         (str "(jolt-host-call " (chez-str-lit m) " " t

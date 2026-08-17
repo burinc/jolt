@@ -678,6 +678,34 @@
   ;; outside the table -> generic dispatch; the keyword arm itself has no
   ;; compareTo, so both paths throw the same IllegalArgumentException
   {:suite "kwdirect" :expr "(.compareTo :a :b)" :expected :throws}
+  ;; (.m sb …) with a PROVEN StringBuilder target emits the accessor inline. Three
+  ;; proof sources, all pinned below: a local bound to (StringBuilder.) with NO
+  ;; hint in the source (init-proves-hint — the shape every string-building let
+  ;; has), a ^StringBuilder param tag, and a constructor in target position.
+  {:suite "sbdirect" :expr "(let [sb (StringBuilder.)] (.append sb \"a\") (.toString sb))" :expected "\"a\""}
+  ;; append renders like the JVM's: a number, nil as \"null\", a char bare
+  {:suite "sbdirect" :expr "(let [sb (StringBuilder.)] (.append sb \"a\") (.append sb 1) (.append sb nil) (.append sb \\c) (.toString sb))" :expected "\"a1nullc\""}
+  ;; append RETURNS the builder — the fluent contract (-> sb (.append a) (.append b))
+  {:suite "sbdirect" :expr "(let [sb (StringBuilder.)] (.toString (.append (.append sb \"a\") \"b\")))" :expected "\"ab\""}
+  {:suite "sbdirect" :expr "(let [sb (StringBuilder.)] (.append sb \"abc\") (.length sb))" :expected "3"}
+  {:suite "sbdirect" :expr "(let [sb (StringBuilder.)] (.isEmpty sb))" :expected "true"}
+  {:suite "sbdirect" :expr "(let [sb (StringBuilder.)] (.append sb \"x\") (.isEmpty sb))" :expected "false"}
+  {:suite "sbdirect" :expr "(let [sb (StringBuilder.)] (.append sb \"abc\") (.charAt sb 1))" :expected "\\b"}
+  ;; the ctor's own content arg still counts, and length/toString flush the chunks
+  {:suite "sbdirect" :expr "(let [sb (StringBuilder. \"pre-\")] (.append sb \"x\") [(.toString sb) (.length sb)])" :expected "[\"pre-x\" 5]"}
+  {:suite "sbdirect" :expr "((fn [^StringBuilder b] (.append b \"x\") (.toString b)) (StringBuilder. \"p-\"))" :expected "\"p-x\""}
+  ;; a constructor in target position is NOT a proof source (it would be spliced
+  ;; twice by append's fluent return); the generic path answers it correctly
+  {:suite "sbdirect" :expr "(.toString (.append (StringBuilder.) \"lit\"))" :expected "\"lit\""}
+  ;; outside the table -> generic dispatch, same answer (setLength is deliberately
+  ;; left generic for its range check)
+  {:suite "sbdirect" :expr "(let [sb (StringBuilder.)] (.append sb \"abcd\") (.setLength sb 2) (.toString sb))" :expected "\"ab\""}
+  {:suite "sbdirect" :expr "(let [sb (StringBuilder.)] (.append sb \"abcd\") (.substring sb 1 3))" :expected "\"bc\""}
+  ;; the emitted heads are shadow-proof (rt-emitted-names): a local named after one
+  ;; of them must not be what the inline emission calls
+  {:suite "sbdirect" :expr "(let [render-piece (fn [_] \"SHADOWED\") sb (StringBuilder.)] (.append sb \"ok\") (.toString sb))" :expected "\"ok\""}
+  {:suite "sbdirect" :expr "(let [sb-append! (fn [_ _] nil) sb (StringBuilder.)] (.append sb \"ok\") (.toString sb))" :expected "\"ok\""}
+  {:suite "strdirect" :expr "(let [str-trim (fn [_] \"SHADOWED\")] (.trim \"  a  \"))" :expected "\"a\""}
   {:suite "type" :expr "(type 5)" :expected "java.lang.Long"}
   {:suite "type" :expr "(type 5.0)" :expected "java.lang.Double"}
   {:suite "type" :expr "(type (/ 10 2))" :expected "java.lang.Long"}
