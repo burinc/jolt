@@ -9,6 +9,48 @@
 ;; lowers * to fl*. build-smoke greps flat.ss for the fl-op (proves wp-infer ran).
 (defn area [r] (* r r))
 
+;; Unhinted string interop: the target (str x) types :str per-form (the str-ret
+;; table), so the built binary lowers .startsWith/.indexOf to the string natives
+;; inline — build-smoke greps flat.ss for str-starts-with? and the ABSENCE of a
+;; record-method-dispatch "startsWith" (proves the :str stamp emitted directly).
+(defn strd-prefix [x] (.startsWith (str x) "s"))
+(defn strd-find [x] (.indexOf (str x) (int 45)))
+
+;; The per-ns ret table: clojure.string/replace ALWAYS returns a string (so the
+;; target types :str and lowers directly), while clojure.core/replace is
+;; polymorphic and must NOT stamp. This call site is the replace row — if the
+;; table lookup regressed to generic dispatch, build-smoke's negative grep for
+;; record-method-dispatch "startsWith" fails on this fn.
+(defn strd-rep [x] (.startsWith (clojure.string/replace x "a" "b") "b"))
+
+;; Never called: only its PRESENCE matters. Referencing a jolt-lang/time class
+;; must make the build scan pull the provider's install ns (src-provider/jolt/
+;; time.clj, a stand-in on the roots) into flat.ss — a built binary has no
+;; source roots, so the runtime class-miss autoload can't fire there.
+(defn zdt-class [] java.time.ZonedDateTime)
+
+;; Proven-keyword interop: honeysql's kw->sym is (.sym ^clojure.lang.Keyword k)
+;; on its :clj branch. The hint proves the target a keyword, so the built binary
+;; must lower .sym to the inline (jolt-symbol (keyword-t-ns t) (keyword-t-name t))
+;; — no record-method-dispatch walk, no jolt-vector rest-args. build-smoke greps
+;; flat.ss for that emission shape and the ABSENCE of a keyword .sym dispatch.
+(defn kwsym [^clojure.lang.Keyword k] (.sym k))
+
+;; Proven-StringBuilder interop: the shape honey.sql.util/join has, and every
+;; string-building loop in Clojure — a let-bound (StringBuilder.) with NO hint in
+;; the source, appended to in a reduce. init-proves-hint supplies the :sb stamp, so
+;; the built binary must lower .append/.toString to the inline sb-append!/sb-str
+;; instead of the jhost method-table walk. build-smoke greps flat.ss for that shape
+;; and for the ABSENCE of a record-method-dispatch "append".
+(defn sbjoin [sep parts]
+  (let [sb (StringBuilder.)]
+    (reduce (fn [first? p]
+              (when-not first? (.append sb sep))
+              (.append sb p)
+              false)
+            true parts)
+    (.toString sb)))
+
 ;; ^:redef / ^:dynamic opt out of direct-linking even with it on by default (the
 ;; release default now), so the built binary can still redef/bind them at runtime.
 (def ^:redef redef-fn (fn [] :original))

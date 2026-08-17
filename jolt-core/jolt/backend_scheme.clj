@@ -41,6 +41,109 @@
 ;; protocol method).
 (def ^:private supported-host-methods #{"isDirectory" "listFiles"})
 
+;; Direct emission for (.m target arg*) whose target is PROVEN a string at
+;; compile time (:target-type :str, stamped by the analyzer from a ^String hint
+;; or a string literal). Emits the jolt-string-method arm's body inline — no
+;; record-method-dispatch arm walk, no jolt-vector rest-args allocation
+;; (~65-150ns/call on the honeysql interop path). Fixed arities only; any other
+;; method or arity falls back to the generic dispatch (identical result).
+;; Chez-only: these natives live in java/natives-str.ss, which the Gambit boot
+;; excludes — a :gambit target keeps the generic path (checked at the emit site).
+;; One deliberate edge divergence: a nil/non-string prefix on startsWith/endsWith
+;; routes to str-starts-with?/str-ends-with?, which throw the JVM's NPE/CCE
+;; instead of the generic arm's Scheme type error.
+(defn- string-direct-emit [m argc t args]
+  (let [a0 (first args) a1 (second args)]
+    (cond
+      (= m "length")      (when (= argc 0) (str "(string-length " t ")"))
+      (= m "toString")    (when (= argc 0) t)
+      (= m "isEmpty")     (when (= argc 0) (str "(fx=? (string-length " t ") 0)"))
+      (= m "toUpperCase") (when (= argc 0) (str "(string-upcase " t ")"))
+      (= m "toLowerCase") (when (= argc 0) (str "(string-downcase " t ")"))
+      (= m "trim")        (when (= argc 0) (str "(str-trim " t ")"))
+      (= m "hashCode")    (when (= argc 0) (str "(java-string-hash " t ")"))
+      (= m "charAt")      (when (= argc 1) (str "(string-ref " t " (jolt->idx " a0 "))"))
+      (= m "indexOf")     (when (or (= argc 1) (= argc 2))
+                            (let [from (if (= argc 2) (str "(jolt->idx " a1 ")") "0")]
+                              (str "(str-index-of-any " t " " a0 " " from ")")))
+      (= m "startsWith")  (when (= argc 1) (str "(str-starts-with? " t " " a0 ")"))
+      (= m "endsWith")    (when (= argc 1) (str "(str-ends-with? " t " " a0 ")"))
+      (= m "contains")    (when (= argc 1)
+                            (str "(fx>=? (str-index-of " t " (str-needle " a0 ") 0) 0)"))
+      (= m "concat")      (when (= argc 1) (str "(string-append " t " " a0 ")"))
+      (= m "substring")   (when (= argc 2)
+                            (str "(substring " t " (jolt->idx " a0 ") (jolt->idx " a1 "))"))
+      (= m "replace")     (when (= argc 2)
+                             (str "(str-replace-literal " t " (str-needle " a0 ") (str-needle " a1 "))"))
+      :else nil)))
+
+;; Direct emission for (.m target …) whose target is PROVEN a keyword
+;; (:target-type :kw, from a ^clojure.lang.Keyword hint or a keyword literal).
+;; Mirrors the keyword arm of record-method-dispatch (records-dispatch.ss)
+;; method-for-method, body-for-body — no dispatch walk, no rest-args vector.
+;; Chez-only, guarded at the emit site like the string path. A wrong hint (a
+;; non-keyword at runtime) fails in the record accessor, the same contract a
+;; wrong ^String hint has.
+;;
+;; `t` is spliced MORE THAN ONCE by sym, toString and hashCode, so it must be an
+;; expression that is free to re-evaluate. It always is: the analyzer stamps
+;; :target-type only for a tagged SYMBOL, a :hint-carrying local (analyzer.clj's
+;; hints ride on :local nodes), or a literal — so `t` is an identifier or a
+;; constant, never a call. A future stamp source that admits a compound target
+;; has to bind t to a temporary first, or these three arms silently evaluate it
+;; two and three times.
+;;
+;; Note this path is NOT what honeysql's kw->sym reaches, despite being the shape
+;; that motivated it. jolt's reader advertises :bb (reader.ss rdr-features), and
+;; honeysql orders its conditional #?(:bb … :clj (.sym ^Keyword k)) with :bb
+;; first at all three of its .sym sites, so jolt takes the pure-Clojure branch
+;; and never sees the interop. It fires for code that writes .sym unconditionally
+;; or puts :clj first.
+(defn- keyword-direct-emit [m argc t args]
+  (let [a0 (first args)]
+    (cond
+      (= m "sym")          (when (= argc 0)
+                             (str "(jolt-symbol (keyword-t-ns " t ") (keyword-t-name " t "))"))
+      (= m "getName")      (when (= argc 0) (str "(keyword-t-name " t ")"))
+      (= m "getNamespace") (when (= argc 0) (str "(or (keyword-t-ns " t ") jolt-nil)"))
+      (= m "toString")     (when (= argc 0)
+                             (str "(string-append \":\" (if (keyword-t-ns " t ") (string-append (keyword-t-ns " t ") \"/\") \"\") (keyword-t-name " t "))"))
+      (= m "hashCode")     (when (= argc 0)
+                             (str "(jolt-s32 (+ (java-symbol-hash (keyword-t-name " t ") (keyword-t-ns " t ")) #x9e3779b9))"))
+      (= m "equals")       (when (= argc 1) (str "(eq? " t " " a0 ")"))
+      :else nil)))
+
+;; Direct emission for (.m target …) whose target is PROVEN a StringBuilder
+;; (:target-type :sb — a ^StringBuilder tag, a local bound to (StringBuilder.),
+;; or a constructor in target position). This is the most expensive interop shape
+;; jolt had: a jhost method call hashes the tag STRING to find the method table,
+;; hashes the method name to find the handler, converts the jolt-vector of rest
+;; args back to a list for `apply`, and hands them to a shim lambda that takes a
+;; further rest list — 270 ns for a 0-arg method and 500 ns for (.append sb "a"),
+;; where sb-append! itself is three vector-set!s.
+;;
+;; Bodies match host-static-methods.ss's own accessors exactly, so a mixed program
+;; that reaches the generic path for an untyped target sees identical behavior. In
+;; particular append RETURNS THE BUILDER (the JVM's fluent contract, which is what
+;; makes (-> sb (.append a) (.append b)) work), so `t` is spliced twice and, as
+;; with the keyword table, that is only sound because the analyzer stamps :sb for
+;; identifiers and constructor calls alone. A constructor in target position is the
+;; one compound case, and it is bound to a let by emit-let before reaching here.
+;;
+;; append's 3-arg (x, start, end) form and setLength/insert/delete are left to the
+;; generic path: they are not hot and the range checks are worth more than the
+;; nanoseconds.
+(defn- sb-direct-emit [m argc t args]
+  (let [a0 (first args)]
+    (cond
+      (= m "append")    (when (= argc 1)
+                          (str "(begin (sb-append! " t " (render-piece " a0 ")) " t ")"))
+      (= m "toString")  (when (= argc 0) (str "(sb-str " t ")"))
+      (= m "length")    (when (= argc 0) (str "(->num (sb-length " t "))"))
+      (= m "isEmpty")   (when (= argc 0) (str "(fx=? (sb-length " t ") 0)"))
+      (= m "charAt")    (when (= argc 1) (str "(string-ref (sb-str " t ") (jolt->idx " a0 "))"))
+      :else nil)))
+
 ;; The current compilation-unit context (jolt.passes.types unit). ALL emit-session
 ;; state — the mode flags, the direct-link name registries, the record-ctor shape
 ;; registry, the gensym counter and the per-site cache cells — lives on it, read
@@ -557,6 +660,17 @@
                   ;; record/reify protocol-method dispatch (:host-call fallback
                   ;; for any .method not in supported-host-methods).
                   "record-method-dispatch"
+                  ;; proven-target interop natives (string-direct-emit,
+                  ;; keyword-direct-emit, sb-direct-emit). These are bare heads a
+                  ;; user local could shadow and the "jolt-" prefix net does not
+                  ;; catch them, so they are enumerated per the invariant above:
+                  ;; (let [str-trim (fn [_] :shadowed)] (.trim ^String s)) would
+                  ;; otherwise emit a call to the local.
+                  "str-trim" "str-needle" "str-starts-with?" "str-ends-with?"
+                  "str-index-of" "str-index-of-any" "str-replace-literal"
+                  "java-string-hash" "java-symbol-hash"
+                  "keyword-t-ns" "keyword-t-name"
+                  "sb-append!" "sb-str" "sb-length" "render-piece" "->num"
                   ;; cell-cached var deref (the whole-program var-cache? path).
                   "var-cell-deref"
                   ;; devirt cached-desc lookup (emit-invoke ctor inlining).
@@ -1843,16 +1957,29 @@
     :bigdec (str "(jolt-bigdec-from-string " (chez-str-lit (:source node)) ")")
     ;; a namespace value spliced into a form (~*ns*) -> reconstruct by name.
     :the-ns (str "(intern-ns! " (chez-str-lit (:name node)) ")")
-    ;; (.method target arg*) -> jolt-host-call for an rt-shimmed method, else
-    ;; record-method-dispatch (a reify/record protocol method).
-    :host-call (let [m (:method node)
-                     target (emit (:target node))
-                     args (map emit (:args node))]
-                 (if (supported-host-methods m)
-                   (str "(jolt-host-call " (chez-str-lit m) " " target
-                        (if (empty? args) "" (str " " (str/join " " args))) ")")
-                   (str "(record-method-dispatch " target " " (chez-str-lit m)
-                        " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))
+     ;; (.method target arg*) -> jolt-host-call for an rt-shimmed method, else
+     ;; record-method-dispatch (a reify/record protocol method). A target PROVEN
+     ;; a string (:target-type :str) or a keyword (:kw) on the Chez target emits
+     ;; that native directly — no dispatch walk, no rest-args vector. The emitted
+     ;; target is bound as `t` rather than `target` so the host predicate
+     ;; `(target)` stays reachable in this scope.
+     :host-call (let [m (:method node)
+                      chez? (not= :gambit (target))
+                      t (emit (:target node))
+                      args (map emit (:args node))
+                      direct (when chez?
+                               (or (when (= :str (:target-type node))
+                                     (string-direct-emit m (count args) t args))
+                                   (when (= :kw (:target-type node))
+                                     (keyword-direct-emit m (count args) t args))
+                                   (when (= :sb (:target-type node))
+                                     (sb-direct-emit m (count args) t args))))]
+                  (if direct direct
+                      (if (supported-host-methods m)
+                        (str "(jolt-host-call " (chez-str-lit m) " " t
+                             (if (empty? args) "" (str " " (str/join " " args))) ")")
+                        (str "(record-method-dispatch " t " " (chez-str-lit m)
+                             " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))"))))
     :let (emit-let node)
     :loop (emit-loop node)
     :recur (emit-recur node)

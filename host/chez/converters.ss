@@ -290,10 +290,51 @@
                                     (else (exact (truncate x)))))
                  (else (jolt-cast-truncate-slow x)))))
     (if (and (>= n lo) (<= n hi)) n (jolt-cast-range-throw name x))))
-(define (jolt-byte-cast x)  (jolt-checked-cast "byte" -128 127 x))
-(define (jolt-short-cast x) (jolt-checked-cast "short" -32768 32767 x))
-(define (jolt-int-cast x)   (jolt-checked-cast "int" -2147483648 2147483647 x))
-(define (jolt-long-cast x)  (jolt-checked-cast "long" -9223372036854775808 9223372036854775807 x))
+;; A fixnum is what these casts are handed almost every time they are called —
+;; (long (.length s)), (int i) in a loop — and it is already the answer, so each
+;; cast checks for one before entering the generic path above. That path is not
+;; slow by accident: `truncate` is a generic procedure call, and for the LONG
+;; bounds in particular Chez's fixnums are 61-bit, so +-2^63 are BIGNUMS and the
+;; two range compares are fixnum-vs-bignum generic arithmetic on every single call.
+;; Measured 44.7 ns for one (unchecked-int i) against 2.7 ns on the JVM, which is
+;; ~100 ns per character in a hinted .charAt loop — honeysql's alphanumeric? was
+;; 30x the JVM almost entirely because of this.
+;;
+;; The bound tests use the fx forms, valid because `fixnum?` has already answered
+;; and every bound here is itself a fixnum on a 61-bit tower. LONG needs no test
+;; at all: every Chez fixnum fits a 64-bit long by construction.
+(define (jolt-byte-cast x)
+  (if (and (fixnum? x) (fx>=? x -128) (fx<=? x 127))
+      x
+      (jolt-checked-cast "byte" -128 127 x)))
+(define (jolt-short-cast x)
+  (if (and (fixnum? x) (fx>=? x -32768) (fx<=? x 32767))
+      x
+      (jolt-checked-cast "short" -32768 32767 x)))
+;; `int` is the one checked cast whose overflow is NOT an
+;; IllegalArgumentException. Clojure routes the integer case through
+;; Numbers.throwIntOverflow, so (int 2147483648) is an ArithmeticException
+;; "integer overflow" while (int 2.5e9) keeps the IAE that RT.intCast(double)
+;; raises for itself. byte/short/long use the IAE for both kinds of input, which
+;; is why only this one needs the split. jolt threw the IAE for both.
+(define (jolt-int-overflow-throw)
+  (jolt-throw (jolt-host-throwable "java.lang.ArithmeticException"
+                                   "integer overflow")))
+(define (jolt-int-cast x)
+  (cond
+    ((and (fixnum? x) (fx>=? x -2147483648) (fx<=? x 2147483647)) x)
+    ((flonum? x) (jolt-checked-cast "int" -2147483648 2147483647 x))
+    (else
+     (let ((n (cond ((char? x) (char->integer x))
+                    ((and (number? x) (exact? x)) (truncate x))
+                    (else (jolt-cast-truncate-slow x)))))
+       (if (and (>= n -2147483648) (<= n 2147483647))
+           n
+           (jolt-int-overflow-throw))))))
+(define (jolt-long-cast x)
+  (if (fixnum? x)
+      x
+      (jolt-checked-cast "long" -9223372036854775808 9223372036854775807 x)))
 (def-var! "clojure.core" "int" jolt-int-cast)
 (def-var! "clojure.core" "long" jolt-long-cast)
 (def-var! "clojure.core" "byte" jolt-byte-cast)
@@ -317,8 +358,14 @@
 ;; unchecked-long: truncate + wrap to 64 bits (RT.uncheckedLongCast — a float
 ;; infinity saturates, NaN is 0). unchecked-int wraps and sign-folds to 32.
 (define (jolt-cast-saturate n lo hi) (cond ((< n lo) lo) ((> n hi) hi) (else n)))
+;; Same fixnum-first shape as the checked casts above, and for the same reason —
+;; see their comment. A fixnum already IS its own 64-bit wrap, so the long form
+;; returns it untouched; the int form still has to sign-fold a fixnum wider than
+;; 32 bits, which fxand/fx- do without leaving the fixnum domain because
+;; #xffffffff is itself a fixnum here.
 (define (jolt-unchecked-long x)
-  (cond ((char? x) (char->integer x))
+  (cond ((fixnum? x) x)
+        ((char? x) (char->integer x))
         ;; an exact integer wraps (long narrowing); a double SATURATES (Java's
         ;; double->long conversion clamps at the bounds, NaN is 0).
         ((and (number? x) (exact? x)) (jolt-wrap64 (truncate x)))
@@ -327,13 +374,24 @@
                                              -9223372036854775808 9223372036854775807)))
         (else (jolt-wrap64 (jolt-cast-truncate-slow x)))))
 (define (jolt-unchecked-int x)
-  (if (flonum? x)
-      ;; double->int clamps like Java
-      (if (nan? x) 0
-          (jolt-cast-saturate (if (infinite? x) (if (> x 0.0) #x80000000 (- #x80000000)) (exact (truncate x)))
-                              -2147483648 2147483647))
-      (let ((i (bitwise-and (jolt-unchecked-long x) #xffffffff)))
-        (if (>= i #x80000000) (- i #x100000000) i))))
+  (cond
+    ((fixnum? x)
+     (if (and (fx>=? x -2147483648) (fx<=? x 2147483647))
+         x
+         (let ((i (fxand x #xffffffff)))
+           (if (fx>=? i #x80000000) (fx- i #x100000000) i))))
+    ;; a char's code point is a Unicode scalar value, so it is always inside the
+    ;; int range and needs no fold — see jolt-char on why jolt's are up to
+    ;; #x10FFFF rather than the JVM's 16 bits.
+    ((char? x) (char->integer x))
+    ((flonum? x)
+     ;; double->int clamps like Java
+     (if (nan? x) 0
+         (jolt-cast-saturate (if (infinite? x) (if (> x 0.0) #x80000000 (- #x80000000)) (exact (truncate x)))
+                             -2147483648 2147483647)))
+    (else
+     (let ((i (bitwise-and (jolt-unchecked-long x) #xffffffff)))
+       (if (>= i #x80000000) (- i #x100000000) i)))))
 (def-var! "clojure.core" "unchecked-long" jolt-unchecked-long)
 (def-var! "clojure.core" "unchecked-int" jolt-unchecked-int)
 (def-var! "clojure.core" "double" jolt-double)

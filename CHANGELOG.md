@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+An interop-dispatch release in the making. The theme: a `.method` call on a
+string — `indexOf`, `toUpperCase`, `startsWith` — is the innermost loop of
+:clj-fast-path libraries like honeysql, and every one of those calls was paying
+the full generic record-dispatch walk plus a rest-args vector it didn't need.
+The entries below remove that cost where the target provably is a string, and
+take the loose ends the campaign surfaced in `clojure.string` with it.
+
+Profiling honeysql the rest of the way turned the theme into a broader one: the
+same library's remaining gap was not interop at all but scalar-key hashing and
+the numeric casts, each of which had one outlier hiding behind an otherwise
+uniform per-call overhead. Those are here too.
+
 ### Added
 
 - **Fibers R8, extended to `jolt.process`: a subprocess pipe read or write
@@ -37,6 +49,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still parked on it would otherwise wait forever for an event that is
   never coming. Gated by `test/chez/fibers-process-io-test.ss`, wired into
   `make fibers` right after the socket half's own gate.
+
+### Performance
+
+- **Proven-string interop emits the native call inline.** When the analyzer or
+  the whole-program type pass can prove a `.method` target is a string — a
+  `^String` hint, a string literal, or inference through `str`/`name`/`subs`/
+  `clojure.string` returns — the compiler emits the Chez string native directly
+  for the 16 hottest method/arity combinations (`indexOf`, `charAt`,
+  `toUpperCase`, `startsWith`, `substring`, …): no `record-method-dispatch`
+  walk, no argument vector. Anything unproven, on any other target type,
+  dispatches exactly as before. A hinted `.indexOf` drops 145ns → 26ns; an
+  inference-proven one with no hint in sight, 139ns → 19ns. On honeysql's
+  entity formatting (two `.indexOf` per entity) the 1M-call bench falls
+  4.6s → 3.2s.
+- **`clojure.string` predicates are single-procedure natives.**
+  `starts-with?`/`ends-with?`/`includes?`/`index-of` and `upper-case`/
+  `lower-case` were prelude wrappers that coerced, counted and substringed
+  before comparing; each is now one native procedure. `upper-case` on a
+  keyword argument: 383ns → 43ns.
+- **Keyword/fixnum/string map lookups resolve in one procedure.** The
+  persistent-map fast path for the three common key types no longer re-enters
+  the generic equality machinery per probe.
+- **`clojure.string/replace` with a string pattern lowers to a literal scan.**
+  No regex machinery is built for a plain-string match (honeysql's per-entity
+  `"-"` → `"_"` rename), and `index-of` accepts a char or code point without
+  materializing a one-character string. `str/join` walks the collection once
+  and skips the intermediate list for 0/1-element collections.
+- **`sequential?` is a native**, not two overlay calls deep.
+- **Proven-keyword and proven-`StringBuilder` targets emit inline too.** The
+  same proof the string work introduced now covers `.getName`/`.getNamespace`
+  on a keyword and `append`/`toString`/`length`/`isEmpty`/`charAt` on a
+  `StringBuilder` a `let` binding provably holds. `StringBuilder.append` was
+  the most expensive interop shape in the language at ~500ns, because a jhost
+  method call hashes the tag string to find the method table, hashes the method
+  name to find the handler, and passes rest args as a vector it then converts
+  back to a list for `apply`.
+- **Symbols carry their hash and have fast paths in `jolt-hasheq` and
+  `jolt=2`.** Symbols were second-class in both: hashing one walked two arm
+  registries and four `cond` clauses (82.5ns against 24ns for the equivalent
+  keyword), and the hash itself lived in a per-thread weak table that, for the
+  case that matters most — a symbol built for one lookup and dropped — MISSED
+  and then INSERTED on every call, growing the table once per lookup.
+- **A symbol's name is hashed once per process, not once per symbol.** Caching
+  in the record only helps a symbol hashed twice, and honeysql's `format-dsl`
+  walks 92 clause keys doing `(get leftover (kw->sym k))`, building a fresh
+  symbol each time. The name string is what repeats, so the murmur is memoized
+  on the interning pool's entry for it and each symbol points at that entry.
+  Constructing and hashing a fresh symbol: 86.9ns → 42.3ns; `(get m sym)` on
+  one: 136.9ns → 91.8ns.
+- **The hash engine's 32-bit leaves are fixnum-pure.** `rotl32` was the most
+  expensive leaf by a factor of three, at 6.3ns against `mul32`'s 2.2ns, and it
+  runs twice per murmur round: `(remainder n 32)` was a generic procedure call
+  on what is a literal 13 or 15 at every call site. `rotl32` 6.3ns → 2.1ns,
+  `hash-combine` 8.2ns → 3.9ns, `murmur3-hash-unencoded-chars` on a 6-char
+  string 67.5ns → 34.4ns.
+- **The numeric casts check for a fixnum first.** `int`, `long`,
+  `unchecked-int` and `unchecked-long` all fell through a generic `cond` to a
+  `truncate` call and generic bitwise masking, and `long` additionally
+  range-checked against ±2^63, which are BIGNUMS on Chez's 61-bit fixnum tower,
+  so every `(long x)` on an ordinary integer paid two fixnum-vs-bignum
+  compares. One `(unchecked-int i)` cost 44.7ns against the JVM's 2.7ns, which
+  is roughly 100ns of pure coercion per character in a hinted `.charAt` loop.
+  honeysql's `alphanumeric?`, a regex rewritten as a character state machine,
+  was 30x the reference almost entirely because of this.
+- **`jolt-invoke1`/`jolt-invoke2` answer lookup-shaped callables.** A map, set,
+  vector or symbol in head position — `(m k)`, `(k m)` — no longer falls
+  through to the variadic `jolt-invoke`.
+
+### Fixed
+
+- **`jolt build` finds host classes a dependency provides.** The
+  require-graph scan never looked at class references inside the closure, so a
+  program using a lib-provided host class (`java.util.Locale`,
+  `ZonedDateTime`, …) built a binary whose runtime class-miss autoload had
+  nothing to load, and hit the RFC 0008 error at startup with the dep
+  correctly declared.
+- **`(int x)` on an out-of-range integer throws `ArithmeticException`.**
+  Clojure routes the integer case through `Numbers.throwIntOverflow`, so
+  `(int 2147483648)` is an `ArithmeticException` "integer overflow" while
+  `(int 2.5e9)` keeps the `IllegalArgumentException` that `RT.intCast(double)`
+  raises for itself. jolt threw the IAE for both. `byte`/`short`/`long` use the
+  IAE for either kind of input, so `int` is the only cast that differs.
+
+- **`(str/replace "aaa" "" "b")` is `"bababab"`.** An empty string pattern now
+  inserts the replacement at every position, as on the JVM, instead of
+  returning the input unchanged.
+- **`starts-with?`/`ends-with?` with a `nil` or non-string prefix** throw the
+  JVM's `NullPointerException`/`ClassCastException` rather than a Scheme type
+  error, so `ex-data`-driven handling sees the expected shape.
 
 ## [0.7.14] - 2026-08-16
 
@@ -4908,7 +5009,7 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.5...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.14...HEAD
 [0.7.6]: https://github.com/jolt-lang/jolt/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/jolt-lang/jolt/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/jolt-lang/jolt/compare/v0.7.3...v0.7.4

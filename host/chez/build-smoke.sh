@@ -103,6 +103,67 @@ if [ "$default_fl" -le "$noop_fl" ]; then
   echo "  FAIL: wp-infer added no fl-ops to the release build (default=$default_fl noop=$noop_fl)"; exit 1
 fi
 
+# The :str stamp on interop targets: app.util/strd-prefix's (.startsWith (str x) …)
+# is unhinted — the target types :str from the str-ret table (per-form inference,
+# no fixpoint needed), so flat.ss carries the inline native and NO
+# record-method-dispatch "startsWith" anywhere. Runtime shape is asserted below
+# via --strd; this is the emit-level proof.
+if ! grep -q 'str-starts-with?' "$out.build/flat.ss"; then
+  echo "  FAIL: str-target .startsWith did not lower to the string native"; exit 1
+fi
+if grep -q 'record-method-dispatch.*startsWith' "$out.build/flat.ss"; then
+  echo "  FAIL: str-target .startsWith still routes through record-method-dispatch"; exit 1
+fi
+if ! grep -q 'str-starts-with?' "$out.noop.build/flat.ss"; then
+  echo "  FAIL: str-target lowering depended on the wp fixpoint (str-ret table is per-form)"; exit 1
+fi
+
+# The :kw stamp on interop targets: app.util/kwsym's (.sym k) is proven a keyword
+# by the ^clojure.lang.Keyword param hint (honeysql's kw->sym shape), so flat.ss
+# must carry the inline keyword arm for kwsym's param and NO record-method-dispatch
+# "sym". The negative grep anchors "sym" right after the target so clojure.pprint's
+# record-method-dispatch this "-fields" lines (which merely contain a symbol named
+# sym elsewhere) don't false-positive; the positive one matches kwsym's exact
+# emission (the bare (jolt-symbol (keyword-t-ns …)) shape also appears in the
+# runtime section, so it alone would not prove the stamp fired).
+if ! grep -qF '(jolt-symbol (keyword-t-ns k) (keyword-t-name k))' "$out.build/flat.ss"; then
+  echo "  FAIL: kw-target .sym did not lower to the inline keyword arm"; exit 1
+fi
+if grep -qE 'record-method-dispatch [^ ()]+"sym"' "$out.build/flat.ss"; then
+  echo "  FAIL: kw-target .sym still routes through record-method-dispatch"; exit 1
+fi
+
+# The :sb stamp: app.util/sbjoin binds (StringBuilder.) to a let local with NOTHING
+# hinted in the source, so this proves init-proves-hint fired and not just the
+# explicit-tag path. flat.ss must carry the inline sb-append!/sb-str emission for
+# that local and route no "append"/"toString" on it through the jhost method table.
+# The negative grep anchors the method name right after the target so unrelated
+# record-method-dispatch lines elsewhere in the closure cannot false-positive.
+if ! grep -qF '(sb-append! sb (render-piece' "$out.build/flat.ss"; then
+  echo "  FAIL: sb-target .append did not lower to the inline sb-append!"; exit 1
+fi
+if ! grep -qF '(sb-str sb)' "$out.build/flat.ss"; then
+  echo "  FAIL: sb-target .toString did not lower to the inline sb-str"; exit 1
+fi
+if grep -qE 'record-method-dispatch [^ ()]+"append"' "$out.build/flat.ss"; then
+  echo "  FAIL: sb-target .append still routes through record-method-dispatch"; exit 1
+fi
+
+# Lib-provided host classes: app.util/zdt-class references java.time.ZonedDateTime
+# (a jolt-lang/time class). The build scan must pull the provider's install ns —
+# src-provider/jolt/time.clj is the on-roots stand-in — into flat.ss, because a
+# built binary has no source roots for the runtime class-miss autoload. The
+# negative control: src-provider/jolt/crypto.clj is also on the roots, but its
+# classes are referenced nowhere, so that provider must stay out. The greps
+# target ns EMISSION (set-chez-ns!), not bare strings — the runtime section of
+# flat.ss always mentions both providers in its autoload tables.
+if ! grep -q 'set-chez-ns! "jolt\.time"' "$out.build/flat.ss"; then
+  echo "  FAIL: a jolt.time class ref did not pull the provider ns into flat.ss"; exit 1
+fi
+if grep -q 'set-chez-ns! "jolt\.crypto"' "$out.build/flat.ss"; then
+  echo "  FAIL: unreferenced lib provider jolt.crypto leaked into flat.ss"; exit 1
+fi
+
 # --no-direct-link opts back out of the release default: the app->app call must
 # NOT lower to a jv$ binding (stays var-routed, dynamically linked).
 if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out.nodl" --no-direct-link >/dev/null 2>&1; then
@@ -131,6 +192,30 @@ got_rd="$(cd / && "$out" --redef 2>&1)"
 if ! printf '%s' "$got_rd" | grep -q '^redef: :patched$'    || ! printf '%s' "$got_rd" | grep -q '^dyn: :bound$'; then
   echo "  FAIL: ^:redef/:dynamic opt-out — want 'redef: :patched' and 'dyn: :bound' lines"
   echo "--- got ----"; echo "$got_rd"; exit 1
+fi
+
+# The :str-stamped interop answers at runtime with the same values the generic
+# dispatch would (the emit-level proof is the flat.ss grep above).
+got_strd="$(cd / && "$out" --strd 2>&1)"
+if ! printf '%s' "$got_strd" | grep -q '^strd: true false 1 true false$'; then
+  echo "  FAIL: :str-stamped interop output — want 'strd: true false 1 true false'"
+  echo "--- got ----"; echo "$got_strd"; exit 1
+fi
+
+# Same runtime-shape check for the :kw-stamped interop (app.util/kwsym).
+got_kwsym="$(cd / && "$out" --kwsym 2>&1)"
+if ! printf '%s' "$got_kwsym" | grep -q '^kwsym: ns/qual plain$'; then
+  echo "  FAIL: :kw-stamped interop output — want 'kwsym: ns/qual plain'"
+  echo "--- got ----"; echo "$got_kwsym"; exit 1
+fi
+
+# Same runtime-shape check for the :sb-stamped interop (app.util/sbjoin): the
+# separator logic, the empty case, and the single-element case all have to survive
+# the inline lowering, since append's fluent return is what the reduce threads.
+got_sbjoin="$(cd / && "$out" --sbjoin 2>&1)"
+if ! printf '%s' "$got_sbjoin" | grep -q '^sbjoin: a\.b\.c  x$'; then
+  echo "  FAIL: :sb-stamped interop output — want 'sbjoin: a.b.c  x'"
+  echo "--- got ----"; echo "$got_sbjoin"; exit 1
 fi
 
 # Portable embed: remove the build-time source tree and run from / — the

@@ -471,8 +471,9 @@
 (define (rdr-attach-meta target meta)
   (cond
     ((symbol-t? target)
-     (make-symbol-t (symbol-t-ns target) (symbol-t-name target)
-                    (rdr-merge-meta (symbol-t-meta target) meta)))
+     ;; symbol-t-with-meta (values.ss): carries the khash over, since ns/name are
+     ;; unchanged and only the metadata differs.
+     (symbol-t-with-meta target (rdr-merge-meta (symbol-t-meta target) meta)))
     ;; Lists/vectors/maps/sets attach metadata to the value itself, as Clojure's
     ;; reader does. Reading DATA (read-string, edn) then preserves it. A list form
     ;; is code: ^Type (expr) is a compile-time hint on the FORM, read off the form

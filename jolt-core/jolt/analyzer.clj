@@ -118,15 +118,50 @@
 ;; Two hints resolve to the :struct fast path (a constant-keyword lookup skips
 ;; the :jolt/type guard and emits a bare get): ^:struct (a plain struct/record
 ;; map) and ^TypeName where TypeName is a defrecord/deftype (its instances are
-;; tagged :jolt/deftype, not :jolt/type, so a raw get is correct). Every other
-;; hint (^String, ^long, ...) parses and is ignored, as before.
+;; tagged :jolt/deftype, not :jolt/type, so a raw get is correct). ^String
+;; resolves to :str (the :host-call direct string-native path, str-target-type
+;; below), and ^clojure.lang.Keyword to :kw (the keyword arm of the same path).
+;; Every other hint (^long, ...) parses and is ignored, as before.
+;;
+;; Both new values are inert to the struct machinery: every consumer that ACTS on
+;; a hint equality-checks :struct (backend_scheme.clj's field-access and 1-arg
+;; lookup sites). The one consumer that does not is passes/inline.clj, which
+;; tests truthiness — but only to copy a hint from an inlined call onto the local
+;; it was bound to, which is propagation, not interpretation, and is what a :str
+;; or :kw hint wants anyway.
+(defn- str-tag? [t]
+  (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
+    (or (= s "String") (= s "java.lang.String"))))
+(defn- kw-tag? [t]
+  (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
+    (or (= s "Keyword") (= s "clojure.lang.Keyword"))))
+(defn- sb-tag? [t]
+  (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
+    (or (= s "StringBuilder") (= s "java.lang.StringBuilder"))))
 (defn- hint-of [ctx sym]
   (let [m (form-sym-meta sym)]
     (cond
       (nil? m) nil
       (get m :struct) :struct
       :else (let [t (get m :tag)]
-              (when (and t (record-type? ctx t)) :struct)))))
+              (cond (and t (record-type? ctx t)) :struct
+                    (str-tag? t) :str
+                    (kw-tag? t) :kw
+                    (sb-tag? t) :sb
+                    :else nil)))))
+
+;; A hint the INIT proves rather than the programmer writes. (StringBuilder.) can
+;; only ever produce a StringBuilder, so a local bound directly to one is proven
+;; :sb with nothing in the source — which matters because nobody writes
+;; ^StringBuilder on `(let [sb (StringBuilder.)] …)`, and that let is how every
+;; string-building loop in Clojure is shaped (honeysql's join, data.json's reader,
+;; clojure.pprint). Deliberately just the direct case: a constructor call in the
+;; binding position, no flow analysis, no reassignment to worry about since a let
+;; local is immutable.
+(defn- init-proves-hint [init]
+  (when (and (= :host-new (get init :op))
+             (sb-tag? (get init :class)))
+    :sb))
 (defn- add-hint [env nm h]
   (if h (assoc env :hints (assoc (:hints env) nm h)) env))
 
@@ -190,7 +225,10 @@
               ;; flvector aget/aset path (mirrors the :ahints param route).
               ak (ahint-of ctx bsym)
               init (if ak (assoc init0 :akind ak) init0)]
-          (recur (+ i 2) (add-hint (add-locals env [nm]) nm (hint-of ctx bsym))
+          ;; an explicit hint wins; init-proves-hint only fills in where the
+          ;; programmer wrote nothing.
+          (recur (+ i 2) (add-hint (add-locals env [nm]) nm
+                                   (or (hint-of ctx bsym) (init-proves-hint init)))
                  (conj pairs [nm init]))))
       [pairs env])))
 
@@ -742,13 +780,65 @@
        (not (= "-" (subs nm 1 2)))     ; .-field is field access
        (not (= "." (subs nm 1 2)))))   ; .. is the threading macro, not .method
 
+;; The compile-time proof that a :host-call's target is a string, driving the
+;; backend's direct string-native emission (no record-method-dispatch walk, no
+;; jolt-vector rest-args). Three sources: the target's own ^String tag, a ^String
+;; let/param binding the target reads through (:hint :str from hint-of), and a
+;; string literal. NOT inferred types — this is the hint seam; widening it to the
+;; :str lattice value is the follow-up.
+(defn- str-target-type [raw target]
+  (when (or (and (form-sym? raw) (str-tag? (get (form-sym-meta raw) :tag)))
+            (= :str (:hint target))
+            (and (= :const (:op target)) (string? (:val target))))
+    :str))
+
+;; Same seam for keywords. Sources mirror str-target-type: the ^Keyword tag, a
+;; :kw-hinted binding, or a keyword literal. Note jolt does NOT reach honeysql's
+;; (.sym ^clojure.lang.Keyword k) despite that being the shape this was written
+;; for — jolt's reader advertises :bb and honeysql orders its conditional with :bb
+;; first, so the pure-Clojure branch wins. See keyword-direct-emit.
+(defn- kw-target-type [raw target]
+  (when (or (and (form-sym? raw) (kw-tag? (get (form-sym-meta raw) :tag)))
+            (= :kw (:hint target))
+            (and (= :const (:op target)) (keyword? (:val target))))
+    :kw))
+
+;; And for StringBuilder, the one that pays for itself the most: a jhost method
+;; call is the most expensive interop shape jolt has — the tag's method table is
+;; found by hashing the tag STRING, the method by hashing its name, the rest args
+;; arrive as a jolt-vector and are converted back to a list for `apply`, and the
+;; shim lambda takes them as a further rest list. Measured 270 ns for a 0-arg
+;; StringBuilder method and 500 ns for (.append sb "a"), against 20 ns on the JVM.
+;; Sources are the ^StringBuilder tag and a :sb-hinted binding — which
+;; init-proves-hint supplies for (let [sb (StringBuilder.)] …) with nothing written
+;; in the source. Both give an IDENTIFIER as the emitted target, which sb-direct-emit
+;; requires: its append arm splices the target twice, once to append and once to
+;; return (the JVM's fluent contract).
+;;
+;; A constructor directly in target position, (.append (StringBuilder.) x), is
+;; deliberately NOT a source even though it proves the type just as well. It is an
+;; expression, so the second splice would run it again and append to a fresh
+;; builder — the gate caught exactly that, answering "" for
+;; (.toString (.append (StringBuilder.) "lit")). Binding the target to a temporary
+;; here would fix it, but nothing writes that shape and the generic path already
+;; handles it correctly.
+(defn- sb-target-type [raw target]
+  (when (or (and (form-sym? raw) (sb-tag? (get (form-sym-meta raw) :tag)))
+            (= :sb (:hint target)))
+    :sb))
+
 (defn- analyze-host-call [ctx hname items env]
   (when (< (count items) 2)
     (throw (str "Malformed member expression, expecting (.method target ...): " hname)))
-  {:op :host-call
-   :method (subs hname 1)
-   :target (analyze ctx (nth items 1) env)
-   :args (mapv #(analyze ctx % env) (drop 2 items))})
+  (let [raw (nth items 1)
+        target (analyze ctx raw env)]
+    (cond-> {:op :host-call
+             :method (subs hname 1)
+             :target target
+             :args (mapv #(analyze ctx % env) (drop 2 items))}
+      (str-target-type raw target) (assoc :target-type :str)
+      (kw-target-type raw target) (assoc :target-type :kw)
+      (sb-target-type raw target) (assoc :target-type :sb))))
 
 ;; A constructor head: `Class.` — a symbol ending in "." (but not the member
 ;; access `.method` / `..` forms). `(Class. args*)` builds an instance.

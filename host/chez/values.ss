@@ -110,20 +110,89 @@
 ;; JVM-parity property this exists for stops holding for that name — but it is the
 ;; same unlocked check-then-set on the same kind of table, reached from every
 ;; thread that reads a symbol, and the miss path is just as cold.
+;;
+;;
+;; The pool's VALUE is a 2-slot CELL — the canonical string plus a memo slot for
+;; its murmur hash — rather than the string itself, and each symbol keeps a pointer
+;; to its name's cell (symbol-t-ncell below). That is what makes a freshly built
+;; symbol cheap to hash: the murmur over a given name happens once per process, not
+;; once per symbol built from it. See symbol-t's comment for why per-object caching
+;; alone left the hot shape slow.
+;;
+;; The memo slot is MUTABLE and starts #f, because hasheq.ss loads after this file
+;; and there is no murmur to call while values.ss is still loading. symstr-mhash!
+;; (hasheq.ss) is its only writer. Two threads racing compute the same value from
+;; the same immutable string, so the loser's store is a no-op — the same benign-race
+;; argument as khash below, and the reason the memo needs no lock while the
+;; identity-conferring string slot does.
 (define symbol-string-pool (make-hashtable string-hash string=?))
 (define symbol-string-pool-mu (make-mutex))
+(define (make-symstr s) (cons s #f))
+(define (symstr-str c) (car c))
+(define (symstr-mhash c) (cdr c))                   ; murmur3-hash-unencoded-chars
+(define (symstr-mhash-set! c h) (set-cdr! c h))
+(define (intern-symbol-cell s)
+  (or (hashtable-ref symbol-string-pool s #f)
+      (jolt-with-mutex symbol-string-pool-mu
+        (or (hashtable-ref symbol-string-pool s #f)
+            (let ((c (make-symstr s)))
+              (hashtable-set! symbol-string-pool s c)
+              c)))))
 (define (intern-symbol-string s)
-  (if (string? s)
-      (or (hashtable-ref symbol-string-pool s #f)
-          (jolt-with-mutex symbol-string-pool-mu
-            (or (hashtable-ref symbol-string-pool s #f)
-                (begin (hashtable-set! symbol-string-pool s s) s))))
-      s))
-(define-record-type symbol-t (fields ns name meta) (nongenerative symbol-v1))
-(define (jolt-symbol ns name)
-  (make-symbol-t (intern-symbol-string ns) (intern-symbol-string name) jolt-nil))
-(define (jolt-symbol/meta ns name meta)
-  (make-symbol-t (intern-symbol-string ns) (intern-symbol-string name) meta))
+  (if (string? s) (symstr-str (intern-symbol-cell s)) s))
+;; khash caches this symbol's hasheq, the way keyword-t-khash does for keywords,
+;; and ncell is the NAME's pool cell — the same one the pool holds, kept here so
+;; hashing this symbol never has to look the name up again.
+;;
+;; khash is MUTABLE and lazily filled (#f until first hashed) rather than computed
+;; in the constructor: symbols are built during boot and by the reader, before
+;; hasheq.ss is loaded at all, so there is no hash function to call here yet.
+;; Filled by symbol-hasheq (hasheq.ss), which is the only writer. Filling it
+;; eagerly instead was measured and was WORSE: it turns the load-order problem into
+;; an indirect call through a hook that Chez cannot inline, and it charges every
+;; symbol for a hash whether or not anything hashes it — (kw->sym k) x92 with the
+;; symbols discarded got 12.1 -> 13.5 us. Lazy plus ncell beats both, because ncell
+;; is what made the lazy path cheap (47 ns -> 10 ns).
+;;
+;; ncell is where the per-NAME memoization lives, and it is the point of this
+;; whole arrangement. khash alone caches per SYMBOL OBJECT, which does nothing for
+;; the shape that matters most — (get m (symbol (name k))), a symbol built for one
+;; lookup and dropped — because each call gets a fresh object and re-murmurs a name
+;; the process has already hashed thousands of times. The name STRING is the thing
+;; that repeats, so that is what the hash hangs off.
+;;
+;; There is deliberately no cell for the ns. Its contribution is a
+;; java-string-hashcode (14.7 ns, not the 45.8 ns murmur), it is paid once per
+;; symbol object because khash then covers it, and unqualified symbols — the whole
+;; hot population here — skip it entirely. A sixth field on every symbol in the
+;; image is not worth that.
+;;
+;; Two threads hashing one shared symbol both compute the same value from the same
+;; immutable ns/name and write it, so the race is benign — the same argument
+;; keyword interning cannot make (where identity is the equality) and the reason
+;; this can be a plain field instead of a lock. What it replaces is a per-thread
+;; weak-eq hashtable keyed by the symbol object, which for the common
+;; freshly-allocated-symbol-used-once pattern missed AND inserted on every single
+;; lookup: (get m (symbol "x")) grew that table once per call.
+(define-record-type symbol-t (fields ns name meta (mutable khash) ncell)
+  (nongenerative symbol-v3))
+
+(define (make-symbol-t/pooled ns name meta)
+  (if (string? name)
+      (let ((nc (intern-symbol-cell name)))
+        (make-symbol-t (intern-symbol-string ns) (symstr-str nc) meta #f nc))
+      ;; a non-string name cannot be pooled, so it has no cell and hashes the slow
+      ;; way through compute-symbol-hasheq.
+      (make-symbol-t (intern-symbol-string ns) name meta #f #f)))
+(define (jolt-symbol ns name) (make-symbol-t/pooled ns name jolt-nil))
+(define (jolt-symbol/meta ns name meta) (make-symbol-t/pooled ns name meta))
+
+;; ns/name identical means the hasheq is identical, so a symbol rebuilt only to
+;; change its metadata inherits the cache instead of recomputing it. with-meta on
+;; a symbol used as a map key is otherwise a guaranteed miss.
+(define (symbol-t-with-meta s m)
+  (make-symbol-t (symbol-t-ns s) (symbol-t-name s) m
+                 (symbol-t-khash s) (symbol-t-ncell s)))
 (define (jolt-symbol? x) (symbol-t? x))
 
 ;; chars/strings: Chez natives (strings treated immutable).
@@ -183,6 +252,7 @@
 (define (eq-fast-probes)
   (list (cons 0 1) (cons 1.5 2.5)
         (cons (keyword #f "a") (keyword #f "b"))
+        (cons (jolt-symbol #f "a") (jolt-symbol #f "b"))
         (cons "s1" "s2")))
 (define (eq-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who
@@ -213,11 +283,31 @@
     ;; other collections (map/set): forward to collections.ss.
     ((and (jolt-coll? a) (jolt-coll? b)) (jolt-coll=? a b))
     (else (eq? a b))))
+;; The symbol clause is a FAST PATH, not just a hoist of jolt=2-base's own arm.
+;; Symbols are the one scalar jolt allocates fresh on a hot lookup path — a
+;; keyword-to-symbol conversion feeding (get m sym) — so every such compare used
+;; to walk the whole jolt-eq-arms registry and then four cond clauses before
+;; reaching the symbol arm, at 177 ns against 11 ns for the equivalent keyword.
+;;
+;; eq? first on each half, then string=?: intern-symbol-cell pools the ns and
+;; name strings, so the eq? hits for any two symbols read or built through
+;; jolt-symbol, which is the whole population in practice. The string=? is not a
+;; formality. A symbol whose name is not a string never entered the pool at all
+;; (see make-symbol-t/pooled), and a caller that reaches make-symbol-t directly
+;; bypasses it too, so eq? alone would answer #f for two symbols that are equal.
+;; So the fast case is a pointer compare and the correct case is still a compare
+;; of the contents.
 (define (jolt=2 a b)
-  (cond ((and (fixnum? a) (fixnum? b)) (= a b)) 
-        ((and (flonum? a) (flonum? b)) (= a b)) 
-        ((and (eq? a b) (not (number? a))) #t) 
-        (else (let loop ((as jolt-eq-arms)) 
+  (cond ((and (fixnum? a) (fixnum? b)) (= a b))
+        ((and (flonum? a) (flonum? b)) (= a b))
+        ((and (eq? a b) (not (number? a))) #t)
+        ((and (symbol-t? a) (symbol-t? b))
+         (let ((nsa (symbol-t-ns a)) (nsb (symbol-t-ns b))
+               (na (symbol-t-name a)) (nb (symbol-t-name b)))
+           (and (or (eq? nsa nsb)
+                    (and (string? nsa) (string? nsb) (string=? nsa nsb)))
+                (or (eq? na nb) (string=? na nb)))))
+        (else (let loop ((as jolt-eq-arms))
                 (cond ((null? as) (jolt=2-base a b)) 
                       (((caar as) a b) ((cdar as) a b)) 
                       (else (loop (cdr as))))))))
@@ -232,12 +322,12 @@
 ;; register-hash-arm! instead of set!-wrapping jolt-hash — the arms are disjoint
 ;; types, checked before the base cases, so the full behavior is gathered here plus
 ;; the registry rather than scattered across a set! chain (cf. register-str-render!).
-;; Narrower than the printer's set: only nil, keywords, fixnums and strings are
-;; answered before the arm walk, so chars, symbols, flonums, bignums and ratios
+;; Narrower than the printer's set: only nil, keywords, symbols, fixnums and
+;; strings are answered before the arm walk, so chars, flonums, bignums and ratios
 ;; all still reach the arms and an arm claiming one of those is legal.
 ;; Built on demand, not at load: interning a keyword needs hasheq.ss, which
 ;; rt.ss loads after this file. Every arm registers later still.
-(define (hash-fast-probes) (list jolt-nil (keyword #f "k") 0 "s"))
+(define (hash-fast-probes) (list jolt-nil (keyword #f "k") (jolt-symbol #f "s") 0 "s"))
 (define (hash-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who pred (hash-fast-probes) "the jolt-hash fast path"))
 (define jolt-hash-arms '())
@@ -255,6 +345,7 @@
   ;; Fast path for common types: skip the arm walk entirely.
   (cond ((jolt-nil? x) 0)
         ((keyword-t? x) (keyword-t-khash x))
+        ((symbol-t? x) (jolt-hasheq x))
         ((fixnum? x) (jolt-hasheq x))
         ((string? x) (jolt-hasheq x))
         (else (let loop ((as jolt-hash-arms))

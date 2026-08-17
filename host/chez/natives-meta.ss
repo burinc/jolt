@@ -102,7 +102,7 @@
 ;; (with-meta 5 nil) instead of throwing.
 (define (jolt-with-meta x m)
   (cond
-    ((symbol-t? x) (if (eq? (jolt-meta x) m) x (make-symbol-t (symbol-t-ns x) (symbol-t-name x) m)))
+    ((symbol-t? x) (if (eq? (jolt-meta x) m) x (symbol-t-with-meta x m)))
     ;; a deftype with an explicit clojure.lang.IObj withMeta carries meta in a
     ;; field; dispatch to it (see jolt-meta) so the meta survives reconstruction.
     ((and (jrec? x) (jrec-cl x "withMeta")) => (lambda (meth) (jolt-invoke meth x m)))

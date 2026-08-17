@@ -20,6 +20,16 @@
   ;; the release default build (the fl-op in flat.ss, not this output).
   (when (= (first args) "--num")
     (println "area:" (util/area 2.0)))
+  ;; --strd: unhinted string interop via the str-ret :str stamp (see app.util).
+  (when (= (first args) "--strd")
+    (println "strd:" (util/strd-prefix "sy") (util/strd-prefix "no") (util/strd-find "a-b")
+             (util/strd-rep "aa") (util/strd-rep "cc")))
+  ;; --kwsym: proven-keyword interop — (.sym k) on a ^clojure.lang.Keyword param.
+  (when (= (first args) "--kwsym")
+    (println "kwsym:" (util/kwsym :ns/qual) (util/kwsym :plain)))
+  ;; --sbjoin: proven-StringBuilder interop — an unhinted (let [sb (StringBuilder.)]).
+  (when (= (first args) "--sbjoin")
+    (println "sbjoin:" (util/sbjoin "." ["a" "b" "c"]) (util/sbjoin "-" []) (util/sbjoin "," ["x"])))
   ;; --redef: with direct-link the release default, ^:redef/:dynamic must still
   ;; opt out so runtime redefinition / binding take effect in the built binary.
   (when (= (first args) "--redef")
