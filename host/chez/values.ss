@@ -119,11 +119,31 @@
             (or (hashtable-ref symbol-string-pool s #f)
                 (begin (hashtable-set! symbol-string-pool s s) s))))
       s))
-(define-record-type symbol-t (fields ns name meta) (nongenerative symbol-v1))
+;; khash caches this symbol's hasheq, the way keyword-t-khash does for keywords.
+;; MUTABLE and lazily filled (#f until first hashed) rather than computed in the
+;; constructor: symbols are built during boot and by the reader, before hasheq.ss
+;; is loaded at all, so there is no hash function to call here yet. Filled by
+;; symbol-hasheq (hasheq.ss), which is the only writer.
+;;
+;; Two threads hashing one shared symbol both compute the same value from the same
+;; immutable ns/name and write it, so the race is benign — the same argument
+;; keyword interning cannot make (where identity is the equality) and the reason
+;; this can be a plain field instead of a lock. What it replaces is a per-thread
+;; weak-eq hashtable keyed by the symbol object, which for the common
+;; freshly-allocated-symbol-used-once pattern missed AND inserted on every single
+;; lookup: (get m (symbol "x")) grew that table once per call.
+(define-record-type symbol-t (fields ns name meta (mutable khash))
+  (nongenerative symbol-v2))
 (define (jolt-symbol ns name)
-  (make-symbol-t (intern-symbol-string ns) (intern-symbol-string name) jolt-nil))
+  (make-symbol-t (intern-symbol-string ns) (intern-symbol-string name) jolt-nil #f))
 (define (jolt-symbol/meta ns name meta)
-  (make-symbol-t (intern-symbol-string ns) (intern-symbol-string name) meta))
+  (make-symbol-t (intern-symbol-string ns) (intern-symbol-string name) meta #f))
+
+;; ns/name identical means the hasheq is identical, so a symbol rebuilt only to
+;; change its metadata inherits the cache instead of recomputing it. with-meta on
+;; a symbol used as a map key is otherwise a guaranteed miss.
+(define (symbol-t-with-meta s m)
+  (make-symbol-t (symbol-t-ns s) (symbol-t-name s) m (symbol-t-khash s)))
 (define (jolt-symbol? x) (symbol-t? x))
 
 ;; chars/strings: Chez natives (strings treated immutable).
@@ -183,6 +203,7 @@
 (define (eq-fast-probes)
   (list (cons 0 1) (cons 1.5 2.5)
         (cons (keyword #f "a") (keyword #f "b"))
+        (cons (jolt-symbol #f "a") (jolt-symbol #f "b"))
         (cons "s1" "s2")))
 (define (eq-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who
@@ -213,11 +234,30 @@
     ;; other collections (map/set): forward to collections.ss.
     ((and (jolt-coll? a) (jolt-coll? b)) (jolt-coll=? a b))
     (else (eq? a b))))
+;; The symbol clause is a FAST PATH, not just a hoist of jolt=2-base's own arm.
+;; Symbols are the one scalar jolt allocates fresh on a hot lookup path — a
+;; keyword-to-symbol conversion feeding (get m sym) — so every such compare used
+;; to walk the whole jolt-eq-arms registry and then four cond clauses before
+;; reaching the symbol arm, at 177 ns against 11 ns for the equivalent keyword.
+;;
+;; eq? first on each half, then string=?: intern-symbol-string pools the ns and
+;; name strings, so the eq? hits for any two symbols read or built through
+;; jolt-symbol, which is the whole population in practice. The string=? is not a
+;; formality — values.ss documents that pool as an unlocked check-then-set that
+;; can hand out two objects for one name under a race, and dropping to eq? alone
+;; would make (= 'foo 'foo) false for the pair that lost. So the fast case is a
+;; pointer compare and the correct case is still a string compare.
 (define (jolt=2 a b)
-  (cond ((and (fixnum? a) (fixnum? b)) (= a b)) 
-        ((and (flonum? a) (flonum? b)) (= a b)) 
-        ((and (eq? a b) (not (number? a))) #t) 
-        (else (let loop ((as jolt-eq-arms)) 
+  (cond ((and (fixnum? a) (fixnum? b)) (= a b))
+        ((and (flonum? a) (flonum? b)) (= a b))
+        ((and (eq? a b) (not (number? a))) #t)
+        ((and (symbol-t? a) (symbol-t? b))
+         (let ((nsa (symbol-t-ns a)) (nsb (symbol-t-ns b))
+               (na (symbol-t-name a)) (nb (symbol-t-name b)))
+           (and (or (eq? nsa nsb)
+                    (and (string? nsa) (string? nsb) (string=? nsa nsb)))
+                (or (eq? na nb) (string=? na nb)))))
+        (else (let loop ((as jolt-eq-arms))
                 (cond ((null? as) (jolt=2-base a b)) 
                       (((caar as) a b) ((cdar as) a b)) 
                       (else (loop (cdr as))))))))
@@ -232,12 +272,12 @@
 ;; register-hash-arm! instead of set!-wrapping jolt-hash — the arms are disjoint
 ;; types, checked before the base cases, so the full behavior is gathered here plus
 ;; the registry rather than scattered across a set! chain (cf. register-str-render!).
-;; Narrower than the printer's set: only nil, keywords, fixnums and strings are
-;; answered before the arm walk, so chars, symbols, flonums, bignums and ratios
+;; Narrower than the printer's set: only nil, keywords, symbols, fixnums and
+;; strings are answered before the arm walk, so chars, flonums, bignums and ratios
 ;; all still reach the arms and an arm claiming one of those is legal.
 ;; Built on demand, not at load: interning a keyword needs hasheq.ss, which
 ;; rt.ss loads after this file. Every arm registers later still.
-(define (hash-fast-probes) (list jolt-nil (keyword #f "k") 0 "s"))
+(define (hash-fast-probes) (list jolt-nil (keyword #f "k") (jolt-symbol #f "s") 0 "s"))
 (define (hash-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who pred (hash-fast-probes) "the jolt-hash fast path"))
 (define jolt-hash-arms '())
@@ -255,6 +295,7 @@
   ;; Fast path for common types: skip the arm walk entirely.
   (cond ((jolt-nil? x) 0)
         ((keyword-t? x) (keyword-t-khash x))
+        ((symbol-t? x) (jolt-hasheq x))
         ((fixnum? x) (jolt-hasheq x))
         ((string? x) (jolt-hasheq x))
         (else (let loop ((as jolt-hash-arms))

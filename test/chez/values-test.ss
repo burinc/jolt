@@ -87,12 +87,19 @@
     (raises? (lambda () (register-eq-arm! (lambda (a b) (and (flonum? a) (flonum? b)))
                                           (lambda (a b) #t)))))
 
-;; hash's fast path is NARROWER than the printer's: chars, symbols, flonums and
-;; bignums all reach the arms, so the hash guard must let them through
+;; hash's fast path is NARROWER than the printer's: chars, flonums and bignums all
+;; reach the arms, so the hash guard must let them through
 (ok "hash guard allows char"   (not (raises? (lambda () (hash-arm-reject-fast-type! 'test char?)))))
 (ok "hash guard allows flonum" (not (raises? (lambda () (hash-arm-reject-fast-type! 'test flonum?)))))
-(ok "hash guard allows symbol" (not (raises? (lambda () (hash-arm-reject-fast-type! 'test symbol-t?)))))
 (ok "pr guard still rejects char" (raises? (lambda () (pr-arm-reject-fast-type! 'test char?))))
+
+;; Symbols moved ONTO the hash fast path (values.ss jolt-hash, hasheq.ss
+;; jolt-hasheq) when symbol-t gained its khash field, so a symbol-claiming hash arm
+;; is now exactly the silent-skip the invariant exists to catch and the guard has
+;; to reject it. This assertion is the inverse of the one it replaces; if symbols
+;; ever come back off that fast path it has to flip back.
+(ok "hash guard now rejects symbol"
+    (raises? (lambda () (hash-arm-reject-fast-type! 'test symbol-t?))))
 
 ;; pmap-fast-get (collections.ss) answers keyword and string key pairs without
 ;; consulting the arms — same class of bypass as jolt=2's fixnum/flonum clauses
@@ -103,12 +110,17 @@
 (ok "eq arm rejects string pair"
     (raises? (lambda () (register-eq-arm! (lambda (a b) (or (string? a) (string? b)))
                                           (lambda (a b) #t)))))
-;; symbols stay off every eq fast path, so the either-arg shape is still legal
-;; there: eq's identity clause legitimately short-circuits every non-number type,
-;; and a single-sided claim is not subject to the invariant.
+;; jolt=2 answers a symbol PAIR directly now (the pooled-string eq? compare), so
+;; symbols joined keywords and strings above and an arm claiming them is rejected
+;; on the same grounds. Records are the type left to make the either-arg point
+;; with: eq's identity clause legitimately short-circuits every non-number type,
+;; and matching that clause is not what the invariant is about.
+(ok "eq arm rejects symbol pair"
+    (raises? (lambda () (register-eq-arm! (lambda (a b) (or (symbol-t? a) (symbol-t? b)))
+                                          (lambda (a b) #t)))))
 (ok "eq guard allows either-arg shape"
     (not (raises? (lambda () (eq-arm-reject-fast-type!
-                              'test (lambda (a b) (or (symbol-t? a) (symbol-t? b))))))))
+                              'test (lambda (a b) (or (armtest-t? a) (armtest-t? b))))))))
 
 ;; and a real arm on a type off the fast path still registers and is consulted
 (ok "hash arm on a plain type registers"

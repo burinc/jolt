@@ -403,13 +403,16 @@
             #x9e3779b9))))
 
 ;; Symbol hasheq = Util.hashCombine(Murmur3.hashUnencodedChars(name), Util.hash(ns)).
-;; JVM caches in _hasheq field. Jolt symbols aren't interned (meta varies),
-;; so we cache in a weak-eq hashtable keyed by the symbol object.
+;; The JVM caches it in Symbol's _hasheq field and so does jolt now, in
+;; symbol-t-khash (values.ss) — see symbol-hasheq below for why that replaced a
+;; table.
 ;; --- the per-thread hasheq caches -------------------------------------------
-;; A symbol's or string's hasheq is cached, because recomputing it is 8-19x the
-;; cost of a lookup (measured: a 12-char key 47 ns vs 5.8 ns, a 48-char key
-;; 109 ns). Keywords do not need this — they carry their hash in the record
-;; (keyword-t-khash) — but a Chez string cannot hold a field, so a table it is.
+;; A string's hasheq is cached, because recomputing it is 8-19x the cost of a
+;; lookup (measured: a 12-char key 47 ns vs 5.8 ns, a 48-char key 109 ns).
+;; Keywords and symbols do not need this — they carry their hash in the record
+;; (keyword-t-khash, symbol-t-khash) — but a Chez string cannot hold a field, so
+;; a table it is. The car of the pair is vestigial: it held the symbol cache and
+;; is kept so the vreg's shape does not change under a running image.
 ;;
 ;; The tables are per THREAD, not shared. A Chez hashtable is not thread-safe,
 ;; and these are written on every cache MISS from whatever thread is hashing, so
@@ -438,12 +441,25 @@
                      (java-string-hashcode ns))))
     (hash-combine (murmur3-hash-unencoded-chars name) ns-hash)))
 
+;; Read the record's own field, filling it on the first hash.
+;;
+;; This used to be a per-thread weak-eq hashtable keyed by the symbol object, on
+;; the reasoning that symbols are not interned so there is nowhere to put the
+;; hash. There is — symbol-t is a record and can carry a mutable field, which
+;; keywords already did. The table was actively harmful for the case that matters
+;; most: a symbol built for one lookup and dropped, which is what
+;; (get m (symbol (name k))) does, MISSED and then INSERTED, so the weak table
+;; grew by an entry per call and every one of them had to be traced and collected.
+;; honeysql's format-dsl does that 92 times per format call. A field write costs
+;; nothing and dies with the symbol.
+;;
+;; The write is unsynchronized on purpose: ns and name are immutable, so two
+;; threads racing compute the same value and the loser's store is a no-op.
 (define (symbol-hasheq sym)
-  (let ((t (car (hasheq-caches))))
-    (or (hashtable-ref t sym #f)
-        (let ((h (compute-symbol-hasheq (symbol-t-ns sym) (symbol-t-name sym))))
-          (hashtable-set! t sym h)
-          h))))
+  (or (symbol-t-khash sym)
+      (let ((h (compute-symbol-hasheq (symbol-t-ns sym) (symbol-t-name sym))))
+        (symbol-t-khash-set! sym h)
+        h)))
 
 ;; The JVM caches String.hashCode in the object; jolt strings are plain Chez
 ;; strings with nowhere to put it, so they use the per-thread table above.
@@ -471,6 +487,11 @@
   (cond
     ((jolt-nil? x) 0)
     ((keyword? x) (keyword-t-khash x))
+    ;; Symbols sit up here with keywords, not down in the fallback cond behind two
+    ;; arm-registry walks. A keyword-to-symbol conversion feeding a map lookup is a
+    ;; hot path (honeysql's clause walk), and reaching symbol-hasheq the long way
+    ;; cost 82.5 ns against 24 ns for the equivalent keyword.
+    ((jolt-symbol? x) (symbol-hasheq x))
     ;; Fixnum: hot path for integer-keyed maps. Hand-inlined murmur to
     ;; avoid the layered dispatch chain (key-hash→jolt-hasheq→cond→
     ;; hashLong→mixK1→mixH1→fmix). All fixnums use hashLong (count=8)
