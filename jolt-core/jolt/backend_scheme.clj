@@ -41,6 +41,42 @@
 ;; protocol method).
 (def ^:private supported-host-methods #{"isDirectory" "listFiles"})
 
+;; Direct emission for (.m target arg*) whose target is PROVEN a string at
+;; compile time (:target-type :str, stamped by the analyzer from a ^String hint
+;; or a string literal). Emits the jolt-string-method arm's body inline — no
+;; record-method-dispatch arm walk, no jolt-vector rest-args allocation
+;; (~65-150ns/call on the honeysql interop path). Fixed arities only; any other
+;; method or arity falls back to the generic dispatch (identical result).
+;; Chez-only: these natives live in java/natives-str.ss, which the Gambit boot
+;; excludes — a :gambit target keeps the generic path (checked at the emit site).
+;; One deliberate edge divergence: a nil/non-string prefix on startsWith/endsWith
+;; routes to str-starts-with?/str-ends-with?, which throw the JVM's NPE/CCE
+;; instead of the generic arm's Scheme type error.
+(defn- string-direct-emit [m argc t args]
+  (let [a0 (first args) a1 (second args)]
+    (cond
+      (= m "length")      (when (= argc 0) (str "(string-length " t ")"))
+      (= m "toString")    (when (= argc 0) t)
+      (= m "isEmpty")     (when (= argc 0) (str "(fx=? (string-length " t ") 0)"))
+      (= m "toUpperCase") (when (= argc 0) (str "(string-upcase " t ")"))
+      (= m "toLowerCase") (when (= argc 0) (str "(string-downcase " t ")"))
+      (= m "trim")        (when (= argc 0) (str "(str-trim " t ")"))
+      (= m "hashCode")    (when (= argc 0) (str "(java-string-hash " t ")"))
+      (= m "charAt")      (when (= argc 1) (str "(string-ref " t " (jolt->idx " a0 "))"))
+      (= m "indexOf")     (when (or (= argc 1) (= argc 2))
+                            (let [from (if (= argc 2) (str "(jolt->idx " a1 ")") "0")]
+                              (str "(str-index-of-any " t " " a0 " " from ")")))
+      (= m "startsWith")  (when (= argc 1) (str "(str-starts-with? " t " " a0 ")"))
+      (= m "endsWith")    (when (= argc 1) (str "(str-ends-with? " t " " a0 ")"))
+      (= m "contains")    (when (= argc 1)
+                            (str "(fx>=? (str-index-of " t " (str-needle " a0 ") 0) 0)"))
+      (= m "concat")      (when (= argc 1) (str "(string-append " t " " a0 ")"))
+      (= m "substring")   (when (= argc 2)
+                            (str "(substring " t " (jolt->idx " a0 ") (jolt->idx " a1 "))"))
+      (= m "replace")     (when (= argc 2)
+                            (str "(str-replace-literal " t " (str-needle " a0 ") (str-needle " a1 "))"))
+      :else nil)))
+
 ;; The current compilation-unit context (jolt.passes.types unit). ALL emit-session
 ;; state — the mode flags, the direct-link name registries, the record-ctor shape
 ;; registry, the gensym counter and the per-site cache cells — lives on it, read
@@ -1843,16 +1879,24 @@
     :bigdec (str "(jolt-bigdec-from-string " (chez-str-lit (:source node)) ")")
     ;; a namespace value spliced into a form (~*ns*) -> reconstruct by name.
     :the-ns (str "(intern-ns! " (chez-str-lit (:name node)) ")")
-    ;; (.method target arg*) -> jolt-host-call for an rt-shimmed method, else
-    ;; record-method-dispatch (a reify/record protocol method).
-    :host-call (let [m (:method node)
-                     target (emit (:target node))
-                     args (map emit (:args node))]
-                 (if (supported-host-methods m)
-                   (str "(jolt-host-call " (chez-str-lit m) " " target
-                        (if (empty? args) "" (str " " (str/join " " args))) ")")
-                   (str "(record-method-dispatch " target " " (chez-str-lit m)
-                        " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))
+     ;; (.method target arg*) -> jolt-host-call for an rt-shimmed method, else
+     ;; record-method-dispatch (a reify/record protocol method). A target PROVEN
+     ;; a string (:target-type :str) on the Chez target emits the string native
+     ;; directly (string-direct-emit) — no dispatch walk, no rest-args vector.
+     ;; chez? is bound before t: `target` (the host predicate) must not be
+     ;; shadowed yet when it is called.
+     :host-call (let [m (:method node)
+                      chez? (not= :gambit (target))
+                      t (emit (:target node))
+                      args (map emit (:args node))
+                      direct (when (and chez? (= :str (:target-type node)))
+                               (string-direct-emit m (count args) t args))]
+                  (if direct direct
+                      (if (supported-host-methods m)
+                        (str "(jolt-host-call " (chez-str-lit m) " " t
+                             (if (empty? args) "" (str " " (str/join " " args))) ")")
+                        (str "(record-method-dispatch " t " " (chez-str-lit m)
+                             " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))"))))
     :let (emit-let node)
     :loop (emit-loop node)
     :recur (emit-recur node)

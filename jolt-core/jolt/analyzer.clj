@@ -118,15 +118,23 @@
 ;; Two hints resolve to the :struct fast path (a constant-keyword lookup skips
 ;; the :jolt/type guard and emits a bare get): ^:struct (a plain struct/record
 ;; map) and ^TypeName where TypeName is a defrecord/deftype (its instances are
-;; tagged :jolt/deftype, not :jolt/type, so a raw get is correct). Every other
-;; hint (^String, ^long, ...) parses and is ignored, as before.
+;; tagged :jolt/deftype, not :jolt/type, so a raw get is correct). ^String
+;; resolves to :str (the :host-call direct string-native path, str-target-type
+;; below). Every other hint (^long, ...) parses and is ignored, as before.
+;; Every :hint consumer equality-checks :struct, so a :str hint is inert to the
+;; struct machinery.
+(defn- str-tag? [t]
+  (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
+    (or (= s "String") (= s "java.lang.String"))))
 (defn- hint-of [ctx sym]
   (let [m (form-sym-meta sym)]
     (cond
       (nil? m) nil
       (get m :struct) :struct
       :else (let [t (get m :tag)]
-              (when (and t (record-type? ctx t)) :struct)))))
+              (cond (and t (record-type? ctx t)) :struct
+                    (str-tag? t) :str
+                    :else nil)))))
 (defn- add-hint [env nm h]
   (if h (assoc env :hints (assoc (:hints env) nm h)) env))
 
@@ -742,13 +750,28 @@
        (not (= "-" (subs nm 1 2)))     ; .-field is field access
        (not (= "." (subs nm 1 2)))))   ; .. is the threading macro, not .method
 
+;; The compile-time proof that a :host-call's target is a string, driving the
+;; backend's direct string-native emission (no record-method-dispatch walk, no
+;; jolt-vector rest-args). Three sources: the target's own ^String tag, a ^String
+;; let/param binding the target reads through (:hint :str from hint-of), and a
+;; string literal. NOT inferred types — this is the hint seam; widening it to the
+;; :str lattice value is the follow-up.
+(defn- str-target-type [raw target]
+  (when (or (and (form-sym? raw) (str-tag? (get (form-sym-meta raw) :tag)))
+            (= :str (:hint target))
+            (and (= :const (:op target)) (string? (:val target))))
+    :str))
+
 (defn- analyze-host-call [ctx hname items env]
   (when (< (count items) 2)
     (throw (str "Malformed member expression, expecting (.method target ...): " hname)))
-  {:op :host-call
-   :method (subs hname 1)
-   :target (analyze ctx (nth items 1) env)
-   :args (mapv #(analyze ctx % env) (drop 2 items))})
+  (let [raw (nth items 1)
+        target (analyze ctx raw env)]
+    (cond-> {:op :host-call
+             :method (subs hname 1)
+             :target target
+             :args (mapv #(analyze ctx % env) (drop 2 items))}
+      (str-target-type raw target) (assoc :target-type :str))))
 
 ;; A constructor head: `Class.` — a symbol ending in "." (but not the member
 ;; access `.method` / `..` forms). `(Class. args*)` builds an instance.
