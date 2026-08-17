@@ -785,9 +785,45 @@
 ;; picks jolt-invokeN by arg count (N<=4); apply/variadic cases keep jolt-invoke.
 ;; Each embeds an arity pre-check — one fxlogbit? test, predicted taken — so a
 ;; wrong-arity call throws a typed ArityException BEFORE Chez raises a raw condition.
+;;
+;; Past the procedure? test they also answer the LOOKUP-SHAPED callables — a
+;; keyword, symbol, map, set or vector in head position — instead of dropping to
+;; variadic jolt-invoke. That fallback is expensive out of proportion to what it
+;; does: a rest list per call, (length args), an `apply`, and an arity-name string
+;; built by jolt-check-arity-1or2 whether or not the arity is wrong. Measured on a
+;; 4-key map, (m k) cost 256 ns against 38.5 ns for the (get m k) it decays to,
+;; and (k m) with k a LOCAL cost 71 ns against 33 ns for a literal :k head (which
+;; the back end lowers straight to jolt-get and never routes here). honeysql's
+;; format-dsl walks 92 clauses per format call as (k leftover) and (k
+;; @clause-format), so the local-keyword shape is the one that matters.
+;;
+;; Ordering: these clauses sit ahead of jolt-invoke's prefix arms (var-cell?,
+;; jolt-multifn?), which is safe because those arms own RECORD types — a var cell
+;; is not a pmap and a multifn is not a keyword — so no predicate here can claim a
+;; value a prefix arm would have. Everything else, records/reifies implementing
+;; IFn, transients, sorted maps, unbound vars, still falls through unchanged.
+;;
+;; Only the arities each type actually accepts are answered here. A vector or set
+;; takes exactly one argument and a map or keyword takes one or two, so
+;; jolt-invoke2 answers fewer types than jolt-invoke1 and the rest fall through to
+;; get their typed ArityException from jolt-invoke, unchanged.
 (define (jolt-invoke0 f) (if (procedure? f) (if (fxlogbit? 0 (procedure-arity-mask f)) (f) (jolt-proc-arity-error f 0)) (jolt-invoke f)))
-(define (jolt-invoke1 f a) (if (procedure? f) (if (fxlogbit? 1 (procedure-arity-mask f)) (f a) (jolt-proc-arity-error f 1)) (jolt-invoke f a)))
-(define (jolt-invoke2 f a b) (if (procedure? f) (if (fxlogbit? 2 (procedure-arity-mask f)) (f a b) (jolt-proc-arity-error f 2)) (jolt-invoke f a b)))
+(define (jolt-invoke1 f a)
+  (cond
+    ((procedure? f) (if (fxlogbit? 1 (procedure-arity-mask f)) (f a) (jolt-proc-arity-error f 1)))
+    ((keyword? f) (jolt-get a f))            ; (:k m) -> (get m :k)
+    ((pmap? f) (jolt-get f a))               ; (m k)  -> (get m k)
+    ((jolt-symbol? f) (jolt-get a f))        ; ('s m) -> (get m 's)
+    ((pvec? f) (jolt-nth f a))               ; (v i)  -> (nth v i)
+    ((pset? f) (jolt-get f a))               ; (s x)  -> (get s x)
+    (else (jolt-invoke f a))))
+(define (jolt-invoke2 f a b)
+  (cond
+    ((procedure? f) (if (fxlogbit? 2 (procedure-arity-mask f)) (f a b) (jolt-proc-arity-error f 2)))
+    ((keyword? f) (jolt-get a f b))          ; (:k m d) -> (get m :k d)
+    ((pmap? f) (jolt-get f a b))             ; (m k d)  -> (get m k d)
+    ((jolt-symbol? f) (jolt-get a f b))      ; ('s m d) -> (get m 's d)
+    (else (jolt-invoke f a b))))
 (define (jolt-invoke3 f a b c) (if (procedure? f) (if (fxlogbit? 3 (procedure-arity-mask f)) (f a b c) (jolt-proc-arity-error f 3)) (jolt-invoke f a b c)))
 (define (jolt-invoke4 f a b c d) (if (procedure? f) (if (fxlogbit? 4 (procedure-arity-mask f)) (f a b c d) (jolt-proc-arity-error f 4)) (jolt-invoke f a b c d)))
 
