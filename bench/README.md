@@ -32,6 +32,7 @@ absolute reference.
 | `transducers` | transducer pipelines (`comp` of `map`/`filter`/`take`) | transducer machinery, `reduce` fast paths | CLBG-style |
 | `keyed-lookup` | scalar KEYS: hashing/comparing keywords, symbols and strings, and looking them up in SMALL maps; a symbol built per lookup, and a collection or keyword-local in head position | hash engine fast paths (`jolt-hasheq`/`jolt=2`), `symbol-t` khash, `jolt-invokeN` lookup shapes | honeysql `format-dsl` |
 | `string-build` | `StringBuilder` appended to in a loop, and the transducer-over-`join` shape libraries render text with | proven-StringBuilder direct emission vs jhost method-table dispatch | honeysql `format-entity` |
+| `char-scan` | walking a string one code point at a time via `.charAt`, with the `int`/`long`/`unchecked-*` casts hinted Clojure puts around it, incl. a `case`-dispatched character state machine | numeric cast fast paths, `.charAt` on a proven string, `case` over small ints | honeysql `alphanumeric?` |
 | `sorted-access` | reads a collection's structure can answer without walking: `count`/`drop` on a vector seq, `rseq`, `first` on a sorted map/set | shape-answered reads (Counted / IDrop / leftmost-node), not traversal | — |
 
 ## Scorecard
@@ -58,6 +59,7 @@ default build ships). Times are the mean of 3 runs after warmup, in ms.
 | `string-build` | **4.5×** | — | 205.0 | 46.0 | `StringBuilder` assembly + `join` |
 | `arrays` | **6.3×** | 6.4× | 230.7 | 36.9 | primitive `double-array` throughput |
 | `sorted-access` | **11.7×** | — | 142.8 | 12.2 | shape-answered collection reads |
+| `char-scan` | **26.4×** | — | 343.0 | 13.0 | per-character `.charAt` + numeric casts |
 
 `sorted-access` exists because every operation in it used to be a full traversal
 here while the reference answers it from the collection's shape — and none of
@@ -78,6 +80,20 @@ reducing function; `string-build`'s rf calls a host method instead, which was th
 most expensive interop shape jolt had. Both are sensitive to the fixes that
 followed: against the binary from before them, `keyed-lookup` ran 444ms (1.9×
 slower) and `string-build` 1322ms (6.4× slower).
+
+`char-scan` came out of the same profiling and is the worst ratio in the suite. It
+exists because the cost was in the *casts*, not the loop or the string: `int`,
+`long` and the `unchecked-*` forms all fell through a generic `cond` to a
+`truncate` call and generic bitwise masking, and `long` additionally compared
+against ±2^63, which are BIGNUMS on Chez's 61-bit fixnum tower, so every
+`(long x)` on an ordinary integer paid two fixnum-vs-bignum compares. One
+`(unchecked-int i)` was 44.7ns against the JVM's 2.7ns, which works out to ~100ns
+of pure coercion per character in a hinted `.charAt` loop. Giving each cast a
+fixnum fast path took this benchmark 466ms → 343ms; `alphanumeric?` on a 5-char
+entity went 597ns → 457ns and a plain code-point sum over 5 characters 330ns →
+203ns. What is left is not the casts — it is ~58ns per character for the `.charAt`
+plus loop plus `case` dispatch, against ~2ns on the JVM, and closing that needs
+the casts and `.charAt` to inline at the call site rather than be called.
 
 `opt` and `release` track each other closely across the suite — the plain
 `jolt build` picks up most of the win.

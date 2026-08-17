@@ -533,9 +533,28 @@
 ;;
 ;; The write is unsynchronized on purpose: ns and name are immutable, so two
 ;; threads racing compute the same value and the loser's store is a no-op.
+;; The murmur over the NAME is memoized on the name's pool cell, so a name the
+;; process has hashed before costs a cdr instead of a 45.8 ns walk. That is the
+;; whole reason symbol-t carries ncell — a fresh symbol for a familiar name is the
+;; hot shape, and khash cannot help it. Only a symbol with a non-string name (no
+;; cell) falls through to compute-symbol-hasheq, which must stay byte-compatible
+;; with this: same combiner, same two hashes, same 0 for an absent ns.
+(define (symstr-mhash! c)
+  (or (symstr-mhash c)
+      (let ((h (murmur3-hash-unencoded-chars (symstr-str c))))
+        (symstr-mhash-set! c h)
+        h)))
 (define (symbol-hasheq sym)
   (or (symbol-t-khash sym)
-      (let ((h (compute-symbol-hasheq (symbol-t-ns sym) (symbol-t-name sym))))
+      (let* ((c (symbol-t-ncell sym))
+             (ns (symbol-t-ns sym))
+             ;; one string? in place of compute-symbol-hasheq's three-way
+             ;; nil/#f/() check: an ns that is not a string is exactly an absent
+             ;; one, whichever of those three spellings it arrived as.
+             (h (if c
+                    (hash-combine (symstr-mhash! c)
+                                  (if (string? ns) (java-string-hashcode ns) 0))
+                    (compute-symbol-hasheq ns (symbol-t-name sym)))))
         (symbol-t-khash-set! sym h)
         h)))
 

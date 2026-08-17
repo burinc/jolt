@@ -201,6 +201,48 @@
     (= (jolt-hasheq (jolt-symbol #f "select"))
        (jolt-hasheq (jolt-symbol #f "select"))))
 
+;; --- 6b. the per-NAME murmur memo (symbol-t-ncell) --------------------------
+;; The khash field above only helps a symbol that gets hashed twice. The shape that
+;; matters — (get m (symbol (name k))) — builds a fresh symbol per call, so the
+;; murmur is memoized on the name's POOL CELL instead and each symbol keeps a
+;; pointer to it. Two things have to hold: symbols sharing a name share one cell
+;; (or nothing is amortised), and the memoized answer equals the unmemoized one
+;; (or every hash is silently wrong for names hashed a second time).
+(printf "\n== 6b. the per-name murmur memo ==\n")
+(let* ((nm (string-append "clause" "-memo"))       ; built, so not a literal's object
+       (a (jolt-symbol #f nm))
+       (b (jolt-symbol #f (string-append "clause" "-memo"))))
+  (ok "two symbols built from equal names share one cell"
+      (eq? (symbol-t-ncell a) (symbol-t-ncell b)))
+  (ok "the name string is canonicalized to the cell's"
+      (eq? (symbol-t-name a) (symbol-t-name b)))
+  (ok "the memo starts empty" (not (symstr-mhash (symbol-t-ncell a))))
+  (let ((ha (jolt-hasheq a)))
+    (ok "hashing fills the memo"
+        (eqv? (symstr-mhash (symbol-t-ncell a)) (murmur3-hash-unencoded-chars nm)))
+    (ok "a symbol built later reads the memo and agrees" (= ha (jolt-hasheq b)))
+    (ok "and both agree with the unmemoized compute"
+        (= ha (compute-symbol-hasheq #f nm)))))
+;; the ns half is NOT memoized, so a qualified symbol has to reach the same answer
+;; through symbol-hasheq's string? test as compute-symbol-hasheq does through its
+;; three-way nil/#f/() test. Every spelling of "no namespace" must agree.
+(let ((h (compute-symbol-hasheq #f "bare")))
+  (ok "an absent ns hashes alike however it is spelled"
+      (and (= h (jolt-hasheq (jolt-symbol #f "bare")))
+           (= h (jolt-hasheq (jolt-symbol jolt-nil "bare")))
+           (= h (jolt-hasheq (jolt-symbol '() "bare"))))))
+;; Every symbol reachable from jolt code has a cell, which is what lets the memo
+;; path be the only one that matters. (symbol 42) is rejected before it gets here —
+;; a non-string name has never been hashable, since both the memo path and
+;; compute-symbol-hasheq end in a murmur that indexes the name as a string — so the
+;; cell-less branch of make-symbol-t/pooled is reachable only by an internal caller
+;; going straight to make-symbol-t.
+(ok "symbols built through the public constructors all carry a cell"
+    (and (symbol-t-ncell (jolt-symbol #f "bare"))
+         (symbol-t-ncell (jolt-symbol "ns" "qual"))
+         (symbol-t-ncell (jolt-symbol/meta #f "meta" jolt-nil))
+         (symbol-t-ncell (symbol-t-with-meta (jolt-symbol #f "bare") jolt-nil))))
+
 ;; --- 7. hasheq agrees with jolt= (the HAMT's correctness condition) --------
 ;; Two values that are jolt= MUST hash alike, or a map lookup finds the right
 ;; bucket and then fails the equality check. Symbols are the interesting case
