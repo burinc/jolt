@@ -48,6 +48,19 @@
 ;; ============================================================================
 
 ;; Mask to unsigned 32 bits (0 .. 2^32-1).
+;;
+;; This one MUST stay generic. Unlike every other helper here, u32 is the entry
+;; point for the COLD paths too: murmur3-hash-long's bignum arm masks a 64-bit
+;; value (itself a bignum on a 61-bit fixnum tower) and double-hasheq feeds it a
+;; double's raw bits, so an fxand here is applied to a non-fixnum. Doing that with
+;; the unsafe #3% form does not error, it silently answers wrong — the corpus
+;; caught exactly that as `hash double 1.5` and `hash large long` divergences.
+;; It also buys nothing: measured 2.1 ns either way, because the result is a
+;; fixnum and Chez's generic bitwise-and is already fast for the fixnum case.
+;;
+;; What the fx forms below rely on is the OUTPUT: (u32 x) is always in
+;; [0, 2^32-1] and therefore a fixnum, whatever came in. That is what makes
+;; i32/urs32/rotl32 safe to build on with unsafe fx ops.
 (define-syntax u32
   (syntax-rules ()
     ((_ x) (#3%bitwise-and x #xFFFFFFFF))))
@@ -87,19 +100,39 @@
   (syntax-rules ()
     ((_ a b) (i32 (#3%fx+ (i32 a) (i32 b))))))
 
-;; Unsigned right shift (Java >>>).
+;; Unsigned right shift (Java >>>). fxsrl on the masked value: the operand is a
+;; fixnum and already non-negative after u32, so the logical and arithmetic shifts
+;; agree and the fx form skips the generic dispatch.
 (define-syntax urs32
   (syntax-rules ()
-    ((_ x n) (#3%bitwise-arithmetic-shift-right (u32 x) n))))
+    ((_ x n) (#3%fxsrl (u32 x) n))))
 
 ;; Rotate left (Java Integer.rotateLeft). x and n each evaluated once.
+;;
+;; This was the most expensive leaf in the engine by a factor of three — 6.3 ns
+;; against mul32's 2.2 ns — for two reasons, and it is called twice per murmur
+;; round so it dominated hashing: (remainder n 32) was a GENERIC procedure call on
+;; what is a literal 13 or 15 at every call site, and the shifts and the ior were
+;; the generic bitwise-* forms rather than fx ops. It accounted for roughly half of
+;; murmur3-hash-unencoded-chars.
+;;
+;; The mask is what makes the fx shift safe for any n, not just the 13/15 the
+;; callers use: a bare (fxsll u n) with u up to 2^32-1 and n up to 31 reaches 2^63
+;; and blows past Chez's 61-bit fixnum ceiling. Masking to the low (32-n) bits
+;; FIRST bounds the shifted value at 2^32.
+;;   mask = #xFFFFFFFF >>> n  -> low (32-n) bits set
+;;   lo   = (u & mask) << n   -> < 2^32                                        ✓
+;;   hi   = u >>> (32-n)      -> < 2^n                                         ✓
+;;   lo | hi                  -> < 2^32                                        ✓
+;; n must be in 1..31; every call site passes a literal in range.
 (define-syntax rotl32
   (syntax-rules ()
     ((_ x n)
-     (let ((n* (remainder n 32))
-           (x* x))
-       (i32 (#3%bitwise-ior (#3%bitwise-arithmetic-shift-left (u32 x*) n*)
-                           (urs32 x* (#3%fx- 32 n*))))))))
+     (let* ((x* (u32 x))
+            (n* n)
+            (lo (#3%fxsll (#3%fxand x* (#3%fxsrl #xFFFFFFFF n*)) n*))
+            (hi (#3%fxsrl x* (#3%fx- 32 n*))))
+       (i32 (#3%fxior lo hi))))))
 
 ;; ============================================================================
 ;; Murmur3 — exact port of clojure.lang.Murmur3.
@@ -122,19 +155,49 @@
     k1))
 
 (define (murmur3-mix-h1 h1 k1)
-  (let* ((h1 (bitwise-xor h1 k1))
+  (let* ((h1 (#3%fxxor h1 k1))
          (h1 (rotl32 h1 13))
          (h1 (add32 (mul32 h1 5) #xe6546b64)))
     h1))
 
 (define (murmur3-fmix h1 len)
-  (let* ((h1 (bitwise-xor h1 len))
-         (h1 (bitwise-xor h1 (urs32 h1 16)))
+  (let* ((h1 (#3%fxxor h1 len))
+         (h1 (#3%fxxor h1 (urs32 h1 16)))
          (h1 (mul32 h1 #x85ebca6b))
-         (h1 (bitwise-xor h1 (urs32 h1 13)))
+         (h1 (#3%fxxor h1 (urs32 h1 13)))
          (h1 (mul32 h1 #xc2b2ae35))
-         (h1 (bitwise-xor h1 (urs32 h1 16))))
+         (h1 (#3%fxxor h1 (urs32 h1 16))))
     h1))
+
+;; The same three mixers as MACROS, so a caller gets the flat fx-op chain the
+;; fixnum paths below hand-expand without hand-expanding it again. Same technique,
+;; same arithmetic, one copy of the logic: mul32/rotl32/add32/urs32/i32 are already
+;; macros, so expanding these leaves a let* of fx ops and no calls at all.
+;;
+;; This exists because "cold path" stopped being true for strings. The procedure
+;; forms above cost roughly 10-15 ns per call in Chez and hashing a 6-char symbol
+;; name makes SEVEN of them (mixK1 and mixH1 per 2-char pair, plus one fmix), which
+;; measured 111 ns of the 161 ns a fresh symbol's hasheq took — and honeysql's
+;; format-dsl hashes 92 freshly built symbols per format call. The procedure forms
+;; stay for the genuinely cold bignum paths.
+(define-syntax murmur3-mix-k1-flat
+  (syntax-rules ()
+    ((_ k) (let* ((k1 (mul32 k murmur3-C1))
+                  (k1 (rotl32 k1 15)))
+             (mul32 k1 murmur3-C2)))))
+(define-syntax murmur3-mix-h1-flat
+  (syntax-rules ()
+    ((_ h k) (let* ((h1 (#3%fxxor h k))
+                    (h1 (rotl32 h1 13)))
+               (add32 (mul32 h1 5) #xe6546b64)))))
+(define-syntax murmur3-fmix-flat
+  (syntax-rules ()
+    ((_ h len) (let* ((h1 (#3%fxxor h len))
+                      (h1 (#3%fxxor h1 (urs32 h1 16)))
+                      (h1 (mul32 h1 #x85ebca6b))
+                      (h1 (#3%fxxor h1 (urs32 h1 13)))
+                      (h1 (mul32 h1 #xc2b2ae35)))
+                 (#3%fxxor h1 (urs32 h1 16))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Flat-inlined murmur3-hash-int for int32-range fixnums.
@@ -233,24 +296,35 @@
   ;; UTF-16 code-unit sequence. Processes 2 code units at a time.
   ;; Iterates codepoints directly (no intermediate vector), pairing
   ;; BMP units across iterations and self-pairing astral surrogates.
+  ;;
+  ;; Java reads charAt, so its input IS the code-unit sequence and its loop is a
+  ;; bare `for i += 2`. A Chez string holds CODEPOINTS, so an astral char is two
+  ;; UTF-16 units and the pairing cannot be a fixed stride — hence `pending`,
+  ;; which carries an unpaired unit into the next iteration.
+  ;;
+  ;; Mixers are the -flat MACRO forms: expanding them leaves fx ops with no calls,
+  ;; where the procedure forms cost 7 calls for a 6-char name (mixK1 + mixH1 per
+  ;; pair, plus fmix). Same technique the file already applied to hash-int/hash-long,
+  ;; extended here because a fresh symbol's hasheq is on honeysql's hot path, not a
+  ;; cold one. Values are unchanged — flat-vs-layered is checked over ASCII, BMP,
+  ;; astral, mixed and every length 0..64 in test/chez/hasheq-test.ss.
   (let ((len (string-length s)))
     (let loop ((i 0) (h1 murmur3-seed) (pending #f) (count 0))
       (if (#3%fx>=? i len)
           (if pending
               ;; One unpaired unit left — mix and finalize
-              (let* ((k1 (murmur3-mix-k1 pending))
-                     (h1 (#3%bitwise-xor h1 k1)))
-                (murmur3-fmix h1 (#3%fx* 2 (#3%fx+ count 1))))
-              (murmur3-fmix h1 (#3%fx* 2 count)))
+              (let* ((k1 (murmur3-mix-k1-flat pending))
+                     (h1 (#3%fxxor h1 k1)))
+                (murmur3-fmix-flat h1 (#3%fx* 2 (#3%fx+ count 1))))
+              (murmur3-fmix-flat h1 (#3%fx* 2 count)))
           (let ((cp (char->integer (string-ref s i))))
             (if (#3%fx<? cp #x10000)
                 ;; BMP: one code unit
                 (if pending
                     ;; Pair pending + this unit; both consumed
-                    (let* ((k1 (murmur3-mix-k1
-                                (#3%bitwise-ior pending
-                                 (#3%bitwise-arithmetic-shift-left cp 16))))
-                           (h1 (murmur3-mix-h1 h1 k1)))
+                    (let* ((k1 (murmur3-mix-k1-flat
+                                (#3%fxior pending (#3%fxsll cp 16))))
+                           (h1 (murmur3-mix-h1-flat h1 k1)))
                       (loop (#3%fx+ i 1) h1 #f (#3%fx+ count 2)))
                     ;; Hold as pending (not counted yet)
                     (loop (#3%fx+ i 1) h1 cp count))
@@ -260,16 +334,14 @@
                        (low  (fxior #xDC00 (fxand cp2 #x3FF))))
                   (if pending
                       ;; Pair pending + high (consumed), low becomes new pending
-                      (let* ((k1 (murmur3-mix-k1
-                                  (#3%bitwise-ior pending
-                                   (#3%bitwise-arithmetic-shift-left high 16))))
-                             (h1 (murmur3-mix-h1 h1 k1)))
+                      (let* ((k1 (murmur3-mix-k1-flat
+                                  (#3%fxior pending (#3%fxsll high 16))))
+                             (h1 (murmur3-mix-h1-flat h1 k1)))
                         (loop (#3%fx+ i 1) h1 low (#3%fx+ count 2)))
                       ;; High + low consumed together
-                      (let* ((k1 (murmur3-mix-k1
-                                  (#3%bitwise-ior high
-                                   (#3%bitwise-arithmetic-shift-left low 16))))
-                             (h1 (murmur3-mix-h1 h1 k1)))
+                      (let* ((k1 (murmur3-mix-k1-flat
+                                  (#3%fxior high (#3%fxsll low 16))))
+                             (h1 (murmur3-mix-h1-flat h1 k1)))
                         (loop (#3%fx+ i 1) h1 #f (#3%fx+ count 2)))))))))))
 
 ;; ============================================================================
@@ -374,15 +446,21 @@
 ;; Util.hashCombine — exact port of clojure.lang.Util.hashCombine
 ;; ============================================================================
 
+;; Util.hashCombine: seed ^= hash + 0x9e3779b9 + (seed << 6) + (seed >> 2)
+;; Java's >> is arithmetic (sign-extending), NOT >>> (logical/unsigned), so fxsra.
+;; fx ops throughout rather than the generic bitwise-*/+ forms: both arguments are
+;; i32-normalized fixnums, and this runs once per symbol and once per keyword hash.
+;; Bounds, with seed and hash in [-2^31, 2^31-1] after i32:
+;;   (fxsll seed 6)  -> |v| <= 2^37                                            ✓
+;;   (fxsra seed 2)  -> |v| <= 2^29                                            ✓
+;;   the two fx+ sums stay under 2^38 before each i32 masks back to 32 bits     ✓
 (define (hash-combine seed hash)
-  ;; a la boost: seed ^= hash + 0x9e3779b9 + (seed << 6) + (seed >> 2)
-  ;; Java's >> is arithmetic (sign-extending), NOT >>> (logical/unsigned).
   (let* ((seed (i32 seed))
          (hash (i32 hash))
-         (sl   (i32 (bitwise-arithmetic-shift-left seed 6)))
-         (sr   (bitwise-arithmetic-shift-right seed 2))
-         (sum  (i32 (+ (i32 (+ hash #x9e3779b9)) (i32 (+ sl sr)))))
-         (result (bitwise-xor seed sum)))
+         (sl   (i32 (#3%fxsll seed 6)))
+         (sr   (#3%fxsra seed 2))
+         (sum  (i32 (#3%fx+ (i32 (#3%fx+ hash #x9e3779b9)) (i32 (#3%fx+ sl sr)))))
+         (result (#3%fxxor seed sum)))
     (i32 result)))
 
 ;; ============================================================================

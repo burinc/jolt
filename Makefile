@@ -58,7 +58,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
-  gateboot gatebootsmoke gosm httpsfetch infer inline inline-body irvalidate \
+  gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit \
@@ -119,6 +119,7 @@ install: build
 CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke depscpcache depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
+  hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck irvalidate devbootsmoke \
@@ -218,6 +219,14 @@ selfhost:
 # Value-model unit tests (nil/truthiness/collections on Chez).
 values:
 	@$(CHEZ) --script test/chez/values-test.ss
+
+# The hash engine's VALUES, pinned to JVM Clojure. hasheq.ss gets tuned for speed
+# (its 32-bit leaf helpers are macros so they inline), and a tuning pass that
+# changes a hash VALUE rather than its cost fails nothing until a hash crosses the
+# JVM boundary — so the goldens are literal here, plus a flat-vs-layered mixer
+# sweep over every length and char class.
+hasheq:
+	@$(CHEZ) --script test/chez/hasheq-test.ss
 
 # Fibers R1 (epic jolt-nvpr.2): the fiber primitive + single-carrier scheduler
 # behind the CONTRACT.txt coroutines tier. Correctness (round trip, completion,
