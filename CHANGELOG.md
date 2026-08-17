@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Fibers R8, extended to `jolt.process`: a subprocess pipe read or write
+  parks the fiber instead of pinning its carrier.** The trick `jolt.socket`
+  already applies to sockets now applies to `proc-fd-input-port` /
+  `proc-fd-output-port` (`host/chez/java/process.ss`): the pipe fd the
+  parent retains is set `O_NONBLOCK` at creation (never poller-gated), and
+  on `EAGAIN` registers readiness with `jolt.io-poller` and parks the
+  current fiber — the carrier runs other fibers meanwhile, and blocks on a
+  private `kevent`/`epoll_wait` exactly as before when there is no fiber
+  (jolt.process's own no-poller fallback keeps working standalone). A
+  working `fcntl` binding for Apple arm64 is what makes the non-blocking fd
+  viable at all: `F_SETFL` is C-variadic, and without the
+  `(__varargs_after 2)` calling-convention marker it reports success but
+  silently never applies the flags. Closing a pipe port now also tells
+  `jolt.io-poller` to forget the fd, mirroring the socket fix below: a
+  closed fd is auto-dropped from the kernel's kqueue/epoll set, so a fiber
+  still parked on it would otherwise wait forever for an event that is
+  never coming. Gated by `test/chez/fibers-process-io-test.ss`, wired into
+  `make fibers` right after the socket half's own gate.
+
 ## [0.7.14] - 2026-08-16
 
 A collections release. The theme running through it is operations that were
