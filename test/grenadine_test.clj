@@ -21,6 +21,25 @@
       (throw (ex-info "missing fixture POM"
                       {:artifact artifact :version version}))))
 
+(let [seen (atom [])]
+  (with-redefs-fn
+    {(var deps/prepare-required!)
+     (fn [coordinate options]
+       (swap! seen conj [(:coordinate coordinate) options])
+       'grenadine.version)}
+    (fn []
+      (portable-deps/require-deps
+       ["mvn:example/unquoted@1.0.0/grenadine.version" :as unquoted-version]
+       '["mvn:example/quoted@1.0.0/grenadine.version" :as quoted-version])))
+  (when-not
+   (and (= [["mvn:example/unquoted@1.0.0/grenadine.version" {}]
+            ["mvn:example/quoted@1.0.0/grenadine.version" {}]]
+           @seen)
+        (some? (resolve 'unquoted-version/compare-versions))
+        (some? (resolve 'quoted-version/compare-versions)))
+    (throw (ex-info "require-deps did not accept both libspec syntaxes"
+                    {:seen @seen}))))
+
 (let [resolution
       (graph/resolve-graph
        {'demo/a {:mvn/version "1"}
