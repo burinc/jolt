@@ -106,6 +106,21 @@
         #f
         (begin (jolt-invoke2 f fd filt-kw) #t))))
 
+;; Bridge to jolt.io-poller/forget!, same shape as poller-wait-ready above.
+;; A closed fd is auto-removed from the kernel's kqueue/epoll set, so no
+;; event is ever coming for a fiber still parked on it -- without telling
+;; the poller to drop its registration, that fiber sleeps forever, and a
+;; leaked ready=true tombstone in the poller's shared :fds table (keyed by
+;; bare fd integer, shared with jolt.socket) can then be consumed by a
+;; REUSED fd number belonging to an unrelated later socket. Mirrors
+;; jolt.socket's socket-close! (stdlib/jolt/socket.clj), which does the
+;; identical close-then-forget for the same reason. Same unbound-var guard
+;; as poller-wait-ready: when jolt.io-poller was never loaded, forget! has
+;; nothing to forget and this is a no-op.
+(define (poller-forget! fd)
+  (let ((f (var-deref "jolt.io-poller" "forget!")))
+    (unless (jolt-var-unbound? f) (jolt-invoke1 f fd))))
+
 ;; A jolt that spawns children has to be able to reap them, so SIGCHLD must not be
 ;; left at an INHERITED SIG_IGN: with that disposition the kernel reaps every child
 ;; itself and waitpid can only ever fail with ECHILD, making exit statuses
@@ -457,7 +472,7 @@
                        (retry))))
                 (else 0))))))
       #f #f
-      (lambda () (sa-foreign-free buf) (proc-c-close fd)))))
+      (lambda () (sa-foreign-free buf) (proc-c-close fd) (poller-forget! fd)))))
 (define (proc-fd-output-port fd)
   (let ((buf (sa-foreign-alloc proc-fd-buf-size)))
     (make-custom-binary-output-port
@@ -482,7 +497,7 @@
                        (retry))))
                 (else (error 'process "write to child failed" fd)))))))
       #f #f
-      (lambda () (sa-foreign-free buf) (proc-c-close fd)))))
+      (lambda () (sa-foreign-free buf) (proc-c-close fd) (poller-forget! fd)))))
 
 ;; What the API hands back for a stream that was INHERITED: the JVM's null
 ;; streams. Reads are at EOF from the start; writes are accepted and dropped.
