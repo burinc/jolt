@@ -87,9 +87,18 @@
 (define proc-F-SETFL 4)
 (define proc-O-NONBLOCK (if (eq? (sa-os-family) 'macos) #x4 #x800))
 
+;; Deliberately unprefixed (no `proc-` prefix, unlike every other definition
+;; in this file): a bridge point meant to be reachable beyond this file, not
+;; a private proc-* helper. Don't rename it into collision with the
+;; naming-shadow hazard this file's own header documents (line ~40-42).
 (define (set-nonblocking! fd)
   (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
-    (proc-fcntl-set fd proc-F-SETFL (fxior flags proc-O-NONBLOCK))))
+    ;; A negative flags value means F_GETFL itself failed -- don't hand that
+    ;; straight to F_SETFL: (fxior -1 proc-O-NONBLOCK) is still negative, and
+    ;; the kernel would mask it down, silently leaving the fd blocking with
+    ;; no diagnostic that anything went wrong.
+    (when (>= flags 0)
+      (proc-fcntl-set fd proc-F-SETFL (fxior flags proc-O-NONBLOCK)))))
 
 ;; Bridge to jolt.io-poller/wait-ready: var-deref never throws for a
 ;; missing var -- jolt-var auto-vivifies a jolt-var-unbound placeholder
@@ -100,6 +109,9 @@
 ;; EAGAIN branches in proc-fd-input-port/proc-fd-output-port below --
 ;; a bare 0-byte return there would misread as EOF, since the pipe fd
 ;; is genuinely non-blocking by then).
+;; poller-wait-ready and poller-forget! below are ALSO deliberately
+;; unprefixed, same reason as set-nonblocking! above: bridge points, not
+;; private proc-* helpers.
 (define (poller-wait-ready fd filt-kw)
   (let ((f (var-deref "jolt.io-poller" "wait-ready")))
     (if (jolt-var-unbound? f)
@@ -401,7 +413,8 @@
 
 (define proc-spawn-fd-ok?
   (and proc-c-pipe proc-c-close proc-fa-init proc-fa-dup2 proc-fa-close
-       proc-fa-destroy proc-c-spawn proc-c-read proc-c-write #t))
+       proc-fa-destroy proc-c-spawn proc-c-read proc-c-write
+       proc-fcntl-get proc-fcntl-set proc-errno-loc #t))
 
 ;; marshal a string list into a NULL-terminated char**; returns (array . cstrs)
 ;; so the caller can free every allocation once posix_spawn has copied them.
@@ -436,8 +449,8 @@
 ;; loaded, EAGAIN clears O_NONBLOCK on this fd (fd is genuinely non-blocking
 ;; now per mk-pipe above, so a no-poller EAGAIN is a live "not ready yet"
 ;; signal, not a real failure) and falls through to a real blocking
-;; proc-c-read/proc-c-write from then on -- exact behavioral parity with
-;; pre-this-plan code once triggered, verified standalone: a blocked
+;; proc-c-read/proc-c-write from then on -- exact behavioral parity with a
+;; plain blocking fd once triggered, verified standalone: a blocked
 ;; read/write genuinely waits rather than busy-looping or returning a
 ;; spurious result. Any OTHER error still ends the port, but the two sides
 ;; report it differently -- pre-existing asymmetry, unchanged by this: the
@@ -506,10 +519,17 @@
 (define (proc-null-output-port)
   (make-custom-binary-output-port "process-null" (lambda (bv start n) n) #f #f #f))
 
-;; The pipe fds are not close-on-exec (fcntl/ioctl are variadic, which the FFI
-;; cannot call safely on arm64), so a concurrent spawn's child could inherit
-;; them and hold a read end open past this child's exit. Exclusion by mutex
-;; instead: no other fd-level spawn runs between pipe() and posix_spawn.
+;; The pipe fds are not close-on-exec: macOS has no pipe2()/O_CLOEXEC (unlike
+;; Linux), so FD_CLOEXEC can only be applied with a SEPARATE fcntl(F_SETFD)
+;; call after pipe() returns -- and that leaves a window, between pipe() and
+;; that fcntl call, where a concurrent spawn's child could still inherit the
+;; fd and hold a read end open past this child's exit. This is true even now
+;; that this file has a working arm64 fcntl binding (proc-fcntl-get/-set
+;; above, via the (__varargs_after 2) marker): a working fcntl fixes whether
+;; we CAN make the F_SETFD call safely, not the fact that pipe() and
+;; F_SETFD are still two separate syscalls with a gap between them. Exclusion
+;; by mutex instead: no other fd-level spawn runs between pipe() and
+;; posix_spawn.
 (define proc-spawn-fd-mutex (make-mutex))
 
 ;; Spawn `/bin/sh -c sh-cmd` with fd-level stdio: an inherited stream gets no
