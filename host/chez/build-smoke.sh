@@ -118,6 +118,21 @@ if ! grep -q 'str-starts-with?' "$out.noop.build/flat.ss"; then
   echo "  FAIL: str-target lowering depended on the wp fixpoint (str-ret table is per-form)"; exit 1
 fi
 
+# Lib-provided host classes: app.util/zdt-class references java.time.ZonedDateTime
+# (a jolt-lang/time class). The build scan must pull the provider's install ns —
+# src-provider/jolt/time.clj is the on-roots stand-in — into flat.ss, because a
+# built binary has no source roots for the runtime class-miss autoload. The
+# negative control: src-provider/jolt/crypto.clj is also on the roots, but its
+# classes are referenced nowhere, so that provider must stay out. The greps
+# target ns EMISSION (set-chez-ns!), not bare strings — the runtime section of
+# flat.ss always mentions both providers in its autoload tables.
+if ! grep -q 'set-chez-ns! "jolt\.time"' "$out.build/flat.ss"; then
+  echo "  FAIL: a jolt.time class ref did not pull the provider ns into flat.ss"; exit 1
+fi
+if grep -q 'set-chez-ns! "jolt\.crypto"' "$out.build/flat.ss"; then
+  echo "  FAIL: unreferenced lib provider jolt.crypto leaked into flat.ss"; exit 1
+fi
+
 # --no-direct-link opts back out of the release default: the app->app call must
 # NOT lower to a jv$ binding (stays var-routed, dynamically linked).
 if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out.nodl" --no-direct-link >/dev/null 2>&1; then

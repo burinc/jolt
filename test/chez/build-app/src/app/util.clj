@@ -23,6 +23,12 @@
 ;; record-method-dispatch "startsWith" fails on this fn.
 (defn strd-rep [x] (.startsWith (clojure.string/replace x "a" "b") "b"))
 
+;; Never called: only its PRESENCE matters. Referencing a jolt-lang/time class
+;; must make the build scan pull the provider's install ns (src-provider/jolt/
+;; time.clj, a stand-in on the roots) into flat.ss — a built binary has no
+;; source roots, so the runtime class-miss autoload can't fire there.
+(defn zdt-class [] java.time.ZonedDateTime)
+
 ;; ^:redef / ^:dynamic opt out of direct-linking even with it on by default (the
 ;; release default now), so the built binary can still redef/bind them at runtime.
 (def ^:redef redef-fn (fn [] :original))

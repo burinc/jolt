@@ -1,4 +1,4 @@
-{:paths ["src" "resources"]
+{:paths ["src" "src-provider" "resources"]
 
  ;; exercise the build's native-lib loading: a :process spec loads the running
  ;; binary's own symbols (libc) at startup — no external file, always succeeds.

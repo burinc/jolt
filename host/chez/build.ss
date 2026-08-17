@@ -759,6 +759,11 @@
           (bld-walk-files root "" '()))))
     (bld-strs embed-dirs)))
 
+;; Namespaces already defined at boot in the BUILD process (snapshotted before
+;; step 1 loads anything) — the driver image's set. bld-require-closure still
+;; skips these as preloaded; only LAZY stdlib (not in the image) is emitted.
+(define bld-boot-loaded #f)
+
 ;; --- the build --------------------------------------------------------------
 ;; entry-ns: the app's main namespace (a string). out-path: the binary to write.
 ;; mode: "dev" | "release" | "optimized". Every form runs through jolt.passes/
@@ -867,14 +872,56 @@
         (map rdr-form->data (ei-read-all src))))
     (reverse reqs)))
 
+;; Host classes a file's forms reference that a LIBRARY provides (jolt-lang/time,
+;; jolt-crypto, …). At runtime a class-miss autoloads the provider's install
+;; namespace off the source roots (host-static.ss jt-try-autoload! /
+;; lib-try-autoload!); a built binary has no source roots, so the scan must pull
+;; the provider into flat.ss instead — otherwise the binary throws the RFC 0008
+;; "add io.github.jolt-lang/time" error for a dependency the project did declare.
+;; Mirrors the runtime predicates: a jt-library class (or java.time.*) ->
+;; "jolt.time"; anything else consults lib-class-providers. A provider is pulled
+;; only when its source is actually on the roots (find-ns-file) — off the roots
+;; the runtime's unknown-class message is the contract and the build must keep
+;; succeeding exactly as before.
+(define (bld-ns-class-providers file)
+  (let ((src (ldr-read-source file))
+        (cands '()))
+    (define (add! class)
+      (let ((cand (cond ((or (member class jt-library-names) (java-time-prefixed? class))
+                         "jolt.time")
+                        ((lib-provider-for class) => (lambda (p) (vector-ref p 0)))
+                        (else #f))))
+        (when (and cand (not (member cand cands)))
+          (set! cands (cons cand cands)))))
+    (define (walk x)
+      (cond ((symbol-t? x)
+             (let ((ns (symbol-t-ns x)))
+               ;; two reference shapes: java.util.Locale/US (the ns segment IS the
+               ;; class) and a bare java.time.ZonedDateTime (no slash — the whole
+               ;; name is the class, namespace is nil).
+               (if (and ns (not (jolt-nil? ns)))
+                   (add! ns)
+                   (add! (symbol-t-name x)))))
+            ((and (cseq? x) (cseq-list? x)) (for-each walk (seq->list x)))
+            ((pvec? x) (for-each walk (seq->list x)))
+            ((pmap? x) (pmap-fold x (lambda (k v a) (walk k) (walk v) #f) #f))))
+    (parameterize ((rdr-scan-mode #t) (rdr-source-file file))
+      (jolt-enter-file! file)
+      (for-each (lambda (f) (walk (rdr-form->data f))) (ei-read-all src)))
+    (filter (lambda (c) (find-ns-file c)) cands)))
+
 ;; Post-order DFS from a list of root namespace names: for each name, find its
 ;; file, recurse into its requires, then append (name . file). Already-visited
 ;; names are skipped (cycles terminate). Names whose source file can't be found
-;; (stdlib/AOT/in-memory) are skipped — they resolve elsewhere.
+;; (AOT/in-memory) are skipped — they resolve elsewhere.
 ;; IMPORTANT: namespaces whose resolved file is jolt-runtime-owned (embedded
-;; resource or under ldr-install-roots) are also skipped — they are either
-;; preloaded at jolt boot or loaded via the hook flow, and emitting them into
-;; the app section would bloat the binary and break direct-link bindings.
+;; resource or under ldr-install-roots) are skipped ONLY when already defined
+;; at boot (bld-boot-loaded, the seed image's set) — they are preloaded at jolt
+;; boot, and emitting them into the app section would bloat the binary and
+;; break direct-link bindings. LAZY stdlib (in the install roots but NOT in
+;; the seed — e.g. jolt.time.impl) IS included and emitted: a built binary
+;; has no disk roots, so its compiled Scheme must define those vars at boot —
+;; the same reason bld-emit-cli-aot emits jolt.main into the release image.
 ;; Result: deps first, roots last.
 (define (bld-require-closure names)
   (let ((visited (make-hashtable string-hash string=?))
@@ -885,8 +932,10 @@
           (unless (hashtable-ref visited name #f)
             (hashtable-set! visited name #t)
             (let ((file (find-ns-file name)))
-              (when (and file (not (ldr-install-file? file)))
-                (dfs (bld-ns-requires file))
+              (when (and file
+                         (or (not (ldr-install-file? file))
+                             (not (hashtable-ref bld-boot-loaded name #f))))
+                (dfs (append (bld-ns-class-providers file) (bld-ns-requires file)))
                 (set! order (cons (cons name file) order)))))
           (dfs (cdr ns)))))
     (reverse order)))
@@ -937,9 +986,11 @@
     ;; procedure evals resolve; the .build dir must exist first.
     (bld-mkdir-p (string-append out-path ".build"))
     (bld-preload-static-natives! natives (string-append out-path ".build")))
-  ;; 1. record app namespaces in dependency order as they finish loading.
-  (let ((app-order '()))
-    (set-ns-loaded-hook!
+   ;; 1. record app namespaces in dependency order as they finish loading.
+   (let ((app-order '()))
+     (set! bld-boot-loaded
+       (hashtable-copy loaded-ns #f))
+     (set-ns-loaded-hook!
       (lambda (name file) (set! app-order (cons (cons name file) app-order))))
     (ei-mark! "startup")
     (parameterize ((ldr-source-only? #t))    ; emit from source, never a compiled artifact
@@ -989,9 +1040,22 @@
                            (cons entry-ns (find-ns-file entry-ns))))
            (ordered (append (remp (lambda (p) (string=? (car p) entry-ns)) merged)
                             (list entry-pair))))
-      (when (null? ordered)
-        (error 'jolt-build (string-append "no source namespace loaded for " entry-ns
-                                          " — is it on the source roots?")))
+       (when (null? ordered)
+         (error 'jolt-build (string-append "no source namespace loaded for " entry-ns
+                                           " — is it on the source roots?")))
+       ;; Namespaces the CLASS scan pulled in (lib providers like jolt.time) are in
+       ;; `ordered` without ever being loaded in-process: step 1 only loads what
+       ;; the require graph reaches, and the runtime class-miss autoload fires on
+       ;; USE, which the build never triggers. The strict emit below re-analyzes
+       ;; their source against process ns state — an unloaded provider has no
+       ;; refer/alias tables, so its own :refer'd names would not resolve. Load
+       ;; any still-unloaded ns of the closure now, source-only like step 1.
+       (for-each
+         (lambda (p)
+           (unless (hashtable-ref loaded-ns (car p) #f)
+             (parameterize ((ldr-source-only? #t))
+               (load-namespace (car p)))))
+         ordered)
       ;; 2. emit each app namespace. Release and optimized modes enable the
       ;; inference + record-shape setup passes (inference-enabled?); optimized
       ;; mode additionally runs the inline + flatten + scalar-replace fixpoint
@@ -1071,51 +1135,72 @@
                   (if tree-shake?
                       (dce-shake
                         (dce-blob-records "host/chez/seed/prelude.ss")
-                        (apply append
-                          (map (lambda (nf)
-                                 ;; ns-prelude forms (always kept, no fqn/refs) set the
-                                 ;; ns + register aliases before this ns's forms; dce
-                                 ;; keeps original order.
-                                 (let* ((src (ldr-read-source (cdr nf)))
-                                        (profile-form
-                                          (bld-startup-profile-form
-                                            (string-append "namespace " (car nf)))))
-                                   (jolt-enter-file! (cdr nf))   ; name the file on a failure
-                                   (parameterize ((rdr-source-file (cdr nf)))
-                                     ;; RT.load-parity bracket (dyn-binding.ss): the
-                                     ;; ns's replayed forms run under fresh
-                                     ;; *warn-on-reflection*/*assert* bindings.
-                                     (append
-                                       (list (dce-rec #t #f '() "(jolt-ns-load-vars-push!)"))
-                                       (map (lambda (s) (dce-rec #t #f '() s))
-                                            (bld-ns-prelude (car nf) src))
-                                       (ei-emit-ns-records (car nf) src)
-                                       (list
-                                         (dce-rec #t #f '() "(jolt-ns-load-vars-pop!)")
-                                         (dce-rec #t #f '() profile-form))))))
-                               ordered))
+                        ;; EAGER per-ns accumulation (see the non-shake branch):
+                        ;; the emit lambdas carry side effects — cell/gensym
+                        ;; allocation and direct-link-defined registration — and
+                        ;; jolt's lazy `map` realizes them in a non-list order,
+                        ;; which can emit the entry ns before its dependencies
+                        ;; (var-routed calls, out-of-order cells). The named let
+                        ;; runs strictly in `ordered` order (deps first).
+                        (let ((per-ns '()))
+                          (let loopfe ((rest ordered))
+                            (unless (null? rest)
+                              (let* ((nf (car rest))
+                                     (src (ldr-read-source (cdr nf)))
+                                     (profile-form
+                                       (bld-startup-profile-form
+                                         (string-append "namespace " (car nf)))))
+                                (jolt-enter-file! (cdr nf))   ; name the file on a failure
+                                (parameterize ((rdr-source-file (cdr nf)))
+                                  ;; RT.load-parity bracket (dyn-binding.ss): the
+                                  ;; ns's replayed forms run under fresh
+                                  ;; *warn-on-reflection*/*assert* bindings.
+                                  (set! per-ns
+                                    (cons (append
+                                            (list (dce-rec #t #f '() "(jolt-ns-load-vars-push!)"))
+                                            (map (lambda (s) (dce-rec #t #f '() s))
+                                                 (bld-ns-prelude (car nf) src))
+                                            (ei-emit-ns-records (car nf) src)
+                                            (list
+                                              (dce-rec #t #f '() "(jolt-ns-load-vars-pop!)")
+                                              (dce-rec #t #f '() profile-form)))
+                                          per-ns)))
+                              (loopfe (cdr rest))))
+                          (apply append (reverse per-ns))))
                         (string-append entry-ns "/-main"))
                       (values
                         #f
-                        (apply append
-                          (map (lambda (nf)
-                                 (let ((src (ei-timed "emit: read source"
-                                              (lambda () (ldr-read-source (cdr nf))))))
-                                   (jolt-enter-file! (cdr nf))   ; name the file on a failure
-                                   (parameterize ((rdr-source-file (cdr nf)))
-                                     ;; RT.load-parity bracket, matching the
-                                     ;; tree-shake path above.
-                                     (append
-                                       (list "(jolt-ns-load-vars-push!)")
-                                       (ei-timed "emit: ns-prelude"
-                                         (lambda () (bld-ns-prelude (car nf) src)))
-                                       (ei-timed "emit: per-ns total"
-                                         (lambda () (bld-emit-ns (car nf) src)))
-                                       (list
-                                         "(jolt-ns-load-vars-pop!)"
-                                         (bld-startup-profile-form
-                                           (string-append "namespace " (car nf))))))))
-                               ordered))
+                        ;; EAGER per-ns accumulation, NOT (apply append (map …)):
+                        ;; `map` here is jolt's LAZY map, and the per-ns emit lambdas carry side
+                        ;; effects (analysis, cell/gensym allocation, direct-link-defined
+                        ;; registration). Their realization order under apply/append is not the
+                        ;; list order, so an entry-ns lambda could run before a dependency's —
+                        ;; leaving cross-ns calls var-routed instead of direct-linked (and cell
+                        ;; names allocated out of order). for-each runs strictly in `ordered`
+                        ;; order (deps first), matching the loader.
+                        (let ((per-ns '()))
+                          (let loopfe ((rest ordered))
+                            (unless (null? rest)
+                              (let* ((nf (car rest))
+                                     (src (ei-timed "emit: read source"
+                                            (lambda () (ldr-read-source (cdr nf))))))
+                                (jolt-enter-file! (cdr nf))   ; name the file on a failure
+                                (parameterize ((rdr-source-file (cdr nf)))
+                                  ;; RT.load-parity bracket, matching the tree-shake path.
+                                  (set! per-ns
+                                    (cons (append
+                                            (list "(jolt-ns-load-vars-push!)")
+                                            (ei-timed "emit: ns-prelude"
+                                              (lambda () (bld-ns-prelude (car nf) src)))
+                                            (ei-timed "emit: per-ns total"
+                                              (lambda () (bld-emit-ns (car nf) src)))
+                                            (list
+                                              "(jolt-ns-load-vars-pop!)"
+                                              (bld-startup-profile-form
+                                                (string-append "namespace " (car nf)))))
+                                          per-ns)))
+                              (loopfe (cdr rest))))
+                          (apply append (reverse per-ns))))
                         #f))))
               (lambda ()
                 (set-optimize! #f)
@@ -1188,9 +1273,9 @@
           (put-string out "\n;; === native libraries (required) ===\n")
           (bld-emit-natives out natives 'required)
           (bld-emit-startup-profile-mark! out "required native libraries")
-          (put-string out "\n;; === embedded resources ===\n")
-          (bld-emit-embeds out embed-dirs)
-           (bld-emit-data-readers out)
+           (put-string out "\n;; === embedded resources ===\n")
+           (bld-emit-embeds out embed-dirs)
+            (bld-emit-data-readers out)
            ;; set-source-roots!* (not the scanning set-source-roots!): data readers
            ;; are baked just above, and re-scanning would eagerly reload reader
            ;; namespaces via jolt-compile-eval-form — dropped by a tree-shaken binary.
