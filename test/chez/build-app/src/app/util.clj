@@ -16,6 +16,13 @@
 (defn strd-prefix [x] (.startsWith (str x) "s"))
 (defn strd-find [x] (.indexOf (str x) (int 45)))
 
+;; The per-ns ret table: clojure.string/replace ALWAYS returns a string (so the
+;; target types :str and lowers directly), while clojure.core/replace is
+;; polymorphic and must NOT stamp. This call site is the replace row — if the
+;; table lookup regressed to generic dispatch, build-smoke's negative grep for
+;; record-method-dispatch "startsWith" fails on this fn.
+(defn strd-rep [x] (.startsWith (clojure.string/replace x "a" "b") "b"))
+
 ;; ^:redef / ^:dynamic opt out of direct-linking even with it on by default (the
 ;; release default now), so the built binary can still redef/bind them at runtime.
 (def ^:redef redef-fn (fn [] :original))

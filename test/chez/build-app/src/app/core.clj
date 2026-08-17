@@ -22,7 +22,8 @@
     (println "area:" (util/area 2.0)))
   ;; --strd: unhinted string interop via the str-ret :str stamp (see app.util).
   (when (= (first args) "--strd")
-    (println "strd:" (util/strd-prefix "sy") (util/strd-prefix "no") (util/strd-find "a-b")))
+    (println "strd:" (util/strd-prefix "sy") (util/strd-prefix "no") (util/strd-find "a-b")
+             (util/strd-rep "aa") (util/strd-rep "cc")))
   ;; --redef: with direct-link the release default, ^:redef/:dynamic must still
   ;; opt out so runtime redefinition / binding take effect in the built binary.
   (when (= (first args) "--redef")

@@ -151,8 +151,8 @@ fi
 # The :str-stamped interop answers at runtime with the same values the generic
 # dispatch would (the emit-level proof is the flat.ss grep above).
 got_strd="$(cd / && "$out" --strd 2>&1)"
-if ! printf '%s' "$got_strd" | grep -q '^strd: true false 1$'; then
-  echo "  FAIL: :str-stamped interop output — want 'strd: true false 1'"
+if ! printf '%s' "$got_strd" | grep -q '^strd: true false 1 true false$'; then
+  echo "  FAIL: :str-stamped interop output — want 'strd: true false 1 true false'"
   echo "--- got ----"; echo "$got_strd"; exit 1
 fi
 
