@@ -413,9 +413,23 @@
   (for-each sa-foreign-free (cdr m))
   (sa-foreign-free (car m)))
 
-;; binary ports over the raw pipe fds. EINTR is retried; any other read error
-;; reads as EOF (the child is gone and the pipe with it). A short write returns
-;; its count and Chez's port machinery re-calls for the rest.
+;; binary ports over the raw pipe fds. EINTR is retried; EAGAIN parks the
+;; current fiber (or blocks this thread) via jolt.io-poller when it's loaded
+;; -- symmetric on both sides below: proc-fd-input-port waits on :read,
+;; proc-fd-output-port waits on :write, over the same mk-pipe-created
+;; non-blocking fd and the same poller-wait-ready bridge. When no poller is
+;; loaded, EAGAIN clears O_NONBLOCK on this fd (fd is genuinely non-blocking
+;; now per mk-pipe above, so a no-poller EAGAIN is a live "not ready yet"
+;; signal, not a real failure) and falls through to a real blocking
+;; proc-c-read/proc-c-write from then on -- exact behavioral parity with
+;; pre-this-plan code once triggered, verified standalone: a blocked
+;; read/write genuinely waits rather than busy-looping or returning a
+;; spurious result. Any OTHER error still ends the port, but the two sides
+;; report it differently -- pre-existing asymmetry, unchanged by this: the
+;; read side reads it as EOF (0, the child is gone and the pipe with it);
+;; the write side raises (child gone, `error 'process "write to child
+;; failed"`). A short write returns its count and Chez's port machinery
+;; re-calls for the rest.
 (define proc-fd-buf-size 32768)
 (define (proc-fd-input-port fd)
   (let ((buf (sa-foreign-alloc proc-fd-buf-size)))
@@ -434,6 +448,13 @@
                  got)
                 ((= got 0) 0)
                 ((= (proc-errno) proc-EINTR) (retry))
+                ((= (proc-errno) proc-EAGAIN)
+                 (if (poller-wait-ready fd (jolt-keyword "read"))
+                     (retry)
+                     (begin
+                       (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
+                         (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
+                       (retry))))
                 (else 0))))))
       #f #f
       (lambda () (sa-foreign-free buf) (proc-c-close fd)))))
@@ -452,6 +473,13 @@
               (cond
                 ((>= wrote 0) wrote)
                 ((= (proc-errno) proc-EINTR) (retry))
+                ((= (proc-errno) proc-EAGAIN)
+                 (if (poller-wait-ready fd (jolt-keyword "write"))
+                     (retry)
+                     (begin
+                       (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
+                         (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
+                       (retry))))
                 (else (error 'process "write to child failed" fd)))))))
       #f #f
       (lambda () (sa-foreign-free buf) (proc-c-close fd)))))
@@ -476,17 +504,41 @@
 ;; the pipe path — so the mask is corrected on this side, around the spawn
 ;; itself (see the call below).
 (define (proc-spawn-fd-level sh-cmd inherit-in? inherit-out? inherit-err?)
-  (define (mk-pipe)
+  ;; nonblocking-read? / nonblocking-write? -- set O_NONBLOCK unconditionally
+  ;; on the PARENT's own RETAINED end at creation (never poller-gated), so
+  ;; the retry loops below
+  ;; (proc-fd-input-port / proc-fd-output-port) can park a fiber on EAGAIN
+  ;; instead of pinning the carrier. Which end is "the parent's own" is
+  ;; per-role and asymmetric: for out-p/err-p the parent keeps the read end
+  ;; (car) and the child gets the write end (cdr) via dup2, so only
+  ;; nonblocking-read? applies; in-p is the mirror image -- the CHILD gets
+  ;; the read end (dup2'd to its own stdin) and the PARENT keeps the write
+  ;; end (cdr, feeding proc-fd-output-port), so only nonblocking-write?
+  ;; applies. Per POSIX, dup2/dup/fork-duplicated descriptors share file
+  ;; status flags -- including O_NONBLOCK -- via the shared open file
+  ;; description; only per-descriptor flags like FD_CLOEXEC are NOT shared
+  ;; (verified standalone: a dup()'d fd inherits O_NONBLOCK from the fd it
+  ;; was dup'd from). So flipping O_NONBLOCK on the end that gets dup2'd into
+  ;; the child would silently change the CHILD's own stdio behavior, not just
+  ;; the parent's -- a non-blocking in-p read end makes the child's own
+  ;; stdin reads see spurious EAGAIN; a non-blocking out-p/err-p write end
+  ;; would do the same to the child's own stdout/stderr writes. Each of the
+  ;; three pipes below only ever sets non-blocking on the end the parent
+  ;; itself retains.
+  (define (mk-pipe nonblocking-read? nonblocking-write?)
     (let ((fds (sa-foreign-alloc 8)))
       (if (= 0 (proc-c-pipe fds))
           (let ((p (cons (sa-foreign-ref 'int fds 0) (sa-foreign-ref 'int fds 4))))
-            (sa-foreign-free fds) p)
+            (sa-foreign-free fds)
+            (when nonblocking-read? (set-nonblocking! (car p)))
+            (when nonblocking-write? (set-nonblocking! (cdr p)))
+            p)
           (begin (sa-foreign-free fds)
                  (throw-jvm (quote java.io.IOException) "pipe: cannot allocate")))))
   (jolt-with-mutex proc-spawn-fd-mutex
-    (let* ((in-p  (and (not inherit-in?)  (mk-pipe)))
-           (out-p (and (not inherit-out?) (mk-pipe)))
-           (err-p (and (not inherit-err?) (mk-pipe)))
+    (let* ((in-p  (and (not inherit-in?)  (mk-pipe #f #t)))
+           (out-p (and (not inherit-out?) (mk-pipe #t #f)))
+           (err-p (and (not inherit-err?) (mk-pipe #t #f)))
            (fa (sa-foreign-alloc 128))
            (pidbuf (sa-foreign-alloc 8)))
       (proc-fa-init fa)
