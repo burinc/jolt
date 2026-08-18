@@ -301,6 +301,23 @@
   (cond ((and (fixnum? a) (fixnum? b)) (= a b))
         ((and (flonum? a) (flonum? b)) (= a b))
         ((and (eq? a b) (not (number? a))) #t)
+        ;; Two keywords, and two strings, answer HERE rather than after the arm
+        ;; walk. Both pairs are already in eq-fast-probes, so the registry REFUSES
+        ;; an arm that would claim them (eq-arm-reject-fast-type!) — that guard is
+        ;; what makes answering early safe, and it is the same reason pmap-fast-get
+        ;; may compare keyword and string keys directly.
+        ;;
+        ;; Without these, only the EQUAL case was fast (the eq? clause above catches
+        ;; two interned keywords, and jolt=2-base's own clauses sat behind the
+        ;; walk). Every UNEQUAL keyword or string compare paid one predicate call
+        ;; per registered arm — and the registry grows as libraries load, so the
+        ;; cost is invisible on a bare runtime and grows with the program. It is
+        ;; also the comparison a map lookup makes on a key miss, so it is on the
+        ;; path of every get/assoc that does not hit. Measured on honeysql, whose
+        ;; clause walk is all keyword compares: (= :abc :abd) 1.035 -> 0.130 us
+        ;; once its own libraries had registered their arms.
+        ((and (keyword-t? a) (keyword-t? b)) (eq? a b))  ; interned; eq? settled it above
+        ((and (string? a) (string? b)) (string=? a b))
         ((and (symbol-t? a) (symbol-t? b))
          (let ((nsa (symbol-t-ns a)) (nsb (symbol-t-ns b))
                (na (symbol-t-name a)) (nb (symbol-t-name b)))
