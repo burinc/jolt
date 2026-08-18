@@ -1016,6 +1016,19 @@
   (let ((h (cond ((keyword-t? k) (keyword-t-khash k))
                  ((fixnum? k) (murmur3-hash-long-flat k))
                  ((string? k) (string-hasheq k))
+                 ;; A SYMBOL key belongs on this path too. The reference
+                 ;; implementation makes no distinction — Util.equiv/hasheq treat a
+                 ;; Symbol key exactly like a Keyword one, and Symbol caches its
+                 ;; hasheq in a field the way Keyword does — but here a symbol fell
+                 ;; off the fast path entirely and took the generic pmap-get, whose
+                 ;; descent is not type-specialized. symbol-hasheq is already
+                 ;; memoized (on the symbol, and on its name cell), so this is the
+                 ;; same one-field read the keyword arm above is.
+                 ;;
+                 ;; It is a real shape, not a curiosity: code that looks a keyword's
+                 ;; SYMBOL form up in a map does it per lookup. honeysql's clause
+                 ;; walk asks (get m (kw->sym k)) for all 92 clauses on every format.
+                 ((symbol-t? k) (symbol-hasheq k))
                  (else #f))))
     (if (and h (fixnum? h))
         (let ((h (fxand h hmask)))
