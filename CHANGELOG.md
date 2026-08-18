@@ -119,6 +119,19 @@ uniform per-call overhead. Those are here too.
 
 ### Fixed
 
+- **Fiber socket I/O works on ARM Linux.** `struct epoll_event`'s layout is
+  architecture-dependent — the kernel UAPI marks it `EPOLL_PACKED` only on
+  x86_64, where it is 12 bytes with the `u64` data at offset 4, while aarch64
+  aligns that `u64` naturally: 16 bytes, data at offset 8. `jolt.io-poller`
+  hardcoded the x86_64 numbers, so on aarch64 it read every event's fd out of
+  the struct padding, matched no waiter, and dropped the event — and epoll being
+  level-triggered, the same readiness was handed back immediately, so the poller
+  span at 100% of a core while reporting nothing and every fiber parked on a
+  socket hung. The layout now comes off `os.arch`; the registration gate loses 8
+  of 8 on aarch64 before and passes 320 of 320 after. No prebuilt binary ships
+  for that target, but jolt cross-builds it and it is what a source build on ARM
+  Linux produces.
+
 - **The dependency resolver does its filesystem work on Windows.** Every
   `mkdir -p`, `mv`, `rm`, `touch`, `test -nt` and `find` in `jolt.deps` went
   through `jolt.host/sh`, which is `cmd.exe` on Windows: `mkdir` there has no

@@ -553,6 +553,30 @@ else
   fails=$((fails + 1))
 fi
 
+# Retiring a registration must not cost the poller its ability to report readiness.
+# Two holes, one per platform, both invisible to the case above (which is read-only
+# on eight distinct fds, so no fd carries two filters and none closes with a delete
+# for it in flight): on kqueue a refused EV_DELETE was re-issued forever, and since
+# kevent returns as soon as a changelist entry errors and reports only the error, one
+# closed socket stopped every readiness report in the process; on epoll, which has no
+# per-direction delete, retiring one direction of an fd took the other one with it.
+pt_out="$($jolt run test/chez/poller-retirement.clj 2>&1)"
+if printf '%s' "$pt_out" | grep -q 'POLLER-RETIREMENT OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: retiring a registration cost the poller a readiness report"
+  # Same reasoning as the case above: print every POLLER line, since the
+  # POLLER-DEBUG table says which direction of which fd was left parked. NO-SHAPE
+  # is its own verdict — the round could not build the two-directions-parked state
+  # it exists to test, so a pass would have meant nothing.
+  if printf '%s' "$pt_out" | grep -q '^POLLER'; then
+    printf '%s\n' "$pt_out" | grep '^POLLER' | sed 's/^/    /'
+  else
+    printf '%s\n' "$pt_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # One monitor, contended by a real thread and by fibers at once (jolt-dfuo). This
 # case lives HERE rather than in `make fibers` because a regression wedges every
 # thread in the process, so the report has to come from outside it: the per-case
