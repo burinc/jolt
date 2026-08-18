@@ -208,6 +208,11 @@ divergences:
   portable Clojure. It resolves first, so a library can ship a portable
   `foo.cljc` next to a `foo.jolt` that wins on jolt, the way `.clj` wins over
   `.cljc` on the JVM. `data_readers.jolt` works like `data_readers.clj` too.
+- **Clojure is a terminal dependency.** jolt *is* Clojure, so
+  `org.clojure/clojure` in a `deps.edn` contributes neither an artifact nor
+  children. On the JVM that artifact pulls in `org.clojure/spec.alpha`, so a
+  project declaring only Clojure still gets `clojure.spec.alpha`; here it has to
+  be declared. See [Runtime dependencies](#runtime-dependencies).
 
 The tracked, gated list of value-level divergences is
 [test/conformance/known-divergences.edn](test/conformance/known-divergences.edn);
