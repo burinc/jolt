@@ -26,7 +26,9 @@
   :permissive
   "jolt succeeds where the JVM throws, on operations with one reasonable meaning: ex-info accepts nil data, count works on eduction, keys on a vector of pairs, (empty MapEntry) => []. A superset: portable JVM code behaves identically.",
   :namespace-model
-  "jolt's namespace layer is permissive: clojure.core always resolves (a :refer-clojure :exclude/:only affects syntax-quote qualification but not resolve/ns-resolve) and var privacy is not enforced across namespaces. A superset — code that resolves on the JVM resolves on jolt."},
+  "jolt's namespace layer is permissive: clojure.core always resolves (a :refer-clojure :exclude/:only affects syntax-quote qualification but not resolve/ns-resolve) and var privacy is not enforced across namespaces. A superset — code that resolves on the JVM resolves on jolt.",
+  :deps-model
+  "jolt resolves deps.edn itself (grenadine, no JVM toolchain) and jolt IS Clojure, so a host-supplied coordinate is TERMINAL: it contributes neither an artifact nor children. Not a superset — the JVM's org.clojure/clojure carries dependencies of its own, and those do not arrive here."},
  :documented
  [;; Deliberate/tracked divergences that are NOT corpus rows, so they live here (not in
   ;; :entries, which certify.clj gates for staleness against the corpus).
@@ -500,7 +502,32 @@
    :behavior "(.start (Thread. f)) as the last act of a program, without a join"
    :jvm "the process stays up until f returns — a non-daemon thread holds it open"
    :jolt "the process exits when the main thread returns; f may never finish"
-   :note "Inherent to Chez's thread model. .setDaemon is a no-op because every thread is already a daemon. Explicit .join / a latch / a deref of a promise all work."}]
+   :note "Inherent to Chez's thread model. .setDaemon is a no-op because every thread is already a daemon. Explicit .join / a latch / a deref of a promise all work."}
+  ;; jolt IS Clojure, so org.clojure/clojure is TERMINAL during deps.edn expansion:
+  ;; the coordinate contributes no artifact (its source on the roots would shadow
+  ;; core) and, since #645, no children either. On the JVM that artifact's POM
+  ;; depends on org.clojure/spec.alpha and org.clojure/core.specs.alpha, so a
+  ;; project declaring only Clojure still gets clojure.spec.alpha — and libraries
+  ;; lean on that, requiring spec without ever naming it (kaocha does, rewrite-clj's
+  ;; suite does). jolt used to substitute those two children in filter-deps; #645
+  ;; dropped the substitution for one uniform rule over host-supplied libraries, so
+  ;; the coordinates now have to be declared. org.clojure/clojurescript is terminal
+  ;; the same way.
+  ;;
+  ;; This one misleads because the failure names a namespace rather than a missing
+  ;; dependency: the require reports "Could not locate clojure/spec/alpha", which
+  ;; reads like a jolt coverage gap rather than a deps.edn that needs one more line.
+  ;;
+  ;; Not a corpus row, and not certifiable: the divergence is in deps RESOLUTION,
+  ;; which a corpus row evaluating an expression in an already-built basis cannot
+  ;; observe. Nothing gates it either — test/chez/deps-alias/specproj declares the
+  ;; spec coordinates explicitly now, and the conformance manifest hand-lists
+  ;; @spec.alpha/src/main/clojure as a source root rather than resolving a deps.edn.
+  {:category :deps-model
+   :behavior "a deps.edn whose only :deps entry is org.clojure/clojure, then (require '[clojure.spec.alpha :as s])"
+   :jvm "loads — spec.alpha and core.specs.alpha arrive transitively with the Clojure artifact"
+   :jolt "raises \"Could not locate clojure/spec/alpha.jolt (or .clj/.cljc) on the source roots\""
+   :note "Declare org.clojure/spec.alpha and org.clojure/core.specs.alpha explicitly; declared that way they resolve as ordinary Maven dependencies. Affects any library that requires spec without declaring it."}]
  :entries
  [;; SimpleDateFormat with no Locale answers for ROOT in jolt but the machine's
   ;; DEFAULT locale on the JVM ("March|Mar|Saturday|Sat" under en), so this row's
