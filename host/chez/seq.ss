@@ -69,30 +69,32 @@
 (define sk-list          1)   ; a PersistentList node (list literal / (list …) / reverse)
 (define sk-chunked-seq   2)   ; a vector's own seq (cvec = whole pvec, crest #f)
 (define sk-chunked-cons  3)   ; a standalone chunk + an after-chunk rest (crest set)
-(define sk-long-range    4)   ; a bounded (range …)
-(define sk-string-seq    5)   ; the characters of a string
-(define sk-rseq          6)   ; a vector's reverse view (rseq)
-(define sk-arraymap-seq  7)   ; an array-mode map's entry seq
-(define sk-hashmap-seq   8)   ; a hash-mode map's entry seq
-(define sk-treemap-seq   9)   ; a sorted map's / sorted set's entry seq
-(define sk-key-seq      10)   ; keys of a map, and a set's own seq (RT.keys)
-(define sk-val-seq      11)   ; vals of a map
-(define sk-iterate      12)   ; (iterate f x) and the unbounded (range)
+(define sk-long-range    4)   ; a bounded (range …) over longs
+(define sk-range         5)   ; a bounded (range …) that is not all-longs
+(define sk-string-seq    6)   ; the characters of a string
+(define sk-rseq          7)   ; a vector's reverse view (rseq)
+(define sk-arraymap-seq  8)   ; an array-mode map's entry seq
+(define sk-hashmap-seq   9)   ; a hash-mode map's entry seq
+(define sk-treemap-seq  10)   ; a sorted map's / sorted set's entry seq
+(define sk-key-seq      11)   ; keys of a map, and a set's own seq (RT.keys)
+(define sk-val-seq      12)   ; vals of a map
+(define sk-iterate      13)   ; (iterate f x) and the unbounded (range)
+(define sk-repeat       14)   ; (range start end 0), which repeats start forever
 ;; An array's seq, one flavor per element type — the JVM has a distinct ArraySeq
 ;; subclass per primitive (ArraySeq$ArraySeq_int …) and the plain ArraySeq for an
 ;; object array. natives-array.ss maps a jolt-array's `kind` onto these.
-(define sk-array-seq    13)   ; Object[]
-(define sk-array-int    14)
-(define sk-array-long   15)
-(define sk-array-short  16)
-(define sk-array-double 17)
-(define sk-array-float  18)
-(define sk-array-bool   19)
-(define sk-array-byte   20)
-(define sk-array-char   21)
+(define sk-array-seq    15)   ; Object[]
+(define sk-array-int    16)
+(define sk-array-long   17)
+(define sk-array-short  18)
+(define sk-array-double 19)
+(define sk-array-float  20)
+(define sk-array-bool   21)
+(define sk-array-byte   22)
+(define sk-array-char   23)
 ;; How many there are — the java layer sizes its kind-indexed tables from this,
 ;; so adding a flavor above needs no second edit to keep them in step.
-(define sk-count        22)
+(define sk-count        24)
 
 (define-record-type cseq (fields head (mutable tail) (mutable forced?) kind cvec ci crest (mutable lock)) (nongenerative chez-cseq-v6))
 ;; tail already a seq. The /k variants take the flavor; the bare ones are the
@@ -115,10 +117,12 @@
 ;; Being chunked is a property of the FLAVOR, not of carrying cvec: a sorted coll's
 ;; seq is vector-backed here because the :seq op materializes the tree, but it is a
 ;; PersistentTreeMap$Seq and is no more a chunked seq than the JVM's is.
-;; The chunked flavors are the contiguous run sk-chunked-seq..sk-long-range, so
-;; this is two fixnum compares.
+;; The chunked flavors are the contiguous run sk-chunked-seq..sk-range, so
+;; this is two fixnum compares. Both range flavors are in it: clojure.lang.Range
+;; implements IChunkedSeq on the JVM exactly as LongRange does, so
+;; (chunked-seq? (range 0 1.0 0.1)) is true there.
 (define (sk-chunked? k)
-  (and (fx>=? k sk-chunked-seq) (fx<=? k sk-long-range)))
+  (and (fx>=? k sk-chunked-seq) (fx<=? k sk-range)))
 ;; vector-backed: like a ChunkedCons, its tail follows from (v, i+1), so it
 ;; carries no thunk either — see cseq-cvec-more.
 ;; The flavor is passed in rather than assumed from cvec: cvec/ci is a
@@ -1245,31 +1249,58 @@
 ;; An empty range is () (jolt-empty-list), NOT nil — (range 0) and (range 5 5) are
 ;; empty seqs in Clojure, so (= () (range 0)) holds, and () seqs back to nil so it
 ;; also terminates the chunked tail (see jolt-take).
-(define (range-chunked n end step)
+;; `kind` is the flavor the caller derived from the ARGUMENT TYPES (range-kind
+;; below) — it cannot be re-derived here, because the values this recurses with are
+;; sums, and a long start plus a double step is a double from the second element on.
+;; clojure.core/range picks the class from what it was handed, once.
+(define (range-chunked n end step kind)
   (cond
     ((= step 0)
-     ;; JVM: (range start end 0) repeats start infinitely
-     (cseq-lazy/k n (lambda () (range-chunked n end step)) sk-long-range))
+     ;; JVM: (range start end 0) is Repeat.create(start) — it repeats start
+     ;; forever, and is a clojure.lang.Repeat, not a range class at all.
+     (cseq-lazy/k n (lambda () (range-chunked n end step sk-repeat)) sk-repeat))
     ((if (> step 0.0) (< n end) (> n end))
      (let loop ((i 0) (v n) (acc '()))
        (if (and (fx<? i seq-chunk-size) (if (> step 0.0) (< v end) (> v end)))
            (loop (fx+ i 1) (+ v step) (cons v acc))
-           ;; chunked in REPRESENTATION but a LongRange by class, which is exactly
-           ;; the JVM's own arrangement (LongRange implements IChunkedSeq).
+           ;; chunked in REPRESENTATION but a range class by name, which is exactly
+           ;; the JVM's own arrangement (both LongRange and Range implement
+           ;; IChunkedSeq).
            (cseq-chunked/k (make-pvec (list->vector (reverse acc))) 0
-                           (jolt-make-lazy-seq (lambda () (jolt-seq (range-chunked v end step))))
-                           sk-long-range))))
+                           (jolt-make-lazy-seq (lambda () (jolt-seq (range-chunked v end step kind))))
+                           kind))))
     (else jolt-empty-list)))
+;; Which range class the args select. clojure.core/range sends every argument
+;; through `int?` and takes clojure.lang.LongRange only when they ALL pass,
+;; clojure.lang.Range otherwise — so a double bound or step, or a ratio, gets Range
+;; even when the values it yields start out as longs: (range 0 1.0 0.1) is a Range.
+;;
+;; The test is "is this value a java.lang.Long in jolt's model", i.e. the same
+;; question host-class.ss answers for `class` — an exact integer inside the JVM long
+;; range. That ties the two together: anything jolt calls a java.lang.Long counts as
+;; a long here. It also means (range 0 (bigint 5)) is a LongRange in jolt while the
+;; JVM makes it a Range, because jolt has no distinct BigInt type for a value that
+;; small — (class (bigint 5)) is java.lang.Long here. That follows from the number
+;; model, not from this tagging, and is allowlisted as such.
+(define (range-long-arg? x)
+  (and (number? x) (exact? x) (integer? x) (not (jolt-bigint-print? x))))
+(define (range-kind . args)
+  (if (for-all range-long-arg? args) sk-long-range sk-range))
 ;; numeric tower: exact 0/1 defaults so (range 3) yields exact ints
 ;; (= JVM longs); flonum args still produce flonums (Scheme arithmetic preserves).
+;; The defaults are exact, so they never by themselves force the Range flavor —
+;; matching the JVM, where the 1-arity checks only `end`.
 ;; (range) with no bound is the lazy, NON-chunked (iterate inc' 0) form.
 (define jolt-range
   (case-lambda
     (() (range-from 0))
-    ((end) (range-chunked 0 (jolt-need-num end) 1))
-    ((start end) (range-chunked (jolt-need-num start) (jolt-need-num end) 1))
-    ((start end step) (range-chunked (jolt-need-num start) (jolt-need-num end)
-                                     (jolt-need-num step)))))
+    ((end) (let ((e (jolt-need-num end)))
+             (range-chunked 0 e 1 (range-kind e))))
+    ((start end) (let ((s (jolt-need-num start)) (e (jolt-need-num end)))
+                   (range-chunked s e 1 (range-kind s e))))
+    ((start end step) (let ((s (jolt-need-num start)) (e (jolt-need-num end))
+                            (p (jolt-need-num step)))
+                        (range-chunked s e p (range-kind s e p))))))
 
 ;; An empty take result is () (jolt-empty-list), NOT nil — (take 0 coll) and
 ;; (take n []) are empty seqs in Clojure, so (= () (take 0 [:a])) and printing

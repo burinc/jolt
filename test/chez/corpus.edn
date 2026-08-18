@@ -3427,6 +3427,27 @@
   {:suite "seq-type-model / specialized seq classes" :label "iterate" :expected "clojure.lang.Iterate" :actual "(class (iterate inc 0))" :portability :common}
   {:suite "seq-type-model / specialized seq classes" :label "range" :expected "clojure.lang.LongRange" :actual "(class (range 5))" :portability :common}
   {:suite "seq-type-model / specialized seq classes" :label "unbounded range is Iterate" :expected "clojure.lang.Iterate" :actual "(class (range))" :portability :common}
+  ;; clojure.core/range sends every argument through int? and picks LongRange only
+  ;; when they ALL pass, Range otherwise — so one double bound or step decides the
+  ;; class even where the values start out as longs.
+  {:suite "seq-type-model / specialized seq classes" :label "long-bounded range with a long step" :expected "clojure.lang.LongRange" :actual "(class (range 0 10 2))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "float-stepped range is Range" :expected "clojure.lang.Range" :actual "(class (range 0 1.0 0.1))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "float-bounded range is Range" :expected "clojure.lang.Range" :actual "(class (range 1.5))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "float-started range is Range" :expected "clojure.lang.Range" :actual "(class (range 0.0 1.0))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "ratio-started range is Range" :expected "clojure.lang.Range" :actual "(class (range 1/2 3))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "beyond-long bound is Range" :expected "clojure.lang.Range" :actual "(class (range 0 99999999999999999999))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "a Range chunks like a LongRange" :expected "true" :actual "(chunked-seq? (range 0 1.0 0.1))" :portability :common}
+  ;; A zero step is Repeat.create(start) on the JVM — not a range class at all.
+  {:suite "seq-type-model / specialized seq classes" :label "zero-step range is Repeat" :expected "clojure.lang.Repeat" :actual "(class (range 0 5 0))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "zero-step range repeats start" :expected "[0 0 0]" :actual "(vec (take 3 (range 0 5 0)))" :portability :common}
+  {:suite "seq-type-model / specialized seq classes" :label "zero-step float range is Repeat" :expected "clojure.lang.Repeat" :actual "(class (range 0.0 5.0 0))" :portability :common}
+  ;; An empty range is PersistentList$EmptyList whichever flavor the args select.
+  {:suite "seq-type-model / specialized seq classes" :label "empty float range is EmptyList" :expected "clojure.lang.PersistentList$EmptyList" :actual "(class (range 0.0 0.0))" :portability :common}
+  ;; DIVERGENCE (integer-box-model, not the range tagging): the JVM answers Range
+  ;; here because BigInt is its own type and fails int?'s Long check. jolt has no
+  ;; BigInt for a value this small — (class (bigint 5)) is java.lang.Long — so the
+  ;; arg IS a long here and LongRange follows. Consistent with jolt's number model.
+  {:suite "seq-type-model / specialized seq classes" :label "bigint of a small bound is a long here" :expected "clojure.lang.LongRange" :actual "(class (range 0 (bigint 5)))" :portability :common}
   {:suite "seq-type-model / specialized seq classes" :label "vector seq" :expected "clojure.lang.PersistentVector$ChunkedSeq" :actual "(class (seq [1 2 3]))" :portability :common}
   {:suite "seq-type-model / specialized seq classes" :label "rest of a vector seq" :expected "clojure.lang.PersistentVector$ChunkedSeq" :actual "(class (rest [1 2 3]))" :portability :common}
   {:suite "seq-type-model / specialized seq classes" :label "string seq" :expected "clojure.lang.StringSeq" :actual "(class (seq \"abc\"))" :portability :common}

@@ -557,6 +557,10 @@
   {:suite "integer-box-model / narrow int class collapses to Long", :label "short class", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "int class", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "bigint of a small value collapses", :category :integer-box-model}
+  ;; Same root as the row above, reached through range's class tagging: the JVM
+  ;; picks clojure.lang.Range because BigInt fails int?'s Long check, while in jolt
+  ;; (bigint 5) IS a java.lang.Long and the all-longs test passes, so LongRange.
+  {:suite "seq-type-model / specialized seq classes", :label "bigint of a small bound is a long here", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Byte is false", :category :integer-box-model}
     {:suite "integer-box-model / narrow int class collapses to Long", :label "instance? Long is true", :category :integer-box-model}
   {:suite "integer-box-model / narrow int class collapses to Long", :label "float class collapses to Double", :category :integer-box-model}

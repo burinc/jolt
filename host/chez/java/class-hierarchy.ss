@@ -357,7 +357,13 @@
 ;; range is one chunk followed by a lazy continuation, so it cannot answer its own
 ;; length without realizing the whole thing.
 (jch-register-supers! "clojure.lang.LongRange" '("clojure.lang.ASeq"))
+;; The non-all-longs range — (range 0 1.0 0.1) and friends. Same shape as
+;; LongRange, and chunked for the same reason.
+(jch-register-supers! "clojure.lang.Range" '("clojure.lang.ASeq"))
 (jch-register-supers! "clojure.lang.Iterate" '("clojure.lang.ASeq"))
+;; (range start end 0), which the JVM answers with Repeat.create(start). Lazy and
+;; unbounded, so not chunked and not Counted.
+(jch-register-supers! "clojure.lang.Repeat" '("clojure.lang.ASeq"))
 (jch-register-supers! "clojure.lang.PersistentQueue" '("clojure.lang.IPersistentList" "clojure.lang.IPersistentCollection" "java.util.Collection"))
 ;; scalars / named / callable
 (jch-register-supers! "clojure.lang.Keyword" '("clojure.lang.IFn" "clojure.lang.Named" "java.lang.Comparable"))
