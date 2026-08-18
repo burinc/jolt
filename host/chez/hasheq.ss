@@ -595,6 +595,17 @@
     ;; matching JVM's Long.hasheq.
     ((fixnum? x) (murmur3-hash-long-flat x))
     ((string? x) (string-hasheq x))
+    ;; Collections sit up here for the same reason symbols do, and the cost they
+    ;; were paying is worse: a collection reached the fallback only after walking
+    ;; BOTH registries (jolt-hasheq-arms, then jolt-hash-arms), and a map or set
+    ;; already CACHES its hasheq — so the two walks were the entire cost of every
+    ;; repeat hash, paid again per nested collection. Loading jolt-lang/time, whose
+    ;; __register-eq!/__register-hash! arm predicates are Clojure fns called
+    ;; through jolt-invoke, made (hash {:a 1 :b 2}) 8.4x slower purely from this.
+    ;; Routing is copied from jolt-hasheq-fallback, so hash VALUES are unchanged.
+    ((jolt-sequential? x) (hash-ordered (jolt-seq x)))
+    ((pmap? x) (jolt-hasheq-fallback x))
+    ((pset? x) (jolt-hasheq-fallback x))
     (else
      ;; New hasheq arms (jrec via records.ss, etc.)
      (let loop ((as jolt-hasheq-arms))

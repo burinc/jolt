@@ -1503,11 +1503,13 @@
                                       (fx- na i))))
                       (let cloop ((j 0))
                         (if (fx>=? j run) (loop (fx+ i run))
-                            (and (jolt= (vector-ref ca (fx+ oa j)) (vector-ref cb (fx+ ob j)))
+                            ;; jolt=2, not the variadic jolt=: the latter conses a
+                            ;; rest list on EVERY element compare.
+                            (and (jolt=2 (vector-ref ca (fx+ oa j)) (vector-ref cb (fx+ ob j)))
                                  (cloop (fx+ j 1))))))))))))
     ((and (pmap? a) (pmap? b))
      (and (fx=? (pmap-cnt a) (pmap-cnt b))
-          (pmap-fold a (lambda (k v ok) (and ok (jolt= (pmap-get b k pmap-absent) v))) #t)))
+          (pmap-fold a (lambda (k v ok) (and ok (jolt=2 (pmap-get b k pmap-absent) v))) #t)))
     ((and (pset? a) (pset? b))
      (and (fx=? (pset-count a) (pset-count b))
           (pset-fold a (lambda (e ok) (and ok (pset-contains? b e))) #t)))
