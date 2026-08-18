@@ -28,7 +28,6 @@
             [grenadine.version :as grenadine.version]
             [jolt.deps.edn :as dedn]
             [jolt.deps.ext :as ext]
-            [jolt.fs :as fs]
             [jolt.mvn-http :as http]))
 
 (defonce ^:private required-state
@@ -1398,15 +1397,23 @@
 
 (defn- required-host
   []
-  {:home-dir #(getenv "HOME")
-   :gitlibs-dir gitlibs-dir
-   :file-exists? file-exists?
-   :mkdirs! #(do (fs/create-dirs %) nil)
-   :delete! #(do (fs/delete-if-exists %) nil)
-   :read-text slurp
-   :download! http/fetch
-   :atomic-move!
-   #(do (fs/move %1 %2 {:replace-existing true :atomic-move true}) nil)})
+  ;; Keep jolt.fs out of the CLI's static require closure. It is needed only
+  ;; when acquiring a Gist or GitHub source, and eagerly requiring it from
+  ;; jolt.deps removes jolt.fs (and babashka.fs) from the stdlib embedded in
+  ;; binaries built by jolt.
+  (require 'jolt.fs)
+  (let [create-dirs (resolve 'jolt.fs/create-dirs)
+        delete-if-exists (resolve 'jolt.fs/delete-if-exists)
+        move (resolve 'jolt.fs/move)]
+    {:home-dir #(getenv "HOME")
+     :gitlibs-dir gitlibs-dir
+     :file-exists? file-exists?
+     :mkdirs! #(do (create-dirs %) nil)
+     :delete! #(do (delete-if-exists %) nil)
+     :read-text slurp
+     :download! http/fetch
+     :atomic-move!
+     #(do (move %1 %2 {:replace-existing true :atomic-move true}) nil)}))
 
 (defn- read-first-form
   [source]
