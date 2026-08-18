@@ -253,7 +253,10 @@
   (list (cons 0 1) (cons 1.5 2.5)
         (cons (keyword #f "a") (keyword #f "b"))
         (cons (jolt-symbol #f "a") (jolt-symbol #f "b"))
-        (cons "s1" "s2")))
+        (cons "s1" "s2")
+        ;; jolt's own collection types, now answered ahead of the walk.
+        (cons (jolt-vector 1) (jolt-vector 2))
+        (cons (jolt-hash-map (keyword #f "a") 1) (jolt-hash-map (keyword #f "a") 2))))
 (define (eq-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who
                            (lambda (probe) (pred (car probe) (cdr probe)))
@@ -276,6 +279,12 @@
     ((and (char? a) (char? b)) (char=? a b))
     ((and (string? a) (string? b)) (string=? a b))
     ((and (boolean? a) (boolean? b)) (eq? a b))
+    ;; Two jolt vectors take the chunked leaf-run compare in jolt-coll=? — it
+    ;; walks both leaf arrays in lockstep instead of allocating a seq cell per
+    ;; element. A pvec IS jolt-sequential?, so this MUST precede the sequential
+    ;; arm below or it is unreachable and every vector compare pays the seq walk
+    ;; (measured 5.1 us against 0.19 us on the JVM for two 20-element vectors).
+    ((and (pvec? a) (pvec? b)) (jolt-coll=? a b))
     ;; sequential (vector / list / lazy seq) compare element-wise, cross-type:
     ;; (= [1 2 3] (list 1 2 3)) is true. Forward to seq.ss (loaded by rt.ss).
     ((and (jolt-sequential? a) (jolt-sequential? b)) (seq=? a b))
@@ -324,6 +333,19 @@
            (and (or (eq? nsa nsb)
                     (and (string? nsa) (string? nsb) (string=? nsa nsb)))
                 (or (eq? na nb) (string=? na nb)))))
+        ;; Jolt's OWN collection types answer here too, for the same reason the
+        ;; keyword and string clauses do: a compare of two vectors or two maps
+        ;; otherwise pays one predicate call per registered arm, and the registry
+        ;; GROWS as libraries load. Loading jolt-lang/time (whose __register-eq!
+        ;; arm predicate is a Clojure fn called through jolt-invoke) made
+        ;; (= v20 v20) 44% slower and `hash` of a 2-entry map 8.4x slower, purely
+        ;; from the walk. Both pairs are in eq-fast-probes, so the registry
+        ;; REFUSES an arm claiming them — that guard is what makes answering here
+        ;; safe. Narrow on purpose: only pvec/pmap/pset, never jolt-map? (whose
+        ;; own arms let host types masquerade as maps) and never records.
+        ((and (pvec? a) (pvec? b)) (jolt-coll=? a b))
+        ((and (pmap? a) (pmap? b)) (jolt-coll=? a b))
+        ((and (pset? a) (pset? b)) (jolt-coll=? a b))
         (else (let loop ((as jolt-eq-arms))
                 (cond ((null? as) (jolt=2-base a b)) 
                       (((caar as) a b) ((cdar as) a b)) 
@@ -344,7 +366,9 @@
 ;; all still reach the arms and an arm claiming one of those is legal.
 ;; Built on demand, not at load: interning a keyword needs hasheq.ss, which
 ;; rt.ss loads after this file. Every arm registers later still.
-(define (hash-fast-probes) (list jolt-nil (keyword #f "k") (jolt-symbol #f "s") 0 "s"))
+(define (hash-fast-probes)
+  (list jolt-nil (keyword #f "k") (jolt-symbol #f "s") 0 "s"
+        (jolt-vector 1) (jolt-hash-map (keyword #f "k") 1)))
 (define (hash-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who pred (hash-fast-probes) "the jolt-hash fast path"))
 (define jolt-hash-arms '())
@@ -365,6 +389,16 @@
         ((symbol-t? x) (jolt-hasheq x))
         ((fixnum? x) (jolt-hasheq x))
         ((string? x) (jolt-hasheq x))
+        ;; Collections answer before the walk for the same reason (see jolt=2).
+        ;; This one is the worse of the two: a pmap already CACHES its hasheq, so
+        ;; the arm walk was the entire cost of a repeat `hash` of a map, and it is
+        ;; paid again per nested collection. Routing matches jolt-hash-base
+        ;; exactly — a pvec is jolt-sequential?, and seq-hash and jolt-coll-hash's
+        ;; pvec arm are both (hash-ordered (jolt-seq x)) — so hash VALUES are
+        ;; unchanged and the HAMT keeps working.
+        ((pvec? x) (seq-hash x))
+        ((pmap? x) (jolt-coll-hash x))
+        ((pset? x) (jolt-coll-hash x))
         (else (let loop ((as jolt-hash-arms))
                 (cond ((null? as) (jolt-hash-base x))
                       (((caar as) x) ((cdar as) x))

@@ -1493,7 +1493,8 @@
   (let loop ((sa (jolt-seq a)) (sb (jolt-seq b)))
     (cond ((and (jolt-nil? sa) (jolt-nil? sb)) #t)
           ((or (jolt-nil? sa) (jolt-nil? sb)) #f)
-          ((jolt= (seq-first sa) (seq-first sb)) (loop (jolt-seq (seq-more sa)) (jolt-seq (seq-more sb))))
+          ;; jolt=2, not the variadic jolt=: the latter conses a rest list per element.
+          ((jolt=2 (seq-first sa) (seq-first sb)) (loop (jolt-seq (seq-more sa)) (jolt-seq (seq-more sb))))
           (else #f))))
 (define (seq-hash x)
   ;; JVM-compatible ordered-collection hash (Murmur3.hashOrdered via mixCollHash).
