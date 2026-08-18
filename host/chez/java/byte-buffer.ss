@@ -2,7 +2,8 @@
 ;; jhost tagged "byte-buffer" with mutable #(backing-array position limit); the
 ;; backing is a jolt byte-array (signed bytes, -128..127). Covers the slice of the API
 ;; portable code reaches for — wrap / get(byte[]) / array / remaining / position /
-;; limit / duplicate / flip / rewind — e.g. cognitect aws-api wrapping blob bytes.
+;; limit / duplicate / flip / rewind / getInt and the sibling widths — e.g. cognitect
+;; aws-api wrapping blob bytes, or a binary codec framing a length prefix.
 
 (define (make-byte-buffer backing pos limit) (make-jhost "byte-buffer" (vector backing pos limit)))
 (define (bb? x) (and (jhost? x) (string=? (jhost-tag x) "byte-buffer")))
@@ -96,6 +97,69 @@
                            (vector-set! dv (+ off i) (vector-ref src (+ p i))))
                          (bb-pos! self (+ p len))
                          self))))))))
+
+;; --- multi-byte accessors ----------------------------------------------------
+;; getInt / putInt and the sibling widths, big-endian: that is the JVM's default
+;; byte order, and .order (little-endian) is deliberately not shimmed, so a caller
+;; asking for it gets "no matching method" rather than silently big-endian bytes.
+;; Each accessor has both JVM overloads — a relative form starting at position and
+;; advancing it by the width, and an absolute form taking an index that leaves
+;; position alone. getShort/getInt/getLong read back SIGNED, so (.getInt) over
+;; 0xF0000000 is negative exactly as on the JVM; getChar is a UTF-16 code unit and
+;; so reads unsigned, as a character.
+
+;; The width bytes at idx, big-endian, as an unsigned integer. The backing holds
+;; signed bytes, hence the mask on each one.
+(define (bb-ref-unsigned self idx width)
+  (let ((v (jolt-array-vec (bb-backing self))))
+    (do ((i 0 (fx+ i 1))
+         (acc 0 (+ (* acc 256) (bitwise-and (vector-ref v (+ idx i)) #xff))))
+        ((fx=? i width) acc))))
+
+(define (bb-set-unsigned! self idx width val)
+  (let ((v (jolt-array-vec (bb-backing self)))
+        (u (bitwise-and val (- (bitwise-arithmetic-shift-left 1 (* 8 width)) 1))))
+    (do ((i 0 (fx+ i 1))) ((fx=? i width))
+      (vector-set! v (+ idx i)
+                   (na-u8->byte
+                     (bitwise-and (bitwise-arithmetic-shift-right u (* 8 (fx- width (fx+ i 1)))) #xff))))))
+
+;; Build both overloads of one width. `in` maps a stored unsigned integer to what
+;; the getter hands back; `out` maps a setter argument to an integer to store.
+(define (bb-num-accessors nm width in out)
+  (list
+    (cons (string-append "get" nm)
+          (lambda (self . a)
+            (if (pair? a)
+                (in (bb-ref-unsigned self (jnum->exact (car a)) width))
+                (let ((p (bb-pos self)))
+                  (bb-pos! self (+ p width))
+                  (in (bb-ref-unsigned self p width))))))
+    (cons (string-append "put" nm)
+          (lambda (self a . b)
+            (if (pair? b)
+                (bb-set-unsigned! self (jnum->exact a) width (out (car b)))
+                (let ((p (bb-pos self)))
+                  (bb-set-unsigned! self p width (out a))
+                  (bb-pos! self (+ p width))))
+            self))))
+
+;; Reinterpret an unsigned width-byte integer as a two's-complement signed one.
+(define (bb-signed width)
+  (lambda (u)
+    (->num (if (>= u (bitwise-arithmetic-shift-left 1 (- (* 8 width) 1)))
+               (- u (bitwise-arithmetic-shift-left 1 (* 8 width)))
+               u))))
+
+(register-host-methods! "byte-buffer"
+  (append
+    (bb-num-accessors "Short" 2 (bb-signed 2) jnum->exact)
+    (bb-num-accessors "Int"   4 (bb-signed 4) jnum->exact)
+    (bb-num-accessors "Long"  8 (bb-signed 8) jnum->exact)
+    ;; a char is a UTF-16 code unit: unsigned in, a character out. putChar takes
+    ;; either a character or its code point, the way jolt's other char shims do.
+    (bb-num-accessors "Char"  2 integer->char
+                      (lambda (c) (if (char? c) (char->integer c) (jnum->exact c))))))
 
 (register-class-arm! bb? (lambda (x) "java.nio.ByteBuffer"))
 (register-instance-check-arm!

@@ -407,6 +407,10 @@
         ;; Integer.compare(int, int): -1/0/1 exactly, not an arbitrary sign value.
         (cons "compare" (lambda (x y) (let ((a (jnum->exact x)) (b (jnum->exact y)))
                                         (->num (cond ((< a b) -1) ((> a b) 1) (else 0))))))
+        ;; Integer.signum(int): -1/0/1 as an int. Math/signum is the double-valued
+        ;; one and stays separate.
+        (cons "signum" (lambda (x) (let ((a (jnum->exact x)))
+                                     (->num (cond ((< a 0) -1) ((> a 0) 1) (else 0))))))
         ;; lowercase, like the JVM; a negative int is the 32-bit unsigned form.
         (cons "toHexString" (lambda (x) (string-downcase (number->string (int->u32 (jnum->exact x)) 16))))
         (cons "toOctalString" (lambda (x) (number->string (int->u32 (jnum->exact x)) 8)))
