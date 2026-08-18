@@ -5,10 +5,10 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.15] - 2026-08-18
 
-An interop-dispatch release in the making. The theme: a `.method` call on a
-string — `indexOf`, `toUpperCase`, `startsWith` — is the innermost loop of
+An interop-dispatch release. The theme: a `.method` call on a string —
+`indexOf`, `toUpperCase`, `startsWith` — is the innermost loop of
 :clj-fast-path libraries like honeysql, and every one of those calls was paying
 the full generic record-dispatch walk plus a rest-args vector it didn't need.
 The entries below remove that cost where the target provably is a string, and
@@ -18,6 +18,13 @@ Profiling honeysql the rest of the way turned the theme into a broader one: the
 same library's remaining gap was not interop at all but scalar-key hashing and
 the numeric casts, each of which had one outlier hiding behind an otherwise
 uniform per-call overhead. Those are here too.
+
+The other half of the release is the class model. A seq used to report
+`PersistentList` whatever produced it, and `cons` built one whatever it was
+handed; both now answer with the class the reference gives them. **Read
+`### Changed` before upgrading** — code that dispatches on a seq's class, or
+that calls `list?`, `counted?` or `peek` on the result of `cons`, sees
+different answers, and they are the reference's answers.
 
 ### Added
 
@@ -116,6 +123,57 @@ uniform per-call overhead. Those are here too.
 - **`jolt-invoke1`/`jolt-invoke2` answer lookup-shaped callables.** A map, set,
   vector or symbol in head position — `(m k)`, `(k m)` — no longer falls
   through to the variadic `jolt-invoke`.
+
+### Changed
+
+- **A seq reports the concrete `clojure.lang` class of whatever produced it.**
+  Every seq answered `clojure.lang.PersistentList` regardless of where it came
+  from, so `(class (range 3))`, `(class (seq [1 2]))` and `(class (keys m))` all
+  read the same and none of them read what the reference says. They now carry
+  the class the reference gives them, and `list?`/`counted?`/`chunked-seq?`
+  follow from it rather than from one blanket answer:
+
+  | expression | before | now (and on the JVM) |
+  |---|---|---|
+  | `(range 3)` | `PersistentList` | `LongRange` |
+  | `(seq [1 2])` | `PersistentList` | `PersistentVector$ChunkedSeq` |
+  | `(keys {:a 1})` | `PersistentList` | `APersistentMap$KeySeq` |
+  | `(vals {:a 1})` | `PersistentList` | `APersistentMap$ValSeq` |
+  | `(seq "ab")` | `PersistentList` | `StringSeq` |
+  | `(seq {:a 1})` | `PersistentList` | `PersistentArrayMap$Seq` |
+  | `(sort [2 1])` | `PersistentList` | `ArraySeq` |
+  | `(iterate inc 0)` | `PersistentList` | `Iterate` |
+
+  Code that dispatched on a seq's class — a `defmulti` on `class`, an
+  `extend-protocol` arm, an `instance?` test — sees the real class now. Code
+  that relied on everything being a `PersistentList` has to change, and that is
+  the point: it was relying on jolt disagreeing with Clojure.
+
+- **`cons` builds a `Cons`, not a `PersistentList`.** `RT.cons` has two
+  outcomes — onto `nil` a `PersistentList`, onto anything else a `Cons` — and a
+  `Cons` is an `ASeq` but not an `IPersistentList`, so it is not `list?`, not
+  `counted?`, and not a stack. jolt built a list cell either way:
+
+  ```clojure
+  (class (cons 1 (list 2)))    ; was PersistentList   -> now Cons
+  (list? (cons 1 (list 2)))    ; was true             -> now false
+  (counted? (cons 1 (list 2))) ; was true             -> now false
+  (peek (cons 1 (list 2)))     ; was 1  -> now throws ClassCastException, as on the JVM
+  ```
+
+  The split is on the ARGUMENT being `nil`, not on its seq being empty, so
+  `(cons 1 [])` is a `Cons` while `(cons 1 nil)` is a one-element
+  `PersistentList` — which is what `RT.cons` tests.
+
+- **`time` reports like the reference macro.** It measured with the epoch wall
+  clock at whole-millisecond resolution, so anything faster than 1 ms printed
+  `"Elapsed time: 0 msecs"` and a clock adjustment mid-expression could print a
+  negative elapsed. It now reads the monotonic nanosecond clock and divides to
+  fractional milliseconds, as `(System/nanoTime)` does there. It also prints
+  through `prn`, not `println`, so the line is the QUOTED string the reference
+  emits — output that was `Elapsed time: 0 msecs` is now
+  `"Elapsed time: 0.001 msecs"`, which is what a caller diffing jolt's output
+  against Clojure's sees.
 
 ### Fixed
 
@@ -5037,7 +5095,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.14...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.15...HEAD
+[0.7.15]: https://github.com/jolt-lang/jolt/compare/v0.7.14...v0.7.15
 [0.7.6]: https://github.com/jolt-lang/jolt/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/jolt-lang/jolt/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/jolt-lang/jolt/compare/v0.7.3...v0.7.4
