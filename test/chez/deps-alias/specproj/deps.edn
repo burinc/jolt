@@ -1,6 +1,6 @@
-;; A project whose ONLY dependency is Clojure itself. On the JVM that is enough
-;; to get clojure.spec.alpha, because the org.clojure/clojure artifact depends on
-;; org.clojure/spec.alpha and org.clojure/core.specs.alpha — so libraries require
-;; spec without ever naming it (kaocha does, rewrite-clj's suite does).
+;; Clojure is supplied by Jolt and is terminal during dependency expansion.
+;; Explicit spec coordinates remain ordinary dependencies and must be acquired.
 {:paths ["src"]
- :deps {org.clojure/clojure {:mvn/version "1.12.4"}}}
+ :deps {org.clojure/clojure {:mvn/version "1.12.4"}
+        org.clojure/spec.alpha {:mvn/version "0.5.238"}
+        org.clojure/core.specs.alpha {:mvn/version "0.4.74"}}}

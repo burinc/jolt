@@ -33,6 +33,7 @@ Read it before assuming a JVM behaviour holds.
 - [Install](#install) — prebuilt binaries, Homebrew, install script
 - [Run](#run) — `-e`, project deps, `clj`-compatible options
 - [Differences from Clojure](#differences-from-clojure) — what actually diverges
+- [Runtime dependencies](#runtime-dependencies) — acquiring libraries in code
 - [Diagnostics](#diagnostics) — error suggestions, EDN errors, the lint pass
 - [REPL and editor integration](#repl-and-editor-integration) — nREPL, CIDER/Calva/Cursive
 - [Compile a binary](#compile-a-binary) — self-contained executables
@@ -70,6 +71,43 @@ archives GitHub attaches to a release are not binaries and omit the submodules,
 so they can neither run nor build — clone the repo instead.
 
 Then `jolt -e '(+ 1 2)'`.
+
+Running from source has no build step. The bootstrap seed
+(`host/chez/seed/{prelude,image}.ss`) is checked in, so a fresh clone runs
+immediately:
+
+```bash
+git clone --recurse-submodules https://github.com/jolt-lang/jolt.git
+cd jolt
+bin/jolt -e '(+ 1 2)'        # => 3
+```
+
+The `--recurse-submodules` matters: jolt vendors its regex engine, its Maven
+resolver, and its test suites as git submodules. In a checkout that's missing
+them (a plain `git clone`, or after pulling a commit that adds one), fetch them
+with:
+
+```bash
+git submodule update --init --recursive
+```
+
+`bin/jolt` needs a **threaded Chez Scheme 10.x**. It first honors `JOLT_CHEZ`,
+then reuses a 10.x Chez already provisioned under `.cache/local` by `make`, and
+finally searches `PATH` for `chez` or `chezscheme`. `make` provisions its own
+10.4.1 when `PATH` has a different version and exports `JOLT_CHEZ` so both halves
+of a build agree.
+
+Note that GitHub's auto-generated "Source code (zip/tar.gz)" archives on the
+releases page do **not** contain submodules, so they can't run or build —
+clone the repo instead (or grab a prebuilt binary from the same page).
+
+After changing a compiler source — the reader (`host/chez/reader.ss`), the
+analyzer/IR/backend (`jolt-core/jolt/*.clj`), or the `clojure.core` overlay
+(`jolt-core/clojure/core/*.clj`) — re-mint the seed:
+
+```bash
+make remint                   # iterates host/chez/bootstrap.ss to a byte-fixpoint
+```
 
 Resolving a project's `deps.edn` needs `git` for git deps, and OpenSSL
 (`libssl`/`libcrypto`, loaded via FFI) plus `unzip` for Maven deps — jolt
@@ -175,6 +213,42 @@ The tracked, gated list of value-level divergences is
 [test/conformance/known-divergences.edn](test/conformance/known-divergences.edn);
 the prose version is [Differences from Clojure](https://jolt-lang.github.io/docs/differences.html)
 on the docs site.
+
+## Runtime dependencies
+
+Jolt supplies `org.clojure/clojure` and `org.clojure/clojurescript` itself, so
+those libraries are terminal when encountered transitively: their artifacts
+and dependency trees are not acquired. Explicitly declared
+`org.clojure/spec.alpha` and `org.clojure/core.specs.alpha` dependencies remain
+ordinary dependencies.
+
+Code can acquire and import dependencies while it runs with the portable
+`clojurestar.deps/require-deps` macro:
+
+```clojure
+(require '[clojurestar.deps :refer [require-deps]])
+
+(require-deps
+ ["mvn:dev.weavejester/medley@1.10.0/medley.core" :as medley])
+```
+
+Literal dependency vectors need no quote; quoted vectors remain supported for
+compatibility. Maven, Gist, and GitHub source-file coordinates support `:as`
+and explicit `:refer` imports. An optional leading map accepts
+`:mvn/local-repo` and `:gitlibs/dir`; `:cache-dir` remains a compatibility alias
+for the source-file cache root. A pinned Gist file accepts either
+`gist:<owner>/<id>/<file>@<revision>` or
+`gist:<owner>/<id>/<revision>/<file>`; both forms use the same cache entry.
+A GitHub source file accepts either
+`github:<owner>/<repo>/<ref>/<path.clj|cljc>` or the equivalent
+`github:<owner>/<repo>/blob/<ref>/<path.clj|cljc>` form. Refs occupy one path
+segment; full commit SHAs reuse persistent cache while named refs refresh in a
+new process. Selected files must be self-contained and begin with an `ns` form.
+The explicit Maven option takes precedence over `JOLT_MAVEN_REPOSITORY`, which
+takes precedence over `GRENADINE_MAVEN_REPOSITORY`. For Gist and GitHub source
+dependencies, `JOLT_GITLIBS_DIR` takes precedence over
+`GRENADINE_GITLIBS_DIR`, then `GITLIBS`; source lives under `gist/` or `github/`
+in that effective root.
 
 ## Diagnostics
 

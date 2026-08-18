@@ -8,13 +8,14 @@
 
   The deps walk is breadth-first so a top-level coordinate registers before any
   transitive one (a top-level pin wins). Git deps reuse an existing
-  tools.gitlibs checkout ($GITLIBS / ~/.gitlibs) when the JVM toolchain already
-  fetched them, else clone into a sha-immutable cache ($JOLT_GITLIBS, else
-  ~/.jolt/gitlibs, or a jolt/ subdir of $GITLIBS) shared across projects.
+  tools.gitlibs checkout ($GRENADINE_GITLIBS_DIR / $GITLIBS / ~/.gitlibs)
+  when the JVM toolchain already fetched them, else clone into a sha-immutable
+  cache ($JOLT_GITLIBS_DIR, else a jolt/ subdir of the shared cache) across
+  projects.
   Maven POMs and jars live in the standard local repository
   (~/.m2/repository; :mvn/local-repo in deps.edn relocates it like tools.deps,
-  GRENADINE_LOCAL_REPOSITORY supplies an environment default, and
-  JOLT_LOCAL_REPO remains as a legacy fallback) shared with the JVM toolchain
+  JOLT_MAVEN_REPOSITORY or GRENADINE_MAVEN_REPOSITORY supplies an environment
+  default) shared with the JVM toolchain
   in both directions. Grenadine expands the dependency tree, builds effective
   POMs, and compares Maven versions; files are fetched by jolt itself over
   HTTPS (jolt.mvn-http);
@@ -23,10 +24,14 @@
             [clojure.string :as str]
             [grenadine.expander :as expander]
             [grenadine.pom :as grenadine.pom]
+            [grenadine.require-deps :as required]
             [grenadine.version :as grenadine.version]
             [jolt.deps.edn :as dedn]
             [jolt.deps.ext :as ext]
             [jolt.mvn-http :as http]))
+
+(defonce ^:private required-state
+  (atom {:coordinates {} :namespaces {}}))
 
 ;; --- small host seams -------------------------------------------------------
 ;; An env var set to the empty string reads as UNSET — `FOO= cmd` is the usual
@@ -171,12 +176,18 @@
 ;; --- git cache --------------------------------------------------------------
 ;; jolt's own clone cache. $GITLIBS (the tools.gitlibs location knob) is
 ;; respected for WHERE the cache lives — under a jolt/ subdir so tools.gitlibs'
-;; own _repos/ and libs/ namespaces are never written to. JOLT_GITLIBS pins an
-;; exact directory.
-(defn- gitlibs-dir []
-  (or (getenv "JOLT_GITLIBS")
-      (when-let [g (getenv "GITLIBS")] (str g "/jolt"))
-      (str (or (getenv "HOME") ".") "/.jolt/gitlibs")))
+;; own _repos/ and libs/ namespaces are never written to. JOLT_GITLIBS_DIR
+;; pins an exact directory.
+(defn- gitlibs-dir
+  ([] (gitlibs-dir (getenv "JOLT_GITLIBS_DIR")
+                   (getenv "GRENADINE_GITLIBS_DIR")
+                   (getenv "GITLIBS")
+                   (getenv "HOME")))
+  ([jolt-cache grenadine-cache gitlibs home]
+   (or jolt-cache
+       (when grenadine-cache (str grenadine-cache "/jolt"))
+       (when gitlibs (str gitlibs "/jolt"))
+       (str (or home ".") "/.jolt/gitlibs"))))
 
 (defn- alnum? [c]
   (let [n (int c)]
@@ -194,7 +205,9 @@
   corrupt, so jolt's own fetches go to its cache below."
   [lib sha]
   (when (and lib (namespace lib))
-    (let [base (or (getenv "GITLIBS") (str (or (getenv "HOME") ".") "/.gitlibs"))
+    (let [base (or (getenv "GRENADINE_GITLIBS_DIR")
+                   (getenv "GITLIBS")
+                   (str (or (getenv "HOME") ".") "/.gitlibs"))
           dir (str base "/libs/" (namespace lib) "/" (name lib) "/" sha)]
       (when (file-exists? dir) dir))))
 
@@ -368,9 +381,9 @@
 ;; "<artifact>-<version>.jar.jolt/" directory beside the jar. The repository
 ;; location is configured the way tools.deps configures it — the :mvn/local-repo
 ;; top key of deps.edn (also accepted in an add-deps map); anyone already using
-;; it gets the same behavior for free. GRENADINE_LOCAL_REPOSITORY supplies the
-;; shared environment default, with JOLT_LOCAL_REPO retained as a legacy
-;; fallback. Setting JOLT_MVNLIBS opts out of sharing entirely: the legacy
+;; it gets the same behavior for free. JOLT_MAVEN_REPOSITORY supplies the
+;; dialect override and GRENADINE_MAVEN_REPOSITORY the shared default. Setting
+;; JOLT_MVNLIBS opts out of sharing entirely: the legacy
 ;; self-contained layout under it, jar not kept.
 
 (def ^:private ^:dynamic *mvn-local-repo*
@@ -379,14 +392,18 @@
 
 (defn- m2-repo-dir
   "The local Maven repository dir. An explicit :mvn/local-repo wins, followed
-  by Grenadine's environment setting, Jolt's legacy override, then the standard
-  ~/.m2/repository."
+  by Jolt's environment setting, Grenadine's shared setting, then the standard
+  ~/.m2/repository. Relative environment overrides resolve against JOLT_PWD,
+  matching :mvn/local-repo and every other project-relative path."
   ([] (m2-repo-dir *mvn-local-repo*
-                   (getenv "GRENADINE_LOCAL_REPOSITORY")
-                   (getenv "JOLT_LOCAL_REPO")
-                   (getenv "HOME")))
-  ([cfg grenadine-override jolt-override home]
-   (or cfg grenadine-override jolt-override
+                   (getenv "JOLT_MAVEN_REPOSITORY")
+                   (getenv "GRENADINE_MAVEN_REPOSITORY")
+                   (getenv "HOME")
+                   (or (getenv "JOLT_PWD") ".")))
+  ([cfg jolt-override grenadine-override home base]
+   (or cfg
+       (when jolt-override (abspath base jolt-override))
+       (when grenadine-override (abspath base grenadine-override))
        (str (or home ".") "/.m2/repository"))))
 
 (def ^:private default-mvn-repos
@@ -610,34 +627,6 @@
 (defn- intrinsic-dep? [lib]
   (or (= lib 'org.clojure/clojure) (= lib 'org.clojure/clojurescript)))
 
-(declare effective-pom-deps)
-
-;; ...but org.clojure/clojure being intrinsic does NOT make its DEPENDENCIES
-;; intrinsic. The artifact depends on spec.alpha and core.specs.alpha, neither of
-;; which is part of core on either host, so on the JVM a project that declares
-;; only Clojure still gets clojure.spec.alpha — and libraries lean on that,
-;; requiring spec without ever naming it (kaocha, and spec.alpha's own suite).
-;; Dropping the coordinate whole took its children with it and those libraries
-;; could not load. Substitute the children instead.
-(def ^:private clojure-spec-libs
-  '[org.clojure/spec.alpha org.clojure/core.specs.alpha])
-
-;; What Clojure 1.12 ships, for when the POM cannot be read (offline, or a
-;; hand-installed jar). Being a version behind is far better than the namespace
-;; being absent, which is a load failure rather than a resolution difference.
-(def ^:private clojure-spec-fallback
-  {'org.clojure/spec.alpha {:mvn/version "0.5.238"}
-   'org.clojure/core.specs.alpha {:mvn/version "0.4.74"}})
-
-(defn- clojure-spec-deps
-  "The spec coordinates the declared Clojure would bring in on the JVM, read off
-  that Clojure's own POM so the versions match what tools.deps would resolve."
-  [coord]
-  (or (when (:mvn/version coord)
-        (not-empty (select-keys (or (effective-pom-deps 'org.clojure/clojure coord true) {})
-                                clojure-spec-libs)))
-      clojure-spec-fallback))
-
 (defn- absolutize-local [spec base-dir]
   (if (and (map? spec) (:local/root spec))
     (update spec :local/root #(abspath base-dir %))
@@ -652,10 +641,6 @@
   (into []
         (mapcat (fn [[lib spec]]
                   (cond
-                    ;; jolt IS Clojure, so the coordinate itself contributes
-                    ;; nothing — but its spec children are not part of core here
-                    ;; either, and on the JVM they come in with it.
-                    (= lib 'org.clojure/clojure) (seq (clojure-spec-deps spec))
                     (intrinsic-dep? lib) nil
                     (:jolt/module spec)
                     (do (info "skipping janet dependency " lib " (:jolt/module is obsolete on Chez)") nil)
@@ -1065,17 +1050,18 @@
        "|" (pr-str (vec (sort alias-kws)))
        "|" runtime-version
        ;; the environment-dependent artifact roots resolution materializes into:
-       ;; a run pointed at a different gitlibs/jarlibs (JOLT_GITLIBS — the
+       ;; a run pointed at a different gitlibs/jarlibs (JOLT_GITLIBS_DIR — the
        ;; deps-alias smoke's retry scenarios do exactly this), a different
        ;; HOME (the ~/.m2 and ~/.jolt defaults), or a moved Maven repo
-       ;; (JOLT_MVNLIBS / JOLT_LOCAL_REPO / GRENADINE_LOCAL_REPOSITORY) must
+       ;; (JOLT_MVNLIBS / JOLT_MAVEN_REPOSITORY /
+       ;; GRENADINE_MAVEN_REPOSITORY) must
        ;; not share an entry whose cached roots point into the old location —
        ;; the old paths usually still exist, so validation alone won't miss.
        "|" (gitlibs-dir)
        "|" (or (getenv "JOLT_JARLIBS") "")
        "|" (or (getenv "JOLT_MVNLIBS") "")
-       "|" (or (getenv "JOLT_LOCAL_REPO") "")
-       "|" (or (getenv "GRENADINE_LOCAL_REPOSITORY") "")
+       "|" (or (getenv "JOLT_MAVEN_REPOSITORY") "")
+       "|" (or (getenv "GRENADINE_MAVEN_REPOSITORY") "")
        "|" (or (getenv "HOME") "")
        "|" (str/join "|" (for [p (sort local-dep-edns)]
                            (let [b (or (slurp-quiet p) "")]
@@ -1408,3 +1394,90 @@
        (info "added deps declare :jolt/native libraries (not auto-loaded): "
              (pr-str (dedup-by native-key natives))))
      added)))
+
+(defn- required-host
+  []
+  ;; Keep jolt.fs out of the CLI's static require closure. It is needed only
+  ;; when acquiring a Gist or GitHub source, and eagerly requiring it from
+  ;; jolt.deps removes jolt.fs (and babashka.fs) from the stdlib embedded in
+  ;; binaries built by jolt.
+  (require 'jolt.fs)
+  (let [create-dirs (resolve 'jolt.fs/create-dirs)
+        delete-if-exists (resolve 'jolt.fs/delete-if-exists)
+        move (resolve 'jolt.fs/move)]
+    {:home-dir #(getenv "HOME")
+     :gitlibs-dir gitlibs-dir
+     :file-exists? file-exists?
+     :mkdirs! #(do (create-dirs %) nil)
+     :delete! #(do (delete-if-exists %) nil)
+     :read-text slurp
+     :download! http/fetch
+     :atomic-move!
+     #(do (move %1 %2 {:replace-existing true :atomic-move true}) nil)}))
+
+(defn- read-first-form
+  [source]
+  (binding [*read-eval* false]
+    (read-string source)))
+
+(defn- loaded-namespace
+  [identity]
+  (get-in @required-state [:coordinates identity]))
+
+(defn- load-required!
+  [coordinate namespace-symbol load!]
+  (let [identity (:identity coordinate)
+        loaded-coordinate (get-in @required-state
+                                  [:namespaces namespace-symbol])]
+    (cond
+      (= identity (:identity loaded-coordinate)) namespace-symbol
+      loaded-coordinate
+      (required/namespace-conflict! namespace-symbol loaded-coordinate coordinate)
+      :else
+      (do
+        (load!)
+        (swap! required-state
+               (fn [state]
+                 (-> state
+                     (assoc-in [:coordinates identity] namespace-symbol)
+                     (assoc-in [:namespaces namespace-symbol] coordinate))))
+        namespace-symbol))))
+
+(defn prepare-required!
+  "Internal hook used by clojurestar.deps/require-deps."
+  [coordinate options]
+  (or
+   (loaded-namespace (:identity coordinate))
+   (case (:provider coordinate)
+     :mvn
+     (load-required!
+      coordinate (:namespace coordinate)
+      #(do
+         (add-deps
+          (cond-> {:deps {(:lib coordinate)
+                          {:mvn/version (:version coordinate)}}}
+            (:mvn/local-repo options)
+            (assoc :mvn/local-repo (:mvn/local-repo options))))
+         (require (:namespace coordinate))))
+
+     :gist
+     (let [{:keys [path source]}
+           (required/acquire-gist! (required-host) options coordinate)
+           namespace-symbol
+           (required/gist-namespace coordinate (read-first-form source))]
+       (load-required! coordinate namespace-symbol
+                       #(let [caller (ns-name *ns*)]
+                          (try
+                            (load-file path)
+                            (finally (in-ns caller))))))
+
+     :github
+     (let [{:keys [path source]}
+           (required/acquire-github! (required-host) options coordinate)
+           namespace-symbol
+           (required/github-namespace coordinate (read-first-form source))]
+       (load-required! coordinate namespace-symbol
+                       #(let [caller (ns-name *ns*)]
+                          (try
+                            (load-file path)
+                            (finally (in-ns caller)))))))))

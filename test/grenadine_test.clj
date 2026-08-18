@@ -1,5 +1,7 @@
 (ns grenadine-test
-  (:require [grenadine.graph :as graph]
+  (:require [clojurestar.deps :as portable-deps]
+            [grenadine.graph :as graph]
+            [grenadine.require-deps :as required]
             [jolt.deps :as deps]))
 
 (defn- coord
@@ -18,6 +20,25 @@
   (or (get poms [artifact version])
       (throw (ex-info "missing fixture POM"
                       {:artifact artifact :version version}))))
+
+(let [seen (atom [])]
+  (with-redefs-fn
+    {(var deps/prepare-required!)
+     (fn [coordinate options]
+       (swap! seen conj [(:coordinate coordinate) options])
+       'grenadine.version)}
+    (fn []
+      (portable-deps/require-deps
+       ["mvn:example/unquoted@1.0.0/grenadine.version" :as unquoted-version]
+       '["mvn:example/quoted@1.0.0/grenadine.version" :as quoted-version])))
+  (when-not
+   (and (= [["mvn:example/unquoted@1.0.0/grenadine.version" {}]
+            ["mvn:example/quoted@1.0.0/grenadine.version" {}]]
+           @seen)
+        (some? (resolve 'unquoted-version/compare-versions))
+        (some? (resolve 'quoted-version/compare-versions)))
+    (throw (ex-info "require-deps did not accept both libspec syntaxes"
+                    {:seen @seen}))))
 
 (let [resolution
       (graph/resolve-graph
@@ -72,20 +93,16 @@
     (let [raw (@#'deps/effective-pom-deps
                'demo/child {:mvn/version "1"})
           filtered (into {} (@#'deps/filter-deps raw "."))]
-      ;; Clojure itself is pruned — jolt IS Clojure, and putting the artifact's
-      ;; source on the roots would shadow core. Its spec children are NOT pruned:
-      ;; spec.alpha and core.specs.alpha are part of core on neither host, and on
-      ;; the JVM they arrive with the Clojure coordinate. Versions are read off the
-      ;; declared Clojure's own POM; this fixture redefines pom-text and so has no
-      ;; POM for clojure 1.9.0, which exercises the fallback — hence asserting on
-      ;; which libs appear rather than on their versions.
+      ;; Clojure itself is terminal — jolt IS Clojure, and putting the artifact's
+      ;; source on the roots would shadow core. Its transitive subtree is skipped
+      ;; with it; spec libraries are resolved only when explicitly declared.
       (when-not (and (= {:mvn/version "2"} (get filtered 'demo/managed))
                      (nil? (get filtered 'org.clojure/clojure))
-                     (contains? filtered 'org.clojure/spec.alpha)
-                     (contains? filtered 'org.clojure/core.specs.alpha))
+                     (nil? (get filtered 'org.clojure/spec.alpha))
+                     (nil? (get filtered 'org.clojure/core.specs.alpha)))
         (throw
-         (ex-info (str "Jolt did not use Grenadine's effective POM, prune Clojure, "
-                       "or carry Clojure's spec dependencies")
+         (ex-info (str "Jolt did not use Grenadine's effective POM or treat "
+                       "Clojure as a terminal host dependency")
                   {:raw raw :filtered filtered}))))))
 
 ;;;; A POM Grenadine cannot model degrades to the jar's own pom.xml rather than
@@ -127,6 +144,109 @@
                    </project>"}
                  'demo/unresolved))
   (throw (ex-info "an unresolvable ${property} should degrade to nil, not deps" {})))
+
+(let [seen (atom [])]
+  (with-redefs-fn
+    {(var jolt.deps/prepare-required!)
+     (fn [coordinate options]
+       (swap! seen conj [(:coordinate coordinate) options])
+       'grenadine.graph)}
+    (fn []
+      (when-not
+       (nil?
+        (portable-deps/require-deps
+         {:cache-dir "/cache"}
+         '["gist:ingydotnet/f70409675d234aa4f2fe379cd975a4f5"
+           :as required-graph]
+         '["mvn:example/library@1.0.0/example.library"
+           :refer [resolve-graph]]))
+       (throw (ex-info "require-deps must return nil" {})))
+      (when-not
+       (= ["gist:ingydotnet/f70409675d234aa4f2fe379cd975a4f5"
+          "mvn:example/library@1.0.0/example.library"]
+          (mapv first @seen))
+       (throw (ex-info "require-deps did not preserve libspec order"
+                       {:seen @seen})))
+      (when-not (and (resolve 'required-graph/resolve-graph)
+                     (resolve 'resolve-graph))
+        (throw (ex-info "require-deps did not apply :as and :refer" {}))))))
+
+(let [repository-dir @#'deps/m2-repo-dir]
+  (when-not
+   (= "/project/explicit"
+      (repository-dir "/project/explicit" "environment" "legacy" "/home/user"
+                      "/project"))
+    (throw (ex-info "explicit Maven repository did not take precedence" {})))
+  (when-not
+   (= "/project/environment"
+      (repository-dir nil "environment" "legacy" "/home/user" "/project"))
+    (throw (ex-info "relative Grenadine repository did not use the project directory"
+                    {}))))
+
+(let [host (@#'deps/required-host)]
+  (when-not
+   (= ((:gitlibs-dir host))
+      (required/cache-root host {}))
+    (throw (ex-info "require-deps did not use Jolt's Gitlibs directory" {}))))
+
+(let [revision "0123456789abcdef0123456789abcdef01234567"
+      base "gist:ingydotnet/f70409675d234aa4f2fe379cd975a4f5/"
+      suffix (required/parse-coordinate (str base "mathy.clj@" revision))
+      slash (required/parse-coordinate (str base revision "/mathy.clj"))]
+  (when-not (= (:identity suffix) (:identity slash))
+    (throw (ex-info "pinned Gist coordinate forms have different identities"
+                    {:suffix suffix :slash slash})))
+  (when-not (= (required/gist-raw-url suffix)
+               (required/gist-raw-url slash))
+    (throw (ex-info "pinned Gist coordinate forms have different raw URLs"
+                    {:suffix suffix :slash slash}))))
+
+(let [caller (ns-name *ns*)
+      path (str (System/getProperty "java.io.tmpdir")
+                "/jolt-require-deps-gist.clj")
+      source "(ns require-deps-gist-fixture)\n(def value 42)\n"
+      coordinate {:provider :gist
+                  :coordinate "gist:fixture/deadbeef"
+                  :identity [:gist "fixture" "deadbeef" nil nil]}]
+  (spit path source)
+  (try
+    (with-redefs-fn
+      {(var required/acquire-gist!)
+       (fn [_host _options _coordinate]
+         {:path path :source source})}
+      (fn []
+        (deps/prepare-required! coordinate {})
+        (when-not (= caller (ns-name *ns*))
+          (throw (ex-info "require-deps leaked the loaded Gist namespace"
+                          {:expected caller :actual (ns-name *ns*)})))
+        (when-not (= 42 @(resolve 'require-deps-gist-fixture/value))
+          (throw (ex-info "require-deps did not load the Gist namespace" {})))))
+    (finally
+      (.delete (java.io.File. path)))))
+
+(let [caller (ns-name *ns*)
+      path (str (System/getProperty "java.io.tmpdir")
+                "/jolt-require-deps-github.clj")
+      source "(ns require-deps-github-fixture)\n(def value 42)\n"
+      coordinate
+      (required/parse-coordinate
+       "github:fixture/library/blob/0123456789abcdef0123456789abcdef01234567/src/github_fixture.clj")]
+  (spit path source)
+  (try
+    (with-redefs-fn
+      {(var required/acquire-github!)
+       (fn [_host _options _coordinate]
+         {:path path :source source})}
+      (fn []
+        (deps/prepare-required! coordinate {})
+        (when-not (= caller (ns-name *ns*))
+          (throw (ex-info "require-deps leaked the GitHub namespace"
+                          {:expected caller :actual (ns-name *ns*)})))
+        (when-not (= 42 @(resolve 'require-deps-github-fixture/value))
+          (throw (ex-info "require-deps did not load the GitHub namespace"
+                          {})))))
+    (finally
+      (.delete (java.io.File. path)))))
 
 ;; ...and a degraded lib still reports whatever pom.xml its jar carries.
 (let [pom (str (System/getProperty "java.io.tmpdir") "/jolt-grenadine-fallback.xml")]

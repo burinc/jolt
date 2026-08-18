@@ -125,7 +125,8 @@ else
 fi
 
 # 7. the env knobs that move where Maven artifacts live select different keys:
-#    a run with JOLT_LOCAL_REPO / JOLT_MVNLIBS / GRENADINE_LOCAL_REPOSITORY set
+#    a run with JOLT_MAVEN_REPOSITORY / JOLT_MVNLIBS /
+#    GRENADINE_MAVEN_REPOSITORY set
 #    must not share the unset run's entry (its cached roots would point into
 #    the other location).
 # (direct invocations, not run(): an env prefix on a shell FUNCTION call
@@ -136,12 +137,12 @@ mkdir -p "$tmp/lib/src/libx"
 printf '(ns libx.core)\n(def x 42)\n' > "$tmp/lib/src/libx/core.clj"
 run -e nil >/dev/null 2>&1
 out14="$(run -e nil)"; yn "7: baseline hit" "$(hit "$out14" && echo yes || echo no)"
-out15="$(runenv JOLT_LOCAL_REPO="$tmp/alt-repo")"
-yn "7: JOLT_LOCAL_REPO change misses" "$(miss "$out15" && echo yes || echo no)"
+out15="$(runenv JOLT_MAVEN_REPOSITORY="$tmp/alt-repo")"
+yn "7: JOLT_MAVEN_REPOSITORY change misses" "$(miss "$out15" && echo yes || echo no)"
 out16="$(runenv JOLT_MVNLIBS="$tmp/alt-mvnlibs")"
 yn "7: JOLT_MVNLIBS change misses" "$(miss "$out16" && echo yes || echo no)"
-out17="$(runenv GRENADINE_LOCAL_REPOSITORY="$tmp/alt-gren")"
-yn "7: GRENADINE_LOCAL_REPOSITORY change misses" "$(miss "$out17" && echo yes || echo no)"
+out17="$(runenv GRENADINE_MAVEN_REPOSITORY="$tmp/alt-gren")"
+yn "7: GRENADINE_MAVEN_REPOSITORY change misses" "$(miss "$out17" && echo yes || echo no)"
 
 # Dev posture: bin/jolt exports JOLT_AOT_CACHE=0, so the cache is OFF — neither
 # hit nor miss line appears, same gate as the AOT namespace cache. Skipped (not

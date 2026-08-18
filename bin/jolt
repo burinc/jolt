@@ -17,29 +17,33 @@ export JOLT_PWD="${JOLT_PWD:-$PWD}"
 
 # Identify the Chez Scheme executable. $JOLT_CHEZ is authoritative and is how the
 # Makefile hands down the one it selected — the same interpreter that mints the
-# seed and compiles target/dev/flat.so. Without it the gate can straddle two Chez
-# installs, because make provisions its own when the one on PATH is the wrong
-# version: source mode then dies on whichever primitive the older one lacks
-# ("variable flvector? is not bound"), and after `make devboot` it dies on
-# "incompatible fasl-object version" instead, since a fasl only loads in the Chez
-# that wrote it.
+# seed and compiles target/dev/flat.so. A direct bin/jolt invocation does not
+# inherit that export, so prefer any 10.x Chez already provisioned by make before
+# searching PATH. Otherwise a checkout built with the local Chez can silently
+# fall back to an older system Chez: source mode then dies on whichever primitive
+# that release predates, and a devboot fasl cannot load in a different Chez.
 if [ -z "${JOLT_CHEZ:-}" ]; then
-  while read -r JOLT_CHEZ
-  do
-      if [ `which ${JOLT_CHEZ}` ]
-      then
-  	break;
-      fi
-  done <<EOF
-chez
-chezscheme
-EOF
+  for candidate in "$root"/.cache/local/chezscheme-*/bin/scheme chez chezscheme; do
+    if [ -x "$candidate" ]; then
+      candidate_path="$candidate"
+    else
+      candidate_path="$(command -v "$candidate" 2>/dev/null || true)"
+    fi
+    [ -n "$candidate_path" ] || continue
 
-  # If we failed to find one, whinge and exit.
-  if [ ! `which ${JOLT_CHEZ}` ]
-  then
-      echo "No valid Chez Scheme executable found: please install Chez Scheme."
-      exit 1
+    case "$("$candidate_path" --version 2>/dev/null || true)" in
+      10.*)
+        if [ "$(printf '(display (threaded?))\n' | "$candidate_path" -q 2>/dev/null)" = "#t" ]; then
+          JOLT_CHEZ="$candidate_path"
+          break
+        fi
+        ;;
+    esac
+  done
+
+  if [ -z "${JOLT_CHEZ:-}" ]; then
+    echo "No threaded Chez Scheme 10.x found; install one or set JOLT_CHEZ." >&2
+    exit 1
   fi
 fi
 CHEZ="$JOLT_CHEZ"
