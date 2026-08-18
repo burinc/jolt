@@ -534,7 +534,22 @@ if printf '%s' "$pr_out" | grep -q 'POLLER-REGISTRATION OK'; then
   pass=$((pass + 1))
 else
   echo "  FAIL: readiness registrations lost under concurrent parking"
-  echo "    $(printf '%s' "$pr_out" | tail -1)"
+  # Print every POLLER line, not just the verdict. The case deliberately prints
+  # POLLER-DEBUG — jolt.io-poller/debug-state captured BEFORE the round's closes
+  # tear the evidence down — to say which stage dropped the wakeup: still :pending
+  # (never drained), waiters parked with no event (kernel set), or ready with no
+  # waiters (resume lost). `tail -1` kept only the verdict and discarded exactly
+  # that, which is why the one occurrence on record (1 of 8 in round 29, during a
+  # make test run, not reproducible in ~105 runs since — isolated, 8-way
+  # concurrent, and under full CPU load) cannot be attributed to a stage.
+  #
+  # A wedge or a throw prints no POLLER-DEBUG at all, so fall back to the tail
+  # rather than reporting nothing.
+  if printf '%s' "$pr_out" | grep -q '^POLLER'; then
+    printf '%s\n' "$pr_out" | grep '^POLLER' | sed 's/^/    /'
+  else
+    printf '%s\n' "$pr_out" | tail -3 | sed 's/^/    /'
+  fi
   fails=$((fails + 1))
 fi
 
