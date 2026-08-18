@@ -254,9 +254,12 @@
         (cons (keyword #f "a") (keyword #f "b"))
         (cons (jolt-symbol #f "a") (jolt-symbol #f "b"))
         (cons "s1" "s2")
-        ;; jolt's own collection types, now answered ahead of the walk.
+        ;; jolt's own collection types, now answered ahead of the walk. All
+        ;; THREE that jolt=2 hoists must be probed — a hoisted type missing from
+        ;; here is one whose arms register happily and are then silently dead.
         (cons (jolt-vector 1) (jolt-vector 2))
-        (cons (jolt-hash-map (keyword #f "a") 1) (jolt-hash-map (keyword #f "a") 2))))
+        (cons (jolt-hash-map (keyword #f "a") 1) (jolt-hash-map (keyword #f "a") 2))
+        (cons (jolt-hash-set 1) (jolt-hash-set 2))))
 (define (eq-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who
                            (lambda (probe) (pred (car probe) (cdr probe)))
@@ -339,10 +342,12 @@
         ;; GROWS as libraries load. Loading jolt-lang/time (whose __register-eq!
         ;; arm predicate is a Clojure fn called through jolt-invoke) made
         ;; (= v20 v20) 44% slower and `hash` of a 2-entry map 8.4x slower, purely
-        ;; from the walk. Both pairs are in eq-fast-probes, so the registry
+        ;; from the walk. All three pairs are in eq-fast-probes, so the registry
         ;; REFUSES an arm claiming them — that guard is what makes answering here
-        ;; safe. Narrow on purpose: only pvec/pmap/pset, never jolt-map? (whose
-        ;; own arms let host types masquerade as maps) and never records.
+        ;; safe, and values-test asserts each of the three separately so a probe
+        ;; set losing one cannot go unnoticed. Narrow on purpose: only
+        ;; pvec/pmap/pset, never jolt-map? (whose own arms let host types
+        ;; masquerade as maps) and never records.
         ((and (pvec? a) (pvec? b)) (jolt-coll=? a b))
         ((and (pmap? a) (pmap? b)) (jolt-coll=? a b))
         ((and (pset? a) (pset? b)) (jolt-coll=? a b))
@@ -368,7 +373,9 @@
 ;; rt.ss loads after this file. Every arm registers later still.
 (define (hash-fast-probes)
   (list jolt-nil (keyword #f "k") (jolt-symbol #f "s") 0 "s"
-        (jolt-vector 1) (jolt-hash-map (keyword #f "k") 1)))
+        ;; as in eq-fast-probes: every type jolt-hash / jolt-hasheq answers
+        ;; ahead of the walk, sets included.
+        (jolt-vector 1) (jolt-hash-map (keyword #f "k") 1) (jolt-hash-set 1)))
 (define (hash-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who pred (hash-fast-probes) "the jolt-hash fast path"))
 (define jolt-hash-arms '())
