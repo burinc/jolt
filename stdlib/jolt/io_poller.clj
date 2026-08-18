@@ -133,6 +133,21 @@
                         (ffi/read buf :uint (+ (* i KEVENT-SIZE) 8)) 16)
                       0x4000))))
 
+;; WHICH filter fired. A kqueue registration is keyed by (ident, filter), so the
+;; EV_DELETE that retires one has to name the same filter the ADD used — it used to
+;; be hardcoded to EVFILT_READ, which silently left every write registration in the
+;; set forever (and, since a socket is almost always writable and kqueue is
+;; level-triggered, made it fire on every round). Read it back off the event: the
+;; u32 at offset 8 is filter in the low half, flags in the high half (see
+;; kevent-put!). epoll reports a mask instead, at offset 0.
+(defn- ev-filt [buf i]
+  (if macos?
+    (if (= (bit-and (ffi/read buf :uint (+ (* i KEVENT-SIZE) 8)) 0xffff)
+           (bit-and EVFILT-WRITE 0xffff))
+      :write :read)
+    (if (pos? (bit-and (ffi/read buf :uint (* i EPOLL-EVENT-SIZE)) EPOLLOUT))
+      :write :read)))
+
 (defn- kevent-put! [buf i fd filt flags]
   (let [o (* i KEVENT-SIZE)]
     (ffi/write buf :uptr o fd)
@@ -150,17 +165,55 @@
       (c-epoll-ctl ep op fd ev)
       (finally (ffi/free ev)))))
 
+;; …with a SET of filters as one mask. An epoll registration is per fd and carries
+;; both directions in one events word, so two waiters on the two directions of a
+;; socket are one registration with EPOLLIN|EPOLLOUT — not two, which is what a
+;; second EPOLL_CTL_ADD would ask for (and be refused with EEXIST).
+(defn- ep-ctl-mask! [ep op fd filts]
+  (let [ev (ffi/alloc EPOLL-EVENT-SIZE)]
+    (try
+      (ffi/write ev :uint 0 (reduce (fn [m f] (bit-or m (if (= f :read) EPOLLIN EPOLLOUT)))
+                                    0 filts))
+      (ffi/write ev :uint 4 fd)
+      (ffi/write ev :uint 8 0)
+      (c-epoll-ctl ep op fd ev)
+      (finally (ffi/free ev)))))
+
 ;; -- the poller table ----------------------------------------------------------
 ;; One monitor serializes everything a fiber and the poller thread share:
-;;   :fds      {fd {:waiters [fiber ...] :ready bool :filt :read|:write}}
-;;   :pending  {fd filt}   ; registered by a fiber, not yet in the poller's set
+;;   :fds      {fd {filt {:waiters [fiber ...] :ready bool}}}   filt = :read|:write
+;;   :pending  {fd #{filt ...}}  ; registered by a fiber, not yet in the poller's set
 ;;   :pipe     [r w]       ; control pipe — registration wake
 ;;   :kq       n           ; the poller's kqueue / epoll fd
+;;
+;; Both are keyed by (fd, FILTER), not by fd, because that is what a registration
+;; actually is: kqueue keys a registration by (ident, filter), and the two
+;; directions of one socket are independent readiness facts. Keying by fd alone
+;; lost registrations and delivered wakeups to the wrong waiter:
+;;
+;;   :pending held ONE filter per fd, and wait-fiber skipped the wake when the fd
+;;   was already present. So a fiber waiting to WRITE an fd that another fiber had
+;;   just queued a READ registration for was never registered with the kernel at
+;;   all: its filter was dropped on the floor, and no event for it could ever
+;;   arrive. Reachable state (fd registered for read only, nothing pending, a
+;;   write-waiter parked) confirmed by model-checking the protocol.
+;;
+;;   :waiters was one flat list per fd, so process-events! resumed EVERY waiter on
+;;   an fd whichever filter fired. A read event woke the write-waiters too; they
+;;   retried, got EAGAIN and re-registered. That is what masked the bug above
+;;   whenever read traffic happened to arrive, and it is why the hang needs a
+;;   full-duplex fd whose peer is silent to show itself.
+;;
+;; :ready is per filter for the same reason — a read tombstone must not satisfy a
+;; write wait.
+;;
 ;; The pending EV_DELETE/EPOLL_CTL_DEL set is NOT here: process-events! hands it
 ;; straight to poller-loop, which carries it in a loop variable to the next
-;; poller-round. It used to be mirrored into this atom as :to-delete, written on
-;; every round and read by nobody, which made the round's critical section look
-;; like it was protecting something it was not.
+;; poller-round. It is a set of [fd filt] pairs, since a kqueue delete has to name
+;; the filter its add used.
+;; (It used to be mirrored into this atom as :to-delete, written on every round and
+;; read by nobody, which made the round's critical section look like it was
+;; protecting something it was not.)
 (def ^:private pm (Object.))
 (def ^:private state (atom {:fds {} :pending {} :pipe nil :kq nil :started? false}))
 
@@ -203,48 +256,77 @@
     ;; read that many entries — heap corruption, not a dropped registration. The
     ;; event buffer below is a different thing: 256 is the count passed to
     ;; kevent/epoll_wait as the most events to report, so it bounds itself.
-    (let [nch (+ (count adds) (count to-delete))
+    ;; adds is {fd #{filt ...}}: one kqueue registration per (fd, filter).
+    (let [add-pairs (for [[fd filts] adds filt filts] [fd filt])
+          nch (+ (count add-pairs) (count to-delete))
           chbuf (when (and macos? (pos? nch)) (ffi/alloc (* nch KEVENT-SIZE)))]
       (try
         (when chbuf
           (let [i (atom 0)]
-            (doseq [fd to-delete] (kevent-put! chbuf @i fd EVFILT-READ EV-DELETE) (swap! i inc))
-            (doseq [[fd filt] adds]
+            ;; Each delete names the FILTER its add used. Hardcoding EVFILT_READ
+            ;; here retired the read registration (or errored with ENOENT when only
+            ;; a write one existed) and left write registrations in the set for good.
+            (doseq [[fd filt] to-delete]
+              (kevent-put! chbuf @i fd (if (= filt :read) EVFILT-READ EVFILT-WRITE) EV-DELETE)
+              (swap! i inc))
+            (doseq [[fd filt] add-pairs]
               (kevent-put! chbuf @i fd (if (= filt :read) EVFILT-READ EVFILT-WRITE) EV-ADD)
               (swap! i inc))))
+        ;; epoll keys a registration by fd alone and carries the wanted directions as
+        ;; ONE mask, so a second filter is a change to the existing registration, not
+        ;; a second registration. DEL-then-ADD with the union mask says that without
+        ;; having to track what the kernel currently holds: the DEL of an
+        ;; unregistered fd fails harmlessly, and epoll is level-triggered, so a
+        ;; readiness that existed across the gap is reported as soon as the ADD lands.
         (when (and (not macos?) (or (seq adds) (seq to-delete)))
-          (doseq [fd to-delete] (c-epoll-ctl kq EPOLL-DEL fd ffi/null))
-          (doseq [[fd filt] adds] (ep-ctl! kq EPOLL-ADD fd filt)))
+          (doseq [fd (distinct (map first to-delete))] (c-epoll-ctl kq EPOLL-DEL fd ffi/null))
+          (doseq [[fd filts] adds]
+            (c-epoll-ctl kq EPOLL-DEL fd ffi/null)
+            (ep-ctl-mask! kq EPOLL-ADD fd filts)))
         (swap! waits inc)
         (let [evbuf (ffi/alloc (if macos? (* 256 KEVENT-SIZE) (* 256 EPOLL-EVENT-SIZE)))]
           (try
             (let [n (if macos? (c-kevent kq (or chbuf ffi/null) nch evbuf 256 ffi/null)
                                 (c-epoll-wait kq evbuf 256 -1))]
               (if (neg? n) []
+                  ;; An EV_ERROR entry is a changelist entry the kernel REFUSED (an
+                  ;; EV_DELETE for an fd that is closed or was never registered with
+                  ;; that filter), not a readiness report. It used to be counted and
+                  ;; then handed on as if it were one, so it marked whatever socket
+                  ;; currently owns that fd number ready and cleared its waiters —
+                  ;; ev-error?'s own comment says this is what must not happen. Count
+                  ;; it and drop it.
                   (loop [i 0 acc []]
                     (if (< i n)
-                      (do (when (ev-error? evbuf i) (swap! ev-errors inc))
-                          (recur (inc i) (conj acc (ev-fd evbuf i))))
+                      (if (ev-error? evbuf i)
+                        (do (swap! ev-errors inc) (recur (inc i) acc))
+                        (recur (inc i) (conj acc [(ev-fd evbuf i) (ev-filt evbuf i)])))
                       acc))))
             (finally (ffi/free evbuf))))
         (finally (when chbuf (ffi/free chbuf)))))))
 
-(defn- process-events! [fds]
-  ;; under pm: mark each fd ready, collect + clear its waiters, schedule its
-  ;; EV_DELETE; the control pipe just gets drained. Returns [woken new-deletes].
+(defn- process-events! [evs]
+  ;; under pm: for each (fd, filter) that fired, mark THAT filter ready, collect +
+  ;; clear THAT filter's waiters, and schedule its delete; the control pipe just
+  ;; gets drained. Returns [woken new-deletes], deletes as [fd filt] pairs.
+  ;;
+  ;; Only the fired filter's waiters are resumed. Resuming an fd's whole waiter list
+  ;; woke the other direction's fibers on every event — they retried, got EAGAIN and
+  ;; re-registered, so it cost a wake and a round each time and, worse, hid the lost
+  ;; write registration this shape exists to prevent.
   (locking pm
-    (loop [fds fds dels #{} woken []]
-      (if (empty? fds)
+    (loop [evs evs dels #{} woken []]
+      (if (empty? evs)
         [woken dels]
-        (let [fd (first fds)]
+        (let [[fd filt] (first evs)]
           (if (= fd (pipe-read!))
-            (do (drain-pipe!) (recur (rest fds) dels woken))
-            (let [e (get-in @state [:fds fd])]
+            (do (drain-pipe!) (recur (rest evs) dels woken))
+            (let [e (get-in @state [:fds fd filt])]
               (if (nil? e)
-                (recur (rest fds) dels woken)
-                (do (swap! state assoc-in [:fds fd :ready] true)
-                    (swap! state assoc-in [:fds fd :waiters] [])
-                    (recur (rest fds) (conj dels fd) (into woken (:waiters e))))))))))))
+                (recur (rest evs) dels woken)
+                (do (swap! state assoc-in [:fds fd filt :ready] true)
+                    (swap! state assoc-in [:fds fd filt :waiters] [])
+                    (recur (rest evs) (conj dels [fd filt]) (into woken (:waiters e))))))))))))
 
 (defn- poller-loop [kq]
   (loop [to-delete #{}]
@@ -270,7 +352,8 @@
                 (let [e (get-in @state [:fds fd])]
                   (swap! state update :pending dissoc fd)
                   (swap! state update :fds dissoc fd)
-                  (:waiters e)))]
+                  ;; every direction's waiters — the fd is going away for both
+                  (into (vec (:waiters (:read e))) (:waiters (:write e)))))]
     (doseq [f woken] (jolt.host/fiber-resume f))))
 
 ;; A point-in-time classification of the poller's table, for a stress gate to
@@ -288,8 +371,13 @@
      :waits @waits
      :ev-errors @ev-errors
      :stale-consumes @stale-consumes
-     :fds (into {} (map (fn [[fd e]]
-                          [fd {:ready (:ready e) :waiters (count (:waiters e))}])
+     ;; per fd, per filter — a loss is now attributable to a DIRECTION as well as
+     ;; a stage, which is the whole point of printing this from a stress gate
+     :fds (into {} (map (fn [[fd per-filt]]
+                          [fd (into {} (map (fn [[filt e]]
+                                              [filt {:ready (:ready e)
+                                                     :waiters (count (:waiters e))}])
+                                            per-filt))])
                         (:fds s)))}))
 
 (defn- ensure-started! []
@@ -321,15 +409,19 @@
 (defn wait-fiber [fd filt]
   (let [park? (locking pm
                 (ensure-started!)
-                (let [e (get-in @state [:fds fd])]
+                (let [e (get-in @state [:fds fd filt])]
                   (if (and e (:ready e))
                     (do (swap! stale-consumes inc)
-                        (swap! state assoc-in [:fds fd :ready] false) false)
-                    (do (swap! state assoc-in [:fds fd]
+                        (swap! state assoc-in [:fds fd filt :ready] false) false)
+                    (do (swap! state assoc-in [:fds fd filt]
                                {:waiters (conj (or (:waiters e) []) (jolt.host/current-fiber))
-                                :ready false :filt filt})
-                        (when-not (contains? (:pending @state) fd)
-                          (swap! state assoc-in [:pending fd] filt)
+                                :ready false})
+                        ;; The guard is per (fd, FILTER). Keyed by fd alone it
+                        ;; skipped the registration whenever the OTHER direction of
+                        ;; the same fd was already queued, and that filter then never
+                        ;; reached the kernel at all.
+                        (when-not (contains? (get (:pending @state) fd #{}) filt)
+                          (swap! state update-in [:pending fd] (fnil conj #{}) filt)
                           (pipe-write!))
                         (jolt.host/fiber-park-commit!)
                         true))))]
