@@ -119,6 +119,43 @@ uniform per-call overhead. Those are here too.
 
 ### Fixed
 
+- **Fiber I/O no longer stops for good when a registration is retired.** Three
+  holes in `jolt.io-poller`, one per platform, none of them covered by a gate.
+  On **macOS**, `poller-round` returns an empty event list for two different
+  reasons — the wait itself failed, or every entry the kernel reported was an
+  `EV_ERROR` that got filtered out — and the loop carried its pending deletes
+  forward on both. But an `EV_ERROR` *is* the kernel having processed the
+  changelist and refused an entry, so re-issuing that delete gets it refused
+  again, forever; and `kevent` returns as soon as a changelist entry errors,
+  reporting only the error and no readiness. One refused delete therefore
+  stopped every readiness report in the process and spun a core doing it, and a
+  fiber closing its own socket the moment its read returns is enough to produce
+  one (the kernel drops a closed fd from the kqueue set, so the delete already
+  scheduled for it comes back `ENOENT`). Measured: four fibers per round, each
+  closing after its read, wedged within three rounds in 10 runs out of 10, with
+  the `ev-errors` counter past 1.5 million. The two cases are now told apart —
+  `nil` for a failed wait, empty for a processed one — and only the first
+  carries its deletes.
+  On **Linux**, `epoll` keys a registration by fd and carries both directions in
+  one mask, and `EPOLL_CTL_DEL` takes no mask and removes the fd outright, so
+  retiring one direction of an fd dropped the other direction's live
+  registration — and it was no longer in `:pending`, so nothing re-added it and
+  that waiter parked forever. The same hole ran the other way: an `ADD` carrying
+  only the newly pending direction dropped the direction already registered.
+  Every round now states the whole fd — `DEL`, then `ADD` with the set of
+  directions that still have a parked waiter — instead of one direction of it.
+  On **ARM Linux**, `struct epoll_event`'s layout was hardcoded to x86_64's: the
+  kernel UAPI marks it `EPOLL_PACKED` only there (12 bytes, the `u64` data at
+  offset 4), while aarch64 aligns the `u64` naturally (16 bytes, data at offset
+  8). So the poller read every event's fd out of the padding, matched nobody,
+  and — epoll being level-triggered — was re-handed the same readiness
+  immediately, spinning at 100% of a core while reporting nothing. All fiber
+  socket I/O hung: the existing registration gate loses 8 of 8 on aarch64 and
+  passes 320 of 320 with the layout picked off `os.arch`.
+  `test/chez/poller-retirement.clj` covers the first two, red-to-green on the
+  platform each belongs to; the third is caught by the existing
+  `poller-registration` case once it can run at all.
+
 - **The dependency resolver does its filesystem work on Windows.** Every
   `mkdir -p`, `mv`, `rm`, `touch`, `test -nt` and `find` in `jolt.deps` went
   through `jolt.host/sh`, which is `cmd.exe` on Windows: `mkdir` there has no
