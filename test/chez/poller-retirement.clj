@@ -40,6 +40,13 @@
 
 (def rounds 12)
 (def per 4)
+;; Round B is deterministic once its shape is built — the registration either
+;; survives the other direction's retirement or it does not — so it runs twice, not
+;; once per A round. It moves 8 MB through a socket to fill the send buffer, which
+;; at jolt's stream throughput is most of a second; running it 12 times put the case
+;; at 25s locally and over the watchdog on a slower CI runner. Round A is the one
+;; that needs repeating: it is racing a close against a delete.
+(def b-rounds 2)
 (def hang-ms 60000)
 
 (def progress (atom {:round 0 :phase :starting}))
@@ -155,16 +162,21 @@
     (loop [r 0 acc 0]
       (swap! progress assoc :round r)
       (if (= r rounds)
-        (do (.close ss) {:status :ok :total acc})
+        ;; A is done; now the both-directions case, twice.
+        (loop [b 0]
+          (swap! progress assoc :round (+ rounds b))
+          (if (= b b-rounds)
+            (do (.close ss) {:status :ok :total acc})
+            (let [{:keys [shape read write fd]} (round-b ss port)]
+              (cond
+                (= shape :no-shape) (do (.close ss) {:status :no-shape :round b :got fd})
+                (not= read "x")     (do (.close ss) {:status :lost-b-read :round b :got read})
+                (not= write :wrote) (do (.close ss) {:status :lost-b-write :round b :got write})
+                :else               (recur (inc b))))))
         (let [n (round-a ss port)]
           (if (< n per)
             (do (.close ss) {:status :lost-a :missing (- per n) :round r})
-            (let [{:keys [shape read write fd]} (round-b ss port)]
-              (cond
-                (= shape :no-shape) (do (.close ss) {:status :no-shape :round r :got fd})
-                (not= read "x")     (do (.close ss) {:status :lost-b-read :round r :got read})
-                (not= write :wrote) (do (.close ss) {:status :lost-b-write :round r :got write})
-                :else               (recur (inc r) (+ acc n))))))))))
+            (recur (inc r) (+ acc n))))))))
 
 (def outcome (atom nil))
 
