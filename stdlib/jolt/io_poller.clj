@@ -235,6 +235,17 @@
       (loop [] (when-not (neg? (c-read r b 64)) (recur)))
       (finally (ffi/free b)))))
 
+;; Put a drained-but-unapplied add set back into :pending, unioning per fd with
+;; whatever landed while the round was in flight. Under pm, like every other write
+;; to the table. No pipe byte is needed: the caller is the poller itself, and the
+;; next thing a round does is drain :pending, so the retry is already scheduled.
+(defn- requeue-adds! [adds]
+  (when (seq adds)
+    (locking pm
+      (swap! state update :pending
+             (fn [p] (reduce (fn [m [fd filts]] (update m fd (fnil into #{}) filts))
+                             (or p {}) adds))))))
+
 ;; One loop iteration of the poller thread. Under pm, drains the pending
 ;; registrations; builds a kevent changelist (or epoll_ctl calls) carrying those
 ;; ADDs and last round's DELETEs, then blocks in the ONE collect-safe wait with
@@ -288,7 +299,26 @@
           (try
             (let [n (if macos? (c-kevent kq (or chbuf ffi/null) nch evbuf 256 ffi/null)
                                 (c-epoll-wait kq evbuf 256 -1))]
-              (if (neg? n) []
+              (if (neg? n)
+                  ;; The wait FAILED, and :pending was drained and cleared under pm
+                  ;; before the call — so without this the registrations that were in
+                  ;; this round's changelist are gone. Nothing else remembers them:
+                  ;; the waiter is parked in :fds, its fd is no longer pending, and
+                  ;; there is no retry. Put them back so the next round applies them.
+                  ;;
+                  ;; Safe whether or not the kernel got them. On kqueue the changelist
+                  ;; rides with the failing call, so it may or may not have been
+                  ;; applied; a repeat EV_ADD for the same (ident, filter) just
+                  ;; updates the existing registration. On epoll the ctls already ran
+                  ;; as their own syscalls before the wait, so the re-add is redundant
+                  ;; and harmless — DEL-then-ADD is what that path does anyway, and
+                  ;; epoll is level-triggered, so a readiness spanning the gap is
+                  ;; reported as soon as the ADD lands.
+                  ;;
+                  ;; This does not introduce a spin: the loop already returned [] and
+                  ;; came straight back round on this path. What changes is that it no
+                  ;; longer forgets what it was told to register on the way.
+                  (do (requeue-adds! adds) [])
                   ;; An EV_ERROR entry is a changelist entry the kernel REFUSED (an
                   ;; EV_DELETE for an fd that is closed or was never registered with
                   ;; that filter), not a readiness report. It used to be counted and
@@ -330,12 +360,22 @@
 
 (defn- poller-loop [kq]
   (loop [to-delete #{}]
-    (let [fds (poller-round kq to-delete)]
-      (if (seq fds)
-        (let [[woken new-del] (process-events! fds)]
+    (let [evs (poller-round kq to-delete)]
+      (if (seq evs)
+        (let [[woken new-del] (process-events! evs)]
           (doseq [f woken] (jolt.host/fiber-resume f))
           (recur new-del))
-        (recur #{})))))
+        ;; Empty means the wait FAILED, or every entry it reported was an EV_ERROR
+        ;; that got filtered out. (A pipe-only wake does not come here — the pipe is
+        ;; a reported event, so process-events! handles it above and correctly drops
+        ;; these deletes, which that round's changelist did apply.) On the failing
+        ;; path the changelist may never have reached the kernel, so carry the
+        ;; deletes rather than dropping them. Dropping left retired registrations
+        ;; in the kernel set: level-triggered, they fire on every subsequent round,
+        ;; and each phantom marks its fd ready and clears whatever waiters the fd has
+        ;; by then. Re-issuing a delete that DID land is harmless — it reports
+        ;; ENOENT, which is counted and dropped as an EV_ERROR entry.
+        (recur to-delete)))))
 
 ;; The fd's story ends with its socket. Drop the table entry and any pending
 ;; registration, and wake anything still parked on it: the kernel auto-removes
