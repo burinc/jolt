@@ -491,14 +491,67 @@
 ;; across sites could let meta leak between them.
 ;;
 ;; Outside a def (no pool) the raw expression is returned unchanged.
+;; The pool value is [name insertion-index]. The index is what orders the emitted
+;; bindings, and it has to be insertion order rather than binding NAME, because a
+;; hoisted constant may now REFERENCE another one: a map literal is hoisted as
+;; (jolt-hash-map _kc$1 1 …) over its already-hoisted keyword constants. A child is
+;; always interned before its parent (the inner emit returns first), so insertion
+;; order is a topological order. Sorting by name is not — fresh-label counts, so
+;; "_kc$10" sorts before "_kc$2" — and it only worked while keywords, which
+;; reference nothing, were the sole hoisted constant.
 (defn- hoist-const [expr]
   (let [pool *const-pool*]
     (if pool
-      (or (get @pool expr)
+      (or (first (get @pool expr))
           (let [nm (fresh-label "_kc$")]
-            (swap! pool assoc expr nm)
+            (swap! pool assoc expr [nm (count @pool) expr])
             nm))
       expr)))
+
+;; Hoist a constant construction WITHOUT sharing it between sites: each call gets
+;; its own binding, keyed by a token no other call can produce.
+;;
+;; Interning is wrong for a collection, and the reference implementation says so.
+;; Each literal site there is its own constant-pool entry, so evaluating ONE site
+;; twice yields the identical object while two distinct sites yield two objects —
+;; verified: (defn f [] [\a ##NaN]) has (= (f) (f)) true, and
+;; (let [a [\a ##NaN] b [\a ##NaN]] (= a b)) false. That difference is observable
+;; wherever = short-circuits on identity but the contents are not equal to
+;; themselves, which is exactly a collection holding ##NaN. Interning by emitted
+;; text made those two sites one object and turned the second answer true; it is
+;; what clojure.core-test/not-eq's `[\a ##NaN] [\a ##NaN]` row catches.
+;;
+;; Keywords keep using the interning hoist-const above: they are interned already,
+;; so sharing one across sites changes nothing observable.
+(defn- hoist-const-per-site [expr]
+  (let [pool *const-pool*]
+    (if pool
+      (let [nm (fresh-label "_kc$")]
+        (swap! pool assoc [::site nm] [nm (count @pool) expr])
+        nm)
+      expr)))
+
+;; Is this literal a CONSTANT construction — one whose value is fully determined at
+;; emit time, so building it once per def and sharing it is indistinguishable from
+;; building it per evaluation? True for a scalar :const and for a collection literal
+;; all of whose elements are themselves constant, recursively.
+;;
+;; Sharing is sound because these are persistent values. Nothing mutates one in
+;; place: with-meta returns a new collection, and a transient over a hoisted map
+;; does not touch the source (enode-claim converts a persistent hnode into a fresh
+;; editable node rather than writing through it — transients.ss).
+;;
+;; A :const only ever holds a scalar (emit-const rejects anything else), so this
+;; never sweeps up a symbol — which hoist-const deliberately refuses, since symbols
+;; carry metadata and sharing one across sites would let meta leak between them.
+(defn- const-coll-node? [n]
+  (and (map? n)
+       (case (:op n)
+         :const true
+         :vector (every? const-coll-node? (:items n))
+         :set (every? const-coll-node? (:items n))
+         :map (every? const-coll-node? (apply concat (:pairs n)))
+         false)))
 
 (defn- emit-with-cells [emit-thunk]
   (let [cells (atom [])
@@ -506,14 +559,18 @@
         raw (binding [*cache-cells* cells
                       *const-pool* pool]
               (emit-thunk))
-        ;; constants bind eagerly (value first); lazy cache cells start #f. Sorted
-        ;; by binding name so a build's output stays deterministic.
-        consts (map (fn [p] (str "(" (val p) " " (key p) ")"))
-                    (sort-by val @pool))
+        ;; constants bind eagerly (value first); lazy cache cells start #f. Ordered
+        ;; by INSERTION so a constant that references an earlier one (a hoisted
+        ;; collection literal over its hoisted keywords) is bound after it; see
+        ;; hoist-const. Deterministic for a given emit, which is what the seed
+        ;; fixpoint needs.
+        consts (map (fn [p] (str "(" (first (val p)) " " (nth (val p) 2) ")"))
+                    (sort-by (comp second val) @pool))
         lazies (map (fn [c] (str "(" c " #f)")) @cells)
         binds  (concat consts lazies)]
     (if (seq binds)
-      (str "(let (" (str/join " " binds) ") " raw ")")
+      ;; let*, not let: the consts can depend on each other now.
+      (str "(let* (" (str/join " " binds) ") " raw ")")
       raw)))
 
 ;; A cache-cell scope for a top-level EXPRESSION (jolt-g3u). Without it the
@@ -1918,10 +1975,22 @@
      ;; collection literals -> rt constructors (collections.ss). Elements are
      ;; already-analyzed IR nodes; evaluate LEFT-TO-RIGHT (emit-ordered, which
      ;; wraps only when two or more operands could have observable effects).
-     :vector (emit-ordered "jolt-vector" (:items node))
-     :set (emit-ordered "jolt-hash-set" (:items node))
-     :map (emit-ordered "jolt-hash-map"
-                       (mapcat (fn [p] [(nth p 0) (nth p 1)]) (:pairs node)))
+     ;;
+     ;; An ALL-CONSTANT literal is hoisted to a per-def constant instead of being
+     ;; rebuilt at every evaluation — what the reference compiler does by emitting
+     ;; literal collections into the class's constant pool. Rebuilding cost real
+     ;; time: a 12-key literal map measured 0.81 us against the JVM's 0.012, and a
+     ;; 2-element literal set 0.12 against 0.012, because each evaluation re-ran
+     ;; jolt-hash-map / jolt-hash-set over the same elements. A literal with a
+     ;; non-constant element (a local, a call) still constructs per evaluation,
+     ;; since its value is not fixed at emit time.
+     :vector (let [s (emit-ordered "jolt-vector" (:items node))]
+               (if (const-coll-node? node) (hoist-const-per-site s) s))
+     :set (let [s (emit-ordered "jolt-hash-set" (:items node))]
+            (if (const-coll-node? node) (hoist-const-per-site s) s))
+     :map (let [s (emit-ordered "jolt-hash-map"
+                                (mapcat (fn [p] [(nth p 0) (nth p 1)]) (:pairs node)))]
+            (if (const-coll-node? node) (hoist-const-per-site s) s))
     :quote (emit-quoted (:form node))
     ;; the thrown value is an operand (emitted non-tail); the throw itself goes
     ;; through emit-call with marks?=#f, so a TAIL throw gets the site-vreg pair
