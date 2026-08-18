@@ -896,6 +896,27 @@
   {:suite "interop / read-line over a host reader" :label ".readLine is a method of the line-numbering reader" :expected "[\"a\" \"b\" nil]" :actual "(let [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"a\\nb\\n\"))] [(.readLine r) (.readLine r) (.readLine r)])" :portability :jvm}
   {:suite "interop / read-line over a host reader" :label "a read leaves the rest of its line for read-line" :expected "[(quote (+ 1 2)) \" rest of line\"]" :actual "(let [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. \"(+ 1 2) rest of line\\nnext\\n\"))] [(read r) (binding [*in* r] (read-line))])" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "char-array of string" :expected "true" :actual "(instance? (Class/forName \"[C\") (char-array \"ab\"))" :portability :jvm}
+  ;; --- into-array / make-array honor an explicit element type -------------------
+  ;; The type argument used to be discarded, so every one of these built an Object[]
+  ;; and reported [Ljava.lang.Object;. A REFERENCE element type is still one
+  ;; Object[] (jolt models all reference arrays as a single kind — see the rows
+  ;; below), which is why only the primitive types are asserted here.
+  {:suite "interop / typed array constructors" :label "into-array int" :expected "\"[I\"" :actual "(.getName (class (into-array Integer/TYPE [1 2])))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "into-array long" :expected "\"[J\"" :actual "(.getName (class (into-array Long/TYPE [1 2])))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "into-array short" :expected "\"[S\"" :actual "(.getName (class (into-array Short/TYPE [1])))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "into-array double" :expected "\"[D\"" :actual "(.getName (class (into-array Double/TYPE [1.0])))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "into-array float" :expected "\"[F\"" :actual "(.getName (class (into-array Float/TYPE [1.0])))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "into-array boolean" :expected "\"[Z\"" :actual "(.getName (class (into-array Boolean/TYPE [true])))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "into-array byte" :expected "\"[B\"" :actual "(.getName (class (into-array Byte/TYPE [1])))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "into-array char" :expected "\"[C\"" :actual "(.getName (class (into-array Character/TYPE [\\a])))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "make-array int" :expected "\"[I\"" :actual "(.getName (class (make-array Integer/TYPE 2)))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "make-array double" :expected "\"[D\"" :actual "(.getName (class (make-array Double/TYPE 2)))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "make-array int zeroes are exact" :expected "[0 0]" :actual "(vec (make-array Integer/TYPE 2))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "make-array double zeroes are floats" :expected "[0.0 0.0]" :actual "(vec (make-array Double/TYPE 2))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "into-array keeps the elements" :expected "[1 2]" :actual "(vec (into-array Integer/TYPE [1 2]))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "make-array length" :expected "3" :actual "(alength (make-array Long/TYPE 3))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "an int[] is instance? of [I" :expected "true" :actual "(instance? (Class/forName \"[I\") (into-array Integer/TYPE [1 2]))" :portability :jvm}
+  {:suite "interop / typed array constructors" :label "an int[] seqs as ArraySeq_int" :expected "\"clojure.lang.ArraySeq$ArraySeq_int\"" :actual "(.getName (class (seq (into-array Integer/TYPE [1 2]))))" :portability :jvm}
   {:suite "interop / StringReader & StringBuilder" :label "reader over char[]" :expected "97" :actual "(do (require (quote clojure.java.io)) (.read (clojure.java.io/reader (char-array \"abc\"))))" :portability :jvm}
   ;; nil is not a source. io/reader used to render it and hand back a reader over
   ;; the empty string, so a missing io/resource read as an empty file instead of

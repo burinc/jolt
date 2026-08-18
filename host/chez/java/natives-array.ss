@@ -27,6 +27,30 @@
     ((byte) sk-array-byte) ((char) sk-array-char)
     (else sk-array-seq)))
 
+;; The element type an array constructor was HANDED, as a backing kind. A primitive
+;; class token evaluates to its own name here — Integer/TYPE is "int", Double/TYPE is
+;; "double" — so on those eight names the mapping is the identity, and the type
+;; argument that into-array / make-array used to discard now picks the backing. A
+;; boxed or reference type (Integer, String, a record class) is one 'object array:
+;; jolt models every reference array as a single kind, which is the rule arraycopy
+;; states (host-static-methods.ss) and why their class is [Ljava.lang.Object;.
+(define na-prim-type-kinds
+  '(("int" . int) ("long" . long) ("short" . short) ("double" . double)
+    ("float" . float) ("boolean" . boolean) ("byte" . byte) ("char" . char)))
+(define (na-type-kind t)
+  (let* ((n (cond ((string? t) t) ((jclass? t) (jclass-name t)) (else #f)))
+         (hit (and n (assoc n na-prim-type-kinds))))
+    (if hit (cdr hit) 'object)))
+;; The JVM's zero for an element kind: an int/long/short/byte array reads 0 (not
+;; 0.0), a double/float 0.0, a boolean false, a char NUL, a reference array nil.
+(define (na-zero-of kind)
+  (case kind
+    ((int long short byte) 0)
+    ((double float) 0.0)
+    ((boolean) #f)
+    ((char) #\nul)
+    (else jolt-nil)))
+
 (define (na-idx i) (if (and (number? i) (not (exact? i))) (exact (floor i)) (jolt-need-num i)))
 
 ;; A double/float jolt-array is backed by a Chez FLVECTOR (unboxed flonums); every
@@ -76,7 +100,13 @@
           (if (null? l) fv (begin (flvector-set! fv i (exact->inexact (car l))) (loop (+ i 1) (cdr l))))))
       (list->vector lst)))
 
-(define (na-from-seq x kind) (make-jolt-array (na-list->backing (seq->list (jolt-seq x)) kind) kind))
+;; A byte array's elements are signed-byte-folded, the same coercion aset applies
+;; through na-elem-of — so (into-array Byte/TYPE …) stores bytes rather than whatever
+;; magnitude it was handed. Only that kind needs the pass, so the common path keeps
+;; building the backing straight off the seq.
+(define (na-from-seq x kind)
+  (let ((xs (seq->list (jolt-seq x))))
+    (make-jolt-array (na-list->backing (if (eq? kind 'byte) (map na-byte-of xs) xs) kind) kind)))
 ;; (T-array size) | (T-array size init) | (T-array seq)
 (define (na-num-array a rest init kind)
   (if (number? a)
@@ -141,8 +171,20 @@
     (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (bitwise-and (exact (vector-ref v i)) #xff)))
     bv))
 (define (na-make-array a . rest)    ; (make-array len) | (make-array type len ...)
-  (make-jolt-array (make-vector (exact (na-idx (if (number? a) a (car rest)))) jolt-nil) 'object))
-(define (na-into-array a . rest)    (na-from-seq (if (pair? rest) (car rest) a) 'object))
+  (let* ((typed? (not (number? a)))
+         (kind (if typed? (na-type-kind a) 'object))
+         (len (exact (na-idx (if typed? (car rest) a)))))
+    (make-jolt-array (na-make-backing len kind (na-zero-of kind)) kind)))
+;; (into-array coll) | (into-array type coll). The typed form honors its element
+;; type, so (into-array Integer/TYPE …) is an int[] — it used to build an Object[]
+;; and report [Ljava.lang.Object; where the JVM says [I.
+;; NOTE the untyped form stays an Object[] while the JVM infers the element class
+;; from the first element ((into-array [1 2]) is a Long[] there); that follows from
+;; jolt modelling reference arrays as one kind, same as the typed reference case.
+(define (na-into-array a . rest)
+  (if (pair? rest)
+      (na-from-seq (car rest) (na-type-kind a))
+      (na-from-seq a 'object)))
 (define (na-to-array coll)          (na-from-seq coll 'object))
 (define (na-aclone arr)
   (if (jolt-array? arr)
