@@ -2,7 +2,7 @@
 
 The four Grenadine namespaces that upstream does **not** commit.
 
-From v0.1.6 Grenadine generates `basis`, `coordinate`, `expander` and `gitlibs`
+From v0.1.7 Grenadine generates `basis`, `coordinate`, `expander` and `gitlibs`
 from pinned upstream sources (`clojure/tools.deps`, `clojure/tools.gitlibs`)
 rather than keeping them in git — its own `.gitignore` lists all four. So the
 `vendor/grenadine` submodule is an incomplete source tree on its own: even
@@ -21,7 +21,7 @@ The `grenadine-<version>-src.tar.gz` asset of the matching Grenadine release,
 which ships the generated sources alongside the committed ones. Verified
 against the release's `grenadine-checksums.txt`:
 
-    8e37ee424207951d201316727838bea9dbc7afd10307378ec30035fb35eced93  grenadine-0.1.6-src.tar.gz
+    302e26b50f765abb9fee4a76148ed81ed8de74a6938acad3eeaa4d6c0106dd3b  grenadine-0.1.7-src.tar.gz
 
 The tarball's copies of the files Grenadine *does* commit are byte-identical to
 the git tag, checked file by file — which is what makes taking half the tree
