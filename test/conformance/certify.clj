@@ -22,6 +22,7 @@
 ;;
 ;; Run from the repo root:
 ;;   clojure -M test/conformance/certify.clj [corpus.edn] [--edn out.edn]
+;;   clojure -M test/conformance/certify.clj --profile test/conformance/profile.edn
 ;;   clojure -M test/conformance/certify.clj --self-test   ; check the classifier
 (ns certify
   (:require [clojure.edn :as edn]
@@ -29,9 +30,25 @@
             [clojure.set]
             [clojure.pprint :as pp]))
 
+;; Flags that take a following VALUE. The corpus path is positional, and finding it
+;; by "first arg that doesn't start with --" swallowed those values: `--profile p`
+;; with no explicit corpus made p the corpus, so certify read the profile file as if
+;; it were the corpus, certified its handful of rows and wrote a profile with almost
+;; nothing left in it. Skipping a valued flag together with its argument is what
+;; makes the documented `[corpus.edn] [--edn out.edn]` usage work in either order.
+(def valued-flags #{"--edn" "--profile"})
+
+(defn positional-args
+  "ARGS with every flag — and the argument of a value-taking flag — removed."
+  [args]
+  (loop [[a & more] (seq args) out []]
+    (cond (nil? a)                  out
+          (valued-flags a)          (recur (next more) out)
+          (str/starts-with? a "--") (recur more out)
+          :else                     (recur more (conj out a)))))
+
 (def corpus-path
-  (or (first (remove #(str/starts-with? % "--") *command-line-args*))
-      "test/chez/corpus.edn"))
+  (or (first (positional-args *command-line-args*)) "test/chez/corpus.edn"))
 
 (def edn-out
   (let [args (vec *command-line-args*)
@@ -299,14 +316,37 @@
    {:bucket :read-error       :expected "1"       :actual "(1 ]"}
    {:bucket :timeout          :expected "nil"     :actual "(Thread/sleep 60000)"}])
 
+;; A valued flag's argument is not the corpus path. Checked here because getting it
+;; wrong is silent: certify runs happily against the wrong file and reports a clean
+;; but meaningless result.
+(def arg-test-cases
+  [[[] nil]
+   [["c.edn"] "c.edn"]
+   [["--self-test"] nil]
+   [["--edn" "out.edn"] nil]
+   [["--profile" "p.edn"] nil]
+   [["c.edn" "--profile" "p.edn"] "c.edn"]
+   [["--profile" "p.edn" "c.edn"] "c.edn"]
+   [["--edn" "o.edn" "--profile" "p.edn"] nil]])
+
+(defn arg-self-test []
+  (for [[args want] arg-test-cases
+        :let [got (first (positional-args args))]
+        :when (not= got want)]
+    (format "  self-test FAIL: args %s — expected corpus %s, got %s"
+            (pr-str args) (pr-str want) (pr-str got))))
+
 (defn self-test []
   (let [got (mapv (fn [row] (assoc row :got (:bucket (classify row)))) self-test-rows)
-        bad (remove #(= (:bucket %) (:got %)) got)]
+        bad (remove #(= (:bucket %) (:got %)) got)
+        arg-bad (arg-self-test)]
     (doseq [{:keys [bucket got actual]} bad]
       (println (format "  self-test FAIL: %s — expected bucket %s, got %s" actual bucket got)))
-    (println (format "certify self-test: %d/%d bucket fixtures pass"
-                     (- (count got) (count bad)) (count got)))
-    (System/exit (if (seq bad) 1 0))))
+    (doseq [m arg-bad] (println m))
+    (println (format "certify self-test: %d/%d bucket fixtures pass, %d/%d arg-parse cases pass"
+                     (- (count got) (count bad)) (count got)
+                     (- (count arg-test-cases) (count arg-bad)) (count arg-test-cases)))
+    (System/exit (if (or (seq bad) (seq arg-bad)) 1 0))))
 
 (defn -main [& _]
   (when (some #{"--self-test"} *command-line-args*) (self-test))
