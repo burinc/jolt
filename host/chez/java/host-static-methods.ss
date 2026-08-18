@@ -277,8 +277,16 @@
   (let ((t (current-time 'time-utc)))
     (+ (* 1000 (time-second t)) (quotient (time-nanosecond t) 1000000))))
 
-;; clojure.core/current-time-ms — epoch milliseconds; backs the `time` macro.
+;; clojure.core/current-time-ms — epoch milliseconds.
 (def-var! "clojure.core" "current-time-ms" (lambda () (->num (now-millis))))
+;; clojure.core/current-time-ns — the MONOTONIC nanosecond clock, and what the
+;; `time` macro measures with. The JVM's time is (System/nanoTime)-based, and the
+;; two properties that buys matter: an interval shorter than a millisecond is
+;; visible rather than 0, and no clock adjustment can make an elapsed time come out
+;; negative. current-time-ms is the wall clock and has neither. Kept as a core fn
+;; rather than having the macro reach for System/nanoTime so the core overlay does
+;; not depend on the java class-statics layer.
+(def-var! "clojure.core" "current-time-ns" (lambda () (->num (jolt-mono-nanos))))
 (register-class-statics! "System"
   (list (cons "currentTimeMillis" (lambda () (->num (now-millis))))
         ;; System/nanoTime is the JVM's MONOTONIC high-resolution timer, not the
