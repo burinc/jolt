@@ -137,12 +137,22 @@
 
 ;; defonce: define name only if it isn't already bound to a non-nil root;
 ;; returns the existing var untouched otherwise.
-;; time: evaluate expr, print the elapsed wall-clock, return the value.
-;; current-time-ms is the host's monotonic clock.
+;; time: evaluate expr, print how long it took, return the value. Matches the
+;; reference macro on both counts it is observed by.
+;;
+;; The clock is the MONOTONIC nanosecond one, divided to fractional milliseconds,
+;; as (System/nanoTime) is there. It used to be current-time-ms — the epoch wall
+;; clock — which reported whole milliseconds, so anything faster than 1 ms timed as
+;; "0 msecs", and could run backwards across a clock adjustment and print a negative
+;; elapsed. (The comment here claimed current-time-ms was monotonic; it is not.)
+;;
+;; And it prints with prn, not println, so the line is the QUOTED string the
+;; reference emits — "Elapsed time: 0.004583 msecs" — which is what a caller
+;; comparing jolt's output against Clojure's sees.
 (defmacro time [expr]
-  `(let [start# (current-time-ms)
+  `(let [start# (current-time-ns)
          ret# ~expr]
-     (println (str "Elapsed time: " (- (current-time-ms) start#) " msecs"))
+     (prn (str "Elapsed time: " (/ (double (- (current-time-ns) start#)) 1000000.0) " msecs"))
      ret#))
 
 ;; with-redefs: temporary root rebinding, restored on exit (incl. throw).

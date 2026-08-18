@@ -1275,6 +1275,14 @@
   {:suite "list / immutability & performance" :label "reduce conj builds" :expected "[2 1 0]" :actual "(reduce conj (list) (range 3))" :portability :common}
   {:suite "list / immutability & performance" :label "O(1) conj at scale" :expected "200000" :actual "(count (reduce conj (list) (range 200000)))" :portability :common}
   {:suite "list / immutability & performance" :label "scale head correct" :expected "199999" :actual "(first (reduce conj (list) (range 200000)))" :portability :common}
+  ;; --- time prints the reference macro's line ------------------------------------
+  ;; The elapsed number is not assertable, but its SHAPE is: the reference prints
+  ;; through prn, so the line is a QUOTED string, and it reports fractional
+  ;; milliseconds off the monotonic clock. jolt printed an unquoted line of whole
+  ;; milliseconds off the wall clock, so anything under 1 ms read "0 msecs".
+  {:suite "macros / time" :label "prints a quoted Elapsed time line ending in msecs" :expected "[true true]" :actual "(do (require (quote [clojure.string :as str])) (let [s (with-out-str (time 42))] [(str/starts-with? s \"\\\"Elapsed time: \") (str/ends-with? (str/trim s) \" msecs\\\"\")]))" :portability :common}
+  {:suite "macros / time" :label "returns the expression's value" :expected "42" :actual "(time 42)" :portability :common}
+  {:suite "macros / time" :label "the elapsed figure reads as a number" :expected "true" :actual "(do (require (quote [clojure.string :as str])) (let [s (with-out-str (time 42))] (number? (read-string (second (str/split (str/replace (str/trim s) \"\\\"\" \"\") #\": \"))))))" :portability :common}
   {:suite "macros / quoting" :label "quote symbol" :expected "(quote a)" :actual "(quote a)" :portability :common}
   {:suite "macros / quoting" :label "quote list" :expected "[1 2 3]" :actual "(quote (1 2 3))" :portability :common}
   {:suite "macros / quoting" :label "quote nested" :expected "[1 [2 3]]" :actual "(quote (1 (2 3)))" :portability :common}
