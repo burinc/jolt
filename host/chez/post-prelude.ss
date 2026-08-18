@@ -305,6 +305,36 @@
     ("associative?" . "clojure.lang.Associative")
     ("sequential?" . "clojure.lang.Sequential")))
 
+;; counted?: Clojure's is (instance? clojure.lang.Counted x), and jolt now models
+;; that interface, so the ONE statement of which things count in O(1) is the class
+;; graph (java/class-hierarchy.ss) — read here through cseq-counted?, which derives
+;; from it per seq flavor. The overlay's hand-rolled (or (vector? x) (map? x) (set?
+;; x) (list? x)) had drifted from the graph in both directions: it answered false
+;; for a vector's own seq, which jolt-count answers without walking (pvec-count
+;; less the cell's index), and false for a queue, which the JVM counts too.
+;;
+;; A native closure for the same reason sequential? below is one: the overlay
+;; spelling routes every call through four more overlay fn invocations, and
+;; counted? sits on core's own count/into fast paths.
+(let ((prev (var-deref "clojure.core" "counted?")))
+  (def-var! "clojure.core" "counted?"
+    (lambda (x)
+      (cond ((pvec? x) #t)              ; vectors, subvec views, map entries
+            ((pmap? x) #t)
+            ((pset? x) #t)
+            ((cseq? x) (cseq-counted? x))
+            ((empty-list-t? x) #t)
+            ((jolt-queue? x) #t)
+            ;; a String is NOT Counted on the JVM (count goes through
+            ;; CharSequence.length, not an O(1) collection count), and a lazy seq
+            ;; cannot be — its length is unknown until it is realized.
+            ((or (string? x) (jolt-lazyseq? x) (jolt-nil? x) (number? x)
+                 (keyword-t? x) (symbol-t? x) (boolean? x) (char? x) (procedure? x))
+             #f)
+            ;; sorted colls, records and deftypes declaring Counted stay with the
+            ;; overlay, which answers them through map?/set?/instance?.
+            (else (jolt-invoke1 prev x))))))
+
 ;; ident?: the overlay's (or (keyword? x) (symbol? x)) pays two overlay var
 ;; calls (~130ns) for two native predicates; dispatch-heavy code (honeysql's
 ;; format-selectable-dsl) calls it per branch. One native closure.

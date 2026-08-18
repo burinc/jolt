@@ -197,10 +197,12 @@
   (case-lambda
     ((coll) (jolt-sort* (cmp->less jolt-compare) coll))
     ((cmp coll) (jolt-sort* (cmp->less cmp) coll))))
+;; clojure.lang.ArraySeq: RT.sort copies into an Object[], sorts it in place and
+;; hands back that array's seq, so (class (sort …)) is an ArraySeq on the JVM.
 (define (jolt-sort* less? coll)
   (let ((s (jolt-seq coll)))
     (if (jolt-nil? s) jolt-empty-list
-        (list->cseq (list-sort less? (seq->list s))))))
+        (list->cseq/k (list-sort less? (seq->list s)) sk-array-seq))))
 
 ;; identical?: reference identity (Clojure ==). eq? gives pointer identity over
 ;; the value model — interned keywords/fixnums/nil compare equal, distinct
@@ -258,14 +260,17 @@
 (define (vec->rseq v i)
   (if (fx<? i 0)
       jolt-nil
-      (cseq-lazy (pvec-nth-d v i jolt-nil) (lambda () (vec->rseq v (fx- i 1))))))
+      (cseq-lazy/k (pvec-nth-d v i jolt-nil) (lambda () (vec->rseq v (fx- i 1))) sk-rseq)))
 (define (jolt-rseq coll)
   (cond
     ((pvec? coll)
      (let ((n (pvec-count coll)))
        (if (fx=? n 0) jolt-nil (vec->rseq coll (fx- n 1)))))
+    ;; a sorted coll's descending seq is still a PersistentTreeMap$Seq on the JVM
+    ;; (the same class with ascending=false), not an RSeq — that one is the vector's.
     ((htable-sorted? coll)
-     (list->cseq (reverse (seq->list (jolt-seq coll)))))
+     (list->cseq/k (reverse (seq->list (jolt-seq coll)))
+                   (if (htable-sorted-set? coll) sk-key-seq sk-treemap-seq)))
     ;; a deftype/record implementing clojure.lang.Reversible (rseq) — e.g.
     ;; data.priority-map — drives rseq through its own method.
     ((and (jrec? coll) (find-method-any-protocol (jrec-tag coll) "rseq"))

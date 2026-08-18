@@ -775,8 +775,13 @@
   {:suite "walk" :expr "(list? (map inc [1 2]))" :expected "false"}
   {:suite "walk" :expr "(list? (filter odd? [1 2 3]))" :expected "false"}
   {:suite "walk" :expr "(list? (seq [1 2]))" :expected "false"}
-  {:suite "walk" :expr "(list? (rest (list 1 2)))" :expected "false"}
-  {:suite "walk" :expr "(list? (next (list 1 2)))" :expected "false"}
+  ;; the tail of a list IS a list — PersistentList._rest is a PersistentList, so
+  ;; the JVM answers true for all three of these (and counts them in O(1))
+  {:suite "walk" :expr "(list? (rest (list 1 2)))" :expected "true"}
+  {:suite "walk" :expr "(list? (next (list 1 2)))" :expected "true"}
+  {:suite "walk" :expr "(list? (rest (list 1)))" :expected "true"}
+  {:suite "walk" :expr "(counted? (rest (list 1 2)))" :expected "true"}
+  {:suite "walk" :expr "(str (class (rest (list 1 2))))" :expected "\"class clojure.lang.PersistentList\""}
   {:suite "walk" :expr "(list? (take 2 (list 1 2 3)))" :expected "false"}
   {:suite "walk" :expr "(list? (concat '(1) '(2)))" :expected "false"}
   {:suite "walk" :expr "(list? (rest [1 2]))" :expected "false"}

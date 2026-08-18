@@ -18,12 +18,9 @@
 ;; head : the realized first element. tail : EITHER a realized seq (cseq |
 ;; jolt-nil) when forced? is #t, OR a 0-arg thunk producing one when forced? is
 ;; #f. Forcing memoizes (set the tail to the produced seq, flip forced?).
-;; list? : #t when this cell is a PersistentList node (list literal / (list ...)
-;; / cons / reverse / conj-onto-list) vs a lazy or vector-backed seq cell — the
-;; only thing that distinguishes a list from any other realized seq on this host,
-;; since one record type backs both (clojure.core/list?). The marker
-;; lives on the cell, so (rest a-list) / (seq a-vector) / (map …) yield plain seq
-;; cells and are not list?.
+;; kind : WHICH flavor of seq this cell is (one of the sk-* constants below) —
+;; the only thing that distinguishes a list from a vector's seq from a map's seq
+;; on this host, since one record type backs them all. See the sk-* block.
 ;; cvec/ci: for a vector-backed seq cell, the backing vector and this cell's
 ;; element index — so it is a real chunked-seq (chunked-seq? true, chunk-first
 ;; hands out a 32-element block, chunk-rest is the seq at the next block) and
@@ -37,13 +34,100 @@
 ;; so their result is itself a chunked-seq (chained chunked transforms each batch
 ;; by 32, like the JVM). crest is #f for a plain vector-backed seq (whose "rest"
 ;; is the next 32-block of the SAME cvec) and for every non-chunked cell.
-(define-record-type cseq (fields head (mutable tail) (mutable forced?) list? cvec ci crest (mutable lock)) (nongenerative chez-cseq-v5))
-(define (cseq-realized head tail) (make-cseq head tail #t #f #f 0 #f #f))   ; tail already a seq
-(define (cseq-lazy head tail-thunk) (make-cseq head tail-thunk #f #f #f 0 #f #f))
-(define (cseq-list head tail) (make-cseq head tail #t #t #f 0 #f #f))       ; a PersistentList node
+;; ---- the seq FLAVOR tag (sk = seq kind) ---------------------------------------
+;; jolt backs Clojure's list, cons, lazy seq, chunked seq AND every collection's
+;; seq view with this ONE record, so nothing on the cell said which of them it
+;; was, and the class arms had no choice but to answer PersistentList for all of
+;; them: (seq [1 2]) reported clojure.lang.PersistentList where the JVM says
+;; PersistentVector$ChunkedSeq, and so did a map's seq, a set's, an array's, a
+;; string's, a range and an rseq. `kind` is that missing bit.
+;;
+;; It costs nothing. The tag is a FIXNUM in the field the boolean list? marker
+;; used to occupy, so a cell is exactly the size it was — no extra field, no
+;; extra allocation on the hottest record in the runtime — and list? became one
+;; fixnum compare (cseq-list? below) in place of a boolean field read.
+;;
+;; This tier stays JVM-free on purpose: the flavor is jolt's own taxonomy, and
+;; the kind -> clojure.lang.* name mapping lives in java/host-class.ss next to
+;; (class …), where every other JVM name mapping already lives. Adding a flavor
+;; is one constant here, one row in that table, and one line in
+;; java/class-hierarchy.ss — nothing else in the seq tier looks at kind.
+;;
+;; The flavor PROPAGATES along the tail, because that is what the JVM does: each
+;; of its seq classes returns its own type from next(), so (next (seq "abc")) is
+;; a StringSeq and (next (rseq v)) an RSeq. Every builder below therefore passes
+;; its own kind down when it builds the following cell.
+;;
+;; sk-cons is the default, and deliberately so — a generic realized-or-lazy cell
+;; with no more specific flavor is exactly clojure.lang.Cons on the JVM, which is
+;; what (next (take-while odd? [1 3 5])) and (next (partition 1 [1 2 3])) report
+;; there.
+;; The three CHUNKED flavors are kept adjacent (2..4) so sk-chunked? is a range
+;; test rather than three separate compares — it sits on the map/filter batching
+;; path, which asks it once per chunk.
+(define sk-cons          0)   ; generic cell: clojure.lang.Cons
+(define sk-list          1)   ; a PersistentList node (list literal / (list …) / reverse)
+(define sk-chunked-seq   2)   ; a vector's own seq (cvec = whole pvec, crest #f)
+(define sk-chunked-cons  3)   ; a standalone chunk + an after-chunk rest (crest set)
+(define sk-long-range    4)   ; a bounded (range …)
+(define sk-string-seq    5)   ; the characters of a string
+(define sk-rseq          6)   ; a vector's reverse view (rseq)
+(define sk-arraymap-seq  7)   ; an array-mode map's entry seq
+(define sk-hashmap-seq   8)   ; a hash-mode map's entry seq
+(define sk-treemap-seq   9)   ; a sorted map's / sorted set's entry seq
+(define sk-key-seq      10)   ; keys of a map, and a set's own seq (RT.keys)
+(define sk-val-seq      11)   ; vals of a map
+(define sk-iterate      12)   ; (iterate f x) and the unbounded (range)
+;; An array's seq, one flavor per element type — the JVM has a distinct ArraySeq
+;; subclass per primitive (ArraySeq$ArraySeq_int …) and the plain ArraySeq for an
+;; object array. natives-array.ss maps a jolt-array's `kind` onto these.
+(define sk-array-seq    13)   ; Object[]
+(define sk-array-int    14)
+(define sk-array-long   15)
+(define sk-array-short  16)
+(define sk-array-double 17)
+(define sk-array-float  18)
+(define sk-array-bool   19)
+(define sk-array-byte   20)
+(define sk-array-char   21)
+;; How many there are — the java layer sizes its kind-indexed tables from this,
+;; so adding a flavor above needs no second edit to keep them in step.
+(define sk-count        22)
+
+(define-record-type cseq (fields head (mutable tail) (mutable forced?) kind cvec ci crest (mutable lock)) (nongenerative chez-cseq-v6))
+;; tail already a seq. The /k variants take the flavor; the bare ones are the
+;; generic cell, which is the overwhelming majority of call sites.
+(define (cseq-realized head tail) (make-cseq head tail #t sk-cons #f 0 #f #f))
+(define (cseq-realized/k head tail kind) (make-cseq head tail #t kind #f 0 #f #f))
+(define (cseq-lazy head tail-thunk) (make-cseq head tail-thunk #f sk-cons #f 0 #f #f))
+(define (cseq-lazy/k head tail-thunk kind) (make-cseq head tail-thunk #f kind #f 0 #f #f))
+(define (cseq-list head tail) (make-cseq head tail #t sk-list #f 0 #f #f))   ; a PersistentList node
+;; clojure.core/list? — Clojure's (instance? IPersistentList x), which among the
+;; seq flavors only PersistentList is.
+(define (cseq-list? s) (fx=? (cseq-kind s) sk-list))
+;; Which flavors are chunked, i.e. hand out a whole block through chunk-first —
+;; stated ONCE, here, because this tier is what drives chunk-first/chunk-rest.
+;; host-class.ss grafts clojure.lang.IChunkedSeq onto exactly these flavors'
+;; classes, so (chunked-seq? x) and (instance? IChunkedSeq x) are the same question
+;; asked twice and cannot drift apart — which is what Clojure means by
+;; (defn chunked-seq? [s] (instance? IChunkedSeq s)).
+;;
+;; Being chunked is a property of the FLAVOR, not of carrying cvec: a sorted coll's
+;; seq is vector-backed here because the :seq op materializes the tree, but it is a
+;; PersistentTreeMap$Seq and is no more a chunked seq than the JVM's is.
+;; The chunked flavors are the contiguous run sk-chunked-seq..sk-long-range, so
+;; this is two fixnum compares.
+(define (sk-chunked? k)
+  (and (fx>=? k sk-chunked-seq) (fx<=? k sk-long-range)))
 ;; vector-backed: like a ChunkedCons, its tail follows from (v, i+1), so it
 ;; carries no thunk either — see cseq-cvec-more.
-(define (cseq-vec head v i) (make-cseq head #f #f #f v i #f #f))
+;; The flavor is passed in rather than assumed from cvec: cvec/ci is a
+;; REPRESENTATION (vector-backed, ascending from ci) and more than one flavor uses
+;; it — a vector's own seq is a ChunkedSeq, while a sorted map materialized into a
+;; pvec is a PersistentTreeMap$Seq that happens to be vector-backed. Keeping the
+;; two independent is what lets the class answer stay right while the O(1)
+;; count/chunk fast paths keep keying off cvec alone.
+(define (cseq-vec head v i kind) (make-cseq head #f #f kind v i #f #f))
 ;; A ChunkedCons cell over a standalone chunk pvec: head is chunk[i], walking
 ;; (seq-more) advances within the chunk and then continues into `rest`. `rest` is
 ;; the already-coerced after-chunk seq (cseq | jolt-nil | a jolt-lazyseq), held in
@@ -65,8 +149,12 @@
 ;; lazy-seq memoization per ELEMENT where Clojure pays it per CHUNK, which is
 ;; why chunking bought nothing here (a chunkable source cost the same 86 ns/elem
 ;; as an unchunkable one, where the JVM gets 2.9x out of it).
+;; A ChunkedCons by default; `kind` lets a producer that chunks say what it really
+;; is instead (a bounded range chunks, and is a LongRange).
 (define (cseq-chunked chunk i rest)
-  (make-cseq (pvec-nth-d chunk i jolt-nil) #f #f #f chunk i rest #f))
+  (make-cseq (pvec-nth-d chunk i jolt-nil) #f #f sk-chunked-cons chunk i rest #f))
+(define (cseq-chunked/k chunk i rest kind)
+  (make-cseq (pvec-nth-d chunk i jolt-nil) #f #f kind chunk i rest #f))
 ;; The tail of a cvec-bearing cell. Two shapes share the field: a ChunkedCons
 ;; (crest set — cvec is a standalone <=32 chunk, and the after-chunk seq follows)
 ;; and a vector-backed index seq (crest #f — cvec is the whole backing vector).
@@ -74,13 +162,19 @@
 ;; next() runs chunkedMore().seq() and realizes what follows, while more()
 ;; returns _more untouched. Getting that wrong makes (rest s) realize the next
 ;; chunk, which is a laziness regression a value test would never catch.
+;; The vector-backed branch builds its next cell INLINE rather than calling
+;; vec->seq/k. This is the tail of every (seq a-vector) walk — the hottest step in
+;; the file — and the call it replaces was there before the flavor existed, so
+;; folding it away pays for the flavor field this function now has to carry.
 (define (cseq-cvec-more s force?)
   (let ((v (cseq-cvec s)) (i1 (fx+ (cseq-ci s) 1)) (cr (cseq-crest s)))
     (if cr
         (if (fx<? i1 (pvec-count v))
-            (cseq-chunked v i1 cr)
+            (cseq-chunked/k v i1 cr (cseq-kind s))
             (if force? (jolt-seq cr) cr))
-        (vec->seq v i1))))
+        (if (fx>=? i1 (pvec-count v))
+            jolt-nil
+            (make-cseq (pvec-nth-d v i1 jolt-nil) #f #f (cseq-kind s) v i1 #f #f)))))
 (define (seq-first s) (cseq-head s))
 ;; guards lazy creation of a cell's tail mutex on the multi-threaded path (mirrors
 ;; force-lazyseq's lock-init). A cseq cell is shared across threads once its owning
@@ -135,6 +229,11 @@
 ;; ============================================================================
 (define (list->cseq xs)               ; Scheme list -> realized cseq chain (jolt-nil if empty)
   (if (null? xs) jolt-nil (cseq-realized (car xs) (list->cseq (cdr xs)))))
+;; …with every cell of the chain carrying one flavor. A collection's seq view is
+;; the same class all the way down on the JVM ((next (keys m)) is another KeySeq),
+;; so the kind goes on the whole chain and not just its head.
+(define (list->cseq/k xs kind)
+  (if (null? xs) jolt-nil (cseq-realized/k (car xs) (list->cseq/k (cdr xs) kind) kind)))
 
 ;; ---- variadic rest: passing a LAZY tail through a Chez rest parameter --------
 ;; A Chez rest parameter must be a proper list, so `apply` would have to realize
@@ -178,11 +277,17 @@
       (lazy-rest-seq (car xs))
       (list->cseq xs)))
 (define (vec->seq v i)                 ; chunked index seq over a persistent vector
+  (vec->seq/k v i sk-chunked-seq))
+;; …as some other flavor that is nonetheless vector-backed (a sorted coll's seq,
+;; materialized once into a pvec, still walks it with the O(1) count and the
+;; chunk-at-a-time fast paths — it just isn't a ChunkedSeq).
+(define (vec->seq/k v i kind)
   (if (fx>=? i (pvec-count v)) jolt-nil
-      (cseq-vec (pvec-nth-d v i jolt-nil) v i)))
+      (cseq-vec (pvec-nth-d v i jolt-nil) v i kind)))
+;; A string's characters. clojure.lang.StringSeq, and the tail is one too.
 (define (str->seq s i)
   (if (fx>=? i (string-length s)) jolt-nil
-      (cseq-lazy (string-ref s i) (lambda () (str->seq s (fx+ i 1))))))
+      (cseq-lazy/k (string-ref s i) (lambda () (str->seq s (fx+ i 1))) sk-string-seq)))
 ;; ---- seq arms: host types register here instead of set!-wrapping jolt-seq ----
 ;; Arms dispatch newest-registration-first (cons front, walk head-first), matching
 ;; the precedence the set! chains produced. The built-in types stay inline in
@@ -205,8 +310,12 @@
     ((empty-list-t? x) jolt-nil)
     ((cseq? x) x)
     ((pvec? x) (vec->seq x 0))
-    ((pmap? x) (list->cseq (pmap-fold x (lambda (k v a) (cons (make-map-entry k v) a)) '())))
-    ((pset? x) (list->cseq (pset-fold x cons '())))
+    ;; array mode and hash mode are different classes on the JVM, the same split
+    ;; (class …) already reports for the map itself.
+    ((pmap? x) (list->cseq/k (pmap-fold x (lambda (k v a) (cons (make-map-entry k v) a)) '())
+                             (if (pmap-order x) sk-arraymap-seq sk-hashmap-seq)))
+    ;; a set's seq is RT.keys over its backing map, i.e. an APersistentMap$KeySeq
+    ((pset? x) (list->cseq/k (pset-fold x cons '()) sk-key-seq))
     ((string? x) (str->seq x 0))
     (else (let loop ((as jolt-seq-arms))
             (cond ((null? as) (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
@@ -244,6 +353,13 @@
       ((cseq-cvec s) (let ((m (cseq-cvec-more s #f)))
                        (if (jolt-nil? m) jolt-empty-list m)))
       ((cseq-forced? s) (let ((m (cseq-tail s))) (if (jolt-nil? m) jolt-empty-list m)))
+      ;; A string seq's tail is a pure O(1) step to the next index of the same
+      ;; string, so force it instead of wrapping a lazy-seq around it: (rest "abc")
+      ;; is a StringSeq on the JVM, not a LazySeq, and there is no laziness to
+      ;; protect here — no side effect and no unbounded work can hide behind a
+      ;; string-ref. Below the forced? arm so the common path pays nothing.
+      ((fx=? (cseq-kind s) sk-string-seq)
+       (let ((m (seq-more s))) (if (jolt-nil? m) jolt-empty-list m)))
       ;; the lazyseq forces to a seq (cseq | nil); an empty realized lazyseq is
       ;; still a sequence value, printing "()" (see lazy-bridge.ss), so (rest s)
       ;; is never nil even when the tail is empty. jolt-seq coerces seq-more's
@@ -257,26 +373,24 @@
   ;; truthy — returning it raw made (next 1-elem-lazy-seq) non-nil, so butlast and
   ;; other (if (next s) ...) loops over a lazy seq ran one step too far.
   (let ((s (jolt-seq x))) (if (jolt-nil? s) jolt-nil (jolt-seq (seq-more s)))))
-;; Only the HEAD cell carries the list marker — (rest a-list)/(next a-list) return
-;; the unmarked tail, so they are seqs and not list? (rest-of-a-list is a non-list
-;; seq). cons/list/reverse/conj therefore mark
-;; just the cell they create.
-;;
-;; cons always yields a list — (list? (cons x anything)) is true (cons
-;; onto a vector/seq/nil all report list?).
+;; EVERY cell of a list is a list cell, not just its head. PersistentList._rest is
+;; itself a PersistentList on the JVM, so (rest '(1 2)) is a PersistentList and
+;; (list? (rest '(1 2))) is true there; marking only the head made both answers
+;; wrong, and made the tail of a list uncounted when the JVM counts it in O(1).
 (define (jolt-cons x coll) (cseq-list x (jolt-seq coll)))
-;; Scheme list -> a jolt PersistentList: head is a list cell, the tail chain is
-;; plain seq cells. For (list …) and quoted list literals (the emitter lowers
-;; '(a b) to (jolt-list a b)).
+;; Scheme list -> a jolt PersistentList. For (list …) and quoted list literals
+;; (the emitter lowers '(a b) to (jolt-list a b)).
 (define (jolt-list . xs)
-  (if (null? xs) jolt-empty-list (cseq-list (car xs) (list->cseq (cdr xs)))))
-;; reverse yields a list (seed: (list? (reverse coll)) is always true). Build a
-;; plain seq chain, then mark its head as a list cell.
+  (if (null? xs) jolt-empty-list (cseq-list (car xs) (list->cseq/k (cdr xs) sk-list))))
+;; reverse yields a list (seed: (list? (reverse coll)) is always true). The chain
+;; is built list-flavored as it goes, so the head needs no second cell to re-mark
+;; it — one allocation less per reverse than re-wrapping did.
 (define (jolt-reverse coll)
   (let loop ((s (jolt-seq coll)) (acc jolt-empty-list))
     (if (jolt-nil? s)
-        (if (empty-list-t? acc) acc (cseq-list (seq-first acc) (seq-more acc)))
-        (loop (jolt-seq (seq-more s)) (cseq-realized (seq-first s) (if (empty-list-t? acc) jolt-nil acc))))))
+        acc
+        (loop (jolt-seq (seq-more s))
+              (cseq-realized/k (seq-first s) (if (empty-list-t? acc) jolt-nil acc) sk-list)))))
 (define (jolt-last coll) (let loop ((s (jolt-seq coll)) (last jolt-nil))
                            (if (jolt-nil? s) last (loop (jolt-seq (seq-more s)) (seq-first s)))))
 ;; nth over a seq (walks; forces lazily). default? selects the 3-arg behavior.
@@ -843,7 +957,15 @@
   (and (cseq? s) (cseq-cvec s)
        (let ((v (cseq-cvec s)) (i (cseq-ci s)))
          (cons v (if (cseq-crest s) (pvec-count v) (fxmin (fx+ i seq-chunk-size) (pvec-count v)))))))
-(define (na-chunked-seq? x) (and (na-vblock x) #t))
+;; Clojure's chunked-seq? IS (instance? IChunkedSeq s), so this asks the flavor and
+;; not just the representation. Both halves are needed: sk-chunked? says the class
+;; claims the interface, na-vblock that this cell can actually produce a block. A
+;; sorted coll's seq is vector-backed here (the :seq op materializes the tree) yet is
+;; a PersistentTreeMap$Seq, which is no more chunked than the JVM's is — answering
+;; true for it made chunked-seq? disagree with instance? on the same value.
+;; The flavor test is first: it is a fixnum compare, na-vblock allocates a pair.
+(define (na-chunked-seq? x)
+  (and (cseq? x) (sk-chunked? (cseq-kind x)) (na-vblock x) #t))
 ;; Copy the block [i, end) straight out of the pvec trie's 32-element leaf node
 ;; (pv-chunk-for is O(log n)). seq-chunk-size == pv-width and vector-seq blocks are
 ;; 32-aligned, so a block is exactly one leaf; the rare non-aligned window crossing
@@ -870,13 +992,15 @@
     ((and (cseq? s) (cseq-crest s))
      (let ((r (jolt-seq (cseq-crest s)))) (if (jolt-nil? r) jolt-empty-list r)))
     ((na-vblock s) => (lambda (vb)
-       (if (fx>=? (cdr vb) (pvec-count (car vb))) jolt-empty-list (vec->seq (car vb) (cdr vb)))))
+       (if (fx>=? (cdr vb) (pvec-count (car vb))) jolt-empty-list
+           (vec->seq/k (car vb) (cdr vb) (cseq-kind s)))))
     (else (jolt-rest s))))
 (define (na-chunk-next s)
   (cond
     ((and (cseq? s) (cseq-crest s)) (jolt-seq (cseq-crest s)))
     ((na-vblock s) => (lambda (vb)
-       (if (fx>=? (cdr vb) (pvec-count (car vb))) jolt-nil (vec->seq (car vb) (cdr vb)))))
+       (if (fx>=? (cdr vb) (pvec-count (car vb))) jolt-nil
+           (vec->seq/k (car vb) (cdr vb) (cseq-kind s)))))
     (else (jolt-next s))))
 
 ;; na-chunk-map-first / na-chunk-filter-first: transform a chunked seq's current
@@ -1081,7 +1205,9 @@
      (meta-carry to
        (reduce-seq (lambda (acc x) (jolt-conj1 acc x)) to (jolt-seq from))))))
 
-(define (range-from n) (cseq-lazy n (lambda () (range-from (+ n 1)))))
+;; (range) with no bound is clojure.lang.Iterate on the JVM — it IS (iterate inc' 0)
+;; there — so it wears the same flavor jolt-iterate does.
+(define (range-from n) (cseq-lazy/k n (lambda () (range-from (+ n 1))) sk-iterate))
 ;; A bounded range is a real chunked-seq, like clojure.lang.LongRange: eager, with
 ;; chunk-first handing out a block of up to 32 consecutive values. Each block is
 ;; materialized into a pvec and chunk-cons'd onto a lazy continuation, so a chunked
@@ -1094,13 +1220,16 @@
   (cond
     ((= step 0)
      ;; JVM: (range start end 0) repeats start infinitely
-     (cseq-lazy n (lambda () (range-chunked n end step))))
+     (cseq-lazy/k n (lambda () (range-chunked n end step)) sk-long-range))
     ((if (> step 0.0) (< n end) (> n end))
      (let loop ((i 0) (v n) (acc '()))
        (if (and (fx<? i seq-chunk-size) (if (> step 0.0) (< v end) (> v end)))
            (loop (fx+ i 1) (+ v step) (cons v acc))
-           (cseq-chunked (make-pvec (list->vector (reverse acc))) 0
-                         (jolt-make-lazy-seq (lambda () (jolt-seq (range-chunked v end step))))))))
+           ;; chunked in REPRESENTATION but a LongRange by class, which is exactly
+           ;; the JVM's own arrangement (LongRange implements IChunkedSeq).
+           (cseq-chunked/k (make-pvec (list->vector (reverse acc))) 0
+                           (jolt-make-lazy-seq (lambda () (jolt-seq (range-chunked v end step))))
+                           sk-long-range))))
     (else jolt-empty-list)))
 ;; numeric tower: exact 0/1 defaults so (range 3) yields exact ints
 ;; (= JVM longs); flonum args still produce flonums (Scheme arithmetic preserves).
@@ -1168,7 +1297,7 @@
 ;; Not chunked, matching clojure.lang.Iterate: chunking would realize up to 31
 ;; elements ahead and break the laziness contract callers depend on.
 (define (jolt-iterate f x)
-  (cseq-lazy x (lambda () (jolt-iterate f (jolt-invoke1 f x)))))
+  (cseq-lazy/k x (lambda () (jolt-iterate f (jolt-invoke1 f x))) sk-iterate))
 
 ;; lazily append seq a then the seqable produced by the thunk `brest` — the rest
 ;; is NOT forced until a is exhausted, so concat is fully lazy (Clojure semantics).
@@ -1304,25 +1433,27 @@
                     (let ((c (jolt-class-name e)))
                       (if (string? c) c (jolt-pr-str e))))
                   " cannot be cast to class java.util.Map$Entry"))))
-(define (entry-seq-part m idx)
+;; idx picks the half; the flavor says which half, since the JVM has a class for
+;; each (APersistentMap$KeySeq / $ValSeq).
+(define (entry-seq-part m idx kind)
   (let loop ((s (jolt-seq m)) (acc '()))
     (if (jolt-nil? s)
-        (list->cseq (reverse acc))
+        (list->cseq/k (reverse acc) kind)
         (let ((e (seq-first s)))
           (unless (entry-like? e) (entry-cast-error e))
           (loop (jolt-seq (seq-more s)) (cons (jolt-nth e idx jolt-nil) acc))))))
 (define (jolt-keys m)
   (cond ((jolt-nil? m) jolt-nil)
-        ((pmap? m) (list->cseq (pmap-fold m (lambda (k v a) (cons k a)) '())))
+        ((pmap? m) (list->cseq/k (pmap-fold m (lambda (k v a) (cons k a)) '()) sk-key-seq))
         ((jolt-nil? (jolt-seq m)) jolt-nil)
-        ((pmap? (jolt-seq m)) (list->cseq (pmap-fold m (lambda (k v a) (cons k a)) '())))
-        (else (entry-seq-part m 0))))
+        ((pmap? (jolt-seq m)) (list->cseq/k (pmap-fold m (lambda (k v a) (cons k a)) '()) sk-key-seq))
+        (else (entry-seq-part m 0 sk-key-seq))))
 (define (jolt-vals m)
   (cond ((jolt-nil? m) jolt-nil)
-        ((pmap? m) (list->cseq (pmap-fold m (lambda (k v a) (cons v a)) '())))
+        ((pmap? m) (list->cseq/k (pmap-fold m (lambda (k v a) (cons v a)) '()) sk-val-seq))
         ((jolt-nil? (jolt-seq m)) jolt-nil)
-        ((pmap? (jolt-seq m)) (list->cseq (pmap-fold m (lambda (k v a) (cons v a)) '())))
-        (else (entry-seq-part m 1))))
+        ((pmap? (jolt-seq m)) (list->cseq/k (pmap-fold m (lambda (k v a) (cons v a)) '()) sk-val-seq))
+        (else (entry-seq-part m 1 sk-val-seq))))
 
 ;; ============================================================================
 ;; sequential equality + hash (hooks called from values.ss / collections.ss);
