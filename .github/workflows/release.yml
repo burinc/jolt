@@ -497,6 +497,14 @@ jobs:
         with:
           repository: jolt-lang/glimmer-gl
           path: glimmer-gl
+      # glimmer-datastar consumes the datastar middleware the same way, as
+      # {:local/root "../../datastar"} — and the repo behind it is jolt-lang's
+      # glimmer-datastar (renamed from datastar), so the checkout path is the name
+      # the app asks for, not the repo's.
+      - uses: actions/checkout@v5
+        with:
+          repository: jolt-lang/glimmer-datastar
+          path: datastar
       - uses: actions/download-artifact@v4
         with:
           name: jolt-x86_64-linux

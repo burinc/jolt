@@ -45,6 +45,7 @@ basic-example    app.core       test
 commonmark-app   app.core       test
 nrepl-example    app.core       test
 ring-app         app.core       test
+glimmer-datastar app.core       test
 hiccup-app       app.core       -
 malli-app        app.core       -
 markdown-app     app.core       -
