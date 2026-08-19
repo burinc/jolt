@@ -5102,4 +5102,6 @@
   {:suite "quoted-literal constants" :label "two sites of the same quoted set are separate constants but equal" :expected "true" :actual "(do (defn qlc-s1 [] #{:q (quote q)}) (defn qlc-s2 [] #{:q (quote q)}) (= (qlc-s1) (qlc-s2)))" :portability :common}
   {:suite "identical? lowering" :label "call, apply, and value position agree" :expected "[true true false true]" :actual "[(identical? :a :a) (apply identical? [:x :x]) (identical? \"a\" \"b\") ((fn [f] (f :q :q)) identical?)]" :portability :common}
   {:suite "identical? lowering" :label "boolean predicates keep JVM answers" :expected "[false false true false true]" :actual "[(true? :kw) (false? nil) (boolean? false) (boolean? :kw) (true? true)]" :portability :common}
+  {:suite "fn identity hash" :label "fn equality is identity; hash is a stable int" :expected "[true false true true]" :actual "(let [f (fn [x] x) g (fn [x] x)] [(= f f) (= f g) (int? (hash f)) (= (hash f) (hash f))])" :portability :common}
+  {:suite "fn identity hash" :label "fns work as distinct map keys" :expected "[1 2 2 :missing]" :actual "(let [f (fn []) g (fn []) m {f 1 g 2}] [(get m f) (get m g) (count m) (get m (fn []) :missing)])" :portability :common}
 ]

@@ -53,6 +53,24 @@
 (ok "syms from distinct equal strings are jolt="
     (jolt= (jolt-symbol #f (string-append "ivt-" "four"))
            (jolt-symbol #f (string-append "ivt-" "four"))))
+;; procedure identity hasheq: distinct fns hash distinct (per-process ids, the
+;; JVM's Object.hashCode shape), the id is stable for the object — including
+;; ACROSS a collection, which a raw address hash would break — and equality is
+;; identity answered ahead of the arm walk.
+(ok "distinct procedures hash distinct"
+    (not (= (jolt-hasheq car) (jolt-hasheq cdr))))
+(ok "procedure hasheq stable"
+    (= (jolt-hasheq car) (jolt-hasheq car)))
+(ok "procedure hasheq survives a collection"
+    (let ((h (jolt-hasheq vector->list)))
+      (collect)
+      (= h (jolt-hasheq vector->list))))
+(ok "procedure hasheq is 32-bit"
+    (let ((h (jolt-hasheq car)))
+      (and (fixnum? h) (fx<=? -2147483648 h 2147483647))))
+(ok "jolt=2 identical procedures" (jolt=2 car car))
+(ok "jolt=2 distinct procedures" (not (jolt=2 car cdr)))
+
 (ok "intern cell agrees across threads"
     (let* ((s (string-append "ivt-" "five"))
            (mine (intern-symbol-cell s))
