@@ -1138,6 +1138,92 @@
    "uint8" "unsigned-8" "u8" "unsigned-8" "byte" "unsigned-8" "char" "char"})
 (defn- ffi-type->chez [t]
   (or (ffi-types t) (throw (ex-info (str "jolt.ffi: unknown foreign type :" t) {}))))
+
+(defn- emit-ffi-layout-ftype [layout]
+  (str "(struct "
+       (str/join
+        " "
+        (map-indexed
+         (fn [i field]
+           (str "[f" i " "
+                (if (string? (:type field))
+                  (ffi-type->chez (:type field))
+                  (emit-ffi-layout-ftype (:type field)))
+                "]"))
+         (:fields layout)))
+       ")"))
+
+(defn- ffi-layout-entries
+  ([layout] (ffi-layout-entries layout [] []))
+  ([layout public-path emitted-path]
+   (mapcat
+    (fn [i field]
+      (let [pp (conj public-path (:name field))
+            ep (conj emitted-path (str "f" i))
+            entry {:path pp :emitted-path ep :type (:type field)}]
+        (if (string? (:type field))
+          [entry]
+          (cons entry (ffi-layout-entries (:type field) pp ep)))))
+    (range (count (:fields layout)))
+    (:fields layout))))
+
+(defn- emit-layout-path [path]
+  (str "(jolt-vector "
+       (str/join " " (map (fn [n] (str "(keyword #f " (chez-str-lit n) ")")) path))
+       ")"))
+
+(defn- emit-layout-descriptor [layout]
+  (str "(jolt-vector (keyword #f \"struct\") (jolt-vector "
+       (str/join
+        " "
+        (map (fn [field]
+               (str "(jolt-vector (keyword #f " (chez-str-lit (:name field)) ") "
+                    (if (string? (:type field))
+                      (str "(keyword #f " (chez-str-lit (:type field)) ")")
+                      (emit-layout-descriptor (:type field)))
+                    ")"))
+             (:fields layout)))
+       "))"))
+
+(defn- emit-ffi-layout [node]
+  (let [layout (:layout node)
+        type-name (fresh-label "jolt_ffi_layout")
+        align-name (fresh-label "jolt_ffi_layout_align")
+        entries (vec (ffi-layout-entries layout))
+        base (str "(make-ftype-pointer " type-name " 0)")
+        offsets
+        (str "(jolt-hash-map "
+             (str/join
+              " "
+              (map (fn [entry]
+                     (str (emit-layout-path (:path entry)) " "
+                          "(ftype-pointer-address (ftype-&ref " type-name " ("
+                          (str/join " " (:emitted-path entry)) ") " base "))"))
+                   entries))
+             ")")
+        types
+        (str "(jolt-hash-map "
+             (str/join
+              " "
+              (keep (fn [entry]
+                      (when (string? (:type entry))
+                        (str (emit-layout-path (:path entry)) " "
+                             "(keyword #f " (chez-str-lit (:type entry)) ")")))
+                    entries))
+             ")")]
+    (str "(let () "
+         "(define-ftype " type-name " " (emit-ffi-layout-ftype layout) ") "
+         "(define-ftype " align-name " (struct [prefix unsigned-8] [value " type-name "])) "
+         "(jolt-hash-map "
+         "(keyword \"jolt.ffi\" \"layout\") #t "
+         "(keyword #f \"descriptor\") " (emit-layout-descriptor layout) " "
+         "(keyword #f \"size\") (ftype-sizeof " type-name ") "
+         "(keyword #f \"alignment\") "
+         "(ftype-pointer-address (ftype-&ref " align-name " (value) "
+         "(make-ftype-pointer " align-name " 0))) "
+         "(keyword \"jolt.ffi\" \"offsets\") " offsets " "
+         "(keyword \"jolt.ffi\" \"types\") " types "))")))
+
 (defn- emit-ffi-fn [node]
   ;; A "varargs" marker in the argtype vector declares the binding variadic and
   ;; marks the FIXED/VARIADIC boundary: types before it are the named
@@ -2171,6 +2257,7 @@
     :let (emit-let node)
     :loop (emit-loop node)
     :recur (emit-recur node)
+    :ffi-layout (emit-ffi-layout node)
     :ffi-fn (emit-ffi-fn node)
     :ffi-callable (emit-ffi-callable node)
     :fn (emit-fn node)

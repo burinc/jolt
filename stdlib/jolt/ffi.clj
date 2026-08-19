@@ -40,6 +40,54 @@
   is the inverse — it wraps a jolt fn as a C-callable function pointer so C can
   call back into jolt (e.g. GTK signal handlers); free-callable releases it.")
 
+(defmacro layout
+  "Compile a literal [:struct [[field type] ...]] descriptor into immutable ABI
+  layout data. Field names are unique unqualified keywords; fields are fixed-size
+  scalars or nested structs. Chez supplies size, alignment, and offsets."
+  [descriptor]
+  (list 'jolt.ffi/__layout descriptor))
+
+(defn- checked-layout [layout]
+  (when-not (and (map? layout) (= true (:jolt.ffi/layout layout)))
+    (throw (ex-info "jolt.ffi: expected a compiled layout" {:layout layout})))
+  layout)
+
+(defn- checked-field-path [path]
+  (let [p (if (keyword? path) [path] path)]
+    (when-not (and (vector? p) (pos? (count p))
+                   (every? #(and (keyword? %) (nil? (namespace %))) p))
+      (throw (ex-info "jolt.ffi: field path must be an unqualified keyword or non-empty vector of them"
+                      {:path path})))
+    p))
+
+(defn layout-size [layout] (:size (checked-layout layout)))
+(defn layout-alignment [layout] (:alignment (checked-layout layout)))
+
+(defn field-offset [layout path]
+  (let [layout (checked-layout layout)
+        path (checked-field-path path)
+        offsets (:jolt.ffi/offsets layout)]
+    (when-not (contains? offsets path)
+      (throw (ex-info "jolt.ffi: unknown layout field path" {:path path})))
+    (get offsets path)))
+
+(defn- field-type [layout path]
+  (let [types (:jolt.ffi/types layout)]
+    (when-not (contains? types path)
+      (throw (ex-info "jolt.ffi: field path names a struct, not a scalar field"
+                      {:path path})))
+    (get types path)))
+
+(defn read-field [pointer layout path]
+  (let [layout (checked-layout layout)
+        path (checked-field-path path)]
+    (jolt.ffi/read pointer (field-type layout path) (field-offset layout path))))
+
+(defn write-field [pointer layout path value]
+  (let [layout (checked-layout layout)
+        path (checked-field-path path)]
+    (jolt.ffi/write pointer (field-type layout path) (field-offset layout path) value)))
+
 ;; foreign-fn binds C symbol `csym` to a typed callable. Expands to the __cfn
 ;; special form (always fully-qualified, so an :as alias on jolt.ffi resolves):
 ;; the analyzer/back end turn it into a Chez foreign-procedure.
