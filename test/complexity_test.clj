@@ -133,9 +133,13 @@
                      (= (dec n1) (get m1 (dec n1))) (nil? (get m1 -1)))
         (println "FAIL complexity transient-write-few: wrong values before timing")
         (System/exit 1))
+      ;; 2000 reps, not 200: at 200 the small arm measured ~1ms, under the CI
+      ;; noise floor — one GC pause or scheduler blip in the 4n arm read 2.06
+      ;; against the 2.0 ceiling on a shared runner (fixed sits ~1.1, broken
+      ;; ~4.0). Bigger arms amortize the noise; the ceiling stays meaningful.
       (judge "transient write-few"
-             (best-of 3 #(dotimes [_ 200] (touch m1)))
-             (best-of 3 #(dotimes [_ 200] (touch m2)))
+             (best-of 3 #(dotimes [_ 2000] (touch m1)))
+             (best-of 3 #(dotimes [_ 2000] (touch m2)))
              "persistent! is rebuilding the whole map instead of freezing only the nodes the writes claimed (transients.ss jolt-persistent!, collections.ss enode-freeze)"))
 
     (if (pos? @failures)
