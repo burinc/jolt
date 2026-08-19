@@ -1238,6 +1238,19 @@
      (meta-carry to
        (reduce-seq (lambda (acc x) (jolt-conj1 acc x)) to (jolt-seq from))))))
 
+;; zipmap: the reference builds through (transient {}), whose array capacity is 8
+;; entries — so the result is an insertion-ordered array map up to 8 entries and
+;; a hash map past that, whatever the key type. Building ordered and dropping the
+;; order once over that capacity gives the same observable result without a
+;; transient's per-call setup cost. Duplicate keys keep their first position with
+;; the later value (the transient's replace-in-place), which order-replace does.
+(define (jolt-zipmap ks vs)
+  (let loop ((m empty-pmap) (ks (jolt-seq ks)) (vs (jolt-seq vs)))
+    (if (or (jolt-nil? ks) (jolt-nil? vs))
+        (if (fx>? (pmap-cnt m) array-map-limit) (pmap->hash m) m)
+        (loop (pmap-put-ordered m (seq-first ks) (seq-first vs))
+              (jolt-seq (seq-more ks)) (jolt-seq (seq-more vs))))))
+
 ;; (range) with no bound is clojure.lang.Iterate on the JVM — it IS (iterate inc' 0)
 ;; there — so it wears the same flavor jolt-iterate does.
 (define (range-from n) (cseq-lazy/k n (lambda () (range-from (+ n 1))) sk-iterate))

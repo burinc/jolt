@@ -238,6 +238,7 @@
 (def-var! "clojure.core" "reduced" jolt-reduced-new)
 (def-var! "clojure.core" "reduced?" jolt-reduced-pred)
 (def-var! "clojure.core" "mapcat" jolt-mapcat)
+(def-var! "clojure.core" "zipmap" jolt-zipmap)
 (def-var! "clojure.core" "take-while" jolt-take-while)
 (def-var! "clojure.core" "drop-while" jolt-drop-while)
 (def-var! "clojure.core" "partition" jolt-partition)

@@ -43,9 +43,12 @@
 (is "promoted stays hash (contents)"
     "(= {17 17 18 18 19 19} (persistent! (reduce dissoc! (reduce (fn [t i] (assoc! t i i)) (transient {}) (range 20)) (range 17))))"
     "true")
-;; keyword-only maps keep array order through a transient to 64 (Clojure 1.13 rule)
-(is "9 kw keys stay array" "(keys (persistent! (reduce (fn [t k] (assoc! t k k)) (transient {}) (map keyword (map (fn [i] (str \"k\" i)) (range 9))))))" "(:k0 :k1 :k2 :k3 :k4 :k5 :k6 :k7 :k8)")
-(is "9 kw keys array type" "(type (persistent! (reduce (fn [t k] (assoc! t k k)) (transient {}) (map keyword (map (fn [i] (str \"k\" i)) (range 9))))))" "clojure.lang.PersistentArrayMap")
+;; a transient promotes at CAPACITY regardless of key type (TransientArrayMap:
+;; the keyword-to-64 extension is the persistent assoc path only), so 9 keyword
+;; keys through (transient {}) come out a hash map on the JVM and here.
+(is "9 kw keys promote to hash" "(type (persistent! (reduce (fn [t k] (assoc! t k k)) (transient {}) (map keyword (map (fn [i] (str \"k\" i)) (range 9))))))" "clojure.lang.PersistentHashMap")
+(is "8 kw keys stay array" "(keys (persistent! (reduce (fn [t k] (assoc! t k k)) (transient {}) (map keyword (map (fn [i] (str \"k\" i)) (range 8))))))" "(:k0 :k1 :k2 :k3 :k4 :k5 :k6 :k7)")
+(is "transient of a large kw array map keeps its capacity" "(let [m (apply array-map (mapcat (fn [i] [(keyword (str \"k\" i)) i]) (range 12)))] (= (keys m) (keys (persistent! (transient m)))))" "true")
 
 ;; --- the leaf-sharing trap at DEPTH: a source map big enough to be a real HAMT ---
 ;; A claimed node's arr is a shallow copy, so the (cons k v) leaves still belong

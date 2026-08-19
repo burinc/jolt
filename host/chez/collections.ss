@@ -931,6 +931,8 @@
 ;; the map is in array mode, or #f once it has grown into hash mode. Equality and
 ;; hashing fold over the entries order-independently, so this only affects
 ;; iteration order (seq/keys/vals/print), matching the JVM.
+;; all-kw is dead — promotion consults only the ADDED key now — but the field
+;; stays so chez-pmap-v4's layout (image surface) is unchanged.
 (define-record-type pmap (fields root cnt order (mutable hasheq) (mutable all-kw)) (nongenerative chez-pmap-v4))
 (define make-pmap
   (let ((raw (record-constructor (record-type-descriptor pmap))))
@@ -938,27 +940,19 @@
       (let ((m (raw root cnt order 0 #f)))
         m))))
 (define empty-pmap (make-pmap empty-hnode 0 '()))          ; {} = empty array map
-(pmap-all-kw-set! empty-pmap #t)                            ; vacuously all keywords
 (define empty-pmap-hash (make-pmap empty-hnode 0 #f))      ; hash-order backing (sets)
 (define pmap-absent (list 'absent))    ; unique missing-key sentinel
-;; PersistentArrayMap threshold: assoc of a new key promotes to hash mode once the
-;; map already holds 8 entries (matching JVM HASHTABLE_THRESHOLD = 16 array slots).
-;; raised the limit to 64 for maps whose keys are ALL keywords (the common
-;; keyword-map case); mixed-key maps still cap at 8.
+;; PersistentArrayMap thresholds: assoc of a new key promotes to hash mode once
+;; the map holds 8 entries (HASHTABLE_THRESHOLD = 16 array slots), unless the
+;; ADDED key is a keyword, which rides array mode to 64 entries
+;; (KW_HASHTABLE_THRESHOLD = 128 slots). Only the new key's type is consulted —
+;; PersistentArrayMap.assoc's isKW check — so a keyword assoc'd onto an 8-entry
+;; string-keyed array map keeps it in array mode.
 (define array-map-limit 8)
 (define array-map-limit-kw 64)
-(define (all-keywords? ord)
-  ;; ord is a list of (key . value) pairs; keyword-ness keys off the pair's car
-  (or (null? ord) (and (keyword? (caar ord)) (all-keywords? (cdr ord)))))
-;; Should a map of `cnt` entries with insertion order `ord` stay in array mode
-;; when key `k` is added? Under 8 always; a keyword-only map (existing keys + the
-;; new key all keywords) grows to 64; otherwise caps at 8.
-(define (pmap-array-keep? cnt ord k all-kw)
-  (cond ((fx<? cnt array-map-limit) #t)
-        ((fx>=? cnt array-map-limit-kw) #f)
-        (all-kw (keyword? k))     ;; cached: existing keys are all keywords
-        ((and (keyword? k) (all-keywords? ord)) #t)
-        (else #f)))
+(define (pmap-array-keep? cnt k)
+  (or (fx<? cnt array-map-limit)
+      (and (keyword? k) (fx<? cnt array-map-limit-kw))))
 ;; The order list holds (key . value) pairs (glojure's PersistentArrayMap keeps
 ;; k/v adjacent): folds scan it directly with no per-key HAMT lookup, and assoc
 ;; replacing an existing key updates the value in place via order-replace.
@@ -975,16 +969,10 @@
   (let* ((added (box #f)) (r (node-assoc (pmap-root m) 0 (key-hash k) k v added))
          (cnt (pmap-cnt m)) (ord (pmap-order m)))
     (if (unbox added)
-        (if (and ord (pmap-array-keep? cnt ord k (pmap-all-kw m)))
-            (let ((new-m (make-pmap r (fx+ cnt 1) (append-key ord k v))))
-              (pmap-all-kw-set! new-m
-                (and (pmap-all-kw m) (keyword? k)))
-              new-m)
+        (if (and ord (pmap-array-keep? cnt k))
+            (make-pmap r (fx+ cnt 1) (append-key ord k v))
             (make-pmap r (fx+ cnt 1) #f))
-        (begin
-          (when (and ord (not (pmap-all-kw m)))
-            (pmap-all-kw-set! m (all-keywords? ord)))
-          (make-pmap r cnt (order-replace ord k v))))))
+        (make-pmap r cnt (order-replace ord k v)))))
 ;; force-ordered / force-hash inserts for rebuilding a map whose final mode is
 ;; already decided (array-map ctor, transient persistent!).
 (define (pmap-put-ordered m k v)
@@ -1078,18 +1066,25 @@
         (let loop ((ps (reverse ord)) (a acc))
           (if (null? ps) a (loop (cdr ps) (proc (caar ps) (cdar ps) a))))
         (node-fold (pmap-root m) proc acc))))
-;; map LITERAL ctor ({...}): array map up to 8 entries (64 if keyword-only, per 1.13),
-;; hash map beyond (RT.map).
+;; map LITERAL ctor ({...}): RT.map/canBePAM — array map up to 8 entries, up to
+;; 64 when every entry PAST the eighth is keyword-keyed (the first 8 slots may
+;; hold any key type). `ord` is reverse insertion order, so entries 9..cnt are
+;; its first (cnt - 8) pairs.
+(define (pam-literal? cnt ord)
+  (or (fx<=? cnt array-map-limit)
+      (and (fx<=? cnt array-map-limit-kw)
+           (let loop ((o ord) (n (fx- cnt array-map-limit)))
+             (or (fx<=? n 0)
+                 (and (keyword? (caar o)) (loop (cdr o) (fx- n 1))))))))
 (define (jolt-hash-map . kvs)
   (let loop ((m empty-pmap) (kvs kvs))
     (cond ((null? kvs)
            (let ((cnt (pmap-cnt m)) (ord (pmap-order m)))
-             (if (fx>? cnt (if (all-keywords? ord) array-map-limit-kw array-map-limit))
-                 (pmap->hash m) m)))
+             (if (pam-literal? cnt ord) m (pmap->hash m))))
           ((null? (cdr kvs)) (throw-jvm (quote IllegalArgumentException) "odd number of map literal entries"))
           (else (loop (pmap-put-ordered m (car kvs) (cadr kvs)) (cddr kvs))))))
 ;; array-map ctor: insertion-ordered (PersistentArrayMap, createAsIfByAssoc).
-;; Promotes past 8 entries to hash-ordered.
+;; Never promotes — an explicit array-map stays an array map at any size.
 (define (jolt-array-map-build kvs)
   (let loop ((m empty-pmap) (kvs kvs))
     (cond ((null? kvs) m)

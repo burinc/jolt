@@ -27,13 +27,15 @@
 ;; and `n` the entry count). A transient SET is always hash mode, like
 ;; PersistentHashSet. For a vector `n` is the element count.
 ;;
-;; Array mode promotes to hash mode on the write that makes an array map
-;; impossible — the same pmap-array-keep? rule the persistent assoc path uses
-;; (under 8 always; a keyword-only map grows to 64) — and the promotion is
-;; ONE-WAY, like the JVM's TransientArrayMap -> TransientHashMap. Deciding
-;; lazily at persistent! from the final count instead let a transient that grew
-;; past the limit and shrank back come down an array map, where the JVM gives a
-;; hash map.
+;; Array mode promotes to hash mode when a new key would grow the map past its
+;; CAPACITY — TransientArrayMap's rule: max(8 entries, the source map's size),
+;; fixed at creation and consulted regardless of the key's type (the keyword
+;; extension is the persistent assoc path only, so (into {} kw-pairs) gives a
+;; hash map at 9 entries like the JVM). In array mode `n` holds that capacity —
+;; the entry count lives in the hashtable — and promotion is ONE-WAY, like
+;; TransientArrayMap -> TransientHashMap. Deciding lazily at persistent! from
+;; the final count instead let a transient that grew past the limit and shrank
+;; back come down an array map, where the JVM gives a hash map.
 (define-record-type jolt-transient
   (fields kind (mutable buf) (mutable n) (mutable active) (mutable ord))
   (nongenerative jolt-transient-v3))
@@ -55,7 +57,7 @@
          (let ((ht (make-hashtable key-hash jolt=2)) (ord '()))
            ;; visit in iteration order so `ord` ends up reverse-insertion (persistent! reverses it back)
            (pmap-fold-fwd coll (lambda (k v acc) (hashtable-set! ht k v) (set! ord (cons (cons k v) ord)) acc) 0)
-           (make-jolt-transient 'map ht (pmap-cnt coll) #t ord))
+           (make-jolt-transient 'map ht (fxmax array-map-limit (pmap-cnt coll)) #t ord))
          (make-jolt-transient 'map (pmap-root coll) (pmap-cnt coll) #t #f)))
     ;; A set stores each element as both key and value, so a lookup answers with
     ;; the element the set HOLDS rather than the equal key it was probed with
@@ -123,16 +125,28 @@
       (let ((ht (jolt-transient-buf t)) (ord (jolt-transient-ord t)))
         (cond
           ((hashtable-contains? ht k) (hashtable-set! ht k v))
-          ((pmap-array-keep? (hashtable-size ht) ord k #f)
+          ((fx<? (hashtable-size ht) (jolt-transient-n t))   ; below capacity
            (jolt-transient-ord-set! t (cons (cons k v) ord))
            (hashtable-set! ht k v))
           (else (tmap-promote! t) (thash-put! t k v))))))
+;; TransientArrayMap.doWithout moves the LAST entry into the removed slot (array
+;; compaction), so removal is order-visible. `ord` is reversed, so the
+;; last-inserted entry is its head: removing the head is a pop; removing any
+;; other key replaces it with the head and drops the head.
+(define (remove-key-swap ord k)
+  (if (jolt= (caar ord) k)
+      (cdr ord)
+      (let ((last (car ord)))
+        (let loop ((o (cdr ord)))
+          (cond ((null? o) '())
+                ((jolt= (caar o) k) (cons last (cdr o)))
+                (else (cons (car o) (loop (cdr o)))))))))
 (define (tmap-del! t k)
   (if (not (jolt-transient-ord t))
       (thash-del! t k)
       (let ((ht (jolt-transient-buf t)))
         (when (hashtable-contains? ht k)
-          (jolt-transient-ord-set! t (remove-key (jolt-transient-ord t) k)))
+          (jolt-transient-ord-set! t (remove-key-swap (jolt-transient-ord t) k)))
         (hashtable-delete! ht k))))
 
 (define (jolt-trans-check t who)
