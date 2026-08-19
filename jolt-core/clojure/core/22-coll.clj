@@ -63,12 +63,6 @@
   [m]
   (reduce-kv (fn [m k v] (if (some? v) (assoc m k v) m)) nil m))
 
-(defn zipmap [keys vals]
-  (loop [m {} ks (seq keys) vs (seq vals)]
-    (if (and ks vs)
-      (recur (assoc m (first ks) (first vs)) (next ks) (next vs))
-      m)))
-
 ;; Structmaps (legacy). A struct basis is the ordered vector of slot keys; a
 ;; struct map is a plain map carrying every basis key (nil when unset), in basis
 ;; order, so it looks up and compares like any other map.
