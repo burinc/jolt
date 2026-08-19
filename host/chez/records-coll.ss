@@ -30,8 +30,14 @@
                           ;; (= (eduction (map inc) [1 2]) [2 3]) is true there.
                           ((or (jrec-sequential-decl? a) (jrec-sequential-decl? b))
                            (and (seq-eq-candidate? a) (seq-eq-candidate? b) (seq=? a b)))
-                          ((and (jrec? a) (jrec? b)) (jrec=? a b))
-                          (else #f))))
+                          ;; field-wise equality is a RECORD's semantics (the
+                          ;; JVM defrecord's equals); a plain deftype without a
+                          ;; declared equiv/equals is Object.equals — IDENTITY.
+                          ;; Two equal-field deftype instances used to compare
+                          ;; = here (and collapse as map keys), which the JVM
+                          ;; never does.
+                          ((and (jrec-record? a) (jrec-record? b)) (jrec=? a b))
+                          (else (eq? a b)))))
 ;; a deftype's declared hashCode governs its map/set hashing (paired with the
 ;; equals/equiv above so the hash/eq contract holds); a plain record hashes its
 ;; fields structurally via jrec-hash.
@@ -43,9 +49,14 @@
                 ((jrec-cl x "hasheq") => (lambda (m) (jolt-invoke m x)))
                 ((jrec-cl x "hashCode") => (lambda (m) (jolt-invoke m x)))
                 ;; defrecords cache per instance (jrec-hash-cached, records.ss —
-                ;; the JVM's __hasheq field); deftypes compute structurally as
-                ;; before (mutable fields could go stale under a cache).
-                (else (jrec-hash-cached x)))))
+                ;; the JVM's __hasheq field); a plain deftype hashes by IDENTITY
+                ;; (jolt-identity-hasheq, hasheq.ss) — the JVM's Object.hashCode
+                ;; — paired with the identity equality above so the hash/eq
+                ;; contract holds. Structural hashing of a deftype was both a
+                ;; divergence and unsound next to mutable fields.
+                (else (if (jrec-record? x)
+                          (jrec-hash-cached x)
+                          (jolt-identity-hasheq x))))))
 ;; get on a jrec: a real field reads raw (so a deftype method's own field bindings,
 ;; compiled to (get inst :field), never recurse); a NON-field key on a deftype that
 ;; implements clojure.lang.ILookup routes to its valAt (core.match's pattern types

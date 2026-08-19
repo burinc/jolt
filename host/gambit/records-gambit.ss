@@ -806,8 +806,8 @@
        (and (seq-eq-candidate? a)
             (seq-eq-candidate? b)
             (seq=? a b)))
-      ((and (jrec? a) (jrec? b)) (jrec=? a b))
-      (else #f))))
+      ((and (jrec-record? a) (jrec-record? b)) (jrec=? a b))
+      (else (eq? a b)))))
 
 (register-hash-arm!
   jrec?
@@ -815,7 +815,10 @@
     (cond
       ((jrec-cl x "hasheq") => (lambda (m) (jolt-invoke m x)))
       ((jrec-cl x "hashCode") => (lambda (m) (jolt-invoke m x)))
-      (else (jrec-hash-cached x)))))
+      (else
+       (if (jrec-record? x)
+           (jrec-hash-cached x)
+           (jolt-identity-hasheq x))))))
 
 (define jrec-cl rec-coll-method)
 

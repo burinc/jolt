@@ -668,7 +668,13 @@
                     (values r touched)))))
              (walk
               (lambda (x path)
-                (when (procedure? x) (set! proc-touched #t))
+                ;; procedures AND plain deftypes hash by per-process identity
+                ;; (hasheq.ss jolt-identity-hasheq), so either under a key means
+                ;; the container's placement cannot travel. A deftype with a
+                ;; declared hashCode rekeys too — over-approximate, harmless.
+                (when (or (procedure? x)
+                          (and (jrec? x) (not (jrec-record? x))))
+                  (set! proc-touched #t))
                 (cond
                   ;; scalar leaves can never hold a procedure
                   ((or (null? x) (boolean? x) (number? x) (char? x)

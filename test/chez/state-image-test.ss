@@ -217,6 +217,23 @@
                      "  (contains? s inc) (contains? s [dec :k])])")
       "[1 2 3 3 true true]")
   (cleanup!))
+
+;; deftype keys hash by identity too (records-coll.ss), and a deftype instance
+;; is REBUILT by the record walk on restore — a fresh object with a fresh id —
+;; so without the rekey flag covering deftypes the restored map could not find
+;; its own keys. Identity semantics mean only the restored key object can hit;
+;; that is the JVM's behavior for a deserialized identity-keyed map as well.
+(begin
+  (cleanup!)
+  (ev (string-append "(do (deftype ImgDtK [a])"
+                     " (jolt.host/image-write! \"" tmp "\""
+                     "   (hash-map (->ImgDtK 1) :dt [(->ImgDtK 2) :nest] :vec)))"))
+  (is "deftype-keyed map is self-consistent after restore"
+      (string-append "(let [m (jolt.host/image-read \"" tmp "\")]"
+                     " [(count m)"
+                     "  (= #{:dt :vec} (set (map (fn [k] (get m k)) (keys m))))])")
+      "[2 true]")
+  (cleanup!))
 ;; (partial compare) would be compare ITSELF (partial's 1-arg arity), a named
 ;; fn — (comp - compare) is a real core-tier closure with no registration
 (is "scan of a sorted-map-by with an unregistered closure reports one finding at the comparator"

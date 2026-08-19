@@ -596,10 +596,15 @@
 ;; a weak table pathological in the intern-cache case. Ids are per-process:
 ;; a procedure's hash does not survive an image dump/restore, exactly as
 ;; identityHashCode does not survive JVM serialization.
+;; jolt-identity-hasheq serves every identity-hashed population: procedures,
+;; and plain deftypes (records-coll.ss — a deftype without a declared
+;; hashCode/hasheq is Object.hashCode on the JVM, identity, where jolt used to
+;; hash it structurally and let equal-field instances collide as map keys).
+;; One shared table: the id is per OBJECT, whatever its type.
 (define proc-hasheq-tbl (make-weak-eq-hashtable))
 (define proc-hasheq-mu (make-mutex))
 (define proc-hasheq-counter 0)
-(define (procedure-hasheq p)
+(define (jolt-identity-hasheq p)
   (jolt-with-mutex proc-hasheq-mu
     (or (hashtable-ref proc-hasheq-tbl p #f)
         (begin
@@ -607,6 +612,7 @@
           (let ((h (murmur3-hash-long-flat proc-hasheq-counter)))
             (hashtable-set! proc-hasheq-tbl p h)
             h)))))
+(define (procedure-hasheq p) (jolt-identity-hasheq p))
 
 ;; pvec hasheq, cached in the field the record has carried since chez-pvec-v3
 ;; (mk-pvec inits it 0 = unset; pvec-with-ent already forwards it) but nothing
