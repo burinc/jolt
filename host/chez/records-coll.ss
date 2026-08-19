@@ -42,7 +42,10 @@
                 ;; through it, so (hash a-record) == (hash an-equal-map).
                 ((jrec-cl x "hasheq") => (lambda (m) (jolt-invoke m x)))
                 ((jrec-cl x "hashCode") => (lambda (m) (jolt-invoke m x)))
-                (else (jrec-hash x)))))
+                ;; defrecords cache per instance (jrec-hash-cached, records.ss —
+                ;; the JVM's __hasheq field); deftypes compute structurally as
+                ;; before (mutable fields could go stale under a cache).
+                (else (jrec-hash-cached x)))))
 ;; get on a jrec: a real field reads raw (so a deftype method's own field bindings,
 ;; compiled to (get inst :field), never recurse); a NON-field key on a deftype that
 ;; implements clojure.lang.ILookup routes to its valAt (core.match's pattern types
