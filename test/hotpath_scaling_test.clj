@@ -77,12 +77,17 @@
     (println "FAIL hotpath: wrong results from a fixed path")
     (System/exit 1))
 
+  ;; Each timed arm repeats its drain 4x: the deque small arm measured ~3ms,
+  ;; under the CI noise floor, and read 8.33 against the 8.0 ceiling on a
+  ;; shared runner (a regressed shifting impl sits ~16). Repetition grows the
+  ;; measurement without growing n, so a quadratic regression's per-drain cost
+  ;; — what "still finishes when broken" was sized around — is unchanged.
   (let [n1 4000]
-    (judge "split" (best-of 3 #(split-drain n1)) (best-of 3 #(split-drain (* 4 n1))) 8.0
+    (judge "split" (best-of 3 #(dotimes [_ 4] (split-drain n1))) (best-of 3 #(dotimes [_ 4] (split-drain (* 4 n1)))) 8.0
            "re-split is recomputing (length out) per part again (natives-str.ss)")
-    (judge "deque" (best-of 3 #(deque-drain n1)) (best-of 3 #(deque-drain (* 4 n1))) 8.0
+    (judge "deque" (best-of 3 #(dotimes [_ 4] (deque-drain n1))) (best-of 3 #(dotimes [_ 4] (deque-drain (* 4 n1)))) 8.0
            "ArrayDeque front ops are shifting the backing vector again (host-static-classes.ss)")
-    (judge "tokenizer" (best-of 3 #(tok-drain n1)) (best-of 3 #(tok-drain (* 4 n1))) 8.0
+    (judge "tokenizer" (best-of 3 #(dotimes [_ 4] (tok-drain n1))) (best-of 3 #(dotimes [_ 4] (tok-drain (* 4 n1)))) 8.0
            "StringTokenizer is scanning its token list per token again (host-static-classes.ss)"))
 
   ;; timeout arming: single measurement per size (arming is not idempotent —

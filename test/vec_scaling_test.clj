@@ -31,8 +31,11 @@
 (def ^:private n1 50000)
 (def ^:private factor 4)
 ;; enough calls that the structural op's batch sits above the ms-timer floor —
-;; at 1ms both sides clamp and the ratio measures nothing.
-(def ^:private reps 5000)
+;; at 1ms both sides clamp and the ratio measures nothing. 15000, not 5000:
+;; the catvec arms measured 6ms/4ms, the same sub-noise-floor size that made
+;; three sibling gates flake a hair over their ceilings on shared runners
+;; (allocating arms + one GC pause moves a small ratio). ~18ms/12ms now.
+(def ^:private reps 15000)
 
 ;; Logarithmic measures ~1 and a linear rebuild ~4, so the line goes between
 ;; them, with room for a loaded machine.

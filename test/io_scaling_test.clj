@@ -42,7 +42,13 @@
 (defn- best-of [k f]
   (reduce min (map first (repeatedly k #(timed f)))))
 
-(def ^:private n1 2000)
+;; 8000, not 2000: the small arm measured 2-3ms on a millisecond clock, so
+;; quantization plus one scheduler blip on a shared runner read 8.33 against
+;; the 8.0 ceiling (locally the drain sits ~4.5; the quadratic bug this gates
+;; sat ~16). At 8000 the small arm is ~10ms and the ratio stops moving with
+;; the clock's granularity. A regressed quadratic drain at 32000 items still
+;; finishes in seconds, so the gate keeps failing fast when it should.
+(def ^:private n1 8000)
 (def ^:private factor 4)
 (def ^:private max-ratio 8.0)
 
