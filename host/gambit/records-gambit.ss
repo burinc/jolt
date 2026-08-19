@@ -710,6 +710,22 @@
          (map-hash (mix-coll-hash (car total) (cdr total))))
     (i32 (bitwise-xor class-hash map-hash))))
 
+(define jrec-hasheq-tbl (make-weak-eq-hashtable))
+
+(define jrec-hasheq-mu (make-mutex))
+
+(define (jrec-hash-cached r)
+  (if (jrec-record? r)
+      (or (jolt-with-mutex
+            jrec-hasheq-mu
+            (hashtable-ref jrec-hasheq-tbl r #f))
+          (let ((h (jrec-hash r)))
+            (jolt-with-mutex
+              jrec-hasheq-mu
+              (hashtable-set! jrec-hasheq-tbl r h))
+            h))
+      (jrec-hash r)))
+
 (define (jrec-coll-print-shape r)
   (vector-ref (jrdesc-ifc-of r) 1))
 
@@ -799,7 +815,7 @@
     (cond
       ((jrec-cl x "hasheq") => (lambda (m) (jolt-invoke m x)))
       ((jrec-cl x "hashCode") => (lambda (m) (jolt-invoke m x)))
-      (else (jrec-hash x)))))
+      (else (jrec-hash-cached x)))))
 
 (define jrec-cl rec-coll-method)
 

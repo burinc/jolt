@@ -529,6 +529,34 @@
                                result)))
          (map-hash (mix-coll-hash (car total) (cdr total))))
     (i32 (bitwise-xor class-hash map-hash))))
+;; Per-INSTANCE hasheq cache for defrecords — the JVM's __hasheq field
+;; (core_deftype.clj emits it; computed once, then a field read). jolt's jrec
+;; layout is image-format surface (a field means bumping every family tag), so
+;; the cache is a weak-eq side table like procedure-hasheq: mutex-guarded,
+;; weak so an entry dies with its record, and — because it is a table and not
+;; a record slot — nothing ever travels into an image fasl, which is what
+;; keeps this safe alongside the dump-side cache zeroing (state-image.ss).
+;; DEFRECORDS ONLY (jrec-record?): a deftype may declare mutable fields, so
+;; caching its structural hash would go stale on a set!. Values are unchanged
+;; — the cache stores exactly what jrec-hash computes; equal-content records
+;; hash equal whether or not either is cached. Measured before: hash of a
+;; 4-field record 752 ns per call against the JVM's 10 (the JVM's second call
+;; is a field read); repeat hashes are now one table probe.
+(define jrec-hasheq-tbl (make-weak-eq-hashtable))
+(define jrec-hasheq-mu (make-mutex))
+;; The compute runs OUTSIDE the lock: jrec-hash recurses into field values
+;; (a nested record re-enters this fn), and holding the mutex across a deep
+;; structural hash would convoy every other thread's record hash behind it.
+;; Both table touches stay locked — a weak table under a concurrent writer is
+;; not safe to read bare — and two racers computing the same content store the
+;; same value, so the double-store is benign.
+(define (jrec-hash-cached r)
+  (if (jrec-record? r)
+      (or (jolt-with-mutex jrec-hasheq-mu (hashtable-ref jrec-hasheq-tbl r #f))
+          (let ((h (jrec-hash r)))
+            (jolt-with-mutex jrec-hasheq-mu (hashtable-set! jrec-hasheq-tbl r h))
+            h))
+      (jrec-hash r)))
 ;; A non-record deftype that declares a collection interface prints in THAT
 ;; collection's shape, which is how print-method dispatches on the JVM: ISeq as
 ;; (…), IPersistentVector as […], IPersistentSet as #{…}, IPersistentMap as
