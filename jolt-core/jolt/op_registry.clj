@@ -154,6 +154,9 @@
    "identity" {:call "jolt-identity" :arity #(= % 1)}
    "nil?"     {:call "jolt-nil?"   :arity #(= % 1) :bool? true :pure? true}
    "some?"    {:call "jolt-some?"  :arity #(= % 1) :bool? true :pure? true}
+   ;; the reference inlines identical? (:inline -> Util/identical); a var call
+   ;; here cost ~100ns per use in cell-less seed code (true?/false?/boolean?).
+   "identical?" {:call "jolt-identical?" :arity #(= % 2) :bool? true :pure? true}
    "ex-info"  {:call "jolt-ex-info" :arity #(or (= % 2) (= % 3))}
    ;; bit ops emit a direct call to their helper instead of var-deref + the
    ;; variadic overlay. The helpers coerce through ->int, which rejects a

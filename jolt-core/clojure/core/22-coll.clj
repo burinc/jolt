@@ -50,8 +50,12 @@
           (with-meta {} (meta map)) keyseq))
 
 ;; some? lives in the top leaf block now (forward refs are errors).
-(defn true? [x] (= true x))
-(defn false? [x] (= false x))
+;; identity, not = — the reference bodies are Util/identical, and a mixed-type
+;; (= true x) here walked the whole extension-arm registry (a registered arm
+;; predicate like jolt.time's runs per call): true? on a keyword measured 367ns
+;; against the JVM's 16. identical? lowers to eq?.
+(defn true? [x] (identical? true x))
+(defn false? [x] (identical? false x))
 
 (defn some-vals
   "Returns a map with only the non-nil values of map m. Returns nil if m has no

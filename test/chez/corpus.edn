@@ -5100,4 +5100,6 @@
   {:suite "quoted-literal constants" :label "a literal with a LOCAL element still constructs per call" :expected "false" :actual "(do (defn qlc-loc [x] #{:a x}) (identical? (qlc-loc 1) (qlc-loc 1)))" :portability :common}
   {:suite "quoted-literal constants" :label "with-meta on a shared constant copies, never mutates the site" :expected "[{:x 1} nil]" :actual "(do (defn qlc-wm [] (quote mm)) (let [a (with-meta (qlc-wm) {:x 1}) b (qlc-wm)] [(meta a) (meta b)]))" :portability :common}
   {:suite "quoted-literal constants" :label "two sites of the same quoted set are separate constants but equal" :expected "true" :actual "(do (defn qlc-s1 [] #{:q (quote q)}) (defn qlc-s2 [] #{:q (quote q)}) (= (qlc-s1) (qlc-s2)))" :portability :common}
+  {:suite "identical? lowering" :label "call, apply, and value position agree" :expected "[true true false true]" :actual "[(identical? :a :a) (apply identical? [:x :x]) (identical? \"a\" \"b\") ((fn [f] (f :q :q)) identical?)]" :portability :common}
+  {:suite "identical? lowering" :label "boolean predicates keep JVM answers" :expected "[false false true false true]" :actual "[(true? :kw) (false? nil) (boolean? false) (boolean? :kw) (true? true)]" :portability :common}
 ]
