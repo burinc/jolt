@@ -22,57 +22,57 @@
 
 ;; expansion of (define-jrec-family 8)
 (define-record-type (jrec make-jrec0 jrec?)
-  (fields (immutable desc) (immutable ext))
-  (nongenerative chez-jrec-v4))
+  (fields (immutable desc) (immutable ext) (mutable hasheq))
+  (nongenerative chez-jrec-v5))
 
 (define-record-type (jrec1 make-jrec1 jrec1?)
   (parent jrec)
   (fields (mutable f0))
-  (nongenerative chez-jrec1v1))
+  (nongenerative chez-jrec1v2))
 
 (define-record-type (jrec2 make-jrec2 jrec2?)
   (parent jrec)
   (fields (mutable f0) (mutable f1))
-  (nongenerative chez-jrec2v1))
+  (nongenerative chez-jrec2v2))
 
 (define-record-type (jrec3 make-jrec3 jrec3?)
   (parent jrec)
   (fields (mutable f0) (mutable f1) (mutable f2))
-  (nongenerative chez-jrec3v1))
+  (nongenerative chez-jrec3v2))
 
 (define-record-type (jrec4 make-jrec4 jrec4?)
   (parent jrec)
   (fields (mutable f0) (mutable f1) (mutable f2) (mutable f3))
-  (nongenerative chez-jrec4v1))
+  (nongenerative chez-jrec4v2))
 
 (define-record-type (jrec5 make-jrec5 jrec5?)
   (parent jrec)
   (fields (mutable f0) (mutable f1) (mutable f2) (mutable f3)
     (mutable f4))
-  (nongenerative chez-jrec5v1))
+  (nongenerative chez-jrec5v2))
 
 (define-record-type (jrec6 make-jrec6 jrec6?)
   (parent jrec)
   (fields (mutable f0) (mutable f1) (mutable f2) (mutable f3)
     (mutable f4) (mutable f5))
-  (nongenerative chez-jrec6v1))
+  (nongenerative chez-jrec6v2))
 
 (define-record-type (jrec7 make-jrec7 jrec7?)
   (parent jrec)
   (fields (mutable f0) (mutable f1) (mutable f2) (mutable f3)
     (mutable f4) (mutable f5) (mutable f6))
-  (nongenerative chez-jrec7v1))
+  (nongenerative chez-jrec7v2))
 
 (define-record-type (jrec8 make-jrec8 jrec8?)
   (parent jrec)
   (fields (mutable f0) (mutable f1) (mutable f2) (mutable f3)
     (mutable f4) (mutable f5) (mutable f6) (mutable f7))
-  (nongenerative chez-jrec8v1))
+  (nongenerative chez-jrec8v2))
 
 (define-record-type (jrec* make-jrec* jrec*?)
   (parent jrec)
   (fields (mutable vals))
-  (nongenerative chez-jrecsp-v1))
+  (nongenerative chez-jrecsp-v2))
 
 (define (jrec-nfields r)
   (cond
@@ -293,39 +293,40 @@
 (define (make-jrec-from-existing src ov ov-val ext)
   (let ((desc (jrec-desc src)))
     (case (jrec-nfields src)
-      ((0) (make-jrec0 desc ext))
+      ((0) (make-jrec0 desc ext 0))
       ((1)
-       (make-jrec1 desc ext (if (eq? ov 0) ov-val (jrec1-f0 src))))
-      ((2)
-       (make-jrec2
+       (make-jrec1
          desc
          ext
-         (if (eq? ov 0) ov-val (jrec2-f0 src))
+         0
+         (if (eq? ov 0) ov-val (jrec1-f0 src))))
+      ((2)
+       (make-jrec2 desc ext 0 (if (eq? ov 0) ov-val (jrec2-f0 src))
          (if (eq? ov 1) ov-val (jrec2-f1 src))))
       ((3)
-       (make-jrec3 desc ext (if (eq? ov 0) ov-val (jrec3-f0 src))
+       (make-jrec3 desc ext 0 (if (eq? ov 0) ov-val (jrec3-f0 src))
          (if (eq? ov 1) ov-val (jrec3-f1 src))
          (if (eq? ov 2) ov-val (jrec3-f2 src))))
       ((4)
-       (make-jrec4 desc ext (if (eq? ov 0) ov-val (jrec4-f0 src))
+       (make-jrec4 desc ext 0 (if (eq? ov 0) ov-val (jrec4-f0 src))
          (if (eq? ov 1) ov-val (jrec4-f1 src))
          (if (eq? ov 2) ov-val (jrec4-f2 src))
          (if (eq? ov 3) ov-val (jrec4-f3 src))))
       ((5)
-       (make-jrec5 desc ext (if (eq? ov 0) ov-val (jrec5-f0 src))
+       (make-jrec5 desc ext 0 (if (eq? ov 0) ov-val (jrec5-f0 src))
          (if (eq? ov 1) ov-val (jrec5-f1 src))
          (if (eq? ov 2) ov-val (jrec5-f2 src))
          (if (eq? ov 3) ov-val (jrec5-f3 src))
          (if (eq? ov 4) ov-val (jrec5-f4 src))))
       ((6)
-       (make-jrec6 desc ext (if (eq? ov 0) ov-val (jrec6-f0 src))
+       (make-jrec6 desc ext 0 (if (eq? ov 0) ov-val (jrec6-f0 src))
          (if (eq? ov 1) ov-val (jrec6-f1 src))
          (if (eq? ov 2) ov-val (jrec6-f2 src))
          (if (eq? ov 3) ov-val (jrec6-f3 src))
          (if (eq? ov 4) ov-val (jrec6-f4 src))
          (if (eq? ov 5) ov-val (jrec6-f5 src))))
       ((7)
-       (make-jrec7 desc ext (if (eq? ov 0) ov-val (jrec7-f0 src))
+       (make-jrec7 desc ext 0 (if (eq? ov 0) ov-val (jrec7-f0 src))
          (if (eq? ov 1) ov-val (jrec7-f1 src))
          (if (eq? ov 2) ov-val (jrec7-f2 src))
          (if (eq? ov 3) ov-val (jrec7-f3 src))
@@ -333,7 +334,7 @@
          (if (eq? ov 5) ov-val (jrec7-f5 src))
          (if (eq? ov 6) ov-val (jrec7-f6 src))))
       ((8)
-       (make-jrec8 desc ext (if (eq? ov 0) ov-val (jrec8-f0 src))
+       (make-jrec8 desc ext 0 (if (eq? ov 0) ov-val (jrec8-f0 src))
          (if (eq? ov 1) ov-val (jrec8-f1 src))
          (if (eq? ov 2) ov-val (jrec8-f2 src))
          (if (eq? ov 3) ov-val (jrec8-f3 src))
@@ -344,17 +345,14 @@
       (else
        (let ((nv (jrec-vec-copy (jrec*-vals src))))
          (when ov (vector-set! nv ov ov-val))
-         (make-jrec* desc ext nv))))))
+         (make-jrec* desc ext 0 nv))))))
 
 (define (make-jrec desc vals ext)
   (let ((n (vector-length vals)))
     (if (fx<= n 8)
-        (apply
-          (vector-ref jrec-ctor-vec n)
-          desc
-          ext
+        (apply (vector-ref jrec-ctor-vec n) desc ext 0
           (vector->list vals))
-        (make-jrec* desc ext vals))))
+        (make-jrec* desc ext 0 vals))))
 
 (define jrec-fast-type-probe
   (make-jrec 'fast-type-probe (vector) jolt-nil))
@@ -710,19 +708,11 @@
          (map-hash (mix-coll-hash (car total) (cdr total))))
     (i32 (bitwise-xor class-hash map-hash))))
 
-(define jrec-hasheq-tbl (make-weak-eq-hashtable))
-
-(define jrec-hasheq-mu (make-mutex))
-
 (define (jrec-hash-cached r)
   (if (jrec-record? r)
-      (or (jolt-with-mutex
-            jrec-hasheq-mu
-            (hashtable-ref jrec-hasheq-tbl r #f))
-          (let ((h (jrec-hash r)))
-            (jolt-with-mutex
-              jrec-hasheq-mu
-              (hashtable-set! jrec-hasheq-tbl r h))
+      (let ((h (jrec-hasheq r)))
+        (if (eqv? h 0)
+            (let ((h2 (jrec-hash r))) (jrec-hasheq-set! r h2) h2)
             h))
       (jrec-hash r)))
 
@@ -809,16 +799,20 @@
       ((and (jrec-record? a) (jrec-record? b)) (jrec=? a b))
       (else (eq? a b)))))
 
-(register-hash-arm!
-  jrec?
-  (lambda (x)
-    (cond
-      ((jrec-cl x "hasheq") => (lambda (m) (jolt-invoke m x)))
-      ((jrec-cl x "hashCode") => (lambda (m) (jolt-invoke m x)))
-      (else
-       (if (jrec-record? x)
-           (jrec-hash-cached x)
-           (jolt-identity-hasheq x))))))
+(define (jrec-hasheq-slow x)
+  (cond
+    ((jrec-cl x "hasheq") => (lambda (m) (jolt-invoke m x)))
+    ((jrec-cl x "hashCode") => (lambda (m) (jolt-invoke m x)))
+    ((jrec-record? x)
+     (let ((h (jrec-hash x))) (jrec-hasheq-set! x h) h))
+    (else
+     (let ((h (jolt-identity-hasheq x)))
+       (jrec-hasheq-set! x h)
+       h))))
+
+(define (jrec-hasheq-fast x)
+  (let ((h (jrec-hasheq x)))
+    (if (eqv? h 0) (jrec-hasheq-slow x) h)))
 
 (define jrec-cl rec-coll-method)
 

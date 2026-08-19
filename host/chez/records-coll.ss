@@ -38,25 +38,27 @@
                           ;; never does.
                           ((and (jrec-record? a) (jrec-record? b)) (jrec=? a b))
                           (else (eq? a b)))))
-;; a deftype's declared hashCode governs its map/set hashing (paired with the
-;; equals/equiv above so the hash/eq contract holds); a plain record hashes its
-;; fields structurally via jrec-hash.
-(register-hash-arm! jrec?
-  (lambda (x) (cond
-                ;; clojure.core/hash uses hasheq (IHashEq); a deftype declaring
-                ;; hasheq (flatland's OrderedMap/OrderedSet) governs its value hash
-                ;; through it, so (hash a-record) == (hash an-equal-map).
-                ((jrec-cl x "hasheq") => (lambda (m) (jolt-invoke m x)))
-                ((jrec-cl x "hashCode") => (lambda (m) (jolt-invoke m x)))
-                ;; defrecords cache per instance (jrec-hash-cached, records.ss —
-                ;; the JVM's __hasheq field); a plain deftype hashes by IDENTITY
-                ;; (jolt-identity-hasheq, hasheq.ss) — the JVM's Object.hashCode
-                ;; — paired with the identity equality above so the hash/eq
-                ;; contract holds. Structural hashing of a deftype was both a
-                ;; divergence and unsound next to mutable fields.
-                (else (if (jrec-record? x)
-                          (jrec-hash-cached x)
-                          (jolt-identity-hasheq x))))))
+;; jrec hashing is a fast clause in jolt-hash / jolt-hasheq (a jrec probe in
+;; hash-fast-probes keeps any arm from claiming one), field-first: the hasheq
+;; slot answers a repeat hash in one read. 0 = unset routes here.
+;;   - a declared hasheq governs the value hash (clojure.core/hash is IHashEq
+;;     first, so (hash a-record) == (hash an-equal-map) for flatland's types),
+;;     then a declared hashCode; both are consulted on EVERY call — the JVM
+;;     does not cache custom methods, and one may read mutable state — so
+;;     these types never fill the slot.
+;;   - a defrecord caches its structural hash in the slot (the __hasheq field);
+;;     a plain deftype caches its identity hash there (Object.hashCode), each
+;;     paired with the matching equality above so the hash/eq contract holds.
+(define (jrec-hasheq-slow x)
+  (cond ((jrec-cl x "hasheq") => (lambda (m) (jolt-invoke m x)))
+        ((jrec-cl x "hashCode") => (lambda (m) (jolt-invoke m x)))
+        ((jrec-record? x)
+         (let ((h (jrec-hash x))) (jrec-hasheq-set! x h) h))
+        (else
+         (let ((h (jolt-identity-hasheq x))) (jrec-hasheq-set! x h) h))))
+(define (jrec-hasheq-fast x)
+  (let ((h (jrec-hasheq x)))
+    (if (eqv? h 0) (jrec-hasheq-slow x) h)))
 ;; get on a jrec: a real field reads raw (so a deftype method's own field bindings,
 ;; compiled to (get inst :field), never recurse); a NON-field key on a deftype that
 ;; implements clojure.lang.ILookup routes to its valAt (core.match's pattern types

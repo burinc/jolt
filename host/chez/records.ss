@@ -69,13 +69,23 @@
          (define (pred k) (sym "jrec~a?" k))
          (define (rtname k) (sym "jrec~a" k))
          (define (mkname k) (sym "make-jrec~a" k))
-         (define (ngname k) (sym "chez-jrec~av1" k))
+         (define (ngname k) (sym "chez-jrec~av2" k))
          (define (acc k i) (sym "jrec~a-f~a" k i))
          (define (mut k i) (sym "jrec~a-f~a-set!" k i))
          (define (fsyms k) (map fsym (range 0 (- k 1))))
+         ;; hasheq is the defrecord __hasheq slot generalized to the family:
+         ;; 0 = unset; a defrecord caches its structural hash here, a plain
+         ;; deftype its identity hash, and a type with a declared
+         ;; hasheq/hashCode never fills it (records-coll.ss jrec-hasheq-slow).
+         ;; make-jrecN is the raw ctor, so every call passes the slot's 0
+         ;; explicitly — a ctor protocol would keep the old arity but costs two
+         ;; closure hops per construction (measured 40 -> 64 ns). The slot makes
+         ;; the family's layout new image surface: every nongenerative tag
+         ;; bumps, and state-image.ss reads older images through a legacy arm.
          (define base-def
            '(define-record-type (jrec make-jrec0 jrec?)
-             (fields (immutable desc) (immutable ext)) (nongenerative chez-jrec-v4)))
+             (fields (immutable desc) (immutable ext) (mutable hasheq))
+             (nongenerative chez-jrec-v5)))
          (define (child-def k)
            `(define-record-type (,(rtname k) ,(mkname k) ,(pred k))
               (parent jrec)
@@ -83,7 +93,7 @@
               (nongenerative ,(ngname k))))
          (define spill-def
            '(define-record-type (jrec* make-jrec* jrec*?)
-             (parent jrec) (fields (mutable vals)) (nongenerative chez-jrecsp-v1)))
+             (parent jrec) (fields (mutable vals)) (nongenerative chez-jrecsp-v2)))
          (define nfields-def
            `(define (jrec-nfields r)
               (cond ,@(map (lambda (k) `((,(pred k) r) ,k)) (range 1 mn))
@@ -132,18 +142,18 @@
           ;; verbatim (dissoc / meta-copy). Spill (>8 fields) copies the backing vals
           ;; vector. Replaces the old jrec-vals + jrec-vec-copy + make-jrec triple-copy.
           (define (fromexisting-clause k)
-            `((,k) (,(mkname k) desc ext
+            `((,k) (,(mkname k) desc ext 0
                     ,@(map (lambda (j) `(if (eq? ov ,j) ov-val (,(acc k j) src)))
                            (range 0 (- k 1))))))
           (define fromexisting-def
             `(define (make-jrec-from-existing src ov ov-val ext)
                (let ((desc (jrec-desc src)))
                  (case (jrec-nfields src)
-                   ((0) (make-jrec0 desc ext))
+                   ((0) (make-jrec0 desc ext 0))
                    ,@(map fromexisting-clause (range 1 mn))
                    (else (let ((nv (jrec-vec-copy (jrec*-vals src))))
                            (when ov (vector-set! nv ov ov-val))
-                           (make-jrec* desc ext nv)))))))
+                           (make-jrec* desc ext 0 nv)))))))
           (datum->syntax tid
             `(begin ,base-def
                     ,@(map child-def (range 1 mn))
@@ -158,8 +168,8 @@
 (define (make-jrec desc vals ext)
   (let ((n (vector-length vals)))
     (if (fx<= n 8)
-        (apply (vector-ref jrec-ctor-vec n) desc ext (vector->list vals))
-        (make-jrec* desc ext vals))))
+        (apply (vector-ref jrec-ctor-vec n) desc ext 0 (vector->list vals))
+        (make-jrec* desc ext 0 vals))))
 ;; One throwaway record, built here at load and reused, for the arm registries to
 ;; probe a candidate predicate against (reject-fast-type-claim!, values.ss).
 ;; Built ONCE rather than per registration: registrations also happen at runtime,
@@ -532,29 +542,20 @@
 ;; Per-INSTANCE hasheq cache for defrecords — the JVM's __hasheq field
 ;; (core_deftype.clj emits it; computed once, then a field read). jolt's jrec
 ;; layout is image-format surface (a field means bumping every family tag), so
-;; the cache is a weak-eq side table like procedure-hasheq: mutex-guarded,
-;; weak so an entry dies with its record, and — because it is a table and not
-;; a record slot — nothing ever travels into an image fasl, which is what
-;; keeps this safe alongside the dump-side cache zeroing (state-image.ss).
-;; DEFRECORDS ONLY (jrec-record?): a deftype may declare mutable fields, so
-;; caching its structural hash would go stale on a set!. Values are unchanged
-;; — the cache stores exactly what jrec-hash computes; equal-content records
-;; hash equal whether or not either is cached. Measured before: hash of a
-;; 4-field record 752 ns per call against the JVM's 10 (the JVM's second call
-;; is a field read); repeat hashes are now one table probe.
-(define jrec-hasheq-tbl (make-weak-eq-hashtable))
-(define jrec-hasheq-mu (make-mutex))
-;; The compute runs OUTSIDE the lock: jrec-hash recurses into field values
-;; (a nested record re-enters this fn), and holding the mutex across a deep
-;; structural hash would convoy every other thread's record hash behind it.
-;; Both table touches stay locked — a weak table under a concurrent writer is
-;; not safe to read bare — and two racers computing the same content store the
-;; same value, so the double-store is benign.
+;; the cache is the hasheq slot on the instance — the JVM defrecord's __hasheq
+;; field. DEFRECORDS ONLY (jrec-record?) fill it with the STRUCTURAL hash here; a
+;; plain deftype fills it with its identity hash instead, and a type with a
+;; declared hasheq/hashCode never fills it — both in records-coll.ss
+;; jrec-hasheq-slow, the one dispatch site. The slot write is a plain fixnum
+;; store with no lock: racing writers compute the same value (a structural hash
+;; is deterministic, and the identity table answers one id per object), so a
+;; double store is benign. The slot never travels: the image dump zeroes it
+;; (state-image.ss), as the JVM marks __hasheq transient.
 (define (jrec-hash-cached r)
   (if (jrec-record? r)
-      (or (jolt-with-mutex jrec-hasheq-mu (hashtable-ref jrec-hasheq-tbl r #f))
-          (let ((h (jrec-hash r)))
-            (jolt-with-mutex jrec-hasheq-mu (hashtable-set! jrec-hasheq-tbl r h))
+      (let ((h (jrec-hasheq r)))
+        (if (eqv? h 0)
+            (let ((h2 (jrec-hash r))) (jrec-hasheq-set! r h2) h2)
             h))
       (jrec-hash r)))
 ;; A non-record deftype that declares a collection interface prints in THAT
