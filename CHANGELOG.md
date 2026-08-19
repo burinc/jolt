@@ -57,6 +57,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `IllegalArgumentException` on anything else instead of returning nil
   (`parse-uuid` keeps its nil-returning Clojure contract).
 
+- **Structs passed and returned by C value:** `foreign-fn` and `defcfn` accept
+  `[:by-value [:struct ...]]` signature types. Arguments are non-null pointers
+  to caller-owned struct storage. Aggregate-returning callables take a non-null
+  caller-owned destination pointer first, write the returned C value there, and
+  return that pointer. Nested structs, multiple aggregate arguments, fixed
+  aggregates before `:varargs`, and `:blocking` calls are supported; aggregate
+  callbacks, variadic aggregate arguments, and aggregate returns combined with
+  `:varargs` remain unsupported.
+
 ## [0.7.22] - 2026-08-22
 
 A patch release of robustness fixes: the AOT cache detects and heals partial

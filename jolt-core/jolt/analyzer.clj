@@ -968,6 +968,26 @@
     (throw "jolt.ffi/layout expects one literal struct descriptor"))
   {:op :ffi-layout :layout (analyze-ffi-layout-struct (nth items 1))})
 
+(defn- ffi-by-value-form? [form]
+  (when (form-vec? form)
+    (let [parts (vec (form-vec-items form))]
+      (and (= 2 (count parts))
+           (form-keyword? (nth parts 0))
+           (nil? (namespace (nth parts 0)))
+           (= "by-value" (name (nth parts 0)))))))
+
+(defn- analyze-ffi-signature-type [form position]
+  (cond
+    (form-keyword? form) (name form)
+    (ffi-by-value-form? form)
+      (let [parts (vec (form-vec-items form))]
+        {:ffi-kind :by-value
+         :type (analyze-ffi-layout-struct (nth parts 1))})
+    :else
+      (throw (str "jolt.ffi " position
+                  " type must be a keyword or [:by-value [:struct ...]], got "
+                  (pr-str form)))))
+
 ;; jolt.ffi/__cfn: the low-level foreign-function form a jolt library
 ;; uses (via the jolt.ffi/foreign-fn macro) to bind native code. Shape:
 ;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype)            ; non-blocking
@@ -982,8 +1002,9 @@
     (throw (str "jolt.ffi/foreign-fn expects (foreign-fn \"sym\" [argtypes] rettype [:blocking])")))
   {:op :ffi-fn
    :csym (nth items 1)
-   :argtypes (mapv name (form-vec-items (nth items 2)))
-   :rettype (name (nth items 3))
+   :argtypes (mapv #(analyze-ffi-signature-type % "argument")
+                   (form-vec-items (nth items 2)))
+   :rettype (analyze-ffi-signature-type (nth items 3) "return")
    :blocking (and (= 5 (count items)) (= "blocking" (name (nth items 4))))})
 
 ;; jolt.ffi/__ccallable: the foreign-CALLBACK form (via the jolt.ffi/foreign-callable
