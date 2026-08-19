@@ -579,6 +579,35 @@
 (define jolt-hasheq-arms '())
 
 ;; Dispatch: fast-path types first, then registered arms, then fallback.
+;; Procedure identity hasheq — the JVM's Object.hashCode shape for fns. The
+;; old route was the (equal-hash x) fallback, and Chez's equal-hash answers ONE
+;; CONSTANT for every procedure (measured 669430755266, for all fns — not even
+;; 32-bit), which collapsed every fn-keyed map into a single collision bucket:
+;; instaparse's GLL msg-cache keys [listener index] made the grammar build
+;; quadratic in listeners, 92% of honeysql's namespace-load time.
+;;
+;; A weak-eq side table hands each procedure a murmured id on first hash. The
+;; table MUST be weak-keyed and unbounded, unlike the intern front cache
+;; (values.ss): an id has to stay stable for the object's lifetime — clearing
+;; on overflow would rehash live map keys out of their maps — and stability
+;; across GC is why this is a table and not an address hash. Entries die with
+;; their fn, and only fns that are actually hashed (fn-keyed maps/sets) ever
+;; get one, so the live-weak-entry volume stays far below the churn that made
+;; a weak table pathological in the intern-cache case. Ids are per-process:
+;; a procedure's hash does not survive an image dump/restore, exactly as
+;; identityHashCode does not survive JVM serialization.
+(define proc-hasheq-tbl (make-weak-eq-hashtable))
+(define proc-hasheq-mu (make-mutex))
+(define proc-hasheq-counter 0)
+(define (procedure-hasheq p)
+  (jolt-with-mutex proc-hasheq-mu
+    (or (hashtable-ref proc-hasheq-tbl p #f)
+        (begin
+          (set! proc-hasheq-counter (fx+ proc-hasheq-counter 1))
+          (let ((h (murmur3-hash-long-flat proc-hasheq-counter)))
+            (hashtable-set! proc-hasheq-tbl p h)
+            h)))))
+
 (define (jolt-hasheq x)
   ;; Fast path for the most common types (matching Util.hasheq order).
   (cond
@@ -606,6 +635,9 @@
     ((jolt-sequential? x) (hash-ordered (jolt-seq x)))
     ((pmap? x) (jolt-hasheq-fallback x))
     ((pset? x) (jolt-hasheq-fallback x))
+    ;; Ahead of the arm walk, like keywords/symbols/collections: a procedure is
+    ;; in hash-fast-probes, so no arm may claim one (values.ss guard).
+    ((procedure? x) (procedure-hasheq x))
     (else
      ;; New hasheq arms (jrec via records.ss, etc.)
      (let loop ((as jolt-hasheq-arms))
@@ -663,7 +695,10 @@
                 (h (mix-coll-hash (car result) (cdr result))))
            (pset-hasheq-set! x h)
            h)))
-    (else (equal-hash x))))
+    ((procedure? x) (procedure-hasheq x))   ; direct fallback callers too
+    ;; equal-hash can exceed the 32-bit hasheq range (a bare procedure's was
+    ;; 669430755266); clamp so every hasheq is a JVM int.
+    (else (i32 (equal-hash x)))))
 
 ;; ============================================================================
 ;; Quick sanity: export a helper for the natives to rebind clojure.core/hash

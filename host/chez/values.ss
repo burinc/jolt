@@ -303,7 +303,11 @@
         ;; here is one whose arms register happily and are then silently dead.
         (cons (jolt-vector 1) (jolt-vector 2))
         (cons (jolt-hash-map (keyword #f "a") 1) (jolt-hash-map (keyword #f "a") 2))
-        (cons (jolt-hash-set 1) (jolt-hash-set 2))))
+        (cons (jolt-hash-set 1) (jolt-hash-set 2))
+        ;; procedures: fn equality is identity, answered ahead of the walk (a
+        ;; collision-bucket compare of fn-keyed map keys paid the whole arm
+        ;; walk per entry) — so no arm may claim one.
+        (cons car cdr)))
 (define (eq-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who
                            (lambda (probe) (pred (car probe) (cdr probe)))
@@ -395,6 +399,10 @@
         ((and (pvec? a) (pvec? b)) (jolt-coll=? a b))
         ((and (pmap? a) (pmap? b)) (jolt-coll=? a b))
         ((and (pset? a) (pset? b)) (jolt-coll=? a b))
+        ;; fn equality is identity (the eq? clause above already answered the
+        ;; EQUAL case); answering the unequal case here keeps a fn-keyed map's
+        ;; bucket scan off the arm walk. The pair is in eq-fast-probes.
+        ((and (procedure? a) (procedure? b)) #f)
         (else (let loop ((as jolt-eq-arms))
                 (cond ((null? as) (jolt=2-base a b)) 
                       (((caar as) a b) ((cdar as) a b)) 
@@ -418,8 +426,10 @@
 (define (hash-fast-probes)
   (list jolt-nil (keyword #f "k") (jolt-symbol #f "s") 0 "s"
         ;; as in eq-fast-probes: every type jolt-hash / jolt-hasheq answers
-        ;; ahead of the walk, sets included.
-        (jolt-vector 1) (jolt-hash-map (keyword #f "k") 1) (jolt-hash-set 1)))
+        ;; ahead of the walk, sets included. Procedures hash by identity
+        ;; (procedure-hasheq, hasheq.ss) ahead of the walk too.
+        (jolt-vector 1) (jolt-hash-map (keyword #f "k") 1) (jolt-hash-set 1)
+        car))
 (define (hash-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who pred (hash-fast-probes) "the jolt-hash fast path"))
 (define jolt-hash-arms '())
@@ -440,6 +450,9 @@
         ((symbol-t? x) (jolt-hasheq x))
         ((fixnum? x) (jolt-hasheq x))
         ((string? x) (jolt-hasheq x))
+        ;; identity hasheq (hasheq.ss loads later; resolved at call time), in
+        ;; hash-fast-probes so no arm may claim a procedure.
+        ((procedure? x) (jolt-hasheq x))
         ;; Collections answer before the walk for the same reason (see jolt=2).
         ;; This one is the worse of the two: a pmap already CACHES its hasheq, so
         ;; the arm walk was the entire cost of a repeat `hash` of a map, and it is
