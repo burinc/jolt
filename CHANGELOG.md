@@ -5,6 +5,226 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.16] - 2026-08-18
+
+A dependencies release. Most of it is one contribution (#645, thanks to
+@ingydotnet): code can now acquire a library *while it runs* — from Maven, a
+Gist or a single GitHub source file — with no deps.edn and no JVM anywhere in
+the picture. The same work settles what it means for a coordinate jolt already
+supplies to appear in a deps.edn: jolt IS Clojure, so `org.clojure/clojure` has
+always contributed no artifact, and as of this release it contributes no
+children either.
+
+**Read `### Changed` before upgrading.** A project whose only dependency is
+Clojure no longer gets `clojure.spec.alpha` transitively, and the Maven and
+gitlibs cache environment variables have new names with no fallback to the old
+ones.
+
+The other half is a collection fast path. `=` and `hash` on a vector, map or
+set were falling through the eq and hash arm registries before reaching their
+base cases, and those registries grow as libraries load — so requiring an
+unrelated library made core operations slower, by 8.4x on a `hash` of a
+two-entry map. Nothing about the call site changes, which is what makes that
+kind of slowdown so hard to attribute.
+
+### Added
+
+- **`clojurestar.deps/require-deps` acquires a dependency and imports it at
+  runtime.**
+
+  ```clojure
+  (require '[clojurestar.deps :refer [require-deps]])
+
+  (require-deps
+   ["mvn:dev.weavejester/medley@1.10.0/medley.core" :as medley])
+  ```
+
+  Literal libspec vectors need no quote — the macro quotes them — and a quoted
+  vector or an expression evaluating to one still works, so existing calls are
+  unaffected. Libspecs take `:as` and an explicit `:refer` vector, and are
+  prepared left to right. An optional leading map accepts `:mvn/local-repo` and
+  `:gitlibs/dir`, with `:cache-dir` retained as an alias for the source-file
+  cache root. The coordinate forms are:
+
+  ```text
+  mvn:<group>/<artifact>@<version>/<namespace>
+
+  gist:<owner>/<id>/<file>
+  gist:<owner>/<id>/<file>@<revision>
+  gist:<owner>/<id>/<revision>/<file>
+
+  github:<owner>/<repo>/<ref>/<path.clj|cljc>
+  github:<owner>/<repo>/blob/<ref>/<path.clj|cljc>
+  ```
+
+  Equivalent pinned spellings of the same file normalize to one identity and
+  one cache entry, so writing a Gist both ways does not fetch it twice. A
+  pinned coordinate reuses the persistent cache — a Gist revision has to be a
+  full 40-character commit SHA, as does a GitHub ref for the same treatment;
+  an unpinned Gist file, or a GitHub named ref, is re-fetched by the first
+  acquisition in each process. A source file must be self-contained and begin
+  with an `ns` form; loading one restores the caller's namespace afterwards,
+  and a second coordinate claiming a namespace another already owns raises a
+  structured error rather than quietly reloading over it. Downloads land
+  through a temporary file and an atomic move.
+
+  The namespace is portable rather than jolt-specific: the facade binds to
+  `jolt.deps` here and `babashka.deps` on bb.
+
+- **`java.nio.ByteBuffer` reads and writes ints, shorts, longs and chars, and
+  `Integer/signum` exists.** The buffer shim had absolute `get(int)`, bulk
+  get/put and a single-byte relative `get`, but no width above a byte — so
+  framing a length prefix through a buffer, which is the ordinary reason to
+  reach for one, got `No matching method putInt found taking 1 args`. Both JVM
+  overloads are covered for each width: the relative form starts at `position`
+  and advances it, the absolute form takes an index and leaves `position`
+  alone. Everything is big-endian, the JVM's default byte order, and `.order`
+  stays unshimmed on purpose so a caller asking for little-endian gets a
+  missing-method error rather than big-endian bytes with no warning.
+  `getShort`, `getInt` and `getLong` read back signed, so a length with the
+  high bit set decodes negative the way it does on the JVM; `getChar` is a
+  UTF-16 code unit and so reads unsigned, as a character. `Integer/signum` was
+  missing for a related reason — the `Integer` statics had `compare`, `max` and
+  `min`, and `Math/signum` returns a double, so the int-valued one had nowhere
+  to land.
+
+### Changed
+
+- **`org.clojure/clojure` and `org.clojure/clojurescript` are terminal during
+  deps.edn expansion: no artifact, and now no children.** jolt used to
+  substitute Clojure's two spec children when it dropped the coordinate,
+  because on the JVM they arrive with the artifact and libraries lean on that,
+  requiring spec without ever naming it. #645 replaced the substitution with
+  one uniform rule over host-supplied libraries, so the coordinates have to be
+  declared:
+
+  ```clojure
+  {:deps {org.clojure/clojure {:mvn/version "1.12.0"}
+          org.clojure/spec.alpha {:mvn/version "0.5.238"}
+          org.clojure/core.specs.alpha {:mvn/version "0.4.74"}}}
+  ```
+
+  Declared that way they resolve as ordinary Maven dependencies. The failure
+  when they are absent misleads, which is the reason for the warning above: the
+  require reports `Could not locate clojure/spec/alpha.jolt (or .clj/.cljc) on
+  the source roots`, and that reads like a jolt coverage gap rather than a
+  deps.edn one line short. It is tracked in
+  [known-divergences.edn](test/conformance/known-divergences.edn) under a new
+  `:deps-model` category, and in the README's divergences list.
+
+- **The Maven and gitlibs cache environment variables have new names, and the
+  old names no longer work.** `JOLT_LOCAL_REPO` is now `JOLT_MAVEN_REPOSITORY`,
+  `GRENADINE_LOCAL_REPOSITORY` is now `GRENADINE_MAVEN_REPOSITORY`, and
+  `JOLT_GITLIBS` is now `JOLT_GITLIBS_DIR`; `GRENADINE_GITLIBS_DIR` joins
+  `GITLIBS` as a shared setting. Precedence for the Maven repository is
+  `:mvn/local-repo`, `JOLT_MAVEN_REPOSITORY`, `GRENADINE_MAVEN_REPOSITORY`,
+  then `~/.m2/repository`; for git, Gist and GitHub source caches it is
+  `:gitlibs/dir`, `JOLT_GITLIBS_DIR`, `GRENADINE_GITLIBS_DIR`, `GITLIBS`, then
+  `~/.jolt/gitlibs`. A **relative** `JOLT_MAVEN_REPOSITORY` or
+  `GRENADINE_MAVEN_REPOSITORY` now resolves against the invoking project
+  directory rather than the process's working directory, matching
+  `:mvn/local-repo` and every other project-relative path. `JOLT_MVNLIBS`, the
+  opt-out from sharing a repository with the JVM toolchain, is unchanged. A
+  cache configured under an old name is not lost, only unused — either rename
+  the variable or point the new one at the same directory.
+
+### Fixed
+
+- **`range` picks its class from the argument types, the way
+  `clojure.core/range` does.** `(range 0 1.0 0.1)` answered
+  `clojure.lang.LongRange` in 0.7.15 where the JVM says `clojure.lang.Range`:
+  the specialized seq classes added there had one range flavor and used it for
+  every bounded range, so a float-stepped range wore the integer-range class.
+  The reference sends every argument through `int?` and takes `LongRange` only
+  when they all pass, `Range` otherwise — decided once, from what the caller
+  handed over, and not following the values, which is why `(range 0 1.0 0.1)`
+  is still a `Range` even though its first element is the long `0`. A zero step
+  was wrong in the same place: the JVM answers `Repeat.create(start)` there, so
+  `(range 0 5 0)` is a `clojure.lang.Repeat` and not a range class at all.
+  `Range` joins the chunked run, since the JVM's implements `IChunkedSeq`
+  exactly as `LongRange` does — `(chunked-seq? (range 0 1.0 0.1))` is true on
+  both. Values, laziness, chunking and `instance?` are unchanged; only the
+  class name moved. `(range 0 (bigint 5))` remains a `LongRange` where the JVM
+  says `Range`, because `(class (bigint 5))` is `java.lang.Long` here — the
+  integer-box model, already documented, rather than this tagging.
+
+- **`bin/jolt` finds a threaded Chez Scheme 10.x rather than the first `chez`
+  on `PATH`.** Running from source, a checkout built against a Chez that `make`
+  provisioned itself could silently fall back to an older system Chez, which
+  then died on whichever primitive that release predates (`variable flvector?
+  is not bound`) or, after `make devboot`, on `incompatible fasl-object
+  version`. The launcher now honors `$JOLT_CHEZ`, then reuses a threaded 10.x
+  already provisioned under `.cache/local`, and only then searches `PATH` —
+  checking the version and the threading of each candidate rather than taking
+  the first name that resolves, so an unusable Chez is rejected up front
+  instead of failing later somewhere stranger. Relative script arguments now
+  resolve against the caller's directory too: `bin/jolt` changes into the jolt
+  checkout and carries the original directory in `JOLT_PWD`, so `bin/jolt
+  ../app/x.clj` used to be read relative to the checkout. This is the source
+  launcher only — an installed binary was never affected.
+
+### Performance
+
+- **`=` and `hash` on a vector, map or set answer before the arm registry
+  walk.** `jolt=2`, `jolt-hash` and `jolt-hasheq` hoist a few scalar types and
+  then fall through a linear walk of the eq and hash arm registries before
+  reaching their base cases. Collections were not hoisted, so every compare or
+  hash of one paid a predicate call per registered arm — and the registries
+  grow as libraries load, with the Clojure-facing `__register-eq!` /
+  `__register-hash!` seams registering arms whose predicate is a Clojure fn
+  called through `jolt-invoke`. The cost is therefore invisible on a bare
+  runtime and shows up as an unrelated dependency slowing down core operations:
+  loading jolt-lang/time made `(hash {:a 1 :b 2})` 8.4x slower and `(= v20
+  v20)` 44% slower. Keywords were already immune because they are hoisted,
+  which is what identified the mechanism.
+
+  A second problem hid behind the same walk. `jolt-coll=?` already had a
+  chunked leaf-run compare for two vectors, but it was unreachable:
+  `jolt=2-base` tests sequential before collection, and a vector is
+  sequential, so two vectors always took the generic seq walk — which
+  allocates a seq cell per element and called the variadic `jolt=`, consing a
+  rest list per element on top of that.
+
+  Measured on one machine, with JVM Clojure for reference:
+
+  ```text
+  (= v20 v20)              1534ms -> 63.6ms   (JVM 156ms)
+  (hash {:a 1 :b 2})        162ms -> 10.9ms, and no longer affected
+                                              by which libraries are loaded
+  honeysql cached format   4573ms -> 2864ms  (JVM 555ms)
+  ```
+
+  Hash routing is copied from the existing fallbacks, so hash values do not
+  change, and equality answers are identical to the JVM's including nested
+  collections, map entries, sorted maps and sets, and maps keyed by
+  collections. The hoist is deliberately narrow — jolt's own vector, map and
+  set only, never `jolt-map?` (whose arms let host types masquerade as maps)
+  and never records, which still route through the walk. All three join the
+  fast-path probe sets, so the registry now refuses an arm that would claim
+  them rather than registering it and silently never consulting it, which is
+  what makes answering ahead of the walk safe.
+
+### Internal
+
+- **The read and print scaling gates measure what they claim to.** Both judge a
+  ratio — quadruple the input, and the cost must not quadruple per element —
+  and both were deciding it from measurements too imprecise to support it,
+  which is how printscaling failed twice on trees with no local changes at all.
+  The timer was `currentTimeMillis` against a 1x arm that renders in 2.3ms, so
+  whole-millisecond quantization consumed a fifth of the headroom to the
+  ceiling as a systematic bias, not noise. The read gate additionally took a
+  single sample per arm and straddled a step in per-form cost at 16000 forms,
+  so its window measured the step rather than the reader. Both now use
+  `nanoTime` and best-of several runs, the read gate sits on the flat side of
+  the step at 2000 -> 8000, and a failing ratio is re-measured up to three
+  times before the gate fails. None of it costs detection power: against a
+  deliberately quadratic record render the ratios stay at 15.7-16.3 over a
+  ceiling of 8.0 on every attempt, and an unambiguous read regression at or
+  above 12 skips the retries entirely. The gates cost what they cost before
+  (read 0.41s, print 0.44s), which matters because CI runs the suite in
+  parallel and a gate that holds a core longer fails the timing gates beside
+  it.
+
 ## [0.7.15] - 2026-08-18
 
 An interop-dispatch release. The theme: a `.method` call on a string —
@@ -5096,6 +5316,7 @@ Clojure-compatible standard library.
   install script.
 
 [Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.15...HEAD
+[0.7.16]: https://github.com/jolt-lang/jolt/compare/v0.7.15...v0.7.16
 [0.7.15]: https://github.com/jolt-lang/jolt/compare/v0.7.14...v0.7.15
 [0.7.6]: https://github.com/jolt-lang/jolt/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/jolt-lang/jolt/compare/v0.7.4...v0.7.5
