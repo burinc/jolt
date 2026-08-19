@@ -71,6 +71,30 @@
 (ok "jolt=2 identical procedures" (jolt=2 car car))
 (ok "jolt=2 distinct procedures" (not (jolt=2 car cdr)))
 
+;; --- record/deftype hasheq rides an instance field (the JVM's __hasheq slot) --
+;; a registered (defrecord) tag caches its STRUCTURAL hash in the slot
+(define vt-hr-desc (make-jrdesc "user.VtHashRec" (list (keyword #f "a") (keyword #f "b"))))
+(jolt-with-mutex rec-tbl-mu (hashtable-set! chez-record-type-tbl "user.VtHashRec" #t))
+(define vt-hr (make-jrec2 vt-hr-desc jolt-nil 0 1 2))
+(ok "record hasheq slot starts unset" (eqv? 0 (jrec-hasheq vt-hr)))
+(define vt-hr-h (jolt-hash vt-hr))
+(ok "record hash fills the slot" (eqv? vt-hr-h (jrec-hasheq vt-hr)))
+(ok "slot answers the repeat hash" (eqv? vt-hr-h (jolt-hash vt-hr)))
+(ok "content-equal record hashes equal (cache-invisible)"
+    (eqv? vt-hr-h (jolt-hash (make-jrec2 vt-hr-desc jolt-nil 0 1 2))))
+(ok "jolt-hasheq agrees with jolt-hash on a record" (eqv? vt-hr-h (jolt-hasheq vt-hr)))
+;; an unregistered tag (plain deftype) caches its IDENTITY hash in the same slot
+(define vt-dt-desc (make-jrdesc "user.VtHashDt" (list (keyword #f "a"))))
+(define vt-dt1 (make-jrec1 vt-dt-desc jolt-nil 0 7))
+(define vt-dt2 (make-jrec1 vt-dt-desc jolt-nil 0 7))
+(define vt-dt1-h (jolt-hash vt-dt1))
+(ok "deftype hash cached in the slot" (eqv? vt-dt1-h (jrec-hasheq vt-dt1)))
+(ok "deftype hash is identity: equal fields still differ"
+    (not (eqv? vt-dt1-h (jolt-hash vt-dt2))))
+(ok "deftype hash stable across calls" (eqv? vt-dt1-h (jolt-hash vt-dt1)))
+(ok "deftype hash is 32-bit"
+    (and (fixnum? vt-dt1-h) (fx<=? -2147483648 vt-dt1-h 2147483647)))
+
 ;; pvec cached hasheq: the leaf-run compute must equal the seq walk (vectors
 ;; and lists hash EQUAL as ordered colls), repeat, and survive the cache; the
 ;; equality fast-reject must never change an answer.

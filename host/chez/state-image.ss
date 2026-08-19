@@ -34,8 +34,8 @@
 ;;
 ;; This build still READS versions 2 and 3: everything they can contain
 ;; (including raw jolt-ref-v1 records) restores here via the legacy arms.
-(define jolt-image-format-version 4)
-(define jolt-image-read-versions '(2 3 4))
+(define jolt-image-format-version 5)
+(define jolt-image-read-versions '(2 3 4 5))
 
 ;; --- classification -----------------------------------------------------------
 ;; An eq hashtable is the ONE hashtable kind Chez can fasl; eqv/equal/string-hash
@@ -337,6 +337,19 @@
   (and (record? x)
        (record-rtd x)
        (eq? (record-type-uid (record-rtd x)) 'jolt-ref-v1)))
+;; A jrec from an image written before the hasheq slot (format <= 4): the
+;; family's nongenerative tags bumped, so the fasl materializes the OLD rtds and
+;; the instances answer #f to the current jrec?. Detected by uid prefix — every
+;; family generation is chez-jrec… (chez-jrdesc… differs at the 8th char, and
+;; the descriptor type is unchanged anyway) — and rebuilt into the current
+;; family from its own rtd's accessors, hasheq starting unset.
+(define (image-legacy-jrec? x)
+  (and (record? x) (not (jrec? x))
+       (let ((uid (record-type-uid (record-rtd x))))
+         (and (symbol? uid)
+              (let ((n (symbol->string uid)))
+                (and (fx>=? (string-length n) 9)
+                     (string=? (substring n 0 9) "chez-jrec")))))))
 (define (legacy-ref-val x)
   ((record-accessor (record-rtd x) 0) x))
 
@@ -703,6 +716,8 @@
                       (walk-ref-restore (image-ref-val x) x path))
                      ((and (eq? mode 'restore) (image-legacy-ref? x))
                       (walk-ref-restore (legacy-ref-val x) x path))
+                     ((and (eq? mode 'restore) (image-legacy-jrec? x))
+                      (walk-legacy-jrec x path))
                      ;; a stub with a matching resolver becomes the live value it
                      ;; stands for; without one it stays the inert record — the
                      ;; per-restore table (populated by restore-world!) lists it
@@ -1122,6 +1137,32 @@
              ;; refs, image records, everything not special-cased above. The
              ;; rebuild applies record-constructor to the SAME list, which is why
              ;; the parent's fields have to be in it and in front.
+             ;; a pre-slot jrec (image-legacy-jrec?, format <= 4) rebuilds into
+             ;; the CURRENT family: fields read via its own rtd's accessors come
+             ;; back (desc ext fields...) root-first, the descriptor type is
+             ;; unchanged, and the ctor protocols start hasheq unset. The spill
+             ;; type is told apart by its rtd name — field counts collide with a
+             ;; one-field child.
+             (walk-legacy-jrec
+              (lambda (x path)
+                (or (hashtable-ref memo x #f)
+                    (let* ((fs (image-record-fields (record-rtd x)))
+                           (n (vector-length fs))
+                           (vals (let loop ((i 0) (acc '()))
+                                   (if (fx=? i n) (reverse acc)
+                                       (let ((f (vector-ref fs i)))
+                                         (loop (fx+ i 1)
+                                               (cons (walk (image-record-field-ref f x)
+                                                           (cons (symbol->string (car f)) path))
+                                                     acc)))))))
+                      (let* ((desc (car vals)) (ext (cadr vals)) (fvals (cddr vals))
+                             (nx (if (eq? (record-type-name (record-rtd x)) 'jrec*)
+                                     (make-jrec desc (car fvals) ext)
+                                     (apply (vector-ref jrec-ctor-vec (length fvals))
+                                            desc ext 0 fvals))))
+                        (hashtable-set! memo x nx)
+                        (image-meta-copy! x nx)
+                        nx)))))
              (walk-record
               (lambda (x path)
                 (let* ((rtd (record-rtd x))
@@ -1142,6 +1183,10 @@
                                   (if dirty
                                       (let ((nx (apply (record-constructor rtd)
                                                        (vector->list vals))))
+                                        ;; rtd's raw ctor copies every slot, the
+                                        ;; hasheq cache included — start the copy
+                                        ;; unset whatever the pass order was
+                                        (when (jrec? nx) (jrec-hasheq-set! nx 0))
                                         (hashtable-set! memo x nx)
                                         (image-meta-copy! x nx)
                                         nx)
@@ -1294,7 +1339,7 @@
   (unless (member (vector-ref h 1) jolt-image-read-versions)
     (jolt-throw (jolt-ex-info
                   (string-append "image: " path " has format version "
-                                 (jolt-str-one (vector-ref h 1)) ", this build reads versions 2, 3 and 4")
+                                 (jolt-str-one (vector-ref h 1)) ", this build reads versions 2 to 5")
                   jolt-nil)))
   ;; The fasl version moves with Chez, and a mismatch otherwise surfaces as an
   ;; opaque fasl-read error, so name it here instead.
@@ -1347,7 +1392,12 @@
                     ;; The JVM marks these fields transient for serialization.
                     (cond ((pvec? x) (pvec-hasheq-set! x 0))
                           ((pmap? x) (pmap-hasheq-set! x 0))
-                          ((pset? x) (pset-hasheq-set! x 0)))
+                          ((pset? x) (pset-hasheq-set! x 0))
+                          ;; a jrec's slot may hold an identity hash (plain
+                          ;; deftype) — per-process by construction — and even a
+                          ;; record's structural hash can embed one through a fn
+                          ;; or deftype field. Same rule as the collections.
+                          ((jrec? x) (jrec-hasheq-set! x 0)))
                     (unless (var-cell? x)
                       (let ((m (call/cc (lambda (k)
                                  (with-exception-handler (lambda (e) (k jolt-nil))

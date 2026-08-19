@@ -1763,7 +1763,7 @@
          (order-args (fn [as]
                        (let [n (count as)]
                          (if (<= n 8)
-                           (str "(make-jrec" n " " cached-desc " jolt-nil"
+                           (str "(make-jrec" n " " cached-desc " jolt-nil 0"
                                 (when (pos? n) (str " " (str/join " " as))) ")")
                            (str "(let ((v (vector " (str/join " " as) "))) (make-jrec " cached-desc " v jolt-nil))"))))))
       ;; a late-bound :var call head can hold a procedure OR a non-applicable

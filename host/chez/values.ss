@@ -424,12 +424,17 @@
 ;; Built on demand, not at load: interning a keyword needs hasheq.ss, which
 ;; rt.ss loads after this file. Every arm registers later still.
 (define (hash-fast-probes)
-  (list jolt-nil (keyword #f "k") (jolt-symbol #f "s") 0 "s"
-        ;; as in eq-fast-probes: every type jolt-hash / jolt-hasheq answers
-        ;; ahead of the walk, sets included. Procedures hash by identity
-        ;; (procedure-hasheq, hasheq.ss) ahead of the walk too.
-        (jolt-vector 1) (jolt-hash-map (keyword #f "k") 1) (jolt-hash-set 1)
-        car))
+  (append
+   (list jolt-nil (keyword #f "k") (jolt-symbol #f "s") 0 "s"
+         ;; as in eq-fast-probes: every type jolt-hash / jolt-hasheq answers
+         ;; ahead of the walk, sets included. Procedures hash by identity
+         ;; (procedure-hasheq, hasheq.ss) ahead of the walk too.
+         (jolt-vector 1) (jolt-hash-map (keyword #f "k") 1) (jolt-hash-set 1)
+         car)
+   ;; a jrec answers via its hasheq slot ahead of the walk. records.ss loads
+   ;; after several arm registrants, and a probe that cannot be built is one
+   ;; those registrations are not checked against (probe-if-available).
+   (probe-if-available (lambda () jrec-fast-type-probe))))
 (define (hash-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who pred (hash-fast-probes) "the jolt-hash fast path"))
 (define jolt-hash-arms '())
@@ -466,6 +471,9 @@
         ((pvec? x) (pvec-hasheq-cached x))
         ((pmap? x) (jolt-coll-hash x))
         ((pset? x) (jolt-coll-hash x))
+        ;; jrec: hasheq slot read, slow-path dispatch on 0 (records-coll.ss,
+        ;; loads later — runtime forward ref like the collection clauses).
+        ((jrec? x) (jrec-hasheq-fast x))
         (else (let loop ((as jolt-hash-arms))
                 (cond ((null? as) (jolt-hash-base x))
                       (((caar as) x) ((cdar as) x))
