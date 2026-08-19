@@ -97,6 +97,19 @@
       (jolt-hasheq a) (jolt-hasheq b)
       (jolt=2 a b)))
 
+;; seq hasheq: cached per head object (ASeq._hasheq), values pinned to the
+;; ordered-coll hash — a seq, a list and a vector of the same elements all
+;; hash equal, repeats are stable, and a suffix hashes as its own chain.
+(ok "seq hash equals vector hash of same elements"
+    (let ((l (jolt-list 1 "two" (keyword #f "three"))))
+      (= (jolt-hasheq l) (jolt-hasheq (jolt-vector 1 "two" (keyword #f "three"))))))
+(ok "seq hash stable on repeat"
+    (let ((l (jolt-list 1 2 3 4 5)))
+      (= (jolt-hasheq l) (jolt-hasheq l))))
+(ok "seq suffix hashes as its own chain"
+    (let ((l (jolt-list 1 2 3)))
+      (= (jolt-hasheq (seq-more l)) (jolt-hasheq (jolt-list 2 3)))))
+
 (ok "intern cell agrees across threads"
     (let* ((s (string-append "ivt-" "five"))
            (mine (intern-symbol-cell s))
