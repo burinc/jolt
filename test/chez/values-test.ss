@@ -71,6 +71,32 @@
 (ok "jolt=2 identical procedures" (jolt=2 car car))
 (ok "jolt=2 distinct procedures" (not (jolt=2 car cdr)))
 
+;; pvec cached hasheq: the leaf-run compute must equal the seq walk (vectors
+;; and lists hash EQUAL as ordered colls), repeat, and survive the cache; the
+;; equality fast-reject must never change an answer.
+(ok "pvec hash equals list hash of same elements"
+    (= (jolt-hasheq (jolt-vector 1 "two" (keyword #f "three")))
+       (hash-ordered (jolt-seq (jolt-list 1 "two" (keyword #f "three"))))))
+(ok "pvec hash stable on repeat"
+    (let ((v (jolt-vector 1 2 3 4 5)))
+      (= (jolt-hasheq v) (jolt-hasheq v))))
+(ok "equal vecs stay equal after both are hashed"
+    (let ((a (jolt-vector 1 2 3)) (b (jolt-vector 1 2 3)))
+      (jolt-hasheq a) (jolt-hasheq b)
+      (jolt=2 a b)))
+(ok "unequal vecs stay unequal after both are hashed (reject path)"
+    (let ((a (jolt-vector 1 2 3)) (b (jolt-vector 1 2 4)))
+      (jolt-hasheq a) (jolt-hasheq b)
+      (not (jolt=2 a b))))
+(ok "unequal vecs stay unequal when only one is hashed"
+    (let ((a (jolt-vector 1 2 3)) (b (jolt-vector 1 2 4)))
+      (jolt-hasheq a)
+      (not (jolt=2 a b))))
+(ok "equal maps stay equal after both are hashed"
+    (let ((a (jolt-hash-map (keyword #f "k") 1)) (b (jolt-hash-map (keyword #f "k") 1)))
+      (jolt-hasheq a) (jolt-hasheq b)
+      (jolt=2 a b)))
+
 (ok "intern cell agrees across threads"
     (let* ((s (string-append "ivt-" "five"))
            (mine (intern-symbol-cell s))

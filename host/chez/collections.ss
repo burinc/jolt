@@ -1486,12 +1486,24 @@
 ;; equality / hash hooks called from values.ss (jolt=2 / jolt-hash)
 ;; ============================================================================
 (define (jolt-coll? x) (or (pvec? x) (pmap? x) (pset? x)))
+;; SPIKE: hash fast-REJECT. Two colls whose CACHED hasheqs differ cannot be =
+;; (hasheq is =-consistent, pinned by the hasheq gate), so answer #f without
+;; walking. Only ever consults hashes both sides already paid for — an unset
+;; side (0) skips straight to the structural walk, so nothing ever computes a
+;; hash just to compare. Equal hashes prove nothing and fall through.
+(define (hasheq-rejects? ha hb)
+  (and (fixnum? ha) (fixnum? hb)
+       (not (fx=? ha 0)) (not (fx=? hb 0))
+       (not (fx=? ha hb))))
+
 (define (jolt-coll=? a b)
   (cond
     ((and (pvec? a) (pvec? b))
      ;; leaf-run lockstep: a's and b's leaves needn't align (RRB tries have
      ;; partial leaves), so each stride is the min of both remaining runs.
      ;; Classic vectors take full-32 strides exactly as before.
+     (if (hasheq-rejects? (pvec-hasheq a) (pvec-hasheq b))
+         #f
      (let ((na (pvec-count a)))
        (and (fx=? na (pvec-count b))
             (let loop ((i 0))
@@ -1506,17 +1518,22 @@
                             ;; jolt=2, not the variadic jolt=: the latter conses a
                             ;; rest list on EVERY element compare.
                             (and (jolt=2 (vector-ref ca (fx+ oa j)) (vector-ref cb (fx+ ob j)))
-                                 (cloop (fx+ j 1))))))))))))
+                                 (cloop (fx+ j 1)))))))))))))
     ((and (pmap? a) (pmap? b))
-     (and (fx=? (pmap-cnt a) (pmap-cnt b))
-          (pmap-fold a (lambda (k v ok) (and ok (jolt=2 (pmap-get b k pmap-absent) v))) #t)))
+     (if (hasheq-rejects? (pmap-hasheq a) (pmap-hasheq b))
+         #f
+         (and (fx=? (pmap-cnt a) (pmap-cnt b))
+              (pmap-fold a (lambda (k v ok) (and ok (jolt=2 (pmap-get b k pmap-absent) v))) #t))))
     ((and (pset? a) (pset? b))
-     (and (fx=? (pset-count a) (pset-count b))
-          (pset-fold a (lambda (e ok) (and ok (pset-contains? b e))) #t)))
+     (if (hasheq-rejects? (pset-hasheq a) (pset-hasheq b))
+         #f
+         (and (fx=? (pset-count a) (pset-count b))
+              (pset-fold a (lambda (e ok) (and ok (pset-contains? b e))) #t))))
     (else #f)))
 (define (jolt-coll-hash x)
   (cond
-    ((pvec? x) (hash-ordered (jolt-seq x)))
+    ;; cached + leaf-run (hasheq.ss, runtime forward ref like hash-ordered)
+    ((pvec? x) (pvec-hasheq-cached x))
     ;; maps hash as hashUnordered of entries; each entry contributes hash-ordered of [k v]
     ;; (APersistentMap.mapHasheq = Murmur3.hashUnordered, MapEntry.hasheq = ordered [k v])
     ((pmap? x)

@@ -608,6 +608,32 @@
             (hashtable-set! proc-hasheq-tbl p h)
             h)))))
 
+;; pvec hasheq, cached in the field the record has carried since chez-pvec-v3
+;; (mk-pvec inits it 0 = unset; pvec-with-ent already forwards it) but nothing
+;; ever FILLED: every (hash v) re-walked the vector through a freshly allocated
+;; seq. Fill it the way pmap/pset do — lazily, on first hash — and compute by
+;; leaf runs (pv-leaf-for) with no seq cells, the same stride jolt-coll=? walks.
+;; The 0-means-unset convention shares pmap's one-in-2^32 flaw: a content whose
+;; hash IS 0 recomputes per call, harmlessly.
+(define (pvec-hasheq-cached p)
+  (let ((c (pvec-hasheq p)))
+    (if (and (fixnum? c) (not (fx=? c 0)))
+        c
+        (let ((n (pvec-count p)))
+          (let loop ((i 0) (h 1))
+            (if (fx=? i n)
+                (let ((r (mix-coll-hash h n)))
+                  (pvec-hasheq-set! p r)
+                  r)
+                (let-values (((leaf off) (pv-leaf-for p i)))
+                  (let ((run (fxmin (fx- (vector-length leaf) off) (fx- n i))))
+                    (let cloop ((j 0) (h h))
+                      (if (fx>=? j run)
+                          (loop (fx+ i run) h)
+                          (cloop (fx+ j 1)
+                                 (i32 (#3%fx+ (#3%fx* 31 h)
+                                              (jolt-hasheq (vector-ref leaf (fx+ off j))))))))))))))))
+
 (define (jolt-hasheq x)
   ;; Fast path for the most common types (matching Util.hasheq order).
   (cond
@@ -632,6 +658,8 @@
     ;; __register-eq!/__register-hash! arm predicates are Clojure fns called
     ;; through jolt-invoke, made (hash {:a 1 :b 2}) 8.4x slower purely from this.
     ;; Routing is copied from jolt-hasheq-fallback, so hash VALUES are unchanged.
+    ;; pvec before the generic sequential walk: cached field + leaf-run compute.
+    ((pvec? x) (pvec-hasheq-cached x))
     ((jolt-sequential? x) (hash-ordered (jolt-seq x)))
     ((pmap? x) (jolt-hasheq-fallback x))
     ((pset? x) (jolt-hasheq-fallback x))

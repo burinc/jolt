@@ -1241,6 +1241,20 @@
 (define (image-collect-meta v)
   (let ((acc '()))
     (image-walk v (lambda (x path)
+                    ;; Same write-side walk, second job: drop cached hasheqs so
+                    ;; no cache lands in the fasl. A content-derived hash would
+                    ;; be stable across processes, but a collection holding a
+                    ;; VAR-REFERENCED fn travels raw (only anon closures are
+                    ;; rebuilt into fnsrc records), and procedure hasheq is
+                    ;; per-process identity (hasheq.ss) — a restored coll would
+                    ;; carry a hash its own contents no longer produce,
+                    ;; corrupting the = fast-reject and any post-restore keying.
+                    ;; Zeroing the LIVE object (v* shares untouched subgraphs)
+                    ;; is harmless: it is a cache, and the next hash refills it.
+                    ;; The JVM marks these fields transient for serialization.
+                    (cond ((pvec? x) (pvec-hasheq-set! x 0))
+                          ((pmap? x) (pmap-hasheq-set! x 0))
+                          ((pset? x) (pset-hasheq-set! x 0)))
                     (unless (var-cell? x)
                       (let ((m (call/cc (lambda (k)
                                  (with-exception-handler (lambda (e) (k jolt-nil))

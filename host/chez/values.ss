@@ -460,7 +460,10 @@
         ;; exactly — a pvec is jolt-sequential?, and seq-hash and jolt-coll-hash's
         ;; pvec arm are both (hash-ordered (jolt-seq x)) — so hash VALUES are
         ;; unchanged and the HAMT keeps working.
-        ((pvec? x) (seq-hash x))
+        ;; pvec-hasheq-cached (hasheq.ss, loads later — runtime forward ref like
+        ;; seq-hash below): cached-field read, leaf-run compute on a miss. Same
+        ;; hash VALUES as the seq walk, so the HAMT keeps working.
+        ((pvec? x) (pvec-hasheq-cached x))
         ((pmap? x) (jolt-coll-hash x))
         ((pset? x) (jolt-coll-hash x))
         (else (let loop ((as jolt-hash-arms))
