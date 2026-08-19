@@ -544,10 +544,19 @@
 ;; A :const only ever holds a scalar (emit-const rejects anything else), so this
 ;; never sweeps up a symbol — which hoist-const deliberately refuses, since symbols
 ;; carry metadata and sharing one across sites would let meta leak between them.
+;;
+;; A :quote node qualifies too: its :form is raw reader data, fully determined at
+;; emit time, so a literal HOLDING one (#{:for 'for}, [:a 'b]) is as constant as
+;; one holding only scalars. The hoist these arms use is PER-SITE
+;; (hoist-const-per-site), so accepting quoted symbols cannot leak meta across
+;; sites — each site keeps its own object, which is the reference compiler's
+;; behavior (a quoted form is a ConstantExpr in the class constant pool; one site
+;; evaluated twice yields the identical object).
 (defn- const-coll-node? [n]
   (and (map? n)
        (case (:op n)
          :const true
+         :quote true
          :vector (every? const-coll-node? (:items n))
          :set (every? const-coll-node? (:items n))
          :map (every? const-coll-node? (apply concat (:pairs n)))
@@ -1991,7 +2000,17 @@
      :map (let [s (emit-ordered "jolt-hash-map"
                                 (mapcat (fn [p] [(nth p 0) (nth p 1)]) (:pairs node)))]
             (if (const-coll-node? node) (hoist-const-per-site s) s))
-    :quote (emit-quoted (:form node))
+    ;; A quoted scalar (form-char?/form-literal?) emits as an immediate constant
+    ;; via emit-const — nothing to hoist. Every other quoted form (symbol, list,
+    ;; vector, map, set, regex/inst/uuid/tagged) is a CONSTRUCTION rebuilt per
+    ;; evaluation, so hoist it to a per-site constant: built once per def, one
+    ;; object across calls of the same site, distinct objects across sites —
+    ;; the reference compiler's ConstantExpr behavior for quoted data.
+    :quote (let [f (:form node)
+                 s (emit-quoted f)]
+             (if (or (form-char? f) (form-literal? f))
+               s
+               (hoist-const-per-site s)))
     ;; the thrown value is an operand (emitted non-tail); the throw itself goes
     ;; through emit-call with marks?=#f, so a TAIL throw gets the site-vreg pair
     ;; (sited-tail-call — stored after the operand is bound, so the operand's own
