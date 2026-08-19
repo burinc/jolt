@@ -142,6 +142,55 @@
 (is "scan of a natural sorted map is empty"
     "(count (jolt.host/image-scan (sorted-map :b 2 :a 1)))"
     "0")
+
+;; A collection HASHED before the dump must not carry that cache into the
+;; image: procedure hasheq is identity-based and per-process (hasheq.ss), so a
+;; restored fn hashes differently than the one the cache was computed over. A
+;; stale cached hash made the restored vector compare UNEQUAL to an equal
+;; vector rebuilt around the restored fn (the = fast-reject trusts cached
+;; hashes), and their hashes disagreed. The dump walk zeroes hasheq caches, so
+;; the restored side recomputes from what it actually holds.
+(begin
+  (cleanup!)
+  (is "hashed fn-carrying vector: restored = rebuilt, hashes agree"
+      (string-append
+        "(let [f (fn [x] (+ x 1)) v [f :a]]"
+        " (hash v)"
+        " (jolt.host/image-write! \"" tmp "\" v)"
+        " (let [v2 (jolt.host/image-read \"" tmp "\")"
+        "       fresh [(nth v2 0) :a]]"
+        "   (vector (= v2 fresh) (= (hash v2) (hash fresh)))))")
+      "[true true]")
+  (cleanup!)
+  (is "hashed fn-carrying set: restored membership via rebuilt element"
+      (string-append
+        "(let [f (fn [x] x) s (hash-set [f :k])]"
+        " (hash s)"
+        " (jolt.host/image-write! \"" tmp "\" s)"
+        " (let [s2 (jolt.host/image-read \"" tmp "\")"
+        "       f2 (first (first s2))]"
+        "   (vector (= (hash s2) (hash (hash-set [f2 :k]))) (= s2 (hash-set [f2 :k])))))")
+      "[true true]"))
+
+;; The zeroing mechanism itself, pinned at the Scheme level: the write walk
+;; must drop a pre-armed hasheq cache from every collection it visits. The
+;; in-process fixtures above cannot show the cross-process staleness (a
+;; var-referenced fn restores to the SAME live object here), so pin the guard
+;; directly: after image-write!, the graph's collections carry no cache.
+(begin
+  (cleanup!)
+  (ok "write walk zeroes armed hasheq caches (vec/map/set)"
+      (let* ((v (jolt-vector 1 2 3))
+             (m (jolt-hash-map (keyword #f "a") v))
+             (s (jolt-hash-set v)))
+        (jolt-hasheq v) (jolt-hasheq m) (jolt-hasheq s)
+        (and (not (fx=? 0 (pvec-hasheq v)))     ; armed before
+             (begin
+               ((var-deref "jolt.host" "image-write!") tmp (jolt-vector v m s))
+               (and (fx=? 0 (pvec-hasheq v))
+                    (fx=? 0 (pmap-hasheq m))
+                    (fx=? 0 (pset-hasheq s)))))))
+  (cleanup!))
 ;; (partial compare) would be compare ITSELF (partial's 1-arg arity), a named
 ;; fn — (comp - compare) is a real core-tier closure with no registration
 (is "scan of a sorted-map-by with an unregistered closure reports one finding at the comparator"
