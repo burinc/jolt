@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Lexically scoped `jolt.ffi` allocation helpers:** `with-alloc`, `with-out`,
+  `with-layout`, `with-c-string`, and `with-c-string-array` release helper-owned
+  native allocations exactly once on normal return or exception. Partially
+  constructed C string arrays are cleaned up safely. Pointers created by these
+  helpers are valid only within the lexical body and must not escape it.
+
 - **Declarative `jolt.ffi` struct layouts:** `(ffi/layout [:struct ...])`
   compiles a literal, data-only descriptor into immutable ABI metadata derived
   by Chez. `layout-size`, `layout-alignment`, and `field-offset` expose the

@@ -497,6 +497,7 @@ ffi:
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-layout-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-aggregate-test.sh "$(CHEZ)"
+	@bin/jolt run test/chez/jolt-ffi-scoped-test.clj
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
