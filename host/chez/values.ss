@@ -131,13 +131,57 @@
 (define (symstr-str c) (car c))
 (define (symstr-mhash c) (cdr c))                   ; murmur3-hash-unencoded-chars
 (define (symstr-mhash-set! c h) (set-cdr! c h))
-(define (intern-symbol-cell s)
+;; Identity front cache over the pool probe. The pool is keyed by CONTENT
+;; (string-hash + string=? per probe), but the hot caller hands over the SAME
+;; string object every time: (symbol (name k)) — honeysql's format-dsl does it
+;; 92 times per format call — reads the keyword's stored name string, and
+;; keywords are interned, so that object is immortal and repeats forever. An
+;; eq table turns those probes into a pointer lookup.
+;;
+;; PER-THREAD (a thread parameter), because a Chez hashtable does not survive
+;; concurrent writers; each thread's cache converges on the same cells since
+;; the pool underneath is the single source of truth — the values-test
+;; cross-thread row pins that.
+;;
+;; BOUNDED and STRONG, cleared on overflow — deliberately NOT a weak table. A
+;; weak entry per one-shot string is scanned by every collection, and a
+;; fresh-name workload builds exactly that: the thread-safety gate's 16x40k
+;; unique names put ~640k weak entries across the per-thread tables and the
+;; GC ground to a halt (measured: the 120s gate at 59 CPU-minutes and
+;; climbing). A strong table capped at 2048 entries pins at most 2048 short
+;; strings per thread, and clear-on-overflow makes churn amortized O(1) with
+;; nothing for the collector to scan. The hot population (keyword-name
+;; objects, ~100 per workload) never reaches the cap.
+;;
+;; The per-thread slot is a VIRTUAL REGISTER, not a thread parameter: a forked
+;; thread INHERITS a thread parameter's value, so workers would share the
+;; creating thread's table object and corrupt it (vector-ref crash in the
+;; thread-safety gate, section 9); a fresh thread starts every vreg at fixnum
+;; 0, so each thread builds its own table — the same reason the hasheq caches
+;; live in a vreg (hasheq.ss slot 5). Slot 8 is registered in rt.ss's slot
+;; table.
+(define symcell-front-cap 2048)
+(define jolt-vreg-symcell-cache 8)
+(define (intern-symbol-cell-slow s)
   (or (hashtable-ref symbol-string-pool s #f)
       (jolt-with-mutex symbol-string-pool-mu
         (or (hashtable-ref symbol-string-pool s #f)
             (let ((c (make-symstr s)))
               (hashtable-set! symbol-string-pool s c)
               c)))))
+(define (intern-symbol-cell s)
+  (let ((cache (let ((c (virtual-register jolt-vreg-symcell-cache)))
+                 (if (eq? c 0)
+                     (let ((t (make-eq-hashtable symcell-front-cap)))
+                       (set-virtual-register! jolt-vreg-symcell-cache t)
+                       t)
+                     c))))
+    (or (hashtable-ref cache s #f)
+        (let ((c (intern-symbol-cell-slow s)))
+          (when (fx>=? (hashtable-size cache) symcell-front-cap)
+            (hashtable-clear! cache))
+          (hashtable-set! cache s c)
+          c))))
 (define (intern-symbol-string s)
   (if (string? s) (symstr-str (intern-symbol-cell s)) s))
 ;; khash caches this symbol's hasheq, the way keyword-t-khash does for keywords,

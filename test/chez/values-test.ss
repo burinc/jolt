@@ -37,6 +37,40 @@
 (ok "sym diff name"     (not (jolt= (jolt-symbol #f "x") (jolt-symbol #f "y"))))
 (ok "sym?"              (jolt-symbol? (jolt-symbol "ns" "n")))
 
+;; intern-symbol-cell: one cell per name CONTENT, however the string arrives.
+;; The identity front cache must stay invisible: the same string object twice,
+;; two distinct-but-equal string objects, and a cross-thread build all hand back
+;; the same pool cell, so eq?-based symbol equality and the ncell hash memo hold.
+(ok "intern cell stable for same string object"
+    (let ((s (string-append "ivt-" "one")))
+      (eq? (intern-symbol-cell s) (intern-symbol-cell s))))
+(ok "intern cell shared across equal string objects"
+    (eq? (intern-symbol-cell (string-append "ivt-" "two"))
+         (intern-symbol-cell (string-append "ivt-" "two"))))
+(ok "syms from distinct equal strings share the ncell"
+    (eq? (symbol-t-ncell (jolt-symbol #f (string-append "ivt-" "three")))
+         (symbol-t-ncell (jolt-symbol #f (string-append "ivt-" "three")))))
+(ok "syms from distinct equal strings are jolt="
+    (jolt= (jolt-symbol #f (string-append "ivt-" "four"))
+           (jolt-symbol #f (string-append "ivt-" "four"))))
+(ok "intern cell agrees across threads"
+    (let* ((s (string-append "ivt-" "five"))
+           (mine (intern-symbol-cell s))
+           (theirs #f)
+           (done (make-mutex))
+           (cv (make-condition)))
+      (mutex-acquire done)
+      (fork-thread (lambda ()
+                     (let ((c (intern-symbol-cell (string-append "ivt-" "five"))))
+                       (mutex-acquire done)
+                       (set! theirs c)
+                       (condition-signal cv)
+                       (mutex-release done))))
+      (let loop ()
+        (unless theirs (condition-wait cv done) (loop)))
+      (mutex-release done)
+      (eq? mine theirs)))
+
 ;; numbers: exactness-aware = (Clojure semantics)
 (ok "1 = 1"             (jolt= 1 1))
 (ok "1 not= 1.0"        (not (jolt= 1 1.0)))

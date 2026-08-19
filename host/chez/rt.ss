@@ -327,6 +327,8 @@
 ;;   scheduler refuses to preempt a fiber while it is non-zero
 ;; slot 6: fibers.ss jolt-vreg-fiber-winder-base — the winder chain this carrier
 ;;   dispatched the running fiber with, so the park's finally walk knows where to stop
+;; slot 8: values.ss jolt-vreg-symcell-cache — this thread's bounded identity
+;;   front cache over the symbol-string pool (intern-symbol-cell)
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
 ;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic

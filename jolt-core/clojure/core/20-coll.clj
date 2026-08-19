@@ -475,7 +475,11 @@
 (defn seqable? [x]
   (if (or (nil? x) (coll? x) (string? x) (jolt.host/array-value? x)) true false))
 
-(defn boolean? [x] (or (true? x) (false? x)))
+;; direct identity checks, not (or (true? x) (false? x)): the seed compiles with
+;; var-cache off, so those were two per-call name-resolved var calls each doing a
+;; mixed-type = through the arm walk — boolean? on a keyword measured 801ns
+;; against the JVM's 8. identical? lowers to eq?.
+(defn boolean? [x] (or (identical? true x) (identical? false x)))
 (defn double? [x] (and (number? x) (not (integer? x))))
 (defn float? [x] (double? x))
 (defn infinite? [x] (and (number? x) (or (= x ##Inf) (= x ##-Inf))))
