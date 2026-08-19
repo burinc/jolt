@@ -496,14 +496,18 @@
    :paths ["src" "test"]
    :deps ["~time/src"]
    ;; lasertag classifies a value by its class, so every failure here is jolt's class
-   ;; model rather than a behavioral difference: the narrow numeric classes collapse
-   ;; to Long/Double (:integer-box-model) and the specialized seq classes to
-   ;; PersistentList/LazySeq (:seq-type-model), recorded in known-divergences.edn.
+   ;; model rather than a behavioral difference, all recorded in
+   ;; known-divergences.edn. The 9 that remain: six narrow numeric classes collapsing
+   ;; to Long/Double (:integer-box-model), one seq class still collapsing to LazySeq
+   ;; where the JVM says Repeat (:seq-type-model), and two the suite's :bb branches
+   ;; asserting babashka's host model (sci.impl.fns classnames, a :lambda-free tag
+   ;; set), where jolt answers with the real defining class.
    ;; (subvec answers the real SubVector class since #629, which is the 44 -> 46.)
-   ;; Two rows are the suite's :bb branches asserting babashka's host model
-   ;; (sci.impl.fns classnames, a :lambda-free tag set); jolt answers with the
-   ;; real defining class.
-   :expect {:tests 58 :pass 46 :fail 12 :error 0}}
+   ;; 46 -> 49 is the seq classes: #648 gave a seq the class its producer gives it
+   ;; and #659 picked the range flavor from the argument types. The row had not been
+   ;; re-recorded since before #648, so part of that 3 was slack this gate had been
+   ;; carrying — a regression in those rows would have read as "ok".
+   :expect {:tests 58 :pass 49 :fail 9 :error 0}}
 
   {:name "tools.logging"
    :paths ["src/main/clojure" "src/test/clojure"]

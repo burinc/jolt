@@ -14,7 +14,7 @@
    :impl-detail
    "representation detail: syntax-quote yields a list? (JVM yields a Cons)",
   :seq-type-model
-  "jolt models every seq as PersistentList (eager) or LazySeq (deferred); JVM reifies a specialized class per producer (Cons/Iterate/LongRange/Repeat/Cycle/ChunkedSeq/StringSeq/KeySeq/RSeq/ArraySeq/SubVector). Values and laziness are correct, only (class …) differs. jolt-aei7",
+  "jolt reifies the JVM's specialized seq class for nearly every producer now (Cons/Iterate/LongRange/Range/Repeat/ChunkedSeq/StringSeq/KeySeq/RSeq/ArraySeq/SubVector). What still collapses to LazySeq is repeat (JVM: Repeat), cycle (Cycle) and drop over a vector (ChunkedSeq) — see the three :entries rows below. Values and laziness are correct, only (class …) differs. jolt-aei7",
   :chunking-model
   "jolt now chunks range/vector seqs through map/filter like the JVM (forcing one element realizes the whole ~32-element chunk). What remains finer-grained: mapcat/dedupe realize 0 at construction where the JVM's (apply concat …) / sequence transformer force the first chunk just to build the seq. jolt-mm6v",
   :integer-box-model
