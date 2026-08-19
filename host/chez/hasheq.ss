@@ -634,6 +634,25 @@
                                  (i32 (#3%fx+ (#3%fx* 31 h)
                                               (jolt-hasheq (vector-ref leaf (fx+ off j))))))))))))))))
 
+;; Seq hasheq, cached per HEAD object — the JVM's ASeq._hasheq. A cseq chain is
+;; memoized-lazy: realized cells never change, so the ordered hash of a given
+;; head is fixed once computed (hash-ordered realizes the chain to compute it,
+;; exactly as ASeq.hasheq walks it). Same weak side table shape as
+;; procedure-hasheq/jrec-hash-cached — no cseq layout change (chez-cseq-v6 is
+;; image surface), nothing travels into a fasl, entries die with their seq.
+;; Only cseq/lazyseq heads cache; other sequentials (empty list, host arrays'
+;; seq views) compute directly as before. Compute outside the lock:
+;; hash-ordered recurses into elements, and a seq of seqs re-enters.
+(define seq-hasheq-tbl (make-weak-eq-hashtable))
+(define seq-hasheq-mu (make-mutex))
+(define (seq-hasheq-cached x)
+  (if (or (cseq? x) (jolt-lazyseq? x))
+      (or (jolt-with-mutex seq-hasheq-mu (hashtable-ref seq-hasheq-tbl x #f))
+          (let ((h (hash-ordered (jolt-seq x))))
+            (jolt-with-mutex seq-hasheq-mu (hashtable-set! seq-hasheq-tbl x h))
+            h))
+      (hash-ordered (jolt-seq x))))
+
 (define (jolt-hasheq x)
   ;; Fast path for the most common types (matching Util.hasheq order).
   (cond
@@ -660,7 +679,7 @@
     ;; Routing is copied from jolt-hasheq-fallback, so hash VALUES are unchanged.
     ;; pvec before the generic sequential walk: cached field + leaf-run compute.
     ((pvec? x) (pvec-hasheq-cached x))
-    ((jolt-sequential? x) (hash-ordered (jolt-seq x)))
+    ((jolt-sequential? x) (seq-hasheq-cached x))
     ((pmap? x) (jolt-hasheq-fallback x))
     ((pset? x) (jolt-hasheq-fallback x))
     ;; Ahead of the arm walk, like keywords/symbols/collections: a procedure is
@@ -703,7 +722,7 @@
     ((char? x) (char->integer x))    ;; Character.hashCode = (int) charValue
     ((jolt-symbol? x) (symbol-hasheq x))
     ;; Sequential (vector/list/seq) → hashOrdered (Murmur3.hashOrdered)
-    ((jolt-sequential? x) (hash-ordered (jolt-seq x)))
+    ((jolt-sequential? x) (seq-hasheq-cached x))
     ;; Collections (map/set) → hashUnordered (Murmur3.hashUnordered)
     ((pmap? x)
      (or (and (not (= 0 (pmap-hasheq x))) (pmap-hasheq x))

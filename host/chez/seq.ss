@@ -1529,4 +1529,7 @@
           (else #f))))
 (define (seq-hash x)
   ;; JVM-compatible ordered-collection hash (Murmur3.hashOrdered via mixCollHash).
-  (hash-ordered (jolt-seq x)))
+  ;; Routed through the per-object caches (hasheq.ss, runtime forward refs):
+  ;; pvec's field, a cseq/lazyseq head's side-table entry; anything else
+  ;; computes directly as before. Values are unchanged either way.
+  (if (pvec? x) (pvec-hasheq-cached x) (seq-hasheq-cached x)))

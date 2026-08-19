@@ -26,10 +26,16 @@
 ;; so the ref record layout is no longer image-format surface. A version-2
 ;; reader refuses these images by the header check — on a runtime without
 ;; the descriptor a ref would restore as an inert record, silently wrong.
-;; This build still READS version 2: everything a v2 image can contain
-;; (including raw jolt-ref-v1 records) restores here via the legacy arm.
-(define jolt-image-format-version 3)
-(define jolt-image-read-versions '(2 3))
+;; 4: hash containers whose key subtree reaches a procedure travel as
+;; image-rekey entry records and REBUILD on restore — their trie placement is
+;; derived from per-process procedure identity hasheqs, so a raw copy answered
+;; nil to every lookup in the restoring process. A version-3 reader refuses
+;; these images by the header check instead of restoring the record inert.
+;;
+;; This build still READS versions 2 and 3: everything they can contain
+;; (including raw jolt-ref-v1 records) restores here via the legacy arms.
+(define jolt-image-format-version 4)
+(define jolt-image-read-versions '(2 3 4))
 
 ;; --- classification -----------------------------------------------------------
 ;; An eq hashtable is the ONE hashtable kind Chez can fasl; eqv/equal/string-hash
@@ -293,6 +299,20 @@
 (define-record-type image-sorted
   (fields kind cmp-fn entries)
   (nongenerative image-sorted-v1))
+
+;; A hash container whose KEY subtree reaches a procedure. Its trie placement
+;; is computed from procedure identity hasheqs, which are per-process
+;; (hasheq.ss proc-hasheq-tbl) — travel it raw and every lookup in the
+;; restoring process silently answers nil, because keys hash with ids the
+;; stored placement was never built from. Same cure as sorted containers
+;; (whose comparator-derived placement can't travel either): substitute an
+;; entries record on the write side and REBUILD in the restoring process, so
+;; placement is computed from the ids the lookups will actually use. kind is
+;; 'map ((k . v) pairs) or 'set (elements — the stored lookup VALUE, which is
+;; what the collection holds).
+(define-record-type image-rekey
+  (fields kind entries)
+  (nongenerative image-rekey-v1))
 
 ;; A ref travels by VALUE: the write side substitutes this descriptor for the
 ;; live jolt-ref, restore re-mints a fresh ref through make-jolt-ref and copies
@@ -629,8 +649,26 @@
                                              (image-stub-detail-of x))))
                      (set! stub-acc (cons s stub-acc))
                      s))))
+             ;; Did the walk just pass through a procedure? Set at walk ENTRY,
+             ;; before the memo check, so a fn seen earlier (memoized) still
+             ;; flips it. walk-key gives each hash-container key its own
+             ;; save/or window: the container learns whether anything under
+             ;; THIS key reaches a procedure (its hash then depends on a
+             ;; per-process id -> the container must rekey, image-rekey above),
+             ;; and a nested container's window ORs back into its parent's, so
+             ;; an fn-keyed map used as a key marks the outer map too.
+             (proc-touched #f)
+             (walk-key
+              (lambda (k path)
+                (let ((saved proc-touched))
+                  (set! proc-touched #f)
+                  (let* ((r (walk k path))
+                         (touched proc-touched))
+                    (set! proc-touched (or saved touched))
+                    (values r touched)))))
              (walk
               (lambda (x path)
+                (when (procedure? x) (set! proc-touched #t))
                 (cond
                   ;; scalar leaves can never hold a procedure
                   ((or (null? x) (boolean? x) (number? x) (char? x)
@@ -650,6 +688,8 @@
                       (walk-handled-restore x path))
                      ((and (eq? mode 'restore) (image-sorted? x))
                       (walk-sorted-restore x path))
+                     ((and (eq? mode 'restore) (image-rekey? x))
+                      (walk-rekey-restore x path))
                      ;; a ref descriptor re-mints a live ref; a raw jolt-ref-v1
                      ;; record from a format-2 image re-mints through the
                      ;; legacy arm (same construction, val read via its own rtd)
@@ -759,17 +799,26 @@
              (walk-pmap
               (lambda (x path)
                 (if (image-rebuild-mode? mode)
-                    (let ((entries '()) (dirty #f))
+                    (let ((entries '()) (dirty #f) (rekey #f))
                       (pmap-fold-fwd x
                         (lambda (k v acc)
-                          (let* ((wk (walk k (cons "<key>" path)))
-                                 (wv (walk v (cons (image-describe-obj k) path))))
-                            (set! entries (cons (cons wk wv) entries))
-                            (set! dirty (or dirty (not (eq? wk k)) (not (eq? wv v))))
-                            acc))
+                          (let*-values (((wk ktouched) (walk-key k (cons "<key>" path))))
+                            (let ((wv (walk v (cons (image-describe-obj k) path))))
+                              (when ktouched (set! rekey #t))
+                              (set! entries (cons (cons wk wv) entries))
+                              (set! dirty (or dirty (not (eq? wk k)) (not (eq? wv v))))
+                              acc)))
                         #f)
                       (if (hashtable-ref memo x #f)
                           (hashtable-ref memo x #f)
+                          (if rekey
+                              ;; a key's hash depends on a per-process fn id —
+                              ;; substitute the entries record; restore rebuilds
+                              (let ((r (make-image-rekey 'map
+                                         (list->vector (reverse entries)))))
+                                (hashtable-set! memo x r)
+                                (image-meta-copy! x r)
+                                r)
                           (if dirty
                               (let ((nx (apply jolt-hash-map
                                                (apply append
@@ -778,7 +827,7 @@
                                 (hashtable-set! memo x nx)
                                 (image-meta-copy! x nx)
                                 nx)
-                              (begin (hashtable-set! memo x x) x))))
+                              (begin (hashtable-set! memo x x) x)))))
                     (begin
                       (hashtable-set! memo x #t)
                       (pmap-fold-fwd x
@@ -793,23 +842,35 @@
                 (if (image-rebuild-mode? mode)
                     ;; pair-wise, like the sub path: the lookup value can be an
                     ;; element merely jolt= to the key it is filed under
-                    (let ((pairs '()) (dirty #f))
+                    (let ((pairs '()) (dirty #f) (rekey #f))
                       (pset-fold-pairs x
                         (lambda (e v acc)
-                          (let* ((w (walk e (cons (image-describe-obj e) path)))
-                                 (wv (if (eq? v e) w (walk v (cons (image-describe-obj v) path)))))
-                            (set! pairs (cons (cons w wv) pairs))
-                            (set! dirty (or dirty (not (eq? w e)) (not (eq? wv v))))
-                            acc))
+                          ;; a set's element IS its key — its whole subtree
+                          ;; decides placement, so track both halves of the pair
+                          (let*-values (((w etouched) (walk-key e (cons (image-describe-obj e) path))))
+                            (let*-values (((wv vtouched)
+                                           (if (eq? v e)
+                                               (values w etouched)
+                                               (walk-key v (cons (image-describe-obj v) path)))))
+                              (when (or etouched vtouched) (set! rekey #t))
+                              (set! pairs (cons (cons w wv) pairs))
+                              (set! dirty (or dirty (not (eq? w e)) (not (eq? wv v))))
+                              acc)))
                         #f)
                       (if (hashtable-ref memo x #f)
                           (hashtable-ref memo x #f)
+                          (if rekey
+                              (let ((r (make-image-rekey 'set
+                                         (list->vector (reverse pairs)))))
+                                (hashtable-set! memo x r)
+                                (image-meta-copy! x r)
+                                r)
                           (if dirty
                               (let ((nx (pset-from-pairs (reverse pairs))))
                                 (hashtable-set! memo x nx)
                                 (image-meta-copy! x nx)
                                 nx)
-                              (begin (hashtable-set! memo x x) x))))
+                              (begin (hashtable-set! memo x x) x)))))
                     (begin
                       (hashtable-set! memo x #t)
                       ;; the split lookup value is its own object, with its own
@@ -1146,6 +1207,32 @@
                     (hashtable-set! memo x coll)
                     (image-meta-copy! x coll)
                     coll))))
+             ;; read side of image-rekey: rebuild the container in THIS process
+             ;; so placement is computed from the ids its lookups will use.
+             ;; Entries walk first (an fnsrc key becomes the live closure before
+             ;; it is hashed); the map rebuild mirrors walk-pmap's dirty rebuild
+             ;; (jolt-hash-map), the set one walk-pset's (pset-from-pairs).
+             (walk-rekey-restore
+              (lambda (x path)
+                (let* ((entries (image-rekey-entries x))
+                       (n (vector-length entries))
+                       (pairs (let loop ((i 0) (acc '()))
+                                (if (fx>=? i n)
+                                    (reverse acc)
+                                    (let* ((e (vector-ref entries i))
+                                           (wk (walk (car e) (cons "<key>" path)))
+                                           (wv (if (eq? (cdr e) (car e))
+                                                   wk
+                                                   (walk (cdr e) (cons "<val>" path)))))
+                                      (loop (fx+ i 1) (cons (cons wk wv) acc)))))))
+                  (let ((coll (if (eq? (image-rekey-kind x) 'map)
+                                  (apply jolt-hash-map
+                                         (apply append
+                                                (map (lambda (e) (list (car e) (cdr e))) pairs)))
+                                  (pset-from-pairs pairs))))
+                    (hashtable-set! memo x coll)
+                    (image-meta-copy! x coll)
+                    coll))))
              (walk-handled-restore
               (lambda (x path)
                 (let ((tp (walk (image-handled-payload x) (cons "payload" path))))
@@ -1201,7 +1288,7 @@
   (unless (member (vector-ref h 1) jolt-image-read-versions)
     (jolt-throw (jolt-ex-info
                   (string-append "image: " path " has format version "
-                                 (jolt-str-one (vector-ref h 1)) ", this build reads versions 2 and 3")
+                                 (jolt-str-one (vector-ref h 1)) ", this build reads versions 2, 3 and 4")
                   jolt-nil)))
   ;; The fasl version moves with Chez, and a mismatch otherwise surfaces as an
   ;; opaque fasl-read error, so name it here instead.

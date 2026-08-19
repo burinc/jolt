@@ -191,6 +191,32 @@
                     (fx=? 0 (pmap-hasheq m))
                     (fx=? 0 (pset-hasheq s)))))))
   (cleanup!))
+
+;; fn-KEYED hash containers: their trie placement is computed from procedure
+;; identity hasheqs, which are PER-PROCESS (hasheq.ss proc-hasheq-tbl) — a map
+;; keyed by a var-referenced fn traveled raw, so a restoring process looked
+;; keys up with ids the stored placement was never built from and silently got
+;; nil. The in-process stand-in for "a different process": hand the fns fresh
+;; ids between write and read, exactly what a new process's id counter does.
+;; The fix substitutes an image-rekey record on the write side (the sorted-map
+;; pattern) so restore REBUILDS the container with the restoring process's ids.
+(begin
+  (cleanup!)
+  (ev (string-append "(jolt.host/image-write! \"" tmp "\""
+                     " [(hash-map inc 1 dec 2 [inc :v] 3)"
+                     "  (conj (hash-set) inc [dec :k])])"))
+  (let ((bump (lambda (nm)
+                (let ((p (var-deref "clojure.core" nm)))
+                  (hashtable-set! proc-hasheq-tbl p
+                                  (i32 (+ 424243 (procedure-hasheq p))))))))
+    (bump "inc") (bump "dec"))
+  (is "fn-keyed map+set look up after a fn-id change (cross-process stand-in)"
+      (string-append "(let [r (jolt.host/image-read \"" tmp "\")"
+                     "      m (nth r 0) s (nth r 1)]"
+                     " [(get m inc) (get m dec) (get m [inc :v]) (count m)"
+                     "  (contains? s inc) (contains? s [dec :k])])")
+      "[1 2 3 3 true true]")
+  (cleanup!))
 ;; (partial compare) would be compare ITSELF (partial's 1-arg arity), a named
 ;; fn — (comp - compare) is a real core-tier closure with no registration
 (is "scan of a sorted-map-by with an unregistered closure reports one finding at the comparator"
@@ -971,8 +997,9 @@
       "   (identical? (:cyc g) (:self (deref (:cyc g))))"
       "   (do (dosync (ref-set (:a g) 100)) (deref (:a g)))])")
     "[99 :hot true true 100]")
-;; format discipline: the new image writes header version 3, and its bytes
-;; carry the descriptor rtd, never the live ref rtd
+;; format discipline: the new image writes header version 4 (3 added ref
+;; descriptors, 4 added image-rekey), and its bytes carry the descriptor rtd,
+;; never the live ref rtd
 (define (bv-contains? bv s)
   (let* ((sb (string->utf8 s)) (m (bytevector-length sb)) (n (bytevector-length bv)))
     (let scan ((i 0))
@@ -982,12 +1009,12 @@
                    (and (fx=? (bytevector-u8-ref bv (fx+ i j)) (bytevector-u8-ref sb j))
                         (cmp (fx+ j 1))))) #t)
             (else (scan (fx+ i 1)))))))
-(ok "ref-carrying image is format 3 with no raw jolt-ref rtd"
+(ok "ref-carrying image is format 4 with no raw jolt-ref rtd"
     (let ((port (open-file-input-port tmp)))
       (let* ((h (fasl-read port))
              (rest (get-bytevector-all port)))
         (close-port port)
-        (and (fx=? 3 (vector-ref h 1))
+        (and (fx=? 4 (vector-ref h 1))
              (bv-contains? rest "image-ref")
              (not (bv-contains? rest "jolt-ref-v2"))))))
 ;; an unknown format version refuses with a clean error naming both versions
