@@ -122,6 +122,24 @@
     (not (raises? (lambda () (eq-arm-reject-fast-type!
                               'test (lambda (a b) (or (armtest-t? a) (armtest-t? b))))))))
 
+;; jolt's own vector, map and set are answered ahead of BOTH walks (jolt=2,
+;; jolt-hash, jolt-hasheq), so all three have to be in the probe sets — a type
+;; that is hoisted but unprobed is one whose arms register happily and are then
+;; silently dead, which is the exact failure the guard exists to make loud.
+;; Asserting each separately so a probe set losing one type names which.
+(ok "hash arm rejects vector" (raises? (lambda () (hash-arm-reject-fast-type! 'test pvec?))))
+(ok "hash arm rejects map"    (raises? (lambda () (hash-arm-reject-fast-type! 'test pmap?))))
+(ok "hash arm rejects set"    (raises? (lambda () (hash-arm-reject-fast-type! 'test pset?))))
+(ok "eq arm rejects vector pair"
+    (raises? (lambda () (eq-arm-reject-fast-type!
+                         'test (lambda (a b) (and (pvec? a) (pvec? b)))))))
+(ok "eq arm rejects map pair"
+    (raises? (lambda () (eq-arm-reject-fast-type!
+                         'test (lambda (a b) (and (pmap? a) (pmap? b)))))))
+(ok "eq arm rejects set pair"
+    (raises? (lambda () (eq-arm-reject-fast-type!
+                         'test (lambda (a b) (and (pset? a) (pset? b)))))))
+
 ;; and a real arm on a type off the fast path still registers and is consulted
 (ok "hash arm on a plain type registers"
     (not (raises? (lambda () (register-hash-arm! armtest-t? (lambda (x) 4242))))))
