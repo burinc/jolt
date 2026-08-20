@@ -251,6 +251,20 @@
 (define (sa-foreign-set! type addr off v)
   (sa-ffi-raise 'sa-foreign-set!))
 
+;; (sa-foreign-bytes-ref! addr bv n) -> void
+;; (sa-foreign-bytes-set! addr bv n) -> void
+;; The BULK octet moves: one block copy between foreign memory and a bytevector,
+;; in place of N sa-foreign-ref!/-set! calls. The CONTRACT lets a target without
+;; a block move implement them as a loop over its own foreign-ref/-set!, which
+;; gives the constant back but stays correct; gambit has no ffi at all, so like
+;; every other data-plane entry here they raise. They must still be BOUND — the
+;; contract-name pass in gambitcheck.ss asserts every CONTRACT.txt name resolves,
+;; and an unbound one is indistinguishable from a target that forgot to port it.
+(define (sa-foreign-bytes-ref! addr bv n)
+  (sa-ffi-raise 'sa-foreign-bytes-ref!))
+(define (sa-foreign-bytes-set! addr bv n)
+  (sa-ffi-raise 'sa-foreign-bytes-set!))
+
 ;; (sa-foreign-sizeof type) -> exact integer
 ;; Size in bytes of a foreign type. Degradation: raise.
 (define (sa-foreign-sizeof type)
