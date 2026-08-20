@@ -16,7 +16,7 @@
   (:require [jolt.host :refer [inline-enabled? inference-enabled? record-shapes protocol-methods stash-inline!]]
             [jolt.passes.fold :refer [const-fold]]
             [jolt.passes.numeric :as numeric]
-            [jolt.passes.inline :refer [inline-node flatten-lets scalar-replace]]
+            [jolt.passes.inline :refer [inline-node flatten-lets scalar-replace direct-call-edges]]
              [jolt.passes.types :refer [run-inference
                                          check-form infer-body reinfer-def
                                          set-rtenv! set-vtypes!
@@ -36,7 +36,10 @@
 
 (defn- stash-of [node]
   (let [a (first (:arities (:init node)))]
-    {:params (:params a) :body (:body a) :nhints (:nhints a) :ret (:ret-nhint a)}))
+    {:params (:params a) :body (:body a) :nhints (:nhints a) :ret (:ret-nhint a)
+     ;; the stash-graph edges splice-cycle-member? (inline.clj) walks to refuse
+     ;; inlining a recursive cluster; computed once here, on the analyzed body.
+     :calls (direct-call-edges (:body a))}))
 
 (defn inject-wp-nhints
   "Merge the whole-program :double param seeds into a def's arity :nhints as
