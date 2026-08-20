@@ -137,6 +137,37 @@
 (check-eq "pb instance?" (instance? java.lang.ProcessBuilder (java.lang.ProcessBuilder. ["true"])) true)
 (check-eq "proc class" (.getName (class (:proc @(process ["true"])))) "java.lang.Process")
 
+;; --- ProcessBuilder.inheritIO and the redirect getters (jolt-674) -------------
+;; inheritIO() is defined as redirectInput(INHERIT).redirectOutput(INHERIT)
+;; .redirectError(INHERIT) returning this. Before it existed the miss reported as
+;; "No matching field found: inheritIO" — jolt reads a 0-arg method miss as a
+;; field probe, like the JVM reflector — and callers had to spell the three out.
+;; Every value below is JVM Clojure's.
+(check-eq "inheritIO runs the issue's repro" (.. (java.lang.ProcessBuilder. ["true"]) inheritIO start waitFor) 0)
+(check-eq "inheritIO propagates a non-zero exit" (.. (java.lang.ProcessBuilder. ["false"]) inheritIO start waitFor) 1)
+(let [pb (java.lang.ProcessBuilder. ["true"])]
+  (check-eq "inheritIO returns this" (identical? pb (.inheritIO pb)) true))
+(let [pb (doto (java.lang.ProcessBuilder. ["true"]) .inheritIO)]
+  (check-eq "inheritIO sets stdin"  (= (.redirectInput pb)  java.lang.ProcessBuilder$Redirect/INHERIT) true)
+  (check-eq "inheritIO sets stdout" (= (.redirectOutput pb) java.lang.ProcessBuilder$Redirect/INHERIT) true)
+  (check-eq "inheritIO sets stderr" (= (.redirectError pb)  java.lang.ProcessBuilder$Redirect/INHERIT) true))
+;; the getters: an unset stream reads back as PIPE, the documented default
+(let [pb (java.lang.ProcessBuilder. ["true"])]
+  (check-eq "an unset redirect is PIPE" (= (.redirectInput pb) java.lang.ProcessBuilder$Redirect/PIPE) true)
+  (check-eq "redirectErrorStream defaults false" (.redirectErrorStream pb) false))
+(check-eq "redirectErrorStream round-trips"
+          (.redirectErrorStream (doto (java.lang.ProcessBuilder. ["true"]) (.redirectErrorStream true))) true)
+;; the two are independent on the JVM: inheritIO does not clear a merge
+(check-eq "inheritIO leaves redirectErrorStream alone"
+          (.redirectErrorStream (doto (java.lang.ProcessBuilder. ["true"])
+                                  (.redirectErrorStream true) .inheritIO)) true)
+;; a later redirect overrides only the stream it names
+(let [pb (doto (java.lang.ProcessBuilder. ["true"])
+           .inheritIO (.redirectOutput java.lang.ProcessBuilder$Redirect/PIPE))]
+  (check-eq "a later redirect overrides one stream"
+            [(= (.redirectOutput pb) java.lang.ProcessBuilder$Redirect/PIPE)
+             (= (.redirectInput pb) java.lang.ProcessBuilder$Redirect/INHERIT)] [true true]))
+
 ;; --- fd-level INHERIT ---------------------------------------------------------
 ;; Redirect.INHERIT hands the child jolt's REAL fds (posix_spawn leaves 0/1/2
 ;; untouched), not a pump-fed pipe. Two things only real inheritance can do:
@@ -153,6 +184,15 @@
       out (:out (sh [jolt-bin "-e" nested]))]
   (check-eq "INHERIT stdout reaches the parent's stdout"
             (str/includes? out "INHERITED-OUT") true))
+
+;; inheritIO is real fd inheritance, not a recorded flag: BOTH streams land on
+;; the nested jolt's stdio, and stderr with them (the single-stream test above
+;; only covers stdout).
+(let [nested (str "(.. (java.lang.ProcessBuilder. [\"sh\" \"-c\" \"echo IIO-OUT; echo IIO-ERR 1>&2\"])"
+                  " inheritIO start waitFor)")
+      r (sh [jolt-bin "-e" nested])]
+  (check-eq "inheritIO stdout reaches the parent" (str/includes? (:out r) "IIO-OUT") true)
+  (check-eq "inheritIO stderr reaches the parent" (str/includes? (str (:out r) (:err r)) "IIO-ERR") true))
 
 ;; isatty: under a pty (script(1)), an INHERIT child's stdout IS the terminal.
 ;; A pump-fed pipe can never answer true here.
