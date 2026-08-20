@@ -5,7 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.19] - 2026-08-20
+
+A patch release: the `java.io.InputStream` surface — `readNBytes`,
+`transferTo`, and a `mark`/`reset` that actually marks — which is the half of
+#681 that missed the 0.7.18 tag, plus review follow-ups to it. With this,
+jolt-lang/http-client stops shimming `java.io.ByteArrayInputStream`
+process-wide (~3300x faster stream drains for every app that requires it).
 
 ### Added
 
