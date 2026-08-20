@@ -131,6 +131,21 @@
   ;; is allowlisted in run-corpus.ss, so this is prose here rather than a keyed
   ;; entry: keyed entries are rows whose :expected departs from the JVM, and this
   ;; row's does not.
+  ;; The JVM's mark/reset provider is BufferedInputStream: wrapping ANY stream
+  ;; answers markSupported true, replaying from its buffer on reset. jolt marks
+  ;; via port positions, so the wrapper is markable only where the port can
+  ;; seek (file, bytevector) — over a socket/pipe/stdin it stays the wrapped
+  ;; stream and answers false, and reset throws IOException instead of
+  ;; silently rewinding wrong. System.in is such a BufferedInputStream on the
+  ;; JVM, so (.markSupported System/in) is true there and false here. jolt's
+  ;; markable reset with no prior mark seeks to 0 (the BAIS default) where a
+  ;; JVM BufferedInputStream would throw "Resetting to invalid mark" —
+  ;; lenient in the same direction the shim tier already goes.
+  {:category :restrictive
+   :behavior "(.markSupported (BufferedInputStream. <non-seekable>)) / System/in"
+   :jvm "true — BufferedInputStream buffers and replays on reset"
+   :jolt "false — no replay layer; mark/reset honoured only where the port seeks"
+   :note "Corpus rows cover the agreeing cases (file, ByteArrayInputStream, PipedInputStream, FileInputStream); unit rows pin System/in answering false without crashing."}
   {:category :permissive
    :behavior "(double \\a) / (float \\a)"
    :jvm "throws ClassCastException — double/float are declared ^Number"

@@ -462,7 +462,11 @@
 ;; an OutputStream. They wrap the process port-writers registered in
 ;; host-static-classes.ss, which is where the underlying ports resolve.  autoFlush
 ;; is on, as it is for the JVM's two.
-(define system-in-stream (make-jhost "in-stream" (vector 'stdin)))
+;; NOT markable, and a known divergence: the JVM's System.in is a
+;; BufferedInputStream (markSupported true); honouring a mark on interactive
+;; stdin would need replay buffering over fd 0 (see stdin-one-port-on-fd0), so
+;; jolt answers false and reset throws cleanly. See known-divergences.edn.
+(define system-in-stream (make-jhost "in-stream" (vector 'stdin #f 0)))
 (define (sys-set-in! v)
   (for-each (lambda (c) (vector-set! (mutable-static-cell c "in" #t) 0 v))
             '("System" "java.lang.System"))
@@ -674,8 +678,26 @@
 (for-each (lambda (n) (register-class-ctor! n (lambda (inner . _) inner)))
           '("BufferedReader" "java.io.BufferedReader"
             "BufferedWriter" "java.io.BufferedWriter"
-            "BufferedInputStream" "java.io.BufferedInputStream"
             "BufferedOutputStream" "java.io.BufferedOutputStream"))
+;; BufferedInputStream is the JVM's mark/reset provider: wrapping ANY stream
+;; makes markSupported true there. jolt honours that when the underlying port
+;; can actually seek (file, bytevector) — a fresh markable jhost over the SAME
+;; port, so close propagates both ways like the JVM's. Over a port that cannot
+;; seek (socket, pipe, stdin) the JVM would replay from its buffer; jolt has no
+;; replay layer, so the wrapper stays the wrapped stream and markSupported
+;; stays false — the honest answer, and a known divergence (reset throws
+;; instead of silently rewinding wrong). See known-divergences.edn.
+(for-each (lambda (n)
+            (register-class-ctor! n
+              (lambda (inner . _)
+                (if (and (in-stream? inner)
+                         (let ((p (vector-ref (jhost-state inner) 0)))
+                           (and (port? p)
+                                (port-has-port-position? p)
+                                (port-has-set-port-position!? p))))
+                    (make-in-stream-markable (in-stream-port inner))
+                    inner))))
+          '("BufferedInputStream" "java.io.BufferedInputStream"))
 
 ;; --- integration: slurp / line-seq / with-open ------------------------------
 ;; a char-reader joins the reader-jhost set (drain-reader / line-seq read it via
@@ -1035,7 +1057,7 @@
                 "piped-input"
                 (lambda (bv start count) (pipe-read! (unbox cell) bv start count))
                 #f #f (lambda () #f)))
-         (self (make-jhost "in-stream" (vector port #f #f cell))))
+         (self (make-jhost "in-stream" (vector port #f 0 cell))))
     (when (pair? rest) (pipe-connect! self (car rest)))
     self))
 

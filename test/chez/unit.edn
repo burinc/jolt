@@ -350,6 +350,9 @@
   {:suite "javastatic" :expr "(URLDecoder/decode (URLEncoder/encode \"x &=%?\"))" :expected "\"x &=%?\""}
   {:suite "javastatic" :expr "(String. (.encode (Base64/getEncoder) (.getBytes \"hello\")))" :expected "\"aGVsbG8=\""}
   {:suite "javastatic" :expr "(String. (.decode (Base64/getDecoder) (String. (.encode (Base64/getEncoder) (.getBytes \"hello\")))))" :expected "\"hello\""}
+  {:suite "javastatic" :expr "(.markSupported System/in)" :expected "false"}
+  {:suite "javastatic" :expr "(try (.reset System/in) :no-throw (catch java.io.IOException e :threw))" :expected ":threw"}
+  {:suite "javastatic" :expr "(do (.mark System/in 4) :ok)" :expected ":ok"}
   {:suite "javastatic" :expr "(Integer/parseInt \"ff\" 16)" :expected "255"}
   {:suite "javastatic" :expr "(regex? (Pattern/compile \"a.c\"))" :expected "true"}
   ;; String[], like the JVM — vec it to compare. Pattern.split used to answer a seq
