@@ -234,12 +234,48 @@
 ;; arithmetic) passes through as an exact integer rather than erroring. fx ops in
 ;; the body still require fixnums (they raise on a bignum), but generic /
 ;; unchecked-* ops handle it.
+;; The ^long hint coercion IS the reference's long cast (RT.longCast), so defer
+;; to jolt-long-cast rather than re-deriving it — the hand-rolled version here
+;; accepted an exact integer of ANY magnitude (so (fn [^long x] x) handed 2^64
+;; returned it instead of raising "Value out of range for long"), and reached
+;; Chez's truncate on a NaN or an infinity, which raises a raw host condition
+;; where the reference answers 0 and IllegalArgumentException respectively.
+;; jolt-long-cast fast-paths a fixnum first, and the emitter's own inline
+;; (emit-nhint-coerce) already short-circuits that case before the call, so the
+;; delegation costs nothing on the path that matters.
+;; A char must NOT come through here even though jolt-long-cast takes one. The
+;; reference's `long` CAST reaches RT.longCast's char overload -- (long \a) is
+;; 97 on both runtimes -- but a ^long PARAMETER is RT.longCast(Object), which
+;; rejects a Character outright. jolt-num-cast-throw raises the matching
+;; ClassCastException (and NullPointerException for nil).
 (define (jolt->fx x)
   (cond ((fixnum? x) x)
-        ((and (number? x) (exact? x) (integer? x)) x)
-        ((flonum? x) (exact (truncate x)))
-        ((rational? x) (exact (truncate x)))
-        (else (jolt-num-cast-throw x))))
+        ((char? x) (jolt-num-cast-throw x))
+        (else (jolt-long-cast x))))
+;; The ^long RETURN coercion is NOT the ^long PARAMETER coercion, and the
+;; difference is observable. A parameter goes through RT.longCast, which
+;; range-checks and raises "Value out of range for long". A return is
+;; ((Number) x).longValue(), which never raises for a number:
+;;
+;;   exact integer   WRAPS to the low 64 bits     2^64 -> 0, 2^63 -> Long/MIN
+;;   flonum          SATURATES (Java's d2l)       Inf -> Long/MAX, NaN -> 0
+;;   ratio           truncates toward zero, then the same
+;;
+;; ((fn ^long [x] x) 18446744073709551616N) is 0 on the reference and was 2^64
+;; here; every case above is checked against it. Anything not a number keeps the
+;; cast throw rather than inventing an answer.
+(define (jolt->fx-ret x)
+  (cond ((fixnum? x) x)
+        ((flonum? x)
+         (cond ((nan? x) 0)
+               ((>= x 9223372036854775807.0) 9223372036854775807)
+               ((<= x -9223372036854775808.0) -9223372036854775808)
+               (else (exact (truncate x)))))
+        ((and (number? x) (exact? x) (integer? x)) (wrap64 x))
+        ((and (number? x) (exact? x) (rational? x)) (wrap64 (exact (truncate x))))
+        ;; a char is not a Number here either -- see jolt->fx
+        ((char? x) (jolt-num-cast-throw x))
+        (else (jolt-long-cast x))))
 (define (jolt->fl x)
   (cond ((flonum? x) x)
         ((number? x) (exact->inexact x))

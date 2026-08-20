@@ -74,7 +74,12 @@
 ;; 64-bit signed so (bit-set 0 63) is Long/MIN, like the JVM. clear only turns
 ;; bits off, so it stays in range.
 (define (jolt-bit-set x n)   (wrap64 (bitwise-ior (->int x) (bit-mask n))))
-(define (jolt-bit-clear x n) (bitwise-and (->int x) (bitwise-not (bit-mask n))))
+;; wrap64 like set/flip: clearing bit 63 of a negative operand leaves the
+;; infinite sign extension above bit 63 set, so (bit-clear Long/MIN_VALUE 63)
+;; read -2^64 instead of 0 and (bit-clear -1 63) read -(2^63)-1 instead of
+;; Long/MAX_VALUE. AND cannot set a bit its operands lack, but it can leave the
+;; ones two's complement puts above the word.
+(define (jolt-bit-clear x n) (wrap64 (bitwise-and (->int x) (bitwise-not (bit-mask n)))))
 (define (jolt-bit-flip x n)  (wrap64 (bitwise-xor (->int x) (bit-mask n))))
 (define (jolt-bit-test x n)  (not (zero? (bitwise-and (->int x) (bit-mask n)))))
 ;; unsigned-bit-shift-right: LOGICAL right shift over a 64-bit long (Java >>>),
