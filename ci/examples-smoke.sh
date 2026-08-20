@@ -22,8 +22,11 @@
 #   http-client-app  -main hits real HTTPS endpoints — a release must not depend
 #                    on third-party uptime.
 #   fps-demo, glimmer-app, glimmer-gl-app, glimmer-tui-example,
+#   todomvc-uikit,
 #   image-dump-example   GUI/GL/TUI; no headless test task. (image-dump-example's save/load path is
-#                    covered by the jolt-side stateimage gate.)
+#                    covered by the jolt-side stateimage gate. todomvc-uikit's
+#                    AppKit backend dlopens its frameworks at require time on
+#                    macOS only, so the build is exercised on Linux too.)
 #   hiccup/malli/markdown-app, ray-tracer*  no test task at all.
 set -eu
 
@@ -56,6 +59,7 @@ fps-demo         fps-demo.core  -
 glimmer-app      app.core       -
 glimmer-gl-app   gl-demo.core   -
 glimmer-tui-example tui-demo.core -
+todomvc-uikit    app.core       -
 image-dump-example app.core     -
 EOF
 
