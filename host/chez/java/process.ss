@@ -301,10 +301,17 @@
 (define (proc-redirect-kind r) (vector-ref (jhost-state r) 0))
 (define (proc-redirect-file r) (vector-ref (jhost-state r) 1))
 
+;; Named so inheritIO() can hand back the SAME object Redirect/INHERIT is. On the
+;; JVM these are singletons — (= (.redirectInput pb) Redirect/INHERIT) is true
+;; after .inheritIO() — and a fresh instance per call would read as a different
+;; redirect to anything comparing them.
+(define proc-redirect-inherit (make-proc-redirect 'inherit #f))
+(define proc-redirect-pipe (make-proc-redirect 'pipe #f))
+
 (define proc-redirect-statics
-  (list (cons "INHERIT" (make-proc-redirect 'inherit #f))
+  (list (cons "INHERIT" proc-redirect-inherit)
         (cons "DISCARD" (make-proc-redirect 'discard #f))
-        (cons "PIPE"    (make-proc-redirect 'pipe #f))
+        (cons "PIPE"    proc-redirect-pipe)
         (cons "to"       (lambda (f) (make-proc-redirect 'write  (file-path-of f))))
         (cons "appendTo" (lambda (f) (make-proc-redirect 'append (file-path-of f))))
         (cons "from"     (lambda (f) (make-proc-redirect 'read   (file-path-of f))))))
@@ -380,10 +387,35 @@
         (cons "environment" (lambda (self)
           (or (proc-pb-env self)
               (let ((em (make-proc-env-map))) (proc-pb-set! self 1 em) em))))
-        (cons "redirectInput"  (lambda (self r) (proc-pb-set! self 3 r) self))
-        (cons "redirectOutput" (lambda (self r) (proc-pb-set! self 4 r) self))
-        (cons "redirectError"  (lambda (self r) (proc-pb-set! self 5 r) self))
-        (cons "redirectErrorStream" (lambda (self b) (proc-pb-set! self 6 (jolt-truthy? b)) self))
+        ;; Each redirect method is a setter with an argument and a GETTER with
+        ;; none, like the JDK's. An unset stream reads back as PIPE, which is the
+        ;; documented default rather than nil.
+        (cons "redirectInput"  (lambda (self . r)
+          (if (null? r) (or (proc-pb-redir-in self) proc-redirect-pipe)
+              (begin (proc-pb-set! self 3 (car r)) self))))
+        (cons "redirectOutput" (lambda (self . r)
+          (if (null? r) (or (proc-pb-redir-out self) proc-redirect-pipe)
+              (begin (proc-pb-set! self 4 (car r)) self))))
+        (cons "redirectError"  (lambda (self . r)
+          (if (null? r) (or (proc-pb-redir-err self) proc-redirect-pipe)
+              (begin (proc-pb-set! self 5 (car r)) self))))
+        (cons "redirectErrorStream" (lambda (self . b)
+          (if (null? b) (and (proc-pb-merge-err? self) #t)
+              (begin (proc-pb-set! self 6 (jolt-truthy? (car b))) self))))
+        ;; inheritIO(): set all three standard streams to INHERIT and return this
+        ;; — the JDK defines it as exactly redirectInput(INHERIT)
+        ;; .redirectOutput(INHERIT).redirectError(INHERIT), and the start path
+        ;; already understands the 'inherit kind. Without it a caller had to spell
+        ;; those three out, and the miss reported as "No matching field found:
+        ;; inheritIO" because jolt reads a 0-arg method miss as a field probe
+        ;; (jolt-674). It does NOT clear redirectErrorStream: on the JVM the two
+        ;; are independent, and a merge set before or after still wins over the
+        ;; error redirect.
+        (cons "inheritIO" (lambda (self)
+                            (proc-pb-set! self 3 proc-redirect-inherit)
+                            (proc-pb-set! self 4 proc-redirect-inherit)
+                            (proc-pb-set! self 5 proc-redirect-inherit)
+                            self))
         (cons "start" (lambda (self) (proc-pb-start self)))))
 
 ;; startPipeline: connect N builders stdout->stdin with pump threads, returning a
