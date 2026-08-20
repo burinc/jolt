@@ -16,17 +16,18 @@
 # cross-checked against the checkout in both directions, so an example added
 # upstream without a row here fails the gate rather than silently skipping it.
 #
-# Fields: dir | build-main | test-task ("-" for build-only)
+# Fields: dir | build-main | test-task ("-" for build-only) | os (optional:
+# only build on this uname, lowercased — todomvc-uikit's glimmer-uikit backend
+# creates its CoreFoundation foreign-procedures at load, so even the BUILD
+# needs macOS until the library defers them; see jolt-lang/glimmer-uikit)
 #
 # Build-only, and why:
 #   http-client-app  -main hits real HTTPS endpoints — a release must not depend
 #                    on third-party uptime.
 #   fps-demo, glimmer-app, glimmer-gl-app, glimmer-tui-example,
-#   todomvc-uikit,
 #   image-dump-example   GUI/GL/TUI; no headless test task. (image-dump-example's save/load path is
-#                    covered by the jolt-side stateimage gate. todomvc-uikit's
-#                    AppKit backend dlopens its frameworks at require time on
-#                    macOS only, so the build is exercised on Linux too.)
+#                    covered by the jolt-side stateimage gate.)
+#   todomvc-uikit    darwin-only, build-only: AppKit.
 #   hiccup/malli/markdown-app, ray-tracer*  no test task at all.
 set -eu
 
@@ -59,7 +60,7 @@ fps-demo         fps-demo.core  -
 glimmer-app      app.core       -
 glimmer-gl-app   gl-demo.core   -
 glimmer-tui-example tui-demo.core -
-todomvc-uikit    app.core       -
+todomvc-uikit    app.core       -   darwin
 image-dump-example app.core     -
 EOF
 
@@ -68,7 +69,7 @@ note_fail() { echo "  FAIL: $*"; fails=$((fails + 1)); }
 
 # Both directions: a row naming no directory, and a directory with no row. The
 # second is the one that matters — an example added upstream must not slip past.
-while read -r name main test; do
+while read -r name main test os; do
   [ -n "${name:-}" ] || continue
   [ -d "$root/$name" ] || note_fail "$name is in the manifest but not in the checkout"
 done < "$manifest"
@@ -80,8 +81,13 @@ for d in "$root"/*/; do
 done
 [ "$fails" -eq 0 ] || { echo "examples-smoke: manifest is out of sync with the checkout"; exit 1; }
 
-while read -r name main test; do
+host_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+while read -r name main test os; do
   [ -n "${name:-}" ] || continue
+  if [ -n "${os:-}" ] && [ "$os" != "$host_os" ]; then
+    echo "examples-smoke: $name — skipped ($os-only, host is $host_os)"
+    continue
+  fi
   dir="$root/$name"
 
   # Build into a throwaway dir: a failed build leaves nothing behind and the
