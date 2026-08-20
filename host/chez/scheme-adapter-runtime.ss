@@ -313,6 +313,60 @@
 ;; the typed write. Degradation: none.
 (define (sa-foreign-set! type addr off v) (foreign-set! type addr off v))
 
+;; --- bulk octet moves --------------------------------------------------------
+;; sa-foreign-ref/-set! carry ONE value per call. Moving a buffer that way costs
+;; ~30ns per byte on Chez (measured against ~4ns for the same loop over a
+;; bytevector, and ~0 for bytevector-copy!), so every socket read, every FFI
+;; buffer hand-off, and every jolt.ffi/read-array paid a per-byte constant that
+;; dwarfed the work around it. These two move a whole block at once.
+;;
+;; The bytevector crosses to C BY ADDRESS (Chez's u8* argument type). A plain
+;; foreign call keeps the calling thread ACTIVE for the collector, so the
+;; bytevector cannot be moved out from under C for the duration of the call --
+;; which is exactly why neither of these may ever be made __collect_safe.
+;;
+;; Resolution is lazy and probe-only: the boot already loaded the process-global
+;; handle, so memcpy resolves without another sa-load-shared-object -- and must
+;; not take one, since re-loading that handle re-promotes it above every
+;; :jolt/native loaded so far (the libboringssl hijack, see java/ffi.ss).
+(define sa-fbytes-probed? #f)
+(define sa-fbytes-in #f)     ; memcpy(bytevector, foreign, n)
+(define sa-fbytes-out #f)    ; memcpy(foreign, bytevector, n)
+(define (sa-fbytes-init!)
+  (unless sa-fbytes-probed?
+    (set! sa-fbytes-probed? #t)                ; probe once, even if it throws
+    (guard (e (#t #f))
+      (when (foreign-entry? "memcpy")
+        (set! sa-fbytes-in (foreign-procedure "memcpy" (u8* void* size_t) void*))
+        (set! sa-fbytes-out (foreign-procedure "memcpy" (void* u8* size_t) void*))))))
+
+;; (sa-foreign-bytes-ref! addr bv n) -> void
+;; Copy the N octets at foreign address ADDR into BV[0,N). Contract: a
+;; binary-faithful block copy, foreign -> bytevector. Degradation: a target with
+;; no block move may loop over its foreign-ref (correct, just slow) -- the
+;; fallback below is that loop, taken when memcpy does not resolve.
+(define (sa-foreign-bytes-ref! addr bv n)
+  (sa-fbytes-init!)
+  (if sa-fbytes-in
+      (begin (sa-fbytes-in bv addr n) (if #f #f))
+      (let loop ((i 0))
+        (when (fx< i n)
+          (bytevector-u8-set! bv i (foreign-ref 'unsigned-8 addr i))
+          (loop (fx+ i 1))))))
+
+;; (sa-foreign-bytes-set! addr bv n) -> void
+;; Copy BV[0,N) to the N octets at foreign address ADDR. Contract: a
+;; binary-faithful block copy, bytevector -> foreign. Degradation: as
+;; sa-foreign-bytes-ref!.
+(define (sa-foreign-bytes-set! addr bv n)
+  (sa-fbytes-init!)
+  (if sa-fbytes-out
+      (begin (sa-fbytes-out addr bv n) (if #f #f))
+      (let loop ((i 0))
+        (when (fx< i n)
+          (foreign-set! 'unsigned-8 addr i (bytevector-u8-ref bv i))
+          (loop (fx+ i 1))))))
+
 ;; (sa-foreign-sizeof type) -> exact integer
 ;; Size in bytes of a foreign type (struct layout, array allocation). Contract:
 ;; the type's byte size. Degradation: none.

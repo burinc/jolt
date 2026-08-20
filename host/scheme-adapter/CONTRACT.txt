@@ -166,11 +166,19 @@ sa-procedure-info
 #   ONLY if the collector never stops other threads (the R4 collect-safety
 #   semantic);
 # - the data-plane entries (alloc/free/ref/set!/sizeof) degrade none — a target
-#   with the ffi capability provides them; without it, jolt.ffi raises cleanly.
+#   with the ffi capability provides them; without it, jolt.ffi raises cleanly;
+# - sa-foreign-bytes-ref!/-set! are the BULK octet moves (a block copy between
+#   foreign memory and a bytevector). A target with no block move may implement
+#   them as a loop over its own foreign-ref/-set! — correct, and the constant
+#   they exist to remove comes back. They pass the bytevector to C by address,
+#   so a target must keep it address-stable for the call's duration and must
+#   NOT make them collect-safe.
 sa-foreign-alloc
 sa-foreign-free
 sa-foreign-ref
 sa-foreign-set!
+sa-foreign-bytes-ref!
+sa-foreign-bytes-set!
 sa-foreign-sizeof
 sa-lock-object
 sa-unlock-object

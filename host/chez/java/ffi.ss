@@ -172,16 +172,22 @@
 (define ffi-null 0)
 
 ;; --- buffer I/O (known length) ----------------------------------------------
+;; Every one of these moves the block in ONE sa-foreign-bytes-ref!/-set! call
+;; and does any per-element work (signed-byte fold, UTF-8 decode) on the Scheme
+;; side. A byte at a time across the foreign boundary costs ~30ns each — an
+;; order of magnitude more than the same loop over a bytevector — so a 64K
+;; socket read used to spend ~2ms in the copy alone.
+
 ;; read n bytes at ptr as a string (UTF-8, falling back to latin1 for invalid
 ;; sequences) — for a socket recv buffer and similar fixed-length reads.
 (define (ffi-read-bytes ptr n)
   (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (bv (make-bytevector n)))
-    (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (sa-foreign-ref 'unsigned-8 p i)))
+    (sa-foreign-bytes-ref! p bv n)
     (guard (e (#t (list->string (map integer->char (bytevector->u8-list bv))))) (utf8->string bv))))
 ;; write a string's UTF-8 bytes into ptr (no NUL terminator); return the count.
 (define (ffi-write-bytes ptr s)
   (let* ((bv (string->utf8 (jolt-str-render-one s))) (n (bytevector-length bv)) (p (jnum->exact ptr)))
-    (do ((i 0 (+ i 1))) ((= i n)) (sa-foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
+    (sa-foreign-bytes-set! p bv n)
     n))
 (def-var! "jolt.ffi" "read-bytes" ffi-read-bytes)
 (def-var! "jolt.ffi" "write-bytes" ffi-write-bytes)
@@ -190,18 +196,60 @@
 ;; Move raw bytes between a jolt byte-array (jolt-array kind 'byte) and foreign
 ;; memory, byte-exact (no UTF-8 / latin1 decode) — for socket recv/send and the
 ;; zlib / OpenSSL buffers an HTTP client passes through. read-array returns a
-;; fresh byte-array of n bytes; write-array copies a byte-array's bytes into ptr
-;; and returns the count. Foreign memory is unsigned octets and a byte-array element
-;; is a signed byte, so the two directions fold and mask across that seam.
+;; fresh byte-array of n bytes; read-into! fills an EXISTING one (so a caller
+;; that knows the total length up front reads a stream into one buffer instead
+;; of regrowing an accumulator per chunk); write-array copies a byte-array's
+;; bytes — all of them, or a slice — into ptr and returns the count. Foreign
+;; memory is unsigned octets and a byte-array element is a signed byte, so the
+;; two directions fold and mask across that seam (bytevector-s8-ref/-u8-set!
+;; are that fold).
+(define (ffi-bv->byte-vec! bv v off n)
+  (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v (+ off i) (bytevector-s8-ref bv i))))
+(define (ffi-byte-vec->bv! v off n)
+  (let ((bv (make-bytevector n)))
+    (do ((i 0 (+ i 1))) ((= i n))
+      (bytevector-u8-set! bv i (bitwise-and (exact (vector-ref v (+ off i))) #xff)))
+    bv))
+
 (define (ffi-read-array ptr n)
-  (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (v (make-vector n 0)))
-    (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (na-u8->byte (sa-foreign-ref 'unsigned-8 p i))))
+  (let* ((n (jnum->exact n)) (p (jnum->exact ptr)) (bv (make-bytevector n)) (v (make-vector n 0)))
+    (sa-foreign-bytes-ref! p bv n)
+    (ffi-bv->byte-vec! bv v 0 n)
     (make-jolt-array v 'byte)))
-(define (ffi-write-array ptr arr)
-  (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (p (jnum->exact ptr)))
-    (do ((i 0 (+ i 1))) ((= i n)) (sa-foreign-set! 'unsigned-8 p i (bitwise-and (exact (vector-ref v i)) #xff)))
-    n))
+
+;; (read-into! ptr arr off n) -> n. Copy n bytes at ptr into arr starting at off
+;; (the java.io.InputStream/read argument order). Throws rather than writing out
+;; of bounds — a short read that silently truncated would corrupt the buffer.
+(define (ffi-read-into! ptr arr off n)
+  (let* ((n (jnum->exact n)) (off (jnum->exact off)) (p (jnum->exact ptr))
+         (v (jolt-array-vec arr)) (cap (vector-length v)))
+    (when (or (< off 0) (< n 0) (> (+ off n) cap))
+      (jolt-throw (jolt-ex-info "jolt.ffi/read-into!: range outside the byte-array"
+                                (jolt-hash-map (jolt-keyword "offset") off
+                                               (jolt-keyword "length") n
+                                               (jolt-keyword "capacity") cap))))
+    (let ((bv (make-bytevector n)))
+      (sa-foreign-bytes-ref! p bv n)
+      (ffi-bv->byte-vec! bv v off n)
+      n)))
+
+(define ffi-write-array
+  (case-lambda
+    ((ptr arr)
+     (let ((v (jolt-array-vec arr)))
+       (ffi-write-array ptr arr 0 (vector-length v))))
+    ((ptr arr off n)
+     (let* ((n (jnum->exact n)) (off (jnum->exact off)) (p (jnum->exact ptr))
+            (v (jolt-array-vec arr)) (cap (vector-length v)))
+       (when (or (< off 0) (< n 0) (> (+ off n) cap))
+         (jolt-throw (jolt-ex-info "jolt.ffi/write-array: range outside the byte-array"
+                                   (jolt-hash-map (jolt-keyword "offset") off
+                                                  (jolt-keyword "length") n
+                                                  (jolt-keyword "capacity") cap))))
+       (sa-foreign-bytes-set! p (ffi-byte-vec->bv! v off n) n)
+       n))))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
+(def-var! "jolt.ffi" "read-into!" ffi-read-into!)
 (def-var! "jolt.ffi" "write-array" ffi-write-array)
 
 ;; --- string / bytevector marshaling ------------------------------------------
