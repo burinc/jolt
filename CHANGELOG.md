@@ -33,6 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--opt` no longer unrolls recursive fn clusters into exponential code**
+  ([#682](https://github.com/jolt-lang/jolt/issues/682)). The inline pass
+  refused direct self-recursion but not *mutual* recursion, and its fixpoint
+  pasted one more layer of a cycle per round — so Ruuter's 4-way-branching
+  route matcher unrolled to ~4^5 copies: a 3.4 MB `match-trie`, a 71x bigger
+  `flat.ss`, 32s builds, and +76 MB idle RSS for a one-route program. A fn
+  that can reach itself through the stashed-inline call graph is now never an
+  inline candidate; its calls stay real, exactly as they compile without
+  `--opt`. Measured on the minimal repro: idle RSS 116 → 40 MB (the no-Ruuter
+  control is 38.5), build 32.5 → 3.9s, route throughput unchanged (~2%
+  faster). Acyclic helpers called from cycle code still inline.
+
 - **A library replacing a host class constructor now says so under
   `JOLT_DEBUG`.** `clojure.core/__register-class-ctor!` exists so a shim can
   register a class jolt does not model, but nothing stopped it from replacing

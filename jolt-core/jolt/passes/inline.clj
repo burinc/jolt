@@ -127,6 +127,51 @@
       (safe-op? op) (reduce-ir-children (fn [ok c] (and ok (body-closed? c scope))) true node)
       :else false)))
 
+(defn direct-call-edges
+  "The [ns name] of every direct callee in body — each :invoke whose :fn is a
+  :var. These are the only edges the splicer can follow (a var passed as a VALUE
+  is referenced, never spliced), so they are exactly the graph
+  splice-cycle-member? walks. Computed once at stash time (jolt.passes/stash-of)
+  and stored on the stash as :calls."
+  [node]
+  (let [f (get node :fn)
+        acc (if (and (= :invoke (get node :op)) (= :var (get f :op)))
+              [[(get f :ns) (get f :name)]]
+              [])]
+    (reduce-ir-children (fn [a c] (into a (direct-call-edges c))) acc node)))
+
+(defn- stash-calls [ctx nsn nm]
+  (let [s (inline-ir ctx nsn nm)]
+    (if s (get s :calls) [])))
+
+(defn- splice-cycle-member?
+  "True when the callee can reach itself through the stash graph — a self- or
+  mutually-recursive cluster every edge of which is spliceable. Inlining such a
+  fn cannot converge: the spliced body re-exposes a call into the cycle, so each
+  inline-fixpoint round pastes one more layer and the body grows by the cycle's
+  branching factor per round until the round cap. Ruuter's 4-way matcher cycle
+  unrolled to 4^5 residual calls — a 3.4MB match-trie and +73MiB idle RSS
+  (jolt-682). A cycle member is never an inline candidate; its calls stay real,
+  exactly as they compile without --opt. Only MEMBERSHIP disqualifies: a fn that
+  merely calls INTO a cycle splices one bounded copy, because the cycle members
+  inside that copy are refused here.
+
+  Recomputed per splice attempt, no memo: stashes stream in as forms compile —
+  from parallel namespace loads too — and a cached 'acyclic' goes stale the
+  moment a later stash closes the loop."
+  [ctx nsn nm]
+  (let [start [nsn nm]]
+    (loop [work (seq (stash-calls ctx nsn nm)) seen #{}]
+      (if work
+        (let [e (first work)]
+          (cond
+            (= e start) true
+            (contains? seen e) (recur (next work) seen)
+            :else (recur (seq (concat (stash-calls ctx (nth e 0) (nth e 1))
+                                      (next work)))
+                         (conj seen e))))
+        false))))
+
 (defn- try-inline
   "node is an :invoke whose children are already inlined. If its :fn is a var
   with a stashed, in-budget, arity-matching inline body, return the spliced
@@ -143,7 +188,10 @@
                 args (get node :args)]
             (if (and (= (count params) (count args))
                      (<= (body-size body) inline-budget)
-                     (body-closed? body (reduce conj #{} params)))
+                     (body-closed? body (reduce conj #{} params))
+                     ;; cheapest checks first; the graph walk only runs on a
+                     ;; stash that would otherwise splice.
+                     (not (splice-cycle-member? ctx (get f :ns) (get f :name))))
               (let [n (count params)
                     ;; trivial args (local/const) substitute straight in (copy
                     ;; propagation); the rest get a fresh local bound once in a

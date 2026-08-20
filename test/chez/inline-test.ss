@@ -96,6 +96,50 @@
   (ok "the sq call is inlined away" (not (has? (code-part e) "sq"))))
 (ok "accumulator over inlined ^double call: 3*4.0 = 12" (= 12 (jnum->exact (ev "((fn* ([] (loop [acc 0.0 i 0] (if (< i 3) (recur (+ acc (sq 2.0)) (inc i)) acc)))))"))))
 
+;; --- recursion cycles are never inlined (jolt-682) ---------------------------
+;; A fn whose stashed body can reach itself through other stashes (mutual
+;; recursion) must not be spliced: the spliced body re-exposes a call into the
+;; cycle, so each inline-fixpoint round pastes one more layer and the body grows
+;; by the cycle's branching factor per round until the cap. Ruuter's 4-way
+;; matcher cycle unrolled to 4^5 copies — a 3.4MB match-trie and +73MiB idle RSS.
+;; The cycle member keeps its real call, exactly as it compiles without --opt.
+(define (count-occ s sub)
+  (let ((ns (string-length s)) (nsub (string-length sub)))
+    (let loop ((i 0) (c 0))
+      (cond ((> (+ i nsub) ns) c)
+            ((string=? (substring s i (+ i nsub)) sub) (loop (+ i nsub) (+ c 1)))
+            (else (loop (+ i 1) c))))))
+
+;; two-fn cycle, branching 1
+(ev "(declare pongf)")
+(ev "(def pingf (fn* ([n] (if (< n 1) 0 (pongf (- n 1))))))")
+(ev "(def pongf (fn* ([n] (if (< n 1) 1 (pingf (- n 1))))))")
+(let ((e (emitf "u" "(fn* ([n] (pingf n)))")))
+  (ok "a mutual-recursion member is not inlined (one pingf call remains)"
+      (= 1 (count-occ (code-part e) "pingf")))
+  (ok "its cycle partner is not pasted in" (= 0 (count-occ (code-part e) "pongf"))))
+(ok "mutual pair still runs: (pingf 4) = 0" (= 0 (jnum->exact (ev "((fn* ([] (pingf 4))))"))))
+(ok "mutual pair still runs: (pingf 3) = 1" (= 1 (jnum->exact (ev "((fn* ([] (pingf 3))))"))))
+
+;; branching cycle (the jolt-682 shape): bx-a calls bx-b TWICE, bx-b calls back.
+;; Unrolling this doubles per round — 2^rounds copies — so the count assertion
+;; is the size gate.
+(ev "(declare bx-b)")
+(ev "(def bx-a (fn* ([n] (if (< n 1) 0 (+ (bx-b (- n 1)) (bx-b (- n 2)))))))")
+(ev "(def bx-b (fn* ([n] (bx-a (- n 1)))))")
+(let ((e (emitf "u" "(fn* ([n] (bx-a n)))")))
+  (ok "a branching cycle member is not inlined" (= 1 (count-occ (code-part e) "bx-a")))
+  (ok "no cycle layer is pasted in" (= 0 (count-occ (code-part e) "bx-b"))))
+(ok "branching cycle still runs: (bx-a 3) = 0" (= 0 (jnum->exact (ev "((fn* ([] (bx-a 3))))"))))
+
+;; an ACYCLIC helper called from cycle code still inlines — only membership in
+;; the cycle disqualifies, not proximity to one.
+(ev "(def tinyh (fn* ([x] (+ x 1))))")
+(let ((e (emitf "u" "(def bx-caller (fn* ([n] (bx-a (tinyh n)))))")))
+  (ok "an acyclic helper beside a cycle call is still inlined"
+      (= 0 (count-occ (code-part e) "tinyh")))
+  (ok "while the cycle call stays real" (= 1 (count-occ (code-part e) "bx-a"))))
+
 (set-optimize! #f)
 (set-direct-link-flag! #f)
 (printf "~a/~a passed~n" (- total fails) total)
