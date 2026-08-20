@@ -5,7 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.18] - 2026-08-20
+
+A patch release. The headline is the `--opt` fix for issue #682 — the inliner
+unrolled mutually recursive fn clusters exponentially, which cost a one-route
+Ruuter server ~76 MB of idle RSS — plus the tail of the bit-op/numeric-hint
+performance and conformance work, and the bulk FFI byte moves.
 
 ### Added
 
@@ -17,7 +22,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   array's bounds throws rather than truncating. `write-array` gained the
   matching slice arity `(write-array ptr arr off n)`.
 
+- **`ProcessBuilder.inheritIO()` and the redirect getters.** `inheritIO` is
+  the JDK's `redirectInput(INHERIT).redirectOutput(INHERIT).redirectError(INHERIT)`
+  returning `this`; each `redirect*` method also gained its 0-arg getter
+  arity, with an unset stream reading back as `PIPE` (the documented default).
+  `Redirect.INHERIT`/`PIPE` are singletons, so
+  `(= (.redirectInput pb) Redirect/INHERIT)` compares true after `.inheritIO()`,
+  as on the JVM.
+
+- **URL-safe Base64** ([#686](https://github.com/jolt-lang/jolt/issues/686)):
+  `java.util.Base64/getUrlEncoder`, `getUrlDecoder`, and `.withoutPadding` on
+  either encoder. The URL alphabet swaps `-_` for `+/`, the URL decoder takes
+  padded and unpadded input, and each decoder rejects the other's alphabet,
+  as on the JVM.
+
+- **Four benchmarks covering axes the suite couldn't see** — `hash-eq`
+  (composite hashing/equality), `literals` (constant collection literals),
+  `transients` (bulk build), `string-ops` (host string interop) — plus
+  `vecops`/`nth-access` restored to the scorecard.
+
 ### Changed
+
+- **Bit ops and numeric-hint coercions are open-coded again.** Moving
+  `bit-and`/`or`/`xor`/`not` and the `^long`/`^double` hint coercions onto
+  classed-exception helpers (v0.5.13) turned Chez-inlined primitives into
+  cross-unit calls cp0 cannot reach — a 1.7x `loop-recur` regression the old
+  scorecard hid. `->int` gained a fixnum fast path, the emitter open-codes the
+  fixnum arm of the four bit ops (`fxand`/`fxior`/`fxxor`/`fxnot`) behind a
+  runtime guard, and the no-op case of `jolt->fl`/`jolt->fx` is hoisted to the
+  call site. 1.28M `bit-xor`s: 26 → 4ms, back at the v0.5.12 raw-primitive
+  time; every operand that could raise still reaches the helper, which owns
+  the classed error (now naming the operand's class, as the reference does).
 
 - **FFI buffer moves copy the whole block instead of one byte at a time.**
   `read-array`, `write-array`, `read-bytes` and `write-bytes` crossed the
@@ -44,6 +79,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--opt`. Measured on the minimal repro: idle RSS 116 → 40 MB (the no-Ruuter
   control is 38.5), build 32.5 → 3.9s, route throughput unchanged (~2%
   faster). Acyclic helpers called from cycle code still inline.
+
+- **Five numeric-hint and bit-op divergences from the reference**, found by
+  diffing 136 hint/bit cases against JVM Clojure after the open-coding work:
+  the `^long` parameter coercion is now exactly `RT.longCast` (an out-of-range
+  exact integer raises "Value out of range for long", `NaN`/`Infinity` answer
+  as the reference does, a `Character` is a `ClassCastException`); the `^long`
+  *return* coercion is `Number.longValue` (2^64 wraps to 0, `Inf` saturates,
+  `NaN` → 0 — a different operation from the parameter one, and now modelled
+  as one); a `:long` operand beside a proven double no longer assumes fixnum
+  range (a 2^60..2^63 bignum widened through `fixnum->flonum` raised where the
+  reference answers); `bit-clear` wraps to 64 bits like `bit-set`/`bit-flip`
+  (`(bit-clear -1 63)` is `Long/MAX_VALUE`, not -2^63-1); and `(double \a)` /
+  `(float \a)` is documented as a deliberate permissive divergence (jolt reads
+  the code point at every width; the reference throws for the float widths
+  only) in known-divergences.edn.
+
+- **A `^long`/`^double` return hint on the arglist vector is honored**, not
+  just on the defn name: `(fn ^long [x] x)` and `(defn f ^long [x] x)` both
+  declare the primitive return now, as in the reference. An explicit name-tag
+  still wins, and a non-numeric arglist tag stays ignored.
+
+- **`#()` no longer strips reader metadata from collection literals in its
+  body.** The `%`-substitution walk rebuilds every collection it visits, and
+  the rebuilt object lost its `^meta` at any depth — which is how
+  `#((fn ^long [x] x) v)` lost its return hint (the hint lives on the arglist
+  vector) and `(#(meta ^{:a 1} [1 2]))` read nil.
+
+- **A load-sensitive assertion in the fibers process-io gate**: check 8
+  sampled the pipe writer's `'parked` state at the instant its sibling fiber
+  completed, but a writer oscillates park/unpark while the child drains its
+  kernel buffers, so the sample raced under full-suite load. It now asserts
+  the load-independent property (the sibling finished while the 2MB write
+  could not yet have).
+
+- **The gambit adapter binds the new bulk foreign-bytes contract entries**, so
+  its contract-name gate can again tell "target with no ffi" from "target that
+  forgot to port an entry".
 
 - **A library replacing a host class constructor now says so under
   `JOLT_DEBUG`.** `clojure.core/__register-class-ctor!` exists so a shim can
