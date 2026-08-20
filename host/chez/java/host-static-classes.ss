@@ -1218,34 +1218,45 @@
         (cons "defaultCharset" (lambda () "UTF-8"))))
 
 ;; ---- Base64 (RFC 4648) ------------------------------------------------------
+;; One codec, two alphabets: basic (+/) and URL-safe (-_), section 5 of the RFC.
+;; An encoder/decoder jhost carries (vector alphabet pad?) as its state, so
+;; getUrlEncoder/getUrlDecoder and .withoutPadding are the SAME tags with
+;; different state — .withoutPadding returns a fresh encoder, like the JDK's
+;; (whose encoders are immutable), and each decoder rejects the other
+;; alphabet's chars because b64-char-val searches only its own alphabet.
 (define b64-alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+(define b64url-alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+(define (b64-self-alphabet self)
+  (let ((st (jhost-state self))) (if (vector? st) (vector-ref st 0) b64-alphabet)))
+(define (b64-self-pad? self)
+  (let ((st (jhost-state self))) (if (vector? st) (vector-ref st 1) #t)))
 (define (->bytevector x)
   (cond ((bytevector? x) x)
         ((and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)) (na-bytearray->bv x))
         ((string? x) (string->utf8 x))
         (else (string->utf8 (jolt-str-render-one x)))))
-(define (b64-encode x)
+(define (b64-encode x alphabet pad?)
   (let* ((bs (->bytevector x)) (n (bytevector-length bs)) (out '()))
     (let loop ((i 0))
-      (if (>= i n) (list->string (reverse out))
+      (if (>= i n) (list->string (filter char? (reverse out)))
           (let* ((b0 (bytevector-u8-ref bs i))
                  (b1 (if (< (+ i 1) n) (bytevector-u8-ref bs (+ i 1)) #f))
                  (b2 (if (< (+ i 2) n) (bytevector-u8-ref bs (+ i 2)) #f)))
-            (set! out (cons (string-ref b64-alphabet (bitwise-arithmetic-shift-right b0 2)) out))
-            (set! out (cons (string-ref b64-alphabet (bitwise-ior (bitwise-arithmetic-shift-left (bitwise-and b0 3) 4)
+            (set! out (cons (string-ref alphabet (bitwise-arithmetic-shift-right b0 2)) out))
+            (set! out (cons (string-ref alphabet (bitwise-ior (bitwise-arithmetic-shift-left (bitwise-and b0 3) 4)
                                                                   (bitwise-arithmetic-shift-right (or b1 0) 4))) out))
-            (set! out (cons (if b1 (string-ref b64-alphabet (bitwise-ior (bitwise-arithmetic-shift-left (bitwise-and b1 15) 2)
-                                                                         (bitwise-arithmetic-shift-right (or b2 0) 6))) #\=) out))
-            (set! out (cons (if b2 (string-ref b64-alphabet (bitwise-and b2 63)) #\=) out))
+            (set! out (cons (if b1 (string-ref alphabet (bitwise-ior (bitwise-arithmetic-shift-left (bitwise-and b1 15) 2)
+                                                                         (bitwise-arithmetic-shift-right (or b2 0) 6))) (and pad? #\=)) out))
+            (set! out (cons (if b2 (string-ref alphabet (bitwise-and b2 63)) (and pad? #\=)) out))
             (loop (+ i 3)))))))
-(define (b64-char-val c)
-  (let loop ((i 0)) (cond ((= i 64) (throw-jvm 'IllegalArgumentException "Base64: illegal character")) ((char=? (string-ref b64-alphabet i) c) i) (else (loop (+ i 1))))))
-(define (b64-decode x)
+(define (b64-char-val c alphabet)
+  (let loop ((i 0)) (cond ((= i 64) (throw-jvm 'IllegalArgumentException "Base64: illegal character")) ((char=? (string-ref alphabet i) c) i) (else (loop (+ i 1))))))
+(define (b64-decode x alphabet)
   (let* ((str (let ((s (if (string? x) x (utf8->string (->bytevector x)))))
                 (list->string (filter (lambda (c) (not (char=? c #\=))) (string->list s)))))
          (out '()) (acc 0) (bits 0))
     (for-each (lambda (c)
-                (set! acc (bitwise-ior (bitwise-arithmetic-shift-left acc 6) (b64-char-val c)))
+                (set! acc (bitwise-ior (bitwise-arithmetic-shift-left acc 6) (b64-char-val c alphabet)))
                 (set! bits (+ bits 6))
                 (when (>= bits 8)
                   (set! bits (- bits 8))
@@ -1257,13 +1268,16 @@
 ;; which no collection dispatcher knows, so (vec (.decode dec s)) threw "Don't know
 ;; how to create ISeq from" and every caller had to route it through String. first.
 (register-host-methods! "b64-encoder"
-  (list (cons "encode" (lambda (self bs) (na-bv->bytearray (string->utf8 (b64-encode bs)))))
-        (cons "encodeToString" (lambda (self bs) (b64-encode bs)))))
+  (list (cons "encode" (lambda (self bs) (na-bv->bytearray (string->utf8 (b64-encode bs (b64-self-alphabet self) (b64-self-pad? self))))))
+        (cons "encodeToString" (lambda (self bs) (b64-encode bs (b64-self-alphabet self) (b64-self-pad? self))))
+        (cons "withoutPadding" (lambda (self) (make-jhost "b64-encoder" (vector (b64-self-alphabet self) #f))))))
 (register-host-methods! "b64-decoder"
-  (list (cons "decode" (lambda (self s) (na-bv->bytearray (b64-decode s))))))
+  (list (cons "decode" (lambda (self s) (na-bv->bytearray (b64-decode s (b64-self-alphabet self)))))))
 (register-class-statics! "Base64"
-  (list (cons "getEncoder" (lambda () (make-jhost "b64-encoder" '())))
-        (cons "getDecoder" (lambda () (make-jhost "b64-decoder" '())))))
+  (list (cons "getEncoder" (lambda () (make-jhost "b64-encoder" (vector b64-alphabet #t))))
+        (cons "getDecoder" (lambda () (make-jhost "b64-decoder" (vector b64-alphabet #t))))
+        (cons "getUrlEncoder" (lambda () (make-jhost "b64-encoder" (vector b64url-alphabet #t))))
+        (cons "getUrlDecoder" (lambda () (make-jhost "b64-decoder" (vector b64url-alphabet #t))))))
 
 ;; ---- java.util.regex.Pattern ------------------------------------------------
 ;; Pattern/compile returns a jolt-regex value (regex-t), so str/replace, re-find,
