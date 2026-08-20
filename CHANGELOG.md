@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`InputStream` gained `readNBytes` and `transferTo`, and `mark`/`reset`
+  now mark.** `readNBytes` (both arities) and `transferTo` were absent, and
+  `markSupported` answered `false` for every stream while `reset` silently
+  seeked to 0 — so a caller that marked mid-stream and reset believed it had
+  gone back to the mark and was actually at the start. `markSupported` is now
+  `true` for `ByteArrayInputStream` and `false` for `FileInputStream` (the JVM's
+  answers), `mark` records the position, `reset` returns to it, and `reset` on a
+  stream that does not support marking throws `IOException` rather than
+  pretending. Every value checked against JVM Clojure, edges included.
+
+- **`BufferedInputStream` provides `mark`/`reset` where the port can seek.**
+  On the JVM, wrapping any stream in `BufferedInputStream` makes
+  `markSupported` true. jolt now honours that over a seekable source (a file
+  or byte-array stream); over a socket, pipe, or stdin — where the JVM would
+  replay from its buffer — the wrapper stays the wrapped stream and answers
+  `false` honestly (documented in known-divergences.edn, with `System/in`
+  called out: `true` on the JVM, `false` here).
+
+### Fixed
+
+- **The `mark` surface crashed on `System/in`.** `#690`'s mark state was added
+  to streams built through the constructors but not to the `System/in`
+  singleton, so `(.markSupported System/in)` (and `.mark`/`.reset`) raised a
+  raw host error instead of answering. It answers `false` now, `.mark` is
+  accepted and ignored, and `.reset` throws `IOException`.
+
 ## [0.7.18] - 2026-08-20
 
 A patch release. The headline is the `--opt` fix for issue #682 — the inliner
@@ -65,16 +95,6 @@ performance and conformance work, and the bulk FFI byte moves.
   (`sa-foreign-bytes-ref!` / `sa-foreign-bytes-set!`); a target with no block
   move may implement them as the old per-byte loop, which is what the Chez
   side falls back to if `memcpy` does not resolve.
-
-- **`InputStream` gained `readNBytes` and `transferTo`, and `mark`/`reset`
-  now mark.** `readNBytes` (both arities) and `transferTo` were absent, and
-  `markSupported` answered `false` for every stream while `reset` silently
-  seeked to 0 — so a caller that marked mid-stream and reset believed it had
-  gone back to the mark and was actually at the start. `markSupported` is now
-  `true` for `ByteArrayInputStream` and `false` for `FileInputStream` (the JVM's
-  answers), `mark` records the position, `reset` returns to it, and `reset` on a
-  stream that does not support marking throws `IOException` rather than
-  pretending. Every value checked against JVM Clojure, edges included.
 
 ### Fixed
 
