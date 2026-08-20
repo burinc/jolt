@@ -20,14 +20,32 @@
 ;; of the loop-recur benchmark's regression when the bit ops moved off the raw
 ;; Chez primitives onto these helpers. Same fix the int/long/unchecked-* casts
 ;; already carry.
+;; The reference is Numbers.bitOpsCast, whose message is built from
+;; x.getClass() — so it names the CLASS, not the value, and on nil the
+;; getClass() call NPEs before the IllegalArgumentException is ever built.
+;; Both are modelled here. Kept out of ->int's body so the hot path stays small.
+;;
+;; jolt's unified integer model has no separate bigint type to ask jolt-class-name
+;; for, but it does not need one: ->int only rejects an exact integer when it is
+;; outside signed 64-bit range, and a value the reference cannot hold in a long is
+;; a clojure.lang.BigInt by construction. Every other operand kind answers through
+;; jolt-class-name directly.
+(define (->int-throw x)
+  (if (jolt-nil? x)
+      (jolt-throw (jolt-host-throwable "java.lang.NullPointerException"
+                                       "bit operation not supported for: nil"))
+      (throw-jvm (quote IllegalArgumentException)
+                 (string-append "bit operation not supported for: class "
+                                (if (and (number? x) (exact? x) (integer? x))
+                                    "clojure.lang.BigInt"
+                                    (jolt-class-name x))))))
 (define (->int x)
   (if (fixnum? x)
       x
       (if (and (number? x) (exact? x) (integer? x)
                (>= x ->int-long-min) (<= x ->int-long-max))
           x
-          (throw-jvm (quote IllegalArgumentException)
-                     (string-append "bit operation not supported for: " (jolt-final-str x))))))
+          (->int-throw x))))
 ;; Mask shift count to low 6 bits (JVM long shift semantics), then wrap result
 ;; to 64-bit signed two's complement.
 (define (shift-mask n) (bitwise-and (->int n) 63))

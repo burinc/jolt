@@ -723,8 +723,9 @@
                   "protocol-dispatch1" "protocol-dispatch2" "protocol-dispatch3"
                   "jolt->fl" "jolt->fx"
                   ;; the bit-op inline (bit-fx-ops): its fixnum guard and the
-                  ;; four Chez fixnum ops it open-codes to.
-                  "fixnum?" "fxand" "fxior" "fxxor" "fxnot"
+                  ;; four Chez fixnum ops it open-codes to; flonum?/fixnum? also
+                  ;; guard the hint-coercion inline (emit-nhint-coerce).
+                  "fixnum?" "flonum?" "fxand" "fxior" "fxxor" "fxnot"
                   "jolt-register-source!" "jolt-proto-epoch"
                   ;; --- bare heads emitted at sites the registry doesn't cover ---
                   ;; INVARIANT: any new bare Scheme head an emit* clause outputs
@@ -1194,10 +1195,27 @@
 ;; (first entry) coerces — recur carries already-typed values, like a JVM goto. This
 ;; is what makes the hint a contract the body's fl*/fx* ops can rely on. `orig` is
 ;; the param's source name (the :nhints key); `munged` the emitted identifier.
+;; A ^double/^long hint coercion with its NO-OP case open-coded. jolt->fl returns
+;; its argument unchanged when it is already a flonum, and jolt->fx likewise for a
+;; fixnum — the helpers already test that first — so hoisting the test to the call
+;; site is value-identical and skips a call cp0 cannot inline across compilation
+;; units. Everything that needs real conversion, or that must raise, still reaches
+;; the helper; only the case that provably does nothing is short-circuited.
+;;
+;; This is the float-side twin of the bit-op inline in emit-invoke, and the same
+;; regression: these sites emitted a bare exact->inexact until v0.5.13, which Chez
+;; inlines, and moving to jolt->fl for JVM cast semantics turned every ^double
+;; parameter entry, return and contagion site into a procedure call. On mandelbrot
+;; that was 23.0 -> 31.7ms with nothing else changed.
+(defn- emit-nhint-coerce [kind e]
+  (let [[pred helper] (if (= kind :double) ["flonum?" "jolt->fl"] ["fixnum?" "jolt->fx"])
+        t (fresh-label "_nc$")]
+    (str "(let ((" t " " e ")) (if (" pred " " t ") " t " (" helper " " t ")))")))
+
 (defn- nhint-init [nh orig munged]
   (let [k (get nh orig)]
-    (cond (= k :double) (str "(jolt->fl " munged ")")
-          (= k :long)   (str "(jolt->fx " munged ")")
+    (cond (= k :double) (emit-nhint-coerce :double munged)
+          (= k :long)   (emit-nhint-coerce :long munged)
           :else munged)))
 
 (defn- emit-arity-clause [a]
@@ -1227,8 +1245,8 @@
         ;; (jolt->fl / jolt->fx), like a JVM primitive return — so a caller's
         ;; arithmetic over the result is sound.
         ret (:ret-nhint a)]
-    [paramlist (cond (= ret :double) (str "(jolt->fl " lett ")")
-                     (= ret :long)   (str "(jolt->fx " lett ")")
+    [paramlist (cond (= ret :double) (emit-nhint-coerce :double lett)
+                     (= ret :long)   (emit-nhint-coerce :long lett)
                      :else lett)]))
 
 ;; The globally unique letrec name for the next anon literal:
@@ -2083,8 +2101,8 @@
      ;; and keeps the hint coercion.
      :coerce (let [e (emit (:expr node))]
                (cond (:cast-fn node) (str "(" (:cast-fn node) " " e ")")
-                     (= :double (:kind node)) (str "(jolt->fl " e ")")
-                     (= :long (:kind node)) (str "(jolt->fx " e ")")
+                     (= :double (:kind node)) (emit-nhint-coerce :double e)
+                     (= :long (:kind node)) (emit-nhint-coerce :long e)
                      :else e))
     :try (emit-try node)
     ;; regex literal #"…" -> a jolt-regex value (regex.ss, vendored irregex).
