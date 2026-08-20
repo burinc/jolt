@@ -75,7 +75,30 @@
                 (hashtable-set! h (car p) (cdr p)))
               members)))
 
-(define (register-class-ctor! name proc) (hashtable-set! class-ctors-tbl name proc))
+;; Names the HOST registered (io.ss, io-streams.ss, …), as opposed to a library
+;; registering a class jolt does not model. Only the host's own boot-time calls
+;; land here — the Clojure-visible hook goes through register-class-ctor-user!.
+(define host-class-ctors-tbl (make-hashtable string-hash string=?))
+
+(define (register-class-ctor! name proc)
+  (hashtable-set! host-class-ctors-tbl name #t)
+  (hashtable-set! class-ctors-tbl name proc))
+
+;; clojure.core/__register-class-ctor! lands here. Registering a class jolt does
+;; not model is the intended use; REPLACING one it does is a process-wide
+;; substitution that every other namespace silently inherits, and the symptoms
+;; are remote from the cause — jolt-lang/http-client swaps its own tagged-table
+;; shim in for java.io.ByteArrayInputStream, and any library loaded alongside it
+;; then finds (.readAllBytes body) unresolvable and io/copy ~3600x slower, with
+;; nothing pointing at the override. Report it under JOLT_DEBUG the way
+;; register-class-statics! reports a colliding static, so the cause is one env
+;; var away instead of a bisect.
+(define (register-class-ctor-user! name proc)
+  (when (and (getenv "JOLT_DEBUG") (hashtable-ref host-class-ctors-tbl name #f))
+    (fprintf (current-error-port)
+             "warning: a library replaced the host constructor for ~a — every (~a. ...) in this process now builds its shim, including in namespaces that never asked for it\n"
+             name name))
+  (hashtable-set! class-ctors-tbl name proc))
 
 (define (register-host-methods! tag members)
   (let ((h (or (hashtable-ref host-methods-tbl tag #f)

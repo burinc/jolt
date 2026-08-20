@@ -5,6 +5,45 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`jolt.ffi/read-into!`** — read a foreign buffer into a slice of an
+  existing byte-array (`(read-into! ptr arr off n)`, the
+  `InputStream.read(b, off, len)` argument order). A caller reading a stream
+  whose total length it already knows now fills one buffer instead of
+  allocating and regrowing an accumulator per chunk; a read outside the
+  array's bounds throws rather than truncating. `write-array` gained the
+  matching slice arity `(write-array ptr arr off n)`.
+
+### Changed
+
+- **FFI buffer moves copy the whole block instead of one byte at a time.**
+  `read-array`, `write-array`, `read-bytes` and `write-bytes` crossed the
+  foreign boundary once per octet, which cost ~30ns each — so a 64K socket
+  read spent ~2ms in the copy alone, dwarfing the work around it. They now
+  move the block in a single copy and do the signed-byte fold or the UTF-8
+  decode on the Scheme side. Measured on the same 64K buffer: `read-array`
+  29.9 → 2.9 ns/byte, `write-array` 31.1 → 4.9, `read-bytes` 29.8 → 1.1,
+  `write-bytes` 31.4 → 1.6. Two adapter capability entry points carry it
+  (`sa-foreign-bytes-ref!` / `sa-foreign-bytes-set!`); a target with no block
+  move may implement them as the old per-byte loop, which is what the Chez
+  side falls back to if `memcpy` does not resolve.
+
+### Fixed
+
+- **A library replacing a host class constructor now says so under
+  `JOLT_DEBUG`.** `clojure.core/__register-class-ctor!` exists so a shim can
+  register a class jolt does not model, but nothing stopped it from replacing
+  one jolt *does* — process-wide, for every namespace, silently.
+  jolt-lang/http-client substitutes its own tagged-table shim for
+  `java.io.ByteArrayInputStream`; any library loaded alongside it then finds
+  `(.readAllBytes body)` unresolvable and `io/copy` over that stream ~3600x
+  slower (0.3 → 1092 ns/byte measured), with nothing in the error pointing at
+  the override. Registering a class the host does not model — the intended
+  use — stays silent.
+
 ## [0.7.17] - 2026-08-19
 
 A performance and conformance release, out of profiling the honeysql test

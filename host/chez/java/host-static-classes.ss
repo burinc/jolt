@@ -1348,7 +1348,7 @@
         (let ((e (jolt-first s)))
           (loop (jolt-seq (jolt-rest s)) (cons (cons (jolt-nth e 0) (jolt-nth e 1)) acc))))))
 (def-var! "clojure.core" "__register-class-ctor!"
-  (lambda (name proc) (register-class-ctor! name proc) jolt-nil))
+  (lambda (name proc) (register-class-ctor-user! name proc) jolt-nil))
 (def-var! "clojure.core" "__register-class-statics!"
   (lambda (name members) (register-class-statics! name (jmap->static-alist members)) jolt-nil))
 

@@ -1001,6 +1001,40 @@ else
   fails=$((fails + 1))
 fi
 
+# A library replacing a HOST class constructor is a process-wide substitution
+# every other namespace inherits, and the symptoms land far from the cause
+# (jolt-lang/http-client swaps its shim in for java.io.ByteArrayInputStream, and
+# an unrelated namespace then finds .readAllBytes unresolvable). JOLT_DEBUG must
+# name the class that was replaced. Registering a class the host does NOT model
+# is the intended use and must stay silent.
+override_out="$(JOLT_DEBUG=1 $jolt -e '(do (clojure.core/__register-class-ctor! "java.io.ByteArrayInputStream" (fn [& _] :shim)) (clojure.core/__register-class-ctor! "com.example.NotAHostClass" (fn [& _] :ok)) nil)' 2>&1)"
+if printf '%s' "$override_out" | grep -q 'replaced the host constructor for java.io.ByteArrayInputStream' &&
+   ! printf '%s' "$override_out" | grep -q 'com.example.NotAHostClass'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: host-class override is not reported under JOLT_DEBUG"
+  printf '%s\n' "$override_out" | tail -3 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# jolt.ffi bulk byte buffers — the foreign<->bytevector block moves under
+# read-array / read-into! / write-array / read-bytes / write-bytes. Binary
+# faithfulness across the unsigned-octet/signed-byte fold, offsets, and bounds.
+# Self-checks, one marker; same capture rules as the errno gate.
+ffibytes_out="$($jolt run test/chez/jolt-ffi-bytes-test.clj 2>&1)"
+if printf '%s' "$ffibytes_out" | grep -q 'JOLT-FFI-BYTES-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.ffi bulk byte buffers"
+  if printf '%s\n' "$ffibytes_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$ffibytes_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$ffibytes_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$ffibytes_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # jolt.fibers — the public lower-level fiber API (spawn/join/monitor!, states,
 # knobs) over the carrier pool. Self-checks, one marker; same capture rules as
 # the socket gate above.

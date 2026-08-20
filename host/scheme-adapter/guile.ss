@@ -112,6 +112,14 @@
 ;;   sa-foreign-ref         UNIMPLEMENTED  ?? (parse-c-struct ...) candidate.
 ;;   sa-foreign-set!        UNIMPLEMENTED  ?? (make-c-struct ...) candidate.
 ;;   sa-foreign-sizeof      UNIMPLEMENTED  ?? (sizeof) — must verify (Guile has (sizeof)).
+;;   sa-foreign-bytes-ref!  UNIMPLEMENTED  Guile: (pointer->bytevector ptr n) + bytevector-copy!
+;;   sa-foreign-bytes-set!  UNIMPLEMENTED  — (system foreign) gives a bytevector VIEW over
+;;                                        foreign memory, so both directions are a
+;;                                        bytevector-copy!. A target with no block move may
+;;                                        loop over sa-foreign-ref/-set! instead; that is
+;;                                        correct and gives back the ~30ns/byte these exist
+;;                                        to remove. Never collect-safe: the bytevector
+;;                                        crosses to C by address.
 ;;   sa-lock-object         UNIMPLEMENTED  may BOTH no-op on a non-moving collector; Guile's
 ;;   sa-unlock-object       UNIMPLEMENTED  Boehm GC is non-moving — no-op candidate;
 ;;                                        must verify (never just one, or it leaks/crashes).

@@ -15,7 +15,22 @@
   :iptr :uptr :double :float :pointer :string :void :uint8 :char.
 
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
-  ptr->string/string->ptr/null/null?) are provided by the host. foreign-fn lowers
+  ptr->string/string->ptr/null/null?) are provided by the host, as are the
+  buffer moves: read-bytes/write-bytes decode and encode UTF-8, read-array/
+  write-array move raw octets to and from a byte-array, and read-into! fills a
+  slice of an EXISTING byte-array — so a caller reading a stream whose length
+  it already knows fills one buffer instead of regrowing an accumulator per
+  chunk. All of them move the block in one copy, not a byte at a time.
+
+      (let [buf (ffi/alloc 65536)
+            frame (byte-array total)]
+        (loop [off 0]
+          (when (< off total)
+            (let [n (recv fd buf 65536 0)]
+              (ffi/read-into! buf frame off n)     ; no per-chunk array
+              (recur (+ off n))))))
+
+  foreign-fn lowers
   a compile-time-typed signature to a real Chez foreign-procedure. foreign-callable
   is the inverse — it wraps a jolt fn as a C-callable function pointer so C can
   call back into jolt (e.g. GTK signal handlers); free-callable releases it.")
