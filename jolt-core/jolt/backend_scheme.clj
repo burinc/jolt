@@ -33,6 +33,22 @@
 (def ^:private fixed-arity-ops op-registry/fixed-arity-ops)
 (def ^:private dbl-ops op-registry/dbl-ops)
 (def ^:private lng-ops op-registry/lng-ops)
+;; The Chez fixnum op that agrees with each jolt-bit-* helper when EVERY operand
+;; is a fixnum, and the arity it applies at. Used by the bit-op inline in
+;; emit-invoke; see the comment there for why the guard is a runtime test.
+;; and/or/xor/not only: on a 61-bit tower their result is always representable as
+;; a fixnum, since the bit pattern is bounded by the operands'. That is NOT true
+;; of the shifts — bit-shift-left overflows fixnum range and jolt-bit-shift-left
+;; wraps to 64 bits — so the shifts are absent here and keep their plain call.
+;; Kept in this ns rather than derived from an op-registry fact on purpose: a NEW
+;; var in op-registry referenced from here cannot be resolved by the running seed
+;; during the first mint pass, so it analyzes as a host-static read, throws at ns
+;; load, and takes every def below it with it.
+(def ^:private bit-fx-ops
+  {"jolt-bit-and" ["fxand" 2]
+   "jolt-bit-or"  ["fxior" 2]
+   "jolt-bit-xor" ["fxxor" 2]
+   "jolt-bit-not" ["fxnot" 1]})
 (def ^:private bd-ops op-registry/bd-ops)
 (def ^:private cmp1-ops op-registry/cmp1-ops)
 (def ^:private registry-emitted-names op-registry/registry-emitted-names)
@@ -706,6 +722,9 @@
                   "register-clone*" "protocol-resolve"
                   "protocol-dispatch1" "protocol-dispatch2" "protocol-dispatch3"
                   "jolt->fl" "jolt->fx"
+                  ;; the bit-op inline (bit-fx-ops): its fixnum guard and the
+                  ;; four Chez fixnum ops it open-codes to.
+                  "fixnum?" "fxand" "fxior" "fxxor" "fxnot"
                   "jolt-register-source!" "jolt-proto-epoch"
                   ;; --- bare heads emitted at sites the registry doesn't cover ---
                   ;; INVARIANT: any new bare Scheme head an emit* clause outputs
@@ -1682,6 +1701,38 @@
           dir  (order-args (fn [as] (str "(" dir " " (first as) ")")))
           idx  (order-args (fn [as] (str "(jrec-field-at " (first as) " " idx " " (emit key-node) ")")))
           :else (order-args (fn [as] (str "(jolt-get " (str/join " " as) ")")))))
+      ;; bit-and/or/xor/not: open-code the fixnum case, helper as the slow arm.
+      ;; These moved off the raw Chez bitwise primitives — which Chez inlines to
+      ;; native code — onto jolt-bit-* helpers so a bad operand raises a CLASSED
+      ;; IllegalArgumentException in call position as well as value position. The
+      ;; helper coerces both operands through ->int, and it is a cross-unit call
+      ;; cp0 cannot inline, so the whole thing costs ~2x a raw bitwise-xor even
+      ;; with ->int's fixnum fast path (1.28M ops: 4ms raw, 8ms through the
+      ;; helper, 4ms with this inline).
+      ;;
+      ;; Soundness: ->int accepts exactly the exact integers in signed 64-bit
+      ;; range and raises on everything else, and a Chez fixnum here is 61-bit,
+      ;; so a fixnum ALWAYS took ->int's accept branch. On fixnum operands
+      ;; fxand/fxior/fxxor/fxnot agree with the generic bitwise-* ops and always
+      ;; yield a fixnum (the result's bit pattern is bounded by the operands'),
+      ;; so the fast arm is value-identical. Every operand that COULD raise —
+      ;; a non-integer, a ratio, an out-of-range bignum — still reaches the
+      ;; helper, which owns the raise. The exception path is untouched.
+      ;;
+      ;; A proven :long operand does NOT license skipping the test: jolt's ^long
+      ;; is 64-bit and a fixnum is 61, so a :long can be a bignum at runtime.
+      ;; That is why this is a runtime guard and not a :lng registry entry.
+      ;; Operands are let*-bound because each appears twice; let* also fixes
+      ;; left-to-right evaluation, so this does not need order-args.
+      (and nop (bit-fx-ops nop) (= (count args) (second (bit-fx-ops nop))))
+      (let [[fxop _] (bit-fx-ops nop)
+            tmps (mapv (fn [_] (fresh-label "_bx$")) args)
+            binds (str/join " " (map (fn [t a] (str "(" t " " a ")")) tmps args))
+            tests (str/join " " (map (fn [t] (str "(fixnum? " t ")")) tmps))
+            test (if (= 1 (count tmps)) tests (str "(and " tests ")"))]
+        (str "(let* (" binds ") (if " test
+             " (" fxop " " (str/join " " tmps) ")"
+             " " (emit-call tail? nop tmps tl) "))"))
       ;; a generic native op.
       nop (order-args (fn [as] (emit-call tail? nop as tl)))
       ;; (:k coll [default]) -> (jolt-get coll :k [default]) — the key (fnode) is a
