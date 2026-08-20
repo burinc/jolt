@@ -581,19 +581,40 @@
      (for-each (lambda (x) (rdr-anon-scan x max-box rest-box)) (seq->list (jolt-get f rdr-kw-value))))
     ((pmap? f)
      (for-each (lambda (x) (rdr-anon-scan x max-box rest-box)) (or (rdr-map-order-ref f) '())))))
+;; rdr-anon-replace REBUILDS every collection it walks, and a rebuilt collection
+;; is a fresh object — so all reader metadata on a nested literal was dropped.
+;; #() therefore stripped ^meta from every vector/map/set in its body at any
+;; depth, which is how #((fn ^long [x] x) v) lost its return hint: the ^long
+;; lives on the arglist VECTOR, and that vector got rebuilt. (meta ^{:a 1} [1 2])
+;; read nil inside #() and {:a 1} outside it.
+;;
+;; Carry the metadata across as a FORM — unlike rdr-carry-meta, which converts it
+;; to data for a value position; here the body is still code to be analyzed. A
+;; pmap copy loses its rdr-map-order side-table entry (source key order for
+;; left-to-right literal eval), so carry that too, the way the ^meta reader does.
+(define (rdr-anon-keep-meta src dst)
+  (let ((m (jolt-meta src)))
+    (if (jolt-nil? m)
+        dst
+        (let ((c (jolt-with-meta dst m)))
+          (let ((order (and (pmap? dst) (rdr-map-order-ref dst))))
+            (when order (rdr-map-order-set! c order)))
+          c))))
+
 (define (rdr-anon-replace f slots rest-sym)
   (cond
     ((symbol-t? f)
      (let ((idx (rdr-pct-index (symbol-t-name f))))
        (cond ((eq? idx 'rest) rest-sym) (idx (vector-ref slots (- idx 1))) (else f))))
-    ((pvec? f) (apply jolt-vector (map (lambda (x) (rdr-anon-replace x slots rest-sym)) (seq->list f))))
+    ((pvec? f)
+     (rdr-anon-keep-meta f (apply jolt-vector (map (lambda (x) (rdr-anon-replace x slots rest-sym)) (seq->list f)))))
     ((or (cseq? f) (empty-list-t? f))
-     (apply jolt-list (map (lambda (x) (rdr-anon-replace x slots rest-sym)) (seq->list f))))
+     (rdr-anon-keep-meta f (apply jolt-list (map (lambda (x) (rdr-anon-replace x slots rest-sym)) (seq->list f)))))
     ((rdr-anon-set? f)
-     (rdr-make-set (map (lambda (x) (rdr-anon-replace x slots rest-sym)) (seq->list (jolt-get f rdr-kw-value)))))
+     (rdr-anon-keep-meta f (rdr-make-set (map (lambda (x) (rdr-anon-replace x slots rest-sym)) (seq->list (jolt-get f rdr-kw-value))))))
     ((pmap? f)
      (let ((kv (rdr-map-order-ref f)))
-       (if kv (rdr-make-map (map (lambda (x) (rdr-anon-replace x slots rest-sym)) kv)) f)))
+       (if kv (rdr-anon-keep-meta f (rdr-make-map (map (lambda (x) (rdr-anon-replace x slots rest-sym)) kv))) f)))
     (else f)))
 (define (rdr-read-anon-fn s i end)       ; i at the '(' after '#'
   (let-values (((form j) (rdr-read-form s i end)))

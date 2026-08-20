@@ -2109,6 +2109,12 @@
   {:suite "numbers / primitive hint coercion" :label "each arity of a multi-arity fn carries its own" :expected "[0 0]" :actual "(do (def arl4 (fn (^long [x] x) (^long [x y] (+ x y)))) [(arl4 18446744073709551616N) (arl4 18446744073709551616N 0)])" :portability :common}
   {:suite "numbers / primitive hint coercion" :label "a ^double arglist hint widens the return" :expected "[5.0 5.0 2.5]" :actual "(do (def arl5 (fn ^double [x] x)) (defn arl6 ^double [x] x) [(arl5 5) (arl6 5) (arl5 5/2)])" :portability :common}
   {:suite "numbers / primitive hint coercion" :label "a non-numeric arglist tag is still ignored" :expected "18446744073709551616N" :actual "(do (def arl7 (fn ^String [x] x)) (arl7 18446744073709551616N))" :portability :common}
+  {:suite "numbers / char in a numeric cast" :label "double and float reject a char; the integer casts take its code point" :expected "[:cce :cce 97 97 97 97]" :actual "[(try (double \\a) (catch ClassCastException _ :cce)) (try (float \\a) (catch ClassCastException _ :cce)) (long \\a) (int \\a) (short \\a) (byte \\a)]" :portability :common}
+  {:suite "reader / anonymous fn literal" :label "#() keeps reader metadata on a nested collection literal" :expected "[{:a 1} {:b 2} {:c 3}]" :actual "[(#(meta ^{:a 1} [1 2])) (#(meta ^{:b 2} {:k 1})) (#(meta ^{:c 3} #{1}))]" :portability :common}
+  {:suite "reader / anonymous fn literal" :label "#() keeps it at depth, not just at the top" :expected "[{:d 4} {:e 5}]" :actual "[(#(meta (first [^{:d 4} [1]]))) (#(meta (get-in {:x [^{:e 5} [1]]} [:x 0])))]" :portability :common}
+  {:suite "reader / anonymous fn literal" :label "a ^long return hint survives #()" :expected "[0 0]" :actual "(do (def B18 18446744073709551616N) [(#((fn ^long [x] x) B18)) (#(let [g (fn ^long [x] x)] (g B18)))])" :portability :common}
+  {:suite "reader / anonymous fn literal" :label "a ^double return hint survives #() too" :expected "5.0" :actual "(#((fn ^double [x] x) 5))" :portability :common}
+  {:suite "reader / anonymous fn literal" :label "#() still substitutes its params" :expected "[[2 4 6] [:b :a] [1 2 3]]" :actual "[(mapv #(* % 2) [1 2 3]) (#(vector %2 %1) :a :b) ((fn [& xs] (apply #(vec %&) xs)) 1 2 3)]" :portability :common}
   ;; var-reference cell caching (runtime path): a ref inside a fn caches the
   ;; resolved cell, but stays correct under redefinition (cell root mutated in
   ;; place) and dynamic binding (read goes through the binding-aware path).

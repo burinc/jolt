@@ -118,6 +118,24 @@
    :jvm "throws IllegalArgumentException — a map has no fields"
    :jolt "41 — the map-as-object read"
    :note "A key the map does not have throws on both. jolt's own values (deftype/defrecord slots) follow the JVM exactly: an undeclared slot is an error, not nil."}
+  ;; A char reaches the reference's INTEGER casts through RT.intCast/longCast's
+  ;; char overload — (int \\a) and (long \\a) are 97 on both — but `double` and
+  ;; `float` are declared ^Number, so a Character is a ClassCastException there.
+  ;; jolt's casts share one coercion that accepts a char at every width, so the
+  ;; float pair answers 97.0 where the reference throws. A superset in the same
+  ;; direction the reference already goes for the integer widths, and the code
+  ;; point is the only reasonable reading; narrowing it would mean a second
+  ;; coercion existing solely to reject. NOT the ^long/^double HINT path, which
+  ;; does reject a char (RT.longCast(Object)) — see jolt->fx / jolt->fx-ret.
+  ;; Corpus row "numbers / char in a numeric cast" carries the JVM's answer and
+  ;; is allowlisted in run-corpus.ss, so this is prose here rather than a keyed
+  ;; entry: keyed entries are rows whose :expected departs from the JVM, and this
+  ;; row's does not.
+  {:category :permissive
+   :behavior "(double \\a) / (float \\a)"
+   :jvm "throws ClassCastException — double/float are declared ^Number"
+   :jolt "97.0 — the char's code point, as the integer casts already give"
+   :note "(int \\a) / (long \\a) / (short \\a) / (byte \\a) are 97 on BOTH runtimes; only the float widths differ."}
   ;; jolt's strings are indexed by Unicode CODE POINT where the JVM's are indexed
   ;; by UTF-16 code unit, and (char n) follows the string model rather than the
   ;; JVM's 16-bit char: it has to accept the whole scalar-value range or it could
