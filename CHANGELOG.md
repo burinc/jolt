@@ -66,6 +66,16 @@ performance and conformance work, and the bulk FFI byte moves.
   move may implement them as the old per-byte loop, which is what the Chez
   side falls back to if `memcpy` does not resolve.
 
+- **`InputStream` gained `readNBytes` and `transferTo`, and `mark`/`reset`
+  now mark.** `readNBytes` (both arities) and `transferTo` were absent, and
+  `markSupported` answered `false` for every stream while `reset` silently
+  seeked to 0 — so a caller that marked mid-stream and reset believed it had
+  gone back to the mark and was actually at the start. `markSupported` is now
+  `true` for `ByteArrayInputStream` and `false` for `FileInputStream` (the JVM's
+  answers), `mark` records the position, `reset` returns to it, and `reset` on a
+  stream that does not support marking throws `IOException` rather than
+  pretending. Every value checked against JVM Clojure, edges included.
+
 ### Fixed
 
 - **`--opt` no longer unrolls recursive fn clusters into exponential code**
