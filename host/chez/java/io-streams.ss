@@ -36,7 +36,15 @@
 (define (in-stream-port self)
   (let ((p (vector-ref (jhost-state self) 0)))
     (if (eq? p 'stdin) (jolt-stdin-binary-port) p)))
-(define (make-in-stream port) (make-jhost "in-stream" (vector port)))
+;; state: #(port mark-supported? mark-pos). mark/reset are only honoured for a
+;; source that declares support, which on the JVM means ByteArrayInputStream
+;; (and BufferedInputStream) but NOT FileInputStream — a Chez file port is
+;; seekable, so "can I seek" is the wrong test and would answer true where the
+;; JVM answers false. The constructor says.
+(define (make-in-stream port . opt)
+  (make-jhost "in-stream" (vector port (and (pair? opt) (eq? (car opt) 'markable)) 0)))
+(define (in-stream-markable? self) (vector-ref (jhost-state self) 1))
+(define (make-in-stream-markable port) (make-in-stream port 'markable))
 (define (in-stream? x) (and (jhost? x) (string=? (jhost-tag x) "in-stream")))
 
 ;; The port behind a stream, or the JVM's IOException when it has been closed.
@@ -177,9 +185,55 @@
                      (if p (pipe-close-read! p) (close-port (in-stream-port self))))
                    jolt-nil))
    (cons "connect" (lambda (self other) (pipe-connect! self other) jolt-nil))
-   (cons "mark" (lambda (self . _) jolt-nil))
-   (cons "reset" (lambda (self) (guard (e (#t jolt-nil)) (set-port-position! (in-stream-port self) 0) jolt-nil)))
-   (cons "markSupported" (lambda (self) #f))
+   ;; readNBytes(len) reads UP TO len bytes and answers what it got — unlike
+   ;; read(byte[],off,len), it does not stop at the first short read, and it
+   ;; answers an empty array at EOF rather than -1.
+   (cons "readNBytes"
+         (lambda (self . args)
+           (if (= 1 (length args))
+               (let ((len (jnum->exact (car args))))
+                 (when (< len 0) (throw-jvm (quote IllegalArgumentException) "len < 0"))
+                 (let ((bv (get-bytevector-n (in-stream-live-port self) len)))
+                   (na-byte-array (if (eof-object? bv) (make-bytevector 0) bv))))
+               ;; (b off len) -> the count actually read, 0 at EOF (never -1)
+               (let* ((vec (jolt-array-vec (car args)))
+                      (off (jnum->exact (cadr args)))
+                      (len (jnum->exact (caddr args))))
+                 (when (or (< off 0) (< len 0) (> (+ off len) (vector-length vec)))
+                   (throw-jvm (quote IndexOutOfBoundsException) "readNBytes range"))
+                 (if (<= len 0) (->num 0)
+                     (let ((bv (get-bytevector-n (in-stream-live-port self) len)))
+                       (if (eof-object? bv) (->num 0)
+                           (let ((n (bytevector-length bv)))
+                             (let loop ((i 0))
+                               (if (>= i n) (->num n)
+                                   (begin (vector-set! vec (+ off i) (na-u8->byte (bytevector-u8-ref bv i)))
+                                          (loop (+ i 1)))))))))))))
+   ;; transferTo drains this stream into an OutputStream and answers the count.
+   (cons "transferTo"
+         (lambda (self out)
+           (let ((bv (get-bytevector-all (in-stream-live-port self))))
+             (if (eof-object? bv) (->num 0)
+                 (let ((n (bytevector-length bv)))
+                   (if (out-stream? out)
+                       (put-bytevector (out-stream-port out) bv)
+                       ;; any other shape of output stream (a library's shim):
+                       ;; go through its own write(byte[]), the way the JVM does
+                       (record-method-dispatch out "write" (jolt-list (na-byte-array bv))))
+                   (->num n))))))
+   ;; mark/reset only where the source declares support (make-in-stream). The
+   ;; JVM throws from reset() on a stream that does not support it; answering a
+   ;; silent no-op there let a caller believe it had rewound.
+   (cons "mark" (lambda (self . _)
+                  (when (in-stream-markable? self)
+                    (vector-set! (jhost-state self) 2 (port-position (in-stream-port self))))
+                  jolt-nil))
+   (cons "reset" (lambda (self)
+                   (unless (in-stream-markable? self)
+                     (io-throw "mark/reset not supported"))
+                   (set-port-position! (in-stream-port self) (vector-ref (jhost-state self) 2))
+                   jolt-nil))
+   (cons "markSupported" (lambda (self) (if (in-stream-markable? self) #t #f)))
    (cons "toString" (lambda (self) "#<InputStream>"))))
 
 ;; --- byte output stream -----------------------------------------------------
@@ -330,7 +384,7 @@
 (reg-ctor! '("ByteArrayInputStream" "java.io.ByteArrayInputStream")
   (lambda (bytes . rest)
     (let ((bv (src-bytevector bytes)))
-      (make-in-stream (open-bytevector-input-port
+      (make-in-stream-markable (open-bytevector-input-port
                        (if (>= (length rest) 2)
                            (let ((off (jnum->exact (car rest))) (len (jnum->exact (cadr rest))))
                              (let ((sub (make-bytevector len))) (bytevector-copy! bv off sub 0 len) sub))

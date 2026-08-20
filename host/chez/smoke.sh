@@ -1001,6 +1001,24 @@ else
   fails=$((fails + 1))
 fi
 
+# InputStream's fuller surface: readNBytes (both arities), transferTo, and
+# mark/reset that actually mark. Every value checked against JVM Clojure,
+# including the edges the JVM is specific about — readNBytes clamps to what
+# remains and throws on a negative count, transferTo answers 0 at EOF, and
+# markSupported is TRUE for ByteArrayInputStream but FALSE for FileInputStream
+# (where reset() throws rather than silently not rewinding, which is what made a
+# caller believe it had gone back to the start).
+check '(seq (.readNBytes (java.io.ByteArrayInputStream. (byte-array [1 2 3])) 2))' '(1 2)'
+check '(seq (.readNBytes (java.io.ByteArrayInputStream. (byte-array [1 2])) 9))' '(1 2)'
+check '(try (.readNBytes (java.io.ByteArrayInputStream. (byte-array [1])) -1) :no-throw (catch Throwable _ :threw))' ':threw'
+check '(let [b (byte-array 4)] [(.readNBytes (java.io.ByteArrayInputStream. (byte-array [1 2 3])) b 1 2) (seq b)])' '[2 (0 1 2 0)]'
+check '(let [o (java.io.ByteArrayOutputStream.)] [(.transferTo (java.io.ByteArrayInputStream. (byte-array [4 5 6])) o) (seq (.toByteArray o))])' '[3 (4 5 6)]'
+check '(.transferTo (java.io.ByteArrayInputStream. (byte-array 0)) (java.io.ByteArrayOutputStream.))' '0'
+check '(.markSupported (java.io.ByteArrayInputStream. (byte-array [1])))' 'true'
+check '(let [s (java.io.ByteArrayInputStream. (byte-array [7 8 9]))] (.read s) (.mark s 0) (.read s) (.reset s) (.read s))' '8'
+check '(.markSupported (java.io.FileInputStream. "Makefile"))' 'false'
+check '(let [s (java.io.FileInputStream. "Makefile")] (try (.reset s) :no-throw (catch Throwable _ :threw)))' ':threw'
+
 # A library replacing a HOST class constructor is a process-wide substitution
 # every other namespace inherits, and the symptoms land far from the cause
 # (jolt-lang/http-client swaps its shim in for java.io.ByteArrayInputStream, and
