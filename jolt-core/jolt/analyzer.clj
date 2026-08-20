@@ -323,6 +323,38 @@
         form))
     form))
 
+;; A ^long/^double on the ARGLIST VECTOR declares that arity's primitive return
+;; type — (fn ^long [x] x) and (defn f ^long [x] x) both mean it, and the
+;; reference honors both. jolt read the tag only off a defn's NAME, so the
+;; arglist spelling was dropped and ((fn ^long [x] x) 18446744073709551616N)
+;; answered 2^64 where the reference answers 0. strip-arglist-meta above throws
+;; the hint away for parsing, which is right — the params are what fn parsing
+;; needs — but the kind has to be read off the ORIGINAL form first.
+;;
+;; Both reader shapes are covered: the vector carries its metadata directly, and
+;; a reader that lowers ^meta on a collection to (with-meta <vec> <meta>) puts it
+;; in the third element. A non-numeric tag (^String [x]) still yields nil, so
+;; class hints on an arglist stay ignored exactly as before.
+(defn- arglist-ret-nkind [form]
+  (let [m (cond
+            (form-vec? form) (form-coll-meta form)
+            (form-list? form)
+            (let [es (vec (form-elements form))]
+              (when (and (= 3 (count es))
+                         (form-sym? (first es))
+                         (= "with-meta" (form-sym-name (first es)))
+                         (form-vec? (nth es 1)))
+                (nth es 2)))
+            :else nil)]
+    (when (map? m) (tag->nkind (get m :tag)))))
+
+;; analyze-arity over the stripped params, with the arglist's own return hint
+;; attached. An explicit :ret-nhint already on the arity wins.
+(defn- analyze-arity-with-ret [ctx params-form body env fn-name]
+  (let [a (analyze-arity ctx (strip-arglist-meta params-form) body env fn-name)
+        k (arglist-ret-nkind params-form)]
+    (if (and k (not (:ret-nhint a))) (assoc a :ret-nhint k) a)))
+
 ;; The ORIGINAL (pre-munge) names of the locals a fn literal references that are
 ;; bound OUTSIDE it — its image-registration free-name list. Computed by walking
 ;; the analyzed arities with the LEXICAL environment (a set of in-scope names):
@@ -399,12 +431,13 @@
         first* (strip-arglist-meta (first rest-items))
         node (cond
                (form-vec? first*)
-               (fn-node fn-name [(analyze-arity ctx first* (rest rest-items) env fn-name)])
+               (fn-node fn-name [(analyze-arity-with-ret ctx (first rest-items) (rest rest-items)
+                                                         env fn-name)])
                (form-list? first*)
                (fn-node fn-name
                         (mapv (fn [clause]
                                 (let [cl (vec (form-elements clause))]
-                                  (analyze-arity ctx (strip-arglist-meta (first cl)) (rest cl) env fn-name)))
+                                  (analyze-arity-with-ret ctx (first cl) (rest cl) env fn-name)))
                               rest-items))
                :else (uncompilable "fn: bad params"))
         ;; :src-form is the original post-expansion (fn* params body…) form —
