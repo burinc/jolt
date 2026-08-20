@@ -5,6 +5,98 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.17] - 2026-08-19
+
+A performance and conformance release, out of profiling the honeysql test
+suite against the JVM. The theme is hashing: the JVM caches a value's hash
+almost everywhere — `__hasheq` on records, the hash field on collections,
+`Object.hashCode` identity for functions and plain deftypes — and jolt now
+does the same, end to end. The same profiling turned up two places where the
+value model itself diverged, and both are conformance fixes with visible
+behavior changes, so **read `### Changed` before upgrading**. The honeysql
+suite that started this runs warm in 16.8s against 0.7.16's 22.1s (the JVM
+runs it in 5.1s, so 4.4x → 3.3x), and its cold first run — compile included —
+drops from 37.3s to 19.2s.
+
+### Changed
+
+- **A plain `deftype` compares and hashes by identity.** A deftype without
+  declared `equals`/`hashCode` is `Object` semantics on the JVM: two
+  equal-field instances are not `=`, do not collide as map or set keys, and
+  hash by identity. jolt hashed and compared every deftype structurally, which
+  both diverged and went quietly stale next to `^:volatile-mutable` fields.
+  defrecords keep structural equality, and a declared `equals`/`hashCode`/
+  `hasheq` still governs — and is consulted on every call, never cached, since
+  the JVM does not cache custom methods and one may read mutable state.
+
+- **Array-map thresholds follow the 1.13 reference rules exactly.** jolt's
+  64-entry keyword array-map limit is Clojure 1.13's `KW_HASHTABLE_THRESHOLD`;
+  the rules around it now match `PersistentArrayMap` in the three places they
+  drifted:
+
+  - `assoc` consults only the **added** key's type, so a keyword assoc'd onto
+    an 8-entry string-keyed map keeps it an insertion-ordered array map, and a
+    non-keyword key promotes at 9 entries.
+  - A map **literal** stays an array map to 64 entries when every entry past
+    the eighth is keyword-keyed; the first 8 may be anything (`canBePAM`).
+  - **Transients promote at capacity** — `max(8 entries, the source map's
+    size)` — whatever the key type. `(into {} kw-pairs)` and `zipmap` of 9 or
+    more pairs now return a `PersistentHashMap` exactly as they do on the JVM,
+    where they used to stay insertion-ordered to 64 here. Transient `dissoc!`
+    also compacts the way `TransientArrayMap.doWithout` does: the last entry
+    moves into the removed slot, which is visible in iteration order.
+
+  Hash-mode iteration order is byte-identical to the JVM's, so code that was
+  (incorrectly) relying on insertion order from `into`/`zipmap` results sees
+  the same reordering it would see on the JVM.
+
+- **Functions hash by identity.** Every procedure used to hash to the same
+  constant, so a function-keyed map degraded to a linear scan as it grew —
+  loading a library that keys dispatch tables by function was quadratic.
+  `hash` of a function is now a stable per-process id, like
+  `Object.hashCode`; as on the JVM, it does not survive serialization, which
+  images handle (see below).
+
+- **The image format is version 5.** Records and deftypes carry the new
+  hasheq slot, so every record layout tag bumped and older runtimes refuse
+  images written by this one, cleanly. This build reads formats 2 through 5:
+  a pre-5 image's records rebuild into the current layout through a legacy
+  arm on restore, and the checked-in v0.6.8 fixture pins that. Hash caches
+  never travel — the dump zeroes them, the way the JVM marks `__hasheq`
+  transient — and a map or set keyed by a function or plain deftype is
+  re-keyed on restore, since an identity hash is meaningless in the next
+  process.
+
+### Fixed
+
+- **A function-keyed map or set restored from an image answered every lookup
+  with nil.** The container's trie placement baked in the writing process's
+  function identities; restore now rebuilds such containers from their
+  entries. Deftype-keyed containers get the same treatment, which is also the
+  JVM's behavior for a deserialized identity-keyed map: only the restored key
+  object can answer.
+
+### Performance
+
+All figures A/B on the same machine, medians of repeated runs.
+
+- **Records:** the hasheq slot answers a repeat `hash` of a 4-field record in
+  35 ns, from 540 ns on 0.7.16 (the JVM's second call is ~10 ns, a field
+  read). A record-keyed map `get` goes 580 → 61 ns. Construction is
+  unchanged at 40 ns.
+- **Collections:** a `pvec`'s cached hash field is finally read — `hash` of
+  the same 1000-element vector repeats in 191 ns, from 131 µs — and seq/lazy
+  heads cache theirs in a side table. `=` on maps, sets and vectors
+  fast-rejects on unequal cached hashes before walking.
+- **Quoted literals:** a quoted symbol or quote-containing literal in a fn
+  body is hoisted to a per-site constant instead of being rebuilt per call.
+- **Cheap predicates:** `true?`/`false?`/`boolean?` compile to identity
+  checks (801 → 194 ns for `boolean?`), `identical?` lowers to `eq`, and the
+  keyword→symbol conversion feeding map lookups rides a small interning
+  front cache. Loading test.chuck's namespace graph goes 3.6 → 1.6 s.
+- **`zipmap`** is a native and ~2x faster at both small and large sizes,
+  with the reference's transient semantics.
+
 ## [0.7.16] - 2026-08-18
 
 A dependencies release. Most of it is one contribution (#645, thanks to
