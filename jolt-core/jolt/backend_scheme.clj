@@ -721,11 +721,14 @@
                   "devirt-resolve" "devirt-resolve-fl"
                   "register-clone*" "protocol-resolve"
                   "protocol-dispatch1" "protocol-dispatch2" "protocol-dispatch3"
-                  "jolt->fl" "jolt->fx"
+                  "jolt->fl" "jolt->fx" "jolt->fx-ret"
                   ;; the bit-op inline (bit-fx-ops): its fixnum guard and the
                   ;; four Chez fixnum ops it open-codes to; flonum?/fixnum? also
-                  ;; guard the hint-coercion inline (emit-nhint-coerce).
-                  "fixnum?" "flonum?" "fxand" "fxior" "fxxor" "fxnot"
+                  ;; guard the hint-coercion inline (emit-nhint-coerce) and the
+                  ;; :fl-coerce contagion widening, whose fixnum->flonum has been
+                  ;; emitted bare since before this set existed.
+                  "fixnum?" "flonum?" "fixnum->flonum"
+                  "fxand" "fxior" "fxxor" "fxnot"
                   "jolt-register-source!" "jolt-proto-epoch"
                   ;; --- bare heads emitted at sites the registry doesn't cover ---
                   ;; INVARIANT: any new bare Scheme head an emit* clause outputs
@@ -821,10 +824,23 @@
             (binding [*tail?* false] (emit* node))
             (emit* node))]
     ;; a :long operand of a :double-specialized op is tagged :fl-coerce by
-    ;; jolt.passes.numeric so it widens to a flonum here (JVM long->double widening
-    ;; == fixnum->flonum); the :long contract guarantees a real fixnum.
+    ;; jolt.passes.numeric so it widens to a flonum here (JVM long->double
+    ;; widening). The obvious emit is a bare (fixnum->flonum s), and that is what
+    ;; this did — on the premise that the :long contract guarantees a real fixnum.
+    ;; It does not: jolt's ^long is 64-bit and a Chez fixnum is 61, so a :long
+    ;; operand between 2^60 and 2^63 is a BIGNUM at runtime and fixnum->flonum
+    ;; raises on it. ((fn [^double a ^long b] (+ a b)) 1.5 (bit-shift-left 1 62))
+    ;; failed outright where the reference answers 4.61e18.
+    ;;
+    ;; Guard the fixnum case instead of widening the contract: the fast path is
+    ;; the same inlined fixnum->flonum, and a bignum falls to jolt->fl, which
+    ;; converts it exactly as the reference's long->double does.
     (if (:fl-coerce node)
-      (str "(fixnum->flonum " s ")")
+      (let [t (fresh-label "_fc$")]
+        (str "(let ((" t " " s "))"
+             " (if (fixnum? " t ")"
+             " (fixnum->flonum " t ")"
+             " (jolt->fl " t ")))"))
       s)))
 
 ;; A Chez string literal. Every char outside printable ASCII becomes a
@@ -1207,10 +1223,17 @@
 ;; inlines, and moving to jolt->fl for JVM cast semantics turned every ^double
 ;; parameter entry, return and contagion site into a procedure call. On mandelbrot
 ;; that was 23.0 -> 31.7ms with nothing else changed.
-(defn- emit-nhint-coerce [kind e]
-  (let [[pred helper] (if (= kind :double) ["flonum?" "jolt->fl"] ["fixnum?" "jolt->fx"])
-        t (fresh-label "_nc$")]
-    (str "(let ((" t " " e ")) (if (" pred " " t ") " t " (" helper " " t ")))")))
+;; `return?` picks the ^long RETURN coercion, which is a different operation from
+;; the parameter one: a parameter range-checks and raises, a return truncates to
+;; the low 64 bits (jolt->fx-ret; see rt.ss). ^double is the same either way.
+(defn- emit-nhint-coerce
+  ([kind e] (emit-nhint-coerce kind e false))
+  ([kind e return?]
+   (let [[pred helper] (cond (= kind :double) ["flonum?" "jolt->fl"]
+                             return?          ["fixnum?" "jolt->fx-ret"]
+                             :else            ["fixnum?" "jolt->fx"])
+         t (fresh-label "_nc$")]
+     (str "(let ((" t " " e ")) (if (" pred " " t ") " t " (" helper " " t ")))"))))
 
 (defn- nhint-init [nh orig munged]
   (let [k (get nh orig)]
@@ -1246,7 +1269,7 @@
         ;; arithmetic over the result is sound.
         ret (:ret-nhint a)]
     [paramlist (cond (= ret :double) (emit-nhint-coerce :double lett)
-                     (= ret :long)   (emit-nhint-coerce :long lett)
+                     (= ret :long)   (emit-nhint-coerce :long lett true)
                      :else lett)]))
 
 ;; The globally unique letrec name for the next anon literal:
