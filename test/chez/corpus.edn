@@ -2079,6 +2079,16 @@
   {:suite "numbers / variadic bit ops" :label "bit-xor in value position" :expected "0" :actual "(reduce bit-xor 0 [1 2 3])" :portability :common}
   {:suite "numbers / variadic bit ops" :label "bit-or via apply" :expected "7" :actual "(apply bit-or [1 2 4])" :portability :common}
   {:suite "numbers / variadic bit ops" :label "unsigned-shift over a full 64-bit value" :expected "17179869183" :actual "(unsigned-bit-shift-right -1 30)" :portability :common}
+  {:suite "numbers / bit-op operand contract" :label "a keyword operand raises IllegalArgumentException in call position" :expected ":iae" :actual "(try (bit-xor 1 :a) (catch IllegalArgumentException _ :iae))" :portability :common}
+  {:suite "numbers / bit-op operand contract" :label "and in value position, through apply" :expected ":iae" :actual "(try (apply bit-xor [1 :a]) (catch IllegalArgumentException _ :iae))" :portability :common}
+  {:suite "numbers / bit-op operand contract" :label "the variadic arity rejects a bad operand too" :expected ":iae" :actual "(try (apply bit-and [7 3 :a]) (catch IllegalArgumentException _ :iae))" :portability :common}
+  {:suite "numbers / bit-op operand contract" :label "bit-not rejects a non-integer" :expected ":iae" :actual "(try (bit-not :a) (catch IllegalArgumentException _ :iae))" :portability :common}
+  {:suite "numbers / bit-op operand contract" :label "a double is not an integer operand" :expected ":iae" :actual "(try (bit-or 1.5 1) (catch IllegalArgumentException _ :iae))" :portability :common}
+  {:suite "numbers / bit-op operand contract" :label "every op rejects, at every position" :expected "[:iae :iae :iae :iae :iae :iae :iae]" :actual "(mapv (fn [f] (try (f) (catch IllegalArgumentException _ :iae))) [(fn [] (bit-and 1 :a)) (fn [] (bit-or 1 :a)) (fn [] (bit-xor 1 :a)) (fn [] (bit-not :a)) (fn [] (apply bit-and [1 :a])) (fn [] (apply bit-or [1 :a])) (fn [] (apply bit-xor [1 :a]))])" :portability :common}
+  {:suite "numbers / bit-op operand contract" :label "an operand past signed 64-bit range raises" :expected ":iae" :actual "(try (bit-xor 18446744073709551616N 1) (catch IllegalArgumentException _ :iae))" :portability :common}
+  {:suite "numbers / bit-op operand contract" :label "an operand above fixnum range but inside long range computes" :expected "[4611686018427387905 4611686018427387904 -4611686018427387905]" :actual "[(bit-xor (bit-shift-left 1 62) 1) (bit-and (bit-shift-left 1 62) (bit-shift-left 1 62)) (bit-not (bit-shift-left 1 62))]" :portability :common}
+  {:suite "numbers / bit-op operand contract" :label "the boundary values" :expected "[-1 5 -1 -1 0]" :actual "[(bit-xor -1 0) (bit-and -1 5) (bit-or 0 -1) (bit-not 0) (bit-not -1)]" :portability :common}
+  {:suite "numbers / bit-op operand contract" :label "Long/MIN_VALUE and Long/MAX_VALUE are in range" :expected "[1 -9223372036854775808 -1]" :actual "[(bit-and Long/MAX_VALUE 1) (bit-or Long/MIN_VALUE 0) (bit-xor Long/MAX_VALUE Long/MIN_VALUE)]" :portability :common}
   ;; var-reference cell caching (runtime path): a ref inside a fn caches the
   ;; resolved cell, but stays correct under redefinition (cell root mutated in
   ;; place) and dynamic binding (read goes through the binding-aware path).
