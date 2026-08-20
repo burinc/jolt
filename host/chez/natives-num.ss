@@ -12,12 +12,22 @@
 ;; not supported for" as closely as the model allows).
 (define ->int-long-min -9223372036854775808)
 (define ->int-long-max 9223372036854775807)
+;; A fixnum is already an exact integer inside signed 64-bit range — Chez's
+;; fixnum width is 61 here, so it cannot reach ±2^63 — and it is what every
+;; ordinary bit operation is handed. Test it first: the bounds are BIGNUMS on a
+;; 61-bit tower, so the general path pays two fixnum-vs-bignum compares per
+;; operand, four per (bit-xor a b). That was ~22ms per 1.28M bit ops, i.e. all
+;; of the loop-recur benchmark's regression when the bit ops moved off the raw
+;; Chez primitives onto these helpers. Same fix the int/long/unchecked-* casts
+;; already carry.
 (define (->int x)
-  (if (and (number? x) (exact? x) (integer? x)
-           (>= x ->int-long-min) (<= x ->int-long-max))
+  (if (fixnum? x)
       x
-      (throw-jvm (quote IllegalArgumentException)
-                 (string-append "bit operation not supported for: " (jolt-final-str x)))))
+      (if (and (number? x) (exact? x) (integer? x)
+               (>= x ->int-long-min) (<= x ->int-long-max))
+          x
+          (throw-jvm (quote IllegalArgumentException)
+                     (string-append "bit operation not supported for: " (jolt-final-str x))))))
 ;; Mask shift count to low 6 bits (JVM long shift semantics), then wrap result
 ;; to 64-bit signed two's complement.
 (define (shift-mask n) (bitwise-and (->int n) 63))

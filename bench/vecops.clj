@@ -1,12 +1,12 @@
 ;; vecops — VECTOR CONCATENATION AND SLICING, the axis no other suite measures.
 ;; collections churns one vector with conj/assoc; this suite makes vectors OUT
 ;; OF vectors: pairwise `into` concatenation, `subvec` windows consumed by
-;; reduce, and a split-at-then-rejoin loop (the classic RRB workload). Today
-;; every one of these is linear per operation on jolt; when pvec grows RRB
-;; concat/slice AND core's `into`/`subvec` are wired through it (the follow-up
-;; beads to the rrb epic), these rows are where the change shows. On the JVM,
-;; `into` is linear too (core Clojure has no RRB) and `subvec` is an O(1) view
-;; that retains its parent — the ratio columns stay honest about both.
+;; reduce, and a split-at-then-rejoin loop (the classic RRB workload). These
+;; were all linear per operation on jolt until pvec grew RRB concat/slice and
+;; core's `into`/`subvec` were wired through it; concat is O(log n) here now. On
+;; the JVM, `into` is still linear (core Clojure has no RRB) and `subvec` is an
+;; O(1) view that retains its parent — the ratio columns stay honest about both,
+;; and this is the one row where jolt wins on ALGORITHM rather than constants.
 ;;
 ;; Portable Clojure (jolt + JVM Clojure).
 ;;   bench/run.sh vecops 60000
