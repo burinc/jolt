@@ -510,8 +510,16 @@
   (ok "8. the oversized write parked the fiber once the pipe filled" f8w-parked)
   (set! f8sib-done
     (wait-until (lambda () (eq? (jolt-fiber-state f8sib) 'done)) 15.0 "8. the sibling completed"))
+  ;; NOT check 1's parked-at-this-instant read: a pipe WRITER oscillates
+  ;; park/unpark while cat drains its stdin+stdout kernel buffers (~128-192KB),
+  ;; and the trivial sibling finishes inside that window — sampling 'parked here
+  ;; raced under full-suite load (one observed CI failure). A read on an empty
+  ;; pipe parks once and stays parked, which is why check 1's read is stable.
+  ;; The load-independent property is that the sibling finished while the 2MB
+  ;; write could not yet have: nothing drains p8-out until the loop below, so
+  ;; the writer is done only after ~10x more bytes than the kernel can buffer.
   (ok "8. the sibling fiber on the SAME carrier made real progress while the write was parked"
-      (and f8sib-done (eq? (jolt-fiber-state f8w) 'parked)))
+      (and f8sib-done (not (eq? (jolt-fiber-state f8w) 'done))))
   (ok "8. the sibling ran to completion" (eqv? (jolt-fiber-result f8sib) 8181))
   ;; drain cat's echoed stdout on this (plain OS thread) workload thread to
   ;; release the backpressure chain: cat is blocked writing its own stdout
