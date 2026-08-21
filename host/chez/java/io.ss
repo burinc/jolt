@@ -259,6 +259,89 @@
         ((char=? (string-ref p 0) #\/) p)
         (else (project-relative p))))
 
+;; --- canonical paths --------------------------------------------------------
+;; getCanonicalPath is realpath(3), not "make it absolute": it resolves
+;; symlinks as well as "." and "..". Answering with the absolute path -- which
+;; is what this used to do -- is not a rougher version of the same answer, it
+;; is a different one, and the difference is load-bearing. The containment
+;; check every Java program writes,
+;;
+;;   (.startsWith (.getCanonicalPath child) (.getCanonicalPath root))
+;;
+;; then passes for a symlink inside root pointing anywhere at all, so a static
+;; file server built on it serves whatever the link names. ring.middleware.file
+;; is written exactly that way.
+(define c-realpath (jolt-foreign-proc-safe "realpath" '(string u8*) 'iptr))
+
+(define (jfile-cstr buf)                        ; buf up to the first NUL, as a string
+  (let loop ((i 0))
+    (cond ((>= i (bytevector-length buf)) (utf8->string buf))
+          ((= 0 (bytevector-u8-ref buf i))
+           (let ((bv (make-bytevector i)))
+             (do ((j 0 (+ j 1))) ((= j i) (utf8->string bv))
+               (bytevector-u8-set! bv j (bytevector-u8-ref buf j)))))
+          (else (loop (+ i 1))))))
+
+;; #f when the path does not exist (realpath fails ENOENT) or the host has no
+;; realpath at all -- a Windows build, where the callers below fall back to
+;; lexical folding, which is what this file could do before.
+(define (jfile-realpath p)
+  (and c-realpath
+       (let ((buf (make-bytevector 4096 0)))     ; >= PATH_MAX
+         (and (not (= 0 (c-realpath p buf))) (jfile-cstr buf)))))
+
+;; "/a/b" -> "/a", "/a" -> "/", "/" -> #f
+(define (path-parent p)
+  (let loop ((i (- (string-length p) 1)))
+    (cond ((< i 0) #f)
+          ((char=? (string-ref p i) #\/) (if (= i 0) "/" (substring p 0 i)))
+          (else (loop (- i 1))))))
+
+;; Fold "." and ".." lexically. Only ever applied to a part of a path that does
+;; NOT exist: where a component is real, realpath resolves it instead, because
+;; POSIX (and the JVM) resolve ".." AFTER following the link before it, and
+;; folding it lexically there would give a different -- wrong -- directory.
+(define (jfile-fold-dots p)
+  (let loop ((segs (let split ((i 0) (start 0) (acc (quote ())))
+                     (cond ((= i (string-length p))
+                            (reverse (cons (substring p start i) acc)))
+                           ((char=? (string-ref p i) #\/)
+                            (split (+ i 1) (+ i 1) (cons (substring p start i) acc)))
+                           (else (split (+ i 1) start acc)))))
+             (out (quote ())))
+    (cond
+      ((null? segs)
+       (if (null? out)
+           "/"
+           (apply string-append (map (lambda (s) (string-append "/" s)) (reverse out)))))
+      ((or (string=? (car segs) "") (string=? (car segs) "."))
+       (loop (cdr segs) out))
+      ((string=? (car segs) "..")
+       (loop (cdr segs) (if (null? out) out (cdr out))))
+      (else (loop (cdr segs) (cons (car segs) out))))))
+
+(define (path-join base segs)
+  (if (null? segs)
+      base
+      (path-join (if (string=? base "/")
+                     (string-append "/" (car segs))
+                     (string-append base "/" (car segs)))
+                 (cdr segs))))
+
+;; The JVM canonicalizes a path whose tail does not exist -- on a host where
+;; /tmp is a link, new File("/tmp/nope").getCanonicalPath is
+;; "/private/tmp/nope" -- while realpath(3) fails outright on ENOENT. So
+;; resolve the longest existing ancestor and re-attach what is left.
+(define (jfile-canonical p)
+  (let ((abs (jfile-abs p)))
+    (or (jfile-realpath abs)
+        (let loop ((dir (path-parent abs)) (tail (list (path-last-segment abs))))
+          (cond
+            ((not dir) (jfile-fold-dots abs))
+            ((jfile-realpath dir)
+             => (lambda (rp) (jfile-fold-dots (path-join rp tail))))
+            (else (loop (path-parent dir) (cons (path-last-segment dir) tail))))))))
+
 ;; --- file metadata over Chez filesystem ops ---------------------------------
 ;; byte size of a regular file (0 for a directory or a missing file).
 (define (file-byte-size p)
@@ -483,7 +566,7 @@
       ((string=? name "getName")        (list (path-last-segment p)))
       ((string=? name "toString")       (list p))
       ((string=? name "getAbsolutePath")(list (jfile-abs fp)))
-      ((string=? name "getCanonicalPath")(list (jfile-abs fp)))
+      ((string=? name "getCanonicalPath")(list (jfile-canonical fp)))
       ;; File.toURI returns a java.net.URI (JVM), not a String.
       ((string=? name "toURI")          (list (uri-parse (string-append "file:" (jfile-abs fp)))))
       ((string=? name "toURL")          (list (make-url (string-append "file:" (jfile-abs fp)))))
@@ -525,7 +608,7 @@
                (else (loop (- i 1))))))
       ((string=? name "toPath")           (list (make-nio-path p)))  ; -> java.nio.file.Path (nio-file.ss)
       ((string=? name "getAbsoluteFile")  (list (make-jfile (jfile-abs fp))))
-      ((string=? name "getCanonicalFile") (list (make-jfile (jfile-abs fp))))
+      ((string=? name "getCanonicalFile") (list (make-jfile (jfile-canonical fp))))
       ((string=? name "compareTo")      (list (->num (let ((o (file-path-of (car args))))
                                                        (cond ((string<? p o) -1) ((string>? p o) 1) (else 0))))))
       ((string=? name "equals")         (list (and (jfile? (car args)) (string=? p (jfile-path (car args))))))
