@@ -16,6 +16,7 @@
 (def ctl-free?        (var jolt.mvn-http/ctl-free?))
 (def classify-status  (var jolt.mvn-http/classify-status))
 (def with-retries     (var jolt.mvn-http/with-retries))
+(def lib-candidates   (var jolt.mvn-http/lib-candidates))
 (def max-attempts     @(var jolt.mvn-http/max-attempts))
 
 (def ^:private fails (atom []))
@@ -100,6 +101,23 @@
   (ok= :failed    (classify-status 401) "classify 401 -> failed")
   (ok= :failed    (classify-status 403) "classify 403 -> failed")
   (ok= :failed    (classify-status 418) "classify 418 -> failed")
+
+  ;; --- JOLT_OPENSSL_LIBDIR candidate construction ----------------------------
+  ;; ensure-native! reads the env var at fetch time; the list construction is
+  ;; the pure part under test. An explicit lib dir is tried before the
+  ;; platform fallbacks; an unset or blank dir leaves the fallbacks untouched.
+  (ok= ["/nix/lib/libssl.3.dylib" "/nix/lib/libssl.dylib" "/opt/homebrew/lib/libssl.dylib"]
+       (lib-candidates "/nix/lib" ["libssl.3.dylib" "libssl.dylib"] ["/opt/homebrew/lib/libssl.dylib"])
+       "lib-candidates: explicit dir entries come first, in name order")
+  (ok= ["/d/libcrypto.so.3" "/d/libcrypto.so" "libcrypto.so.3" "libcrypto.so"]
+       (lib-candidates "/d" ["libcrypto.so.3" "libcrypto.so"] ["libcrypto.so.3" "libcrypto.so"])
+       "lib-candidates: bare-name fallbacks stay after the dir entries")
+  (ok= ["libcrypto.so.3"]
+       (lib-candidates nil ["libcrypto.so.3"] ["libcrypto.so.3"])
+       "lib-candidates: nil dir means fallbacks only")
+  (ok= ["libcrypto.so.3"]
+       (lib-candidates "" ["libcrypto.so.3"] ["libcrypto.so.3"])
+       "lib-candidates: blank dir means fallbacks only")
 
   ;; --- retry policy (jolt-ktiz.2) --------------------------------------------
   ;; Driven through an injectable attempt fn so the gate stays network-free.
