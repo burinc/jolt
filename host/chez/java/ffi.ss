@@ -45,9 +45,19 @@
                        (string-append "jolt.ffi/load-library: no :" key
                                       " entry in the per-OS spec")
                        (car args))))
-       (jolt-ffi-load-native (jolt-str-render-one name))
+       (ffi-load-native-or-throw (jolt-str-render-one name))
        jolt-nil))
-    (else (jolt-ffi-load-native (jolt-str-render-one (car args))) jolt-nil)))
+    (else (ffi-load-native-or-throw (jolt-str-render-one (car args))) jolt-nil)))
+
+;; A named load that fails must RAISE: callers probe candidate lists with
+;; try/catch around load-library (jolt.mvn-http), and the pre-scoped-loader
+;; implementation raised through sa-load-shared-object. Silently returning nil
+;; turned every fallback list into "first candidate wins, loaded or not".
+(define (ffi-load-native-or-throw path)
+  (unless (jolt-ffi-load-native path)
+    (jolt-throw (jolt-ex-info
+                  (string-append "jolt.ffi/load-library: cannot load " path)
+                  (jolt-hash-map (jolt-keyword "path") path)))))
 
 ;; Loadable without mutating resolution state: probe with a LOCAL dlopen through
 ;; the scoped loader (registering the handle — a probe that succeeds will be

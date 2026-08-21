@@ -21,6 +21,21 @@
 (ev "(def c-abs (jolt.ffi/__cfn \"abs\" [:int] :int))")
 
 (ok "foreign-procedure built for strlen" (procedure? (var-deref "user" "c-strlen")))
+
+;; load-library contract: a failed named load RAISES. Regression — the scoped
+;; native loader returned nil whether or not dlopen succeeded, so candidate
+;; probes (try/catch around load-library, as in jolt.mvn-http) accepted the
+;; first candidate loaded-or-not and fallback lists never advanced.
+(ok "load-library raises on a nonexistent path"
+    (jolt-truthy?
+      (ev "(try (jolt.ffi/load-library \"/nonexistent-dir/libjolt-no-such.so\") false
+                (catch :default e true))")))
+(ok "load-library per-OS map raises on a nonexistent path"
+    (jolt-truthy?
+      (ev "(try (jolt.ffi/load-library {:darwin \"/nonexistent-dir/no.dylib\"
+                                        :linux \"/nonexistent-dir/no.so\"
+                                        :windows \"Z:/nonexistent-dir/no.dll\"}) false
+                (catch :default e true))")))
 (ok "typed call: strlen(\"hello\") = 5" (= 5 (jnum->exact (ev "(c-strlen \"hello\")"))))
 (ok "typed call: abs(-7) = 7"          (= 7 (jnum->exact (ev "(c-abs -7)"))))
 
