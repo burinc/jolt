@@ -21,6 +21,7 @@
             pkgs.unzip
           ];
           opensslLibraryPath = pkgs.lib.makeLibraryPath [ pkgs.openssl ];
+          cacertFile = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         in
         pkgs.stdenv.mkDerivation {
           pname = "jolt";
@@ -66,7 +67,8 @@
           postFixup = ''
             wrapProgram "$out/bin/jolt" \
               --prefix PATH : "${runtimePath}" \
-              --prefix LD_LIBRARY_PATH : "${opensslLibraryPath}"
+              --prefix LD_LIBRARY_PATH : "${opensslLibraryPath}" \
+              --set-default SSL_CERT_FILE "${cacertFile}"
           '';
 
           meta = {
