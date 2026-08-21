@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "makes": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785480273,
+        "narHash": "sha256-/g8O4PW0v3NNChKyrWw/EqpEAUCKiI9/KFE2EiXoUlA=",
+        "owner": "makeplus",
+        "repo": "makes",
+        "rev": "d14cb578c2f04e6f9d00e01c7c4e416a9baf94e9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "makeplus",
+        "repo": "makes",
+        "rev": "d14cb578c2f04e6f9d00e01c7c4e416a9baf94e9",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1787135253,
+        "narHash": "sha256-RD2kNWCG+Bjo6h+JVjWVNntZs2GtRoeY2xHjts/FNkA=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "ffb3c9b700e759be2ef13237c9d8f953b32a1e46",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "makes": "makes",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

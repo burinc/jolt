@@ -2,8 +2,9 @@
   "Minimal cert-verifying HTTPS GET-to-file for dependency download. A plain
   TCP socket (getaddrinfo/socket/connect) carries ciphertext; TLS runs against
   in-memory BIOs over the system OpenSSL via jolt.ffi, so no raw fd reaches
-  OpenSSL. libcrypto then libssl lazy-load on first use (candidate lists,
-  Homebrew first on macOS). fetch returns true on a 2xx, false on any failure,
+  OpenSSL. libcrypto then libssl lazy-load on first use (candidate lists —
+  a JOLT_OPENSSL_LIBDIR directory first when set, then Homebrew paths on
+  macOS / bare sonames elsewhere). fetch returns true on a 2xx, false on any failure,
   so jolt.deps falls through to the next repo. HTTPS only; the server
   certificate is verified (default verify paths + VERIFY_PEER + hostname check).
   macOS and Linux are validated; the Windows path (ws2_32 + WSAStartup +
@@ -21,21 +22,43 @@
 ;; (an uncatchable SIGABRT, not a Scheme error) — so only explicit real-OpenSSL
 ;; paths are tried; the bare "libcrypto.dylib" name is deliberately NOT a
 ;; candidate. If none of these exist, fetch fails gracefully.
-(def ^:private crypto-candidates
+(def ^:private crypto-names
   (cond
-    macos?   ["/opt/homebrew/opt/openssl@3/lib/libcrypto.dylib"
-              "/opt/homebrew/lib/libcrypto.dylib"
-              "/usr/local/opt/openssl@3/lib/libcrypto.dylib"]
+    macos?   ["libcrypto.3.dylib" "libcrypto.dylib"]
     windows? ["libcrypto-3-x64.dll" "libcrypto-3.dll" "libcrypto-1_1-x64.dll"]
     :else    ["libcrypto.so.3" "libcrypto.so.1.1" "libcrypto.so"]))
 
-(def ^:private ssl-candidates
+(def ^:private ssl-names
   (cond
-    macos?   ["/opt/homebrew/opt/openssl@3/lib/libssl.dylib"
-              "/opt/homebrew/lib/libssl.dylib"
-              "/usr/local/opt/openssl@3/lib/libssl.dylib"]
+    macos?   ["libssl.3.dylib" "libssl.dylib"]
     windows? ["libssl-3-x64.dll" "libssl-3.dll" "libssl-1_1-x64.dll"]
     :else    ["libssl.so.3" "libssl.so.1.1" "libssl.so"]))
+
+;; Everywhere but macOS the bare names double as the system candidates (the
+;; dynamic loader owns the search); macOS gets the explicit real-OpenSSL paths.
+(def ^:private crypto-candidates
+  (if macos?
+    ["/opt/homebrew/opt/openssl@3/lib/libcrypto.dylib"
+     "/opt/homebrew/lib/libcrypto.dylib"
+     "/usr/local/opt/openssl@3/lib/libcrypto.dylib"]
+    crypto-names))
+
+(def ^:private ssl-candidates
+  (if macos?
+    ["/opt/homebrew/opt/openssl@3/lib/libssl.dylib"
+     "/opt/homebrew/lib/libssl.dylib"
+     "/usr/local/opt/openssl@3/lib/libssl.dylib"]
+    ssl-names))
+
+;; JOLT_OPENSSL_LIBDIR names a directory whose libcrypto/libssl are tried
+;; before the platform candidates — the seam for an OpenSSL living outside
+;; the built-in paths (Nix, MacPorts, Guix, a nonstandard Homebrew prefix).
+;; The macOS hazard above does not apply to it: the entries are absolute
+;; paths into the named directory, never the bare Apple-shadowed sonames.
+(defn- lib-candidates [libdir names fallbacks]
+  (if (and libdir (not (str/blank? libdir)))
+    (into (mapv #(str libdir "/" %) names) fallbacks)
+    fallbacks))
 
 (def ^:private native-ready? (volatile! false))
 
@@ -63,14 +86,17 @@
 
 (defn- ensure-native!
   "Lazy-load the native transport on first use: (Windows) ws2_32 + WSAStartup,
-  then libcrypto then libssl. Returns true once ready; a later fetch retries."
+  then libcrypto then libssl. JOLT_OPENSSL_LIBDIR is read here, at fetch time,
+  so baked app binaries and restored images honor the runtime environment.
+  Returns true once ready; a later fetch retries."
   []
   (or @native-ready?
-      (when (and (init-sockets!)
-                 (try-candidates crypto-candidates)
-                 (try-candidates ssl-candidates))
-        (vreset! native-ready? true)
-        true)))
+      (let [libdir (System/getenv "JOLT_OPENSSL_LIBDIR")]
+        (when (and (init-sockets!)
+                   (try-candidates (lib-candidates libdir crypto-names crypto-candidates))
+                   (try-candidates (lib-candidates libdir ssl-names ssl-candidates)))
+          (vreset! native-ready? true)
+          true))))
 
 ;; --- BSD socket layer. On POSIX these are the process's own symbols (libc);
 ;; on Windows they live in ws2_32.dll (loaded, with WSAStartup, by ensure-native!
