@@ -264,9 +264,11 @@
     ;; segfaults on the mismatch. Naming the archives costs nothing when they
     ;; resolve to shared libraries instead — ld ignores an --exclude-libs name
     ;; it did not link.
-    (else (string-append
-            "-Wl,--exclude-libs,libncurses.a:libncursesw.a:libtinfo.a "
-            "-llz4 -lz -lncurses -ltinfo -ldl -lm -lpthread -luuid -lrt"))))
+    (else
+     (string-append
+       "-L" (bld-sh-quote bld-host-csv-dir) " "
+       "-Wl,--exclude-libs,libncurses.a:libncursesw.a:libtinfo.a "
+       "-llz4 -lz -lncurses -ltinfo -ldl -lm -lpthread -luuid -lrt"))))
 
 ;; --- optional built-binary startup profile ----------------------------------
 ;; JOLT_STARTUP_PROFILE=1 reports wall time, process CPU, collections,
