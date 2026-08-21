@@ -17,8 +17,12 @@
       makes,
     }:
     let
-      # macOS support is intentionally deferred. Keep this flake's support claim Linux-only.
-      systems = [ "x86_64-linux" ];
+      # Intel macOS is deferred: releases cross-build x86_64-macos from the
+      # arm64 runner, and Nix has no equivalent cross path here to validate.
+      systems = [
+        "x86_64-linux"
+        "aarch64-darwin"
+      ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
       mkJolt =
         pkgs:
@@ -47,9 +51,10 @@
             pkgs.lz4
             pkgs.zlib
             pkgs.ncurses
-            pkgs.libuuid
             pkgs.openssl
-          ];
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.libuuid ]
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
 
           # Flake sources contain no .git directory, so build-jolt.ss cannot
           # derive the version with git describe.
@@ -70,12 +75,14 @@
             runHook postInstall
           '';
 
-          # jolt.deps invokes git and unzip, while jolt.mvn-http loads OpenSSL
-          # dynamically by soname. Pin all three to the Nix package closure.
+          # jolt.deps invokes git and unzip; jolt.mvn-http dlopens OpenSSL at
+          # fetch time through the JOLT_OPENSSL_LIBDIR seam (its macOS built-in
+          # candidates are Homebrew paths, so no loader-path variable could
+          # cover Darwin). Pin all of them to the Nix package closure.
           postFixup = ''
             wrapProgram "$out/bin/jolt" \
               --prefix PATH : "${runtimePath}" \
-              --prefix LD_LIBRARY_PATH : "${opensslLibraryPath}" \
+              --set-default JOLT_OPENSSL_LIBDIR "${opensslLibraryPath}" \
               --set-default SSL_CERT_FILE "${cacertFile}"
           '';
 
@@ -128,14 +135,15 @@
             pkgs.lz4
             pkgs.zlib
             pkgs.ncurses
-            pkgs.libuuid
-          ];
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.libuuid ]
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
 
           # Make uses this locked source-only input instead of cloning makes.
           M = makes;
           JOLT_CHEZ = "${pkgs.chez}/bin/scheme";
           CHEZ = "${pkgs.chez}/bin/scheme";
-          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.openssl ];
+          JOLT_OPENSSL_LIBDIR = pkgs.lib.makeLibraryPath [ pkgs.openssl ];
 
           shellHook = ''
             echo "Jolt development environment"

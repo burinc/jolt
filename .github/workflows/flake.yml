@@ -9,9 +9,19 @@ permissions:
 
 jobs:
   test:
-    name: Linux x86_64
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            system: x86_64-linux
+          - name: macOS arm64
+            os: macos-latest
+            system: aarch64-darwin
     steps:
       - uses: actions/checkout@v5
         with:
@@ -23,7 +33,7 @@ jobs:
       - name: Check the flake and formatting
         run: |
           nix flake check --no-build --no-write-lock-file
-          nix build .#formatter.x86_64-linux --no-write-lock-file
+          nix build .#formatter.${{ matrix.system }} --no-write-lock-file
           ./result/bin/nixfmt --check flake.nix
 
       - name: Build and smoke-test the packaged Jolt
@@ -35,6 +45,18 @@ jobs:
           trap 'rm -rf "$tmp" result' EXIT
           env -i HOME="$tmp/home" XDG_CACHE_HOME="$tmp/cache" PATH=/usr/bin:/bin \
             "$out/bin/jolt" -e '(+ 40 2)' | grep -Fx '42'
+
+      # jolt.mvn-http's built-in macOS candidates are the Homebrew OpenSSL
+      # paths, and the runner image ships Homebrew OpenSSL — which would let
+      # the fetch below pass without the Nix-provided OpenSSL ever loading.
+      # Remove the Homebrew entries so success can only come through the
+      # wrapper's JOLT_OPENSSL_LIBDIR.
+      - name: Drop Homebrew OpenSSL from the built-in candidate paths (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sudo rm -f /opt/homebrew/opt/openssl@3 \
+            /opt/homebrew/lib/libcrypto.dylib /opt/homebrew/lib/libssl.dylib
+          sudo rm -rf /usr/local/opt/openssl@3
 
       - name: Verify packaged dependency resolution
         run: |
