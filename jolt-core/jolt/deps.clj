@@ -1397,23 +1397,21 @@
 
 (defn- required-host
   []
-  ;; Keep jolt.fs out of the CLI's static require closure. It is needed only
-  ;; when acquiring a Gist or GitHub source, and eagerly requiring it from
-  ;; jolt.deps removes jolt.fs (and babashka.fs) from the stdlib embedded in
-  ;; binaries built by jolt.
-  (require 'jolt.fs)
-  (let [create-dirs (resolve 'jolt.fs/create-dirs)
-        delete-if-exists (resolve 'jolt.fs/delete-if-exists)
-        move (resolve 'jolt.fs/move)]
-    {:home-dir #(getenv "HOME")
-     :gitlibs-dir gitlibs-dir
-     :file-exists? file-exists?
-     :mkdirs! #(do (create-dirs %) nil)
-     :delete! #(do (delete-if-exists %) nil)
-     :read-text slurp
-     :download! http/fetch
-     :atomic-move!
-     #(do (move %1 %2 {:replace-existing true :atomic-move true}) nil)}))
+  {:home-dir #(getenv "HOME")
+   :gitlibs-dir gitlibs-dir
+   :file-exists? file-exists?
+   :mkdirs! #(do (mkdirs! %) nil)
+   :delete! #(do (rm-f %) nil)
+   :read-text slurp
+   :download! http/fetch
+   :atomic-move!
+   (fn [from to]
+     (when-not (or (mv! from to)
+                   (and (rm-f to) (mv! from to)))
+       (throw
+        (ex-info (str "Unable to move dependency cache file to " to)
+                 {:from from :to to})))
+     nil)})
 
 (defn- read-first-form
   [source]

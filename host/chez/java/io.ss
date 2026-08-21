@@ -871,6 +871,16 @@
          (utf8->string (na-bytearray->bv
                         (record-method-dispatch s "readAllBytes" jolt-nil))))
         (else (jolt-str-render-one s))))
+(define (drain-ireader src)
+  (let ((out (open-output-string)))
+    (let loop ((first? #t))
+      (let ((line (record-method-dispatch src "-read-line" jolt-nil)))
+        (if (jolt-nil? line)
+            (get-output-string out)
+            (begin
+              (unless first? (put-char out #\newline))
+              (put-string out line)
+              (loop #f)))))))
 (define (jolt-slurp src . opts)
   (cond
     ((jfile? src) (slurp-path (jfile-fs src)))
@@ -878,6 +888,9 @@
      (let ((c (embedded-res-content src)))
        (if (bytevector? c) (utf8->string c) c)))
     ((reader-jhost? src) (drain-reader src))
+    ((and (reified-methods src)
+          (hashtable-ref (reified-methods src) "-read-line" #f))
+     (drain-ireader src))
     ;; a file: URL reads its target (jar:/http:/… raise in url-content).
     ((and (jhost? src) (string=? (jhost-tag src) "url")) (url-content src))
     ;; bytes (a bytevector or a jolt byte-array): decode with :encoding (UTF-8

@@ -232,7 +232,7 @@
               (and c (var-cell-defined? c) c))
             ;; a :refer'd name resolves to its source ns
             (let ((ref (chez-resolve-refer (chez-actx-cns ctx) nm)))
-              (and ref (var-cell-lookup ref nm)))
+              (and ref (var-cell-lookup (car ref) (cdr ref))))
             (var-cell-lookup "clojure.core" nm)))))
 
 ;; Runtime macros: a defmacro is emitted into the prelude as a

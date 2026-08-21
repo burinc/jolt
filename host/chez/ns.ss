@@ -66,10 +66,16 @@
   (jolt-with-mutex ns-map-mu (hashtable-set! ns-alias-table (cons cns alias) target)))
 (define (chez-resolve-alias cns alias)
   (hashtable-ref ns-alias-table (cons cns alias) #f))
-;; :refer brings an UNQUALIFIED name into cns, resolving to target-ns/name.
+;; :refer brings an UNQUALIFIED name into cns.  The table value records both
+;; the target namespace and the source name so :rename can map local-name to
+;; target-ns/source-name.
 (define ns-refer-table (make-hashtable equal-hash equal?))
-(define (chez-register-refer! cns name target)
-  (jolt-with-mutex ns-map-mu (hashtable-set! ns-refer-table (cons cns name) target)))
+(define (chez-register-refer! cns name target . source-name)
+  (jolt-with-mutex ns-map-mu
+    (hashtable-set! ns-refer-table
+                    (cons cns name)
+                    (cons target
+                          (if (pair? source-name) (car source-name) name)))))
 ;; refer-all (a bare `use`): cns -> list of fully-referred target ns names. A name
 ;; not found per-name resolves to the first refer-all target that defines it.
 (define ns-refer-all-table (make-hashtable equal-hash equal?))
@@ -107,7 +113,7 @@
         (cond ((null? ts) #f)
               ((and (not (chez-refer-all-excluded? cns (car ts) name))
                     (let ((c (var-cell-lookup (car ts) name))) (and c (var-cell-defined? c))))
-               (car ts))
+               (cons (car ts) name))
               (else (loop (cdr ts)))))))))
 ;; --- libspec parsing (shared by the loader + compile-eval) ------------------
 ;; A libspec is one of: a bare symbol `foo`; a vector `[foo :as f :refer [x]]`;
@@ -310,8 +316,9 @@
      (vector-for-each
        (lambda (k)
          (when (string=? (car k) cns)
-           (let* ((target (hashtable-ref ns-refer-table k #f))
-                  (c (and target (var-cell-lookup target (cdr k)))))
+           (let* ((ref (hashtable-ref ns-refer-table k #f))
+                  (c (and (pair? ref)
+                          (var-cell-lookup (car ref) (cdr ref)))))
              (when c (set! m (jolt-assoc m (jolt-symbol #f (cdr k)) c))))))
        (jolt-with-mutex ns-map-mu (hashtable-keys ns-refer-table)))
      ;; refer-all: merge all public vars from :refer :all namespaces
@@ -388,7 +395,8 @@
          (c (if (string? sns)
                 (var-cell-lookup (or (chez-resolve-alias cns sns) sns) nm)
                 (or (var-cell-lookup cns nm)
-                    (let ((ref (chez-resolve-refer cns nm))) (and ref (var-cell-lookup ref nm)))
+                    (let ((ref (chez-resolve-refer cns nm)))
+                      (and ref (var-cell-lookup (car ref) (cdr ref))))
                     ;; the implicit clojure.core refer — blocked by an ns-unmap tombstone
                     (and (not (eq? (hashtable-ref ns-refer-table (cons cns nm) #f) 'unmapped))
                          (var-cell-lookup "clojure.core" nm))))))
@@ -431,7 +439,8 @@
          (c (if (string? sns)
                 (var-cell-lookup (or (chez-resolve-alias cns sns) sns) nm)
                 (or (var-cell-lookup cns nm)
-                    (let ((ref (chez-resolve-refer cns nm))) (and ref (var-cell-lookup ref nm)))
+                    (let ((ref (chez-resolve-refer cns nm)))
+                      (and ref (var-cell-lookup (car ref) (cdr ref))))
                     (and (not (eq? (hashtable-ref ns-refer-table (cons cns nm) #f) 'unmapped))
                          (var-cell-lookup "clojure.core" nm))))))
     (if (and c (var-cell-defined? c)) c jolt-nil)))
@@ -495,12 +504,12 @@
   jolt-nil)
 
 ;; refer: bring the public vars of `ns-sym` into the current ns as unqualified
-;; names. :only [names] restricts to those names; :exclude [names] drops them.
-;; (:rename is not yet supported — the refer table keys on the plain name.)
+;; names. :only [names] restricts to those names; :exclude [names] drops them;
+;; :rename {source local} installs the var under its requested local name.
 (define (jolt-refer ns-sym . filters)
   (let ((target (ns-desig->name ns-sym)) (cns (chez-current-ns))
-        (only #f) (excl '()))
-    ;; parse :only / :exclude name lists into string sets
+        (only #f) (excl '()) (rename #f))
+    ;; parse :only / :exclude name lists and the :rename map
     (let loop ((a filters))
       (when (and (pair? a) (pair? (cdr a)))
         (let ((k (car a)) (v (cadr a)))
@@ -509,7 +518,8 @@
                                       (map symbol-t-name (filter symbol-t? xs))))))
               (cond
                 ((string=? (keyword-t-name k) "only")    (set! only (names)))
-                ((string=? (keyword-t-name k) "exclude") (set! excl (names)))))))
+                ((string=? (keyword-t-name k) "exclude") (set! excl (names)))
+                ((string=? (keyword-t-name k) "rename")  (set! rename v))))))
         (loop (cddr a))))
     ;; the target's own bucket (rt.ss ns-cells-index): a refer walked EVERY
     ;; interned var in the image before, so each (:use ...)/(refer ...) cost
@@ -519,7 +529,13 @@
         (when (var-cell-defined? c)
           (let ((nm (var-cell-name c)))
             (when (and (or (not only) (member nm only)) (not (member nm excl)))
-              (chez-register-refer! cns nm target)))))
+              (let ((renamed (and rename
+                                  (jolt-get rename (jolt-symbol #f nm)))))
+                (chez-register-refer!
+                 cns
+                 (if (symbol-t? renamed) (symbol-t-name renamed) nm)
+                 target
+                 nm))))))
       (ns-cells-list target))
     jolt-nil))
 ;; (:refer-clojure :exclude [names…]) — clojure.core always resolves on Chez, so

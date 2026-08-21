@@ -144,7 +144,7 @@
                 ;; require, would shadow the referred clojure.core multifn instead
                 ;; of extending it. An undefined local falls through to the refer.
                 ((let ((c (var-cell-lookup here nm))) (and c (var-cell-defined? c))) here)
-                ((chez-resolve-refer here nm) => values)
+                ((chez-resolve-refer here nm) => car)
                 ;; implicit refer-clojure: an unqualified name that isn't defined
                 ;; or explicitly referred locally but names a clojure.core MULTIFN
                 ;; (print-method, print-dup, …) extends that multifn. refer-clojure
@@ -153,7 +153,12 @@
                 ;; dead per-ns shadow the printer never consults.
                 ((jolt-multifn? (var-deref "clojure.core" nm)) "clojure.core")
                 (else here)))
-         (cur (var-deref mns nm))
+         (source-name
+          (if qns
+              nm
+              (let ((ref (chez-resolve-refer here nm)))
+                (if ref (cdr ref) nm))))
+         (cur (var-deref mns source-name))
          (mf (if (jolt-multifn? cur) cur
                  ;; auto-create: copy the dispatch fn + default from a same-named
                  ;; clojure.core multifn (e.g. print-method's 2-arg dispatch) so a
