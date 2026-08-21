@@ -62,12 +62,16 @@ jobs:
           export REAL_GIT="$(command -v git)"
           cat > "$shim/git" <<'GIT'
           #!/usr/bin/env bash
-          case "${1:-}" in
-            clone|fetch)
-              echo "unexpected Make bootstrap: git $1" >&2
-              exit 99
-              ;;
-          esac
+          # Git accepts options before its subcommand (for example,
+          # `git -C DIR fetch`), so inspect every argument rather than $1.
+          for arg; do
+            case "$arg" in
+              clone|fetch)
+                echo "unexpected Make bootstrap: git $*" >&2
+                exit 99
+                ;;
+            esac
+          done
           exec "$REAL_GIT" "$@"
           GIT
           chmod +x "$shim/git"
