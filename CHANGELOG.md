@@ -5,6 +5,56 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.20] - 2026-08-21
+
+A patch release about where jolt runs and what it links against: Nix flake
+support lands (thanks to @jasalt, #694), `JOLT_OPENSSL_LIBDIR` reaches an
+OpenSSL outside the built-in search paths, and `File.getCanonicalPath`
+resolves symlinks — which turns the containment check every static file
+server writes from decorative into real.
+
+### Added
+
+- **Nix flake** (`x86_64-linux` and `aarch64-darwin`): `nix build`, `nix run`,
+  and a reproducible `nix develop` shell with the pinned toolchain. The
+  packaged binary is wrapped with Git, unzip, OpenSSL, and a CA bundle from
+  the Nix closure, so `deps.edn` resolution — Maven HTTPS fetches and
+  SHA-pinned Git deps — works in a scrubbed environment with nothing
+  installed on the host. Contributed by @jasalt in #694. A new `flake`
+  workflow builds and smoke-tests it in CI on both platforms.
+
+- **`JOLT_OPENSSL_LIBDIR` overrides the OpenSSL search.** A directory named
+  by the variable is tried before the platform candidates when the Maven
+  HTTPS transport loads OpenSSL, so a libcrypto outside the built-in paths —
+  Nix, MacPorts, Guix, a nonstandard Homebrew prefix — is reachable without
+  loader-path tricks (which cannot work on macOS anyway, where the candidates
+  are absolute Homebrew paths). Read at fetch time, so baked app binaries and
+  restored images honor the environment they run in.
+
+### Fixed
+
+- **`File.getCanonicalPath` resolves symlinks.** It answered with the
+  absolute path — never resolving a symlink, a `.`, or a `..` — and the
+  difference is load-bearing: the containment check every Java program
+  writes,
+
+  ```clojure
+  (.startsWith (.getCanonicalPath child) (.getCanonicalPath root))
+  ```
+
+  passed for a symlink inside `root` pointing anywhere on the filesystem, so
+  a static file server built on it (`ring.middleware.file` is one) served
+  whatever the link named. It is `realpath(3)` now, with nonexistent tails
+  canonicalized rather than thrown on — the JVM's behavior — and
+  `java.nio`'s `toRealPath` delegates to the same binding. (#693)
+
+- **`jolt.ffi/load-library` raises again when a named load fails.** Since
+  the scoped-native rewrite in 0.7.10 it dropped the dlopen result and
+  returned `nil` either way, turning every candidate-list fallback into dead
+  code: `jolt.mvn-http` accepted its first candidate loaded-or-not, and
+  http-client's TLS probe could never see a failure. A failed load raises
+  `ex-info` naming the path, matching the pre-0.7.10 contract.
+
 ## [0.7.19] - 2026-08-20
 
 A patch release: the `java.io.InputStream` surface — `readNBytes`,
