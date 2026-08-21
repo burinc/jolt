@@ -5,15 +5,17 @@
 # `make remint` rebuilds the seed after a source change.
 
 R := https://github.com/makeplus/makes
-M := .cache/makes
+M ?= .cache/makes
 # PINNED. Unpinned, this clone is whatever makeplus/makes HEAD is on the day of
 # the build — including a release build, whose toolchain would then be decided by
 # a repository this one records no version of. Bump deliberately.
 V := d14cb578c2f04e6f9d00e01c7c4e416a9baf94e9
-$(shell [ -d '$M' ] || git clone -q $R '$M')
-# Fetch only when the pin is absent, so a normal build stays offline.
-$(shell git -C '$M' cat-file -e '$V^{commit}' 2>/dev/null || git -C '$M' fetch -q origin)
-$(shell git -C '$M' rev-parse -q --verify HEAD 2>/dev/null | grep -qx '$V' || git -C '$M' checkout -q '$V')
+# Nix supplies a locked, source-only tree through M. Ordinary checkouts retain
+# the Git clone so their pinned revision is verified and provisioned on demand.
+$(shell [ -f '$M/init.mk' ] || git clone -q $R '$M')
+# Fetch only when the pin is absent, so a normal build stays offline. A
+# source-only Nix input has no .git directory, so there is nothing to fetch.
+$(shell [ ! -d '$M/.git' ] || { git -C '$M' cat-file -e '$V^{commit}' 2>/dev/null || git -C '$M' fetch -q origin; git -C '$M' rev-parse -q --verify HEAD 2>/dev/null | grep -qx '$V' || git -C '$M' checkout -q '$V'; })
 
 include $M/init.mk
 

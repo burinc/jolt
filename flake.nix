@@ -3,11 +3,19 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    makes = {
+      url = "github:makeplus/makes/d14cb578c2f04e6f9d00e01c7c4e416a9baf94e9";
+      flake = false;
+    };
     self.submodules = true;
   };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      makes,
+    }:
     let
       # macOS support is intentionally deferred. Keep this flake's support claim Linux-only.
       systems = [ "x86_64-linux" ];
@@ -102,6 +110,9 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = [
+            # Required by makeplus/makes during Makefile initialization.
+            pkgs.bash
+            pkgs.which
             pkgs.chez
             pkgs.stdenv.cc
             pkgs.gnumake
@@ -120,6 +131,8 @@
             pkgs.libuuid
           ];
 
+          # Make uses this locked source-only input instead of cloning makes.
+          M = makes;
           JOLT_CHEZ = "${pkgs.chez}/bin/scheme";
           CHEZ = "${pkgs.chez}/bin/scheme";
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.openssl ];
