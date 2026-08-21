@@ -9,20 +9,28 @@
   outputs =
     { self, nixpkgs }:
     let
-      systems = [
-        "x86_64-linux"
-        "aarch64-darwin"
-      ];
+      # macOS support is intentionally deferred. Keep this flake's support claim Linux-only.
+      systems = [ "x86_64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
       mkJolt =
         pkgs:
+        let
+          version = self.shortRev or "dev";
+          runtimePath = pkgs.lib.makeBinPath [
+            pkgs.git
+            pkgs.unzip
+          ];
+          opensslLibraryPath = pkgs.lib.makeLibraryPath [ pkgs.openssl ];
+        in
         pkgs.stdenv.mkDerivation {
           pname = "jolt";
-          version = self.shortRev or "dev";
+          inherit version;
           src = self;
 
+          strictDeps = true;
           nativeBuildInputs = [
             pkgs.chez
+            pkgs.makeWrapper
             pkgs.pkg-config
             pkgs.xxd
           ];
@@ -30,9 +38,13 @@
             pkgs.lz4
             pkgs.zlib
             pkgs.ncurses
-          ]
-          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.libuuid ]
-          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
+            pkgs.libuuid
+            pkgs.openssl
+          ];
+
+          # Flake sources contain no .git directory, so build-jolt.ss cannot
+          # derive the version with git describe.
+          JOLT_VERSION = version;
 
           dontConfigure = true;
 
@@ -47,6 +59,14 @@
             mkdir -p "$out/bin"
             install -m755 target/release/jolt "$out/bin/jolt"
             runHook postInstall
+          '';
+
+          # jolt.deps invokes git and unzip, while jolt.mvn-http loads OpenSSL
+          # dynamically by soname. Pin all three to the Nix package closure.
+          postFixup = ''
+            wrapProgram "$out/bin/jolt" \
+              --prefix PATH : "${runtimePath}" \
+              --prefix LD_LIBRARY_PATH : "${opensslLibraryPath}"
           '';
 
           meta = {
@@ -95,12 +115,12 @@
             pkgs.lz4
             pkgs.zlib
             pkgs.ncurses
-          ]
-          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.libuuid ]
-          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
+            pkgs.libuuid
+          ];
 
           JOLT_CHEZ = "${pkgs.chez}/bin/scheme";
           CHEZ = "${pkgs.chez}/bin/scheme";
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.openssl ];
 
           shellHook = ''
             echo "Jolt development environment"
