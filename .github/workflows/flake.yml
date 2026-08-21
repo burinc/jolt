@@ -36,7 +36,7 @@ jobs:
           env -i HOME="$tmp/home" XDG_CACHE_HOME="$tmp/cache" PATH=/usr/bin:/bin \
             "$out/bin/jolt" -e '(+ 40 2)' | grep -Fx '42'
 
-      - name: Verify the packaged HTTPS trust store
+      - name: Verify packaged dependency resolution
         run: |
           set -euo pipefail
           out="$(nix path-info .#jolt --no-write-lock-file)"
@@ -46,10 +46,46 @@ jobs:
           cert="$(env -i HOME="$tmp/home" XDG_CACHE_HOME="$tmp/cache" PATH=/usr/bin:/bin \
             "$out/bin/jolt" -e '(System/getenv "SSL_CERT_FILE")' | tr -d '"')"
           test -r "$cert"
-          env -i HOME="$tmp/home" XDG_CACHE_HOME="$tmp/cache" PATH=/usr/bin:/bin \
-            "$out/bin/jolt" -e "(require '[jolt.mvn-http]) (if (jolt.mvn-http/fetch \"https://repo1.maven.org/maven2/org/clojure/math.combinatorics/0.2.0/math.combinatorics-0.2.0.pom\" \"$tmp/math.combinatorics.pom\") :ok :fail)" \
-            | grep -Fx ':ok'
-          test -s "$tmp/math.combinatorics.pom"
+
+          # The Maven dependency makes the resolver download and unzip a jar.
+          # The local Git dependency drives jolt.deps through its git shell-out
+          # without adding another network dependency to this CI check.
+          gitdep="$tmp/gitdep"
+          mkdir -p "$gitdep/src/gitdep"
+          cat > "$gitdep/deps.edn" <<'EOF'
+          {:paths ["src"]}
+          EOF
+          cat > "$gitdep/src/gitdep/core.clj" <<'EOF'
+          (ns gitdep.core)
+          (def answer 39)
+          EOF
+          git -C "$gitdep" init --quiet
+          git -C "$gitdep" add .
+          git -C "$gitdep" -c user.name=flake-ci -c user.email=flake-ci@example.invalid \
+            commit --quiet -m initial
+          sha="$(git -C "$gitdep" rev-parse HEAD)"
+
+          app="$tmp/app"
+          mkdir -p "$app/src/app"
+          cat > "$app/deps.edn" <<EOF
+          {:paths ["src"]
+           :deps {org.clojure/math.combinatorics {:mvn/version "0.2.0"}
+                  test/gitdep {:git/url "file://$gitdep"
+                               :git/sha "$sha"}}}
+          EOF
+          cat > "$app/src/app/core.clj" <<'EOF'
+          (ns app.core
+            (:require [clojure.math.combinatorics :as combo]
+                      [gitdep.core :as gitdep]))
+          (defn -main []
+            (println (+ gitdep/answer (count (combo/combinations [1 2 3] 2)))))
+          EOF
+          (
+            cd "$app"
+            env -i HOME="$tmp/home" XDG_CACHE_HOME="$tmp/cache" \
+              JOLT_MAVEN_REPOSITORY="$tmp/m2" JOLT_GITLIBS_DIR="$tmp/gitlibs" \
+              PATH=/usr/bin:/bin "$out/bin/jolt" run -m app.core
+          ) | grep -Fx '42'
 
       - name: Verify the development shell does not bootstrap Makes from Git
         run: |
