@@ -708,7 +708,6 @@
       (string-append who " is not supported on this host: unverified struct stat layout for "
                      (sa-host-tag))))))
 (define c-stat (jolt-foreign-proc-safe "stat" '(string u8*) 'int))
-(define c-realpath (jolt-foreign-proc-safe "realpath" '(string u8*) 'iptr))
 (define (nio-stat-mode fp)
   (and c-stat
        (begin
@@ -718,18 +717,10 @@
                 (if nio-macos?
                     (bytevector-u16-ref buf 4 (native-endianness))
                     (bytevector-u32-ref buf 24 (native-endianness))))))))
-(define (nio-cstr buf)                          ; buf up to the first NUL, as a string
-  (let loop ((i 0))
-    (cond ((>= i (bytevector-length buf)) (utf8->string buf))
-          ((= 0 (bytevector-u8-ref buf i))
-           (let ((bv (make-bytevector i)))
-             (do ((j 0 (+ j 1))) ((= j i) (utf8->string bv))
-               (bytevector-u8-set! bv j (bytevector-u8-ref buf j)))))
-          (else (loop (+ i 1))))))
-(define (nio-realpath fp)                        ; resolve symlinks; #f if the path is absent
-  (and c-realpath
-       (let ((buf (make-bytevector 4096 0)))
-         (and (not (= 0 (c-realpath fp buf))) (nio-cstr buf)))))
+;; resolve symlinks; #f if the path is absent. One binding of realpath(3) for
+;; the whole runtime, in java/io.ss, which loads before this file and needs it
+;; for File.getCanonicalPath.
+(define (nio-realpath fp) (jfile-realpath fp))
 (define (nio-mode->perm-set mode)
   (let ((low (bitwise-and mode #o777)))
     (make-perm-set

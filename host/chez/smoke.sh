@@ -917,6 +917,18 @@ else
   fails=$((fails + 1))
 fi
 
+# java.io.File/getCanonicalPath — realpath semantics: symlinks, "." and ".."
+# resolve, and a path that does not exist still canonicalizes. Self-checks, one
+# marker. stderr is captured so a run that dies before its first check says why.
+canon_out="$($jolt run test/chez/canonical-path-test.clj 2>&1)"
+if printf '%s' "$canon_out" | grep -q 'CANONICAL-PATH OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: File.getCanonicalPath"
+  printf '%s\n' "$canon_out" | tail -8 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # jolt.socket — the java.net.Socket/ServerSocket surface over real loopback TCP
 # (roundtrip, EOF, broken pipe, ephemeral ports, class model). Self-checks, one marker.
 # stderr goes into the capture: a run that dies before its first check must leave
