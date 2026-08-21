@@ -1,0 +1,76 @@
+name: flake
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v19
+
+      - name: Check the flake and formatting
+        run: |
+          nix flake check --no-build --no-write-lock-file
+          nix build .#formatter.x86_64-linux --no-write-lock-file
+          ./result/bin/nixfmt --check flake.nix
+
+      - name: Build and smoke-test the packaged Jolt
+        run: |
+          set -euo pipefail
+          nix build .#jolt --no-write-lock-file -L
+          out="$(nix path-info .#jolt --no-write-lock-file)"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp" result' EXIT
+          env -i HOME="$tmp/home" XDG_CACHE_HOME="$tmp/cache" PATH=/usr/bin:/bin \
+            "$out/bin/jolt" -e '(+ 40 2)' | grep -Fx '42'
+
+      - name: Verify the packaged HTTPS trust store
+        run: |
+          set -euo pipefail
+          out="$(nix path-info .#jolt --no-write-lock-file)"
+          nix-store -q --references "$out" | grep -q -- '-nss-cacert-'
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp" result' EXIT
+          cert="$(env -i HOME="$tmp/home" XDG_CACHE_HOME="$tmp/cache" PATH=/usr/bin:/bin \
+            "$out/bin/jolt" -e '(System/getenv "SSL_CERT_FILE")' | tr -d '"')"
+          test -r "$cert"
+          env -i HOME="$tmp/home" XDG_CACHE_HOME="$tmp/cache" PATH=/usr/bin:/bin \
+            "$out/bin/jolt" -e "(require '[jolt.mvn-http]) (if (jolt.mvn-http/fetch \"https://repo1.maven.org/maven2/org/clojure/math.combinatorics/0.2.0/math.combinatorics-0.2.0.pom\" \"$tmp/math.combinatorics.pom\") :ok :fail)" \
+            | grep -Fx ':ok'
+          test -s "$tmp/math.combinatorics.pom"
+
+      - name: Verify the development shell does not bootstrap Makes from Git
+        run: |
+          nix develop --ignore-environment --command bash -seu <<'SH'
+          test -f "$M/init.mk"
+          test ! -e "$M/.git"
+
+          shim="$(mktemp -d)"
+          trap 'rm -rf "$shim"' EXIT
+          export REAL_GIT="$(command -v git)"
+          cat > "$shim/git" <<'GIT'
+          #!/usr/bin/env bash
+          case "${1:-}" in
+            clone|fetch)
+              echo "unexpected Make bootstrap: git $1" >&2
+              exit 99
+              ;;
+          esac
+          exec "$REAL_GIT" "$@"
+          GIT
+          chmod +x "$shim/git"
+          PATH="$shim:$PATH" make shelloutcheck
+          PATH="$shim:$PATH" make makefilesmoke
+          SH
