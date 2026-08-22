@@ -1334,9 +1334,52 @@
         (jolt-make-file a))))
 ;; UUID: randomUUID / fromString statics + a (UUID. s) string ctor. Registering
 ;; under the FQN also registers the short name (shared member table).
+;;
+;; fromString is the JVM's lenient 5-component parse: the canonical 36-char
+;; shape takes the fast path; otherwise exactly five dash-separated hex groups,
+;; each masked into its slot, so short groups zero-pad ((UUID/fromString
+;; "1-1-1-1-1") is legal) and an overlong group drops its high bits. Anything
+;; else throws IllegalArgumentException — returning nil here sent library code
+;; down a wrong branch silently. parse-uuid stays the nil-returning Clojure
+;; surface; only the java.util.UUID spellings throw.
+(define (uuid-split-dashes s)
+  (let ((len (string-length s)))
+    (let loop ((i 0) (start 0) (acc '()))
+      (cond ((fx=? i len) (reverse (cons (substring s start len) acc)))
+            ((char=? (string-ref s i) #\-)
+             (loop (fx+ i 1) (fx+ i 1) (cons (substring s start i) acc)))
+            (else (loop (fx+ i 1) start acc))))))
+(define (uuid-from-string-jvm s0)
+  (let ((s (jolt-str-render-one s0)))
+    (define (bad!)
+      (throw-jvm (quote IllegalArgumentException) (string-append "Invalid UUID string: " s)))
+    (define (part-u p)          ; unsigned hex value; JVM parses each group as a signed long
+      (let ((n (string-length p)))
+        (when (or (fx=? n 0) (fx>? n 16)) (bad!))
+        (let loop ((i 0) (acc 0))
+          (if (fx=? i n)
+              (if (> acc #x7FFFFFFFFFFFFFFF) (bad!) acc)
+              (let ((c (string-ref p i)))
+                (if (hex-char? c)
+                    (loop (fx+ i 1) (+ (* acc 16) (uuid-hexv (char-downcase c))))
+                    (bad!)))))))
+    (if (uuid-shape? s)
+        (make-juuid (string-downcase s))
+        (let ((parts (uuid-split-dashes s)))
+          (if (not (= (length parts) 5))
+              (bad!)
+              (let ((p0 (part-u (car parts)))    (p1 (part-u (cadr parts)))
+                    (p2 (part-u (caddr parts)))  (p3 (part-u (cadddr parts)))
+                    (p4 (part-u (car (cddddr parts)))))
+                (uuid-from-halves
+                 (bitwise-ior (bitwise-arithmetic-shift-left (bitwise-and p0 #xFFFFFFFF) 32)
+                              (bitwise-arithmetic-shift-left (bitwise-and p1 #xFFFF) 16)
+                              (bitwise-and p2 #xFFFF))
+                 (bitwise-ior (bitwise-arithmetic-shift-left (bitwise-and p3 #xFFFF) 48)
+                              (bitwise-and p4 #xFFFFFFFFFFFF)))))))))
 (register-class-statics! "java.util.UUID"
   (list (cons "randomUUID" (lambda () (jolt-random-uuid)))
-        (cons "fromString" (lambda (s) (jolt-parse-uuid (jolt-str-render-one s))))))
+        (cons "fromString" uuid-from-string-jvm)))
 ;; (UUID. msb lsb): build from the most/least-significant 64-bit halves (the JVM's
 ;; 2-long ctor), the form test.check's uuid generator uses. (UUID. s) parses a
 ;; string. The 128 bits format as the canonical 8-4-4-4-12 lowercase hex string.
@@ -1351,9 +1394,59 @@
 (define (uuid-ctor . args)
   (if (= (length args) 2)
       (uuid-from-halves (car args) (cadr args))
-      (jolt-parse-uuid (jolt-str-render-one (car args)))))
+      (uuid-from-string-jvm (car args))))
 (register-class-ctor! "UUID" uuid-ctor)
 (register-class-ctor! "java.util.UUID" uuid-ctor)
+;; a uuid's java.util.UUID method surface (record-method-dispatch arm; shares
+;; the date tier — disjoint receiver types). The bit accessors answer SIGNED
+;; longs (natives-misc.ss); timestamp/clockSequence/node are v1-only, like the
+;; JVM. Unknown names 'pass so the base still answers toString/equals/getClass.
+(define (uuid-version-of u) (uuid-hexv (string-ref (juuid-s u) 14)))
+(define (uuid-method u m args)
+  (define (need-v1!)
+    (unless (= 1 (uuid-version-of u))
+      (throw-jvm (quote UnsupportedOperationException) "Not a time-based UUID")))
+  (cond
+    ((string=? m "getMostSignificantBits") (uuid-u64->s64 (uuid-msb-u u)))
+    ((string=? m "getLeastSignificantBits") (uuid-u64->s64 (uuid-lsb-u u)))
+    ((string=? m "version") (uuid-version-of u))
+    ((string=? m "variant")
+     ;; top 3 bits of the lsb: 0xx -> 0 (NCS), 10x -> 2 (RFC 4122), 110 -> 6
+     ;; (Microsoft), 111 -> 7 (reserved) — UUID.variant's decoding.
+     (let ((top (fxarithmetic-shift-right (uuid-hexv (string-ref (juuid-s u) 19)) 1)))
+       (cond ((fx<? top 4) 0) ((fx<? top 6) 2) ((fx=? top 6) 6) (else 7))))
+    ((string=? m "timestamp")
+     (need-v1!)
+     (let ((msb (uuid-msb-u u)))
+       (bitwise-ior (bitwise-arithmetic-shift-left (bitwise-and msb #xFFF) 48)
+                    (bitwise-arithmetic-shift-left
+                     (bitwise-and (bitwise-arithmetic-shift-right msb 16) #xFFFF) 32)
+                    (bitwise-arithmetic-shift-right msb 32))))
+    ((string=? m "clockSequence")
+     (need-v1!)
+     (bitwise-and (bitwise-arithmetic-shift-right (uuid-lsb-u u) 48) #x3FFF))
+    ((string=? m "node")
+     (need-v1!)
+     (bitwise-and (uuid-lsb-u u) #xFFFFFFFFFFFF))
+    ((string=? m "compareTo")
+     (let ((o (if (pair? args) (car args) jolt-nil)))
+       (if (juuid? o)
+           (uuid-cmp u o)
+           (throw-jvm (quote ClassCastException)
+                      (string-append (jolt-final-str o) " cannot be cast to java.util.UUID")))))
+    ((string=? m "hashCode")
+     ;; (int)(hilo >> 32) ^ (int)hilo where hilo = msb ^ lsb — the JVM fold.
+     (let* ((hilo (bitwise-xor (uuid-msb-u u) (uuid-lsb-u u)))
+            (x (bitwise-xor (bitwise-arithmetic-shift-right hilo 32)
+                            (bitwise-and hilo #xFFFFFFFF))))
+       (if (>= x #x80000000) (- x #x100000000) x)))
+    (else 'pass)))
+(register-method-arm! arm-priority-date
+  (lambda (obj method-name rest-args)
+    (if (juuid? obj)
+        (uuid-method obj method-name
+                     (if (jolt-nil? rest-args) '() (seq->list rest-args)))
+        'pass)))
 ;; (Long. n) / (Long. "n"): a Long is just jolt's integer; return it (parse a string).
 (register-class-ctor! "Long" (lambda (x) (if (string? x) (parse-int-or-throw x 10 "Long") (->num (jnum->exact x)))))
 (register-class-ctor! "java.lang.Long" (lambda (x) (if (string? x) (parse-int-or-throw x 10 "Long") (->num (jnum->exact x)))))

@@ -5,6 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Static fields resolve through every access path.** Three related bugs in
+  the shared field/method registry. A field holding a falsy value —
+  `Boolean/FALSE` is registered as `#f` — read as absent, so every spelling of
+  it threw "No matching field or method"; the registry now detects a miss with
+  a sentinel instead of the value's own truthiness. `(. Token -FIELD)` reached
+  through a Class-valued local or a cold import looked up the literal `-FIELD`;
+  the class-token arm now strips the field spelling. And a field VALUE reached
+  through that arm or `host-static-call` was applied as a procedure, surfacing
+  Chez's bare "attempt to apply non-procedure" with no message; both now follow
+  `static-member`'s rule — a procedure is a method to call, anything else
+  answers a zero-argument access and reports itself if given arguments. The
+  visible consequence: `malli.experimental.time` loads cold with only the time
+  library on deps — its `(. LocalDate -MIN)` reads through the imported simple
+  name used to throw unless something had already touched `java.time` by the
+  slash spelling first.
+
+- **The reducible family dispatches to `IReduce`/`IReduceInit`/`IKVReduce`
+  like the JVM.** 3-arity `reduce` already drove a deftype/reify's own `reduce`
+  method; now the rest of the family does too: 2-arity `reduce` (scoped to
+  values that DECLARE `clojure.lang.IReduce`, mirroring `instanceof` — an
+  `IReduceInit`-only source such as an eduction still seqs), `into` in both
+  arities, and `vec`. `reduce-kv` consults a declared `clojure.lang.IKVReduce`
+  (`kvreduce`, lowercase) before throwing. `sequence` still requires a seqable
+  source, as on the JVM.
+
+### Added
+
+- **The `java.util.UUID` instance surface.** `.getMostSignificantBits` /
+  `.getLeastSignificantBits` (signed longs), `.version`, `.variant`,
+  `.timestamp` / `.clockSequence` / `.node` (v1-only, like the JVM),
+  `.compareTo` (signed msb-then-lsb — a high-bit uuid sorts first), and a
+  JVM-exact `.hashCode`. Uuids are Comparable, so `sort`, `compare` and sorted
+  collections accept them. `UUID/fromString` and the `(UUID. s)` ctor now
+  implement the JVM's lenient 5-component parse — short groups zero-pad,
+  `(UUID/fromString "1-1-1-1-1")` is legal — and throw
+  `IllegalArgumentException` on anything else instead of returning nil
+  (`parse-uuid` keeps its nil-returning Clojure contract).
+
 ## [0.7.22] - 2026-08-22
 
 A patch release of robustness fixes: the AOT cache detects and heals partial
