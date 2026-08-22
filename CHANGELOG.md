@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.22] - 2026-08-22
+
+A patch release of robustness fixes: the AOT cache detects and heals partial
+artifacts instead of serving them, `System/gc` never spuriously throws, and
+the `var` special form reports real errors.
+
+### Fixed
+
+- **The AOT cache detects a fasl cut at a form boundary.** `load` of a cached
+  `.so` truncated exactly at a compiled-form boundary succeeds and silently
+  runs only a prefix of the namespace, so a damaged artifact could be served on
+  every run — with missing or misplaced defs — while a plain source load
+  worked, until the cache directory was deleted by hand. Every published
+  artifact now ends with a completion marker; a cache hit that loads without
+  reaching it is treated like a corrupt fasl: the artifact is dropped and the
+  namespace recompiles from source. Existing caches migrate themselves (one
+  recompile per artifact on first use).
+
+- **`System/gc` never throws.** `jolt.host/gc-full!` (behind `System/gc` and
+  `Runtime.gc`) called Chez's `collect` directly, which raises when any other
+  thread is active at that instant — and jolt always has service threads (the
+  io-poller, fiber carriers, the timer) that are active for the microseconds
+  between their blocking waits, so an explicit GC could spuriously throw
+  "cannot collect when multiple threads are active". The collect now retries
+  over a short window and degrades to a no-op if a thread stays active
+  throughout, matching the JVM contract that `System.gc` is a hint. (#696)
+
+- **`(var ...)` error messages.** A non-symbol argument — `(var 5)`,
+  `(var)` — used to surface an opaque `#object[:object]` raise; it is now a
+  clear analysis error. An unresolvable symbol reports the reference wording,
+  `Unable to resolve var: nosuchns/foo in this context`, keeping the full
+  namespaced symbol (the namespace part used to be dropped). `(var String)`
+  still succeeds and returns the class-holding var — jolt keeps imported
+  classes in vars, a deliberate superset of the JVM, which refuses.
+
 ## [0.7.21] - 2026-08-22
 
 A patch release that gives core vars their documentation: `(meta #'map)` used
