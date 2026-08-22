@@ -1,7 +1,8 @@
 ; Jolt Standard Library: clojure.repl
-; Partial port: special-form documentation data (special-doc-map / special-doc),
-; verbatim from Clojure 1.12's clojure.repl. The interactive fns (doc, source,
-; apropos, dir, pst) are not provided.
+; Partial port from Clojure 1.12's clojure.repl: the special-form documentation
+; data (special-doc-map / special-doc) and the metadata-driven interactive fns
+; (doc, find-doc, apropos, dir). source and pst are not provided — image-baked
+; vars carry no :file, so there is no source text to point at.
 
 (ns clojure.repl)
 
@@ -64,3 +65,86 @@ itself (not its value) is returned. The reader macro #'x expands to (var x)."}})
 (defn- special-doc [name-symbol]
   (assoc (or (special-doc-map name-symbol) (meta (resolve name-symbol)))
          :special-form true))
+
+(defn- namespace-doc [nspace]
+  (assoc (meta nspace) :name (ns-name nspace)))
+
+; Verbatim from Clojure minus the trailing spec block (jolt's image carries no
+; clojure.spec, so there is no fnspec to describe).
+(defn- print-doc [{n :ns
+                   nm :name
+                   :keys [forms arglists special-form doc url macro]
+                   :as m}]
+  (println "-------------------------")
+  (println (str (when n (str (ns-name n) "/")) nm))
+  (when forms
+    (doseq [f forms]
+      (print "  ")
+      (prn f)))
+  (when arglists
+    (prn arglists))
+  (cond
+    special-form
+    (println "Special Form")
+    macro
+    (println "Macro"))
+  (when doc (println " " doc))
+  (when special-form
+    (if (contains? m :url)
+      (when url
+        (println (str "\n  Please see http://clojure.org/" url)))
+      (println (str "\n  Please see http://clojure.org/special_forms#" nm)))))
+
+(defn find-doc
+  "Prints documentation for any var whose documentation or name
+ contains a match for re-string-or-pattern"
+  {:added "1.0"}
+  [re-string-or-pattern]
+    (let [re (re-pattern re-string-or-pattern)
+          ms (concat (mapcat #(sort-by :name (map meta (vals (ns-interns %))))
+                             (all-ns))
+                     (map namespace-doc (all-ns))
+                     (map special-doc (keys special-doc-map)))]
+      (doseq [m ms
+              :when (and (:doc m)
+                         (or (re-find (re-matcher re (:doc m)))
+                             (re-find (re-matcher re (str (:name m))))))]
+               (print-doc m))))
+
+; Verbatim minus the keyword branch (spec lookup — no clojure.spec on jolt).
+(defmacro doc
+  "Prints documentation for a var or special form given its name"
+  {:added "1.0"}
+  [name]
+  (if-let [special-name ('{& fn catch try finally try} name)]
+    `(#'print-doc (#'special-doc '~special-name))
+    (cond
+      (special-doc-map name) `(#'print-doc (#'special-doc '~name))
+      (find-ns name) `(#'print-doc (#'namespace-doc (find-ns '~name)))
+      (resolve name) `(#'print-doc (meta (var ~name))))))
+
+(defn apropos
+  "Given a regular expression or stringable thing, return a seq of all
+public definitions in all currently-loaded namespaces that match the
+str-or-pattern."
+  [str-or-pattern]
+  (let [matches? (if (instance? java.util.regex.Pattern str-or-pattern)
+                   #(re-find str-or-pattern (str %))
+                   #(.contains (str %) (str str-or-pattern)))]
+    (sort (mapcat (fn [ns]
+                    (let [ns-name (str ns)]
+                      (map #(symbol ns-name (str %))
+                           (filter matches? (keys (ns-publics ns))))))
+                  (all-ns)))))
+
+(defn dir-fn
+  "Returns a sorted seq of symbols naming public vars in
+  a namespace or namespace alias. Looks for aliases in *ns*"
+  [ns]
+  (sort (map first (ns-publics (the-ns (get (ns-aliases *ns*) ns ns))))))
+
+(defmacro dir
+  "Prints a sorted directory of public vars in a namespace"
+  [nsname]
+  `(doseq [v# (dir-fn '~nsname)]
+     (println v#)))

@@ -191,13 +191,33 @@
       (ei-timed "emit: emit-top" (lambda () (jolt-ce-emit-top ir*))))))
 
 ;; The emitted `(def-var! …)(mark-macro! …)` pair for a defmacro, guard-wrapped
-;; (tolerant) or bare (strict) to match guard?.
-(define (ei-macro-string ns-name nm scm guard?)
-  (if guard?
-      (string-append "(guard (e (#t #f))\n  (def-var! " (ei-str-lit ns-name) " " (ei-str-lit nm)
-                     "\n    " scm ")\n  (mark-macro! " (ei-str-lit ns-name) " " (ei-str-lit nm) "))")
-      (string-append "(def-var! " (ei-str-lit ns-name) " " (ei-str-lit nm) "\n  " scm
-                     ")\n(mark-macro! " (ei-str-lit ns-name) " " (ei-str-lit nm) ")")))
+;; (tolerant) or bare (strict) to match guard?. With meta-scm (the derived
+;; :doc/:arglists cross-compiled as quoted data) the def becomes
+;; def-var-with-meta!, so an image-baked macro answers (meta #'when) like the
+;; runtime spine does instead of the bare {:ns :name}.
+(define (ei-macro-string ns-name nm scm meta-scm guard?)
+  (let ((def-str (if meta-scm
+                     (string-append "(def-var-with-meta! " (ei-str-lit ns-name) " " (ei-str-lit nm)
+                                    "\n    " scm "\n    " meta-scm ")")
+                     (string-append "(def-var! " (ei-str-lit ns-name) " " (ei-str-lit nm)
+                                    "\n    " scm ")"))))
+    (if guard?
+        (string-append "(guard (e (#t #f))\n  " def-str
+                       "\n  (mark-macro! " (ei-str-lit ns-name) " " (ei-str-lit nm) "))")
+        (string-append def-str
+                       "\n(mark-macro! " (ei-str-lit ns-name) " " (ei-str-lit nm) ")"))))
+
+;; A defmacro's derived meta pmap, cross-compiled as quoted data (or #f).
+;; Emitted through analyze+emit-top directly — NOT ei-compile-form, whose
+;; optimize? arm pops the positionally-aligned whole-program IR cache (one pop
+;; per SOURCE form; the meta is not a source form).
+(define (ei-emit-meta ns mmap guard?)
+  (and mmap
+       (let ((emit1 (lambda ()
+                      (jolt-ce-emit-top
+                        (jolt-ce-analyze (make-analyze-ctx ns)
+                          (jolt-list (jolt-symbol #f "quote") mmap))))))
+         (if guard? (guard (e (#t #f)) (emit1)) (emit1)))))
 
 ;; Cross-compile one namespace's source to a list of Scheme strings — shared by
 ;; the seed minter (ei-emit-ns: optimize? #f, guard? #t — tolerant, skips a form
@@ -250,8 +270,10 @@
               (cond
                 ((ei-ns-form? f) (loop (cdr forms)))
                 ((ce-macro-form? f)
-                 (let-values (((nm fn-form) (ce-defmacro->fn f)))
-                   (proc ns-name 'macro nm fn-form))
+                 ;; macro kind hands proc (fn-form . meta-pmap-or-#f) — the
+                 ;; derived :doc/:arglists ride along to the def emission.
+                 (let-values (((nm fn-form mmap) (ce-defmacro->fn f)))
+                   (proc ns-name 'macro nm (cons fn-form mmap)))
                  (loop (cdr forms)))
                 (else
                  (when (ei-flag-set-form? f)
@@ -272,9 +294,10 @@
   (let ((acc '()))
     (ei-for-each-form ns-name src
       (lambda (ns kind nm f)
-        (let ((scm (if guard?
-                       (guard (e (#t #f)) (ei-compile-form (make-analyze-ctx ns) f optimize?))
-                       (ei-compile-form (make-analyze-ctx ns) f optimize?))))
+        (let* ((form (if (eq? kind 'macro) (car f) f))
+               (scm (if guard?
+                        (guard (e (#t #f)) (ei-compile-form (make-analyze-ctx ns) form optimize?))
+                        (ei-compile-form (make-analyze-ctx ns) form optimize?))))
           (if (and guard? (not scm))
               ;; a form the guard swallowed — report it so the drop isn't silent
               (begin
@@ -283,7 +306,7 @@
                          ns (or nm "<top-level-form>")))
               (set! acc
                     (cons (if (eq? kind 'macro)
-                              (ei-macro-string ns nm scm guard?)
+                              (ei-macro-string ns nm scm (ei-emit-meta ns (cdr f) guard?) guard?)
                               (if guard? (string-append "(guard (e (#t #f))\n  " scm ")") scm))
                           acc))))))
     (reverse acc)))
@@ -304,11 +327,12 @@
   (let ((acc '()))
     (ei-for-each-form ns-name src
       (lambda (ns kind nm f)
-        (let* ((ctx (make-analyze-ctx ns))
+        (let* ((form (if (eq? kind 'macro) (car f) f))
+               (ctx (make-analyze-ctx ns))
                (cached (ei-next-cached ns))
-               (ir (jolt-ce-run-passes (or cached (jolt-ce-analyze ctx f)) ctx (ei-unit)))
+               (ir (jolt-ce-run-passes (or cached (jolt-ce-analyze ctx form)) ctx (ei-unit)))
                (str (if (eq? kind 'macro)
-                        (ei-macro-string ns nm (jolt-ce-emit-top ir) #f)
+                        (ei-macro-string ns nm (jolt-ce-emit-top ir) (ei-emit-meta ns (cdr f) #f) #f)
                         (jolt-ce-emit-top ir)))
                (fqn (if (eq? kind 'macro) (string-append ns "/" nm) (dce-def-fqn ir)))
                (refs (dce-app-refs ir str)))
@@ -356,7 +380,10 @@
           (cons "clojure.edn" "stdlib/clojure/edn.clj")
           (cons "clojure.set" "stdlib/clojure/set.clj")
           (cons "clojure.pprint" "stdlib/clojure/pprint.clj")
-          (cons "clojure.repl" "stdlib/clojure/repl.clj"))))
+          (cons "clojure.repl" "stdlib/clojure/repl.clj")
+          ;; LAST: the generated :doc/:arglists shard fills what the sources
+          ;; above did not declare, for every image ns (tools/gen-core-docs.sh).
+          (cons "clojure.core" "jolt-core/clojure/core/90-docs.clj"))))
 
 ;; Join a list of form strings with "\n", no trailing newline.
 (define (ei-join forms)

@@ -362,7 +362,71 @@
               (let ((h (symbol-t-name (car items))))
                 (or (string=? h "defmacro") (string=? h "definline")))))))
 
-;; (defmacro NAME [docstring] [attr-map] params body...) -> (values "NAME" (fn ...)).
+;; --- derived defmacro var metadata ------------------------------------------
+;; The runtime spine gets a defmacro's :doc/:arglists for free (the analyzer's
+;; defmacro arm derives them); this static mirror is for the image/build path,
+;; which lowers the form via ce-defmacro->fn instead and used to drop the meta
+;; entirely — every image-baked macro's (meta #'when) came back {:ns :name}.
+;; Merge order matches the analyzer arm (and the JVM):
+;; name ^meta < derived :arglists < attr-map < docstring.
+(define ce-kw-arglists (keyword #f "arglists"))
+(define ce-kw-doc (keyword #f "doc"))
+
+;; (quote x) -> x, else #f. The runtime path EVALUATES attr values, so a quoted
+;; value must land as its datum, not as the (quote …) form.
+(define (ce-quoted-datum v)
+  (and (cseq? v)
+       (let ((h (seq-first v)))
+         (and (symbol-t? h) (jolt-nil? (hc-sym-ns h))
+              (string=? (symbol-t-name h) "quote")))
+       (let ((r (seq->list v)))
+         (and (pair? r) (pair? (cdr r)) (cadr r)))))
+
+;; A value the image can carry as quoted data with the same meaning the runtime
+;; path's evaluation gives it: self-evaluating literals and vectors thereof. A
+;; symbol or a call would evaluate to something else, so those entries are
+;; skipped — they were dropped wholesale before, a skip is never a regression.
+(define (ce-static-datum? v)
+  (cond ((or (string? v) (number? v) (boolean? v) (char? v) (keyword-t? v)) #t)
+        ((jolt-nil? v) #t)
+        ((pvec? v)
+         (let ((n (jolt-count v)))
+           (let loop ((i 0))
+             (or (= i n)
+                 (and (ce-static-datum? (jolt-nth v i)) (loop (+ i 1)))))))
+        (else #f)))
+
+;; Fold an attr/name-meta pmap onto base, keeping only statically-safe values.
+(define (ce-attr-onto base m)
+  (pmap-fold m
+    (lambda (k v acc)
+      (let ((q (ce-quoted-datum v)))
+        (cond (q (jolt-assoc acc k q))
+              ((ce-static-datum? v) (jolt-assoc acc k v))
+              (else acc))))
+    base))
+
+;; params-or-clauses -> jolt list of the param vectors as written, or #f.
+(define (ce-derive-arglists after-meta)
+  (cond ((null? after-meta) #f)
+        ((cseq? (car after-meta))          ; multi-arity ([p] body…) clauses
+         (apply jolt-list (map seq-first after-meta)))
+        ((pvec? (car after-meta)) (jolt-list (car after-meta)))
+        (else #f)))
+
+;; The var meta pmap for a defmacro form's pieces, or #f when there is nothing.
+(define (ce-defmacro-meta name-sym after-meta attr doc)
+  (let* ((arglists (ce-derive-arglists after-meta))
+         (nm-meta (hc-sym-meta name-sym))
+         (m (jolt-hash-map))
+         (m (if (pmap? nm-meta) (ce-attr-onto m nm-meta) m))
+         (m (if arglists (jolt-assoc m ce-kw-arglists arglists) m))
+         (m (if (pmap? attr) (ce-attr-onto m attr) m))
+         (m (if doc (jolt-assoc m ce-kw-doc doc) m)))
+    (and (> (jolt-count m) 0) m)))
+
+;; (defmacro NAME [docstring] [attr-map] params body...)
+;; -> (values "NAME" (fn ...) meta-pmap-or-#f).
 ;; Strips a leading docstring (native string) + attr-map (a non-symbol pmap), then
 ;; re-heads the rest with `fn` so a destructured macro arglist desugars. Emits the
 ;; BARE fn (the caller wraps it in def-var! + mark-macro!), never a (def NAME ...) —
@@ -373,13 +437,14 @@
   (let* ((items (seq->list f))
          (name-sym (cadr items))
          (after-name (cddr items))
-         (a1 (if (and (pair? after-name) (string? (car after-name)))
-                 (cdr after-name) after-name))
-         (after-meta (if (and (pair? a1) (pmap? (car a1)))
-                         (cdr a1) a1))
+         (doc (and (pair? after-name) (string? (car after-name)) (car after-name)))
+         (a1 (if doc (cdr after-name) after-name))
+         (attr (and (pair? a1) (pmap? (car a1)) (car a1)))
+         (after-meta (if attr (cdr a1) a1))
          (fn-sym (jolt-symbol "clojure.core" "fn")))
     (values (symbol-t-name name-sym)
-            (apply jolt-list (cons fn-sym after-meta)))))
+            (apply jolt-list (cons fn-sym after-meta))
+            (ce-defmacro-meta name-sym after-meta attr doc))))
 
 ;; A bare top-level (do ...) form — head is the unqualified `do` symbol.
 (define (ce-top-do? form)
