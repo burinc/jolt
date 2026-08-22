@@ -3750,6 +3750,9 @@
   ;; the vector spelling of a require prefix list — a vector is a single
   ;; libspec only when its second element is a keyword or absent.
   {:suite "interop / charsets" :label "StandardCharsets constants name their charsets" :expected "[104 105]" :actual "(vec (.getBytes \"hi\" java.nio.charset.StandardCharsets/UTF_8))" :portability :jvm}
+  ;; a deftype/reify may name a protocol by its dotted CLASS spelling (mulog's
+  ;; ConsolePublisher implements com.brunobonacci.mulog.publisher.PPublisher).
+  {:suite "protocols / dotted class spelling" :label "deftype implements a protocol named by its class" :expected "[42 15]" :actual "(do (ns dotspell.ns) (clojure.core/defprotocol PDs (pda [x]) (pdb [x])) (clojure.core/deftype TDs [v] dotspell.ns.PDs (pda [_] (clojure.core/* 3 v)) (pdb [_] (clojure.core/+ 1 v))) [(dotspell.ns/pda (dotspell.ns/->TDs 14)) (dotspell.ns/pdb (dotspell.ns/->TDs 14))])" :portability :jvm}
   {:suite "loader / prefix lists" :label "vector prefix list registers every sub-spec" :expected "[\"A\" \"b\"]" :actual "(do (require (quote [clojure [string :as pfx-up] [string :as pfx-lo]])) [(pfx-up/upper-case \"a\") (pfx-lo/lower-case \"B\")])" :portability :jvm}
   {:suite "uuid / parse-uuid" :label "case-insensitive =" :expected "true" :actual "(= (parse-uuid \"b6883c0a-0342-4007-9966-bc2dfa6b109e\") (parse-uuid \"B6883C0A-0342-4007-9966-BC2DFA6B109E\"))" :portability :common}
   {:suite "uuid / parse-uuid" :label "empty -> nil" :expected "nil" :actual "(parse-uuid \"\")" :portability :common}
