@@ -1895,4 +1895,10 @@
   {:suite "var-form" :expr "(let [x 1] (var x))" :expected :throws}
   {:suite "var-form" :expr "(var nosuchns/foo)" :expected :throws}
   {:suite "var-form" :expr "(= (var map) (var map inc))" :expected "true"}
+
+  ;; System/gc parity: gc-full! is a hint and never throws. With a compute
+  ;; thread pinned active, an explicit Chez collect would raise "cannot
+  ;; collect when multiple threads are active"; the adapter retries and then
+  ;; degrades to a no-op instead.
+  {:suite "concurrency" :expr "(let [stop (atom false) f (future (loop [] (when-not @stop (recur))))] (try (do (jolt.host/gc-full!) :ok) (finally (reset! stop true))))" :expected ":ok"}
 ]

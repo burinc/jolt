@@ -43,8 +43,27 @@
 ;; System.gc callers mean: weak references clear and guardians fire.
 ;; Contract: perform a full collection. Degradation: may no-op (WASM) —
 ;; callers already guard the call and the JVM semantic is only a hint.
+;;
+;; An explicit (collect) raises "cannot collect when multiple threads are
+;; active" when any OTHER thread is active at that instant, and jolt always
+;; has service threads (io-poller, fiber carriers, the timer) that are
+;; collect-safe while blocked but active for the microseconds between waits —
+;; so a single attempt can lose that race at any time. Retry over a short
+;; window; a thread that stays active through all of it (a compute loop)
+;; degrades the call to a no-op, because System.gc must hint, never throw.
+;; Any other collector error still raises.
 (define (sa-gc-collect)
-  (collect (collect-maximum-generation)))
+  (let loop ((tries 100))
+    (let ((r (guard (e (#t (if (and (message-condition? e)
+                                    (string=? (condition-message e)
+                                              "cannot collect when multiple threads are active"))
+                               'busy
+                               (raise e))))
+               (collect (collect-maximum-generation))
+               'ok)))
+      (when (and (eq? r 'busy) (fx>? tries 0))
+        (sleep (make-time 'time-duration 1000000 0))   ; 1 ms
+        (loop (fx- tries 1))))))
 
 ;; (sa-gc-max-generation) -> exact integer
 ;; The deepest collectable generation, for callers mapping JVM generations.
