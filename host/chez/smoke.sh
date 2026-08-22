@@ -178,6 +178,17 @@ fi
 rm -rf "$mfile_dir"
 # resolve returns the class for a class mapping, the var for a var
 check '[(class? (resolve (quote String))) (= (resolve (quote java.util.Map)) java.util.Map) (var? (resolve (quote map)))]' '[true true true]'
+
+# Cold-process static-field access through an IMPORTED simple name: import only
+# interns a Class token, so the analyzer cannot classify the name as a class and
+# the access reaches the runtime class-token arm — which must strip the -field
+# spelling, fire the provider autoload, and answer a FIELD value without
+# applying it as a procedure. Each check is a fresh process, which is the point:
+# any earlier slash-form touch warms the registry and hides the bug (jolt-o3sw.1).
+check '(import (quote (java.time LocalDate))) (str (. LocalDate -MIN))' '"-999999999-01-01"'
+check '(import (quote (java.time LocalDate))) (str (. LocalDate MIN))' '"-999999999-01-01"'
+check '(let [c java.time.LocalDate] (str (. c -MIN)))' '"-999999999-01-01"'
+check '(let [c java.time.LocalDate] (str (. c MIN)))' '"-999999999-01-01"'
 # The source a binary serves for a namespace is jolt's own, not a same-named one
 # from a later install root — the vendored Grenadine ships a jolt.deps facade for
 # embedders. Roots are first-wins and the bake matches, but only for source: the

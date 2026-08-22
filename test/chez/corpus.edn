@@ -195,6 +195,11 @@
   ;; was rejected outright. Four malli namespaces load-failed on LocalDate/-MIN.
   ;; The two call forms are here so the fix cannot regress them.
   {:suite "interop / static members" :label "(. Class FIELD), (. Class -FIELD) and the call forms" :expected "[2147483647 2147483647 2147483647 \"42\" 7]" :actual "[(. java.lang.Integer MAX_VALUE) (. java.lang.Integer -MAX_VALUE) java.lang.Integer/MAX_VALUE (. java.lang.Long toString 42) (. java.lang.Long parseLong \"7\")]" :portability :jvm}
+  ;; a static field can hold a FALSY value: the shared field/method registry
+  ;; detected a miss with (or v ...), so Boolean/FALSE — registered as #f — threw
+  ;; "No matching field or method" in every spelling. A sentinel default keeps a
+  ;; registered #f distinct from an absent member.
+  {:suite "interop / static members" :label "a false-valued static field resolves" :expected "[true false false false]" :actual "[Boolean/TRUE Boolean/FALSE (. Boolean -FALSE) (. java.lang.Boolean -FALSE)]" :portability :jvm}
   ;; System.arraycopy behaves as if the source range were copied through a
   ;; temporary, so an overlapping copy within one array still reads pre-copy
   ;; values — a naive forward loop gives [1 1 1 1 1] for the second case.

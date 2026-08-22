@@ -181,7 +181,21 @@
            ;; provider. time-literals' data readers are written in exactly this
            ;; form, so #time/date could not read at all.
            ((string=? (jhost-tag obj) "class")
-            (apply (host-static-ref (jclass-name obj) method-name) args))
+            ;; A leading dash is the explicit FIELD spelling — (. Token -MIN)
+            ;; lands here when the token came through a local or a cold import,
+            ;; and used to look up "-MIN" verbatim. And a field VALUE answers a
+            ;; zero-argument access instead of being applied as a procedure —
+            ;; the same rule jolt.host/static-member and host-static-call use.
+            (let* ((mname (if (and (> (string-length method-name) 1)
+                                   (char=? (string-ref method-name 0) #\-))
+                              (substring method-name 1 (string-length method-name))
+                              method-name))
+                   (v (host-static-ref (jclass-name obj) mname)))
+              (cond ((procedure? v) (apply v args))
+                    ((null? args) v)
+                    (else (throw-jvm (quote IllegalArgumentException)
+                            (string-append (jclass-name obj) "/" mname
+                                           " is a static field; it takes no arguments"))))))
            ;; the shared end of the chain, so a host object reports its real class
            ;; rather than its internal tag, and a (.-x obj) read that no registered
            ;; member claimed reads as a missing FIELD like it does everywhere else
@@ -426,16 +440,21 @@
          (let ((m (hashtable-ref h member #f)))
            (and m (lambda args (apply m (jolt-class-for class) args)))))))
 
+;; Unique miss marker: the registry holds fields and methods in one table, and a
+;; field may legitimately hold a falsy value (Boolean/FALSE is #f), so absence
+;; cannot be read off a #f result.
+(define host-static-miss (list 'host-static-miss))
 (define (host-static-ref class member)
   (let ((cell (mutable-static-cell class member #f)))
     (if cell
         (vector-ref cell 0)
         (let ((h (lookup-class class-statics-tbl class)))
           (if h
-              (let ((v (hashtable-ref h member #f)))
-                (or v
-                    (class-instance-fallback class member)
-                    (throw-jvm (quote IllegalArgumentException) (string-append "No matching field or method: " class "/" member))))
+              (let ((v (hashtable-ref h member host-static-miss)))
+                (if (eq? v host-static-miss)
+                    (or (class-instance-fallback class member)
+                        (throw-jvm (quote IllegalArgumentException) (string-append "No matching field or method: " class "/" member)))
+                    v))
               ;; class miss — autoload a provider (the java.time base, or a
               ;; first-party library that installs the class) and retry once
               (if (or (jt-try-autoload! class) (lib-try-autoload! class))
@@ -444,7 +463,15 @@
                       (throw-jvm (quote IllegalArgumentException) (static-miss-message class member)))))))))
 
 (define (host-static-call class member . args)
-  (apply (host-static-ref class member) args))
+  ;; the registry's one rule: a procedure is a method to call, anything else is
+  ;; a field value — which answers a zero-argument access and nothing more.
+  ;; Applying the field's value used to raise Chez's bare "attempt to apply
+  ;; non-procedure" with no message.
+  (let ((v (host-static-ref class member)))
+    (cond ((procedure? v) (apply v args))
+          ((null? args) v)
+          (else (throw-jvm (quote IllegalArgumentException)
+                  (string-append class "/" member " is a static field; it takes no arguments"))))))
 
 ;; (. Class member) with no arguments is ambiguous on the JVM too: it reads a
 ;; static FIELD when one exists and otherwise calls a no-arg static method. jolt
