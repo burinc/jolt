@@ -96,6 +96,65 @@
         path (checked-field-path path)]
     (jolt.ffi/write pointer (field-type layout path) (field-offset layout path) value)))
 
+(defn- helper-binding [macro-name binding]
+  (when-not (and (vector? binding) (= 2 (count binding))
+                 (symbol? (first binding)))
+    (throw (str "jolt.ffi/" macro-name " requires [pointer value] binding")))
+  binding)
+
+(defmacro with-alloc
+  "Allocate byte-count bytes for pointer, evaluate body, and free exactly once.
+  The pointer is valid only within body and must not escape the lexical scope."
+  [binding & body]
+  (let [[pointer byte-count] (helper-binding "with-alloc" binding)]
+    `(let [~pointer (jolt.ffi/alloc ~byte-count)]
+       (try ~@body (finally (jolt.ffi/free ~pointer))))))
+
+(defmacro with-out
+  "Lexically allocate one scalar value of scalar-type."
+  [binding & body]
+  (let [[pointer scalar-type] (helper-binding "with-out" binding)]
+    `(jolt.ffi/with-alloc [~pointer (jolt.ffi/sizeof ~scalar-type)] ~@body)))
+
+(defmacro with-layout
+  "Lexically allocate one instance of a compiled layout."
+  [binding & body]
+  (let [[pointer layout] (helper-binding "with-layout" binding)]
+    `(jolt.ffi/with-alloc [~pointer (jolt.ffi/layout-size ~layout)] ~@body)))
+
+(defmacro with-c-string
+  "Copy value to a lexical NUL-terminated UTF-8 C string."
+  [binding & body]
+  (let [[pointer value] (helper-binding "with-c-string" binding)]
+    `(let [~pointer (jolt.ffi/string->ptr ~value)]
+       (try ~@body (finally (jolt.ffi/free ~pointer))))))
+
+(defmacro with-c-string-array
+  "Build a lexical pointer array of count NUL-terminated UTF-8 strings. The
+  values expression is evaluated once. Partially built arrays are cleaned up if
+  conversion fails. Neither the array nor its member pointers may escape body."
+  [binding values & body]
+  (let [[pointer count-expr] (helper-binding "with-c-string-array" binding)]
+    `(let [values# (vec ~values)
+           count# ~count-expr]
+       (when-not (= count# (count values#))
+         (throw (ex-info "jolt.ffi: C string array count does not match values"
+                         {:count count# :value-count (count values#)})))
+       (let [~pointer (jolt.ffi/alloc (* count# (jolt.ffi/sizeof :pointer)))
+             owned# (atom [])]
+         (try
+           (doseq [[index# value#] (map-indexed vector values#)]
+             (let [string-pointer# (jolt.ffi/string->ptr value#)]
+               (swap! owned# conj string-pointer#)
+               (jolt.ffi/write ~pointer :pointer
+                               (* index# (jolt.ffi/sizeof :pointer))
+                               string-pointer#)))
+           ~@body
+           (finally
+             (doseq [string-pointer# @owned#]
+               (jolt.ffi/free string-pointer#))
+             (jolt.ffi/free ~pointer)))))))
+
 ;; foreign-fn binds C symbol `csym` to a typed callable. Expands to the __cfn
 ;; special form (always fully-qualified, so an :as alias on jolt.ffi resolves):
 ;; the analyzer/back end turn it into a Chez foreign-procedure.
