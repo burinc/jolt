@@ -34,7 +34,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`kvreduce`, lowercase) before throwing. `sequence` still requires a seqable
   source, as on the JVM.
 
+- **The vector spelling of a require prefix list expands.**
+  `[clj-uuid [bitmop :as bitmop] [clock :as clock]]` is a prefix list on the
+  JVM; the old single-libspec read required the PREFIX itself — a silent
+  self-require mid-load with every sub-spec and alias dropped. The expansion
+  is shared by the loader, the build driver, and the compile-env alias
+  pre-scan, in both the list and vector spellings.
+
 ### Added
+
+- **`X/from` for the core `java.time` value types.** `LocalDate/from`,
+  `LocalTime/from` and `LocalDateTime/from` answer the JVM TemporalAccessor
+  query over the core value types, throwing `DateTimeException` when the
+  fields aren't there; the jolt-lang/time library re-registers them with the
+  zoned/offset types added.
+
+- **`#=` read-eval.** The clojure reader's EvalReader: `#=form` evaluates its
+  form at read time, refused under `(binding [*read-eval* false] …)` with the
+  JVM's message. EDN still has no `=` dispatch. clj-uuid computes its bit
+  masks with `#=` and now reads.
+
+- **`java.util.concurrent` construction.** `ArrayBlockingQueue` is a real
+  bounded blocking queue (offer/put/take/poll and the timed variants,
+  fiber-aware), `FutureTask` a run-once task with a blocking get, and the
+  `ThreadPoolExecutor` constructor builds on the existing executor machinery —
+  sized by maximumPoolSize, with `.getQueue` answering a live view of the
+  internal queue's depth. One documented divergence: the JVM rejects a submit
+  when its bounded queue fills; jolt's internal queue is unbounded and accepts
+  it.
 
 - **The `java.util.UUID` instance surface.** `.getMostSignificantBits` /
   `.getLeastSignificantBits` (signed longs), `.version`, `.variant`,
