@@ -542,6 +542,47 @@ else
   echo "FAIL: (t) mylib.core sidecars=$t_res (want 0), proj.core sidecars=$p_res (want >=1)"; fails=$((fails+1))
 fi
 
+# --- (u) a fasl cut at a form boundary is detected, not served ----------------
+# `load` of a .so truncated exactly at a compiled-form boundary SUCCEEDS — a
+# Chez fasl is a sequence of objects — so the raise-based guard in (j) never
+# fires and a partial namespace would be served on every run while a plain
+# source load works. Every published .scm ends with a completion marker the
+# loader checks after a hit-load. Simulate the partial artifact by stripping
+# the marker from the cached .scm, recompiling that with the same Chez, and
+# planting the result as the .so.
+u="$tmp/u"; mkdir -p "$u/src/ulib"
+printf '(ns ulib.core)\n(defn answer [] 42)\n' > "$u/src/ulib/core.clj"
+cache_u="$(mktemp -d)"
+urun() {
+  JOLT_DEBUG="${UDEBUG:-}" JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_u" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'ulib/ulib {:local/root \"$u\"}}})
+    (require 'ulib.core) (println (ulib.core/answer))" 2>&1
+}
+if [ -z "$chez_bin" ]; then
+  echo "SKIP: (u) needs a chez on PATH to recompile the stripped .scm"
+else
+  urun >/dev/null 2>&1                                     # cold: populate
+  u_scm="$(find "$cache_u" -name 'ulib.core-*.scm' | head -1)"
+  u_so="${u_scm%.scm}.so"
+  u_marked="$(tail -1 "$u_scm" | grep -c 'aot-mark-complete!')"
+  u_warm="$(UDEBUG=1 urun)"                                # warm: real hit
+  grep -v 'aot-mark-complete!' "$u_scm" > "$u_scm.cut"
+  printf '(compile-file "%s" "%s")\n' "$u_scm.cut" "$u_so" | "$chez_bin" -q >/dev/null 2>&1
+  u_cut="$(UDEBUG=1 urun)"                                 # partial artifact planted
+  u_heal="$(UDEBUG=1 urun)"                                # must be a clean hit again
+  if [ "$u_marked" = "1" ] \
+     && echo "$u_warm" | grep -q '^42$' && echo "$u_warm" | grep -q 'hit ulib.core' \
+     && ! echo "$u_warm" | grep -q 'incomplete cache' \
+     && echo "$u_cut" | grep -q '^42$' && echo "$u_cut" | grep -q 'incomplete cache for ulib.core' \
+     && echo "$u_heal" | grep -q '^42$' && echo "$u_heal" | grep -q 'hit ulib.core' \
+     && ! echo "$u_heal" | grep -q 'incomplete cache'; then
+    echo "PASS: (u) form-boundary-truncated fasl detected, recompiled, healed"; pass=$((pass+1))
+  else
+    echo "FAIL: (u) marker=$u_marked warm-hit=$(echo "$u_warm" | grep -c 'hit ulib.core') cut-detected=$(echo "$u_cut" | grep -c 'incomplete cache') cut-out=$(echo "$u_cut" | tail -1) heal-hit=$(echo "$u_heal" | grep -c 'hit ulib.core')"; fails=$((fails+1))
+  fi
+fi
+rm -rf "$cache_u"
+
 # Phase 4 (cold-vs-warm speedup) lives in aot-cache-perf.sh — a timing
 # measurement doesn't belong in this deterministic correctness gate.
 

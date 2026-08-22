@@ -865,6 +865,25 @@
 ;; the deps are what that load records. Writing under the pre-load base instead
 ;; would strand the fasl — the next run computes the key WITH deps and misses it,
 ;; paying a second compile for every namespace that requires anything.
+;; Completion markers. compile-file writes a fasl as a SEQUENCE of compiled
+;; top-level forms, and `load` of a file cut exactly at a form boundary succeeds
+;; silently, running only a prefix of the namespace — the corrupt-fasl guard
+;; below never fires, and the partial artifact is served on every later run
+;; while a plain source load works. So the published .scm ends with a marker
+;; call naming the namespace, and a hit-load that finishes without its marker is
+;; treated exactly like a corrupt fasl: drop the artifact, recompile from
+;; source. Per-name (not one flag), because a namespace's fasl re-runs its own
+;; requires, and a nested cache hit's marker would satisfy a shared flag even
+;; when the OUTER fasl is the truncated one. Artifacts published before markers
+;; existed read as incomplete and recompile once — self-migrating.
+(define aot-complete-tbl (make-hashtable string-hash string=?))
+(define (aot-mark-complete! name)
+  (jolt-with-mutex ldr-tbl-mu (hashtable-set! aot-complete-tbl name #t)))
+(define (aot-complete-reset! name)
+  (jolt-with-mutex ldr-tbl-mu (hashtable-delete! aot-complete-tbl name)))
+(define (aot-complete? name)
+  (jolt-with-mutex ldr-tbl-mu (hashtable-ref aot-complete-tbl name #f)))
+
 (define (aot-compile-and-cache name file src own)
   (let ((sink (aot-new-dep-sink))
         ;; the files this compile reads, collected the same way and for the same
@@ -897,7 +916,9 @@
           (guard (e (else (aot-info (string-append "compile failed for " name))
                           (delete-file tmp-scm #f) (delete-file tmp-so #f) #f))
             (let ((out (open-output-file tmp-scm 'replace)))
-              (put-string out captured) (close-output-port out))
+              (put-string out captured)
+              (put-string out (format "\n(aot-mark-complete! ~s)\n" name))
+              (close-output-port out))
             (rename-file tmp-scm scm)
             ;; compile-file prints "compiling X with output to Y" per file to
             ;; current-output-port by default — swallow it so a cache miss can't
@@ -907,20 +928,28 @@
             (rename-file tmp-so so))
           (unless (file-exists? so)
             (aot-info (string-append "no .so produced for " name))))))))
-;; A truncated/corrupt .so (a killed process left a partial write, or a concurrent
-;; jolt is mid-write) would make `load` throw. Fall back to recompile: delete the
-;; bad files so the miss path rebuilds them. Safe because a truncated fasl fails at
-;; its header before any top-level define runs, so the image carries no half-loaded
-;; state from the failed load. Non-fatal — a repeated failure just misses every run.
+;; A garbled .so makes `load` throw; one cut at a form boundary loads fine and
+;; just stops early, which the completion marker catches instead. Either way:
+;; delete the bad files and recompile from source. Recompiling after a partial
+;; load is safe — the prefix's defs are idempotent (def-var! replaces roots, a
+;; require dedups) and the fresh full load re-runs them; install-owned
+;; namespaces, whose defs DO get set!-overridden after load, never take this
+;; path at all. Non-fatal — a repeated failure just misses every run.
 (define (aot-safe-load-or-recompile name file src own base)
   (let ((so (string-append base ".so")))
-    (guard (e (else
-                (aot-info (string-append "corrupt cache for " name ", recompiling"))
-                (delete-file so #f)           ; best-effort; ignore if already gone
-                (let ((scm (string-append base ".scm")))
-                  (delete-file scm #f))
-                (aot-compile-and-cache name file src own)))
-      (load so))))
+    (define (recover! why)
+      (aot-info (string-append why " cache for " name ", recompiling"))
+      (delete-file so #f)           ; best-effort; ignore if already gone
+      (delete-file (string-append base ".scm") #f)
+      (aot-compile-and-cache name file src own))
+    (let ((state (guard (e (else 'corrupt))
+                   (aot-complete-reset! name)
+                   (load so)
+                   (if (aot-complete? name) 'ok 'incomplete))))
+      (case state
+        ((ok) (aot-complete-reset! name))     ; done with the entry
+        ((incomplete) (recover! "incomplete"))
+        (else (recover! "corrupt"))))))
 ;; Load an embedded compiled fasl for `name` if one was baked into this binary.
 ;; The release jolt embeds one fasl per install-owned stdlib namespace so a
 ;; require never recompiles from source on process start. The embedded bytes
