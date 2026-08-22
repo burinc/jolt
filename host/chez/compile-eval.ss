@@ -270,7 +270,10 @@
             ((and hn (string=? hn "quote")) #t)
             ;; (require spec...) / (use spec...) — specs are quoted
             ((and hn (or (string=? hn "require") (string=? hn "use")))
-             (for-each (lambda (a) (chez-register-spec! ns (ce-unquote a))) (cdr items)))
+             (for-each (lambda (a)
+                         (for-each (lambda (x) (chez-register-spec! ns x))
+                                   (expand-libspec (ce-unquote a))))
+                       (cdr items)))
             ;; (ns name (:require [a :as x]) ...) — clause specs are literal. Register
             ;; the aliases under NAME (the ns being defined), not the passed `ns`:
             ;; when a file is loaded its ns form compiles while (chez-current-ns) is
@@ -285,7 +288,10 @@
                            (when (cseq? clause)
                              (let ((cl (seq->list clause)))
                                (when (ce-clause-require? cl)
-                                 (for-each (lambda (spec) (chez-register-spec! ns-name spec)) (cdr cl))))))
+                                 (for-each (lambda (spec)
+                                             (for-each (lambda (x) (chez-register-spec! ns-name x))
+                                                       (expand-libspec spec)))
+                                           (cdr cl))))))
                          (if (pair? (cdr items)) (cddr items) '()))))
             (else (for-each (lambda (x) (ce-scan-requires! x ns)) items))))))))
 

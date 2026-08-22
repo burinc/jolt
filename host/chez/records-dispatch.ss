@@ -525,6 +525,26 @@
     (or (and (symbol-t? sym)
              (let ((v (jolt-resolve sym)))
                (and (var-cell? v) (protocol-value-key (var-cell-root v)))))
+        ;; the dotted CLASS spelling of a protocol: a deftype/reify may name it
+        ;; by its class — mulog's ConsolePublisher implements
+        ;; com.brunobonacci.mulog.publisher.PPublisher — where the last segment
+        ;; is the protocol name and the demunged prefix its namespace. Without
+        ;; this the methods filed as interface methods and protocol dispatch
+        ;; answered "No method ...".
+        (and (symbol-t? sym) (not (symbol-t-ns sym))
+             (let* ((nm (symbol-t-name sym))
+                    (n (string-length nm))
+                    (i (let loop ((k (- n 1)))
+                         (cond ((< k 1) #f)
+                               ((char=? (string-ref nm k) #\.) k)
+                               (else (loop (- k 1)))))))
+               (and i (< (+ i 1) n)
+                    (let* ((ns-part (list->string
+                                     (map (lambda (c) (if (char=? c #\_) #\- c))
+                                          (string->list (substring nm 0 i)))))
+                           (name-part (substring nm (+ i 1) n))
+                           (cell (var-cell-lookup ns-part name-part)))
+                      (and cell (protocol-value-key (var-cell-root cell)))))))
         jolt-nil)))
 (def-var! "clojure.core" "make-reified" (lambda (mm . rest) (apply make-reified mm rest)))
 (def-var! "clojure.core" "record-method-dispatch" (lambda (obj m rest) (record-method-dispatch obj m rest)))

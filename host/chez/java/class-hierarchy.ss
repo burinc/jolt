@@ -585,6 +585,8 @@
 (define jhost-tag->fqn (make-hashtable string-hash string=?))
 (for-each (lambda (p) (hashtable-set! jhost-tag->fqn (car p) (cdr p)))
   '(("user-thread" . "java.lang.Thread")
+    ("abq" . "java.util.concurrent.ArrayBlockingQueue")
+    ("future-task" . "java.util.concurrent.FutureTask")
     ("instant" . "java.time.Instant")
     ("local-date" . "java.time.LocalDate")
     ("local-time" . "java.time.LocalTime")

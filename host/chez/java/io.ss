@@ -1332,6 +1332,14 @@
     (if (pair? rest)
         (jolt-make-file (jolt-file-join a (car rest)))
         (jolt-make-file a))))
+;; java.nio.charset.StandardCharsets: the constants ARE the charset names —
+;; every jolt charset seam (.getBytes, String ctors, InputStreamReader) takes
+;; the name string, so the constant composes with all of them (clj-uuid's v3/v5
+;; digest .getBytes with StandardCharsets/UTF_8).
+(register-class-statics! "java.nio.charset.StandardCharsets"
+  (list (cons "UTF_8" "UTF-8") (cons "US_ASCII" "US-ASCII")
+        (cons "ISO_8859_1" "ISO-8859-1") (cons "UTF_16" "UTF-16")
+        (cons "UTF_16BE" "UTF-16BE") (cons "UTF_16LE" "UTF-16LE")))
 ;; UUID: randomUUID / fromString statics + a (UUID. s) string ctor. Registering
 ;; under the FQN also registers the short name (shared member table).
 ;;

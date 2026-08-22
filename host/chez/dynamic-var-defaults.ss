@@ -54,8 +54,8 @@
 ;; behaviour, so exposing them is sound (resolve/binding work, reads return the
 ;; right value) — not a silent divergence.
 ;;
-;; *read-eval* — gates #=() read-eval. jolt's reader has no #=, so it reads true
-;; (no eval-on-read happens regardless); a lib can (binding [*read-eval* false] …).
+;; *read-eval* — gates the reader's #=() read-eval (reader.ss consults the
+;; current binding per use, so (binding [*read-eval* false] …) refuses it).
 (def-dynvar! "clojure.core" "*read-eval*" #t)
 ;; *print-dup* — gates print-dup (a multimethod that exists); default false.
 (def-dynvar! "clojure.core" "*print-dup*" #f)

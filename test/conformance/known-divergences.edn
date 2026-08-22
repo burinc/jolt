@@ -6,7 +6,7 @@
   :host-model
   "no JVM host: classes->name strings, type->symbol, *in* is a map, inline-impl extenders, duck-typed with-open close",
   :reader-model
-  "jolt reader features (:jolt :bb) + syntax-quote literal collapse (spec 2.4 S25); map source-order preserved. #=(...) reads as inert data (never evaluates, regardless of *read-eval*); nested #() literals read where the JVM rejects them.",
+  "jolt reader features (:jolt :bb) + syntax-quote literal collapse (spec 2.4 S25); map source-order preserved. nested #() literals read where the JVM rejects them. (#=(...) evaluates at read time gated by *read-eval* now, like the JVM.)",
   :printer-model
   "jolt printer renders transients/atoms/print-method overrides differently from JVM #object",
   :strictness
@@ -260,7 +260,7 @@
    :behavior "(read-string \"#foo/bar 5\") with no reader for foo/bar"
    :jvm "throws: No reader function for tag foo/bar"
    :jolt "#foo/bar 5 (a tagged literal)"
-   :note "The default data-reader tags rather than throwing, like #= reads as data. clojure.edn still throws on an unknown tag."}
+   :note "The default data-reader tags rather than throwing. clojure.edn still throws on an unknown tag."}
   ;; resolve of a class name jolt does not model answers nil, not a throw.
   {:category :host-model
    :behavior "(resolve 'java.lang.module.ModuleFinder)"
@@ -634,7 +634,8 @@
    {:suite "string-model / codepoint strings", :label "subs across astral boundary", :category :string-model}
    {:suite "string-model / codepoint strings", :label "charAt of an astral character is the codepoint", :category :string-model}
    {:suite "concurrency-model / compare-and-set!", :label "value equality where JVM uses identity", :category :concurrency-model}
-   {:suite "reader-model / read-eval", :label "#= is inert data", :category :reader-model}
+   ;; (#= evaluates at read time now, gated by *read-eval* — that divergence is
+   ;;  gone; the reader / read-eval corpus suite pins the JVM behavior.)
    ;; A \ud800 escape names half a surrogate pair, which is not a scalar value a
    ;; code-point string can hold, so jolt's reader rejects it where the JVM reads a
    ;; one-char string holding the unpaired half. Same model as the astral entries
