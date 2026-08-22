@@ -1883,4 +1883,16 @@
   ;; width. Positive exact-width memory/signature/callback witnesses live in the
   ;; dedicated C-backed ffi-widths gate.
   {:suite "ffi" :expr "(jolt.ffi/__cfn \"strlen\" [:bogus] :size_t)" :expected :throws}
+
+  ;; (var …) on a non-var is a clean analysis error, never an opaque raise: a
+  ;; non-symbol argument, an unresolvable symbol, a local (var ignores locals,
+  ;; like the JVM), and a missing namespace all raise. Extra arguments beyond
+  ;; the symbol are ignored (JVM parity). (var String) is jolt's deliberate
+  ;; class-model superset — classes live in vars — so it is NOT a throws row.
+  {:suite "var-form" :expr "(var 5)" :expected :throws}
+  {:suite "var-form" :expr "(var)" :expected :throws}
+  {:suite "var-form" :expr "(var undefined-abc-xyz)" :expected :throws}
+  {:suite "var-form" :expr "(let [x 1] (var x))" :expected :throws}
+  {:suite "var-form" :expr "(var nosuchns/foo)" :expected :throws}
+  {:suite "var-form" :expr "(= (var map) (var map inc))" :expected "true"}
 ]

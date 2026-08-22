@@ -755,11 +755,19 @@
     ;; Lower the backtick to construction code (zero runtime cost), then analyze
     ;; it — the macroexpand/compile-time step, per read -> macroexpand -> compile.
     "syntax-quote" (analyze ctx (form-syntax-quote-lower ctx (second items)) env)
-    "var" (let [sym (second items)
-                r (resolve-global ctx sym)]
-            (if (= :var (:kind r))
-              (the-var (:ns r) (:name r))
-              (uncompilable (str "var of non-var " (form-sym-name sym)))))
+    ;; (var sym): the var itself, resolved at compile time. A non-symbol
+    ;; argument and an unresolvable symbol are distinct errors; the latter uses
+    ;; the reference wording. Note (var String) succeeds where the JVM refuses:
+    ;; jolt holds imported classes in vars, so the symbol resolves as :var.
+    "var" (let [sym (second items)]
+            (if-not (form-sym? sym)
+              (uncompilable (str "var argument must be a symbol: " (pr-str sym)))
+              (let [r (resolve-global ctx sym)]
+                (if (= :var (:kind r))
+                  (the-var (:ns r) (:name r))
+                  (uncompilable (str "Unable to resolve var: "
+                                     (if-let [ns (form-sym-ns sym)] (str ns "/") "")
+                                     (form-sym-name sym) " in this context"))))))
     ;; (set! *var* val): set the var's innermost thread binding; throws if none.
     ;; Uses jolt-set-var! (not jolt-var-set — that's the public root-setter).
     ;; supported (jolt binds fields immutably); an interop (.-field) target too.
