@@ -1122,8 +1122,16 @@
 ;; compile-time literals from the analyzer, so this emits a real typed binding;
 ;; the resulting Scheme procedure is callable like any jolt fn. The library must
 ;; have loaded the shared object (jolt.ffi/load-library) before this def runs.
+;; Keep this in agreement with ffi-type->chez in host/chez/java/ffi.ss: these are
+;; the compile-time signature and runtime memory halves of one public contract.
+;; This table is baked into each checked-in compiler seed.
 (def ^:private ffi-types
-  {"int" "int" "uint" "unsigned-int" "long" "long" "ulong" "unsigned-long"
+  {"int" "int" "uint" "unsigned-int"
+   "int8" "integer-8" "i8" "integer-8"
+   "int16" "integer-16" "short" "integer-16"
+   "uint16" "unsigned-16" "ushort" "unsigned-16"
+   "int32" "integer-32" "uint32" "unsigned-32"
+   "long" "long" "ulong" "unsigned-long"
    "int64" "integer-64" "uint64" "unsigned-64" "size_t" "size_t" "ssize_t" "ssize_t"
    "iptr" "iptr" "uptr" "uptr" "double" "double" "float" "float"
    "pointer" "void*" "void*" "void*" "string" "string" "void" "void"

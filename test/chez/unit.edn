@@ -1878,4 +1878,9 @@
   {:suite "seq" :label "drop past the end of a vector seq" :expr "(pr-str (drop 200 (seq (vec (range 100)))))" :expected "\"()\""}
   {:suite "seq" :label "drop 0 keeps the whole vector seq" :expr "(= (drop 0 (seq (vec (range 100)))) (range 100))" :expected "true"}
   {:suite "seq" :label "drop through cons onto a vector seq" :expr "(= (drop 2 (cons :x (cons :y (seq (vec (range 5)))))) (range 5))" :expected "true"}
+
+  ;; The compiler must reject an unregistered FFI type rather than guessing a
+  ;; width. Positive exact-width memory/signature/callback witnesses live in the
+  ;; dedicated C-backed ffi-widths gate.
+  {:suite "ffi" :expr "(jolt.ffi/__cfn \"strlen\" [:bogus] :size_t)" :expected :throws}
 ]

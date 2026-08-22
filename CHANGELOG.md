@@ -83,6 +83,17 @@ process-wide (~3300x faster stream drains for every app that requires it).
   `false` honestly (documented in known-divergences.edn, with `System/in`
   called out: `true` on the JVM, `false` here).
 
+- **Exact-width `jolt.ffi` scalar types:** `:int8`/`:i8`,
+  `:int16`/`:short`, `:uint16`/`:ushort`, `:int32`, and `:uint32`. Each type
+  works in native-memory access (`sizeof`/`read`/`write`) and typed native
+  signatures (`foreign-fn`/`defcfn`/`foreign-callable`), with signed and
+  unsigned boundaries preserved. The existing `:uint8`/`:u8`/`:byte` aliases
+  remain unsigned C octets. Exact-width values use native byte order; wire byte
+  order remains explicit through a codec or conversions such as
+  `htons`/`ntohs`. C default argument promotions still apply after `:varargs`,
+  so narrow integers must be declared as `:int` there (and `float` as
+  `:double`).
+
 ### Fixed
 
 - **The `mark` surface crashed on `System/in`.** `#690`'s mark state was added

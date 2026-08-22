@@ -12,7 +12,12 @@
         (ffi/free pp))
 
   Types (keywords): :int :uint :long :ulong :int64 :uint64 :size_t :ssize_t
-  :iptr :uptr :double :float :pointer :string :void :uint8 :char.
+  :iptr :uptr :double :float :pointer :string :void :uint8/:u8/:byte :char,
+  plus exact scalar widths :int8/:i8, :int16/:short, :uint16/:ushort, :int32,
+  :uint32.
+  Exact widths use native byte order for both memory and signatures. Signed and
+  unsigned names at one width expose the same stored bits; wire byte order stays
+  an explicit codec or htons/ntohs concern.
 
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
   ptr->string/string->ptr/null/null?) are provided by the host, as are the
@@ -48,6 +53,8 @@
 ;; arm64, which passes variadic arguments on the stack; a fixed-arity binding
 ;; silently corrupts them. fcntl is (int fd, int cmd, ...), so:
 ;;   (ffi/defcfn c-fcntl "fcntl" [:int :int :varargs :int] :int)
+;; C's default argument promotions still apply after the marker: pass values
+;; narrower than int as :int (and float as :double), not as an exact narrow type.
 (defmacro foreign-fn [csym argtypes rettype & [opt]]
   (if (= opt :blocking)
     (list 'jolt.ffi/__cfn csym argtypes rettype :blocking)
