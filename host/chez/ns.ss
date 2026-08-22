@@ -149,6 +149,35 @@
        (pair? (cdr items))
        (not (keyword? (cadr items)))))
 
+;; A libspec under a prefix joins onto it: a bare symbol `string` ->
+;; `prefix.string`, a vector `[string :as s]` -> `[prefix.string :as s]`.
+(define (prefix-join prefix lib)
+  (cond
+    ((symbol-t? lib) (jolt-symbol #f (string-append prefix "." (symbol-t-name lib))))
+    ((pvec? lib)
+     (let ((items (seq->list lib)))
+       (if (and (pair? items) (symbol-t? (car items)))
+           (apply jolt-vector (jolt-symbol #f (string-append prefix "." (symbol-t-name (car items)))) (cdr items))
+           lib)))
+    (else lib)))
+
+;; A require/use spec -> the list of single libspecs it stands for. A prefix
+;; list expands to one spec per sub-lib; both the LIST spelling
+;; (clojure [string :as str]) and the VECTOR spelling
+;; [clj-uuid [bitmop :as bitmop] …] are prefix lists on the JVM — a vector is a
+;; single libspec only when its second element is a keyword or absent. The old
+;; single-libspec read of the vector form required the PREFIX itself — for
+;; clj-uuid, a silent self-require mid-load — and dropped every sub-spec.
+;; Shared by the loader's expand-spec and the compile-env alias pre-scan.
+(define (expand-libspec s)
+  (cond
+    ((or (cseq? s) (empty-list-t? s) (pvec? s))
+     (let ((items (seq->list s)))
+       (if (prefix-list-items? items)
+           (map (lambda (lib) (prefix-join (symbol-t-name (car items)) lib)) (cdr items))
+           (list s))))
+    (else (list s))))
+
 ;; Register a parsed libspec's :as alias + :refer/:only names under `cns`.
 (define (chez-register-spec! cns spec)
   (let ((parsed (parse-libspec spec)))

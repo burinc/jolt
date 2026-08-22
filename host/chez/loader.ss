@@ -1767,30 +1767,9 @@
   (load-jolt-file path)
   jolt-nil)
 
-;; A libspec under a prefix joins onto it: a bare symbol `string` -> `prefix.string`,
-;; a vector `[string :as s]` -> `[prefix.string :as s]` (opts preserved).
-(define (prefix-join prefix lib)
-  (cond
-    ((symbol-t? lib) (jolt-symbol #f (string-append prefix "." (symbol-t-name lib))))
-    ((pvec? lib)
-     (let ((items (seq->list lib)))
-       (if (and (pair? items) (symbol-t? (car items)))
-           (apply jolt-vector (jolt-symbol #f (string-append prefix "." (symbol-t-name (car items)))) (cdr items))
-           lib)))
-    (else lib)))
-
-;; The prefix-list form of a require/use spec: a LIST `(prefix lib …)` expands to
-;; one spec per lib (prefix.lib), so (:require (clojure [string :as str])) means
-;; clojure.string :as str. A list with a KEYWORD second element is a single
-;; libspec (the jolt superset — see parse-libspec in ns.ss), not a prefix list;
-;; a vector / symbol spec is already a single lib.
-(define (expand-spec s)
-  (if (or (cseq? s) (empty-list-t? s))
-      (let ((items (seq->list s)))
-        (if (prefix-list-items? items)
-            (map (lambda (lib) (prefix-join (symbol-t-name (car items)) lib)) (cdr items))
-            (list s)))
-      (list s)))
+;; expand-spec: the shared prefix-list expansion (expand-libspec, ns.ss) —
+;; kept under its old name for the build driver's callers.
+(define (expand-spec s) (expand-libspec s))
 
 ;; --- require/use that LOAD ---------------------------------------------------
 ;; Override the alias-only versions from natives-str.ss. Load each spec's target
