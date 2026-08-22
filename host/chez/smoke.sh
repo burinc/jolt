@@ -189,6 +189,12 @@ check '(import (quote (java.time LocalDate))) (str (. LocalDate -MIN))' '"-99999
 check '(import (quote (java.time LocalDate))) (str (. LocalDate MIN))' '"-999999999-01-01"'
 check '(let [c java.time.LocalDate] (str (. c -MIN)))' '"-999999999-01-01"'
 check '(let [c java.time.LocalDate] (str (. c MIN)))' '"-999999999-01-01"'
+
+# X/from over the CORE java.time value types (no time library on deps — the
+# base autoload alone must serve these; the jolt-lang/time library re-registers
+# them with the zoned/offset types added). Certified on OpenJDK 20.
+check '(let [ldt (java.time.LocalDateTime/parse "2020-01-02T03:04")] [(str (java.time.LocalDate/from ldt)) (str (java.time.LocalTime/from ldt)) (str (java.time.LocalDateTime/from ldt))])' '["2020-01-02" "03:04" "2020-01-02T03:04"]'
+check '(try (java.time.LocalDate/from (java.time.Instant/parse "2020-01-01T00:00:00Z")) (catch java.time.DateTimeException e :dte))' ':dte'
 # The source a binary serves for a namespace is jolt's own, not a same-named one
 # from a later install root — the vendored Grenadine ships a jolt.deps facade for
 # embedders. Roots are first-wins and the bake matches, but only for source: the
