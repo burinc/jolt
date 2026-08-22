@@ -70,7 +70,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
 # Only mark PHONY targets for names that have file system conflicts:
 .PHONY: build install test ci gate-run-test gate-run-ci gate-status \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
-        gambitgen gambitgencheck grenadinecheck \
+        gambitgen gambitgencheck gambitseedcheck grenadinecheck \
         fibersbench dynbench \
         fibersresidue
 
@@ -127,7 +127,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscali
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
-  certify gambitcheck gambitgencheck gambitboot grenadinecheck fibers gosm asynctimer threadsafety
+  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer threadsafety
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -841,6 +841,27 @@ gambitgencheck:
 	    rm -f "$$out"; exit 1; \
 	  fi; \
 	  rm -f "$$out"
+
+# Gambit seed-mint gate: re-mint the gambit seed into a temp dir on Chez and
+# require it to match host/gambit/seed/ byte-for-byte. Fails when gen-seed.ss
+# itself cannot run (a chez-only construct reached the emission) or when the
+# chez seed was re-minted without `make gambitseed`. Runs on Chez alone, so it
+# gates in CI whether or not gambit is installed.
+gambitseedcheck:
+	@out=$$(mktemp -d); \
+	  if ! GEN_SEED_OUT_DIR="$$out" $(CHEZ) --script host/gambit/gen-seed.ss > "$$out/mint.log" 2>&1; then \
+	    tail -20 "$$out/mint.log" >&2; \
+	    echo "gambitseedcheck: gen-seed.ss FAILED — the gambit seed cannot be minted from current sources" >&2; \
+	    rm -rf "$$out"; exit 1; \
+	  fi; \
+	  if diff -q "$$out/prelude.ss" host/gambit/seed/prelude.ss >/dev/null \
+	      && diff -q "$$out/image.ss" host/gambit/seed/image.ss >/dev/null; then \
+	    echo "gambitseedcheck: gambit seed is current with the sources"; \
+	    rm -rf "$$out"; \
+	  else \
+	    echo "gambitseedcheck: host/gambit/seed is STALE — run 'make gambitseed'" >&2; \
+	    rm -rf "$$out"; exit 1; \
+	  fi
 
 gambitcheck:
 	@if [ -x "$(GAMBIT_GSI)" ]; then \

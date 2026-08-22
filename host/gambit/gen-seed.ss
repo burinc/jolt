@@ -162,7 +162,10 @@
   (display (string-append "gen-seed: wrote " path " ("
                           (number->string (string-length text)) " bytes)\n")))
 
-(gs-write "host/gambit/seed/prelude.ss" gs-prelude)
-(gs-write "host/gambit/seed/image.ss" gs-image)
+;; GEN_SEED_OUT_DIR redirects the writes, which is what `make gambitseedcheck`
+;; uses to mint into a temp dir and diff against the checked-in seed.
+(define gs-out-dir (or (getenv "GEN_SEED_OUT_DIR") "host/gambit/seed"))
+(gs-write (string-append gs-out-dir "/prelude.ss") gs-prelude)
+(gs-write (string-append gs-out-dir "/image.ss") gs-image)
 (fprintf (current-error-port) "mint: ~a form(s) skipped\n" ei-skipped-count)
 (display "gen-seed: gambit seed minted on Chez\n")
