@@ -3722,6 +3722,13 @@
   {:suite "uuid / java.util.UUID surface" :label "v1 timestamp / clockSequence / node" :expected "[138648505420000000 13256 175272763512902]" :actual "(let [u (java.util.UUID/fromString \"c232ab00-9414-11ec-b3c8-9f68deced846\")] [(.timestamp u) (.clockSequence u) (.node u)])" :portability :jvm}
   {:suite "uuid / java.util.UUID surface" :label ".timestamp on a non-time uuid throws" :expected ":unsupported" :actual "(try (.timestamp (java.util.UUID/fromString \"11112222-3333-4444-5555-666677778888\")) (catch UnsupportedOperationException e :unsupported))" :portability :jvm}
   {:suite "uuid / java.util.UUID surface" :label ".hashCode matches the JVM fold" :expected "[34952 0 1073786880]" :actual "(mapv (fn [s] (.hashCode (java.util.UUID/fromString s))) [\"11112222-3333-4444-5555-666677778888\" \"00000000-0000-0000-0000-000000000000\" \"ffffffff-ffff-4fff-bfff-ffffffffffff\"])" :portability :jvm}
+  ;; #= read-eval: evaluate the next form at READ time, gated by *read-eval*
+  ;; (clj-uuid computes its bit masks with it). Certified on OpenJDK 20.
+  {:suite "reader / read-eval" :label "#= evaluates at read time" :expected "3" :actual "(read-string \"#=(+ 1 2)\")" :portability :jvm}
+  {:suite "reader / read-eval" :label "#= nests" :expected "[3 4]" :actual "(read-string \"[#=(+ 1 2) #=(* 2 #=(+ 1 1))]\")" :portability :jvm}
+  {:suite "reader / read-eval" :label "*read-eval* false refuses" :expected ":denied" :actual "(binding [*read-eval* false] (try (read-string \"#=(+ 1 2)\") (catch Exception e :denied)))" :portability :jvm}
+  {:suite "reader / read-eval" :label "#= of a symbol resolves it" :expected "\"class java.lang.String\"" :actual "(str (read-string \"#=java.lang.String\"))" :portability :jvm}
+  {:suite "reader / read-eval" :label "edn has no #= dispatch" :expected ":no-dispatch" :actual "(try (clojure.edn/read-string \"#=(+ 1 2)\") (catch Exception e :no-dispatch))" :portability :jvm}
   {:suite "uuid / parse-uuid" :label "case-insensitive =" :expected "true" :actual "(= (parse-uuid \"b6883c0a-0342-4007-9966-bc2dfa6b109e\") (parse-uuid \"B6883C0A-0342-4007-9966-BC2DFA6B109E\"))" :portability :common}
   {:suite "uuid / parse-uuid" :label "empty -> nil" :expected "nil" :actual "(parse-uuid \"\")" :portability :common}
   {:suite "uuid / parse-uuid" :label "short -> nil" :expected "nil" :actual "(parse-uuid \"0\")" :portability :common}
@@ -4943,7 +4950,9 @@
   ;; round trip is pinned in unit.edn, not here, since the JVM throws.
   {:suite "string-model / codepoint strings" :label "charAt of an astral character is the codepoint" :expected "[128512 1]" :actual "[(int (.charAt \"😀\" 0)) (.length \"😀\")]" :portability :jvm}
   {:suite "concurrency-model / compare-and-set!" :label "value equality where JVM uses identity" :expected "true" :actual "(compare-and-set! (atom [1]) [1] [2])" :portability :common}
-  {:suite "reader-model / read-eval" :label "#= is inert data" :expected "false" :actual "(= 3 (read-string \"#=(+ 1 2)\"))" :portability :common}
+  ;; #= evaluates at read time now (the reader / read-eval suite above pins the
+  ;; full behavior); this row used to assert it read as inert data.
+  {:suite "reader-model / read-eval" :label "#= evaluates under read-string" :expected "true" :actual "(= 3 (read-string \"#=(+ 1 2)\"))" :portability :common}
   {:suite "reader-model / nested fn literals" :label "nested #() reads" :expected "true" :actual "(string? (str (read-string \"#(#(inc %))\")))" :portability :common}
   {:suite "permissive / ex-info nil map" :label "ex-info accepts nil data" :expected "\"m\"" :actual "(ex-message (ex-info \"m\" nil))" :portability :common}
   {:suite "transducers / into & eduction (overlay)" :label "count on an eduction throws (JVM parity)" :expected ":uoe" :actual "(try (count (eduction (map inc) [1 2 3])) :no-throw (catch UnsupportedOperationException _ :uoe))" :portability :common}
