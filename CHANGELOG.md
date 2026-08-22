@@ -34,6 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`kvreduce`, lowercase) before throwing. `sequence` still requires a seqable
   source, as on the JVM.
 
+- **Protocol dispatch reaches a deftype or reify through its declared
+  interfaces.** `value-host-tags` now reports a reify's declared interfaces
+  (with their modeled ancestry) and a bare deftype's declared interfaces from
+  the class graph, so an `extend-protocol` filed under an interface name —
+  `clojure.lang.IReduceInit`, `java.lang.Iterable`, an ancestor like
+  `Associative` for a type declaring `IPersistentVector` — dispatches on such
+  a value the way `instanceof` answers on the JVM. A defrecord's EXTRA declared
+  interfaces join its automatic map set the same way. `satisfies?` agrees: it
+  falls through to the same interface walk when the type's own registry has no
+  entry (it used to answer false while dispatch succeeded). An extension on
+  the type's own tag still wins, and `Object` extensions still catch types
+  declaring nothing.
+
 - **A deftype/reify can name a protocol by its dotted class spelling.**
   `(deftype T [] my.ns.PThing (m [_] …))` resolves `my.ns.PThing` to the
   protocol like the JVM does; the methods used to file as interface methods
