@@ -899,6 +899,95 @@
   (host-new (or (deftype-ctor-class ctx class) class)
             (mapv #(analyze ctx % env) args)))
 
+;; Literal, data-only struct descriptors. Keep the analyzer representation free
+;; of reader objects so it survives self-hosting and can be embedded in the IR.
+(def ^:private ffi-layout-scalars
+  #{"int" "uint" "int8" "i8" "uint8" "u8" "byte" "char"
+    "int16" "short" "uint16" "ushort" "int32" "uint32"
+    "long" "ulong" "int64" "uint64" "size_t" "ssize_t" "iptr" "uptr"
+    "double" "float" "pointer" "void*"})
+
+(declare analyze-ffi-layout-type)
+
+(defn- analyze-ffi-layout-struct [form]
+  (when-not (form-vec? form)
+    (throw (str "jolt.ffi layout descriptor must be [:struct [[field type] ...]], got "
+                (pr-str form))))
+  (let [parts (vec (form-vec-items form))]
+    (when-not (and (= 2 (count parts))
+                   (form-keyword? (nth parts 0))
+                   (nil? (namespace (nth parts 0)))
+                   (= "struct" (name (nth parts 0)))
+                   (form-vec? (nth parts 1)))
+      (throw (str "jolt.ffi layout descriptor must be [:struct [[field type] ...]], got "
+                  (pr-str form))))
+    (let [field-forms (vec (form-vec-items (nth parts 1)))]
+      (when (empty? field-forms)
+        (throw "jolt.ffi struct descriptor must contain at least one field"))
+      (loop [remaining field-forms names #{} fields []]
+        (if (empty? remaining)
+          {:ffi-kind :struct :fields fields}
+          (let [field (first remaining)]
+            (when-not (form-vec? field)
+              (throw (str "jolt.ffi struct field must be [keyword type], got "
+                          (pr-str field))))
+            (let [fp (vec (form-vec-items field))]
+              (when-not (= 2 (count fp))
+                (throw (str "jolt.ffi struct field must be [keyword type], got "
+                            (pr-str field))))
+              (let [field-name (nth fp 0)]
+                (when-not (and (form-keyword? field-name)
+                               (nil? (namespace field-name)))
+                  (throw (str "jolt.ffi struct field name must be an unqualified keyword, got "
+                              (pr-str field-name))))
+                (let [nm (name field-name)]
+                  (when (contains? names nm)
+                    (throw (str "jolt.ffi struct field names must be unique; duplicate :" nm)))
+                  (recur (rest remaining)
+                         (conj names nm)
+                         (conj fields {:name nm
+                                       :type (analyze-ffi-layout-type (nth fp 1))})))))))))))
+
+(defn- analyze-ffi-layout-type [form]
+  (cond
+    (form-keyword? form)
+    (let [n (name form)]
+      (when-not (and (nil? (namespace form)) (contains? ffi-layout-scalars n))
+        (throw (str "jolt.ffi struct field type must be a fixed-size scalar or nested struct; got "
+                    (pr-str form))))
+      n)
+
+    (form-vec? form) (analyze-ffi-layout-struct form)
+
+    :else
+    (throw (str "jolt.ffi struct field type must be a fixed-size scalar or nested struct; got "
+                (pr-str form)))))
+
+(defn- analyze-ffi-layout [items]
+  (when-not (= 2 (count items))
+    (throw "jolt.ffi/layout expects one literal struct descriptor"))
+  {:op :ffi-layout :layout (analyze-ffi-layout-struct (nth items 1))})
+
+(defn- ffi-by-value-form? [form]
+  (when (form-vec? form)
+    (let [parts (vec (form-vec-items form))]
+      (and (= 2 (count parts))
+           (form-keyword? (nth parts 0))
+           (nil? (namespace (nth parts 0)))
+           (= "by-value" (name (nth parts 0)))))))
+
+(defn- analyze-ffi-signature-type [form position]
+  (cond
+    (form-keyword? form) (name form)
+    (ffi-by-value-form? form)
+      (let [parts (vec (form-vec-items form))]
+        {:ffi-kind :by-value
+         :type (analyze-ffi-layout-struct (nth parts 1))})
+    :else
+      (throw (str "jolt.ffi " position
+                  " type must be a keyword or [:by-value [:struct ...]], got "
+                  (pr-str form)))))
+
 ;; jolt.ffi/__cfn: the low-level foreign-function form a jolt library
 ;; uses (via the jolt.ffi/foreign-fn macro) to bind native code. Shape:
 ;;   (jolt.ffi/__cfn "c_symbol" [:argtype ...] :rettype)            ; non-blocking
@@ -913,8 +1002,9 @@
     (throw (str "jolt.ffi/foreign-fn expects (foreign-fn \"sym\" [argtypes] rettype [:blocking])")))
   {:op :ffi-fn
    :csym (nth items 1)
-   :argtypes (mapv name (form-vec-items (nth items 2)))
-   :rettype (name (nth items 3))
+   :argtypes (mapv #(analyze-ffi-signature-type % "argument")
+                   (form-vec-items (nth items 2)))
+   :rettype (analyze-ffi-signature-type (nth items 3) "return")
    :blocking (and (= 5 (count items)) (= "blocking" (name (nth items 4))))})
 
 ;; jolt.ffi/__ccallable: the foreign-CALLBACK form (via the jolt.ffi/foreign-callable
@@ -1235,6 +1325,11 @@
           (and (form-sym? head) (= "jolt.ffi" (form-sym-ns head))
                (= "__cfn" (form-sym-name head)))
             (analyze-ffi-fn ctx items env)
+          ;; jolt.ffi/layout expands to this literal-only leaf. The back end
+          ;; asks Chez for the actual ABI size, alignment and offsets.
+          (and (form-sym? head) (= "jolt.ffi" (form-sym-ns head))
+               (= "__layout" (form-sym-name head)))
+            (analyze-ffi-layout items)
           ;; jolt.ffi/__ccallable — the foreign-callback special form (the fn is a
           ;; child expression, analyzed here).
           (and (form-sym? head) (= "jolt.ffi" (form-sym-ns head))

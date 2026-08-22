@@ -19,6 +19,14 @@
   unsigned names at one width expose the same stored bits; wire byte order stays
   an explicit codec or htons/ntohs concern.
 
+  A struct passed or returned by value uses the same literal descriptor as
+  layout, wrapped in [:by-value descriptor]. An argument value is a non-null
+  caller-owned pointer to the struct bytes. An aggregate-returning callable takes
+  a non-null caller-owned destination pointer as its first Jolt argument, writes
+  the C return there, and returns that pointer. Aggregate callbacks and exports
+  are not supported. A fixed aggregate may precede :varargs, but aggregate
+  variadic arguments and aggregate-return-plus-varargs are rejected.
+
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
   ptr->string/string->ptr/null/null?) are provided by the host, as are the
   buffer moves: read-bytes/write-bytes decode and encode UTF-8, read-array/
@@ -39,6 +47,113 @@
   a compile-time-typed signature to a real Chez foreign-procedure. foreign-callable
   is the inverse — it wraps a jolt fn as a C-callable function pointer so C can
   call back into jolt (e.g. GTK signal handlers); free-callable releases it.")
+
+(defmacro layout
+  "Compile a literal [:struct [[field type] ...]] descriptor into immutable ABI
+  layout data. Field names are unique unqualified keywords; fields are fixed-size
+  scalars or nested structs. Chez supplies size, alignment, and offsets."
+  [descriptor]
+  (list 'jolt.ffi/__layout descriptor))
+
+(defn- checked-layout [layout]
+  (when-not (and (map? layout) (= true (:jolt.ffi/layout layout)))
+    (throw (ex-info "jolt.ffi: expected a compiled layout" {:layout layout})))
+  layout)
+
+(defn- checked-field-path [path]
+  (let [p (if (keyword? path) [path] path)]
+    (when-not (and (vector? p) (pos? (count p))
+                   (every? #(and (keyword? %) (nil? (namespace %))) p))
+      (throw (ex-info "jolt.ffi: field path must be an unqualified keyword or non-empty vector of them"
+                      {:path path})))
+    p))
+
+(defn layout-size [layout] (:size (checked-layout layout)))
+(defn layout-alignment [layout] (:alignment (checked-layout layout)))
+
+(defn field-offset [layout path]
+  (let [layout (checked-layout layout)
+        path (checked-field-path path)
+        offsets (:jolt.ffi/offsets layout)]
+    (when-not (contains? offsets path)
+      (throw (ex-info "jolt.ffi: unknown layout field path" {:path path})))
+    (get offsets path)))
+
+(defn- field-type [layout path]
+  (let [types (:jolt.ffi/types layout)]
+    (when-not (contains? types path)
+      (throw (ex-info "jolt.ffi: field path names a struct, not a scalar field"
+                      {:path path})))
+    (get types path)))
+
+(defn read-field [pointer layout path]
+  (let [layout (checked-layout layout)
+        path (checked-field-path path)]
+    (jolt.ffi/read pointer (field-type layout path) (field-offset layout path))))
+
+(defn write-field [pointer layout path value]
+  (let [layout (checked-layout layout)
+        path (checked-field-path path)]
+    (jolt.ffi/write pointer (field-type layout path) (field-offset layout path) value)))
+
+(defn- helper-binding [macro-name binding]
+  (when-not (and (vector? binding) (= 2 (count binding))
+                 (symbol? (first binding)))
+    (throw (str "jolt.ffi/" macro-name " requires [pointer value] binding")))
+  binding)
+
+(defmacro with-alloc
+  "Allocate byte-count bytes for pointer, evaluate body, and free exactly once.
+  The pointer is valid only within body and must not escape the lexical scope."
+  [binding & body]
+  (let [[pointer byte-count] (helper-binding "with-alloc" binding)]
+    `(let [~pointer (jolt.ffi/alloc ~byte-count)]
+       (try ~@body (finally (jolt.ffi/free ~pointer))))))
+
+(defmacro with-out
+  "Lexically allocate one scalar value of scalar-type."
+  [binding & body]
+  (let [[pointer scalar-type] (helper-binding "with-out" binding)]
+    `(jolt.ffi/with-alloc [~pointer (jolt.ffi/sizeof ~scalar-type)] ~@body)))
+
+(defmacro with-layout
+  "Lexically allocate one instance of a compiled layout."
+  [binding & body]
+  (let [[pointer layout] (helper-binding "with-layout" binding)]
+    `(jolt.ffi/with-alloc [~pointer (jolt.ffi/layout-size ~layout)] ~@body)))
+
+(defmacro with-c-string
+  "Copy value to a lexical NUL-terminated UTF-8 C string."
+  [binding & body]
+  (let [[pointer value] (helper-binding "with-c-string" binding)]
+    `(let [~pointer (jolt.ffi/string->ptr ~value)]
+       (try ~@body (finally (jolt.ffi/free ~pointer))))))
+
+(defmacro with-c-string-array
+  "Build a lexical pointer array of count NUL-terminated UTF-8 strings. The
+  values expression is evaluated once. Partially built arrays are cleaned up if
+  conversion fails. Neither the array nor its member pointers may escape body."
+  [binding values & body]
+  (let [[pointer count-expr] (helper-binding "with-c-string-array" binding)]
+    `(let [values# (vec ~values)
+           count# ~count-expr]
+       (when-not (= count# (count values#))
+         (throw (ex-info "jolt.ffi: C string array count does not match values"
+                         {:count count# :value-count (count values#)})))
+       (let [~pointer (jolt.ffi/alloc (* count# (jolt.ffi/sizeof :pointer)))
+             owned# (atom [])]
+         (try
+           (doseq [[index# value#] (map-indexed vector values#)]
+             (let [string-pointer# (jolt.ffi/string->ptr value#)]
+               (swap! owned# conj string-pointer#)
+               (jolt.ffi/write ~pointer :pointer
+                               (* index# (jolt.ffi/sizeof :pointer))
+                               string-pointer#)))
+           ~@body
+           (finally
+             (doseq [string-pointer# @owned#]
+               (jolt.ffi/free string-pointer#))
+             (jolt.ffi/free ~pointer)))))))
 
 ;; foreign-fn binds C symbol `csym` to a typed callable. Expands to the __cfn
 ;; special form (always fully-qualified, so an :as alias on jolt.ffi resolves):

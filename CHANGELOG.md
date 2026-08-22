@@ -62,6 +62,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `IllegalArgumentException` on anything else instead of returning nil
   (`parse-uuid` keeps its nil-returning Clojure contract).
 
+- **Lexically scoped `jolt.ffi` allocation helpers:** `with-alloc`, `with-out`,
+  `with-layout`, `with-c-string`, and `with-c-string-array` release helper-owned
+  native allocations exactly once on normal return or exception. Partially
+  constructed C string arrays are cleaned up safely. Pointers created by these
+  helpers are valid only within the lexical body and must not escape it.
+
+- **Declarative `jolt.ffi` struct layouts:** `(ffi/layout [:struct ...])`
+  compiles a literal, data-only descriptor into immutable ABI metadata derived
+  by Chez. `layout-size`, `layout-alignment`, and `field-offset` expose the
+  native layout, while `read-field` and `write-field` access scalar fields by
+  keyword path. Layouts support fixed-size scalar fields and nested structs;
+  arrays, unions, bitfields, packing, and recursive descriptors are not yet
+  supported.
+
+- **Structs passed and returned by C value:** `foreign-fn` and `defcfn` accept
+  `[:by-value [:struct ...]]` signature types. Arguments are non-null pointers
+  to caller-owned struct storage. Aggregate-returning callables take a non-null
+  caller-owned destination pointer first, write the returned C value there, and
+  return that pointer. Nested structs, multiple aggregate arguments, fixed
+  aggregates before `:varargs`, and `:blocking` calls are supported; aggregate
+  callbacks, variadic aggregate arguments, and aggregate returns combined with
+  `:varargs` remain unsupported.
+
 ### Fixed
 
 - **Static fields resolve through every access path.** Three related bugs in
@@ -153,7 +176,6 @@ the `var` special form reports real errors.
   namespaced symbol (the namespace part used to be dropped). `(var String)`
   still succeeds and returns the class-holding var — jolt keeps imported
   classes in vars, a deliberate superset of the JVM, which refuses.
-
 ## [0.7.21] - 2026-08-22
 
 A patch release that gives core vars their documentation: `(meta #'map)` used

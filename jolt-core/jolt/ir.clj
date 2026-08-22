@@ -135,6 +135,7 @@
 ;; :set-var      :the-var :val                    :val   (:the-var is a leaf the-var node)
 ;; :set-field    :obj :field :val                 :obj :val
 ;; :defmacro     :ns :name :fn                     :fn
+;; :ffi-layout   :layout                           —
 ;; :ffi-fn       :csym :argtypes :rettype         —
 ;; :ffi-callable :fn :argtypes :rettype           :fn
 ;; :regex        :source                          —
@@ -164,7 +165,7 @@
 (def node-ops
   #{:const :local :var :the-var :host :host-static :host-new :if :do :invoke :def
     :let :loop :recur :fn :vector :map :set :quote :throw :coerce :try :host-call
-    :set-var :set-field :defmacro :ffi-fn :ffi-callable :regex :inst :uuid :bigdec
+    :set-var :set-field :defmacro :ffi-layout :ffi-fn :ffi-callable :regex :inst :uuid :bigdec
     :the-ns})
 
 ;; op -> the keys a node of that op must carry. Optional keys (:init, annotations)
@@ -179,6 +180,7 @@
    :throw [:expr] :coerce [:kind :expr] :try [:body]
    :host-call [:target :method :args] :set-var [:the-var :val]
    :set-field [:obj :field :val] :defmacro [:ns :name :fn]
+   :ffi-layout [:layout]
    :ffi-fn [:csym :argtypes :rettype] :ffi-callable [:fn :argtypes :rettype]
    :regex [:source] :inst [:source] :uuid [:source] :bigdec [:source]
    :the-ns [:name]})
