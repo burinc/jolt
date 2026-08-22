@@ -34,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`kvreduce`, lowercase) before throwing. `sequence` still requires a seqable
   source, as on the JVM.
 
+- **A deftype/reify can name a protocol by its dotted class spelling.**
+  `(deftype T [] my.ns.PThing (m [_] …))` resolves `my.ns.PThing` to the
+  protocol like the JVM does; the methods used to file as interface methods
+  and protocol dispatch answered "No method …" (found running mulog).
+
 - **The vector spelling of a require prefix list expands.**
   `[clj-uuid [bitmop :as bitmop] [clock :as clock]]` is a prefix list on the
   JVM; the old single-libspec read required the PREFIX itself — a silent
@@ -42,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pre-scan, in both the list and vector spellings.
 
 ### Added
+
+- **`java.nio.charset.StandardCharsets` constants.** The constants are the
+  charset name strings, which every jolt charset seam takes, so they compose
+  with `.getBytes`, `String` ctors and stream readers alike.
 
 - **`X/from` for the core `java.time` value types.** `LocalDate/from`,
   `LocalTime/from` and `LocalDateTime/from` answer the JVM TemporalAccessor
