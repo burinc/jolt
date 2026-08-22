@@ -102,9 +102,46 @@
             (loop (+ j 3)
                   (if use? (cons j uses) uses)
                   (+ n 1))))))
-  (when (gs-has? text "(foreign-procedure")
-    (fprintf (current-error-port) "gen-seed: FAIL ~a contains (foreign-procedure — chez-only, not writing\n" what)
-    (exit 1)))
+  ;; "(foreign-procedure" is chez-only as an OP USE. Inside a string literal it
+  ;; is DATA: emit-cfn's own emitter strings carry the text (the compiler must
+  ;; be able to DESCRIBE chez output while running on gambit), so the preceding-
+  ;; char heuristic above cannot classify it — the needle sits mid-string after
+  ;; ordinary characters. Scan with a string-literal state machine instead and
+  ;; fail only on an occurrence OUTSIDE any string literal.
+  (let ((uses (gs-op-uses text "(foreign-procedure")))
+    (when (pair? uses)
+      (fprintf (current-error-port)
+               "gen-seed: FAIL ~a has ~a (foreign-procedure op use(s) — chez-only, not writing\n"
+               what (length uses))
+      (for-each (lambda (k)
+                  (let ((lo (max 0 (- k 60))) (hi (min (string-length text) (+ k 80))))
+                    (fprintf (current-error-port) "gen-seed:   ...~a...\n"
+                             (substring text lo hi))))
+                uses)
+      (exit 1))))
+
+;; Occurrences of needle (which starts with #\() OUTSIDE string literals.
+;; Tracks Chez `write` string syntax: \" and \\ escapes inside strings, and a
+;; #\< char literal outside them (#\" must not open a string).
+(define (gs-op-uses text needle)
+  (let ((nlen (string-length needle)) (tlen (string-length text)))
+    (let loop ((i 0) (in-str #f) (uses '()))
+      (if (>= i tlen)
+          (reverse uses)
+          (let ((c (string-ref text i)))
+            (cond
+              (in-str
+               (cond ((char=? c #\\) (loop (+ i 2) #t uses))
+                     ((char=? c #\") (loop (+ i 1) #f uses))
+                     (else (loop (+ i 1) #t uses))))
+              ((and (char=? c #\#) (< (+ i 1) tlen)
+                    (char=? (string-ref text (+ i 1)) #\\))
+               (loop (+ i 3) #f uses))          ; #\" / #\\ / first char of a name
+              ((char=? c #\") (loop (+ i 1) #t uses))
+              ((and (char=? c #\() (<= (+ i nlen) tlen)
+                    (string=? (substring text i (+ i nlen)) needle))
+               (loop (+ i nlen) #f (cons i uses)))
+              (else (loop (+ i 1) #f uses))))))))
 
 (define (gs-index-at text needle from)
   (let loop ((i from))
@@ -115,8 +152,8 @@
 
 (gs-verify gs-prelude "prelude")
 (gs-verify gs-image "image")
-(display (string-append "gen-seed: prelude grep-verified (no #3%, no (foreign-procedure)\n"))
-(display (string-append "gen-seed: image  grep-verified (no #3%, no (foreign-procedure)\n"))
+(display (string-append "gen-seed: prelude grep-verified (no #3% / (foreign-procedure op uses)\n"))
+(display (string-append "gen-seed: image  grep-verified (no #3% / (foreign-procedure op uses)\n"))
 
 (define (gs-write path text)
   (let ((p (open-output-file path 'replace)))
