@@ -11,7 +11,7 @@
 ;; reset between cases so there is no leakage — same isolation a fresh process gives.
 ;;
 ;;   chez --script host/chez/run-corpus.ss
-;;   JOLT_CHEZ_ZJ_FLOOR=N   override the regression floor (default 3390)
+;;   JOLT_CHEZ_ZJ_FLOOR=N   override the regression floor (default 4590)
 ;;   JOLT_CORPUS_LIMIT=N    every-Nth stride (fast iteration; floor drops to 0)
 ;;   JOLT_DUMP_CRASH_LABELS=1   list crash + allowlisted labels
 (import (chezscheme))
@@ -263,7 +263,7 @@
   (for-each (lambda (l) (printf "  ~a\n" l)) crash-stale))
 
 (define base-floor (let ((s (getenv "JOLT_CHEZ_ZJ_FLOOR")))
-                     (if s (string->number s) 3390)))
+                     (if s (string->number s) 4590)))
 (define floor (if limit 0 base-floor))
 (define crash-gate-fails (and (not limit) (or (pair? crash-new) (pair? crash-stale))))
 (when (or (> (length diverged) 0) (< pass floor) crash-gate-fails)

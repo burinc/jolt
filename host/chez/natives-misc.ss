@@ -65,6 +65,35 @@
 ;; uuid? / random-uuid / parse-uuid are OVERLAY fns (they read :jolt/type), so
 ;; the prelude would clobber a def-var! here — they're asserted in post-prelude.ss.
 
+;; --- java.util.UUID bit views ------------------------------------------------
+;; The canonical string is the stored representation; the JVM's two-long view is
+;; derived by parsing its 32 hex digits. The longs are SIGNED, and that is
+;; observable: compareTo orders by signed msb then lsb, so a uuid with the high
+;; bit set sorts FIRST — before the nil uuid (UUID.compareTo). The instance
+;; method surface over these lives with the ctors in java/io.ss.
+(define (uuid-hexv c)
+  (cond ((and (char>=? c #\0) (char<=? c #\9)) (fx- (char->integer c) 48))
+        ((and (char>=? c #\a) (char<=? c #\f)) (fx- (char->integer c) 87))
+        (else (fx- (char->integer c) 55))))
+;; unsigned value of the 16 hex digits starting at digit index `start` (0 = msb,
+;; 16 = lsb), mapped through the 8-4-4-4-12 layout by uuid-hex-pos.
+(define (uuid-half-u s start)
+  (let loop ((j start) (acc 0))
+    (if (fx=? j (fx+ start 16))
+        acc
+        (loop (fx+ j 1) (+ (* acc 16) (uuid-hexv (string-ref s (uuid-hex-pos j))))))))
+(define (uuid-msb-u u) (uuid-half-u (juuid-s u) 0))
+(define (uuid-lsb-u u) (uuid-half-u (juuid-s u) 16))
+(define (uuid-u64->s64 n) (if (>= n #x8000000000000000) (- n #x10000000000000000) n))
+(define (uuid-cmp a b)
+  (let ((ma (uuid-u64->s64 (uuid-msb-u a))) (mb (uuid-u64->s64 (uuid-msb-u b))))
+    (cond ((< ma mb) -1) ((> ma mb) 1)
+          (else (let ((la (uuid-u64->s64 (uuid-lsb-u a))) (lb (uuid-u64->s64 (uuid-lsb-u b))))
+                  (cond ((< la lb) -1) ((> la lb) 1) (else 0)))))))
+;; a uuid is Comparable — compare / sort / sorted colls agree with .compareTo.
+(register-compare-arm! (lambda (a b) (and (juuid? a) (juuid? b)))
+                       (lambda (a b) (uuid-cmp a b)))
+
 ;; str of a uuid -> the bare 36-char string; pr-str -> #uuid "…".
 (register-str-render! juuid? juuid-s)
 (define (juuid-pr u) (string-append "#uuid \"" (juuid-s u) "\""))

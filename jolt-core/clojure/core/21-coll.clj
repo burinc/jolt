@@ -199,6 +199,10 @@
     (vector? coll) (reduce (fn [acc i] (f acc i (nth coll i))) init (range (count coll)))
     (map? coll)    (reduce (fn [acc k] (f acc k (get coll k))) init (keys coll))
     (nil? coll)    init
+    ;; a deftype/reify declaring IKVReduce drives its own kvreduce (the JVM
+    ;; method name is lowercase). Unwrap a reduced defensively, like reduce.
+    (instance? clojure.lang.IKVReduce coll)
+    (let [r (.kvreduce coll f init)] (if (reduced? r) (deref r) r))
     :else (throw (str "reduce-kv not supported on: " coll))))
 
 ;; ex-info accessors. The constructor (ex-info) stays native — it builds the tagged

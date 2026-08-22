@@ -98,7 +98,9 @@
   (let* ((conj-rf (lambda a (if (fx=? (length a) 1) (car a)   ; completion = identity
                                (jolt-conj1 (car a) (cadr a)))))
          (xrf (jolt-invoke xform conj-rf))
-         (res (reduce-seq xrf to (jolt-seq from))))
+         ;; into-fold, not reduce-seq: an IReduce(Init) source drives its own
+         ;; reduce here too (seq.ss).
+         (res (into-fold xrf to from)))
     (jolt-invoke xrf res)))
 
 ;; mapcat: (mapcat f) -> transducer; (mapcat f coll & colls) -> map f across the
