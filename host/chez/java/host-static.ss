@@ -339,6 +339,18 @@
              "Cipher" "javax.crypto.Cipher"
              "SecretKeySpec" "javax.crypto.spec.SecretKeySpec"
              "IvParameterSpec" "javax.crypto.spec.IvParameterSpec")
+           (box #f))
+   ;; java.net lives in jolt's own stdlib rather than the runtime, since it is
+   ;; POSIX sockets over jolt.ffi. No coordinate to declare, so the autoload
+   ;; always finds it — a program reaching for InetAddress or NetworkInterface
+   ;; should no more have to require jolt.socket than it does on the JVM.
+   (vector "jolt.socket" "jolt.socket"
+           '("InetAddress" "java.net.InetAddress"
+             "Inet4Address" "java.net.Inet4Address"
+             "NetworkInterface" "java.net.NetworkInterface"
+             "Socket" "java.net.Socket"
+             "ServerSocket" "java.net.ServerSocket"
+             "InetSocketAddress" "java.net.InetSocketAddress")
            (box #f))))
 (define (lib-provider-for class)
   (let loop ((ps lib-class-providers))

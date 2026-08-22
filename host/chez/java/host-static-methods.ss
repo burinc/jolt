@@ -857,7 +857,12 @@
           ((string=? k "java.io.tmpdir") (or (getenv "TMPDIR") "/tmp"))
           ((pair? dflt) (car dflt))
           (else jolt-nil))))
+;; System/getProperties: a java.util.Properties holding the same values
+;; System/getProperty answers one at a time. make-properties-jhost is defined in
+;; host-static-classes.ss, which loads after this file — resolved at call time.
 (define (sys-properties-map)
+  (make-system-properties (sys-properties-pmap) sys-prop-table))
+(define (sys-properties-pmap)
   (let ((base (jolt-hash-map "os.name" sys-os-name "os.arch" sys-os-arch
                              "line.separator" "\n" "file.separator" "/"
                              "path.separator" ":" "java.class.path" (sys-class-path)

@@ -508,6 +508,10 @@
 (jch-register-supers! "java.util.LinkedList" '("java.util.List" "java.util.Deque"))
 (jch-register-supers! "java.util.ArrayDeque" '("java.util.Deque"))
 (jch-register-supers! "java.util.HashMap" '("java.util.Map"))
+;; Properties is a Hashtable, which is a Map — System/getProperties answers
+;; (instance? java.util.Map …) as well as (instance? java.util.Properties …).
+(jch-register-supers! "java.util.Hashtable" '("java.util.Map"))
+(jch-register-supers! "java.util.Properties" '("java.util.Hashtable"))
 (jch-register-supers! "java.util.HashSet" '("java.util.Set"))
 ;; base interfaces used as super targets — need keys for simple-name resolution
 (jch-register-supers! "java.lang.Number" '())
@@ -623,6 +627,7 @@
     ("linkedlist" . "java.util.LinkedList")
     ("arraydeque" . "java.util.ArrayDeque")
     ("hashmap" . "java.util.HashMap")
+    ("properties" . "java.util.Properties")
     ("hashset" . "java.util.HashSet")
     ;; io writer/reader shims: *out* is a PrintWriter like the JVM REPL's
     ("port-writer" . "java.io.PrintWriter")

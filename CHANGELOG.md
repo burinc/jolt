@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`java.net` host identity.** `InetAddress/getLocalHost`, `getAllByName`
+  (an array, as on the JVM), `.getCanonicalHostName`, `.getAddress`, and a new
+  `java.net.NetworkInterface` — `getNetworkInterfaces`, `getByName`,
+  `getByInetAddress`, `.getInetAddresses`, `.getHardwareAddress`,
+  `.getDisplayName` — read from `getifaddrs(3)`. IPv4, matching the rest of
+  `jolt.socket`. Touching any `java.net` class now loads `jolt.socket` on
+  demand, the courtesy `java.time` and `MessageDigest` already got, so a JVM
+  library that reaches for `InetAddress` works with nothing to require.
+
+- **`java.util.Properties`**, with the `defaults` chain the JVM's has, and the
+  same split over which operations span it: `getProperty`, `propertyNames` and
+  `stringPropertyNames` do, the inherited `Hashtable` surface (`get`,
+  `containsKey`, `keySet`, `size`) does not. `System/getProperties` returns one
+  whose entries are the computed values, recomputed per call so `user.dir` and
+  `java.class.path` stay current, and writes through it reach the store
+  `System/getProperty` reads. It used to return a plain map, which answered
+  `.getProperty` as a key lookup and so read `nil` for every system property.
+
+- **`java.nio.charset.StandardCharsets` constants.** The constants are the
+  charset name strings, which every jolt charset seam takes, so they compose
+  with `.getBytes`, `String` ctors and stream readers alike.
+
+- **`X/from` for the core `java.time` value types.** `LocalDate/from`,
+  `LocalTime/from` and `LocalDateTime/from` answer the JVM TemporalAccessor
+  query over the core value types, throwing `DateTimeException` when the
+  fields aren't there; the jolt-lang/time library re-registers them with the
+  zoned/offset types added.
+
+- **`#=` read-eval.** The clojure reader's EvalReader: `#=form` evaluates its
+  form at read time, refused under `(binding [*read-eval* false] …)` with the
+  JVM's message. EDN still has no `=` dispatch. clj-uuid computes its bit
+  masks with `#=` and now reads.
+
+- **`java.util.concurrent` construction.** `ArrayBlockingQueue` is a real
+  bounded blocking queue (offer/put/take/poll and the timed variants,
+  fiber-aware), `FutureTask` a run-once task with a blocking get, and the
+  `ThreadPoolExecutor` constructor builds on the existing executor machinery —
+  sized by maximumPoolSize, with `.getQueue` answering a live view of the
+  internal queue's depth. One documented divergence: the JVM rejects a submit
+  when its bounded queue fills; jolt's internal queue is unbounded and accepts
+  it.
+
+- **The `java.util.UUID` instance surface.** `.getMostSignificantBits` /
+  `.getLeastSignificantBits` (signed longs), `.version`, `.variant`,
+  `.timestamp` / `.clockSequence` / `.node` (v1-only, like the JVM),
+  `.compareTo` (signed msb-then-lsb — a high-bit uuid sorts first), and a
+  JVM-exact `.hashCode`. Uuids are Comparable, so `sort`, `compare` and sorted
+  collections accept them. `UUID/fromString` and the `(UUID. s)` ctor now
+  implement the JVM's lenient 5-component parse — short groups zero-pad,
+  `(UUID/fromString "1-1-1-1-1")` is legal — and throw
+  `IllegalArgumentException` on anything else instead of returning nil
+  (`parse-uuid` keeps its nil-returning Clojure contract).
+
 - **Lexically scoped `jolt.ffi` allocation helpers:** `with-alloc`, `with-out`,
   `with-layout`, `with-c-string`, and `with-c-string-array` release helper-owned
   native allocations exactly once on normal return or exception. Partially
@@ -22,6 +75,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keyword path. Layouts support fixed-size scalar fields and nested structs;
   arrays, unions, bitfields, packing, and recursive descriptors are not yet
   supported.
+
+- **Structs passed and returned by C value:** `foreign-fn` and `defcfn` accept
+  `[:by-value [:struct ...]]` signature types. Arguments are non-null pointers
+  to caller-owned struct storage. Aggregate-returning callables take a non-null
+  caller-owned destination pointer first, write the returned C value there, and
+  return that pointer. Nested structs, multiple aggregate arguments, fixed
+  aggregates before `:varargs`, and `:blocking` calls are supported; aggregate
+  callbacks, variadic aggregate arguments, and aggregate returns combined with
+  `:varargs` remain unsupported.
 
 ### Fixed
 
@@ -75,51 +137,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is shared by the loader, the build driver, and the compile-env alias
   pre-scan, in both the list and vector spellings.
 
-### Added
-
-- **`java.nio.charset.StandardCharsets` constants.** The constants are the
-  charset name strings, which every jolt charset seam takes, so they compose
-  with `.getBytes`, `String` ctors and stream readers alike.
-
-- **`X/from` for the core `java.time` value types.** `LocalDate/from`,
-  `LocalTime/from` and `LocalDateTime/from` answer the JVM TemporalAccessor
-  query over the core value types, throwing `DateTimeException` when the
-  fields aren't there; the jolt-lang/time library re-registers them with the
-  zoned/offset types added.
-
-- **`#=` read-eval.** The clojure reader's EvalReader: `#=form` evaluates its
-  form at read time, refused under `(binding [*read-eval* false] …)` with the
-  JVM's message. EDN still has no `=` dispatch. clj-uuid computes its bit
-  masks with `#=` and now reads.
-
-- **`java.util.concurrent` construction.** `ArrayBlockingQueue` is a real
-  bounded blocking queue (offer/put/take/poll and the timed variants,
-  fiber-aware), `FutureTask` a run-once task with a blocking get, and the
-  `ThreadPoolExecutor` constructor builds on the existing executor machinery —
-  sized by maximumPoolSize, with `.getQueue` answering a live view of the
-  internal queue's depth. One documented divergence: the JVM rejects a submit
-  when its bounded queue fills; jolt's internal queue is unbounded and accepts
-  it.
-
-- **The `java.util.UUID` instance surface.** `.getMostSignificantBits` /
-  `.getLeastSignificantBits` (signed longs), `.version`, `.variant`,
-  `.timestamp` / `.clockSequence` / `.node` (v1-only, like the JVM),
-  `.compareTo` (signed msb-then-lsb — a high-bit uuid sorts first), and a
-  JVM-exact `.hashCode`. Uuids are Comparable, so `sort`, `compare` and sorted
-  collections accept them. `UUID/fromString` and the `(UUID. s)` ctor now
-  implement the JVM's lenient 5-component parse — short groups zero-pad,
-  `(UUID/fromString "1-1-1-1-1")` is legal — and throw
-  `IllegalArgumentException` on anything else instead of returning nil
-  (`parse-uuid` keeps its nil-returning Clojure contract).
-
-- **Structs passed and returned by C value:** `foreign-fn` and `defcfn` accept
-  `[:by-value [:struct ...]]` signature types. Arguments are non-null pointers
-  to caller-owned struct storage. Aggregate-returning callables take a non-null
-  caller-owned destination pointer first, write the returned C value there, and
-  return that pointer. Nested structs, multiple aggregate arguments, fixed
-  aggregates before `:varargs`, and `:blocking` calls are supported; aggregate
-  callbacks, variadic aggregate arguments, and aggregate returns combined with
-  `:varargs` remain unsupported.
+- **The `java.util` map shims answer `count`, `seq` and `get` over one key
+  set.** The three spellings of "is this a hashmap-backed host object" had
+  drifted into separate predicates; they are one now, so a shim of that shape
+  cannot be countable through one and opaque through another.
 
 ## [0.7.22] - 2026-08-22
 

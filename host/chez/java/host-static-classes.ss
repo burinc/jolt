@@ -534,7 +534,15 @@
 (define (hm-drop-key! self k)
   (hm-ord! self (remove (lambda (e) (jolt=2 e k)) (hm-ord self))))
 (define (hm-keys-ordered self) (reverse (hm-ord self)))
-(define (hm-hashmap? x) (and (jhost? x) (string=? (jhost-tag x) "hashmap")))
+;; A hashmap-shaped jhost: the HashMap family and java.util.Properties, which is
+;; a Hashtable with two string-typed accessors on top and so carries the same
+;; #(table key-order) state. One predicate for every question about that shape —
+;; seq, count, contains?, get, copy-into — so a new member of the family cannot
+;; be map-like through one of them and opaque through another.
+(define (hm-hashmap? x)
+  (and (jhost? x)
+       (let ((t (jhost-tag x)))
+         (or (string=? t "hashmap") (string=? t "properties")))))
 (define (hm-copy-into-ordered! self src)  ; copy a jolt map or hashmap, keeping insertion order
   (if (hm-hashmap? src)
       (for-each (lambda (k)
@@ -557,7 +565,7 @@
     (for-each (lambda (k) (set! m (jolt-assoc m k (hashtable-ref (hm-tbl self) k jolt-nil))))
               (hm-keys-ordered self))
     m))
-(register-host-methods! "hashmap"
+(define hashmap-methods
   (list (cons "put" (lambda (self k v) (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
                                           (hm-note-key! self k)
                                           (hashtable-set! (hm-tbl self) k v) old)))
@@ -634,6 +642,114 @@
                                (hm-keys-ordered self)))))
         (cons "entrySet" (lambda (self) (jolt-seq (hm->pmap self))))
         (cons "toString" (lambda (self) (jolt-pr-str (hm->pmap self))))))
+(register-host-methods! "hashmap" hashmap-methods)
+
+;; java.util.Properties — a Hashtable of strings with getProperty/setProperty and
+;; a DEFAULTS chain. The JVM is precise about which operations see that chain:
+;; getProperty, propertyNames and stringPropertyNames do; the inherited Hashtable
+;; surface (get, containsKey, keySet, values, size) does NOT. Checked against the
+;; reference — a Properties holding only defaults answers isEmpty true and an
+;; empty keySet, while its propertyNames lists them.
+;;
+;; The WRITE-THROUGH target is jolt's own. System/getProperties hands back an
+;; object whose entries are a snapshot, because jolt computes most system
+;; properties on read (user.dir tracks the source roots, java.class.path the
+;; resolved paths) and they cannot be a live table; but a setProperty through it
+;; must still be what System/getProperty reports, so writes go to both.
+;;
+;; System/getProperties used to return a plain map, which answered .getProperty
+;; as a key lookup and so read nil for every system property — how a library that
+;; reads them through the Properties API saw nothing.
+(define (make-properties-jhost . defaults)
+  (make-jhost "properties"
+              (vector (make-hashtable hm-hash jolt=2) (quote ())
+                      (if (pair? defaults) (car defaults) #f)
+                      #f)))
+(define (props-slot self i)
+  (let ((st (jhost-state self)))
+    (and (fx>? (vector-length st) i) (vector-ref st i))))
+(define (props-defaults self) (props-slot self 2))
+(define (props-writethrough self) (props-slot self 3))
+;; getProperty answers only STRING values, as on the JVM: a non-string mapping is
+;; invisible to it (get still sees it) and the default is returned instead. The
+;; defaults are themselves searched by getProperty, so a Properties whose
+;; defaults is another Properties walks the WHOLE chain, as the JVM's recursive
+;; defaults.getProperty does.
+(define (props-string-ref self k dflt)
+  (let ((v (hashtable-ref (hm-tbl self) k jolt-nil)))
+    (cond ((string? v) v)
+          ((not (jolt-nil? v)) dflt)
+          (else (let ((d (props-defaults self)))
+                  (cond ((not d) dflt)
+                        ((and (jhost? d) (string=? (jhost-tag d) "properties"))
+                         (props-string-ref d k dflt))
+                        (else (let ((dv (jolt-get d k jolt-nil)))
+                                (if (string? dv) dv dflt)))))))))
+;; every name the object can answer for: its own keys plus its defaults' — down
+;; the whole chain, since propertyNames enumerates it all on the JVM too.
+(define (props-names self)
+  (let* ((own (hm-keys-ordered self))
+         (d (props-defaults self))
+         (inherited
+          (cond ((not d) (quote ()))
+                ((and (jhost? d) (string=? (jhost-tag d) "properties")) (props-names d))
+                (else (seq->list (jolt-keys d))))))
+    (append own
+            (filter (lambda (k) (not (hashtable-contains? (hm-tbl self) k))) inherited))))
+(define (props-put! self k v)
+  (hm-note-key! self k)
+  (hashtable-set! (hm-tbl self) k v)
+  (let ((wt (props-writethrough self)))
+    (when wt (hashtable-set! wt k (if (string? v) v (jolt-str-render-one v))))))
+(register-host-methods! "properties"
+  (append
+    hashmap-methods
+    (list
+      (cons "getProperty" (lambda (self k . dflt)
+                            (props-string-ref self k (if (pair? dflt) (car dflt) jolt-nil))))
+      ;; setProperty delegates to put on the JVM, so it returns THIS object's
+      ;; previous value and never the one it was shadowing in the defaults.
+      (cons "setProperty" (lambda (self k v)
+                            (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
+                              (props-put! self k (if (string? v) v (jolt-str-render-one v)))
+                              old)))
+      (cons "put" (lambda (self k v)
+                    (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
+                      (props-put! self k v) old)))
+      (cons "remove" (lambda (self k)
+                       (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
+                         (hashtable-delete! (hm-tbl self) k)
+                         (hm-drop-key! self k)
+                         (let ((wt (props-writethrough self)))
+                           (when wt (hashtable-delete! wt k)))
+                         old)))
+      (cons "clear" (lambda (self)
+                      (hashtable-clear! (hm-tbl self)) (hm-ord! self (quote ()))
+                      (let ((wt (props-writethrough self)))
+                        (when wt (hashtable-clear! wt)))
+                      jolt-nil))
+      ;; the two enumerations that DO span the defaults chain.
+      (cons "stringPropertyNames"
+            (lambda (self) (apply jolt-hash-set
+                             (filter (lambda (k) (string? (props-string-ref self k #f)))
+                                     (props-names self)))))
+      (cons "propertyNames" (lambda (self) (list->cseq (props-names self)))))))
+(register-class-ctor! "Properties"
+  (lambda args (apply make-properties-jhost args)))
+(register-class-ctor! "java.util.Properties"
+  (lambda args (apply make-properties-jhost args)))
+;; System/getProperties: real entries, so get/count/seq see them as on the JVM,
+;; recomputed per call so user.dir and java.class.path stay current, with writes
+;; going through to the override store.
+(define (make-system-properties m override-tbl)
+  (let ((self (make-jhost "properties"
+                          (vector (make-hashtable hm-hash jolt=2) (quote ()) #f override-tbl))))
+    (for-each (lambda (e)
+                (hm-note-key! self (jolt-nth e 0))
+                (hashtable-set! (hm-tbl self) (jolt-nth e 0) (jolt-nth e 1)))
+              (seq->list (jolt-seq m)))
+    self))
+
 ;; java.util.concurrent.ConcurrentHashMap — one shared heap, so the mutable
 ;; HashMap shim serves. (get a-hashmap k) reads the map (clojure.core/get).
 (define (make-hashmap-jhost . args)
@@ -747,11 +863,11 @@
         (cons "clear" (lambda (self) (hashtable-clear! (hm-tbl self)) (hm-ord! self '()) jolt-nil))
         (cons "toString" (lambda (self) (jolt-pr-str (apply jolt-hash-set (hs->list self)))))))
 (register-seq-arm! hs-hashset? (lambda (x) (list->cseq (hs->list x))))
-(register-get-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "hashmap")))
+(register-get-arm! hm-hashmap?
                    (lambda (coll k d) (hashtable-ref (hm-tbl coll) k d)))
 ;; count / contains? over the mutable map shim (clojure.core/count + contains?,
 ;; which core.cache's SoftCache uses on its backing ConcurrentHashMap).
-(define (jhost-hashmap? x) (and (jhost? x) (string=? (jhost-tag x) "hashmap")))
+(define jhost-hashmap? hm-hashmap?)
 (register-count-arm! jhost-hashmap? (lambda (c) (hashtable-size (hm-tbl c))))
 (register-contains-arm! jhost-hashmap?
   (lambda (c k) (if (hashtable-contains? (hm-tbl c) k) #t #f)))
