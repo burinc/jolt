@@ -19,6 +19,14 @@
   unsigned names at one width expose the same stored bits; wire byte order stays
   an explicit codec or htons/ntohs concern.
 
+  A struct passed or returned by value uses the same literal descriptor as
+  layout, wrapped in [:by-value descriptor]. An argument value is a non-null
+  caller-owned pointer to the struct bytes. An aggregate-returning callable takes
+  a non-null caller-owned destination pointer as its first Jolt argument, writes
+  the C return there, and returns that pointer. Aggregate callbacks and exports
+  are not supported. A fixed aggregate may precede :varargs, but aggregate
+  variadic arguments and aggregate-return-plus-varargs are rejected.
+
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
   ptr->string/string->ptr/null/null?) are provided by the host, as are the
   buffer moves: read-bytes/write-bytes decode and encode UTF-8, read-array/
