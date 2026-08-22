@@ -5,6 +5,61 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.21] - 2026-08-22
+
+A patch release that gives core vars their documentation: `(meta #'map)` used
+to come back `{:ns clojure.core, :name map}` — no arglists, no docstring — so
+editor hover and signature help on any core name had nothing to show, and
+`(doc ...)` did not exist. Now every var in the image-baked namespaces carries
+`:doc` and `:arglists`, clojure.repl grew the fns that read them, and jolt.ffi
+gained the exact-width scalar types (#692).
+
+### Added
+
+- **Exact-width `jolt.ffi` scalar types:** `:int8`/`:i8`,
+  `:int16`/`:short`, `:uint16`/`:ushort`, `:int32`, and `:uint32`. Each type
+  works in native-memory access (`sizeof`/`read`/`write`) and typed native
+  signatures (`foreign-fn`/`defcfn`/`foreign-callable`), with signed and
+  unsigned boundaries preserved. The existing `:uint8`/`:u8`/`:byte` aliases
+  remain unsigned C octets. Exact-width values use native byte order; wire byte
+  order remains explicit through a codec or conversions such as
+  `htons`/`ntohs`. C default argument promotions still apply after `:varargs`,
+  so narrow integers must be declared as `:int` there (and `float` as
+  `:double`). Contributed by @casselc in #692.
+
+- **Core vars carry `:doc` and `:arglists`.** The image-baked namespaces
+  (`clojure.core`, `clojure.string`, `clojure.walk`, `clojure.set`,
+  `clojure.edn`, `clojure.pprint`, `clojure.repl`, `clojure.template`) are
+  finished off by a generated shard that fills reference docstrings and
+  arglists from Clojure 1.12.5's own metadata (EPL-1.0, (c) Rich Hickey and
+  contributors) — 857 vars. Native primitives (`map`, `reduce`, `conj`, `+`,
+  ...) had no metadata at all and now report their full arglists; a `:doc` or
+  `:arglists` the jolt source itself declares always wins. Regenerate with
+  `tools/gen-core-docs.sh` after adding core vars.
+
+- **`clojure.repl/doc`, `find-doc`, `apropos`, and `dir`.** Ported from
+  Clojure 1.12 now that var metadata makes them meaningful: `(doc map)`
+  prints the arglists and docstring, `(doc when)` says Macro, `(doc if)`
+  documents the special form. `source` and `pst` remain unprovided —
+  image-baked vars carry no `:file` to point at.
+
+### Fixed
+
+- **Image-baked defmacros no longer lose their metadata.** A `defmacro`
+  compiled at runtime kept its derived `:arglists`/`:doc` on the var, but the
+  seed mint and `jolt build` lowered macros through a path that dropped the
+  metadata wholesale — which is why every core macro (`when`, `cond`, `defn`,
+  `->`) answered `(meta #'when)` with just `{:ns :name :macro true}`. The
+  image path now derives the same metadata the runtime path does and emits it
+  with the expander. App macros in built binaries keep theirs too.
+
+- **`make gambitseed` mints again.** The chez-only-emission safety check
+  refused any `(foreign-procedure` occurrence, including the ones inside the
+  compiler's OWN emitter strings (data, not code) that the scoped-FFI change
+  introduced — the gambit seed had been unmintable since then. The check now
+  classifies occurrences with a string-literal scanner and fails only on real
+  op uses.
+
 ## [0.7.20] - 2026-08-21
 
 A patch release about where jolt runs and what it links against: Nix flake
@@ -82,17 +137,6 @@ process-wide (~3300x faster stream drains for every app that requires it).
   replay from its buffer — the wrapper stays the wrapped stream and answers
   `false` honestly (documented in known-divergences.edn, with `System/in`
   called out: `true` on the JVM, `false` here).
-
-- **Exact-width `jolt.ffi` scalar types:** `:int8`/`:i8`,
-  `:int16`/`:short`, `:uint16`/`:ushort`, `:int32`, and `:uint32`. Each type
-  works in native-memory access (`sizeof`/`read`/`write`) and typed native
-  signatures (`foreign-fn`/`defcfn`/`foreign-callable`), with signed and
-  unsigned boundaries preserved. The existing `:uint8`/`:u8`/`:byte` aliases
-  remain unsigned C octets. Exact-width values use native byte order; wire byte
-  order remains explicit through a codec or conversions such as
-  `htons`/`ntohs`. C default argument promotions still apply after `:varargs`,
-  so narrow integers must be declared as `:int` there (and `float` as
-  `:double`).
 
 ### Fixed
 
