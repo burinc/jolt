@@ -406,6 +406,11 @@
    ;; themselves agree with 1.12.5 exactly on literal inputs, checked directly.
    ;; That is the same family as test.check's :tolerance, not a malli bug.
    ;;
+   ;; The four malli.experimental.time suites went green when jolt-lang/time
+   ;; grew the 3-arg DateTimeFormatter.parse with a strict pattern walk, the
+   ;; X/from statics and OffsetTime — 13 failures and 2 errors' worth. That is
+   ;; where the +14/-13/-1 against the previous recording came from.
+   ;;
    ;; Two things shape the tally below. The suite :bb-gates roughly half its
    ;; assertions (babashka runs the reduced set, and jolt reads :bb branches
    ;; now) — that is where the old 12059 passes went, with fail and error
@@ -413,7 +418,7 @@
    ;; cheshire, i.e. Jackson. The native-backed clojure.core.rrb-vector
    ;; replaced the jar here, which is what brought the fipp/virhe chain (ten
    ;; namespaces) back from the old mk-am load-fail wall.
-   :expect {:tests 219 :pass 6737 :fail 55 :error 35 :load-fail 1}}
+   :expect {:tests 219 :pass 6751 :fail 42 :error 34 :load-fail 1}}
 
   ;; ---------------------------------------------------------- web
   {:name "ring-codec"

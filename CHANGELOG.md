@@ -5,7 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.23] - 2026-08-22
+
+Interop reach. The FFI can describe C structs instead of counting byte offsets:
+`ffi/layout` derives size, alignment and field offsets from a literal
+descriptor, `[:by-value ...]` passes and returns structs by value, and the
+`with-alloc` family scopes foreign allocations so they are released on every
+path out. On the Java side, `java.net` answers host identity —
+`InetAddress/getLocalHost` and a real `NetworkInterface` — and loads on demand;
+`java.util.Properties` is modelled, so `System/getProperties` answers
+`.getProperty` rather than reading as a plain map.
+
+The rest is conformance: static fields resolve through every access path, the
+reducible family dispatches to `IReduce`/`IReduceInit`/`IKVReduce`, protocol
+dispatch reaches a deftype or reify through its declared interfaces, `#=`
+read-eval works, and the vector spelling of a require prefix list expands.
+Between them these let clj-uuid, mulog and the malli time suites run.
 
 ### Added
 
