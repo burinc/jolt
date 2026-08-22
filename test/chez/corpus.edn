@@ -195,6 +195,11 @@
   ;; was rejected outright. Four malli namespaces load-failed on LocalDate/-MIN.
   ;; The two call forms are here so the fix cannot regress them.
   {:suite "interop / static members" :label "(. Class FIELD), (. Class -FIELD) and the call forms" :expected "[2147483647 2147483647 2147483647 \"42\" 7]" :actual "[(. java.lang.Integer MAX_VALUE) (. java.lang.Integer -MAX_VALUE) java.lang.Integer/MAX_VALUE (. java.lang.Long toString 42) (. java.lang.Long parseLong \"7\")]" :portability :jvm}
+  ;; a static field can hold a FALSY value: the shared field/method registry
+  ;; detected a miss with (or v ...), so Boolean/FALSE — registered as #f — threw
+  ;; "No matching field or method" in every spelling. A sentinel default keeps a
+  ;; registered #f distinct from an absent member.
+  {:suite "interop / static members" :label "a false-valued static field resolves" :expected "[true false false false]" :actual "[Boolean/TRUE Boolean/FALSE (. Boolean -FALSE) (. java.lang.Boolean -FALSE)]" :portability :jvm}
   ;; System.arraycopy behaves as if the source range were copied through a
   ;; temporary, so an overlapping copy within one array still reads pre-copy
   ;; values — a naive forward loop gives [1 1 1 1 1] for the second case.
@@ -996,6 +1001,20 @@
   {:suite "host-interop / ring-codec surface" :label "extend-protocol nil" :expected ":nil" :actual "(do (defprotocol Pn (pn [x])) (extend-protocol Pn nil (pn [n] :nil) Object (pn [o] :obj)) (pn nil))" :portability :common}
   {:suite "host-interop / ring-codec surface" :label "extend-protocol Map covers sorted" :expected ":map" :actual "(do (defprotocol Ps (ps [x])) (extend-protocol Ps Map (ps [m] :map) Object (ps [o] :obj)) (ps (sorted-map 1 2)))" :portability :common}
   {:suite "host-interop / ring-codec surface" :label "reduce over reified IReduceInit" :expected "42" :actual "(reduce + 0 (reify clojure.lang.IReduceInit (reduce [_ f init] (f (f init 40) 2))))" :portability :jvm}
+  ;; the REST of the reducible family: the JVM routes 2-arity reduce, into (both
+  ;; arities), vec and set through IReduce/IReduceInit before seqing, and
+  ;; reduce-kv consults IKVReduce (method name kvreduce, lowercase). jolt's
+  ;; 3-arity reduce already dispatched (the row above); these pin the family.
+  ;; Expectations certified on OpenJDK 20 / Clojure 1.12.
+  {:suite "host-interop / reducible dispatch" :label "2-arity reduce drives a reify's IReduce" :expected "3" :actual "(reduce + (reify clojure.lang.IReduce (reduce [_ f] (f 1 2)) (reduce [_ f init] (f (f init 1) 2))))" :portability :jvm}
+  {:suite "host-interop / reducible dispatch" :label "into drives IReduceInit" :expected "[1 2]" :actual "(into [] (reify clojure.lang.IReduceInit (reduce [_ f init] (f (f init 1) 2))))" :portability :jvm}
+  {:suite "host-interop / reducible dispatch" :label "into with a transducer drives IReduceInit" :expected "[2 3]" :actual "(into [] (map inc) (reify clojure.lang.IReduceInit (reduce [_ f init] (f (f init 1) 2))))" :portability :jvm}
+  {:suite "host-interop / reducible dispatch" :label "vec drives IReduceInit" :expected "[1 2]" :actual "(vec (reify clojure.lang.IReduceInit (reduce [_ f init] (f (f init 1) 2))))" :portability :jvm}
+  {:suite "host-interop / reducible dispatch" :label "set drives IReduceInit" :expected "#{1 2}" :actual "(set (reify clojure.lang.IReduceInit (reduce [_ f init] (f (f init 1) 2))))" :portability :jvm}
+  {:suite "host-interop / reducible dispatch" :label "into drives a deftype's IReduceInit" :expected "[5 6]" :actual "(do (deftype Tirx [] clojure.lang.IReduceInit (reduce [_ f init] (f (f init 5) 6))) (into [] (->Tirx)))" :portability :jvm}
+  {:suite "host-interop / reducible dispatch" :label "reduce-kv drives a reify's IKVReduce" :expected "{:a 1 :b 2}" :actual "(reduce-kv (fn [m k v] (assoc m k v)) {} (reify clojure.lang.IKVReduce (kvreduce [_ f init] (f (f init :a 1) :b 2))))" :portability :jvm}
+  {:suite "host-interop / reducible dispatch" :label "reduced short-circuits a driven into" :expected "[99]" :actual "(into [] (reify clojure.lang.IReduceInit (reduce [_ f init] (let [r (f init 99)] (if (reduced? r) (deref r) r)))))" :portability :jvm}
+  {:suite "host-interop / reducible dispatch" :label "2-arity reduce over an eduction stays on the seq path" :expected "9" :actual "(reduce + (eduction (map inc) [1 2 3]))" :portability :jvm}
   {:suite "core / reify" :label "multi-arity method dispatches by arg count" :expected "[:z 9]" :actual "(do (defprotocol P (m [_] [_ a])) (let [r (reify P (m [_] :z) (m [_ x] x))] [(m r) (m r 9)]))" :portability :common}
   {:suite "core / reify" :label "reify implements IObj and carries metadata" :expected "[true 2]" :actual "(do (defprotocol Q (qq [_])) (let [r (reify Q (qq [_] 1))] [(instance? clojure.lang.IObj r) (:k (meta (with-meta r {:k 2})))]))" :portability :jvm}
   {:suite "core / reify" :label "with-meta leaves the original untouched and keeps dispatch" :expected "[nil {:k 2} 1]" :actual "(do (defprotocol Q (qq [_])) (let [r (reify Q (qq [_] 1)) r2 (with-meta r {:k 2})] [(meta r) (meta r2) (qq r2)]))" :portability :common}
@@ -3686,6 +3705,55 @@
   {:suite "uuid / random-uuid" :label "all hex digits" :expected "true" :actual "(every? (fn [c] (contains? (set (seq \"0123456789abcdef-\")) c)) (seq (str (random-uuid))))" :portability :common}
   {:suite "uuid / parse-uuid" :label "valid round-trips" :expected "\"b6883c0a-0342-4007-9966-bc2dfa6b109e\"" :actual "(str (parse-uuid \"b6883c0a-0342-4007-9966-bc2dfa6b109e\"))" :portability :common}
   {:suite "uuid / parse-uuid" :label "parses to uuid" :expected "true" :actual "(uuid? (parse-uuid \"b6883c0a-0342-4007-9966-bc2dfa6b109e\"))" :portability :common}
+  ;; java.util.UUID instance surface. The bit accessors answer SIGNED longs,
+  ;; compareTo is the JVM's signed msb-then-lsb comparison (NOT string order — a
+  ;; high-bit uuid sorts FIRST, before the nil uuid), and fromString is the
+  ;; JVM's lenient 5-component parse: short groups zero-pad, anything else
+  ;; throws IllegalArgumentException. Certified on OpenJDK 20.
+  {:suite "uuid / java.util.UUID surface" :label "getMost/LeastSignificantBits" :expected "[1229801703532086340 6148933456521300104]" :actual "(let [u (java.util.UUID/fromString \"11112222-3333-4444-5555-666677778888\")] [(.getMostSignificantBits u) (.getLeastSignificantBits u)])" :portability :jvm}
+  {:suite "uuid / java.util.UUID surface" :label "bit accessors are signed" :expected "[-45057 -4611686018427387905]" :actual "(let [u (java.util.UUID/fromString \"ffffffff-ffff-4fff-bfff-ffffffffffff\")] [(.getMostSignificantBits u) (.getLeastSignificantBits u)])" :portability :jvm}
+  {:suite "uuid / java.util.UUID surface" :label ".version reads the version nibble" :expected "[4 1 7 0]" :actual "(mapv (fn [s] (.version (java.util.UUID/fromString s))) [\"11112222-3333-4444-5555-666677778888\" \"c232ab00-9414-11ec-b3c8-9f68deced846\" \"017f22e2-79b0-7cc3-98c4-dc0c0c07398f\" \"00000000-0000-0000-0000-000000000000\"])" :portability :jvm}
+  {:suite "uuid / java.util.UUID surface" :label ".variant decodes the variant bits" :expected "[0 0 2]" :actual "(mapv (fn [s] (.variant (java.util.UUID/fromString s))) [\"11112222-3333-4444-5555-666677778888\" \"00000000-0000-0000-0000-000000000000\" \"ffffffff-ffff-4fff-bfff-ffffffffffff\"])" :portability :jvm}
+  {:suite "uuid / java.util.UUID surface" :label ".compareTo is signed msb-then-lsb" :expected "[1 -1 0 1]" :actual "(let [z (java.util.UUID/fromString \"00000000-0000-0000-0000-000000000000\") hi (java.util.UUID/fromString \"ffffffff-ffff-4fff-bfff-ffffffffffff\")] [(.compareTo z hi) (.compareTo hi z) (.compareTo z z) (compare z hi)])" :portability :jvm}
+  {:suite "uuid / java.util.UUID surface" :label "sort: a high-bit uuid comes first" :expected "[\"ffffffff-ffff-4fff-bfff-ffffffffffff\" \"00000000-0000-0000-0000-000000000000\" \"11112222-3333-4444-5555-666677778888\"]" :actual "(mapv str (sort (mapv (fn [s] (java.util.UUID/fromString s)) [\"11112222-3333-4444-5555-666677778888\" \"ffffffff-ffff-4fff-bfff-ffffffffffff\" \"00000000-0000-0000-0000-000000000000\"])))" :portability :jvm}
+  {:suite "uuid / java.util.UUID surface" :label "uuids as sorted-set members" :expected "[\"ffffffff-ffff-4fff-bfff-ffffffffffff\" \"00000000-0000-0000-0000-000000000000\" \"11112222-3333-4444-5555-666677778888\"]" :actual "(mapv str (into (sorted-set) (mapv (fn [s] (java.util.UUID/fromString s)) [\"11112222-3333-4444-5555-666677778888\" \"00000000-0000-0000-0000-000000000000\" \"ffffffff-ffff-4fff-bfff-ffffffffffff\"])))" :portability :jvm}
+  {:suite "uuid / java.util.UUID surface" :label "fromString zero-pads short groups" :expected "[\"00000001-0001-0001-0001-000000000001\" \"11112222-3333-4444-5555-066667777888\"]" :actual "[(str (java.util.UUID/fromString \"1-1-1-1-1\")) (str (java.util.UUID/fromString \"11112222-3333-4444-5555-66667777888\"))]" :portability :jvm}
+  {:suite "uuid / java.util.UUID surface" :label "fromString throws IllegalArgumentException on junk" :expected "[:iae :iae]" :actual "[(try (java.util.UUID/fromString \"not-a-uuid\") (catch IllegalArgumentException e :iae)) (try (java.util.UUID/fromString \"1-1-1-1-1-1\") (catch IllegalArgumentException e :iae))]" :portability :jvm}
+  {:suite "uuid / java.util.UUID surface" :label "v1 timestamp / clockSequence / node" :expected "[138648505420000000 13256 175272763512902]" :actual "(let [u (java.util.UUID/fromString \"c232ab00-9414-11ec-b3c8-9f68deced846\")] [(.timestamp u) (.clockSequence u) (.node u)])" :portability :jvm}
+  {:suite "uuid / java.util.UUID surface" :label ".timestamp on a non-time uuid throws" :expected ":unsupported" :actual "(try (.timestamp (java.util.UUID/fromString \"11112222-3333-4444-5555-666677778888\")) (catch UnsupportedOperationException e :unsupported))" :portability :jvm}
+  {:suite "uuid / java.util.UUID surface" :label ".hashCode matches the JVM fold" :expected "[34952 0 1073786880]" :actual "(mapv (fn [s] (.hashCode (java.util.UUID/fromString s))) [\"11112222-3333-4444-5555-666677778888\" \"00000000-0000-0000-0000-000000000000\" \"ffffffff-ffff-4fff-bfff-ffffffffffff\"])" :portability :jvm}
+  ;; java.util.concurrent construction the JVM way: ArrayBlockingQueue is a real
+  ;; bounded blocking queue, FutureTask a run-once future, and the
+  ;; ThreadPoolExecutor ctor builds on the existing executor machinery (its
+  ;; queue argument contributes capacity to .getQueue's view; tasks flow
+  ;; through the executor's own queue, which does not reject on overflow — the
+  ;; one divergence). Certified on OpenJDK 20.
+  {:suite "interop / juc ctors" :label "ArrayBlockingQueue offer/put/take/poll" :expected "[2 0 false 1 1 2 nil true]" :actual "(let [q (java.util.concurrent.ArrayBlockingQueue. 2)] (.offer q 1) (.put q 2) [(.size q) (.remainingCapacity q) (.offer q 3) (.peek q) (.take q) (.poll q) (.poll q) (.isEmpty q)])" :portability :jvm}
+  {:suite "interop / juc ctors" :label "take blocks until an element arrives" :expected "42" :actual "(let [q (java.util.concurrent.ArrayBlockingQueue. 1) f (future (.take q))] (Thread/sleep 50) (.put q 42) (deref f))" :portability :jvm}
+  {:suite "interop / juc ctors" :label "put blocks while full" :expected ":done" :actual "(let [q (java.util.concurrent.ArrayBlockingQueue. 1)] (.put q 1) (let [f (future (.put q 2) :done)] (Thread/sleep 50) (.take q) (deref f)))" :portability :jvm}
+  {:suite "interop / juc ctors" :label "timed poll and offer give up" :expected "[nil false]" :actual "(let [q (java.util.concurrent.ArrayBlockingQueue. 1)] [(.poll q 30 java.util.concurrent.TimeUnit/MILLISECONDS) (do (.put q 1) (.offer q 2 30 java.util.concurrent.TimeUnit/MILLISECONDS))])" :portability :jvm}
+  {:suite "interop / juc ctors" :label "FutureTask runs once and answers" :expected "[true 41 false]" :actual "(let [ft (java.util.concurrent.FutureTask. (fn [] 41))] (.run ft) [(.isDone ft) (.get ft) (.isCancelled ft)])" :portability :jvm}
+  {:suite "interop / juc ctors" :label "FutureTask runnable+result ctor" :expected ":res" :actual "(let [ft (java.util.concurrent.FutureTask. (fn [] nil) :res)] (.run ft) (.get ft))" :portability :jvm}
+  {:suite "interop / juc ctors" :label "cancel before run wins" :expected "[true true true :cancelled false]" :actual "(let [ft (java.util.concurrent.FutureTask. (fn [] 1))] [(.cancel ft false) (.isCancelled ft) (.isDone ft) (try (.get ft) (catch java.util.concurrent.CancellationException e :cancelled)) (.cancel ft false)])" :portability :jvm}
+  {:suite "interop / juc ctors" :label "run after cancel is a no-op" :expected "true" :actual "(let [ft (java.util.concurrent.FutureTask. (fn [] 1))] (.cancel ft false) (.run ft) (.isCancelled ft))" :portability :jvm}
+  {:suite "interop / juc ctors" :label "cancel after run loses" :expected "[false 1]" :actual "(let [ft (java.util.concurrent.FutureTask. (fn [] 1))] (.run ft) [(.cancel ft false) (.get ft)])" :portability :jvm}
+  {:suite "interop / juc ctors" :label "ThreadPoolExecutor submit/getQueue/shutdown" :expected "[7 0 true true]" :actual "(let [ex (java.util.concurrent.ThreadPoolExecutor. 1 1 0 java.util.concurrent.TimeUnit/MILLISECONDS (java.util.concurrent.ArrayBlockingQueue. 8))] (let [r (.get (.submit ex ^java.util.concurrent.Callable (fn [] 7))) qs (.size (.getQueue ex))] (.shutdown ex) [r qs (.awaitTermination ex 1 java.util.concurrent.TimeUnit/SECONDS) (.isShutdown ex)]))" :portability :jvm}
+  {:suite "interop / juc ctors" :label "a 1-thread pool preserves submission order" :expected "[0 1 2 3 4]" :actual "(let [ex (java.util.concurrent.ThreadPoolExecutor. 1 1 0 java.util.concurrent.TimeUnit/MILLISECONDS (java.util.concurrent.ArrayBlockingQueue. 16)) a (atom [])] (dotimes [i 5] (.execute ex (fn [] (swap! a conj i)))) (.shutdown ex) (.awaitTermination ex 1 java.util.concurrent.TimeUnit/SECONDS) (deref a))" :portability :jvm}
+  {:suite "interop / juc ctors" :label "execute runs a FutureTask" :expected "5" :actual "(let [ex (java.util.concurrent.ThreadPoolExecutor. 1 1 0 java.util.concurrent.TimeUnit/MILLISECONDS (java.util.concurrent.ArrayBlockingQueue. 4)) ft (java.util.concurrent.FutureTask. (fn [] 5))] (.execute ex ft) (let [r (.get ft)] (.shutdown ex) r))" :portability :jvm}
+  ;; #= read-eval: evaluate the next form at READ time, gated by *read-eval*
+  ;; (clj-uuid computes its bit masks with it). Certified on OpenJDK 20.
+  {:suite "reader / read-eval" :label "#= evaluates at read time" :expected "3" :actual "(read-string \"#=(+ 1 2)\")" :portability :jvm}
+  {:suite "reader / read-eval" :label "#= nests" :expected "[3 4]" :actual "(read-string \"[#=(+ 1 2) #=(* 2 #=(+ 1 1))]\")" :portability :jvm}
+  {:suite "reader / read-eval" :label "*read-eval* false refuses" :expected ":denied" :actual "(binding [*read-eval* false] (try (read-string \"#=(+ 1 2)\") (catch Exception e :denied)))" :portability :jvm}
+  {:suite "reader / read-eval" :label "#= of a symbol resolves it" :expected "\"class java.lang.String\"" :actual "(str (read-string \"#=java.lang.String\"))" :portability :jvm}
+  {:suite "reader / read-eval" :label "edn has no #= dispatch" :expected ":no-dispatch" :actual "(try (clojure.edn/read-string \"#=(+ 1 2)\") (catch Exception e :no-dispatch))" :portability :jvm}
+  ;; the vector spelling of a require prefix list — a vector is a single
+  ;; libspec only when its second element is a keyword or absent.
+  {:suite "interop / charsets" :label "StandardCharsets constants name their charsets" :expected "[104 105]" :actual "(vec (.getBytes \"hi\" java.nio.charset.StandardCharsets/UTF_8))" :portability :jvm}
+  ;; a deftype/reify may name a protocol by its dotted CLASS spelling (mulog's
+  ;; ConsolePublisher implements com.brunobonacci.mulog.publisher.PPublisher).
+  {:suite "protocols / dotted class spelling" :label "deftype implements a protocol named by its class" :expected "[42 15]" :actual "(do (ns dotspell.ns) (clojure.core/defprotocol PDs (pda [x]) (pdb [x])) (clojure.core/deftype TDs [v] dotspell.ns.PDs (pda [_] (clojure.core/* 3 v)) (pdb [_] (clojure.core/+ 1 v))) [(dotspell.ns/pda (dotspell.ns/->TDs 14)) (dotspell.ns/pdb (dotspell.ns/->TDs 14))])" :portability :jvm}
+  {:suite "loader / prefix lists" :label "vector prefix list registers every sub-spec" :expected "[\"A\" \"b\"]" :actual "(do (require (quote [clojure [string :as pfx-up] [string :as pfx-lo]])) [(pfx-up/upper-case \"a\") (pfx-lo/lower-case \"B\")])" :portability :jvm}
   {:suite "uuid / parse-uuid" :label "case-insensitive =" :expected "true" :actual "(= (parse-uuid \"b6883c0a-0342-4007-9966-bc2dfa6b109e\") (parse-uuid \"B6883C0A-0342-4007-9966-BC2DFA6B109E\"))" :portability :common}
   {:suite "uuid / parse-uuid" :label "empty -> nil" :expected "nil" :actual "(parse-uuid \"\")" :portability :common}
   {:suite "uuid / parse-uuid" :label "short -> nil" :expected "nil" :actual "(parse-uuid \"0\")" :portability :common}
@@ -4907,7 +4975,9 @@
   ;; round trip is pinned in unit.edn, not here, since the JVM throws.
   {:suite "string-model / codepoint strings" :label "charAt of an astral character is the codepoint" :expected "[128512 1]" :actual "[(int (.charAt \"😀\" 0)) (.length \"😀\")]" :portability :jvm}
   {:suite "concurrency-model / compare-and-set!" :label "value equality where JVM uses identity" :expected "true" :actual "(compare-and-set! (atom [1]) [1] [2])" :portability :common}
-  {:suite "reader-model / read-eval" :label "#= is inert data" :expected "false" :actual "(= 3 (read-string \"#=(+ 1 2)\"))" :portability :common}
+  ;; #= evaluates at read time now (the reader / read-eval suite above pins the
+  ;; full behavior); this row used to assert it read as inert data.
+  {:suite "reader-model / read-eval" :label "#= evaluates under read-string" :expected "true" :actual "(= 3 (read-string \"#=(+ 1 2)\"))" :portability :common}
   {:suite "reader-model / nested fn literals" :label "nested #() reads" :expected "true" :actual "(string? (str (read-string \"#(#(inc %))\")))" :portability :common}
   {:suite "permissive / ex-info nil map" :label "ex-info accepts nil data" :expected "\"m\"" :actual "(ex-message (ex-info \"m\" nil))" :portability :common}
   {:suite "transducers / into & eduction (overlay)" :label "count on an eduction throws (JVM parity)" :expected ":uoe" :actual "(try (count (eduction (map inc) [1 2 3])) :no-throw (catch UnsupportedOperationException _ :uoe))" :portability :common}
@@ -5169,4 +5239,12 @@
   {:suite "maps / array-map 1.13" :label "into {} of 9 keyword pairs is a PersistentHashMap" :expected "true" :actual "(instance? clojure.lang.PersistentHashMap (into {} (map (fn [i] [(keyword (str \"k\" i)) i]) (range 9))))" :portability :common}
   {:suite "maps / array-map 1.13" :label "transient assoc! promotes at capacity regardless of key type" :expected "[:k8 :k11 :k5 :k7 :k9 :k6 :k0 :k10 :k3 :k4 :k1 :k2]" :actual "(vec (keys (persistent! (reduce (fn [t i] (assoc! t (keyword (str \"k\" i)) i)) (transient {}) (range 12)))))" :portability :common}
   {:suite "maps / array-map 1.13" :label "transient dissoc! moves the last entry into the removed slot" :expected "[:a :d :c]" :actual "(vec (keys (persistent! (dissoc! (transient (array-map :a 1 :b 2 :c 3 :d 4)) :b))))" :portability :common}
+  {:suite "protocols / interface tags" :label "extend-protocol under an interface reaches a reify declaring it" :expected ":ireduce" :actual "(do (defprotocol IftP (iftp [x])) (extend-protocol IftP clojure.lang.IReduceInit (iftp [x] :ireduce)) (iftp (reify clojure.lang.IReduceInit (reduce [_ f init] init))))" :portability :common}
+  {:suite "protocols / interface tags" :label "extend-protocol under an interface reaches a deftype declaring it" :expected ":ireduce" :actual "(do (defprotocol IftQ (iftq [x])) (extend-protocol IftQ clojure.lang.IReduceInit (iftq [x] :ireduce)) (deftype IftT1 [] clojure.lang.IReduceInit (reduce [_ f init] init)) (iftq (->IftT1)))" :portability :common}
+  {:suite "protocols / interface tags" :label "a declared interface's ANCESTORS dispatch too (IPersistentVector is an Associative)" :expected ":assoc" :actual "(do (defprotocol IftR (iftr [x])) (extend-protocol IftR clojure.lang.Associative (iftr [x] :assoc)) (deftype IftT2 [] clojure.lang.IPersistentVector) (iftr (->IftT2)))" :portability :common}
+  {:suite "protocols / interface tags" :label "an extension on the type's own tag beats an interface extension" :expected ":own" :actual "(do (defprotocol IftS (ifts [x])) (extend-protocol IftS clojure.lang.IReduceInit (ifts [x] :iface)) (deftype IftT3 [] clojure.lang.IReduceInit (reduce [_ f init] init)) (extend-type IftT3 IftS (ifts [x] :own)) (ifts (->IftT3)))" :portability :common}
+  {:suite "protocols / interface tags" :label "satisfies? sees an interface extension for reify, deftype, and not others" :expected "[true true false]" :actual "(do (defprotocol IftU (iftu [x])) (extend-protocol IftU clojure.lang.IReduceInit (iftu [x] :i)) (deftype IftT4 [] clojure.lang.IReduceInit (reduce [_ f init] init)) [(satisfies? IftU (reify clojure.lang.IReduceInit (reduce [_ f init] init))) (satisfies? IftU (->IftT4)) (satisfies? IftU 42)])" :portability :common}
+  {:suite "protocols / interface tags" :label "an Object extension still catches a reify declaring interfaces" :expected ":obj" :actual "(do (defprotocol IftV (iftv [x])) (extend-protocol IftV Object (iftv [x] :obj)) (iftv (reify clojure.lang.IReduceInit (reduce [_ f init] init))))" :portability :common}
+  {:suite "protocols / interface tags" :label "a defrecord's EXTRA declared interface dispatches alongside the map set" :expected ":rec" :actual "(do (defprotocol IftW (iftw [x])) (extend-protocol IftW clojure.lang.IReduceInit (iftw [x] :rec)) (defrecord IftR1 [] clojure.lang.IReduceInit (reduce [_ f init] init)) (iftw (->IftR1)))" :portability :common}
+  {:suite "protocols / interface tags" :label "IRecord extension: dispatch and satisfies? agree on a record" :expected "[:irec true]" :actual "(do (defprotocol IftX (iftx [x])) (extend-protocol IftX clojure.lang.IRecord (iftx [x] :irec)) (defrecord IftR2 [a]) [(iftx (->IftR2 1)) (satisfies? IftX (->IftR2 1))])" :portability :common}
 ]

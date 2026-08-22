@@ -409,16 +409,23 @@
           (cond ((jclass? proto) (jclass-name proto))
                 ((jolt-nil? proto) "nil")
                 (else (jolt-final-str proto))))))
-    (cond
-      ((jrec? obj) (type-satisfies? (jrec-tag obj) pn-str))
-      ((jreify? obj)
-       (and (memp (lambda (p) (or (string=? p pn-str) (proto-class-match? p pn-str)))
-                  (jreify-protos obj))
-            #t))
-      (else (let loop ((tags (value-host-tags obj)))
-              (cond ((null? tags) #f)
-                    ((type-satisfies? (car tags) pn-str) #t)
-                    (else (loop (cdr tags)))))))))
+    (or
+      ;; direct: a record type's own registry, a reify's declared list.
+      (cond
+        ((jrec? obj) (and (type-satisfies? (jrec-tag obj) pn-str) #t))
+        ((jreify? obj)
+         (and (memp (lambda (p) (or (string=? p pn-str) (proto-class-match? p pn-str)))
+                    (jreify-protos obj))
+              #t))
+        (else #f))
+      ;; extended: the protocol may be extended to an interface or class the
+      ;; value reports — value-host-tags includes a deftype/reify's declared
+      ;; interfaces — the same walk dispatch takes. On the JVM one instanceof
+      ;; answers both the direct and the extended case.
+      (let loop ((tags (value-host-tags obj)))
+        (cond ((null? tags) #f)
+              ((type-satisfies? (car tags) pn-str) #t)
+              (else (loop (cdr tags))))))))
 (define (last-dot s)
   (let loop ((i (- (string-length s) 1)))
     (cond ((< i 0) s) ((char=? (string-ref s i) #\.) (substring s (+ i 1) (string-length s))) (else (loop (- i 1))))))
@@ -525,6 +532,26 @@
     (or (and (symbol-t? sym)
              (let ((v (jolt-resolve sym)))
                (and (var-cell? v) (protocol-value-key (var-cell-root v)))))
+        ;; the dotted CLASS spelling of a protocol: a deftype/reify may name it
+        ;; by its class — mulog's ConsolePublisher implements
+        ;; com.brunobonacci.mulog.publisher.PPublisher — where the last segment
+        ;; is the protocol name and the demunged prefix its namespace. Without
+        ;; this the methods filed as interface methods and protocol dispatch
+        ;; answered "No method ...".
+        (and (symbol-t? sym) (not (symbol-t-ns sym))
+             (let* ((nm (symbol-t-name sym))
+                    (n (string-length nm))
+                    (i (let loop ((k (- n 1)))
+                         (cond ((< k 1) #f)
+                               ((char=? (string-ref nm k) #\.) k)
+                               (else (loop (- k 1)))))))
+               (and i (< (+ i 1) n)
+                    (let* ((ns-part (list->string
+                                     (map (lambda (c) (if (char=? c #\_) #\- c))
+                                          (string->list (substring nm 0 i)))))
+                           (name-part (substring nm (+ i 1) n))
+                           (cell (var-cell-lookup ns-part name-part)))
+                      (and cell (protocol-value-key (var-cell-root cell)))))))
         jolt-nil)))
 (def-var! "clojure.core" "make-reified" (lambda (mm . rest) (apply make-reified mm rest)))
 (def-var! "clojure.core" "record-method-dispatch" (lambda (obj m rest) (record-method-dispatch obj m rest)))

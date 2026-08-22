@@ -110,6 +110,9 @@
     ((jolt-nil? coll) (jolt-vector))
     ((pvec? coll) coll)
     ((string? coll) (apply jolt-vector (string->list coll)))
+    ;; a source that drives its own reduce (IReduce/IReduceInit deftype or
+    ;; reify) builds the vector by reduction, like LazilyPersistentVector.
+    ((iface-method coll "reduce" 3) (jolt-into (jolt-vector) coll))
     (else (apply jolt-vector (seq->list coll)))))
 
 (define (jolt-keyword . args)

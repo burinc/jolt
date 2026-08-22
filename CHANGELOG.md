@@ -27,7 +27,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `System/getProperty` reads. It used to return a plain map, which answered
   `.getProperty` as a key lookup and so read `nil` for every system property.
 
+- **`java.nio.charset.StandardCharsets` constants.** The constants are the
+  charset name strings, which every jolt charset seam takes, so they compose
+  with `.getBytes`, `String` ctors and stream readers alike.
+
+- **`X/from` for the core `java.time` value types.** `LocalDate/from`,
+  `LocalTime/from` and `LocalDateTime/from` answer the JVM TemporalAccessor
+  query over the core value types, throwing `DateTimeException` when the
+  fields aren't there; the jolt-lang/time library re-registers them with the
+  zoned/offset types added.
+
+- **`#=` read-eval.** The clojure reader's EvalReader: `#=form` evaluates its
+  form at read time, refused under `(binding [*read-eval* false] …)` with the
+  JVM's message. EDN still has no `=` dispatch. clj-uuid computes its bit
+  masks with `#=` and now reads.
+
+- **`java.util.concurrent` construction.** `ArrayBlockingQueue` is a real
+  bounded blocking queue (offer/put/take/poll and the timed variants,
+  fiber-aware), `FutureTask` a run-once task with a blocking get, and the
+  `ThreadPoolExecutor` constructor builds on the existing executor machinery —
+  sized by maximumPoolSize, with `.getQueue` answering a live view of the
+  internal queue's depth. One documented divergence: the JVM rejects a submit
+  when its bounded queue fills; jolt's internal queue is unbounded and accepts
+  it.
+
+- **The `java.util.UUID` instance surface.** `.getMostSignificantBits` /
+  `.getLeastSignificantBits` (signed longs), `.version`, `.variant`,
+  `.timestamp` / `.clockSequence` / `.node` (v1-only, like the JVM),
+  `.compareTo` (signed msb-then-lsb — a high-bit uuid sorts first), and a
+  JVM-exact `.hashCode`. Uuids are Comparable, so `sort`, `compare` and sorted
+  collections accept them. `UUID/fromString` and the `(UUID. s)` ctor now
+  implement the JVM's lenient 5-component parse — short groups zero-pad,
+  `(UUID/fromString "1-1-1-1-1")` is legal — and throw
+  `IllegalArgumentException` on anything else instead of returning nil
+  (`parse-uuid` keeps its nil-returning Clojure contract).
+
 ### Fixed
+
+- **Static fields resolve through every access path.** Three related bugs in
+  the shared field/method registry. A field holding a falsy value —
+  `Boolean/FALSE` is registered as `#f` — read as absent, so every spelling of
+  it threw "No matching field or method"; the registry now detects a miss with
+  a sentinel instead of the value's own truthiness. `(. Token -FIELD)` reached
+  through a Class-valued local or a cold import looked up the literal `-FIELD`;
+  the class-token arm now strips the field spelling. And a field VALUE reached
+  through that arm or `host-static-call` was applied as a procedure, surfacing
+  Chez's bare "attempt to apply non-procedure" with no message; both now follow
+  `static-member`'s rule — a procedure is a method to call, anything else
+  answers a zero-argument access and reports itself if given arguments. The
+  visible consequence: `malli.experimental.time` loads cold with only the time
+  library on deps — its `(. LocalDate -MIN)` reads through the imported simple
+  name used to throw unless something had already touched `java.time` by the
+  slash spelling first.
+
+- **The reducible family dispatches to `IReduce`/`IReduceInit`/`IKVReduce`
+  like the JVM.** 3-arity `reduce` already drove a deftype/reify's own `reduce`
+  method; now the rest of the family does too: 2-arity `reduce` (scoped to
+  values that DECLARE `clojure.lang.IReduce`, mirroring `instanceof` — an
+  `IReduceInit`-only source such as an eduction still seqs), `into` in both
+  arities, and `vec`. `reduce-kv` consults a declared `clojure.lang.IKVReduce`
+  (`kvreduce`, lowercase) before throwing. `sequence` still requires a seqable
+  source, as on the JVM.
+
+- **Protocol dispatch reaches a deftype or reify through its declared
+  interfaces.** `value-host-tags` now reports a reify's declared interfaces
+  (with their modeled ancestry) and a bare deftype's declared interfaces from
+  the class graph, so an `extend-protocol` filed under an interface name —
+  `clojure.lang.IReduceInit`, `java.lang.Iterable`, an ancestor like
+  `Associative` for a type declaring `IPersistentVector` — dispatches on such
+  a value the way `instanceof` answers on the JVM. A defrecord's EXTRA declared
+  interfaces join its automatic map set the same way. `satisfies?` agrees: it
+  falls through to the same interface walk when the type's own registry has no
+  entry (it used to answer false while dispatch succeeded). An extension on
+  the type's own tag still wins, and `Object` extensions still catch types
+  declaring nothing.
+
+- **A deftype/reify can name a protocol by its dotted class spelling.**
+  `(deftype T [] my.ns.PThing (m [_] …))` resolves `my.ns.PThing` to the
+  protocol like the JVM does; the methods used to file as interface methods
+  and protocol dispatch answered "No method …" (found running mulog).
+
+- **The vector spelling of a require prefix list expands.**
+  `[clj-uuid [bitmop :as bitmop] [clock :as clock]]` is a prefix list on the
+  JVM; the old single-libspec read required the PREFIX itself — a silent
+  self-require mid-load with every sub-spec and alias dropped. The expansion
+  is shared by the loader, the build driver, and the compile-env alias
+  pre-scan, in both the list and vector spellings.
 
 - **The `java.util` map shims answer `count`, `seq` and `get` over one key
   set.** The three spellings of "is this a hashmap-backed host object" had

@@ -109,11 +109,23 @@
                         ([d h m s nano] (local-dt (ld-epoch-day d) (u/hmsn->nano (u/->long h) (u/->long m) (u/->long s) (u/->long nano)))))
    "toString"       (fn [d] (iso-date-str (ld-epoch-day d)))})
 
+;; X/from — the JVM TemporalAccessor query: answer from any temporal that
+;; carries the needed fields, DateTimeException otherwise. Core knows the core
+;; value types; the jolt-lang/time library re-registers these with the
+;; zoned/offset types added (same layering as the formatter-aware parse).
+(defn- from-dte! [what x]
+  (throw (jolt.host/throwable "java.time.DateTimeException"
+                              (str "Unable to obtain " what " from TemporalAccessor: " (pr-str x)))))
+(declare ldt? ldt-epoch-day ldt-nod)
+
 (statics! ["LocalDate" "java.time.LocalDate"]
   {"of"         (fn [y m d] (ld-of (u/->long y) (u/->long m) (u/->long d)))
    "ofEpochDay" (fn [n] (local-date (u/->long n)))
    "ofYearDay"  (fn [y doy] (local-date (+ (days-from-civil (u/->long y) 1 1) (dec (u/->long doy)))))
    "parse"      (fn [s & _] (local-date (parse-iso-date (str s))))
+   "from"       (fn [x] (cond (ld? x) x
+                              (ldt? x) (local-date (ldt-epoch-day x))
+                              :else (from-dte! "LocalDate" x)))
    "now"        (fn [& args] (ld-from-ms (impl/clock-millis (first args))))
    "MIN"        (ld-of -999999999 1 1)
    "MAX"        (ld-of 999999999 12 31)})
@@ -189,6 +201,9 @@
    "ofNanoOfDay"  (fn [n] (local-time (u/->long n)))
    "ofSecondOfDay" (fn [n] (local-time (* (u/->long n) nps)))
    "parse"        (fn [s & _] (local-time (u/parse-hms->nano (str s))))
+   "from"         (fn [x] (cond (lt? x) x
+                                (ldt? x) (local-time (ldt-nod x))
+                                :else (from-dte! "LocalTime" x)))
    "now"          (fn [& args] (local-time (* (u/floor-mod (impl/clock-millis (first args)) 86400000) 1000000)))
    "MIN"          (local-time 0)
    "MAX"          (local-time (dec npd))
@@ -280,6 +295,7 @@
    "ofEpochSecond" (fn [secs nano _off]
                      (let [es (u/->long secs)]
                        (local-dt (u/floor-div es 86400) (+ (* (u/floor-mod es 86400) nps) (u/->long nano)))))
+   "from"    (fn [x] (if (ldt? x) x (from-dte! "LocalDateTime" x)))
    "parse"   (fn [s & _] (let [d (str s) t (.indexOf d "T")]
                            (local-dt (parse-iso-date (subs d 0 t)) (u/parse-hms->nano (subs d (inc t))))))
    "now"     (fn [& args] (let [ms (impl/clock-millis (first args))] (local-dt (u/floor-div ms 86400000) (* (u/floor-mod ms 86400000) 1000000))))

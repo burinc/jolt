@@ -1431,6 +1431,33 @@
          (find-method-any-protocol (jrec-tag v) "toString")
          (record-method-dispatch v "toString" jolt-nil))))
 
+(define jrec-record-iface-tags
+  '("IRecord" "clojure.lang.IRecord" "IPersistentMap"
+     "clojure.lang.IPersistentMap" "APersistentMap" "Associative"
+     "ILookup" "Seqable" "Counted" "IPersistentCollection" "IObj"
+     "IMeta" "Map" "java.util.Map" "Iterable"
+     "java.lang.Iterable" "Object"))
+
+(define (jch-tags-sans-object ts)
+  (if (null? (cdr ts))
+      '()
+      (cons (car ts) (jch-tags-sans-object (cdr ts)))))
+
+(define (jreify-host-tags obj)
+  (let loop ((ps (jreify-protos obj)) (acc '()))
+    (if (null? ps)
+        (reverse (cons "Object" acc))
+        (let inner ((ts (jch-tags (proto-iface-name (car ps))))
+                    (acc acc))
+          (if (null? ts)
+              (loop (cdr ps) acc)
+              (inner
+                (cdr ts)
+                (let ((t (car ts)))
+                  (if (or (string=? t "Object") (member t acc))
+                      acc
+                      (cons t acc)))))))))
+
 (define (value-host-tags obj)
   (cond
     ((flonum? obj) '("Double" "Float" "Number" "Object"))
@@ -1492,15 +1519,19 @@
     ((jbigdec? obj) (jch-tags "java.math.BigDecimal"))
     ((procedure? obj) (jch-tags "clojure.lang.AFunction"))
     ((jolt-nil? obj) '("nil"))
+    ((jreify? obj) (jreify-host-tags obj))
     ((jrec-record? obj)
-     (cons
-       (jrec-tag obj)
-       '("IRecord" "clojure.lang.IRecord" "IPersistentMap"
-          "clojure.lang.IPersistentMap" "APersistentMap" "Associative"
-          "ILookup" "Seqable" "Counted" "IPersistentCollection" "IObj"
-          "IMeta" "Map" "java.util.Map" "Iterable"
-          "java.lang.Iterable" "Object")))
-    ((jrec? obj) (list (jrec-tag obj) "Object"))
+     (let* ((tag (jrec-tag obj)) (extra (cddr (jch-tags tag))))
+       (cons
+         tag
+         (if (null? (cdr extra))
+             jrec-record-iface-tags
+             (append
+               (jch-tags-sans-object extra)
+               jrec-record-iface-tags)))))
+    ((jrec? obj)
+     (let ((tag (jrec-tag obj)))
+       (cons tag (cddr (jch-tags tag)))))
     ((jolt-ex-info-record? obj)
      (jch-tags (jolt-ex-info-record-class-name obj)))
     ((jolt-atom? obj) (jch-tags "clojure.lang.Atom"))
@@ -2332,20 +2363,21 @@
             ((jclass? proto) (jclass-name proto))
             ((jolt-nil? proto) "nil")
             (else (jolt-final-str proto))))))
-    (cond
-      ((jrec? obj) (type-satisfies? (jrec-tag obj) pn-str))
-      ((jreify? obj)
-       (and (memp
-              (lambda (p)
-                (or (string=? p pn-str) (proto-class-match? p pn-str)))
-              (jreify-protos obj))
-            #t))
-      (else
-       (let loop ((tags (value-host-tags obj)))
-         (cond
-           ((null? tags) #f)
-           ((type-satisfies? (car tags) pn-str) #t)
-           (else (loop (cdr tags)))))))))
+    (or (cond
+          ((jrec? obj)
+           (and (type-satisfies? (jrec-tag obj) pn-str) #t))
+          ((jreify? obj)
+           (and (memp
+                  (lambda (p)
+                    (or (string=? p pn-str) (proto-class-match? p pn-str)))
+                  (jreify-protos obj))
+                #t))
+          (else #f))
+        (let loop ((tags (value-host-tags obj)))
+          (cond
+            ((null? tags) #f)
+            ((type-satisfies? (car tags) pn-str) #t)
+            (else (loop (cdr tags))))))))
 
 (define (last-dot s)
   (let loop ((i (- (string-length s) 1)))
@@ -2513,6 +2545,26 @@
     (or (and (symbol-t? sym)
              (let ((v (jolt-resolve sym)))
                (and (var-cell? v) (protocol-value-key (var-cell-root v)))))
+        (and (symbol-t? sym)
+             (not (symbol-t-ns sym))
+             (let* ((nm (symbol-t-name sym))
+                    (n (string-length nm))
+                    (i (let loop ((k (- n 1)))
+                         (cond
+                           ((< k 1) #f)
+                           ((char=? (string-ref nm k) #\.) k)
+                           (else (loop (- k 1)))))))
+               (and i
+                    (< (+ i 1) n)
+                    (let* ((ns-part (list->string
+                                      (map (lambda (c)
+                                             (if (char=? c #\_) #\- c))
+                                           (string->list
+                                             (substring nm 0 i)))))
+                           (name-part (substring nm (+ i 1) n))
+                           (cell (var-cell-lookup ns-part name-part)))
+                      (and cell
+                           (protocol-value-key (var-cell-root cell)))))))
         jolt-nil)))
 
 (def-var!

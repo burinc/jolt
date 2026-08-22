@@ -778,6 +778,16 @@
              (values (rdr-make-map (rdr-nsmap-kvs mapns es)) k))))
         (else (loop (+ j 1)))))))
 
+;; *read-eval* gate for #= — the cell is captured lazily (the var is def'd
+;; after this file loads) and the value read per use, so a
+;; (binding [*read-eval* false] (read-string ...)) holds.
+(define rdr-read-eval-cell #f)
+(define (rdr-read-eval?)
+  (unless rdr-read-eval-cell
+    (set! rdr-read-eval-cell (jolt-var "clojure.core" "*read-eval*")))
+  (let ((v (jolt-var-get rdr-read-eval-cell)))
+    (and v (not (jolt-nil? v)))))
+
 (define (rdr-read-dispatch s i end)      ; i points just past the '#'
   (when (>= i end) (rdr-error s i "EOF after #"))
   (let ((c (string-ref s i)))
@@ -826,6 +836,17 @@
                        (else (rdr-error s j (string-append "unknown ## literal: " tok)
 )))
                  j)))
+      ((char=? c #\=)                    ; #=form read-eval: evaluate at READ time
+       ;; The clojure reader's EvalReader, gated by *read-eval* (clj-uuid
+       ;; computes its bit masks with #=). EDN has no = dispatch. The var cell
+       ;; and the eval entry point live in later-loaded files; both resolve at
+       ;; call time, and by the time user source is read the runtime is up.
+       (when (rdr-edn-mode) (rdr-error s i "No dispatch macro for: ="))
+       (let-values (((form j) (rdr-read-form s (+ i 1) end)))
+         (when (rdr-eof? form) (rdr-error s i "EOF after #="))
+         (unless (rdr-read-eval?)
+           (rdr-error s i "EvalReader not allowed when *read-eval* is false."))
+         (values (jolt-compile-eval-form form (chez-current-ns)) j)))
       ((char=? c #\?)                    ; #?(...) / #?@(...) reader conditional
        (rdr-read-reader-cond s (+ i 1) end))
       ((char=? c #\:)                    ; #:ns{...} namespaced map literal

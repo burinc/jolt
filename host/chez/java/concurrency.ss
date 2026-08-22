@@ -1395,12 +1395,16 @@
         (cons "isDone" (lambda (self) (vector-ref (jhost-state self) 0)))
         (cons "isCancelled" (lambda (self) #f))
         (cons "cancel" (lambda (self . _) #f))))
-;; executor-service state: #(shutdown? queue-box queue-mutex queue-cond worker-count)
+;; executor-service state: #(shutdown? queue-box queue-mutex queue-cond
+;; worker-count advisory-queue-capacity)  — the capacity is #f except for a
+;; ThreadPoolExecutor built with an ArrayBlockingQueue; .getQueue's view
+;; subtracts the live depth from it.
 ;; queue-box holds a pair (out . in) — out is the dequeue head-list, in is the
 ;; enqueue tail-list (reversed). Enqueue conses onto in (O(1)); dequeue pops from
 ;; out, reversing in into out when out is empty (amortized O(1)).
-(define (make-executor n-workers)
-  (let ((self (make-jhost "executor-service" (vector #f (box (cons '() '())) (make-mutex) (make-condition) n-workers))))
+(define (make-executor n-workers . cap)
+  (let ((self (make-jhost "executor-service" (vector #f (box (cons '() '())) (make-mutex) (make-condition) n-workers
+                                                     (if (null? cap) #f (car cap))))))
     (let ((st (jhost-state self)))
       (let spawn ((k n-workers))
         (when (> k 0)
@@ -1449,17 +1453,18 @@
             '("Executors" "java.util.concurrent.Executors")))
 (register-host-methods! "executor-service"
   (list (cons "submit" (lambda (self thunk)
-          (let ((fut (make-j-future)) (snap (dyn-binding-stack)))
+          (let ((fut (make-j-future)) (snap (dyn-binding-stack)) (thunk (runnable->thunk thunk)))
             (executor-enqueue! self (lambda () (dyn-binding-stack snap) (j-future-complete! fut thunk)))
             fut)))
-        (cons "execute" (lambda (self thunk)
+        (cons "execute" (lambda (self thunk*)
+          (let ((thunk (runnable->thunk thunk*)))
           (let ((snap (dyn-binding-stack)))
             (executor-enqueue! self (lambda () (dyn-binding-stack snap)
               (guard (e (#t (guard (_ (#t #f))
                               (display "Exception in executor task:\n" (current-error-port))
                               (jolt-report-throwable e (current-error-port)))))
                 (jolt-invoke thunk)))))
-          jolt-nil))
+          jolt-nil)))
         (cons "shutdown" (lambda (self) (let ((st (jhost-state self)))
           (vector-set! st 0 #t) (jolt-with-mutex (vector-ref st 2) (jolt-cv-wake! (vector-ref st 3)))) jolt-nil))
         (cons "shutdownNow" (lambda (self) (let ((st (jhost-state self)))
@@ -1487,6 +1492,188 @@
                 (cond ((and (vector-ref st 0) (fx=? 0 (vector-ref st 4))) #t)
                       (timed-out? #f)
                       (else jolt-cv-again)))))))))
+
+;; --- ArrayBlockingQueue / FutureTask / ThreadPoolExecutor --------------------
+;; The construction Grain's SQLite write coordinator does directly:
+;; (ThreadPoolExecutor. 1 1 keepAlive unit (ArrayBlockingQueue. n)) plus
+;; FutureTask. ArrayBlockingQueue is a real bounded blocking queue (fiber-aware
+;; through jolt-cv-wait); FutureTask a run-once future; the ThreadPoolExecutor
+;; ctor builds on make-executor above, sized by maximumPoolSize, its queue
+;; argument contributing capacity to .getQueue's view. Tasks flow through the
+;; executor's own unbounded queue — the JVM REJECTS a submit when the bounded
+;; queue is full, jolt queues it; that is the deliberate divergence here.
+;;
+;; abq state: #(capacity mutex cond queue-pair count); queue-pair is (out . in)
+;; like the executor's. One condition serves takers and putters (broadcast).
+(define (make-abq cap)
+  (make-jhost "abq" (vector cap (make-mutex) (make-condition) (cons '() '()) 0)))
+(define (abq? x) (and (jhost? x) (string=? (jhost-tag x) "abq")))
+;; the mutators run under the mutex (jolt-cv-wait's decide, or jolt-with-mutex)
+(define (abq-enq! st v)
+  (let ((q (vector-ref st 3)))
+    (set-cdr! q (cons v (cdr q)))
+    (vector-set! st 4 (fx+ (vector-ref st 4) 1))
+    (jolt-cv-wake! (vector-ref st 2))))
+(define (abq-norm! st)
+  (let ((q (vector-ref st 3)))
+    (when (and (null? (car q)) (pair? (cdr q)))
+      (set-car! q (reverse (cdr q)))
+      (set-cdr! q '()))))
+(define (abq-deq! st)
+  (abq-norm! st)
+  (let* ((q (vector-ref st 3)) (out (car q)) (v (car out)))
+    (set-car! q (cdr out))
+    (vector-set! st 4 (fx- (vector-ref st 4) 1))
+    (jolt-cv-wake! (vector-ref st 2))
+    v))
+;; blocking take/put; deadline #f waits forever. take answers (v . #t) so a #f
+;; ELEMENT stays distinct from a timeout's #f.
+(define (abq-take-wait self deadline)
+  (let ((st (jhost-state self)))
+    (jolt-cv-wait (vector-ref st 1) (vector-ref st 2) deadline
+      (lambda (timed-out?)
+        (cond ((fx>? (vector-ref st 4) 0) (cons (abq-deq! st) #t))
+              (timed-out? #f)
+              (else jolt-cv-again))))))
+(define (abq-put-wait self v deadline)
+  (let ((st (jhost-state self)))
+    (jolt-cv-wait (vector-ref st 1) (vector-ref st 2) deadline
+      (lambda (timed-out?)
+        (cond ((fx<? (vector-ref st 4) (vector-ref st 0)) (abq-enq! st v) #t)
+              (timed-out? #f)
+              (else jolt-cv-again))))))
+(for-each (lambda (nm) (register-class-ctor! nm
+            ;; (cap) / (cap fair) — fairness is accepted and ignored
+            (lambda (cap . _) (make-abq (jnum->exact cap)))))
+          '("ArrayBlockingQueue" "java.util.concurrent.ArrayBlockingQueue"))
+(register-host-methods! "abq"
+  (list (cons "offer" (lambda (self v . args)
+          (if (null? args)
+              (let ((st (jhost-state self)))
+                (jolt-with-mutex (vector-ref st 1)
+                  (if (fx<? (vector-ref st 4) (vector-ref st 0))
+                      (begin (abq-enq! st v) #t)
+                      #f)))
+              (abq-put-wait self v (ms->deadline-millis (tu-args->ms args))))))
+        (cons "put" (lambda (self v) (abq-put-wait self v #f) jolt-nil))
+        (cons "take" (lambda (self) (car (abq-take-wait self #f))))
+        (cons "poll" (lambda (self . args)
+          (if (null? args)
+              (let ((st (jhost-state self)))
+                (jolt-with-mutex (vector-ref st 1)
+                  (if (fx>? (vector-ref st 4) 0) (abq-deq! st) jolt-nil)))
+              (let ((r (abq-take-wait self (ms->deadline-millis (tu-args->ms args)))))
+                (if r (car r) jolt-nil)))))
+        (cons "peek" (lambda (self)
+          (let ((st (jhost-state self)))
+            (jolt-with-mutex (vector-ref st 1)
+              (if (fx>? (vector-ref st 4) 0)
+                  (begin (abq-norm! st) (car (car (vector-ref st 3))))
+                  jolt-nil)))))
+        (cons "size" (lambda (self) (vector-ref (jhost-state self) 4)))
+        (cons "remainingCapacity" (lambda (self)
+          (let ((st (jhost-state self))) (fx- (vector-ref st 0) (vector-ref st 4)))))
+        (cons "isEmpty" (lambda (self) (fx=? 0 (vector-ref (jhost-state self) 4))))
+        (cons "clear" (lambda (self)
+          (let ((st (jhost-state self)))
+            (jolt-with-mutex (vector-ref st 1)
+              (let ((q (vector-ref st 3)))
+                (set-car! q '()) (set-cdr! q '())
+                (vector-set! st 4 0)
+                (jolt-cv-wake! (vector-ref st 2)))))
+          jolt-nil))
+        (cons "toString" (lambda (self)
+          (string-append "ArrayBlockingQueue(" (number->string (vector-ref (jhost-state self) 4)) ")")))))
+
+;; FutureTask — a run-once task with a blocking get. State:
+;; #(status override-flag override value error mutex cond thunk); status is one
+;; of new/running/done/cancelled. cancel wins only before run starts (the JVM
+;; can interrupt a RUNNING task; jolt cannot, so cancel answers #f there).
+(define (make-future-task thunk override-flag override)
+  (make-jhost "future-task"
+              (vector 'new override-flag override jolt-nil #f (make-mutex) (make-condition) thunk)))
+(define (future-task? x) (and (jhost? x) (string=? (jhost-tag x) "future-task")))
+(define (future-task-run! self)
+  (let ((st (jhost-state self)))
+    (when (jolt-with-mutex (vector-ref st 5)
+            (and (eq? (vector-ref st 0) 'new)
+                 (begin (vector-set! st 0 'running) #t)))
+      (let ((r (guard (e (#t (vector-set! st 4 e) jolt-nil)) (jolt-invoke (vector-ref st 7)))))
+        (jolt-with-mutex (vector-ref st 5)
+          (vector-set! st 3 (if (vector-ref st 1) (vector-ref st 2) r))
+          (vector-set! st 0 'done)
+          (jolt-cv-wake! (vector-ref st 6)))))
+    jolt-nil))
+(for-each (lambda (nm) (register-class-ctor! nm
+            (lambda (thunk . rest)
+              (make-future-task thunk (pair? rest) (if (pair? rest) (car rest) jolt-nil)))))
+          '("FutureTask" "java.util.concurrent.FutureTask"))
+(register-host-methods! "future-task"
+  (list (cons "run" (lambda (self) (future-task-run! self)))
+        (cons "get" (lambda (self . args)
+          (let* ((st (jhost-state self))
+                 (ms (tu-args->ms args))
+                 (r (jolt-cv-wait (vector-ref st 5) (vector-ref st 6)
+                                  (and ms (ms->deadline-millis ms))
+                      (lambda (timed-out?)
+                        (cond ((memq (vector-ref st 0) '(done cancelled)) (vector-ref st 0))
+                              (timed-out? #f)
+                              (else jolt-cv-again))))))
+            (cond ((not r) (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException"
+                                                            "timed out waiting for the task")))
+                  ((eq? r 'cancelled)
+                   (jolt-throw (jolt-host-throwable "java.util.concurrent.CancellationException"
+                                                    "task was cancelled")))
+                  ((vector-ref st 4) (jolt-throw (vector-ref st 4)))
+                  (else (vector-ref st 3))))))
+        (cons "isDone" (lambda (self) (and (memq (vector-ref (jhost-state self) 0) '(done cancelled)) #t)))
+        (cons "isCancelled" (lambda (self) (eq? (vector-ref (jhost-state self) 0) 'cancelled)))
+        (cons "cancel" (lambda (self . _)
+          (let ((st (jhost-state self)))
+            (jolt-with-mutex (vector-ref st 5)
+              (if (eq? (vector-ref st 0) 'new)
+                  (begin (vector-set! st 0 'cancelled)
+                         (jolt-cv-wake! (vector-ref st 6))
+                         #t)
+                  #f)))))
+        (cons "toString" (lambda (self)
+          (string-append "FutureTask[" (symbol->string (vector-ref (jhost-state self) 0)) "]")))))
+;; submit/execute above route a FutureTask through its own run (a Runnable on
+;; the JVM); anything else is an invokable thunk.
+(define (runnable->thunk x)
+  (if (future-task? x)
+      (lambda () (future-task-run! x) jolt-nil)
+      x))
+
+;; ThreadPoolExecutor ctor: (core max keepAlive unit [queue] [factory]
+;; [handler]) — workers sized by maximumPoolSize (with an unbounded internal
+;; queue, threads past core would never spawn; max preserves the concurrency
+;; the caller asked for). keepAlive/factory/handler are accepted and ignored.
+(for-each (lambda (nm) (register-class-ctor! nm
+            (lambda (core-n max-n . rest)
+              (let ((q (and (>= (length rest) 3) (abq? (list-ref rest 2)) (list-ref rest 2))))
+                (make-executor (max 1 (jnum->exact max-n))
+                               (and q (vector-ref (jhost-state q) 0)))))))
+          '("ThreadPoolExecutor" "java.util.concurrent.ThreadPoolExecutor"))
+;; .getQueue answers a live VIEW of the executor's internal queue — size reads
+;; the real depth, remainingCapacity subtracts it from the advisory capacity
+;; (Integer/MAX_VALUE without one). Honest for monitoring; not the caller's
+;; ArrayBlockingQueue instance, which the executor does not use.
+(define (executor-queue-depth ex)
+  (let ((st (jhost-state ex)))
+    (jolt-with-mutex (vector-ref st 2)
+      (let ((q (unbox (vector-ref st 1))))
+        (fx+ (length (car q)) (length (cdr q)))))))
+(register-host-methods! "executor-queue-view"
+  (list (cons "size" (lambda (self) (executor-queue-depth (vector-ref (jhost-state self) 0))))
+        (cons "isEmpty" (lambda (self) (fx=? 0 (executor-queue-depth (vector-ref (jhost-state self) 0)))))
+        (cons "remainingCapacity" (lambda (self)
+          (let* ((ex (vector-ref (jhost-state self) 0))
+                 (cap (vector-ref (jhost-state ex) 5)))
+            (if cap (max 0 (- cap (executor-queue-depth ex))) 2147483647))))
+        (cons "toString" (lambda (self) "ExecutorQueueView"))))
+(register-host-methods! "executor-service"
+  (list (cons "getQueue" (lambda (self) (make-jhost "executor-queue-view" (vector self))))))
 
 ;; java.util.concurrent.locks.ReentrantLock — a reentrant mutual-exclusion lock.
 ;; State: #(monitor), one MONITOR record of its own (make-monitor above), not the
