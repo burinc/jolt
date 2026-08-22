@@ -263,6 +263,36 @@
          (find-method-any-protocol (jrec-tag v) "toString")
          (record-method-dispatch v "toString" jolt-nil))))
 
+;; the interfaces every defrecord carries, spelled both ways (the record arm of
+;; value-host-tags below).
+(define jrec-record-iface-tags
+  '("IRecord" "clojure.lang.IRecord" "IPersistentMap" "clojure.lang.IPersistentMap"
+    "APersistentMap" "Associative" "ILookup" "Seqable" "Counted"
+    "IPersistentCollection" "IObj" "IMeta" "Map" "java.util.Map"
+    "Iterable" "java.lang.Iterable" "Object"))
+
+;; a jch-tags list always ends with "Object"; the tail without it, for splicing
+;; ahead of another tag list.
+(define (jch-tags-sans-object ts)
+  (if (null? (cdr ts)) '() (cons (car ts) (jch-tags-sans-object (cdr ts)))))
+
+;; A reify's dispatch tags: each declared protocol/interface as its JVM interface
+;; name plus that interface's modeled ancestry, deduped, Object last — so an
+;; extend-protocol filed under an interface name (clojure.lang.IReduceInit,
+;; java.lang.Iterable, …) reaches a reify declaring it, exactly as instanceof
+;; answers on the JVM. The reify's own method table is consulted before these
+;; (protocol-resolve), so an inline impl still wins.
+(define (jreify-host-tags obj)
+  (let loop ((ps (jreify-protos obj)) (acc '()))
+    (if (null? ps)
+        (reverse (cons "Object" acc))
+        (let inner ((ts (jch-tags (proto-iface-name (car ps)))) (acc acc))
+          (if (null? ts)
+              (loop (cdr ps) acc)
+              (inner (cdr ts)
+                     (let ((t (car ts)))
+                       (if (or (string=? t "Object") (member t acc)) acc (cons t acc)))))))))
+
 ;; host type-tag candidates for a non-record value (extend-protocol on builtins).
 (define (value-host-tags obj)
   ;; numbers dispatch by actual type (a Double is NOT a Long): flonum -> Double,
@@ -364,15 +394,29 @@
         ;; IWalkTerm to clojure.lang.IRecord, and walking a record value must hit
         ;; that, not the Object default (which would recur forever). The record's
         ;; own type is tried first (dispatch checks jrec-tag before these tags).
+        ;; a reify reports its declared interfaces and their ancestry — see
+        ;; jreify-host-tags above.
+        ((jreify? obj) (jreify-host-tags obj))
+        ;; A record that declares FURTHER interfaces beyond the automatic map set
+        ;; reports those too (register-inline-protocol! files them as the tag's
+        ;; supers in the class graph, so cddr of the cached jch-tags list — own
+        ;; tag and simple segment dropped — is exactly the declared ancestry).
+        ;; The common record declares nothing extra and keeps the shared list,
+        ;; costing this hot fallback path one cons, as before.
         ((jrec-record? obj)
-         (cons (jrec-tag obj)
-               '("IRecord" "clojure.lang.IRecord" "IPersistentMap" "clojure.lang.IPersistentMap"
-                 "APersistentMap" "Associative" "ILookup" "Seqable" "Counted"
-                 "IPersistentCollection" "IObj" "IMeta" "Map" "java.util.Map"
-                 "Iterable" "java.lang.Iterable" "Object")))
-        ;; a bare deftype is opaque — its declared interfaces dispatch via the
-        ;; inline methods registered under its own tag (tried before these tags).
-        ((jrec? obj) (list (jrec-tag obj) "Object"))
+         (let* ((tag (jrec-tag obj))
+                (extra (cddr (jch-tags tag))))
+           (cons tag (if (null? (cdr extra))
+                         jrec-record-iface-tags
+                         (append (jch-tags-sans-object extra) jrec-record-iface-tags)))))
+        ;; a bare deftype dispatches through its own tag first, then its declared
+        ;; interfaces and their modeled ancestry — an extend-protocol filed under
+        ;; clojure.lang.IReduceInit reaches a deftype declaring it, as instanceof
+        ;; does. The tag's own SIMPLE segment is dropped (cddr): extensions on a
+        ;; deftype name file under its ns-qualified tag, and a bare segment could
+        ;; collide with a host class of the same name. A type declaring no
+        ;; interfaces keeps (tag "Object").
+        ((jrec? obj) (let ((tag (jrec-tag obj))) (cons tag (cddr (jch-tags tag)))))
         ;; a throwable reports its OWN class and that class's ancestry, so
         ;; (extend-protocol P Throwable …) reaches an ex-info or a host-constructed
         ;; RuntimeException. clojure.datafy extends Datafiable to Throwable exactly
