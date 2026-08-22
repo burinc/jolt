@@ -231,6 +231,107 @@
                      (catch java.io.IOException e [(class e) (.getMessage e)]))
                 [java.net.SocketException "Socket closed"]))))
 
+
+;; -- host identity: InetAddress statics + NetworkInterface --------------------
+;; What a program asks about the machine it is on. The loopback interface is
+;; found by the address it carries, not by name — it is lo0 on macOS and lo on
+;; Linux, and a gate that hardcodes either is a gate that only runs on one.
+
+(defn- dotted-quad? [s]
+  (boolean (and (string? s) (re-matches #"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}" s))))
+
+(def local-host (java.net.InetAddress/getLocalHost))
+
+(check-eq "getLocalHost is an InetAddress" (instance? java.net.InetAddress local-host) true)
+(check-eq "getLocalHost has a dotted-quad address" (dotted-quad? (.getHostAddress local-host)) true)
+(check-eq "getLocalHost names the host" (pos? (count (.getHostName local-host))) true)
+;; toString is "host/address", the JVM's shape.
+(check-eq "getLocalHost toString joins host and address"
+          (str local-host) (str (.getHostName local-host) "/" (.getHostAddress local-host)))
+(check-eq "getCanonicalHostName answers a name"
+          (pos? (count (.getCanonicalHostName local-host))) true)
+
+;; getAllByName returns an ARRAY on the JVM, so alength and aget both hold.
+(def all-loopback (java.net.InetAddress/getAllByName "localhost"))
+(check-eq "getAllByName returns a non-empty array" (pos? (alength all-loopback)) true)
+(check-eq "getAllByName resolves localhost to the loopback address"
+          (boolean (some (fn [a] (= "127.0.0.1" (.getHostAddress a))) (seq all-loopback))) true)
+
+(def interfaces (enumeration-seq (java.net.NetworkInterface/getNetworkInterfaces)))
+(check-eq "getNetworkInterfaces enumerates at least one interface" (pos? (count interfaces)) true)
+(check-eq "every interface has a name"
+          (every? (fn [ni] (pos? (count (.getName ni)))) interfaces) true)
+(check-eq "an interface is a NetworkInterface"
+          (instance? java.net.NetworkInterface (first interfaces)) true)
+
+(def loopback-ni
+  (first (filter (fn [ni]
+                   (some (fn [a] (= "127.0.0.1" (.getHostAddress a)))
+                         (enumeration-seq (.getInetAddresses ni))))
+                 interfaces)))
+
+(check-eq "the loopback interface is enumerated" (some? loopback-ni) true)
+(check-eq "getByName finds the same interface"
+          (.getName (java.net.NetworkInterface/getByName (.getName loopback-ni)))
+          (.getName loopback-ni))
+(check-eq "getByInetAddress finds the loopback interface"
+          (.getName (java.net.NetworkInterface/getByInetAddress
+                      (java.net.InetAddress/getByName "127.0.0.1")))
+          (.getName loopback-ni))
+;; No interface carries a routable public address of someone else's.
+(check-eq "getByInetAddress is nil for an address no interface holds"
+          (java.net.NetworkInterface/getByInetAddress
+            (java.net.InetAddress/getByName "8.8.8.8"))
+          nil)
+(check-eq "getByName is nil for an interface that does not exist"
+          (java.net.NetworkInterface/getByName "jolt-no-such-iface0") nil)
+;; The loopback has no hardware address on the JVM; a physical one is 6 bytes.
+(check-eq "loopback has no hardware address" (.getHardwareAddress loopback-ni) nil)
+(check-eq "a hardware address, where present, is six bytes"
+          (every? (fn [ni] (let [h (.getHardwareAddress ni)]
+                             (or (nil? h) (= 6 (alength h)))))
+                  interfaces)
+          true)
+(check-eq "toString names the interface"
+          (str loopback-ni)
+          (str "name:" (.getName loopback-ni) " (" (.getDisplayName loopback-ni) ")"))
+
+;; -- System/getProperties is a java.util.Properties ---------------------------
+;; It answers getProperty, not just map lookup: a JVM library reads system
+;; properties through the Properties API (clj-uuid's node id digests six of them).
+(def sys-props (System/getProperties))
+(check-eq "getProperties answers getProperty"
+          (.getProperty sys-props "os.name") (System/getProperty "os.name"))
+(check-eq "getProperty falls back to its default"
+          (.getProperty sys-props "jolt.no.such.property" "fallback") "fallback")
+(check-eq "getProperties is still map-readable"
+          (get sys-props "os.name") (System/getProperty "os.name"))
+(check-eq "setProperty writes through"
+          (do (.setProperty sys-props "jolt.socket.test.prop" "set")
+              (System/getProperty "jolt.socket.test.prop"))
+          "set")
+(check-eq "stringPropertyNames includes a known key"
+          (contains? (set (.stringPropertyNames sys-props)) "os.name") true)
+(check-eq "getProperties is a Properties"
+          (instance? java.util.Properties sys-props) true)
+;; count, seq and get answer over the same key set — a value visible to one of
+;; them and not the others is the half-map state this shape invites.
+(check-eq "count and seq agree" (count sys-props) (count (seq sys-props)))
+(check-eq "every key seq reports is readable"
+          (every? (fn [k] (= (get sys-props k) (.getProperty sys-props k))) (keys sys-props))
+          true)
+(check-eq "into {} round-trips the whole view"
+          (count (into {} sys-props)) (count sys-props))
+;; a Properties built by hand carries its own defaults, as the JVM's does.
+(check-eq "an explicit defaults chain answers a miss"
+          (.getProperty (java.util.Properties. {"fallback.key" "from-defaults"}) "fallback.key")
+          "from-defaults")
+(check-eq "an own value wins over the defaults"
+          (let [p (java.util.Properties. {"k" "default"})]
+            (.setProperty p "k" "own")
+            (.getProperty p "k"))
+          "own")
+
 (if (empty? @failures)
   (println "SOCKET-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))

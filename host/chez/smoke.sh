@@ -929,6 +929,16 @@ else
   fails=$((fails + 1))
 fi
 
+# java.net autoloads jolt.socket, in a FRESH process with no require: a program
+# reaching for InetAddress or NetworkInterface should not have to know which
+# namespace installs them, any more than it does on the JVM. Each of these is a
+# cold first touch of the class in its own process.
+check '(boolean (re-matches #"\d+\.\d+\.\d+\.\d+" (.getHostAddress (java.net.InetAddress/getLocalHost))))' 'true'
+check '(pos? (count (enumeration-seq (java.net.NetworkInterface/getNetworkInterfaces))))' 'true'
+check '(= "class java.net.Inet4Address" (str (class (java.net.InetAddress/getLoopbackAddress))))' 'true'
+# System properties read through the Properties API, not just as a map.
+check '(= (.getProperty (System/getProperties) "os.name") (System/getProperty "os.name"))' 'true'
+
 # jolt.socket — the java.net.Socket/ServerSocket surface over real loopback TCP
 # (roundtrip, EOF, broken pipe, ephemeral ports, class model). Self-checks, one marker.
 # stderr goes into the capture: a run that dies before its first check must leave

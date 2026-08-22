@@ -37,6 +37,11 @@
 (ffi/defcfn c-ioctl       "ioctl"       [:int :ulong :varargs :pointer] :int)
 (ffi/defcfn c-inet-addr   "inet_addr"   [:pointer] :uint)
 (ffi/defcfn c-gethostbyname "gethostbyname" [:pointer] :pointer :blocking)
+(ffi/defcfn c-gethostname  "gethostname"  [:pointer :size_t] :int)
+(ffi/defcfn c-getifaddrs   "getifaddrs"   [:pointer] :int)
+(ffi/defcfn c-freeifaddrs  "freeifaddrs"  [:pointer] :void)
+(ffi/defcfn c-getnameinfo  "getnameinfo"
+  [:pointer :uint :pointer :uint :pointer :uint :int] :int :blocking)
 
 ;; macOS carries BSD constants and a sin_len-led sockaddr; Linux has a 16-bit
 ;; sin_family and needs MSG_NOSIGNAL on send — without it a write to a
@@ -49,6 +54,15 @@
 (def ^:private so-nosigpipe 0x1022)
 (def ^:private msg-nosignal (if macos? 0 0x4000))
 (def ^:private fionread (if macos? 0x4004667F 0x541B))
+
+;; The link-layer address family getifaddrs reports a MAC under, and where the
+;; MAC sits inside that entry's sockaddr. BSD's sockaddr_dl carries a
+;; variable-length name before the address (data starts at 8, the name occupies
+;; sdl_nlen of it); Linux's sockaddr_ll has a fixed 12-byte header.
+(def ^:private af-link (if macos? 18 17))
+;; A sockaddr's family byte: BSD leads with a one-byte sa_len, Linux with a
+;; 16-bit sa_family.
+(defn- sa-family [sa] (if macos? (ffi/read sa :uint8 1) (ffi/read sa :uint16 0)))
 
 ;; -- sockaddr helpers ---------------------------------------------------------
 
@@ -459,6 +473,76 @@
                                  (catch java.io.IOException _ nil)))))
    "toString"      isa->str})
 
+;; -- host identity: local host + network interfaces ---------------------------
+;; getifaddrs(3) reports one entry PER ADDRESS, so an interface with an IPv4
+;; address and a MAC appears twice; the entries are grouped by name below into
+;; one NetworkInterface each, which is the shape java.net presents.
+;;
+;; struct ifaddrs is laid out the same on both platforms for the fields read
+;; here: ifa_next 0, ifa_name 8, ifa_flags 16, ifa_addr 24.
+
+(defn- mac-bytes
+  "The hardware address inside a link-layer sockaddr, or nil when the entry
+  carries none (a loopback or tunnel interface reports a zero-length address)."
+  [sa]
+  (let [[off len] (if macos?
+                    ;; sockaddr_dl: sdl_nlen 5, sdl_alen 6, sdl_data 8 — the
+                    ;; interface name occupies sdl_nlen bytes of data first.
+                    [(+ 8 (ffi/read sa :uint8 5)) (ffi/read sa :uint8 6)]
+                    ;; sockaddr_ll: sll_halen 11, sll_addr 12.
+                    [12 (ffi/read sa :uint8 11)])]
+    (when (pos? len)
+      (let [bs (mapv (fn [i] (ffi/read sa :uint8 (+ off i))) (range len))]
+        ;; an all-zero address is what an interface with no hardware reports.
+        (when (some pos? bs) (byte-array bs))))))
+
+(defn- ifaddr-entries
+  "One map per getifaddrs entry: {:name :ip :mac}. The list is freed before
+  returning, so everything needed is read out here."
+  []
+  (let [pp (ffi/alloc (ffi/sizeof :pointer))]
+    (try
+      (ffi/write pp :pointer 0 ffi/null)
+      (when (neg? (c-getifaddrs pp))
+        (throw (java.io.IOException. "getifaddrs() failed")))
+      (let [head (ffi/read pp :pointer)]
+        (try
+          (loop [cur head acc []]
+            (if (ffi/null? cur)
+              acc
+              (let [nm (ffi/ptr->string (ffi/read cur :pointer 8))
+                    sa (ffi/read cur :pointer 24)
+                    fam (when-not (ffi/null? sa) (sa-family sa))]
+                (recur (ffi/read cur :pointer 0)
+                       (conj acc (cond-> {:name nm}
+                                   (= fam AF-INET) (assoc :ip (sa-addr sa))
+                                   (= fam af-link) (assoc :mac (mac-bytes sa))))))))
+          (finally (c-freeifaddrs head))))
+      (finally (ffi/free pp)))))
+
+(defn- local-hostname []
+  (let [n 256 buf (ffi/alloc n)]
+    (try
+      (ffi/write buf :uint8 0 0)
+      (if (neg? (c-gethostname buf n)) "localhost" (ffi/ptr->string buf))
+      (finally (ffi/free buf)))))
+
+(defn- reverse-name
+  "The name DNS gives back for an address, or nil. getnameinfo with no flags
+  asks for the canonical name and falls back to the numeric form itself, so a
+  result equal to the address means the lookup found nothing."
+  [address]
+  (let [sa (make-sockaddr (resolve-host address) 0)
+        n 1025
+        buf (ffi/alloc n)]
+    (try
+      (ffi/write buf :uint8 0 0)
+      (when (zero? (c-getnameinfo sa 16 buf n ffi/null 0 0))
+        (let [nm (ffi/ptr->string buf)]
+          (when-not (or (str/blank? nm) (= nm address)) nm)))
+      (catch java.io.IOException _ nil)
+      (finally (ffi/free buf) (ffi/free sa)))))
+
 ;; -- InetAddress --------------------------------------------------------------
 (defn- inet-address-ctor [& _]
   (make-inet-address "localhost" "127.0.0.1"))
@@ -471,13 +555,143 @@
   {"getHostAddress" (fn [self] (or (jolt.host/ref-get self :address) "127.0.0.1"))
    "getHostName"    (fn [self] (or (jolt.host/ref-get self :host)
                                    (jolt.host/ref-get self :address)))
+   ;; The JVM reverse-resolves and caches; so does this, on the address it holds,
+   ;; falling back to the name it was built with and then to the address itself.
+   "getCanonicalHostName"
+   (fn [self]
+     (or (jolt.host/ref-get self :canonical)
+         (let [addr (jolt.host/ref-get self :address)
+               nm (or (and addr (reverse-name addr))
+                      (jolt.host/ref-get self :host)
+                      addr)]
+           (jolt.host/ref-put! self :canonical nm)
+           nm)))
+   ;; the four address octets, network order — the JVM's byte[].
+   "getAddress"
+   (fn [self]
+     (byte-array (mapv (fn [o] (Integer/parseInt o))
+                       (str/split (or (jolt.host/ref-get self :address) "127.0.0.1") #"\."))))
+   "equals"   (fn [self other]
+                (boolean (and (= :inet-address (jolt.host/ref-get other :jolt/type))
+                              (= (jolt.host/ref-get self :address)
+                                 (jolt.host/ref-get other :address)))))
+   "hashCode" (fn [self] (hash (jolt.host/ref-get self :address)))
+   "isLoopbackAddress" (fn [self] (= "127.0.0.1" (jolt.host/ref-get self :address)))
    "toString"       inet-address->str})
+
+(defn- all-addresses-of
+  "Every address the resolver has for `host`. gethostbyname's h_addr_list (a
+  NULL-terminated array of pointers at offset 24 of struct hostent) carries them
+  all; a numeric literal resolves to itself without a lookup."
+  [host]
+  (let [hp (ffi/string->ptr (str host))]
+    (try
+      (let [numeric (c-inet-addr hp)]
+        (if (not= numeric 4294967295)
+          [(ip->str numeric)]
+          (let [he (c-gethostbyname hp)]
+            (when (ffi/null? he)
+              (throw (java.io.IOException. (str "unknown host: " host))))
+            (let [list-ptr (ffi/read he :uptr 24)]
+              (loop [i 0 acc []]
+                (let [entry (ffi/read list-ptr :uptr (* i (ffi/sizeof :pointer)))]
+                  (if (zero? entry)
+                    acc
+                    (recur (inc i) (conj acc (ip->str (ffi/read entry :uint 0)))))))))))
+      (finally (ffi/free hp)))))
 
 (def ^:private inet-address-statics
   {"getByName"
    (fn [h] (make-inet-address (str h) (ip->str (resolve-host h))))
+   "getAllByName"
+   ;; an array, as on the JVM, so alength and aget hold on the result.
+   (fn [h] (object-array (mapv (fn [ip] (make-inet-address (str h) ip))
+                               (all-addresses-of h))))
    "getLoopbackAddress"
-   (fn [] (make-inet-address "localhost" "127.0.0.1"))})
+   (fn [] (make-inet-address "localhost" "127.0.0.1"))
+   ;; gethostname(2) plus whatever the resolver says that name is. A machine
+   ;; whose own name does not resolve — a laptop off any DNS that knows it — is
+   ;; answered from its own interfaces rather than by throwing
+   ;; UnknownHostException, which is what the JVM does there.
+   "getLocalHost"
+   (fn []
+     (let [nm (local-hostname)]
+       (make-inet-address
+         nm
+         (or (try (ip->str (resolve-host nm)) (catch java.io.IOException _ nil))
+             (first (remove (fn [ip] (= "127.0.0.1" ip))
+                            (keep :ip (ifaddr-entries))))
+             "127.0.0.1"))))})
+
+;; -- java.util.Enumeration ----------------------------------------------------
+;; NetworkInterface hands back Enumerations, which enumeration-seq drives
+;; through hasMoreElements/nextElement.
+
+(defn- make-enumeration [coll]
+  (doto (tt :enumeration "java.util.Enumeration")
+    (jolt.host/ref-put! :rest (seq coll))))
+
+(def ^:private enumeration-methods
+  {"hasMoreElements" (fn [self] (boolean (jolt.host/ref-get self :rest)))
+   "nextElement"     (fn [self]
+                       (let [r (jolt.host/ref-get self :rest)]
+                         (when-not r
+                           (throw (ex-info "no more elements" {})))
+                         (jolt.host/ref-put! self :rest (next r))
+                         (first r)))
+   "toString"        (fn [_] "java.util.Enumeration")})
+
+;; -- java.net.NetworkInterface ------------------------------------------------
+;; A snapshot, as on the JVM: the addresses and hardware address are read when
+;; the interface is looked up, not on each call.
+
+(defn- make-network-interface [nm addresses mac]
+  (doto (tt :network-interface "java.net.NetworkInterface")
+    (jolt.host/ref-put! :name nm)
+    (jolt.host/ref-put! :addresses addresses)
+    (jolt.host/ref-put! :mac mac)))
+
+(defn- network-interfaces []
+  ;; Preserve the order getifaddrs reports, one interface per distinct name.
+  (let [entries (ifaddr-entries)
+        names (distinct (map :name entries))]
+    (mapv (fn [nm]
+            (let [mine (filter (fn [e] (= nm (:name e))) entries)]
+              (make-network-interface
+                nm
+                (mapv (fn [e] (make-inet-address (or (reverse-name (:ip e)) "") (:ip e)))
+                      (filter :ip mine))
+                (first (keep :mac mine)))))
+          names)))
+
+(defn- ni->str [self]
+  (str "name:" (jolt.host/ref-get self :name)
+       " (" (jolt.host/ref-get self :name) ")"))
+
+(def ^:private network-interface-methods
+  {"getName"        (fn [self] (jolt.host/ref-get self :name))
+   ;; jolt has no separate friendly name for an interface, as Linux does not
+   ;; either — the JVM reports the name for both there.
+   "getDisplayName" (fn [self] (jolt.host/ref-get self :name))
+   "getInetAddresses" (fn [self] (make-enumeration (jolt.host/ref-get self :addresses)))
+   "getHardwareAddress" (fn [self] (jolt.host/ref-get self :mac))
+   "isLoopback"     (fn [self] (boolean (some (fn [a] (= "127.0.0.1" (jolt.host/ref-get a :address)))
+                                              (jolt.host/ref-get self :addresses))))
+   "toString"       ni->str})
+
+(def ^:private network-interface-statics
+  {"getNetworkInterfaces" (fn [] (make-enumeration (network-interfaces)))
+   "getByName" (fn [nm] (or (first (filter (fn [ni] (= (str nm) (jolt.host/ref-get ni :name)))
+                                           (network-interfaces)))
+                            nil))
+   "getByInetAddress"
+   (fn [addr]
+     (let [want (host-arg->str addr)]
+       (or (first (filter (fn [ni]
+                            (some (fn [a] (= want (jolt.host/ref-get a :address)))
+                                  (jolt.host/ref-get ni :addresses)))
+                          (network-interfaces)))
+           nil)))})
 
 ;; -- value-semantics + registration -------------------------------------------
 
@@ -489,13 +703,16 @@
    :inet-socket-address  #{"InetSocketAddress" "java.net.InetSocketAddress"
                            "SocketAddress" "java.net.SocketAddress"}
    :inet-address         #{"InetAddress" "java.net.InetAddress"
-                           "Inet4Address" "java.net.Inet4Address"}})
+                           "Inet4Address" "java.net.Inet4Address"}
+   :network-interface    #{"NetworkInterface" "java.net.NetworkInterface"}
+   :enumeration          #{"Enumeration" "java.util.Enumeration"}})
 
 (def ^:private tag->render
   {:socket              socket->str
    :server-socket       server->str
    :inet-socket-address isa->str
-   :inet-address        inet-address->str})
+   :inet-address        inet-address->str
+   :network-interface   ni->str})
 
 (def ^:private registered? (atom false))
 
@@ -507,6 +724,8 @@
     (clojure.core/__register-class-methods! :server-socket server-socket-methods)
     (clojure.core/__register-class-methods! :inet-socket-address inet-socket-address-methods)
     (clojure.core/__register-class-methods! :inet-address inet-address-methods)
+    (clojure.core/__register-class-methods! :network-interface network-interface-methods)
+    (clojure.core/__register-class-methods! :enumeration enumeration-methods)
 
     (clojure.core/__register-class-ctor! "InetSocketAddress" isa-ctor)
     (clojure.core/__register-class-ctor! "java.net.InetSocketAddress" isa-ctor)
@@ -515,6 +734,9 @@
     (clojure.core/__register-class-ctor! "java.net.InetAddress" inet-address-ctor)
     (clojure.core/__register-class-statics! "InetAddress" inet-address-statics)
     (clojure.core/__register-class-statics! "java.net.InetAddress" inet-address-statics)
+
+    (clojure.core/__register-class-statics! "NetworkInterface" network-interface-statics)
+    (clojure.core/__register-class-statics! "java.net.NetworkInterface" network-interface-statics)
 
     (clojure.core/__register-class-ctor! "Socket" socket-ctor)
     (clojure.core/__register-class-ctor! "java.net.Socket" socket-ctor)

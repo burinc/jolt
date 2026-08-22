@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`java.net` host identity.** `InetAddress/getLocalHost`, `getAllByName`
+  (an array, as on the JVM), `.getCanonicalHostName`, `.getAddress`, and a new
+  `java.net.NetworkInterface` — `getNetworkInterfaces`, `getByName`,
+  `getByInetAddress`, `.getInetAddresses`, `.getHardwareAddress`,
+  `.getDisplayName` — read from `getifaddrs(3)`. IPv4, matching the rest of
+  `jolt.socket`. Touching any `java.net` class now loads `jolt.socket` on
+  demand, the courtesy `java.time` and `MessageDigest` already got, so a JVM
+  library that reaches for `InetAddress` works with nothing to require.
+
+- **`java.util.Properties`**, with the `defaults` chain the JVM's has:
+  `getProperty` / `setProperty` / `stringPropertyNames` / `propertyNames`
+  alongside the `Map` reads. `System/getProperties` returns one that shares the
+  override store, so a `setProperty` through it is what `System/getProperty`
+  then reports; it used to return a plain map, which answered `.getProperty` as
+  a key lookup and so read `nil` for every system property. The values Jolt
+  computes on read — `user.dir`, `java.class.path` — are its defaults rather
+  than frozen entries, so they stay current.
+
+### Fixed
+
+- **`count`, `seq` and `get` agree on the `java.util` map shims.** The three
+  spellings of "is this a hashmap-backed host object" had drifted into separate
+  predicates; they are one now, so a map shim cannot be countable through one
+  and opaque through another.
+
 ## [0.7.22] - 2026-08-22
 
 A patch release of robustness fixes: the AOT cache detects and heals partial
