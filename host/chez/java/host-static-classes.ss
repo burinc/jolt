@@ -671,25 +671,31 @@
 (define (props-defaults self) (props-slot self 2))
 (define (props-writethrough self) (props-slot self 3))
 ;; getProperty answers only STRING values, as on the JVM: a non-string mapping is
-;; invisible to it (get still sees it) and the default is returned instead.
+;; invisible to it (get still sees it) and the default is returned instead. The
+;; defaults are themselves searched by getProperty, so a Properties whose
+;; defaults is another Properties walks the WHOLE chain, as the JVM's recursive
+;; defaults.getProperty does.
 (define (props-string-ref self k dflt)
   (let ((v (hashtable-ref (hm-tbl self) k jolt-nil)))
     (cond ((string? v) v)
           ((not (jolt-nil? v)) dflt)
           (else (let ((d (props-defaults self)))
-                  (if d
-                      (let ((dv (jolt-get d k jolt-nil)))
-                        (if (string? dv) dv dflt))
-                      dflt))))))
-;; every name the object can answer for: its own keys plus its defaults'.
+                  (cond ((not d) dflt)
+                        ((and (jhost? d) (string=? (jhost-tag d) "properties"))
+                         (props-string-ref d k dflt))
+                        (else (let ((dv (jolt-get d k jolt-nil)))
+                                (if (string? dv) dv dflt)))))))))
+;; every name the object can answer for: its own keys plus its defaults' — down
+;; the whole chain, since propertyNames enumerates it all on the JVM too.
 (define (props-names self)
-  (let ((own (hm-keys-ordered self))
-        (d (props-defaults self)))
+  (let* ((own (hm-keys-ordered self))
+         (d (props-defaults self))
+         (inherited
+          (cond ((not d) (quote ()))
+                ((and (jhost? d) (string=? (jhost-tag d) "properties")) (props-names d))
+                (else (seq->list (jolt-keys d))))))
     (append own
-            (if d
-                (filter (lambda (k) (not (hashtable-contains? (hm-tbl self) k)))
-                        (seq->list (jolt-keys d)))
-                (quote ())))))
+            (filter (lambda (k) (not (hashtable-contains? (hm-tbl self) k))) inherited))))
 (define (props-put! self k v)
   (hm-note-key! self k)
   (hashtable-set! (hm-tbl self) k v)
@@ -701,8 +707,10 @@
     (list
       (cons "getProperty" (lambda (self k . dflt)
                             (props-string-ref self k (if (pair? dflt) (car dflt) jolt-nil))))
+      ;; setProperty delegates to put on the JVM, so it returns THIS object's
+      ;; previous value and never the one it was shadowing in the defaults.
       (cons "setProperty" (lambda (self k v)
-                            (let ((old (props-string-ref self k jolt-nil)))
+                            (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
                               (props-put! self k (if (string? v) v (jolt-str-render-one v)))
                               old)))
       (cons "put" (lambda (self k v)

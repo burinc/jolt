@@ -361,6 +361,19 @@
             (.setProperty p "k" "own")
             (.getProperty p "k"))
           "own")
+;; setProperty delegates to put on the JVM, so it reports THIS object's previous
+;; value — nil when the key was only ever in the defaults, not the value it is
+;; now shadowing.
+(check-eq "setProperty reports the own previous value, not the shadowed default"
+          (.setProperty (java.util.Properties. {"k" "default"}) "k" "own") nil)
+;; the chain is walked recursively: a Properties whose defaults is a Properties.
+(check-eq "nested defaults are searched through"
+          (.getProperty (java.util.Properties. (java.util.Properties. {"deep" "found"})) "deep")
+          "found")
+(check-eq "propertyNames enumerates the whole chain"
+          (vec (enumeration-seq
+                 (.propertyNames (java.util.Properties. (java.util.Properties. {"deep" "found"})))))
+          ["deep"])
 (check-eq "removing an own value uncovers the default"
           (let [p (java.util.Properties. {"k" "default"})]
             (.setProperty p "k" "own")
