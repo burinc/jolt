@@ -3749,6 +3749,7 @@
   {:suite "reader / read-eval" :label "edn has no #= dispatch" :expected ":no-dispatch" :actual "(try (clojure.edn/read-string \"#=(+ 1 2)\") (catch Exception e :no-dispatch))" :portability :jvm}
   ;; the vector spelling of a require prefix list — a vector is a single
   ;; libspec only when its second element is a keyword or absent.
+  {:suite "interop / charsets" :label "StandardCharsets constants name their charsets" :expected "[104 105]" :actual "(vec (.getBytes \"hi\" java.nio.charset.StandardCharsets/UTF_8))" :portability :jvm}
   {:suite "loader / prefix lists" :label "vector prefix list registers every sub-spec" :expected "[\"A\" \"b\"]" :actual "(do (require (quote [clojure [string :as pfx-up] [string :as pfx-lo]])) [(pfx-up/upper-case \"a\") (pfx-lo/lower-case \"B\")])" :portability :jvm}
   {:suite "uuid / parse-uuid" :label "case-insensitive =" :expected "true" :actual "(= (parse-uuid \"b6883c0a-0342-4007-9966-bc2dfa6b109e\") (parse-uuid \"B6883C0A-0342-4007-9966-BC2DFA6B109E\"))" :portability :common}
   {:suite "uuid / parse-uuid" :label "empty -> nil" :expected "nil" :actual "(parse-uuid \"\")" :portability :common}
