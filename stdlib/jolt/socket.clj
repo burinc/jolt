@@ -553,8 +553,17 @@
 
 (def ^:private inet-address-methods
   {"getHostAddress" (fn [self] (or (jolt.host/ref-get self :address) "127.0.0.1"))
-   "getHostName"    (fn [self] (or (jolt.host/ref-get self :host)
-                                   (jolt.host/ref-get self :address)))
+   ;; Resolves on first call and caches, as the JVM does — an address built
+   ;; from a literal or read off an interface carries no name until asked.
+   "getHostName"
+   (fn [self]
+     (let [h (jolt.host/ref-get self :host)]
+       (if (str/blank? h)
+         (let [addr (jolt.host/ref-get self :address)
+               nm (or (and addr (reverse-name addr)) addr)]
+           (jolt.host/ref-put! self :host nm)
+           nm)
+         h)))
    ;; The JVM reverse-resolves and caches; so does this, on the address it holds,
    ;; falling back to the name it was built with and then to the address itself.
    "getCanonicalHostName"
@@ -659,8 +668,12 @@
             (let [mine (filter (fn [e] (= nm (:name e))) entries)]
               (make-network-interface
                 nm
-                (mapv (fn [e] (make-inet-address (or (reverse-name (:ip e)) "") (:ip e)))
-                      (filter :ip mine))
+                ;; No hostname: an address read off an interface is unresolved
+                ;; on the JVM too (its toString is "/1.2.3.4"), and resolving
+                ;; every one of them eagerly would put a DNS round trip per
+                ;; address in the way of enumerating interfaces. .getHostName
+                ;; resolves on demand.
+                (mapv (fn [e] (make-inet-address "" (:ip e))) (filter :ip mine))
                 (first (keep :mac mine)))))
           names)))
 

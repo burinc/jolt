@@ -271,6 +271,18 @@
                  interfaces)))
 
 (check-eq "the loopback interface is enumerated" (some? loopback-ni) true)
+;; An address read off an interface carries no hostname until asked — the JVM
+;; prints it as "/127.0.0.1" — and .getHostName resolves once and caches.
+(check-eq "an interface address is unresolved until asked"
+          (str (first (filter (fn [a] (= "127.0.0.1" (.getHostAddress a)))
+                              (enumeration-seq (.getInetAddresses loopback-ni)))))
+          "/127.0.0.1")
+(check-eq "getHostName resolves it and caches the name"
+          (let [a (first (filter (fn [x] (= "127.0.0.1" (.getHostAddress x)))
+                                 (enumeration-seq (.getInetAddresses loopback-ni))))]
+            (.getHostName a)
+            (str a))
+          "localhost/127.0.0.1")
 (check-eq "getByName finds the same interface"
           (.getName (java.net.NetworkInterface/getByName (.getName loopback-ni)))
           (.getName loopback-ni))
@@ -322,15 +334,39 @@
           true)
 (check-eq "into {} round-trips the whole view"
           (count (into {} sys-props)) (count sys-props))
-;; a Properties built by hand carries its own defaults, as the JVM's does.
-(check-eq "an explicit defaults chain answers a miss"
-          (.getProperty (java.util.Properties. {"fallback.key" "from-defaults"}) "fallback.key")
-          "from-defaults")
+(check-eq "setProperty through the object is what System/getProperty reports"
+          (do (.setProperty sys-props "jolt.socket.test.wt" "through")
+              (System/getProperty "jolt.socket.test.wt"))
+          "through")
+;; the computed values are recomputed per call, not frozen at the first one.
+(check-eq "user.dir is current, not a frozen entry"
+          (.getProperty (System/getProperties) "user.dir") (System/getProperty "user.dir"))
+
+;; A Properties built by hand carries its own defaults. The JVM is precise about
+;; which operations span that chain — getProperty and the two name enumerations
+;; do, the inherited Hashtable surface does not — and these pin that split.
+(def defaulted (java.util.Properties. {"only-default" "from-defaults"}))
+(check-eq "getProperty spans the defaults"
+          (.getProperty defaulted "only-default") "from-defaults")
+(check-eq "propertyNames spans the defaults"
+          (vec (enumeration-seq (.propertyNames defaulted))) ["only-default"])
+(check-eq "stringPropertyNames spans the defaults"
+          (vec (.stringPropertyNames defaulted)) ["only-default"])
+(check-eq "containsKey does NOT span the defaults"
+          (.containsKey defaulted "only-default") false)
+(check-eq "keySet does NOT span the defaults" (vec (.keySet defaulted)) [])
+(check-eq "isEmpty does NOT span the defaults" (.isEmpty defaulted) true)
 (check-eq "an own value wins over the defaults"
           (let [p (java.util.Properties. {"k" "default"})]
             (.setProperty p "k" "own")
             (.getProperty p "k"))
           "own")
+(check-eq "removing an own value uncovers the default"
+          (let [p (java.util.Properties. {"k" "default"})]
+            (.setProperty p "k" "own")
+            (.remove p "k")
+            (.getProperty p "k"))
+          "default")
 
 (if (empty? @failures)
   (println "SOCKET-TEST OK")

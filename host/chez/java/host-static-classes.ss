@@ -560,12 +560,11 @@
       (when (and (pair? args) (or (pmap? (car args)) (hm-hashmap? (car args))))
         (hm-copy-into-ordered! self (car args)))
       self)))
-;; The map view of a hashmap-shaped jhost — what seq/entrySet/toString/into read.
-;; Routed through the Properties accessors so a Properties' defaults chain is
-;; part of the view; for a plain HashMap (no defaults) they answer identically.
 (define (hm->pmap self)
-  (let loop ((ks (props-names self)) (m (jolt-hash-map)))
-    (if (null? ks) m (loop (cdr ks) (jolt-assoc m (car ks) (props-ref self (car ks) jolt-nil))))))
+  (let ((m (jolt-hash-map)))
+    (for-each (lambda (k) (set! m (jolt-assoc m k (hashtable-ref (hm-tbl self) k jolt-nil))))
+              (hm-keys-ordered self))
+    m))
 (define hashmap-methods
   (list (cons "put" (lambda (self k v) (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
                                           (hm-note-key! self k)
@@ -645,41 +644,43 @@
         (cons "toString" (lambda (self) (jolt-pr-str (hm->pmap self))))))
 (register-host-methods! "hashmap" hashmap-methods)
 
-;; java.util.Properties — a Hashtable of strings with getProperty/setProperty
-;; and a DEFAULTS chain: a key the table does not hold is looked up in the
-;; defaults before the caller's fallback, and propertyNames covers both. That
-;; chain is what System/getProperties needs — jolt computes most system
-;; properties on read (user.dir tracks the source roots, java.class.path the
-;; resolved paths), so they cannot be frozen into the table, while an explicit
-;; System/setProperty must be visible through the object and vice versa. The
-;; returned Properties shares the override table, and carries the computed
-;; values as its defaults.
+;; java.util.Properties — a Hashtable of strings with getProperty/setProperty and
+;; a DEFAULTS chain. The JVM is precise about which operations see that chain:
+;; getProperty, propertyNames and stringPropertyNames do; the inherited Hashtable
+;; surface (get, containsKey, keySet, values, size) does NOT. Checked against the
+;; reference — a Properties holding only defaults answers isEmpty true and an
+;; empty keySet, while its propertyNames lists them.
 ;;
-;; A plain map answered .getProperty as a key lookup and so returned nil for
-;; every system property, which is how a library that reads them through the
-;; Properties API (clj-uuid's node id digests six) saw nothing.
+;; The WRITE-THROUGH target is jolt's own. System/getProperties hands back an
+;; object whose entries are a snapshot, because jolt computes most system
+;; properties on read (user.dir tracks the source roots, java.class.path the
+;; resolved paths) and they cannot be a live table; but a setProperty through it
+;; must still be what System/getProperty reports, so writes go to both.
+;;
+;; System/getProperties used to return a plain map, which answered .getProperty
+;; as a key lookup and so read nil for every system property — how a library that
+;; reads them through the Properties API saw nothing.
 (define (make-properties-jhost . defaults)
   (make-jhost "properties"
               (vector (make-hashtable hm-hash jolt=2) (quote ())
-                      (if (pair? defaults) (car defaults) #f))))
-;; Share an existing override table rather than copying it, so writes through
-;; either path are one store.
-(define (make-properties-over tbl defaults)
-  (make-jhost "properties" (vector tbl (quote ()) defaults)))
-(define (props-defaults self)
+                      (if (pair? defaults) (car defaults) #f)
+                      #f)))
+(define (props-slot self i)
   (let ((st (jhost-state self)))
-    (and (fx>? (vector-length st) 2) (vector-ref st 2))))
-(define (props-ref self k dflt)
-  (let ((v (hashtable-ref (hm-tbl self) k jolt-nil)))
-    (if (jolt-nil? v)
-        (let ((d (props-defaults self)))
-          (if d (jolt-get d k dflt) dflt))
-        v)))
-;; getProperty answers only STRING values, as on the JVM: a non-string mapping
-;; is invisible to it (get/valAt still see it) and the default is returned.
+    (and (fx>? (vector-length st) i) (vector-ref st i))))
+(define (props-defaults self) (props-slot self 2))
+(define (props-writethrough self) (props-slot self 3))
+;; getProperty answers only STRING values, as on the JVM: a non-string mapping is
+;; invisible to it (get still sees it) and the default is returned instead.
 (define (props-string-ref self k dflt)
-  (let ((v (props-ref self k jolt-nil)))
-    (if (string? v) v dflt)))
+  (let ((v (hashtable-ref (hm-tbl self) k jolt-nil)))
+    (cond ((string? v) v)
+          ((not (jolt-nil? v)) dflt)
+          (else (let ((d (props-defaults self)))
+                  (if d
+                      (let ((dv (jolt-get d k jolt-nil)))
+                        (if (string? dv) dv dflt))
+                      dflt))))))
 ;; every name the object can answer for: its own keys plus its defaults'.
 (define (props-names self)
   (let ((own (hm-keys-ordered self))
@@ -689,6 +690,11 @@
                 (filter (lambda (k) (not (hashtable-contains? (hm-tbl self) k)))
                         (seq->list (jolt-keys d)))
                 (quote ())))))
+(define (props-put! self k v)
+  (hm-note-key! self k)
+  (hashtable-set! (hm-tbl self) k v)
+  (let ((wt (props-writethrough self)))
+    (when wt (hashtable-set! wt k (if (string? v) v (jolt-str-render-one v))))))
 (register-host-methods! "properties"
   (append
     hashmap-methods
@@ -697,30 +703,44 @@
                             (props-string-ref self k (if (pair? dflt) (car dflt) jolt-nil))))
       (cons "setProperty" (lambda (self k v)
                             (let ((old (props-string-ref self k jolt-nil)))
-                              (hm-note-key! self k)
-                              (hashtable-set! (hm-tbl self) k
-                                              (if (string? v) v (jolt-str-render-one v)))
+                              (props-put! self k (if (string? v) v (jolt-str-render-one v)))
                               old)))
+      (cons "put" (lambda (self k v)
+                    (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
+                      (props-put! self k v) old)))
+      (cons "remove" (lambda (self k)
+                       (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
+                         (hashtable-delete! (hm-tbl self) k)
+                         (hm-drop-key! self k)
+                         (let ((wt (props-writethrough self)))
+                           (when wt (hashtable-delete! wt k)))
+                         old)))
+      (cons "clear" (lambda (self)
+                      (hashtable-clear! (hm-tbl self)) (hm-ord! self (quote ()))
+                      (let ((wt (props-writethrough self)))
+                        (when wt (hashtable-clear! wt)))
+                      jolt-nil))
+      ;; the two enumerations that DO span the defaults chain.
       (cons "stringPropertyNames"
             (lambda (self) (apply jolt-hash-set
-                             (filter (lambda (k) (string? (props-ref self k jolt-nil)))
+                             (filter (lambda (k) (string? (props-string-ref self k #f)))
                                      (props-names self)))))
-      (cons "propertyNames" (lambda (self) (list->cseq (props-names self))))
-      ;; the read side of the Map surface sees the defaults too.
-      (cons "get" (lambda (self k) (props-ref self k jolt-nil)))
-      (cons "getOrDefault" (lambda (self k d) (props-ref self k d)))
-      (cons "containsKey" (lambda (self k) (if (member k (props-names self)) #t #f)))
-      (cons "size" (lambda (self) (length (props-names self))))
-      (cons "isEmpty" (lambda (self) (null? (props-names self))))
-      (cons "keySet" (lambda (self) (apply jolt-hash-set (props-names self))))
-      (cons "values" (lambda (self) (apply jolt-vector
-                        (map (lambda (k) (props-ref self k jolt-nil)) (props-names self)))))
-      (cons "entrySet" (lambda (self) (jolt-seq (hm->pmap self))))
-      (cons "toString" (lambda (self) (jolt-pr-str (hm->pmap self)))))))
+      (cons "propertyNames" (lambda (self) (list->cseq (props-names self)))))))
 (register-class-ctor! "Properties"
   (lambda args (apply make-properties-jhost args)))
 (register-class-ctor! "java.util.Properties"
   (lambda args (apply make-properties-jhost args)))
+;; System/getProperties: real entries, so get/count/seq see them as on the JVM,
+;; recomputed per call so user.dir and java.class.path stay current, with writes
+;; going through to the override store.
+(define (make-system-properties m override-tbl)
+  (let ((self (make-jhost "properties"
+                          (vector (make-hashtable hm-hash jolt=2) (quote ()) #f override-tbl))))
+    (for-each (lambda (e)
+                (hm-note-key! self (jolt-nth e 0))
+                (hashtable-set! (hm-tbl self) (jolt-nth e 0) (jolt-nth e 1)))
+              (seq->list (jolt-seq m)))
+    self))
 
 ;; java.util.concurrent.ConcurrentHashMap — one shared heap, so the mutable
 ;; HashMap shim serves. (get a-hashmap k) reads the map (clojure.core/get).
@@ -843,15 +863,6 @@
 (register-count-arm! jhost-hashmap? (lambda (c) (hashtable-size (hm-tbl c))))
 (register-contains-arm! jhost-hashmap?
   (lambda (c k) (if (hashtable-contains? (hm-tbl c) k) #t #f)))
-;; Properties reads see the defaults chain, so (get (System/getProperties)
-;; "os.name") answers like .getProperty does. Registered after the HashMap arms
-;; and so consulted before them; the HashMap arms stay exact, since a plain map
-;; holding an explicit nil must not fall through to a caller's default.
-(define (jhost-properties? x) (and (jhost? x) (string=? (jhost-tag x) "properties")))
-(register-get-arm! jhost-properties? (lambda (coll k d) (props-ref coll k d)))
-(register-count-arm! jhost-properties? (lambda (c) (length (props-names c))))
-(register-contains-arm! jhost-properties?
-  (lambda (c k) (if (member k (props-names c)) #t #f)))
 
 ;; ---- java.lang.ref.Soft/WeakReference + ReferenceQueue ----------------------
 ;; Real GC reclamation via Chez's generational collector: the referent is held

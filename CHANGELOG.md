@@ -18,21 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   demand, the courtesy `java.time` and `MessageDigest` already got, so a JVM
   library that reaches for `InetAddress` works with nothing to require.
 
-- **`java.util.Properties`**, with the `defaults` chain the JVM's has:
-  `getProperty` / `setProperty` / `stringPropertyNames` / `propertyNames`
-  alongside the `Map` reads. `System/getProperties` returns one that shares the
-  override store, so a `setProperty` through it is what `System/getProperty`
-  then reports; it used to return a plain map, which answered `.getProperty` as
-  a key lookup and so read `nil` for every system property. The values Jolt
-  computes on read — `user.dir`, `java.class.path` — are its defaults rather
-  than frozen entries, so they stay current.
+- **`java.util.Properties`**, with the `defaults` chain the JVM's has, and the
+  same split over which operations span it: `getProperty`, `propertyNames` and
+  `stringPropertyNames` do, the inherited `Hashtable` surface (`get`,
+  `containsKey`, `keySet`, `size`) does not. `System/getProperties` returns one
+  whose entries are the computed values, recomputed per call so `user.dir` and
+  `java.class.path` stay current, and writes through it reach the store
+  `System/getProperty` reads. It used to return a plain map, which answered
+  `.getProperty` as a key lookup and so read `nil` for every system property.
 
 ### Fixed
 
-- **`count`, `seq` and `get` agree on the `java.util` map shims.** The three
-  spellings of "is this a hashmap-backed host object" had drifted into separate
-  predicates; they are one now, so a map shim cannot be countable through one
-  and opaque through another.
+- **The `java.util` map shims answer `count`, `seq` and `get` over one key
+  set.** The three spellings of "is this a hashmap-backed host object" had
+  drifted into separate predicates; they are one now, so a shim of that shape
+  cannot be countable through one and opaque through another.
 
 ## [0.7.22] - 2026-08-22
 
