@@ -1201,9 +1201,19 @@
                    (jolt-seq (seq-more s))))))))
 (define jolt-reduce
   (case-lambda
-    ((f coll) (let ((s (jolt-seq coll)))
-                (if (jolt-nil? s) (jolt-invoke f)          ; (reduce f []) -> (f)
-                    (reduce-seq f (seq-first s) (jolt-seq (seq-more s))))))
+    ((f coll)
+     ;; IReduce first: a deftype/reify DECLARING clojure.lang.IReduce drives the
+     ;; no-init reduction, like the JVM's instanceof-IReduce check. The check is
+     ;; interface-scoped, not method-name-scoped: Eduction declares only
+     ;; IReduceInit and its one reduce method takes an init, so driving it from
+     ;; here would pass the wrong arity — it seqs instead, as on the JVM.
+     (cond
+       ((and (declares-ireduce? coll) (iface-method coll "reduce" 2))
+        => (lambda (m) (let ((r (jolt-invoke m coll f)))
+                         (if (jolt-reduced? r) (jolt-reduced-val r) r))))
+       (else (let ((s (jolt-seq coll)))
+               (if (jolt-nil? s) (jolt-invoke f)          ; (reduce f []) -> (f)
+                   (reduce-seq f (seq-first s) (jolt-seq (seq-more s))))))))
     ((f init coll)
      ;; IReduceInit: a deftype/record OR reify with its own `reduce` method drives
      ;; the reduction, e.g. (reduce f init (reify clojure.lang.IReduceInit
@@ -1219,6 +1229,26 @@
 ;; fold O(n^2) (and into/vec/mapv/filterv all route here). jolt-transient-new
 ;; falls back to a copy-on-write wrapper for other targets (lists, sorted colls,
 ;; nil), so those keep the old per-step jolt-conj behaviour.
+;; Does v declare clojure.lang.IReduce (the no-init interface)? A deftype's
+;; declared interfaces sit in the class graph; a reify's ride on the instance.
+(define (declares-ireduce? v)
+  (cond ((jrec? v) (jrec-declares? v "clojure.lang.IReduce"))
+        ((jreify? v)
+         (and (memp (lambda (p) (proto-class-match? p "clojure.lang.IReduce"))
+                    (jreify-protos v))
+              #t))
+        (else #f)))
+;; Fold from's elements with f: a source that drives its own reduce (a deftype
+;; or reify declaring IReduce/IReduceInit) does so — the JVM routes into/vec
+;; through CollReduce's IReduceInit arm the same way — and anything else is
+;; seq'd. A conforming driver returns the unwrapped value; unwrap defensively,
+;; like 3-arity reduce.
+(define (into-fold f acc from)
+  (cond
+    ((iface-method from "reduce" 3)
+     => (lambda (m) (let ((r (jolt-invoke m from f acc)))
+                      (if (jolt-reduced? r) (jolt-reduced-val r) r))))
+    (else (reduce-seq f acc (jolt-seq from)))))
 (define (jolt-into to from)
   (cond
     ;; two non-empty vectors: O(log n) RRB concatenation instead of a linear
@@ -1233,10 +1263,10 @@
     ;; instanceof IEditableCollection split.
     ((or (pvec? to) (pmap? to) (pset? to))
      (meta-carry to
-       (jolt-persistent! (reduce-seq (lambda (t x) (jolt-conj! t x)) (jolt-transient-new to) (jolt-seq from)))))
+       (jolt-persistent! (into-fold (lambda (t x) (jolt-conj! t x)) (jolt-transient-new to) from))))
     (else
      (meta-carry to
-       (reduce-seq (lambda (acc x) (jolt-conj1 acc x)) to (jolt-seq from))))))
+       (into-fold (lambda (acc x) (jolt-conj1 acc x)) to from)))))
 
 ;; zipmap: the reference builds through (transient {}), whose array capacity is 8
 ;; entries — so the result is an insertion-ordered array map up to 8 entries and
