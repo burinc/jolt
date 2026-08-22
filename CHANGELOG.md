@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Declarative `jolt.ffi` struct layouts:** `(ffi/layout [:struct ...])`
+  compiles a literal, data-only descriptor into immutable ABI metadata derived
+  by Chez. `layout-size`, `layout-alignment`, and `field-offset` expose the
+  native layout, while `read-field` and `write-field` access scalar fields by
+  keyword path. Layouts support fixed-size scalar fields and nested structs;
+  arrays, unions, bitfields, packing, and recursive descriptors are not yet
+  supported.
+
 ### Fixed
 
 - **Static fields resolve through every access path.** Three related bugs in
@@ -130,7 +140,6 @@ the `var` special form reports real errors.
   namespaced symbol (the namespace part used to be dropped). `(var String)`
   still succeeds and returns the class-holding var — jolt keeps imported
   classes in vars, a deliberate superset of the JVM, which refuses.
-
 ## [0.7.21] - 2026-08-22
 
 A patch release that gives core vars their documentation: `(meta #'map)` used
