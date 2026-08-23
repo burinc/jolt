@@ -1287,11 +1287,23 @@
                  "(throw-jvm 'NullPointerException "
                  (chez-str-lit (str "jolt.ffi: null by-value " role " pointer")) ") "
                  "(make-ftype-pointer " type-name " address)))"))
+          ;; A :string argument is wrapped so jolt's nil reaches C as a null
+          ;; char*. Chez's `string` type already accepts #f for that; it just
+          ;; does not know jolt's nil, and raised "invalid foreign-procedure
+          ;; argument" on the sentinel. Plenty of C treats NULL as a real
+          ;; argument (setlocale queries, rlLoadShaderCode's default vertex
+          ;; shader), and binding those as :pointer to get NULL through loses
+          ;; the string marshaling on that parameter.
           native-args
           (mapv (fn [i param]
-                  (if-let [entry (get aggregate-by-index i)]
-                    (pointer-check param (:name entry) "aggregate")
-                    param))
+                  (cond
+                    (get aggregate-by-index i)
+                    (pointer-check param (:name (get aggregate-by-index i)) "aggregate")
+
+                    (= "string" (nth types i))
+                    (str "(jolt-ffi-string-arg " param ")")
+
+                    :else param))
                 (range n) params)
           native-destination (when ret-aggregate?
                                (pointer-check return-param return-name "return destination"))
@@ -1314,7 +1326,13 @@
           call-args (if ret-aggregate? (into [native-destination] native-args) native-args)
           call (str "(" proc
                     (when (seq call-args) (str " " (str/join " " call-args))) ")")
-          body (if ret-aggregate? (str "(begin " call " " return-param ")") call)
+          ;; The return direction is the same boundary: Chez hands back #f for a
+          ;; NULL char*, which is Scheme's false, not jolt's nil. getenv of an
+          ;; unset name returned false to Clojure before this.
+          body (cond
+                 ret-aggregate? (str "(begin " call " " return-param ")")
+                 (= "string" (:rettype node)) (str "(jolt-ffi-string-ret " call ")")
+                 :else call)
           binding (str "(let ((p #f)) (lambda (" (str/join " " wrapper-params) ") " body "))")]
       (if (or (seq aggregates) ret-aggregate?)
         (str "(let () "
