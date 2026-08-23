@@ -1040,6 +1040,24 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.host's libc timezone probe must not leave TZ set. It is process global,
+# and the capability check at boot ends on "UTC", so an unrestored write left
+# every jolt process answering UTC from localtime() while the machine was
+# somewhere else. Self-checks, one marker; same capture rules as the gates above.
+tzprobe_out="$($jolt run test/chez/jolt-tz-probe-test.clj 2>&1)"
+if printf '%s' "$tzprobe_out" | grep -q 'JOLT-TZ-PROBE-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.host tz probe"
+  if printf '%s\n' "$tzprobe_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$tzprobe_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$tzprobe_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$tzprobe_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # jolt.ffi :string <-> NULL. Chez's `string` type carries NULL as #f in both
 # directions; these gates prove jolt's nil translates to it and back, so a C
 # API where NULL is a real argument (setlocale) or a real result (getenv of an
