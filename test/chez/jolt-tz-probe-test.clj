@@ -29,10 +29,8 @@
 (ffi/defcfn c-localtime "localtime" [:pointer] :pointer)
 (ffi/defcfn c-gmtime "gmtime" [:pointer] :pointer)
 
-(defn- hour-of [f]
-  (let [b (ffi/alloc 8)]
-    (try (c-time b) (ffi/read (f b) :int 8)     ; tm_hour is the third int
-         (finally (ffi/free b)))))
+(defn- hour-of [f epoch-buf]
+  (ffi/read (f epoch-buf) :int 8))     ; tm_hour is the third int
 
 ;; The boot-time capability probe has already run by the time this loads, so an
 ;; unrestored TZ would be observable right here.
@@ -55,12 +53,16 @@
 ;; The end-to-end symptom: with the system zone in effect, localtime and gmtime
 ;; agree only if the machine really is on UTC. On a UTC machine this check cannot
 ;; discriminate, so it is skipped there rather than asserted as a pass.
-(let [local (hour-of c-localtime)
-      utc   (hour-of c-gmtime)
-      sys-tz (c-getenv "TZ")]
-  (if (= local utc)
-    (println (str "  .. (skipped: this machine's local time IS UTC, TZ=" (pr-str sys-tz) ")"))
-    (check-eq "localtime is not silently gmtime" (= local utc) false)))
+(let [b (ffi/alloc 8)]
+  (try
+    (c-time b)                          ; one shared epoch for both calls below
+    (let [local  (hour-of c-localtime b)
+          utc    (hour-of c-gmtime b)
+          sys-tz (c-getenv "TZ")]
+      (if (= local utc)
+        (println (str "  .. (skipped: this machine's local time IS UTC, TZ=" (pr-str sys-tz) ")"))
+        (check-eq "localtime is not silently gmtime" (= local utc) false)))
+    (finally (ffi/free b))))
 
 (if (empty? @failures)
   (println "JOLT-TZ-PROBE-TEST OK")

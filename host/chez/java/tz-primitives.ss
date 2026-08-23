@@ -29,8 +29,12 @@
        (guard (e (#t #f))
          (let ((r (tzp-setlocale tzp-LC_TIME "en_US.UTF-8"))) (and r (not (eq? r 0)))))))
 
-;; FFI symbols present? (setenv is POSIX-only, so this is #f on Windows).
-(define tzp-tz-symbols? (and tzp-setenv tzp-tzset tzp-localtime))
+;; FFI symbols present? (setenv/getenv/unsetenv are POSIX-only, so this is #f on
+;; Windows). getenv and unsetenv are required here too: tzp-offset-raw needs both
+;; to save/restore TZ around its write, and without that guarantee a resolve
+;; failure on either would silently reintroduce the TZ leak this file exists to
+;; prevent, rather than falling back to the DST-table backend.
+(define tzp-tz-symbols? (and tzp-setenv tzp-tzset tzp-localtime tzp-getenv tzp-unsetenv))
 
 ;; zone offset in seconds east of UTC at an epoch-second instant, via libc.
 ;; struct tm layout (64-bit): 9 ints(36) + pad(4) + long tm_gmtoff at byte 40.
@@ -52,13 +56,13 @@
 (define (tzp-restore-tz! saved)
   (if saved
       (tzp-setenv "TZ" saved 1)
-      (and tzp-unsetenv (tzp-unsetenv "TZ")))
+      (tzp-unsetenv "TZ"))
   (tzp-tzset))
 
 (define (tzp-offset-raw zone epoch)
   (and tzp-tz-symbols?
        (jolt-with-mutex tzp-mutex
-         (let ((saved (and tzp-getenv (tzp-getenv "TZ"))))
+         (let ((saved (tzp-getenv "TZ")))
            (dynamic-wind
              (lambda ()
                (tzp-setenv "TZ" zone 1)
