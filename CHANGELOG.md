@@ -2788,6 +2788,12 @@ call. Memoizing the probe by `(zone, instant)` undoes it: a repeated
 
 ### Fixed
 
+- **Dependency roots preserve absolute Windows paths.** `:local/root` and cache
+  paths with drive, UNC, device, or root-relative spellings are no longer
+  prefixed with Jolt's launch directory, and both `/` and `\` are accepted as
+  Windows separators. Ambiguous drive-relative paths such as `C:project` now
+  fail with a targeted error that asks for a drive-absolute path.
+
 - **`jolt.ffi` `:string` carries NULL in both directions.** Chez's `string`
   foreign type already spells NULL as `#f`, but jolt's own nil is a separate
   sentinel, so the boundary leaked Scheme: passing `nil` to a `:string`
