@@ -154,5 +154,62 @@
   (ok ":blocking emits the collect-safe scoped branch"
       (contains-str? e "(foreign-procedure __collect_safe a")))
 
+;; --- :string <-> NULL on a CALLBACK -----------------------------------------
+;; A foreign-fn carries NULL across a :string position in both directions
+;; (test/chez/jolt-ffi-string-null-test.clj). A foreign-callable is the same
+;; boundary with C as the caller, so the two directions swap: the null char* C
+;; passes IN must arrive as nil, and a jolt fn returning nil must leave as a
+;; null char*. Untranslated, the first arrived as #f (jolt FALSE, not nil) and
+;; the second RAISED "invalid return value" — so a callback could neither model
+;; an optional string argument nor decline to answer one, which is ordinary in
+;; any C API that hands a callback a nullable path, name or error.
+;;
+;; No C witness is needed to drive it: a foreign-callable's entry point is an
+;; address and Chez takes an address in the entry position, so the test calls
+;; the callback exactly the way C does.
+(ev "(def cb-seen (atom :unset))")
+(ev "(def cb-str (jolt.ffi/__ccallable
+                   (fn [s] (reset! cb-seen s) (if (nil? s) nil (str s \"!\")))
+                   [:string] :string))")
+(let ((call-cb (foreign-procedure (jnum->exact (var-deref "user" "cb-str")) (string) string)))
+  ;; C hands in NULL: the jolt fn must see nil (the atom starts at :unset, so a
+  ;; callback that never ran would not read as nil either).
+  (let ((returned (call-cb #f)))
+    (ok "callback :string argument of NULL arrives as nil"
+        (jolt-nil? (jolt-deref (var-deref "user" "cb-seen"))))
+    ;; and the nil it returns leaves as a null char*, which Chez reads back as #f
+    (ok "callback :string result of nil leaves as NULL"
+        (eq? returned #f)))
+  ;; the ordinary direction is untouched on both halves
+  (let ((returned (call-cb "hi")))
+    (ok "callback :string argument of a real char* arrives as a string"
+        (equal? "hi" (jolt-deref (var-deref "user" "cb-seen"))))
+    (ok "callback :string result of a real string still marshals"
+        (equal? "hi!" returned))))
+(ev "(jolt.ffi/free-callable cb-str)")
+
+;; The conversions are emitted ONLY where the signature says :string, so every
+;; other binding and callable is emitted byte-identically to before they
+;; existed — that is what keeps this off the hot path of the FFI's scalar and
+;; pointer bindings, and it is the property that regresses silently.
+(let ((scalar-fn (emitted-for "(jolt.ffi/__cfn \"abs\" [:int] :int)"))
+      (string-fn (emitted-for "(jolt.ffi/__cfn \"getenv\" [:string] :string)"))
+      (scalar-cb (emitted-for "(jolt.ffi/__ccallable identity [:int] :int)"))
+      (string-cb (emitted-for "(jolt.ffi/__ccallable identity [:string] :string)")))
+  (ok "a foreign-fn without :string emits no string conversion"
+      (and (not (contains-str? scalar-fn "jolt-ffi-string->c"))
+           (not (contains-str? scalar-fn "jolt-ffi-c->string"))))
+  (ok "a foreign-fn with :string converts out on the arg and in on the result"
+      (and (contains-str? string-fn "jolt-ffi-string->c")
+           (contains-str? string-fn "jolt-ffi-c->string")))
+  (ok "a callable without :string emits no wrapper lambda"
+      (and (not (contains-str? scalar-cb "jolt-ffi-string->c"))
+           (not (contains-str? scalar-cb "jolt-ffi-c->string"))))
+  ;; the callable's directions are the MIRROR of the foreign-fn's: c->string on
+  ;; the argument, string->c on the result
+  (ok "a callable with :string converts in on the arg and out on the result"
+      (and (contains-str? string-cb "jolt-ffi-c->string")
+           (contains-str? string-cb "jolt-ffi-string->c"))))
+
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))
