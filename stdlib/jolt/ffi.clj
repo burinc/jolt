@@ -19,6 +19,11 @@
   unsigned names at one width expose the same stored bits; wire byte order stays
   an explicit codec or htons/ntohs concern.
 
+  :string carries NULL as nil in both directions: nil as an argument reaches C
+  as a null char*, which is how APIs like setlocale spell \"query instead of
+  set\", and a function returning NULL reads as nil. ffi/null stays the
+  :pointer spelling of NULL and is unchanged.
+
   A struct passed or returned by value uses the same literal descriptor as
   layout, wrapped in [:by-value descriptor]. An argument value is a non-null
   caller-owned pointer to the struct bytes. An aggregate-returning callable takes

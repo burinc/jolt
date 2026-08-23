@@ -1040,6 +1040,24 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.ffi :string <-> NULL. Chez's `string` type carries NULL as #f in both
+# directions; these gates prove jolt's nil translates to it and back, so a C
+# API where NULL is a real argument (setlocale) or a real result (getenv of an
+# unset name) reads as nil in Clojure rather than raising or answering false.
+strnull_out="$($jolt run test/chez/jolt-ffi-string-null-test.clj 2>&1)"
+if printf '%s' "$strnull_out" | grep -q 'JOLT-FFI-STRING-NULL-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.ffi :string NULL"
+  if printf '%s\n' "$strnull_out" | grep -q '^FAIL'; then
+    printf '%s\n' "$strnull_out" | grep '^FAIL' | head -5 | sed 's/^/    /'
+  elif [ -n "$strnull_out" ]; then
+    echo "    (no verdict; last check reached was:)"
+    printf '%s\n' "$strnull_out" | tail -3 | sed 's/^/    /'
+  fi
+  fails=$((fails + 1))
+fi
+
 # InputStream's fuller surface: readNBytes (both arities), transferTo, and
 # mark/reset that actually mark. Every value checked against JVM Clojure,
 # including the edges the JVM is specific about — readNBytes clamps to what

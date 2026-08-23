@@ -175,6 +175,16 @@
       ((string=? n "char") 'char)
       (else (error #f (string-append "jolt.ffi: unknown foreign type :" n))))))
 
+;; --- :string <-> NULL ---------------------------------------------------------
+;; Chez's `string` foreign type already carries NULL in both directions, spelled
+;; #f: passing #f sends a null char*, and a C function returning NULL comes back
+;; as #f. jolt's own nil is a distinct sentinel, so without these two the boundary
+;; leaks Scheme: passing nil raised "invalid foreign-procedure argument
+;; #[jolt-nil-v1]", and a NULL return surfaced in Clojure as false rather than nil.
+;; The backend wraps every :string argument and :string return with these.
+(define (jolt-ffi-string-arg x) (if (jolt-nil? x) #f x))
+(define (jolt-ffi-string-ret x) (if x x jolt-nil))
+
 ;; --- foreign memory ----------------------------------------------------------
 ;; alloc returns a pointer (integer address). The caller frees it. read/write take
 ;; a type keyword and an optional byte offset.

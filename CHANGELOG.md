@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`jolt.ffi` `:string` carries NULL in both directions.** Chez's `string`
+  foreign type already spells NULL as `#f`, but jolt's own nil is a separate
+  sentinel, so the boundary leaked Scheme: passing `nil` to a `:string`
+  parameter raised `invalid foreign-procedure argument #[jolt-nil-v1]`, and a C
+  function returning NULL answered `false` rather than `nil`. Both directions
+  now translate, so `(c-setlocale 0 nil)` queries the locale the way the C API
+  intends and `(c-getenv "UNSET")` reads as `nil`.
+
+  This matters for the large amount of C where NULL is a real argument rather
+  than an error — `setlocale` queries with it, raylib's `rlLoadShaderCode` takes
+  it to mean "use the default vertex shader". Binding such a parameter as
+  `:pointer` to get `ffi/null` through worked, but gave up string marshaling on
+  that argument and left two parameters of the same C type carrying different
+  jolt types for no visible reason. `ffi/null` is unchanged and remains the
+  `:pointer` spelling of NULL.
+
 ## [0.7.23] - 2026-08-22
 
 Interop reach. The FFI can describe C structs instead of counting byte offsets:
