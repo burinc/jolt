@@ -181,9 +181,15 @@
 ;; as #f. jolt's own nil is a distinct sentinel, so without these two the boundary
 ;; leaks Scheme: passing nil raised "invalid foreign-procedure argument
 ;; #[jolt-nil-v1]", and a NULL return surfaced in Clojure as false rather than nil.
-;; The backend wraps every :string argument and :string return with these.
-(define (jolt-ffi-string-arg x) (if (jolt-nil? x) #f x))
-(define (jolt-ffi-string-ret x) (if x x jolt-nil))
+;;
+;; Named for the direction of the CONVERSION, not for the position it sits on,
+;; because the two forms invert each other. A foreign-fn calls out to C, so its
+;; :string arguments convert jolt->c and its :string result converts c->jolt. A
+;; foreign-callable is called BY C, so the roles swap: its :string arguments
+;; convert c->jolt and its :string result converts jolt->c. Position-relative
+;; names ("arg"/"ret") read backwards on one of the two.
+(define (jolt-ffi-string->c x) (if (jolt-nil? x) #f x))
+(define (jolt-ffi-c->string x) (if x x jolt-nil))
 
 ;; --- foreign memory ----------------------------------------------------------
 ;; alloc returns a pointer (integer address). The caller frees it. read/write take

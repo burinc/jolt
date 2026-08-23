@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   jolt types for no visible reason. `ffi/null` is unchanged and remains the
   `:pointer` spelling of NULL.
 
+  The same translation now covers `foreign-callable`, where C is the caller and
+  so the two directions swap: a null `char*` C passes into a `:string` argument
+  arrives as `nil` instead of `false`, and a callback returning `nil` from a
+  `:string` hands C a null `char*` instead of raising `invalid return value`.
+  Until this a callback could neither model a nullable string argument nor
+  decline to answer one, which is ordinary in any C API that hands a callback an
+  optional path, name or error.
+
 ## [0.7.23] - 2026-08-22
 
 Interop reach. The FFI can describe C structs instead of counting byte offsets:

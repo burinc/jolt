@@ -22,7 +22,9 @@
   :string carries NULL as nil in both directions: nil as an argument reaches C
   as a null char*, which is how APIs like setlocale spell \"query instead of
   set\", and a function returning NULL reads as nil. ffi/null stays the
-  :pointer spelling of NULL and is unchanged.
+  :pointer spelling of NULL and is unchanged. A foreign-callable gets the same
+  translation with the directions swapped, since C is the caller there: a null
+  char* C passes in arrives as nil, and returning nil hands C a null char*.
 
   A struct passed or returned by value uses the same literal descriptor as
   layout, wrapped in [:by-value descriptor]. An argument value is a non-null

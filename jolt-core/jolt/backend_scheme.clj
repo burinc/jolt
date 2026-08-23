@@ -1301,7 +1301,7 @@
                     (pointer-check param (:name (get aggregate-by-index i)) "aggregate")
 
                     (= "string" (nth types i))
-                    (str "(jolt-ffi-string-arg " param ")")
+                    (str "(jolt-ffi-string->c " param ")")
 
                     :else param))
                 (range n) params)
@@ -1331,7 +1331,7 @@
           ;; unset name returned false to Clojure before this.
           body (cond
                  ret-aggregate? (str "(begin " call " " return-param ")")
-                 (= "string" (:rettype node)) (str "(jolt-ffi-string-ret " call ")")
+                 (= "string" (:rettype node)) (str "(jolt-ffi-c->string " call ")")
                  :else call)
           binding (str "(let ((p #f)) (lambda (" (str/join " " wrapper-params) ") " body "))")]
       (if (or (seq aggregates) ret-aggregate?)
@@ -1354,12 +1354,43 @@
 ;; expression evaluates to the entry-point address — a jolt pointer the caller
 ;; hands to C. :collect-safe emits the convention that reactivates the thread on
 ;; entry, for callbacks invoked while it is parked in a :blocking foreign call.
+;;
+;; A :string position on a callback needs the same NULL translation a foreign-fn
+;; gets, with the two directions swapped: C is the CALLER here, so a :string
+;; argument converts c->jolt (a null char* arrived as #f, which is jolt false,
+;; not nil) and a :string result converts jolt->c (returning nil raised "invalid
+;; return value" instead of handing C a null char*). Callbacks are where a C API
+;; hands back an optional string — a null path, name or error is ordinary — so
+;; the callback could not model the argument at all, and could not decline to
+;; answer one.
+;;
+;; The wrapper lambda is emitted only when the signature actually mentions
+;; :string; every other callable reaches sa-foreign-callable exactly as before.
 (defn- emit-ffi-callable [node]
-  (str "(jolt-ffi-register-callable! ("
-       (if (:collect-safe node) "sa-foreign-callable-collect-safe " "sa-foreign-callable ")
-       (emit (:fn node))
-       " (" (str/join " " (map ffi-type->chez (:argtypes node))) ") "
-       (ffi-type->chez (:rettype node)) "))"))
+  (let [argtypes (:argtypes node)
+        rettype (:rettype node)
+        string-position? (or (= "string" rettype) (some #(= "string" %) argtypes))
+        target
+        (if-not string-position?
+          (emit (:fn node))
+          ;; The fn is bound to a fresh name rather than inlined into the lambda
+          ;; body so it is evaluated once, at callable-construction time, not on
+          ;; every call C makes through the entry point.
+          (let [fname (fresh-label "jolt_ffi_cb")
+                params (mapv (fn [i] (str "a" i)) (range (count argtypes)))
+                args (mapv (fn [param type]
+                             (if (= "string" type) (str "(jolt-ffi-c->string " param ")") param))
+                           params argtypes)
+                invoke (str "(" fname (when (seq args) (str " " (str/join " " args))) ")")]
+            (str "(let ((" fname " " (emit (:fn node)) ")) "
+                 "(lambda (" (str/join " " params) ") "
+                 (if (= "string" rettype) (str "(jolt-ffi-string->c " invoke ")") invoke)
+                 "))")))]
+    (str "(jolt-ffi-register-callable! ("
+         (if (:collect-safe node) "sa-foreign-callable-collect-safe " "sa-foreign-callable ")
+         target
+         " (" (str/join " " (map ffi-type->chez argtypes)) ") "
+         (ffi-type->chez rettype) "))")))
 
 (defn- emit-recur [node]
   (when-not *recur-target* (throw (ex-info "emit: recur outside a loop/fn target" {})))
