@@ -19,6 +19,8 @@
 (define tzp-setlocale (jolt-foreign-proc-safe "setlocale" '(int string) 'void*))
 (define tzp-strftime  (jolt-foreign-proc-safe "strftime"  '(u8* size_t string void*) 'size_t))
 (define tzp-setenv    (jolt-foreign-proc-safe "setenv"    '(string string int) 'int))
+(define tzp-unsetenv  (jolt-foreign-proc-safe "unsetenv"  '(string) 'int))
+(define tzp-getenv    (jolt-foreign-proc-safe "getenv"    '(string) 'string))
 (define tzp-tzset     (jolt-foreign-proc-safe "tzset"     '() 'void))
 (define tzp-localtime (jolt-foreign-proc-safe "localtime" '(void*) 'void*))
 
@@ -33,16 +35,41 @@
 ;; zone offset in seconds east of UTC at an epoch-second instant, via libc.
 ;; struct tm layout (64-bit): 9 ints(36) + pad(4) + long tm_gmtoff at byte 40.
 ;; localtime returns a STATIC buffer — do NOT foreign-free it.
+;; TZ is process-global, so it is saved and restored around the write. Without
+;; that, this leaves the process in whichever zone it last probed: the capability
+;; check below ends on "UTC", so every jolt process was left in UTC and any later
+;; localtime() — jolt's own, or a user's through jolt.ffi — answered UTC while
+;; the machine was somewhere else. getenv returns #f when TZ was unset, which is
+;; the common case and restores with unsetenv rather than an empty TZ (an empty
+;; TZ means UTC, not "unset").
+;;
+;; Chez's `string` return copies the char* into a Scheme string, so `saved`
+;; survives the setenv that immediately follows it; a raw pointer into environ
+;; would not.
+;;
+;; dynamic-wind rather than straight-line code so a throw between the two cannot
+;; leave TZ clobbered — the same shape jolt-with-mutex itself uses.
+(define (tzp-restore-tz! saved)
+  (if saved
+      (tzp-setenv "TZ" saved 1)
+      (and tzp-unsetenv (tzp-unsetenv "TZ")))
+  (tzp-tzset))
+
 (define (tzp-offset-raw zone epoch)
   (and tzp-tz-symbols?
        (jolt-with-mutex tzp-mutex
-         (tzp-setenv "TZ" zone 1)
-         (tzp-tzset)
-         (let ((tp (sa-foreign-alloc 8)))
-           (sa-foreign-set! 'long tp 0 epoch)
-           (let ((tm (tzp-localtime tp)))
-             (sa-foreign-free tp)
-             (and tm (not (eq? tm 0)) (sa-foreign-ref 'long tm 40)))))))
+         (let ((saved (and tzp-getenv (tzp-getenv "TZ"))))
+           (dynamic-wind
+             (lambda ()
+               (tzp-setenv "TZ" zone 1)
+               (tzp-tzset))
+             (lambda ()
+               (let ((tp (sa-foreign-alloc 8)))
+                 (sa-foreign-set! 'long tp 0 epoch)
+                 (let ((tm (tzp-localtime tp)))
+                   (sa-foreign-free tp)
+                   (and tm (not (eq? tm 0)) (sa-foreign-ref 'long tm 40)))))
+             (lambda () (tzp-restore-tz! saved)))))))
 
 ;; Capability probe: trust libc only if it returns known-correct offsets for known
 ;; zones/instants. Rejects Windows (garbage tm_gmtoff) and missing tzdata.
