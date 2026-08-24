@@ -37,7 +37,27 @@
             (jns-name bv)
             (chez-current-ns-param)))
       (chez-current-ns-param)))
-(define (set-chez-ns! ns) (chez-current-ns-param ns))
+;; The WRITE half of the same seam, and it has to target whatever the read half
+;; would consult or the two disagree: chez-current-ns prefers a live (binding
+;; [*ns* ..]) over the parameter, so writing only the parameter under such a
+;; binding is a write that no read can see. JVM parity too — (set! *ns* ..) is
+;; Var.set, which writes the innermost thread binding and leaves the root alone,
+;; so the binding frame popping still restores the ns that was current before it.
+;;
+;; What the asymmetry cost: ldr-load-body saves the current ns and restores it on
+;; the way out so a loaded file's ns form cannot leak past its own load. Under a
+;; *ns* binding that restore silently did nothing, so a nested require left *ns*
+;; pointing at the LAST file it finished — every def after the require in the
+;; requiring file interned into the wrong namespace.
+;;
+;; Bootstrap-safe by the same star-ns-cell test chez-current-ns uses: it is #f
+;; until dyn-binding.ss captures the cell, and the boot writes just set the
+;; parameter.
+(define (set-chez-ns! ns)
+  (let ((p (and star-ns-cell (dyn-find-binding star-ns-cell))))
+    (if p
+        (set-cdr! p (intern-ns! ns))
+        (chez-current-ns-param ns))))
 
 (define-record-type jolt-multifn
   (fields name dispatch-fn methods default hierarchy prefers

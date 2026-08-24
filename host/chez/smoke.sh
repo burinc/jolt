@@ -1292,7 +1292,9 @@ fi
 
 # Loader: require :reload / :reload-all, failed-load rollback, a data-reader fn
 # whose var resolves surfaces a throw (not silently degraded), the LIST-libspec
-# superset (use '(ns :only [x])), and the prefix-list form ((require '(pfx [c :as s]))).
+# superset (use '(ns :only [x])), the prefix-list form ((require '(pfx [c :as s])))
+# and that a require fired under a (binding [*ns* ..]) still interns each loaded
+# file's defs into its own namespace.
 # The fixture writes its own scratch ns files under a temp dir and requires them.
 loader_out="$($jolt run test/chez/loader-test.clj 2>/dev/null)"
 if printf '%s' "$loader_out" | grep -q 'LOADER OK'; then
