@@ -216,6 +216,9 @@ call. Memoizing the probe by `(zone, instant)` undoes it: a repeated
 `jolt.host/tz-offset-seconds` lookup drops from ~1.7ms to ~100ns, and
 `jolt-lang/time`'s zone-aware `now` speeds up by roughly 100x.
 
+Also here: a binary no longer exports the Chez kernel's own ncurses, which was
+enough to stop any FFI binding of a real ncurses from opening a terminal.
+
 ### Fixed
 
 - **`jolt.ffi` `:string` carries NULL in both directions.** Chez's `string`
@@ -241,6 +244,32 @@ call. Memoizing the probe by `(zone, instant)` undoes it: a repeated
   Until this a callback could neither model a nullable string argument nor
   decline to answer one, which is ordinary in any C API that hands a callback an
   optional path, name or error.
+
+- **The kernel's ncurses is no longer exported from the executable.** Chez's
+  expression editor links ncurses and terminfo, and `-rdynamic` — which a built
+  binary needs, so a statically linked native resolves through
+  `(load-shared-object #f)` — put all of it in the dynamic symbol table: 77
+  `_nc_*` internals plus `setupterm`, `tigetnum`, `raw`, `cbreak`, `curs_set`,
+  `keypad`, `notimeout`, `wtimeout`, and globals including `cur_term`. The
+  executable is searched before any `dlopen`'d library, so a program that bound
+  a real ncurses through the FFI had that library's own internal calls bound
+  back into the kernel's copy:
+
+  ```
+  binding file /lib/x86_64-linux-gnu/libncursesw.so.6 [0] to jolt [0]:
+      normal symbol `_nc_setupterm' [NCURSES6_TINFO_5.5.20051010]
+  ```
+
+  The kernel's copy predates ncurses 6.1, so it reads a terminfo entry with a
+  4096-byte buffer and cannot parse the 32-bit number format that any entry
+  carrying a value above 32767 is stored in — `xterm-256color`, whose
+  `max_pairs` is 65536, for one. `initscr` then failed with "Error opening
+  terminal" on a terminal that works everywhere else; where the entry was in the
+  legacy format the old code parsed it instead and filled `cur_term` with a
+  pre-6.1 `TERMINAL` layout that the newer library then read with its own, which
+  segfaults. Linking with `--exclude-libs` marks those archives' symbols local,
+  which is enough: Chez calls them internally, and internal linkage does not go
+  through the dynamic symbol table, so the expression editor is unaffected.
 
 ### Performance
 
