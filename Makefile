@@ -127,7 +127,7 @@ CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscali
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
-  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer threadsafety
+  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -272,6 +272,12 @@ fibers:
 # cleared before an idle wait forked a second immortal timer per call.
 asynctimer:
 	@$(CHEZ) --script test/chez/async-timer-test.ss
+
+# A nested run-interruptible extent restores the enclosing polling timer after
+# normal return, exception, or interruption, without sharing ownership between
+# application threads.
+interruptnest:
+	@$(CHEZ) --script test/chez/interrupt-nesting-test.ss
 
 # The dynamic-var binding stack (jolt-3bo): lookup cost against binding DEPTH and
 # against the number of vars in one frame, push/pop throughput, and the two

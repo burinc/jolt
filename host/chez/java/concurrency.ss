@@ -1180,12 +1180,23 @@
 (define (jolt-make-interrupt) (box #f))
 (define (jolt-interrupt! token) (when (box? token) (set-box! token #t)) jolt-nil)
 (define (jolt-interrupted? token) (and (box? token) (unbox token) #t))
+;; Active timer borrows form a dynamic stack per application thread. Chez child
+;; threads inherit thread-parameter values, so owner-tag it: an inherited stack
+;; is empty in the child and cannot make the child poll a parent's token.
+(define interrupt-poll-stack (make-thread-parameter (cons #f '())))
+(define (current-interrupt-poll-stack)
+  (let ((state (interrupt-poll-stack)) (owner (get-thread-id)))
+    (if (and (pair? state) (eqv? (car state) owner)) (cdr state) '())))
 (define (jolt-run-interruptible token thunk)
   ;; Captured ONCE, outside the wind: a before-thunk that re-read it would, on a
   ;; resume, save the handler the SCHEDULER had put back and restore that on the
   ;; real exit — the borrow would hand the carrier its own handler a second time
   ;; and lose whatever an enclosing borrow had installed.
   (let* ((prev-handler (timer-interrupt-handler))
+         ;; Captured once, like prev-handler. On a real off-fiber exit from a
+         ;; nested borrow the restored outer handler needs a fresh poll tick.
+         (owner (get-thread-id))
+         (outer-stack (current-interrupt-poll-stack))
          ;; --- handing the quantum back DURING the borrow (jolt-449m) -----------
          ;; jolt-ly62 stopped the borrow outliving itself. What was still open is
          ;; the extent of the borrow: the handler below answered a quantum by
@@ -1220,8 +1231,8 @@
                 (dynamic-wind
                   (lambda ()
                     (set! borrowed 0)
-                    (timer-interrupt-handler
-                      (lambda ()
+                    (let ((handler
+                           (lambda ()
                         (cond
                           ((and (box? token) (unbox token)) (k interrupt-sentinel))
                           (else
@@ -1243,12 +1254,15 @@
                              ;; nothing AND does not re-arm, so calling it there
                              ;; would leave the borrow with no timer and stop the
                              ;; interrupt from ever being noticed.
-                             ((and (jolt-current-fiber)
-                                   (fx>=? borrowed (jolt-fiber-preempt-ticks)))
-                              (set! borrowed 0)
-                              (jolt-fiber-preempt-handler))
-                             (else (arm!) (void)))))))
-                    (arm!))
+                              ((and (jolt-current-fiber)
+                                    (fx>=? borrowed (jolt-fiber-preempt-ticks)))
+                               (set! borrowed 0)
+                               (jolt-fiber-preempt-handler))
+                              (else (arm!) (void))))))))
+                      ;; Push is the timer-frame ownership linearization point.
+                      (interrupt-poll-stack (cons owner (cons handler outer-stack)))
+                      (timer-interrupt-handler handler)
+                      (arm!)))
                   (lambda () (thunk))
                   ;; Runs on every way out of the body, the park included. Disarm
                   ;; BEFORE restoring the handler: the other order leaves a window
@@ -1256,12 +1270,21 @@
                   ;; handler, which answers it by preempting.
                   (lambda ()
                     (set-timer 0)
+                    ;; Pop before restoring the enclosing handler. Every terminal
+                    ;; path (return, throw, interrupt, and park unwind) comes here.
+                    (interrupt-poll-stack (cons owner outer-stack))
                     (timer-interrupt-handler prev-handler)
                     ;; Off a fiber, and on a park (the current-fiber vreg is
                     ;; already cleared by then), this is a plain disarm — which is
                     ;; what the scheduler wants for the carrier it is about to take
                     ;; back. On a real exit from a fiber it re-arms the quantum.
-                    (jolt-fiber-rearm-preempt!)))))))
+                    ;; On a park, enclosing winds immediately disarm this tick;
+                    ;; on a real off-fiber nested exit it keeps the outer token
+                    ;; polling. Fiber exits retain the scheduler rearm behavior.
+                    (cond
+                      ((jolt-current-fiber) (jolt-fiber-rearm-preempt!))
+                      ((pair? outer-stack) (set-timer interrupt-check-ticks))
+                      (else (jolt-fiber-rearm-preempt!)))))))))
     (if (eq? r interrupt-sentinel)
         (jolt-throw (jolt-ex-info "Evaluation interrupted" (jolt-hash-map jolt-kw-interrupted #t)))
         r)))
