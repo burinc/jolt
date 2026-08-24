@@ -33,6 +33,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decline to answer one, which is ordinary in any C API that hands a callback an
   optional path, name or error.
 
+### Performance
+
+- **The libc timezone probe is memoized.** Restoring `TZ` after every lookup
+  fixed a real leak, but it meant libc reloaded zone data twice on every
+  call instead of reusing what the leaked `TZ` had already loaded, making
+  `jolt.host/tz-offset-seconds` on a repeated `(zone, instant)` pair about
+  1000x slower than the leaky version it replaced. The offset of a zone at
+  an instant is a pure function of the two, so it is now cached on that
+  pair: a repeated lookup answers in low microseconds instead of over a
+  millisecond, and `jolt-lang/time`'s `ZonedDateTime/now` is roughly 100x
+  faster for it. A live instant, whose epoch is new on every call, still
+  pays the full probe.
+
 ## [0.7.23] - 2026-08-22
 
 Interop reach. The FFI can describe C structs instead of counting byte offsets:
