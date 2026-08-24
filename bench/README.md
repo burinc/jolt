@@ -46,39 +46,50 @@ absolute reference.
 under 1.0× means jolt is faster**. Two build modes: **opt** is
 `jolt build --direct-link --opt`, **release** is a plain `jolt build` (what a
 default build ships). Times are the mean of 3 runs after warmup, in ms. Every
-row below is from ONE `MODE_A=1 bench/run.sh` on one machine (M-series) in one
-sitting, which is the only way the ratios mean anything.
+row below is from ONE `MODE_A=1 bench/run.sh` on one machine in one sitting,
+which is the only way the ratios mean anything.
+
+Refreshed 2026-08-24 on an x86_64 Linux host (Intel i5-4278U, 4 threads,
+OpenJDK 21.0.11, Chez 10.4.1) — a weaker, older machine than the Apple Silicon
+host the previous table was measured on. This is a full same-sitting re-run,
+not a patch of individual rows, so it supersedes the old table wholesale
+rather than being diffed against it: absolute ms are not comparable across the
+two machines, and several ratios shift with them (`collections` and
+`arrays` most visibly) because JVM warmup/JIT and GC behavior do not scale
+identically with the reference figures. Treat this table as internally
+consistent with itself and with the release-mode column beside it, the same
+caveat the test.check table below already carries across its own refreshes.
 
 | Benchmark | vs JVM | vs JVM (release) | jolt (ms) | JVM (ms) | Axis |
 |---|---:|---:|---:|---:|---|
-| `vecops` | **0.3×** | 0.3× | 5.1 | 15.9 | vector concat + slice (beats the JVM) |
-| `tak` | **0.3×** | 0.3× | 7.0 | 20.4 | deep three-way self-recursion + integer arith (beats the JVM) |
-| `dispatch` | **1.1×** | 1.1× | 64.6 | 58.3 | megamorphic protocol dispatch |
-| `fib` | **1.3×** | 1.3× | 9.2 | 7.2 | recursion: call + integer arith |
-| `mathfns` | **1.5×** | 1.6× | 24.3 | 16.5 | transcendental math (`Math` sqrt/sin/cos/log/pow/atan2) |
-| `collections` | **1.8×** | 1.8× | 20.7 | 11.3 | persistent map/vector churn |
-| `loop-recur` | **1.8×** | 1.7× | 31.5 | 17.9 | tight loop/recur + per-iteration integer arith |
-| `binary-trees` | **1.8×** | 1.8× | 76.0 | 42.7 | escaping short-lived records (allocation/GC) |
-| `mandelbrot` | **1.9×** | 1.8× | 23.7 | 12.8 | pure float compute |
-| `mono-dispatch` | **2.5×** | 2.5× | 34.7 | 13.9 | monomorphic protocol dispatch |
-| `nth-access` | **2.6×** | 2.7× | 64.6 | 24.4 | `nth` on a vector, small and large |
-| `seqs` | **2.6×** | 2.7× | 384.5 | 145.3 | lazy-seq + HOF pipelines |
-| `hash-eq` | **3.7×** | 3.7× | 678.0 | 183.0 | composite-value hashing + collection `=` |
-| `transducers` | **3.9×** | 3.9× | 134.4 | 34.5 | transducer pipelines |
-| `transients` | **3.9×** | 3.8× | 242.0 | 62.0 | transient map/set bulk build |
-| `string-build` | **5.4×** | 5.5× | 210.0 | 39.0 | `StringBuilder` assembly + `join` |
-| `keyed-lookup` | **5.7×** | 5.9× | 148.0 | 26.0 | scalar-key hashing + small-map lookup |
-| `arrays` | **6.4×** | 6.4× | 234.2 | 36.4 | primitive `double-array` throughput |
-| `string-ops` | **7.1×** | 7.3× | 519.0 | 73.0 | String/Keyword interop + `clojure.string` |
-| `literals` | **8.2×** | 9.0× | 204.0 | 25.0 | constant literals + boolean predicates, per call |
-| `sorted-access` | **11.4×** | 11.6× | 123.8 | 10.9 | shape-answered collection reads |
-| `char-scan` | **27.1×** | 26.9× | 352.0 | 13.0 | per-character `.charAt` + numeric casts |
+| `tak` | **0.2×** | 0.2× | 9.0 | 58.8 | deep three-way self-recursion + integer arith (beats the JVM) |
+| `vecops` | **0.3×** | 0.3× | 10.7 | 37.9 | vector concat + slice (beats the JVM) |
+| `collections` | **0.8×** | 0.8× | 36.2 | 45.3 | persistent map/vector churn (beats the JVM) |
+| `dispatch` | **1.2×** | 1.2× | 105.8 | 91.9 | megamorphic protocol dispatch |
+| `fib` | **1.2×** | 1.0× | 18.2 | 14.8 | recursion: call + integer arith |
+| `loop-recur` | **1.6×** | 1.6× | 73.5 | 47.1 | tight loop/recur + per-iteration integer arith |
+| `mathfns` | **1.7×** | 1.7× | 118.5 | 71.1 | transcendental math (`Math` sqrt/sin/cos/log/pow/atan2) |
+| `binary-trees` | **1.8×** | 1.7× | 158.0 | 87.6 | escaping short-lived records (allocation/GC) |
+| `mandelbrot` | **1.9×** | 1.8× | 38.3 | 19.7 | pure float compute |
+| `mono-dispatch` | **2.4×** | 2.4× | 68.0 | 28.4 | monomorphic protocol dispatch |
+| `nth-access` | **2.4×** | 2.5× | 110.8 | 45.3 | `nth` on a vector, small and large |
+| `seqs` | **2.5×** | 2.5× | 817.2 | 324.4 | lazy-seq + HOF pipelines |
+| `transducers` | **2.7×** | 2.8× | 261.9 | 98.2 | transducer pipelines |
+| `transients` | **3.0×** | 3.1× | 468.0 | 156.0 | transient map/set bulk build |
+| `hash-eq` | **3.7×** | 3.7× | 1386.0 | 379.0 | composite-value hashing + collection `=` |
+| `keyed-lookup` | **5.0×** | 5.1× | 318.0 | 63.0 | scalar-key hashing + small-map lookup |
+| `string-build` | **5.8×** | 6.0× | 429.0 | 74.0 | `StringBuilder` assembly + `join` |
+| `string-ops` | **7.2×** | 7.6× | 1097.0 | 153.0 | String/Keyword interop + `clojure.string` |
+| `sorted-access` | **7.7×** | 7.9× | 207.3 | 27.0 | shape-answered collection reads |
+| `arrays` | **9.2×** | 9.2× | 416.6 | 45.4 | primitive `double-array` throughput |
+| `literals` | **10.5×** | 10.9× | 429.0 | 41.0 | constant literals + boolean predicates, per call |
+| `char-scan` | **24.9×** | 24.9× | 647.0 | 26.0 | per-character `.charAt` + numeric casts |
 
 `opt` and `release` track each other closely across the whole suite — the plain
 `jolt build` picks up essentially all of the win. Every row is within 0.2 of a
-ratio point except `literals` (8.2× vs 9.0×), and that one is run-to-run spread
-on a small absolute (204ms vs 225ms) rather than a real mode difference; it reads
-level on repeat runs.
+ratio point except `literals` (10.5× vs 10.9×) and `string-ops` (7.2× vs 7.6×),
+both of which read level on repeat runs — small absolute differences (429 vs
+447ms, 1097 vs 1169ms) rather than a real mode gap.
 
 ### A stale scorecard hid a 1.7× regression for three weeks (now fixed)
 
@@ -158,7 +169,7 @@ re-run the suite or say plainly which rows it did not.
 
 ### Where the rest of the suite stands
 
-The arithmetic/loop half sits at ~1.3–1.9× the JVM. The 2026-07 numeric-pass
+The arithmetic/loop half sits at ~1.2–1.9× the JVM. The 2026-07 numeric-pass
 round did most of that: mixed long×double contagion (a `:long` operand beside a
 proven double widens via `fixnum->flonum`, so `Math` calls over it lower to
 native flonum ops instead of generic host dispatch — `mathfns` ~22.7×→~1.6×) and
@@ -230,7 +241,7 @@ data structure or a loop trip count.
   instaparse's `[listener index]` cache went quadratic — procedures get an
   identity hasheq from a weak side table now, which took test.chuck's grammar
   require 3.57s → 1.66s.
-- **`literals` 8.1×** is the worst new ratio and the purest one: it does no work
+- **`literals` 10.5×** is the worst new ratio and the purest one: it does no work
   at all beyond constructing the literals in a function body and calling three
   predicates. A literal collection is a compile-time constant the reference
   emits into the class constant pool; rebuilding one per call made `pset-conj`
@@ -241,7 +252,7 @@ data structure or a loop trip count.
   and `false?` were `(= true x)`, and a mixed-type `=` misses every fast clause
   and walks the equality arm registry, so `boolean?` on a keyword cost 801ns
   against 194 now.
-- **`transients` 3.9×** is the bulk-build write path. A transient map or set was
+- **`transients` 3.0×** is the bulk-build write path. A transient map or set was
   a Chez hashtable, so `persistent!` folded every entry back through the
   ordinary insert and rebuilt the trie from scratch — the transient did not
   avoid the path-copying build, it deferred it and added a hashtable on top.
@@ -249,7 +260,7 @@ data structure or a loop trip count.
   VECTOR build in the same benchmark is the control: it was always a tail-array
   append, so if the map/set rows move and it does not, the change is in the trie
   edit path.
-- **`string-ops` 7.1×** is the ordinary String surface, which `string-build`
+- **`string-ops` 7.2×** is the ordinary String surface, which `string-build`
   (StringBuilder) and `char-scan` (`.charAt` plus casts) both miss. An interop
   call on an unproven target finds its method table by hashing the target's tag
   string, finds the handler by hashing the method name, and passes arguments as
@@ -313,19 +324,20 @@ data structure or a loop trip count.
   later nil receiver would return a wrong value where Clojure raises
   `IllegalArgumentException` — a `some?`/`nil?` guard narrows it back and devirt
   fires again.
-- **`dispatch` ~1.1×**: a megamorphic site runs a per-site polymorphic inline
+- **`dispatch` ~1.2×**: a megamorphic site runs a per-site polymorphic inline
   cache (4-slot descriptor scan, `#3%` reads over the proven cache shape), so
   it no longer pays a registry lookup per call.
-- **`nth-access` ~2.6×**: `jolt-nth` is `set!`-wrapped several times and the
+- **`nth-access` ~2.4×**: `jolt-nth` is `set!`-wrapped several times and the
   array shim was outermost, so a plain vector read walked a chain of
   extension-type probes before reaching the arm that answers it. `RT.nth` tests
   `Indexed` first; so does this now (small vector 34.3 → 16.0ns). The residual
   is a constant factor, which is why it lives here and not in
   `test/complexity_test.clj` — two CI runners measured 2.79× and 5.14× for the
   same commit, and the regression worth watching for lands inside that spread.
-- **`collections` ~1.8×**: JVM-exact Murmur3 hashing plus the array-map
-  `(k . v)` fold; the residual is Murmur3 on integer keys, which the JVM JITs
-  to a handful of instructions.
+- **`collections` ~0.8×** (beats the JVM on this run): JVM-exact Murmur3
+  hashing plus the array-map `(k . v)` fold. It read ~1.8× on the previous
+  (Apple Silicon) host; the sign flip on this machine is a JVM warmup/JIT
+  effect, not a jolt-side change — see the machine note above the scorecard.
 
 
 ## 64-bit integer arithmetic & generators (test.check)
@@ -343,17 +355,25 @@ carry both plus the rose-tree machinery.
 
 | Workload | ×N | vs JVM | jolt (ms) | JVM (ms) | Bound by |
 |---|---:|---:|---:|---:|---|
-| SplitMix `mix-64` | 100k | **8.2×** | 48.4 | 5.9 | 64-bit integer arithmetic |
-| deftype alloc + protocol dispatch | 100k | **4.3×** | 28.6 | 6.7 | open-world dispatch |
-| raw `split` + `rand-long` | 20k | **21.3×** | 78.7 | 3.7 | bignum 64-bit + dispatch |
-| `gen/large-integer` | 2k | **7.4×** | 66.8 | 9.0 | arithmetic + rose-tree machinery |
-| `(gen/vector gen/large-integer)` | 500 | **21.4×** | 755.2 | 35.3 | element gen + gen machinery |
+| SplitMix `mix-64` | 100k | **9.3×** | 77.1 | 8.3 | 64-bit integer arithmetic |
+| deftype alloc + protocol dispatch | 100k | **3.7×** | 49.8 | 13.5 | open-world dispatch |
+| raw `split` + `rand-long` | 20k | **12.3×** | 146.9 | 11.9 | bignum 64-bit + dispatch |
+| `gen/large-integer` | 2k | **4.2×** | 163.2 | 38.8 | arithmetic + rose-tree machinery |
+| `(gen/vector gen/large-integer)` | 500 | **17.5×** | 1762.4 | 100.8 | element gen + gen machinery |
 
 Both columns are a fresh `bench/testcheck.sh` pair on one machine in one sitting,
-which is the only way the ratio means anything — the absolutes here read ~1.4× the
-previously published ones on BOTH hosts (JVM `mix-64` 4.0→5.9 alongside jolt
-34.7→48.4), so that shift is the machine, not either runtime. Compare ratios
-across revisions of this table, not milliseconds.
+which is the only way the ratio means anything. This pair was measured 2026-08-24
+on the same x86_64 Linux host as the scorecard above (Intel i5-4278U, 4 threads),
+not the Apple Silicon host the previous pair used, so neither column is
+comparable to the previously published ones — every absolute roughly doubled.
+The ratio shift is not uniform, though: the allocation/dispatch-heavy rows
+(`split`+`rand-long` 21.3×→12.3×, `gen/large-integer` 7.4×→4.2×, the `gen/vector`
+row 21.4×→17.5×) narrowed, while the purely-arithmetic `mix-64` row widened
+slightly (8.2×→9.3×). Consistent with the JVM's JIT and GC paying more on an
+older, weaker CPU than Chez's ahead-of-time compile does — but that is a
+plausible reading of one pair of runs, not a re-derivation; treat the ratio
+shift as machine-driven, and compare ratios across revisions of this table
+measured on the SAME host, not across a host change like this one.
 
 Two no-C codegen levers collapsed the **arithmetic** half: emitting `bit-and`/
 `bit-or`/`bit-xor`/`bit-not` as inlined Chez `bitwise-*` primitives (they had gone
@@ -415,8 +435,11 @@ Three sizes: `version` (pure boot floor, no program), `trivial` (boot + compile 
 run a one-liner), `script` (a small lazy-seq pipeline). Use a BUILT jolt
 (`target/release/jolt` or an installed one), not the dev `bin/jolt` source
 launcher — the dev script boots from source and opts out of the AOT cache, so it
-is not representative. Indicative (M-series): ~117ms vs babashka ~18ms (~6.5×).
-The floor is runtime + compiler image instantiation that re-runs each boot (Chez
+is not representative. Indicative (2026-08-24, x86_64 Linux, Intel i5-4278U):
+~276ms boot floor; babashka wasn't installed on this host to compare against.
+The previous M-series figure (~117ms vs babashka ~18ms, ~6.5×) is not
+comparable — different, weaker machine, and no babashka reference here. The
+floor is runtime + compiler image instantiation that re-runs each boot (Chez
 has no heap snapshot); see the CLI-closure AOT work that removed the per-boot
 recompile of `jolt.main`.
 
@@ -437,9 +460,11 @@ run-trivial program (many defns) over the `nil` file, and `run` is the delta of 
 run-heavy, compile-trivial program (one long loop). The phases are external
 subtractions, each isolating one cost by construction — honest approximations,
 not a strict partition, but directional: speed up the compiler and `compile`
-drops, speed up the runtime and `run` drops. Indicative (M-series): boot ~110ms,
-dispatch ~1ms, compile ~400ms for 400 defns, run ~120ms for a 30M-iter loop —
-compilation is the dominant per-program cost.
+drops, speed up the runtime and `run` drops. Indicative (2026-08-24, x86_64
+Linux, Intel i5-4278U): boot ~274ms, dispatch ~2ms, compile ~971ms for 400
+defns, run ~62ms for a 30M-iter loop — compilation is the dominant per-program
+cost, more so than on the previous M-series host (boot ~110ms, dispatch ~1ms,
+compile ~400ms, run ~120ms), which is not directly comparable to this row.
 
 ## A/B against a change
 
