@@ -1268,6 +1268,7 @@
 (register-host-methods! "thread"
   (list (cons "getContextClassLoader" (lambda (self) the-classloader))
         (cons "getName" (lambda (self) "main"))
+        (cons "getId" (lambda (self) (get-thread-id)))
         ;; no reified call stack (jolt does TCO, so caller frames are erased) — an
         ;; empty StackTraceElement[]. clojure.spec.test.alpha's instrument reads it
         ;; to name the caller var; it degrades to no ::caller, the conform error

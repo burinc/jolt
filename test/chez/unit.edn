@@ -162,6 +162,8 @@
   {:suite "interrupt" :expr "(let [t (jolt.host/make-interrupt)] (jolt.host/interrupt! t) (try (jolt.host/run-interruptible t (fn [] (loop [i 0] (recur (inc i))))) :not-interrupted (catch :default e (:jolt/interrupted (ex-data e)))))" :expected "true"}
   {:suite "interrupt" :expr "(do (Thread/yield) :ok)" :expected ":ok"}
   {:suite "interrupt" :expr "(nil? (Thread/yield))" :expected "true"}
+  {:suite "threads / id" :expr "(let [t (Thread/currentThread) a (.getId t) b (.getId t)] (and (integer? a) (= a b)))" :expected "true"}
+  {:suite "threads / id" :expr "(let [current-id (.getId (Thread/currentThread)) ready (java.util.concurrent.CountDownLatch. 1) release (java.util.concurrent.CountDownLatch. 1) f (future (let [id (.getId (Thread/currentThread))] (.countDown ready) (.await release 5 java.util.concurrent.TimeUnit/SECONDS) id))] (.await ready 5 java.util.concurrent.TimeUnit/SECONDS) (.countDown release) (let [child-id (deref f)] (and (integer? child-id) (not= current-id child-id))))" :expected "true"}
   {:suite "interrupt" :expr "(.isInterrupted (Thread/currentThread))" :expected "false"}
   {:suite "interrupt" :expr "(let [t (Thread/currentThread)] (.interrupt t) (.isInterrupted t))" :expected "true"}
   {:suite "interrupt" :expr "(let [t (Thread/currentThread)] (.interrupt t) [(.isInterrupted t) (.isInterrupted t)])" :expected "[true true]"}
