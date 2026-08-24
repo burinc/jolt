@@ -291,6 +291,10 @@
   ;; Restores the roots in a finally: set-source-roots! is global, and leaving a
   ;; temp dir as the only root breaks every later row that needs to require.
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/joltresunit\") prior (jolt.host/source-roots)] (.mkdirs (io/file d)) (spit (io/file d \"probe.txt\") \"hello\") (try (jolt.host/set-source-roots! [d]) (let [u (io/resource \"probe.txt\")] [(instance? java.net.URL u) (.getName (class u)) (slurp u) (io/resource \"absent.txt\")]) (finally (jolt.host/set-source-roots! prior)))))" :expected "[true \"java.net.URL\" \"hello\" nil]"}
+  ;; The 2-arity (resource n loader) resolves the same as the 1-arity: jolt has
+  ;; one source-root classloader, so the loader argument is accepted and
+  ;; ignored. cognitect aws-api calls it this way and used to fail to load.
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/joltresloader\") prior (jolt.host/source-roots)] (.mkdirs (io/file d)) (spit (io/file d \"probe2.txt\") \"hello\") (try (jolt.host/set-source-roots! [d]) [(slurp (io/resource \"probe2.txt\" (clojure.lang.RT/baseLoader))) (= (str (io/resource \"probe2.txt\")) (str (io/resource \"probe2.txt\" nil))) (io/resource \"absent2.txt\" (clojure.lang.RT/baseLoader))] (finally (jolt.host/set-source-roots! prior)))))" :expected "[\"hello\" true nil]"}
   ;; a file: URL is a first-class source — slurp / .openStream / io/reader /
   ;; io/input-stream read its bytes (verified by content, not type) and io/file
   ;; strips the scheme. All five must hold before io/resource can return a URL.

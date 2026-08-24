@@ -1091,7 +1091,15 @@
 ;; resource is finally added (a new migration is exactly that). An embedded
 ;; resource is baked into the binary and covered by the runtime fingerprint, so it
 ;; contributes nothing here.
-(define (jolt-io-resource name)
+;; (resource n) and (resource n loader). The JVM's 2-arity resolves against the
+;; ClassLoader it is handed; jolt has a single "classloader" whose getResource
+;; scans the same source roots this does (see the java.lang.ClassLoader section
+;; below), so every loader resolves the same resources and the argument is
+;; accepted and ignored. Libraries pass it to pin resolution to one loader
+;; across threads — cognitect aws-api's `cognitect.aws.resources/resource` is
+;; (io/resource n (RT/baseLoader)) — and without the arity they fail to load at
+;; all rather than degrading.
+(define (jolt-io-resource name . _loader)
   (let* ((nm (jolt-str-render-one name))
          (emb (hashtable-ref embedded-resources nm #f)))
     (if emb (make-embedded-res nm emb)
