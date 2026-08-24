@@ -252,7 +252,21 @@
      "-static -llz4 -lz -lws2_32 -lrpcrt4 -lole32 -luuid -ladvapi32 -luser32 -lshell32 -lm")
     ;; Linux: the Chez kernel pulls in compression (lz4/z), the expression
     ;; editor (ncurses + terminfo), threads, dlopen, libuuid, and clock_gettime.
-    (else "-llz4 -lz -lncurses -ltinfo -ldl -lm -lpthread -luuid -lrt")))
+    ;;
+    ;; --exclude-libs keeps the terminal libraries OUT of the executable's
+    ;; dynamic symbol table. -rdynamic puts everything else in, which is what
+    ;; lets a statically linked native resolve through (load-shared-object #f) —
+    ;; but exporting ncurses is actively harmful. The executable is searched
+    ;; before any dlopen'd library, so a jolt program that binds a real ncurses
+    ;; through the FFI has that library's own calls (_nc_setupterm and the rest)
+    ;; bound back into the kernel's copy, which is a different build with a
+    ;; different TERMINAL layout: the terminfo entry fails to parse, or initscr
+    ;; segfaults on the mismatch. Naming the archives costs nothing when they
+    ;; resolve to shared libraries instead — ld ignores an --exclude-libs name
+    ;; it did not link.
+    (else (string-append
+            "-Wl,--exclude-libs,libncurses.a:libncursesw.a:libtinfo.a "
+            "-llz4 -lz -lncurses -ltinfo -ldl -lm -lpthread -luuid -lrt"))))
 
 ;; --- optional built-binary startup profile ----------------------------------
 ;; JOLT_STARTUP_PROFILE=1 reports wall time, process CPU, collections,
