@@ -337,6 +337,12 @@
   {:suite "javastatic" :expr "(Math/sqrt 16)" :expected "4.0"}
   {:suite "javastatic" :expr "(Math/abs -3)" :expected "3"}
   {:suite "javastatic" :expr "(Math/max 2 7)" :expected "7"}
+  {:suite "javastatic / Numbers" :expr "[(clojure.lang.Numbers/inc 41) (clojure.lang.Numbers/dec -1) (clojure.lang.Numbers/unchecked_inc 9) (clojure.lang.Numbers/unchecked_dec 9)]" :expected "[42 -2 10 8]"}
+  {:suite "javastatic / Numbers" :expr "[(clojure.lang.Numbers/isZero 0) (clojure.lang.Numbers/isPos 1/2) (clojure.lang.Numbers/isNeg -1)]" :expected "[true true true]"}
+  {:suite "javastatic / Numbers" :expr "[(clojure.lang.Numbers/add 2 3) (clojure.lang.Numbers/minus 2 3) (clojure.lang.Numbers/multiply 6 7) (clojure.lang.Numbers/remainder -7 3)]" :expected "[5 -1 42 -1]"}
+  {:suite "javastatic / Numbers" :expr "[(clojure.lang.Numbers/add 1 1/2) (clojure.lang.Numbers/multiply 3 1/2) (clojure.lang.Numbers/add 100000000000000000000 1)]" :expected "[3/2 3/2 100000000000000000001N]"}
+  {:suite "javastatic / Numbers" :expr "[(clojure.lang.Numbers/unchecked_inc Long/MAX_VALUE) (clojure.lang.Numbers/unchecked_dec Long/MIN_VALUE) (clojure.lang.Numbers/unchecked_add Long/MAX_VALUE 1) (clojure.lang.Numbers/unchecked_minus Long/MIN_VALUE 1) (clojure.lang.Numbers/unchecked_multiply Long/MAX_VALUE 2)]" :expected "[-9223372036854775808 9223372036854775807 -9223372036854775808 9223372036854775807 -2]"}
+  {:suite "javastatic / Numbers" :expr "[(clojure.lang.Numbers/lt 1 2) (clojure.lang.Numbers/gt 2.0 1) (clojure.lang.Numbers/lte 2 2) (clojure.lang.Numbers/gte 3/2 1) (clojure.lang.Numbers/equiv 3 3.0) (clojure.lang.Numbers/equiv 3 4)]" :expected "[true true true true true false]"}
   {:suite "javastatic" :expr "(pos? Long/MAX_VALUE)" :expected "true"}
   {:suite "javastatic" :expr "(String/valueOf 42)" :expected "\"42\""}
   {:suite "javastatic" :expr "(String/valueOf \"hi\")" :expected "\"hi\""}
