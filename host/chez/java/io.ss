@@ -1084,6 +1084,29 @@
                   rel)))
     (make-url (string-append "file:" (jfile-abs rel)))))
 
+;; The name argument, or an NPE. The JVM throws NullPointerException for a null
+;; resource name from ClassLoader.getResource / getResources /
+;; getResourceAsStream and Class.getResource alike (probed directly), and
+;; clojure.java.io/resource is a bare .getResource, so it throws too. jolt sent
+;; the name through jolt-str-render-one, the `str` coercion, which renders nil as
+;; "" — and "" is a DIFFERENT question with a real answer, since the empty name is
+;; the classpath root. (io/resource nil) therefore handed back a URL for the first
+;; source root: a caller whose name came from a missing config key or an absent
+;; optional path got a directory, and only found out when something far away tried
+;; to read it. "" itself keeps answering the root, which is what the JVM does with
+;; it — verified, not assumed.
+(define (resource-name-arg name)
+  (if (jolt-nil? name)
+      (throw-jvm (quote NullPointerException) "resource name is nil")
+      (jolt-str-render-one name)))
+
+;; This is THE resource resolver: clojure.java.io/resource and every ClassLoader
+;; method in the java.lang.ClassLoader section below (getResource / getResources /
+;; getResourceAsStream, on the loader and on a Class) answer through it, so all of
+;; them see the embedded branch and announce the same candidates. They used to
+;; walk the roots themselves, which silently made the loader the weaker resolver;
+;; cl-get-resource carries what that cost.
+;;
 ;; Every candidate probed is announced to the AOT cache (io-note-file-read!),
 ;; not just the one that answered — including the ones that were not there. Which
 ;; root wins is part of the answer, so a file appearing at an EARLIER root has to
@@ -1091,14 +1114,8 @@
 ;; resource is finally added (a new migration is exactly that). An embedded
 ;; resource is baked into the binary and covered by the runtime fingerprint, so it
 ;; contributes nothing here.
-;; This is THE resource resolver: clojure.java.io/resource and every ClassLoader
-;; method in the java.lang.ClassLoader section below (getResource / getResources /
-;; getResourceAsStream, on the loader and on a Class) answer through it, so all of
-;; them see the embedded branch and announce the same candidates. They used to
-;; walk the roots themselves, which silently made the loader the weaker resolver;
-;; cl-get-resource carries what that cost.
 (define (resolve-resource name)
-  (let* ((nm (jolt-str-render-one name))
+  (let* ((nm (resource-name-arg name))
          (emb (hashtable-ref embedded-resources nm #f)))
     (if emb (make-embedded-res nm emb)
         (let loop ((roots (get-source-roots)))
@@ -1164,7 +1181,7 @@
 ;; An embedded hit leads, matching the precedence the singular resolver gives it,
 ;; and every candidate is announced for the reason resolve-resource announces.
 (define (cl-get-resources self name)
-  (let* ((nm (jolt-str-render-one name))
+  (let* ((nm (resource-name-arg name))
          (emb (hashtable-ref embedded-resources nm #f)))
     (let loop ((roots (get-source-roots))
                (acc (if emb (list (make-embedded-res nm emb)) '())))
@@ -1214,11 +1231,11 @@
         (cons "getResource"
               (lambda (self name)
                 (cl-get-resource the-classloader
-                                 (class-resource-name (jclass-name self) (jolt-str-render-one name)))))
+                                 (class-resource-name (jclass-name self) (resource-name-arg name)))))
         (cons "getResourceAsStream"
               (lambda (self name)
                 (cl-resource-stream the-classloader
-                                    (class-resource-name (jclass-name self) (jolt-str-render-one name)))))))
+                                    (class-resource-name (jclass-name self) (resource-name-arg name)))))))
 ;; clojure.lang.RT/nextID — process-unique increasing id (AtomicInteger(1)
 ;; getAndIncrement), used by id generators such as core.logic's lvar.
 (define rt-next-id-counter 1)
