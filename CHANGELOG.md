@@ -5,7 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.24] - 2026-08-24
+
+NULL now round-trips through a `:string` FFI position in both directions —
+`foreign-callable` joins `foreign-fn`, so a nullable C string argument or
+return value has a home on either side of the boundary.
+
+The other half (#716, thanks to @burinc) is a fix for a performance
+regression: restoring `TZ` after every timezone probe call — itself a real
+leak fix in the previous release — meant libc reloaded zone data twice per
+call. Memoizing the probe by `(zone, instant)` undoes it: a repeated
+`jolt.host/tz-offset-seconds` lookup drops from ~1.7ms to ~100ns, and
+`jolt-lang/time`'s zone-aware `now` speeds up by roughly 100x.
 
 ### Fixed
 
