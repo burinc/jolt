@@ -26,6 +26,14 @@
   translation with the directions swapped, since C is the caller there: a null
   char* C passes in arrives as nil, and returning nil hands C a null char*.
 
+  nil is the only spelling of NULL a :string position accepts. false is
+  rejected rather than sent, though Chez's own `string` type would take it as
+  NULL: there is no :bool foreign type for a boolean to have come from, so one
+  arriving here is a mistake — a `when` that did not fire, a predicate result —
+  and silently sending it would land on the one value C reads as \"absent\".
+  Every other non-string is rejected too, which the other foreign types already
+  did on their own.
+
   A struct passed or returned by value uses the same literal descriptor as
   layout, wrapped in [:by-value descriptor]. An argument value is a non-null
   caller-owned pointer to the struct bytes. An aggregate-returning callable takes
@@ -41,6 +49,20 @@
   slice of an EXISTING byte-array — so a caller reading a stream whose length
   it already knows fills one buffer instead of regrowing an accumulator per
   chunk. All of them move the block in one copy, not a byte at a time.
+
+  string->ptr and ptr->string round-trip nil: nil answers NULL and allocates
+  nothing, NULL reads back as nil, and \"\" still allocates its NUL byte and
+  still reads back as \"\" — so an absent string stays distinguishable from a
+  present empty one. Every other value keeps going through the `str` coercion,
+  since with-c-string copies a VALUE. NULL is safe to free, so the scoped
+  helpers need no special case for it.
+
+  Where NULL is not available to mean it, a nil is rejected instead of rendered
+  as \"\": a nil foreign type (read/write/sizeof), a nil name to loaded?, and a
+  nil value to write-bytes, whose destination is the caller's own buffer so
+  there is no pointer that could carry absence. (load-library nil) keeps its
+  documented meaning — no name at all, the process's own symbols — which is an
+  answer rather than a missing one.
 
       (let [buf (ffi/alloc 65536)
             frame (byte-array total)]
@@ -130,7 +152,9 @@
     `(jolt.ffi/with-alloc [~pointer (jolt.ffi/layout-size ~layout)] ~@body)))
 
 (defmacro with-c-string
-  "Copy value to a lexical NUL-terminated UTF-8 C string."
+  "Copy value to a lexical NUL-terminated UTF-8 C string. A nil value binds NULL
+  rather than an empty string, which is how an optional C string argument is
+  passed; freeing it is still a no-op."
   [binding & body]
   (let [[pointer value] (helper-binding "with-c-string" binding)]
     `(let [~pointer (jolt.ffi/string->ptr ~value)]
@@ -139,7 +163,9 @@
 (defmacro with-c-string-array
   "Build a lexical pointer array of count NUL-terminated UTF-8 strings. The
   values expression is evaluated once. Partially built arrays are cleaned up if
-  conversion fails. Neither the array nor its member pointers may escape body."
+  conversion fails. Neither the array nor its member pointers may escape body.
+  A nil member is a NULL entry, which is what an argv/envp-shaped array wants;
+  it is tracked and freed like any other member, freeing NULL being a no-op."
   [binding values & body]
   (let [[pointer count-expr] (helper-binding "with-c-string-array" binding)]
     `(let [values# (vec ~values)

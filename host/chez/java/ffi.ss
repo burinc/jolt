@@ -11,6 +11,24 @@
 ;; representation `void*` arguments and results use, so pointers flow between
 ;; foreign-fn calls and these helpers transparently.
 
+;; --- a jolt value used AS a string -------------------------------------------
+;; jolt-str-render-one is the `str` coercion, and it renders nil as "". That is
+;; right for str and it is right where the boundary copies a VALUE — string->ptr
+;; and with-c-string document exactly that. It is wrong wherever the string names
+;; something, because an absent name silently became an empty one: dlopen(""), a
+;; foreign type called "", a zero-byte write that reports 0 octets written and is
+;; indistinguishable from writing "".
+;;
+;; nil has no representation in any of those positions. Where it DOES have one it
+;; is already used — NULL, in a :string argument and in string->ptr — so the split
+;; is between "absence means NULL here" and "absence means nothing here", and this
+;; is the second. Every other value keeps the coercion, so 42 still names "42".
+(define (ffi-str-arg what x)
+  (if (jolt-nil? x)
+      (throw-jvm 'IllegalArgumentException
+                 (string-append "jolt.ffi: " what " must be a string, got nil"))
+      (jolt-str-render-one x)))
+
 ;; --- loading shared objects --------------------------------------------------
 ;; (jolt.ffi/load-library name) loads a .so/.dylib by name (resolved by the OS
 ;; loader against the standard search paths). A library typically calls this once
@@ -64,7 +82,7 @@
 ;; followed by use). The old form side-effected the GLOBAL namespace to answer
 ;; a yes/no question.
 (define (ffi-loaded? name)
-  (if (jolt-ffi-load-native (jolt-str-render-one name)) #t #f))
+  (if (jolt-ffi-load-native (ffi-str-arg "loaded? name" name)) #t #f))
 
 ;; --- scoped native libraries: dlopen RTLD_LOCAL + per-handle dlsym ----------
 ;; A :jolt/native library's symbols must NEVER depend on the process-global
@@ -149,7 +167,7 @@
 ;; width expose the same stored bits; wire byte order remains an explicit codec
 ;; or htons/ntohs concern.
 (define (ffi-type->chez kw)
-  (let ((n (if (keyword-t? kw) (keyword-t-name kw) (jolt-str-render-one kw))))
+  (let ((n (if (keyword-t? kw) (keyword-t-name kw) (ffi-str-arg "foreign type" kw))))
     (cond
       ((string=? n "int") 'int)
       ((string=? n "uint") 'unsigned-int)
@@ -188,7 +206,26 @@
 ;; foreign-callable is called BY C, so the roles swap: its :string arguments
 ;; convert c->jolt and its :string result converts jolt->c. Position-relative
 ;; names ("arg"/"ret") read backwards on one of the two.
-(define (jolt-ffi-string->c x) (if (jolt-nil? x) #f x))
+;;
+;; jolt->c validates rather than passing the odd value through, because `string`
+;; is the ONE foreign type that takes a non-string quietly. Chez rejects #t, an
+;; integer, a symbol and a bytevector in a `string` position, and rejects #f in
+;; every other position — argument, result and foreign-set! alike. So #f in a
+;; `string` position is the single hole in the boundary's type checking, and what
+;; falls through it lands on precisely the value C reads as "absent": a `when`
+;; that did not fire, a predicate result, a `boolean` of a missing key, silently
+;; becomes NULL. jolt.ffi has no :bool type, so no false ever belongs here — nil
+;; is how NULL is spelled. Naming the whole non-string set in one jolt-level error
+;; also beats Chez's "invalid foreign-procedure argument #[...]" for the rest.
+;;
+;; c->jolt needs no such check: its input comes from Chez, which hands back a
+;; string or #f and nothing else.
+(define (jolt-ffi-string->c x)
+  (cond ((string? x) x)                 ; the common path, one test
+        ((jolt-nil? x) #f)              ; nil IS NULL, in both directions
+        (else (throw-jvm 'IllegalArgumentException
+                         (string-append "jolt.ffi: :string got " (jolt-pr-str x)
+                                        " — NULL is spelled nil")))))
 (define (jolt-ffi-c->string x) (if x x jolt-nil))
 
 ;; --- foreign memory ----------------------------------------------------------
@@ -220,7 +257,7 @@
     (guard (e (#t (list->string (map integer->char (bytevector->u8-list bv))))) (utf8->string bv))))
 ;; write a string's UTF-8 bytes into ptr (no NUL terminator); return the count.
 (define (ffi-write-bytes ptr s)
-  (let* ((bv (string->utf8 (jolt-str-render-one s))) (n (bytevector-length bv)) (p (jnum->exact ptr)))
+  (let* ((bv (string->utf8 (ffi-str-arg "write-bytes value" s))) (n (bytevector-length bv)) (p (jnum->exact ptr)))
     (sa-foreign-bytes-set! p bv n)
     n))
 (def-var! "jolt.ffi" "read-bytes" ffi-read-bytes)
@@ -298,14 +335,32 @@
                 (loop (+ i 1) (cons b acc))))))))
 ;; Copy a jolt string's UTF-8 bytes into a freshly alloc'd NUL-terminated buffer;
 ;; the caller frees it. Returns the pointer.
+;;
+;; nil answers NULL, allocating nothing, so it round-trips against ptr->string
+;; above — which has always read NULL back as nil. Before this the pair lost the
+;; distinction in one direction: nil went through jolt-str-render-one, which
+;; renders it "", so it came back as "" and an absent string was indistinguishable
+;; from a present empty one. "" itself still allocates its one NUL byte and still
+;; reads back as "", which is what keeps the two answers apart.
+;;
+;; Every value that is not nil keeps going through jolt-str-render-one, the `str`
+;; coercion: with-c-string documents "Copy VALUE", not "copy a string", and
+;; with-c-string-array maps over arbitrary values. Only nil is special, for the
+;; same reason it is special in a :string position — it is what jolt spells
+;; absence with, and NULL is what C spells it with.
+;;
+;; NULL is safe for both callers to free: free(NULL) is a defined no-op, and
+;; ffi/free reaches it through Chez's foreign-free, which accepts 0.
 (define (ffi-string->ptr s)
-  (let* ((bv (string->utf8 (jolt-str-render-one s))) (n (bytevector-length bv))
-         (p (sa-foreign-alloc (+ n 1))))
-    ;; free on a mid-copy throw — the caller only ever sees a whole buffer
-    (guard (e (#t (guard (_ (#t #f)) (sa-foreign-free p)) (raise e)))
-      (do ((i 0 (+ i 1))) ((= i n)) (sa-foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
-      (sa-foreign-set! 'unsigned-8 p n 0)
-      p)))
+  (if (jolt-nil? s)
+      ffi-null
+      (let* ((bv (string->utf8 (jolt-str-render-one s))) (n (bytevector-length bv))
+             (p (sa-foreign-alloc (+ n 1))))
+        ;; free on a mid-copy throw — the caller only ever sees a whole buffer
+        (guard (e (#t (guard (_ (#t #f)) (sa-foreign-free p)) (raise e)))
+          (do ((i 0 (+ i 1))) ((= i n)) (sa-foreign-set! 'unsigned-8 p i (bytevector-u8-ref bv i)))
+          (sa-foreign-set! 'unsigned-8 p n 0)
+          p))))
 
 ;; --- callbacks: receive calls FROM C ----------------------------------------
 ;; jolt.ffi/foreign-callable lowers to (jolt-ffi-register-callable! (foreign-callable …)).
