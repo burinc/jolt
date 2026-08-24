@@ -423,6 +423,8 @@
   {:suite "ns" :expr "(do (in-ns 'my.ns) (symbol? 'x))" :expected "true"}
   {:suite "ns" :expr "(str (ns-name *ns*))" :expected "\"user\""}
   {:suite "ns" :expr "(var? (find-var 'clojure.core/map))" :expected "true"}
+  {:suite "ns / core compatibility" :expr "(let [v (find-var 'clojure.core/imap-cons)] (and (var? v) (= {:a 1 :b 2} ((var-get v) {:a 1} [:b 2]))))" :expected "true"}
+  {:suite "ns / core compatibility" :expr "(let [v (find-var 'clojure.core/system-newline)] (and (var? v) (= \"\\n\" (var-get v))))" :expected "true"}
   {:suite "ns" :expr "(= 'user (ns-name (the-ns 'user)))" :expected "true"}
   {:suite "ns" :expr "(= 'foo.bar (ns-name (create-ns 'foo.bar)))" :expected "true"}
   {:suite "reader" :expr "(= 42 (read-string \"42\"))" :expected "true"}
