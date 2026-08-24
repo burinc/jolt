@@ -5,6 +5,204 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.25] - 2026-08-24
+
+Three boundaries where an absent thing was quietly turned into a present one.
+A `nil` resource name became the classpath root, so a missing config key
+answered with a directory. A `nil` or `false` crossing the FFI's `:string`
+boundary became `""` or NULL, so C acted on a value nobody passed. And
+`setlocale`'s NULL failure answer arrived as the address 0 — truthy in Scheme —
+so every failed locale lookup read as a success.
+
+The rest is reach on the same seams. `clojure.java.io/resource` takes the
+ClassLoader argument libraries pass it, and the loader's resource methods
+resolve through the same resolver `io/resource` does — which is what makes a
+resource baked into a `jolt build` binary visible to a library that reaches the
+classpath through `RT/baseLoader`. A `require` fired under someone else's
+`(binding [*ns* ..])` interns each loaded file's defs into that file's own
+namespace instead of the bound one. And a nested `run-interruptible` extent
+leaves the enclosing one still watching its token.
+
+The last one came out of reviewing the others: a `java.lang.Thread` handle now
+answers about the thread it stands for rather than the thread doing the asking,
+which is what makes `.interrupt` from outside a thread and that thread's own
+view of its flag one flag instead of two.
+
+Thanks to @casselc for the interrupt fix and the compatibility surface SCI
+reaches for.
+
+### Added
+
+- **The `clojure.lang.Numbers` statics a hosted analyzer emits.** SCI's
+  optimized analyzer emits direct `Numbers` calls rather than core var
+  references, so 19 of them now route to jolt's existing numeric tower:
+  `inc`/`dec` and their `unchecked_` forms, `isZero`/`isPos`/`isNeg`,
+  `add`/`minus`/`multiply` checked and unchecked, `remainder`, the four
+  comparisons, and `equiv`. Only the ones it emits — this is not a
+  claim of complete `Numbers` parity.
+
+- **`Thread.getId`**, answering jolt's stable numeric identity for the running
+  thread: repeatable for one thread, distinct across simultaneously live ones.
+  It does not claim JVM `Thread` semantics beyond jolt's thread model.
+
+- **`clojure.core/imap-cons` and `clojure.core/system-newline`.** Both are
+  private on the JVM, and both are reached by ordinary hosted library code —
+  `imap-cons` is the map arm of `conj`, `system-newline` the newline `println`
+  writes. jolt's `system-newline` is `"\n"`, its portable convention, on every
+  platform.
+
+### Fixed
+
+- **`clojure.java.io/resource` accepts a ClassLoader.** `(io/resource n
+  loader)` raised `Wrong number of args (2) passed to:
+  clojure.java.io/resource` — jolt only defined the 1-arity. Libraries pass a
+  loader at namespace load to pin resource resolution across threads, so the
+  missing arity was a load failure rather than a degraded call: cognitect
+  aws-api's `cognitect.aws.resources/resource` is `(io/resource n
+  (RT/baseLoader))`, which made every `cognitect.aws.*` namespace unloadable.
+  jolt has a single classloader, so the argument is accepted and ignored, the
+  way `.setDaemon` is on the Thread shim. Three arguments is an arity error
+  here as on the JVM; the rest argument was quietly accepting it.
+
+- **Every ClassLoader resource method resolves through `io/resource`.**
+  `getResource`, `getResources`, `getResourceAsStream` and the two `Class`
+  arms walked the source roots with their own copy of the resolver, which was
+  missing two things the real one has. It had no embedded-resources branch, so
+  in a `jolt build` binary with `:jolt/build :embed` a baked-in resource
+  answered `nil` through `RT/baseLoader` while `(io/resource n)` served it —
+  libraries that reach the classpath through a loader therefore found nothing
+  in the built artifact and everything in the source tree they were developed
+  against. And it never announced its lookup to the AOT cache, so an added
+  resource kept serving the "not there" answer, the staleness #576 fixed for
+  `io/resource` still live on this path. `getResourceAsStream` now dispatches
+  `openStream` on what the resolver returned rather than stripping the scheme
+  and slurping a path, which is what makes an embedded hit readable at all.
+
+- **A `nil` resource name is a `NullPointerException`, not the classpath
+  root.** The name went through the `str` coercion, which renders `nil` as
+  `""` — and `""` is a name with a real answer, since the empty name *is* the
+  classpath root. So `(io/resource nil)`, and `.getResource` / `.getResources`
+  / `.getResourceAsStream` on `RT/baseLoader`, and `Class.getResource`, handed
+  back a URL for the first source root. A name that came from a missing config
+  key or an absent optional path became a directory, and the caller only found
+  out somewhere far away when something tried to read it. All four throw on
+  the JVM, probed directly; `""` keeps answering the root on both, so only
+  `nil` changes.
+
+- **`false` is not a `jolt.ffi` `:string`.** 0.7.24 taught the `:string`
+  boundary to carry NULL as `nil`. Chez's own `string` foreign type spells NULL
+  as `#f`, and the boundary passed anything non-nil straight through, so jolt's
+  `false` went out as NULL too — an undocumented second spelling, and the one
+  that arrives by accident: a `when` that did not fire, a predicate result, a
+  `boolean` of a missing key. `string` is the only foreign type that takes a
+  non-string quietly, and what falls through that gap lands on precisely the
+  value C reads as "absent". Worse in the callable return direction, where the
+  callback hands C a null `char*` and nothing in jolt ever said so. The
+  boundary now validates, which also upgrades the message for the non-strings
+  that were already rejected:
+
+      before   :object | invalid foreign-procedure argument #[keyword-v1 ...]
+      after    IllegalArgumentException | jolt.ffi: :string got :kw — NULL is spelled nil
+
+- **`nil` round-trips through `ffi/string->ptr` and `ffi/ptr->string` as
+  NULL.** `ptr->string` has always read NULL back as `nil`, but `string->ptr`
+  went out through the `str` coercion and rendered `nil` as `""`, so the pair
+  lost the distinction in one direction — an absent string and a present empty
+  one were the same thing after a round trip, which for a path, a name or an
+  optional argument is the difference C cares about. `nil` now answers NULL and
+  allocates nothing; `""` still allocates its NUL byte and still reads back as
+  `""`. `with-c-string` binds NULL for a `nil` value, which is how an optional
+  C string argument is passed, and `with-c-string-array` writes NULL into the
+  slot — argv/envp shape. Every other value keeps the coercion, so `42` is
+  still `"42"`.
+
+- **A `nil` that cannot mean NULL is an error, not an empty string.** Three
+  more sites took the `str` coercion where the string *names* something, so an
+  absent name silently became an empty one and the boundary acted on it:
+  `ffi/write-bytes` wrote 0 octets and answered 0, indistinguishable from
+  writing `""` on purpose; `ffi/read`, `ffi/write` and `ffi/sizeof` resolved a
+  `nil` type and raised `unknown foreign type :`, loud but naming nothing; and
+  `ffi/loaded?` `dlopen`'d `""` and answered `false`, so a nonsense query got a
+  definite-looking no. All three reject `nil` now. `(load-library nil)` is
+  unchanged — it is documented to mean "no name at all, the process's own
+  symbols are already resolvable", which is an answer rather than a missing
+  one.
+
+- **The libc locale probes no longer clobber `LC_TIME` process-wide.**
+  `tzp-locale-available?`, the boot capability probe, set `en_US.UTF-8` and
+  left it — and it runs unconditionally, so *every* jolt process ran in
+  `en_US.UTF-8` where a C program starts in `"C"`, and any later `strftime`,
+  `localtime` or `nl_langinfo`, jolt's own or a user's through `jolt.ffi`,
+  answered from a locale nobody selected. An embedder that had chosen its own
+  locale before calling in lost it. `tzp-locale-name` restored to a hardcoded
+  `"C"` rather than to the value it displaced, which is its own clobber; it
+  just looks tidy. Both now save with `setlocale(cat, NULL)` and restore under
+  `dynamic-wind`, so a throw between the two cannot leave the category changed
+  either — the shape the TZ probe already had.
+
+- **A failed `setlocale` reads as a failure.** Its result was read as `void*`,
+  so the NULL it answers for a locale the OS does not have installed arrived as
+  the address 0 — truthy in Scheme — and every failure read as a success. That
+  is the common case, not a rare path: most images carry only `C` and
+  `en_US`. `jolt.host/locale-name` then ran `strftime` under whatever locale
+  was current and returned the answer as if it were the requested locale's, so
+  `"fr"`, `"ja"`, `"de"` and `"ru"` all answered `January` on a stock box — and
+  genuinely the wrong language wherever some other locale was current. It
+  answers `nil` now, which is what the caller wants: `jolt.time.fmt` falls
+  through to its bundled tables, which are right everywhere.
+
+- **A nested `run-interruptible` leaves the enclosing extent watching.** Each
+  extent installs a polling timer handler and restores the previous one on the
+  way out, but the restore did not re-arm the timer — so off a fiber, once an
+  inner extent had returned, the outer one never polled its token again and an
+  interruption after that point was simply never noticed. Active extents are
+  now an owner-tagged per-thread stack, tagged because Chez child threads
+  inherit thread-parameter values and an inherited stack must not let a child
+  poll its parent's token. Covered by a new `interruptnest` gate: normal inner
+  return, inner exception, inner interruption, outer interruption after the
+  inner exit, concurrent tokens, and child-thread ownership.
+
+- **A `java.lang.Thread` handle answers about the thread it stands for.** Three
+  questions asked through one answered about the caller instead. `.getId` read
+  the *asking* thread's id, so every handle `Thread/getAllStackTraces` hands
+  back — and they are all handles for other threads — reported the caller's id:
+  four live threads, four entries, one id. `.getName` was the constant
+  `"main"` for every thread. And a thread jolt had forked allocated its own
+  interrupt flag on first use rather than adopting the one its `Thread` object
+  hands `.interrupt`, so the two were unrelated boxes and the ordinary
+  interruption idiom never reached the worker:
+
+      (let [t (Thread. body)] (.start t) ... (.interrupt t))
+      before   the caller sees true, the worker polling .isInterrupted sees false
+      after    one flag
+
+  A handle now carries the id of the thread it stands for, names are kept in an
+  id-keyed table — a thread nobody named answers the JVM's shape, `"main"` for
+  the boot thread and `"Thread-<id>"` otherwise — and a forked thread adopts its
+  `Thread` object's flag before running the body. `Thread(runnable, name)` also
+  accepted the name and dropped it, and a constructed `Thread` had neither
+  `.getName` nor `.setName`; all three work, and a rename after `.start` reaches
+  the running thread. What has not changed is that no jolt park is interruptible:
+  a thread already blocked in `CountDownLatch.await`, `Thread/sleep` or
+  `.join` is not thrown out of it with `InterruptedException` the way the JVM
+  does, so interruption on jolt is the polling idiom. That half is tracked and
+  now written down in `known-divergences.edn`.
+
+- **A `require` under a `(binding [*ns* ..])` interns each file's defs into its
+  own namespace.** `*ns*` reads prefer a live thread binding over the
+  thread-local current-ns parameter, but the write half only ever set the
+  parameter — so the loader's restore of the current namespace on the way out
+  of a load did nothing under such a binding, and `*ns*` stayed pointing at the
+  last file the require finished. Every def after the `:require` in the
+  requiring file then interned into the wrong namespace, and nothing said so
+  until a call somewhere else could not resolve. Macroexpansion is where this
+  is reached in practice — typedclojure's `ann*` expands under exactly such a
+  binding, and its whole dependency tree loaded wrong. The write now targets
+  whatever the read would consult, which is also what `(set! *ns* ...)` does on
+  the JVM: `Var.set` writes the innermost thread binding and leaves the root
+  alone, so the binding frame popping still restores the namespace that was
+  current before it.
+
 ## [0.7.24] - 2026-08-24
 
 NULL now round-trips through a `:string` FFI position in both directions —
