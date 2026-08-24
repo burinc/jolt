@@ -113,6 +113,14 @@
         (let ((b (box #f)))
           (thread-interrupt-cell (cons id b))
           b))))
+;; A thread jolt itself forked already HAS a flag — the box its Thread object hands
+;; .interrupt — so it must not lazily allocate a second one. The child adopts that
+;; box as its own before running the body; without this, .interrupt from outside
+;; and (.isInterrupted (Thread/currentThread)) inside were two unrelated flags and
+;; the ordinary interruption idiom never reached the worker.
+(define (adopt-interrupt-box! b)
+  (thread-interrupt-cell (cons (get-thread-id) b))
+  b)
 (define (clear-thread-interrupt!) (set-box! (current-interrupt-box) #f))
 
 ;; libc sched_yield, resolved once; fall back to a zero-length park if the symbol

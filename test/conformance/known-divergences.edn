@@ -458,6 +458,29 @@
    :jvm "\"localhost\" — reverse lookup through the nameservice (machine-dependent)"
    :jolt "\"127.0.0.1\" — the literal; no reverse lookup"
    :note "Reverse DNS would need getnameinfo and makes the answer environment-dependent; the JVM's own javadoc flags the lookup. Use .getHostString for the literal on both. Caught certifying test/chez/socket-test.clj against the JVM."}
+  ;; Interruption reaches the FLAG but not a thread already parked. .interrupt sets
+  ;; the target's flag and the target sees it (jolt#727 made that one flag rather
+  ;; than two), so the polling idiom — (while (not (.isInterrupted
+  ;; (Thread/currentThread))) ...) — behaves as on the JVM. What does NOT happen is
+  ;; the JVM's second half: a thread blocked in an interruptible wait is not thrown
+  ;; out of it. Every jolt park runs to its own completion or timeout instead.
+  {:category :concurrency-model
+   :behavior "(.interrupt t) while t is parked in CountDownLatch.await / Thread.sleep / Thread.join / a blocking queue take"
+   :jvm "the wait throws InterruptedException at once and clears the flag"
+   :jolt "the wait runs to completion or its timeout and returns normally; the flag is set and readable afterwards"
+   :note "jolt.host/run-interruptible is the interruptible-blocking primitive that does exist, and ReentrantLock.lockInterruptibly does throw. Making every park interruptible means threading the interrupt box through each jolt-cv-wait site — bead jolt-qdi8. Code that must be interruptible on jolt should poll .isInterrupted or bound its waits with a timeout."}
+  ;; The three separator system properties are POSIX on every platform, Windows
+  ;; included. This is deliberate and consistent rather than an oversight: jolt's
+  ;; own IO layer writes LF and joins with "/" everywhere (java.io.File, the
+  ;; classpath, `newline`), so answering "\r\n" and "\\" on Windows would make the
+  ;; properties disagree with what the runtime beside them actually does. Windows
+  ;; accepts "/" in paths. Found reviewing clojure.core/system-newline, which is
+  ;; "\n" for the same reason.
+  {:category :host-model
+   :behavior "(System/getProperty \"line.separator\") / \"file.separator\" / \"path.separator\", and clojure.core/system-newline, ON WINDOWS"
+   :jvm "\"\\r\\n\", \"\\\\\" and \";\" — the platform's own conventions"
+   :jolt "\"\\n\", \"/\" and \":\" on every platform"
+   :note "Consistent with the rest of jolt on Windows, which reads and writes LF and joins paths with \"/\". Code that must produce native line endings on Windows should not read them from these properties on jolt. On POSIX the two agree exactly."}
   ;; ThreadLocal under thread-parameter fork-inheritance: a proxy'd
   ;; ThreadLocal's value is a Chez thread parameter, and a forked thread
   ;; starts with the CREATING thread's current value — so a child observes

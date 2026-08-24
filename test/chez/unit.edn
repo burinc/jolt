@@ -164,6 +164,30 @@
   {:suite "interrupt" :expr "(nil? (Thread/yield))" :expected "true"}
   {:suite "threads / id" :expr "(let [t (Thread/currentThread) a (.getId t) b (.getId t)] (and (integer? a) (= a b)))" :expected "true"}
   {:suite "threads / id" :expr "(let [current-id (.getId (Thread/currentThread)) ready (java.util.concurrent.CountDownLatch. 1) release (java.util.concurrent.CountDownLatch. 1) f (future (let [id (.getId (Thread/currentThread))] (.countDown ready) (.await release 5 java.util.concurrent.TimeUnit/SECONDS) id))] (.await ready 5 java.util.concurrent.TimeUnit/SECONDS) (.countDown release) (let [child-id (deref f)] (and (integer? child-id) (not= current-id child-id))))" :expected "true"}
+  ;; A handle asks about the thread it STANDS FOR, not the thread doing the
+  ;; asking — the distinction only shows through a handle for someone else, which
+  ;; is what Thread/getAllStackTraces hands back.
+  {:suite "threads / id" :expr "(let [ready (java.util.concurrent.CountDownLatch. 1) release (java.util.concurrent.CountDownLatch. 1) seen (atom nil) t (Thread. (fn [] (reset! seen (.getId (Thread/currentThread))) (.countDown ready) (.await release 5 java.util.concurrent.TimeUnit/SECONDS)))] (.start t) (.await ready 5 java.util.concurrent.TimeUnit/SECONDS) (let [ids (into #{} (map #(.getId %) (keys (Thread/getAllStackTraces))))] (.countDown release) (contains? ids @seen)))" :expected "true"}
+  {:suite "threads / id" :expr "(let [ready (java.util.concurrent.CountDownLatch. 1) release (java.util.concurrent.CountDownLatch. 1) t (Thread. (fn [] (.countDown ready) (.await release 5 java.util.concurrent.TimeUnit/SECONDS)))] (.start t) (.await ready 5 java.util.concurrent.TimeUnit/SECONDS) (let [ths (keys (Thread/getAllStackTraces)) ids (map #(.getId %) ths)] (.countDown release) (= (count ths) (count (set ids)))))" :expected "true"}
+  {:suite "threads / name" :expr "(.getName (Thread/currentThread))" :expected "\"main\""}
+  {:suite "threads / name" :expr "(let [p (promise)] (.start (Thread. (fn [] (deliver p (.getName (Thread/currentThread)))))) (not= \"main\" (deref p 5000 :timeout)))" :expected "true"}
+  {:suite "threads / name" :expr "(let [p (promise) t (Thread. (fn [] (deliver p (.getName (Thread/currentThread)))) \"worker-x\")] (.start t) [(.getName t) (deref p 5000 :timeout)])" :expected "[\"worker-x\" \"worker-x\"]"}
+  {:suite "threads / name" :expr "(let [t (Thread. (fn []) \"a\")] (.setName t \"b\") (.getName t))" :expected "\"b\""}
+  ;; renaming through the currentThread handle, done inside a worker so the row
+  ;; cannot rename the thread the rest of the suite runs on
+  {:suite "threads / name" :expr "(let [p (promise)] (.start (Thread. (fn [] (let [t (Thread/currentThread)] (.setName t \"renamed\") (deliver p (.getName t)))))) (deref p 5000 :timeout))" :expected "\"renamed\""}
+  ;; .interrupt from outside and the thread's own view of its flag are ONE flag on
+  ;; the JVM — the whole interruption idiom is an outside caller setting it and the
+  ;; worker polling Thread/currentThread or Thread/interrupted. All three answers
+  ;; certified against JVM Clojure 1.12. The worker SPINS rather than parking on a
+  ;; latch: on the JVM an interrupt out of an interruptible wait throws
+  ;; InterruptedException instead, which would test something else.
+  {:suite "threads / interrupt" :expr "(let [ready (promise) release (atom false) done (promise) t (Thread. (fn [] (deliver ready true) (loop [] (when-not @release (Thread/yield) (recur))) (deliver done (.isInterrupted (Thread/currentThread)))))] (.start t) (deref ready 5000 :timeout) (.interrupt t) (reset! release true) [(.isInterrupted t) (deref done 5000 :timeout)])" :expected "[true true]"}
+  {:suite "threads / interrupt" :expr "(let [ready (promise) release (atom false) done (promise) t (Thread. (fn [] (deliver ready true) (loop [] (when-not @release (Thread/yield) (recur))) (deliver done [(Thread/interrupted) (Thread/interrupted)])))] (.start t) (deref ready 5000 :timeout) (.interrupt t) (reset! release true) (deref done 5000 :timeout))" :expected "[true false]"}
+  ;; a handle taken for the thread by SOMEONE ELSE reaches the same flag
+  {:suite "threads / interrupt" :expr "(let [ready (promise) release (atom false) done (promise) t (Thread. (fn [] (deliver ready true) (loop [] (when-not @release (Thread/yield) (recur))) (deliver done (.isInterrupted (Thread/currentThread)))) \"interruptee\")] (.start t) (deref ready 5000 :timeout) (doseq [h (keys (Thread/getAllStackTraces))] (when (= \"interruptee\" (.getName h)) (.interrupt h))) (reset! release true) (deref done 5000 :timeout))" :expected "true"}
+  ;; the name a handle answers is the name of the thread it stands for
+  {:suite "threads / name" :expr "(let [ready (java.util.concurrent.CountDownLatch. 1) release (java.util.concurrent.CountDownLatch. 1) t (Thread. (fn [] (.countDown ready) (.await release 5 java.util.concurrent.TimeUnit/SECONDS)) \"named-worker\")] (.start t) (.await ready 5 java.util.concurrent.TimeUnit/SECONDS) (let [names (into #{} (map #(.getName %) (keys (Thread/getAllStackTraces))))] (.countDown release) (contains? names \"named-worker\")))" :expected "true"}
   {:suite "interrupt" :expr "(.isInterrupted (Thread/currentThread))" :expected "false"}
   {:suite "interrupt" :expr "(let [t (Thread/currentThread)] (.interrupt t) (.isInterrupted t))" :expected "true"}
   {:suite "interrupt" :expr "(let [t (Thread/currentThread)] (.interrupt t) [(.isInterrupted t) (.isInterrupted t)])" :expected "[true true]"}

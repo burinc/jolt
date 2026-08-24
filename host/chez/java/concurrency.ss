@@ -1297,13 +1297,39 @@
 ;; Real OS threads over Chez fork-thread (shared heap — a captured atom/var is
 ;; shared). A Thread runs its Runnable thunk; start forks, join waits on a
 ;; condition latched at completion. CountDownLatch is a counting barrier.
-(define (make-jthread thunk) (make-jhost "user-thread" (vector thunk #f (make-mutex) (make-condition) (box #f) #f)))
+;; Slot 6 is the thread's NAME, in a box so .setName after .start reaches the
+;; running thread through the same box the start published. Unnamed threads get
+;; the JVM's construction-order default rather than nothing, so .getName has an
+;; answer before the thread has an id to be named after.
+(define jthread-name-counter 0)
+(define jthread-name-mutex (make-mutex))
+(define (next-jthread-name)
+  (jolt-with-mutex jthread-name-mutex
+    (let ((n jthread-name-counter))
+      (set! jthread-name-counter (+ n 1))
+      (string-append "Thread-" (number->string n)))))
+(define (make-jthread thunk name)
+  (make-jhost "user-thread"
+              (vector thunk #f (make-mutex) (make-condition) (box #f) #f
+                      (box (or name (next-jthread-name))) #f)))
+;; slot 7: the id of the thread the start forked, #f until then. A rename needs
+;; it to reach the id-keyed name table the handles read.
+(define (jthread-id st) (vector-ref st 7))
 ;; alive = started and not yet completed. join waits on exactly this, so a thread
 ;; that was never started is not waited for at all (JVM: isAlive is false before
 ;; .start, so join returns at once).
 (define (jthread-alive? st) (and (vector-ref st 5) (not (vector-ref st 1))))
 ;; JVM Thread() is legal: the target is null and run/start are no-ops.
-(for-each (lambda (nm) (register-class-ctor! nm (lambda args (make-jthread (if (null? args) #f (car args))))))
+;; Thread(), Thread(runnable) and Thread(runnable, name) — the name argument used
+;; to be accepted and dropped, so a thread the caller had named answered with a
+;; generated one.
+(for-each (lambda (nm)
+            (register-class-ctor! nm
+              (lambda args
+                (make-jthread (if (null? args) #f (car args))
+                              (if (or (null? args) (null? (cdr args)) (jolt-nil? (cadr args)))
+                                  #f
+                                  (jolt-final-str (cadr args)))))))
           '("Thread" "java.lang.Thread"))
 (register-host-methods! "user-thread"
   (list (cons "start" (lambda (self)
@@ -1311,6 +1337,17 @@
             (vector-set! st 5 #t)  ; mark started before forking
             (fork-thread (lambda ()
                (*txn* #f)                          ; child thread must not inherit parent's txn
+               ;; Adopt the Thread object's own interrupt flag, so .interrupt from
+               ;; outside and this thread's Thread/currentThread view are ONE flag.
+               (adopt-interrupt-box! (vector-ref st 4))
+               ;; publish the name under this thread's id, so .getName agrees
+               ;; whether it is asked of the Thread object or of the handle
+               ;; Thread/currentThread (and getAllStackTraces) hands out
+               (vector-set! st 7 (get-thread-id))
+               (jolt-thread-name-set! (get-thread-id) (unbox (vector-ref st 6)))
+               ;; and register that handle now, so a handle someone else takes for
+               ;; this thread before it first asks who it is is the live one
+               (current-thread-handle)
                (dyn-binding-stack snap)
                ;; surface a thread body's throw like the JVM's default uncaught-
               ;; exception handler; the thread still completes (isAlive/join
@@ -1351,6 +1388,14 @@
         (cons "isAlive" (lambda (self) (jthread-alive? (jhost-state self))))
         (cons "interrupt" (lambda (self . _) (set-box! (vector-ref (jhost-state self) 4) #t) jolt-nil))
         (cons "isInterrupted" (lambda (self) (and (unbox (vector-ref (jhost-state self) 4)) #t)))
+        (cons "getName" (lambda (self) (unbox (vector-ref (jhost-state self) 6))))
+        ;; A rename after .start has to reach the running thread too, or the two
+        ;; spellings of the same thread's name disagree.
+        (cons "setName" (lambda (self nm)
+          (let* ((st (jhost-state self)) (s (jolt-final-str nm)))
+            (set-box! (vector-ref st 6) s)
+            (when (jthread-id st) (jolt-thread-name-set! (jthread-id st) s)))
+          jolt-nil))
         (cons "setDaemon" (lambda (self . _) jolt-nil))))
 
 (define (make-jlatch n) (make-jhost "count-down-latch" (vector n (make-mutex) (make-condition))))

@@ -1265,20 +1265,45 @@
 ;; any thread sets the target thread's flag and .isInterrupted reads it without
 ;; clearing (instance semantics; the static Thread/interrupted reads-and-clears).
 ;; getContextClassLoader hands back the loader.
+;; A handle STANDS FOR one thread, and every question asked through it is about
+;; that thread — including when some other thread is holding it, which is the
+;; only shape Thread/getAllStackTraces hands back. So the id travels IN the
+;; handle: reading (get-thread-id) here answered about whoever was asking, so
+;; every entry in that map reported the caller's id and its name was the constant
+;; "main". State is (interrupt-box . thread-id).
+(define (thread-handle-box h) (car (jhost-state h)))
+(define (thread-handle-id h) (cdr (jhost-state h)))
+;; Names live in an id-keyed table for the same reason, under the handle mutex:
+;; a thread parameter is only readable by its own thread. A thread nobody named
+;; answers the JVM's default shape — the boot thread is "main", anything else
+;; "Thread-<id>".
+(define thread-names-by-id (make-eqv-hashtable))
+(define (jolt-thread-name-set! id nm)
+  (jolt-with-mutex thread-handles-mutex (hashtable-set! thread-names-by-id id nm)))
+(define (jolt-thread-name id)
+  (or (jolt-with-mutex thread-handles-mutex (hashtable-ref thread-names-by-id id #f))
+      (if (eqv? id jolt-boot-thread-id)
+          "main"
+          (string-append "Thread-" (number->string id)))))
 (register-host-methods! "thread"
   (list (cons "getContextClassLoader" (lambda (self) the-classloader))
-        (cons "getName" (lambda (self) "main"))
-        (cons "getId" (lambda (self) (get-thread-id)))
+        (cons "getName" (lambda (self) (jolt-thread-name (thread-handle-id self))))
+        (cons "setName" (lambda (self nm)
+                          (jolt-thread-name-set! (thread-handle-id self) (jolt-final-str nm))
+                          jolt-nil))
+        (cons "getId" (lambda (self) (thread-handle-id self)))
         ;; no reified call stack (jolt does TCO, so caller frames are erased) — an
         ;; empty StackTraceElement[]. clojure.spec.test.alpha's instrument reads it
         ;; to name the caller var; it degrades to no ::caller, the conform error
         ;; (the ExceptionInfo) is still thrown.
         (cons "getStackTrace" (lambda (self) (jolt-vector)))
         (cons "interrupt" (lambda (self)
-                            (when (box? (jhost-state self)) (set-box! (jhost-state self) #t))
+                            (let ((b (thread-handle-box self)))
+                              (when (box? b) (set-box! b #t)))
                             jolt-nil))
         (cons "isInterrupted" (lambda (self)
-                                (and (box? (jhost-state self)) (unbox (jhost-state self)) #t)))))
+                                (let ((b (thread-handle-box self)))
+                                  (and (box? b) (unbox b) #t))))))
 ;; ONE handle per thread, cached in a thread parameter. The JVM's
 ;; Thread/currentThread is identity-stable, and code relies on it: keying a map by
 ;; the current thread, or comparing two calls with identical?/=. Allocating a fresh
@@ -1298,7 +1323,7 @@
         (id (get-thread-id)))
     (if (and (pair? c) (eqv? (car c) id))
         (cdr c)
-        (let ((h (make-jhost "thread" (current-interrupt-box))))
+        (let ((h (make-jhost "thread" (cons (current-interrupt-box) id))))
           (thread-handle-cell (cons id h))
           (jolt-with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
           h))))
@@ -1309,7 +1334,7 @@
   (if (eqv? id (get-thread-id))
       (current-thread-handle)              ; the caller must find ITSELF in the map
       (or (jolt-with-mutex thread-handles-mutex (hashtable-ref thread-handles-by-id id #f))
-          (let ((h (make-jhost "thread" (box #f))))
+          (let ((h (make-jhost "thread" (cons (box #f) id))))
             (jolt-with-mutex thread-handles-mutex (hashtable-set! thread-handles-by-id id h))
             h))))
 ;; Thread/getAllStackTraces: the live threads mapped to EMPTY stack traces. jolt
