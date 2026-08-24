@@ -1091,15 +1091,13 @@
 ;; resource is finally added (a new migration is exactly that). An embedded
 ;; resource is baked into the binary and covered by the runtime fingerprint, so it
 ;; contributes nothing here.
-;; (resource n) and (resource n loader). The JVM's 2-arity resolves against the
-;; ClassLoader it is handed; jolt has a single "classloader" whose getResource
-;; scans the same source roots this does (see the java.lang.ClassLoader section
-;; below), so every loader resolves the same resources and the argument is
-;; accepted and ignored. Libraries pass it to pin resolution to one loader
-;; across threads — cognitect aws-api's `cognitect.aws.resources/resource` is
-;; (io/resource n (RT/baseLoader)) — and without the arity they fail to load at
-;; all rather than degrading.
-(define (jolt-io-resource name . _loader)
+;; This is THE resource resolver: clojure.java.io/resource and every ClassLoader
+;; method in the java.lang.ClassLoader section below (getResource / getResources /
+;; getResourceAsStream, on the loader and on a Class) answer through it, so all of
+;; them see the embedded branch and announce the same candidates. They used to
+;; walk the roots themselves, which silently made the loader the weaker resolver;
+;; cl-get-resource carries what that cost.
+(define (resolve-resource name)
   (let* ((nm (jolt-str-render-one name))
          (emb (hashtable-ref embedded-resources nm #f)))
     (if emb (make-embedded-res nm emb)
@@ -1111,6 +1109,21 @@
                 (if (file-exists? cand)
                     (resource-file-url (car roots) nm)
                     (loop (cdr roots)))))))))
+
+;; (resource n) and (resource n loader). The JVM's 2-arity resolves against the
+;; ClassLoader it is handed; jolt has a single "classloader" that resolves through
+;; resolve-resource just as this does (see the java.lang.ClassLoader section
+;; below), so every loader resolves the same resources and the argument is
+;; accepted and ignored. Libraries pass it to pin resolution to one loader
+;; across threads — cognitect aws-api's `cognitect.aws.resources/resource` is
+;; (io/resource n (RT/baseLoader)) — and without the arity they fail to load at
+;; all rather than degrading. case-lambda rather than a rest argument so the JVM's
+;; two arities are the only two: (resource n loader extra) is an arity error there
+;; and has to stay one here.
+(define jolt-io-resource
+  (case-lambda
+    ((name) (resolve-resource name))
+    ((name _loader) (resolve-resource name))))
 (def-var! "clojure.java.io" "resource" jolt-io-resource)
 ;; as-url honors a library-registered URL class (e.g. jolt-lang/http-client's full
 ;; java.net.URL shim) so io/as-url and (URL. spec) agree; else the file-only jhost.
@@ -1131,23 +1144,45 @@
 ;; back this loader. Libraries that probe the classpath (e.g. migratus's migration-
 ;; dir discovery) then fall back to the filesystem when a resource isn't a root.
 (define the-classloader (make-jhost "classloader" (vector)))
-(define (cl-get-resource self name)
-  (let ((nm (jolt-str-render-one name)))
-    (let loop ((roots (get-source-roots)))
-      (cond ((null? roots) jolt-nil)
-            ((file-exists? (string-append (car roots) "/" nm))
-             (resource-file-url (car roots) nm))
-            (else (loop (cdr roots)))))))
+;; Straight through to io/resource's resolver. This walked the roots itself until
+;; it was found to be resolving LESS than io/resource did, in two ways that both
+;; only bite where they are hardest to see:
+;;
+;;   - it never consulted embedded-resources, so in a `jolt build` binary with
+;;     :jolt/build :embed a baked-in resource answered nil here while
+;;     (io/resource n) served it. Every classpath-probing library that goes
+;;     through a loader rather than io/resource — .getResourceAsStream on
+;;     RT/baseLoader is the common spelling — therefore saw nothing in the built
+;;     artifact and everything in the source tree it was developed against.
+;;   - it announced no candidate to the AOT cache, so a compile-time lookup
+;;     through a loader was not part of the cache key: exactly the staleness
+;;     jolt#576 fixed for io/resource, still live on this path.
+(define (cl-get-resource self name) (resolve-resource name))
 ;; getResources: every source root that holds the named resource, as file: URLs
 ;; (enumeration-seq just calls seq, so a list serves). ring's static-resource
 ;; symlink check enumerates these to confirm a served file sits under a root.
+;; An embedded hit leads, matching the precedence the singular resolver gives it,
+;; and every candidate is announced for the reason resolve-resource announces.
 (define (cl-get-resources self name)
-  (let ((nm (jolt-str-render-one name)))
-    (let loop ((roots (get-source-roots)) (acc '()))
+  (let* ((nm (jolt-str-render-one name))
+         (emb (hashtable-ref embedded-resources nm #f)))
+    (let loop ((roots (get-source-roots))
+               (acc (if emb (list (make-embedded-res nm emb)) '())))
       (cond ((null? roots) (list->cseq (reverse acc)))
-            ((file-exists? (string-append (car roots) "/" nm))
-             (loop (cdr roots) (cons (resource-file-url (car roots) nm) acc)))
-            (else (loop (cdr roots) acc))))))
+            (else
+             (let ((cand (string-append (car roots) "/" nm)))
+               (io-note-file-read! cand)
+               (if (file-exists? cand)
+                   (loop (cdr roots) (cons (resource-file-url (car roots) nm) acc))
+                   (loop (cdr roots) acc))))))))
+;; The stream for whatever the resolver answered. Both branches of a resolved
+;; resource are java.net.URLs with an openStream — a file: URL reads its target,
+;; an embedded-res hands back its baked content — so dispatching the method is
+;; what makes an embedded hit readable. Stripping the scheme and slurping the
+;; path, which is what this did, only ever worked for the file: branch.
+(define (cl-resource-stream self name)
+  (let ((u (cl-get-resource self name)))
+    (if (jolt-nil? u) jolt-nil (record-method-dispatch u "openStream" jolt-nil))))
 (register-host-methods! "classloader"
   (list (cons "getResource" cl-get-resource)
         (cons "getResources" cl-get-resources)
@@ -1155,10 +1190,7 @@
         ;; JVM's bootstrap loader gives, which terminates the usual
         ;; (take-while identity (iterate #(.getParent %) loader)) walk.
         (cons "getParent" (lambda (self) jolt-nil))
-        (cons "getResourceAsStream"
-              (lambda (self name)
-                (let ((u (cl-get-resource self name)))
-                  (if (jolt-nil? u) jolt-nil (host-new "StringReader" (jolt-slurp (url-strip-scheme (url-spec u))))))))))
+        (cons "getResourceAsStream" cl-resource-stream)))
 (register-class-statics! "java.lang.ClassLoader" (list (cons "getSystemClassLoader" (lambda () the-classloader))))
 ;; clojure.lang.RT/baseLoader — the resource-resolving class loader (RT/baseLoader
 ;; is how libraries reach Clojure's base loader, e.g. aws-api's resources ns).
@@ -1185,9 +1217,8 @@
                                  (class-resource-name (jclass-name self) (jolt-str-render-one name)))))
         (cons "getResourceAsStream"
               (lambda (self name)
-                (let ((u (cl-get-resource the-classloader
-                                          (class-resource-name (jclass-name self) (jolt-str-render-one name)))))
-                  (if (jolt-nil? u) jolt-nil (host-new "StringReader" (jolt-slurp (url-strip-scheme (url-spec u))))))))))
+                (cl-resource-stream the-classloader
+                                    (class-resource-name (jclass-name self) (jolt-str-render-one name)))))))
 ;; clojure.lang.RT/nextID — process-unique increasing id (AtomicInteger(1)
 ;; getAndIncrement), used by id generators such as core.logic's lvar.
 (define rt-next-id-counter 1)

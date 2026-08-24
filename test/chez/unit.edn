@@ -295,6 +295,16 @@
   ;; one source-root classloader, so the loader argument is accepted and
   ;; ignored. cognitect aws-api calls it this way and used to fail to load.
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/joltresloader\") prior (jolt.host/source-roots)] (.mkdirs (io/file d)) (spit (io/file d \"probe2.txt\") \"hello\") (try (jolt.host/set-source-roots! [d]) [(slurp (io/resource \"probe2.txt\" (clojure.lang.RT/baseLoader))) (= (str (io/resource \"probe2.txt\")) (str (io/resource \"probe2.txt\" nil))) (io/resource \"absent2.txt\" (clojure.lang.RT/baseLoader))] (finally (jolt.host/set-source-roots! prior)))))" :expected "[\"hello\" true nil]"}
+  ;; The JVM's resource has exactly two arities, so a third argument is an arity
+  ;; error there and must stay one here — a rest argument would have swallowed it.
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (io/resource \"probe.txt\" nil nil))" :expected :throws}
+  ;; Every ClassLoader resource method answers through io/resource's resolver, so
+  ;; the loader surface resolves neither more nor less than io/resource does:
+  ;; getResource agrees on the URL, getResourceAsStream reads the same content,
+  ;; getResources enumerates the one root holding it, Class.getResource takes an
+  ;; absolute "/name", and an absent name is nil on all of them. (The embedded
+  ;; branch of the same claim needs a built binary — build-smoke's --resloader.)
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/joltrescl\") prior (jolt.host/source-roots)] (.mkdirs (io/file d)) (spit (io/file d \"probe3.txt\") \"hello\") (try (jolt.host/set-source-roots! [d]) (let [cl (clojure.lang.RT/baseLoader)] [(= (str (io/resource \"probe3.txt\")) (str (.getResource cl \"probe3.txt\"))) (slurp (.getResourceAsStream cl \"probe3.txt\")) (count (enumeration-seq (.getResources cl \"probe3.txt\"))) (= (str (io/resource \"probe3.txt\")) (str (.getResource String \"/probe3.txt\"))) [(.getResource cl \"absent3.txt\") (.getResourceAsStream cl \"absent3.txt\")]]) (finally (jolt.host/set-source-roots! prior)))))" :expected "[true \"hello\" 1 true [nil nil]]"}
   ;; a file: URL is a first-class source — slurp / .openStream / io/reader /
   ;; io/input-stream read its bytes (verified by content, not type) and io/file
   ;; strips the scheme. All five must hold before io/resource can return a URL.

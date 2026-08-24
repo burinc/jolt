@@ -220,6 +220,17 @@ if ! printf '%s' "$got_sbjoin" | grep -q '^sbjoin: a\.b\.c  x$'; then
   echo "--- got ----"; echo "$got_sbjoin"; exit 1
 fi
 
+# The ClassLoader resource surface resolves what io/resource resolves. It used to
+# walk the source roots on its own and never consult the embedded table, so a
+# baked-in resource answered nil through RT/baseLoader while io/resource served
+# it — invisible in the source tree, and only ever wrong in a built binary, which
+# is why the check lives here.
+got_rl="$(cd / && "$out" --resloader 2>&1)"
+if ! printf '%s' "$got_rl" | grep -q '^resloader: true true 1 true true$'; then
+  echo "  FAIL: ClassLoader resource surface — want 'resloader: true true 1 true true'"
+  echo "--- got ----"; echo "$got_rl"; exit 1
+fi
+
 # Portable embed: remove the build-time source tree and run from / — the
 # embedded resource must still resolve (contents baked as literals, not
 # read-file-string at startup).
