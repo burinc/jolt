@@ -119,7 +119,7 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke depscpcache depsunit \
-  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci cts ffi stdlibfasl \
+  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
@@ -485,6 +485,12 @@ stdlibfasl: testbin
 # SCI conformance: load borkdude/sci's source through jolt (floor-gated).
 sci:
 	@$(CHEZ) --script host/chez/run-sci.ss
+
+# A complementary functional gate: load SCI through Jolt's ordinary dependency
+# path, then initialize and reuse real contexts. run-sci.ss remains the broad,
+# intentionally lenient source-loading compatibility gate.
+scifunctional: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt -Sdeps '{:deps {borkdude/sci {:local/root "vendor/sci"}}}' run test/chez/sci-functional-test.clj
 
 # clojure-test-suite conformance: run the vendored jank-lang/clojure-test-suite
 # per-namespace under jolt, gated on the per-namespace baseline
