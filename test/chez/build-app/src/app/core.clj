@@ -37,6 +37,22 @@
                         (util/redef-fn)))
     (println "dyn:" (binding [util/*config* :bound]
                       util/*config*)))
+  ;; --resloader: the ClassLoader surface must resolve exactly what io/resource
+  ;; resolves, INCLUDING a resource baked into this binary. It used to walk the
+  ;; source roots on its own and never look at the embedded table, so every
+  ;; classpath-probing library that reaches resources through RT/baseLoader
+  ;; rather than clojure.java.io found nothing in a built artifact and everything
+  ;; in the source tree it was developed against. Only a built binary has an
+  ;; embedded resource, so this is the only place the claim can be checked.
+  (when (= (first args) "--resloader")
+    (let [cl (clojure.lang.RT/baseLoader)]
+      (println "resloader:"
+               (= (str (io/resource "greeting.txt")) (str (.getResource cl "greeting.txt")))
+               (= (slurp (io/resource "greeting.txt"))
+                  (slurp (.getResourceAsStream cl "greeting.txt")))
+               (count (enumeration-seq (.getResources cl "greeting.txt")))
+               (some? (.getResource String "/greeting.txt"))
+               (nil? (.getResource cl "no-such-resource.txt")))))
   ;; the resource is baked into the binary (deps.edn :jolt/build :embed), so this
   ;; resolves with no resources/ dir on disk, run from any cwd.
   (println (slurp (io/resource "greeting.txt")))

@@ -480,6 +480,27 @@ else
   echo "FAIL: (q2) cold='$q2_cold' (want none) after-add='$q2_warm' (want appeared)"; fails=$((fails+1))
 fi
 
+# (q3) the same probe through a ClassLoader. RT/baseLoader's getResource is the
+# other spelling of the same lookup, and libraries that reach the classpath
+# rather than clojure.java.io use it — but it walked the roots on its own and
+# announced nothing, so a compile-time probe through it was invisible to the key
+# and an added resource kept serving the "not there" answer. It resolves through
+# io/resource's resolver now, so it announces what that announces.
+printf '(ns proj.clopt)\n(defmacro embed [] (if-let [u (.getResource (clojure.lang.RT/baseLoader) "clopt.sql")] (slurp u) "none"))\n(defn run [] (embed))\n' > "$q/src/proj/clopt.clj"
+q3run() {
+  JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'proj/proj {:local/root \"$q\"}}})
+    (require 'proj.clopt) (println (proj.clopt/run))" 2>/dev/null | tail -1
+}
+q3_cold="$(q3run)"
+printf 'appeared' > "$q/resources/clopt.sql"
+q3_warm="$(q3run)"
+if [ "$q3_cold" = "none" ] && [ "$q3_warm" = "appeared" ]; then
+  echo "PASS: (q3) an added resource invalidated the ns that probed the loader"; pass=$((pass+1))
+else
+  echo "FAIL: (q3) cold='$q3_cold' (want none) after-add='$q3_warm' (want appeared)"; fails=$((fails+1))
+fi
+
 # (r) the read happens while compiling the CONSUMER (the macro lives one
 # namespace away), so the resource belongs to the consumer's key, and editing it
 # has to move that key even though neither .clj changed.
