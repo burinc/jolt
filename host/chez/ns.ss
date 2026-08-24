@@ -617,7 +617,8 @@
     (cons "min" min) (cons "max" max)
     (cons "mod" modulo) (cons "rem" remainder) (cons "quot" quotient)
     (cons "vector" jolt-vector) (cons "hash-map" jolt-hash-map) (cons "hash-set" jolt-hash-set)
-    (cons "conj" jolt-conj) (cons "get" jolt-get) (cons "nth" jolt-nth) (cons "count" jolt-count)
+    (cons "conj" jolt-conj) (cons "imap-cons" jolt-conj)
+    (cons "get" jolt-get) (cons "nth" jolt-nth) (cons "count" jolt-count)
     (cons "assoc" jolt-assoc) (cons "dissoc" jolt-dissoc) (cons "contains?" jolt-contains?)
     (cons "empty?" jolt-empty?) (cons "peek" jolt-peek) (cons "pop" jolt-pop)
     (cons "first" jolt-first) (cons "rest" jolt-rest) (cons "next" jolt-next) (cons "seq" jolt-seq)
@@ -654,6 +655,7 @@
 (def-var! "clojure.core" "refer" jolt-refer)
 (def-var! "clojure.core" "refer-clojure" jolt-refer-clojure)
 (mark-macro! "clojure.core" "refer-clojure")
+(def-var! "clojure.core" "system-newline" "\n")
 ;; Runtime half of the refer-clojure macro: the expansion calls this AFTER the
 ;; enclosing ns form's in-ns has switched chez-current-ns (see jolt-refer-clojure).
 (def-var! "clojure.core" "refer-clojure-register!" jolt-refer-clojure-register!)
