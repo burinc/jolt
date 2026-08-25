@@ -5,6 +5,77 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.27] - 2026-08-25
+
+`nth`'s three-argument form used to answer its not-found value for any receiver
+that has no `nth` at all — a set, a map, a keyword, a number, a function — rather
+than raising the way `RT.nth` does. That turned "you cannot index this" into
+"there is nothing at index 0", silently, and the clearest casualty was
+`(distinct #{1 2 3})`, which answered `(nil 3 2)`: `distinct` reads its head
+through a `[[f :as xs]]` destructure, which lowers to `(nth coll 0 nil)`.
+
+Note this is a behaviour change, not only a bug fix. Code that fed a map or a
+set to `nth`'s not-found arity, or sequentially destructured one, used to get
+nil and now raises — which is what the same code does on Clojure.
+
+`distinct` itself comes out the other side accepting any seqable, and answering
+a hash set roughly fourteen times faster than it did.
+
+### Fixed
+
+- **`nth`'s not-found arity raises on a type that has no `nth`.** The three-arity
+  ended in a bare fallthrough that returned the not-found value for every
+  receiver it did not recognize, so an unindexable type was indistinguishable
+  from an absent index:
+
+  ```clojure
+  (nth #{1 2} 0 :nf)   ; was :nf   — now UnsupportedOperationException
+  (nth {:a 1} 0 :nf)   ; was :nf   — now UnsupportedOperationException
+  (nth :k 0 :nf)       ; was :nf   — now UnsupportedOperationException
+  (let [[f] #{1 2}] f) ; was nil   — now UnsupportedOperationException
+  ```
+
+  A genuinely out-of-range index on a type that does have `nth` is untouched, so
+  `(nth [1 2] 5 :nf)`, `(nth (range 5) 9 :nf)`, `(nth "ab" 9 :nf)` and
+  `(nth nil 3 :nf)` all still answer `:nf`.
+
+- **`nth` and `count` name the simple class when they refuse.** Both wrote the
+  canonical name where `RT.nth` and `RT.count` use `getClass().getSimpleName()`,
+  so a message read `nth not supported on this type: clojure.lang.Keyword`
+  against Clojure's `… : Keyword`. A function class keeps its package-stripped
+  form, `core$inc` rather than `clojure.core$inc`.
+
+- **`(class (Object.))` reports `java.lang.Object`.** A bare `Object` fell off
+  the end of the class-name chain and answered jolt's internal `:object` type
+  keyword, which also appeared inside `count`'s refusal message for one.
+
+### Changed
+
+- **`distinct` accepts any seqable.** It takes its head off the seq it already
+  holds rather than through `nth`, so a set, a map, or any other seqable works:
+
+  ```clojure
+  (distinct #{3 1 2})     ; => (1 3 2)
+  (distinct {:a 1 :b 2})  ; => ([:a 1] [:b 2])
+  ```
+
+  This is a superset — Clojure raises on both, in every version back to 1.9 —
+  and it is tracked in `test/conformance/known-divergences.edn` as `:permissive`.
+  Nothing that runs on Clojure behaves differently here: for every collection
+  `nth` accepts, the head it read and the head `seq` yields are the same value.
+  The refusal is incidental rather than designed, in that Clojure's own
+  `distinct` already accepts a set through its transducer and `sequence` arities
+  and every sibling seq function accepts one.
+
+### Performance
+
+- **`distinct` over a hash set answers its seq.** A hash set holds no two
+  elements that are `=`, so walking it against a `seen` set it can never hit is
+  pure cost — 141.8ms against 10.5ms over 100k elements, where a bare `seq` is
+  8.3ms. A sorted set is deliberately excluded: one built with a comparator that
+  never reports `0` really does hold `=` duplicates, so it still takes the dedup
+  walk. Vector and seq receivers are unmeasurably affected, paying one type test.
+
 ## [0.7.26] - 2026-08-25
 
 Interruption, second half. 0.7.25 made a `java.lang.Thread` handle answer about
