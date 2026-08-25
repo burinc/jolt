@@ -871,6 +871,11 @@
          (utf8->string (na-bytearray->bv
                         (record-method-dispatch s "readAllBytes" jolt-nil))))
         (else (jolt-str-render-one s))))
+;; slurp over a clojure.core/IReader (what *in* and with-in-str hand out). The
+;; protocol is line-based — -read-line, -read-form, -read+string, no char read —
+;; and -read-line drops the delimiter, so whether the input ended with a newline
+;; is not recoverable here: "a\nb" and "a\nb\n" both drain to "a\nb". Reading
+;; source text off a pipe, which is what this is for, does not care.
 (define (drain-ireader src)
   (let ((out (open-output-string)))
     (let loop ((first? #t))
