@@ -2740,6 +2740,13 @@
   ;; reads are the same value. known-divergences, :permissive.
   {:suite "distinct / any seqable" :label "the head of a distinct set is an element, not nil" :expected "[:only 1]" :actual "(let [s (distinct #{:only})] [(first s) (count s)])" :portability :common}
   {:suite "distinct / any seqable" :label "distinct over a set keeps every element" :expected "[1 2 3]" :actual "(vec (sort (distinct #{3 1 2})))" :portability :common}
+  {:suite "distinct / any seqable" :label "an empty set answers () like an empty vector, not seq's nil" :expected "[() () true]" :actual "[(distinct #{}) (distinct []) (seq? (distinct #{1 2}))]" :portability :common}
+  ;; The hash-set shortcut's boundary. A sorted set whose comparator never reports
+  ;; 0 really does hold two elements that are = to each other, so it must take the
+  ;; dedup walk, not the shortcut. Collapsing the guard to a bare (set? coll)
+  ;; answers (:x :x) here and fails this row.
+  {:suite "distinct / any seqable" :label "a sorted set with an =-inconsistent comparator still dedups" :expected "[2 [:x]]" :actual "(let [s (conj (sorted-set-by (fn [a b] 1)) :x :x)] [(count s) (vec (distinct s))])" :portability :common}
+  {:suite "distinct / any seqable" :label "a default sorted set is unaffected" :expected "[1 2 3]" :actual "(vec (distinct (sorted-set 3 1 2)))" :portability :common}
   {:suite "distinct / any seqable" :label "distinct over a map yields its entries" :expected "#{[:a 1] [:b 2]}" :actual "(set (distinct {:a 1 :b 2}))" :portability :common}
   {:suite "seq / transform" :label "distinct" :expected "[1 2 3]" :actual "(distinct [1 1 2 3 3])" :portability :common}
   {:suite "seq / transform" :label "dedupe" :expected "[1 2 1]" :actual "(dedupe [1 1 2 1])" :portability :common}

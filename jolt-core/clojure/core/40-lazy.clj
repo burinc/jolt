@@ -19,16 +19,34 @@
   ;; value there — and it drops the only reason distinct refused a set or a map.
   ;; Widening only; see known-divergences (:permissive, "distinct / any seqable").
   ([coll]
-   (let [step (fn step [xs seen]
-                (lazy-seq
-                  ((fn [xs seen]
-                     (when-let [s (seq xs)]
-                       (let [f (first s)]
-                         (if (contains? seen f)
-                           (recur (rest s) seen)
-                           (cons f (step (rest s) (conj seen f)))))))
-                    xs seen)))]
-     (step coll #{}))))
+   ;; A HASH set holds no two elements that are = to each other, so distinct over
+   ;; one is exactly its seq: walking it against a `seen` set it can never hit is
+   ;; pure cost (143.8ms vs 7.0ms over 100k elements).
+   ;;
+   ;; NOT (set? coll) alone. A sorted set whose comparator never reports 0 DOES
+   ;; hold = duplicates — (conj (sorted-set-by (fn [a b] 1)) :x :x) has two :x —
+   ;; so it must take the real walk. Excluding every sorted set is the conservative
+   ;; side of that line: a default (sorted-set …) is =-consistent and merely keeps
+   ;; paying the walk it always paid. The corpus pins the sorted-set-by case, so
+   ;; collapsing this to (set? coll) fails the gate instead of silently answering
+   ;; with duplicates.
+   ;;
+   ;; set? is the cheap half (28ns against sorted?'s ~1us), so it goes first: a
+   ;; vector or a seq — every caller the JVM also serves — pays one type test and
+   ;; nothing more. lazy-seq keeps construction side-effect-free and makes an empty
+   ;; set answer () like (distinct []) rather than seq's nil.
+   (if (and (set? coll) (not (sorted? coll)))
+     (lazy-seq (seq coll))
+     (let [step (fn step [xs seen]
+                  (lazy-seq
+                    ((fn [xs seen]
+                       (when-let [s (seq xs)]
+                         (let [f (first s)]
+                           (if (contains? seen f)
+                             (recur (rest s) seen)
+                             (cons f (step (rest s) (conj seen f)))))))
+                      xs seen)))]
+       (step coll #{})))))
 
 
 ;; --- keep ---

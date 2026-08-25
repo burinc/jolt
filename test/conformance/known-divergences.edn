@@ -721,6 +721,9 @@
    {:suite "distinct / any seqable", :label "the head of a distinct set is an element, not nil", :category :permissive}
    {:suite "distinct / any seqable", :label "distinct over a set keeps every element", :category :permissive}
    {:suite "distinct / any seqable", :label "distinct over a map yields its entries", :category :permissive}
+   {:suite "distinct / any seqable", :label "an empty set answers () like an empty vector, not seq's nil", :category :permissive}
+   {:suite "distinct / any seqable", :label "a sorted set with an =-inconsistent comparator still dedups", :category :permissive}
+   {:suite "distinct / any seqable", :label "a default sorted set is unaffected", :category :permissive}
 
    ;; jolt's conj! is variadic; the JVM's is [coll x] and raises on a third arg.
    ;; The rows are about nil elements and dedup, not about arity — they just
