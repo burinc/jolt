@@ -612,14 +612,6 @@
               (str url-prefix (subs ns (count prefix)) "/" (name coord) url-suffix)))
           git-url-hosts)))
 
-(defn- has-clj-source?
-  "Does the tree hold any jolt-loadable source (.clj/.cljc)? A Maven JAR that is
-  pure-Java (closure-compiler) or ClojureScript-only (cljs.java-time) has none —
-  it contributes nothing to run and its transitive deps are the cljs/JVM toolchain,
-  so the walk skips it rather than dragging in that whole subtree."
-  [root]
-  (boolean (find-file root #(or (str/ends-with? % ".clj") (str/ends-with? % ".cljc")))))
-
 ;; --- coordinate skips + normalization ----------------------------------------
 ;; jolt IS Clojure, so org.clojure/clojure is intrinsic; jolt has no
 ;; ClojureScript compiler, so clojurescript (and the closure/rhino toolchain it
@@ -765,9 +757,6 @@
       (let [root (ensure-maven lib (:mvn/version coord))]
         (cond
           (nil? root) {:root nil :manifest :none}
-          ;; a Maven dep with no jolt-loadable source contributes nothing and
-          ;; its transitive deps are cljs/JVM tooling — don't walk them.
-          (not (has-clj-source? root)) {:root nil :manifest :none}
           ;; :pom is the fallback children-of reaches for when the effective POM
           ;; can't be built — not every jar carries one, and the ones that do
           ;; predate their own dependencyManagement, so it is second choice.

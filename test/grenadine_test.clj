@@ -105,6 +105,29 @@
                        "Clojure as a terminal host dependency")
                   {:raw raw :filtered filtered}))))))
 
+(let [root (str (System/getProperty "java.io.tmpdir")
+                "/jolt-grenadine-resource-only")
+      directory (java.io.File. root)
+      resource (java.io.File. directory "endpoints.edn")]
+  (.mkdirs directory)
+  (spit resource "{}")
+  (try
+    (with-redefs-fn
+      {(var jolt.deps/ensure-maven) (fn [_lib _version] root)
+       (var jolt.deps/effective-pom-deps) (fn [_lib _coord] {})}
+      (fn []
+        (let [result
+              (deps/resolve-deps
+               {'com.cognitect.aws/endpoints {:mvn/version "1"}}
+               ".")]
+          (when-not (= [root] (:roots result))
+            (throw
+             (ex-info "a resource-only Maven JAR must remain a source root"
+                      {:result result}))))))
+    (finally
+      (.delete resource)
+      (.delete directory))))
+
 ;;;; A POM Grenadine cannot model degrades to the jar's own pom.xml rather than
 ;;;; failing the whole resolution.
 
