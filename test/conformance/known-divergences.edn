@@ -285,6 +285,13 @@
    :jvm "throws ArityException — these are arity-2 only"
    :jolt "folds like +: no args => 0, one => the operand, N => a left fold"
    :note "The overlay is variadic where the JVM's is fixed-arity. At arity 2 — every arity the JVM accepts — the wrapping result is identical, 64-bit edges included, so portable code is unaffected. Costs nothing on the hot path either: proven-long operands lower straight to jolt-uncadd2 (a left fold past 2 operands) and never reach the variadic overlay, which only serves value position."}
+  ;; distinct accepts any seqable, not just what nth can index.
+  {:category :permissive
+   :behavior "(distinct #{1 2 3}) or (distinct {:a 1}) — a coll that seqs but has no nth"
+   :jvm "throws UnsupportedOperationException: nth not supported on this type: PersistentHashSet"
+   :jolt "(1 3 2) — the set's own seq order, deduped"
+   :note "The reference implementation reads the head twice: f as (nth coll 0 nil) through its [[f :as xs]] destructure, s as (seq coll). Only the nth read refuses a set or a map, and for every coll the JVM does accept the two reads are the same value — so taking f off the seq widens the domain and moves nothing else. Widening only; portable JVM code behaves identically. jolt's nth is NOT lenient here (it raises for an unsupported type exactly as RT.nth does, message included) — distinct simply no longer asks it."}
+
   ;; keys/vals accept a plain 2-element vector where the JVM casts to Map.Entry.
   {:category :permissive
    :behavior "(keys [[:a 1] [:b 2]]) — a vector of pairs rather than of map entries"
@@ -706,6 +713,14 @@
    ;; until the bucket was split, which is how a wrong :expected on
    ;; (.-value {:value 41}) survived. Classified below; none is a jolt bug.
    ;; ==========================================================================
+
+   ;; distinct takes its head off (seq coll); the JVM's takes it with
+   ;; (nth coll 0 nil), through the [[f :as xs]] destructure. The two agree on every
+   ;; coll nth accepts, so this only widens what distinct accepts — to any seqable,
+   ;; which is what its docstring already says. See the :permissive note below.
+   {:suite "distinct / any seqable", :label "the head of a distinct set is an element, not nil", :category :permissive}
+   {:suite "distinct / any seqable", :label "distinct over a set keeps every element", :category :permissive}
+   {:suite "distinct / any seqable", :label "distinct over a map yields its entries", :category :permissive}
 
    ;; jolt's conj! is variadic; the JVM's is [coll x] and raises on a third arg.
    ;; The rows are about nil elements and dedup, not about arity — they just

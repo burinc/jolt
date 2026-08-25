@@ -13,14 +13,20 @@
           (if (contains? @seen input)
             result
             (do (vswap! seen conj input) (rf result input))))))))
+  ;; The reference reads the head TWICE and two different ways: f as
+  ;; (nth coll 0 nil) via the [[f :as xs]] destructure, s as (seq coll). They agree
+  ;; on everything nth accepts, so taking f off the seq we already hold is the same
+  ;; value there — and it drops the only reason distinct refused a set or a map.
+  ;; Widening only; see known-divergences (:permissive, "distinct / any seqable").
   ([coll]
    (let [step (fn step [xs seen]
                 (lazy-seq
-                  ((fn [[f :as xs] seen]
+                  ((fn [xs seen]
                      (when-let [s (seq xs)]
-                       (if (contains? seen f)
-                         (recur (rest s) seen)
-                         (cons f (step (rest s) (conj seen f))))))
+                       (let [f (first s)]
+                         (if (contains? seen f)
+                           (recur (rest s) seen)
+                           (cons f (step (rest s) (conj seen f)))))))
                     xs seen)))]
      (step coll #{}))))
 

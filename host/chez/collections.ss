@@ -1268,6 +1268,15 @@
 (define (jolt-nth-nil-idx! i)
   (when (jolt-nil? i)
     (jolt-throw (jolt-host-throwable "java.lang.NullPointerException" "nth index"))))
+;; RT.nth / RT.count word their refusal off getClass().getSimpleName(), not the
+;; canonical name — "Keyword", not "clojure.lang.Keyword"; "core$inc", not
+;; "clojure.core$inc" (a fn class is top level, so only the package is stripped).
+;; simple-class-name (java/records-interop.ss) is that rule, resolved at call time
+;; the way jolt-class-name below it already is.
+(define (unsupported-on-type who coll)
+  (throw-jvm (quote UnsupportedOperationException)
+             (string-append who " not supported on this type: "
+                            (simple-class-name (jolt-class-name coll)))))
 (define jolt-nth
   (case-lambda
      ((coll i)
@@ -1284,7 +1293,7 @@
               ;; RT.nth reads a CharSequence by charAt once Indexed has missed —
               ;; jrec-charseq-method (records.ss) resolves at call time.
               ((jrec-charseq-method coll "charAt") => (lambda (m) (jolt-invoke m coll i)))
-              (else (throw-jvm (quote UnsupportedOperationException) (string-append "nth not supported on this type: " (jolt-class-name coll)))))))
+              (else (unsupported-on-type "nth" coll)))))
     ((coll i d)
      (jolt-nth-nil-idx! i)
      (let ((i (->idx i)))
@@ -1296,7 +1305,13 @@
              ((jrec-charseq-method coll "charAt")
               => (lambda (m) (let ((n (jolt-count coll)))
                                (if (and (fx>=? i 0) (fx<? i n)) (jolt-invoke m coll i) d))))
-             (else d))))))
+             ;; NOT (else d). RT.nth's notFound answers an out-of-range INDEX on a
+             ;; type that HAS nth; a type with no nth raises here exactly as it does
+             ;; in the two-arity above. Returning d instead turned "you cannot index
+             ;; this" into "there is nothing at index 0" — which is how a vector
+             ;; destructure of a set bound nil, and (distinct #{1 2 3}) answered
+             ;; (nil 3 2), silently, instead of raising.
+             (else (unsupported-on-type "nth" coll)))))))
 
 ;; a count is an exact integer (JVM parity: count returns a long). jolt= is
 ;; exactness-aware, so this must be exact to match an exact integer literal:
@@ -1320,7 +1335,7 @@
 (define (jolt-count-base coll)
   ;; arms exhausted: a deftype/record counts through its declared method.
   (cond ((rec-coll-method coll "count") => (lambda (m) (jolt-invoke m coll)))
-        (else (throw-jvm (quote UnsupportedOperationException) (string-append "count not supported on this type: " (jolt-class-name coll))))))
+        (else (unsupported-on-type "count" coll))))
 (define (jolt-count coll)
   (cond ((pvec? coll) (pvec-count coll))
         ((pmap? coll) (pmap-cnt coll))

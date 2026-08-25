@@ -1031,6 +1031,11 @@
 ;; (Object.) — a fresh value with distinct identity (libraries use it as a lock
 ;; or a unique sentinel). Each call returns a new jhost so identical?/= separate.
 (register-class-ctor! "Object" (lambda _ (make-jhost "object" (vector))))
+;; …and it reports java.lang.Object. Without this arm it fell off the end of
+;; jolt-class-name's chain onto jolt-type's internal keyword, so (class (Object.))
+;; answered :object — and that keyword was what count's refusal message named.
+(register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "object")))
+                     (lambda (x) "java.lang.Object"))
 
 ;; ---- clojure.lang.LispReader$StringReader -----------------------------------
 ;; The JVM reader's string-literal handler. It is package-private, but a library
