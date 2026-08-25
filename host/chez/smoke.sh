@@ -472,6 +472,18 @@ printf '%s\n' \
   '(defmacro use [& specs] `(println (quote ~specs)))' \
   '(use (demo :as d))' > "$use_prog"
 cla_check "$jolt - < \"$use_prog\"" '((demo :as d))'
+# ... and the same for a dialect-defined require, which shadows core's just as
+# a use macro does.
+printf '%s\n' \
+  '(defmacro require [& specs] `(println (quote ~specs)))' \
+  '(require (demo :as d))' > "$use_prog"
+cla_check "$jolt - < \"$use_prog\"" '((demo :as d))'
+# Shadowing is what turns the convenience off, not the name: an UNshadowed
+# top-level use still gets its args auto-quoted, the way require does.
+printf '%s\n' \
+  '(use [clojure.set :only [union]])' \
+  '(prn (union #{1} #{2}))' > "$use_prog"
+cla_check "$jolt - < \"$use_prog\"" '#{1 2}'
 rm -rf "$use_dir"
 
 # help prints usage (bare `help` and --help/-h are synonyms) and lists the
