@@ -152,6 +152,14 @@
 ;; The CLI auto-quotes require/use vector/list args (but NOT symbols — a plain
 ;; (require sym) evaluates sym normally) so `(require [my.lib :as m])` works
 ;; without an explicit quote, matching the convenience of JVM Clojure's ns macro.
+;;
+;; The convenience belongs to clojure.core's require/use, not to the SPELLING of
+;; the head symbol. Forms are read and evaluated one at a time, so a dialect that
+;; defines its own `use` (or `require`) macro earlier in the same stdin program
+;; has already interned it by the time the next form is rewritten — and it owns
+;; the quoting of its own arguments. So the head is resolved the way the compiler
+;; will resolve it (a locally defined var, then a :refer, then clojure.core) and
+;; auto-quoting applies only when that lands on clojure.core's own var.
 (define (jolt-run-expr-string expr app-args print?)
   (let ((cla (if (null? app-args) jolt-nil (list->cseq app-args)))
         (end (string-length expr))
@@ -161,15 +169,36 @@
            (let ((ah (car (seq->list a))))
              (and (symbol-t? ah)
                   (string=? (symbol-t-name ah) "quote")))))
+    ;; Does HEAD name clojure.core's require/use? Resolved to the (ns . name) pair
+    ;; the compiler would reach — a locally DEFINED var shadows, then a :refer
+    ;; (which carries the name it was renamed FROM), else the implicit core refer.
+    ;; Deliberately compares the resolved pair rather than dereferencing
+    ;; clojure.core/require by name: a literal (var-cell-lookup "clojure.core"
+    ;; "require") here would be a runtime shim reference that has to be pinned as
+    ;; a dce-runtime-core-roots entry, which would keep require/use (and the whole
+    ;; loader behind them) unshakeable in every tree-shaken app.
+    (define (core-require-head? h)
+      (and (symbol-t? h)
+           (let* ((nm (symbol-t-name h))
+                  (sns (symbol-t-ns h))
+                  (qualified (and sns (not (jolt-nil? sns)) (not (null? sns)) sns))
+                  (here (chez-current-ns))
+                  (target
+                    (if qualified
+                        ;; a qualified ns may be a require :as alias
+                        (cons (or (chez-resolve-alias here qualified) qualified) nm)
+                        (cond ((let ((c (var-cell-lookup here nm)))
+                                 (and c (var-cell-defined? c)))
+                               (cons here nm))
+                              ((chez-resolve-refer here nm) => values)
+                              (else (cons "clojure.core" nm))))))
+             (and (string=? (car target) "clojure.core")
+                  (or (string=? (cdr target) "require")
+                      (string=? (cdr target) "use"))))))
     (define (maybe-quote-require-args form)
       (if (and (cseq? form)
                (let ((items (seq->list form)))
-                 (and (pair? items)
-                      (let ((h (car items)))
-                        (and (symbol-t? h)
-                             (let ((hn (symbol-t-name h)))
-                               (or (string=? hn "require")
-                                   (string=? hn "use"))))))))
+                 (and (pair? items) (core-require-head? (car items)))))
           (let ((items (seq->list form)))
             (list->cseq
               (cons (car items)
