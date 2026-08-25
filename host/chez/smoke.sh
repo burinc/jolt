@@ -2,8 +2,8 @@
 # CLI smoke: exercise the real jolt process end to end — core eval, runtime
 # eval/load-string, runtime defmacro, futures, and the numeric tower. The in-process
 # corpus/unit gates cover semantics in depth; this confirms the CLI entry itself.
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
-cd "$root"
+root="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
+cd "$root" || exit 1
 
 # JOLT_BIN overrides the jolt under test (make test points it at the freshly
 # built target/release/jolt — 10x faster boot than script mode; the explicit
@@ -464,6 +464,15 @@ ns_dir="$(mktemp -d)"; ns_prog="$ns_dir/p.clj"
 printf "(intern (create-ns 'aux) 'AAA 42)\n(ns main)\n(refer 'aux :only '[AAA])\n(println AAA)\n" > "$ns_prog"
 cla_check "$jolt - < \"$ns_prog\"" '42'
 rm -rf "$ns_dir"
+
+# A dialect-defined use macro owns the quoting of its arguments. The stdin
+# evaluator must not quote them first and turn one module spec into (quote ...).
+use_dir="$(mktemp -d)"; use_prog="$use_dir/p.clj"
+printf '%s\n' \
+  '(defmacro use [& specs] `(println (quote ~specs)))' \
+  '(use (demo :as d))' > "$use_prog"
+cla_check "$jolt - < \"$use_prog\"" '((demo :as d))'
+rm -rf "$use_dir"
 
 # help prints usage (bare `help` and --help/-h are synonyms) and lists the
 # nREPL server as a bare command.

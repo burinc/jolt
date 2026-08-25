@@ -149,9 +149,10 @@
 ;; throws wherever it appears — top level or nested body — matching JVM. A forward
 ;; reference needs a declare, as it does on the JVM.
 ;;
-;; The CLI auto-quotes require/use vector/list args (but NOT symbols — a plain
+;; The CLI auto-quotes require vector/list args (but NOT symbols, so a plain
 ;; (require sym) evaluates sym normally) so `(require [my.lib :as m])` works
 ;; without an explicit quote, matching the convenience of JVM Clojure's ns macro.
+;; A dialect may define its own `use` macro and own the quoting of its arguments.
 (define (jolt-run-expr-string expr app-args print?)
   (let ((cla (if (null? app-args) jolt-nil (list->cseq app-args)))
         (end (string-length expr))
@@ -167,9 +168,7 @@
                  (and (pair? items)
                       (let ((h (car items)))
                         (and (symbol-t? h)
-                             (let ((hn (symbol-t-name h)))
-                               (or (string=? hn "require")
-                                   (string=? hn "use"))))))))
+                             (string=? (symbol-t-name h) "require"))))))
           (let ((items (seq->list form)))
             (list->cseq
               (cons (car items)
