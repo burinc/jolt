@@ -97,29 +97,32 @@
 ;; A thread handle (from currentThread) captures this box, so .interrupt from
 ;; another thread sets the target thread's flag.
 ;;
-;; The cell carries the owning thread's id, because a Chez thread parameter is
-;; INHERITED: a forked thread starts with the creating thread's value. A plain
-;; (make-thread-parameter #f) therefore handed a child its PARENT's box — so
-;; interrupting the child set the parent's flag, and the monitor-ownership check in
-;; concurrency.ss saw a child as holding a lock the parent had taken. Comparing the
-;; stored id against (get-thread-id) makes an inherited cell miss, so the child
-;; allocates its own box on first use; no global table, so no per-thread leak.
-(define thread-interrupt-cell (make-thread-parameter #f))   ; (thread-id . box)
+;; A VIRTUAL REGISTER and not a thread parameter, and the reason is the bug this
+;; used to carry a workaround for: a Chez thread parameter is INHERITED, so a
+;; forked thread started out holding its PARENT's box and interrupting the child
+;; set the parent's flag. That was patched by storing (thread-id . box) and
+;; comparing the id on every read. A vreg has the property directly — a freshly
+;; forked thread starts every slot at fixnum 0 — so the id compare, the pair, and
+;; the (get-thread-id) call all go away, and what is left is one register read.
+;; That read is on the hot path: every interruptible wait consults it before
+;; deciding, including the ones that never wait (a deref of a delivered promise),
+;; and so do Thread/interrupted, .isInterrupted, monitor enter/exit and
+;; ReentrantLock's owner check.
+(define jolt-vreg-interrupt-box 9)      ; rt.ss owns the slot map; 0-8 were taken
 (define (current-interrupt-box)
-  (let ((c (thread-interrupt-cell))
-        (id (get-thread-id)))
-    (if (and (pair? c) (eqv? (car c) id))
-        (cdr c)
-        (let ((b (box #f)))
-          (thread-interrupt-cell (cons id b))
-          b))))
+  (let ((b (virtual-register jolt-vreg-interrupt-box)))
+    (if (box? b)
+        b
+        (let ((nb (box #f)))
+          (set-virtual-register! jolt-vreg-interrupt-box nb)
+          nb))))
 ;; A thread jolt itself forked already HAS a flag — the box its Thread object hands
 ;; .interrupt — so it must not lazily allocate a second one. The child adopts that
 ;; box as its own before running the body; without this, .interrupt from outside
 ;; and (.isInterrupted (Thread/currentThread)) inside were two unrelated flags and
 ;; the ordinary interruption idiom never reached the worker.
 (define (adopt-interrupt-box! b)
-  (thread-interrupt-cell (cons (get-thread-id) b))
+  (set-virtual-register! jolt-vreg-interrupt-box b)
   b)
 (define (clear-thread-interrupt!) (set-box! (current-interrupt-box) #f))
 
