@@ -147,6 +147,21 @@
 ;; *ns*, record print tags (#user.Pt), syntax-quote qualification (user/foo), and
 ;; var print (#'user/v) all render the current ns name. Recreating `user` per case
 ;; both names it correctly AND drops the previous case's defs. Never throws;
+;; Realize a value depth-first. A row's program can return an UNREALIZED lazy seq
+;; that throws only when forced — (distinct #{}) is exactly one: it builds fine on
+;; the JVM and raises "nth not supported" at realization. Left unforced inside
+;; eval-once's try, that exception escapes the per-row handler and fires later, in
+;; classify's = or in pr-str, aborting the entire run instead of bucketing the one
+;; row. Depth-first so a lazy seq nested in a vector or a map counts too.
+;; eval-safe's per-case deadline covers the forcing, which is what makes this safe
+;; on an infinite seq — the comment there already anticipates one being forced.
+(defn force-deep [v]
+  (cond
+    (map? v)  (doseq [[k vv] v] (force-deep k) (force-deep vv))
+    (coll? v) (doseq [x v] (force-deep x))
+    :else     nil)
+  v)
+
 ;; returns [:ok value] / [:throw throwable] / [:read-error throwable].
 (defn eval-once [src imports]
   (let [sink (java.io.StringWriter.)
@@ -157,7 +172,7 @@
         (binding [*ns* the-ns *out* sink *err* sink *in* empty-in]
           (clojure.core/refer-clojure)
           (doseq [c imports] (.importClass the-ns (Class/forName c)))
-          [:ok (eval-program src)]))
+          [:ok (force-deep (eval-program src))]))
       (catch clojure.lang.ExceptionInfo e
         (if (::read (ex-data e)) [:read-error (::read (ex-data e))] [:throw e]))
       (catch Throwable t [:throw t]))))
