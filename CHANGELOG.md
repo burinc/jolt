@@ -28,6 +28,11 @@ answers about the thread it stands for rather than the thread doing the asking,
 which is what makes `.interrupt` from outside a thread and that thread's own
 view of its flag one flag instead of two.
 
+And building on that one flag: `.interrupt` now reaches a thread that is
+already *parked*, not just one that will look at its flag later. Every blocking
+operation jolt models that is interruptible on the JVM now throws
+`InterruptedException` and leaves the flag cleared, the way the JVM's do.
+
 Thanks to @casselc for the interrupt fix and the compatibility surface SCI
 reaches for.
 
@@ -52,6 +57,58 @@ reaches for.
   platform.
 
 ### Fixed
+
+- **A blocking wait is interrupted, not merely flagged.** `.interrupt` set the
+  target's flag and stopped there, so a thread already parked ran its wait to
+  completion and the JVM's second half of interruption — being thrown out of the
+  wait — never happened. Code that shuts a worker down by interrupting it hung
+  until whatever it was waiting for arrived, which for a `promise` nobody
+  delivers is forever. These now throw
+  `java.lang.InterruptedException` and leave the interrupted status **cleared**,
+  each certified against JVM Clojure 1.12: `@a-promise` and `@a-future` and
+  their timed `deref` forms, `await` and `await-for`, `Thread/sleep`,
+  `TimeUnit.sleep`, `Thread.join`, `CountDownLatch.await`, an executor
+  `Future.get`, `FutureTask.get`, `ArrayBlockingQueue` `take`/`put`,
+  `ExecutorService.awaitTermination` and `Process.waitFor`. A flag that is
+  already set makes the next one of them throw immediately, without waiting at
+  all.
+
+  The mechanism is one seam. Every thread and fiber wait in the runtime already
+  funnels through `jolt-cv-wait`, whose decision is **retaken** on each wake
+  rather than resumed into, so an interrupt check at the top of that decision
+  re-runs for free on every wake and needs no second wait protocol. What had to
+  be added is a way for the interrupter to wake a waiter sitting on a condition
+  variable it has never heard of: a waiter registers its `(mutex . condition)`
+  against its own interrupt box for as long as it is willing to wait, and
+  `.interrupt` sets the flag and then pokes what is registered. The race closes
+  because the registration and the check both happen with the waiter's mutex
+  held and the interrupter must take that mutex to wake — so an interrupt cannot
+  land in the gap between deciding to wait and actually parking.
+
+  It is an **opt-in variant**, and `jolt-cv-wait` itself is unchanged: the
+  runtime's own plumbing waits through the same seam — the carrier idle wait,
+  the load barrier, the main-thread queue pump, the tap queue, the channel
+  internals — and interrupting any of those breaks the runtime rather than the
+  caller's code. Two things that look adjacent are already right and were left
+  alone: `monitor-enter` / `locking` is not interruptible on the JVM either (a
+  thread blocked entering a monitor stays blocked and its flag stays *set*), and
+  `ReentrantLock.lockInterruptibly` already threw.
+
+- **`future-cancel` interrupts the worker, and deref of a cancelled future
+  raises `CancellationException`.** `clojure.core/future-cancel` is
+  `cancel(true)` on the JVM: the worker gets a real `InterruptedException`.
+  jolt only flipped the future's own flags, so a cancelled `(future
+  (Thread/sleep 60000) ...)` kept its thread for the full minute. The worker now
+  carries the future's interrupt box, so a cancel throws it out of any
+  interruptible wait. Deref of a cancelled future raised a bare `ExceptionInfo`
+  where the JVM raises `java.util.concurrent.CancellationException`, so
+  `(catch java.util.concurrent.CancellationException _ ...)` around a deref did
+  not catch; it now does.
+
+  `jolt-future`'s record tag moves from `jolt-future-v1` to `jolt-future-v2`,
+  because a `jolt-future` is image-format surface: `jolt.image` round-trips
+  record values by nongenerative tag, and adding a field under the old tag would
+  let a new image read as an old record.
 
 - **`clojure.java.io/resource` accepts a ClassLoader.** `(io/resource n
   loader)` raised `Wrong number of args (2) passed to:

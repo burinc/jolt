@@ -71,7 +71,8 @@
         (cons "toMinutes" (lambda (self n) (tu-convert self n 60000000000)))
         (cons "toHours"   (lambda (self n) (tu-convert self n 3600000000000)))
         (cons "toDays"    (lambda (self n) (tu-convert self n 86400000000000)))
-        (cons "sleep"     (lambda (self n) (sleep (ms->duration (tu->ms n self))) jolt-nil))
+        ;; the same interruptible sleep Thread/sleep takes (java/host-static-methods.ss)
+        (cons "sleep"     (lambda (self n) (jolt-thread-sleep-ms (tu->ms n self))))
         (cons "name"      (lambda (self) (vector-ref (jhost-state self) 0)))
         (cons "toString"  (lambda (self) (vector-ref (jhost-state self) 0)))))
 ;; ...and the same for (str TimeUnit/SECONDS): an enum constant's toString is its
@@ -84,9 +85,19 @@
 ;;   cancelled?  — future-cancel won before the body finished
 ;;   ok?         — payload is a value (else payload is a raised condition/value)
 ;;   payload     — the result value, or the captured throw
+;;   ibox        — the WORKER's interrupt box, so future-cancel can interrupt the
+;;                 running body the way the JVM's cancel(true) does. Allocated by
+;;                 future-call and adopted by the worker, not read out of it after
+;;                 the fork: a cancel that lands before the worker has run a line
+;;                 must still reach it.
+;;
+;; The tag is jolt-future-v2 and not -v1 because a jolt-future is IMAGE-FORMAT
+;; surface (jolt.image round-trips record values by nongenerative tag), so adding a
+;; field to the old tag would let a new image read as an old record. `make
+;; stateimage` is the gate.
 (define-record-type jolt-future
-  (fields (mutable done?) (mutable cancelled?) (mutable ok?) (mutable payload) mu cv)
-  (nongenerative jolt-future-v1))
+  (fields (mutable done?) (mutable cancelled?) (mutable ok?) (mutable payload) mu cv ibox)
+  (nongenerative jolt-future-v2))
 
 ;; (future-call thunk): spawn a thread running (thunk). The dynamic bindings in
 ;; effect now are conveyed into the worker (Chez inherits thread-parameters at
@@ -94,11 +105,17 @@
 ;; or thrown condition — is latched and broadcast; a cancel that already finalized
 ;; the future makes the late result a no-op.
 (define (jolt-future-call thunk)
-  (let ((f (make-jolt-future #f #f #f jolt-nil (make-mutex) (make-condition)))
-        (snap (dyn-binding-stack)))
+  (let* ((ibox (box #f))
+         (f (make-jolt-future #f #f #f jolt-nil (make-mutex) (make-condition) ibox))
+         (snap (dyn-binding-stack)))
     (fork-thread
      (lambda ()
        (*txn* #f)                          ; child thread must not inherit parent's txn
+       ;; The worker's flag is the future's flag: future-cancel sets it, and
+       ;; (Thread/currentThread) inside the body hands back a handle onto the same
+       ;; box, so .isInterrupted / Thread/interrupted inside the worker and the
+       ;; cancel from outside are ONE flag (the shape jolt#727 fixed for Thread.).
+       (adopt-interrupt-box! ibox)
        (dyn-binding-stack snap)
        (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
          (jolt-with-mutex (jolt-future-mu f)
@@ -114,8 +131,13 @@
 ;; the value. The original exception is stored as the cause so ex-cause works.
 (define (jolt-future-finish f)
   (cond
+    ;; CancellationException, certified against JVM Clojure 1.12 — @a-cancelled-future
+    ;; raises java.util.concurrent.CancellationException there, where jolt raised a
+    ;; bare ExceptionInfo, so (catch java.util.concurrent.CancellationException _ …)
+    ;; around a deref did not catch on jolt.
     ((jolt-future-cancelled? f)
-     (jolt-throw (jolt-ex-info "Future cancelled" (jolt-hash-map))))
+     (jolt-throw (jolt-host-throwable "java.util.concurrent.CancellationException"
+                                      "Future cancelled")))
     ((jolt-future-ok? f) (jolt-future-payload f))
     (else (let ((cause (jolt-unwrap-throw (jolt-future-payload f))))
             (jolt-throw (jolt-host-throwable "java.util.concurrent.ExecutionException"
@@ -129,7 +151,7 @@
 ;; parks now and the settle resumes it; a thread still blocks, which is what a
 ;; thread should do.
 (define (jolt-future-deref f)
-  (jolt-cv-wait (jolt-future-mu f) (jolt-future-cv f) #f
+  (jolt-cv-wait-interruptibly "future deref" (jolt-future-mu f) (jolt-future-cv f) #f
     (lambda (_timed-out?)
       (if (jolt-future-done? f) #t jolt-cv-again)))
   (jolt-future-finish f))
@@ -137,7 +159,8 @@
 ;; (deref f timeout-ms timeout-val): wait up to timeout-ms; return timeout-val if
 ;; it has not settled by the absolute deadline.
 (define (jolt-future-deref-timed f ms timeout-val)
-  (let ((settled (jolt-cv-wait (jolt-future-mu f) (jolt-future-cv f)
+  (let ((settled (jolt-cv-wait-interruptibly "future deref"
+                               (jolt-future-mu f) (jolt-future-cv f)
                                (ms->deadline-millis ms)
                    (lambda (timed-out?)
                      ;; done? FIRST on both paths: a future that settled as the
@@ -148,9 +171,17 @@
                            (else jolt-cv-again))))))
     (if settled (jolt-future-finish f) timeout-val)))
 
-;; future-cancel: the running thread can't be interrupted, but the future object
-;; reflects the cancellation — if not already settled, mark it cancelled+done so
-;; derefs raise and the predicates flip. Returns true iff this call cancelled it.
+;; future-cancel: mark the future cancelled+done if it has not settled — so derefs
+;; raise and the predicates flip — and INTERRUPT the worker, which is what
+;; clojure.core/future-cancel does on the JVM (it calls cancel(true)). A worker
+;; blocked in an interruptible wait is thrown out of it; one running compute sees
+;; the flag through Thread/interrupted or .isInterrupted, the same as on the JVM,
+;; which cannot stop a computation either. Returns true iff this call cancelled it.
+;;
+;; The interrupt is delivered OUTSIDE the future's mutex. jolt-interrupt-wake-waits!
+;; takes the registry's mutex and then each waiter's, and the worker may itself be
+;; waiting on something; doing that under mu here would order this future's mutex
+;; above the whole set of them for no reason.
 (define (jolt-future-cancel f)
   (let ((cancelled (jolt-with-mutex (jolt-future-mu f)
                      (if (jolt-future-done? f)
@@ -159,6 +190,10 @@
                                 (jolt-future-done?-set! f #t)
                                 (jolt-cv-wake! (jolt-future-cv f))
                                 #t)))))
+    (when cancelled
+      (let ((b (jolt-future-ibox f)))
+        (set-box! b #t)
+        (jolt-interrupt-wake-waits! b)))
     cancelled))
 
 (define (jolt-native-future-done? x)
@@ -196,13 +231,14 @@
       (jolt-throw (jolt-ex-info "deliver requires a promise" (jolt-hash-map)))))
 
 (define (jolt-promise-deref p)
-  (jolt-cv-wait (jolt-promise-mu p) (jolt-promise-cv p) #f
+  (jolt-cv-wait-interruptibly "promise deref" (jolt-promise-mu p) (jolt-promise-cv p) #f
     (lambda (_timed-out?)
       (if (jolt-promise-delivered? p) #t jolt-cv-again)))
   (jolt-promise-value p))
 
 (define (jolt-promise-deref-timed p ms timeout-val)
-  (let ((got (jolt-cv-wait (jolt-promise-mu p) (jolt-promise-cv p)
+  (let ((got (jolt-cv-wait-interruptibly "promise deref"
+                           (jolt-promise-mu p) (jolt-promise-cv p)
                            (ms->deadline-millis ms)
                (lambda (timed-out?)
                  (cond ((jolt-promise-delivered? p) #t)
@@ -414,7 +450,7 @@
   (jolt-agent-await-check)
   (for-each
     (lambda (a)
-      (jolt-cv-wait (jolt-agent-mu a) (jolt-agent-cv a) #f
+      (jolt-cv-wait-interruptibly "agent await" (jolt-agent-mu a) (jolt-agent-cv a) #f
         (lambda (_timed-out?)
           (cond
             ((not (jolt-nil? (jolt-agent-err a))) (jolt-agent-failed-throw a))
@@ -432,7 +468,8 @@
       (lambda (a)
         (when ok
           (unless
-            (jolt-cv-wait (jolt-agent-mu a) (jolt-agent-cv a) deadline
+            (jolt-cv-wait-interruptibly "agent await-for"
+                                        (jolt-agent-mu a) (jolt-agent-cv a) deadline
               (lambda (timed-out?)
                 (cond
                   ;; DRAINED is tested before the deadline on purpose: a drain that
@@ -1378,7 +1415,8 @@
             ;; is LEFT of the timeout rather than restarting it. A joining FIBER
             ;; parks: blocking its carrier would stop every other fiber on it until
             ;; the thread it joins exits.
-            (jolt-cv-wait (vector-ref st 2) (vector-ref st 3)
+            (jolt-cv-wait-interruptibly "Thread.join"
+                          (vector-ref st 2) (vector-ref st 3)
                           (and ms (not (= ms 0)) (ms->deadline-millis ms))
               (lambda (timed-out?)
                 (cond ((not (jthread-alive? st)) #t)
@@ -1386,7 +1424,13 @@
                       (else jolt-cv-again)))))
           jolt-nil))
         (cons "isAlive" (lambda (self) (jthread-alive? (jhost-state self))))
-        (cons "interrupt" (lambda (self . _) (set-box! (vector-ref (jhost-state self) 4) #t) jolt-nil))
+        ;; flag then poke, so a wait already parked on a condition this thread
+        ;; registered is thrown out of it rather than merely told afterwards
+        (cons "interrupt" (lambda (self . _)
+          (let ((b (vector-ref (jhost-state self) 4)))
+            (set-box! b #t)
+            (jolt-interrupt-wake-waits! b))
+          jolt-nil))
         (cons "isInterrupted" (lambda (self) (and (unbox (vector-ref (jhost-state self) 4)) #t)))
         (cons "getName" (lambda (self) (unbox (vector-ref (jhost-state self) 6))))
         ;; A rename after .start has to reach the running thread too, or the two
@@ -1417,7 +1461,8 @@
                 (ms (tu-args->ms args)))
             ;; absolute deadline, so a spurious wakeup resumes waiting for what is
             ;; left of the timeout rather than restarting it
-            (let ((reached (jolt-cv-wait (vector-ref st 1) (vector-ref st 2)
+            (let ((reached (jolt-cv-wait-interruptibly "CountDownLatch.await"
+                                         (vector-ref st 1) (vector-ref st 2)
                                          (and ms (ms->deadline-millis ms))
                              (lambda (timed-out?)
                                (cond ((<= (vector-ref st 0) 0) #t)
@@ -1449,7 +1494,8 @@
   (list (cons "get" (lambda (self . args)
           (let* ((st (jhost-state self))
                  (ms (tu-args->ms args))
-                 (done (jolt-cv-wait (vector-ref st 3) (vector-ref st 4)
+                 (done (jolt-cv-wait-interruptibly "Future.get"
+                                     (vector-ref st 3) (vector-ref st 4)
                                      (and ms (ms->deadline-millis ms))
                          (lambda (timed-out?)
                            (cond ((vector-ref st 0) #t)
@@ -1555,7 +1601,8 @@
             ;; care: the workers already broadcast this condition as each one exits,
             ;; and shutdown broadcasts it too. It also stops a fiber calling this from
             ;; sleeping its carrier in 100ms chunks.
-            (jolt-cv-wait (vector-ref st 2) (vector-ref st 3) deadline
+            (jolt-cv-wait-interruptibly "ExecutorService.awaitTermination"
+                                        (vector-ref st 2) (vector-ref st 3) deadline
               (lambda (timed-out?)
                 (cond ((and (vector-ref st 0) (fx=? 0 (vector-ref st 4))) #t)
                       (timed-out? #f)
@@ -1598,14 +1645,16 @@
 ;; ELEMENT stays distinct from a timeout's #f.
 (define (abq-take-wait self deadline)
   (let ((st (jhost-state self)))
-    (jolt-cv-wait (vector-ref st 1) (vector-ref st 2) deadline
+    (jolt-cv-wait-interruptibly "BlockingQueue.take"
+                                (vector-ref st 1) (vector-ref st 2) deadline
       (lambda (timed-out?)
         (cond ((fx>? (vector-ref st 4) 0) (cons (abq-deq! st) #t))
               (timed-out? #f)
               (else jolt-cv-again))))))
 (define (abq-put-wait self v deadline)
   (let ((st (jhost-state self)))
-    (jolt-cv-wait (vector-ref st 1) (vector-ref st 2) deadline
+    (jolt-cv-wait-interruptibly "BlockingQueue.put"
+                                (vector-ref st 1) (vector-ref st 2) deadline
       (lambda (timed-out?)
         (cond ((fx<? (vector-ref st 4) (vector-ref st 0)) (abq-enq! st v) #t)
               (timed-out? #f)
@@ -1681,7 +1730,8 @@
         (cons "get" (lambda (self . args)
           (let* ((st (jhost-state self))
                  (ms (tu-args->ms args))
-                 (r (jolt-cv-wait (vector-ref st 5) (vector-ref st 6)
+                 (r (jolt-cv-wait-interruptibly "FutureTask.get"
+                                  (vector-ref st 5) (vector-ref st 6)
                                   (and ms (ms->deadline-millis ms))
                       (lambda (timed-out?)
                         (cond ((memq (vector-ref st 0) '(done cancelled)) (vector-ref st 0))

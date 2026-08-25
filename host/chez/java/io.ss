@@ -1297,9 +1297,16 @@
         ;; to name the caller var; it degrades to no ::caller, the conform error
         ;; (the ExceptionInfo) is still thrown.
         (cons "getStackTrace" (lambda (self) (jolt-vector)))
+        ;; The flag first, then the poke: a waiter woken by the poke reads the
+        ;; flag, so a wake that arrives before it is set says nothing. Waking is
+        ;; what turns .interrupt from "the target will notice next time it looks"
+        ;; into the JVM's "the target is thrown out of its wait now"
+        ;; (jolt-cv-wait-interruptibly, host/chez/locks.ss).
         (cons "interrupt" (lambda (self)
                             (let ((b (thread-handle-box self)))
-                              (when (box? b) (set-box! b #t)))
+                              (when (box? b)
+                                (set-box! b #t)
+                                (jolt-interrupt-wake-waits! b)))
                             jolt-nil))
         (cons "isInterrupted" (lambda (self)
                                 (let ((b (thread-handle-box self)))
