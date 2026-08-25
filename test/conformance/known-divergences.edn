@@ -475,14 +475,30 @@
    :behavior "(.interrupt t) for a dispatch thread t while several go blocks are parked in blocking derefs that ran on it"
    :jvm "a parked go block holds no thread; only whatever is running on t at that moment can be interrupted"
    :jolt "the parked fibers registered against t's interrupt box are all woken and one of them consumes the interrupt and throws"
-   :note "jolt has no per-fiber interrupt flag to key on and .interrupt is handed a box and nothing else. The check CLEARS, so one interrupt still produces exactly one InterruptedException — but which fiber gets it is not determined. Pinned by the \"interrupt / blocking\" rows in test/chez/unit.edn; the reasoning is at jolt-cv-wait-interruptibly in host/chez/locks.ss."}
+   :note "jolt has no per-fiber interrupt flag to key on and .interrupt is handed a box and nothing else. The check CLEARS, so one interrupt still produces exactly one InterruptedException — but which fiber gets it is not determined. Pinned by the \"interrupt / blocking fibers\" rows in test/chez/unit.edn, which bind *go-backend* :fiber — go defaults to :thread, so an unbound (go ...) runs on an OS thread and tests nothing about fibers. The reasoning is at jolt-cv-wait-interruptibly in host/chez/locks.ss."}
+  ;; A fiber's Thread/sleep gets the ALREADY-SET half of the rule but not the other
+  ;; half. Chez's sleep has no wakeup, and Thread/sleep on a fiber deliberately
+  ;; sleeps its CARRIER (fibers-pool-test case 6 pins that, and a go block doing
+  ;; Thread/sleep occupies its thread on the JVM too), so there is nothing to poke.
+  ;; Parking the fiber with a deadline instead would fix it and would also release
+  ;; the carrier, which is the behavior that gate deliberately pins the other way.
+  {:category :concurrency-model
+   :behavior "(.interrupt carrier) while a fiber on it is inside (Thread/sleep n) — under (binding [*go-backend* :fiber] ...)"
+   :jvm "a go block's Thread/sleep runs on a pool thread and throws InterruptedException at once"
+   :jolt "the sleep runs to its full duration; the flag is set and readable the moment it returns"
+   :note "Entering the sleep with the flag ALREADY set does throw, so the pre-set half matches. Only mid-sleep delivery is missing. Pinned by the last \"interrupt / blocking fibers\" row in test/chez/unit.edn, which also shows the flag surviving the nap. A fiber that must be interruptible mid-wait should park on a promise or channel rather than sleep."}
   ;; The piped streams are the one blocking read left outside the interruptible set.
   {:category :concurrency-model
    :behavior "(.interrupt t) while t is blocked in (.read a-PipedInputStream)"
    :jvm "the read throws java.io.InterruptedIOException"
    :jolt "the read blocks until the writer writes or closes; the flag is set and readable afterwards"
    :note "PipedInputStream signals interruption with an IOException subclass rather than InterruptedException, so it is a different contract from the ops jolt-cv-wait-interruptibly covers. Bound the read with a timeout or close the write end to release a reader."}
-  ;; NOT a divergence, recorded so it is not "fixed": monitor-enter / locking is
+  ;; NOT a divergence, and recorded so it does not read as an oversight: jolt has no
+  ;; Object.wait / .notify / .notifyAll on any object — they are in no host method
+  ;; table — so the JVM's interruptible Object.wait has no jolt counterpart to
+  ;; convert. (monitor-wait! in java/concurrency.ss is the monitor ENTER wait, not
+  ;; Object.wait, and it is correctly uninterruptible; see the row below.)
+  ;; NOT a divergence either, recorded so it is not "fixed": monitor-enter / locking is
   ;; uninterruptible on the JVM too — a thread blocked entering a monitor stays
   ;; blocked and its flag stays SET rather than being consumed. jolt matches it
   ;; exactly, both halves probed against JVM Clojure 1.12. ReentrantLock is the

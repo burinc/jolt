@@ -150,7 +150,17 @@
 (define (jolt-thread-sleep-ms ms)
   (let ((ms (exact (floor ms))))
     (if (jolt-current-fiber)
-        (sleep (make-time 'time-duration (* (remainder ms 1000) 1000000) (quotient ms 1000)))
+        (begin
+          ;; The ALREADY-SET half of the rule, which a bare sleep silently dropped:
+          ;; entering any interruptible op with the flag set throws without waiting,
+          ;; and a fiber reads that flag on its carrier's box like every other wait
+          ;; here. What a fiber cannot get is the other half — Chez's sleep has no
+          ;; wakeup, so an interrupt arriving DURING the nap is not seen until it
+          ;; ends. That is in known-divergences.edn rather than papered over: closing
+          ;; it means parking the fiber with a deadline, and releasing the carrier is
+          ;; the thing fibers-pool-test case 6 deliberately pins the other way.
+          (jolt-interrupt-poll-check! "sleep interrupted")
+          (sleep (make-time 'time-duration (* (remainder ms 1000) 1000000) (quotient ms 1000))))
         (let ((mu (make-mutex)) (cv (make-condition)))
           (jolt-cv-wait-interruptibly "sleep interrupted" mu cv (+ (now-millis) ms)
             (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))))

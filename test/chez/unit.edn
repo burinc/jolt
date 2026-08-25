@@ -201,37 +201,77 @@
   ;; --- interrupt out of a blocking wait ---------------------------------------
   ;; The JVM's second half of interruption: a thread parked in an interruptible wait
   ;; is THROWN OUT of it with InterruptedException and the flag is left cleared.
-  ;; The behavior these rows pin was probed on JVM Clojure 1.12 rather than read
-  ;; off the javadoc: all thirteen blocking ops throw and leave the flag cleared,
-  ;; and @promise / @future throw InterruptedException raw rather than wrapped.
+  ;; The behavior these rows pin was probed on JVM Clojure 1.12.5 rather than read
+  ;; off the javadoc, and every thread row below was run there and answers the same
+  ;; value it does here.
+  ;;
   ;; The ops jolt makes interruptible are the ones a JVM caller can already name;
   ;; the runtime's own plumbing (carrier idle wait, load barrier, main-queue pump,
   ;; tap queue, channel internals) is deliberately NOT — see host/chez/locks.ss.
+  ;; jolt has no Object.wait/notify at all, on any object, so the JVM's Object.wait
+  ;; has nothing here to make interruptible; monitor-wait! in java/concurrency.ss is
+  ;; the monitor ENTER wait, which correctly stays uninterruptible (row (e) below).
   ;;
-  ;; A flag that is ALREADY set makes the next blocking op throw without waiting,
-  ;; and clears. Both halves in one row so a stray set flag cannot leak into the
-  ;; next case.
-  {:suite "interrupt / blocking" :expr "(let [t (Thread/currentThread)] (.interrupt t) [(try (deref (promise)) :no-throw (catch InterruptedException e :threw)) (.isInterrupted t)])" :expected "[:threw false]"}
-  ;; ...and the same for a thread already parked when the interrupt arrives. The
-  ;; sleep is only there to make the PARKED path the one exercised; the row passes
-  ;; either way, so it is not a timing dependency.
-  {:suite "interrupt / blocking" :expr "(let [p (promise) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (deliver out (try (deref p) :no-throw (catch InterruptedException e :threw)))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected ":threw"}
-  {:suite "interrupt / blocking" :expr "(let [l (java.util.concurrent.CountDownLatch. 1) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (deliver out (try (.await l) :no-throw (catch InterruptedException e :threw)))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected ":threw"}
-  {:suite "interrupt / blocking" :expr "(let [ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (deliver out (try (Thread/sleep 30000) :no-throw (catch InterruptedException e :threw)))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected ":threw"}
-  {:suite "interrupt / blocking" :expr "(let [w (Thread. (fn [] (try (Thread/sleep 30000) (catch InterruptedException e nil)))) ready (promise) out (promise)] (.start w) (let [t (Thread. (fn [] (deliver ready true) (deliver out (try (.join w) :no-throw (catch InterruptedException e :threw)))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (let [r (deref out 5000 :timeout)] (.interrupt w) r)))" :expected ":threw"}
-  {:suite "interrupt / blocking" :expr "(let [q (java.util.concurrent.ArrayBlockingQueue. 1) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (deliver out (try (.take q) :no-throw (catch InterruptedException e :threw)))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected ":threw"}
-  {:suite "interrupt / blocking" :expr "(let [a (agent 0) ready (promise) out (promise)] (send-off a (fn [x] (Thread/sleep 3000) (inc x))) (let [t (Thread. (fn [] (deliver ready true) (deliver out (try (await a) :no-throw (catch InterruptedException e :threw)))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout)))" :expected ":threw"}
+  ;; NO ROW MAY BLOCK THE EVALUATING THREAD UNBOUNDEDLY. A row that hangs stalls the
+  ;; gate with no output instead of reporting, so every wait here is either on a
+  ;; worker read back through a bounded deref, or rescued by a late deliver.
+  ;; A flag that is ALREADY set makes the next blocking op throw without waiting
+  ;; at all, and clears it. Nothing here blocks THIS thread unboundedly: the late
+  ;; deliver rescues the deref, so a runtime that ignores the interrupt answers
+  ;; :late after 4s and the row FAILS instead of hanging the gate with no output.
+  {:suite "interrupt / blocking" :expr "(let [p (promise) t (Thread/currentThread) t0 (System/nanoTime)] (future (Thread/sleep 4000) (deliver p :late)) (.interrupt t) (let [r (try (deref p) :no-throw (catch InterruptedException e :threw))] [r (< (quot (- (System/nanoTime) t0) 1000000) 2000) (.isInterrupted t)]))" :expected "[:threw true false]"}
+  ;; ...and a thread already PARKED when the interrupt arrives. Every row below is
+  ;; the same shape: the worker parks in one op, the main thread interrupts it, and
+  ;; the answer pins both that it threw (a) and that it threw promptly rather than
+  ;; running the wait out (b).
+  {:suite "interrupt / blocking" :expr "(let [p (promise) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (deref p) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [p (promise) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (deref p 30000 :to) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [f (future (Thread/sleep 30000) 1) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (deref f 30000 :to) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (let [r (deref out 5000 :timeout)] (future-cancel f) r))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [l (java.util.concurrent.CountDownLatch. 1) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.await l) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (Thread/sleep 30000) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.sleep java.util.concurrent.TimeUnit/SECONDS 30) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [w (doto (Thread. (fn [] (try (Thread/sleep 30000) (catch InterruptedException e nil)))) (.start)) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.join w) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (let [r (deref out 5000 :timeout)] (.interrupt w) r))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [q (java.util.concurrent.ArrayBlockingQueue. 1) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.take q) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [q (doto (java.util.concurrent.ArrayBlockingQueue. 1) (.put :fill)) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.put q :blocked) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor) fut (.submit ex ^java.util.concurrent.Callable (fn [] (Thread/sleep 30000) 42)) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.get fut) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (let [r (deref out 5000 :timeout)] (.shutdownNow ex) r))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [ft (java.util.concurrent.FutureTask. (fn [] (Thread/sleep 30000) 1)) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.get ft) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [ex (doto (java.util.concurrent.Executors/newSingleThreadExecutor) (.submit ^java.util.concurrent.Callable (fn [] (Thread/sleep 30000) 1)) (.shutdown)) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.awaitTermination ex 30 java.util.concurrent.TimeUnit/SECONDS) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (let [r (deref out 5000 :timeout)] (.shutdownNow ex) r))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [pr (.start (ProcessBuilder. [\"sleep\" \"30\"])) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (.waitFor pr) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 200) (.interrupt t) (let [r (deref out 5000 :timeout)] (.destroyForcibly pr) r))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [a (agent 0) ready (promise) out (promise)] (send-off a (fn [x] (Thread/sleep 4000) (inc x))) (let [t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (await a) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout)))" :expected "[:threw true]"}
+  {:suite "interrupt / blocking" :expr "(let [a (agent 0) ready (promise) out (promise)] (send-off a (fn [x] (Thread/sleep 4000) (inc x))) (let [t (Thread. (fn [] (deliver ready true) (let [t0 (System/nanoTime) r (try (await-for 30000 a) :no-throw (catch InterruptedException e :threw))] (deliver out [r (< (quot (- (System/nanoTime) t0) 1000000) 3000)]))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout)))" :expected "[:threw true]"}
   ;; future-cancel is cancel(true) on the JVM: the worker gets a real interrupt.
   {:suite "interrupt / blocking" :expr "(let [ready (promise) out (promise) f (future (deliver ready true) (try (Thread/sleep 30000) (deliver out :no-throw) (catch InterruptedException e (deliver out :threw))))] (deref ready 5000 :timeout) (Thread/sleep 50) [(future-cancel f) (deref out 5000 :timeout)])" :expected "[true :threw]"}
   ;; ...and deref of a cancelled future is CancellationException, not ExceptionInfo.
   {:suite "interrupt / blocking" :expr "(let [f (future (Thread/sleep 30000) 1)] (future-cancel f) (try (deref f) :no-throw (catch java.util.concurrent.CancellationException e :cancelled)))" :expected ":cancelled"}
-  ;; THE FIBER ROW. A fiber has no interrupt flag of its own, so it registers under
-  ;; the interrupt box of the carrier it runs on and (Thread/currentThread) inside a
-  ;; go block IS that carrier — so a go block can interrupt its own blocking wait.
-  ;; This is the identity decision jolt-cv-wait-interruptibly documents, pinned.
-  {:suite "interrupt / blocking" :expr "(do (require (quote [clojure.core.async :as a])) (a/<!! (a/go (.interrupt (Thread/currentThread)) (try (deref (promise)) :no-throw (catch InterruptedException e :threw)))))" :expected ":threw"}
-  ;; a wait nobody interrupts still returns its value, and the flag stays clear
+  ;; (e) THE OTHER DIRECTION, and the reason it is a row rather than a comment:
+  ;; monitor-enter / locking is NOT interruptible on the JVM, and the flag is left
+  ;; SET rather than consumed. jolt matches it exactly. Probed on both runtimes —
+  ;; if a later change made every wait interruptible, this row is what refuses it.
+  {:suite "interrupt / blocking" :expr "(let [o (Object.) held (promise) rel (promise) ready (promise) out (promise) h (Thread. (fn [] (locking o (deliver held true) (deref rel 5000 :t)))) t (Thread. (fn [] (deliver ready true) (deliver out (try (locking o [:entered (.isInterrupted (Thread/currentThread))]) (catch InterruptedException e :threw)))))] (.start h) (deref held 5000 :t) (.start t) (deref ready 5000 :t) (Thread/sleep 100) (.interrupt t) (Thread/sleep 200) (deliver rel true) (deref out 5000 :timeout))" :expected "[:entered true]"}
+  ;; (c) a wait nobody interrupts still returns its value, and the flag stays clear
   {:suite "interrupt / blocking" :expr "(let [p (promise)] (future (Thread/sleep 20) (deliver p :ok)) [(deref p 5000 :timeout) (.isInterrupted (Thread/currentThread))])" :expected "[:ok false]"}
+  ;; THE FIBER ROWS, and they bind *go-backend* :fiber ON PURPOSE — go defaults to
+  ;; :thread, so an unbound (go ...) row runs on a plain OS thread and re-tests the
+  ;; thread rows above rather than the fiber path. (jolt.host/fiber?) is carried in
+  ;; each answer so the row cannot silently stop testing what it claims to.
+  ;;
+  ;; A fiber has no interrupt flag of its own: it registers under the interrupt box
+  ;; of the CARRIER it runs on, and (Thread/currentThread) inside a go block is that
+  ;; carrier. So a fiber can interrupt its own blocking wait. The late deliver keeps
+  ;; a runtime that ignores it from hanging the gate.
+  {:suite "interrupt / blocking fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [p (promise)] (future (Thread/sleep 4000) (deliver p :late)) (a/<!! (a/go [(jolt.host/fiber?) (do (.interrupt (Thread/currentThread)) (try (deref p) :no-throw (catch InterruptedException e :threw)))])))))" :expected "[true :threw]"}
+  ;; ...and a genuinely PARKED fiber, woken by an external .interrupt of its carrier.
+  ;; This is the half a self-interrupt cannot show: the fiber is off the CPU when the
+  ;; interrupt lands, so it is the registry that has to find it.
+  {:suite "interrupt / blocking fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [p (promise) carrier (promise) out (promise)] (a/go (deliver carrier [(jolt.host/fiber?) (Thread/currentThread)]) (deliver out (try (deref p) :no-throw (catch InterruptedException e :threw)))) (let [[fib? c] (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt c) [fib? (deref out 5000 :timeout)]))))" :expected "[true :threw]"}
+  ;; Thread/sleep on a fiber sleeps its CARRIER (fibers-pool-test case 6 pins that),
+  ;; but it still owes the already-set half of the rule.
+  {:suite "interrupt / blocking fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (a/<!! (a/go [(jolt.host/fiber?) (try (.interrupt (Thread/currentThread)) (Thread/sleep 2000) :no-throw (catch InterruptedException e :threw))]))))" :expected "[true :threw]"}
+  ;; THE DIVERGENCE, pinned rather than left to prose: an interrupt arriving DURING a
+  ;; fiber's sleep is not seen, because Chez's sleep has no wakeup. Reading the flag
+  ;; with Thread/interrupted proves it was set all along AND clears it, so this row
+  ;; cannot leak a set flag onto a carrier the later rows share.
+  {:suite "interrupt / blocking fibers" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (let [carrier (promise) out (promise)] (a/go (deliver carrier (Thread/currentThread)) (deliver out [(try (Thread/sleep 1200) :no-throw (catch InterruptedException e :threw)) (Thread/interrupted)])) (let [c (deref carrier 5000 :timeout)] (Thread/sleep 150) (.interrupt c) (deref out 5000 :timeout)))))" :expected "[:no-throw true]"}
   {:suite "ns-tl" :expr "(do (in-ns (quote foo.bar)) (str *ns*))" :expected "\"foo.bar\""}
   {:suite "ns-tl" :expr "(do (create-ns (quote my.ns)) (binding [*ns* (find-ns (quote my.ns))] (str *ns*)))" :expected "\"my.ns\""}
   {:suite "ns-tl" :expr "(do (in-ns (quote app.core)) (def sekret 42) (in-ns (quote user)) (binding [*ns* (find-ns (quote app.core))] (load-string \"sekret\")))" :expected "42"}

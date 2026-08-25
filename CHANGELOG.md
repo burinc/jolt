@@ -29,9 +29,9 @@ which is what makes `.interrupt` from outside a thread and that thread's own
 view of its flag one flag instead of two.
 
 And building on that one flag: `.interrupt` now reaches a thread that is
-already *parked*, not just one that will look at its flag later. Fourteen
-blocking operations throw `InterruptedException` and leave the flag cleared, the
-way the JVM's do.
+already *parked*, not just one that will look at its flag later. Every blocking
+operation jolt models that is interruptible on the JVM now throws
+`InterruptedException` and leaves the flag cleared, the way the JVM's do.
 
 Thanks to @casselc for the interrupt fix and the compatibility surface SCI
 reaches for.
@@ -63,7 +63,7 @@ reaches for.
   completion and the JVM's second half of interruption — being thrown out of the
   wait — never happened. Code that shuts a worker down by interrupting it hung
   until whatever it was waiting for arrived, which for a `promise` nobody
-  delivers is forever. Fourteen operations now throw
+  delivers is forever. Fourteen entry points now throw
   `java.lang.InterruptedException` and leave the interrupted status **cleared**,
   each certified against JVM Clojure 1.12: `@a-promise` and `@a-future` and
   their timed `deref` forms, `await` and `await-for`, `Thread/sleep`,

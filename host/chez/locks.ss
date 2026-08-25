@@ -511,37 +511,56 @@
 ;; strictly more information and is what its other host throwables do.
 (define (jolt-cv-wait-interruptibly who mu cv deadline decide)
   (let ((b (current-interrupt-box))
-        (entry (cons mu cv))
-        (registered? #f))
-    ;; registered? is read and written only from inside decide, which runs under
-    ;; mu and only ever for this one waiter, so it needs no protection of its own.
-    (define (unregister!)
-      (when registered?
-        (set! registered? #f)
-        (jolt-interrupt-wait-remove! b entry)))
-    (define (interrupted!)
-      (unregister!)
-      (jolt-interrupted-throw! who))
+        (entry #f))                    ; consed only if this wait actually waits
     (jolt-cv-wait mu cv deadline
       (lambda (timed-out?)
-        (when (jolt-interrupt-take! b) (interrupted!))
-        ;; decide throws on its own account (a failed agent is the live case), so
-        ;; the deregistration has to cover that exit too or the entry outlives the
-        ;; wait and a later interrupt pokes a condition nobody is on.
-        ;;
-        ;; with-exception-handler and not guard, for java/sm.ss's reason: the
-        ;; handler runs AT THE RAISE POINT, so jolt-throw's captured continuation
-        ;; and site still describe where the throw came from. A guard would unwind
-        ;; first and the report would name this wait instead.
-        (let ((r (with-exception-handler
-                   (lambda (e) (unregister!) (raise-continuable e))
-                   (lambda () (decide timed-out?)))))
+        ;; The flag read is INLINE rather than a call to jolt-interrupt-take!. This
+        ;; runs on every round of every interruptible wait, including the ones that
+        ;; never wait at all, and the call alone measured ~8ns per deref against an
+        ;; already-settled promise — the same order as everything else left here.
+        (when (unbox b)
+          (set-box! b #f)
+          (when entry (jolt-interrupt-wait-remove! b entry))
+          (jolt-interrupted-throw! who))
+        (let ((r (if entry
+                     ;; REGISTERED. decide throws on its own account (a failed agent
+                     ;; is the live case), so that exit has to deregister too, or the
+                     ;; entry outlives the wait and a later interrupt pokes a
+                     ;; condition nobody is on.
+                     ;;
+                     ;; with-exception-handler and not guard, for java/sm.ss's
+                     ;; reason: the handler runs AT THE RAISE POINT, so jolt-throw's
+                     ;; captured continuation and site still describe where the throw
+                     ;; came from. A guard would unwind first and the report would
+                     ;; name this wait instead.
+                     (with-exception-handler
+                       (lambda (e) (jolt-interrupt-wait-remove! b entry) (raise-continuable e))
+                       (lambda () (decide timed-out?)))
+                     ;; NOT REGISTERED — the fast path, and the reason for the
+                     ;; branch. A wait that answers on its first run (a deref of an
+                     ;; already-delivered promise, a take from a non-empty queue) has
+                     ;; nothing to clean up, so it runs decide with nothing wrapped
+                     ;; around it and its whole cost is the flag read above. Wrapping
+                     ;; it unconditionally, and consing the entry up front, is what
+                     ;; made a settled deref 1.7x rather than 1.1x.
+                     (decide timed-out?))))
           (cond
-            ((not (eq? r jolt-cv-again)) (unregister!) r)
-            (registered? r)             ; already findable; nothing changed
+            ((not (eq? r jolt-cv-again))
+             (when entry
+               (jolt-interrupt-wait-remove! b entry)
+               (set! entry #f))
+             r)
+            (entry r)                   ; already findable; nothing changed
             (else
-             (set! registered? #t)
-             (jolt-interrupt-wait-add! b entry)
-             ;; the re-read that closes the check-then-register window
-             (when (jolt-interrupt-take! b) (interrupted!))
+             ;; about to wait for the first time: become findable, then RE-READ the
+             ;; flag. The window between the read above and this registration is
+             ;; exactly what that second read closes.
+             (let ((e (cons mu cv)))
+               (set! entry e)
+               (jolt-interrupt-wait-add! b e)
+               (when (unbox b)
+                 (set-box! b #f)
+                 (jolt-interrupt-wait-remove! b e)
+                 (set! entry #f)
+                 (jolt-interrupted-throw! who)))
              r)))))))
