@@ -63,7 +63,7 @@ reaches for.
   completion and the JVM's second half of interruption — being thrown out of the
   wait — never happened. Code that shuts a worker down by interrupting it hung
   until whatever it was waiting for arrived, which for a `promise` nobody
-  delivers is forever. Fourteen entry points now throw
+  delivers is forever. These now throw
   `java.lang.InterruptedException` and leave the interrupted status **cleared**,
   each certified against JVM Clojure 1.12: `@a-promise` and `@a-future` and
   their timed `deref` forms, `await` and `await-for`, `Thread/sleep`,
