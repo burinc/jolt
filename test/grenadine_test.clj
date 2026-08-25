@@ -105,6 +105,13 @@
                        "Clojure as a terminal host dependency")
                   {:raw raw :filtered filtered}))))))
 
+;;;; A Maven artifact with no .clj/.cljc in it is a LEAF, not a nobody. Cognitect's
+;;;; aws endpoints jar packages resource data and no source at all; dropping it
+;;;; left io/resource unable to find the data the aws api client reads. So its
+;;;; extraction stays on the roots — and, having no source of ours to load, it
+;;;; contributes no children either: the deps such a jar declares are its
+;;;; publisher's JVM/cljs toolchain, which jolt has no JVM to run.
+
 (let [root (str (System/getProperty "java.io.tmpdir")
                 "/jolt-grenadine-resource-only")
       directory (java.io.File. root)
@@ -114,7 +121,10 @@
   (try
     (with-redefs-fn
       {(var jolt.deps/ensure-maven) (fn [_lib _version] root)
-       (var jolt.deps/effective-pom-deps) (fn [_lib _coord] {})}
+       ;; a child the leaf must NOT drag in — reached only if the artifact is
+       ;; walked, so its absence from :libs is what proves the walk stopped.
+       (var jolt.deps/effective-pom-deps)
+       (fn [_lib _coord] {'demo/jvm-only {:mvn/version "1"}})}
       (fn []
         (let [result
               (deps/resolve-deps
@@ -123,6 +133,10 @@
           (when-not (= [root] (:roots result))
             (throw
              (ex-info "a resource-only Maven JAR must remain a source root"
+                      {:result result})))
+          (when (contains? (:libs result) 'demo/jvm-only)
+            (throw
+             (ex-info "a source-less Maven JAR must not have its deps walked"
                       {:result result}))))))
     (finally
       (.delete resource)

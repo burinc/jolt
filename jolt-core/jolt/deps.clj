@@ -145,9 +145,10 @@
 ;; was the outlier.
 ;;
 ;; Note what is NOT affected: a jar that downloaded fine and simply carries no
-;; jolt-loadable source still contributes nothing, quietly. That is a different
-;; condition — the artifact resolved — and plenty of JVM-only jars are declared
-;; transitively. Only a failure to OBTAIN the artifact is fatal.
+;; jolt-loadable source is a quiet leaf — on the roots for the resources it may
+;; package, its own deps unwalked. That is a different condition — the artifact
+;; resolved — and plenty of JVM-only jars are declared transitively. Only a
+;; failure to OBTAIN the artifact is fatal.
 ;;
 ;; Collected rather than thrown at the first failure, so the message names every
 ;; unresolvable dep at once the way tools.deps' does, instead of making you fix
@@ -372,7 +373,8 @@
 ;; SOURCE (Clojure ships source, not just bytecode). So a :mvn/version coordinate
 ;; resolves by fetching the JAR (Clojars, then Central), extracting it, and using
 ;; the extraction as a source root — its pom.xml supplies the transitive deps.
-;; A JAR of pure Java classes has no source to run and simply contributes nothing.
+;; A JAR of pure Java classes has no source to run, but the resources it packages
+;; are still readable through it, so it stays on the roots as a leaf.
 ;;
 ;; JARs live at their standard path in the local Maven repository
 ;; (~/.m2/repository), so they are shared with JVM Clojure/tools.deps in both
@@ -612,6 +614,17 @@
               (str url-prefix (subs ns (count prefix)) "/" (name coord) url-suffix)))
           git-url-hosts)))
 
+(defn- has-clj-source?
+  "Does the tree hold any jolt-loadable source (.clj/.cljc)? A Maven JAR that is
+  pure-Java (closure-compiler) or ClojureScript-only (cljs.java-time) has none,
+  so nothing in it can be required. It still belongs on the roots — a jar can
+  carry RESOURCES and nothing else, which is exactly what Cognitect's aws
+  endpoints data is, and io/resource has to find them. What it does not get is
+  a WALK: with no source of ours to load, the deps it declares are its
+  publisher's own JVM/cljs toolchain, and jolt has no JVM to run them on."
+  [root]
+  (boolean (find-file root #(or (str/ends-with? % ".clj") (str/ends-with? % ".cljc")))))
+
 ;; --- coordinate skips + normalization ----------------------------------------
 ;; jolt IS Clojure, so org.clojure/clojure is intrinsic; jolt has no
 ;; ClojureScript compiler, so clojurescript (and the closure/rhino toolchain it
@@ -757,6 +770,11 @@
       (let [root (ensure-maven lib (:mvn/version coord))]
         (cond
           (nil? root) {:root nil :manifest :none}
+          ;; a Maven dep with no jolt-loadable source is a LEAF: the extraction
+          ;; stays on the roots so io/resource can read whatever it packages,
+          ;; but with no source of ours in it, the deps it declares are cljs/JVM
+          ;; tooling — no :deps and no :pom here is what stops the walk.
+          (not (has-clj-source? root)) {:root root :manifest :mvn}
           ;; :pom is the fallback children-of reaches for when the effective POM
           ;; can't be built — not every jar carries one, and the ones that do
           ;; predate their own dependencyManagement, so it is second choice.
