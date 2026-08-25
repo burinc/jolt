@@ -5,56 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.25] - 2026-08-24
+## [0.7.26] - 2026-08-25
 
-Three boundaries where an absent thing was quietly turned into a present one.
-A `nil` resource name became the classpath root, so a missing config key
-answered with a directory. A `nil` or `false` crossing the FFI's `:string`
-boundary became `""` or NULL, so C acted on a value nobody passed. And
-`setlocale`'s NULL failure answer arrived as the address 0 — truthy in Scheme —
-so every failed locale lookup read as a success.
+Interruption, second half. 0.7.25 made a `java.lang.Thread` handle answer about
+the thread it stands for, so an `.interrupt` from outside and that thread's own
+view of its flag became one flag rather than two. This release gives that flag
+the half the JVM has and jolt did not: an `.interrupt` now reaches a thread that
+is already *parked*, not merely one that will look at the flag the next time it
+asks. Every blocking operation jolt models that is interruptible on the JVM
+throws `InterruptedException` and leaves the flag cleared, the way the JVM's do
+— which is what makes the ordinary shutdown idiom, interrupt the worker and join
+it, terminate rather than wait out a `promise` nobody is going to deliver.
+`future-cancel` is `cancel(true)` for the same reason, so cancelling a future
+now ends the work rather than only marking it.
 
-The rest is reach on the same seams. `clojure.java.io/resource` takes the
-ClassLoader argument libraries pass it, and the loader's resource methods
-resolve through the same resolver `io/resource` does — which is what makes a
-resource baked into a `jolt build` binary visible to a library that reaches the
-classpath through `RT/baseLoader`. A `require` fired under someone else's
-`(binding [*ns* ..])` interns each loaded file's defs into that file's own
-namespace instead of the bound one. And a nested `run-interruptible` extent
-leaves the enclosing one still watching its token.
+The check that buys this runs on waits that never wait — a deref of a promise
+already delivered — so the first cut's per-call allocation was measurable
+against a release binary. The interrupt box is threaded through the wait loop
+instead, and the settled path falls through it.
 
-The last one came out of reviewing the others: a `java.lang.Thread` handle now
-answers about the thread it stands for rather than the thread doing the asking,
-which is what makes `.interrupt` from outside a thread and that thread's own
-view of its flag one flag instead of two.
-
-And building on that one flag: `.interrupt` now reaches a thread that is
-already *parked*, not just one that will look at its flag later. Every blocking
-operation jolt models that is interruptible on the JVM now throws
-`InterruptedException` and leaves the flag cleared, the way the JVM's do.
-
-Thanks to @casselc for the interrupt fix and the compatibility surface SCI
-reaches for.
-
-### Added
-
-- **The `clojure.lang.Numbers` statics a hosted analyzer emits.** SCI's
-  optimized analyzer emits direct `Numbers` calls rather than core var
-  references, so 19 of them now route to jolt's existing numeric tower:
-  `inc`/`dec` and their `unchecked_` forms, `isZero`/`isPos`/`isNeg`,
-  `add`/`minus`/`multiply` checked and unchecked, `remainder`, the four
-  comparisons, and `equiv`. Only the ones it emits — this is not a
-  claim of complete `Numbers` parity.
-
-- **`Thread.getId`**, answering jolt's stable numeric identity for the running
-  thread: repeatable for one thread, distinct across simultaneously live ones.
-  It does not claim JVM `Thread` semantics beyond jolt's thread model.
-
-- **`clojure.core/imap-cons` and `clojure.core/system-newline`.** Both are
-  private on the JVM, and both are reached by ordinary hosted library code —
-  `imap-cons` is the map arm of `conj`, `system-newline` the newline `println`
-  writes. jolt's `system-newline` is `"\n"`, its portable convention, on every
-  platform.
+And one linking fix carried over from the same window: a built binary no
+longer exports the Chez kernel's own ncurses, which was enough to stop any
+FFI binding of a real ncurses from opening a terminal.
 
 ### Fixed
 
@@ -85,14 +57,27 @@ reaches for.
   held and the interrupter must take that mutex to wake — so an interrupt cannot
   land in the gap between deciding to wait and actually parking.
 
-  It is an **opt-in variant**, and `jolt-cv-wait` itself is unchanged: the
-  runtime's own plumbing waits through the same seam — the carrier idle wait,
-  the load barrier, the main-thread queue pump, the tap queue, the channel
-  internals — and interrupting any of those breaks the runtime rather than the
-  caller's code. Two things that look adjacent are already right and were left
-  alone: `monitor-enter` / `locking` is not interruptible on the JVM either (a
-  thread blocked entering a monitor stays blocked and its flag stays *set*), and
-  `ReentrantLock.lockInterruptibly` already threw.
+  It is **opt-in**, and a wait that asks for no interrupt box behaves exactly as
+  it did: the runtime's own plumbing waits through the same seam — the carrier
+  idle wait, the load barrier, the main-thread queue pump, the tap queue, the
+  channel internals — and interrupting any of those breaks the runtime rather
+  than the caller's code. Two things that look adjacent are already right and
+  were left alone: `monitor-enter` / `locking` is not interruptible on the JVM
+  either (a thread blocked entering a monitor stays blocked and its flag stays
+  *set*), and `ReentrantLock.lockInterruptibly` already threw.
+
+  What stays divergent is recorded in `test/conformance/known-divergences.edn`,
+  because jolt's interrupt identity is the thread's interrupt box and a fiber has
+  no flag of its own. N fibers share a carrier, so an interrupt aimed at a
+  carrier while several fibers are parked wakes all of them and one consumes it —
+  one interrupt still produces exactly one `InterruptedException`, but which
+  fiber gets it is not determined, where on the JVM a parked go block occupies no
+  thread to interrupt at all. A fiber inside `Thread/sleep` sleeps its carrier
+  and there is nothing to poke, so only the already-set half of the rule applies
+  there; park on a promise or a channel instead if the wait must be
+  interruptible mid-flight. And `PipedInputStream.read` is left out of the set
+  because it signals with `InterruptedIOException`, a different contract from the
+  ops this covers.
 
 - **`future-cancel` interrupts the worker, and deref of a cancelled future
   raises `CancellationException`.** `clojure.core/future-cancel` is
@@ -109,6 +94,119 @@ reaches for.
   because a `jolt-future` is image-format surface: `jolt.image` round-trips
   record values by nongenerative tag, and adding a field under the old tag would
   let a new image read as an old record.
+
+- **The kernel's ncurses is no longer exported from the executable.** Chez's
+  expression editor links ncurses and terminfo, and `-rdynamic` — which a built
+  binary needs, so a statically linked native resolves through
+  `(load-shared-object #f)` — put all of it in the dynamic symbol table: 77
+  `_nc_*` internals plus `setupterm`, `tigetnum`, `raw`, `cbreak`, `curs_set`,
+  `keypad`, `notimeout`, `wtimeout`, and globals including `cur_term`. The
+  executable is searched before any `dlopen`'d library, so a program that bound
+  a real ncurses through the FFI had that library's own internal calls bound
+  back into the kernel's copy:
+
+  ```
+  binding file /lib/x86_64-linux-gnu/libncursesw.so.6 [0] to jolt [0]:
+      normal symbol `_nc_setupterm' [NCURSES6_TINFO_5.5.20051010]
+  ```
+
+  The kernel's copy predates ncurses 6.1, so it reads a terminfo entry with a
+  4096-byte buffer and cannot parse the 32-bit number format that any entry
+  carrying a value above 32767 is stored in — `xterm-256color`, whose
+  `max_pairs` is 65536, for one. `initscr` then failed with "Error opening
+  terminal" on a terminal that works everywhere else; where the entry was in the
+  legacy format the old code parsed it instead and filled `cur_term` with a
+  pre-6.1 `TERMINAL` layout that the newer library then read with its own, which
+  segfaults. Linking with `--exclude-libs` marks those archives' symbols local,
+  which is enough: Chez calls them internally, and internal linkage does not go
+  through the dynamic symbol table, so the expression editor is unaffected.
+
+### Performance
+
+- **The interrupt check is paid by the waits that wait, not by every call.**
+  The check above runs on every interruptible wait, including the ones that
+  never park: a deref of an already-delivered promise or a settled future
+  decides on its first pass and returns. The first cut wrapped the caller's
+  decision in a fresh closure and consed a registration entry before deciding,
+  so that path allocated twice per call and measured 1.15×–1.18× against the
+  same operations before any of this landed.
+
+  The interrupt box is threaded through the wait loop instead:
+  `jolt-cv-wait/ibox` is the old loop with one more argument, and the settled
+  path is now an `(if ibox ...)` that falls through. `jolt-cv-wait` passes `#f`
+  and is exactly as uninterruptible as it was, so the plumbing that must never
+  be interrupted is untouched. Release binary, A/B/A in one sitting, ms per 500k
+  ops, medians of 5:
+
+  | | before | first cut | now |
+  |---|---:|---:|---:|
+  | `@delivered-promise` | 27.4 | 32.3 | 30.3 |
+  | `@settled-future` | 29.0 | 33.3 | 31.3 |
+  | `ArrayBlockingQueue` put+take | 175.0 | 185.8 | 182.9 |
+
+  That is 1.11× / 1.08× / 1.05× over the pre-interrupt figures, down from
+  1.18× / 1.15× / 1.06×. It is at the ceiling rather than comfortably under it —
+  a second sitting put the two derefs at 1.08× and 1.09× — and 1.04× is the
+  measured floor for reading a flag before deciding at all, so what remains is
+  close to the cost of the feature itself. The queue column swings ~5% run to
+  run.
+
+  `current-interrupt-box` also moves from a thread parameter to a virtual
+  register. It had stored `(thread-id . box)` and compared the running thread's
+  id on every read, for one reason: a Chez thread parameter is inherited by a
+  forked thread, so a plain one would hand a child its parent's box. A virtual
+  register starts at fixnum 0 in a fresh thread, which is exactly the property
+  that workaround was buying, so the comparison is deleted rather than
+  optimized. `.isInterrupted`, `Thread/interrupted`, `monitor-enter`/`exit` and
+  `ReentrantLock`'s owner check all read it too.
+
+## [0.7.25] - 2026-08-24
+
+Three boundaries where an absent thing was quietly turned into a present one.
+A `nil` resource name became the classpath root, so a missing config key
+answered with a directory. A `nil` or `false` crossing the FFI's `:string`
+boundary became `""` or NULL, so C acted on a value nobody passed. And
+`setlocale`'s NULL failure answer arrived as the address 0 — truthy in Scheme —
+so every failed locale lookup read as a success.
+
+The rest is reach on the same seams. `clojure.java.io/resource` takes the
+ClassLoader argument libraries pass it, and the loader's resource methods
+resolve through the same resolver `io/resource` does — which is what makes a
+resource baked into a `jolt build` binary visible to a library that reaches the
+classpath through `RT/baseLoader`. A `require` fired under someone else's
+`(binding [*ns* ..])` interns each loaded file's defs into that file's own
+namespace instead of the bound one. And a nested `run-interruptible` extent
+leaves the enclosing one still watching its token.
+
+The last one came out of reviewing the others: a `java.lang.Thread` handle now
+answers about the thread it stands for rather than the thread doing the asking,
+which is what makes `.interrupt` from outside a thread and that thread's own
+view of its flag one flag instead of two.
+
+Thanks to @casselc for the interrupt fix and the compatibility surface SCI
+reaches for.
+
+### Added
+
+- **The `clojure.lang.Numbers` statics a hosted analyzer emits.** SCI's
+  optimized analyzer emits direct `Numbers` calls rather than core var
+  references, so 19 of them now route to jolt's existing numeric tower:
+  `inc`/`dec` and their `unchecked_` forms, `isZero`/`isPos`/`isNeg`,
+  `add`/`minus`/`multiply` checked and unchecked, `remainder`, the four
+  comparisons, and `equiv`. Only the ones it emits — this is not a
+  claim of complete `Numbers` parity.
+
+- **`Thread.getId`**, answering jolt's stable numeric identity for the running
+  thread: repeatable for one thread, distinct across simultaneously live ones.
+  It does not claim JVM `Thread` semantics beyond jolt's thread model.
+
+- **`clojure.core/imap-cons` and `clojure.core/system-newline`.** Both are
+  private on the JVM, and both are reached by ordinary hosted library code —
+  `imap-cons` is the map arm of `conj`, `system-newline` the newline `println`
+  writes. jolt's `system-newline` is `"\n"`, its portable convention, on every
+  platform.
+
+### Fixed
 
 - **`clojure.java.io/resource` accepts a ClassLoader.** `(io/resource n
   loader)` raised `Wrong number of args (2) passed to:
@@ -273,9 +371,6 @@ call. Memoizing the probe by `(zone, instant)` undoes it: a repeated
 `jolt.host/tz-offset-seconds` lookup drops from ~1.7ms to ~100ns, and
 `jolt-lang/time`'s zone-aware `now` speeds up by roughly 100x.
 
-Also here: a binary no longer exports the Chez kernel's own ncurses, which was
-enough to stop any FFI binding of a real ncurses from opening a terminal.
-
 ### Fixed
 
 - **`jolt.ffi` `:string` carries NULL in both directions.** Chez's `string`
@@ -301,32 +396,6 @@ enough to stop any FFI binding of a real ncurses from opening a terminal.
   Until this a callback could neither model a nullable string argument nor
   decline to answer one, which is ordinary in any C API that hands a callback an
   optional path, name or error.
-
-- **The kernel's ncurses is no longer exported from the executable.** Chez's
-  expression editor links ncurses and terminfo, and `-rdynamic` — which a built
-  binary needs, so a statically linked native resolves through
-  `(load-shared-object #f)` — put all of it in the dynamic symbol table: 77
-  `_nc_*` internals plus `setupterm`, `tigetnum`, `raw`, `cbreak`, `curs_set`,
-  `keypad`, `notimeout`, `wtimeout`, and globals including `cur_term`. The
-  executable is searched before any `dlopen`'d library, so a program that bound
-  a real ncurses through the FFI had that library's own internal calls bound
-  back into the kernel's copy:
-
-  ```
-  binding file /lib/x86_64-linux-gnu/libncursesw.so.6 [0] to jolt [0]:
-      normal symbol `_nc_setupterm' [NCURSES6_TINFO_5.5.20051010]
-  ```
-
-  The kernel's copy predates ncurses 6.1, so it reads a terminfo entry with a
-  4096-byte buffer and cannot parse the 32-bit number format that any entry
-  carrying a value above 32767 is stored in — `xterm-256color`, whose
-  `max_pairs` is 65536, for one. `initscr` then failed with "Error opening
-  terminal" on a terminal that works everywhere else; where the entry was in the
-  legacy format the old code parsed it instead and filled `cur_term` with a
-  pre-6.1 `TERMINAL` layout that the newer library then read with its own, which
-  segfaults. Linking with `--exclude-libs` marks those archives' symbols local,
-  which is enough: Chez calls them internally, and internal linkage does not go
-  through the dynamic symbol table, so the expression editor is unaffected.
 
 ### Performance
 
