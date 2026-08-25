@@ -264,9 +264,16 @@
     ;; segfaults on the mismatch. Naming the archives costs nothing when they
     ;; resolve to shared libraries instead — ld ignores an --exclude-libs name
     ;; it did not link.
-    (else (string-append
-            "-Wl,--exclude-libs,libncurses.a:libncursesw.a:libtinfo.a "
-            "-llz4 -lz -lncurses -ltinfo -ldl -lm -lpthread -luuid -lrt"))))
+    (else
+     (string-append
+       ;; -L the csv dir the kernel itself comes from: Chez ships liblz4.a /
+       ;; libz.a there, so -llz4 -lz resolve on a machine with no lz4/zlib
+       ;; development packages. (bld-csv-dir), not bld-host-csv-dir — every
+       ;; caller of bld-link-libs takes -I and libkernel.a from the same
+       ;; place, which for a cross build is the TARGET pack, not this host.
+       "-L" (bld-sh-quote (bld-csv-dir)) " "
+       "-Wl,--exclude-libs,libncurses.a:libncursesw.a:libtinfo.a "
+       "-llz4 -lz -lncurses -ltinfo -ldl -lm -lpthread -luuid -lrt"))))
 
 ;; --- optional built-binary startup profile ----------------------------------
 ;; JOLT_STARTUP_PROFILE=1 reports wall time, process CPU, collections,

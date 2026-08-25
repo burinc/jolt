@@ -135,37 +135,54 @@
          ;; unqualified resolves in the writing ns, else a :refer's home ns (so a
          ;; defmethod on a referred multifn lands on the real one), else stays in
          ;; the writing ns (a shadow, as before).
-         (mns (cond
-                (qns (or (chez-resolve-alias here qns) qns))
-                ;; a locally DEFINED var (a multifn interned in `here`) wins; an
-                ;; unbound forward-ref cell the analyzer interned for the multifn
-                ;; name while compiling the defmethod body does NOT — otherwise a
-                ;; library's unqualified (defmethod print-method …), loaded via
-                ;; require, would shadow the referred clojure.core multifn instead
-                ;; of extending it. An undefined local falls through to the refer.
-                ((let ((c (var-cell-lookup here nm))) (and c (var-cell-defined? c))) here)
-                ((chez-resolve-refer here nm) => values)
-                ;; implicit refer-clojure: an unqualified name that isn't defined
-                ;; or explicitly referred locally but names a clojure.core MULTIFN
-                ;; (print-method, print-dup, …) extends that multifn. refer-clojure
-                ;; is resolved at compile time, so chez-resolve-refer doesn't record
-                ;; it; without this a library's (defmethod print-method …) built a
-                ;; dead per-ns shadow the printer never consults.
-                ((jolt-multifn? (var-deref "clojure.core" nm)) "clojure.core")
-                (else here)))
-         (cur (var-deref mns nm))
+         ;; ONE decision, yielding (ns . name) together: which namespace holds
+         ;; the multifn AND what it is called there. Deriving the two separately
+         ;; let them disagree -- a :rename'd refer whose local name is also
+         ;; defined here took the local branch for the ns and the refer's source
+         ;; name for the name, and looked up a var that was in neither place.
+         (mns+name
+          (cond
+            (qns (cons (or (chez-resolve-alias here qns) qns) nm))
+            ;; a locally DEFINED var (a multifn interned in `here`) wins; an
+            ;; unbound forward-ref cell the analyzer interned for the multifn
+            ;; name while compiling the defmethod body does NOT — otherwise a
+            ;; library's unqualified (defmethod print-method …), loaded via
+            ;; require, would shadow the referred clojure.core multifn instead
+            ;; of extending it. An undefined local falls through to the refer.
+            ((let ((c (var-cell-lookup here nm))) (and c (var-cell-defined? c)))
+             (cons here nm))
+            ;; the refer table's value IS (target . source-name), so a :rename'd
+            ;; local reaches the var it was renamed FROM.
+            ((chez-resolve-refer here nm) => values)
+            ;; implicit refer-clojure: an unqualified name that isn't defined
+            ;; or explicitly referred locally but names a clojure.core MULTIFN
+            ;; (print-method, print-dup, …) extends that multifn. refer-clojure
+            ;; is resolved at compile time, so chez-resolve-refer doesn't record
+            ;; it; without this a library's (defmethod print-method …) built a
+            ;; dead per-ns shadow the printer never consults.
+            ((jolt-multifn? (var-deref "clojure.core" nm)) (cons "clojure.core" nm))
+            (else (cons here nm))))
+         (mns (car mns+name))
+         ;; the multifn's name IN mns — the same as nm unless a :rename brought
+         ;; it in under a different local name.
+         (source-name (cdr mns+name))
+         (cur (var-deref mns source-name))
          (mf (if (jolt-multifn? cur) cur
                  ;; auto-create: copy the dispatch fn + default from a same-named
                  ;; clojure.core multifn (e.g. print-method's 2-arg dispatch) so a
                  ;; (defmethod print-method ...) before naming clojure.core's still
                  ;; dispatches right — the old 1-arg identity fallback crashed.
-                 (let* ((core (var-deref "clojure.core" nm))
+                 ;; source-name throughout, not nm: under a :rename the var lives
+                 ;; in mns under its ORIGINAL name, and it is core's same-named
+                 ;; multifn -- not one named after the local alias -- that has the
+                 ;; dispatch fn worth copying.
+                 (let* ((core (var-deref "clojure.core" source-name))
                         (disp (if (jolt-multifn? core)
                                   (jolt-multifn-dispatch-fn core)
                                   (var-deref "clojure.core" "identity")))
                         (deft (if (jolt-multifn? core) (jolt-multifn-default core) kw-default))
-                        (m (make-jolt-multifn nm disp (new-mm-table) deft #f (new-mm-table) (new-mm-table) -1 #f)))
-                   (def-var! mns nm m) m))))
+                        (m (make-jolt-multifn source-name disp (new-mm-table) deft #f (new-mm-table) (new-mm-table) -1 #f)))
+                   (def-var! mns source-name m) m))))
     (jolt-with-mutex mm-tbl-mu
       (hashtable-set! (jolt-multifn-methods mf) (mm-dispatch-val-canon dval) impl)
       (set! jolt-mm-epoch (fx+ jolt-mm-epoch 1)))

@@ -36,6 +36,11 @@ MAKES-CLEAN := \
   build/ \
   target/ \
 
+MAKES-REALCLEAN := \
+  .jolt/ \
+  test/chez/*/.jolt/ \
+  test/chez/*/*/.jolt/ \
+
 PREFIX ?= $(if $(IS-ROOT),/usr/local,$(HOME)/.local)
 CHEZ ?= $(JOLT-CHEZ)
 

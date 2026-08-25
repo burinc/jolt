@@ -1189,9 +1189,10 @@
           ((var-cell-lookup cns nm)                              ; the ns's own var
            => (lambda (cell) (or (jsq-class-symbol cell) (jolt-symbol cns nm))))
           ((chez-resolve-refer cns nm)                             ; a :refer'd name
-           => (lambda (target)
-                (let ((cell (var-cell-lookup target nm)))
-                  (or (jsq-class-symbol cell) (jolt-symbol target nm)))))
+           => (lambda (ref)
+                (let ((cell (var-cell-lookup (car ref) (cdr ref))))
+                  (or (jsq-class-symbol cell)
+                      (jolt-symbol (car ref) (cdr ref))))))
           ((and (not (chez-core-excluded? cns nm))                 ; else clojure.core,
                 (not (eq? (hashtable-ref ns-refer-table (cons cns nm) #f) 'unmapped))
                 (var-cell-lookup "clojure.core" nm))               ; unless excluded/unmapped
