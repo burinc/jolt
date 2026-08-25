@@ -408,18 +408,32 @@
     "(jolt-fiber-carrier-count-set! 2)\n"
     "(jolt-fiber-pool-reset!)\n"
     "(jolt-fiber-ensure-carrier!)\n"
-    "(ev \"(def np2s (mapv (fn [i] (jolt.process/process [\\\"sh\\\" \\\"-c\\\" \\\"sleep 2; printf npf\\\"])) (range 2)))\")\n"
+    "(ev \"(def np2s (mapv (fn [i] (jolt.process/process [\\\"sh\\\" \\\"-c\\\" \\\"cat >/dev/null; printf npf\\\"])) (range 2)))\")\n"
     "(ev \"(def np2-outs (mapv :out np2s))\")\n"
     "(define read-thunk (ev \"(fn [i] (let [s (nth np2-outs i) b (byte-array 64) n (.read s b 0 64)] (String. b 0 n \\\"UTF-8\\\")))\"))\n"
     "(define fs (list (sa-fiber-spawn (lambda () (read-thunk 0)))\n"
     "                 (sa-fiber-spawn (lambda () (read-thunk 1)))))\n"
     "(define (all-state? st) (lambda () (andmap (lambda (f) (eq? (jolt-fiber-state f) st)) fs)))\n"
     "(define parked2 (wait-until (all-state? 'parked) 8.0))\n"
-    ;; a third body on a pool both of whose carriers are hosting a pipe read
-    "(define sib (sa-fiber-spawn (lambda () 606)))\n"
+    ;; A third body on a pool both of whose carriers are hosting a pipe read. It
+    ;; samples the readers from ITS OWN carrier, at the instant it runs, and carries
+    ;; the verdict out in its result. Sampling them from THIS thread after waiting
+    ;; for sib raced: the readers used to be gated on `sleep 2`, and everything
+    ;; before the park — require, spawn, first read, and the jolt.io-poller autoload
+    ;; this check exists to force — came out of that same 2s. Measured at 1041-1153ms
+    ;; on an idle 10-core dev machine, so over half the budget was already spent
+    ;; before the window opened; a CI runner lands near 2000ms and the readers wake
+    ;; within a millisecond of sib running. Observed as one failed and one passed run
+    ;; on the same commit. Now nothing is on a clock: the readers park until we send
+    ;; EOF below, so if parking did NOT free a carrier sib can never run at all and
+    ;; the wait times out, which is the real property this check is for.
+    "(define sib (sa-fiber-spawn (lambda () (if ((all-state? 'parked)) 606 -1))))\n"
     "(define sib-ran (and (wait-until (lambda () (eq? (jolt-fiber-state sib) 'done)) 5.0)\n"
-    "                     ((all-state? 'parked))))\n"
+    "                     (eqv? (jolt-fiber-result sib) 606)))\n"
     "(define post (poller-loaded?))\n"
+    ;; only now let the readers finish: closing our end of each stdin is the EOF
+    ;; their `cat` is waiting for.
+    "(ev \"(doseq [p np2s] (.close (:in p)))\")\n"
     "(define done2 (wait-until (all-state? 'done) 15.0))\n"
     "(define r2 (map jolt-fiber-result fs))\n"
     "(if (and (not pre) (string? r1) (string=? r1 \"npo\") (> el1 150.0) (not mid)\n"
