@@ -953,11 +953,18 @@
 ;; itself slept the carrier, so a fiber could not have parked in there anyway
 ;; (jolt-x1no). Now the lock covers one waitpid attempt, and jolt-pause-ms parks a
 ;; fiber between attempts while a thread sleeps.
+;;
+;; The interrupt check is per ROUND rather than a registration, because this is a
+;; poll and not a condition wait: there is no cv for .interrupt to poke, so the flag
+;; is simply read (and cleared) each time round, which is the same
+;; check-clear-throw jolt-cv-wait-interruptibly does at the top of its decide.
+;; Process.waitFor throws InterruptedException on the JVM.
 (define (proc-wait-blocking st)
   (let ((code
           (let loop ((step 1))                   ; 1ms
             (or (proc-reap-once st)
                 (begin
+                  (jolt-interrupt-poll-check! "Process.waitFor")
                   (jolt-pause-ms step)
                   (loop (min proc-poll-step-max (* step 2))))))))
     (for-each proc-latch-wait (unbox (proc-p-inherit-latches st)))
@@ -1022,7 +1029,8 @@
       (cond ((not (proc-alive? st)) #t)
             ((<= remaining 0) #f)
             ;; a fiber parks for the step rather than sleeping its carrier
-            (else (jolt-pause-ms step)
+            (else (jolt-interrupt-poll-check! "Process.waitFor")
+                  (jolt-pause-ms step)
                   (loop (- remaining step)))))))
 
 ;; --- java.lang.ProcessHandle (destroy-tree) ----------------------------------
