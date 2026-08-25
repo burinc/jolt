@@ -458,17 +458,35 @@
    :jvm "\"localhost\" — reverse lookup through the nameservice (machine-dependent)"
    :jolt "\"127.0.0.1\" — the literal; no reverse lookup"
    :note "Reverse DNS would need getnameinfo and makes the answer environment-dependent; the JVM's own javadoc flags the lookup. Use .getHostString for the literal on both. Caught certifying test/chez/socket-test.clj against the JVM."}
-  ;; Interruption reaches the FLAG but not a thread already parked. .interrupt sets
-  ;; the target's flag and the target sees it (jolt#727 made that one flag rather
-  ;; than two), so the polling idiom — (while (not (.isInterrupted
-  ;; (Thread/currentThread))) ...) — behaves as on the JVM. What does NOT happen is
-  ;; the JVM's second half: a thread blocked in an interruptible wait is not thrown
-  ;; out of it. Every jolt park runs to its own completion or timeout instead.
+  ;; Interruption now reaches a PARKED thread as well as the flag: promise/future
+  ;; deref, agent await, Thread.sleep/join, CountDownLatch.await, a task Future's
+  ;; get, a blocking queue take/put, awaitTermination and Process.waitFor all throw
+  ;; InterruptedException and leave the flag cleared, as on the JVM (jolt-qdi8).
+  ;; What remains divergent is narrower, and both halves are listed here.
+  ;;
+  ;; A FIBER has no interrupt flag of its own. jolt's interrupt identity is the
+  ;; thread's interrupt box, and N fibers SHARE a carrier, so an interrupt aimed at
+  ;; a carrier can be consumed by a different parked fiber than the interrupter had
+  ;; in mind. On the JVM a parked go block occupies no thread at all, so there is
+  ;; nothing on that thread to interrupt but the block currently running.
+  ;; A go block that interrupts (Thread/currentThread) and then blocks does throw on
+  ;; both — that part matches.
   {:category :concurrency-model
-   :behavior "(.interrupt t) while t is parked in CountDownLatch.await / Thread.sleep / Thread.join / a blocking queue take"
-   :jvm "the wait throws InterruptedException at once and clears the flag"
-   :jolt "the wait runs to completion or its timeout and returns normally; the flag is set and readable afterwards"
-   :note "jolt.host/run-interruptible is the interruptible-blocking primitive that does exist, and ReentrantLock.lockInterruptibly does throw. Making every park interruptible means threading the interrupt box through each jolt-cv-wait site — bead jolt-qdi8. Code that must be interruptible on jolt should poll .isInterrupted or bound its waits with a timeout."}
+   :behavior "(.interrupt t) for a dispatch thread t while several go blocks are parked in blocking derefs that ran on it"
+   :jvm "a parked go block holds no thread; only whatever is running on t at that moment can be interrupted"
+   :jolt "the parked fibers registered against t's interrupt box are all woken and one of them consumes the interrupt and throws"
+   :note "jolt has no per-fiber interrupt flag to key on and .interrupt is handed a box and nothing else. The check CLEARS, so one interrupt still produces exactly one InterruptedException — but which fiber gets it is not determined. Pinned by the \"interrupt / blocking\" rows in test/chez/unit.edn; the reasoning is at jolt-cv-wait-interruptibly in host/chez/locks.ss."}
+  ;; The piped streams are the one blocking read left outside the interruptible set.
+  {:category :concurrency-model
+   :behavior "(.interrupt t) while t is blocked in (.read a-PipedInputStream)"
+   :jvm "the read throws java.io.InterruptedIOException"
+   :jolt "the read blocks until the writer writes or closes; the flag is set and readable afterwards"
+   :note "PipedInputStream signals interruption with an IOException subclass rather than InterruptedException, so it is a different contract from the ops jolt-cv-wait-interruptibly covers. Bound the read with a timeout or close the write end to release a reader."}
+  ;; NOT a divergence, recorded so it is not "fixed": monitor-enter / locking is
+  ;; uninterruptible on the JVM too — a thread blocked entering a monitor stays
+  ;; blocked and its flag stays SET rather than being consumed. jolt matches it
+  ;; exactly, both halves probed against JVM Clojure 1.12. ReentrantLock is the
+  ;; interruptible one there and .lockInterruptibly is interruptible here.
   ;; The three separator system properties are POSIX on every platform, Windows
   ;; included. This is deliberate and consistent rather than an oversight: jolt's
   ;; own IO layer writes LF and joins with "/" everywhere (java.io.File, the

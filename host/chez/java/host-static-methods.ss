@@ -134,13 +134,30 @@
       (if fp (fp) (sleep (make-time 'time-duration 0 0)))
       jolt-nil)))
 
+;; Thread/sleep, and TimeUnit.sleep through the same door (java/concurrency.ss).
+;;
+;; A THREAD sleeps in an interruptible wait on a private mutex and condition, so
+;; .interrupt throws it out with InterruptedException the way the JVM does. The
+;; pair is fresh and unreachable from anywhere else, so the only wake it can get is
+;; an interrupt; the deadline is what ends the sleep otherwise, read from the clock
+;; by decide rather than signalled (jolt-cv-wait, host/chez/locks.ss).
+;;
+;; A FIBER still sleeps its CARRIER, and that is deliberate rather than an omission.
+;; Thread/sleep is a user-facing request to stop a THREAD, a go block doing it stops
+;; its carrier on the JVM too, and test/chez/fibers-pool-test.ss case 6 asserts
+;; exactly that. jolt.host's jolt-pause-ms is the park-with-a-deadline for runtime
+;; code that must not take its carrier away; this is not that.
+(define (jolt-thread-sleep-ms ms)
+  (let ((ms (exact (floor ms))))
+    (if (jolt-current-fiber)
+        (sleep (make-time 'time-duration (* (remainder ms 1000) 1000000) (quotient ms 1000)))
+        (let ((mu (make-mutex)) (cv (make-condition)))
+          (jolt-cv-wait-interruptibly "sleep interrupted" mu cv (+ (now-millis) ms)
+            (lambda (timed-out?) (if timed-out? #t jolt-cv-again)))))
+    jolt-nil))
+
 (define thread-statics
-  (list (cons "sleep" (lambda (ms . _)
-                        (let* ((ms* (exact (floor (jolt-need-num ms))))
-                               (secs (quotient ms* 1000))
-                               (nanos (* (remainder ms* 1000) 1000000)))
-                          (sleep (make-time 'time-duration nanos secs)))
-                        jolt-nil))
+  (list (cons "sleep" (lambda (ms . _) (jolt-thread-sleep-ms (jolt-need-num ms))))
         (cons "yield" (lambda _ (thread-yield!)))
         (cons "interrupted" (lambda _ (let* ((b (current-interrupt-box)) (v (unbox b)))
                                         (set-box! b #f) (and v #t))))))

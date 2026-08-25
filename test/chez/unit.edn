@@ -193,7 +193,45 @@
   {:suite "interrupt" :expr "(let [t (Thread/currentThread)] (.interrupt t) [(.isInterrupted t) (.isInterrupted t)])" :expected "[true true]"}
   {:suite "interrupt" :expr "(let [t (Thread/currentThread)] (.interrupt t) [(Thread/interrupted) (Thread/interrupted)])" :expected "[true false]"}
   {:suite "interrupt" :expr "(do (.interrupt (Thread/currentThread)) (Thread/interrupted) (.isInterrupted (Thread/currentThread)))" :expected "false"}
-  {:suite "interrupt" :expr "(let [t (atom nil) started (promise) go (promise) f (future (reset! t (Thread/currentThread)) (deliver started true) (deref go) (.isInterrupted (deref t)))] (deref started) (.interrupt (deref t)) (deliver go true) (deref f))" :expected "true"}
+  ;; a future's worker sees an interrupt aimed at the handle it published. It SPINS
+  ;; on an atom rather than parking on a promise for the reason the threads/interrupt
+  ;; rows above give: a park is thrown out with InterruptedException now, which is a
+  ;; different thing to test (the "interrupt / blocking" suite below tests it).
+  {:suite "interrupt" :expr "(let [t (atom nil) started (promise) go (atom false) f (future (reset! t (Thread/currentThread)) (deliver started true) (loop [] (when-not @go (Thread/yield) (recur))) (.isInterrupted (deref t)))] (deref started) (.interrupt (deref t)) (reset! go true) (deref f))" :expected "true"}
+  ;; --- interrupt out of a blocking wait ---------------------------------------
+  ;; The JVM's second half of interruption: a thread parked in an interruptible wait
+  ;; is THROWN OUT of it with InterruptedException and the flag is left cleared.
+  ;; The behavior these rows pin was probed on JVM Clojure 1.12 rather than read
+  ;; off the javadoc: all thirteen blocking ops throw and leave the flag cleared,
+  ;; and @promise / @future throw InterruptedException raw rather than wrapped.
+  ;; The ops jolt makes interruptible are the ones a JVM caller can already name;
+  ;; the runtime's own plumbing (carrier idle wait, load barrier, main-queue pump,
+  ;; tap queue, channel internals) is deliberately NOT — see host/chez/locks.ss.
+  ;;
+  ;; A flag that is ALREADY set makes the next blocking op throw without waiting,
+  ;; and clears. Both halves in one row so a stray set flag cannot leak into the
+  ;; next case.
+  {:suite "interrupt / blocking" :expr "(let [t (Thread/currentThread)] (.interrupt t) [(try (deref (promise)) :no-throw (catch InterruptedException e :threw)) (.isInterrupted t)])" :expected "[:threw false]"}
+  ;; ...and the same for a thread already parked when the interrupt arrives. The
+  ;; sleep is only there to make the PARKED path the one exercised; the row passes
+  ;; either way, so it is not a timing dependency.
+  {:suite "interrupt / blocking" :expr "(let [p (promise) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (deliver out (try (deref p) :no-throw (catch InterruptedException e :threw)))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected ":threw"}
+  {:suite "interrupt / blocking" :expr "(let [l (java.util.concurrent.CountDownLatch. 1) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (deliver out (try (.await l) :no-throw (catch InterruptedException e :threw)))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected ":threw"}
+  {:suite "interrupt / blocking" :expr "(let [ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (deliver out (try (Thread/sleep 30000) :no-throw (catch InterruptedException e :threw)))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected ":threw"}
+  {:suite "interrupt / blocking" :expr "(let [w (Thread. (fn [] (try (Thread/sleep 30000) (catch InterruptedException e nil)))) ready (promise) out (promise)] (.start w) (let [t (Thread. (fn [] (deliver ready true) (deliver out (try (.join w) :no-throw (catch InterruptedException e :threw)))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (let [r (deref out 5000 :timeout)] (.interrupt w) r)))" :expected ":threw"}
+  {:suite "interrupt / blocking" :expr "(let [q (java.util.concurrent.ArrayBlockingQueue. 1) ready (promise) out (promise) t (Thread. (fn [] (deliver ready true) (deliver out (try (.take q) :no-throw (catch InterruptedException e :threw)))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout))" :expected ":threw"}
+  {:suite "interrupt / blocking" :expr "(let [a (agent 0) ready (promise) out (promise)] (send-off a (fn [x] (Thread/sleep 3000) (inc x))) (let [t (Thread. (fn [] (deliver ready true) (deliver out (try (await a) :no-throw (catch InterruptedException e :threw)))))] (.start t) (deref ready 5000 :timeout) (Thread/sleep 50) (.interrupt t) (deref out 5000 :timeout)))" :expected ":threw"}
+  ;; future-cancel is cancel(true) on the JVM: the worker gets a real interrupt.
+  {:suite "interrupt / blocking" :expr "(let [ready (promise) out (promise) f (future (deliver ready true) (try (Thread/sleep 30000) (deliver out :no-throw) (catch InterruptedException e (deliver out :threw))))] (deref ready 5000 :timeout) (Thread/sleep 50) [(future-cancel f) (deref out 5000 :timeout)])" :expected "[true :threw]"}
+  ;; ...and deref of a cancelled future is CancellationException, not ExceptionInfo.
+  {:suite "interrupt / blocking" :expr "(let [f (future (Thread/sleep 30000) 1)] (future-cancel f) (try (deref f) :no-throw (catch java.util.concurrent.CancellationException e :cancelled)))" :expected ":cancelled"}
+  ;; THE FIBER ROW. A fiber has no interrupt flag of its own, so it registers under
+  ;; the interrupt box of the carrier it runs on and (Thread/currentThread) inside a
+  ;; go block IS that carrier — so a go block can interrupt its own blocking wait.
+  ;; This is the identity decision jolt-cv-wait-interruptibly documents, pinned.
+  {:suite "interrupt / blocking" :expr "(do (require (quote [clojure.core.async :as a])) (a/<!! (a/go (.interrupt (Thread/currentThread)) (try (deref (promise)) :no-throw (catch InterruptedException e :threw)))))" :expected ":threw"}
+  ;; a wait nobody interrupts still returns its value, and the flag stays clear
+  {:suite "interrupt / blocking" :expr "(let [p (promise)] (future (Thread/sleep 20) (deliver p :ok)) [(deref p 5000 :timeout) (.isInterrupted (Thread/currentThread))])" :expected "[:ok false]"}
   {:suite "ns-tl" :expr "(do (in-ns (quote foo.bar)) (str *ns*))" :expected "\"foo.bar\""}
   {:suite "ns-tl" :expr "(do (create-ns (quote my.ns)) (binding [*ns* (find-ns (quote my.ns))] (str *ns*)))" :expected "\"my.ns\""}
   {:suite "ns-tl" :expr "(do (in-ns (quote app.core)) (def sekret 42) (in-ns (quote user)) (binding [*ns* (find-ns (quote app.core))] (load-string \"sekret\")))" :expected "42"}
