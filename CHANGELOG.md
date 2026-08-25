@@ -28,6 +28,13 @@ And one linking fix carried over from the same window: a built binary no
 longer exports the Chez kernel's own ncurses, which was enough to stop any
 FFI binding of a real ncurses from opening a terminal.
 
+The rest of the window is a run of smaller fixes, most of them found by piping
+a generated program into `jolt -`: `slurp` accepts the reader behind `*in*`,
+and `refer`'s `:rename` is implemented rather than silently ignored. Separately,
+a Maven artifact that packages resources and no Clojure source is now a leaf
+rather than a nobody — its extraction stays on the roots so `io/resource` can
+read what it ships, without its publisher's JVM dependency tree being walked.
+
 ### Fixed
 
 - **A blocking wait is interrupted, not merely flagged.** `.interrupt` set the
@@ -121,6 +128,85 @@ FFI binding of a real ncurses from opening a terminal.
   which is enough: Chez calls them internally, and internal linkage does not go
   through the dynamic symbol table, so the expression editor is unaffected.
 
+- **`slurp` reads the `IReader` behind `*in*`.** `*in*` is a reified `IReader`
+  — `-read-line` / `-read-form`, with no host reader object underneath — so
+  `slurp` fell past every arm of its cond and reported the value as unopenable:
+
+  ```
+  (with-in-str "one\ntwo" (slurp *in*))
+  ;; 0.7.25: Cannot open <#object[clojure.lang.IObj$reify__0]> as a Reader.
+  ;; now:    "one\ntwo"
+  ```
+
+  This is what `jolt -` needs to read a program off a pipe, so
+  `ys --to=star file.ys | jolt -` works. The drain is line-based, because
+  `-read-line` is the only read `IReader` offers and it drops the delimiter, so
+  a trailing newline does not survive — `"a\nb"` and `"a\nb\n"` both drain to
+  `"a\nb"`. Reading source text off a pipe does not care.
+
+- **`refer`'s `:rename` installs the var under the name you asked for.** The
+  option was parsed by nothing and the refer table keyed on the plain name, so
+  the local name simply never existed:
+
+  ```
+  (refer 'clojure.string :only '[upper-case] :rename '{upper-case up})
+  (up "ok")
+  ;; 0.7.25: Unable to resolve symbol: up in this context
+  ;; now:    "OK"
+  ```
+
+  The table now records `(target-ns . source-name)` against the local name, so
+  everything that reads it — `resolve`, `ns-refers`, `ns-map`, syntax-quote
+  resolution, the runtime macro lookup — reports the local name and reaches the
+  var it was renamed from. `defmethod` is included: a `defmethod` on a renamed
+  multifn extends the multifn it was renamed from, where 0.7.25 auto-created a
+  dead shadow under the alias and printed the default form.
+
+- **A dialect's own `require`/`use` macro owns its arguments.** The CLI
+  auto-quotes the vector/list arguments of a top-level `require` or `use`, so
+  `(require [my.lib :as m])` works from `-e` or a stdin program without an
+  explicit quote. It decided by the head symbol's *spelling*, so a program that
+  defined its own macro of that name — a dialect compiled to jolt, which is how
+  `ys --to=star file.ys | jolt -` arrives — had its module spec rewritten to
+  `(quote …)` before the macro ever saw it:
+
+  ```
+  (defmacro use [& specs] `(println (quote ~specs)))
+  (use (demo :as d))
+  ;; 0.7.25: ((quote (demo :as d)))
+  ;; now:    ((demo :as d))
+  ```
+
+  The head is resolved the way the compiler resolves it — a locally defined var
+  shadows, then a `:refer`, else the implicit `clojure.core` one — and the
+  convenience applies only when that lands on `clojure.core/require` or
+  `clojure.core/use`. So an unshadowed `(use [clojure.set :only [union]])` keeps
+  its auto-quote, and a qualified `(clojure.core/use …)` or a `:rename`d core
+  `require` reaches it too.
+
+- **A Maven JAR carrying only resources stays on the roots.** An artifact with
+  no `.clj`/`.cljc` was dropped from the resolution outright, on the reasoning
+  that nothing in it can be required. But a jar can package RESOURCES and
+  nothing else: `com.cognitect.aws/endpoints` is a jar of endpoint data and the
+  aws api client reads it through `io/resource`, which could not find it once
+  the root was gone. The extraction is kept.
+
+  What such an artifact still does not get is a **walk**. With no source of ours
+  to load, the deps it declares are its publisher's own JVM/cljs toolchain and
+  jolt has no JVM to run them on — a wrapper around a large Java SDK would
+  otherwise pull that SDK's whole transitive tree, and since a dep that cannot
+  be *obtained* is fatal, a subtree that used to be pruned could abort a
+  resolution over an artifact jolt has no use for. So it resolves as
+  `{:root root :manifest :mvn}` with no `:deps` and no `:pom`, which is a leaf:
+  on the roots for its resources, and childless.
+
+- **A Linux build links Chez's own `liblz4`/`libz`.** The link line asked for
+  `-llz4 -lz` with no `-L`, so it resolved them only on a machine that had lz4
+  and zlib development packages installed. Chez ships both archives in the same
+  directory the kernel comes from (`libkernel.a`, `petite.boot`), and the link
+  now names that directory — the target pack's for a cross build, not this
+  host's, so a cross link cannot pick up the wrong copies.
+
 ### Performance
 
 - **The interrupt check is paid by the waits that wait, not by every call.**
@@ -159,6 +245,19 @@ FFI binding of a real ncurses from opening a terminal.
   that workaround was buying, so the comparison is deleted rather than
   optimized. `.isInterrupted`, `Thread/interrupted`, `monitor-enter`/`exit` and
   `ReentrantLock`'s owner check all read it too.
+
+### Internal
+
+- **Gist/GitHub dependency acquisition reaches the filesystem directly.** Its
+  host map was built by requiring `jolt.fs` at runtime and `resolve`-ing three
+  vars out of it; it now goes through the same `jolt.host` helpers the rest of
+  `jolt.deps` already uses, so there is no runtime require left. A cache move
+  that fails raises `Unable to move dependency cache file to …` rather than
+  returning nil and leaving the caller to discover the file is not there.
+
+- **`make realclean` clears the `.jolt` caches.** The root and test-fixture
+  `.jolt` cache directories are in the `realclean` set now; plain `clean` stays
+  limited to build artifacts.
 
 ## [0.7.25] - 2026-08-24
 
