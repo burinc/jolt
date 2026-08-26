@@ -968,6 +968,59 @@
   {:suite "hostshim" :expr "(do (__register-class-ctor! \"Box2\" (fn [v] (let [t (jolt.host/tagged-table :my/box2)] (jolt.host/ref-put! t :v v) t))) (__register-class-methods! :my/box2 {\"add\" (fn [self n] (+ n (jolt.host/ref-get self :v)))}) (.add (Box2. 10) 5))" :expected "15"}
   {:suite "hostshim" :expr "(do (__register-class-ctor! \"Box3\" (fn [] (jolt.host/tagged-table :my/box3))) (__register-instance-check! (fn [cn val] (if (= cn \"Box3\") (= :my/box3 (jolt.host/ref-get val :jolt/type)) nil))) (instance? Box3 (Box3.)))" :expected "true"}
   {:suite "hostshim" :expr "(do (__register-class-ctor! \"Box4\" (fn [] (jolt.host/tagged-table :my/box4))) (__register-instance-check! (fn [cn val] (if (= cn \"Box4\") (= :my/box4 (jolt.host/ref-get val :jolt/type)) nil))) (instance? Box4 \"not-a-box\"))" :expected "false"}
+  ;; class-extensions (jolt#575): a library adds to / replaces the shim jolt
+  ;; already has for a class, instead of replacing the whole class with its own.
+  ;; jolt.host/extend-class! keys by class NAME, so every shim family — the jfile
+  ;; record, a jhost, a jinst, a regex, a boxed number, a string — is reachable
+  ;; through the one seam. Extensions are process-wide, so run-unit.ss clears them
+  ;; between rows (class-ext-reset!).
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:methods {\"shout\" (fn [self] (.toUpperCase (.getPath self)))}}) (.shout (java.io.File. \"a/b\")))" :expected "\"A/B\""}
+  ;; the default tier only fills gaps — it cannot take a method the shim answers
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:methods {\"getPath\" (fn [self] \"hijacked\")}}) (.getPath (java.io.File. \"a/b\")))" :expected "\"a/b\""}
+  ;; …and :override does, for every caller in the process
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:methods {\"getPath\" (fn [self] \"overridden\")} :override true}) (.getPath (java.io.File. \"a/b\")))" :expected "\"overridden\""}
+  ;; a registration on a SUPERCLASS answers for a subclass receiver (class graph)
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.Reader\" {:methods {\"kind\" (fn [_] :reader)}}) (.kind (java.io.StringReader. \"x\")))" :expected ":reader"}
+  ;; either spelling of the class name resolves
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"File\" {:methods {\"kind\" (fn [_] :file)}}) (.kind (java.io.File. \"a\")))" :expected ":file"}
+  ;; a Class value (the bare token) names the class too
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! java.io.File {:methods {\"kind\" (fn [_] :token)}}) (.kind (java.io.File. \"a\")))" :expected ":token"}
+  ;; jhost receiver (java.util.ArrayList)
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.util.ArrayList\" {:methods {\"secondItem\" (fn [self] (.get self 1))}}) (let [l (java.util.ArrayList.)] (.add l :a) (.add l :b) (.secondItem l)))" :expected ":b"}
+  ;; jinst receiver (java.util.Date) — its arm used to raise its own message
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.util.Date\" {:methods {\"epochish\" (fn [self] (.getTime self))}}) (.epochish (java.util.Date. 5)))" :expected "5"}
+  ;; regex receiver (java.util.regex.Pattern)
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.util.regex.Pattern\" {:methods {\"src\" (fn [self] (.pattern self))}}) (.src #\"a+\"))" :expected "\"a+\""}
+  ;; boxed-number receiver
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.lang.Long\" {:methods {\"twice\" (fn [self] (* 2 self))}}) (.twice 21))" :expected "42"}
+  ;; a string receiver reaches the tier too — only OVERRIDING one is refused
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.lang.String\" {:methods {\"shoutIt\" (fn [self] (.toUpperCase self))}}) (.shoutIt \"hi\"))" :expected "\"HI\""}
+  ;; …because the backend lowers a proven String receiver directly, so an
+  ;; override would apply at some call sites and not others
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"java.lang.String\" {:methods {\"length\" (fn [_] 0)} :override true})" :expected :throws}
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"clojure.lang.Keyword\" {:methods {\"getName\" (fn [_] \"x\")} :override true})" :expected :throws}
+  ;; …and the refusal is derived from the class graph, so an ANCESTOR of one of
+  ;; those three is refused too — a proven String receiver would reach it
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"java.lang.CharSequence\" {:methods {\"length\" (fn [_] 0)} :override true})" :expected :throws}
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"java.lang.Object\" {:methods {\"toString\" (fn [_] \"x\")} :override true})" :expected :throws}
+  ;; an unrelated class is still overridable
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:methods {\"getName\" (fn [_] \"ok\")} :override true}) (.getName (java.io.File. \"a/b\")))" :expected "\"ok\""}
+  ;; a dashed name answers the FIELD spelling
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:methods {\"-ext\" (fn [_] \"clj\")}}) (.-ext (java.io.File. \"a\")))" :expected "\"clj\""}
+  ;; statics merge into the class's existing member table
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:statics {\"tmpName\" (fn [] \"t\")}}) [(java.io.File/tmpName) java.io.File/separator])" :expected "[\"t\" \"/\"]"}
+  ;; :ctor registers (Class. args) for a class jolt does not model
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"ExtBox\" {:ctor (fn [v] (let [t (jolt.host/tagged-table :ext/box)] (jolt.host/ref-put! t :v v) t))}) (jolt.host/ref-get (ExtBox. 7) :v))" :expected "7"}
+  ;; an unclaimed method still raises — the tier must not turn a miss into nil
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:methods {\"a\" (fn [_] 1)}}) (try (.zzz (java.io.File. \"a\")) (catch IllegalArgumentException e (.getMessage e))))" :expected "\"No matching field found: zzz for class java.io.File\""}
+  ;; a class with no extension at all is unaffected
+  {:suite "class-extensions" :expr "(do (jolt.host/extend-class! \"java.io.File\" {:methods {\"a\" (fn [_] 1)}}) (try (.zzz (java.util.ArrayList.)) (catch IllegalArgumentException e (.getMessage e))))" :expected "\"No matching field found: zzz for class java.util.ArrayList\""}
+  ;; spec validation
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"java.io.File\" :nope)" :expected :throws}
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"java.io.File\" {:methods {\"x\" 42}})" :expected :throws}
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"java.io.File\" {:methods :nope})" :expected :throws}
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! 42 {:methods {\"x\" (fn [_] 1)}})" :expected :throws}
+  {:suite "class-extensions" :expr "(jolt.host/extend-class! \"java.io.File\" {:ctor 42})" :expected :throws}
   ;; eq-fast-probes: an arm may not claim keyword/string keys — pmap-fast-get
   ;; answers those without consulting the arms, so such an arm would be silently
   ;; skipped by map lookups.

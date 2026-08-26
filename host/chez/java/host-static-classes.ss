@@ -1442,7 +1442,7 @@
                ;; ones it opens with; read those. Callers use it to decide whether a
                ;; pattern is one they can handle (test.chuck's string-from-regex).
                ((string=? method-name "flags") (rx-inline-flags (regex-t-source obj)))
-               (else (throw-jvm (quote IllegalArgumentException) (string-append "No matching method " method-name " for java.util.regex.Pattern")))))
+               (else (dispatch-miss obj method-name rest))))
         ;; java.util.regex.Matcher: .matches (anchored whole-region), .find
         ;; (next match), .group [n], .groupCount.
         ((jolt-matcher? obj)
@@ -1460,7 +1460,7 @@
                 (let ((mm (matcher-t-last obj)))
                   (if mm (irregex-match-end-index mm (if (pair? rest) (jnum->exact (car rest)) 0))
                       (jolt-throw (jolt-host-throwable "java.lang.IllegalStateException" "No match available")))))
-               (else (throw-jvm (quote IllegalArgumentException) (string-append "No matching method " method-name " for java.util.regex.Matcher")))))
+               (else (dispatch-miss obj method-name rest))))
         (else 'pass)))))
 
 ;; ---- def-var! the registry entry points so emit can also reach them ---------

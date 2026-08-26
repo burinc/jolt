@@ -2453,6 +2453,12 @@
     :bigdec (str "(jolt-bigdec-from-string " (chez-str-lit (:source node)) ")")
     ;; a namespace value spliced into a form (~*ns*) -> reconstruct by name.
     :the-ns (str "(intern-ns! " (chez-str-lit (:name node)) ")")
+     ;; A :target-type direct emit skips record-method-dispatch entirely, so the
+     ;; classes it fires for are the classes a library CANNOT override at runtime
+     ;; (jolt.host/extend-class! rejects them, listed in class-ext-no-override,
+     ;; java/class-extensions.ss). Adding a fourth :target-type here means adding
+     ;; its class there, or an override on it applies at some call sites and not
+     ;; others.
      ;; (.method target arg*) -> jolt-host-call for an rt-shimmed method, else
      ;; record-method-dispatch (a reify/record protocol method). A target PROVEN
      ;; a string (:target-type :str) or a keyword (:kw) on the Chez target emits

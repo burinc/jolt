@@ -1155,6 +1155,31 @@ else
   fails=$((fails + 1))
 fi
 
+# jolt.host/extend-class! (jolt#575) end to end, in a real process: the extend
+# tier fills a gap in the shim jolt already has for java.io.File, does NOT take a
+# method the shim answers, and :override does. The whole point of the seam is
+# that the class keeps its OTHER methods, so each case reads a shim method back
+# alongside the extension.
+check '(do (jolt.host/extend-class! "java.io.File" {:methods {"shout" (fn [self] (.toUpperCase (.getName self)))}}) [(.shout (java.io.File. "a/b.txt")) (.getName (java.io.File. "a/b.txt"))])' '["B.TXT" "b.txt"]'
+check '(do (jolt.host/extend-class! "java.io.File" {:methods {"getName" (fn [_] "hijacked")}}) (.getName (java.io.File. "a/b.txt")))' '"b.txt"'
+check '(do (jolt.host/extend-class! "java.io.File" {:methods {"getName" (fn [_] "overridden")} :override true}) [(.getName (java.io.File. "a/b.txt")) (.getPath (java.io.File. "a/b.txt"))])' '["overridden" "a/b.txt"]'
+# file-seq lowers (.isDirectory f) through jolt-host-call rather than the arm
+# chain, so an override has to reach that spelling too or one method would have
+# two behaviours in the same program.
+check '(do (jolt.host/extend-class! "java.io.File" {:methods {"isDirectory" (fn [_] false)} :override true}) (count (file-seq (java.io.File. "host/chez/java"))))' '1'
+
+# An override is a process-wide substitution the same way a replaced constructor
+# is, so it is reported under JOLT_DEBUG and stays silent for the additive tier.
+extend_out="$(JOLT_DEBUG=1 $jolt -e '(do (jolt.host/extend-class! "java.io.File" {:methods {"getName" (fn [_] "x")} :override true}) (jolt.host/extend-class! "java.io.File" {:methods {"quietlyAdded" (fn [_] :ok)}}) nil)' 2>&1)"
+if printf '%s' "$extend_out" | grep -q 'overrode java.io.File/getName' &&
+   ! printf '%s' "$extend_out" | grep -q 'quietlyAdded'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a class-method override is not reported under JOLT_DEBUG"
+  printf '%s\n' "$extend_out" | tail -3 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # jolt.ffi bulk byte buffers — the foreign<->bytevector block moves under
 # read-array / read-into! / write-array / read-bytes / write-bytes. Binary
 # faithfulness across the unsigned-octet/signed-byte fold, offsets, and bounds.

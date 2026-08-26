@@ -831,7 +831,7 @@
                                                    (= (jinst-ms obj) (jinst-ms (car (seq->list rest-args))))))
              ((string=? method-name "before") (< (jinst-ms obj) (ms-of (car (seq->list rest-args)))))
              ((string=? method-name "after") (> (jinst-ms obj) (ms-of (car (seq->list rest-args)))))
-             (else (throw-jvm (quote IllegalArgumentException) (string-append "No matching method " method-name " for java.util.Date")))))
+             (else (dispatch-miss obj method-name (if (jolt-nil? rest-args) '() (seq->list rest-args))))))
       (else 'pass))))
 
 ;; Clojure's built-in data readers, so a library that merges default-data-readers

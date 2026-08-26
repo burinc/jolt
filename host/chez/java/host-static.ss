@@ -158,7 +158,7 @@
                               (if asc (>= c 0) (<= c 0))))
                           es)))
        (list->cseq (if asc keep (reverse keep)))))
-    (else (throw-jvm (quote IllegalArgumentException) (string-append "No matching method " method " on sorted collection")))))
+    (else (dispatch-miss obj method rest))))
 
 (register-method-arm! arm-priority-host-type
   (lambda (obj method-name rest-args)
@@ -199,7 +199,7 @@
            ;; the shared end of the chain, so a host object reports its real class
            ;; rather than its internal tag, and a (.-x obj) read that no registered
            ;; member claimed reads as a missing FIELD like it does everywhere else
-           (else (no-method-throw method-name obj (length args))))))
+           (else (dispatch-miss obj method-name args)))))
       ((number? obj) (apply number-method method-name obj (if (jolt-nil? rest-args) '() (seq->list rest-args))))
       (else 'pass))))
 
@@ -235,7 +235,7 @@
     ;; precision, so an arithmetic shift by the (positive) amount.
     ((string=? method "shiftLeft") (->num (bitwise-arithmetic-shift-left (jnum->exact n) (jnum->exact (car args)))))
     ((string=? method "shiftRight") (->num (bitwise-arithmetic-shift-right (jnum->exact n) (jnum->exact (car args)))))
-    (else (throw-jvm (quote IllegalArgumentException) (string-append "No matching method " method " for Number")))))
+    (else (dispatch-miss n method args))))
 
 ;; Mutable static fields: "Class" -> (member -> 1-vector cell). A library that
 ;; writes a static field — clojure.spec.alpha's (set! (. clojure.lang.RT
