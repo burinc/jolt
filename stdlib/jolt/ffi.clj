@@ -48,6 +48,18 @@
   [:matrix 1 2]. The array field path itself names its base address and is not a
   scalar read/write target.
 
+  TWO LIBRARIES, ONE COPY. A declared :jolt/native is dlopen'd RTLD_LOCAL, so
+  its symbols reach its own defcfns and nobody else's. That is fine for a
+  dependent library linked against the SHARED base — it resolves the base's
+  symbols through its own handle and there is one copy of the base's globals.
+  It is not fine for one linked against the base's STATIC archive: that library
+  carries its own copy, so writes through one never appear in the other, and
+  nothing raises. raygui built against libraylib.a is the case that named this
+  — every control reads a mouse that never moves. jolt reports a duplicate
+  native symbol on stderr the first time such a symbol is bound, and
+  defining-libraries answers which libraries supply distinct definitions. The
+  fix is always to rebuild the dependent against the shared base library.
+
   The memory/library primitives (alloc/free/read/write/sizeof/load-library/
   ptr->string/string->ptr/null/null?) are provided by the host, as are the
   buffer moves: read-bytes/write-bytes decode and encode UTF-8, read-array/

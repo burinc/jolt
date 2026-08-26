@@ -28,6 +28,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A native library carrying its own static copy of another one is reported
+  instead of going inert (#731).** A declared `:jolt/native` linked against
+  another's static archive gets a private copy of that library's globals, so
+  writes through one are invisible to the other — raygui built against
+  `libraylib.a` reads a mouse that never moves and every control goes dead with
+  no error anywhere. jolt cannot merge the copies (the duplicate is baked into
+  the `.so`; the fix is to rebuild the dependent against the shared library),
+  but it no longer stays quiet: binding such a symbol prints a duplicate-native-
+  symbol report naming the symbol and the libraries, and
+  `jolt.ffi/defining-libraries` answers which libraries supply distinct
+  definitions of a symbol.
+
+  The check keys on the resolved ADDRESS, not on how many handles answer:
+  `dlsym` searches a handle's dependency chain, so a dependent linked correctly
+  against the shared base also resolves the base's symbols through its own
+  handle. Counting handles would have flagged exactly the build that got it
+  right.
+
 - **A jolt local could capture the ftype heads `jolt.ffi/layout` lowers to.**
   The layout lowering emits `define-ftype`, `make-ftype-pointer`,
   `ftype-sizeof`, `ftype-&ref`, and `ftype-pointer-address` into the scope a
