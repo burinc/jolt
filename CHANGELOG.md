@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`File.canRead`/`canWrite`/`canExecute` and `Files.isReadable`/`isWritable`/
+  `isExecutable` answer permissions, not existence.** All six reported whether
+  the file exists, so a read-only file came back writable and every regular file
+  came back executable — code testing writability before a write took the wrong
+  branch and found out at the open. `babashka.fs/writable?` and its siblings
+  route to `Files/is*able` and inherited it. They now ask `access(2)` about the
+  effective user, through one shared predicate so the `java.io` and
+  `java.nio.file` spellings cannot drift apart.
+
 ### Added
 
 - **`jolt.host/extend-class!`: add to or replace the shim jolt already has for a

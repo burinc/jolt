@@ -350,6 +350,31 @@
 ;; last-modified as epoch milliseconds (0 if the file is absent).
 (define (file-mtime-millis p)
   (if (file-exists? p) (sa-file-mtime-ms p) 0))
+
+;; access(2): may the EFFECTIVE user read / write / execute this path? This is
+;; the question File.canRead/canWrite/canExecute and Files.isReadable/isWritable/
+;; isExecutable ask on the JVM. All six used to answer (file-exists? p) instead,
+;; which reports a read-only file as writable and every regular file as
+;; executable — so a caller testing writability before a write took the wrong
+;; branch and found out at the open, and babashka.fs/writable? (which routes to
+;; Files/isWritable) inherited it. ONE predicate for all six: two hand-kept
+;; copies is how java.io and java.nio.file start disagreeing about a path.
+;;
+;; Resolved through jolt-foreign-proc-safe like utimes above — a literal
+;; foreign-procedure is a fasl relocation that aborts the boot where the symbol
+;; is absent. Windows' CRT spells it _access and has no X_OK: mode 1 is EINVAL
+;; there, so an execute test falls back to existence.
+(define c-access (or (jolt-foreign-proc-safe "access" '(string int) 'int)
+                     (jolt-foreign-proc-safe "_access" '(string int) 'int)))
+(define access-r-ok 4)
+(define access-w-ok 2)
+(define access-x-ok 1)
+(define (file-accessible? p mode)
+  (if (and c-access
+           (not (and (fx=? mode access-x-ok) (eq? (sa-os-family) 'windows))))
+      (= (c-access p mode) 0)
+      ;; no access(2) to ask (or X_OK on Windows): the old answer, existence.
+      (if (file-exists? p) #t #f)))
 ;; set atime+mtime from epoch milliseconds via utimes(2). struct timeval is
 ;; sec + usec, 16 bytes each on the 64-bit platforms Chez targets; usec fits
 ;; its field (< 1e6) so a signed 64-bit native-endian write covers the layout.
@@ -584,9 +609,9 @@
                  jolt-nil)))
       ((string=? name "length")         (list (->num (file-byte-size fp))))
       ((string=? name "lastModified")   (list (->num (file-mtime-millis fp))))
-      ((string=? name "canRead")        (list (if (file-exists? fp) #t #f)))
-      ((string=? name "canWrite")       (list (if (file-exists? fp) #t #f)))
-      ((string=? name "canExecute")     (list (if (file-exists? fp) #t #f)))
+      ((string=? name "canRead")        (list (file-accessible? fp access-r-ok)))
+      ((string=? name "canWrite")       (list (file-accessible? fp access-w-ok)))
+      ((string=? name "canExecute")     (list (file-accessible? fp access-x-ok)))
       ((string=? name "isHidden")       (list (let ((nm (path-last-segment p)))
                                                 (if (and (> (string-length nm) 0) (char=? (string-ref nm 0) #\.)) #t #f))))
       ((string=? name "mkdir")          (list (guard (e (#t #f)) (and (not (file-exists? fp)) (begin (mkdir fp) #t)))))

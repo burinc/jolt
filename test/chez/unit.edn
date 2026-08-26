@@ -350,6 +350,17 @@
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.isFile (io/file \"stdlib\")))" :expected "false"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.exists (io/file \"/no/such/path/xyz\")))" :expected "false"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (.exists (io/file \"README.md\")))" :expected "true"}
+  ;; canRead/canWrite/canExecute ask access(2) — whether the EFFECTIVE user may
+  ;; read/write/execute the path — not whether the file exists. Answering
+  ;; existence made a read-only file report writable and every regular file
+  ;; report executable, so a caller testing writability before a write took the
+  ;; wrong branch and found out at the open.
+  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (fs/delete-if-exists \"/tmp/jolt-access-ro.txt\") (spit \"/tmp/jolt-access-ro.txt\" \"x\") (fs/set-posix-file-permissions \"/tmp/jolt-access-ro.txt\" (fs/str->posix \"r--r--r--\")) (let [f (java.io.File. \"/tmp/jolt-access-ro.txt\")] [(.canRead f) (.canWrite f) (.canExecute f)]))" :expected "[true false false]"}
+  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (fs/delete-if-exists \"/tmp/jolt-access-rwx.txt\") (spit \"/tmp/jolt-access-rwx.txt\" \"x\") (fs/set-posix-file-permissions \"/tmp/jolt-access-rwx.txt\" (fs/str->posix \"rwxr-xr-x\")) (let [f (java.io.File. \"/tmp/jolt-access-rwx.txt\")] [(.canRead f) (.canWrite f) (.canExecute f)]))" :expected "[true true true]"}
+  {:suite "io" :expr "(let [f (java.io.File. \"/tmp/jolt-access-absent-xyz\")] [(.canRead f) (.canWrite f) (.canExecute f)])" :expected "[false false false]"}
+  ;; java.nio.file.Files/isReadable etc. (what babashka.fs/readable? routes to)
+  ;; answer from the same predicate, so the two spellings cannot disagree
+  {:suite "io" :expr "(do (require (quote [babashka.fs :as fs])) (fs/delete-if-exists \"/tmp/jolt-access-ro2.txt\") (spit \"/tmp/jolt-access-ro2.txt\" \"x\") (fs/set-posix-file-permissions \"/tmp/jolt-access-ro2.txt\" (fs/str->posix \"r--r--r--\")) [(fs/readable? \"/tmp/jolt-access-ro2.txt\") (fs/writable? \"/tmp/jolt-access-ro2.txt\") (fs/executable? \"/tmp/jolt-access-ro2.txt\")])" :expected "[true false false]"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (instance? java.io.File (io/file \"/a/b\")))" :expected "true"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (instance? java.io.File \"/a/b\"))" :expected "false"}
   {:suite "io" :expr "(do (require (quote [clojure.java.io :as io])) (str (type (io/file \"/a\"))))" :expected "\"class java.io.File\""}
