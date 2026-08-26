@@ -26,6 +26,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offsets from ABI-derived element strides, so even million-element flat and
   nested arrays remain compact.
 
+### Fixed
+
+- **A jolt local could capture the ftype heads `jolt.ffi/layout` lowers to.**
+  The layout lowering emits `define-ftype`, `make-ftype-pointer`,
+  `ftype-sizeof`, `ftype-&ref`, and `ftype-pointer-address` into the scope a
+  jolt local lives in, but none were in the back end's emitted-name set. A local
+  named `ftype-pointer-address` answered its own value as the layout's
+  `:alignment`; the other four failed to compile.
+- **`make ffi` reported a green layout and aggregate gate over a red one.** Both
+  wrappers run the Scheme-level C-ABI witness and then the public-API test
+  without `set -e`, so only the second one's status survived — a failing ABI
+  witness exited 0.
+
 ## [0.7.27] - 2026-08-25
 
 `nth`'s three-argument form used to answer its not-found value for any receiver

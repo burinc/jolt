@@ -77,6 +77,30 @@
                   (jolt.ffi/read p :uint16 (layout-offset arrays [:matrix 1 2]))])
               (finally (jolt.ffi/free p))))")))
 
+
+;; The layout lowering emits bare Chez ftype heads into the same scope a jolt
+;; local lives in, so munge-name must rename a local that collides. Without
+;; that, a local named ftype-pointer-address answered ITS value as the layout's
+;; :alignment -- silently wrong data -- and the other four broke the compile,
+;; which is why each row is guarded: an unrenamed head must report FAIL here,
+;; not abort the gate before the remaining rows run.
+(define (evb source) (guard (e (#t #f)) (jolt-truthy? (ev source))))
+(ev "(def unshadowed (jolt.ffi/__layout [:struct [[:tag :uint8] [:value :double] [:items [:array 3 :uint16]]]]))")
+(for-each
+ (lambda (name)
+   (ok (string-append "a local named " name " does not shadow the layout lowering")
+       (evb (string-append
+             "(let [" name " (fn [& _] :shadowed)]
+                (let [l (jolt.ffi/__layout [:struct [[:tag :uint8] [:value :double] [:items [:array 3 :uint16]]]])]
+                  (= [(:size unshadowed) (:alignment unshadowed)
+                      (get (:jolt.ffi/offsets unshadowed) [:value])
+                      (get (:jolt.ffi/array-strides unshadowed) [:items])]
+                     [(:size l) (:alignment l)
+                      (get (:jolt.ffi/offsets l) [:value])
+                      (get (:jolt.ffi/array-strides l) [:items])])))"))))
+ '("define-ftype" "make-ftype-pointer" "ftype-sizeof" "ftype-&ref"
+   "ftype-pointer-address"))
+
 (for-each
  (lambda (row) (ok (car row) (rejects? (cdr row))))
  '(("empty struct rejects" . "(jolt.ffi/__layout [:struct []])")

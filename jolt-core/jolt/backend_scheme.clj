@@ -772,7 +772,13 @@
                   ;; syntaxes a Chez foreign-procedure/callable expands to).
                   "sa-foreign-procedure" "sa-foreign-procedure-blocking"
                   "sa-foreign-callable" "sa-foreign-callable-collect-safe"
-                  "jolt-ffi-native-error-procedure" "call-with-values"}]
+                  "jolt-ffi-native-error-procedure" "call-with-values"
+                  ;; layout lowering (emit-ffi-layout): the ftype heads the
+                  ;; struct/array metadata is computed with. A local named
+                  ;; ftype-pointer-address answered ITS value as the layout's
+                  ;; :alignment; the other four broke the compile.
+                  "define-ftype" "make-ftype-pointer" "ftype-sizeof"
+                  "ftype-&ref" "ftype-pointer-address"}]
     (into from-registry helpers)))
 
 ;; Most jolt names are already valid Scheme identifiers. The one that isn't is

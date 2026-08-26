@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build the struct-layout C witness outside the tree, run the compiler-level and
 # public API checks, and retain the complete temporary directory on failure.
-set -u
+set -eu
 
 CHEZ=${1-}
 [ -n "$CHEZ" ] || { echo "usage: $0 <chez> [jolt]" >&2; exit 2; }
