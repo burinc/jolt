@@ -80,6 +80,10 @@
   (hashtable-clear! ns-refer-all-table)
   (hashtable-clear! ns-refer-all-exclude-table)
   (hashtable-clear! ns-core-exclude-table)
+  ;; class extensions are process-wide by design (java/class-extensions.ss), so a
+  ;; row that overrides java.io.File/getPath would otherwise decide what every
+  ;; later row sees.
+  (class-ext-reset!)
   (clear-thread-interrupt!)   ; a case that set the runner thread's interrupt flag mustn't leak
   (when zj-ghier (jolt-invoke (var-deref "clojure.core" "reset!")
                    (var-cell-root zj-ghier) (jolt-invoke (var-deref "clojure.core" "make-hierarchy"))))

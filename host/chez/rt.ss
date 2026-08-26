@@ -1607,6 +1607,11 @@
 ;; outermost over every earlier extension.
 (load "host/chez/java/bigdec.ss")
 
+;; The library seam for extending / overriding a class jolt already part-shims.
+;; After every java shim and after bigdec.ss's class-arm wraps, so the class name
+;; a lookup resolves against is the final one.
+(load "host/chez/java/class-extensions.ss")
+
 ;; Native stack traces: jv$ns$name -> source registry + continuation frame walk +
 ;; uncaught-throwable renderer. After the printers/equality it relies on.
 (load "host/chez/source-registry.ss")

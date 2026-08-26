@@ -625,7 +625,7 @@
     (if (jfile? obj)
         (let* ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args)))
                (r (jfile-method obj method-name rest)))
-          (if r (car r) (throw-jvm (quote IllegalArgumentException) (string-append "No matching method for File: " method-name))))
+          (if r (car r) (dispatch-miss obj method-name rest)))
         'pass)))
 ;; An embedded resource shares the tier: io/resource returns one of these where a
 ;; source root would have yielded a jfile, so it has to answer the same methods.
@@ -634,24 +634,26 @@
     (if (embedded-res? obj)
         (let* ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args)))
                (r (embedded-res-method obj method-name rest)))
-          (if r (car r)
-              (throw-jvm (quote IllegalArgumentException)
-                         (string-append "No matching method for an embedded resource: " method-name))))
+          (if r (car r) (dispatch-miss obj method-name rest)))
         'pass)))
 (register-class-arm! embedded-res? (lambda (x) "java.net.URL"))
 ;; (str resource) is the resource name, like URL.toString — which also gives the
 ;; printer's #object[…] fallback its content.
 (register-str-render! embedded-res? (lambda (x) (embedded-res-name x)))
 
-;; File methods emitted via jolt-host-call (rt.ss) need jfile dispatch,
-;; not the string-path shims in the base jolt-host-call. Route through
-;; the jfile-method table so all File methods share one dispatch point.
+;; File methods emitted via jolt-host-call (rt.ss) need jfile dispatch, not the
+;; string-path shims in the base jolt-host-call. Route through
+;; record-method-dispatch — the same entry point every other (.method file)
+;; call takes — so the two spellings cannot answer differently. Calling
+;; jfile-method here directly was that second answer: it skipped the arm chain,
+;; so a library override of File/isDirectory registered through
+;; jolt.host/extend-class! applied everywhere EXCEPT the file-seq call sites the
+;; backend lowers to jolt-host-call.
 (define %io-host-call jolt-host-call)
 (set! jolt-host-call
   (lambda (method target . args)
     (if (jfile? target)
-        (let ((r (jfile-method target method args)))
-          (if r (car r) (apply %io-host-call method target args)))
+        (record-method-dispatch target method (apply jolt-vector args))
         (apply %io-host-call method target args))))
 
 ;; --- the files a load READ ---------------------------------------------------

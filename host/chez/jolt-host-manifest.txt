@@ -42,6 +42,7 @@ enable-trace!
 entry-at
 escape-fn?
 exact?
+extend-class!
 extension-epoch
 extension-has?
 extension-value

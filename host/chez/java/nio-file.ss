@@ -242,7 +242,7 @@
     (if (nio-path? obj)
         (let* ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args)))
                (r (nio-path-method obj method-name rest)))
-          (if r (car r) (throw-jvm (quote IllegalArgumentException) (string-append "No matching method for Path: " method-name))))
+          (if r (car r) (dispatch-miss obj method-name rest)))
         'pass)))
 
 ;; (str p), value equality + hashing. instance? and (class p) come from the

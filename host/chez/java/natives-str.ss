@@ -410,7 +410,7 @@
     ((string=? method "isArray") (and (fx>? (string-length s) 0) (char=? (string-ref s 0) #\[)))
     ;; the shared end of the chain, so a string reports the same way every other
     ;; value does — including "No matching field found" for a (.-x "s") read
-    (else (no-method-throw method s (length rest)))))
+    (else (dispatch-miss s method rest))))
 
 ;; --- clojure.core str-* primitives (the substrate clojure.string.clj calls) ---
 ;; clojure.string.clj is pure Clojure over these

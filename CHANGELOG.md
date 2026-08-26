@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`jolt.host/extend-class!`: add to or replace the shim jolt already has for a
+  Java class (#575).** jolt models the `java.*` surface with hand-written shims,
+  and each one covers the methods jolt and the ported libraries have needed so
+  far. A library that needed a method a shim did not have had one way out:
+  `__register-class-ctor!` its own replacement for the whole class, which every
+  other namespace in the process then silently inherits — the shape that made
+  `(.readAllBytes body)` unresolvable for code that never asked for a
+  `ByteArrayInputStream` shim.
+
+  ```clojure
+  (jolt.host/extend-class! "java.io.File"
+    {:methods {"toPath" (fn [self] ...)}})
+  ```
+
+  Two tiers. The default is consulted at the end of the dispatch chain, where
+  the call would otherwise raise "No matching method", so it can only fill gaps
+  — nothing jolt already answers changes behaviour. `:override true` is
+  consulted before every built-in arm and replaces jolt's method for every
+  caller in the process; it is reported under `JOLT_DEBUG` the way a replaced
+  constructor is. Both are keyed by class name and resolved through the modeled
+  class graph, so a registration on `java.io.Reader` answers for a
+  `StringReader` and either spelling of the name matches. `:statics` and
+  `:ctor` in the same spec cover `Class/member` and `(Class. ...)`.
+
+  Overriding a method on `String`, `Keyword` or `StringBuilder` is refused: the
+  compiler lowers those receivers directly at proven call sites, so an override
+  would apply at some call sites and not others. Adding a method jolt does not
+  have on them is allowed.
+
 - **`jolt.continuations`: one-shot escape continuations (#736).** `call-cc` and
   `letcc` expose the capability jolt's runtime already runs on — the fiber
   park/resume switch, the throw site a backtrace is walked from — to jolt

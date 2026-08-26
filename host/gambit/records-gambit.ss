@@ -1950,14 +1950,7 @@
            ((string=? method-name "getSimpleName") (last-dot tag))
            ((string=? method-name "toString")
             (string-append "class " tag))
-           (else
-            (throw-jvm
-              'IllegalArgumentException
-              (string-append
-                "No method "
-                method-name
-                " on class "
-                tag))))))
+           (else (dispatch-miss obj method-name rest)))))
       ((jolt-multifn? obj)
        (cond
          ((string=? method-name "addMethod")
@@ -1997,10 +1990,7 @@
                       (vector-ref vs i)))))))
          ((string=? method-name "toString")
           (jolt-str-render-one obj))
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on MultiFn")))))
+         (else (dispatch-miss obj method-name rest))))
       ((and (jrec? obj)
             (find-method-any-protocol-arity
               (jrec-tag obj)
@@ -2046,10 +2036,7 @@
            (cond
              (f (apply jolt-invoke f obj rest))
              (d (record-method-dispatch d method-name rest-args))
-             (else
-              (throw-jvm
-                'IllegalArgumentException
-                (string-append "No method " method-name)))))))
+             (else (dispatch-miss obj method-name rest))))))
       ((string? obj) (jolt-string-method method-name obj rest))
       ((jiterator? obj)
        (cond
@@ -2062,10 +2049,7 @@
                 (let ((v (jolt-first s)))
                   (jiterator-cur-set! obj (jolt-rest s))
                   v))))
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on Iterator")))))
+         (else (dispatch-miss obj method-name rest))))
       ((string=? method-name "iterator")
        (make-jiterator (jolt-seq obj)))
       ((keyword-t? obj)
@@ -2090,10 +2074,7 @@
                2654435769)))
          ((string=? method-name "equals")
           (and (pair? rest) (eq? obj (car rest))))
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on Keyword")))))
+         (else (dispatch-miss obj method-name rest))))
       ((symbol-t? obj)
        (cond
          ((string=? method-name "getName") (symbol-t-name obj))
@@ -2109,20 +2090,14 @@
           (and (pair? rest) (jolt=2 obj (car rest))))
          ((string=? method-name "hashCode")
           (java-symbol-hash (symbol-t-name obj) (symbol-t-ns obj)))
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on Symbol")))))
+         (else (dispatch-miss obj method-name rest))))
       ((jns? obj)
        (cond
          ((or (string=? method-name "name")
               (string=? method-name "getName"))
           (jolt-symbol #f (jns-name obj)))
          ((string=? method-name "toString") (jns-name obj))
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on Namespace")))))
+         (else (dispatch-miss obj method-name rest))))
       ((var-cell? obj)
        (cond
          ((string=? method-name "ns") (intern-ns! (var-cell-ns obj)))
@@ -2137,17 +2112,11 @@
             (var-cell-ns obj)
             "/"
             (var-cell-name obj)))
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on Var")))))
+         (else (dispatch-miss obj method-name rest))))
       ((condition? obj)
        (cond
          ((throwable-method obj method-name rest) => car)
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on Throwable")))))
+         (else (dispatch-miss obj method-name rest))))
       ((char? obj)
        (cond
          ((string=? method-name "toString") (string obj))
@@ -2160,10 +2129,7 @@
          ((string=? method-name "compareTo")
           (let ((o (car rest)))
             (cond ((char<? obj o) -1) ((char>? obj o) 1) (else 0))))
-         (else
-          (throw-jvm
-            'IllegalArgumentException
-            (string-append "No method " method-name " on char")))))
+         (else (dispatch-miss obj method-name rest))))
       ((or (string=? method-name "indexOf")
            (string=? method-name "lastIndexOf"))
        (let ((target (car rest))
@@ -2191,8 +2157,20 @@
        (let ((boxed (dot-coll-method obj method-name rest)))
          (if boxed
              (car boxed)
-             (no-method-throw method-name obj (length rest)))))
-      (else (no-method-throw method-name obj (length rest))))))
+             (dispatch-miss obj method-name rest))))
+      (else (dispatch-miss obj method-name rest)))))
+
+(define class-ext-fallback-hook #f)
+
+(define (set-class-ext-fallback-hook! f)
+  (set! class-ext-fallback-hook f))
+
+(define (dispatch-miss obj method-name args)
+  (let ((f (and class-ext-fallback-hook
+                (class-ext-fallback-hook obj method-name))))
+    (if f
+        (apply jolt-invoke f obj args)
+        (no-method-throw method-name obj (length args)))))
 
 (define (no-method-throw method-name obj . maybe-argc)
   (let* ((argc (if (null? maybe-argc) 0 (car maybe-argc)))
@@ -2233,6 +2211,8 @@
         ((null? as) (list (cons priority arm)))
         ((< priority (caar as)) (cons (cons priority arm) as))
         (else (cons (car as) (ins (cdr as))))))))
+
+(define arm-priority-user-override 1)
 
 (define arm-priority-getclass 5)
 

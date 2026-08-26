@@ -55,7 +55,7 @@
                        (string=? method-name "getTypeName")) tag)
                   ((string=? method-name "getSimpleName") (last-dot tag))
                   ((string=? method-name "toString") (string-append "class " tag))
-                  (else (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name " on class " tag))))))
+                  (else (dispatch-miss obj method-name rest)))))
       ;; clojure.lang.MultiFn interop on a defmulti value: addMethod/removeMethod/
       ;; getMethod/getMethodTable, the same table (defmethod) fills — schema's
       ;; abstract-map registers dispatch methods by calling .addMethod directly.
@@ -92,7 +92,7 @@
                   m
                   (loop (fx+ i 1) (jolt-assoc1 m (vector-ref ks i) (vector-ref vs i)))))))
          ((string=? method-name "toString") (jolt-str-render-one obj))
-         (else (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name " on MultiFn")))))
+         (else (dispatch-miss obj method-name rest))))
       ((and (jrec? obj) (find-method-any-protocol-arity (jrec-tag obj) method-name (+ 1 (length rest))))
        => (lambda (f) (apply jolt-invoke f obj rest)))
       ;; (.field inst): a deftype/record field read with no matching method.
@@ -133,7 +133,7 @@
                 ;; whatever method resolution its own kind of value has.
                 ;; rest-args, not rest: the dispatcher takes a jolt seq
                 (d (record-method-dispatch d method-name rest-args))
-                (else (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name)))))))
+                (else (dispatch-miss obj method-name rest))))))
       ;; java.lang.String interop: defined in natives-str.ss, loaded
       ;; after this file (free reference, resolved at call time).
       ((string? obj) (jolt-string-method method-name obj rest))
@@ -143,7 +143,7 @@
               (let ((s (jolt-seq (jiterator-cur obj))))
                 (if (jolt-nil? s) (throw-jvm (quote NoSuchElementException) "iterator exhausted")
                     (let ((v (jolt-first s))) (jiterator-cur-set! obj (jolt-rest s)) v))))
-             (else (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name " on Iterator")))))
+             (else (dispatch-miss obj method-name rest))))
       ((string=? method-name "iterator") (make-jiterator (jolt-seq obj)))
       ;; clojure.lang.Keyword interop: a Keyword carries an interned `sym` field
       ;; (the symbol form, ns + name) plus the Named methods. honeysql/reitit read
@@ -164,7 +164,7 @@
               (jolt-s32 (+ (java-symbol-hash (keyword-t-name obj) (keyword-t-ns obj))
                            #x9e3779b9)))
              ((string=? method-name "equals") (and (pair? rest) (eq? obj (car rest))))
-             (else (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name " on Keyword")))))
+             (else (dispatch-miss obj method-name rest))))
       ;; clojure.lang.Symbol interop: the Named methods + getName/getNamespace.
       ((symbol-t? obj)
        (cond ((string=? method-name "getName") (symbol-t-name obj))
@@ -175,14 +175,14 @@
              ((string=? method-name "equals") (and (pair? rest) (jolt=2 obj (car rest))))
              ((string=? method-name "hashCode")
               (java-symbol-hash (symbol-t-name obj) (symbol-t-ns obj)))
-             (else (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name " on Symbol")))))
+             (else (dispatch-miss obj method-name rest))))
       ;; clojure.lang.Namespace: name/getName yield the ns name as a Symbol (JVM:
       ;; Namespace.name is a Symbol). clojure.spec.alpha reads (.name *ns*).
       ((jns? obj)
        (cond ((or (string=? method-name "name") (string=? method-name "getName"))
               (jolt-symbol #f (jns-name obj)))
              ((string=? method-name "toString") (jns-name obj))
-             (else (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name " on Namespace")))))
+             (else (dispatch-miss obj method-name rest))))
       ;; clojure.lang.Var: ns -> its Namespace, sym -> the simple-name Symbol.
       ;; clojure.spec.alpha's ->sym reads (.name (.ns v)) and (.sym v).
       ((var-cell? obj)
@@ -192,7 +192,7 @@
              ((string=? method-name "getName")
               (jolt-symbol (var-cell-ns obj) (var-cell-name obj)))
              ((string=? method-name "toString") (string-append "#'" (var-cell-ns obj) "/" (var-cell-name obj)))
-             (else (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name " on Var")))))
+             (else (dispatch-miss obj method-name rest))))
       ;; java.lang.Throwable interop over a Chez condition. A jolt host error
       ;; (`error`/`assertion-violationf`) raises a Chez condition; Clojure code
       ;; that catches it as a Throwable reads (.getMessage e) / (.toString e).
@@ -201,7 +201,7 @@
       ;; same set of methods — restating them here is what let the two drift.
       ((condition? obj)
        (cond ((throwable-method obj method-name rest) => car)
-             (else (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name " on Throwable")))))
+             (else (dispatch-miss obj method-name rest))))
       ;; java.lang.Character interop: (.toString \+) -> "+", etc.
       ((char? obj)
        (cond ((string=? method-name "toString") (string obj))
@@ -210,7 +210,7 @@
              ((string=? method-name "equals") (and (pair? rest) (char? (car rest)) (char=? obj (car rest))))
              ((string=? method-name "compareTo")
               (let ((o (car rest))) (cond ((char<? obj o) -1) ((char>? obj o) 1) (else 0))))
-             (else (throw-jvm (quote IllegalArgumentException) (string-append "No method " method-name " on char")))))
+             (else (dispatch-miss obj method-name rest))))
       ;; java.util.List .indexOf / .lastIndexOf over any seqable (vector / list /
       ;; seq) — -1 when absent, like the JVM (medley/index-of reads this).
       ((or (string=? method-name "indexOf") (string=? method-name "lastIndexOf"))
@@ -247,8 +247,29 @@
       ;; caller gets a one-element list instead of the value.
       ((jrec? obj)
        (let ((boxed (dot-coll-method obj method-name rest)))
-         (if boxed (car boxed) (no-method-throw method-name obj (length rest)))))
-      (else (no-method-throw method-name obj (length rest))))))
+         (if boxed (car boxed) (dispatch-miss obj method-name rest))))
+      (else (dispatch-miss obj method-name rest)))))
+
+;; The end of the .method dispatch chain: the library extension tier, then the
+;; throw. EVERY "this receiver has no such method" path routes here — the
+;; per-type arms and the base's per-type conds each used to raise their own
+;; throw-jvm with their own wording, which split the error surface (a File said
+;; "No matching method for File: x" while a String said "No matching field
+;; found: x for class java.lang.String", and neither applied the nil -> NPE
+;; rule) and, more to the point, put those receivers out of reach of the
+;; extension tier below.
+;;
+;; class-extensions.ss sets the hook the first time a library registers a
+;; non-override extension; it is #f until then, so a process that never uses the
+;; seam pays nothing and misses throw exactly as before. The hook answers
+;; (obj method-name) -> proc | #f.
+(define class-ext-fallback-hook #f)
+(define (set-class-ext-fallback-hook! f) (set! class-ext-fallback-hook f))
+(define (dispatch-miss obj method-name args)
+  (let ((f (and class-ext-fallback-hook (class-ext-fallback-hook obj method-name))))
+    (if f
+        (apply jolt-invoke f obj args)
+        (no-method-throw method-name obj (length args)))))
 
 ;; The end of the dispatch chain. A method call on nil is the JVM's
 ;; NullPointerException; anything else is its IllegalArgumentException ("No
@@ -301,6 +322,11 @@
 ;; arm's role; two disjoint-type arms may share a tier (regex-t and nio-path
 ;; both sit just above jfile at 42). Values are unchanged from the prior magic
 ;; numbers — this is a readability rename only.
+;; Library overrides sit above every built-in arm: the whole point of the tier is
+;; that jolt's own method for the class does not get a say. Registered lazily by
+;; java/class-extensions.ss, so a process that never calls jolt.host/extend-class!
+;; has no such arm in the chain at all.
+(define arm-priority-user-override 1)
 (define arm-priority-getclass 5)      ; .getClass — universal Object method, first
 (define arm-priority-string 6)       ; string receivers — the base's string? case hoisted
 (define arm-priority-dotform 30)      ; -field accessor + dot-form method dispatch
