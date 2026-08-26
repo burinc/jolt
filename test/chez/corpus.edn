@@ -1132,6 +1132,22 @@
   {:suite "inst / value semantics & printing" :label "unequal instants" :expected "false" :actual "(= #inst \"2020-01-01T00:00:00Z\" #inst \"2020-01-01T00:00:01Z\")" :portability :common}
   {:suite "inst / value semantics & printing" :label "works as map key" :expected ":v" :actual "(get {#inst \"2020-01-01T00:00:00Z\" :v} #inst \"2020-01-01T00:00:00.000Z\")" :portability :common}
   {:suite "inst / value semantics & printing" :label "pr-str round-trips" :expected "\"#inst \\\"2020-01-01T00:00:00.000-00:00\\\"\"" :actual "(pr-str #inst \"2020-01-01T00:00:00Z\")" :portability :common}
+  {:suite "reader / digit separators" :label "underscores group a long decimal" :expected "1000000" :actual "1_000_000" :portability :common}
+  {:suite "reader / digit separators" :label "a run of underscores is one separator" :expected "52" :actual "5_______2" :portability :common}
+  {:suite "reader / digit separators" :label "a separator survives a leading sign" :expected "[-1000 1000]" :actual "[-1_000 +1_000]" :portability :common}
+  {:suite "reader / digit separators" :label "hex groups by nibble" :expected "65535" :actual "0xFF_FF" :portability :common}
+  {:suite "reader / digit separators" :label "octal keeps its leading zero" :expected "42" :actual "0_52" :portability :common}
+  {:suite "reader / digit separators" :label "a radix literal groups its digits" :expected "1007" :actual "36rR_Z" :portability :common}
+  {:suite "reader / digit separators" :label "both sides of a decimal point group" :expected "10.55" :actual "1_0.5_5" :portability :common}
+  {:suite "reader / digit separators" :label "mantissa and exponent group independently" :expected "1.0E11" :actual "1_0e1_0" :portability :common}
+  {:suite "reader / digit separators" :label "a bigint suffix follows a grouped literal" :expected "3000N" :actual "3_000N" :portability :common}
+  {:suite "reader / digit separators" :label "a ratio groups either side" :expected "10/3" :actual "1_0/3" :portability :common}
+  {:suite "reader / digit separators" :label "a trailing separator is an invalid number" :expected "\"Invalid number: 1_\"" :actual "(try (read-string \"1_\") (catch Exception e (.getMessage e)))" :portability :common}
+  {:suite "reader / digit separators" :label "a separator against the hex marker is an invalid number" :expected "\"Invalid number: 0x_52\"" :actual "(try (read-string \"0x_52\") (catch Exception e (.getMessage e)))" :portability :common}
+  {:suite "reader / digit separators" :label "a separator against the exponent marker is an invalid number" :expected "\"Invalid number: 1e_5\"" :actual "(try (read-string \"1e_5\") (catch Exception e (.getMessage e)))" :portability :common}
+  {:suite "reader / digit separators" :label "a separator against the decimal point is an invalid number" :expected "\"Invalid number: 1_.5\"" :actual "(try (read-string \"1_.5\") (catch Exception e (.getMessage e)))" :portability :common}
+  {:suite "reader / digit separators" :label "a leading underscore is still an ordinary symbol" :expected "\"_1\"" :actual "(pr-str (read-string \"_1\"))" :portability :common}
+  {:suite "reader / digit separators" :label "edn refuses a separator the source reader accepts" :expected "true" :actual "(try (clojure.edn/read-string \"1_000\") false (catch Exception _ true))" :portability :common}
   {:suite "reader / delimiters" :label "a mismatched close reports, it does not hang" :expected "\"Unmatched delimiter: )\"" :actual "(try (read-string \"(def m {:a 1)\") (catch Exception e (.getMessage e)))" :portability :common}
   {:suite "reader / delimiters" :label "mismatched bracket" :expected "\"Unmatched delimiter: }\"" :actual "(try (read-string \"[1 2}\") (catch Exception e (.getMessage e)))" :portability :common}
   {:suite "io / java.net.URL" :label "str renders the spec" :expected "\"https://e.com/x\"" :actual "(str (java.net.URL. \"https://e.com/x\"))" :portability :jvm}

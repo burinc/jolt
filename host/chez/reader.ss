@@ -99,6 +99,132 @@
 ;; Numeric tower (JVM parity): integer literals read as exact integers (= Long/
 ;; BigInt, arbitrary precision), a/b ratios as exact rationals (= Ratio), and
 ;; decimal/exponent literals as flonums (= double).
+;; --- digit separators: 1_000_000 (issue #389) --------------------------------
+;; A jolt superset: the JVM reader raises "Invalid number" on every token below,
+;; so nothing that reads today changes meaning. Only a token that ALREADY starts
+;; like a number is affected — a leading underscore is still an ordinary symbol
+;; (_1 reads as the symbol _1 here exactly as on the JVM), because that decision
+;; is made before this runs.
+;;
+;; The rule is Java's, which is the one someone writing 1_000_000 expects: an
+;; underscore must sit BETWEEN TWO DIGITS of the literal. Never at either end,
+;; never against the sign, the 0x / NrDDD radix marker, the decimal point, the
+;; exponent marker, the ratio slash, or the N/M suffix. Being looser would be
+;; easier — strip every underscore and let the parse decide — but that accepts
+;; 0x_FF, 1e_5 and 2r_10, which reads as a second, stranger divergence to
+;; explain. One rule, matching the language jolt models, is cheaper to document
+;; than three special cases.
+;;
+;; "Digit" is per literal kind, so the marker characters are located FIRST and
+;; excluded by position rather than by character class: r IS a digit in base 36
+;; (36rR_Z is legal) and e IS a hex digit (0x1e_5 is legal), so a rule phrased
+;; over characters alone gets both wrong.
+(define (rdr-digit-sep-marker-positions body blen)
+  ;; Positions in BODY that are structural markers, not digits: the x of a 0x
+  ;; prefix, the r of a radix literal, and a trailing N/M suffix. The decimal
+  ;; point, exponent marker, sign and slash are handled by the alphanumeric
+  ;; test itself — none of them is alphanumeric except e/E, which is only a
+  ;; marker when the token has no hex or radix prefix.
+  (let* ((hex? (and (>= blen 2) (char=? (string-ref body 0) #\0)
+                    (let ((c (string-ref body 1)))
+                      (or (char=? c #\x) (char=? c #\X)))))
+         (ri (and (not hex?)
+                  (let loop ((i 0))
+                    (cond ((>= i blen) #f)
+                          ((let ((c (string-ref body i)))
+                             (or (char=? c #\r) (char=? c #\R)))
+                           i)
+                          (else (loop (+ i 1)))))))
+         (acc '()))
+    (when hex? (set! acc (cons 1 acc)))
+    (when (and ri (> ri 0)) (set! acc (cons ri acc)))
+    ;; A trailing N (bigint) or M (bigdecimal) is a suffix, not a digit.
+    (when (> blen 0)
+      (let ((c (string-ref body (- blen 1))))
+        (when (or (char=? c #\N) (char=? c #\M))
+          (set! acc (cons (- blen 1) acc)))))
+    ;; e/E is the exponent marker only in a plain decimal literal; in hex and in
+    ;; base>14 radix literals it is a digit.
+    (when (and (not hex?) (not ri))
+      (let loop ((i 0))
+        (when (< i blen)
+          (let ((c (string-ref body i)))
+            (when (or (char=? c #\e) (char=? c #\E)) (set! acc (cons i acc))))
+          (loop (+ i 1)))))
+    acc))
+
+(define (rdr-digit-sep-alnum? c)
+  (or (and (char>=? c #\0) (char<=? c #\9))
+      (and (char>=? c #\a) (char<=? c #\z))
+      (and (char>=? c #\A) (char<=? c #\Z))))
+
+;; TOK with its underscores removed, or #f when any of them is misplaced. #f
+;; reaches the caller's "starts like a number but does not parse" arm, which
+;; raises NumberFormatException naming the original token — the same answer the
+;; JVM gives, which is what a misplaced separator deserves.
+(define (rdr-strip-digit-separators tok)
+  (let* ((len (string-length tok))
+         (c0 (string-ref tok 0))
+         (start (if (or (char=? c0 #\+) (char=? c0 #\-)) 1 0))
+         (body (substring tok start len))
+         (blen (string-length body))
+         (markers (rdr-digit-sep-marker-positions body blen)))
+    (let loop ((i 0) (acc '()))
+      (cond
+        ((>= i blen)
+         (string-append (substring tok 0 start)
+                        (list->string (reverse acc))))
+        ((char=? (string-ref body i) #\_)
+         ;; The RUN of underscores starting here must be between two digits —
+         ;; 5_______2 is legal, the same as 5_2 (JLS 3.10.1). So look past the
+         ;; rest of the run for the right-hand neighbour rather than requiring
+         ;; the very next character to be a digit.
+         (let scan ((j i))
+           (cond
+             ((and (< j blen) (char=? (string-ref body j) #\_)) (scan (+ j 1)))
+             (else
+              ;; Both neighbours must exist, be alphanumeric, and not be one of
+              ;; this literal's structural markers.
+              (and (> i 0) (< j blen)
+                   (rdr-digit-sep-alnum? (string-ref body (- i 1)))
+                   (rdr-digit-sep-alnum? (string-ref body j))
+                   (not (memv (- i 1) markers))
+                   (not (memv j markers))
+                   (loop j acc))))))
+        (else (loop (+ i 1) (cons (string-ref body i) acc)))))))
+
+(define (rdr-has-digit-separator? tok)
+  (let ((n (string-length tok)))
+    (let loop ((i 0))
+      (cond ((>= i n) #f)
+            ((char=? (string-ref tok i) #\_) #t)
+            (else (loop (+ i 1)))))))
+
+;; NOT in EDN. edn is an interchange format with a published grammar, and its
+;; integers are [+-]?(0|[1-9][0-9]*)N? — no separators. jolt's PRINTER never
+;; emits one (numbers print canonically), so jolt-written edn stays portable
+;; either way; what accepting them would add is the other direction, a
+;; hand-written deps.edn or config that reads here and fails in tools.deps or
+;; any other edn reader. That is the trap edn strict mode already exists to
+;; prevent — it is why #(), #= and auto-resolved keywords are refused too — so
+;; a separator is refused with it, and the divergence stays confined to source
+;; jolt reads for itself.
+;; The separator retry, for a token that ALREADY failed to parse and already
+;; looks like a number. It is deliberately NOT part of rdr-try-number: that runs
+;; on every token in every source file, and a symbol fails the ordinary parse
+;; too, so hanging the retry off failure alone made every symbol in the file pay
+;; a parameter read and a scan of its own name to discover it is not a number.
+;; Measured on a 2593-line file: 7.06 ms/read became 7.22.
+;;
+;; rdr-token->value already knows which failures are numeric-looking, so the
+;; retry sits in that arm — on the path whose only other outcome is raising
+;; "Invalid number". Nothing that reads today reaches it.
+(define (rdr-try-separated-number tok)
+  (and (not (rdr-edn-mode))
+       (rdr-has-digit-separator? tok)
+       (let ((stripped (rdr-strip-digit-separators tok)))
+         (and stripped (rdr-try-number-raw stripped)))))
+
 (define (rdr-try-number tok)
   (rdr-try-number-raw tok))
 
@@ -344,9 +470,13 @@
       (n n)
       ;; a token that starts like a number but doesn't parse as one is an
       ;; invalid number (1a, 08, 0x2g, 2r2), never a symbol — like the JVM.
+      ;; Except that a digit separator (1_000_000) lands here too, so the
+      ;; retry goes in front of the raise: this is the only arm it can help,
+      ;; and putting it anywhere earlier taxes tokens that can never benefit.
       ((rdr-numeric-lead? tok)
-       (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
-                                        (string-append "Invalid number: " tok))))
+       (or (rdr-try-separated-number tok)
+           (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
+                                            (string-append "Invalid number: " tok)))))
       ((string=? tok "nil") jolt-nil)
       ((string=? tok "true") #t)
       ((string=? tok "false") #f)
