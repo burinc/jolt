@@ -269,6 +269,28 @@
   ;; available to programs. It used to be reserved, and a var or local named
   ;; syntax-quote was silently miscompiled into a syntax-quote of its first
   ;; argument (edamame names its own resolver that, and :refers it).
+  ;; A backtick nested inside a backtick — the macro-defining macro. The JVM's
+  ;; reader resolves these inside-out: the inner ` is already construction code
+  ;; by the time the outer ` walks it, so the outer's auto-gensym env rewrites
+  ;; the bare x# sitting in that code and it matches the parameter. jolt lowers
+  ;; syntax-quote in the analyzer instead, and the compile path did not
+  ;; recognize a nested one at all: the outer walk consumed the INNER template's
+  ;; ~unquotes as its own, so merely DEFINING the outer macro tried to resolve
+  ;; x# as a variable (jolt#a-nested-gensym).
+  {:suite "reader / nested syntax-quote" :label "defining a macro-defining macro does not resolve the inner macro's auto-gensym params" :expected ":defined" :actual "(do (defmacro sqb-outer [n] `(defmacro ~(symbol (str \"sqb-\" n)) [x# y#] `(vector ~x# ~y#))) :defined)" :portability :common}
+  {:suite "reader / nested syntax-quote" :label "the generated macro's auto-gensym params reach its template" :expected "[1 2]" :actual "(do (defmacro sqa-outer [n] `(defmacro ~(symbol (str \"sqa-\" n)) [x# y#] `(vector ~x# ~y#))) (sqa-outer one) (sqa-one 1 2))" :portability :common}
+  {:suite "reader / nested syntax-quote" :label "params are distinct gensyms, and one may be used twice" :expected "[:b :a :a]" :actual "(do (defmacro sqf-outer [n] `(defmacro ~(symbol (str \"sqf-\" n)) [x# y#] `(vector ~y# ~x# ~x#))) (sqf-outer one) (sqf-one :a :b))" :portability :common}
+  ;; The DATA a nested backtick yields is jolt's own construction code
+  ;; (__sqcat/__sq1), where the JVM's is seq/concat — the two evaluate to the
+  ;; same thing, but a program that prints or structurally walks that data sees
+  ;; a different shape. This is only observable for a NESTED backtick, because
+  ;; that is the one case where construction code becomes a value instead of
+  ;; being compiled. Recorded in known-divergences.edn (:impl-detail); the row
+  ;; is here so the shape cannot change without the gate saying so.
+  {:suite "reader / nested syntax-quote" :label "the inner template is jolt's construction code, not the JVM's seq/concat" :expected "\"(user/a (clojure.core/__sqcat (clojure.core/__sq1 (quote user/b)) (clojure.core/__sq1 (clojure.core/+ 1 2))))\"" :actual "(do (in-ns (quote user)) (pr-str `(a `(b ~(+ 1 2)))))" :portability :common}
+  ;; ~'~x interpolates the OUTER macro's argument into the inner expansion —
+  ;; the outer walk reaches the (unquote nm) the inner left behind.
+  {:suite "reader / nested syntax-quote" :label "~'~x carries the outer macro's argument into the inner template" :expected "(quote (9 1 2))" :actual "(do (defmacro sqe-outer [nm] `(defmacro ~(symbol (str \"sqe-\" nm)) [x# y#] `(list ~'~nm ~x# ~y#))) (sqe-outer 9) (sqe-9 1 2))" :portability :common}
   {:suite "reader / syntax-quote is not a reserved name" :label "a local named syntax-quote is an ordinary local" :expected "[:local 1 2]" :actual "(let [syntax-quote (fn [a b] [:local a b])] (syntax-quote 1 2))" :portability :common}
   {:suite "reader / syntax-quote is not a reserved name" :label "a var named syntax-quote is an ordinary var" :expected "[:fn 1 2 3]" :actual "(do (ns sqg.ns) (clojure.core/defn syntax-quote [a b c] [:fn a b c]) (syntax-quote 1 2 3))" :portability :common}
   {:suite "reader / syntax-quote is not a reserved name" :label "and it can be referred into another namespace" :expected "[:fn 1 2]" :actual "(do (ns sqa.ns) (clojure.core/defn syntax-quote [a b] [:fn a b]) (ns sqb.ns) (clojure.core/refer (quote sqa.ns)) (syntax-quote 1 2))" :portability :common}

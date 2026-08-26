@@ -626,7 +626,16 @@
    :jolt "raises \"Could not locate clojure/spec/alpha.jolt (or .clj/.cljc) on the source roots\""
    :note "Declare org.clojure/spec.alpha and org.clojure/core.specs.alpha explicitly; declared that way they resolve as ordinary Maven dependencies. Affects any library that requires spec without declaring it."}]
  :entries
- [;; SimpleDateFormat with no Locale answers for ROOT in jolt but the machine's
+ [;; A nested backtick is the one place a syntax-quote's CONSTRUCTION CODE
+  ;; becomes a value rather than being compiled, so it is the one place jolt's
+  ;; lowering is visible. jolt's compile path emits __sqcat/__sq1 (which the
+  ;; analyzer builds at compile time, the point of the design); the JVM's reader
+  ;; emits seq/concat. Both evaluate to the same expansion — a program only
+  ;; notices if it prints or structurally walks the inner template.
+  {:suite "reader / nested syntax-quote",
+   :label "the inner template is jolt's construction code, not the JVM's seq/concat",
+   :category :impl-detail}
+  ;; SimpleDateFormat with no Locale answers for ROOT in jolt but the machine's
   ;; DEFAULT locale on the JVM ("March|Mar|Saturday|Sat" under en), so this row's
   ;; :expected is jolt's ROOT rendering, not the JVM's. See the :documented entry.
   {:suite "time / sdf locale names",
