@@ -120,6 +120,34 @@ echo "$out2" | grep -q "jolt.ffi: duplicate native symbol" \
 echo "$out2" | grep -q "WIDGET 42" \
   || report "correctly linked build did not share the global (got: $(echo "$out2" | grep WIDGET || echo none))"
 
+# --- a declared native shadowing the GLOBAL namespace is not a duplicate -------
+# The scoped loader exists so a declared native's symbols beat the process
+# global namespace for its own defcfns — that is how jolt-lang/crypto's OpenSSL
+# EVP_* reach OpenSSL and not Apple's BoringSSL. That shadowing is the FEATURE,
+# and it must not read as a duplicate: the check only compares declared natives
+# against each other, never against the global namespace, or the case the loader
+# was built for would warn on every call.
+cat > "$work/shadow.c" <<'EOF'
+int abs(int x) { return (x < 0 ? -x : x) + 1000; }
+EOF
+# shellcheck disable=SC2086
+cc $shared "$work/shadow.c" -o "$work/libshadow.$soext"
+cat > "$work/shadow.clj" <<EOF
+(ns shadow (:require [jolt.ffi :as ffi]))
+(ffi/load-library "$work/libshadow.$soext")
+(ffi/defcfn c-abs "abs" [:int] :int)
+(println "SHADOW" (c-abs -4))
+(println "DEFINERS" (count (ffi/defining-libraries "abs")))
+EOF
+out3="$("$jolt" run "$work/shadow.clj" 2>&1)" || { echo "$out3"; report "shadow fixture did not run"; }
+
+echo "$out3" | grep -q "SHADOW 1004" \
+  || report "the declared native no longer shadows the global namespace (got: $(echo "$out3" | grep SHADOW || echo none))"
+echo "$out3" | grep -q "DEFINERS 1" \
+  || report "global-namespace shadowing counted as a duplicate definition (got: $(echo "$out3" | grep DEFINERS || echo none))"
+echo "$out3" | grep -q "jolt.ffi: duplicate native symbol" \
+  && report "false positive: shadowing the global namespace was reported as duplicated"
+
 # --- the warning is emitted once per symbol, not once per call ------------------
 cat > "$work/once.clj" <<EOF
 (ns once (:require [jolt.ffi :as ffi]))
