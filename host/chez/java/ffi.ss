@@ -120,7 +120,10 @@
 ;; not dlopen'd twice. Mutated only from load-natives!/jolt-build-load-native,
 ;; but guarded anyway in case a repl loads a native lazily.
 (define ffi-native-mu (make-mutex))
-(define ffi-native-handles (vector #f))   ; cell[0] = list of handles, oldest first
+;; cell[0] = list of (path . handle) pairs, oldest first. The PATH rides along
+;; only so a duplicate-symbol report can name the libraries involved (issue
+;; #731); resolution itself reads the handle.
+(define ffi-native-handles (vector #f))
 (define ffi-native-paths (make-hashtable string-hash equal?))  ; path(string) -> #t
 ;; dlopen `path` RTLD_LOCAL and record the handle. Returns the handle (a positive
 ;; integer) on success, #f on failure, or #t on Windows (loaded globally, not
@@ -141,22 +144,110 @@
               ((and h (integer? h) (positive? h))
                (hashtable-set! ffi-native-paths path #t)
                (vector-set! ffi-native-handles 0
-                            (append (or (vector-ref ffi-native-handles 0) '()) (list h)))
+                            (append (or (vector-ref ffi-native-handles 0) '())
+                                    (list (cons path h))))
                h)
               (else #f)))))))))
+;; Every declared native through which `sym` RESOLVES, as (path . address) in
+;; declaration order. Walking all of them rather than stopping at the first is
+;; what makes the duplicate below visible; it costs one dlsym per declared
+;; native, paid ONCE per defcfn (the emitted binding caches the address in its
+;; own `p` cell — backend_scheme.clj emit-ffi-fn), not once per call.
+(define (jolt-ffi-native-resolvers sym)
+  (if (or (eq? (sa-os-family) 'windows) (not ffi-dlsym))
+      '()
+      (let loop ((hs (or (vector-ref ffi-native-handles 0) '())) (acc '()))
+        (cond
+          ((null? hs) (reverse acc))
+          (else
+           (let ((a (ffi-dlsym (cdar hs) sym)))
+             (loop (cdr hs)
+                   (if (and a (integer? a) (positive? a))
+                       (cons (cons (caar hs) a) acc)
+                       acc))))))))
+
+;; The DISTINCT definitions of `sym`, one entry per address, naming the first
+;; declared native that reaches each.
+;;
+;; The address is the discriminator, and it has to be: dlsym(handle, sym)
+;; searches that handle's DEPENDENCY CHAIN as well as the library itself, so a
+;; dependent linked correctly against the shared base resolves the base's
+;; symbols through its own handle too. Counting handles that answer would call
+;; that a duplicate — a false positive on exactly the build that got it right,
+;; which is the one way to make a warning worth ignoring. Two copies means two
+;; ADDRESSES; one address reached through several handles is one copy, which is
+;; the whole point of linking dynamically.
+(define (jolt-ffi-native-definers sym)
+  (let loop ((rs (jolt-ffi-native-resolvers sym)) (seen '()) (acc '()))
+    (cond
+      ((null? rs) (reverse acc))
+      ((memv (cdar rs) seen) (loop (cdr rs) seen acc))
+      (else (loop (cdr rs) (cons (cdar rs) seen) (cons (car rs) acc))))))
+
+;; --- the duplicate-static-copy report (issue #731) ---------------------------
+;; Two declared natives defining the SAME symbol is the signature of a dependent
+;; library that was linked against the base library's STATIC archive instead of
+;; its shared object: the archive members it pulled in are exported from the
+;; dependent too. raygui built against libraylib.a is the case that named this —
+;; it gets a private copy of raylib's input globals, so every control reads a
+;; mouse that never moves and the UI goes inert with no error anywhere.
+;;
+;; jolt cannot repair it. By the time the .so exists the second copy is baked in,
+;; and the only fix is to rebuild the dependent against the SHARED base library.
+;; So this reports rather than raises, for two reasons: the damage is already
+;; done and refusing to run would not undo it, and two unrelated natives may
+;; legitimately export a common name (`version`, `init`) where first-hit
+;; resolution is correct and always was. A raise would turn those into a
+;; regression; silence is what the issue is about.
+;;
+;; Once per symbol, not once per call. The emitted binding caches its address,
+;; so a repeat would only appear if a caller resolved the same name again — and
+;; a warning that repeats is a warning that gets filtered out.
+(define ffi-dup-reported (make-hashtable string-hash equal?))
+(define (ffi-report-duplicate! sym defs)
+  (unless (hashtable-ref ffi-dup-reported sym #f)
+    (hashtable-set! ffi-dup-reported sym #t)
+    (let ((p (current-error-port)))
+      (display (string-append
+                 "jolt.ffi: duplicate native symbol " sym " — defined by "
+                 (number->string (length defs)) " declared libraries:\n")
+               p)
+      (for-each (lambda (d)
+                  (display (string-append "  " (car d) "\n") p))
+                defs)
+      (display (string-append
+                 "  Resolving against the first. This usually means a library was linked\n"
+                 "  against another's STATIC archive and carries its own copy of that\n"
+                 "  library's globals, which then never see the other copy's writes.\n"
+                 "  Rebuild it against the shared library instead.\n")
+               p)
+      (flush-output-port p))))
+
 ;; dlsym `sym` across the registered native handles in declaration order. Returns
 ;; the address (positive integer) of the first hit, or #f when no handle has it
 ;; — the emitter then falls back to global name resolution. #f on Windows (no
 ;; registered handles).
 (define (jolt-ffi-dlsym-native sym)
-  (if (or (eq? (sa-os-family) 'windows) (not ffi-dlsym))
-      #f
-      (let loop ((hs (or (vector-ref ffi-native-handles 0) '())))
-        (cond
-          ((null? hs) #f)
-          (else
-           (let ((a (ffi-dlsym (car hs) sym)))
-             (if (and a (integer? a) (positive? a)) a (loop (cdr hs)))))))))
+  (let ((rs (jolt-ffi-native-resolvers sym)))
+    (cond
+      ((null? rs) #f)
+      (else
+       ;; Only walk the dedupe when more than one handle answered; the common
+       ;; case (exactly one) skips it entirely.
+       (when (pair? (cdr rs))
+         (let ((defs (jolt-ffi-native-definers sym)))
+           (when (pair? (cdr defs)) (ffi-report-duplicate! sym defs))))
+       (cdar rs)))))
+
+;; jolt.ffi/defining-libraries: one declared native per DISTINCT definition of
+;; `sym`, in declaration order — the diagnostic to reach for when a native call
+;; returns something impossible and nothing has raised. A correctly linked set
+;; answers one entry however many libraries use the symbol; two entries means
+;; two copies.
+(define (jolt-ffi-defining-libraries sym)
+  (make-pvec
+   (list->vector
+    (map car (jolt-ffi-native-definers (ffi-str-arg "symbol" sym))))))
 
 ;; --- foreign type keywords ---------------------------------------------------
 ;; The keyword type names jolt.ffi accepts (in foreign-fn signatures and the
@@ -445,6 +536,7 @@
 (def-var! "jolt.ffi" "load-library" ffi-load-library)
 (def-var! "jolt.ffi" "loaded?" (lambda (n) (if (ffi-loaded? n) #t #f)))
 (def-var! "jolt.ffi" "load-native" jolt-ffi-load-native)
+(def-var! "jolt.ffi" "defining-libraries" jolt-ffi-defining-libraries)
 (def-var! "jolt.ffi" "dlsym-native" jolt-ffi-dlsym-native)
 (def-var! "jolt.ffi" "alloc" ffi-alloc)
 (def-var! "jolt.ffi" "free" ffi-free)

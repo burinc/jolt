@@ -124,7 +124,7 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke depscpcache depsunit \
-  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi stdlibfasl \
+  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
@@ -365,6 +365,13 @@ buildlibsmoke: testbin
 # default), and --dynamic keeps the runtime load-shared-object path.
 staticnativesmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/static-native-smoke.sh
+
+# Duplicate native symbol detection (issue #731): a declared :jolt/native that
+# carries its own static copy of another's code — raygui linked against
+# libraylib.a — used to go inert with no error. Pins that the footgun build is
+# reported AND that a correctly linked one is not.
+ffidupsym:
+	@sh host/chez/ffi-duplicate-symbol-smoke.sh
 
 # OPT-IN: jolt.mvn-http cert-verifying HTTPS fetch against Central + Clojars.
 # Not in `make test` — needs network + a working system OpenSSL.
