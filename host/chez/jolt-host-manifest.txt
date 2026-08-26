@@ -17,6 +17,7 @@ block-sigint
 build-binary
 build-library
 bytes-allocated
+call-cc
 call-on-main-thread
 call-on-main-thread-async
 callable-host?
@@ -39,6 +40,7 @@ delete-tree!
 directory?
 enable-trace!
 entry-at
+escape-fn?
 exact?
 extension-epoch
 extension-has?

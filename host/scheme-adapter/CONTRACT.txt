@@ -191,6 +191,29 @@ sa-foreign-procedure
 sa-foreign-procedure-native-error
 sa-foreign-procedure-blocking
 #
+# tier: capability-continuations
+# OUR OWN definition in host/chez/scheme-adapter-runtime.ss — the one-shot
+# ESCAPE continuation, exposed to jolt programs as jolt.continuations
+# (call-cc / letcc) via host/chez/continuations.ss.
+#   (sa-call-with-escape-continuation proc) -> value: call PROC with a one-shot
+#     escape procedure k; (k v) returns v from THIS call, unwinding the
+#     dynamic-wind chain in between (so a jolt `finally` runs — an escape is a
+#     real exit, unlike a fiber park, which drops those winders first).
+# ENFORCED, NOT MERELY OFFERED: k is valid AT MOST ONCE and only while this
+# call is still on the stack. A second invocation, or one after PROC returned
+# normally, must RAISE — never re-enter a dead frame and never hang. A target
+# whose only continuation primitive is multi-shot (Gambit's call/cc) carries a
+# spent flag in its adapter to meet this; Chez's call/1cc is the contract
+# natively, so its adapter is a one-liner.
+# The layer above adds jolt policy the contract does not: which thread and
+# fiber may invoke a given escape, and the jolt-level error. Targets do not
+# implement that — they only owe the one-shot primitive.
+# Permitted degradation: a target with no usable continuations must raise a
+# message-carrying condition (never leave the name unbound); jolt.continuations
+# then fails honestly on that target, the same shape jolt.image takes when
+# fasl serialization is absent.
+sa-call-with-escape-continuation
+#
 # tier: eval
 # interaction-environment: R7RS (scheme repl), not Chez-only. The ONLY host
 # call shape is the standard (eval expr (interaction-environment)) — jolt's

@@ -373,6 +373,39 @@
 (define (sa-fasl-read port . rest)
   (error 'sa-fasl-read "fasl serialization is unsupported on the gambit target"))
 
+;; ---- continuations tier (capability: continuations) -------------------------
+
+;; (sa-call-with-escape-continuation proc) -> value
+;; The one-shot ESCAPE continuation jolt.continuations is built on. Gambit's
+;; usable primitive is call/cc (the same R0(e) finding the fiber scheduler
+;; below rests on: ##continuation-capture/##continuation-graft SIGBUS gsi on
+;; same-stack re-entry), and call/cc is MULTI-SHOT — so the one-shot half of
+;; the contract is this adapter's job, not something the primitive gives.
+;;
+;; The spent flag is what supplies it. Chez's call/1cc refuses a second
+;; invocation and refuses one after the capturing call returned; both refusals
+;; are reproduced here, because without them a re-invocation would graft
+;; control back into a frame that already finished and silently re-run the
+;; caller's half-completed expression — the exact trap the fiber scheduler
+;; below avoids by construction rather than by checking.
+;;
+;; The flag is set on the normal return as well as on the escape: after PROC
+;; answers, this capture is no longer live, and a saved k invoked later must
+;; raise rather than re-enter. The layer above (host/chez/continuations.ss)
+;; adds the thread/fiber ownership rule and the jolt-level error; a target owes
+;; only the one-shot primitive.
+(define (sa-call-with-escape-continuation proc)
+  (call/cc
+   (lambda (k)
+     (let ((spent #f))
+       (let ((v (proc (lambda (val)
+                        (if spent
+                            (error 'sa-call-with-escape-continuation
+                                   "escape continuation is spent")
+                            (begin (set! spent #t) (k val)))))))
+         (set! spent #t)
+         v)))))
+
 ;; ---- fibers R1: coroutines tier (capability: coroutines) --------------------
 ;; Stackful green threads sharing one OS thread, per CONTRACT.txt's coroutines
 ;; tier. R0(e) pinned the primitive: ##continuation-capture/##continuation-graft

@@ -443,6 +443,29 @@
 ;; Degradation: none.
 (define (sa-foreign-callable-entry-point co) (foreign-callable-entry-point co))
 
+;; ---- continuations tier (capability: continuations) --------------------------
+
+;; (sa-call-with-escape-continuation proc) -> value
+;; Call PROC with a one-shot ESCAPE procedure k. Invoking (k v) returns v from
+;; this sa-call-with-escape-continuation call, unwinding the dynamic-wind chain
+;; between the two — an escape is a real exit, so a jolt `finally` in between
+;; RUNS (unlike a fiber park, which drops those winders first).
+;;
+;; The contract is call/1cc's, and a target must enforce it rather than merely
+;; offer it: k is valid AT MOST ONCE, and only while this call is still on the
+;; stack. Invoking it a second time, or after PROC has returned normally, must
+;; RAISE — never re-enter, and never hang. That is what lets the layer above
+;; (host/chez/continuations.ss) present a single one-shot escape semantic on
+;; every target instead of one per target's continuation model.
+;;
+;; Degradation: a target with no continuations at all must raise a
+;; message-carrying condition; jolt.continuations then fails honestly rather
+;; than silently doing nothing. Chez: call/1cc natively, so this is the whole
+;; implementation — zero wrappers, capture is O(1) and depth-independent.
+;; Gambit: call/cc plus the spent flag its adapter carries, because call/cc is
+;; multi-shot and would otherwise re-enter a dead frame.
+(define (sa-call-with-escape-continuation proc) (call/1cc proc))
+
 ;; ---- R8: eval/compile/AOT (capabilities: native-compile, image) --------------
 
 ;; (sa-baked-global sym) -> value | #f

@@ -100,6 +100,11 @@
 ;; ---------------------------------------------------------------------------
 ;; tier: capability-ffi
 ;; ---------------------------------------------------------------------------
+;;   sa-call-with-escape-continuation UNIMPLEMENTED Guile has call/cc; wrap it with a
+;;                                        spent flag so a second invocation (or one after
+;;                                        the capturing call returned) RAISES rather than
+;;                                        re-entering. The escape must unwind dynamic-wind
+;;                                        on the way out — jolt's `finally` rides that.
 ;;   sa-foreign-procedure   UNIMPLEMENTED  Guile: (pointer->procedure ret (dynamic-func name
 ;;                                        lib) args) — (system foreign). must verify call
 ;;                                        shape translation; SYNTAX on Chez (lowering).

@@ -1585,6 +1585,12 @@
 ;; runtime (it depends on async.ss).
 (load "host/chez/java/fibers-async.ss")
 
+;; Escape continuations as a jolt API (issue #736): jolt.host/call-cc, which
+;; stdlib/jolt/continuations.clj presents as call-cc / letcc. After fibers.ss —
+;; the guard that refuses an escape captured on another fiber reads the fiber
+;; vreg, and refusing is what keeps a cross-fiber invoke from hanging.
+(load "host/chez/continuations.ss")
+
 ;; The cheap park (R7, jolt-nvpr.9): __sm-spawn/__sm-take/__sm-put, the ops a
 ;; CPS'd go body (the pass in clojure.core.async) calls. A
 ;; lexically-parking body stores the rest of the computation as an ordinary
