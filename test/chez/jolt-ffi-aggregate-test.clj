@@ -8,6 +8,12 @@
 
 (def date-layout
   (ffi/layout [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]))
+(def packet-layout
+  (ffi/layout [:struct [[:tag :uint8]
+                        [:params [:array 4 :uint32]]
+                        [:dates [:array 2 [:struct [[:year :int32]
+                                                    [:month :uint8]
+                                                    [:day :uint8]]]]]]]))
 
 ;; The public macros require literal signature data, so keep the descriptor
 ;; inline rather than referring to date-layout in these declarations. Define
@@ -27,6 +33,23 @@
                   [[:by-value [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]]
                    :int :varargs :int :int]
                   :int64))
+(def packet-score
+  (ffi/foreign-fn "jolt_agg_packet_score"
+                  [[:by-value [:struct [[:tag :uint8]
+                                        [:params [:array 4 :uint32]]
+                                        [:dates [:array 2 [:struct [[:year :int32]
+                                                                    [:month :uint8]
+                                                                    [:day :uint8]]]]]]]]]
+                  :int64))
+(def make-packet
+  (ffi/foreign-fn "jolt_agg_make_packet"
+                  [:uint8 :uint32
+                   [:by-value [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]]]
+                  [:by-value [:struct [[:tag :uint8]
+                                       [:params [:array 4 :uint32]]
+                                       [:dates [:array 2 [:struct [[:year :int32]
+                                                                   [:month :uint8]
+                                                                   [:day :uint8]]]]]]]]))
 
 (ffi/load-library helper)
 
@@ -55,6 +78,32 @@
                (ffi/read-field output date-layout :month)
                (ffi/read-field output date-layout :day)]))
     (finally (ffi/free input) (ffi/free output))))
+
+(ffi/with-layout [input packet-layout]
+  (ffi/with-layout [date date-layout]
+    (ffi/with-layout [output packet-layout]
+      (ffi/write-field input packet-layout :tag 7)
+      (doseq [i (range 4)]
+        (ffi/write-field input packet-layout [:params i] (+ 10 i)))
+      (doseq [[index year month day] [[0 2026 7 23] [1 2027 8 24]]]
+        (ffi/write-field input packet-layout [:dates index :year] year)
+        (ffi/write-field input packet-layout [:dates index :month] month)
+        (ffi/write-field input packet-layout [:dates index :day] day))
+      (check "public fixed-array aggregate argument"
+             (= 40545874 (packet-score input)))
+      (ffi/write-field date date-layout :year 2026)
+      (ffi/write-field date date-layout :month 7)
+      (ffi/write-field date date-layout :day 23)
+      (check "public fixed-array aggregate return"
+             (= [output 7 10 13 2026 2027 8 24]
+                [(make-packet output 7 10 date)
+                 (ffi/read-field output packet-layout :tag)
+                 (ffi/read-field output packet-layout [:params 0])
+                 (ffi/read-field output packet-layout [:params 3])
+                 (ffi/read-field output packet-layout [:dates 0 :year])
+                 (ffi/read-field output packet-layout [:dates 1 :year])
+                 (ffi/read-field output packet-layout [:dates 1 :month])
+                 (ffi/read-field output packet-layout [:dates 1 :day])])))))
 
 (check "public null argument rejects"
        (rejects? #(date-score ffi/null)))
