@@ -39,6 +39,15 @@ misbehavior, not a crash.
 - **`condition-wait` may wake spuriously.** Every wait site loops on its
   predicate; your implementation may wake threads freely but must not LOSE
   wakeups.
+- **An escape continuation is one-shot, and the target enforces it.**
+  `sa-call-with-escape-continuation` hands `proc` a procedure valid AT MOST
+  ONCE and only while that call is still on the stack. A second invocation, or
+  one after `proc` returned normally, must RAISE — a target whose only
+  primitive is multi-shot (`call/cc`) carries a spent flag rather than letting
+  control re-enter a finished frame. The escape must unwind the dynamic-wind
+  chain on its way out: jolt's `finally` runs on an escape, and a target that
+  skipped the unwind would silently drop cleanup. Ownership (which thread and
+  fiber may invoke a given escape) is the HOST's rule, not yours.
 - **Native error capture is part of the foreign call boundary.**
   `sa-foreign-procedure-native-error` must return the C result and the calling
   thread's errno/GetLastError-equivalent atomically; a later host call that reads

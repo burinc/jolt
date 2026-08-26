@@ -124,7 +124,7 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke depscpcache depsunit \
-  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym stdlibfasl \
+  smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
@@ -524,6 +524,15 @@ ffi:
 	@sh test/chez/ffi-aggregate-test.sh "$(CHEZ)"
 	@bin/jolt run test/chez/jolt-ffi-scoped-test.clj
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
+
+# Escape continuations (jolt.continuations, issue #736): the one-shot contract
+# call-cc/letcc expose, what unwinds on an escape, that a park inside ONE fiber
+# is not an ownership boundary, and the four misuses. The cross-fiber rows are
+# why this gate exists — unguarded, invoking an escape captured on another
+# fiber hangs the process rather than raising, so each of those rows runs on a
+# watchdog thread and FAILS on a deadline instead of wedging the run.
+continuations:
+	@bin/jolt run test/chez/continuations-test.clj
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`jolt.continuations`: one-shot escape continuations (#736).** `call-cc` and
+  `letcc` expose the capability jolt's runtime already runs on — the fiber
+  park/resume switch, the throw site a backtrace is walked from — to jolt
+  programs. `(letcc [return] ...)` unwinds out of any depth, including out of a
+  callback a library invoked, where `reduced` cannot reach. JVM Clojure
+  cannot have this (the JVM cannot capture its stack), so
+  code using it is jolt-only by design, like `jolt.scheme`; it is purely
+  additive and no Clojure program is affected.
+
+  An escape is a real exit, so a `finally` between the capture and the escape
+  runs and a `binding` is restored — the opposite of a fiber park, which drops
+  those winders because a park is not an exit. A park between the capture and
+  the escape is fine within one fiber: the scheduler captures and restores the
+  fiber's whole stack segment.
+
+  Re-entrancy is not supported and never half-works. Invoking an escape twice,
+  invoking one after its `call-cc` returned, or invoking one from a thread or
+  fiber other than the one that captured it each raise
+  `IllegalStateException` naming the rule. The last of those is not pedantry:
+  the raw host primitive HANGS the process there, with no error at all.
 - **Digit separators in number literals (#389).** `1_000_000` reads as
   `1000000`. The rule is Java's, which is the one someone writing a grouped
   literal expects: an underscore must sit between two digits, never against the
@@ -25,7 +45,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has none, and jolt's printer never emits one, so the only thing accepting
   them there would add is a hand-written config that reads on jolt and fails in
   every other edn reader.
-
 - **Atomic native-error capture for `jolt.ffi`.** `foreign-fn` and `defcfn`
   accept `{:capture-native-error true}` and return `[native-result error-code]`,
   capturing POSIX `errno` or Windows `GetLastError` in the foreign-call return

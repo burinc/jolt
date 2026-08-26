@@ -403,6 +403,55 @@
   (check-raise-message "sa-run-process" (lambda () (sa-run-process "echo hi" #f))
                        "subprocess support is unsupported on the gambit target"))
 
+;; ---- continuations tier — the one-shot escape primitive ---------------------
+;; The gambit target IMPLEMENTS this tier rather than degrading, so these rows
+;; assert real behaviour, not an honest-failure message. The two refusals are
+;; the whole reason the adapter wraps call/cc at all: call/cc is multi-shot and
+;; would happily graft control back into a frame that already finished.
+(define (test-continuations)
+  (printf "== continuations: one-shot escape (call/cc + spent flag) ==\n")
+  (check "escape returns its value"
+         (sa-call-with-escape-continuation (lambda (k) (k 'escaped) 'not-reached))
+         'escaped)
+  (check "falling through returns the body value"
+         (sa-call-with-escape-continuation (lambda (k) 'fell-through))
+         'fell-through)
+  (check "escape leaves a loop from depth"
+         (sa-call-with-escape-continuation
+          (lambda (k) (let loop ((i 0)) (if (= i 100) (k i) (loop (+ i 1))))))
+         100)
+  ;; An escape is a real exit: the dynamic-wind chain between the capture and
+  ;; the escape unwinds, which is what makes a jolt `finally` run.
+  (check "escape unwinds dynamic-wind"
+         (let ((log '()))
+           (sa-call-with-escape-continuation
+            (lambda (k)
+              (dynamic-wind
+                (lambda () (set! log (cons 'in log)))
+                (lambda () (k 'out))
+                (lambda () (set! log (cons 'out log))))))
+           (reverse log))
+         '(in out))
+  (check-raise-message "second invocation refused"
+                       (lambda ()
+                         (let ((saved #f))
+                           (sa-call-with-escape-continuation
+                            (lambda (k) (set! saved k) (k 'first)))
+                           (saved 'again)))
+                       "escape continuation is spent")
+  (check-raise-message "invocation after a normal return refused"
+                       (lambda ()
+                         (let ((saved #f))
+                           (sa-call-with-escape-continuation
+                            (lambda (k) (set! saved k) 'fell-through))
+                           (saved 'too-late)))
+                       "escape continuation is spent")
+  (check "a fresh capture after a spent one still escapes"
+         (let ((saved #f))
+           (sa-call-with-escape-continuation (lambda (k) (set! saved k) (k 'first)))
+           (sa-call-with-escape-continuation (lambda (k) (k 'second))))
+         'second))
+
 ;; ---- coroutines tier (fibers R1) — the call/cc-based fiber primitive --------
 ;; Mirrors the Chez gate's correctness set at small scale: round trip,
 ;; round-robin order, per-fiber raise isolation with a surviving scheduler,
@@ -482,6 +531,7 @@
 (test-threads)
 (test-hasheq-known-answers)
 (test-sa-surface)
+(test-continuations)
 (test-coroutines)
 
 (printf "\ngambitcheck: ~a failure(s)\n" failures)
