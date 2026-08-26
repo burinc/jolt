@@ -93,6 +93,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A backtick nested inside a backtick is lowered inside-out.** Defining a
+  macro that defines a macro — `` `(defmacro f [x#] `(g ~x#)) `` — raised
+  "Unable to resolve symbol: x#" at the point the OUTER macro was defined,
+  where `x#` names a parameter of an inner macro that does not exist yet. It
+  was never gensym-specific: `` `(defmacro f [a b] `(vector ~a ~b)) `` failed
+  the same way with no `#` anywhere. jolt lowers syntax-quote in the analyzer
+  rather than the reader, and the compile path did not recognise a nested one
+  at all, so the outer walk claimed the inner template's `~unquotes` as its
+  own. It now lowers the inner backtick first, with its own auto-gensym scope,
+  and walks the construction code that produces — the order the JVM's reader
+  gets for free, and what makes the `x#` in the parameter vector and the `x#`
+  in the body the same gensym. `~'~x` carries the outer macro's argument into
+  the inner expansion again for the same reason. The reader's data path
+  (`read-string`) already did this; only the compile path was missing it.
+
+  One thing this makes visible for the first time: a nested backtick is the
+  only place a syntax-quote's construction code becomes a value rather than
+  being compiled, so it is the only place jolt's `__sqcat`/`__sq1` shows where
+  the JVM has `seq`/`concat`. Both evaluate to the same expansion; only a
+  program that prints or structurally walks the inner template can tell.
+  Recorded in `known-divergences.edn` as `:impl-detail`.
+
 - **A native library carrying its own static copy of another one is reported
   instead of going inert (#731).** A declared `:jolt/native` linked against
   another's static archive gets a private copy of that library's globals, so

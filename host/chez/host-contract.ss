@@ -464,9 +464,40 @@
         out
         (jolt-list (hc-sym "with-meta") out (hc-sq-lower ctx m gsmap)))))
 
+;; Is this the raw (clojure.core/syntax-quote x) form the reader emits for a `?
+;; The qualification is the point, exactly as in rdr-syntax-quote-form?: a BARE
+;; (syntax-quote x) is an ordinary call to whatever the program means by that
+;; name, not a marker. hc-head-is? accepts either spelling, so it cannot be used
+;; here.
+(define (hc-syntax-quote-form? x)
+  (and (hc-list? x)
+       (let ((s (jolt-seq x)))
+         (and (not (jolt-nil? s))
+              (let ((h (seq-first s)))
+                (and (symbol-t? h) (string=? (symbol-t-name h) "syntax-quote")
+                     (let ((ns (hc-sym-ns h)))
+                       (and (string? ns) (string=? ns "clojure.core")))))))))
+
 (define (hc-sq-lower-bare ctx form gsmap)
   (cond
     ((hc-head-is? form "unquote") (hc-second form))
+    ;; A NESTED backquote, lowered INSIDE-OUT — the order the JVM gets for free
+    ;; by resolving syntax-quote in the reader, where the inner ` has already
+    ;; become construction code before the outer one walks it. Two things follow
+    ;; from doing it in that order, and neither works without it:
+    ;;
+    ;;   * the inner template's ~unquotes belong to the INNER `. Lowering the
+    ;;     nested form as an ordinary list let the outer walk claim them, so
+    ;;     `(defmacro f [x#] `(g ~x#)) tried to resolve x# as a variable while
+    ;;     merely DEFINING the outer macro — the parameter it names does not
+    ;;     exist until the outer macro is called.
+    ;;   * a bare symbol left in the inner's construction code (what an inner
+    ;;     ~x# lowers to) is then walked by the OUTER gsmap, so the x# in the
+    ;;     parameter vector and the x# in the body get the same gensym.
+    ;;
+    ;; Fresh gsmap for the inner: each ` has its own auto-gensym scope.
+    ((hc-syntax-quote-form? form)
+     (hc-sq-lower ctx (hc-syntax-quote-lower ctx (hc-second form)) gsmap))
     ((hc-head-is? form "unquote-splicing")
      (jolt-throw (jolt-ex-info "~@ used outside of a list or vector in syntax-quote"
                                (jolt-hash-map))))
