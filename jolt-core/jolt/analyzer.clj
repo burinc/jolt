@@ -899,7 +899,7 @@
   (host-new (or (deftype-ctor-class ctx class) class)
             (mapv #(analyze ctx % env) args)))
 
-;; Literal, data-only struct descriptors. Keep the analyzer representation free
+;; Literal, data-only layout descriptors. Keep the analyzer representation free
 ;; of reader objects so it survives self-hosting and can be embedded in the IR.
 (def ^:private ffi-layout-scalars
   #{"int" "uint" "int8" "i8" "uint8" "u8" "byte" "char"
@@ -908,6 +908,13 @@
     "double" "float" "pointer" "void*"})
 
 (declare analyze-ffi-layout-type)
+
+(defn- ffi-layout-form-kind [form]
+  (when (form-vec? form)
+    (let [parts (vec (form-vec-items form))
+          head (first parts)]
+      (when (and (form-keyword? head) (nil? (namespace head)))
+        (name head)))))
 
 (defn- analyze-ffi-layout-struct [form]
   (when-not (form-vec? form)
@@ -948,19 +955,37 @@
                          (conj fields {:name nm
                                        :type (analyze-ffi-layout-type (nth fp 1))})))))))))))
 
+(defn- analyze-ffi-layout-array [form]
+  (let [parts (vec (form-vec-items form))]
+    (when-not (= 3 (count parts))
+      (throw (str "jolt.ffi array descriptor must be [:array positive-count element-type], got "
+                  (pr-str form))))
+    (let [count (nth parts 1)]
+      (when-not (and (integer? count) (pos? count))
+        (throw (str "jolt.ffi array count must be a positive integer literal, got "
+                    (pr-str count))))
+      {:ffi-kind :array
+       :count count
+       :type (analyze-ffi-layout-type (nth parts 2))})))
+
 (defn- analyze-ffi-layout-type [form]
   (cond
     (form-keyword? form)
     (let [n (name form)]
       (when-not (and (nil? (namespace form)) (contains? ffi-layout-scalars n))
-        (throw (str "jolt.ffi struct field type must be a fixed-size scalar or nested struct; got "
+        (throw (str "jolt.ffi struct field type must be a fixed-size scalar, nested struct, or fixed array; got "
                     (pr-str form))))
       n)
 
-    (form-vec? form) (analyze-ffi-layout-struct form)
+    (form-vec? form)
+    (case (ffi-layout-form-kind form)
+      "struct" (analyze-ffi-layout-struct form)
+      "array" (analyze-ffi-layout-array form)
+      (throw (str "jolt.ffi struct field type must be a fixed-size scalar, nested struct, or fixed array; got "
+                  (pr-str form))))
 
     :else
-    (throw (str "jolt.ffi struct field type must be a fixed-size scalar or nested struct; got "
+    (throw (str "jolt.ffi struct field type must be a fixed-size scalar, nested struct, or fixed array; got "
                 (pr-str form)))))
 
 (defn- analyze-ffi-layout [items]
