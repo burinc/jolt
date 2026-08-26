@@ -208,6 +208,14 @@ divergences:
   portable Clojure. It resolves first, so a library can ship a portable
   `foo.cljc` next to a `foo.jolt` that wins on jolt, the way `.clj` wins over
   `.cljc` on the JVM. `data_readers.jolt` works like `data_readers.clj` too.
+- **Digit separators in numbers.** `1_000_000`, `0xFF_FF` and `36rR_Z` read as
+  numbers; the JVM raises `Invalid number` on all three. The rule is Java's — an
+  underscore must sit between two digits, never against a sign, radix marker,
+  decimal point, exponent marker or `N`/`M` suffix — so `1_` and `0x_52` still
+  raise. A leading underscore is still an ordinary symbol. `clojure.edn` refuses
+  separators: edn's grammar has none, and a config that read only here would
+  fail in every other edn reader. Additive — nothing that reads on the JVM
+  changes meaning.
 - **Clojure is a terminal dependency.** jolt *is* Clojure, so
   `org.clojure/clojure` in a `deps.edn` contributes neither an artifact nor
   children. On the JVM that artifact pulls in `org.clojure/spec.alpha`, so a

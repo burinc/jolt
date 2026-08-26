@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Digit separators in number literals (#389).** `1_000_000` reads as
+  `1000000`. The rule is Java's, which is the one someone writing a grouped
+  literal expects: an underscore must sit between two digits, never against the
+  sign, the `0x` / `NrDDD` radix marker, the decimal point, the exponent
+  marker, the ratio slash, or the `N`/`M` suffix. So `0xFF_FF`, `0_52`,
+  `36rR_Z`, `1_0.5_5`, `1_0e1_0` and `3_000N` all read, while `1_`, `0x_52` and
+  `1e_5` raise `Invalid number` exactly as before. A run of underscores counts
+  as one separator (`5_______2` is `52`), and a leading underscore is still an
+  ordinary symbol — `_1` is the symbol `_1`, unchanged.
+
+  A jolt superset: the JVM raises `Invalid number` on every literal this adds,
+  so nothing that reads today changes meaning. `clojure.edn` deliberately does
+  NOT accept separators — edn is an interchange format whose integer grammar
+  has none, and jolt's printer never emits one, so the only thing accepting
+  them there would add is a hand-written config that reads on jolt and fails in
+  every other edn reader.
+
 - **Atomic native-error capture for `jolt.ffi`.** `foreign-fn` and `defcfn`
   accept `{:capture-native-error true}` and return `[native-result error-code]`,
   capturing POSIX `errno` or Windows `GetLastError` in the foreign-call return
