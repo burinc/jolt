@@ -342,9 +342,12 @@
 (let ((files-statics
        (list
         (cons "notExists"     (lambda (p . _) (if (file-exists? (nfp p)) #f #t)))
-        (cons "isReadable"    (lambda (p . _) (if (file-exists? (nfp p)) #t #f)))
-        (cons "isWritable"    (lambda (p . _) (if (file-exists? (nfp p)) #t #f)))
-        (cons "isExecutable"  (lambda (p . _) (if (file-exists? (nfp p)) #t #f)))
+        ;; the effective user's permission, from the one predicate java.io.File's
+        ;; canRead/canWrite/canExecute uses (io.ss) — these are the same question
+        ;; and must not drift into two answers for one path.
+        (cons "isReadable"    (lambda (p . _) (file-accessible? (nfp p) access-r-ok)))
+        (cons "isWritable"    (lambda (p . _) (file-accessible? (nfp p) access-w-ok)))
+        (cons "isExecutable"  (lambda (p . _) (file-accessible? (nfp p) access-x-ok)))
         (cons "isHidden"      (lambda (p . _) (let ((nm (npath-string-of (npath-file-name (npath-string-of p)))))
                                                 (and (> (string-length nm) 0) (char=? (string-ref nm 0) #\.)))))
         (cons "size"          (lambda (p . _) (nio-size (nfp p))))
