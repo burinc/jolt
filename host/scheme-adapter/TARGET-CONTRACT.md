@@ -39,6 +39,11 @@ misbehavior, not a crash.
 - **`condition-wait` may wake spuriously.** Every wait site loops on its
   predicate; your implementation may wake threads freely but must not LOSE
   wakeups.
+- **Native error capture is part of the foreign call boundary.**
+  `sa-foreign-procedure-native-error` must return the C result and the calling
+  thread's errno/GetLastError-equivalent atomically; a later host call that reads
+  an error slot is not an equivalent implementation. A target without native
+  FFI must raise its documented unsupported-capability error.
 - **Blocking foreign calls must not stop other threads' GC.** Chez spells
   this `__collect_safe`; `sa-foreign-procedure-blocking` /
   `sa-foreign-callable-collect-safe` carry the requirement. A target whose

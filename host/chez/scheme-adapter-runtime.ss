@@ -262,6 +262,19 @@
     ;; register-save area, so a fixed-arity call silently corrupts them).
     ((_ conv name args res) (foreign-procedure conv name args res))))
 
+;; (sa-foreign-procedure-native-error error-convention (conv ...) name args res)
+;; -> foreign procedure
+;; SYNTAX: like sa-foreign-procedure, with Chez's native-error convention kept
+;; separate from any other calling conventions. The result is a two-value
+;; answer: the declared C result and the calling thread's captured native error
+;; slot. `error-convention` is __errno on POSIX and __get_last_error on Windows.
+;; A target adapter must provide the equivalent atomic call-boundary capture;
+;; reading errno/GetLastError in a later host call is racy and is not equivalent.
+(define-syntax sa-foreign-procedure-native-error
+  (syntax-rules ()
+    ((_ error-convention (conv ...) name args res)
+     (foreign-procedure error-convention conv ... name args res))))
+
 ;; (sa-foreign-procedure-blocking name args res) -> foreign procedure
 ;; SYNTAX: like sa-foreign-procedure, but the call is __collect_safe — a blocking
 ;; foreign call must not freeze the stop-the-world collector process-wide (the

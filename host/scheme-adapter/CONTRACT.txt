@@ -188,6 +188,7 @@ sa-foreign-entry-address
 sa-foreign-callable-entry-point
 sa-foreign-procedure-runtime
 sa-foreign-procedure
+sa-foreign-procedure-native-error
 sa-foreign-procedure-blocking
 #
 # tier: eval
