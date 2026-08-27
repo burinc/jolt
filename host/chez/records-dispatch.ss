@@ -207,6 +207,11 @@
              ((string=? method-name "getName")
               (jolt-symbol (var-cell-ns obj) (var-cell-name obj)))
              ((string=? method-name "toString") (string-append "#'" (var-cell-ns obj) "/" (var-cell-name obj)))
+             ;; getRawRoot is the ROOT value, past any thread binding — how
+             ;; fully-satisfies' requiring-resolve reads the global
+             ;; clojure.core/*loaded-libs* rather than whatever a load has bound
+             ;; over it. deref would answer the binding.
+             ((string=? method-name "getRawRoot") (var-cell-root obj))
              (else (dispatch-miss obj method-name rest))))
       ;; java.lang.Throwable interop over a Chez condition. A jolt host error
       ;; (`error`/`assertion-violationf`) raises a Chez condition; Clojure code
