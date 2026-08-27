@@ -19,6 +19,13 @@
 (load "host/chez/host-contract.ss")
 (load "host/chez/seed/image.ss")
 (load "host/chez/compile-eval.ss")
+;; cli-core.ss is inlined into the emitted image below, but it also has to be
+;; loaded HERE, exactly as in build-jolt.ss: it defines jolt.host/run-expr-string,
+;; and bld-emit-cli-aot emits jolt.main in this process — an unresolved jolt.host
+;; var emits as a host-static class reference, so the devcache's -M/-A/-Sdeps
+;; -e arm died with "No such var: jolt.host/run-expr-string" while a bare -e
+;; (which skips jolt.main) worked.
+(load "host/chez/cli-core.ss")
 (load "host/chez/png.ss")
 (load "host/chez/loader.ss")
 (load "host/chez/java/ffi.ss")
