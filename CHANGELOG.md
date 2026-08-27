@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`compare` ignored a deftype's declared `Comparable`.** `(.compareTo a b)`
+  reached the type's own method, but `compare` did not, so it raised "cannot be
+  compared to" for values that carry an ordering — and `sort`, `sorted-set` and
+  `sorted-map-by`, which all route through `compare`, raised with it. The JVM's
+  `Util.compare` calls `((Comparable) o1).compareTo(o2)` for anything
+  implementing the interface. A record that does NOT declare `Comparable` still
+  refuses to compare, as before.
+
 - **`bases` on a deftype/defrecord type token walked the constructor procedure,
   not the class.** `(bases Rec)` answered `clojure.lang.AFunction` where
   `(bases (class inst))` gave the record's real interfaces. `supers` and
