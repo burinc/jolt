@@ -584,6 +584,36 @@ if [ "$got_procs" != "PROC-APP hi 0 143" ]; then
   echo "  FAIL: petite-only process binary output mismatch — want 'PROC-APP hi 0 143', got \`$got_procs\`"; exit 1
 fi
 
+# A built binary must carry the CLOJURE half of jolt.ffi (stdlib/jolt/ffi.clj),
+# not just the host primitives from java/ffi.ss. jolt.ffi sits in the CLI's own
+# AOT closure and in neither the runtime image nor the stdlib-fasl manifest, so
+# an app build that reads the CLI's closure as preloaded interns layout-size /
+# field-offset / read-field / write-field UNBOUND and fails at the call. `jolt
+# run` compiles the source at require time and masks it entirely.
+ffiapp="$root/test/chez/ffi-app"
+ffiout="$(dirname "$out")/ffi-app-bin"
+if ! JOLT_PWD="$ffiapp" "$jolt" build -m ffiapp.main -o "$ffiout" >/dev/null 2>&1; then
+  echo "  FAIL: jolt build of a jolt.ffi app exited non-zero"; exit 1
+fi
+got_ffi="$(cd / && "$ffiout" 2>&1 | tail -1)"
+if [ "$got_ffi" != "FFI-APP 8 4 4 2.5 true" ]; then
+  echo "  FAIL: built binary missing the jolt.ffi Clojure layer — want 'FFI-APP 8 4 4 2.5 true', got \`$got_ffi\`"; exit 1
+fi
+
+# The same ffi app tree-shaken: a petite-only boot has no compiler, so
+# errno-message's strerror defcfn must resolve as a compiled foreign-procedure.
+ffishake="$(dirname "$out")/ffi-app-shake-bin"
+if ! JOLT_PWD="$ffiapp" "$jolt" build -m ffiapp.main -o "$ffishake" --tree-shake >/dev/null 2>&1; then
+  echo "  FAIL: jolt build --tree-shake of the jolt.ffi app exited non-zero"; exit 1
+fi
+if grep -q 'scheme.boot' "$ffishake.build/compile.ss" 2>/dev/null; then
+  echo "  FAIL: tree-shaken ffi app still bundles scheme.boot (petite-only boot expected)"; exit 1
+fi
+got_ffis="$(cd / && "$ffishake" 2>&1 | tail -1)"
+if [ "$got_ffis" != "FFI-APP 8 4 4 2.5 true" ]; then
+  echo "  FAIL: petite-only ffi binary output mismatch — want 'FFI-APP 8 4 4 2.5 true', got \`$got_ffis\`"; exit 1
+fi
+
 # A declaration-only var and a no-root dynamic var must stay resolvable
 # (find-var / resolve / ns-interns) in an AOT binary. A no-init def now carries
 # source-position metadata, so it emits set-var-meta! then declare-var! —
@@ -836,4 +866,4 @@ if [ "$got_split" != "$want" ] || [ "$got_split2" != "$want" ] || [ "$got_nospli
   exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache)"
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache)"

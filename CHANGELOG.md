@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A built binary could intern a stdlib var and leave it unbound.** `jolt build`
+  skips any namespace already loaded in the build process as "already in the
+  image", which is right for the runtime image every app shares and wrong for
+  the CLI's own AOT closure — an app image is a different image and carries none
+  of it. `jolt.ffi` and `jolt.mvn-http` are in that closure and in neither the
+  runtime image nor the fasl manifest, so `layout-size`, `field-offset`,
+  `read-field`, `write-field`, `errno`, `errno-message`, `fetch` and `fetch*`
+  were interned but unbound in a built binary and failed at the call rather than
+  the build. `jolt run` compiles the source at require time and masked it
+  entirely. The loader records why a namespace is preloaded, not merely that it
+  is. Thanks to @burinc.
+
 - **38 of the 96 java.lang auto-imports did not resolve.**
   `(resolve 'ExceptionInInitializerError)`, `'StringBuffer`, `'Process`,
   `'ThreadLocal` and 34 others answered nil where the JVM answers the class —
