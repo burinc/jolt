@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`getSimpleName` and `getCanonicalName` ignored class nesting.**
+  `(.getSimpleName java.util.Map$Entry)` answered `"Map$Entry"` where the JVM
+  answers `"Entry"`, and `getCanonicalName` kept the `$` where the JVM spells
+  nesting with a dot. Splitting on `$` is not the rule: the JVM reads nesting
+  off the class file, and a Clojure fn class merely contains one and is
+  top-level, so `(.getSimpleName (class inc))` is `"core$inc"`, not `"inc"`.
+  Both now ask the class model whether the name before a `$` is itself a class,
+  which is the same distinction. Surfaced by the auto-import work above, which
+  made `Thread$State` resolvable for the first time.
+
 - **A built binary could intern a stdlib var and leave it unbound.** `jolt build`
   skips any namespace already loaded in the build process as "already in the
   image", which is right for the runtime image every app shares and wrong for

@@ -1624,6 +1624,32 @@
     (cond ((< i 0) s)
           ((char=? (string-ref s i) #\.) (substring s (+ i 1) (string-length s)))
           (else (loop (- i 1))))))
+;; Where a class name's nesting boundary is, or #f if it names a top-level class.
+;; The JVM reads nesting off the class file's enclosing-class attribute, never off
+;; the name, so a `$` does not by itself mean nested: java.util.Map$Entry is Map's
+;; member class, while clojure.core$inc is a TOP-LEVEL class whose name merely
+;; contains one — which is why the JVM answers "Entry" for the first and
+;; "core$inc", not "inc", for the second. Derive that from the class model: a `$`
+;; is a nesting boundary only when the name before it is itself a class jolt
+;; knows. Scanning stops at the last dot, since a `$` can only appear in the
+;; final segment.
+(define (hsc-nesting-dollar cn)
+  (let loop ((i (- (string-length cn) 1)))
+    (cond ((fx<? i 0) #f)
+          ((char=? (string-ref cn i) #\.) #f)
+          ((and (char=? (string-ref cn i) #\$) (jch-known? (substring cn 0 i))) i)
+          (else (loop (fx- i 1))))))
+;; Class.getSimpleName drops the package and, for a nested class, the enclosing
+;; class too. Class.getCanonicalName spells nesting with a dot instead of a `$`.
+(define (hsc-simple-name cn)
+  (let ((i (hsc-nesting-dollar cn)))
+    (if i (substring cn (fx+ i 1) (string-length cn)) (hsc-last-segment cn))))
+(define (hsc-canonical-name cn)
+  (let ((i (hsc-nesting-dollar cn)))
+    (if i
+        (string-append (hsc-canonical-name (substring cn 0 i))
+                       "." (substring cn (fx+ i 1) (string-length cn)))
+        cn)))
 ;; values that carry metadata (mirrors jolt-with-meta's set in natives-meta.ss).
 (define (hsc-imeta? x)
   (or (pvec? x) (pmap? x) (pset? x) (cseq? x) (empty-list-t? x)
@@ -1740,8 +1766,8 @@
     (lambda (x) (if (jclass? x) (jclass-name x) (jolt-invoke1 prev x)))))
 (register-host-methods! "class"
   (list (cons "getName" (lambda (self) (jclass-name self)))
-        (cons "getCanonicalName" (lambda (self) (jclass-name self)))
-        (cons "getSimpleName" (lambda (self) (hsc-last-segment (jclass-name self))))
+        (cons "getCanonicalName" (lambda (self) (hsc-canonical-name (jclass-name self))))
+        (cons "getSimpleName" (lambda (self) (hsc-simple-name (jclass-name self))))
         (cons "toString" (lambda (self) (string-append "class " (jclass-name self))))
         (cons "isArray" (lambda (self) (let ((n (jclass-name self)))
                                          (and (fx>? (string-length n) 0) (char=? (string-ref n 0) #\[)))))
