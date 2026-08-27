@@ -1,0 +1,5 @@
+;; No bb.edn: jolt's own deps.edn :tasks forms keep working unchanged.
+{:paths ["src"]
+ :tasks {hello "echo deps-only-hello"
+         fail  "exit 3"
+         main  {:doc "app entry" :main-opts ["-m" "depsonly.core"]}}}

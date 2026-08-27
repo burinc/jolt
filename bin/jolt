@@ -14,6 +14,9 @@
 # JOLT_PWD.
 root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 export JOLT_PWD="${JOLT_PWD:-$PWD}"
+# How jolt re-invokes itself (babashka.tasks/clojure in a task). An installed
+# jolt is on PATH and needs no help; this checkout is not.
+export JOLT_EXE="${JOLT_EXE:-$root/bin/jolt}"
 
 # Identify the Chez Scheme executable. $JOLT_CHEZ is authoritative and is how the
 # Makefile hands down the one it selected — the same interpreter that mints the

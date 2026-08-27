@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failing `:tasks` shell command exited 0.** `jolt <task>` for a string task
+  called the shell and dropped its status on the floor, so a task that failed
+  reported success and a CI step built on one could not fail. It now exits with
+  the command's status, like every other task failure.
+
+- **The resolution cache keyed on the deps.edn FILES, not on the deps it was
+  about to expand.** `-Sdeps '{:deps …}'` merges a map that is in no file, so
+  two runs differing only in `-Sdeps` shared a `.jolt/cpcache` entry and the
+  second got the first's roots. The effective dep map (with `:override-deps` /
+  `:default-deps`) is part of the key now.
+
 - **`File.canRead`/`canWrite`/`canExecute` and `Files.isReadable`/`isWritable`/
   `isExecutable` answer permissions, not existence.** All six reported whether
   the file exists, so a read-only file came back writable and every regular file
@@ -19,6 +30,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `java.nio.file` spellings cannot drift apart.
 
 ### Added
+
+- **bb.edn tasks (#578).** jolt reads a project's `bb.edn` and runs its `:tasks`
+  with babashka's semantics, so a bb.edn written for `bb` runs under `jolt`:
+
+  ```clojure
+  ;; bb.edn
+  {:paths ["script"]
+   :tasks {:requires ([babashka.fs :as fs])
+           clean {:doc "remove build output" :task (fs/delete-tree "target")}
+           build {:doc "build" :depends [clean] :task (shell "make")}}}
+  ```
+
+  ```
+  $ jolt tasks          # list them
+  $ jolt build          # or `jolt run build`, or `jolt run --parallel build`
+  ```
+
+  `:init`, `:requires`, `:enter`/`:leave`, `:depends` (each dependency runs once
+  per invocation, a cycle is an error rather than a hang), `:doc`, `:private`,
+  `:extra-paths`/`:extra-deps` and `:override-builtin` all work. Bodies run in
+  the `user` namespace with `babashka.tasks` referred, so `shell`, `jolt`,
+  `clojure`, `run` and `current-task` need no require, and the arguments after
+  the task name are `*command-line-args*`. A failed `shell` exits with the
+  child's status and no jolt stack trace over it. `:pods` are not supported and
+  say so.
+
+  Two things differ from babashka deliberately. `clojure` runs the jolt CLI
+  rather than the JVM Clojure CLI — on this host jolt is the Clojure, and the
+  point is not to need a JVM; `(shell "clojure" "-M:test")` still reaches the
+  real one. `jolt` is the same function under the name that says what it does,
+  and the spelling to prefer in new task maps. And a STRING task body is a
+  shell command line, which is what jolt's own `deps.edn` `:tasks` have always
+  meant; babashka evaluates it as an expression, where it does nothing.
+
+  With no `deps.edn`, `bb.edn` is the project config for every command — its
+  `:paths` and `:deps` drive `run`, `repl` and `build` too. With both files,
+  `deps.edn` is the project and `bb.edn` contributes its `:tasks`; its
+  `:paths`/`:deps` join a task run only, so a `bb.edn` `:paths ["script"]`
+  cannot displace the app's own source roots on every other command. A task
+  name declared in both files is babashka's.
 
 - **`jolt.host/extend-class!`: add to or replace the shim jolt already has for a
   Java class (#575).** jolt models the `java.*` surface with hand-written shims,

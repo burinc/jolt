@@ -244,15 +244,18 @@
     jolt-nil))
 (def-var! "jolt.host" "read-all-stdin" (lambda () (jolt-read-all-stdin)))
 
-;; Does the project dir have a deps.edn? The launcher's -e / - arms below skip
-;; jolt.main entirely — no deps chain, no project source roots, no natives — which
-;; is only equivalent to the real thing when there is no project to resolve. With a
-;; deps.edn present the argv falls through to jolt.main instead, so `jolt -e
-;; "(require 'my.app)"` sees the project's paths and deps like every other command.
+;; Does the project dir have a config file — a deps.edn, or a bb.edn, which
+;; jolt.deps reads for the same :paths / :deps / :tasks? The launcher's -e / -
+;; arms below skip jolt.main entirely — no deps chain, no project source roots,
+;; no natives — which is only equivalent to the real thing when there is no
+;; project to resolve. With one present the argv falls through to jolt.main
+;; instead, so `jolt -e "(require 'my.app)"` sees the project's paths and deps
+;; like every other command.
 (define (jolt-project-deps-edn?)
   (let* ((pwd (getenv "JOLT_PWD"))
          (dir (if (and pwd (string? pwd) (not (string=? pwd ""))) pwd ".")))
-    (file-exists? (string-append dir "/deps.edn"))))
+    (or (file-exists? (string-append dir "/deps.edn"))
+        (file-exists? (string-append dir "/bb.edn")))))
 
 ;; Is this argv a `build`? The build driver has to be loaded before jolt.main
 ;; runs, and the command can sit behind the global options that re-dispatch the

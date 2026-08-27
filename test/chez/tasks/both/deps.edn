@@ -1,0 +1,7 @@
+;; The app config. A project with BOTH files resolves every non-task command
+;; from deps.edn alone — bb.edn's :paths/:deps join in only for a task run.
+{:paths ["src"]
+ :tasks {donly "echo only-in-deps-edn"
+         dtask "echo from-deps-edn-task"
+         dmain {:doc "run the app" :main-opts ["-m" "both.core"]}
+         dfail "exit 4"}}
