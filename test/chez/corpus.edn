@@ -5284,10 +5284,24 @@
   {:suite "ns / resolve-class" :label "a macro guarding on (resolve name) still emits its deftype" :expected "true" :actual "(do (ns rzc.i) (clojure.core/defmacro rzc-defty [n] (clojure.core/when-not (clojure.core/resolve n) (clojure.core/list 'clojure.core/deftype n '[a]))) (rzc.i/rzc-defty Path) (clojure.core/some? (clojure.core/resolve 'rzc.i/->Path)))" :portability :jvm}
   ;; The other edge of that: resolve answers a CLASS only for one jolt models, and
   ;; the instance? macro reads a class answer as "this symbol evaluates to that
-  ;; class" and emits it unquoted. Some java.lang auto-imports have no backing
-  ;; here at all, so widening resolve to the auto-import LIST turns fipp's
-  ;; (catch ExceptionInInitializerError _) into an unresolved symbol.
-  {:suite "ns / resolve-class" :label "an auto-import jolt does not model still works in catch and instance?" :expected "[:ex false false]" :actual "[(try (throw (Exception. \"x\")) (catch ExceptionInInitializerError e :eiie) (catch Exception e :ex)) (instance? ExceptionInInitializerError 1) (instance? UnsupportedClassVersionError 1)]" :portability :jvm}
+  ;; class" and emits it UNQUOTED. So the two have to move together — the row
+  ;; below pins that for every auto-import at once, and these two pin the shape it
+  ;; broke while they did not (fipp's (catch ExceptionInInitializerError _) became
+  ;; an unresolved symbol, and 7 malli namespaces with it).
+  {:suite "ns / resolve-class" :label "a java.lang auto-import works in catch and instance?" :expected "[:ex false false]" :actual "[(try (throw (Exception. \"x\")) (catch ExceptionInInitializerError e :eiie) (catch Exception e :ex)) (instance? ExceptionInInitializerError 1) (instance? UnsupportedClassVersionError 1)]" :portability :jvm}
+  {:suite "ns / resolve-class" :label "what resolve answers as a class, the symbol also evaluates to" :expected "true" :actual "(every? (fn [s] (= (resolve s) (eval s))) (keys (ns-imports 'user)))" :portability :jvm}
+  ;; Every one of the 96 auto-imports is mapped in every namespace on the JVM, so
+  ;; every one has to resolve — and to the class the mapping names, which for four
+  ;; of them is not java.lang.
+  {:suite "ns / resolve-class" :label "every auto-import resolves" :expected "0" :actual "(count (remove (fn [s] (some? (resolve s))) (keys (ns-imports 'user))))" :portability :jvm}
+  {:suite "ns / resolve-class" :label "and to the class the namespace maps it to" :expected "true" :actual "(every? (fn [e] (= (val e) (resolve (key e)))) (ns-imports 'user))" :portability :jvm}
+  {:suite "ns / resolve-class" :label "the four that are not java.lang" :expected "[java.math.BigDecimal clojure.lang.Compiler java.util.concurrent.Callable java.math.BigInteger]" :actual "[(resolve 'BigDecimal) (resolve 'Compiler) (resolve 'Callable) (resolve 'BigInteger)]" :portability :jvm}
+  {:suite "ns / resolve-class" :label "their ancestry is the JVM's" :expected "[true true true]" :actual "[(isa? ExceptionInInitializerError LinkageError) (isa? Thread$State Enum) (isa? UnsupportedClassVersionError Error)]" :portability :jvm}
+  ;; A class is mapped under the name after the last DOT, $ and all — the JVM
+  ;; imports java.util.Map$Entry as Map$Entry. Reading the innermost segment as
+  ;; the import name instead minted clojure.core mappings for Entry, Seq and
+  ;; friends, which the JVM has no mapping for at all.
+  {:suite "ns / resolve-class" :label "an inner class is not mapped under its innermost name" :expected "[nil nil nil]" :actual "[(resolve 'Entry) (resolve 'Seq) (resolve 'State)]" :portability :jvm}
   ;; ns-imports is the same question made observable — what class names does THIS
   ;; namespace map. It used to be the fixed 96 auto-imports for every ns, so an
   ;; :import and a deftype were both invisible in it.

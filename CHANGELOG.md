@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **38 of the 96 java.lang auto-imports did not resolve.**
+  `(resolve 'ExceptionInInitializerError)`, `'StringBuffer`, `'Process`,
+  `'ThreadLocal` and 34 others answered nil where the JVM answers the class —
+  they had no row in the class model, so no class token. They have one now:
+  a name and an ancestry, not an implementation, so `(StringBuffer. "a")` still
+  has no constructor. Four of the 96 are not java.lang, and `ns-imports` named
+  them wrongly: `BigDecimal` and `BigInteger` are `java.math`, `Callable` is
+  `java.util.concurrent`, `Compiler` is `clojure.lang`.
+
+- **A nested class was mapped under its innermost name.** The name a namespace
+  maps a class under is the part after the last dot, `$` and all —
+  `java.util.Map$Entry` is `Map$Entry`. jolt read the innermost segment instead,
+  which minted `clojure.core` mappings for `Entry`, `Seq`, `RSeq`, `SubVector`
+  and friends that the JVM has no mapping for, and left `Thread$State` and
+  `Thread$UncaughtExceptionHandler` with no mapping at all.
+
 - **A backtick was still there when a macro read its own argument.** Clojure's
   `` ` `` is a reader macro, so a form is past its backticks before anything can
   look at it. jolt reads one to a `(clojure.core/syntax-quote FORM)` marker and

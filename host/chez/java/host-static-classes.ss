@@ -2528,6 +2528,16 @@
 (for-each
   (lambda (nm) (def-var! "clojure.core" nm (jolt-class-for nm)))
   class-fqn-list)
+;; ...and the 96 auto-imports get theirs pinned to the canonical name, last, so
+;; the mapping every namespace has cannot be decided by which class the graph
+;; happened to enumerate first: class-token-alist is first-simple-name-wins over
+;; an unordered hashtable walk, so a same-named class anywhere else in the graph
+;; could otherwise take `Process` or `Package` from java.lang.
+(for-each
+  (lambda (n)
+    (let ((fqn (jolt-default-import-canonical n)))
+      (when (jch-known? fqn) (def-var! "clojure.core" n (jolt-class-for fqn)))))
+  jolt-default-import-names)
 
 ;; --- resolve/ns-resolve return the Class for a class mapping ------------------
 ;; A JVM ns mapping is a var or a Class, and resolve hands back whichever the

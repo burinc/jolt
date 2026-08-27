@@ -375,18 +375,29 @@
     "Thread$UncaughtExceptionHandler" "ThreadDeath" "ThreadGroup" "ThreadLocal" "Throwable"
     "TypeNotPresentException" "UnknownError" "UnsatisfiedLinkError" "UnsupportedClassVersionError"
     "UnsupportedOperationException" "VerifyError" "VirtualMachineError" "Void"))
+;; Four of the 96 are not java.lang, so the canonical name is not derivable from
+;; the short one for all of them.
+(define jolt-default-import-overrides
+  '(("BigDecimal" . "java.math.BigDecimal")
+    ("BigInteger" . "java.math.BigInteger")
+    ("Callable"   . "java.util.concurrent.Callable")
+    ("Compiler"   . "clojure.lang.Compiler")))
+(define (jolt-default-import-canonical n)
+  (let ((o (assoc n jolt-default-import-overrides)))
+    (if o (cdr o) (string-append "java.lang." n))))
 (define jolt-default-imports
   (let loop ((ns jolt-default-import-names) (m (jolt-hash-map)))
     (if (null? ns) m
         (loop (cdr ns)
-              (jolt-assoc m (jolt-symbol #f (car ns)) (string-append "java.lang." (car ns)))))))
+              (jolt-assoc m (jolt-symbol #f (car ns))
+                          (jolt-default-import-canonical (car ns)))))))
 ;; The same set as a name lookup. A bare class name is a namespace MAPPING, not a
 ;; global fact — (:import ...) and deftype map one into a single namespace, and
 ;; these are the only ones mapped everywhere — so resolve asks this before it
 ;; answers a bare capitalized symbol (host-static-classes.ss rsv-mapping-visible?).
 (define jolt-default-import-tbl
   (let ((t (make-hashtable string-hash string=?)))
-    (for-each (lambda (n) (hashtable-set! t n (string-append "java.lang." n)))
+    (for-each (lambda (n) (hashtable-set! t n (jolt-default-import-canonical n)))
               jolt-default-import-names)
     t))
 (define (jolt-default-import-fqn nm) (hashtable-ref jolt-default-import-tbl nm #f))
