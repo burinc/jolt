@@ -1,0 +1,38 @@
+;; A bb.edn-only project: no deps.edn, so bb.edn IS the project config —
+;; its :paths supply the source roots for every command, not just tasks.
+{:paths ["src" "script"]
+ :tasks
+ {:init     (def greeting "hello")
+  :requires ([clojure.string :as str])
+  :enter    (println "enter" (:name (current-task)))
+  :leave    (println "leave" (:name (current-task)))
+
+  hi     {:doc "say hi" :task (println greeting (str/upper-case "world"))}
+  clean  {:doc "remove build output" :task (println "cleaning")}
+  build  {:doc "build it" :depends [clean] :task (println "building")}
+  both   {:doc "depend on two" :depends [clean build] :task (println "both")}
+  args   {:task (println "args:" (pr-str *command-line-args*))}
+  boom   {:doc "fail with 7" :task (shell "sh" "-c" "exit 7")}
+  nested {:task (do (println "before") (run 'clean) (println "after"))}
+  secret {:private true :task (println "secret")}
+  needs  {:requires ([bbproj.core :as c]) :task (println (c/hello))}
+  helper {:requires ([helper]) :task (println (helper/help))}
+  echo   {:task (shell "echo" "from-shell")}
+  bare   (println "bare body")
+  ;; the referred `clojure` fn must not shadow a clojure.* namespace prefix
+  fq     {:task (println (clojure.string/upper-case "fq") (clojure.core/inc 1))}
+  shcmd  "echo shell-string && echo second"
+
+  ;; a task's own roots, on top of the project's
+  xp     {:extra-paths ["extra"] :requires ([extra.thing]) :task (println (extra.thing/x))}
+  ;; re-invoke the jolt CLI
+  viajolt {:task (clojure "-e" "(println :from-clojure-fn)")}
+  ;; …with an options map, and with the args in one tokenized string
+  viajolt2 {:task (println (str/trim (:out (clojure {:out :string} "-e :tokenized"))))}
+  ;; a built-in command name, taken deliberately
+  path   {:override-builtin true :task (println "overridden path")}
+  ;; a cycle is an error, not a hang
+  ;; a :depends that fails still reports ITS status, parallel or not
+  pfail  {:depends [clean boom] :task (println "never")}
+  cyc1   {:depends [cyc2] :task (println "cyc1")}
+  cyc2   {:depends [cyc1] :task (println "cyc2")}}}

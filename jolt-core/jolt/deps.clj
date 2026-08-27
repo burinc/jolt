@@ -1050,11 +1050,20 @@
   (JOLT_NO_USER_DEPS / :repro?) or absent. alias-kws is the active alias set.
   Each :local/root dep's deps.edn CONTENT is folded in — its length alone once
   was, and a same-length edit (one version digit for another) then kept serving
-  the stale entry."
-  [project-edn-bytes user-edn-bytes alias-kws local-dep-edns runtime-version]
+  the stale entry.
+
+  `deps` is the EFFECTIVE dep map the expansion is about to run on, with the
+  coordinate adjustments (:override-deps / :default-deps) that go with it. The
+  files above do not determine it on their own: -Sdeps merges a map that is in
+  no file, and a bb.edn contributes :deps for a task run and not otherwise. Key
+  on the input to the expansion, not only on the files it was read from."
+  [project-edn-bytes user-edn-bytes alias-kws local-dep-edns runtime-version deps opts]
   (str (count project-edn-bytes) ":" project-edn-bytes
        "|" (count user-edn-bytes) ":" user-edn-bytes
        "|" (pr-str (vec (sort alias-kws)))
+       "|" (pr-str (vec (sort-by (comp str key) deps)))
+       "|" (pr-str (vec (sort-by (comp str key) (:override-deps opts))))
+       "|" (pr-str (vec (sort-by (comp str key) (:default-deps opts))))
        "|" runtime-version
        ;; the environment-dependent artifact roots resolution materializes into:
        ;; a run pointed at a different gitlibs/jarlibs (JOLT_GITLIBS_DIR — the
@@ -1153,7 +1162,8 @@
                         (or (slurp-quiet user-path) "::absent::"))
           runtime-version (jolt.host/jolt-version)
           local-edns (local-deps-edn-paths deps project-dir)
-          material (cpcache-material proj-bytes user-bytes alias-kws local-edns runtime-version)
+          material (cpcache-material proj-bytes user-bytes alias-kws local-edns runtime-version
+                                     deps opts)
           k (cpcache-file-key material)]
       (if-let [cached (cpcache-hit? project-dir k material)]
         (do (info "cpcache hit") cached)
@@ -1244,10 +1254,38 @@
   [path]
   (some-> (read-edn path) dedn/canonicalize))
 
+;; bb.edn — babashka's project file, read for the same :paths / :deps / :tasks
+;; keys deps.edn carries. Two shapes, and which one a project has decides how
+;; far bb.edn reaches:
+;;
+;;   bb.edn alone   — it IS the project config, standing in for deps.edn
+;;                    everywhere (a babashka project has no other file to
+;;                    resolve from).
+;;   both files     — deps.edn is the project: it alone answers `path`, `run`,
+;;                    `build`, the REPL. bb.edn contributes its :tasks, and its
+;;                    :paths/:deps join the resolution only for a task run
+;;                    (:tasks? below), where babashka's environment is what the
+;;                    task was written against. Merging them everywhere would
+;;                    let a bb.edn :paths ["script"] displace the app's own
+;;                    source roots on every command.
+;;
+;; :min-bb-version is ignored (jolt is not babashka, and a version comparison
+;; against it would answer nothing useful); :pods are not supported and say so,
+;; since a task that shells to a pod otherwise fails somewhere far from here.
+(defn- read-bb-file [path]
+  (let [m (read-deps-file path)]
+    (when (seq (:pods m))
+      (warn path " declares :pods, which jolt does not run: "
+            (pr-str (vec (keys (:pods m))))))
+    m))
+
 (defn resolve-project
   "Resolve `project-dir`'s deps.edn with the selected alias keywords. Returns
   {:roots [...] :main-opts [...] :tasks {...} :natives [...]}; :natives are the
   project's + deps' :jolt/native shared-library declarations.
+
+  A bb.edn beside (or instead of) the deps.edn contributes its :tasks always,
+  and its :paths/:deps when the :tasks? option is set — see the comment above.
 
   The deps.edn chain merges like tools.deps (jolt.deps.edn/merge-edns): the
   user deps.edn ($CLJ_CONFIG / $XDG_CONFIG_HOME/clojure / ~/.clojure — skipped
@@ -1267,8 +1305,15 @@
   ([project-dir] (resolve-project project-dir []))
   ([project-dir alias-kws] (resolve-project project-dir alias-kws nil))
   ([project-dir alias-kws extra-edn] (resolve-project project-dir alias-kws extra-edn nil))
-  ([project-dir alias-kws extra-edn {:keys [tool? repro? trace? cp]}]
-   (let [project-edn (read-deps-file (str project-dir "/deps.edn"))
+  ([project-dir alias-kws extra-edn {:keys [tool? repro? trace? cp tasks?]}]
+   (let [deps-edn (read-deps-file (str project-dir "/deps.edn"))
+         bb-edn (read-bb-file (str project-dir "/bb.edn"))
+         ;; with no deps.edn, bb.edn stands in as the project config
+         project-edn (or deps-edn bb-edn)
+         ;; …and when there is one, bb.edn's own paths/deps are additional, and
+         ;; only for a task run. Its paths go LAST (after the project's own), so
+         ;; a script root can never shadow the app's namespaces.
+         bb-extra (when (and tasks? deps-edn bb-edn) bb-edn)
          user-edn (when-not (or repro? (getenv "JOLT_NO_USER_DEPS"))
                     (try (read-deps-file (user-deps-path))
                          (catch :default e (warn (ex-message e)) nil)))
@@ -1298,10 +1343,13 @@
          ;; :replace-paths ["."] :replace-deps {}).
          project-paths (concat (:extra-paths argmap)
                                (or (:replace-paths argmap) (:paths argmap)
-                                   (if tool? ["."] (or (:paths edn) ["src"]))))
+                                   (if tool? ["."] (or (:paths edn) ["src"])))
+                               ;; last: a task run's bb.edn paths (see read-bb-file)
+                               (:paths bb-extra))
          project-roots (map #(abspath project-dir %) project-paths)
          all-deps (merge (or (:replace-deps argmap) (:deps argmap)
                              (if tool? {} (:deps edn)))
+                         (:deps bb-extra)
                          (:extra-deps argmap))
           ;; :cp (the CLI's -Scp) supplies the roots outright, so the dependency
           ;; graph is never expanded and nothing is fetched. The deps.edn chain is
@@ -1338,13 +1386,27 @@
       :project-roots (vec project-roots)
       :build (:jolt/build edn)
       :embed-dirs (mapv #(abspath project-dir %) (:embed (:jolt/build edn)))
-      :tasks (:tasks edn)
+      ;; :tasks from both files, bb.edn last — a name in both is babashka's.
+      ;; (When bb.edn IS the project config the second merge is a no-op.)
+      :tasks (not-empty (merge (:tasks edn) (:tasks bb-edn)))
       :natives (dedup-by native-key (concat (:jolt/native edn) dep-natives))
       ;; the expansion trace, when it was asked for (-Stree renders it)
       :trace dep-trace
       ;; nREPL middleware a library contributes (jolt.nrepl composes them over its
       ;; built-in handler) — symbols resolving to a middleware fn or a vector of them.
       :nrepl-middleware (:nrepl/middleware edn)})))
+
+(defn project-tasks
+  "The project's :tasks map — deps.edn's and bb.edn's merged, bb.edn last —
+  read from the config files alone. Naming what a project can run needs no
+  dependency expansion, and a project whose deps don't resolve (offline, a
+  typo'd coordinate) should still be able to list its tasks."
+  [project-dir]
+  (let [user-edn (when-not (getenv "JOLT_NO_USER_DEPS")
+                   (try (read-deps-file (user-deps-path)) (catch :default _ nil)))]
+    (not-empty (merge (:tasks user-edn)
+                      (:tasks (read-deps-file (str project-dir "/deps.edn")))
+                      (:tasks (read-edn (str project-dir "/bb.edn")))))))
 
 (defn env-info
   "The files a resolution reads and the caches it fetches into, as data. One
@@ -1355,12 +1417,14 @@
   ([project-dir repro?]
    (let [repro? (boolean (or repro? (getenv "JOLT_NO_USER_DEPS")))
          user (user-deps-path)
-         project (str project-dir "/deps.edn")]
+         project (str project-dir "/deps.edn")
+         bb (str project-dir "/bb.edn")]
      {:project-dir project-dir
       :config-user (when-not repro? user)
       :config-project project
       :config-files (vec (concat (when (and (not repro?) (file-exists? user)) [user])
-                                 (when (file-exists? project) [project])))
+                                 (when (file-exists? project) [project])
+                                 (when (file-exists? bb) [bb])))
       :gitlibs-dir (gitlibs-dir)
       :mvn-local-repo (m2-repo-dir)
       :repro repro?})))

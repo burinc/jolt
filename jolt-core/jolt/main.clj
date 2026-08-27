@@ -83,13 +83,29 @@
 (def ^:private ^:dynamic *cli-cp* nil)
 
 (defn- resolve-current
-  ([] (resolve-current []))
-  ([aliases] (deps/resolve-project (project-dir) (into *cli-aliases* aliases)
-                                   *cli-extra-edn*
-                                   {:tool? *cli-tool?*
-                                    :repro? *cli-repro?*
-                                    :cp *cli-cp*
-                                    :trace? (contains? #{:tree :trace-file} *cli-report*)})))
+  ([] (resolve-current [] nil))
+  ([aliases] (resolve-current aliases nil))
+  ([aliases opts]
+   (deps/resolve-project (project-dir) (into *cli-aliases* aliases)
+                         *cli-extra-edn*
+                         (merge {:tool? *cli-tool?*
+                                 :repro? *cli-repro?*
+                                 :cp *cli-cp*
+                                 :trace? (contains? #{:tree :trace-file} *cli-report*)}
+                                opts))))
+
+;; The resolution a task runs against: :tasks? lets a project's bb.edn
+;; contribute its own :paths/:deps (see jolt.deps), and a task's :extra-paths /
+;; :extra-deps ride in as a synthetic alias so they combine by the ordinary
+;; tools.deps rules rather than by a second set of them.
+(defn- resolve-for-task
+  ([] (resolve-for-task nil))
+  ([task]
+   (if-let [extra (and (map? task) (not-empty (select-keys task [:extra-paths :extra-deps])))]
+     (binding [*cli-aliases* (conj (vec *cli-aliases*) :jolt/task)
+               *cli-extra-edn* (assoc-in (or *cli-extra-edn* {}) [:aliases :jolt/task] extra)]
+       (resolve-current [] {:tasks? true}))
+     (resolve-current [] {:tasks? true}))))
 
 (defn- print-roots [{:keys [roots]}]
   (println (str/join ":" roots)))
@@ -241,15 +257,29 @@
            (some #(str/ends-with? x %) [".jolt" ".clj" ".cljc" ".cljs"])
            (jolt.host/file-exists? x))))
 
-;; run [-m NS args… | FILE]  — FILE may be "-" (stdin)
+(declare run-task)
+
+;; run [-m NS args… | FILE | TASK]  — FILE may be "-" (stdin). A token that
+;; isn't a file names a task, so `jolt run build` works like `bb run build`
+;; (and like the bare `jolt build`); --parallel is bb's flag for running a
+;; task's :depends concurrently.
 (defn- cmd-run [more]
-  (apply-project! (resolve-current))
-  (cond
-    (= "-m" (first more)) (run-ns (second more) (drop 2 more))
-    (seq more)            (do (push-thread-bindings
-                                {#'clojure.core/*command-line-args* (seq (drop-end-of-options (rest more)))})
-                              (load-file (file-arg (first more))) nil)
-    :else (throw (ex-info "run needs -m NS or a FILE" {}))))
+  (let [parallel? (= "--parallel" (first more))
+        more (if parallel? (rest more) more)]
+    (cond
+      (= "-m" (first more))
+      (do (apply-project! (resolve-current)) (run-ns (second more) (drop 2 more)))
+
+      (and (seq more) (not (run-file-arg? (first more))))
+      (run-task (first more) (rest more) parallel?)
+
+      (seq more)
+      (do (apply-project! (resolve-current))
+          (push-thread-bindings
+            {#'clojure.core/*command-line-args* (seq (drop-end-of-options (rest more)))})
+          (load-file (file-arg (first more))) nil)
+
+      :else (throw (ex-info "run needs -m NS, a FILE, or a task name" {})))))
 
 ;; -M[:alias…] [main-opts…] — resolve with the aliases (plus any bound by a
 ;; leading -A), then run their :main-opts followed by the command-line ones. With
@@ -430,15 +460,47 @@
                      (print bt))))
             (recur)))))))
 
-;; A deps.edn :tasks entry: a string is a shell command; a map is {:main-opts …}.
-(defn- run-task [name more]
-  (let [{:keys [tasks] :as resolved} (resolve-current)
-        task (get tasks (symbol name))]
-    (cond
-      (nil? task) (throw (ex-info (str "unknown command or task: " name " (see 'jolt help')") {:name name}))
-      (string? task) (jolt.host/sh task)
-      (map? task) (do (apply-project! resolved) (apply-main-opts (:main-opts task) more))
-      :else (throw (ex-info (str "bad task " name) {})))))
+;; A bb.edn / deps.edn :tasks entry. The semantics live in jolt.tasks — required
+;; here only when a task actually runs, so the CLI's startup closure (and the
+;; AOT'd jolt.main in a built binary) stays free of it and of babashka.process.
+;; The task's own :extra-paths / :extra-deps change the resolution, so the map is
+;; read from a first resolution and the run gets a second one only when it must.
+(defn- run-task [name more parallel?]
+  (let [base (resolve-for-task)
+        task (get (:tasks base) (symbol name))
+        resolved (if (and (map? task)
+                          (or (:extra-paths task) (:extra-deps task)))
+                   (resolve-for-task task)
+                   base)]
+    (when (nil? task)
+      (throw (ex-info (str "unknown command or task: " name " (see 'jolt tasks')")
+                      {:name name})))
+    (apply-project! resolved)
+    ((requiring-resolve 'jolt.tasks/run-task!)
+     {:tasks (:tasks resolved)
+      :name name
+      ;; :args verbatim — a :main-opts task hands them to run-ns, which is the
+      ;; one end-of-options point for every ns entry form and consumes the
+      ;; leading "--" itself. :app-args is the same list with it consumed, for
+      ;; the *command-line-args* a code body sees. Dropping it in both places
+      ;; would eat a second standalone "--" that is the program's own data.
+      :args (vec more)
+      :app-args (vec (drop-end-of-options more))
+      :parallel parallel?
+      :run-main-opts apply-main-opts})))
+
+;; `jolt tasks` — the listing. Reads the :tasks maps alone: naming the tasks
+;; needs no dependency expansion, and a project whose deps don't resolve should
+;; still be able to say what it can run.
+(defn- cmd-tasks []
+  ((requiring-resolve 'jolt.tasks/list-tasks!) (deps/project-tasks (project-dir))))
+
+;; babashka's :override-builtin — a task only displaces the jolt command of the
+;; same name when it says so. Checked from the :tasks maps directly, so it costs
+;; a small file read rather than loading the task runner on every command.
+(defn- builtin-overridden? [cmd]
+  (let [t (get (deps/project-tasks (project-dir)) (symbol cmd))]
+    (boolean (and (map? t) (:override-builtin t)))))
 
  ;; build [-m NS | FILE] [-o OUT] [--opt | --dev] [--no-direct-link] — AOT-compile
  ;; the app into a standalone executable. Resolves deps + roots like `run`, then hands
@@ -613,7 +675,9 @@
   (println "                         compile a standalone binary (--target cross-compiles")
   (println "                         for another Chez machine; see tools/cross-compile)")
   (println "  path                   print the resolved source roots")
-  (println "  <task> [args]          run a deps.edn :tasks entry")
+  (println "  tasks                  list the project's bb.edn/deps.edn :tasks")
+  (println "  <task> [args]          run a task (`run <task>` and `run --parallel")
+  (println "                         <task>` do the same)")
   (println "  help, --help, -h       print this message")
   (println "  version, --version, -V print the jolt version")
   (println)
@@ -714,10 +778,20 @@
 
       (#{"help" "--help" "-h"} cmd)      (usage)
       (#{"version" "--version" "-V"} cmd) (println (str "jolt " (version)))
+
+      ;; A task may take a built-in command's name, but only by asking to
+      ;; (babashka's :override-builtin). Checked here, after the two commands
+      ;; that read no project at all, so it costs nothing a command doesn't
+      ;; already pay: everything below resolves the project anyway.
+      (and (#{"run" "repl" "nrepl-server" "path" "build" "tasks"} cmd)
+           (builtin-overridden? cmd))
+      (run-task cmd more false)
+
       (= cmd "run")                      (cmd-run more)
       (= cmd "repl")                     (repl)
       (= cmd "nrepl-server")             (nrepl more)
       (= cmd "path")                     (cmd-path)
+      (= cmd "tasks")                    (cmd-tasks)
       ;; -Sdeps '<edn>' — an extra deps.edn map merged last into the chain,
       ;; bound around the re-dispatch of the remaining argv.
       (= cmd "-Sdeps")
@@ -752,6 +826,6 @@
                            " -Sforce, -Sthreads)")
                       {:option cmd}))
       ;; a bare FILE (or "-" for stdin) runs it, `run` optional — like bb; a
-      ;; non-file token falls through to a deps.edn :tasks lookup.
+      ;; non-file token falls through to a bb.edn/deps.edn :tasks lookup.
       (run-file-arg? cmd)                (cmd-run (cons cmd more))
-      :else                              (run-task cmd more))))
+      :else                              (run-task cmd more false))))

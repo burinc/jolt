@@ -123,7 +123,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq \
@@ -450,6 +450,13 @@ hotscaling: testbin
 # fixture projects in test/chez/deps-alias/. Offline.
 depssmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/deps-alias-smoke.sh
+
+# bb.edn / deps.edn :tasks through the real CLI: babashka task semantics
+# (:depends, :init, :requires, :enter/:leave, :private, :extra-paths/:extra-deps,
+# the babashka.tasks API), the `tasks` listing, and exit-code propagation.
+# Offline fixture projects in test/chez/tasks/.
+taskssmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/tasks-smoke.sh
 
 # The resolved-roots cache (.jolt/cpcache): a warm run reuses a project's final
 # dependency resolution instead of re-expanding the graph. Offline throwaway
