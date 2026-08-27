@@ -814,3 +814,23 @@
 (define (devirt-resolve-fl type-tag proto-name method-name obj)
   (or (find-clone type-tag proto-name method-name)
       (devirt-resolve type-tag proto-name method-name obj)))
+
+
+;; ---- compare over a declared Comparable ------------------------------------
+;; clojure.core/compare calls compareTo on anything that implements Comparable
+;; (Util.compare's ((Comparable) o1).compareTo(o2)), and a deftype/defrecord that
+;; declares the interface is exactly that. Without this arm the type's own
+;; compareTo was reachable as (.compareTo a b) but invisible to compare — so
+;; sort, sorted-set and sorted-map-by all raised "cannot be compared to" on
+;; values that carry an ordering, and (into (sorted-set) types) — how
+;; typedclojure builds every union — could not be evaluated at all.
+;;
+;; Registered here rather than in converters.ss because it needs the protocol
+;; registry, and it goes through find-method-any-protocol so a compareTo declared
+;; under any interface the type implements answers, the same lookup
+;; record-method-dispatch performs for the direct call.
+(define (jrec-comparable-method v)
+  (and (jrec? v) (find-method-any-protocol (jrec-tag v) "compareTo")))
+(register-compare-arm!
+  (lambda (a b) (and (jrec-comparable-method a) #t))
+  (lambda (a b) (jnum->exact (jolt-invoke (jrec-comparable-method a) a b))))

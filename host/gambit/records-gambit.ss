@@ -1904,6 +1904,15 @@
   (or (find-clone type-tag proto-name method-name)
       (devirt-resolve type-tag proto-name method-name obj)))
 
+(define (jrec-comparable-method v)
+  (and (jrec? v)
+       (find-method-any-protocol (jrec-tag v) "compareTo")))
+
+(register-compare-arm!
+  (lambda (a b) (and (jrec-comparable-method a) #t))
+  (lambda (a b)
+    (jnum->exact (jolt-invoke (jrec-comparable-method a) a b))))
+
 (define-record-type jiterator
   (fields (mutable cur))
   (nongenerative jolt-iterator-v1))
