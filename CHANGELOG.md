@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A backtick was still there when a macro read its own argument.** Clojure's
+  `` ` `` is a reader macro, so a form is past its backticks before anything can
+  look at it. jolt reads one to a `(clojure.core/syntax-quote FORM)` marker and
+  lowered it only when the marker itself was analyzed, which left it visible to a
+  macro reading its argument forms and in quoted data: `(pr-str '`foo)` gave
+  `"(clojure.core/syntax-quote foo)"` where Clojure gives `"(quote ns/foo)"`.
+  typedclojure's `(f/sub-f sb `call-abstract-many* opts)` asserts its argument is
+  `(quote qualified-sym)` and got the marker, so `typed.clj.checker` failed to
+  load. The analyzer lowers every marker in a top-level form up front now — same
+  lowering, at the reader's moment. A form with no backtick in it is returned
+  unchanged and unallocated. tools.reader's three syntax-quote failures go with
+  it.
+
 - **`resolve` answered a bare class name the namespace never imported.** A class
   name is a per-namespace mapping on the JVM — the java.lang auto-imports
   everywhere, an `(:import ...)` in the namespace that asked, a

@@ -95,6 +95,7 @@ form-sym-meta
 form-sym-name
 form-sym-ns
 form-sym?
+form-syntax-quote-expand
 form-syntax-quote-lower
 form-uuid-source
 form-uuid-value-source

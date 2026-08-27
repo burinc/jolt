@@ -308,14 +308,28 @@
   {:suite "reader / nested syntax-quote" :label "defining a macro-defining macro does not resolve the inner macro's auto-gensym params" :expected ":defined" :actual "(do (defmacro sqb-outer [n] `(defmacro ~(symbol (str \"sqb-\" n)) [x# y#] `(vector ~x# ~y#))) :defined)" :portability :common}
   {:suite "reader / nested syntax-quote" :label "the generated macro's auto-gensym params reach its template" :expected "[1 2]" :actual "(do (defmacro sqa-outer [n] `(defmacro ~(symbol (str \"sqa-\" n)) [x# y#] `(vector ~x# ~y#))) (sqa-outer one) (sqa-one 1 2))" :portability :common}
   {:suite "reader / nested syntax-quote" :label "params are distinct gensyms, and one may be used twice" :expected "[:b :a :a]" :actual "(do (defmacro sqf-outer [n] `(defmacro ~(symbol (str \"sqf-\" n)) [x# y#] `(vector ~y# ~x# ~x#))) (sqf-outer one) (sqf-one :a :b))" :portability :common}
-  ;; The DATA a nested backtick yields is jolt's own construction code
-  ;; (__sqcat/__sq1), where the JVM's is seq/concat — the two evaluate to the
-  ;; same thing, but a program that prints or structurally walks that data sees
-  ;; a different shape. This is only observable for a NESTED backtick, because
-  ;; that is the one case where construction code becomes a value instead of
-  ;; being compiled. Recorded in known-divergences.edn (:impl-detail); the row
-  ;; is here so the shape cannot change without the gate saying so.
+  ;; The DATA a backtick yields is jolt's own construction code (__sqcat/__sq1),
+  ;; where the JVM's is seq/concat — the two evaluate to the same thing, but a
+  ;; program that prints or structurally walks that data sees a different shape.
+  ;; Visible wherever a template becomes a value rather than being compiled: a
+  ;; nested backtick, a quoted one, a macro's argument. A backtick over a bare
+  ;; SYMBOL agrees exactly ((quote ns/sym) both), which is the shape programs
+  ;; actually test for. Recorded in known-divergences.edn (:impl-detail); the
+  ;; rows are here so the shape cannot change without the gate saying so.
   {:suite "reader / nested syntax-quote" :label "the inner template is jolt's construction code, not the JVM's seq/concat" :expected "\"(user/a (clojure.core/__sqcat (clojure.core/__sq1 (quote user/b)) (clojure.core/__sq1 (clojure.core/+ 1 2))))\"" :actual "(do (in-ns (quote user)) (pr-str `(a `(b ~(+ 1 2)))))" :portability :common}
+  {:suite "reader / nested syntax-quote" :label "a quoted template is that same construction code" :expected "\"(__sqcat (__sq1 (quote user/a)) (__sq1 b))\"" :actual "(do (in-ns (quote user)) (pr-str '`(a ~b)))" :portability :common}
+  ;; ` is a READER macro in Clojure: a form is past its backticks before anything
+  ;; can look at it. jolt reads one to a (clojure.core/syntax-quote FORM) marker
+  ;; and used to lower it only when the marker itself was analyzed, so the marker
+  ;; was still there for a macro reading its own argument forms and for quoted
+  ;; data. typedclojure's (f/sub-f sb `call-abstract-many* opts) asserts its
+  ;; argument is (quote qualified-sym) and got the marker (jolt-024c).
+  {:suite "syntax-quote / expanded before anything sees the form" :label "a macro's argument arrives expanded, not as a marker" :expected "[true true true \"some-name\"]" :actual "(do (defmacro sqx-q [f] (list 'quote [(seq? f) (= 'quote (first f)) (qualified-symbol? (second f)) (name (second f))])) (sqx-q `some-name))" :portability :common}
+  {:suite "syntax-quote / expanded before anything sees the form" :label "and so does one inside a collection argument" :expected "[[true \"foo\"] [true \"bar\"]]" :actual "(do (defmacro sqx-n [f] (list 'quote (mapv (fn [x] [(seq? x) (name (second x))]) f))) (sqx-n [`foo `bar]))" :portability :common}
+  {:suite "syntax-quote / expanded before anything sees the form" :label "a quoted backtick is its expansion" :expected "[true true \"foo\"]" :actual "(let [f '`foo] [(seq? f) (= 'quote (first f)) (name (second f))])" :portability :common}
+  {:suite "syntax-quote / expanded before anything sees the form" :label "in quoted data, beside an unquote" :expected "(quote [a \"b\" clojure.core/unquote])" :actual "(let [v '[a `b ~'c]] [(first v) (name (second (second v))) (first (nth v 2))])" :portability :common}
+  {:suite "syntax-quote / expanded before anything sees the form" :label "in a quoted map and a quoted set" :expected "[\"v\" \"w\"]" :actual "(let [m '{:k `v} s '#{`w}] [(name (second (:k m))) (name (second (first s)))])" :portability :common}
+  {:suite "syntax-quote / expanded before anything sees the form" :label "the compiler and read-string agree on a bare symbol" :expected "[\"(quote user/foo)\" \"(quote user/foo)\"]" :actual "(do (in-ns (quote user)) [(pr-str '`foo) (pr-str (read-string \"`foo\"))])" :portability :common}
   ;; ~'~x interpolates the OUTER macro's argument into the inner expansion —
   ;; the outer walk reaches the (unquote nm) the inner left behind.
   {:suite "reader / nested syntax-quote" :label "~'~x carries the outer macro's argument into the inner template" :expected "(quote (9 1 2))" :actual "(do (defmacro sqe-outer [nm] `(defmacro ~(symbol (str \"sqe-\" nm)) [x# y#] `(list ~'~nm ~x# ~y#))) (sqe-outer 9) (sqe-9 1 2))" :portability :common}

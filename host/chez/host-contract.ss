@@ -531,6 +531,91 @@
 
 (define (hc-syntax-quote-lower ctx inner)
   (hc-sq-lower ctx inner (make-hashtable string-hash string=?)))
+
+;; --- lowering every marker in a form, before anything can see it -------------
+;; Clojure's ` is a READER macro: by the time a program sees a form the backtick
+;; is already gone, replaced by its expansion. jolt reads ` to a marker
+;; (clojure.core/syntax-quote FORM) and lowers it in the analyzer, which is right
+;; for a marker in evaluated position and leaves it VISIBLE everywhere else — a
+;; macro reading its own argument forms, or a quoted form. typedclojure's
+;; (f/sub-f sb `call-abstract-many* opts) asserts its argument is
+;; (quote qualified-sym) and got (clojure.core/syntax-quote call-abstract-many*),
+;; so the checker would not load (jolt-024c).
+;;
+;; So the analyzer lowers every marker in a top-level form up front, at the
+;; reader's moment, through this same hc-syntax-quote-lower. A marker is replaced
+;; by its lowering and the result is NOT rewalked: it is already fully lowered,
+;; nested backticks included (hc-sq-lower-bare does those inside-out). Everything
+;; else is rebuilt only when a child actually changed, so a form with no backtick
+;; comes back as it went in, unallocated — and a rebuilt collection is handed its
+;; metadata, its map source order and its record-literal mark, all three of which
+;; the reader keys off OBJECT IDENTITY and a copy would drop.
+;;
+;; Only the reader's eager shapes are walked. A macro that builds its expansion
+;; lazily can still hand back a marker; analyze's own syntax-quote case — the
+;; evaluated-position path — is what lowers that one.
+(define (hc-sq-keep-identity old new)
+  (let ((m (jolt-meta old)))
+    (if (jolt-nil? m)
+        new
+        (let ((c (jolt-with-meta new m)))
+          ;; jolt-with-meta copies, and a pmap copy loses the rdr-map-order entry
+          ;; (a map literal's source key order, which is its evaluation order).
+          (let ((order (and (pmap? new) (rdr-map-order-ref new))))
+            (when order (rdr-map-order-set! c order)))
+          c))))
+
+(define (hc-sq-expand-items ctx items)
+  (let loop ((xs items) (acc '()) (changed #f))
+    (if (null? xs)
+        (values (reverse acc) changed)
+        (let ((y (hc-sq-expand-all ctx (car xs))))
+          (loop (cdr xs) (cons y acc) (or changed (not (eq? y (car xs)))))))))
+
+(define (hc-sq-expand-map ctx form)
+  (let ((ty (jolt-get form hc-kw-jolt-type)))
+    (cond
+      ;; the reader's set FORM: {:jolt/type :jolt/set :value <pvec>}
+      ((eq? ty hc-kw-jolt-set)
+       (let* ((v (jolt-get form hc-kw-value))
+              (nv (hc-sq-expand-all ctx v)))
+         (if (eq? nv v) form (hc-sq-keep-identity form (jolt-assoc form hc-kw-value nv)))))
+      ;; a tagged literal: {:jolt/type :jolt/tagged :tag t :form f}
+      ((eq? ty hc-kw-jolt-tagged)
+       (let* ((f (jolt-get form hc-kw-form))
+              (nf (hc-sq-expand-all ctx f)))
+         (if (eq? nf f) form (hc-sq-keep-identity form (jolt-assoc form hc-kw-form nf)))))
+      ((jolt-nil? ty)
+       (let ((order (rdr-map-order-ref form)))
+         (if order
+             ;; rdr-make-map re-registers the source order for the rebuilt map
+             (let-values (((kvs changed) (hc-sq-expand-items ctx order)))
+               (if changed (hc-sq-keep-identity form (rdr-make-map kvs)) form))
+             (let-values (((kvs changed)
+                           (hc-sq-expand-items
+                             ctx (pmap-fold form (lambda (k v a) (cons k (cons v a))) '()))))
+               (if changed (hc-sq-keep-identity form (apply jolt-hash-map kvs)) form)))))
+      (else form))))
+
+(define (hc-sq-expand-all ctx form)
+  (cond
+    ((hc-syntax-quote-form? form) (hc-syntax-quote-lower ctx (hc-second form)))
+    ((or (symbol-t? form) (hc-literal? form) (empty-list-t? form)) form)
+    ((cseq? form)
+     (let-values (((items changed) (hc-sq-expand-items ctx (seq->list form))))
+       (if (not changed)
+           form
+           (let ((new (hc-sq-keep-identity form (apply jolt-list items))))
+             (when (rdr-ctor-call? form) (rdr-mark-ctor-form new))
+             new))))
+    ((pvec? form)
+     (let-values (((items changed) (hc-sq-expand-items ctx (vector->list (pvec-v form)))))
+       (if changed (hc-sq-keep-identity form (apply jolt-vector items)) form)))
+    ((pset? form)
+     (let-values (((items changed) (hc-sq-expand-items ctx (pset-fold form cons '()))))
+       (if changed (hc-sq-keep-identity form (apply jolt-hash-set items)) form)))
+    ((pmap? form) (hc-sq-expand-map ctx form))
+    (else form)))
 ;; a ^Type param hint: name is the tag (a symbol, sometimes a string). Resolve it
 ;; against the record registry (records.ss) so the inference seeds the param as
 ;; that record — the open-world / cross-ns path where no caller type is inferred.
@@ -680,6 +765,7 @@
   (def-var! "jolt.host" "host-class-name?" hc-host-class-name?)
   (def-var! "jolt.host" "host-intern!" hc-intern!)
   (def-var! "jolt.host" "form-syntax-quote-lower" hc-syntax-quote-lower)
+  (def-var! "jolt.host" "form-syntax-quote-expand" hc-sq-expand-all)
   (def-var! "jolt.host" "record-type?" hc-record-type?)
   (def-var! "jolt.host" "record-ctor-key" hc-record-ctor-key)
   (def-var! "jolt.host" "deftype-ctor-class" hc-deftype-ctor-class)
