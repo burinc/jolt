@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The dev boot cache broke every project-aware `-e`.** `make devboot` emits
+  jolt.main AOT'd into `target/dev/flat.so` without loading `cli-core.ss` into
+  the build image first, so `jolt.host/run-expr-string` wasn't a var at
+  emission and compiled as a host-static class reference — `jolt -M -e`,
+  `-A`, `-Sdeps`, and `-e` in any directory with a deps.edn all died with
+  "No such var: jolt.host/run-expr-string" whenever bin/jolt took the cache.
+  `build-jolt.ss` has loaded cli-core.ss for exactly this reason all along;
+  make-devboot.ss now does the same.
+
+- **`set!` on the `(. obj field)` / `(. obj -field)` instance spelling
+  compiled.** The analyzer accepted only the `(.field obj)` sugar, but a
+  deftype method conventionally writes its mutable fields as
+  `(set! (. this -field) v)` — typedclojure's `def-type` does. And the deftype
+  macro's mutable-field rewrite treated the member position of a dot form as a
+  value, so `(. this v)` with a mutable field named `v` rewrote its member
+  symbol into a field read and produced an uncompilable form. Both spellings
+  now compile, and the rewrite leaves member positions alone.
+
+- **Loading a namespace from compiled code did not bind the compiler-flag vars,
+  so every namespace with `(set! *warn-on-reflection* true)` at its top level
+  recompiled from source on every load.** The set! wrote the root binding and
+  raised; each caller read that raise as a broken artifact and quietly rebuilt.
+  A cached `.so` was deleted and recompiled on every run without ever being
+  served, and the embedded fasls for `babashka.fs` and `babashka.process` — both
+  of which use the idiom — had never once been used. `RT.load` brackets a
+  compiled class's init with those vars just as `Compiler.load` brackets a
+  source load, and `jolt build` already did it for the namespaces it AOTs into a
+  binary; the loader's own three compiled paths were the ones left out.
+
+  It only looked fine because an enclosing file load leaves the same frame up,
+  so a `require` from a script worked and the same `require` from `-e`, a REPL,
+  or an nREPL eval did not. `jolt -e "(require 'babashka.process)"` was 0.68s
+  and is 0.14s; a `bb.edn` task calling `(shell …)` was 0.69s and is 0.15s.
+  The idiom is common in ported libraries — 25 of the conformance-suite
+  libraries use it, rewrite-clj and next-jdbc in dozens of namespaces each — and
+  none of them could hit their cache.
+
+  Two members of the same family, fixed alongside: `jolt -e` (and the `-` stdin
+  script) now binds the compiler-flag vars the way `clojure.main` wraps every
+  entry point, so a top-level `(set! *warn-on-reflection* true)` works under
+  `-e` instead of raising; and `load-string` listed two of the three vars by
+  hand, so a `(set! *unchecked-math* true)` inside one escaped into the caller
+  and changed what its later arithmetic compiled to. All the sites now share
+  one definition of the frame.
+
 - **A failing `:tasks` shell command exited 0.** `jolt <task>` for a string task
   called the shell and dropped its status on the floor, so a task that failed
   reported success and a CI step built on one could not fail. It now exits with
@@ -30,6 +75,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `java.nio.file` spellings cannot drift apart.
 
 ### Added
+
+- **`clojure.core/assert-args`**, the reference implementation verbatim.
+  Private on the JVM, but macro-heavy libraries reach it as
+  `@#'clojure.core/assert-args` — typedclojure consumes it from four
+  namespaces and could not load without it.
+
+- **`clojure.repl/demunge`**, the reference implementation over
+  `clojure.lang.Compiler/demunge`. typedclojure's `gen-datatype*` resolves it
+  lazily via `requiring-resolve`, which returned nil and surfaced later as an
+  opaque cast error.
 
 - **bb.edn tasks (#578).** jolt reads a project's `bb.edn` and runs its `:tasks`
   with babashka's semantics, so a bb.edn written for `bb` runs under `jolt`:

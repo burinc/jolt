@@ -211,6 +211,20 @@
 (defmacro if-not [test then & [else]]
   `(if (not ~test) ~then ~else))
 
+;; Macro-argument validation, the reference implementation verbatim: each
+;; pred/message pair expands to a check that throws IllegalArgumentException
+;; naming the calling macro (via &form) and the requirement. Private on the JVM,
+;; but reachable there as @#'clojure.core/assert-args — the shape typedclojure
+;; and other macro-heavy libraries use, and what this exists to serve.
+(defmacro ^{:private true} assert-args
+  [& pairs]
+  `(do (when-not ~(first pairs)
+         (throw (IllegalArgumentException.
+                  (str (first ~'&form) " requires " ~(second pairs) " in " ~'*ns* ":" (:line (meta ~'&form))))))
+     ~(let [more (nnext pairs)]
+        (when more
+          (list* `assert-args more)))))
+
 ;; Conditional binding macros: the name is bound ONLY in the taken branch (the
 ;; auto-gensym temp# tests the value; the else/empty branch sees the surrounding
 ;; scope). temp# is a single template-local gensym — referenced twice, same symbol.
@@ -481,6 +495,20 @@
                   do-art (fn [ar] (cons (first ar) (map (fn [x] (rw inst (psyms (first ar)) x)) (rest ar))))
                   arts' (if (vector? (first arts)) (do-art arts) (map do-art arts))]
               (concat (list head) (when named? (list fname)) arts'))
+            ;; (. obj member args*) / (. obj (method args*)): the member position
+            ;; names a field or method, it is not a value — rewrite the object and
+            ;; argument positions only. Without this a member named like a mutable
+            ;; field ((. this v)) had its member symbol rewritten into a field
+            ;; read, producing (. this (.-v this)).
+            (and (seq? form) (seq form) (symbol? (first form)) (= "." (name (first form)))
+                 (>= (count form) 3) (symbol? (nth form 2)))
+            (concat (list (first form) (rw inst shadowed (second form)) (nth form 2))
+                    (map (fn [x] (rw inst shadowed x)) (drop 3 form)))
+            (and (seq? form) (seq form) (symbol? (first form)) (= "." (name (first form)))
+                 (= 3 (count form)) (seq? (nth form 2)) (symbol? (first (nth form 2))))
+            (list (first form) (rw inst shadowed (second form))
+                  (cons (first (nth form 2))
+                        (map (fn [x] (rw inst shadowed x)) (rest (nth form 2)))))
             ;; a bare read of a mutable field -> live field access
             (and (symbol? form) (mutable? form) (not (contains? shadowed form)))
             (list (symbol (str ".-" (name form))) inst)

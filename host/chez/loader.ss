@@ -928,6 +928,34 @@
             (rename-file tmp-so so))
           (unless (file-exists? so)
             (aot-info (string-append "no .so produced for " name))))))))
+;; Evaluate a namespace's top-level forms from COMPILED code — an embedded fasl,
+;; an AOT-cached .so, a classpath artifact. RT.load brackets a compiled class's
+;; init with the compiler-flag vars exactly as Compiler.load brackets a source
+;; load, and so does `jolt build` for the namespaces it AOTs into a binary
+;; (jolt-ns-load-vars-push! is the same frame ldr-with-file-vars establishes for
+;; source). The loader's own compiled paths were the ones left out.
+;;
+;; Without the frame, a namespace whose top level does (set! *warn-on-reflection*
+;; true) — the standard idiom in ported Clojure libraries, and what both vendored
+;; babashka namespaces do — writes the ROOT binding and raises. Every caller here
+;; reads that raise as a broken artifact, so the failure is invisible and
+;; permanent: the embedded fasl silently recompiled babashka.fs and
+;; babashka.process from source on every process start, and a cached .so deleted
+;; and rebuilt itself on every run without ever once being served. It only ever
+;; worked when some enclosing file load happened to have the frame up already,
+;; which is why loading such a namespace from a script looked fine and loading it
+;; from -e, a REPL, or an nREPL eval did not.
+(define (ldr-with-compiled-ns-vars thunk)
+  (jolt-with-ns-load-vars thunk))
+
+;; " (msg)" for a diagnostic line, or "" when the message can't be read — the
+;; jolt.host seam is absent in a bootstrap image, and a diagnostic may not throw.
+(define (ldr-condition-suffix e)
+  (let ((m (guard (_ (#t #f))
+             (let ((m ((var-deref "jolt.host" "condition-message") e)))
+               (and (string? m) m)))))
+    (if m (string-append " (" m ")") "")))
+
 ;; A garbled .so makes `load` throw; one cut at a form boundary loads fine and
 ;; just stops early, which the completion marker catches instead. Either way:
 ;; delete the bad files and recompile from source. Recompiling after a partial
@@ -944,7 +972,7 @@
       (aot-compile-and-cache name file src own))
     (let ((state (guard (e (else 'corrupt))
                    (aot-complete-reset! name)
-                   (load so)
+                   (ldr-with-compiled-ns-vars (lambda () (load so)))
                    (if (aot-complete? name) 'ok 'incomplete))))
       (case state
         ((ok) (aot-complete-reset! name))     ; done with the entry
@@ -964,15 +992,27 @@
         (let ((bv (jolt-embedded-fasl name)))
           (and bv
                (begin
-                 (aot-info (string-append "embedded " name))
                  ;; Make success explicit: load-compiled-from-port returns the
                  ;; fasl's LAST expression value, which can be #f for a ns whose
                  ;; final form evaluates to nil/false. A #f read as "failed" so
                  ;; the caller reloaded the namespace from source ON TOP of the
                  ;; already-loaded fasl — the override-replay bug class at
                  ;; loader.ss:~432. #t is the real success signal.
-                 (guard (e (else #f))
-                   (load-compiled-from-port (open-bytevector-input-port bv))
+                 ;;
+                 ;; The aot-info line reports the OUTCOME, not the attempt. It
+                 ;; used to print before the load, so it said "embedded" just as
+                 ;; loudly for a fasl that raised on its first form and sent the
+                 ;; whole namespace to the source compiler — which is exactly
+                 ;; what both babashka namespaces did, unnoticed, for as long as
+                 ;; they have been embedded.
+                 (guard (e (else (aot-info (string-append "embedded " name
+                                                          " FAILED to load"
+                                                          (ldr-condition-suffix e)
+                                                          ", falling back to source"))
+                                 #f))
+                   (ldr-with-compiled-ns-vars
+                     (lambda () (load-compiled-from-port (open-bytevector-input-port bv))))
+                   (aot-info (string-append "embedded " name))
                    #t))))))
 
 ;; Dispatch for load-namespace*: embedded fasl (install-owned ns in a built
@@ -1726,7 +1766,7 @@
                          (unless was-loaded? (ldr-unmark-loaded! name)) ; roll the mark back
                          (raise e)))
                (cond
-                 (art (load (cpath-so-file art)))
+                 (art (ldr-with-compiled-ns-vars (lambda () (load (cpath-so-file art)))))
                  ;; inside a compile, loading from source also emits the artifact
                  ;; — RT.load's COMPILE_FILES branch, which is what carries a
                  ;; compile through to the whole load closure.

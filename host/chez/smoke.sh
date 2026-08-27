@@ -1580,5 +1580,20 @@ check '(do (require (quote jolt.nrepl)) (if jolt.nrepl/windows? :close-on-exec (
 check '(do (require (quote jolt.ffi)) (jolt.ffi/load-library {:darwin "libsqlite3.0.dylib" :linux "libsqlite3.so.0" :windows "winsqlite3.dll"}) :map-form-ok)' ':map-form-ok'
 check '(do (require (quote jolt.ffi)) (try (jolt.ffi/load-library {:no-such-os "x.so"}) :no-raise (catch Exception e (if (clojure.string/includes? (ex-message e) "entry in the per-OS spec") :named-raise :wrong-message))))' ':named-raise'
 
+# clojure.main wraps repl / -e / -m in with-bindings, so a top-level
+# (set! *warn-on-reflection* true) — the standard idiom in ported libraries —
+# has a thread-local slot to write. jolt's REPL bound them and -e did not, so
+# the same expression worked from a file and raised "Can't change/establish
+# root binding" here. Each of the three flags, and the write must be visible to
+# a later form in the same -e.
+check '(do (set! *warn-on-reflection* true) *warn-on-reflection*)' 'true'
+check '(do (set! *unchecked-math* true) *unchecked-math*)' 'true'
+check '(do (set! *assert* false) *assert*)' 'false'
+# ...and load-string scopes its own set! the way a file load does. This listed
+# two of the three vars by hand, so *unchecked-math* escaped into the caller.
+check '(do (load-string "(set! *unchecked-math* true) :x") *unchecked-math*)' 'false'
+check '(do (load-string "(set! *warn-on-reflection* true) :x") *warn-on-reflection*)' 'false'
+check '(do (load-string "(set! *assert* false) :x") *assert*)' 'true'
+
 echo "cli smoke: $pass passed, $fails failed"
 [ "$fails" -eq 0 ]

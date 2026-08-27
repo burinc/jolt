@@ -581,13 +581,12 @@
     ;; the caller's binding stack for the rest of the thread (observed poisoning
     ;; every later corpus case in a shared-process run).
     (dynamic-wind
-      (lambda ()
-        (jolt-push-thread-bindings
-          (jolt-hash-map
-            (jolt-var "clojure.core" "*warn-on-reflection*")
-              (var-cell-root (jolt-var "clojure.core" "*warn-on-reflection*"))
-            (jolt-var "clojure.core" "*assert*")
-              (var-cell-root (jolt-var "clojure.core" "*assert*")))))
+      ;; The same frame ldr-with-file-vars gives a file and the loader gives a
+      ;; compiled namespace, from the one definition of which vars that is — this
+      ;; site listed two of the three by hand, so a (set! *unchecked-math* true)
+      ;; inside a load-string escaped into the caller and changed what its later
+      ;; arithmetic compiled to.
+      jolt-ns-load-vars-push!
       (lambda ()
         (let loop ((i 0) (result jolt-nil))
           (if (>= i end)
@@ -600,7 +599,7 @@
                                  (if drl (ldr-apply-readers form) form)
                                  (chez-current-ns))))
                     result)))))
-      (lambda () (jolt-pop-thread-bindings)))))
+      jolt-ns-load-vars-pop!)))
 
 ;; eval / load-string are FUNCTIONS on the spine (the compiler image is resident
 ;; at runtime). eval takes an already-read FORM (e.g. from quote / list); it and

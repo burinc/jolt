@@ -17,6 +17,14 @@
   {:suite "uuid" :expr "(every? (fn [_] (re-matches #\"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\" (str (random-uuid)))) (range 200))" :expected "true"}
   {:suite "uuid" :expr "(let [us (repeatedly 400 #(str (random-uuid)))] (every? #(> (count (distinct (map (fn [u] (nth u %)) us))) 8) [0 1 2 7 9 35]))" :expected "true"}
   {:suite "uuid" :expr "(= (str (random-uuid)) (str (random-uuid)))" :expected "false"}
+  {:suite "assert-args" :expr "(:private (meta #'clojure.core/assert-args))" :expected "true"}
+  {:suite "assert-args" :expr "(:macro (meta #'clojure.core/assert-args))" :expected "true"}
+  {:suite "assert-args" :expr "(seq? (@#'clojure.core/assert-args true \"x\"))" :expected "true"}
+  {:suite "assert-args" :expr "(do (eval '(defmacro aa-m1 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\") :ok)) (eval '(aa-m1 [1])))" :expected ":ok"}
+  {:suite "assert-args" :expr "(do (eval '(defmacro aa-m2 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\") :ok)) (try (eval '(aa-m2 (1))) (catch IllegalArgumentException e (boolean (re-find #\"aa-m2 requires a vector for its binding\" (ex-message e))))))" :expected "true"}
+  {:suite "assert-args" :expr "(do (eval '(defmacro aa-m3 [b] (clojure.core/assert-args (vector? b) \"a vector for its binding\" (even? (count b)) \"an even number of forms in binding vector\") :ok)) (try (eval '(aa-m3 [1 2 3])) (catch IllegalArgumentException e (boolean (re-find #\"aa-m3 requires an even number of forms in binding vector\" (ex-message e))))))" :expected "true"}
+  {:suite "repl-demunge" :expr "(do (require 'clojure.repl) (clojure.repl/demunge \"my_ns$my_fn_QMARK_\"))" :expected "\"my-ns/my-fn?\""}
+  {:suite "repl-demunge" :expr "(do (require 'clojure.repl) (ifn? (requiring-resolve 'clojure.repl/demunge)))" :expected "true"}
   {:suite "special-form precedence" :expr "(do (ns sftest (:refer-clojure :exclude [def])) (defmacro def [n v] :shadowed) (clojure.core/defn ff [] 99) (ff))" :expected "99"}
   {:suite "special-form precedence" :expr "(do (set! (. clojure.lang.RT checkSpecAsserts) true) clojure.lang.RT/checkSpecAsserts)" :expected "true"}
   {:suite "atomwatch" :expr "(let [a (atom 0) seen (atom 0)] (add-watch a :k (fn [k r o n] (reset! seen 1))) (reset! a 5) @seen)" :expected "1"}
@@ -1370,7 +1378,9 @@
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'when-class))" :expected "false"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'with-loading-context))" :expected "false"}
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'add-doc-and-meta))" :expected "false"}
- {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'assert-args))" :expected "false"}
+ ;; assert-args moved out of the JVM-only set: ported (see the assert-args suite)
+ ;; because macro-heavy libraries reach it as @#'clojure.core/assert-args.
+ {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'assert-args))" :expected "true"}
  ;; amap/areduce are NOT JVM-only: they are index loops over alength/aget/aset/
  ;; aclone, all of which jolt has, so they are implemented in the overlay.
  {:suite "naa9-jvm-only-macros" :expr "(some? (resolve 'amap))" :expected "true"}

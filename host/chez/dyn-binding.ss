@@ -177,21 +177,28 @@
 ;; source loads). Frames push directly like the loader's; an empty frame keeps
 ;; push/pop balanced if the cells are ever absent.
 (define jolt-nsload-cells #f)
-(define (jolt-ns-load-vars-push!)
+(define (jolt-ns-load-var-pairs)
   (unless jolt-nsload-cells
     (set! jolt-nsload-cells
       (let ((cells (map (lambda (nm) (var-cell-lookup "clojure.core" nm))
                         '("*warn-on-reflection*" "*assert*" "*unchecked-math*"))))
         (if (for-all values cells) cells 'missing))))
-  (dyn-push-frame!
-    (if (pair? jolt-nsload-cells)
-        (map (lambda (c) (cons c (var-cell-root c))) jolt-nsload-cells)
-        '()))
+  (if (pair? jolt-nsload-cells)
+      (map (lambda (c) (cons c (var-cell-root c))) jolt-nsload-cells)
+      '()))
+(define (jolt-ns-load-vars-push!)
+  (dyn-push-frame! (jolt-ns-load-var-pairs))
   jolt-nil)
 (define (jolt-ns-load-vars-pop!)
   (when (pair? (dyn-binding-stack))
     (dyn-binding-stack (cdr (dyn-binding-stack))))
   jolt-nil)
+;; The same frame for a caller that has a thunk rather than a pair of emitted
+;; statements: dyn-with-frame restores the whole stack instead of popping a head,
+;; so a nested load that leaves a frame standing cannot make the pop take the
+;; wrong one, and a fiber parking mid-load re-enters without pushing twice.
+(define (jolt-with-ns-load-vars thunk)
+  (dyn-with-frame (jolt-ns-load-var-pairs) thunk))
 
 ;; get-thread-bindings: a jolt map of every currently-bound cell -> value,
 ;; innermost wins. Merge oldest-frame-first (the stack head is innermost). The
