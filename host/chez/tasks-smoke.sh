@@ -9,7 +9,7 @@
 # Asserts the babashka task semantics jolt supports — code bodies, :doc,
 # :depends (deduped, dependency-first, cycles refused), :init, :requires (global
 # and per-task), :enter/:leave, :private, :extra-paths/:extra-deps,
-# :override-builtin, the babashka.tasks API (shell / clojure / run /
+# :override-builtin, the babashka.tasks API (shell / jolt / clojure / run /
 # current-task), *command-line-args*, the `tasks` listing, `run <task>` and
 # `run --parallel`, and exit-code propagation from a failed shell — plus jolt's
 # own string and :main-opts forms, and which file drives which command when a
@@ -25,8 +25,9 @@ BOTH="$root/test/chez/tasks/both"
 DEPS="$root/test/chez/tasks/depsonly"
 pass=0; fail=0
 export JOLT_NO_USER_DEPS=1
-# babashka.tasks/clojure re-invokes the jolt CLI: point it at the one under
-# test, not at whatever `jolt` PATH happens to hold.
+# babashka.tasks/jolt (and `clojure`, its babashka name) re-invokes the jolt
+# CLI: point it at the one under test, not at whatever `jolt` PATH happens to
+# hold.
 case "$JOLT" in /*) export JOLT_EXE="$JOLT" ;; *) export JOLT_EXE="$root/$JOLT" ;; esac
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -113,9 +114,10 @@ shell-string
 second
 leave shcmd" "$(inbb "$BB" shcmd)"
 
-# the `clojure` fn referred into the task ns must not shadow clojure.* prefixes
-check "fully-qualified clojure.* names still resolve" "enter fq
-FQ 2
+# the `clojure` and `jolt` fns referred into the task ns must not shadow the
+# clojure.* / jolt.* namespace prefixes
+check "fully-qualified clojure.*/jolt.* names still resolve" "enter fq
+FQ 2 true
 leave fq" "$(inbb "$BB" fq)"
 
 # --- exit codes --------------------------------------------------------------
@@ -185,7 +187,7 @@ from-bbproj-core
 leave needs" "$out"
 check "bb.edn :deps reach a task" "from-bb-edn-dep" "$(inbb "$BOTH" bbdep)"
 
-# --- babashka.tasks/clojure --------------------------------------------------
+# --- babashka.tasks/jolt and clojure -----------------------------------------
 
 check "clojure re-invokes the jolt CLI" "enter viajolt
 :from-clojure-fn
@@ -193,6 +195,9 @@ leave viajolt" "$(inbb "$BB" viajolt)"
 check "clojure with an options map + tokenized args" "enter viajolt2
 :tokenized
 leave viajolt2" "$(inbb "$BB" viajolt2)"
+check "jolt is the same fn under its own name" "enter viajolt3
+:from-jolt-fn
+leave viajolt3" "$(inbb "$BB" viajolt3)"
 
 # --- :override-builtin -------------------------------------------------------
 

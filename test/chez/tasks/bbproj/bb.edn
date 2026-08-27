@@ -20,7 +20,8 @@
   echo   {:task (shell "echo" "from-shell")}
   bare   (println "bare body")
   ;; the referred `clojure` fn must not shadow a clojure.* namespace prefix
-  fq     {:task (println (clojure.string/upper-case "fq") (clojure.core/inc 1))}
+  fq     {:task (println (clojure.string/upper-case "fq") (clojure.core/inc 1)
+                         (boolean (jolt.host/getenv "PATH")))}
   shcmd  "echo shell-string && echo second"
 
   ;; a task's own roots, on top of the project's
@@ -29,6 +30,8 @@
   viajolt {:task (clojure "-e" "(println :from-clojure-fn)")}
   ;; …with an options map, and with the args in one tokenized string
   viajolt2 {:task (println (str/trim (:out (clojure {:out :string} "-e :tokenized"))))}
+  ;; `jolt` is the same function under the name that says what it does
+  viajolt3 {:task (jolt "-e" "(println :from-jolt-fn)")}
   ;; a built-in command name, taken deliberately
   path   {:override-builtin true :task (println "overridden path")}
   ;; a cycle is an error, not a hang

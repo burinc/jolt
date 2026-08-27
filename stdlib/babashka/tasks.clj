@@ -9,17 +9,20 @@
 
   `shell` is babashka.process/shell — it inherits stdio and throws on a
   non-zero exit, and the runner turns that throw into jolt's own exit status.
-  `clojure` runs the jolt CLI rather than the JVM Clojure CLI: on this host jolt
-  IS the Clojure, so `(clojure \"-M:test\")` means the same thing it does under
-  bb without dragging in a JVM. Shell out explicitly — `(shell \"clojure\"
-  \"-M:test\")` — to run the real thing.
+
+  `jolt` re-invokes this CLI. `clojure` is the same function under babashka's
+  name for it, so a bb.edn that calls `(clojure \"-M:test\")` runs here — on
+  this host jolt IS the Clojure, and the point of the exercise is not to need a
+  JVM. Write `jolt` in new task maps; it says what it does. Shell out
+  explicitly — `(shell \"clojure\" \"-M:test\")` — to reach the real
+  Clojure CLI.
 
   jolt.tasks is the runner; this namespace is only the surface it binds.
 
   babashka.process is resolved on first use rather than required here: a task
-  namespace refers these four whether or not the task shells out, and loading
-  the process layer for a task body that only prints cost half a second on
-  every run.")
+  namespace refers these whether or not the task shells out, and loading the
+  process layer for a task body that only prints cost half a second on every
+  run.")
 
 ;; babashka.process, on first call (see the namespace docstring).
 (def ^:private p-shell (delay (requiring-resolve 'babashka.process/shell)))
@@ -51,11 +54,12 @@
   []
   (or (System/getenv "JOLT_EXE") "jolt"))
 
-(defn clojure
-  "Run the jolt CLI as a subprocess with these arguments — the jolt analogue of
-  babashka.tasks/clojure, which shells out to the Clojure CLI. Same call shape
-  as `shell` (leading options map, first argument tokenized), so
-  `(clojure \"-M:test -m app.test-runner\")` works as written."
+(defn jolt
+  "Run the jolt CLI as a subprocess with these arguments. Same call shape as
+  `shell` (leading options map, first argument tokenized), so
+  `(jolt \"-M:test -m app.test-runner\")` works as written.
+
+  This is where babashka's `clojure` lands — see the namespace docstring."
   {:arglists '([opts? & args])}
   [& args]
   (let [[opts args] (if (map? (first args)) [(first args) (rest args)] [nil args])
@@ -67,6 +71,14 @@
                   (concat (when (seq args) (@p-tokenize (str (first args))))
                           (rest args)))]
     (if opts (apply @p-shell opts cmd) (apply @p-shell cmd))))
+
+(defn clojure
+  "babashka.tasks/clojure under its babashka name, so a bb.edn written for `bb`
+  runs unchanged. It runs the jolt CLI, not the JVM Clojure CLI: `jolt` is the
+  same function and the spelling to prefer in new task maps."
+  {:arglists '([opts? & args])}
+  [& args]
+  (apply jolt args))
 
 (defn run
   "Run another task by name, in this process. Its :depends run first (each at

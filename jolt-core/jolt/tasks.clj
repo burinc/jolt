@@ -16,8 +16,8 @@
   A task's value is either a map — :doc, :task (the body), :depends, :requires,
   :private, :extra-paths, :extra-deps — or the body on its own. Bodies run in
   the `user` namespace with clojure.core and babashka.tasks referred, so
-  `shell`, `clojure`, `run` and `current-task` are available unqualified, and
-  the arguments after the task name are *command-line-args*.
+  `shell`, `jolt`, `clojure`, `run` and `current-task` are available
+  unqualified, and the arguments after the task name are *command-line-args*.
 
   Two forms are jolt's own rather than babashka's, and work in either file:
   a STRING body is a shell command line (babashka would evaluate it as an
@@ -92,7 +92,7 @@
   (require 'babashka.tasks)
   (binding [*ns* (the-ns task-ns)]
     (refer 'clojure.core)
-    (refer 'babashka.tasks :only '[shell clojure run current-task]))
+    (refer 'babashka.tasks :only '[shell jolt clojure run current-task]))
   (require-all! (:requires tasks))
   (when-let [init (:init tasks)] (eval-body init))
   true)

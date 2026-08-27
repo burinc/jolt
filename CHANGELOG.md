@@ -50,17 +50,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:init`, `:requires`, `:enter`/`:leave`, `:depends` (each dependency runs once
   per invocation, a cycle is an error rather than a hang), `:doc`, `:private`,
   `:extra-paths`/`:extra-deps` and `:override-builtin` all work. Bodies run in
-  the `user` namespace with `babashka.tasks` referred, so `shell`, `clojure`,
-  `run` and `current-task` need no require, and the arguments after the task
-  name are `*command-line-args*`. A failed `shell` exits with the child's
-  status and no jolt stack trace over it. `:pods` are not supported and say so.
+  the `user` namespace with `babashka.tasks` referred, so `shell`, `jolt`,
+  `clojure`, `run` and `current-task` need no require, and the arguments after
+  the task name are `*command-line-args*`. A failed `shell` exits with the
+  child's status and no jolt stack trace over it. `:pods` are not supported and
+  say so.
 
   Two things differ from babashka deliberately. `clojure` runs the jolt CLI
-  rather than the JVM Clojure CLI — on this host jolt is the Clojure, and
-  `(shell "clojure" "-M:test")` still reaches the real one. And a STRING task
-  body is a shell command line, which is what jolt's own `deps.edn` `:tasks`
-  have always meant; babashka evaluates it as an expression, where it does
-  nothing.
+  rather than the JVM Clojure CLI — on this host jolt is the Clojure, and the
+  point is not to need a JVM; `(shell "clojure" "-M:test")` still reaches the
+  real one. `jolt` is the same function under the name that says what it does,
+  and the spelling to prefer in new task maps. And a STRING task body is a
+  shell command line, which is what jolt's own `deps.edn` `:tasks` have always
+  meant; babashka evaluates it as an expression, where it does nothing.
 
   With no `deps.edn`, `bb.edn` is the project config for every command — its
   `:paths` and `:deps` drive `run`, `repl` and `build` too. With both files,
