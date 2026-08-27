@@ -261,18 +261,99 @@
             dst))
       dst))
 
+;; --- rewriting a form the reader built, before anything else sees it ----------
+;; Two things have to happen to a form between the reader and the code that reads
+;; it: a syntax-quote marker gets lowered (hc-sq-expand-all) and a set-form gets
+;; turned into a real set (hc-macro-arg). Both are "the reader's shape is not the
+;; language's shape", both walk the same eager reader shapes, so both go through
+;; this one traversal. `visit` gets first refusal on each node and answers a
+;; replacement, or #f to keep descending.
+;;
+;; A container is rebuilt only when something below it changed, so a form with
+;; nothing to rewrite comes back as it went in, unallocated. A rebuilt one is
+;; handed back the three things the reader keys off OBJECT IDENTITY and a plain
+;; copy would drop: its metadata, its map source key order (which is its
+;; evaluation order) and its record-literal mark.
+(define (hc-keep-identity old new)
+  (let ((m (jolt-meta old)))
+    (if (jolt-nil? m)
+        new
+        (let ((c (jolt-with-meta new m)))
+          (let ((order (and (pmap? new) (rdr-map-order-ref new))))
+            (when order (rdr-map-order-set! c order)))
+          c))))
+
+(define (hc-walk-items visit items)
+  (let loop ((xs items) (acc '()) (changed #f))
+    (if (null? xs)
+        (values (reverse acc) changed)
+        (let ((y (hc-walk-form visit (car xs))))
+          (loop (cdr xs) (cons y acc) (or changed (not (eq? y (car xs)))))))))
+
+(define (hc-walk-map visit form)
+  (let ((ty (jolt-get form hc-kw-jolt-type)))
+    (cond
+      ;; the reader's set FORM: {:jolt/type :jolt/set :value <pvec>}
+      ((eq? ty hc-kw-jolt-set)
+       (let* ((v (jolt-get form hc-kw-value))
+              (nv (hc-walk-form visit v)))
+         (if (eq? nv v) form (hc-keep-identity form (jolt-assoc form hc-kw-value nv)))))
+      ;; a tagged literal: {:jolt/type :jolt/tagged :tag t :form f}
+      ((eq? ty hc-kw-jolt-tagged)
+       (let* ((f (jolt-get form hc-kw-form))
+              (nf (hc-walk-form visit f)))
+         (if (eq? nf f) form (hc-keep-identity form (jolt-assoc form hc-kw-form nf)))))
+      ((jolt-nil? ty)
+       (let ((order (rdr-map-order-ref form)))
+         (if order
+             ;; rdr-make-map re-registers the source order for the rebuilt map
+             (let-values (((kvs changed) (hc-walk-items visit order)))
+               (if changed (hc-keep-identity form (rdr-make-map kvs)) form))
+             (let-values (((kvs changed)
+                           (hc-walk-items
+                             visit (pmap-fold form (lambda (k v a) (cons k (cons v a))) '()))))
+               (if changed (hc-keep-identity form (apply jolt-hash-map kvs)) form)))))
+      (else form))))
+
+(define (hc-walk-form visit form)
+  (cond
+    ((visit form))
+    ((or (symbol-t? form) (hc-literal? form) (empty-list-t? form)) form)
+    ((cseq? form)
+     (let-values (((items changed) (hc-walk-items visit (seq->list form))))
+       (if (not changed)
+           form
+           (let ((new (hc-keep-identity form (apply jolt-list items))))
+             (when (rdr-ctor-call? form) (rdr-mark-ctor-form new))
+             new))))
+    ((pvec? form)
+     (let-values (((items changed) (hc-walk-items visit (vector->list (pvec-v form)))))
+       (if changed (hc-keep-identity form (apply jolt-vector items)) form)))
+    ((pset? form)
+     (let-values (((items changed) (hc-walk-items visit (pset-fold form cons '()))))
+       (if changed (hc-keep-identity form (apply jolt-hash-set items)) form)))
+    ((pmap? form) (hc-walk-map visit form))
+    (else form)))
+
 ;; A set literal reads as the tagged set-form {:jolt/type :jolt/set :value [...]}
-;; for the analyzer, but a macro must see a real set value (Clojure parity, so
-;; (set? arg) / seq / conj work — hiccup's compiler does this). Convert a set-form
-;; argument to a set; elements stay as read (a deeply-nested set literal inside
-;; another form is rarer and left for the analyzer).
-(define (hc-macro-arg x)
-  (if (rdr-set-form? x)
-      (let ((items (jolt-get x rdr-kw-value)))
-        (let loop ((i 0) (s empty-pset))
-          (if (fx>=? i (pvec-count items)) s
-              (loop (fx+ i 1) (pset-conj s (pvec-nth-d items i jolt-nil))))))
-      x))
+;; for the analyzer, but Clojure's ` #{...} ` is a reader macro: a real set exists
+;; before any macro runs, so a macro must see one too — (set? arg), seq and conj
+;; all depend on it, and hiccup's compiler does exactly that. The shape is jolt's,
+;; not the language's, so it is normalized out of the WHOLE argument rather than
+;; only its top level. A nested one used to arrive as the raw map, where (set? x)
+;; was false and (map? x) TRUE, so the obvious cond over vector?/set?/map? routed
+;; a set into the map branch and died on the key :jolt/type (#762).
+(define (hc-set-form->set x)
+  (and (rdr-set-form? x)
+       ;; the set-form is what carries the literal's metadata, so the set built
+       ;; from it has to inherit that — reitit writes ^:replace #{...} in route
+       ;; data and meta-merge unions instead of replacing without it.
+       (let ((items (hc-walk-form hc-set-form->set (jolt-get x rdr-kw-value))))
+         (hc-keep-identity x
+           (let loop ((i 0) (s empty-pset))
+             (if (fx>=? i (pvec-count items)) s
+                 (loop (fx+ i 1) (pset-conj s (pvec-nth-d items i jolt-nil)))))))))
+(define (hc-macro-arg x) (hc-walk-form hc-set-form->set x))
 ;; &form and &env are bound (as dynamic vars) around the expander call, so a
 ;; macro body can read the call form / lexical env without changing the calling
 ;; convention. The analyzer passes amp-env (the in-scope locals); macroexpand-1
@@ -544,78 +625,17 @@
 ;;
 ;; So the analyzer lowers every marker in a top-level form up front, at the
 ;; reader's moment, through this same hc-syntax-quote-lower. A marker is replaced
-;; by its lowering and the result is NOT rewalked: it is already fully lowered,
-;; nested backticks included (hc-sq-lower-bare does those inside-out). Everything
-;; else is rebuilt only when a child actually changed, so a form with no backtick
-;; comes back as it went in, unallocated — and a rebuilt collection is handed its
-;; metadata, its map source order and its record-literal mark, all three of which
-;; the reader keys off OBJECT IDENTITY and a copy would drop.
+;; by its lowering and NOT rewalked: it is already fully lowered, nested backticks
+;; included (hc-sq-lower-bare does those inside-out).
 ;;
 ;; Only the reader's eager shapes are walked. A macro that builds its expansion
 ;; lazily can still hand back a marker; analyze's own syntax-quote case — the
 ;; evaluated-position path — is what lowers that one.
-(define (hc-sq-keep-identity old new)
-  (let ((m (jolt-meta old)))
-    (if (jolt-nil? m)
-        new
-        (let ((c (jolt-with-meta new m)))
-          ;; jolt-with-meta copies, and a pmap copy loses the rdr-map-order entry
-          ;; (a map literal's source key order, which is its evaluation order).
-          (let ((order (and (pmap? new) (rdr-map-order-ref new))))
-            (when order (rdr-map-order-set! c order)))
-          c))))
-
-(define (hc-sq-expand-items ctx items)
-  (let loop ((xs items) (acc '()) (changed #f))
-    (if (null? xs)
-        (values (reverse acc) changed)
-        (let ((y (hc-sq-expand-all ctx (car xs))))
-          (loop (cdr xs) (cons y acc) (or changed (not (eq? y (car xs)))))))))
-
-(define (hc-sq-expand-map ctx form)
-  (let ((ty (jolt-get form hc-kw-jolt-type)))
-    (cond
-      ;; the reader's set FORM: {:jolt/type :jolt/set :value <pvec>}
-      ((eq? ty hc-kw-jolt-set)
-       (let* ((v (jolt-get form hc-kw-value))
-              (nv (hc-sq-expand-all ctx v)))
-         (if (eq? nv v) form (hc-sq-keep-identity form (jolt-assoc form hc-kw-value nv)))))
-      ;; a tagged literal: {:jolt/type :jolt/tagged :tag t :form f}
-      ((eq? ty hc-kw-jolt-tagged)
-       (let* ((f (jolt-get form hc-kw-form))
-              (nf (hc-sq-expand-all ctx f)))
-         (if (eq? nf f) form (hc-sq-keep-identity form (jolt-assoc form hc-kw-form nf)))))
-      ((jolt-nil? ty)
-       (let ((order (rdr-map-order-ref form)))
-         (if order
-             ;; rdr-make-map re-registers the source order for the rebuilt map
-             (let-values (((kvs changed) (hc-sq-expand-items ctx order)))
-               (if changed (hc-sq-keep-identity form (rdr-make-map kvs)) form))
-             (let-values (((kvs changed)
-                           (hc-sq-expand-items
-                             ctx (pmap-fold form (lambda (k v a) (cons k (cons v a))) '()))))
-               (if changed (hc-sq-keep-identity form (apply jolt-hash-map kvs)) form)))))
-      (else form))))
-
 (define (hc-sq-expand-all ctx form)
-  (cond
-    ((hc-syntax-quote-form? form) (hc-syntax-quote-lower ctx (hc-second form)))
-    ((or (symbol-t? form) (hc-literal? form) (empty-list-t? form)) form)
-    ((cseq? form)
-     (let-values (((items changed) (hc-sq-expand-items ctx (seq->list form))))
-       (if (not changed)
-           form
-           (let ((new (hc-sq-keep-identity form (apply jolt-list items))))
-             (when (rdr-ctor-call? form) (rdr-mark-ctor-form new))
-             new))))
-    ((pvec? form)
-     (let-values (((items changed) (hc-sq-expand-items ctx (vector->list (pvec-v form)))))
-       (if changed (hc-sq-keep-identity form (apply jolt-vector items)) form)))
-    ((pset? form)
-     (let-values (((items changed) (hc-sq-expand-items ctx (pset-fold form cons '()))))
-       (if changed (hc-sq-keep-identity form (apply jolt-hash-set items)) form)))
-    ((pmap? form) (hc-sq-expand-map ctx form))
-    (else form)))
+  (hc-walk-form
+    (lambda (f)
+      (and (hc-syntax-quote-form? f) (hc-syntax-quote-lower ctx (hc-second f))))
+    form))
 ;; a ^Type param hint: name is the tag (a symbol, sometimes a string). Resolve it
 ;; against the record registry (records.ss) so the inference seeds the param as
 ;; that record — the open-world / cross-ns path where no caller type is inferred.

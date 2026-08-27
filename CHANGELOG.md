@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A nested set literal reached a macro as jolt's reader form.** `#{...}` reads
+  as `{:jolt/type :jolt/set :value [...]}` for the analyzer, and only a set that
+  *was* the whole macro argument got turned back into a set. A nested one arrived
+  as the raw map, so `set?` answered false and `map?` answered **true** — the
+  obvious `cond` over `vector?`/`set?`/`map?` routed a set into the map branch and
+  died on the key `:jolt/type`. Clojure's `#{...}` is a reader macro, so a real
+  set exists before any macro runs; the whole argument is normalized now, at any
+  depth. Reported by @burinc (#762).
+
 - **`getSimpleName` and `getCanonicalName` ignored class nesting.**
   `(.getSimpleName java.util.Map$Entry)` answered `"Map$Entry"` where the JVM
   answers `"Entry"`, and `getCanonicalName` kept the `$` where the JVM spells
