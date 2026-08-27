@@ -5254,6 +5254,42 @@
   {:suite "ns / resolve-class" :label "an unknown bare capitalized name is nil" :expected "true" :actual "(nil? (resolve 'NoSuchClassXyz))" :portability :jvm}
   {:suite "ns / resolve-class" :label "a var merely holding a class stays a var" :expected "true" :actual "(do (def rzc-corpus-alias String) (var? (resolve 'rzc-corpus-alias)))" :portability :jvm}
   {:suite "ns / resolve-class" :label "resolve of a deftype name is its class" :expected "true" :actual "(do (deftype RzCorpT [a]) (class? (resolve 'RzCorpT)))" :portability :jvm}
+  ;; A bare class name is a per-NAMESPACE mapping, not a global fact: the JVM maps
+  ;; the java.lang auto-imports into every ns, an (:import ...) into the ns that
+  ;; asked, a deftype into the ns that defines it — and resolve answers only what
+  ;; the ns maps. jolt keeps a clojure.core class-token var for every class it
+  ;; models so a bare `Pattern` self-evaluates, and reading those as mappings made
+  ;; resolve answer for classes the ns never imported. typedclojure's
+  ;; (u/def-object Path ...) guards on that resolve before emitting its deftype,
+  ;; so the guard fired and the Path-maker it also emits never existed (jolt-17w2).
+  {:suite "ns / resolve-class" :label "a class the namespace never imported does not resolve" :expected "[nil nil nil]" :actual "(do (ns rzc.a) [(clojure.core/resolve 'Pattern) (clojure.core/resolve 'ArrayList) (clojure.core/resolve 'Path)])" :portability :jvm}
+  {:suite "ns / resolve-class" :label "the java.lang auto-imports resolve with no import at all" :expected "[true true true true true true]" :actual "(mapv (fn [s] (some? (resolve s))) '[String Integer Thread Object Exception Math])" :portability :jvm}
+  {:suite "ns / resolve-class" :label "an :import maps the short name in that namespace" :expected "true" :actual "(do (ns rzc.b (:import [java.nio.file Path])) (clojure.core/= java.nio.file.Path (clojure.core/resolve 'Path)))" :portability :jvm}
+  {:suite "ns / resolve-class" :label "and not in a namespace that did not import it" :expected "nil" :actual "(do (ns rzc.c (:import [java.nio.file Path])) (ns rzc.d) (clojure.core/resolve 'Path))" :portability :jvm}
+  {:suite "ns / resolve-class" :label "a deftype's class maps only where it is defined" :expected "[true false]" :actual "(do (ns rzc.e) (clojure.core/deftype RzcT [a]) (ns rzc.f) [(clojure.core/some? (clojure.core/ns-resolve 'rzc.e 'RzcT)) (clojure.core/some? (clojure.core/ns-resolve 'rzc.f 'RzcT))])" :portability :common}
+  {:suite "ns / resolve-class" :label "a macro guarding on (resolve name) still emits its deftype" :expected "true" :actual "(do (ns rzc.i) (clojure.core/defmacro rzc-defty [n] (clojure.core/when-not (clojure.core/resolve n) (clojure.core/list 'clojure.core/deftype n '[a]))) (rzc.i/rzc-defty Path) (clojure.core/some? (clojure.core/resolve 'rzc.i/->Path)))" :portability :jvm}
+  ;; The other edge of that: resolve answers a CLASS only for one jolt models, and
+  ;; the instance? macro reads a class answer as "this symbol evaluates to that
+  ;; class" and emits it unquoted. Some java.lang auto-imports have no backing
+  ;; here at all, so widening resolve to the auto-import LIST turns fipp's
+  ;; (catch ExceptionInInitializerError _) into an unresolved symbol.
+  {:suite "ns / resolve-class" :label "an auto-import jolt does not model still works in catch and instance?" :expected "[:ex false false]" :actual "[(try (throw (Exception. \"x\")) (catch ExceptionInInitializerError e :eiie) (catch Exception e :ex)) (instance? ExceptionInInitializerError 1) (instance? UnsupportedClassVersionError 1)]" :portability :jvm}
+  ;; ns-imports is the same question made observable — what class names does THIS
+  ;; namespace map. It used to be the fixed 96 auto-imports for every ns, so an
+  ;; :import and a deftype were both invisible in it.
+  {:suite "ns / ns-imports" :label "the auto-imports are mapped to classes, not name strings" :expected "[true true]" :actual "[(class? (get (ns-imports 'user) 'String)) (= (get (ns-imports 'user) 'String) String)]" :portability :jvm}
+  {:suite "ns / ns-imports" :label "an :import shows up in that namespace's imports only" :expected "[true false]" :actual "(do (ns rzc.g (:import [java.nio.file Path])) [(clojure.core/contains? (clojure.core/ns-imports 'rzc.g) 'Path) (clojure.core/contains? (clojure.core/ns-imports 'user) 'Path)])" :portability :jvm}
+  {:suite "ns / ns-imports" :label "a runtime import shows up too" :expected "[true true]" :actual "(do (ns rzc.k) (clojure.core/import '[java.util ArrayList]) [(clojure.core/some? (clojure.core/resolve 'ArrayList)) (clojure.core/contains? (clojure.core/ns-imports 'rzc.k) 'ArrayList)])" :portability :jvm}
+  {:suite "ns / ns-imports" :label "a deftype adds its own class and nothing else" :expected "[true 97]" :actual "(do (ns rzc.h) (clojure.core/deftype RzcU [a]) [(clojure.core/contains? (clojure.core/ns-imports 'rzc.h) 'RzcU) (clojure.core/count (clojure.core/ns-imports 'rzc.h))])" :portability :jvm}
+  {:suite "ns / ns-imports" :label "a defrecord maps its class, not its factory fns" :expected "[true true false]" :actual "(do (ns rzc.j) (clojure.core/defrecord RzcR [a]) [(clojure.core/some? (clojure.core/resolve 'RzcR)) (clojure.core/contains? (clojure.core/ns-imports 'rzc.j) 'RzcR) (clojure.core/contains? (clojure.core/ns-imports 'rzc.j) 'clojure.core/->RzcR)])" :portability :jvm}
+  ;; ...and the other side of the same line: a class mapping is an IMPORT, never an
+  ;; intern. jolt holds one as a cell like a var, so without the split the class
+  ;; tokens are clojure.core publics, every ns refers them, and the refer shadows
+  ;; the ns-imports entry for the same name.
+  {:suite "ns / ns-imports" :label "an imported class is not an intern" :expected "[false true]" :actual "(do (ns rzc.m (:import [java.nio.file Path])) [(clojure.core/contains? (clojure.core/ns-interns 'rzc.m) 'Path) (clojure.core/contains? (clojure.core/ns-map 'rzc.m) 'Path)])" :portability :jvm}
+  {:suite "ns / ns-imports" :label "a deftype's class is not an intern, its factory fn is" :expected "[false true true]" :actual "(do (ns rzc.n) (clojure.core/deftype RzcV [a]) [(clojure.core/contains? (clojure.core/ns-interns 'rzc.n) 'RzcV) (clojure.core/contains? (clojure.core/ns-interns 'rzc.n) '->RzcV) (clojure.core/contains? (clojure.core/ns-map 'rzc.n) 'RzcV)])" :portability :common}
+  {:suite "ns / ns-imports" :label "ns-map answers the class for an auto-import, not a var" :expected "[true true false]" :actual "[(= (get (ns-map 'user) 'String) String) (class? (get (ns-map 'user) 'String)) (contains? (ns-publics 'clojure.core) 'String)]" :portability :jvm}
+  {:suite "ns / ns-imports" :label "ordinary vars are still in ns-map" :expected "true" :actual "(some? (get (ns-map 'user) 'map))" :portability :common}
   ;; A rest param can duplicate a positional (both _, typically). Chez rejects
   ;; duplicate formals, so every earlier occurrence renames — including against
   ;; the rest binder, which is the last occurrence and keeps the name (jolt-n6o4).

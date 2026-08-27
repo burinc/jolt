@@ -270,13 +270,22 @@
 (define (var-private? c)
   (let ((m (var-cell-meta c)))
     (and m (jolt-truthy? (jolt-get m (keyword #f "private"))))))
+;; A namespace maps class names as well as vars, and the JVM keeps the two apart:
+;; a class mapping is an IMPORT, never an intern, so ns-interns / ns-publics /
+;; ns-map's intern layer must skip it. jolt holds a class mapping as a cell —
+;; (:import ...) binds the short name, deftype/defrecord binds its own name, and
+;; the class model registers a token for every class it knows in clojure.core —
+;; so without this the tokens leak into every namespace as refers and shadow
+;; ns-imports' entry for the same name. That model is not loaded where this file
+;; is, so it starts as "no cell is one" and host-static-classes.ss replaces it.
+(define ns-cell-class-mapping? (lambda (c) #f))
 (define (ns-vars-pmap-when nm keep?)
   ;; the namespace's own bucket (rt.ss ns-cells-index): O(vars in nm), where a
   ;; var-table-cells scan cost O(every var in the image) per call
   (let ((m (jolt-hash-map)))
     (for-each
       (lambda (c)
-        (when (and (var-cell-defined? c) (keep? c))
+        (when (and (var-cell-defined? c) (keep? c) (not (ns-cell-class-mapping? c)))
           (set! m (jolt-assoc m (jolt-symbol #f (var-cell-name c)) c))))
       (ns-cells-list nm))
     m))
@@ -371,6 +380,20 @@
     (if (null? ns) m
         (loop (cdr ns)
               (jolt-assoc m (jolt-symbol #f (car ns)) (string-append "java.lang." (car ns)))))))
+;; The same set as a name lookup. A bare class name is a namespace MAPPING, not a
+;; global fact — (:import ...) and deftype map one into a single namespace, and
+;; these are the only ones mapped everywhere — so resolve asks this before it
+;; answers a bare capitalized symbol (host-static-classes.ss rsv-mapping-visible?).
+(define jolt-default-import-tbl
+  (let ((t (make-hashtable string-hash string=?)))
+    (for-each (lambda (n) (hashtable-set! t n (string-append "java.lang." n)))
+              jolt-default-import-names)
+    t))
+(define (jolt-default-import-fqn nm) (hashtable-ref jolt-default-import-tbl nm #f))
+;; The base is the auto-imports alone; host-static-classes.ss extends it with the
+;; namespace's OWN class mappings (its :imports and deftypes) once the class model
+;; it reads them out of exists. jolt-ns-map below goes through this variable, so
+;; that extension reaches ns-map too.
 (define (jolt-ns-imports . _) jolt-default-imports)
 
 ;; ns-map: every mapping visible in the ns — the java.lang imports, the refers

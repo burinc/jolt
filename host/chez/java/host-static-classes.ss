@@ -2539,49 +2539,113 @@
 ;;     merely holds a class ((def MyCls String)) keeps resolving to the var,
 ;;     which is what the JVM's def would produce. The name must match the class
 ;;     (FQN or simple), so ->Rec ctor vars stay vars.
-;;   - an unresolved symbol classifies exactly as the analyzer's
-;;     hc-resolve-global :class branches do, through the same jolt-class-for
-;;     interner, so (= (resolve 'X) X) holds for every class form: dotted names
-;;     (java.util.Map), registered short names (an :import), deftype simple names.
+;;   - an unresolved symbol classifies as a class the same way, through the same
+;;     jolt-class-for interner, so (= (resolve 'X) X) holds for every class form
+;;     the asking namespace maps: dotted names (java.util.Map) and the java.lang
+;;     auto-imports.
+;;
+;; Both layers answer the JVM's question, which is per-NAMESPACE: "does this ns
+;; map this name to a class", not "does this class exist". The distinction is not
+;; academic — jolt keeps a class-token var in clojure.core for EVERY class it
+;; models (above) so a bare `Pattern` self-evaluates, and reading those as
+;; mappings made (resolve 'Path) answer in a namespace that never imported
+;; java.nio.file.Path. typedclojure's (u/def-object Path ...) guards on exactly
+;; that resolve before emitting its deftype, so the guard fired, the deftype was
+;; skipped, and the Path-maker it also emits never existed (jolt-17w2).
+(define (rsv-registration-class-name c)
+  (let ((root (var-cell-root c)))
+    (cond ((jclass? root) (jclass-name root))
+          ;; a deftype/defrecord NAME var holds its ctor, which carries the tag
+          ((procedure? root) (deftype-ctor-tag root))
+          (else #f))))
 (define (rsv-registration-class c)
-  (let* ((root (var-cell-root c))
-         (cn (cond ((jclass? root) (jclass-name root))
-                   ((procedure? root) (deftype-ctor-tag root))
-                   (else #f))))
+  (let ((cn (rsv-registration-class-name c)))
     (and cn
          (let ((nm (var-cell-name c)))
            (and (or (string=? nm cn) (string=? nm (hsc-last-segment cn)))
-                root)))))
+                (var-cell-root c))))))
+;; Is that registration a mapping the asking namespace HAS? jolt holds a ns's own
+;; class mappings as cells in that ns — (:import ...) binds the short name there
+;; (natives-str.ss), deftype/defrecord binds its own name there (protocols.ss) —
+;; so a cell found in the asking ns is one by construction. Beyond that only the
+;; two kinds the JVM makes visible everywhere answer: a fully-qualified name, and
+;; the java.lang auto-imports. The clojure.core class tokens for everything else
+;; are the class MODEL and stay invisible to resolve.
+(define (rsv-mapping-visible? c ns)
+  (let ((nm (var-cell-name c)))
+    (or (string=? (var-cell-ns c) ns)
+        (hc-fq-class-name? nm)
+        (and (jolt-default-import-fqn nm) #t))))
 (define (rsv-class-for-name nm)
-  ;; only classes the host actually MODELS answer — the class graph, a
-  ;; statics/ctor registration, or a deftype. The syntactic dotted-name shape
-  ;; is deliberately not enough: resolve is how tooling feature-detects a class
-  ;; (compliment gates its JDK9 module scanner on resolving
+  ;; Only a class the host actually MODELS answers, and the syntactic dotted-name
+  ;; shape is deliberately not enough: resolve is how tooling feature-detects a
+  ;; class (compliment gates its JDK9 module scanner on resolving
   ;; java.lang.module.ModuleFinder), and a token for a class jolt cannot back
-  ;; sends such code down paths that then die on the missing pieces. A symbol
-  ;; in code keeps the syntactic model (hc-resolve-global); resolve answers
-  ;; the narrower "does this class exist here".
-  (cond ((and (hc-fq-class-name? nm)
-              (or (jch-known? nm) (host-class-registered? nm)))
-         (jolt-class-for nm))
-        ((and (fx>? (string-length nm) 0) (char-upper-case? (string-ref nm 0)))
-         (cond ((host-class-has-statics? nm) (jolt-class-for nm))
-               ((chez-deftype-simple->tag nm) => jolt-class-for)
-               (else #f)))
-        (else #f)))
-(define (rsv-through v sym)
+  ;; sends such code down paths that then die on the missing pieces — the
+  ;; instance? macro reads a class answer here as "the symbol evaluates to that
+  ;; class" and emits it unquoted, so answering for an unbacked java.lang name
+  ;; (ExceptionInInitializerError, which nothing registers) turns fipp's
+  ;; (catch ExceptionInInitializerError _) into an unresolved symbol.
+  ;; A symbol in CODE keeps the wider syntactic model (hc-resolve-global).
+  ;; A bare name needs no arm here: every one a namespace maps and jolt models is
+  ;; a cell — an :import, a deftype, or the clojure.core token the class model
+  ;; registers for each auto-import it knows — so jolt-resolve already found it.
+  (and (hc-fq-class-name? nm)
+       (or (jch-known? nm) (host-class-registered? nm))
+       (jolt-class-for nm)))
+(define (rsv-through v sym ns)
   (cond ((jolt-nil? v)
          (or (and (symbol-t? sym) (not (string? (symbol-t-ns sym)))
                   (rsv-class-for-name (symbol-t-name sym)))
              jolt-nil))
-        ((rsv-registration-class v))
+        ;; a class registration the ns does not map is NOT the var either — the
+        ;; JVM has no such var to hand back, so the answer is nil.
+        ((rsv-registration-class v)
+         => (lambda (root) (if (rsv-mapping-visible? v ns) root jolt-nil)))
         (else v)))
 (def-var! "clojure.core" "resolve"
   (case-lambda
-    ((sym) (rsv-through (jolt-resolve sym) sym))
+    ((sym) (rsv-through (jolt-resolve sym) sym (chez-current-ns)))
     ;; the &env arity: a local named sym answers nil, never a class
     ((env sym) (if (and (pmap? env) (pmap-contains? env sym))
                    jolt-nil
-                   (rsv-through (jolt-resolve env sym) sym)))))
+                   (rsv-through (jolt-resolve env sym) sym (chez-current-ns))))))
 (def-var! "clojure.core" "ns-resolve"
-  (lambda (ns-desig sym) (rsv-through (jolt-ns-resolve ns-desig sym) sym)))
+  (lambda (ns-desig sym)
+    (rsv-through (jolt-ns-resolve ns-desig sym) sym
+                 (jns-name (jolt-the-ns ns-desig)))))
+
+;; --- ns-imports reports the namespace's own class mappings --------------------
+;; A JVM namespace maps class names as well as vars: the java.lang auto-imports
+;; everywhere, an (:import ...) into the ns that asked for it, a deftype/defrecord
+;; into the ns that defines it. ns.ss returns the auto-imports alone because the
+;; class model does not exist yet where it is defined; this reads the other two
+;; back off the namespace itself rather than keeping a second table that could
+;; drift out of step with the cells resolve answers from.
+(define hsc-default-imports
+  (pmap-fold jolt-default-imports
+             (lambda (k v acc) (jolt-assoc acc k (jolt-class-for v)))
+             (jolt-hash-map)))
+(define (hsc-ns-import-class c)
+  ;; the cell is the ns's mapping FOR a class only when it is bound under that
+  ;; class's own simple name, so Foo counts and ->Foo / map->Foo do not.
+  (and (var-cell-defined? c)
+       (let ((cn (rsv-registration-class-name c)))
+         (and cn (string=? (var-cell-name c) (hsc-last-segment cn))
+              (jolt-class-for cn)))))
+(define (hsc-ns-imports . desig)
+  (let ((cns (if (pair? desig) (ns-desig->name (car desig)) (chez-current-ns))))
+    (fold-left (lambda (m c)
+                 (let ((cls (hsc-ns-import-class c)))
+                   (if cls (jolt-assoc m (jolt-symbol #f (var-cell-name c)) cls) m)))
+               hsc-default-imports
+               (ns-cells-list cns))))
+(set! jolt-ns-imports hsc-ns-imports)   ; so ns-map (ns.ss) sees them too
+(def-var! "clojure.core" "ns-imports" hsc-ns-imports)
+;; ...and the other half of that: a cell that IS a class mapping is an import, so
+;; ns-interns / ns-publics / the refers built from clojure.core's publics must not
+;; report it as a var. Without this the class tokens above are public vars of
+;; clojure.core, every namespace refers them, and the refer shadows the very
+;; ns-imports entry this section just built ((ns-map 'user) answered the token var
+;; for String where the JVM answers the class).
+(set! ns-cell-class-mapping? (lambda (c) (and (hsc-ns-import-class c) #t)))
