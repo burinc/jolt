@@ -2129,6 +2129,7 @@
             (var-cell-ns obj)
             "/"
             (var-cell-name obj)))
+         ((string=? method-name "getRawRoot") (var-cell-root obj))
          (else (dispatch-miss obj method-name rest))))
       ((condition? obj)
        (cond

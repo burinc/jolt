@@ -792,6 +792,12 @@
 (def-var! "clojure.core" "add-tap" jolt-add-tap)
 (def-var! "clojure.core" "remove-tap" jolt-remove-tap)
 (def-var! "clojure.core" "make-delay" jolt-make-delay)
+;; (clojure.lang.Delay. thunk) — the class (delay …) already reports, so a
+;; library spelling its own delay macro as the constructor (fully-satisfies'
+;; safe-locals-clearing does, to control when locals clear) builds the same
+;; object core's delay does and derefs through the same force.
+(register-class-ctor! "clojure.lang.Delay" (lambda (thunk) (jolt-make-delay thunk)))
+(register-class-ctor! "Delay" (lambda (thunk) (jolt-make-delay thunk)))
 (def-var! "clojure.core" "delay?" jolt-delay?)
 (def-var! "clojure.core" "deref" jolt-deref)
 

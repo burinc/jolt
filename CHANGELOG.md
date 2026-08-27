@@ -100,6 +100,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`(clojure.lang.Delay. thunk)` and `Var.getRawRoot`.** The class `(delay …)`
+  already reported had no constructor, so a library spelling its own `delay`
+  macro as the constructor could not build one — fully-satisfies'
+  `safe-locals-clearing` does, to control when locals clear. `getRawRoot` reads
+  a var's root past any thread binding, which is how its `requiring-resolve`
+  reads the global `clojure.core/*loaded-libs*` rather than whatever a load has
+  bound over it.
+
 - **Class reflection: `getModifiers`, `java.lang.reflect.Modifier`, and the
   method/field surface.** `Class.getModifiers` derives the JVM bitmask from the
   class graph (jolt has no bytecode to read one out of), with the final,
