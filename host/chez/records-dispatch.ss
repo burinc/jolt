@@ -42,6 +42,12 @@
 ;; "#<compound condition>".
 (def-var! "jolt.host" "condition-message"
   (lambda (c) (if (condition? c) (condition->message-string c) jolt-nil)))
+;; Set by the java layer once java.lang.Class has a method table (this file loads
+;; first). Takes (tag method-name args) and returns a wrapped result, or #f when
+;; the table has no such method so the caller can fall through.
+(define rd-class-method-hook #f)
+(define (set-rd-class-method-hook! f) (set! rd-class-method-hook f))
+
 (define (record-method-dispatch-base obj method-name rest-args)
   (let ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args))))
     (cond
@@ -51,11 +57,20 @@
       ;; schema resolves class schemas by calling these on the record class.
       ((and (procedure? obj) (deftype-ctor-tag obj))
        => (lambda (tag)
-            (cond ((or (string=? method-name "getName") (string=? method-name "getCanonicalName")
-                       (string=? method-name "getTypeName")) tag)
-                  ((string=? method-name "getSimpleName") (last-dot tag))
-                  ((string=? method-name "toString") (string-append "class " tag))
-                  (else (dispatch-miss obj method-name rest)))))
+            ;; Delegate to the java.lang.Class method table for the tag rather
+            ;; than re-listing a subset here: the two spellings of "the class" —
+            ;; the type token and (class inst) — must answer the same questions,
+            ;; and a hand-kept list here silently answered fewer. Every Class
+            ;; method the table grows is reachable through the token from the
+            ;; moment it is added.
+            (let ((hit (and rd-class-method-hook (rd-class-method-hook tag method-name rest))))
+              (if (pair? hit)
+                  (car hit)                       ; the hook wraps, so a nil/#f answer is still a hit
+                  (cond ((or (string=? method-name "getName") (string=? method-name "getCanonicalName")
+                             (string=? method-name "getTypeName")) tag)
+                        ((string=? method-name "getSimpleName") (last-dot tag))
+                        ((string=? method-name "toString") (string-append "class " tag))
+                        (else (dispatch-miss obj method-name rest)))))))
       ;; clojure.lang.MultiFn interop on a defmulti value: addMethod/removeMethod/
       ;; getMethod/getMethodTable, the same table (defmethod) fills — schema's
       ;; abstract-map registers dispatch methods by calling .addMethod directly.

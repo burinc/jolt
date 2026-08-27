@@ -264,7 +264,80 @@
             "java.lang.Appendable" "java.lang.Comparable" "java.lang.Runnable"
             "java.util.concurrent.Callable" "java.io.Serializable"
             "java.lang.AutoCloseable" "java.io.Closeable" "java.io.Flushable"
-            "java.lang.Readable"))
+            "java.lang.Readable"
+            ;; interfaces the graph modeled as concrete classes, so .isInterface
+            ;; answered false and .getSuperclass named a supertype where the JVM
+            ;; returns null — java.util.Map$Entry reported clojure.lang.AFunction.
+            ;; Derived by probing the reference JVM for every java.* name this
+            ;; graph models, not by eye.
+            "java.util.Queue" "java.util.Deque" "java.util.Map$Entry"
+            "java.nio.file.Path" "java.nio.file.PathMatcher" "java.nio.file.Watchable"))
+
+;; ---- class modifiers ---------------------------------------------------------
+;; Class.getModifiers is a JVM bitmask; jolt derives it from the graph rather than
+;; from bytecode it does not have. PUBLIC is always set (jolt models no
+;; package-private class), INTERFACE implies ABSTRACT the way javac emits it, and
+;; FINAL / ABSTRACT / ENUM come from the marks below.
+;;
+;; The three lists were derived by probing the reference JVM for every java.*
+;; class this graph models (Class/getModifiers on each), so they say what the JVM
+;; says rather than what looked right. A class jolt does not model reports PUBLIC
+;; alone — an honest "I know it is a class and nothing more", not a claim of
+;; non-finality.
+(define jch-mod-public    1)
+(define jch-mod-final     16)
+(define jch-mod-interface 512)
+(define jch-mod-abstract  1024)
+(define jch-mod-enum      16384)
+(define jch-final-set (make-hashtable string-hash string=?))
+(define jch-abstract-set (make-hashtable string-hash string=?))
+(define jch-enum-set (make-hashtable string-hash string=?))
+(define (jch-mark-final! name)
+  (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-final-set name #t)))
+(define (jch-mark-abstract! name)
+  (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-abstract-set name #t)))
+(define (jch-mark-enum! name)
+  (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-enum-set name #t)))
+(define (jch-final? name) (and (hashtable-ref jch-final-set name #f) #t))
+(define (jch-abstract? name)
+  (or (jch-interface? name) (and (hashtable-ref jch-abstract-set name #f) #t)))
+(define (jch-enum? name) (and (hashtable-ref jch-enum-set name #f) #t))
+;; The bitmask for `name`, resolving a simple name to its FQN first so
+;; (.getModifiers String) and (.getModifiers java.lang.String) agree.
+(define (jch-modifiers name)
+  (let ((n (if (jch-known? name) (jch-fqn-of-simple name) name)))
+    (+ jch-mod-public
+       (if (jch-final? n) jch-mod-final 0)
+       (if (jch-interface? n) jch-mod-interface 0)
+       (if (jch-abstract? n) jch-mod-abstract 0)
+       (if (jch-enum? n) jch-mod-enum 0))))
+(for-each jch-mark-final!
+          '(
+            "java.lang.Boolean" "java.lang.Byte" "java.lang.Character"
+            "java.lang.Class" "java.lang.Double" "java.lang.Float"
+            "java.lang.Integer" "java.lang.Long" "java.lang.Math"
+            "java.lang.Short" "java.lang.String" "java.lang.StringBuilder"
+            "java.lang.System" "java.net.URI" "java.time.DayOfWeek"
+            "java.time.Duration" "java.time.format.DateTimeFormatter" "java.time.Instant"
+            "java.time.LocalDate" "java.time.LocalDateTime" "java.time.LocalTime"
+            "java.time.Month" "java.time.OffsetDateTime" "java.time.OffsetTime"
+            "java.time.Period" "java.time.temporal.ChronoField" "java.time.temporal.ChronoUnit"
+            "java.time.Year" "java.time.YearMonth" "java.time.zone.ZoneRules"
+            "java.time.ZonedDateTime" "java.time.ZoneOffset" "java.util.Base64"
+            "java.util.Locale" "java.util.regex.Pattern" "java.util.UUID"
+            ))
+(for-each jch-mark-abstract!
+          '(
+            "java.io.InputStream" "java.io.OutputStream" "java.io.Reader"
+            "java.io.Writer" "java.lang.Number" "java.lang.VirtualMachineError"
+            "java.nio.ByteBuffer" "java.nio.charset.Charset" "java.nio.file.FileSystem"
+            "java.time.Clock" "java.time.ZoneId" "java.util.TimeZone"
+            ))
+(for-each jch-mark-enum!
+          '(
+            "java.time.DayOfWeek" "java.time.Month" "java.time.temporal.ChronoField"
+            "java.time.temporal.ChronoUnit"
+            ))
 
 ;; ---- seed the built-in graph: direct supers only, faithful to the JVM ---------
 ;; core clojure.lang interfaces
@@ -731,9 +804,15 @@
      ;; the represented class name via jclass-name (defined in host-static-classes.ss,
      ;; loaded after us — resolved at call time). For other values (number, string,
      ;; etc.), jolt-class-name gives their JVM class name (java.lang.Long, etc.).
-     (let ((name (if (and (jhost? c) (string=? (jhost-tag c) "class"))
-                    (vector-ref (jhost-state c) 0)
-                    (jolt-class-name c))))
+     ;; A deftype/defrecord TYPE TOKEN is its class, not a function: without this
+     ;; (bases Rec) walked the ctor PROCEDURE's ancestry and answered
+     ;; clojure.lang.AFunction, while (bases (class inst)) gave the record's real
+     ;; interfaces. supers/ancestors already routed through the same question via
+     ;; class-key; this was the one spelling that did not.
+     (let ((name (cond ((and (jhost? c) (string=? (jhost-tag c) "class"))
+                        (vector-ref (jhost-state c) 0))
+                       ((and (procedure? c) (deftype-ctor-tag c)) => values)
+                       (else (jolt-class-name c)))))
        (let ((supers (jch-direct-supers name)))
          (if (null? supers) jolt-nil (list->cseq supers)))))))
 (def-var! "clojure.core" "bases" jolt-bases)

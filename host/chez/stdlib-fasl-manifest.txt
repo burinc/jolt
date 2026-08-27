@@ -31,6 +31,7 @@ clojure.main
 clojure.sci.host-stubs
 clojure.sci.io-stubs
 clojure.sci.lang-stubs
+clojure.reflect
 clojure.stacktrace
 clojure.test
 clojure.zip

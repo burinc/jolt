@@ -613,6 +613,19 @@
             (hashtable-set! proc-hasheq-tbl p h)
             h)))))
 (define (procedure-hasheq p) (jolt-identity-hasheq p))
+;; Pin a procedure's identity hash to a value chosen by the caller, before
+;; anything asks for one. A deftype/defrecord type token is = to its Class (they
+;; are one object on the JVM), so it has to HASH like it too, and the fast path
+;; above may not grow a probe for that — procedures are in hash-fast-probes
+;; precisely so no arm can claim one, and adding a second weak-table lookup to
+;; every procedure hash would tax the fn-keyed-map path to fix a rare case.
+;; Seeding the table the fast path already reads costs the hot path nothing.
+;; A content-derived seed also travels better than the counter: it is the same
+;; number in the next process, where a counter-assigned id is not.
+(define (jolt-identity-hasheq-seed! p h)
+  (jolt-with-mutex proc-hasheq-mu
+    (unless (hashtable-ref proc-hasheq-tbl p #f)
+      (hashtable-set! proc-hasheq-tbl p h))))
 
 ;; pvec hasheq, cached in the field the record has carried since chez-pvec-v3
 ;; (mk-pvec inits it 0 = unset; pvec-with-ent already forwards it) but nothing

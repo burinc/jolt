@@ -392,6 +392,7 @@
   (hashtable-ref (unbox chez-deftype-ctor-tag-box) p #f))
 
 (define (deftype-ctor-tag-set! ctor tag)
+  (jolt-identity-hasheq-seed! ctor (jolt-hash tag))
   (jolt-with-mutex
     chez-deftype-ctor-tag-mu
     (let ((t (hashtable-copy
@@ -441,6 +442,12 @@
 (define (chez-double-tag? t)
   (and (string? t) (string=? t "double")))
 
+(define chez-record-fields-tbl
+  (make-hashtable string-hash string=?))
+
+(define (chez-record-field-kws type-tag)
+  (or (hashtable-ref chez-record-fields-tbl type-tag #f) '()))
+
 (define (register-record-shape! ctor-key field-kws
          field-tags type-tag)
   (jolt-with-mutex
@@ -449,6 +456,7 @@
       chez-record-shapes-tbl
       ctor-key
       (vector field-kws field-tags type-tag))
+    (hashtable-set! chez-record-fields-tbl type-tag field-kws)
     (hashtable-set!
       chez-record-dbl-tbl
       type-tag
@@ -1934,6 +1942,11 @@
   (lambda (c)
     (if (condition? c) (condition->message-string c) jolt-nil)))
 
+(define rd-class-method-hook #f)
+
+(define (set-rd-class-method-hook! f)
+  (set! rd-class-method-hook f))
+
 (define (record-method-dispatch-base obj method-name
          rest-args)
   (let ((rest (if (jolt-nil? rest-args)
@@ -1942,15 +1955,19 @@
     (cond
       ((and (procedure? obj) (deftype-ctor-tag obj)) =>
        (lambda (tag)
-         (cond
-           ((or (string=? method-name "getName")
-                (string=? method-name "getCanonicalName")
-                (string=? method-name "getTypeName"))
-            tag)
-           ((string=? method-name "getSimpleName") (last-dot tag))
-           ((string=? method-name "toString")
-            (string-append "class " tag))
-           (else (dispatch-miss obj method-name rest)))))
+         (let ((hit (and rd-class-method-hook
+                         (rd-class-method-hook tag method-name rest))))
+           (if (pair? hit)
+               (car hit)
+               (cond
+                 ((or (string=? method-name "getName")
+                      (string=? method-name "getCanonicalName")
+                      (string=? method-name "getTypeName"))
+                  tag)
+                 ((string=? method-name "getSimpleName") (last-dot tag))
+                 ((string=? method-name "toString")
+                  (string-append "class " tag))
+                 (else (dispatch-miss obj method-name rest)))))))
       ((jolt-multifn? obj)
        (cond
          ((string=? method-name "addMethod")

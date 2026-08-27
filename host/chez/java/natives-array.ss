@@ -454,10 +454,22 @@
 ;; (fireworks' datatype->map) works because the model already holds the field
 ;; list in the type's descriptor.
 (define (reflect-field-name self) (vector-ref (jhost-state self) 0))
+;; The field's NAME as the JVM reports it: a record's field keys are keywords, and
+;; Field.getName has no leading colon. getDeclaredField used to match against
+;; jolt-str-render-one instead, which renders :x as ":x", so a lookup by the name
+;; getDeclaredFields had just reported could never hit and every field on every
+;; record raised NoSuchFieldException. One helper now answers for both.
+(define (reflect-key-name k) (if (keyword? k) (keyword-t-name k) (jolt-str-render-one k)))
 (register-host-methods! "reflect-field"
-  (list (cons "getName" (lambda (self) (let ((k (reflect-field-name self)))
-                                         (if (keyword? k) (keyword-t-name k) (jolt-str-render-one k)))))
+  (list (cons "getName" (lambda (self) (reflect-key-name (reflect-field-name self))))
         (cons "setAccessible" (lambda (self v) jolt-nil))
+        ;; the declaring class travels with the field so a caller can ask where it
+        ;; came from, as clojure.reflect's field->map does
+        (cons "getDeclaringClass"
+              (lambda (self) (let ((c (vector-ref (jhost-state self) 1)))
+                               (if c (jolt-class-for c) jolt-nil))))
+        (cons "getType" (lambda (self) (jolt-class-for "java.lang.Object")))
+        (cons "getModifiers" (lambda (self) (->num 1)))
         (cons "get" (lambda (self obj)
                       (jolt-get obj (reflect-field-name self) jolt-nil)))
         (cons "toString" (lambda (self) (jolt-str-render-one (reflect-field-name self))))))
@@ -503,7 +515,7 @@
                 (let ((desc (hashtable-ref chez-tag-desc (jclass-name self) #f)))
                   (make-jolt-array
                    (if desc
-                       (vector-map (lambda (k) (make-jhost "reflect-field" (vector k)))
+                       (vector-map (lambda (k) (make-jhost "reflect-field" (vector k (jclass-name self))))
                                    (jrdesc-fkeys desc))
                        (vector))
                    'objects))))
@@ -515,7 +527,88 @@
                                         (vector (jclass-name self) name getter))))
                       ((let ((desc (hashtable-ref chez-tag-desc (jclass-name self) #f)))
                          (and desc
-                              (find (lambda (k) (string=? (jolt-str-render-one k) name))
+                              (find (lambda (k) (string=? (reflect-key-name k) name))
                                     (vector->list (jrdesc-fkeys desc)))))
-                       => (lambda (k) (make-jhost "reflect-field" (vector k))))
-                      (else (throw-jvm 'NoSuchFieldException name)))))))
+                       => (lambda (k) (make-jhost "reflect-field" (vector k (jclass-name self)))))
+                      (else (throw-jvm 'NoSuchFieldException name)))))
+        ;; getFields / getField are the public-member spellings. jolt's member
+        ;; sets are already flat per type (there is no separate inherited set to
+        ;; add), so they answer the same as the declared pair.
+        (cons "getFields"
+              (lambda (self) (record-method-dispatch self "getDeclaredFields" jolt-nil)))
+        (cons "getField"
+              (lambda (self name) (record-method-dispatch self "getDeclaredField" (list->cseq (list name)))))
+        ;; --- methods ----------------------------------------------------------
+        ;; Every method the protocol registry records for this type, under
+        ;; whichever protocol or interface declares it. A class jolt models with
+        ;; no registered methods answers empty rather than guessing at the JVM's
+        ;; set (recorded divergence :reflection-member-model) — the registries
+        ;; are what jolt actually knows, and String's methods are a `cond` in
+        ;; natives-str.ss, not data anything can enumerate.
+        (cons "getDeclaredMethods" (lambda (self) (class-method-array self)))
+        (cons "getMethods" (lambda (self) (class-method-array self)))))
+
+;; java.lang.reflect.Method, enough of one to name it, say where it was declared,
+;; and call it.
+(define (reflect-method-cls self) (vector-ref (jhost-state self) 0))
+(define (reflect-method-name self) (vector-ref (jhost-state self) 1))
+(define (reflect-method-fn self) (vector-ref (jhost-state self) 2))
+;; Lowest arity the impl accepts, minus the leading `this` — the JVM's parameter
+;; count for the same method.
+(define (reflect-method-param-count f)
+  (if (procedure? f)
+      (let ((mask (procedure-arity-mask f)))
+        (let loop ((k 1))
+          (cond ((fx>? k 24) 0)
+                ((bitwise-bit-set? mask k) (fx- k 1))
+                (else (loop (fx+ k 1))))))
+      0))
+(register-host-methods! "reflect-method"
+  (list (cons "getName" (lambda (self) (reflect-method-name self)))
+        (cons "getDeclaringClass" (lambda (self) (jolt-class-for (reflect-method-cls self))))
+        (cons "setAccessible" (lambda (self v) jolt-nil))
+        (cons "getParameterCount"
+              (lambda (self) (->num (reflect-method-param-count (reflect-method-fn self)))))
+        (cons "getParameterTypes"
+              (lambda (self)
+                (make-jolt-array
+                 (make-vector (reflect-method-param-count (reflect-method-fn self))
+                              (jolt-class-for "java.lang.Object"))
+                 'objects)))
+        ;; jolt's registries carry no return or throws signature; Object and empty
+        ;; are the honest answers, and they are what the JVM reports for an
+        ;; Object-returning method with no checked exceptions anyway.
+        (cons "getReturnType" (lambda (self) (jolt-class-for "java.lang.Object")))
+        (cons "getExceptionTypes" (lambda (self) (make-jolt-array (vector) 'objects)))
+        (cons "getModifiers" (lambda (self) (->num 1)))
+        ;; Method.invoke(obj, Object... args) — from Clojure the varargs arrive as
+        ;; one array, so a lone trailing array IS the argument list and gets
+        ;; splatted. Anything else is passed straight through, which is what a
+        ;; caller spelling the arguments out means.
+        (cons "invoke"
+              (lambda (self target . args)
+                (let ((as (if (and (= 1 (length args)) (jolt-array? (car args)))
+                              (vector->list (jolt-array-vec (car args)))
+                              args)))
+                  (apply (reflect-method-fn self) target as))))
+        (cons "toString"
+              (lambda (self)
+                (string-append (reflect-method-cls self) "." (reflect-method-name self))))))
+;; The type's registered methods as a Method[]. type-registry is
+;; tag -> (proto -> (method-name -> fn)); a name declared by two protocols
+;; surfaces once per declaration, as it does on the JVM for two interfaces.
+(define (class-method-array cls)
+  (let* ((nm (jclass-name cls))
+         (ti (or (hashtable-ref type-registry nm #f)
+                 (hashtable-ref type-registry (jch-fqn-of-simple nm) #f)))
+         (acc '()))
+    (when ti
+      (let-values (((protos impls) (hashtable-entries ti)))
+        (vector-for-each
+         (lambda (proto pi)
+           (let-values (((names fns) (hashtable-entries pi)))
+             (vector-for-each
+              (lambda (n f) (set! acc (cons (make-jhost "reflect-method" (vector nm n f)) acc)))
+              names fns)))
+         protos impls)))
+    (make-jolt-array (list->vector (reverse acc)) 'objects)))
