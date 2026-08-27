@@ -120,6 +120,16 @@
           ((char=? (string-ref s i) #\$) (substring s (+ i 1) (string-length s)))
           (else (loop (- i 1))))))
 
+;; The name a NAMESPACE maps a class under — the part after the last dot, $ and
+;; all: the JVM imports java.util.Map$Entry as Map$Entry, not as Entry. Distinct
+;; from jch-last-segment above, which goes on past the $ because its job is the
+;; alternative SPELLING a protocol extension may use for a tag.
+(define (jch-import-name s)
+  (let loop ((i (- (string-length s) 1)))
+    (cond ((< i 0) s)
+          ((char=? (string-ref s i) #\.) (substring s (+ i 1) (string-length s)))
+          (else (loop (- i 1))))))
+
 ;; The protocol-dispatch / instance? tag list for a value of class NAME: the class
 ;; and its whole ancestry, each in BOTH canonical and simple spelling (extend-protocol
 ;; and instance? accept either "Associative" or "clojure.lang.Associative"), plus
@@ -586,6 +596,76 @@
 (jch-register-supers! "java.util.Hashtable" '("java.util.Map"))
 (jch-register-supers! "java.util.Properties" '("java.util.Hashtable"))
 (jch-register-supers! "java.util.HashSet" '("java.util.Set"))
+;; --- the java.lang auto-imports ---------------------------------------------
+;; clojure.core maps 96 class names into every namespace, so on the JVM every one
+;; of them resolves, always. 38 had no row here, which meant no class token, which
+;; meant (resolve 'ExceptionInInitializerError) answered nil where the JVM answers
+;; the class (jolt-9my7). A row is what backs the name: it mints the clojure.core
+;; token (class-token-alist, host-class.ss) so the bare symbol evaluates to the
+;; class, which is the half resolve's answer promises — the instance? macro reads
+;; a class from resolve as "this symbol evaluates to that class" and emits it
+;; unquoted.
+;;
+;; A row is the class's NAME and ancestry, not an implementation: (StringBuffer.
+;; "a") still has no constructor here, exactly as before. That is safe in a way it
+;; would not be for an arbitrary class — resolve is how tooling feature-DETECTS a
+;; class, and these 96 are present on every JVM, so no program can be using one as
+;; a capability test.
+;;
+;; Direct supers are the JVM's wherever jolt models the parent. Where it does not
+;; — StringBuffer's package-private AbstractStringBuilder, Package's NamedPackage,
+;; RuntimePermission's java.security.BasicPermission — the row roots at Object and
+;; keeps the interfaces jolt does model, so .getSuperclass is the one thing that
+;; differs. Process's java.io.Closeable is left off deliberately: it is JDK-version
+;; dependent, and claiming it would let with-open take a Process.
+(jch-register-supers! "java.lang.ArrayStoreException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.EnumConstantNotPresentException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.IllegalMonitorStateException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.NegativeArraySizeException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.SecurityException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.TypeNotPresentException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.IllegalThreadStateException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.lang.InstantiationException" '("java.lang.ReflectiveOperationException"))
+(jch-register-supers! "java.lang.ClassFormatError" '("java.lang.LinkageError"))
+(jch-register-supers! "java.lang.ExceptionInInitializerError" '("java.lang.LinkageError"))
+(jch-register-supers! "java.lang.VerifyError" '("java.lang.LinkageError"))
+(jch-register-supers! "java.lang.UnsupportedClassVersionError" '("java.lang.ClassFormatError"))
+(jch-register-supers! "java.lang.InstantiationError" '("java.lang.IncompatibleClassChangeError"))
+(jch-register-supers! "java.lang.NoSuchFieldError" '("java.lang.IncompatibleClassChangeError"))
+(jch-register-supers! "java.lang.NoSuchMethodError" '("java.lang.IncompatibleClassChangeError"))
+(jch-register-supers! "java.lang.UnknownError" '("java.lang.VirtualMachineError"))
+(jch-register-supers! "java.lang.ClassLoader" '())
+(jch-register-supers! "java.lang.Enum" '("java.lang.Comparable"))
+(jch-register-supers! "java.lang.Package" '())
+(jch-register-supers! "java.lang.Process" '())
+(jch-register-supers! "java.lang.ProcessBuilder" '())
+(jch-register-supers! "java.lang.Runtime" '())
+(jch-register-supers! "java.lang.RuntimePermission" '())
+(jch-register-supers! "java.lang.SecurityManager" '())
+(jch-register-supers! "java.lang.StackTraceElement" '())
+(jch-register-supers! "java.lang.StrictMath" '())
+(jch-register-supers! "java.lang.StringBuffer" '("java.lang.CharSequence" "java.lang.Appendable" "java.lang.Comparable"))
+(jch-register-supers! "java.lang.ThreadLocal" '())
+(jch-register-supers! "java.lang.InheritableThreadLocal" '("java.lang.ThreadLocal"))
+(jch-register-supers! "java.lang.ThreadGroup" '("java.lang.Thread$UncaughtExceptionHandler"))
+(jch-register-supers! "java.lang.Thread$State" '("java.lang.Enum"))
+(jch-register-supers! "java.lang.Void" '())
+(jch-register-supers! "clojure.lang.Compiler" '())
+;; interfaces, including the three annotations — an annotation type IS an
+;; interface on the JVM, and extends java.lang.annotation.Annotation.
+(jch-register-supers! "java.lang.Cloneable" '())
+(jch-mark-interface! "java.lang.Cloneable")
+(jch-register-supers! "java.lang.Thread$UncaughtExceptionHandler" '())
+(jch-mark-interface! "java.lang.Thread$UncaughtExceptionHandler")
+(jch-register-supers! "java.lang.annotation.Annotation" '())
+(jch-mark-interface! "java.lang.annotation.Annotation")
+(jch-register-supers! "java.lang.Deprecated" '("java.lang.annotation.Annotation"))
+(jch-mark-interface! "java.lang.Deprecated")
+(jch-register-supers! "java.lang.Override" '("java.lang.annotation.Annotation"))
+(jch-mark-interface! "java.lang.Override")
+(jch-register-supers! "java.lang.SuppressWarnings" '("java.lang.annotation.Annotation"))
+(jch-mark-interface! "java.lang.SuppressWarnings")
+
 ;; base interfaces used as super targets — need keys for simple-name resolution
 (jch-register-supers! "java.lang.Number" '())
 (jch-register-supers! "java.lang.Iterable" '())

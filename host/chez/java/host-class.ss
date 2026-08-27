@@ -197,12 +197,20 @@
 ;; bare class-name tokens -> canonical JVM class-name strings, derived from the
 ;; modeled class graph (jvm-class-parents) so this list stays current with any
 ;; additions to class-hierarchy.ss.
+;;
+;; Keyed by the name a namespace would MAP the class under — the part after the
+;; last dot, $ and all (java.util.Map$Entry -> Map$Entry, java.lang.Thread$State
+;; -> Thread$State), which is what the JVM imports. jch-last-segment goes on past
+;; the $ because its job is the alternative spelling a protocol extension may use;
+;; taking that as an import name minted a clojure.core/Entry and a
+;; clojure.core/Seq the JVM has no mapping for, and left the two nested auto-
+;; imports with no token at all.
 (define class-token-alist
   (let-values (((keys vals) (hashtable-entries jvm-class-parents)))
     (let ((result '()) (seen (make-hashtable string-hash string=?)))
       (vector-for-each
         (lambda (k _)
-          (let ((s (jch-last-segment k)))
+          (let ((s (jch-import-name k)))
             (when (not (hashtable-ref seen s #f))
               (hashtable-set! seen s #t)
               (set! result (cons (cons s k) result)))))
