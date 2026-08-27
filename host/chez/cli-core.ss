@@ -209,8 +209,15 @@
                                a))
                          (cdr items)))))
           form))
+    ;; clojure.main wraps every entry — repl, -e, -m — in with-bindings, so a
+    ;; top-level (set! *warn-on-reflection* true) has a thread-local slot to
+    ;; write. jolt's REPL already binds them; -e (and the `-` stdin script, which
+    ;; comes through here too) bound only *command-line-args*, so the same
+    ;; expression that works from a file or the REPL raised "Can't
+    ;; change/establish root binding" here.
     (jolt-push-thread-bindings
       (jolt-hash-map (jolt-var "clojure.core" "*command-line-args*") cla))
+    (jolt-ns-load-vars-push!)
     (let ((result (let loop ((i 0) (result jolt-nil))
                     (if (>= i end)
                         result
@@ -228,6 +235,7 @@
                                             (maybe-quote-require-args form)
                                             (chez-current-ns))))
                               result))))))
+      (jolt-ns-load-vars-pop!)
       (jolt-pop-thread-bindings)
       (let ((s (jolt-repl-str result)))
         (when (and print? (not (string=? s "")))

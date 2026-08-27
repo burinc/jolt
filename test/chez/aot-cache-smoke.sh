@@ -607,6 +607,50 @@ else
 fi
 rm -rf "$cache_u"
 
+# --- (v) a namespace that sets a compiler flag still hits its cache -----------
+# (set! *warn-on-reflection* true) at a namespace's top level is the standard
+# idiom in ported Clojure libraries. A source load binds that var to a
+# thread-local slot for the duration of the file; loading the cached .so has to
+# bind it too, or the set! hits the root, raises, and the loader reads the raise
+# as a broken artifact — deleting and recompiling the SAME .so on every run, so
+# the cache never once takes.
+v="$tmp/v"; mkdir -p "$v/src/vlib"
+cat > "$v/src/vlib/core.clj" <<'CLJ'
+(ns vlib.core)
+(set! *warn-on-reflection* true)
+(defn answer [] 42)
+CLJ
+# ...and the frame has to be the NAMESPACE's own. Every entry point binds these
+# vars now, so a .so whose set! writes the CALLER's binding loads and hits fine
+# — it just escapes into the requiring code. :leak is what fails if the loader
+# stops establishing a frame per compiled load.
+# Top-level forms on purpose: -e compiles form by form, so vlib.core/answer
+# resolves only because the require evaluated in an earlier form. The || true
+# matters under set -e — a raising jolt otherwise kills the whole script before
+# the FAIL branch can say which case died.
+vrun() {
+  JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_v" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'vlib/vlib {:local/root \"$v\"}}})
+    (def b0 *warn-on-reflection*)
+    (require 'vlib.core)
+    (println :leak (not= b0 *warn-on-reflection*))
+    (println (vlib.core/answer))" 2>&1
+}
+cache_v="$(mktemp -d)"
+v_cold="$(vrun || true)"
+v_warm="$(vrun || true)"
+if echo "$v_cold" | grep -q '^42$' \
+   && echo "$v_warm" | grep -q '^42$' \
+   && echo "$v_warm" | grep -q 'hit vlib.core' \
+   && ! echo "$v_warm" | grep -q 'corrupt cache for vlib.core' \
+   && echo "$v_cold" | grep -q ':leak false' \
+   && echo "$v_warm" | grep -q ':leak false'; then
+  echo "PASS: (v) compiler-flag set! namespace hits its cache, set! stays in its own load"; pass=$((pass+1))
+else
+  echo "FAIL: (v) warm run: hit=$(echo "$v_warm" | grep -c 'hit vlib.core') corrupt=$(echo "$v_warm" | grep -c 'corrupt cache for vlib.core') out=$(echo "$v_warm" | grep -c '^42$') cold-leak=$(echo "$v_cold" | grep -c ':leak false') warm-leak=$(echo "$v_warm" | grep -c ':leak false')"; fails=$((fails+1))
+fi
+rm -rf "$cache_v"
+
 # Phase 4 (cold-vs-warm speedup) lives in aot-cache-perf.sh — a timing
 # measurement doesn't belong in this deterministic correctness gate.
 

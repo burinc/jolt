@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Loading a namespace from compiled code did not bind the compiler-flag vars,
+  so every namespace with `(set! *warn-on-reflection* true)` at its top level
+  recompiled from source on every load.** The set! wrote the root binding and
+  raised; each caller read that raise as a broken artifact and quietly rebuilt.
+  A cached `.so` was deleted and recompiled on every run without ever being
+  served, and the embedded fasls for `babashka.fs` and `babashka.process` — both
+  of which use the idiom — had never once been used. `RT.load` brackets a
+  compiled class's init with those vars just as `Compiler.load` brackets a
+  source load, and `jolt build` already did it for the namespaces it AOTs into a
+  binary; the loader's own three compiled paths were the ones left out.
+
+  It only looked fine because an enclosing file load leaves the same frame up,
+  so a `require` from a script worked and the same `require` from `-e`, a REPL,
+  or an nREPL eval did not. `jolt -e "(require 'babashka.process)"` was 0.68s
+  and is 0.14s; a `bb.edn` task calling `(shell …)` was 0.69s and is 0.15s.
+  The idiom is common in ported libraries — 25 of the conformance-suite
+  libraries use it, rewrite-clj and next-jdbc in dozens of namespaces each — and
+  none of them could hit their cache.
+
+  Two members of the same family, fixed alongside: `jolt -e` (and the `-` stdin
+  script) now binds the compiler-flag vars the way `clojure.main` wraps every
+  entry point, so a top-level `(set! *warn-on-reflection* true)` works under
+  `-e` instead of raising; and `load-string` listed two of the three vars by
+  hand, so a `(set! *unchecked-math* true)` inside one escaped into the caller
+  and changed what its later arithmetic compiled to. All the sites now share
+  one definition of the frame.
+
 - **A failing `:tasks` shell command exited 0.** `jolt <task>` for a string task
   called the shell and dropped its status on the floor, so a task that failed
   reported success and a CI step built on one could not fail. It now exits with
