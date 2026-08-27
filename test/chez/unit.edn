@@ -17,6 +17,30 @@
   {:suite "uuid" :expr "(every? (fn [_] (re-matches #\"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\" (str (random-uuid)))) (range 200))" :expected "true"}
   {:suite "uuid" :expr "(let [us (repeatedly 400 #(str (random-uuid)))] (every? #(> (count (distinct (map (fn [u] (nth u %)) us))) 8) [0 1 2 7 9 35]))" :expected "true"}
   {:suite "uuid" :expr "(= (str (random-uuid)) (str (random-uuid)))" :expected "false"}
+  ;; The reflection member model: jolt reports what its registries KNOW a class
+  ;; declares, not what the JVM ships. A host class whose methods are a `cond`
+  ;; (String's live in natives-str.ss) has nothing to enumerate, so the honest
+  ;; answer is empty rather than a guess. jolt-only — the JVM answers differently
+  ;; by construction, so these cannot be corpus rows.
+  {:suite "reflect-member-model" :expr "(count (.getMethods String))" :expected "0"}
+  {:suite "reflect-member-model" :expr "(count (.getDeclaredFields String))" :expected "0"}
+  {:suite "reflect-member-model" :expr "(do (defprotocol PA (pa [this])) (defprotocol PB (pb [this])) (deftype TT [] PA (pa [_] 1) PB (pb [_] 2)) (count (.getMethods TT)))" :expected "2"}
+  {:suite "reflect-member-model" :expr "(do (defrecord RR [a b]) (mapv (fn [f] (.getName f)) (.getDeclaredFields RR)))" :expected "[\"a\" \"b\"]"}
+  {:suite "reflect-member-model" :expr "(do (defrecord RS [a]) (.getName (.getDeclaredField RS \"a\")))" :expected "\"a\""}
+  {:suite "reflect-member-model" :expr "(do (defrecord RT [a]) (= (.getName (.getField RT \"a\")) (.getName (.getDeclaredField RT \"a\"))))" :expected "true"}
+  ;; the class graph answers modifiers for a name it models; one it does not
+  ;; reports PUBLIC alone rather than claiming non-finality it cannot know
+  {:suite "reflect-member-model" :expr "(.getModifiers (Class/forName \"java.lang.Thread\"))" :expected "1"}
+  ;; clojure.reflect over the same registries: the reference JavaReflector is a
+  ;; thin layer on getDeclaredFields/Methods/Constructors + getModifiers + bases,
+  ;; so the port is the reference apart from the member-set model above.
+  {:suite "clojure-reflect" :expr "(do (require 'clojure.reflect) (defrecord Rr1 [a b]) (sort (map (comp str :name) (filter :type (:members (clojure.reflect/reflect Rr1))))))" :expected "(\"a\" \"b\")"}
+  {:suite "clojure-reflect" :expr "(do (require 'clojure.reflect) (= #{:public :final} (:flags (clojure.reflect/type-reflect 'java.lang.String))))" :expected "true"}
+  {:suite "clojure-reflect" :expr "(do (require 'clojure.reflect) (= #{:public :interface :abstract} (:flags (clojure.reflect/type-reflect 'java.util.List))))" :expected "true"}
+  {:suite "clojure-reflect" :expr "(do (require 'clojure.reflect) (contains? (:bases (clojure.reflect/type-reflect 'java.lang.Integer)) 'java.lang.Number))" :expected "true"}
+  {:suite "clojure-reflect" :expr "(do (require 'clojure.reflect) (defprotocol Prf (prf [this])) (deftype Trf [] Prf (prf [_] 1)) (contains? (set (map (comp str :name) (:members (clojure.reflect/reflect Trf)))) \"prf\"))" :expected "true"}
+  {:suite "clojure-reflect" :expr "(do (require 'clojure.reflect) (defrecord Rr2 [a]) (= (clojure.reflect/reflect Rr2) (clojure.reflect/reflect (->Rr2 1))))" :expected "true"}
+  {:suite "clojure-reflect" :expr "(do (require 'clojure.reflect) (map? (clojure.reflect/type-reflect 'java.lang.String :ancestors true)))" :expected "true"}
   {:suite "assert-args" :expr "(:private (meta #'clojure.core/assert-args))" :expected "true"}
   {:suite "assert-args" :expr "(:macro (meta #'clojure.core/assert-args))" :expected "true"}
   {:suite "assert-args" :expr "(seq? (@#'clojure.core/assert-args true \"x\"))" :expected "true"}

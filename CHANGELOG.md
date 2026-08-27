@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`bases` on a deftype/defrecord type token walked the constructor procedure,
+  not the class.** `(bases Rec)` answered `clojure.lang.AFunction` where
+  `(bases (class inst))` gave the record's real interfaces. `supers` and
+  `ancestors` already routed both spellings through one question; `bases` was
+  the one that did not.
+
+- **A type token and `(class inst)` were not `=`.** They are the same Class
+  object on the JVM, so `(= Rec (class (->Rec 1)))` should be true and the two
+  spellings should be one key in a map. Both now hold: the token's identity hash
+  is seeded from its class name where it is registered, so `=` and `hash` agree
+  without taxing the procedure-hash fast path.
+
+- **`Class.getDeclaredField` could never find a record's field.** It matched the
+  name against `(str :x)` — `":x"` — while `getDeclaredFields`' `getName`
+  reported `"x"`, so a lookup by the name jolt had just handed you raised
+  `NoSuchFieldException`. Both spellings go through one helper now.
+
+- **Six interfaces were modeled as concrete classes.** `java.util.Queue`,
+  `Deque`, `Map$Entry`, `java.nio.file.Path`, `PathMatcher` and `Watchable`
+  answered `false` to `.isInterface` and named a superclass where the JVM
+  returns null — `Map$Entry` reported `clojure.lang.AFunction`. Found by probing
+  the reference JVM for every `java.*` name the class graph models rather than
+  by eye.
+
 - **The dev boot cache broke every project-aware `-e`.** `make devboot` emits
   jolt.main AOT'd into `target/dev/flat.so` without loading `cli-core.ss` into
   the build image first, so `jolt.host/run-expr-string` wasn't a var at
@@ -75,6 +99,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `java.nio.file` spellings cannot drift apart.
 
 ### Added
+
+- **Class reflection: `getModifiers`, `java.lang.reflect.Modifier`, and the
+  method/field surface.** `Class.getModifiers` derives the JVM bitmask from the
+  class graph (jolt has no bytecode to read one out of), with the final,
+  abstract and enum marks taken from a probe of the reference JVM for every
+  `java.*` class the graph models. `Modifier` ships its constants, its
+  predicates and `toString`. `getMethods`/`getDeclaredMethods` return real named
+  `Method` objects — `getName`, `getDeclaringClass`, `getParameterCount`,
+  `invoke` — and `getFields`/`getField` join the declared pair. A type token
+  answers every `java.lang.Class` method by delegating to the same table
+  `(class inst)` uses, rather than the four names that were listed by hand.
+
+  The member sets are what jolt's registries know a class declares — a
+  deftype/defrecord's fields, and every method registered against the type by
+  whichever protocol declares it. A host class jolt models by other means
+  (String's methods are a `cond`, not data) reports none rather than guessing at
+  the JVM's set. `:bases` and `:flags` are faithful.
+
+- **`clojure.reflect`**, ported from the reference: the `Reflector` and
+  `TypeReference` protocols, `flag-descriptors`, the `Constructor`/`Method`/
+  `Field` records, `type-reflect` (`:ancestors` included) and `reflect`. The
+  reference `JavaReflector` is a thin layer over the Class methods above, so the
+  port is the reference apart from the member-set model. There is no
+  `AsmReflector` — it reads `.class` bytes, which jolt has none of.
 
 - **`clojure.core/assert-args`**, the reference implementation verbatim.
   Private on the JVM, but macro-heavy libraries reach it as

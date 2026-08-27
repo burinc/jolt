@@ -246,6 +246,10 @@
 (define chez-deftype-ctor-tag-mu (make-mutex))
 (define (deftype-ctor-tag p) (hashtable-ref (unbox chez-deftype-ctor-tag-box) p #f))
 (define (deftype-ctor-tag-set! ctor tag)
+  ;; The token is = to its Class (host-static-classes.ss), so pin its identity
+  ;; hash to the class NAME's hash before anything can ask — =/hash have to agree
+  ;; or a map keyed by one spelling answers nil for the other.
+  (jolt-identity-hasheq-seed! ctor (jolt-hash tag))
   (jolt-with-mutex chez-deftype-ctor-tag-mu
     (let ((t (hashtable-copy (unbox chez-deftype-ctor-tag-box) #t)))  ; copy is weak too
       (hashtable-set! t ctor tag)
@@ -319,10 +323,18 @@
 (define chez-record-dbl-tbl (make-hashtable string-hash string=?))
 (define (chez-double-tag? t) (and (string? t) (string=? t "double")))
 
+;; type-tag "ns.Name" -> the declared field keywords, in order. The shapes table
+;; above is keyed by ctor-key, which the reflection surface does not have: it is
+;; handed a class and has to answer what that class declares.
+(define chez-record-fields-tbl (make-hashtable string-hash string=?))
+(define (chez-record-field-kws type-tag)
+  (or (hashtable-ref chez-record-fields-tbl type-tag #f) '()))
+
 (define (register-record-shape! ctor-key field-kws field-tags type-tag)
   (jolt-with-mutex rec-tbl-mu
     (hashtable-set! chez-record-shapes-tbl ctor-key
                     (vector field-kws field-tags type-tag))
+    (hashtable-set! chez-record-fields-tbl type-tag field-kws)
     (hashtable-set! chez-record-dbl-tbl type-tag
                     (list->vector (map chez-double-tag? field-tags)))))
 

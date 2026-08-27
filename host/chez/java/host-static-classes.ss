@@ -1716,6 +1716,20 @@
 (register-eq-arm! (lambda (a b) (and (jclass? a) (jclass? b)))
                   (lambda (a b) (let ((ka (class-key a)) (kb (class-key b)))
                                   (and ka kb (string=? ka kb) #t))))
+;; A deftype/defrecord TYPE TOKEN and (class inst) are the same Class object on
+;; the JVM — identical?, not merely =. jolt spells them differently (the token is
+;; the ctor procedure, so it stays callable) and they compared unequal, so
+;; (= Rec (class (->Rec 1))) was false and the two spellings were distinct keys in
+;; the same map. =/hash stay in step: the token's identity hash is seeded from its
+;; class name at registration (records.ss deftype-ctor-tag-set!), which costs the
+;; procedure-hash fast path nothing. Half of this pair alone would be worse than
+;; neither — that is the shape that makes a hash container answer nil for a key it
+;; contains.
+(register-eq-arm! (lambda (a b)
+                    (or (and (jclass? a) (procedure? b) (deftype-ctor-tag b) #t)
+                        (and (jclass? b) (procedure? a) (deftype-ctor-tag a) #t)))
+                  (lambda (a b) (let ((ka (class-key a)) (kb (class-key b)))
+                                  (and ka kb (string=? ka kb) #t))))
 (register-hash-arm! jclass? (lambda (x) (jolt-hash (jclass-name x))))
 (register-str-render! jclass? (lambda (x) (string-append "class " (jclass-name x))))
 (register-pr-arm! jclass? (lambda (x) (jclass-name x)))
@@ -1775,7 +1789,45 @@
                                      (if (and ka kb (jch-isa? kb ka)) #t #f))))
         (cons "getConstructors" (lambda (self) (class-constructors self)))
         (cons "getDeclaredConstructors" (lambda (self) (class-constructors self)))
+        ;; getModifiers: the JVM bitmask, derived from the class graph (jolt has
+        ;; no bytecode to read one out of). Modifier's predicates read it.
+        (cons "getModifiers" (lambda (self) (->num (jch-modifiers (jclass-name self)))))
         (cons "getClass" (lambda (self) (make-class-obj "java.lang.Class")))))
+
+;; ---- java.lang.reflect.Modifier ---------------------------------------------
+;; The bit constants and their predicates, the JVM's values, over whatever int a
+;; caller has — Class.getModifiers here, and a member's modifiers read the same.
+(define (mod-bit? m bit) (if (fx=? 0 (fxand (jnum->exact m) bit)) #f #t))
+(register-class-statics! "java.lang.reflect.Modifier"
+  (list (cons "PUBLIC" (->num 1)) (cons "PRIVATE" (->num 2)) (cons "PROTECTED" (->num 4))
+        (cons "STATIC" (->num 8)) (cons "FINAL" (->num 16)) (cons "SYNCHRONIZED" (->num 32))
+        (cons "VOLATILE" (->num 64)) (cons "TRANSIENT" (->num 128)) (cons "NATIVE" (->num 256))
+        (cons "INTERFACE" (->num 512)) (cons "ABSTRACT" (->num 1024)) (cons "STRICT" (->num 2048))
+        (cons "isPublic" (lambda (m) (mod-bit? m 1)))
+        (cons "isPrivate" (lambda (m) (mod-bit? m 2)))
+        (cons "isProtected" (lambda (m) (mod-bit? m 4)))
+        (cons "isStatic" (lambda (m) (mod-bit? m 8)))
+        (cons "isFinal" (lambda (m) (mod-bit? m 16)))
+        (cons "isSynchronized" (lambda (m) (mod-bit? m 32)))
+        (cons "isVolatile" (lambda (m) (mod-bit? m 64)))
+        (cons "isTransient" (lambda (m) (mod-bit? m 128)))
+        (cons "isNative" (lambda (m) (mod-bit? m 256)))
+        (cons "isInterface" (lambda (m) (mod-bit? m 512)))
+        (cons "isAbstract" (lambda (m) (mod-bit? m 1024)))
+        (cons "isStrict" (lambda (m) (mod-bit? m 2048)))
+        ;; Modifier.toString lists the set bits in the JLS's canonical order.
+        (cons "toString"
+              (lambda (m)
+                (let loop ((ps (list (cons 1 "public") (cons 4 "protected") (cons 2 "private")
+                                     (cons 1024 "abstract") (cons 8 "static") (cons 16 "final")
+                                     (cons 32 "synchronized") (cons 256 "native") (cons 2048 "strictfp")
+                                     (cons 128 "transient") (cons 64 "volatile") (cons 512 "interface")))
+                           (acc '()))
+                  (if (null? ps)
+                      (let ((names (reverse acc)))
+                        (if (null? names) ""
+                            (fold-left (lambda (a b) (string-append a " " b)) (car names) (cdr names))))
+                      (loop (cdr ps) (if (mod-bit? m (caar ps)) (cons (cdar ps) acc) acc))))))))
 
 ;; ---- constructors as values -------------------------------------------------
 ;; Enough of java.lang.reflect.Constructor to pick a constructor by arity and call
@@ -1814,6 +1866,12 @@
                 (apply jolt-vector
                        (make-list (vector-ref (jhost-state self) 1) (jolt-class-for "java.lang.Object")))))
         (cons "getDeclaringClass" (lambda (self) (vector-ref (jhost-state self) 0)))
+        ;; Constructor.getName is the DECLARING CLASS's fully qualified name on
+        ;; the JVM, not a member name of its own.
+        (cons "getName" (lambda (self) (jclass-name (vector-ref (jhost-state self) 0))))
+        (cons "getModifiers" (lambda (self) (->num 1)))
+        (cons "getExceptionTypes" (lambda (self) (make-jolt-array (vector) 'objects)))
+        (cons "setAccessible" (lambda (self v) jolt-nil))
         (cons "newInstance" (lambda (self . args) (apply reflect-construct (vector-ref (jhost-state self) 0) args)))
         (cons "toString" (lambda (self) (jclass-name (vector-ref (jhost-state self) 0))))))
 
@@ -1835,6 +1893,17 @@
               (lambda (target method args)
                 (record-method-dispatch target (jolt-str-render-one method)
                                         (list->cseq (reflect-args args)))))))
+;; A deftype/defrecord type token answers every java.lang.Class method, through
+;; the SAME table (class inst) uses — records-dispatch.ss owns the token arm and
+;; loads before this file, so it calls back through here. Returns a one-element
+;; list holding the result (so a nil/#f answer is still a hit) or #f for "no such
+;; method", which is what lets that arm fall through to its own error.
+(set-rd-class-method-hook!
+  (lambda (tag method-name args)
+    (let* ((h (hashtable-ref host-methods-tbl "class" #f))
+           (f (and h (hashtable-ref h method-name #f))))
+      (and f (list (apply f (jolt-class-for tag) args))))))
+
 ;; (class x) on a jclass value returns java.lang.Class, so (instance? Class
 ;; (class y)) and class-based dispatch see the correct JVM class.
 (register-class-arm! jclass? (lambda (x) "java.lang.Class"))
