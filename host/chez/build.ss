@@ -686,7 +686,10 @@
                   ;; defines above already installed every var. Without this the
                   ;; loader sees an unmarked ns and recompiles it from source on the
                   ;; first command that enters jolt.main/-main (run/build/version).
-                  (put-string out (string-append "(ldr-mark-loaded! " (ei-str-lit name) ")\n")))))
+                  (put-string out (string-append "(ldr-mark-loaded! " (ei-str-lit name) ")\n"))
+                  ;; ...and record that this ns is preloaded only because the CLI
+                  ;; image defines it, so an app build does not inherit the claim.
+                  (put-string out (string-append "(ldr-mark-cli-aot! " (ei-str-lit name) ")\n")))))
             ordered))
         (lambda ()
           (set-optimize! #f)
@@ -990,7 +993,9 @@
             (let ((file (find-ns-file name)))
               (when (and file
                          (or (not (ldr-install-file? file))
-                             (not (hashtable-ref bld-boot-loaded name #f))))
+                             (not (hashtable-ref bld-boot-loaded name #f))
+                             ;; preloaded only in the CLI image, not in an app's
+                             (ldr-cli-aot? name)))
                 (dfs (append (bld-ns-class-providers file) (bld-ns-requires file)))
                 (set! order (cons (cons name file) order)))))
           (dfs (cdr ns)))))
