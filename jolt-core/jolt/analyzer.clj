@@ -681,6 +681,14 @@
       (invoke (var-ref "jolt.host" "set-static-field!")
               [(const (:name (resolve-global ctx (nth ti 1))))
                (const (form-sym-name (nth ti 2))) val-node])
+      ;; (set! (. obj -field) val) and (set! (. obj field) val) — the two-part
+      ;; spelling of the instance-field set above; a deftype method writes its
+      ;; mutable fields as (set! (. this -field) v). After the static arm, so a
+      ;; class name in the object position still means a static field.
+      (and (= thead ".") (= 3 (count ti)) (form-sym? (nth ti 2)))
+      (let [mname (form-sym-name (nth ti 2))]
+        {:op :set-field :obj (analyze ctx (nth ti 1) env)
+         :field (if (= \- (first mname)) (subs mname 1) mname) :val val-node})
       (form-sym? target)
       (do (when (local? env (form-sym-name target)) (uncompilable "set! of a local"))
           (let [r (resolve-global ctx target)]

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The dev boot cache broke every project-aware `-e`.** `make devboot` emits
+  jolt.main AOT'd into `target/dev/flat.so` without loading `cli-core.ss` into
+  the build image first, so `jolt.host/run-expr-string` wasn't a var at
+  emission and compiled as a host-static class reference — `jolt -M -e`,
+  `-A`, `-Sdeps`, and `-e` in any directory with a deps.edn all died with
+  "No such var: jolt.host/run-expr-string" whenever bin/jolt took the cache.
+  `build-jolt.ss` has loaded cli-core.ss for exactly this reason all along;
+  make-devboot.ss now does the same.
+
+- **`set!` on the `(. obj field)` / `(. obj -field)` instance spelling
+  compiled.** The analyzer accepted only the `(.field obj)` sugar, but a
+  deftype method conventionally writes its mutable fields as
+  `(set! (. this -field) v)` — typedclojure's `def-type` does. And the deftype
+  macro's mutable-field rewrite treated the member position of a dot form as a
+  value, so `(. this v)` with a mutable field named `v` rewrote its member
+  symbol into a field read and produced an uncompilable form. Both spellings
+  now compile, and the rewrite leaves member positions alone.
+
 - **Loading a namespace from compiled code did not bind the compiler-flag vars,
   so every namespace with `(set! *warn-on-reflection* true)` at its top level
   recompiled from source on every load.** The set! wrote the root binding and
@@ -57,6 +75,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `java.nio.file` spellings cannot drift apart.
 
 ### Added
+
+- **`clojure.core/assert-args`**, the reference implementation verbatim.
+  Private on the JVM, but macro-heavy libraries reach it as
+  `@#'clojure.core/assert-args` — typedclojure consumes it from four
+  namespaces and could not load without it.
+
+- **`clojure.repl/demunge`**, the reference implementation over
+  `clojure.lang.Compiler/demunge`. typedclojure's `gen-datatype*` resolves it
+  lazily via `requiring-resolve`, which returned nil and surfaced later as an
+  opaque cast error.
 
 - **bb.edn tasks (#578).** jolt reads a project's `bb.edn` and runs its `:tasks`
   with babashka's semantics, so a bb.edn written for `bb` runs under `jolt`:
