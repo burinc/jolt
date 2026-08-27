@@ -1095,6 +1095,11 @@
   {:suite "host-interop / class tokens & readers" :label "Class str is class-prefixed" :expected "\"class java.lang.String\"" :actual "(str (class \"\"))" :portability :common}
   {:suite "host-interop / class tokens & readers" :label "Class getName" :expected "\"java.lang.String\"" :actual "(.getName (class \"\"))" :portability :jvm}
   {:suite "host-interop / class tokens & readers" :label "Class getSimpleName" :expected "\"Long\"" :actual "(.getSimpleName (class 5))" :portability :jvm}
+  {:suite "host-interop / class tokens & readers" :label "getSimpleName drops a nested class's enclosing class" :expected "\"Entry\"" :actual "(.getSimpleName java.util.Map$Entry)" :portability :jvm}
+  {:suite "host-interop / class tokens & readers" :label "getSimpleName on a nested enum" :expected "\"State\"" :actual "(.getSimpleName java.lang.Thread$State)" :portability :jvm}
+  {:suite "host-interop / class tokens & readers" :label "getCanonicalName spells nesting with a dot" :expected "\"java.util.Map.Entry\"" :actual "(.getCanonicalName java.util.Map$Entry)" :portability :jvm}
+  {:suite "host-interop / class tokens & readers" :label "getSimpleName keeps a fn class's $" :expected "\"core$inc\"" :actual "(.getSimpleName (class inc))" :portability :jvm}
+  {:suite "host-interop / class tokens & readers" :label "getCanonicalName of a fn class is its name" :expected "\"clojure.core$inc\"" :actual "(.getCanonicalName (class inc))" :portability :jvm}
   {:suite "host-interop / class tokens & readers" :label "Class of equal-typed values is =" :expected "true" :actual "(= (class 5) (class 6))" :portability :common}
   {:suite "host-interop / class tokens & readers" :label "Class in a thrown message" :expected "\"of class java.lang.String\"" :actual "(try (throw (Exception. (str \"of \" (class \"\")))) (catch Exception e (.getMessage e)))" :portability :jvm}
   {:suite "host-interop / class tokens & readers" :label "ctor sugar still constructs" :expected "\"x\"" :actual "(.toString (StringBuilder. \"x\"))" :portability :jvm}
