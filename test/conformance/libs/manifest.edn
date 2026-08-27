@@ -141,9 +141,11 @@
   {:name "tools.reader"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   ;; the 3 fails are the syntax-quote reader-model divergence (a quoted
-   ;; syntax-quote is data on the JVM, a form on jolt); see known-divergences.edn
-   :expect {:tests 50 :pass 884 :fail 3 :error 0}}
+   ;; The 3 fails here were the syntax-quote reader-model divergence — a quoted
+   ;; backtick was data on the JVM and jolt's unlowered marker here. Gone since
+   ;; the analyzer lowers every marker before anything can see the form
+   ;; (jolt-024c).
+   :expect {:tests 50 :pass 887 :fail 0 :error 0}}
 
   {:name "edamame"
    :paths ["src" "resources" "test"]

@@ -34,6 +34,7 @@
                                unchecked-math? allow-unresolved-vars?
                                form-macro? form-expand-1 resolve-global resolvable-names
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
+                               form-syntax-quote-expand
                                record-type? record-ctor-key deftype-ctor-class form-position form-line late-bind?
                                resolve-class-hint host-class-name? jolt-class-for]]))
 
@@ -1551,10 +1552,18 @@
    ;; inside, which is what the single shared atom used to give it on one thread.
    (binding [*positioned-form-box* (or *positioned-form-box* (atom nil))]
      (try
+       ;; ` is a reader macro in Clojure, so a form is already past its backticks
+       ;; by the time anything looks at it. jolt reads one to a marker and lowers
+       ;; it here — up front, over the whole form, so a macro reading its own
+       ;; argument forms and a quoted form see the expansion and not the marker.
+       ;; Costs nothing on a form that has no backtick in it: the walk returns it
+       ;; unchanged and unallocated (jolt-024c).
+       ;;
        ;; Stamp the compile namespace on the TOP-LEVEL node so the back end can
        ;; gate anon-fn naming/registration on it even for a non-def form (a def
        ;; carries its own :ns). Invisible to emission unless read.
-       (assoc (analyze ctx form (empty-env)) :fnsrc-ns (compile-ns ctx))
+       (assoc (analyze ctx (form-syntax-quote-expand ctx form) (empty-env))
+              :fnsrc-ns (compile-ns ctx))
        (catch Throwable e (throw (as-analysis-diagnostic e))))))
   ([ctx form env]
    (cond

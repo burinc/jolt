@@ -135,18 +135,25 @@
 (define x-qquote (go-expansion "(go (clojure.core/quote (<! ch)))"))
 (gate-check "qualified quote: datum not evaluated" (gate-sub? x-qquote "__sm-") #f)
 
-;; A BACKTICK is jolt's other quoting special form. jolt's reader leaves it as
-;; (syntax-quote datum) for the analyzer, where the JVM's reader expands it during
-;; read — so it is absent from clojure.core/special-syms, which is where sm-opaque
-;; came from. Missing, the datum fell to sm-cps's :else arm and was rebuilt as an
-;; application: the park inside it became a REAL take and the value came back as a
-;; syntax-quoted gensym. Both spellings, since the reader's is unqualified and a
-;; macro's syntax-quote can qualify it.
+;; A BACKTICK is jolt's other quoting special form. jolt's reader leaves it as a
+;; (syntax-quote datum) marker and the ANALYZER lowers it — up front over the
+;; whole top-level form now (jolt-024c), so `go` never sees the marker: the body
+;; reaches it already lowered to the construction code a backtick becomes, with
+;; the park a QUOTED symbol inside it. What is being gated is the same either way,
+;; and it is why sm-opaque still carries syntax-quote for a marker that reaches
+;; the pass from a macro-built form: the park inside the datum is DATA. It used to
+;; fall to sm-cps's :else arm and be rebuilt as an application — syntax-quote is
+;; absent from clojure.core/special-syms, which is where sm-opaque came from — so
+;; the park became a REAL take and the value came back as a syntax-quoted gensym.
+;; Both spellings, since the reader's marker and a macro-written one lower alike.
 (define x-sq (go-expansion "(go (list `(<! ch) :done))"))
 (gate-check "syntax-quote: datum not evaluated" (gate-sub? x-sq "__sm-take") #f)
-(gate-check "syntax-quote: datum survives whole" (gate-sub? x-sq "(<! ch)") #t)
+(gate-check "syntax-quote: the park stays a quoted symbol"
+            (gate-sub? x-sq "(quote clojure.core.async/<!)") #t)
 (define x-qsq (go-expansion "(go (list (clojure.core/syntax-quote (<! ch)) :done))"))
 (gate-check "qualified syntax-quote: datum not evaluated" (gate-sub? x-qsq "__sm-take") #f)
+(gate-check "qualified syntax-quote: lowers the same way"
+            (gate-sub? x-qsq "(quote clojure.core.async/<!)") #t)
 ;; and the value, on both backends, against a channel that stays UNDRAINED
 (define sq-val
   (ev (string-append
