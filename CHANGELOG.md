@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`resolve` answered a bare class name the namespace never imported.** A class
+  name is a per-namespace mapping on the JVM — the java.lang auto-imports
+  everywhere, an `(:import ...)` in the namespace that asked, a
+  `deftype`/`defrecord` in the namespace that defines it — and `resolve` answers
+  only what the namespace maps. jolt keeps a `clojure.core` class token for every
+  class it models so a bare `Pattern` self-evaluates, and `resolve` was reading
+  those as mappings: `(resolve 'Path)` answered `java.nio.file.Path` in a
+  namespace with no import of it. A macro that guards on `(resolve Name)` before
+  defining a type therefore skipped the definition — typedclojure's
+  `(u/def-object Path ...)` emitted neither the deftype nor the `Path-maker` fn
+  it also emits, and the checker failed to load.
+
+- **`ns-imports` was the same 96 auto-imports for every namespace.** An
+  `(:import ...)` and a `deftype`'s own class are namespace mappings and now
+  show up in it, mapped to classes rather than class-name strings. The other half
+  of that line: a class mapping is an import, never an intern, so `ns-interns`,
+  `ns-publics` and the refers built from `clojure.core`'s publics no longer
+  report one — which is what made `(ns-map 'user)` answer a var for `String`
+  where the JVM answers the class.
+
 - **`compare` ignored a deftype's declared `Comparable`.** `(.compareTo a b)`
   reached the type's own method, but `compare` did not, so it raised "cannot be
   compared to" for values that carry an ordering — and `sort`, `sorted-set` and
