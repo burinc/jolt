@@ -776,6 +776,12 @@
    ;; Iterable, so allowlisting it as a plain divergence fails one of the two.
    {:suite "seq / lazy over infinite", :label "eduction reduces", :category :permissive, :flaky true}
 
+   ;; Same expression, same unspecified dispatch, reached from the other side:
+   ;; this row asserts the Iterable outcome ("stays on the seq path", :expected
+   ;; "9"), so it fails wherever find-protocol-impl happens to pick IReduceInit.
+   ;; Added in 36105184 without the :flaky its sibling above already carries.
+   {:suite "host-interop / reducible dispatch", :label "2-arity reduce over an eduction stays on the seq path", :category :permissive, :flaky true}
+
    ;; with-open closes anything carrying a :close fn; the JVM demands a member
    ;; named close and raises on a map. line-seq and file-seq are the same shape:
    ;; jolt duck-types the reader and takes a path string, where the JVM insists on
