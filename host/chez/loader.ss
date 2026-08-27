@@ -1059,6 +1059,19 @@
     (else (parameterize ((aot-dep-sink #f) (io-file-read-sink #f)) (load-jolt-file file)))))
 
 ;; Mark a namespace as loaded in both the host hashtable and the *loaded-libs* ref.
+;; Namespaces defined by the CLI's OWN AOT closure (bld-emit-cli-aot bakes
+;; jolt.main, jolt.deps and their on-demand requires into the CLI boot image and
+;; marks each loaded). They really are preloaded in the jolt process — but an app
+;; image written by `jolt build` is a DIFFERENT image and carries none of them,
+;; so the app build must not skip them as "already in the image". Without this,
+;; a ns that is in the CLI closure and neither in the runtime image nor the
+;; stdlib-fasl manifest — jolt.ffi, jolt.mvn-http — has every var it defines
+;; interned but UNBOUND in a built binary, while `jolt run` masks it by
+;; compiling the source at require time.
+(define ldr-cli-aot-ns (make-hashtable string-hash string=?))
+(define (ldr-mark-cli-aot! name) (hashtable-set! ldr-cli-aot-ns name #t))
+(define (ldr-cli-aot? name) (hashtable-ref ldr-cli-aot-ns name #f))
+
 (define (ldr-mark-loaded! name)
   (jolt-with-mutex ldr-tbl-mu (hashtable-set! loaded-ns name #t))
   (ldr-libs-update! (lambda (s) (pset-conj s (jolt-symbol #f name)))))
