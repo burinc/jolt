@@ -14,6 +14,11 @@
              var (host-contract.ss declares them; manifest-check.sh pins that list
              to native-ops).
     :value   Scheme proc for a VALUE-position use ((map + xs)); defaults to :call.
+             REQUIRED when the :call name is a Scheme MACRO rather than a
+             procedure (the arithmetic ops, and the spliced predicates in
+             values.ss): a macro name in value position is a compile error on
+             Gambit and a variable transformer at best on Chez, so these name
+             their <proc>-fn twin here.
     :dbl     flonum fast-path proc (^double contagion) — emit-numeric splices it.
     :lng     fixnum fast-path proc (^long). `/` has none (long/long is a Ratio).
     :bd      BigDecimal fast-path proc.
@@ -69,7 +74,7 @@
           :dbl-contagion? true :num-result? true :num-args? true :pure? true :foldable? true}
    "dec" {:call "jolt-n-dec" :value "jolt-dec" :arity #(= % 1)
           :dbl-contagion? true :num-result? true :num-args? true :pure? true :foldable? true}
-   "not" {:call "jolt-not" :arity #(= % 1) :bool? true :pure? true}
+   "not" {:call "jolt-not" :value "jolt-not-fn" :arity #(= % 1) :bool? true :pure? true}
    "min" {:call "jolt-n-min" :value "jolt-min"
           :dbl "flmin" :lng "jolt-l-min" :bd "jbd-min"
           :num-result? true :num-args? true :pure? true}
@@ -151,12 +156,12 @@
    "pos?"     {:call "jolt-pos?"   :arity #(= % 1) :bool? true :bd "jbd-pos?" :pure? true}
    "neg?"     {:call "jolt-neg?"   :arity #(= % 1) :bool? true :bd "jbd-neg?" :pure? true}
    "zero?"    {:call "jolt-zero?"  :arity #(= % 1) :bool? true :bd "jbd-zero?" :pure? true}
-   "identity" {:call "jolt-identity" :arity #(= % 1)}
-   "nil?"     {:call "jolt-nil?"   :arity #(= % 1) :bool? true :pure? true}
-   "some?"    {:call "jolt-some?"  :arity #(= % 1) :bool? true :pure? true}
+   "identity" {:call "jolt-identity" :value "jolt-identity-fn" :arity #(= % 1)}
+   "nil?"     {:call "jolt-nil?"   :value "jolt-nil?-fn"   :arity #(= % 1) :bool? true :pure? true}
+   "some?"    {:call "jolt-some?"  :value "jolt-some?-fn"  :arity #(= % 1) :bool? true :pure? true}
    ;; the reference inlines identical? (:inline -> Util/identical); a var call
    ;; here cost ~100ns per use in cell-less seed code (true?/false?/boolean?).
-   "identical?" {:call "jolt-identical?" :arity #(= % 2) :bool? true :pure? true}
+   "identical?" {:call "jolt-identical?" :value "jolt-identical?-fn" :arity #(= % 2) :bool? true :pure? true}
    "ex-info"  {:call "jolt-ex-info" :arity #(or (= % 2) (= % 3))}
    ;; bit ops emit a direct call to their helper instead of var-deref + the
    ;; variadic overlay. The helpers coerce through ->int, which rejects a
