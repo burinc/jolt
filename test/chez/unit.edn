@@ -473,6 +473,15 @@
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [f (java.io.File/createTempFile \"joltres\" \".txt\")] (spit f \"hello\") (let [u (java.net.URL. (str \"file:\" (.getAbsolutePath f))) r (and (= \"hello\" (slurp u)) (= \"hello\" (slurp (.openStream u))) (= \"hello\" (slurp (io/reader u))) (= \"hello\" (slurp (io/input-stream u))) (= (.getAbsolutePath f) (str (io/file u))))] (.delete f) r)))" :expected "true"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getPath (.toURL (io/file \"/tmp/x\"))))" :expected "\"/tmp/x\""}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getAbsolutePath (io/file \"/a/b\")))" :expected "\"/a/b\""}
+  ;; Normalizing &form rebuilds the call form, so its reader metadata has to ride
+  ;; along — a macro reading (:line (meta &form)) is how a library reports the
+  ;; position of the call it is expanding. jolt-only: in an eval'd (do ...) the
+  ;; JVM attaches no line meta to the inner form, so the two disagree here for a
+  ;; reason that has nothing to do with the normalization. Loaded from a FILE both
+  ;; answer the same {:line :column}, which is the case that matters.
+  {:suite "macro-form" :expr "(do (defmacro amf-meta [& _] (list 'quote (boolean (:line (meta &form))))) (amf-meta x))" :expected "true"}
+  ;; and the set-form normalization itself still holds through &form
+  {:suite "macro-form" :expr "(do (defmacro amf-set [& _] (list 'quote [(set? (nth &form 1)) (map? (nth &form 1))])) (amf-set #{1 2}))" :expected "[true false]"}
   {:suite "ioreader" :expr "(slurp (StringReader. \"a=1\"))" :expected "\"a=1\""}
   {:suite "ioreader" :expr "(slurp (StringReader. \"b\") :encoding \"UTF-8\")" :expected "\"b\""}
   {:suite "ioreader" :expr "(with-open [r (StringReader. \"a\")] (.read r))" :expected "97"}
