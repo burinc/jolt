@@ -223,6 +223,88 @@
               (re-find #"Unable to resolve classname|Unable to resolve var|Unable to find static field|No such namespace|No such var" m) :unresolved-name)))
         (causes t)))
 
+;; --- the :documented half of known-divergences.edn ---------------------------
+;; :entries names corpus rows, and everything above gates them. :documented is
+;; prose about divergences that are NOT corpus rows, and until now nothing ever
+;; ran it. Prose with no oracle behind it decays silently: of the 33 entries that
+;; could be made checkable, two documented a divergence that no longer existed and
+;; five recorded a JVM or jolt answer no run reproduces — one claiming the JVM
+;; throws on (ex-info "m" nil), which returns {}, and one claiming resolve throws
+;; ClassNotFoundException, which it never does.
+;;
+;; So every :documented entry now declares how it is verified:
+;;   :check {:expr "<expr>" :jvm "<rendered>" :jolt "<rendered>"}
+;;   :check :prose  :why "<reason it cannot be an expression>"
+;; and an entry with neither fails the gate, so a new one cannot arrive unchecked.
+;;
+;; This half evaluates :expr on reference Clojure and requires it to render
+;; exactly :jvm. host/chez/run-documented.ss does the same for :jolt. Both halves
+;; also require :jvm and :jolt to DIFFER — an entry whose sides have converged is
+;; documenting a divergence that no longer exists, and belongs deleted.
+(def registry
+  (if (.exists (java.io.File. allowlist-path))
+    (edn/read-string (slurp allowlist-path))
+    {}))
+(def documented-entries (:documented registry))
+
+;; Render as host/chez/run-documented.ss does: pr-str for a value, "throws
+;; <SimpleName>" for a raise. The name is the ROOT cause's — the Compiler wraps a
+;; macroexpansion-time throw, and jolt has no such wrapper to match.
+(defn render-documented [src]
+  (let [r (eval-safe src)]
+    (case (first r)
+      :ok (pr-str (second r))
+      :timeout "timeout"
+      (str "throws " (.getSimpleName (class (last (causes (second r)))))))))
+
+;; Every :category in use must have a :legend line explaining it. A category is
+;; how a reader decides whether a divergence is deliberate, and one with no legend
+;; entry says nothing — :restrictive was in use with no legend line until this
+;; check went in.
+(defn check-legend []
+  (let [legend (set (keys (:legend registry)))
+        used (into (sorted-set) (map :category (concat (:documented registry)
+                                                       (:entries registry))))]
+    (for [c used :when (not (legend c))]
+      (str "  [:legend] category " c " is used but has no :legend entry"))))
+
+(defn check-documented
+  "Problems with the :documented list, as printable lines. Empty means it holds."
+  []
+  (for [e documented-entries
+        :let [label (or (:behavior e) "<no :behavior>")
+              {:keys [expr jvm jolt]} (when (map? (:check e)) (:check e))]
+        msg (cond
+              (nil? (:check e))
+              ["no :check — add {:expr .. :jvm .. :jolt ..}, or :prose with a :why"]
+
+              (= :prose (:check e))
+              (when-not (string? (:why e))
+                [":check :prose needs a :why saying why it is not machine-checkable"])
+
+              (not (map? (:check e)))
+              [":check must be a map or :prose"]
+
+              (not (every? string? [expr jvm jolt]))
+              [":check needs string :expr, :jvm and :jolt"]
+
+              (= jvm jolt)
+              [(str "STALE — :jvm and :jolt agree (" jvm "), so this is no longer a divergence")]
+
+              :else
+              (let [got (render-documented expr)]
+                (when-not (= got jvm)
+                  [(str "JVM side: want `" jvm "` got `" got "`\n      expr: " expr)])))]
+    (str "  [" label "]\n      " msg)))
+
+(defn record-documented []
+  (doseq [e documented-entries
+          :when (map? (:check e))]
+    (println (format "  :expr %s\n  :jvm %s\n"
+                     (pr-str (:expr (:check e)))
+                     (pr-str (render-documented (:expr (:check e)))))))
+  (System/exit 0))
+
 (defn classify [row]
   (let [{:keys [expected actual]} row
         throws? (= expected :throws)
@@ -338,6 +420,7 @@
   [[[] nil]
    [["c.edn"] "c.edn"]
    [["--self-test"] nil]
+   [["--record-documented"] nil]
    [["--edn" "out.edn"] nil]
    [["--profile" "p.edn"] nil]
    [["c.edn" "--profile" "p.edn"] "c.edn"]
@@ -365,7 +448,12 @@
 
 (defn -main [& _]
   (when (some #{"--self-test"} *command-line-args*) (self-test))
-  (let [corpus (edn/read-string (slurp corpus-path))
+  (when (some #{"--record-documented"} *command-line-args*) (record-documented))
+  (let [;; forced here, not left lazy: these evaluate programs, and a gate should
+        ;; run its checks where it says it does rather than wherever the seq is
+        ;; first realized.
+        documented-problems (vec (concat (check-legend) (check-documented)))
+        corpus (edn/read-string (slurp corpus-path))
         results (mapv (fn [row] (assoc (classify row) :row row)) corpus)
         by (group-by :bucket results)
         n (count results)
@@ -491,6 +579,17 @@
     ;; intentional (classified in the allowlist) or a tracked bug — so a clean run
     ;; means the corpus matches reference Clojure everywhere it claims to, modulo the
     ;; documented jolt-specific deltas.
-    (System/exit (if (or (seq new-divergences) (seq stale-entries) (pos? (cnt :expected-error))) 1 0))))
+    ;; The :documented list is gated too: its entries are prose about divergences
+    ;; that are not corpus rows, so nothing above would notice one going stale.
+    (println (format "\ndocumented-divergence gate (JVM half): %d machine-checked, %d prose"
+                     (count (filter #(map? (:check %)) documented-entries))
+                     (count (filter #(= :prose (:check %)) documented-entries))))
+    (when (seq documented-problems)
+      (println (format "\n%d DOCUMENTED-DIVERGENCE FAILURE(S):" (count documented-problems)))
+      (doseq [m documented-problems] (println m)))
+
+    (System/exit (if (or (seq new-divergences) (seq stale-entries)
+                         (seq documented-problems) (pos? (cnt :expected-error)))
+                   1 0))))
 
 (apply -main *command-line-args*)

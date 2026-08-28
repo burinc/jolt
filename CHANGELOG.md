@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ex-info` with nil data.** `(ex-data (ex-info "m" nil))` answered `nil` where
+  the JVM answers `{}` — `ExceptionInfo`'s constructor rejects a null map, so an
+  ExceptionInfo whose data is nil cannot exist. It flipped a
+  `(when (ex-data e) ...)` branch silently, and `Throwable->map` and `str` were
+  wrong with it. The coercion is in the constructor, which is what the emitter
+  lowers the `ex-info` native op to, so compiled call sites are covered too.
+  Fixes #771.
+
+- **Binding a non-dynamic var reports its real class.** `push-thread-bindings`
+  on a var that is not `^:dynamic`, and `set!` on a var with no thread binding,
+  raised an `ExceptionInfo`; the JVM raises `java.lang.IllegalStateException`
+  with the same message. Both are typed throwables now, so `ex-data` on them is
+  `nil` the way it is on the JVM.
+
+- **`resolve` no longer answers for classes that do not exist.**
+  `(resolve 'fake.pkg.String)` handed back a class token because the class-graph
+  lookup fell back to the last dotted segment, so any `a.b.String` matched
+  `java.lang.String`'s registration. Feature detection — which is what `resolve`
+  on a class name is for — read that as "this class is present" and took the
+  branch. Answers `nil` now, like the JVM.
+
+### Internal
+
+- The `:documented` half of `test/conformance/known-divergences.edn` is gated.
+  Those entries are prose about divergences that are not corpus rows, and
+  nothing ever ran them: an audit found entries claiming the JVM throws on
+  `(ex-info "m" nil)` and on `(resolve 'java.lang.module.ModuleFinder)`, neither
+  of which any JVM run reproduces, and two entries whose divergence had been
+  fixed years apart with no one noticing. Every entry now carries a `:check` —
+  either an expression with its recorded value on each runtime, or `:prose` with
+  a reason it cannot be one. `certify.clj` verifies the JVM side, `make
+  documented` the jolt side, and both reject an entry whose two sides agree.
+
+
 ## [0.7.28] - 2026-08-27
 
 Two things a namespace does constantly — name a class and read a form — were

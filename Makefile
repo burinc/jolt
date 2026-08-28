@@ -123,7 +123,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq \
@@ -311,6 +311,19 @@ corpus:
 # Host-specific unit cases.
 unit:
 	@$(CHEZ) --script host/chez/run-unit.ss
+
+# The jolt half of the known-divergences :documented gate: every entry's :check
+# must render exactly its recorded :jolt value, its :jvm and :jolt must differ,
+# and an entry with no :check fails. certify.clj runs the JVM half against
+# reference Clojure; this half needs no JVM, so it lives in `ci`.
+# `make documented-record` prints what jolt currently answers, for recording a
+# new entry (the JVM side comes from
+# `clojure -M test/conformance/certify.clj --record-documented`).
+documented:
+	@$(CHEZ) --script host/chez/run-documented.ss
+
+documented-record:
+	@$(CHEZ) --script host/chez/run-documented.ss --record
 
 # Real-CLI smoke over bin/jolt.
 # The CLI and build gates spawn a jolt process per case; a prebuilt binary boots

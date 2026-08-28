@@ -2626,8 +2626,12 @@
   ;; A bare name needs no arm here: every one a namespace maps and jolt models is
   ;; a cell — an :import, a deftype, or the clojure.core token the class model
   ;; registers for each auto-import it knows — so jolt-resolve already found it.
+  ;; jch-known-exact?, not jch-known?: the latter falls back to the last dotted
+  ;; segment, so fake.pkg.String answered java.lang.String's registration and
+  ;; resolve handed back a token for a class that exists nowhere — the opposite
+  ;; of the feature-detection answer this is here to give.
   (and (hc-fq-class-name? nm)
-       (or (jch-known? nm) (host-class-registered? nm))
+       (or (jch-known-exact? nm) (host-class-registered? nm))
        (jolt-class-for nm)))
 (define (rsv-through v sym ns)
   (cond ((jolt-nil? v)

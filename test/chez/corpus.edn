@@ -603,6 +603,16 @@
   {:suite "exceptions / ex-info" :label "ex-data on non-ex" :expected "nil" :actual "(ex-data 42)" :portability :common}
   {:suite "exceptions / ex-info" :label "ex-cause on non-ex" :expected "nil" :actual "(ex-cause {:k 1})" :portability :common}
   {:suite "exceptions / ex-info" :label "ex-message of string" :expected "nil" :actual "(ex-message \"hi\")" :portability :common}
+  {:suite "exceptions / ex-info" :label "nil data reads back as {}" :expected "{}" :actual "(ex-data (ex-info \"m\" nil))" :portability :common}
+  {:suite "exceptions / ex-info" :label "nil data is indistinguishable from {}" :expected "true" :actual "(= (ex-data (ex-info \"m\" nil)) (ex-data (ex-info \"m\" {})))" :portability :common}
+  {:suite "exceptions / ex-info" :label "nil data survives a catch as {}" :expected "{}" :actual "(try (throw (ex-info \"m\" nil)) (catch clojure.lang.ExceptionInfo e (ex-data e)))" :portability :common}
+  {:suite "exceptions / ex-info" :label "nil data with a cause still reads {}" :expected "{}" :actual "(ex-data (ex-info \"m\" nil (RuntimeException. \"c\")))" :portability :jvm}
+  {:suite "core / Throwable->map" :label "nil ex-info data maps as {}" :expected "{}" :actual "(:data (Throwable->map (ex-info \"m\" nil)))" :portability :common}
+  {:suite "exceptions / ex-info" :label "str renders the data map even when nil was passed" :expected "\"clojure.lang.ExceptionInfo: m {}\"" :actual "(str (ex-info \"m\" nil))" :portability :jvm}
+  {:suite "exceptions / typed throw" :label "binding a non-dynamic var is an IllegalStateException with no ex-data" :expected "[\"java.lang.IllegalStateException\" nil]" :actual "(do (def ndv 1) (try (push-thread-bindings {(var ndv) 2}) (catch Throwable e [(.getName (class e)) (ex-data e)])))" :portability :jvm}
+  {:suite "host-interop / resolve" :label "a dotted name whose last segment is modeled but whose package is not resolves to nil" :expected "[nil nil nil]" :actual "[(resolve 'fake.pkg.String) (resolve 'no.such.Class) (resolve 'x.y.Object)]" :portability :jvm}
+  {:suite "host-interop / resolve" :label "a fully-qualified modeled class still resolves" :expected "\"java.lang.String\"" :actual "(pr-str (resolve 'java.lang.String))" :portability :jvm}
+  {:suite "host-interop / resolve" :label "a class the host models under an import resolves" :expected "true" :actual "(some? (resolve 'java.io.StringReader))" :portability :jvm}
   {:suite "forms / case" :label "bool" :expected ":yes" :actual "(case true true :yes false :no :default)" :portability :common}
   {:suite "forms / case" :label "keyword match" :expected ":b" :actual "(case :a :x :wrong :a :b :default)" :portability :common}
   {:suite "forms / case" :label "number match" :expected ":two" :actual "(case 2 1 :one 2 :two :default)" :portability :common}

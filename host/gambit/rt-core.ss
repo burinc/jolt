@@ -355,10 +355,22 @@
 ;; /associative?/counted? are naturally false). Arity 2 (msg data) or 3 (msg data cause).
 ;; No :jolt/class field on plain ex-info — class defaults to clojure.lang.ExceptionInfo
 ;; via ex-info-class in records-interop.ss.
+;;
+;; nil data reads back as {}, not nil: ExceptionInfo's constructor rejects a null
+;; map, so an ExceptionInfo whose data is nil cannot exist and (ex-data (ex-info
+;; "m" nil)) is {}. Coercing HERE covers every caller — the emitter lowers the
+;; ex-info native op to a direct call to this procedure, so a wrapper around the
+;; clojure.core/ex-info var root would miss every compiled call site. It is also
+;; what makes (some? (ex-data e)) a sound "is this an ExceptionInfo" test, which
+;; is how the analyzer's throw-message tells one from a host throwable.
+;;
+;; A throwable that genuinely has NO data is a different construction:
+;; jolt-host-throwable / throw-jvm, which is what the JVM raises wherever
+;; ex-data is nil.
 (define (jolt-ex-info msg data . more)
   (make-jolt-ex-info-record "clojure.lang.ExceptionInfo" msg
                              (if (null? more) jolt-nil (car more))
-                             data 0))
+                             (if (jolt-nil? data) empty-pmap data) 0))
 ;; A host-constructed throwable (RuntimeException. etc.): a jolt-ex-info-record
 ;; carrying its canonical JVM class-name, so (class …) / instance? / .getMessage /
 ;; ex-message all reflect the real type.

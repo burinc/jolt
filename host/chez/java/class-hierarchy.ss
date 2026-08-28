@@ -199,6 +199,14 @@
     (or (hashtable-ref t wanted #f)
         (hashtable-ref t (jch-last-segment wanted) #f))))
 
+;; Exact membership, no last-segment fallback. The fallback above is there so a
+;; SIMPLE name answers (chez-condition-exc-class hands over "ArityException"),
+;; but it also makes every dotted name whose last segment happens to be modeled —
+;; fake.pkg.String, no.such.Class — read as known. A caller asking "does the host
+;; back THIS class" rather than "have I seen this name" wants this one.
+(define (jch-known-exact? wanted)
+  (and (hashtable-ref (jch-known-table) wanted #f) #t))
+
 ;; simple last-segment -> canonical FQN for a modeled class (first registered
 ;; wins). Lets a simple exception name (from chez-condition-exc-class) resolve to
 ;; its graph key so the exception hierarchy answers through the one graph.

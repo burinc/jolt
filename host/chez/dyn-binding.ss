@@ -164,11 +164,12 @@
                    ;; set-var-meta!).
                    (let ((m (var-cell-meta cell)))
                      (when (not (and m (jolt-truthy? (jolt-get m (keyword #f "dynamic")))))
-                       (jolt-throw
-                        (jolt-ex-info
-                         (string-append "Can't dynamically bind non-dynamic var: "
-                                        (var-cell-ns cell) "/" (var-cell-name cell))
-                         jolt-nil))))
+                       ;; Var.pushThreadBindings raises IllegalStateException, not
+                       ;; an ExceptionInfo — so ex-data on it is nil, and only a
+                       ;; typed host throwable can say that.
+                       (throw-jvm (quote IllegalStateException)
+                                  (string-append "Can't dynamically bind non-dynamic var: "
+                                                 (var-cell-ns cell) "/" (var-cell-name cell)))))
                    (cons (cons cell v) acc))
                  '())))
     pairs))
@@ -251,11 +252,10 @@
       (let ((p (dyn-find-binding v)))
         (if p
             (begin (set-cdr! p val) val)
-            (jolt-throw
-             (jolt-ex-info
-              (string-append "Can't change/establish root binding of: "
-                             (var-cell-name v) " with set")
-              jolt-nil))))
+            ;; Var.set raises IllegalStateException — see the push path above.
+            (throw-jvm (quote IllegalStateException)
+                       (string-append "Can't change/establish root binding of: "
+                                      (var-cell-name v) " with set"))))
       (throw-jvm (quote ClassCastException) "set!: not a var")))
 
 ;; alter-var-root: apply f to the current root plus args, atomically.
