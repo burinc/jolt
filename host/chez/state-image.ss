@@ -253,17 +253,17 @@
            (jolt-throw (jolt-ex-info
                          (string-append "image: no var " (cadr d) "/" (caddr d)
                                         " in this build to restore a function reference")
-                         jolt-nil)))))
+                         empty-pmap)))))
     ((handler)
      (let loop ((hs image-handlers))
        (if (null? hs)
-           (jolt-throw (jolt-ex-info "image: no handler registered to restore a resource" jolt-nil))
+           (jolt-throw (jolt-ex-info "image: no handler registered to restore a resource" empty-pmap))
            ;; restore fns are tried in registration order; the first that accepts wins
            (let ((r (call/cc (lambda (k)
                       (with-exception-handler (lambda (e) (k 'image-no))
                         (lambda () (jolt-invoke (caddr (car hs)) (cadr d))))))))
              (if (eq? r 'image-no) (loop (cdr hs)) r)))))
-    (else (jolt-throw (jolt-ex-info "image: unknown external descriptor" jolt-nil)))))
+    (else (jolt-throw (jolt-ex-info "image: unknown external descriptor" empty-pmap)))))
 
 ;; --- R2: substitution pre-pass --------------------------------------------------
 ;; A var root a handler claimed, replaced by the handler's plain-data payload.
@@ -559,12 +559,12 @@
                                           "' was optimized into the compiled code, so its value"
                                           " cannot be recovered from the live closure —"
                                           " store a named fn, or the data to rebuild one")
-                           jolt-nil))))
+                           empty-pmap))))
         (else
          (jolt-throw (jolt-ex-info
                        (string-append "image: cannot write " (image-describe-obj x)
                                       " at " (image-path->string path))
-                       jolt-nil)))))))
+                       empty-pmap)))))))
 
 ;; A condition's human text, best effort — jolt ex-info and raw Chez
 ;; conditions both pass through here on the restore failure path.
@@ -596,7 +596,7 @@
                                    (image-fnsrc-name x) " from source"
                                    " (a tree-shaken build that dropped the compiler"
                                    " cannot restore images holding anonymous fns)")
-                    jolt-nil)))
+                    empty-pmap)))
     (let* ((frees (image-fnsrc-free-names x))
            (params (let loop ((s (jolt-seq frees)) (acc '()))
                      (if (jolt-nil? s)
@@ -610,7 +610,7 @@
                                                            (image-fnsrc-name x) " in ns "
                                                            (image-fnsrc-ns x) ": "
                                                            (image-condition-text e))
-                                            jolt-nil))))
+                                            empty-pmap))))
                   (ce wrapper (image-fnsrc-ns x)))))
       (apply jolt-invoke wfn tfvs))))
 
@@ -619,7 +619,7 @@
 (define (image-restore-handler payload)
   (let loop ((hs image-handlers))
     (if (null? hs)
-        (jolt-throw (jolt-ex-info "image: no handler registered to restore a resource" jolt-nil))
+        (jolt-throw (jolt-ex-info "image: no handler registered to restore a resource" empty-pmap))
         (let ((r (call/cc (lambda (k)
                    (with-exception-handler (lambda (e) (k 'image-no))
                      (lambda () (jolt-invoke (caddr (car hs)) payload)))))))
@@ -729,7 +729,7 @@
                                                        (number->string (image-stub-id x))
                                                        " (" (image-stub-kind x) "): "
                                                        (image-condition-text e))
-                                        jolt-nil))))
+                                        empty-pmap))))
                                        (jolt-invoke r (image-stub-info x)))))
                               (hashtable-set! memo x v)
                               v)
@@ -764,7 +764,7 @@
                                 (jolt-ex-info
                                   (string-append "image: cannot write " (image-describe-obj x)
                                                  " at " (image-path->string path))
-                                  jolt-nil)))
+                                  empty-pmap)))
                              (else
                               (hashtable-set! memo x #t)
                               (report! x path (image-report-disposition mode)))))
@@ -1223,7 +1223,7 @@
                                                  (image-fnsrc-name x) ": " (number->string n)
                                                  " free values for " (number->string (pvec-count frees))
                                                  " free names")
-                                  jolt-nil)))
+                                  empty-pmap)))
                   (let ((tfvs (map (lambda (v)
                                      (walk v (cons (string-append "free:" (image-fnsrc-name x)) path)))
                                    (vector->list fvs))))
@@ -1335,12 +1335,12 @@
 
 (define (image-check-header! h path)
   (unless (and (vector? h) (fx=? (vector-length h) 4) (eq? (vector-ref h 0) 'jolt-image))
-    (jolt-throw (jolt-ex-info (string-append "image: " path " is not a jolt image") jolt-nil)))
+    (jolt-throw (jolt-ex-info (string-append "image: " path " is not a jolt image") empty-pmap)))
   (unless (member (vector-ref h 1) jolt-image-read-versions)
     (jolt-throw (jolt-ex-info
                   (string-append "image: " path " has format version "
                                  (jolt-str-one (vector-ref h 1)) ", this build reads versions 2 to 5")
-                  jolt-nil)))
+                  empty-pmap)))
   ;; The fasl version moves with Chez, and a mismatch otherwise surfaces as an
   ;; opaque fasl-read error, so name it here instead.
   (unless (equal? (vector-ref h 2) (jolt-image-runtime-version))
@@ -1348,7 +1348,7 @@
                   (string-append "image: " path " was written by runtime "
                                  (jolt-str-one (vector-ref h 2)) ", this is "
                                  (jolt-image-runtime-version))
-                  jolt-nil)))
+                  empty-pmap)))
   #t)
 
 ;; Runtime identity an image is pinned to. The fasl format moves with the Chez
@@ -1458,7 +1458,7 @@
                                               (string-append "image: cannot write "
                                                              (image-describe-obj x)
                                                              " at " where)
-                                              jolt-nil)))))
+                                              empty-pmap)))))
                         externals)))
         ;; Descriptors are written WITHOUT an externals-pred, so a handler that
         ;; returns something non-data would fail here with a raw Chez error.
@@ -1470,7 +1470,7 @@
                     (lambda (e)
                       (k (jolt-throw (jolt-ex-info
                                        "image: a resource handler returned a value that is not plain data"
-                                       jolt-nil))))
+                                       empty-pmap))))
                     (lambda () (call-with-bytevector-output-port
                                  (lambda (p) (sa-fasl-write descs p)))))))))
           (let ((port (open-file-output-port path (file-options no-fail))))
@@ -1485,7 +1485,7 @@
 
 (define (jolt-image-read path)
   (unless (file-exists? path)
-    (jolt-throw (jolt-ex-info (string-append "image: no such file: " path) jolt-nil)))
+    (jolt-throw (jolt-ex-info (string-append "image: no such file: " path) empty-pmap)))
   (let ((port (open-file-input-port path)))
     (let* ((h (sa-fasl-read port))
            (_ (image-check-header! h path))
@@ -1494,7 +1494,7 @@
            (b (sa-fasl-read port 'load exts)))
       (close-port port)
       (unless (and (vector? b) (fx=? (vector-length b) 2))
-        (jolt-throw (jolt-ex-info (string-append "image: malformed body in " path) jolt-nil)))
+        (jolt-throw (jolt-ex-info (string-append "image: malformed body in " path) empty-pmap)))
       (image-reattach-meta! (vector-ref b 1))
       ;; R3: rebuild what the write side substituted — fn source records become
       ;; live closures, handler payloads go back through their restore fns.
@@ -1598,7 +1598,7 @@
       (jolt-throw (jolt-ex-info
                     (string-append "image: " path
                                    " is a value image, not a world image — read it with read-image")
-                    jolt-nil)))
+                    empty-pmap)))
     (let ((n 0))
       (for-each
         (lambda (p)
@@ -1735,7 +1735,7 @@
       (jolt-throw (jolt-ex-info
                     (string-append "image: no unresolved stub #"
                                    (jolt-str-one id) " from the last world restore")
-                    jolt-nil)))
+                    empty-pmap)))
     (let* ((k (cdr e))
            (slash (let scan ((i 0))
                     (cond ((fx>=? i (string-length k)) #f)
