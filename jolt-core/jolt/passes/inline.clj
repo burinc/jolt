@@ -39,12 +39,29 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- safe-op? [op]
-  ;; ops an inline-eligible body may contain. recur/loop/fn/try/def are excluded
-  ;; (binding/control forms the splicer doesn't handle), so a body containing one
-  ;; is rejected by body-size below and never inlined or alpha-renamed.
+  ;; ops an inline-eligible body may contain. The criterion is what the SPLICER
+  ;; can handle, not purity: subst walks children through map-ir-children and
+  ;; special-cases only :local (substitution) and :let (alpha-renames its
+  ;; binders), so any op that binds no names is safe however it is spelled and
+  ;; whether or not it can throw (:invoke and :throw are here already).
+  ;;
+  ;; recur/loop/fn/try/def stay out — those bind names or move control, and the
+  ;; splicer has no case for them, so a body containing one is rejected by
+  ;; body-size below and never inlined or alpha-renamed.
+  ;;
+  ;; The literal leaves and the interop arg-only forms were missing rather than
+  ;; refused. Measured while building a real project (grenadine) under --opt, a
+  ;; :regex literal alone blocked 538 splice attempts and :host-new another 56 —
+  ;; a fn was disqualified for containing #"..." Everything added here is either
+  ;; a leaf (no child nodes at all) or carries only :args/:target, both of which
+  ;; map-ir-children and reduce-ir-children already recurse.
   (or (= op :const) (= op :local) (= op :var) (= op :host) (= op :the-var)
       (= op :quote) (= op :if) (= op :do) (= op :let) (= op :invoke)
-      (= op :map) (= op :vector) (= op :set) (= op :throw) (= op :coerce)))
+      (= op :map) (= op :vector) (= op :set) (= op :throw) (= op :coerce)
+      ;; literal leaves, like :const
+      (= op :regex) (= op :inst) (= op :uuid) (= op :bigdec)
+      ;; interop: a leaf, and two arg-only call forms (:host is already above)
+      (= op :host-static) (= op :host-new) (= op :host-call)))
 
 (def ^:private inline-budget 120)
 
