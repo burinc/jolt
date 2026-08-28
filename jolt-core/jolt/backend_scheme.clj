@@ -866,6 +866,28 @@
 (defn- chez-str-lit [s]
   (str "\"" (apply str (map (fn [c] (char-escape (int c))) s)) "\""))
 
+;; Hoist the VAR CELL a late-bound reference reads through, so the name lookup
+;; (string-append + string-hash + a hashtable probe, measured at ~102ns) runs once
+;; per def instead of once per access. Rides the same interning pool as the keyword
+;; literals above, and for the same reason: jolt-var INTERNS, so it already returns
+;; one stable object per ns/name and sharing it across sites changes nothing. Ten
+;; references to clojure.core/str in one def therefore bind one cell, not ten.
+;;
+;; Eager (the pool binds at the top of the def) rather than the lazy
+;; (or cell (set! cell …)) shape this replaces. Three reasons:
+;;   - a cell has no resolution to defer that an (or …) branch could save; the
+;;     lookup is the same lookup whenever it runs,
+;;   - the eager form is an IMMUTABLE binding, so the def's closure needs no
+;;     assignable frame slot, and
+;;   - the emitted text is a quarter the size, which is what kept the seed and
+;;     every built binary from growing.
+;; Interning a cell early is not observable: jolt-var creates an UNBOUND cell, and
+;; ns-publics / ns-interns / ns-map / resolve all filter on var-cell-defined?
+;; (ns.ss ns-vars-pmap-when), so a hoisted reference to a var nothing ever defines
+;; stays invisible exactly as it does today.
+(defn- hoist-var-cell [ns nm]
+  (str "(var-cell-deref " (hoist-const (str "(jolt-var " (chez-str-lit ns) " " (chez-str-lit nm) ")")) ")"))
+
 (defn- emit-const [v]
   (cond
     (nil? v) "jolt-nil"
@@ -2352,13 +2374,9 @@
              ;; jolt-var-get throws on a forward-declared var). Outside a def,
              ;; resolve per access.
              :else
-             (let [cells *cache-cells*
-                   nslit (chez-str-lit (:ns node)) nmlit (chez-str-lit (:name node))]
-               (if (and (var-cache?) cells)
-                 (let [c (fresh-label "_vc$")]
-                   (swap! cells conj c)
-                   (str "(var-cell-deref (or " c " (let ((_v (jolt-var " nslit " " nmlit "))) (set! " c " _v) _v)))"))
-                 (str "(var-deref " nslit " " nmlit ")")))))
+             (if (and (var-cache?) *const-pool*)
+               (hoist-var-cell (:ns node) (:name node))
+               (str "(var-deref " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) ")"))))
     :the-var (str "(jolt-var " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) ")")
     ;; (set! *var* val) -> set the var's innermost thread binding; throws if none.
     :set-var (str "(jolt-set-var! " (emit (:the-var node)) " " (emit (:val node)) ")")

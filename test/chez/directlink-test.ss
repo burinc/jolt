@@ -1,7 +1,8 @@
 ;; Direct-linking emission (jolt build, closed world). With direct-link on, a
 ;; top-level app def emits a Scheme binding jv$<ns>$<name> aliased to its var cell,
-;; and an app->app call/value-ref binds to it directly instead of going through
-;; (jolt-invoke (var-deref ...)). ^:dynamic/^:redef defs and nested defs opt out.
+;; and an app->app call/value-ref binds to it directly instead of reading the var
+;; cell (see var-routed? below for the two spellings that read counts as).
+;; ^:dynamic/^:redef defs and nested defs opt out.
 ;; Off direct-link mode the emission is byte-identical to plain `emit`. Run:
 ;;   chez --script test/chez/directlink-test.ss
 
@@ -21,6 +22,16 @@
       (cond ((> (+ i nsub) ns) #f)
             ((string=? (substring s i (+ i nsub)) sub) #t)
             (else (loop (+ i 1)))))))
+
+;; "the reference stays INDIRECT" — it reads the var cell rather than binding to a
+;; jv$ name — in either spelling the emitter uses. Inside a def (a const pool is
+;; bound) a late-bound ref hoists its cell: (var-cell-deref _kc$N) over a
+;; (jolt-var "ns" "name") binding in the def's let*. Outside one it resolves per
+;; access: (var-deref "ns" "name"). Both are the var route; only jv$<ns>$<name> is
+;; not, and that is what every assertion here is actually about.
+(define (var-routed? s ns name)
+  (or (contains? s (string-append "(var-deref \"" ns "\" \"" name "\")"))
+      (contains? s (string-append "(jolt-var \"" ns "\" \"" name "\")"))))
 
 ;; Analyze+emit one form (string) in a namespace through the real build entry
 ;; (ei-compile-form -> emit-top-form), no optimization passes.
@@ -45,7 +56,7 @@
 ;; --- direct-link OFF: every reference stays indirect (var-deref) ---
 (let ((eb (emit-form "app" "(def b (fn* ([] (a))))")))
   (ok "off: call to a routes through jolt-invoke + var-deref"
-      (and (contains? eb "(jolt-invoke") (contains? eb "(var-deref \"app\" \"a\")")))
+      (and (contains? eb "(jolt-invoke") (var-routed? eb "app" "a")))
   (ok "off: no jv$ direct call" (not (contains? eb "(jv$app$a)")))
   ;; a def carries source position in its var meta (:line/:column/:file), so it
   ;; emits def-var-with-meta! — but still NO jv$ binding off direct-link.
@@ -64,12 +75,12 @@
 
 (let ((eb (emit-form "app" "(def b (fn* ([] (a))))")))
   (ok "on: b's call to a is a direct (jv$app$a) call" (contains? eb "(jv$app$a)"))
-  (ok "on: b's call to a is NOT var-deref'd" (not (contains? eb "(var-deref \"app\" \"a\")")))
+  (ok "on: b's call to a is NOT var-routed" (not (var-routed? eb "app" "a")))
   (ok "on: b's call to a is NOT jolt-invoke'd" (not (contains? eb "(jolt-invoke"))))
 
 (let ((eh (emit-form "app" "(def hof (fn* ([] a)))")))
   (ok "on: a used as a value references the binding directly" (contains? eh " jv$app$a)"))
-  (ok "on: value-ref to a is NOT var-deref'd" (not (contains? eh "(var-deref \"app\" \"a\")"))))
+  (ok "on: value-ref to a is NOT var-routed" (not (var-routed? eh "app" "a"))))
 
 ;; A map-valued (non-fn) def is invokable in Clojure but is NOT a Scheme procedure;
 ;; a direct-link call to it must route through jolt-invoke, never raw-apply the
@@ -85,20 +96,20 @@
 (let ((ed (emit-form "app" "(def ^:dynamic d 5)")))
   (ok "on: ^:dynamic def gets no jv$ binding" (not (contains? ed "(define jv$app$d"))))
 (let ((eu (emit-form "app" "(def usesd (fn* ([] (d))))")))
-  (ok "on: call to a ^:dynamic var stays indirect" (contains? eu "(var-deref \"app\" \"d\")"))
+  (ok "on: call to a ^:dynamic var stays indirect" (var-routed? eu "app" "d"))
   (ok "on: ^:dynamic var not direct-linked" (not (contains? eu "(jv$app$d)"))))
 
 ;; ^:redef opts out too (a def redefinable after build stays var-routed).
 (let ((er (emit-form "app" "(def ^:redef r 5)")))
   (ok "on: ^:redef def gets no jv$ binding" (not (contains? er "(define jv$app$r"))))
 (let ((eu (emit-form "app" "(def usesr (fn* ([] (r))))")))
-  (ok "on: call to a ^:redef var stays indirect" (contains? eu "(var-deref \"app\" \"r\")"))
+  (ok "on: call to a ^:redef var stays indirect" (var-routed? eu "app" "r"))
   (ok "on: ^:redef var not direct-linked" (not (contains? eu "(jv$app$r)"))))
 
 ;; A var only defined LATER in emission order is not yet in the set -> indirect.
 (direct-link-reset!)
 (let ((efwd (emit-form "app" "(def caller (fn* ([] (a))))")))  ; a not (re)emitted since reset
-  (ok "on: forward/undefined ref stays indirect" (contains? efwd "(var-deref \"app\" \"a\")")))
+  (ok "on: forward/undefined ref stays indirect" (var-routed? efwd "app" "a")))
 
 (set-direct-link! #f)
 (printf "~a/~a passed~n" (- total fails) total)
