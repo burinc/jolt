@@ -46,7 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved symbol reader (a form result is spliced as code, a value result as a
   value), and a var value resolves through its root, matching what `read-string`
   already accepted. A table entry that is not a reader at all now says so
-  instead of emitting a form the analyzer can only call unsupported.
+  instead of emitting a form the analyzer can only call unsupported. `jolt build`
+  bakes the table into the binary and assumed every value was a symbol, so it
+  died in `symbol-t-ns` on a function; a function entry is skipped there now —
+  a closure has no literal form, and the top-level code that installed it is in
+  the binary and re-runs at startup, which puts the entry back.
+
+- **An unregistered `#tag` names the tag.** A `#foo/bar` literal with no reader
+  function reached the analyzer as a form it had no leaf for and failed with
+  `jolt/uncompilable: unsupported form`, which names nothing to fix. It reports
+  `No reader function for tag foo/bar` now, as the JVM's reader does.
 
 - **A built binary runs its app's top-level forms past `Sbuild_heap`.** Chez does
   not schedule a forked thread until the boot file has finished loading, and

@@ -65,6 +65,20 @@
   (and (pmap? x)
        (eq? (jolt-get x hc-kw-jolt-type) hc-kw-jolt-tagged)
        (eq? (jolt-get x hc-kw-tag) tag)))
+;; ANY #tag form the reader built. The analyzer has a leaf for the four tags it
+;; knows (#inst/#uuid/#bigdec, and #"regex" as a value); one that reaches the end
+;; of the cond is a tag with no reader function, which is what the JVM's reader
+;; raises on by name — better than "unsupported form", which names nothing.
+(define (hc-tagged? x)
+  (and (pmap? x) (eq? (jolt-get x hc-kw-jolt-type) hc-kw-jolt-tagged)))
+;; the tag as written. The reader keys a source tag :#name / :#ns/name and its own
+;; internal ones (:bigdec, :regex) bare, so strip a leading # if there is one.
+(define (hc-tag-name x)
+  (let* ((k (jolt-get x hc-kw-tag))
+         (nm (if (keyword-t? k) (keyword-t-name k) (jolt-pr-str k))))
+    (if (and (> (string-length nm) 0) (char=? (string-ref nm 0) #\#))
+        (substring nm 1 (string-length nm))
+        nm)))
 (define (hc-regex? x) (regex-t? x))   ; #"..." reads as a regex VALUE now
 (define (hc-inst? x) (hc-tagged-of x hc-kw-inst))
 (define (hc-uuid? x) (hc-tagged-of x hc-kw-uuid))
@@ -751,6 +765,8 @@
   (def-var! "jolt.host" "form-literal?" hc-literal?)
   (def-var! "jolt.host" "form-keyword?" hc-keyword?)
   (def-var! "jolt.host" "form-regex?" hc-regex?)
+  (def-var! "jolt.host" "form-tagged?" hc-tagged?)
+  (def-var! "jolt.host" "form-tag-name" hc-tag-name)
   (def-var! "jolt.host" "form-inst?" hc-inst?)
   (def-var! "jolt.host" "form-uuid?" hc-uuid?)
   (def-var! "jolt.host" "form-ns-value?" hc-ns-value?)

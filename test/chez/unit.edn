@@ -642,6 +642,13 @@
   {:suite "reader" :expr "(true? (read-string \"true\"))" :expected "true"}
   {:suite "reader" :expr "(false? (read-string \"false\"))" :expected "true"}
   {:suite "reader" :expr "(let [r (read-string \"#foo bar\")] (and (tagged-literal? r) (= (quote foo) (:tag r)) (= (quote bar) (:form r)) (= \"#foo bar\" (pr-str r))))" :expected "true"}
+  ;; …but COMPILING one is an error, and it names the tag the way the JVM's reader
+  ;; does. It used to reach the analyzer's catch-all as "unsupported form", which
+  ;; said nothing about what to fix. The tags the compiler does build a leaf for
+  ;; are unaffected.
+  {:suite "reader" :expr "(try (load-string \"#foo/bar [1 2]\") (catch Throwable e (str e)))" :expected "\"jolt/uncompilable: No reader function for tag foo/bar\""}
+  {:suite "reader" :expr "(try (load-string \"#zz 1\") (catch Throwable e (str e)))" :expected "\"jolt/uncompilable: No reader function for tag zz\""}
+  {:suite "reader" :expr "[(try (load-string \"#inst \\\"2020-01-01\\\"\") :ok (catch Throwable e (str e))) (try (load-string \"#uuid \\\"00000000-0000-0000-0000-000000000000\\\"\") :ok (catch Throwable e (str e))) (try (load-string \"1.5M\") :ok (catch Throwable e (str e)))]" :expected "[:ok :ok :ok]"}
   {:suite "reader" :expr "(let [t (first (quote [#foo bar]))] (and (tagged-literal? t) (= (quote foo) (:tag t)) (= \"#foo bar\" (pr-str t))))" :expected "true"}
   {:suite "reader" :expr "(= \\a (read-string \"\\\\a\"))" :expected "true"}
   {:suite "reader" :expr "(= \\newline (read-string \"\\\\newline\"))" :expected "true"}

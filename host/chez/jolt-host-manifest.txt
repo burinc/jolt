@@ -96,6 +96,8 @@ form-sym-meta
 form-sym-name
 form-sym-ns
 form-sym?
+form-tag-name
+form-tagged?
 form-syntax-quote-expand
 form-syntax-quote-lower
 form-uuid-source
