@@ -301,8 +301,12 @@
 
 ;; (sa-foreign-callable-collect-safe proc args res) -> foreign callable
 ;; SYNTAX: like sa-foreign-callable, but the callable entry uses the
-;; __collect_safe convention that reactivates the thread — for callbacks
-;; invoked while the thread is parked in a :blocking foreign call.
+;; __collect_safe convention that reactivates the thread — for a callback that
+;; can arrive on a thread which is not an ACTIVE Scheme thread at that moment:
+;; one the runtime never started (a dispatch queue or a pthread the C library
+;; spawned), or one parked in a :blocking foreign call. Both need the entry to
+;; activate the thread before any Scheme runs; without it the process takes a
+;; nonrecoverable memory fault instead of an exception.
 (define-syntax sa-foreign-callable-collect-safe
   (syntax-rules ()
     ((_ proc args res) (foreign-callable __collect_safe proc args res))))

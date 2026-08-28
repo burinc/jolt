@@ -330,6 +330,14 @@
 ;; --- char output (Writer) ---------------------------------------------------
 (define (char-writer-port self) (vector-ref (jhost-state self) 0))
 (define (char-writer? x) (and (jhost? x) (string=? (jhost-tag x) "char-writer")))
+;; Every jhost on the CHARACTER side of the io split, the mirror of reader-jhost?:
+;; char-writer here, and StringWriter / *out* / io/writer-of-a-file over in io.ss
+;; and host-static-classes.ss. A print-stream is deliberately absent -- it is a
+;; java.io.OutputStream, so it is a legitimate thing to wrap in a writer.
+(define (writer-jhost? x)
+  (and (jhost? x)
+       (member (jhost-tag x) '("char-writer" "writer" "port-writer" "file-writer"))
+       #t))
 ;; state #(port downstream): downstream is the byte stream this writer wraps, when
 ;; it wraps one. flush/close have to reach it — java.io.OutputStreamWriter.flush
 ;; flushes its own encoder AND the stream underneath, which is what makes a
@@ -373,14 +381,42 @@
 
 (define (reg-ctor! names ctor) (for-each (lambda (n) (register-class-ctor! n ctor)) names))
 
+;; The JVM's file constructors raise java.io.FileNotFoundException when the path
+;; cannot be opened, and libraries branch on that class the same way they do on
+;; slurp's (io.ss slurp-path says why). A raw Chez i/o condition is not catchable
+;; as that class, so the caller's fallback never runs. The message is the JVM's
+;; shape -- the path AS GIVEN, then the reason in parens -- and the JVM uses this
+;; one class for all three reasons, so distinguish only the parenthetical.
+(define (file-open-error given resolved)
+  (throw-jvm (quote java.io.FileNotFoundException)
+             (string-append given " ("
+                            (cond ((not (file-exists? resolved)) "No such file or directory")
+                                  ((file-directory? resolved)    "Is a directory")
+                                  (else                          "Permission denied"))
+                            ")")))
+;; Opening is guarded rather than pre-checked -- existence and permission can
+;; change between a check and the open, and only the open itself is
+;; authoritative. A DIRECTORY is the one case that needs the check: the JVM
+;; refuses it at construction, while a Chez binary input port over a directory
+;; opens fine and raises on the first read, far from the call that was wrong.
+(define (open-file-guarded src thunk)
+  (let ((resolved (path-of src)))
+    (when (file-directory? resolved) (file-open-error (file-path-of src) resolved))
+    (guard (e ((i/o-error? e) (file-open-error (file-path-of src) resolved)))
+      (thunk resolved))))
+
 (reg-ctor! '("FileInputStream" "java.io.FileInputStream")
-  (lambda (src . _) (make-in-stream (open-file-input-port (path-of src) (file-options) (buffer-mode block)))))
+  (lambda (src . _)
+    (open-file-guarded src
+      (lambda (p) (make-in-stream (open-file-input-port p (file-options) (buffer-mode block)))))))
 (reg-ctor! '("FileOutputStream" "java.io.FileOutputStream")
   (lambda (src . rest)
     (let ((append? (and (pair? rest) (jolt-truthy? (car rest)))))
-      (make-out-stream (open-file-output-port (path-of src)
-                         (if append? (file-options no-fail no-truncate append) (file-options no-fail))
-                         (buffer-mode block))))))
+      (open-file-guarded src
+        (lambda (p)
+          (make-out-stream (open-file-output-port p
+                             (if append? (file-options no-fail no-truncate append) (file-options no-fail))
+                             (buffer-mode block))))))))
 (reg-ctor! '("ByteArrayInputStream" "java.io.ByteArrayInputStream")
   (lambda (bytes . rest)
     (let ((bv (src-bytevector bytes)))
@@ -627,13 +663,17 @@
     (call-with-values open-bytevector-output-port
       (lambda (port extract) (make-jhost "out-stream" (vector port extract (make-bytevector 0)))))))
 (reg-ctor! '("FileReader" "java.io.FileReader")
-  (lambda (src . _) (make-char-reader (transcoded-port (open-file-input-port (path-of src) (file-options) (buffer-mode block)) utf8-tx))))
+  (lambda (src . _)
+    (open-file-guarded src
+      (lambda (p) (make-char-reader (transcoded-port (open-file-input-port p (file-options) (buffer-mode block)) utf8-tx))))))
 (reg-ctor! '("FileWriter" "java.io.FileWriter")
   (lambda (src . rest)
     (let ((append? (and (pair? rest) (jolt-truthy? (car rest)))))
-      (make-char-writer (transcoded-port (open-file-output-port (path-of src)
-                          (if append? (file-options no-fail no-truncate append) (file-options no-fail))
-                          (buffer-mode block)) utf8-tx)))))
+      (open-file-guarded src
+        (lambda (p)
+          (make-char-writer (transcoded-port (open-file-output-port p
+                              (if append? (file-options no-fail no-truncate append) (file-options no-fail))
+                              (buffer-mode block)) utf8-tx)))))))
 ;; InputStreamReader / OutputStreamWriter decode / encode the wrapped byte stream
 ;; (UTF-8 default; an explicit charset is honored only as UTF-8 here).
 ;;
@@ -655,7 +695,17 @@
            (begin (bytevector-copy! (na-bytearray->bv arr) 0 bv start n) n))))
    #f #f (lambda () #f)))
 (reg-ctor! '("InputStreamReader" "java.io.InputStreamReader")
-  (lambda (in . _) (make-char-reader (transcoded-port (in-stream-source-port in) utf8-tx))))
+  (lambda (in . _)
+    ;; A Reader is already decoded characters, so there is nothing for an
+    ;; InputStreamReader to decode and the JVM has no such constructor. Say so
+    ;; here: the byte port below drives the wrapped stream's read(byte[],int,int),
+    ;; which a Reader answers by writing CHARACTERS into the array, and the
+    ;; failure then surfaces from whatever finally reads a char as a number --
+    ;; far from the call that was actually wrong.
+    (when (reader-jhost? in)
+      (throw-jvm (quote IllegalArgumentException)
+                 "InputStreamReader wraps an InputStream, not a Reader (it is already decoded)"))
+    (make-char-reader (transcoded-port (in-stream-source-port in) utf8-tx))))
 ;; A byte port that hands each encoded block to the stream's OWN write method,
 ;; whatever kind of stream it is — a port-backed out-stream, a PrintStream, or a
 ;; proxy over one. Dispatching rather than writing to the stream's port directly
@@ -673,6 +723,11 @@
    #f #f (lambda () #f)))
 (reg-ctor! '("OutputStreamWriter" "java.io.OutputStreamWriter")
   (lambda (out . _)
+    ;; The mirror of InputStreamReader above: a Writer takes characters, so there
+    ;; is nothing to encode and the JVM has no such constructor.
+    (when (writer-jhost? out)
+      (throw-jvm (quote IllegalArgumentException)
+                 "OutputStreamWriter wraps an OutputStream, not a Writer (it already takes characters)"))
     (make-char-writer (transcoded-port (out-stream-sink-port out) utf8-tx) out)))
 ;; Buffered* — Chez ports are buffered already; the wrapper is the wrapped stream.
 (for-each (lambda (n) (register-class-ctor! n (lambda (inner . _) inner)))

@@ -38,4 +38,11 @@
   ;; a :depends that fails still reports ITS status, parallel or not
   pfail  {:depends [clean boom] :task (println "never")}
   cyc1   {:depends [cyc2] :task (println "cyc1")}
-  cyc2   {:depends [cyc1] :task (println "cyc2")}}}
+  cyc2   {:depends [cyc1] :task (println "cyc2")}
+  ;; a cycle that spans two SIBLING branches rather than one chain. Detection
+  ;; used to live in a per-thread dynamic var, which each :parallel branch
+  ;; inherited separately — so neither branch could see the other's task, and the
+  ;; run deadlocked with no output where the sequential one reported.
+  xcyc   {:depends [xcycA xcycB] :task (println "xcyc")}
+  xcycA  {:depends [xcycB] :task (println "xcycA")}
+  xcycB  {:depends [xcycA] :task (println "xcycB")}}}

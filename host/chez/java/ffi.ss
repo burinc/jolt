@@ -203,10 +203,18 @@
 ;; Once per symbol, not once per call. The emitted binding caches its address,
 ;; so a repeat would only appear if a caller resolved the same name again — and
 ;; a warning that repeats is a warning that gets filtered out.
+;; Guarded by ffi-native-mu like every other global table here. A defcfn binding
+;; resolves lazily on FIRST CALL, so two threads first-calling two duplicated
+;; symbols race this writer-vs-writer — which faults inside the collector rather
+;; than merely losing an entry. Probe and set are one critical section so the
+;; "once per symbol" claim holds under the race too.
 (define ffi-dup-reported (make-hashtable string-hash equal?))
+(define (ffi-dup-claim! sym)      ; #t if THIS caller owns the report
+  (jolt-with-mutex ffi-native-mu
+    (cond ((hashtable-ref ffi-dup-reported sym #f) #f)
+          (else (hashtable-set! ffi-dup-reported sym #t) #t))))
 (define (ffi-report-duplicate! sym defs)
-  (unless (hashtable-ref ffi-dup-reported sym #f)
-    (hashtable-set! ffi-dup-reported sym #t)
+  (when (ffi-dup-claim! sym)
     (let ((p (current-error-port)))
       (display (string-append
                  "jolt.ffi: duplicate native symbol " sym " — defined by "

@@ -1097,13 +1097,13 @@
 ;; Shape:
 ;;   (jolt.ffi/__ccallable f [:argtype ...] :rettype)                ; thread stays active
 ;;   (jolt.ffi/__ccallable f [:argtype ...] :rettype :collect-safe)  ; may be invoked
-;;                                                                   ; while the thread is
-;;                                                                   ; parked in a :blocking call
+;;                                                                   ; on a thread that is
+;;                                                                   ; not active at the time
 ;; Unlike __cfn, the fn is a CHILD expression (analyzed + walked by the passes);
 ;; the types are literal keywords read at compile time. The Chez back end lowers
 ;; it to a locked `foreign-callable` and returns its entry-point address (a jolt
-;; pointer). :collect-safe is required when C invokes the callback from a thread
-;; that is deactivated inside a :blocking foreign call (e.g. a GTK main loop).
+;; pointer). :collect-safe is required when the callback can arrive on a thread
+;; that is not ACTIVE: one the runtime never started, or one in a :blocking call.
 (defn- analyze-ffi-callable [ctx items env]
   (when-not (<= 4 (count items) 5)
     (throw (str "jolt.ffi/foreign-callable expects (foreign-callable f [argtypes] rettype [:collect-safe])")))

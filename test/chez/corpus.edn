@@ -1232,6 +1232,23 @@
   {:suite "io / java.net.URL" :label "no protocol throws" :expected "\"no protocol: /some/path/\"" :actual "(try (java.net.URL. \"/some/path/\") (catch java.net.MalformedURLException e (.getMessage e)))" :portability :jvm}
   {:suite "io / java.net.URL" :label "unknown protocol throws" :expected "\"unknown protocol: bogus\"" :actual "(try (java.net.URL. \"bogus://x\") (catch java.net.MalformedURLException e (.getMessage e)))" :portability :jvm}
   {:suite "io / java.net.URL" :label "jar spec is left alone" :expected "\"jar:file:/x!/y\"" :actual "(str (java.net.URL. \"jar:file:/x!/y\"))" :portability :jvm}
+  ;; openStream hands back an InputStream — the BYTE half of the io hierarchy —
+  ;; so (InputStreamReader. (.openStream u)) is the documented composition and
+  ;; works. jolt used to answer a StringReader: content-correct on its own, but an
+  ;; ISR over it drives read(byte[],int,int), which a Reader answers by writing
+  ;; CHARACTERS into the byte array, and the failure surfaced far away as
+  ;; "#\{ is not a number". typedclojure reads its config through this chain.
+  {:suite "io / java.net.URL" :label "openStream is a byte stream and composes with InputStreamReader" :expected "[true 123 \"{:a 1}\"]" :actual "(let [f (java.io.File/createTempFile \"joltisr\" \".txt\")] (spit f \"{:a 1}\") (let [u (java.net.URL. (str \"file:\" (.getAbsolutePath f))) r [(instance? java.io.InputStream (.openStream u)) (.read (java.io.InputStreamReader. (.openStream u) \"UTF-8\")) (.readLine (java.io.BufferedReader. (java.io.InputStreamReader. (.openStream u) \"UTF-8\")))]] (.delete f) r))" :portability :jvm}
+  ;; A Reader is already decoded, so wrapping one in an InputStreamReader is not
+  ;; a thing the JVM has a constructor for. Raise where the mistake is rather than
+  ;; letting the byte/char confusion surface from the eventual read.
+  {:suite "io / java.net.URL" :label "InputStreamReader over a Reader is rejected" :expected ":iae" :actual "(try (java.io.InputStreamReader. (java.io.StringReader. \"x\") \"UTF-8\") :none (catch IllegalArgumentException e :iae))" :portability :jvm}
+  ;; The file constructors raise java.io.FileNotFoundException, the class callers
+  ;; branch on; a raw Chez i/o condition is not catchable as it, so the caller's
+  ;; fallback never ran. The JVM uses this one class for missing, unreadable and
+  ;; is-a-directory alike, naming the path AS GIVEN.
+  {:suite "io / file streams" :label "a path that cannot be opened is FileNotFoundException" :expected "[:fnf :fnf :fnf :fnf]" :actual "[(try (java.io.FileInputStream. \"jolt-absent-probe.txt\") :none (catch java.io.FileNotFoundException e :fnf)) (try (java.io.FileReader. \"jolt-absent-probe.txt\") :none (catch java.io.FileNotFoundException e :fnf)) (try (java.io.FileOutputStream. \"jolt-absent-dir/probe.txt\") :none (catch java.io.FileNotFoundException e :fnf)) (try (java.io.FileInputStream. (System/getProperty \"java.io.tmpdir\")) :none (catch java.io.FileNotFoundException e :fnf))]" :portability :jvm}
+  {:suite "io / file streams" :label "the message names the path as given" :expected "\"jolt-absent-probe.txt (No such file or directory)\"" :actual "(try (java.io.FileInputStream. \"jolt-absent-probe.txt\") nil (catch java.io.FileNotFoundException e (.getMessage e)))" :portability :jvm}
   {:suite "io / with-out-str captures" :label "println" :expected "\"hi\\n\"" :actual "(with-out-str (println \"hi\"))" :portability :common}
   {:suite "io / with-out-str captures" :label "print spaces" :expected "\"a b\"" :actual "(with-out-str (print \"a\" \"b\"))" :portability :common}
   {:suite "io / with-out-str captures" :label "prn quotes" :expected "\"[1 2]\\n\"" :actual "(with-out-str (prn [1 2]))" :portability :common}

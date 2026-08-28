@@ -423,6 +423,15 @@ printf '{jx/up jx.rdrs/up}\n' > "$jx/src/data_readers.jolt"
 printf '(ns jx.rd (:require [jx.rdrs]))\n(defn -main [& _] (println #jx/up "shout"))\n' > "$jx/src/jx/rd.clj"
 jx_check "data_readers.jolt registers a tag" "SHOUT" \
          "$(JOLT_PWD="$jx" $jolt run -m jx.rd 2>&1 | tail -1)"
+# A RELATIVE file: URL resolves against the project directory, like the JVM
+# resolving one against user.dir. Only visible with JOLT_PWD set: the launcher
+# cd's to the jolt root, so a bare relative path here used to read from THERE and
+# the URL came back FileNotFoundException for a file sitting in the project.
+printf 'relative-url-ok\n' > "$jx/rel-probe.txt"
+jx_check "a relative file: URL resolves against the project dir" "relative-url-ok" \
+         "$(JOLT_PWD="$jx" $jolt -e '(print (slurp (java.net.URL. "file:rel-probe.txt")))' 2>&1 | tail -1)"
+jx_check "and through openStream, which is a byte stream" "relative-url-ok" \
+         "$(JOLT_PWD="$jx" $jolt -e '(print (.readLine (java.io.BufferedReader. (java.io.InputStreamReader. (.openStream (java.net.URL. "file:rel-probe.txt")) "UTF-8"))))' 2>&1 | tail -1)"
 # a missing namespace names .jolt in the error, so the extension is discoverable
 miss="$(JOLT_PWD="$jx" $jolt -e "(require 'jx.nope)" 2>&1 | head -1)"
 case "$miss" in

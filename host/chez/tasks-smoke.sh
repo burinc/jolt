@@ -218,6 +218,18 @@ inbb "$BB" cyc1 2>&1 | grep -q "circular task dependency" \
   && check "cycle error names the problem" "yes" "yes" \
   || check "cycle error names the problem" "yes" "no"
 
+# The same claim under --parallel, and for a cycle that spans two sibling
+# branches rather than one chain. Like the row above, a regression here HANGS
+# rather than failing — that is the shape of the bug these pin (per-thread cycle
+# detection let two parallel branches wait on each other forever).
+check "a cycle is an error under --parallel" "1" "$(status "$BB" run --parallel cyc1)"
+check "a cross-branch cycle is an error" "1" "$(status "$BB" xcyc)"
+check "a cross-branch cycle is an error under --parallel" "1" \
+  "$(status "$BB" run --parallel xcyc)"
+inbb "$BB" run --parallel xcyc 2>&1 | grep -q "circular task dependency" \
+  && check "cross-branch cycle error names the problem" "yes" "yes" \
+  || check "cross-branch cycle error names the problem" "yes" "no"
+
 printf '{:paths ["src"]}\n' > "$tmp/deps.edn"
 check "tasks with none declared" "No tasks found. Add a :tasks map to bb.edn or deps.edn." \
   "$(inbb "$tmp" tasks)"
