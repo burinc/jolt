@@ -165,10 +165,21 @@
 
 ;; Fresh free-standing var cells bound as locals; read/write with
 ;; var-get/var-set. The cells come from the host seam __local-var.
+;;
+;; The init goes into a THREAD BINDING, not the cell's root — Clojure's expansion
+;; is Var/create + setDynamic followed by pushThreadBindings, and var-set (Var.set)
+;; only ever writes a thread binding. Rooting them instead left the locals
+;; thread-bound? false and only worked because var-set used to fall back to a root
+;; write. The frame is scoped like `binding`'s, so leaving the form — by a throw as
+;; much as by returning — unbinds them again.
 (defmacro with-local-vars [bindings & body]
-  (let [binds (reduce (fn [acc p] (conj (conj acc (first p)) `(__local-var ~(second p))))
-                      [] (partition 2 bindings))]
-    `(let [~@binds] ~@body)))
+  (let [ps (partition 2 bindings)
+        binds (reduce (fn [acc p] (conj (conj acc (first p)) `(__local-var))) [] ps)
+        pairs (reduce (fn [acc p] (conj (conj acc (first p)) (second p))) [] ps)]
+    `(let* [~@binds
+            frame# (array-map ~@pairs)]
+       (push-thread-bindings frame#)
+       (try (do ~@body) (finally (pop-thread-bindings))))))
 
 ;; Canonical recursive expansion; closing goes through the host seam __close
 ;; (a map-like value's :close fn or a host file — no .close interop here).

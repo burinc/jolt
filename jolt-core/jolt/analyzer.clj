@@ -659,8 +659,9 @@
           (if me (assoc node :meta-expr me) node))))))
 
 ;; (set! (.-field obj) v) mutates a deftype instance field in place; (set! *var* v)
-;; sets the var's innermost thread binding, else its root. A local target (jolt
-;; binds fields immutably) or any other shape is uncompilable.
+;; sets the var's innermost thread binding through jolt.host/set-var! — Var.set,
+;; which throws when there is none rather than establishing a root. A local target
+;; (jolt binds fields immutably) or any other shape is uncompilable.
 (defn- analyze-set! [ctx items env]
   (let [target (nth items 1)
         val-node (analyze ctx (nth items 2) env)
@@ -777,9 +778,6 @@
                   (uncompilable (str "Unable to resolve var: "
                                      (if-let [ns (form-sym-ns sym)] (str ns "/") "")
                                      (form-sym-name sym) " in this context"))))))
-    ;; (set! *var* val): set the var's innermost thread binding; throws if none.
-    ;; Uses jolt-set-var! (not jolt-var-set — that's the public root-setter).
-    ;; supported (jolt binds fields immutably); an interop (.-field) target too.
     ;; A defmacro that is not top-level (the spine intercepts those) — e.g. one
     ;; produced by a macro like (when … (defmacro …)). Lower it the way the spine
     ;; does: def the expander fn, then mark the var a macro at runtime so later
