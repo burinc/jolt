@@ -1323,14 +1323,35 @@ fi
 # A data reader that returns a CODE form (deps.edn data_readers.clj -> reader fn)
 # must have its result spliced in and COMPILED, like Clojure — #code [:x] becomes
 # (+ 40 2) and evaluates to 42, not the literal list. A project run so the source
-# root's data_readers.clj is picked up.
+# root's data_readers.clj is picked up. The last two lines cover a *data-readers*
+# entry that holds the reader FUNCTION rather than a symbol naming it (the JVM's
+# own table shape): a form result compiles, a value result is spliced.
 dr_out="$(JOLT_PWD="$root/test/chez/datareader-app" $jolt run -m drtest.main 2>/dev/null)"
 dr_want="42
-olleh!"
+olleh!
+3
+shout-value"
 if [ "$dr_out" = "$dr_want" ]; then
   pass=$((pass + 1))
 else
-  echo "  FAIL: data readers — got \`$dr_out\`, want 42 + olleh! (#code compiled; transitive reader-ns require)"
+  echo "  FAIL: data readers — got \`$dr_out\`, want \`$dr_want\` (#code compiled; transitive reader-ns require; fn-valued table entries)"
+  fails=$((fails + 1))
+fi
+
+# Reader macros (jolt.reader): a source file registers a #<char> reader and uses
+# it BELOW in the same file, which only works because jolt reads and evaluates a
+# file one top-level form at a time. Covers both tiers (form and :raw), the
+# baked-in #$ interpolation, and clojure.core.strint's << over the same grammar.
+rm_out="$(JOLT_PWD="$root/test/chez/readermacro-app" $jolt run -m rmtest.main 2>/dev/null)"
+rm_want="[3 3]
+C:\\new
+interp 3 4
+strint 3 4
+($ % |)"
+if [ "$rm_out" = "$rm_want" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: reader macros — got \`$rm_out\`, want \`$rm_want\`"
   fails=$((fails + 1))
 fi
 

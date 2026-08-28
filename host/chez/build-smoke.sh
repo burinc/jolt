@@ -416,7 +416,8 @@ fi
 # datareader-app's #code literal builds to 42, not the literal list.
 # Also exercises transitive reader requires: #my/rev calls app.readers/reverse-str
 # which requires app.util, proving the require-graph closure pulls in helper
-# namespaces reachable only through the data-readers table.
+# namespaces reachable only through the data-readers table — and the two fn-valued
+# *data-readers* entries, whose results the emit path has to splice by value.
 drapp="$root/test/chez/datareader-app"
 drout="$(dirname "$out")/dr-bin"
 if ! JOLT_PWD="$drapp" "$jolt" build -m drtest.main -o "$drout" >/dev/null 2>&1; then
@@ -424,7 +425,9 @@ if ! JOLT_PWD="$drapp" "$jolt" build -m drtest.main -o "$drout" >/dev/null 2>&1;
 fi
 got_dr="$(cd / && "$drout" 2>&1)"
 dr_want='42
-olleh!'
+olleh!
+3
+shout-value'
 if [ "$got_dr" != "$dr_want" ]; then
   echo "  FAIL: built data-reader output mismatch"
   echo "--- want ---"; echo "$dr_want"

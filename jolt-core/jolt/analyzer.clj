@@ -31,6 +31,7 @@
                                form-ns-value? form-ns-value-name
                                form-var-value? form-var-value-ns form-var-value-name
                                form-class-value? form-class-value-name
+                               form-tagged? form-tag-name
                                unchecked-math? allow-unresolved-vars?
                                form-macro? form-expand-1 resolve-global resolvable-names
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
@@ -1605,4 +1606,11 @@
      ;; compiles to the interner call the class symbol itself compiles to.
      (form-class-value? form) (invoke (var-ref "jolt.host" "jolt-class-for")
                                       [(const (form-class-value-name form))])
+     ;; Any other #tag form is one no reader function was found for — the four
+     ;; above are the whole set the compiler builds a leaf for, and a registered
+     ;; data reader is applied before the form reaches here (loader.ss
+     ;; ldr-apply-readers). Name the tag, the way the JVM's reader does; the
+     ;; generic "unsupported form" pointed at nothing to fix.
+     (form-tagged? form) (uncompilable (str "No reader function for tag "
+                                            (form-tag-name form)))
      :else (uncompilable "unsupported form"))))

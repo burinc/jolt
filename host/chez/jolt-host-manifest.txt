@@ -38,6 +38,7 @@ deftype-ctor-class
 delete-file!
 delete-tree!
 directory?
+dispatch-macros
 enable-trace!
 entry-at
 escape-fn?
@@ -95,6 +96,8 @@ form-sym-meta
 form-sym-name
 form-sym-ns
 form-sym?
+form-tag-name
+form-tagged?
 form-syntax-quote-expand
 form-syntax-quote-lower
 form-uuid-source
@@ -133,6 +136,7 @@ image-write!
 inference-enabled?
 inline-enabled?
 inline-ir
+interpolate-parts
 interrupt!
 interrupted?
 java-hashcode
@@ -173,6 +177,7 @@ register-class-supers!
 register-extension!
 register-extension-point!
 register-source!
+remove-dispatch-macro!
 rename-file!
 resolvable-names
 resolve-class-hint
@@ -183,6 +188,7 @@ run-main-pump
 scheme-eval-string
 scheme-proc
 scheme-version
+set-dispatch-macro!
 set-field!
 set-instant-ctor!
 set-source-roots!

@@ -574,6 +574,41 @@
   ;; still wins when :clj is listed first.
   {:suite "reader-features" :expr "#?(:bb :bb-branch :clj :clj-branch)" :expected ":bb-branch"}
   {:suite "reader-features" :expr "#?(:clj :clj-first :bb :bb-second)" :expected ":clj-first"}
+  ;; jolt.reader — the # dispatch table is open for punctuation. #$ is jolt's own
+  ;; reader macro (clojure.core.strint's ~{}/~() grammar over a string literal),
+  ;; registered through the same table a program registers into.
+  {:suite "reader-macros" :expr "(let [x 3] #$\"a ~{x} b ~(inc x)\")" :expected "\"a 3 b 4\""}
+  {:suite "reader-macros" :expr "[(string? #$\"plain\") #$\"plain\"]" :expected "[true \"plain\"]"}
+  {:suite "reader-macros" :expr "#$\"~{\\\"~{\\\"}x\"" :expected "\"~{x\""}
+  {:suite "reader-macros" :expr "#$\"100~ ok ~x\"" :expected "\"100~ ok ~x\""}
+  {:suite "reader-macros" :expr "(= (quote (clojure.core/str \"a \" x)) (read-string \"#$\\\"a ~{x}\\\"\"))" :expected "true"}
+  {:suite "reader-macros" :expr "(try (load-string \"#$(+ 1 2)\") (catch Exception e (ex-message e)))" :expected "\"string interpolation reads a string literal, got (+ 1 2)\""}
+  ;; an interpolated form's offsets are into the STRING, not the file, so it
+  ;; carries no reader position — with one a throw inside ~(…) reported line 1 of
+  ;; whatever file the literal sits in. An ordinary read still positions its lists.
+  {:suite "reader-macros" :expr "[(meta (nth (read-string \"#$\\\"a ~(inc x)\\\"\") 2)) (some? (:line (meta (read-string \"(inc x)\"))))]" :expected "[nil true]"}
+  ;; edn is a closed grammar with no user extension point, so the table is not
+  ;; consulted there and #$ stays the unreadable tag it always was.
+  {:suite "reader-macros" :expr "(try (clojure.edn/read-string \"#$\\\"a\\\"\") :no-throw (catch Exception e (ex-message e)))" :expected "\"No reader function for tag $\""}
+  ;; the two registration tiers: the default reads the next form and hands it to
+  ;; the fn, :raw hands the fn the source and an index and takes back [form end].
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (r/set-dispatch-macro! \\% (fn [f] (list (quote clojure.core/vector) f f))) (load-string \"#%(+ 1 2)\"))" :expected "[3 3]"}
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (r/set-dispatch-macro! \\| (fn [s i] (let [e (.indexOf s \"|\" i)] [(subs s i e) (inc e)])) {:raw true}) (load-string \"#|a(b|\"))" :expected "\"a(b\""}
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (r/set-dispatch-macro! \\& (fn [s i] :nope) {:raw true}) (try (load-string \"#& x\") (catch Exception e (ex-message e))))" :expected "\"reader macro #& must return [form end-index]\""}
+  ;; an end-index that does not move forward would spin the read loop on the same
+  ;; character forever, so it is rejected rather than trusted.
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (r/set-dispatch-macro! \\& (fn [s i] [1 0]) {:raw true}) (try (load-string \"#& x\") (catch Exception e (ex-message e))))" :expected "\"reader macro #& returned an out-of-range end-index: 0\""}
+  ;; a character the reader claims, and a letter (which begins a #tag — a #s
+  ;; reader would swallow every #some/tag), are refused rather than shadowed.
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (try (r/set-dispatch-macro! \\{ identity) :no-throw (catch Exception e (ex-message e))))" :expected "\"cannot register a reader macro on #{: the reader claims it\""}
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (try (r/set-dispatch-macro! \\s identity) :no-throw (catch Exception e (ex-message e))))" :expected "\"cannot register a reader macro on #s: only punctuation can carry one (a letter or digit starts a #tag)\""}
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (r/set-dispatch-macro! \\% (fn [f] f)) (r/remove-dispatch-macro! \\%) (:tag (read-string \"#% x\")))" :expected "%"}
+  {:suite "reader-macros" :expr "(do (require (quote [jolt.reader :as r])) (contains? (r/dispatch-macros) \\$))" :expected "true"}
+  ;; clojure.core.strint: core.incubator's << over the same grammar #$ reads.
+  {:suite "reader-macros" :expr "(do (require (quote [clojure.core.strint :refer [<<]])) (let [v 30.5] (<< \"This trial required ~{v}ml of solution.\")))" :expected "\"This trial required 30.5ml of solution.\""}
+  {:suite "reader-macros" :expr "(do (require (quote [clojure.core.strint :refer [<<]])) (let [m {:a [1 2 3]}] (<< \"total ~(->> m :a (apply +)).\")))" :expected "\"total 6.\""}
+  {:suite "reader-macros" :expr "(do (require (quote [clojure.core.strint :refer [<<]])) (<< \"a\" \"~{(+ 1 1)}\"))" :expected "\"a2\""}
+  {:suite "reader-macros" :expr "(do (require (quote clojure.core.strint)) (try (load-string \"(clojure.core.strint/<< x)\") (catch Exception e (ex-message e))))" :expected "\"java.lang.IllegalArgumentException: << takes string literals, got x\""}
   {:suite "ns" :expr "(do (def npv 1) (some? (get (ns-publics 'user) 'npv)))" :expected "true"}
   {:suite "ns" :expr "(do (def nmv 1) (some? (get (ns-map 'user) 'nmv)))" :expected "true"}
   {:suite "ns" :expr "(map? (ns-aliases 'clojure.core))" :expected "true"}
@@ -607,6 +642,13 @@
   {:suite "reader" :expr "(true? (read-string \"true\"))" :expected "true"}
   {:suite "reader" :expr "(false? (read-string \"false\"))" :expected "true"}
   {:suite "reader" :expr "(let [r (read-string \"#foo bar\")] (and (tagged-literal? r) (= (quote foo) (:tag r)) (= (quote bar) (:form r)) (= \"#foo bar\" (pr-str r))))" :expected "true"}
+  ;; …but COMPILING one is an error, and it names the tag the way the JVM's reader
+  ;; does. It used to reach the analyzer's catch-all as "unsupported form", which
+  ;; said nothing about what to fix. The tags the compiler does build a leaf for
+  ;; are unaffected.
+  {:suite "reader" :expr "(try (load-string \"#foo/bar [1 2]\") (catch Throwable e (str e)))" :expected "\"jolt/uncompilable: No reader function for tag foo/bar\""}
+  {:suite "reader" :expr "(try (load-string \"#zz 1\") (catch Throwable e (str e)))" :expected "\"jolt/uncompilable: No reader function for tag zz\""}
+  {:suite "reader" :expr "[(try (load-string \"#inst \\\"2020-01-01\\\"\") :ok (catch Throwable e (str e))) (try (load-string \"#uuid \\\"00000000-0000-0000-0000-000000000000\\\"\") :ok (catch Throwable e (str e))) (try (load-string \"1.5M\") :ok (catch Throwable e (str e)))]" :expected "[:ok :ok :ok]"}
   {:suite "reader" :expr "(let [t (first (quote [#foo bar]))] (and (tagged-literal? t) (= (quote foo) (:tag t)) (= \"#foo bar\" (pr-str t))))" :expected "true"}
   {:suite "reader" :expr "(= \\a (read-string \"\\\\a\"))" :expected "true"}
   {:suite "reader" :expr "(= \\newline (read-string \"\\\\newline\"))" :expected "true"}

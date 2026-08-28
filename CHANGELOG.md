@@ -7,7 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Reader macros: the `#` dispatch table is open for punctuation.** Clojure's
+  is closed on principle, so `#$`, `#%`, `#|` and every other unclaimed
+  `#<punct>` is "No dispatch macro for: …" there. `jolt.reader/set-dispatch-macro!`
+  puts a reader function on one character and `#<char>` reads through it from
+  then on; `remove-dispatch-macro!` takes it back off and `dispatch-macros`
+  lists what is registered. Two tiers: the default reads the next form normally
+  and the function rewrites it, and `{:raw true}` hands the function the source
+  string and an index and takes back `[form end-index]`, which is what a literal
+  whose body is not Clojure data (a raw string, a heredoc) needs.
+
+  Registration is a runtime call and jolt reads a file one top-level form at a
+  time, so a file can register a macro and use it below — and `jolt build` loads
+  the app from source before it scans it, so a built binary reads what a run
+  reads. A character the reader already claims, and any letter or digit (which
+  begins a `#tag` — a `#s` reader would swallow every `#some/tag`), are refused
+  at registration rather than shadowed. `clojure.edn` never consults the table.
+  Additive: nothing that reads on the JVM reads differently here.
+
+- **String interpolation: `#$"…"` and `clojure.core.strint/<<`.** `#$` is the
+  one reader macro jolt ships on the seam above, applying core.incubator's
+  `~{form}` / `~(form)` grammar to a string literal at read time —
+  `#$"a ~{x} b ~(inc x)"` reads as `(str "a " x " b " (inc x))`. A string with
+  no marker reads as itself, so `#$"plain"` *is* `"plain"` and costs nothing at
+  runtime. `clojure.core.strint` ships the `<<` macro under its original name
+  and expands through the same grammar, so code written against core.incubator
+  runs unchanged.
+
 ### Fixed
+
+- **A `*data-readers*` entry holding the reader function itself.** The load path
+  accepted only a symbol naming the reader var, so a table entry added as
+  `(alter-var-root #'*data-readers* assoc 'my/tag (fn …))` — the shape the JVM's
+  own table uses — reached the analyzer as `(#<procedure> 'form)` and died there
+  as "unsupported form". A function value is now applied at load time like a
+  resolved symbol reader (a form result is spliced as code, a value result as a
+  value), and a var value resolves through its root, matching what `read-string`
+  already accepted. A table entry that is not a reader at all now says so
+  instead of emitting a form the analyzer can only call unsupported. `jolt build`
+  bakes the table into the binary and assumed every value was a symbol, so it
+  died in `symbol-t-ns` on a function; a function entry is skipped there now —
+  a closure has no literal form, and the top-level code that installed it is in
+  the binary and re-runs at startup, which puts the entry back.
+
+- **An unregistered `#tag` names the tag.** A `#foo/bar` literal with no reader
+  function reached the analyzer as a form it had no leaf for and failed with
+  `jolt/uncompilable: unsupported form`, which names nothing to fix. It reports
+  `No reader function for tag foo/bar` now, as the JVM's reader does.
 
 - **A built binary runs its app's top-level forms past `Sbuild_heap`.** Chez does
   not schedule a forked thread until the boot file has finished loading, and

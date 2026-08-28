@@ -24,6 +24,10 @@
 (define zj-type-base (zj-snap type-registry))
 (define zj-loaded-base (zj-snap loaded-ns))
 (define zj-ghier (var-cell-lookup "clojure.core" "global-hierarchy"))
+;; the #-dispatch reader macro table (reader.ss) is process-wide like the class
+;; extensions below, and it decides how the NEXT case's source reads — a row that
+;; registers #% and does not take it off would rewrite every later row's #%.
+(define zj-dispatch-base rdr-dispatch-macros)
 (define (zj-reset!)
   ;; a var-table mutation, so it takes var-table-mu like every other one (rt.ss).
   ;; This harness is single-threaded, but the invariant is easier to keep if it
@@ -52,6 +56,7 @@
   ;; row that overrides java.io.File/getPath would otherwise decide what every
   ;; later row sees.
   (class-ext-reset!)
+  (set! rdr-dispatch-macros zj-dispatch-base)
   (clear-thread-interrupt!)   ; a case that set the runner thread's interrupt flag mustn't leak
   (when zj-ghier (jolt-invoke (var-deref "clojure.core" "reset!")
                    (var-cell-root zj-ghier) (jolt-invoke (var-deref "clojure.core" "make-hierarchy"))))

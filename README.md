@@ -216,6 +216,10 @@ divergences:
   separators: edn's grammar has none, and a config that read only here would
   fail in every other edn reader. Additive — nothing that reads on the JVM
   changes meaning.
+- **Reader macros.** The `#` dispatch table is open for punctuation:
+  `jolt.reader/set-dispatch-macro!` puts a reader on a character. jolt ships
+  `#$"a ~{x}"` interpolation (`clojure.core.strint`'s grammar) on it. Additive —
+  `#<punct>` is a read error on the JVM.
 - **Clojure is a terminal dependency.** jolt *is* Clojure, so
   `org.clojure/clojure` in a `deps.edn` contributes neither an artifact nor
   children. On the JVM that artifact pulls in `org.clojure/spec.alpha`, so a

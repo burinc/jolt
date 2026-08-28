@@ -1141,24 +1141,39 @@
     (reverse order)))
 
 ;; Bake the *data-readers* table into the binary so a runtime (read-string
-;; "#my/tag …") resolves its reader fn like it does under jolt run. Tag and
-;; reader are symbols; the reader path var-derefs the fn at use time.
+;; "#my/tag …") resolves its reader fn like it does under jolt run. A reader is
+;; written as the SYMBOL naming its var (a var value is written as its own name);
+;; the reader path var-derefs the fn at use time.
 (define (bld-sym-lit s)
   (let ((ns (symbol-t-ns s)))
     (if (and ns (not (jolt-nil? ns)))
         (string-append "(jolt-symbol " (ei-str-lit ns) " " (ei-str-lit (symbol-t-name s)) ")")
         (string-append "(jolt-symbol #f " (ei-str-lit (symbol-t-name s)) ")"))))
+;; A table entry's source text, or #f for one that cannot be written as a literal.
+;; A FUNCTION value — the shape (alter-var-root #'*data-readers* assoc 'my/tag
+;; (fn …)) leaves — is skipped rather than emitted: a closure has no literal form,
+;; and the top-level code that installed it is in the binary and re-runs at
+;; startup, so the entry is back in the table before anything reads a #tag.
+;; Without the skip the emit walked a procedure into bld-sym-lit and the build
+;; died in symbol-t-ns.
+(define (bld-data-reader-lit v)
+  (cond ((symbol-t? v) (bld-sym-lit v))
+        ((var-cell? v) (bld-sym-lit (jolt-symbol (var-cell-ns v) (var-cell-name v))))
+        (else #f)))
 (define (bld-emit-data-readers out)
   (let ((tbl (var-deref "clojure.core" "*data-readers*")))
-    (when (and (pmap? tbl) (> (pmap-cnt tbl) 0))
-      (put-string out "\n;; === data readers ===\n")
-      (put-string out "(def-var! \"clojure.core\" \"*data-readers*\"\n  (jolt-assoc empty-pmap")
-      (pmap-fold tbl
-        (lambda (k v a)
-          (put-string out (string-append "\n    " (bld-sym-lit k) " " (bld-sym-lit v)))
-          a)
-        #f)
-      (put-string out "))\n"))))
+    (when (pmap? tbl)
+      (let ((pairs (pmap-fold tbl
+                     (lambda (k v a)
+                       (let ((klit (and (symbol-t? k) (bld-sym-lit k)))
+                             (vlit (bld-data-reader-lit v)))
+                         (if (and klit vlit) (cons (cons klit vlit) a) a)))
+                     '())))
+        (when (pair? pairs)
+          (put-string out "\n;; === data readers ===\n")
+          (put-string out "(def-var! \"clojure.core\" \"*data-readers*\"\n  (jolt-assoc empty-pmap")
+          (for-each (lambda (p) (put-string out (string-append "\n    " (car p) " " (cdr p)))) pairs)
+          (put-string out "))\n"))))))
 
 (define (build-binary entry-ns out-path mode natives embed-dirs ext-roots direct-link? tree-shake? library?)
   (ei-profile-init!)
