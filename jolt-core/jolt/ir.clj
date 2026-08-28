@@ -97,6 +97,19 @@
        (get node :init)
        (single-fixed-arity-fn? (get node :init))))
 
+;; Does this def's metadata opt it out of the closed world? ^:dynamic must stay
+;; rebindable by `binding` and ^:redef redefinable by a later def, so neither may
+;; be bound to a Scheme name (the back end's direct-link opt-out) NOR have its
+;; body copied into a caller (the inline pass's stash gate). Those are the same
+;; question -- can this var's value still change under code already compiled --
+;; and answering it in two places is how ^:redef came to be direct-link-exempt
+;; and inline-eligible at once: a redefinition then landed on a var nothing read
+;; any more, and the caller kept running the spliced original.
+;;
+;; Lives here, in the leaf both the back end and jolt.passes require, so the key
+;; set has one home.
+(defn closed-world-opt-out? [m] (boolean (or (get m :dynamic) (get m :redef))))
+
 ;; ---------------------------------------------------------------------------
 ;; IR schema.
 ;;

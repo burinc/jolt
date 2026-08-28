@@ -2557,7 +2557,7 @@
 
 ;; ^:dynamic / ^:redef on a def opts it out of direct-linking: it stays redefinable,
 ;; so callers must go through the var cell. m is a def's :meta (a jolt map value).
-(defn- dl-opt-out? [m] (or (get m :dynamic) (get m :redef)))
+(defn- dl-opt-out? [m] (jolt.ir/closed-world-opt-out? m))
 
 ;; Per-form entry used by the image/build emitter. In direct-link mode a TOP-LEVEL
 ;; def (form root, or spliced from a top-level do) without an opt-out also binds
