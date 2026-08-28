@@ -1512,7 +1512,13 @@
 (define (jolt-pos? n) (> (jolt-need-num n) 0))
 (define (jolt-neg? n) (< (jolt-need-num n) 0))
 (define (jolt-zero? n) (= (jolt-need-num n) 0))
-(define (jolt-identity x) x)
+;; Spliced, like the predicates in values.ss (see jolt-nil? there for why). This
+;; one is pure overhead when called: the whole body is the argument.
+(define (jolt-identity-fn x) x)
+(define-syntax jolt-identity
+  (syntax-rules ()
+    ((_ e) e)
+    ((_ e ...) (jolt-identity-fn e ...))))
 
 ;; ============================================================================
 ;; keys / vals — return seqs (nil on the empty map), HAMT-iteration order
