@@ -145,6 +145,17 @@
 ;; identity-keyed alist of mutable pairs and push. Vars without metadata yet
 ;; (early bootstrap) pass through: the check fires once metadata is settled.
 (define (jolt-push-thread-bindings frame)
+  (dyn-push-frame! (thread-binding-pairs frame))
+  jolt-nil)
+;; The scoped form, and the one to reach for: dyn-with-frame restores the whole
+;; stack instead of popping a head, so a throw (or a park) inside the extent
+;; cannot leave the frame standing for the rest of the thread. Same relationship
+;; jolt-with-ns-load-vars has to its own push!/pop! pair.
+(define (jolt-with-thread-bindings frame thunk)
+  (dyn-with-frame (thread-binding-pairs frame) thunk))
+;; A jolt map of var-cell -> value as the alist dyn-push-frame! wants, refusing a
+;; non-dynamic var on the way (the check is the JVM's, and belongs to both forms).
+(define (thread-binding-pairs frame)
   (let ((pairs (pmap-fold frame
                  (lambda (cell v acc)
                    ;; JVM semantics: only an explicitly ^:dynamic var binds. No
@@ -160,8 +171,7 @@
                          jolt-nil))))
                    (cons (cons cell v) acc))
                  '())))
-    (dyn-push-frame! pairs)
-    jolt-nil))
+    pairs))
 
 (define (jolt-pop-thread-bindings)
   (when (pair? (dyn-binding-stack))

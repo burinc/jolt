@@ -17,31 +17,64 @@
 ;; and does not depend on absolute timings, which differ per machine and flake
 ;; under parallel CI.
 ;;
-;; Ops are repeated so the fast cases clear jolt's ~1us timer granularity —
-;; several of them now measure as zero for a single call.
+;; What is compared is THROUGHPUT over a fixed time budget, not the time for a
+;; fixed number of reps, because a fixed rep count cannot serve both ends of this
+;; gate at once. The ops here are ~40ns when correct and ~20ms when broken — a
+;; 500,000x spread. A rep count small enough to keep the BROKEN case from running
+;; for an hour leaves the correct one measuring tens of microseconds, which is
+;; under the noise floor of a shared CI runner: `rseq vector` failed on main at
+;; ratio 3.22 with both arms reading 0ms, on a build where rseq is O(1).
+;; Measuring how many ops fit in a budget instead makes every arm cost the same
+;; wall time whatever its speed, and the batch self-calibrates past the ~1us
+;; timer granularity, so neither end needs a hand-tuned constant.
 
 (ns complexity-test)
 
 (def ^:private n1 50000)
 (def ^:private n2 200000)
-(def ^:private reps 2000)
 (def ^:private max-ratio 2.0)
+(def ^:private budget-ns 30000000)        ; 30ms of measurement per arm
+(def ^:private floor-ns   1000000)        ; a batch must clear 1ms to be timed
 
 (defn- timed [f]
   (let [t (System/nanoTime)]
     (f)
     (- (System/nanoTime) t)))
 
-(defn- best-of [k f]
+(defn- batch-size
+  "The smallest power-of-two batch whose single run clears floor-ns, so what gets
+  timed is the work and not the clock. A ~40ns op lands around 32k, a ~20ms one
+  at 1 — which is the whole point: the caller below never picks a rep count."
+  [f]
+  (loop [b 1]
+    (if (or (>= (timed #(dotimes [_ b] (f))) floor-ns) (>= b 1048576))
+      b
+      (recur (* 2 b)))))
+
+(defn- rate
+  "Operations per second, measured over at least budget-ns of wall time."
+  [f]
+  (let [b (batch-size f)]
+    (loop [n 0 elapsed 0]
+      (if (>= elapsed budget-ns)
+        (/ (* (double n) 1e9) (double (max 1 elapsed)))
+        (recur (+ n b) (+ elapsed (timed #(dotimes [_ b] (f)))))))))
+
+(defn- best-of
+  "The BEST rate of k rounds: a GC pause or a descheduled slice can only make a
+  round look slower, so the fastest one is the least contaminated estimate."
+  [k f]
   (f)                                     ; warm
-  (reduce min (map (fn [_] (timed f)) (range k))))
+  (reduce max (map (fn [_] (rate f)) (range k))))
 
 (def ^:private failures (atom 0))
 
-(defn- judge [label t1 t4 detail]
-  (let [ratio (double (/ (max 1 t4) (max 1 t1)))]
-    (println (format "complexity %-22s %5dms at n, %5dms at 4n, ratio %5.2f (flat ~1.0, linear ~4.0, ceiling %.1f)"
-                     label (quot t1 1000000) (quot t4 1000000) ratio max-ratio))
+(defn- judge [label r1 r4 detail]
+  ;; Rates, so the SLOWER arm is the smaller number and the ratio keeps the same
+  ;; sense it always had: flat ~1.0, linear ~4.0.
+  (let [ratio (/ r1 (max 1.0 r4))]
+    (println (format "complexity %-22s %10.0f ops/s at n, %10.0f at 4n, ratio %5.2f (flat ~1.0, linear ~4.0, ceiling %.1f)"
+                     label r1 r4 ratio max-ratio))
     (when (> ratio max-ratio)
       (println (str "FAIL complexity " label ": " detail))
       (swap! failures inc))))
@@ -65,28 +98,28 @@
       (System/exit 1))
 
     (judge "count vector-seq"
-           (best-of 3 #(dotimes [_ reps] (count s1)))
-           (best-of 3 #(dotimes [_ reps] (count s2)))
+           (best-of 3 #(count s1))
+           (best-of 3 #(count s2))
            "count is walking a vector-backed seq instead of subtracting its index from the backing vector's count (collections.ss)")
 
     (judge "drop vector-seq"
-           (best-of 3 #(dotimes [_ reps] (drop (- n1 5) s1)))
-           (best-of 3 #(dotimes [_ reps] (drop (- n2 5) s2)))
+           (best-of 3 #(drop (- n1 5) s1))
+           (best-of 3 #(drop (- n2 5) s2))
            "drop is stepping instead of jumping to the index (jolt-drop, seq.ss)")
 
     (judge "rseq vector"
-           (best-of 3 #(dotimes [_ reps] (rseq v1)))
-           (best-of 3 #(dotimes [_ reps] (rseq v2)))
+           (best-of 3 #(rseq v1))
+           (best-of 3 #(rseq v2))
            "rseq is materializing the vector — Clojure documents it as constant time (jolt-rseq, natives-seq.ss)")
 
     (judge "first sorted-map"
-           (best-of 3 #(dotimes [_ reps] (first sm1)))
-           (best-of 3 #(dotimes [_ reps] (first sm2)))
+           (best-of 3 #(first sm1))
+           (best-of 3 #(first sm2))
            "first on a sorted map is materializing the tree instead of walking to its leftmost node (25-sorted.clj :first, routed via host-table.ss)")
 
     (judge "first sorted-set"
-           (best-of 3 #(dotimes [_ reps] (first ss1)))
-           (best-of 3 #(dotimes [_ reps] (first ss2)))
+           (best-of 3 #(first ss1))
+           (best-of 3 #(first ss2))
            "first on a sorted set is materializing the tree instead of walking to its leftmost node (25-sorted.clj :first)")
 
     ;; nth's values, but deliberately NOT its cost.
@@ -133,13 +166,13 @@
                      (= (dec n1) (get m1 (dec n1))) (nil? (get m1 -1)))
         (println "FAIL complexity transient-write-few: wrong values before timing")
         (System/exit 1))
-      ;; 2000 reps, not 200: at 200 the small arm measured ~1ms, under the CI
-      ;; noise floor — one GC pause or scheduler blip in the 4n arm read 2.06
-      ;; against the 2.0 ceiling on a shared runner (fixed sits ~1.1, broken
-      ;; ~4.0). Bigger arms amortize the noise; the ceiling stays meaningful.
+      ;; This row is why the arms are sized by TIME rather than by a rep count:
+      ;; at 200 reps the small arm measured ~1ms, under the CI noise floor, and
+      ;; one GC pause in the 4n arm read 2.06 against the 2.0 ceiling on a shared
+      ;; runner (fixed sits ~1.1, broken ~4.0). The budget does that sizing now.
       (judge "transient write-few"
-             (best-of 3 #(dotimes [_ 2000] (touch m1)))
-             (best-of 3 #(dotimes [_ 2000] (touch m2)))
+             (best-of 3 #(touch m1))
+             (best-of 3 #(touch m2))
              "persistent! is rebuilding the whole map instead of freezing only the nodes the writes claimed (transients.ss jolt-persistent!, collections.ss enode-freeze)"))
 
     (if (pos? @failures)

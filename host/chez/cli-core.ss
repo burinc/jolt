@@ -215,9 +215,15 @@
     ;; comes through here too) bound only *command-line-args*, so the same
     ;; expression that works from a file or the REPL raised "Can't
     ;; change/establish root binding" here.
-    (jolt-push-thread-bindings
-      (jolt-hash-map (jolt-var "clojure.core" "*command-line-args*") cla))
-    (jolt-ns-load-vars-push!)
+    ;; Both frames are scoped, not bracketed by hand: a form that throws mid-loop
+    ;; used to skip the pops and leave them standing for the rest of the thread.
+    ;; That is invisible from `-e`, which exits through the uncaught handler, but
+    ;; run-expr-string is also the -M/-A/-Sdeps re-dispatch path, which does not.
+    (jolt-with-thread-bindings
+      (jolt-hash-map (jolt-var "clojure.core" "*command-line-args*") cla)
+      (lambda ()
+       (jolt-with-ns-load-vars
+        (lambda ()
     (let ((result (let loop ((i 0) (result jolt-nil))
                     (if (>= i end)
                         result
@@ -235,11 +241,9 @@
                                             (maybe-quote-require-args form)
                                             (chez-current-ns))))
                               result))))))
-      (jolt-ns-load-vars-pop!)
-      (jolt-pop-thread-bindings)
       (let ((s (jolt-repl-str result)))
         (when (and print? (not (string=? s "")))
-          (display s) (newline))))))
+          (display s) (newline))))))))))
 
 ;; Expose the evaluator (and the stdin reader it pairs with) to Clojure. jolt.main's
 ;; -e arm — the project-aware path, reached from -Sdeps/-A/-M, an alias's

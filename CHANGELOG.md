@@ -9,14 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`URL/openStream` on a `file:` URL answered a Reader, not an InputStream.**
+  It handed back a `StringReader` — content-correct on its own, but the wrong
+  half of the io hierarchy, so the documented composition
+  `(InputStreamReader. (.openStream u))` could not work: an `InputStreamReader`
+  drives its argument's `read(byte[], int, int)`, and a Reader answers that by
+  writing *characters* into the byte array. The failure surfaced far from the
+  call, as `#\{ is not a number` out of tools.reader, which is how
+  typedclojure's config load broke. `openStream` is a `FileInputStream` now,
+  like the JVM. Wrapping a Reader in an `InputStreamReader` (or a Writer in an
+  `OutputStreamWriter`) raises `IllegalArgumentException` where the mistake is,
+  rather than letting the byte/char confusion surface from the eventual read.
+  Reported by @burinc.
+
+- **A relative `file:` URL resolved against the process directory.** The JVM
+  resolves one against `user.dir`; jolt read it from the current working
+  directory, which under the launcher is the jolt installation root — so
+  `(slurp (java.net.URL. "file:config.clj"))` raised `FileNotFoundException`
+  for a file sitting in the project.
+
+- **The file constructors leaked a raw Chez condition instead of
+  `FileNotFoundException`.** `FileInputStream`, `FileReader`, `FileOutputStream`
+  and `FileWriter` raised something uncatchable as `java.io.FileNotFoundException`
+  when the path could not be opened, so a caller branching on that class — the
+  reason `slurp` already raised it — never ran its fallback. A directory is
+  refused at construction now, like the JVM, rather than at the first read.
+
 - **A nested set literal reached a macro as jolt's reader form.** `#{...}` reads
   as `{:jolt/type :jolt/set :value [...]}` for the analyzer, and only a set that
   *was* the whole macro argument got turned back into a set. A nested one arrived
   as the raw map, so `set?` answered false and `map?` answered **true** — the
   obvious `cond` over `vector?`/`set?`/`map?` routed a set into the map branch and
   died on the key `:jolt/type`. Clojure's `#{...}` is a reader macro, so a real
-  set exists before any macro runs; the whole argument is normalized now, at any
-  depth. Reported by @burinc (#762).
+  set exists before any macro runs; the whole call form is normalized now, at any
+  depth — including `&form`, so a macro reading `(nth &form 1)` rather than its
+  parameter sees the same shapes its arguments do. Reported by @burinc (#762).
 
 - **`getSimpleName` and `getCanonicalName` ignored class nesting.**
   `(.getSimpleName java.util.Map$Entry)` answered `"Map$Entry"` where the JVM

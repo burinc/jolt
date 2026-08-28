@@ -192,6 +192,28 @@
                        (:exit d)))]
         (if code code (recur (ex-cause e)))))))
 
+(defn- check-depends-acyclic!
+  "Walk the static :depends graph reachable from `name` and raise on a cycle
+  BEFORE anything runs. *in-progress* catches a cycle the sequential walk enters,
+  but it is per-thread and conveyed down each branch: under :parallel two sibling
+  branches force each other's delay, neither one's *in-progress* holds the other's
+  task, and the run DEADLOCKED with no output where the sequential one reported.
+  :depends is static data, so the graph is where that question is actually
+  answerable. An unknown name has no edges here — run-one! still reports it."
+  [tasks name]
+  (letfn [(walk [sym path seen]
+            (cond
+              (contains? path sym)
+              (throw (ex-info (str "circular task dependency at " sym) {:task (str sym)}))
+              (contains? seen sym) seen
+              :else
+              (conj (reduce (fn [s d] (walk (symbol d) (conj path sym) s))
+                            seen
+                            (:depends (entry tasks sym)))
+                    sym)))]
+    (walk (symbol name) #{} #{})
+    nil))
+
 (defn run-task!
   "Run one task tree. `ctx` is
   {:tasks :name :args :app-args :run-main-opts :parallel} — :args is the argv
@@ -207,6 +229,7 @@
     (reset! current-ctx ctx)
     (binding [*command-line-args* (seq app-args)]
       (try
+        (check-depends-acyclic! tasks name)
         (ensure-run! ctx (symbol name))
         (catch :default e
           (if-let [code (exit-code e)]

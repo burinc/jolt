@@ -331,6 +331,12 @@
   {:suite "reader / set literals reach a macro as sets" :label "a set inside a vector argument" :expected "true" :actual "(do (defmacro sfx-v [f] (list 'quote (set? (first (second f))))) (sfx-v (x [#{1}])))" :portability :common}
   {:suite "reader / set literals reach a macro as sets" :label "a set under a map key" :expected "true" :actual "(do (defmacro sfx-m [f] (list 'quote (set? (:k (second f))))) (sfx-m (x {:k #{1}})))" :portability :common}
   {:suite "reader / set literals reach a macro as sets" :label "the literal's metadata comes with it" :expected "[true true]" :actual "(do (defmacro sfx-r [f] (list 'quote [(set? (:roles (second f))) (:replace (meta (:roles (second f))))])) (sfx-r (x {:roles ^:replace #{:user}})))" :portability :common}
+  ;; &form is the CALL form, so it has to show the same shapes the parameters do.
+  ;; Normalizing arguments one at a time left this one place raw, and a macro that
+  ;; reads (nth &form 1) instead of its parameter — which is how a macro inspects
+  ;; a call it also rewrites — still saw set? false and map? TRUE.
+  {:suite "reader / set literals reach a macro as sets" :label "a set literal read off &form is a set" :expected "[true false]" :actual "(do (defmacro sfx-af [& _] (list 'quote [(set? (nth &form 1)) (map? (nth &form 1))])) (sfx-af #{1 2}))" :portability :common}
+  {:suite "reader / set literals reach a macro as sets" :label "&form is normalized at any depth" :expected "true" :actual "(do (defmacro sfx-ad [& _] (list 'quote (set? (first (:k (nth &form 1)))))) (sfx-ad {:k [#{1}]}))" :portability :common}
   {:suite "syntax-quote / expanded before anything sees the form" :label "in quoted data, beside an unquote" :expected "(quote [a \"b\" clojure.core/unquote])" :actual "(let [v '[a `b ~'c]] [(first v) (name (second (second v))) (first (nth v 2))])" :portability :common}
   {:suite "syntax-quote / expanded before anything sees the form" :label "in a quoted map and a quoted set" :expected "[\"v\" \"w\"]" :actual "(let [m '{:k `v} s '#{`w}] [(name (second (:k m))) (name (second (first s)))])" :portability :common}
   {:suite "syntax-quote / expanded before anything sees the form" :label "the compiler and read-string agree on a bare symbol" :expected "[\"(quote user/foo)\" \"(quote user/foo)\"]" :actual "(do (in-ns (quote user)) [(pr-str '`foo) (pr-str (read-string \"`foo\"))])" :portability :common}
@@ -1232,6 +1238,23 @@
   {:suite "io / java.net.URL" :label "no protocol throws" :expected "\"no protocol: /some/path/\"" :actual "(try (java.net.URL. \"/some/path/\") (catch java.net.MalformedURLException e (.getMessage e)))" :portability :jvm}
   {:suite "io / java.net.URL" :label "unknown protocol throws" :expected "\"unknown protocol: bogus\"" :actual "(try (java.net.URL. \"bogus://x\") (catch java.net.MalformedURLException e (.getMessage e)))" :portability :jvm}
   {:suite "io / java.net.URL" :label "jar spec is left alone" :expected "\"jar:file:/x!/y\"" :actual "(str (java.net.URL. \"jar:file:/x!/y\"))" :portability :jvm}
+  ;; openStream hands back an InputStream — the BYTE half of the io hierarchy —
+  ;; so (InputStreamReader. (.openStream u)) is the documented composition and
+  ;; works. jolt used to answer a StringReader: content-correct on its own, but an
+  ;; ISR over it drives read(byte[],int,int), which a Reader answers by writing
+  ;; CHARACTERS into the byte array, and the failure surfaced far away as
+  ;; "#\{ is not a number". typedclojure reads its config through this chain.
+  {:suite "io / java.net.URL" :label "openStream is a byte stream and composes with InputStreamReader" :expected "[true 123 \"{:a 1}\"]" :actual "(let [f (java.io.File/createTempFile \"joltisr\" \".txt\")] (spit f \"{:a 1}\") (let [u (java.net.URL. (str \"file:\" (.getAbsolutePath f))) r [(instance? java.io.InputStream (.openStream u)) (.read (java.io.InputStreamReader. (.openStream u) \"UTF-8\")) (.readLine (java.io.BufferedReader. (java.io.InputStreamReader. (.openStream u) \"UTF-8\")))]] (.delete f) r))" :portability :jvm}
+  ;; A Reader is already decoded, so wrapping one in an InputStreamReader is not
+  ;; a thing the JVM has a constructor for. Raise where the mistake is rather than
+  ;; letting the byte/char confusion surface from the eventual read.
+  {:suite "io / java.net.URL" :label "InputStreamReader over a Reader is rejected" :expected ":iae" :actual "(try (java.io.InputStreamReader. (java.io.StringReader. \"x\") \"UTF-8\") :none (catch IllegalArgumentException e :iae))" :portability :jvm}
+  ;; The file constructors raise java.io.FileNotFoundException, the class callers
+  ;; branch on; a raw Chez i/o condition is not catchable as it, so the caller's
+  ;; fallback never ran. The JVM uses this one class for missing, unreadable and
+  ;; is-a-directory alike, naming the path AS GIVEN.
+  {:suite "io / file streams" :label "a path that cannot be opened is FileNotFoundException" :expected "[:fnf :fnf :fnf :fnf]" :actual "[(try (java.io.FileInputStream. \"jolt-absent-probe.txt\") :none (catch java.io.FileNotFoundException e :fnf)) (try (java.io.FileReader. \"jolt-absent-probe.txt\") :none (catch java.io.FileNotFoundException e :fnf)) (try (java.io.FileOutputStream. \"jolt-absent-dir/probe.txt\") :none (catch java.io.FileNotFoundException e :fnf)) (try (java.io.FileInputStream. (System/getProperty \"java.io.tmpdir\")) :none (catch java.io.FileNotFoundException e :fnf))]" :portability :jvm}
+  {:suite "io / file streams" :label "the message names the path as given" :expected "\"jolt-absent-probe.txt (No such file or directory)\"" :actual "(try (java.io.FileInputStream. \"jolt-absent-probe.txt\") nil (catch java.io.FileNotFoundException e (.getMessage e)))" :portability :jvm}
   {:suite "io / with-out-str captures" :label "println" :expected "\"hi\\n\"" :actual "(with-out-str (println \"hi\"))" :portability :common}
   {:suite "io / with-out-str captures" :label "print spaces" :expected "\"a b\"" :actual "(with-out-str (print \"a\" \"b\"))" :portability :common}
   {:suite "io / with-out-str captures" :label "prn quotes" :expected "\"[1 2]\\n\"" :actual "(with-out-str (prn [1 2]))" :portability :common}

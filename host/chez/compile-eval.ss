@@ -577,16 +577,15 @@
 (define (jolt-load-string s)
   (let ((end (string-length s))
         (drl (guard (_ (#t #f)) data-readers-active)))
-    ;; dynamic-wind: a throw mid-load must still pop, or the frame leaks into
-    ;; the caller's binding stack for the rest of the thread (observed poisoning
-    ;; every later corpus case in a shared-process run).
-    (dynamic-wind
-      ;; The same frame ldr-with-file-vars gives a file and the loader gives a
-      ;; compiled namespace, from the one definition of which vars that is — this
-      ;; site listed two of the three by hand, so a (set! *unchecked-math* true)
-      ;; inside a load-string escaped into the caller and changed what its later
-      ;; arithmetic compiled to.
-      jolt-ns-load-vars-push!
+    ;; The same frame ldr-with-file-vars gives a file and the loader gives a
+    ;; compiled namespace, from the one definition of which vars that is — this
+    ;; site listed two of the three by hand, so a (set! *unchecked-math* true)
+    ;; inside a load-string escaped into the caller and changed what its later
+    ;; arithmetic compiled to. It scopes through jolt-with-ns-load-vars rather
+    ;; than a hand-rolled (dynamic-wind push! body pop!): a throw mid-load must
+    ;; still unwind the frame, and so must a PARK — dyn-binding.ss documents why
+    ;; the winder shape pushes a second frame when a fiber resumes inside it.
+    (jolt-with-ns-load-vars
       (lambda ()
         (let loop ((i 0) (result jolt-nil))
           (if (>= i end)
@@ -598,8 +597,7 @@
                                 (jolt-compile-eval-form
                                  (if drl (ldr-apply-readers form) form)
                                  (chez-current-ns))))
-                    result)))))
-      jolt-ns-load-vars-pop!)))
+                    result))))))))
 
 ;; eval / load-string are FUNCTIONS on the spine (the compiler image is resident
 ;; at runtime). eval takes an already-read FORM (e.g. from quote / list); it and

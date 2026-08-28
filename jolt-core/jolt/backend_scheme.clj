@@ -1473,7 +1473,7 @@
 ;; collector neither moves nor reclaims it while C may still call through it. The
 ;; expression evaluates to the entry-point address — a jolt pointer the caller
 ;; hands to C. :collect-safe emits the convention that reactivates the thread on
-;; entry, for callbacks invoked while it is parked in a :blocking foreign call.
+;; entry, for a callback arriving on an inactive thread (see jolt/ffi.clj).
 ;;
 ;; A :string position on a callback needs the same NULL translation a foreign-fn
 ;; gets, with the two directions swapped: C is the CALLER here, so a :string

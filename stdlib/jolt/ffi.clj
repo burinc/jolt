@@ -286,8 +286,18 @@
 ;; it where C expects a function pointer. argtypes/rettype use the same keywords
 ;; as foreign-fn; the args C passes arrive as jolt values and the jolt return is
 ;; marshaled back. The callback stays live until free-callable is called on the
-;; pointer. Pass a trailing :collect-safe when C invokes the callback from a
-;; thread parked in a :blocking foreign call (e.g. a GTK main loop):
+;; pointer.
+;;
+;; Pass a trailing :collect-safe when the callback can arrive on a thread that is
+;; not an ACTIVE jolt thread at that moment. Two ways that happens: C invokes it
+;; on a thread the runtime never started (a dispatch queue, a pthread the library
+;; spawned), or on a jolt thread currently parked in a :blocking foreign call
+;; (e.g. a GTK main loop). Either way the entry has to reactivate the thread
+;; first; without :collect-safe it runs jolt code on a thread the collector does
+;; not know is running, and the process dies with a nonrecoverable memory fault
+;; that no handler can catch. It costs an activation per call, so leave it off
+;; for a callback C only ever invokes on the thread that called into C (a qsort
+;; comparator).
 ;;   (g-signal-connect button "clicked"
 ;;                     (ffi/foreign-callable on-click [:pointer :pointer] :void :collect-safe)
 ;;                     (ffi/null))

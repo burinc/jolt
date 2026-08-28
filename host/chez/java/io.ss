@@ -558,12 +558,26 @@
         ;; protocol has no local backing and raises (the JVM would connect or read
         ;; the jar), never empty content.
         (cons "openConnection" (lambda (self . _) (url-open-connection self)))
-        (cons "openStream"     (lambda (self)
-                                 (let ((h (url-handler self)))
-                                   (if h
-                                       (record-method-dispatch (url-open-connection self)
-                                                               "getInputStream" jolt-nil)
-                                       (host-new "StringReader" (url-content self))))))))
+        (cons "openStream"     (lambda (self) (url-open-stream self)))))
+;; openStream hands back an InputStream, like the JVM (a file: URL there is a
+;; FileInputStream behind a BufferedInputStream). It used to answer a StringReader
+;; -- content-correct, but the wrong half of the io hierarchy, so the documented
+;; composition (InputStreamReader. (.openStream u)) could not work: an ISR drives
+;; its argument's read(byte[],int,int), and a Reader answers that by writing
+;; CHARACTERS into the byte array. typedclojure reads its config through exactly
+;; that chain and the failure surfaced from tools.reader as "#\{ is not a number".
+(define (url-open-stream u)
+  (let ((spec (url-spec u)))
+    (cond
+      ;; a stream handler decides what this URL means, whatever its protocol
+      ((url-handler u)
+       (record-method-dispatch (url-open-connection u) "getInputStream" jolt-nil))
+      ;; FileInputStream resolves a relative path against user.dir and raises
+      ;; java.io.FileNotFoundException for a missing one, both like the JVM.
+      ((string=? (url-protocol spec) "file")
+       (host-new "FileInputStream" (url-strip-scheme spec)))
+      (else (throw-jvm (quote java.io.IOException)
+                       (string-append "protocol doesn't support input: " spec))))))
 ;; The handler's own openConnection. Without one there is nothing to connect
 ;; through — say so rather than returning something that reads as empty.
 (define (url-open-connection u)
@@ -887,7 +901,11 @@
       ((url-handler u)
        (drain-any-stream (record-method-dispatch (url-open-connection u)
                                                  "getInputStream" jolt-nil)))
-      ((string=? (url-protocol spec) "file") (slurp-path (url-strip-scheme spec)))
+      ;; project-relative: a relative file: URL resolves against user.dir on the
+      ;; JVM, where a bare path here would resolve against the process cwd -- the
+      ;; jolt repo root under the launcher, not the project the user is in.
+      ((string=? (url-protocol spec) "file")
+       (slurp-path (project-relative (url-strip-scheme spec))))
       (else (throw-jvm (quote java.io.IOException)
                        (string-append "protocol doesn't support input: " spec))))))
 ;; Whatever the handler handed back: a byte stream, a reader, or a value that

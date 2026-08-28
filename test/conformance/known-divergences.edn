@@ -24,7 +24,7 @@
   :concurrency-model
   "compare-and-set! compares with value equality (jolt=), not JVM reference identity — Chez immediates and reconstructed values have no stable identity to compare. Deliberate (atoms.ss).",
   :permissive
-  "jolt succeeds where the JVM throws, on operations with one reasonable meaning: ex-info accepts nil data, count works on eduction, keys on a vector of pairs, (empty MapEntry) => []. A superset: portable JVM code behaves identically.",
+  "jolt succeeds where the JVM throws, on operations with one reasonable meaning: count works on eduction, keys on a vector of pairs, (empty MapEntry) => []. A superset: portable JVM code behaves identically.",
   :namespace-model
   "jolt's namespace layer is permissive: clojure.core always resolves (a :refer-clojure :exclude/:only affects syntax-quote qualification but not resolve/ns-resolve) and var privacy is not enforced across namespaces. A superset — code that resolves on the JVM resolves on jolt.",
   :deps-model
@@ -76,14 +76,28 @@
    :jvm "\"clojure.lang.LazySeq@<hash>\""
    :jolt "\"(2 3)\""
    :note "Deliberately friendlier rendering; intentionally left as is."}
-  ;; = / .equals do not respect numeric category: (= 1 1N) is true on jolt, false on
-  ;; the JVM (Long vs BigInt category). The root is jolt's numeric value-equality in =,
-  ;; not just .equals; no cheap isolated fix, so documented rather than fixed.
+  ;; .equals does not respect numeric category: (.equals {:a 1} {:a 1N}) is true on
+  ;; jolt, false on the JVM (Long vs BigInt category). The root is jolt's numeric
+  ;; value-equality, not just .equals; no cheap isolated fix, so documented.
+  ;; NOT (= 1 1N): that is TRUE on both — Clojure's = compares by numeric value
+  ;; across categories, and this entry used to claim the JVM said false.
   {:category :numeric-model
-   :behavior "(= 1 1N) and (.equals {:a 1} {:a 1N}) => true"
+   :behavior "(.equals {:a 1} {:a 1N})"
    :jvm "false"
    :jolt "true"
-   :note "Numeric-category-blind value equality; a deep = property, not a cheap fix."}
+   :note "Numeric-category-blind value equality; a deep = property, not a cheap fix. Verified against Clojure 1.12.5."}
+  ;; ex-info with explicit nil data. Both runtimes ACCEPT it — the JVM does not
+  ;; throw, which the legend used to imply — but they disagree on what ex-data
+  ;; then reports, and that flips a (when (ex-data e) ...) branch. jolt models
+  ;; every throwable as one record whose data field is nil unless given, and 25
+  ;; internal throw sites rely on that reading back as nil the way a plain
+  ;; RuntimeException's does on the JVM; separating the user-facing constructor
+  ;; from the internal one is the fix, and it is bigger than the divergence.
+  {:category :impl-detail
+   :behavior "(ex-data (ex-info \"m\" nil))"
+   :jvm "{}"
+   :jolt "nil"
+   :note "Both accept nil data; they differ in what ex-data reports. Verified against Clojure 1.12.5."}
   ;; A ^long-typed or (now) literal-init loop var is a Chez 61-bit fixnum, so its
   ;; fixed-width arithmetic raises at 2^60 where a JVM long raises/wraps at 2^63.
   ;; jolt matches JVM loop semantics (a literal-init loop var is a primitive long and
@@ -222,14 +236,6 @@
    :jvm "VerifyError at the defn (UnresolvedVarExpr emits nothing)"
    :jolt "42 — the unresolved name compiles to a late-bound var-ref"
    :note "Deliberate. The JVM's UnresolvedVarExpr is unusable in every position; jolt implements the flag's intent."}
-  ;; defn attaches :arglists to the var (like the JVM); a clojure.core fn jolt
-  ;; models as a host native-op (map/reduce/+/…) is def-var!'d directly, not via
-  ;; defn, so it carries no :arglists. Overlay defns and all user defns do. jolt-ox7c.29
-  {:category :impl-detail
-   :behavior "(:arglists (meta #'clojure.core/map))"
-   :jvm "([f coll] [f c1 c2] …)"
-   :jolt "nil"
-   :note "map/reduce/+/… are host native-ops, not defns — no source arglists to carry. Overlay + user defns have :arglists."}
   ;; a def/defn carries source position (:line/:column/:file) in its var meta, like
   ;; the JVM Compiler, for user code and loaded files. A clojure.core var built
   ;; during the seed mint (native-op or overlay defn) has no reader position, so it
@@ -353,12 +359,6 @@
    :jvm "false"
    :jolt "true"
    :note "io/reader's result and a bare StringReader are one jhost tag; the BufferedReader answer belongs to the former. Widening only, and only for readers."}
-  ;; a backquoted bare class name qualifies to clojure.core, not java.lang (class model).
-  {:category :host-model
-   :behavior "`String (syntax-quote of a bare class name)"
-   :jvm "java.lang.String"
-   :jolt "clojure.core/String"
-   :note "A consequence of the class model — a class name is not a java.lang-resolved token in syntax-quote."}
   ;; On the JVM syntax-quote is purely a reader macro, so nothing of it survives a
   ;; read. jolt's compile-path reader emits (clojure.core/syntax-quote form) and
   ;; the analyzer lowers it, which is invisible except when the form is itself
