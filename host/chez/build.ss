@@ -595,6 +595,145 @@
                                 (seq->list v))))))))
             (loop (cddr xs))))))))
 
+;; --- deferring the app's top-level forms out of the boot ---------------------
+;; Chez does not schedule a forked thread until Sbuild_heap returns. The app's
+;; emitted forms used to sit at the top level of the boot file, which is exactly
+;; that window — so a namespace top-level form that spawned a thread and waited
+;; for it never got its answer. Measured in a built binary: @(future …) hung
+;; forever, an agent send + await-for never ran the action, a promise delivered
+;; from a Thread timed out. All of them worked the moment -main started, and all
+;; of them worked under `jolt -m`, where the namespace loads after boot. The
+;; shape that found it was a top-level (clojure.java.shell/sh …): sh drains the
+;; child through two futures and derefs them with NO timeout, so it hung the
+;; process with no diagnostic.
+;;
+;; Proven below jolt: a boot file whose top level forks a thread and then sleeps
+;; two seconds reports the child never ran, and the child runs only once
+;; Sbuild_heap returns and Sscheme_start begins. Chez also refuses (collect) in
+;; that window — "cannot collect when multiple threads are active" — so the
+;; forked thread counts as active while being unable to run.
+;;
+;; So the app's forms move into the scheme-start launcher, which is past the
+;; boundary. They cannot simply be wrapped in a lambda: the app emit produces
+;; top-level (define jv$… …) forms interleaved with expressions, and Chez
+;; rejects an internal definition after an expression in a body. Instead each
+;; define is split — the binding is DECLARED at boot and ASSIGNED at init — so
+;; every jv$ name still exists at the top level and cross-form references (which
+;; is what direct-linking emits) are unchanged. Measured: an assigned top-level
+;; variable costs nothing against an immutable one in a compile-file unit (479ms
+;; vs 477ms on a 30M-iteration call loop), because such a unit compiles against
+;; the interaction environment and so cannot assume immutability either way.
+
+;; Index of PAT in S at or after START, or #f. Char-by-char rather than
+;; substring: this runs over every emitted app form of a whole application.
+(define (bld-find-substring s pat start)
+  (let ((n (string-length s)) (m (string-length pat)))
+    (let loop ((i start))
+      (cond ((fx> (fx+ i m) n) #f)
+            ((let cmp ((j 0))
+               (or (fx= j m)
+                   (and (char=? (string-ref s (fx+ i j)) (string-ref pat j))
+                        (cmp (fx+ j 1)))))
+             i)
+            (else (loop (fx+ i 1)))))))
+
+(define (bld-prefix? s pre)
+  (let ((n (string-length s)) (m (string-length pre)))
+    (and (fx>= n m) (string=? (substring s 0 m) pre))))
+
+;; The top-level (define nm …) names in one emitted app form, walking the
+;; (begin …) splice the def emit wraps its registrations in.
+;;
+;; Anything else that binds at the top level is refused rather than passed
+;; through: a define-record-type or a procedure-style define needs restructuring,
+;; not a set!, and would otherwise land in the init body as an illegal internal
+;; definition — or worse, compile and shadow. Today's app emit produces neither
+;; (records, protocols and deftypes all lower to (define jv$… <init>) plus
+;; runtime registration calls), so this is a tripwire on that staying true.
+(define (bld-app-form-defines s)
+  (let ((names '()))
+    (let ((ip (open-input-string s)))
+      (let loop ((f (read ip)))
+        (unless (eof-object? f)
+          (let walk ((f f))
+            (when (and (pair? f) (symbol? (car f)))
+              (cond
+                ((eq? (car f) 'begin) (for-each walk (cdr f)))
+                ((eq? (car f) 'define)
+                 (let ((h (and (pair? (cdr f)) (cadr f))))
+                   (unless (symbol? h)
+                     (error 'bld-app-form-defines
+                            "app form has a procedure-style define; cannot defer it" h))
+                   (set! names (cons h names))))
+                ((bld-prefix? (symbol->string (car f)) "define")
+                 (error 'bld-app-form-defines
+                        "app form has a top-level binding form the deferral cannot split"
+                        (car f)))
+                (else #f))))
+          (loop (read ip)))))
+    (reverse names)))
+
+;; Split APP-STRS into the declarations that stay at boot and the bodies that run
+;; from the launcher. Each (define nm <init>) becomes a bare (define nm) up top
+;; and a (set! nm <init>) in the body, rewritten textually so the emitted source
+;; is otherwise byte-identical — the line-number comments the back end threads
+;; through it survive, and no read/write round trip can perturb a literal. The
+;; jv$ name is unique to its var, so the occurrence is unambiguous; exactly one
+;; is required, and a miss fails the build rather than silently leaving a define
+;; that would become an illegal internal definition.
+(define (bld-defer-app-strs app-strs)
+  (let loop ((rest app-strs) (decls '()) (bodies '()))
+    (if (null? rest)
+        (values (reverse decls) (reverse bodies))
+        (let* ((s (car rest))
+               (names (bld-app-form-defines s)))
+          (loop (cdr rest)
+                (fold-left (lambda (acc nm)
+                             (cons (string-append "(define " (symbol->string nm) " (void))") acc))
+                           decls names)
+                (cons (fold-left
+                        (lambda (str nm)
+                          (let* ((n (symbol->string nm))
+                                 (pat (string-append "(define " n " "))
+                                 (at (bld-find-substring str pat 0)))
+                            (unless at
+                              (error 'bld-defer-app-strs "no (define …) text for" nm))
+                            (when (bld-find-substring str pat (fx+ at 1))
+                              (error 'bld-defer-app-strs "ambiguous (define …) text for" nm))
+                            (string-append (substring str 0 at)
+                                           "(set! " n " "
+                                           (substring str (fx+ at (string-length pat))
+                                                      (string-length str)))))
+                        s names)
+                      bodies)))))) 
+
+;; The init bodies as procedures the launcher calls, in order. Chunked rather
+;; than one procedure: a whole application's forms in a single lambda body is one
+;; enormous letrec* for Chez to compile, where the boot file used to hand it many
+;; small top-level forms. An empty chunk is not emitted — a lambda needs a body.
+(define bld-app-init-chunk 100)
+(define (bld-emit-app-init out bodies)
+  (let loop ((rest bodies) (k 0) (names '()))
+    (if (null? rest)
+        (begin
+          (put-string out "(define (jolt-app-init!)\n")
+          (if (null? names)
+              (put-string out "  #f")
+              (for-each (lambda (n) (put-string out (string-append "  (" n ")\n")))
+                        (reverse names)))
+          (put-string out ")\n"))
+        (let* ((nm (string-append "jolt-app-init$" (number->string k) "!"))
+               (chunk (let take ((r rest) (i 0) (acc '()))
+                        (if (or (null? r) (fx= i bld-app-init-chunk))
+                            (reverse acc)
+                            (take (cdr r) (fx+ i 1) (cons (car r) acc)))))
+               (after (let drop ((r rest) (i 0))
+                        (if (or (null? r) (fx= i bld-app-init-chunk)) r (drop (cdr r) (fx+ i 1))))))
+          (put-string out (string-append "(define (" nm ")\n"))
+          (for-each (lambda (s) (put-string out s) (put-string out "\n")) chunk)
+          (put-string out ")\n")
+          (loop after (fx+ k 1) (cons nm names))))))
+
 (define (bld-ns-prelude ns-name src)
   (let ((acc (list (string-append "(set-chez-ns! " (ei-str-lit ns-name) ")")))
         (nsf (let loop ((fs (ei-read-all src)))
@@ -1357,9 +1496,14 @@
           (for-each (lambda (p) (put-string out (string-append "(intern-ns! " (ei-str-lit (car p)) ")\n")))
                     ordered)
           (bld-emit-startup-profile-mark! out "app namespace registration")
-          (put-string out "\n;; === app ===\n")
-          (bld-emit-startup-profile-mark! out "app namespaces begin")
-          (for-each (lambda (s) (put-string out s) (put-string out "\n")) app-strs)
+          ;; The app's forms are DECLARED here and RUN from the launcher — see
+          ;; bld-defer-app-strs. The profile mark rides along into the init body,
+          ;; so "app namespaces begin" still brackets the work rather than the
+          ;; declarations.
+          (put-string out "\n;; === app (declarations; the bodies run at scheme-start) ===\n")
+          (let-values (((decls bodies) (bld-defer-app-strs app-strs)))
+            (for-each (lambda (s) (put-string out s) (put-string out "\n")) decls)
+            (bld-emit-app-init out (cons (bld-startup-profile-form "app namespaces begin") bodies)))
           ;; The launcher runs as Chez's scheme-start (so argv reaches -main —
           ;; top-level boot forms run during heap build, before args are set), and
           ;; suppresses the interactive greeting. It resets source roots to the
@@ -1395,6 +1539,13 @@
             (string-append
               "    (guard (v (#t (jolt-report-throwable v (current-error-port))"
               (if library? " 1))\n" " (exit 1)))\n")))
+          ;; The app's own top-level forms, first thing inside the guard: past
+          ;; Sbuild_heap (so a thread they spawn can actually run) but still
+          ;; before the optional natives and the runtime source-root reset, which
+          ;; is the order they ran in when they lived in the boot file. Being
+          ;; inside the guard is a bonus — a throw from an app top-level form used
+          ;; to escape as Chez's opaque dump, and now reports like any other.
+          (put-string out "      (jolt-app-init!)\n")
           (bld-emit-natives out natives 'optional)
            (put-string out (string-append
                               "      (let ((base (or (getenv \"JOLT_PWD\") \".\")))\n"

@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A built binary runs its app's top-level forms past `Sbuild_heap`.** Chez does
+  not schedule a forked thread until the boot file has finished loading, and
+  `jolt build` put the app's namespace top-level forms in that window — so a
+  top-level form that spawned a thread and waited for it never got an answer in a
+  built binary, while working under `jolt -m` and in the REPL. Measured at
+  namespace top level in a binary: `@(future …)` hung forever, an `agent` `send`
+  + `await-for` never ran the action, a `promise` delivered from a `Thread` timed
+  out, and `.join` returned with the thread still alive. The shape that found it
+  was a top-level `(clojure.java.shell/sh …)`, which drains the child through two
+  futures and derefs them with no timeout — so it hung the process with no
+  diagnostic at all.
+
+  The app's forms now run from the `scheme-start` launcher instead, before
+  `-main` and in the same order relative to optional natives and the source-root
+  reset that they had at boot. They also run inside the launcher's guard now, so
+  a throw from an app top-level form reports like any other error instead of
+  escaping as Chez's opaque dump. Startup is unchanged (the work moved, it did
+  not grow): 224/220/225 ms against 225/224/228 ms before, on the same app.
+
 - **`var-set` writes a thread binding, or throws.** `(var-set #'v x)` with no
   thread binding for `v` wrote `v`'s root and returned `x`; the JVM raises
   `IllegalStateException` "Can't change/establish root binding of: v with set",
