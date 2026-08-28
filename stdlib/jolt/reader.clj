@@ -36,9 +36,9 @@
         {:raw true})
       #|C:\\new|                             ;=> \"C:\\\\new\"
 
-  `end-index` must be greater than the dispatch character's own index and no
-  greater than the length of the source; a reader that returns anything else
-  raises rather than spinning or reading past the end.
+  `end-index` must be at least the index your function was handed and no greater
+  than the length of the source; a reader that returns anything else raises
+  rather than spinning on the same character or reading past the end.
 
   ## When a registration takes effect
 
@@ -54,7 +54,7 @@
 
   Only punctuation can carry a reader macro. A character the reader already
   claims (`#{ #( #\" #_ #! #' #^ ## #= #? #:`) and a letter or digit (which
-  begin a `#tag` — a `#s` reader would swallow every `#some/tag`) both raise at
+  begins a `#tag` — a `#s` reader would swallow every `#some/tag`) both raise at
   registration rather than shadowing what is there.
 
   `clojure.edn` never consults the table: edn is a closed grammar with no user

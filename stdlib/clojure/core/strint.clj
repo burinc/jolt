@@ -24,7 +24,7 @@
   literal, so a literal `~{` is written `~{\"~{\"}`. Quotes inside an embedded
   form must be escaped, since the whole thing is one string literal.
 
-  The arguments are read at macroexpansion, so they must be string literals."
+  The arguments are split at macroexpansion, so they must be string literals."
   [& strings]
   (doseq [s strings]
     (when-not (string? s)
