@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.28] - 2026-08-27
+
+Two things a namespace does constantly — name a class and read a form — were
+answering from the wrong place, and this release is mostly the fallout of
+fixing that. `resolve` was reading jolt's internal class tokens as if they were
+namespace imports, so it answered classes the namespace never imported; a
+nested class was mapped under its innermost name, minting `clojure.core`
+mappings the JVM has none of; and 38 of the 96 java.lang auto-imports had no
+class-model row, so they resolved to nil. On the reader side, a backtick and a
+set literal both survived into macro arguments as jolt's own shapes rather than
+the language's, so a macro inspecting its argument saw
+`(clojure.core/syntax-quote …)` where the JVM has a quoted symbol, and saw a set
+as a map — `map?` answering **true** for `#{}` is what took typedclojure and
+reitit down. Both are lowered up front now, over the whole form.
+
+The io shims got the same treatment. `URL/openStream` handed back a Reader where
+the JVM hands back an InputStream, so the documented
+`(InputStreamReader. (.openStream u))` composition could not work and failed
+several layers away with a message about a character not being a number.
+
+New in this release: bb.edn `:tasks`, one-shot escape continuations, class
+reflection and `clojure.reflect`, `jolt.host/extend-class!` for extending a shim,
+digit separators in number literals, and FFI fixed-array layouts with atomic
+native-error capture.
+
 ### Fixed
 
 - **`URL/openStream` on a `file:` URL answered a Reader, not an InputStream.**
@@ -6859,7 +6884,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.27...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.28...HEAD
+[0.7.28]: https://github.com/jolt-lang/jolt/compare/v0.7.27...v0.7.28
 [0.7.16]: https://github.com/jolt-lang/jolt/compare/v0.7.15...v0.7.16
 [0.7.15]: https://github.com/jolt-lang/jolt/compare/v0.7.14...v0.7.15
 [0.7.6]: https://github.com/jolt-lang/jolt/compare/v0.7.5...v0.7.6
