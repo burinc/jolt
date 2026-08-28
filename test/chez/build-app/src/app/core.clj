@@ -11,6 +11,19 @@
 ;; the :refer so the bare name resolves to app.util/greet, not a shadow.
 (defmethod greet :soft [_] "greet:soft")
 
+;; Namespace top-level code that WAITS on another thread. A built binary used to
+;; run these forms from the Chez boot file, during Sbuild_heap, where Chez does
+;; not schedule a forked thread at all — so both of these answered :TIMED-OUT in
+;; a binary while working under `jolt -m` and in the REPL. clojure.java.shell/sh
+;; is the shape that found it: it drains the child through two futures and
+;; derefs them with no timeout, so a top-level (sh …) hung forever.
+;; Bounded waits deliberately: a regression must fail with a wrong value, not by
+;; hanging the gate.
+(def boot-future (deref (future :ran) 5000 :TIMED-OUT))
+(def boot-thread (let [p (promise)]
+                   (.start (Thread. (fn [] (deliver p :ran))))
+                   (deref p 5000 :TIMED-OUT)))
+
 (defn -main [& args]
   ;; --boom: throw through a two-deep call chain so build-smoke can assert the
   ;; native stack trace. Off the normal path, so default output is unchanged.
@@ -61,4 +74,5 @@
   (println "sum:" (reduce + (map count args)))
   (println "greet-default:" (util/greet :unknown))
   (println "greet-loud:" (util/greet :loud))
-  (println "greet-soft:" (util/greet :soft)))
+  (println "greet-soft:" (util/greet :soft))
+  (println "boot-threads:" boot-future boot-thread))
