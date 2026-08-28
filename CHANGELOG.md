@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`var-set` writes a thread binding, or throws.** `(var-set #'v x)` with no
+  thread binding for `v` wrote `v`'s root and returned `x`; the JVM raises
+  `IllegalStateException` "Can't change/establish root binding of: v with set",
+  because `var-set` is `Var.set` — the same entry point `set!` on a var lowers
+  to, and `set!` already got this right. A root write is process-wide and visible
+  to every other thread, so code reference Clojure refuses to run was quietly
+  mutating shared state. The validator now runs ahead of the binding lookup too,
+  as `Var.set` does, so a rejected value reports the validator rather than the
+  missing binding.
+
+  Two core forms leaned on the old fallback and are now written the way Clojure
+  writes them. `with-redefs-fn` rebinds the **root** (`alter-var-root`) and saves
+  it through `.getRawRoot`, so a redef under an enclosing `binding` no longer
+  writes the thread-local value over the var's real root on the way out, and a
+  redef reaches threads that did not inherit this one's bindings.
+  `with-local-vars` gives each local a thread binding for the extent of the form
+  instead of a root, so `thread-bound?` on one answers `true` and the cell reads
+  back unbound once the form is left. `bound?` follows `Var.isBound` — a root
+  **or** a binding in scope.
+
 - **`ex-info` with nil data.** `(ex-data (ex-info "m" nil))` answered `nil` where
   the JVM answers `{}` — `ExceptionInfo`'s constructor rejects a null map, so an
   ExceptionInfo whose data is nil cannot exist. It flipped a

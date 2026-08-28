@@ -1881,6 +1881,29 @@
   ;; tools.reader's source-logging reader carries one out of with-local-vars and
   ;; hands it to with-bindings.
   {:suite "core / with-local-vars" :label "a local var takes a thread binding" :expected "[1 2 1]" :actual "(let [v (with-local-vars [x nil] x)] (alter-var-root v (constantly 1)) [(deref v) (with-bindings {v 2} (deref v)) (deref v)])" :portability :common}
+  ;; A local var is Var/create + pushThreadBindings, so it lives in a thread
+  ;; binding for the extent of the form and its root is never written. jolt used
+  ;; to build it root-valued and lean on var-set writing the root.
+  {:suite "core / with-local-vars" :label "a local var is thread-bound inside the form" :expected "[true true]" :actual "(with-local-vars [x 1] [(thread-bound? x) (bound? x)])" :portability :common}
+  {:suite "core / with-local-vars" :label "and unbound once the form is left" :expected "[false false]" :actual "(let [v (with-local-vars [x 1] (var-set x 2) x)] [(thread-bound? v) (bound? v)])" :portability :common}
+  {:suite "core / with-local-vars" :label "so var-set on a carried-out local var throws" :expected ":ise" :actual "(let [v (with-local-vars [x 1] x)] (try (var-set v 3) :no-throw (catch IllegalStateException e :ise)))" :portability :common}
+  {:suite "core / with-local-vars" :label "sibling locals are independent" :expected "[3 2]" :actual "(with-local-vars [x 1 y 2] (var-set x (+ (var-get x) (var-get y))) [(var-get x) (var-get y)])" :portability :common}
+  ;; var-set IS Var.set — the same entry point set! lowers to. It writes the
+  ;; current thread binding or throws; it never establishes a root. jolt used to
+  ;; fall back to a root write, which silently succeeded where Clojure refuses.
+  {:suite "vars / var-set targets the thread binding" :label "no thread binding is an IllegalStateException" :expected "[\"Can't change/establish root binding of: *vsa* with set\" 1]" :actual "(do (def ^:dynamic *vsa* 1) [(try (var-set (var *vsa*) 42) :no-throw (catch IllegalStateException e (ex-message e))) *vsa*])" :portability :common}
+  {:suite "vars / var-set targets the thread binding" :label "a non-dynamic var has no binding to set either" :expected "[:ise 1]" :actual "(do (def vsb 1) [(try (var-set (var vsb) 9) :no-throw (catch IllegalStateException e :ise)) vsb])" :portability :common}
+  {:suite "vars / var-set targets the thread binding" :label "set! and var-set report identically" :expected "[\"Can't change/establish root binding of: *vsc* with set\" \"Can't change/establish root binding of: *vsc* with set\"]" :actual "(do (def ^:dynamic *vsc* 1) (mapv (fn [f] (try (f) :no-throw (catch IllegalStateException e (ex-message e)))) [(fn [] (var-set (var *vsc*) 2)) (fn [] (set! *vsc* 2))]))" :portability :common}
+  ;; Var.set validates BEFORE it looks for a binding, so a rejected value reports
+  ;; the validator, not the missing binding.
+  {:suite "vars / var-set targets the thread binding" :label "the validator runs before the binding check" :expected "\"Invalid reference state\"" :actual "(do (def ^:dynamic *vsd* 2) (set-validator! (var *vsd*) even?) (try (var-set (var *vsd*) 3) :no-throw (catch IllegalStateException e (ex-message e))))" :portability :common}
+  {:suite "vars / var-set targets the thread binding" :label "and on the value a bound set! writes" :expected "[\"Invalid reference state\" 4 6 6]" :actual "(do (def ^:dynamic *vse* 2) (set-validator! (var *vse*) even?) (binding [*vse* 4] [(try (set! *vse* 3) :no-throw (catch IllegalStateException e (ex-message e))) *vse* (set! *vse* 6) *vse*]))" :portability :common}
+  ;; with-redefs is bindRoot, not set: it changes the ROOT, which a thread binding
+  ;; in scope still shadows.
+  {:suite "vars / var-set targets the thread binding" :label "with-redefs writes the root, so a binding still wins" :expected "[5 5]" :actual "(do (def ^:dynamic *vsf* 1) (binding [*vsf* 5] [(with-redefs [*vsf* 2] *vsf*) *vsf*]))" :portability :common}
+  {:suite "vars / var-set targets the thread binding" :label "and restores the root the binding was hiding" :expected "1" :actual "(do (def ^:dynamic *vsh* 1) (binding [*vsh* 5] (with-redefs [*vsh* 2] nil)) *vsh*)" :portability :common}
+  {:suite "vars / var-set targets the thread binding" :label "the root really moved under the binding" :expected "[2 1]" :actual "(do (def ^:dynamic *vsg* 1) [(binding [*vsg* 5] (with-redefs [*vsg* 2] (.getRawRoot (var *vsg*)))) *vsg*])" :portability :jvm}
+  {:suite "vars / var-set targets the thread binding" :label "a redef is visible to a thread that did not inherit it" :expected "[42 42]" :actual "(do (defn vsi [] 1) (with-redefs [vsi (fn [] 42)] [(vsi) (deref (future (vsi)))]))" :portability :common}
   {:suite "core / with-open" :label "body result" :expected ":r" :actual "(let [log (atom [])] (with-open [c {:close (fn [] (swap! log conj :closed))}] :r))" :portability :common}
   {:suite "core / with-open" :label "close runs" :expected "[:closed]" :actual "(let [log (atom [])] (with-open [c {:close (fn [] (swap! log conj :closed))}] :r) (deref log))" :portability :common}
   {:suite "core / with-open" :label "close on throw" :expected "[]" :actual "(let [log (atom [])] (try (with-open [c {:close (fn [] (swap! log conj :closed))}] (throw (ex-info \"boom\" {}))) (catch Exception e nil)) (deref log))" :portability :common}
