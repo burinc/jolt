@@ -331,6 +331,13 @@
   {:suite "reader / set literals reach a macro as sets" :label "a set inside a vector argument" :expected "true" :actual "(do (defmacro sfx-v [f] (list 'quote (set? (first (second f))))) (sfx-v (x [#{1}])))" :portability :common}
   {:suite "reader / set literals reach a macro as sets" :label "a set under a map key" :expected "true" :actual "(do (defmacro sfx-m [f] (list 'quote (set? (:k (second f))))) (sfx-m (x {:k #{1}})))" :portability :common}
   {:suite "reader / set literals reach a macro as sets" :label "the literal's metadata comes with it" :expected "[true true]" :actual "(do (defmacro sfx-r [f] (list 'quote [(set? (:roles (second f))) (:replace (meta (:roles (second f))))])) (sfx-r (x {:roles ^:replace #{:user}})))" :portability :common}
+  ;; &form is the CALL form, so it has to show the same shapes the parameters do.
+  ;; Normalizing arguments one at a time left this one place raw, and a macro that
+  ;; reads (nth &form 1) instead of its parameter — which is how a macro inspects
+  ;; a call it also rewrites — still saw set? false and map? TRUE.
+  {:suite "reader / set literals reach a macro as sets" :label "a set literal read off &form is a set" :expected "[true false]" :actual "(do (defmacro sfx-af [& _] (list 'quote [(set? (nth &form 1)) (map? (nth &form 1))])) (sfx-af #{1 2}))" :portability :common}
+  {:suite "reader / set literals reach a macro as sets" :label "&form is normalized at any depth" :expected "true" :actual "(do (defmacro sfx-ad [& _] (list 'quote (set? (first (:k (nth &form 1)))))) (sfx-ad {:k [#{1}]}))" :portability :common}
+  {:suite "reader / set literals reach a macro as sets" :label "&form keeps its line/column meta" :expected "true" :actual "(do (defmacro sfx-am [& _] (list 'quote (boolean (:line (meta &form))))) (sfx-am x))" :portability :common}
   {:suite "syntax-quote / expanded before anything sees the form" :label "in quoted data, beside an unquote" :expected "(quote [a \"b\" clojure.core/unquote])" :actual "(let [v '[a `b ~'c]] [(first v) (name (second (second v))) (first (nth v 2))])" :portability :common}
   {:suite "syntax-quote / expanded before anything sees the form" :label "in a quoted map and a quoted set" :expected "[\"v\" \"w\"]" :actual "(let [m '{:k `v} s '#{`w}] [(name (second (:k m))) (name (second (first s)))])" :portability :common}
   {:suite "syntax-quote / expanded before anything sees the form" :label "the compiler and read-string agree on a bare symbol" :expected "[\"(quote user/foo)\" \"(quote user/foo)\"]" :actual "(do (in-ns (quote user)) [(pr-str '`foo) (pr-str (read-string \"`foo\"))])" :portability :common}

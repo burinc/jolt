@@ -373,14 +373,22 @@
         form
         (jolt-with-meta form (jolt-dissoc2 m hc-kw-file)))))
 (define (hc-expand-1 ctx form . maybe-env)
-  (let* ((items (seq->list form))
+  ;; Normalize the WHOLE call form once, then take both the arguments and &form
+  ;; out of the result. Walking each argument separately left &form holding the
+  ;; raw shapes — a macro reading (nth &form 1) rather than its parameter still
+  ;; saw a set literal as the tagged map, set? false and map? TRUE, which is the
+  ;; #762 hazard surviving in the one place the argument walk did not reach. One
+  ;; walk is also less work than one per argument, and an unchanged form comes
+  ;; back unallocated.
+  (let* ((nform (hc-macro-arg form))
+         (items (seq->list nform))
          (head (car items))
-         (args (map hc-macro-arg (cdr items)))
+         (args (cdr items))
          (expander (var-cell-root (hc-resolve-cell ctx head)))
          (amp-env (if (pair? maybe-env) (car maybe-env) (jolt-hash-map))))
     (dynamic-wind
       (lambda () (jolt-push-thread-bindings
-                  (jolt-hash-map hc-amp-form-cell (hc-form-sans-file form) hc-amp-env-cell amp-env)))
+                  (jolt-hash-map hc-amp-form-cell (hc-form-sans-file nform) hc-amp-env-cell amp-env)))
       (lambda () (hc-propagate-pos form (apply jolt-invoke expander args)))
       (lambda () (jolt-pop-thread-bindings)))))
 
