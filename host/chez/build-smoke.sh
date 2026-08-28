@@ -87,10 +87,22 @@ done
 # throughput lever the perf audit identified) AND run wp-infer — both were opt-in
 # (--direct-link / --opt) before. $out is still the plain release build here.
 
-# The cross-ns app.core -> app.util/shout call lowers to a direct jv$ binding in
-# the plain release build, not var-deref.
-if ! grep -q '(jv\$app.util\$shout' "$out.build/flat.ss"; then
+# The cross-ns app.core -> app.util/shout reference is direct-linked in the plain
+# release build, not var-routed.
+#
+# Asserted on the BINDING, not on a (jv$app.util$shout ...) call form. Release
+# inlines now (jolt-mbcm.6), and shout is small enough to be spliced into its
+# caller, so there is no call left to find -- the old assertion failed on a build
+# that had done MORE than it asked for. The binding is emitted for every
+# direct-linked def whether or not any particular call to it survives, and it is
+# absent entirely under --no-direct-link, so it still discriminates.
+if ! grep -q 'define jv\$app.util\$shout' "$out.build/flat.ss"; then
   echo "  FAIL: release build did not direct-link the app->app call"; exit 1
+fi
+# ...and nothing reads it through its var, which is the thing direct-linking is
+# for. This holds whether the call was spliced or left as a jv$ application.
+if grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")' "$out.build/flat.ss"; then
+  echo "  FAIL: release build still var-routed the app->app call"; exit 1
 fi
 
 # wp-infer ran: a hintless double fn (app.util/area, called with 2.0) gets its
@@ -172,8 +184,13 @@ fi
 if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out.nodl" --no-direct-link >/dev/null 2>&1; then
   echo "  FAIL: jolt build --no-direct-link exited non-zero"; exit 1
 fi
-if grep -q '(jv\$app.util\$shout' "$out.nodl.build/flat.ss"; then
+if grep -q 'define jv\$app.util\$shout' "$out.nodl.build/flat.ss"; then
   echo "  FAIL: --no-direct-link still direct-linked the app->app call"; exit 1
+fi
+# and it IS var-routed there -- without this the check above would pass on a
+# build that emitted no reference to shout at all.
+if ! grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")' "$out.nodl.build/flat.ss"; then
+  echo "  FAIL: --no-direct-link did not var-route the app->app call"; exit 1
 fi
 # An OPEN-WORLD build maps its frames too. emit-def-cached only emits a source
 # registration under direct-link, so without one a built binary printed a bare
@@ -273,7 +290,7 @@ if [ "$got_dl" != "$want" ]; then
   echo "--- got ----"; echo "$got_dl"
   exit 1
 fi
-if ! grep -q '(jv\$app.util\$shout' "$out.build/flat.ss"; then
+if ! grep -q 'define jv\$app.util\$shout' "$out.build/flat.ss"; then
   echo "  FAIL: --direct-link did not emit a direct app->app call"; exit 1
 fi
 # A direct-link build registers fn sources, so an uncaught throw prints a Clojure
@@ -282,13 +299,27 @@ if ! grep -q 'jolt-register-source!' "$out.build/flat.ss"; then
   echo "  FAIL: --direct-link did not emit source registrations"; exit 1
 fi
 boom_err="$(cd / && "$out" --boom 2>&1 >/dev/null)"
-for frame in 'app.util/deep-boom' 'app.util/mid-boom' 'app.core/-main'; do
-  if ! printf '%s' "$boom_err" | grep -q "$frame"; then
-    echo "  FAIL: stack trace missing frame $frame"
-    echo "--- got ----"; echo "$boom_err"
-    exit 1
-  fi
-done
+# A direct-linked build INLINES (jolt-mbcm.6), and a spliced callee has no frame
+# at runtime to name -- deep-boom and mid-boom are both small enough to travel,
+# so this three-deep chain reports one frame where the --no-direct-link build
+# above reports three. That is the cost of splicing, recorded here rather than
+# papered over: what a direct-linked trace still gives you is the message and the
+# outermost frame, located.
+#
+# The three-frame assertion lives on the --no-direct-link build (see the
+# nodl_boom loop above), which does not splice -- that is what keeps per-frame
+# source mapping under test at all. Recovering the spliced names needs an
+# inline-range table the reporter can consult; filed, not done.
+if ! printf '%s' "$boom_err" | grep -q 'Assert failed: needs a number'; then
+  echo "  FAIL: stack trace lost the error message"
+  echo "--- got ----"; echo "$boom_err"
+  exit 1
+fi
+if ! printf '%s' "$boom_err" | grep -Eq 'app\.core/-main .*core\.clj:[0-9]'; then
+  echo "  FAIL: stack trace missing the located outermost frame"
+  echo "--- got ----"; echo "$boom_err"
+  exit 1
+fi
 
 # A pure-fn fold must not discard a throwing op. scalar-replace folds
 # (:a {:a 1 :b (/ 1 0)}) -> 1 under --opt --direct-link, dropping the sibling;

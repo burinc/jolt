@@ -30,9 +30,19 @@
 ;; sets `dirty` when it rewrote something; the loop stops at a clean pass or here.
 (def ^:private inline-fixpoint-cap 8)
 
-;; A top-level defn the inline pass may splice: a single fixed arity (no rest). The
-;; pass itself checks body size + closedness, so any such fn is stashable.
-(defn- inline-eligible? [node] (jolt.ir/single-fixed-arity-fn-def? node))
+;; A top-level defn the inline pass may splice: a single fixed arity (no rest),
+;; and NOT opted out of the closed world. The pass itself checks body size +
+;; closedness, so any such fn is stashable.
+;;
+;; The opt-out check is the same one the back end applies to direct-linking, and
+;; it has to be, because splicing is the stronger commitment: a ^:redef def is
+;; left var-routed so a later redefinition reaches its callers, and copying its
+;; body into one of them defeats exactly that. Refused at the STASH rather than
+;; at the splice site, so an opted-out fn never enters the graph the cycle walk
+;; and the fixpoint traverse.
+(defn- inline-eligible? [node]
+  (and (jolt.ir/single-fixed-arity-fn-def? node)
+       (not (jolt.ir/closed-world-opt-out? (:meta node)))))
 
 (defn- stash-of [node]
   (let [a (first (:arities (:init node)))]
@@ -76,20 +86,24 @@
 
   Three modes, determined by host-contract flags:
 
-  **Full optimization** (optimize + direct-link enabled):
+  **Full optimization** (passes on + direct-link):
     run inline + flatten + scalar-replace + const-fold to a capped fixpoint —
     inlining exposes map literals to lookups, scalar-replace collapses them,
     which may expose more — then a collection-type inference pass (optionally
     also emitting success diagnostics) that auto-drops the lookup guard where
-    the type is proven. Used for --opt --direct-link builds.
+    the type is proven. This is what every `jolt build` gets, release and --opt
+    alike: inlining follows LINKAGE, because a spliced body is sound exactly
+    when the callee's var cannot be redefined under it.
 
-  **Inference mode** (release or optimize without direct-link):
+  **Inference mode** (passes on, dynamically linked):
     setup record/protocol shapes (redefinition-safe caches), then run const-fold,
     collection-type inference (with seeds if available), and numeric annotate —
-    without inline/scalar. Used for release builds and --opt (no --direct-link).
+    without inline/scalar. Reached by --no-direct-link (or :jolt/build
+    {:direct-link false}), where every def stays redefinable and so cannot be
+    spliced, but the type inference still holds.
 
-  **Dev/normal** (optimize off, no release):
-    just const-fold + numeric annotate, as before.
+  **Dev/normal** (passes off):
+    just const-fold + numeric annotate. --dev, and the runtime compile spine.
 
   numeric/annotate runs last in all branches (hint-directed fl*/fx* arithmetic);
   it benefits open builds too, so it is not gated on inlining.
