@@ -21,6 +21,7 @@ clojure.core.async
 clojure.core.async.lab
 clojure.core.protocols
 clojure.core.rrb-vector
+clojure.core.strint
 clojure.data
 clojure.datafy
 clojure.instant
@@ -66,6 +67,7 @@ jolt.parser.combinators
 jolt.parser.monad
 jolt.parser.position
 jolt.process
+jolt.reader
 jolt.scheme
 jolt.socket
 jolt.tasks

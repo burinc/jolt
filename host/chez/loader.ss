@@ -106,6 +106,33 @@
                 (jolt-throw
                   (jolt-ex-info msg (jolt-hash-map (keyword #f "tag") tag-kw) orig)))))
     (jolt-invoke rfn inner)))
+
+;; The reader FUNCTION for a *data-readers* value: a fn as-is, a var's root, or a
+;; qualified symbol's var — the same three shapes the read-string path accepts
+;; (reader.ss rdr-data-reader-fn). The load path took symbols only, so an entry
+;; added with (alter-var-root #'*data-readers* assoc 'my/tag (fn …)) reached the
+;; analyzer as (#<procedure> 'form) and died there as "unsupported form".
+(define (ldr-reader-fn rdr)
+  (cond
+    ((procedure? rdr) rdr)
+    ((var-cell? rdr) (let ((f (var-cell-root rdr))) (and (procedure? f) f)))
+    ((and (symbol-t? rdr) (not (jolt-nil? (symbol-t-ns rdr))))
+     (guard (e (#t #f))
+       (let ((v (var-deref (symbol-t-ns rdr) (symbol-t-name rdr))))
+         (and (procedure? v) v))))
+    (else #f)))
+
+;; The deferred shape, (reader-fn 'inner) evaluated at runtime. Only a SYMBOL
+;; reader can be written as a call; anything else that reaches here is a table
+;; entry that is not a reader at all, and saying so beats emitting a form the
+;; analyzer can only report as "unsupported form".
+(define (ldr-reader-call tag-kw rdr inner)
+  (if (symbol-t? rdr)
+      (jolt-list rdr (jolt-list (jolt-symbol #f "quote") inner))
+      (jolt-throw (jolt-ex-info
+                    (string-append "data reader " (keyword-t-name tag-kw) " is not a function")
+                    (jolt-hash-map (keyword #f "tag") tag-kw)))))
+
 ;; change-tracking walk: rewrite registered #tag forms, keep everything else
 ;; (and its identity/metadata) intact. Mirrors reader.ss rdr-form->data but keeps
 ;; set FORMS for the compiler spine instead of building real sets.
@@ -124,23 +151,26 @@
            ;; Clojure applies a data reader at read time and substitutes its result
            ;; as code. A reader that returns a FORM (a list — e.g. borkdude.html's
            ;; #html expands to (->Html (str …))) must be compiled, so splice it in.
-           ;; A reader that returns a VALUE (time-literals #time/date -> a Date) is
-           ;; left as a runtime call (reader-fn 'inner): the value rebuilds at
-           ;; startup, which also keeps a non-serializable constant out of an AOT
-           ;; build. The reader runs at load time only when its var RESOLVES — a
-           ;; reader whose ns isn't loaded yet falls back to the runtime call. A
-           ;; resolved reader that throws surfaces (the prior catch-all guard
-           ;; silently downgraded every reader bug to a runtime call).
-           (let ((rfn (and (symbol-t? rdr) (not (jolt-nil? (symbol-t-ns rdr)))
-                           (let ((v (var-deref (symbol-t-ns rdr) (symbol-t-name rdr))))
-                             (and (procedure? v) v)))))
+           ;; A reader NAMED BY A SYMBOL that returns a VALUE (time-literals
+           ;; #time/date -> a Date) is left as a runtime call (reader-fn 'inner):
+           ;; the value rebuilds at startup, which also keeps a non-serializable
+           ;; constant out of an AOT build. A fn/var reader has no name to call,
+           ;; so its value is spliced in. The reader runs at load time only when
+           ;; it RESOLVES — a reader whose ns isn't loaded yet falls back to the
+           ;; runtime call. A resolved reader that throws surfaces (the prior
+           ;; catch-all guard silently downgraded every reader bug to a call).
+           (let ((rfn (ldr-reader-fn rdr)))
              (if rfn
                  (let ((result (ldr-invoke-reader (jolt-get x rdr-kw-tag) rfn inner)))
-                   (if (cseq? result)
-                       result
-                       (jolt-list rdr (jolt-list (jolt-symbol #f "quote") inner))))
+                   (cond
+                     ((cseq? result) result)
+                     ;; a SYMBOL reader has a name to call at runtime
+                     ((symbol-t? rdr) (ldr-reader-call (jolt-get x rdr-kw-tag) rdr inner))
+                     ;; a fn/var reader has no name to defer to, so splice the value
+                     ;; it just produced — what the read-string path does anyway
+                     (else result)))
                  ;; unresolved reader (ns not loaded yet): runtime-call fallback
-                 (jolt-list rdr (jolt-list (jolt-symbol #f "quote") inner)))))
+                 (ldr-reader-call (jolt-get x rdr-kw-tag) rdr inner))))
          ((eq? inner (jolt-get x rdr-kw-form)) x)
          (else (rdr-make-tagged (jolt-get x rdr-kw-tag) inner)))))
     ((rdr-set-form? x)

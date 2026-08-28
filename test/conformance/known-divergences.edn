@@ -6,7 +6,7 @@
   :host-model
   "no JVM host: classes->name strings, type->symbol, *in* is a map, inline-impl extenders, duck-typed with-open close",
   :reader-model
-  "jolt reader features (:jolt :bb) + syntax-quote literal collapse (spec 2.4 S25); map source-order preserved. nested #() literals read where the JVM rejects them. (#=(...) evaluates at read time gated by *read-eval* now, like the JVM.)",
+  "jolt reader features (:jolt :bb) + syntax-quote literal collapse (spec 2.4 S25); map source-order preserved. nested #() literals read where the JVM rejects them. (#=(...) evaluates at read time gated by *read-eval* now, like the JVM.) The # dispatch table is open for punctuation (jolt.reader), which is where the #$ interpolation reader lives.",
   :printer-model
   "jolt printer renders transients/atoms/print-method overrides differently from JVM #object",
   :strictness
@@ -775,7 +775,34 @@
    :jolt "raises \"Could not locate clojure/spec/alpha.jolt (or .clj/.cljc) on the source roots\""
    :check :prose
    :why "project-level: needs a deps.edn resolution rather than an expression"
-   :note "Declare org.clojure/spec.alpha and org.clojure/core.specs.alpha explicitly; declared that way they resolve as ordinary Maven dependencies. Affects any library that requires spec without declaring it."}]
+   :note "Declare org.clojure/spec.alpha and org.clojure/core.specs.alpha explicitly; declared that way they resolve as ordinary Maven dependencies. Affects any library that requires spec without declaring it."}
+  ;; jolt's `#` dispatch table is OPEN for punctuation: jolt.reader registers a
+  ;; reader function on one character and `#<char>` reads through it from then on.
+  ;; The JVM's is closed on principle — "why Clojure does not allow to introduce
+  ;; new syntax like Common Lisp" — so every unclaimed `#<punct>` is a read error
+  ;; there. That direction makes this a superset: nothing that reads on the JVM
+  ;; reads differently here. The two tiers, the refused characters, and both error
+  ;; shapes are pinned jolt-side in unit.edn ("reader-macros").
+  {:category :reader-model
+   :behavior "(jolt.reader/set-dispatch-macro! \\% f), then #%form"
+   :jvm "there is no such namespace and no way to add a dispatch character"
+   :jolt "#% reads through f from the next form on"
+   :check {:expr "(do (require (quote [jolt.reader :as r])) (r/set-dispatch-macro! \\% (fn [f] (list (quote clojure.core/vector) f f))) (load-string \"#%(+ 1 2)\"))"
+           :jvm "throws FileNotFoundException"
+           :jolt "[3 3]"}
+   :note "Opt-in and process-wide, like Common Lisp's set-dispatch-macro-character. A character the reader claims, and any letter or digit (which begins a #tag), are refused at registration rather than shadowed."}
+  ;; The one reader macro jolt ships on that seam: #$"…" interpolates ~{form} and
+  ;; ~(form) into the string, clojure.core.strint's grammar applied at read time.
+  ;; Rich Hickey passed on string interpolation in 2009 and again in 2012 and the
+  ;; JVM reader has no $ dispatch, so this too only adds readings.
+  {:category :reader-model
+   :behavior "#$\"a ~{x} b ~(inc x)\" with x bound to 3"
+   :jvm "read error: No dispatch macro for: $"
+   :jolt "\"a 3 b 4\" — reads as (clojure.core/str \"a \" x \" b \" (inc x))"
+   :check {:expr "(let [x 3] #$\"a ~{x} b ~(inc x)\")"
+           :jvm "throws RuntimeException"
+           :jolt "\"a 3 b 4\""}
+   :note "clojure.core.strint/<< ships alongside it and expands through the same grammar; a string with no marker reads as itself, so #$\"plain\" IS \"plain\"."}]
  :entries
  [;; Wherever a syntax-quote's CONSTRUCTION CODE becomes a value rather than
   ;; being compiled — a nested backtick, a quoted one, a macro's argument —

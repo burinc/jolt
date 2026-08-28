@@ -71,6 +71,14 @@
 ;; erroring; the scanner only extracts require clauses and discards every
 ;; other form, so the placeholder value is never observed.
 (define rdr-scan-mode (make-parameter #f))
+;; Suppress the :line/:column/:file metadata a list form carries. Set while
+;; reading a form out of a string that is NOT the source being read — the
+;; ~(…) inside a #$ interpolation, whose offsets are into the string literal.
+;; Attaching them would report line 1 of the real file for a throw inside the
+;; interpolated form, and would thrash rdr-line-col-at's per-string cursor back
+;; and forth between the two strings. With no position of its own the form
+;; inherits the enclosing form's, which is the right answer.
+(define rdr-suppress-pos (make-parameter #f))
 
 (define (rdr-skip-ws s i end)
   (let loop ((i i))
@@ -918,6 +926,169 @@
   (let ((v (jolt-var-get rdr-read-eval-cell)))
     (and v (not (jolt-nil? v)))))
 
+;; --- user reader macros -----------------------------------------------------
+;; Clojure's dispatch table is closed: after a `#`, the reader claims a fixed set
+;; of characters, a letter starts a data-reader tag, and everything else is a read
+;; error ("No dispatch macro for: $"). jolt owns its reader, so the punctuation
+;; half of that table is open here — a program registers a reader for one
+;; character and `#<c>` from then on reads through it. It is the seam the two
+;; things Clojure never shipped both need: string interpolation (`#$"…"` below)
+;; and user-defined reader macros. See stdlib/jolt/reader.clj.
+;;
+;; Two tiers, the same shape as jolt.host/extend-class!:
+;;   form tier  (fn [form]) -> form         the next form is read normally and the
+;;                                          registered fn rewrites it
+;;   raw  tier  (fn [src i]) -> [form j]    the fn reads the SOURCE itself, from
+;;                                          index i, and says where it stopped
+;; The raw tier is for a literal whose body is not Clojure data (a raw string, a
+;; heredoc); the form tier covers everything else. Either way a registration is
+;; a runtime call and jolt reads a file one top-level form at a time, so a file
+;; can register a macro and use it below — and `jolt build` loads the app from
+;; source before it scans it, so a build reads what a run reads.
+;;
+;; A character the reader itself claims can never be registered, and neither can
+;; a letter or a digit — those begin a data-reader tag, so a `#s` reader would
+;; silently swallow every `#some/tag`. Registration throws on both rather than
+;; shadowing.
+;;
+;; The table is an immutable alist swapped whole under a mutex. Reads happen on
+;; every `#` in every file jolt reads and take no lock: a reader sees either the
+;; old list or the new one, where a Chez hashtable read while another thread
+;; writes it faults in the collector.
+(define rdr-dispatch-mu (make-mutex))
+(define rdr-dispatch-macros '())        ; ((char raw? . fn) …) — swapped, never mutated
+
+(define (rdr-dispatch-macro-ref c)
+  (let ((tbl rdr-dispatch-macros))      ; one read of the pointer, then work off it
+    (and (pair? tbl) (assv c tbl))))
+
+;; the characters rdr-read-dispatch handles itself, above the registry clause
+(define rdr-dispatch-builtins '(#\{ #\( #\" #\_ #\! #\' #\^ #\# #\= #\? #\:))
+(define (rdr-dispatch-char-ok? c)
+  (and (char? c)
+       (not (memv c rdr-dispatch-builtins))
+       (not (char-alphabetic? c))       ; a data-reader tag's first character
+       (not (char-numeric? c))
+       (not (rdr-ws? c))                ; whitespace and the comma the reader skips
+       (not (memv c '(#\; #\\ #\) #\] #\}))))) ; comment, char literal, closers
+
+(define (rdr-dispatch-reject c why)
+  (jolt-throw (jolt-ex-info (string-append "cannot register a reader macro on #"
+                                           (if (char? c) (string c) (jolt-pr-str c))
+                                           ": " why)
+                            (jolt-hash-map (keyword #f "char") c))))
+
+(define (rdr-set-dispatch-macro! c fn raw?)
+  (unless (char? c) (rdr-dispatch-reject c "not a character"))
+  (when (memv c rdr-dispatch-builtins) (rdr-dispatch-reject c "the reader claims it"))
+  (unless (rdr-dispatch-char-ok? c)
+    (rdr-dispatch-reject c "only punctuation can carry one (a letter or digit starts a #tag)"))
+  (unless (procedure? fn)
+    (jolt-throw (jolt-ex-info "a reader macro must be a function" (jolt-hash-map))))
+  (jolt-with-mutex rdr-dispatch-mu
+    (set! rdr-dispatch-macros
+          (cons (cons c (cons (and (jolt-truthy? raw?) #t) fn))
+                (filter (lambda (e) (not (eqv? (car e) c))) rdr-dispatch-macros))))
+  jolt-nil)
+
+(define (rdr-remove-dispatch-macro! c)
+  (jolt-with-mutex rdr-dispatch-mu
+    (set! rdr-dispatch-macros (filter (lambda (e) (not (eqv? (car e) c))) rdr-dispatch-macros)))
+  jolt-nil)
+
+;; {char fn} of what is registered — the tier is not in it: a caller re-registers
+;; with the tier it wants rather than reading one back out.
+(define (rdr-dispatch-macro-map)
+  (let loop ((es rdr-dispatch-macros) (acc '()))
+    (if (null? es)
+        (apply jolt-hash-map acc)
+        (loop (cdr es) (cons (caar es) (cons (cddr (car es)) acc))))))
+
+;; Apply a registered reader macro. i points AT the dispatch character.
+(define (rdr-apply-dispatch-macro entry s i end)
+  (let ((c (car entry)) (raw? (cadr entry)) (fn (cddr entry)))
+    (if raw?
+        (let ((res (jolt-invoke fn s (+ i 1))))
+          (unless (and (pvec? res) (= 2 (vector-length (pvec-v res))))
+            (rdr-error s i (string-append "reader macro #" (string c)
+                                          " must return [form end-index]")))
+          (let ((j (vector-ref (pvec-v res) 1)))
+            ;; the index has to move forward and stay inside the input, or the
+            ;; read loop above either spins on the same character forever or
+            ;; indexes past the end of the string.
+            (unless (and (integer? j) (exact? j) (>= j (+ i 1)) (<= j end))
+              (rdr-error s i (string-append "reader macro #" (string c)
+                                            " returned an out-of-range end-index: "
+                                            (jolt-pr-str j))))
+            (values (vector-ref (pvec-v res) 0) j)))
+        (let-values (((form j) (rdr-read-form s (+ i 1) end)))
+          (when (rdr-eof? form)
+            (rdr-error s i (string-append "EOF after #" (string c))))
+          (values (jolt-invoke fn form) j)))))
+
+;; --- #$"…" — string interpolation -------------------------------------------
+;; clojure.core.strint's ~{form} / ~(form) markers, applied to a string LITERAL
+;; at read time:
+;;
+;;   #$"a ~{x} b ~(inc x)"  ->  (clojure.core/str "a " x " b " (inc x))
+;;
+;; A string with no marker reads as itself, so #$"plain" IS "plain" and costs
+;; nothing at runtime. A `~` that is not followed by `{` or `(` is literal, as in
+;; strint; a literal `~{` is written `~{"~{"}`.
+;;
+;; This is registered through the table above rather than wired into
+;; rdr-read-dispatch directly, so (jolt.reader/dispatch-macros) lists it and
+;; jolt.reader/remove-dispatch-macro! takes it back off like any other.
+(define (rdr-interp-error msg str)
+  (jolt-throw (jolt-ex-info (string-append msg ": " (jolt-pr-str str)) (jolt-hash-map))))
+
+(define (rdr-interp-parts str)
+  (let ((n (string-length str)))
+    (let loop ((i 0) (lit '()) (parts '()))
+      (let ((flush (lambda (ps) (if (null? lit) ps (cons (list->string (reverse lit)) ps)))))
+        (cond
+          ((>= i n) (reverse (flush parts)))
+          ((and (char=? (string-ref str i) #\~) (< (+ i 1) n)
+                (memv (string-ref str (+ i 1)) '(#\{ #\()))
+           (let ((brace? (char=? (string-ref str (+ i 1)) #\{)))
+             ;; ~{x} delimits the form with the brace; ~(f x) IS the form, so the
+             ;; read starts on the paren and consumes its own closer.
+             (let-values (((form j) (parameterize ((rdr-suppress-pos #t))
+                                      (rdr-read-form str (if brace? (+ i 2) (+ i 1)) n))))
+               (when (rdr-eof? form)
+                 (rdr-interp-error "EOF in an interpolated form" str))
+               (let ((k (if brace?
+                            (let ((k (rdr-skip-ws str j n)))
+                              (unless (and (< k n) (char=? (string-ref str k) #\}))
+                                (rdr-interp-error "unterminated ~{…} in an interpolated string" str))
+                              (+ k 1))
+                            j)))
+                 (loop k '() (cons form (flush parts)))))))
+          (else (loop (+ i 1) (cons (string-ref str i) lit) parts)))))))
+
+(define (rdr-interp-check! str)
+  (unless (string? str)
+    (jolt-throw (jolt-ex-info (string-append "string interpolation reads a string literal, got "
+                                             (jolt-pr-str str))
+                              (jolt-hash-map)))))
+
+;; the literal-and-form parts, in source order — what clojure.core.strint's <<
+;; splices into its own (str …) so the macro and the reader macro share one
+;; implementation of the ~{} / ~() grammar.
+(define (rdr-interpolate-parts str)
+  (rdr-interp-check! str)
+  (apply jolt-vector (rdr-interp-parts str)))
+
+(define (rdr-interpolate str)
+  (rdr-interp-check! str)
+  (let ((parts (rdr-interp-parts str)))
+    (cond
+      ((null? parts) "")
+      ((and (null? (cdr parts)) (string? (car parts))) (car parts))
+      (else (apply jolt-list (jolt-symbol "clojure.core" "str") parts)))))
+
+(rdr-set-dispatch-macro! #\$ rdr-interpolate #f)
+
 (define (rdr-read-dispatch s i end)      ; i points just past the '#'
   (when (>= i end) (rdr-error s i "EOF after #"))
   (let ((c (string-ref s i)))
@@ -981,6 +1152,11 @@
        (rdr-read-reader-cond s (+ i 1) end))
       ((char=? c #\:)                    ; #:ns{...} namespaced map literal
        (rdr-read-ns-map s (+ i 1) end))
+      ;; a registered reader macro (see the table above). EDN has a closed
+      ;; grammar and no user extension point, so clojure.edn never consults it —
+      ;; a #$ there stays the unreadable tag it already was.
+      ((and (not (rdr-edn-mode)) (rdr-dispatch-macro-ref c))
+       => (lambda (entry) (rdr-apply-dispatch-macro entry s i end)))
       (else                              ; #tag form -> tagged {:tag :#tag :form ...}
        (let-values (((tok j) (rdr-read-token s i end)))
          (let-values (((form k) (rdr-read-form s j end)))
@@ -1046,9 +1222,14 @@
         (values rdr-eof i)
         (let ((c (string-ref s i)))
           (cond
-            ((char=? c #\() (let-values (((line col) (rdr-line-col-at s i)))
-                              (let-values (((es j) (rdr-read-seq s (+ i 1) end #\))))
-                                (values (rdr-attach-pos (apply jolt-list es) line col) j))))
+            ((char=? c #\()
+             (let-values (((es j) (rdr-read-seq s (+ i 1) end #\))))
+               (let ((lst (apply jolt-list es)))
+                 (values (if (rdr-suppress-pos)
+                             lst
+                             (let-values (((line col) (rdr-line-col-at s i)))
+                               (rdr-attach-pos lst line col)))
+                         j))))
             ((char=? c #\[) (let-values (((es j) (rdr-read-seq s (+ i 1) end #\])))
                               (values (apply jolt-vector es) j)))
             ((char=? c #\{) (let-values (((es j) (rdr-read-seq s (+ i 1) end #\})))
@@ -1613,6 +1794,16 @@
   (let ((r (rdr-parse-at s i)))
     (if r (jolt-vector (car r) (cdr r)) jolt-nil)))
 
+
+;; --- the reader-extension seam (stdlib/jolt/reader.clj wraps these) ----------
+;; raw? picks the tier: #f hands the fn the next FORM, #t hands it the source
+;; string and the index just past the dispatch character.
+(def-var! "jolt.host" "set-dispatch-macro!" rdr-set-dispatch-macro!)
+(def-var! "jolt.host" "remove-dispatch-macro!" rdr-remove-dispatch-macro!)
+(def-var! "jolt.host" "dispatch-macros" rdr-dispatch-macro-map)
+;; the ~{}/~() split behind #$, so clojure.core.strint's << expands through
+;; exactly the same grammar instead of a second copy of it.
+(def-var! "jolt.host" "interpolate-parts" rdr-interpolate-parts)
 (def-var! "clojure.core" "read-string" jolt-read-string)
 (def-var! "clojure.core" "__parse-next" jolt-parse-next)
 (def-var! "clojure.core" "__parse-next-from" jolt-parse-next-from)
