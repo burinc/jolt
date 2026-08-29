@@ -211,7 +211,14 @@
 ;; collections do not. Must NOT be value equality: a deftype whose .equals calls
 ;; (identical? this o) to short-circuit (e.g. core.logic's Substitutions) would
 ;; otherwise recur forever (identical? -> = -> equiv -> .equals -> identical?).
-(define (jolt-identical? a b) (eq? a b))
+;; Spliced, like the predicates in values.ss (see jolt-nil? there for why). The
+;; reference compiler inlines identical? too (:inline -> Util/identical), and a
+;; var call here already cost ~100ns per use in cell-less seed code.
+(define (jolt-identical?-fn a b) (eq? a b))
+(define-syntax jolt-identical?
+  (syntax-rules ()
+    ((_ a b) (eq? a b))
+    ((_ e ...) (jolt-identical?-fn e ...))))
 
 ;; Give the seq.ss native procedures their transducer (1-arg) arity — the emitter
 ;; lowers (map f)/(filter p)/(take n) at the wrong arity to the bare procedure
@@ -245,7 +252,7 @@
 (def-var! "clojure.core" "drop-while" jolt-drop-while)
 (def-var! "clojure.core" "partition" jolt-partition)
 (def-var! "clojure.core" "sort" jolt-sort)
-(def-var! "clojure.core" "identical?" jolt-identical?)
+(def-var! "clojure.core" "identical?" jolt-identical?-fn)
 
 ;; rseq: vectors + sorted colls only (Clojure), the reverse of the ascending seq.
 ;; Clojure's contract is explicit that this is CONSTANT time ("Returns, in

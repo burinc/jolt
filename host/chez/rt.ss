@@ -317,7 +317,12 @@
         ((number? x) (exact->inexact x))
         (else (jolt-num-cast-throw x))))
 ;; jolt `not`: only nil and false are falsey.
-(define (jolt-not x) (if (jolt-truthy? x) #f #t))
+;; Spliced, like the predicates in values.ss (see jolt-nil? there for why).
+(define (jolt-not-fn x) (if (jolt-truthy? x) #f #t))
+(define-syntax jolt-not
+  (syntax-rules ()
+    ((_ e) (if (jolt-truthy? e) #f #t))
+    ((_ e ...) (jolt-not-fn e ...))))
 
 ;; --- ex-info record type -----------------------------------------------------
 ;; A throwable (ex-info or host-constructed typed throwable) is a distinct

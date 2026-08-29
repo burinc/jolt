@@ -112,11 +112,26 @@
 ;; top-level entry: in direct-link mode it binds jv$<fqn> for a top-level def; off
 ;; that mode (the minter, runtime eval) it is exactly emit, so output is unchanged.
 (define jolt-ce-emit-top (var-deref "jolt.backend-scheme" "emit-top-form"))
-;; Seed mint and AOT build must stay byte-deterministic, so emit the image with var
-;; cell-caching OFF (compile-eval.ss turned it on for runtime eval; this file loads
-;; after it). Guarded for the first re-mint pass off an older seed.
+;; Hoist the var cell behind every late-bound reference in the minted seed, so a
+;; clojure.core fn that calls another core fn resolves the callee's cell once per
+;; def instead of once per call. This was OFF, on the theory that the gensym-
+;; numbered cell names would not survive the mint's byte-fixpoint; they do —
+;; remint converges in 3 passes — and the shape is the same eager const-pool hoist
+;; the keyword literals have used here all along (backend_scheme.clj
+;; hoist-var-cell). It is worth the pass: the name lookup it removes is a
+;; string-append plus a string-hash probe, ~102ns, against ~1ns for the hoisted
+;; read, and 258 of core's 357 emitted vars carry at least one such reference —
+;; frequencies resolves assoc! per ELEMENT. Measured on 1M elements, that alone
+;; put clojure.core/frequencies at 439ms against 337ms for the identical body
+;; written in user code (which has had this since the per-site cache landed);
+;; both are 337ms now.
+;;
+;; Costs, measured against the same hello-world binary built either way: +297KB
+;; of binary (+1.3%) and +4.6ms of startup (+2.0%).
+;;
+;; Guarded for the first re-mint pass off an older seed.
 (let ((scv (var-deref "jolt.backend-scheme" "set-var-cache!")))
-  (when (procedure? scv) (scv #f)))
+  (when (procedure? scv) (scv #t)))
 ;; Tail-frame tracing off for the mint + `jolt build`: the seed must stay a
 ;; byte-fixpoint, and a built app should carry no per-call trace overhead.
 (let ((stf (var-deref "jolt.backend-scheme" "set-trace-frames!")))

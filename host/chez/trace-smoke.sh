@@ -53,6 +53,22 @@ cat > "$work/src/app/tail.clj" <<'EOF'
   (boom 1))
 EOF
 
+# Same shape, but the callee is ^:redef so it stays var-routed and is never
+# spliced. A built binary must still name ITS frame -- that is what keeps the
+# baked tail-site instrumentation under test now that an ordinary callee is
+# inlined away (see the built-binary block below).
+mkdir -p "$work/src/app"
+cat > "$work/src/app/tailredef.clj" <<'EOF'
+(ns app.tailredef)
+
+(defn ^:redef boom [x]
+  (/ x 0))
+
+(defn -main [& _]
+  (println "before")
+  (boom 1))
+EOF
+
 run_app() {   # run_app <ns> [env-assignment]; prints combined output
   ( cd "$work" && env $2 "$joltabs" run -m "$1" 2>&1 )
 }
@@ -317,11 +333,28 @@ expect_match "execution continued past every catch" "$pst" 'DONE'
 # instrumentation in, so a deployed binary's uncaught error still names the
 # TCO-erased frame with its exact line — no marker files needed, the site
 # literals carry the lines. JOLT_TRACE=0 at BUILD time opts the binary out.
+#
+# A built binary also INLINES (jolt-mbcm.6: splicing follows direct-linking, which
+# every non-dev build sets), and a spliced callee has no procedure left to name a
+# frame after. The trace reads the same anyway: the splicer stamps each copied
+# node with the chain of fns it came through, the emitter folds that into the
+# marker and the tail-site pair, and the reporter expands one physical frame back
+# into the logical ones (jolt-mbcm.7). These rows are that parity, so they assert
+# the SAME two frames the `jolt run` rows above do -- if inline attribution
+# regresses, the built binary reports app.tail/-main at line 4 and both fail.
 echo "trace smoke: a built binary traces by default"
 ( cd "$work" && "$joltabs" build -m app.tail -o tailbin >/dev/null 2>&1 )
 out_bt="$("$work/tailbin" 2>&1)"
-expect_match "built: the tail-erased thrower is named at its line" "$out_bt" 'app\.tail/boom (.*src/app/tail\.clj:4)'
-expect_match "built: its caller is present" "$out_bt" 'app\.tail/-main'
+expect_match "built: the spliced callee is named at its own line" "$out_bt" 'app\.tail/boom (.*src/app/tail\.clj:4)'
+expect_match "built: and its caller at the call site" "$out_bt" 'app\.tail/-main (.*src/app/tail\.clj:8)'
+
+# The same shape where the callee CANNOT be spliced (^:redef stays var-routed):
+# a real frame, not a reconstructed one. Without this row the block above would
+# pass on a build that had stopped inlining altogether.
+( cd "$work" && "$joltabs" build -m app.tailredef -o tailredefbin >/dev/null 2>&1 )
+out_rd="$("$work/tailredefbin" 2>&1)"
+expect_match "built: a ^:redef callee keeps its own frame at its line" "$out_rd" 'app\.tailredef/boom (.*src/app/tailredef\.clj:4)'
+expect_match "built: and its caller at the call site" "$out_rd" 'app\.tailredef/-main (.*src/app/tailredef\.clj:8)'
 echo "trace smoke: JOLT_TRACE=0 at build time opts the binary out"
 ( cd "$work" && env JOLT_TRACE=0 "$joltabs" build -m app.tail -o tailbin0 >/dev/null 2>&1 )
 out_bt0="$("$work/tailbin0" 2>&1)"

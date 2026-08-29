@@ -45,6 +45,16 @@
 (let ((spm (var-deref "jolt.backend-scheme" "set-prelude-mode!")))
   (if (procedure? spm) (spm #t)
       (begin (display "gen-seed: WARNING set-prelude-mode! not found\n") (exit 1))))
+;; Same reason as prelude-mode above: emit-image.ss turned var cell-hoisting ON on
+;; the unit current at ITS load time, and the fresh unit published here defaults it
+;; off. Without this the Gambit seed silently keeps the un-hoisted (var-deref ns
+;; name) shape — correct, but ~102ns per core var reference where the Chez seed
+;; pays ~1ns. dyn-binding.ss (which defines var-cell-deref) is ##included at
+;; boot.ss:83 / boot-full.ss:90, ahead of seed/prelude.ss, so the hoisted reader
+;; is bound before any hoisted cell is read.
+(let ((svc (var-deref "jolt.backend-scheme" "set-var-cache!")))
+  (if (procedure? svc) (svc #t)
+      (begin (display "gen-seed: WARNING set-var-cache! not found\n") (exit 1))))
 (let ((st (var-deref "jolt.backend-scheme" "set-target!")))
   (if (procedure? st)
       (begin (st (keyword #f "gambit"))
