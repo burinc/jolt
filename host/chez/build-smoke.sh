@@ -214,6 +214,66 @@ if ! printf '%s' "$got_rd" | grep -q '^redef: :patched$'    || ! printf '%s' "$g
   echo "--- got ----"; echo "$got_rd"; exit 1
 fi
 
+# A NAMED inner fn inside a spliced callee (jolt-pzos). Two claims:
+#  - the alpha-rename the splicer applies for hygiene (step-boom -> step-boom__ilN)
+#    is a compiler artifact and must not reach the user;
+#  - app.util/inner-boom appears ONCE. The inner fn is emitted as its own lambda
+#    and has its own runtime frame, so stamping the inline chain through the fn
+#    boundary made the reporter expand that frame as spliced code as well, and the
+#    callee was printed twice — once for the inner fn's frame, once for its own.
+got_if="$(cd / && "$out" --innerfn 2>&1)"
+if printf '%s' "$got_if" | grep -q '__il'; then
+  echo "  FAIL: inner-fn trace leaked the __ilN alpha-rename artifact"
+  echo "--- got ----"; echo "$got_if"; exit 1
+fi
+if ! printf '%s' "$got_if" | grep -q 'step-boom'; then
+  echo "  FAIL: inner-fn trace lost the inner fn's frame (want a step-boom frame)"
+  echo "--- got ----"; echo "$got_if"; exit 1
+fi
+n_inner="$(printf '%s\n' "$got_if" | grep -c 'app\.util/inner-boom')"
+if [ "$n_inner" != "1" ]; then
+  echo "  FAIL: inner-fn trace names app.util/inner-boom $n_inner times, want 1"
+  echo "--- got ----"; echo "$got_if"; exit 1
+fi
+
+# --tree-shake must not cost the trace its inlined frames. A callee whose every
+# call site was spliced has no reference left in the graph, so the shake dropped
+# its def -- and with it the (jolt-register-source! ...) that def's record
+# carries, which is the only thing mapping an inlined frame back to ns/name
+# (file:line). The shaken binary printed ONE frame where this same build prints
+# three (jolt-o13s). Same assertion as the plain release build above, so the two
+# cannot drift.
+if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out.ts" --tree-shake >/dev/null 2>&1; then
+  echo "  FAIL: jolt build --tree-shake exited non-zero"; exit 1
+fi
+got_ts="$(cd / && "$out.ts" --boom 2>&1)"
+for frame in 'app\.util/deep-boom .*util\.clj:[0-9]' 'app\.util/mid-boom .*util\.clj:[0-9]' 'app\.core/-main .*core\.clj:[0-9]'; do
+  if ! printf '%s' "$got_ts" | grep -qE "$frame"; then
+    echo "  FAIL: --tree-shake trace missing inlined frame $frame"
+    echo "--- got ----"; echo "$got_ts"; exit 1
+  fi
+done
+# ...and in that order, innermost first — a backwards chain contains every frame
+# and would pass the per-frame loop above.
+if ! printf '%s' "$got_ts" | tr '\n' '~' | grep -qE 'deep-boom[^~]*~[^~]*mid-boom[^~]*~[^~]*-main'; then
+  echo "  FAIL: --tree-shake trace frames out of order"
+  echo "--- got ----"; echo "$got_ts"; exit 1
+fi
+
+# A var defined TWICE must answer the same through every call path, and the same
+# as `jolt run` (jolt-rtjm). app.util defines dd-target, then dd-caller which
+# calls it, then dd-target again: the stashed inline body froze the FIRST
+# definition into dd-caller, while dd-late — compiled after the second def —
+# spliced the second. One binary, two answers. `apply` is in there because a
+# direct (dd-caller) can fold at its own call site and mask the frozen body.
+got_dd="$(cd / && "$out" --doubledef 2>&1)"
+for line in 'dd-apply: second' 'dd-call:  second' 'dd-late:  second'; do
+  if ! printf '%s' "$got_dd" | grep -qF "$line"; then
+    echo "  FAIL: double-def — want '$line' (a stashed body froze the first def)"
+    echo "--- got ----"; echo "$got_dd"; exit 1
+  fi
+done
+
 # The :str-stamped interop answers at runtime with the same values the generic
 # dispatch would (the emit-level proof is the flat.ss grep above).
 got_strd="$(cd / && "$out" --strd 2>&1)"

@@ -469,13 +469,22 @@
 ;; JVM-style class name and clojure.spec.alpha's fn-sym can recover the symbol of a
 ;; bare-fn predicate. Weak so GC'd fns drop out. Last def of a given proc wins.
 (define proc-name-tbl (make-weak-eq-hashtable))
+(define var-redefined-set (make-hashtable string-hash string=?))
+(define (var-redefined? ns name)
+  (hashtable-contains? var-redefined-set (string-append ns "/" name)))
 (define (def-var! ns name v)
   ;; first def of a given proc wins, so an alias like (def inc' inc) — which binds
   ;; the SAME proc to a second var — doesn't rename inc.
   (when (and (procedure? v) (not (hashtable-contains? proc-name-tbl v)))
     (hashtable-set! proc-name-tbl v (cons ns name)))
   (hashtable-set! ns-has-vars-set ns #t)
-  (let ((c (jolt-var ns name))) (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
+  (let ((c (jolt-var ns name)))
+    ;; see host/chez/rt.ss def-var! -- a var defined more than once with a value
+    ;; may not have its body spliced (jolt-rtjm). (declare x) emits declare-var!,
+    ;; so a forward declaration is not a redefinition.
+    (when (not (jolt-var-unbound? (var-cell-root c)))
+      (hashtable-set! var-redefined-set (string-append ns "/" name) #t))
+    (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
 ;; Value-position comparison references compile to the seq.ss chain singletons
 ;; (jolt-lt/gt/le/ge), not to the clojure.core var roots — the roots were later
 ;; re-bound by the checked numeric layer, so def-var! never saw these procs.

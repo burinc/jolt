@@ -803,6 +803,12 @@
 ;; (java/host-class.ss) — so none of them can afford to skip it either.
 (define proc-name-mu (make-mutex))
 (define (proc-name-of v) (jolt-with-mutex proc-name-mu (hashtable-ref proc-name-tbl v #f)))
+;; "ns/name" of every var defined more than once with a value. Guarded by
+;; var-table-mu like the other var-table side sets; reads are single-key.
+(define var-redefined-set (make-hashtable string-hash string=?))
+(define (var-redefined? ns name)
+  (jolt-with-mutex var-table-mu
+    (hashtable-contains? var-redefined-set (string-append ns "/" name))))
 (define (def-var! ns name v)
   ;; first def of a given proc wins, so an alias like (def inc' inc) — which binds
   ;; the SAME proc to a second var — doesn't rename inc.
@@ -811,7 +817,26 @@
       (unless (hashtable-contains? proc-name-tbl v)
         (hashtable-set! proc-name-tbl v (cons ns name)))))
   (jolt-with-mutex var-table-mu (hashtable-set! ns-has-vars-set ns #t))
-  (let ((c (jolt-var ns name))) (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
+  (let ((c (jolt-var ns name)))
+    ;; A var this def is REDEFINING -- it already had a value. Recorded because the
+    ;; inline pass may not splice such a var's body: a caller compiled between two
+    ;; defs would freeze the first one while a later caller splices the second, and
+    ;; the same binary then answers two ways (jolt-rtjm). The build loads the whole
+    ;; app before it emits any of it, so by stash time this set is complete.
+    ;;
+    ;; "Already had a value" is the root not being the unbound marker -- NOT
+    ;; var-cell-defined?, which means interned/resolvable and is set by
+    ;; declare-var! too (and by the compiler interning a global as it classifies
+    ;; it), so it is true on the very first def of every var.
+    ;;
+    ;; That distinction is the point: (declare x) leaves the unbound root intact,
+    ;; so a forward declaration ahead of the real defn is ONE definition and stays
+    ;; spliceable. The string-append is inside the branch, so it runs once per
+    ;; actual redefinition rather than once per def.
+    (when (not (jolt-var-unbound? (var-cell-root c)))
+      (jolt-with-mutex var-table-mu
+        (hashtable-set! var-redefined-set (string-append ns "/" name) #t)))
+    (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
 ;; Value-position comparison references compile to the seq.ss chain singletons
 ;; (jolt-lt/gt/le/ge), not to the clojure.core var roots — the roots were later
 ;; re-bound by the checked numeric layer, so def-var! never saw these procs.

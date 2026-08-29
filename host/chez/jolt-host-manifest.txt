@@ -152,6 +152,7 @@ machine-type
 make-interrupt
 make-thread-local
 map-entry
+mark-spliced!
 maximum-memory-bytes
 mkdirs!
 monitor-enter
@@ -211,5 +212,6 @@ type-satisfies?
 tz-backend
 tz-offset-seconds
 unchecked-math?
+var-redefined?
 wall-nanos
 with-monitor
