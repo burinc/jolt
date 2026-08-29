@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Every non-dev build inlines, and the seed's var references are hoisted.**
+  Splicing a `defn` body at a call site is sound exactly when the callee's var
+  cannot be redefined under the copy, which is what direct-linking commits to —
+  so that is now the whole condition. It used to also require `--opt`, which
+  made the default release build emit a real call everywhere the optimized build
+  emitted a spliced body, and Chez cannot make that up: it does not inline
+  across top-level forms in a compiled file. `--opt` still selects the Chez
+  compile parameters (no inspector or procedure-source information) and no
+  longer changes what the compiler emits.
+
+  Alongside it, `clojure.core` stopped re-resolving var names. Core ships in the
+  seed image, which was minted with var-cell caching off on the theory that
+  gensym-numbered cell names would break the mint's byte-fixpoint; they do not.
+  Each late-bound reference was a `string-append` plus a hashtable probe —
+  ~102ns against ~1ns hoisted — and 258 of core's 357 emitted vars carried at
+  least one. `jolt-truthy?` and five other hot predicates became macros with
+  `-fn` twins for value position, and the splicer learned `:fn`, `:loop` and
+  `:recur` (alpha-renaming their binders) plus regex/interop literals, which
+  were missing from its allowed set rather than refused by it.
+
+  Measured against the previous release, min of 3 timed runs per side on one
+  machine: sorted-access 0.28x, hash-eq 0.80x, loop-recur and char-scan 0.92x,
+  nothing above 1.02x; app-to-app calls 1.70x in the default release build.
+  Costs: +297KB of binary and ~3% of startup. `ci/bench-gate.sh` runs the
+  benchmark suite against the previous release on every tag and `publish` waits
+  on it, because `make test` and `make libconformance` both stayed green through
+  a 5.4x regression in `bench/arrays` during this work — every answer correct,
+  just much slower.
+
 - **Cross-compiled managed-runtime libraries.** `jolt build --library` now
   composes with `--target` and `--target-pack`, retargeting the Scheme compile
   through the pack's xpatch and linking the shared object with the target C
@@ -46,6 +75,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs unchanged.
 
 ### Fixed
+
+- **A var defined twice froze the first definition into callers compiled between
+  the two.** With splicing on by default, this legal Clojure gave one binary two
+  answers:
+
+  ```clojure
+  (defn greet [] "first")
+  (defn call-it [] (greet))       ; spliced "first" — frozen
+  (defn greet [] "second")
+  ```
+
+  `(apply call-it nil)` answered `"first"` while `(call-it)` answered
+  `"second"`, and neither matched `jolt run`, `--no-direct-link`, or the JVM
+  (all `"second"`). Direct-linking alone was never the problem — both defs
+  assign the same binding and the second wins — so a var the program defines
+  more than once is no longer stashed for inlining at all, which converges on
+  the direct-linked call and restores last-def-wins. A `(declare x)` ahead of
+  the real `defn` is one definition, not two, and still inlines.
+
+- **`--tree-shake` dropped every inlined frame from a backtrace.** A callee
+  whose call sites were all spliced has no reference left in the graph, so the
+  shake pruned its def — and with it the source registration that maps an
+  inlined frame back to `ns/name (file:line)`. A shaken binary printed one frame
+  where the same build unshaken printed three. Spliced callees are graph roots
+  now, so a `--tree-shake` trace reads like every other trace.
+
+- **A named inner fn in a spliced body was reported twice, under a mangled
+  name.** The inline chain was stamped through the nested `fn`, but a nested fn
+  is emitted as its own lambda and has its own runtime frame, so the reporter
+  expanded that frame as spliced code as well and printed the enclosing callee a
+  second time. The chain now stops at the `fn` boundary, and the `__ilN` suffix
+  the splicer's alpha-rename adds is stripped from a frame name rather than
+  shown.
+
+- **`jolt.image` now says why it will not write a fn.** A fn literal returned by
+  a fn the compiler inlined has no recorded source — the spliced copy's binders
+  are renamed and its captures include the caller's locals, so it matches no
+  registered source form, and the pass drops the registration rather than let a
+  restore rebuild from stale names and bind `nil`. The refusal used to read
+  `cannot write #<procedure> at <root>`; it now explains that and points at the
+  two ways out (store a top-level fn, or mark the enclosing fn `^:redef` so it
+  is not spliced). Note this differs from `jolt run`, which does not splice and
+  dumps such a closure fine.
 
 - **A `*data-readers*` entry holding the reader function itself.** The load path
   accepted only a symbol naming the reader var, so a table entry added as
