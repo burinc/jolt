@@ -76,6 +76,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Synchronisation primitives travelled into state images as dead objects.** A
+  record carrying a mutex or condition variable had no image walker of its own,
+  so the generic record copy serialised the primitive itself. What came back was
+  a fasl copy, not a live kernel object — and an *uncontended* acquire on one
+  succeeds, so a promise, future or agent read out of an image looked perfectly
+  healthy right up until something actually waited on it, and then it was
+  `Exception in mutex-acquire: failed: Invalid argument` from whichever thread
+  got there first, with no path and no name. `jolt.image/scan` reported nothing.
+
+  Affected `promise`, `future`, `agent`, the per-node lock a lazy sequence and a
+  seq cell take once the process is multi-threaded, `core.async` channels, and
+  the tap and fibers queues — `atom` and `ref` were already right, because they
+  rebuild through their own constructors, which is the shape this generalises. A
+  primitive is now written as an inert marker and a fresh live one is minted on
+  read. Done at the walk rather than per bearing type, so a record that gains a
+  mutex later is carried correctly without anyone rediscovering this; restoring
+  an image written before the fix mints a live primitive over the raw one, so
+  old files are healed rather than merely readable.
+
+  Image format version 6. Versions 2 through 6 still read; a version 6 image is
+  refused by an older build with the version in the message, as before.
+
+- **A restored `future` or `agent` could come back silently wedged.** Both carry
+  state that says a thread is mid-flight, and both used to travel with it. A
+  future written while still running restored as one that nothing would ever
+  complete, so `deref` hung forever; an agent written while an action was in
+  flight restored believing it had a busy worker, so every later `send` queued
+  behind nothing and its state never moved again. Neither said anything.
+
+  A state image carries state, not execution. A running future is refused now,
+  with a message that says so and points at `deref`-ing it first (and stubs
+  under `{:unwritable :stub}` like any other unwritable object); a completed one
+  is just its value and still travels. An agent's state, validator and error
+  handling travel, while its queue and in-flight flag do not, so a restored
+  agent accepts work immediately.
+
 - **A var defined twice froze the first definition into callers compiled between
   the two.** With splicing on by default, this legal Clojure gave one binary two
   answers:

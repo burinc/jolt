@@ -93,6 +93,80 @@
 (rt "empty colls" "[[] {} #{} ()]"                 "[[] {} #{} ()]")
 (rt "record"      "(do (defrecord P [x y]) (->P 1 2))" "#user.P{:x 1, :y 2}")
 
+;; --- the value-kind matrix: restored values must still WORK ---------------------
+;; `rt` above compares printed forms, which settles a value type. It settles
+;; nothing for a value whose identity IS its meaning: = is identity for an atom, a
+;; delay, a regex, an array and a StringBuilder, so a restored one can print
+;; correctly and be dead. These rows bind the restored value and USE it.
+;;
+;; Every kind here round-trips today and none of it was pinned; probing the
+;; language kind by kind is what found the gaps the rest of this epic closes
+;; (jolt-1vfl).
+(define (rtu name expr probe expect)
+  (cleanup!)
+  (ev (string-append "(jolt.host/image-write! \"" tmp "\" " expr ")"))
+  (def-var! "user" "$rt"
+    (jolt-compile-eval (string-append "(jolt.host/image-read \"" tmp "\")") "user"))
+  (is name (string-append "(pr-str " probe ")") expect))
+
+;; reference types — restored, they must still deref, mutate and settle
+(rtu "atom"        "(atom {:a 1})"
+     "[(deref $rt) (do (swap! $rt assoc :b 2) (deref $rt))]" "[{:a 1} {:a 1, :b 2}]")
+(rtu "volatile"    "(volatile! 1)"
+     "[(deref $rt) (do (vreset! $rt 9) (deref $rt))]"        "[1 9]")
+(rtu "delay unforced" "(delay (+ 1 2))"
+     "[(realized? $rt) (deref $rt) (realized? $rt)]"         "[false 3 true]")
+(rtu "delay forced"   "(let [d (delay (+ 1 2))] @d d)"
+     "[(realized? $rt) (deref $rt)]"                         "[true 3]")
+
+;; NOT here: promise, future, agent, and a realized lazy seq. Each carries OS
+;; synchronisation state that the image copies as data, so what comes back holds
+;; dead primitives (jolt-ojoh). They get pinned with that fix, not before —
+;; a passing row here would enshrine the bug.
+
+;; seq kinds
+
+;; literals whose printed form is not the whole story
+(rtu "regex"       "#\"a+b\""
+     "[(str $rt) (re-find $rt \"xaabz\")]"                   "[\"a+b\" \"aab\"]")
+(rtu "class token" "String"     "[(str $rt) (instance? $rt \"x\")]"
+     "[\"class java.lang.String\" true]")
+(rtu "File"        "(java.io.File. \"/tmp\")"
+     "[(.getPath $rt) (.isDirectory $rt)]"                   "[\"/tmp\" true]")
+
+;; arrays and StringBuilder are mutable host objects: contents, and still writable
+(rtu "byte-array"   "(byte-array [1 2 3])"      "(vec $rt)"  "[1 2 3]")
+(rtu "double-array" "(double-array [1.0 2.5])"  "(vec $rt)"  "[1.0 2.5]")
+(rtu "object-array" "(object-array [1 :a])"     "(vec $rt)"  "[1 :a]")
+(rtu "StringBuilder" "(StringBuilder. \"ab\")"
+     "(do (.append $rt \"c\") (str $rt))"                    "\"abc\"")
+
+(rtu "cons onto vec" "(cons 1 [2 3])"          "(vec $rt)"   "[1 2 3]")
+(rtu "PersistentQueue"
+     "(conj clojure.lang.PersistentQueue/EMPTY 1 2)"
+     "[(vec $rt) (peek $rt)]"                                "[[1 2] 1]")
+(rtu "subvec"      "(subvec [1 2 3 4] 1 3)"    "(vec $rt)"   "[2 3]")
+(rtu "sorted-set-by" "(sorted-set-by > 1 3 2)"
+     "[(vec $rt) (vec (conj $rt 4))]"                        "[[3 2 1] [4 3 2 1]]")
+
+;; scalars and literals the printed-form rows above do not reach
+(rtu "bigdec"      "1.5M"        "[(pr-str $rt) (decimal? $rt)]" "[\"1.5M\" true]")
+(rtu "NaN and Inf" "[##NaN ##Inf ##-Inf]"
+     "[(Double/isNaN (nth $rt 0)) (nth $rt 1) (nth $rt 2)]"  "[true ##Inf ##-Inf]")
+(rtu "inst"        "#inst \"2020-01-01T00:00:00.000-00:00\""
+     "[(inst? $rt) (inst-ms $rt)]"                           "[true 1577836800000]")
+(rtu "uuid"        "#uuid \"00000000-0000-0000-0000-000000000001\""
+     "[(uuid? $rt) (str $rt)]"
+     "[true \"00000000-0000-0000-0000-000000000001\"]")
+(rtu "tagged-literal" "(tagged-literal 'x 1)"
+     "[(:tag $rt) (:form $rt)]"                              "[x 1]")
+(rtu "qualified symbol" "'foo.bar/baz"
+     "[(namespace $rt) (name $rt)]"                          "[\"foo.bar\" \"baz\"]")
+
+;; a var travels by NAME and comes back as the live var, not a copy
+(rtu "var"         "(do (def rt-data-var {:a 1}) #'rt-data-var)"
+     "[(deref $rt) (= $rt #'rt-data-var)]"                   "[{:a 1} true]")
+
 ;; --- R4: sorted maps and sets travel -------------------------------------------
 ;; The wrapper's internal comparator machinery (a wrapped comparator closure + an
 ;; :ops table of closures in a string-keyed hashtable) never reaches the externals
@@ -511,6 +585,123 @@
   (ok "handler payload rides in the body"
       (= 7 (jolt-get (image-handled-payload (car handled)) (keyword #f "claimed") jolt-nil))))
 
+
+;; --- no synchronisation primitive may travel (jolt-ojoh) -----------------------
+;; A record carrying a mutex or condition variable has to be rebuilt through the
+;; LIVE constructor on the way out, the way walk-atom and walk-ref already are.
+;; Copying one as data produces an object whose primitives are not live kernel
+;; objects: an uncontended acquire on the copy happens to succeed, so the damage
+;; does not show until something actually waits, and then it is
+;;
+;;   Exception in mutex-acquire: failed: Invalid argument
+;;
+;; which names nothing and takes the process with it. That is why this is
+;; asserted STRUCTURALLY, on the written file, and not by using the restored
+;; object: a probe that acquires the copy passes, and a probe that contends for
+;; it is a race. The contract is simply that no such primitive is in the image.
+(define (sync-prims-in path)
+  (let ((acc '()))
+    (image-walk (image-graph path)
+                (lambda (x p) (when (mutex? x) (set! acc (cons (image-path->string p) acc)))))
+    acc))
+
+;; These run AFTER a thread has been forked, because that is what populates the
+;; per-node locks on a lazy cell and a lazily-tailed seq -- single-threaded, the
+;; lock field stays #f and the bug is invisible.
+(ev "(deref (future 1))")
+(ok "the runtime is on its multi-threaded path" jolt-mt?)
+
+(define (no-sync name expr)
+  (cleanup!)
+  (ev (string-append "(jolt.host/image-write! \"" tmp "\" " expr ")"))
+  (let ((found (sync-prims-in tmp)))
+    (set! total (+ total 1))
+    (unless (null? found)
+      (set! fails (+ fails 1))
+      (printf "FAIL: ~a wrote ~a mutex(es), at: ~a\n" name (length found) found))))
+
+(no-sync "an undelivered promise"  "(promise)")
+(no-sync "a delivered promise"     "(let [p (promise)] (deliver p 5) p)")
+(no-sync "a completed future"      "(let [f (future 5)] @f f)")
+(no-sync "an agent"                "(agent 1)")
+(no-sync "a lazy seq forced multi-threaded" "(doall (map inc [1 2 3]))")
+(no-sync "a lazily-tailed seq"     "(doall (take 2 (iterate inc 0)))")
+(no-sync "a promise inside app state" "{:pending (promise) :xs [1 2]}")
+
+;; An image written BEFORE this fix (format 5 and older) has a raw mutex in it,
+;; and there is nothing to be done about the file -- but the restore walk can
+;; hand back a live primitive instead of the dead copy. Driven through the walk
+;; directly, since the checked-in old-format fixtures predate agents/promises.
+;; --- execution does not travel (jolt-ojoh) --------------------------------------
+;; The two records whose own state says a thread is mid-flight. Both used to
+;; restore SILENTLY WEDGED, which is worse than the dead-primitive bug above: a
+;; restored running future never completes, so deref hangs forever, and a
+;; restored agent that believes it has a busy worker queues every later send
+;; behind nothing.
+(define (str-has? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0))
+      (cond ((fx>? (fx+ i m) n) #f)
+            ((string=? (substring s i (fx+ i m)) sub) #t)
+            (else (loop (fx+ i 1)))))))
+(define (refusal-of expr)
+  (cleanup!)
+  (call/cc (lambda (k)
+    (with-exception-handler
+      (lambda (e) (k (if (jolt-ex-info-record? e)
+                         (jolt-ex-info-record-message e)
+                         (call/cc (lambda (k2)
+                           (with-exception-handler (lambda (_) (k2 "?"))
+                             (lambda () (condition->message-string e))))))))
+      (lambda ()
+        (ev (string-append "(jolt.host/image-write! \"" tmp "\" " expr ")"))
+        "WROTE")))))
+
+;; sleeps far longer than the gate takes, so it is still running when written --
+;; no window to get wrong, since the row only needs "not done yet"
+(ok "a running future is refused, and the message says why"
+    (str-has? (refusal-of "(future (Thread/sleep 300000))") "carries state, not execution"))
+(is "a running future scans as unwritable"
+    "(count (jolt.host/image-scan (future (Thread/sleep 300000))))" "1")
+(is "a completed future still travels"
+    "(count (jolt.host/image-scan (let [f (future 5)] @f f)))" "0")
+
+;; the wedged agent state is built directly rather than by racing a real send:
+;; the row is about the invariant, not about how fast this machine runs an action
+(let ((a (jolt-compile-eval "(agent 7)" "user")))
+  (jolt-agent-running?-set! a #t)
+  (jolt-agent-queue-set! a (vector '() (list 'pending-action)))
+  (def-var! "user" "$ag" a)
+  (cleanup!)
+  (ev (string-append "(jolt.host/image-write! \"" tmp "\" $ag)"))
+  (let ((r (jolt-compile-eval (string-append "(jolt.host/image-read \"" tmp "\")") "user")))
+    (def-var! "user" "$agr" r)
+    (ok "a restored agent has no phantom worker" (not (jolt-agent-running? r)))
+    (ok "a restored agent has an empty queue"
+        (let ((q (jolt-agent-queue r)))
+          (and (null? (vector-ref q 0)) (null? (vector-ref q 1)))))
+    (is "a restored agent keeps its state and still takes work"
+        "(do (send $agr inc) (await-for 5000 $agr) (deref $agr))" "8")))
+
+(ok "restore mints a live primitive over a raw one from an old image"
+    (let* ((dead (vector (make-mutex) (make-condition)))
+           (healed (let-values (((g _) (image-graph-process dead 'restore #f))) g)))
+      (and (mutex? (vector-ref healed 0))
+           (thread-condition? (vector-ref healed 1))
+           (not (eq? (vector-ref healed 0) (vector-ref dead 0)))
+           (not (eq? (vector-ref healed 1) (vector-ref dead 1))))))
+
+;; ...and the restored objects still have to WORK. These pass today by luck --
+;; an uncontended acquire on a dead mutex succeeds -- so they are here to hold
+;; the behaviour steady across the fix, not to prove the bug.
+(rtu "promise unkept" "(promise)"
+     "[(realized? $rt) (do (deliver $rt 42) (deref $rt))]"   "[false 42]")
+(rtu "promise kept"   "(let [p (promise)] (deliver p 5) p)"  "(deref $rt)" "5")
+(rtu "future"         "(let [f (future 5)] @f f)"            "(deref $rt)" "5")
+(rtu "agent"          "(agent 1)"
+     "(do (send $rt inc) (await-for 5000 $rt) (deref $rt))"  "2")
+(rtu "lazy realized"  "(doall (map inc [1 2 3]))"
+     "[(vec $rt) (str (type $rt))]"   "[[2 3 4] \"class clojure.lang.LazySeq\"]")
 
 ;; --- header / compatibility ------------------------------------------------------
 (is "reading a non-image fails with a clear message"
@@ -1014,9 +1205,9 @@
       "   (identical? (:cyc g) (:self (deref (:cyc g))))"
       "   (do (dosync (ref-set (:a g) 100)) (deref (:a g)))])")
     "[99 :hot true true 100]")
-;; format discipline: the new image writes header version 5 (3 added ref
-;; descriptors, 4 added image-rekey, 5 the jrec hasheq slot), and its bytes
-;; carry the descriptor rtd, never the live ref rtd
+;; format discipline: the new image writes header version 6 (3 added ref
+;; descriptors, 4 added image-rekey, 5 the jrec hasheq slot, 6 the image-sync
+;; marker), and its bytes carry the descriptor rtd, never the live ref rtd
 (define (bv-contains? bv s)
   (let* ((sb (string->utf8 s)) (m (bytevector-length sb)) (n (bytevector-length bv)))
     (let scan ((i 0))
@@ -1026,12 +1217,12 @@
                    (and (fx=? (bytevector-u8-ref bv (fx+ i j)) (bytevector-u8-ref sb j))
                         (cmp (fx+ j 1))))) #t)
             (else (scan (fx+ i 1)))))))
-(ok "ref-carrying image is format 5 with no raw jolt-ref rtd"
+(ok "ref-carrying image is format 6 with no raw jolt-ref rtd"
     (let ((port (open-file-input-port tmp)))
       (let* ((h (fasl-read port))
              (rest (get-bytevector-all port)))
         (close-port port)
-        (and (fx=? 5 (vector-ref h 1))
+        (and (fx=? 6 (vector-ref h 1))
              (bv-contains? rest "image-ref")
              (not (bv-contains? rest "jolt-ref-v2"))))))
 ;; an unknown format version refuses with a clean error naming both versions
