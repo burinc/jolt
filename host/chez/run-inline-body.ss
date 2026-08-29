@@ -67,4 +67,150 @@
               (gate-sub? emitted "throwme") #t))
 (set-direct-link-flag! #f)
 
+;; --- splicing follows LINKAGE, not a build mode (jolt-mbcm.6) ---------------
+;; hc-inline-enabled? used to be (and hc-optimize? hc-direct-link?), so the
+;; DEFAULT release build emitted a real call everywhere --opt emitted a spliced
+;; body -- a policy dial on a pass whose precondition is a correctness property.
+;; It is hc-direct-link? alone now, and there is no second path to fall back to,
+;; so this 2x2 is what stands in for the flag.
+;;
+;; Both axes are varied INDEPENDENTLY on purpose. Pinning only the shipped
+;; configurations would leave the linkage-on/passes-off cell untested, and that
+;; is the one cell that tells (and hc-optimize? hc-direct-link?) apart from
+;; hc-direct-link? -- checked by mutation: restoring the old conjunction fails
+;; row 1 and nothing else, and widening the gate to #t fails rows 3 and 4.
+;;
+;; Asserted on the callee's NAME: a spliced body has no reference left to it, an
+;; un-spliced call reads its var by name whichever way the back end spells that.
+(define (ilg-emit src)
+  (emit (run-passes (analyze (make-analyze-ctx "user") (jolt-ce-read src))
+                    (make-analyze-ctx "user") U)))
+(define ilg-callee "(defn ilg-callee [a b] (+ a b 1))")
+(define ilg-caller "(defn ilg-caller [x] (ilg-callee x 2))")
+(define (ilg-spliced?) (not (gate-sub? (ilg-emit ilg-caller) "ilg-callee")))
+(evals ilg-callee)                      ; intern the var so the ref resolves to :var
+
+;; 1. linkage alone decides. Passes OFF, direct-linked: still spliced, because
+;;    the closed world is the whole precondition. This also stashes the callee,
+;;    so rows 3 and 4 below refuse a splice that is otherwise available.
+(set-optimize! #f)
+(set-direct-link-flag! #t)
+(ilg-emit ilg-callee)
+(gate-check "direct-linked, passes off: eligible callee is spliced" (ilg-spliced?) #t)
+
+;; 2. the shipped build configuration.
+(set-optimize! #t)
+(gate-check "direct-linked, passes on: eligible callee is spliced" (ilg-spliced?) #t)
+
+;; 3. --no-direct-link: the var stays redefinable, so the same stashed callee
+;;    must NOT travel. This is the row that catches an inline gate widened past
+;;    what linkage guarantees.
+(set-direct-link-flag! #f)
+(gate-check "dynamically linked, passes on: the same callee stays a call"
+            (ilg-spliced?) #f)
+
+;; 4. --dev, and the runtime compile spine.
+(set-optimize! #f)
+(gate-check "dynamically linked, passes off: the same callee stays a call"
+            (ilg-spliced?) #f)
+
+;; --- ^:redef / ^:dynamic are never spliced ----------------------------------
+;; Direct-linking is decided PER DEF, not just by the global flag: dl-opt-out?
+;; leaves a ^:dynamic or ^:redef def var-routed so `binding` and a later
+;; redefinition still reach code already compiled. The stash gate has to make the
+;; same per-def decision, and until jolt-mbcm.6 it did not -- with splicing gated
+;; on --opt the gap was unreachable in a default build, and the moment splicing
+;; followed linkage a ^:redef callee got its body copied into its caller and the
+;; redefinition landed on a var nothing read any more. Verified end to end at the
+;; time: a built binary printed "original" after interning a new greeting.
+;;
+;; Both rows assert on the callee's NAME, like the 2x2 above -- and the callers
+;; are named so that neither name CONTAINS the callee's. gate-sub? is a substring
+;; test, so an ilg-redef-caller would match "ilg-redef" whether or not the body
+;; was spliced, and the row would pass under any mutation. It did.
+(set-optimize! #t)
+(set-direct-link-flag! #t)
+
+(evals "(defn ^:redef ilg-redef [a] (+ a 1))")
+(ilg-emit "(defn ^:redef ilg-redef [a] (+ a 1))")
+(gate-check "^:redef callee is not spliced, even direct-linked"
+            (gate-sub? (ilg-emit "(defn ilg-uses-redef [x] (ilg-redef x))") "ilg-redef") #t)
+
+(evals "(defn ^:dynamic ilg-dyn [a] (+ a 1))")
+(ilg-emit "(defn ^:dynamic ilg-dyn [a] (+ a 1))")
+(gate-check "^:dynamic callee is not spliced, even direct-linked"
+            (gate-sub? (ilg-emit "(defn ilg-uses-dyn [x] (ilg-dyn x))") "ilg-dyn") #t)
+
+(set-direct-link-flag! #f)
+(set-optimize! #f)
+
+;; --- binder-carrying bodies: :fn, :loop, :recur (jolt-mbcm.5) ---------------
+;; safe-op? used to refuse any body containing one of these, which was the real
+;; limiter: instrumenting a grenadine build found 88 refused splices, 86 of them
+;; a disallowed op and only 2 over the size budget, with :fn at 1144 blocked
+;; visits and :loop at 438. subst alpha-renames their binders now, exactly as it
+;; already did for :let.
+;;
+;; The hygiene rows EVALUATE the emitted Scheme instead of matching its text. A
+;; captured variable still emits a perfectly well-formed lambda -- the bug is in
+;; what it computes, not in how it reads -- so a string assertion would pass on
+;; the broken output.
+(define (ilg-run scm) (eval (read (open-input-string scm)) (interaction-environment)))
+(define (ilg-call src) (jolt-pr-str ((ilg-run (ilg-emit src)))))
+
+(set-optimize! #t)
+(set-direct-link-flag! #t)
+
+;; 1. capture. The callee's inner fn binds y; the caller passes ITS OWN y as the
+;;    argument that lands next to it. Renaming the inner binder is the only thing
+;;    keeping (+ a y) from becoming (+ y y): shadowing the name in env would not,
+;;    because the danger is the substituted ARGUMENT being captured, not the
+;;    callee's body seeing the wrong scope. Verified by mutation: make the :fn
+;;    arm bind (:name nm) instead of (fresh nm) and (+ a y) becomes (+ y y) over
+;;    the inner binder, printing [2 4 6].
+(evals "(defn ilg-inner [a] (mapv (fn [y] (+ a y)) [1 2 3]))")
+(ilg-emit "(defn ilg-inner [a] (mapv (fn [y] (+ a y)) [1 2 3]))")
+(gate-check "inner fn binder is renamed, so the argument is not captured"
+            (ilg-call "(fn [] (let [y 10] (ilg-inner y)))") "[11 12 13]")
+
+;; 2. a loop/recur pair travels together -- the recur's target is the loop, which
+;;    is inside the body being copied.
+(evals "(defn ilg-sum [n] (loop [i 0 acc 0] (if (< i n) (recur (inc i) (+ acc i)) acc)))")
+(ilg-emit "(defn ilg-sum [n] (loop [i 0 acc 0] (if (< i n) (recur (inc i) (+ acc i)) acc)))")
+(gate-check "a callee's loop/recur travels with it"
+            (ilg-call "(fn [] (ilg-sum 5))") "10")
+
+;; 3. a recur targeting the callee's OWN arity does not, because that arity is
+;;    not at the call site. recur-bound? refuses the splice, so the call stays a
+;;    call -- asserted on the name, and on the answer still being right.
+(evals "(defn ilg-down [n] (if (pos? n) (recur (dec n)) :done))")
+(ilg-emit "(defn ilg-down [n] (if (pos? n) (recur (dec n)) :done))")
+(gate-check "a fn-level recur refuses the splice"
+            (gate-sub? (ilg-emit "(defn ilg-uses-down [] (ilg-down 3))") "ilg-down") #t)
+
+;; 4. an inner binder that SHADOWS the callee's own param.
+(evals "(defn ilg-shadow [a] ((fn [a] (* a 2)) (+ a 1)))")
+(ilg-emit "(defn ilg-shadow [a] ((fn [a] (* a 2)) (+ a 1)))")
+(gate-check "a shadowing inner binder still shadows after the splice"
+            (ilg-call "(fn [] (let [a 100] (ilg-shadow a)))") "202")
+
+;; 5. an ARRAY-HINTED callee is not a candidate at all. ^doubles/^longs/^ints
+;;    type their local through the arity (numeric/arity-env reads :ahints off
+;;    it), and a spliced body has no arity: :nhints survive as a coerce-node on
+;;    the wrapping let, but nothing says "this local is a flvector", so the copy
+;;    falls off the unboxed path. Caught by bench/arrays going 229.7 -> 1272.6ms
+;;    when :loop became spliceable and dot's (aget a i) started emitting jolt-nth
+;;    instead of flvector-ref -- a 5.4x regression that every behavioural gate
+;;    passed, because the answers were all still right.
+;;
+;;    Asserted on the name (the call survives) rather than on flvector-ref, so it
+;;    pins the refusal itself and not the emission that happens to follow from it.
+(evals "(defn ilg-adot ^double [^doubles v ^long n] (loop [i 0 acc 0.0] (if (< i n) (recur (inc i) (+ acc (aget v i))) acc)))")
+(ilg-emit "(defn ilg-adot ^double [^doubles v ^long n] (loop [i 0 acc 0.0] (if (< i n) (recur (inc i) (+ acc (aget v i))) acc)))")
+(gate-check "an array-hinted callee is never spliced"
+            (gate-sub? (ilg-emit "(defn ilg-uses-adot [v] (ilg-adot v 4))") "ilg-adot") #t)
+
+(set-direct-link-flag! #f)
+(set-optimize! #f)
+
 (gate-summary "inline-body")

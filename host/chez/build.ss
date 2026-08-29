@@ -806,7 +806,6 @@
           (ei-fresh-unit!)
           ((var-deref "jolt.backend-scheme" "set-prelude-mode!") #t)
           (set-optimize! #t)
-          (set-release! #t)
           ((var-deref "jolt.backend-scheme" "set-var-cache!") #t))
         (lambda ()
           (for-each
@@ -832,7 +831,6 @@
             ordered))
         (lambda ()
           (set-optimize! #f)
-          (set-release! #f)
           ((var-deref "jolt.backend-scheme" "set-var-cache!") #f)
           (ei-clear-cached!))))))
 
@@ -965,8 +963,8 @@
 ;; --- the build --------------------------------------------------------------
 ;; entry-ns: the app's main namespace (a string). out-path: the binary to write.
 ;; mode: "dev" | "release" | "optimized". Every form runs through jolt.passes/
-;; run-passes (const-fold always; type inference in release+optimized; inline +
-;; scalar-replace additionally when optimized). Deps + source roots are already
+;; run-passes (const-fold always; type inference in every mode but dev; inline +
+;; scalar-replace additionally when direct-linked). Deps + source roots are already
 ;; applied by the caller.
 ;; natives: encoded :jolt/native libs to load at startup. embed-dirs: dirs whose
 ;; files bake into the binary (single-file). ext-roots: project-relative io/resource
@@ -1295,8 +1293,12 @@
                 ;; must lower to var-deref, so prelude mode is on for the whole build.
                 (ei-fresh-unit!)
                 ((var-deref "jolt.backend-scheme" "set-prelude-mode!") #t)
-                (set-optimize! (string=? mode "optimized"))
-                (set-release! (string=? mode "release"))
+                ;; The passes run for every mode but dev. "release" and
+                ;; "optimized" differ only in the Chez compile parameters
+                ;; below (inspector + procedure-source info), not in what the
+                ;; compiler emits -- inlining follows direct-link, which both
+                ;; of them set.
+                (set-optimize! (not (string=? mode "dev")))
                 (when direct-link?
                   ((var-deref "jolt.backend-scheme" "set-direct-link!") #t)
                   ((var-deref "jolt.backend-scheme" "direct-link-reset!"))
@@ -1419,7 +1421,6 @@
                         #f))))
               (lambda ()
                 (set-optimize! #f)
-                (set-release! #f)
                 (set-direct-link-flag! #f)
                 ((var-deref "jolt.backend-scheme" "set-direct-link!") #f)
                 ((var-deref "jolt.backend-scheme" "set-source-reg!") #f)
