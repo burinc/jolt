@@ -244,8 +244,36 @@
 ;; the launcher cd'd to the jolt repo root — matching the JVM, where io/file is
 ;; cwd-relative. (io/resource builds jfiles from the source roots directly, so it
 ;; isn't routed through here.)
+(define (path-separator-char? c)
+  (or (char=? c #\/) (char=? c #\\)))
+
+(define (ascii-drive-letter? c)
+  (or (and (char>=? c #\A) (char<=? c #\Z))
+      (and (char>=? c #\a) (char<=? c #\z))))
+
+;; java.io.File.isAbsolute is host-platform-specific. POSIX has one absolute
+;; prefix (/). Windows has drive-rooted paths (C:\x or C:/x) and UNC paths
+;; (\\server\share); drive-relative C:x and current-drive-rooted \x are not
+;; absolute in the JVM sense. Keep absolute recognition shared with filesystem
+;; resolution and getAbsolutePath so introspection/build commands cannot
+;; disagree about drive-rooted or UNC inputs. This deliberately does not claim
+;; full emulation of Windows' two special *relative* forms (`C:child` uses that
+;; drive's process-local current directory and `\child` uses the current drive);
+;; their resolution remains an older File-shim compatibility gap.
+(define (jfile-path-absolute? p)
+  (let ((n (string-length p)))
+    (if (eq? (sa-os-family) 'windows)
+        (or (and (>= n 3)
+                 (ascii-drive-letter? (string-ref p 0))
+                 (char=? (string-ref p 1) #\:)
+                 (path-separator-char? (string-ref p 2)))
+            (and (>= n 2)
+                 (path-separator-char? (string-ref p 0))
+                 (path-separator-char? (string-ref p 1))))
+        (and (> n 0) (char=? (string-ref p 0) #\/)))))
+
 (define (project-relative p)
-  (if (or (= (string-length p) 0) (char=? (string-ref p 0) #\/))
+  (if (or (= (string-length p) 0) (jfile-path-absolute? p))
       p
       (let ((base (jolt-user-dir)))
         ;; "." adds nothing the OS won't do itself when it resolves a relative
@@ -299,7 +327,7 @@
 ;; are user.dir-relative.
 (define (jfile-abs p)
   (cond ((= (string-length p) 0) (jolt-user-dir))
-        ((char=? (string-ref p 0) #\/) p)
+        ((jfile-path-absolute? p) p)
         (else (project-relative p))))
 
 ;; --- canonical paths --------------------------------------------------------
@@ -697,7 +725,7 @@
       ((string=? name "exists")         (list (if (file-exists? fp) #t #f)))
       ((string=? name "isDirectory")    (list (if (file-directory? fp) #t #f)))
       ((string=? name "isFile")         (list (if (and (file-exists? fp) (not (file-directory? fp))) #t #f)))
-      ((string=? name "isAbsolute")     (list (if (and (> (string-length p) 0) (char=? (string-ref p 0) #\/)) #t #f)))
+      ((string=? name "isAbsolute")     (list (if (jfile-path-absolute? p) #t #f)))
       ;; listFiles builds each child from the path AS GIVEN (new File(this, name)
       ;; on the JVM), so a File made from a relative path lists relative children.
       ((string=? name "listFiles")
