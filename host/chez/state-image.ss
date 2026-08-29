@@ -61,7 +61,13 @@
       (keyword? x)
       (and (hashtable? x) (not (image-eq-hashtable? x)))
       (port? x)
-      (thread? x)))
+      (thread? x)
+      ;; A var-rooted multimethod or reify: code, like a named fn, and written the
+      ;; same way -- as the var's name through the fn-ref descriptor. code-value?
+      ;; is a two-predicate check and runs before the table lookup, so this costs
+      ;; a walked value nothing it did not already pay (jolt-2cny).
+      (jns? x)
+      (and (code-value? x) (proc-name-of x) #t)))
 
 ;; A record's fields for image purposes: its own AND every parent's, root first —
 ;; the order record-constructor takes them in. record-type-field-names reports only
@@ -256,10 +262,17 @@
     (cond
       (h (list 'handler (jolt-invoke (cadr h) x)))
       ((keyword? x) (list 'kw (keyword-t-ns x) (keyword-t-name x)))
-      ((procedure? x)
+      ;; a namespace is interned by name, exactly like a keyword: a fasl copy
+      ;; would be a SECOND `user` that merely = the live one, where find-ns is
+      ;; identity-stable and a var round-trips to the identical var (jolt-ji1h)
+      ((jns? x) (list 'ns (jns-name x)))
+      ;; A named fn travels as its var's name. So does any other CODE value some
+      ;; var roots -- a multimethod, a reify -- which is not a procedure but is
+      ;; equally something the restoring build already has (rt.ss code-value?).
+      ;; A bare closure has no stable identity to write, so it is refused here
+      ;; and reported with its path.
+      ((or (procedure? x) (proc-name-of x))
        (let ((p (proc-name-of x)))
-         ;; A named fn travels as its var's name. A bare closure has no stable
-         ;; identity to write, so it is refused here and reported with its path.
          (and p (list 'fn-ref (car p) (cdr p)))))
       ;; A non-eq hashtable is refused rather than described. Its contents would
       ;; have to ride in the descriptor stream, which is written WITHOUT an
@@ -273,6 +286,7 @@
   (case (car d)
     ;; back through the intern table, so the restored keyword IS the live one
     ((kw) (keyword (cadr d) (caddr d)))
+    ((ns) (intern-ns! (cadr d)))
     ((fn-ref)
      (let ((c (var-cell-lookup (cadr d) (caddr d))))
        (if (and c (not (jolt-var-unbound? (var-cell-root c))))
@@ -1013,6 +1027,39 @@
                                          (walk (lazy-src-a x) (cons "lazy-arg" path))
                                          (walk (lazy-src-b x) (cons "lazy-arg" path))
                                          #t))))
+                             ;; a var-rooted multimethod or reify: code the
+                             ;; restoring build already has, so it travels as the
+                             ;; var's NAME through the same fn-ref external a
+                             ;; named fn uses. Without this the walk descended
+                             ;; into a multifn's dispatch tables and refused at a
+                             ;; raw hashtable the user could do nothing about
+                             ;; (jolt-2cny).
+                             ;; A transient is thread-owned mutable state whose
+                             ;; owning thread is gone by definition after a
+                             ;; restore, and half of them could not travel anyway
+                             ;; -- a transient vector wrote silently while a
+                             ;; transient map refused on its backing hashtable.
+                             ;; Refuse both, saying what to do (jolt-ji1h).
+                             ((jolt-transient? x)
+                              (cond
+                                ((eq? mode 'rebuild-stub)
+                                 (let ((st (make-stub x path "a transient")))
+                                   (hashtable-set! memo x st) st))
+                                ((image-rebuild-mode? mode)
+                                 (jolt-throw
+                                   (jolt-ex-info
+                                     (string-append
+                                       "image: cannot write a transient at "
+                                       (image-path->string path)
+                                       ": it belongs to the thread that made it, which"
+                                       " a restore does not have. Call persistent! on it"
+                                       " first.")
+                                     empty-pmap)))
+                                (else (hashtable-set! memo x #t)
+                                      (report! x path (image-report-disposition mode)))))
+                             ((and (not (procedure? x)) (proc-name-of x))
+                              (hashtable-set! memo x x)
+                              x)
                              ((mutex? x)
                               (cond ((eq? mode 'restore) (make-mutex))
                                     ((image-rebuild-mode? mode) (make-image-sync 'mutex))

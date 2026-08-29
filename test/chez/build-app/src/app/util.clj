@@ -110,3 +110,11 @@
 
 (defn make-closure [n]
   (fn [y] (+ closure-base n y)))
+
+;; A multimethod and a lazy sequence, for the built-binary image case in
+;; app.core. Both are things a real program holds in its state, and both used to
+;; refuse in an image: a multimethod had its dispatch tables walked, and a lazy
+;; seq clojure.core built had no recorded source for its thunk.
+(defmulti image-mm (fn [x] x))
+(defmethod image-mm :a [_] :got-a)
+(defmethod image-mm :default [_] :dflt)

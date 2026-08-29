@@ -393,6 +393,8 @@
 ;; table does not. clojure.core/proxy over a concrete class builds one that way —
 ;; see java/proxy.ss. A plain reify has no delegate and a method miss still throws.
 (define-record-type jreify (fields methods protos delegate) (nongenerative chez-jreify-v2))
+;; likewise a reify: (def r (reify ...)) is code the restoring build already has.
+(register-code-value! jreify?)
 (define (reified-methods obj) (and (jreify? obj) (jreify-methods obj)))
 (define (reify-delegate obj) (and (jreify? obj) (jreify-delegate obj)))
 ;; (get reify k) / (:k reify) routes to a reify's ILookup valAt — clojure.spec.alpha

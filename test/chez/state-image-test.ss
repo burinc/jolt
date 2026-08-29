@@ -745,6 +745,37 @@
     (is "a restored agent keeps its state and still takes work"
         "(do (send $agr inc) (await-for 5000 $agr) (deref $agr))" "8")))
 
+;; --- code a var roots travels as the var's NAME (jolt-2cny) --------------------
+;; A named fn already did. A multimethod and a reify are code too, but they are
+;; RECORDS, so `procedure?` missed them, nothing recorded their var name, and the
+;; walk descended into a multifn's dispatch tables and refused at a raw hashtable
+;; the user could do nothing about. They restore as the LIVE object, not a copy.
+(ev "(defmulti sim-mm (fn [x] x)) (defmethod sim-mm :a [_] :got-a) (defmethod sim-mm :default [_] :dflt)")
+(ev "(defprotocol SimP (sim-px [x])) (def sim-rfy (reify SimP (sim-px [_] :from-reify)))")
+(rtu "multimethod"  "sim-mm"
+     "[($rt :a) ($rt :zz) (identical? $rt sim-mm)]"          "[:got-a :dflt true]")
+(rtu "reify"        "sim-rfy"
+     "[(sim-px $rt) (identical? $rt sim-rfy)]"               "[:from-reify true]")
+(rtu "a multimethod inside app state" "{:handler sim-mm}"
+     "((:handler $rt) :a)"                                   ":got-a")
+(is "a multimethod scans clean" "(count (jolt.host/image-scan sim-mm))" "0")
+
+;; --- a namespace is interned, a transient is not written at all (jolt-ji1h) ----
+;; find-ns is identity-stable and a var round-trips to the identical var, so a
+;; namespace coming back as a SECOND `user` that merely = the live one was out of
+;; line with both. It travels by name now, like a keyword.
+(rtu "namespace" "(find-ns 'user)"
+     "[(identical? $rt (find-ns 'user)) (str (ns-name $rt))]"  "[true \"user\"]")
+;; A transient belongs to the thread that made it. A transient VECTOR used to be
+;; written silently while a transient MAP refused on its backing hashtable --
+;; both refuse now, saying what to do.
+(ok "a transient refuses, saying what to do"
+    (str-has? (refusal-of "(transient [1 2])") "persistent!"))
+(is "a transient map refuses too"
+    "(count (jolt.host/image-scan (transient {:a 1})))" "1")
+(is "persistent! is the way through"
+    "(count (jolt.host/image-scan (persistent! (transient [1 2]))))" "0")
+
 (ok "restore mints a live primitive over a raw one from an old image"
     (let* ((dead (vector (make-mutex) (make-condition)))
            (healed (let-values (((g _) (image-graph-process dead 'restore #f))) g)))
@@ -1298,6 +1329,41 @@
 
 (cleanup!)
 (when (file-exists? (string-append tmp ".txt")) (delete-file (string-append tmp ".txt")))
+
+;; --- the API surface (jolt-hnlk) ----------------------------------------------
+;; The handler READ side had no coverage at all: the existing handler test writes
+;; and inspects the graph, and never restores through image-restore-handler. So
+;; the restore-fn running, the first-accepting-wins order, and a restore-fn that
+;; THROWS falling through to the next -- the contract register-handler!'s own
+;; docstring states -- were unasserted.
+(ev "(jolt.host/image-register-handler! (fn [x] (and (map? x) (:res2 x))) (fn [x] {:tag :second}) (fn [d] (if (= (:tag d) :second) {:restored :by-second} (throw (ex-info \"not mine\" {})))))")
+;; registered LAST, so it is tried FIRST and must decline by throwing
+(ev "(jolt.host/image-register-handler! (fn [x] (and (map? x) (:res2 x))) (fn [x] {:tag :second}) (fn [d] (throw (ex-info \"never mine\" {}))))")
+(rtu "a handler's restore-fn runs" "{:r {:res2 true}}"
+     "(:restored (:r $rt))"                                  ":by-second")
+
+;; dump-world! takes an explicit namespace list, and {:unwritable :fail} restores
+;; dump!'s strictness where the default stubs.
+(ev "(in-ns 'apiworld) (def api-data {:a 1}) (in-ns 'user)")
+(def-var! "apiworld" "api-port"
+  (open-file-output-port (string-append tmp ".api-probe.txt") (file-options no-fail)))
+(is "dump-world! of a named ns writes it"
+    (string-append "(do (jolt.host/image-dump-world! \"" tmp "\" [\"apiworld\"]) "
+                   " (jolt.host/image-restore-world! \"" tmp "\"))")
+    "2")
+;; NOT covered here: dump-world! {:unwritable :fail}. It walks whole namespaces,
+;; and by this point in the file enough handlers and resolvers are registered that
+;; the default stubs NOTHING -- so a row asserting ":fail refuses where the default
+;; stubs" asserts nothing at all. Verified by hand instead (jolt-hnlk).
+
+;; a resolver spec may be a KIND STRING rather than a predicate; only the
+;; predicate form was covered. Asserted on the matcher directly, because
+;; resolvers are global and registration order decides which one claims a stub.
+(ok "a resolver spec given as a kind string matches that kind"
+    (and (image-stub-resolver-match ":object"
+           (jolt-hash-map (jolt-keyword "kind") ":object"))
+         (not (image-stub-resolver-match ":port"
+                (jolt-hash-map (jolt-keyword "kind") ":object")))))
 
 (printf "~a/~a state-image assertions passed\n" (- total fails) total)
 (when (> fails 0) (exit 1))

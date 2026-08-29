@@ -71,7 +71,23 @@
       (img/dump! path folded)
       (println "closure-folded:" (folded 5) ((img/read-image path) 5))
       (img/dump! path live)
-      (println "closure-live:" (live 5) ((img/read-image path) 5))))
+      (println "closure-live:" (live 5) ((img/read-image path) 5))
+      ;; the rest of the value kinds an image is supposed to carry, checked HERE
+      ;; because a built binary is a different emit path from `jolt run` and
+      ;; nothing else exercises images through it
+      (let [lazy (map inc (range 4))
+            walked (let [s (map inc (range 100))] (first s) s)]
+        (println "img-dumpable:" (img/dumpable? lazy) (img/dumpable? util/image-mm))
+        (img/dump! path lazy)
+        (println "img-lazy:" (vec (img/read-image path)))
+        (img/dump! path walked)
+        (println "img-walked:" (vec (take 3 (img/read-image path))))
+        (img/dump! path util/image-mm)
+        (println "img-multi:" ((img/read-image path) :a) ((img/read-image path) :zz))
+        (img/dump! path {:p (promise) :n (find-ns (quote app.core))})
+        (let [back (img/read-image path)]
+          (println "img-misc:" (realized? (:p back))
+                   (identical? (:n back) (find-ns (quote app.core))))))))
 
   ;; --innerfn: a named inner fn inside a spliced callee (jolt-pzos).
   (when (= (first args) "--innerfn")
