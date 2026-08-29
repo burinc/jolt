@@ -1255,6 +1255,11 @@
 ;; the anon-fn emission registers source forms for image closure capture — a
 ;; no-op keeps those calls inert, matching the image-off degradation.
 (define (image-register-fn-form! . _) #f)
+;; chez's def-var! records the var name of a code value (a multimethod, a reify)
+;; so a state image can write it as a reference. Gambit has no image, so the
+;; registration is a no-op and nothing is ever a named code value.
+(define (register-code-value! . _) #f)
+(define (code-value? x) #f)
 
 ;; jclass?/jclass-name and the class objects they read live in host-vars.ss.
 

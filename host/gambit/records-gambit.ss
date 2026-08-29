@@ -2287,6 +2287,8 @@
   (fields methods protos delegate)
   (nongenerative chez-jreify-v2))
 
+(register-code-value! jreify?)
+
 (define (reified-methods obj)
   (and (jreify? obj) (jreify-methods obj)))
 

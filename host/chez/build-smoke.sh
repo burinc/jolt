@@ -290,12 +290,18 @@ if [ "$got_cl" != "$want_cl" ]; then
   echo "--- binary ----"; echo "$got_cl"
   echo "--- jolt run --"; echo "$want_cl"; exit 1
 fi
-# ...and both actually wrote one, rather than agreeing on a shared failure.
+# ...and both actually wrote one, rather than agreeing on a shared failure. The
+# img-* lines cover the rest of the value kinds an image carries -- a lazy seq
+# built by clojure.core, one already walked part-way, a multimethod, an unkept
+# promise and a namespace -- through the BUILD emit path, which is a different
+# path from `jolt run` and which nothing else exercises for images.
 if ! printf '%s' "$got_cl" | grep -q '^closure-scan: 0 0$'; then
   echo "  FAIL: spliced closure is not writable (scan reported refusals)"
   echo "--- got ----"; echo "$got_cl"; exit 1
 fi
-for line in 'closure-folded: 115 115' 'closure-live: 110 110'; do
+for line in 'closure-folded: 115 115' 'closure-live: 110 110' \
+            'img-dumpable: true true' 'img-lazy: [1 2 3 4]' 'img-walked: [1 2 3]' \
+            'img-multi: :got-a :dflt' 'img-misc: false true'; do
   if ! printf '%s' "$got_cl" | grep -qF "$line"; then
     echo "  FAIL: spliced closure round trip — want '$line'"
     echo "--- got ----"; echo "$got_cl"; exit 1

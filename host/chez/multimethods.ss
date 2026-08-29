@@ -64,6 +64,10 @@
           cache (mutable cache-epoch) (mutable cache-hier))
   (nongenerative jolt-multifn-v2))
 
+;; a multimethod is CODE: a var holding one travels in a state image as the var's
+;; NAME, the way a named fn does, instead of having its dispatch tables walked.
+(register-code-value! jolt-multifn?)
+
 (define kw-default (keyword #f "default"))
 (define (new-mm-table) (make-hashtable key-hash jolt=))
 

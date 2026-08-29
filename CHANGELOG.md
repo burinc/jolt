@@ -110,6 +110,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closure. Measured against the previous release on one machine, min of 5
   alternating runs.
 
+- **A var-rooted multimethod or `reify` was walked instead of named.** A named
+  fn travels as its var's name and comes back as the live fn. A multimethod is
+  code too, but it is a *record*, so `procedure?` missed it, nothing recorded its
+  var name, and the image descended into its dispatch tables and refused at a raw
+  hashtable naming nothing the user could act on. Both travel as the var's name
+  now and restore as the live object — `identical?`, not a copy.
+
+- **A namespace came back as a second namespace.** `find-ns` is identity-stable
+  and a var round-trips to the identical var, so a restored namespace that merely
+  `=` the live one was out of line with both. Namespaces are interned by name
+  now, like keywords.
+
+- **A transient was written silently, or half-written.** A transient vector
+  travelled while a transient map refused on its backing hashtable. A transient
+  belongs to the thread that made it, which a restore does not have; both refuse
+  now, saying to call `persistent!` first.
+
 - **`jolt.image/scan` hung on an infinite unwritable sequence.** A finding
   describes its object by printing it, and printing a lazy seq realizes it, so
   scanning `(repeat :z)` never returned. Seqs are described by kind now.
