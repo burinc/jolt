@@ -50,6 +50,17 @@
                         (util/redef-fn)))
     (println "dyn:" (binding [util/*config* :bound]
                       util/*config*)))
+  ;; --doubledef: a var defined twice must answer the same through every call
+  ;; path in the built binary, and the same as `jolt run` (jolt-rtjm). apply
+  ;; defeats any direct-call folding, so the two lines exercise different doors
+  ;; into dd-caller.
+  (when (= (first args) "--doubledef")
+    (println "dd-apply:" (apply util/dd-caller nil))
+    (println "dd-call: " (util/dd-caller))
+    (println "dd-late: " (util/dd-late)))
+  ;; --innerfn: a named inner fn inside a spliced callee (jolt-pzos).
+  (when (= (first args) "--innerfn")
+    (util/inner-boom 1))
   ;; --resloader: the ClassLoader surface must resolve exactly what io/resource
   ;; resolves, INCLUDING a resource baked into this binary. It used to walk the
   ;; source roots on its own and never look at the embedded table, so every

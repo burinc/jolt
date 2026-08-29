@@ -13,7 +13,7 @@
   :refer, so jolt.passes stays the only namespace the back end imports.
 
   Portable Clojure: kernel-tier fns + seed primitives only."
-  (:require [jolt.host :refer [inline-enabled? inference-enabled? record-shapes protocol-methods stash-inline!]]
+  (:require [jolt.host :refer [inline-enabled? inference-enabled? record-shapes protocol-methods stash-inline! var-redefined?]]
             [jolt.passes.fold :refer [const-fold]]
             [jolt.passes.numeric :as numeric]
             [jolt.passes.inline :refer [inline-node flatten-lets scalar-replace direct-call-edges]]
@@ -40,7 +40,7 @@
 ;; body into one of them defeats exactly that. Refused at the STASH rather than
 ;; at the splice site, so an opted-out fn never enters the graph the cycle walk
 ;; and the fixpoint traverse.
-(defn- inline-eligible? [node]
+(defn- inline-eligible? [ctx node]
   (and (jolt.ir/single-fixed-arity-fn-def? node)
        (not (jolt.ir/closed-world-opt-out? (:meta node)))
        ;; ...and not array-hinted. A ^doubles/^longs/^ints param types its local
@@ -57,7 +57,29 @@
        ;; declared kind on a let-bound local. Costs nothing against the state before
        ;; :loop landed -- these fns are nearly all loops, so none of them were
        ;; spliceable then either.
-       (not (seq (:ahints (first (:arities (:init node))))))))
+       (not (seq (:ahints (first (:arities (:init node))))))
+       ;; ...and not a var this program defines more than once. A stash is a
+       ;; promise that the body a call site copies is the body that var will
+       ;; have, and a second def breaks it for every caller compiled before it:
+       ;;
+       ;;   (defn greet [] "first")
+       ;;   (defn call-it [] (greet))    ; splices "first" -- frozen
+       ;;   (defn greet [] "second")
+       ;;   (defn later [] (greet))      ; splices "second"
+       ;;
+       ;; One binary, two answers, and neither matches `jolt run` or the JVM
+       ;; (both "second"). Direct-linking ALONE is fine here -- the two defs
+       ;; both (set! jv$…$greet …) and the second wins -- so this is splicing
+       ;; specifically, and refusing the stash converges on the direct-linked
+       ;; call, i.e. last-def-wins (jolt-rtjm).
+       ;;
+       ;; Asked of the HOST, not of the forms seen so far, because the answer has
+       ;; to be final before the first call site compiles: `jolt build` loads the
+       ;; whole app from source before it emits any of it, so def-var! has
+       ;; already seen both defs by the time run-passes reaches the first one.
+       ;; (declare x) emits declare-var!, not def-var!, so a forward declaration
+       ;; ahead of its real defn is not a redefinition and stays spliceable.
+       (not (var-redefined? ctx (:ns node) (:name node)))))
 
 (defn- stash-of [node]
   (let [a (first (:arities (:init node)))]
@@ -143,8 +165,17 @@
   (when ir-validate? (report-ir! "analyze" node))
   ;; stash an inline-eligible defn so later call sites can splice it (closed-world
   ;; optimization only). Done before optimizing, from the analyzed node.
-  (when (and (inline-enabled? ctx) (inline-eligible? node))
-    (stash-inline! ctx (:ns node) (:name node) (stash-of node)))
+  ;;
+  ;; A def that is NOT eligible clears the entry rather than leaving it alone. The
+  ;; stash table is process-global and shared across compilations on purpose (that
+  ;; is what makes cross-namespace splicing work), so "no stash written" is not the
+  ;; same as "no stash": a previous compilation in this process — the pass gates
+  ;; compile many small programs in one — can have left one under the same fqn, and
+  ;; a refusal that only declines to overwrite would splice it. Storing nil is the
+  ;; removal: inline-ir hands it back as nil and try-inline treats that as no stash.
+  (when (and (inline-enabled? ctx) (= :def (:op node)))
+    (stash-inline! ctx (:ns node) (:name node)
+                   (when (inline-eligible? ctx node) (stash-of node))))
   (let [result
         (numeric/annotate
           (cond

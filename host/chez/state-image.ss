@@ -119,6 +119,32 @@
         (loop (cdr p)
               (if (string=? acc "") (car p) (string-append acc " -> " (car p)))))))
 
+;; Why an unregistered PROCEDURE cannot be written, and what to do instead. A fn
+;; is writable only through its recorded source (:src-form + :free-names, emitted
+;; by the back end's fnsrc registration); an unregistered one has nothing to
+;; rebuild from.
+;;
+;; Since inlining follows linkage (0.7.29), a fn LITERAL returned by a fn the
+;; compiler spliced is a new way to land here: the copy's binders are
+;; alpha-renamed and its captures include the caller's own locals, so it matches
+;; no recorded source form, and the inline pass drops the registration rather than
+;; let a restore rebuild from stale names — a name the inspector cannot report
+;; binds jolt-nil, which would surface as a WRONG VALUE long after the restore
+;; instead of a refusal here (jolt-giqc).
+;;
+;; The ^:redef advice is verified, not a guess: it opts the enclosing fn out of the
+;; closed world, so it is never spliced and its literal keeps its registration.
+;; Empty for a non-procedure, whose refusal has nothing to do with any of this.
+(define (image-unregistered-fn-hint x)
+  (if (procedure? x)
+      (string-append
+        ": this fn has no recorded source, so there is nothing to rebuild it from."
+        " A fn literal returned by a fn the compiler inlined is one way to get here"
+        " - the spliced copy is not the registered original. Store a top-level fn"
+        " (or the data to rebuild one), or mark the enclosing fn ^:redef so it is"
+        " not spliced.")
+      ""))
+
 (define (image-describe-obj x)
   (cond
     ((procedure? x) "#<procedure>")
@@ -763,7 +789,8 @@
                               (jolt-throw
                                 (jolt-ex-info
                                   (string-append "image: cannot write " (image-describe-obj x)
-                                                 " at " (image-path->string path))
+                                                 " at " (image-path->string path)
+                                                 (image-unregistered-fn-hint x))
                                   empty-pmap)))
                              (else
                               (hashtable-set! memo x #t)
