@@ -142,6 +142,13 @@
 (define (image-describe-obj x)
   (cond
     ((procedure? x) "#<procedure>")
+    ;; Never PRINT a seq to describe it. Printing forces it, and an unrealized
+    ;; one can be infinite -- (image-scan (repeat :z)) would hang instead of
+    ;; reporting. A description exists to identify the object, and this does.
+    ;; Reachable since an unwritable lazy cell is refused as ITSELF rather than
+    ;; as the anonymous procedure inside it (jolt-zr91).
+    ((jolt-lazyseq? x) "#<lazy-seq>")
+    ((cseq? x) "#<seq>")
     ((port? x) "#<port>")
     ((thread? x) "#<thread>")
     ((hashtable? x) "#<hashtable>")
@@ -945,6 +952,37 @@
                                     (walk (jolt-agent-validator x) (cons "@validator" path))
                                     (walk (jolt-agent-err-handler x) (cons "@error-handler" path))
                                     #t)))
+;; An unrealized lazy cell whose thunk is a closure the image cannot record.
+                             ;; clojure.core's NATIVE producers carry a descriptor
+                             ;; and travel (below); its overlay ones -- cycle,
+                             ;; repeatedly, map-indexed and the rest -- are fn
+                             ;; literals in clojure.core, and the language's own
+                             ;; namespaces are not registered, which is the same
+                             ;; limit that stops a partial/comp closure travelling.
+                             ;; Refuse by NAME rather than let the generic
+                             ;; procedure refusal report an anonymous #<procedure>
+                             ;; at a path ending in "thunk" (jolt-zr91).
+                             ((and (jolt-lazyseq? x)
+                                   (not (jolt-lazyseq-realized? x))
+                                   (procedure? (jolt-lazyseq-thunk x))
+                                   (not (image-fnsrc-probe (jolt-lazyseq-thunk x))))
+                              (cond
+                                ((eq? mode 'rebuild-stub)
+                                 (let ((st (make-stub x path "an unrealized lazy sequence")))
+                                   (hashtable-set! memo x st) st))
+                                ((image-rebuild-mode? mode)
+                                 (jolt-throw
+                                   (jolt-ex-info
+                                     (string-append
+                                       "image: cannot write an unrealized lazy sequence at "
+                                       (image-path->string path)
+                                       ": it was produced by a clojure.core fn whose body the"
+                                       " image cannot record, the same reason a partial or comp"
+                                       " closure cannot travel. Realize it first (doall), or"
+                                       " store the data it produces.")
+                                     empty-pmap)))
+                                (else (hashtable-set! memo x #t)
+                                      (report! x path (image-report-disposition mode)))))
                              ;; A clojure.core lazy producer, recorded as its
                              ;; arguments plus a forcer (seq.ss lazy-src). The
                              ;; forcer is a procedure and cannot travel, so the
@@ -964,18 +1002,16 @@
                                        (lazy-src-name-of (lazy-src-fn x))))
                               => (lambda (swapped)
                                    (if (image-rebuild-mode? mode)
-                                       (let ((nx (make-lazy-src swapped #f #f #f)))
+                                       (let ((nx (make-lazy-src swapped #f #f)))
                                          (hashtable-set! memo x nx)
                                          (image-meta-copy! x nx)
                                          (lazy-src-a-set! nx (walk (lazy-src-a x) (cons "lazy-arg" path)))
                                          (lazy-src-b-set! nx (walk (lazy-src-b x) (cons "lazy-arg" path)))
-                                         (lazy-src-c-set! nx (walk (lazy-src-c x) (cons "lazy-arg" path)))
                                          nx)
                                        (begin
                                          (hashtable-set! memo x #t)
                                          (walk (lazy-src-a x) (cons "lazy-arg" path))
                                          (walk (lazy-src-b x) (cons "lazy-arg" path))
-                                         (walk (lazy-src-c x) (cons "lazy-arg" path))
                                          #t))))
                              ((mutex? x)
                               (cond ((eq? mode 'restore) (make-mutex))

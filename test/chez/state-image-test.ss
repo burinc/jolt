@@ -93,6 +93,25 @@
 (rt "empty colls" "[[] {} #{} ()]"                 "[[] {} #{} ()]")
 (rt "record"      "(do (defrecord P [x y]) (->P 1 2))" "#user.P{:x 1, :y 2}")
 
+(define (str-has? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0))
+      (cond ((fx>? (fx+ i m) n) #f)
+            ((string=? (substring s i (fx+ i m)) sub) #t)
+            (else (loop (fx+ i 1)))))))
+(define (refusal-of expr)
+  (cleanup!)
+  (call/cc (lambda (k)
+    (with-exception-handler
+      (lambda (e) (k (if (jolt-ex-info-record? e)
+                         (jolt-ex-info-record-message e)
+                         (call/cc (lambda (k2)
+                           (with-exception-handler (lambda (_) (k2 "?"))
+                             (lambda () (condition->message-string e))))))))
+      (lambda ()
+        (ev (string-append "(jolt.host/image-write! \"" tmp "\" " expr ")"))
+        "WROTE")))))
+
 ;; --- the value-kind matrix: restored values must still WORK ---------------------
 ;; `rt` above compares printed forms, which settles a value type. It settles
 ;; nothing for a value whose identity IS its meaning: = is identity for an atom, a
@@ -166,6 +185,41 @@
      "(map (fn [x] (swap! img-lazy-count inc) x) [1 2 3])"
      "[(deref img-lazy-count) (vec $rt) (deref img-lazy-count)]"
      "[0 [1 2 3] 3]")
+
+;; ...and a chain already walked PART-WAY. Its unforced frontier is a per-element
+;; cell rather than the producer that built it, so these needed every cseq tail
+;; to carry a descriptor too, not just the producer entry points (jolt-0u7m).
+(rtu "map walked part-way"
+     "(let [s (map inc (range 100))] (first s) s)"
+     "(vec (take 4 $rt))"                                    "[1 2 3 4]")
+(rtu "rest of a core map"    "(rest (map inc [1 2 3]))" "(vec $rt)" "[3 4]")
+(rtu "filter walked part-way"
+     "(let [s (filter odd? (range 100))] (first s) s)"
+     "(vec (take 3 $rt))"                                    "[1 3 5]")
+(rtu "infinite iterate walked"
+     "(let [s (iterate inc 0)] (first s) (rest s))"
+     "(vec (take 3 $rt))"                                    "[1 2 3]")
+;; cycle and repeat are clojure.core OVERLAY fns: their thunk is a fn literal in
+;; clojure.core, and the language's own namespaces are not registered -- the same
+;; limit that stops a partial or comp closure travelling. They refuse, and the
+;; refusal has to name what it is rather than report an anonymous #<procedure>.
+(ok "scanning an INFINITE unwritable seq terminates"
+    ;; describing a finding used to print the object, which forces it
+    (= 1 (jolt-count (jolt-compile-eval "(jolt.host/image-scan (repeat :z))" "user"))))
+(ok "an overlay lazy seq refuses, naming itself"
+    (str-has? (refusal-of "(cycle [1 2])") "unrealized lazy sequence"))
+(is "an overlay lazy seq scans as unwritable"
+    "(count (jolt.host/image-scan (repeat :z)))" "1")
+(is "realizing it first is the way through"
+    "(count (jolt.host/image-scan (doall (take 3 (repeat :z)))))" "0")
+(rtu "take-while"   "(take-while odd? [1 3 4 5])" "(vec $rt)" "[1 3]")
+(rtu "partition"    "(partition 2 (range 7))"    "(vec (map vec $rt))" "[[0 1] [2 3] [4 5]]")
+(rtu "mapcat"       "(mapcat (fn [x] [x x]) [1 2])" "(vec $rt)" "[1 1 2 2]")
+(rtu "string seq walked"
+     "(let [s (seq \"abc\")] (first s) s)"      "(vec $rt)"  "[\\a \\b \\c]")
+(rtu "rseq"         "(rseq [1 2 3])"             "(vec $rt)"  "[3 2 1]")
+(rtu "concat walked part-way"
+     "(let [s (concat [1] [2 3])] (first s) s)"  "(vec $rt)"  "[1 2 3]")
 
 (rtu "cons onto vec" "(cons 1 [2 3])"          "(vec $rt)"   "[1 2 3]")
 (rtu "PersistentQueue"
@@ -664,24 +718,6 @@
 ;; restored running future never completes, so deref hangs forever, and a
 ;; restored agent that believes it has a busy worker queues every later send
 ;; behind nothing.
-(define (str-has? s sub)
-  (let ((n (string-length s)) (m (string-length sub)))
-    (let loop ((i 0))
-      (cond ((fx>? (fx+ i m) n) #f)
-            ((string=? (substring s i (fx+ i m)) sub) #t)
-            (else (loop (fx+ i 1)))))))
-(define (refusal-of expr)
-  (cleanup!)
-  (call/cc (lambda (k)
-    (with-exception-handler
-      (lambda (e) (k (if (jolt-ex-info-record? e)
-                         (jolt-ex-info-record-message e)
-                         (call/cc (lambda (k2)
-                           (with-exception-handler (lambda (_) (k2 "?"))
-                             (lambda () (condition->message-string e))))))))
-      (lambda ()
-        (ev (string-append "(jolt.host/image-write! \"" tmp "\" " expr ")"))
-        "WROTE")))))
 
 ;; sleeps far longer than the gate takes, so it is still running when written --
 ;; no window to get wrong, since the row only needs "not done yet"
