@@ -141,6 +141,32 @@
 (rtu "StringBuilder" "(StringBuilder. \"ab\")"
      "(do (.append $rt \"c\") (str $rt))"                    "\"abc\"")
 
+;; --- lazy sequences built by clojure.core (jolt-a6k2) --------------------------
+;; A lazy seq whose thunk is a jolt `lazy-seq` form already travels: the thunk is
+;; an ordinary fn literal, so it registers and rebuilds like any closure, and the
+;; restored seq is still lazy (an infinite one keeps generating). What did not
+;; travel is a thunk clojure.core built -- map/filter/range/take/rest/cons build
+;; theirs as Chez lambdas in seq.ss, runtime Scheme with no source form -- and
+;; ONE core call anywhere in a chain poisoned the whole thing.
+(ev "(defn img-nat [n] (lazy-seq (cons n (img-nat (inc n)))))")
+
+(rtu "core map, unrealized"  "(map inc [1 2 3])"       "(vec $rt)"  "[2 3 4]")
+(rtu "core filter"           "(filter odd? [1 2 3 4])" "(vec $rt)"  "[1 3]")
+(rtu "core range"            "(range 3)"               "(vec $rt)"  "[0 1 2]")
+(rtu "rest of a user lazy"   "(rest (img-nat 0))"      "(vec (take 3 $rt))" "[1 2 3]")
+(rtu "core map over a user lazy" "(map inc (img-nat 0))" "(vec (take 3 $rt))" "[1 2 3]")
+(rtu "take of a user lazy"   "(take 3 (img-nat 0))"    "(vec $rt)"  "[0 1 2]")
+(rtu "cons onto a user lazy" "(cons 9 (img-nat 0))"    "(vec (take 3 $rt))" "[9 0 1]")
+
+;; and the point of carrying it as a producer rather than forcing it at dump: the
+;; restored seq is STILL LAZY. Forcing would both hang on an infinite seq and
+;; move when the side effect runs.
+(ev "(def img-lazy-count (atom 0))")
+(rtu "a restored core lazy seq is still lazy"
+     "(map (fn [x] (swap! img-lazy-count inc) x) [1 2 3])"
+     "[(deref img-lazy-count) (vec $rt) (deref img-lazy-count)]"
+     "[0 [1 2 3] 3]")
+
 (rtu "cons onto vec" "(cons 1 [2 3])"          "(vec $rt)"   "[1 2 3]")
 (rtu "PersistentQueue"
      "(conj clojure.lang.PersistentQueue/EMPTY 1 2)"

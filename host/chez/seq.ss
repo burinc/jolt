@@ -104,6 +104,76 @@
 (define (cseq-lazy head tail-thunk) (make-cseq head tail-thunk #f sk-cons #f 0 #f #f))
 (define (cseq-lazy/k head tail-thunk kind) (make-cseq head tail-thunk #f kind #f 0 #f #f))
 (define (cseq-list head tail) (make-cseq head tail #t sk-list #f 0 #f #f))   ; a PersistentList node
+
+;; --- a lazy cell's thunk, as DATA ---------------------------------------------
+;; A thunk built in Scheme carries its captured values where nothing can read
+;; them, which is why a lazy seq clojure.core produced could not be written to a
+;; state image at all -- while one a user `lazy-seq` form produced could, its
+;; thunk being an ordinary fn literal with a recorded source. Recording the
+;; producer and its arguments closes that without forcing anything: the image
+;; writes the producer's NAME and the arguments as data, and restore re-applies
+;; it, so what comes back is STILL LAZY -- an infinite seq keeps generating and a
+;; side effect still has not run.
+;;
+;; fn is the forcer, always a top-level procedure, so forcing a descriptor is one
+;; indirect call: the same shape as invoking the closure it replaces, with no
+;; dispatch on a tag added to the hot path. Three argument slots because that
+;; covers every producer here; unused ones are #f.
+;;
+;; Defined in seq.ss rather than beside the lazy cell in lazy-bridge.ss because
+;; the producers live here and lazy-bridge loads afterwards.
+;; Fields are mutable so the image walk can memoize the record BEFORE walking its
+;; arguments -- a self-referential producer ((def fib (lazy-cat [0 1] (map + fib
+;; (rest fib))))) reaches its own cell through them.
+(define-record-type lazy-src
+  (fields (mutable fn) (mutable a) (mutable b) (mutable c))
+  (nongenerative jolt-lazy-src-v1))
+
+;; producer name <-> forcer. The dump needs name-of (a procedure cannot travel);
+;; the restore needs proc-of. Registered at load, next to each producer.
+(define lazy-src-name-tbl (make-eq-hashtable))
+(define lazy-src-proc-tbl (make-eq-hashtable))
+(define (register-lazy-src! name proc)
+  (hashtable-set! lazy-src-name-tbl proc name)
+  (hashtable-set! lazy-src-proc-tbl name proc)
+  proc)
+(define (lazy-src-name-of proc) (hashtable-ref lazy-src-name-tbl proc #f))
+(define (lazy-src-proc-of name) (hashtable-ref lazy-src-proc-tbl name #f))
+(define (lazy-src-force t)
+  ((lazy-src-fn t) (lazy-src-a t) (lazy-src-b t) (lazy-src-c t)))
+;; a cseq's unforced tail is either a thunk or a descriptor, same as a lazy
+;; cell's. One record predicate on the force path, measured at no cost.
+(define (cseq-run-tail t) (if (lazy-src? t) (lazy-src-force t) (t)))
+
+;; forced tail of a seq whose own tail was not yet realized (jolt-rest)
+(define lz-rest
+  (register-lazy-src! 'rest (lambda (s _b _c) (jolt-seq (seq-more s)))))
+(define lz-map-chunk
+  (register-lazy-src! 'map-chunk
+    (lambda (f s _c) (jolt-seq (map-seq f (jolt-seq (na-chunk-rest s)))))))
+(define lz-filter-chunk
+  (register-lazy-src! 'filter-chunk
+    (lambda (pred s keep) (jolt-seq (filter-seq pred (jolt-seq (na-chunk-rest s)) keep)))))
+;; range carries four values through three slots: step and kind share the last.
+(define lz-range
+  (register-lazy-src! 'range
+    (lambda (v end step+kind)
+      (jolt-seq (range-chunked v end (car step+kind) (cdr step+kind))))))
+(define lz-take
+  (register-lazy-src! 'take
+    (lambda (n coll _c)
+      (jolt-seq
+       (if (and (flonum? n) (infinite? n))
+           (if (> n 0.0) (jolt-seq coll) jolt-empty-list)
+           (let ((n (->idx n)))
+             (if (fx<=? n 0)
+                 jolt-empty-list                 ; (take 0 coll) must not seq its source
+                 (let loop ((n n) (s (jolt-seq coll)))
+                   (cond
+                     ((or (fx<=? n 0) (jolt-nil? s)) jolt-empty-list)
+                     ((fx=? n 1) (cseq-lazy (seq-first s) (lambda () jolt-empty-list)))
+                     (else (cseq-lazy (seq-first s)
+                                      (lambda () (loop (fx- n 1) (jolt-seq (seq-more s)))))))))))))))
 ;; clojure.core/list? — Clojure's (instance? IPersistentList x), which among the
 ;; seq flavors only PersistentList is.
 (define (cseq-list? s) (fx=? (cseq-kind s) sk-list))
@@ -208,11 +278,11 @@
   (cond
     ((not jolt-mt?)
      (if (cseq-forced? s) (cseq-tail s)
-         (let ((t (if (cseq-cvec s) (cseq-cvec-more s #t) ((cseq-tail s)))))
+         (let ((t (if (cseq-cvec s) (cseq-cvec-more s #t) (cseq-run-tail (cseq-tail s)))))
            (cseq-tail-set! s t) (cseq-forced?-set! s #t) t)))
     (else (jolt-with-mutex (cseq-ensure-lock! s)     ; multi-threaded: always lock
             (if (cseq-forced? s) (cseq-tail s)
-                (let ((t (if (cseq-cvec s) (cseq-cvec-more s #t) ((cseq-tail s)))))
+                (let ((t (if (cseq-cvec s) (cseq-cvec-more s #t) (cseq-run-tail (cseq-tail s)))))
                   (cseq-tail-set! s t) (cseq-forced?-set! s #t) t))))))
 
 ;; The empty seq (Clojure's empty list ()), distinct from nil. The (unused) field
@@ -370,7 +440,7 @@
       ;; result (which may be jolt-empty-list, e.g. map's tail) back to cseq | nil,
       ;; the contract force-lazyseq relies on — else (seq (rest s)) of an empty
       ;; tail yields a truthy empty-list and walkers (distinct, dedupe) overrun.
-      (else (jolt-make-lazy-seq (lambda () (jolt-seq (seq-more s))))))))
+      (else (jolt-make-lazy-src lz-rest s #f #f)))))
 (define (jolt-next x)                  ; nil when the rest is empty
   ;; next = (seq (rest x)): the rest must be RE-SEQ'd so an empty tail collapses to
   ;; nil. seq-more on a lazy seq (e.g. map's) forces to jolt-empty-list, which is
@@ -1095,7 +1165,7 @@
       ((jolt-nil? s) jolt-empty-list)
       ((na-chunked-seq? s)
        (cseq-chunked (na-chunk-map-first s g) 0
-                     (jolt-make-lazy-seq (lambda () (jolt-seq (map-seq f (jolt-seq (na-chunk-rest s))))))))
+                     (jolt-make-lazy-src lz-map-chunk f s #f)))
       (else
        (cseq-lazy (g (seq-first s)) (lambda () (map-seq f (jolt-seq (seq-more s)))))))))
 (define (map-seq* f seqs)              ; multi-collection map; stops at the shortest
@@ -1108,10 +1178,14 @@
 ;; once yields the cseq chain, which then iterates with no per-element overhead.
 ;; jolt-seq coerces map-seq's result (cseq | jolt-empty-list) to cseq | nil, the
 ;; contract force-lazyseq relies on (see jolt-rest).
+(define lz-map1
+  (register-lazy-src! 'map1 (lambda (f coll _) (jolt-seq (map-seq f (jolt-seq coll))))))
+(define lz-mapN
+  (register-lazy-src! 'mapN (lambda (f colls _) (jolt-seq (map-seq* f (map jolt-seq colls))))))
 (define (jolt-map f . colls)
   (if (null? (cdr colls))
-      (jolt-make-lazy-seq (lambda () (jolt-seq (map-seq f (jolt-seq (car colls))))))
-      (jolt-make-lazy-seq (lambda () (jolt-seq (map-seq* f (map jolt-seq colls)))))))
+      (jolt-make-lazy-src lz-map1 f (car colls) #f)
+      (jolt-make-lazy-src lz-mapN f colls #f)))
 
 ;; Chunk-preserving, like core.clj filter: a chunked source has pred applied to the
 ;; whole chunk, the kept elements packed into a fresh (possibly smaller) chunk, and
@@ -1133,9 +1207,7 @@
              (filter-seq pred (jolt-seq (na-chunk-rest s)) keep)
              (cseq-chunked
               c 0
-              (jolt-make-lazy-seq
-               (lambda ()
-                 (jolt-seq (filter-seq pred (jolt-seq (na-chunk-rest s)) keep))))))))
+              (jolt-make-lazy-src lz-filter-chunk pred s keep)))))
       (else
        (let walk ((s s))
          (cond ((jolt-nil? s) jolt-empty-list)
@@ -1144,10 +1216,10 @@
                (else (walk (jolt-seq (seq-more s))))))))))
 ;; filter/remove are fully lazy (LazySeq): defer the predicate and the source seq
 ;; until forced, like Clojure. (lazy-seq* = a 0-arg lazy node coercing to cseq|nil.)
-(define (jolt-filter pred coll)
-  (jolt-make-lazy-seq (lambda () (jolt-seq (filter-seq pred (jolt-seq coll) #t)))))
-(define (jolt-remove pred coll)
-  (jolt-make-lazy-seq (lambda () (jolt-seq (filter-seq pred (jolt-seq coll) #f)))))
+(define lz-filter
+  (register-lazy-src! 'filter (lambda (pred coll keep) (jolt-seq (filter-seq pred (jolt-seq coll) keep)))))
+(define (jolt-filter pred coll) (jolt-make-lazy-src lz-filter pred coll #t))
+(define (jolt-remove pred coll) (jolt-make-lazy-src lz-filter pred coll #f))
 
 ;; honors `reduced`: a reducing fn that returns (reduced x) stops the fold and
 ;; unwraps to x (so does a reduced INIT). Checked at entry, so the value returned
@@ -1310,7 +1382,7 @@
            ;; the JVM's own arrangement (both LongRange and Range implement
            ;; IChunkedSeq).
            (cseq-chunked/k (make-pvec (list->vector (reverse acc))) 0
-                           (jolt-make-lazy-seq (lambda () (jolt-seq (range-chunked v end step kind))))
+                           (jolt-make-lazy-src lz-range v end (cons step kind))
                            kind))))
     (else jolt-empty-list)))
 ;; Which range class the args select. clojure.core/range sends every argument
@@ -1358,19 +1430,7 @@
   ;; Double/POSITIVE_INFINITY coll) takes the whole coll on the JVM (the count
   ;; never reaches 0); test.check's rose-tree unchunk relies on it. Coercing +inf.0
   ;; to a fixnum index would throw, so take all up front in that case.
-  (jolt-make-lazy-seq
-   (lambda ()
-     (jolt-seq
-      (if (and (flonum? n) (infinite? n))
-          (if (> n 0.0) (jolt-seq coll) jolt-empty-list)
-          (let ((n (->idx n)))
-            (if (fx<=? n 0)
-                jolt-empty-list                  ; (take 0 coll) must not seq its source
-                (let loop ((n n) (s (jolt-seq coll)))
-                  (cond
-                    ((or (fx<=? n 0) (jolt-nil? s)) jolt-empty-list)
-                    ((fx=? n 1) (cseq-lazy (seq-first s) (lambda () jolt-empty-list)))
-                    (else (cseq-lazy (seq-first s) (lambda () (loop (fx- n 1) (jolt-seq (seq-more s)))))))))))))))
+  (jolt-make-lazy-src lz-take n coll #f))
 ;; Dropping from a vector-backed cell is an index jump, not a walk: the result is
 ;; the same backing vector seen from further along. PersistentVector$ChunkedSeq
 ;; implements IDrop on the JVM for exactly this, and it is the difference between
@@ -1410,13 +1470,15 @@
 (define (concat2 a brest)
   (if (jolt-nil? a) (jolt-seq (brest))
       (cseq-lazy (seq-first a) (lambda () (concat2 (jolt-seq (seq-more a)) brest)))))
-(define (jolt-concat . colls)
-  (jolt-make-lazy-seq
-   (lambda ()
-     (jolt-seq
-      (cond ((null? colls) jolt-empty-list)
-            ((null? (cdr colls)) (jolt-seq (car colls)))
-            (else (concat2 (jolt-seq (car colls)) (lambda () (apply jolt-concat (cdr colls))))))))))
+(define lz-concat
+  (register-lazy-src! 'concat
+    (lambda (colls _b _c)
+      (jolt-seq
+       (cond ((null? colls) jolt-empty-list)
+             ((null? (cdr colls)) (jolt-seq (car colls)))
+             (else (concat2 (jolt-seq (car colls))
+                            (lambda () (apply jolt-concat (cdr colls))))))))))
+(define (jolt-concat . colls) (jolt-make-lazy-src lz-concat colls #f #f))
 
 ;; Lazily concatenate a (possibly infinite) SEQ of colls — what (apply concat ss)
 ;; means, but without realizing ss. Pulls one coll at a time, so mapcat /
