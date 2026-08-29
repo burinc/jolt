@@ -5,8 +5,10 @@
 # Runs `jolt build --target` end to end on one runner:
 #   ta6le (x86_64 Linux) host  ->  tarm64le (aarch64 Linux) target,
 # verified under qemu with a byte-identical-output diff against the native
-# build. A change that bakes host state into the Scheme emission (an absolute
-# path, a compile-time machine-type constant) fails this job.
+# build. It also cross-builds a managed-runtime shared library and calls its
+# export through a target-compiled dlopen driver. A change that bakes host state
+# into the Scheme emission (an absolute path, a compile-time machine-type
+# constant) fails this job.
 #
 # Manual-dispatch only: it is a guard for cross-compile work, not a per-push
 # gate. ~25 min cold, ~8 min with a warm Chez cache. (jolt-lang/jolt#375)
@@ -38,7 +40,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/chez
-          key: chez-cross-v10.4.1-ta6le-tarm64le-v1
+          key: chez-cross-v10.4.1-ta6le-tarm64le-pic-v2
 
       - name: Build Chez host + tarm64le boot files + cross kernel
         if: steps.cache-chez.outputs.cache-hit != 'true'
@@ -51,9 +53,11 @@ jobs:
           make bootquick XM=tarm64le
           # --disable-curses/--disable-x11: the aarch64 cross sysroot has no
           # ncurses or X11 headers (same reason the other workflows build x11off).
+          # PIC is harmless for the executable and required when libkernel.a
+          # and its static compression dependencies are folded into a .so.
           ./configure --cross --force -m=tarm64le \
             --toolprefix=aarch64-linux-gnu- --disable-curses --disable-x11 \
-            CC_FOR_BUILD=cc
+            CFLAGS="-fPIC -O2" CC_FOR_BUILD=cc
           make -j"$(nproc)"
 
       # bin/jolt wants a `chez` on PATH; the workarea scheme needs its boot
@@ -92,3 +96,18 @@ jobs:
           # the load-bearing assertion: cross output is byte-identical to native
           diff native.out cross.out
           echo "cross-smoke OK: tarm64le output byte-identical to ta6le"
+
+      - name: Cross build managed-runtime library + qemu verification
+        run: |
+          cd test/chez/build-lib
+          JOLT_TARGET_CC=aarch64-linux-gnu-gcc \
+            ../../../bin/jolt build --library -m libadd.core -o /tmp/libadd-arm64.so \
+              --target tarm64le --target-pack /tmp/pack-tarm64le
+          file /tmp/libadd-arm64.so | grep -q "ARM aarch64"
+
+          aarch64-linux-gnu-gcc -O2 driver.c -ldl -o /tmp/libadd-driver-arm64
+          file /tmp/libadd-driver-arm64 | grep -q "ARM aarch64"
+          got="$(qemu-aarch64-static -L /usr/aarch64-linux-gnu \
+            /tmp/libadd-driver-arm64 /tmp/libadd-arm64.so)"
+          test "$got" = "5"
+          echo "cross-library smoke OK: add(2,3)=5 through dlopen+jolt_lookup"

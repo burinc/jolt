@@ -1185,9 +1185,16 @@
                       out-path)))
   ;; The self-contained path (jolt-embedded-bytes "stub/launcher") needs no csv
   ;; kernel files, no Chez, no cc — only the legacy cc path does. A --library build
-  ;; ALWAYS takes the cc path (build-shared), and a cross build (--target) always
-  ;; takes build-with-cc, so both need the toolchain even from the self-contained jolt.
+  ;; always takes build-shared, and any cross build takes a spawned cc path, so both
+  ;; need the toolchain even from the self-contained jolt.
   (when (or library? (bld-cross?) (not (jolt-embedded-bytes "stub/launcher"))) (bld-check-toolchain))
+  ;; Static natives have to be loaded into this HOST process while the app is
+  ;; emitted, so a target-architecture archive cannot be supported merely by
+  ;; handing it to the target linker. Refuse before bld-preload-static-natives!
+  ;; tries to turn one into a host shared object.
+  (when (and (bld-cross?) (> (string-length (bld-native-link-flags natives)) 0))
+    (error 'jolt-build
+      "cross build (--target) does not support :jolt/native archives yet (they need separate host and target archives)"))
   (when (> (string-length (bld-native-link-flags natives)) 0)
     ;; :static natives are cc-linked into the binary, so a C compiler must be on
     ;; PATH — the self-contained jolt bundles the Chez kernel (libkernel.a +
@@ -1611,15 +1618,12 @@
         ;;    make-boot-file, then xxd the boot into a C array and cc-link against
         ;;    libkernel.a. Kept so `make buildsmoke` still exercises the cc path.
         (cond
-          ;; cross-compiling (--target) always takes the spawn/cc path: the
+          ;; Cross-compiling (--target) always takes a spawned cc path: the
           ;; self-contained in-process compile can't load a target xpatch, and the
           ;; xpatch retargets make-boot-file for the whole spawned process.
+          ((and (bld-cross?) library?)
+           (build-shared entry-ns out-path mode builddir flat-ss flat-so boot boot-h ""))
           ((bld-cross?)
-           (when library?
-             (error 'jolt-build "cross build (--target) does not support --library yet"))
-           (when (> (string-length (bld-native-link-flags natives)) 0)
-             (error 'jolt-build
-               "cross build (--target) does not support :jolt/native archives yet (they need per-target-arch archives)"))
            (build-with-cc entry-ns out-path mode builddir flat-ss flat-so boot boot-h main-c
                           "" (and drop-compiler? (not (bld-tgt-nt?)))))
           (library?
@@ -2021,6 +2025,9 @@
       (put-string p
         (string-append
           "(import (chezscheme))\n"
+          ;; As in build-with-cc, loading the xpatch retargets compile-file and
+          ;; make-boot-file for the lifetime of this fresh Chez process.
+          (if (bld-cross?) (string-append "(load " (ei-str-lit (bld-xpatch)) ")\n") "")
           (bld-chez-param-forms mode)
           "(compile-file " (ei-str-lit flat-ss) " " (ei-str-lit flat-so) ")\n"
           "(make-boot-file " (ei-str-lit boot) " '()\n  "
@@ -2039,10 +2046,10 @@
       (close-port p))
     (bld-clear-output! out-path)
     (bld-system (string-append
-      "cc -O2 -fPIC "
+      (bld-cc) " " (bld-arch-flag) " -O2 -fPIC "
       ;; -install_name @rpath/<base> so a binary that link-edits against the dylib
       ;; (rather than dlopen'ing it) can locate it via its rpath, not a build-dir path.
-      (if bld-osx?
+      (if (bld-tgt-osx?)
           (string-append "-dynamiclib -install_name '@rpath/" (bld-basename out-path) "' ")
           "-shared ")
       "-I'" (bld-csv-dir) "' '" lc "' '" (bld-csv-dir) "/libkernel.a' "
@@ -2065,9 +2072,10 @@
                     natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #f))
     jolt-nil))
 (def-var! "jolt.host" "build-library"
-  (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake?)
-    (build-binary (jolt-str-render-one entry)
-                  (jolt-str-render-one out)
-                  (jolt-str-render-one mode)
-                  natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #t)
+  (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
+    (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1)))
+      (build-binary (jolt-str-render-one entry)
+                    (jolt-str-render-one out)
+                    (jolt-str-render-one mode)
+                    natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?) #t))
     jolt-nil))

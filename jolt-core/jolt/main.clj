@@ -609,14 +609,12 @@
             ;; DIR or $JOLT_TARGET_PACK) — see tools/cross-compile/README.md.
             target (:target opts)
             target-pack (or (:target-pack opts) (System/getenv "JOLT_TARGET_PACK"))]
-        (when (and target library?)
-          (throw (ex-info "cross build (--target) does not support --library yet" {})))
         (when (and target (nil? target-pack))
           (throw (ex-info "--target needs a target pack: --target-pack DIR (or $JOLT_TARGET_PACK)" {:target target})))
         ;; embed-dirs (absolute) are walked + baked into the binary by the driver;
         ;; project-paths (relative) become runtime io/resource roots (ship-alongside).
         (if library?
-          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake?)
+          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack)
           (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack))))))
 
 (defn- nrepl [more]
