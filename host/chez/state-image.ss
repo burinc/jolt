@@ -34,8 +34,8 @@
 ;;
 ;; This build still READS versions 2 and 3: everything they can contain
 ;; (including raw jolt-ref-v1 records) restores here via the legacy arms.
-(define jolt-image-format-version 5)
-(define jolt-image-read-versions '(2 3 4 5))
+(define jolt-image-format-version 6)
+(define jolt-image-read-versions '(2 3 4 5 6))
 
 ;; --- classification -----------------------------------------------------------
 ;; An eq hashtable is the ONE hashtable kind Chez can fasl; eqv/equal/string-hash
@@ -345,6 +345,23 @@
 (define-record-type image-ref
   (fields (mutable val))
   (nongenerative image-ref-v1))
+
+;; A mutex or condition variable, standing in for one in the written graph. Chez
+;; fasls a mutex without complaint and the copy is NOT a live primitive -- but an
+;; uncontended acquire on the copy SUCCEEDS, so nothing goes wrong until
+;; something actually waits, and then it is "mutex-acquire: failed: Invalid
+;; argument" from whichever thread reached it first, with no path and no name.
+;;
+;; kind is 'mutex or 'condition; restore mints a fresh live one. Substituting at
+;; the WALK rather than through a walker arm per bearing type makes it total:
+;; jolt-promise, jolt-future, jolt-agent, the per-node lock on a lazy cell and on
+;; a seq, async channels, the tap queue and the fibers queues all carry one, and
+;; a record added later carries it correctly without anyone reading this file.
+;; jolt-atom and jolt-ref rebuild through their own constructors and so were
+;; always right; they are the shape this generalizes (jolt-ojoh).
+(define-record-type image-sync
+  (fields kind)
+  (nongenerative image-sync-v1))
 
 ;; A raw jolt-ref record in a format-2 image (v0.6.5/v0.6.6). The live runtime
 ;; type is jolt-ref-v2, so the fasl's nongenerative jolt-ref-v1 rtd (fields:
@@ -740,6 +757,8 @@
                      ;; a ref descriptor re-mints a live ref; a raw jolt-ref-v1
                      ;; record from a format-2 image re-mints through the
                      ;; legacy arm (same construction, val read via its own rtd)
+                     ((and (eq? mode 'restore) (image-sync? x))
+                      (if (eq? (image-sync-kind x) 'condition) (make-condition) (make-mutex)))
                      ((and (eq? mode 'restore) (image-ref? x))
                       (walk-ref-restore (image-ref-val x) x path))
                      ((and (eq? mode 'restore) (image-legacy-ref? x))
@@ -843,6 +862,97 @@
                              ((vector? x) (walk-vector x path))
                              ((and (hashtable? x) (hashtable-mutable? x))
                               (walk-hashtable x path))
+                             ;; A mutex or condition variable is per-process
+                             ;; kernel state. fasl copies one happily and the
+                             ;; copy is NOT a live primitive -- but an
+                             ;; uncontended acquire on it succeeds, so nothing
+                             ;; goes wrong until something actually waits, and
+                             ;; then it is "mutex-acquire: failed: Invalid
+                             ;; argument" from whichever thread got there first.
+                             ;;
+                             ;; Handled here rather than by a walker arm per
+                             ;; bearing type, so it is TOTAL: jolt-promise,
+                             ;; jolt-future, jolt-agent, the per-node locks on a
+                             ;; lazy cell and a seq, async channels, the tap
+                             ;; queue and the fibers queues all carry one, and a
+                             ;; record added later carries it correctly without
+                             ;; anyone remembering this file. jolt-atom and
+                             ;; jolt-ref predate it and rebuild through their own
+                             ;; constructors, which is why they were already
+                             ;; right. A FRESH primitive, not #f: a lock field
+                             ;; that is created on demand tolerates one either
+                             ;; way, and a promise's mu is dereferenced
+                             ;; unconditionally (jolt-ojoh).
+                             ;; Execution does not travel, and these two are the
+                             ;; cases where a record's own state says so.
+                             ;;
+                             ;; A future that has not completed is waiting on a
+                             ;; thread the image cannot carry: restored, nothing
+                             ;; will ever finish it, so `deref` hangs forever.
+                             ;; Refuse it, the way any other unwritable object is
+                             ;; refused -- naming it, and stubbing under stub
+                             ;; mode. A completed one is just its value and
+                             ;; travels.
+                             ((and (jolt-future? x) (not (jolt-future-done? x)))
+                              (cond
+                                ((eq? mode 'rebuild-stub)
+                                 (let ((st (make-stub x path "a future that has not completed")))
+                                   (hashtable-set! memo x st) st))
+                                ((image-rebuild-mode? mode)
+                                 (jolt-throw
+                                   (jolt-ex-info
+                                     (string-append
+                                       "image: cannot write a running future at "
+                                       (image-path->string path)
+                                       ": it is waiting on a thread, and a state image"
+                                       " carries state, not execution. Deref it first,"
+                                       " or store what it computes.")
+                                     empty-pmap)))
+                                (else (hashtable-set! memo x #t)
+                                      (report! x path (image-report-disposition mode)))))
+                             ;; An agent's QUEUE is pending execution too. Its
+                             ;; state travels; the actions behind it do not, and
+                             ;; carrying `running?` across would leave the
+                             ;; restored agent believing a worker it does not
+                             ;; have is mid-action, so every later send would
+                             ;; queue behind nothing and never run -- silently
+                             ;; wedged, which is worse than dropping them.
+                             ((jolt-agent? x)
+                              (if (image-rebuild-mode? mode)
+                                  ;; mu/cv go through the walk like any other
+                                  ;; field, so the marker/mint rule below covers
+                                  ;; this arm in both directions rather than
+                                  ;; being restated here (they are immutable
+                                  ;; fields, hence walked before construction).
+                                  (let ((nx (make-jolt-agent jolt-nil jolt-nil jolt-nil
+                                                             (vector '() '()) #f
+                                                             (walk (jolt-agent-mu x) (cons "@mu" path))
+                                                             (walk (jolt-agent-cv x) (cons "@cv" path))
+                                                             (jolt-agent-err-mode x) jolt-nil)))
+                                    (hashtable-set! memo x nx)
+                                    (image-meta-copy! x nx)
+                                    (jolt-agent-state-set! nx (walk (jolt-agent-state x) (cons "@" path)))
+                                    (jolt-agent-err-set! nx (walk (jolt-agent-err x) (cons "@err" path)))
+                                    (jolt-agent-validator-set! nx
+                                      (walk (jolt-agent-validator x) (cons "@validator" path)))
+                                    (jolt-agent-err-handler-set! nx
+                                      (walk (jolt-agent-err-handler x) (cons "@error-handler" path)))
+                                    nx)
+                                  (begin
+                                    (hashtable-set! memo x #t)
+                                    (walk (jolt-agent-state x) (cons "@" path))
+                                    (walk (jolt-agent-err x) (cons "@err" path))
+                                    (walk (jolt-agent-validator x) (cons "@validator" path))
+                                    (walk (jolt-agent-err-handler x) (cons "@error-handler" path))
+                                    #t)))
+                             ((mutex? x)
+                              (cond ((eq? mode 'restore) (make-mutex))
+                                    ((image-rebuild-mode? mode) (make-image-sync 'mutex))
+                                    (else #t)))
+                             ((thread-condition? x)
+                              (cond ((eq? mode 'restore) (make-condition))
+                                    ((image-rebuild-mode? mode) (make-image-sync 'condition))
+                                    (else #t)))
                              ((and (record? x) (record-rtd x))
                               (walk-record x path))
                              (else (if (image-rebuild-mode? mode) x #t)))))))))))
@@ -1368,7 +1478,7 @@
   (unless (member (vector-ref h 1) jolt-image-read-versions)
     (jolt-throw (jolt-ex-info
                   (string-append "image: " path " has format version "
-                                 (jolt-str-one (vector-ref h 1)) ", this build reads versions 2 to 5")
+                                 (jolt-str-one (vector-ref h 1)) ", this build reads versions 2 to 6")
                   empty-pmap)))
   ;; The fasl version moves with Chez, and a mismatch otherwise surfaces as an
   ;; opaque fasl-read error, so name it here instead.
