@@ -701,18 +701,33 @@
 ;; (records.ss) populated as deftype/defprotocol forms load.
 (define (hc-record-shapes ctx) (chez-record-shapes-map))
 (define (hc-protocol-methods ctx) (chez-protocol-methods-map))
-;; Optimization gate. On for --opt / :opt builds; off for release and dev.
-;; Inference + inline + scalar-replace passes are gated on this.
+;; Do the optimizing passes run at all? On for every build that is not --dev,
+;; and for nothing else: the runtime compile spine (REPL, load-string, runtime
+;; require) leaves it off, because a form compiled there must stay redefinable.
+;;
+;; ONE flag. There were two -- hc-optimize? for --opt and hc-release? for
+;; release -- and (or …) of them was the only thing either was ever read for, so
+;; they were the same question asked twice. That duplication is what let the
+;; inline gate below read "--opt" when it meant "closed world".
 (define hc-optimize? #f)
 (define (set-optimize! on) (set! hc-optimize? on))
-;; Inference gate. On for release builds too (inference without inline/scalar).
-(define hc-release? #f)
-(define (set-release! on) (set! hc-release? on))
-(define (hc-inference-enabled? ctx) (or hc-optimize? hc-release?))
-;; Inline additionally requires direct-link (closed-world guarantee).
+(define (hc-inference-enabled? ctx) hc-optimize?)
+;; Inline requires direct-link, and that is the WHOLE condition: splicing a defn
+;; body at a call site is sound exactly when the callee's var cannot be redefined
+;; out from under the copy, which is the closed world direct-linking commits to.
+;; A ^:dynamic/^:redef def, --no-direct-link and --dev all stay var-routed, so
+;; none of them splice.
+;;
+;; It used to also require hc-optimize? -- i.e. --opt -- which made the DEFAULT
+;; release build emit a real call everywhere the optimized build emitted a spliced
+;; body, and Chez cannot make that up: it does not inline across top-level forms
+;; in a compiled file. That was a policy dial on a pass whose precondition is a
+;; correctness property, so it is gone rather than defaulted differently. There is
+;; no configuration in which the un-spliced code is preferable to the spliced code
+;; at the same linkage, so there is no reason to keep a second path to test.
 (define hc-direct-link? #f)
 (define (set-direct-link-flag! on) (set! hc-direct-link? on))
-(define (hc-inline-enabled? ctx) (and hc-optimize? hc-direct-link?))
+(define (hc-inline-enabled? ctx) hc-direct-link?)
 ;; Inline-body registry: jolt.passes stashes an inline-eligible defn's
 ;; {:params :body :nhints :ret} here (keyed ns/name) as its form is optimized;
 ;; jolt.passes.inline fetches it to splice the body at a call site. The stash is an

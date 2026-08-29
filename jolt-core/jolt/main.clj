@@ -505,8 +505,11 @@
  ;; build [-m NS | FILE] [-o OUT] [--opt | --dev] [--no-direct-link] — AOT-compile
  ;; the app into a standalone executable. Resolves deps + roots like `run`, then hands
  ;; the entry namespace to the host build driver (jolt.host/build-binary, defined by
- ;; build.ss). Default mode is release; --opt selects optimized (release + the riskier
- ;; inline/scalar-replace passes), --dev unoptimized.
+ ;; build.ss). Default mode is release; --dev unoptimized. --opt now selects only
+ ;; the Chez compile parameters (inspector + procedure-source information off, so
+ ;; a smaller and faster binary that cannot render a Clojure backtrace) — it no
+ ;; longer changes what the compiler emits, because inline/scalar-replace follow
+ ;; direct-linking rather than a separate opt-in.
  ;; Release and optimized default to closed-world direct-linking + whole-program
  ;; inference (the throughput lever the perf audit identified). The tradeoff is runtime
  ;; redefinition: a plain def is frozen in the built binary (its eval/load-string and

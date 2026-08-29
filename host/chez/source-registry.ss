@@ -29,11 +29,21 @@
 ;; to prevent (400 contended pairs missed it 3 times). Reads stay unlocked: this is
 ;; a strong hashtable and every read of it is single-key.
 (define source-registry-mu (make-mutex))
+;; The same records, keyed "ns/name" instead of by emitted procedure name. A
+;; spliced call site names its callee by fqn (the trace marker carries it) and has
+;; no procedure of its own to look up, so this is the index that answers it. Fed
+;; from the same registration, under the same lock; unlike the procname table it
+;; cannot go 'ambiguous, because a fqn identifies exactly one var.
+(define source-registry-by-fqn (make-hashtable string-hash string=?))
+(define (srcreg-record-for-fqn fqn)
+  (and (string? fqn) (hashtable-ref source-registry-by-fqn fqn #f)))
 (define (jolt-register-source! procname ns nm file line)
   (jolt-with-mutex source-registry-mu
-    (let ((existing (hashtable-ref source-registry procname #f)))
+    (let ((rec (vector ns nm file line))
+          (existing (hashtable-ref source-registry procname #f)))
+      (hashtable-set! source-registry-by-fqn (string-append ns "/" nm) rec)
       (cond
-        ((not existing) (hashtable-set! source-registry procname (vector ns nm file line)))
+        ((not existing) (hashtable-set! source-registry procname rec))
         ((and (vector? existing)
               (or (not (equal? (vector-ref existing 0) ns))
                   (not (equal? (vector-ref existing 1) nm))))
@@ -147,15 +157,44 @@
 ;; eval registry (jolt-eval-source-line). #f when the frame carries no source or
 ;; no marker precedes its offset — the renderer then falls back to the defn line.
 ;; Exception-proof: the reporter runs while an error is being reported.
-(define (srcreg-frame-line-from-source-pair io)
+(define (srcreg-frame-entry-from-source-pair io)
   (guard (e (#t #f))
     (let ((pair (srcreg-frame-source-pair io)))
       (and pair
            (let ((name (car pair)) (offset (cdr pair)))
              (if (jolt-eval-source-name? name)
-                 (jolt-eval-source-line name offset)
-                 (jolt-marker-line-in-file name offset)))))))
+                 (jolt-eval-source-entry name offset)
+                 (jolt-marker-entry-in-file name offset)))))))
+(define (srcreg-frame-line-from-source-pair io)
+  (jolt-marker-entry-line (srcreg-frame-entry-from-source-pair io)))
 
+
+;; The logical frames a marker/site entry stands for, innermost first, as
+;; srcreg-frame records. `nm`/`own` are the PHYSICAL fn (its procname and record);
+;; the entry's chain names the fns whose code was spliced into it.
+;;
+;; Reading the chain: the entry's own line locates the first fn in it, entry i's
+;; call-line locates entry i+1, and the last call-line locates the physical fn.
+;; So a chain of N produces N+1 frames, which is exactly what the same code reads
+;; as without inlining. An entry naming a fn nothing registered stops the walk and
+;; the physical frame stands alone — incomplete, never invented.
+(define (srcreg-entry-frames nm own e)
+  (let ((ok (lambda (l) (and (fixnum? l) (fx>? l 0) l))))
+    (let loop ((ch (jolt-marker-entry-chain e))
+               (line (jolt-marker-entry-line e))
+               (acc '()))
+      (cond
+        ((null? ch) (reverse (cons (srcreg-frame nm own (ok line)) acc)))
+        (else
+         (let* ((ent (car ch))
+                (rec (srcreg-record-for-fqn (car ent))))
+           (if (not rec)
+               (reverse (cons (srcreg-frame nm own (ok line)) acc))
+               (loop (cdr ch) (cdr ent)
+                     (cons (srcreg-frame (string-append (vector-ref rec 0) "/"
+                                                        (vector-ref rec 1))
+                                         rec (ok line))
+                           acc)))))))))
 ;; Walk a continuation, returning its frames (innermost first) as (frame-name .
 ;; record) pairs. record is a source vector #(ns name file line) for a frame that
 ;; maps to registered Clojure source, the symbol 'ambiguous for a short name shared
@@ -179,16 +218,25 @@
                  (src (and nm (hashtable-ref source-registry nm #f)))
                  ;; keep a frame that maps, or any named frame that isn't plumbing
                  (keep? (and nm (or src (not (srcreg-plumbing-name? nm)))))
-                 ;; the line reached inside this frame (only a mapped frame prints
-                 ;; one, so only it pays the marker lookup)
-                 (line (and src (srcreg-frame-line-from-source-pair io))))
+                 ;; the marker entry at the offset this frame is stopped at (only
+                 ;; a mapped frame prints a line, so only it pays the lookup)
+                 (entry (and src (srcreg-frame-entry-from-source-pair io)))
+                 (line (jolt-marker-entry-line entry)))
             (when (and debug? nm)
               (display (string-append "  [frame] " nm (if src " *MAPPED*"
                                                           (if keep? "" " (skipped)"))
                                       (srcreg-frame-source-debug io) "\n")
                        (current-error-port)))
             (loop (cdr ios)
-                  (if keep? (cons (srcreg-frame nm src line) acc) acc))))))))
+                  (if (not keep?)
+                      acc
+                      ;; One PHYSICAL frame can stand for several logical ones
+                      ;; when code was spliced into it. srcreg-entry-frames hands
+                      ;; them back innermost first, and acc is reversed on return,
+                      ;; so each is consed IN ORDER — a left fold, not a recursive
+                      ;; cons, which would put them on backwards.
+                      (let add ((fs (srcreg-entry-frames nm src entry)) (a acc))
+                        (if (null? fs) a (add (cdr fs) (cons (car fs) a))))))))))))
 
 ;; --- clj-line lookup for generated .scm offsets ---------------------------------
 ;;
@@ -227,7 +275,14 @@
   (define (alpha? c) (or (char<=? #\a c #\z) (char<=? #\A c #\Z)))
   (define (hex-digit? c)
     (or (digit? c) (char<=? #\a c #\f) (char<=? #\A c #\F)))
-  ;; Is text[i..] exactly "#|L<digits>|#"?  (line . end) or #f.
+  ;; Is text[i..] a marker?  Two shapes:
+  ;;   #|L<digits>|#                     -> entry is the line, a fixnum
+  ;;   #|L<digits>@<fqn>@<digits>|#      -> entry is #(line fqn callsite-line)
+  ;; The second is emitted for a site the inline pass copied out of another fn
+  ;; (backend_scheme with-site); fqn is that fn's ns/name and the trailing number
+  ;; is the line of the call in the fn it was copied into. The emitter refuses to
+  ;; write the long form when the fqn holds a |, # or @, so the fqn field here can
+  ;; be read up to the next @ without escaping. Returns (entry . end) or #f.
   (define (marker-at? i)
     (and (<= (+ i 3) n)
          (char=? (string-ref text i) #\#)
@@ -244,6 +299,36 @@
                    (char=? (string-ref text j) #\|)
                    (char=? (string-ref text (+ j 1)) #\#))
               (cons acc (+ j 2)))
+             ;; the inline form: one or more @<fqn>@<digits> groups, then |#
+             ((and digits? (< j n) (char=? (string-ref text j) #\@))
+              (let group ((p j) (chain '()))
+                ;; at p: either "|#" (done) or "@<fqn>@<digits>"
+                (cond
+                  ((and (< (+ p 1) n)
+                        (char=? (string-ref text p) #\|)
+                        (char=? (string-ref text (+ p 1)) #\#))
+                   (and (pair? chain) (cons (vector acc (reverse chain)) (+ p 2))))
+                  ((and (< p n) (char=? (string-ref text p) #\@))
+                   (let fqn ((k (+ p 1)))
+                     (cond
+                       ((>= k n) #f)
+                       ((char=? (string-ref text k) #\@)
+                        (let at ((m (+ k 1)) (a 0) (d? #f))
+                          (cond
+                            ((and (< m n) (digit? (string-ref text m)))
+                             (at (+ m 1) (+ (* a 10)
+                                            (- (char->integer (string-ref text m))
+                                               (char->integer #\0)))
+                                 #t))
+                            ((not d?) #f)
+                            (else (group m (cons (cons (substring text (+ p 1) k) a)
+                                                 chain))))))
+                       ;; a | or # inside the fqn field means this is not a marker
+                       ;; the emitter wrote; refuse rather than guess
+                       ((or (char=? (string-ref text k) #\|)
+                            (char=? (string-ref text k) #\#)) #f)
+                       (else (fqn (+ k 1))))))
+                  (else #f))))
              (else #f)))))
   (let scan ((i 0) (out '()))
     (cond
@@ -323,8 +408,27 @@
              (loop (+ mid 1) hi (cdr (vector-ref table mid)))
              (loop lo (- mid 1) best)))))))
 
-(define (jolt-marker-line-at-offset text offset)
+;; A table entry is either the clj line (a fixnum), or #(line chain) for a site
+;; the inline pass copied out of another fn — chain being ((fqn . call-line) ...)
+;; innermost first, the logical frames between the site and the physical fn it
+;; ended up inside. Everything that only wants the line goes through
+;; jolt-marker-entry-line, so the extended form is transparent to it.
+(define (jolt-marker-entry-line e) (if (vector? e) (vector-ref e 0) e))
+(define (jolt-marker-entry-chain e) (if (vector? e) (vector-ref e 1) '()))
+
+(define (jolt-marker-entry-at-offset text offset)
   (let ((tbl (hashtable-ref jolt-marker-cache-text text #f)))
+    (if tbl
+        (jolt-marker-line-from-table tbl offset)
+        (let ((tbl (jolt-marker-table text)))
+          (when (fx>=? (hashtable-size jolt-marker-cache-text) 16)
+            (hashtable-clear! jolt-marker-cache-text))
+          (hashtable-set! jolt-marker-cache-text text tbl)
+          (jolt-marker-line-from-table tbl offset)))))
+
+(define (jolt-marker-line-at-offset text offset)
+  (jolt-marker-entry-line
+   (let ((tbl (hashtable-ref jolt-marker-cache-text text #f)))
     (if tbl
         (jolt-marker-line-from-table tbl offset)
         (let ((tbl (jolt-marker-table text)))
@@ -334,7 +438,7 @@
           (when (fx>=? (hashtable-size jolt-marker-cache-text) 16)
             (hashtable-clear! jolt-marker-cache-text))
           (hashtable-set! jolt-marker-cache-text text tbl)
-          (jolt-marker-line-from-table tbl offset)))))
+          (jolt-marker-line-from-table tbl offset))))))
 
 ;; --- eval-path source registry -------------------------------------------------
 ;; On the eval path (an AOT cache MISS) the emitted Scheme is a transient string:
@@ -391,9 +495,11 @@
     name))
 ;; Resolve an eval-path frame's (name . offset) to a clj line, or #f when the
 ;; name was evicted / never registered or no marker precedes the offset.
-(define (jolt-eval-source-line name offset)
+(define (jolt-eval-source-entry name offset)
   (let ((tbl (hashtable-ref jolt-eval-marker-registry name #f)))
     (and tbl (jolt-marker-line-from-table tbl offset))))
+(define (jolt-eval-source-line name offset)
+  (jolt-marker-entry-line (jolt-eval-source-entry name offset)))
 ;; Is this source name a registry key rather than a real file? The distinguisher
 ;; between "consult the eval registry" and "read a .scm off disk": every name
 ;; this registry mints is "jolt-eval-src-" followed by decimal digits, and no
@@ -412,7 +518,7 @@
 ;; same .scm serves every frame of a backtrace, so read+scan it once. Whole-
 ;; second mtime granularity means a file regenerated within the same second can
 ;; serve a stale table — acceptable on a debug path, never a correctness claim.
-(define (jolt-marker-line-in-file path offset)
+(define (jolt-marker-entry-in-file path offset)
   (define (read-table)
     (call-with-input-file path
       (lambda (p) (jolt-marker-table (get-string-all p)))))
@@ -422,6 +528,8 @@
       (set! entry (cons mtime (read-table)))
       (hashtable-set! jolt-marker-cache-file path entry))
     (jolt-marker-line-from-table (cdr entry) offset)))
+(define (jolt-marker-line-in-file path offset)
+  (jolt-marker-entry-line (jolt-marker-entry-in-file path offset)))
 
 ;; Render a list of (frame-name . record) pairs (innermost/deepest first) to a
 ;; backtrace string. record is a source vector #(ns name file line) -> "ns/name
@@ -483,11 +591,31 @@
 
 (define jolt-chain-cap 16)
 
-;; render one (fn . line) entry
-(define (jolt-site-frame site)
-  (let ((nm (car site)) (line (cdr site)))
-    (srcreg-frame nm (hashtable-ref source-registry nm #f)
-                  (and (fixnum? line) (fx>? line 0) line))))
+;; Render one (fn . line) entry as a LIST of frames — usually one.
+;;
+;; The cdr is the same shape a marker-table entry has: a line, or
+;; #(line callee-fqn call-site-line) when the emitter marked the site as code the
+;; inline pass copied out of another fn (backend_scheme sited-tail-call). A
+;; spliced callee has no procedure of its own, so a tail site inside one would
+;; otherwise be attributed to the fn it was spliced INTO and located at a line
+;; that fn does not contain. Two frames then: the callee at the line reached in
+;; it, then this fn at the call. Deepest first, matching the order the callers
+;; splice these in.
+(define (jolt-site-frame* site)
+  (srcreg-entry-frames (car site)
+                       (hashtable-ref source-registry (car site) #f)
+                       (cdr site)))
+;; the single-frame spelling, where only one is wanted
+(define (jolt-site-frame site) (car (jolt-site-frame* site)))
+;; (append-map jolt-site-frame* sites). Written out rather than pulled from
+;; SRFI-1: (chezscheme) has no append-map, and every list here is capped
+;; (jolt-chain-cap / the 30-frame render limit) so the naive shape is fine.
+(define (srcreg-site-frames sites)
+  (let loop ((ss sites) (acc '()))
+    (if (null? ss)
+        (reverse acc)
+        (loop (cdr ss) (let add ((fs (jolt-site-frame* (car ss))) (a acc))
+                         (if (null? fs) a (add (cdr fs) (cons (car fs) a))))))))
 
 ;; Backward walk from the throw-time pair: (values entries connected?), entries
 ;; innermost first starting with the pair itself.
@@ -574,7 +702,7 @@
                               '()))
                    (gap (if (and (pair? paths) (null? (cdr paths))) (car paths) '())))
               (loop outer (cdr rest)
-                    (cons outer (append (reverse (map jolt-site-frame gap)) acc))))))))
+                    (cons outer (append (srcreg-site-frames (reverse gap)) acc))))))))
 
 ;; The no-continuation / REPL fallback: the pair plus its backward walk is all
 ;; there is (a REPL's own continuation is just its machinery). #f when tracing
@@ -585,7 +713,7 @@
          (let ((none (make-hashtable string-hash string=?)))
            (call-with-values (lambda () (jolt-backwalk site none))
              (lambda (path connected?)
-               (let ((recs (map jolt-site-frame path)))
+               (let ((recs (srcreg-site-frames path)))
                  (and (pair? recs) (jolt-render-recs recs)))))))))
 
 ;; Multi-line backtrace for an uncaught value: the live continuation is the
@@ -609,7 +737,7 @@
                          (call-with-values (lambda () (jolt-backwalk site cont-names))
                            (lambda (path connected?)
                              (if (jolt-site-valid? site path connected? cont cont-names)
-                                 (append (map jolt-site-frame path) body)
+                                 (append (srcreg-site-frames path) body)
                                  body)))
                          body)))
           (and (pair? recs) (jolt-render-recs recs))))))

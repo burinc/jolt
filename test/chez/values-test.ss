@@ -192,7 +192,7 @@
 (ok "hash arm rejects fixnum"  (raises? (lambda () (register-hash-arm! fixnum? (lambda (x) 0)))))
 (ok "hash arm rejects string"  (raises? (lambda () (register-hash-arm! string? (lambda (x) 0)))))
 (ok "hash arm rejects keyword" (raises? (lambda () (register-hash-arm! keyword-t? (lambda (x) 0)))))
-(ok "hash arm rejects nil"     (raises? (lambda () (register-hash-arm! jolt-nil? (lambda (x) 0)))))
+(ok "hash arm rejects nil"     (raises? (lambda () (register-hash-arm! jolt-nil?-fn (lambda (x) 0)))))
 
 ;; an arm claiming BOTH sides of a fast pair is what jolt=2 would skip
 (ok "eq arm rejects fixnum pair"

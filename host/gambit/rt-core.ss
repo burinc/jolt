@@ -121,7 +121,14 @@
         ((number? x) (exact->inexact x))
         (else (jolt-num-cast-throw x))))
 ;; jolt `not`: only nil and false are falsey.
-(define (jolt-not x) (if (jolt-truthy? x) #f #t))
+;; Mirrors rt.ss's spliced jolt-not (see values.ss jolt-nil? for why these are
+;; macros); rt-core.ss is the Gambit port of rt.ss's kernel, so the shape has to
+;; match or the Gambit host keeps paying the call.
+(define (jolt-not-fn x) (if (jolt-truthy? x) #f #t))
+(define-syntax jolt-not
+  (syntax-rules ()
+    ((_ e) (if (jolt-truthy? e) #f #t))
+    ((_ e ...) (jolt-not-fn e ...))))
 
 ;; --- ex-info record type -----------------------------------------------------
 ;; A throwable (ex-info or host-constructed typed throwable) is a distinct
