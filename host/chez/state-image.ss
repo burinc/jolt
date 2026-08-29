@@ -124,25 +124,19 @@
 ;; by the back end's fnsrc registration); an unregistered one has nothing to
 ;; rebuild from.
 ;;
-;; Since inlining follows linkage (0.7.29), a fn LITERAL returned by a fn the
-;; compiler spliced is a new way to land here: the copy's binders are
-;; alpha-renamed and its captures include the caller's own locals, so it matches
-;; no recorded source form, and the inline pass drops the registration rather than
-;; let a restore rebuild from stale names — a name the inspector cannot report
-;; binds jolt-nil, which would surface as a WRONG VALUE long after the restore
-;; instead of a refusal here (jolt-giqc).
-;;
-;; The ^:redef advice is verified, not a guess: it opts the enclosing fn out of the
-;; closed world, so it is never spliced and its literal keeps its registration.
+;; A fn literal the compiler SPLICED is registered like any other (the copy
+;; carries its own capture list — see image-recover-free-values), so inlining is
+;; no longer a way to land here. What is: a fn the language itself built rather
+;; than analyzed from a literal, one whose namespace is not registered at all
+;; (the core tier), and one whose source form holds a value the back end could
+;; not render, which drops the registration at emit.
 ;; Empty for a non-procedure, whose refusal has nothing to do with any of this.
 (define (image-unregistered-fn-hint x)
   (if (procedure? x)
       (string-append
         ": this fn has no recorded source, so there is nothing to rebuild it from."
-        " A fn literal returned by a fn the compiler inlined is one way to get here"
-        " - the spliced copy is not the registered original. Store a top-level fn"
-        " (or the data to rebuild one), or mark the enclosing fn ^:redef so it is"
-        " not spliced.")
+        " Anonymous fns written in your own namespaces travel; ones the runtime"
+        " built for you do not. Store a top-level fn, or the data to rebuild one.")
       ""))
 
 (define (image-describe-obj x)
@@ -525,7 +519,7 @@
 ;; failure returns 'image-no (the caller refuses) — never a crash, never a
 ;; silent partial; the free-value walk itself is unguarded so a refusal on a
 ;; nested free value keeps its own, more specific path.
-(define (image-recover-free-values x frees walk path)
+(define (image-recover-free-values x frees lives walk path)
   (call/cc
     (lambda (refuse)
       (define (refuse-on-fail thunk)
@@ -536,13 +530,20 @@
                            (for-each (lambda (p) (hashtable-set! h (car p) (cdr p)))
                                      (cdr info))
                            h))))
-        (let loop ((s (jolt-seq frees)) (acc '()))
-          (if (jolt-nil? s)
+        ;; frees and lives run in lockstep: frees names the wrapper parameter (and
+        ;; the error message), lives says where this one's value comes from — a
+        ;; variable in the live closure, or, for a spliced copy whose constant
+        ;; argument left no capture, a one-element vector holding the value.
+        (let loop ((fs (jolt-seq frees)) (ls (jolt-seq lives)) (acc '()))
+          (if (jolt-nil? fs)
               (list->vector (reverse acc))
-              (let* ((orig (jolt-first s))
-                     (val (hashtable-ref tbl
-                                         (refuse-on-fail (lambda () (image-munge orig)))
-                                         'image-missing)))
+              (let* ((orig (jolt-first fs))
+                     (live (if (jolt-nil? ls) orig (jolt-first ls)))
+                     (val (if (string? live)
+                              (hashtable-ref tbl
+                                             (refuse-on-fail (lambda () (image-munge live)))
+                                             'image-missing)
+                              (refuse-on-fail (lambda () (jolt-nth live 0))))))
                 ;; A name the source references but the compiled closure does not
                 ;; carry: const-folding baked its value into the code (a let-bound
                 ;; constant, a provably-dead branch), so the value is UNRECOVERABLE
@@ -551,7 +552,7 @@
                 ;; naming the capture, so the failure is at dump time and actionable.
                 (if (eq? val 'image-missing)
                     (refuse (cons 'image-folded orig))
-                    (loop (jolt-next s)
+                    (loop (jolt-next fs) (if (jolt-nil? ls) ls (jolt-next ls))
                           (cons (walk val (cons (string-append "free:" orig) path))
                                 acc))))))))))
 
@@ -563,7 +564,8 @@
                              (vector-ref (cdr reg) 1) (vector-ref (cdr reg) 2)
                              (vector))))
     (hashtable-set! memo x r)
-    (let ((fvs (image-recover-free-values x (vector-ref (cdr reg) 2) walk path)))
+    (let ((fvs (image-recover-free-values x (vector-ref (cdr reg) 2) (vector-ref (cdr reg) 3)
+                                          walk path)))
       (cond
         ((vector? fvs)
          (image-fnsrc-free-values-set! r fvs)
@@ -803,7 +805,7 @@
                                (image-fnsrc-build x v walk memo path
                                                   (if (eq? mode 'rebuild-stub) make-stub #f))
                                (let ((probe (image-recover-free-values
-                                              x (vector-ref (cdr v) 2)
+                                              x (vector-ref (cdr v) 2) (vector-ref (cdr v) 3)
                                               (lambda (fv p) #t) path)))
                                  (hashtable-set! memo x #t)
                                  (if (vector? probe)
