@@ -670,7 +670,7 @@
 ;; not use; nothing reads the cells that is not also emitted by the same pass. A
 ;; quoted {:op :recur} still answers true, through the :quote node rather than
 ;; through :src-form — pre-existing, equally harmless, and left alone.
-(def ^:private node-payload-keys #{:src-form :free-names})
+(def ^:private node-payload-keys #{:src-form :free-names :live-names})
 
 (defn- node-tree-any?
   "Does any node in this tree satisfy pred? Walks map values and sequential
@@ -1673,12 +1673,19 @@
                 (reduce
                  (fn [acc row]
                    (let [nm (nth row 0) form (nth row 1) ns (nth row 2) frees (nth row 3)
+                         ;; the optional 5th argument, emitted only when the copy's
+                         ;; captures differ from the source names — so every
+                         ;; un-spliced registration stays byte-identical.
+                         lives (nth row 4)
+                         lives (when (and lives (not= lives frees)) lives)
                          q (try
                              (binding [*quote-shared* (:shared acc)]
                                (let [f (emit-quoted form)]
                                  [f (str "(image-register-fn-form! " (chez-str-lit nm) " "
                                          f " " (chez-str-lit ns) " "
-                                         (emit-quoted frees) ")")]))
+                                         (emit-quoted frees)
+                                         (if lives (str " " (emit-quoted lives)) "")
+                                         ")")]))
                              (catch Exception _ nil))]
                      (if (nil? q)
                        acc
@@ -1716,8 +1723,16 @@
         ;; the unique name is allocated BEFORE the arity bodies emit, so an
         ;; enclosing literal numbers ahead of the literals nested inside it
         ;; (document order — jfn$ns$def$0 is the outermost)
+        ;; The namespace the literal's SOURCE was written in: this one, or the
+        ;; callee's when the inline pass copied it here. Both are checked against
+        ;; the system split, so a core literal spliced into user code stays
+        ;; unregistered exactly as it is when core runs un-spliced — the language
+        ;; owns those namespaces, and a copy of one is still one of theirs.
+        fnsrc-src-ns (or (:src-ns node) *fnsrc-ns*)
         fnsrc-nm (when (and (nil? (:name node)) (not def-init?)
-                            (not (fnsrc-system-ns? *fnsrc-ns*)) (:src-form node))
+                            (not (fnsrc-system-ns? *fnsrc-ns*))
+                            (not (fnsrc-system-ns? fnsrc-src-ns))
+                            (:src-form node))
                    (fnsrc-name))
         clauses (binding [*known-procs* (if self (conj *known-procs* self) *known-procs*)
                           *trace-site* (or qname self)
@@ -1783,10 +1798,17 @@
         ;; image. The variadic registration stays in the letrec BODY so the
         ;; binding holds the bare lambda and the name survives (same constraint
         ;; as the named path above).
+        ;; The ns is the one the FORM was written in. For a literal the analyzer
+        ;; produced that is the namespace being compiled; for one the inline pass
+        ;; copied here it is the callee's (:src-ns), and compiling the callee's
+        ;; text in this namespace would resolve its private and aliased names
+        ;; against the wrong map. :live-names says what each source free name
+        ;; became in this copy (a renamed local, or a constant with no capture
+        ;; left) — absent for a literal that was not spliced.
         (let [nm fnsrc-nm
               form (:src-form node)
               frees (:free-names node)]
-          (swap! *fnsrc-regs* conj [nm form *fnsrc-ns* frees])
+          (swap! *fnsrc-regs* conj [nm form fnsrc-src-ns frees (:live-names node)])
           (if variadic-fixed
             (str "(letrec ((" nm " " lambda ")) "
                  "(jolt-register-variadic! " variadic-fixed " " nm "))")

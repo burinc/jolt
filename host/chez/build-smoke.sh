@@ -274,6 +274,34 @@ for line in 'dd-apply: second' 'dd-call:  second' 'dd-late:  second'; do
   fi
 done
 
+# A closure returned by a SPLICED callee must still travel in a state image, and
+# the built binary must agree with `jolt run` about it. Only a built binary
+# splices, and the splicer used to drop the fn's source registration -- so the
+# same program wrote the closure under `jolt run` and refused it here.
+#
+# Compared against `jolt run` rather than pinned to a literal, because the bug
+# was a DIVERGENCE between the two; a literal would have to be re-derived every
+# time the fixture's arithmetic changes, and would not say what it is for.
+fasl="$(dirname "$out")/closure.fasl"
+got_cl="$(cd / && "$out" --closure "$fasl" 2>&1)"
+want_cl="$(cd "$app" && JOLT_PWD="$app" "$joltabs" run -m app.core --closure "$fasl" 2>&1)"
+if [ "$got_cl" != "$want_cl" ]; then
+  echo "  FAIL: a spliced callee's closure does not travel the same as under jolt run"
+  echo "--- binary ----"; echo "$got_cl"
+  echo "--- jolt run --"; echo "$want_cl"; exit 1
+fi
+# ...and both actually wrote one, rather than agreeing on a shared failure.
+if ! printf '%s' "$got_cl" | grep -q '^closure-scan: 0 0$'; then
+  echo "  FAIL: spliced closure is not writable (scan reported refusals)"
+  echo "--- got ----"; echo "$got_cl"; exit 1
+fi
+for line in 'closure-folded: 115 115' 'closure-live: 110 110'; do
+  if ! printf '%s' "$got_cl" | grep -qF "$line"; then
+    echo "  FAIL: spliced closure round trip — want '$line'"
+    echo "--- got ----"; echo "$got_cl"; exit 1
+  fi
+done
+
 # The :str-stamped interop answers at runtime with the same values the generic
 # dispatch would (the emit-level proof is the flat.ss grep above).
 got_strd="$(cd / && "$out" --strd 2>&1)"

@@ -178,6 +178,14 @@
 ;;   :devirt-type :devirt-*  a monomorphic protocol call's resolved impl (backend).
 ;;   :num-ret                a ^double/^long declared return, on a :var node.
 ;;   :phints :nhints         per-arity ^Record / ^double param hints (analyzer).
+;;   :rec-hint               a declared ^Record type on a :local, moved off a
+;;                           callee arity by the inline pass onto the local that
+;;                           replaced the param (a spliced body has no arity).
+;;   :src-form :free-names   a :fn literal's source and captured names, the pair
+;;                           the state image rebuilds a closure from (analyzer).
+;;   :live-names :src-ns     what a SPLICED copy of that literal actually
+;;                           captures, and the namespace its form was written in
+;;                           (jolt.passes.inline).
 ;;   :ret-nhint              a fn arity's declared numeric return kind.
 ;;   :no-init                a :def with no initializer (declare).
 ;;   :meta-expr              a :def's evaluated metadata expression.

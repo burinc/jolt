@@ -1,6 +1,7 @@
 (ns app.core
   (:require [app.util :as util :refer [greet]]
-            [clojure.java.io :as io]))
+            [clojure.java.io :as io]
+            [jolt.image :as img]))
 
 ;; An aliased cross-ns defmethod: 'util/greet is passed quoted to defmethod-setup,
 ;; so the AOT build must register the `util` alias for app.core or it resolves to
@@ -58,6 +59,20 @@
     (println "dd-apply:" (apply util/dd-caller nil))
     (println "dd-call: " (util/dd-caller))
     (println "dd-late: " (util/dd-late)))
+  ;; --closure <path>: write a closure returned by a SPLICED callee to a state
+  ;; image, read it back, and call both. `jolt run` and the built binary have to
+  ;; agree — they did not, because the splice dropped the fn's source
+  ;; registration and only a built binary splices (jolt-giqc).
+  (when (= (first args) "--closure")
+    (let [path (second args)
+          folded (util/make-closure 10)                 ; constant, no capture left
+          live   (util/make-closure (+ 3 (count args)))] ; a renamed live local
+      (println "closure-scan:" (count (img/scan folded)) (count (img/scan live)))
+      (img/dump! path folded)
+      (println "closure-folded:" (folded 5) ((img/read-image path) 5))
+      (img/dump! path live)
+      (println "closure-live:" (live 5) ((img/read-image path) 5))))
+
   ;; --innerfn: a named inner fn inside a spliced callee (jolt-pzos).
   (when (= (first args) "--innerfn")
     (util/inner-boom 1))

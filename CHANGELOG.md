@@ -109,15 +109,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the splicer's alpha-rename adds is stripped from a frame name rather than
   shown.
 
-- **`jolt.image` now says why it will not write a fn.** A fn literal returned by
-  a fn the compiler inlined has no recorded source — the spliced copy's binders
-  are renamed and its captures include the caller's locals, so it matches no
-  registered source form, and the pass drops the registration rather than let a
-  restore rebuild from stale names and bind `nil`. The refusal used to read
-  `cannot write #<procedure> at <root>`; it now explains that and points at the
-  two ways out (store a top-level fn, or mark the enclosing fn `^:redef` so it
-  is not spliced). Note this differs from `jolt run`, which does not splice and
-  dumps such a closure fine.
+- **A closure returned by an inlined fn would not go into a state image.** An
+  anonymous fn travels as its source form plus the values it captured, recovered
+  from the live closure by name; a spliced copy matched neither half — its
+  binders are renamed, its captures may be the caller's locals, and a constant
+  argument folded into the body leaves no capture at all — so the pass dropped
+  the registration and `jolt.image/dump!` refused with `cannot write
+  #<procedure>`. The same program wrote the closure fine under `jolt run`, which
+  does not splice, so this was a divergence between running a program and
+  building it, in every default release build.
+
+  A spliced copy now carries its own capture list: the source names still build
+  the wrapper the restore compiles, and alongside them the copy records what
+  each one became — the live variable's new name, or the constant value itself,
+  which then travels as data. It records the namespace the form was written in
+  too, so a callee's private and aliased names still resolve when the copy lives
+  in another namespace. `clojure.*` and `jolt.*` literals stay unregistered
+  whether or not they were spliced, which is what they are when they run
+  un-spliced. The refusal message for a fn that genuinely has no source no
+  longer blames inlining.
+
+  A spliced literal registers per call site, so a real app emits more of them —
+  1082 to 1397 building metosin/malli, +6.7% of emitted Scheme and ~5% of build
+  wall time (7.50s to 7.88s, min of three alternating runs). Runtime is
+  unaffected: the benchmark suite is 0.96x-1.02x across all 22 rows and the
+  built binary starts in the same time, while the record-hint fix below takes
+  1.4% off its size.
+
+- **A `^Record` param hint was dropped by a splice.** `:phints` are what types a
+  record parameter when nothing about the caller could be inferred, which is the
+  open-world case the hint exists for — and the inline stash never carried them,
+  so a callee that read its own field by static slot fell back to the generic
+  lookup the moment its body was copied into a caller. A declaration the user
+  wrote should not depend on whether the compiler happened to inline the fn, so
+  the splicer moves it onto the local that replaced the param, where it survives
+  the later passes rearranging the bindings around it.
 
 - **A `*data-readers*` entry holding the reader function itself.** The load path
   accepted only a symbol naming the reader var, so a table entry added as
