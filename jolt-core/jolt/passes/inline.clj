@@ -45,9 +45,14 @@
   ;; binders), so any op that binds no names is safe however it is spelled and
   ;; whether or not it can throw (:invoke and :throw are here already).
   ;;
-  ;; recur/loop/fn/try/def stay out — those bind names or move control, and the
-  ;; splicer has no case for them, so a body containing one is rejected by
-  ;; body-size below and never inlined or alpha-renamed.
+  ;; :try and :def stay out — a winder and a definition, neither of which the
+  ;; splicer has a case for, so a body containing one is rejected by body-size
+  ;; below and never inlined or alpha-renamed.
+  ;;
+  ;; :fn, :loop and :recur BIND names, and subst/body-closed? below have explicit
+  ;; cases for them (see subst's :fn and :loop arms). :recur additionally needs
+  ;; recur-bound? — a recur that targets the inlined fn's OWN arity has no target
+  ;; once spliced, so safe-op? alone cannot admit it.
   ;;
   ;; The literal leaves and the interop arg-only forms were missing rather than
   ;; refused. Measured while building a real project (grenadine) under --opt, a
@@ -61,7 +66,31 @@
       ;; literal leaves, like :const
       (= op :regex) (= op :inst) (= op :uuid) (= op :bigdec)
       ;; interop: a leaf, and two arg-only call forms (:host is already above)
-      (= op :host-static) (= op :host-new) (= op :host-call)))
+      (= op :host-static) (= op :host-new) (= op :host-call)
+      ;; binders — see subst/body-closed?/recur-bound? below
+      (= op :fn) (= op :loop) (= op :recur)))
+
+(defn- recur-bound?
+  "True if every :recur in node is enclosed by a :loop or :fn WITHIN node, so its
+  target travels with it when the body is spliced.
+
+  A :recur that is not — one sitting under :if/:do/:let straight off the body —
+  targets the arity of the fn being inlined, and that arity does not exist at the
+  call site. Splicing it would emit a recur with nothing to recur to. `bound?`
+  starts false at the body root and turns true under a binder that provides a
+  target.
+
+  Separate from body-size because that is a context-free fold and this is not."
+  [node bound?]
+  (let [op (get node :op)]
+    (cond
+      (= op :recur) bound?
+      (= op :loop) (and (reduce (fn [ok b] (and ok (recur-bound? (nth b 1) bound?)))
+                                true (get node :bindings))
+                        (recur-bound? (get node :body) true))
+      (= op :fn) (reduce (fn [ok a] (and ok (recur-bound? (get a :body) true)))
+                         true (get node :arities))
+      :else (reduce-ir-children (fn [ok c] (and ok (recur-bound? c bound?))) true node))))
 
 (def ^:private inline-budget 120)
 
@@ -109,9 +138,71 @@
                         [env []]
                         (get node :bindings))]
         (assoc node :bindings (nth res 1) :body (subst (get node :body) (nth res 0))))
-      ;; every other op substitutes env uniformly into its children. Inline
-      ;; bodies only contain safe ops (see safe-op?), so loop/recur/fn/def/try
-      ;; never reach here; the combinator handles them harmlessly regardless.
+      ;; :loop binds exactly like :let and its :recur travels with it, so it gets
+      ;; the same sequential alpha-rename.
+      (= op :loop)
+      (let [res (reduce (fn [acc b]
+                          (let [e (nth acc 0)
+                                binds (nth acc 1)
+                                nm (nth b 0)
+                                init (subst (nth b 1) e)
+                                f (fresh nm)]
+                            [(assoc e nm {:op :local :name f}) (conj binds [f init])]))
+                        [env []]
+                        (get node :bindings))]
+        (assoc node :bindings (nth res 1) :body (subst (get node :body) (nth res 0))))
+      ;; :fn — each arity's params (and :rest) bind within that arity, and a
+      ;; named fn binds its own name across all of them. All are alpha-renamed,
+      ;; for the reason the :let arm is: a param that merely SHADOWED the name in
+      ;; env would still let the substituted argument be captured. (defn callee
+      ;; [a] (map (fn [y] (+ a y)) xs)) inlined at (let [y 10] (callee y)) puts
+      ;; the caller's `y` inside a fn that binds `y`, and shadowing alone turns
+      ;; (+ a y) into (+ y y).
+      ;;
+      ;; A named inner fn is renamed too, and its emitted procedure — hence its
+      ;; backtrace frame — is then `foo__ilN` rather than `foo`. That is the
+      ;; cosmetic price of the same hygiene; an anonymous fn (the common case)
+      ;; has no name to change.
+      (= op :fn)
+      (let [self (get node :name)
+            env (if self (assoc env self {:op :local :name (fresh self)}) env)
+            ren (fn [e nm] (get (get e nm) :name))
+            arities
+            (mapv (fn [a]
+                    (let [names (if (get a :rest)
+                                  (conj (vec (get a :params)) (get a :rest))
+                                  (vec (get a :params)))
+                          e (reduce (fn [e nm] (assoc e nm {:op :local :name (fresh nm)}))
+                                    env names)
+                          ;; :phints/:nhints/:ahints are vectors of [param value]
+                          ;; keyed BY PARAM NAME; rekey them or the numeric and
+                          ;; record-type passes look up names that no longer exist.
+                          rekey (fn [k]
+                                  (when-let [hs (get a k)]
+                                    (mapv (fn [pr] [(ren e (nth pr 0)) (nth pr 1)]) hs)))
+                          a (assoc a
+                                   :params (mapv (fn [nm] (ren e nm)) (get a :params))
+                                   :body (subst (get a :body) e))
+                          a (if (get a :rest) (assoc a :rest (ren e (get a :rest))) a)
+                          a (reduce (fn [a k] (if-let [v (rekey k)] (assoc a k v) a))
+                                    a [:phints :nhints :ahints])]
+                      a))
+                  (get node :arities))
+            node (assoc node :arities arities)
+            node (if self (assoc node :name (ren env self)) node)]
+        ;; :src-form and :free-names describe the fn as WRITTEN, and the image
+        ;; rebuilds a travelling closure from exactly those two (analyzer
+        ;; analyze-fn, backend emit-fn/fnsrc-flush, state-image
+        ;; image-recover-free-values). A spliced copy matches neither: its binders
+        ;; are renamed and its captures now include the caller's locals, which no
+        ;; source form of the callee can name. Dropping them makes the copy
+        ;; UNREGISTERED, which emit-fn already handles — it refuses at dump like
+        ;; any other unregistered fn. Keeping them would instead have the image
+        ;; rebuild a closure from stale names, and a name the inspector cannot
+        ;; report binds jolt-nil rather than failing, so the damage would surface
+        ;; as a wrong value long after the restore.
+        (dissoc node :src-form :free-names))
+      ;; every other op substitutes env uniformly into its children.
       :else (map-ir-children (fn [c] (subst c env)) node))))
 
 (defn- trivial-arg? [n]
@@ -139,6 +230,29 @@
                         [scope true]
                         (get node :bindings))]
         (and (nth res 1) (body-closed? (get node :body) (nth res 0))))
+      ;; :loop threads scope sequentially, exactly like :let.
+      (= op :loop)
+      (let [res (reduce (fn [acc b]
+                          (let [sc (nth acc 0) ok (nth acc 1)]
+                            (if (not ok)
+                              acc
+                              [(conj sc (nth b 0)) (body-closed? (nth b 1) sc)])))
+                        [scope true]
+                        (get node :bindings))]
+        (and (nth res 1) (body-closed? (get node :body) (nth res 0))))
+      ;; :fn — each arity's params and :rest bind only within that arity; a named
+      ;; fn's own name binds across all of them (the analyzer makes the
+      ;; self-reference a :local). Anything else its body reads has to be in the
+      ;; enclosing scope, or the copy would dangle at the call site.
+      (= op :fn)
+      (let [sc (if (get node :name) (conj scope (get node :name)) scope)]
+        (reduce (fn [ok a]
+                  (and ok
+                       (body-closed? (get a :body)
+                                     (let [s (reduce conj sc (get a :params))]
+                                       (if (get a :rest) (conj s (get a :rest)) s)))))
+                true
+                (get node :arities)))
       ;; leaves (:const/:var/:host/:the-var/:quote) fold to true; the rest AND
       ;; their children. Unsafe ops never reach here (body-size rejects them).
       (safe-op? op) (reduce-ir-children (fn [ok c] (and ok (body-closed? c scope))) true node)
@@ -206,6 +320,9 @@
             (if (and (= (count params) (count args))
                      (<= (body-size body) inline-budget)
                      (body-closed? body (reduce conj #{} params))
+                     ;; a recur targeting the callee's own arity has no target
+                     ;; once the body leaves it
+                     (recur-bound? body false)
                      ;; cheapest checks first; the graph walk only runs on a
                      ;; stash that would otherwise splice.
                      (not (splice-cycle-member? ctx (get f :ns) (get f :name))))
