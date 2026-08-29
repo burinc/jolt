@@ -236,9 +236,19 @@
 ;; --- the shake: graph -> reachable -> bail check -> partition ----------------
 ;; edges: fqn -> refs (prunable defs only). roots: -main + the runtime-core roots +
 ;; every non-def form's refs.
+;; A callee the inline pass spliced is a ROOT even when nothing calls it any more.
+;; Splicing removes the last reference to a fn whose every call site was inlined,
+;; so the graph walk below would prune its def -- and the def's record carries the
+;; (jolt-register-source! …) that maps an inlined frame back to ns/name
+;; (file:line). Without this a --tree-shake binary printed one frame where the
+;; unshaken build printed three (jolt-o13s). The kept def is bounded by the inline
+;; budget, so the size this costs is small and the alternative is a trace that
+;; silently loses frames the same build shows without --tree-shake.
+;; inline-spliced-fqns is host-contract.ss; loaded well before build.ss loads this.
 (define (dce-build-graph records entry-main)
   (let ((edges (make-hashtable string-hash string=?))
-        (roots (append (dce-data-reader-roots)
+        (roots (append (inline-spliced-fqns)
+                       (dce-data-reader-roots)
                        (cons entry-main dce-runtime-core-roots))))
     (for-each (lambda (r)
                 (if (dce-rec-keep? r)

@@ -3,7 +3,7 @@
   when host/inline-enabled? (user code opted into direct-linking); they
   share the alpha-rename invariant (every spliced binder is made globally fresh)
   and the `dirty` fixpoint flag. Portable Clojure (compiler-tier)."
-  (:require [jolt.host :refer [inline-ir]]
+  (:require [jolt.host :refer [inline-ir mark-spliced!]]
             [jolt.ir :refer [map-ir-children reduce-ir-children coerce-node]]
             [jolt.op-registry :as op-registry]
             [jolt.passes.fold :refer [scalar-const? kw-callee? get-callee?]]))
@@ -236,7 +236,24 @@
             (assoc node :inline-chain
                    (into (conj (or (get node :inline-chain) []) [fqn at]) outer))
             node)]
-    (map-ir-children (fn [c] (stamp-inline c fqn at outer)) n)))
+    ;; STOP at a nested :fn. The chain describes the frames between a node and the
+    ;; physical fn it ends up inside, and a nested fn is emitted as its own lambda
+    ;; — it HAS a physical frame, so nothing separates its body from it. Stamping
+    ;; through the boundary made the reporter expand that frame as though it were
+    ;; spliced code and print the callee twice:
+    ;;
+    ;;   app.core/helper (core.clj:6)   <- spurious, from the inner fn's own frame
+    ;;   named-step__il1
+    ;;   app.core/helper (core.clj:7)
+    ;;   app.core/-main  (core.clj:10)
+    ;;
+    ;; The :fn NODE itself still takes the stamp — building the closure is the
+    ;; callee's code, and that expression really does sit in the caller's frame.
+    ;; Only its arity bodies are excluded, which is exactly what map-ir-children
+    ;; recurses into for a :fn (jolt-pzos).
+    (if (= :fn (get node :op))
+      n
+      (map-ir-children (fn [c] (stamp-inline c fqn at outer)) n))))
 
 (defn- trivial-arg? [n]
   ;; safe to substitute directly (immutable, free to duplicate): a local read or
@@ -389,6 +406,14 @@
                     ;; preserve the fn's ^double/^long return coercion.
                     rbody (if ret (coerce-node ret rbody0) rbody0)]
                 (mark!)
+                ;; Tell the host this callee's body was actually copied somewhere.
+                ;; The tree-shake graph roots the set: with every call site spliced
+                ;; there is no reference left to the callee's def, so the shake
+                ;; would drop it — along with the (jolt-register-source! …) its
+                ;; record carries, which is what names an inlined frame in a
+                ;; backtrace (jolt-o13s). Recorded at the SPLICE, so a stashed fn
+                ;; nobody spliced still shakes away.
+                (mark-spliced! ctx (get f :ns) (get f :name))
                 (if (= 0 (count binds))
                   rbody
                   {:op :let :bindings binds :body rbody}))
