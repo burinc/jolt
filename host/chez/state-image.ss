@@ -945,6 +945,38 @@
                                     (walk (jolt-agent-validator x) (cons "@validator" path))
                                     (walk (jolt-agent-err-handler x) (cons "@error-handler" path))
                                     #t)))
+                             ;; A clojure.core lazy producer, recorded as its
+                             ;; arguments plus a forcer (seq.ss lazy-src). The
+                             ;; forcer is a procedure and cannot travel, so the
+                             ;; image carries the producer's NAME in its place
+                             ;; and the restore puts the live one back. The
+                             ;; arguments are ordinary values and walk as data,
+                             ;; so a producer over another lazy seq nests and a
+                             ;; self-referential one closes on the memo.
+                             ;;
+                             ;; Restoring a seq this way, rather than forcing it
+                             ;; at dump, is the whole point: an infinite seq
+                             ;; keeps generating and a side effect still has not
+                             ;; run (jolt-a6k2).
+                             ((and (lazy-src? x)
+                                   (if (eq? mode 'restore)
+                                       (lazy-src-proc-of (lazy-src-fn x))
+                                       (lazy-src-name-of (lazy-src-fn x))))
+                              => (lambda (swapped)
+                                   (if (image-rebuild-mode? mode)
+                                       (let ((nx (make-lazy-src swapped #f #f #f)))
+                                         (hashtable-set! memo x nx)
+                                         (image-meta-copy! x nx)
+                                         (lazy-src-a-set! nx (walk (lazy-src-a x) (cons "lazy-arg" path)))
+                                         (lazy-src-b-set! nx (walk (lazy-src-b x) (cons "lazy-arg" path)))
+                                         (lazy-src-c-set! nx (walk (lazy-src-c x) (cons "lazy-arg" path)))
+                                         nx)
+                                       (begin
+                                         (hashtable-set! memo x #t)
+                                         (walk (lazy-src-a x) (cons "lazy-arg" path))
+                                         (walk (lazy-src-b x) (cons "lazy-arg" path))
+                                         (walk (lazy-src-c x) (cons "lazy-arg" path))
+                                         #t))))
                              ((mutex? x)
                               (cond ((eq? mode 'restore) (make-mutex))
                                     ((image-rebuild-mode? mode) (make-image-sync 'mutex))
