@@ -85,7 +85,8 @@
 ;; Written via tmp+rename like the .so: a gate checking freshness concurrently
 ;; (parallel make) must never read a half-written list and conclude from the
 ;; truncated prefix that a stale image is fresh.
-(let* ((tmp (string-append gb-inputs ".tmp"))
+(define gb-pid (number->string (get-process-id)))
+(let* ((tmp (string-append gb-inputs "." gb-pid ".tmp"))
        (out (open-output-file tmp 'replace)))
   (for-each (lambda (p) (put-string out p) (put-string out "\n")) (gb-collect-paths))
   (close-port out)
@@ -94,10 +95,13 @@
 
 ;; --- 2. compile in a FRESH Chez ---------------------------------------------
 ;; Compile to a temp path and rename into place: a concurrent gate (parallel make
-;; ci) must never load a half-written image.
+;; ci) must never load a half-written image. The temp names carry this process's
+;; pid for the same reason make-devboot.ss's do: several gates rebuild this in one
+;; parallel `make ci`, and on a fixed scratch path two writers race until one
+;; rename finds the file the other already moved.
 (display "make-gateboot: compiling gate.so (fresh Chez)\n")
-(define gb-gate-so-tmp (string-append gb-gate-so ".tmp"))
-(let ((cs (string-append gb-build "/gate-compile.ss")))
+(define gb-gate-so-tmp (string-append gb-gate-so "." gb-pid ".tmp"))
+(let ((cs (string-append gb-build "/gate-compile." gb-pid ".ss")))
   (let ((p (open-output-file cs 'replace)))
     (put-string p
       (string-append
@@ -109,7 +113,8 @@
         "(fasl-compressed #t)\n"
         "(compile-file " (ei-str-lit gb-gate-ss) " " (ei-str-lit gb-gate-so-tmp) ")\n"))
     (close-port p))
-  (bld-system (string-append bld-chez " --script '" cs "'")))
+  (bld-system (string-append bld-chez " --script '" cs "'"))
+  (when (file-exists? cs) (delete-file cs)))
 (when (file-exists? gb-gate-so) (delete-file gb-gate-so))
 (rename-file gb-gate-so-tmp gb-gate-so)
 

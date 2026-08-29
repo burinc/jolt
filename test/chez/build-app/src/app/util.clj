@@ -78,3 +78,23 @@
 ;; adds an aliased method (util/greet :loud) — see there.
 (defmulti greet (fn [kind] kind))
 (defmethod greet :default [_] "greet:default")
+
+;; A var defined TWICE, with a caller compiled between the two defs. Plain
+;; Clojure, legal, and last-def-wins in every other jolt mode — but a stashed
+;; inline body froze the FIRST definition into dd-caller while dd-late, compiled
+;; after the second def, saw the second. One binary, two answers (jolt-rtjm).
+;; Both call paths must report "second".
+(defn dd-target [] "first")
+(defn dd-caller [] (dd-target))
+(defn dd-target [] "second")
+(defn dd-late [] (dd-target))
+
+;; A spliceable callee holding a NAMED inner fn. The splicer alpha-renames the
+;; inner fn's own name for hygiene, so its emitted procedure — and its backtrace
+;; frame — is `step-boom__ilN`. Two things this pins (jolt-pzos): the mangled
+;; suffix must not reach the user, and inner-boom must appear ONCE, not twice —
+;; the inner fn has its own runtime frame, so stamping the inline chain through
+;; the fn boundary made the reporter expand that frame as spliced code too.
+(defn inner-boom [n]
+  (let [step (fn step-boom [y] (throw (ex-info "inner boom" {:y y})))]
+    (step n)))

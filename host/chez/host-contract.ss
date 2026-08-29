@@ -740,6 +740,35 @@
 ;; site, and an unlocked read of a strong table is safe (see var-table in rt.ss).
 (define inline-stash-table (make-hashtable string-hash string=?))
 (define inline-stash-mu (make-mutex))
+;; Has this var been defined more than once, with a value, in the program loaded
+;; so far? The inline pass asks before stashing: splicing a var that is redefined
+;; later freezes whichever definition was current when the CALLER compiled, so one
+;; binary answers two ways depending which side of the second def a call site sat
+;; on (jolt-rtjm). `jolt build` loads the whole app from source before it emits any
+;; of it, so the answer is already final by stash time.
+;;
+;; Conservative in the harmless direction: a var redefined for any reason at all
+;; (the post-prelude native clobber, a reloaded namespace) loses its stash and
+;; keeps a real call, which is exactly what it compiles to without direct-linking.
+;; Every callee the inline pass actually spliced somewhere, "ns/name". A callee
+;; whose every call site was spliced has no reference left in the emitted code, so
+;; the tree-shake graph walk drops its def -- and the def's record is where the
+;; (jolt-register-source! …) lives, which is the only thing that maps an inlined
+;; frame back to ns/name (file:line). A --tree-shake binary then printed ONE frame
+;; where the same build unshaken printed three (jolt-o13s). dce.ss roots this set,
+;; so the identity survives the shake.
+;;
+;; Recorded at the SPLICE, not at the stash: a stashed fn nobody spliced is still
+;; genuinely dead and should still shake away.
+(define inline-spliced-set (make-hashtable string-hash string=?))
+(define (hc-mark-spliced! ctx ns-name nm)
+  (jolt-with-mutex inline-stash-mu
+    (hashtable-set! inline-spliced-set (string-append ns-name "/" nm) #t))
+  jolt-nil)
+(define (inline-spliced-fqns)
+  (jolt-with-mutex inline-stash-mu (vector->list (hashtable-keys inline-spliced-set))))
+(define (hc-var-redefined? ctx ns-name nm)
+  (if (var-redefined? ns-name nm) #t jolt-nil))
 (define (hc-stash-inline! ctx ns-name nm m)
   (jolt-with-mutex inline-stash-mu
     (hashtable-set! inline-stash-table (string-append ns-name "/" nm) m))
@@ -833,6 +862,8 @@
   (def-var! "jolt.host" "inline-enabled?" hc-inline-enabled?)
   (def-var! "jolt.host" "inference-enabled?" hc-inference-enabled?)
   (def-var! "jolt.host" "inline-ir" hc-inline-ir)
-  (def-var! "jolt.host" "stash-inline!" hc-stash-inline!))
+  (def-var! "jolt.host" "stash-inline!" hc-stash-inline!)
+  (def-var! "jolt.host" "var-redefined?" hc-var-redefined?)
+  (def-var! "jolt.host" "mark-spliced!" hc-mark-spliced!))
 
 (hc-install!)

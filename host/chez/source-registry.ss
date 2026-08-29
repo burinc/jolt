@@ -540,6 +540,27 @@
 ;; INSIDE that frame (#f when unknown), which is what the JVM prints per frame and
 ;; what a reader needs; the record's own line is where the function was DEFINED and
 ;; is only the fallback.
+;; The inline pass alpha-renames a spliced callee's binders, so a NAMED inner fn
+;; inside a spliced body emits as `foo__il7` and Chez names its frame that. The
+;; suffix is a compiler artifact -- `__il` plus the unit's fresh counter
+;; (jolt.passes.inline/fresh) -- and nothing maps such a frame to a source record,
+;; so it reaches the renderer as a bare name and used to print the mangled form
+;; verbatim (jolt-pzos). Strip it back to what the user wrote.
+;;
+;; Only a trailing __il<digits> over a non-empty base is stripped, so a fn the user
+;; actually named foo__il is left alone.
+(define (srcreg-display-name nm)
+  (let ((n (string-length nm)))
+    (let scan ((i n))
+      (cond
+        ;; walk back over the digit run
+        ((and (fx>? i 0) (char<=? #\0 (string-ref nm (fx- i 1)) #\9)) (scan (fx- i 1)))
+        ;; ...which must be non-empty, preceded by "__il", over a non-empty base
+        ((and (fx<? i n) (fx>? i 4)
+              (string=? (substring nm (fx- i 4) i) "__il"))
+         (substring nm 0 (fx- i 4)))
+        (else nm)))))
+
 (define (srcreg-frame name record line) (vector name record line))
 (define (srcreg-frame-nm f) (vector-ref f 0))
 (define (srcreg-frame-rec f) (vector-ref f 1))
@@ -567,7 +588,7 @@
                             (put-string port " (") (put-string port file)
                             (put-string port ":") (put-string port (number->string line))
                             (put-string port ")")))
-                        (put-string port frame-name))   ; 'ambiguous / unmapped: bare name
+                        (put-string port (srcreg-display-name frame-name)))   ; 'ambiguous / unmapped: bare name
                     (when (fx>? cnt 1)
                       (put-string port " (x") (put-string port (number->string cnt)) (put-string port ")"))
                     (put-char port #\newline)
