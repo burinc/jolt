@@ -157,8 +157,18 @@
 ;; Compile to a temp path and rename into place: a concurrent bin/jolt (e.g.
 ;; parallel make ci gates) must never load a partially written image — a
 ;; truncated fasl can load a prefix of the runtime and fail on late defines.
-(define jb-flat-so-tmp (string-append jb-flat-so ".tmp"))
-(let ((cs (string-append jb-build "/dev-compile.ss")))
+;;
+;; The temp names carry THIS PROCESS's pid, because the readers are not the only
+;; concurrency here: devbootsmoke runs `make devboot` four times and gatebootsmoke
+;; rebuilds it too, and both gates run in the same parallel `make ci`. On one
+;; fixed scratch path the two writers raced — one renamed the shared .tmp into
+;; place and the other's rename died with "cannot rename target/dev/flat.so.tmp:
+;; no such file or directory", failing the whole gate on a target nothing had
+;; changed. The rename into the final name stays atomic, so the last writer wins
+;; and every reader sees one complete image either way.
+(define jb-pid (number->string (get-process-id)))
+(define jb-flat-so-tmp (string-append jb-flat-so "." jb-pid ".tmp"))
+(let ((cs (string-append jb-build "/dev-compile." jb-pid ".ss")))
   (let ((p (open-output-file cs 'replace)))
     (put-string p
       (string-append
@@ -170,7 +180,8 @@
         "(fasl-compressed #t)\n"
         "(compile-file " (ei-str-lit jb-flat-ss) " " (ei-str-lit jb-flat-so-tmp) ")\n"))
     (close-port p))
-  (bld-system (string-append bld-chez " --script '" cs "'")))
+  (bld-system (string-append bld-chez " --script '" cs "'"))
+  (when (file-exists? cs) (delete-file cs)))
 (when (file-exists? jb-flat-so) (delete-file jb-flat-so))
 (rename-file jb-flat-so-tmp jb-flat-so)
 
