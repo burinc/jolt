@@ -76,6 +76,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A lazy sequence built by `clojure.core` could not go into a state image.** A
+  lazy seq written with `lazy-seq` already travelled — that thunk is an ordinary
+  fn literal with a recorded source, so an infinite generator came back still
+  generating and an unrealized side effect still had not run. `map`, `filter`,
+  `range`, `take` and friends build their thunks as Scheme closures inside the
+  runtime instead, and a closure carries its captured values where nothing can
+  read them, so those refused. One core call anywhere in a chain was enough:
+  `(rest user-lazy)`, `(take 3 user-lazy)` and `(map inc user-lazy)` all refused
+  even though the seq they were built from travelled.
+
+  Those producers record what they are — the producer and its arguments — rather
+  than closing over them, so the image writes the producer's *name* and the
+  arguments as data and restore re-applies it. Nothing is forced: an infinite
+  seq still comes back generating, and a side effect still runs on the restoring
+  side rather than at dump. The arguments walk as ordinary data, so a producer
+  over another lazy seq nests and a self-referential one (`(def fib (lazy-cat
+  [0 1] (map + (rest fib) fib)))`) closes on itself.
+
+  Free: the forcer is a direct call where invoking the closure went through
+  `jolt-invoke`, so the benchmark suite is unchanged (`bench/seqs` 1.00x).
+
+  Not yet covered: a chain already walked part-way, whose frontier is a
+  per-element cell rather than the producer that made it. Those still refuse.
+
 - **Synchronisation primitives travelled into state images as dead objects.** A
   record carrying a mutex or condition variable had no image walker of its own,
   so the generic record copy serialised the primitive itself. What came back was
