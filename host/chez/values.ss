@@ -15,8 +15,39 @@
 ;; --- nil ---------------------------------------------------------------------
 (define-record-type jolt-nil-t (fields) (nongenerative jolt-nil-v1))
 (define jolt-nil (make-jolt-nil-t))
-(define (jolt-nil? x) (jolt-nil-t? x))
-(define (jolt-some? x) (not (jolt-nil-t? x)))
+;; SPLICED, not called. Chez compiles each top-level form on its own -- verified:
+;; (define (f x) (fx+ x 1)) (define (g y) (f y)) in one compiled file, then
+;; (set! f ...) after load, still changes what g returns -- so a plain (define
+;; (jolt-nil? x) ...) here is an out-of-line call from every one of the thousands
+;; of sites the emitter writes, and from the whole runtime besides. Measured per
+;; check at optimize-level 2: 2.78ns called, 1.25ns spliced.
+;;
+;; Value position keeps an ordinary <name>-fn procedure and names it explicitly:
+;; op-registry's :value entry for the op, and every host reference that hands the
+;; predicate around rather than calling it. These are plain syntax-rules macros
+;; with NO identifier clause on purpose. Chez would accept a variable transformer
+;; (syntax-case with an (identifier? #'id) arm) and Gambit will not -- "Macro name
+;; can't be used as a variable" -- so a bare use has to be a compile error on both
+;; hosts rather than working on one. That is also what makes the -fn sweep
+;; verifiable: a missed value-position use fails the build, it does not silently
+;; keep the old cost.
+;; An arity the inline arm does not cover falls through to the procedure, so a
+;; wrong-arity use raises exactly what it raised before.
+;;
+;; An arm that uses its operand twice binds it first (jolt-truthy? below), so the
+;; argument expression is still evaluated exactly once; the binding is hygienic
+;; and cannot capture. The single-use arms splice the expression directly.
+(define (jolt-nil?-fn x) (jolt-nil-t? x))
+(define-syntax jolt-nil?
+  (syntax-rules ()
+    ((_ e) (jolt-nil-t? e))
+    ((_ e ...) (jolt-nil?-fn e ...))))
+
+(define (jolt-some?-fn x) (not (jolt-nil-t? x)))
+(define-syntax jolt-some?
+  (syntax-rules ()
+    ((_ e) (not (jolt-nil-t? e)))
+    ((_ e ...) (jolt-some?-fn e ...))))
 
 ;; --- the exit-only-cleanup marker --------------------------------------------
 ;; A fiber park is a continuation escape that is NOT an exit — the computation
@@ -53,7 +84,14 @@
 (define jolt-park-unwinding?-hook (lambda () #f))
 (define (jolt-park-unwinding?) (jolt-park-unwinding?-hook))
 
-(define (jolt-truthy? x) (not (or (jolt-nil? x) (eq? x #f))))
+;; The hot one: every `if` whose test is not provably a Scheme boolean goes
+;; through this, 2395 sites in a trivial app's emitted source before any of the
+;; runtime's own. See jolt-nil? above for why it is a macro.
+(define (jolt-truthy?-fn x) (not (or (jolt-nil-t? x) (eq? x #f))))
+(define-syntax jolt-truthy?
+  (syntax-rules ()
+    ((_ e) (let ((v e)) (not (or (jolt-nil-t? v) (eq? v #f)))))
+    ((_ e ...) (jolt-truthy?-fn e ...))))
 
 ;; --- keywords: interned so identity works; optional namespace ----------------
 (define-record-type keyword-t (fields ns name khash) (nongenerative keyword-v1))

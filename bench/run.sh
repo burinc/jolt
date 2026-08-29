@@ -21,8 +21,21 @@
 set -e
 cd "$(dirname "$0")"
 root="$(cd .. && pwd)"
-jolt="$root/bin/jolt"
+# $JOLT_BIN points the suite at another jolt — a released binary, or the one a
+# release workflow just built. ci/bench-gate.sh drives both sides through it.
+jolt="${JOLT_BIN:-$root/bin/jolt}"
 export JOLT_PWD="$PWD"
+
+# The benchmark list is the single source of truth for what the suite covers, and
+# ci/bench-gate.sh reads it from here rather than keeping a second copy. Printed
+# before the toolchain check below, so listing needs no Chez and no cc.
+if [ "${1:-}" = "--list" ]; then
+  # defined below; re-stated by name so the list lives in exactly one place
+  # cd'd into bench/ above, so name the script rather than reusing $0 (which is
+  # still relative to the caller's directory and no longer resolves)
+  sed -n 's/^BENCHES="\(.*\)"$/\1/p' run.sh | tr ' ' '\n' | grep .
+  exit 0
+fi
 
 # Locate Chez's kernel dev files for the optimized build (as build-smoke.sh does).
 csv="$JOLT_CHEZ_CSV"

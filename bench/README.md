@@ -1,5 +1,19 @@
 # jolt benchmark suite
 
+Run it after any change to the compiler passes, the emitter, or the runtime's
+hot paths. `make test` and `make libconformance` check that answers are right and
+neither notices when they get slower: `arrays` went 229.7 -> 1272.6ms on a
+codegen change with all 88 ci targets and all 47 libraries green, because every
+answer was still correct. A release compares this suite against the previous
+release and blocks `publish` on it (`ci/bench-gate.sh`, wired into
+`.github/workflows/release.yml`).
+
+One suite run is not evidence. Per-benchmark noise is around 1.07x on a quiet
+machine and the first benchmark of a run can be much further out — the run that
+caught the 5.4x also reported `mandelbrot` 1.63x faster and `nth-access` 1.07x
+slower, and both were noise. Re-measure anything that moved with
+`bench/run.sh <name>`, on each side, before believing it.
+
 Benchmarks that isolate the workload axes jolt's optimizing passes target. The
 ray tracer (`examples/ray-tracer`) is **float-compute-bound** — its time is
 irreducible algorithmic math (hit-testing + transcendentals), and devirt,

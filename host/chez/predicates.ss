@@ -65,7 +65,7 @@
                   (else (throw-jvm (quote ClassCastException) (string-append (jolt-final-str x) " cannot be cast to clojure.lang.Named"))))))
     (if (or (jolt-nil? ns) (not ns) (eq? ns '())) jolt-nil ns)))
 
-(def-var! "clojure.core" "nil?" jolt-nil?)
+(def-var! "clojure.core" "nil?" jolt-nil?-fn)
 (def-var! "clojure.core" "number?" jolt-number?)
 (def-var! "clojure.core" "string?" jolt-string?)
 (def-var! "clojure.core" "char?" jolt-char-pred?)

@@ -663,7 +663,7 @@
   (list
     (cons "+" jolt-add) (cons "-" jolt-sub) (cons "*" jolt-mul) (cons "/" jolt-div)
     (cons "<" <) (cons ">" >) (cons "<=" <=) (cons ">=" >=)
-    (cons "=" jolt=) (cons "inc" jolt-inc) (cons "dec" jolt-dec) (cons "not" jolt-not)
+    (cons "=" jolt=) (cons "inc" jolt-inc) (cons "dec" jolt-dec) (cons "not" jolt-not-fn)
     (cons "min" min) (cons "max" max)
     (cons "mod" modulo) (cons "rem" remainder) (cons "quot" quotient)
     (cons "vector" jolt-vector) (cons "hash-map" jolt-hash-map) (cons "hash-set" jolt-hash-set)
@@ -679,7 +679,7 @@
     (cons "iterate" jolt-iterate)
     (cons "keys" jolt-keys) (cons "vals" jolt-vals)
     (cons "even?" jolt-even?) (cons "odd?" jolt-odd?) (cons "pos?" jolt-pos?) (cons "neg?" jolt-neg?)
-    (cons "zero?" jolt-zero?) (cons "identity" jolt-identity)
+    (cons "zero?" jolt-zero?) (cons "identity" jolt-identity-fn)
     (cons "ex-info" jolt-ex-info)))
 
 ;; --- bindings + *ns* --------------------------------------------------------
