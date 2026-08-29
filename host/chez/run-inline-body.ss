@@ -194,6 +194,22 @@
 (gate-check "a shadowing inner binder still shadows after the splice"
             (ilg-call "(fn [] (let [a 100] (ilg-shadow a)))") "202")
 
+;; 5. an ARRAY-HINTED callee is not a candidate at all. ^doubles/^longs/^ints
+;;    type their local through the arity (numeric/arity-env reads :ahints off
+;;    it), and a spliced body has no arity: :nhints survive as a coerce-node on
+;;    the wrapping let, but nothing says "this local is a flvector", so the copy
+;;    falls off the unboxed path. Caught by bench/arrays going 229.7 -> 1272.6ms
+;;    when :loop became spliceable and dot's (aget a i) started emitting jolt-nth
+;;    instead of flvector-ref -- a 5.4x regression that every behavioural gate
+;;    passed, because the answers were all still right.
+;;
+;;    Asserted on the name (the call survives) rather than on flvector-ref, so it
+;;    pins the refusal itself and not the emission that happens to follow from it.
+(evals "(defn ilg-adot ^double [^doubles v ^long n] (loop [i 0 acc 0.0] (if (< i n) (recur (inc i) (+ acc (aget v i))) acc)))")
+(ilg-emit "(defn ilg-adot ^double [^doubles v ^long n] (loop [i 0 acc 0.0] (if (< i n) (recur (inc i) (+ acc (aget v i))) acc)))")
+(gate-check "an array-hinted callee is never spliced"
+            (gate-sub? (ilg-emit "(defn ilg-uses-adot [v] (ilg-adot v 4))") "ilg-adot") #t)
+
 (set-direct-link-flag! #f)
 (set-optimize! #f)
 

@@ -42,7 +42,22 @@
 ;; and the fixpoint traverse.
 (defn- inline-eligible? [node]
   (and (jolt.ir/single-fixed-arity-fn-def? node)
-       (not (jolt.ir/closed-world-opt-out? (:meta node)))))
+       (not (jolt.ir/closed-world-opt-out? (:meta node)))
+       ;; ...and not array-hinted. A ^doubles/^longs/^ints param types its local
+       ;; through the ARITY (numeric/arity-env reads :ahints off it), and a spliced
+       ;; body has no arity -- the stash carries :nhints, which survive as a
+       ;; coerce-node on the wrapping let, but there is no coercion that says "this
+       ;; local is a flvector", so the copy falls off the unboxed path. bench/arrays
+       ;; went 229.7 -> 1272.6ms the moment :loop became spliceable and dot's
+       ;; (aget a i) started emitting jolt-nth instead of flvector-ref.
+       ;;
+       ;; Refused at the stash, so it is not a missed optimization discovered late:
+       ;; an array-hinted fn simply is not an inline candidate until the splicer can
+       ;; carry a param's array type, which needs the numeric pass to take a
+       ;; declared kind on a let-bound local. Costs nothing against the state before
+       ;; :loop landed -- these fns are nearly all loops, so none of them were
+       ;; spliceable then either.
+       (not (seq (:ahints (first (:arities (:init node))))))))
 
 (defn- stash-of [node]
   (let [a (first (:arities (:init node)))]
