@@ -729,8 +729,19 @@
                :else :truthy))                  ; true, char, ... -> non-nil
        node]
       (= op :local)
-      (let [t (get tenv (get node :name))]
-        [(if t t :any)
+      (let [t0 (get tenv (get node :name))
+            ;; :rec-hint is a DECLARED ^Record type the splicer moved off a
+            ;; callee arity onto the local that replaced the param (inline.clj
+            ;; try-inline). It fills in only where inference has nothing — the
+            ;; inferred type is at least as precise, and the arity seed it stands
+            ;; in for is a fallback too (types.clj reinfer-def).
+            t (if (or (nil? t0) (= :any t0))
+                (let [ck (get node :rec-hint)
+                      ent (when ck (get (get env :record-shapes) ck))]
+                  (if ent (record-type-from-entry ent ck type-depth (get env :record-shapes))
+                      (if t0 t0 :any)))
+                t0)]
+        [t
          (cond
            ;; mark-struct, not a hand-rolled :hint/:shape pair: it also carries
            ;; :nilable, and :shape without :nilable is exactly the shape the back end
