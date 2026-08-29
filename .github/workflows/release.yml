@@ -532,12 +532,86 @@ jobs:
       - name: Build every example, run the test tasks
         run: jolt/ci/examples-smoke.sh examples ./jolt-bin
 
+  # Throughput. `make test` and `make libconformance` check that answers are right;
+  # neither notices when they get slower. bench/arrays went 5.4x on a codegen change
+  # with all 88 ci targets and all 47 libraries still green, so the suite runs here
+  # too, against the PREVIOUS release rather than against a checked-in millisecond
+  # figure: both compilers build the same bench sources on this one runner, and the
+  # gate reads the ratio. A number in ms would false-fail whenever the runner was
+  # slow and pass on a fast one while hiding a real regression.
+  #
+  # Compares the release being cut against the newest published release. Skipped,
+  # loudly, when there is no earlier release to compare against.
+  bench:
+    name: benchmarks vs the last release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: jolt
+      - uses: actions/download-artifact@v4
+        with:
+          name: jolt-x86_64-linux
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          # cc + the runtime's own shared deps: the gate BUILDS each bench with
+          # both compilers, so this needs the same toolchain `jolt build` does.
+          sudo apt-get install -y build-essential liblz4-1 zlib1g libtinfo6
+      - name: Unpack the jolt under test
+        run: |
+          set -eu
+          tgz="$(find . -maxdepth 2 -name '*x86_64-linux.tar.gz' -print -quit)"
+          [ -n "$tgz" ] || { echo "no linux tarball in the artifact"; exit 1; }
+          # Own directory, searched there only — the jolt checkout in this
+          # workspace also has an executable file named `jolt`.
+          mkdir -p unpacked-cand
+          tar -xzf "$tgz" -C unpacked-cand
+          bin="$(find unpacked-cand -type f -name jolt -perm -u+x -print -quit)"
+          [ -n "$bin" ] || { echo "no jolt binary in $tgz"; exit 1; }
+          mv "$bin" ./jolt-cand
+          ./jolt-cand --version
+      - name: Fetch the previous release
+        id: prev
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          # The newest PUBLISHED release, which is the last one users could have
+          # installed. This tag's own release is still a draft at this point, so it
+          # cannot select itself; --exclude-drafts says so regardless.
+          tag="$(gh release list --limit 20 --exclude-drafts --exclude-pre-releases \
+                   --json tagName --jq '.[0].tagName' 2>/dev/null || true)"
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "none=1" >> "$GITHUB_OUTPUT"
+            echo "no published release to compare against — nothing to gate"
+            exit 0
+          fi
+          echo "comparing against $tag"
+          gh release download "$tag" --pattern '*x86_64-linux.tar.gz' --dir prev-dl
+          mkdir -p unpacked-base
+          tar -xzf prev-dl/*x86_64-linux.tar.gz -C unpacked-base
+          bin="$(find unpacked-base -type f -name jolt -perm -u+x -print -quit)"
+          [ -n "$bin" ] || { echo "no jolt binary in the $tag tarball"; exit 1; }
+          mv "$bin" ./jolt-base
+          ./jolt-base --version
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Benchmark suite vs ${{ steps.prev.outputs.tag }}
+        if: steps.prev.outputs.none != '1'
+        run: jolt/ci/bench-gate.sh ./jolt-base ./jolt-cand
+      - name: No previous release
+        if: steps.prev.outputs.none == '1'
+        run: echo "First release — no baseline to compare against, bench gate skipped."
+
   # Flip the draft release public. Nothing downstream (install script, Homebrew tap)
   # sees the release until this runs, so a red fleet gate aborts the release with the
   # tag and assets intact for inspection.
   publish:
     name: publish the release
-    needs: [build, libraries, libraries-db, examples]
+    needs: [build, libraries, libraries-db, examples, bench]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 15

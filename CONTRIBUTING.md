@@ -229,6 +229,26 @@ make certify                  # JVM oracle (skips if clojure is absent)
 make libconformance           # replay the downstream library suites vs recorded tallies
 ```
 
+None of those measure throughput, and that is a real hole rather than an
+oversight to live with: `bench/arrays` once went 5.4x slower on a codegen change
+with all 88 ci targets and all 47 libraries still green — every answer was still
+correct. **Run `bench/run.sh` after any change to the compiler passes, the
+emitter, or the runtime's hot paths**, and read the table rather than the exit
+code; the suite reports, it does not judge.
+
+```bash
+NO_JVM=1 bench/run.sh          # the suite, optimized AOT binaries
+bench/run.sh sorted-access     # one benchmark, to re-check a suspicious row
+ci/bench-gate.sh A B           # two compilers head to head, ratios, exits nonzero
+```
+
+Suite noise is around 1.07x per benchmark on a quiet machine, and the FIRST
+benchmark of a run can be much further out than that, so a single suite run is
+not evidence on its own: re-measure anything that moved by running that
+benchmark alone, both before and after. A release runs `ci/bench-gate.sh`
+against the previous release automatically (`.github/workflows/release.yml`),
+and `publish` waits on it.
+
 The conformance corpus (`test/chez/corpus.edn`) is a host-neutral language spec
 whose expected values are sourced from reference JVM Clojure. See
 [test/conformance/SPEC.md](test/conformance/SPEC.md).
