@@ -98,3 +98,15 @@
 (defn inner-boom [n]
   (let [step (fn step-boom [y] (throw (ex-info "inner boom" {:y y})))]
     (step n)))
+
+;; A spliceable callee that RETURNS a closure. An anonymous fn travels in a state
+;; image as its source form plus its captured values, and the splicer used to drop
+;; that registration — so `jolt run` wrote this closure and the built binary
+;; refused it (jolt-giqc). The two captures are the two shapes: closure-base is
+;; private to THIS namespace, so the registration has to record app.util as the ns
+;; the form was written in, and n arrives as a folded constant at one call site
+;; and as a renamed live local at the other.
+(def ^:private closure-base 100)
+
+(defn make-closure [n]
+  (fn [y] (+ closure-base n y)))

@@ -83,7 +83,13 @@
 
 (defn- stash-of [node]
   (let [a (first (:arities (:init node)))]
-    {:params (:params a) :body (:body a) :nhints (:nhints a) :ret (:ret-nhint a)
+    ;; :phints are the declared ^Record param hints. They are a user DECLARATION,
+    ;; not an inference result — types.clj seeds an arity from them precisely when
+    ;; no caller type could be inferred — so a splice has to carry them for the
+    ;; same reason it carries :nhints. The splicer puts them on the substituted
+    ;; locals (try-inline rec-hint), since the copy has no arity to hang them on.
+    {:params (:params a) :body (:body a) :nhints (:nhints a) :phints (:phints a)
+     :ret (:ret-nhint a)
      ;; the stash-graph edges splice-cycle-member? (inline.clj) walks to refuse
      ;; inlining a recursive cluster; computed once here, on the analyzed body.
      :calls (direct-call-edges (:body a))}))

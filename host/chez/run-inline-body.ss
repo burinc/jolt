@@ -213,4 +213,138 @@
 (set-direct-link-flag! #f)
 (set-optimize! #f)
 
+;; --- a declared ^Record param survives the splice (jolt-2ztv) ---------------
+;; :phints are a DECLARATION, not an inference result: types.clj seeds an arity
+;; from them exactly when no caller type could be inferred, which is what types a
+;; record param in the open world. A spliced body has no arity, and until now the
+;; stash did not carry them at all -- so a callee that bare-indexed its own field
+;; read fell back to jolt-get the moment it was copied into a caller.
+;;
+;; The argument is deliberately opaque (a var deref), so nothing but the
+;; declaration can type it: with the hint removed the same call emits jolt-get,
+;; which is the control row below.
+(evals "(defrecord ILGPt [x y])")
+(set-record-shapes! U (chez-record-shapes-map))
+(set-protocol-methods! U (chez-protocol-methods-map))
+(set-optimize! #t)
+(set-direct-link-flag! #t)
+(evals "(def ilg-pt (->ILGPt 1 2))")
+
+(evals "(defn ilg-hinted [^ILGPt p] (:x p))")
+(ilg-emit "(defn ilg-hinted [^ILGPt p] (:x p))")
+(gate-check "the hinted callee bare-indexes its own field read"
+            (gate-sub? (ilg-emit "(defn ilg-hinted [^ILGPt p] (:x p))") "jrec2-f0") #t)
+(let ((e (ilg-emit "(defn ilg-uses-hinted [] (ilg-hinted ilg-pt))")))
+  (gate-check "the hinted callee is spliced" (gate-sub? e "ilg-hinted") #f)
+  (gate-check "a spliced ^Record param still bare-indexes" (gate-sub? e "jrec2-f0") #t)
+  (gate-check "and leaves no generic lookup behind" (gate-sub? e "jolt-get") #f))
+
+;; control: the SAME code without the hint. Nothing types the local, so the
+;; spliced read is generic -- which is what the rows above measure.
+(evals "(defn ilg-unhinted [p] (:x p))")
+(ilg-emit "(defn ilg-unhinted [p] (:x p))")
+(let ((e (ilg-emit "(defn ilg-uses-unhinted [] (ilg-unhinted ilg-pt))")))
+  (gate-check "control: no hint, no bare index" (gate-sub? e "jrec2-f0") #f)
+  (gate-check "control: no hint, generic lookup" (gate-sub? e "jolt-get") #t))
+
+;; --- a spliced fn literal still travels in a state image (jolt-giqc) --------
+;; A closure is written to an image through its RECORDED SOURCE: the back end
+;; registers (form, defining ns, free names) per anon literal, and restore
+;; compiles (fn* [free-names...] form) in that ns and applies it to the values
+;; recovered from the live closure by those names. A spliced copy broke both
+;; halves of the name assumption -- its binders are renamed and its captures may
+;; be the caller's locals or gone entirely -- so the pass used to drop the
+;; registration, and a fn `jolt run` dumped fine refused in a built binary.
+;;
+;; The rows below do the real round trip rather than match emitted text: the
+;; failure was never in how the lambda READ, it was in whether the image could
+;; rebuild it, and only writing and reading one answers that.
+(define (ilg-emit-ns src ns)
+  (emit (run-passes (analyze (make-analyze-ctx ns) (jolt-ce-read src))
+                    (make-analyze-ctx ns) U)))
+(define (ilg-eval scm) (eval (read (open-input-string scm)) (interaction-environment)))
+(define image-write! (var-deref "jolt.host" "image-write!"))
+(define image-read   (var-deref "jolt.host" "image-read"))
+(define image-scan   (var-deref "jolt.host" "image-scan"))
+(define (ilg-roundtrip clo path)
+  ;; guarded so a refusal reports as a failed row rather than aborting the gate
+  ;; before the rows after it run
+  (guard (e (#t 'image-refused))
+    (jolt-invoke2 image-write! path clo)
+    (jolt-invoke1 image-read path)))
+(define (ilg-call-restored clo path arg)
+  (let ((r (ilg-roundtrip clo path)))
+    (if (procedure? r) (jolt-invoke1 r arg) r)))
+
+;; the callee lives in its OWN namespace and its literal reads a var only that
+;; namespace can resolve -- so a registration recording the CALLER's ns would
+;; fail to compile at restore. That is what pins :src-ns.
+(jolt-compile-eval "(do (def ilg-base 100) (defn ilg-mk [n] (fn [y] (+ ilg-base n y))))"
+                   "ilglib")
+(ilg-emit-ns "(def ilg-base 100)" "ilglib")
+(ilg-emit-ns "(defn ilg-mk [n] (fn [y] (+ ilg-base n y)))" "ilglib")
+
+;; 1. a live capture, renamed by the splice: the closure holds the caller's own
+;;    local under a fresh name, and the registration has to say so.
+(ilg-eval (ilg-emit-ns "(defn ilg-app-live [q] (ilglib/ilg-mk (+ q 1)))" "ilgapp"))
+(let* ((clo (jolt-invoke1 (var-deref "ilgapp" "ilg-app-live") 9)))
+  (gate-check "spliced closure over a renamed local is live-correct"
+              (jolt-invoke1 clo 5) 115)
+  (gate-check "spliced closure over a renamed local is writable"
+              (jolt-count (jolt-invoke1 image-scan clo)) 0)
+  (gate-check "and restores to the same answer"
+              (ilg-call-restored clo "/tmp/jolt-gate-ilg-live.fasl" 5) 115))
+
+;; 2. a CONSTANT argument. Copy propagation folds it into the body, so the
+;;    compiled closure captures nothing at all and there is no variable left for
+;;    the inspector to report -- the value has to travel as data on the
+;;    registration instead. This is the shape the bug report opened with.
+(ilg-eval (ilg-emit-ns "(defn ilg-app-const [] (ilglib/ilg-mk 10))" "ilgapp"))
+(let* ((clo (jolt-invoke0 (var-deref "ilgapp" "ilg-app-const"))))
+  (gate-check "spliced closure over a folded constant is live-correct"
+              (jolt-invoke1 clo 5) 115)
+  (gate-check "spliced closure over a folded constant is writable"
+              (jolt-count (jolt-invoke1 image-scan clo)) 0)
+  (gate-check "and restores to the same answer"
+              (ilg-call-restored clo "/tmp/jolt-gate-ilg-const.fasl" 5) 115))
+
+;; 3. the capture list is only emitted when the copy actually differs. An
+;;    un-spliced literal registers exactly as it always did -- the registry
+;;    defaults the live names to the source names, and defaulting is `eq?`, so
+;;    this reads whether the fifth argument was emitted at all.
+(let ((reg (image-fn-form-lookup "jfn$ilglib$ilg-mk$0")))
+  (gate-check "the callee's own literal is registered" (vector? reg) #t)
+  (gate-check "an un-spliced registration carries no capture list"
+              (eq? (vector-ref reg 2) (vector-ref reg 3)) #t))
+;; 4. a literal the LANGUAGE owns stays unregistered even when it is spliced
+;;    into user code. clojure.* and jolt.* literals do not travel when they run
+;;    un-spliced (the seed emits no registration for them), and a copy of one is
+;;    still one of theirs -- registering it here would make a built binary dump
+;;    closures `jolt run` refuses, which is the same divergence in the other
+;;    direction. The callee's name is what the assertion reads, so the caller is
+;;    named so as not to contain it.
+(jolt-compile-eval "(do (defn sysmk [n] (fn [y] (+ n y))))" "jolt.ilgsys")
+(ilg-emit-ns "(defn sysmk [n] (fn [y] (+ n y)))" "jolt.ilgsys")
+(let ((e (ilg-emit-ns "(defn ilg-uses-sys [q] (jolt.ilgsys/sysmk q))" "ilgapp")))
+  (gate-check "a system-namespace callee is still spliced" (gate-sub? e "sysmk") #f)
+  (gate-check "but its literal is not registered"
+              (gate-sub? e "image-register-fn-form!") #f))
+;;    the positive control for the row above, same shape and a callee that only
+;;    differs in its namespace -- so the pair reads as the split it is testing.
+(let ((e (ilg-emit-ns "(defn ilg-uses-lib [q] (ilglib/ilg-mk q))" "ilgapp")))
+  (gate-check "an ordinary callee is spliced too" (gate-sub? e "ilg-mk") #f)
+  (gate-check "and its literal IS registered"
+              (gate-sub? e "image-register-fn-form!") #t))
+
+(let ((reg (image-fn-form-lookup "jfn$ilgapp$ilg-app-live$0")))
+  (gate-check "a spliced literal is registered at all" (vector? reg) #t)
+  (when (vector? reg)
+    (gate-check "a spliced registration carries one"
+                (eq? (vector-ref reg 2) (vector-ref reg 3)) #f)
+    (gate-check "and records the ns the form was WRITTEN in, not the call site's"
+                (vector-ref reg 1) "ilglib")))
+
+(set-direct-link-flag! #f)
+(set-optimize! #f)
+
 (gate-summary "inline-body")
