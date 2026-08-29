@@ -305,9 +305,30 @@
 ;; A pair now survives its chain's return, so the reporter validates the splice
 ;; against the compile-time callsite table (*callsites* / jolt-register-callsite!)
 ;; before accepting it (source-registry.ss jolt-site-splice?).
+;; A node the inline pass copied out of another fn carries :inline-chain — the
+;; logical frames between it and the physical fn it ended up in, innermost first
+;; (jolt.passes.inline stamp-inline). The marker carries the whole chain, so the
+;; reporter can name a spliced site after the fn it came from and still show every
+;; call site above it: a spliced callee has no procedure at runtime, so without
+;; this its frame is named after whatever it was spliced into and located at a
+;; line that fn does not contain.
+(defn- marker-safe-fqn? [q]
+  (and (string? q)
+       (not (or (str/includes? q "|") (str/includes? q "#") (str/includes? q "@")))))
+
+;; "@<fqn>@<line>" per chain entry, innermost first — or nil when the chain is
+;; absent or holds an fqn with one of the marker's own delimiters in it. A var
+;; name may contain almost anything, and a `|`, `#` or `@` would either close the
+;; block comment early (breaking the emitted Scheme) or split a field, so such a
+;; site emits the plain marker: unattributed, exactly as before, never malformed.
+(defn- inline-chain-suffix [node]
+  (let [ch (get node :inline-chain)]
+    (when (and (seq ch) (every? (fn [e] (marker-safe-fqn? (nth e 0))) ch))
+      (apply str (map (fn [e] (str "@" (nth e 0) "@" (nth e 1))) ch)))))
+
 (defn- with-site [node s]
   (if-let [l (and (trace-frames?) (node-line node))]
-    (str "#|L" l "|# " s)
+    (str "#|L" l (or (inline-chain-suffix node) "") "|# " s)
     s))
 
 ;; Source-map registration for a fn def: one hashtable insert at definition time,
@@ -1904,22 +1925,40 @@
 ;; chains at runtime and ballooned the heap on delegation-heavy code — every
 ;; mark op allocated; see rt.ss.) Self-tail calls never reach here (emit-call
 ;; elides them), so a tight self-loop stores once, not per iteration.
-(defn- sited-tail-call [site-qname line callee operand-strs]
+(defn- sited-tail-call
+  ([site-qname line callee operand-strs] (sited-tail-call site-qname line callee operand-strs nil))
+  ([site-qname line callee operand-strs inl-chain]
   (let [tts (mapv (fn [_] (fresh-label "_tt$")) operand-strs)
         binds (str/join " " (map (fn [t a] (str "(" t " " a ")")) tts operand-strs))
-        site (str "'(" (chez-str-lit site-qname) " . " line ")")]
+        ;; The cdr is the line, or #(line callee-fqn call-site-line) when this
+        ;; site is code the inline pass copied out of another fn — the same shape
+        ;; a trace marker carries, read back by the same accessors
+        ;; (source-registry jolt-marker-entry-*). Without it a tail site inside a
+        ;; spliced body reports the fn it was spliced INTO, at a line that fn does
+        ;; not contain: this is the path the continuation walk cannot cover,
+        ;; because the tail call erased the frame.
+        site (str "'(" (chez-str-lit site-qname) " . "
+                  (if (seq inl-chain)
+                    (str "#(" line " ("
+                         (str/join " " (map (fn [e] (str "(" (chez-str-lit (nth e 0))
+                                                         " . " (nth e 1) ")")) inl-chain))
+                         "))")
+                    (str line))
+                  ")")]
     (if (seq binds)
       (str "(let* (" binds ") (jolt-site! " site ") " (plain-call callee tts) ")")
-      (str "(begin (jolt-site! " site ") " (plain-call callee operand-strs) ")"))))
+      (str "(begin (jolt-site! " site ") " (plain-call callee operand-strs) ")")))))
 ;; Emit a call. In tail position with tracing on, a call to a DIFFERENT fn than
 ;; the enclosing one stores its site pair (sited-tail-call). Everything else —
 ;; non-tail calls, JOLT_TRACE=0, direct self-tail-calls — is a plain
 ;; application, byte-identical to untraced code.
-(defn- emit-call [tail? callee operand-strs line]
-  (if (and (trace-frames?) tail? *trace-site*
-           (not (contains? *trace-self* callee)))
-    (sited-tail-call *trace-site* line callee operand-strs)
-    (plain-call callee operand-strs)))
+(defn- emit-call
+  ([tail? callee operand-strs line] (emit-call tail? callee operand-strs line nil))
+  ([tail? callee operand-strs line inl-chain]
+   (if (and (trace-frames?) tail? *trace-site*
+            (not (contains? *trace-self* callee)))
+     (sited-tail-call *trace-site* line callee operand-strs inl-chain)
+     (plain-call callee operand-strs))))
 
 (defn- emit-invoke [node]
   (let [tail? *tail?*]           ; capture: children below emit non-tail
@@ -1928,6 +1967,11 @@
         arg-nodes (:args node)
         args (mapv emit arg-nodes)
         tl (or (node-line node) 0)
+        ;; the same stamp with-site folds into the marker; a TAIL site needs it in
+        ;; the site pair instead, because the call erases the frame the marker
+        ;; would have been read against (source-registry jolt-site-frame*)
+        ich (let [c (get node :inline-chain)]
+              (when (and (seq c) (every? (fn [e] (marker-safe-fqn? (nth e 0))) c)) c))
         ;; R2: record this site's static callee for the callsite table. Runs after
         ;; the args are emitted, so when a line carries both a call and its
         ;; operand's call the OUTER (later-emitted) callee wins — the tail call's.
@@ -1947,7 +1991,7 @@
                                 (str "jolt-invoke" (count args))
                                 "jolt-invoke")]
                    (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
-                                 (fn [operands] (emit-call tail? callee operands tl)))))]
+                                 (fn [operands] (emit-call tail? callee operands tl ich)))))]
     (cond
       ;; devirtualized protocol call: the inference proved the receiver (arg 0) is
       ;; one record type, so resolve the impl by that static tag instead of routing
@@ -2111,9 +2155,9 @@
             test (if (= 1 (count tmps)) tests (str "(and " tests ")"))]
         (str "(let* (" binds ") (if " test
              " (" fxop " " (str/join " " tmps) ")"
-             " " (emit-call tail? nop tmps tl) "))"))
+             " " (emit-call tail? nop tmps tl ich) "))"))
       ;; a generic native op.
-      nop (order-args (fn [as] (emit-call tail? nop as tl)))
+      nop (order-args (fn [as] (emit-call tail? nop as tl ich)))
       ;; (:k coll [default]) -> (jolt-get coll :k [default]) — the key (fnode) is a
       ;; const, so only the coll/default args carry order. When the inference typed
       ;; the receiver as a record whose declared fields include :k (it carries the
@@ -2158,7 +2202,7 @@
       ;; holds an arbitrary IFn -> dynamic dispatch.
       (= :local (:op fnode))
       (if (*known-procs* (munge-name (:name fnode)))
-        (order-args (fn [as] (emit-call tail? (munge-name (:name fnode)) as tl)))
+        (order-args (fn [as] (emit-call tail? (munge-name (:name fnode)) as tl ich)))
         (invoke))
       ;; closed-world direct call: the callee var is an app fn def already emitted
       ;; with a Scheme binding — apply it directly, no var lookup, no jolt-invoke.
@@ -2167,7 +2211,7 @@
       ;; below (which still uses the direct binding as the invoke target).
       (and (= :var (:op fnode)) (direct-linkable? (:ns fnode) (:name fnode))
            (direct-link-fn? (:ns fnode) (:name fnode)))
-      (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as tl)))
+      (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as tl ich)))
        ;; record ctor with matching arity: inline the native per-arity ctor
        ;; (make-jrecN) directly — desc + ext + one inline slot per field —
        ;; eliminating jolt-invoke / var-deref / rest-list / ctor call / hashtable
@@ -2445,11 +2489,33 @@
     ;; operand's own with-site store carries the line. The analyzer stamps :pos
     ;; on call forms, not on throw special forms, so the site line falls back to
     ;; the thrown expression's — (throw (ex-info …)) sits on one line.
+    ;; The chain comes from the same two places the line does — a :throw the
+    ;; inline pass copied carries it, and so does the expression it throws when
+    ;; the throw form itself was not stamped.
     :throw (let [line (or (node-line node) (node-line (:expr node)))
+                 ch (let [c (or (get node :inline-chain) (get (:expr node) :inline-chain))]
+                      (when (and (seq c) (every? (fn [x] (marker-safe-fqn? (nth x 0))) c)) c))
                  e (binding [*tail?* false] (emit (:expr node)))
-                 call (emit-call *tail?* "jolt-throw" [e] (or line 0))]
-             (if (and (trace-frames?) line)
-               (str "#|L" line "|# " call)
+                 call (emit-call *tail?* "jolt-throw" [e] (or line 0) ch)]
+             ;; A macro-built throw has no :pos — `assert` expands to one, and the
+             ;; app.util fixture reaches it through a user macro besides — so a
+             ;; site with a chain but no line still emits a marker, with line 0.
+             ;; 0 is not a line: srcreg-entry-frames drops it and the renderer
+             ;; falls back to the callee's DEFINING line. That is close to, but
+             ;; not always identical to, what the un-inlined build reports — there
+             ;; the frame is located by the nearest marker inside the callee's own
+             ;; compiled body, which for the app.util fixture is the macro's line
+             ;; (64) rather than the defn's (66). The frame is named correctly
+             ;; either way; only a macro-generated site whose neighbours were
+             ;; const-folded away can differ, and it differs by pointing at the fn
+             ;; instead of into the macro that wrote it.
+             ;;
+             ;; Without a chain the lineless case still emits nothing, because
+             ;; there the nearest enclosing marker is a better answer than 0.
+             (if (and (trace-frames?) (or line ch))
+               (str "#|L" (or line 0)
+                    (if ch (apply str (map (fn [x] (str "@" (nth x 0) "@" (nth x 1))) ch)) "")
+                    "|# " call)
                call))
      ;; numeric coercion. A :cast-fn (from a user (double x)/(long x)/… cast)
      ;; emits the checked runtime helper — clojure.core's full JVM semantics —

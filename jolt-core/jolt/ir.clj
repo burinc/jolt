@@ -160,6 +160,14 @@
 ;;  * the positions map-ir-children / reduce-ir-children recurse. A `?` marks an
 ;;    optional position recursed only when present.
 ;;
+;; :inline-chain — stamped by jolt.passes.inline on every node it copies out of a
+;; callee: a vector of [callee-fqn call-line] pairs, innermost first, naming the
+;; logical frames between this node and the physical fn it ends up inside. The
+;; back end folds it into the trace marker and the tail-site pair (backend_scheme
+;; with-site / sited-tail-call) so a backtrace reports a spliced call chain the
+;; way it reads without inlining. Carried on the node, not in a side table,
+;; because that is what survives the passes that rebuild nodes.
+;;
 ;; Annotation keys — optional, attached to any node by a later pass; a back end or
 ;; pass reads them but a node is valid without them. WHO attaches / reads each:
 ;;   :hint :shape :nilable   collection-type inference (jolt.passes.types) — the

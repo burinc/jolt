@@ -334,24 +334,23 @@ expect_match "execution continued past every catch" "$pst" 'DONE'
 # TCO-erased frame with its exact line — no marker files needed, the site
 # literals carry the lines. JOLT_TRACE=0 at BUILD time opts the binary out.
 #
-# A built binary also INLINES now (jolt-mbcm.6: splicing follows direct-linking,
-# which every non-dev build sets), and a spliced callee has no frame at runtime
-# to name -- there is no app.tail/boom procedure left. So the built trace here is
-# one frame where `jolt run` gives two. What survives, and what these rows pin,
-# is the THROWING LINE: the frame reports tail.clj:4, which is where the divide
-# is, attributed to the fn whose compiled body now contains it. Getting the
-# callee's name back needs an inline-range table the reporter can consult --
-# filed, not done. Do not "fix" these rows by matching app.tail/-main against a
-# looser line: line 4 is the whole assertion.
+# A built binary also INLINES (jolt-mbcm.6: splicing follows direct-linking, which
+# every non-dev build sets), and a spliced callee has no procedure left to name a
+# frame after. The trace reads the same anyway: the splicer stamps each copied
+# node with the chain of fns it came through, the emitter folds that into the
+# marker and the tail-site pair, and the reporter expands one physical frame back
+# into the logical ones (jolt-mbcm.7). These rows are that parity, so they assert
+# the SAME two frames the `jolt run` rows above do -- if inline attribution
+# regresses, the built binary reports app.tail/-main at line 4 and both fail.
 echo "trace smoke: a built binary traces by default"
 ( cd "$work" && "$joltabs" build -m app.tail -o tailbin >/dev/null 2>&1 )
 out_bt="$("$work/tailbin" 2>&1)"
-expect_match "built: an inlined thrower reports its exact line, under its caller" "$out_bt" 'app\.tail/-main (.*src/app/tail\.clj:4)'
-expect_no_match "built: the spliced callee has no frame of its own" "$out_bt" 'app\.tail/boom'
+expect_match "built: the spliced callee is named at its own line" "$out_bt" 'app\.tail/boom (.*src/app/tail\.clj:4)'
+expect_match "built: and its caller at the call site" "$out_bt" 'app\.tail/-main (.*src/app/tail\.clj:8)'
 
-# ...and where the callee is NOT spliceable, the built binary still names it,
-# exactly as `jolt run` does. Without this row the block above would pass even if
-# built-binary frame naming stopped working altogether.
+# The same shape where the callee CANNOT be spliced (^:redef stays var-routed):
+# a real frame, not a reconstructed one. Without this row the block above would
+# pass on a build that had stopped inlining altogether.
 ( cd "$work" && "$joltabs" build -m app.tailredef -o tailredefbin >/dev/null 2>&1 )
 out_rd="$("$work/tailredefbin" 2>&1)"
 expect_match "built: a ^:redef callee keeps its own frame at its line" "$out_rd" 'app\.tailredef/boom (.*src/app/tailredef\.clj:4)'
@@ -360,7 +359,7 @@ echo "trace smoke: JOLT_TRACE=0 at build time opts the binary out"
 ( cd "$work" && env JOLT_TRACE=0 "$joltabs" build -m app.tail -o tailbin0 >/dev/null 2>&1 )
 out_bt0="$("$work/tailbin0" 2>&1)"
 expect_match "untraced build: still reports the message" "$out_bt0" 'Unhandled exception: Divide by zero'
-expect_no_match "untraced build: no baked trace frames" "$out_bt0" 'app\.tail/-main (.*:4)'
+expect_no_match "untraced build: no baked trace frames" "$out_bt0" 'app\.tail/boom (.*:4)'
 
 if [ "$fails" -gt 0 ]; then
   echo "trace smoke: $fails failed, $pass passed"

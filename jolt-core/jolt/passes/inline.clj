@@ -205,6 +205,39 @@
       ;; every other op substitutes env uniformly into its children.
       :else (map-ir-children (fn [c] (subst c env)) node))))
 
+(defn- stamp-inline
+  "Record, on every node of a callee body, the logical frames a backtrace should
+  report for it — the inline equivalent of a DWARF inline record.
+
+  :inline-chain is a vector of [callee-fqn call-line] pairs, INNERMOST FIRST.
+  Each entry says \"the code here belongs to callee-fqn, which was called at
+  call-line of the next frame out\"; the last entry's call-line is a line in the
+  physical fn the whole thing ended up inside. Reading it back: the node's own
+  line locates the first entry's fn, entry i's call-line locates entry i+1's, and
+  the final call-line locates the physical fn (source-registry jolt-site-frame*).
+
+  APPENDS rather than overwrites, which is what makes nesting work. inline-node
+  runs bottom-up, so when C is spliced into P the body already carries whatever
+  chain an earlier splice into C left; appending [C at] puts P's view outside it.
+  deep-boom spliced into mid-boom spliced into -main ends up
+  [[deep-boom 70] [mid-boom 31]], and reports three frames.
+
+  `outer` is the chain the CALL SITE already carried, and it goes on the end of
+  every stamped node. Without it a splice into an already-spliced region loses
+  everything above the region: mid-boom is spliced into -main, the fixpoint then
+  splices deep-boom into that copy, and deep-boom's nodes would claim
+  [[deep-boom 70]] alone — naming -main at a line in another file.
+
+  Applied to the callee body BEFORE subst, never after: subst replaces params
+  with CALLER expressions, and those did not come from the callee — stamping the
+  result would attribute the caller's own code to it."
+  [node fqn at outer]
+  (let [n (if at
+            (assoc node :inline-chain
+                   (into (conj (or (get node :inline-chain) []) [fqn at]) outer))
+            node)]
+    (map-ir-children (fn [c] (stamp-inline c fqn at outer)) n)))
+
 (defn- trivial-arg? [n]
   ;; safe to substitute directly (immutable, free to duplicate): a local read or
   ;; a constant. Everything else is let-bound so it evaluates exactly once.
@@ -346,7 +379,13 @@
                             [env binds]))
                     env (nth res 0)
                     binds (nth res 1)
-                    rbody0 (subst body env)
+                    ;; stamp before substituting — see stamp-inline
+                    rbody0 (subst (stamp-inline body
+                                                (str (get f :ns) "/" (get f :name))
+                                                (let [p (get node :pos)]
+                                                  (when (map? p) (get p :line)))
+                                                (get node :inline-chain))
+                                  env)
                     ;; preserve the fn's ^double/^long return coercion.
                     rbody (if ret (coerce-node ret rbody0) rbody0)]
                 (mark!)
