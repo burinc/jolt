@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cross-compiled managed-runtime libraries.** `jolt build --library` now
+  composes with `--target` and `--target-pack`, retargeting the Scheme compile
+  through the pack's xpatch and linking the shared object with the target C
+  compiler, architecture flags, CSV files, and platform libraries. The target
+  pack's Chez kernel and static dependencies must be position-independent.
+  Cross `:jolt/native` static archives remain unsupported: build-time emission
+  must load them into the host process as well as link target code, so they need
+  separate host and target artifacts rather than a target linker flag alone.
+
 - **Reader macros: the `#` dispatch table is open for punctuation.** Clojure's
   is closed on principle, so `#$`, `#%`, `#|` and every other unclaimed
   `#<punct>` is "No dispatch macro for: …" there. `jolt.reader/set-dispatch-macro!`
