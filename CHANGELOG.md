@@ -97,8 +97,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Free: the forcer is a direct call where invoking the closure went through
   `jolt-invoke`, so the benchmark suite is unchanged (`bench/seqs` 1.00x).
 
-  Not yet covered: a chain already walked part-way, whose frontier is a
-  per-element cell rather than the producer that made it. Those still refuse.
+  A chain already walked part-way travels too: every seq cell carries the same
+  descriptor, not just the producer that made it. What still refuses is a lazy
+  seq from a `clojure.core` *overlay* fn — `cycle`, `repeatedly`, `map-indexed`
+  and the rest are fn literals in `clojure.core`, and the language's own
+  namespaces are not registered, the same limit that stops a `partial` or `comp`
+  closure travelling. That refusal names itself now instead of reporting an
+  anonymous `#<procedure>`, and says to realize the seq first.
+
+  Cost: `bench/seqs` 1.03x, the only benchmark of 22 outside 0.98–1.02x. The
+  per-element cell carries a two-slot descriptor where it used to carry a
+  closure. Measured against the previous release on one machine, min of 5
+  alternating runs.
+
+- **`jolt.image/scan` hung on an infinite unwritable sequence.** A finding
+  describes its object by printing it, and printing a lazy seq realizes it, so
+  scanning `(repeat :z)` never returned. Seqs are described by kind now.
 
 - **Synchronisation primitives travelled into state images as dead objects.** A
   record carrying a mutex or condition variable had no image walker of its own,
