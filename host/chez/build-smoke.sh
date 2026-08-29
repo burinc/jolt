@@ -299,24 +299,24 @@ if ! grep -q 'jolt-register-source!' "$out.build/flat.ss"; then
   echo "  FAIL: --direct-link did not emit source registrations"; exit 1
 fi
 boom_err="$(cd / && "$out" --boom 2>&1 >/dev/null)"
-# A direct-linked build INLINES (jolt-mbcm.6), and a spliced callee has no frame
-# at runtime to name -- deep-boom and mid-boom are both small enough to travel,
-# so this three-deep chain reports one frame where the --no-direct-link build
-# above reports three. That is the cost of splicing, recorded here rather than
-# papered over: what a direct-linked trace still gives you is the message and the
-# outermost frame, located.
-#
-# The three-frame assertion lives on the --no-direct-link build (see the
-# nodl_boom loop above), which does not splice -- that is what keeps per-frame
-# source mapping under test at all. Recovering the spliced names needs an
-# inline-range table the reporter can consult; filed, not done.
-if ! printf '%s' "$boom_err" | grep -q 'Assert failed: needs a number'; then
-  echo "  FAIL: stack trace lost the error message"
-  echo "--- got ----"; echo "$boom_err"
-  exit 1
-fi
-if ! printf '%s' "$boom_err" | grep -Eq 'app\.core/-main .*core\.clj:[0-9]'; then
-  echo "  FAIL: stack trace missing the located outermost frame"
+# A direct-linked build INLINES (jolt-mbcm.6): deep-boom is spliced into
+# mid-boom and mid-boom into -main, so all three of these frames come out of ONE
+# physical frame, reconstructed from the inline chain the splicer stamped
+# (jolt-mbcm.7). The --no-direct-link loop above asserts the same three without
+# splicing, so the two together are the parity claim: inlining must not change
+# what a backtrace says.
+for frame in 'app\.util/deep-boom .*util\.clj:[0-9]' 'app\.util/mid-boom .*util\.clj:[0-9]' 'app\.core/-main .*core\.clj:[0-9]'; do
+  if ! printf '%s' "$boom_err" | grep -Eq "$frame"; then
+    echo "  FAIL: stack trace missing located frame $frame"
+    echo "--- got ----"; echo "$boom_err"
+    exit 1
+  fi
+done
+# ...and in that order, innermost first. A chain reconstructed backwards would
+# still contain every frame and pass the loop above.
+if ! printf '%s' "$boom_err" | tr '\n' '|' \
+     | grep -q 'deep-boom.*mid-boom.*-main'; then
+  echo "  FAIL: reconstructed frames are not innermost-first"
   echo "--- got ----"; echo "$boom_err"
   exit 1
 fi
