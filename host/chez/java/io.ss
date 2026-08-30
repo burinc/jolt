@@ -1137,7 +1137,26 @@
     (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as a Writer.")))))
 
 ;; --- clojure.java.io ns -----------------------------------------------------
-(def-var! "clojure.java.io" "file" jolt-make-file)
+;; io/file is NOT the File constructor. It puts every child through
+;; as-relative-path, which throws on an absolute one, so (io/file "/a/b" "/c")
+;; raises where (File. "/a/b" "/c") happily answers "/a/b/c" -- both checked
+;; against the JVM. jolt registered io/file as jolt-make-file, which has no
+;; notion of a child, so the absolute one was silently joined.
+;;
+;; Normalization alone would have HIDDEN this rather than fixed it: joining
+;; "/a/b" and "/c" produces "/a/b//c", which now collapses to "/a/b/c" and looks
+;; like a correct answer to a call the JVM rejects.
+(define (io-file-relative-child c)
+  (let ((s (file-path-of c)))
+    (when (and (fx>? (string-length s) 0) (char=? (string-ref s 0) #\/))
+      (throw-jvm (quote IllegalArgumentException)
+                 (string-append s " is not a relative path")))
+    s))
+(define (jolt-io-file a . rest)
+  (if (null? rest)
+      (jolt-make-file a)
+      (apply jolt-make-file a (map io-file-relative-child rest))))
+(def-var! "clojure.java.io" "file" jolt-io-file)
 ;; io/as-file of a file: URL yields the file it points at (JVM: new
 ;; File(url.toURI())); a URL with any other protocol has no filesystem path —
 ;; IllegalArgumentException, as the JVM's File(URI) throws.

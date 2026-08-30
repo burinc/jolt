@@ -66,6 +66,26 @@
 (check "(io/file dup)" (.getPath (io/file "/a//b")) "/a/b")
 (check "(io/as-file trailing)" (.getPath (io/as-file "/a//b/")) "/a/b")
 
+;; --- io/file's as-relative-path contract -------------------------------------
+;; io/file is not the File constructor. Clojure puts every child through
+;; as-relative-path, which throws on an absolute one, while the two-arg
+;; constructor above joins it. Normalization alone would have hidden this:
+;; joining "/a/b" and "/c" gives "/a/b//c", which collapses to a plausible
+;; "/a/b/c" answer to a call the JVM rejects.
+
+(defn- raises-not-relative? [f]
+  (try (f) false
+       (catch IllegalArgumentException e
+         (boolean (re-find #"is not a relative path" (.getMessage e))))))
+
+(check "(io/file parent absolute-child) raises"
+       (raises-not-relative? #(io/file "/a/b" "/c")) true)
+(check "(io/file parent child absolute-more) raises"
+       (raises-not-relative? #(io/file "/a" "b" "/c")) true)
+;; a child with an interior separator is still relative, and joins
+(check "(io/file parent nested-relative-child)" (.getPath (io/file "/a" "b/c")) "/a/b/c")
+(check "(io/file relative relative)" (.getPath (io/file "a" "b")) "a/b")
+
 ;; --- the route in ------------------------------------------------------------
 ;; createTempFile builds its path from $TMPDIR, which ends in "/" on macOS. It
 ;; also builds its jfile directly rather than through the constructor, which is
