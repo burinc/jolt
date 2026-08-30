@@ -533,8 +533,10 @@
   (guard (e (#t #f))
     (let* ((info (sa-procedure-info x))
            (nm (and info (car info))))
+      ;; No prefix test: an anonymous literal is bound under jfn$..., a NAMED one
+      ;; under <name>$jf<n>, and the registry lookup is the real question either
+      ;; way -- a name nothing registered simply misses.
       (and (string? nm)
-           (image-string-prefix? nm "jfn$")
            (let ((reg (image-fn-form-lookup nm)))
              (and reg (cons nm reg)))))))
 
@@ -844,9 +846,16 @@
                            (if (image-rebuild-mode? mode)
                                (image-fnsrc-build x v walk memo path
                                                   (if (eq? mode 'rebuild-stub) make-stub #f))
+                               ;; the REAL walk, not a stub: a captured value can
+                               ;; itself be unwritable (a letfn fn a lazy-seq
+                               ;; thunk closes over), and passing (lambda (fv p) #t)
+                               ;; meant scan never looked -- it reported a value
+                               ;; clean that dump then refused, which is exactly
+                               ;; the scan/dump disagreement the shared verdict
+                               ;; above exists to prevent.
                                (let ((probe (image-recover-free-values
                                               x (vector-ref (cdr v) 2) (vector-ref (cdr v) 3)
-                                              (lambda (fv p) #t) path)))
+                                              walk path)))
                                  (hashtable-set! memo x #t)
                                  (if (vector? probe)
                                      #t
