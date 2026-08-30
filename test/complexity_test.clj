@@ -60,19 +60,39 @@
         (/ (* (double n) 1e9) (double (max 1 elapsed)))
         (recur (+ n b) (+ elapsed (timed #(dotimes [_ b] (f)))))))))
 
-(defn- best-of
-  "The BEST rate of k rounds: a GC pause or a descheduled slice can only make a
-  round look slower, so the fastest one is the least contaminated estimate."
-  [k f]
-  (f)                                     ; warm
-  (reduce max (map (fn [_] (rate f)) (range k))))
+(def ^:private rounds 3)
+
+(defn- paired
+  "Measure both arms in the SAME round, k times, and keep the round whose ratio
+  is smallest — that is, the least contaminated pairing. Returns [ratio r1 r4].
+
+  Measuring the arms separately and dividing their bests is not equivalent, and
+  the difference is not academic: the two bests can come from different moments,
+  and a loaded runner does not slow the arms equally. The 4n arm holds a working
+  set four times larger, so it loses more to cache pressure and to GC — one CI
+  run read n only 1.2x slower than a quiet machine while 4n was 2.2x slower, and
+  the row failed at 2.15 against a 2.0 ceiling on a build where the operation is
+  flat. Pairing cancels whatever both arms share in a round; what survives is the
+  part that scales with n, which is the whole question. A genuinely linear
+  operation still reads ~4.0 in every round, so nothing is masked."
+  [f1 f4]
+  (f1) (f4)                               ; warm both
+  (reduce (fn [a b] (if (< (first b) (first a)) b a))
+          (map (fn [_]
+                 (let [r1 (rate f1)
+                       r4 (rate f4)]
+                   [(/ r1 (max 1.0 r4)) r1 r4]))
+               (range rounds))))
 
 (def ^:private failures (atom 0))
 
-(defn- judge [label r1 r4 detail]
+;; Takes the two arms as THUNKS, not as rates: the pairing above is the point,
+;; and a caller that measured them itself could hand over two numbers from
+;; different moments without it being visible here.
+(defn- judge [label f1 f4 detail]
   ;; Rates, so the SLOWER arm is the smaller number and the ratio keeps the same
   ;; sense it always had: flat ~1.0, linear ~4.0.
-  (let [ratio (/ r1 (max 1.0 r4))]
+  (let [[ratio r1 r4] (paired f1 f4)]
     (println (format "complexity %-22s %10.0f ops/s at n, %10.0f at 4n, ratio %5.2f (flat ~1.0, linear ~4.0, ceiling %.1f)"
                      label r1 r4 ratio max-ratio))
     (when (> ratio max-ratio)
@@ -98,28 +118,28 @@
       (System/exit 1))
 
     (judge "count vector-seq"
-           (best-of 3 #(count s1))
-           (best-of 3 #(count s2))
+           #(count s1)
+           #(count s2)
            "count is walking a vector-backed seq instead of subtracting its index from the backing vector's count (collections.ss)")
 
     (judge "drop vector-seq"
-           (best-of 3 #(drop (- n1 5) s1))
-           (best-of 3 #(drop (- n2 5) s2))
+           #(drop (- n1 5) s1)
+           #(drop (- n2 5) s2)
            "drop is stepping instead of jumping to the index (jolt-drop, seq.ss)")
 
     (judge "rseq vector"
-           (best-of 3 #(rseq v1))
-           (best-of 3 #(rseq v2))
+           #(rseq v1)
+           #(rseq v2)
            "rseq is materializing the vector — Clojure documents it as constant time (jolt-rseq, natives-seq.ss)")
 
     (judge "first sorted-map"
-           (best-of 3 #(first sm1))
-           (best-of 3 #(first sm2))
+           #(first sm1)
+           #(first sm2)
            "first on a sorted map is materializing the tree instead of walking to its leftmost node (25-sorted.clj :first, routed via host-table.ss)")
 
     (judge "first sorted-set"
-           (best-of 3 #(first ss1))
-           (best-of 3 #(first ss2))
+           #(first ss1)
+           #(first ss2)
            "first on a sorted set is materializing the tree instead of walking to its leftmost node (25-sorted.clj :first)")
 
     ;; nth's values, but deliberately NOT its cost.
@@ -166,13 +186,18 @@
                      (= (dec n1) (get m1 (dec n1))) (nil? (get m1 -1)))
         (println "FAIL complexity transient-write-few: wrong values before timing")
         (System/exit 1))
-      ;; This row is why the arms are sized by TIME rather than by a rep count:
-      ;; at 200 reps the small arm measured ~1ms, under the CI noise floor, and
-      ;; one GC pause in the 4n arm read 2.06 against the 2.0 ceiling on a shared
-      ;; runner (fixed sits ~1.1, broken ~4.0). The budget does that sizing now.
+      ;; This row is the one that keeps finding the harness's weak spots, because
+      ;; its arms differ in WORKING SET (a 50k map against a 200k one) and not
+      ;; just in iteration count. First it was sized by a rep count, and the small
+      ;; arm measured ~1ms — under the noise floor — so one GC pause read 2.06
+      ;; against the 2.0 ceiling; the arms are sized by TIME now. Then, still,
+      ;; a loaded runner read 2.15, because the bigger arm loses more to a busy
+      ;; machine than the smaller one and the arms were measured at different
+      ;; moments; `paired` above measures them together. Fixed sits ~1.1 (~0.8
+      ;; unloaded), broken ~4.0.
       (judge "transient write-few"
-             (best-of 3 #(touch m1))
-             (best-of 3 #(touch m2))
+             #(touch m1)
+             #(touch m2)
              "persistent! is rebuilding the whole map instead of freezing only the nodes the writes claimed (transients.ss jolt-persistent!, collections.ss enode-freeze)"))
 
     (if (pos? @failures)
