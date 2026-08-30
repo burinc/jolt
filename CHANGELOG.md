@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.29] - 2026-08-30
+
+Two threads. Splicing a `defn` body at a call site follows **linkage** now
+rather than a build flag, so every non-dev build inlines — and the round that
+made that true shook four bugs out of the inline pass, every one of which an
+`--opt` build could already hit.
+
+The other is state images. `jolt.image` wrote maps, vectors and records, and
+quietly could not write most of the rest of the language: a `promise` or an
+`agent` came back holding dead OS primitives that worked until something waited
+on them, a lazy sequence from `map` refused outright, a multimethod had its
+dispatch tables walked and refused at a raw hashtable, and every closure
+`clojure.core` made — `partial`, `comp`, `memoize`, `cycle` — refused because
+core's fn literals were never recorded. That last one was written up as a limit
+of the *format*; it was a limit of the build. Images round-trip every value kind
+the language has now, or refuse by name and say what to do about it.
+
 ### Added
 
 - **Every non-dev build inlines, and the seed's var references are hoisted.**
@@ -75,6 +92,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs unchanged.
 
 ### Fixed
+
+- **A socket read could answer EOF on a live connection, under load.**
+  `jolt.socket`'s syscall wrapper read `errno` *after* the call, and twice — once
+  to ask about `EINTR`, once about `EAGAIN`. `errno` survives only until the next
+  thing that can set it, and reading it is itself a foreign call, so the two
+  questions were not about the same value: under CPU load `recv`'s `EAGAIN` (35)
+  read back as `ENOMEM` (12) often enough to matter. The retry branch was missed,
+  the `-1` fell through, and the read reported end-of-stream on a connection that
+  was simply not ready yet. Callers saw a socket close for no reason — inside a
+  `go` block, an exception and a channel that closed with no value.
+
+  `errno` is captured once now, at the syscall, and the branch reads that value;
+  the same for `connect`. Measured on the poller stress case: 13 of 60 runs under
+  load before, 0 of 100 after. `make errnocheck` fails if a syscall wrapper asks
+  twice again — the two spellings are indistinguishable in review, and this one
+  presented as a lost poller registration, which sent the search to the wrong
+  subsystem entirely.
 
 - **A closure `clojure.core` made could not be written to a state image.**
   `partial`, `comp`, `memoize`, `juxt`, `fnil`, `complement`, and every lazy
@@ -360,6 +394,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `java.lang.String`'s registration. Feature detection — which is what `resolve`
   on a class name is for — read that as "this class is present" and took the
   branch. Answers `nil` now, like the JVM.
+
+### Performance
+
+- **`bench/seqs` is 1.03x slower**, the only benchmark of 22 outside 0.98–1.02x.
+  Every lazy sequence cell carries a two-slot descriptor of the producer that
+  made it where it used to carry a closure — which is what lets a lazy sequence
+  travel in a state image unforced, walked or not. Measured against the previous
+  release on one machine, min of 5 alternating runs.
+
+- **A built binary is about 1MB larger** (roughly 4%). `clojure.core`'s fn
+  literals now record their source so core's closures can travel, which grows
+  the seed prelude from 1.30MB to 1.75MB and the compiler image from 833KB to
+  1.04MB. Startup is unchanged — 0.1806s against 0.1819s, min of 5 — because
+  the registrations are hashtable inserts, not work.
+
+- App-to-app calls are about 1.70x faster in a default release build, and
+  `clojure.core` no longer re-resolves var names at each reference. See the
+  inlining entry under Added for the per-benchmark figures.
 
 ### Internal
 
