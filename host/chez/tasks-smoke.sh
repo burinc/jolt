@@ -23,6 +23,7 @@ JOLT="${JOLT_BIN:-bin/jolt}"
 BB="$root/test/chez/tasks/bbproj"
 BOTH="$root/test/chez/tasks/both"
 DEPS="$root/test/chez/tasks/depsonly"
+NAT="$root/test/chez/tasks/native"
 pass=0; fail=0
 export JOLT_NO_USER_DEPS=1
 # babashka.tasks/jolt (and `clojure`, its babashka name) re-invokes the jolt
@@ -47,6 +48,31 @@ check() { # label expected actual
 # on its own.
 inbb()   { d="$1"; shift; JOLT_PWD="$d" JOLT_QUIET=1 "$JOLT" "$@" 2>&1; }
 status() { d="$1"; shift; JOLT_PWD="$d" JOLT_QUIET=1 "$JOLT" "$@" >/dev/null 2>&1; echo $?; }
+
+# --- a build task for a :jolt/native library that does not exist yet ----------
+# A project whose native/ holds C sources names the .so/.dylib built from them in
+# :jolt/native, so on a fresh checkout the library is missing until a task builds
+# it. Applying the project used to load the natives strictly first, which made
+# that task impossible to run: the build step needed its own output. A task run
+# warns instead.
+out="$(inbb "$NAT" build-native)"
+case "$out" in *compiled*) r=yes ;; *) r="no: $out" ;; esac
+check "a task runs when its :jolt/native library is not built yet" "yes" "$r"
+check "...and exits 0" "0" "$(status "$NAT" build-native)"
+case "$out" in *warning:*nope*) r=yes ;; *) r="no: $out" ;; esac
+check "...having said which library was missing" "yes" "$r"
+
+# Everything that is not a task still refuses to start without it.
+check "a run still fails on a missing required native" "1" \
+  "$(s=$(status "$NAT" -M:go); [ "$s" = 0 ] && echo 0 || echo 1)"
+
+# The candidate is a PATH (it has a separator), so it belongs to the project, not
+# to whatever directory jolt was started from — bin/jolt cd's to its own tree, so
+# resolving against the current directory looked in the wrong place and reported
+# the library missing even when it was built.
+out="$(inbb "$NAT" -M:go)"
+case "$out" in *"$NAT/native/libnope."*) r=yes ;; *) r="no: $out" ;; esac
+check "a relative :jolt/native path resolves against the project" "yes" "$r"
 
 # --- bb.edn task bodies ------------------------------------------------------
 
