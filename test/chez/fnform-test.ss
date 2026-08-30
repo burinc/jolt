@@ -90,9 +90,15 @@
 (ok "captured calls" (eqv? ((var-deref "app" "captured") 7) 17))
 (ok "shadowed calls" (eqv? ((var-deref "app" "shadowed") 2) 101))
 
-;; --- system gate: a clojure.core-produced closure has no jfn$ name ---
+;; --- clojure.core's own literals are registered too ---
+;; They used to be excluded, so the seed prelude would stay byte-identical across
+;; a mint -- and the consequence was that a closure core made (partial, comp, a
+;; lazy seq from an overlay fn) could not be written to a state image at all.
+;; Now core carries its source like any other namespace: the closure partial
+;; returns is a registered literal, with a name and a registration to match.
 (define pn (closure-name (var-deref "app" "p")))
-(ok "partial closure not jfn$-named" (or (not pn) (not (string-prefix? pn "jfn$"))))
+(ok "a partial closure IS named" (and pn (string-prefix? pn "jfn$")))
+(ok "...and its name resolves to a registration" (vector? (image-fn-form-lookup pn)))
 
 
 ;; a macro can splice a LIVE value (here the namespace object) into a fn body;
