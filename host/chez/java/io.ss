@@ -13,7 +13,37 @@
 ;; natives-meta.ss / records.ss / printing.ss (jolt-type / instance-check /
 ;; jolt-str-render-one, which it extends).
 
-(define-record-type jfile (fields path) (nongenerative jolt-jfile-v1))
+;; Every JVM File constructor runs its path through FileSystem.normalize(), so a
+;; File's path is ALWAYS normalized: runs of "/" collapse to one and a trailing
+;; "/" is dropped. "." and ".." are left alone -- the constructor does not resolve
+;; those, and neither does this. new File("/a/b//c").getPath() is "/a/b/c".
+;;
+;; Applied in the record's protocol rather than at the call sites, because there
+;; are nine of them and only one is the constructor entry point: as-file, the
+;; file: URL coercion, createTempFile, getParentFile and listRoots all build a
+;; jfile directly. The invariant belongs where it cannot be bypassed by the next
+;; one added.
+(define (jolt-path-normalize p)
+  (let ((n (string-length p)))
+    (if (fx=? n 0)
+        p
+        (let ((out (make-string n)))
+          (let loop ((i 0) (j 0) (prev-slash? #f))
+            (if (fx=? i n)
+                ;; a trailing separator goes, but "/" is a path, not an empty one
+                (let ((j (if (and (fx>? j 1) (char=? (string-ref out (fx- j 1)) #\/))
+                             (fx- j 1)
+                             j)))
+                  ;; nothing collapsed and nothing trimmed -> hand back the
+                  ;; original rather than an identical copy
+                  (if (fx=? j n) p (substring out 0 j)))
+                (let ((c (string-ref p i)))
+                  (cond ((and (char=? c #\/) prev-slash?) (loop (fx+ i 1) j #t))
+                        (else (string-set! out j c)
+                              (loop (fx+ i 1) (fx+ j 1) (char=? c #\/)))))))))))
+
+(define-record-type jfile (fields path) (nongenerative jolt-jfile-v1)
+  (protocol (lambda (new) (lambda (p) (new (jolt-path-normalize p))))))
 (define (jolt-file? x) (jfile? x))
 
 ;; path string of any value: a jfile -> its path, else its str rendering.
