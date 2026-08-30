@@ -721,6 +721,16 @@ fi
 # run` compiles the source at require time and masks it entirely.
 ffiapp="$root/test/chez/ffi-app"
 ffiout="$(dirname "$out")/ffi-app-bin"
+ffiout_source="$(dirname "$out")/ffi-app-source-bin"
+# Force the source-mode ordering that exposed #756 again: load jolt.ffi into the
+# driver process before build.ss snapshots the runtime image. A correct snapshot
+# still emits jolt.ffi into the app; a late snapshot leaves layout-size UNBOUND.
+if ! JOLT_PWD="$ffiapp" "$root/bin/jolt" build -m ffiapp.main -o "$ffiout_source" >/dev/null 2>&1; then
+  echo "  FAIL: source-mode jolt build of a preloaded jolt.ffi app exited non-zero"; exit 1
+fi
+if [ "$(cd / && "$ffiout_source" 2>&1 | tail -1)" != "FFI-APP 8 4 4 2.5 true" ]; then
+  echo "  FAIL: source-mode build skipped the preloaded jolt.ffi Clojure layer"; exit 1
+fi
 if ! JOLT_PWD="$ffiapp" "$jolt" build -m ffiapp.main -o "$ffiout" >/dev/null 2>&1; then
   echo "  FAIL: jolt build of a jolt.ffi app exited non-zero"; exit 1
 fi

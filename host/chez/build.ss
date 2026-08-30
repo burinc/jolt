@@ -955,10 +955,12 @@
           (bld-walk-files root "" '()))))
     (bld-strs embed-dirs)))
 
-;; Namespaces already defined at boot in the BUILD process (snapshotted before
-;; step 1 loads anything) — the driver image's set. bld-require-closure still
-;; skips these as preloaded; only LAZY stdlib (not in the image) is emitted.
-(define bld-boot-loaded #f)
+;; Namespaces defined in the runtime image before the CLI loads jolt.main and
+;; its require closure. By the time build-binary is called, jolt.main has loaded
+;; jolt.ffi and other lazy stdlib namespaces into THIS process, but those are not
+;; in the app image being written. Re-snapshotting loaded-ns there silently
+;; leaves their vars interned but UNBOUND in a source-mode-built app/library.
+(define bld-boot-loaded (ldr-runtime-image-ns-copy))
 
 ;; --- the build --------------------------------------------------------------
 ;; entry-ns: the app's main namespace (a string). out-path: the binary to write.
@@ -1208,8 +1210,6 @@
     (bld-preload-static-natives! natives (string-append out-path ".build")))
    ;; 1. record app namespaces in dependency order as they finish loading.
    (let ((app-order '()))
-     (set! bld-boot-loaded
-       (hashtable-copy loaded-ns #f))
      (set-ns-loaded-hook!
       (lambda (name file) (set! app-order (cons (cons name file) app-order))))
     (ei-mark! "startup")

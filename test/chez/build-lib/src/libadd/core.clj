@@ -1,10 +1,14 @@
 (ns libadd.core
   (:require [jolt.ffi :as ffi]))
 
-(defn add [x y] (+ x y))
+(def point-layout (ffi/layout [:struct [[:x :float] [:y :float]]]))
 
-;; Publish `add` as a C-callable entry point named "add". An embedder resolves it
-;; via jolt_lookup("add") after jolt_library_init. export! runs at the library's
-;; top-level (during heap build), so it is available before jolt_library_init
-;; returns.
+(defn add [x y] (+ x y))
+(defn point-size [] (ffi/layout-size point-layout))
+
+;; Publish scalar controls and a function that calls the Clojure half of
+;; jolt.ffi. The latter catches a source-mode build driver mistaking jolt.ffi,
+;; loaded by jolt.main in the build process, for code inherited by this distinct
+;; library image: that leaves layout-size interned but UNBOUND at invocation.
 (ffi/export! "add" add [:int :int] :int)
+(ffi/export! "point_size" point-size [] :int)
