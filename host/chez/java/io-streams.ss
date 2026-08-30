@@ -867,7 +867,10 @@
             ((char=? (string-ref p i) #\/) (mkdirs! (substring p 0 i)))
             (else (loop (- i 1)))))))
 (define (apply-make-file-path args)
-  (jfile-path (apply jolt-make-file args)))
+  ;; the JVM's make-parents builds (-> f as-file (apply file more) ...), so it
+  ;; carries io/file's as-relative-path contract: an absolute child throws
+  ;; here, it is not quietly joined the way the bare constructor would
+  (jfile-path (apply jolt-io-file args)))
 (def-var! "clojure.java.io" "make-parents" jio-make-parents)
 
 ;; io/delete-file: delete the file; raise unless :silently truthy.

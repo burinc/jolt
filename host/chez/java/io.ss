@@ -1146,16 +1146,24 @@
 ;; Normalization alone would have HIDDEN this rather than fixed it: joining
 ;; "/a/b" and "/c" produces "/a/b//c", which now collapses to "/a/b/c" and looks
 ;; like a correct answer to a call the JVM rejects.
-(define (io-file-relative-child c)
-  (let ((s (file-path-of c)))
-    (when (and (fx>? (string-length s) 0) (char=? (string-ref s 0) #\/))
+;; as-relative-path is Clojure's own coercion, and on the JVM it goes through
+;; as-file FIRST: normalize(child) is what .isAbsolute sees, so the thrown
+;; message names the normalized path -- (io/file "/a/b" "//c") says
+;; "/c is not a relative path", not "//c". io-file-relative-child checked the
+;; raw string, so the accept/reject set was right but the message diverged.
+;; Registered as io/as-relative-path too: public API in clojure.java.io on
+;; the JVM, and missing here entirely before.
+(define (jolt-as-relative-path x)
+  (let ((p (jfile-path (make-jfile (file-path-of x)))))
+    (when (and (fx>? (string-length p) 0) (char=? (string-ref p 0) #\/))
       (throw-jvm (quote IllegalArgumentException)
-                 (string-append s " is not a relative path")))
-    s))
+                 (string-append p " is not a relative path")))
+    p))
+(def-var! "clojure.java.io" "as-relative-path" jolt-as-relative-path)
 (define (jolt-io-file a . rest)
   (if (null? rest)
       (jolt-make-file a)
-      (apply jolt-make-file a (map io-file-relative-child rest))))
+      (apply jolt-make-file a (map jolt-as-relative-path rest))))
 (def-var! "clojure.java.io" "file" jolt-io-file)
 ;; io/as-file of a file: URL yields the file it points at (JVM: new
 ;; File(url.toURI())); a URL with any other protocol has no filesystem path —
