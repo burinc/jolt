@@ -62,6 +62,19 @@ stays authoritative.
   not work at all under `bin/jolt`, which exports `JOLT_PWD` and then changes to
   its own tree. A "not found" error names the resolved path now.
 
+- **A build through `bin/jolt` dropped stdlib Clojure code the CLI had already
+  loaded.** `jolt.ffi` and `jolt.mvn-http` come into the driver process on the
+  way to a build, and the build read its own loaded set as the set the new image
+  inherits — so their Clojure half was never emitted, and calling
+  `jolt.ffi/layout-size` from the built executable or library died with
+  "Attempting to call unbound fn". `jolt run` masked it by compiling the source
+  at require time. The preloaded set now comes from the runtime image
+  (snapshotted in `loader.ss`, before the CLI loads anything) instead of from the
+  build process. Builds through a release binary were already correct — baking
+  the CLI closure into the image records the same distinction — so this only hit
+  builds driven from a checkout. Diagnosed and fixed by @jasalt in #787, found
+  while getting an aggregate-ABI raylib binding to run on Android.
+
 ## [0.7.29] - 2026-08-30
 
 Two threads. Splicing a `defn` body at a call site follows **linkage** now
