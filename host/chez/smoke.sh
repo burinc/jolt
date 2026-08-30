@@ -586,17 +586,39 @@ else
   # tear the evidence down — to say which stage dropped the wakeup: still :pending
   # (never drained), waiters parked with no event (kernel set), or ready with no
   # waiters (resume lost). `tail -1` kept only the verdict and discarded exactly
-  # that, which is why the one occurrence on record (1 of 8 in round 29, during a
-  # make test run, not reproducible in ~105 runs since — isolated, 8-way
-  # concurrent, and under full CPU load) cannot be attributed to a stage.
+  # that, which is why the first occurrence on record could not be attributed to
+  # a stage.
   #
-  # A wedge or a throw prints no POLLER-DEBUG at all, so fall back to the tail
-  # rather than reporting nothing.
-  if printf '%s' "$pr_out" | grep -q '^POLLER'; then
-    printf '%s\n' "$pr_out" | grep '^POLLER' | sed 's/^/    /'
-  else
-    printf '%s\n' "$pr_out" | tail -3 | sed 's/^/    /'
-  fi
+  # WHAT THIS ACTUALLY CAUGHT (2026-08-30). Not a lost registration: the poller
+  # was innocent every time. jolt.socket's io-call read errno AFTER the syscall,
+  # and twice -- once for EINTR, once for EAGAIN. errno survives only until the
+  # next thing that can set it, and reading it is itself a foreign call, so under
+  # load recv's EAGAIN (35) read back as ENOMEM (12): the retry branch was missed,
+  # the -1 fell through, and do-recv answered EOF on a live connection. The go
+  # block then threw on (String. b 0 -1 "UTF-8"), its channel closed empty, and
+  # alts!! returned nil instantly -- which this case reports as a lost
+  # registration. 13 of 60 runs under load; 0 of 100 with errno captured at the
+  # syscall. Guarded now by host/chez/errno-check.sh.
+  #
+  # Two things worth keeping from the hunt. The failing run is FASTER than a
+  # passing one (it stops at the losing round) and no timeout elapses -- that is
+  # what says "channel closed empty", not "wakeup lost". And the exception was in
+  # the captured output all along; the tail -1 that this block replaced is what
+  # hid it.
+  #
+  # To reproduce the class: saturate the CPU (eight background
+  # `jolt -e '(reduce + (map inc (range 3000000)))'` loops) and run this case in a
+  # loop. On an idle machine it is ~0 in 145 runs, which is why it only ever
+  # appeared inside a parallel `make test`. Instrumenting the case itself changes
+  # the answer -- a probe in one-round took 6-of-60 to 0-of-60 -- so measure the
+  # rate before concluding anything from a quiet run, and probe the runtime
+  # rather than the workload.
+
+  # EVERYTHING, not just the POLLER lines. The cause turned out to be an
+  # exception printed by the go block ("Exception in go/fiber body (channel
+  # closed)"), which a ^POLLER filter drops on the floor — the same mistake as
+  # the tail -1 this replaced, one level up.
+  printf '%s\n' "$pr_out" | sed 's/^/    /' 
   fails=$((fails + 1))
 fi
 

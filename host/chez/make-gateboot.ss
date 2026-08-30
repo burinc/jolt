@@ -67,6 +67,10 @@
   (for-each (lambda (entry) (bld-inline-line (gb-entry-line entry) out 0)) gb-entries)
   (close-port out))
 
+;; The staleness predicate AND its content hash, so the list this writes is
+;; hashed by exactly the function that will check it.
+(load "host/chez/gate-boot-fresh.ss")
+
 ;; --- input list (for run-gate-harness.ss's staleness check) -----------------
 ;; The transitive load closure of the preamble entries — the same walk
 ;; make-devboot uses, restricted to the prefix. Written before compiling, so a
@@ -88,7 +92,16 @@
 (define gb-pid (number->string (get-process-id)))
 (let* ((tmp (string-append gb-inputs "." gb-pid ".tmp"))
        (out (open-output-file tmp 'replace)))
-  (for-each (lambda (p) (put-string out p) (put-string out "\n")) (gb-collect-paths))
+  ;; "<hash> <path>": the freshness question is whether an input still has the
+  ;; content that went into the image, which mtime cannot answer (see
+  ;; gate-boot-fresh.ss). Hashed with that file's own function, loaded below, so
+  ;; writer and reader cannot drift.
+  (for-each (lambda (p)
+              (put-string out (gate-boot-hash-string p))
+              (put-string out " ")
+              (put-string out p)
+              (put-string out "\n"))
+            (gb-collect-paths))
   (close-port out)
   (when (file-exists? gb-inputs) (delete-file gb-inputs))
   (rename-file tmp gb-inputs))
