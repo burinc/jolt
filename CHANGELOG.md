@@ -101,6 +101,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `set!`-extended after their `def-var!` so the procedure you get was never the
   one recorded.
 
+- **Ten `clojure.core` fns could not be written to a state image when used as a
+  VALUE.** `seq`, `get`, `nth`, `peek`, `pop`, `min`, `max`, `mod`, `rem` and
+  `quot`, plus `bit-and`/`bit-or`/`bit-xor`/`some?` — so `(tree-seq branch? seq
+  root)` refused, and so would `(map seq colls)`. A core fn in value position
+  compiles to the runtime's own procedure rather than the var's root, and an
+  image writes a procedure as its var name; `def-var!` records that name for the
+  procedure it was handed, but these are `set!`-extended afterwards (lazy
+  sequences taught to `seq`, arrays to `nth`, the checked numeric layer taking
+  over `min` and `quot`), and the extension was a new procedure nothing named.
+
+  The names are re-registered after every extension has run. `make coreproc`
+  sweeps the var table and fails if any core fn is unnameable in value position,
+  so the next extension that forgets is caught here rather than surfacing as an
+  image that will not write. It checks 719 fns.
+
 - **`jolt.image/scan` disagreed with `dump!` about captured values.** The scan
   walked a registered closure's free values with a stub that inspected nothing,
   so a value whose capture was unwritable scanned clean and then refused at dump

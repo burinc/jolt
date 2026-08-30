@@ -358,3 +358,45 @@
                  (number? x) (char? x) (boolean? x) (jolt-nil? x) (procedure? x))
              #f)
             (else (jolt-invoke1 prev x))))))
+
+;; --- value-position natives are nameable ---------------------------------------
+;; A core fn used as a VALUE compiles to the runtime's Scheme procedure, not to
+;; the var's root, and the image writes a procedure as its var NAME. def-var!
+;; records that name -- but only for the procedure it was handed, and seq/get/nth
+;; are set!-EXTENDED afterwards (lazy-bridge for a lazy seq, records-coll for a
+;; deftype, natives-array for an array, nio-file for a Path). The extension is a
+;; new procedure nothing named, so (tree-seq vector? seq coll) refused to travel
+;; while 37 of 40 core fns sampled were fine.
+;;
+;; Registered HERE rather than beside each set!, because "the last extension" is
+;; not a place any one file can know it is: three files extend jolt-nth. This
+;; runs after every one of them. Same fix rt.ss already applies to the comparison
+;; chain singletons (jolt-lt/gt/le/ge), for the same reason (jolt-6cwk).
+;;
+;; `make coreproc` fails if any core fn goes unnameable, so a new extension that
+;; forgets is caught rather than discovered by an image that will not write.
+(for-each (lambda (p) (register-proc-name! (cdr p) "clojure.core" (car p)))
+          (list (cons "seq" jolt-seq)
+                  (cons "get" jolt-get)
+                  (cons "nth" jolt-nth)
+                  (cons "sequential?" jolt-sequential?)
+                  (cons "seq?" jolt-seq?)
+                  (cons "peek" jolt-peek)
+                  (cons "pop" jolt-pop)
+                  ;; value position compiles to the checked numeric layer's own
+                  ;; procedures, while the var roots went elsewhere -- the same
+                  ;; split as the comparison chain registered in rt.ss
+                  (cons "min" jolt-min)
+                  (cons "max" jolt-max)
+                  (cons "mod" jolt-mod)
+                  (cons "rem" jolt-rem)
+                  (cons "quot" jolt-quot)
+                  (cons "bit-and" jolt-bit-and*)
+                  (cons "bit-or" jolt-bit-or*)
+                  (cons "bit-xor" jolt-bit-xor*)
+                  (cons "some?" jolt-some?-fn)
+                  ;; protocol dispatch entry points: internal, but they are var
+                  ;; roots and a value built from one is as unwritable as any
+                  (cons "protocol-dispatch1" protocol-dispatch1)
+                  (cons "protocol-dispatch2" protocol-dispatch2)
+                (cons "protocol-dispatch3" protocol-dispatch3)))
