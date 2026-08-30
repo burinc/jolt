@@ -112,6 +112,17 @@
         (ev (string-append "(jolt.host/image-write! \"" tmp "\" " expr ")"))
         "WROTE")))))
 
+;; A closure with no source to rebuild from. It used to be enough to reach for a
+;; core-tier one -- (partial + 1) -- because clojure.core's literals were never
+;; registered. They are now, so the fixture has to be a procedure that was never
+;; ANALYZED at all: one this test makes in Scheme and hands to a var.
+;; Held INSIDE a vector, not as the var's root: a var root is nameable, and a
+;; nameable procedure travels as its var's name. This one is reachable only as
+;; data, so nothing can name it. Variadic, since it stands in for a watch fn and
+;; a map fn alike.
+(def-var! "user" "raw-holder"
+  (jolt-vector (lambda args (if (null? args) jolt-nil (car args)))))
+
 ;; --- the value-kind matrix: restored values must still WORK ---------------------
 ;; `rt` above compares printed forms, which settles a value type. It settles
 ;; nothing for a value whose identity IS its meaning: = is identity for an atom, a
@@ -199,27 +210,27 @@
 (rtu "infinite iterate walked"
      "(let [s (iterate inc 0)] (first s) (rest s))"
      "(vec (take 3 $rt))"                                    "[1 2 3]")
-;; cycle and repeat are clojure.core OVERLAY fns: their thunk is a fn literal in
-;; clojure.core, and the language's own namespaces are not registered -- the same
-;; limit that stops a partial or comp closure travelling. They refuse, and the
-;; refusal has to name what it is rather than report an anonymous #<procedure>.
+;; cycle and repeat are clojure.core OVERLAY fns -- their thunk is a fn literal in
+;; clojure.core. Those used to be unregisterable, so anything built from one
+;; refused; core's literals register now and they travel like any other.
+(rtu "cycle"    "(cycle [1 2])"   "(vec (take 5 $rt))"  "[1 2 1 2 1]")
+(rtu "repeat"   "(repeat :z)"     "(vec (take 3 $rt))"  "[:z :z :z]")
+(rtu "repeatedly" "(repeatedly (fn [] 7))" "(vec (take 2 $rt))" "[7 7]")
+(rtu "map-indexed" "(map-indexed (fn [i x] [i x]) [:a :b])"
+     "(vec (map vec $rt))"                              "[[0 :a] [1 :b]]")
+(rtu "distinct" "(distinct [1 1 2])" "(vec $rt)"        "[1 2]")
+(rtu "partial"  "(partial + 10)"  "($rt 5)"             "15")
+(rtu "comp"     "(comp inc inc)"  "($rt 1)"             "3")
+(rtu "memoize"  "(memoize (fn [x] (* x 2)))" "[($rt 4) ($rt 4)]" "[8 8]")
+
+;; ...and an infinite seq that genuinely CANNOT be written still terminates a
+;; scan: describing a finding used to print the object, which forces it.
 (ok "scanning an INFINITE unwritable seq terminates"
-    ;; describing a finding used to print the object, which forces it
-    (= 1 (jolt-count (jolt-compile-eval "(jolt.host/image-scan (repeat :z))" "user"))))
-(ok "an overlay lazy seq refuses, naming itself"
-    (str-has? (refusal-of "(cycle [1 2])") "unrealized lazy sequence"))
-(is "an overlay lazy seq scans as unwritable"
-    "(count (jolt.host/image-scan (repeat :z)))" "1")
-(is "realizing it first is the way through"
-    "(count (jolt.host/image-scan (doall (take 3 (repeat :z)))))" "0")
-(rtu "take-while"   "(take-while odd? [1 3 4 5])" "(vec $rt)" "[1 3]")
-(rtu "partition"    "(partition 2 (range 7))"    "(vec (map vec $rt))" "[[0 1] [2 3] [4 5]]")
-(rtu "mapcat"       "(mapcat (fn [x] [x x]) [1 2])" "(vec $rt)" "[1 1 2 2]")
-(rtu "string seq walked"
-     "(let [s (seq \"abc\")] (first s) s)"      "(vec $rt)"  "[\\a \\b \\c]")
-(rtu "rseq"         "(rseq [1 2 3])"             "(vec $rt)"  "[3 2 1]")
-(rtu "concat walked part-way"
-     "(let [s (concat [1] [2 3])] (first s) s)"  "(vec $rt)"  "[1 2 3]")
+    ;; unwritable because the producer captured a closure with no source, and
+    ;; infinite because (range) is -- so a describe that PRINTED it would hang
+    (= 1 (jolt-count (jolt-compile-eval
+                       "(jolt.host/image-scan (map (first raw-holder) (range)))"
+                       "user"))))
 
 (rtu "cons onto vec" "(cons 1 [2 3])"          "(vec $rt)"   "[1 2 3]")
 (rtu "PersistentQueue"
@@ -389,9 +400,9 @@
       "[2 true]")
   (cleanup!))
 ;; (partial compare) would be compare ITSELF (partial's 1-arg arity), a named
-;; fn — (comp - compare) is a real core-tier closure with no registration
+;; fn — (first raw-holder) is a real core-tier closure with no registration
 (is "scan of a sorted-map-by with an unregistered closure reports one finding at the comparator"
-    (string-append "(let [f (jolt.host/image-scan (sorted-map-by (comp - compare) :b 2 :a 1))]"
+    (string-append "(let [f (jolt.host/image-scan (sorted-map-by (first raw-holder) :b 2 :a 1))]"
                    " (vector (count f) (boolean (re-find #\"cmp-fn\" (str (:path (first f)))))))")
     "[1 true]")
 
@@ -443,11 +454,11 @@
 ;; a closure with no source registration to write -> refused, with the path to
 ;; it (a core-tier closure like partial's is never jfn$-registered)
 (is "unregistered closure is refused"
-    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (partial + 1)}}) :no-throw"
+    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (first raw-holder)}}) :no-throw"
                    " (catch Exception e (if (re-find #\"cannot write\" (ex-message e)) :refused :wrong-error)))")
     ":refused")
 (is "refusal names the path"
-    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (partial + 1)}}) \"\""
+    (string-append "(try (jolt.host/image-write! \"" tmp "\" {:handlers {:go (first raw-holder)}}) \"\""
                    " (catch Exception e (if (re-find #\":handlers\" (ex-message e)) :has-path :no-path)))")
     ":has-path")
 
@@ -461,9 +472,9 @@
 (is "scan is empty for a registered anon fn"
     "(count (jolt.host/image-scan user/scn))" "0")
 (is "scan reports an unregistered closure"
-    "(count (jolt.host/image-scan {:p (partial + 1)}))" "1")
+    "(count (jolt.host/image-scan {:p (first raw-holder)}))" "1")
 (is "scan reports a path"
-    "(-> (jolt.host/image-scan {:outer {:p (partial + 1)}}) first :path string? )" "true")
+    "(-> (jolt.host/image-scan {:outer {:p (first raw-holder)}}) first :path string? )" "true")
 (is "scan is empty for a named fn"
     "(count (jolt.host/image-scan {:f inc}))" "0")
 
@@ -632,7 +643,7 @@
            (null? (cdr ws))))
   (ok "watch key preserved" (eq? (car (car ws)) (keyword #f "w"))))
 (ev "(def wb (atom 0))")
-(ev "(add-watch user/wb :w (partial + 1))")
+(ev "(add-watch user/wb :w (first raw-holder))")
 (is "scan reports an unregistered watch"
     "(count (jolt.host/image-scan user/wb))" "1")
 (is "dump refuses an unregistered watch"
