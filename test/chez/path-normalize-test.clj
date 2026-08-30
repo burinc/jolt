@@ -56,6 +56,17 @@
 ;; the two-arg constructor has no as-relative-path contract: it joins an
 ;; absolute child rather than rejecting it, and the JVM agrees
 (check "(File. parent absolute-child)" (.getPath (File. "/a/b" "/c")) "/a/b/c")
+;; a separator-only child normalizes to "/" first, and resolve then joins
+;; parent+"/" -- which the constructor's normalize pass collapses back down.
+;; All five measured on the JVM.
+(check "(File. parent separator-only-child)" (.getPath (File. "/a/b" "///")) "/a/b")
+(check "(File. parent double-sep-only-child)" (.getPath (File. "/a/b" "//")) "/a/b")
+(check "(File. root separator-only-child)" (.getPath (File. "/" "//")) "/")
+(check "(File. parent absolute-child-trailing)" (.getPath (File. "/a/b/" "/c/")) "/a/b/c")
+(check "(File. parent absolute-child-single)" (.getPath (File. "/a/b" "/")) "/a/b")
+(check "(File. parent empty-child)" (.getPath (File. "/a/b" "")) "/a/b")
+(check "(File. root child)" (.getPath (File. "/" "c")) "/c")
+(check "(File. file-parent child)" (.getPath (File. (File. "/a//b") "c")) "/a/b/c")
 
 ;; --- clojure.java.io/file and as-file ----------------------------------------
 ;; io/file never reached the joining path at all: it is jolt-make-file directly,
@@ -82,9 +93,30 @@
        (raises-not-relative? #(io/file "/a/b" "/c")) true)
 (check "(io/file parent child absolute-more) raises"
        (raises-not-relative? #(io/file "/a" "b" "/c")) true)
+;; as-relative-path goes through as-file first, so what .isAbsolute sees -- and
+;; what the thrown message names -- is the NORMALIZED path
+(check "(io/file parent absolute-dup-child) message names the normalized path"
+       (try (io/file "/a/b" "//c") nil
+            (catch IllegalArgumentException e (.getMessage e)))
+       "/c is not a relative path")
 ;; a child with an interior separator is still relative, and joins
 (check "(io/file parent nested-relative-child)" (.getPath (io/file "/a" "b/c")) "/a/b/c")
 (check "(io/file relative relative)" (.getPath (io/file "a" "b")) "a/b")
+
+;; io/as-relative-path itself: public in clojure.java.io on the JVM, and it
+;; answers the normalized path on the way through
+(check "(io/as-relative-path relative-dup)" (io/as-relative-path "a//b") "a/b")
+(check "(io/as-relative-path trailing)" (io/as-relative-path "b/") "b")
+(check "(io/as-relative-path of a File)" (io/as-relative-path (File. "x//y")) "x/y")
+(check "(io/as-relative-path absolute-dup) message names the normalized path"
+       (try (io/as-relative-path "//c") nil
+            (catch IllegalArgumentException e (.getMessage e)))
+       "/c is not a relative path")
+
+;; io/make-parents builds (apply io/file f more) on the JVM, so it carries the
+;; same contract: an absolute child raises rather than quietly joining
+(check "(io/make-parents parent absolute-child) raises"
+       (raises-not-relative? #(io/make-parents "/a/b" "/c")) true)
 
 ;; --- the route in ------------------------------------------------------------
 ;; createTempFile builds its path from $TMPDIR, which ends in "/" on macOS. It

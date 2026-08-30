@@ -56,6 +56,14 @@ stays authoritative.
   plausible-looking `/a/b/c` answer to a call the JVM refuses. A call site that
   newly raises here was already broken for JVM Clojure.
 
+  Review follow-ups, all JVM-measured: `as-relative-path` goes through `as-file`
+  first, so the thrown message names the normalized path — `(io/file "/a/b"
+  "//c")` says `/c is not a relative path`, not `//c`. `io/as-relative-path`
+  itself is now registered as a var (public API in `clojure.java.io` on the
+  JVM, missing here entirely). And `io/make-parents` builds `(apply io/file f
+  more)` on the JVM, so it carries the same contract: an absolute child raises
+  instead of quietly joining.
+
 - **`jolt run` could not write any closure `clojure.core` makes.** `cycle`,
   `repeat`, `partial`, `comp` and the rest refused with "captured local … was
   optimized into the compiled code" — while a default `jolt build` wrote them
