@@ -1,0 +1,14 @@
+;; A project whose shared library is COMPILED FROM SOURCE that lives beside it:
+;; native/ would hold the .c, and :jolt/native names the artifact a build task
+;; produces. The artifact is deliberately absent here — that is the state a
+;; fresh checkout is in, and the state the build task has to be runnable in.
+{:paths ["src"]
+
+ :jolt/native [{:name "nope"
+                :darwin ["native/libnope.dylib"]
+                :linux  ["native/libnope.so"]}]
+
+ :aliases {:go {:main-opts ["-m" "app.go"]}}
+
+ :tasks {build-native {:doc "stands in for the compile step"
+                       :task (println "compiled")}}}
