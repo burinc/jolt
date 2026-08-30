@@ -24,6 +24,10 @@ core's fn literals were never recorded. That last one was written up as a limit
 of the *format*; it was a limit of the build. Images round-trip every value kind
 the language has now, or refuse by name and say what to do about it.
 
+And one fix that belongs to neither: under load a socket read could report
+end-of-stream on a connection that was merely not ready yet, because `errno` was
+read after the syscall rather than at it.
+
 ### Added
 
 - **Every non-dev build inlines, and the seed's var references are hoisted.**
