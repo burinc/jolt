@@ -20,6 +20,30 @@ stays authoritative.
 
 ### Fixed
 
+- **`jolt run` could not write any closure `clojure.core` makes.** `cycle`,
+  `repeat`, `partial`, `comp` and the rest refused with "captured local … was
+  optimized into the compiled code" — while a default `jolt build` wrote them
+  fine, which is what made it look like an optimizer problem. It was not.
+  Recovering a closure's captures needs to know which slot holds which name;
+  Chez hands the slots back by position, and the names live in inspector
+  information, which a release build does not generate. Generating it would cost
+  +117% on the compiled prelude — a debugging model of every procedure in core to
+  name a few hundred captures — and measured +53% on the binary with +70% on
+  startup.
+
+  Each registered literal is now built by a small per-site maker, so the image
+  can call it once with distinct sentinels and learn the layout: every instance
+  of a site shares one code object, so what it learns holds for all of them. No
+  inspector information, +0.9% on the binary, and no benchmark moved more than
+  1.01x. Literals that capture nothing skip it entirely — there is nothing to
+  recover — which is what keeps dispatch-heavy code at 1.00x.
+
+- **A `letfn` binding read as free in its own initialiser.** `:free-names` walked
+  a `letrec`'s inits with only the *earlier* bindings in scope, which is right
+  for `let*` and wrong for `letrec`, where every name is in scope in every init.
+  A closure there listed a name it binds itself as a capture, and dumping it
+  refused for a variable that was never captured.
+
 - **A project could not build a `:jolt/native` library it declares.** Applying a
   project loads its native libraries before anything runs, so a project whose
   `native/` holds C sources and whose `:jolt/native` names the `.so`/`.dylib`

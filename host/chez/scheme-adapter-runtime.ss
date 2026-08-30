@@ -224,6 +224,22 @@
 ;; (state-image.ss). Contract: name + captured values. Degradation: #f — the
 ;; image writer refuses the closure ('image-no), the same verdict as today's
 ;; no-inspector builds.
+;; (sa-procedure-free-values p) -> list of the closure's captured values, in the
+;; order Chez stores them, or #f. POSITIONS, no names: the names are inspector
+;; information, which a release build does not generate, while the values are
+;; there either way. What position means which name is not knowable from here —
+;; see image-fnsrc-layout, which learns it per site from a probe.
+(define (sa-procedure-free-values x)
+  (guard (e (#t #f))
+    (let* ((io (inspect/object x))
+           (n  (io 'length)))
+      (and n
+           (let loop ((i 0) (acc '()))
+             (if (fx>=? i n)
+                 (reverse acc)
+                 (loop (fx+ i 1)
+                       (cons (let ((vo (io 'ref i))) ((vo 'ref) 'value)) acc))))))))
+
 (define (sa-procedure-info x)
   (guard (e (#t #f))
     (if (sa-introspect-enabled?)
