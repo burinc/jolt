@@ -46,6 +46,16 @@ stays authoritative.
   `.` and `..` are still not resolved. The JVM constructor does not resolve them
   either; that is `getCanonicalPath`.
 
+- **`clojure.java.io/file` joined an absolute child instead of rejecting it.**
+  `io/file` is not the `File` constructor: Clojure puts every child through
+  `as-relative-path`, so `(io/file "/a/b" "/c")` raises `IllegalArgumentException`
+  while `(File. "/a/b" "/c")` answers `/a/b/c`. jolt joined it either way.
+
+  Worth knowing that normalization alone would have hidden this rather than
+  fixed it — `/a/b` joined to `/c` gives `/a/b//c`, which collapses to a
+  plausible-looking `/a/b/c` answer to a call the JVM refuses. A call site that
+  newly raises here was already broken for JVM Clojure.
+
 - **`jolt run` could not write any closure `clojure.core` makes.** `cycle`,
   `repeat`, `partial`, `comp` and the rest refused with "captured local … was
   optimized into the compiled code" — while a default `jolt build` wrote them
