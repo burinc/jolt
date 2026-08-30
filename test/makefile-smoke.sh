@@ -46,6 +46,7 @@ inspect-chez:
 	@printf "%s\n" \
 	  "chez=$(CHEZ)" \
 	  "jolt-chez=$(JOLT-CHEZ)" \
+	  "local-root=$(LOCAL-ROOT)" \
 	  "local-origin=$(origin LOCAL-LOADED)" \
 	  "gcc-origin=$(origin GCC-LOADED)" \
 	  "joltcc-origin=$(origin JOLT_CC)" \
@@ -196,12 +197,19 @@ check_provision_fallback() {  local bin out
     echo "$out" >&2
     exit 1
   }
-  grep -E "^jolt-chez=$root/.cache/local/chezscheme-[0-9.]+/bin/scheme$" <<<"$out" >/dev/null || {
+  # Against LOCAL-ROOT as the Makefile computes it, not against a hardcoded
+  # .cache/local: the nix develop shell puts the provisioned toolchain somewhere
+  # else entirely, and a pattern anchored on this checkout asserts the layout
+  # rather than the property (which is that the PINNED toolchain won, not the
+  # older one on PATH).
+  local root_dir
+  root_dir="$(sed -n 's/^local-root=//p' <<<"$out")"
+  grep -E "^jolt-chez=${root_dir%/}/chezscheme-[0-9.]+/bin/scheme$" <<<"$out" >/dev/null || {
     echo "pinned provisioned Chez not selected as the fallback:" >&2
     echo "$out" >&2
     exit 1
   }
-  grep -E "^joltcc-env=$root/.cache/local/gcc-[0-9.-]+/bin/gcc$" <<<"$out" >/dev/null || {
+  grep -E "^joltcc-env=${root_dir%/}/gcc-[0-9.-]+/bin/gcc$" <<<"$out" >/dev/null || {
     echo "provisioning armed but JOLT_CC not pinned to the provisioned GCC:" >&2
     echo "$out" >&2
     exit 1
