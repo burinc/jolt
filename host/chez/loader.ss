@@ -316,6 +316,13 @@
 ;; (like clojure.test); the primitives stay defined either way.
 (hashtable-delete! loaded-ns "clojure.core.async")
 
+;; Immutable baseline for app-image construction.  The build command itself
+;; loads jolt.main and lazy stdlib namespaces before build-binary runs; those
+;; process-local additions must not be mistaken for namespaces baked into the
+;; runtime image that the new app will inherit.
+(define ldr-runtime-image-ns (hashtable-copy loaded-ns #f))
+(define (ldr-runtime-image-ns-copy) (hashtable-copy ldr-runtime-image-ns #f))
+
 ;; *loaded-libs* is the other half of the loaded set: a clojure.lang.Ref that
 ;; tools.namespace and core.typed conj/disj on, and that ns-dedup-loaded? below
 ;; reads alongside loaded-ns. A bare read-modify-write of the ref field lost marks
