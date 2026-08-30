@@ -1259,6 +1259,9 @@
 ;; so a state image can write it as a reference. Gambit has no image, so the
 ;; registration is a no-op and nothing is ever a named code value.
 (define (register-code-value! . _) #f)
+;; chez names a procedure def-var! never saw, so a state image can write it as a
+;; var reference. Gambit has no image; the registration is a no-op.
+(define (register-proc-name! v . _) v)
 (define (code-value? x) #f)
 
 ;; jclass?/jclass-name and the class objects they read live in host-vars.ss.

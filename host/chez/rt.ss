@@ -803,6 +803,16 @@
 ;; (java/host-class.ss) — so none of them can afford to skip it either.
 (define proc-name-mu (make-mutex))
 (define (proc-name-of v) (jolt-with-mutex proc-name-mu (hashtable-ref proc-name-tbl v #f)))
+;; Name a procedure def-var! never saw. A core fn in VALUE position compiles to
+;; the runtime's own procedure, not the var's root, and a native that is
+;; set!-extended after its def-var! leaves that procedure unnamed -- so an image,
+;; which writes a procedure as its var name, could not write values built from it.
+;; post-prelude.ss calls this once everything has finished extending; the shared
+;; file reaches it through this rather than the table, so the Gambit host can shim
+;; it (jolt-6cwk).
+(define (register-proc-name! v ns name)
+  (jolt-with-mutex proc-name-mu (hashtable-set! proc-name-tbl v (cons ns name)))
+  v)
 ;; "ns/name" of every var defined more than once with a value. Guarded by
 ;; var-table-mu like the other var-table side sets; reads are single-key.
 (define var-redefined-set (make-hashtable string-hash string=?))
