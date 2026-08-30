@@ -97,8 +97,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Free: the forcer is a direct call where invoking the closure went through
   `jolt-invoke`, so the benchmark suite is unchanged (`bench/seqs` 1.00x).
 
-  Not yet covered: a chain already walked part-way, whose frontier is a
-  per-element cell rather than the producer that made it. Those still refuse.
+  A chain already walked part-way travels too: every seq cell carries the same
+  descriptor, not just the producer that made it. What still refuses is a lazy
+  seq from a `clojure.core` *overlay* fn — `cycle`, `repeatedly`, `map-indexed`
+  and the rest are fn literals in `clojure.core`, and the language's own
+  namespaces are not registered, the same limit that stops a `partial` or `comp`
+  closure travelling. That refusal names itself now instead of reporting an
+  anonymous `#<procedure>`, and says to realize the seq first.
+
+  Cost: `bench/seqs` 1.03x, the only benchmark of 22 outside 0.98–1.02x. The
+  per-element cell carries a two-slot descriptor where it used to carry a
+  closure. Measured against the previous release on one machine, min of 5
+  alternating runs.
+
+- **A var-rooted multimethod or `reify` was walked instead of named.** A named
+  fn travels as its var's name and comes back as the live fn. A multimethod is
+  code too, but it is a *record*, so `procedure?` missed it, nothing recorded its
+  var name, and the image descended into its dispatch tables and refused at a raw
+  hashtable naming nothing the user could act on. Both travel as the var's name
+  now and restore as the live object — `identical?`, not a copy.
+
+- **A namespace came back as a second namespace.** `find-ns` is identity-stable
+  and a var round-trips to the identical var, so a restored namespace that merely
+  `=` the live one was out of line with both. Namespaces are interned by name
+  now, like keywords.
+
+- **A transient was written silently, or half-written.** A transient vector
+  travelled while a transient map refused on its backing hashtable. A transient
+  belongs to the thread that made it, which a restore does not have; both refuse
+  now, saying to call `persistent!` first.
+
+- **`jolt.image/scan` hung on an infinite unwritable sequence.** A finding
+  describes its object by printing it, and printing a lazy seq realizes it, so
+  scanning `(repeat :z)` never returned. Seqs are described by kind now.
 
 - **Synchronisation primitives travelled into state images as dead objects.** A
   record carrying a mutex or condition variable had no image walker of its own,

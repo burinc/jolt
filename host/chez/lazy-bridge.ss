@@ -47,8 +47,8 @@
 (define (jolt-make-lazy-seq thunk) (make-jolt-lazyseq thunk jolt-nil #f #f #f))
 ;; the descriptor form: a producer that records what it is instead of closing
 ;; over it, so the cell can be written to a state image (seq.ss lazy-src).
-(define (jolt-make-lazy-src fn a b c)
-  (make-jolt-lazyseq (make-lazy-src fn a b c) jolt-nil #f #f #f))
+(define (jolt-make-lazy-src fn a b)
+  (make-jolt-lazyseq (make-lazy-src fn a b) jolt-nil #f #f #f))
 
 ;; force once and memoize. The thunk is (fn [] (coll->cells body)); coll->cells
 ;; already coerced the body to a seq (cseq | nil) via the live jolt-seq, so the
@@ -125,10 +125,10 @@
 ;; written to a state image -- (rest user-lazy) reaches this too, since a user
 ;; `lazy-seq` body is usually (cons x (recur ...)) (seq.ss lazy-src).
 (define lz-cons-tail
-  (register-lazy-src! 'cons-tail (lambda (coll _b _c) (force-lazyseq coll))))
+  (register-lazy-src! 'cons-tail (lambda (coll _b) (force-lazyseq coll))))
 (set! jolt-cons (lambda (x coll)
   (if (jolt-lazyseq? coll)
-      (cseq-lazy x (make-lazy-src lz-cons-tail coll #f #f))
+      (cseq-lazy x (make-lazy-src lz-cons-tail coll #f))
       (%ls-cons x coll))))
 
 ;; (conj lazyseq x): conj onto a seq prepends, like any seq — (conj (rest xs) y).

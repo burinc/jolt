@@ -809,10 +809,24 @@
 (define (var-redefined? ns name)
   (jolt-with-mutex var-table-mu
     (hashtable-contains? var-redefined-set (string-append ns "/" name))))
+;; A var root that is CODE rather than data. A procedure always is; a multimethod
+;; and a reify are code too, but they are RECORDS, so `procedure?` misses them and
+;; nothing recorded their name -- which is why a state image walked a multimethod's
+;; dispatch tables and refused it, instead of writing the var's name and resolving
+;; it back to the live one (jolt-2cny). Registered rather than hardcoded because
+;; multimethods.ss and records.ss both load after this file.
+(define code-value-arms '())
+(define (register-code-value! pred) (set! code-value-arms (cons pred code-value-arms)))
+(define (code-value? v)
+  (let loop ((ps code-value-arms))
+    (cond ((null? ps) #f)
+          (((car ps) v) #t)
+          (else (loop (cdr ps))))))
+
 (define (def-var! ns name v)
   ;; first def of a given proc wins, so an alias like (def inc' inc) — which binds
   ;; the SAME proc to a second var — doesn't rename inc.
-  (when (procedure? v)
+  (when (or (procedure? v) (code-value? v))
     (jolt-with-mutex proc-name-mu
       (unless (hashtable-contains? proc-name-tbl v)
         (hashtable-set! proc-name-tbl v (cons ns name)))))
