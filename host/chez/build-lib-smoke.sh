@@ -88,8 +88,8 @@ if ! cc -O2 "$app/driver.c" -ldl -o "$work/driver" 2>"$work/driver.err"; then
   echo "  FAIL: driver compile failed"; cat "$work/driver.err"; exit 1
 fi
 got="$("$work/driver" "$lib" 2>&1)"; rc=$?
-if [ "$got" != "5" ] || [ "$rc" != "0" ]; then
-  echo "  FAIL: add(2,3) — want '5' rc 0, got '$got' rc $rc"; exit 1
+if [ "$got" != "5 8" ] || [ "$rc" != "0" ]; then
+  echo "  FAIL: exports — want '5 8' rc 0, got '$got' rc $rc"; exit 1
 fi
 
-echo "build-lib smoke: passed (library built, add(2,3)=5 via dlopen+jolt_lookup)"
+echo "build-lib smoke: passed (add(2,3)=5 + jolt.ffi layout-size=8 via dlopen+jolt_lookup)"

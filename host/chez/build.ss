@@ -977,10 +977,18 @@
           (bld-walk-files root "" '()))))
     (bld-strs embed-dirs)))
 
-;; Namespaces already defined at boot in the BUILD process (snapshotted before
-;; step 1 loads anything) — the driver image's set. bld-require-closure still
-;; skips these as preloaded; only LAZY stdlib (not in the image) is emitted.
-(define bld-boot-loaded #f)
+;; Namespaces defined in the runtime image before the CLI loads jolt.main and
+;; its require closure. By the time build-binary is called, jolt.main has loaded
+;; jolt.ffi and other lazy stdlib namespaces into THIS process, but those are not
+;; in the app image being written. Re-snapshotting loaded-ns there silently
+;; leaves their vars interned but UNBOUND in a source-mode-built app/library.
+;;
+;; The baseline is taken in loader.ss, and bld-runtime-manifest below loads
+;; loader.ss last but for java/ffi.ss (which defines no namespace of its own) —
+;; so the baseline is exactly the set an app image inherits. A load added after
+;; loader.ss there makes the baseline too SMALL, an over-emit that costs bytes;
+;; too large is the direction that leaves vars unbound.
+(define bld-boot-loaded (ldr-runtime-image-ns-copy))
 
 ;; --- the build --------------------------------------------------------------
 ;; entry-ns: the app's main namespace (a string). out-path: the binary to write.
@@ -1140,6 +1148,11 @@
 ;; the seed — e.g. jolt.time.impl) IS included and emitted: a built binary
 ;; has no disk roots, so its compiled Scheme must define those vars at boot —
 ;; the same reason bld-emit-cli-aot emits jolt.main into the release image.
+;; ldr-cli-aot? is the same claim reached from the other side: a release CLI
+;; bakes jolt.main's closure into its OWN heap, and bld-boot-loaded is taken
+;; before that (loader.ss), so the two agree — it stays as the explicit record
+;; of WHY such a namespace is preloaded, and covers any image that ever seeds
+;; the CLI closure earlier.
 ;; Result: deps first, roots last.
 (define (bld-require-closure names)
   (let ((visited (make-hashtable string-hash string=?))
@@ -1230,8 +1243,6 @@
     (bld-preload-static-natives! natives (string-append out-path ".build")))
    ;; 1. record app namespaces in dependency order as they finish loading.
    (let ((app-order '()))
-     (set! bld-boot-loaded
-       (hashtable-copy loaded-ns #f))
      (set-ns-loaded-hook!
       (lambda (name file) (set! app-order (cons (cons name file) app-order))))
     (ei-mark! "startup")
