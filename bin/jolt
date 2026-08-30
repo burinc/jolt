@@ -68,11 +68,18 @@ cd "$root" || exit 1
 # than source mode. Check freshness against the input list emitted by make devboot.
 # The cache is not used for REPL (interactive stdin needed) or when the first
 # arg is "repl" (explicit REPL command).
+#
+# JOLT_NO_DEVCACHE=1 forces source mode with the cache present and fresh. The two
+# are not interchangeable: the cached image bakes jolt.main's require closure and
+# marks it (ldr-mark-cli-aot!), where source mode loads the same namespaces as
+# ordinary requires — so a gate that means to exercise the source-mode ordering
+# has to say so, or it silently tests the cached one instead.
 CACHE_SO="target/dev/flat.so"
 CACHE_INPUTS="target/dev/flat.inputs"
 CACHE_CHEZ="target/dev/flat.chez"
 use_cache=0
-if [ -f "$CACHE_SO" ] && [ -f "$CACHE_INPUTS" ] && [ $# -gt 0 ] && [ "$1" != "repl" ]; then
+if [ -z "${JOLT_NO_DEVCACHE:-}" ] && \
+   [ -f "$CACHE_SO" ] && [ -f "$CACHE_INPUTS" ] && [ $# -gt 0 ] && [ "$1" != "repl" ]; then
   stale=0
   while IFS= read -r f; do
     if [ -n "$f" ] && [ "$CACHE_SO" -ot "$f" ]; then

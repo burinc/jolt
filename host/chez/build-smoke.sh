@@ -721,16 +721,6 @@ fi
 # run` compiles the source at require time and masks it entirely.
 ffiapp="$root/test/chez/ffi-app"
 ffiout="$(dirname "$out")/ffi-app-bin"
-ffiout_source="$(dirname "$out")/ffi-app-source-bin"
-# Force the source-mode ordering that exposed #756 again: load jolt.ffi into the
-# driver process before build.ss snapshots the runtime image. A correct snapshot
-# still emits jolt.ffi into the app; a late snapshot leaves layout-size UNBOUND.
-if ! JOLT_PWD="$ffiapp" "$root/bin/jolt" build -m ffiapp.main -o "$ffiout_source" >/dev/null 2>&1; then
-  echo "  FAIL: source-mode jolt build of a preloaded jolt.ffi app exited non-zero"; exit 1
-fi
-if [ "$(cd / && "$ffiout_source" 2>&1 | tail -1)" != "FFI-APP 8 4 4 2.5 true" ]; then
-  echo "  FAIL: source-mode build skipped the preloaded jolt.ffi Clojure layer"; exit 1
-fi
 if ! JOLT_PWD="$ffiapp" "$jolt" build -m ffiapp.main -o "$ffiout" >/dev/null 2>&1; then
   echo "  FAIL: jolt build of a jolt.ffi app exited non-zero"; exit 1
 fi
@@ -824,19 +814,40 @@ fi
 [ -x "$sdeps_out" ] || { echo "  FAIL: \`-Sdeps '{}' build\` produced no executable"; exit 1; }
 
 # Everything above builds through $jolt, which the make target points at the
-# prebuilt binary. Build one app through the source-mode driver too, so the
-# bin/jolt path a developer actually runs stays gated here and not only as a
-# side effect of devbootsmoke's cached-project-build case. Redundant when $jolt
-# already is bin/jolt, so skip it then.
+# prebuilt binary. Build through bin/jolt too, so the driver a developer actually
+# runs stays gated here and not only as a side effect of devbootsmoke's
+# cached-project-build case. Redundant when $jolt already is bin/jolt, so skip it
+# then. The first case takes whichever image bin/jolt picks (a fresh
+# target/dev/flat.so, else source); the second pins source mode, for the reason
+# spelled out there.
 if [ "$jolt" != "bin/jolt" ]; then
-  echo "build smoke: source-mode driver check"
+  echo "build smoke: checkout-driver check"
   srcout="$(dirname "$out")/srcmode-bin"
   if ! JOLT_PWD="$root/test/chez/jolt-ext-app" bin/jolt build -m jxapp.main -o "$srcout" >/dev/null 2>&1; then
-    echo "  FAIL: source-mode (bin/jolt) build exited non-zero"; exit 1
+    echo "  FAIL: bin/jolt build exited non-zero"; exit 1
   fi
   got_src="$(cd / && "$srcout" 2>&1 | tail -1)"
   if [ "$got_src" != "JOLT-EXT BUILT! (:x :x)" ]; then
-    echo "  FAIL: source-mode build output — want 'JOLT-EXT BUILT! (:x :x)', got \`$got_src\`"; exit 1
+    echo "  FAIL: bin/jolt build output — want 'JOLT-EXT BUILT! (:x :x)', got \`$got_src\`"; exit 1
+  fi
+
+  # The ffi-app case above, through the source-mode driver. Only this ordering
+  # reaches it: both the release binary and the dev boot cache bake jolt.main
+  # with bld-emit-cli-aot, which marks its closure ldr-cli-aot? and re-emits it
+  # into the app regardless, while source mode loads jolt.main — and with it
+  # jolt.ffi — into the driver process as an ordinary require. A boot-image
+  # snapshot still emits jolt.ffi into the app; snapshotting loaded-ns at
+  # build-binary time reads it as already in the app's image and leaves
+  # layout-size interned but UNBOUND (#756's shape, reached the other way).
+  # JOLT_NO_DEVCACHE is what keeps this honest: without it the gate passes on a
+  # fresh target/dev/flat.so whether or not the bug is present.
+  ffisrcout="$(dirname "$out")/ffi-app-srcmode-bin"
+  if ! JOLT_NO_DEVCACHE=1 JOLT_PWD="$ffiapp" bin/jolt build -m ffiapp.main -o "$ffisrcout" >/dev/null 2>&1; then
+    echo "  FAIL: source-mode (bin/jolt) build of the jolt.ffi app exited non-zero"; exit 1
+  fi
+  got_ffisrc="$(cd / && "$ffisrcout" 2>&1 | tail -1)"
+  if [ "$got_ffisrc" != "FFI-APP 8 4 4 2.5 true" ]; then
+    echo "  FAIL: source-mode build dropped the jolt.ffi Clojure layer — want 'FFI-APP 8 4 4 2.5 true', got \`$got_ffisrc\`"; exit 1
   fi
 fi
 
