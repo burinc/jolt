@@ -316,21 +316,23 @@
   (gate-check "the callee's own literal is registered" (vector? reg) #t)
   (gate-check "an un-spliced registration carries no capture list"
               (eq? (vector-ref reg 2) (vector-ref reg 3)) #t))
-;; 4. a literal the LANGUAGE owns stays unregistered even when it is spliced
-;;    into user code. clojure.* and jolt.* literals do not travel when they run
-;;    un-spliced (the seed emits no registration for them), and a copy of one is
-;;    still one of theirs -- registering it here would make a built binary dump
-;;    closures `jolt run` refuses, which is the same divergence in the other
-;;    direction. The callee's name is what the assertion reads, so the caller is
-;;    named so as not to contain it.
+;; 4. a literal from a namespace the LANGUAGE owns registers like any other,
+;;    spliced or not. This row used to assert the opposite: core's literals were
+;;    excluded from registration so the seed prelude stayed byte-identical across
+;;    a mint, and a spliced COPY of one had to stay excluded too, or a built
+;;    binary would dump closures `jolt run` refused. Core registers now -- an
+;;    image that cannot carry core's closures is not carrying program state --
+;;    so both halves of that asymmetry are gone and a copy is treated like the
+;;    original. The callee's name is what the splice assertion reads, so the
+;;    caller is named so as not to contain it.
 (jolt-compile-eval "(do (defn sysmk [n] (fn [y] (+ n y))))" "jolt.ilgsys")
 (ilg-emit-ns "(defn sysmk [n] (fn [y] (+ n y)))" "jolt.ilgsys")
 (let ((e (ilg-emit-ns "(defn ilg-uses-sys [q] (jolt.ilgsys/sysmk q))" "ilgapp")))
   (gate-check "a system-namespace callee is still spliced" (gate-sub? e "sysmk") #f)
-  (gate-check "but its literal is not registered"
-              (gate-sub? e "image-register-fn-form!") #f))
-;;    the positive control for the row above, same shape and a callee that only
-;;    differs in its namespace -- so the pair reads as the split it is testing.
+  (gate-check "and its literal is registered, like any other"
+              (gate-sub? e "image-register-fn-form!") #t))
+;;    the same shape from an ordinary namespace, so the pair reads as one rule
+;;    rather than two.
 (let ((e (ilg-emit-ns "(defn ilg-uses-lib [q] (ilglib/ilg-mk q))" "ilgapp")))
   (gate-check "an ordinary callee is spliced too" (gate-sub? e "ilg-mk") #f)
   (gate-check "and its literal IS registered"

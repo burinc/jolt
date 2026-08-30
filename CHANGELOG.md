@@ -76,6 +76,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A closure `clojure.core` made could not be written to a state image.**
+  `partial`, `comp`, `memoize`, `juxt`, `fnil`, `complement`, and every lazy
+  sequence from an overlay fn — `cycle`, `repeat`, `repeatedly`, `map-indexed`,
+  `distinct`, `dedupe`, `partition-by` — all refused. RFC 0009 documented that as
+  a limit of the format. It was not: it was a limit of the build. Fn literals in
+  the language's own namespaces were left unregistered so the seed prelude would
+  stay byte-identical across a mint, and the consequence was an image feature
+  that carried the part of your program state the compiler found convenient.
+
+  Core's literals register now. A named inner literal registers too — it is bound
+  under a unique `<name>$jf<n>` alias so the registry has a key that cannot
+  collide, with its short name aliasing that, and the backtrace reader strips the
+  suffix the way it already strips the splicer's `__ilN`. That is what the five
+  lazy fns above needed: each closes a `lazy-seq` thunk over a `letfn`-bound fn,
+  and the captured fn had no source however well the thunk itself travelled.
+
+  Costs: the seed prelude grows 1.30MB to 1.75MB and the compiler image 833KB to
+  1.04MB, so a built binary is about 1MB larger. Startup is unchanged (0.1806s
+  against 0.1819s, min of 5) — the registrations are hashtable inserts.
+
+  Still unwritable: a procedure nothing can name — one the runtime built rather
+  than analyzed, and `seq`, `get` and `nth` in value position, which are
+  `set!`-extended after their `def-var!` so the procedure you get was never the
+  one recorded.
+
+- **`jolt.image/scan` disagreed with `dump!` about captured values.** The scan
+  walked a registered closure's free values with a stub that inspected nothing,
+  so a value whose capture was unwritable scanned clean and then refused at dump
+  — the one thing the shared write/report verdict exists to prevent. It walks
+  them for real now.
+
 - **A lazy sequence built by `clojure.core` could not go into a state image.** A
   lazy seq written with `lazy-seq` already travelled — that thunk is an ordinary
   fn literal with a recorded source, so an infinite generator came back still

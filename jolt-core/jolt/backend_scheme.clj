@@ -387,15 +387,21 @@
 (def ^:dynamic *fnsrc-counter* nil)
 (def ^:dynamic *fnsrc-regs* nil)
 (def ^:dynamic *fnsrc-def-init?* false)
-;; Same split as image-system-ns? in host/chez/state-image.ss: a namespace the
-;; language owns (clojure.core or a clojure.* / jolt.* prefix) keeps its old
-;; emission — the seed mint and the core overlay must stay byte-identical. nil
-;; (no per-form context) counts as system so a bare emit never changes.
-(defn- fnsrc-system-ns? [ns]
-  (or (nil? ns)
-      (= ns "clojure.core")
-      (str/starts-with? ns "clojure.")
-      (str/starts-with? ns "jolt.")))
+;; A fn literal registers its source unless there is no per-form context to name
+;; it by — that is the whole rule now.
+;;
+;; It used to exclude every namespace the language owns (clojure.core and any
+;; clojure.* / jolt.* prefix), to keep the seed mint and the core overlay
+;; byte-identical. The consequence was that a closure clojure.core made could not
+;; be written to a state image at all: `partial`, `comp`, `memoize` and every
+;; lazy seq from an overlay fn refused, and RFC 0009 documented that as a limit
+;; of the format. It is not a limit of the format, it was a limit of the build —
+;; and an image feature that cannot carry core's own closures is not carrying
+;; program state, it is carrying the part of it the compiler found convenient.
+;;
+;; So core's literals register too. The seed prelude grows by their source forms;
+;; that is the price, and it is paid once at mint rather than by every program.
+(defn- fnsrc-system-ns? [ns] (nil? ns))
 ;; True while emitting a node in TAIL position. Only used, in trace mode, to mark a
 ;; tail call so the runtime routes its callee into the current history rib instead
 ;; of a new one (rt.ss). It never affects semantics — a wrong value only mislabels
@@ -1729,11 +1735,26 @@
         ;; unregistered exactly as it is when core runs un-spliced — the language
         ;; owns those namespaces, and a copy of one is still one of theirs.
         fnsrc-src-ns (or (:src-ns node) *fnsrc-ns*)
-        fnsrc-nm (when (and (nil? (:name node)) (not def-init?)
+        ;; A literal registers whether or not it has a NAME. It used to have to be
+        ;; anonymous, because the registry is keyed on the name Chez reports and a
+        ;; named fn is bound under its own munged name, which is not unique -- two
+        ;; `mapi`s in two fns would collide. So a named one is bound under
+        ;; <name>$jf<n> instead and its short name aliases that: unique for the
+        ;; registry, still readable in a backtrace (source-registry strips the
+        ;; suffix, as it already does for the splicer's __ilN).
+        ;;
+        ;; This is what map-indexed, distinct, dedupe, partition-by and tree-seq
+        ;; needed: each closes a lazy-seq thunk over a letfn-bound fn, and that
+        ;; captured fn had no source to rebuild from however well the thunk itself
+        ;; travelled.
+        fnsrc-nm (when (and (not def-init?)
                             (not (fnsrc-system-ns? *fnsrc-ns*))
                             (not (fnsrc-system-ns? fnsrc-src-ns))
                             (:src-form node))
-                   (fnsrc-name))
+                   (if (:name node)
+                     (str (munge-name (:name node)) "$jf" (let [n @*fnsrc-counter*]
+                                                            (swap! *fnsrc-counter* inc) n))
+                     (fnsrc-name)))
         clauses (binding [*known-procs* (if self (conj *known-procs* self) *known-procs*)
                           *trace-site* (or qname self)
                           *trace-self* (cond-> #{} self (conj self) qname (conj qname))
@@ -1780,8 +1801,17 @@
         ;; the letrec BODY is where a variadic fn registers, so the binding still
         ;; holds the bare lambda and Chez keeps the frame name.
         (let [ret (if reg-here? (str "(jolt-register-variadic! " variadic-fixed " " m ")") m)]
-          (if qname
+          (cond
+            qname
             (str "(letrec* ((" qname " " lambda ") (" m " " qname ")) " ret ")")
+            ;; a registered inner literal: the lambda sits in the UNIQUE binding
+            ;; (that is what names the procedure), the short name aliases it
+            fnsrc-nm
+            (do (swap! *fnsrc-regs* conj
+                       [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node)
+                        (:live-names node)])
+                (str "(letrec* ((" fnsrc-nm " " lambda ") (" m " " fnsrc-nm ")) " ret ")"))
+            :else
             (str "(letrec ((" m " " lambda ")) " ret ")"))))
       (if (not fnsrc-nm)
         ;; system namespaces, a def's direct init, and ad-hoc fns (contagion

@@ -559,6 +559,12 @@
         ((and (fx<? i n) (fx>? i 4)
               (string=? (substring nm (fx- i 4) i) "__il"))
          (substring nm 0 (fx- i 4)))
+        ;; ...or by "$jf", the unique alias a NAMED inner literal is bound under
+        ;; so the image registry has a key that cannot collide. Same deal as
+        ;; __ilN: a compiler artifact, not something to show a user.
+        ((and (fx<? i n) (fx>? i 3)
+              (string=? (substring nm (fx- i 3) i) "$jf"))
+         (substring nm 0 (fx- i 3)))
         (else nm)))))
 
 (define (srcreg-frame name record line) (vector name record line))
