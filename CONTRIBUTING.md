@@ -41,10 +41,13 @@ do **not** contain submodules, so they can't run or build — clone the repo
 instead.
 
 `bin/jolt` needs a **threaded Chez Scheme 10.x** on `PATH` as `chez` or
-`chezscheme`; set `JOLT_CHEZ` to point at a specific one. `make` provisions its
-own 10.4.1 when `PATH` has a different version, and exports `JOLT_CHEZ` so both
-halves of a build agree — running `bin/jolt` by hand against a 9.x picks up
-whatever primitive that release predates (`variable flvector? is not bound`).
+`chezscheme`; set `JOLT_CHEZ` to point at a specific one. `make` uses a Chez on
+`PATH` at or above its pinned version as-is, and provisions its own 10.4.1 only
+when nothing qualifies. It exports `JOLT_CHEZ` so both halves of a build agree —
+running `bin/jolt` by hand against a 9.x picks up whatever primitive that
+release predates (`variable flvector? is not bound`) — and, when provisioning
+did run, `JOLT_CC` too, so the standalone binary links with the same GCC that
+built Chez instead of whatever `cc` happens to resolve to.
 
 `make build` provisions [Chez Scheme](https://cisco.github.io/ChezScheme/) and a
 C compiler locally through [Makes](https://github.com/makeplus/makes), then

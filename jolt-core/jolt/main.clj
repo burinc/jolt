@@ -21,14 +21,41 @@
 ;; map: {:name "sqlite3" :darwin ["libsqlite3.0.dylib" ...] :linux ["libsqlite3.so.0" ...]}
 ;; with optional :optional (missing is fine — a feature-gated dep) and :process
 ;; (use the running process's symbols, e.g. libc sockets — no external file).
-(defn- load-natives! [natives]
+;; A :jolt/native candidate that names a PATH — it has a separator — is relative
+;; to the project, not to the current directory. dlopen draws the same line:
+;; a name with no separator is searched for, a name with one is used as given.
+;; Without this, a project that keeps its shared library beside its sources
+;; ("native/libfoo.so", which is what a build task produces) loaded only when
+;; jolt happened to be run from the project root: `bin/jolt` exports JOLT_PWD and
+;; then cd's to its own tree, so the path resolved against the wrong directory
+;; and the library read as missing.
+(defn- native-candidate [base c]
+  (if (and base
+           (or (str/includes? c "/") (str/includes? c "\\"))
+           (not (str/starts-with? c "/"))
+           (not (re-find #"^[A-Za-z]:" c)))
+    (str base "/" c)
+    c))
+
+;; strict? false lets a MISSING required library through with a warning instead of
+;; an error. A task is the one command that may be what PRODUCES the library it
+;; is declared alongside: a project whose native/ holds C sources and whose
+;; :jolt/native names the .so/.dylib built from them could not run its own build
+;; task, because applying the project loaded the natives first and the artifact
+;; was not there yet. Any task that actually needs the library still fails on
+;; use, and the warning names what was missing either way.
+(defn- load-natives!
+  ([natives] (load-natives! natives true))
+  ([natives strict?] (load-natives! natives strict? nil))
+  ([natives strict? base]
   (when (seq natives)
     (let [plat (current-platform)]
       (doseq [spec natives]
         (if (:process spec)
           (jolt.ffi/load-library)
           (let [c (get spec plat)
-                cands (if (string? c) [c] (vec c))
+                cands (mapv #(native-candidate base %)
+                            (if (string? c) [c] (vec c)))
                 ;; Load the native RTLD_LOCAL and register its handle, so the
                 ;; spec's defcfns resolve from the handle (isolated from the
                 ;; process-global namespace) rather than depending on global
@@ -40,16 +67,23 @@
             ;; skip it rather than fail. Its foreign calls only resolve in a static
             ;; build; document a dynamic candidate too to use it under `run`.
             (when (and (nil? hit) (not (:optional spec)) (not (:static spec)))
-              (throw (ex-info (str "required native library "
-                                   (or (:name spec) (first cands) "?")
-                                   " not found — tried " (pr-str cands) " for " (name plat))
-                              {:native spec})))))))))
+              (let [msg (str "required native library "
+                             (or (:name spec) (first cands) "?")
+                             " not found — tried " (pr-str cands) " for " (name plat))]
+                (if strict?
+                  (throw (ex-info msg {:native spec}))
+                  (binding [*out* *err*]
+                    (println (str "warning: " msg " (a task may build it)")))))))))))))
 
 ;; Apply a resolved project's roots on top of the current (jolt-core) roots so app
 ;; namespaces resolve while jolt.* stays loadable, then load its native deps.
-(defn- apply-project! [{:keys [roots natives]}]
-  (jolt.host/set-source-roots! (vec (distinct (concat roots (jolt.host/source-roots)))))
-  (load-natives! natives))
+(defn- apply-project!
+  ([resolved] (apply-project! resolved true))
+  ([{:keys [roots natives project-dir]} strict?]
+   (jolt.host/set-source-roots! (vec (distinct (concat roots (jolt.host/source-roots)))))
+   ;; project-dir is absent from a cpcache entry written by an older jolt; JOLT_PWD
+   ;; is where the user invoked us, which is the same directory in the common case.
+   (load-natives! natives strict? (or project-dir (jolt.host/getenv "JOLT_PWD")))))
 
 ;; Aliases selected by a leading -A:… — bound around the re-dispatch so every
 ;; command that resolves the project (run/path/build/repl/nrepl/task, and a
@@ -475,7 +509,9 @@
     (when (nil? task)
       (throw (ex-info (str "unknown command or task: " name " (see 'jolt tasks')")
                       {:name name})))
-    (apply-project! resolved)
+    ;; tolerant: see load-natives! — the task may be the build step for a
+    ;; :jolt/native library that does not exist yet
+    (apply-project! resolved false)
     ((requiring-resolve 'jolt.tasks/run-task!)
      {:tasks (:tasks resolved)
       :name name
