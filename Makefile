@@ -21,7 +21,36 @@ include $M/init.mk
 
 # An explicit caller-selected Chez is authoritative. This preserves CI/release
 # toolchains whose threading, libc floor, and native libraries are intentional.
+#
+# Same-or-newer system Chez: with nothing explicit selected, a Chez on PATH at
+# or above JOLT-CHEZ-FLOOR is also used as-is — the system toolchain then
+# builds and links everything, one self-consistent toolchain end to end, and
+# nothing is downloaded. Older, broken, or absent, fall through to provisioning
+# the pinned Chez + xPack GCC below. Set JOLT_SYSTEM_CHEZ= (empty) to always
+# provision the pinned versions.
+JOLT-CHEZ-FLOOR ?= 10.4.1
+JOLT_SYSTEM_CHEZ ?= 1
 JOLT-CHEZ := $(or $(CHEZ),$(CHEZSCHEME))
+ifeq (,$(JOLT-CHEZ))
+ifeq (1,$(JOLT_SYSTEM_CHEZ))
+JOLT-CHEZ := $(shell \
+  for name in chez chezscheme scheme; do \
+    exe=$$(command -v $$name 2>/dev/null) || continue; \
+    test -x "$$exe" || continue; \
+    exe=$$(cd "$$(dirname "$$exe")" && pwd -P)/$$(basename "$$exe"); \
+    v=$$(printf '(display (scheme-version)) (newline)\n' | "$$exe" -q 2>/dev/null | tr -d '\r'); \
+    v=$$(printf '%s\n' "$$v" | awk '{print $$NF}'); \
+    ok=$$(awk -v v="$$v" -v f="$(JOLT-CHEZ-FLOOR)" 'BEGIN { \
+      split(v, V, "."); split(f, F, "."); \
+      for (i = 1; i <= 3; i = i + 1) { \
+        if (V[i] + 0 > F[i] + 0) { print 1; exit } \
+        if (V[i] + 0 < F[i] + 0) { exit } \
+      } \
+      print 1 }'); \
+    if [ "$$ok" = 1 ]; then printf '%s\n' "$$exe"; break; fi; \
+  done)
+endif
+endif
 ifneq (,$(JOLT-CHEZ))
 SHELL-DEPS += $(JOLT-CHEZ)
 else
@@ -58,6 +87,12 @@ CHEZSCHEME-LIB-DIRS := \
   $(LOCAL-TMP)/$(CHEZSCHEME-DIR)/pb/lz4/lib \
   $(LOCAL-TMP)/$(CHEZSCHEME-DIR)/pb/zlib
 export LIBRARY_PATH := $(subst $(space),:,$(strip $(CHEZSCHEME-LIB-DIRS)))$(if $(LIBRARY_PATH),:$(LIBRARY_PATH))
+# The provisioned GCC built Chez, so the same driver links the standalone
+# binary: gcc.mk puts the bundle's bin FIRST on the exported PATH, but the
+# bundle ships no `cc`, so a bare cc falls through to the distro driver and
+# pairs it with the bundle's older as/ld (#788: gcc 16 .base64 into pre-2.43
+# gas). build.ss bld-cc reads JOLT_CC. A command-line JOLT_CC=... still wins.
+export JOLT_CC := $(GCC)
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \

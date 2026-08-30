@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The build keeps one toolchain end to end now. When make provisions the pinned
+Chez + xPack GCC, the standalone-binary link runs through that same provisioned
+GCC — `JOLT_CC`, honored by `build.ss`'s `bld-cc` — instead of a bare `cc`,
+which can pair a distro gcc 16 driver with the bundle's pre-`.base64` binutils
+and die on `unknown pseudo-op: .base64` (#788). And with nothing explicit
+selected, a Chez on `PATH` at or above the pinned version is used as-is rather
+than triggering a provisioning download; the system toolchain then builds and
+links everything. Older, broken, or absent Chez falls back to the pinned
+provision. `JOLT_SYSTEM_CHEZ=` (empty) forces provisioning; an explicit `CHEZ=`
+stays authoritative.
+
+### Fixed
+
+- **A project could not build a `:jolt/native` library it declares.** Applying a
+  project loads its native libraries before anything runs, so a project whose
+  `native/` holds C sources and whose `:jolt/native` names the `.so`/`.dylib`
+  built from them could not run its own build step: the task needed its own
+  output to exist first. A **task** run now warns and carries on — it may be the
+  thing that produces the library — while every other command still refuses to
+  start without it. With this, the compile step can live in `deps.edn` `:tasks`
+  instead of a makefile or a shell script beside the project.
+
+- **A relative `:jolt/native` path was resolved against the wrong directory.**
+  Candidates split the way `dlopen` splits them: a name with no separator is
+  searched for on the loader path, a name with one is a path. A path is now
+  resolved relative to the **project**, not to the current directory — so
+  `native/libfoo.so` loads whatever the working directory happens to be. It used
+  to work only when jolt was started from the project root, which meant it did
+  not work at all under `bin/jolt`, which exports `JOLT_PWD` and then changes to
+  its own tree. A "not found" error names the resolved path now.
+
 ## [0.7.29] - 2026-08-30
 
 Two threads. Splicing a `defn` body at a call site follows **linkage** now

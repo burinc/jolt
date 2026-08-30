@@ -87,10 +87,32 @@
 (define (bld-cross?) (and (bld-target) (not (string=? (bld-target) bld-machine)) #t))
 (define (bld-tgt-osx?) (bld-contains? (bld-eff-machine) "osx"))
 (define (bld-tgt-nt?) (bld-contains? (bld-eff-machine) "nt"))
+;; An env override, treating an EMPTY value as absent. A Makefile that exports a
+;; variable it did not manage to compute exports "" rather than nothing, and ""
+;; is a true value in Scheme -- so a plain (or (getenv ...) "cc") would hand the
+;; link an empty compiler name and fail somewhere far from the cause.
+(define (bld-env-override name)
+  (let ((v (getenv name))) (and v (> (string-length v) 0) v)))
+
 ;; The C compiler + arch flag for the OUTPUT binary. Cross overrides via env
 ;; (JOLT_TARGET_CC, e.g. aarch64-linux-gnu-gcc or a zig-cc wrapper;
 ;; JOLT_TARGET_ARCH_FLAG, e.g. "-arch x86_64" for a macOS x-arch link).
-(define (bld-cc) (if (bld-cross?) (or (getenv "JOLT_TARGET_CC") "cc") "cc"))
+;;
+;; JOLT_CC names the compiler for a NATIVE link. It exists because a bare `cc`
+;; is resolved by PATH, and PATH is not neutral when make provisions the pinned
+;; toolchain: gcc.mk puts the xPack bundle's bin directory FIRST on an exported
+;; PATH, so `as` and `ld` come from that bundle -- but the bundle ships no `cc`,
+;; so `cc` alone falls through to the system compiler. The link then pairs one
+;; vendor's driver with another vendor's assembler and linker (#788: a distro
+;; gcc 16 emitting .base64 into the bundle's pre-2.43 gas). Chez itself never
+;; had the problem: chezscheme.mk builds it with the absolute CC=$(GCC), and the
+;; Makefile now exports JOLT_CC with that same GCC. Same shape as JOLT_CHEZ,
+;; which exists because a bare `chez` on PATH could likewise be a different
+;; install from the one make provisioned.
+(define (bld-cc)
+  (if (bld-cross?)
+      (or (bld-env-override "JOLT_TARGET_CC") "cc")
+      (or (bld-env-override "JOLT_CC") "cc")))
 (define (bld-arch-flag) (if (bld-cross?) (or (getenv "JOLT_TARGET_ARCH_FLAG") "") ""))
 
 ;; Platform-appropriate flag to export executable symbols so a statically-linked
