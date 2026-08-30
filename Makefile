@@ -129,7 +129,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck irvalidate devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety
@@ -839,6 +839,12 @@ parkcheck:
 # remembered.
 shelloutcheck:
 	@sh host/chez/shellout-check.sh
+
+# errno survives only until the next thing that can set it, and reading it is
+# itself a foreign call — so a syscall wrapper must capture it once, at the
+# syscall, and branch on the value. See the script for what asking twice cost.
+errnocheck:
+	@sh host/chez/errno-check.sh
 
 # Makefile dependency selection: explicit Chez overrides must bypass local
 # Makes provisioning so release jobs retain their chosen compiler and libc.

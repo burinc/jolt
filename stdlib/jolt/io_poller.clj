@@ -84,8 +84,12 @@
 
 ;; -- fd helpers (the socket layer's syscall surface) ---------------------------
 (defn errno [] (ffi/errno))
-(defn eagain? [] (= EAGAIN (errno)))
-(defn eintr? [] (= EINTR (errno)))
+;; errno is only meaningful until the next thing that can set it, and reading it
+;; is itself a foreign call -- so a caller that asks two questions about one
+;; syscall can get two different answers. Capture the value ONCE at the call site
+;; and pass it in; the no-arg forms remain for a caller that reads it directly.
+(defn eagain? ([] (= EAGAIN (errno))) ([e] (= EAGAIN e)))
+(defn eintr? ([] (= EINTR (errno))) ([e] (= EINTR e)))
 (defn connect-pending? [e] (or (= EINPROGRESS e) (= EALREADY e)))
 (defn nonblock! [fd]
   (let [f (c-fcntl fd F-GETFL 0)]
