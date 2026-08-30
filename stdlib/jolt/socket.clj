@@ -170,10 +170,13 @@
   (let [ip (resolve-host host)
         sa (make-sockaddr ip port)
         r  (loop []
-             (let [r (c-connect fd sa 16)]
+             (let [r (c-connect fd sa 16)
+                   ;; captured before anything else runs, for the reason io-call
+                   ;; spells out above
+                   e (if (zero? r) 0 (poller/errno))]
                (cond
                  (zero? r) 0
-                 (poller/connect-pending? (poller/errno))
+                 (poller/connect-pending? e)
                  (do (poller/wait-ready fd :write)
                      (let [e (poller/so-error fd)]
                        (if (zero? e)
@@ -289,11 +292,30 @@
   ;; there is not — and retries; EINTR retries immediately; anything else is
   ;; the syscall's real answer, returned as-is (callers read errno semantics).
   (loop []
-    (let [r (op)]
+    (let [r (op)
+          ;; ERRNO IS READ HERE AND NOWHERE ELSE. It survives only until the next
+          ;; thing that can set it, and that includes reading it: the accessor is
+          ;; a foreign call, and an allocation on the way can trip a collection
+          ;; whose mmap leaves ENOMEM behind. Asking twice -- once for EINTR, once
+          ;; for EAGAIN -- read recv's EAGAIN as ENOMEM often enough to matter: the
+          ;; retry was missed, the -1 fell through, and a socket read answered EOF
+          ;; on a live connection. The (neg? r) guard is a fixnum compare, which
+          ;; allocates nothing and so cannot collect.
+          e (if (neg? r) (poller/errno) 0)]
       (cond
-        (and (neg? r) (poller/eintr?)) (recur)
-        (and (neg? r) (poller/eagain?)) (do (poller/wait-ready fd wait-kind) (recur))
-        :else r))))
+        (and (neg? r) (poller/eintr? e)) (recur)
+        (and (neg? r) (poller/eagain? e)) (do (poller/wait-ready fd wait-kind) (recur))
+        :else
+        (do
+          ;; A negative return that is neither retryable nor a wait is where a
+          ;; socket read turns into EOF (do-recv below), and the caller then sees
+          ;; a closed connection with no reason attached. It is the one place a
+          ;; syscall failure goes quiet, so say what it was when asked.
+          (when (and (neg? r) (jolt.host/getenv "JOLT_DEBUG"))
+            (binding [*out* *err*]
+              (println "jolt.socket: fd" fd wait-kind "syscall failed, errno" e
+                       "- answered as EOF")))
+          r)))))
 
 (defn- do-recv [fd buf len]
   ;; n <= 0 answers EOF: recv 0 is orderly shutdown; a negative return (error)
