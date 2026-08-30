@@ -559,30 +559,89 @@
 ;; failure returns 'image-no (the caller refuses) — never a crash, never a
 ;; silent partial; the free-value walk itself is unguarded so a refusal on a
 ;; nested free value keeps its own, more specific path.
-(define (image-recover-free-values x frees lives walk path)
+;; Which closure SLOT holds each of a site's free names, as a list index-aligned
+;; with free-names. Derived once per site and cached on the registration.
+;;
+;; Chez hands a closure's captures back by position; the names that say which is
+;; which are inspector information, which a release build does not generate (it
+;; costs +117% on the compiled prelude to name a few hundred captures out of
+;; every procedure in core). So `jolt run` could not write any closure
+;; clojure.core makes — cycle, repeat, partial, comp — while a default app build,
+;; which does generate it, wrote them fine.
+;;
+;; The maker settles it. Every instance of a site comes from one code object, so
+;; the capture layout is a property of the CODE and identical across instances:
+;; call the maker once with distinct sentinels, see which slot each landed in,
+;; and read every later instance through that permutation. 'none when there is no
+;; maker, when the probe cannot be read, or when a sentinel does not appear at
+;; all — Chez dropped a capture the body never uses, and guessing which of the
+;; remaining slots is which is exactly the wrong answer to give a restore.
+(define (image-fnsrc-layout reg)
+  (let ((cached (image-fn-form-layout reg)))
+    (if cached
+        cached
+        (let ((mk (image-fn-form-maker reg)))
+          (let ((v (if (not mk)
+                       'none
+                       (guard (e (#t 'none))
+                         (let* ((frees (vector-ref reg 2))
+                                (n (let loop ((f (jolt-seq frees)) (k 0))
+                                     (if (jolt-nil? f) k (loop (jolt-next f) (fx+ k 1)))))
+                                (sent (let loop ((i 0) (acc '()))
+                                        (if (fx=? i n)
+                                            (reverse acc)
+                                            (loop (fx+ i 1) (cons (list 'jolt-fnsrc-probe i) acc)))))
+                                (slots (sa-procedure-free-values (apply mk sent))))
+                           (if (not slots)
+                               'none
+                               (let ((perm (map (lambda (s)
+                                                  (let loop ((l slots) (i 0))
+                                                    (cond ((null? l) #f)
+                                                          ((eq? (car l) s) i)
+                                                          (else (loop (cdr l) (fx+ i 1))))))
+                                                sent)))
+                                 (if (memq #f perm) 'none perm))))))))
+            (image-fn-form-layout-set! reg v)
+            v)))))
+
+(define (image-recover-free-values x reg frees lives walk path)
   (call/cc
     (lambda (refuse)
       (define (refuse-on-fail thunk)
         (guard (e (#t (refuse 'image-no))) (thunk)))
-      (let* ((info (refuse-on-fail (lambda () (sa-procedure-info x))))
-             (tbl (begin (unless info (refuse 'image-no))
+      (let* ((layout (and reg (let ((l (image-fnsrc-layout reg))) (and (pair? l) l))))
+             (slots  (and layout (sa-procedure-free-values x)))
+             (info (refuse-on-fail (lambda () (sa-procedure-info x))))
+             ;; No inspector information at all is fatal only when there is no
+             ;; layout to read positions through.
+             (tbl (begin (unless (or info layout) (refuse 'image-no))
                          (let ((h (make-hashtable string-hash string=?)))
-                           (for-each (lambda (p) (hashtable-set! h (car p) (cdr p)))
-                                     (cdr info))
+                           (when info
+                             (for-each (lambda (p) (hashtable-set! h (car p) (cdr p)))
+                                       (cdr info)))
                            h))))
         ;; frees and lives run in lockstep: frees names the wrapper parameter (and
         ;; the error message), lives says where this one's value comes from — a
         ;; variable in the live closure, or, for a spliced copy whose constant
         ;; argument left no capture, a one-element vector holding the value.
-        (let loop ((fs (jolt-seq frees)) (ls (jolt-seq lives)) (acc '()))
+        (let loop ((fs (jolt-seq frees)) (ls (jolt-seq lives)) (k 0) (acc '()))
           (if (jolt-nil? fs)
               (list->vector (reverse acc))
               (let* ((orig (jolt-first fs))
                      (live (if (jolt-nil? ls) orig (jolt-first ls)))
                      (val (if (string? live)
-                              (hashtable-ref tbl
-                                             (refuse-on-fail (lambda () (image-munge live)))
-                                             'image-missing)
+                              (let ((byname (hashtable-ref
+                                              tbl
+                                              (refuse-on-fail (lambda () (image-munge live)))
+                                              'image-missing)))
+                                ;; the name table first (it is exact when present),
+                                ;; the site's learned layout when it has nothing
+                                (if (and (eq? byname 'image-missing) layout slots)
+                                    (let ((idx (list-ref layout k)))
+                                      (if (and idx (fx<? idx (length slots)))
+                                          (list-ref slots idx)
+                                          'image-missing))
+                                    byname))
                               (refuse-on-fail (lambda () (jolt-nth live 0))))))
                 ;; A name the source references but the compiled closure does not
                 ;; carry: const-folding baked its value into the code (a let-bound
@@ -592,7 +651,7 @@
                 ;; naming the capture, so the failure is at dump time and actionable.
                 (if (eq? val 'image-missing)
                     (refuse (cons 'image-folded orig))
-                    (loop (jolt-next fs) (if (jolt-nil? ls) ls (jolt-next ls))
+                    (loop (jolt-next fs) (if (jolt-nil? ls) ls (jolt-next ls)) (fx+ k 1)
                           (cons (walk val (cons (string-append "free:" orig) path))
                                 acc))))))))))
 
@@ -604,8 +663,8 @@
                              (vector-ref (cdr reg) 1) (vector-ref (cdr reg) 2)
                              (vector))))
     (hashtable-set! memo x r)
-    (let ((fvs (image-recover-free-values x (vector-ref (cdr reg) 2) (vector-ref (cdr reg) 3)
-                                          walk path)))
+    (let ((fvs (image-recover-free-values x (cdr reg) (vector-ref (cdr reg) 2)
+                                          (vector-ref (cdr reg) 3) walk path)))
       (cond
         ((vector? fvs)
          (image-fnsrc-free-values-set! r fvs)
@@ -854,8 +913,8 @@
                                ;; the scan/dump disagreement the shared verdict
                                ;; above exists to prevent.
                                (let ((probe (image-recover-free-values
-                                              x (vector-ref (cdr v) 2) (vector-ref (cdr v) 3)
-                                              walk path)))
+                                              x (cdr v) (vector-ref (cdr v) 2)
+                                              (vector-ref (cdr v) 3) walk path)))
                                  (hashtable-set! memo x #t)
                                  (if (vector? probe)
                                      #t

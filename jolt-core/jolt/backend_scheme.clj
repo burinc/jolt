@@ -511,6 +511,15 @@
 ;; The gensym counter deliberately stays shared on the unit: swap! is atomic, and one
 ;; counter per process is what keeps a registered anon-fn name globally unique.
 (def ^:dynamic *cache-cells* nil)
+
+;; The source names a letrec* group is CURRENTLY initialising (letfn, and the
+;; state-machine loops core.async's CPS transform builds out of it). A literal in
+;; one of those inits may reference a sibling — or itself — and letrec* makes
+;; that legal because the reference is not read until the closure RUNS. Passing
+;; such a name to a maker as an ARGUMENT reads it immediately, while the binding
+;; is still uninitialised, which Chez reports as "variable lp__2 is not bound".
+;; So a literal whose free names meet this set gets no maker. See fnsrc-maker-site.
+(def ^:dynamic *letrec-binders* #{})
 (def ^:dynamic *const-pool* nil)
 
 ;; Emit a def's init (via the supplied thunk) under a fresh cache-cell collector,
@@ -1158,7 +1167,12 @@
 (defn- emit-let [node]
   (let [kw (if (:letrec node) "letrec*" "let*")
         ;; bindings are non-tail; the body inherits the let's tail position
-        binds (binding [*tail?* false] (str/join " " (mapv emit-binding (:bindings node))))]
+        binds (binding [*tail?* false
+                        *letrec-binders* (if (:letrec node)
+                                           (into *letrec-binders*
+                                                 (map #(nth % 0) (:bindings node)))
+                                           *letrec-binders*)]
+                (str/join " " (mapv emit-binding (:bindings node))))]
     (str "(" kw " (" binds ") " (emit (:body node)) ")")))
 
 (defn- emit-loop [node]
@@ -1662,6 +1676,43 @@
 ;; A row that throws leaves whatever it interned before throwing in the pool, so
 ;; the let* can carry a binding nothing references. Dead, valid, and confined to a
 ;; path that is already best-effort.
+;; The per-site makers, as top-level defines. Emitted AHEAD of the registrations
+;; that name them and of the form itself, so a form whose own evaluation creates
+;; one of these closures finds the maker already defined.
+;; A site's MAKER: (lambda (free…) <the literal>), which the site then calls.
+;;
+;; Writing a closure to an image needs its captured values, and Chez hands those
+;; back by POSITION. The NAMES that say which is which are inspector information,
+;; which a release build does not generate — it costs +117% on the compiled
+;; prelude, a debugging model of every procedure, to name the captures of a few
+;; hundred. So `jolt run` refused every closure clojure.core makes (cycle,
+;; repeat, partial, comp) while a default app build, which does generate it,
+;; wrote them fine. The position order is not the source order and is not ours to
+;; predict.
+;;
+;; A maker settles it: every instance of a site comes from one code object, so
+;; the capture layout is a property of the CODE and identical across instances.
+;; The image calls the maker once with distinct sentinels, sees which slot each
+;; landed in, and reads every later instance through that permutation.
+;;
+;; The maker is built HERE, in the site's own scope, and not hoisted to the top of
+;; the form. Hoisting looked cheaper — one maker per form rather than one per
+;; closure — but the emitted body can reference bindings this scope has and that
+;; one does not: a cache cell, and, as core.async's CPS transform showed, the
+;; gensym a `letfn*` binds around a loop. Hoisted, those are unbound at runtime.
+;; Only the FIRST maker is registered (the cell guards it), because all it is used
+;; for is the layout, and every instance shares the code object that decides it.
+(defn- fnsrc-maker-site [nm frees inner]
+  (let [c (fresh-label "_mkc$")
+        v (fresh-label "_mk$")
+        ps (map munge-name frees)
+        args (apply str (map #(str " " %) ps))]
+    (swap! *cache-cells* conj c)
+    (str "(let ((" v " (lambda (" (str/join " " ps) ") " inner "))) "
+         "(if (not " c ") (begin (set! " c " #t) "
+         "(image-fn-form-maker! " (chez-str-lit nm) " " v "))) "
+         "(" v args "))")))
+
 (defn- fnsrc-flush []
   (if (or (fnsrc-system-ns? *fnsrc-ns*) (empty? @*fnsrc-regs*))
     ""
@@ -1758,6 +1809,13 @@
         clauses (binding [*known-procs* (if self (conj *known-procs* self) *known-procs*)
                           *trace-site* (or qname self)
                           *trace-self* (cond-> #{} self (conj self) qname (conj qname))
+                          ;; An enclosing letrec's bindings are initialised by the
+                          ;; time anything in THIS body runs, so a literal nested
+                          ;; here may name one — map-indexed's lazy-seq thunk
+                          ;; referencing the letfn-bound mapi is the ordinary case.
+                          ;; The constraint applies only to a literal created
+                          ;; DURING the initialisation, which is this fn itself.
+                          *letrec-binders* #{}
                           *fnsrc-def-init?* false]
                   (mapv emit-arity-clause arities))
         lambda (if (= 1 (count clauses))
@@ -1807,10 +1865,23 @@
             ;; a registered inner literal: the lambda sits in the UNIQUE binding
             ;; (that is what names the procedure), the short name aliases it
             fnsrc-nm
-            (do (swap! *fnsrc-regs* conj
-                       [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node)
-                        (:live-names node)])
-                (str "(letrec* ((" fnsrc-nm " " lambda ") (" m " " fnsrc-nm ")) " ret ")"))
+            (let [inner (str "(letrec* ((" fnsrc-nm " " lambda ") (" m " " fnsrc-nm ")) "
+                             ret ")")]
+              ;; the same maker treatment as an anonymous literal below, and for
+              ;; the same reason — a letfn-bound fn that a lazy-seq thunk closes
+              ;; over is exactly what map-indexed, distinct and tree-seq capture
+              (if (or (:live-names node) (nil? *cache-cells*)
+                    ;; nothing captured, nothing to recover: the restore wrapper
+                    ;; binds no free names, so this closure never needs a layout
+                    (empty? (:free-names node))
+                    (some *letrec-binders* (:free-names node)))
+                (do (swap! *fnsrc-regs* conj
+                           [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node)
+                            (:live-names node)])
+                    inner)
+                (do (swap! *fnsrc-regs* conj
+                           [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node) nil])
+                    (fnsrc-maker-site fnsrc-nm (:free-names node) inner))))
             :else
             (str "(letrec ((" m " " lambda ")) " ret ")"))))
       (if (not fnsrc-nm)
@@ -1837,12 +1908,50 @@
         ;; left) — absent for a literal that was not spliced.
         (let [nm fnsrc-nm
               form (:src-form node)
-              frees (:free-names node)]
-          (swap! *fnsrc-regs* conj [nm form fnsrc-src-ns frees (:live-names node)])
-          (if variadic-fixed
-            (str "(letrec ((" nm " " lambda ")) "
-                 "(jolt-register-variadic! " variadic-fixed " " nm "))")
-            (str "(letrec ((" nm " " lambda ")) " nm ")")))))))
+              frees (:free-names node)
+              lives (:live-names node)
+              inner (if variadic-fixed
+                      (str "(letrec ((" nm " " lambda ")) "
+                           "(jolt-register-variadic! " variadic-fixed " " nm "))")
+                      (str "(letrec ((" nm " " lambda ")) " nm ")"))]
+          ;; A MAKER, for every literal that was not spliced: one top-level
+          ;; (lambda (free…) <the literal>) that this site then calls, so the
+          ;; closure comes from a code object the image can reach.
+          ;;
+          ;; Why: writing a closure to an image needs its captured values, and
+          ;; those are read out of the live closure. Chez hands them back by
+          ;; POSITION; the NAMES that say which is which live in inspector
+          ;; information, which a release build does not generate — it costs
+          ;; +117% on the compiled prelude, for a debugging model of every
+          ;; procedure, to name the captures of a few hundred. So `jolt run`
+          ;; refused every closure clojure.core makes (cycle, repeat, partial,
+          ;; comp) while a default app build, which does generate it, wrote them
+          ;; fine. The position order is not the source order and is not ours to
+          ;; predict.
+          ;;
+          ;; A maker settles it without inspector information: every instance of
+          ;; a site shares one code object, so the layout is a property of the
+          ;; code and identical across instances. The image calls the maker once
+          ;; with distinct sentinels, sees which position each landed in, and
+          ;; reads every later instance through that permutation. The cost is one
+          ;; closure per site at first dump and one call per closure creation.
+          ;;
+          ;; A SPLICED copy keeps the old emission: its captures no longer stand
+          ;; in one-to-one correspondence with the source's free names (a binder
+          ;; was renamed, an argument was folded to a constant), which is what
+          ;; :live-names records, so there is no honest parameter list to give a
+          ;; maker. Those still need inspector information, which the builds that
+          ;; splice (an app build, not the seed) generate by default.
+          (if (or lives (nil? *cache-cells*)
+                  (empty? frees)
+                  (some *letrec-binders* frees))
+            ;; no maker: a spliced copy (see above), or a literal emitted outside
+            ;; any cache-cell scope — there would be nowhere to bind one, and a
+            ;; site calling an unbound maker is worse than a closure that refuses.
+            (do (swap! *fnsrc-regs* conj [nm form fnsrc-src-ns frees lives])
+                inner)
+            (do (swap! *fnsrc-regs* conj [nm form fnsrc-src-ns frees nil])
+                (fnsrc-maker-site nm frees inner))))))))
 
 ;; If fnode is a clojure.core (or host) ref to a native-op primitive, return the
 ;; Scheme op string — only at an arity where the Scheme op and the jolt fn agree.
@@ -2780,9 +2889,10 @@
                 (emit-def-cached node)
                 :else (emit-top-cells node #(emit node)))
           freg (fnsrc-flush)]
-      (if (= freg "") scm
+      (cond
+        (= freg "") scm
           ;; registrations run BEFORE the form: they are static data with no
           ;; dependency on the form's evaluation, and the form itself may dump a
           ;; closure it just created — the registration must already be there.
           ;; begin keeps the form's value as the result.
-          (str "(begin" freg " " scm ")")))))
+        :else (str "(begin" freg " " scm ")")))))

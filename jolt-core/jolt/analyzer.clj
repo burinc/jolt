@@ -402,11 +402,24 @@
                             (into (if (:name n) (conj bound (:name n)) bound)
                                   (if (:rest a) (conj (:params a) (:rest a)) (:params a))))))
                   (or (= op :let) (= op :loop))
-                  (let [b* (reduce (fn [b [nm init]]
-                                     (walk init b)
-                                     (conj b nm))
-                                   bound (:bindings n))]
-                    (walk (:body n) b*))
+                  ;; letrec (letfn, and the state-machine loops core.async's CPS
+                  ;; transform builds from it) binds EVERY name across EVERY init,
+                  ;; including the init's own. Walking those inits with only the
+                  ;; earlier names bound — which is right for let* and loop, where
+                  ;; an init sees only what precedes it — reports a letrec binding
+                  ;; as free in its own init. That over-approximates :free-names,
+                  ;; and a name the literal itself binds has no captured value to
+                  ;; recover, so the closure refuses at dump for a variable that
+                  ;; was never a capture.
+                  (if (:letrec n)
+                    (let [b* (into bound (map first (:bindings n)))]
+                      (doseq [b (:bindings n)] (walk (second b) b*))
+                      (walk (:body n) b*))
+                    (let [b* (reduce (fn [b [nm init]]
+                                       (walk init b)
+                                       (conj b nm))
+                                     bound (:bindings n))]
+                      (walk (:body n) b*)))
                   (= op :try)
                   (do (walk (:body n) bound)
                       (when (:catch-body n)
