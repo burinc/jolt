@@ -126,7 +126,7 @@
 ;; arguments -- a self-referential producer ((def fib (lazy-cat [0 1] (map + fib
 ;; (rest fib))))) reaches its own cell through them.
 (define-record-type lazy-src
-  (fields (mutable fn) (mutable a) (mutable b) (mutable c))
+  (fields (mutable fn) (mutable a) (mutable b))
   (nongenerative jolt-lazy-src-v1))
 
 ;; producer name <-> forcer. The dump needs name-of (a procedure cannot travel);
@@ -139,41 +139,68 @@
   proc)
 (define (lazy-src-name-of proc) (hashtable-ref lazy-src-name-tbl proc #f))
 (define (lazy-src-proc-of name) (hashtable-ref lazy-src-proc-tbl name #f))
-(define (lazy-src-force t)
-  ((lazy-src-fn t) (lazy-src-a t) (lazy-src-b t) (lazy-src-c t)))
+(define (lazy-src-force t) ((lazy-src-fn t) (lazy-src-a t) (lazy-src-b t)))
 ;; a cseq's unforced tail is either a thunk or a descriptor, same as a lazy
 ;; cell's. One record predicate on the force path, measured at no cost.
 (define (cseq-run-tail t) (if (lazy-src? t) (lazy-src-force t) (t)))
 
 ;; forced tail of a seq whose own tail was not yet realized (jolt-rest)
 (define lz-rest
-  (register-lazy-src! 'rest (lambda (s _b _c) (jolt-seq (seq-more s)))))
+  (register-lazy-src! 'rest (lambda (s _b) (jolt-seq (seq-more s)))))
+(define lz-map-more
+  (register-lazy-src! 'map-more
+    (lambda (f s) (map-seq f (jolt-seq (seq-more s))))))
+(define lz-mapN-more
+  (register-lazy-src! 'mapN-more
+    (lambda (f seqs)
+      (map-seq* f (map (lambda (s) (jolt-seq (seq-more s))) seqs)))))
+(define lz-filter-more
+  (register-lazy-src! 'filter-more
+    (lambda (pred s) (filter-seq pred (jolt-seq (seq-more s)) #t))))
+(define lz-remove-more
+  (register-lazy-src! 'remove-more
+    (lambda (pred s) (filter-seq pred (jolt-seq (seq-more s)) #f))))
+(define lz-str-seq
+  (register-lazy-src! 'str-seq (lambda (s i) (str->seq s (fx+ i 1)))))
+(define lz-range-from
+  (register-lazy-src! 'range-from (lambda (n _b) (range-from (+ n 1)))))
+(define lz-repeat
+  (register-lazy-src! 'repeat
+    (lambda (n end+step) (range-chunked n (car end+step) (cdr end+step) sk-repeat))))
+(define lz-iterate
+  (register-lazy-src! 'iterate (lambda (f x) (jolt-iterate f (jolt-invoke1 f x)))))
 (define lz-map-chunk
   (register-lazy-src! 'map-chunk
-    (lambda (f s _c) (jolt-seq (map-seq f (jolt-seq (na-chunk-rest s)))))))
+    (lambda (f s) (jolt-seq (map-seq f (jolt-seq (na-chunk-rest s)))))))
 (define lz-filter-chunk
   (register-lazy-src! 'filter-chunk
-    (lambda (pred s keep) (jolt-seq (filter-seq pred (jolt-seq (na-chunk-rest s)) keep)))))
+    (lambda (pred s) (jolt-seq (filter-seq pred (jolt-seq (na-chunk-rest s)) #t)))))
+(define lz-remove-chunk
+  (register-lazy-src! 'remove-chunk
+    (lambda (pred s) (jolt-seq (filter-seq pred (jolt-seq (na-chunk-rest s)) #f)))))
 ;; range carries four values through three slots: step and kind share the last.
 (define lz-range
   (register-lazy-src! 'range
-    (lambda (v end step+kind)
-      (jolt-seq (range-chunked v end (car step+kind) (cdr step+kind))))))
+    (lambda (v rest) (jolt-seq (range-chunked v (car rest) (cadr rest) (caddr rest))))))
+(define lz-empty (register-lazy-src! 'empty (lambda (_a _b) jolt-empty-list)))
+;; take's walk is a top-level fn, not a named let, so a cell's tail can name it
+(define (take-walk n s)
+  (cond
+    ((or (fx<=? n 0) (jolt-nil? s)) jolt-empty-list)
+    ((fx=? n 1) (cseq-lazy (seq-first s) (make-lazy-src lz-empty #f #f)))
+    (else (cseq-lazy (seq-first s) (make-lazy-src lz-take-walk (fx- n 1) s)))))
+(define lz-take-walk
+  (register-lazy-src! 'take-walk (lambda (n s) (take-walk n (jolt-seq (seq-more s))))))
 (define lz-take
   (register-lazy-src! 'take
-    (lambda (n coll _c)
+    (lambda (n coll)
       (jolt-seq
        (if (and (flonum? n) (infinite? n))
            (if (> n 0.0) (jolt-seq coll) jolt-empty-list)
            (let ((n (->idx n)))
              (if (fx<=? n 0)
                  jolt-empty-list                 ; (take 0 coll) must not seq its source
-                 (let loop ((n n) (s (jolt-seq coll)))
-                   (cond
-                     ((or (fx<=? n 0) (jolt-nil? s)) jolt-empty-list)
-                     ((fx=? n 1) (cseq-lazy (seq-first s) (lambda () jolt-empty-list)))
-                     (else (cseq-lazy (seq-first s)
-                                      (lambda () (loop (fx- n 1) (jolt-seq (seq-more s)))))))))))))))
+                 (take-walk n (jolt-seq coll)))))))))
 ;; clojure.core/list? — Clojure's (instance? IPersistentList x), which among the
 ;; seq flavors only PersistentList is.
 (define (cseq-list? s) (fx=? (cseq-kind s) sk-list))
@@ -361,7 +388,7 @@
 ;; A string's characters. clojure.lang.StringSeq, and the tail is one too.
 (define (str->seq s i)
   (if (fx>=? i (string-length s)) jolt-nil
-      (cseq-lazy/k (string-ref s i) (lambda () (str->seq s (fx+ i 1))) sk-string-seq)))
+      (cseq-lazy/k (string-ref s i) (make-lazy-src lz-str-seq s i) sk-string-seq)))
 ;; ---- seq arms: host types register here instead of set!-wrapping jolt-seq ----
 ;; Arms dispatch newest-registration-first (cons front, walk head-first), matching
 ;; the precedence the set! chains produced. The built-in types stay inline in
@@ -440,7 +467,7 @@
       ;; result (which may be jolt-empty-list, e.g. map's tail) back to cseq | nil,
       ;; the contract force-lazyseq relies on — else (seq (rest s)) of an empty
       ;; tail yields a truthy empty-list and walkers (distinct, dedupe) overrun.
-      (else (jolt-make-lazy-src lz-rest s #f #f)))))
+      (else (jolt-make-lazy-src lz-rest s #f)))))
 (define (jolt-next x)                  ; nil when the rest is empty
   ;; next = (seq (rest x)): the rest must be RE-SEQ'd so an empty tail collapses to
   ;; nil. seq-more on a lazy seq (e.g. map's) forces to jolt-empty-list, which is
@@ -1165,13 +1192,13 @@
       ((jolt-nil? s) jolt-empty-list)
       ((na-chunked-seq? s)
        (cseq-chunked (na-chunk-map-first s g) 0
-                     (jolt-make-lazy-src lz-map-chunk f s #f)))
+                     (jolt-make-lazy-src lz-map-chunk f s)))
       (else
-       (cseq-lazy (g (seq-first s)) (lambda () (map-seq f (jolt-seq (seq-more s)))))))))
+       (cseq-lazy (g (seq-first s)) (make-lazy-src lz-map-more f s))))))
 (define (map-seq* f seqs)              ; multi-collection map; stops at the shortest
   (if (any-nil? seqs) jolt-empty-list
       (cseq-lazy (apply jolt-invoke f (map seq-first seqs))
-                 (lambda () (map-seq* f (map (lambda (s) (jolt-seq (seq-more s))) seqs))))))
+                 (make-lazy-src lz-mapN-more f seqs))))
 ;; map is fully lazy: Clojure's (map f coll) is a LazySeq whose body — including
 ;; (f (first coll)) — runs only when forced, so a side-effecting f does not fire
 ;; at construction. Wrap the (eager-headed) map-seq in a lazy-seq node; forcing it
@@ -1179,13 +1206,13 @@
 ;; jolt-seq coerces map-seq's result (cseq | jolt-empty-list) to cseq | nil, the
 ;; contract force-lazyseq relies on (see jolt-rest).
 (define lz-map1
-  (register-lazy-src! 'map1 (lambda (f coll _) (jolt-seq (map-seq f (jolt-seq coll))))))
+  (register-lazy-src! 'map1 (lambda (f coll) (jolt-seq (map-seq f (jolt-seq coll))))))
 (define lz-mapN
-  (register-lazy-src! 'mapN (lambda (f colls _) (jolt-seq (map-seq* f (map jolt-seq colls))))))
+  (register-lazy-src! 'mapN (lambda (f colls) (jolt-seq (map-seq* f (map jolt-seq colls))))))
 (define (jolt-map f . colls)
   (if (null? (cdr colls))
-      (jolt-make-lazy-src lz-map1 f (car colls) #f)
-      (jolt-make-lazy-src lz-mapN f colls #f)))
+      (jolt-make-lazy-src lz-map1 f (car colls))
+      (jolt-make-lazy-src lz-mapN f colls)))
 
 ;; Chunk-preserving, like core.clj filter: a chunked source has pred applied to the
 ;; whole chunk, the kept elements packed into a fresh (possibly smaller) chunk, and
@@ -1207,19 +1234,22 @@
              (filter-seq pred (jolt-seq (na-chunk-rest s)) keep)
              (cseq-chunked
               c 0
-              (jolt-make-lazy-src lz-filter-chunk pred s keep)))))
+              (jolt-make-lazy-src (if keep lz-filter-chunk lz-remove-chunk) pred s)))))
       (else
        (let walk ((s s))
          (cond ((jolt-nil? s) jolt-empty-list)
                ((eq? keep (tp (seq-first s)))
-                (cseq-lazy (seq-first s) (lambda () (filter-seq pred (jolt-seq (seq-more s)) keep))))
+                (cseq-lazy (seq-first s)
+                           (make-lazy-src (if keep lz-filter-more lz-remove-more) pred s)))
                (else (walk (jolt-seq (seq-more s))))))))))
 ;; filter/remove are fully lazy (LazySeq): defer the predicate and the source seq
 ;; until forced, like Clojure. (lazy-seq* = a 0-arg lazy node coercing to cseq|nil.)
 (define lz-filter
-  (register-lazy-src! 'filter (lambda (pred coll keep) (jolt-seq (filter-seq pred (jolt-seq coll) keep)))))
-(define (jolt-filter pred coll) (jolt-make-lazy-src lz-filter pred coll #t))
-(define (jolt-remove pred coll) (jolt-make-lazy-src lz-filter pred coll #f))
+  (register-lazy-src! 'filter (lambda (pred coll) (jolt-seq (filter-seq pred (jolt-seq coll) #t)))))
+(define lz-remove
+  (register-lazy-src! 'remove (lambda (pred coll) (jolt-seq (filter-seq pred (jolt-seq coll) #f)))))
+(define (jolt-filter pred coll) (jolt-make-lazy-src lz-filter pred coll))
+(define (jolt-remove pred coll) (jolt-make-lazy-src lz-remove pred coll))
 
 ;; honors `reduced`: a reducing fn that returns (reduced x) stops the fold and
 ;; unwraps to x (so does a reduced INIT). Checked at entry, so the value returned
@@ -1355,7 +1385,7 @@
 
 ;; (range) with no bound is clojure.lang.Iterate on the JVM — it IS (iterate inc' 0)
 ;; there — so it wears the same flavor jolt-iterate does.
-(define (range-from n) (cseq-lazy/k n (lambda () (range-from (+ n 1))) sk-iterate))
+(define (range-from n) (cseq-lazy/k n (make-lazy-src lz-range-from n #f) sk-iterate))
 ;; A bounded range is a real chunked-seq, like clojure.lang.LongRange: eager, with
 ;; chunk-first handing out a block of up to 32 consecutive values. Each block is
 ;; materialized into a pvec and chunk-cons'd onto a lazy continuation, so a chunked
@@ -1373,7 +1403,7 @@
     ((= step 0)
      ;; JVM: (range start end 0) is Repeat.create(start) — it repeats start
      ;; forever, and is a clojure.lang.Repeat, not a range class at all.
-     (cseq-lazy/k n (lambda () (range-chunked n end step sk-repeat)) sk-repeat))
+     (cseq-lazy/k n (make-lazy-src lz-repeat n (cons end step)) sk-repeat))
     ((if (> step 0.0) (< n end) (> n end))
      (let loop ((i 0) (v n) (acc '()))
        (if (and (fx<? i seq-chunk-size) (if (> step 0.0) (< v end) (> v end)))
@@ -1382,7 +1412,7 @@
            ;; the JVM's own arrangement (both LongRange and Range implement
            ;; IChunkedSeq).
            (cseq-chunked/k (make-pvec (list->vector (reverse acc))) 0
-                           (jolt-make-lazy-src lz-range v end (cons step kind))
+                           (jolt-make-lazy-src lz-range v (list end step kind))
                            kind))))
     (else jolt-empty-list)))
 ;; Which range class the args select. clojure.core/range sends every argument
@@ -1430,16 +1460,16 @@
   ;; Double/POSITIVE_INFINITY coll) takes the whole coll on the JVM (the count
   ;; never reaches 0); test.check's rose-tree unchunk relies on it. Coercing +inf.0
   ;; to a fixnum index would throw, so take all up front in that case.
-  (jolt-make-lazy-src lz-take n coll #f))
+  (jolt-make-lazy-src lz-take n coll))
 ;; Dropping from a vector-backed cell is an index jump, not a walk: the result is
 ;; the same backing vector seen from further along. PersistentVector$ChunkedSeq
 ;; implements IDrop on the JVM for exactly this, and it is the difference between
 ;; 625ns and 18.5ms when dropping a million elements. As with count, the step
 ;; loop re-checks per cell so a few plain cells in front of a vector-backed one
 ;; still reach the jump.
-(define (jolt-drop n coll)
-  (jolt-make-lazy-seq
-   (lambda ()
+(define lz-drop
+  (register-lazy-src! 'drop
+    (lambda (n coll)
      (jolt-seq
       (let loop ((n (->idx n)) (s (jolt-seq coll)))
         (cond
@@ -1449,6 +1479,7 @@
            (let ((v (cseq-cvec s)) (i (fx+ (cseq-ci s) n)))
              (if (fx>=? i (pvec-count v)) jolt-empty-list (vec->seq v i))))
           (else (loop (fx- n 1) (jolt-seq (seq-more s))))))))))
+(define (jolt-drop n coll) (jolt-make-lazy-src lz-drop n coll))
 
 ;; (iterate f x) — x, (f x), (f (f x)), … as ONE lazy cell per element.
 ;; The overlay spelling, (cons x (lazy-seq (iterate f (f x)))), costs two records
@@ -1460,25 +1491,30 @@
 ;; Not chunked, matching clojure.lang.Iterate: chunking would realize up to 31
 ;; elements ahead and break the laziness contract callers depend on.
 (define (jolt-iterate f x)
-  (cseq-lazy/k x (lambda () (jolt-iterate f (jolt-invoke1 f x))) sk-iterate))
+  (cseq-lazy/k x (make-lazy-src lz-iterate f x) sk-iterate))
 
 ;; lazily append seq a then the seqable produced by the thunk `brest` — the rest
 ;; is NOT forced until a is exhausted, so concat is fully lazy (Clojure semantics).
 ;; This matters for a self-referential lazy-cat (fib = (lazy-cat [0 1] (map + (rest
 ;; fib) fib))): forcing the rest eagerly at construction would read fib before its
 ;; def binds, memoizing the tail as empty.
+;; brest is the REMAINING COLLS, not a thunk over them: a thunk is a closure, and
+;; a cell whose tail is one cannot be written to a state image (seq.ss lazy-src).
+;; (apply jolt-concat '()) is the empty seq, so the exhausted case still ends.
 (define (concat2 a brest)
-  (if (jolt-nil? a) (jolt-seq (brest))
-      (cseq-lazy (seq-first a) (lambda () (concat2 (jolt-seq (seq-more a)) brest)))))
+  (if (jolt-nil? a) (jolt-seq (apply jolt-concat brest))
+      (cseq-lazy (seq-first a) (make-lazy-src lz-concat2 a brest))))
+(define lz-concat2
+  (register-lazy-src! 'concat2
+    (lambda (a brest) (concat2 (jolt-seq (seq-more a)) brest))))
 (define lz-concat
   (register-lazy-src! 'concat
-    (lambda (colls _b _c)
+    (lambda (colls _b)
       (jolt-seq
        (cond ((null? colls) jolt-empty-list)
              ((null? (cdr colls)) (jolt-seq (car colls)))
-             (else (concat2 (jolt-seq (car colls))
-                            (lambda () (apply jolt-concat (cdr colls))))))))))
-(define (jolt-concat . colls) (jolt-make-lazy-src lz-concat colls #f #f))
+             (else (concat2 (jolt-seq (car colls)) (cdr colls))))))))
+(define (jolt-concat . colls) (jolt-make-lazy-src lz-concat colls #f))
 
 ;; Lazily concatenate a (possibly infinite) SEQ of colls — what (apply concat ss)
 ;; means, but without realizing ss. Pulls one coll at a time, so mapcat /
@@ -1495,19 +1531,24 @@
 ;; An empty inner coll is skipped without emitting a cell, and the outer seq is
 ;; advanced only at a boundary — so f runs once per inner collection, lazily,
 ;; exactly as before.
-(define (lazy-concat-seq ss)
-  (let outer ((s (jolt-seq ss)))
-    (if (jolt-nil? s)
-        jolt-empty-list
-        (let inner ((cur (jolt-seq (seq-first s))))
-          (if (jolt-nil? cur)
-              (outer (jolt-seq (seq-more s)))          ; empty inner: skip, no cell
-              (cseq-lazy (seq-first cur)
-                         (lambda ()
-                           (let ((nx (jolt-seq (seq-more cur))))
-                             (if (jolt-nil? nx)
-                                 (outer (jolt-seq (seq-more s)))   ; boundary
-                                 (inner nx))))))))))
+;; outer/inner are top-level rather than a named let, so a cell's tail can name
+;; them instead of closing over them (seq.ss lazy-src).
+(define (lazy-concat-outer s)
+  (if (jolt-nil? s)
+      jolt-empty-list
+      (lazy-concat-inner (jolt-seq (seq-first s)) s)))
+(define (lazy-concat-inner cur s)
+  (if (jolt-nil? cur)
+      (lazy-concat-outer (jolt-seq (seq-more s)))      ; empty inner: skip, no cell
+      (cseq-lazy (seq-first cur) (make-lazy-src lz-concat-inner cur s))))
+(define lz-concat-inner
+  (register-lazy-src! 'concat-inner
+    (lambda (cur s)
+      (let ((nx (jolt-seq (seq-more cur))))
+        (if (jolt-nil? nx)
+            (lazy-concat-outer (jolt-seq (seq-more s)))   ; boundary
+            (lazy-concat-inner nx s))))))
+(define (lazy-concat-seq ss) (lazy-concat-outer (jolt-seq ss)))
 
 ;; (apply f a b ... coll): spread the trailing seqable into the call.
 ;;
