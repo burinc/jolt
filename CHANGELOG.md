@@ -20,6 +20,32 @@ stays authoritative.
 
 ### Fixed
 
+- **A `File`'s path was kept exactly as given, not normalized.** Every JVM `File`
+  constructor runs its path through `FileSystem.normalize()`, so runs of `/`
+  collapse to one and a trailing `/` is dropped: `new File("/a/b//c").getPath()`
+  is `/a/b/c`. jolt answered `/a/b//c`. The visible route in was
+  `createTempFile`, since `$TMPDIR` ends in `/` on macOS and every temp file came
+  back carrying a doubled separator.
+
+  `clojure.java.io/file` had the same gap and a second one under it. It is
+  registered as the bare file constructor, whose multi-arg loop appends `/`
+  unconditionally, so `(io/file "/a/b/" "c")` gave `/a/b//c` where the JVM gives
+  `/a/b/c` — Clojure's own docstring says the multi-arg versions are equivalent
+  to `(File. parent child)`. That is the half more likely to bite, since
+  `(io/file dir name)` is everywhere and a directory read from config or the
+  environment often carries a trailing separator.
+
+  `jolt-file-join` already normalized, but only the JOIN SEAM — a trailing
+  separator off the parent, leading ones off the child, and it never looked
+  inside either. So `(File. "/a//b" "c")` still gave `/a//b/c`. Normalization now
+  lives in the `jfile` record's protocol instead: there are nine construction
+  sites and only one is the constructor entry point, so `as-file`, the `file:`
+  URL coercion, `createTempFile`, `getParentFile` and `listRoots` were each
+  building unnormalized paths of their own.
+
+  `.` and `..` are still not resolved. The JVM constructor does not resolve them
+  either; that is `getCanonicalPath`.
+
 - **`jolt run` could not write any closure `clojure.core` makes.** `cycle`,
   `repeat`, `partial`, `comp` and the rest refused with "captured local … was
   optimized into the compiled code" — while a default `jolt build` wrote them
