@@ -64,7 +64,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
-  devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform grenadine \
+  devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
@@ -128,7 +128,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
-  fnform traceemit traceeval degradedbacktrace \
+  fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
@@ -709,6 +709,14 @@ directlink:
 # closure's inspector name must agree; system-ns closures stay unregistered.
 fnform:
 	@$(CHEZ) --script test/chez/fnform-test.ss
+
+# Every clojure.core fn must be nameable in value position: the state image
+# writes a procedure as its var NAME, and a native that is set!-extended after
+# its def-var! leaves a procedure nothing named — so values built from it stop
+# being writable, silently. Swept from the var table, so a fn added later is
+# covered without anyone remembering.
+coreproc:
+	@$(CHEZ) --script test/chez/core-proc-name-test.ss
 
 # Compilation-unit context: the emit-session state (mode flags, direct-link
 # registries, ctor shapes, gensym, cache cells) is per-unit, so two units are
