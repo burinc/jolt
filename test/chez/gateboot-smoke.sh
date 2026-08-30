@@ -2,7 +2,7 @@
 # gateboot-smoke.sh — pin the gate boot image's staleness predicate.
 #
 # gate-boot.ss loads a precompiled target/dev/gate.so instead of the runtime
-# source when the image is newer than everything that went into it. Both paths
+# source when every input still has the content the image was built from. Both paths
 # behave identically, so a bug here is invisible in gate OUTPUT and shows up only
 # as a gate quietly testing code that is no longer on disk. This drives
 # gate-boot-image-fresh? directly over synthetic input lists in a temp dir, so it
@@ -31,21 +31,52 @@ probe() { # so inputs -> "#t" | "#f"
 CHEZEOF
 }
 
+# The hash of a file, from the same function the predicate and the writer use.
+hash_of() {
+  "$CHEZ" --script /dev/stdin <<CHEZEOF 2>/dev/null
+(import (chezscheme))
+(load "host/chez/gate-boot-fresh.ss")
+(display (gate-boot-hash-string "$1"))
+CHEZEOF
+}
+listing() { printf '%s %s\n' "$(hash_of "$1")" "$1"; }
+
 mkdir -p "$tmp/d"
-: > "$tmp/d/older"                       # an input, then the image, then a newer input
+printf 'original\n' > "$tmp/d/in"
 sleep 1
-: > "$tmp/image.so"
-printf '%s\n' "$tmp/d/older" > "$tmp/ok.inputs"
-check "image newer than its inputs is fresh"      "#t" "$(probe "$tmp/image.so" "$tmp/ok.inputs")"
-check "blank lines in the list are skipped"       "#t" "$(printf '\n%s\n\n' "$tmp/d/older" > "$tmp/blank.inputs"; probe "$tmp/image.so" "$tmp/blank.inputs")"
-check "no image is not fresh"                     "#f" "$(probe "$tmp/nope.so" "$tmp/ok.inputs")"
-check "no input list is not fresh"                "#f" "$(probe "$tmp/image.so" "$tmp/nope.inputs")"
-printf '%s\n' "$tmp/d/gone" > "$tmp/gone.inputs"
-check "a deleted input is not fresh"              "#f" "$(probe "$tmp/image.so" "$tmp/gone.inputs")"
-sleep 1
-: > "$tmp/d/newer"
-printf '%s\n%s\n' "$tmp/d/older" "$tmp/d/newer" > "$tmp/stale.inputs"
-check "an input newer than the image is stale"    "#f" "$(probe "$tmp/image.so" "$tmp/stale.inputs")"
+: > "$tmp/image.so"                      # the image is NEWER than its input
+listing "$tmp/d/in" > "$tmp/ok.inputs"
+
+check "an input with the content it was built from is fresh" \
+  "#t" "$(probe "$tmp/image.so" "$tmp/ok.inputs")"
+check "blank lines in the list are skipped" "#t" \
+  "$(printf '\n%s\n\n' "$(listing "$tmp/d/in")" > "$tmp/blank.inputs"; probe "$tmp/image.so" "$tmp/blank.inputs")"
+check "no image is not fresh"       "#f" "$(probe "$tmp/nope.so" "$tmp/ok.inputs")"
+check "no input list is not fresh"  "#f" "$(probe "$tmp/image.so" "$tmp/nope.inputs")"
+printf '%s %s\n' deadbeef "$tmp/d/gone" > "$tmp/gone.inputs"
+check "a deleted input is not fresh" "#f" "$(probe "$tmp/image.so" "$tmp/gone.inputs")"
+
+# THE ONE THAT MATTERS. Content changed, mtime left OLDER than the image — which
+# is what a build overlapping an edit produces, and what a preserved mtime
+# (cp -p, tar -x, a restored revision) produces. The mtime predicate this
+# replaced called it fresh, so the gate ran code that was no longer on disk.
+printf 'changed\n' > "$tmp/d/in"
+touch -t 202601010000 "$tmp/d/in"
+check "changed content with an OLDER mtime is stale" \
+  "#f" "$(probe "$tmp/image.so" "$tmp/ok.inputs")"
+
+# ...and restoring the exact bytes makes it fresh again, mtime notwithstanding:
+# the question is content, so an edit and its undo leave the image usable.
+printf 'original\n' > "$tmp/d/in"
+touch -t 202601010000 "$tmp/d/in"
+check "restored content is fresh again, whatever the mtime" \
+  "#t" "$(probe "$tmp/image.so" "$tmp/ok.inputs")"
+
+# A list from an older build has bare paths and no hash to check, so it cannot
+# be trusted; rebuilding is the safe reading.
+printf '%s\n' "$tmp/d/in" > "$tmp/legacy.inputs"
+check "a bare-path list from an older build is not fresh" \
+  "#f" "$(probe "$tmp/image.so" "$tmp/legacy.inputs")"
 
 # End to end: a gate consults the predicate and actually loads the image.
 #
