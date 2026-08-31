@@ -21,14 +21,17 @@
 (def ^:private SOCK-STREAM 1)
 
 (ffi/defcfn c-socket      "socket"      [:int :int :int] :int)
-(ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int :blocking)
+(ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int
+  {:blocking true :capture-native-error true})
 (ffi/defcfn c-bind        "bind"        [:int :pointer :int] :int)
 (ffi/defcfn c-listen      "listen"      [:int :int] :int)
 (ffi/defcfn c-accept      "accept"      [:int :pointer :pointer] :int :blocking)
 (ffi/defcfn c-setsockopt  "setsockopt"  [:int :int :int :pointer :int] :int)
 (ffi/defcfn c-getsockname "getsockname" [:int :pointer :pointer] :int)
-(ffi/defcfn c-recv        "recv"        [:int :pointer :size_t :int] :ssize_t :blocking)
-(ffi/defcfn c-send        "send"        [:int :pointer :size_t :int] :ssize_t :blocking)
+(ffi/defcfn c-recv        "recv"        [:int :pointer :size_t :int] :ssize_t
+  {:blocking true :capture-native-error true})
+(ffi/defcfn c-send        "send"        [:int :pointer :size_t :int] :ssize_t
+  {:blocking true :capture-native-error true})
 (ffi/defcfn c-close       "close"       [:int] :int)
 ;; ioctl is (int fd, unsigned long request, ...) — the :varargs marker puts the
 ;; third argument where the callee's va_list reads it. Binding it fixed-arity
@@ -171,10 +174,7 @@
   (let [ip (resolve-host host)
         sa (make-sockaddr ip port)
         r  (loop []
-             (let [r (c-connect fd sa 16)
-                   ;; captured before anything else runs, for the reason io-call
-                   ;; spells out above
-                   e (if (zero? r) 0 (poller/errno))]
+             (let [[r e] (c-connect fd sa 16)]
                (cond
                  (zero? r) 0
                  (poller/connect-pending? e)
@@ -293,16 +293,15 @@
   ;; there is not — and retries; EINTR retries immediately; anything else is
   ;; the syscall's real answer, returned as-is (callers read errno semantics).
   (loop []
-    (let [r (op)
-          ;; ERRNO IS READ HERE AND NOWHERE ELSE. It survives only until the next
-          ;; thing that can set it, and that includes reading it: the accessor is
-          ;; a foreign call, and an allocation on the way can trip a collection
-          ;; whose mmap leaves ENOMEM behind. Asking twice -- once for EINTR, once
-          ;; for EAGAIN -- read recv's EAGAIN as ENOMEM often enough to matter: the
-          ;; retry was missed, the -1 fell through, and a socket read answered EOF
-          ;; on a live connection. The (neg? r) guard is a fixnum compare, which
-          ;; allocates nothing and so cannot collect.
-          e (if (neg? r) (poller/errno) 0)]
+    (let [result (op)
+          captured? (vector? result)
+          r (if captured? (nth result 0) result)
+          ;; recv/send return [result errno] from the foreign return path.
+          ;; accept retains its legacy scalar binding and delayed read until
+          ;; that separate call is migrated.
+          e (if captured?
+              (nth result 1)
+              (if (neg? r) (poller/errno) 0))]
       (cond
         (and (neg? r) (poller/eintr? e)) (recur)
         (and (neg? r) (poller/eagain? e)) (do (poller/wait-ready fd wait-kind) (recur))
