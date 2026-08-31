@@ -28,10 +28,20 @@
 
 (load "host/chez/gate-boot-fresh.ss")
 
+;; The image's freshness is decided by the CONTENT of the files that went into
+;; it, which cannot see JOLT_NARROW_HASH: that knob is read at EXPAND time by
+;; hasheq.ss's define-width-op, so an image compiled without it holds the wide
+;; arms no matter how current its inputs are. Loading it under the narrow gate
+;; would silently test the wide path — the one thing that gate exists to catch.
+;; Take the source arm whenever it is set.
+(define (gate-boot-narrow-hash?)
+  (let ((v (getenv "JOLT_NARROW_HASH"))) (and v (not (string=? v "")))))
+
 ;; JOLT_GATEBOOT=1 announces which path was taken, mirroring JOLT_DEVCACHE for
 ;; the bin/jolt image — the only way to tell from the outside, since both paths
 ;; produce identical behavior.
-(if (gate-boot-image-fresh? "target/dev/gate.so" "target/dev/gate.inputs")
+(if (and (not (gate-boot-narrow-hash?))
+         (gate-boot-image-fresh? "target/dev/gate.so" "target/dev/gate.inputs"))
     (begin
       (when (let ((m (getenv "JOLT_GATEBOOT"))) (and m (not (string=? m ""))))
         (display "gateboot: using target/dev/gate.so\n" (current-error-port)))
