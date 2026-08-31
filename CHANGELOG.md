@@ -20,6 +20,38 @@ stays authoritative.
 
 ### Fixed
 
+- **A portable-bytecode build reported itself as Linux, wherever it was running.**
+  `sa-os-family` derived the OS by substring-matching Chez's machine tag, which
+  answers for a native tag and cannot answer for a bytecode one: `pb`, `pb64l`
+  and `tpb64l` name the threading, word size and endianness and deliberately
+  name no OS, because the same bytecode is meant to run on any of them. So the
+  `else` branch fired and every bytecode build called itself Linux, macOS
+  included (#796).
+
+  That function is the single place the rest of the host asks what OS this is,
+  so one wrong answer was wrong everywhere at once: `SIGCHLD` (20 vs 17),
+  `EAGAIN` (35 vs 11), `O_NONBLOCK`, `LC_TIME`, the `struct stat` offsets, the
+  chmod and entropy fallbacks, and the link libraries. The visible route in was
+  a socket — `jolt.nrepl` handed Darwin's `socket()` the Linux `SOCK_CLOEXEC`,
+  so a bytecode build on a Mac could not bind an nREPL server at all.
+
+  A tag containing `pb` now probes the running host instead of being parsed:
+  `/System/Library/CoreServices/SystemVersion.plist` for Darwin (chosen over
+  `libSystem.B.dylib` because it is readable from inside a sandbox, which
+  anything in the dyld shared cache is not), `/proc/self/status` for Linux,
+  `SystemRoot` for Windows, cached for the life of the process. Native tags
+  never reach the branch, so `tarm64osx`, `ta6nt` and `ta6le` resolve exactly as
+  before, and an unrecognized non-`pb` tag still falls through to `linux` rather
+  than newly probing.
+
+  Still open, and pinned by the gate so it is not mistaken for done: a pb tag
+  *does* carry its word size and endianness, and neither `sa-arch` nor
+  `sa-endian` parses that shape, so `pb64l` answers `other` and `#f`. Both
+  stat-layout arms in `nio-file` therefore stay false and a pb build on x86-64
+  Linux still refuses `getPosixFilePermissions`; the Darwin case is fixed only
+  because that guard does not consult the arch. Closing it needs probes of their
+  own.
+
 - **A `File`'s path was kept exactly as given, not normalized.** Every JVM `File`
   constructor runs its path through `FileSystem.normalize()`, so runs of `/`
   collapse to one and a trailing `/` is dropped: `new File("/a/b//c").getPath()`
