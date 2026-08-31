@@ -352,6 +352,19 @@
 (define-syntax fxsra
   (syntax-rules () ((_ a b) (arithmetic-shift a (- b)))))
 
+;; ../chez/collections.ss declares its HAMT bitmap operators through
+;; define-width-op, the form host/chez/hasheq.ss uses to pick fx vs generic
+;; arithmetic by the target's fixnum width. This target's own hash engine is
+;; host/gambit/hasheq.ss, so the Chez definition never loads here — and the
+;; question it answers is already settled above: the fx aliases in this file ARE
+;; the generic operators, for the same ~30-bit-fixnum reason Chez's tpb32l needs
+;; the narrow arm. So always take the wide arm; it is bignum-safe on this target.
+(define-syntax define-width-op
+  (syntax-rules ()
+    ((_ name wide narrow)
+     (define-syntax name
+       (syntax-rules () ((_ a (... ...)) (wide a (... ...))))))))
+
 ;; Chez fxlogbit? (i fx): #t when bit i of fixnum fx is set. Gambit 4.9.7 has
 ;; no bit-test primitive (no bitwise-bit-set? / fixnum bit-test in any module);
 ;; decompose via fxand + shift. Used by seq.ss's jolt-invoke* arity pre-checks

@@ -43,6 +43,61 @@
 ;; INTERNAL — reached only through jolt-hasheq.)
 
 ;; ============================================================================
+;; Fixnum-width selection for the 32-bit engine (shared with collections.ss).
+;; ============================================================================
+;; Every value this engine and the HAMT compute lives in the Java int window:
+;; [0, 2^32-1] unsigned, [-2^31, 2^31-1] signed. On a 64-bit Chez that whole
+;; window is fixnum, which is what makes the unsafe #3%fx chain below sound and
+;; what the measured fast path was tuned against. On a 32-bit target — tpb32l,
+;; the pb/WASM build — the positive fixnum ceiling is 2^29-1, so an ordinary int
+;; hash is a bignum and an fx op applied to it is unsound, not merely slow.
+;;
+;; define-width-op names one operator per pair and picks between them at EXPAND
+;; time, so exactly one arm reaches the compiler: on a wide target the generated
+;; code is the same #3%fx chain as before, with no runtime width test, no
+;; duplicated arms, and no reliance on cp0 folding the test away. It is one
+;; macro-generating macro rather than a hand-written (if (fixnum? ...) a b) per
+;; operator so the width question is asked in exactly ONE place — collections.ss
+;; declares its own HAMT operators through this same form.
+;;
+;; The test runs on the COMPILING Chez, which for a native build is the target.
+;; Cross-compiling to a target narrower than the host would have to consult the
+;; target's fixnum width here instead.
+;;
+;; JOLT_NARROW_HASH=1 in the compiling environment forces the narrow arm on a
+;; wide machine. That is what makes the generic arms executable under the
+;; ordinary gates instead of only on 32-bit hardware: `make narrowhash` replays
+;; the JVM-pinned hash suite and the collection suites with it set.
+(define-syntax define-width-op
+  (lambda (x)
+    (syntax-case x ()
+      ((_ name wide narrow)
+       (if (and (fixnum? #xFFFFFFFF) (not (getenv "JOLT_NARROW_HASH")))
+           #'(define-syntax name
+               (syntax-rules () ((_ a (... ...)) (wide a (... ...)))))
+           #'(define-syntax name
+               (syntax-rules () ((_ a (... ...)) (narrow a (... ...))))))))))
+
+;; The hash engine's operators. Unsafe #3% on the wide path: the window
+;; invariant documented above is the type check, and these are the measured
+;; inner chain of murmur3/mul32.
+(define-width-op hash-fx=?  #3%fx=?  =)
+(define-width-op hash-fx<?  #3%fx<?  <)
+(define-width-op hash-fx>=? #3%fx>=? >=)
+(define-width-op hash-fx+   #3%fx+   +)
+(define-width-op hash-fx-   #3%fx-   -)
+(define-width-op hash-fx*   #3%fx*   *)
+(define-width-op hash-fxand #3%fxand bitwise-and)
+(define-width-op hash-fxior #3%fxior bitwise-ior)
+(define-width-op hash-fxxor #3%fxxor bitwise-xor)
+(define-width-op hash-fxsll #3%fxsll bitwise-arithmetic-shift-left)
+(define-width-op hash-fxsra #3%fxsra bitwise-arithmetic-shift-right)
+;; fxsrl has no exact-integer twin, and needs none: every use below shifts a
+;; u32-masked (non-negative) operand, where the logical and arithmetic shifts
+;; agree. urs32 is the only entry point and it masks first.
+(define-width-op hash-fxsrl #3%fxsrl bitwise-arithmetic-shift-right)
+
+;; ============================================================================
 ;; 32-bit signed integer helpers — all macros (syntax-rules) so they textually
 ;; inline at every call site with zero procedure-call overhead.
 ;; ============================================================================
@@ -58,9 +113,9 @@
 ;; It also buys nothing: measured 2.1 ns either way, because the result is a
 ;; fixnum and Chez's generic bitwise-and is already fast for the fixnum case.
 ;;
-;; What the fx forms below rely on is the OUTPUT: (u32 x) is always in
-;; [0, 2^32-1] and therefore a fixnum, whatever came in. That is what makes
-;; i32/urs32/rotl32 safe to build on with unsafe fx ops.
+;; The output is always in [0, 2^32-1]. hash-fx* exploits that as a fixnum
+;; invariant only on wide-fixnum machines and uses generic exact arithmetic on
+;; narrower targets.
 (define-syntax u32
   (syntax-rules ()
     ((_ x) (#3%bitwise-and x #xFFFFFFFF))))
@@ -69,19 +124,21 @@
 (define-syntax i32
   (syntax-rules ()
     ((_ x) (let ((u (u32 x)))
-             (if (#3%fx>=? u #x80000000) (#3%fx- u #x100000000) u)))))
+             (if (hash-fx>=? u #x80000000) (hash-fx- u #x100000000) u)))))
 
-;; 32-bit wrapping multiply — fixnum-pure via 16-bit split.
+;; 32-bit wrapping multiply via a 16-bit split. On a wide-fixnum target the
+;; selected fast path is fixnum-pure; on a narrow target the same bounded
+;; intermediates use generic exact arithmetic.
 ;; Proof no step exceeds Chez's signed 61-bit fixnum range (±2^60−1):
 ;;   Let a ∈ [−2^31, 2^31−1] (after i32), b likewise.
 ;;   hi = low 16 bits of (b >>> 16) ∈ [0, 0xFFFF]
 ;;   lo = low 16 bits of b          ∈ [0, 0xFFFF]
-;;   (#3%fx* a hi) : |a| ≤ 2^31, hi ≤ 0xFFFF → |p| ≤ 2^47        ≪ 2^60  ✓
-;;   (#3%fxand p #xFFFF) ∈ [0, 0xFFFF]                              ≪ 2^60  ✓
-;;   (#3%fxsll ... 16)  ∈ [0, 0xFFFF0000] ≤ 2^32                   ≪ 2^60  ✓
-;;   (#3%fx* a lo) : |a| ≤ 2^31, lo ≤ 0xFFFF → |p| ≤ 2^47          ≪ 2^60  ✓
-;;   (#3%fx+ hi_part lo_part) : each ≤ max(2^32, 2^47) = 2^47 → sum ≤ 2^48 ≪ 2^60 ✓
-;;   final (#3%fxand sum #xFFFFFFFF) ∈ [0, 2^32−1]                  ≪ 2^60  ✓
+;;   (hash-fx* a hi) : |a| ≤ 2^31, hi ≤ 0xFFFF → |p| ≤ 2^47        ≪ 2^60  ✓
+;;   (hash-fxand p #xFFFF) ∈ [0, 0xFFFF]                              ≪ 2^60  ✓
+;;   (hash-fxsll ... 16)  ∈ [0, 0xFFFF0000] ≤ 2^32                   ≪ 2^60  ✓
+;;   (hash-fx* a lo) : |a| ≤ 2^31, lo ≤ 0xFFFF → |p| ≤ 2^47          ≪ 2^60  ✓
+;;   (hash-fx+ hi_part lo_part) : each ≤ max(2^32, 2^47) = 2^47 → sum ≤ 2^48 ≪ 2^60 ✓
+;;   final (hash-fxand sum #xFFFFFFFF) ∈ [0, 2^32−1]                  ≪ 2^60  ✓
 ;; After the unsigned 32-bit result is obtained, i32 converts back to signed.
 ;; a and b are each evaluated exactly once (let*-bound as a*/b*).
 (define-syntax mul32
@@ -89,23 +146,23 @@
     ((_ a b)
      (let* ((a* (i32 a))
             (b* (i32 b))
-            (hi (#3%fxand (#3%fxsra b* 16) #xFFFF))
-            (lo (#3%fxand b* #xFFFF))
-            (hi-part (#3%fxsll (#3%fxand (#3%fx* a* hi) #xFFFF) 16))
-            (lo-part (#3%fx* a* lo)))
-       (i32 (#3%fxand (#3%fx+ hi-part lo-part) #xFFFFFFFF))))))
+            (hi (hash-fxand (hash-fxsra b* 16) #xFFFF))
+            (lo (hash-fxand b* #xFFFF))
+            (hi-part (hash-fxsll (hash-fxand (hash-fx* a* hi) #xFFFF) 16))
+            (lo-part (hash-fx* a* lo)))
+       (i32 (hash-fxand (hash-fx+ hi-part lo-part) #xFFFFFFFF))))))
 
 ;; 32-bit wrapping add. a and b each evaluated once.
 (define-syntax add32
   (syntax-rules ()
-    ((_ a b) (i32 (#3%fx+ (i32 a) (i32 b))))))
+    ((_ a b) (i32 (hash-fx+ (i32 a) (i32 b))))))
 
 ;; Unsigned right shift (Java >>>). fxsrl on the masked value: the operand is a
 ;; fixnum and already non-negative after u32, so the logical and arithmetic shifts
 ;; agree and the fx form skips the generic dispatch.
 (define-syntax urs32
   (syntax-rules ()
-    ((_ x n) (#3%fxsrl (u32 x) n))))
+    ((_ x n) (hash-fxsrl (u32 x) n))))
 
 ;; Rotate left (Java Integer.rotateLeft). x and n each evaluated once.
 ;;
@@ -130,9 +187,9 @@
     ((_ x n)
      (let* ((x* (u32 x))
             (n* n)
-            (lo (#3%fxsll (#3%fxand x* (#3%fxsrl #xFFFFFFFF n*)) n*))
-            (hi (#3%fxsrl x* (#3%fx- 32 n*))))
-       (i32 (#3%fxior lo hi))))))
+            (lo (hash-fxsll (hash-fxand x* (hash-fxsrl #xFFFFFFFF n*)) n*))
+            (hi (hash-fxsrl x* (hash-fx- 32 n*))))
+       (i32 (hash-fxior lo hi))))))
 
 ;; ============================================================================
 ;; Murmur3 — exact port of clojure.lang.Murmur3.
@@ -155,18 +212,18 @@
     k1))
 
 (define (murmur3-mix-h1 h1 k1)
-  (let* ((h1 (#3%fxxor h1 k1))
+  (let* ((h1 (hash-fxxor h1 k1))
          (h1 (rotl32 h1 13))
          (h1 (add32 (mul32 h1 5) #xe6546b64)))
     h1))
 
 (define (murmur3-fmix h1 len)
-  (let* ((h1 (#3%fxxor h1 len))
-         (h1 (#3%fxxor h1 (urs32 h1 16)))
+  (let* ((h1 (hash-fxxor h1 len))
+         (h1 (hash-fxxor h1 (urs32 h1 16)))
          (h1 (mul32 h1 #x85ebca6b))
-         (h1 (#3%fxxor h1 (urs32 h1 13)))
+         (h1 (hash-fxxor h1 (urs32 h1 13)))
          (h1 (mul32 h1 #xc2b2ae35))
-         (h1 (#3%fxxor h1 (urs32 h1 16))))
+         (h1 (hash-fxxor h1 (urs32 h1 16))))
     h1))
 
 ;; The same three mixers as MACROS, so a caller gets the flat fx-op chain the
@@ -187,17 +244,17 @@
              (mul32 k1 murmur3-C2)))))
 (define-syntax murmur3-mix-h1-flat
   (syntax-rules ()
-    ((_ h k) (let* ((h1 (#3%fxxor h k))
+    ((_ h k) (let* ((h1 (hash-fxxor h k))
                     (h1 (rotl32 h1 13)))
                (add32 (mul32 h1 5) #xe6546b64)))))
 (define-syntax murmur3-fmix-flat
   (syntax-rules ()
-    ((_ h len) (let* ((h1 (#3%fxxor h len))
-                      (h1 (#3%fxxor h1 (urs32 h1 16)))
+    ((_ h len) (let* ((h1 (hash-fxxor h len))
+                      (h1 (hash-fxxor h1 (urs32 h1 16)))
                       (h1 (mul32 h1 #x85ebca6b))
-                      (h1 (#3%fxxor h1 (urs32 h1 13)))
+                      (h1 (hash-fxxor h1 (urs32 h1 13)))
                       (h1 (mul32 h1 #xc2b2ae35)))
-                 (#3%fxxor h1 (urs32 h1 16))))))
+                 (hash-fxxor h1 (urs32 h1 16))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Flat-inlined murmur3-hash-int for int32-range fixnums.
@@ -215,7 +272,7 @@
 (define (murmur3-hash-long-flat input)
   ;; input: fixnum. Java Long.hasheq: (int)(input ^ (input >>> 32))
   ;; If 0 → return 0; otherwise murmur3-hash-long with count=8.
-  (if (#3%fx=? input 0) 0
+  (if (hash-fx=? input 0) 0
       (let* ((low (i32 input))
              (high (i32 (bitwise-arithmetic-shift-right input 32)))
              ;; --- mixK1(low): mul32(low, C1) ---
@@ -223,7 +280,7 @@
              (k1 (rotl32 k1 15))
              (k1 (mul32 k1 murmur3-C2))
              ;; --- mixH1(seed, k1) ---
-             (h1 (#3%fxxor murmur3-seed k1))
+             (h1 (hash-fxxor murmur3-seed k1))
              (h1 (rotl32 h1 13))
              (h1 (add32 (mul32 h1 5) #xe6546b64))
              ;; --- mixK1(high) ---
@@ -231,23 +288,23 @@
              (k1 (rotl32 k1 15))
              (k1 (mul32 k1 murmur3-C2))
              ;; --- mixH1(h1 from low, k1 from high) ---
-             (h1 (#3%fxxor h1 k1))
+             (h1 (hash-fxxor h1 k1))
              (h1 (rotl32 h1 13))
              (h1 (add32 (mul32 h1 5) #xe6546b64))
              ;; --- fmix(h1, 8) ---
-             (h1 (#3%fxxor h1 8))
-             (h1 (#3%fxxor h1 (urs32 h1 16)))
+             (h1 (hash-fxxor h1 8))
+             (h1 (hash-fxxor h1 (urs32 h1 16)))
              (h1 (mul32 h1 #x85ebca6b))
-             (h1 (#3%fxxor h1 (urs32 h1 13)))
+             (h1 (hash-fxxor h1 (urs32 h1 13)))
              (h1 (mul32 h1 #xc2b2ae35))
-             (h1 (#3%fxxor h1 (urs32 h1 16))))
+             (h1 (hash-fxxor h1 (urs32 h1 16))))
         h1)))
 
 ;; Legacy entry points — kept for cold paths (strings, bignums).
 ;; The hot fixnum path in jolt-hasheq and key-hash calls the flat versions above.
 
 (define (murmur3-hash-int input)
-  (if (fx=? (i32 input) 0) 0
+  (if (hash-fx=? (i32 input) 0) 0
       (let* ((k1 (murmur3-mix-k1 (i32 input)))
              (h1 (murmur3-mix-h1 murmur3-seed k1)))
         (murmur3-fmix h1 4))))
@@ -280,16 +337,16 @@
 (define (java-string-hashcode s)
   (let ((len (string-length s)))
     (let loop ((i 0) (h 0))
-      (if (#3%fx>=? i len)
+      (if (hash-fx>=? i len)
           (i32 h)
           (let ((cp (char->integer (string-ref s i))))
-            (if (#3%fx<? cp #x10000)
-                (loop (#3%fx+ i 1) (i32 (#3%fx+ (#3%fx* 31 h) cp)))
-                (let* ((cp2 (#3%fx- cp #x10000))
+            (if (hash-fx<? cp #x10000)
+                (loop (hash-fx+ i 1) (i32 (hash-fx+ (hash-fx* 31 h) cp)))
+                (let* ((cp2 (hash-fx- cp #x10000))
                        (high (fxior #xD800 (fxsra cp2 10)))
                        (low  (fxior #xDC00 (fxand cp2 #x3FF))))
-                  (let ((h* (i32 (#3%fx+ (#3%fx* 31 h) high))))
-                    (loop (#3%fx+ i 1) (i32 (#3%fx+ (#3%fx* 31 h*) low)))))))))))
+                  (let ((h* (i32 (hash-fx+ (hash-fx* 31 h) high))))
+                    (loop (hash-fx+ i 1) (i32 (hash-fx+ (hash-fx* 31 h*) low)))))))))))
 
 (define (murmur3-hash-unencoded-chars s)
   ;; Match Java's Murmur3.hashUnencodedChars(CharSequence) over the
@@ -310,39 +367,39 @@
   ;; astral, mixed and every length 0..64 in test/chez/hasheq-test.ss.
   (let ((len (string-length s)))
     (let loop ((i 0) (h1 murmur3-seed) (pending #f) (count 0))
-      (if (#3%fx>=? i len)
+      (if (hash-fx>=? i len)
           (if pending
               ;; One unpaired unit left — mix and finalize
               (let* ((k1 (murmur3-mix-k1-flat pending))
-                     (h1 (#3%fxxor h1 k1)))
-                (murmur3-fmix-flat h1 (#3%fx* 2 (#3%fx+ count 1))))
-              (murmur3-fmix-flat h1 (#3%fx* 2 count)))
+                     (h1 (hash-fxxor h1 k1)))
+                (murmur3-fmix-flat h1 (hash-fx* 2 (hash-fx+ count 1))))
+              (murmur3-fmix-flat h1 (hash-fx* 2 count)))
           (let ((cp (char->integer (string-ref s i))))
-            (if (#3%fx<? cp #x10000)
+            (if (hash-fx<? cp #x10000)
                 ;; BMP: one code unit
                 (if pending
                     ;; Pair pending + this unit; both consumed
                     (let* ((k1 (murmur3-mix-k1-flat
-                                (#3%fxior pending (#3%fxsll cp 16))))
+                                (hash-fxior pending (hash-fxsll cp 16))))
                            (h1 (murmur3-mix-h1-flat h1 k1)))
-                      (loop (#3%fx+ i 1) h1 #f (#3%fx+ count 2)))
+                      (loop (hash-fx+ i 1) h1 #f (hash-fx+ count 2)))
                     ;; Hold as pending (not counted yet)
-                    (loop (#3%fx+ i 1) h1 cp count))
+                    (loop (hash-fx+ i 1) h1 cp count))
                 ;; Astral: surrogate pair (high, low) — always 2 units
-                (let* ((cp2 (#3%fx- cp #x10000))
+                (let* ((cp2 (hash-fx- cp #x10000))
                        (high (fxior #xD800 (fxsra cp2 10)))
                        (low  (fxior #xDC00 (fxand cp2 #x3FF))))
                   (if pending
                       ;; Pair pending + high (consumed), low becomes new pending
                       (let* ((k1 (murmur3-mix-k1-flat
-                                  (#3%fxior pending (#3%fxsll high 16))))
+                                  (hash-fxior pending (hash-fxsll high 16))))
                              (h1 (murmur3-mix-h1-flat h1 k1)))
-                        (loop (#3%fx+ i 1) h1 low (#3%fx+ count 2)))
+                        (loop (hash-fx+ i 1) h1 low (hash-fx+ count 2)))
                       ;; High + low consumed together
                       (let* ((k1 (murmur3-mix-k1-flat
-                                  (#3%fxior high (#3%fxsll low 16))))
+                                  (hash-fxior high (hash-fxsll low 16))))
                              (h1 (murmur3-mix-h1-flat h1 k1)))
-                        (loop (#3%fx+ i 1) h1 #f (#3%fx+ count 2)))))))))))
+                        (loop (hash-fx+ i 1) h1 #f (hash-fx+ count 2)))))))))))
 
 ;; ============================================================================
 ;; Long.hashCode (Java): (int)(value ^ (value >>> 32))
@@ -417,14 +474,14 @@
     (if (jolt-nil? xs)
         (mix-coll-hash h n)
         (loop (jolt-seq (seq-more xs))
-              (#3%fx+ n 1)
-              (i32 (#3%fx+ (#3%fx* 31 h) (jolt-hasheq (seq-first xs))))))))
+              (hash-fx+ n 1)
+              (i32 (hash-fx+ (hash-fx* 31 h) (jolt-hasheq (seq-first xs))))))))
 
 ;; Compute hash-ordered of a 2-element sequence [k v] — exactly what
 ;; MapEntry-as-vector yields on the JVM. Inlined to avoid cseq allocs.
 (define (entry-hasheq k v)
-  (let* ((h1 (i32 (#3%fx+ 31 (jolt-hasheq k))))
-         (h2 (i32 (#3%fx+ (#3%fx* 31 h1) (jolt-hasheq v)))))
+  (let* ((h1 (i32 (hash-fx+ 31 (jolt-hasheq k))))
+         (h2 (i32 (hash-fx+ (hash-fx* 31 h1) (jolt-hasheq v)))))
     (mix-coll-hash h2 2)))
 
 (define (hash-unordered xs)
@@ -433,7 +490,7 @@
         (mix-coll-hash h n)
         (let ((e (seq-first xs)))
           (loop (jolt-seq (seq-more xs))
-                (#3%fx+ n 1)
+                (hash-fx+ n 1)
                 ;; add32: APersistentMap.mapHasheq/APersistentSet.setHasheq sum in a
                 ;; Java int (32-bit wrap), matching the native pmap/pset paths — so a
                 ;; custom coll that hashes via hash-unordered-coll (flatland's ordered
@@ -457,10 +514,10 @@
 (define (hash-combine seed hash)
   (let* ((seed (i32 seed))
          (hash (i32 hash))
-         (sl   (i32 (#3%fxsll seed 6)))
-         (sr   (#3%fxsra seed 2))
-         (sum  (i32 (#3%fx+ (i32 (#3%fx+ hash #x9e3779b9)) (i32 (#3%fx+ sl sr)))))
-         (result (#3%fxxor seed sum)))
+         (sl   (i32 (hash-fxsll seed 6)))
+         (sr   (hash-fxsra seed 2))
+         (sum  (i32 (hash-fx+ (i32 (hash-fx+ hash #x9e3779b9)) (i32 (hash-fx+ sl sr)))))
+         (result (hash-fxxor seed sum)))
     (i32 result)))
 
 ;; ============================================================================
@@ -650,7 +707,7 @@
                       (if (fx>=? j run)
                           (loop (fx+ i run) h)
                           (cloop (fx+ j 1)
-                                 (i32 (#3%fx+ (#3%fx* 31 h)
+                                 (i32 (hash-fx+ (hash-fx* 31 h)
                                               (jolt-hasheq (vector-ref leaf (fx+ off j))))))))))))))))
 
 ;; Seq hasheq, cached per HEAD object — the JVM's ASeq._hasheq. A cseq chain is

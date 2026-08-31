@@ -421,9 +421,14 @@
        (nil? (ffi/find-symbol "jolt_no_such_symbol_anywhere")))
 (check "load-system-library answers a library map naming what loaded"
        (string? (:path (ffi/load-system-library "m"))))
+;; The real candidate comes from load-system-library rather than being written
+;; in: libm's soname is per-platform (libm.so.6 on glibc, libm.dylib on macOS),
+;; and the row is about the ORDER, not the spelling. Whatever this host answers
+;; for "m" is by construction loadable, so putting a name that cannot exist in
+;; front of it tests exactly the one thing: the second candidate is the answer.
 (check "load-library tries candidates in order and answers the one that took"
-       (= "libm.so.6" (let [p (:path (ffi/load-library ["libnot-a-library.so.99" "libm.so.6"]))]
-                        (subs p (inc (.lastIndexOf p "/"))))))
+       (let [real (:path (ffi/load-system-library "m"))]
+         (= real (:path (ffi/load-library ["libnot-a-library.so.99" real])))))
 (check "load-library raises when no candidate loads"
        (rejects? #(ffi/load-library ["libnot-a-library.so.98" "libnot-a-library.so.99"])))
 (check "(load-library nil) is still the documented no-op"
