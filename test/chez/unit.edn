@@ -198,6 +198,8 @@
   {:suite "reader / namespaced-map boundary" :expr "(read-string \"#:nsmap.foo\")" :expected :throws}
   {:suite "reader / namespaced-map boundary" :expr "(read-string \"#:nsmap.foo :a\")" :expected :throws}
   {:suite "reader / namespaced-map boundary" :expr "(read-string \"#: {:a 1}\")" :expected :throws}
+  {:suite "reader / namespaced-map namespace" :expr "(try (read-string \"#:foo/bar{:a 1}\") (catch Throwable e (ex-message e)))" :expected "\"Namespaced map must specify a valid namespace: foo/bar\""}
+  {:suite "reader / namespaced-map namespace" :expr "(try (read-string \"#:123{:a 1}\") (catch Throwable e (ex-message e)))" :expected "\"Namespaced map must specify a valid namespace: 123\""}
   {:suite "reader / namespaced-map boundary" :expr "(read-string \"#::missing-alias {:a 1}\")" :expected :throws}
   {:suite "hostctor" :expr "(String/format \"%d-%s\" 5 \"x\")" :expected "\"5-x\""}
   {:suite "hostctor" :expr "[(.format (java.text.NumberFormat/getInstance) 1234567.5) (.format (java.text.NumberFormat/getIntegerInstance) 1234567)]" :expected "[\"1,234,567.5\" \"1,234,567\"]"}
