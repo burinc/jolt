@@ -40,6 +40,36 @@
            (ffi/close-arena a)
            (ffi/close-arena a))
          (= 1 @frees)))
+;; The check and the attach are one step. If they were not, an alloc that passed
+;; the check just before another thread's close would conj its block onto the
+;; state close had already reset — attached to a group nothing will ever release.
+;; Racing it directly is timing-dependent, so the row closes the arena from
+;; inside the swap instead, which is the interleaving the fix exists for.
+(check "a block cannot attach to an arena that closed mid-allocation"
+       (let [a (ffi/shared-arena)
+             real-free ffi/__free
+             real-calloc ffi/__calloc
+             frees (atom 0)]
+         (with-redefs [ffi/__free (fn [p] (swap! frees inc) (real-free p))
+                       ffi/__calloc (fn [n]
+                                      (let [p (real-calloc n)]
+                                        (ffi/close-arena a)   ; the racing close
+                                        p))]
+           (and (rejects? #(ffi/alloc a 8))
+                ;; the block the alloc had already taken was handed back
+                (= 1 @frees)))))
+(check "a lost allocation is not left recorded in the size table"
+       (let [a (ffi/shared-arena)
+             real-calloc ffi/__calloc
+             seen (atom nil)]
+         (with-redefs [ffi/__calloc (fn [n]
+                                      (let [p (real-calloc n)]
+                                        (reset! seen p)
+                                        (ffi/close-arena a)
+                                        p))]
+           (rejects? #(ffi/alloc a 8)))
+         (zero? (ffi/size @seen))))
+
 (check "allocating in a closed arena raises"
        (let [a (ffi/confined-arena)]
          (ffi/close-arena a)
