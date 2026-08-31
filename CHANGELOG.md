@@ -204,6 +204,11 @@ when transposed.
   corrupt. Reported and first patched by @jasalt, found bringing up a
   WASM/Emscripten build.
 
+- **Modeled atomic classes used Clojure value equality and unbounded
+  arithmetic.** `AtomicReference.compareAndSet` now compares object identity,
+  while `AtomicInteger` and `AtomicLong` validate primitive arguments and wrap
+  arithmetic at their signed 32- and 64-bit widths, matching the JVM.
+
 - **`getPosixFilePermissions` and `getOwner` refused to run on hosts whose
   layout jolt already knew.** `nio-file` reads `st_mode` and `st_uid` at offsets
   that are a per-platform ABI, and it chose them from the host's *identity*:
