@@ -4,33 +4,40 @@
 clojure.core-test.abs 1 0
 clojure.core-test.bigint 3 0
 clojure.core-test.byte 1 0
-# descendants: the suite's :bb branch expects class-as-SYMBOL in hierarchies
-# (babashka's model); jolt derives with the class VALUE like the JVM, so the
-# three set-equality rows miss. See the class model notes in known-divergences.
-clojure.core-test.descendants 3 0
 # char: the suite's "4+ byte characters" case is host-dependent — it expects a
 # throw on the JVM but the character itself on jank and basilisp, which index
 # strings by code point as jolt does. jolt has no branch there so it takes
 # :default; (= (first "\u{10127}") (char 65895)) holds here exactly as the :lpy
 # branch asserts. See the :string-model entry in known-divergences.edn.
 clojure.core-test.char 1 0
+clojure.core-test.contains-qmark 0 9
 clojure.core-test.dec 1 0
+# descendants: the suite's :bb branch expects class-as-SYMBOL in hierarchies
+# (babashka's model); jolt derives with the class VALUE like the JVM, so the
+# three set-equality rows miss. See the class model notes in known-divergences.
+clojure.core-test.descendants 3 0
 clojure.core-test.double-qmark 3 0
 clojure.core-test.eq 1 0
 clojure.core-test.float 1 0
 clojure.core-test.inc 1 0
 clojure.core-test.int-qmark 3 0
 clojure.core-test.lazy-seq 1 2
+clojure.core-test.list 1 0
 clojure.core-test.minus 2 0
-clojure.core-test.mod 18 0
+clojure.core-test.mod 22 0
 clojure.core-test.neg-int-qmark 1 0
 clojure.core-test.not-eq 1 0
-# num: the suite's :bb branch asserts (num nil) => nil (babashka leniency);
-# jolt throws like the JVM. The other numeric rows now match through :bb.
+clojure.core-test.nth 0 7
+# num: the file carries TWO :bb branches and jolt takes both. The first,
+# #?(:bb nil :clj (do (definterface IChecker ...))), skips a definterface
+# block that jolt in fact supports; the second asserts (num nil) => nil
+# (babashka leniency) where jolt throws like the JVM. So the whole :clj path
+# is viable here and the error is recoverable suite-side with a :jolt branch
+# placed ahead of :bb. The other numeric rows match through :bb already.
 clojure.core-test.num 0 1
 clojure.core-test.parse-uuid 3 0
 clojure.core-test.plus 11 0
-clojure.core-test.plus-squote 11 0
+clojure.core-test.plus-squote 13 0
 clojure.core-test.pos-int-qmark 1 0
 clojure.core-test.quot 25 0
 clojure.core-test.rem 16 0
@@ -39,3 +46,4 @@ clojure.core-test.star 11 0
 clojure.core-test.star-squote 13 0
 clojure.core-test.transient 4 0
 clojure.core-test.vec 1 0
+clojure.string-test.replace 7 0
