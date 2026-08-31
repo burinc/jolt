@@ -207,7 +207,8 @@ when transposed.
 - **Modeled atomic classes used Clojure value equality and unbounded
   arithmetic.** `AtomicReference.compareAndSet` now compares object identity,
   while `AtomicInteger` and `AtomicLong` validate primitive arguments and wrap
-  arithmetic at their signed 32- and 64-bit widths, matching the JVM.
+  arithmetic at their signed 32- and 64-bit widths, and `AtomicLong.intValue`
+  narrows to a signed 32-bit result, matching the JVM.
 
 - **`getPosixFilePermissions` and `getOwner` refused to run on hosts whose
   layout jolt already knew.** `nio-file` reads `st_mode` and `st_uid` at offsets
