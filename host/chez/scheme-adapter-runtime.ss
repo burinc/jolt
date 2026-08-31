@@ -181,28 +181,46 @@
 ;; macOS — which picks the Linux SIGCHLD, EAGAIN, O_NONBLOCK, LC_TIME and
 ;; struct-stat values on a Darwin host. Probe instead.
 (define (sa-os-family)
-  (let ((m (sa-host-tag)))
-    (cond ((or (sa-tag-contains? m "osx") (sa-tag-contains? m "macos")) 'macos)
-          ((or (sa-tag-contains? m "nt") (sa-tag-contains? m "windows")) 'windows)
-          ((sa-tag-contains? m "pb") (sa-probed-os-family))
-          (else 'linux))))
+  (sa-os-family-for-tag (sa-host-tag)))
+
+;; (sa-os-family-for-tag tag) -> 'macos | 'windows | 'linux
+;; The derivation above, as a function OF the tag, so the gate can pin the whole
+;; table on one host instead of only the row that host happens to be
+;; (test/chez/host-derived-props-test.ss). The bug this splits out of was in
+;; this cond and was reported with the cond transcribed into Clojure, because
+;; there was no way to ask it about a tag. NOT for callers: anything with a tag
+;; to pass is branching on the tag, which sa-host-tag's contract forbids.
+(define (sa-os-family-for-tag m)
+  (cond ((or (sa-tag-contains? m "osx") (sa-tag-contains? m "macos")) 'macos)
+        ((or (sa-tag-contains? m "nt") (sa-tag-contains? m "windows")) 'windows)
+        ((sa-tag-contains? m "pb") (sa-probed-os-family))
+        (else 'linux)))
 
 ;; (sa-arch) -> 'x86-64 | 'arm64 | 'i386 | 'other
 ;; The machine architecture — the nio-file stat-layout guard keys on x86-64.
 ;; Contract: the architecture symbol. Degradation: 'other for an unrecognized
 ;; host; callers treat it as unverified.
 (define (sa-arch)
-  (let ((m (sa-host-tag)))
-    (cond ((sa-tag-contains? m "arm64") 'arm64)
-          ((sa-tag-contains? m "a6") 'x86-64)
-          ((sa-tag-contains? m "i3") 'i386)
-          (else 'other))))
+  (sa-arch-for-tag (sa-host-tag)))
+
+;; (sa-arch-for-tag tag) -> the derivation above as a function OF the tag, on
+;; the same terms as sa-os-family-for-tag: for the gate, not for callers.
+(define (sa-arch-for-tag m)
+  (cond ((sa-tag-contains? m "arm64") 'arm64)
+        ((sa-tag-contains? m "a6") 'x86-64)
+        ((sa-tag-contains? m "i3") 'i386)
+        (else 'other)))
 
 ;; (sa-endian) -> 'little | 'big | #f
 ;; Byte order of the host. Contract: the byte order. Degradation: #f for an
 ;; unrecognized suffix — the stat-layout guard treats that as unverified.
 (define (sa-endian)
-  (let* ((m (sa-host-tag)) (n (string-length m)))
+  (sa-endian-for-tag (sa-host-tag)))
+
+;; (sa-endian-for-tag tag) -> the derivation above as a function OF the tag, on
+;; the same terms as sa-os-family-for-tag: for the gate, not for callers.
+(define (sa-endian-for-tag m)
+  (let ((n (string-length m)))
     (if (>= n 2)
         (let ((suf (substring m (- n 2) n)))
           (cond ((string=? suf "le") 'little)

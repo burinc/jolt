@@ -101,6 +101,14 @@ Logic branches on derived properties only: `sa-os-family` ('macos | 'windows
 NAMES only (release dirs, image headers, telemetry) — a port chooses any
 stable identifier; nothing parses it except target-owned build machinery.
 
+The derived three answer for the process that is RUNNING, not for the build
+that produced it. Chez's native machine tag happens to answer both, which is
+why the adapter reads it; its portable-bytecode tags name no OS at all, and
+deriving one from them called every bytecode build Linux (#796). A port whose
+identifier is likewise portable must probe the host instead of parsing the
+identifier — `sa-probed-os-family` in the Chez adapter is one such probe, and
+the answer may be cached, since it cannot change while the process runs.
+
 ## Target-owned files
 
 The lint's allowlist may only name these; everything else routes through the

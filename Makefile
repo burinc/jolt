@@ -164,7 +164,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety
@@ -846,6 +846,14 @@ census:
 # contract file lists a name Chez does not provide.
 adaptercheck:
 	@$(CHEZ) --script host/scheme-adapter/chez.ss
+
+# The three derived host properties (sa-os-family / sa-arch / sa-endian) are all
+# host logic may ask about the platform, so one wrong row is a wrong SIGCHLD,
+# LC_TIME and struct-stat offset at once. The row that broke in #796 — a
+# portable-bytecode tag, which names no OS — is only reachable from a host we do
+# not build on, so the table is pinned per tag rather than per running machine.
+hostprops:
+	@$(CHEZ) --script test/chez/host-derived-props-test.ss
 
 # Every lock in the runtime must route through jolt's wrapper, because
 # preemption is refused while one is held and that only works if the runtime can
