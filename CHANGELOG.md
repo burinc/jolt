@@ -20,6 +20,71 @@ stays authoritative.
 
 ### Fixed
 
+- **A `File`'s path was kept exactly as given, not normalized.** Every JVM `File`
+  constructor runs its path through `FileSystem.normalize()`, so runs of `/`
+  collapse to one and a trailing `/` is dropped: `new File("/a/b//c").getPath()`
+  is `/a/b/c`. jolt answered `/a/b//c`. The visible route in was
+  `createTempFile`, since `$TMPDIR` ends in `/` on macOS and every temp file came
+  back carrying a doubled separator.
+
+  `clojure.java.io/file` had the same gap and a second one under it. It is
+  registered as the bare file constructor, whose multi-arg loop appends `/`
+  unconditionally, so `(io/file "/a/b/" "c")` gave `/a/b//c` where the JVM gives
+  `/a/b/c` — Clojure's own docstring says the multi-arg versions are equivalent
+  to `(File. parent child)`. That is the half more likely to bite, since
+  `(io/file dir name)` is everywhere and a directory read from config or the
+  environment often carries a trailing separator.
+
+  `jolt-file-join` already normalized, but only the JOIN SEAM — a trailing
+  separator off the parent, leading ones off the child, and it never looked
+  inside either. So `(File. "/a//b" "c")` still gave `/a//b/c`. Normalization now
+  lives in the `jfile` record's protocol instead: there are nine construction
+  sites and only one is the constructor entry point, so `as-file`, the `file:`
+  URL coercion, `createTempFile`, `getParentFile` and `listRoots` were each
+  building unnormalized paths of their own.
+
+  `.` and `..` are still not resolved. The JVM constructor does not resolve them
+  either; that is `getCanonicalPath`.
+
+  The two-arg constructor is `resolve(normalize(parent), normalize(child))` — it
+  normalizes each argument, and resolve is not a plain join. An empty parent
+  resolves against `getDefaultParent()`, so `new File("", "")` is `/`, not `""`,
+  which jolt got wrong in both directions before. (If you go measuring this
+  yourself: resolve grew its `child == "/"` case in JDK 21, so through JDK 20
+  `new File("/a/b", "/")` answered `/a/b/`, a path with a trailing separator no
+  one-arg constructor can produce. 21 onward it is `/a/b`.)
+
+- **`clojure.java.io/file` joined an absolute child instead of rejecting it.**
+  `io/file` is not the `File` constructor: Clojure puts every child through
+  `as-relative-path`, so `(io/file "/a/b" "/c")` raises `IllegalArgumentException`
+  while `(File. "/a/b" "/c")` answers `/a/b/c`. jolt joined it either way.
+
+  Worth knowing that normalization alone would have hidden this rather than
+  fixed it — `/a/b` joined to `/c` gives `/a/b//c`, which collapses to a
+  plausible-looking `/a/b/c` answer to a call the JVM refuses. A call site that
+  newly raises here was already broken for JVM Clojure.
+
+  Review follow-ups, all JVM-measured: `as-relative-path` goes through `as-file`
+  first, so the thrown message names the normalized path — `(io/file "/a/b"
+  "//c")` says `/c is not a relative path`, not `//c`. `io/as-relative-path`
+  itself is now registered as a var (public API in `clojure.java.io` on the
+  JVM, missing here entirely). And `io/make-parents` builds `(apply io/file f
+  more)` on the JVM, so it carries the same contract: an absolute child raises
+  instead of quietly joining.
+
+- **`(io/file nil)` and `(io/as-file nil)` answered an empty `File`, not `nil`.**
+  Clojure extends `Coercions` to `nil`, so both are `nil` on the JVM. A `File`
+  whose path is `""` is not a harmless stand-in for that: it names the process's
+  working directory, so a nil that should have blown up at the coercion instead
+  went on to read or write the wrong file. `as-relative-path` goes through
+  `as-file`, so a nil child now raises there too, the way `(io/file "/a" nil)`
+  does on the JVM, rather than joining as an empty segment.
+
+  The `File` constructor null-checks for the same reason: `(File. nil)` and
+  `(File. "/a" nil)` raise `NullPointerException` instead of reading the nil as
+  `""`. `(File. nil "c")` still answers `c` — a null *parent* is the one the
+  two-arg constructor accepts, and it means the child alone.
+
 - **`jolt run` could not write any closure `clojure.core` makes.** `cycle`,
   `repeat`, `partial`, `comp` and the rest refused with "captured local … was
   optimized into the compiled code" — while a default `jolt build` wrote them
