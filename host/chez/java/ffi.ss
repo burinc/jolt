@@ -797,6 +797,60 @@
 ;; Guardians are global mutable state and a drain both reads and mutates one, so
 ;; every access takes this mutex: an automatic arena can become garbage on any
 ;; thread, and two threads draining at once corrupts the guardian's own list.
+;; --- recorded pointer sizes --------------------------------------------------
+;; jolt.ffi/size answers the size jolt was TOLD a pointer addresses. A jolt
+;; pointer is a bare address, so a size cannot ride along with the value the way
+;; a MemorySegment carries its own — it lives here, keyed by address, and the
+;; entry has to be removed when the memory is released or the next allocation to
+;; land on that address inherits it.
+;;
+;; SHARDED, unlike the callable table above. That one is written when a callback
+;; is minted; this one is written by every allocation, every string->ptr and
+;; every declared view, from whatever thread is running — one lock over one
+;; table would serialize allocation across the whole process. Chez hashtables
+;; are not safe for concurrent writers (two resizing at once faults inside the
+;; collector), so each shard owns its mutex and nothing is written outside it.
+;; Single-key reads stay unlocked, as they do for the callable table.
+;;
+;; The index drops the low four bits before masking: every allocator underneath
+;; this file hands back 16-aligned addresses, so those bits are always zero and
+;; masking them directly would put every entry in shard 0.
+(define ffi-size-shard-count 16)
+(define ffi-size-tables (make-vector ffi-size-shard-count))
+(define ffi-size-mutexes (make-vector ffi-size-shard-count))
+(let loop ((i 0))
+  (when (fx<? i ffi-size-shard-count)
+    (vector-set! ffi-size-tables i (make-eqv-hashtable))
+    (vector-set! ffi-size-mutexes i (make-mutex))
+    (loop (fx+ i 1))))
+
+(define (ffi-size-shard-index a)
+  (bitwise-and (bitwise-arithmetic-shift-right a 4) (- ffi-size-shard-count 1)))
+
+(define (jolt-ffi-remember-size! p n)
+  (let* ((a (jnum->exact p))
+         (i (ffi-size-shard-index a)))
+    (jolt-with-mutex (vector-ref ffi-size-mutexes i)
+      (hashtable-set! (vector-ref ffi-size-tables i) a (jnum->exact n)))
+    p))
+
+(define (jolt-ffi-recorded-size p)
+  (let* ((a (jnum->exact p))
+         (i (ffi-size-shard-index a)))
+    (hashtable-ref (vector-ref ffi-size-tables i) a 0)))
+
+;; Batch, because an arena close forgets its whole group at once and a per-entry
+;; crossing of the jolt/host boundary is the expensive part, not the delete.
+(define (jolt-ffi-forget-sizes! ps)
+  (for-each
+    (lambda (p)
+      (let* ((a (jnum->exact p))
+             (i (ffi-size-shard-index a)))
+        (jolt-with-mutex (vector-ref ffi-size-mutexes i)
+          (hashtable-delete! (vector-ref ffi-size-tables i) a))))
+    (seq->list (jolt-seq ps)))
+  jolt-nil)
+
 (define ffi-auto-mu (make-mutex))
 (define ffi-auto-guardian (make-guardian))
 (define (jolt-ffi-auto-guard! token)
@@ -837,6 +891,9 @@
 ;; __free is the raw deallocator. The public jolt.ffi/free is a stdlib wrapper
 ;; that also forgets the pointer's recorded size, the same way __read/__write sit
 ;; under the layout-aware read/write.
+(def-var! "jolt.ffi" "__remember-size!" jolt-ffi-remember-size!)
+(def-var! "jolt.ffi" "__forget-sizes!" jolt-ffi-forget-sizes!)
+(def-var! "jolt.ffi" "__size" jolt-ffi-recorded-size)
 (def-var! "jolt.ffi" "__free" ffi-free)
 (def-var! "jolt.ffi" "__alloc" ffi-alloc)
 (def-var! "jolt.ffi" "__calloc" ffi-calloc)
