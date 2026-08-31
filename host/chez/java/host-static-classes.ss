@@ -876,7 +876,10 @@
         (cons "getAndAdd" (lambda (self d)
           (let ((delta (atomic-convert self d)))
             (atomic-numeric-transition! self delta #t))))
-        (cons "intValue" (lambda (self) (jnum->exact (unbox (atomic-box self)))))
+        (cons "intValue" (lambda (self)
+          (if (eq? (atomic-kind self) 'long)
+              (jolt-unchecked-int (unbox (atomic-box self)))
+              (jnum->exact (unbox (atomic-box self))))))
         (cons "longValue" (lambda (self) (jnum->exact (unbox (atomic-box self)))))
         (cons "toString" (lambda (self) (jolt-str-render-one (unbox (atomic-box self)))))))
 ;; java.util.Collections/synchronizedMap|List|Set wrap a collection for
