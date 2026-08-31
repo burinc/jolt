@@ -205,10 +205,10 @@ when transposed.
   WASM/Emscripten build.
 
 - **Namespaced-map prefixes could absorb separator text into a silent wrong
-  namespace.** The reader now stops at the namespace-token boundary, allows
-  whitespace and commas before `{`, and rejects other intervening input —
-  including comments, matching JVM boundary behavior — and rejects invalid
-  explicit namespace symbols.
+  namespace or accept an invalid namespace.** The reader now requires an
+  explicit namespace to be a simple unqualified symbol, stops at the token
+  boundary, allows whitespace and commas before `{`, and rejects other
+  intervening input including comments to match JVM behavior.
 
 - **`getPosixFilePermissions` and `getOwner` refused to run on hosts whose
   layout jolt already knew.** `nio-file` reads `st_mode` and `st_uid` at offsets
