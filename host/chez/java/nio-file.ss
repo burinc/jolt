@@ -702,13 +702,18 @@
 ;; #(name st_mode-offset st_mode-width st_uid-offset):
 ;;   darwin        mode@4  (16-bit) uid@16   -- all arches
 ;;   linux-x86-64  mode@24 (32-bit) uid@28   -- glibc, offsetof-measured
-;;   linux-arm64   mode@16 (32-bit) uid@24   -- glibc's generic bits/stat.h, in
-;;                                              which st_mode precedes st_nlink
-;;                                              instead of following it; read
-;;                                              from the header, not measured on
-;;                                              a machine, and so left for the
-;;                                              probe below to confirm before it
-;;                                              is ever used
+;;   linux-arm64   mode@16 (32-bit) uid@24   -- glibc, offsetof-measured under
+;;                                              qemu-aarch64 against the arm64
+;;                                              cross headers. st_mode precedes
+;;                                              st_nlink here instead of
+;;                                              following it, which is the only
+;;                                              difference from the row above --
+;;                                              and it is why aarch64 Linux is a
+;;                                              row rather than sharing one.
+;;
+;; sizeof(struct stat) is 144 on x86-64 and 128 on aarch64. st_ino@8 and
+;; st_mtim@88 were measured identical on both, which is what lets those two
+;; readers stay unguarded.
 (define nio-stat-layouts
   (list (vector 'darwin        4 2 16)
         (vector 'linux-x86-64 24 4 28)
@@ -745,17 +750,26 @@
 ;; directly: S_IFDIR has to appear in the format bits of whichever field really
 ;; is st_mode, and it appears in no other field of any of these layouts (at the
 ;; competing offsets a real host has st_dev's high half, st_nlink, or st_uid,
-;; none of which reach 0x4000 for a root directory).
+;; none of which reach 0x4000 for a root directory). Measured on both Linux
+;; ABIs -- natively on x86-64, and under qemu-aarch64 on a statically linked
+;; aarch64 build -- where stat("/") is mode 040755 and exactly one row matches:
+;;
+;;   x86-64   darwin@4 -> 0x0  linux-x86-64@24 -> 0x41ed  linux-arm64@16 -> 0x15
+;;   aarch64  darwin@4 -> 0x0  linux-x86-64@24 -> 0x0     linux-arm64@16 -> 0x41ed
+;;
+;; The rows that do not match land on st_nlink (0x15) and st_uid (0), which is
+;; the discrimination working rather than a coincidence to rely on.
 ;;
 ;; Identity gets the first word and measurement gets the last. The proposal is
 ;; preferred whenever the measurement agrees with it, so a host we already know
 ;; reads exactly as it did before; a proposal the measurement CONTRADICTS is
 ;; discarded rather than used, because a contradicted proposal is a proposal
 ;; that would read garbage -- which is the whole failure this guard exists to
-;; prevent, and throwing is what it did about it before. That is also what makes
-;; the linux-arm64 row safe to ship without an arm64 machine to measure on: if
-;; those offsets are wrong, no row verifies, and the host refuses exactly as it
-;; refuses today instead of quietly answering nonsense.
+;; prevent, and throwing is what it did about it before. That is also the
+;; property that makes a NEW row cheap to add: get the offsets wrong and nothing
+;; verifies, so the host refuses exactly as it refuses today rather than quietly
+;; answering nonsense. A row still has to be measured before it is added -- this
+;; is a backstop, not a licence to guess.
 ;;
 ;; Only when nothing can be measured (no stat entry, no root directory) does
 ;; identity stand alone, which is the pre-#798 behaviour. Only macos/linux are
