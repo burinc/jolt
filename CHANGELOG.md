@@ -20,6 +20,27 @@ stays authoritative.
 
 ### Fixed
 
+- **`getPosixFilePermissions` and `getOwner` refused to run on hosts whose
+  layout jolt already knew.** `nio-file` reads `st_mode` and `st_uid` at offsets
+  that are a per-platform ABI, and it chose them from the host's *identity*:
+  Darwin, or x86-64 Linux, or else throw `UnsupportedOperationException:
+  unverified struct stat layout`. Two kinds of host fell through that were not
+  actually unknown. A portable-bytecode build has no identity to read at all —
+  its machine tag names neither OS nor architecture (#796, #798) — so every pb
+  build refused. And native **aarch64 Linux** refused too, on a machine whose
+  offsets were written in the file's own comment and never turned into a branch.
+
+  The layout is measured now instead of deduced. `stat("/")` says which
+  candidate row really is `st_mode`, because `S_IFDIR` appears in the format
+  bits of the true field and in none of the competing ones — at those offsets a
+  real host has `st_dev`'s high half, `st_nlink`, or `st_uid`, none of which
+  reach `0x4000` for a root directory. Identity still gets the first word, so a
+  host that worked before reads exactly as it did; measurement gets the last, so
+  a proposal it contradicts is discarded rather than used. That is also what
+  makes the aarch64 row safe to ship without an arm64 machine to measure on: if
+  those offsets are wrong, nothing verifies and the host refuses exactly as it
+  refuses today, rather than quietly answering nonsense.
+
 - **A portable-bytecode build reported itself as Linux, wherever it was running.**
   `sa-os-family` derived the OS by substring-matching Chez's machine tag, which
   answers for a native tag and cannot answer for a bytecode one: `pb`, `pb64l`
