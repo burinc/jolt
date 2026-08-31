@@ -42,41 +42,60 @@
 ;; (string-hasheq, double-hasheq, jolt-hasheq-fallback and the caches stay
 ;; INTERNAL — reached only through jolt-hasheq.)
 
-;; A Java int fits Chez's fixnum domain on 64-bit machines but not on 32-bit
-;; machines, whose positive fixnum ceiling is 2^29-1. Keep the measured unsafe
-;; fast path where the complete unsigned 32-bit window is a fixnum and select
-;; generic exact-integer operations otherwise. The target compiler can fold the
-;; literal fixnum? test, so 64-bit generated code retains the existing fx chain.
-(define-syntax hash-fx>=?
-  (syntax-rules () ((_ a b) (if (fixnum? #xFFFFFFFF) (#3%fx>=? a b) (>= a b)))))
-(define-syntax hash-fx<?
-  (syntax-rules () ((_ a b) (if (fixnum? #xFFFFFFFF) (#3%fx<? a b) (< a b)))))
-(define-syntax hash-fx=?
-  (syntax-rules () ((_ a b) (if (fixnum? #xFFFFFFFF) (#3%fx=? a b) (= a b)))))
-(define-syntax hash-fx+
-  (syntax-rules () ((_ a b) (if (fixnum? #xFFFFFFFF) (#3%fx+ a b) (+ a b)))))
-(define-syntax hash-fx-
-  (syntax-rules () ((_ a b) (if (fixnum? #xFFFFFFFF) (#3%fx- a b) (- a b)))))
-(define-syntax hash-fx*
-  (syntax-rules () ((_ a b) (if (fixnum? #xFFFFFFFF) (#3%fx* a b) (* a b)))))
-(define-syntax hash-fxand
-  (syntax-rules () ((_ a b) (if (fixnum? #xFFFFFFFF) (#3%fxand a b) (bitwise-and a b)))))
-(define-syntax hash-fxior
-  (syntax-rules () ((_ a b) (if (fixnum? #xFFFFFFFF) (#3%fxior a b) (bitwise-ior a b)))))
-(define-syntax hash-fxxor
-  (syntax-rules () ((_ a b) (if (fixnum? #xFFFFFFFF) (#3%fxxor a b) (bitwise-xor a b)))))
-(define-syntax hash-fxsll
-  (syntax-rules ()
-    ((_ a b) (if (fixnum? #xFFFFFFFF) (#3%fxsll a b)
-                 (bitwise-arithmetic-shift-left a b)))))
-(define-syntax hash-fxsra
-  (syntax-rules ()
-    ((_ a b) (if (fixnum? #xFFFFFFFF) (#3%fxsra a b)
-                 (bitwise-arithmetic-shift-right a b)))))
-(define-syntax hash-fxsrl
-  (syntax-rules ()
-    ((_ a b) (if (fixnum? #xFFFFFFFF) (#3%fxsrl a b)
-                 (bitwise-arithmetic-shift-right a b)))))
+;; ============================================================================
+;; Fixnum-width selection for the 32-bit engine (shared with collections.ss).
+;; ============================================================================
+;; Every value this engine and the HAMT compute lives in the Java int window:
+;; [0, 2^32-1] unsigned, [-2^31, 2^31-1] signed. On a 64-bit Chez that whole
+;; window is fixnum, which is what makes the unsafe #3%fx chain below sound and
+;; what the measured fast path was tuned against. On a 32-bit target — tpb32l,
+;; the pb/WASM build — the positive fixnum ceiling is 2^29-1, so an ordinary int
+;; hash is a bignum and an fx op applied to it is unsound, not merely slow.
+;;
+;; define-width-op names one operator per pair and picks between them at EXPAND
+;; time, so exactly one arm reaches the compiler: on a wide target the generated
+;; code is the same #3%fx chain as before, with no runtime width test, no
+;; duplicated arms, and no reliance on cp0 folding the test away. It is one
+;; macro-generating macro rather than a hand-written (if (fixnum? ...) a b) per
+;; operator so the width question is asked in exactly ONE place — collections.ss
+;; declares its own HAMT operators through this same form.
+;;
+;; The test runs on the COMPILING Chez, which for a native build is the target.
+;; Cross-compiling to a target narrower than the host would have to consult the
+;; target's fixnum width here instead.
+;;
+;; JOLT_NARROW_HASH=1 in the compiling environment forces the narrow arm on a
+;; wide machine. That is what makes the generic arms executable under the
+;; ordinary gates instead of only on 32-bit hardware: `make narrowhash` replays
+;; the JVM-pinned hash suite and the collection suites with it set.
+(define-syntax define-width-op
+  (lambda (x)
+    (syntax-case x ()
+      ((_ name wide narrow)
+       (if (and (fixnum? #xFFFFFFFF) (not (getenv "JOLT_NARROW_HASH")))
+           #'(define-syntax name
+               (syntax-rules () ((_ a (... ...)) (wide a (... ...)))))
+           #'(define-syntax name
+               (syntax-rules () ((_ a (... ...)) (narrow a (... ...))))))))))
+
+;; The hash engine's operators. Unsafe #3% on the wide path: the window
+;; invariant documented above is the type check, and these are the measured
+;; inner chain of murmur3/mul32.
+(define-width-op hash-fx=?  #3%fx=?  =)
+(define-width-op hash-fx<?  #3%fx<?  <)
+(define-width-op hash-fx>=? #3%fx>=? >=)
+(define-width-op hash-fx+   #3%fx+   +)
+(define-width-op hash-fx-   #3%fx-   -)
+(define-width-op hash-fx*   #3%fx*   *)
+(define-width-op hash-fxand #3%fxand bitwise-and)
+(define-width-op hash-fxior #3%fxior bitwise-ior)
+(define-width-op hash-fxxor #3%fxxor bitwise-xor)
+(define-width-op hash-fxsll #3%fxsll bitwise-arithmetic-shift-left)
+(define-width-op hash-fxsra #3%fxsra bitwise-arithmetic-shift-right)
+;; fxsrl has no exact-integer twin, and needs none: every use below shifts a
+;; u32-masked (non-negative) operand, where the logical and arithmetic shifts
+;; agree. urs32 is the only entry point and it masks first.
+(define-width-op hash-fxsrl #3%fxsrl bitwise-arithmetic-shift-right)
 
 ;; ============================================================================
 ;; 32-bit signed integer helpers — all macros (syntax-rules) so they textually
@@ -285,7 +304,7 @@
 ;; The hot fixnum path in jolt-hasheq and key-hash calls the flat versions above.
 
 (define (murmur3-hash-int input)
-  (if (= (i32 input) 0) 0
+  (if (hash-fx=? (i32 input) 0) 0
       (let* ((k1 (murmur3-mix-k1 (i32 input)))
              (h1 (murmur3-mix-h1 murmur3-seed k1)))
         (murmur3-fmix h1 4))))
