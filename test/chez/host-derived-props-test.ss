@@ -16,6 +16,13 @@
 ;; requiring the pb probe to agree with what this host's native tag says.
 
 (import (chezscheme))
+;; The boot takes the process-global handle before anything asks for an
+;; architecture (rt.ss binds _exit through jolt-foreign-proc-safe long before
+;; host-static-methods.ss reads sa-arch), and sa-probed-arch relies on that
+;; rather than re-taking it. Loading the adapter on its own here has to stand in
+;; for that, or the uname probe finds no symbol and the gate measures the
+;; degraded answer instead of the real one.
+(load-shared-object #f)
 (load "host/chez/scheme-adapter-runtime.ss")
 
 (define total 0) (define fails 0)
@@ -41,32 +48,65 @@
 (row "a6ob"      'linux   'x86-64 #f)   ; unrecognized OS still degrades to linux
 
 ;; Portable-bytecode tags: pb/pb64l/tpb64l name the threading, word size and
-;; endianness and deliberately name no OS, so the OS is PROBED and must not be
-;; hardcoded. arch stays 'other and endian stays #f: the tag's own 64/l fields
-;; are not in the shape either derivation parses, and neither is probed yet, so
-;; a pb build on x86-64 Linux still reads as "unverified struct stat layout".
-;; That is a known gap, pinned here so closing it is a deliberate edit.
+;; endianness and deliberately name no OS, and their 64/l fields are not in the
+;; shape sa-arch-for-tag/sa-endian-for-tag parse either. So all three tag
+;; derivations decline, and all three public entry points probe past them
+;; (#796 for the OS, #798 for the other two).
 (for-each
   (lambda (tag)
-    (ok (format "~a -> os is probed, not assumed" tag)
+    (ok (format "~a -> os declines to the probe" tag)
         (eq? (sa-os-family-for-tag tag) (sa-probed-os-family)))
-    (ok (format "~a -> arch other (not derived from the tag)" tag)
+    (ok (format "~a -> arch not derivable from the tag" tag)
         (eq? (sa-arch-for-tag tag) 'other))
-    (ok (format "~a -> endian #f (not derived from the tag)" tag)
+    (ok (format "~a -> endian not derivable from the tag" tag)
         (eq? (sa-endian-for-tag tag) #f)))
   '("pb" "pb64l" "pb64b" "pb32l" "tpb64l" "tpb64b"))
 
-;; The probe is a cache, and the answer cannot change while the process runs.
-(ok "probe is stable across calls" (eq? (sa-probed-os-family) (sa-probed-os-family)))
+;; The probes are caches, and none of the three answers can change while the
+;; process runs.
+(ok "os probe is stable across calls"   (eq? (sa-probed-os-family) (sa-probed-os-family)))
+(ok "arch probe is stable across calls" (eq? (sa-probed-arch) (sa-probed-arch)))
 
-;; And it is RIGHT: this run is a native build, whose tag names the OS
-;; independently. The probe has to reach the same verdict — that is the whole
-;; claim a bytecode build then rests on, checked on every host the gate runs on.
-(ok (format "probe agrees with the native tag ~s (~a)" (sa-host-tag) (sa-os-family))
-    (or (eq? (sa-os-family-for-tag (sa-host-tag)) (sa-probed-os-family))
-        ;; a pb gate run has no independent answer to compare against; the rows
-        ;; above still hold, so do not fail the gate on it.
-        (sa-tag-contains? (sa-host-tag) "pb")))
+;; The probes must produce a real answer, not the degraded one, on any host the
+;; gate runs on. sa-arch degrades to 'other when uname cannot be reached, which
+;; is a legitimate answer on a statically linked build but not on this one.
+(ok "os probe answers a real family"
+    (memq (sa-probed-os-family) '(macos windows linux)))
+(ok (format "arch probe answers a real architecture (~a)" (sa-probed-arch))
+    (memq (sa-probed-arch) '(x86-64 arm64 i386)))
+(ok (format "endian answers a real byte order (~a)" (sa-endian))
+    (memq (sa-endian) '(little big)))
+
+;; And the probes are RIGHT: this run is a native build, whose tag names the OS
+;; and the architecture independently. Each probe has to reach the same verdict
+;; as the tag it can be checked against — that is the whole claim a bytecode
+;; build then rests on, checked on every host the gate runs on.
+(define native-tag (sa-host-tag))
+(define native? (not (sa-tag-contains? native-tag "pb")))
+(ok (format "os probe agrees with the native tag ~s (~a)" native-tag (sa-os-family))
+    (or (not native?)
+        (eq? (sa-os-family-for-tag native-tag) (sa-probed-os-family))))
+(ok (format "arch probe agrees with the native tag ~s (~a)" native-tag (sa-arch))
+    (or (not native?)
+        (eq? (sa-arch-for-tag native-tag) 'other)      ; tag names no arch to compare
+        (eq? (sa-arch-for-tag native-tag) (sa-probed-arch))))
+(ok "endian agrees with the tag when the tag names one"
+    (let ((from-tag (sa-endian-for-tag native-tag)))
+      (or (not from-tag) (eq? from-tag (sa-endian)))))
+
+;; A pb build resolves all three, which is the end state #796 and #798 are
+;; between them for: nothing about a bytecode tag may leave a property unknown
+;; on a host that can answer it.
+(for-each
+  (lambda (tag)
+    (ok (format "~a -> os resolves" tag)
+        (memq (sa-os-family-for-tag tag) '(macos windows linux)))
+    (ok (format "~a -> arch resolves to this host's" tag)
+        (eq? (let ((a (sa-arch-for-tag tag))) (if (eq? a 'other) (sa-probed-arch) a))
+             (sa-arch)))
+    (ok (format "~a -> endian resolves to this host's" tag)
+        (eq? (or (sa-endian-for-tag tag) (native-endianness)) (sa-endian))))
+  '("pb" "pb64l" "tpb64l"))
 
 (printf "host-derived-props: ~a checks, ~a failures\n" total fails)
 (when (> fails 0) (exit 1))

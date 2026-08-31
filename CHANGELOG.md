@@ -20,6 +20,49 @@ stays authoritative.
 
 ### Fixed
 
+- **`getPosixFilePermissions` and `getOwner` refused to run on hosts whose
+  layout jolt already knew.** `nio-file` reads `st_mode` and `st_uid` at offsets
+  that are a per-platform ABI, and it chose them from the host's *identity*:
+  Darwin, or x86-64 Linux, or else throw `UnsupportedOperationException:
+  unverified struct stat layout`. Two kinds of host fell through that were not
+  actually unknown. A portable-bytecode build has no identity to read at all —
+  its machine tag names neither OS nor architecture (#796, #798) — so every pb
+  build refused. And native **aarch64 Linux** refused too, on a machine whose
+  offsets were written in the file's own comment and never turned into a branch.
+
+  The layout is measured now instead of deduced. `stat("/")` says which
+  candidate row really is `st_mode`, because `S_IFDIR` appears in the format
+  bits of the true field and in none of the competing ones — at those offsets a
+  real host has `st_dev`'s high half, `st_nlink`, or `st_uid`, none of which
+  reach `0x4000` for a root directory. Identity still gets the first word, so a
+  host that worked before reads exactly as it did; measurement gets the last, so
+  a proposal it contradicts is discarded rather than used. That is also what
+  makes a new row cheap to add: get the offsets wrong and nothing verifies, so
+  the host refuses exactly as it refuses today rather than quietly answering
+  nonsense.
+
+  Both Linux rows are `offsetof`-measured — x86-64 natively, aarch64 under
+  `qemu-aarch64` against the arm64 cross headers — and on each ABI `stat("/")`
+  matches exactly one row, the others landing on `st_nlink` and `st_uid`.
+
+- **`sa-arch` and `sa-endian` could not answer for a portable-bytecode build.**
+  The follow-up half of #796. `sa-arch` matched `arm64`/`a6`/`i3` in the machine
+  tag and `sa-endian` read its last two characters for `le`/`be`; a pb tag
+  matches neither vocabulary even though `pb64l` does name a 64-bit
+  little-endian build, in fields those derivations do not parse. Both now probe
+  past a tag that declines to say: `uname(2)`'s `machine` field for the
+  architecture (`PROCESSOR_ARCHITECTURE` on Windows, which has no `uname`), and
+  `native-endianness` for the byte order, which is exact everywhere and needs no
+  probe at all. `os.arch` on a bytecode build answers `amd64`/`aarch64` rather
+  than the raw tag.
+
+  `sa-endian` no longer has a `#f` answer — a runtime always knows its own byte
+  order. That mattered beyond the tag: `nio-x86-64-linux?` tested the
+  architecture and the byte order but never the OS, so it was correct only by
+  the accident that the Windows tag has no `le` suffix. Answering endianness
+  honestly would have made a Windows x86-64 build claim the Linux `struct stat`
+  layout, and the rewrite above removes that predicate entirely.
+
 - **A portable-bytecode build reported itself as Linux, wherever it was running.**
   `sa-os-family` derived the OS by substring-matching Chez's machine tag, which
   answers for a native tag and cannot answer for a bytecode one: `pb`, `pb64l`
