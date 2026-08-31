@@ -902,19 +902,29 @@
 (define (rdr-read-ns-map s i end)        ; i points just past "#:"
   (let* ((auto? (and (< i end) (char=? (string-ref s i) #\:)))
          (i2 (if auto? (+ i 1) i)))
-    (let loop ((j i2))
-      (cond
-        ((>= j end) (rdr-error s j "EOF in namespaced map literal"))
-        ((char=? (string-ref s j) #\{)
-         (let* ((nstok (substring s i2 j))
-                (mapns (if auto?
-                           (if (string=? nstok "") (chez-current-ns)
-                               (let ((a (chez-resolve-alias (chez-current-ns) nstok)))
-                                 (if a a (rdr-invalid-token (string-append "::" nstok)))))
-                           nstok)))
-           (let-values (((es k) (rdr-read-seq s (+ j 1) end #\})))
-             (values (rdr-make-map (rdr-nsmap-kvs mapns es)) k))))
-        (else (loop (+ j 1)))))))
+    ;; The namespace is a token, not every byte up to the opening brace.
+    ;; Whitespace (including commas) may separate that token from the map;
+    ;; anything else at the boundary is an error rather than part of the
+    ;; namespace or a non-map payload borrowing a later opening brace.
+    (let-values (((nstok j) (rdr-read-token s i2 end)))
+      (let skip-boundary ((k j))
+        (cond
+          ((and (not auto?) (string=? nstok ""))
+           (rdr-error s i2 "Namespaced map must specify a namespace"))
+          ((and (< k end) (rdr-ws? (string-ref s k)))
+           (skip-boundary (+ k 1)))
+          ((or (>= k end) (not (char=? (string-ref s k) #\{)))
+           ;; A comment is a reader macro rather than whitespace at this exact
+           ;; boundary on the JVM, so do not use rdr-skip-ws (which skips it).
+           (rdr-error s k "Namespaced map must specify a map"))
+          (else
+           (let ((mapns (if auto?
+                            (if (string=? nstok "") (chez-current-ns)
+                                (let ((a (chez-resolve-alias (chez-current-ns) nstok)))
+                                  (if a a (rdr-invalid-token (string-append "::" nstok)))))
+                            nstok)))
+             (let-values (((es next) (rdr-read-seq s (+ k 1) end #\})))
+               (values (rdr-make-map (rdr-nsmap-kvs mapns es)) next)))))))))
 
 ;; *read-eval* gate for #= — the cell is captured lazily (the var is def'd
 ;; after this file loads) and the value read per use, so a
