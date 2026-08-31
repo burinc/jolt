@@ -100,7 +100,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
-  gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate \
+  gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit \
@@ -164,7 +164,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   hasheq \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety
@@ -854,6 +854,14 @@ adaptercheck:
 # not build on, so the table is pinned per tag rather than per running machine.
 hostprops:
 	@$(CHEZ) --script test/chez/host-derived-props-test.ss
+
+# The other half of the same rule: knowing the platform is only useful if the
+# struct stat offsets it selects are the ones this machine actually uses. The
+# gate measures the layout with no identity to go on — the pb case — and then
+# reads a file whose mode it just set, which no offset that merely happens to
+# carry S_IFDIR would answer correctly.
+statlayout:
+	@$(CHEZ) --script test/chez/stat-layout-test.ss
 
 # Every lock in the runtime must route through jolt's wrapper, because
 # preemption is refused while one is held and that only works if the runtime can
