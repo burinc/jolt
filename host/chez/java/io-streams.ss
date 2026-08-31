@@ -867,7 +867,15 @@
             ((char=? (string-ref p i) #\/) (mkdirs! (substring p 0 i)))
             (else (loop (- i 1)))))))
 (define (apply-make-file-path args)
-  (jfile-path (apply jolt-make-file args)))
+  ;; the JVM's make-parents builds (-> f as-file (apply file more) ...), so it
+  ;; carries io/file's as-relative-path contract: an absolute child throws
+  ;; here, it is not quietly joined the way the bare constructor would. It also
+  ;; inherits the nil: (io/file nil) is nil, and .getParentFile raises on it.
+  (let ((f (apply jolt-io-file args)))
+    (when (jolt-nil? f)
+      (throw-jvm (quote NullPointerException)
+                 "Cannot invoke \"java.io.File.getParentFile()\" because the return value of \"clojure.core$apply.invokeStatic(Object, Object, Object)\" is null"))
+    (jfile-path f)))
 (def-var! "clojure.java.io" "make-parents" jio-make-parents)
 
 ;; io/delete-file: delete the file; raise unless :silently truthy.
