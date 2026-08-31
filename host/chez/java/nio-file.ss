@@ -695,18 +695,112 @@
 ;; ---- stat-backed perms + real path (increment: what the fs suite exercises) --
 ;; st_mode lives at a platform-specific offset in struct stat; read only that.
 (define nio-macos? (eq? (sa-os-family) 'macos))
-;; struct stat field offsets are platform ABIs, not portable: verified for
-;; Darwin (st_mode@4/st_uid@16, all arches) and x86_64 Linux glibc
-;; (st_mode@24/st_uid@28 -- ground-truthed via offsetof probes). aarch64 Linux
-;; DIFFERS (st_mode@16/st_uid@24), and other hosts are unknown -- reading the
-;; hardcoded offsets there returns garbage, so the mode/uid readers throw a
-;; clear error instead. st_mtim@88 is identical on both Linux ABIs, so the
-;; mtime readers stay unguarded. Add a verified branch (not a guess) when a
-;; new host is brought up.
-(define nio-x86-64-linux? (and (eq? (sa-arch) 'x86-64) (eq? (sa-endian) 'little)))
-(define nio-stat-layout-known? (or nio-macos? nio-x86-64-linux?))
+;; struct stat field offsets are platform ABIs, not portable. Only two fields
+;; move: st_mode and st_uid. st_ino@8 is identical everywhere we run, and
+;; st_mtim@88 is identical on both Linux ABIs, so those readers stay unguarded.
+;;
+;; #(name st_mode-offset st_mode-width st_uid-offset):
+;;   darwin        mode@4  (16-bit) uid@16   -- all arches
+;;   linux-x86-64  mode@24 (32-bit) uid@28   -- glibc, offsetof-measured
+;;   linux-arm64   mode@16 (32-bit) uid@24   -- glibc, offsetof-measured under
+;;                                              qemu-aarch64 against the arm64
+;;                                              cross headers. st_mode precedes
+;;                                              st_nlink here instead of
+;;                                              following it, which is the only
+;;                                              difference from the row above --
+;;                                              and it is why aarch64 Linux is a
+;;                                              row rather than sharing one.
+;;
+;; sizeof(struct stat) is 144 on x86-64 and 128 on aarch64. st_ino@8 and
+;; st_mtim@88 were measured identical on both, which is what lets those two
+;; readers stay unguarded.
+(define nio-stat-layouts
+  (list (vector 'darwin        4 2 16)
+        (vector 'linux-x86-64 24 4 28)
+        (vector 'linux-arm64  16 4 24)))
+(define (nio-layout-name l) (vector-ref l 0))
+(define (nio-layout-mode-ref l buf)
+  (if (= 2 (vector-ref l 2))
+      (bytevector-u16-ref buf (vector-ref l 1) (native-endianness))
+      (bytevector-u32-ref buf (vector-ref l 1) (native-endianness))))
+(define (nio-layout-uid-ref l buf)
+  (bytevector-u32-ref buf (vector-ref l 3) (native-endianness)))
+(define (nio-layout-named n)
+  (let loop ((ls nio-stat-layouts))
+    (cond ((null? ls) #f)
+          ((eq? (nio-layout-name (car ls)) n) (car ls))
+          (else (loop (cdr ls))))))
+
+;; The row the host's IDENTITY proposes. A proposal only -- it is what gets
+;; measured below, never what gets trusted.
+(define (nio-proposed-stat-layout)
+  (case (sa-os-family)
+    ((macos) (nio-layout-named 'darwin))
+    ((linux) (case (sa-arch)
+               ((x86-64) (nio-layout-named 'linux-x86-64))
+               ((arm64)  (nio-layout-named 'linux-arm64))
+               (else #f)))
+    (else #f)))
+
+;; MEASURE the layout instead of deducing it from the host's name, because the
+;; name is not always available to be read: a portable-bytecode build's machine
+;; tag carries no OS and no arch (jolt-lang/jolt#796, #798), so identity alone
+;; sent every such build down the "unverified" branch even on a host whose
+;; layout is one of the three above. A stat of a directory we know settles it
+;; directly: S_IFDIR has to appear in the format bits of whichever field really
+;; is st_mode, and it appears in no other field of any of these layouts (at the
+;; competing offsets a real host has st_dev's high half, st_nlink, or st_uid,
+;; none of which reach 0x4000 for a root directory). Measured on both Linux
+;; ABIs -- natively on x86-64, and under qemu-aarch64 on a statically linked
+;; aarch64 build -- where stat("/") is mode 040755 and exactly one row matches:
+;;
+;;   x86-64   darwin@4 -> 0x0  linux-x86-64@24 -> 0x41ed  linux-arm64@16 -> 0x15
+;;   aarch64  darwin@4 -> 0x0  linux-x86-64@24 -> 0x0     linux-arm64@16 -> 0x41ed
+;;
+;; The rows that do not match land on st_nlink (0x15) and st_uid (0), which is
+;; the discrimination working rather than a coincidence to rely on.
+;;
+;; Identity gets the first word and measurement gets the last. The proposal is
+;; preferred whenever the measurement agrees with it, so a host we already know
+;; reads exactly as it did before; a proposal the measurement CONTRADICTS is
+;; discarded rather than used, because a contradicted proposal is a proposal
+;; that would read garbage -- which is the whole failure this guard exists to
+;; prevent, and throwing is what it did about it before. That is also the
+;; property that makes a NEW row cheap to add: get the offsets wrong and nothing
+;; verifies, so the host refuses exactly as it refuses today rather than quietly
+;; answering nonsense. A row still has to be measured before it is added -- this
+;; is a backstop, not a licence to guess.
+;;
+;; Only when nothing can be measured (no stat entry, no root directory) does
+;; identity stand alone, which is the pre-#798 behaviour. Only macos/linux are
+;; measured at all: a Windows _stat is a different struct that none of these rows
+;; describes, so it stays unknown rather than risking a chance match.
+(define (nio-layout-verifies? l buf)
+  ;; bitwise-and, not fxand: a 32-bit st_mode read is not a fixnum on a 32-bit host.
+  (= #x4000 (bitwise-and (nio-layout-mode-ref l buf) #xF000)))   ; S_IFDIR
+(define (nio-probe-root-stat)
+  (and c-stat
+       (memq (sa-os-family) '(macos linux))
+       (let ((buf (make-bytevector 256 0)))
+         (and (= 0 (c-stat "/" buf)) buf))))
+(define (nio-sole-verifying-layout buf)
+  (let loop ((ls nio-stat-layouts) (hits '()))
+    (cond ((null? ls) (and (pair? hits) (null? (cdr hits)) (car hits)))
+          ((nio-layout-verifies? (car ls) buf) (loop (cdr ls) (cons (car ls) hits)))
+          (else (loop (cdr ls) hits)))))
+(define (nio-resolve-stat-layout)
+  (let ((proposed (nio-proposed-stat-layout))
+        (buf (nio-probe-root-stat)))
+    (cond ((not buf) proposed)                                   ; nothing to measure with
+          ((and proposed (nio-layout-verifies? proposed buf)) proposed)
+          (else (nio-sole-verifying-layout buf)))))
+(define nio-stat-layout-cache 'unresolved)
+(define (nio-stat-layout)
+  (when (eq? nio-stat-layout-cache 'unresolved)
+    (set! nio-stat-layout-cache (nio-resolve-stat-layout)))
+  nio-stat-layout-cache)
 (define (nio-stat-layout-guard! who)
-  (unless nio-stat-layout-known?
+  (unless (nio-stat-layout)
     (jolt-throw (jolt-host-throwable "java.lang.UnsupportedOperationException"
       (string-append who " is not supported on this host: unverified struct stat layout for "
                      (sa-host-tag))))))
@@ -715,11 +809,8 @@
   (and c-stat
        (begin
          (nio-stat-layout-guard! "getPosixFilePermissions")
-         (let ((buf (make-bytevector 256 0)))
-           (and (= 0 (c-stat fp buf))
-                (if nio-macos?
-                    (bytevector-u16-ref buf 4 (native-endianness))
-                    (bytevector-u32-ref buf 24 (native-endianness))))))))
+         (let ((lay (nio-stat-layout)) (buf (make-bytevector 256 0)))
+           (and (= 0 (c-stat fp buf)) (nio-layout-mode-ref lay buf))))))
 ;; resolve symlinks; #f if the path is absent. One binding of realpath(3) for
 ;; the whole runtime, in java/io.ss, which loads before this file and needs it
 ;; for File.getCanonicalPath.
@@ -927,8 +1018,8 @@
 (define (nio-stat-uid fp)
   (and c-stat (begin
                 (nio-stat-layout-guard! "getOwner")
-                (let ((buf (make-bytevector 256 0)))
-                  (and (= 0 (c-stat fp buf)) (bytevector-u32-ref buf (if nio-macos? 16 28) (native-endianness)))))))
+                (let ((lay (nio-stat-layout)) (buf (make-bytevector 256 0)))
+                  (and (= 0 (c-stat fp buf)) (nio-layout-uid-ref lay buf))))))
 (define (nio-uid->name uid)
   (and c-getpwuid (let ((pw (c-getpwuid uid))) (and (not (= 0 pw)) (nio-cstr-at (sa-foreign-ref 'iptr pw 0))))))
 ;; user-principal values compare and hash by name; getOwner honors NOFOLLOW.
@@ -939,8 +1030,8 @@
 (define (nio-lstat-uid fp)
   (and c-lstat (begin
                  (nio-stat-layout-guard! "getOwner")
-                 (let ((buf (make-bytevector 256 0)))
-                   (and (= 0 (c-lstat fp buf)) (bytevector-u32-ref buf (if nio-macos? 16 28) (native-endianness)))))))
+                 (let ((lay (nio-stat-layout)) (buf (make-bytevector 256 0)))
+                   (and (= 0 (c-lstat fp buf)) (nio-layout-uid-ref lay buf))))))
 (let ((files-owner2
        (list (cons "getOwner" (lambda (p . opts)
                                 (let* ((fp (nfp p))
