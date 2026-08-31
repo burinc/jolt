@@ -899,6 +899,10 @@
         ((null? (cdr es)) es)
         (else (cons (rdr-nsmap-key mapns (car es))
                     (cons (cadr es) (rdr-nsmap-kvs mapns (cddr es)))))))
+(define (rdr-simple-symbol-token? tok)
+  (guard (e (#t #f))
+    (let ((v (rdr-token->value tok)))
+      (and (symbol-t? v) (not (symbol-t-ns v))))))
 (define (rdr-read-ns-map s i end)        ; i points just past "#:"
   (let* ((auto? (and (< i end) (char=? (string-ref s i) #\:)))
          (i2 (if auto? (+ i 1) i)))
@@ -907,10 +911,12 @@
     ;; anything else at the boundary is an error rather than part of the
     ;; namespace or a non-map payload borrowing a later opening brace.
     (let-values (((nstok j) (rdr-read-token s i2 end)))
+      (when (and (not auto?) (string=? nstok ""))
+        (rdr-error s i2 "Namespaced map must specify a namespace"))
+      (when (and (not auto?) (not (rdr-simple-symbol-token? nstok)))
+        (rdr-error s i2 (string-append "Namespaced map must specify a valid namespace: " nstok)))
       (let skip-boundary ((k j))
         (cond
-          ((and (not auto?) (string=? nstok ""))
-           (rdr-error s i2 "Namespaced map must specify a namespace"))
           ((and (< k end) (rdr-ws? (string-ref s k)))
            (skip-boundary (+ k 1)))
           ((or (>= k end) (not (char=? (string-ref s k) #\{)))
