@@ -102,7 +102,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  narrow numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
+  narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
   threadsafety values wp ci
@@ -161,7 +161,7 @@ install: build
 CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
-  hasheq \
+  hasheq narrowhash \
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
@@ -269,6 +269,19 @@ values:
 # sweep over every length and char class.
 hasheq:
 	@$(CHEZ) --script test/chez/hasheq-test.ss
+
+# The same suites again with the hash engine's NARROW arms selected. hasheq.ss
+# and collections.ss compute in the Java int window, which is fixnum on a 64-bit
+# Chez and bignum on a 32-bit one (tpb32l, the pb/WASM build), so each operator
+# has a generic exact-integer twin that only a 32-bit host would otherwise ever
+# run. JOLT_NARROW_HASH=1 forces that arm at expand time here, which puts the
+# generic twins under the JVM-pinned hash goldens, the value-model suite and the
+# transient HAMT suite on ordinary hardware. Slower than `hasheq`: the knob is
+# read during expansion, so gate-boot has to compile the preamble from source.
+narrowhash:
+	@JOLT_NARROW_HASH=1 $(CHEZ) --script test/chez/hasheq-test.ss
+	@JOLT_NARROW_HASH=1 $(CHEZ) --script test/chez/values-test.ss
+	@JOLT_NARROW_HASH=1 $(CHEZ) --script test/chez/transient-test.ss
 
 # Fibers R1 (epic jolt-nvpr.2): the fiber primitive + single-carrier scheduler
 # behind the CONTRACT.txt coroutines tier. Correctness (round trip, completion,

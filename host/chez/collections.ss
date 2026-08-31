@@ -669,19 +669,37 @@
 (define empty-hnode (make-hnode 0 (vector)))
 (define hmask #xFFFFFFFF)                ; 32-bit unsigned hash window (JVM int range)
 (define max-shift 30)                     ; 7 levels × 5 bits = 35 > 32; last level shift 30
-;; bitwise-and (not fxand): jolt-hasheq returns a signed 32-bit int, so it's
-;; always a fixnum. But keep the generic fallback for extension types that might
-;; return bignums via equal-hash.
+
+;; A hash and a node bitmap each span all 32 bits, so on a 32-bit Chez (tpb32l)
+;; they are bignums, not fixnums — see hasheq.ss's define-width-op for the width
+;; invariant and why the arm is chosen at expand time. These are the SAFE fx
+;; forms on the wide path, as they have always been: the bitmap arithmetic is
+;; not the measured inner chain the hash engine's #3% forms were tuned for, and
+;; a checked op here fails loudly rather than corrupting a node.
+(define-width-op hamt=?       fx=?        =)
+(define-width-op hamt-sub     fx-         -)
+(define-width-op hamt-and     fxand       bitwise-and)
+(define-width-op hamt-ior     fxior       bitwise-ior)
+(define-width-op hamt-not     fxnot       bitwise-not)
+(define-width-op hamt-sll     fxsll       bitwise-arithmetic-shift-left)
+(define-width-op hamt-sra     fxsra       bitwise-arithmetic-shift-right)
+(define-width-op hamt-popcount fxbit-count bitwise-bit-count)
+
+;; The runtime fixnum? test stays, on both arms: an extension type can return a
+;; bignum here via equal-hash whatever the machine's width is, and that case has
+;; to reach bitwise-and even on a 64-bit build. hamt-and covers the other half —
+;; on a 32-bit machine an ORDINARY int hash is a bignum too, so the test is not
+;; the only thing keeping fxand off a non-fixnum there.
 (define (key-hash k)
   ;; jolt-hasheq now has a flat-inlined fixnum fast path (murmur3-hash-long-flat)
   ;; and a keyword cached-field read — no re-dispatch needed here.
   ;; Mask to unsigned 32 bits for the HAMT's fx ops.
   (let ((h (jolt-hasheq k)))
-    (if (fixnum? h) (fxand h hmask) (bitwise-and h hmask))))
-(define (chunk h shift) (fxand (fxsra h shift) 31))
-(define (bitpos h shift) (fxsll 1 (chunk h shift)))
-(define (popcount n) (fxbit-count n))
-(define (arr-index bm bit) (popcount (fxand bm (fx- bit 1))))
+    (if (fixnum? h) (hamt-and h hmask) (bitwise-and h hmask))))
+(define (chunk h shift) (hamt-and (hamt-sra h shift) 31))
+(define (bitpos h shift) (hamt-sll 1 (chunk h shift)))
+(define (popcount n) (hamt-popcount n))
+(define (arr-index bm bit) (popcount (hamt-and bm (hamt-sub bit 1))))
 
 ;; jolt= alist ops (for hash-collision buckets)
 (define (assoc-jolt k al) (cond ((null? al) #f) ((jolt= (caar al) k) (car al)) (else (assoc-jolt k (cdr al)))))
@@ -696,21 +714,21 @@
 ;; full hashes are equal / the hash is exhausted).
 (define (split-leaf shift ek ev h k v)
   (let ((eh (key-hash ek)))
-    (if (or (fx>? shift max-shift) (fx=? eh h))
+    (if (or (fx>? shift max-shift) (hamt=? eh h))
         (make-hcoll h (list (cons ek ev) (cons k v)))
         (let ((ei (chunk eh shift)) (ni (chunk h shift)))
           (if (fx=? ei ni)
-              (make-hnode (fxsll 1 ei) (vector (split-leaf (fx+ shift 5) ek ev h k v)))
-              (let ((eb (fxsll 1 ei)) (nb (fxsll 1 ni)))
+              (make-hnode (hamt-sll 1 ei) (vector (split-leaf (fx+ shift 5) ek ev h k v)))
+              (let ((eb (hamt-sll 1 ei)) (nb (hamt-sll 1 ni)))
                 (if (fx<? ei ni)
-                    (make-hnode (fxior eb nb) (vector (cons ek ev) (cons k v)))
-                    (make-hnode (fxior eb nb) (vector (cons k v) (cons ek ev))))))))))
+                    (make-hnode (hamt-ior eb nb) (vector (cons ek ev) (cons k v)))
+                    (make-hnode (hamt-ior eb nb) (vector (cons k v) (cons ek ev))))))))))
 
 (define (node-assoc node shift h k v added)
   (let* ((bit (bitpos h shift)) (bm (hnode-bm node)) (arr (hnode-arr node)))
-    (if (fx=? 0 (fxand bm bit))
+    (if (hamt=? 0 (hamt-and bm bit))
         (begin (set-box! added #t)
-               (make-hnode (fxior bm bit) (vec-insert arr (arr-index bm bit) (cons k v))))
+               (make-hnode (hamt-ior bm bit) (vec-insert arr (arr-index bm bit) (cons k v))))
         (let* ((i (arr-index bm bit)) (child (vector-ref arr i)))
           (cond
             ((hnode? child) (make-hnode bm (vec-set arr i (node-assoc child (fx+ shift 5) h k v added))))
@@ -727,7 +745,7 @@
 
 (define (node-get node shift h k default)
   (let* ((bit (bitpos h shift)) (bm (hnode-bm node)))
-    (if (fx=? 0 (fxand bm bit)) default
+    (if (hamt=? 0 (hamt-and bm bit)) default
         (let ((child (vector-ref (hnode-arr node) (arr-index bm bit))))
           (cond ((hnode? child) (node-get child (fx+ shift 5) h k default))
                 ((hcoll? child) (let ((p (assoc-jolt k (hcoll-alist child)))) (if p (cdr p) default)))
@@ -739,7 +757,7 @@
 ;; must put in its entry (see pmap-entry-at).
 (define (node-entry node shift h k)
   (let* ((bit (bitpos h shift)) (bm (hnode-bm node)))
-    (if (fx=? 0 (fxand bm bit)) #f
+    (if (hamt=? 0 (hamt-and bm bit)) #f
         (let ((child (vector-ref (hnode-arr node) (arr-index bm bit))))
           (cond ((hnode? child) (node-entry child (fx+ shift 5) h k))
                 ((hcoll? child) (assoc-jolt k (hcoll-alist child)))
@@ -748,7 +766,7 @@
 
 (define (node-dissoc node shift h k removed)
   (let* ((bit (bitpos h shift)) (bm (hnode-bm node)) (arr (hnode-arr node)))
-    (if (fx=? 0 (fxand bm bit)) node
+    (if (hamt=? 0 (hamt-and bm bit)) node
         (let* ((i (arr-index bm bit)) (child (vector-ref arr i)))
           (cond
             ((hnode? child) (make-hnode bm (vec-set arr i (node-dissoc child (fx+ shift 5) h k removed))))
@@ -756,12 +774,12 @@
              (if (assoc-jolt k (hcoll-alist child))
                  (begin (set-box! removed #t)
                         (let ((nal (alist-remove k (hcoll-alist child))))
-                          (cond ((null? nal) (make-hnode (fxand bm (fxnot bit)) (vec-remove arr i)))
+                          (cond ((null? nal) (make-hnode (hamt-and bm (hamt-not bit)) (vec-remove arr i)))
                                 ((null? (cdr nal)) (make-hnode bm (vec-set arr i (car nal))))   ; collapse to leaf
                                 (else (make-hnode bm (vec-set arr i (make-hcoll (hcoll-hash child) nal)))))))
                  node))
             ((jolt= (car child) k)
-             (set-box! removed #t) (make-hnode (fxand bm (fxnot bit)) (vec-remove arr i)))
+             (set-box! removed #t) (make-hnode (hamt-and bm (hamt-not bit)) (vec-remove arr i)))
             (else node))))))
 
 (define (node-fold node proc acc)     ; (proc k v acc) over every leaf, JVM (ascending) order
@@ -839,10 +857,10 @@
 ;; node-assoc's so the transient can keep its count.
 (define (enode-assoc! nd shift h k v added)
   (let ((bit (bitpos h shift)) (bm (enode-bm nd)))
-    (if (fx=? 0 (fxand bm bit))
+    (if (hamt=? 0 (hamt-and bm bit))
         (begin (set-box! added #t)
                (enode-insert! nd (arr-index bm bit) (cons k v))
-               (enode-bm-set! nd (fxior bm bit)))
+               (enode-bm-set! nd (hamt-ior bm bit)))
         (let* ((i (arr-index bm bit)) (arr (enode-arr nd)) (child (vector-ref arr i)))
           (cond
             ((enode? child) (enode-assoc! child (fx+ shift 5) h k v added))
@@ -869,7 +887,7 @@
 ;; rather than collapsing it (node-dissoc does the same).
 (define (enode-dissoc! nd shift h k removed)
   (let ((bit (bitpos h shift)) (bm (enode-bm nd)))
-    (unless (fx=? 0 (fxand bm bit))
+    (unless (hamt=? 0 (hamt-and bm bit))
       (let* ((i (arr-index bm bit)) (arr (enode-arr nd)) (child (vector-ref arr i)))
         (cond
           ((or (enode? child) (hnode? child))
@@ -880,13 +898,13 @@
            (when (assoc-jolt k (hcoll-alist child))
              (set-box! removed #t)
              (let ((nal (alist-remove k (hcoll-alist child))))
-               (cond ((null? nal) (enode-remove! nd i) (enode-bm-set! nd (fxand bm (fxnot bit))))
+               (cond ((null? nal) (enode-remove! nd i) (enode-bm-set! nd (hamt-and bm (hamt-not bit))))
                      ((null? (cdr nal)) (vector-set! arr i (car nal)))   ; collapse to leaf
                      (else (vector-set! arr i (make-hcoll (hcoll-hash child) nal)))))))
           ((jolt= (car child) k)
            (set-box! removed #t)
            (enode-remove! nd i)
-           (enode-bm-set! nd (fxand bm (fxnot bit)))))))))
+           (enode-bm-set! nd (hamt-and bm (hamt-not bit)))))))))
 
 ;; Reads work over a MIXED tree: the part the transient has written to is
 ;; enodes, everything else is still the source map's hnodes. This is on the hot
@@ -897,7 +915,7 @@
 (define (enode-get nd shift h k default)
   (if (enode? nd)
       (let ((bit (bitpos h shift)) (bm (enode-bm nd)))
-        (if (fx=? 0 (fxand bm bit))
+        (if (hamt=? 0 (hamt-and bm bit))
             default
             (let ((child (vector-ref (enode-arr nd) (arr-index bm bit))))
               (cond ((pair? child) (if (jolt= (car child) k) (cdr child) default))
@@ -1019,13 +1037,13 @@
                  ((symbol-t? k) (symbol-hasheq k))
                  (else #f))))
     (if (and h (fixnum? h))
-        (let ((h (fxand h hmask)))
+        (let ((h (hamt-and h hmask)))
           (let lp ((node (pmap-root m)) (shift 0))
-            (let* ((bit (fxsll 1 (fxand (fxsra h shift) 31)))
+            (let* ((bit (hamt-sll 1 (hamt-and (hamt-sra h shift) 31)))
                    (bm (hnode-bm node)))
-              (if (fx=? 0 (fxand bm bit)) d
+              (if (hamt=? 0 (hamt-and bm bit)) d
                   (let ((child (vector-ref (hnode-arr node)
-                                           (fxbit-count (fxand bm (fx- bit 1))))))
+                                           (hamt-popcount (hamt-and bm (hamt-sub bit 1))))))
                     (cond ((hnode? child) (lp child (fx+ shift 5)))
                           ((hcoll? child)
                            (let ((p (assoc-jolt k (hcoll-alist child)))) (if p (cdr p) d)))
