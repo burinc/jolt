@@ -1659,6 +1659,7 @@
   {:suite "atomics" :label "AtomicLong addAndGet wraps signed overflow" :expected "-9223372036854775808" :expr "(.addAndGet (AtomicLong. 9223372036854775807) 1)"}
   {:suite "atomics" :label "AtomicLong decrementAndGet wraps signed underflow" :expected "9223372036854775807" :expr "(.decrementAndGet (AtomicLong. -9223372036854775808))"}
   {:suite "atomics" :label "AtomicLong getAndAdd returns old and stores wrapped result" :expected "[9223372036854775807 -9223372036854775808]" :expr "(let [a (AtomicLong. 9223372036854775807)] [(.getAndAdd a 1) (.get a)])"}
+  {:suite "atomics" :label "AtomicLong intValue narrows to signed 32 bits" :expected "[1 -2147483648 2147483647 7]" :expr "[(.intValue (AtomicLong. 4294967297)) (.intValue (AtomicLong. 2147483648)) (.intValue (AtomicLong. -2147483649)) (.intValue (AtomicInteger. 7))]"}
   {:suite "atomics" :label "AtomicInteger getAndSet validates before mutation" :expected "[:threw 7]" :expr "(let [a (AtomicInteger. 7)] [(try (.getAndSet a 2147483648) :no-throw (catch ArithmeticException _ :threw)) (.get a)])"}
   {:suite "atomics" :label "AtomicInteger compareAndSet validates next before mutation" :expected "[:threw 7]" :expr "(let [a (AtomicInteger. 7)] [(try (.compareAndSet a 7 2147483648) :no-throw (catch ArithmeticException _ :threw)) (.get a)])"}
   {:suite "atomics" :label "AtomicReference compareAndSet rejects equal distinct expectations" :expected "[false true]" :expr "(let [v (list 1) a (AtomicReference. v)] [(.compareAndSet a (list 1) :bad) (identical? v (.get a))])"}
