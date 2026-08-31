@@ -37,9 +37,13 @@ stays authoritative.
   reach `0x4000` for a root directory. Identity still gets the first word, so a
   host that worked before reads exactly as it did; measurement gets the last, so
   a proposal it contradicts is discarded rather than used. That is also what
-  makes the aarch64 row safe to ship without an arm64 machine to measure on: if
-  those offsets are wrong, nothing verifies and the host refuses exactly as it
-  refuses today, rather than quietly answering nonsense.
+  makes a new row cheap to add: get the offsets wrong and nothing verifies, so
+  the host refuses exactly as it refuses today rather than quietly answering
+  nonsense.
+
+  Both Linux rows are `offsetof`-measured — x86-64 natively, aarch64 under
+  `qemu-aarch64` against the arm64 cross headers — and on each ABI `stat("/")`
+  matches exactly one row, the others landing on `st_nlink` and `st_uid`.
 
 - **`sa-arch` and `sa-endian` could not answer for a portable-bytecode build.**
   The follow-up half of #796. `sa-arch` matched `arm64`/`a6`/`i3` in the machine
