@@ -201,24 +201,94 @@
 ;; Contract: the architecture symbol. Degradation: 'other for an unrecognized
 ;; host; callers treat it as unverified.
 (define (sa-arch)
-  (sa-arch-for-tag (sa-host-tag)))
+  (let ((a (sa-arch-for-tag (sa-host-tag))))
+    (if (eq? a 'other) (sa-probed-arch) a)))
 
 ;; (sa-arch-for-tag tag) -> the derivation above as a function OF the tag, on
 ;; the same terms as sa-os-family-for-tag: for the gate, not for callers.
+;; 'other means THE TAG DOES NOT SAY, which is not the same as "unknown" —
+;; sa-arch probes past it.
 (define (sa-arch-for-tag m)
   (cond ((sa-tag-contains? m "arm64") 'arm64)
         ((sa-tag-contains? m "a6") 'x86-64)
         ((sa-tag-contains? m "i3") 'i386)
         (else 'other)))
 
-;; (sa-endian) -> 'little | 'big | #f
-;; Byte order of the host. Contract: the byte order. Degradation: #f for an
-;; unrecognized suffix — the stat-layout guard treats that as unverified.
+;; (sa-probed-arch) -> 'x86-64 | 'arm64 | 'i386 | 'other
+;; The architecture for a host tag that does not carry one — every pb tag, and
+;; any native tag outside the a6/i3/arm64 vocabulary. Contract: the architecture
+;; the process is actually running on. Degradation: 'other, matching the
+;; else-branch it replaces; every caller already treats that as unverified.
+;;
+;; uname(2) rather than the tag, because a pb tag's own "64" and "l" fields
+;; describe the BYTECODE's encoding and not the machine under it. The machine
+;; field's offset is the one platform constant here: struct utsname is
+;; fixed-width char arrays, 65 on Linux (machine is the 5th, at 260) and 256 on
+;; Darwin (at 1024), and the OS is already settled by sa-os-family before this
+;; runs. Windows has no uname and answers from the environment instead.
+(define sa-arch-cache #f)
+(define (sa-probed-arch)
+  (or sa-arch-cache
+      (let ((a (or (sa-probe-arch-name) 'other)))
+        (set! sa-arch-cache a)
+        a)))
+
+(define (sa-arch-name->symbol s)
+  (cond ((not s) #f)
+        ((or (string=? s "x86_64") (string=? s "amd64") (string=? s "AMD64")) 'x86-64)
+        ((or (string=? s "aarch64") (string=? s "arm64") (string=? s "ARM64")) 'arm64)
+        ((or (string=? s "i386") (string=? s "i686") (string=? s "x86")) 'i386)
+        (else #f)))
+
+(define (sa-probe-arch-name)
+  (if (eq? (sa-os-family) 'windows)
+      (sa-arch-name->symbol (getenv "PROCESSOR_ARCHITECTURE"))
+      (sa-arch-name->symbol (sa-uname-machine))))
+
+;; The `machine` field of uname(2), or #f when it cannot be had. Probe-only and
+;; fully guarded: a statically linked build may not carry the symbol at all, and
+;; a missing arch is a documented degradation rather than a boot failure.
+;;
+;; No sa-load-shared-object here, on sa-fbytes-init!'s reasoning and for its
+;; reason: the boot took the process-global handle long before anything can ask
+;; for an arch (rt.ss binds _exit through jolt-foreign-proc-safe at its line
+;; 135, and the first caller of sa-arch is host-static-methods.ss at 1553), and
+;; re-taking it would re-promote it above every :jolt/native loaded since.
+(define (sa-uname-machine)
+  (guard (e (#t #f))
+    (and (foreign-entry? "uname")
+         (let* ((linux? (eq? (sa-os-family) 'linux))
+                (off (if linux? 260 1024))
+                (size (if linux? 512 2048))
+                (buf (foreign-alloc size)))
+           (dynamic-wind
+             (lambda ()
+               (let loop ((i 0))
+                 (when (fx<? i size)
+                   (foreign-set! 'unsigned-8 buf i 0)
+                   (loop (fx+ i 1)))))
+             (lambda ()
+               (and (= 0 ((foreign-procedure "uname" (void*) int) buf))
+                    (let loop ((i 0) (acc '()))
+                      (let ((b (foreign-ref 'unsigned-8 buf (fx+ off i))))
+                        (if (or (fx=? b 0) (fx>? i 62))
+                            (and (pair? acc) (list->string (reverse acc)))
+                            (loop (fx+ i 1) (cons (integer->char b) acc)))))))
+             (lambda () (foreign-free buf)))))))
+
+;; (sa-endian) -> 'little | 'big
+;; Byte order of the host. Contract: the byte order. Degradation: none — the
+;; runtime always knows its own byte order, so a tag that does not name one is
+;; answered by native-endianness rather than by #f.
 (define (sa-endian)
-  (sa-endian-for-tag (sa-host-tag)))
+  (or (sa-endian-for-tag (sa-host-tag)) (native-endianness)))
 
 ;; (sa-endian-for-tag tag) -> the derivation above as a function OF the tag, on
-;; the same terms as sa-os-family-for-tag: for the gate, not for callers.
+;; the same terms as sa-os-family-for-tag: for the gate, not for callers. #f
+;; means THE TAG DOES NOT SAY — the osx and nt tags carry no le/be suffix and
+;; neither does any pb tag, whose own trailing l/b names the bytecode's encoding
+;; rather than a suffix in this shape. sa-endian answers native-endianness
+;; there, which is exact on every host and needs no probe.
 (define (sa-endian-for-tag m)
   (let ((n (string-length m)))
     (if (>= n 2)
