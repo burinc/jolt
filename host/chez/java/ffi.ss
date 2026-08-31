@@ -834,6 +834,10 @@
 ;; wrapper needs a name for the primitive that its own definition has not taken.
 ;; A host-level gate (test/chez/ffi-*.ss loads this file alone) keeps using the
 ;; public names, which is why both are registered.
+;; __free is the raw deallocator. The public jolt.ffi/free is a stdlib wrapper
+;; that also forgets the pointer's recorded size, the same way __read/__write sit
+;; under the layout-aware read/write.
+(def-var! "jolt.ffi" "__free" ffi-free)
 (def-var! "jolt.ffi" "__alloc" ffi-alloc)
 (def-var! "jolt.ffi" "__calloc" ffi-calloc)
 (def-var! "jolt.ffi" "__read" ffi-read)

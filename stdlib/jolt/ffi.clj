@@ -96,8 +96,9 @@
   is ZEROED — a struct a caller only partly fills is the ordinary case, and
   malloc's leftovers in the rest of it are a C-visible bug that reproduces only
   under load. An integer byte count aligns to 16; a type or layout aligns
-  naturally; a third argument overrides. string->ptr, clone, reinterpret and
-  callback all take an arena in the same first position.
+  naturally; a third argument overrides. string->ptr, clone, reinterpret,
+  segment, slice and callback all take an arena in the same first position, and
+  free forgets the size it recorded.
 
       (with-open [a (ffi/shared-arena)]
         (let [buf (ffi/alloc a 4096)
@@ -295,10 +296,16 @@
 ;; exists; a per-access bounds check is not on offer and would cost a lookup on
 ;; every read.
 ;;
-;; An arena forgets its blocks' sizes when it closes. A `reinterpret` or
-;; `segment` size given WITHOUT an arena is remembered for the life of the
-;; process — the same unbounded lifetime babashka.ffi documents for that form —
-;; so pass an arena when calling either in a loop.
+;; The table is keyed by ADDRESS, which is the whole reason an entry has to be
+;; removed when the memory goes away: an allocator hands the same address out
+;; again, and a stale entry would answer a size for a block that never had one.
+;; So `free` forgets, and an arena forgets its blocks and views when it closes.
+;;
+;; segment, slice and reinterpret all take an arena for the same reason. Without
+;; one the declaration lasts for the life of the process, which is a leak in a
+;; loop and, once the memory is released, a wrong answer — babashka.ffi has
+;; neither problem because a MemorySegment carries its own size and there is no
+;; side table to go stale.
 (def ^:private known-sizes (atom {}))
 
 (defn- remember-size! [pointer byte-count]
@@ -348,26 +355,6 @@
     (keyword? n) (jolt.ffi/__sizeof n)
     :else (throw (ex-info "jolt.ffi: expected a byte count, a type keyword, or a compiled layout"
                           {:size n}))))
-
-(defn segment
-  "A pointer to addr. With a byte count, records that size so `size`, copy and
-  clone can use it.
-
-  CAUTION: keep addr before size. Transposed, the size becomes the address and
-  the first read can stop the process."
-  ([addr] addr)
-  ([addr byte-count] (remember-size! addr (byte-count-of byte-count))))
-
-(defn slice
-  "A pointer `offset` bytes into p. With a length — a byte count, a type
-  keyword, or a compiled layout — the slice's size is recorded, so walking an
-  array of structs takes the layout itself:
-
-      (slice arr (* i (sizeof point)) point)
-
-  CAUTION: keep offset before len. Transposed, the length becomes the offset."
-  ([p offset] (+ p offset))
-  ([p offset len] (remember-size! (+ p offset) (byte-count-of len))))
 
 ;; -- sizes --------------------------------------------------------------------
 
@@ -454,7 +441,7 @@
       (doseq [addr (:callables group)]
         (attempt (fn [] (jolt.ffi/free-callable addr))))
       (doseq [block (reverse (:blocks group))]
-        (attempt (fn [] (jolt.ffi/free (second block)))))
+        (attempt (fn [] (jolt.ffi/__free (second block)))))
       (forget-sizes! (concat (map first (:blocks group))
                              (map first (:views group))))
       (when @failure (throw @failure)))
@@ -636,6 +623,19 @@
        (do (arena-add! arena :blocks [p p])
            (remember-size! p (+ 1 (jolt.ffi/__utf8-length s))))))))
 
+(defn free
+  "Release a caller-owned block from `alloc` and answer nil, and forget the size
+  jolt recorded for that pointer.
+
+  Forgetting is not bookkeeping: the size table is keyed by address, an
+  allocator hands the same address out again, and a leftover entry would answer
+  a size for a block that never had one — which copy and clone would then use as
+  a byte count. Arena memory is released by closing the arena, not by this."
+  [p]
+  (forget-sizes! [p])
+  (jolt.ffi/__free p)
+  nil)
+
 (defn copy
   "Copy bytes from pointer src to pointer dst; answers nil. Without n, copies
   src's known size (see `size`), and dst must be at least that large.
@@ -665,23 +665,72 @@
      (jolt.ffi/__copy src dst n)
      dst)))
 
+(defn segment
+  "A pointer to addr. With a byte count, records that size so `size`, copy and
+  clone can use it. With an arena first, the arena forgets the size when it
+  closes; without one the declaration lasts for the life of the process.
+
+  CAUTION: keep addr before size. Transposed, the size becomes the address and
+  the first read can stop the process."
+  ([addr] addr)
+  ([addr byte-count]
+   (when (arena? addr)
+     (throw (ex-info "jolt.ffi/segment: the arena comes first — (segment arena addr byte-count)"
+                     {:arena addr})))
+   (remember-size! addr (byte-count-of byte-count)))
+  ([arena addr byte-count]
+   (let [arena (arena-usable! arena "segment")]
+     (arena-add! arena :views [addr nil])
+     (remember-size! addr (byte-count-of byte-count)))))
+
+(defn slice
+  "A pointer `offset` bytes into p. With a length — a byte count, a type
+  keyword, or a compiled layout — the slice's size is recorded, so walking an
+  array of structs takes the layout itself:
+
+      (with-open [a (ffi/confined-arena)]
+        (slice a arr (* i (sizeof point)) point))
+
+  Pass the arena when slicing in a loop. Each length recorded without one is an
+  entry that lives as long as the process, on an address the caller is free to
+  release — see the note above `known-sizes`.
+
+  CAUTION: keep offset before len. Transposed, the length becomes the offset."
+  ([p offset] (+ p offset))
+  ([p offset len]
+   (when (arena? p)
+     (throw (ex-info "jolt.ffi/slice: the arena comes first — (slice arena p offset len)"
+                     {:arena p})))
+   (remember-size! (+ p offset) (byte-count-of len)))
+  ([arena p offset len]
+   (let [arena (arena-usable! arena "slice")
+         q (+ p offset)]
+     (arena-add! arena :views [q nil])
+     (remember-size! q (byte-count-of len)))))
+
 (defn reinterpret
   "Declare that pointer p addresses `byte-count` bytes, and answer p. This is how
   a pointer from C gets a size, which is what `size`, copy and clone read.
 
-  With an arena, the declaration is forgotten when the arena closes, and the
-  arena calls the optional cleanup function with p — the place to hand a C
-  library's own deallocator. Without an arena the declaration lasts for the life
-  of the process, so pass one when calling this in a loop.
+  The arena comes first, as it does for alloc, string->ptr, clone and callback:
+  (reinterpret arena p byte-count [cleanup]). With one, the declaration is
+  forgotten when the arena closes and the arena calls the optional cleanup
+  function with p — the place to hand a C library's own deallocator. Without an
+  arena the declaration lasts for the life of the process, so pass one when
+  calling this in a loop.
 
   CAUTION: give the ACTUAL size. Nothing can check it, and jolt does not
   bounds-check a read; a size larger than the allocation is a read off the end.
 
   CAUTION: the arena frees nothing here — the memory is C's. What it releases is
   the declaration and, through the cleanup function, whatever C wants released."
-  ([p byte-count] (remember-size! p (byte-count-of byte-count)))
-  ([p byte-count arena] (reinterpret p byte-count arena nil))
-  ([p byte-count arena cleanup]
+  ([p byte-count]
+   (when (arena? p)
+     (throw (ex-info "jolt.ffi/reinterpret: the arena comes first — (reinterpret arena p byte-count)"
+                     {:arena p})))
+   (remember-size! p (byte-count-of byte-count)))
+  ([arena p byte-count] (reinterpret arena p byte-count nil))
+  ([arena p byte-count cleanup]
    (let [arena (arena-usable! arena "reinterpret")]
      (arena-add! arena :views [p cleanup])
      (remember-size! p (byte-count-of byte-count)))))
