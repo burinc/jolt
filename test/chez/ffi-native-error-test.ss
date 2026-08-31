@@ -234,11 +234,7 @@
 ;;
 ;; jolt.socket is POSIX-only, while this FFI gate also validates GetLastError on
 ;; Windows. Keep the socket consumer witness on the platforms that provide it.
-(define machine-name (symbol->string (machine-type)))
-(define windows-host?
-  (let ((n (string-length machine-name)))
-    (and (>= n 2) (string=? "nt" (substring machine-name (- n 2) n)))))
-(unless windows-host?
+(unless (eq? (sa-os-family) 'windows)
   (ev "(require 'jolt.socket)")
   (ok "socket recv keeps EAGAIN across an intervening errno clobber"
       (evb "(let [server (java.net.ServerSocket. 0)
@@ -262,6 +258,37 @@
                    (ffi/free buf)
                    (.close conn)
                    (.close client)
+                   (.close server))))"))
+
+  (ok "socket accept keeps EAGAIN across an intervening errno clobber"
+      (evb "(let [server (java.net.ServerSocket. 0)
+                   server-fd (jolt.host/ref-get server :fd)
+                   client (atom nil)
+                   accepted-fd (atom -1)
+                   sa (ffi/alloc 16)
+                   lenp (ffi/alloc 4)
+                   first? (atom true)
+                   raw-accept (deref (ns-resolve 'jolt.socket 'c-accept))
+                   raw-close (deref (ns-resolve 'jolt.socket 'c-close))
+                   io-call (deref (ns-resolve 'jolt.socket 'io-call))
+                   op (fn []
+                        (let [result (raw-accept server-fd sa lenp)]
+                          (when (compare-and-set! first? true false)
+                            (reset! client
+                                    (java.net.Socket. \"127.0.0.1\"
+                                                      (.getLocalPort server)))
+                            (c-clobber-scalar 9))
+                          result))]
+               (try
+                 (do
+                   (ffi/write lenp :int 0 16)
+                   (reset! accepted-fd (io-call op server-fd :read))
+                   (not (neg? @accepted-fd)))
+                 (finally
+                   (when-not (neg? @accepted-fd) (raw-close @accepted-fd))
+                   (when @client (.close @client))
+                   (ffi/free sa)
+                   (ffi/free lenp)
                    (.close server))))")))
 
 ;; --- scalar preserved: omitted / empty / legacy :blocking / false -------------
