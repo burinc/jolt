@@ -241,6 +241,17 @@
 ;; the analyzer/back end turn it into a Chez foreign-procedure.
 ;; An optional trailing :blocking marks a call that may block (accept/recv/...),
 ;; so it's emitted collect-safe and won't pin the garbage collector.
+;;
+;; "Pin the garbage collector" is worth spelling out, because the cost is not
+;; paid by the calling thread. A collection runs only when every other thread
+;; is inactive, and a thread inside a foreign call that was not marked stays
+;; ACTIVE for the whole call. So the price of omitting :blocking is that every
+;; OTHER thread stops as soon as it needs to allocate, for as long as the call
+;; lasts — and for a call that never returns, such as a UI run loop entered
+;; through the FFI, that is the rest of the process's life. Nothing crashes and
+;; the blocked thread looks fine; work elsewhere simply stops, arbitrarily far
+;; from the call that caused it. Mark anything that can block indefinitely.
+;;
 ;; A :varargs marker inside the argtype vector declares a VARIADIC libc
 ;; function and marks the boundary: the types before :varargs are the fixed
 ;; (named) parameters, the types after it are the concrete variadic arguments
