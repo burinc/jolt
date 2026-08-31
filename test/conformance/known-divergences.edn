@@ -118,6 +118,40 @@
            :jvm "false"
            :jolt "true"}
    :note "Numeric-category-blind value equality; a deep = property, not a cheap fix. Verified against Clojure 1.12.5."}
+  ;; NaN inside a collection. The JVM walks collection = with .equals, and
+  ;; Double.equals reports NaN equal to itself, so two LISTS of ##NaN are equal
+  ;; even though the scalars are not. jolt compares NaN by value everywhere, so
+  ;; the list answers false like the scalar. The JVM is not self-consistent here:
+  ;; (= [##NaN] [##NaN]) is false on the JVM too, because vector = takes another
+  ;; path. clojure.org's equality guide calls this out as a "sometimes".
+  ;; Found through the clojure-test-suite: eq.cljc asserts the JVM list behaviour
+  ;; and skips it with #?@(:bb [] ...). jolt reads :bb, so that row never ran.
+  {:category :numeric-model
+   :behavior "(= (list ##NaN) (list ##NaN))"
+   :jvm "true — collection = defers to Double.equals, which says NaN equals NaN"
+   :jolt "false — NaN compares by value at every depth"
+   :check {:expr "[(= ##NaN ##NaN) (= (list ##NaN) (list ##NaN)) (= [##NaN] [##NaN])]"
+           :jvm "[false true false]"
+           :jolt "[false false false]"}
+   :note "The scalar and vector cases agree with the JVM; only the list case diverges. Whether to match the JVM here is open: unlike the flonum and integer collapses this does not fall out of the Chez value model, and the JVM behaviour is itself widely considered surprising."}
+  ;; not= on NaN. (not= x y) is (not (= x y)), and since (= ##NaN ##NaN) is false
+  ;; the answer should be true. jolt gives true. The JVM gives false, which is a
+  ;; known JVM bug (ask.clojure.org #14298). So this is one of the rare rows where
+  ;; jolt matches the documented contract and the reference implementation does
+  ;; not. Recorded anyway: the registry tracks divergence from the reference, not
+  ;; which side is right.
+  ;; Invisible to the cts gate, and not because a row was skipped. The suite's
+  ;; not_eq.cljc asserts jolt's own answer in its :bb branch, jolt reads :bb, and
+  ;; so the test PASSES while the divergence stands. A :bb branch can hide a gap
+  ;; by agreeing with it.
+  {:category :numeric-model
+   :behavior "(not= ##NaN ##NaN)"
+   :jvm "false — a known JVM bug, ask.clojure.org #14298"
+   :jolt "true — (not (= ##NaN ##NaN)), which is what not= promises"
+   :check {:expr "[(= ##NaN ##NaN) (not= ##NaN ##NaN)]"
+           :jvm "[false false]"
+           :jolt "[false true]"}
+   :note "jolt is the side following the contract here. Kept as a divergence because the registry measures against the reference implementation."}
   ;; ex-info's data map is unchecked here. ExceptionInfo's constructor takes an
   ;; IPersistentMap, so a non-map is a ClassCastException on the JVM; jolt stores
   ;; whatever it is handed and ex-data reads it back. A superset: portable code

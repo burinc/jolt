@@ -1,49 +1,131 @@
 # clojure-test-suite known failures: <namespace> <fail> <error>
 # The gate fails on any per-namespace change, worse OR better; regenerate
 # with: JOLT_CTS_WRITE_BASELINE=1 host/chez/cts.sh
+#
+# NOTE: regenerating STRIPS every comment below. Save this file first and put
+# the prose back, or the reasoning is lost and the next reader re-derives it.
+#
+# Each entry is tagged with why it is here. Three kinds:
+#
+#   [divergence]  jolt behaves as designed and differently from the JVM. Not a
+#                 defect. The deep ones are in test/conformance/known-divergences.edn.
+#   [suite/:bb]   the suite asked babashka's question. jolt's reader feature set
+#                 is {:jolt :bb :clj :default} and :bb is listed first, so jolt
+#                 takes the :bb branch. Fixable in the suite with a :jolt branch
+#                 placed AHEAD of :bb, not here.
+#   [gap]         neither of the above. None currently.
+#
+# The audit behind these tags also found that most :bb branches SKIP assertions
+# rather than fail them, so this file understates the divergence surface: 97
+# assertions across eight other namespaces never run here at all. See
+# b12n-sp-docs/jolt/findings/2026-08-31-cts-bb-branch-audit.md.
+# [divergence] :integer-box-model. (abs min-int) promotes to a bignum
+# instead of overflow-wrapping to itself as the JVM does.
 clojure.core-test.abs 1 0
+# [divergence] :integer-box-model. (bigint 0) is a Long here, so the
+# instance? clojure.lang.BigInt rows miss; one row also pins the exact
+# bignum for max-double, which jolt computes at full precision.
 clojure.core-test.bigint 3 0
+# [divergence] :integer-box-model. (instance? java.lang.Byte (byte 0))
+# is false: every integer collapses to one exact-integer type.
 clojure.core-test.byte 1 0
-# char: the suite's "4+ byte characters" case is host-dependent — it expects a
-# throw on the JVM but the character itself on jank and basilisp, which index
-# strings by code point as jolt does. jolt has no branch there so it takes
-# :default; (= (first "\u{10127}") (char 65895)) holds here exactly as the :lpy
-# branch asserts. See the :string-model entry in known-divergences.edn.
+# [divergence] :string-model. The suite's "4+ byte characters" case is
+# host-dependent — it expects a throw on the JVM but the character itself
+# on jank and basilisp, which index strings by code point as jolt does.
+# jolt has no branch there so it takes :default; (= (first "\u{10127}")
+# (char 65895)) holds here exactly as the :lpy branch asserts.
 clojure.core-test.char 1 0
+# [divergence] host arrays. (contains? (int-array [0 1 2]) 0) raises
+# "contains? not supported on type: [I". All 9 errors are that one row shape.
 clojure.core-test.contains-qmark 0 9
+# [divergence] :integer-box-model. (dec min-int) promotes to a bignum
+# where the JVM throws on overflow.
 clojure.core-test.dec 1 0
-# descendants: the suite's :bb branch expects class-as-SYMBOL in hierarchies
+# [suite/:bb] The suite's :bb branch expects class-as-SYMBOL in hierarchies
 # (babashka's model); jolt derives with the class VALUE like the JVM, so the
-# three set-equality rows miss. See the class model notes in known-divergences.
+# three set-equality rows miss. Measured: a :jolt branch ahead of :bb fixes
+# all three and unhides 3 more assertions. Not a jolt defect.
 clojure.core-test.descendants 3 0
+# [divergence] one flonum type. (double? (float 0.0)) is true here because
+# Chez has a single flonum; see the :check'd float entry in known-divergences.
 clojure.core-test.double-qmark 3 0
+# [divergence] one flonum type. (= (float 0.1) (double 0.1)) is true here.
+# NOTE: this namespace also SKIPS a row jolt fails — #?@(:bb [] ...) hides
+# (= (list ##NaN) (list ##NaN)), now registered in known-divergences.
 clojure.core-test.eq 1 0
+# [divergence] one flonum type. (float min-double) does not narrow to 0.0
+# because there is no separate single-precision representation.
 clojure.core-test.float 1 0
+# [divergence] :integer-box-model. (inc max-int) promotes to a bignum
+# where the JVM throws on overflow.
 clojure.core-test.inc 1 0
+# [divergence] :integer-box-model. The :default rows assert (int? 0N) is
+# false; jolt collapses 0N/1N/-1N to Long, so int? answers true.
 clojure.core-test.int-qmark 3 0
+# [divergence] :seq-type-model. nthrest returns a Cons rather than a LazySeq,
+# and realized? on a Cons raises rather than answering.
 clojure.core-test.lazy-seq 1 2
+# [divergence] reader/printer. #bigdec "4" round-trips as 4M, so the literal
+# comparison against the unevaluated form misses.
 clojure.core-test.list 1 0
+# [divergence] :integer-box-model. (- min-int 1) and (- max-int -1) promote
+# to bignums where the JVM throws on overflow.
 clojure.core-test.minus 2 0
+# [divergence] :integer-box-model. Every row is p/big-int? on a result jolt
+# returns as a Long, because a small bigint is a Long here.
 clojure.core-test.mod 22 0
+# [divergence] :integer-box-model. Same as int-qmark: the -1N row.
 clojure.core-test.neg-int-qmark 1 0
+# [divergence] one flonum type. Shares eq.cljc's helper, so it inherits the
+# (float 0.1) vs (double 0.1) row. Separately, jolt's (not= ##NaN ##NaN) is
+# true and the JVM's is false, but the suite's :bb branch asserts jolt's own
+# answer, so that divergence PASSES here and is invisible. Registered in
+# known-divergences.edn instead. Do NOT add a :jolt branch to not_eq.cljc:
+# :bb is the correct branch for jolt in that one file.
 clojure.core-test.not-eq 1 0
+# [divergence] regex model. (nth m 0) on a re-matcher raises "nth not supported
+# on this type: :object" — jolt's matcher comes from vendored irregex, not
+# java.util.regex. NOT array interop: an earlier commit message on this file
+# said both this and contains-qmark were the [I array case. Only contains-qmark is.
 clojure.core-test.nth 0 7
-# num: the file carries TWO :bb branches and jolt takes both. The first,
-# #?(:bb nil :clj (do (definterface IChecker ...))), skips a definterface
-# block that jolt in fact supports; the second asserts (num nil) => nil
-# (babashka leniency) where jolt throws like the JVM. So the whole :clj path
-# is viable here and the error is recoverable suite-side with a :jolt branch
-# placed ahead of :bb. The other numeric rows match through :bb already.
+# [suite/:bb] The file carries TWO :bb branches and jolt takes both. The first,
+# #?(:bb nil :clj (do (definterface IChecker ...))), skips a definterface block
+# that jolt in fact supports; the second asserts (num nil) => nil (babashka
+# leniency) where jolt throws like the JVM. Taking the :clj path instead removes
+# this error and surfaces 3 :integer-box-model failures, which is more honest but
+# reads worse. A judgement call for whoever writes the suite change.
 clojure.core-test.num 0 1
+# [divergence] :strictness. jolt returns nil for the JVM's lenient short
+# forms ("0-0-0-0-0"), rather than zero-padding each group.
 clojure.core-test.parse-uuid 3 0
+# [divergence] :integer-box-model. Overflow promotes instead of throwing, and
+# the big-int? rows see Longs because a small bigint is a Long here.
 clojure.core-test.plus 11 0
+# [divergence] :integer-box-model, as plus. NOTE: 4 of these 13 are an
+# artifact of portability/big-int? itself, which uses (not (int? n)) and so
+# answers false for a real bignum here. A :jolt branch of
+# (= (type n) clojure.lang.BigInt) fixes those 4 in the suite.
 clojure.core-test.plus-squote 13 0
+# [divergence] :integer-box-model. Same as int-qmark: the 1N row.
 clojure.core-test.pos-int-qmark 1 0
+# [divergence] :integer-box-model. Every row is p/big-int? on a Long result.
 clojure.core-test.quot 25 0
+# [divergence] :integer-box-model. Every row is p/big-int? on a Long result.
 clojure.core-test.rem 16 0
+# [divergence] :integer-box-model. (instance? java.lang.Short (short 0)) is
+# false: narrow int classes collapse to Long.
 clojure.core-test.short 1 0
+# [divergence] :integer-box-model, as plus.
 clojure.core-test.star 11 0
+# [divergence] :integer-box-model, as plus-squote. 4 of these 13 are the
+# same portability/big-int? artifact described there.
 clojure.core-test.star-squote 13 0
+# [divergence] :permissive. (transient '(1 2 3)) and the sorted colls return
+# a transient rather than throwing, so the p/thrown? rows miss.
 clojure.core-test.transient 4 0
+# [divergence] host arrays. The JVM's (vec arr) ALIASES the array, so a later
+# aset shows through the vector. jolt copies, so it does not.
 clojure.core-test.vec 1 0
+# [divergence] regex model. A map replacement and \b word boundaries behave
+# differently through vendored irregex than through java.util.regex.
 clojure.string-test.replace 7 0
