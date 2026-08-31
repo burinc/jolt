@@ -104,10 +104,17 @@ stable identifier; nothing parses it except target-owned build machinery.
 The derived three answer for the process that is RUNNING, not for the build
 that produced it. Chez's native machine tag happens to answer both, which is
 why the adapter reads it; its portable-bytecode tags name no OS at all, and
-deriving one from them called every bytecode build Linux (#796). A port whose
-identifier is likewise portable must probe the host instead of parsing the
-identifier — `sa-probed-os-family` in the Chez adapter is one such probe, and
-the answer may be cached, since it cannot change while the process runs.
+deriving one from them called every bytecode build Linux (#796) while leaving
+the architecture and byte order unknown (#798). A port whose identifier is
+likewise portable must probe the host instead of parsing the identifier — the
+Chez adapter probes the filesystem for the OS, `uname(2)` for the architecture,
+and answers the byte order from `native-endianness` — and each answer may be
+cached, since none can change while the process runs.
+
+`sa-endian` has no degraded answer: a runtime always knows its own byte order,
+so a port answers it rather than declining. `sa-arch` may still answer `'other`,
+which callers read as "unverified" — but `'other` must mean the port could not
+find out, never merely that its identifier did not say.
 
 ## Target-owned files
 

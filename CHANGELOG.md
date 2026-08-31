@@ -41,6 +41,24 @@ stays authoritative.
   those offsets are wrong, nothing verifies and the host refuses exactly as it
   refuses today, rather than quietly answering nonsense.
 
+- **`sa-arch` and `sa-endian` could not answer for a portable-bytecode build.**
+  The follow-up half of #796. `sa-arch` matched `arm64`/`a6`/`i3` in the machine
+  tag and `sa-endian` read its last two characters for `le`/`be`; a pb tag
+  matches neither vocabulary even though `pb64l` does name a 64-bit
+  little-endian build, in fields those derivations do not parse. Both now probe
+  past a tag that declines to say: `uname(2)`'s `machine` field for the
+  architecture (`PROCESSOR_ARCHITECTURE` on Windows, which has no `uname`), and
+  `native-endianness` for the byte order, which is exact everywhere and needs no
+  probe at all. `os.arch` on a bytecode build answers `amd64`/`aarch64` rather
+  than the raw tag.
+
+  `sa-endian` no longer has a `#f` answer — a runtime always knows its own byte
+  order. That mattered beyond the tag: `nio-x86-64-linux?` tested the
+  architecture and the byte order but never the OS, so it was correct only by
+  the accident that the Windows tag has no `le` suffix. Answering endianness
+  honestly would have made a Windows x86-64 build claim the Linux `struct stat`
+  layout, and the rewrite above removes that predicate entirely.
+
 - **A portable-bytecode build reported itself as Linux, wherever it was running.**
   `sa-os-family` derived the OS by substring-matching Chez's machine tag, which
   answers for a native tag and cannot answer for a bytecode one: `pb`, `pb64l`
