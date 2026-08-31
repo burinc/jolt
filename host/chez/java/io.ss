@@ -13,34 +13,47 @@
 ;; natives-meta.ss / records.ss / printing.ss (jolt-type / instance-check /
 ;; jolt-str-render-one, which it extends).
 
-;; Every JVM File constructor runs its path through FileSystem.normalize(), so a
-;; File's path is ALWAYS normalized: runs of "/" collapse to one and a trailing
-;; "/" is dropped. "." and ".." are left alone -- the constructor does not resolve
+;; FileSystem.normalize(): runs of "/" collapse to one and a trailing "/" is
+;; dropped. "." and ".." are left alone -- the JVM's constructor does not resolve
 ;; those, and neither does this. new File("/a/b//c").getPath() is "/a/b/c".
 ;;
-;; Applied in the record's protocol rather than at the call sites, because there
-;; are nine of them and only one is the constructor entry point: as-file, the
-;; file: URL coercion, createTempFile, getParentFile and listRoots all build a
-;; jfile directly. The invariant belongs where it cannot be bypassed by the next
-;; one added.
+;; Every path the ONE-argument constructor produces is normalized, and so is
+;; every path built by as-file, the file: URL coercion, createTempFile,
+;; getParentFile and listRoots -- nine construction sites of which only one is
+;; the constructor entry point. So make-jfile normalizes and they all go through
+;; it, rather than the invariant being restated nine times.
+;;
+;; The two-argument constructor normalizes each ARGUMENT and then resolves them.
+;; That result is normal too, on every JDK from 21. See jolt-file-join.
+(define (path-has-double-sep? p n)
+  (let loop ((i 1))
+    (and (fx<? i n)
+         (or (and (char=? (string-ref p i) #\/) (char=? (string-ref p (fx- i 1)) #\/))
+             (loop (fx+ i 1))))))
+
 (define (jolt-path-normalize p)
   (let ((n (string-length p)))
-    (if (fx=? n 0)
-        p
-        (let ((out (make-string n)))
-          (let loop ((i 0) (j 0) (prev-slash? #f))
-            (if (fx=? i n)
-                ;; a trailing separator goes, but "/" is a path, not an empty one
-                (let ((j (if (and (fx>? j 1) (char=? (string-ref out (fx- j 1)) #\/))
-                             (fx- j 1)
-                             j)))
-                  ;; nothing collapsed and nothing trimmed -> hand back the
-                  ;; original rather than an identical copy
-                  (if (fx=? j n) p (substring out 0 j)))
-                (let ((c (string-ref p i)))
-                  (cond ((and (char=? c #\/) prev-slash?) (loop (fx+ i 1) j #t))
-                        (else (string-set! out j c)
-                              (loop (fx+ i 1) (fx+ j 1) (char=? c #\/)))))))))))
+    (cond
+      ;; an already-normal path is the overwhelmingly common case, and a jfile is
+      ;; built per entry on every directory listing: look before copying, so the
+      ;; answer is p itself and nothing is allocated
+      ((not (path-has-double-sep? p n))
+       ;; a trailing separator goes, but "/" is a path, not an empty one
+       (if (and (fx>? n 1) (char=? (string-ref p (fx- n 1)) #\/))
+           (substring p 0 (fx- n 1))
+           p))
+      (else
+       (let ((out (make-string n)))
+         (let loop ((i 0) (j 0) (prev-slash? #f))
+           (if (fx=? i n)
+               (let ((j (if (and (fx>? j 1) (char=? (string-ref out (fx- j 1)) #\/))
+                            (fx- j 1)
+                            j)))
+                 (substring out 0 j))
+               (let ((c (string-ref p i)))
+                 (cond ((and (char=? c #\/) prev-slash?) (loop (fx+ i 1) j #t))
+                       (else (string-set! out j c)
+                             (loop (fx+ i 1) (fx+ j 1) (char=? c #\/))))))))))))
 
 (define-record-type jfile (fields path) (nongenerative jolt-jfile-v1)
   (protocol (lambda (new) (lambda (p) (new (jolt-path-normalize p))))))
@@ -1154,6 +1167,11 @@
 ;; Registered as io/as-relative-path too: public API in clojure.java.io on
 ;; the JVM, and missing here entirely before.
 (define (jolt-as-relative-path x)
+  ;; as-file first, so nil coerces to nil and .isAbsolute raises on it rather
+  ;; than the child being read as ""
+  (when (jolt-nil? x)
+    (throw-jvm (quote NullPointerException)
+               "Cannot invoke \"java.io.File.isAbsolute()\" because \"f\" is null"))
   (let ((p (jfile-path (make-jfile (file-path-of x)))))
     (when (and (fx>? (string-length p) 0) (char=? (string-ref p 0) #\/))
       (throw-jvm (quote IllegalArgumentException)
@@ -1161,9 +1179,10 @@
     p))
 (def-var! "clojure.java.io" "as-relative-path" jolt-as-relative-path)
 (define (jolt-io-file a . rest)
-  (if (null? rest)
-      (jolt-make-file a)
-      (apply jolt-make-file a (map jolt-as-relative-path rest))))
+  (cond ((pair? rest) (apply jolt-make-file a (map jolt-as-relative-path rest)))
+        ;; one-arg io/file IS as-file, and as-file of nil is nil
+        ((jolt-nil? a) a)
+        (else (jolt-make-file a))))
 (def-var! "clojure.java.io" "file" jolt-io-file)
 ;; io/as-file of a file: URL yields the file it points at (JVM: new
 ;; File(url.toURI())); a URL with any other protocol has no filesystem path —
@@ -1173,7 +1192,11 @@
       (make-jfile (url-strip-scheme (url-spec u)))
       (throw-jvm 'IllegalArgumentException (string-append "Not a file: " (url-spec u)))))
 (def-var! "clojure.java.io" "as-file"
-  (lambda (x) (cond ((jfile? x) x)
+  ;; Clojure extends Coercions to nil, so (io/as-file nil) is nil -- NOT a File
+  ;; whose path is "". The difference is load-bearing one call downstream, where
+  ;; the JVM raises on the nil and jolt was quietly reading the process's cwd.
+  (lambda (x) (cond ((jolt-nil? x) x)
+                    ((jfile? x) x)
                     ((and (jhost? x) (string=? (jhost-tag x) "url")) (url-file-coercion x))
                     (else (make-jfile (file-path-of x))))))
 ;; "reader" is bound by natives-array.ss (loaded later) so a char[] argument is
@@ -1483,30 +1506,51 @@
   (register-class-statics! "java.lang.Thread" statics))
 
 ;; --- java.io.File / java.util.UUID constructors -----------------------------
-;; (java.io.File. parent child) joins with exactly ONE separator: File(parent,
-;; child) normalizes, so a parent that already ends in "/" does not produce a
-;; doubled slash (ring's resource middleware builds "assets/" + "index.html").
-;; A child that starts with a separator is joined the same way, and an empty
-;; child yields the parent's path alone -- all four checked against the JVM.
+;; (java.io.File. parent child) answers resolve(normalize(parent),
+;; normalize(child)) -- it normalizes each ARGUMENT, and then:
+;;
+;;   resolve(p, c) = p              when c is "" or "/"
+;;                 = c              when c is absolute and p is "/"
+;;                 = p + c          when c is absolute
+;;                 = p + c          when p is "/"
+;;                 = p + "/" + c    otherwise
+;;
+;; So a parent that already ends in "/" does not produce a doubled slash (ring's
+;; resource middleware builds "assets/" + "index.html"), a duplicate INSIDE
+;; either argument collapses, and a separator-only child yields the parent alone.
+;;
+;; A null parent is the child by itself. An EMPTY parent is not: it resolves
+;; against getDefaultParent(), which is "/" -- new File("", "c") is "/c", not
+;; "c", and new File("", "") is "/", not "". Both measured against the JVM.
+;;
+;; Worth knowing before measuring this yourself: resolve grew its c == "/" case
+;; in JDK 21. Through JDK 20, new File("/a/b", "/") answered "/a/b/" -- a path
+;; carrying a trailing separator no one-argument constructor can produce, whose
+;; .getName() was "". From 21 on it is "/a/b", which is what this matches.
+;;
+;; A null CHILD is not a null parent: the constructor null-checks it up front and
+;; throws, message and all -- new File("/a", null) raises NPE rather than
+;; answering "/a". jolt read it as "" and quietly answered the parent, the same
+;; silently-wrong-file shape as the nil coercions above.
 (define (jolt-file-join parent child)
-  (let* ((p (file-path-of parent))
-         (c (file-path-of child))
-         (p (if (and (> (string-length p) 1)
-                     (char=? (string-ref p (- (string-length p) 1)) #\/))
-                (substring p 0 (- (string-length p) 1))
-                p))
-         (c (let strip ((i 0))
-              (cond ((= i (string-length c)) c)
-                    ((char=? (string-ref c i) #\/) (strip (+ i 1)))
-                    (else (substring c i (string-length c)))))))
-    (cond ((string=? c "") p)
-          ((string=? p "/") (string-append "/" c))
-          (else (string-append p "/" c)))))
-(register-class-ctor! "File"
-  (lambda (a . rest)
-    (if (pair? rest)
-        (jolt-make-file (jolt-file-join a (car rest)))
-        (jolt-make-file a))))
+  (when (jolt-nil? child) (throw-jvm (quote NullPointerException) jolt-nil))
+  (let ((c (jolt-path-normalize (file-path-of child))))
+    (if (jolt-nil? parent)
+        c
+        (let* ((p (jolt-path-normalize (file-path-of parent)))
+               (p (if (string=? p "") "/" p)))
+          (cond ((or (string=? c "") (string=? c "/")) p)
+                ((char=? (string-ref c 0) #\/)
+                 (if (string=? p "/") c (string-append p c)))
+                ((string=? p "/") (string-append p c))
+                (else (string-append p "/" c)))))))
+;; new File((String)null) throws too, with a null message of its own. Only the
+;; two-arg form takes a null parent, and there it means "the child alone".
+(define (jolt-file-ctor a . rest)
+  (cond ((pair? rest) (jolt-make-file (jolt-file-join a (car rest))))
+        ((jolt-nil? a) (throw-jvm (quote NullPointerException) jolt-nil))
+        (else (jolt-make-file a))))
+(register-class-ctor! "File" jolt-file-ctor)
 ;; File statics: the platform separators plus createTempFile / listRoots.
 (define temp-file-counter 0)
 (define (file-create-temp prefix suffix . dir)
@@ -1536,11 +1580,7 @@
                      (cons "listRoots" (lambda () (jolt-vector (make-jfile "/")))))))
   (register-class-statics! "File" statics)
   (register-class-statics! "java.io.File" statics))
-(register-class-ctor! "java.io.File"
-  (lambda (a . rest)
-    (if (pair? rest)
-        (jolt-make-file (jolt-file-join a (car rest)))
-        (jolt-make-file a))))
+(register-class-ctor! "java.io.File" jolt-file-ctor)
 ;; java.nio.charset.StandardCharsets: the constants ARE the charset names —
 ;; every jolt charset seam (.getBytes, String ctors, InputStreamReader) takes
 ;; the name string, so the constant composes with all of them (clj-uuid's v3/v5

@@ -46,6 +46,14 @@ stays authoritative.
   `.` and `..` are still not resolved. The JVM constructor does not resolve them
   either; that is `getCanonicalPath`.
 
+  The two-arg constructor is `resolve(normalize(parent), normalize(child))` — it
+  normalizes each argument, and resolve is not a plain join. An empty parent
+  resolves against `getDefaultParent()`, so `new File("", "")` is `/`, not `""`,
+  which jolt got wrong in both directions before. (If you go measuring this
+  yourself: resolve grew its `child == "/"` case in JDK 21, so through JDK 20
+  `new File("/a/b", "/")` answered `/a/b/`, a path with a trailing separator no
+  one-arg constructor can produce. 21 onward it is `/a/b`.)
+
 - **`clojure.java.io/file` joined an absolute child instead of rejecting it.**
   `io/file` is not the `File` constructor: Clojure puts every child through
   `as-relative-path`, so `(io/file "/a/b" "/c")` raises `IllegalArgumentException`
@@ -63,6 +71,19 @@ stays authoritative.
   JVM, missing here entirely). And `io/make-parents` builds `(apply io/file f
   more)` on the JVM, so it carries the same contract: an absolute child raises
   instead of quietly joining.
+
+- **`(io/file nil)` and `(io/as-file nil)` answered an empty `File`, not `nil`.**
+  Clojure extends `Coercions` to `nil`, so both are `nil` on the JVM. A `File`
+  whose path is `""` is not a harmless stand-in for that: it names the process's
+  working directory, so a nil that should have blown up at the coercion instead
+  went on to read or write the wrong file. `as-relative-path` goes through
+  `as-file`, so a nil child now raises there too, the way `(io/file "/a" nil)`
+  does on the JVM, rather than joining as an empty segment.
+
+  The `File` constructor null-checks for the same reason: `(File. nil)` and
+  `(File. "/a" nil)` raise `NullPointerException` instead of reading the nil as
+  `""`. `(File. nil "c")` still answers `c` — a null *parent* is the one the
+  two-arg constructor accepts, and it means the child alone.
 
 - **`jolt run` could not write any closure `clojure.core` makes.** `cycle`,
   `repeat`, `partial`, `comp` and the rest refused with "captured local … was

@@ -1,8 +1,12 @@
 ;; java.io.File path-normalization gate — every JVM File constructor runs its
-;; path through FileSystem.normalize(), so a File's path is always normalized:
-;; runs of "/" collapse to one and a trailing "/" is dropped. "." and ".." are
-;; NOT resolved, by the JVM or here — that is getCanonicalPath's job, which
-;; canonical-path-test.clj covers.
+;; arguments through FileSystem.normalize(): runs of "/" collapse to one and a
+;; trailing "/" is dropped. "." and ".." are NOT resolved, by the JVM or here —
+;; that is getCanonicalPath's job, which canonical-path-test.clj covers.
+;;
+;; The one-arg constructor normalizes and is done. The two-arg one normalizes
+;; each ARGUMENT and then resolves them, which is a different contract: an empty
+;; parent resolves against getDefaultParent() rather than against "". Both
+;; shapes are pinned below.
 ;;
 ;; jolt used to keep the path exactly as given, so (File. "/a/b//c") answered
 ;; "/a/b//c". The visible route in was createTempFile: $TMPDIR ends in "/" on
@@ -56,17 +60,46 @@
 ;; the two-arg constructor has no as-relative-path contract: it joins an
 ;; absolute child rather than rejecting it, and the JVM agrees
 (check "(File. parent absolute-child)" (.getPath (File. "/a/b" "/c")) "/a/b/c")
-;; a separator-only child normalizes to "/" first, and resolve then joins
-;; parent+"/" -- which the constructor's normalize pass collapses back down.
-;; All five measured on the JVM.
-(check "(File. parent separator-only-child)" (.getPath (File. "/a/b" "///")) "/a/b")
-(check "(File. parent double-sep-only-child)" (.getPath (File. "/a/b" "//")) "/a/b")
-(check "(File. root separator-only-child)" (.getPath (File. "/" "//")) "/")
 (check "(File. parent absolute-child-trailing)" (.getPath (File. "/a/b/" "/c/")) "/a/b/c")
-(check "(File. parent absolute-child-single)" (.getPath (File. "/a/b" "/")) "/a/b")
+(check "(File. parent absolute-child-dup)" (.getPath (File. "/a/b" "/c//d")) "/a/b/c/d")
 (check "(File. parent empty-child)" (.getPath (File. "/a/b" "")) "/a/b")
 (check "(File. root child)" (.getPath (File. "/" "c")) "/c")
 (check "(File. file-parent child)" (.getPath (File. (File. "/a//b") "c")) "/a/b/c")
+(check "(File. parent-with-trailing-dup child)" (.getPath (File. "/a/b//" "c")) "/a/b/c")
+(check "(File. parent child-with-trailing)" (.getPath (File. "/a/b" "c//")) "/a/b/c")
+(check "(File. parent dotdot-child)" (.getPath (File. "/a/b" "..//")) "/a/b/..")
+(check "(File. dot-parent child)" (.getPath (File. "." "b")) "./b")
+(check "(File. relative empty-child)" (.getPath (File. "a" "")) "a")
+
+;; a separator-only child normalizes to "/", and resolve answers the parent
+;; alone. Careful measuring this one against an old JVM: resolve grew its
+;; c == "/" case in JDK 21, and through JDK 20 (File. "/a/b" "/") was "/a/b/",
+;; a trailing separator no one-arg constructor can produce. 21 onward it is
+;; "/a/b" — checked on 20, 21 and 26, and jolt matches 21+.
+(check "(File. parent separator-only-child)" (.getPath (File. "/a/b" "///")) "/a/b")
+(check "(File. parent double-sep-only-child)" (.getPath (File. "/a/b" "//")) "/a/b")
+(check "(File. parent absolute-child-single)" (.getPath (File. "/a/b" "/")) "/a/b")
+(check "(File. root separator-only-child)" (.getPath (File. "/" "//")) "/")
+
+;; an EMPTY parent resolves against getDefaultParent(), which is "/" -- not
+;; against the empty string, so the child comes back absolute
+(check "(File. empty-parent child)" (.getPath (File. "" "c")) "/c")
+(check "(File. empty-parent absolute-child)" (.getPath (File. "" "/c")) "/c")
+(check "(File. empty-parent empty-child)" (.getPath (File. "" "")) "/")
+(check "(File. empty-file-parent child)" (.getPath (File. (File. "") "c")) "/c")
+;; The hinted local below is only there to pick an overload for the JVM
+;; compiler, which cannot resolve (File. nil "c") on its own. Every File
+;; constructor taking a null in that position agrees on the answer.
+(let [^String s-nil nil]
+  ;; a nil parent is the child alone, default parent not consulted
+  (check "(File. nil-parent child)" (.getPath (File. s-nil "c")) "c")
+  (check "(File. nil-parent absolute-child)" (.getPath (File. s-nil "/c")) "/c")
+  ;; a null CHILD is null-checked before any of that, and so is the one-arg
+  ;; constructor's only argument — both raise rather than reading nil as ""
+  (check "(File. parent nil-child) raises"
+         (try (File. "/a" s-nil) false (catch NullPointerException _ true)) true)
+  (check "(File. nil) raises"
+         (try (File. s-nil) false (catch NullPointerException _ true)) true))
 
 ;; --- clojure.java.io/file and as-file ----------------------------------------
 ;; io/file never reached the joining path at all: it is jolt-make-file directly,
@@ -113,10 +146,24 @@
             (catch IllegalArgumentException e (.getMessage e)))
        "/c is not a relative path")
 
+;; Coercions is extended to nil, so as-file and the one-arg io/file answer nil
+;; rather than a File whose path is "" — which is the cwd, a different file
+;; altogether. as-relative-path goes through as-file, so a nil child is an NPE
+;; on the .isAbsolute rather than an empty child that quietly joins to nothing.
+(check "(io/as-file nil)" (io/as-file nil) nil)
+(check "(io/file nil)" (io/file nil) nil)
+(check "(io/file parent nil-child) raises"
+       (try (io/file "/a" nil) false (catch NullPointerException _ true)) true)
+(check "(io/as-relative-path nil) raises"
+       (try (io/as-relative-path nil) false (catch NullPointerException _ true)) true)
+
 ;; io/make-parents builds (apply io/file f more) on the JVM, so it carries the
 ;; same contract: an absolute child raises rather than quietly joining
 (check "(io/make-parents parent absolute-child) raises"
        (raises-not-relative? #(io/make-parents "/a/b" "/c")) true)
+;; and the nil, since (io/file nil) is nil and .getParentFile raises on it
+(check "(io/make-parents nil) raises"
+       (try (io/make-parents nil) false (catch NullPointerException _ true)) true)
 
 ;; --- the route in ------------------------------------------------------------
 ;; createTempFile builds its path from $TMPDIR, which ends in "/" on macOS. It
