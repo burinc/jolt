@@ -149,6 +149,22 @@
             ((string=? (substring tag i (+ i m)) needle) #t)
             (else (loop (+ i 1)))))))
 
+;; (sa-probed-os-family) -> 'macos | 'windows | 'linux
+;; The OS family for a host tag that does not carry one, probed from the
+;; filesystem. Contract: the family the process is actually running on.
+;; Degradation: 'linux, matching the else-branch it replaces. Cached because
+;; sa-os-family is consulted from hot paths and the answer cannot change while
+;; the process runs.
+(define sa-os-family-cache #f)
+(define (sa-probed-os-family)
+  (or sa-os-family-cache
+      (let ((fam (cond ((file-exists? "/System/Library/CoreServices/SystemVersion.plist") 'macos)
+                       ((file-exists? "/proc/self/status") 'linux)
+                       ((getenv "SystemRoot") 'windows)
+                       (else 'linux))))
+        (set! sa-os-family-cache fam)
+        fam)))
+
 ;; (sa-os-family) -> 'macos | 'windows | 'linux
 ;; The OS family every host OS branch derives: SIGCHLD/SIG_BLOCK numerics
 ;; (process.ss, concurrency.ss), LC_TIME (tz-primitives.ss), struct-stat
@@ -157,10 +173,18 @@
 ;; of the three symbols. Degradation: none — the sites have no safe assumed
 ;; default; an unrecognized host falls back to 'linux, matching today's
 ;; else-branches.
+;;
+;; Portable-bytecode tags (pb, pb64l, tpb64l, ...) name the threading, word
+;; size and endianness and deliberately name no OS, because the same bytecode
+;; is meant to run on any of them. The tag therefore cannot answer for them and
+;; the else-branch called every bytecode build 'linux, including one running on
+;; macOS — which picks the Linux SIGCHLD, EAGAIN, O_NONBLOCK, LC_TIME and
+;; struct-stat values on a Darwin host. Probe instead.
 (define (sa-os-family)
   (let ((m (sa-host-tag)))
     (cond ((or (sa-tag-contains? m "osx") (sa-tag-contains? m "macos")) 'macos)
           ((or (sa-tag-contains? m "nt") (sa-tag-contains? m "windows")) 'windows)
+          ((sa-tag-contains? m "pb") (sa-probed-os-family))
           (else 'linux))))
 
 ;; (sa-arch) -> 'x86-64 | 'arm64 | 'i386 | 'other
