@@ -204,6 +204,12 @@ when transposed.
   corrupt. Reported and first patched by @jasalt, found bringing up a
   WASM/Emscripten build.
 
+- **Namespaced-map prefixes could absorb separator text into a silent wrong
+  namespace.** The reader now stops at the namespace-token boundary, allows
+  whitespace and commas before `{`, and rejects other intervening input —
+  including comments, matching JVM boundary behavior — and rejects invalid
+  explicit namespace symbols.
+
 - **`getPosixFilePermissions` and `getOwner` refused to run on hosts whose
   layout jolt already knew.** `nio-file` reads `st_mode` and `st_uid` at offsets
   that are a per-platform ABI, and it chose them from the host's *identity*:
