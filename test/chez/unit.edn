@@ -184,6 +184,21 @@
   {:suite "sdf" :expr "(let [f (java.text.SimpleDateFormat. \"yyyy-MM-dd\")] (.format f (.parse f \"2023-07-15\")))" :expected "\"2023-07-15\""}
   {:suite "reader" :expr "(let [r (-> \"foo bar baz\" java.io.StringReader. java.io.PushbackReader.)] [(read r) (slurp r)])" :expected "[foo \" bar baz\"]"}
   {:suite "reader" :expr "(let [r (-> \"(+ 1 2) 99\" java.io.StringReader. java.io.PushbackReader.)] [(read r) (read r)])" :expected "[(+ 1 2) 99]"}
+  ;; A namespaced-map prefix ends at the namespace token.  Ordinary reader
+  ;; whitespace and commas may separate it from the opening map delimiter.
+  {:suite "reader / namespaced-map boundary" :expr "(= #:nsmap.foo{:a 1 :_/raw 2} #:nsmap.foo {:a 1 :_/raw 2})" :expected "true"}
+  {:suite "reader / namespaced-map boundary" :expr "(= #::{:a 1 :_/raw 2} #:: {:a 1 :_/raw 2})" :expected "true"}
+  {:suite "reader / namespaced-map boundary" :expr "(do (alias (quote nsmap-str) (quote clojure.string)) (= (read-string \"#::nsmap-str{:a 1}\") (read-string \"#::nsmap-str {:a 1}\")))" :expected "true"}
+  {:suite "reader / namespaced-map boundary" :expr "[(= #:nsmap.foo{:a 1} #:nsmap.foo, {:a 1}) (= #::{:a 1} #::, {:a 1}) (do (alias (quote nsmap-str) (quote clojure.string)) (= (read-string \"#::nsmap-str{:a 1}\") (read-string \"#::nsmap-str, {:a 1}\")))]" :expected "[true true true]"}
+  {:suite "reader / namespaced-map boundary" :expr "(= #:nsmap.foo{:a 1} (read-string \"#:nsmap.foo {; comment inside the map\\n :a 1}\"))" :expected "true"}
+  ;; JVM Clojure treats a comment as a reader macro, not whitespace at this
+  ;; exact boundary.  Junk and malformed/non-map payloads also fail closed.
+  {:suite "reader / namespaced-map boundary" :expr "(read-string \"#:nsmap.foo ; not boundary whitespace\\n{:a 1}\")" :expected :throws}
+  {:suite "reader / namespaced-map boundary" :expr "(read-string \"#:foo bar{:a 1}\")" :expected :throws}
+  {:suite "reader / namespaced-map boundary" :expr "(read-string \"#:nsmap.foo\")" :expected :throws}
+  {:suite "reader / namespaced-map boundary" :expr "(read-string \"#:nsmap.foo :a\")" :expected :throws}
+  {:suite "reader / namespaced-map boundary" :expr "(read-string \"#: {:a 1}\")" :expected :throws}
+  {:suite "reader / namespaced-map boundary" :expr "(read-string \"#::missing-alias {:a 1}\")" :expected :throws}
   {:suite "hostctor" :expr "(String/format \"%d-%s\" 5 \"x\")" :expected "\"5-x\""}
   {:suite "hostctor" :expr "[(.format (java.text.NumberFormat/getInstance) 1234567.5) (.format (java.text.NumberFormat/getIntegerInstance) 1234567)]" :expected "[\"1,234,567.5\" \"1,234,567\"]"}
   {:suite "hostobj" :expr "(try (throw (ex-info \"x\" {})) (catch Throwable e [(.getNextException e) (vec (.getStackTrace e))]))" :expected "[nil []]"}
