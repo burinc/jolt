@@ -204,6 +204,10 @@ when transposed.
   corrupt. Reported and first patched by @jasalt, found bringing up a
   WASM/Emscripten build.
 
+- **Socket error handling could lose `errno` between a syscall and its accessor,**
+  causing a clobbered `EAGAIN` to be treated as a terminal socket failure.
+  `connect`, `accept`, `recv`, and `send` now capture result and `errno` atomically.
+
 - **`getPosixFilePermissions` and `getOwner` refused to run on hosts whose
   layout jolt already knew.** `nio-file` reads `st_mode` and `st_uid` at offsets
   that are a per-platform ABI, and it chose them from the host's *identity*:

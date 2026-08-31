@@ -25,7 +25,8 @@
   {:blocking true :capture-native-error true})
 (ffi/defcfn c-bind        "bind"        [:int :pointer :int] :int)
 (ffi/defcfn c-listen      "listen"      [:int :int] :int)
-(ffi/defcfn c-accept      "accept"      [:int :pointer :pointer] :int :blocking)
+(ffi/defcfn c-accept      "accept"      [:int :pointer :pointer] :int
+  {:blocking true :capture-native-error true})
 (ffi/defcfn c-setsockopt  "setsockopt"  [:int :int :int :pointer :int] :int)
 (ffi/defcfn c-getsockname "getsockname" [:int :pointer :pointer] :int)
 (ffi/defcfn c-recv        "recv"        [:int :pointer :size_t :int] :ssize_t
@@ -293,15 +294,7 @@
   ;; there is not — and retries; EINTR retries immediately; anything else is
   ;; the syscall's real answer, returned as-is (callers read errno semantics).
   (loop []
-    (let [result (op)
-          captured? (vector? result)
-          r (if captured? (nth result 0) result)
-          ;; recv/send return [result errno] from the foreign return path.
-          ;; accept retains its legacy scalar binding and delayed read until
-          ;; that separate call is migrated.
-          e (if captured?
-              (nth result 1)
-              (if (neg? r) (poller/errno) 0))]
+    (let [[r e] (op)]
       (cond
         (and (neg? r) (poller/eintr? e)) (recur)
         (and (neg? r) (poller/eagain? e)) (do (poller/wait-ready fd wait-kind) (recur))
