@@ -1662,6 +1662,7 @@
   {:suite "atomics" :label "AtomicLong intValue narrows to signed 32 bits" :expected "[1 -2147483648 2147483647 7]" :expr "[(.intValue (AtomicLong. 4294967297)) (.intValue (AtomicLong. 2147483648)) (.intValue (AtomicLong. -2147483649)) (.intValue (AtomicInteger. 7))]"}
   {:suite "atomics" :label "AtomicInteger getAndSet validates before mutation" :expected "[:threw 7]" :expr "(let [a (AtomicInteger. 7)] [(try (.getAndSet a 2147483648) :no-throw (catch ArithmeticException _ :threw)) (.get a)])"}
   {:suite "atomics" :label "AtomicInteger compareAndSet validates next before mutation" :expected "[:threw 7]" :expr "(let [a (AtomicInteger. 7)] [(try (.compareAndSet a 7 2147483648) :no-throw (catch ArithmeticException _ :threw)) (.get a)])"}
+  {:suite "atomics" :label "AtomicInteger compareAndSet validates expected before mutation" :expected "[:threw 7]" :expr "(let [a (AtomicInteger. 7)] [(try (.compareAndSet a 2147483648 8) :no-throw (catch ArithmeticException _ :threw)) (.get a)])"}
   {:suite "atomics" :label "AtomicReference compareAndSet rejects equal distinct expectations" :expected "[false true]" :expr "(let [v (list 1) a (AtomicReference. v)] [(.compareAndSet a (list 1) :bad) (identical? v (.get a))])"}
   {:suite "atomics" :label "AtomicReference compareAndSet accepts the same expectation" :expected "[true :ok]" :expr "(let [v (list 1) a (AtomicReference. v)] [(.compareAndSet a v :ok) (.get a)])"}
   ;; shadow-emitted (compiler-review R2 stage 1). Each row binds a local whose
