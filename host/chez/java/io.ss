@@ -639,6 +639,35 @@
           (or (and (jhost? val) (string=? (jhost-tag val) "url")) (embedded-res? val))
           'pass))))
 
+;; File.getParent()/getParentFile(): the prefix up to the last separator, or nil
+;; when the path names no parent. The JVM's no-parent set is wider than "no
+;; separator in the path" -- the root is its own longest prefix, so "/" answers
+;; null there while the scan below finds "/" and hands the path straight back.
+;; Comparing the result against the input is what turns that into nil, and it
+;; costs one string=? to cover the case without naming "/" anywhere: any path
+;; whose parent would be itself has no parent, whatever normalization does next.
+;; The loop never terminating is the visible failure -- (.getParentFile d) in a
+;; walk-to-root recur is a tail call, so a parent that answers itself spins with
+;; no stack growth and no exception.
+(define (jfile-parent-path p)        ; -> the parent path, or #f when there is none
+  (let loop ((i (- (string-length p) 1)))
+    (cond ((< i 0) #f)
+          ((char=? (string-ref p i) #\/)
+           (let ((parent (if (= i 0) "/" (substring p 0 i))))
+             (and (not (string=? parent p)) parent)))
+          (else (loop (- i 1))))))
+
+;; File.list()/File.listFiles(): the JVM answers null -- not an empty array, and
+;; not a throw -- for a path that is not a readable directory, so the ordinary
+;; (map str (.listFiles f)) over a missing path or a plain file yields () rather
+;; than dying. file-directory? covers both of those; the guard covers a directory
+;; the process may not read, which is an I/O error and null on the JVM too. Both
+;; spellings go through here so they cannot drift apart again.
+(define (jfile-listing fp produce)   ; -> the listing, or jolt-nil
+  (if (file-directory? fp)
+      (guard (e (#t jolt-nil)) (produce))
+      jolt-nil))
+
 ;; --- File method surface (record-method-dispatch arm) -----------------------
 (define (jfile-method f name args)        ; -> boxed result, or #f to fall through
   (let ((p (jfile-path f))               ; the path as given (display methods)
@@ -658,12 +687,11 @@
       ((string=? name "isAbsolute")     (list (if (and (> (string-length p) 0) (char=? (string-ref p 0) #\/)) #t #f)))
       ;; listFiles builds each child from the path AS GIVEN (new File(this, name)
       ;; on the JVM), so a File made from a relative path lists relative children.
-      ((string=? name "listFiles")      (list (list->cseq (map make-jfile (jolt-list-dir p)))))
-      ;; .list -> the child NAMES (a String[]), nil if not a directory.
+      ((string=? name "listFiles")
+       (list (jfile-listing fp (lambda () (list->cseq (map make-jfile (jolt-list-dir p)))))))
+      ;; .list -> the child NAMES (a String[]), nil if not a readable directory.
       ((string=? name "list")
-       (list (if (file-directory? fp)
-                 (apply jolt-vector (sort string<? (directory-list fp)))
-                 jolt-nil)))
+       (list (jfile-listing fp (lambda () (apply jolt-vector (sort string<? (directory-list fp)))))))
       ((string=? name "length")         (list (->num (file-byte-size fp))))
       ((string=? name "lastModified")   (list (->num (file-mtime-millis fp))))
       ((string=? name "canRead")        (list (file-accessible? fp access-r-ok)))
@@ -684,10 +712,8 @@
       ((string=? name "renameTo")
        (list (let ((dst (jfile-fs (car args)))) (guard (e (#t #f)) (rename-file fp dst) #t))))
       ((string=? name "getParentFile")
-       (let loop ((i (- (string-length p) 1)))
-         (cond ((< i 0) (list jolt-nil))
-               ((char=? (string-ref p i) #\/) (list (make-jfile (if (= i 0) "/" (substring p 0 i)))))
-               (else (loop (- i 1))))))
+       (list (let ((parent (jfile-parent-path p)))
+               (if parent (make-jfile parent) jolt-nil))))
       ((string=? name "toPath")           (list (make-nio-path p)))  ; -> java.nio.file.Path (nio-file.ss)
       ((string=? name "getAbsoluteFile")  (list (make-jfile (jfile-abs fp))))
       ((string=? name "getCanonicalFile") (list (make-jfile (jfile-canonical fp))))
@@ -696,10 +722,7 @@
       ((string=? name "equals")         (list (and (jfile? (car args)) (string=? p (jfile-path (car args))))))
       ((string=? name "hashCode")       (list (->num (string-hash p))))
       ((string=? name "getParent")
-       (let loop ((i (- (string-length p) 1)))
-         (cond ((< i 0) (list jolt-nil))
-               ((char=? (string-ref p i) #\/) (list (if (= i 0) "/" (substring p 0 i))))
-               (else (loop (- i 1))))))
+       (list (or (jfile-parent-path p) jolt-nil)))
       (else #f))))
 
 (register-method-arm! arm-priority-file
