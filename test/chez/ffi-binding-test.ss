@@ -119,16 +119,15 @@
       (ev "(let [fd (c-socket 2 1 0)] (c-fcntl fd f-setfl o-nonblock) (c-fcntl fd f-setfl 0) (let [after (c-fcntl fd f-getfl 0)] (c-close fd) (zero? (bit-and after o-nonblock))))")))
 
 ;; malformed :varargs shapes reject at compile with a message that names the
-;; rule — a marker first (C needs a named parameter), a trailing marker
-;; (nothing variadic), and :blocking (no convention combining)
+;; rule — a marker first (C needs a named parameter) and :blocking (no
+;; convention combining). A TRAILING marker is no longer malformed: it is the
+;; bare form, covered below.
 (define (rejects? s)
   (call/cc (lambda (k)
     (with-exception-handler (lambda (e) (k #t))
       (lambda () (ev s) #f)))))
 (ok ":varargs first rejects"
     (rejects? "(jolt.ffi/__cfn \"fcntl\" [:varargs :int] :int)"))
-(ok ":varargs last rejects"
-    (rejects? "(jolt.ffi/__cfn \"fcntl\" [:int :int :varargs] :int)"))
 (ok ":varargs with :blocking rejects"
     (rejects? "(jolt.ffi/__cfn \"recv\" [:int :varargs :int] :int :blocking)"))
 
@@ -143,12 +142,66 @@
     (rejects? "(jolt.ffi/__cfn \"fcntl\" [:& :int] :int)"))
 (ok ":& with :blocking rejects"
     (rejects? "(jolt.ffi/__cfn \"recv\" [:int :& :int] :int :blocking)"))
-;; The bare marker is babashka.ffi's per-call tail inference, which a compiled
-;; foreign-procedure cannot have — the tail is part of the binding. The MESSAGE
-;; it rejects with is checked from the jolt side, in jolt-ffi-arena-test.clj,
-;; where ex-message can read it.
-(ok ":& last rejects — no per-call tail inference"
-    (rejects? "(jolt.ffi/__cfn \"open\" [:string :int :&] :int)"))
+;; The BARE marker — no types after it — is babashka.ffi's per-call tail
+;; inference: ONE binding serving every tail shape, each call's tail read off the
+;; values it is given. A foreign-procedure has its types fixed when it is
+;; compiled, so the binding lowers to a dispatcher that compiles (and caches) one
+;; foreign-procedure per observed shape. open(2) is the case the marker exists
+;; for — open(path, flags) and open(path, flags, mode) off one binding.
+(ev "(def c-open (jolt.ffi/__cfn \"open\" [:string :int :&] :int))")
+(ev "(def c-unlink (jolt.ffi/__cfn \"unlink\" [:string] :int))")
+(ok "bare :& — two-argument open, empty tail"
+    (jolt-truthy?
+      (ev "(let [fd (c-open \"/dev/null\" 0)] (c-close fd) (>= fd 0))")))
+(ok "bare :& — three-argument open, one-int tail, SAME binding"
+    (jolt-truthy?
+      (ev (string-append
+            "(let [p \"/tmp/jolt-bare-varargs-gate\" fd (c-open p "
+            (if (eq? (sa-os-family) 'linux) "65" "513")   ; O_CREAT|O_WRONLY
+            " 420)] (c-close fd) (c-unlink p) (>= fd 0))"))))
+;; Every carrier, through snprintf: 64-bit integers (integers, pointers,
+;; booleans and nil), doubles (floats and ratios) and C strings.
+(ev "(def c-snprintf (jolt.ffi/__cfn \"snprintf\" [:pointer :size_t :string :&] :int))")
+(define (fmt call)
+  (ev (string-append "(let [b (jolt.ffi/alloc 128)]"
+                     " (try " call " (jolt.ffi/ptr->string b)"
+                     " (finally (jolt.ffi/free b))))")))
+(ok "bare :& carrier — no tail at all"    (equal? "none" (fmt "(c-snprintf b 128 \"none\")")))
+(ok "bare :& carrier — integer"           (equal? "42" (fmt "(c-snprintf b 128 \"%d\" 42)")))
+(ok "bare :& carrier — double"            (equal? "2.50" (fmt "(c-snprintf b 128 \"%.2f\" 2.5)")))
+(ok "bare :& carrier — ratio promotes"    (equal? "0.250" (fmt "(c-snprintf b 128 \"%.3f\" 1/4)")))
+(ok "bare :& carrier — string"            (equal? "hi" (fmt "(c-snprintf b 128 \"%s\" \"hi\")")))
+(ok "bare :& carrier — boolean and nil"   (equal? "1 0 0" (fmt "(c-snprintf b 128 \"%d %d %d\" true false nil)")))
+(ok "bare :& — mixed three-value tail"    (equal? "a 1 2.0" (fmt "(c-snprintf b 128 \"%s %d %.1f\" \"a\" 1 2.0)")))
+;; Tails of nought to three are arity-specialized case-lambda arms that carry
+;; the values as arguments; a LONGER tail falls through to the rest arm, which
+;; keys and marshals the list the general way. Both must agree, so the boundary
+;; is covered on either side.
+(ok "bare :& — four-value tail (the rest arm)"
+    (equal? "1 2 3 4" (fmt "(c-snprintf b 128 \"%d %d %d %d\" 1 2 3 4)")))
+(ok "bare :& — six-value mixed tail (the rest arm)"
+    (equal? "1 a 2.5 2 b 3.5"
+            (fmt "(c-snprintf b 128 \"%d %s %.1f %d %s %.1f\" 1 \"a\" 2.5 2 \"b\" 3.5)")))
+(ok "bare :& — the rest arm marshals booleans and nil too"
+    (equal? "1 0 0 7" (fmt "(c-snprintf b 128 \"%d %d %d %d\" true false nil 7)")))
+;; The cache is keyed on the SHAPE, so the same binding serves a second shape
+;; and then answers both from the cache.
+(ok "bare :& — one binding, two shapes, then reuse"
+    (and (equal? "5" (fmt "(c-snprintf b 128 \"%d\" 5)"))
+         (equal? "x=6" (fmt "(c-snprintf b 128 \"%s=%d\" \"x\" 6)"))
+         (equal? "7" (fmt "(c-snprintf b 128 \"%d\" 7)"))))
+;; A value in no carrier names itself rather than reaching C as whatever it is.
+(ok "bare :& — an uncarryable tail value rejects at the call"
+    (rejects? "(let [b (jolt.ffi/alloc 8)] (c-snprintf b 8 \"%d\" :kw))"))
+;; A fixed by-value aggregate cannot combine with the bare form: the tail is
+;; compiled at the call, and an aggregate argument needs an ftype the binding
+;; declared.
+(ok "bare :& with a fixed by-value aggregate rejects"
+    (rejects? "(jolt.ffi/__cfn \"f\" [[:by-value [:struct [[:a :int]]]] :&] :int)"))
+(ok "bare :& with an aggregate return rejects"
+    (rejects? "(jolt.ffi/__cfn \"f\" [:int :&] [:by-value [:struct [[:a :int]]]])"))
+(ok "bare :& with :blocking rejects"
+    (rejects? "(jolt.ffi/__cfn \"recv\" [:int :&] :int :blocking)"))
 
 ;; The EMITTED code for a :blocking binding carries __collect_safe on BOTH
 ;; resolution branches — the global-name fallback AND the scoped dlsym-address
