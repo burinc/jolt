@@ -126,6 +126,17 @@
            (jolt-cv-wake! (jolt-future-cv f))))))
     f))
 
+;; Wrap a task's captured throw in an ExecutionException, the original as the
+;; cause so ex-cause and .getCause both reach it. One helper for every place a
+;; task's throw surfaces — a clojure `future`'s deref just below, and the .get of
+;; either Future shim (the ExecutorService's and FutureTask's, further down) —
+;; because the JVM makes a caller catch ExecutionException at all of them.
+(define (task-execution-exception e)
+  (let ((cause (jolt-unwrap-throw e)))
+    (jolt-host-throwable "java.util.concurrent.ExecutionException"
+                         (jolt-str-render-one cause)
+                         cause)))
+
 ;; Final value of a settled future (called OUTSIDE the lock): wrap a captured
 ;; throw in an ExecutionException (JVM semantics), signal a cancellation, else
 ;; the value. The original exception is stored as the cause so ex-cause works.
@@ -139,10 +150,7 @@
      (jolt-throw (jolt-host-throwable "java.util.concurrent.CancellationException"
                                       "Future cancelled")))
     ((jolt-future-ok? f) (jolt-future-payload f))
-    (else (let ((cause (jolt-unwrap-throw (jolt-future-payload f))))
-            (jolt-throw (jolt-host-throwable "java.util.concurrent.ExecutionException"
-                          (jolt-str-render-one cause)
-                          cause))))))
+    (else (jolt-throw (task-execution-exception (jolt-future-payload f))))))
 
 ;; jolt-cv-wait and not a bare condition-wait, here and at every other wait in this
 ;; file: @a-future from a go block used to block the fiber's CARRIER, so every other
@@ -702,6 +710,24 @@
        (if (null? opts) (jolt-agent-state x) (jolt-throw (deref-cast-error x opts))))
       ((jolt-delay? x)
        (if (null? opts) (jolt-delay-force x) (jolt-throw (deref-cast-error x opts))))
+      ;; java.util.concurrent.Future — a FutureTask, and what an ExecutorService's
+      ;; submit hands back. Neither is IDeref on the JVM either; clojure.core/deref
+      ;; falls THROUGH to deref-future for anything that is not, which is .get, and
+      ;; for the timed arity .get(ms, MILLISECONDS) with a TimeoutException answered
+      ;; by the timeout value rather than thrown. Without this arm @a-future-task
+      ;; raised "deref: unsupported reference type", so @(.submit pool f) — and
+      ;; core.async.flow's own @(flow/inject …) and @(futurize …) — did not work.
+      ;; The ms goes through tu-args->ms so the timed arity normalizes its amount
+      ;; exactly as the .get(timeout, unit) overload does.
+      ;;
+      ;; ONE jhost? test and then the tag, rather than an arm per shim: every deref
+      ;; of an ATOM falls past this whole cond to %pre-conc-deref, so what the
+      ;; common case pays for these two shims is a single record-type predicate.
+      ((and (jhost? x) (future-shim-get* x))
+       => (lambda (get*)
+            (if (null? opts)
+                (get* x #f future-timeout-throw)
+                (get* x (tu-args->ms (list (car opts))) (lambda () (cadr opts))))))
       ;; a record/reify implementing clojure.lang.IDeref: @x calls its `deref`
       ;; method with the value itself as the leading `this`. The timed arity
       ;; passes its opts through — (deref r ms val) reaches the IBlockingDeref
@@ -1398,7 +1424,11 @@
               (guard (e (#t (guard (_ (#t #f))
                               (display "Exception in Thread body:\n" (current-error-port))
                               (jolt-report-throwable e (current-error-port)))))
-                (let ((th (vector-ref st 0))) (when th (jolt-invoke th))))
+                ;; runnable->thunk and not a bare jolt-invoke: Thread(Runnable)
+                ;; accepts any Runnable on the JVM, and a FutureTask is one (it is
+                ;; registered as such in the class graph). Invoking it directly
+                ;; hung — a FutureTask is a shim value, not a procedure.
+                (let ((th (vector-ref st 0))) (when th (jolt-invoke (runnable->thunk th)))))
               (jolt-with-mutex (vector-ref st 2)
                  (vector-set! st 1 #t)
                  (jolt-cv-wake! (vector-ref st 3)))))
@@ -1484,6 +1514,11 @@
 ;; code relies on that ordering (claxon dispatches handlers on a single-thread
 ;; executor and a later empty task acts as a barrier). submit returns a Future
 ;; whose .get waits for the result (re-raising the task's throw, like the JVM).
+;; Future.get reports a task's throw as an ExecutionException wrapping it, on the
+;; JVM and here — the raw throw used to come straight back out, so a caller
+;; catching ExecutionException (what the JVM makes them catch) caught nothing and
+;; .getCause had nothing to read. task-execution-exception (above) is the wrap,
+;; the same one a clojure `future` already did on deref; the two now agree.
 ;; j-future state: #(done? result error mutex condition)
 (define (make-j-future) (make-jhost "j-future" (vector #f jolt-nil #f (make-mutex) (make-condition))))
 (define (j-future-complete! self thunk)
@@ -1493,25 +1528,34 @@
         (unless (vector-ref st 2) (vector-set! st 1 r))
         (vector-set! st 0 #t)
         (jolt-cv-wake! (vector-ref st 4))))))
+(define (j-future? x) (and (jhost? x) (string=? (jhost-tag x) "j-future")))
+;; get() waits for the task; get(timeout, unit) gives up at the deadline and throws
+;; TimeoutException, like the JVM. The timeout used to be discarded, so the bounded
+;; overload waited forever on a task that never finished.
+;;
+;; ON-TIMEOUT is what a missed deadline produces. Future.get throws there;
+;; `deref` with a timeout value returns it instead (Clojure's deref-future
+;; swallows exactly TimeoutException), so both spellings share one wait rather
+;; than one of them catching what the other just threw.
+(define (j-future-get* self ms on-timeout)
+  (let* ((st (jhost-state self))
+         (done (jolt-cv-wait-interruptibly "Future.get"
+                             (vector-ref st 3) (vector-ref st 4)
+                             (and ms (ms->deadline-millis ms))
+                 (lambda (timed-out?)
+                   (cond ((vector-ref st 0) #t)
+                         (timed-out? #f)
+                         (else jolt-cv-again))))))
+    (cond ((not done) (on-timeout))
+          ((vector-ref st 2) (jolt-throw (task-execution-exception (vector-ref st 2))))
+          (else (vector-ref st 1)))))
+(define (future-timeout-throw)
+  (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException"
+                                   "timed out waiting for the task")))
+(define (j-future-get self . args)
+  (j-future-get* self (tu-args->ms args) future-timeout-throw))
 (register-host-methods! "j-future"
-  ;; get() waits for the task; get(timeout, unit) gives up at the deadline and throws
-  ;; TimeoutException, like the JVM. The timeout used to be discarded, so the bounded
-  ;; overload waited forever on a task that never finished.
-  (list (cons "get" (lambda (self . args)
-          (let* ((st (jhost-state self))
-                 (ms (tu-args->ms args))
-                 (done (jolt-cv-wait-interruptibly "Future.get"
-                                     (vector-ref st 3) (vector-ref st 4)
-                                     (and ms (ms->deadline-millis ms))
-                         (lambda (timed-out?)
-                           (cond ((vector-ref st 0) #t)
-                                 (timed-out? #f)
-                                 (else jolt-cv-again))))))
-            (cond ((not done)
-                   (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException"
-                                                    "timed out waiting for the task")))
-                  ((vector-ref st 2) (jolt-throw (vector-ref st 2)))
-                  (else (vector-ref st 1))))))
+  (list (cons "get" j-future-get)
         (cons "isDone" (lambda (self) (vector-ref (jhost-state self) 0)))
         (cons "isCancelled" (lambda (self) #f))
         (cons "cancel" (lambda (self . _) #f))))
@@ -1731,25 +1775,35 @@
             (lambda (thunk . rest)
               (make-future-task thunk (pair? rest) (if (pair? rest) (car rest) jolt-nil)))))
           '("FutureTask" "java.util.concurrent.FutureTask"))
+(define (future-task-get* self ms on-timeout)
+  (let* ((st (jhost-state self))
+         (r (jolt-cv-wait-interruptibly "FutureTask.get"
+                          (vector-ref st 5) (vector-ref st 6)
+                          (and ms (ms->deadline-millis ms))
+              (lambda (timed-out?)
+                (cond ((memq (vector-ref st 0) '(done cancelled)) (vector-ref st 0))
+                      (timed-out? #f)
+                      (else jolt-cv-again))))))
+    (cond ((not r) (on-timeout))
+          ((eq? r 'cancelled)
+           (jolt-throw (jolt-host-throwable "java.util.concurrent.CancellationException"
+                                            "task was cancelled")))
+          ((vector-ref st 4) (jolt-throw (task-execution-exception (vector-ref st 4))))
+          (else (vector-ref st 3)))))
+(define (future-task-get self . args)
+  (future-task-get* self (tu-args->ms args) future-timeout-throw))
+
+;; The get* of a Future-shaped shim value, or #f. Both spellings of the deref
+;; arity go through it: ms #f waits forever (Future.get()), an ms with a timeout
+;; thunk is the bounded overload.
+(define (future-shim-get* x)
+  (let ((tag (jhost-tag x)))
+    (cond ((string=? tag "future-task") future-task-get*)
+          ((string=? tag "j-future") j-future-get*)
+          (else #f))))
 (register-host-methods! "future-task"
   (list (cons "run" (lambda (self) (future-task-run! self)))
-        (cons "get" (lambda (self . args)
-          (let* ((st (jhost-state self))
-                 (ms (tu-args->ms args))
-                 (r (jolt-cv-wait-interruptibly "FutureTask.get"
-                                  (vector-ref st 5) (vector-ref st 6)
-                                  (and ms (ms->deadline-millis ms))
-                      (lambda (timed-out?)
-                        (cond ((memq (vector-ref st 0) '(done cancelled)) (vector-ref st 0))
-                              (timed-out? #f)
-                              (else jolt-cv-again))))))
-            (cond ((not r) (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException"
-                                                            "timed out waiting for the task")))
-                  ((eq? r 'cancelled)
-                   (jolt-throw (jolt-host-throwable "java.util.concurrent.CancellationException"
-                                                    "task was cancelled")))
-                  ((vector-ref st 4) (jolt-throw (vector-ref st 4)))
-                  (else (vector-ref st 3))))))
+        (cons "get" future-task-get)
         (cons "isDone" (lambda (self) (and (memq (vector-ref (jhost-state self) 0) '(done cancelled)) #t)))
         (cons "isCancelled" (lambda (self) (eq? (vector-ref (jhost-state self) 0) 'cancelled)))
         (cons "cancel" (lambda (self . _)
