@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`clojure.core.async.flow`, with `:io` processes on fibers.** core.async's
+  flow library — a flow is a directed graph of processes communicating over
+  channels, with the topology, thread execution, lifecycle, monitoring and error
+  handling factored out of your step functions and centralized in the graph — now
+  ships in the stdlib. The four namespaces (`clojure.core.async.flow`, `.flow.spi`,
+  `.flow.impl`, `.flow.impl.graph`) are upstream's sources unmodified, so they
+  track the library rather than reimplementing it, and upstream's own
+  `flow_test.clj` passes.
+
+  ```clojure
+  (require '[clojure.core.async.flow :as flow])
+  (def g (flow/create-flow
+          {:procs {:src {:proc (flow/process #'source) :args {:n 5}}
+                   :dbl {:proc (flow/process #'doubler)}}
+           :conns [[[:src :out] [:dbl :in]]]}))
+  (flow/start g)
+  (flow/resume g)
+  ```
+
+  What jolt supplies underneath is `clojure.core.async.impl.dispatch/executor-for`,
+  the workload -> Executor mapping flow runs its processes on, and it maps the
+  tags the way `clojure.core.async/thread-call` already does:
+
+  - **`:io` is a fiber.** A flow process's loop is mostly channel ops, which park
+    and free their carrier, so an `:io` process costs a stack rather than an OS
+    thread. 200 of them run on four carriers; against a bounded pool, everything
+    past the worker count never started at all — silently, with no error and no
+    message ever reaching those processes. `clojure.core.async/fiber-execute` is
+    the spawn behind it, deliberately leaner than `fiber-spawn`: an
+    `Executor.execute` returns void, so there is nobody to hand a result channel
+    to and none is allocated.
+  - **`:mixed` is a thread per task**, because a `:mixed` step may block somewhere
+    the runtime cannot see (`Thread/sleep`, a raw fd, a blocking FFI call) and
+    that would pin a carrier. One per task and not a pool because a flow process
+    runs for the life of the flow, so pooling buys no reuse.
+  - **`:compute` is a pooled executor**, the one case that runs a short task per
+    message rather than one per process.
+
 - **`jolt.ffi`: babashka.ffi's bare `:&`, one binding for every tail shape
   (#803).** `:&` already declared a variadic C function, but only in the
   *declared-tail* form — `[:int :int :& :int]`, the tail fixed when the binding
@@ -108,6 +146,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and every answer they gave before. The buffer keeps nothing alive: using one
   after the memory is released reads freed memory, the same rule babashka.ffi
   states for its own.
+
+### Fixed
+
+- **`deref` of a `java.util.concurrent.Future`.** `@fut` raised "deref:
+  unsupported reference type" for a `FutureTask` and for what an
+  `ExecutorService.submit` hands back. Neither is `IDeref` on the JVM either —
+  `clojure.core/deref` falls *through* to `deref-future` for anything that is not,
+  which is `.get`, and for the timed arity `.get(ms, MILLISECONDS)` with a
+  `TimeoutException` answered by the timeout value rather than thrown. Both
+  arities now work, so `@(.submit pool f)` and `(deref fut 100 :timeout)` do what
+  they do on the JVM.
+
+- **`Future.get` reports a task's throw as an `ExecutionException`.** The raw
+  throw used to come straight back out, so a caller catching
+  `ExecutionException` — which is what the JVM makes them catch — caught nothing,
+  and `.getCause` had nothing to read. The original is now the cause, so
+  `ex-cause` and `.getCause` both reach it. This is the same wrap a clojure
+  `future` already did on deref; the two now agree.
+
+- **`instance?` on the executor and future shims.** `java.util.concurrent`'s
+  executor/future interfaces had no rows in the class graph at all, so an
+  `ExecutorService` reported `(class x)` as `:object` and answered **false** to
+  `(instance? java.util.concurrent.Executor x)`. That is the exact seam
+  core.async.flow tests a user-supplied `:io-exec`/`:mixed-exec`/`:compute-exec`
+  through, so a real jolt executor was rejected as "not an Executor". `Executor`,
+  `ExecutorService`, `ThreadPoolExecutor`, `Future`, `RunnableFuture` and
+  `FutureTask` are now in the graph and the shims report their real classes. The
+  graph is consulted only by `instance?`/`class`, so naming it costs a shim value
+  nothing to construct or call.
+
+- **`Thread(Runnable)` accepts a `FutureTask`.** `.start` invoked its target
+  directly, and a `FutureTask` is a shim value rather than a procedure, so
+  `(.start (Thread. a-future-task))` hung instead of running the task. It goes
+  through the same `Runnable` conversion the executors use now — which is what
+  the class graph above already claims, a `FutureTask` being a `Runnable`.
 
 ## [0.8.0] - 2026-08-31
 
