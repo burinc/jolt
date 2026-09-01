@@ -47,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`core.async/alts!` and `alts!!` validate every put before trying any
+  operation.** An invalid later `[channel nil]` put can no longer throw after
+  an earlier ready operation has already consumed or published a value.
 - **The default time zone is the machine's.** `TimeZone/getDefault`,
   `Calendar/getInstance`, a `SimpleDateFormat` with no zone set, the deprecated
   `Date` constructor and getters, `java.sql.Date.valueOf` and `toLocalDate` all
@@ -296,7 +299,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prompt that said `user`, and `-main` under `run -m` ran in `jolt.main`.
   `clojure.main` starts every entry in `user`; jolt does too now, and the REPL
   prompt names whatever namespace is current, as `clojure.main`'s does.
-
 ## [0.8.1] - 2026-09-02
 
 Host classes are provided by declaration now. The runtime no longer carries the
