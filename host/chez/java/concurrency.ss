@@ -1559,11 +1559,26 @@
         (cons "isDone" (lambda (self) (vector-ref (jhost-state self) 0)))
         (cons "isCancelled" (lambda (self) #f))
         (cons "cancel" (lambda (self . _) #f))))
-;; executor-service state: #(shutdown? queue-box queue-mutex queue-cond
+;; executor-service state: #(shutdown? queue-box queue-mutex task-cond
 ;; live-workers advisory-queue-capacity core-workers max-workers keep-alive-ms
-;; idle-workers queue-depth) — the capacity is #f except for a ThreadPoolExecutor
-;; built with an ArrayBlockingQueue; .getQueue's view subtracts the live depth
-;; from it.
+;; idle-workers queue-depth term-cond) — the capacity is #f except for a
+;; ThreadPoolExecutor built with an ArrayBlockingQueue; .getQueue's view subtracts
+;; the live depth from it.
+;;
+;; TWO CONDITIONS, one mutex. task-cond carries "a task is queued, or the pool is
+;; shutting down" to the WORKERS, which are threads; term-cond carries "shut down
+;; and the last worker is gone" to awaitTermination, which a fiber can reach. They
+;; were one condition, and an enqueue therefore broadcast to every waiter on it:
+;; with 130 idle workers, one task woke all 130, and 129 of them took the queue
+;; mutex, found the task already claimed and parked again. Fire-and-forget cost
+;; 152us per no-op task that way, against 5.2us on the JVM (and 26.5us with the
+;; fixed 32-worker pool this replaced, which woke 32), and the herd fed the
+;; growth rule below — workers that slow to return look like workers that are not
+;; coming, so a 200k-task burst grew the pool to 134 threads, which made the herd
+;; bigger still. Split, an enqueue signals exactly ONE worker (jolt-cv-signal-one!,
+;; locks.ss, where the preconditions this relies on are written out): the same
+;; no-op task costs 8.9us and the same burst needs 7 threads, which is the pool the
+;; JVM grows for it too.
 ;; queue-box holds a pair (out . in) — out is the dequeue head-list, in is the
 ;; enqueue tail-list (reversed). Enqueue conses onto in (O(1)); dequeue pops from
 ;; out, reversing in into out when out is empty (amortized O(1)). queue-depth is
@@ -1605,7 +1620,7 @@
 (define (make-executor* core-n max-n keep-alive-ms cap)
   (let ((self (make-jhost "executor-service"
                           (vector #f (box (cons '() '())) (make-mutex) (make-condition) 0
-                                  cap core-n max-n keep-alive-ms 0 0))))
+                                  cap core-n max-n keep-alive-ms 0 0 (make-condition)))))
     (let ((st (jhost-state self)))
       ;; The core workers, eagerly. Above core, a worker appears when a task
       ;; arrives with nobody idle to take it, and not before: a cached pool that
@@ -1643,7 +1658,7 @@
 (define (executor-spawn-worker! st)
   (guard (e (#t (let ((none-left? (jolt-with-mutex (vector-ref st 2)
                                     (vector-set! st 4 (fx- (vector-ref st 4) 1))
-                                    (jolt-cv-wake! (vector-ref st 3))
+                                    (jolt-cv-wake! (vector-ref st 11))
                                     (fx=? 0 (vector-ref st 4)))))
                   (when none-left? (raise e)))))
     (fork-thread (lambda ()
@@ -1686,14 +1701,11 @@
 ;; wake sends it back to the queue), one after sees the count without it.
 (define (executor-worker-exit! st)
   (vector-set! st 4 (fx- (vector-ref st 4) 1))
-  ;; Announced only to the waiter that can care, which is awaitTermination
-  ;; (isTerminated polls): it wants live 0 with the pool shut down, so a
-  ;; keep-alive retirement in a RUNNING pool needs to wake nobody. Every wake
-  ;; here is a broadcast to every idle worker, and the retirements come in a
-  ;; crowd — a burst that grew the pool to 558 retires all 558 sixty seconds
-  ;; later, which would otherwise be 558 broadcasts to a shrinking crowd.
+  ;; Announced on term-cond only, and only to a waiter that can care: what
+  ;; awaitTermination waits for is live 0 with the pool shut down, so a keep-alive
+  ;; retirement in a RUNNING pool wakes nobody at all. (isTerminated polls.)
   (when (or (vector-ref st 0) (fx=? 0 (vector-ref st 4)))
-    (jolt-cv-wake! (vector-ref st 3)))
+    (jolt-cv-wake! (vector-ref st 11)))
   #f)
 ;; The next task for this worker, or #f meaning it has exited — because the pool
 ;; is shut down and drained, or because this worker is above core and has been
@@ -1720,13 +1732,25 @@
     (let ((job (jolt-with-mutex (vector-ref st 2) (executor-take-job! st))))
       (when job (job) (loop)))))
 
+;; shutdown / shutdownNow / close, which differ only in what they RETURN here.
+(define (executor-shutdown! st)
+  (vector-set! st 0 #t)
+  (jolt-with-mutex (vector-ref st 2)
+    (jolt-cv-wake! (vector-ref st 3))       ; every idle worker: leave
+    (jolt-cv-wake! (vector-ref st 11))))    ; awaitTermination: re-read the flag
+
 (define (executor-enqueue! self job)
   (let ((st (jhost-state self)))
     (when (jolt-with-mutex (vector-ref st 2)
             (let ((q (unbox (vector-ref st 1))))
               (set-cdr! q (cons job (cdr q))))
             (vector-set! st 10 (fx+ (vector-ref st 10) 1))
-            (jolt-cv-wake! (vector-ref st 3))
+            ;; One task, one taker: signal a single parked worker, and none at all
+            ;; when none is parked — a worker that is running or waiting on this
+            ;; mutex re-reads the queue before it parks, under this same hold, so
+            ;; there is no wake for it to miss.
+            (when (fx>? (vector-ref st 9) 0)
+              (jolt-cv-signal-one! (vector-ref st 3)))
             ;; Grow if this task has no idle worker waiting to take it. Not after
             ;; shutdown: a task enqueued then is one jolt keeps rather than
             ;; rejects (the divergence noted above), and starting a thread for it
@@ -1783,12 +1807,15 @@
                               (jolt-report-throwable e (current-error-port)))))
                 (jolt-invoke thunk)))))
           jolt-nil)))
-        (cons "shutdown" (lambda (self) (let ((st (jhost-state self)))
-          (vector-set! st 0 #t) (jolt-with-mutex (vector-ref st 2) (jolt-cv-wake! (vector-ref st 3)))) jolt-nil))
-        (cons "shutdownNow" (lambda (self) (let ((st (jhost-state self)))
-          (vector-set! st 0 #t) (jolt-with-mutex (vector-ref st 2) (jolt-cv-wake! (vector-ref st 3)))) (jolt-vector)))
-        (cons "close" (lambda (self) (let ((st (jhost-state self)))
-          (vector-set! st 0 #t) (jolt-with-mutex (vector-ref st 2) (jolt-cv-wake! (vector-ref st 3)))) jolt-nil))
+        ;; Shutdown wakes BOTH conditions, and every waiter on each: task-cond so
+        ;; that all the idle workers see the flag and leave (the one place a
+        ;; broadcast there is the point — the news is for all of them, not for
+        ;; whichever one a signal would pick), term-cond because a pool with no
+        ;; live worker is already terminated and awaitTermination has to re-read
+        ;; the flag to find out.
+        (cons "shutdown" (lambda (self) (executor-shutdown! (jhost-state self)) jolt-nil))
+        (cons "shutdownNow" (lambda (self) (executor-shutdown! (jhost-state self)) (jolt-vector)))
+        (cons "close" (lambda (self) (executor-shutdown! (jhost-state self)) jolt-nil))
         (cons "isShutdown" (lambda (self) (vector-ref (jhost-state self) 0)))
         (cons "isTerminated" (lambda (self) (let ((st (jhost-state self)))
           (and (vector-ref st 0) (fx=? 0 (vector-ref st 10)) (fx=? 0 (vector-ref st 4))))))
@@ -1802,11 +1829,13 @@
             ;; outside it in 10-100ms steps, because sleeping while HOLDING the mutex
             ;; starves the worker exit it waits for. A condition wait releases the
             ;; mutex atomically with blocking, so it needs neither the poll nor the
-            ;; care: the workers already broadcast this condition as each one exits,
-            ;; and shutdown broadcasts it too. It also stops a fiber calling this from
-            ;; sleeping its carrier in 100ms chunks.
+            ;; care: the workers already broadcast term-cond as each one exits, and
+            ;; shutdown broadcasts it too. It also stops a fiber calling this from
+            ;; sleeping its carrier in 100ms chunks. term-cond and not task-cond: a
+            ;; wait that can belong to a FIBER must not sit on the condition the
+            ;; enqueue path signals one thread on.
             (jolt-cv-wait-interruptibly "ExecutorService.awaitTermination"
-                                        (vector-ref st 2) (vector-ref st 3) deadline
+                                        (vector-ref st 2) (vector-ref st 11) deadline
               (lambda (timed-out?)
                 (cond ((and (vector-ref st 0) (fx=? 0 (vector-ref st 4))) #t)
                       (timed-out? #f)
