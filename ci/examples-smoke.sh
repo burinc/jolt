@@ -29,6 +29,10 @@
 #                    covered by the jolt-side stateimage gate.)
 #   todomvc-uikit    darwin-only, build-only: AppKit.
 #   hiccup/malli/markdown-app, ray-tracer*  no test task at all.
+#   ffi-examples     its three programs call libffi and PortAudio, both declared
+#                    `:optional true` because neither is on every runner, and it
+#                    has no `test` task — `check` only reports what is present.
+#                    Building app.check still compiles all three.
 set -eu
 
 root="${1:?usage: examples-smoke.sh <examples-checkout> <jolt-binary>}"
@@ -72,6 +76,7 @@ glimmer-gl-app   gl-demo.core   -
 glimmer-tui-example tui-demo.core -
 todomvc-uikit    app.core       -   darwin
 image-dump-example app.core     -
+ffi-examples     app.check      -
 EOF
 
 fails=0
