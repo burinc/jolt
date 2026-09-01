@@ -53,6 +53,15 @@ absolute reference.
 | `char-scan` | walking a string one code point at a time via `.charAt`, with the `int`/`long`/`unchecked-*` casts hinted Clojure puts around it, incl. a `case`-dispatched character state machine | numeric cast fast paths, `.charAt` on a proven string, `case` over small ints | honeysql `alphanumeric?` |
 | `sorted-access` | reads a collection's structure can answer without walking: `count`/`drop` on a vector seq, `rseq`, `first` on a sorted map/set | shape-answered reads (Counted / IDrop / leftmost-node), not traversal | — |
 | `nth-access` | `nth` on a vector, small and large, and with a default — the constant cost of an indexed read | `Indexed`-first ordering in `jolt-nth` ahead of the extension-type probes | — |
+| `executors` | `java.util.concurrent` dispatch: fire-and-forget at a cached pool faster than it can drain, submit/get round trips, growth to 64 blocking tasks, and four producers on one pool | the RUNTIME rather than a pass — the executor's queue, its wake rule and its growth rule (`host/chez/java/concurrency.ss`) | — |
+
+`executors` is the one row that is not about a compiler pass. It is here because
+nothing else in the suite measures concurrency throughput, and the cost it watches
+is real: an enqueue that woke every idle worker instead of one took a no-op task
+from 8.9µs to 152µs and the pool from 7 threads to 134, with every correctness
+gate still green. Concurrency numbers are noisier than the rest — the four-producer
+phase is a fight over one mutex on however many cores the machine has — so read a
+move here with more suspicion than usual, and re-run it alone on both sides.
 
 ## Scorecard
 
