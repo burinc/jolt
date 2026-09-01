@@ -32,14 +32,44 @@
 ;; release inside a with-open body is legitimate, and an exception from the
 ;; `finally` would replace whatever the body was reporting.
 (check "a second close releases nothing and does not raise"
-       (let [real-free ffi/free
+       (let [real-free ffi/__free
              frees (atom 0)
              a (ffi/confined-arena)]
          (ffi/alloc a 8)
-         (with-redefs [ffi/free (fn [p] (swap! frees inc) (real-free p))]
+         (with-redefs [ffi/__free (fn [p] (swap! frees inc) (real-free p))]
            (ffi/close-arena a)
            (ffi/close-arena a))
          (= 1 @frees)))
+;; The check and the attach are one step. If they were not, an alloc that passed
+;; the check just before another thread's close would conj its block onto the
+;; state close had already reset — attached to a group nothing will ever release.
+;; Racing it directly is timing-dependent, so the row closes the arena from
+;; inside the swap instead, which is the interleaving the fix exists for.
+(check "a block cannot attach to an arena that closed mid-allocation"
+       (let [a (ffi/shared-arena)
+             real-free ffi/__free
+             real-calloc ffi/__calloc
+             frees (atom 0)]
+         (with-redefs [ffi/__free (fn [p] (swap! frees inc) (real-free p))
+                       ffi/__calloc (fn [n]
+                                      (let [p (real-calloc n)]
+                                        (ffi/close-arena a)   ; the racing close
+                                        p))]
+           (and (rejects? #(ffi/alloc a 8))
+                ;; the block the alloc had already taken was handed back
+                (= 1 @frees)))))
+(check "a lost allocation is not left recorded in the size table"
+       (let [a (ffi/shared-arena)
+             real-calloc ffi/__calloc
+             seen (atom nil)]
+         (with-redefs [ffi/__calloc (fn [n]
+                                      (let [p (real-calloc n)]
+                                        (reset! seen p)
+                                        (ffi/close-arena a)
+                                        p))]
+           (rejects? #(ffi/alloc a 8)))
+         (zero? (ffi/size @seen))))
+
 (check "allocating in a closed arena raises"
        (let [a (ffi/confined-arena)]
          (ffi/close-arena a)
@@ -176,16 +206,47 @@
 (check "an arena forgets a reinterpreted size when it closes"
        (let [a (ffi/confined-arena)
              p (ffi/alloc 8)]
-         (ffi/reinterpret p 8 a)
+         (ffi/reinterpret a p 8)
          (ffi/close-arena a)
          (try (zero? (ffi/size p)) (finally (ffi/free p)))))
 (check "an arena runs a view's cleanup with the pointer, and frees nothing itself"
        (let [seen (atom nil)
              a (ffi/confined-arena)
              p (ffi/alloc 8)]
-         (ffi/reinterpret p 8 a (fn [x] (reset! seen x)))
+         (ffi/reinterpret a p 8 (fn [x] (reset! seen x)))
          (ffi/close-arena a)
          (try (= p @seen) (finally (ffi/free p)))))
+
+;; The size table is keyed by ADDRESS, so an entry that outlives its allocation
+;; answers a size for a block that never had one — and copy/clone take that as a
+;; byte count. free forgets; an arena forgets its blocks and its views.
+(check "free forgets the size it recorded, so a recycled address inherits nothing"
+       (let [p (ffi/alloc 1024)]
+         (ffi/reinterpret p 1024)
+         (ffi/free p)
+         (let [q (ffi/alloc 1024)]                ; the allocator reuses the address
+           (try (zero? (ffi/size q)) (finally (ffi/free q))))))
+(check "an arena forgets a segment size when it closes"
+       (let [a (ffi/confined-arena)
+             p (ffi/alloc 64)]
+         (ffi/segment a p 64)
+         (ffi/close-arena a)
+         (try (zero? (ffi/size p)) (finally (ffi/free p)))))
+(check "an arena forgets a slice size when it closes"
+       (let [a (ffi/confined-arena)
+             p (ffi/alloc 64)]
+         (ffi/slice a p 16 16)
+         (ffi/close-arena a)
+         (try (zero? (ffi/size (+ p 16))) (finally (ffi/free p)))))
+(check "an arena-scoped slice still records the size while the arena is open"
+       (let [p (ffi/alloc 64)]
+         (try (with-open [a (ffi/confined-arena)]
+                (= 16 (ffi/size (ffi/slice a p 16 16))))
+              (finally (ffi/free p)))))
+(check "the arena-first argument order is enforced, not just documented"
+       (and (rejects? #(ffi/reinterpret (ffi/global-arena) 8))
+            (rejects? #(ffi/segment (ffi/global-arena) 8))
+            (rejects? #(ffi/slice (ffi/global-arena) 8 16))))
 
 ;; -- copy and clone -----------------------------------------------------------
 
@@ -479,11 +540,11 @@
 ;; -- a closing arena releases everything it holds -----------------------------
 
 (check "close releases blocks, strings and callbacks in one pass"
-       (let [real-free ffi/free
+       (let [real-free ffi/__free
              real-free-callable ffi/free-callable
              frees (atom 0)
              callables (atom 0)]
-         (with-redefs [ffi/free (fn [p] (swap! frees inc) (real-free p))
+         (with-redefs [ffi/__free (fn [p] (swap! frees inc) (real-free p))
                        ffi/free-callable (fn [p] (swap! callables inc) (real-free-callable p))]
            (let [a (ffi/confined-arena)]
              (ffi/alloc a 8)
@@ -493,13 +554,13 @@
              (ffi/close-arena a)))
          (= [3 1] [@frees @callables])))
 (check "a cleanup that raises does not strand the rest of the group"
-       (let [real-free ffi/free
+       (let [real-free ffi/__free
              frees (atom 0)]
-         (with-redefs [ffi/free (fn [p] (swap! frees inc) (real-free p))]
+         (with-redefs [ffi/__free (fn [p] (swap! frees inc) (real-free p))]
            (let [a (ffi/confined-arena)
                  view (ffi/alloc 8)]
              (ffi/alloc a 8)
-             (ffi/reinterpret view 8 a (fn [_] (throw (ex-info "cleanup failed" {}))))
+             (ffi/reinterpret a view 8 (fn [_] (throw (ex-info "cleanup failed" {}))))
              (rejects? #(ffi/close-arena a))
              (real-free view)))
          (= 1 @frees)))
