@@ -237,6 +237,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are new, so a caller can see the pool grow and retire — and so the tests can
   assert it without counting threads by hand.
 
+- **The three spellings of executor shutdown do what they say (#819).** Found
+  while measuring the pool above, all three verified against reference JVM Clojure
+  on Java 21:
+
+  - **A `submit` or `execute` after shutdown is REJECTED** with
+    `RejectedExecutionException` (a `RuntimeException`, catchable as either), which
+    is what the JVM's default `AbortPolicy` does. jolt used to accept the task and
+    queue it — a promise the pool cannot keep, because its workers leave as soon as
+    the queue they are draining runs dry. The task then ran only if a worker
+    happened to still be there, and otherwise sat in the queue for good, with a
+    `Future` whose `.get` waits forever and an `isTerminated` answering false about
+    a pool that has nothing left to run it. The check is made under the queue mutex,
+    so a task that gets in ahead of the flag is enqueued while a worker is still
+    live, and a worker drains the queue before it leaves.
+  - **`shutdownNow` drops the queued tasks and hands them back**, which is the
+    whole difference between it and `shutdown`. It used to answer an empty vector
+    and leave the queue to drain, so the method that exists to say "do not run the
+    rest" ran the rest: a caller shutting a pool down hard because its work had
+    become irrelevant got every queued task executed anyway, and an empty list
+    claiming nothing had been pending. The returned procedures are callable, so a
+    caller can still run one itself, as `.run` lets them on the JVM. What jolt still
+    cannot do is the other half — interrupting the tasks already RUNNING, which
+    needs the workers to carry an interrupt flag a shutdown can set.
+  - **`close` blocks until the pool has terminated**, as the JVM's has since 19.
+    It used to return the moment the flag was set, so the one spelling of shutdown
+    that promises the work is finished when it returns was the one that did not
+    wait, and `(with-open [ex …] …)` left its tasks running behind it.
+
+  A worker that dies for any reason other than its task throwing (nothing does
+  that today) now hands its slot back before it goes, instead of leaving
+  `live-workers` counting a thread that is gone — which would have left
+  `isTerminated` false forever and `awaitTermination` waiting out its deadline on a
+  finished pool. The next enqueue starts a replacement, because a live count below
+  max with a task waiting is what the growth rule spawns on.
+
 - **`deref` of a `java.util.concurrent.Future`.** `@fut` raised "deref:
   unsupported reference type" for a `FutureTask` and for what an
   `ExecutorService.submit` hands back. Neither is `IDeref` on the JVM either —

@@ -1727,38 +1727,124 @@
                  (begin (executor-idle-wait! st (jolt-millis->time dl))
                         (poll dl)))))
           (else (executor-idle-wait! st #f) (poll deadline)))))
+;; A worker that dies must not take the pool's accounting with it. Everything a
+;; TASK can throw is already caught at the task (submit's future keeps it, execute
+;; reports it), so reaching this handler means the queue mechanics threw — which
+;; nothing in them does today. Unhandled, it would leave live-workers counting a
+;; thread that is gone: isTerminated would never answer true and awaitTermination
+;; would wait out its whole deadline on a pool that is finished. The bookkeeping
+;; here is the same one a retiring worker does, and the next enqueue replaces the
+;; worker for free, because a live count below max with a task waiting is exactly
+;; what the growth rule starts one on (the JVM replaces an abruptly-dead worker
+;; too, for the same reason).
 (define (executor-worker-loop st)
-  (let loop ()
-    (let ((job (jolt-with-mutex (vector-ref st 2) (executor-take-job! st))))
-      (when job (job) (loop)))))
+  (guard (e (#t (jolt-with-mutex (vector-ref st 2) (executor-worker-exit! st))
+                (guard (_ (#t #f))
+                  (display "Exception in executor worker:\n" (current-error-port))
+                  (jolt-report-throwable e (current-error-port)))))
+    (let loop ()
+      (let ((job (jolt-with-mutex (vector-ref st 2) (executor-take-job! st))))
+        (when job (job) (loop))))))
 
-;; shutdown / shutdownNow / close, which differ only in what they RETURN here.
+;; shutdown: stop accepting, let what is queued drain.
 (define (executor-shutdown! st)
   (vector-set! st 0 #t)
   (jolt-with-mutex (vector-ref st 2)
     (jolt-cv-wake! (vector-ref st 3))       ; every idle worker: leave
     (jolt-cv-wake! (vector-ref st 11))))    ; awaitTermination: re-read the flag
 
+;; shutdownNow: stop accepting AND drop what is queued, answering the dropped
+;; tasks in queue order — which is the whole difference between the two methods and
+;; the whole point of this one. It used to set the flag, answer an empty vector, and
+;; leave the queue to drain, so the method that exists to say "do not run the rest"
+;; ran the rest: a caller shutting a pool down hard because its work had become
+;; irrelevant (a cancelled request, a failing import) got every queued task
+;; executed anyway, and an empty list claiming nothing had been pending.
+;;
+;; A dropped task's Future never completes, so a .get on it waits forever. That is
+;; the JVM's behaviour too — the tasks it hands back are the pending FutureTasks
+;; themselves, and nothing runs them unless the caller does — which is why they are
+;; returned rather than discarded: the returned procedures are callable, and calling
+;; one runs that task on the caller's thread, the same recovery .run gives there.
+;;
+;; What jolt CANNOT do is the other half of shutdownNow, interrupting the tasks
+;; already running: the workers do not carry an interrupt flag for a shutdown to
+;; set, so a task in Thread/sleep or a blocking read keeps going. The JVM
+;; interrupts those threads. Tracked; a worker would have to adopt an interrupt box
+;; the way Thread.start does.
+(define (executor-drain-queue! st)
+  (let* ((q (unbox (vector-ref st 1)))
+         (jobs (append (car q) (reverse (cdr q)))))
+    (set-car! q '())
+    (set-cdr! q '())
+    (vector-set! st 10 0)
+    jobs))
+(define (executor-shutdown-now! st)
+  (vector-set! st 0 #t)
+  (let ((dropped (jolt-with-mutex (vector-ref st 2)
+                   (let ((jobs (executor-drain-queue! st)))
+                     (jolt-cv-wake! (vector-ref st 3))
+                     (jolt-cv-wake! (vector-ref st 11))
+                     jobs))))
+    (apply jolt-vector dropped)))
+
+;; The wait awaitTermination and close share. DEADLINE #f waits for as long as it
+;; takes, which is what close does.
+(define (executor-await-termination st deadline)
+  (jolt-cv-wait-interruptibly "ExecutorService.awaitTermination"
+                              (vector-ref st 2) (vector-ref st 11) deadline
+    (lambda (timed-out?)
+      (cond ((and (vector-ref st 0) (fx=? 0 (vector-ref st 4))) #t)
+            (timed-out? #f)
+            (else jolt-cv-again)))))
+
+;; A submit or execute after shutdown is REJECTED, as on the JVM, whose default
+;; handler is AbortPolicy. jolt used to accept it and queue it, which is a promise
+;; the pool cannot keep: the workers leave as soon as the queue they are draining
+;; runs dry, so the task ran only if one happened to still be there, and otherwise
+;; sat in the queue for good — with a Future whose .get waits forever and an
+;; isTerminated that answers false about a pool with nothing left to run it. A
+;; throw at the submit says the same thing the JVM says, at the only point where
+;; the caller can still do something about it.
+;;
+;; Decided under the queue mutex, which is what makes the answer honest either way:
+;; shutdown sets the flag and then takes this mutex, so a task that gets in ahead of
+;; the flag is enqueued with a worker still live, and a worker drains the queue
+;; before it leaves (executor-take-job! reads the depth before it reads the flag).
+;; Checked outside, the window between reading the flag and enqueueing is exactly
+;; the one where the task can be both accepted and abandoned.
+(define (executor-reject-task! st)
+  (jolt-throw (jolt-host-throwable
+               "java.util.concurrent.RejectedExecutionException"
+               "task rejected from executor: it is shut down")))
 (define (executor-enqueue! self job)
-  (let ((st (jhost-state self)))
-    (when (jolt-with-mutex (vector-ref st 2)
-            (let ((q (unbox (vector-ref st 1))))
-              (set-cdr! q (cons job (cdr q))))
-            (vector-set! st 10 (fx+ (vector-ref st 10) 1))
-            ;; One task, one taker: signal a single parked worker, and none at all
-            ;; when none is parked — a worker that is running or waiting on this
-            ;; mutex re-reads the queue before it parks, under this same hold, so
-            ;; there is no wake for it to miss.
-            (when (fx>? (vector-ref st 9) 0)
-              (jolt-cv-signal-one! (vector-ref st 3)))
-            ;; Grow if this task has no idle worker waiting to take it. Not after
-            ;; shutdown: a task enqueued then is one jolt keeps rather than
-            ;; rejects (the divergence noted above), and starting a thread for it
-            ;; would also resurrect a pool that had reached termination.
-            (and (not (vector-ref st 0))
-                 (fx>? (vector-ref st 10) (vector-ref st 9))
-                 (executor-claim-worker! st)))
-      (executor-spawn-worker! st))))
+  (let* ((st (jhost-state self))
+         (action (jolt-with-mutex (vector-ref st 2)
+                   (cond
+                     ((vector-ref st 0) 'reject)
+                     (else
+                      (let ((q (unbox (vector-ref st 1))))
+                        (set-cdr! q (cons job (cdr q))))
+                      (vector-set! st 10 (fx+ (vector-ref st 10) 1))
+                      ;; One task, one taker: signal a single parked worker, and
+                      ;; none at all when none is parked — a worker that is running
+                      ;; or waiting on this mutex re-reads the queue before it
+                      ;; parks, under this same hold, so there is no wake for it to
+                      ;; miss.
+                      (when (fx>? (vector-ref st 9) 0)
+                        (jolt-cv-signal-one! (vector-ref st 3)))
+                      ;; Grow if this task has no idle worker waiting to take it.
+                      (if (and (fx>? (vector-ref st 10) (vector-ref st 9))
+                               (executor-claim-worker! st))
+                          'spawn
+                          #f))))))
+    ;; Both of these happen with the mutex RELEASED: a fork takes ~80us and the
+    ;; queue cannot be shut for that long, and a throw has no business unwinding
+    ;; through a lock region it does not need to hold.
+    (case action
+      ((spawn) (executor-spawn-worker! st))
+      ((reject) (executor-reject-task! st))
+      (else (void)))))
 (let ((single (lambda _ (make-executor 1)))
       (fixed  (lambda (n . _) (make-executor (max 1 (jnum->exact n)))))
       ;; cached / virtual-thread-per-task: the two factories that are UNBOUNDED on
@@ -1814,32 +1900,37 @@
         ;; live worker is already terminated and awaitTermination has to re-read
         ;; the flag to find out.
         (cons "shutdown" (lambda (self) (executor-shutdown! (jhost-state self)) jolt-nil))
-        (cons "shutdownNow" (lambda (self) (executor-shutdown! (jhost-state self)) (jolt-vector)))
-        (cons "close" (lambda (self) (executor-shutdown! (jhost-state self)) jolt-nil))
+        (cons "shutdownNow" (lambda (self) (executor-shutdown-now! (jhost-state self))))
+        ;; close is shutdown plus an unbounded awaitTermination, and it BLOCKS —
+        ;; "blocks until all tasks have completed execution", as the JVM has it
+        ;; since 19. It used to return the moment the flag was set, so the one
+        ;; spelling of shutdown that promises the work is finished when it returns
+        ;; was the one that did not wait: (with-open [ex …] …) left its tasks
+        ;; running behind it and the body's cleanup ran against a live pool.
+        (cons "close" (lambda (self)
+          (let ((st (jhost-state self)))
+            (executor-shutdown! st)
+            (executor-await-termination st #f))
+          jolt-nil))
         (cons "isShutdown" (lambda (self) (vector-ref (jhost-state self) 0)))
         (cons "isTerminated" (lambda (self) (let ((st (jhost-state self)))
           (and (vector-ref st 0) (fx=? 0 (vector-ref st 10)) (fx=? 0 (vector-ref st 4))))))
         ;; (timeout, unit) on the JVM. The unit used to be dropped and the amount read
         ;; as milliseconds outright, so (.awaitTermination ex 5 TimeUnit/SECONDS)
         ;; waited five MILLISECONDS and reported the pool still running.
+        ;; A WAIT AND NOT A POLL (executor-await-termination above). This used to
+        ;; check under the mutex and sleep outside it in 10-100ms steps, because
+        ;; sleeping while HOLDING the mutex starves the worker exit it waits for. A
+        ;; condition wait releases the mutex atomically with blocking, so it needs
+        ;; neither the poll nor the care: the workers already broadcast term-cond as
+        ;; each one exits, and shutdown broadcasts it too. It also stops a fiber
+        ;; calling this from sleeping its carrier in 100ms chunks. term-cond and not
+        ;; task-cond: a wait that can belong to a FIBER must not sit on the
+        ;; condition the enqueue path signals one thread on.
         (cons "awaitTermination" (lambda (self ms . rest)
-          (let* ((st (jhost-state self))
-                 (deadline (+ (now-millis) (tu->ms ms (if (null? rest) #f (car rest))))))
-            ;; A WAIT AND NOT A POLL. This used to check under the mutex and sleep
-            ;; outside it in 10-100ms steps, because sleeping while HOLDING the mutex
-            ;; starves the worker exit it waits for. A condition wait releases the
-            ;; mutex atomically with blocking, so it needs neither the poll nor the
-            ;; care: the workers already broadcast term-cond as each one exits, and
-            ;; shutdown broadcasts it too. It also stops a fiber calling this from
-            ;; sleeping its carrier in 100ms chunks. term-cond and not task-cond: a
-            ;; wait that can belong to a FIBER must not sit on the condition the
-            ;; enqueue path signals one thread on.
-            (jolt-cv-wait-interruptibly "ExecutorService.awaitTermination"
-                                        (vector-ref st 2) (vector-ref st 11) deadline
-              (lambda (timed-out?)
-                (cond ((and (vector-ref st 0) (fx=? 0 (vector-ref st 4))) #t)
-                      (timed-out? #f)
-                      (else jolt-cv-again)))))))))
+          (executor-await-termination
+            (jhost-state self)
+            (+ (now-millis) (tu->ms ms (if (null? rest) #f (car rest)))))))))
 
 ;; --- ArrayBlockingQueue / FutureTask / ThreadPoolExecutor --------------------
 ;; The construction Grain's SQLite write coordinator does directly:
