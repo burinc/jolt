@@ -22,6 +22,17 @@
 (ffi/defcfn arrays-name-4 "jolt_layout_arrays_name_4" [] :size_t)
 (ffi/defcfn arrays-dates-1-year "jolt_layout_arrays_dates_1_year" [] :size_t)
 (ffi/defcfn arrays-matrix-1-2 "jolt_layout_arrays_matrix_1_2" [] :size_t)
+(ffi/defcfn data-size "jolt_layout_data_size" [] :size_t)
+(ffi/defcfn data-align "jolt_layout_data_align" [] :size_t)
+(ffi/defcfn msg-size "jolt_layout_msg_size" [] :size_t)
+(ffi/defcfn msg-align "jolt_layout_msg_align" [] :size_t)
+(ffi/defcfn msg-easy "jolt_layout_msg_easy" [] :size_t)
+(ffi/defcfn msg-data "jolt_layout_msg_data" [] :size_t)
+(ffi/defcfn msg-data-result "jolt_layout_msg_data_result" [] :size_t)
+(ffi/defcfn union-tail-size "jolt_layout_union_tail_size" [] :size_t)
+(ffi/defcfn union-tail-align "jolt_layout_union_tail_align" [] :size_t)
+(ffi/defcfn union-tail-data "jolt_layout_union_tail_data" [] :size_t)
+(ffi/defcfn union-tail-tail "jolt_layout_union_tail_tail" [] :size_t)
 
 (def failures (atom []))
 (defmacro check [label expr]
@@ -114,6 +125,81 @@
              (ffi/read-field p arrays-layout [:name 4])
              (ffi/read-field p arrays-layout [:dates 1 :year])
              (ffi/read-field p arrays-layout [:matrix 1 2])])))
+
+;; --- unions ------------------------------------------------------------------
+;; A union is as large as its largest member and aligned to its strictest, and
+;; every member starts at the union's own offset. Checked against the C witness
+;; rather than against Chez, since the point is the platform ABI.
+(def data-union (ffi/layout [:union [[:whatever :pointer] [:result :int32] [:wide :double]]]))
+(def msg-layout
+  (ffi/layout [:struct [[:msg :int32]
+                        [:easy :pointer]
+                        [:data [:union [[:whatever :pointer] [:result :int32] [:wide :double]]]]]]))
+(def union-tail-layout
+  (ffi/layout [:struct [[:tag :uint8]
+                        [:data [:union [[:whatever :pointer] [:result :int32] [:wide :double]]]]
+                        [:tail :uint16]]]))
+
+(check "bare union size" (= (data-size) (ffi/layout-size data-union)))
+(check "bare union alignment" (= (data-align) (ffi/layout-alignment data-union)))
+(check "union members all start at 0"
+       (= [0 0 0] [(ffi/field-offset data-union :whatever)
+                   (ffi/field-offset data-union :result)
+                   (ffi/field-offset data-union :wide)]))
+(check "struct holding a union: size" (= (msg-size) (ffi/layout-size msg-layout)))
+(check "struct holding a union: alignment" (= (msg-align) (ffi/layout-alignment msg-layout)))
+(check "field before the union" (= (msg-easy) (ffi/field-offset msg-layout :easy)))
+(check "the union member's own offset"
+       (= (msg-data) (ffi/field-offset msg-layout [:data :whatever])))
+(check "a member inside the union" (= (msg-data-result) (ffi/field-offset msg-layout [:data :result])))
+(check "a union pushes the field after it into place"
+       (and (= (union-tail-size) (ffi/layout-size union-tail-layout))
+            (= (union-tail-align) (ffi/layout-alignment union-tail-layout))
+            (= (union-tail-data) (ffi/field-offset union-tail-layout [:data :result]))
+            (= (union-tail-tail) (ffi/field-offset union-tail-layout :tail))))
+
+;; A union carries no tag, so `read` answers a POINTER to its bytes and the
+;; caller reads the member it knows applies; `write` names the member.
+(def msg-kind (ffi/place msg-layout :msg))
+(def msg-result (ffi/place msg-layout [:data :result]))
+(check "write names the member, read answers the whole struct"
+       (ffi/with-layout [p msg-layout]
+         (ffi/write p msg-layout {:msg 1 :easy ffi/null :data [:result 42]})
+         (let [m (ffi/read p msg-layout)]
+           (and (= 1 (:msg m))
+                ;; the union reads as a pointer AT the union's offset
+                (ffi/pointer? (:data m))
+                (= (+ p (msg-data)) (:data m))
+                ;; and through that pointer, with a type of the caller's own
+                (= 42 (ffi/read (:data m) :int32))))))
+(check "a place reaches a union member by path"
+       (ffi/with-layout [p msg-layout]
+         (ffi/write p msg-layout {:msg 7 :easy ffi/null :data [:result 9]})
+         (and (= 7 (ffi/read p msg-kind)) (= 9 (ffi/read p msg-result)))))
+(check "writing through a member place lands in the union"
+       (ffi/with-layout [p msg-layout]
+         (ffi/write p msg-layout {:msg 0 :easy ffi/null :data [:result 0]})
+         (ffi/write p msg-result 12345)
+         (= 12345 (ffi/read-field p msg-layout [:data :result]))))
+(check "members overlap: writing one is visible through another"
+       (ffi/with-layout [p data-union]
+         (ffi/write p data-union [:result -1])
+         (= 0xffffffff (bit-and (ffi/read-field p data-union :whatever) 0xffffffff))))
+(check "read-field and write-field reach a union member"
+       (ffi/with-layout [p msg-layout]
+         (ffi/write-field p msg-layout [:data :result] 77)
+         (= 77 (ffi/read-field p msg-layout [:data :result]))))
+(check "a union value must be a member pair"
+       (rejects? #(ffi/with-layout [p data-union] (ffi/write p data-union {:result 1}))))
+(check "a union value naming an unknown member rejects"
+       (rejects? #(ffi/with-layout [p data-union] (ffi/write p data-union [:nope 1]))))
+(check "a union is not passed by value"
+       (rejects? #(eval '(jolt.ffi/__cfn "f" [[:by-value [:union [[:a :int]]]]] :void))))
+(check "nor inside a by-value struct"
+       (rejects? #(eval '(jolt.ffi/__cfn "f" [[:by-value [:struct [[:a [:union [[:b :int]]]]]]]] :void))))
+(check "an empty union rejects" (rejects? #(eval '(jolt.ffi/__layout [:union []]))))
+(check "duplicate union member names reject"
+       (rejects? #(eval '(jolt.ffi/__layout [:union [[:a :int] [:a :int]]]))))
 
 (check "unknown path rejects"
        (rejects? #(ffi/field-offset date-layout :missing)))

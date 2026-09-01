@@ -461,20 +461,43 @@
        (rejects? #(macroexpand '(jolt.ffi/cfn {:path "x"} "strlen" [:string] :size_t))))
 (check "a :library attribute raises for the same reason"
        (rejects? #(macroexpand '(jolt.ffi/defcfn f {:library :x} "strlen" [:string] :size_t))))
-;; :& is babashka.ffi's variadic marker and means what :varargs means here. The
-;; BARE marker is its per-call tail inference, which a compiled
-;; foreign-procedure cannot have — so it must reject saying THAT, not fall
-;; through to "unknown foreign type :&", which is what a babashka signature
-;; pasted in here would otherwise hit.
+;; :& is babashka.ffi's variadic marker and means what :varargs means here, in
+;; both of its forms: the declared tail, and the BARE marker whose tail each call
+;; infers from the values it is given.
 (check ":& declares a variadic binding"
        (integer? ((ffi/cfn "fcntl" [:int :int :& :int] :int) 0 1 0)))
-(check "a bare :& rejects, naming the tail inference it cannot do"
-       (let [msg (message-of #(eval '(jolt.ffi/__cfn "open" [:string :int :&] :int)))]
-         (and (string? msg)
-              (not (nil? (re-find #"tail" msg)))
-              (not (nil? (re-find #"inference" msg))))))
 (check "a leading :& rejects, as a leading :varargs does"
        (rejects? #(eval '(jolt.ffi/__cfn "fcntl" [:& :int] :int))))
+
+;; One bare-:& binding serving several tail shapes, through the public macro —
+;; babashka.ffi's [:string :int :&], which used to reject here.
+(ffi/defcfn c-bare-snprintf "snprintf" [:pointer :size_t :string :&] :int)
+(defn- bare-fmt [f & args]
+  (let [b (ffi/alloc 128)]
+    (try (apply c-bare-snprintf b 128 f args) (ffi/ptr->string b)
+         (finally (ffi/free b)))))
+(check "bare :& — empty tail" (= "none" (bare-fmt "none")))
+(check "bare :& — integer tail" (= "42" (bare-fmt "%d" 42)))
+(check "bare :& — double tail" (= "2.50" (bare-fmt "%.2f" 2.5)))
+(check "bare :& — string tail" (= "hi" (bare-fmt "%s" "hi")))
+(check "bare :& — boolean and nil ride as 64-bit integers"
+       (= "1 0 0" (bare-fmt "%d %d %d" true false nil)))
+(check "bare :& — a ratio promotes to double" (= "0.250" (bare-fmt "%.3f" 1/4)))
+(check "bare :& — a second shape off the same binding, then the first again"
+       (and (= "x=6" (bare-fmt "%s=%d" "x" 6)) (= "7" (bare-fmt "%d" 7))))
+(check "bare :& — a tail value in no carrier names the carriers it has"
+       (let [msg (message-of #(bare-fmt "%d" :kw))]
+         (and (string? msg) (not (nil? (re-find #"bare :& tail" msg))))))
+;; The tail is inferred per call, so :capture-native-error still pairs the C
+;; result with the error slot — the two conventions compose here as they do for
+;; a declared tail.
+(ffi/defcfn c-bare-open "open" [:string :int :&] :int {:capture-native-error true})
+(check "bare :& composes with :capture-native-error"
+       (let [r (c-bare-open "/jolt/no/such/path" 0)]
+         (and (neg? (nth r 0)) (pos? (nth r 1)))))
+(check "bare :& + :capture-native-error, one-int tail"
+       (let [r (c-bare-open "/jolt/no/such/path" 0 0644)]
+         (and (neg? (nth r 0)) (pos? (nth r 1)))))
 
 (check "find-symbol answers an address for a symbol that exists"
        (ffi/pointer? (ffi/find-symbol "strlen")))

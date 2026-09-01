@@ -26,6 +26,27 @@ struct jolt_layout_nested {
   uint16_t tail;
 };
 
+/* A union is as large as its largest member and aligned to its strictest, and a
+   struct that holds one gets the offsets the compiler gives it. CURLMsg's shape
+   is the case that names this. */
+union jolt_layout_data {
+  void *whatever;
+  int32_t result;
+  double wide;
+};
+
+struct jolt_layout_msg {
+  int32_t msg;
+  void *easy;
+  union jolt_layout_data data;
+};
+
+struct jolt_layout_union_tail {
+  uint8_t tag;
+  union jolt_layout_data data;
+  uint16_t tail;
+};
+
 struct jolt_layout_arrays {
   uint8_t tag;
   float params[4];
@@ -68,3 +89,17 @@ WITNESS(arrays_dates_1_year,
 WITNESS(arrays_matrix_1_2,
         offsetof(struct jolt_layout_arrays, matrix) + 5 * sizeof(uint16_t))
 WITNESS(arrays_tail, offsetof(struct jolt_layout_arrays, tail))
+WITNESS(data_size, sizeof(union jolt_layout_data))
+WITNESS(data_align, _Alignof(union jolt_layout_data))
+WITNESS(data_result, offsetof(union jolt_layout_data, result))
+WITNESS(msg_size, sizeof(struct jolt_layout_msg))
+WITNESS(msg_align, _Alignof(struct jolt_layout_msg))
+WITNESS(msg_easy, offsetof(struct jolt_layout_msg, easy))
+WITNESS(msg_data, offsetof(struct jolt_layout_msg, data))
+WITNESS(msg_data_result,
+        offsetof(struct jolt_layout_msg, data) +
+            offsetof(union jolt_layout_data, result))
+WITNESS(union_tail_size, sizeof(struct jolt_layout_union_tail))
+WITNESS(union_tail_align, _Alignof(struct jolt_layout_union_tail))
+WITNESS(union_tail_data, offsetof(struct jolt_layout_union_tail, data))
+WITNESS(union_tail_tail, offsetof(struct jolt_layout_union_tail, tail))
