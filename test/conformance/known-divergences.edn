@@ -560,15 +560,16 @@
            :jvm "\"java.lang.management.ManagementFactory\""
            :jolt "\"nil\""}
    :note "Runtime.totalMemory/freeMemory/maxMemory ARE present over Chez's collector accounting. What is missing is JMX itself. Affects criterium's benchmark reporting, not its timing."}
-  ;; A recv error reads as EOF: errno is not reachable through the FFI, so
-  ;; ECONNRESET (Java: SocketException) cannot be told from EINTR (Java: retry).
+  ;; A recv error reads as EOF: io-call classifies the captured errno itself and
+  ;; returns only the syscall result, so ECONNRESET reaches the read side as a
+  ;; bare -1 with no way to raise Java's SocketException for it.
   {:category :host-model
    :behavior "(.read (.getInputStream socket)) on a reset connection — requires (require 'jolt.socket)"
    :jvm "throws java.net.SocketException (\"Connection reset\")"
    :jolt "-1 (EOF)"
    :check :prose
    :why "needs a live TCP peer that resets the connection"
-   :note "No errno through the FFI, so error and orderly shutdown collapse to EOF. Writes DO throw (send's return distinguishes); only the read side is permissive."}
+   :note "errno IS captured atomically per syscall; io-call just consumes it for retry classification instead of returning it, so error and orderly shutdown collapse to EOF. Writes DO throw (send's return distinguishes); only the read side is permissive."}
   ;; connect's timeout argument is accepted and ignored — the underlying
   ;; connect(2) is always blocking (equivalent to Java's timeout 0).
   {:category :host-model

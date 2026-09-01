@@ -292,7 +292,11 @@
   ;; R8). EAGAIN waits for readiness — parking the fiber on the poller when
   ;; there is a current fiber, blocking on a private kevent/epoll_wait when
   ;; there is not — and retries; EINTR retries immediately; anything else is
-  ;; the syscall's real answer, returned as-is (callers read errno semantics).
+  ;; the syscall's real answer, returned as-is. OP hands back the captured
+  ;; [result errno] pair from one foreign return path (jolt.ffi
+  ;; :capture-native-error) — every binding io-call drives is declared that
+  ;; way. The errno is spent on that classification and not returned, so a
+  ;; caller sees a terminal failure only as a negative result.
   (loop []
     (let [[r e] (op)]
       (cond
@@ -312,8 +316,13 @@
 
 (defn- do-recv [fd buf len]
   ;; n <= 0 answers EOF: recv 0 is orderly shutdown; a negative return (error)
-  ;; also reads as EOF because errno isn't reachable to tell ECONNRESET from
-  ;; EINTR. Java throws SocketException there — documented divergence.
+  ;; also reads as EOF. Java throws SocketException there — documented
+  ;; divergence. What is left of the error is a CHOICE, not a limitation:
+  ;; io-call classifies a captured errno and returns only the syscall result,
+  ;; so a reset arrives here as -1 with nothing attached. Retryable errnos are
+  ;; already gone by this point — io-call loops on EINTR and waits out EAGAIN
+  ;; — so every negative n here is terminal. Narrowing that to SocketException
+  ;; on ECONNRESET means widening io-call's contract to hand the errno back.
   (let [n (io-call #(c-recv fd buf len 0) fd :read)]
     (if (pos? n)
       {:n n :bytes (ffi/read-array buf n)}
@@ -336,7 +345,10 @@
     (try
       (ffi/write out :int 0)
       ;; a failed ioctl reads as "nothing there", the way a failed recv reads as
-      ;; EOF — errno is not reachable to say more
+      ;; EOF. c-ioctl is not on a retry path, so it is bound without
+      ;; :capture-native-error and its errno is never captured to say more
+      ;; with — unlike the recv side, where the errno exists and io-call
+      ;; spends it on classification.
       (if (neg? (c-ioctl fd fionread out)) 0 (max 0 (ffi/read out :int 0)))
       (finally (ffi/free out)))))
 
