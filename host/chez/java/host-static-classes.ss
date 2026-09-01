@@ -856,6 +856,8 @@
         (cons "compareAndSet" (lambda (self o n) (atomic-cas! self o n)))
         (cons "updateAndGet" (lambda (self f)
           (let loop ((v (unbox (atomic-box self))))
+            ;; atomic-cas! deliberately re-normalizes V and N. This keeps every
+            ;; CAS caller behind one typed boundary; conversion is idempotent.
             (let ((n (atomic-convert self (jolt-invoke f v))))
               (if (atomic-cas! self v n) n (loop (unbox (atomic-box self))))))))
         (cons "getAndUpdate" (lambda (self f)
