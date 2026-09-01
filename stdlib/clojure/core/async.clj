@@ -2,9 +2,11 @@
 ;;
 ;; The primitives (chan, <!, >!, <!!, >!!, close!, put!, take!, offer!, timeout,
 ;; promise-chan, buffer/dropping-buffer/sliding-buffer, thread, go-spawn,
-;; fiber-spawn) are provided natively (host/chez/java/async.ss); everything but
-;; fiber-spawn (which is io-thread's carrier — see thread-call below) runs on real
-;; OS threads. go and go-loop
+;; fiber-spawn, fiber-execute) are provided natively (host/chez/java/async.ss);
+;; everything but the two fiber ones (fiber-spawn is io-thread's carrier — see
+;; thread-call below; fiber-execute is the same spawn without a result channel,
+;; behind clojure.core.async.impl.dispatch's :io Executor) runs on real OS
+;; threads. go and go-loop
 ;; are NOT: they are defined below, because the pass that picks a park's
 ;; representation per site needs &env, macroexpand and resolve. This overlay
 ;; adds the portable dataflow operators — alts!, pipe, pipeline, split, reduce,

@@ -682,6 +682,33 @@
 (jch-register-supers! "java.lang.Comparable" '())
 (jch-register-supers! "java.lang.Runnable" '())
 (jch-register-supers! "java.util.concurrent.Callable" '())
+;; java.util.concurrent's executor/future interfaces. The shims for these
+;; (concurrency.ss) had no rows at all, so an ExecutorService reported (class x)
+;; => :object and answered FALSE to (instance? java.util.concurrent.Executor x) —
+;; which is the seam core.async.flow tests a user-supplied :io-exec through, so a
+;; real jolt executor was rejected as "not an Executor". The graph is consulted
+;; only by instance?/class (host-static-classes.ss), so naming it costs a shim
+;; value nothing to construct or call.
+(jch-register-supers! "java.util.concurrent.Executor" '())
+(jch-mark-interface! "java.util.concurrent.Executor")
+(jch-register-supers! "java.util.concurrent.ExecutorService"
+                      '("java.util.concurrent.Executor"))
+(jch-mark-interface! "java.util.concurrent.ExecutorService")
+(jch-register-supers! "java.util.concurrent.AbstractExecutorService"
+                      '("java.util.concurrent.ExecutorService" "java.util.concurrent.Executor"))
+(jch-register-supers! "java.util.concurrent.ThreadPoolExecutor"
+                      '("java.util.concurrent.AbstractExecutorService"
+                        "java.util.concurrent.ExecutorService" "java.util.concurrent.Executor"))
+(jch-register-supers! "java.util.concurrent.Future" '())
+(jch-mark-interface! "java.util.concurrent.Future")
+(jch-register-supers! "java.util.concurrent.RunnableFuture"
+                      '("java.util.concurrent.Future" "java.lang.Runnable"))
+(jch-mark-interface! "java.util.concurrent.RunnableFuture")
+;; FutureTask is the class Executors' pools hand back from submit, and the one
+;; core.async.flow's futurize constructs directly.
+(jch-register-supers! "java.util.concurrent.FutureTask"
+                      '("java.util.concurrent.RunnableFuture"
+                        "java.util.concurrent.Future" "java.lang.Runnable"))
 ;; java.time temporal interfaces — base abstractions the concrete time classes implement
 (jch-register-supers! "java.time.temporal.TemporalAccessor" '())
 (jch-mark-interface! "java.time.temporal.TemporalAccessor")
@@ -752,6 +779,11 @@
   '(("user-thread" . "java.lang.Thread")
     ("abq" . "java.util.concurrent.ArrayBlockingQueue")
     ("future-task" . "java.util.concurrent.FutureTask")
+    ;; Executors' pools are ThreadPoolExecutors on the JVM too, and what their
+    ;; submit returns is a FutureTask — the same class the "future-task" tag
+    ;; models, which is why two tags share one FQN here (as the writer tags do).
+    ("executor-service" . "java.util.concurrent.ThreadPoolExecutor")
+    ("j-future" . "java.util.concurrent.FutureTask")
     ("instant" . "java.time.Instant")
     ("local-date" . "java.time.LocalDate")
     ("local-time" . "java.time.LocalTime")

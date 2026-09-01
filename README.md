@@ -173,7 +173,7 @@ doubles, `BigDecimal` with `M` literals and `with-precision`), lazy and infinite
 sequences, transducers, destructuring, multimethods with hierarchies,
 protocols/records (`deftype`/`defrecord`/`reify`/`extend-protocol`), metadata,
 namespaces, atoms, refs/STM (`ref`/`dosync`/`alter`/`commute`),
-`future`/`promise`/`agent`/`pmap`, `clojure.core.async`, runtime
+`future`/`promise`/`agent`/`pmap`, `clojure.core.async` (and `.flow`), runtime
 `eval`/`load-string`/`defmacro`, and the full reader (`#()`, `#_`, `#?`, tagged
 literals, `#"…"`) all behave as on the JVM. `=` is category-aware
 (`(= 3 3.0)` ⇒ `false`) and `==` is value-equality, as in Clojure. The genuine
