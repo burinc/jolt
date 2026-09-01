@@ -1160,6 +1160,19 @@
   {:suite "host-interop / java.io.File" :label "exists is false off-disk" :expected "false" :actual "(do (require '[clojure.java.io :as io]) (.exists (io/file \"/no/such/path/xyz\")))" :portability :jvm}
   {:suite "host-interop / java.io.File" :label "file-seq yields File values" :expected "true" :actual "(do (require '[clojure.java.io :as io]) (every? (fn [f] (instance? java.io.File f)) (file-seq (io/file \"stdlib\"))))" :portability :jvm}
   {:suite "host-interop / java.io.File" :label "file-seq finds files" :expected "true" :actual "(do (require '[clojure.java.io :as io]) (pos? (count (filter (fn [f] (.isFile f)) (file-seq (io/file \"stdlib\"))))))" :portability :jvm}
+  ;; getParent/getParentFile answer nil where the path names no parent. The root
+  ;; is the case that bites: "/" is its own longest prefix, so a parent computed
+  ;; as "the text before the last separator" hands the path straight back, and
+  ;; the walk-to-root idiom below then never reaches its nil and spins forever.
+  {:suite "host-interop / java.io.File" :label "getParent over the no-parent set" :expected "[nil nil \"/\" \"/a\" nil \"a\" nil nil \"/\"]" :actual "(do (require '[clojure.java.io :as io]) (mapv (fn [s] (.getParent (io/file s))) [\"/\" \"//\" \"/a\" \"/a/b\" \"a\" \"a/b\" \"\" \".\" \"/tmp/\"]))" :portability :jvm}
+  {:suite "host-interop / java.io.File" :label "getParentFile agrees with getParent" :expected "[nil nil \"/\" \"/a\" nil \"a\" nil nil \"/\"]" :actual "(do (require '[clojure.java.io :as io]) (mapv (fn [s] (some-> (.getParentFile (io/file s)) str)) [\"/\" \"//\" \"/a\" \"/a/b\" \"a\" \"a/b\" \"\" \".\" \"/tmp/\"]))" :portability :jvm}
+  {:suite "host-interop / java.io.File" :label "walk to root terminates" :expected "2" :actual "(do (require '[clojure.java.io :as io]) (loop [d (io/file \"/tmp\") n 0] (cond (nil? d) n (> n 20) :did-not-terminate :else (recur (.getParentFile d) (inc n)))))" :portability :jvm}
+  ;; list/listFiles answer nil -- not an empty array, and not a throw -- for
+  ;; anything that is not a readable directory, so (map str (.listFiles f)) over
+  ;; a missing path yields () rather than dying.
+  {:suite "host-interop / java.io.File" :label "listFiles is nil off-disk and on a plain file" :expected "[nil nil]" :actual "(do (require '[clojure.java.io :as io]) [(.listFiles (io/file \"/no/such/path/xyz\")) (.listFiles (io/file \"README.md\"))])" :portability :jvm}
+  {:suite "host-interop / java.io.File" :label "list is nil off-disk and on a plain file" :expected "[nil nil]" :actual "(do (require '[clojure.java.io :as io]) [(.list (io/file \"/no/such/path/xyz\")) (.list (io/file \"README.md\"))])" :portability :jvm}
+  {:suite "host-interop / java.io.File" :label "a nil listing maps to the empty seq" :expected "()" :actual "(do (require '[clojure.java.io :as io]) (map str (.listFiles (io/file \"/no/such/path/xyz\"))))" :portability :jvm}
   {:suite "host-interop / java.nio.file.Path" :label "Paths/get joins" :expected "\"a/b/c\"" :actual "(do (import [java.nio.file Paths]) (str (Paths/get \"a\" (into-array String [\"b\" \"c\"]))))" :portability :jvm}
   {:suite "host-interop / java.nio.file.Path" :label "normalize" :expected "\"a/c/d\"" :actual "(do (import [java.nio.file Paths]) (str (.normalize (Paths/get \"a/b/../c/./d\" (into-array String [])))))" :portability :jvm}
   {:suite "host-interop / java.nio.file.Path" :label "relativize" :expected "\"c/d\"" :actual "(do (import [java.nio.file Paths]) (str (.relativize (Paths/get \"/a/b\" (into-array String [])) (Paths/get \"/a/b/c/d\" (into-array String [])))))" :portability :jvm}

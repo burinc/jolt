@@ -214,6 +214,23 @@ when transposed.
   arithmetic at their signed 32- and 64-bit widths, and `AtomicLong.intValue`
   narrows to a signed 32-bit result, matching the JVM.
 
+- **`File.getParentFile` answered the filesystem root as its own parent, so a
+  walk-to-root loop never terminated (#809).** The parent was the text before
+  the last separator, which for `"/"` is `"/"` — the path back again, where the
+  JVM answers `nil`. Every `(recur (.getParentFile d) …)` is written against
+  that `nil`, and because the recur is a tail call the non-terminating loop had
+  no stack to overflow and nothing to raise: it presented as a hang. Both
+  `.getParent` and `.getParentFile` now answer `nil` whenever the computed
+  parent equals the path it came from, which is the JVM's invariant and needs no
+  special case for `"/"`.
+
+  In the same dispatch table, **`.listFiles` raised where the JVM answers
+  `nil`** — for a path that does not exist, for a plain file, and for a
+  directory the process may not read — so the ordinary
+  `(map str (.listFiles f))` died instead of yielding `()`. Its neighbour
+  `.list` already guarded the first two cases and not the third; both spellings
+  now share one guard covering all three.
+
 - **Namespaced-map prefixes could absorb separator text into a silent wrong
   namespace or accept an invalid namespace.** The reader now requires the
   namespace — auto-resolved (`#::a`) or explicit (`#:a`) alike — to be a simple
