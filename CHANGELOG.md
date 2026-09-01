@@ -5,6 +5,110 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`jolt.ffi`: babashka.ffi's bare `:&`, one binding for every tail shape
+  (#803).** `:&` already declared a variadic C function, but only in the
+  *declared-tail* form — `[:int :int :& :int]`, the tail fixed when the binding
+  is made. The BARE marker, where no types follow and each call reads its own
+  tail off the values it is given, is the more useful half for exactly the libc
+  functions the marker exists for, and it now works:
+
+  ```clojure
+  (ffi/defcfn c-open "open" [:string :int :&] :int)
+  (c-open path O_RDONLY)          ; empty tail
+  (c-open path flags 0644)        ; one-int tail, same binding
+  ```
+
+  A Chez `foreign-procedure` has its argument and result types fixed when it is
+  *compiled*, so a call has nothing to compile a new one from — which is why the
+  bare form used to raise saying so. It now lowers to a dispatcher over a
+  per-binding cache: the first call of each distinct tail shape compiles a
+  `foreign-procedure` for that shape and every call after finds it. jolt carries
+  its own compiler, in a `jolt build --release` binary too, so this works in a
+  standalone app and not only under the REPL.
+
+  Three carriers keep the shape space small, the same three babashka.ffi
+  collapses to: an integer, pointer, boolean or `nil` travels as a 64-bit
+  integer, a floating-point number or ratio as a `double`, and a string as a
+  NUL-terminated C string. A tail value in none of them raises at the call
+  naming the three, rather than reaching C as whatever it happened to be.
+
+  The cost is a compile — about 0.8ms — on the first call of each shape, and a
+  cache lookup on every call after. Measured end to end from jolt against a
+  do-nothing C variadic on Chez 10.4.1, where a fixed binding to the same callee
+  is 20ns and a declared tail 20.4ns:
+
+  | tail | per call |
+  |---|---|
+  | none | 26.5 ns |
+  | one value | 34 ns |
+  | two values | 41.5 ns |
+
+  So roughly +13ns and 1.6x a declared tail, against the "roughly twice as fast"
+  babashka.ffi's own guide gives for declaring one. Declare the tail where it
+  does not vary. Three things got it there, each measured rather than assumed:
+  the form is COMPILED, not interpreted (interpreting builds 2.5x faster and
+  then calls 3x slower forever); the emitted binding is a `case-lambda` with
+  arity-specialized arms for tails of nought to three, so a short tail allocates
+  no rest list, is not walked twice and is not spread back with `apply` (12ns);
+  and the carrier, the marshaller and the cache scan all test for a fixnum first
+  (10ns). The bare form does not combine with `:blocking` (neither form does) or
+  with a by-value aggregate argument, whose ftype the runtime path has no way to
+  declare; `:capture-native-error` composes with both forms.
+
+- **A variadic binding reaches a scoped library's symbols (#803).** A declared
+  `:jolt/native` is `dlopen`'d `RTLD_LOCAL`, so its symbols are not in the
+  process-global table that a bare symbol name resolves through. Every binding
+  therefore tries the library's own handle first — except a scalar-variadic one,
+  which skipped that branch and resolved by name only. The effect was that a
+  variadic function in a library loaded with `load-library` could not be bound
+  **at all**: the name found nothing and the first call raised
+  `no entry for "..."`. `curl_easy_setopt` is that case, and so is every
+  `ioctl`-alike a wrapped library exports. Both spellings of `:&` now resolve the
+  way the rest of the FFI does. libc is unaffected — nothing declares those
+  symbols, so they still come from the global table.
+
+- **`[:union …]` in a layout (#803).** A union goes anywhere a nested struct
+  does, is as large as its largest member and aligned to its strictest, and gets
+  its offsets from the platform ABI — checked against a C witness, not against
+  Chez:
+
+  ```clojure
+  (def curl-msg
+    (ffi/layout [:struct [[:msg :int]
+                          [:easy :pointer]
+                          [:data [:union [[:whatever :pointer] [:result :int]]]]]]))
+  ```
+
+  A union carries no tag of its own — in C the program knows which member is
+  live, from a sibling field (`CURLMsg`) or from what it stored
+  (`epoll_data_t`). So `read` answers a union as a POINTER to its bytes and the
+  caller reads the member that applies, through a `place` at its path or with a
+  type of its own, every member starting at offset 0. `write` names the member
+  as a pair, `{:data [:result 0]}`, since the members overlap and writing them
+  all would leave only the last. A union is not passed BY VALUE in a signature,
+  alone or inside a struct — which member is live is the program's knowledge
+  rather than the type's — and that raises saying so.
+
+- **`ffi/byte-buffer`: a `java.nio.ByteBuffer` over foreign memory (#803).**
+  `(ffi/byte-buffer p 4096)` answers a buffer that SHARES the pointer's bytes
+  rather than copying them, so a decoder that speaks `ByteBuffer` reads foreign
+  memory in place and a `put` through the buffer is a write to the pointer. The
+  length may also be a type keyword or a compiled layout, as it may for `slice`
+  and `reinterpret`. `read-bytes`, `read-array` and `read-into!` remain the block
+  moves that copy *out* into a jolt value.
+
+  This is a real java.nio DIRECT buffer: `hasArray` answers false and `array`
+  raises, exactly as they do on the JVM, and `slice` shares the bytes instead of
+  copying them because there is a real address to offset. `ByteBuffer/wrap` and
+  `ByteBuffer/allocate` are unchanged — they keep their jolt byte-array backing
+  and every answer they gave before. The buffer keeps nothing alive: using one
+  after the memory is released reads freed memory, the same rule babashka.ffi
+  states for its own.
+
 ## [0.8.0] - 2026-08-31
 
 The build keeps one toolchain end to end now. When make provisions the pinned

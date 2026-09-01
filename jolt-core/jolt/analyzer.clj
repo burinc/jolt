@@ -937,44 +937,47 @@
       (when (and (form-keyword? head) (nil? (namespace head)))
         (name head)))))
 
-(defn- analyze-ffi-layout-struct [form]
-  (when-not (form-vec? form)
-    (throw (str "jolt.ffi layout descriptor must be [:struct [[field type] ...]], got "
-                (pr-str form))))
-  (let [parts (vec (form-vec-items form))]
-    (when-not (and (= 2 (count parts))
-                   (form-keyword? (nth parts 0))
-                   (nil? (namespace (nth parts 0)))
-                   (= "struct" (name (nth parts 0)))
-                   (form-vec? (nth parts 1)))
-      (throw (str "jolt.ffi layout descriptor must be [:struct [[field type] ...]], got "
-                  (pr-str form))))
-    (let [field-forms (vec (form-vec-items (nth parts 1)))]
-      (when (empty? field-forms)
-        (throw "jolt.ffi struct descriptor must contain at least one field"))
-      (loop [remaining field-forms names #{} fields []]
-        (if (empty? remaining)
-          {:ffi-kind :struct :fields fields}
-          (let [field (first remaining)]
-            (when-not (form-vec? field)
-              (throw (str "jolt.ffi struct field must be [keyword type], got "
-                          (pr-str field))))
-            (let [fp (vec (form-vec-items field))]
-              (when-not (= 2 (count fp))
-                (throw (str "jolt.ffi struct field must be [keyword type], got "
+;; A struct and a union differ only in how the ABI lays the members out, so one
+;; analyzer reads both and the :ffi-kind it answers is what the back end turns
+;; into Chez's (struct ...) or (union ...) ftype. Everything downstream — offsets,
+;; size, alignment, field paths — is computed by the SAME ftype machinery, so a
+;; union needs no arithmetic of its own here.
+(defn- analyze-ffi-layout-aggregate [form]
+  (let [kind (ffi-layout-form-kind form)
+        kind (when (or (= "struct" kind) (= "union" kind)) kind)]
+    (when-not (form-vec? form)
+      (throw (str "jolt.ffi layout descriptor must be [:struct [[field type] ...]] "
+                  "or [:union [[field type] ...]], got " (pr-str form))))
+    (let [parts (vec (form-vec-items form))]
+      (when-not (and kind (= 2 (count parts)) (form-vec? (nth parts 1)))
+        (throw (str "jolt.ffi layout descriptor must be [:struct [[field type] ...]] "
+                    "or [:union [[field type] ...]], got " (pr-str form))))
+      (let [field-forms (vec (form-vec-items (nth parts 1)))]
+        (when (empty? field-forms)
+          (throw (str "jolt.ffi " kind " descriptor must contain at least one field")))
+        (loop [remaining field-forms names #{} fields []]
+          (if (empty? remaining)
+            {:ffi-kind (if (= "union" kind) :union :struct) :fields fields}
+            (let [field (first remaining)]
+              (when-not (form-vec? field)
+                (throw (str "jolt.ffi " kind " field must be [keyword type], got "
                             (pr-str field))))
-              (let [field-name (nth fp 0)]
-                (when-not (and (form-keyword? field-name)
-                               (nil? (namespace field-name)))
-                  (throw (str "jolt.ffi struct field name must be an unqualified keyword, got "
-                              (pr-str field-name))))
-                (let [nm (name field-name)]
-                  (when (contains? names nm)
-                    (throw (str "jolt.ffi struct field names must be unique; duplicate :" nm)))
-                  (recur (rest remaining)
-                         (conj names nm)
-                         (conj fields {:name nm
-                                       :type (analyze-ffi-layout-type (nth fp 1))})))))))))))
+              (let [fp (vec (form-vec-items field))]
+                (when-not (= 2 (count fp))
+                  (throw (str "jolt.ffi " kind " field must be [keyword type], got "
+                              (pr-str field))))
+                (let [field-name (nth fp 0)]
+                  (when-not (and (form-keyword? field-name)
+                                 (nil? (namespace field-name)))
+                    (throw (str "jolt.ffi " kind " field name must be an unqualified keyword, got "
+                                (pr-str field-name))))
+                  (let [nm (name field-name)]
+                    (when (contains? names nm)
+                      (throw (str "jolt.ffi " kind " field names must be unique; duplicate :" nm)))
+                    (recur (rest remaining)
+                           (conj names nm)
+                           (conj fields {:name nm
+                                         :type (analyze-ffi-layout-type (nth fp 1))}))))))))))))
 
 (defn- analyze-ffi-layout-array [form]
   (let [parts (vec (form-vec-items form))]
@@ -994,25 +997,26 @@
     (form-keyword? form)
     (let [n (name form)]
       (when-not (and (nil? (namespace form)) (contains? ffi-layout-scalars n))
-        (throw (str "jolt.ffi struct field type must be a fixed-size scalar, nested struct, or fixed array; got "
+        (throw (str "jolt.ffi struct field type must be a fixed-size scalar, nested struct or union, or fixed array; got "
                     (pr-str form))))
       n)
 
     (form-vec? form)
     (case (ffi-layout-form-kind form)
-      "struct" (analyze-ffi-layout-struct form)
+      "struct" (analyze-ffi-layout-aggregate form)
+      "union" (analyze-ffi-layout-aggregate form)
       "array" (analyze-ffi-layout-array form)
-      (throw (str "jolt.ffi struct field type must be a fixed-size scalar, nested struct, or fixed array; got "
+      (throw (str "jolt.ffi struct field type must be a fixed-size scalar, nested struct or union, or fixed array; got "
                   (pr-str form))))
 
     :else
-    (throw (str "jolt.ffi struct field type must be a fixed-size scalar, nested struct, or fixed array; got "
+    (throw (str "jolt.ffi struct field type must be a fixed-size scalar, nested struct or union, or fixed array; got "
                 (pr-str form)))))
 
 (defn- analyze-ffi-layout [items]
   (when-not (= 2 (count items))
-    (throw "jolt.ffi/layout expects one literal struct descriptor"))
-  {:op :ffi-layout :layout (analyze-ffi-layout-struct (nth items 1))})
+    (throw "jolt.ffi/layout expects one literal struct or union descriptor"))
+  {:op :ffi-layout :layout (analyze-ffi-layout-aggregate (nth items 1))})
 
 (defn- ffi-by-value-form? [form]
   (when (form-vec? form)
@@ -1022,13 +1026,32 @@
            (nil? (namespace (nth parts 0)))
            (= "by-value" (name (nth parts 0)))))))
 
+;; A union has no by-value ABI a caller can rely on: which member is live is the
+;; program's knowledge, not the type's, and the register classification of the
+;; bytes differs by which one it is. babashka.ffi refuses it in a signature for
+;; the same reason. So a union reaches C as a :pointer, alone or as a member of
+;; a struct that would otherwise travel by value.
+(defn- ffi-layout-holds-union? [type]
+  (cond
+    (string? type) false
+    (= :union (:ffi-kind type)) true
+    (= :struct (:ffi-kind type))
+      (boolean (some (fn [f] (ffi-layout-holds-union? (:type f))) (:fields type)))
+    (= :array (:ffi-kind type)) (ffi-layout-holds-union? (:type type))
+    :else false))
+
 (defn- analyze-ffi-signature-type [form position]
   (cond
     (form-keyword? form) (name form)
     (ffi-by-value-form? form)
-      (let [parts (vec (form-vec-items form))]
+      (let [parts (vec (form-vec-items form))
+            analyzed (analyze-ffi-layout-aggregate (nth parts 1))]
+        (when (ffi-layout-holds-union? analyzed)
+          (throw (str "jolt.ffi " position
+                      " type: a union is not passed by value, alone or inside a struct"
+                      " — declare :pointer and read the member you know applies")))
         {:ffi-kind :by-value
-         :type (analyze-ffi-layout-struct (nth parts 1))})
+         :type analyzed})
     :else
       (throw (str "jolt.ffi " position
                   " type must be a keyword or [:by-value [:struct ...]], got "

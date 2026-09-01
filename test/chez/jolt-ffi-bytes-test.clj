@@ -105,6 +105,68 @@
 
   (ffi/free buf))
 
+;; --- a java.nio.ByteBuffer over foreign memory -------------------------------
+;; ffi/byte-buffer is a DIRECT buffer: it shares the bytes with the pointer
+;; rather than copying them, which is the whole difference from read-array. So
+;; the property under test is that writes cross in BOTH directions, and that the
+;; buffer reports itself as direct the way the JVM's does.
+(let [buf (ffi/alloc 64)]
+  (ffi/write-array buf (byte-array (range 8)))
+  (let [bb (ffi/byte-buffer buf 64)]
+    (check-eq "capacity is the declared length" (.capacity bb) 64)
+    (check-eq "a direct buffer has no backing array" (.hasArray bb) false)
+    (check-eq "array raises on a direct buffer"
+              (try (.array bb) :no-throw (catch UnsupportedOperationException _ :rejected))
+              :rejected)
+    (check-eq "relative get walks the foreign bytes"
+              [(.get bb) (.get bb) (.get bb)] [0 1 2])
+    (check-eq "absolute get leaves position alone"
+              [(.get bb 7) (.position bb)] [7 3])
+    ;; big-endian, java.nio's default and every other jolt ByteBuffer accessor
+    (check-eq "getInt reads big-endian" (.getInt bb 4) 0x04050607)
+
+    ;; the buffer writes THROUGH to the pointer
+    (.putInt bb 0 0x12345678)
+    (check-eq "a put is visible to the pointer"
+              (mapv #(bit-and % 0xff) (ffi/read-array buf 4)) [0x12 0x34 0x56 0x78])
+    ;; and a write to the pointer is visible to the buffer
+    (ffi/write buf :uint8 0xab 0)
+    (check-eq "a write through the pointer is visible to the buffer"
+              (bit-and (.get bb 0) 0xff) 0xab)
+
+    ;; bulk moves, which take the block-move path rather than a byte at a time
+    (ffi/write-array buf (byte-array (range 8)))
+    (.position bb 0)
+    (let [dst (byte-array 8)]
+      (.get bb dst)
+      (check-eq "bulk get fills a byte-array" (seq dst) (seq (byte-array (range 8)))))
+    (.position bb 0)
+    (.put bb (byte-array [-1 -128 0 127]))
+    (check-eq "bulk put is binary-faithful through the fold"
+              (seq (ffi/read-array buf 4)) (seq (byte-array [-1 -128 0 127])))
+
+    ;; a direct slice SHARES, where a heap slice copies
+    (.position bb 4)
+    (let [sl (.slice bb)]
+      (check-eq "a direct slice is 0-based over the remainder" (.capacity sl) 60)
+      (.put sl (byte-array [99]))
+      (check-eq "a direct slice writes through to the same bytes"
+                (nth (ffi/read-array buf 8) 4) 99)))
+  ;; the length may be a type or a layout, as it may for slice and reinterpret
+  (check-eq "a type keyword sizes the view" (.capacity (ffi/byte-buffer buf :int64)) 8)
+  (ffi/free buf))
+
+;; A heap buffer keeps every one of its old answers — the direct backing is an
+;; addition, not a change to ByteBuffer/wrap and ByteBuffer/allocate.
+(let [hb (java.nio.ByteBuffer/wrap (byte-array [1 2 3 4]))]
+  (check-eq "a wrapped buffer still has its array" (.hasArray hb) true)
+  (check-eq "and hands it back" (seq (.array hb)) (seq (byte-array [1 2 3 4])))
+  (check-eq "and still reads big-endian" (.getInt hb 0) 0x01020304))
+(let [hb (java.nio.ByteBuffer/allocate 8)]
+  (.putInt hb 42)
+  (.flip hb)
+  (check-eq "an allocated buffer round-trips" [(.getInt hb 0) (.remaining hb)] [42 4]))
+
 (if (empty? @failures)
   (println "JOLT-FFI-BYTES-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))

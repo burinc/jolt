@@ -533,7 +533,7 @@
    :check {:expr "(let [b (java.nio.ByteBuffer/wrap (byte-array [1 2 3 4]))] (.position b 1) (count (.array (.slice b))))"
            :jvm "4"
            :jolt "3"}
-   :note "jolt's byte-buffer state is #(backing position limit) with no array offset, so a slice cannot express \"0-based view into a shared backing\". Read paths — hexdumps, decoders — are unaffected; a write through a slice does not propagate back. Tracked as jolt-93c9."}
+   :note "A HEAP buffer's state is #(backing position limit) with no array offset, so its slice cannot express \"0-based view into a shared backing\" and copies instead. Read paths — hexdumps, decoders — are unaffected; a write through such a slice does not propagate back. A DIRECT buffer (jolt.ffi/byte-buffer) does share, there being a real address to offset, and .array raises on it as it does on the JVM. Tracked as jolt-93c9."}
   ;; No classloaders. This is not a shim gap that could be filled — a classloader
   ;; is a JVM linkage concept, and jolt compiles ahead of time to native code with
   ;; no class-loading step to intercept. Surfaced running kaocha, whose dynapath
