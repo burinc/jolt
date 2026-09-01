@@ -5387,7 +5387,11 @@
   ;; deliberate superset of the JVM's 16-bit char (see known-divergences). The
   ;; round trip is pinned in unit.edn, not here, since the JVM throws.
   {:suite "string-model / codepoint strings" :label "charAt of an astral character is the codepoint" :expected "[128512 1]" :actual "[(int (.charAt \"😀\" 0)) (.length \"😀\")]" :portability :jvm}
-  {:suite "concurrency-model / compare-and-set!" :label "value equality where JVM uses identity" :expected "true" :actual "(compare-and-set! (atom [1]) [1] [2])" :portability :common}
+  {:suite "concurrency-model / compare-and-set!" :label "identity mismatch on equal values fails" :expected "false" :actual "(compare-and-set! (atom [1]) [1] [2])" :portability :common}
+  ;; Jolt's identity predicate is Chez eq?. A fixnum is an immediate value with
+  ;; no separately allocated box, so equal fixnums are necessarily identical;
+  ;; the JVM can distinguish separately boxed values outside its small cache.
+  {:suite "concurrency-model / compare-and-set!" :label "immediate fixnums have no distinct boxes" :expected "true" :actual "(compare-and-set! (atom 1000) 1000 2000)" :portability :common}
   ;; #= evaluates at read time now (the reader / read-eval suite above pins the
   ;; full behavior); this row used to assert it read as inert data.
   {:suite "reader-model / read-eval" :label "#= evaluates under read-string" :expected "true" :actual "(= 3 (read-string \"#=(+ 1 2)\"))" :portability :common}
