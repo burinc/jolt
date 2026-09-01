@@ -149,6 +149,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Executors/newCachedThreadPool` grows on demand (#819).** It was a fixed pool
+  of 32 workers. A burst of more than 32 concurrent tasks queued behind the ones
+  already running — invisible while tasks are short, and a deadlock when they are
+  not: 32 tasks that block waiting for the 33rd (a fan-out whose children hand
+  their results back through a channel, say) never let it start, with no error and
+  nothing in the code to suggest a ceiling. The pool now has the JVM's shape —
+  core 0, max `Integer/MAX_VALUE`, 60s keep-alive — so nothing is forked until a
+  task arrives, a task that no idle worker is waiting to take starts one, and a
+  worker retires after 60 seconds idle.
+
+  It is still a POOL, which is what keeps that unbounded maximum from meaning a
+  thread per task: 2000 trivial tasks submitted back to back peak at **4** workers
+  on an idle 8-core box (5000 of them, 3), because the handful that keep up with
+  them are idle again by the time the next one lands. How far it grows is a
+  property of how far the producer runs ahead of the workers — the same 2000-task
+  burst pinned to a single core peaks at 136 — and of the tasks themselves: 1000
+  tasks that each sleep 50ms do reach 558 workers. Which is the JVM's own answer to
+  the same bursts, measured on the same box against reference Clojure: 13 workers
+  for the 2000 trivial tasks, 697 for the 1000 sleepers, and the same 64 for the
+  64 blocking ones. The unbounded growth is concurrency, not churn.
+
+  `newVirtualThreadPerTaskExecutor` maps to the same pool, being equally unbounded
+  on the JVM; a pooled thread stands in for a fresh virtual one, which nothing
+  here can tell apart. `newWorkStealingPool` stays a fixed pool, because a
+  `ForkJoinPool` is sized at `availableProcessors` on the JVM too. `newFixedThreadPool`
+  and `newSingleThreadExecutor` are unchanged: every worker eager, none retired,
+  and for the single-thread pool the submission ORDER that depends on there being
+  exactly one worker forever.
+
+  `ThreadPoolExecutor.`'s `corePoolSize`, `maximumPoolSize` and `keepAliveTime`
+  now all reach the pool it builds — the core workers eager, the rest on demand up
+  to max, and the above-core ones retired after keepAlive. Before, it was a fixed
+  pool of `maximumPoolSize` and the keep-alive was discarded. One divergence
+  remains, in the direction of the caller's stated maximum: the JVM grows past
+  core only once the work queue is FULL, so a `ThreadPoolExecutor` with an
+  unbounded queue never passes core there, while jolt (which has one unbounded
+  queue per pool) grows on the same no-idle-worker test as a cached pool.
+
+  `.getPoolSize`, `.getActiveCount`, `.getCorePoolSize` and `.getMaximumPoolSize`
+  are new, so a caller can see the pool grow and retire — and so the tests can
+  assert it without counting threads by hand.
+
 - **`deref` of a `java.util.concurrent.Future`.** `@fut` raised "deref:
   unsupported reference type" for a `FutureTask` and for what an
   `ExecutorService.submit` hands back. Neither is `IDeref` on the JVM either —
