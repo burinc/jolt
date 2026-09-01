@@ -204,6 +204,10 @@ when transposed.
   corrupt. Reported and first patched by @jasalt, found bringing up a
   WASM/Emscripten build.
 
+- **Socket error handling could lose `errno` between a syscall and its accessor,**
+  causing a clobbered `EAGAIN` to be treated as a terminal socket failure.
+  `connect`, `accept`, `recv`, and `send` now capture result and `errno` atomically.
+
 - **Modeled atomic classes used Clojure value equality and unbounded
   arithmetic.** `AtomicReference.compareAndSet` now compares object identity,
   while `AtomicInteger` and `AtomicLong` validate primitive arguments and wrap

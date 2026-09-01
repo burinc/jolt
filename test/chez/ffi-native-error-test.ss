@@ -223,6 +223,74 @@
 (ok "captured pair survives a later slot-overwriting native call"
     (evb "(let [a (c-fail-err 42) _ (c-clobber-scalar 7)] (and (= (first a) -1) (= (second a) 42)))"))
 
+;; --- socket consumer: recv classification uses the captured pair --------------
+;; Exercise the production jolt.socket binding and retry loop, not merely the
+;; lower-level FFI contract above.  The accepted loopback fd is nonblocking and
+;; has no bytes available, so its first recv returns EAGAIN.  Before io-call can
+;; classify that result, the operation sends one byte (making the fd readable)
+;; and overwrites ambient errno with EBADF.  A delayed errno read therefore
+;; mistakes the retryable recv for a terminal failure and returns -1.  Atomic
+;; capture preserves EAGAIN, waits, retries, and returns the one available byte.
+;;
+;; jolt.socket is POSIX-only, while this FFI gate also validates GetLastError on
+;; Windows. Keep the socket consumer witness on the platforms that provide it.
+(unless (eq? (sa-os-family) 'windows)
+  (ev "(require 'jolt.socket)")
+  (ok "socket recv keeps EAGAIN across an intervening errno clobber"
+      (evb "(let [server (java.net.ServerSocket. 0)
+                   client (java.net.Socket. \"127.0.0.1\" (.getLocalPort server))
+                   conn (.accept server)
+                   fd (jolt.host/ref-get conn :fd)
+                   buf (ffi/alloc 1)
+                   out (.getOutputStream client)
+                   first? (atom true)
+                   raw-recv (deref (ns-resolve 'jolt.socket 'c-recv))
+                   io-call (deref (ns-resolve 'jolt.socket 'io-call))
+                   op (fn []
+                        (let [result (raw-recv fd buf 1 0)]
+                          (when (compare-and-set! first? true false)
+                            (.write out (byte-array [65]) 0 1)
+                            (c-clobber-scalar 9))
+                          result))]
+               (try
+                 (= 1 (io-call op fd :read))
+                 (finally
+                   (ffi/free buf)
+                   (.close conn)
+                   (.close client)
+                   (.close server))))"))
+
+  (ok "socket accept keeps EAGAIN across an intervening errno clobber"
+      (evb "(let [server (java.net.ServerSocket. 0)
+                   server-fd (jolt.host/ref-get server :fd)
+                   client (atom nil)
+                   accepted-fd (atom -1)
+                   sa (ffi/alloc 16)
+                   lenp (ffi/alloc 4)
+                   first? (atom true)
+                   raw-accept (deref (ns-resolve 'jolt.socket 'c-accept))
+                   raw-close (deref (ns-resolve 'jolt.socket 'c-close))
+                   io-call (deref (ns-resolve 'jolt.socket 'io-call))
+                   op (fn []
+                        (let [result (raw-accept server-fd sa lenp)]
+                          (when (compare-and-set! first? true false)
+                            (reset! client
+                                    (java.net.Socket. \"127.0.0.1\"
+                                                      (.getLocalPort server)))
+                            (c-clobber-scalar 9))
+                          result))]
+               (try
+                 (do
+                   (ffi/write lenp :int 0 16)
+                   (reset! accepted-fd (io-call op server-fd :read))
+                   (not (neg? @accepted-fd)))
+                 (finally
+                   (when-not (neg? @accepted-fd) (raw-close @accepted-fd))
+                   (when @client (.close @client))
+                   (ffi/free sa)
+                   (ffi/free lenp)
+                   (.close server))))")))
+
 ;; --- scalar preserved: omitted / empty / legacy :blocking / false -------------
 ;; Every non-capturing form must keep the existing scalar result. This is the
 ;; backwards-compatibility floor: the option is strictly additive.
