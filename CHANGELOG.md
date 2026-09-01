@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-08-31
 
 The build keeps one toolchain end to end now. When make provisions the pinned
 Chez + xPack GCC, the standalone-binary link runs through that same provisioned
@@ -53,10 +53,22 @@ when transposed.
   constructor spelled in, and `close-arena`, `arena?`, `arena-open?` and
   `drain-auto-arenas!` are the rest of the vocabulary.
 
-  `alloc`, `string->ptr`, `clone`, `reinterpret` and `callback` all take an
-  arena in the same first position; `(alloc n)` with no arena is still the
-  caller-owned form, and the `with-alloc`/`with-out`/`with-layout`/
-  `with-c-string` helpers are unchanged.
+  `alloc`, `string->ptr`, `clone`, `reinterpret`, `segment`, `slice` and
+  `callback` all take an arena in the same first position; `(alloc n)` with no
+  arena is still the caller-owned form, and the `with-alloc`/`with-out`/
+  `with-layout`/`with-c-string` helpers are unchanged.
+
+  An arena also scopes a POINTER SIZE. A jolt pointer is a bare address and
+  carries no length, so `size` answers what jolt was told — by an arena
+  allocation, or by `segment`/`slice`/`reinterpret` — and that record is keyed
+  by address. `free` forgets the size of the pointer it releases and an arena
+  forgets its group's, because an allocator hands the same address out again and
+  a record that outlived its memory would answer a size the new block never had,
+  which `copy` and `clone` would then use as a byte count. Called WITHOUT an
+  arena, `segment`, `slice` and `reinterpret` record for the life of the
+  process: that is the form for a size declared once at startup, and the wrong
+  one in a loop, where the record both grows without bound and outlives the
+  memory it describes.
 
 - **`jolt.ffi` is now name-for-name and semantics-for-semantics compatible with
   `babashka.ffi`.** The two FFIs had the same job, the same type vocabulary and
@@ -167,6 +179,30 @@ when transposed.
   bytevector one byte longer is already zero there.
 
 ### Fixed
+
+- **The hash engine computed the wrong hashes on a 32-bit Chez (#801).**
+  `hasheq.ss` and the HAMT in `collections.ss` work in the Java int window —
+  `[0, 2^32-1]` unsigned — and applied Chez's `#3%fx` UNSAFE fixnum primitives
+  to it, on the strength of "every unsigned 32-bit value is a fixnum". That
+  holds on a 64-bit target and not on a 32-bit one, where the positive fixnum
+  ceiling is 2^29-1: an ordinary hash with bit 30 set is a bignum there, and an
+  unsafe fx op applied to a bignum does not raise — it answers nonsense. So a
+  `tpb32l` build, the threaded portable-bytecode target a WASM build goes
+  through, hashed wrongly rather than failing.
+
+  Each operator now names its wide and narrow twin through one `define-width-op`
+  form and the arm is chosen at EXPAND time, so a 64-bit build generates the
+  same `#3%fx` chain it always did — no runtime width test, no duplicated arms —
+  and a 32-bit build gets exact-integer arithmetic. `JOLT_NARROW_HASH=1` selects
+  the narrow arm on a wide machine, which is what lets `make narrowhash` run the
+  JVM-pinned hash goldens, the value-model suite and the transient HAMT suite
+  over the generic operators without 32-bit hardware.
+
+  This is the hash engine, which is the only place in the host that uses unsafe
+  fixnum primitives at all; it is not full `tpb32l` support. Other host code
+  still applies checked `fx` ops to int-width values, which raise rather than
+  corrupt. Reported and first patched by @jasalt, found bringing up a
+  WASM/Emscripten build.
 
 - **`getPosixFilePermissions` and `getOwner` refused to run on hosts whose
   layout jolt already knew.** `nio-file` reads `st_mode` and `st_uid` at offsets
