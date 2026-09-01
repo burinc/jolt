@@ -1014,13 +1014,18 @@
 ;; --- :jolt/min-version ------------------------------------------------------
 ;; A project or a library declares the oldest jolt it works on, and a runtime
 ;; below that refuses to load it rather than run it. Not every breaking change is
-;; visible at the call site — ffi/write's argument order moved, and the old and
-;; new spellings are both integers, so an older runtime writes to the wrong place
-;; and reports nothing — and a declared floor turns that into a message.
+;; visible at the call site — ffi/write's argument order moved in 0.8.0, and the
+;; old and new spellings are both integers, so an older runtime writes to the
+;; wrong place and reports nothing — and a declared floor turns the NEXT break of
+;; that shape into a message.
 ;;
-;; Honoured by the jolt that READS the key, so it protects from this release
-;; onward and not before: an older jolt ignores it, as it ignores every key it
-;; does not know. That is the reason to add it now rather than at the next break.
+;; Honoured by the jolt that READS the key, so it protects from 0.8.0 onward and
+;; not before: an older jolt ignores it, as it ignores every key it does not
+;; know. Note what that excludes — this key landed in the commit AFTER the one
+;; that moved ffi/write, so no floor catches that particular break: every runtime
+;; with the old argument order skips the key. Pinning the toolchain is the answer
+;; there. The floor is for the breaks that come after a reader exists on both
+;; sides, which is the reason to add it now rather than at the next one.
 (defn- version-parts
   "The leading numeric components of a version string, as a vector of longs.
   Tolerates a `v` prefix and reads each component's numeric PREFIX, stopping at
