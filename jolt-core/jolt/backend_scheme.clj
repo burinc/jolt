@@ -1403,9 +1403,17 @@
 ;; reuses it after (jolt-ffi-varargs-* in host/chez/java/ffi.ss, where the carrier
 ;; table and the costs are written down).
 ;;
-;; The fixed arguments stay ARGUMENTS to apply rather than being appended onto
-;; the inferred tail — the append is about as expensive as the rest of the
-;; dispatch put together.
+;; SHAPE OF THE EMITTED BINDING. A rest-argument lambda would make Chez allocate
+;; a list for the tail on every call, and the dispatcher would then walk it twice
+;; (once to key the shape, once to marshal) and spread it back with `apply` —
+;; about 18ns per tail value, which is most of what a bare marker costs. A tail
+;; of nought to three values is the whole of real usage, so those arities get
+;; their own case-lambda arms that carry the tail as ARGUMENTS: no list is built,
+;; nothing is walked, and the foreign procedure is called directly. Longer tails
+;; fall through to a rest arm that still works the general way.
+;;
+;; The arms and the general path agree on the cache key by construction — the
+;; arity-specialized lookups are the same base-3 fold, unrolled.
 (defn- emit-ffi-bare-varargs-fn [node vi]
   (let [at (:argtypes node)
         fixed (subvec at 0 vi)
@@ -1424,25 +1432,40 @@
                   (= "bool" (nth fixed i)) (str "(jolt-ffi-bool->c " param ")")
                   :else param))
               (range n) params)
+        fixed-args (if (seq native-args) (str " " (str/join " " native-args)) "")
         cache (str "(jolt-ffi-varargs-cache " (chez-str-lit (:csym node))
                    " (quote (" (str/join " " (map ffi-type->chez fixed)) ")) "
                    "(quote " (ffi-type->chez rettype) ") " n " "
                    (if capture "#t" "#f") ")")
-        call (str "(apply (jolt-ffi-varargs-procedure " cache-name " " tail-name ")"
-                  (when (seq native-args) (str " " (str/join " " native-args)))
-                  " (jolt-ffi-varargs-tail " tail-name "))")
         convert (fn [expr]
                   (cond
                     (= "string" rettype) (str "(jolt-ffi-c->string " expr ")")
                     (= "bool" rettype) (str "(jolt-ffi-c->bool " expr ")")
                     :else expr))
-        body (if capture
-               (str "(call-with-values (lambda () " call ")"
-                    " (lambda (result native-error)"
-                    " (jolt-vector " (convert "result") " native-error)))")
-               (convert call))]
+        wrap (fn [call]
+               (if capture
+                 (str "(call-with-values (lambda () " call ")"
+                      " (lambda (result native-error)"
+                      " (jolt-vector " (convert "result") " native-error)))")
+                 (convert call)))
+        ;; tail names t1..tk for the specialized arms
+        tvars (fn [k] (mapv (fn [i] (str tail-name "_" (inc i))) (range k)))
+        arm (fn [k]
+              (let [ts (tvars k)]
+                (str "((" (str/join " " (concat params ts)) ") "
+                     (wrap (str "((jolt-ffi-varargs-proc" k " " cache-name
+                                (when (seq ts) (str " " (str/join " " ts))) ")"
+                                fixed-args
+                                (str/join "" (map (fn [t] (str " (jolt-ffi-varargs-arg " t ")")) ts))
+                                ")"))
+                     ")")))
+        rest-arm (str "((" (str/join " " params) " . " tail-name ") "
+                      (wrap (str "(apply (jolt-ffi-varargs-procedure " cache-name " " tail-name ")"
+                                 fixed-args
+                                 " (jolt-ffi-varargs-tail " tail-name "))"))
+                      ")")]
     (str "(let ((" cache-name " " cache ")) "
-         "(lambda (" (str/join " " params) " . " tail-name ") " body "))")))
+         "(case-lambda " (str/join " " (map arm (range 4))) " " rest-arm "))")))
 
 (defn- emit-ffi-fn [node]
   ;; A "varargs" marker in the argtype vector declares the binding variadic and
@@ -1566,22 +1589,25 @@
                              "sa-foreign-procedure-blocking "
                              "sa-foreign-procedure ")
                       conv " " csym signature ")"))
-            ;; Preserve the historical global-only path for scalar varargs. A
-            ;; fixed aggregate before :varargs needs scoped lookup because it can
-            ;; only come from a named native library; that address+convention form
-            ;; is covered by the aggregate C witness on each target ABI.
-            scoped (if (and vi (empty? aggregates))
-                     "#f"
-                     (str "(let ((a (jolt-ffi-dlsym-native " csym "))) "
-                          "(and a "
-                          (if capture
-                            (str "(jolt-ffi-native-error-procedure (" capture-conv ") a"
-                                 signature ")")
-                            (str "(foreign-procedure"
-                                 (when (:blocking node) " __collect_safe")
-                                 (when vi conv)
-                                 " a" signature ")"))
-                          "))"))
+            ;; Resolution order is the same for every binding, variadic or not:
+            ;; a declared :jolt/native's own dlopen handle first, the
+            ;; process-global table second. A scalar-varargs binding used to skip
+            ;; the scoped branch, which meant a variadic symbol in a library
+            ;; loaded with load-library could not be bound AT ALL -- RTLD_LOCAL
+            ;; keeps it out of the global table, so the name found nothing and
+            ;; the call raised "no entry". curl_easy_setopt is that case. The
+            ;; address+convention form this emits is the one the aggregate C
+            ;; witness already covers on each target ABI.
+            scoped (str "(let ((a (jolt-ffi-dlsym-native " csym "))) "
+                        "(and a "
+                        (if capture
+                          (str "(jolt-ffi-native-error-procedure (" capture-conv ") a"
+                               signature ")")
+                          (str "(foreign-procedure"
+                               (when (:blocking node) " __collect_safe")
+                               (when vi conv)
+                               " a" signature ")"))
+                        "))")
             proc (str "(or p (begin (set! p (or " scoped " " fp ")) p))")
             call-args (if ret-aggregate? (into [native-destination] native-args) native-args)
             call (str "(" proc

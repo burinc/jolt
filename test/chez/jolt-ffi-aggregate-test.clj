@@ -33,6 +33,16 @@
                   [[:by-value [:struct [[:year :int32] [:month :uint8] [:day :uint8]]]]
                    :int :varargs :int :int]
                   :int64))
+;; A scalar variadic in the SAME scoped library. Both marker forms must reach it:
+;; a declared :jolt/native is dlopen'd RTLD_LOCAL, so its symbols are not in the
+;; process-global table, and a variadic binding that resolved by name only could
+;; not bind one at all (it raised "no entry"). Declared before the load, like the
+;; rest, so lazy scoped resolution is what answers.
+(def sum-declared
+  (ffi/foreign-fn "jolt_agg_sum_varargs" [:int :& :int64 :int64] :int64))
+(def sum-bare
+  (ffi/foreign-fn "jolt_agg_sum_varargs" [:int :&] :int64))
+
 (def packet-score
   (ffi/foreign-fn "jolt_agg_packet_score"
                   [[:by-value [:struct [[:tag :uint8]
@@ -109,6 +119,16 @@
        (rejects? #(date-score ffi/null)))
 (check "public null destination rejects"
        (rejects? #(make-date ffi/null 2026 7 23)))
+;; The regression: a SCALAR variadic in a scoped library, both marker forms.
+(check "declared tail resolves through the scoped handle"
+       (= 30 (sum-declared 2 10 20)))
+(check "bare marker resolves through the scoped handle"
+       (= 30 (sum-bare 2 10 20)))
+(check "bare marker, a different tail shape off the same scoped binding"
+       (= 60 (sum-bare 3 10 20 30)))
+(check "bare marker, empty tail through a scoped handle"
+       (= 0 (sum-bare 0)))
+
 (check "public aggregate callback rejects"
        (rejects?
         #(eval '(ffi/foreign-callable identity

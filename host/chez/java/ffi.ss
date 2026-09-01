@@ -711,23 +711,46 @@
 ;; C strings. A tail of length k has 3^k shapes — too many to emit eagerly, few
 ;; enough that a program hits one or two.
 ;;
-;; COST. Compiling one shape takes about a millisecond, once per shape per
-;; binding. After that a call walks the tail once and does an assv over a list
-;; that is almost always one entry: about 11ns over a declared-tail binding,
-;; which is the "roughly twice as fast" babashka.ffi's own guide gives for
-;; declaring the tail. An alist beats a hashtable at one to three entries, and
-;; the fixed arguments stay separate arguments to `apply` rather than being
-;; appended onto the tail, which costs another 13ns. INTERPRETING the form
-;; instead of compiling it builds 2.5x faster and then calls 3x slower, on every
-;; call for the life of the process, so this compiles.
+;; COST, measured end to end from jolt against a do-nothing C variadic on Chez
+;; 10.4.1 (a fixed binding to the same callee is 20ns, a declared tail 20.4ns):
 ;;
-;; Resolution is by SYMBOL NAME, through the process-global table, exactly as the
-;; declared-tail :& path resolves — a scoped :jolt/native handle is not searched
-;; by either spelling of the marker, so both behave the same way.
+;;     bare, no tail        26.5ns        bare, one-value tail   34ns
+;;     bare, two-value tail 41.5ns        compile, per shape     ~0.8ms once
+;;
+;; So a bare marker costs about +13ns and 1.6x a declared tail, against the
+;; "roughly twice as fast" babashka.ffi's own guide gives for declaring one.
+;; Getting there took three things, each measured rather than assumed:
+;;
+;;   - COMPILE the form, do not interpret it. Interpreting builds 2.5x faster
+;;     (0.32ms) and then calls 3x SLOWER for the life of the process (22.9
+;;     against 6.9ns at the raw Chez level).
+;;   - Let the emitted binding be a case-lambda with arity-specialized arms
+;;     rather than a rest-argument lambda, so a short tail allocates no list,
+;;     is not walked twice, and is not spread back with `apply`. Worth 12ns of
+;;     the 36ns a rest lambda cost.
+;;   - Test for a fixnum FIRST in the carrier and the marshaller, and scan the
+;;     cache with eq? over fixnum keys instead of assv. Worth another 10ns.
+;;
+;; An alist beats a hashtable at the one to three entries a binding really has
+;; (8.2 against 11.5ns), and the one-entry inline cache in front of it answers
+;; the monomorphic case without walking at all.
+;;
+;; Resolution is a declared :jolt/native's own dlopen handle first and the
+;; process-global table second, which is what every other binding does and what
+;; both spellings of the marker now do.
 
-;; #(name fixed-types ret-type fixed-count capture? entries mutex)
+;; #(name fixed-types ret-type fixed-count capture? entries mutex last)
+;;
+;; `last` is a one-entry inline cache: the (key . proc) pair the previous call
+;; used. Almost every binding is monomorphic — one call site, one tail shape —
+;; so this answers before the list is walked at all. It holds the PAIR in a
+;; single slot rather than a key and a procedure in two: two slots could be read
+;; torn under concurrency, pairing one shape's key with another shape's
+;; procedure, and calling a foreign procedure with the wrong argument types
+;; corrupts memory rather than raising. One slot is one word, so a reader sees
+;; either the old pair or the new one.
 (define (jolt-ffi-varargs-cache name fixed-types ret-type fixed-count capture?)
-  (vector name fixed-types ret-type fixed-count capture? '() (make-mutex)))
+  (vector name fixed-types ret-type fixed-count capture? '() (make-mutex) #f))
 (define (ffi-vc-name vc)        (vector-ref vc 0))
 (define (ffi-vc-fixed-types vc) (vector-ref vc 1))
 (define (ffi-vc-ret vc)         (vector-ref vc 2))
@@ -736,12 +759,17 @@
 (define (ffi-vc-entries vc)     (vector-ref vc 5))
 (define (ffi-vc-entries! vc e)  (vector-set! vc 5 e))
 (define (ffi-vc-mutex vc)       (vector-ref vc 6))
+(define (ffi-vc-last vc)        (vector-ref vc 7))
+(define (ffi-vc-last! vc e)     (vector-set! vc 7 e))
 
 ;; The carrier a tail value travels in, as a small integer: 0 = 64-bit integer,
 ;; 1 = double, 2 = C string. `integer?` is true of 3.0, so the flonum test comes
 ;; first; an exact non-integer is a ratio, which promotes to double.
 (define (ffi-varargs-carrier v)
   (cond
+    ;; A fixnum is the overwhelmingly common tail value (a flag, a mode, an
+    ;; ioctl request), so it answers on the first test rather than the fourth.
+    ((fixnum? v) 0)
     ((flonum? v) 1)
     ((string? v) 2)
     ((number? v) (if (and (exact? v) (integer? v)) 0 1))
@@ -780,6 +808,11 @@
 
 (define (ffi-varargs-marshal v)
   (cond
+    ;; Same ordering as the carrier: the values that need no conversion at all
+    ;; are the common ones, and they answer first.
+    ((fixnum? v) v)
+    ((flonum? v) v)
+    ((string? v) v)
     ((jolt-nil? v) 0)
     ((eq? v #t) 1)
     ((eq? v #f) 0)
@@ -795,6 +828,10 @@
     (else (cons (ffi-varargs-marshal (car tail))
                 (jolt-ffi-varargs-tail (cdr tail))))))
 
+;; One tail value, for the arity-specialized arms below, which hand their values
+;; over as ARGUMENTS and so never build a list to walk.
+(define (jolt-ffi-varargs-arg v) (ffi-varargs-marshal v))
+
 ;; Windows x64 passes named and variadic arguments alike, and its runtime
 ;; (eval) construction has no slot for a convention — the same reason
 ;; jolt-foreign-proc-safe drops it there.
@@ -808,29 +845,91 @@
   (if (eq? (sa-os-family) 'windows) '(__get_last_error) '(__errno)))
 
 (define (ffi-varargs-compile vc shape-types)
-  (eval (append (list 'foreign-procedure)
-                (if (ffi-vc-capture? vc) (ffi-varargs-error-convention) '())
-                (ffi-varargs-convention (ffi-vc-fixed-count vc))
-                (list (ffi-vc-name vc)
-                      (append (ffi-vc-fixed-types vc) shape-types)
-                      (ffi-vc-ret vc)))))
+  (let ((name (ffi-vc-name vc)))
+    (eval (append (list 'foreign-procedure)
+                  (if (ffi-vc-capture? vc) (ffi-varargs-error-convention) '())
+                  (ffi-varargs-convention (ffi-vc-fixed-count vc))
+                  (list
+                   ;; A declared :jolt/native is dlopen'd RTLD_LOCAL, so its
+                   ;; symbols are NOT in the process-global table a name
+                   ;; resolves through -- build against the address its own
+                   ;; handle answers when there is one, exactly as every
+                   ;; non-variadic binding does, and fall back to the name.
+                   (or (jolt-ffi-dlsym-native name) name)
+                   (append (ffi-vc-fixed-types vc) shape-types)
+                   (ffi-vc-ret vc))))))
 
 ;; Reads are unlocked: entries is one variable holding an immutable alist, so a
 ;; reader sees either the old list or the new one. The COMPILE is serialized and
 ;; re-checks the cache under the lock, so two threads meeting the same new shape
 ;; compile it once instead of racing to drop one of the two entries.
+(define (ffi-varargs-hit vc key)
+  (let ((e (assv key (ffi-vc-entries vc)))) (and e (cdr e))))
+
+;; The specialized arms key on a small fixnum (53 is the largest a three-value
+;; tail can fold to), so their scan compares with eq? and open-codes the walk
+;; instead of paying assv's eqv? per entry. A bignum key from the general arm
+;; can sit in the same list and is simply never eq? to one of these, which is
+;; the right answer: the shapes differ.
+(define (ffi-varargs-hit-fx vc key)
+  (let ((last (ffi-vc-last vc)))
+    (if (and last (eq? (car last) key))
+        (cdr last)
+        (let loop ((e (ffi-vc-entries vc)))
+          (cond ((null? e) #f)
+                ((eq? (caar e) key)
+                 (let ((entry (car e))) (ffi-vc-last! vc entry) (cdr entry)))
+                (else (loop (cdr e))))))))
+
+(define (ffi-varargs-miss vc key shape-types)
+  (jolt-with-mutex (ffi-vc-mutex vc)
+    (let ((again (assv key (ffi-vc-entries vc))))
+      (if again
+          (cdr again)
+          (let ((proc (ffi-varargs-compile vc shape-types)))
+            (ffi-vc-entries! vc (cons (cons key proc) (ffi-vc-entries vc)))
+            proc)))))
+
+;; The general arm: a tail of any length, arriving as a list.
 (define (jolt-ffi-varargs-procedure vc tail)
-  (let* ((key (ffi-varargs-shape-key tail))
-         (hit (assv key (ffi-vc-entries vc))))
-    (if hit
-        (cdr hit)
-        (jolt-with-mutex (ffi-vc-mutex vc)
-          (let ((again (assv key (ffi-vc-entries vc))))
-            (if again
-                (cdr again)
-                (let ((proc (ffi-varargs-compile vc (ffi-varargs-shape-types tail))))
-                  (ffi-vc-entries! vc (cons (cons key proc) (ffi-vc-entries vc)))
-                  proc)))))))
+  (let ((key (ffi-varargs-shape-key tail)))
+    (or (ffi-varargs-hit vc key)
+        (ffi-varargs-miss vc key (ffi-varargs-shape-types tail)))))
+
+;; --- the arity-specialized lookups -------------------------------------------
+;; A tail of nought to three values is the whole of real usage — open(2) takes
+;; one, an ioctl one, a printf-alike a handful — and for those the emitted
+;; binding is a case-lambda whose arms take the tail as ARGUMENTS. That removes,
+;; per call, the rest-argument list Chez would otherwise allocate, the two walks
+;; over it (one to key the shape, one to marshal), and the `apply`. These are the
+;; matching lookups: the same base-3 fold as ffi-varargs-shape-key, unrolled, so
+;; an arm and the general path agree on the key for the same shape.
+(define (jolt-ffi-varargs-proc0 vc)
+  (or (ffi-varargs-hit-fx vc 1) (ffi-varargs-miss vc 1 '())))
+
+(define (jolt-ffi-varargs-proc1 vc t1)
+  (let* ((c1 (ffi-varargs-carrier t1))
+         (key (fx+ 3 c1)))
+    (or (ffi-varargs-hit-fx vc key)
+        (ffi-varargs-miss vc key (list (ffi-varargs-carrier-type c1))))))
+
+(define (jolt-ffi-varargs-proc2 vc t1 t2)
+  (let* ((c1 (ffi-varargs-carrier t1))
+         (c2 (ffi-varargs-carrier t2))
+         (key (fx+ (fx+ 9 (fx* 3 c1)) c2)))
+    (or (ffi-varargs-hit-fx vc key)
+        (ffi-varargs-miss vc key (list (ffi-varargs-carrier-type c1)
+                                       (ffi-varargs-carrier-type c2))))))
+
+(define (jolt-ffi-varargs-proc3 vc t1 t2 t3)
+  (let* ((c1 (ffi-varargs-carrier t1))
+         (c2 (ffi-varargs-carrier t2))
+         (c3 (ffi-varargs-carrier t3))
+         (key (fx+ (fx+ (fx+ 27 (fx* 9 c1)) (fx* 3 c2)) c3)))
+    (or (ffi-varargs-hit-fx vc key)
+        (ffi-varargs-miss vc key (list (ffi-varargs-carrier-type c1)
+                                       (ffi-varargs-carrier-type c2)
+                                       (ffi-varargs-carrier-type c3))))))
 
 ;; --- a java.nio.ByteBuffer over foreign memory -------------------------------
 ;; jolt.ffi/byte-buffer answers a DIRECT java.nio.ByteBuffer view of `n` bytes at

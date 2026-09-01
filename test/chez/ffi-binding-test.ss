@@ -173,6 +173,17 @@
 (ok "bare :& carrier — string"            (equal? "hi" (fmt "(c-snprintf b 128 \"%s\" \"hi\")")))
 (ok "bare :& carrier — boolean and nil"   (equal? "1 0 0" (fmt "(c-snprintf b 128 \"%d %d %d\" true false nil)")))
 (ok "bare :& — mixed three-value tail"    (equal? "a 1 2.0" (fmt "(c-snprintf b 128 \"%s %d %.1f\" \"a\" 1 2.0)")))
+;; Tails of nought to three are arity-specialized case-lambda arms that carry
+;; the values as arguments; a LONGER tail falls through to the rest arm, which
+;; keys and marshals the list the general way. Both must agree, so the boundary
+;; is covered on either side.
+(ok "bare :& — four-value tail (the rest arm)"
+    (equal? "1 2 3 4" (fmt "(c-snprintf b 128 \"%d %d %d %d\" 1 2 3 4)")))
+(ok "bare :& — six-value mixed tail (the rest arm)"
+    (equal? "1 a 2.5 2 b 3.5"
+            (fmt "(c-snprintf b 128 \"%d %s %.1f %d %s %.1f\" 1 \"a\" 2.5 2 \"b\" 3.5)")))
+(ok "bare :& — the rest arm marshals booleans and nil too"
+    (equal? "1 0 0 7" (fmt "(c-snprintf b 128 \"%d %d %d %d\" true false nil 7)")))
 ;; The cache is keyed on the SHAPE, so the same binding serves a second shape
 ;; and then answers both from the cache.
 (ok "bare :& — one binding, two shapes, then reuse"

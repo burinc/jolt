@@ -36,13 +36,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NUL-terminated C string. A tail value in none of them raises at the call
   naming the three, rather than reaching C as whatever it happened to be.
 
-  The cost is a compile (about a millisecond) on the first call of each shape,
-  and after that a walk of the tail plus a lookup over a list that is almost
-  always one entry — roughly twice the per-call cost of a declared tail, which
-  is the same ratio babashka.ffi's own guide gives. Declare the tail where it
-  does not vary. The bare form does not combine with `:blocking` (neither form
-  does) or with a by-value aggregate argument, whose ftype the runtime path has
-  no way to declare; `:capture-native-error` composes with both forms.
+  The cost is a compile — about 0.8ms — on the first call of each shape, and a
+  cache lookup on every call after. Measured end to end from jolt against a
+  do-nothing C variadic on Chez 10.4.1, where a fixed binding to the same callee
+  is 20ns and a declared tail 20.4ns:
+
+  | tail | per call |
+  |---|---|
+  | none | 26.5 ns |
+  | one value | 34 ns |
+  | two values | 41.5 ns |
+
+  So roughly +13ns and 1.6x a declared tail, against the "roughly twice as fast"
+  babashka.ffi's own guide gives for declaring one. Declare the tail where it
+  does not vary. Three things got it there, each measured rather than assumed:
+  the form is COMPILED, not interpreted (interpreting builds 2.5x faster and
+  then calls 3x slower forever); the emitted binding is a `case-lambda` with
+  arity-specialized arms for tails of nought to three, so a short tail allocates
+  no rest list, is not walked twice and is not spread back with `apply` (12ns);
+  and the carrier, the marshaller and the cache scan all test for a fixnum first
+  (10ns). The bare form does not combine with `:blocking` (neither form does) or
+  with a by-value aggregate argument, whose ftype the runtime path has no way to
+  declare; `:capture-native-error` composes with both forms.
+
+- **A variadic binding reaches a scoped library's symbols (#803).** A declared
+  `:jolt/native` is `dlopen`'d `RTLD_LOCAL`, so its symbols are not in the
+  process-global table that a bare symbol name resolves through. Every binding
+  therefore tries the library's own handle first — except a scalar-variadic one,
+  which skipped that branch and resolved by name only. The effect was that a
+  variadic function in a library loaded with `load-library` could not be bound
+  **at all**: the name found nothing and the first call raised
+  `no entry for "..."`. `curl_easy_setopt` is that case, and so is every
+  `ioctl`-alike a wrapped library exports. Both spellings of `:&` now resolve the
+  way the rest of the FFI does. libc is unaffected — nothing declares those
+  symbols, so they still come from the global table.
 
 - **`[:union …]` in a layout (#803).** A union goes anywhere a nested struct
   does, is as large as its largest member and aligned to its strictest, and gets
