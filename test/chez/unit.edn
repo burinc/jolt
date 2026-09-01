@@ -1673,6 +1673,20 @@
   {:suite "atomics" :label "swap-vals! on nil is a NullPointerException" :expected "\"java.lang.NullPointerException\"" :expr "(try (swap-vals! nil inc) (catch Throwable e (.getName (class e))))"}
   {:suite "atomics" :label "reset-vals! on nil is a NullPointerException" :expected "\"java.lang.NullPointerException\"" :expr "(try (reset-vals! nil 1) (catch Throwable e (.getName (class e))))"}
   {:suite "atomics" :label "CAS-retry increments across futures lose no updates (atomic native)" :expected "\"true\"" :expr "(do (let [a (atom 0) done (atom 0) n 4 per 2000 target (* n per)] (dotimes [_ n] (future (dotimes [_ per] (loop [] (let [cur (deref a)] (when-not (compare-and-set! a cur (inc cur)) (recur))))) (swap! done inc))) (loop [w 0] (cond (== (deref done) n) :fin (> w 1000000) :timeout :else (do (Thread/yield) (recur (inc w))))) (str (== (deref a) target))))"}
+  {:suite "atomics" :label "AtomicInteger constructors preserve valid primitive values" :expected "[0 7]" :expr "[(.get (AtomicInteger.)) (.get (AtomicInteger. 7))]"}
+  {:suite "atomics" :label "AtomicLong constructors preserve valid primitive values" :expected "[0 9]" :expr "[(.get (AtomicLong.)) (.get (AtomicLong. 9))]"}
+  {:suite "atomics" :label "AtomicInteger constructor rejects an out-of-range value" :expected :throws :expr "(AtomicInteger. 2147483648)"}
+  {:suite "atomics" :label "AtomicInteger addAndGet wraps signed overflow" :expected "-2147483648" :expr "(.addAndGet (AtomicInteger. 2147483647) 1)"}
+  {:suite "atomics" :label "AtomicInteger decrementAndGet wraps signed underflow" :expected "2147483647" :expr "(.decrementAndGet (AtomicInteger. -2147483648))"}
+  {:suite "atomics" :label "AtomicLong addAndGet wraps signed overflow" :expected "-9223372036854775808" :expr "(.addAndGet (AtomicLong. 9223372036854775807) 1)"}
+  {:suite "atomics" :label "AtomicLong decrementAndGet wraps signed underflow" :expected "9223372036854775807" :expr "(.decrementAndGet (AtomicLong. -9223372036854775808))"}
+  {:suite "atomics" :label "AtomicLong getAndAdd returns old and stores wrapped result" :expected "[9223372036854775807 -9223372036854775808]" :expr "(let [a (AtomicLong. 9223372036854775807)] [(.getAndAdd a 1) (.get a)])"}
+  {:suite "atomics" :label "AtomicLong intValue narrows to signed 32 bits" :expected "[1 -2147483648 2147483647 7]" :expr "[(.intValue (AtomicLong. 4294967297)) (.intValue (AtomicLong. 2147483648)) (.intValue (AtomicLong. -2147483649)) (.intValue (AtomicInteger. 7))]"}
+  {:suite "atomics" :label "AtomicInteger getAndSet validates before mutation" :expected "[:threw 7]" :expr "(let [a (AtomicInteger. 7)] [(try (.getAndSet a 2147483648) :no-throw (catch ArithmeticException _ :threw)) (.get a)])"}
+  {:suite "atomics" :label "AtomicInteger compareAndSet validates next before mutation" :expected "[:threw 7]" :expr "(let [a (AtomicInteger. 7)] [(try (.compareAndSet a 7 2147483648) :no-throw (catch ArithmeticException _ :threw)) (.get a)])"}
+  {:suite "atomics" :label "AtomicInteger compareAndSet validates expected before mutation" :expected "[:threw 7]" :expr "(let [a (AtomicInteger. 7)] [(try (.compareAndSet a 2147483648 8) :no-throw (catch ArithmeticException _ :threw)) (.get a)])"}
+  {:suite "atomics" :label "AtomicReference compareAndSet rejects equal distinct expectations" :expected "[false true]" :expr "(let [v (list 1) a (AtomicReference. v)] [(.compareAndSet a (list 1) :bad) (identical? v (.get a))])"}
+  {:suite "atomics" :label "AtomicReference compareAndSet accepts the same expectation" :expected "[true :ok]" :expr "(let [v (list 1) a (AtomicReference. v)] [(.compareAndSet a v :ok) (.get a)])"}
   ;; shadow-emitted (compiler-review R2 stage 1). Each row binds a local whose
   ;; name is a bare Scheme head the back end emits, in the scope of a construct
   ;; that emits that head, so the local would shadow the emitted form. Pre-remint
