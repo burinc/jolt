@@ -1248,6 +1248,21 @@
   ;; threads on demand, so getPoolSize there is 0 until the first task. Which is
   ;; why this is a host unit case and not a corpus row.
   {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 3)] (Thread/sleep 300) [(.getPoolSize ex) (.getCorePoolSize ex) (.getMaximumPoolSize ex)])" :expected "[3 3 3]"}
+  ;; SHUTDOWN, the three spellings, each of which was quietly not doing what its
+  ;; name says. All four expected values are reference JVM Clojure's, read off the
+  ;; same expressions on Java 21.
+  ;;
+  ;; A submit after shutdown is REJECTED rather than queued-and-abandoned.
+  {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor)] (.shutdown ex) (try (.submit ex (fn [] 1)) :no-throw (catch java.util.concurrent.RejectedExecutionException e :rejected)))" :expected ":rejected"}
+  ;; and so is an execute, catchable as the RuntimeException it is on the JVM
+  {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool)] (.shutdown ex) (try (.execute ex (fn [] 1)) :no-throw (catch RuntimeException e :rejected)))" :expected ":rejected"}
+  ;; close BLOCKS until the work is done, which is what makes it usable as the
+  ;; closing half of with-open
+  {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) done (atom nil)] (.execute ex (fn [] (Thread/sleep 300) (reset! done :ran))) (.close ex) [@done (.isTerminated ex)])" :expected "[:ran true]"}
+  ;; shutdownNow DROPS what is queued and hands it back, instead of answering an
+  ;; empty list and running it all anyway. The first task is known to be running
+  ;; before the five are queued, so the count is not a race.
+  {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) started (promise) go (promise) ran (atom 0)] (.execute ex (fn [] (deliver started true) (deref go 5000 :timeout))) (deref started 5000 :timeout) (dotimes [_ 5] (.execute ex (fn [] (swap! ran inc)))) (let [returned (.shutdownNow ex)] (deliver go true) [(count returned) @ran (.awaitTermination ex 10 java.util.concurrent.TimeUnit/SECONDS)]))" :expected "[5 0 true]"}
   {:suite "telemetry" :expr "(clojure.string/starts-with? (jolt.host/scheme-version) \"Chez Scheme\")" :expected "true"}
   {:suite "telemetry" :expr "(let [m (jolt.host/machine-type)] [(string? m) (pos? (count m))])" :expected "[true true]"}
   ;; bytes-allocated reads the LIVE heap, so it only has to grow across an
