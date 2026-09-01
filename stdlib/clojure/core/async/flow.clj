@@ -7,9 +7,10 @@
 ;;   You must not remove this notice, or any other, from this software.
 
 ;; Upstream core.async's flow library, carried UNMODIFIED — this file and its
-;; three siblings (flow/spi.clj, flow/impl.clj, flow/impl/graph.clj) are byte-for-
-;; byte the sources from the dev-flow-alpha branch (42dbd51, 2026-06-12), which is
-;; where flow lives; it was removed from core.async master in c63dfee. Keeping
+;; three siblings (flow/spi.clj, flow/impl.clj, flow/impl/graph.clj) are the
+;; sources from the dev-flow-alpha branch (42dbd51, 2026-06-12), which is where
+;; flow lives; it was removed from core.async master in c63dfee. The siblings are
+;; byte for byte, and so is this file apart from this header comment. Keeping
 ;; them verbatim is the point: flow tracks upstream rather than being reimplemented
 ;; here, and upstream's own flow_test.clj is part of the gate (test/chez/flow-test.clj).
 ;;

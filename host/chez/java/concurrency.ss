@@ -126,6 +126,17 @@
            (jolt-cv-wake! (jolt-future-cv f))))))
     f))
 
+;; Wrap a task's captured throw in an ExecutionException, the original as the
+;; cause so ex-cause and .getCause both reach it. One helper for every place a
+;; task's throw surfaces — a clojure `future`'s deref just below, and the .get of
+;; either Future shim (the ExecutorService's and FutureTask's, further down) —
+;; because the JVM makes a caller catch ExecutionException at all of them.
+(define (task-execution-exception e)
+  (let ((cause (jolt-unwrap-throw e)))
+    (jolt-host-throwable "java.util.concurrent.ExecutionException"
+                         (jolt-str-render-one cause)
+                         cause)))
+
 ;; Final value of a settled future (called OUTSIDE the lock): wrap a captured
 ;; throw in an ExecutionException (JVM semantics), signal a cancellation, else
 ;; the value. The original exception is stored as the cause so ex-cause works.
@@ -139,10 +150,7 @@
      (jolt-throw (jolt-host-throwable "java.util.concurrent.CancellationException"
                                       "Future cancelled")))
     ((jolt-future-ok? f) (jolt-future-payload f))
-    (else (let ((cause (jolt-unwrap-throw (jolt-future-payload f))))
-            (jolt-throw (jolt-host-throwable "java.util.concurrent.ExecutionException"
-                          (jolt-str-render-one cause)
-                          cause))))))
+    (else (jolt-throw (task-execution-exception (jolt-future-payload f))))))
 
 ;; jolt-cv-wait and not a bare condition-wait, here and at every other wait in this
 ;; file: @a-future from a go block used to block the fiber's CARRIER, so every other
@@ -1509,15 +1517,8 @@
 ;; Future.get reports a task's throw as an ExecutionException wrapping it, on the
 ;; JVM and here — the raw throw used to come straight back out, so a caller
 ;; catching ExecutionException (what the JVM makes them catch) caught nothing and
-;; .getCause had nothing to read. The original is the cause, so ex-cause and
-;; .getCause both reach it. This is the same wrap jolt-future-finish does for a
-;; clojure `future`; the two now agree.
-(define (task-execution-exception e)
-  (let ((cause (jolt-unwrap-throw e)))
-    (jolt-host-throwable "java.util.concurrent.ExecutionException"
-                         (jolt-str-render-one cause)
-                         cause)))
-
+;; .getCause had nothing to read. task-execution-exception (above) is the wrap,
+;; the same one a clojure `future` already did on deref; the two now agree.
 ;; j-future state: #(done? result error mutex condition)
 (define (make-j-future) (make-jhost "j-future" (vector #f jolt-nil #f (make-mutex) (make-condition))))
 (define (j-future-complete! self thunk)
