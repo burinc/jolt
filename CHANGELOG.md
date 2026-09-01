@@ -204,6 +204,12 @@ when transposed.
   corrupt. Reported and first patched by @jasalt, found bringing up a
   WASM/Emscripten build.
 
+- **Modeled atomic classes used Clojure value equality and unbounded
+  arithmetic.** `AtomicReference.compareAndSet` now compares object identity,
+  while `AtomicInteger` and `AtomicLong` validate primitive arguments and wrap
+  arithmetic at their signed 32- and 64-bit widths, and `AtomicLong.intValue`
+  narrows to a signed 32-bit result, matching the JVM.
+
 - **Namespaced-map prefixes could absorb separator text into a silent wrong
   namespace or accept an invalid namespace.** The reader now requires an
   explicit namespace to be a simple unqualified symbol, stops at the token
