@@ -27,10 +27,11 @@
              not a pool because a flow process's task is its whole lifetime —
              pooling buys no reuse, while a bounded pool silently strands every
              process past the worker count.
-    :compute a pooled executor. Unlike the other two this runs one SHORT task per
+    :compute a cached pool. Unlike the other two this runs one SHORT task per
              message (flow futurizes a :compute step per call and waits on it), so
-             thread reuse is the whole point and bounded parallelism is right for
-             CPU-bound work."
+             thread reuse is the whole point: a stream of :compute calls is served
+             by the handful of workers that keep up with it, and a burst grows the
+             pool rather than queueing behind a fixed ceiling."
   (:require [clojure.core.async :as async])
   (:import [java.util.concurrent Executors Executor]))
 
@@ -48,8 +49,9 @@
     (execute [_ r]
       (.start (Thread. r (str "async-mixed-" (swap! thread-counter inc)))))))
 
-;; Lazy: constructing a pool forks its workers, and merely loading this namespace
-;; must not cost a thread.
+;; Lazy: a flow that never runs a :compute step never builds the pool. (A cached
+;; pool forks no worker until a task arrives, so this no longer costs a thread at
+;; load either way.)
 (def ^:private compute-executor (delay (Executors/newCachedThreadPool)))
 
 (defn executor-for
