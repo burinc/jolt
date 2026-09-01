@@ -52,14 +52,41 @@
 
   LAYOUTS. (layout [:struct [[field type] ...]]) compiles a literal descriptor
   to ABI layout data. Fields may use [:array element-type positive-count];
-  arrays may hold fixed-size scalars, nested structs, or other fixed arrays.
-  read and write take a compiled layout where they take a type: a struct reads
-  as a MAP of its fields and writes from one, an array reads as a VECTOR and
-  writes from any sequence of the declared length. field-offset, read-field and
-  write-field reach one member by path, and integer components address array
+  arrays may hold fixed-size scalars, nested structs or unions, or other fixed
+  arrays. read and write take a compiled layout where they take a type: a struct
+  reads as a MAP of its fields and writes from one, an array reads as a VECTOR
+  and writes from any sequence of the declared length. field-offset, read-field
+  and write-field reach one member by path, and integer components address array
   elements: [:params 3], [:events 1 :frame], [:matrix 1 2]. `place` resolves one
   such path ONCE into a value read and write accept where they take a type, for
   a member read in a loop.
+
+  UNIONS. [:union [[field type] ...]] anywhere a nested struct goes. A union is
+  as large as its largest member and aligned to its strictest, so a struct that
+  holds one gets the offsets the compiler gives it:
+
+      (def curl-msg
+        (layout [:struct [[:msg :int]
+                          [:easy :pointer]
+                          [:data [:union [[:whatever :pointer] [:result :int]]]]]]))
+
+  A union carries no tag of its own — in C the program knows which member is
+  live, from a sibling field (CURLMsg) or from what it stored (epoll_data_t). So
+  `read` answers a union as a POINTER to its bytes and the caller reads the
+  member that applies, either through a `place` at its path or with a type of its
+  own, every member starting at offset 0:
+
+      (def msg-kind (place curl-msg :msg))
+      (def msg-result (place curl-msg [:data :result]))
+      (when (= (read p msg-kind) CURLMSG_DONE) (read p msg-result))
+
+  That pointer carries no RECORDED size (see `size`): reinterpret it where copy
+  or clone needs one. `write` names the member, as a pair —
+  (write p curl-msg {:msg 1 :easy nil :data [:result 0]}) — since the members
+  overlap and writing them all would leave only the last. A union is not passed
+  BY VALUE in a signature, alone or inside a struct: which member is live is the
+  program's knowledge rather than the type's, and the register classification
+  differs by which one it is. Declare :pointer and read the member from memory.
 
   TWO LIBRARIES, ONE COPY. A declared :jolt/native is dlopen'd RTLD_LOCAL, so
   its symbols reach its own defcfns and nobody else's. That is fine for a
@@ -123,6 +150,12 @@
   knows fills one buffer instead of regrowing an accumulator per chunk. All of
   them move the block in one copy, not a byte at a time.
 
+  Those four COPY. byte-buffer does not: it answers a direct
+  java.nio.ByteBuffer sharing the pointer's bytes, so a decoder that speaks
+  ByteBuffer reads foreign memory in place and a put through the buffer is a
+  write to the pointer. It keeps nothing alive — using one after the memory is
+  released reads freed memory.
+
   string->ptr and ptr->string round-trip nil: nil answers NULL and allocates
   nothing, NULL reads back as nil, and \"\" still allocates its NUL byte and
   still reads back as \"\" — so an absent string stays distinguishable from a
@@ -161,8 +194,9 @@
   read/write (INCLUDING the argument order — the offset is last), sizeof,
   alignof, place, copy, clone, size, address, segment, slice, reinterpret,
   pointer?, null, null?, ptr->string, string->ptr, read-array, write-array,
-  find-symbol, load-library, load-system-library, cfn, defcfn, callback, and the
-  type keywords with :bool included.
+  find-symbol, load-library, load-system-library, cfn, defcfn, callback,
+  byte-buffer, both forms of the :& variadic marker, [:union ...] layouts, and
+  the type keywords with :bool included.
 
   Where the two differ, they differ because the substrate does:
 
@@ -179,29 +213,63 @@
       silently searching everything — jolt already resolves a declared native's
       symbols through its own handle (see TWO LIBRARIES above).
     - `callback` is likewise a macro, and takes jolt's :collect-safe option.
-    - :& declares a variadic C function, as it does in babashka.ffi, and :varargs
-      is jolt's older spelling of the same marker. The types after it are the
-      tail this binding passes. babashka.ffi's BARE :& — no types after it, each
-      call inferring its own tail from the values — is not available: a
-      foreign-procedure's types are fixed when it is compiled, and a call has
-      nothing to compile a new one from. Bind one signature per tail shape; a
-      bare marker raises and says so.
+    - A bare :& costs a compile on the first call of each distinct tail shape.
+      Both of babashka.ffi's variadic forms work — the declared tail
+      [:int :int :& :int], and the bare [:string :int :&] whose tail each call
+      infers from its values. What differs is what a new shape costs: a Chez
+      foreign-procedure has its types fixed when it is COMPILED, so the first
+      call of each shape compiles one (about a millisecond) and caches it. See
+      VARIADIC below.
     - A layout is COMPILED by the `layout` macro and read and write take that
       compiled value, where babashka.ffi takes the literal [:struct ...]
       descriptor at each call. Chez builds the ABI layout with an ftype, at
       compile time, which is also why the descriptor must be a literal —
-      (layout d) on a runtime value has nothing to compile.
-    - Layouts have no :union. read-array and write-array copy the one-byte
-      widths in a single block move and the wider ones element by element.
-    - No byte-buffer: there is no java.nio here. read-bytes, read-array and
-      read-into! are the block moves in and out of jolt values.
+      (layout d) on a runtime value has nothing to compile. The same holds for
+      the [:union ...] descriptor, which is otherwise babashka.ffi's.
+    - read-array and write-array copy the one-byte widths in a single block move
+      and the wider ones element by element.
     - jolt adds: (alloc n) with no arena, the with-* scoped helpers, arena?,
       arena-open?, close-arena, drain-auto-arenas!, layout-size,
       layout-alignment, field-offset, read-field, write-field, :varargs (a
       second spelling of :&),
       :blocking, :capture-native-error, errno, export!, foreign-callable,
       free-callable, loaded?, defining-libraries, read-bytes, write-bytes,
-      read-into!, and the exact-width type aliases.")
+      read-into!, and the exact-width type aliases.
+
+  VARIADIC. :& marks the fixed/variadic boundary of a C function that takes an
+  ellipsis, as it does in babashka.ffi; :varargs is jolt's older spelling of the
+  same marker. It has two forms.
+
+  DECLARE THE TAIL and the binding is one compiled call, exactly as a fixed
+  signature is:
+
+      (defcfn c-fcntl "fcntl" [:int :int :& :int] :int)
+
+  LEAVE IT BARE and the binding serves every tail shape, each call reading its
+  own tail off the values it is given — the more useful half for the libc
+  functions the marker exists for, where the caller's arity varies:
+
+      (defcfn c-open "open" [:string :int :&] :int)
+      (c-open path O_RDONLY)          ; empty tail
+      (c-open path flags 0644)        ; one-int tail, same binding
+
+  Three carriers decide the tail, as in babashka.ffi: an integer, pointer,
+  boolean or nil travels as a 64-bit integer; a floating-point number or ratio as
+  a double; a string as a NUL-terminated C string. Anything else raises at the
+  call rather than reaching C as whatever it happens to be.
+
+  A bare marker costs a compile on the FIRST call of each distinct shape — a
+  foreign-procedure's types are fixed when it is compiled, so a shape jolt has
+  not seen has to be built — and a cache lookup on every call after, roughly
+  twice the per-call cost of a declared tail. Declare the tail where it is
+  always the same; leave it bare where it is not.
+
+  C's default argument promotions apply to a declared tail too: pass values
+  narrower than int as :int and float as :double, which includes :bool, since
+  _Bool promotes to int in a variadic call. Neither form combines with :blocking
+  (a varargs convention and __collect_safe cannot both be emitted), and the bare
+  form additionally takes no by-value aggregate — its tail is compiled at the
+  call, where an ftype the binding declared is not available.")
 
 ;; The primitives this namespace is built over are the host's, reached by their
 ;; reserved __ names: alloc, read, write, sizeof, string->ptr, copy, read-array
@@ -217,12 +285,17 @@
 ;; -- layouts ------------------------------------------------------------------
 
 (defmacro layout
-  "Compile a literal [:struct [[field type] ...]] descriptor into immutable ABI
-  layout data. Field names are unique unqualified keywords; fields are fixed-size
-  scalars, nested structs, or recursively nestable [:array type positive-count]
-  descriptors. Chez supplies size, alignment, and offsets; array elements use
-  integer path components, for example [:matrix 1 2]. Array metadata scales
-  with the declared shape rather than the product of array dimensions."
+  "Compile a literal [:struct [[field type] ...]] or [:union [[field type] ...]]
+  descriptor into immutable ABI layout data. Field names are unique unqualified
+  keywords; fields are fixed-size scalars, nested structs or unions, or
+  recursively nestable [:array type positive-count] descriptors. Chez supplies
+  size, alignment, and offsets; array elements use integer path components, for
+  example [:matrix 1 2]. Array metadata scales with the declared shape rather
+  than the product of array dimensions.
+
+  A union's members all start at its own offset, and it is as large as its
+  largest and aligned to its strictest — see UNIONS in the namespace docstring
+  for how read and write treat one."
   [descriptor]
   (list 'jolt.ffi/__layout descriptor))
 
@@ -779,8 +852,8 @@
                 (throw (ex-info "jolt.ffi: layout field path indexes something that is not an array"
                                 {:path compact})))
               (recur (nth desc 1) (next parts)))
-          (do (when-not (= :struct (nth desc 0))
-                (throw (ex-info "jolt.ffi: layout field path names a member of something that is not a struct"
+          (do (when-not (or (= :struct (nth desc 0)) (= :union (nth desc 0)))
+                (throw (ex-info "jolt.ffi: layout field path names a member of something that is not a struct or union"
                                 {:path compact})))
               (let [field (first (filter (fn [f] (= part (nth f 0))) (nth desc 1)))]
                 (when-not field
@@ -837,6 +910,21 @@
             {}
             (nth desc 1))
 
+    ;; A union carries no tag, so there is no member `read` could know to
+    ;; decode: which one is live is the program's knowledge, from a sibling
+    ;; field (CURLMsg) or from what it stored (epoll_data_t). So a union reads
+    ;; as a POINTER to its bytes, as it does in babashka.ffi, and the caller
+    ;; reads the member that applies — with a `place` at its path, or with a
+    ;; type of its own, every member starting at offset 0.
+    ;;
+    ;; The pointer carries no RECORDED size: a jolt pointer is a bare address
+    ;; and sizes live in a process-wide table (see `size`), so recording one per
+    ;; union read would add an entry per element walked over an array of
+    ;; structs, none of them reclaimed. `reinterpret` it where copy or clone
+    ;; needs a size.
+    (= :union (nth desc 0))
+    (+ p base delta (or (get (:jolt.ffi/offsets layout) compact) 0))
+
     (= :array (nth desc 0))
     (let [element (nth desc 1)
           n (nth desc 2)
@@ -870,6 +958,25 @@
       (doseq [field fields]
         (encode-desc p layout (nth field 1) (conj compact (nth field 0))
                      delta base (get v (nth field 0))))
+      nil)
+
+    ;; The write direction has to name the member, since the bytes overlap and
+    ;; writing them all would leave only the last one. babashka.ffi spells that
+    ;; as a pair, and so does this: {:data [:result 0]}.
+    (= :union (nth desc 0))
+    (let [fields (nth desc 1)
+          names (mapv (fn [f] (nth f 0)) fields)]
+      (when-not (and (sequential? v) (= 2 (count (vec v))))
+        (throw (ex-info (str "jolt.ffi/write: a union value is a pair of a member name and its value, "
+                             "one of " (pr-str names))
+                        {:value v :fields names})))
+      (let [member (nth (vec v) 0)
+            member-value (nth (vec v) 1)
+            field (first (filter (fn [f] (= member (nth f 0))) fields))]
+        (when-not field
+          (throw (ex-info (str "jolt.ffi/write: union value names unknown member " (pr-str member))
+                          {:value v :fields names})))
+        (encode-desc p layout (nth field 1) (conj compact member) delta base member-value))
       nil)
 
     (= :array (nth desc 0))
@@ -907,8 +1014,9 @@
   "Read a value of type t from pointer p, at byte offset `off` (default 0).
 
   t is a type keyword, a compiled layout, or a place. A layout reads a struct as
-  a map of its fields and an array as a vector; a place is one member of a layout
-  with its path already resolved.
+  a map of its fields, an array as a vector, and a union as a POINTER to its
+  bytes — a union carries no tag, so the member that is live is the caller's to
+  know; a place is one member of a layout with its path already resolved.
 
   A jolt pointer carries no size, so nothing here is bounds-checked: reading past
   an allocation reads whatever is there."
@@ -926,7 +1034,8 @@
 
   t is a type keyword, a compiled layout, or a place. A struct value is a map
   holding each of the layout's fields and no others; an array value is any
-  sequence of the declared length.
+  sequence of the declared length; a union value is a PAIR of a member name and
+  its value, [:result 0], since the members overlap.
 
   Note the argument order: the VALUE comes before the offset, as it does in
   babashka.ffi."
@@ -1057,6 +1166,30 @@
      (write-array-typed p a b c)
      (jolt.ffi/__write-array p a b c))))
 
+(defn byte-buffer
+  "A java.nio.ByteBuffer view of `len` bytes at pointer p — a byte count, a type
+  keyword, or a compiled layout.
+
+      (ffi/byte-buffer p 4096)
+      (ffi/byte-buffer p frame)              ; a layout's worth
+
+  The buffer and the native memory SHARE THE SAME BYTES, as they do in
+  babashka.ffi: a put through the buffer is a write to the pointer, and a write
+  C makes is visible to the next get. Nothing is copied, so this is the cheap way
+  to hand a decoder that speaks ByteBuffer a window onto foreign memory —
+  read-bytes, read-array and read-into! remain the block moves that copy OUT into
+  a jolt value.
+
+  It is a DIRECT buffer, so hasArray answers false and array raises, exactly as
+  they do on the JVM. Multi-byte accessors (getInt and the sibling widths) are
+  big-endian, which is java.nio's default and all jolt shims.
+
+  CAUTION: the buffer keeps nothing alive. It holds an address, not a reference
+  to an arena or an allocation, so using one after the memory is freed reads
+  memory that is no longer yours — the same rule babashka.ffi states for its own."
+  [p len]
+  (jolt.ffi/__byte-buffer p (byte-count-of len)))
+
 ;; -- scoped helpers -----------------------------------------------------------
 
 (defn- helper-binding [macro-name binding]
@@ -1150,12 +1283,19 @@
 ;; narrower than int as :int (and float as :double), not as an exact narrow type
 ;; — which includes :bool, since _Bool promotes to int in a variadic call.
 ;;
-;; The tail belongs to the BINDING, not to the call. babashka.ffi's bare :& —
-;; [:string :int :&], each call inferring its own tail — has no equivalent here:
-;; a foreign-procedure's types are fixed when it is compiled. Bind one signature
-;; per tail shape, which is also what keeps each of them a real typed call:
-;;   (ffi/defcfn c-open "open" [:string :int :&] :int)        ; rejected, says why
-;;   (ffi/defcfn c-open-mode "open" [:string :int :& :int] :int)
+;; With NO types after it the marker is BARE — babashka.ffi's other variadic
+;; form, where the tail belongs to the call rather than to the binding and each
+;; call infers its own from the values it is given:
+;;   (ffi/defcfn c-open "open" [:string :int :&] :int)
+;;   (c-open path O_RDONLY)         ; empty tail
+;;   (c-open path flags 0644)       ; one-int tail, same binding
+;; A foreign-procedure's types are fixed when it is COMPILED, so this lowers to a
+;; dispatcher over a per-binding cache rather than to one procedure: the first
+;; call of each distinct tail shape compiles a foreign-procedure for it and every
+;; call after that finds it. Three carriers keep the shape space small (integer/
+;; pointer/boolean/nil, double, C string) — see jolt-ffi-varargs-* in
+;; host/chez/java/ffi.ss for the table and the measured costs. Declaring the tail
+;; stays about twice as fast per call, so declare it where it does not vary.
 ;; An options map may instead combine :blocking with
 ;; :capture-native-error. Capture returns [native-result error-code] (result
 ;; first), with the error slot read in the foreign-call return path. The analyzer

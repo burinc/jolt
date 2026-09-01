@@ -5,6 +5,83 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`jolt.ffi`: babashka.ffi's bare `:&`, one binding for every tail shape
+  (#803).** `:&` already declared a variadic C function, but only in the
+  *declared-tail* form — `[:int :int :& :int]`, the tail fixed when the binding
+  is made. The BARE marker, where no types follow and each call reads its own
+  tail off the values it is given, is the more useful half for exactly the libc
+  functions the marker exists for, and it now works:
+
+  ```clojure
+  (ffi/defcfn c-open "open" [:string :int :&] :int)
+  (c-open path O_RDONLY)          ; empty tail
+  (c-open path flags 0644)        ; one-int tail, same binding
+  ```
+
+  A Chez `foreign-procedure` has its argument and result types fixed when it is
+  *compiled*, so a call has nothing to compile a new one from — which is why the
+  bare form used to raise saying so. It now lowers to a dispatcher over a
+  per-binding cache: the first call of each distinct tail shape compiles a
+  `foreign-procedure` for that shape and every call after finds it. jolt carries
+  its own compiler, in a `jolt build --release` binary too, so this works in a
+  standalone app and not only under the REPL.
+
+  Three carriers keep the shape space small, the same three babashka.ffi
+  collapses to: an integer, pointer, boolean or `nil` travels as a 64-bit
+  integer, a floating-point number or ratio as a `double`, and a string as a
+  NUL-terminated C string. A tail value in none of them raises at the call
+  naming the three, rather than reaching C as whatever it happened to be.
+
+  The cost is a compile (about a millisecond) on the first call of each shape,
+  and after that a walk of the tail plus a lookup over a list that is almost
+  always one entry — roughly twice the per-call cost of a declared tail, which
+  is the same ratio babashka.ffi's own guide gives. Declare the tail where it
+  does not vary. The bare form does not combine with `:blocking` (neither form
+  does) or with a by-value aggregate argument, whose ftype the runtime path has
+  no way to declare; `:capture-native-error` composes with both forms.
+
+- **`[:union …]` in a layout (#803).** A union goes anywhere a nested struct
+  does, is as large as its largest member and aligned to its strictest, and gets
+  its offsets from the platform ABI — checked against a C witness, not against
+  Chez:
+
+  ```clojure
+  (def curl-msg
+    (ffi/layout [:struct [[:msg :int]
+                          [:easy :pointer]
+                          [:data [:union [[:whatever :pointer] [:result :int]]]]]]))
+  ```
+
+  A union carries no tag of its own — in C the program knows which member is
+  live, from a sibling field (`CURLMsg`) or from what it stored
+  (`epoll_data_t`). So `read` answers a union as a POINTER to its bytes and the
+  caller reads the member that applies, through a `place` at its path or with a
+  type of its own, every member starting at offset 0. `write` names the member
+  as a pair, `{:data [:result 0]}`, since the members overlap and writing them
+  all would leave only the last. A union is not passed BY VALUE in a signature,
+  alone or inside a struct — which member is live is the program's knowledge
+  rather than the type's — and that raises saying so.
+
+- **`ffi/byte-buffer`: a `java.nio.ByteBuffer` over foreign memory (#803).**
+  `(ffi/byte-buffer p 4096)` answers a buffer that SHARES the pointer's bytes
+  rather than copying them, so a decoder that speaks `ByteBuffer` reads foreign
+  memory in place and a `put` through the buffer is a write to the pointer. The
+  length may also be a type keyword or a compiled layout, as it may for `slice`
+  and `reinterpret`. `read-bytes`, `read-array` and `read-into!` remain the block
+  moves that copy *out* into a jolt value.
+
+  This is a real java.nio DIRECT buffer: `hasArray` answers false and `array`
+  raises, exactly as they do on the JVM, and `slice` shares the bytes instead of
+  copying them because there is a real address to offset. `ByteBuffer/wrap` and
+  `ByteBuffer/allocate` are unchanged — they keep their jolt byte-array backing
+  and every answer they gave before. The buffer keeps nothing alive: using one
+  after the memory is released reads freed memory, the same rule babashka.ffi
+  states for its own.
+
 ## [0.8.0] - 2026-08-31
 
 The build keeps one toolchain end to end now. When make provisions the pinned

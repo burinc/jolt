@@ -690,6 +690,157 @@
 (define (ffi-utf8-length s)
   (if (jolt-nil? s) 0 (bytevector-length (string->utf8 (jolt-str-render-one s)))))
 
+;; --- bare :& — per-call variadic tail inference ------------------------------
+;; babashka.ffi's BARE :& is one binding serving every tail shape: no types
+;; follow the marker, and each call's tail is read off the values it is given.
+;;
+;;   (ffi/defcfn c-open "open" [:string :int :&] :int)
+;;   (c-open path O_RDONLY)        ; empty tail
+;;   (c-open path flags #o644)     ; one-int tail, same binding
+;;
+;; A Chez foreign-procedure has its argument and result types fixed when it is
+;; COMPILED, so a call has nothing to compile a new one from. The binding is
+;; therefore a DISPATCHER over a cache of compiled procedures, one per observed
+;; tail shape, rather than a single procedure: on a miss it builds the
+;; foreign-procedure for that shape by eval'ing the form — jolt carries its own
+;; compiler, in a `jolt build --release` binary too — and keeps it.
+;;
+;; Three carriers, as in babashka.ffi, which is what keeps the shape space small:
+;; integers, pointers, booleans and nil travel as 64-bit integers; C's default
+;; argument promotions send floats as doubles, and a ratio with them; strings as
+;; C strings. A tail of length k has 3^k shapes — too many to emit eagerly, few
+;; enough that a program hits one or two.
+;;
+;; COST. Compiling one shape takes about a millisecond, once per shape per
+;; binding. After that a call walks the tail once and does an assv over a list
+;; that is almost always one entry: about 11ns over a declared-tail binding,
+;; which is the "roughly twice as fast" babashka.ffi's own guide gives for
+;; declaring the tail. An alist beats a hashtable at one to three entries, and
+;; the fixed arguments stay separate arguments to `apply` rather than being
+;; appended onto the tail, which costs another 13ns. INTERPRETING the form
+;; instead of compiling it builds 2.5x faster and then calls 3x slower, on every
+;; call for the life of the process, so this compiles.
+;;
+;; Resolution is by SYMBOL NAME, through the process-global table, exactly as the
+;; declared-tail :& path resolves — a scoped :jolt/native handle is not searched
+;; by either spelling of the marker, so both behave the same way.
+
+;; #(name fixed-types ret-type fixed-count capture? entries mutex)
+(define (jolt-ffi-varargs-cache name fixed-types ret-type fixed-count capture?)
+  (vector name fixed-types ret-type fixed-count capture? '() (make-mutex)))
+(define (ffi-vc-name vc)        (vector-ref vc 0))
+(define (ffi-vc-fixed-types vc) (vector-ref vc 1))
+(define (ffi-vc-ret vc)         (vector-ref vc 2))
+(define (ffi-vc-fixed-count vc) (vector-ref vc 3))
+(define (ffi-vc-capture? vc)    (vector-ref vc 4))
+(define (ffi-vc-entries vc)     (vector-ref vc 5))
+(define (ffi-vc-entries! vc e)  (vector-set! vc 5 e))
+(define (ffi-vc-mutex vc)       (vector-ref vc 6))
+
+;; The carrier a tail value travels in, as a small integer: 0 = 64-bit integer,
+;; 1 = double, 2 = C string. `integer?` is true of 3.0, so the flonum test comes
+;; first; an exact non-integer is a ratio, which promotes to double.
+(define (ffi-varargs-carrier v)
+  (cond
+    ((flonum? v) 1)
+    ((string? v) 2)
+    ((number? v) (if (and (exact? v) (integer? v)) 0 1))
+    ((jolt-nil? v) 0)
+    ((boolean? v) 0)
+    (else
+     (throw-jvm 'IllegalArgumentException
+                (string-append
+                 "jolt.ffi: a bare :& tail takes an integer, pointer, boolean, nil,"
+                 " floating-point number, ratio or string; got " (jolt-pr-str v))))))
+
+;; The Chez foreign type each carrier declares.
+(define (ffi-varargs-carrier-type c)
+  (cond ((fx=? c 0) 'integer-64) ((fx=? c 1) 'double) (else 'string)))
+
+;; One fixnum standing for the whole tail shape, folded base-3 from a seed of 1
+;; so that tails of DIFFERENT LENGTHS cannot collide (0 shapes => 1, one-int =>
+;; 3, one-double => 4, ...). Cheaper to build and to compare than a list of
+;; symbols, and it is what the cache is keyed on.
+(define (ffi-varargs-shape-key tail)
+  (let loop ((t tail) (k 1))
+    (if (null? t) k (loop (cdr t) (+ (* k 3) (ffi-varargs-carrier (car t)))))))
+
+(define (ffi-varargs-shape-types tail)
+  (if (null? tail)
+      '()
+      (cons (ffi-varargs-carrier-type (ffi-varargs-carrier (car tail)))
+            (ffi-varargs-shape-types (cdr tail)))))
+
+;; A value Chez already accepts in its carrier's position needs no conversion,
+;; and the common tail is entirely such values — so the marshalled list is the
+;; SAME list when nothing changed, and a variadic call allocates nothing beyond
+;; the rest argument the lambda already built.
+(define (ffi-varargs-plain? v)
+  (or (flonum? v) (string? v) (and (number? v) (exact? v) (integer? v))))
+
+(define (ffi-varargs-marshal v)
+  (cond
+    ((jolt-nil? v) 0)
+    ((eq? v #t) 1)
+    ((eq? v #f) 0)
+    ((number? v) (if (and (exact? v) (integer? v)) v (inexact v)))
+    (else v)))
+
+(define (jolt-ffi-varargs-tail tail)
+  (cond
+    ((null? tail) tail)
+    ((ffi-varargs-plain? (car tail))
+     (let ((rest (jolt-ffi-varargs-tail (cdr tail))))
+       (if (eq? rest (cdr tail)) tail (cons (car tail) rest))))
+    (else (cons (ffi-varargs-marshal (car tail))
+                (jolt-ffi-varargs-tail (cdr tail))))))
+
+;; Windows x64 passes named and variadic arguments alike, and its runtime
+;; (eval) construction has no slot for a convention — the same reason
+;; jolt-foreign-proc-safe drops it there.
+(define (ffi-varargs-convention n)
+  (if (eq? (sa-os-family) 'windows) '() (list (list '__varargs_after n))))
+
+;; :capture-native-error rides in front of the calling convention, as it does in
+;; the compiled path (jolt-ffi-native-error-procedure). The convention is the
+;; platform's, decided here at run time rather than at expansion time.
+(define (ffi-varargs-error-convention)
+  (if (eq? (sa-os-family) 'windows) '(__get_last_error) '(__errno)))
+
+(define (ffi-varargs-compile vc shape-types)
+  (eval (append (list 'foreign-procedure)
+                (if (ffi-vc-capture? vc) (ffi-varargs-error-convention) '())
+                (ffi-varargs-convention (ffi-vc-fixed-count vc))
+                (list (ffi-vc-name vc)
+                      (append (ffi-vc-fixed-types vc) shape-types)
+                      (ffi-vc-ret vc)))))
+
+;; Reads are unlocked: entries is one variable holding an immutable alist, so a
+;; reader sees either the old list or the new one. The COMPILE is serialized and
+;; re-checks the cache under the lock, so two threads meeting the same new shape
+;; compile it once instead of racing to drop one of the two entries.
+(define (jolt-ffi-varargs-procedure vc tail)
+  (let* ((key (ffi-varargs-shape-key tail))
+         (hit (assv key (ffi-vc-entries vc))))
+    (if hit
+        (cdr hit)
+        (jolt-with-mutex (ffi-vc-mutex vc)
+          (let ((again (assv key (ffi-vc-entries vc))))
+            (if again
+                (cdr again)
+                (let ((proc (ffi-varargs-compile vc (ffi-varargs-shape-types tail))))
+                  (ffi-vc-entries! vc (cons (cons key proc) (ffi-vc-entries vc)))
+                  proc)))))))
+
+;; --- a java.nio.ByteBuffer over foreign memory -------------------------------
+;; jolt.ffi/byte-buffer answers a DIRECT java.nio.ByteBuffer view of `n` bytes at
+;; `p` — the buffer and the pointer share the same bytes, as babashka.ffi's does,
+;; so a put through the buffer is a write to the pointer. The buffer keeps
+;; nothing alive: using one after the memory is released reads freed memory. The
+;; representation and the accessors are in host/chez/java/byte-buffer.ss.
+(define (ffi-byte-buffer p n)
+  (make-direct-byte-buffer (jnum->exact p) (jnum->exact n)))
+
 ;; --- callbacks: receive calls FROM C ----------------------------------------
 ;; jolt.ffi/foreign-callable lowers to (jolt-ffi-register-callable! (foreign-callable …)).
 ;; A foreign-callable code object must be LOCKED (so the collector neither moves
@@ -909,3 +1060,4 @@
 (def-var! "jolt.ffi" "string->ptr" ffi-string->ptr)
 (def-var! "jolt.ffi" "__string->ptr" ffi-string->ptr)
 (def-var! "jolt.ffi" "__utf8-length" ffi-utf8-length)
+(def-var! "jolt.ffi" "__byte-buffer" ffi-byte-buffer)
