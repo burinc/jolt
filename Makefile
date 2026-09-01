@@ -167,7 +167,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
   systemstreams \
-  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety
+  certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -607,6 +607,14 @@ ffi:
 # watchdog thread and FAILS on a deadline instead of wedging the run.
 continuations:
 	@bin/jolt run test/chez/continuations-test.clj
+
+# clojure.core.async.flow: the graph end to end (start/pause/resume/ping/inject,
+# the error channel, casts) and the j.u.c seams under it — deref of a Future,
+# ExecutionException out of .get, instance? Executor, and the workload -> carrier
+# mapping. The scale row is the one that would regress silently: :io processes
+# run on fibers, so 200 of them do not need 200 threads.
+flow:
+	@bin/jolt run test/chez/flow-test.clj
 
 # Transients: mutable backing, snapshot on persistent!, and linear-time builds.
 transient:
