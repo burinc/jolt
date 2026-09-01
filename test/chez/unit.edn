@@ -1482,6 +1482,10 @@
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) f (future (a/alts!! [[c :v]]))] (Thread/sleep 50) (a/close! c) (let [[v p] @f] [v (= p c)])))" :expected "[false true]"}
   ;; 9. transducer chan works through alts put
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1 (map inc))] (a/alts!! [[c 1]]) (a/<!! c)))" :expected "2"}
+  ;; Validate every put before any ready operation can mutate channel state.
+  ;; JVM core.async throws while leaving :kept available; validating only as
+  ;; each candidate is attempted consumes the earlier ready take first.
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [ready (a/chan 1) other (a/chan) _ (a/>!! ready :kept)] (try (a/alts!! [ready [other nil]] :priority true) [:no-throw (a/poll! ready)] (catch AssertionError _ [:threw (a/poll! ready)]))))" :expected "[:threw :kept]"}
   ;; 10. mult/tap smoke — proves the dataflow layer still works
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) m (a/mult c) t1 (a/chan) t2 (a/chan)] (a/tap m t1) (a/tap m t2) (a/>!! c :x) [(a/<!! t1) (a/<!! t2)]))" :expected "[:x :x]"}
   ;; clojure.test — instance? in is still reports correctly (instance? is a fn)
