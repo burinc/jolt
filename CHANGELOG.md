@@ -93,21 +93,31 @@ when transposed.
    :jolt/min-version "0.8.0"}
   ```
 
-  Not every breaking change is visible at the call site. `ffi/write`'s argument
-  order moved in this release, and the old and new spellings are both integers,
-  so an older runtime writes to the wrong place and reports nothing — the exact
-  failure a declared floor turns into a message. A **library** is the natural
-  declarer: it knows which jolt its FFI bindings or host shims need, and the app
-  pulling it in does not. An unmet floor names what is needed, what is running,
-  and which dependency asked; several unmet floors report the newest one.
+  The key is honoured by the jolt that **reads** it, so it protects from this
+  release onward and not before — an older jolt ignores it, as it ignores every
+  key it does not know.
 
-  The key is honoured by the jolt that reads it, so it protects from this release
-  onward and not before — an older jolt ignores it, as it ignores every key it
-  does not know. That is the reason it arrives now rather than at the next break.
-  A runtime that names no version (a source build answers `dev`) is never
-  refused, since it reads as the oldest possible while in practice being the
-  newest; `JOLT_SKIP_MIN_VERSION=1` runs anyway for a released runtime whose
-  version string understates what it carries.
+  That cuts one way worth stating plainly: **the floor cannot cover this
+  release's own breaking changes.** `ffi/write`'s argument order moved here, and
+  the old and new spellings are both integers, so an older runtime writes to the
+  wrong place and reports nothing — the shape of failure a floor exists for, and
+  the one it cannot catch, because the jolt that reads the key arrived in the
+  commit after the one that moved the arguments. Every runtime old enough to take
+  the offset first is too old to parse `:jolt/min-version`, and skips it.
+  Declaring `"0.8.0"` does not turn that break into a message; on such a runtime
+  you get the untreated failure — a misdirected write, or a namespace that will
+  not load — and not a refusal. Pin the toolchain for that one. What the floor
+  catches is the *next* break of that shape, where the runtime on both sides of
+  the change can read the key. That is the reason it arrives now rather than at
+  the next break.
+
+  A **library** is the natural declarer: it knows which jolt its FFI bindings or
+  host shims need, and the app pulling it in does not. An unmet floor names what
+  is needed, what is running, and which dependency asked; several unmet floors
+  report the newest one. A runtime that names no version (a source build answers
+  `dev`) is never refused, since it reads as the oldest possible while in
+  practice being the newest; `JOLT_SKIP_MIN_VERSION=1` runs anyway for a released
+  runtime whose version string understates what it carries.
 
 - **`:&` declares a variadic C function**, as it does in babashka.ffi.
   `:varargs` is jolt's older spelling of the same marker and still works; the
