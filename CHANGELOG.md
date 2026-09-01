@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Atom `compare-and-set!` now compares expected values with Jolt identity.**
+  Equal but distinct reference values no longer allow an update or run value
+  equality, matching Clojure's Atom contract for reference values. Chez
+  immediates retain Jolt's documented substrate identity model.
 - **The default time zone is the machine's.** `TimeZone/getDefault`,
   `Calendar/getInstance`, a `SimpleDateFormat` with no zone set, the deprecated
   `Date` constructor and getters, `java.sql.Date.valueOf` and `toLocalDate` all
@@ -296,7 +300,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prompt that said `user`, and `-main` under `run -m` ran in `jolt.main`.
   `clojure.main` starts every entry in `user`; jolt does too now, and the REPL
   prompt names whatever namespace is current, as `clojure.main`'s does.
-
 ## [0.8.1] - 2026-09-02
 
 Host classes are provided by declaration now. The runtime no longer carries the
