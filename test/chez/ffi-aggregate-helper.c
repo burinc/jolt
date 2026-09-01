@@ -52,6 +52,18 @@ JOLT_AGG_EXPORT int64_t jolt_agg_date_plus_varargs(struct jolt_agg_date d,
   return answer;
 }
 
+/* A SCALAR variadic -- no aggregate anywhere in the signature. The scoped
+   resolution path used to be skipped for exactly this shape, so a variadic
+   symbol in a library loaded with load-library could not be bound at all. */
+JOLT_AGG_EXPORT int64_t jolt_agg_sum_varargs(int count, ...) {
+  int64_t answer = 0;
+  va_list ap;
+  va_start(ap, count);
+  for (int i = 0; i < count; i++) answer += va_arg(ap, int64_t);
+  va_end(ap);
+  return answer;
+}
+
 JOLT_AGG_EXPORT struct jolt_agg_date jolt_agg_make_date(int32_t year,
                                                         uint8_t month,
                                                         uint8_t day) {

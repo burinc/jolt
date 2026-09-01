@@ -216,10 +216,10 @@
     - A bare :& costs a compile on the first call of each distinct tail shape.
       Both of babashka.ffi's variadic forms work — the declared tail
       [:int :int :& :int], and the bare [:string :int :&] whose tail each call
-      infers from its values. What differs is what a new shape costs: a Chez
+      infers from its values. What differs is what a NEW SHAPE costs: a Chez
       foreign-procedure has its types fixed when it is COMPILED, so the first
-      call of each shape compiles one (about a millisecond) and caches it. See
-      VARIADIC below.
+      call of each shape compiles one (about 0.8ms) and caches it. Steady-state
+      cost is about +13ns a call over a declared tail. See VARIADIC below.
     - A layout is COMPILED by the `layout` macro and read and write take that
       compiled value, where babashka.ffi takes the literal [:struct ...]
       descriptor at each call. Chez builds the ABI layout with an ftype, at
@@ -260,9 +260,12 @@
 
   A bare marker costs a compile on the FIRST call of each distinct shape — a
   foreign-procedure's types are fixed when it is compiled, so a shape jolt has
-  not seen has to be built — and a cache lookup on every call after, roughly
-  twice the per-call cost of a declared tail. Declare the tail where it is
-  always the same; leave it bare where it is not.
+  not seen has to be built — and a cache lookup on every call after. Measured
+  end to end against a do-nothing C variadic, where a fixed binding is 20ns and
+  a declared tail 20.4ns: 26.5ns with no tail, 34ns with one value, 41.5ns with
+  two, and about 0.8ms once per shape. So roughly +13ns and 1.6x a declared
+  tail. Declare the tail where it is always the same; leave it bare where it is
+  not.
 
   C's default argument promotions apply to a declared tail too: pass values
   narrower than int as :int and float as :double, which includes :bool, since
@@ -1295,7 +1298,7 @@
 ;; call after that finds it. Three carriers keep the shape space small (integer/
 ;; pointer/boolean/nil, double, C string) — see jolt-ffi-varargs-* in
 ;; host/chez/java/ffi.ss for the table and the measured costs. Declaring the tail
-;; stays about twice as fast per call, so declare it where it does not vary.
+;; stays about 1.6x cheaper per call, so declare it where it does not vary.
 ;; An options map may instead combine :blocking with
 ;; :capture-native-error. Capture returns [native-result error-code] (result
 ;; first), with the error slot read in the foreign-call return path. The analyzer
