@@ -352,6 +352,36 @@
   (let ((fs (jolt-cv-take-waiters! cv)))
     (unless (null? fs) (for-each sa-fiber-resume fs))))
 
+;; (jolt-cv-signal-one! cv) — wake exactly ONE thread waiting on cv, with mu held.
+;;
+;; The narrow counterpart of jolt-cv-wake!, for a condition that carries a QUEUE of
+;; interchangeable items to a crowd of interchangeable waiters: one item arrives,
+;; one waiter can take it, and any of them will do. The executor's task condition is
+;; that and is the only one in the runtime (java/concurrency.ss).
+;;
+;; The two preconditions, both of which that condition meets and neither of which
+;; the caller can be trusted to remember, so they are stated where the call is:
+;;
+;;   NO FIBER MAY WAIT ON cv. There is no fiber half here — a parked fiber lives in
+;;   a table this does not read, so signalling would leave it parked. The executor's
+;;   workers are threads, and jolt-condition-wait REFUSES on a fiber, so the pool
+;;   cannot acquire a fiber waiter by accident; the pool's other waiters (its
+;;   awaitTermination, which a fiber can reach) wait on a second condition of their
+;;   own and are woken with jolt-cv-wake!.
+;;
+;;   EVERY WAITER MUST WANT THE SAME THING. Broadcast is the default for the reason
+;;   given above — when the state is true for only one waiter, the waker cannot pick
+;;   which — and a signal here is right only because they are all waiting for "a
+;;   task, any task", so the one that wakes can always use what arrived.
+;;
+;; What it buys, measured on the pool it was written for: an enqueue used to
+;; broadcast, so a pool with 130 idle workers woke all 130 for one task, 129 of
+;; which took the queue mutex, found the task gone and parked again. Dispatching a
+;; no-op task cost 152us of that; signalling one took it to 8.9us, and the pool it
+;; needs for the same work from 134 threads to 7. Reference JVM Clojure dispatches
+;; the same task in 5.2us.
+(define (jolt-cv-signal-one! cv) (condition-signal cv))
+
 ;; Absolute epoch millis -> the absolute time object Chez's condition-wait wants.
 ;; Floored to an exact integer first: make-time will not take a flonum field, and a
 ;; deadline arriving as one is a caller's arithmetic, not something to trust.

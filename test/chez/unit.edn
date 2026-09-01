@@ -1198,6 +1198,71 @@
   {:suite "threads" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor)] (.submit ex (fn [] (Thread/sleep 200))) (.shutdown ex) (.awaitTermination ex 10 java.util.concurrent.TimeUnit/SECONDS))" :expected "true"}
   ;; a bounded Future/get throws TimeoutException instead of waiting out the task
   {:suite "threads" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor) f (.submit ex (fn [] (Thread/sleep 30000)))] (try (.get f 50 java.util.concurrent.TimeUnit/MILLISECONDS) :no-throw (catch Throwable e :timeout)))" :expected ":timeout"}
+  ;; A CACHED POOL GROWS. These are the properties of Executors/newCachedThreadPool
+  ;; that a fixed pool of any size does not have, so each one is a size-independent
+  ;; statement rather than a count to update when a number changes.
+  ;;
+  ;; The first five expected values were read off reference JVM Clojure running the
+  ;; same expression, so those are conformance rows in substance. They live in the
+  ;; host unit file and not the corpus because they are timing-shaped — a corpus row
+  ;; is a value, and \"how many threads by now\" is not one. The last three are
+  ;; jolt's own: a fiber is not a JVM thing at all, the ThreadPoolExecutor row
+  ;; leaves out the queue argument the JVM ctor requires (jolt supplies its own
+  ;; unbounded one, and grows past core on the no-idle-worker test rather than on a
+  ;; full queue), and the fixed-pool row records the eager core threads.
+  ;;
+  ;; Nothing is forked until a task arrives, and max is the JVM's own
+  ;; Integer/MAX_VALUE.
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool)] [(.getPoolSize ex) (.getCorePoolSize ex) (.getMaximumPoolSize ex)])" :expected "[0 0 2147483647]"}
+  ;; 64 tasks that all block until the last one has started: a pool with any fixed
+  ;; ceiling below 64 never gets there, whatever the ceiling is.
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool) n 64 latch (java.util.concurrent.CountDownLatch. n) go (promise)] (dotimes [_ n] (.execute ex (fn [] (.countDown latch) (deref go 20000 :timeout)))) (let [started (.await latch 20 java.util.concurrent.TimeUnit/SECONDS) grown (.getPoolSize ex)] (deliver go true) (.shutdown ex) [started grown (.awaitTermination ex 20 java.util.concurrent.TimeUnit/SECONDS)]))" :expected "[true 64 true]"}
+  ;; The shape that used to deadlock: a task that submits a task and waits on it,
+  ;; 40 deep in parallel — 80 workers at once, which no 32-worker pool reaches.
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool) outer (mapv (fn [i] (.submit ex (fn [] (+ i (.get (.submit ex (fn [] 100))))))) (range 40))] (reduce + (map (fn [f] (.get f)) outer)))" :expected "4780"}
+  ;; and it is a POOL: 20 tasks submitted one at a time, each waited out before the
+  ;; next, are served by a worker or two rather than by 20 — the growth above is
+  ;; concurrency, not churn. Not exactly one, because a worker that has just
+  ;; finished a task may not be back at the queue when the next submit tests for an
+  ;; idle worker; reference Clojure answers 3 to this same expression, for the same
+  ;; race against its SynchronousQueue handoff.
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool)] (dotimes [_ 20] (.get (.submit ex (fn [] 1)))) (< (.getPoolSize ex) 5))" :expected "true"}
+  ;; A burst of 2000 short tasks: every one runs, the pool drains and terminates,
+  ;; and it is served by the workers that keep up with the burst rather than by one
+  ;; thread per task. The bound on the peak is deliberately loose — the growth test
+  ;; is \"no idle worker to take this task\", so how far the pool actually grows
+  ;; depends on how far the producer runs ahead of the workers, which is a property
+  ;; of the machine: 4 workers on an idle 8-core box, 136 pinned to one core (and
+  ;; 13 on reference Clojure, which grows on the same rule).
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool) c (atom 0) peak (atom 0)] (dotimes [_ 2000] (.execute ex (fn [] (swap! c inc))) (swap! peak max (.getPoolSize ex))) (.shutdown ex) [(.awaitTermination ex 30 java.util.concurrent.TimeUnit/SECONDS) @c (< @peak 1000)])" :expected "[true 2000 true]"}
+  ;; Growth reached from a FIBER: .execute on a fiber's carrier forks the new
+  ;; worker, and that worker must not inherit the fiber context — a worker that
+  ;; thought it was a fiber would refuse the condition wait it lives in. 20 fibers,
+  ;; each handing the pool a task and waiting on its promise.
+  {:suite "cached-pool" :expr "(do (require '[clojure.core.async :as a]) (let [ex (java.util.concurrent.Executors/newCachedThreadPool) out (a/chan 20)] (dotimes [i 20] (a/io-thread (let [p (promise)] (.execute ex (fn [] (deliver p i))) (a/>!! out (deref p 5000 :timeout))))) (= (set (repeatedly 20 (fn [] (a/<!! out)))) (set (range 20)))))" :expected "true"}
+  ;; A ThreadPoolExecutor's core, max and keepAlive all reach the pool: it grows to
+  ;; max on demand and retires the grown workers after keepAlive, keeping core.
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.ThreadPoolExecutor. 1 6 100 java.util.concurrent.TimeUnit/MILLISECONDS) latch (java.util.concurrent.CountDownLatch. 6) go (promise)] (dotimes [_ 6] (.execute ex (fn [] (.countDown latch) (deref go 20000 :timeout)))) (let [started (.await latch 20 java.util.concurrent.TimeUnit/SECONDS) grown (.getPoolSize ex)] (deliver go true) (Thread/sleep 1000) [started grown (.getPoolSize ex) (.getActiveCount ex)]))" :expected "[true 6 1 0]"}
+  ;; A fixed pool is still fixed: every worker eager, none retired, max = core.
+  ;; Eager is jolt's, and unchanged by the growth work: the JVM creates even core
+  ;; threads on demand, so getPoolSize there is 0 until the first task. Which is
+  ;; why this is a host unit case and not a corpus row.
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 3)] (Thread/sleep 300) [(.getPoolSize ex) (.getCorePoolSize ex) (.getMaximumPoolSize ex)])" :expected "[3 3 3]"}
+  ;; SHUTDOWN, the three spellings, each of which was quietly not doing what its
+  ;; name says. All four expected values are reference JVM Clojure's, read off the
+  ;; same expressions on Java 21.
+  ;;
+  ;; A submit after shutdown is REJECTED rather than queued-and-abandoned.
+  {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newSingleThreadExecutor)] (.shutdown ex) (try (.submit ex (fn [] 1)) :no-throw (catch java.util.concurrent.RejectedExecutionException e :rejected)))" :expected ":rejected"}
+  ;; and so is an execute, catchable as the RuntimeException it is on the JVM
+  {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool)] (.shutdown ex) (try (.execute ex (fn [] 1)) :no-throw (catch RuntimeException e :rejected)))" :expected ":rejected"}
+  ;; close BLOCKS until the work is done, which is what makes it usable as the
+  ;; closing half of with-open
+  {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) done (atom nil)] (.execute ex (fn [] (Thread/sleep 300) (reset! done :ran))) (.close ex) [@done (.isTerminated ex)])" :expected "[:ran true]"}
+  ;; shutdownNow DROPS what is queued and hands it back, instead of answering an
+  ;; empty list and running it all anyway. The first task is known to be running
+  ;; before the five are queued, so the count is not a race.
+  {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) started (promise) go (promise) ran (atom 0)] (.execute ex (fn [] (deliver started true) (deref go 5000 :timeout))) (deref started 5000 :timeout) (dotimes [_ 5] (.execute ex (fn [] (swap! ran inc)))) (let [returned (.shutdownNow ex)] (deliver go true) [(count returned) @ran (.awaitTermination ex 10 java.util.concurrent.TimeUnit/SECONDS)]))" :expected "[5 0 true]"}
   {:suite "telemetry" :expr "(clojure.string/starts-with? (jolt.host/scheme-version) \"Chez Scheme\")" :expected "true"}
   {:suite "telemetry" :expr "(let [m (jolt.host/machine-type)] [(string? m) (pos? (count m))])" :expected "[true true]"}
   ;; bytes-allocated reads the LIVE heap, so it only has to grow across an

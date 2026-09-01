@@ -147,7 +147,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the memory is released reads freed memory, the same rule babashka.ffi
   states for its own.
 
+### Performance
+
+- **An executor enqueue wakes one worker, not all of them (#819).** The pool's
+  workers and its `awaitTermination` waited on ONE condition, so every enqueue
+  broadcast to every waiter: with 130 idle workers, one task woke all 130, and
+  129 of them took the queue mutex, found the task already claimed, and parked
+  again. Fire-and-forget cost **152µs per no-op task** that way, against 3.2µs on
+  reference Clojure, and the herd fed back into the growth rule — workers that
+  slow to return look like workers that are not coming, so a 200k-task burst grew
+  the pool to 134 threads and 131MB, which made the herd bigger still.
+
+  Task and termination now have a condition each. An enqueue signals exactly one
+  parked worker (`jolt-cv-signal-one!`, locks.ss, where the two preconditions it
+  needs are written out), and none at all when none is parked — a worker re-reads
+  the queue before it parks, under the same mutex, so there is no wake to miss.
+  A worker retiring on keep-alive wakes nobody unless the pool is shutting down or
+  it is the last one out. Shutdown still broadcasts, on both conditions: that news
+  is for every worker.
+
+  The broadcast is older than the growing pool and cost something all along — a
+  fixed 32-worker pool woke 32 — so this is a **3x improvement on 0.8.0** as well
+  as a 17x one on the growing pool before the split. Dispatching a no-op task
+  through `.execute`, same box:
+
+  | | µs/task | threads |
+  |---|---|---|
+  | 0.8.0: fixed 32-worker pool, one condition | 26.5 | 32 |
+  | growing pool, one condition | 152 | 134 |
+  | growing pool, one worker signalled | **8.9** | 7 |
+  | reference JVM Clojure | 5.2 | 8 |
+
+  and the rest of the shapes, jolt against reference Clojure on that box:
+
+  | | jolt | JVM |
+  |---|---|---|
+  | 4 producers, one pool | 11 µs/task (was 80) | 2.2 µs |
+  | single-thread pool | 4.3 µs | 9.1 µs |
+  | submit + get round trip | 12.0 µs | 7.2 µs |
+  | 256 threads created | 21 ms | 22 ms |
+
+  The pool now grows to the same handful of threads the JVM's does for the same
+  work. What is left between the two is one mutex and one park/unpark per handoff
+  where a `SynchronousQueue` transfers without either: it costs jolt 1.7x on a
+  single producer, and it is most of the gap with four producers on one pool,
+  where the JVM's queue stripes and jolt's one mutex convoys.
+
 ### Fixed
+
+- **`Executors/newCachedThreadPool` grows on demand (#819).** It was a fixed pool
+  of 32 workers. A burst of more than 32 concurrent tasks queued behind the ones
+  already running — invisible while tasks are short, and a deadlock when they are
+  not: 32 tasks that block waiting for the 33rd (a fan-out whose children hand
+  their results back through a channel, say) never let it start, with no error and
+  nothing in the code to suggest a ceiling. The pool now has the JVM's shape —
+  core 0, max `Integer/MAX_VALUE`, 60s keep-alive — so nothing is forked until a
+  task arrives, a task that no idle worker is waiting to take starts one, and a
+  worker retires after 60 seconds idle.
+
+  It is still a POOL, which is what keeps that unbounded maximum from meaning a
+  thread per task: 2000 trivial tasks submitted back to back peak at **4** workers
+  on an idle 8-core box (5000 of them, 3), because the handful that keep up with
+  them are idle again by the time the next one lands. How far it grows is a
+  property of how far the producer runs ahead of the workers — the same 2000-task
+  burst pinned to a single core peaks at 136 — and of the tasks themselves: 1000
+  tasks that each sleep 50ms do reach 558 workers. Which is the JVM's own answer to
+  the same bursts, measured on the same box against reference Clojure: 13 workers
+  for the 2000 trivial tasks, 697 for the 1000 sleepers, and the same 64 for the
+  64 blocking ones. The unbounded growth is concurrency, not churn.
+
+  `newVirtualThreadPerTaskExecutor` maps to the same pool, being equally unbounded
+  on the JVM; a pooled thread stands in for a fresh virtual one, which nothing
+  here can tell apart. `newWorkStealingPool` stays a fixed pool, because a
+  `ForkJoinPool` is sized at `availableProcessors` on the JVM too. `newFixedThreadPool`
+  and `newSingleThreadExecutor` are unchanged: every worker eager, none retired,
+  and for the single-thread pool the submission ORDER that depends on there being
+  exactly one worker forever.
+
+  `ThreadPoolExecutor.`'s `corePoolSize`, `maximumPoolSize` and `keepAliveTime`
+  now all reach the pool it builds — the core workers eager, the rest on demand up
+  to max, and the above-core ones retired after keepAlive. Before, it was a fixed
+  pool of `maximumPoolSize` and the keep-alive was discarded. One divergence
+  remains, in the direction of the caller's stated maximum: the JVM grows past
+  core only once the work queue is FULL, so a `ThreadPoolExecutor` with an
+  unbounded queue never passes core there, while jolt (which has one unbounded
+  queue per pool) grows on the same no-idle-worker test as a cached pool.
+
+  `.getPoolSize`, `.getActiveCount`, `.getCorePoolSize` and `.getMaximumPoolSize`
+  are new, so a caller can see the pool grow and retire — and so the tests can
+  assert it without counting threads by hand.
+
+- **The three spellings of executor shutdown do what they say (#819).** Found
+  while measuring the pool above, all three verified against reference JVM Clojure
+  on Java 21:
+
+  - **A `submit` or `execute` after shutdown is REJECTED** with
+    `RejectedExecutionException` (a `RuntimeException`, catchable as either), which
+    is what the JVM's default `AbortPolicy` does. jolt used to accept the task and
+    queue it — a promise the pool cannot keep, because its workers leave as soon as
+    the queue they are draining runs dry. The task then ran only if a worker
+    happened to still be there, and otherwise sat in the queue for good, with a
+    `Future` whose `.get` waits forever and an `isTerminated` answering false about
+    a pool that has nothing left to run it. The check is made under the queue mutex,
+    so a task that gets in ahead of the flag is enqueued while a worker is still
+    live, and a worker drains the queue before it leaves.
+  - **`shutdownNow` drops the queued tasks and hands them back**, which is the
+    whole difference between it and `shutdown`. It used to answer an empty vector
+    and leave the queue to drain, so the method that exists to say "do not run the
+    rest" ran the rest: a caller shutting a pool down hard because its work had
+    become irrelevant got every queued task executed anyway, and an empty list
+    claiming nothing had been pending. The returned procedures are callable, so a
+    caller can still run one itself, as `.run` lets them on the JVM. What jolt still
+    cannot do is the other half — interrupting the tasks already RUNNING, which
+    needs the workers to carry an interrupt flag a shutdown can set.
+  - **`close` blocks until the pool has terminated**, as the JVM's has since 19.
+    It used to return the moment the flag was set, so the one spelling of shutdown
+    that promises the work is finished when it returns was the one that did not
+    wait, and `(with-open [ex …] …)` left its tasks running behind it.
+
+  A worker that dies for any reason other than its task throwing (nothing does
+  that today) now hands its slot back before it goes, instead of leaving
+  `live-workers` counting a thread that is gone — which would have left
+  `isTerminated` false forever and `awaitTermination` waiting out its deadline on a
+  finished pool. The next enqueue starts a replacement, because a live count below
+  max with a task waiting is what the growth rule spawns on.
 
 - **`deref` of a `java.util.concurrent.Future`.** `@fut` raised "deref:
   unsupported reference type" for a `FutureTask` and for what an
