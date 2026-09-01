@@ -147,6 +147,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the memory is released reads freed memory, the same rule babashka.ffi
   states for its own.
 
+### Performance
+
+- **An executor enqueue wakes one worker, not all of them (#819).** The pool's
+  workers and its `awaitTermination` waited on ONE condition, so every enqueue
+  broadcast to every waiter: with 130 idle workers, one task woke all 130, and
+  129 of them took the queue mutex, found the task already claimed, and parked
+  again. Fire-and-forget cost **152µs per no-op task** that way, against 3.2µs on
+  reference Clojure, and the herd fed back into the growth rule — workers that
+  slow to return look like workers that are not coming, so a 200k-task burst grew
+  the pool to 134 threads and 131MB, which made the herd bigger still.
+
+  Task and termination now have a condition each. An enqueue signals exactly one
+  parked worker (`jolt-cv-signal-one!`, locks.ss, where the two preconditions it
+  needs are written out), and none at all when none is parked — a worker re-reads
+  the queue before it parks, under the same mutex, so there is no wake to miss.
+  A worker retiring on keep-alive wakes nobody unless the pool is shutting down or
+  it is the last one out. Shutdown still broadcasts, on both conditions: that news
+  is for every worker.
+
+  The broadcast is older than the growing pool and cost something all along — a
+  fixed 32-worker pool woke 32 — so this is a **3x improvement on 0.8.0** as well
+  as a 17x one on the growing pool before the split. Dispatching a no-op task
+  through `.execute`, same box:
+
+  | | µs/task | threads |
+  |---|---|---|
+  | 0.8.0: fixed 32-worker pool, one condition | 26.5 | 32 |
+  | growing pool, one condition | 152 | 134 |
+  | growing pool, one worker signalled | **8.9** | 7 |
+  | reference JVM Clojure | 5.2 | 8 |
+
+  and the rest of the shapes, jolt against reference Clojure on that box:
+
+  | | jolt | JVM |
+  |---|---|---|
+  | 4 producers, one pool | 11 µs/task (was 80) | 2.2 µs |
+  | single-thread pool | 4.3 µs | 9.1 µs |
+  | submit + get round trip | 12.0 µs | 7.2 µs |
+  | 256 threads created | 21 ms | 22 ms |
+
+  The pool now grows to the same handful of threads the JVM's does for the same
+  work. What is left between the two is one mutex and one park/unpark per handoff
+  where a `SynchronousQueue` transfers without either: it costs jolt 1.7x on a
+  single producer, and it is most of the gap with four producers on one pool,
+  where the JVM's queue stripes and jolt's one mutex convoys.
+
 ### Fixed
 
 - **`Executors/newCachedThreadPool` grows on demand (#819).** It was a fixed pool
