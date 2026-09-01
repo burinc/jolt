@@ -215,10 +215,14 @@ when transposed.
   narrows to a signed 32-bit result, matching the JVM.
 
 - **Namespaced-map prefixes could absorb separator text into a silent wrong
-  namespace or accept an invalid namespace.** The reader now requires an
-  explicit namespace to be a simple unqualified symbol, stops at the token
-  boundary, allows whitespace and commas before `{`, and rejects other
-  intervening input including comments to match JVM behavior.
+  namespace or accept an invalid namespace.** The reader now requires the
+  namespace — auto-resolved (`#::a`) or explicit (`#:a`) alike — to be a simple
+  unqualified symbol, stops at the token boundary, allows whitespace and commas
+  before `{`, and rejects other intervening input including comments to match
+  JVM behavior. A missing map is reported before the namespace token is judged,
+  and an unregistered alias now says `Unknown auto-resolved namespace alias`
+  rather than `Invalid token`, so the message matches the JVM's for every
+  spelling that names a namespace.
 
 - **`getPosixFilePermissions` and `getOwner` refused to run on hosts whose
   layout jolt already knew.** `nio-file` reads `st_mode` and `st_uid` at offsets

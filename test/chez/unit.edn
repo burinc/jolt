@@ -201,6 +201,15 @@
   {:suite "reader / namespaced-map namespace" :expr "(try (read-string \"#:foo/bar{:a 1}\") (catch Throwable e (ex-message e)))" :expected "\"Namespaced map must specify a valid namespace: foo/bar\""}
   {:suite "reader / namespaced-map namespace" :expr "(try (read-string \"#:123{:a 1}\") (catch Throwable e (ex-message e)))" :expected "\"Namespaced map must specify a valid namespace: 123\""}
   {:suite "reader / namespaced-map boundary" :expr "(read-string \"#::missing-alias {:a 1}\")" :expected :throws}
+  ;; The JVM decides the payload is not a map before it judges the namespace
+  ;; token, and it applies the same token rules to both prefix forms.  Messages
+  ;; below were taken from Clojure 1.12 on the JVM.
+  {:suite "reader / namespaced-map namespace" :expr "(try (read-string \"#::foo/bar{:a 1}\") (catch Throwable e (ex-message e)))" :expected "\"Namespaced map must specify a valid namespace: foo/bar\""}
+  {:suite "reader / namespaced-map namespace" :expr "(try (read-string \"#::123{:a 1}\") (catch Throwable e (ex-message e)))" :expected "\"Namespaced map must specify a valid namespace: 123\""}
+  {:suite "reader / namespaced-map namespace" :expr "(try (read-string \"#:{:a 1}\") (catch Throwable e (ex-message e)))" :expected "\"Namespaced map must specify a valid namespace: nil\""}
+  {:suite "reader / namespaced-map namespace" :expr "(try (read-string \"#::nosuchalias{:a 1}\") (catch Throwable e (ex-message e)))" :expected "\"Unknown auto-resolved namespace alias: nosuchalias\""}
+  {:suite "reader / namespaced-map boundary" :expr "[(try (read-string \"#:foo/bar :a\") (catch Throwable e (ex-message e))) (try (read-string \"#::nosuch :a\") (catch Throwable e (ex-message e))) (try (read-string \"#:foo (1)\") (catch Throwable e (ex-message e)))]" :expected "[\"Namespaced map must specify a map\" \"Namespaced map must specify a map\" \"Namespaced map must specify a map\"]"}
+  {:suite "reader / namespaced-map boundary" :expr "[(try (read-string \"#: {:a 1}\") (catch Throwable e (ex-message e))) (try (read-string \"#:: :a\") (catch Throwable e (ex-message e)))]" :expected "[\"Namespaced map must specify a namespace\" \"Namespaced map must specify a namespace\"]"}
   {:suite "hostctor" :expr "(String/format \"%d-%s\" 5 \"x\")" :expected "\"5-x\""}
   {:suite "hostctor" :expr "[(.format (java.text.NumberFormat/getInstance) 1234567.5) (.format (java.text.NumberFormat/getIntegerInstance) 1234567)]" :expected "[\"1,234,567.5\" \"1,234,567\"]"}
   {:suite "hostobj" :expr "(try (throw (ex-info \"x\" {})) (catch Throwable e [(.getNextException e) (vec (.getStackTrace e))]))" :expected "[nil []]"}

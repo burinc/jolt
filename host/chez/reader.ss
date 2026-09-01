@@ -905,16 +905,18 @@
       (and (symbol-t? v) (not (symbol-t-ns v))))))
 (define (rdr-read-ns-map s i end)        ; i points just past "#:"
   (let* ((auto? (and (< i end) (char=? (string-ref s i) #\:)))
-         (i2 (if auto? (+ i 1) i)))
+         (i2 (if auto? (+ i 1) i))
+         ;; Reader whitespace (a comma included) directly after the prefix means
+         ;; no namespace token was written at all. Only `#::` may still reach a
+         ;; map from there, naming the current namespace.
+         (spaced? (and (< i2 end) (rdr-ws? (string-ref s i2)))))
     ;; The namespace is a token, not every byte up to the opening brace.
-    ;; Whitespace (including commas) may separate that token from the map;
-    ;; anything else at the boundary is an error rather than part of the
-    ;; namespace or a non-map payload borrowing a later opening brace.
+    ;; Whitespace may separate that token from the map; anything else at the
+    ;; boundary is an error rather than part of the namespace or a non-map
+    ;; payload borrowing a later opening brace.
     (let-values (((nstok j) (rdr-read-token s i2 end)))
-      (when (and (not auto?) (string=? nstok ""))
+      (when (and spaced? (not auto?))
         (rdr-error s i2 "Namespaced map must specify a namespace"))
-      (when (and (not auto?) (not (rdr-simple-symbol-token? nstok)))
-        (rdr-error s i2 (string-append "Namespaced map must specify a valid namespace: " nstok)))
       (let skip-boundary ((k j))
         (cond
           ((and (< k end) (rdr-ws? (string-ref s k)))
@@ -922,12 +924,32 @@
           ((or (>= k end) (not (char=? (string-ref s k) #\{)))
            ;; A comment is a reader macro rather than whitespace at this exact
            ;; boundary on the JVM, so do not use rdr-skip-ws (which skips it).
-           (rdr-error s k "Namespaced map must specify a map"))
+           ;; A missing map is also reported BEFORE the namespace token is
+           ;; judged, which is the order the JVM reports these two in.
+           (rdr-error s k (if spaced?
+                              "Namespaced map must specify a namespace"
+                              "Namespaced map must specify a map")))
           (else
+           ;; Both prefix forms require a simple, unqualified symbol here; only
+           ;; the auto form may leave the token out, naming the current ns.
+           ;; The JVM renders the offending namespace the way Java prints the
+           ;; object it read, so an absent one reads as "null" there and as
+           ;; "nil" here. Reading a TOKEN rather than a whole form is what
+           ;; makes a non-map payload fail closed, and it is why the two
+           ;; cannot agree on every degenerate spelling (`#:"s"{}` names the
+           ;; string on the JVM and no token at all here) — so report the
+           ;; value jolt actually has rather than imitate Java's printer.
+           (when (if (string=? nstok "")
+                     (not auto?)
+                     (not (rdr-simple-symbol-token? nstok)))
+             (rdr-error s i2 (string-append "Namespaced map must specify a valid namespace: "
+                                            (if (string=? nstok "") "nil" nstok))))
            (let ((mapns (if auto?
                             (if (string=? nstok "") (chez-current-ns)
                                 (let ((a (chez-resolve-alias (chez-current-ns) nstok)))
-                                  (if a a (rdr-invalid-token (string-append "::" nstok)))))
+                                  (if a a
+                                      (rdr-error s i2 (string-append
+                                                       "Unknown auto-resolved namespace alias: " nstok)))))
                             nstok)))
              (let-values (((es next) (rdr-read-seq s (+ k 1) end #\})))
                (values (rdr-make-map (rdr-nsmap-kvs mapns es)) next)))))))))
