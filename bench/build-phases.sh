@@ -97,12 +97,17 @@ run_config() {
       # after stripping parens a line reads:
       #   jolt build: [profile] <name words…> <ms> ms cumulative <total>
       gsub(/[()]/, "");
+      # a "- wp: fixpoint 3153 ms" sub-row is part of its parent's total and
+      # carries no cumulative column; counting it would double the parent
+      if ($4 == "-") next;
       ms = $(NF-3);
       name = "";
       for (i = 4; i <= NF - 4; i++) name = name (name == "" ? "" : " ") $i;
-      if (name ~ /compile-file|make-boot-file|payload link/) chez += ms;
-      else if (name ~ /prologue/)                            pro  += ms;
-      else                                                   jolt += ms;
+      # build.ss names the Chez rows "compile runtime half", "compile app
+      # half", "runtime fasl (cached)", "make-boot-file", "stub + payload link"
+      if (name ~ /^compile |^runtime fasl|make-boot-file|payload link/) chez += ms;
+      else if (name ~ /prologue/)                                        pro  += ms;
+      else                                                               jolt += ms;
     }
     END {
       t = jolt + pro + chez;
