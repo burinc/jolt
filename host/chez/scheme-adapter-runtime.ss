@@ -735,6 +735,23 @@
 (define (sa-disable-count) (#3%$tc-field 'disable-count (#3%$tc)))
 
 
+;; --- capability-unchecked ---------------------------------------------------
+;; Unchecked fixnum / vector primitives, SYNTAX (CONTRACT.txt). A call site
+;; carries its own range proof; here each is the #3% primitive — what the
+;; whole runtime would be at optimize-level 3, applied to the one loop that
+;; has proven it.
+(define-syntax sa-ufx+ (syntax-rules () ((_ a b) (#3%fx+ a b))))
+(define-syntax sa-ufx- (syntax-rules () ((_ a b) (#3%fx- a b))))
+(define-syntax sa-ufx<? (syntax-rules () ((_ a b) (#3%fx<? a b))))
+(define-syntax sa-ufx>=? (syntax-rules () ((_ a b) (#3%fx>=? a b))))
+(define-syntax sa-ufx=? (syntax-rules () ((_ a b) (#3%fx=? a b))))
+(define-syntax sa-uvector-ref (syntax-rules () ((_ v i) (#3%vector-ref v i))))
+(define-syntax sa-uvector-set! (syntax-rules () ((_ v i x) (#3%vector-set! v i x))))
+;; (sa-vector-copy-range! to at from start end): the R7RS shape over Chez's
+;; (vector-copy! from from-start to to-start count).
+(define (sa-vector-copy-range! to at from start end)
+  (vector-copy! from start to at (fx- end start)))
+
 ;; locks.ss first: fibers.ss uses the counting lock wrapper, and jolt-with-mutex
 ;; is a macro, so it must be defined before this load rather than captured at
 ;; run time the way the sa-* seams are.

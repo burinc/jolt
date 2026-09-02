@@ -2377,7 +2377,7 @@
     (case (jolt-transient-kind x)
       ((vec) "clojure.lang.PersistentVector$TransientVector")
       ;; a transient over an array-mode map carries its insertion order
-      ((map) (if (jolt-transient-ord x)
+      ((map) (if (jolt-transient-array-map? x)
                  "clojure.lang.PersistentArrayMap$TransientArrayMap"
                  "clojure.lang.PersistentHashMap$TransientHashMap"))
       ((set) "clojure.lang.PersistentHashSet$TransientHashSet")

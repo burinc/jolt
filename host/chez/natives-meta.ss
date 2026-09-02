@@ -70,7 +70,7 @@
 (define (meta-copy x)
   (cond
     ((pvec? x) (mk-pvec (pvec-cnt x) (pvec-shift x) (pvec-root x) (pvec-tail x) (pvec-ent x)))
-    ((pmap? x) (make-pmap (pmap-root x) (pmap-cnt x) (pmap-order x)))
+    ((pmap? x) (make-pmap (pmap-root x) (pmap-cnt x)))
     ((pset? x) (make-pset (pset-m x)))
     ((jrec? x) (make-jrec-from-existing x #f #f (jrec-ext x)))
     ;; a reify shares its (read-only) method table + protos but gets a fresh

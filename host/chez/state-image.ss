@@ -32,10 +32,14 @@
 ;; nil to every lookup in the restoring process. A version-3 reader refuses
 ;; these images by the header check instead of restoring the record inert.
 ;;
-;; This build still READS versions 2 and 3: everything they can contain
+;; Version 7: a map's record is chez-pmap-v5 — an array-mode map is a flat k/v
+;; slot vector, where formats 6 and older carried a trie root plus an order
+;; list (chez-pmap-v4). Those restore through image-legacy-pmap? below.
+;;
+;; This build still READS versions 2 to 6: everything they can contain
 ;; (including raw jolt-ref-v1 records) restores here via the legacy arms.
-(define jolt-image-format-version 6)
-(define jolt-image-read-versions '(2 3 4 5 6))
+(define jolt-image-format-version 7)
+(define jolt-image-read-versions '(2 3 4 5 6 7))
 
 ;; --- classification -----------------------------------------------------------
 ;; An eq hashtable is the ONE hashtable kind Chez can fasl; eqv/equal/string-hash
@@ -410,6 +414,36 @@
                      (string=? (substring n 0 9) "chez-jrec")))))))
 (define (legacy-ref-val x)
   ((record-accessor (record-rtd x) 0) x))
+;; A map from an image written before the flat array-mode representation
+;; (format <= 6): chez-pmap-v4's layout is (root cnt order hasheq all-kw), where
+;; root is a trie in BOTH modes and `order`, for an array-mode map, the
+;; (key . value) pairs in reverse insertion order (#f in hash mode). The tag
+;; bumped, so the fasl materializes the old rtd and its instances answer #f to
+;; pmap?. Detected by uid prefix like a legacy jrec and rebuilt through the
+;; old rtd's accessors: an array-mode map's pairs become its slot vector, a
+;; hash-mode root is kept as is — hnode/hcoll are unchanged, so it IS a
+;; current trie.
+(define (image-legacy-pmap? x)
+  (and (record? x) (not (pmap? x))
+       (let ((uid (record-type-uid (record-rtd x))))
+         (and (symbol? uid)
+              (let ((n (symbol->string uid)))
+                (and (fx>=? (string-length n) 9)
+                     (string=? (substring n 0 9) "chez-pmap")))))))
+(define (legacy-pmap->pmap x)
+  (let* ((rtd (record-rtd x))
+         (root ((record-accessor rtd 0) x))
+         (cnt ((record-accessor rtd 1) x))
+         (ord ((record-accessor rtd 2) x)))
+    (if (or (pair? ord) (null? ord))
+        (let* ((ps (reverse ord)) (n (length ps)) (arr (make-vector (fx* 2 n))))
+          (let loop ((ps ps) (i 0))
+            (unless (null? ps)
+              (vector-set! arr i (caar ps))
+              (vector-set! arr (fx+ i 1) (cdar ps))
+              (loop (cdr ps) (fx+ i 2))))
+          (make-pmap arr n))
+        (make-pmap root cnt))))
 
 ;; A resource the dump could not write (port, thread, non-eq hashtable,
 ;; unregistered closure) that stub mode substitutes in place of a refusal. id
@@ -847,6 +881,12 @@
                       (walk-ref-restore (legacy-ref-val x) x path))
                      ((and (eq? mode 'restore) (image-legacy-jrec? x))
                       (walk-legacy-jrec x path))
+                     ;; a pre-format-7 map, or a set over one, re-minted into
+                     ;; the current representation and then walked like any map
+                     ((and (eq? mode 'restore) (image-legacy-pmap? x))
+                      (walk-legacy-pmap x path))
+                     ((and (eq? mode 'restore) (pset? x) (image-legacy-pmap? (pset-m x)))
+                      (walk-legacy-pmap x path))
                      ;; a stub with a matching resolver becomes the live value it
                      ;; stands for; without one it stays the inert record — the
                      ;; per-restore table (populated by restore-world!) lists it
@@ -1485,6 +1525,15 @@
                         (hashtable-set! memo x nx)
                         (image-meta-copy! x nx)
                         nx)))))
+             (walk-legacy-pmap
+              (lambda (x path)
+                (or (hashtable-ref memo x #f)
+                    (let ((nx (if (pset? x)
+                                  (walk-pset (make-pset (legacy-pmap->pmap (pset-m x))) path)
+                                  (walk-pmap (legacy-pmap->pmap x) path))))
+                      (hashtable-set! memo x nx)
+                      (image-meta-copy! x nx)
+                      nx))))
              (walk-record
               (lambda (x path)
                 (let* ((rtd (record-rtd x))
@@ -1661,7 +1710,7 @@
   (unless (member (vector-ref h 1) jolt-image-read-versions)
     (jolt-throw (jolt-ex-info
                   (string-append "image: " path " has format version "
-                                 (jolt-str-one (vector-ref h 1)) ", this build reads versions 2 to 6")
+                                 (jolt-str-one (vector-ref h 1)) ", this build reads versions 2 to 7")
                   empty-pmap)))
   ;; The fasl version moves with Chez, and a mismatch otherwise surfaces as an
   ;; opaque fasl-read error, so name it here instead.
