@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`clojure.lang.RT/REQUIRE_LOCK`.** The JVM's `RT.REQUIRE_LOCK` is the agreed
+  object a caller holds around a `require` so two threads do not load one
+  namespace at once. jolt had no such field, so
+  `io.github.frenchy64.fully-satisfies.requiring-resolve` — which typedclojure's
+  runtime requires — fell back to locking `#'clojure.core/require` instead, and
+  `(locking clojure.lang.RT/REQUIRE_LOCK …)` raised outright. The field is now a
+  plain `(Object.)`, the same value the JVM holds, and it is reachable both as a
+  static reference and reflectively — the two spellings library code uses:
+
+  ```clojure
+  (locking clojure.lang.RT/REQUIRE_LOCK (require 'my.ns))
+  (.get (.getField clojure.lang.RT "REQUIRE_LOCK") clojure.lang.RT)
+  ```
+
+  `clojure.core/requiring-resolve` now holds it across its own `require`, as
+  Clojure's does: two threads resolving the same qualified symbol at once both
+  started loading its namespace, and the second could resolve a var out of a
+  half-loaded one.
+
+- **`clojure.lang.Compiler/munge`, and `clojure.core/munge` over the whole
+  `CHAR_MAP`.** `munge` rewrote dashes and nothing else, so `(munge 'a?)` answered
+  `a?` — not a legal identifier on any host, and not what any caller building a
+  class name from it can use. It also made `(= (munge "a?") (munge "a_QMARK_"))`
+  **false** for two names that do compile to one class, which is exactly the
+  question typedclojure's datatype collision check asks. `Compiler/munge` is now
+  registered as the forward direction of the `demunge` that was already there, and
+  both ends derive from ONE table, so they cannot name different escapes for a
+  character:
+
+  ```clojure
+  (munge "a-b?")                          ;=> "a_b_QMARK_"
+  (clojure.lang.Compiler/munge "+'")      ;=> "_PLUS__SINGLEQUOTE_"
+  ```
+
+  That table was also what named a fn's class, where the nine missing entries
+  were visible directly: `(class clojure.core/+')` reported
+  `clojure.core$_PLUS_'`, a name no JVM emits and `demunge` cannot reverse. It
+  now reads `clojure.core$_PLUS__SINGLEQUOTE_`.
+
 - **`clojure.core.async.flow`, with `:io` processes on fibers.** core.async's
   flow library — a flow is a directed graph of processes communicating over
   channels, with the topology, thread execution, lifecycle, monitoring and error
@@ -147,6 +186,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the memory is released reads freed memory, the same rule babashka.ffi
   states for its own.
 
+### Changed
+
+- **The reflection member model now reads jolt's static and shim registries, and
+  member objects are real `java.lang.reflect.*` values.** `Class.getDeclaredFields`
+  / `getMethods` used to consult only the protocol/type registry, so every host
+  class jolt models reported no members at all — and `(.getField Long "MAX_VALUE")`
+  raised `NoSuchFieldException`, which a caller with a handler for that cannot
+  tell apart from a field that really is absent. Three registries now answer, on
+  the one rule the statics table already used (a procedure is a static method,
+  anything else a static field's value):
+
+  ```clojure
+  (.get (.getField Long "MAX_VALUE") nil)             ;=> 9223372036854775807
+  (map #(.getName %) (.getMethods String))            ;=> ("format" "join" "valueOf")
+  (:flags (first (:members (clojure.reflect/type-reflect 'java.lang.Long))))
+  ;;=> #{:public :static :final}
+  ```
+
+  `getMethod` / `getDeclaredMethod` / `getConstructor` / `getDeclaredConstructor`
+  are new; they select by parameter COUNT (jolt carries no signatures) and raise
+  `NoSuchMethodException` for a name no registry has. And the member values —
+  `Method`, `Field`, `Constructor` — now report their JVM class and print like the
+  JVM instead of as an opaque `#object[:object]`:
+
+  ```clojure
+  (str (.getField Long "MAX_VALUE"))
+  ;;=> "public static final java.lang.Object java.lang.Long.MAX_VALUE"
+  ```
+
+  A member that lives in none of the registries is still absent rather than
+  guessed at: String's instance methods are a `cond` in `natives-str.ss`, not data
+  anything can enumerate, so String reports its three statics and nothing else.
+
 ### Performance
 
 - **An executor enqueue wakes one worker, not all of them (#819).** The pool's
@@ -194,6 +266,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where the JVM's queue stripes and jolt's one mutex convoys.
 
 ### Fixed
+
+- **A bad namespace designator says what was wrong.** `(ns-name nil)`,
+  `(the-ns nil)` and `(find-ns nil)` reached a bare Chez record accessor and
+  escaped as a condition with no jolt class and no message — printing as
+  `#object[:object]`, with `(ex-message e)` **nil**. A `nil` designator is now the
+  JVM's `NullPointerException` and any other non-symbol its failed cast to
+  `clojure.lang.Symbol`. `(ns-name nil)` is a plausible slip in any macro reading
+  a `:ns` out of metadata (typedclojure's `update-expr` does), and it used to say
+  nothing whatsoever about where the failure was.
 
 - **`Executors/newCachedThreadPool` grows on demand (#819).** It was a fixed pool
   of 32 workers. A burst of more than 32 concurrent tasks queued behind the ones

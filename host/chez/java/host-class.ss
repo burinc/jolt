@@ -152,11 +152,25 @@
 ;; forward CHAR_MAP), so clojure.spec.alpha's fn-sym (which splits on $ and
 ;; demunges) recovers the predicate's symbol. Anonymous / unregistered fns stay
 ;; clojure.lang.IFn (fn-sym yields :unknown, as on the JVM).
+;;
+;; The table below IS clojure.lang.Compiler/CHAR_MAP, character by character, and
+;; it is the ONE forward munge table. It lives here rather than beside demunge
+;; (compile-eval.ss) only because of load order: rt.ss loads this file and
+;; compile-eval.ss comes after it, so this is the earlier of the two ends and the
+;; later one derives from it — Compiler/CHAR_MAP, Compiler/munge and the demunge
+;; token table are all built out of this alist, so no two of them can name
+;; different escapes for one character. It used to hold 15 of the JVM's 24
+;; entries, which is why (class clojure.core/+') reported "clojure.core$_PLUS_'":
+;; a name no JVM emits, demunge cannot reverse, and Java would not accept as an
+;; identifier.
 (define class-munge-map
-  '((#\? . "_QMARK_") (#\! . "_BANG_") (#\* . "_STAR_") (#\+ . "_PLUS_")
-    (#\> . "_GT_") (#\< . "_LT_") (#\= . "_EQ_") (#\/ . "_SLASH_") (#\- . "_")
-    (#\& . "_AMPERSAND_") (#\% . "_PERCENT_") (#\~ . "_TILDE_") (#\^ . "_CARET_")
-    (#\| . "_BAR_") (#\: . "_COLON_")))
+  '((#\- . "_") (#\: . "_COLON_") (#\+ . "_PLUS_") (#\> . "_GT_")
+    (#\< . "_LT_") (#\= . "_EQ_") (#\~ . "_TILDE_") (#\! . "_BANG_")
+    (#\@ . "_CIRCA_") (#\# . "_SHARP_") (#\' . "_SINGLEQUOTE_")
+    (#\" . "_DOUBLEQUOTE_") (#\% . "_PERCENT_") (#\^ . "_CARET_")
+    (#\& . "_AMPERSAND_") (#\* . "_STAR_") (#\| . "_BAR_") (#\{ . "_LBRACE_")
+    (#\} . "_RBRACE_") (#\[ . "_LBRACK_") (#\] . "_RBRACK_") (#\/ . "_SLASH_")
+    (#\\ . "_BSLASH_") (#\? . "_QMARK_")))
 (define (class-munge-name s)
   (let ((out (open-output-string)))
     (string-for-each

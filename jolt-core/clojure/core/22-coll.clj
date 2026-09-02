@@ -413,13 +413,26 @@
 (defn construct-proxy [c & args] (throw "construct-proxy: not supported in Jolt"))
 (defn get-proxy-class [& interfaces] (throw "get-proxy-class: not supported in Jolt"))
 
+;; Clojure's serialized-require: require while holding
+;; clojure.lang.RT/REQUIRE_LOCK, so two threads reaching for one namespace load it
+;; once rather than racing through the same file. Private there and here — it
+;; exists for requiring-resolve below, and a caller wanting the same guarantee
+;; takes the field itself. jolt.host/with-monitor rather than `locking`: that
+;; macro is defined in 30-macros.clj, which loads after this file.
+(defn ^:private serialized-require [& args]
+  (jolt.host/with-monitor clojure.lang.RT/REQUIRE_LOCK
+    (fn* [] (apply require args))))
+
 ;; resolve, requiring the symbol's namespace first when it isn't loaded yet —
 ;; the dynamic-require pattern (tooling, plugin registries). The require and
 ;; resolve are the runtime fns, so this works identically under jolt run and
-;; in an AOT binary (which compiles the namespace from the source roots).
+;; in an AOT binary (which compiles the namespace from the source roots). The
+;; require is serialized, as Clojure's is: two threads resolving the same
+;; qualified symbol at once would otherwise both start loading its namespace,
+;; and the second could resolve a var out of a half-loaded one.
 (defn requiring-resolve [sym]
   (if (qualified-symbol? sym)
     (or (resolve sym)
-        (do (require (symbol (namespace sym)))
+        (do (serialized-require (symbol (namespace sym)))
             (resolve sym)))
     (throw (new IllegalArgumentException (str "Not a qualified symbol: " sym)))))
