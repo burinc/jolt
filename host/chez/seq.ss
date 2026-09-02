@@ -433,7 +433,30 @@
 ;; ============================================================================
 ;; the seq leaf ops the emitter lowers core fns to
 ;; ============================================================================
-(define (jolt-first x) (let ((s (jolt-seq x))) (if (jolt-nil? s) jolt-nil (seq-first s))))
+;; first: a cell's head, or a vector's element 0, with NO seq cell built — the
+;; JVM allocates a ChunkedSeq for (first v); reading the backing store is a
+;; superset that changes nothing observable and takes (first v) from 45 ns to
+;; a type test and an indexed read (the allocation was 4 of those 45; the rest
+;; was jolt-seq's dispatch and two set!-wrappers in front of it).
+;; A host type whose first is not its seq's head — a sorted map answers from
+;; the tree's leftmost node without materializing the tree — registers a
+;; first arm here instead of set!-wrapping jolt-first, so these clauses stay
+;; first. Same shape and guard as register-seq-arm!.
+(define (first-fast-probes)
+  (list jolt-nil jolt-empty-list (probe-cseq) (probe-pvec) "s"))
+(define jolt-first-arms '())
+(define (register-first-arm! pred handler)
+  (reject-fast-type-claim! 'register-first-arm! pred (first-fast-probes) "the jolt-first fast path")
+  (set! jolt-first-arms (cons (cons pred handler) jolt-first-arms)))
+(define (jolt-first x)
+  (cond
+    ((cseq? x) (cseq-head x))
+    ((pvec? x) (if (fx>? (pvec-cnt x) 0) (pvec-nth-in-range x 0) jolt-nil))
+    ((jolt-nil? x) jolt-nil)
+    (else (let loop ((as jolt-first-arms))
+            (cond ((null? as) (let ((s (jolt-seq x))) (if (jolt-nil? s) jolt-nil (seq-first s))))
+                  (((caar as) x) ((cdar as) x))
+                  (else (loop (cdr as))))))))
 ;; rest = Clojure's more(): the tail as a (possibly empty) seq, NOT nil, and
 ;; WITHOUT realizing it. A forced cseq (list / realized chain) hands back its tail
 ;; directly. An UNFORCED tail (vector / string / lazy-seq cell) is returned as a
