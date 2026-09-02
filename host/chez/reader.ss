@@ -953,9 +953,18 @@
            (let ((mapns (if auto?
                             (if (string=? nstok "") (chez-current-ns)
                                 (let ((a (chez-resolve-alias (chez-current-ns) nstok)))
-                                  (if a a
-                                      (rdr-error s i2 (string-append
-                                                       "Unknown auto-resolved namespace alias: " nstok)))))
+                                  (cond (a a)
+                                        ;; The build's require/class-provider scans
+                                        ;; read every top-level form before the ns
+                                        ;; declaration has installed its aliases.
+                                        ;; Preserve the alias spelling just as the
+                                        ;; ::alias/keyword reader does below; scan
+                                        ;; mode discards the value after extracting
+                                        ;; dependency names.
+                                        ((rdr-scan-mode) nstok)
+                                        (else
+                                         (rdr-error s i2 (string-append
+                                                          "Unknown auto-resolved namespace alias: " nstok))))))
                             nstok)))
              (let-values (((es next) (rdr-read-seq s (+ k 1) end #\})))
                (values (rdr-make-map (rdr-nsmap-kvs mapns es)) next)))))))))
