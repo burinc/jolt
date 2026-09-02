@@ -343,5 +343,23 @@
     (raises? (lambda () (register-eq-arm! (lambda (a b) (or (jolt-nil? a) (jolt-nil? b)))
                                           (lambda (a b) #t)))))
 
+;; --- first answers a cell / a vector ahead of its arms ----------------------
+(define first-arm-calls 0)
+(define-record-type firstarm-t (fields v) (nongenerative firstarm-v1))
+(register-first-arm! (lambda (x) (set! first-arm-calls (+ first-arm-calls 1)) (firstarm-t? x))
+                     (lambda (x) 'arm))
+(set! first-arm-calls 0)
+(ok "first of a vector is its element 0" (= 1 (jolt-first (jolt-vector 1 2))))
+(ok "first of an empty vector is nil" (jolt-nil? (jolt-first (jolt-vector))))
+(ok "first of a list cell is its head" (= 3 (jolt-first (jolt-list 3 4))))
+(ok "first of nil is nil" (jolt-nil? (jolt-first jolt-nil)))
+(ok "no first arm consulted for a vector, a cell or nil" (= first-arm-calls 0))
+;; a string is neither, so it asks the arms on its way to its seq
+(ok "first of a string reaches its seq" (char=? #\a (jolt-first "ab")))
+(ok "registered first arm answers its type" (eq? 'arm (jolt-first (make-firstarm-t 1))))
+(ok "first arm rejects vector" (raises? (lambda () (register-first-arm! pvec? (lambda (x) x)))))
+(ok "first arm rejects cseq"   (raises? (lambda () (register-first-arm! cseq? (lambda (x) x)))))
+(ok "first arm rejects nil"    (raises? (lambda () (register-first-arm! jolt-nil?-fn (lambda (x) x)))))
+
 (printf "values-test: ~a/~a passed\n" (- total fails) total)
 (exit (if (> fails 0) 1 0))
