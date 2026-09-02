@@ -23,10 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (.get (.getField clojure.lang.RT "REQUIRE_LOCK") clojure.lang.RT)
   ```
 
-  `clojure.core/requiring-resolve` now holds it across its own `require`, as
-  Clojure's does: two threads resolving the same qualified symbol at once both
-  started loading its namespace, and the second could resolve a var out of a
-  half-loaded one.
+  `clojure.core/requiring-resolve` does NOT hold it, deliberately. Clojure's
+  does because its loader has no other guard against two threads loading one
+  namespace; jolt's loader blocks the second thread until the first one's load
+  of that namespace finishes, so the process-wide lock would add nothing — and
+  it adds a lock edge the loader's deadlock detector cannot see. A thread holding
+  it while waiting on a namespace whose top level reaches for it hangs both for
+  good, and did. `clojure.core/serialized-require` exists, private as upstream,
+  for code that reaches for the var.
 
 - **`clojure.lang.Compiler/munge`, and `clojure.core/munge` over the whole
   `CHAR_MAP`.** `munge` rewrote dashes and nothing else, so `(munge 'a?)` answered
