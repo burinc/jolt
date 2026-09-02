@@ -527,3 +527,17 @@
       (if f
           (begin (jolt-fiber-run f) (loop))
           #f))))
+
+;; --- capability-unchecked ---------------------------------------------------
+;; The unchecked fixnum / vector primitives (CONTRACT.txt): this target expands
+;; them to the checked primitives — the permitted degradation.
+(define-syntax sa-ufx+ (syntax-rules () ((_ a b) (fx+ a b))))
+(define-syntax sa-ufx- (syntax-rules () ((_ a b) (fx- a b))))
+(define-syntax sa-ufx<? (syntax-rules () ((_ a b) (fx<? a b))))
+(define-syntax sa-ufx>=? (syntax-rules () ((_ a b) (fx>=? a b))))
+(define-syntax sa-ufx=? (syntax-rules () ((_ a b) (fx=? a b))))
+(define-syntax sa-uvector-ref (syntax-rules () ((_ v i) (vector-ref v i))))
+(define-syntax sa-uvector-set! (syntax-rules () ((_ v i x) (vector-set! v i x))))
+;; gambit's vector-copy! has the R7RS shape already
+(define (sa-vector-copy-range! to at from start end)
+  (vector-copy! to at from start end))

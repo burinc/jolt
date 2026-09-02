@@ -10,25 +10,57 @@
 ;; bitmap HAMT. They live in Scheme; correctness, not perf, is the gate.
 
 ;; ============================================================================
-;; small immutable-vector helpers (manual; avoid stdlib arg-order ambiguity)
+;; small immutable-vector helpers
 ;; ============================================================================
+;; No copy here is a checked Scheme loop: the runtime compiles at
+;; optimize-level 2, where such a loop pays a type and bounds check per element
+;; (a 64-slot copy measured 390ns). Ranges the caller COMPUTES (vec-copy-range,
+;; vec-insert, vec-remove — trie leaves and nodes) go through the target's
+;; checked bulk move; the whole-vector copies below it (a node update, an
+;; array-map assoc/dissoc) run an unchecked loop over 0..n with n the source's
+;; own length, which on Chez beats the bulk-move primitive at every size (10
+;; slots: 14 vs 19ns, 64: 62 vs 72). Not vector-copy: the vendored irregex
+;; redefines that name at top level as a one-argument loop.
 (define (vec-copy-range v start end)
   (let ((out (make-vector (fx- end start))))
-    (let loop ((i start))
-      (when (fx<? i end) (vector-set! out (fx- i start) (vector-ref v i)) (loop (fx+ i 1))))
+    (sa-vector-copy-range! out 0 v start end)
     out))
 (define (vec-insert v i x)            ; copy of v with x spliced in at index i
   (let* ((n (vector-length v)) (out (make-vector (fx+ n 1))))
-    (let loop ((j 0)) (when (fx<? j i) (vector-set! out j (vector-ref v j)) (loop (fx+ j 1))))
+    (sa-vector-copy-range! out 0 v 0 i)
     (vector-set! out i x)
-    (let loop ((j i)) (when (fx<? j n) (vector-set! out (fx+ j 1) (vector-ref v j)) (loop (fx+ j 1))))
+    (sa-vector-copy-range! out (fx+ i 1) v i n)
     out))
-(define (vec-set v i x)               ; functional update at index i
-  (let ((out (vec-copy-range v 0 (vector-length v)))) (vector-set! out i x) out))
 (define (vec-remove v i)              ; copy of v with index i dropped
   (let* ((n (vector-length v)) (out (make-vector (fx- n 1))))
-    (let loop ((j 0)) (when (fx<? j i) (vector-set! out j (vector-ref v j)) (loop (fx+ j 1))))
-    (let loop ((j (fx+ i 1))) (when (fx<? j n) (vector-set! out (fx- j 1) (vector-ref v j)) (loop (fx+ j 1))))
+    (sa-vector-copy-range! out 0 v 0 i)
+    (sa-vector-copy-range! out i v (fx+ i 1) n)
+    out))
+;; slots 0..n-1 of v into out, unchecked: out was just made at least n long
+(define (vec-fill-prefix! out v n)
+  (let loop ((j 0))
+    (when (sa-ufx<? j n)
+      (sa-uvector-set! out j (sa-uvector-ref v j))
+      (loop (sa-ufx+ j 1)))))
+(define (vec-set v i x)               ; functional update at index i
+  (let* ((n (vector-length v)) (out (make-vector n)))
+    (vec-fill-prefix! out v n)
+    (vector-set! out i x)
+    out))
+;; the two below serve the array-mode map's k/v slot vector
+(define (vec-append2 v k x)           ; copy of v with k and x appended
+  (let* ((n (vector-length v)) (out (make-vector (fx+ n 2))))
+    (vec-fill-prefix! out v n)
+    (vector-set! out n k) (vector-set! out (fx+ n 1) x)
+    out))
+(define (vec-remove2 v i)             ; copy of v with slots i and i+1 dropped
+  (let* ((n (vector-length v)) (out (make-vector (fx- n 2))))
+    (vec-fill-prefix! out v i)
+    ;; the tail, shifted down two: j runs i+2..n-1 into i..n-3
+    (let loop ((j (fx+ i 2)))
+      (when (sa-ufx<? j n)
+        (sa-uvector-set! out (sa-ufx- j 2) (sa-uvector-ref v j))
+        (loop (sa-ufx+ j 1))))
     out))
 
 ;; ============================================================================
@@ -82,7 +114,7 @@
 ;; trailing helpers over Scheme vectors used by the trie
 (define (vec-snoc v x)                 ; copy v with x appended
   (let* ((n (vector-length v)) (out (make-vector (fx+ n 1))))
-    (let loop ((i 0)) (when (fx<? i n) (vector-set! out i (vector-ref v i)) (loop (fx+ i 1))))
+    (sa-vector-copy-range! out 0 v 0 n)
     (vector-set! out n x) out))
 (define (vec-drop-last v) (vec-copy-range v 0 (fx- (vector-length v) 1)))
 (define (vec-take v n) (vec-copy-range v 0 n))
@@ -157,17 +189,26 @@
 ;; raise and ->idx coercion lived in jolt-nth ahead of type dispatch; a
 ;; hoisted pvec case never reaches them, so both happen here, inlined — this
 ;; is the hot read, every call frame in front of pv-leaf-for costs.
+;; The tail is tested HERE, before pv-leaf-for: every vector of 32 or fewer
+;; elements is all tail, and a tail index is one subtraction and a vector-ref,
+;; where pv-leaf-for's two-value return through let-values costs 9 of the 13 ns
+;; a small-vector nth used to take. The trie path is unchanged.
+(define (pvec-nth-in-range p i)
+  (let* ((tail (pvec-tail p)) (tailoff (fx- (pvec-cnt p) (vector-length tail))))
+    (if (fx>=? i tailoff)
+        (vector-ref tail (fx- i tailoff))
+        (let-values (((chunk off) (pv-leaf-for p i))) (vector-ref chunk off)))))
 (define (pvec-nth! p i)
   (if (jolt-nil? i)
       (jolt-throw (jolt-host-throwable "java.lang.NullPointerException" "nth index"))
       (let ((i (if (fixnum? i) i (if (flonum? i) (exact (floor i)) i))))
         (if (and (fixnum? i) (fx>=? i 0) (fx<? i (pvec-cnt p)))
-            (let-values (((chunk off) (pv-leaf-for p i))) (vector-ref chunk off))
+            (pvec-nth-in-range p i)
             (jolt-throw (jolt-host-throwable "java.lang.IndexOutOfBoundsException" "index out of bounds"))))))
 (define (pvec-nth-d p i d)
   (let ((i (->idx i)))
     (if (and (fixnum? i) (fx>=? i 0) (fx<? i (pvec-cnt p)))
-        (let-values (((chunk off) (pv-leaf-for p i))) (vector-ref chunk off))
+        (pvec-nth-in-range p i)
         d)))
 
 ;; new-path: wrap a node in single-child nodes up `level` bits.
@@ -724,6 +765,10 @@
                     (make-hnode (hamt-ior eb nb) (vector (cons ek ev) (cons k v)))
                     (make-hnode (hamt-ior eb nb) (vector (cons k v) (cons ek ev))))))))))
 
+;; Answers the node ITSELF when the key is present with that very value — the
+;; reference's `if(val == valOrNode) return this` — so pmap-assoc can hand the
+;; caller's map back untouched (the eq? test at the root), the way both
+;; PersistentArrayMap.assoc and PersistentHashMap.assoc do.
 (define (node-assoc node shift h k v added)
   (let* ((bit (bitpos h shift)) (bm (hnode-bm node)) (arr (hnode-arr node)))
     (if (hamt=? 0 (hamt-and bm bit))
@@ -731,15 +776,19 @@
                (make-hnode (hamt-ior bm bit) (vec-insert arr (arr-index bm bit) (cons k v))))
         (let* ((i (arr-index bm bit)) (child (vector-ref arr i)))
           (cond
-            ((hnode? child) (make-hnode bm (vec-set arr i (node-assoc child (fx+ shift 5) h k v added))))
+            ((hnode? child)
+             (let ((nc (node-assoc child (fx+ shift 5) h k v added)))
+               (if (eq? nc child) node (make-hnode bm (vec-set arr i nc)))))
             ((hcoll? child)
-             (let ((al (hcoll-alist child)))
-               (if (assoc-jolt k al)
-                   (make-hnode bm (vec-set arr i (make-hcoll (hcoll-hash child) (alist-replace k v al))))
-                    (begin (set-box! added #t)
-                           (make-hnode bm (vec-set arr i (make-hcoll (hcoll-hash child) (append al (list (cons k v))))))))))
+             (let* ((al (hcoll-alist child)) (p (assoc-jolt k al)))
+               (cond ((not p)
+                      (set-box! added #t)
+                      (make-hnode bm (vec-set arr i (make-hcoll (hcoll-hash child) (append al (list (cons k v)))))))
+                     ((eq? (cdr p) v) node)
+                     (else (make-hnode bm (vec-set arr i (make-hcoll (hcoll-hash child) (alist-replace k v al))))))))
             ;; replace: the leaf keeps ITS key, not the equal one handed in
-            ((jolt= (car child) k) (make-hnode bm (vec-set arr i (cons (car child) v))))
+            ((jolt= (car child) k)
+             (if (eq? (cdr child) v) node (make-hnode bm (vec-set arr i (cons (car child) v)))))
             (else (set-box! added #t)
                   (make-hnode bm (vec-set arr i (split-leaf (fx+ shift 5) (car child) (cdr child) h k v)))))))))
 
@@ -943,22 +992,36 @@
 ;; ============================================================================
 ;; persistent map / set over the HAMT
 ;; ============================================================================
-;; A small map keeps its keys in INSERTION order (Clojure's PersistentArrayMap),
-;; converting to hash order past a threshold (PersistentHashMap). The HAMT root
-;; always backs the values; `order` is the auxiliary insertion-order key list when
-;; the map is in array mode, or #f once it has grown into hash mode. Equality and
-;; hashing fold over the entries order-independently, so this only affects
-;; iteration order (seq/keys/vals/print), matching the JVM.
-;; all-kw is dead — promotion consults only the ADDED key now — but the field
-;; stays so chez-pmap-v4's layout (image surface) is unchanged.
-(define-record-type pmap (fields root cnt order (mutable hasheq) (mutable all-kw)) (nongenerative chez-pmap-v4))
+;; A map is one of two representations behind one record type, told apart by
+;; its root — an hnode is the trie, anything else the slot vector (the test is
+;; hnode?, never vector?: a target may represent records as vectors):
+;;
+;;   ARRAY mode — root is a Scheme vector of alternating key/value slots
+;;     #(k0 v0 k1 v1 ...) in INSERTION order (Clojure's PersistentArrayMap).
+;;     Lookup is a linear scan specialized on the probe key's kind; assoc and
+;;     dissoc copy the vector. That is the whole structure: a 3-entry map is a
+;;     record and a 6-slot vector, where a trie-backed small map was a record,
+;;     a node, a leaf pair per entry and an order list on top.
+;;   HASH mode — root is an hnode, the bitmap HAMT above (PersistentHashMap).
+;;
+;; The mode is observable only through iteration order and (class m): equality
+;; and hashing fold over the entries order-independently. A map moves from
+;; array to hash mode when assoc would grow it past the thresholds below, and
+;; never back (PersistentHashMap.without does not demote).
+;;
+;; Image-format surface: chez-pmap-v5. Instances travel raw in a state image,
+;; so the layout (root cnt hasheq) is frozen; the previous generation
+;; (chez-pmap-v4: root cnt order hasheq all-kw, a trie root plus an order list)
+;; restores through state-image.ss's legacy arm.
+(define-record-type pmap (fields root cnt (mutable hasheq)) (nongenerative chez-pmap-v5))
 (define make-pmap
   (let ((raw (record-constructor (record-type-descriptor pmap))))
-    (lambda (root cnt order)
-      (let ((m (raw root cnt order 0 #f)))
-        m))))
-(define empty-pmap (make-pmap empty-hnode 0 '()))          ; {} = empty array map
-(define empty-pmap-hash (make-pmap empty-hnode 0 #f))      ; hash-order backing (sets)
+    (lambda (root cnt) (raw root cnt 0))))
+(define (pmap-array? m) (not (hnode? (pmap-root m))))
+(define amap-no-slots (vector))
+(define empty-pmap (make-pmap amap-no-slots 0))            ; {} = the shared empty array map
+(define (fresh-empty-pmap) (make-pmap amap-no-slots 0))   ; an empty result a caller may attach meta to
+(define empty-pmap-hash (make-pmap empty-hnode 0))        ; hash-order backing (sets)
 (define pmap-absent (list 'absent))    ; unique missing-key sentinel
 ;; PersistentArrayMap thresholds: assoc of a new key promotes to hash mode once
 ;; the map holds 8 entries (HASHTABLE_THRESHOLD = 16 array slots), unless the
@@ -970,150 +1033,274 @@
 (define array-map-limit-kw 64)
 (define (pmap-array-keep? cnt k)
   (or (fx<? cnt array-map-limit)
-      (and (keyword? k) (fx<? cnt array-map-limit-kw))))
-;; The order list holds (key . value) pairs (glojure's PersistentArrayMap keeps
-;; k/v adjacent): folds scan it directly with no per-key HAMT lookup, and assoc
-;; replacing an existing key updates the value in place via order-replace.
-(define (append-key ord k v) (cons (cons k v) ord))  ; O(1) prepend — reversed order, reversed at iteration
-;; keeps the stored key, like node-assoc's leaf replace — the order list is what
-;; seq/keys read, so a replaced value must not swap the key out from under them.
-(define (order-replace ord k v) (if (not ord) ord (let loop ((o ord)) (cond ((null? o) '()) ((jolt= (caar o) k) (cons (cons (caar o) v) (cdr o))) (else (cons (car o) (loop (cdr o))))))))
-(define (remove-key ord k) (let loop ((o ord)) (cond ((null? o) '()) ((jolt= (caar o) k) (cdr o)) (else (cons (car o) (loop (cdr o)))))))
+      (and (keyword-t? k) (fx<? cnt array-map-limit-kw))))
 
-;; growth rule (PersistentArrayMap.assoc): a new key appends to the order while in
-;; array mode under the limit; otherwise the result is hash-ordered. Replacing an
-;; existing key (or assoc onto an already-hash map) keeps the current order.
+;; --- the slot vector ----------------------------------------------------------
+;; Slot index of k among the first n slots of arr, or -1. The compare is chosen
+;; ONCE from the probe key's kind (Util.equivPred), not per slot: a keyword is
+;; interned, so identity is its equality and no other kind of key equals one;
+;; a fixnum only equals a fixnum (5 and 5.0 differ, a bignum never normalizes
+;; into fixnum range); a string only a string; a symbol only a symbol with the
+;; same name and namespace (the name first — it discriminates). Everything
+;; else takes jolt=2. n is passed rather than read so a transient's buffer,
+;; which carries spare capacity, scans only its used slots.
+;;
+;; The loops are unchecked (sa-u*): n <= the vector's length is the caller's
+;; invariant — a map passes the length itself, a transient its used count,
+;; which never exceeds the buffer — and i steps from 0 by 2, so every
+;; vector-ref is in range and every fixnum op stays fixnum. Checked, the same
+;; scan of a 64-keyword map costs 3x (92 -> 33ns at the last slot).
+(define (amap-index arr n k)
+  (cond
+    ((keyword-t? k)
+     (let lp ((i 0))
+       (cond ((sa-ufx>=? i n) -1)
+             ((eq? (sa-uvector-ref arr i) k) i)
+             (else (lp (sa-ufx+ i 2))))))
+    ((fixnum? k)
+     (let lp ((i 0))
+       (cond ((sa-ufx>=? i n) -1)
+             ((let ((x (sa-uvector-ref arr i))) (and (fixnum? x) (sa-ufx=? x k))) i)
+             (else (lp (sa-ufx+ i 2))))))
+    ((string? k)
+     (let lp ((i 0))
+       (cond ((sa-ufx>=? i n) -1)
+             ((let ((x (sa-uvector-ref arr i))) (and (string? x) (string=? x k))) i)
+             (else (lp (sa-ufx+ i 2))))))
+    ((symbol-t? k)
+     (let* ((kn (symbol-t-name k)) (kl (string-length kn)) (kns (symbol-t-ns k)))
+       (let lp ((i 0))
+         (cond ((sa-ufx>=? i n) -1)
+               ((let ((x (sa-uvector-ref arr i)))
+                  (and (symbol-t? x)
+                       (let ((xn (symbol-t-name x)))
+                         (or (eq? xn kn)
+                             (and (fx=? (string-length xn) kl) (string=? xn kn))))
+                       (let ((xns (symbol-t-ns x)))
+                         (or (eq? xns kns)
+                             (and (string? xns) (string? kns) (string=? xns kns))))))
+                i)
+               (else (lp (sa-ufx+ i 2)))))))
+    (else
+     (let lp ((i 0))
+       (cond ((sa-ufx>=? i n) -1)
+             ((jolt=2 (sa-uvector-ref arr i) k) i)
+             (else (lp (sa-ufx+ i 2))))))))
+(define (amap-get arr k d)
+  (let ((i (amap-index arr (vector-length arr) k)))
+    (if (fx<? i 0) d (vector-ref arr (fx+ i 1)))))
+;; Slots from a k v k v ... list of n pairs. A repeated key keeps its first
+;; position and takes the LAST value (createAsIfByAssoc), so the result can be
+;; shorter than 2n.
+(define (amap-from-kvs kvs n)
+  (let ((arr (make-vector (fx* 2 n))))
+    (let loop ((kvs kvs) (used 0))
+      (if (null? kvs)
+          (if (fx=? used (vector-length arr)) arr (vec-copy-range arr 0 used))
+          ;; used < 2n while pairs remain (at most one slot pair per list pair)
+          (let* ((k (car kvs)) (v (cadr kvs)) (i (amap-index arr used k)))
+            (if (fx>=? i 0)
+                (begin (sa-uvector-set! arr (sa-ufx+ i 1) v) (loop (cddr kvs) used))
+                (begin (sa-uvector-set! arr used k) (sa-uvector-set! arr (sa-ufx+ used 1) v)
+                       (loop (cddr kvs) (sa-ufx+ used 2)))))))))
+(define (amap-slots->pmap arr) (make-pmap arr (fxsra (vector-length arr) 1)))
+;; array -> hash: the slots become a trie. Keys are distinct by construction.
+(define (amap->hnode arr)
+  (let ((n (vector-length arr)) (added (box #f)))
+    (let loop ((i 0) (root empty-hnode))
+      (if (fx>=? i n) root
+          (let ((k (vector-ref arr i)))
+            (loop (fx+ i 2) (node-assoc root 0 (key-hash k) k (vector-ref arr (fx+ i 1)) added)))))))
+
+;; --- assoc / dissoc -----------------------------------------------------------
+;; growth rule (PersistentArrayMap.assoc): a new key appends to the slots while
+;; the map may stay in array mode; otherwise the slots become a trie first and
+;; the key goes in there. Replacing a key keeps its position. Assoc of the value
+;; already held is the map itself, in both modes.
+(define (pmap-hash-assoc m root k v)
+  (let* ((added (box #f)) (r (node-assoc root 0 (key-hash k) k v added)))
+    (cond ((unbox added) (make-pmap r (fx+ (pmap-cnt m) 1)))
+          ((eq? r root) m)
+          (else (make-pmap r (pmap-cnt m))))))
 (define (pmap-assoc m k v)
-  (let* ((added (box #f)) (r (node-assoc (pmap-root m) 0 (key-hash k) k v added))
-         (cnt (pmap-cnt m)) (ord (pmap-order m)))
-    (if (unbox added)
-        (if (and ord (pmap-array-keep? cnt k))
-            (make-pmap r (fx+ cnt 1) (append-key ord k v))
-            (make-pmap r (fx+ cnt 1) #f))
-        (make-pmap r cnt (order-replace ord k v)))))
-;; force-ordered / force-hash inserts for rebuilding a map whose final mode is
-;; already decided (array-map ctor, transient persistent!).
-(define (pmap-put-ordered m k v)
-  (let* ((added (box #f)) (r (node-assoc (pmap-root m) 0 (key-hash k) k v added)))
-    (if (unbox added)
-        (make-pmap r (fx+ (pmap-cnt m) 1) (append-key (or (pmap-order m) '()) k v))
-        (make-pmap r (pmap-cnt m) (order-replace (pmap-order m) k v)))))
+  (let ((root (pmap-root m)))
+    (if (hnode? root)
+        (pmap-hash-assoc m root k v)
+        (let ((i (amap-index root (vector-length root) k)))
+          (cond ((fx>=? i 0)
+                 (if (eq? (vector-ref root (fx+ i 1)) v)
+                     m
+                     (make-pmap (vec-set root (fx+ i 1) v) (pmap-cnt m))))
+                ((pmap-array-keep? (pmap-cnt m) k)
+                 (make-pmap (vec-append2 root k v) (fx+ (pmap-cnt m) 1)))
+                (else (pmap-hash-assoc m (amap->hnode root) k v)))))))
+;; force-hash insert for rebuilding a map whose final mode is already decided
+;; (hash-map ctor, a set's backing map).
 (define (pmap-put-hash m k v)
   (let* ((added (box #f)) (r (node-assoc (pmap-root m) 0 (key-hash k) k v added)))
-    (make-pmap r (if (unbox added) (fx+ (pmap-cnt m) 1) (pmap-cnt m)) #f)))
-(define (pmap->hash m) (if (pmap-order m) (make-pmap (pmap-root m) (pmap-cnt m) #f) m))
+    (make-pmap r (if (unbox added) (fx+ (pmap-cnt m) 1) (pmap-cnt m)))))
 (define (pmap-dissoc m k)
-  (let* ((removed (box #f)) (r (node-dissoc (pmap-root m) 0 (key-hash k) k removed))
-         (ord (pmap-order m)))
-    (if (unbox removed)
-        (make-pmap r (fx- (pmap-cnt m) 1) (if ord (remove-key ord k) #f))
-        m)))
-(define (pmap-get m k default) (node-get (pmap-root m) 0 (key-hash k) k default))
-;; Flattened hot lookup for the key types that dominate real lookups (keyword,
-;; fixnum, string). The layered path above costs ~40ns/call: case-lambda ->
-;; dispatch -> pmap? -> pmap-get -> key-hash -> jolt-hasheq cond -> node-get ->
-;; bitpos/chunk/arr-index/popcount -> VARIADIC jolt= (a rest-list alloc) ->
-;; jolt=2 type walk. Everything here is one procedure so cp0 inlines the local
-;; helpers (bitpos/arr-index/popcount) and the record preds/accessors; the key
-;; compare is specialized (keyword eq? / fixnum = / string string=?) instead of
-;; the generic jolt= walk. Anything else (bignum-keyed, symbolic, heterogeneous
-;; hashes) falls to pmap-get. Semantics identical to node-get.
+  (let ((root (pmap-root m)))
+    (if (hnode? root)
+        (let* ((removed (box #f)) (r (node-dissoc root 0 (key-hash k) k removed)))
+          (if (unbox removed) (make-pmap r (fx- (pmap-cnt m) 1)) m))
+        (let ((i (amap-index root (vector-length root) k)))
+          (cond ((fx<? i 0) m)
+                ;; the reference answers empty() — a fresh empty, since the caller
+                ;; may carry the source's metadata onto it (never onto the shared {})
+                ((fx=? (vector-length root) 2) (fresh-empty-pmap))
+                (else (make-pmap (vec-remove2 root i) (fx- (pmap-cnt m) 1))))))))
+
+;; --- lookup -------------------------------------------------------------------
+(define (pmap-get m k default)
+  (let ((root (pmap-root m)))
+    (if (hnode? root)
+        (node-get root 0 (key-hash k) k default)
+        (amap-get root k default))))
+;; The lookup the emitter and jolt-get route through. Array mode scans its
+;; slots — the keyword scan is inline here, being the shape (:k m) lowers to.
+;; Hash mode is flattened for the key types that dominate real lookups
+;; (keyword, fixnum, string, symbol): the layered path costs ~40ns/call —
+;; case-lambda -> dispatch -> pmap? -> pmap-get -> key-hash -> jolt-hasheq cond
+;; -> node-get -> bitpos/chunk/arr-index/popcount -> VARIADIC jolt= (a rest-list
+;; alloc) -> jolt=2 type walk. Everything here is one procedure so cp0 inlines
+;; the local helpers (bitpos/arr-index/popcount) and the record preds/accessors;
+;; the key compare is specialized (keyword eq? / fixnum = / string string=?)
+;; instead of the generic jolt= walk. Anything else (bignum-keyed, symbolic,
+;; heterogeneous hashes) falls to pmap-get. Semantics identical to node-get.
 (define (pmap-fast-get m k d)
-  (let ((h (cond ((keyword-t? k) (keyword-t-khash k))
-                 ((fixnum? k) (murmur3-hash-long-flat k))
-                 ((string? k) (string-hasheq k))
-                 ;; A SYMBOL key belongs on this path too. The reference
-                 ;; implementation makes no distinction — Util.equiv/hasheq treat a
-                 ;; Symbol key exactly like a Keyword one, and Symbol caches its
-                 ;; hasheq in a field the way Keyword does — but here a symbol fell
-                 ;; off the fast path entirely and took the generic pmap-get, whose
-                 ;; descent is not type-specialized. symbol-hasheq is already
-                 ;; memoized (on the symbol, and on its name cell), so this is the
-                 ;; same one-field read the keyword arm above is.
-                 ;;
-                 ;; It is a real shape, not a curiosity: code that looks a keyword's
-                 ;; SYMBOL form up in a map does it per lookup. honeysql's clause
-                 ;; walk asks (get m (kw->sym k)) for all 92 clauses on every format.
-                 ((symbol-t? k) (symbol-hasheq k))
-                 (else #f))))
-    (if (and h (fixnum? h))
-        (let ((h (hamt-and h hmask)))
-          (let lp ((node (pmap-root m)) (shift 0))
-            (let* ((bit (hamt-sll 1 (hamt-and (hamt-sra h shift) 31)))
-                   (bm (hnode-bm node)))
-              (if (hamt=? 0 (hamt-and bm bit)) d
-                  (let ((child (vector-ref (hnode-arr node)
-                                           (hamt-popcount (hamt-and bm (hamt-sub bit 1))))))
-                    (cond ((hnode? child) (lp child (fx+ shift 5)))
-                          ((hcoll? child)
-                           (let ((p (assoc-jolt k (hcoll-alist child)))) (if p (cdr p) d)))
-                          ((let ((ck (car child)))
-                             (cond ((keyword-t? ck) (and (keyword-t? k) (eq? ck k)))
-                                   ((fixnum? ck) (and (fixnum? k) (fx=? ck k)))
-                                   ((string? ck) (and (string? k) (string=? ck k)))
-                                   (else (jolt=2 ck k))))
-                           (cdr child))
-                          (else d)))))))
-        (pmap-get m k d))))
+  (let ((root (pmap-root m)))
+    (cond
+      ((not (hnode? root))
+       (if (keyword-t? k)
+           ;; unchecked like amap-index: n is the vector's own length, i steps
+           ;; from 0 by 2, and slot i+1 exists whenever slot i holds a key
+           (let ((n (vector-length root)))
+             (let lp ((i 0))
+               (cond ((sa-ufx>=? i n) d)
+                     ((eq? (sa-uvector-ref root i) k) (sa-uvector-ref root (sa-ufx+ i 1)))
+                     (else (lp (sa-ufx+ i 2))))))
+           (amap-get root k d)))
+      (else
+       (let ((h (cond ((keyword-t? k) (keyword-t-khash k))
+                      ((fixnum? k) (murmur3-hash-long-flat k))
+                      ((string? k) (string-hasheq k))
+                      ;; A SYMBOL key belongs on this path too. The reference
+                      ;; implementation makes no distinction — Util.equiv/hasheq treat a
+                      ;; Symbol key exactly like a Keyword one, and Symbol caches its
+                      ;; hasheq in a field the way Keyword does — but here a symbol fell
+                      ;; off the fast path entirely and took the generic pmap-get, whose
+                      ;; descent is not type-specialized. symbol-hasheq is already
+                      ;; memoized (on the symbol, and on its name cell), so this is the
+                      ;; same one-field read the keyword arm above is.
+                      ;;
+                      ;; It is a real shape, not a curiosity: code that looks a keyword's
+                      ;; SYMBOL form up in a map does it per lookup. honeysql's clause
+                      ;; walk asks (get m (kw->sym k)) for all 92 clauses on every format.
+                      ((symbol-t? k) (symbol-hasheq k))
+                      (else #f))))
+         (if (and h (fixnum? h))
+             (let ((h (hamt-and h hmask)))
+               (let lp ((node root) (shift 0))
+                 (let* ((bit (hamt-sll 1 (hamt-and (hamt-sra h shift) 31)))
+                        (bm (hnode-bm node)))
+                   (if (hamt=? 0 (hamt-and bm bit)) d
+                       (let ((child (vector-ref (hnode-arr node)
+                                                (hamt-popcount (hamt-and bm (hamt-sub bit 1))))))
+                         (cond ((hnode? child) (lp child (fx+ shift 5)))
+                               ((hcoll? child)
+                                (let ((p (assoc-jolt k (hcoll-alist child)))) (if p (cdr p) d)))
+                               ((let ((ck (car child)))
+                                  (cond ((keyword-t? ck) (and (keyword-t? k) (eq? ck k)))
+                                        ((fixnum? ck) (and (fixnum? k) (fx=? ck k)))
+                                        ((string? ck) (and (string? k) (string=? ck k)))
+                                        (else (jolt=2 ck k))))
+                                (cdr child))
+                               (else d)))))))
+             (node-get root 0 (key-hash k) k d)))))))
 ;; the stored (key . value) pair, or #f — `find` builds its entry from this so the
 ;; entry's key is the map's own key object, not the equal one probed with.
-(define (pmap-entry-at m k) (node-entry (pmap-root m) 0 (key-hash k) k))
-(define (pmap-contains? m k) (not (eq? pmap-absent (node-get (pmap-root m) 0 (key-hash k) k pmap-absent))))
+(define (pmap-entry-at m k)
+  (let ((root (pmap-root m)))
+    (if (hnode? root)
+        (node-entry root 0 (key-hash k) k)
+        (let ((i (amap-index root (vector-length root) k)))
+          (and (fx>=? i 0) (cons (vector-ref root i) (vector-ref root (fx+ i 1))))))))
+(define (pmap-contains? m k)
+  (let ((root (pmap-root m)))
+    (if (hnode? root)
+        (not (eq? pmap-absent (node-get root 0 (key-hash k) k pmap-absent)))
+        (fx>=? (amap-index root (vector-length root) k) 0))))
+
+;; --- folds --------------------------------------------------------------------
 ;; The universal fold idiom across the runtime is `(pmap-fold m (lambda (k v a)
 ;; (cons ... a)) '())`, which accumulates in REVERSE visitation order. So that this
-;; reconstructs the map's INSERTION order, pmap-fold visits an array-mode map's keys
-;; in reverse insertion order; a hash-mode map visits HAMT order (its iteration
-;; order is unspecified, so reverse-of-HAMT is equivalent and matches prior
-;; behaviour). Use pmap-fold-fwd when building a value directly in iteration order.
-;; The order list carries (key . value) pairs, so the array-mode arms below scan
-;; it directly — no per-key HAMT lookup. This matters most for the keyword-only
-;; 64-entry maps used in defrecord ext maps.
+;; reconstructs the map's INSERTION order, pmap-fold visits an array-mode map's
+;; slots from the last pair to the first; a hash-mode map visits HAMT order (its
+;; iteration order is unspecified, so reverse-of-HAMT is equivalent and matches
+;; prior behaviour). Use pmap-fold-fwd when building a value directly in
+;; iteration order.
 (define (pmap-fold m proc acc)
-  (let ((ord (pmap-order m)))
-    (if ord
-        ;; ord is reverse-insertion-order (newest first) (key . value) pairs;
-        ;; fold-left + cons = insertion order. Scanning the pairs directly avoids
-        ;; a HAMT lookup per key (the old (pmap-get m k) per element).
-        (fold-left (lambda (a p) (proc (car p) (cdr p) a)) acc ord)
-        (node-fold (pmap-root m) proc acc))))
+  (let ((root (pmap-root m)))
+    (if (hnode? root)
+        (node-fold root proc acc)
+        (let loop ((i (fx- (vector-length root) 2)) (acc acc))
+          (if (fx<? i 0) acc
+              (loop (fx- i 2) (proc (sa-uvector-ref root i) (sa-uvector-ref root (sa-ufx+ i 1)) acc)))))))
 ;; visit entries in iteration (insertion) order — for code that builds a new map /
 ;; ordered value directly rather than via cons-accumulation.
 (define (pmap-fold-fwd m proc acc)
-  (let ((ord (pmap-order m)))
-    (if ord
-        (let loop ((ps (reverse ord)) (a acc))
-          (if (null? ps) a (loop (cdr ps) (proc (caar ps) (cdar ps) a))))
-        (node-fold (pmap-root m) proc acc))))
+  (let ((root (pmap-root m)))
+    (if (hnode? root)
+        (node-fold root proc acc)
+        (let ((n (vector-length root)))
+          (let loop ((i 0) (acc acc))
+            (if (sa-ufx>=? i n) acc
+                (loop (sa-ufx+ i 2) (proc (sa-uvector-ref root i) (sa-uvector-ref root (sa-ufx+ i 1)) acc))))))))
+
+;; --- constructors -------------------------------------------------------------
 ;; map LITERAL ctor ({...}): RT.map/canBePAM — array map up to 8 entries, up to
 ;; 64 when every entry PAST the eighth is keyword-keyed (the first 8 slots may
-;; hold any key type). `ord` is reverse insertion order, so entries 9..cnt are
-;; its first (cnt - 8) pairs.
-(define (pam-literal? cnt ord)
-  (or (fx<=? cnt array-map-limit)
-      (and (fx<=? cnt array-map-limit-kw)
-           (let loop ((o ord) (n (fx- cnt array-map-limit)))
-             (or (fx<=? n 0)
-                 (and (keyword? (caar o)) (loop (cdr o) (fx- n 1))))))))
-(define (jolt-hash-map . kvs)
-  (let loop ((m empty-pmap) (kvs kvs))
-    (cond ((null? kvs)
-           (let ((cnt (pmap-cnt m)) (ord (pmap-order m)))
-             (if (pam-literal? cnt ord) m (pmap->hash m))))
-          ((null? (cdr kvs)) (throw-jvm (quote IllegalArgumentException) "odd number of map literal entries"))
-          (else (loop (pmap-put-ordered m (car kvs) (cadr kvs)) (cddr kvs))))))
+;; hold any key type). Decided on the entries as written, the way the reference
+;; reads init.length before building: a literal whose computed keys collapse
+;; onto each other still lands in the mode its shape chose. Repeated keys keep
+;; the first position and the last value (the reader has already refused a
+;; literal that repeats a key).
+(define (pam-literal-kvs? kvs n)       ; n = pair count
+  (or (fx<=? n array-map-limit)
+      (and (fx<=? n array-map-limit-kw)
+           (let loop ((kvs (list-tail kvs (fx* 2 array-map-limit))))
+             (or (null? kvs) (and (keyword-t? (car kvs)) (loop (cddr kvs))))))))
+(define (hash-from-kvs kvs)
+  (let loop ((m empty-pmap-hash) (kvs kvs))
+    (if (null? kvs) m (loop (pmap-put-hash m (car kvs) (cadr kvs)) (cddr kvs)))))
+(define (odd-kvs-error who)
+  (throw-jvm (quote IllegalArgumentException) (string-append "odd number of " who)))
+;; The one- and two-entry shapes are fixed arities so a dynamic literal of that
+;; size ({:a x :b y}, the commonest) builds without a rest list.
+(define jolt-hash-map
+  (case-lambda
+    (() empty-pmap)
+    ((k v) (make-pmap (vector k v) 1))
+    ((k1 v1 k2 v2)
+     (if (jolt=2 k1 k2) (make-pmap (vector k1 v2) 1) (make-pmap (vector k1 v1 k2 v2) 2)))
+    (kvs
+     (let ((n2 (length kvs)))
+       (when (fxodd? n2) (odd-kvs-error "map literal entries"))
+       (let ((n (fxsra n2 1)))
+         (if (pam-literal-kvs? kvs n)
+             (amap-slots->pmap (amap-from-kvs kvs n))
+             (hash-from-kvs kvs)))))))
 ;; array-map ctor: insertion-ordered (PersistentArrayMap, createAsIfByAssoc).
 ;; Never promotes — an explicit array-map stays an array map at any size.
 (define (jolt-array-map-build kvs)
-  (let loop ((m empty-pmap) (kvs kvs))
-    (cond ((null? kvs) m)
-          ((null? (cdr kvs)) (throw-jvm (quote IllegalArgumentException) "odd number of map entries"))
-          (else (loop (pmap-put-ordered m (car kvs) (cadr kvs)) (cddr kvs))))))
+  (let ((n2 (length kvs)))
+    (when (fxodd? n2) (odd-kvs-error "map entries"))
+    (if (fx=? n2 0) empty-pmap (amap-slots->pmap (amap-from-kvs kvs (fxsra n2 1))))))
 ;; hash-map-build: CL function hash-map — always hash-ordered (JVM PersistentHashMap).
 (define (jolt-hash-map-build kvs)
-  (let loop ((m empty-pmap-hash) (kvs kvs))
-    (cond ((null? kvs) m)
-          ((null? (cdr kvs)) (throw-jvm (quote IllegalArgumentException) "odd number of map entries"))
-          (else (loop (pmap-put-hash m (car kvs) (cadr kvs)) (cddr kvs))))))
+  (when (fxodd? (length kvs)) (odd-kvs-error "map entries"))
+  (hash-from-kvs kvs))
 
 (define-record-type pset (fields m (mutable hasheq)) (nongenerative chez-pset-v2))
 (define make-pset
@@ -1551,7 +1738,18 @@
      (if (hasheq-rejects? (pmap-hasheq a) (pmap-hasheq b))
          #f
          (and (fx=? (pmap-cnt a) (pmap-cnt b))
-              (pmap-fold a (lambda (k v ok) (and ok (jolt=2 (pmap-get b k pmap-absent) v))) #t))))
+              (let ((ra (pmap-root a)) (rb (pmap-root b)))
+                (if (not (or (hnode? ra) (hnode? rb)))
+                    ;; two slot vectors: look each of a's keys up in b's slots
+                    ;; directly — no closure per entry, the typed scan for the key
+                    (let ((n (vector-length ra)) (nb (vector-length rb)))
+                      (let loop ((i 0))
+                        (or (fx>=? i n)
+                            (let ((j (amap-index rb nb (vector-ref ra i))))
+                              (and (fx>=? j 0)
+                                   (jolt=2 (vector-ref ra (fx+ i 1)) (vector-ref rb (fx+ j 1)))
+                                   (loop (fx+ i 2)))))))
+                    (pmap-fold a (lambda (k v ok) (and ok (jolt=2 (pmap-fast-get b k pmap-absent) v))) #t))))))
     ((and (pset? a) (pset? b))
      (if (hasheq-rejects? (pset-hasheq a) (pset-hasheq b))
          #f

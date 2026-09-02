@@ -1309,9 +1309,10 @@
       "   (identical? (:cyc g) (:self (deref (:cyc g))))"
       "   (do (dosync (ref-set (:a g) 100)) (deref (:a g)))])")
     "[99 :hot true true 100]")
-;; format discipline: the new image writes header version 6 (3 added ref
+;; format discipline: the new image writes header version 7 (3 added ref
 ;; descriptors, 4 added image-rekey, 5 the jrec hasheq slot, 6 the image-sync
-;; marker), and its bytes carry the descriptor rtd, never the live ref rtd
+;; marker, 7 the flat array-map record), and its bytes carry the descriptor
+;; rtd, never the live ref rtd
 (define (bv-contains? bv s)
   (let* ((sb (string->utf8 s)) (m (bytevector-length sb)) (n (bytevector-length bv)))
     (let scan ((i 0))
@@ -1321,12 +1322,12 @@
                    (and (fx=? (bytevector-u8-ref bv (fx+ i j)) (bytevector-u8-ref sb j))
                         (cmp (fx+ j 1))))) #t)
             (else (scan (fx+ i 1)))))))
-(ok "ref-carrying image is format 6 with no raw jolt-ref rtd"
+(ok "ref-carrying image is format 7 with no raw jolt-ref rtd"
     (let ((port (open-file-input-port tmp)))
       (let* ((h (fasl-read port))
              (rest (get-bytevector-all port)))
         (close-port port)
-        (and (fx=? 6 (vector-ref h 1))
+        (and (fx=? 7 (vector-ref h 1))
              (bv-contains? rest "image-ref")
              (not (bv-contains? rest "jolt-ref-v2"))))))
 ;; an unknown format version refuses with a clean error naming both versions

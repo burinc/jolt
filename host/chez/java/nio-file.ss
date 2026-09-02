@@ -473,13 +473,15 @@
 
 ;; dir-stream is seqable (its child Paths) and closeable (a no-op) so
 ;; (with-open [s (newDirectoryStream d)] (mapv f s)) works.
-(let ((prev jolt-seq))
-  (set! jolt-seq (lambda (x)
-                   (cond ((dir-stream? x) (list->cseq (jhost-state x)))
-                         ((nio-path? x) (let ((segs (npath-segs (nio-path-str x))))
-                                          ;; the empty path iterates as one empty component (java parity)
-                                          (list->cseq (map make-nio-path (if (null? segs) '("") segs)))))
-                         (else (prev x))))))
+;; seq arms, not a set!-wrap of jolt-seq: a wrapper put two record tests in
+;; front of EVERY seq in the program (a vector's included); an arm is consulted
+;; only after jolt-seq's own types have missed.
+(register-seq-arm! dir-stream? (lambda (x) (list->cseq (jhost-state x))))
+(register-seq-arm! nio-path?
+  (lambda (x)
+    (let ((segs (npath-segs (nio-path-str x))))
+      ;; the empty path iterates as one empty component (java parity)
+      (list->cseq (map make-nio-path (if (null? segs) '("") segs))))))
 (let ((prev jolt-close))
   (set! jolt-close (lambda (x) (if (dir-stream? x) jolt-nil (prev x))))
   (def-var! "clojure.core" "__close" jolt-close))

@@ -305,5 +305,61 @@
     (not (raises? (lambda () (register-count-arm! armtest-t? (lambda (x) 7))))))
 (ok "registered count arm is consulted" (= 7 (jolt-count (make-armtest-t 1))))
 
+;; --- a base-vs-base pair never reaches the arms -----------------------------
+;; The JVM's Util.equiv has no extension point for two base scalars (nil, a
+;; number, keyword, symbol, string, char, boolean): a Keyword is never equal to a
+;; String, nil is equal only to nil. jolt=2 used to answer those pairs only after
+;; running every registered arm predicate — 145-240 ns per miss with 17 arms in a
+;; bare runtime, growing with each library — and `case` lowers to a chain of
+;; exactly those compares. They are answered ahead of the walk now, so the
+;; registry must refuse an arm that would claim one (the same invariant that
+;; keeps the same-type fast pairs honest), and a registered arm must never be
+;; consulted for one.
+(define eq-arm-calls 0)
+(define-record-type armcount-t (fields v) (nongenerative armcount-v1))
+(register-eq-arm! (lambda (a b)
+                    (set! eq-arm-calls (+ eq-arm-calls 1))
+                    (or (armcount-t? a) (armcount-t? b)))
+                  (lambda (a b) #t))
+(set! eq-arm-calls 0)
+(define k-a (keyword #f "a"))
+(define mixed-base-pairs
+  (list (cons k-a jolt-nil) (cons jolt-nil 5) (cons jolt-nil "s") (cons jolt-nil #f)
+        (cons k-a (jolt-symbol #f "a")) (cons (jolt-symbol #f "a") k-a)
+        (cons k-a "a") (cons "a" k-a) (cons 5 k-a) (cons 5 5.0) (cons 1/2 0.5)
+        (cons #t k-a) (cons #f 0) (cons #\a "a") (cons "1" 1) (cons #\a 97)))
+(for-each (lambda (p) (ok "mixed base pair is unequal" (not (jolt=2 (car p) (cdr p)))))
+          mixed-base-pairs)
+(ok "same-kind base pairs still answer"
+    (and (jolt=2 jolt-nil jolt-nil) (jolt=2 #\a #\a) (jolt=2 #t #t) (not (jolt=2 #t #f))
+         (jolt=2 1 1) (not (jolt=2 1 2)) (jolt=2 1/2 1/2) (jolt=2 2.5 2.5)))
+(ok "no eq arm consulted for base-vs-base pairs" (= eq-arm-calls 0))
+(ok "registered eq arm is still consulted for its own type"
+    (jolt=2 (make-armcount-t 1) (make-armcount-t 2)))
+(ok "eq arm rejects a cross-base pair"
+    (raises? (lambda () (register-eq-arm! (lambda (a b) (and (keyword-t? a) (string? b)))
+                                          (lambda (a b) #t)))))
+(ok "eq arm rejects a nil-vs-base pair"
+    (raises? (lambda () (register-eq-arm! (lambda (a b) (or (jolt-nil? a) (jolt-nil? b)))
+                                          (lambda (a b) #t)))))
+
+;; --- first answers a cell / a vector ahead of its arms ----------------------
+(define first-arm-calls 0)
+(define-record-type firstarm-t (fields v) (nongenerative firstarm-v1))
+(register-first-arm! (lambda (x) (set! first-arm-calls (+ first-arm-calls 1)) (firstarm-t? x))
+                     (lambda (x) 'arm))
+(set! first-arm-calls 0)
+(ok "first of a vector is its element 0" (= 1 (jolt-first (jolt-vector 1 2))))
+(ok "first of an empty vector is nil" (jolt-nil? (jolt-first (jolt-vector))))
+(ok "first of a list cell is its head" (= 3 (jolt-first (jolt-list 3 4))))
+(ok "first of nil is nil" (jolt-nil? (jolt-first jolt-nil)))
+(ok "no first arm consulted for a vector, a cell or nil" (= first-arm-calls 0))
+;; a string is neither, so it asks the arms on its way to its seq
+(ok "first of a string reaches its seq" (char=? #\a (jolt-first "ab")))
+(ok "registered first arm answers its type" (eq? 'arm (jolt-first (make-firstarm-t 1))))
+(ok "first arm rejects vector" (raises? (lambda () (register-first-arm! pvec? (lambda (x) x)))))
+(ok "first arm rejects cseq"   (raises? (lambda () (register-first-arm! cseq? (lambda (x) x)))))
+(ok "first arm rejects nil"    (raises? (lambda () (register-first-arm! jolt-nil?-fn (lambda (x) x)))))
+
 (printf "values-test: ~a/~a passed\n" (- total fails) total)
 (exit (if (> fails 0) 1 0))

@@ -1486,7 +1486,7 @@
      (jch-tags "clojure.lang.APersistentVector$SubVector"))
     ((pvec? obj) (jch-tags "clojure.lang.PersistentVector"))
     ((pmap? obj)
-     (if (pmap-order obj)
+     (if (pmap-array? obj)
          (jch-tags "clojure.lang.PersistentArrayMap")
          (jch-tags "clojure.lang.PersistentHashMap")))
     ((pset? obj) (jch-tags "clojure.lang.PersistentHashSet"))
@@ -2266,6 +2266,16 @@
         (let ((r ((cdar as) obj method-name rest-args)))
           (if (eq? r 'pass) (loop (cdr as)) r)))))
 
+(define (method-rest-args->list rest-args)
+  (cond
+    ((jolt-nil? rest-args) '())
+    ((and (pvec? rest-args)
+          (fx=?
+            (pvec-cnt rest-args)
+            (vector-length (pvec-tail rest-args))))
+     (vector->list (pvec-tail rest-args)))
+    (else (seq->list rest-args))))
+
 (register-method-arm!
   arm-priority-string
   (lambda (obj method-name rest-args)
@@ -2273,7 +2283,7 @@
         (jolt-string-method
           method-name
           obj
-          (if (jolt-nil? rest-args) '() (seq->list rest-args)))
+          (method-rest-args->list rest-args))
         'pass)))
 
 (register-method-arm!

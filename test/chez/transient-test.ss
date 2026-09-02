@@ -85,6 +85,8 @@
 (is "big map build"     "(count (persistent! (reduce (fn [t i] (assoc! t i i)) (transient {}) (range 200000))))" "200000")
 (is "big set build"     "(count (persistent! (reduce conj! (transient #{}) (range 200000))))" "200000")
 (is "big map see-through count" "(let [t (reduce (fn [t i] (assoc! t i i)) (transient {}) (range 200000))] [(count t) (get t 199999) (contains? t 0)])" "[200000 199999 true]")
+(is "big zipmap"        "(count (zipmap (range 200000) (range 200000)))" "200000")
+(is "big array-map source" "(count (persistent! (reduce (fn [t i] (assoc! t i i)) (transient (apply array-map (range 200))) (range 200000))))" "200000")
 
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))

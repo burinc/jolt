@@ -144,7 +144,9 @@
   '(with-mutex
     sa-foreign-procedure sa-foreign-procedure-native-error
     sa-foreign-procedure-blocking
-    sa-foreign-callable sa-foreign-callable-collect-safe))
+    sa-foreign-callable sa-foreign-callable-collect-safe
+    ;; capability-unchecked: expand to the checked primitives here
+    sa-ufx+ sa-ufx- sa-ufx<? sa-ufx>=? sa-ufx=? sa-uvector-ref sa-uvector-set!))
 
 (define (bound? s)
   (or (guard (e (#t #f)) (eval s (interaction-environment)) #t)
@@ -229,6 +231,17 @@
   (check "fxsll alias" (fxsll 1 4) 16)
   (check "fxsra alias" (fxsra 8 1) 4)
   (check "native fx+ still bound" (fx+ 1 2) 3)
+  ;; capability-unchecked: on this target each is the checked primitive
+  (check "sa-ufx+" (sa-ufx+ 1 2) 3)
+  (check "sa-ufx-" (sa-ufx- 5 2) 3)
+  (check "sa-ufx<?" (sa-ufx<? 1 2) #t)
+  (check "sa-ufx>=?" (sa-ufx>=? 2 2) #t)
+  (check "sa-ufx=?" (sa-ufx=? 3 3) #t)
+  (check "sa-uvector-ref" (sa-uvector-ref (vector 1 2 3) 1) 2)
+  (check "sa-uvector-set!" (let ((v (vector 1 2 3))) (sa-uvector-set! v 1 9) (vector-ref v 1)) 9)
+  (check "sa-vector-copy-range! (R7RS shape)"
+         (let ((to (make-vector 5 0))) (sa-vector-copy-range! to 1 (vector 7 8 9) 1 3) to)
+         (vector 0 8 9 0 0))
   (check "bitwise-arithmetic-shift-left (natives-num.ss spelling)" (bitwise-arithmetic-shift-left 1 40) 1099511627776)
   (check "bitwise-arithmetic-shift-right floor on negative" (bitwise-arithmetic-shift-right -7 1) -4))
 

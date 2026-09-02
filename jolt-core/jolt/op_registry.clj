@@ -96,9 +96,30 @@
    "quot"  {:call "jolt-quot" :arity #(= % 2)
             :lng "jolt-l-quot" :bd "jbd-quot"
             :num-result? true :num-args? true :foldable? true}
-   "unchecked-add"      {:lng "jolt-uncadd2"}
-   "unchecked-subtract" {:lng "jolt-uncsub2"}
-   "unchecked-multiply" {:lng "jolt-uncmul2"}
+   ;; The unchecked family lowers to its runtime helpers directly. Before, only a
+   ;; proven-:long operand pair reached jolt-uncadd2 (via :lng); every other call
+   ;; was var-deref + jolt-invoke + the variadic rest-list fold — 29 ns against
+   ;; 3.6 for + on the same operands, and the hinted-Clojure idiom libraries
+   ;; write (unchecked-inc on a loop counter, unchecked-add on an accumulator) is
+   ;; exactly what paid it. :fixed names the 2-arg entry; :lng keeps the proven-
+   ;; long path on the same WRAPPING helpers (never the raising fx ops); :dbl is
+   ;; the same flonum op as +/-/*: unchecked-* wrap only longs and are ordinary
+   ;; arithmetic on a flonum operand, so a proven-double pair unboxes too.
+   "unchecked-add"      {:call "jolt-unchecked-add" :fixed {2 "jolt-uncadd2"}
+                         :lng "jolt-uncadd2" :dbl "fl+"
+                         :dbl-contagion? true :num-result? true :num-args? true}
+   "unchecked-subtract" {:call "jolt-unchecked-sub" :fixed {2 "jolt-uncsub2"}
+                         :lng "jolt-uncsub2" :dbl "fl-"
+                         :dbl-contagion? true :num-result? true :num-args? true}
+   "unchecked-multiply" {:call "jolt-unchecked-mul" :fixed {2 "jolt-uncmul2"}
+                         :lng "jolt-uncmul2" :dbl "fl*"
+                         :dbl-contagion? true :num-result? true :num-args? true}
+   "unchecked-inc"      {:call "jolt-uncinc" :arity #(= % 1)
+                         :dbl-contagion? true :num-result? true :num-args? true}
+   "unchecked-dec"      {:call "jolt-uncdec" :arity #(= % 1)
+                         :dbl-contagion? true :num-result? true :num-args? true}
+   "unchecked-negate"   {:call "jolt-uncneg" :arity #(= % 1)
+                         :dbl-contagion? true :num-result? true :num-args? true}
    ;; collections
    "vector"      {:call "jolt-vector"}
    "hash-map"    {:call "jolt-hash-map-fn"}
@@ -142,6 +163,7 @@
    "filter"  {:call "jolt-filter"  :arity #(= % 2)}
    "remove"  {:call "jolt-remove"  :arity #(= % 2)}
    "reduce"  {:call "jolt-reduce"  :arity #(or (= % 2) (= % 3))}
+   "reduce-kv" {:call "jolt-reduce-kv" :arity #(= % 3)}
    "into"    {:call "jolt-into"    :arity #(= % 2)}
    "concat"  {:call "jolt-concat"}
    "apply"   {:call "jolt-apply"   :arity #(>= % 2)}

@@ -611,10 +611,20 @@
         mk-const (fn [c] (if (and (or (symbol? c) (seq? c) (vector? c) (map? c) (set? c))
                                   (not (tagged? c)))
                            `(quote ~c) c))
+        ;; a keyword, nil, true or false constant is compared by identity: a
+        ;; keyword is interned (and re-interned on image restore), and identical?
+        ;; is an inline native op where = is a call. That is what the reference
+        ;; does for these too (its case hashes then compares identity). Symbols,
+        ;; strings and numbers keep = — a symbol is not interned here.
+        ident-const? (fn [c] (or (keyword? c) (nil? c) (true? c) (false? c)))
+        mk-test1 (fn [c]
+                   (if (ident-const? c)
+                     `(identical? ~g ~c)
+                     `(= ~g ~(mk-const c))))
         mk-test (fn [c]
                   (if (seq? c)
-                    `(or ~@(map (fn [v] `(= ~g ~(mk-const v))) c))
-                    `(= ~g ~(mk-const c))))
+                    `(or ~@(map mk-test1 c))
+                    (mk-test1 c)))
         ;; Collect test constants pairwise (so a trailing unpaired default is
         ;; excluded), flattening list/or-group tests into individual constants.
         ;; seed-only fns (reduce/conj/first/rest/drop/empty?/seq?) — analyzer.clj

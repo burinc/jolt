@@ -133,9 +133,7 @@
 ;; 0.4us over 200k entries. Clojure answers the same question through
 ;; PersistentTreeMap.min(). The generic path stays for everything else, so
 ;; take/subseq still pay the materialization (bead jolt-r8tz.7).
-(define %h-first jolt-first)
-(set! jolt-first
-  (lambda (x) (if (htable-sorted? x) (sc-call x kw-op-first) (%h-first x))))
+(register-first-arm! htable-sorted? (lambda (x) (sc-call x kw-op-first)))
 (register-count-arm! htable-sorted?
   (lambda (coll) (sc-call coll kw-op-count)))
 (register-get-arm! htable-sorted? (lambda (coll k d) (sc-call coll kw-op-get k d)))

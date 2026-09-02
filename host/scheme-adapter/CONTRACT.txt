@@ -249,6 +249,32 @@ sa-make-boot-file
 sa-fasl-write
 sa-fasl-read
 #
+# tier: capability-unchecked
+# OUR OWN definitions in the adapter runtime file, SYNTAX. The unchecked
+# fixnum / vector primitives for the runtime's hot loops: the linear scan of a
+# small map's slot vector, a slot-vector copy. Contract: on VALID input —
+# fixnum operands whose result is a fixnum, a vector index in range — each
+# gives exactly the checked primitive's result. On invalid input the behaviour
+# is undefined, so a call site carries its own proof: a loop bound read from
+# the vector's own length or a used-count kept <= it, an index stepped from 0
+# by a constant. Degradation: a target may expand every one of these to the
+# checked primitive (gambit does) — the speed goes, nothing else. On Chez they
+# lower to the #3% (optimize-level 3) primitives, which is what makes a scan
+# loop 3x faster in the optimize-level 2 runtime.
+sa-ufx+
+sa-ufx-
+sa-ufx<?
+sa-ufx>=?
+sa-ufx=?
+sa-uvector-ref
+sa-uvector-set!
+#   (sa-vector-copy-range! to at from start end) -> unspecified: copy FROM's
+#     elements start..end-1 into TO at index at, the R7RS vector-copy! shape.
+#     Chez's vector-copy! takes (from from-start to to-start count), so its
+#     adapter reorders; a target with the R7RS order passes through. A bulk
+#     move in the target's runtime — what beats a Scheme copy loop.
+sa-vector-copy-range!
+#
 # tier: misc
 # format is the Chez/Guile ~a ~s ~d subset (SRFI-28); printf/fprintf are
 # format to the current/given output port. pretty-print is the standard

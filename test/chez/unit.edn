@@ -1285,10 +1285,12 @@
   {:suite "executor-shutdown" :expr "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) started (promise) go (promise) ran (atom 0)] (.execute ex (fn [] (deliver started true) (deref go 5000 :timeout))) (deref started 5000 :timeout) (dotimes [_ 5] (.execute ex (fn [] (swap! ran inc)))) (let [returned (.shutdownNow ex)] (deliver go true) [(count returned) @ran (.awaitTermination ex 10 java.util.concurrent.TimeUnit/SECONDS)]))" :expected "[5 0 true]"}
   {:suite "telemetry" :expr "(clojure.string/starts-with? (jolt.host/scheme-version) \"Chez Scheme\")" :expected "true"}
   {:suite "telemetry" :expr "(let [m (jolt.host/machine-type)] [(string? m) (pos? (count m))])" :expected "[true true]"}
-  ;; bytes-allocated reads the LIVE heap, so it only has to grow across an
-  ;; allocation the test still holds a reference to — dropping the data instead
-  ;; lets a collection land in between and legitimately shrink it.
-  {:suite "telemetry" :expr "(let [a (jolt.host/bytes-allocated) keep (into [] (map (fn [i] (str \"padpadpadpad\" i)) (range 100000))) b (jolt.host/bytes-allocated)] [(count keep) (> b a)])" :expected "[100000 true]"}
+  ;; bytes-allocated reads the heap as it stands: live data AND garbage not yet
+  ;; collected. Two readings around an allocation therefore do not order — a
+  ;; collection landing between them can free more of the earlier rows' garbage
+  ;; than the new data adds, and did on CI. What holds whatever the collector
+  ;; does is the lower bound: the reading counts the data still referenced.
+  {:suite "telemetry" :expr "(let [keep (into [] (map (fn [i] (str \"padpadpadpad\" i)) (range 100000))) b (jolt.host/bytes-allocated)] [(count keep) (> b (* 100000 16))])" :expected "[100000 true]"}
   ;; System/nanoTime is the JVM's MONOTONIC high-resolution timer, so it must not be
   ;; the wall clock and must not be millisecond-granular.
   {:suite "telemetry" :expr "(let [a (System/nanoTime) b (System/nanoTime)] (>= b a))" :expected "true"}
@@ -2111,6 +2113,43 @@
   {:suite "pmap-order" :expr "(str (into {} [[:a 1] [:b 2] [:a 9]]))" :expected "\"{:a 9, :b 2}\""}
   {:suite "pmap-order" :expr "(get (into {} [[:a 1] [:a 9]]) :a)" :expected "9"}
   {:suite "pmap-order" :expr "(str (keys (array-map :k0 0 :k1 1 :k2 2 :k3 3 :k4 4 :k5 5 :k6 6 :k7 7 :k8 8 :k9 9)))" :expected "\"(:k0 :k1 :k2 :k3 :k4 :k5 :k6 :k7 :k8 :k9)\""}
+  {:suite "pmap-order" :expr "(str (keys (dissoc {:a 1 :b 2 :c 3} :b)))" :expected "\"(:a :c)\""}
+  {:suite "pmap-order" :expr "(str (keys (dissoc (dissoc {:a 1 :b 2 :c 3} :a) :c)))" :expected "\"(:b)\""}
+  ;; TransientArrayMap.doWithout moves the last entry into the removed slot
+  {:suite "pmap-order" :expr "(str (keys (persistent! (dissoc! (transient {:a 1 :b 2 :c 3}) :a))))" :expected "\"(:c :b)\""}
+  {:suite "pmap-order" :expr "(str (keys (persistent! (dissoc! (transient {:a 1 :b 2 :c 3}) :c))))" :expected "\"(:a :b)\""}
+  {:suite "pmap-order" :expr "(str (keys (persistent! (assoc! (dissoc! (transient {:a 1 :b 2 :c 3}) :a) :d 4))))" :expected "\"(:c :b :d)\""}
+  ;; assoc of the value already held answers the same map (PersistentArrayMap
+  ;; and PersistentHashMap both return this), dissoc of an absent key too
+  {:suite "pmap-order" :expr "(let [m {:a 1 :b 2}] (identical? m (assoc m :a 1)))" :expected "true"}
+  {:suite "pmap-order" :expr "(let [m (hash-map :a 1 :b 2)] (identical? m (assoc m :a 1)))" :expected "true"}
+  {:suite "pmap-order" :expr "(let [m {:a 1 :b 2}] (identical? m (dissoc m :zz)))" :expected "true"}
+  {:suite "pmap-order" :expr "(let [m (hash-map :a 1 :b 2)] (identical? m (dissoc m :zz)))" :expected "true"}
+  {:suite "pmap-order" :expr "(let [m {:a 1 :b 2}] (identical? m (assoc m :a 2)))" :expected "false"}
+  ;; the map keeps the key object it holds: find and a replacing assoc answer
+  ;; with the stored key, not the equal one probed with
+  {:suite "pmap-order" :expr "(let [k1 (str \"x\" \"y\") k2 (str \"x\" \"y\") m {k1 1}] [(identical? k1 k2) (identical? k1 (key (find m k2))) (identical? k1 (key (first (assoc m k2 2))))])" :expected "[false true true]"}
+  {:suite "pmap-order" :expr "(let [k1 (str \"x\" \"y\") k2 (str \"x\" \"y\") m (hash-map k1 1)] [(identical? k1 (key (find m k2))) (identical? k1 (key (first (assoc m k2 2))))])" :expected "[true true]"}
+  ;; lookup answers by kind: a keyword only matches a keyword, a string a
+  ;; string, a fixnum a fixnum of the same exactness class
+  {:suite "pmap-order" :expr "[(get {:a 1} 'a) (get {'a 1} :a) (get {\"a\" 1} 'a) (get {'a 1} \"a\") (get {1 :i} 1.0) (get {1.0 :d} 1) (get {1 :i} 1) (get {nil :n} nil) (get {\\a :c} \\a) (get {[1 2] :v} [1 2]) (get {12345678901234567890 :big} 12345678901234567890)]" :expected "[nil nil nil nil nil nil :i :n :c :v :big]"}
+  {:suite "pmap-order" :expr "(let [m (reduce (fn [m i] (assoc m (keyword (str \"k\" i)) i)) {} (range 40))] [(type m) (get m :k37) (get m :k0) (get m :zz) (count (dissoc m :k3))])" :expected "[clojure.lang.PersistentArrayMap 37 0 nil 39]"}
+  {:suite "pmap-order" :expr "(meta (dissoc (with-meta {:a 1} {:m 1}) :a))" :expected "{:m 1}"}
+  {:suite "pmap-order" :expr "(let [m (dissoc {:a 1} :a)] [(= {} m) (count m) (type m) (type (assoc m :b 2))])" :expected "[true 0 clojure.lang.PersistentArrayMap clojure.lang.PersistentArrayMap]"}
+  {:suite "pmap-order" :expr "(str (keys (into {} [[:c 3] [:a 1] [:b 2]])))" :expected "\"(:c :a :b)\""}
+  {:suite "pmap-order" :expr "(str (keys (persistent! (transient {:c 3 :a 1 :b 2}))))" :expected "\"(:c :a :b)\""}
+  ;; the seq view counts without walking and keeps the map's order
+  {:suite "pmap-order" :expr "(let [s (seq {:c 3 :a 1 :b 2})] [(count s) (count (rest s)) (key (first s)) (key (second s)) (chunked-seq? s) (type s)])" :expected "[3 2 :c :a false clojure.lang.PersistentArrayMap$Seq]"}
+  {:suite "pmap-order" :expr "(let [s (seq (hash-map :a 1 :b 2))] [(count s) (type s) (= (map key s) (keys (hash-map :a 1 :b 2)))])" :expected "[2 clojure.lang.PersistentHashMap$NodeSeq true]"}
+  {:suite "pmap-order" :expr "(let [m {:c 3 :a 1 :b 2}] [(type (keys m)) (type (vals m)) (count (keys m)) (= (keys m) (map key (seq m))) (= (vals m) (map val (seq m)))])" :expected "[clojure.lang.APersistentMap$KeySeq clojure.lang.APersistentMap$ValSeq 3 true true]"}
+  ;; reduce-kv is native: folds in place, honors reduced, drives IKVReduce
+  {:suite "pmap-order" :expr "(reduce-kv (fn [a k v] (if (= k :b) (reduced a) (+ a v))) 0 (array-map :a 1 :b 2 :c 3))" :expected "1"}
+  {:suite "pmap-order" :expr "(reduce-kv (fn [a i v] (if (= i 1) (reduced a) (+ a v))) 0 [10 20 30])" :expected "10"}
+  {:suite "pmap-order" :expr "(reduce-kv (fn [a k v] (+ a v)) 7 nil)" :expected "7"}
+  {:suite "pmap-order" :expr "(sort (reduce-kv (fn [a k v] (conj a (+ k v))) [] (zipmap (range 20) (range 20))))" :expected "(0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36 38)"}
+  {:suite "pmap-order" :expr "(reduce-kv (fn [a k v] (conj a k)) [] (sorted-map 3 1 1 2 2 3))" :expected "[1 2 3]"}
+  {:suite "pmap-order" :expr "(do (defrecord KvRec [x y]) (reduce-kv (fn [a k v] (assoc a k v)) {} (->KvRec 1 2)))" :expected "{:x 1, :y 2}"}
+  {:suite "pmap-order" :expr "(try (reduce-kv + 0 5) (catch IllegalArgumentException e :iae))" :expected ":iae"}
   ;; satisfies? on a host interface (a Class, not a defprotocol) must throw — the
   ;; JVM errors too — but with a non-empty message naming the offending value.
   ;; Not JVM-certifiable (the JVM's own message differs), so a unit row.
