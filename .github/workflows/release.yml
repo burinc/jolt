@@ -1,9 +1,12 @@
 name: release
 
 # Build the self-contained jolt binary for each platform and attach it to the
-# GitHub Release when a v* tag is pushed. The binary bundles the runtime,
-# compiler, jolt-core + stdlib source, the Chez boots, and a launcher stub, so it
-# runs AND compiles jolt apps with no Chez or cc on the user's machine (jolt-eaj).
+# GitHub Release when a v* tag is pushed — and, daily, publish main as the
+# rolling `vnightly` prerelease (`install --version nightly`) so a downstream
+# project can test against unreleased jolt without building it. The binary
+# bundles the runtime, compiler, jolt-core + stdlib source, the Chez boots, and a
+# launcher stub, so it runs AND compiles jolt apps with no Chez or cc on the
+# user's machine (jolt-eaj).
 #
 # No Apple notarization, mirroring dirge: macOS users who download the tarball
 # clear Gatekeeper quarantine once (`xattr -d com.apple.quarantine jolt`), or
@@ -11,42 +14,107 @@ name: release
 on:
   push:
     tags:
-      - 'v*'
+      # Release tags only. `vnightly` is a tag too — moved to main's head by the
+      # schedule below — and it must never enter the release path.
+      - 'v[0-9]*'
   workflow_dispatch:
     inputs:
       nightly:
-        description: "Build and publish the rolling nightly prerelease, as the schedule does"
+        description: "Publish this run as the rolling vnightly prerelease, as the daily schedule does (from main only). Unticked: a dry run — build and gate, publish nothing."
         type: boolean
         required: false
         default: false
-  # A rolling prerelease built from main daily, so downstream projects can test
-  # against unreleased jolt without building it from source. The tagged-release
-  # path is untouched: `publish` and `homebrew` are already guarded to
-  # refs/tags, so a scheduled run never reaches them.
+  # main, daily: the same build and fleet gates as a release, then
+  # publish-nightly replaces `vnightly`. The tag name is the install script's:
+  # it does `tag="v${version#v}"` and `filename="jolt-${tag}-${target}.tar.gz"`,
+  # so `--version nightly` resolves to jolt-vnightly-<target>.tar.gz with the
+  # installer unchanged.
   schedule:
     - cron: '0 17 * * *'
 
 permissions:
   contents: write   # create/update the GitHub Release and upload assets
 
-# The tag everything is named for, decided once because the package name, the
-# asset names and the release all have to agree. A tag push uses the tag; a
-# scheduled build uses the rolling `vnightly`.
-#
-# That name is not arbitrary. jolt's own install script does
-# `tag="v${version#v}"` and `filename="jolt-${tag}-${target}.tar.gz"`, so tag
-# `vnightly` makes `--version nightly` resolve to `jolt-vnightly-<target>.tar.gz`,
-# and a nightly is installable with the shipped installer, unchanged.
-env:
-  # Schedule or an explicit dispatch. Without the dispatch half the nightly path
-  # can only ever be exercised by waiting for the cron, which makes it
-  # untestable in a fork and unreviewable in a pull request.
-  JOLT_NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly == true }}
-  JOLT_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'vnightly' }}
-
 jobs:
+  # What this run IS, decided once and read by every job below. Three kinds:
+  #
+  #   release     a v<digits> tag was pushed. Assets named for the tag, drafted
+  #               per platform, published (and the Homebrew tap bumped) once the
+  #               fleet gates pass.
+  #   nightly     the schedule, or a dispatch with `nightly` ticked, on main. The
+  #               same build and gates, then `vnightly` is replaced. Reads
+  #               `nightly-current` when this commit already IS the published
+  #               nightly: nothing to build.
+  #   dry-run     any other dispatch. Build and gate, publish nothing.
+  #
+  # A job output rather than a workflow `env`: the job-level `if:` that keeps a
+  # nightly out of `publish`/`homebrew` and a release out of `publish-nightly`
+  # cannot read `env`, and a condition spelled out per job drifts.
+  #
+  # The version build-jolt bakes into the binary is decided here too. A tag
+  # names itself; everything else is tools/version.sh, the answer a dev checkout
+  # gives (v0.8.0-56-g63374117), which needs the tags and the history back to
+  # the newest one — hence fetch-depth 0. Once, on this runner, rather than per
+  # build row: the Linux row builds inside a container where the mounted
+  # checkout belongs to another user and git refuses to read it, and a shallow
+  # checkout would answer with a bare sha.
+  meta:
+    name: what this run is
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      kind: ${{ steps.decide.outputs.kind }}
+      tag: ${{ steps.decide.outputs.tag }}
+      version: ${{ steps.decide.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          # The one place the nightly's triggers are spelled out.
+          NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly == true }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/tags/vnightly)
+              echo "::error::vnightly is the rolling nightly tag, not a release — dispatch from a branch"
+              exit 1 ;;
+            refs/tags/v[0-9]*)
+              kind=release; tag="$GITHUB_REF_NAME"; version="$GITHUB_REF_NAME" ;;
+            *)
+              version="$(tools/version.sh)"
+              if [ "$NIGHTLY" = true ]; then
+                # A nightly is a build of main: by definition, and by what its
+                # release notes say it is.
+                if [ "$GITHUB_REF" != refs/heads/main ]; then
+                  echo "::error::a nightly publishes only from main, not from $GITHUB_REF"
+                  exit 1
+                fi
+                kind=nightly; tag=vnightly
+                # Already published from this commit? Both the tag here AND the
+                # release live, not just the tag: the release can be gone with
+                # the tag still here (deleted by hand), or live with the tag
+                # still on yesterday's commit (a run that died after publishing,
+                # before the move). Either one reruns.
+                at="$(gh api "repos/${GH_REPO}/git/ref/tags/vnightly" --jq .object.sha 2>/dev/null || true)"
+                if [ "$at" = "$GITHUB_SHA" ] && gh api "repos/${GH_REPO}/releases/tags/vnightly" >/dev/null 2>&1; then
+                  kind=nightly-current
+                  echo "vnightly is already the published build of ${GITHUB_SHA}; nothing to do"
+                fi
+              else
+                kind=dry-run; tag="$version"
+              fi ;;
+          esac
+          echo "kind=${kind} tag=${tag} version=${version}"
+          { echo "kind=${kind}"; echo "tag=${tag}"; echo "version=${version}"; } >> "$GITHUB_OUTPUT"
+
   build:
     name: build ${{ matrix.target }}
+    needs: meta
+    if: needs.meta.outputs.kind != 'nightly-current'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -106,6 +174,8 @@ jobs:
 
       - name: Build jolt in ${{ matrix.container-build }} (Linux)
         if: runner.os == 'Linux'
+        env:
+          JOLT_VERSION: ${{ needs.meta.outputs.version }}
         run: |
           mkdir -p "$HOME/chez-opt"
           docker run --rm \
@@ -113,7 +183,7 @@ jobs:
             -v "$HOME/chez-src":/chez-src:ro \
             -v "$HOME/chez-opt":/opt/chez \
             -w /src \
-            -e JOLT_VERSION="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}" \
+            -e JOLT_VERSION="$JOLT_VERSION" \
             -e STATIC_DEPS=1 \
             '${{ matrix.container-build }}' sh ci/glibc-floor-build.sh
 
@@ -229,9 +299,8 @@ jobs:
         if: runner.os != 'Linux'
         run: make jolt-release JOLT_CROSS_TARGET="${{ matrix.cross }}"
         env:
-          # Bake the release tag into the binary (build-jolt falls back to
-          # `git describe` when this is empty, e.g. a workflow_dispatch dry run).
-          JOLT_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          # Bake the version into the binary: the tag, or meta's describe string.
+          JOLT_VERSION: ${{ needs.meta.outputs.version }}
 
       - name: Inspect the binary (Windows)
         if: runner.os == 'Windows'
@@ -283,6 +352,8 @@ jobs:
           test "$out" = "Hello, runtime!" || { echo "runtime require ran '$out', want 'Hello, runtime!'"; exit 1; }
 
       - name: Package
+        env:
+          JOLT_TAG: ${{ needs.meta.outputs.tag }}
         run: |
           ver="${JOLT_TAG}"
           name="jolt-${ver}-${{ matrix.target }}"
@@ -299,13 +370,10 @@ jobs:
           ls -la dist
 
       # The linux binary is what the fleet gates below run against, so hand it over
-      # as a workflow artifact. A workflow_dispatch dry run creates no release, so
-      # the artifact — not `gh release download` — is the only way to reach it.
-      # `**` and the find-based unpack below, not a fixed glob: on a
-      # workflow_dispatch dry run GITHUB_REF_NAME is the BRANCH, so a branch with a
-      # slash in it ("fix/foo") nests the tarball a directory deeper. Real tags never
-      # do, but the dry run is how this gate gets tested before a release depends on
-      # it, so it has to survive one.
+      # as a workflow artifact. A dry run creates no release, so the artifact — not
+      # `gh release download` — is the only way to reach it. The gates find the
+      # tarball by its `*x86_64-linux.tar.gz` suffix, so the version in its name
+      # (a tag, or a describe string) is theirs to ignore.
       - name: Upload the linux binary for the fleet gates
         if: matrix.target == 'x86_64-linux'
         uses: actions/upload-artifact@v4
@@ -314,31 +382,25 @@ jobs:
           path: dist/**/*.tar.gz
           retention-days: 1
 
-      # Draft first, exactly as a real release does and for the same reason: a
-      # nightly that fails the gates below stays a draft nobody can install, and
-      # the previous nightly remains the newest thing available.
-      - name: Upload to the nightly prerelease (draft)
-        if: env.JOLT_NIGHTLY == 'true'
-        uses: softprops/action-gh-release@v2
+      # A nightly's assets go to publish-nightly as workflow artifacts, one per
+      # platform, and touch no release until every gate has passed: that job is
+      # the only writer of `vnightly`, so a red gate leaves the previous nightly
+      # exactly as it was. Not a per-row release upload as the tag path does
+      # below — that looks the release up by tag, which from the second night on
+      # finds yesterday's PUBLISHED nightly and replaces its assets in place,
+      # platform by platform, an hour before the gates have run.
+      - name: Hand the assets to publish-nightly
+        if: needs.meta.outputs.kind == 'nightly'
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: vnightly
-          name: nightly
-          draft: true
-          prerelease: true
-          target_commitish: ${{ github.sha }}
-          body: |
-            Rolling build of `main`, replaced daily. Not a release: no
-            compatibility promise, and it may be broken.
-
-                curl -sSL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash -s -- --version nightly
-
-            Built from ${{ github.sha }}.
-          files: |
+          name: nightly-${{ matrix.target }}
+          path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
             dist/*.zip
             dist/*.zip.sha256
-          fail_on_unmatched_files: false
+          if-no-files-found: error
+          retention-days: 1
 
       # DRAFT, so the release is not public until the fleet gates pass: `publish`
       # below flips it. A draft is invisible to the install script and to Homebrew
@@ -346,7 +408,7 @@ jobs:
       # with assets attached for inspection and nothing anyone can install —
       # i.e. the release aborts. Each matrix row creates-or-updates the same draft.
       - name: Upload to the GitHub Release (draft)
-        if: startsWith(github.ref, 'refs/tags/')
+        if: needs.meta.outputs.kind == 'release'
         uses: softprops/action-gh-release@v2
         with:
           draft: true
@@ -359,9 +421,10 @@ jobs:
 
   # --- fleet gates: the jolt-lang libraries and examples, on the tag's own binary.
   #
-  # These run ONLY here (release.yml is `on: push: tags: v*` + workflow_dispatch), so
-  # a regular commit or PR pays nothing for them — tests.yml stays the per-commit
-  # gate. The cost lands once per release, where it buys the thing the jolt-repo gate
+  # These run ONLY here (release.yml is `on: push: tags: v*` + workflow_dispatch +
+  # the nightly schedule), so a regular commit or PR pays nothing for them —
+  # tests.yml stays the per-commit gate. The cost lands once per release and once
+  # per nightly, where it buys the thing the jolt-repo gate
   # structurally cannot see: whether a language change breaks real code that a user
   # would `git/sha`-pin. v0.5.13 is the case in point — making byte[] elements signed
   # was correct and fully green in-repo, and truncated every HTTP response body in
@@ -593,7 +656,8 @@ jobs:
   # gate reads the ratio. A number in ms would false-fail whenever the runner was
   # slow and pass on a fast one while hiding a real regression.
   #
-  # Compares the release being cut against the newest published release. Skipped,
+  # Compares the release being cut against the newest published release — never
+  # the rolling nightly, which is a prerelease and excluded below. Skipped,
   # loudly, when there is no earlier release to compare against.
   bench:
     name: benchmarks vs the last release
@@ -635,7 +699,9 @@ jobs:
           set -eu
           # The newest PUBLISHED release, which is the last one users could have
           # installed. This tag's own release is still a draft at this point, so it
-          # cannot select itself; --exclude-drafts says so regardless.
+          # cannot select itself; --exclude-drafts says so regardless, and
+          # --exclude-pre-releases keeps `vnightly` out, so a nightly is gated
+          # against the last release rather than against yesterday's nightly.
           tag="$(gh release list --limit 20 --exclude-drafts --exclude-pre-releases \
                    --json tagName --jq '.[0].tagName' 2>/dev/null || true)"
           if [ -z "$tag" ] || [ "$tag" = "null" ]; then
@@ -664,51 +730,101 @@ jobs:
   # tag and assets intact for inspection.
   publish:
     name: publish the release
-    needs: [build, libraries, libraries-db, examples, bench]
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [meta, build, libraries, libraries-db, examples, bench]
+    if: needs.meta.outputs.kind == 'release'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - name: Un-draft ${{ github.ref_name }}
+      - name: Un-draft ${{ needs.meta.outputs.tag }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-        run: gh release edit "${GITHUB_REF_NAME}" --draft=false --latest
+          JOLT_TAG: ${{ needs.meta.outputs.tag }}
+        run: gh release edit "${JOLT_TAG}" --draft=false --latest
 
-  # The nightly's counterpart to `publish`, behind the same gates, so a rolling
-  # build that breaks the libraries, examples or bench never becomes
-  # installable: it stays a draft and the previous nightly remains newest.
+  # The nightly's counterpart to `publish`, behind the same gates. `vnightly` is
+  # REPLACED, never edited: this build is staged as a draft with every asset
+  # attached, the previous nightly is deleted, the draft is published under the
+  # tag, and the tag is moved to this commit. Nothing anyone can install changes
+  # before the delete, so a run that dies earlier — a red gate, a lost runner —
+  # leaves the previous nightly exactly as it was, and the window with no
+  # installable nightly is the one API call between the delete and the publish.
   #
-  # The tag is moved explicitly. softprops creates `vnightly` at the current sha
-  # when it does not exist but leaves it alone when it does, so without this the
-  # tag drifts behind the assets attached to it.
+  # Staged under a name that is not the tag (`vnightly-staging`), so nothing
+  # about the draft can collide with the live `vnightly` while both exist, and
+  # addressed by release id throughout: here a tag name may mean the old
+  # release, the new one, or a draft an earlier run left behind.
   publish-nightly:
     name: publish nightly
-    needs: [build, libraries, libraries-db, examples, bench]
-    if: github.event_name == 'schedule' || inputs.nightly == true
+    needs: [meta, build, libraries, libraries-db, examples, bench]
+    if: needs.meta.outputs.kind == 'nightly'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
+    # A dispatch alongside the schedule: the swaps run one at a time.
+    concurrency:
+      group: publish-nightly
     steps:
-      - name: Point vnightly at this commit and publish it
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nightly-*
+          merge-multiple: true
+          path: dist
+      - name: Replace vnightly with this build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
           set -euo pipefail
-          # --latest=false matters: a prerelease must never displace the newest
-          # real release, which is what the install script's bare invocation and
-          # the Homebrew tap both read.
-          gh release edit vnightly --draft=false --prerelease --latest=false
+          ls -la dist
+          # A fork's nightly lives on the fork, and the installer needs telling.
+          repo_flag=""
+          [ "$GH_REPO" = jolt-lang/jolt ] || repo_flag=" --repo ${GH_REPO}"
+          body="$(printf '%s\n' \
+            "Rolling build of \`main\`, replaced daily. Not a release: no compatibility promise, and it may be broken. \`jolt --version\` reports \`${VERSION}\`." \
+            "" \
+            "    curl -sSL https://raw.githubusercontent.com/${GH_REPO}/main/install | bash -s -- --version nightly${repo_flag}" \
+            "" \
+            "Built from ${SHA}.")"
+
+          # 1. Stage: a draft with every asset attached. Nothing visible yet.
+          id="$(gh api -X POST "repos/${GH_REPO}/releases" \
+                  -f tag_name=vnightly-staging -f name=nightly -f target_commitish="$SHA" \
+                  -F draft=true -F prerelease=true -f make_latest=false -f body="$body" \
+                  --jq .id)"
+          echo "staged draft ${id}"
+          for f in dist/*; do
+            gh api -X POST -H "Content-Type: application/octet-stream" \
+              "https://uploads.github.com/repos/${GH_REPO}/releases/${id}/assets?name=$(basename "$f")" \
+              --input "$f" --jq '"  \(.name) (\(.size) bytes)"'
+          done
+
+          # 2. Retire the previous nightly, and any staging draft a run that
+          #    died between here and the publish left behind.
+          gh api --paginate "repos/${GH_REPO}/releases" \
+            --jq ".[] | select((.tag_name == \"vnightly\" or .tag_name == \"vnightly-staging\") and .id != ${id}) | .id" \
+          | while read -r old; do
+              echo "deleting release ${old}"
+              gh api -X DELETE "repos/${GH_REPO}/releases/${old}"
+            done
+
+          # 3. Publish under the tag, then move the tag. Publishing binds the
+          #    release to `vnightly` as it stands — yesterday's commit — or
+          #    creates it here on the first night, so the move comes after,
+          #    forced. prerelease + make_latest=false: releases/latest is the
+          #    newest NON-prerelease, and a bare `install` and the Homebrew tap
+          #    both read it, so a nightly never displaces the real release.
+          gh api -X PATCH "repos/${GH_REPO}/releases/${id}" \
+            -f tag_name=vnightly -F draft=false -F prerelease=true -f make_latest=false \
+            --jq '"published \(.tag_name): \(.assets | length) assets, \(.html_url)"'
           gh api -X PATCH "repos/${GH_REPO}/git/refs/tags/vnightly" \
-            -f sha="$SHA" -F force=true >/dev/null
-          gh release view vnightly \
-            --json tagName,isPrerelease,isDraft,assets \
-            --jq '"published \(.tagName) prerelease=\(.isPrerelease) draft=\(.isDraft) assets=\(.assets|length)"'
+            -f sha="$SHA" -F force=true \
+            --jq '"vnightly -> \(.object.sha)"'
 
   # Bump the Homebrew tap (jolt-lang/homebrew-jolt) to this tag: rewrite each
   # platform's url + sha256 in Formula/jolt.rb from the release's .sha256 assets.
@@ -717,8 +833,8 @@ jobs:
   # After `publish`, so the tap never points at a release the fleet gates rejected.
   homebrew:
     name: update homebrew tap
-    needs: publish
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [meta, publish]
+    if: needs.meta.outputs.kind == 'release'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -734,9 +850,10 @@ jobs:
         if: steps.tok.outputs.ok == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOLT_TAG: ${{ needs.meta.outputs.tag }}
         run: |
           set -euo pipefail
-          ver="${GITHUB_REF_NAME}"
+          ver="${JOLT_TAG}"
           sha() { gh release download "$ver" --repo "${{ github.repository }}" -p "$1.sha256" -O - | awk '{print $1}'; }
           {
             echo "VER=$ver"

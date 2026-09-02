@@ -57,8 +57,9 @@ With Homebrew:
 brew install jolt-lang/jolt/jolt
 ```
 
-Or with the install script (installs to `/usr/local/bin` by default; `--dir <dir>`
-and `--version <v>` override that):
+Or with the install script (installs to `~/.local/bin`, or `/usr/local/bin` as
+root; `--dir <dir>` and `--version <v>` — or `nightly`, the daily build of
+`main` — override that):
 
 ```bash
 curl -sL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash

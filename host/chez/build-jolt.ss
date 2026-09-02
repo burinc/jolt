@@ -66,12 +66,13 @@
       (bld-target-pack pack))))
 
 ;; Version baked into the binary's saved heap. Prefer $JOLT_VERSION (CI sets it to
-;; the release tag); else derive it from git in this checkout; else "dev".
+;; the release tag, or a nightly's describe string); else tools/version.sh, the
+;; same answer bin/jolt gives for this checkout (it says "dev" outside git).
 (define jb-version
   (let ((env (getenv "JOLT_VERSION")))
     (if (and env (> (string-length env) 0))
         env
-        (let ((s (bld-sh-capture "git describe --tags --always --dirty 2>/dev/null")))
+        (let ((s (bld-sh-capture "sh tools/version.sh 2>/dev/null")))
           (if (> (string-length s) 0) s "dev")))))
 
 (define jb-build (string-append jb-out ".build"))
