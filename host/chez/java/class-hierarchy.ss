@@ -546,6 +546,21 @@
 (jch-register-supers! "java.lang.Object" '())
 (jch-register-supers! "java.lang.Class" '())
 (jch-register-supers! "java.lang.Throwable" '())
+;; java.lang.reflect — the member objects Class.getDeclaredFields / getMethods /
+;; getConstructors hand back (java/natives-array.ss, java/host-static-classes.ss).
+;; The JVM's own shape: Member is the interface all three implement, Executable
+;; the abstract class Method and Constructor share, AccessibleObject the root of
+;; all of them. Without these rows the member values reported (class m) => :object
+;; and printed as #object[:object], which is all a caller ever saw of them.
+(jch-register-supers! "java.lang.reflect.Member" '())
+(jch-mark-interface! "java.lang.reflect.Member")
+(jch-register-supers! "java.lang.reflect.AccessibleObject" '())
+(jch-register-supers! "java.lang.reflect.Executable"
+                      '("java.lang.reflect.AccessibleObject" "java.lang.reflect.Member"))
+(jch-register-supers! "java.lang.reflect.Method" '("java.lang.reflect.Executable"))
+(jch-register-supers! "java.lang.reflect.Constructor" '("java.lang.reflect.Executable"))
+(jch-register-supers! "java.lang.reflect.Field"
+                      '("java.lang.reflect.AccessibleObject" "java.lang.reflect.Member"))
 ;; statics-only shims (no value ever carries these tags, so the rows cannot
 ;; shift protocol dispatch) — present so Class.getSuperclass answers Object
 ;; as the JVM does, jolt-of08.8
@@ -846,10 +861,30 @@
     ("process-builder" . "java.lang.ProcessBuilder")
     ("process" . "java.lang.Process")
     ("process-redirect" . "java.lang.ProcessBuilder$Redirect")
-    ("process-handle" . "java.lang.ProcessHandle")))
+    ("process-handle" . "java.lang.ProcessHandle")
+    ;; java.lang.reflect member objects (java/natives-array.ss,
+    ;; java/host-static-classes.ss). Two field tags share one FQN: a deftype's
+    ;; declared field and a registered host static are both a java.lang.reflect.Field
+    ;; to a caller, and differ only in where the value comes from.
+    ("reflect-method" . "java.lang.reflect.Method")
+    ("reflect-field" . "java.lang.reflect.Field")
+    ("static-field" . "java.lang.reflect.Field")
+    ("class-ctor" . "java.lang.reflect.Constructor")))
 ;; FQN for a jhost tag, or #f if the tag names no modeled class (e.g. "class",
 ;; "in-stream", "jolt-comparator") — callers fall through on #f.
 (define (jhost-fqn tag) (hashtable-ref jhost-tag->fqn tag #f))
+
+;; The reverse: every tag that models class NAME, or '() for a class no shim
+;; backs. More than one tag can map to one FQN (the two writer tags, the two
+;; field tags), so this answers a LIST — Class.getDeclaredMethods walks it to
+;; report the methods jolt has registered for the class, and dropping the second
+;; tag would silently halve the answer for exactly the classes that have two.
+(define (jhost-tags-for-fqn name)
+  (let-values (((ks vs) (hashtable-entries jhost-tag->fqn)))
+    (let loop ((i 0) (acc '()))
+      (cond ((fx=? i (vector-length ks)) (reverse acc))
+            ((string=? (vector-ref vs i) name) (loop (fx+ i 1) (cons (vector-ref ks i) acc)))
+            (else (loop (fx+ i 1) acc))))))
 
 ;; Is this tag one of the pushback readers? Two tags model the pair
 ;; (java.io.PushbackReader and its line-numbering subclass), and everything that

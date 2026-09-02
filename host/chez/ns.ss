@@ -213,9 +213,24 @@
           (cdr parsed))))))
 
 ;; a namespace designator -> its name string (a jns or a symbol; the corpus never
-;; passes a bare string).
+;; passes a bare string). Anything else is refused HERE, with the throw the JVM
+;; makes for it: nil is its NullPointerException (Namespace.find hashes the key),
+;; and any other value is the failed cast to Symbol. Without these two arms a bad
+;; designator reached symbol-t-name — a bare Chez record accessor — and escaped as
+;; a condition with no jolt class and no message at all, printing as
+;; #object[:object]. (ns-name nil) is a plausible slip in any macro that reads a
+;; :ns out of metadata, and it said nothing whatsoever about what went wrong.
 (define (ns-desig->name d)
-  (if (jns? d) (jns-name d) (symbol-t-name d)))
+  (cond ((jns? d) (jns-name d))
+        ((symbol-t? d) (symbol-t-name d))
+        ((jolt-nil? d)
+         (jolt-throw (jolt-host-throwable "java.lang.NullPointerException"
+                                          "namespace designator is nil")))
+        (else
+         (jolt-throw (jolt-host-throwable
+                      "java.lang.ClassCastException"
+                      (string-append "class " (jolt-class-name d)
+                                     " cannot be cast to class clojure.lang.Symbol"))))))
 
 (define (ns-has-vars? nm)
   (hashtable-ref ns-has-vars-set nm #f))

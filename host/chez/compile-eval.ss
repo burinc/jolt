@@ -61,12 +61,22 @@
 ;; build JVM class/method names, so "clojure.core$odd_QMARK_" -> clojure.core/odd?.
 ;; clojure.spec.alpha's fn-sym uses it to recover a symbol from a fn's class name.
 ;; Longest tokens first; a standalone _ is a hyphen; $ separates ns from name.
+;;
+;; Derived from class-munge-map (java/host-class.ss), the forward table, so the two
+;; directions cannot drift: every escape demunge reverses is one munge emits. The
+;; hyphen row is dropped — its escape is a bare "_", which demunge handles as its
+;; own rule below rather than as a token — and "_DOT_" is added, an escape jolt
+;; reverses although Clojure's CHAR_MAP never produces it. Sorted longest token
+;; first so a scan cannot stop at a shorter token that prefixes a longer one.
 (define demunge-token-map
-  '(("_DOUBLEQUOTE_" . "\"") ("_SINGLEQUOTE_" . "'") ("_AMPERSAND_" . "&") ("_PERCENT_" . "%")
-    ("_LBRACE_" . "{") ("_RBRACE_" . "}") ("_LBRACK_" . "[") ("_RBRACK_" . "]")
-    ("_BSLASH_" . "\\") ("_TILDE_" . "~") ("_CIRCA_" . "@") ("_SHARP_" . "#") ("_BANG_" . "!")
-    ("_CARET_" . "^") ("_COLON_" . ":") ("_QMARK_" . "?") ("_SLASH_" . "/") ("_PLUS_" . "+")
-    ("_STAR_" . "*") ("_BAR_" . "|") ("_GT_" . ">") ("_LT_" . "<") ("_EQ_" . "=") ("_DOT_" . ".")))
+  (sort (lambda (a b) (fx>? (string-length (car a)) (string-length (car b))))
+        (cons '("_DOT_" . ".")
+              (fold-left (lambda (acc p)
+                           (if (string=? (cdr p) "_")
+                               acc
+                               (cons (cons (cdr p) (string (car p))) acc)))
+                         '()
+                         class-munge-map))))
 (define (compiler-demunge s)
   (let* ((s (if (string? s) s (jolt-str-render-one s)))
          (n (string-length s))
@@ -86,19 +96,24 @@
               ((char=? (string-ref s i) #\$) (write-char #\/ out) (loop (+ i 1)))
               (else (write-char (string-ref s i) out) (loop (+ i 1)))))))))
 ;; clojure.lang.Compiler/CHAR_MAP — the forward munge map (special char -> escape
-;; token), the inverse of demunge-token-map. Derived from that single source so
-;; the two can't drift: drop _DOT_ (a '.' is never munged in CHAR_MAP) and add the
-;; hyphen -> "_" entry (demunge treats a lone _ as '-' via a separate rule).
+;; token) as a jolt map, which is what a Clojure caller reading the field expects.
+;; class-munge-map is already exactly that table; this only changes its shape.
 (define compiler-char-map
-  (fold-left (lambda (m pair)
-               (if (string=? (car pair) "_DOT_")
-                   m
-                   (jolt-assoc1 m (string-ref (cdr pair) 0) (car pair))))
-             (jolt-assoc1 (jolt-hash-map) #\- "_")
-             demunge-token-map))
+  (fold-left (lambda (m pair) (jolt-assoc1 m (car pair) (cdr pair)))
+             (jolt-hash-map)
+             class-munge-map))
+
+;; clojure.lang.Compiler/munge — the forward direction, the same walk that names a
+;; fn's class (class-munge-name, java/host-class.ss) and over the same table.
+;; clojure.core/munge is this, and typedclojure asks it whether two var names
+;; compile to one class name — a question a dash-only munge answered wrong for
+;; every pair that meets only after escaping (a? and a_QMARK_).
+(define (compiler-munge s)
+  (class-munge-name (if (string? s) s (jolt-str-render-one s))))
 (let ((members (list (cons "LINE" compiler-line-cell) (cons "COLUMN" compiler-column-cell)
                      (cons "specials" compiler-specials)
                      (cons "CHAR_MAP" compiler-char-map)
+                     (cons "munge" compiler-munge)
                      (cons "demunge" compiler-demunge))))
   (register-class-statics! "Compiler" members)
   (register-class-statics! "clojure.lang.Compiler" members))

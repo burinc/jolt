@@ -18,12 +18,32 @@
   {:suite "uuid" :expr "(let [us (repeatedly 400 #(str (random-uuid)))] (every? #(> (count (distinct (map (fn [u] (nth u %)) us))) 8) [0 1 2 7 9 35]))" :expected "true"}
   {:suite "uuid" :expr "(= (str (random-uuid)) (str (random-uuid)))" :expected "false"}
   ;; The reflection member model: jolt reports what its registries KNOW a class
-  ;; declares, not what the JVM ships. A host class whose methods are a `cond`
-  ;; (String's live in natives-str.ss) has nothing to enumerate, so the honest
-  ;; answer is empty rather than a guess. jolt-only — the JVM answers differently
-  ;; by construction, so these cannot be corpus rows.
-  {:suite "reflect-member-model" :expr "(count (.getMethods String))" :expected "0"}
+  ;; declares, not what the JVM ships. Three registries answer: the protocol/type
+  ;; registry (a deftype's methods), the host shim tables (an ArrayList's), and
+  ;; class-statics (a procedure is a static method, anything else a static field's
+  ;; value). A member that lives in none of them — String's instance methods are a
+  ;; `cond` in natives-str.ss, not data anything can enumerate — is absent rather
+  ;; than guessed at. jolt-only: the JVM answers differently by construction, so
+  ;; these cannot be corpus rows.
+  {:suite "reflect-member-model" :expr "(let [ns (set (map (fn [m] (.getName m)) (.getMethods String)))] [(contains? ns \"format\") (contains? ns \"substring\")])" :expected "[true false]"}
+  {:suite "reflect-member-model" :expr "(java.lang.reflect.Modifier/isStatic (.getModifiers (.getMethod String \"format\" nil)))" :expected "true"}
   {:suite "reflect-member-model" :expr "(count (.getDeclaredFields String))" :expected "0"}
+  ;; a registered static is a Field, and reading it reflectively gives the value
+  ;; the static reference gives
+  {:suite "reflect-member-model" :expr "(.get (.getField Long \"MAX_VALUE\") nil)" :expected "9223372036854775807"}
+  {:suite "reflect-member-model" :expr "(sort (map (fn [f] (.getName f)) (.getDeclaredFields Long)))" :expected "(\"MAX_VALUE\" \"MIN_VALUE\" \"TYPE\")"}
+  {:suite "reflect-member-model" :expr "(identical? (.get (.getField clojure.lang.RT \"REQUIRE_LOCK\") clojure.lang.RT) clojure.lang.RT/REQUIRE_LOCK)" :expected "true"}
+  {:suite "reflect-member-model" :expr "(try (.getField Long \"NOPE\") (catch NoSuchFieldException _ :nsf))" :expected ":nsf"}
+  ;; a shim-backed class reports the methods its tag registers
+  {:suite "reflect-member-model" :expr "(contains? (set (map (fn [m] (.getName m)) (.getMethods java.util.ArrayList))) \"add\")" :expected "true"}
+  ;; a member object is a java.lang.reflect.* value, not an opaque :object
+  {:suite "reflect-member-model" :expr "(mapv class [(.getField Long \"MAX_VALUE\") (.getMethod Math \"floor\" nil) (first (.getConstructors java.util.ArrayList))])" :expected "[java.lang.reflect.Field java.lang.reflect.Method java.lang.reflect.Constructor]"}
+  {:suite "reflect-member-model" :expr "(str (.getField Long \"MAX_VALUE\"))" :expected "\"public static final java.lang.Object java.lang.Long.MAX_VALUE\""}
+  ;; getMethod / getConstructor select by parameter COUNT (jolt has no signatures)
+  ;; and raise NoSuchMethodException only for a name no registry has
+  {:suite "reflect-member-model" :expr "(try (.getMethod Math \"nope\" nil) (catch NoSuchMethodException _ :nsm))" :expected ":nsm"}
+  {:suite "reflect-member-model" :expr "(do (defrecord RC [a b]) (.getParameterCount (.getConstructor RC (into-array Class [Object Object]))))" :expected "2"}
+  {:suite "reflect-member-model" :expr "(.invoke (.getMethod Math \"floor\" nil) nil (into-array Object [2.7]))" :expected "2.0"}
   {:suite "reflect-member-model" :expr "(do (defprotocol PA (pa [this])) (defprotocol PB (pb [this])) (deftype TT [] PA (pa [_] 1) PB (pb [_] 2)) (count (.getMethods TT)))" :expected "2"}
   {:suite "reflect-member-model" :expr "(do (defrecord RR [a b]) (mapv (fn [f] (.getName f)) (.getDeclaredFields RR)))" :expected "[\"a\" \"b\"]"}
   {:suite "reflect-member-model" :expr "(do (defrecord RS [a]) (.getName (.getDeclaredField RS \"a\")))" :expected "\"a\""}

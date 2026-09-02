@@ -402,11 +402,16 @@
   (let [s (jolt.host/class-supers x)]
     (if s (set s) #{})))
 
-;; Like Clojure's munge: rewrite dashes to underscores, preserving the argument's
-;; type — a symbol munges to a symbol, anything else to a string. (jolt only
-;; rewrites dashes, not the full Compiler CHAR_MAP.)
+;; munge: the name as the compiler would spell it in a class or method name,
+;; preserving the argument's type — a symbol munges to a symbol, anything else to
+;; a string. Clojure's own definition, character for character: the whole
+;; Compiler CHAR_MAP, not just the dash. Rewriting dashes alone left every other
+;; special character in place, so the result was not a legal identifier at all —
+;; (munge 'a?) answered a? — and a caller asking "do these two compile to one
+;; class name?" (typedclojure's datatype collision check does) was told no for
+;; a? and a_QMARK_, which do.
 (defn munge [s]
-  (let [m (str-replace-all "-" "_" (str s))]
+  (let [m (clojure.lang.Compiler/munge (str s))]
     (if (symbol? s) (symbol m) m)))
 
 (defn test
