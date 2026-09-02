@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Nightly prerelease.** `main` is built daily (17:00 UTC) through the same
+  platform matrix and fleet gates as a release and published as the rolling
+  `vnightly` prerelease, so a downstream project can test against unreleased
+  jolt without building it:
+
+  ```bash
+  curl -sSL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash -s -- --version nightly
+  ```
+
+  The install script also takes `--repo <owner/name>` (or `JOLT_REPO`) so a
+  fork's own nightly is installable. A nightly's binary reports its
+  `git describe` version (`v0.8.0-56-g63374117`), it never displaces
+  `releases/latest` (a bare `install` and the Homebrew tap keep reading the
+  newest real release), and a build that fails a gate leaves the previous
+  nightly in place: the release is replaced only after every gate has passed.
+- **`tools/version.sh`** is now the one definition of a checkout's version,
+  read by `bin/jolt`, `build-jolt.ss` and the release workflow. It describes
+  against release tags only (`v` + digit): the rolling `vnightly` tag is the
+  nearest tag from `main`, so a plain `git describe --tags` would have every
+  clone that fetched it report `vnightly`. A checkout with no release tag
+  reachable (a shallow clone) reports `dev-g<sha>` rather than the bare sha,
+  which `:jolt/min-version` read as a version whenever the sha began with a
+  digit — a sha beginning with `0` failed every floor.
+
 - **`clojure.lang.RT/REQUIRE_LOCK`.** The JVM's `RT.REQUIRE_LOCK` is the agreed
   object a caller holds around a `require` so two threads do not load one
   namespace at once. jolt had no such field, so

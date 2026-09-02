@@ -56,8 +56,9 @@ CHEZ="$JOLT_CHEZ"
 # can silently disagree with the interpreter actually selected above.
 export JOLT_CHEZ="$(command -v "$CHEZ" 2>/dev/null || echo "$CHEZ")"
 
-# Version for --version / banners: git describe of this checkout, else "dev".
-export JOLT_VERSION="${JOLT_VERSION:-$(git -C "$root" describe --tags --always --dirty 2>/dev/null || echo dev)}"
+# Version for --version / banners: tools/version.sh (git describe of this
+# checkout against release tags, else "dev" — see the script for why not bare).
+export JOLT_VERSION="${JOLT_VERSION:-$("$root/tools/version.sh")}"
 # Dev source mode opts OUT of the per-namespace AOT cache: the compiler is
 # volatile here (a "dev" version tag wouldn't invalidate the cache across edits),
 # and devboot already covers startup. A built jolt binary defaults the cache ON.
