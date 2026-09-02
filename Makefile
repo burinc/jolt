@@ -365,8 +365,7 @@ unit:
 # and an entry with no :check fails. certify.clj runs the JVM half against
 # reference Clojure; this half needs no JVM, so it lives in `ci`.
 # `make documented-record` prints what jolt currently answers, for recording a
-# new entry (the JVM side comes from
-# `clojure -M test/conformance/certify.clj --record-documented`).
+# new entry. Run `make certify` for the JVM side through the pinned oracle.
 documented:
 	@$(CHEZ) --script host/chez/run-documented.ss
 
@@ -951,8 +950,10 @@ versionsmoke:
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
 certify:
 	@if command -v clojure >/dev/null 2>&1; then \
-		clojure -M test/conformance/certify.clj --self-test && \
-		clojure -M test/conformance/certify.clj; \
+		clojure -Sdeps '{:deps {org.clojure/clojure {:mvn/version "1.12.5"}}}' \
+		  -M test/conformance/certify.clj --self-test && \
+		clojure -Sdeps '{:deps {org.clojure/clojure {:mvn/version "1.12.5"}}}' \
+		  -M test/conformance/certify.clj; \
 	else \
 		echo "certify: clojure not on PATH — skipped"; \
 	fi
