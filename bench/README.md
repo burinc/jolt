@@ -294,6 +294,69 @@ data structure or a loop trip count.
   and the `clojure.string` layer over them, where `to-str` used to take
   `.toString` unconditionally so a plain string paid the full dispatch chain.
 
+### Five general defects behind the worst rows (2026-09)
+
+An audit that measured the worst rows per OPERATION — each shape timed once and
+four times per iteration inside one `--opt` binary, so the loop floor cancels,
+then decomposed at the Scheme level inside the real runtime — found that none
+of `char-scan`, `literals`, `string-ops`, `keyed-lookup` or `arrays` was about
+the pass its row is named for. Five mechanisms, each general, explained them:
+
+- **A compare of two base scalars of different kinds walked the eq arm
+  registry.** `jolt=2` answered same-kind pairs fast but every other pair —
+  keyword vs symbol, keyword vs string, long vs double, boolean vs keyword, and
+  anything vs `nil` — ran every registered arm predicate before `jolt=2-base`
+  saw the nil clause: 145–240 ns per miss with the 17 arms a bare runtime
+  registers, more per library loaded. `case` lowers to a chain of exactly those
+  compares, so a keyword `case` fed a symbol paid ~200 ns per clause where the
+  JVM hash-jumps. Answered ahead of the walk now (the JVM's `Util.equiv` has no
+  extension point for such a pair either), the cross-kind pairs joined the fast
+  probes so the registry refuses an arm that would claim one, and `case`
+  compares keyword/nil/boolean constants with `identical?`. `(= :a 'a)` 217 → ~6
+  ns.
+- **The `unchecked-*` family was not lowered.** `unchecked-int`, `unchecked-
+  long` and `unchecked-inc` were plain var calls; `unchecked-add` only reached
+  `jolt-uncadd2` when both operands were already proven long; the helpers were
+  variadic rest-list folds; and `jolt-wrap64` compared a fixnum against BIGNUM
+  bounds. `unchecked-add` 29 ns against 3.6 for `+`, `unchecked-int` 13 against
+  5 for `int`, and every loop counter written in the hinted idiom stayed
+  untyped. They are native ops now, `unchecked-long`/`unchecked-int` are casts
+  that type their result `:long` (the `jolt-l*` guards already admit a wrap
+  result past the 61-bit fixnum), and the helpers test `fixnum?` first
+  (`unchecked-add` 3 ns). This is `char-scan`'s whole 24× and most of
+  `literals`' — whose literals hoist correctly; the cost was the eleven
+  `unchecked-add`s and `true?`/`boolean?` calls per iteration.
+- **An interop call on an unproven receiver cost 60–135 ns.** `(.length s)` with
+  no hint walked the method-dispatch arms, converted its `jolt-vector` rest args
+  back to a list through the seq machinery, and matched the method name down a
+  `string=?` chain — where the proven-string direct form is 3–11 ns. A method
+  with a string or keyword direct form now tests the receiver at the site and
+  takes it, with `record-method-dispatch` as the slow arm (receiver and args
+  bound once, in order), and the generic path reads the rest args off the
+  vector's tail.
+- **Calling a clojure.core fn from a built binary cost ~12 ns of dispatch.** An
+  app fn is a direct Scheme call under direct-link, but every seed fn call was
+  `(jolt-invokeN (var-cell-deref cell) …)`: 7 ns for the dynamic-binding check
+  and root read, 5 for the `procedure?` and arity-mask tests, on top of the
+  callee — `true?` 16 ns, `name` 22. A `jolt build` now direct-links seed vars
+  under the same closed-world rule an app def gets (a procedure root whose
+  arity admits the call; not `^:dynamic`, `^:redef` or redefined by the app):
+  the def binds the root once at load and calls it. `jolt run` never
+  direct-links, so `with-redefs` in tests is unaffected.
+- **Collection dispatch overhead.** `nth` on a 4-element vector was 19 ns
+  (`pv-leaf-for`'s two-value return through `let-values` was 9 of it; every
+  vector of 32 or fewer elements is all tail, read directly now), `first` on a
+  vector 45–62 ns where the cell allocation was 4 (`jolt-seq` was `set!`-wrapped
+  by nio-file.ss and `jolt-first` by host-table.ss; both are registry arms now,
+  and `first` answers a cell or a vector from its backing store with no cell),
+  and `str` over two strings 56 ns where `string-append` is 1 (fixed 2/3-arg
+  entries, strings/keywords/fixnums rendered without the printer). `(:k m)` on a
+  5-entry map is still 38 ns and `assoc` 201 against ~5 and ~20 on the JVM —
+  that is the HAMT standing in for a flat array map, bead jolt-mw44.33.
+
+The measured table is in the memory note `perf-audit-2026-09-marginal-costs`;
+the scorecard below is the same-sitting re-run after the rounds landed.
+
 ### The allocation-bound axes
 
 - **`arrays` ~6.4×** (was ~18.6×): two rounds took it there. The fixnum-first
@@ -302,11 +365,17 @@ data structure or a loop trip count.
   boundary itself — on a site where the pass has proven a `^doubles` array and
   a `:long` index, the back end now emits `(flvector-ref (jolt-array-vec a) i)`
   directly, so the flonum stays unboxed through the surrounding `fl+` chain
-  instead of being boxed at the wrapper's return (~9.5×→~6.4×). The residual is
-  the checked `flvector-ref` + record accessor at O2, Chez boxing the
-  loop-carried flonum accumulator (~145ms of the 234ms on a 40M-iteration
-  loop), and the JVM SIMD-vectorizing the dot loop. Hoisting the loop-invariant
-  `jolt-array-vec` accessor out of the loop is the queued next lever.
+  instead of being boxed at the wrapper's return (~9.5×→~6.4×). An earlier
+  version of this paragraph blamed the residual on Chez boxing the loop-carried
+  flonum accumulator; that was wrong. A Chez probe of the exact emitted loop
+  (`(let loop ((i 0) (acc 0.0)) … (#3%fl+ acc (#3%fl* …)))`) allocates 0.09
+  bytes per iteration — the accumulator is unboxed. What the probe DID show is
+  the checked `jolt-array-vec` record accessor being re-read twice per
+  iteration: hoisting it took the loop 225 → 145 ms in isolation, and the back
+  end now binds a `^doubles` parameter's backing flvector once at the arity's
+  entry (`_av$N`) and indexes that (a non-array argument raises the JVM's
+  checkcast `ClassCastException` on entry). What remains is memory-bound
+  `flvector-ref` against a JVM dot loop the JIT SIMD-vectorizes.
 - **`seqs` ~2.6×** (was ~6.3×): the allocation axis idiomatic Clojure hits most
   — range/map/filter/reduce chains, short-circuiting `every?`, `iterate`/`take`,
   and `mapcat` all build lazy-seq cells and call a closure per element. Two

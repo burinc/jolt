@@ -192,6 +192,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A `jolt build` direct-links calls to seed vars.** A call from app code to a
+  var of a namespace the runtime image boots with (clojure.core, clojure.string,
+  …) binds the var's root procedure once, when the def holding the site loads,
+  and calls it directly — the same closed-world rule an app def already gets
+  under direct-link, applied only where the root is a procedure whose arity
+  admits the call and the var is not `^:dynamic`, `^:redef` or redefined by
+  the app. What changes is what changes under the JVM's own direct linking: an
+  `alter-var-root` or `with-redefs` of such a var is not seen by call sites
+  compiled into the binary. `jolt run`, the REPL and `--no-direct-link` never
+  direct-link, so tests that redefine core fns keep working there.
+- **`case` compares keyword, `nil` and boolean constants with `identical?`.**
+  Keywords are interned, and this is what the reference does for those
+  constants; symbol, string and number constants still compare with `=`.
+
 - **The reflection member model now reads jolt's static and shim registries, and
   member objects are real `java.lang.reflect.*` values.** `Class.getDeclaredFields`
   / `getMethods` used to consult only the protocol/type registry, so every host
@@ -224,6 +238,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anything can enumerate, so String reports its three statics and nothing else.
 
 ### Performance
+
+- **The worst scorecard rows shared five general defects, now fixed.** Measured
+  per operation inside one `--opt` binary (see `bench/README.md`): a compare of
+  two base scalars of different kinds, or of anything against nil, walked every
+  registered eq arm before it was answered (145-240 ns per miss; `case` lowers
+  to that chain) — answered ahead of the walk now, and the registry refuses an
+  arm claiming such a pair. The `unchecked-*` family was not lowered at all
+  (`unchecked-add` 29 ns against 3.6 for `+`): it now emits its helpers
+  directly, `unchecked-long`/`unchecked-int` are casts that type their result
+  `:long`, and `jolt-wrap64` tests `fixnum?` before comparing against bignum
+  bounds. An interop call on an unproven receiver (`(.length s)` with no hint)
+  cost 60-135 ns in the arm walk and a rest-args vector-to-list conversion; a
+  method with a string or keyword direct form now tests the receiver at the
+  site and takes it, with the generic dispatch as the slow arm. A call to a
+  clojure.core fn from a built binary paid ~12 ns of var-cell-deref +
+  jolt-invoke dispatch; under direct-link such a site now binds the var's root
+  procedure once at load and calls it (see Changed). `nth` on a small vector,
+  `first` and `str` had their own dispatch overheads trimmed. `char-scan`,
+  `literals`, `string-ops`, `keyed-lookup` and `arrays` all move; the refreshed
+  scorecard is in `bench/README.md`.
+- **`aget`/`aset` on a `^doubles` parameter index the backing flvector bound
+  once at the arity's entry** instead of re-reading the checked record
+  accessor per access. A `^doubles` argument that is not a double array now
+  raises `ClassCastException` on entry, as a JVM checkcast does, whether or not
+  the body reads it. The README's earlier note that the remaining `arrays`
+  cost was flonum boxing of the loop accumulator was wrong — a Chez probe of
+  the emitted loop allocates nothing per iteration; the accessor was the cost.
 
 - **An executor enqueue wakes one worker, not all of them (#819).** The pool's
   workers and its `awaitTermination` waited on ONE condition, so every enqueue

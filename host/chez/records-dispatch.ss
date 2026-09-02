@@ -371,11 +371,20 @@
 ;; getClass so they pay one type test instead. Same handler as the base case —
 ;; jolt-string-method — so an unknown method throws the identical error, and a
 ;; non-string still 'passes on unchanged.
+;; The rest args arrive as a jolt-vector the call site built, never wider than
+;; a method's arity, so it is all tail: read the tail vector straight into a
+;; list instead of seq->list, which allocated a seq cell per argument plus the
+;; vec->seq dispatch (about half of a 116 ns unhinted .charAt).
+(define (method-rest-args->list rest-args)
+  (cond ((jolt-nil? rest-args) '())
+        ((and (pvec? rest-args)
+              (fx=? (pvec-cnt rest-args) (vector-length (pvec-tail rest-args))))
+         (vector->list (pvec-tail rest-args)))
+        (else (seq->list rest-args))))
 (register-method-arm! arm-priority-string
   (lambda (obj method-name rest-args)
     (if (string? obj)
-        (jolt-string-method method-name obj
-                            (if (jolt-nil? rest-args) '() (seq->list rest-args)))
+        (jolt-string-method method-name obj (method-rest-args->list rest-args))
         'pass)))
 
 

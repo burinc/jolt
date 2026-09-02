@@ -1387,7 +1387,15 @@
     (cond (= hname "double") {:kind :double :cast-fn "jolt-double"}
           (= hname "long")   {:kind :long   :cast-fn "jolt-long-cast"}
           (= hname "int")    {:kind :long   :cast-fn "jolt-int-cast"}
-          (= hname "float")  {:kind :double :cast-fn "jolt-float"})))
+          (= hname "float")  {:kind :double :cast-fn "jolt-float"}
+          ;; the unchecked casts are casts too: a primitive long/int on the JVM,
+          ;; so the result feeds the :long lattice the same way. Their wrap
+          ;; result can be a bignum past the 61-bit fixnum, which is the case
+          ;; every :long consumer already guards (the jolt-l* fixnum? tests) —
+          ;; the same reason a ^long param is admitted. Before this they were
+          ;; ordinary var calls and left every loop counter they fed untyped.
+          (= hname "unchecked-long") {:kind :long :cast-fn "jolt-unchecked-long"}
+          (= hname "unchecked-int")  {:kind :long :cast-fn "jolt-unchecked-int"})))
 
 (defn- analyze-list* [ctx form env]
   (let [items (vec (form-elements form))]

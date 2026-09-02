@@ -1335,6 +1335,11 @@
 
 ;; iterate ptypes/rets to a fixpoint with back-edge collection on or off. Returns
 ;; [converged? ptypes rets] so the caller can chain one phase into the next.
+;; JOLT_WP_TRACE=1 prints one line per fixpoint iteration and field round, so a
+;; build's whole-program cost can be read as walk counts rather than guessed.
+;; jolt.host/getenv is referenced fully-qualified (late-bound) for the same
+;; reason passes.clj does: the seed mint compiles this ns before it resolves.
+(def ^:private wp-trace? (jolt.host/getenv "JOLT_WP_TRACE"))
 (defn- wp-iterate [unit nodes spec ks ptypes0 rets0 self-rec?]
   (loop [iter 0 ptypes ptypes0 rets rets0]
     (set-rtenv! unit (reduce (fn [m k] (let [v (get rets k)] (if (some? v) (assoc m k v) m))) {} ks))
@@ -1350,6 +1355,10 @@
                              (:ptypes pass) ks)
           new-rets (:rets pass)
           converged? (and (= new-ptypes ptypes) (= new-rets rets))]
+      (when wp-trace?
+        (println (str "[wp] iter " iter (if self-rec? " main" " prime")
+                      " nodes " (count nodes) " specializable " (count ks)
+                      (if converged? " converged" ""))))
       (if (or converged? (>= iter 16))
         [converged? new-ptypes new-rets]
         (recur (inc iter) new-ptypes new-rets)))))
@@ -1409,6 +1418,9 @@
                new-rich-ftypes (derive-field-types unit @(:wp-field-joins unit) @(:wp-field-demote unit) escaped shallow-field-type-rich)
                ft-stable? (= new-ftypes ftypes)
               sound? (and param-converged? ft-stable?)]
+          (when wp-trace?
+            (println (str "[wp] field round " ft-iter " params-converged? " param-converged?
+                          " fields-stable? " ft-stable? " field-types " (count new-ftypes))))
           (if (or sound? (>= ft-iter 8))
             (let [seed-ptypes (if sound?
                                 new-ptypes
