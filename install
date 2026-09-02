@@ -23,14 +23,17 @@ fi
 install_dir="$default_install_dir"
 download_dir=""
 
-repo="jolt-lang/jolt"
+# Overridable so a fork's build can be installed: a nightly or a candidate
+# lives on the fork that produced it, and without this there is no way to
+# install one for testing.
+repo="${JOLT_REPO:-jolt-lang/jolt}"
 
 print_help() {
     echo "Installs the latest (or a specific) version of jolt."
     echo "Installation directory defaults to ${default_install_dir}."
     echo
     echo "Usage:"
-    echo "  install [--dir <dir>] [--download-dir <dir>] [--version <version>] [--checksum <sha256>]"
+    echo "  install [--dir <dir>] [--download-dir <dir>] [--version <version>] [--checksum <sha256>] [--repo <owner/name>]"
     echo
     echo "Defaults:"
     echo " * Installation directory: \$PREFIX/bin if PREFIX is set;"
@@ -64,6 +67,7 @@ while [[ $# -gt 0 ]]; do
         --download-dir) download_dir="$2"; shift 2 ;;
         --version)      version="$2"; shift 2 ;;
         --checksum)     checksum="$2"; shift 2 ;;
+        --repo)         repo="$2"; shift 2 ;;
         --help|-h)      print_help ;;
         *)              print_help ;;
     esac
