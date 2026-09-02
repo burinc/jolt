@@ -794,16 +794,17 @@
 ;; call. `jolt run` never direct-links, so the REPL and with-redefs in tests
 ;; keep the var-routed call.
 (define hc-seed-ns-tbl #f)
-;; loader.ss installs its boot-time copy here (ldr-runtime-image-ns-copy) — the
-;; same set build.ss reads as bld-boot-loaded. A boot without the loader (the
-;; pass gates) falls back to the namespaces present when hc-install! ran: the
-;; prelude is loaded by then and no app namespace exists yet.
+;; The boot that owns the runtime supplies the set: loader.ss installs its
+;; boot-time copy (ldr-runtime-image-ns-copy — the same set build.ss reads as
+;; bld-boot-loaded) for the CLI and `jolt build`, and gate-boot.ss snapshots the
+;; var table after the image loads for the pass gates. A boot that installs
+;; nothing (the Gambit host) direct-links no seed var, which is the safe answer.
 (define hc-seed-ns-source #f)
-(define hc-install-ns-tbl (make-hashtable string-hash string=?))
 (define (hc-seed-ns? ns)
-  (unless hc-seed-ns-tbl
-    (set! hc-seed-ns-tbl (if hc-seed-ns-source (hc-seed-ns-source) hc-install-ns-tbl)))
-  (hashtable-ref hc-seed-ns-tbl ns #f))
+  (and hc-seed-ns-source
+       (begin
+         (unless hc-seed-ns-tbl (set! hc-seed-ns-tbl (hc-seed-ns-source)))
+         (hashtable-ref hc-seed-ns-tbl ns #f))))
 (define hc-kw-dynamic (keyword #f "dynamic"))
 (define hc-kw-redef (keyword #f "redef"))
 (define (hc-seed-callable? ctx ns-name nm nargs)
@@ -914,8 +915,6 @@
   (def-var! "jolt.host" "stash-inline!" hc-stash-inline!)
   (def-var! "jolt.host" "var-redefined?" hc-var-redefined?)
   (def-var! "jolt.host" "seed-callable?" hc-seed-callable?)
-  (vector-for-each (lambda (c) (hashtable-set! hc-install-ns-tbl (var-cell-ns c) #t))
-                   (var-table-cells))
   (def-var! "jolt.host" "mark-spliced!" hc-mark-spliced!))
 
 (hc-install!)
