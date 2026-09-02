@@ -261,6 +261,12 @@
     (else #f)))
 
 (define (jolt-cli-run cli-args prepare-build!)
+  ;; Every entry starts in user, as clojure.main's does. The image bakes jolt.main
+  ;; and jolt.deps at heap build, and loading a namespace leaves it current, so
+  ;; without this a bare -e or a REPL evaluated in jolt.main: (str *ns*) said so,
+  ;; and a REPL def landed as #'jolt.main/x under a prompt that said user. The
+  ;; script driver arrives with user already current; here it costs nothing.
+  (set-chez-ns! "user")
   ;; On the main thread, before anything user code can reach: Chez's exit-handler
   ;; is a thread parameter, so the shutdown-hook wrapper has to be installed on
   ;; the thread that will call (exit), and this is that thread for both CLI
