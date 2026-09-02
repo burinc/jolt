@@ -257,6 +257,20 @@
 (register-class-statics! "RT" (list (cons "iter" (lambda (coll) (make-jiterator (jolt-seq coll))))))
 (register-class-statics! "clojure.lang.RT" (list (cons "iter" (lambda (coll) (make-jiterator (jolt-seq coll))))))
 
+;; clojure.lang.RT/REQUIRE_LOCK — the JVM's `static final Object REQUIRE_LOCK`.
+;; Nothing inside require takes it; it is the AGREED lock a caller holds around a
+;; require so two threads do not load the same namespace at once, and its whole
+;; value is that everyone reaches for the same object. clojure.core/serialized-require
+;; locks it, and so does io.github.frenchy64.fully-satisfies.requiring-resolve —
+;; which typedclojure's runtime requires, and which read the field REFLECTIVELY
+;; ((.getField clojure.lang.RT "REQUIRE_LOCK")) and fell back to locking
+;; #'clojure.core/require when it was absent. A plain (Object.), the same value
+;; the JVM field holds: locking only needs identity, and every jolt value has a
+;; monitor (java/concurrency.ss object-monitor).
+(define rt-require-lock (make-jhost "object" (vector)))
+(register-class-statics! "RT" (list (cons "REQUIRE_LOCK" rt-require-lock)))
+(register-class-statics! "clojure.lang.RT" (list (cons "REQUIRE_LOCK" rt-require-lock)))
+
 ;; clojure.lang.PersistentList/create: a list (in order) from a seq; empty -> ().
 ;; Build it the way clojure.core/list does — list->cseq alone yields plain seq
 ;; cells, and jolt marks the HEAD cell to record that a chain IS a list, so an

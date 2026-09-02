@@ -1884,6 +1884,21 @@
 ;; The bit constants and their predicates, the JVM's values, over whatever int a
 ;; caller has — Class.getModifiers here, and a member's modifiers read the same.
 (define (mod-bit? m bit) (if (fx=? 0 (fxand (jnum->exact m) bit)) #f #t))
+;; Modifier.toString's rendering, as a procedure rather than only as a registered
+;; static: the reflective member objects (java/natives-array.ss) spell their own
+;; toString the way the JVM does — "public static final java.lang.Object Foo.BAR" —
+;; and must name the modifiers with the very words Modifier/toString would.
+(define (jmod-string m)
+  (let loop ((ps (list (cons 1 "public") (cons 4 "protected") (cons 2 "private")
+                       (cons 1024 "abstract") (cons 8 "static") (cons 16 "final")
+                       (cons 32 "synchronized") (cons 256 "native") (cons 2048 "strictfp")
+                       (cons 128 "transient") (cons 64 "volatile") (cons 512 "interface")))
+             (acc '()))
+    (if (null? ps)
+        (let ((names (reverse acc)))
+          (if (null? names) ""
+              (fold-left (lambda (a b) (string-append a " " b)) (car names) (cdr names))))
+        (loop (cdr ps) (if (mod-bit? m (caar ps)) (cons (cdar ps) acc) acc)))))
 (register-class-statics! "java.lang.reflect.Modifier"
   (list (cons "PUBLIC" (->num 1)) (cons "PRIVATE" (->num 2)) (cons "PROTECTED" (->num 4))
         (cons "STATIC" (->num 8)) (cons "FINAL" (->num 16)) (cons "SYNCHRONIZED" (->num 32))
@@ -1902,18 +1917,7 @@
         (cons "isAbstract" (lambda (m) (mod-bit? m 1024)))
         (cons "isStrict" (lambda (m) (mod-bit? m 2048)))
         ;; Modifier.toString lists the set bits in the JLS's canonical order.
-        (cons "toString"
-              (lambda (m)
-                (let loop ((ps (list (cons 1 "public") (cons 4 "protected") (cons 2 "private")
-                                     (cons 1024 "abstract") (cons 8 "static") (cons 16 "final")
-                                     (cons 32 "synchronized") (cons 256 "native") (cons 2048 "strictfp")
-                                     (cons 128 "transient") (cons 64 "volatile") (cons 512 "interface")))
-                           (acc '()))
-                  (if (null? ps)
-                      (let ((names (reverse acc)))
-                        (if (null? names) ""
-                            (fold-left (lambda (a b) (string-append a " " b)) (car names) (cdr names))))
-                      (loop (cdr ps) (if (mod-bit? m (caar ps)) (cons (cdar ps) acc) acc))))))))
+        (cons "toString" jmod-string)))
 
 ;; ---- constructors as values -------------------------------------------------
 ;; Enough of java.lang.reflect.Constructor to pick a constructor by arity and call
@@ -1945,6 +1949,14 @@
                      (map (lambda (k) (ctor-obj cls k))
                           (filter (lambda (k) (bitwise-bit-set? mask k)) ctor-arity-probe))))))
       (else (jolt-vector)))))
+;; "java.lang.Object, java.lang.Object" — the parameter list a member's toString
+;; prints between its parens. jolt carries no signatures, so every parameter is an
+;; Object; the COUNT is the part that is real, and it is the part a caller reading
+;; the string is looking for.
+(define (jreflect-param-str n)
+  (if (fx=? n 0) ""
+      (let loop ((k (fx- n 1)) (acc "java.lang.Object"))
+        (if (fx=? k 0) acc (loop (fx- k 1) (string-append acc ", java.lang.Object"))))))
 (register-host-methods! "class-ctor"
   (list (cons "getParameterCount" (lambda (self) (->num (vector-ref (jhost-state self) 1))))
         (cons "getParameterTypes"
@@ -1959,7 +1971,15 @@
         (cons "getExceptionTypes" (lambda (self) (make-jolt-array (vector) 'objects)))
         (cons "setAccessible" (lambda (self v) jolt-nil))
         (cons "newInstance" (lambda (self . args) (apply reflect-construct (vector-ref (jhost-state self) 0) args)))
-        (cons "toString" (lambda (self) (jclass-name (vector-ref (jhost-state self) 0))))))
+        ;; the JVM's shape — "public user.Foo(java.lang.Object, java.lang.Object)".
+        ;; It used to print the bare class name, which is also what getName answers,
+        ;; so two constructors of different arity were indistinguishable in output.
+        (cons "toString"
+              (lambda (self)
+                (string-append "public " (jclass-name (vector-ref (jhost-state self) 0))
+                               "(" (jreflect-param-str (vector-ref (jhost-state self) 1)) ")")))))
+(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "class-ctor")))
+                      (lambda (x) (record-method-dispatch x "toString" jolt-nil)))
 
 ;; ---- clojure.lang.Reflector -------------------------------------------------
 ;; The reflective entry points Clojure code reaches for by name. Each is the
