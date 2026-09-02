@@ -281,7 +281,7 @@
                           result))]
                (try
                  (do
-                   (ffi/write lenp :int 0 16)
+                   (ffi/write lenp :int 16)
                    (reset! accepted-fd (io-call op server-fd :read))
                    (not (neg? @accepted-fd)))
                  (finally
