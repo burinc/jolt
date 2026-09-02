@@ -833,7 +833,7 @@
   '("+" "-" "*" "/" "<" ">" "<=" ">=" "=" "inc" "dec" "not" "min" "max"
     "mod" "rem" "quot" "vector" "hash-map" "hash-set" "conj" "get" "nth" "count"
     "assoc" "dissoc" "contains?" "find" "empty?" "peek" "pop" "first" "rest" "next" "seq"
-    "cons" "list" "reverse" "last" "map" "filter" "remove" "reduce" "into" "concat"
+    "cons" "list" "reverse" "last" "map" "filter" "remove" "reduce" "reduce-kv" "into" "concat"
     "apply" "range" "take" "drop" "keys" "vals" "even?" "odd?" "pos?" "neg?"
     "zero?" "identity" "nil?" "some?" "identical?" "ex-info"
     "aget" "aset" "alength"

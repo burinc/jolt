@@ -405,6 +405,22 @@
   (seq-arm-reject-fast-type! 'register-seq-arm! pred)
   (set! jolt-seq-arms (cons (cons pred handler) jolt-seq-arms)))
 
+;; A map's entries, keys or vals as a VECTOR-BACKED seq of the given flavor: the
+;; selected values are built once into a pvec and the cells walk it by index. So
+;; count is O(1), reduce runs vec-reduce's tight loop over the vector, and
+;; stepping allocates one cell — where a cons chain cost a cell, a list pair and
+;; an entry per element up front, all before the first element was read. The
+;; vector is filled from its END through pmap-fold, whose visit order is the
+;; reverse of iteration order, so the view reads in iteration order in both
+;; modes. The flavor keeps the class answer (PersistentArrayMap$Seq, KeySeq…)
+;; and keeps chunked-seq? false: chunking is a property of the flavor, not of
+;; the representation.
+(define (pmap-view-seq m sel kind)
+  (let ((n (pmap-cnt m)))
+    (if (fx=? n 0) jolt-nil
+        (let ((v (make-vector n)))
+          (pmap-fold m (lambda (k val i) (vector-set! v i (sel k val)) (fx- i 1)) (fx- n 1))
+          (cseq-vec (vector-ref v 0) (make-pvec v #f) 0 kind)))))
 (define (jolt-seq x)
   (cond
     ((jolt-nil? x) jolt-nil)
@@ -412,9 +428,9 @@
     ((cseq? x) x)
     ((pvec? x) (vec->seq x 0))
     ;; array mode and hash mode are different classes on the JVM, the same split
-    ;; (class …) already reports for the map itself.
-    ((pmap? x) (list->cseq/k (pmap-fold x (lambda (k v a) (cons (make-map-entry k v) a)) '())
-                             (if (pmap-order x) sk-arraymap-seq sk-hashmap-seq)))
+    ;; (class …) already reports for the map itself. The view is vector-backed
+    ;; (pmap-view-seq): one entries vector, walked by index.
+    ((pmap? x) (pmap-view-seq x make-map-entry (if (pmap-array? x) sk-arraymap-seq sk-hashmap-seq)))
     ;; a set's seq is RT.keys over its backing map, i.e. an APersistentMap$KeySeq
     ((pset? x) (list->cseq/k (pset-fold x cons '()) sk-key-seq))
     ((string? x) (str->seq x 0))
@@ -1409,6 +1425,14 @@
     ((and (pvec? to) (pvec? from)
           (fx>? (pvec-cnt to) 0) (fx>? (pvec-cnt from) 0))
      (meta-carry to (pvec-catvec to from)))
+    ;; a map into a map: the source's entries go straight into the transient —
+    ;; no entry objects, no seq view. Same result as conj'ing each entry, which
+    ;; is what the general path below does.
+    ((and (pmap? to) (pmap? from))
+     (meta-carry to
+       (let ((t (jolt-transient-new to)))
+         (pmap-fold-fwd from (lambda (k v acc) (tmap-put! t k v) acc) #f)
+         (jolt-persistent! t))))
     ;; only an editable collection rides the transient path; anything else
     ;; (PersistentQueue, sorted colls, seqs) folds through conj, like RT's
     ;; instanceof IEditableCollection split.
@@ -1419,18 +1443,82 @@
      (meta-carry to
        (into-fold (lambda (acc x) (jolt-conj1 acc x)) to from)))))
 
-;; zipmap: the reference builds through (transient {}), whose array capacity is 8
-;; entries — so the result is an insertion-ordered array map up to 8 entries and
-;; a hash map past that, whatever the key type. Building ordered and dropping the
-;; order once over that capacity gives the same observable result without a
-;; transient's per-call setup cost. Duplicate keys keep their first position with
-;; the later value (the transient's replace-in-place), which order-replace does.
+;; zipmap: the reference builds through (transient {}) — a slot buffer of 8
+;; entries, promoted to a hash map by the 9th distinct key whatever the key
+;; type — and so does this, through the same transient (transients.ss, bound by
+;; call time). Duplicate keys keep their first position with the later value.
 (define (jolt-zipmap ks vs)
-  (let loop ((m empty-pmap) (ks (jolt-seq ks)) (vs (jolt-seq vs)))
-    (if (or (jolt-nil? ks) (jolt-nil? vs))
-        (if (fx>? (pmap-cnt m) array-map-limit) (pmap->hash m) m)
-        (loop (pmap-put-ordered m (seq-first ks) (seq-first vs))
-              (jolt-seq (seq-more ks)) (jolt-seq (seq-more vs))))))
+  (let ((t (jolt-transient-new empty-pmap)))
+    (if (and (pvec? ks) (pvec? vs))
+        ;; two vectors index straight into their tries — no seq cell per step
+        (let ((n (fxmin (pvec-count ks) (pvec-count vs))))
+          (let loop ((i 0))
+            (when (fx<? i n)
+              (tmap-put! t (pvec-nth-d ks i jolt-nil) (pvec-nth-d vs i jolt-nil))
+              (loop (fx+ i 1)))))
+        (let loop ((ks (jolt-seq ks)) (vs (jolt-seq vs)))
+          (unless (or (jolt-nil? ks) (jolt-nil? vs))
+            (tmap-put! t (seq-first ks) (seq-first vs))
+            (loop (jolt-seq (seq-more ks)) (jolt-seq (seq-more vs))))))
+    (jolt-persistent! t)))
+
+;; reduce-kv — the JVM's IKVReduce. A map folds its entries in place (no entry
+;; objects, no seq cells) and a vector its index/element pairs; `reduced` stops
+;; either. A deftype/reify declaring clojure.lang.IKVReduce drives its own
+;; kvreduce (the JVM method name is lowercase); any other map-like value (a
+;; record, a sorted map, a host map arm) folds over its keys, the reference's
+;; IPersistentMap arm. nil folds to init.
+(define (kv-step f) (if (procedure? f) f (lambda (acc k v) (jolt-invoke f acc k v))))
+(define (pmap-kv-reduce m f init)
+  (let ((step (kv-step f)) (root (pmap-root m)))
+    (if (not (hnode? root))
+        (let ((n (vector-length root)))
+          (let loop ((i 0) (acc init))
+            (cond ((jolt-reduced? acc) acc)
+                  ((fx>=? i n) acc)
+                  (else (loop (fx+ i 2) (step acc (vector-ref root i) (vector-ref root (fx+ i 1))))))))
+        ;; hash mode walks the trie in the seq view's order (ascending slots,
+        ;; children in place), stopping at a reduced accumulator at any leaf
+        (let walk ((node root) (acc init))
+          (let ((arr (hnode-arr node)))
+            (let loop ((i 0) (acc acc))
+              (cond ((jolt-reduced? acc) acc)
+                    ((fx>=? i (vector-length arr)) acc)
+                    (else
+                     (let ((child (vector-ref arr i)))
+                       (loop (fx+ i 1)
+                             (cond ((hnode? child) (walk child acc))
+                                   ((hcoll? child)
+                                    (let cl ((al (hcoll-alist child)) (acc acc))
+                                      (cond ((jolt-reduced? acc) acc)
+                                            ((null? al) acc)
+                                            (else (cl (cdr al) (step acc (caar al) (cdar al)))))))
+                                   (else (step acc (car child) (cdr child))))))))))))))
+(define (vec-kv-reduce v f init)
+  (let ((step (kv-step f)) (n (pvec-count v)))
+    (let outer ((i 0) (acc init))
+      (cond ((jolt-reduced? acc) acc)
+            ((fx>=? i n) acc)
+            (else
+             (let*-values (((chunk offset) (pv-leaf-for v i))
+                           ((clen) (vector-length chunk)))
+               (let inner ((j offset) (k i) (acc acc))
+                 (cond ((jolt-reduced? acc) acc)
+                       ((fx>=? j clen) (outer k acc))
+                       (else (inner (fx+ j 1) (fx+ k 1) (step acc k (vector-ref chunk j))))))))))))
+(define (jolt-reduce-kv f init coll)
+  (let ((r (cond
+             ((pmap? coll) (pmap-kv-reduce coll f init))
+             ((pvec? coll) (vec-kv-reduce coll f init))
+             ((jolt-nil? coll) init)
+             ((iface-method coll "kvreduce" 3) => (lambda (m) (jolt-invoke m coll f init)))
+             ((jolt-map? coll)
+              (let ((step (kv-step f)))
+                (reduce-seq (lambda (acc k) (step acc k (jolt-get coll k))) init (jolt-seq (jolt-keys coll)))))
+             (else (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
+                     (string-append "No implementation of method: :kv-reduce of protocol: #'clojure.core.protocols/IKVReduce found for class: "
+                                    (guard (e (#t "?")) (jolt-class-name coll)))))))))
+    (if (jolt-reduced? r) (jolt-reduced-val r) r)))
 
 ;; (range) with no bound is clojure.lang.Iterate on the JVM — it IS (iterate inc' 0)
 ;; there — so it wears the same flavor jolt-iterate does.
@@ -1703,17 +1791,19 @@
         (let ((e (seq-first s)))
           (unless (entry-like? e) (entry-cast-error e))
           (loop (jolt-seq (seq-more s)) (cons (jolt-nth e idx jolt-nil) acc))))))
+(define (sel-key k v) k)
+(define (sel-val k v) v)
 (define (jolt-keys m)
   (cond ((jolt-nil? m) jolt-nil)
-        ((pmap? m) (list->cseq/k (pmap-fold m (lambda (k v a) (cons k a)) '()) sk-key-seq))
+        ((pmap? m) (pmap-view-seq m sel-key sk-key-seq))
         ((jolt-nil? (jolt-seq m)) jolt-nil)
-        ((pmap? (jolt-seq m)) (list->cseq/k (pmap-fold m (lambda (k v a) (cons k a)) '()) sk-key-seq))
+        ((pmap? (jolt-seq m)) (pmap-view-seq m sel-key sk-key-seq))
         (else (entry-seq-part m 0 sk-key-seq))))
 (define (jolt-vals m)
   (cond ((jolt-nil? m) jolt-nil)
-        ((pmap? m) (list->cseq/k (pmap-fold m (lambda (k v a) (cons v a)) '()) sk-val-seq))
+        ((pmap? m) (pmap-view-seq m sel-val sk-val-seq))
         ((jolt-nil? (jolt-seq m)) jolt-nil)
-        ((pmap? (jolt-seq m)) (list->cseq/k (pmap-fold m (lambda (k v a) (cons v a)) '()) sk-val-seq))
+        ((pmap? (jolt-seq m)) (pmap-view-seq m sel-val sk-val-seq))
         (else (entry-seq-part m 1 sk-val-seq))))
 
 ;; ============================================================================

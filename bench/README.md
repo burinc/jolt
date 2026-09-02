@@ -84,7 +84,10 @@ before and after in the same session: `char-scan` 24.2× → 6.7×, `literals`
 7.5× → 2.1×, `string-ops` 6.9× → 3.7×, `arrays` 6.4× → 3.9×, `keyed-lookup`
 5.7× → 3.5×, `string-build` 5.3× → 4.5×, `hash-eq` 3.0× → 2.6×; `seqs`,
 `transducers`, `transients` and `sorted-access` each lost 10–15% of their
-absolute time, and no row got slower.
+absolute time, and no row got slower. The six rows the flat array-map round
+touched (`keyed-lookup`, `collections`, `transients`, `hash-eq`, `literals`,
+`seqs`) were re-run the same day after it landed, both columns in one sitting,
+and are the figures shown; that round's own A/B/A is in its section below.
 
 The previous refresh (2026-08-24, x86_64 Linux, Intel i5-4278U, OpenJDK
 21.0.11) was a weaker, older machine than this one; its `collections` row read
@@ -100,17 +103,17 @@ than a jolt-side change.
 | `loop-recur` | **1.5×** | 1.5× | 27.9 | 18.6 | tight loop/recur + per-iteration integer arith |
 | `mathfns` | **1.5×** | 1.5× | 24.0 | 16.5 | transcendental math (`Math` sqrt/sin/cos/log/pow/atan2) |
 | `mandelbrot` | **1.6×** | 1.5× | 22.6 | 14.5 | pure float compute |
+| `collections` | **1.6×** | 1.6× | 17.0 | 10.7 | persistent map/vector churn |
 | `binary-trees` | **2.0×** | 1.9× | 73.2 | 37.1 | escaping short-lived records (allocation/GC) |
-| `collections` | **2.0×** | 1.9× | 22.4 | 11.0 | persistent map/vector churn |
-| `literals` | **2.1×** | 2.1× | 53 | 25 | constant literals + boolean predicates, per call |
+| `literals` | **2.1×** | 2.1× | 52 | 25 | constant literals + boolean predicates, per call |
 | `sorted-access` | **2.4×** | 2.4× | 31.3 | 13.0 | shape-answered collection reads |
-| `hash-eq` | **2.6×** | 2.6× | 467 | 177 | composite-value hashing + collection `=` |
-| `seqs` | **2.6×** | 2.6× | 357.7 | 138.7 | lazy-seq + HOF pipelines |
+| `seqs` | **2.4×** | 2.5× | 338.7 | 140.1 | lazy-seq + HOF pipelines |
+| `hash-eq` | **2.5×** | 2.4× | 448 | 182 | composite-value hashing + collection `=` |
+| `transients` | **2.6×** | 2.6× | 147 | 56 | transient map/set bulk build |
 | `mono-dispatch` | **2.7×** | 2.5× | 36.1 | 13.6 | monomorphic protocol dispatch |
 | `nth-access` | **2.9×** | 2.9× | 62.9 | 21.5 | `nth` on a vector, small and large |
 | `executors` | **3.4×** | 3.4× | 1427.9 | 417.5 | `java.util.concurrent` dispatch: enqueue, submit/get, growth, contention |
-| `keyed-lookup` | **3.5×** | 3.6× | 95 | 27 | scalar-key hashing + small-map lookup |
-| `transients` | **3.5×** | 3.5× | 201 | 58 | transient map/set bulk build |
+| `keyed-lookup` | **3.5×** | 3.5× | 91 | 26 | scalar-key hashing + small-map lookup |
 | `string-ops` | **3.7×** | 3.7× | 250 | 68 | String/Keyword interop + `clojure.string` |
 | `arrays` | **3.9×** | 3.9× | 141.1 | 35.9 | primitive `double-array` throughput |
 | `transducers` | **4.2×** | 4.3× | 128.2 | 30.4 | transducer pipelines |
@@ -362,11 +365,61 @@ the pass its row is named for. Five mechanisms, each general, explained them:
   and `first` answers a cell or a vector from its backing store with no cell),
   and `str` over two strings 56 ns where `string-append` is 1 (fixed 2/3-arg
   entries, strings/keywords/fixnums rendered without the printer). `(:k m)` on a
-  5-entry map is still 38 ns and `assoc` 201 against ~5 and ~20 on the JVM —
-  that is the HAMT standing in for a flat array map, bead jolt-mw44.33.
+  5-entry map was still 38 ns and `assoc` 201 against ~5 and ~20 on the JVM —
+  the HAMT standing in for a flat array map, fixed next.
 
 The measured table is in the memory note `perf-audit-2026-09-marginal-costs`;
 the scorecard below is the same-sitting re-run after the rounds landed.
+
+### A small map is one flat slot vector (2026-09)
+
+An array-mode map — a literal of up to 8 entries, up to 64 keyword-keyed, and
+whatever `assoc` keeps below those limits — was a hash trie with an
+insertion-order list beside it: a record, a node, a leaf pair per entry and an
+order pair per entry, every lookup hashing the key and descending the trie. It
+is now what `PersistentArrayMap` is, a record over `#(k0 v0 k1 v1 …)`: lookup
+scans the slots with a compare chosen once from the probe key's kind (a keyword
+by identity, a fixnum, string or symbol by its own equality, the rest by `=`);
+`assoc` and `dissoc` copy the slots; the transient is a slot buffer with the
+reference's swap-on-remove; `seq`, `keys` and `vals` are vector-backed cells
+(O(1) `count`, `reduce` in the chunk loop) instead of a cons chain built before
+the first element is read; `reduce-kv` is native and folds in place; `into {}`
+from a map and `zipmap` over vectors never build a seq.
+
+Two general things sit under it. The runtime half of a built binary compiles at
+Chez optimize-level 2 (level 3 is unsafe mode, deliberately not used), where a
+Scheme loop pays a type and bounds check per element: a checked scan of a
+64-keyword map cost 92 ns against 33 unchecked, and a 64-slot copy loop 390 ns
+against 62. The hot slot loops now run on an adapter tier of unchecked
+primitives (`sa-ufx+`, `sa-uvector-ref` … in `host/scheme-adapter/CONTRACT.txt`;
+Chez's `#3%` forms, the checked ones on Gambit) where the bound is proven by
+construction, and every vector copy under a trie node update, a tail append or
+a transient's growth is a bulk move — which is why `collections` and
+`transients`, all hash-mode maps, moved too.
+
+Per operation, same binary shape as the audit table (before → after, ns):
+`(:k m)` on 3 entries 34 → 12, on 8 entries 25 → 15, a miss 17 → 16, `(get m
+20)` 43 → 16, `contains?` 31 → 11, `find` 40 → 23, `assoc` replacing a value
+116 → 64 and of the value already held 117 → 35 (the map itself, as on the
+JVM), `dissoc` 111 → 59, `{:a x :b y}` built at run time 100 → 17, `(= m m')`
+on 5 entries 230 → 84, `(into {} m)` 1045 → 205, `zipmap` of three 400 → 201,
+`(count (keys m))` on 8 entries 209 → 99, `reduce-kv` on 8 entries 583 → 50 and
+on a 64-keyword map 4259 → 324, `{:keys [a b]}` destructuring 96 → 48. What got
+slower, and stays slower on purpose: the far end of a large keyword array map,
+where the scan is linear exactly as `PersistentArrayMap.indexOf` is — the 64th
+key of a 64-keyword map 38 → 53 (the 30th 38 → 29, the average over the map
+better than the trie) — and a symbol probed against SYMBOL keys and missing,
+20 → 38, each slot paying a checked record predicate and accessor at
+optimize-level 2 (a symbol probed against keyword keys, honeysql's shape, is
+faster than before). Hash-mode maps' lookups are unchanged.
+
+Rows, A/B/A in one sitting against a worktree of the commit before (a jolt
+binary assembles a built app's runtime from the CHECKOUT's sources, so a
+"before" binary run from this tree measures nothing — the worktree is what
+makes the A side real): `keyed-lookup` 97 / 91 / 98 ms, `collections` 19.3 /
+17.0 / 19.3, `transients` 205 / 147 / 203, `hash-eq` 461 / 443 / 458, `literals`
+53 / 54 / 53, `seqs` 358 / 340 / 357. Nothing slower; the scorecard rows below
+carry the refreshed figures.
 
 ### The allocation-bound axes
 

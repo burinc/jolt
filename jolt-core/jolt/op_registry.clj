@@ -163,6 +163,7 @@
    "filter"  {:call "jolt-filter"  :arity #(= % 2)}
    "remove"  {:call "jolt-remove"  :arity #(= % 2)}
    "reduce"  {:call "jolt-reduce"  :arity #(or (= % 2) (= % 3))}
+   "reduce-kv" {:call "jolt-reduce-kv" :arity #(= % 3)}
    "into"    {:call "jolt-into"    :arity #(= % 2)}
    "concat"  {:call "jolt-concat"}
    "apply"   {:call "jolt-apply"   :arity #(>= % 2)}

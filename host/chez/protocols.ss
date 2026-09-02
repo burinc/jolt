@@ -326,7 +326,7 @@
         ;; on the concrete PersistentVector does NOT catch it (issue #629)
         ((jolt-subvec-view? obj) (jch-tags "clojure.lang.APersistentVector$SubVector"))
         ((pvec? obj) (jch-tags "clojure.lang.PersistentVector"))
-        ((pmap? obj) (if (pmap-order obj)
+        ((pmap? obj) (if (pmap-array? obj)
                         (jch-tags "clojure.lang.PersistentArrayMap")
                         (jch-tags "clojure.lang.PersistentHashMap")))
         ((pset? obj) (jch-tags "clojure.lang.PersistentHashSet"))

@@ -166,6 +166,19 @@
 ;;   sa-fasl-read           UNIMPLEMENTED  ?? same, must verify externals resolution shape.
 
 ;; ---------------------------------------------------------------------------
+;; tier: capability-unchecked
+;; ---------------------------------------------------------------------------
+;;   sa-ufx+ sa-ufx- sa-ufx<? sa-ufx>=? sa-ufx=?  UNIMPLEMENTED  Guile: the
+;;                                        checked (rnrs arithmetic fixnums) ops are
+;;                                        the permitted degradation; a tuned port may
+;;                                        expand to the unchecked variants.
+;;   sa-uvector-ref sa-uvector-set!       UNIMPLEMENTED  Guile: vector-ref /
+;;                                        vector-set! (degradation), or the
+;;                                        unchecked accessors when the port is tuned.
+;;   sa-vector-copy-range!                UNIMPLEMENTED  Guile: R7RS vector-copy!
+;;                                        has the contract's argument order.
+
+;; ---------------------------------------------------------------------------
 ;; tier: misc
 ;; ---------------------------------------------------------------------------
 ;;   gensym                 UNIMPLEMENTED  Guile: (gensym) native.

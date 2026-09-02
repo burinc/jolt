@@ -191,20 +191,6 @@
 (defn namespace-munge [s]
   (apply str (map (fn [c] (if (= c \-) \_ c)) (seq (str s)))))
 
-;; reduce-kv over a map (k v) or vector (index v). Both branches go through reduce,
-;; so reduced short-circuits — and the vector path indexes correctly. nil folds
-;; to init, matching Clojure.
-(defn reduce-kv [f init coll]
-  (cond
-    (vector? coll) (reduce (fn [acc i] (f acc i (nth coll i))) init (range (count coll)))
-    (map? coll)    (reduce (fn [acc k] (f acc k (get coll k))) init (keys coll))
-    (nil? coll)    init
-    ;; a deftype/reify declaring IKVReduce drives its own kvreduce (the JVM
-    ;; method name is lowercase). Unwrap a reduced defensively, like reduce.
-    (instance? clojure.lang.IKVReduce coll)
-    (let [r (.kvreduce coll f init)] (if (reduced? r) (deref r) r))
-    :else (throw (str "reduce-kv not supported on: " coll))))
-
 ;; ex-info accessors. The constructor (ex-info) stays native — it builds the tagged
 ;; value and wires into throw — but the value exposes :jolt/type/:message/:data/
 ;; :cause via get, so the accessors are pure over get. A thrown non-ex-info arrives
