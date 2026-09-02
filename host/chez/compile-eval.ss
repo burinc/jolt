@@ -135,27 +135,86 @@
 ;; A bare set, not a parameterize, because the reporter runs from the CLI's guard —
 ;; OUTSIDE every dynamic binding the failing phase had established. A parameterized
 ;; value is long gone by then; only a sticky one survives the unwind, which is the
-;; same reason jolt-enter-form! sets rather than binds and load-jolt-file* restores
-;; on normal return only. Clears any leftover line/column: they belong to whatever
-;; was last evaluated, in some other file entirely.
+;; same reason jolt-enter-form! sets rather than binds (a file LOAD is different:
+;; its failing form's position travels with the throw — jolt-note-throw-source!
+;; below). Clears any leftover line/column: they belong to whatever was last
+;; evaluated, in some other file entirely.
 (define (jolt-enter-file! path)
   (when (string? path)
     (jolt-current-source (jolt-hash-map hc-kw-file path))))
 
 ;; "file:line:col" for a form position, bare "file" for a file-only one (above), or
-;; #f when nothing is set.
+;; #f for anything else.
+(define (jolt-source-position-string p)
+  (and (pmap? p)
+       (let ((line (jolt-get p hc-kw-line jolt-nil))
+             (col  (jolt-get p hc-kw-column jolt-nil))
+             (file (jolt-get p hc-kw-file jolt-nil)))
+         (if (jolt-nil? line)
+             (and (string? file) file)
+             (string-append
+               (if (jolt-nil? file) "" (string-append file ":"))
+               (number->string line) ":"
+               (if (jolt-nil? col) "?" (number->string col)))))))
 (define (jolt-current-source-string)
-  (let ((p (jolt-current-source)))
-    (and (pmap? p)
-         (let ((line (jolt-get p hc-kw-line jolt-nil))
-               (col  (jolt-get p hc-kw-column jolt-nil))
-               (file (jolt-get p hc-kw-file jolt-nil)))
-           (if (jolt-nil? line)
-               (and (string? file) file)
-               (string-append
-                 (if (jolt-nil? file) "" (string-append file ":"))
-                 (number->string line) ":"
-                 (if (jolt-nil? col) "?" (number->string col))))))))
+  (jolt-source-position-string (jolt-current-source)))
+
+;; --- where a throwable happened -----------------------------------------
+;; jolt-current-source answers what is evaluating NOW. A throw that crosses a
+;; file load unwinds to the requiring form, and load-jolt-file* (loader.ss) binds
+;; the position around the file, so it unwinds too; the report still wants the
+;; form that FAILED, so that position travels with the throw instead. The
+;; innermost load a raise passes through records (raised-object . position)
+;; here — from its exception handler, before the stack unwinds — and the report
+;; asks for it back by the object's identity. A throw caught on the way leaves a
+;; record nobody asks for, and blames nothing on that file afterwards: while the
+;; position simply stayed put on a throw, a data_readers namespace that failed
+;; on a Joda class put "at .../clj_time/core.clj:254:1" under every later,
+;; unrelated error in the process, the CLI's own argument errors included.
+(define jolt-throw-source (make-thread-parameter #f))
+(define (jolt-note-throw-source! raw)
+  (let ((cur (jolt-throw-source)))
+    (unless (and cur (eq? (car cur) raw))
+      (jolt-throw-source (cons raw (jolt-current-source))))))
+;; The position `raw` was thrown at, as a pmap, or #f.
+(define (jolt-throw-source-position raw)
+  (let ((cur (jolt-throw-source)))
+    (and cur (eq? (car cur) raw) (cdr cur))))
+
+;; The ":jolt/error" map an analyzer diagnostic carries, or #f. Its presence marks
+;; a COMPILE-time diagnostic: raised while analyzing a form, so the live Chez stack
+;; is the analyzer recursing into it, never the user's program.
+(define diag-kw-jolt-error (keyword "jolt" "error"))
+(define (jolt-analyzer-diagnostic v)
+  (let* ((data (and (jolt-ex-info-record? v) (jolt-ex-info-record-data v)))
+         (err (and data (pmap? data) (jolt-get data diag-kw-jolt-error jolt-nil))))
+    (and (pmap? err) err)))
+
+;; "file:line:col" for a diagnostic that carries its own position, else #f — so a
+;; report can name the offending expression rather than the enclosing top-level
+;; form. Same shape jolt-source-position-string renders, so the two are
+;; indistinguishable in the report.
+(define (jolt-diagnostic-location-string err)
+  (let ((line (jolt-get err hc-kw-line jolt-nil))
+        (col (jolt-get err hc-kw-column jolt-nil))
+        (file (jolt-get err hc-kw-file jolt-nil)))
+    (and (not (jolt-nil? line))
+         (string-append
+           (if (jolt-nil? file) "" (string-append (jolt-str-render-one file) ":"))
+           (number->string (jnum->exact line)) ":"
+           (if (jolt-nil? col) "?" (number->string (jnum->exact col)))))))
+
+;; "file:line:col" where the throwable `raw` happened, in the order a report
+;; should trust: the analyzer diagnostic's own position (the innermost form it
+;; failed in), the position the throw crossed a file load at, then whatever is
+;; evaluating now (a -e form, a build phase's file) — or #f. One answer for the
+;; uncaught reporter (cli-core.ss) and for a load the loader catches and warns
+;; about (a data_readers namespace).
+(define (jolt-throwable-source-string raw)
+  (let ((diag (jolt-analyzer-diagnostic (jolt-unwrap-throw raw))))
+    (or (and diag (jolt-diagnostic-location-string diag))
+        (jolt-source-position-string (jolt-throw-source-position raw))
+        (jolt-current-source-string))))
 
 ;; The spine ALWAYS runs with the full clojure.core prelude loaded, so a clojure.*
 ;; ref must lower to var-deref (resolved from the prelude), not trip the emitter's

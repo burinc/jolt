@@ -27,7 +27,6 @@
 ;; {:type :symbol :suggestions :ns}; those fields are lifted to the top of the
 ;; diagnostic, alongside the human :message and the current form's :line/:column/
 ;; :file. A plain error still yields {:message ... :line ... :column ...}.
-(define diag-kw-jolt-error (keyword "jolt" "error"))
 (define diag-kw-message (keyword #f "message"))
 (define diag-kw-line (keyword #f "line"))
 (define diag-kw-column (keyword #f "column"))
@@ -38,7 +37,7 @@
     (and e (string? e) (string-ci=? e "edn"))))
 
 ;; Build the EDN diagnostic map for an unwrapped throw value.
-(define (jolt-diagnostic-map v)
+(define (jolt-diagnostic-map raw v)
   (let* ((msg (cond ((jolt-ex-info-record? v)
                      (jolt-str-render-one (jolt-ex-info-record-message v)))
                     ((condition? v)
@@ -47,7 +46,7 @@
          (data (and (jolt-ex-info-record? v) (jolt-ex-info-record-data v)))
          (err (and data (pmap? data) (jolt-get data diag-kw-jolt-error jolt-nil)))
          (base (if (and err (pmap? err)) err (jolt-hash-map)))
-         (pos (jolt-current-source))
+         (pos (or (jolt-throw-source-position raw) (jolt-current-source)))
          (m (jolt-assoc base diag-kw-message msg)))
     (if (pmap? pos)
         ;; The loader's per-top-level-form position FILLS IN only what the
@@ -67,28 +66,6 @@
             m))
         m)))
 
-;; The ":jolt/error" map an analyzer diagnostic carries, or #f. Its presence marks
-;; a COMPILE-time diagnostic: raised while analyzing a form, so the live Chez stack
-;; is the analyzer recursing into it, never the user's program.
-(define (jolt-analyzer-diagnostic v)
-  (let* ((data (and (jolt-ex-info-record? v) (jolt-ex-info-record-data v)))
-         (err (and data (pmap? data) (jolt-get data diag-kw-jolt-error jolt-nil))))
-    (and (pmap? err) err)))
-
-;; "file:line:col" for a diagnostic that carries its own position, else #f — so the
-;; report can name the offending expression rather than the enclosing top-level
-;; form. Same shape jolt-current-source-string renders, so the two are
-;; indistinguishable in the report.
-(define (jolt-diagnostic-location-string err)
-  (let ((line (jolt-get err diag-kw-line jolt-nil))
-        (col (jolt-get err diag-kw-column jolt-nil))
-        (file (jolt-get err diag-kw-file jolt-nil)))
-    (and (not (jolt-nil? line))
-         (string-append
-           (if (jolt-nil? file) "" (string-append (jolt-str-render-one file) ":"))
-           (number->string (jnum->exact line)) ":"
-           (if (jolt-nil? col) "?" (number->string (jnum->exact col)))))))
-
 ;; Render an uncaught jolt throw (any value, not just a Chez condition) to stderr
 ;; and exit non-zero, instead of Chez's opaque "non-condition value" dump. The
 ;; message/ex-data/cause + a mapped Clojure backtrace come from the shared
@@ -100,14 +77,13 @@
     (if (jolt-diag-machine?)
         ;; jolt-pr-readable, not jolt-pr-str: strings must be quoted so the line
         ;; is valid EDN a tool can read back.
-        (begin (display (jolt-pr-readable (jolt-diagnostic-map v)) port) (newline port))
+        (begin (display (jolt-pr-readable (jolt-diagnostic-map raw v)) port) (newline port))
         (let ((diag (jolt-analyzer-diagnostic v)))
           (jolt-render-throwable v port)
-          ;; Where it failed: the diagnostic's own position when it has one (the
-          ;; innermost form the analyzer was in), else the top-level form that was
-          ;; evaluating when this propagated.
-          (let ((loc (or (and diag (jolt-diagnostic-location-string diag))
-                         (jolt-current-source-string))))
+          ;; Where it failed: the diagnostic's own position, the form a file load
+          ;; was at when this crossed it, or the top-level form evaluating now
+          ;; (jolt-throwable-source-string, compile-eval.ss).
+          (let ((loc (jolt-throwable-source-string raw)))
             (when loc (display "  at " port) (display loc port) (newline port)))
           ;; No trace for a compile-time diagnostic. It is raised while ANALYZING,
           ;; so the frames are jolt's own analyzer recursing into the form

@@ -267,11 +267,18 @@
 ;; with trailing args). The user-supplied extra args are appended, so an alias's
 ;; :main-opts and the command line combine exactly like the clj CLI, which
 ;; prepends the alias's :main-opts to the argv.
+(declare repl-session)
+
 (defn- apply-main-opts [main-opts extra-args]
   (let [opts (concat main-opts extra-args)]
     (cond
       (= "-m" (first opts)) (run-ns (second opts) (drop 2 opts))
       (= "-e" (first opts)) (eval-expr-string (second opts) (drop 2 opts) true)
+      ;; clojure.main -r / --repl: a REPL, the rest as *command-line-args*.
+      (#{"-r" "--repl"} (first opts))
+      (do (push-thread-bindings
+            {#'clojure.core/*command-line-args* (seq (drop-end-of-options (rest opts)))})
+          (repl-session))
       ;; clojure.main: a bare non-option first arg is a script path and the
       ;; rest is *command-line-args* — `jolt -M file.clj a b`, or an alias
       ;; whose :main-opts name a script. Same load shape as `run FILE`.
@@ -282,7 +289,9 @@
             {#'clojure.core/*command-line-args* (seq (drop-end-of-options (rest opts)))})
           (load-file (file-arg (first opts)))
           nil)
-      :else (throw (ex-info (str "unsupported :main-opts " (pr-str (vec opts))) {})))))
+      :else (throw (ex-info (str "unsupported :main-opts " (pr-str (vec opts))
+                                 " (accepted: -m NS, -e EXPR, -r, or a script FILE)")
+                            {:main-opts (vec opts)})))))
 
 (defn- parse-aliases [s]            ; "-M:a:b" / ":a:b" -> [:a :b]
   (let [s (if (str/starts-with? s "-") (subs s 2) s)]
@@ -330,8 +339,10 @@
 ;; -M[:alias…] [main-opts…] — resolve with the aliases (plus any bound by a
 ;; leading -A), then run their :main-opts followed by the command-line ones. With
 ;; no :main-opts anywhere in the selected aliases the command line supplies them
-;; on its own, so a bare `jolt -M -e EXPR` (or `-M -m NS`) works like clj — only
-;; an empty command line with no :main-opts is an error.
+;; on its own, so a bare `jolt -M -e EXPR` (or `-M -m NS`) works like clj. With
+;; nothing to run at all this is clojure.main with no arguments: a REPL over the
+;; resolved project — `clj -M:dev` is how a REPL with an alias's deps is started.
+;; (It used to be an error, "alias(es) [...] have no :main-opts".)
 (defn- cmd-M [arg more]
   (let [aliases (parse-aliases arg)
         {:keys [main-opts] :as resolved} (resolve-current aliases)]
@@ -339,7 +350,7 @@
       (fn []
         (if (or (seq main-opts) (seq more))
           (apply-main-opts main-opts more)
-          (throw (ex-info (str "alias(es) " (pr-str aliases) " have no :main-opts") {})))))))
+          (repl-session))))))
 
 ;; -A:alias… — select the aliases, then run the remaining argv as a command with
 ;; *cli-aliases* bound, so the command's own project resolution (run/path/build/
@@ -470,11 +481,16 @@
         :else       (let [nb (str buf "\n" line)]
                       (if (repl-form-complete? nb) nb (recur nb)))))))
 
+;; `jolt repl`: resolve the project so deps (git libs) are on the roots and
+;; native libs are loaded — same context a run gets, so (require '[some.lib])
+;; works in the REPL — then the session. -M reaches the session directly, with
+;; its aliases already applied.
 (defn- repl []
-  ;; resolve the project so deps (git libs) are on the roots and native libs are
-  ;; loaded — same context a run gets, so (require '[some.lib]) works in the REPL.
   (try (apply-project! (resolve-current))
        (catch :default _ nil))
+  (repl-session))
+
+(defn- repl-session []
   ;; REPL-driven development: trace by default so an uncaught error in evaluated
   ;; code shows a tail-frame backtrace, no JOLT_TRACE needed (JOLT_TRACE=0 opts out).
   (jolt.host/enable-trace!)

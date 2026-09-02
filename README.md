@@ -134,7 +134,8 @@ $ jolt -e '(/ 1 2)'
 When the current directory has a `deps.edn`, `-e` resolves it first, so the
 expression can require the project's own namespaces and its dependencies.
 `-Sdeps` and `-A` compose with it for a one-off evaluation, and `-M` takes the
-same main options on the command line when the selected aliases declare none:
+same main options on the command line when the selected aliases declare none
+(none at all starts a REPL, like `clj -M:dev`):
 
 ```bash
 jolt -Sdeps '{:paths ["src" "test"]}' -e "(require 'my.app-test 'clojure.test)
@@ -161,9 +162,8 @@ failing the query, so `jolt -A:test:dev -Spath` and `jolt -Spath -M:test` both
 answer. Under `-Scp` the deps.edn is still read — aliases, `:main-opts` and
 tasks work — but nothing is expanded, so a shared library declared by a
 *dependency* is not loaded (the project's own `:jolt/native` still is).
-`-Sforce`, `-Sthreads`, and `-Jopt` are accepted and ignored: there is no
-classpath cache to force, fetching is serial, and there is no JVM to pass
-options to.
+`-Sforce`, `-Sthreads`, and `-Jopt` are accepted and ignored: no classpath
+cache to force, serial fetching, no JVM to pass options to.
 
 ## Differences from Clojure
 
