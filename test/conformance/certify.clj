@@ -454,6 +454,10 @@
 ;; none — not the newest JDK on the machine.
 (def oracle-jdk-floor 21)
 
+(def oracle-clojure-version
+  (:clojure-version
+   (edn/read-string (slurp "test/conformance/profile.edn"))))
+
 (defn check-oracle-jdk! []
   (let [feature (.feature (Runtime/version))]
     (when (< feature oracle-jdk-floor)
@@ -462,8 +466,16 @@
       (println "        Set JAVA_CMD to a newer JDK's java (the clojure launcher's first choice), or put one first on PATH.")
       (System/exit 2))))
 
+(defn check-oracle-clojure! []
+  (when-not (= oracle-clojure-version (clojure-version))
+    (println (format "certify: the oracle is Clojure %s, but the committed profile targets %s."
+                     (clojure-version) oracle-clojure-version))
+    (println "        Run make certify, which pins the recorded oracle version.")
+    (System/exit 2)))
+
 (defn -main [& _]
   (check-oracle-jdk!)
+  (check-oracle-clojure!)
   (when (some #{"--self-test"} *command-line-args*) (self-test))
   (when (some #{"--record-documented"} *command-line-args*) (record-documented))
   (let [;; forced here, not left lazy: these evaluate programs, and a gate should
