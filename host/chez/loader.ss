@@ -202,22 +202,40 @@
                  (pmap-fold m (lambda (k v a) (cons k (cons v a))) '()))))
       (set! data-readers-active #t)
       ;; eagerly load each reader fn's namespace so the rewritten call resolves.
+      ;; Tolerant — a data_readers entry must not kill the project load — but a
+      ;; failure is reported in full (ldr-warn-reader-ns-failed!), or the miss
+      ;; surfaces later as an unrelated unresolved-var error at first #tag read.
       (pmap-fold m (lambda (k v a)
                      (when (and (symbol-t? v) (symbol-t-ns v) (not (jolt-nil? (symbol-t-ns v))))
-                       ;; tolerant — a data_readers entry must not kill the project
-                       ;; load — but say WHICH reader ns failed and why, or the
-                       ;; miss surfaces later as an unrelated unresolved-var error
-                       ;; at first #tag read.
-                       (guard (e (#t (display
-                                      (string-append "jolt: warning: data-reader namespace "
-                                                     (symbol-t-ns v) " failed to load: "
-                                                     (guard (_ (#t "(unprintable error)"))
-                                                       ((var-deref "jolt.host" "condition-message") e))
-                                                     "\n")
-                                      (current-error-port))))
+                       (guard (e (#t (ldr-warn-reader-ns-failed! (symbol-t-ns v) e m)))
                          (load-namespace (symbol-t-ns v))))
                      a)
                  #f)))))
+
+;; The warning for a data_readers namespace that failed to load — everything the
+;; reader needs to act on it: which namespace, why, WHERE it failed (the throw's
+;; own position, in the shape the uncaught report uses), and which tags of the
+;; file now have no reader. The load's position does not outlive the warning:
+;; load-jolt-file* unwinds it, so the next error in the process is not reported
+;; "at" this namespace's failing form.
+(define (ldr-warn-reader-ns-failed! ns-name e readers)
+  (let ((port (current-error-port))
+        (msg (guard (_ (#t "(unprintable error)"))
+               ((var-deref "jolt.host" "condition-message") e)))
+        (where (jolt-throwable-source-string e))
+        (tags (sort string<?
+                    (pmap-fold readers
+                               (lambda (k v a)
+                                 (if (and (symbol-t? v) (equal? (symbol-t-ns v) ns-name))
+                                     (cons (string-append "#" (jolt-pr-str k)) a)
+                                     a))
+                               '()))))
+    (display (string-append "jolt: warning: data-reader namespace " ns-name
+                            " failed to load: " msg "\n")
+             port)
+    (when where (display (string-append "  at " where "\n") port))
+    (unless (null? tags)
+      (display (string-append "  tags " (jolt-str-join tags) " will not read\n") port))))
 (define (load-data-readers!)
   (for-each
     (lambda (root)
@@ -449,18 +467,22 @@
 ;; Split out so the AOT cache (below) reads source once for both keying and the
 ;; capture load, instead of re-reading inside the loop.
 (define (load-jolt-file* path src)
-  (let* ((end (string-length src))
-         ;; Restore the current-source position on NORMAL return only. Loading a
-         ;; required file advances the position per form; without restoring it, a
-         ;; later error in the requiring file (e.g. a second, missing require in
-         ;; the same ns form) would be blamed on the last form of the dependency
-         ;; that just loaded. On a throw we intentionally do NOT restore, so the
-         ;; error keeps the failing form's own position instead of unwinding to
-         ;; the requiring form — the report then points at the file that failed.
-         (saved-source (jolt-current-source)))
+  (let ((end (string-length src)))
     ;; parameterize (not a bare set!) so a require nested in this file's ns form
     ;; restores path when control returns to the rest of this file.
     (parameterize ((rdr-source-file path)    ; list forms read here carry :file = path
+                   ;; The current-source position too: loading a file advances it
+                   ;; per form, and the requiring file's next error (a second,
+                   ;; missing require in the same ns form) must not be blamed on
+                   ;; the dependency's last form. Bound around the WHOLE load, so a
+                   ;; throw restores it as well — the failing form's position
+                   ;; travels with the throw instead (the handler below), which is
+                   ;; what the uncaught report prints. Restoring on a normal
+                   ;; return only, as this used to, left a throw that was CAUGHT
+                   ;; (a data_readers namespace the loader tolerates, a require
+                   ;; in a try) pinning the position on the file that failed, and
+                   ;; every later, unrelated error was reported "at" it.
+                   (jolt-current-source (jolt-current-source))
                    ;; Tee into the AOT capture only while loading the file that
                    ;; capture was opened for. A nested load must not append its
                    ;; forms to the requiring namespace's artifact: that artifact
@@ -479,25 +501,34 @@
                                           (jolt-aot-capture))))
       (ldr-with-file-vars path
         (lambda ()
-          ;; rdr-read-top, not rdr-read-form: a stray close delimiter is a READ
-          ;; ERROR at a file's top level, and only the top-level entry says so.
-          ;; rdr-read-form leaves the position where it found the `)`, and the
-          ;; (> j i) guard below reads no progress as end of input — so one extra
-          ;; paren silently DROPPED the rest of the file and the run exited 0.
-          ;; A test file that lost its whole body that way still looked like a
-          ;; pass. The JVM raises "Unmatched delimiter: )" here (jolt-3amm).
-          (let loop ((i 0))
-            (when (< i end)
-              (let-values (((form j) (rdr-read-top src i end)))
-                (when (> j i)
-                  (unless (rdr-eof? form)
-                    (when (getenv "JOLT_TRACE_LOAD")
-                      (display "  [load-form] " (current-error-port))
-                      (display (jolt-pr-str form) (current-error-port)) (newline (current-error-port)))
-                    (jolt-compile-eval-form (if data-readers-active (ldr-apply-readers form) form)
-                                            (chez-current-ns)))
-                  (loop j))))))))
-    (jolt-current-source saved-source)))
+          ;; The failing form's position, recorded before the stack unwinds (an
+          ;; exception handler runs at the raise; a guard runs after) and keyed
+          ;; by the raised object, so the report can ask for it back. The
+          ;; innermost load records first and outer ones keep its answer.
+          ;; raise-continuable, so a continuable raise (a compiler warning)
+          ;; resumes exactly as it would without this handler.
+          (with-exception-handler
+            (lambda (e) (jolt-note-throw-source! e) (raise-continuable e))
+            (lambda ()
+              ;; rdr-read-top, not rdr-read-form: a stray close delimiter is a
+              ;; READ ERROR at a file's top level, and only the top-level entry
+              ;; says so. rdr-read-form leaves the position where it found the
+              ;; `)`, and the (> j i) guard below reads no progress as end of
+              ;; input — so one extra paren silently DROPPED the rest of the file
+              ;; and the run exited 0. A test file that lost its whole body that
+              ;; way still looked like a pass. The JVM raises "Unmatched
+              ;; delimiter: )" here (jolt-3amm).
+              (let loop ((i 0))
+                (when (< i end)
+                  (let-values (((form j) (rdr-read-top src i end)))
+                    (when (> j i)
+                      (unless (rdr-eof? form)
+                        (when (getenv "JOLT_TRACE_LOAD")
+                          (display "  [load-form] " (current-error-port))
+                          (display (jolt-pr-str form) (current-error-port)) (newline (current-error-port)))
+                        (jolt-compile-eval-form (if data-readers-active (ldr-apply-readers form) form)
+                                                (chez-current-ns)))
+                      (loop j))))))))))))
 
 ;; --- AOT / compile cache for required namespaces ----------------------------
 ;; A disk-backed namespace is recompiled from source on EVERY run (load-jolt-file

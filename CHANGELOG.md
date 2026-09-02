@@ -5,6 +5,42 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`-M` with nothing to run starts a REPL.** `jolt -M:test` where no selected
+  alias declares `:main-opts` and the command line adds none used to exit 1
+  with `alias(es) [:test] have no :main-opts`. `-M` is `clojure.main`, and
+  `clojure.main` with no arguments is a REPL — `clj -M:dev` is how a REPL over
+  an alias's extra deps is started — so jolt does the same now, over the
+  project resolved with those aliases. `:main-opts ["-r"]` (or `--repl`) asks
+  for one explicitly, as on the JVM. A `:main-opts` form jolt does not take
+  says which it does: `-m NS`, `-e EXPR`, `-r`, or a script file.
+
+### Fixed
+
+- **A caught load error no longer misplaces every later error.** The
+  `at file:line:col` line under an uncaught error is the top-level form that
+  was evaluating, and a file load deliberately left that position on its
+  failing form when it threw, so the report named the file that failed. When
+  the throw was *caught* — a `data_readers.clj` namespace the loader tolerates,
+  a `require` inside a `try` — the position stayed put anyway, and every later,
+  unrelated error was reported at it: a CLI argument error came out `at
+  …/clj_time/core.clj:254:1`, the form whose Joda class the clj-time data-reader
+  load had stumbled on. A file load now binds the position around the whole
+  load, and the failing form's position travels with the throw itself (recorded
+  by the innermost load it crosses, before the stack unwinds), which the report
+  reads back — so a propagating load error is placed exactly as before, and a
+  caught one leaves nothing behind. `JOLT_DIAG=edn` diagnostics read the same
+  position.
+- **The data-reader load warning says where and what.** `data-reader namespace
+  clj-time.coerce failed to load: Unknown class DateTimeZone` now carries the
+  position the load failed at and the tags that consequently have no reader
+  (`tags #clj-time/date-time will not read`), instead of leaving the reader to
+  find the form and to meet the missing tag later as an unrelated
+  unresolved-var error.
+
 ## [0.8.1] - 2026-09-02
 
 Host classes are provided by declaration now. The runtime no longer carries the
