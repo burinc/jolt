@@ -380,11 +380,51 @@ check "-e - reads the expression from stdin" "main1" \
       "$(printf "(require 'appmain) (appmain/-main)" | JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" -e - 2>&1 | tail -1)"
 check "- runs a stdin program against the project" "main1" \
       "$(printf "(require 'appmain) (appmain/-main)" | JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" - 2>&1 | tail -1)"
-out="$(runfull -M)"
-case "$out" in
-  *"have no :main-opts"*) check "bare -M with nothing to run errors" ok ok ;;
-  *) check "bare -M with nothing to run errors" "no-main-opts error" "$(printf '%s' "$out" | head -1)" ;;
-esac
+# -M is clojure.main: with no :main-opts anywhere and nothing on the command
+# line it starts a REPL (`clj -M:dev` is how a REPL over an alias's deps is
+# started), and -r / --repl ask for one explicitly. Resolved WITH the alias:
+# libc is on the roots only through :dev. Piped stdin drives the REPL.
+repl() { expr="$1"; shift; printf '%s\n' "$expr" | JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" "$@" 2>&1; }
+replcheck() { # label expected-fragment out
+  case "$3" in
+    *"$2"*) check "$1" ok ok ;;
+    *) check "$1" "$2" "$(printf '%s' "$3" | head -3)" ;;
+  esac
+}
+replcheck "bare -M with nothing to run starts a REPL" "user=> 3" "$(repl '(+ 1 2)' -M)"
+replcheck "-M:alias without :main-opts starts a REPL over the alias" "libc C" \
+          "$(repl "(require 'appc) (appc/-main)" -M:dev)"
+replcheck ":main-opts [\"-r\"] starts a REPL" "user=> 42" "$(repl '(+ 40 2)' -M:r1)"
+replcheck "-M:alias -r starts a REPL over the alias" "libc C" \
+          "$(repl "(require 'appc) (appc/-main)" -M:dev --repl)"
+# an option jolt's clojure.main does not take says what it does take
+replcheck "unsupported :main-opts names the accepted forms" "accepted: -m NS, -e EXPR, -r, or a script FILE" \
+          "$(runfull -M:bad)"
+
+# A data_readers entry whose namespace fails to load is a WARNING (the project
+# still loads), and the warning has to be actionable: which namespace, why,
+# WHERE it failed, and which tags are now unreadable. And the position the
+# failed load was at must not stick: it used to blame every later, unrelated
+# error on that file ("at .../clj_time/core.clj:254:1" under a CLI arg error).
+RB="$root/test/chez/deps-alias/rdrbroken"
+runrb() { JOLT_PWD="$RB" JOLT_QUIET=1 "$JOLT" "$@" 2>&1; }
+after_report() { printf '%s\n' "$1" | sed -n '/^Unhandled exception/,$p'; }
+warning_block() { printf '%s\n' "$1" | sed '/^Unhandled exception/,$d'; }
+out="$(runrb -X:x)"
+replcheck "data-reader load warning names the namespace and cause" \
+          "data-reader namespace rb.rdr failed to load: Unknown class NoSuchHostClass" "$out"
+replcheck "data-reader load warning says where it failed" "rb/rdr.clj:3:" "$(warning_block "$out")"
+replcheck "data-reader load warning names the tags it takes down" "#rb/up" "$out"
+replcheck "the CLI's own error still reports after the warning" "No function to execute" "$out"
+check "a caught data-reader load leaves no stale 'at' location" "0" \
+      "$(after_report "$out" | grep -c '^  at ')"
+# same leak through a require caught in user code
+out="$(runrb run -m rb.app)"
+replcheck "an error after a caught require is reported" "after a caught load" "$out"
+check "a caught require leaves no stale 'at' location" "0" "$(after_report "$out" | grep -c '^  at ')"
+# …while a load error that PROPAGATES still names the form that failed
+out="$(runrb run -m rb.boom)"
+replcheck "a propagating load error names its form" "rb/boom.clj:3:1" "$(after_report "$out")"
 
 # -X: :exec-fn / :exec-args from the alias, k v overrides, a trailing map, an
 # explicit ns/fn argument, and :ns-aliases qualification
