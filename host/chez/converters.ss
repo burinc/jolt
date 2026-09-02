@@ -392,7 +392,12 @@
 ;; #xffffffff is itself a fixnum here.
 (define (jolt-unchecked-long x)
   (cond ((fixnum? x) x)
-        ((char? x) (char->integer x))
+        ;; RT.uncheckedLongCast(Object) is ((Number) x).longValue(): a Character
+        ;; is not a Number there, so (unchecked-long \a) raises. Only the INT
+        ;; cast has a char overload — (unchecked-long (unchecked-int c)) is the
+        ;; idiom, and it still works. jolt used to answer 97 here (found by the
+        ;; JVM certification of the new corpus rows).
+        ((char? x) (jolt-num-cast-throw x))
         ;; an exact integer wraps (long narrowing); a double SATURATES (Java's
         ;; double->long conversion clamps at the bounds, NaN is 0).
         ((and (number? x) (exact? x)) (jolt-wrap64 (truncate x)))
