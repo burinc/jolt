@@ -5,7 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.1] - 2026-09-02
+
+Host classes are provided by declaration now. The runtime no longer carries the
+list of which library implements `java.time.ZoneOffset` or `javax.crypto.Mac`:
+a library declares the classes it provides in its own `deps.edn`
+(`:jolt/provides`, RFC 0014), and `jolt.deps` installs the mapping before any
+user code compiles. **This is a breaking change for a project pinning
+jolt-lang/time or jolt-lang/crypto at a sha older than their declarations** —
+time before v0.0.8, crypto before v0.0.5 — which raises `No dependency provides
+java.time.ZoneOffset` on the first use of such a class unless the project
+requires the library itself first. Bump the pin; details under Changed.
+
+The rest is additive. `main` is built every night and published as the rolling
+`vnightly` prerelease. A small map is one flat slot vector, and the five general
+defects behind the worst scorecard rows are fixed. `clojure.core.async.flow`
+ships in the stdlib with its `:io` processes on fibers, and the executors under
+it have the JVM's shape: `newCachedThreadPool` grows on demand, an enqueue wakes
+one worker rather than all of them, and the three spellings of shutdown do what
+they say. `jolt.ffi` gained babashka.ffi's bare `:&`, `[:union …]` layouts and a
+direct `ByteBuffer` over foreign memory. `clojure.lang.RT/REQUIRE_LOCK`, a
+`munge` over the whole `CHAR_MAP` and reflection that reads the statics registry
+are what typedclojure's runtime asks of a host.
 
 ### Added
 
@@ -215,6 +236,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   states for its own.
 
 ### Changed
+
+- **Host classes are provided by declaration, not by a list in the runtime
+  (#813, RFC 0014).** The runtime carried the mapping from host class names to
+  the library that installs them — `java.time.ZoneOffset` to jolt-lang/time,
+  `javax.crypto.Mac` to jolt-lang/crypto — as a hand-synced table, so a library
+  growing a class needed a jolt release, and core decided what a class meant
+  rather than the library implementing it. A library now declares what it
+  provides in its own `deps.edn`, and `jolt.deps` collects the declarations
+  through the walk it already does for `:jolt/native` and installs them before
+  any user code compiles:
+
+  ```clojure
+  :jolt/provides {jolt.time ["java.time.ZoneOffset" "java.time.ZoneId" "java.util.Locale"]}
+  ```
+
+  Fully-qualified names only; the runtime derives the simple spelling, which is
+  what the old table got wrong by hand. Core keeps only the classes it
+  implements itself — `jolt.time.base`'s java.time value types and
+  `jolt.socket`'s java.net surface. Two dependencies claiming one class is an
+  error at resolve time naming both, since whichever won would decide what the
+  class means program-wide; a claim on a class the runtime already implements
+  is refused. A miss no longer names a library, because which library supplies
+  a class is not the runtime's to say and a caller may write the shim
+  themselves:
+
+  ```
+  No dependency provides java.time.ZoneOffset — a concrete implementation of
+  the JDK classes must be provided. A library supplies one by declaring
+  :jolt/provides in its deps.edn (RFC 0014).
+  ```
+
+  **Migration.** A project pinning jolt-lang/time or jolt-lang/crypto at a sha
+  older than their declarations sees that message on the first
+  `DateTimeFormatter`, `ZoneId`, `Locale` or `MessageDigest` reference that
+  used to autoload the library; a project that requires `jolt.time` or
+  `jolt.crypto` itself before that first use is unaffected, because
+  registration at load is unchanged. jolt-lang/time v0.0.8 and jolt-lang/crypto
+  v0.0.5 declare theirs, and both run on 0.8.0 as well, which ignores the key —
+  so the pin can move before the toolchain does.
 
 - **`reduce-kv` is native, and `assoc` of the value a map already holds is the
   map itself.** `reduce-kv` folds a map's entries or a vector's index/element
@@ -510,6 +570,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through the same `Runnable` conversion the executors use now — which is what
   the class graph above already claims, a `FutureTask` being a `Runnable`.
 
+- **Socket error handling could lose `errno` between a syscall and its accessor,**
+  causing a clobbered `EAGAIN` to be treated as a terminal socket failure.
+  `connect`, `accept`, `recv`, and `send` now capture result and `errno` atomically.
+
+- **Modeled atomic classes used Clojure value equality and unbounded
+  arithmetic.** `AtomicReference.compareAndSet` now compares object identity,
+  while `AtomicInteger` and `AtomicLong` validate primitive arguments and wrap
+  arithmetic at their signed 32- and 64-bit widths, and `AtomicLong.intValue`
+  narrows to a signed 32-bit result, matching the JVM.
+
+- **`File.getParentFile` answered the filesystem root as its own parent, so a
+  walk-to-root loop never terminated (#809).** The parent was the text before
+  the last separator, which for `"/"` is `"/"` — the path back again, where the
+  JVM answers `nil`. Every `(recur (.getParentFile d) …)` is written against
+  that `nil`, and because the recur is a tail call the non-terminating loop had
+  no stack to overflow and nothing to raise: it presented as a hang. Both
+  `.getParent` and `.getParentFile` now answer `nil` whenever the computed
+  parent equals the path it came from, which is the JVM's invariant and needs no
+  special case for `"/"`.
+
+  In the same dispatch table, **`.listFiles` raised where the JVM answers
+  `nil`** — for a path that does not exist, for a plain file, and for a
+  directory the process may not read — so the ordinary
+  `(map str (.listFiles f))` died instead of yielding `()`. Its neighbour
+  `.list` already guarded the first two cases and not the third; both spellings
+  now share one guard covering all three.
+
+- **Namespaced-map prefixes could absorb separator text into a silent wrong
+  namespace or accept an invalid namespace.** The reader now requires the
+  namespace — auto-resolved (`#::a`) or explicit (`#:a`) alike — to be a simple
+  unqualified symbol, stops at the token boundary, allows whitespace and commas
+  before `{`, and rejects other intervening input including comments to match
+  JVM behavior. A missing map is reported before the namespace token is judged,
+  and an unregistered alias now says `Unknown auto-resolved namespace alias`
+  rather than `Invalid token`, so the message matches the JVM's for every
+  spelling that names a namespace.
+
 ## [0.8.0] - 2026-08-31
 
 The build keeps one toolchain end to end now. When make provisions the pinned
@@ -718,43 +815,6 @@ when transposed.
   still applies checked `fx` ops to int-width values, which raise rather than
   corrupt. Reported and first patched by @jasalt, found bringing up a
   WASM/Emscripten build.
-
-- **Socket error handling could lose `errno` between a syscall and its accessor,**
-  causing a clobbered `EAGAIN` to be treated as a terminal socket failure.
-  `connect`, `accept`, `recv`, and `send` now capture result and `errno` atomically.
-
-- **Modeled atomic classes used Clojure value equality and unbounded
-  arithmetic.** `AtomicReference.compareAndSet` now compares object identity,
-  while `AtomicInteger` and `AtomicLong` validate primitive arguments and wrap
-  arithmetic at their signed 32- and 64-bit widths, and `AtomicLong.intValue`
-  narrows to a signed 32-bit result, matching the JVM.
-
-- **`File.getParentFile` answered the filesystem root as its own parent, so a
-  walk-to-root loop never terminated (#809).** The parent was the text before
-  the last separator, which for `"/"` is `"/"` — the path back again, where the
-  JVM answers `nil`. Every `(recur (.getParentFile d) …)` is written against
-  that `nil`, and because the recur is a tail call the non-terminating loop had
-  no stack to overflow and nothing to raise: it presented as a hang. Both
-  `.getParent` and `.getParentFile` now answer `nil` whenever the computed
-  parent equals the path it came from, which is the JVM's invariant and needs no
-  special case for `"/"`.
-
-  In the same dispatch table, **`.listFiles` raised where the JVM answers
-  `nil`** — for a path that does not exist, for a plain file, and for a
-  directory the process may not read — so the ordinary
-  `(map str (.listFiles f))` died instead of yielding `()`. Its neighbour
-  `.list` already guarded the first two cases and not the third; both spellings
-  now share one guard covering all three.
-
-- **Namespaced-map prefixes could absorb separator text into a silent wrong
-  namespace or accept an invalid namespace.** The reader now requires the
-  namespace — auto-resolved (`#::a`) or explicit (`#:a`) alike — to be a simple
-  unqualified symbol, stops at the token boundary, allows whitespace and commas
-  before `{`, and rejects other intervening input including comments to match
-  JVM behavior. A missing map is reported before the namespace token is judged,
-  and an unregistered alias now says `Unknown auto-resolved namespace alias`
-  rather than `Invalid token`, so the message matches the JVM's for every
-  spelling that names a namespace.
 
 - **`getPosixFilePermissions` and `getOwner` refused to run on hosts whose
   layout jolt already knew.** `nio-file` reads `st_mode` and `st_uid` at offsets
@@ -8251,7 +8311,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.7.28...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/jolt-lang/jolt/compare/v0.8.0...v0.8.1
 [0.7.28]: https://github.com/jolt-lang/jolt/compare/v0.7.27...v0.7.28
 [0.7.16]: https://github.com/jolt-lang/jolt/compare/v0.7.15...v0.7.16
 [0.7.15]: https://github.com/jolt-lang/jolt/compare/v0.7.14...v0.7.15
