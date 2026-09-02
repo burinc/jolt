@@ -47,6 +47,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`jolt build` accepts an alias-qualified namespaced map before the namespace
+  has loaded.** The dependency scanner reads every top-level form before it
+  evaluates the file's `ns` declaration. Scan mode already preserved an
+  unresolved `::alias/keyword` until the real load installed the alias, but
+  `#::alias{:key value}` still tried to resolve it immediately and failed with
+  `Unknown auto-resolved namespace alias`. This prevented a self-contained
+  application using `clojure.core.async.flow` from building because flow's
+  implementation uses `:as-alias flow` and `#::flow{...}`. Namespaced maps now
+  use the same scan-only placeholder rule as auto-resolved keywords; ordinary
+  reads remain strict.
 - **The default time zone is the machine's.** `TimeZone/getDefault`,
   `Calendar/getInstance`, a `SimpleDateFormat` with no zone set, the deprecated
   `Date` constructor and getters, `java.sql.Date.valueOf` and `toLocalDate` all
@@ -296,7 +306,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prompt that said `user`, and `-main` under `run -m` ran in `jolt.main`.
   `clojure.main` starts every entry in `user`; jolt does too now, and the REPL
   prompt names whatever namespace is current, as `clojure.main`'s does.
-
 ## [0.8.1] - 2026-09-02
 
 Host classes are provided by declaration now. The runtime no longer carries the
