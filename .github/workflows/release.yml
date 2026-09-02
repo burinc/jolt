@@ -13,9 +13,26 @@ on:
     tags:
       - 'v*'
   workflow_dispatch: {}   # dry-run the build matrix without tagging
+  # A rolling prerelease built from main daily, so downstream projects can test
+  # against unreleased jolt without building it from source. The tagged-release
+  # path is untouched: `publish` and `homebrew` are already guarded to
+  # refs/tags, so a scheduled run never reaches them.
+  schedule:
+    - cron: '0 17 * * *'
 
 permissions:
   contents: write   # create/update the GitHub Release and upload assets
+
+# The tag everything is named for, decided once because the package name, the
+# asset names and the release all have to agree. A tag push uses the tag; a
+# scheduled build uses the rolling `vnightly`.
+#
+# That name is not arbitrary. jolt's own install script does
+# `tag="v${version#v}"` and `filename="jolt-${tag}-${target}.tar.gz"`, so tag
+# `vnightly` makes `--version nightly` resolve to `jolt-vnightly-<target>.tar.gz`,
+# and a nightly is installable with the shipped installer, unchanged.
+env:
+  JOLT_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'vnightly' }}
 
 jobs:
   build:
@@ -257,7 +274,7 @@ jobs:
 
       - name: Package
         run: |
-          ver="${GITHUB_REF_NAME}"
+          ver="${JOLT_TAG}"
           name="jolt-${ver}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
           cp README.md LICENSE "dist/${name}/"
@@ -286,6 +303,32 @@ jobs:
           name: jolt-x86_64-linux
           path: dist/**/*.tar.gz
           retention-days: 1
+
+      # Draft first, exactly as a real release does and for the same reason: a
+      # nightly that fails the gates below stays a draft nobody can install, and
+      # the previous nightly remains the newest thing available.
+      - name: Upload to the nightly prerelease (draft)
+        if: github.event_name == 'schedule'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vnightly
+          name: nightly
+          draft: true
+          prerelease: true
+          target_commitish: ${{ github.sha }}
+          body: |
+            Rolling build of `main`, replaced daily. Not a release: no
+            compatibility promise, and it may be broken.
+
+                curl -sSL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash -s -- --version nightly
+
+            Built from ${{ github.sha }}.
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
+          fail_on_unmatched_files: false
 
       # DRAFT, so the release is not public until the fleet gates pass: `publish`
       # below flips it. A draft is invisible to the install script and to Homebrew
@@ -623,6 +666,39 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: gh release edit "${GITHUB_REF_NAME}" --draft=false --latest
+
+  # The nightly's counterpart to `publish`, behind the same gates, so a rolling
+  # build that breaks the libraries, examples or bench never becomes
+  # installable: it stays a draft and the previous nightly remains newest.
+  #
+  # The tag is moved explicitly. softprops creates `vnightly` at the current sha
+  # when it does not exist but leaves it alone when it does, so without this the
+  # tag drifts behind the assets attached to it.
+  publish-nightly:
+    name: publish nightly
+    needs: [build, libraries, libraries-db, examples, bench]
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Point vnightly at this commit and publish it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # --latest=false matters: a prerelease must never displace the newest
+          # real release, which is what the install script's bare invocation and
+          # the Homebrew tap both read.
+          gh release edit vnightly --draft=false --prerelease --latest=false
+          gh api -X PATCH "repos/${GH_REPO}/git/refs/tags/vnightly" \
+            -f sha="$SHA" -F force=true >/dev/null
+          gh release view vnightly \
+            --json tagName,isPrerelease,isDraft,assets \
+            --jq '"published \(.tagName) prerelease=\(.isPrerelease) draft=\(.isDraft) assets=\(.assets|length)"'
 
   # Bump the Homebrew tap (jolt-lang/homebrew-jolt) to this tag: rewrite each
   # platform's url + sha256 in Formula/jolt.rb from the release's .sha256 assets.
