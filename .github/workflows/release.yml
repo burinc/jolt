@@ -677,16 +677,30 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: gh release edit "${GITHUB_REF_NAME}" --draft=false --latest
 
-  # The nightly's counterpart to `publish`, behind the same gates, so a rolling
-  # build that breaks the libraries, examples or bench never becomes
-  # installable: it stays a draft and the previous nightly remains newest.
+  # Gated on jolt itself, NOT on the downstream libraries.
+  #
+  # The first run of this workflow published nothing, because `library db`,
+  # `library db (postgres)` and `library transit-jolt` fail on main today:
+  # "No dependency provides Locale ... a library supplies one by declaring
+  # :jolt/provides (RFC 0014)". Those gates last passed at the v0.8.0 tag and
+  # main is 45 commits past it, which is exactly the drift a nightly exists to
+  # surface — but blocking on it would mean no nightly at all for as long as a
+  # third-party library lags a jolt change.
+  #
+  # So a nightly requires jolt to build, smoke, run the examples and hold its
+  # benchmarks. A library that has not caught up yet still fails its own job
+  # loudly, and the run is still red, but it no longer withholds the binary
+  # people need in order to fix it.
+  #
+  # A tagged release keeps the strict gate: `publish` below is unchanged, and
+  # every library must be green before anything ships under a version number.
   #
   # The tag is moved explicitly. softprops creates `vnightly` at the current sha
   # when it does not exist but leaves it alone when it does, so without this the
   # tag drifts behind the assets attached to it.
   publish-nightly:
     name: publish nightly
-    needs: [build, libraries, libraries-db, examples, bench]
+    needs: [build, examples, bench]
     if: github.event_name == 'schedule' || inputs.nightly == true
     runs-on: ubuntu-latest
     timeout-minutes: 15
