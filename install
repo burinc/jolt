@@ -39,8 +39,9 @@ print_help() {
     echo " * Installation directory: \$PREFIX/bin if PREFIX is set;"
     echo "   otherwise /usr/local/bin when run as root, ~/.local/bin when not"
     echo " * Download directory: a temporary directory"
-    echo " * Version: the latest release on GitHub"
+    echo " * Version: the latest release on GitHub ('nightly' is the rolling build of main)"
     echo " * Checksum: fetched from the release and verified automatically"
+    echo " * Repo: jolt-lang/jolt, or \$JOLT_REPO (a fork's own nightly lives on the fork)"
     exit 1
 }
 

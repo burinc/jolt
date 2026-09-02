@@ -165,7 +165,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke versionsmoke \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
 TEST-GATES := submodules selfhost ci
@@ -928,6 +928,14 @@ errnocheck:
 # Makes provisioning so release jobs retain their chosen compiler and libc.
 makefilesmoke:
 	@bash test/makefile-smoke.sh
+
+# tools/version.sh is the one definition of a checkout's version (bin/jolt,
+# build-jolt.ss and the release workflow all read it). The property: release
+# tags only, so the rolling `vnightly` tag the nightly moves to main's head is
+# never the answer, and a checkout with no release tag reachable answers
+# dev-g<sha>, which no :jolt/min-version floor can misread as a version.
+versionsmoke:
+	@bash test/version-smoke.sh
 
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
 certify:
