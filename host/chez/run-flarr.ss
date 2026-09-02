@@ -16,13 +16,38 @@
 ((var-deref "jolt.backend-scheme" "set-prelude-mode!") #t)
 (define (anode src) (analyze (make-analyze-ctx "user") (jolt-ce-read src)))
 (define (emit-num src) (emit (numeric-annotate (anode src))))
+;; how many times sub occurs in s (non-overlapping)
+(define (gate-count s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0) (c 0))
+      (cond ((> (+ i m) n) c)
+            ((string=? (substring s i (+ i m)) sub) (loop (+ i m) (+ c 1)))
+            (else (loop (+ i 1) c))))))
+;; A ^doubles PARAM's backing flvector is bound once at the arity's entry
+;; ((_av$N (jolt-array-vec-of a)), inside the named let so a fn-level recur
+;; rebinds it) and every proven read/write indexes THAT — the accessor is not
+;; re-read per access. A ^doubles LET binding (row 4) keeps the accessor.
 (let ((e (emit-num "(def _ (fn [^doubles a ^long i] (aget a i)))")))
-  (gate-check "(1) aget ^doubles,^long idx -> inline flvector-ref" (gate-sub? e "(flvector-ref (jolt-array-vec") #t)
+  (gate-check "(1) aget ^doubles,^long idx -> inline flvector-ref on the hoisted vector" (gate-sub? e "(flvector-ref _av$") #t)
+  (gate-check "(1) ...the vector is bound at entry from the param" (gate-sub? e "(jolt-array-vec-of a)") #t)
+  (gate-check "(1) ...and not re-read per access" (gate-sub? e "(flvector-ref (jolt-array-vec") #f)
   (gate-check "(1) ...proven idx NOT the jolt-flaget call" (gate-sub? e "jolt-flaget") #f)
   (gate-check "(1) ...not the generic jolt-nth" (gate-sub? e "jolt-nth") #f))
 (let ((e (emit-num "(def _ (fn [^doubles a ^long i] (+ (aget a i) (aget a i))))")))
   (gate-check "(2) arithmetic over ^doubles param reads -> fl+" (gate-sub? e "fl+") #t)
-  (gate-check "(2) ...reading via inline flvector-ref" (gate-sub? e "(flvector-ref (jolt-array-vec") #t))
+  (gate-check "(2) ...reading via the hoisted vector" (gate-sub? e "(flvector-ref _av$") #t))
+;; shadowing: a let, a loop var or a nested fn param reusing the name reads ITS
+;; array through the accessor, never the outer param's hoisted vector.
+(let ((e (emit-num "(def _ (fn [^doubles a ^long i] (let [^doubles a (double-array 4)] (aget a i))))")))
+  (gate-check "(2a) a ^doubles let shadowing the param reads its own array" (gate-sub? e "(flvector-ref (jolt-array-vec a)") #t)
+  (gate-check "(2a) ...and not the hoisted vector" (gate-sub? e "(flvector-ref _av$") #f))
+(let ((e (emit-num "(def _ (fn [^doubles a ^long i] (loop [^doubles a (double-array 4) j 0] (if (< j 1) (recur a (inc j)) (aget a i)))))")))
+  ;; the numeric pass does not type a ^doubles LOOP var, so this read is the
+  ;; generic one; the property is that it never reaches the hoisted vector.
+  (gate-check "(2b) a loop var shadowing the param never reads the hoisted vector" (gate-sub? e "(flvector-ref _av$") #f))
+(let ((e (emit-num "(def _ (fn [^doubles a ^long i] ((fn [^doubles a] (aget a i)) (double-array 4))))")))
+  (gate-check "(2c) a nested fn's own ^doubles param gets its own hoist" (gate-sub? e "(flvector-ref _av$") #t)
+  (gate-check "(2c) ...bound from ITS param, twice in all" (gate-count e "(jolt-array-vec-of a)") 2))
 (let ((e (emit-num "(def _ (fn [a i] (aget a i)))")))
   (gate-check "(3) untyped aget stays native jolt-nth (not flaget)" (gate-sub? e "jolt-flaget") #f)
   (gate-check "(3) ...uses jolt-nth" (gate-sub? e "jolt-nth") #t))
@@ -34,8 +59,10 @@
 (let ((e (emit-num "(def _ (fn [m ^long i] (let [^doubles a (:pixels m)] (+ (aget a i) (aget a i)))))")))
   (gate-check "(5) arithmetic over ^doubles let read -> fl+" (gate-sub? e "fl+") #t))
 (let ((e (emit-num "(def _ (fn [^doubles a ^long i] (aset a i 7.25)))")))
-  (gate-check "(5a) aset ^doubles,^long idx,double val -> inline flvector-set!" (gate-sub? e "(flvector-set! (jolt-array-vec") #t)
+  (gate-check "(5a) aset ^doubles,^long idx,double val -> inline flvector-set! on the hoisted vector" (gate-sub? e "(flvector-set! _av$") #t)
   (gate-check "(5a) ...NOT the jolt-flaset call" (gate-sub? e "jolt-flaset") #f))
+(let ((e (emit-num "(def _ (fn [m ^long i] (let [^doubles a (:pixels m)] (aset a i 7.25))))")))
+  (gate-check "(5a-let) aset on a ^doubles LET binding keeps the accessor" (gate-sub? e "(flvector-set! (jolt-array-vec") #t))
 (let ((e (emit-num "(def _ (fn [^doubles a ^long i] (aset a i 4)))")))
   (gate-check "(5b) aset ^doubles,int val keeps jolt-flaset (exact->inexact)" (gate-sub? e "jolt-flaset") #t))
 
@@ -48,6 +75,14 @@
 (define (ev s) (jolt-compile-eval s "user"))
 (gate-check "(6) aget fixnum index reads the stored double"
             (ev "(let [^doubles a (double-array 3)] (aset a 1 7.25) (aget a 1))") 7.25)
+;; the hoisted vector follows a fn-level recur that passes a different array,
+;; and a non-array ^doubles argument raises the JVM's checkcast on entry.
+(ev "(defn flarr-recur [^doubles a ^long i] (if (< i 1) (recur (double-array 2 3.5) (inc i)) (aget a 0)))")
+(gate-check "(6a) fn-level recur rebinds the hoisted vector" (ev "(flarr-recur (double-array 2 1.0) 0)") 3.5)
+(gate-check "(6b) a non-array ^doubles arg raises ClassCastException on entry"
+            (ev "(try (flarr-recur [1.0 2.0] 5) (catch ClassCastException e :cce))") (keyword #f "cce"))
+(gate-check "(6c) a ^doubles param shadowed by a let reads the let's array"
+            (ev "(let [f (fn [^doubles a ^long i] (let [^doubles a (double-array 2 9.0)] (aget a i)))] (f (double-array 2 1.0) 1))") 9.0)
 (gate-check "(6) aset returns the stored value"
             (ev "(let [^doubles a (double-array 3)] (aset a 1 7.25))") 7.25)
 (gate-check "(6) aset of an int value stores its double"

@@ -783,6 +783,18 @@
 ;; non-creating lookup (resolve / find-var / ns-unmap): #f when absent, so a
 ;; probe never interns an empty cell.
 (define (var-cell-lookup ns name) (hashtable-ref var-table (string-append ns "/" name) #f))
+;; A direct-linked call to a seed var binds the var's root ONCE, when the def
+;; that holds the site loads (backend emit-invoke, jolt.host/seed-callable?).
+;; The compile-time check proved the root a procedure in the same seed, so
+;; anything else here is a runtime that does not match the build — say so
+;; rather than let the site fail on its first call with a bare Chez error.
+(define (jolt-seed-root cell)
+  (let ((r (var-cell-root cell)))
+    (if (procedure? r)
+        r
+        (error 'jolt-seed-root
+               (string-append "direct-linked seed var " (var-cell-ns cell) "/" (var-cell-name cell)
+                              " is not bound to a procedure in this runtime")))))
 (define (var-deref ns name) (var-cell-root (jolt-var ns name)))
 ;; def-var! / declare-var! return the VAR CELL, not the value — Clojure's `def`
 ;; evaluates to #'ns/name (a first-class var), so (var? (def x 1)) is true and

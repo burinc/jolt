@@ -8,7 +8,7 @@
   portable jolt.host form-* contract, the same seam the analyzer uses, so the
   emitter never touches a concrete host representation directly."
   (:require [clojure.string :as str]
-            [jolt.host :refer [form-sym? form-sym-name form-sym-ns form-sym-meta
+            [jolt.host :refer [form-sym? form-sym-name form-sym-ns form-sym-meta seed-callable?
                                form-list? form-vec? form-map? form-set? form-char?
                                form-literal? form-elements form-vec-items
                                form-map-pairs form-set-items form-char-code
@@ -360,6 +360,15 @@
 ;; recursion auto-restores them (no manual save/restore, no throw-leak).
 (def ^:dynamic *recur-target* nil)
 (def ^:dynamic *known-procs* #{})
+;; munged local name -> the Scheme name holding its backing flvector, for the
+;; ^doubles PARAMS of the arities being emitted. emit-arity-clause binds one per
+;; such param at entry ((_av$N (jolt-array-vec-of a))), and a proven aget/aset
+;; on that local indexes it directly instead of re-reading the checked record
+;; accessor per access — bench/arrays 225 -> 145 ms in a Chez probe of the
+;; emitted loop. Every binding form that can SHADOW the param (let, loop, a
+;; nested arity's params, a catch binding) drops the name for its scope, so an
+;; inner `a` bound to some other array never reads the outer one's vector.
+(def ^:dynamic *array-vecs* {})
 ;; When set (in the :def emit path), fns are emitted with a qualified letrec
 ;; binding (ns/name) so Chez reports a unique per-var frame name — no collisions
 ;; across namespaces. Nested/anonymous fns ignore it (they never register).
@@ -927,6 +936,11 @@
 ;; stays invisible exactly as it does today.
 (defn- hoist-var-cell [ns nm]
   (str "(var-cell-deref " (hoist-const (str "(jolt-var " (chez-str-lit ns) " " (chez-str-lit nm) ")")) ")"))
+;; A direct-linked SEED var: the def binds the var's root procedure once, at
+;; load (jolt-seed-root checks it is one), and the site calls it like any Scheme
+;; procedure. Only where jolt.host/seed-callable? said so — see emit-invoke.
+(defn- hoist-seed-root [ns nm]
+  (hoist-const (str "(jolt-seed-root (jolt-var " (chez-str-lit ns) " " (chez-str-lit nm) "))")))
 
 (defn- emit-const [v]
   (cond
@@ -1170,14 +1184,30 @@
 ;; Scheme `letrec*` binds them so each sees its siblings. A plain let uses let*.
 (defn- emit-let [node]
   (let [kw (if (:letrec node) "letrec*" "let*")
+        bs (:bindings node)
+        names (map #(munge-name (nth % 0)) bs)
+        ;; a binding that reuses a hoisted ^doubles param's name shadows its
+        ;; flvector from there on (*array-vecs*). let* binds sequentially, so
+        ;; each init is emitted under the names bound BEFORE it; letrec* binds
+        ;; every name up front.
+        av-body (apply dissoc *array-vecs* names)
         ;; bindings are non-tail; the body inherits the let's tail position
         binds (binding [*tail?* false
                         *letrec-binders* (if (:letrec node)
                                            (into *letrec-binders*
-                                                 (map #(nth % 0) (:bindings node)))
+                                                 (map #(nth % 0) bs))
                                            *letrec-binders*)]
-                (str/join " " (mapv emit-binding (:bindings node))))]
-    (str "(" kw " (" binds ") " (emit (:body node)) ")")))
+                (cond
+                  (empty? *array-vecs*) (str/join " " (mapv emit-binding bs))
+                  (:letrec node) (binding [*array-vecs* av-body]
+                                   (str/join " " (mapv emit-binding bs)))
+                  :else (loop [bs bs av *array-vecs* acc []]
+                          (if (empty? bs)
+                            (str/join " " acc)
+                            (let [b (first bs)
+                                  s (binding [*array-vecs* av] (emit-binding b))]
+                              (recur (rest bs) (dissoc av (munge-name (nth b 0))) (conj acc s)))))))]
+    (str "(" kw " (" binds ") " (binding [*array-vecs* av-body] (emit (:body node))) ")")))
 
 (defn- emit-loop [node]
   (let [label (fresh-label "loop")
@@ -1185,11 +1215,24 @@
         names (map #(munge-name (nth % 0)) pairs)
         ;; inits evaluate in the OUTER scope (recur-target unchanged) and, like
         ;; Clojure loop/let, SEQUENTIALLY — wrap a let* around the named let.
-        inits (binding [*tail?* false] (mapv #(emit (nth % 1)) pairs))
+        ;; sequential, so a loop var reusing a hoisted ^doubles param's name
+        ;; shadows its flvector for the inits after it and for the body
+        ;; (*array-vecs*).
+        inits (binding [*tail?* false]
+                (if (empty? *array-vecs*)
+                  (mapv #(emit (nth % 1)) pairs)
+                  (loop [ps pairs av *array-vecs* acc []]
+                    (if (empty? ps)
+                      acc
+                      (let [p (first ps)
+                            s (binding [*array-vecs* av] (emit (nth p 1)))]
+                        (recur (rest ps) (dissoc av (munge-name (nth p 0))) (conj acc s)))))))
         seq-bs (str/join " " (map (fn [n i] (str "(" n " " i ")")) names inits))
         rebinds (str/join " " (map (fn [n] (str "(" n " " n ")")) names))
         ;; the loop body inherits the loop's tail position
-        body (binding [*recur-target* label] (emit (:body node)))]
+        body (binding [*recur-target* label
+                       *array-vecs* (apply dissoc *array-vecs* names)]
+               (emit (:body node)))]
     (str "(let* (" seq-bs ") (let " label " (" rebinds ") " body "))")))
 
 ;; jolt.ffi/__cfn -> a Chez foreign-procedure (jolt-ffi). The C symbol + types are
@@ -1748,10 +1791,24 @@
         restp (when-let [r (:rest a)] (munge-name r))
         label (fresh-label "fnrec")
         ret (:ret-nhint a)
+        ;; a ^doubles param's backing flvector, bound once per entry — inside the
+        ;; named let, so a fn-level recur that passes a DIFFERENT array rebinds
+        ;; it — and every proven aget/aset on that param indexes it directly
+        ;; (*array-vecs*). The params themselves shadow any outer hoist.
+        ah (into {} (:ahints a))
+        avecs (into {} (keep (fn [o] (when (= :doubles (get ah o))
+                                       [(munge-name o) (fresh-label "_av$")]))
+                             orig))
+        av (merge (apply dissoc *array-vecs* (concat params (when restp [restp]))) avecs)
         ;; the body is the fn's tail position — UNLESS a ^double/^long return hint
         ;; wraps it in a coercion below, which puts the body back in non-tail.
         body-tail? (not (or (= ret :double) (= ret :long)))
-        body (binding [*recur-target* label *tail?* body-tail?] (emit (:body a)))
+        body (binding [*recur-target* label *tail?* body-tail? *array-vecs* av]
+               (emit (:body a)))
+        body (if (seq avecs)
+               (str "(let (" (str/join " " (map (fn [[p v]] (str "(" v " (jolt-array-vec-of " p "))")) avecs))
+                    ") " body ")")
+               body)
         paramlist (cond
                     (and restp (empty? params)) restp
                     restp (str "(" (str/join " " params) " . " restp ")")
@@ -2138,6 +2195,12 @@
     (and (= kind :long) (= nm "dec")) (str "(jolt-l-dec " (first args) ")")
     (and (= kind :long) (= nm "unchecked-inc")) (str "(jolt-uncinc " (first args) ")")
     (and (= kind :long) (= nm "unchecked-dec")) (str "(jolt-uncdec " (first args) ")")
+    (and (= kind :long) (= nm "unchecked-negate")) (str "(jolt-uncneg " (first args) ")")
+    ;; on a proven flonum the unchecked forms are the plain flonum ops: they
+    ;; wrap only longs (jolt-uncinc on 1.5 is 2.5, exactly what fl+ says).
+    (and (= kind :double) (= nm "unchecked-inc")) (str "(" (unsafe-prefix) "fl+ " (first args) " 1.0)")
+    (and (= kind :double) (= nm "unchecked-dec")) (str "(" (unsafe-prefix) "fl- " (first args) " 1.0)")
+    (and (= kind :double) (= nm "unchecked-negate")) (str "(" (unsafe-prefix) "fl- " (first args) ")")
     :else
     (let [op (case kind :double (dbl-ops nm) :long (lng-ops nm) :bigdec (bd-ops nm))
           op (if (= kind :double) (str (unsafe-prefix) op) op)]
@@ -2174,9 +2237,13 @@
         (first args)
         ;; unchecked-subtract at one operand negates, matching both `-` and jolt's
         ;; own overlay ((apply unchecked-subtract [x]) => -x). jolt-uncsub2 has no
-        ;; unary form, so subtract from zero — which wraps identically.
+        ;; unary form, so subtract from zero — which wraps identically. On a
+        ;; proven flonum it is fl-'s own unary negation (a fixnum 0 is not a
+        ;; flonum, and negating keeps -0.0 where 0.0 - x would not).
         (and (= 1 (count args)) (= "unchecked-subtract" nm))
-        (order-args (fn [as] (str "(" op " 0 " (first as) ")")))
+        (order-args (fn [as] (if (= kind :double)
+                               (str "(" op " " (first as) ")")
+                               (str "(" op " 0 " (first as) ")"))))
         :else
         (order-args (fn [as] (str "(" op " " (str/join " " as) ")")))))))
 
@@ -2362,24 +2429,31 @@
       ;; at a jolt-flaget procedure boundary. An unproven index keeps (jolt-flaget A I),
       ;; which owns the fixnum?/na-idx coercion; the inline flvector-ref's own range
       ;; check is the bounds contract on the hot path (a pre-check regresses ~11%).
+      ;; A ^doubles PARAM (the local is in *array-vecs*) reads the flvector its
+      ;; arity bound at entry; any other proven array re-reads the accessor.
       (:fl-aget node)
-      (order-args
-       (fn [as]
-         (if (:fl-idx-long node)
-           (str "(flvector-ref (jolt-array-vec " (first as) ") " (second as) ")")
-           (str "(jolt-flaget " (str/join " " as) ")"))))
+      (let [an (first arg-nodes)
+            hv (when (= :local (:op an)) (get *array-vecs* (munge-name (:name an))))]
+        (order-args
+         (fn [as]
+           (if (:fl-idx-long node)
+             (str "(flvector-ref " (or hv (str "(jolt-array-vec " (first as) ")")) " " (second as) ")")
+             (str "(jolt-flaget " (str/join " " as) ")")))))
       ;; (aset ^doubles a i v): proven index AND :double value (:fl-idx-long +
       ;; :fl-val-double) store inline — (let ((v V)) (flvector-set! (jolt-array-vec A)
       ;; I v) v) — and return the stored value (JVM contract; the let evaluates V once).
       ;; Otherwise keep (jolt-flaset A I V), which owns exact->inexact for a non-double.
       (:fl-aset node)
-      (order-args
-       (fn [as]
-         (if (and (:fl-idx-long node) (:fl-val-double node))
-           (let [v (fresh-label "_v$")]
-             (str "(let ((" v " " (nth as 2) ")) (flvector-set! (jolt-array-vec "
-                  (first as) ") " (second as) " " v ") " v ")"))
-           (str "(jolt-flaset " (str/join " " as) ")"))))
+      (let [an (first arg-nodes)
+            hv (when (= :local (:op an)) (get *array-vecs* (munge-name (:name an))))]
+        (order-args
+         (fn [as]
+           (if (and (:fl-idx-long node) (:fl-val-double node))
+             (let [v (fresh-label "_v$")]
+               (str "(let ((" v " " (nth as 2) ")) (flvector-set! "
+                    (or hv (str "(jolt-array-vec " (first as) ")"))
+                    " " (second as) " " v ") " v ")"))
+             (str "(jolt-flaset " (str/join " " as) ")")))))
       (:fl-op node) (order-args (fn [as] (str "(" (:fl-op node) " " (str/join " " as) ")")))
       ;; hint-directed fast arithmetic: jolt.passes.numeric proved every operand a
       ;; flonum (^double) or fixnum (^long), so emit the Chez fl*/fx* op.
@@ -2494,6 +2568,20 @@
       (and (= :var (:op fnode)) (direct-linkable? (:ns fnode) (:name fnode))
            (direct-link-fn? (:ns fnode) (:name fnode)))
       (order-args (fn [as] (emit-call tail? (dl-name (:ns fnode) (:name fnode)) as tl ich)))
+      ;; closed-world direct call to a SEED var — clojure.core and the other
+      ;; namespaces the runtime image boots with. Such a var is preloaded ahead
+      ;; of every app def and never emitted by this build, so the def binds its
+      ;; root procedure once at load and the site applies it directly: no
+      ;; var-cell-deref (7 ns), no jolt-invokeN (5 ns) — true? went 16 -> 4 ns.
+      ;; jolt.host/seed-callable? applies the same closed-world rule an app def
+      ;; gets (not ^:dynamic/^:redef, not redefined by the app) plus "root is a
+      ;; procedure whose arity mask admits this arity", so a keyword/map/multi-
+      ;; method-valued var and a wrong-arity call keep jolt-invoke below. A later
+      ;; alter-var-root / with-redefs of such a var is invisible to this site,
+      ;; exactly as under the JVM's direct linking; `jolt run` never direct-links.
+      (and (= :var (:op fnode)) (direct-link?)
+           (seed-callable? nil (:ns fnode) (:name fnode) (count args)))
+      (order-args (fn [as] (emit-call tail? (hoist-seed-root (:ns fnode) (:name fnode)) as tl ich)))
        ;; record ctor with matching arity: inline the native per-arity ctor
        ;; (make-jrecN) directly — desc + ext + one inline slot per field —
        ;; eliminating jolt-invoke / var-deref / rest-list / ctor call / hashtable
@@ -2580,7 +2668,8 @@
                      cl (when (trace-frames?) (fresh-label "_cl$"))
                      body (str "(guard (" raw " (else (let ((" (munge-name cs) " (jolt-unwrap-throw " raw "))) "
                                (if cl (str "(let ((" cl " (jolt-catch-enter!))) ") "")
-                               "(let ((r " (emit (:catch-body node)) ")) "
+                               "(let ((r " (binding [*array-vecs* (dissoc *array-vecs* (munge-name cs) raw)]
+                                            (emit (:catch-body node))) ")) "
                                (if cl (str "(jolt-catch-leave! " cl ") ") "")
                                "(jolt-catch-complete!) r)"
                                (if cl ")" "")
@@ -2805,7 +2894,15 @@
      ;; The 2-arg :coerce (inlined ^double/^long param or return) has no :cast-fn
      ;; and keeps the hint coercion.
      :coerce (let [e (emit (:expr node))]
-               (cond (:cast-fn node) (str "(" (:cast-fn node) " " e ")")
+               (cond
+                 ;; (long x) and (unchecked-long x) both hand a fixnum back
+                 ;; unchanged, and a fixnum is what a loop counter or a char code
+                 ;; point is: test it here so the common case is a type check,
+                 ;; not a call. The helper still owns every other operand.
+                 (contains? #{"jolt-long-cast" "jolt-unchecked-long"} (:cast-fn node))
+                 (let [t (fresh-label "_lc$")]
+                   (str "(let ((" t " " e ")) (if (fixnum? " t ") " t " (" (:cast-fn node) " " t ")))"))
+                 (:cast-fn node) (str "(" (:cast-fn node) " " e ")")
                      (= :double (:kind node)) (emit-nhint-coerce :double e)
                      (= :long (:kind node)) (emit-nhint-coerce :long e)
                      :else e))
@@ -2842,12 +2939,40 @@
                                      (keyword-direct-emit m (count args) t args))
                                    (when (= :sb (:target-type node))
                                      (sb-direct-emit m (count args) t args))))]
-                  (if direct direct
-                      (if (supported-host-methods m)
-                        (str "(jolt-host-call " (chez-str-lit m) " " t
-                             (if (empty? args) "" (str " " (str/join " " args))) ")")
+                  (cond
+                    direct direct
+                    (supported-host-methods m)
+                    (str "(jolt-host-call " (chez-str-lit m) " " t
+                         (if (empty? args) "" (str " " (str/join " " args))) ")")
+                    ;; An UNPROVEN receiver whose method has a string or keyword
+                    ;; direct form: test the receiver's type at the site and take
+                    ;; that form, with the generic dispatch as the slow arm — the
+                    ;; same open-code-the-fast-case shape the bit ops use. Strings
+                    ;; and keywords are what library code calls .length/.charAt/
+                    ;; .getName on without a hint, and the generic walk cost
+                    ;; 60-135 ns per call against 3-11 for the direct form. The
+                    ;; receiver and args are bound once, in order, so nothing is
+                    ;; evaluated twice and the direct forms may splice `t` freely.
+                    ;; A receiver of any other type behaves exactly as before.
+                    chez?
+                    (let [tt (fresh-label "_ht$")
+                          as (mapv (fn [_] (fresh-label "_ha$")) args)
+                          sd (string-direct-emit m (count as) tt as)
+                          kd (keyword-direct-emit m (count as) tt as)
+                          generic (str "(record-method-dispatch " tt " " (chez-str-lit m)
+                                       " (jolt-vector" (if (empty? as) "" (str " " (str/join " " as))) "))")]
+                      (if (or sd kd)
+                        (str "(let* ((" tt " " t ")"
+                             (apply str (map (fn [a e] (str " (" a " " e ")")) as args))
+                             ") (cond"
+                             (when sd (str " ((string? " tt ") " sd ")"))
+                             (when kd (str " ((keyword-t? " tt ") " kd ")"))
+                             " (else " generic ")))")
                         (str "(record-method-dispatch " t " " (chez-str-lit m)
-                             " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))"))))
+                             " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))
+                    :else
+                    (str "(record-method-dispatch " t " " (chez-str-lit m)
+                         " (jolt-vector" (if (empty? args) "" (str " " (str/join " " args))) "))")))
     :let (emit-let node)
     :loop (emit-loop node)
     :recur (emit-recur node)

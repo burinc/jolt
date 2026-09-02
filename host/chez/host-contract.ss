@@ -776,6 +776,52 @@
 (define (hc-inline-ir ctx ns-name nm)
   (or (hashtable-ref inline-stash-table (string-append ns-name "/" nm) #f) jolt-nil))
 
+;; --- direct-link of a seed var --------------------------------------------------
+;; The back end asks this before emitting a call to a var it did not define in
+;; this build: may the site bind the var's ROOT procedure once, at load, and
+;; call it directly? The answer is the same closed-world rule an app def gets
+;; under direct-link, applied to the seed image:
+;;   - the var's namespace was already defined when the runtime image booted
+;;     (ldr-runtime-image-ns-copy — the set build.ss reads as bld-boot-loaded),
+;;     so it is preloaded ahead of every app def and NOT emitted by this build;
+;;   - its root is a procedure whose arity mask admits the call's arity, so the
+;;     direct call cannot land on a keyword/map/multimethod or a wrong arity
+;;     (those keep jolt-invoke, which owns the ArityException);
+;;   - it is not ^:dynamic or ^:redef (the closed-world opt-outs), and the app
+;;     has not redefined it (var-redefined?).
+;; What changes for such a site is what changes under the JVM's direct linking:
+;; a later alter-var-root / with-redefs of the var is not seen by the compiled
+;; call. `jolt run` never direct-links, so the REPL and with-redefs in tests
+;; keep the var-routed call.
+(define hc-seed-ns-tbl #f)
+;; loader.ss installs its boot-time copy here (ldr-runtime-image-ns-copy) — the
+;; same set build.ss reads as bld-boot-loaded. A boot without the loader (the
+;; pass gates) falls back to the namespaces present when hc-install! ran: the
+;; prelude is loaded by then and no app namespace exists yet.
+(define hc-seed-ns-source #f)
+(define hc-install-ns-tbl (make-hashtable string-hash string=?))
+(define (hc-seed-ns? ns)
+  (unless hc-seed-ns-tbl
+    (set! hc-seed-ns-tbl (if hc-seed-ns-source (hc-seed-ns-source) hc-install-ns-tbl)))
+  (hashtable-ref hc-seed-ns-tbl ns #f))
+(define hc-kw-dynamic (keyword #f "dynamic"))
+(define hc-kw-redef (keyword #f "redef"))
+(define (hc-seed-callable? ctx ns-name nm nargs)
+  (let ((cell (var-cell-lookup ns-name nm)))
+    (if (and cell
+             (hc-seed-ns? ns-name)
+             (var-cell-defined? cell)
+             (procedure? (var-cell-root cell))
+             (fixnum? nargs)
+             (fxlogbit? nargs (procedure-arity-mask (var-cell-root cell)))
+             (let ((m (var-cell-meta cell)))
+               (or (not m) (jolt-nil? m)
+                   (and (not (jolt-truthy? (jolt-get m hc-kw-dynamic jolt-nil)))
+                        (not (jolt-truthy? (jolt-get m hc-kw-redef jolt-nil))))))
+             (not (var-redefined? ns-name nm)))
+        #t
+        jolt-nil)))
+
 ;; --- declare the hot clojure.core primitives so resolve-global sees them ------
 ;; Mirrors backend_scheme.clj native-ops keys (op-registry entries with a :call)
 ;; minus the internal protocol-dispatch{1,2,3} emit helpers, which are not
@@ -791,7 +837,10 @@
     "zero?" "identity" "nil?" "some?" "identical?" "ex-info"
     "aget" "aset" "alength"
     "bit-and" "bit-or" "bit-xor" "bit-not"
-    "bit-shift-left" "bit-shift-right" "unsigned-bit-shift-right"))
+    "bit-shift-left" "bit-shift-right" "unsigned-bit-shift-right"
+    "unchecked-add" "unchecked-subtract" "unchecked-multiply"
+    "unchecked-inc" "unchecked-dec" "unchecked-negate"))
+
 
 ;; --- install: bind the contract into the jolt.host namespace -----------------
 (define (hc-install!)
@@ -864,6 +913,9 @@
   (def-var! "jolt.host" "inline-ir" hc-inline-ir)
   (def-var! "jolt.host" "stash-inline!" hc-stash-inline!)
   (def-var! "jolt.host" "var-redefined?" hc-var-redefined?)
+  (def-var! "jolt.host" "seed-callable?" hc-seed-callable?)
+  (vector-for-each (lambda (c) (hashtable-set! hc-install-ns-tbl (var-cell-ns c) #t))
+                   (var-table-cells))
   (def-var! "jolt.host" "mark-spliced!" hc-mark-spliced!))
 
 (hc-install!)

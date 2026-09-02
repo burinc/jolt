@@ -70,8 +70,9 @@
 ;; jolt.backend-scheme/dbl-ops resp. lng-ops, or emit-numeric splices a nil op.
 (defn- dbl-spec [nm n]
   (cond
-    (and (>= n 1) (contains? #{"+" "-" "*" "/" "min" "max"} nm)) :double
-    (and (= n 1) (contains? #{"inc" "dec"} nm)) :double
+    (and (>= n 1) (contains? #{"+" "-" "*" "/" "min" "max"
+                               "unchecked-add" "unchecked-subtract" "unchecked-multiply"} nm)) :double
+    (and (= n 1) (contains? #{"inc" "dec" "unchecked-inc" "unchecked-dec" "unchecked-negate"} nm)) :double
     (and (>= n 2) (contains? #{"<" ">" "<=" ">=" "=" "=="} nm)) :bool
     :else nil))
 
@@ -82,7 +83,7 @@
   (cond
     (and (>= n 1) (contains? #{"+" "-" "*" "min" "max"
                                "unchecked-add" "unchecked-subtract" "unchecked-multiply"} nm)) :long
-    (and (= n 1) (contains? #{"inc" "dec" "unchecked-inc" "unchecked-dec"} nm)) :long
+    (and (= n 1) (contains? #{"inc" "dec" "unchecked-inc" "unchecked-dec" "unchecked-negate"} nm)) :long
     (and (= n 2) (contains? #{"quot" "rem" "mod"} nm)) :long
     (and (>= n 2) (contains? #{"<" ">" "<=" ">=" "=" "=="} nm)) :bool
     :else nil))

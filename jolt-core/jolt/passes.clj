@@ -120,6 +120,9 @@
 ;; :refer'd — a qualified ref to a loaded ns is late-bound, so the mint compiles
 ;; this before those vars resolve.
 (def ^:private ir-validate? (jolt.host/getenv "JOLT_IR_VALIDATE"))
+;; JOLT_WP_TRACE=1 also reports each def whose inline fixpoint ran more than one
+;; round (see jolt.passes.types wp-trace?).
+(def ^:private wp-trace? (jolt.host/getenv "JOLT_WP_TRACE"))
 (defn- report-ir! [phase node]
   (run! (fn [p] (println (str "IR-VALIDATE [" phase "] " p)))
         (jolt.ir/tree-problems node)))
@@ -197,7 +200,9 @@
                   (let [n2 (const-fold (scalar-replace (flatten-lets (inline-node n ctx))))]
                     (if (and @(:dirty unit) (< i inline-fixpoint-cap))
                       (recur (inc i) n2)
-                      n2)))
+                      (do (when (and wp-trace? (pos? i))
+                            (println (str "[inline] " (:ns node) "/" (:name node) " rounds " (inc i))))
+                          n2))))
             ;; a top-level def whose params the whole-program fixpoint typed gets
             ;; reinferred with those seeds (record types flow in from its callers);
             ;; everything else takes the ordinary per-form inference.

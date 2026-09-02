@@ -5556,4 +5556,58 @@
   {:suite "collections / nth tail and trie" :label "out of range throws" :expected ":oob" :actual "(try (nth [1 2 3] 3) (catch IndexOutOfBoundsException _ :oob))" :portability :common}
   {:suite "collections / nth tail and trie" :label "nil index throws NPE" :expected ":npe" :actual "(try (nth [1 2 3] nil) (catch NullPointerException _ :npe))" :portability :common}
   {:suite "collections / nth tail and trie" :label "nth on nil is nil" :expected "nil" :actual "(nth nil 5)" :portability :common}
+  ;; the unchecked family lowers to direct helper calls and the unchecked casts
+  ;; type their result :long; the answers must not move with the lowering
+  {:suite "numbers / unchecked lowering" :label "hinted char scan sums code points" :expected "294" :actual "(let [s \"abc\" n (long (.length ^String s))] (loop [i (unchecked-long 0) acc 0] (if (>= i n) acc (recur (unchecked-inc i) (unchecked-add acc (unchecked-long (unchecked-int (.charAt ^String s (unchecked-int i)))))))))" :portability :common}
+  {:suite "numbers / unchecked lowering" :label "unchecked-add over doubles" :expected "4.0" :actual "(let [a 1.5 b 2.5] (unchecked-add a b))" :portability :common}
+  {:suite "numbers / unchecked lowering" :label "unchecked-multiply of a double and a long" :expected "5.0" :actual "(let [a 2.5 b 2] (unchecked-multiply a b))" :portability :common}
+  {:suite "numbers / unchecked lowering" :label "unchecked-negate of a double" :expected "-1.5" :actual "(unchecked-negate 1.5)" :portability :common}
+  {:suite "numbers / unchecked lowering" :label "unchecked-dec of a double" :expected "0.5" :actual "(unchecked-dec 1.5)" :portability :common}
+  {:suite "numbers / unchecked lowering" :label "unchecked-subtract of one operand negates" :expected "-3" :actual "(apply unchecked-subtract [3])" :portability :jolt}
+  {:suite "numbers / unchecked lowering" :label "unchecked-add in value position" :expected "6" :actual "(reduce unchecked-add 0 [1 2 3])" :portability :common}
+  {:suite "numbers / unchecked lowering" :label "unchecked-inc in value position" :expected "[2 3 4]" :actual "(mapv unchecked-inc [1 2 3])" :portability :common}
+  {:suite "numbers / unchecked lowering" :label "unchecked-long of a char in a let" :expected "97" :actual "(let [c \\a] (unchecked-long c))" :portability :common}
+  {:suite "numbers / unchecked lowering" :label "unchecked-add on a non-number throws" :expected ":cce" :actual "(try (unchecked-add \"a\" 1) (catch ClassCastException _ :cce))" :portability :common}
+  ;; an interop call on an UNPROVEN string or keyword receiver takes the direct
+  ;; form at the site; other receivers still reach the generic dispatch
+  {:suite "host-interop / unhinted receiver guard" :label ".length on a string from a map" :expected "4" :actual "(let [m {:s \"abcd\"}] (.length (:s m)))" :portability :common}
+  {:suite "host-interop / unhinted receiver guard" :label ".charAt on a string from a vector" :expected "\\c" :actual "(let [v [\"abc\"]] (.charAt (first v) 2))" :portability :common}
+  {:suite "host-interop / unhinted receiver guard" :label ".indexOf with a from-index on an unhinted string" :expected "5" :actual "(let [s (str \"ab\" \"cabc\")] (.indexOf s \"c\" 3))" :portability :common}
+  {:suite "host-interop / unhinted receiver guard" :label ".substring on an unhinted string" :expected "\"bc\"" :actual "(let [s (str \"a\" \"bcd\")] (.substring s 1 3))" :portability :common}
+  {:suite "host-interop / unhinted receiver guard" :label ".startsWith / .endsWith on an unhinted string" :expected "[true false]" :actual "(let [s (str \"ab\" \"cd\")] [(.startsWith s \"ab\") (.endsWith s \"ab\")])" :portability :common}
+  {:suite "host-interop / unhinted receiver guard" :label ".toUpperCase on an unhinted string" :expected "\"ABC\"" :actual "(let [s (str \"a\" \"bc\")] (.toUpperCase s))" :portability :common}
+  {:suite "host-interop / unhinted receiver guard" :label ".getName / .getNamespace on an unhinted keyword" :expected "[\"b\" \"a\"]" :actual "(let [k (first [:a/b])] [(.getName k) (.getNamespace k)])" :portability :common}
+  {:suite "host-interop / unhinted receiver guard" :label ".getNamespace of an unqualified keyword is nil" :expected "nil" :actual "(let [k (first [:b])] (.getNamespace k))" :portability :common}
+  {:suite "host-interop / unhinted receiver guard" :label ".length on an unhinted StringBuilder still dispatches" :expected "2" :actual "(let [b (first [(doto (StringBuilder.) (.append \"ab\"))])] (.length b))" :portability :common}
+  {:suite "host-interop / unhinted receiver guard" :label ".toString on an unhinted keyword" :expected "\":a/b\"" :actual "(let [k (first [:a/b])] (.toString k))" :portability :common}
+  {:suite "host-interop / unhinted receiver guard" :label ".length on a deftype with its own length" :expected "42" :actual "(do (deftype Sized [] Object (length [_] 42)) (let [x (first [(Sized.)])] (.length x)))" :portability :jolt}
+  {:suite "host-interop / unhinted receiver guard" :label "receiver then args, each once" :expected "[2 [\"hello\" \"l\"]]" :actual "(let [calls (atom []) note (fn [v] (swap! calls conj v) v)] [(.indexOf (note \"hello\") (note \"l\")) @calls])" :portability :common}
+  ;; case on interned constants compares by identity
+  {:suite "equality / case by identity" :label "keyword clause hit" :expected "2" :actual "(case (first [:b]) :a 1 :b 2 3)" :portability :common}
+  {:suite "equality / case by identity" :label "nil clause hit" :expected ":nil" :actual "(case (first [nil]) nil :nil :a :a :other)" :portability :common}
+  {:suite "equality / case by identity" :label "boolean clauses" :expected "[:t :f]" :actual "[(case (first [true]) true :t false :f :o) (case (first [false]) true :t false :f :o)]" :portability :common}
+  {:suite "equality / case by identity" :label "grouped keyword clause" :expected ":ab" :actual "(case (first [:b]) (:a :b) :ab :c :c :other)" :portability :common}
+  {:suite "equality / case by identity" :label "a keyword-valued case fed a string of the same name" :expected ":other" :actual "(case (first [\"a\"]) :a :kw :other)" :portability :common}
+  {:suite "equality / case by identity" :label "symbol clause still compares by value" :expected ":sym" :actual "(case (symbol (str \"q\")) q :sym :other)" :portability :common}
+  {:suite "equality / case by identity" :label "string clause still compares by value" :expected ":str" :actual "(case (str \"s\") \"s\" :str :other)" :portability :common}
+  {:suite "equality / case by identity" :label "no match without a default throws" :expected ":iae" :actual "(try (case (first [:z]) :a 1) (catch IllegalArgumentException _ :iae))" :portability :common}
+  ;; first answers a vector and a cell from the backing store; every other shape
+  ;; still seqs, and a sorted collection's first is the tree's leftmost node
+  {:suite "collections / first without a seq cell" :label "vector" :expected "1" :actual "(first [1 2 3])" :portability :common}
+  {:suite "collections / first without a seq cell" :label "empty vector" :expected "nil" :actual "(first [])" :portability :common}
+  {:suite "collections / first without a seq cell" :label "large vector" :expected "0" :actual "(first (vec (range 100)))" :portability :common}
+  {:suite "collections / first without a seq cell" :label "subvec" :expected "2" :actual "(first (subvec [1 2 3] 1))" :portability :common}
+  {:suite "collections / first without a seq cell" :label "list" :expected "3" :actual "(first (list 3 4))" :portability :common}
+  {:suite "collections / first without a seq cell" :label "empty list" :expected "nil" :actual "(first ())" :portability :common}
+  {:suite "collections / first without a seq cell" :label "lazy seq" :expected "0" :actual "(first (map identity (range 5)))" :portability :common}
+  {:suite "collections / first without a seq cell" :label "rest of a vector" :expected "2" :actual "(first (rest [1 2 3]))" :portability :common}
+  {:suite "collections / first without a seq cell" :label "string" :expected "\\a" :actual "(first \"ab\")" :portability :common}
+  {:suite "collections / first without a seq cell" :label "map entry" :expected "[:a 1]" :actual "(first {:a 1})" :portability :common}
+  {:suite "collections / first without a seq cell" :label "set" :expected "7" :actual "(first #{7})" :portability :common}
+  {:suite "collections / first without a seq cell" :label "sorted map leftmost" :expected "[1 :a]" :actual "(first (sorted-map 3 :c 1 :a 2 :b))" :portability :common}
+  {:suite "collections / first without a seq cell" :label "sorted set leftmost" :expected "2" :actual "(first (sorted-set 5 2 9))" :portability :common}
+  {:suite "collections / first without a seq cell" :label "empty sorted map" :expected "nil" :actual "(first (sorted-map))" :portability :common}
+  {:suite "collections / first without a seq cell" :label "nil" :expected "nil" :actual "(first nil)" :portability :common}
+  {:suite "collections / first without a seq cell" :label "a directory stream seqs to paths" :expected "true" :actual "(instance? java.nio.file.Path (first (java.nio.file.Files/newDirectoryStream (java.nio.file.Paths/get \".\" (into-array String [])))))" :portability :common}
+  {:suite "collections / first without a seq cell" :label "a path seqs to its components" :expected "[\"a\" \"b\"]" :actual "(mapv str (seq (java.nio.file.Paths/get \"a/b\" (into-array String []))))" :portability :common}
 ]
