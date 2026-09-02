@@ -72,47 +72,55 @@ default build ships). Times are the mean of 3 runs after warmup, in ms. Every
 row below is from ONE `MODE_A=1 bench/run.sh` on one machine in one sitting,
 which is the only way the ratios mean anything.
 
-Refreshed 2026-08-24 on an x86_64 Linux host (Intel i5-4278U, 4 threads,
-OpenJDK 21.0.11, Chez 10.4.1) — a weaker, older machine than the Apple Silicon
-host the previous table was measured on. This is a full same-sitting re-run,
-not a patch of individual rows, so it supersedes the old table wholesale
-rather than being diffed against it: absolute ms are not comparable across the
-two machines, and several ratios shift with them (`collections` and
-`arrays` most visibly) because JVM warmup/JIT and GC behavior do not scale
-identically with the reference figures. Treat this table as internally
-consistent with itself and with the release-mode column beside it, the same
-caveat the test.check table below already carries across its own refreshes.
+Refreshed 2026-09-02 on an Apple Silicon host (MacBook Pro, M1 Pro, macOS 26.3,
+OpenJDK 20.0.1, Chez 10.4.1), after the 2026-09 audit rounds landed. This is a
+full same-sitting re-run of every row with one binary, not a patch of
+individual rows, so it supersedes the previous (x86_64 Linux) table wholesale:
+absolute ms are not comparable across the two machines, and several ratios
+shift with them (`collections` most visibly — see the machine note kept below
+from the previous refresh — and `nth-access`, where the JVM figure moves more
+run to run than jolt's). The rows the audit targeted, measured on THIS machine
+before and after in the same session: `char-scan` 24.2× → 6.7×, `literals`
+7.5× → 2.1×, `string-ops` 6.9× → 3.7×, `arrays` 6.4× → 3.9×, `keyed-lookup`
+5.7× → 3.5×, `string-build` 5.3× → 4.5×, `hash-eq` 3.0× → 2.6×; `seqs`,
+`transducers`, `transients` and `sorted-access` each lost 10–15% of their
+absolute time, and no row got slower.
+
+The previous refresh (2026-08-24, x86_64 Linux, Intel i5-4278U, OpenJDK
+21.0.11) was a weaker, older machine than this one; its `collections` row read
+0.8× where this one reads 2.0×, a JVM warmup/JIT effect of that host rather
+than a jolt-side change.
 
 | Benchmark | vs JVM | vs JVM (release) | jolt (ms) | JVM (ms) | Axis |
 |---|---:|---:|---:|---:|---|
-| `tak` | **0.2×** | 0.2× | 9.0 | 58.8 | deep three-way self-recursion + integer arith (beats the JVM) |
-| `vecops` | **0.3×** | 0.3× | 10.7 | 37.9 | vector concat + slice (beats the JVM) |
-| `collections` | **0.8×** | 0.8× | 36.2 | 45.3 | persistent map/vector churn (beats the JVM) |
-| `dispatch` | **1.2×** | 1.2× | 105.8 | 91.9 | megamorphic protocol dispatch |
-| `fib` | **1.2×** | 1.0× | 18.2 | 14.8 | recursion: call + integer arith |
-| `loop-recur` | **1.6×** | 1.6× | 73.5 | 47.1 | tight loop/recur + per-iteration integer arith |
-| `mathfns` | **1.7×** | 1.7× | 118.5 | 71.1 | transcendental math (`Math` sqrt/sin/cos/log/pow/atan2) |
-| `binary-trees` | **1.8×** | 1.7× | 158.0 | 87.6 | escaping short-lived records (allocation/GC) |
-| `mandelbrot` | **1.9×** | 1.8× | 38.3 | 19.7 | pure float compute |
-| `mono-dispatch` | **2.4×** | 2.4× | 68.0 | 28.4 | monomorphic protocol dispatch |
-| `nth-access` | **2.4×** | 2.5× | 110.8 | 45.3 | `nth` on a vector, small and large |
-| `seqs` | **2.5×** | 2.5× | 817.2 | 324.4 | lazy-seq + HOF pipelines |
-| `transducers` | **2.7×** | 2.8× | 261.9 | 98.2 | transducer pipelines |
-| `transients` | **3.0×** | 3.1× | 468.0 | 156.0 | transient map/set bulk build |
-| `hash-eq` | **3.7×** | 3.7× | 1386.0 | 379.0 | composite-value hashing + collection `=` |
-| `keyed-lookup` | **5.0×** | 5.1× | 318.0 | 63.0 | scalar-key hashing + small-map lookup |
-| `string-build` | **5.8×** | 6.0× | 429.0 | 74.0 | `StringBuilder` assembly + `join` |
-| `string-ops` | **7.2×** | 7.6× | 1097.0 | 153.0 | String/Keyword interop + `clojure.string` |
-| `sorted-access` | **7.7×** | 7.9× | 207.3 | 27.0 | shape-answered collection reads |
-| `arrays` | **9.2×** | 9.2× | 416.6 | 45.4 | primitive `double-array` throughput |
-| `literals` | **10.5×** | 10.9× | 429.0 | 41.0 | constant literals + boolean predicates, per call |
-| `char-scan` | **24.9×** | 24.9× | 647.0 | 26.0 | per-character `.charAt` + numeric casts |
+| `vecops` | **0.3×** | 0.3× | 4.5 | 15.5 | vector concat + slice (beats the JVM) |
+| `tak` | **0.4×** | 0.4× | 7.1 | 18.4 | deep three-way self-recursion + integer arith (beats the JVM) |
+| `dispatch` | **1.2×** | 1.2× | 62.2 | 52.3 | megamorphic protocol dispatch |
+| `fib` | **1.3×** | 1.3× | 9.3 | 6.9 | recursion: call + integer arith |
+| `loop-recur` | **1.5×** | 1.5× | 27.9 | 18.6 | tight loop/recur + per-iteration integer arith |
+| `mathfns` | **1.5×** | 1.5× | 24.0 | 16.5 | transcendental math (`Math` sqrt/sin/cos/log/pow/atan2) |
+| `mandelbrot` | **1.6×** | 1.5× | 22.6 | 14.5 | pure float compute |
+| `binary-trees` | **2.0×** | 1.9× | 73.2 | 37.1 | escaping short-lived records (allocation/GC) |
+| `collections` | **2.0×** | 1.9× | 22.4 | 11.0 | persistent map/vector churn |
+| `literals` | **2.1×** | 2.1× | 53 | 25 | constant literals + boolean predicates, per call |
+| `sorted-access` | **2.4×** | 2.4× | 31.3 | 13.0 | shape-answered collection reads |
+| `hash-eq` | **2.6×** | 2.6× | 467 | 177 | composite-value hashing + collection `=` |
+| `seqs` | **2.6×** | 2.6× | 357.7 | 138.7 | lazy-seq + HOF pipelines |
+| `mono-dispatch` | **2.7×** | 2.5× | 36.1 | 13.6 | monomorphic protocol dispatch |
+| `nth-access` | **2.9×** | 2.9× | 62.9 | 21.5 | `nth` on a vector, small and large |
+| `executors` | **3.4×** | 3.4× | 1427.9 | 417.5 | `java.util.concurrent` dispatch: enqueue, submit/get, growth, contention |
+| `keyed-lookup` | **3.5×** | 3.6× | 95 | 27 | scalar-key hashing + small-map lookup |
+| `transients` | **3.5×** | 3.5× | 201 | 58 | transient map/set bulk build |
+| `string-ops` | **3.7×** | 3.7× | 250 | 68 | String/Keyword interop + `clojure.string` |
+| `arrays` | **3.9×** | 3.9× | 141.1 | 35.9 | primitive `double-array` throughput |
+| `transducers` | **4.2×** | 4.3× | 128.2 | 30.4 | transducer pipelines |
+| `string-build` | **4.5×** | 4.6× | 170 | 38 | `StringBuilder` assembly + `join` |
+| `char-scan` | **6.7×** | 6.6× | 94 | 14 | per-character `.charAt` + numeric casts |
 
 `opt` and `release` track each other closely across the whole suite — the plain
 `jolt build` picks up essentially all of the win. Every row is within 0.2 of a
-ratio point except `literals` (10.5× vs 10.9×) and `string-ops` (7.2× vs 7.6×),
-both of which read level on repeat runs — small absolute differences (429 vs
-447ms, 1097 vs 1169ms) rather than a real mode gap.
+ratio point; the widest gaps are `mono-dispatch` (2.7× vs 2.5×) and `hash-eq`
+(467 vs 457 ms), both of which read level on repeat runs.
 
 ### A stale scorecard hid a 1.7× regression for three weeks (now fixed)
 
@@ -227,19 +235,22 @@ most expensive interop shape jolt had. Both are sensitive to the fixes that
 followed: against the binary from before them, `keyed-lookup` ran 444ms (1.9×
 slower) and `string-build` 1322ms (6.4× slower).
 
-`char-scan` came out of the same profiling and is the worst ratio in the suite. It
-exists because the cost was in the *casts*, not the loop or the string: `int`,
-`long` and the `unchecked-*` forms all fell through a generic `cond` to a
-`truncate` call and generic bitwise masking, and `long` additionally compared
-against ±2^63, which are BIGNUMS on Chez's 61-bit fixnum tower, so every
-`(long x)` on an ordinary integer paid two fixnum-vs-bignum compares. One
-`(unchecked-int i)` was 44.7ns against the JVM's 2.7ns, which works out to ~100ns
-of pure coercion per character in a hinted `.charAt` loop. Giving each cast a
-fixnum fast path took this benchmark 466ms → 343ms; `alphanumeric?` on a 5-char
-entity went 597ns → 457ns and a plain code-point sum over 5 characters 330ns →
-203ns. What is left is not the casts — it is ~58ns per character for the `.charAt`
-plus loop plus `case` dispatch, against ~2ns on the JVM, and closing that needs
-the casts and `.charAt` to inline at the call site rather than be called.
+`char-scan` came out of the same profiling and is still the worst ratio in the
+suite, at 6.7× down from 24.9×. It exists because the cost was in the *casts*,
+not the loop or the string: `int`, `long` and the `unchecked-*` forms all fell
+through a generic `cond` to a `truncate` call and generic bitwise masking, and
+`long` additionally compared against ±2^63, which are BIGNUMS on Chez's 61-bit
+fixnum tower, so every `(long x)` on an ordinary integer paid two fixnum-vs-
+bignum compares. Giving each cast a fixnum fast path took it 466 → 343 ms on the
+x86 host; what the 2026-09 audit then found was that the `unchecked-*` family
+was never lowered at all — `unchecked-int`, `unchecked-long` and `unchecked-inc`
+were var calls, so a loop written in exactly the hinted idiom this benchmark
+copies from honeysql paid five generic invokes per character and kept its
+counters untyped. They are native ops and `:long`-typed casts now, and the
+proven-string `.charAt` index skips `jolt->idx`'s generic path: 363 → 94 ms on
+this machine. What is left is the `case` chain (`identical?` per clause where
+the JVM hash-jumps) and the per-character call sequence against a JIT that
+inlines all of it.
 
 ### The hash, equality and per-call-overhead axes
 
@@ -248,7 +259,7 @@ instaparse. None of the older benchmarks could see any of them: the work they
 measure is per-CALL and per-KEY, and every other benchmark amortises it across a
 data structure or a loop trip count.
 
-- **`hash-eq` 3.7×** is the composite-value half of the hash engine, where
+- **`hash-eq` 2.6×** is the composite-value half of the hash engine, where
   `keyed-lookup` is the scalar half. Vectors, maps and sets fell through to a
   linear walk of the equality and hash arm REGISTRIES before reaching their base
   cases, so loading an unrelated library made `(hash {:a 1 :b 2})` 8.4× slower;
@@ -264,7 +275,7 @@ data structure or a loop trip count.
   instaparse's `[listener index]` cache went quadratic — procedures get an
   identity hasheq from a weak side table now, which took test.chuck's grammar
   require 3.57s → 1.66s.
-- **`literals` 10.5×** is the worst new ratio and the purest one: it does no work
+- **`literals` 2.1×** (was 10.5× on the x86 host, 7.5× here before the audit rounds) is the purest row in the suite: it does no work
   at all beyond constructing the literals in a function body and calling three
   predicates. A literal collection is a compile-time constant the reference
   emits into the class constant pool; rebuilding one per call made `pset-conj`
@@ -275,7 +286,7 @@ data structure or a loop trip count.
   and `false?` were `(= true x)`, and a mixed-type `=` misses every fast clause
   and walks the equality arm registry, so `boolean?` on a keyword cost 801ns
   against 194 now.
-- **`transients` 3.0×** is the bulk-build write path. A transient map or set was
+- **`transients` 3.5×** is the bulk-build write path. A transient map or set was
   a Chez hashtable, so `persistent!` folded every entry back through the
   ordinary insert and rebuilt the trie from scratch — the transient did not
   avoid the path-copying build, it deferred it and added a hashtable on top.
@@ -283,7 +294,7 @@ data structure or a loop trip count.
   VECTOR build in the same benchmark is the control: it was always a tail-array
   append, so if the map/set rows move and it does not, the change is in the trie
   edit path.
-- **`string-ops` 7.2×** is the ordinary String surface, which `string-build`
+- **`string-ops` 3.7×** (was 7.2×) is the ordinary String surface, which `string-build`
   (StringBuilder) and `char-scan` (`.charAt` plus casts) both miss. An interop
   call on an unproven target finds its method table by hashing the target's tag
   string, finds the handler by hashing the method name, and passes arguments as
@@ -359,7 +370,7 @@ the scorecard below is the same-sitting re-run after the rounds landed.
 
 ### The allocation-bound axes
 
-- **`arrays` ~6.4×** (was ~18.6×): two rounds took it there. The fixnum-first
+- **`arrays` 3.9×** (was ~18.6×, then ~6.4×): three rounds took it there. The fixnum-first
   index path in `jolt-flaget`/`jolt-flaset` removed the per-access index
   coercion (~18.6×→~9.5×), then emit-side inlining removed the procedure
   boundary itself — on a site where the pass has proven a `^doubles` array and
@@ -388,12 +399,12 @@ the scorecard below is the same-sitting re-run after the rounds landed.
   collection via variadic `jolt-concat`: ~3 lazy nodes and ~5 closures per
   boundary, which swamps the per-element work when inner colls are small
   (302ms → 122ms). Both now emit exactly one cell per element.
-- **`transducers` ~3.9×** (was ~7.0×): `eduction` was a plain lazy seq, so
+- **`transducers` ~4.2×** (was ~7.0×): `eduction` was a plain lazy seq, so
   reducing one allocated a cell per element instead of driving the transducer
   into the accumulator. It is now a real `Eduction` implementing `IReduceInit`,
   as on the JVM — 152ms→61ms, in line with `transduce`. The remainder is the
   per-element reducing-fn call chain, not the pipeline shape.
-- **`binary-trees` ~1.8×** (was ~7.2×): two rounds. Each node walk read a field
+- **`binary-trees` ~2.0×** (was ~7.2×): two rounds. Each node walk read a field
   through a keyword RE-INTERNED at every use site; keyword literals are now
   hoisted to a per-def constant (277ms→171ms). Then the read itself stopped
   being a generic `jolt-get`: typing the walker's parameter needs a record
@@ -407,7 +418,7 @@ the scorecard below is the same-sitting re-run after the rounds landed.
   `(:left node)` now emits `jrec-field-at` at a static slot (165ms→67ms). What
   is left is allocation and GC — the nodes escape into the tree, so
   scalar-replace can't remove them.
-- **`mono-dispatch` ~2.5×**:
+- **`mono-dispatch` ~2.7×**:
   collapsed from two orders of magnitude by the type-proving / inline-field /
   bare-read work (`binary-trees` ~140×→~1.8×, `mono-dispatch` ~330×→~2.5×). On a
   statically proven monomorphic receiver, devirt resolves the impl and a
@@ -419,14 +430,14 @@ the scorecard below is the same-sitting re-run after the rounds landed.
 - **`dispatch` ~1.2×**: a megamorphic site runs a per-site polymorphic inline
   cache (4-slot descriptor scan, `#3%` reads over the proven cache shape), so
   it no longer pays a registry lookup per call.
-- **`nth-access` ~2.4×**: `jolt-nth` is `set!`-wrapped several times and the
+- **`nth-access` ~2.9×** (jolt 63 ms on this machine before and after the audit; the ratio moves with the JVM column): `jolt-nth` is `set!`-wrapped several times and the
   array shim was outermost, so a plain vector read walked a chain of
   extension-type probes before reaching the arm that answers it. `RT.nth` tests
   `Indexed` first; so does this now (small vector 34.3 → 16.0ns). The residual
   is a constant factor, which is why it lives here and not in
   `test/complexity_test.clj` — two CI runners measured 2.79× and 5.14× for the
   same commit, and the regression worth watching for lands inside that spread.
-- **`collections` ~0.8×** (beats the JVM on this run): JVM-exact Murmur3
+- **`collections` ~2.0×** (0.8× on the x86 host): JVM-exact Murmur3
   hashing plus the array-map `(k . v)` fold. It read ~1.8× on the previous
   (Apple Silicon) host; the sign flip on this machine is a JVM warmup/JIT
   effect, not a jolt-side change — see the machine note above the scorecard.
