@@ -217,6 +217,64 @@ out_ss="$(run_app app.sitestale)"
 expect_match "sitestale: the thrower is named at its line" "$out_ss" 'app\.sitestale/h (.*src/app/sitestale\.clj:5)'
 expect_no_match "sitestale: the returned fn's site is rejected" "$out_ss" 'app\.sitestale/g'
 
+# A top-level form is a root. The site vreg holds the LAST tail site executed,
+# and only tail sites write it — so when a loaded file throws at its top level,
+# which nothing tail-called, the raise-time stash is whatever the previous call
+# left behind: helper's `str` tail here, long returned. The validator cannot
+# reject it either, because the innermost live frame is the loader itself, a
+# host fn that registers no callees. Each form-at-a-time entry — the loader,
+# -e, load-string, the REPL — clears the slot when a form starts (jolt-site-reset!).
+cat > "$work/src/app/topres.clj" <<'EOF'
+(ns app.topres)
+(defn helper [] (str "a" "b"))
+(defn -main [& _]
+  (helper)
+  (require 'app.topboom)
+  (println "unreachable"))
+EOF
+cat > "$work/src/app/topboom.clj" <<'EOF'
+(ns app.topboom)
+(throw (ex-info "top" {}))
+EOF
+echo "trace smoke: a returned tail site cannot haunt a throw at a loaded file's top level"
+out_tr="$(run_app app.topres)"
+expect_match "topres: the location is the throwing form" "$out_tr" 'at .*src/app/topboom\.clj:2:1'
+expect_match "topres: the loading caller is named at its require line" "$out_tr" 'app\.topres/-main (.*src/app/topres\.clj:5)'
+expect_no_match "topres: the returned helper is not resurrected" "$out_tr" 'app\.topres/helper'
+# The form's COMPILE is a root too: macroexpansion runs user code, and mk's
+# `apply` tail is what the slot held when the expanded throw ran — cleared again
+# between the expansion and the run.
+cat > "$work/src/app/macboom.clj" <<'EOF'
+(ns app.macboom)
+(defn mk [] (apply list ['throw (list 'ex-info "mac" {})]))
+(defmacro m [] (mk))
+(m)
+EOF
+cat > "$work/src/app/macmain.clj" <<'EOF'
+(ns app.macmain)
+(defn -main [& _]
+  (require 'app.macboom)
+  (println "unreachable"))
+EOF
+echo "trace smoke: macroexpansion's tail sites cannot haunt the expanded form's run"
+out_mr="$(run_app app.macmain)"
+expect_match "macres: the loading caller is named" "$out_mr" 'app\.macmain/-main (.*src/app/macmain\.clj:3)'
+expect_no_match "macres: the expander's helper is not resurrected" "$out_mr" 'app\.macboom/mk'
+# The same rule at the other form-at-a-time entries.
+run_e() { ( cd "$work" && "$joltabs" -e "$1" 2>&1 ); }
+out_e="$(run_e '(defn h [] (str 1)) (h) (throw (ex-info "x" {}))')"
+expect_match "-e: the throw is reported" "$out_e" 'Unhandled exception: x'
+expect_no_match "-e: a returned fn is not resurrected" "$out_e" '^ *[a-z.]*/h$'
+out_ls="$(run_e '(load-string "(defn h2 [] (str 1)) (h2) (throw (ex-info \"y\" {}))")')"
+expect_match "load-string: the throw is reported" "$out_ls" 'Unhandled exception: y'
+expect_no_match "load-string: a returned fn is not resurrected" "$out_ls" '^ *[a-z.]*/h2$'
+out_repl="$( ( cd "$work" && printf '(defn h3 [] (str 1))\n(h3)\n(throw (ex-info "z" {}))\n' | "$joltabs" repl 2>&1 ) )"
+expect_match "repl: the throw is reported" "$out_repl" 'error: z'
+expect_no_match "repl: a returned fn is not resurrected" "$out_repl" '^ *[a-z.]*/h3$'
+# and the positive dual: a throw INSIDE an evaluated fn still names it
+out_repl2="$( ( cd "$work" && printf '(defn t [] (throw (ex-info "q" {})))\n(t)\n' | "$joltabs" repl 2>&1 ) )"
+expect_match "repl: a throw inside an evaluated fn names it" "$out_repl2" '^ *[a-z.]*/t$'
+
 # R2: a HOST fault (no jolt-throw anywhere — a bad primitive-array index) is
 # captured by the cli's with-exception-handler while the frames are live, so
 # the trace still names the fn and its exact line.

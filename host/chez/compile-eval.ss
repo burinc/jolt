@@ -119,6 +119,7 @@
   (register-class-statics! "clojure.lang.Compiler" members))
 
 (define (jolt-enter-form! form)
+  (jolt-site-reset!)   ; a top-level form is a root (rt.ss)
   (let ((p (hc-form-position form)))
     (when (pmap? p)
       (jolt-current-source p)
@@ -630,6 +631,9 @@
      (let* ((scm (jolt-analyze-emit-form form ns))
             (cap (jolt-aot-capture)))            ; tee for the AOT cache (loader.ss)
        (when cap (put-string cap scm) (newline cap))
+       ;; the run is a root as much as the compile was: expanding the form ran
+       ;; macros, whose tail sites would otherwise be what a throw here reports.
+       (jolt-site-reset!)
        (if (jolt-ce-trace-frames?)
            (jolt-eval-with-source scm)
            (eval (read (open-input-string scm)) (interaction-environment)))))))

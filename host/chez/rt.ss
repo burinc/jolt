@@ -442,6 +442,13 @@
 ;; Consumers therefore read the THROW-TIME snapshot (jolt-throw-sitep), and the
 ;; reporter validates it against the callsite table before splicing.
 (define (jolt-site! p) (set-virtual-register! jolt-vreg-site p))
+;; A top-level form is a root: nothing tail-called it, so whatever the slot holds
+;; when one starts is a returned call's residue — the reporter's validator cannot
+;; tell it from a live pair when the innermost live frame is a host fn (the
+;; loader, the eval loop), which registers no callees. compile-eval.ss clears the
+;; slot when a form starts to compile and again when its compiled code starts to
+;; run, since macroexpansion runs user code in between.
+(define (jolt-site-reset!) (set-virtual-register! jolt-vreg-site 0))
 ;; The line to report for the INNERMOST frame. Inside a catch clause that is the
 ;; line the throw came from, snapshotted on the way in; else the pair stashed at
 ;; the raise. Never the live vreg — it can be stale between throws.
