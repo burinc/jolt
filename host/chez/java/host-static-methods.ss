@@ -296,8 +296,8 @@
 (register-class-statics! "clojure.lang.PersistentHashSet" (list (cons "createWithCheck" phs-create-with-check)))
 
 ;; java.lang.Character statics. digit(ch, radix) -> the digit value or -1; ch may
-;; be a char or an int codepoint (tools.reader passes (int c)). isDigit/
-;; isWhitespace take a char; valueOf boxes a char (identity on jolt).
+;; be a char or an int codepoint (tools.reader passes (int c)), as it may for
+;; every predicate below; valueOf boxes a char (identity on jolt).
 (define (char->cp x) (if (char? x) (char->integer x) (jnum->exact x)))
 (define (char-digit-value cp radix)
   (let ((d (cond ((and (fx>=? cp 48) (fx<=? cp 57)) (fx- cp 48))            ; 0-9
@@ -305,8 +305,9 @@
                  ((and (fx>=? cp 65) (fx<=? cp 90)) (fx+ 10 (fx- cp 65)))   ; A-Z
                  (else 99))))
     (if (fx<? d radix) d -1)))
-;; Character's isDigit/isWhitespace/isUpperCase/isLowerCase/TYPE are registered
-;; in one block further below; these are the codepoint conversion statics.
+;; Character's getType/isDigit/isWhitespace/isUpperCase/isLowerCase/TYPE and the
+;; category constants are registered in one block further below; these are the
+;; codepoint conversion statics.
 (register-class-statics! "java.lang.Character"
   (list (cons "digit" (lambda (ch radix) (->num (char-digit-value (char->cp ch) (jnum->exact radix)))))
         (cons "toChars" (lambda (cp) (na-char-array (jolt-vector (integer->char (char->cp cp))))))
@@ -537,22 +538,68 @@
         (cons "POSITIVE_INFINITY" +inf.0) (cons "NEGATIVE_INFINITY" -inf.0)
         (cons "NaN" +nan.0)))
 
-;; Character: ASCII predicates (the engine is byte/ASCII oriented).
+;; Character: the JVM's classification is the Unicode general category, and Chez's
+;; char-general-category IS that property (the same table the JVM reads), so
+;; getType is a rename of its symbol to the JVM's constant, and the predicates are
+;; the JVM's own category rules: isLetter is L*, isDigit is Nd (a vulgar fraction
+;; is numeric but not a digit), isUpperCase/isLowerCase are the Uppercase/Lowercase
+;; properties (Lu/Ll plus Other_Uppercase/Other_Lowercase, which is exactly what
+;; char-upper-case?/char-lower-case? answer: a Roman numeral is upper case, the
+;; feminine ordinal is lower case, a titlecase digraph is neither). They used to be
+;; ASCII ranges, so \é was not a letter and \É was not upper case.
+;;
+;; Every one takes a char or an int codepoint. An int that is not a Unicode scalar
+;; value (negative, a surrogate, above U+10FFFF) is no char on this host, and the
+;; JVM classifies it as nothing: every predicate is false and getType is
+;; UNASSIGNED, except that a surrogate is SURROGATE. A signed high byte reaches
+;; these — cognitect aws-api's request signer classifies each UTF-8 byte of a URI
+;; through isLetterOrDigit — and is negative, so it must not reach integer->char.
+(define (scalar-char x)            ; the char for x, or #f when x is not a scalar value
+  (if (char? x) x
+      (let ((cp (jnum->exact x)))
+        (and (fixnum? cp) (fx>=? cp 0) (fx<=? cp #x10FFFF)
+             (not (and (fx>=? cp #xD800) (fx<=? cp #xDFFF)))
+             (integer->char cp)))))
+(define (char-category-in? x cats)
+  (let ((c (scalar-char x)))
+    (and c (memq (char-general-category c) cats) #t)))
+;; general-category symbol -> java.lang.Character.getType constant. 17 is unused
+;; on the JVM as well; Cs is listed for the record, though no char here carries it.
+(define char-category-types
+  '((Cn . 0) (Lu . 1) (Ll . 2) (Lt . 3) (Lm . 4) (Lo . 5) (Mn . 6) (Me . 7) (Mc . 8)
+    (Nd . 9) (Nl . 10) (No . 11) (Zs . 12) (Zl . 13) (Zp . 14) (Cc . 15) (Cf . 16)
+    (Co . 18) (Cs . 19) (Pd . 20) (Ps . 21) (Pe . 22) (Pc . 23) (Po . 24)
+    (Sm . 25) (Sc . 26) (Sk . 27) (So . 28) (Pi . 29) (Pf . 30)))
+(define (char-type x)
+  (let ((c (scalar-char x)))
+    (if c
+        (cdr (assq (char-general-category c) char-category-types))
+        (let ((cp (jnum->exact x)))   ; not a char: scalar-char answers every char
+          (if (and (fixnum? cp) (fx>=? cp #xD800) (fx<=? cp #xDFFF)) 19 0)))))
 (register-class-statics! "java.lang.Character"
   (list (cons "TYPE" "char")
-        (cons "isUpperCase" (lambda (c) (let ((n (char-code c))) (and (>= n 65) (<= n 90)))))
-        (cons "isLowerCase" (lambda (c) (let ((n (char-code c))) (and (>= n 97) (<= n 122)))))
-        (cons "isDigit" (lambda (c) (let ((n (char-code c))) (and (>= n 48) (<= n 57)))))
-        ;; isLetter / isLetterOrDigit take a char or an int codepoint, so a byte read
-        ;; out of a byte[] reaches them — negative for a high byte, which is not a
-        ;; letter on the JVM either (it is not a valid codepoint). cognitect aws-api's
-        ;; request signer classifies each UTF-8 byte of a URI this way.
-        (cons "isLetter" (lambda (c) (let ((n (char-code c)))
-                                       (or (and (>= n 65) (<= n 90)) (and (>= n 97) (<= n 122))))))
-        (cons "isLetterOrDigit" (lambda (c) (let ((n (char-code c)))
-                                              (or (and (>= n 48) (<= n 57))
-                                                  (and (>= n 65) (<= n 90))
-                                                  (and (>= n 97) (<= n 122))))))
+        (cons "getType" (lambda (c) (->num (char-type c))))
+        (cons "isUpperCase" (lambda (c) (let ((ch (scalar-char c))) (and ch (char-upper-case? ch)))))
+        (cons "isLowerCase" (lambda (c) (let ((ch (scalar-char c))) (and ch (char-lower-case? ch)))))
+        (cons "isDigit" (lambda (c) (char-category-in? c '(Nd))))
+        (cons "isLetter" (lambda (c) (char-category-in? c '(Lu Ll Lt Lm Lo))))
+        (cons "isLetterOrDigit" (lambda (c) (char-category-in? c '(Lu Ll Lt Lm Lo Nd))))
+        ;; The getType constants, in JVM order (17 is skipped there too).
+        (cons "UNASSIGNED" (->num 0)) (cons "UPPERCASE_LETTER" (->num 1))
+        (cons "LOWERCASE_LETTER" (->num 2)) (cons "TITLECASE_LETTER" (->num 3))
+        (cons "MODIFIER_LETTER" (->num 4)) (cons "OTHER_LETTER" (->num 5))
+        (cons "NON_SPACING_MARK" (->num 6)) (cons "ENCLOSING_MARK" (->num 7))
+        (cons "COMBINING_SPACING_MARK" (->num 8)) (cons "DECIMAL_DIGIT_NUMBER" (->num 9))
+        (cons "LETTER_NUMBER" (->num 10)) (cons "OTHER_NUMBER" (->num 11))
+        (cons "SPACE_SEPARATOR" (->num 12)) (cons "LINE_SEPARATOR" (->num 13))
+        (cons "PARAGRAPH_SEPARATOR" (->num 14)) (cons "CONTROL" (->num 15))
+        (cons "FORMAT" (->num 16)) (cons "PRIVATE_USE" (->num 18))
+        (cons "SURROGATE" (->num 19)) (cons "DASH_PUNCTUATION" (->num 20))
+        (cons "START_PUNCTUATION" (->num 21)) (cons "END_PUNCTUATION" (->num 22))
+        (cons "CONNECTOR_PUNCTUATION" (->num 23)) (cons "OTHER_PUNCTUATION" (->num 24))
+        (cons "MATH_SYMBOL" (->num 25)) (cons "CURRENCY_SYMBOL" (->num 26))
+        (cons "MODIFIER_SYMBOL" (->num 27)) (cons "OTHER_SYMBOL" (->num 28))
+        (cons "INITIAL_QUOTE_PUNCTUATION" (->num 29)) (cons "FINAL_QUOTE_PUNCTUATION" (->num 30))
         ;; JVM Character.isWhitespace: Unicode whitespace (so U+2028 line separator
         ;; counts, like the JVM) MINUS the no-break spaces the JVM excludes
         ;; (U+00A0/U+2007/U+202F). char<=?space missed everything above ASCII.
