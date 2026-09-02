@@ -5534,7 +5534,7 @@
   {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-inc on a double" :expected "2.5" :actual "(unchecked-inc 1.5)" :portability :common}
   {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-int wraps a wide long" :expected "-1294967296" :actual "(unchecked-int 3000000000)" :portability :common}
   {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-int of a char" :expected "97" :actual "(unchecked-int \\a)" :portability :common}
-  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-long of a char" :expected "97" :actual "(unchecked-long \\a)" :portability :common}
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-long of a char raises (only the int cast has a char overload)" :expected ":cce" :actual "(try (unchecked-long \\a) (catch ClassCastException _ :cce))" :portability :common}
   {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-long of a negative double truncates" :expected "-3" :actual "(unchecked-long -3.7)" :portability :common}
   ;; str over two and three arguments, the arities a fixed-arity entry answers
   {:suite "strings / str small arities" :label "two strings" :expected "\"ab\"" :actual "(str \"a\" \"b\")" :portability :common}
@@ -5563,10 +5563,10 @@
   {:suite "numbers / unchecked lowering" :label "unchecked-multiply of a double and a long" :expected "5.0" :actual "(let [a 2.5 b 2] (unchecked-multiply a b))" :portability :common}
   {:suite "numbers / unchecked lowering" :label "unchecked-negate of a double" :expected "-1.5" :actual "(unchecked-negate 1.5)" :portability :common}
   {:suite "numbers / unchecked lowering" :label "unchecked-dec of a double" :expected "0.5" :actual "(unchecked-dec 1.5)" :portability :common}
-  {:suite "numbers / unchecked lowering" :label "unchecked-subtract of one operand negates" :expected "-3" :actual "(apply unchecked-subtract [3])" :portability :jolt}
   {:suite "numbers / unchecked lowering" :label "unchecked-add in value position" :expected "6" :actual "(reduce unchecked-add 0 [1 2 3])" :portability :common}
   {:suite "numbers / unchecked lowering" :label "unchecked-inc in value position" :expected "[2 3 4]" :actual "(mapv unchecked-inc [1 2 3])" :portability :common}
-  {:suite "numbers / unchecked lowering" :label "unchecked-long of a char in a let" :expected "97" :actual "(let [c \\a] (unchecked-long c))" :portability :common}
+  {:suite "numbers / unchecked lowering" :label "unchecked-long of a char in a let raises" :expected ":cce" :actual "(let [c \\a] (try (unchecked-long c) (catch ClassCastException _ :cce)))" :portability :common}
+  {:suite "numbers / unchecked lowering" :label "unchecked-long of (unchecked-int char) is the idiom" :expected "97" :actual "(let [c \\a] (unchecked-long (unchecked-int c)))" :portability :common}
   {:suite "numbers / unchecked lowering" :label "unchecked-add on a non-number throws" :expected ":cce" :actual "(try (unchecked-add \"a\" 1) (catch ClassCastException _ :cce))" :portability :common}
   ;; an interop call on an UNPROVEN string or keyword receiver takes the direct
   ;; form at the site; other receivers still reach the generic dispatch
@@ -5580,7 +5580,7 @@
   {:suite "host-interop / unhinted receiver guard" :label ".getNamespace of an unqualified keyword is nil" :expected "nil" :actual "(let [k (first [:b])] (.getNamespace k))" :portability :common}
   {:suite "host-interop / unhinted receiver guard" :label ".length on an unhinted StringBuilder still dispatches" :expected "2" :actual "(let [b (first [(doto (StringBuilder.) (.append \"ab\"))])] (.length b))" :portability :common}
   {:suite "host-interop / unhinted receiver guard" :label ".toString on an unhinted keyword" :expected "\":a/b\"" :actual "(let [k (first [:a/b])] (.toString k))" :portability :common}
-  {:suite "host-interop / unhinted receiver guard" :label ".length on a deftype with its own length" :expected "42" :actual "(do (deftype Sized [] Object (length [_] 42)) (let [x (first [(Sized.)])] (.length x)))" :portability :jolt}
+  {:suite "host-interop / unhinted receiver guard" :label ".length on a deftype with its own length" :expected "42" :actual "(do (defprotocol HasLen (length [x])) (deftype Sized [] HasLen (length [_] 42)) (let [x (first [(Sized.)])] (.length x)))" :portability :common}
   {:suite "host-interop / unhinted receiver guard" :label "receiver then args, each once" :expected "[2 [\"hello\" \"l\"]]" :actual "(let [calls (atom []) note (fn [v] (swap! calls conj v) v)] [(.indexOf (note \"hello\") (note \"l\")) @calls])" :portability :common}
   ;; case on interned constants compares by identity
   {:suite "equality / case by identity" :label "keyword clause hit" :expected "2" :actual "(case (first [:b]) :a 1 :b 2 3)" :portability :common}

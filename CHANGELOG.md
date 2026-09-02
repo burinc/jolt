@@ -312,6 +312,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`(unchecked-long \a)` raises `ClassCastException`.** `RT.uncheckedLongCast(Object)`
+  is `((Number) x).longValue()`, so a Character is rejected on the JVM; only
+  the int cast has a char overload, and `(unchecked-long (unchecked-int c))`
+  still works. jolt answered 97. Found by the JVM certification of new corpus
+  rows.
+
 - **A bad namespace designator says what was wrong.** `(ns-name nil)`,
   `(the-ns nil)` and `(find-ns nil)` reached a bare Chez record accessor and
   escaped as a condition with no jolt class and no message — printing as
