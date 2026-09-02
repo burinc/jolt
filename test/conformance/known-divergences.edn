@@ -30,7 +30,9 @@
   :namespace-model
   "jolt's namespace layer is permissive: clojure.core always resolves (a :refer-clojure :exclude/:only affects syntax-quote qualification but not resolve/ns-resolve) and var privacy is not enforced across namespaces. A superset — code that resolves on the JVM resolves on jolt.",
   :deps-model
-  "jolt resolves deps.edn itself (grenadine, no JVM toolchain) and jolt IS Clojure, so a host-supplied coordinate is TERMINAL: it contributes neither an artifact nor children. Not a superset — the JVM's org.clojure/clojure carries dependencies of its own, and those do not arrive here."},
+  "jolt resolves deps.edn itself (grenadine, no JVM toolchain) and jolt IS Clojure, so a host-supplied coordinate is TERMINAL: it contributes neither an artifact nor children. Not a superset — the JVM's org.clojure/clojure carries dependencies of its own, and those do not arrive here.",
+  :reflection-member-model
+  "Class reflection (getMethods / getDeclaredFields / getMethod …) answers from jolt's registries — the protocol/type registry, the host shim tables, class-statics — not from JVM class files, which jolt does not have. A member in none of them is absent rather than guessed at; every parameter type is Object and getMethod selects by parameter count, since jolt carries no signatures. Substrate-inherent; the per-registry model is pinned jolt-side in unit.edn (reflect-member-model)."},
  :documented
  [;; Deliberate/tracked divergences that are NOT corpus rows, so they live here (not
   ;; in :entries, which certify.clj gates for staleness against the corpus).
@@ -803,7 +805,23 @@
    :check {:expr "(let [x 3] #$\"a ~{x} b ~(inc x)\")"
            :jvm "throws RuntimeException"
            :jolt "\"a 3 b 4\""}
-   :note "clojure.core.strint/<< ships alongside it and expands through the same grammar; a string with no marker reads as itself, so #$\"plain\" IS \"plain\"."}]
+   :note "clojure.core.strint/<< ships alongside it and expands through the same grammar; a string with no marker reads as itself, so #$\"plain\" IS \"plain\"."}
+  ;; Class reflection answers from what jolt REGISTERS for a class — a deftype's
+  ;; methods and fields (the protocol/type registry), an ArrayList's methods (the
+  ;; host shim tables), Long/MAX_VALUE and Math/floor (class-statics) — because
+  ;; there are no JVM class files to read. A member that lives in none of those is
+  ;; absent rather than guessed at: String's instance methods are a `cond` over
+  ;; method names in java/natives-str.ss, not data anything can enumerate, so
+  ;; String reports its three statics and nothing else. The JVM lists every public
+  ;; method of java.lang.String.
+  {:category :reflection-member-model
+   :behavior "(.getMethods String) — which members a class reports"
+   :jvm "every public method of java.lang.String, substring among them"
+   :jolt "the three statics jolt registers (format, join, valueOf) and no instance methods"
+   :check {:expr "(contains? (set (map #(.getName %) (.getMethods String))) \"substring\")"
+           :jvm "true"
+           :jolt "false"}
+   :note "A class whose methods jolt models as a cond rather than a table under-reports; a member that IS registered reports its JVM class (java.lang.reflect.Method/Field/Constructor) and prints like one. getMethod raises NoSuchMethodException only for a name no registry has."}]
  :entries
  [;; Wherever a syntax-quote's CONSTRUCTION CODE becomes a value rather than
   ;; being compiled — a nested backtick, a quoted one, a macro's argument —

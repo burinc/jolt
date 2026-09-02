@@ -58,6 +58,15 @@
 ;;      namespace too. It shares the owner's thread id, so ownership by thread read
 ;;      the claim as its own and returned half-loaded; and it has to wait by parking,
 ;;      because blocking that carrier is the one thing the parked load cannot survive.
+;;   J. a requiring-resolve INSIDE a load, while another thread's requiring-resolve
+;;      is waiting on that load. Clojure's requiring-resolve holds RT/REQUIRE_LOCK
+;;      across its require because its loader has no other guard; here the
+;;      per-namespace claim already blocks the second thread until the first one's
+;;      load finishes, so the process-wide lock adds nothing — and it adds an edge
+;;      the wait-for graph cannot see. Thread A holds the lock and waits on the
+;;      namespace B is loading; B's top level reaches for the lock. Neither is a
+;;      loader wait, so the cycle walk never fires and both hang for good. jolt's
+;;      requiring-resolve is a plain require for that reason, and this pins it.
 ;;
 ;; Run: jolt run test/chez/concurrent-require.clj  (wired into smoke.sh)
 
@@ -154,6 +163,23 @@
        "(def got (a/<!! ch))\n"
        "(def after :ran)\n"))
 
+;; Property J's three namespaces: rlx requires rly; rly's top level announces
+;; itself, waits to be released, then requiring-resolves rlz — the reach for the
+;; lock from inside a load. The release is external so thread A is certainly
+;; waiting on rly before rly asks for anything. Bounded like the cycle gate.
+(def rl-y-started (atom false))
+(def rl-go (atom false))
+(def rl-z-src "(ns ldrtest.rlz)\n(def bar 1)\n")
+(def rl-x-src "(ns ldrtest.rlx (:require [ldrtest.rly]))\n(def foo 1)\n")
+(def rl-y-src
+  (str "(ns ldrtest.rly)\n"
+       "(reset! concurrent-require/rl-y-started true)\n"
+       "(loop [n 0]\n"
+       "  (when (and (not @concurrent-require/rl-go) (< n 5000))\n"
+       "    (Thread/sleep 1) (recur (inc n))))\n"
+       "(def got (requiring-resolve 'ldrtest.rlz/bar))\n"
+       "(def sentinel :rly)\n"))
+
 (defn- write-sources! []
   (let [dir (str tmp-root "/ldrtest")]
     (.mkdirs (java.io.File. dir))
@@ -166,7 +192,10 @@
     (spit (str dir "/dedup.clj") (dedup-src "dedup"))
     (spit (str dir "/dedupab.clj") (dedup-src "dedupab"))
     (spit (str dir "/parky.clj") parky-src)
-    (spit (str dir "/sibling.clj") sibling-src)))
+    (spit (str dir "/sibling.clj") sibling-src)
+    (spit (str dir "/rlx.clj") rl-x-src)
+    (spit (str dir "/rly.clj") rl-y-src)
+    (spit (str dir "/rlz.clj") rl-z-src)))
 
 ;; A gate every thread spins on, so they all enter require together — without it
 ;; the first finishes before the rest start and there is no race to lose.
@@ -438,6 +467,38 @@
                  ", expected :whole — it read the parked load's claim as its own"
                  " and took the cycle break")))))
 
+;; Property J: requiring-resolve does not hold a process-wide lock across its
+;; require. B is inside rly's load (and will requiring-resolve from there) before A
+;; starts; A's requiring-resolve of rlx requires rly and so waits on B. If A held
+;; RT/REQUIRE_LOCK while waiting, B's reach for it would close a cycle the loader
+;; cannot detect, and both would hang — which is what this reported before
+;; requiring-resolve became a plain require.
+(defn- require-lock-failures []
+  (let [b (future (try (require 'ldrtest.rly) :ok
+                       (catch Throwable e (str (.getMessage e)))))
+        _ (loop [n 0]
+            (when (and (not @rl-y-started) (< n 5000)) (Thread/sleep 1) (recur (inc n))))
+        a (future (try (some? (requiring-resolve 'ldrtest.rlx/foo))
+                       (catch Throwable e (str (.getMessage e)))))
+        ;; long enough for A to be waiting on rly, which is where it holds a lock if
+        ;; it holds one at all
+        _ (Thread/sleep 200)
+        _ (reset! rl-go true)
+        [sa ra] (deref-timeout a 15000)
+        [sb rb] (deref-timeout b 15000)]
+    (cond-> []
+      (or (= :timeout sa) (= :timeout sb))
+      (conj (str "a requiring-resolve waiting on another thread's load, whose top level"
+                 " itself requiring-resolves, hung: requiring-resolve holds a"
+                 " process-wide lock across its require, and the loader's wait-for"
+                 " graph cannot see it"))
+      (and (not= :timeout sa) (not (true? ra)))
+      (conj (str "requiring-resolve through a namespace another thread was loading"
+                 " came back with " (pr-str ra)))
+      (and (not= :timeout sb) (not= :ok rb))
+      (conj (str "the load that requiring-resolved from its own top level failed: "
+                 (pr-str rb))))))
+
 (defn- clean-up! []
   ;; the temp root is per-run (currentTimeMillis), so clean it up rather than
   ;; leave one behind on every smoke run
@@ -448,6 +509,8 @@
              (str tmp-root "/ldrtest/y.clj") (str tmp-root "/ldrtest/boom.clj")
              (str tmp-root "/ldrtest/dedup.clj") (str tmp-root "/ldrtest/dedupab.clj")
              (str tmp-root "/ldrtest/parky.clj") (str tmp-root "/ldrtest/sibling.clj")
+             (str tmp-root "/ldrtest/rlx.clj") (str tmp-root "/ldrtest/rly.clj")
+             (str tmp-root "/ldrtest/rlz.clj")
              (str tmp-root "/ldrtest") tmp-root]]
     (try (.delete (java.io.File. p)) (catch Throwable _ nil))))
 
@@ -461,7 +524,8 @@
                      (into (dosync-wait-failures))
                      (into (dosync-dedup-failures))
                      (into (parked-load-failures))
-                     (into (sibling-fiber-failures)))]
+                     (into (sibling-fiber-failures))
+                     (into (require-lock-failures)))]
     (clean-up!)
     (if (seq failures)
       (do (doseq [f failures] (println "FAIL:" f))
@@ -470,6 +534,6 @@
       (println "CONCURRENT-REQUIRE OK" n-threads "threads on 1 namespace,"
                n-distinct "namespaces in parallel, cycle and dosync-wait not hung,"
                "dosync dedups, a parked load finishes for its owner and its"
-               "siblings"))))
+               "siblings, requiring-resolve takes no process-wide lock"))))
 
 (-main)

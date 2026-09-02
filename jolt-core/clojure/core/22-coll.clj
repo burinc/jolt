@@ -414,11 +414,11 @@
 (defn get-proxy-class [& interfaces] (throw "get-proxy-class: not supported in Jolt"))
 
 ;; Clojure's serialized-require: require while holding
-;; clojure.lang.RT/REQUIRE_LOCK, so two threads reaching for one namespace load it
-;; once rather than racing through the same file. Private there and here — it
-;; exists for requiring-resolve below, and a caller wanting the same guarantee
-;; takes the field itself. jolt.host/with-monitor rather than `locking`: that
-;; macro is defined in 30-macros.clj, which loads after this file.
+;; clojure.lang.RT/REQUIRE_LOCK. Private there and here, and here it exists ONLY
+;; for code that reaches for the private var — jolt's own requiring-resolve does
+;; not go through it, for the reason given below. jolt.host/with-monitor rather
+;; than `locking`: that macro is defined in 30-macros.clj, which loads after this
+;; file.
 (defn ^:private serialized-require [& args]
   (jolt.host/with-monitor clojure.lang.RT/REQUIRE_LOCK
     (fn* [] (apply require args))))
@@ -426,13 +426,21 @@
 ;; resolve, requiring the symbol's namespace first when it isn't loaded yet —
 ;; the dynamic-require pattern (tooling, plugin registries). The require and
 ;; resolve are the runtime fns, so this works identically under jolt run and
-;; in an AOT binary (which compiles the namespace from the source roots). The
-;; require is serialized, as Clojure's is: two threads resolving the same
-;; qualified symbol at once would otherwise both start loading its namespace,
-;; and the second could resolve a var out of a half-loaded one.
+;; in an AOT binary (which compiles the namespace from the source roots).
+;;
+;; A plain require, NOT serialized-require. Clojure holds RT/REQUIRE_LOCK across
+;; the require because its loader has no other guard against two threads loading
+;; one namespace. jolt's loader does (loader.ss, JLS 12.4.2 per namespace): a
+;; second thread's require blocks until the first thread's load of that namespace
+;; has finished, so the process-wide lock would add nothing it does not already
+;; give — and it adds a lock edge the loader's wait-for graph cannot see. Thread A
+;; holds the lock and waits on a namespace B is loading; B's top level calls
+;; requiring-resolve and waits on the lock. Neither wait is a loader wait, so the
+;; cycle walk never fires and both hang for good. test/chez/concurrent-require.clj
+;; pins this (property J).
 (defn requiring-resolve [sym]
   (if (qualified-symbol? sym)
     (or (resolve sym)
-        (do (serialized-require (symbol (namespace sym)))
+        (do (require (symbol (namespace sym)))
             (resolve sym)))
     (throw (new IllegalArgumentException (str "Not a qualified symbol: " sym)))))
