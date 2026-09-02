@@ -5494,4 +5494,66 @@
   {:suite "protocols / interface tags" :label "an Object extension still catches a reify declaring interfaces" :expected ":obj" :actual "(do (defprotocol IftV (iftv [x])) (extend-protocol IftV Object (iftv [x] :obj)) (iftv (reify clojure.lang.IReduceInit (reduce [_ f init] init))))" :portability :common}
   {:suite "protocols / interface tags" :label "a defrecord's EXTRA declared interface dispatches alongside the map set" :expected ":rec" :actual "(do (defprotocol IftW (iftw [x])) (extend-protocol IftW clojure.lang.IReduceInit (iftw [x] :rec)) (defrecord IftR1 [] clojure.lang.IReduceInit (reduce [_ f init] init)) (iftw (->IftR1)))" :portability :common}
   {:suite "protocols / interface tags" :label "IRecord extension: dispatch and satisfies? agree on a record" :expected "[:irec true]" :actual "(do (defprotocol IftX (iftx [x])) (extend-protocol IftX clojure.lang.IRecord (iftx [x] :irec)) (defrecord IftR2 [a]) [(iftx (->IftR2 1)) (satisfies? IftX (->IftR2 1))])" :portability :common}
+  ;; equality of two base scalars is decided by kind on the JVM (Util.equiv goes
+  ;; straight to k1.equals(k2)), and nil equals only nil. jolt used to answer
+  ;; these only after walking the eq arm registry; `case` lowers to this chain.
+  {:suite "equality / base scalars of different kinds" :label "nil vs number" :expected "false" :actual "(= nil 1)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "number vs nil" :expected "false" :actual "(= 1 nil)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "nil vs false" :expected "false" :actual "(= nil false)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "nil vs nil" :expected "true" :actual "(= nil nil)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "keyword vs symbol" :expected "false" :actual "(= :a 'a)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "symbol vs keyword" :expected "false" :actual "(= 'a :a)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "keyword vs string" :expected "false" :actual "(= :a \"a\")" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "string vs symbol" :expected "false" :actual "(= \"a\" 'a)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "long vs double" :expected "false" :actual "(= 1 1.0)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "long vs bigint" :expected "true" :actual "(= 1 1N)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "ratio vs double" :expected "false" :actual "(= 1/2 0.5)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "boolean vs keyword" :expected "false" :actual "(= true :a)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "false vs zero" :expected "false" :actual "(= false 0)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "char vs string" :expected "false" :actual "(= \\a \"a\")" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "char vs its code point" :expected "false" :actual "(= \\a 97)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "string vs long" :expected "false" :actual "(= \"1\" 1)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "not= across kinds" :expected "true" :actual "(not= :a \"a\")" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "variadic = stops at the first cross-kind miss" :expected "false" :actual "(= 1 1 1.0)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "case: keyword clauses fed a symbol take the default" :expected ":none" :actual "(case 'a :a 1 :b 2 :none)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "case: keyword clauses fed a string take the default" :expected ":none" :actual "(case \"a\" :a 1 :b 2 :none)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "case: a nil clause matches nil" :expected ":nil" :actual "(case nil nil :nil :a :a :other)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "case: an int clause fed a keyword takes the default" :expected ":none" :actual "(case :k 0 :zero 1 :one :none)" :portability :common}
+  {:suite "equality / base scalars of different kinds" :label "some with a set of keywords over mixed values" :expected ":b" :actual "(some #{:a :b} [1 \"a\" 'a nil :b])" :portability :common}
+  ;; the unchecked ops wrap at the 64-bit boundary; the fixnum fast path must
+  ;; not change that on the way past 2^60
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-add wraps MAX+1" :expected "-9223372036854775808" :actual "(unchecked-add Long/MAX_VALUE 1)" :portability :common}
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-inc wraps MAX" :expected "-9223372036854775808" :actual "(unchecked-inc Long/MAX_VALUE)" :portability :common}
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-dec wraps MIN" :expected "9223372036854775807" :actual "(unchecked-dec Long/MIN_VALUE)" :portability :common}
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-subtract wraps MIN-1" :expected "9223372036854775807" :actual "(unchecked-subtract Long/MIN_VALUE 1)" :portability :common}
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-multiply wraps" :expected "-2" :actual "(unchecked-multiply Long/MAX_VALUE 2)" :portability :common}
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-negate of MIN is MIN" :expected "-9223372036854775808" :actual "(unchecked-negate Long/MIN_VALUE)" :portability :common}
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-add past the fixnum width but inside long" :expected "2305843009213693952" :actual "(unchecked-add 1152921504606846976 1152921504606846976)" :portability :common}
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-add MAX+MAX" :expected "-2" :actual "(unchecked-add Long/MAX_VALUE Long/MAX_VALUE)" :portability :common}
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-add on a double does not wrap" :expected "3.5" :actual "(unchecked-add 1.5 2)" :portability :common}
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-inc on a double" :expected "2.5" :actual "(unchecked-inc 1.5)" :portability :common}
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-int wraps a wide long" :expected "-1294967296" :actual "(unchecked-int 3000000000)" :portability :common}
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-int of a char" :expected "97" :actual "(unchecked-int \\a)" :portability :common}
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-long of a char" :expected "97" :actual "(unchecked-long \\a)" :portability :common}
+  {:suite "numbers / unchecked wrap at the 64-bit boundary" :label "unchecked-long of a negative double truncates" :expected "-3" :actual "(unchecked-long -3.7)" :portability :common}
+  ;; str over two and three arguments, the arities a fixed-arity entry answers
+  {:suite "strings / str small arities" :label "two strings" :expected "\"ab\"" :actual "(str \"a\" \"b\")" :portability :common}
+  {:suite "strings / str small arities" :label "string and nil" :expected "\"a\"" :actual "(str \"a\" nil)" :portability :common}
+  {:suite "strings / str small arities" :label "nil and string" :expected "\"b\"" :actual "(str nil \"b\")" :portability :common}
+  {:suite "strings / str small arities" :label "string keyword number" :expected "\"a:k1\"" :actual "(str \"a\" :k 1)" :portability :common}
+  {:suite "strings / str small arities" :label "char and string" :expected "\"ab\"" :actual "(str \\a \"b\")" :portability :common}
+  {:suite "strings / str small arities" :label "symbol double string" :expected "\"s1.5x\"" :actual "(str 's 1.5 \"x\")" :portability :common}
+  {:suite "strings / str small arities" :label "three strings" :expected "\"abc\"" :actual "(str \"a\" \"b\" \"c\")" :portability :common}
+  {:suite "strings / str small arities" :label "a vector renders readably" :expected "\"x[1 \\\"s\\\"]\"" :actual "(str \"x\" [1 \"s\"])" :portability :common}
+  ;; nth on an all-tail vector and a trie vector, both sides of the tail boundary
+  {:suite "collections / nth tail and trie" :label "small vector index" :expected "3" :actual "(nth [1 2 3 4] 2)" :portability :common}
+  {:suite "collections / nth tail and trie" :label "last index of a 32-vector" :expected "31" :actual "(nth (vec (range 32)) 31)" :portability :common}
+  {:suite "collections / nth tail and trie" :label "trie index of a 40-vector" :expected "3" :actual "(nth (vec (range 40)) 3)" :portability :common}
+  {:suite "collections / nth tail and trie" :label "tail index of a 40-vector" :expected "35" :actual "(nth (vec (range 40)) 35)" :portability :common}
+  {:suite "collections / nth tail and trie" :label "boundary index of a 40-vector" :expected "32" :actual "(nth (vec (range 40)) 32)" :portability :common}
+  {:suite "collections / nth tail and trie" :label "out of range with a default" :expected ":d" :actual "(nth [1 2 3] 7 :d)" :portability :common}
+  {:suite "collections / nth tail and trie" :label "negative index with a default" :expected ":d" :actual "(nth [1 2 3] -1 :d)" :portability :common}
+  {:suite "collections / nth tail and trie" :label "out of range throws" :expected ":oob" :actual "(try (nth [1 2 3] 3) (catch IndexOutOfBoundsException _ :oob))" :portability :common}
+  {:suite "collections / nth tail and trie" :label "nil index throws NPE" :expected ":npe" :actual "(try (nth [1 2 3] nil) (catch NullPointerException _ :npe))" :portability :common}
+  {:suite "collections / nth tail and trie" :label "nth on nil is nil" :expected "nil" :actual "(nth nil 5)" :portability :common}
 ]

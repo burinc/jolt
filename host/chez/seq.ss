@@ -824,11 +824,16 @@
 ;; [-2^63, 2^63) is its own wrap — skip the bignum mask, which on Chez (61-bit
 ;; fixnums) allocates for any value past 2^60. Only an out-of-range result (a
 ;; multiply overflowing into 128 bits) needs the mask + sign fixup.
+;; fixnum? first: a Chez fixnum is 61 bits wide, so it is always inside signed
+;; 64-bit range and the bounds compares below — against BIGNUMS on this tower —
+;; never needed to run for it. They cost 8 of the 12 ns of an unchecked-add.
 (define (jolt-wrap64 x)
-  (if (and (exact? x) (integer? x) (>= x unc-neg-2^63) (< x unc-2^63))
+  (if (fixnum? x)
       x
-      (let ((m (bitwise-and (if (and (number? x) (exact? x) (integer? x)) x (exact (floor x))) unc-mask64)))
-        (if (>= m unc-2^63) (- m unc-2^64) m))))
+      (if (and (exact? x) (integer? x) (>= x unc-neg-2^63) (< x unc-2^63))
+          x
+          (let ((m (bitwise-and (if (and (number? x) (exact? x) (integer? x)) x (exact (floor x))) unc-mask64)))
+            (if (>= m unc-2^63) (- m unc-2^64) m)))))
 ;; unchecked-* only WRAP integer (long) math; on a flonum OR ratio operand they
 ;; are an ordinary numeric op, since *unchecked-math* never wraps a non-long —
 ;; Clojure's unchecked-add falls back to regular arithmetic for non-primitives:
@@ -836,13 +841,25 @@
 ;; truncated long. (test.check's rand-double is (* double-unit shifted), and
 ;; gen/ratio sums ratios, both under *unchecked-math*.) Wrap iff both are exact
 ;; integers.
-(define (unc-int? x) (and (exact? x) (integer? x)))
-(define (jolt-uncadd2 a b) (if (and (unc-int? a) (unc-int? b)) (jolt-wrap64 (+ a b)) (+ a b)))
-(define (jolt-uncsub2 a b) (if (and (unc-int? a) (unc-int? b)) (jolt-wrap64 (- a b)) (- a b)))
-(define (jolt-uncmul2 a b) (if (and (unc-int? a) (unc-int? b)) (jolt-wrap64 (* a b)) (* a b)))
-(define (jolt-uncinc x)    (if (unc-int? x) (jolt-wrap64 (+ x 1)) (+ x 1)))
-(define (jolt-uncdec x)    (if (unc-int? x) (jolt-wrap64 (- x 1)) (- x 1)))
-(define (jolt-uncneg x)    (if (unc-int? x) (jolt-wrap64 (- x)) (- x)))
+(define (unc-int? x) (or (fixnum? x) (and (exact? x) (integer? x))))
+;; Two fixnum operands are the whole of the hot path (loop counters, char code
+;; points, accumulators): their sum/difference/product is an exact integer that
+;; jolt-wrap64 leaves alone whenever it is still a fixnum, so the generic
+;; predicates are skipped for them. The wrap itself happens in jolt-wrap64, so
+;; a product that overflows 64 bits still wraps.
+(define-syntax unc-op2
+  (syntax-rules ()
+    ((_ op a b)
+     (let ((x a) (y b))
+       (if (and (fixnum? x) (fixnum? y))
+           (let ((r (op x y))) (if (fixnum? r) r (jolt-wrap64 r)))
+           (if (and (unc-int? x) (unc-int? y)) (jolt-wrap64 (op x y)) (op x y)))))))
+(define (jolt-uncadd2 a b) (unc-op2 + a b))
+(define (jolt-uncsub2 a b) (unc-op2 - a b))
+(define (jolt-uncmul2 a b) (unc-op2 * a b))
+(define (jolt-uncinc x)    (if (fixnum? x) (let ((r (+ x 1))) (if (fixnum? r) r (jolt-wrap64 r))) (if (unc-int? x) (jolt-wrap64 (+ x 1)) (+ x 1))))
+(define (jolt-uncdec x)    (if (fixnum? x) (let ((r (- x 1))) (if (fixnum? r) r (jolt-wrap64 r))) (if (unc-int? x) (jolt-wrap64 (- x 1)) (- x 1))))
+(define (jolt-uncneg x)    (if (fixnum? x) (jolt-wrap64 (- x)) (if (unc-int? x) (jolt-wrap64 (- x)) (- x))))
 (define (jolt-unchecked-add . xs) (if (null? xs) 0 (fold-left jolt-uncadd2 (car xs) (cdr xs))))
 (define (jolt-unchecked-mul . xs) (if (null? xs) 1 (fold-left jolt-uncmul2 (car xs) (cdr xs))))
 (define (jolt-unchecked-sub . xs)
@@ -953,13 +970,22 @@
 (define (jolt-proc-arity-error f nargs)
   (jolt-arity-error-name (jolt-proc-arity-name f) nargs))
 ;; check one-arg-or-two: the common arity rule for keywords, symbols, maps.
-(define (jolt-check-arity-1or2 name nargs)
-  (unless (or (fx=? nargs 1) (fx=? nargs 2))
-    (jolt-arity-error-name name nargs)))
+;; Macros, not procedures, so the NAME expression — a string-append for a
+;; keyword, jolt-class-name for a collection — is evaluated only on the error
+;; path; as procedures they built it on every successful call.
+(define-syntax jolt-check-arity-1or2
+  (syntax-rules ()
+    ((_ name nargs)
+     (let ((n nargs))
+       (unless (or (fx=? n 1) (fx=? n 2))
+         (jolt-arity-error-name name n))))))
 ;; check exactly-one-arg: vectors and sets on the JVM accept exactly 1 arg.
-(define (jolt-check-arity-1 name nargs)
-  (unless (fx=? nargs 1)
-    (jolt-arity-error-name name nargs)))
+(define-syntax jolt-check-arity-1
+  (syntax-rules ()
+    ((_ name nargs)
+     (let ((n nargs))
+       (unless (fx=? n 1)
+         (jolt-arity-error-name name n))))))
 
 (define (jolt-invoke f . args)
   (cond

@@ -157,17 +157,26 @@
 ;; raise and ->idx coercion lived in jolt-nth ahead of type dispatch; a
 ;; hoisted pvec case never reaches them, so both happen here, inlined — this
 ;; is the hot read, every call frame in front of pv-leaf-for costs.
+;; The tail is tested HERE, before pv-leaf-for: every vector of 32 or fewer
+;; elements is all tail, and a tail index is one subtraction and a vector-ref,
+;; where pv-leaf-for's two-value return through let-values costs 9 of the 13 ns
+;; a small-vector nth used to take. The trie path is unchanged.
+(define (pvec-nth-in-range p i)
+  (let* ((tail (pvec-tail p)) (tailoff (fx- (pvec-cnt p) (vector-length tail))))
+    (if (fx>=? i tailoff)
+        (vector-ref tail (fx- i tailoff))
+        (let-values (((chunk off) (pv-leaf-for p i))) (vector-ref chunk off)))))
 (define (pvec-nth! p i)
   (if (jolt-nil? i)
       (jolt-throw (jolt-host-throwable "java.lang.NullPointerException" "nth index"))
       (let ((i (if (fixnum? i) i (if (flonum? i) (exact (floor i)) i))))
         (if (and (fixnum? i) (fx>=? i 0) (fx<? i (pvec-cnt p)))
-            (let-values (((chunk off) (pv-leaf-for p i))) (vector-ref chunk off))
+            (pvec-nth-in-range p i)
             (jolt-throw (jolt-host-throwable "java.lang.IndexOutOfBoundsException" "index out of bounds"))))))
 (define (pvec-nth-d p i d)
   (let ((i (->idx i)))
     (if (and (fixnum? i) (fx>=? i 0) (fx<? i (pvec-cnt p)))
-        (let-values (((chunk off) (pv-leaf-for p i))) (vector-ref chunk off))
+        (pvec-nth-in-range p i)
         d)))
 
 ;; new-path: wrap a node in single-child nodes up `level` bits.
