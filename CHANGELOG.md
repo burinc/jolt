@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Character/getType` and the general-category constants.** The Unicode
+  general category of a char or int codepoint as the JVM's constant, with
+  `Character/UNASSIGNED` through `Character/FINAL_QUOTE_PUNCTUATION` (all 30;
+  17 is unused, as on the JVM). An int that is not a Unicode scalar value
+  answers `UNASSIGNED`, a surrogate `SURROGATE`, as on the JVM.
+
 ### Changed
 
 - **`-M` with nothing to run starts a REPL.** `jolt -M:test` where no selected
@@ -20,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Character/isLetter`, `isDigit`, `isLetterOrDigit`, `isUpperCase` and
+  `isLowerCase` classify all of Unicode.** They were ASCII range checks, so
+  `(Character/isLetter \é)` and `(Character/isUpperCase \É)` were false where
+  the JVM says true. They now apply the JVM's category rules over the same
+  Unicode general category `getType` reports: `isLetter` is L*, `isDigit` is Nd
+  (so `\½` is not a digit), and the case predicates are the Uppercase/Lowercase
+  properties (so `\Ⅰ` is upper case, `\ª` lower case, `\ǅ` neither). An int
+  codepoint that is not a scalar value is still false throughout.
 - **A caught load error no longer misplaces every later error.** The
   `at file:line:col` line under an uncaught error is the top-level form that
   was evaluating, and a file load deliberately left that position on its
