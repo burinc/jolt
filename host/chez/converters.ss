@@ -37,6 +37,17 @@
        (if (or (not ns) (jolt-nil? ns))
            (symbol-t-name v)
            (string-append ns "/" (symbol-t-name v)))))
+    ;; a keyword and a fixnum are the next most common str operands after
+    ;; strings (a keyword's name in a key, a count in a message), and both
+    ;; used to reach the full printer below: 78 ns for (str s :k). Rendered
+    ;; here exactly as the printer does — the keyword form is the one
+    ;; keyword-direct-emit (backend) spells for .toString.
+    ((keyword-t? v)
+     (let ((ns (keyword-t-ns v)))
+       (if ns
+           (string-append ":" ns "/" (keyword-t-name v))
+           (string-append ":" (keyword-t-name v)))))
+    ((fixnum? v) (number->string v))
     ;; numbers and booleans reach the printer without an arm ever claiming them
     ;; (pr-fast-type?, rt.ss); the cases above already cover the rest of that set.
     ((pr-fast-type? v) (jolt-pr-str v))
@@ -83,21 +94,34 @@
       ((or (pvec? v) (pmap? v) (pset? v) (cseq? v) (empty-list-t? v) (jolt-lazyseq? v))
        (jolt-pr-readable v))
       (else (jolt-str-render-one v)))))
-(define (jolt-str . xs)
-  (cond
-    ((null? xs) "")
+;; A string renders as itself. jolt-str-one asks the toString hook first, but
+;; that hook only ever answers for a record (protocols.ss), so a string can skip
+;; it and the type cond behind it: strings are most of what str is handed.
+(define (jolt-str-piece v) (if (string? v) v (jolt-str-one v)))
+;; Fixed entries for two and three arguments — the arities library code
+;; actually writes — build the result in one string-append with no rest list,
+;; no accumulator and no reverse. The variadic entry keeps its shape. Measured
+;; 56 ns against string-append's 1 ns for (str s "!") before this.
+(define jolt-str
+  (case-lambda
+    (() "")
     ;; single arg returns its rendering directly (no string-append copy), so
     ;; (str sym) hands back the symbol's own name string — JVM (str x) is
     ;; x.toString(), and core.logic's non-unique lvar equality compares those by
     ;; identity.
-    ((null? (cdr xs)) (jolt-str-one (car xs)))
-    (else (let loop ((xs xs) (acc '()))
-            (if (null? xs)
-                (apply string-append (reverse acc))
-                (loop (cdr xs) (cons (jolt-str-one (car xs)) acc)))))))
+    ((a) (jolt-str-one a))
+    ((a b) (string-append (jolt-str-piece a) (jolt-str-piece b)))
+    ((a b c) (string-append (jolt-str-piece a) (jolt-str-piece b) (jolt-str-piece c)))
+    ((a b c . rest)
+     (let loop ((xs rest) (acc (list (jolt-str-piece c) (jolt-str-piece b) (jolt-str-piece a))))
+       (if (null? xs)
+           (apply string-append (reverse acc))
+           (loop (cdr xs) (cons (jolt-str-piece (car xs)) acc)))))))
 
-;; jolt indices are flonums; substring etc. need exact ints.
-(define (jolt->idx n) (exact (truncate (jolt-need-num n))))
+;; jolt indices are flonums; substring etc. need exact ints. A fixnum is already
+;; one — this sits on the proven-string .charAt/.substring path, so it must not
+;; call anything for the common case.
+(define (jolt->idx n) (if (fixnum? n) n (exact (truncate (jolt-need-num n)))))
 
 (define (jolt-subs s start . end)
   (let ((s (jolt-need-string s)))
@@ -368,7 +392,12 @@
 ;; #xffffffff is itself a fixnum here.
 (define (jolt-unchecked-long x)
   (cond ((fixnum? x) x)
-        ((char? x) (char->integer x))
+        ;; RT.uncheckedLongCast(Object) is ((Number) x).longValue(): a Character
+        ;; is not a Number there, so (unchecked-long \a) raises. Only the INT
+        ;; cast has a char overload — (unchecked-long (unchecked-int c)) is the
+        ;; idiom, and it still works. jolt used to answer 97 here (found by the
+        ;; JVM certification of the new corpus rows).
+        ((char? x) (jolt-num-cast-throw x))
         ;; an exact integer wraps (long narrowing); a double SATURATES (Java's
         ;; double->long conversion clamps at the bounds, NaN is 0).
         ((and (number? x) (exact? x)) (jolt-wrap64 (truncate x)))

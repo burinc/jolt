@@ -317,6 +317,18 @@
 ;; dominant per-access cost in the hot loop. Non-fixnum indices (flonum/bignum/
 ;; ratio) keep the coercing path unchanged; out-of-range still raises via
 ;; flvector-ref's range check (the array bounds contract).
+;; The backing flvector of a ^doubles PARAM, bound once at the arity's entry by
+;; the back end so a loop over the array indexes the flvector directly instead
+;; of re-reading the checked record accessor on every aget/aset (bench/arrays
+;; 225 -> 145 ms in a Chez probe of the emitted loop). Raising here is the JVM
+;; checkcast at the call boundary: a ^doubles parameter that is not a double[]
+;; raises on entry there too, whether or not the body ever reads it.
+(define (jolt-array-vec-of a)
+  (if (jolt-array? a)
+      (jolt-array-vec a)
+      (jolt-throw (jolt-host-throwable "java.lang.ClassCastException"
+                   (string-append "class " (guard (e (#t "?")) (jolt-class-name a))
+                                  " cannot be cast to class [D")))))
 (define (jolt-flaget a i)
   (flvector-ref (jolt-array-vec a) (if (fixnum? i) i (exact (na-idx i)))))
 ;; unboxed write target for (aset ^doubles a i v): direct flvector-set!, returning

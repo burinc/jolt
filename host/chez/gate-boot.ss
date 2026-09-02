@@ -57,3 +57,11 @@
       (load "host/chez/host-contract.ss")
       (load "host/chez/seed/image.ss")
       (load "host/chez/compile-eval.ss")))  ; manifest prefix ends here
+;; The seed-var direct-link check (host-contract.ss hc-seed-ns?) needs the set
+;; of namespaces the image booted with; the CLI gets it from loader.ss, which a
+;; gate does not load, so snapshot it here — every namespace with vars at this
+;; point is image-defined, and no gate has evaluated user code yet.
+(set! hc-seed-ns-source
+  (let ((t (make-hashtable string-hash string=?)))
+    (vector-for-each (lambda (c) (hashtable-set! t (var-cell-ns c) #t)) (var-table-cells))
+    (lambda () t)))

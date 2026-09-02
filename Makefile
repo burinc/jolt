@@ -162,7 +162,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   smoke tracesmoke buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
-  protoret pic narrow directlink unitcontext numeric oparity mathfl flarr \
+  protoret pic narrow directlink directcall arraymap unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke \
@@ -759,6 +759,17 @@ degradedbacktrace:
 # the then-branch narrows x to non-nil, so its field reads bare-index and unbox.
 narrow:
 	@$(CHEZ) --script host/chez/run-narrow.ss
+
+# The direct call shapes of a --direct-link build: seed vars called through a
+# load-bound root, the unhinted string/keyword interop guard, the unchecked
+# family lowered to its helpers, case on interned constants (run-directcall.ss).
+directcall:
+	@$(CHEZ) --script host/chez/run-directcall.ss
+
+# Array-mode maps are one flat k/v slot vector (PersistentArrayMap), their
+# transients a slot buffer, their seq views vector-backed (test/chez/arraymap-test.ss).
+arraymap:
+	@$(CHEZ) --script test/chez/arraymap-test.ss
 
 # Direct-linking emission: a closed-world build binds top-level app defs to jv$
 # Scheme bindings and routes app->app calls/refs to them, skipping var-deref +

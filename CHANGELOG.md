@@ -192,6 +192,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`reduce-kv` is native, and `assoc` of the value a map already holds is the
+  map itself.** `reduce-kv` folds a map's entries or a vector's index/element
+  pairs in place — no entry objects, no seq — and stops at a `reduced`; a
+  deftype or reify declaring `clojure.lang.IKVReduce` still drives its own
+  `kvreduce`, and any other map-like value (a record, a sorted map) folds over
+  its keys, the reference's `IPersistentMap` arm. A non-collection now raises
+  `IllegalArgumentException` naming the protocol, as on the JVM, instead of
+  throwing a string. `(assoc m k v)` where `m` already maps `k` to that very
+  object answers `m`, and `(dissoc m k)` of an absent key answers `m` — what
+  `PersistentArrayMap` and `PersistentHashMap` both do — so `identical?`
+  agrees with the JVM there and no copy is made.
+- **State images are format 7.** A map's record is `chez-pmap-v5` (the flat
+  slot representation above); images of formats 2 to 6 still restore, an
+  old-format map re-minted from its own record's fields on the way in. An
+  image written by this build does not read on 0.8.0 and earlier.
+- **A `jolt build` direct-links calls to seed vars.** A call from app code to a
+  var of a namespace the runtime image boots with (clojure.core, clojure.string,
+  …) binds the var's root procedure once, when the def holding the site loads,
+  and calls it directly — the same closed-world rule an app def already gets
+  under direct-link, applied only where the root is a procedure whose arity
+  admits the call and the var is not `^:dynamic`, `^:redef` or redefined by
+  the app. What changes is what changes under the JVM's own direct linking: an
+  `alter-var-root` or `with-redefs` of such a var is not seen by call sites
+  compiled into the binary. `jolt run`, the REPL and `--no-direct-link` never
+  direct-link, so tests that redefine core fns keep working there.
+- **`case` compares keyword, `nil` and boolean constants with `identical?`.**
+  Keywords are interned, and this is what the reference does for those
+  constants; symbol, string and number constants still compare with `=`.
+
 - **The reflection member model now reads jolt's static and shim registries, and
   member objects are real `java.lang.reflect.*` values.** `Class.getDeclaredFields`
   / `getMethods` used to consult only the protocol/type registry, so every host
@@ -224,6 +253,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anything can enumerate, so String reports its three statics and nothing else.
 
 ### Performance
+
+- **A small map is one flat key/value slot vector.** An array-mode map — a
+  literal of up to 8 entries, up to 64 keyword-keyed, and everything `assoc`
+  keeps below those limits — used to be a hash trie carrying an insertion-order
+  list on the side: a record, a node, a leaf pair per entry and an order pair
+  per entry, with every lookup hashing the key and descending the trie. It is
+  now what `PersistentArrayMap` is: a record over `#(k0 v0 k1 v1 …)`. A lookup
+  scans the slots with a compare chosen once from the probe key's kind (a
+  keyword by identity, a fixnum, string or symbol by its own equality, the rest
+  by `=`); `assoc`, `dissoc` and the transient's `assoc!`/`dissoc!` copy or
+  write the slots; `reduce-kv`, `seq`, `keys`, `vals`, `=` and `into` read them
+  in place. Measured per operation in one `--opt` binary, before → after:
+  `(:k m)` on a 3-entry map 34 → 12 ns, on an 8-entry map 25 → 15,
+  `(get m 20)` 43 → 16, `contains?` 31 → 11, `assoc` replacing a value 116 →
+  64, `dissoc` 111 → 59, `{:a x :b y}` built at run time 100 → 17, `(= m m')`
+  on 5 entries 230 → 84, `(into {} m)` 1045 → 205, `zipmap` of three 400 →
+  201, `(reduce-kv f 0 m)` on 8 entries 583 → 50 and on a 64-keyword map
+  4259 → 324. The one shape that got slower is the far end of a large
+  keyword array map, where the scan is linear as it is on the JVM: the 64th
+  key of a 64-keyword map answers in 53 ns where the trie took 38 (the 30th
+  is 29), and a symbol probed against symbol keys and missing costs 38 where
+  hashing it took 20. A hash-mode map (`hash-map`, or grown past the limits)
+  is unchanged.
+
+  Under it, three general things. The runtime's hot loops over a slot vector
+  run on a new adapter tier of unchecked fixnum/vector primitives
+  (`sa-ufx+`, `sa-uvector-ref` …, see `host/scheme-adapter/CONTRACT.txt`):
+  the runtime compiles at Chez's safe optimize-level 2, where a checked scan
+  of a 64-keyword map costs three times the unchecked one. Every vector copy
+  under a trie node update, a tail append or a transient's growth is a bulk
+  move rather than a checked element loop (a 64-slot copy: 390 → 62 ns).
+  And a map's `seq`, `keys` and `vals` views are vector-backed cells — one
+  entries vector walked by index, so `count` is O(1) and `reduce` runs the
+  chunk loop — where they were a cons chain built up front, a cell, a pair
+  and an entry per element before the first was read.
+- **The worst scorecard rows shared five general defects, now fixed.** Measured
+  per operation inside one `--opt` binary (see `bench/README.md`): a compare of
+  two base scalars of different kinds, or of anything against nil, walked every
+  registered eq arm before it was answered (145-240 ns per miss; `case` lowers
+  to that chain) — answered ahead of the walk now, and the registry refuses an
+  arm claiming such a pair. The `unchecked-*` family was not lowered at all
+  (`unchecked-add` 29 ns against 3.6 for `+`): it now emits its helpers
+  directly, `unchecked-long`/`unchecked-int` are casts that type their result
+  `:long`, and `jolt-wrap64` tests `fixnum?` before comparing against bignum
+  bounds. An interop call on an unproven receiver (`(.length s)` with no hint)
+  cost 60-135 ns in the arm walk and a rest-args vector-to-list conversion; a
+  method with a string or keyword direct form now tests the receiver at the
+  site and takes it, with the generic dispatch as the slow arm. A call to a
+  clojure.core fn from a built binary paid ~12 ns of var-cell-deref +
+  jolt-invoke dispatch; under direct-link such a site now binds the var's root
+  procedure once at load and calls it (see Changed). `nth` on a small vector,
+  `first` and `str` had their own dispatch overheads trimmed. `char-scan`,
+  `literals`, `string-ops`, `keyed-lookup` and `arrays` all move; the refreshed
+  scorecard is in `bench/README.md`.
+- **`aget`/`aset` on a `^doubles` parameter index the backing flvector bound
+  once at the arity's entry** instead of re-reading the checked record
+  accessor per access. A `^doubles` argument that is not a double array now
+  raises `ClassCastException` on entry, as a JVM checkcast does, whether or not
+  the body reads it. The README's earlier note that the remaining `arrays`
+  cost was flonum boxing of the loop accumulator was wrong — a Chez probe of
+  the emitted loop allocates nothing per iteration; the accessor was the cost.
 
 - **An executor enqueue wakes one worker, not all of them (#819).** The pool's
   workers and its `awaitTermination` waited on ONE condition, so every enqueue
@@ -270,6 +360,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where the JVM's queue stripes and jolt's one mutex convoys.
 
 ### Fixed
+
+- **`(unchecked-long \a)` raises `ClassCastException`.** `RT.uncheckedLongCast(Object)`
+  is `((Number) x).longValue()`, so a Character is rejected on the JVM; only
+  the int cast has a char overload, and `(unchecked-long (unchecked-int c))`
+  still works. jolt answered 97. Found by the JVM certification of new corpus
+  rows.
 
 - **A bad namespace designator says what was wrong.** `(ns-name nil)`,
   `(the-ns nil)` and `(find-ns nil)` reached a bare Chez record accessor and

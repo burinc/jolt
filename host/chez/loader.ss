@@ -322,6 +322,8 @@
 ;; runtime image that the new app will inherit.
 (define ldr-runtime-image-ns (hashtable-copy loaded-ns #f))
 (define (ldr-runtime-image-ns-copy) (hashtable-copy ldr-runtime-image-ns #f))
+;; host-contract's seed-var direct-link check reads the same boot set.
+(set! hc-seed-ns-source ldr-runtime-image-ns-copy)
 
 ;; *loaded-libs* is the other half of the loaded set: a clojure.lang.Ref that
 ;; tools.namespace and core.typed conj/disj on, and that ns-dedup-loaded? below

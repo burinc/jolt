@@ -136,7 +136,7 @@
     ((pset? x) "clojure.lang.PersistentHashSet")
     ;; array mode (insertion-ordered, small literal maps) is PersistentArrayMap;
     ;; hash mode (hash-map, or grown past the array limit) is PersistentHashMap
-    ((pmap? x) (if (pmap-order x) "clojure.lang.PersistentArrayMap"
+    ((pmap? x) (if (pmap-array? x) "clojure.lang.PersistentArrayMap"
                    "clojure.lang.PersistentHashMap"))
     ((jolt-lazyseq? x) "clojure.lang.LazySeq")
     ((empty-list-t? x) "clojure.lang.PersistentList$EmptyList")
