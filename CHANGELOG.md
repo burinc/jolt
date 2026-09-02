@@ -40,6 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`tags #clj-time/date-time will not read`), instead of leaving the reader to
   find the form and to meet the missing tag later as an unrelated
   unresolved-var error.
+- **A returned call no longer haunts a top-level throw.** The trace under an
+  error thrown at the top level of a file being loaded — or of a `-e`, a
+  `load-string`, a REPL input — opened with a frame from a fn that had returned
+  long before: `jolt.main/drop-end-of-options` under a `run -m` whose namespace
+  failed to load, a helper's tail call from the fn that called `require`, a
+  macro's helper when the expansion threw. The tail-site slot the reporter reads
+  holds the last tail call made, and nothing tail-calls a top-level form, so
+  the slot is cleared when one starts to compile and again when its compiled
+  code starts to run.
+- **Every CLI entry starts in `user`.** The built image bakes `jolt.main` and
+  loading a namespace leaves it current, so a bare `jolt -e '(str *ns*)'`
+  printed `jolt.main`, a REPL `(defn h …)` landed as `#'jolt.main/h` under a
+  prompt that said `user`, and `-main` under `run -m` ran in `jolt.main`.
+  `clojure.main` starts every entry in `user`; jolt does too now, and the REPL
+  prompt names whatever namespace is current, as `clojure.main`'s does.
 
 ## [0.8.1] - 2026-09-02
 

@@ -470,7 +470,7 @@
   ;; accumulated buffer is a complete form. Returns the (possibly multi-line)
   ;; buffer, or nil on EOF at the primary prompt.
   (loop [buf nil]
-    (print (if buf "... " "user=> ")) (flush)
+    (print (if buf "... " (str (ns-name *ns*) "=> "))) (flush)
     (let [line (read-line)]
       (cond
         (nil? line) buf                                 ; EOF: nil at primary, partial mid-form

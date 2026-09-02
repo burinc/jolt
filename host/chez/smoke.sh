@@ -527,6 +527,37 @@ else
   fails=$((fails + 1))
 fi
 
+# Every CLI entry starts in user, like clojure.main's. The image bakes jolt.main
+# at heap build, and loading a namespace leaves it current, so -e, the REPL and a
+# run's -main all evaluated in jolt.main: a REPL def landed as #'jolt.main/x
+# under a prompt that said user.
+ns_e="$($jolt -e '(defn h [] 1) (println (str *ns*) (str #'"'"'h))' 2>/dev/null)"
+if printf '%s' "$ns_e" | grep -q "^user #'user/h"; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: -e should evaluate in user (got \`$ns_e\`)"
+  fails=$((fails + 1))
+fi
+repl_ns="$(printf '(in-ns (quote foo))\n(str *ns*)\n' | $jolt repl 2>/dev/null)"
+if printf '%s' "$repl_ns" | grep -q '^foo=> "foo"'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: the REPL prompt should name the current namespace (got \`$repl_ns\`)"
+  fails=$((fails + 1))
+fi
+nsm="$(mktemp -d)"
+mkdir -p "$nsm/src/nsm"
+printf '{:paths ["src"]}\n' > "$nsm/deps.edn"
+printf '(ns nsm.core)\n(defn -main [& _] (println (str *ns*)))\n' > "$nsm/src/nsm/core.clj"
+nsm_out="$(JOLT_PWD="$nsm" $jolt run -m nsm.core 2>/dev/null | tail -1)"
+if [ "$nsm_out" = "user" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: run -m should invoke -main in user (got \`$nsm_out\`)"
+  fails=$((fails + 1))
+fi
+rm -rf "$nsm"
+
 # The runtime's shared side-tables (metadata, the variadic fixed-arity registry)
 # must survive concurrent access: a Chez hashtable is not thread-safe, and
 # unsynchronized mutation corrupts it into a SIGSEGV inside the collector or a
