@@ -22,7 +22,7 @@
   :string-model
   "jolt strings are Chez strings: codepoint-indexed, no UTF-16 surrogate pairs. count/seq/subs/nth index codepoints, so an astral character counts 1 where the JVM counts 2 surrogate units. Substrate-inherent.",
   :concurrency-model
-  "compare-and-set! uses Jolt identical?/Chez eq? identity. Reference values match the JVM, but Chez immediates such as fixnums and characters have no distinct boxes, so their CAS identity cannot reproduce JVM boxing allocation/cache boundaries. Other differences: interrupt delivery limitations, ThreadLocal inheritance, serialized STM history, and agent mid-failure await behavior",
+  "compare-and-set! uses Jolt identical?/Chez eq? identity. Reference values match the JVM, but Chez immediates such as fixnums and characters have no distinct boxes, so their CAS identity cannot reproduce JVM boxing allocation/cache boundaries",
   :restrictive
   "the JVM supports something jolt does not: mark/reset replay over a non-seekable stream. The narrow direction, so it is NOT a superset — code relying on the JVM capability has no counterpart here",
   :permissive
