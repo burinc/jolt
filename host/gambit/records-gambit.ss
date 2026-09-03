@@ -785,7 +785,7 @@
                                  " "
                                  (jolt-pr-readable (jrec-field-ref r i)))
                                acc))))))
-    (string-append "#" (jrec-tag r) "{"
+    (string-append "#" (jch-munge-segments (jrec-tag r)) "{"
       (jolt-str-join-comma entry-strs) "}")))
 
 (register-eq-arm!
@@ -1763,17 +1763,39 @@
         (let ((pi (hashtable-ref ti proto-name #f)))
           (when pi (hashtable-set! pi extend-mark #t)))))))
 
+(define (deftype-tag-for-jvm-name type-name)
+  (and (not (hashtable-ref chez-deftype-tag-set type-name #f))
+       (let ((c (jch-registered-name type-name)))
+         (and c
+              (not (string=? c type-name))
+              (hashtable-ref chez-deftype-tag-set c #f)
+              c))))
+
+(define (ns-mapped-class-tag type-name)
+  (let ((cell (var-cell-lookup (chez-current-ns) type-name)))
+    (and cell
+         (let ((v (var-cell-root cell)))
+           (and (jclass? v) (jclass-name v))))))
+
 (define (register-method type-name proto-name method-name
          fn)
-  (let* ((host (canonical-host-tag type-name))
+  (let* ((type-name (or (deftype-tag-for-jvm-name type-name)
+                        type-name))
+         (host (canonical-host-tag type-name))
          (local (string-append (chez-current-ns) "." type-name))
          (tag (cond
                 (host host)
                 ((hashtable-ref chez-deftype-tag-set local #f) local)
                 ((hashtable-ref chez-deftype-tag-set type-name #f)
                  type-name)
+                ((ns-mapped-class-tag type-name))
                 ((hashtable-ref chez-simple-name-tag type-name #f))
-                (else local))))
+                (else
+                 (throw-jvm
+                   'IllegalArgumentException
+                   (string-append
+                     "Unable to resolve classname: "
+                     type-name))))))
     (register-protocol-method tag proto-name method-name fn)
     (mark-extend! tag proto-name)
     jolt-nil))
@@ -2106,15 +2128,16 @@
                          (rd-class-method-hook tag method-name rest))))
            (if (pair? hit)
                (car hit)
-               (cond
-                 ((or (string=? method-name "getName")
-                      (string=? method-name "getCanonicalName")
-                      (string=? method-name "getTypeName"))
-                  tag)
-                 ((string=? method-name "getSimpleName") (last-dot tag))
-                 ((string=? method-name "toString")
-                  (string-append "class " tag))
-                 (else (dispatch-miss obj method-name rest)))))))
+               (let ((jvm (jch-munge-segments tag)))
+                 (cond
+                   ((or (string=? method-name "getName")
+                        (string=? method-name "getCanonicalName")
+                        (string=? method-name "getTypeName"))
+                    jvm)
+                   ((string=? method-name "getSimpleName") (last-dot jvm))
+                   ((string=? method-name "toString")
+                    (string-append "class " jvm))
+                   (else (dispatch-miss obj method-name rest))))))))
       ((jolt-multifn? obj)
        (cond
          ((string=? method-name "addMethod")
@@ -2723,7 +2746,13 @@
 
 (def-var! "clojure.core" "extenders" extenders)
 
-(def-var! "jolt.host" "type-satisfies?" type-satisfies?)
+(def-var!
+  "jolt.host"
+  "type-satisfies?"
+  (lambda (type-tag proto)
+    (type-satisfies?
+      (or (deftype-tag-for-jvm-name type-tag) type-tag)
+      proto)))
 
 (def-var!
   "jolt.host"

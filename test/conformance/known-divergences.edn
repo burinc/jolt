@@ -832,7 +832,39 @@
    :jolt "false — a PersistentVector"
    :check {:expr "(instance? clojure.lang.IChunk (chunk (chunk-buffer 1)))"
            :jvm "true"
-           :jolt "false"}}]
+           :jolt "false"}}
+  ;; A deftype's class name on the JVM is its namespace MUNGED (rf.def_two.R3 for
+  ;; a type in rf.def-two); the namespace as written names no class there. jolt
+  ;; registers the type under the written spelling — what its values report and
+  ;; what every ns-qualified lookup keys on — and answers the JVM spelling at
+  ;; every name seam (resolve, :import, Class/forName, a class symbol in code,
+  ;; the record-literal reader, extend-protocol; class-hierarchy.ss
+  ;; jch-registered-name). The written spelling keeps answering too, a superset:
+  ;; it is what jolt printed for every record before the JVM spelling became the
+  ;; presented one, so data and code written against it still read.
+  {:category :host-model
+   :behavior "(resolve 'rf.def-two.R3) — the namespace-as-written spelling of a deftype class"
+   :jvm "nil; no class has that name, the class is rf.def_two.R3"
+   :jolt "the class, the same token rf.def_two.R3 resolves to"
+   :check {:expr "(do (ns rzc.dash-doc) (defrecord R [a]) (in-ns 'user) (some? (resolve 'rzc.dash-doc.R)))"
+           :jvm "false"
+           :jolt "true"}
+   :note "Superset. .getName, str and the record literal present the JVM spelling, so a record round-trips through the JVM's reader; the written spelling is accepted, never emitted."}
+  ;; extend-type/extend-protocol on a name that resolves to nothing is "Unable to
+  ;; resolve classname" on the JVM at load time, and on jolt too for a bare name.
+  ;; A DOTTED name jolt does not model is filed verbatim instead: that is the seam
+  ;; a library declares its own classes through (__register-class!, whose tags-fn
+  ;; reports the exact string; protocols.ss canonical-host-tag), and a JVM class
+  ;; jolt does not carry (java.sql.Connection) loads rather than aborting the
+  ;; namespace — the extension simply never fires, since no value reports the tag.
+  {:category :host-model
+   :behavior "(extend-protocol P no.such.Thing …) — a dotted classname the host does not model"
+   :jvm "throws IllegalArgumentException: Unable to resolve classname: no.such.Thing"
+   :jolt "registers under the name verbatim and returns; no value ever dispatches to it"
+   :check {:expr "(try (eval '(do (defprotocol PXD (pxd [x])) (extend-protocol PXD no.such.Thing (pxd [_] 1)))) :ok (catch Throwable _ :threw))"
+           :jvm ":threw"
+           :jolt ":ok"}
+   :note "A bare unresolvable name (NoSuchThing) throws on both, pinned in the corpus (protocols / extend-type resolution). The dotted leniency is the __register-class! contract."}]
  :entries
  [;; Wherever a syntax-quote's CONSTRUCTION CODE becomes a value rather than
   ;; being compiled — a nested backtick, a quoted one, a macro's argument —
