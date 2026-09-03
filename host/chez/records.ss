@@ -625,4 +625,7 @@
                       (cons (string-append (jolt-pr-readable (vector-ref fkeys i)) " "
                                            (jolt-pr-readable (jrec-field-ref r i)))
                             acc))))))
-    (string-append "#" (jrec-tag r) "{" (jolt-str-join-comma entry-strs) "}")))
+    ;; the JVM spelling of the tag (my_app.core.Foo for a type in my-app.core):
+    ;; what the JVM's reader resolves a record literal by, and what its own
+    ;; printer writes. jolt's reader takes either spelling (reader.ss).
+    (string-append "#" (jch-munge-segments (jrec-tag r)) "{" (jolt-str-join-comma entry-strs) "}")))

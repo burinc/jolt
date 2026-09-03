@@ -292,7 +292,15 @@
   (java-hash-combine (java-string-hash name) (if ns (java-string-hash ns) 0)))
 
 (define (jolt-string-method method s rest)
-  (define (arg n) (list-ref rest n))
+  ;; A missing argument is the JVM's reflective miss (dispatch-miss: a 0-arg read
+  ;; reports as a field, more as a method of that arity), not an index fault from
+  ;; reading past the argument list — that left the call uncatchable as the
+  ;; IllegalArgumentException it is.
+  (define (arg n)
+    (let loop ((l rest) (i n))
+      (cond ((null? l) (dispatch-miss s method rest))
+            ((fx=? i 0) (car l))
+            (else (loop (cdr l) (fx- i 1))))))
    (cond
     ;; hot-first: length/charAt/indexOf/startsWith dominate library interop
     ;; (honeysql, string codecs); a miss at the bottom of the chain cost ~100ns
@@ -719,11 +727,24 @@
 ;; import: bring a deftype/defrecord from another ns into the current one. A spec
 ;; [from-ns Type ...] binds each Type's ctor closure under the current ns, so its
 ;; (Type. ...) constructor (host-new resolves it as a var) works after :import.
+;; A bare fully-qualified symbol spec — (import 'java.util.Date), or java.util.Date
+;; in an ns :import clause — is the (java.util Date) list it abbreviates. A name
+;; with no package (a default-package class the JVM would look up) binds nothing.
+(define (import-spec-of-fqn nm)
+  (let ((i (let loop ((i (fx- (string-length nm) 1)))
+             (cond ((fx<? i 0) #f)
+                   ((char=? (string-ref nm i) #\.) i)
+                   (else (loop (fx- i 1)))))))
+    (if i
+        (list (jolt-symbol #f (substring nm 0 i))
+              (jolt-symbol #f (substring nm (fx+ i 1) (string-length nm))))
+        '())))
 (define (chez-runtime-import . specs)
   (for-each
     (lambda (spec)
       (let ((items (cond ((pvec? spec) (seq->list spec))
                          ((or (cseq? spec) (empty-list-t? spec)) (seq->list spec))
+                         ((symbol-t? spec) (import-spec-of-fqn (symbol-t-name spec)))
                          (else '()))))
         (when (and (pair? items) (symbol-t? (car items)))
           (let ((from (symbol-t-name (car items))))

@@ -862,7 +862,13 @@
 ;; #a.b.C[..] -> (a.b/->C  (datafy val)...).  The factory call compiles like any
 ;; invoke; defrecord interns map->C/->C in the type's ns.
 (define (rdr-record-ctor-form tok form)
-  (let* ((di (rdr-string-rindex-char tok #\.))
+  ;; The JVM's reader resolves the CLASS the literal names, and the JVM spelling
+  ;; of a type in a dashed namespace is munged (#my_app.core.Foo{…} — what the
+  ;; JVM printed it as). The class graph maps that back to the registered name,
+  ;; whose namespace holds the factory; a name it does not know (the type's ns
+  ;; not loaded yet) is taken as written, as before.
+  (let* ((tok (or (jch-registered-name tok) tok))
+         (di (rdr-string-rindex-char tok #\.))
          (ns (substring tok 0 di))
          (simple (substring tok (+ di 1) (string-length tok))))
     (cond

@@ -141,11 +141,14 @@
             (let ((hit (and rd-class-method-hook (rd-class-method-hook tag method-name rest))))
               (if (pair? hit)
                   (car hit)                       ; the hook wraps, so a nil/#f answer is still a hit
-                  (cond ((or (string=? method-name "getName") (string=? method-name "getCanonicalName")
-                             (string=? method-name "getTypeName")) tag)
-                        ((string=? method-name "getSimpleName") (last-dot tag))
-                        ((string=? method-name "toString") (string-append "class " tag))
-                        (else (dispatch-miss obj method-name rest)))))))
+                  ;; presented in the JVM spelling of the tag (my_app.core.Foo for
+                  ;; a type in my-app.core), as the class token's own methods are
+                  (let ((jvm (jch-munge-segments tag)))
+                    (cond ((or (string=? method-name "getName") (string=? method-name "getCanonicalName")
+                               (string=? method-name "getTypeName")) jvm)
+                          ((string=? method-name "getSimpleName") (last-dot jvm))
+                          ((string=? method-name "toString") (string-append "class " jvm))
+                          (else (dispatch-miss obj method-name rest))))))))
       ;; clojure.lang.MultiFn interop on a defmulti value: addMethod/removeMethod/
       ;; getMethod/getMethodTable, the same table (defmethod) fills — schema's
       ;; abstract-map registers dispatch methods by calling .addMethod directly.
@@ -686,7 +689,13 @@
 (def-var! "clojure.core" "protocol-dispatch3" (lambda (pn mn obj a b) (protocol-dispatch3 pn mn obj a b)))
 (def-var! "clojure.core" "satisfies?" jolt-satisfies?)
 (def-var! "clojure.core" "extenders" extenders)
-(def-var! "jolt.host" "type-satisfies?" type-satisfies?)
+;; extends? asks with the name a class token PRESENTS (.getName: the JVM spelling,
+;; my_app.core.Foo), and the registry is keyed by the tag (my-app.core.Foo). Map
+;; it back here, at the jolt-visible entry only — the Scheme callers above hand
+;; over tags already, and this keeps the satisfies? path at its measured cost.
+(def-var! "jolt.host" "type-satisfies?"
+  (lambda (type-tag proto)
+    (type-satisfies? (or (deftype-tag-for-jvm-name type-tag) type-tag) proto)))
 ;; The dispatch key for the protocol SYM names — resolved the way any other
 ;; reference resolves, through :refer and :as — or nil when the symbol names no
 ;; protocol (a host class or interface, which keeps its bare name). deftype /

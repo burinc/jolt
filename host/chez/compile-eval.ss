@@ -110,11 +110,19 @@
 ;; every pair that meets only after escaping (a? and a_QMARK_).
 (define (compiler-munge s)
   (class-munge-name (if (string? s) s (jolt-str-render-one s))))
+;; clojure.lang.Compiler/eval — evaluate a form in the current namespace, which is
+;; clojure.core/eval below. typedclojure's analyzer calls the static directly
+;; ((. clojure.lang.Compiler (eval frm))) so a user rebinding of eval cannot
+;; recurse into it. The JVM's second arity takes a fresh-loader flag that has no
+;; counterpart here.
+(define (compiler-eval form . _)
+  (jolt-compile-eval-form form (chez-current-ns)))
 (let ((members (list (cons "LINE" compiler-line-cell) (cons "COLUMN" compiler-column-cell)
                      (cons "specials" compiler-specials)
                      (cons "CHAR_MAP" compiler-char-map)
                      (cons "munge" compiler-munge)
-                     (cons "demunge" compiler-demunge))))
+                     (cons "demunge" compiler-demunge)
+                     (cons "eval" compiler-eval))))
   (register-class-statics! "Compiler" members)
   (register-class-statics! "clojure.lang.Compiler" members))
 

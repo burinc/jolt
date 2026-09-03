@@ -868,21 +868,16 @@
          (or (char=? (string-ref nm i) #\.) (loop (+ i 1))))))
 ;; A namespace with a hyphen munges to an underscore in the package name, so a
 ;; record defined in my-app.core is my_app.core.Foo on the JVM. jolt keeps the
-;; namespace as written, so a forName of the munged name has to demunge to find
-;; it — that is the name a library computes from (munge (str *ns*)), and it is how
-;; a #my_app.core.Foo[…] record literal names its class.
-(define (forname-demunged nm)
-  (and (let loop ((i 0))
-         (cond ((>= i (string-length nm)) #f)
-               ((char=? (string-ref nm i) #\_) #t)
-               (else (loop (+ i 1)))))
-       (let ((d (list->string (map (lambda (c) (if (char=? c #\_) #\- c)) (string->list nm)))))
-         (and (forname-known? d) d))))
+;; namespace as written, so a forName of the munged name goes through the class
+;; graph's registered-name lookup (class-hierarchy.ss jch-registered-name, the
+;; one canonicalizer every name seam shares) — that is the name a library
+;; computes from (munge (str *ns*)). The interned token, so the answer is the
+;; very token the type's values report.
 (define (class-for-name nm . _)
   (cond
     ((and (> (string-length nm) 0) (char=? (string-ref nm 0) #\[)) nm)
-    ((forname-known? nm) (make-class-obj nm))
-    ((forname-demunged nm) => make-class-obj)
+    ((forname-known? nm) (jolt-class-for nm))
+    ((let ((c (jch-registered-name nm))) (and c (forname-known? c) c)) => jolt-class-for)
     (else (jolt-throw (jolt-host-throwable "java.lang.ClassNotFoundException" nm)))))
 (register-class-statics! "Class" (list (cons "forName" class-for-name)))
 ;; clojure.lang.RT's own class lookups (the analyzer's resolve path): the same

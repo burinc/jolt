@@ -656,12 +656,36 @@
     (let ((ti (hashtable-ref type-registry tag #f)))
       (when ti (let ((pi (hashtable-ref ti proto-name #f)))
                  (when pi (hashtable-set! pi extend-mark #t)))))))
+;; A deftype named by its JVM spelling — the namespace munged, rf.def_two.R3 for
+;; the tag rf.def-two.R3 — is what a library computes from (namespace-munge *ns*)
+;; and how typedclojure's subtype table spells every type-rep class. The tag.
+(define (deftype-tag-for-jvm-name type-name)
+  (and (not (hashtable-ref chez-deftype-tag-set type-name #f))
+       (let ((c (jch-registered-name type-name)))
+         (and c (not (string=? c type-name))
+              (hashtable-ref chez-deftype-tag-set c #f)
+              c))))
+;; The class the extending namespace MAPS type-name to: an :import binds the short
+;; name to the class token (natives-str.ss chez-runtime-import), and its registered
+;; name is the tag. This is the JVM's first question for a bare name
+;; (Compiler.maybeClass reads the ns mapping before trying Class.forName). A var
+;; holding a class answers too — a superset: the JVM reads only a class mapping
+;; here and rejects the var.
+(define (ns-mapped-class-tag type-name)
+  (let ((cell (var-cell-lookup (chez-current-ns) type-name)))
+    (and cell
+         (let ((v (var-cell-root cell)))
+           (and (jclass? v) (jclass-name v))))))
 (define (register-method type-name proto-name method-name fn)
-  (let* ((host (canonical-host-tag type-name))
+  (let* ((type-name (or (deftype-tag-for-jvm-name type-name) type-name))
+         (host (canonical-host-tag type-name))
          (local (string-append (chez-current-ns) "." type-name))
          ;; a host class -> its canonical tag; a deftype defined in THIS ns -> the
-         ;; local tag; an :import-ed deftype from another ns -> its real tag via the
-         ;; simple-name index; otherwise the local tag (a forward extend).
+         ;; local tag; a deftype the ns imported -> the class it maps; a deftype
+         ;; from another ns by simple name -> its tag via the simple-name index.
+         ;; Anything else is "Unable to resolve classname", as the JVM raises at
+         ;; load time — never a registration under a tag no value carries, which
+         ;; surfaced as "No method" at the first dispatch instead.
          (tag (cond (host host)
                     ((hashtable-ref chez-deftype-tag-set local #f) local)
                     ;; a deftype named by its FULLY-QUALIFIED name — the tag
@@ -671,8 +695,10 @@
                     ;; prefixed with the EXTENDING ns and the impl is filed under
                     ;; a tag no value carries.
                     ((hashtable-ref chez-deftype-tag-set type-name #f) type-name)
+                    ((ns-mapped-class-tag type-name))
                     ((hashtable-ref chez-simple-name-tag type-name #f))
-                    (else local))))
+                    (else (throw-jvm 'IllegalArgumentException
+                            (string-append "Unable to resolve classname: " type-name))))))
     (register-protocol-method tag proto-name method-name fn)
     (mark-extend! tag proto-name)
     jolt-nil))

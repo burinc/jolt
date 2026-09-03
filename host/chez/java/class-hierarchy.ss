@@ -48,6 +48,12 @@
 ;; revalidation could never catch.
 (define jch-cache-mutex (make-mutex))
 (define jch-graph-epoch 0)
+;; Runs after a class is registered, OUTSIDE jch-cache-mutex, with its name. The
+;; class-token interner (host-static-classes.ss) installs it to drop a token it
+;; interned under the JVM spelling of a deftype before the deftype existed. Outside
+;; the mutex because the interner takes its own lock first and then asks the graph,
+;; and the hook path must not take the two in the other order.
+(define jch-class-registered-hook (lambda (name) (void)))
 (define jch-closure-cache (make-hashtable string-hash string=?))
 (define jch-tags-cache (make-hashtable string-hash string=?))
 ;; call with jch-cache-mutex HELD
@@ -95,7 +101,9 @@
     (hashtable-set! jvm-class-parents name supers)
     (set! jch-known-cache #f)
     (set! jch-simple->fqn-cache #f)
-    (jch-invalidate!/locked)))
+    (set! jch-jvm-name-cache #f)
+    (jch-invalidate!/locked))
+  (jch-class-registered-hook name))
 
 ;; transitive supers of NAME (canonical), excluding NAME and Object; Object is the
 ;; universal root supplied by callers. Breadth-first, deduped, stable order.
@@ -211,6 +219,38 @@
 (define (jch-known-exact? wanted)
   (and (hashtable-ref (jch-known-table) wanted #f) #t))
 
+;; JVM spelling -> registered name, for every class the graph registers under a
+;; name that is not its JVM spelling. A deftype/defrecord in ns rf.def-two is
+;; registered as rf.def-two.R3 — the namespace as written, which is what its
+;; values report and what ns-qualified lookups key on — and is rf.def_two.R3 on
+;; the JVM, where Compiler.munge turns the dash into an underscore. Host classes
+;; never differ. Same build-into-a-local-then-publish rule as jch-known-table
+;; above, for the same reason, and invalidated at the same sites.
+(define jch-jvm-name-cache #f)
+(define (jch-jvm-name-table)
+  (or jch-jvm-name-cache
+      (jolt-with-mutex jch-cache-mutex
+        (or jch-jvm-name-cache
+            (let ((t (make-hashtable string-hash string=?)))
+              (let-values (((keys vals) (hashtable-entries jvm-class-parents)))
+                (vector-for-each
+                 (lambda (k)
+                   (let ((m (jch-munge-segments k)))
+                     (unless (string=? m k) (hashtable-set! t m k))))
+                 keys))
+              (set! jch-jvm-name-cache t)
+              t)))))
+;; The name jolt registers a class under, given any spelling the JVM accepts for
+;; it: the registration itself, else the registered name whose JVM spelling is
+;; NM. #f for a class the graph models under neither. Every seam that takes a
+;; class NAME from source asks this — resolve, a class symbol in code (through
+;; the token interner), :import, Class/forName, the record-literal reader,
+;; extend-protocol — so rf.def_two.R3 and rf.def-two.R3 are one class everywhere.
+(define (jch-registered-name nm)
+  (cond ((hashtable-ref (jch-known-table) nm #f) nm)
+        ((hashtable-ref (jch-jvm-name-table) nm #f))
+        (else #f)))
+
 ;; simple last-segment -> canonical FQN for a modeled class (first registered
 ;; wins). Lets a simple exception name (from chez-condition-exc-class) resolve to
 ;; its graph key so the exception hierarchy answers through the one graph.
@@ -249,7 +289,9 @@
     (jolt-with-mutex jch-cache-mutex
       (jch-register-supers!-inner name supers)
       (set! jch-known-cache #f)
-      (set! jch-simple->fqn-cache #f))))
+      (set! jch-simple->fqn-cache #f)
+      (set! jch-jvm-name-cache #f))
+    (jch-class-registered-hook name)))
 
 ;; throw-jvm (rt.ss) resolves an unlisted simple exception name through this graph
 ;; now that it exists — so (throw-jvm 'RuntimeException …) reports

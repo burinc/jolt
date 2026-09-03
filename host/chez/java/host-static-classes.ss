@@ -1815,6 +1815,13 @@
 (define (make-class-obj name) (make-jhost "class" (vector name)))
 (define (jclass? x) (and (jhost? x) (string=? (jhost-tag x) "class")))
 (define (jclass-name x) (vector-ref (jhost-state x) 0))
+;; The name a class token PRESENTS — .getName, toString, print: the JVM spelling.
+;; A deftype's registered name is its namespace as written (rf.def-two.R3); the
+;; JVM munges the dash (rf.def_two.R3), and that is the spelling a record literal
+;; must print in for the JVM's reader to find the class. Every other name is
+;; already its JVM spelling (jch-munge-segments is the identity on it). Lookups
+;; keep asking jclass-name: the registered name is the identity.
+(define (jclass-jvm-name x) (jch-munge-segments (jclass-name x)))
 
 ;; Global interner: class tokens resolve to the same eq? object per name, so
 ;; identity, =, and defmethod table keys are stable. Called by the analyzer for
@@ -1832,10 +1839,36 @@
   (or (hashtable-ref jolt-class-for-tbl name #f)
       (jolt-with-mutex hsc-mu
         (or (hashtable-ref jolt-class-for-tbl name #f)
-            (let ((obj (make-class-obj name)))
+            ;; First sight of a name asks the class graph for its registered
+            ;; spelling, so the JVM spelling of a deftype in a dashed namespace
+            ;; (rf.def_two.R3 for rf.def-two.R3 — what resolve, :import, a class
+            ;; symbol in code and Class/forName all arrive with) interns to the
+            ;; ONE token the type's values report; = on tokens compares names.
+            ;; A name the graph does not know is its own token: the syntactic
+            ;; class model, unchanged.
+            (let* ((reg (jch-registered-name name))
+                   (canon (if (and reg (not (string=? reg name))) reg name))
+                   (obj (or (hashtable-ref jolt-class-for-tbl canon #f)
+                            (let ((o (make-class-obj canon)))
+                              (hashtable-set! jolt-class-for-tbl canon o)
+                              o))))
               (hashtable-set! jolt-class-for-tbl name obj)
               obj)))))
 (def-var! "jolt.host" "jolt-class-for" jolt-class-for)
+;; A deftype registered AFTER its JVM spelling was interned — an :import or a
+;; class symbol compiled ahead of the defining namespace, which the JVM rejects
+;; but jolt's syntactic model lets through — left a token under that spelling
+;; that is not the type's. Drop it, so the next lookup re-interns through the
+;; graph. Runs outside the graph's mutex (class-hierarchy.ss), so the
+;; hsc-mu -> jch-cache-mutex order jolt-class-for takes is never inverted.
+(set! jch-class-registered-hook
+  (lambda (name)
+    (let ((m (jch-munge-segments name)))
+      (unless (string=? m name)
+        (jolt-with-mutex hsc-mu
+          (let ((tok (hashtable-ref jolt-class-for-tbl m #f)))
+            (when (and tok (not (string=? (jclass-name tok) name)))
+              (hashtable-delete! jolt-class-for-tbl m))))))))
 
 (define (class-key x)
   (cond ((jclass? x) (jclass-name x))
@@ -1867,18 +1900,18 @@
 ;; Class.toString says which kind it is: "interface java.util.List", "class java.lang.String".
 (register-str-render! jclass?
   (lambda (x) (string-append (if (jch-interface? (jclass-name x)) "interface " "class ")
-                             (jclass-name x))))
-(register-pr-arm! jclass? (lambda (x) (jclass-name x)))
+                             (jclass-jvm-name x))))
+(register-pr-arm! jclass? (lambda (x) (jclass-jvm-name x)))
 ;; print/println of a Class prints the bare name (getName), like pr — the JVM's
 ;; print-method for Class ignores *print-readably*. Only str is "class <name>".
 (let ((prev (var-deref "clojure.core" "__print1")))
   (def-var! "clojure.core" "__print1"
-    (lambda (x) (if (jclass? x) (jclass-name x) (jolt-invoke1 prev x)))))
+    (lambda (x) (if (jclass? x) (jclass-jvm-name x) (jolt-invoke1 prev x)))))
 (register-host-methods! "class"
-  (list (cons "getName" (lambda (self) (jclass-name self)))
-        (cons "getCanonicalName" (lambda (self) (hsc-canonical-name (jclass-name self))))
-        (cons "getSimpleName" (lambda (self) (hsc-simple-name (jclass-name self))))
-        (cons "toString" (lambda (self) (string-append "class " (jclass-name self))))
+  (list (cons "getName" (lambda (self) (jclass-jvm-name self)))
+        (cons "getCanonicalName" (lambda (self) (hsc-canonical-name (jclass-jvm-name self))))
+        (cons "getSimpleName" (lambda (self) (hsc-simple-name (jclass-jvm-name self))))
+        (cons "toString" (lambda (self) (string-append "class " (jclass-jvm-name self))))
         (cons "isArray" (lambda (self) (let ((n (jclass-name self)))
                                          (and (fx>? (string-length n) 0) (char=? (string-ref n 0) #\[)))))
         ;; Class.getComponentType: for an array class returns the element class;
@@ -2776,8 +2809,13 @@
   ;; resolve handed back a token for a class that exists nowhere — the opposite
   ;; of the feature-detection answer this is here to give.
   (and (hc-fq-class-name? nm)
-       (or (jch-known-exact? nm) (host-class-registered? nm))
-       (jolt-class-for nm)))
+       (let ((c (if (or (jch-known-exact? nm) (host-class-registered? nm))
+                    nm
+                    ;; the JVM spelling of a deftype in a dashed namespace
+                    ;; (rf.def_two.R3), what a library builds from
+                    ;; (namespace-munge *ns*) — the same class, one token
+                    (jch-registered-name nm))))
+         (and c (jolt-class-for c)))))
 (define (rsv-through v sym ns)
   (cond ((jolt-nil? v)
          (or (and (symbol-t? sym) (not (string? (symbol-t-ns sym)))

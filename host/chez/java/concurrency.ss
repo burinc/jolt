@@ -832,6 +832,14 @@
 ;; object core's delay does and derefs through the same force.
 (register-class-ctor! "clojure.lang.Delay" (lambda (thunk) (jolt-make-delay thunk)))
 (register-class-ctor! "Delay" (lambda (thunk) (jolt-make-delay thunk)))
+;; (clojure.lang.LazySeq. thunk) — the cell core's lazy-seq builds, forced once
+;; through the same bridge (lazy-bridge.ss: the thunk yields the body coerced to
+;; cells). fully-satisfies' safe-locals-clearing spells its lazy-seq as this
+;; constructor, exactly as it spells its delay above.
+(define (lazyseq-ctor f)
+  (jolt-make-lazy-seq (lambda () (jolt-coll->cells (jolt-invoke0 f)))))
+(register-class-ctor! "clojure.lang.LazySeq" lazyseq-ctor)
+(register-class-ctor! "LazySeq" lazyseq-ctor)
 (def-var! "clojure.core" "delay?" jolt-delay?)
 (def-var! "clojure.core" "deref" jolt-deref)
 
