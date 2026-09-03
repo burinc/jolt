@@ -821,7 +821,18 @@
    :check {:expr "(contains? (set (map #(.getName %) (.getMethods String))) \"substring\")"
            :jvm "true"
            :jolt "false"}
-   :note "A class whose methods jolt models as a cond rather than a table under-reports; a member that IS registered reports its JVM class (java.lang.reflect.Method/Field/Constructor) and prints like one. getMethod raises NoSuchMethodException only for a name no registry has."}]
+   :note "A class whose methods jolt models as a cond rather than a table under-reports; a member that IS registered reports its JVM class (java.lang.reflect.Method/Field/Constructor) and prints like one. getMethod raises NoSuchMethodException only for a name no registry has."}
+  ;; chunk seals a ChunkBuffer into a plain vector where the JVM builds an
+  ;; ArrayChunk, an IChunk. Every consumer — chunk-cons, chunk-first, nth —
+  ;; reads the Indexed block it is, so only the class differs. IChunk itself
+  ;; resolves and is an Indexed interface, as on the JVM; nothing jolt makes is one.
+  {:category :seq-type-model
+   :behavior "(instance? clojure.lang.IChunk (chunk (chunk-buffer 1)))"
+   :jvm "true — an ArrayChunk"
+   :jolt "false — a PersistentVector"
+   :check {:expr "(instance? clojure.lang.IChunk (chunk (chunk-buffer 1)))"
+           :jvm "true"
+           :jolt "false"}}]
  :entries
  [;; Wherever a syntax-quote's CONSTRUCTION CODE becomes a value rather than
   ;; being compiled — a nested backtick, a quoted one, a macro's argument —

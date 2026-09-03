@@ -78,11 +78,15 @@
 (define (str-has-dollar? s)
   (let loop ((i 0)) (and (< i (string-length s)) (or (char=? (string-ref s i) #\$) (loop (+ i 1))))))
 
+;; A row registered with NO supers (java.util.Map$Entry, a marker interface) is
+;; still a row: only a name the table has never seen falls to the fn rule. It
+;; used to read an empty row as absent, and a $ in the name then made the
+;; interface a fn — (supers java.util.Map$Entry) answered the AFunction chain.
 (define (jch-direct-supers name)
-  (let ((direct (hashtable-ref jvm-class-parents name '())))
-    (if (pair? direct) direct
-        (if (str-has-dollar? name) '("clojure.lang.AFunction")
-            '()))))
+  (let ((direct (hashtable-ref jvm-class-parents name #f)))
+    (cond (direct direct)
+          ((str-has-dollar? name) '("clojure.lang.AFunction"))
+          (else '()))))
 
 ;; Replace a class's direct supers outright (defrecord re-declares the row its
 ;; deftype half registered). Same cache invalidation as a register.
@@ -269,7 +273,9 @@
             "clojure.lang.Reversible" "clojure.lang.Indexed" "clojure.lang.Counted"
             "clojure.lang.Named" "clojure.lang.Fn" "clojure.lang.IFn"
             "clojure.lang.IPersistentCollection" "clojure.lang.ISeq"
-            "clojure.lang.IChunkedSeq"
+            "clojure.lang.IChunkedSeq" "clojure.lang.IChunk"
+            "clojure.lang.IPending" "clojure.lang.IRef" "clojure.lang.IAtom"
+            "clojure.lang.IAtom2" "clojure.lang.IBlockingDeref" "clojure.lang.IMapEntry"
             "clojure.lang.Associative" "clojure.lang.ILookup"
             "clojure.lang.IPersistentStack" "clojure.lang.IPersistentVector"
             "clojure.lang.IPersistentMap" "clojure.lang.IPersistentSet"
@@ -343,9 +349,12 @@
             "java.time.Year" "java.time.YearMonth" "java.time.zone.ZoneRules"
             "java.time.ZonedDateTime" "java.time.ZoneOffset" "java.util.Base64"
             "java.util.Locale" "java.util.regex.Pattern" "java.util.UUID"
+            ;; clojure.lang's final classes, from their declarations
+            "clojure.lang.ChunkBuffer" "clojure.lang.Volatile" "clojure.lang.Reduced"
             ))
 (for-each jch-mark-abstract!
           '(
+            "clojure.lang.AMapEntry"
             "java.io.InputStream" "java.io.OutputStream" "java.io.Reader"
             "java.io.Writer" "java.lang.Number" "java.lang.VirtualMachineError"
             "java.nio.ByteBuffer" "java.nio.charset.Charset" "java.nio.file.FileSystem"
@@ -459,12 +468,23 @@
 ;; scalars / named / callable
 (jch-register-supers! "clojure.lang.Keyword" '("clojure.lang.IFn" "clojure.lang.Named" "java.lang.Comparable"))
 (jch-register-supers! "clojure.lang.Symbol" '("clojure.lang.IObj" "clojure.lang.IFn" "clojure.lang.Named" "java.lang.Comparable"))
-(jch-register-supers! "clojure.lang.Var" '("clojure.lang.IDeref" "clojure.lang.IFn"))
-;; Atom extends ARef, and ARef implements IRef — so an atom IS an IRef, not just
-;; an IDeref. IRef itself extends IDeref, so IDeref still holds transitively.
-(jch-register-supers! "clojure.lang.Atom" '("clojure.lang.IRef"))
-(jch-register-supers! "clojure.lang.Ref" '("clojure.lang.IRef"))
+;; The reference types extend ARef, which implements IRef — so each IS an IRef,
+;; not just an IDeref (IRef extends IDeref, so that still holds transitively).
+;; An atom is also the IAtom2 swap/reset surface; Ref and Var are callable.
 (jch-register-supers! "clojure.lang.IRef" '("clojure.lang.IDeref"))
+(jch-register-supers! "clojure.lang.IAtom" '())
+(jch-register-supers! "clojure.lang.IAtom2" '("clojure.lang.IAtom"))
+(jch-register-supers! "clojure.lang.Atom" '("clojure.lang.IRef" "clojure.lang.IAtom2"))
+(jch-register-supers! "clojure.lang.Ref" '("clojure.lang.IRef" "clojure.lang.IFn" "java.lang.Comparable"))
+(jch-register-supers! "clojure.lang.Var" '("clojure.lang.IRef" "clojure.lang.IFn"))
+(jch-register-supers! "clojure.lang.Agent" '("clojure.lang.IRef"))
+;; the boxes: Volatile and Reduced are plain derefs, a Delay is a pending one.
+;; IBlockingDeref is the timed deref a promise or future answers (their reify
+;; classes register in concurrency.ss, beside the values that carry them).
+(jch-register-supers! "clojure.lang.IBlockingDeref" '())
+(jch-register-supers! "clojure.lang.Volatile" '("clojure.lang.IDeref"))
+(jch-register-supers! "clojure.lang.Reduced" '("clojure.lang.IDeref"))
+(jch-register-supers! "clojure.lang.Delay" '("clojure.lang.IDeref" "clojure.lang.IPending"))
 (jch-register-supers! "clojure.lang.Ratio" '("java.lang.Number" "java.lang.Comparable"))
 (jch-register-supers! "clojure.lang.BigInt" '("java.lang.Number"))
 (jch-register-supers! "java.lang.String" '("java.lang.CharSequence" "java.lang.Comparable"))
@@ -601,10 +621,18 @@
 (jch-register-supers! "java.util.StringTokenizer" '())
 (jch-register-supers! "java.nio.charset.Charset" '())
 (jch-register-supers! "java.util.Base64" '())
-;; MapEntry is an APersistentVector that also implements java.util.Map.Entry —
-;; libraries (orchard.print) dispatch entries via (instance? java.util.Map$Entry e).
-(jch-register-supers! "clojure.lang.MapEntry" '("clojure.lang.APersistentVector" "java.util.Map$Entry"))
+;; MapEntry extends AMapEntry: an APersistentVector that is also an IMapEntry, the
+;; clojure.lang view of java.util.Map.Entry — so the vector checks and
+;; (instance? java.util.Map$Entry e) (orchard.print) both hold through one chain.
+(jch-register-supers! "clojure.lang.IMapEntry" '("java.util.Map$Entry"))
+(jch-register-supers! "clojure.lang.AMapEntry" '("clojure.lang.APersistentVector" "clojure.lang.IMapEntry"))
+(jch-register-supers! "clojure.lang.MapEntry" '("clojure.lang.AMapEntry"))
 (jch-register-supers! "java.util.Map$Entry" '())
+;; chunk building: a ChunkBuffer is Counted, and IChunk — the block chunk seals
+;; one into on the JVM — is Indexed. jolt seals a chunk into a plain vector, so
+;; nothing here is an IChunk (known-divergences, :seq-type-model).
+(jch-register-supers! "clojure.lang.ChunkBuffer" '("clojure.lang.Counted"))
+(jch-register-supers! "clojure.lang.IChunk" '("clojure.lang.Indexed"))
 (jch-register-supers! "clojure.lang.Namespace" '())
 (jch-register-supers! "java.util.regex.Pattern" '())
 (jch-register-supers! "java.net.URI" '())
