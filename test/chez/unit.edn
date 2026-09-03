@@ -2391,4 +2391,29 @@
   ;; collect when multiple threads are active"; the adapter retries and then
   ;; degrades to a no-op instead.
   {:suite "concurrency" :expr "(let [stop (atom false) f (future (loop [] (when-not @stop (recur))))] (try (do (jolt.host/gc-full!) :ok) (finally (reset! stop true))))" :expected ":ok"}
+  ;; The clojure.lang reference, box, entry and chunk classes typed.ann.clojure
+  ;; annotates: each resolves, sits in the class graph under its JVM supers, and
+  ;; names the jolt value that implements it — so instance?, supers, protocol
+  ;; dispatch and Class/forName all answer from the one graph.
+  {:suite "class-lattice" :expr "(vec (remove (comp some? resolve) '[clojure.lang.Agent clojure.lang.AMapEntry clojure.lang.ChunkBuffer clojure.lang.IAtom clojure.lang.IAtom2 clojure.lang.IBlockingDeref clojure.lang.IChunk clojure.lang.IMapEntry clojure.lang.Reduced clojure.lang.Volatile]))" :expected "[]"}
+  {:suite "class-lattice" :expr "(class (reduced 1))" :expected "clojure.lang.Reduced"}
+  {:suite "class-lattice" :expr "(instance? clojure.lang.IDeref (reduced 1))" :expected "true"}
+  {:suite "class-lattice" :expr "[(instance? clojure.lang.IAtom (atom 1)) (instance? clojure.lang.IAtom2 (atom 1)) (instance? clojure.lang.IAtom (volatile! 1))]" :expected "[true true false]"}
+  {:suite "class-lattice" :expr "[(instance? clojure.lang.IBlockingDeref (promise)) (instance? clojure.lang.IBlockingDeref (future 1)) (instance? clojure.lang.IBlockingDeref (delay 1)) (instance? clojure.lang.IBlockingDeref (atom 1))]" :expected "[true true false false]"}
+  ;; a promise or future is a reify over the deref interfaces, not a fn: no AFunction/Fn
+  {:suite "class-lattice" :expr "(let [s (set (map #(.getName %) (supers (class (promise)))))] (mapv (partial contains? s) [\"clojure.lang.IBlockingDeref\" \"clojure.lang.IPending\" \"clojure.lang.IFn\" \"clojure.lang.AFunction\" \"clojure.lang.Fn\"]))" :expected "[true true true false false]"}
+  {:suite "class-lattice" :expr "(let [s (set (map #(.getName %) (supers clojure.lang.MapEntry)))] (mapv (partial contains? s) [\"clojure.lang.AMapEntry\" \"clojure.lang.IMapEntry\" \"java.util.Map$Entry\" \"clojure.lang.APersistentVector\" \"clojure.lang.AFunction\"]))" :expected "[true true true true false]"}
+  ;; an interface registered with no supers has none — a $ in its name does not make it a fn
+  {:suite "class-lattice" :expr "(bases java.util.Map$Entry)" :expected ""}
+  {:suite "class-lattice" :expr "[(.getName (.getSuperclass clojure.lang.MapEntry)) (.getName (.getSuperclass clojure.lang.AMapEntry)) (.getSuperclass clojure.lang.IMapEntry)]" :expected "[\"clojure.lang.AMapEntry\" \"clojure.lang.APersistentVector\" nil]"}
+  {:suite "class-lattice" :expr "[(.isInterface clojure.lang.IAtom) (.isInterface clojure.lang.IChunk) (.isInterface clojure.lang.AMapEntry) (bit-and (.getModifiers clojure.lang.AMapEntry) 1024) (bit-and (.getModifiers clojure.lang.ChunkBuffer) 16) (bit-and (.getModifiers clojure.lang.Volatile) 16) (bit-and (.getModifiers clojure.lang.Reduced) 16)]" :expected "[true true false 1024 16 16 16]"}
+  {:suite "class-lattice" :expr "(let [b (chunk-buffer 4)] [(.getName (class b)) (count b) (instance? clojure.lang.Counted b) (do (chunk-append b 1) (chunk-append b 2) (count b))])" :expected "[\"clojure.lang.ChunkBuffer\" 0 true 2]"}
+  ;; protocol dispatch reads the same class the value reports
+  {:suite "class-lattice" :expr "(do (defprotocol PLat (plat [x])) (extend-protocol PLat clojure.lang.Volatile (plat [x] :vol) clojure.lang.Agent (plat [x] :agent) clojure.lang.Reduced (plat [x] :reduced) clojure.lang.Delay (plat [x] :delay) clojure.lang.ChunkBuffer (plat [x] :chunkbuf)) [(plat (volatile! 1)) (plat (agent 1)) (plat (reduced 1)) (plat (delay 1)) (plat (chunk-buffer 1))])" :expected "[:vol :agent :reduced :delay :chunkbuf]"}
+  {:suite "class-lattice" :expr "(do (defprotocol PLatD (platd [x])) (extend-protocol PLatD clojure.lang.IDeref (platd [x] :deref)) [(platd (volatile! 1)) (platd (reduced 1)) (platd (promise)) (platd (ref 1)) (platd #'platd) (platd (agent 1))])" :expected "[:deref :deref :deref :deref :deref :deref]"}
+  {:suite "class-lattice" :expr "[(instance? clojure.lang.IRef #'first) (instance? clojure.lang.IRef (ref 1)) (instance? clojure.lang.IFn (ref 1)) (instance? clojure.lang.IPending (delay 1)) (instance? clojure.lang.IPending (future 1)) (instance? clojure.lang.IPending (atom 1))]" :expected "[true true true true true false]"}
+  {:suite "class-lattice" :expr "(do (import 'clojure.lang.Volatile) (instance? Volatile (volatile! 1)))" :expected "true"}
+  ;; Class/forName answers for every class resolve does — interfaces included — and
+  ;; only for a fully qualified name, as on the JVM.
+  {:suite "class-lattice" :expr "[(.getName (Class/forName \"clojure.lang.IDeref\")) (.getName (Class/forName \"clojure.lang.IAtom\")) (try (Class/forName \"IDeref\") :found (catch ClassNotFoundException _ :not-found)) (try (Class/forName \"String\") :found (catch ClassNotFoundException _ :not-found))]" :expected "[\"clojure.lang.IDeref\" \"clojure.lang.IAtom\" :not-found :not-found]"}
 ]

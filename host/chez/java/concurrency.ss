@@ -225,6 +225,14 @@
 ;; matches the stable enclosing-fn prefix and pins __0 (rather than :object).
 (register-class-arm! jolt-future? (lambda (f) "clojure.core$future_call$reify__0"))
 (register-class-arm! jolt-promise? (lambda (p) "clojure.core$promise$reify__0"))
+;; ...and what those reifies implement. A row is needed: to the class graph a
+;; $-name with no row is a fn (AFunction), which neither of these is.
+(jch-register-supers! "clojure.core$future_call$reify__0"
+  '("clojure.lang.IDeref" "clojure.lang.IBlockingDeref" "clojure.lang.IPending"
+    "java.util.concurrent.Future"))
+(jch-register-supers! "clojure.core$promise$reify__0"
+  '("clojure.lang.IDeref" "clojure.lang.IBlockingDeref" "clojure.lang.IPending"
+    "clojure.lang.IFn"))
 
 (define (jolt-deliver p v)
   (if (jolt-promise? p)
@@ -2685,29 +2693,14 @@
 (def-var! "jolt.host" "block-sigint" (lambda () (jolt-set-sigint-blocked #t)))
 (def-var! "jolt.host" "park-until-interrupt" jolt-park-until-interrupt)
 
-;; reference types report their JVM classes and answer the IDeref/IRef taxonomy
-;; ((class (agent 1)) is clojure.lang.Agent; derefables are IDeref; the mutable
-;; references — Atom/Ref/Agent/Var — are IRef; Ref and Var are also IFn).
+;; reference types report their JVM classes ((class (agent 1)) is
+;; clojure.lang.Agent). The IDeref/IRef/IPending/IFn/IBlockingDeref answers come
+;; from the class graph's rows for these names (class-hierarchy.ss, and the two
+;; reify rows above): instance? and protocol dispatch both read the class a
+;; value reports and take its ancestry from there, so there is no second list
+;; of "which values are derefable" to keep in step with the graph.
 (register-class-arm! jolt-agent? (lambda (x) "clojure.lang.Agent"))
 (register-class-arm! jolt-delay? (lambda (x) "clojure.lang.Delay"))
 (register-class-arm! (lambda (x) (jvol? x)) (lambda (x) "clojure.lang.Volatile"))
 (register-class-arm! (lambda (x) (var-cell? x)) (lambda (x) "clojure.lang.Var"))
 (register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "user-thread"))) (lambda (x) "java.lang.Thread"))
-(register-instance-check-arm!
-  (lambda (type-sym val)
-    (if (symbol-t? type-sym)
-        (let ((tn (symbol-t-name type-sym)))
-          (cond
-            ((or (string=? tn "IDeref") (string=? tn "clojure.lang.IDeref"))
-             (if (or (jolt-atom? val) (jolt-ref? val) (jolt-agent? val) (var-cell? val)
-                     (jvol? val) (jolt-delay? val) (jolt-future? val) (jolt-promise? val))
-                 #t 'pass))
-            ((or (string=? tn "IRef") (string=? tn "clojure.lang.IRef"))
-             (if (or (jolt-atom? val) (jolt-ref? val) (jolt-agent? val) (var-cell? val))
-                 #t 'pass))
-            ((or (string=? tn "IFn") (string=? tn "clojure.lang.IFn"))
-             (if (or (jolt-ref? val) (var-cell? val)) #t 'pass))
-            ((or (string=? tn "IPending") (string=? tn "clojure.lang.IPending"))
-             (if (or (jolt-delay? val) (jolt-future? val) (jolt-promise? val)) #t 'pass))
-            (else 'pass)))
-        'pass)))
