@@ -28,6 +28,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A child process no longer inherits `JOLT_PWD`.** `bin/jolt` exports the
+  user's directory in `JOLT_PWD` before changing into its checkout, and a
+  spawned child's environment was seeded from the parent's, so a child jolt
+  started with `:dir` at another project took its user.dir from the variable
+  rather than from its own working directory: `(slurp "README.md")` under
+  `:dir` answered the parent's README. The variable is the launcher's message
+  to the process it started, and the child's directory is whatever the spawn
+  set, so `ProcessBuilder`, `jolt.process` and `clojure.java.shell` now start
+  every child without it — a child jolt, directly under `:dir` or behind a
+  shell's `cd`, reads its own project. A caller that puts `JOLT_PWD` in the
+  child's environment map asked for it and keeps it. An installed binary never
+  exports the variable, which is why the same program passed under one and
+  failed under a source checkout.
+- **`clojure.lang.Agent`, `AMapEntry`, `ChunkBuffer`, `IAtom`, `IAtom2`,
+  `IBlockingDeref`, `IChunk`, `IMapEntry`, `Reduced` and `Volatile` resolve.**
+  typed.clojure's core annotations name all ten, and its `override-classes`
+  stopped at the first: `Could not resolve class: clojure.lang.ChunkBuffer`.
+  Each is in the class graph under its JVM supers now, so `resolve`, `import`,
+  `Class/forName`, `bases`, `supers`, `.isInterface`, `.getModifiers` and
+  `instance?` agree: an atom is an `IAtom2`, a promise and a future are
+  `IBlockingDeref`, a reduced box is an `IDeref` and reports
+  `clojure.lang.Reduced` (it was `:object`), `MapEntry` extends `AMapEntry`
+  which is an `IMapEntry`, and a chunk buffer is `Counted` and answers `count`.
+  Three general faults came out with them. Protocol dispatch never consulted
+  the class a value reports through a class arm, so `extend-protocol` on
+  `clojure.lang.Volatile`, `Agent`, `Delay`, `Ref` or a promise's class — or on
+  `IDeref` for any of them — threw `No method`; dispatch now reads the same
+  class `instance?` does, and the hand-kept list of derefable values that
+  answered `instance?` for `IDeref`/`IRef`/`IPending` is gone in favour of the
+  graph. A class registered with no supers was read as unregistered, and a `$`
+  in its name then made it a fn, so `(supers java.util.Map$Entry)` and the
+  promise and future reify classes reported the `AFunction` chain, `Fn`
+  included. And `Class/forName` rejected every interface `resolve` accepts
+  (`"clojure.lang.IDeref"`) because it consulted a narrower table; it answers
+  for every modeled class now, under its full name only. `chunk` still seals
+  into a vector rather than an `ArrayChunk`, so nothing is an `IChunk`
+  (known-divergences).
 - **`Character/isLetter`, `isDigit`, `isLetterOrDigit`, `isUpperCase` and
   `isLowerCase` classify all of Unicode.** They were ASCII range checks, so
   `(Character/isLetter \é)` and `(Character/isUpperCase \É)` were false where

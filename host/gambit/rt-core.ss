@@ -812,6 +812,11 @@
     (cond ((null? rs) #f)
           (((caar rs) x) ((cdar rs) x))
           (else (loop (cdr rs))))))
+;; The class a value reports. This host has no class model, so the answer is no
+;; class: jolt-object-repr below prints the value plainly, and the last arm of
+;; value-host-tags (records-gambit.ss, from host/chez/protocols.ss) leaves it a
+;; plain Object — the same outcomes the guarded call used to reach by raising.
+(define (jolt-class-name x) #f)
 (define (jolt-object-repr x readable?)
   (let ((cls (guard (e (#t #f)) (jolt-class-name x)))
         (content (guard (e (#t #f)) (jolt-object-content x))))

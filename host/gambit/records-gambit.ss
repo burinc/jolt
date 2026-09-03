@@ -1544,6 +1544,9 @@
      (jch-tags (jolt-ex-info-record-class-name obj)))
     ((jolt-atom? obj) (jch-tags "clojure.lang.Atom"))
     ((jns? obj) (jch-tags "clojure.lang.Namespace"))
+    ((let ((n (jolt-class-name obj)))
+       (and (string? n) (jch-known-exact? n) n)) =>
+     jch-tags)
     (else '("Object"))))
 
 (define (make-deftype-ctor name-sym field-kws . rest-args)

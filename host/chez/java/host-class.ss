@@ -113,6 +113,7 @@
     ((symbol-t? x) "clojure.lang.Symbol")
     ((jolt-atom? x) "clojure.lang.Atom")
     ((jolt-ref? x) "clojure.lang.Ref")
+    ((jolt-reduced? x) "clojure.lang.Reduced")
     ((char? x) "java.lang.Character")
     ((regex-t? x) "java.util.regex.Pattern")
     ;; an anonymous / unregistered fn — like the JVM, where (class #(..)) is a

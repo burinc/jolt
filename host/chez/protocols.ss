@@ -429,6 +429,18 @@
         ;; a namespace value is clojure.lang.Namespace — (class *ns*) already says
         ;; so, and clojure.datafy extends Datafiable to it.
         ((jns? obj) (jch-tags "clojure.lang.Namespace"))
+        ;; anything else that reports a modeled class — an agent, a volatile, a
+        ;; delay, a future, a promise, a reduced box, a chunk buffer, a ref —
+        ;; dispatches as that class and its ancestry: the class arms name it
+        ;; (host-class.ss) and the graph carries its supers, so an extension on
+        ;; clojure.lang.Volatile, or on IDeref for any of them, reaches the
+        ;; value. The same class instance? reads. A value naming no modeled
+        ;; class stays a plain Object; this is the last arm, so only values
+        ;; every arm above declined pay for the lookup. jolt-class-name is the
+        ;; java host layer's (host-class.ss, loaded after this file); the Gambit
+        ;; runtime shares this file and shims it to answer no class (rt-core.ss).
+        ((let ((n (jolt-class-name obj))) (and (string? n) (jch-known-exact? n) n))
+         => jch-tags)
         (else '("Object"))))
 
 

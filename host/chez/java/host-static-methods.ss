@@ -827,9 +827,19 @@
   ;; matches a known class (e.g. "com.acme.String" when "java.lang.String"
   ;; exists). jch-known? does last-segment matching and is NOT used here;
   ;; it lives on for jch-isa?'s suffix matching (round-6 territory).
-  (or (hashtable-ref class-statics-tbl nm #f)
-      (hashtable-ref class-ctors-tbl nm #f)
-      (hashtable-ref jvm-class-parents nm #f)))
+  ;; And a full name only: the statics table is keyed by the short name as
+  ;; well, and jch-known-exact? holds each simple segment (the spelling
+  ;; chez-condition-exc-class hands over), where (Class/forName "String") is a
+  ;; ClassNotFoundException on the JVM. Every class the graph models answers,
+  ;; interfaces included — the set resolve answers for.
+  (and (forname-qualified? nm)
+       (or (hashtable-ref class-statics-tbl nm #f)
+           (hashtable-ref class-ctors-tbl nm #f)
+           (jch-known-exact? nm))))
+(define (forname-qualified? nm)
+  (let loop ((i 0))
+    (and (< i (string-length nm))
+         (or (char=? (string-ref nm i) #\.) (loop (+ i 1))))))
 ;; A namespace with a hyphen munges to an underscore in the package name, so a
 ;; record defined in my-app.core is my_app.core.Foo on the JVM. jolt keeps the
 ;; namespace as written, so a forName of the munged name has to demunge to find
