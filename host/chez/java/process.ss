@@ -326,9 +326,19 @@
 ;; A live mutable Map<String,String>, seeded from the parent environment. jolt's
 ;; babashka.process only calls clear/putAll, but put/get/remove are provided too.
 ;; state: a Scheme string->string hashtable.
+;; The environment a child starts from: the parent's, less JOLT_PWD. That variable
+;; is the launcher's message to THIS process — bin/jolt exports the user's cwd
+;; before cd'ing to its checkout — and a child's cwd is whatever the spawn chose
+;; (proc-effective-dir), so an inherited copy hands a child jolt the PARENT's
+;; project as its user.dir: (slurp "README.md") under :dir read the spawner's
+;; README. A caller that puts JOLT_PWD in the env map asked for it and keeps it.
+;; Both the inherited envp and the seed of ProcessBuilder.environment() come from
+;; here, so there is no spawn shape that forwards it.
+(define (proc-child-env-pairs)
+  (filter (lambda (p) (not (string=? (car p) "JOLT_PWD"))) (all-env-pairs)))
 (define (make-proc-env-map)
   (let ((h (make-hashtable string-hash string=?)))
-    (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) (all-env-pairs))
+    (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) (proc-child-env-pairs))
     (make-jhost "jolt-env-map" h)))
 (define (proc-env-map? x) (and (jhost? x) (string=? (jhost-tag x) "jolt-env-map")))
 (define (proc-env-map-pairs em)
@@ -753,7 +763,7 @@
         (let* ((argv (proc-marshal-argv (list "/bin/sh" "-c" sh-cmd)))
                (envp (proc-marshal-argv
                       (map (lambda (p) (string-append (car p) "=" (cdr p)))
-                           (all-env-pairs))))
+                           (proc-child-env-pairs))))
                ;; attrp is NULL, so the child inherits this thread's signal mask —
                ;; which must carry none of jolt's own blocking (concurrency.ss).
                (rc (jolt-with-empty-sigmask
