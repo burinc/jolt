@@ -191,7 +191,17 @@
 ;; there was no way to ask it about a tag. NOT for callers: anything with a tag
 ;; to pass is branching on the tag, which sa-host-tag's contract forbids.
 (define (sa-os-family-for-tag m)
-  (cond ((or (sa-tag-contains? m "osx") (sa-tag-contains? m "macos")) 'macos)
+  ;; "ios" joins the macos branch rather than getting one of its own: iOS is
+  ;; Darwin, so every constant this selects is already the right one, and the
+  ;; three-symbol contract has nowhere else to put it. Chez has four iOS tags
+  ;; (a6ios, arm64ios, ta6ios, tarm64ios; BUILDING documents tarm64ios as the
+  ;; cross-target), and not one of them contains "osx", "macos", "nt" or "pb",
+  ;; so all four reached the else-branch and called a Darwin system Linux.
+  ;; The substring is exact rather than lucky: those four are the only tags in
+  ;; the Chez tree containing "ios", and a tag that contained it by accident
+  ;; would have to be an "osx" tag, which wants 'macos anyway.
+  (cond ((or (sa-tag-contains? m "osx") (sa-tag-contains? m "macos")
+             (sa-tag-contains? m "ios")) 'macos)
         ((or (sa-tag-contains? m "nt") (sa-tag-contains? m "windows")) 'windows)
         ((sa-tag-contains? m "pb") (sa-probed-os-family))
         (else 'linux)))

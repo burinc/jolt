@@ -47,6 +47,15 @@
 (row "i3le"      'linux   'i386   'little)
 (row "a6ob"      'linux   'x86-64 #f)   ; unrecognized OS still degrades to linux
 
+;; iOS is Darwin, and its tags say so without saying "osx". Chez has four of
+;; them (a6ios, arm64ios, ta6ios, tarm64ios) and BUILDING documents tarm64ios
+;; as the iOS cross-target. The OS row is what picks SIGCHLD, EAGAIN,
+;; O_NONBLOCK, LC_TIME, the struct-stat offsets and the link libraries, all of
+;; which are Darwin's here. endian is #f for the same reason as the osx tags:
+;; the suffix is not le/be.
+(row "tarm64ios" 'macos   'arm64  #f)
+(row "a6ios"     'macos   'x86-64 #f)
+
 ;; Portable-bytecode tags: pb/pb64l/tpb64l name the threading, word size and
 ;; endianness and deliberately name no OS, and their 64/l fields are not in the
 ;; shape sa-arch-for-tag/sa-endian-for-tag parse either. So all three tag
