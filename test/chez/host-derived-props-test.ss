@@ -56,6 +56,14 @@
 (row "tarm64ios" 'macos   'arm64  #f)
 (row "a6ios"     'macos   'x86-64 #f)
 
+;; Android is the other cross-target with no tag of its own, and unlike iOS it
+;; needs no branch: it builds as tarm64le (tools/cross-compile/README.md), and
+;; Bionic is Linux for every constant this row picks. Pinned so the answer is a
+;; decision rather than the else-branch's luck. Where Android does diverge is
+;; the link libraries, which this tag cannot express — tarm64le is glibc arm64
+;; Linux too — and which the target pack owns.
+(row "tarm64le"  'linux   'arm64  'little)
+
 ;; Portable-bytecode tags: pb/pb64l/tpb64l name the threading, word size and
 ;; endianness and deliberately name no OS, and their 64/l fields are not in the
 ;; shape sa-arch-for-tag/sa-endian-for-tag parse either. So all three tag
