@@ -1303,7 +1303,10 @@ fi
 # single check, "FAIL: jolt.process" with nothing under it is all the gate says, and
 # the reason — the exception — is exactly what was thrown away.
 process_log="$(mktemp)"
-$jolt run test/chez/process-test.clj >"$process_log" 2>&1 || true
+# JOLT_EXE names the jolt under test for the cases that spawn a child jolt, so a
+# built binary tests itself rather than whatever `jolt` is on PATH.
+JOLT_EXE="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")" \
+  $jolt run test/chez/process-test.clj >"$process_log" 2>&1 || true
 process_out="$(cat "$process_log")"
 if printf '%s' "$process_out" | grep -q 'PROCESS-TEST OK'; then
   pass=$((pass + 1))

@@ -94,6 +94,34 @@
 (let [sub (fs/create-temp-dir {:prefix "jp-dir-"})]
   (check-eq "dir set" (str/trim (:out (sh ["pwd"] {:dir (str sub)}))) (str sub))
   (fs/delete-tree sub))
+;; JOLT_PWD is the launcher's message to THIS process — bin/jolt exports the user's
+;; cwd before cd'ing to its checkout. A child's cwd is whatever the spawn chose, so
+;; the variable is never forwarded: a child jolt reads user.dir from its own cwd
+;; instead of inheriting the parent's project. A caller that puts it in the env map
+;; asked for it and gets it.
+(check-eq "JOLT_PWD is not forwarded"
+          (str/trim (:out (sh ["sh" "-c" "echo ${JOLT_PWD-unset}"]))) "unset")
+(check-eq "JOLT_PWD is not forwarded through :extra-env"
+          (str/trim (:out (sh ["sh" "-c" "echo ${JOLT_PWD-unset}"] {:extra-env {"JP_Y" "1"}}))) "unset")
+(check-eq "an explicit JOLT_PWD is honored"
+          (str/trim (:out (sh ["sh" "-c" "echo $JOLT_PWD"] {:extra-env {"JOLT_PWD" "/explicit"}}))) "/explicit")
+;; End to end, in the shape a test harness takes: this process's own directory
+;; has a README.md (the jolt checkout's), and a child jolt rooted at another
+;; project — one with its own README.md — must read THAT one, whether it is put
+;; there by :dir or by a shell's cd. The wrong answer is the parent's README, a
+;; different text rather than a missing file. The child is the jolt under test:
+;; smoke.sh hands it down in JOLT_EXE, and bin/jolt exports the same.
+(let [sub (fs/create-temp-dir {:prefix "jp-proj-"})
+      exe (or (System/getenv "JOLT_EXE") (some-> (fs/which "jolt") str) "jolt-not-found:set-JOLT_EXE")
+      expr "(print (slurp \"README.md\"))"]
+  (spit (str sub "/README.md") "PROJECT-README-MARKER")
+  (check-eq "the parent's own README is not the project's"
+            (str/includes? (slurp "README.md") "PROJECT-README-MARKER") false)
+  (check-eq "a child jolt under :dir reads its own project"
+            (:out (sh [exe "-e" expr] {:dir (str sub)})) "PROJECT-README-MARKER")
+  (check-eq "a child jolt behind a cd reads its own project"
+            (:out (sh ["sh" "-c" (str "cd '" sub "' && '" exe "' -e '" expr "'")])) "PROJECT-README-MARKER")
+  (fs/delete-tree sub))
 
 ;; ProcessBuilder.start throws (like the JVM) when the program can't be resolved,
 ;; with a "No such file" message — not a shell "not found" after spawning

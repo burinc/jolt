@@ -28,6 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A child process no longer inherits `JOLT_PWD`.** `bin/jolt` exports the
+  user's directory in `JOLT_PWD` before changing into its checkout, and a
+  spawned child's environment was seeded from the parent's, so a child jolt
+  started with `:dir` at another project took its user.dir from the variable
+  rather than from its own working directory: `(slurp "README.md")` under
+  `:dir` answered the parent's README. The variable is the launcher's message
+  to the process it started, and the child's directory is whatever the spawn
+  set, so `ProcessBuilder`, `jolt.process` and `clojure.java.shell` now start
+  every child without it — a child jolt, directly under `:dir` or behind a
+  shell's `cd`, reads its own project. A caller that puts `JOLT_PWD` in the
+  child's environment map asked for it and keeps it. An installed binary never
+  exports the variable, which is why the same program passed under one and
+  failed under a source checkout.
 - **`Character/isLetter`, `isDigit`, `isLetterOrDigit`, `isUpperCase` and
   `isLowerCase` classify all of Unicode.** They were ASCII range checks, so
   `(Character/isLetter \é)` and `(Character/isUpperCase \É)` were false where
