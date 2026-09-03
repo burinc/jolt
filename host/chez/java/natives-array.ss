@@ -252,6 +252,9 @@
     (make-pvec out)))
 (define (na-chunk-cons chunk rest)
   (if (fx=? 0 (pvec-count chunk)) rest (cseq-chunked chunk 0 rest)))
+;; the buffer is clojure.lang.ChunkBuffer, a Counted: count reads its fill
+(register-class-arm! jolt-chunkbuf? (lambda (b) "clojure.lang.ChunkBuffer"))
+(register-count-arm! jolt-chunkbuf? (lambda (b) (jolt-chunkbuf-cnt b)))
 
 ;; --- extend the collection dispatchers to see a jolt-array ------------------
 (register-count-arm! jolt-array? (lambda (c) (ja-len (jolt-array-vec c))))
