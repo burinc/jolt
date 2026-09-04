@@ -526,12 +526,14 @@
                  (rtags (map (lambda (t)
                                (chez-resolve-field-tag t by-name owner-ns))
                              tags)))
-            (set! out
-              (jolt-assoc
-                out
-                k
-                (jolt-hash-map kw-fields (apply jolt-vector fields) kw-tags
-                  (apply jolt-vector rtags) kw-type type-tag)))))
+            (unless (chez-type-owns-lookup? type-tag)
+              (set! out
+                (jolt-assoc
+                  out
+                  k
+                  (jolt-hash-map kw-fields (apply jolt-vector fields)
+                    kw-tags (apply jolt-vector rtags) kw-type
+                    type-tag))))))
         ks
         vs))
     out))
@@ -575,6 +577,11 @@
 (define (jrec-get-index r k)
   (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
     (and i (fx>=? i 0) i)))
+
+(define (chez-type-owns-lookup? tag)
+  (and (find-method-any-protocol tag "valAt")
+       (not (hashtable-ref chez-record-type-tbl tag #f))
+       #t))
 
 (define (jrdesc-mask-fields! desc)
   (let ((idx (jrdesc-index desc)))
@@ -1428,7 +1435,7 @@
                           h))))
             (hashtable-set! pt k fn))))
       (when (and (string=? method "valAt")
-                 (not (hashtable-ref chez-record-type-tbl type-tag #f)))
+                 (chez-type-owns-lookup? type-tag))
         (jrdesc-mask-fields! desc))))
   (remove-clone! type-tag proto method)
   (if #f #f))
@@ -1659,8 +1666,7 @@
               (let ((old-desc (hashtable-ref chez-tag-desc tag #f)))
                 (when old-desc (jrdesc-ptable-set! old-desc #f)))
               (hashtable-set! chez-tag-desc tag desc)))
-         (_ (when (and (find-method-any-protocol tag "valAt")
-                       (not (hashtable-ref chez-record-type-tbl tag #f)))
+         (_ (when (chez-type-owns-lookup? tag)
               (jrdesc-mask-fields! desc)))
          (nf (length kws))
          (ctor-name (string-append
