@@ -400,6 +400,17 @@
          (args (cdr items))
          (expander (var-cell-root (hc-resolve-cell ctx head)))
          (amp-env (if (pair? maybe-env) (car maybe-env) (jolt-hash-map))))
+    ;; A macro's two implicit parameters are invisible to its caller, so an arity
+    ;; error names the DECLARED count: (m 1 2) on a one-param macro is (2), not
+    ;; the (4) the expander is actually called with. The JVM corrects that after
+    ;; the fact (Compiler.macroexpand1 rethrows the ArityException with
+    ;; actual - 2); jolt asks first, the way seq.ss's arity pre-check classifies
+    ;; a site structurally rather than by matching a message afterwards — which
+    ;; also means the count never has to be parsed back out of one.
+    ;; Only for a real procedure: anything else jolt-invoke owns, error included.
+    (when (and (procedure? expander)
+               (not (proc-accepts? expander (fx+ 2 (length args)))))
+      (jolt-arity-error-name (jolt-proc-arity-name expander) (length args)))
     (hc-propagate-pos form
       (apply jolt-invoke expander (hc-form-sans-file nform) amp-env args))))
 

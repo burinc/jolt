@@ -893,7 +893,37 @@
    :check {:expr "(try (eval '(do (defprotocol PXD (pxd [x])) (extend-protocol PXD no.such.Thing (pxd [_] 1)))) :ok (catch Throwable _ :threw))"
            :jvm ":threw"
            :jolt ":ok"}
-   :note "A bare unresolvable name (NoSuchThing) throws on both, pinned in the corpus (protocols / extend-type resolution). The dotted leniency is the __register-class! contract."}]
+   :note "A bare unresolvable name (NoSuchThing) throws on both, pinned in the corpus (protocols / extend-type resolution). The dotted leniency is the __register-class! contract."}
+  ;; contains? on a bare deftype answers what the field index holds, where the JVM
+  ;; refuses the question outright — the same map-as-object superset the deftype
+  ;; entry above describes for (:a t), one seam further along. It stays true for a
+  ;; field-named key even on a type that declares its own ILookup, where the get
+  ;; path goes through that valAt instead: contains? asks whether the KEY is
+  ;; declared, which is a fact about the type either way. jolt-fpp3.7
+  {:category :host-model
+   :behavior "(contains? t :a) on a bare deftype with a field named a"
+   :jvm "throws IllegalArgumentException — contains? not supported on type"
+   :jolt "true — the field index answers"
+   :check {:expr "(do (deftype KDT [a] clojure.lang.ILookup (valAt [_ k] :v) (valAt [_ k d] :v)) (try (contains? (->KDT 1) :a) (catch IllegalArgumentException e :threw)))"
+           :jvm ":threw"
+           :jolt "true"}
+   :note "A defrecord is a map and answers contains? on both."}
+  ;; A leading &form is what `sigs` keys on to elide a macro's two implicit params
+  ;; from the :arglists defn derives, and the reference reads the second element
+  ;; without checking there is one: (defn f [&form] 1) is (subvec [&form] 2 1)
+  ;; there, an IndexOutOfBoundsException the compiler reports as "Unexpected error
+  ;; macroexpanding defn". jolt elides only when a second param exists, so the
+  ;; degenerate arity keeps the vector it was written with. A crash is not a shape
+  ;; worth reproducing, and no program means (defn f [&form] …) to fail.
+  {:category :permissive
+   :behavior "(defn f [&form] 1) — a lone &form param, the arity `sigs` cannot subvec"
+   :jvm "throws while macroexpanding defn (IndexOutOfBoundsException inside sigs)"
+   :jolt "defines f; :arglists is ([&form]), the vector as written"
+   :check {:expr "(try (eval (quote (do (defn zdf1 [&form] 1) (pr-str (:arglists (meta (var zdf1))))))) (catch Throwable _ :threw))"
+           :jvm ":threw"
+           :jolt "\"([&form])\""}
+   :note "[&form &env] and longer elide on both; that is pinned in the corpus (defn / implicit macro params)."}
+]
  :entries
  [;; Wherever a syntax-quote's CONSTRUCTION CODE becomes a value rather than
   ;; being compiled — a nested backtick, a quoted one, a macro's argument —

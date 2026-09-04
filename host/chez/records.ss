@@ -390,15 +390,22 @@
             (hashtable-set! by-name type-tag k)
             (hashtable-set! by-name (chez-shape-simple-name type-tag) k)))
         ks vs)
+      ;; A type that owns its lookup is left OUT: the passes read this map to
+      ;; decide that (:field x) is a slot read — the (:k (->T …)) fold and the
+      ;; proven-struct guard drop both do — and for such a type it is not one.
+      ;; Omitting the entry, rather than flagging it, is what keeps a consumer
+      ;; from forgetting to ask: an absent ctor-key already means "not a shape I
+      ;; know", which every reader handles (a nested field tag reads :any).
       (vector-for-each
         (lambda (k v)
           (let* ((fields (vector-ref v 0)) (tags (vector-ref v 1)) (type-tag (vector-ref v 2))
                  (owner-ns (chez-ctor-key-ns k))
                  (rtags (map (lambda (t) (chez-resolve-field-tag t by-name owner-ns)) tags)))
-            (set! out (jolt-assoc out k
-                                  (jolt-hash-map kw-fields (apply jolt-vector fields)
-                                                 kw-tags   (apply jolt-vector rtags)
-                                                 kw-type   type-tag)))))
+            (unless (chez-type-owns-lookup? type-tag)
+              (set! out (jolt-assoc out k
+                                    (jolt-hash-map kw-fields (apply jolt-vector fields)
+                                                   kw-tags   (apply jolt-vector rtags)
+                                                   kw-type   type-tag))))))
         ks vs))
     out))
 
@@ -447,6 +454,19 @@
 (define (jrec-get-index r k)
   (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
     (and i (fx>=? i 0) i)))
+;; #t when TAG answers every key through a valAt IT declares — a bare deftype
+;; implementing clojure.lang.ILookup. Such a type has no field-first lookup at
+;; all, so three things have to agree about it: the get path (which reads the
+;; masked index below), the mask itself, and the record-shapes registry the
+;; optimizing passes read. One predicate is what makes them agree — the passes
+;; used to see such a type as an ordinary record shape and fold (:field (->T …))
+;; straight to the ctor argument in a built binary, past the valAt (jolt-fpp3.1).
+;; A defrecord is never one: its generated field-first lookup stands, and the JVM
+;; will not compile one declaring another valAt.
+(define (chez-type-owns-lookup? tag)
+  (and (find-method-any-protocol tag "valAt")
+       (not (hashtable-ref chez-record-type-tbl tag #f))
+       #t))
 ;; Bias every field of DESC negative. Driven by register-protocol-method the
 ;; moment a non-record type registers a valAt; fkeys is walked (not the table's
 ;; keys) so nothing scans a hashtable another thread may be writing.

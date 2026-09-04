@@ -158,12 +158,15 @@
 (define (thread-binding-pairs frame)
   (let ((pairs (pmap-fold frame
                  (lambda (cell v acc)
-                   ;; JVM semantics: only an explicitly ^:dynamic var binds. No
-                   ;; meta entry = non-dynamic (runtime dynamic vars are tagged
-                   ;; via def-dynvar!/def-var-with-meta!; the declare path via
-                   ;; set-var-meta!).
-                   (let ((m (var-cell-meta cell)))
-                     (when (not (and m (jolt-truthy? (jolt-get m (keyword #f "dynamic")))))
+                   ;; JVM semantics: only an explicitly ^:dynamic var binds. The
+                   ;; FLAG is what says so — a field set by the def that declared
+                   ;; it (rt.ss def-var-with-meta!/set-var-meta!, and def-dynvar!
+                   ;; for the runtime ones) or by .setDynamic. Reading :dynamic
+                   ;; back out of the metadata instead let alter-meta! hand a var
+                   ;; the ability to bind, and take it away again, neither of
+                   ;; which moves the JVM's flag.
+                   (begin
+                     (when (not (var-cell-dynamic? cell))
                        ;; Var.pushThreadBindings raises IllegalStateException, not
                        ;; an ExceptionInfo — so ex-data on it is nil, and only a
                        ;; typed host throwable can say that.
@@ -312,9 +315,11 @@
                                  local-var-counter))))
          (c (make-var-cell "" name
                            (if (pair? args) (car args) (make-jolt-var-unbound "" name))
-                           #t #f #f #f)))
+                           #t #f #f #f #t)))
     ;; Clojure builds these with Var/create + setDynamic, so a local var takes a
     ;; thread binding like any other — tools.reader hands one to with-bindings.
+    ;; Hence the flag in the constructor above, beside the metadata that says the
+    ;; same thing to a reader of (meta v).
     (var-cell-meta-set! c local-var-meta)
     c))
 

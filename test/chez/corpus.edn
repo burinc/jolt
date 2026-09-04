@@ -5934,4 +5934,90 @@
   {:suite "macros / defmacro expands like the JVM" :label "docstring and attr-map keep their place, a rest param survives" :expected "\"(do (clojure.core/defn mm \\\"d\\\" {:k 1} ([&form &env a & r] a)) (. (var mm) (setMacro)) (var mm))\"" :actual "(pr-str (macroexpand-1 (quote (defmacro mm \"d\" {:k 1} [a & r] a))))" :portability :common}
   {:suite "macros / defmacro expands like the JVM" :label "a nullary macro still declares the two implicit params" :expected "\"(do (clojure.core/defn mm ([&form &env] 1)) (. (var mm) (setMacro)) (var mm))\"" :actual "(pr-str (macroexpand-1 (quote (defmacro mm [] 1))))" :portability :common}
   {:suite "macros / defmacro expands like the JVM" :label "and defining one still marks the var and works" :expected "[42 true]" :actual "(do (defmacro mw [a] (list (quote inc) a)) [(mw 41) (:macro (meta (var mw)))])" :portability :common}
+  ;; The JVM hides a macro's two implicit params from an arity error:
+  ;; Compiler.macroexpand1 catches the expander's ArityException and rethrows it
+  ;; with actual - 2. jolt's expander takes [&form &env & declared] as of #837, so
+  ;; without that the count came back two too high — (m 1 2) on a one-param macro
+  ;; reported (4). eval, because a direct call raises while the try form is being
+  ;; compiled, which is outside the try.
+  {:suite "macros / arity error hides the implicit params" :label "too many args reports the declared count" :expected "\"Wrong number of args (2) passed to: user/mac1\"" :actual "(do (defmacro mac1 [a] a) (try (eval (quote (mac1 1 2))) (catch clojure.lang.ArityException e (ex-message e))))" :portability :jvm}
+  {:suite "macros / arity error hides the implicit params" :label "too few args too" :expected "\"Wrong number of args (1) passed to: user/mac2\"" :actual "(do (defmacro mac2 [a b] a) (try (eval (quote (mac2 1))) (catch clojure.lang.ArityException e (ex-message e))))" :portability :jvm}
+  {:suite "macros / arity error hides the implicit params" :label "a variadic macro still takes any count" :expected "[0 3]" :actual "(do (defmacro mac3 [& xs] (count xs)) [(mac3) (mac3 1 2 3)])" :portability :common}
+  {:suite "macros / arity error hides the implicit params" :label "and every arity of a multi-arity macro still resolves" :expected "[:one :two]" :actual "(do (defmacro mac4 ([a] :one) ([a b] :two)) [(mac4 1) (mac4 1 2)])" :portability :common}
+  ;; The JVM's `sigs` elides a macro's implicit params from the :arglists defn
+  ;; derives: a defmacro expands to a defn whose params are [&form &env & declared]
+  ;; and the var still reports the declared ones, which is what doc and every
+  ;; arglists-driven tool show. That is load-bearing here as of #843, whose
+  ;; macroexpand-1 answer is a real defn — a tools.analyzer-style consumer
+  ;; evaluates it, and used to intern a macro reporting ([&form &env a]).
+  ;; The trigger is &form in FIRST position, exactly what the reference keys on.
+  {:suite "defn / implicit macro params" :label "a leading &form &env is elided from the derived arglists" :expected "\"([a])\"" :actual "(do (defn zz1 [&form &env a] a) (pr-str (:arglists (meta (var zz1)))))" :portability :common}
+  {:suite "defn / implicit macro params" :label "every arity of a multi-arity fn" :expected "\"([a] [a b])\"" :actual "(do (defn zz2 ([&form &env a] a) ([&form &env a b] b)) (pr-str (:arglists (meta (var zz2)))))" :portability :common}
+  {:suite "defn / implicit macro params" :label "&env alone is not the trigger" :expected "\"([&env a])\"" :actual "(do (defn zz3 [&env a] a) (pr-str (:arglists (meta (var zz3)))))" :portability :common}
+  {:suite "defn / implicit macro params" :label "so evaluating a defmacro's expansion interns the declared arglists" :expected "[\"([a])\" true 42]" :actual "(do (eval (macroexpand-1 (quote (defmacro mq1 [a] (list (quote inc) a))))) [(pr-str (:arglists (meta (resolve (quote mq1))))) (:macro (meta (resolve (quote mq1)))) (eval (quote (mq1 41)))])" :portability :common}
+  ;; The timeout arities of invokeAll / invokeAny were accepted and DISCARDED, so
+  ;; a caller that used one as its bound waited for the tasks anyway. The JVM
+  ;; cancels what has not finished by the deadline (invokeAll) and raises
+  ;; TimeoutException when nothing has (invokeAny). And invokeAny cancels the
+  ;; losers once one task has succeeded, which jolt did not do either.
+  ;;
+  ;; ONE worker and the finishing task FIRST, so which task the deadline catches
+  ;; is decided by the queue rather than by a race: the worker runs :fast to
+  ;; completion, starts the sleeper, and the caller is still waiting on that one
+  ;; when the deadline lands. A two-worker pool with a 1ms bound looked simpler
+  ;; and was flaky in the other direction -- under load the JVM did not reach
+  ;; even the first get before the deadline, and cancelled BOTH.
+  {:suite "concurrency / invokeAll deadlines" :label "invokeAll cancels what missed the deadline" :expected "[[true false :fast] [true true \"CancellationException\"]]" :actual "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) fs (.invokeAll ex [(fn [] :fast) (fn [] (Thread/sleep 3000) :slow)] 1000 java.util.concurrent.TimeUnit/MILLISECONDS)] (try (mapv (fn [f] [(.isDone f) (.isCancelled f) (try (.get f) (catch Throwable e (.getSimpleName (class e))))]) fs) (finally (.shutdownNow ex))))" :portability :jvm}
+  {:suite "concurrency / invokeAll deadlines" :label "invokeAny raises TimeoutException at its deadline" :expected "\"TimeoutException\"" :actual "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 2)] (try (try (.invokeAny ex [(fn [] (Thread/sleep 400) :slow)] 1 java.util.concurrent.TimeUnit/MILLISECONDS) (catch Throwable e (.getSimpleName (class e)))) (finally (.shutdown ex))))" :portability :jvm}
+  ;; One worker, so the ordering is decided rather than raced: the winner runs
+  ;; first, loser1's second-long sleep then holds the only worker, and loser2 is
+  ;; provably still QUEUED when invokeAny cancels it — so it must never run.
+  {:suite "concurrency / invokeAll deadlines" :label "invokeAny cancels the tasks that lost" :expected "[:won true nil]" :actual "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) ran (atom nil) r (.invokeAny ex [(fn [] :won) (fn [] (Thread/sleep 1000) :loser1) (fn [] (reset! ran :loser2-ran) :loser2)])] (.shutdown ex) [r (.awaitTermination ex 5 java.util.concurrent.TimeUnit/SECONDS) (deref ran)])" :portability :jvm}
+  ;; A one-worker pool runs invokeAll's tasks in LIST order. jolt submitted them
+  ;; with Scheme's `map`, whose element order is unspecified — the compiled
+  ;; runtime evaluated it right-to-left, so these reached the queue as (c a b)
+  ;; while .submit and .execute, which enqueue one at a time, were FIFO.
+  {:suite "concurrency / invokeAll deadlines" :label "invokeAll submits in list order" :expected "[:a :b :c]" :actual "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) log (atom [])] (try (.invokeAll ex (mapv (fn [n] (fn [] (swap! log conj n) n)) [:a :b :c])) (deref log) (finally (.shutdown ex))))" :portability :jvm}
+  ;; defmacro takes a TRAILING attr-map, like defn — the JVM's defmacro hands the
+  ;; whole fdecl to defn, trailing map included. jolt dropped it from the var meta
+  ;; and leaked it into :arglists as a bogus arity, on both the compile path and
+  ;; the macroexpand-1 shape. Its :doc precedence is defn's too: an attr-map's
+  ;; :doc wins over the docstring (jolt's defn already agrees; its defmacro did
+  ;; not). And a defmacro with no arities is a defn with none, not one taking
+  ;; the two implicit params.
+  {:suite "defmacro / attr-map" :label "a trailing attr-map reaches the var and stays out of :arglists" :expected "[2 3 \"doc\" \"([a])\" 41]" :actual "(do (defmacro dm5 \"doc\" {:k 1} ([a] a) {:k 2 :j 3}) [(:k (meta (var dm5))) (:j (meta (var dm5))) (:doc (meta (var dm5))) (pr-str (:arglists (meta (var dm5)))) (dm5 41)])" :portability :common}
+  {:suite "defmacro / attr-map" :label "an attr-map :doc wins over the docstring, as in defn" :expected "\"attr\"" :actual "(do (defmacro dm6 \"doc\" {:doc \"attr\"} [a] a) (:doc (meta (var dm6))))" :portability :common}
+  {:suite "defmacro / attr-map" :label "macroexpand-1 keeps the trailing attr-map where defn takes it" :expected "\"(do (clojure.core/defn dm7 ([&form &env a] a) {:k 1}) (. (var dm7) (setMacro)) (var dm7))\"" :actual "(pr-str (macroexpand-1 (quote (defmacro dm7 ([a] a) {:k 1}))))" :portability :common}
+  {:suite "defmacro / attr-map" :label "and a defmacro with no arities expands to a defn with none" :expected "\"(do (clojure.core/defn dm8) (. (var dm8) (setMacro)) (var dm8))\"" :actual "(pr-str (macroexpand-1 (quote (defmacro dm8))))" :portability :common}
+  ;; Var.setDynamic was named in the Var-surface work and never landed — it
+  ;; raised "No matching field found". It answers the var and makes it bindable,
+  ;; and the boolean overload turns the flag off again.
+  {:suite "host-interop / Var surface" :label "setDynamic answers the var and flips the flag" :expected "[\"#'user/sd1\" true]" :actual "(do (def sd1 1) [(str (.setDynamic (var sd1))) (.isDynamic (var sd1))])" :portability :jvm}
+  {:suite "host-interop / Var surface" :label "and the var binds after it" :expected "2" :actual "(do (def sd2 1) (.setDynamic (var sd2)) (eval (quote (binding [sd2 2] sd2))))" :portability :jvm}
+  {:suite "host-interop / Var surface" :label "the boolean overload turns it off again" :expected "[true false]" :actual "(do (def sd3 1) (.setDynamic (var sd3) true) [(.isDynamic (var sd3)) (do (.setDynamic (var sd3) false) (.isDynamic (var sd3)))])" :portability :jvm}
+  ;; identityHashCode of nil is 0 on the JVM — it is the one input with no object
+  ;; to identify. jolt answered the nil sentinel's own id.
+  {:suite "host-interop / identity hash" :label "identityHashCode of nil is 0" :expected "0" :actual "(System/identityHashCode nil)" :portability :jvm}
+  ;; cond-> expands to the reference's shape: ONE let with g rebound per step,
+  ;; each step delegating to -> rather than inlining the call itself. jolt built a
+  ;; nest of let* forms with a fresh symbol per step and threaded by hand, so a
+  ;; consumer reading a single macroexpand-1 saw neither — the same
+  ;; single-step-shape class #842 fixed for -> (cond->> already agreed).
+  ;; The gensym is normalized, since its number is not the claim.
+  {:suite "macros / cond-> expands like the reference" :label "one let, a step per pair, threading through ->" :expected "\"(clojure.core/let [g 1 g (if true (clojure.core/-> g inc) g)] (if false (clojure.core/-> g (+ 2)) g))\"" :actual "(clojure.string/replace (pr-str (macroexpand-1 (quote (cond-> 1 true inc false (+ 2))))) #\"G__[0-9]+\" \"g\")" :portability :common}
+  {:suite "macros / cond-> expands like the reference" :label "no clauses is the value in a let" :expected "\"(clojure.core/let [g 1] g)\"" :actual "(clojure.string/replace (pr-str (macroexpand-1 (quote (cond-> 1)))) #\"G__[0-9]+\" \"g\")" :portability :common}
+  {:suite "macros / cond-> expands like the reference" :label "a list step keeps its extra args" :expected "\"(clojure.core/let [g 1] (if true (clojure.core/-> g (assoc :a 1)) g))\"" :actual "(clojure.string/replace (pr-str (macroexpand-1 (quote (cond-> 1 true (assoc :a 1))))) #\"G__[0-9]+\" \"g\")" :portability :common}
+  {:suite "macros / cond-> expands like the reference" :label "and the threaded values are unchanged" :expected "[2 1 {:a 1 :b 2}]" :actual "[(cond-> 1 true inc) (cond-> 1 false inc) (cond-> {} true (assoc :a 1) (= 1 1) (assoc :b 2))]" :portability :common}
+  ;; :dynamic is a FIELD on the var, not a metadata entry that `binding` reads
+  ;; back. jolt derived it from the metadata, so alter-meta! could make a var
+  ;; bindable (and un-bindable) where the JVM's flag does not move, and
+  ;; .setDynamic had to write metadata the JVM leaves alone. The `def` ASSIGNS
+  ;; the field from its declared metadata — both directions, so a plain re-def of
+  ;; a dynamic var clears it — and nothing else but .setDynamic touches it.
+  {:suite "vars / dynamic is a field" :label "a ^:dynamic def sets both the flag and the metadata" :expected "[true true]" :actual "(do (def ^:dynamic *dy1* 1) [(.isDynamic (var *dy1*)) (:dynamic (meta (var *dy1*)))])" :portability :jvm}
+  {:suite "vars / dynamic is a field" :label "alter-meta! does not make a var bindable" :expected "[false true \"IllegalStateException\"]" :actual "(do (def dy2 1) (alter-meta! (var dy2) assoc :dynamic true) [(.isDynamic (var dy2)) (:dynamic (meta (var dy2))) (try (eval (quote (binding [dy2 2] dy2))) (catch Throwable e (.getSimpleName (class e))))])" :portability :jvm}
+  {:suite "vars / dynamic is a field" :label "setDynamic sets the flag and leaves the metadata alone" :expected "[true nil 2]" :actual "(do (def dy3 1) (.setDynamic (var dy3)) [(.isDynamic (var dy3)) (:dynamic (meta (var dy3))) (eval (quote (binding [dy3 2] dy3)))])" :portability :jvm}
+  {:suite "vars / dynamic is a field" :label "and dropping the metadata does not un-bind it" :expected "[true nil 2]" :actual "(do (def ^:dynamic *dy4* 1) (alter-meta! (var *dy4*) dissoc :dynamic) [(.isDynamic (var *dy4*)) (:dynamic (meta (var *dy4*))) (eval (quote (binding [*dy4* 2] *dy4*)))])" :portability :jvm}
+  {:suite "vars / dynamic is a field" :label "a plain re-def clears the flag" :expected "[true false]" :actual "(do (def ^:dynamic *dy5* 1) (let [was (.isDynamic (var *dy5*))] (eval (quote (def *dy5* 2))) [was (.isDynamic (var *dy5*))]))" :portability :jvm}
+  {:suite "vars / dynamic is a field" :label "intern carries the metadata but not the flag" :expected "[false true]" :actual "(do (intern (quote user) (with-meta (quote dy6) {:dynamic true}) 1) [(.isDynamic (resolve (quote dy6))) (:dynamic (meta (resolve (quote dy6))))])" :portability :jvm}
 ]
