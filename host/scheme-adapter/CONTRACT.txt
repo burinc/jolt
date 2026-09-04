@@ -60,11 +60,17 @@
 # reset at use, so those work under either model; they are noted per file in
 # the R4 table, not re-pinned here.
 #
-# ThreadLocal (host-static-classes.ss:1195) is the one opposite-direction
-# parameter that does NOT defend: under fork-inheritance a child inherits the
-# parent's SET value instead of re-running its init-thunk (the JVM always
-# yields a fresh value per thread). Accepted divergence, documented in the R4
-# table; a fresh-default-per-thread target reproduces JVM ThreadLocal exactly.
+# java.lang.ThreadLocal (host-static-classes.ss) used to be the one opposite-
+# direction parameter that did NOT defend: under fork-inheritance a child
+# inherited the parent's SET value instead of running its own initialValue. That
+# was recorded here as an accepted divergence and it was not one — it is the only
+# thing the class promises, and it silently gave every worker in a pool one
+# shared ThreadLocal<Process> / RNG / SimpleDateFormat (jolt-uecg). It no longer
+# uses a thread parameter: the value lives in a per-thread virtual-register
+# table, so "fresh per thread" holds under either fork model.
+# java.lang.InheritableThreadLocal, whose contract IS inheritance, keeps a
+# per-instance thread parameter and so joins the load-bearing list above — an
+# adapter whose threads do not inherit must arrange it explicitly there too.
 #
 # MUTEXES ARE NON-RECURSIVE (PSL R4, pinned): same-thread re-acquire blocks,
 # per SRFI-18 mutex-acquire!. No host site re-acquires: re-entrant entry is

@@ -382,6 +382,29 @@
   {:suite "interop / Thread" :label "Thread with no target" :expected "[false nil nil]" :actual "(let [t (Thread.)] [(.isAlive t) (.run t) (do (.start t) (.join t) nil)])" :portability :jvm}
   {:suite "interop / Thread" :label "class of a Thread instance" :expected "java.lang.Thread" :actual "(class (Thread.))" :portability :jvm}
   {:suite "interop / Thread" :label "a Thread is a Runnable" :expected "true" :actual "(instance? java.lang.Runnable (Thread.))" :portability :jvm}
+  ;; java.lang.ThreadLocal is per-thread storage, and the per-thread half is the
+  ;; whole point: a value one thread stores must not be visible to another. jolt
+  ;; backed it with a Chez thread parameter, which a forked thread INHERITS, so a
+  ;; child saw the parent's stored value instead of running its own initialValue —
+  ;; three worker threads sharing one ThreadLocal<Process> got the parent's already
+  ;; drained subprocess rather than one each.
+  {:suite "interop / ThreadLocal" :label "a bare ThreadLocal starts unset" :expected "nil" :actual "(.get (ThreadLocal.))" :portability :jvm}
+  {:suite "interop / ThreadLocal" :label "set stores, remove clears back to the initial value" :expected "[3 nil]" :actual "(let [t (ThreadLocal.)] (.set t 3) [(.get t) (do (.remove t) (.get t))])" :portability :jvm}
+  {:suite "interop / ThreadLocal" :label "class of a ThreadLocal instance" :expected "java.lang.ThreadLocal" :actual "(class (ThreadLocal.))" :portability :jvm}
+  {:suite "interop / ThreadLocal" :label "class of an InheritableThreadLocal instance" :expected "java.lang.InheritableThreadLocal" :actual "(class (InheritableThreadLocal.))" :portability :jvm}
+  {:suite "interop / ThreadLocal" :label "an InheritableThreadLocal is a ThreadLocal" :expected "true" :actual "(instance? java.lang.ThreadLocal (InheritableThreadLocal.))" :portability :jvm}
+  {:suite "interop / ThreadLocal" :label "a proxy over ThreadLocal is a ThreadLocal" :expected "true" :actual "(instance? java.lang.ThreadLocal (proxy [ThreadLocal] [] (initialValue [] 1)))" :portability :jvm}
+  {:suite "interop / ThreadLocal" :label "initialValue runs once per thread, on the first get" :expected "[0 1 1 1]" :actual "(let [n (atom 0) t (proxy [ThreadLocal] [] (initialValue [] (swap! n inc)))] [@n (.get t) (.get t) @n])" :portability :jvm}
+  {:suite "interop / ThreadLocal" :label "withInitial takes a Supplier" :expected "[5 true]" :actual "(let [t (ThreadLocal/withInitial (reify java.util.function.Supplier (get [_] 5)))] [(.get t) (instance? java.lang.ThreadLocal t)])" :portability :jvm}
+  {:suite "interop / ThreadLocal" :label "remove re-runs initialValue on the next get" :expected "[1 2]" :actual "(let [n (atom 0) t (proxy [ThreadLocal] [] (initialValue [] (swap! n inc)))] [(.get t) (do (.remove t) (.get t))])" :portability :jvm}
+  ;; The divergence itself: a child thread must not see the parent's value.
+  {:suite "interop / ThreadLocal" :label "a forked thread runs its own initialValue, it does not inherit the parent's value" :expected "[7 42 7]" :actual "(let [t (proxy [ThreadLocal] [] (initialValue [] 42)) p (promise)] (.set t 7) (.start (Thread. (fn [] (deliver p (.get t))))) [(.get t) (deref p 5000 :TIMED-OUT) (.get t)])" :portability :jvm}
+  {:suite "interop / ThreadLocal" :label "a child's own set does not leak back to the parent" :expected "[:child-done 7]" :actual "(let [t (proxy [ThreadLocal] [] (initialValue [] 42)) p (promise)] (.set t 7) (.start (Thread. (fn [] (.set t 99) (deliver p :child-done)))) [(deref p 5000 :TIMED-OUT) (.get t)])" :portability :jvm}
+  ;; InheritableThreadLocal is the opposite contract, and jolt used to be unable to
+  ;; tell the two apart: the proxy macro lowered both to the same object.
+  {:suite "interop / ThreadLocal" :label "an InheritableThreadLocal child DOES inherit the parent's value" :expected "7" :actual "(let [t (proxy [InheritableThreadLocal] [] (initialValue [] 42)) p (promise)] (.set t 7) (.start (Thread. (fn [] (deliver p (.get t))))) (deref p 5000 :TIMED-OUT))" :portability :jvm}
+  {:suite "interop / ThreadLocal" :label "an InheritableThreadLocal the parent never read gives the child its own initial value" :expected "42" :actual "(let [t (proxy [InheritableThreadLocal] [] (initialValue [] 42)) p (promise)] (.start (Thread. (fn [] (deliver p (.get t))))) (deref p 5000 :TIMED-OUT))" :portability :jvm}
+  {:suite "interop / ThreadLocal" :label "a child's set does not leak back into an InheritableThreadLocal parent" :expected "[:child-done 7]" :actual "(let [t (proxy [InheritableThreadLocal] [] (initialValue [] 42)) p (promise)] (.set t 7) (.start (Thread. (fn [] (.set t 99) (deliver p :child-done)))) [(deref p 5000 :TIMED-OUT) (.get t)])" :portability :jvm}
   {:suite "syntax-quote / classes" :label "imported class qualifies to its FQN" :expected "(quote java.lang.Thread)" :actual "`Thread" :portability :jvm}
   {:suite "syntax-quote / classes" :label "String qualifies to java.lang.String" :expected "(quote java.lang.String)" :actual "`String" :portability :jvm}
   {:suite "syntax-quote / classes" :label "class tag in metadata qualifies" :expected "(quote java.lang.Thread)" :actual "(-> `^Thread [] meta :tag)" :portability :jvm}
