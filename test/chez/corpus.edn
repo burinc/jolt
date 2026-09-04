@@ -5911,4 +5911,14 @@
   ;; IllegalArgumentException, not an index fault from reading the missing arg.
   {:suite "host-interop / shim arity fault" :label "a method called with too few args raises IllegalArgumentException with the JVM's message" :expected "[true \"No matching field found: substring for class java.lang.String\"]" :actual "(try (.substring \"abc\") (catch IllegalArgumentException e [(instance? Throwable e) (.getMessage e)]))" :portability :jvm}
   {:suite "host-interop / shim arity fault" :label "a Class method called with too few args is an IllegalArgumentException too" :expected "[true true]" :actual "(try (.getDeclaredField clojure.lang.Keyword) (catch IllegalArgumentException e [(instance? Throwable e) (some? (ex-message e))]))" :portability :jvm}
+  ;; -> / ->> thread the whole chain in ONE expansion step, like the reference's
+  ;; loop-based versions. A recursive definition answers a fresh (-> ...) form
+  ;; instead, which agrees only after a full macroexpand — tooling that inspects a
+  ;; single step (tools.analyzer, a linter) sees the wrong shape.
+  {:suite "macros / threading expands in one step" :label "-> with a bare symbol step" :expected "\"(inc 1)\"" :actual "(pr-str (macroexpand-1 (quote (-> 1 inc))))" :portability :common}
+  {:suite "macros / threading expands in one step" :label "-> threads every step, not just the first" :expected "\"(* (+ 1 2) 3)\"" :actual "(pr-str (macroexpand-1 (quote (-> 1 (+ 2) (* 3)))))" :portability :common}
+  {:suite "macros / threading expands in one step" :label "->> threads last, all the way down" :expected "\"(filter odd? (map inc [1 2]))\"" :actual "(pr-str (macroexpand-1 (quote (->> [1 2] (map inc) (filter odd?)))))" :portability :common}
+  {:suite "macros / threading expands in one step" :label "->> mixes bare symbols in" :expected "\"(dec (inc 1))\"" :actual "(pr-str (macroexpand-1 (quote (->> 1 inc dec))))" :portability :common}
+  {:suite "macros / threading expands in one step" :label "no steps expands to the value itself" :expected "[\"x\" \"x\"]" :actual "[(pr-str (macroexpand-1 (quote (-> x)))) (pr-str (macroexpand-1 (quote (->> x))))]" :portability :common}
+  {:suite "macros / threading expands in one step" :label "and the threaded values are unchanged" :expected "[8 9]" :actual "[(-> 5 inc dec (+ 3)) (->> [1 2 3] (map inc) (reduce +))]" :portability :common}
 ]

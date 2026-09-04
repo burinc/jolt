@@ -144,24 +144,34 @@
             specs)))
 
 ;; Threading: a list form threads x in as the first (->) or last (->>) arg; a bare
-;; symbol becomes (form x). Recursive; the expand-once cache makes that free.
+;; symbol becomes (form x). Iterative, so ONE expansion step yields the whole
+;; chain: a consumer that reads a single macroexpand-1 (tools.analyzer, a linter)
+;; gets the threaded shape, where a recursive definition would hand back another
+;; (-> ...) and only agree after a full macroexpand. A threaded step keeps its own
+;; form's metadata, so a fault inside the chain reports that step's line and not
+;; the whole chain's; a bare symbol has no form of its own and inherits the call's.
+;; loop*/recur, not loop: the loop macro is defined further down this file.
 (defmacro -> [x & forms]
-  (if (empty? forms)
-    x
-    (let [form (first forms)
-          threaded (if (seq? form)
-                     `(~(first form) ~x ~@(rest form))
-                     `(~form ~x))]
-      `(-> ~threaded ~@(rest forms)))))
+  (loop* [x x
+          forms (seq forms)]
+    (if forms
+      (let* [form (first forms)
+             threaded (if (seq? form)
+                        (with-meta `(~(first form) ~x ~@(rest form)) (meta form))
+                        `(~form ~x))]
+        (recur threaded (next forms)))
+      x)))
 
 (defmacro ->> [x & forms]
-  (if (empty? forms)
-    x
-    (let [form (first forms)
-          threaded (if (seq? form)
-                     `(~(first form) ~@(rest form) ~x)
-                     `(~form ~x))]
-      `(->> ~threaded ~@(rest forms)))))
+  (loop* [x x
+          forms (seq forms)]
+    (if forms
+      (let* [form (first forms)
+             threaded (if (seq? form)
+                        (with-meta `(~(first form) ~@(rest form) ~x) (meta form))
+                        `(~form ~x))]
+        (recur threaded (next forms)))
+      x)))
 
 ;; Forward declaration interns unbound vars (Clojure semantics). The interpreter
 ;; resolves forward refs lazily either way, but the COMPILER classifies globals at
