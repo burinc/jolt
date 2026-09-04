@@ -1,0 +1,9 @@
+Unhandled exception (RuntimeException): Invalid token: :::c
+  at ./test/errors/read/invalid-keyword/input.clj:1:1
+  trace:
+    rdr-read-keyword
+    rdr-read-seq
+    rdr-read-form
+    rdr-read-top
+    cmd-run
+exit: 1
