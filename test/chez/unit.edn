@@ -737,6 +737,14 @@
   {:suite "reader" :expr "(:line (meta (macroexpand-1 (read-string \"(when x y)\"))))" :expected "1"}
   {:suite "reader" :expr "(:line (meta (macroexpand-1 (read-string \"\\n\\n(when x y)\"))))" :expected "3"}
   {:suite "reader" :expr "(:column (meta (macroexpand-1 (read-string \"(when x y)\"))))" :expected "1"}
+  ;; Each -> step keeps its own form's position, so a fault inside a chain reports
+  ;; the step's line and not the whole chain's. A bare-symbol step has no form of
+  ;; its own, so it inherits the -> call's position.
+  {:suite "reader" :expr "(:line (meta (macroexpand-1 (read-string \"(-> 1\\n  (inc))\"))))" :expected "2"}
+  {:suite "reader" :expr "(:line (meta (macroexpand-1 (read-string \"(-> 1\\n  (inc)\\n  (dec))\"))))" :expected "3"}
+  {:suite "reader" :expr "(:line (meta (second (macroexpand-1 (read-string \"(-> 1\\n  (inc)\\n  (dec))\")))))" :expected "2"}
+  {:suite "reader" :expr "(:line (meta (macroexpand-1 (read-string \"\\n(-> 1 inc)\"))))" :expected "2"}
+  {:suite "reader" :expr "(:line (meta (macroexpand-1 (read-string \"(->> [1]\\n  (map inc))\"))))" :expected "2"}
   {:suite "reader" :expr "(= 42 (with-in-str \"42\" (read)))" :expected "true"}
   {:suite "reader" :expr "(= (quote (+ 1 2)) (with-in-str \"(+ 1 2)\" (read)))" :expected "true"}
   {:suite "reader" :expr "(with-in-str \"1 2\" [(read) (read)])" :expected "[1 2]"}
