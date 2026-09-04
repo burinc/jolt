@@ -47,6 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Unicode-aware `String.equalsIgnoreCase` and JVM-compatible
+  `compareToIgnoreCase` results.** The instance methods used a separate ASCII
+  lowercase path and reduced every nonzero comparison to `-1` or `1`, even
+  though `String/CASE_INSENSITIVE_ORDER` already modeled Java's character-wise
+  upper-then-lower fold and returned the differing character values. They now
+  share that implementation, so non-ASCII pairs such as `"É"` / `"é"`, null
+  equality, and comparison magnitudes agree with the JVM.
+
 - **`java.lang.ThreadLocal` is per-thread again, and the class exists.** The
   value lived in a Chez thread parameter, which a forked thread inherits, so a
   child observed the parent's stored value instead of running its own

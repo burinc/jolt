@@ -4,9 +4,11 @@
 ;; which falls through to jolt-string-method here when the target is a string.
 ;; Covers the
 ;; portable java.lang.String/CharSequence methods cljc libraries actually call.
-;; Case mapping is ASCII (the whole engine is byte-oriented), indexOf returns -1
-;; on miss as on the JVM, indices come in as flonums, char results are Scheme
-;; chars, and numeric results are flonums to match jolt's number model.
+;; The case-conversion methods preserve their existing ASCII contract; Java's
+;; case-insensitive comparison methods use their separate character-wise
+;; Unicode fold. indexOf returns -1 on miss as on the JVM, indices come in as
+;; flonums, char results are Scheme chars, and numeric results are flonums to
+;; match jolt's number model.
 ;;
 ;; Loaded from rt.ss AFTER regex.ss (the regex methods reuse jolt-re-pattern /
 ;; regex-t-irx) and records.ss (which calls jolt-string-method).
@@ -40,6 +42,28 @@
                     ((fx=? j n) r)
                   (string-set! r j (ascii-down-char (string-ref s j)))))
               (check (fx+ i 1)))))))
+
+;; String.compareToIgnoreCase, character for character: each pair is folded to
+;; upper case, then to lower case when that still differs, and the first pair
+;; that differs answers the DIFFERENCE of the folded chars (not merely a sign).
+;; Equal prefixes answer the length difference. This is also the comparison
+;; contract used by String.CASE_INSENSITIVE_ORDER.
+(define (jvm-string-ci-compare a b)
+  (let ((la (string-length a)) (lb (string-length b)))
+    (let loop ((i 0))
+      (cond ((or (fx=? i la) (fx=? i lb)) (fx- la lb))
+            (else
+             (let ((ca (string-ref a i)) (cb (string-ref b i)))
+               (if (char=? ca cb)
+                   (loop (fx+ i 1))
+                   (let ((ua (char-upcase ca)) (ub (char-upcase cb)))
+                     (if (char=? ua ub)
+                         (loop (fx+ i 1))
+                         (let ((da (char-downcase ua)) (db (char-downcase ub)))
+                           (if (char=? da db)
+                               (loop (fx+ i 1))
+                               (fx- (char->integer da)
+                                    (char->integer db)))))))))))))
 
 ;; Two different notions of whitespace, and the JVM uses both. String.trim drops
 ;; anything at or below the space character; clojure.string/trim drops whatever
@@ -344,14 +368,15 @@
     ((string=? method "concat") (string-append s (str-arg (arg 0))))
     ((string=? method "replace") (str-replace-literal s (str-needle (arg 0)) (str-needle (arg 1))))
     ((string=? method "equalsIgnoreCase")
-     (string=? (ascii-string-down s) (ascii-string-down (arg 0))))
+     (let ((o (arg 0)))
+       (and (not (jolt-nil? o))
+            (fx=? 0 (jvm-string-ci-compare s (jolt-need-str o))))))
     ;; compareTo answers an INT on the JVM, not a double — it fed straight into
     ;; (neg? …) fine but printed as -1.0, and (= -1 (.compareTo …)) was false.
     ((string=? method "compareTo")
      (let ((o (jolt-need-str (arg 0)))) (cond ((string<? s o) -1) ((string>? s o) 1) (else 0))))
     ((string=? method "compareToIgnoreCase")
-     (let ((a (string-downcase s)) (b (string-downcase (jolt-need-str (arg 0)))))
-       (cond ((string<? a b) -1) ((string>? a b) 1) (else 0))))
+     (jvm-string-ci-compare s (jolt-need-str (arg 0))))
     ;; CharSequence content equality — the same characters, whatever the receiver's
     ;; concrete type (a StringBuilder compares equal to the String it holds).
     ((string=? method "contentEquals")

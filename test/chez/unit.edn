@@ -849,6 +849,7 @@
   {:suite "str" :expr "(= -1 (.compareTo \"a\" \"b\"))" :expected "true"}
   {:suite "str" :expr "(.compareToIgnoreCase \"ABC\" \"abc\")" :expected "0"}
   {:suite "str" :expr "(.contentEquals \"ab\" (StringBuilder. \"ab\"))" :expected "true"}
+  {:suite "str" :expr "[(.equalsIgnoreCase \"É\" \"é\") (.equalsIgnoreCase \"É\" nil) (.compareToIgnoreCase \"a\" \"c\") (.compareToIgnoreCase \"Z\" \"a\") (.compare String/CASE_INSENSITIVE_ORDER \"É\" \"é\")]" :expected "[true false -2 25 0]"}
   {:suite "str" :expr "[(.regionMatches \"abcd\" 1 \"bc\" 0 2) (.regionMatches \"abcd\" 1 \"xy\" 0 2)]" :expected "[true false]"}
   ;; the leading-boolean ignore-case overload, and an out-of-range region (false, not a throw)
   {:suite "str" :expr "[(.regionMatches \"abcd\" true 1 \"BC\" 0 2) (.regionMatches \"abcd\" false 1 \"BC\" 0 2)]" :expected "[true false]"}
