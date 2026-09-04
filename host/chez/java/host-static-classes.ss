@@ -2071,6 +2071,45 @@
 (define (reflect-args a) (if (jolt-nil? a) '() (seq->list (jolt-seq a))))
 (define (reflect-construct cls . args)
   (apply host-new (if (jclass? cls) (jclass-name cls) (jolt-str-render-one cls)) args))
+;; clojure.lang.Var / Symbol / Keyword statics — all four used to raise "No
+;; dependency provides", and typedclojure gensyms every fresh type variable
+;; through Symbol/intern. Var.find is find-var plus the JVM's missing-namespace
+;; error (find-var answers nil for any missing cell); Var.intern is spelled out
+;; below, where it parts ways with clojure.core/intern. Symbol.intern / create are `symbol` (the first slash
+;; splits the namespace); Keyword.intern is `keyword`; Keyword.find answers only
+;; a keyword the intern table already holds, nil otherwise, as on the JVM.
+(register-class-statics! "clojure.lang.Var"
+  (list (cons "find" (lambda (sym)
+          (let ((sns (symbol-t-ns sym)))
+            (if (and (string? sns) (not (hashtable-ref ns-registry sns #f)))
+                (throw-jvm (quote IllegalArgumentException) (string-append "No such namespace: " sns))
+                (jolt-find-var sym)))))
+        ;; Var.intern is NOT clojure.core/intern: the two-argument overload takes a
+        ;; symbol and findOrCreates the namespace, where clojure.core/intern raises
+        ;; on a missing one; and only the Namespace overload takes a root, so a
+        ;; symbol with one is the JVM's ClassCastException.
+        (cons "intern" (lambda (ns sym . root)
+          (when (and (pair? root) (not (jns? ns)))
+            (throw-jvm (quote ClassCastException)
+                       "class clojure.lang.Symbol cannot be cast to class clojure.lang.Namespace"))
+          (unless (jns? ns) (jolt-create-ns ns))
+          (apply jolt-intern ns sym root)))))
+(register-class-statics! "clojure.lang.Symbol"
+  (list (cons "intern" (lambda args (apply jolt-symbol-new args)))
+        (cons "create" (lambda args (apply jolt-symbol-new args)))))
+(define (keyword-find . args)
+  (let-values (((ns name)
+                (if (= (length args) 2)
+                    (values (let ((n (car args))) (if (jolt-nil? n) #f n)) (jolt-need-string (cadr args)))
+                    (let ((s (jolt-symbol-new (car args))))   ; a symbol, or a string split at its first slash
+                      (values (symbol-t-ns s) (symbol-t-name s))))))
+    (or (if ns
+            (hashtable-ref keyword-table (keyword-intern-key ns name) #f)
+            (hashtable-ref keyword-table-bare name #f))
+        jolt-nil)))
+(register-class-statics! "clojure.lang.Keyword"
+  (list (cons "intern" (lambda args (apply jolt-keyword args)))
+        (cons "find" keyword-find)))
 (register-class-statics! "clojure.lang.Reflector"
   (list (cons "invokeConstructor"
               (lambda (cls args) (apply reflect-construct cls (reflect-args args))))

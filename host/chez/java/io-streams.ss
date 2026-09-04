@@ -828,6 +828,8 @@
            (make-out-stream (open-file-output-port (path-of x)
                               (if append? (file-options no-fail no-truncate append) (file-options no-fail))
                               (buffer-mode block)))))
+        ;; a file: URL writes its target, any other protocol raises (io.ss).
+        ((url-jhost? x) (apply jio-output-stream (url-write-path x) rest))
         ;; System/out and System/err are already byte streams — pass them through,
         ;; the way an out-stream passes through.
         ((and (jhost? x) (text-sink-tag? (jhost-tag x))) x)
