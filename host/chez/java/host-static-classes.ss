@@ -2529,6 +2529,13 @@
 (register-class-arm!
   (lambda (x) (and (jhost? x) (jhost-fqn (jhost-tag x)) #t))
   (lambda (x) (jhost-fqn (jhost-tag x))))
+;; An iterator is a seq walked by hasNext/next, which is what
+;; clojure.lang.SeqIterator is; the JVM's per-collection inner classes
+;; (PersistentVector$2) have no counterpart in jolt's single representation.
+;; Without a row here (class it) leaked the :object taxonomy keyword and
+;; (instance? java.util.Iterator it) was false — value-host-tags reads the
+;; class arms, so this one row answers class, instance? and protocol dispatch.
+(register-class-arm! jiterator? (lambda (x) "clojure.lang.SeqIterator"))
 ;; sorted collections and transients report their JVM classes. jolt's one
 ;; transient-map representation reports TransientHashMap (the JVM also has
 ;; PersistentArrayMap$TransientArrayMap for small maps).

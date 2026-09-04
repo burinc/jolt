@@ -268,29 +268,33 @@
         keys vals)
       (reverse result))))
 
+;; The hex an object's default toString appends is Integer.toHexString of its
+;; hashCode, i.e. its IDENTITY hash. equal-hash is not that: it answers one
+;; constant for every procedure (hasheq.ss records the measurement), so every
+;; anonymous fn rendered the same string and a two-operand cast error named
+;; both operands identically. jolt-identity-hasheq is the per-object id
+;; (hash f) already reports — the same number the JVM prints. Rendering it
+;; unsigned over 32 bits is what Integer.toHexString does; the old (abs …)
+;; collapsed h and -h onto one string.
+(define (jolt-identity-hex x)
+  (string-downcase (number->string (bitwise-and (jolt-identity-hasheq x) #xffffffff) 16)))
 ;; (str f) of a fn renders JVM-style — "ns$name@hexhash" — so code that parses
 ;; fn identity out of the string (expound's pprint-fn) finds the $-separated
 ;; class name instead of a raw Chez #<procedure> form.
 (register-str-render!
   (lambda (x) (procedure? x))
-  (lambda (x) (string-append (jolt-class-name x) "@"
-                             (string-downcase (number->string (abs (equal-hash x)) 16)))))
+  (lambda (x) (string-append (jolt-class-name x) "@" (jolt-identity-hex x))))
 ;; pr/print of a fn uses the JVM object form — #object[ns$name 0xHASH
 ;; "ns$name@HASH"] — which fn-identity parsers (lasertag's resolve-fn-name)
 ;; read the class name out of.
-(register-pr-arm!
-  (lambda (x) (procedure? x))
-  (lambda (x)
-    (let ((cn (jolt-class-name x))
-          (h (string-downcase (number->string (abs (equal-hash x)) 16))))
-      (string-append "#object[" cn " 0x" h " \"" cn "@" h "\"]"))))
+(define (jolt-fn-object-form x)
+  (let ((cn (jolt-class-name x))
+        (h (jolt-identity-hex x)))
+    (string-append "#object[" cn " 0x" h " \"" cn "@" h "\"]")))
+(register-pr-arm! (lambda (x) (procedure? x)) jolt-fn-object-form)
 ;; print of a fn uses the same #object form as pr (the JVM prints fns through
 ;; print-method Object on both paths); str keeps the bare cn@hash.
 (let ((prev (var-deref "clojure.core" "__print1")))
   (def-var! "clojure.core" "__print1"
     (lambda (x)
-      (if (procedure? x)
-          (let ((cn (jolt-class-name x))
-                (h (string-downcase (number->string (abs (equal-hash x)) 16))))
-            (string-append "#object[" cn " 0x" h " \"" cn "@" h "\"]"))
-          (jolt-invoke1 prev x)))))
+      (if (procedure? x) (jolt-fn-object-form x) (jolt-invoke1 prev x)))))

@@ -496,6 +496,15 @@
 (jch-register-supers! "java.util.Collection" '("java.lang.Iterable"))
 (jch-register-supers! "java.util.RandomAccess" '())
 (jch-register-supers! "java.util.Comparator" '())
+;; jolt has ONE iterator over a seq where the JVM has an inner class per
+;; collection (PersistentVector$2, …), and clojure.lang.SeqIterator is the JVM
+;; class that iterator IS — a seq walked by hasNext/next. Naming it that keeps
+;; (class (.iterator coll)) a real class instead of leaking the :object
+;; taxonomy keyword, and (SeqIterator. s) then reports the same class the JVM
+;; gives it. Iterator's own row is empty so it is a graph node, not an
+;; unregistered name.
+(jch-register-supers! "java.util.Iterator" '())
+(jch-register-supers! "clojure.lang.SeqIterator" '("java.util.Iterator"))
 ;; Serializable is a marker too. Its rows below sit exactly where the JVM
 ;; declares it — on Number, on the wrapper classes that are not Numbers, and on
 ;; the abstract Clojure collection classes — so every concrete class inherits it
