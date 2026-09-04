@@ -384,7 +384,13 @@
         ;; decide whether to emit ANSI, and a nil means "not a tty".
         (cons "console" (lambda _ jolt-nil))
         (cons "lineSeparator" (lambda _ "\n"))
-        (cons "identityHashCode" (lambda (x) (->num (equal-hash x))))
+        ;; identityHashCode is the object's own hash, not its contents' —
+        ;; equal-hash answers one constant for every procedure and hashes a
+        ;; collection structurally, so two distinct fns (and two equal vectors)
+        ;; came back with the same "identity". jolt-identity-hasheq is the
+        ;; per-object id a weak side table hands out, which is also what
+        ;; (hash f) reports, exactly as on the JVM.
+        (cons "identityHashCode" (lambda (x) (->num (jolt-identity-hasheq x))))
         ;; System.arraycopy(src, srcPos, dest, destPos, length). Specified to
         ;; behave as if the source range were copied to a temporary first, so a
         ;; copy that OVERLAPS within one array still reads pre-copy values —
