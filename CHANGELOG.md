@@ -47,10 +47,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Atom `compare-and-set!` now compares expected values with Jolt identity.**
-  Equal but distinct reference values no longer allow an update or run value
-  equality, matching Clojure's Atom contract for reference values. Chez
-  immediates retain Jolt's documented substrate identity model.
+- **`compare-and-set!` compares the expected value by identity.** It compared
+  with `=`, so an equal but distinct object authorized a replacement of a value
+  the caller had never observed, and the comparison could realize a lazy value
+  on its way to saying no. It is `identical?` now — what `swap!`'s own CAS loop
+  and the `AtomicReference` shim already used, and what the JVM's atom does.
+  Code that relied on an equal-but-distinct expectation succeeding will see it
+  fail, which is what it does on the JVM. Chez immediates (a fixnum, a
+  character) have no distinct boxes, so a CAS between two equal ones still
+  succeeds where the JVM's boxing can tell them apart; that narrower case is
+  the `:concurrency-model` divergence now, recorded with an oracle.
 - **The default time zone is the machine's.** `TimeZone/getDefault`,
   `Calendar/getInstance`, a `SimpleDateFormat` with no zone set, the deprecated
   `Date` constructor and getters, `java.sql.Date.valueOf` and `toLocalDate` all
@@ -300,6 +306,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prompt that said `user`, and `-main` under `run -m` ran in `jolt.main`.
   `clojure.main` starts every entry in `user`; jolt does too now, and the REPL
   prompt names whatever namespace is current, as `clojure.main`'s does.
+
 ## [0.8.1] - 2026-09-02
 
 Host classes are provided by declaration now. The runtime no longer carries the
