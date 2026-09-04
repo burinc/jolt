@@ -5997,4 +5997,16 @@
   {:suite "macros / cond-> expands like the reference" :label "no clauses is the value in a let" :expected "\"(clojure.core/let [g 1] g)\"" :actual "(clojure.string/replace (pr-str (macroexpand-1 (quote (cond-> 1)))) #\"G__[0-9]+\" \"g\")" :portability :common}
   {:suite "macros / cond-> expands like the reference" :label "a list step keeps its extra args" :expected "\"(clojure.core/let [g 1] (if true (clojure.core/-> g (assoc :a 1)) g))\"" :actual "(clojure.string/replace (pr-str (macroexpand-1 (quote (cond-> 1 true (assoc :a 1))))) #\"G__[0-9]+\" \"g\")" :portability :common}
   {:suite "macros / cond-> expands like the reference" :label "and the threaded values are unchanged" :expected "[2 1 {:a 1 :b 2}]" :actual "[(cond-> 1 true inc) (cond-> 1 false inc) (cond-> {} true (assoc :a 1) (= 1 1) (assoc :b 2))]" :portability :common}
+  ;; :dynamic is a FIELD on the var, not a metadata entry that `binding` reads
+  ;; back. jolt derived it from the metadata, so alter-meta! could make a var
+  ;; bindable (and un-bindable) where the JVM's flag does not move, and
+  ;; .setDynamic had to write metadata the JVM leaves alone. The `def` ASSIGNS
+  ;; the field from its declared metadata — both directions, so a plain re-def of
+  ;; a dynamic var clears it — and nothing else but .setDynamic touches it.
+  {:suite "vars / dynamic is a field" :label "a ^:dynamic def sets both the flag and the metadata" :expected "[true true]" :actual "(do (def ^:dynamic *dy1* 1) [(.isDynamic (var *dy1*)) (:dynamic (meta (var *dy1*)))])" :portability :jvm}
+  {:suite "vars / dynamic is a field" :label "alter-meta! does not make a var bindable" :expected "[false true \"IllegalStateException\"]" :actual "(do (def dy2 1) (alter-meta! (var dy2) assoc :dynamic true) [(.isDynamic (var dy2)) (:dynamic (meta (var dy2))) (try (eval (quote (binding [dy2 2] dy2))) (catch Throwable e (.getSimpleName (class e))))])" :portability :jvm}
+  {:suite "vars / dynamic is a field" :label "setDynamic sets the flag and leaves the metadata alone" :expected "[true nil 2]" :actual "(do (def dy3 1) (.setDynamic (var dy3)) [(.isDynamic (var dy3)) (:dynamic (meta (var dy3))) (eval (quote (binding [dy3 2] dy3)))])" :portability :jvm}
+  {:suite "vars / dynamic is a field" :label "and dropping the metadata does not un-bind it" :expected "[true nil 2]" :actual "(do (def ^:dynamic *dy4* 1) (alter-meta! (var *dy4*) dissoc :dynamic) [(.isDynamic (var *dy4*)) (:dynamic (meta (var *dy4*))) (eval (quote (binding [*dy4* 2] *dy4*)))])" :portability :jvm}
+  {:suite "vars / dynamic is a field" :label "a plain re-def clears the flag" :expected "[true false]" :actual "(do (def ^:dynamic *dy5* 1) (let [was (.isDynamic (var *dy5*))] (eval (quote (def *dy5* 2))) [was (.isDynamic (var *dy5*))]))" :portability :jvm}
+  {:suite "vars / dynamic is a field" :label "intern carries the metadata but not the flag" :expected "[false true]" :actual "(do (intern (quote user) (with-meta (quote dy6) {:dynamic true}) 1) [(.isDynamic (resolve (quote dy6))) (:dynamic (meta (resolve (quote dy6))))])" :portability :jvm}
 ]

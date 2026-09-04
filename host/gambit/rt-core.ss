@@ -448,13 +448,13 @@
 ;; two hosts' cells must not drift (this one sat at v2 while chez moved twice).
 (define-record-type var-cell
   (fields ns name (mutable root) (mutable defined?) (mutable meta) (mutable macro?)
-          (mutable dyn-bound?))
-  (nongenerative var-cell-v4))
+          (mutable dyn-bound?) (mutable dynamic?))
+  (nongenerative var-cell-v5))
 (define var-table (make-hashtable string-hash string=?))
 (define (jolt-var ns name)
   (let ((k (string-append ns "/" name)))
     (or (hashtable-ref var-table k #f)
-        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f)))
+        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f #f)))
           (hashtable-set! var-table k c)
           c))))
 ;; non-creating lookup (resolve / find-var / ns-unmap): #f when absent, so a
@@ -485,6 +485,9 @@
     (when (not (jolt-var-unbound? (var-cell-root c)))
       (hashtable-set! var-redefined-set (string-append ns "/" name) #t))
     (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
+;; A def whose form declared NO metadata — see host/chez/rt.ss def-var-plain!.
+(define (def-var-plain! ns name v)
+  (let ((c (def-var! ns name v))) (var-cell-dynamic?-set! c #f) c))
 ;; Value-position comparison references compile to the seq.ss chain singletons
 ;; (jolt-lt/gt/le/ge), not to the clojure.core var roots — the roots were later
 ;; re-bound by the checked numeric layer, so def-var! never saw these procs.
@@ -518,16 +521,23 @@
 ;; keyed by the cell. jolt-meta (natives-meta.ss) merges it onto {:ns :name},
 ;; which it derives from the cell — so EVERY var (plain def, native-op, declare)
 ;; reports {:ns :name} like Clojure, with the user meta layered on when present.
-;; Meta and the macro flag live IN the cell (var-cell-v4 fields), matching
-;; chez: the shared files read and write the fields directly (dyn-binding.ss's
-;; dynamic check reads meta, ns.ss's alter-meta! sync writes macro?), so the
+;; Meta, the macro flag and the dynamic flag live IN the cell (var-cell-v5
+;; fields), matching chez: the shared files read and write the fields directly
+;; (dyn-binding.ss's dynamic check reads dynamic?, ns.ss's alter-meta! sync
+;; writes macro?), so the
 ;; eq-side-tables this file used to keep were invisible to them — a var defined
 ;; ^:dynamic through the seed still threw "non-dynamic" at the first binding.
 (define jolt-kw-var-ns (keyword #f "ns"))
 (define jolt-kw-var-name (keyword #f "name"))
 (define jolt-kw-var-macro (keyword #f "macro"))
 (define (def-var-with-meta! ns name v m)
-  (let ((c (def-var! ns name v))) (var-cell-meta-set! c m) c))
+  (let ((c (def-var! ns name v)))
+    (var-cell-meta-set! c m)
+    (var-cell-dynamic?-set! c (var-meta-dynamic? m))
+    c))
+(define (var-meta-dynamic? m)
+  (and m (not (jolt-nil? m))
+       (jolt-truthy? (jolt-get m (keyword #f "dynamic")))))
 ;; A runtime-defined DYNAMIC var (the *earmuffed* core vars): tagged :dynamic so
 ;; push-thread-bindings accepts it — with no meta entry a var is non-dynamic and
 ;; binding throws, like the JVM.
@@ -537,7 +547,9 @@
 ;; Attach meta to an already-interned var (the declare/no-init emission path:
 ;; (def ^:dynamic *x*) must be bindable before its root is set).
 (define (set-var-meta! ns name m)
-  (var-cell-meta-set! (jolt-var ns name) m))
+  (let ((c (jolt-var ns name)))
+    (var-cell-meta-set! c m)
+    (var-cell-dynamic?-set! c (var-meta-dynamic? m))))
 ;; runtime-macro flag: a var whose root holds a macro expander fn, so the
 ;; analyzer's form-macro?/form-expand-1 (host-contract.ss) expand it. The
 ;; prelude emits each core/stdlib defmacro as a def-var! of its expander
@@ -561,7 +573,7 @@
         ;; declaration-only var stays defined?=#f and resolve/find-var/ns-interns
         ;; miss it in an AOT build. The existing root is left intact.
         (begin (var-cell-defined?-set! c #t) c)
-        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f)))  ; declared => interned/resolvable
+        (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f #f)))  ; declared => interned/resolvable
           (hashtable-set! var-table k c)
           c))))
 

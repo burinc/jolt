@@ -811,7 +811,7 @@
                   "hashtable-ref"
                   ;; top-level def / forward-declare / ns-value splice
                   ;; (emit-def-cached, :forward-decl, :the-ns).
-                  "define" "def-var!" "def-var-with-meta!"
+                  "define" "def-var!" "def-var-plain!" "def-var-with-meta!"
                   "declare-var!" "intern-ns!"
                   ;; ffi lowering (emit-ffi-fn/emit-ffi-callable: the sa-* adapter
                   ;; syntaxes a Chez foreign-procedure/callable expands to).
@@ -3053,7 +3053,7 @@
                      (str "(def-var-with-meta! " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) " "
                           (emit-with-cells #(emit (:init node))) " " (emit-def-meta node) ")")
                      :else
-                     (str "(def-var! " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) " "
+                     (str "(def-var-plain! " (chez-str-lit (:ns node)) " " (chez-str-lit (:name node)) " "
                           (emit-with-cells #(emit (:init node))) ")"))
                    creg (trace-callsite-reg)
                    freg (fnsrc-flush)]
@@ -3142,7 +3142,7 @@
         (str "(begin" freg " (define " b " " init ") (def-var-with-meta! "
              (chez-str-lit ns) " " (chez-str-lit nm) " " b " " (emit-def-meta node) ")"
              (or reg "") (or vreg "") creg ")")
-        (str "(begin" freg " (define " b " " init ") (def-var! "
+        (str "(begin" freg " (define " b " " init ") (def-var-plain! "
              (chez-str-lit ns) " " (chez-str-lit nm) " " b ")" (or reg "") (or vreg "") creg ")"))
       (jmeta-nonempty? (:meta node))
       (if (= (str creg freg) "")
@@ -3152,9 +3152,9 @@
           (str "(begin" freg " (let ((" v " (def-var-with-meta! " (chez-str-lit ns) " " (chez-str-lit nm) " " init " " (emit-def-meta node) ")))" creg " " v "))")))
       :else
       (if (= (str creg freg) "")
-        (str "(def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")")
+        (str "(def-var-plain! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")")
         (let [v (fresh-label "_dv$")]
-          (str "(begin" freg " (let ((" v " (def-var! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")))" creg " " v "))"))))))
+          (str "(begin" freg " (let ((" v " (def-var-plain! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")))" creg " " v "))"))))))
 
 (defn emit-top-form [node]
   (binding [*fnsrc-ns* (or (:ns node) (:fnsrc-ns node))
