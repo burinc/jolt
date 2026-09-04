@@ -225,6 +225,7 @@ make corpus                   # conformance corpus vs the JVM-sourced spec
 make unit                     # host-specific unit cases
 make selfhost                 # bootstrap fixpoint (rebuild == checked-in seed)
 make smoke                    # bin/jolt CLI smoke
+make errorreport              # what a failing program PRINTS, pinned per case
 make sci                      # load borkdude/sci's source through jolt (compat stress)
 make ffi                      # the foreign-function interface, against C witnesses
 make transient                # transient mutation + linear-time builds
@@ -255,6 +256,16 @@ and `publish` waits on it.
 The conformance corpus (`test/chez/corpus.edn`) is a host-neutral language spec
 whose expected values are sourced from reference JVM Clojure. See
 [test/conformance/SPEC.md](test/conformance/SPEC.md).
+
+Error *reports* are pinned the same way, by `make errorreport`: one directory per
+case under `test/errors/`, holding the program and the exact report jolt prints
+for it — message, position, ex-data, trace and exit status. The golden files
+record today's behaviour, bugs included, so that fixing one shows up as a diff a
+reviewer can read. After an intended change:
+
+```bash
+sh host/chez/error-report-check.sh generate    # then read the diff
+```
 
 Divergences from JVM Clojure are tracked, not tolerated silently:
 `test/conformance/known-divergences.edn` holds both the corpus rows whose value
