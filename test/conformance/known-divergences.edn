@@ -893,7 +893,36 @@
    :check {:expr "(try (eval '(do (defprotocol PXD (pxd [x])) (extend-protocol PXD no.such.Thing (pxd [_] 1)))) :ok (catch Throwable _ :threw))"
            :jvm ":threw"
            :jolt ":ok"}
-   :note "A bare unresolvable name (NoSuchThing) throws on both, pinned in the corpus (protocols / extend-type resolution). The dotted leniency is the __register-class! contract."}]
+   :note "A bare unresolvable name (NoSuchThing) throws on both, pinned in the corpus (protocols / extend-type resolution). The dotted leniency is the __register-class! contract."}
+  ;; contains? on a bare deftype answers what the field index holds, where the JVM
+  ;; refuses the question outright — the same map-as-object superset the deftype
+  ;; entry above describes for (:a t), one seam further along. It stays true for a
+  ;; field-named key even on a type that declares its own ILookup, where the get
+  ;; path goes through that valAt instead: contains? asks whether the KEY is
+  ;; declared, which is a fact about the type either way. jolt-fpp3.7
+  {:category :host-model
+   :behavior "(contains? t :a) on a bare deftype with a field named a"
+   :jvm "throws IllegalArgumentException — contains? not supported on type"
+   :jolt "true — the field index answers"
+   :check {:expr "(do (deftype KDT [a] clojure.lang.ILookup (valAt [_ k] :v) (valAt [_ k d] :v)) (try (contains? (->KDT 1) :a) (catch IllegalArgumentException e :threw)))"
+           :jvm ":threw"
+           :jolt "true"}
+   :note "A defrecord is a map and answers contains? on both."}
+  ;; Var.setDynamic records the flag in the var's METADATA here. jolt reads
+  ;; :dynamic out of meta in both places that ask — .isDynamic and the check
+  ;; `binding` makes — where the JVM keeps a field beside the metadata and leaves
+  ;; the metadata alone. So the var IS bindable after setDynamic on both, and
+  ;; only the metadata read differs. (def ^:dynamic …) agrees on both, because
+  ;; the reader puts :dynamic in the metadata there. jolt-fpp3.7
+  {:category :host-model
+   :behavior "(:dynamic (meta v)) after (.setDynamic v)"
+   :jvm "nil — the flag is a field on the Var, not metadata"
+   :jolt "true — the flag IS the metadata entry"
+   :check {:expr "(do (def kdv 1) (.setDynamic (var kdv)) [(.isDynamic (var kdv)) (:dynamic (meta (var kdv)))])"
+           :jvm "[true nil]"
+           :jolt "[true true]"}
+   :note "Reached only by a bare .setDynamic call; a ^:dynamic def carries the metadata on both."}
+]
  :entries
  [;; Wherever a syntax-quote's CONSTRUCTION CODE becomes a value rather than
   ;; being compiled — a nested backtick, a quoted one, a macro's argument —

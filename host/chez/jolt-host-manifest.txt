@@ -181,6 +181,7 @@ register-extension-point!
 register-source!
 remove-dispatch-macro!
 rename-file!
+replace-builtin-ns!
 resolvable-names
 resolve-class-hint
 resolve-global

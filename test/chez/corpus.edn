@@ -5987,4 +5987,14 @@
   ;; identityHashCode of nil is 0 on the JVM — it is the one input with no object
   ;; to identify. jolt answered the nil sentinel's own id.
   {:suite "host-interop / identity hash" :label "identityHashCode of nil is 0" :expected "0" :actual "(System/identityHashCode nil)" :portability :jvm}
+  ;; cond-> expands to the reference's shape: ONE let with g rebound per step,
+  ;; each step delegating to -> rather than inlining the call itself. jolt built a
+  ;; nest of let* forms with a fresh symbol per step and threaded by hand, so a
+  ;; consumer reading a single macroexpand-1 saw neither — the same
+  ;; single-step-shape class #842 fixed for -> (cond->> already agreed).
+  ;; The gensym is normalized, since its number is not the claim.
+  {:suite "macros / cond-> expands like the reference" :label "one let, a step per pair, threading through ->" :expected "\"(clojure.core/let [g 1 g (if true (clojure.core/-> g inc) g)] (if false (clojure.core/-> g (+ 2)) g))\"" :actual "(clojure.string/replace (pr-str (macroexpand-1 (quote (cond-> 1 true inc false (+ 2))))) #\"G__[0-9]+\" \"g\")" :portability :common}
+  {:suite "macros / cond-> expands like the reference" :label "no clauses is the value in a let" :expected "\"(clojure.core/let [g 1] g)\"" :actual "(clojure.string/replace (pr-str (macroexpand-1 (quote (cond-> 1)))) #\"G__[0-9]+\" \"g\")" :portability :common}
+  {:suite "macros / cond-> expands like the reference" :label "a list step keeps its extra args" :expected "\"(clojure.core/let [g 1] (if true (clojure.core/-> g (assoc :a 1)) g))\"" :actual "(clojure.string/replace (pr-str (macroexpand-1 (quote (cond-> 1 true (assoc :a 1))))) #\"G__[0-9]+\" \"g\")" :portability :common}
+  {:suite "macros / cond-> expands like the reference" :label "and the threaded values are unchanged" :expected "[2 1 {:a 1 :b 2}]" :actual "[(cond-> 1 true inc) (cond-> 1 false inc) (cond-> {} true (assoc :a 1) (= 1 1) (assoc :b 2))]" :portability :common}
 ]

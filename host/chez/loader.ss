@@ -87,19 +87,50 @@
 ;; not let a classpath copy shadow a built-in either.
 (define ldr-ns-supplements '(("babashka.fs" . "jolt.bb.fs")))
 (define (ldr-supplement-of name)
-  (cond ((assoc name ldr-ns-supplements) => cdr) (else #f)))
+  (and (not (ldr-ns-replaced? name))
+       (cond ((assoc name ldr-ns-supplements) => cdr) (else #f))))
+
+;; ...and the escape hatch, because "jolt always wins" is not a thing a project
+;; can be stuck with. A project declares (deps.edn) which of these it supplies
+;; itself:
+;;
+;;   :jolt/replaces [babashka.fs]
+;;
+;; and its own copy resolves, with no supplement loaded over it — it is claiming
+;; the whole namespace, completing it included. jolt.deps collects the key and
+;; jolt.main hands it here through jolt.host/replace-builtin-ns! before any of
+;; the project compiles, which is the same ordering :jolt/provides needs.
+;;
+;; Only the PROJECT may declare one. A library that took a built-in over for the
+;; whole program would decide what babashka.fs MEANS for every other library in
+;; it, which is the shape the provider table already refuses for classes.
+(define ldr-ns-replacements '())
+(define (ldr-ns-replaced? name) (and (member name ldr-ns-replacements) #t))
+(define (replace-builtin-ns! name)
+  (unless (ldr-ns-replaced? name)
+    (set! ldr-ns-replacements (cons name ldr-ns-replacements))))
+;; the same question at the path level, for resolve-on-roots. A replacement
+;; covers the namespace's children too (babashka/fs/whatever), like the
+;; built-in list it overrides.
+(define (ldr-ns-replaced-rel? rel)
+  (let loop ((ns ldr-ns-replacements))
+    (and (pair? ns)
+         (or (ldr-rel-prefix? rel (ns-name->rel (car ns))) (loop (cdr ns))))))
 ;; Matched as a namespace PREFIX so a child (babashka/process/pprint) travels
 ;; with its parent.
 (define ldr-builtin-ns-rels '("babashka/fs" "babashka/process"))
 (define (ldr-builtin-ns-rel? rel)
   (let loop ((bs ldr-builtin-ns-rels))
     (and (pair? bs)
-         (let* ((b (car bs)) (bn (string-length b)))
-           (or (and (>= (string-length rel) bn)
-                    (string=? (substring rel 0 bn) b)
-                    (or (fx=? (string-length rel) bn)
-                        (char=? (string-ref rel bn) #\/)))
-               (loop (cdr bs)))))))
+         (or (ldr-rel-prefix? rel (car bs)) (loop (cdr bs))))))
+;; REL is B, or a child of it: matched as a namespace prefix so a child
+;; (babashka/process/pprint) travels with its parent.
+(define (ldr-rel-prefix? rel b)
+  (let ((bn (string-length b)))
+    (and (>= (string-length rel) bn)
+         (string=? (substring rel 0 bn) b)
+         (or (fx=? (string-length rel) bn)
+             (char=? (string-ref rel bn) #\/)))))
 
 ;; --- data readers (#tag literals) -------------------------------------------
 ;; A project's data_readers.{jolt,clj,cljc} at a source root maps a tag symbol to a
@@ -334,14 +365,21 @@
                       (let ((f (string-append (car roots) "/" rel (car es))))
                         (if (file-exists? f) f (ext (cdr es))))))
                (loop (cdr roots))))))
-  (or (let loop ((es ldr-source-exts))
-        (and (pair? es)
-             (let ((k (string-append rel (car es))))
-               (if (embedded-key? k) k (loop (cdr es))))))
-      ;; a namespace jolt provides as a host built-in resolves to jolt's copy
-      ;; before a project root's — see ldr-builtin-ns-rels
-      (and (ldr-builtin-ns-rel? rel) (on-roots ldr-install-roots))
-      (on-roots source-roots)))
+  ;; A namespace the project DECLARED it supplies is the project's, ahead of
+  ;; everything — including the embedded copy a built binary carries, which is
+  ;; what probes first for every other namespace. Anything less and the hatch
+  ;; would work in source mode and not in a build, which is the divergence the
+  ;; built-in rule exists to prevent.
+  (if (ldr-ns-replaced-rel? rel)
+      (on-roots source-roots)
+      (or (let loop ((es ldr-source-exts))
+            (and (pair? es)
+                 (let ((k (string-append rel (car es))))
+                   (if (embedded-key? k) k (loop (cdr es))))))
+          ;; a namespace jolt provides as a host built-in resolves to jolt's copy
+          ;; before a project root's — see ldr-builtin-ns-rels
+          (and (ldr-builtin-ns-rel? rel) (on-roots ldr-install-roots))
+          (on-roots source-roots))))
 
 ;; Read a namespace source. An embedded key (resolve-on-roots above, or the
 ;; build driver's app-order entries) reads its baked string; everything else is
@@ -2089,6 +2127,11 @@
   (lambda (roots) (set-source-roots! (seq->list roots)) jolt-nil))
 (def-var! "jolt.host" "source-roots" (lambda () (list->cseq source-roots)))
 (def-var! "jolt.host" "load-namespace" (lambda (n) (load-namespace n) jolt-nil))
+;; The Clojure-facing seam for :jolt/replaces (see ldr-ns-replacements above).
+;; jolt.deps collects the key and jolt.main calls this once per namespace after
+;; it resolves the project, before any of the project compiles.
+(def-var! "jolt.host" "replace-builtin-ns!"
+  (lambda (n) (replace-builtin-ns! (jolt-str-render-one n)) jolt-nil))
 (def-var! "jolt.host" "file-exists?" (lambda (p) (if (file-exists? p) #t #f)))
 ;; …and whether it is a DIRECTORY, which file-exists? also answers #t for. A bare
 ;; argv token is dispatched as a file to run before a :tasks lookup (main.clj's
