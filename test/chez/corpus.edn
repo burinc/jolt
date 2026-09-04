@@ -5921,4 +5921,13 @@
   {:suite "macros / threading expands in one step" :label "->> mixes bare symbols in" :expected "\"(dec (inc 1))\"" :actual "(pr-str (macroexpand-1 (quote (->> 1 inc dec))))" :portability :common}
   {:suite "macros / threading expands in one step" :label "no steps expands to the value itself" :expected "[\"x\" \"x\"]" :actual "[(pr-str (macroexpand-1 (quote (-> x)))) (pr-str (macroexpand-1 (quote (->> x))))]" :portability :common}
   {:suite "macros / threading expands in one step" :label "and the threaded values are unchanged" :expected "[8 9]" :actual "[(-> 5 inc dec (+ 3)) (->> [1 2 3] (map inc) (reduce +))]" :portability :common}
+  ;; defmacro is a special form here, so its var's expander only ever answers
+  ;; macroexpand-1 — but a tools.analyzer-style consumer expands to a fixpoint and
+  ;; reads that, and the JVM's answer is a defn plus a setMacro. It used to raise
+  ;; ("(mm [a] a) is not a proper list"), so the consumer saw a crash, not a shape.
+  {:suite "macros / defmacro expands like the JVM" :label "a single arity becomes one clause, with &form and &env leading" :expected "\"(do (clojure.core/defn mm ([&form &env a] a)) (. (var mm) (setMacro)) (var mm))\"" :actual "(pr-str (macroexpand-1 (quote (defmacro mm [a] a))))" :portability :common}
+  {:suite "macros / defmacro expands like the JVM" :label "every arity of a multi-arity macro gets them" :expected "\"(do (clojure.core/defn mm ([&form &env a] a) ([&form &env a b] b)) (. (var mm) (setMacro)) (var mm))\"" :actual "(pr-str (macroexpand-1 (quote (defmacro mm ([a] a) ([a b] b)))))" :portability :common}
+  {:suite "macros / defmacro expands like the JVM" :label "docstring and attr-map keep their place, a rest param survives" :expected "\"(do (clojure.core/defn mm \\\"d\\\" {:k 1} ([&form &env a & r] a)) (. (var mm) (setMacro)) (var mm))\"" :actual "(pr-str (macroexpand-1 (quote (defmacro mm \"d\" {:k 1} [a & r] a))))" :portability :common}
+  {:suite "macros / defmacro expands like the JVM" :label "a nullary macro still declares the two implicit params" :expected "\"(do (clojure.core/defn mm ([&form &env] 1)) (. (var mm) (setMacro)) (var mm))\"" :actual "(pr-str (macroexpand-1 (quote (defmacro mm [] 1))))" :portability :common}
+  {:suite "macros / defmacro expands like the JVM" :label "and defining one still marks the var and works" :expected "[42 true]" :actual "(do (defmacro mw [a] (list (quote inc) a)) [(mw 41) (:macro (meta (var mw)))])" :portability :common}
 ]
