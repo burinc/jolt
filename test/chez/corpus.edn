@@ -5967,4 +5967,15 @@
   ;; runtime evaluated it right-to-left, so these reached the queue as (c a b)
   ;; while .submit and .execute, which enqueue one at a time, were FIFO.
   {:suite "concurrency / invokeAll deadlines" :label "invokeAll submits in list order" :expected "[:a :b :c]" :actual "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) log (atom [])] (try (.invokeAll ex (mapv (fn [n] (fn [] (swap! log conj n) n)) [:a :b :c])) (deref log) (finally (.shutdown ex))))" :portability :jvm}
+  ;; defmacro takes a TRAILING attr-map, like defn — the JVM's defmacro hands the
+  ;; whole fdecl to defn, trailing map included. jolt dropped it from the var meta
+  ;; and leaked it into :arglists as a bogus arity, on both the compile path and
+  ;; the macroexpand-1 shape. Its :doc precedence is defn's too: an attr-map's
+  ;; :doc wins over the docstring (jolt's defn already agrees; its defmacro did
+  ;; not). And a defmacro with no arities is a defn with none, not one taking
+  ;; the two implicit params.
+  {:suite "defmacro / attr-map" :label "a trailing attr-map reaches the var and stays out of :arglists" :expected "[2 3 \"doc\" \"([a])\" 41]" :actual "(do (defmacro dm5 \"doc\" {:k 1} ([a] a) {:k 2 :j 3}) [(:k (meta (var dm5))) (:j (meta (var dm5))) (:doc (meta (var dm5))) (pr-str (:arglists (meta (var dm5)))) (dm5 41)])" :portability :common}
+  {:suite "defmacro / attr-map" :label "an attr-map :doc wins over the docstring, as in defn" :expected "\"attr\"" :actual "(do (defmacro dm6 \"doc\" {:doc \"attr\"} [a] a) (:doc (meta (var dm6))))" :portability :common}
+  {:suite "defmacro / attr-map" :label "macroexpand-1 keeps the trailing attr-map where defn takes it" :expected "\"(do (clojure.core/defn dm7 ([&form &env a] a) {:k 1}) (. (var dm7) (setMacro)) (var dm7))\"" :actual "(pr-str (macroexpand-1 (quote (defmacro dm7 ([a] a) {:k 1}))))" :portability :common}
+  {:suite "defmacro / attr-map" :label "and a defmacro with no arities expands to a defn with none" :expected "\"(do (clojure.core/defn dm8) (. (var dm8) (setMacro)) (var dm8))\"" :actual "(pr-str (macroexpand-1 (quote (defmacro dm8))))" :portability :common}
 ]
