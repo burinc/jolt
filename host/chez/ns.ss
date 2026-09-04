@@ -618,7 +618,9 @@
 ;; switches chez-current-ns when the expansion EVALUATES. Emit a runtime call
 ;; instead; it runs after in-ns, so the exclusion lands in the ns the form
 ;; creates and is in place before the loader reads the next form.
-(define (jolt-refer-clojure . args)
+;; A Scheme-side macro expander takes the JVM's leading &form / &env like any
+;; other (host-contract.ss hc-expand-1); neither is read here.
+(define (jolt-refer-clojure _form _env . args)
   (let loop ((a args) (names '()))
     (cond
      ((or (null? a) (null? (cdr a)))
@@ -727,7 +729,7 @@
 ;; defmacro — special form; the var cell exists so (resolve 'defmacro) works.
 ;; The expander re-emits the form (the special-form path handles analysis).
 (def-var! "clojure.core" "defmacro"
-  (lambda args (apply jolt-list (cons (jolt-symbol #f "defmacro") (list->cseq args)))))
+  (lambda (_form _env . args) (apply jolt-list (cons (jolt-symbol #f "defmacro") (list->cseq args)))))
 (mark-macro! "clojure.core" "defmacro")
 (def-var! "clojure.core" "alter-meta!" jolt-alter-meta!)
 (def-var! "clojure.core" "reset-meta!" jolt-reset-meta!)

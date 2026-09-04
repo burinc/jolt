@@ -965,7 +965,7 @@
 ;; carrier when a :fiber binding is in scope. thread is the documented escape
 ;; for blocking work (fibers-plan.md).
 (define cca-thread-spawn-sym (jolt-symbol "clojure.core.async" "thread-spawn"))
-(define (cca-thread-macro . body)
+(define (cca-thread-macro _form _env . body)
   (jolt-list cca-thread-spawn-sym (apply jolt-list cca-fn*-sym empty-pvec body)))
 
 ;; --- install clojure.core.async ---------------------------------------------
