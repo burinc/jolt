@@ -1,0 +1,4 @@
+Unhandled exception: java.lang.IndexOutOfBoundsException: index out of bounds
+  ex-data: {:jolt/error {:type :analysis-error, :line 4, :column 3, :file ./test/errors/analyze/invalid-let-odd-bindings/input.clj}}
+  at ./test/errors/analyze/invalid-let-odd-bindings/input.clj:4:3
+exit: 1

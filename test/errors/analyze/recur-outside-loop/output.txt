@@ -1,0 +1,4 @@
+Unhandled exception: jolt/uncompilable: recur outside loop/fn
+  ex-data: {:jolt/error {:type :analysis-error, :line 3, :column 8, :file ./test/errors/analyze/recur-outside-loop/input.clj}}
+  at ./test/errors/analyze/recur-outside-loop/input.clj:3:8
+exit: 1

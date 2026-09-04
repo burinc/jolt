@@ -1,0 +1,4 @@
+Unhandled exception: java.lang.IllegalArgumentException: Don't know how to create ISeq from: java.lang.Long
+  ex-data: {:jolt/error {:type :analysis-error, :line 3, :column 1, :file ./test/errors/analyze/invalid-fn-params/input.clj}}
+  at ./test/errors/analyze/invalid-fn-params/input.clj:3:1
+exit: 1

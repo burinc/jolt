@@ -1,0 +1,14 @@
+Unhandled exception (IllegalArgumentException): odd number of map literal entries
+  at ./test/errors/read/odd-entries-in-map/input.clj:1:1
+  trace:
+    rdr-make-map
+    rdr-read-form
+    rdr-read-seq
+    rdr-read-form
+    rdr-read-seq
+    rdr-read-form
+    rdr-read-seq
+    rdr-read-form
+    rdr-read-top
+    cmd-run
+exit: 1
