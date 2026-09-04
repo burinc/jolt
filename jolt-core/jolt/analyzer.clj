@@ -293,6 +293,34 @@
          after)
     (cons (macro-arity-params (first after)) (rest after))))
 
+;; What macroexpand-1 answers for a defmacro form. defmacro is a special form
+;; here, so this never runs during compilation — but a tools.analyzer-style
+;; consumer expands to a fixpoint and reads the result, and on the JVM that
+;; result is a defn plus a setMacro, not an opaque call to defmacro. It shares
+;; macro-arity-params with the special-form arm below so the reported shape
+;; cannot drift from the compiled one: docstring and attr-map keep their place,
+;; every arity becomes a clause, and &form/&env lead the declared params.
+(defn defmacro-expansion [form]
+  (let [items (vec (form-elements form))
+        name-sym (nth items 1)
+        after (drop 2 items)
+        [after doc] (if (string? (first after)) [(rest after) (first after)] [after nil])
+        [after attr] (if (form-map? (first after)) [(rest after) (first after)] [after nil])
+        clauses (if (form-list? (first after))
+                  (map (fn [clause]
+                         (let [es (vec (form-elements clause))]
+                           (cons (macro-arity-params (first es)) (rest es))))
+                       after)
+                  (list (cons (macro-arity-params (first after)) (rest after))))
+        vform (list 'var name-sym)]
+    (list 'do
+          (concat (list (symbol "clojure.core" "defn") name-sym)
+                  (when doc (list doc))
+                  (when attr (list attr))
+                  clauses)
+          (list '. vform (list 'setMacro))
+          vform)))
+
 (defn- analyze-arity [ctx pvec body env fn-name]
   (let [pp (parse-params ctx (vec (form-vec-items pvec)))
         rst (:rest pp)

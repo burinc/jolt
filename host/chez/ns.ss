@@ -726,10 +726,19 @@
 ;; Runtime half of the refer-clojure macro: the expansion calls this AFTER the
 ;; enclosing ns form's in-ns has switched chez-current-ns (see jolt-refer-clojure).
 (def-var! "clojure.core" "refer-clojure-register!" jolt-refer-clojure-register!)
-;; defmacro — special form; the var cell exists so (resolve 'defmacro) works.
-;; The expander re-emits the form (the special-form path handles analysis).
+;; defmacro — special form; the var cell exists so (resolve 'defmacro) works and
+;; so macroexpand-1 can answer the JVM's shape,
+;;   (do (clojure.core/defn n ([&form &env …] …)) (. (var n) (setMacro)) (var n)).
+;; Analysis goes through the special-form path, never through here. The expansion
+;; is built by jolt.analyzer, which normalizes a defmacro form the same way that
+;; path does, so the reported shape cannot drift from the compiled one; before the
+;; analyzer image loads, the form comes back unchanged.
 (def-var! "clojure.core" "defmacro"
-  (lambda (_form _env . args) (apply jolt-list (cons (jolt-symbol #f "defmacro") (list->cseq args)))))
+  (lambda (form _env . args)
+    (let ((mk (var-deref "jolt.analyzer" "defmacro-expansion")))
+      (if (procedure? mk)
+          (jolt-invoke1 mk form)
+          (apply jolt-list (jolt-symbol #f "defmacro") args)))))
 (mark-macro! "clojure.core" "defmacro")
 (def-var! "clojure.core" "alter-meta!" jolt-alter-meta!)
 (def-var! "clojure.core" "reset-meta!" jolt-reset-meta!)
