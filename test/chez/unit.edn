@@ -1509,6 +1509,10 @@
   {:suite "io" :expr "(do (require '[clojure.java.io :as io]) (let [d (doto (java.io.File/createTempFile \"jtd\" \".d\") (.delete) (.mkdir)) child (java.io.File. d \"child.txt\")] (spit child \"x\") (let [deleted (.delete d)] (.delete child) (.delete d) deleted)))" :expected "false"}
   ;; Stage B — fixed-buffer transducer puts block when full
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1 (map inc)) p (future (a/>!! c 1) (a/>!! c 2) (a/>!! c 3) :done)] (Thread/sleep 100) (let [parked (not (realized? p)) v1 (a/<!! c) v2 (a/<!! c) v3 (a/<!! c) result @p] [parked v1 v2 v3 result])))" :expected "[true 2 3 4 :done]"}
+  ;; nil is not a value a channel can carry, and the message is the reference's:
+  ;; channels.clj raises IllegalArgumentException "Can't put nil on channel".
+  ;; jolt said "on a channel".
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1)] (try (a/>!! c nil) :no-throw (catch IllegalArgumentException e (ex-message e)))))" :expected "\"Can't put nil on channel\""}
   ;; Stage B — pending rendezvous put parks until consumed (does NOT complete on close)
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) p (future (a/>!! c :v))] (Thread/sleep 50) (a/close! c) [(a/<!! c) @p]))" :expected "[:v true]"}
   ;; io-thread is the FIBER carrier (jolt-579): the three names pick the three
