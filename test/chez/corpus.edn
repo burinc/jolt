@@ -705,6 +705,25 @@
   {:suite "exceptions / try-catch" :label "malformed catch: non-symbol binding" :expected :throws :actual "(try 1 (catch e (* e 10)))" :portability :common}
   {:suite "exceptions / try-catch" :label "malformed catch: literal binding" :expected :throws :actual "(try 1 (catch e 5))" :portability :common}
   {:suite "exceptions / try-catch" :label "malformed catch: too short" :expected :throws :actual "(try 1 (catch Exception))" :portability :common}
+  ;; recur may not cross a try. The reference refuses these at compile time because
+  ;; the bytecode cannot express the jump; jolt refuses them because its lowering
+  ;; re-enters the handler scope without leaving the previous one, so the ones with
+  ;; a loop condition leak ~400 bytes an iteration and the ones without HANG.
+  {:suite "exceptions / recur across try" :label "recur from try body" :expected :throws :actual "(loop [i 0] (if (< i 3) (try (recur (inc i)) (catch Exception e :err)) i))" :portability :common}
+  {:suite "exceptions / recur across try" :label "recur from try body with finally" :expected :throws :actual "(loop [i 0] (try (recur (inc i)) (finally nil)))" :portability :common}
+  {:suite "exceptions / recur across try" :label "recur from catch" :expected :throws :actual "(loop [i 0] (try 1 (catch Exception e (recur (inc i)))))" :portability :common}
+  {:suite "exceptions / recur across try" :label "recur from finally" :expected :throws :actual "(loop [i 0] (try 1 (finally (recur (inc i)))))" :portability :common}
+  ;; A recur target established INSIDE the try is the target's own; only a target
+  ;; the recur would have to cross the try to reach is refused.
+  {:suite "exceptions / recur across try" :label "fn inside try recurs to itself" :expected "15" :actual "(try ((fn f [n acc] (if (zero? n) acc (recur (dec n) (+ acc n)))) 5 0) (catch Exception e :err))" :portability :common}
+  {:suite "exceptions / recur across try" :label "loop inside try recurs to itself" :expected "3" :actual "(try (loop [i 0 acc 0] (if (< i 3) (recur (inc i) (+ acc i)) acc)) (catch Exception e :err))" :portability :common}
+  {:suite "exceptions / recur across try" :label "loop inside catch recurs to itself" :expected "3" :actual "(try (throw (ex-info \"x\" {})) (catch Exception e (loop [i 0] (if (< i 3) (recur (inc i)) i))))" :portability :common}
+  {:suite "exceptions / recur across try" :label "recur after a try, not across it" :expected "3" :actual "(loop [i 0] (let [x (try i (catch Exception e 0))] (if (< x 3) (recur (inc i)) x)))" :portability :common}
+  ;; The try usually arrives by macroexpansion rather than being written, which is
+  ;; how real code meets this rule. Both of these report at the same column as the
+  ;; reference does.
+  {:suite "exceptions / recur across try" :label "recur across binding" :expected :throws :actual "(do (def ^:dynamic *rx* 0) (loop [i 0] (binding [*rx* i] (if (< i 3) (recur (inc i)) i))))" :portability :common}
+  {:suite "exceptions / recur across try" :label "recur across with-open" :expected :throws :actual "(loop [i 0] (with-open [r (java.io.StringReader. \"a\")] (if (< i 3) (recur (inc i)) i)))" :portability :jvm}
   {:suite "exceptions / assert" :label "assert true -> ok" :expected ":ok" :actual "(do (assert true) :ok)" :portability :common}
   {:suite "exceptions / assert" :label "assert expr -> ok" :expected ":ok" :actual "(do (assert (= 1 1)) :ok)" :portability :common}
   {:suite "exceptions / assert" :label "assert false throws" :expected :throws :actual "(assert false)" :portability :common}
