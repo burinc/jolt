@@ -558,7 +558,14 @@
                           pnames (set (map name shadowed))
                           ;; let-bind only immutable fields; mutable ones are read live
                           ;; via rewrite-body so a set! within the method is observed.
-                          binds (vec (mapcat (fn [f] [f `(get ~inst ~(keyword (name f)))])
+                          ;; The read is the DECLARED-SLOT one, not get: a type
+                          ;; declaring clojure.lang.ILookup answers get through its
+                          ;; own valAt, so binding fields with get would re-enter
+                          ;; that valAt on every method entry — including valAt's
+                          ;; own — and never come back. It is also the cheaper read
+                          ;; (straight to the slot, no type cascade).
+                          binds (vec (mapcat (fn [f] [f (list (symbol "clojure.core" "__deftype-field")
+                                                              inst (keyword (name f)))])
                                              (filter (fn [f] (and (not (mutable? f))
                                                                   (not (contains? pnames (name f)))))
                                                      fields)))

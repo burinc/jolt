@@ -136,7 +136,27 @@
             ;; rest because it is asked on the EQUALITY path — every (= record x)
             ;; consults it for both operands — and answering it from the protocol
             ;; table meant a mutex and a key-vector allocation per comparison.
-            (and (not record?) (tag-declares-sequential? tag)))))
+            (and (not record?) (tag-declares-sequential? tag))
+            ;; slot 6: a bare deftype's DECLARED ILookup, as (3-arity . 2-arity);
+            ;; either half may be #f. The JVM gives a bare deftype no key lookup
+            ;; of its own, so a declared valAt IS the lookup and answers for
+            ;; every key — a field-named one included, which is the whole point
+            ;; when the slot holds something valAt is there to transform
+            ;; (typed.clojure keeps a lazy thunk in one and forces it here).
+            ;; A defrecord keeps its generated field-first lookup: the JVM will
+            ;; not compile one that declares another valAt.
+            ;; Derived here, so the get path pays the vector-ref it already pays
+            ;; for the flags above rather than two string hashes per lookup.
+            (and (not record?)
+                 (let ((m3 (find-method-any-protocol-arity tag "valAt" 3))
+                       (m2 (find-method-any-protocol-arity tag "valAt" 2)))
+                   ;; -arity falls back to ANY same-named impl when no arity
+                   ;; matches, so each half is confirmed against the procedure
+                   ;; before it is kept — a type declaring only (valAt [_ k])
+                   ;; must not be called with a not-found argument.
+                   (let ((m3 (and m3 (proc-accepts? m3 3) m3))
+                         (m2 (and m2 (proc-accepts? m2 2) m2)))
+                     (and (or m3 m2) (cons m3 m2))))))))
 (define (jrdesc-ifc-of x)
   (let* ((d (jrec-desc x))
          (c (jrdesc-ifc d)))
