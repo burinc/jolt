@@ -5978,4 +5978,13 @@
   {:suite "defmacro / attr-map" :label "an attr-map :doc wins over the docstring, as in defn" :expected "\"attr\"" :actual "(do (defmacro dm6 \"doc\" {:doc \"attr\"} [a] a) (:doc (meta (var dm6))))" :portability :common}
   {:suite "defmacro / attr-map" :label "macroexpand-1 keeps the trailing attr-map where defn takes it" :expected "\"(do (clojure.core/defn dm7 ([&form &env a] a) {:k 1}) (. (var dm7) (setMacro)) (var dm7))\"" :actual "(pr-str (macroexpand-1 (quote (defmacro dm7 ([a] a) {:k 1}))))" :portability :common}
   {:suite "defmacro / attr-map" :label "and a defmacro with no arities expands to a defn with none" :expected "\"(do (clojure.core/defn dm8) (. (var dm8) (setMacro)) (var dm8))\"" :actual "(pr-str (macroexpand-1 (quote (defmacro dm8))))" :portability :common}
+  ;; Var.setDynamic was named in the Var-surface work and never landed — it
+  ;; raised "No matching field found". It answers the var and makes it bindable,
+  ;; and the boolean overload turns the flag off again.
+  {:suite "host-interop / Var surface" :label "setDynamic answers the var and flips the flag" :expected "[\"#'user/sd1\" true]" :actual "(do (def sd1 1) [(str (.setDynamic (var sd1))) (.isDynamic (var sd1))])" :portability :jvm}
+  {:suite "host-interop / Var surface" :label "and the var binds after it" :expected "2" :actual "(do (def sd2 1) (.setDynamic (var sd2)) (eval (quote (binding [sd2 2] sd2))))" :portability :jvm}
+  {:suite "host-interop / Var surface" :label "the boolean overload turns it off again" :expected "[true false]" :actual "(do (def sd3 1) (.setDynamic (var sd3) true) [(.isDynamic (var sd3)) (do (.setDynamic (var sd3) false) (.isDynamic (var sd3)))])" :portability :jvm}
+  ;; identityHashCode of nil is 0 on the JVM — it is the one input with no object
+  ;; to identify. jolt answered the nil sentinel's own id.
+  {:suite "host-interop / identity hash" :label "identityHashCode of nil is 0" :expected "0" :actual "(System/identityHashCode nil)" :portability :jvm}
 ]

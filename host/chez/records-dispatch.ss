@@ -131,6 +131,7 @@
 (define (rd-var-meta-get obj key)
   (let ((m (rd-var-meta obj))) (if m (jolt-get m (keyword #f key) jolt-nil) jolt-nil)))
 (define (rd-var-meta-flag? obj key) (jolt-truthy? (rd-var-meta-get obj key)))
+(define rd-kw-var-dynamic (keyword #f "dynamic"))
 (define (rd-args->list x) (let ((s (jolt-seq x))) (if (jolt-nil? s) '() (seq->list s))))
 
 (define (record-method-dispatch-base obj method-name rest-args)
@@ -319,6 +320,19 @@
              ;; together. bindRoot / alterRoot go through alter-var-root so the
              ;; validator and watches see the change; bindRoot also clears the
              ;; macro flag, as Var.bindRoot does (a def over a macro un-macros it).
+             ;; setDynamic is what makes a var BINDABLE here: jolt reads
+             ;; :dynamic out of the meta (dyn-binding.ss thread-binding-pairs and
+             ;; isDynamic above both do), where the JVM keeps a field beside it —
+             ;; so the flag has to land in the meta to mean anything. It answers
+             ;; the var, as the JVM does, and the boolean overload turns it off.
+             ((string=? method-name "setDynamic")
+              (let ((on (if (pair? rest) (jolt-truthy? (car rest)) #t)))
+                (var-cell-meta-set!
+                 obj (if on
+                         (jolt-assoc (or (rd-var-meta obj) (jolt-hash-map)) rd-kw-var-dynamic #t)
+                         (let ((m (rd-var-meta obj)))
+                           (if m (jolt-dissoc2 m rd-kw-var-dynamic) (jolt-hash-map))))))
+              obj)
              ((string=? method-name "setMacro")
               (var-cell-macro?-set! obj #t)
               (var-cell-meta-set! obj (jolt-assoc (or (rd-var-meta obj) (jolt-hash-map)) jolt-kw-var-macro #t))

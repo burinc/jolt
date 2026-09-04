@@ -390,7 +390,10 @@
         ;; came back with the same "identity". jolt-identity-hasheq is the
         ;; per-object id a weak side table hands out, which is also what
         ;; (hash f) reports, exactly as on the JVM.
-        (cons "identityHashCode" (lambda (x) (->num (jolt-identity-hasheq x))))
+        ;; nil is the one input with no object to identify, and the JVM answers 0
+        ;; for it rather than hashing the reference.
+        (cons "identityHashCode"
+              (lambda (x) (if (jolt-nil? x) 0 (->num (jolt-identity-hasheq x)))))
         ;; System.arraycopy(src, srcPos, dest, destPos, length). Specified to
         ;; behave as if the source range were copied to a temporary first, so a
         ;; copy that OVERLAPS within one array still reads pre-copy values —
