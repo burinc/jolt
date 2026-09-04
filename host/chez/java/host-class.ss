@@ -191,9 +191,19 @@
     (cond ((null? as) (jolt-class-base x))
           (((caar as) x) ((cdar as) x))
           (else (loop (cdr as))))))
+;; A Class is ONE object per class, as on the JVM: (class 1) and (class 2) hand
+;; back the same token, and it is the same token the class-name symbol Long
+;; evaluates to. That makes identical? on two Class values a class-equality test,
+;; which library code takes for granted — typedclojure dispatches its whole
+;; RClass-vs-RClass subtype rule behind (identical? (.getClass s) (.getClass t)),
+;; so a fresh token per call answered false there and skipped the rule outright.
+;; jolt-class-for is the interner every other class seam already went through
+;; (a class token, resolve, supers, Class/forName); this was the one that minted
+;; its own. It also canonicalizes the spelling, so a deftype in a dashed
+;; namespace lands on the token its own values report.
 (define (jolt-class x)
   (let ((n (jolt-class-name x)))
-    (if (jolt-nil? n) jolt-nil (make-class-obj n))))
+    (if (jolt-nil? n) jolt-nil (jolt-class-for n))))
 
 (def-var! "clojure.core" "class" jolt-class)
 

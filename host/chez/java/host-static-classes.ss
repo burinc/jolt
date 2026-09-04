@@ -1855,6 +1855,22 @@
               (hashtable-set! jolt-class-for-tbl name obj)
               obj)))))
 (def-var! "jolt.host" "jolt-class-for" jolt-class-for)
+
+;; Long/TYPE and its eight siblings are the primitive CLASSES, not their names.
+;; They are declared beside the rest of each wrapper's statics
+;; (host-static-methods.ss), which loads before the interner exists, so they are
+;; registered as the primitive's name and promoted here in one pass — one
+;; declaration site, one place that knows the interner is now available.
+;; Promoting them is what lets a Class method reach them at all: .isPrimitive on
+;; a bare string is a field miss, and typedclojure's symbol->Class asserts its
+;; result is a class?.
+(for-each
+  (lambda (cls)
+    (let ((h (hashtable-ref class-statics-tbl cls #f)))
+      (when h
+        (let ((v (hashtable-ref h "TYPE" #f)))
+          (when (string? v) (hashtable-set! h "TYPE" (jolt-class-for v)))))))
+  '("Long" "Integer" "Short" "Byte" "Character" "Boolean" "Double" "Float" "Void"))
 ;; A deftype registered AFTER its JVM spelling was interned — an :import or a
 ;; class symbol compiled ahead of the defining namespace, which the JVM rejects
 ;; but jolt's syntactic model lets through — left a token under that spelling
@@ -1897,10 +1913,24 @@
                   (lambda (a b) (let ((ka (class-key a)) (kb (class-key b)))
                                   (and ka kb (string=? ka kb) #t))))
 (register-hash-arm! jclass? (lambda (x) (jolt-hash (jclass-name x))))
-;; Class.toString says which kind it is: "interface java.util.List", "class java.lang.String".
-(register-str-render! jclass?
-  (lambda (x) (string-append (if (jch-interface? (jclass-name x)) "interface " "class ")
-                             (jclass-jvm-name x))))
+;; The nine primitive classes. jolt names them exactly as the JVM does — the
+;; class `long` is spelled "long" — and they are in no class graph row, so this
+;; literal set is what tells them from a reference class.
+(define jclass-primitive-names
+  '("boolean" "byte" "char" "short" "int" "long" "float" "double" "void"))
+(define (jclass-primitive? x)
+  (and (member (jclass-name x) jclass-primitive-names) #t))
+
+;; Class.toString says which kind it is: "interface java.util.List",
+;; "class java.lang.String" — and a primitive, alone, is just its own name
+;; ("long"). ONE renderer, so (str c) and (.toString c) cannot drift: they used
+;; to, with str reading the graph for the interface case and the method always
+;; saying "class".
+(define (jclass-tostring x)
+  (cond ((jclass-primitive? x) (jclass-jvm-name x))
+        ((jch-interface? (jclass-name x)) (string-append "interface " (jclass-jvm-name x)))
+        (else (string-append "class " (jclass-jvm-name x)))))
+(register-str-render! jclass? jclass-tostring)
 (register-pr-arm! jclass? (lambda (x) (jclass-jvm-name x)))
 ;; print/println of a Class prints the bare name (getName), like pr — the JVM's
 ;; print-method for Class ignores *print-readably*. Only str is "class <name>".
@@ -1911,7 +1941,7 @@
   (list (cons "getName" (lambda (self) (jclass-jvm-name self)))
         (cons "getCanonicalName" (lambda (self) (hsc-canonical-name (jclass-jvm-name self))))
         (cons "getSimpleName" (lambda (self) (hsc-simple-name (jclass-jvm-name self))))
-        (cons "toString" (lambda (self) (string-append "class " (jclass-jvm-name self))))
+        (cons "toString" jclass-tostring)
         (cons "isArray" (lambda (self) (let ((n (jclass-name self)))
                                          (and (fx>? (string-length n) 0) (char=? (string-ref n 0) #\[)))))
         ;; Class.getComponentType: for an array class returns the element class;
@@ -1950,6 +1980,7 @@
                                       (filter jch-interface?
                                               (jch-direct-supers (jclass-name self)))))))
         (cons "isInterface" (lambda (self) (if (jch-interface? (jclass-name self)) #t #f)))
+        (cons "isPrimitive" (lambda (self) (jclass-primitive? self)))
         ;; isAssignableFrom: the graph's isa?, JVM argument order — self is the
         ;; wanted supertype. class-key so a deftype ctor or a name string on
         ;; either side answers too.
@@ -1961,7 +1992,8 @@
         ;; getModifiers: the JVM bitmask, derived from the class graph (jolt has
         ;; no bytecode to read one out of). Modifier's predicates read it.
         (cons "getModifiers" (lambda (self) (->num (jch-modifiers (jclass-name self)))))
-        (cons "getClass" (lambda (self) (make-class-obj "java.lang.Class")))))
+        ;; interned like every other Class token, so (identical? (.getClass String) Class)
+        (cons "getClass" (lambda (self) (jolt-class-for "java.lang.Class")))))
 
 ;; ---- java.lang.reflect.Modifier ---------------------------------------------
 ;; The bit constants and their predicates, the JVM's values, over whatever int a

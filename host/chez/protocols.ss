@@ -293,12 +293,30 @@
                      (let ((t (car ts)))
                        (if (or (string=? t "Object") (member t acc)) acc (cons t acc)))))))))
 
+;; A class's tags with jolt's EXTRA spellings for the same representation spliced
+;; in behind the class's own two: one Chez flonum answers for Double and Float,
+;; one exact integer for Long and Integer. jch-tags is (fqn simple ancestors…
+;; "Object"), so keeping the first two ahead of the extras leaves the concrete
+;; class outranking both the supersets and the ancestry in dispatch order.
+(define (jch-tags-plus name extra)
+  (let ((ts (jch-tags name)))
+    (if (or (null? ts) (null? (cdr ts)))
+        (append ts extra)
+        (cons (car ts) (cons (cadr ts) (append extra (cddr ts)))))))
+
 ;; host type-tag candidates for a non-record value (extend-protocol on builtins).
 (define (value-host-tags obj)
   ;; numbers dispatch by actual type (a Double is NOT a Long): flonum -> Double,
   ;; exact ratio -> Ratio, exact integer -> Long.
-  (cond ((flonum? obj) '("Double" "Float" "Number" "Object"))
-        ((and (number? obj) (exact? obj) (not (integer? obj))) '("Ratio" "Number" "Object"))
+  ;;
+  ;; Every arm reads the class graph, so a scalar carries the SAME ancestry
+  ;; isa?/supers report for its class and instance? (which answers from this
+  ;; list) cannot disagree with them. These arms used to carry hand-written tag
+  ;; lists that stopped at Number / CharSequence, so (instance? Comparable 1) was
+  ;; false while (isa? Long Comparable) was true — and a protocol extended to an
+  ;; interface a number implements never reached one.
+  (cond ((flonum? obj) (jch-tags-plus "java.lang.Double" '("java.lang.Float" "Float")))
+        ((and (number? obj) (exact? obj) (not (integer? obj))) (jch-tags "clojure.lang.Ratio"))
         ;; exact integers split at the LONG RANGE (issue #627), the same
         ;; boundary the printer's N suffix uses — NOT the fixnum range: Chez
         ;; fixnums are 61-bit, so Long/MAX_VALUE is a Chez bignum that must
@@ -309,11 +327,11 @@
         ;; superset. (instance? BigInt 21) is false on the JVM and now here.
         ((and (number? obj) (exact? obj) (integer? obj))
          (if (jolt-bigint-print? obj)
-             '("BigInt" "BigInteger" "Number" "Object")
-             '("Long" "Integer" "Number" "Object")))
-        ((number? obj) '("Number" "Object"))
-        ((string? obj) '("String" "CharSequence" "Object"))
-        ((boolean? obj) '("Boolean" "Object"))
+             (jch-tags-plus "clojure.lang.BigInt" '("java.math.BigInteger" "BigInteger"))
+             (jch-tags-plus "java.lang.Long" '("java.lang.Integer" "Integer"))))
+        ((number? obj) (jch-tags "java.lang.Number"))
+        ((string? obj) (jch-tags "java.lang.String"))
+        ((boolean? obj) (jch-tags "java.lang.Boolean"))
         ((char? obj) (jch-tags "java.lang.Character"))
         ((keyword? obj) (jch-tags "clojure.lang.Keyword"))
         ((jolt-symbol? obj) (jch-tags "clojure.lang.Symbol"))

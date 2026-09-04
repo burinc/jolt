@@ -330,6 +330,7 @@
             "clojure.lang.IPersistentList" "clojure.lang.IObj" "clojure.lang.IMeta"
             "clojure.lang.IDeref" "clojure.lang.IRecord" "clojure.lang.IType"
             "clojure.lang.IHashEq" "clojure.lang.IEditableCollection"
+            "clojure.lang.IReference"
             "clojure.lang.IExceptionInfo" "clojure.lang.IReduceInit"
             "java.util.List" "java.util.Set" "java.util.Collection" "java.util.Map"
             "java.util.Iterator" "java.lang.Iterable" "java.lang.CharSequence"
@@ -495,8 +496,13 @@
 (jch-register-supers! "java.util.Collection" '("java.lang.Iterable"))
 (jch-register-supers! "java.util.RandomAccess" '())
 (jch-register-supers! "java.util.Comparator" '())
+;; Serializable is a marker too. Its rows below sit exactly where the JVM
+;; declares it — on Number, on the wrapper classes that are not Numbers, and on
+;; the abstract Clojure collection classes — so every concrete class inherits it
+;; instead of restating it, and (bases Long) stays what the JVM reports.
+(jch-register-supers! "java.io.Serializable" '())
 ;; concrete collection classes
-(jch-register-supers! "clojure.lang.APersistentVector" '("clojure.lang.IPersistentVector" "java.util.List" "java.util.RandomAccess"))
+(jch-register-supers! "clojure.lang.APersistentVector" '("clojure.lang.IPersistentVector" "java.lang.Iterable" "java.util.List" "java.util.RandomAccess" "java.lang.Comparable" "java.io.Serializable"))
 (jch-register-supers! "clojure.lang.PersistentVector" '("clojure.lang.APersistentVector" "clojure.lang.IObj"
                                                         "java.util.List" "java.lang.Comparable"))
 ;; subvec's view class (issue #629): an APersistentVector, so every vector
@@ -504,15 +510,15 @@
 (jch-register-supers! "clojure.lang.APersistentVector$SubVector"
                       '("clojure.lang.APersistentVector" "clojure.lang.IObj"
                         "java.util.List" "java.lang.Comparable"))
-(jch-register-supers! "clojure.lang.APersistentMap" '("clojure.lang.IPersistentMap" "java.util.Map"))
+(jch-register-supers! "clojure.lang.APersistentMap" '("clojure.lang.IPersistentMap" "java.util.Map" "java.lang.Iterable" "java.io.Serializable"))
 (jch-register-supers! "clojure.lang.PersistentArrayMap" '("clojure.lang.APersistentMap" "clojure.lang.IObj"))
 (jch-register-supers! "clojure.lang.PersistentHashMap" '("clojure.lang.APersistentMap" "clojure.lang.IObj"))
 (jch-register-supers! "clojure.lang.PersistentTreeMap" '("clojure.lang.APersistentMap" "clojure.lang.IObj" "clojure.lang.Sorted" "clojure.lang.Reversible"))
-(jch-register-supers! "clojure.lang.APersistentSet" '("clojure.lang.IPersistentSet" "java.util.Set"))
+(jch-register-supers! "clojure.lang.APersistentSet" '("clojure.lang.IPersistentSet" "java.util.Collection" "java.util.Set" "java.io.Serializable"))
 (jch-register-supers! "clojure.lang.PersistentHashSet" '("clojure.lang.APersistentSet" "clojure.lang.IObj"))
 (jch-register-supers! "clojure.lang.PersistentTreeSet" '("clojure.lang.APersistentSet" "clojure.lang.IObj" "clojure.lang.Sorted" "clojure.lang.Reversible"))
-(jch-register-supers! "clojure.lang.ASeq" '("clojure.lang.ISeq" "clojure.lang.Sequential" "java.util.List"))
-(jch-register-supers! "clojure.lang.PersistentList" '("clojure.lang.ASeq" "clojure.lang.IPersistentList" "clojure.lang.Counted"))
+(jch-register-supers! "clojure.lang.ASeq" '("clojure.lang.ISeq" "clojure.lang.Sequential" "java.util.List" "java.io.Serializable"))
+(jch-register-supers! "clojure.lang.PersistentList" '("clojure.lang.ASeq" "clojure.lang.IPersistentList" "java.util.List" "clojure.lang.Counted"))
 (jch-register-supers! "clojure.lang.PersistentList$EmptyList" '("clojure.lang.PersistentList"))
 (jch-register-supers! "clojure.lang.LazySeq" '("clojure.lang.ISeq" "clojure.lang.Sequential" "java.util.List" "clojure.lang.IObj"))
 (jch-register-supers! "clojure.lang.Cons" '("clojure.lang.ASeq"))
@@ -568,18 +574,25 @@
 (jch-register-supers! "clojure.lang.Repeat" '("clojure.lang.ASeq"))
 (jch-register-supers! "clojure.lang.PersistentQueue" '("clojure.lang.IPersistentList" "clojure.lang.IPersistentCollection" "java.util.Collection"))
 ;; scalars / named / callable
-(jch-register-supers! "clojure.lang.Keyword" '("clojure.lang.IFn" "clojure.lang.Named" "java.lang.Comparable"))
-(jch-register-supers! "clojure.lang.Symbol" '("clojure.lang.IObj" "clojure.lang.IFn" "clojure.lang.Named" "java.lang.Comparable"))
+(jch-register-supers! "clojure.lang.Keyword" '("clojure.lang.IFn" "clojure.lang.Named" "java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "clojure.lang.Symbol" '("clojure.lang.IObj" "clojure.lang.IFn" "clojure.lang.Named" "java.lang.Comparable" "java.io.Serializable"))
 ;; The reference types extend ARef, which implements IRef — so each IS an IRef,
 ;; not just an IDeref (IRef extends IDeref, so that still holds transitively).
 ;; An atom is also the IAtom2 swap/reset surface; Ref and Var are callable.
+;; ARef is a row of its own rather than a collapsed edge to IRef: a consumer that
+;; reads a class's DIRECT bases (typed.clojure validates an annotation's :replace
+;; keys against them) is told what the class extends, and every one of these
+;; extends ARef.
+(jch-register-supers! "clojure.lang.IReference" '("clojure.lang.IMeta"))
+(jch-register-supers! "clojure.lang.AReference" '("clojure.lang.IReference"))
 (jch-register-supers! "clojure.lang.IRef" '("clojure.lang.IDeref"))
+(jch-register-supers! "clojure.lang.ARef" '("clojure.lang.AReference" "clojure.lang.IRef"))
 (jch-register-supers! "clojure.lang.IAtom" '())
 (jch-register-supers! "clojure.lang.IAtom2" '("clojure.lang.IAtom"))
-(jch-register-supers! "clojure.lang.Atom" '("clojure.lang.IRef" "clojure.lang.IAtom2"))
-(jch-register-supers! "clojure.lang.Ref" '("clojure.lang.IRef" "clojure.lang.IFn" "java.lang.Comparable"))
-(jch-register-supers! "clojure.lang.Var" '("clojure.lang.IRef" "clojure.lang.IFn"))
-(jch-register-supers! "clojure.lang.Agent" '("clojure.lang.IRef"))
+(jch-register-supers! "clojure.lang.Atom" '("clojure.lang.ARef" "clojure.lang.IAtom2"))
+(jch-register-supers! "clojure.lang.Ref" '("clojure.lang.ARef" "clojure.lang.IRef" "clojure.lang.IFn" "java.lang.Comparable"))
+(jch-register-supers! "clojure.lang.Var" '("clojure.lang.ARef" "clojure.lang.IRef" "clojure.lang.IFn" "java.io.Serializable"))
+(jch-register-supers! "clojure.lang.Agent" '("clojure.lang.ARef"))
 ;; the boxes: Volatile and Reduced are plain derefs, a Delay is a pending one.
 ;; IBlockingDeref is the timed deref a promise or future answers (their reify
 ;; classes register in concurrency.ss, beside the values that carry them).
@@ -589,16 +602,16 @@
 (jch-register-supers! "clojure.lang.Delay" '("clojure.lang.IDeref" "clojure.lang.IPending"))
 (jch-register-supers! "clojure.lang.Ratio" '("java.lang.Number" "java.lang.Comparable"))
 (jch-register-supers! "clojure.lang.BigInt" '("java.lang.Number"))
-(jch-register-supers! "java.lang.String" '("java.lang.CharSequence" "java.lang.Comparable"))
+(jch-register-supers! "java.lang.String" '("java.lang.CharSequence" "java.lang.Comparable" "java.io.Serializable"))
 (jch-register-supers! "java.lang.Long" '("java.lang.Number" "java.lang.Comparable"))
 (jch-register-supers! "java.lang.Integer" '("java.lang.Number" "java.lang.Comparable"))
 (jch-register-supers! "java.lang.Double" '("java.lang.Number" "java.lang.Comparable"))
 (jch-register-supers! "java.lang.Float" '("java.lang.Number" "java.lang.Comparable"))
 (jch-register-supers! "java.math.BigDecimal" '("java.lang.Number" "java.lang.Comparable"))
 (jch-register-supers! "java.math.BigInteger" '("java.lang.Number" "java.lang.Comparable"))
-(jch-register-supers! "java.lang.Boolean" '("java.lang.Comparable"))
-(jch-register-supers! "java.lang.Character" '("java.lang.Comparable"))
-(jch-register-supers! "java.util.UUID" '("java.lang.Comparable"))
+(jch-register-supers! "java.lang.Boolean" '("java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "java.lang.Character" '("java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "java.util.UUID" '("java.lang.Comparable" "java.io.Serializable"))
 ;; exception hierarchy (folds in the former exception-parent table)
 (jch-register-supers! "java.lang.Exception" '("java.lang.Throwable"))
 (jch-register-supers! "java.lang.RuntimeException" '("java.lang.Exception"))
@@ -735,8 +748,8 @@
 ;; nothing here is an IChunk (known-divergences, :seq-type-model).
 (jch-register-supers! "clojure.lang.ChunkBuffer" '("clojure.lang.Counted"))
 (jch-register-supers! "clojure.lang.IChunk" '("clojure.lang.Indexed"))
-(jch-register-supers! "clojure.lang.Namespace" '())
-(jch-register-supers! "java.util.regex.Pattern" '())
+(jch-register-supers! "clojure.lang.Namespace" '("java.io.Serializable"))
+(jch-register-supers! "java.util.regex.Pattern" '("java.io.Serializable"))
 (jch-register-supers! "java.net.URI" '())
 (jch-register-supers! "java.util.ArrayList" '("java.util.List" "java.util.RandomAccess"))
 (jch-register-supers! "java.util.Queue" '("java.util.Collection"))
@@ -859,7 +872,7 @@
 (jch-mark-interface! "java.lang.SuppressWarnings")
 
 ;; base interfaces used as super targets — need keys for simple-name resolution
-(jch-register-supers! "java.lang.Number" '())
+(jch-register-supers! "java.lang.Number" '("java.io.Serializable"))
 (jch-register-supers! "java.lang.Iterable" '())
 (jch-register-supers! "java.util.Map" '())
 (jch-register-supers! "java.lang.CharSequence" '())
@@ -939,7 +952,7 @@
 ;; subclasses (jolt's one #inst value reports Date only — see inst-time.ss, which
 ;; answers instance? Timestamp #f — so these rows exist for the sql-date shim and
 ;; for isa?/supers of the class tokens, not for the #inst value's dispatch tags).
-(jch-register-supers! "java.util.Date" '("java.lang.Comparable"))
+(jch-register-supers! "java.util.Date" '("java.lang.Comparable" "java.io.Serializable"))
 (jch-register-supers! "java.sql.Date" '("java.util.Date"))
 (jch-register-supers! "java.sql.Timestamp" '("java.util.Date"))
 (jch-register-supers! "java.nio.ByteBuffer" '("java.lang.Comparable"))
