@@ -290,6 +290,15 @@
   {:suite "defn / attr-map" :label "a trailing attr-map wins over the leading one" :expected "\"trail\"" :actual "(do (defn tam4 {:k \"lead\"} ([x] x) {:k \"trail\"}) (:k (meta (var tam4))))" :portability :common}
   {:suite "defn / attr-map" :label ":doc in an attr-map wins over the docstring (JVM conj order)" :expected "\"attr\"" :actual "(do (defn tam5 \"docstring\" {:doc \"attr\"} [x] x) (:doc (meta (var tam5))))" :portability :common}
   {:suite "defn / attr-map" :label "metadata on an arity's param vector does not break the arity" :expected "2" :actual "(do (defn tam6 (^{:x 1} [x] (inc x))) (tam6 1))" :portability :common}
+  ;; The :arglists defn derives is QUOTED in the expansion, as the JVM's is —
+  ;; (def ^{:arglists (quote ([x]))} f …). jolt's own def-meta-expr treats the key
+  ;; as data either way, so nothing here noticed the bare seq; a consumer that
+  ;; evaluates the def-name meta (tools.analyzer, typedclojure's parse-def) saw
+  ;; ([x]) as a call of [x] and reported x as an unresolvable var.
+  {:suite "defn / arglists meta shape" :label "the expansion quotes :arglists on the name" :expected "[(quote quote) (quote ([x]))]" :actual "(let [al (:arglists (meta (second (macroexpand-1 (quote (defn aq1 [x] (+ x 1)))))))] [(first al) (second al)])" :portability :common}
+  {:suite "defn / arglists meta shape" :label "so evaluating the def-name meta yields the data back" :expected "{:arglists (quote ([x] [x y]))}" :actual "(eval (meta (second (macroexpand-1 (quote (defn aq2 ([x] x) ([x y] y)))))))" :portability :common}
+  {:suite "defn / arglists meta shape" :label "with a docstring and attr-map in the mix" :expected "{:arglists (quote ([x])) :doc \"d\" :k 1}" :actual "(eval (meta (second (macroexpand-1 (quote (defn aq3 \"d\" {:k 1} [x] x))))))" :portability :common}
+  {:suite "defn / arglists meta shape" :label "and the var still carries plain data" :expected "[true \"([a b])\"]" :actual "(do (defn aq4 [a b] a) [(seq? (:arglists (meta (var aq4)))) (pr-str (:arglists (meta (var aq4))))])" :portability :common}
   ;; Image-baked var metadata: the seed mint used to strip a defmacro's derived
   ;; :doc/:arglists (ce-defmacro->fn dropped them on the emit path), natives had
   ;; no meta at all, and no core var carried :doc. Presence rows, not exact text,
