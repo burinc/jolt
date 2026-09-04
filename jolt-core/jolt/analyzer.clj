@@ -272,6 +272,27 @@
           (recur (inc i) (conj out (if dup? (gen-name (str nm "_")) nm))))
         out))))
 
+;; The JVM's macro calling convention: an expander fn's parameters are
+;; [&form &env & declared], so (apply macro-fn form env args) is a legal call.
+;; That shape is not decoration — every tools.analyzer-style macroexpand-1
+;; (typedclojure's included) expands a macro by applying its fn that way, and a
+;; declared-params-only fn answers those with an ArityException. Inside the body
+;; &form/&env are then ordinary lexical params, so a closure over them works
+;; where a dynamically-bound var would already have been popped. The DECLARED
+;; params are what :arglists keeps, as on the JVM.
+(defn- macro-arity-params [pvec]
+  (let [m (form-coll-meta pvec)
+        v (vec (concat [(symbol "&form") (symbol "&env")] (form-vec-items pvec)))]
+    (if m (with-meta v m) v)))
+
+(defn- macro-fn-arities [after]
+  (if (form-list? (first after))
+    (map (fn [clause]
+           (let [es (vec (form-elements clause))]
+             (cons (macro-arity-params (first es)) (rest es))))
+         after)
+    (cons (macro-arity-params (first after)) (rest after))))
+
 (defn- analyze-arity [ctx pvec body env fn-name]
   (let [pp (parse-params ctx (vec (form-vec-items pvec)))
         rst (:rest pp)
@@ -808,7 +829,7 @@
                      ;; the QUALIFIED clojure.core/fn so it resolves to the real fn
                      ;; macro even when the macro being defined is `fn` (schema/s/fn)
                      ;; or the ns excluded it.
-                     fn-form (cons (symbol "clojure.core" "fn") after)
+                     fn-form (cons (symbol "clojure.core" "fn") (macro-fn-arities after))
                      ;; var meta like defn: ^meta on the name, docstring, attr-map, arglists
                      arglists (if (form-list? (first after))
                                 (map first after)

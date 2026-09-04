@@ -368,16 +368,16 @@
              (if (fx>=? i (pvec-count items)) s
                  (loop (fx+ i 1) (pset-conj s (pvec-nth-d items i jolt-nil)))))))))
 (define (hc-macro-arg x) (hc-walk-form hc-set-form->set x))
-;; &form and &env are bound (as dynamic vars) around the expander call, so a
-;; macro body can read the call form / lexical env without changing the calling
-;; convention. The analyzer passes amp-env (the in-scope locals); macroexpand-1
-;; has none, so it defaults to {}.
-(define hc-amp-form-cell (declare-var! "clojure.core" "&form"))
-(define hc-amp-env-cell (declare-var! "clojure.core" "&env"))
-;; bound on every macro expansion (hc-expand-1's dynamic-wind) — tag :dynamic
-;; so the push passes the non-dynamic-var check.
-(set-var-meta! "clojure.core" "&form" (jolt-hash-map (keyword #f "dynamic") #t))
-(set-var-meta! "clojure.core" "&env" (jolt-hash-map (keyword #f "dynamic") #t))
+;; &form and &env are the expander fn's first two PARAMETERS, as on the JVM —
+;; the lowering that adds them is analyzer.clj's macro-fn-arities (and its build
+;; path twin, ce-macro-arities). They used to be dynamic vars bound around the
+;; call instead, which read the same from inside a macro body but left the
+;; expander fn taking only its declared parameters: (apply macro-fn form env args)
+;; — the call every tools.analyzer-style macroexpand-1 makes — raised an
+;; ArityException. Params also outlive the expansion, so a closure a macro
+;; returns over &form still has it.
+;; The analyzer passes amp-env (the in-scope locals); macroexpand-1 has none, so
+;; it defaults to {}.
 ;; &form meta matches the JVM's {:line :column}. hc-kw-file is defined above
 ;; with hc-kw-line/hc-kw-column. hc-form-sans-file strips :file from &form meta
 ;; so a macro reading (meta &form) doesn't see it — libraries branch on its presence.
@@ -400,11 +400,8 @@
          (args (cdr items))
          (expander (var-cell-root (hc-resolve-cell ctx head)))
          (amp-env (if (pair? maybe-env) (car maybe-env) (jolt-hash-map))))
-    (dynamic-wind
-      (lambda () (jolt-push-thread-bindings
-                  (jolt-hash-map hc-amp-form-cell (hc-form-sans-file nform) hc-amp-env-cell amp-env)))
-      (lambda () (hc-propagate-pos form (apply jolt-invoke expander args)))
-      (lambda () (jolt-pop-thread-bindings)))))
+    (hc-propagate-pos form
+      (apply jolt-invoke expander (hc-form-sans-file nform) amp-env args))))
 
 ;; Classify a global (non-local) symbol reference against the var registry:
 ;;   {:kind :var :ns NS :name NAME}   — a defined var (compile ns / clojure.core)
