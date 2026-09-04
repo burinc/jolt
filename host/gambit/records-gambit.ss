@@ -1356,6 +1356,13 @@
   (let ((mi (hashtable-ref type-method-index type-tag #f)))
     (if mi (hashtable-ref mi method '()) '())))
 
+(define (forget-type-methods! type-tag)
+  (jolt-with-mutex rec-tbl-mu (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+    (hashtable-delete! type-registry type-tag)
+    (hashtable-delete! type-method-index type-tag)
+    (hashtable-delete! type-class-memo type-tag)
+    (hashtable-delete! clone-registry type-tag)))
+
 (define (prune-type-registry! keep?)
   (vector-for-each
     (lambda (k)
@@ -1645,6 +1652,8 @@
          (dbl-flags (list->vector (map chez-double-tag? field-tags)))
          (ndbl (vector-length dbl-flags))
          (desc (make-jrdesc tag kws))
+         (_ (when (hashtable-ref chez-tag-desc tag #f)
+              (forget-type-methods! tag)))
          (_ (jolt-with-mutex
               rec-tbl-mu
               (let ((old-desc (hashtable-ref chez-tag-desc tag #f)))
