@@ -89,6 +89,15 @@
           (println "img-misc:" (realized? (:p back))
                    (identical? (:n back) (find-ns (quote app.core))))))))
 
+  ;; --dtlookup: a deftype that declares its own ILookup must answer through
+  ;; that valAt for a field-named key in a BUILT binary too. `jolt run` was right
+  ;; and the build folded past it, so this is compared against `jolt run` in
+  ;; build-smoke rather than pinned here (jolt-fpp3.1).
+  (when (= (first args) "--dtlookup")
+    (reset! util/lk-box (util/->Lk (count args)))
+    (println "dt-ctor:  " (:a (util/->Lk 1)))
+    (println "dt-proven:" (util/lk-read (util/->Lk (count args))))
+    (println "dt-opaque:" (:a @util/lk-box) (get @util/lk-box :zz :none)))
   ;; --innerfn: a named inner fn inside a spliced callee (jolt-pzos).
   (when (= (first args) "--innerfn")
     (util/inner-boom 1))

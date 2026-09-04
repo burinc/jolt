@@ -193,8 +193,7 @@
       ;; lookup the JVM gives a bare deftype, so it answers for a field-named key
       ;; too. A defrecord keeps its generated field-first lookup, and its
       ;; register-record-type! has already run by the time its methods register.
-      (when (and (string=? method "valAt")
-                 (not (hashtable-ref chez-record-type-tbl type-tag #f)))
+      (when (and (string=? method "valAt") (chez-type-owns-lookup? type-tag))
         (jrdesc-mask-fields! desc))))
   ;; a (re)registration of this impl invalidates any contagion clone built for it —
   ;; the clone captured the prior body. Keyed exactly (type/proto/method) so a
@@ -530,9 +529,7 @@
           ;; type existed, may already have registered a valAt for it: the fresh
           ;; descriptor has to arrive masked, since register-protocol-method's
           ;; mask ran against the descriptor that is now gone.
-          (_ (when (and (find-method-any-protocol tag "valAt")
-                        (not (hashtable-ref chez-record-type-tbl tag #f)))
-               (jrdesc-mask-fields! desc)))
+          (_ (when (chez-type-owns-lookup? tag) (jrdesc-mask-fields! desc)))
          (nf (length kws))
          ;; the ctor var's name, baked at definition (the JVM ArityException
          ;; names the positional ctor: "… passed to: ns/->Name").

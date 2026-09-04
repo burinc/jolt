@@ -282,6 +282,30 @@ done
 # Compared against `jolt run` rather than pinned to a literal, because the bug
 # was a DIVERGENCE between the two; a literal would have to be re-derived every
 # time the fixture's arithmetic changes, and would not say what it is for.
+# A deftype that DECLARES clojure.lang.ILookup answers every key through that
+# valAt, field-named ones included -- the JVM gives such a type no other key
+# lookup, and the slot may hold exactly what valAt is there to transform. The
+# runtime honours it; the BUILD folded past it in two places, because every
+# deftype is registered as a record shape and nothing told the passes this one
+# has a lookup of its own (jolt-fpp3.1): scalar replacement's (:k <ctor>) fold,
+# and whole-program inference proving a param a struct and dropping the guard.
+#
+# Compared against `jolt run` because the bug is a DIVERGENCE between the two,
+# then against the literal so the two cannot agree on a shared failure.
+got_dt="$(cd / && "$out" --dtlookup 2>&1)"
+want_dt="$(cd "$app" && JOLT_PWD="$app" "$joltabs" run -m app.core --dtlookup 2>&1)"
+if [ "$got_dt" != "$want_dt" ]; then
+  echo "  FAIL: a deftype's declared valAt does not answer the same as under jolt run"
+  echo "--- binary ----"; echo "$got_dt"
+  echo "--- jolt run --"; echo "$want_dt"; exit 1
+fi
+for line in 'dt-ctor:   :from-valat' 'dt-proven: :from-valat' 'dt-opaque: :from-valat :none'; do
+  if ! printf '%s' "$got_dt" | grep -qF "$line"; then
+    echo "  FAIL: declared valAt -- want '$line' (the field slot was read instead)"
+    echo "--- got ----"; echo "$got_dt"; exit 1
+  fi
+done
+
 fasl="$(dirname "$out")/closure.fasl"
 got_cl="$(cd / && "$out" --closure "$fasl" 2>&1)"
 want_cl="$(cd "$app" && JOLT_PWD="$app" "$joltabs" run -m app.core --closure "$fasl" 2>&1)"
