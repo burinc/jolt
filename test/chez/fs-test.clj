@@ -1,7 +1,8 @@
 ;; jolt.fs gate — exercises the public file-system API against a scratch temp dir.
 ;; Run: bin/jolt run test/chez/fs-test.clj (smoke.sh greps for "FS-TEST OK").
 (ns fs-test
-  (:require [jolt.fs :as fs]))
+  (:require [babashka.fs]
+            [jolt.fs :as fs]))
 
 (def failures (atom []))
 (defn check [label got want]
@@ -41,6 +42,19 @@
 
 ;; listing + glob (Path results)
 (check "list-dir count" (count (fs/list-dir (fs/path root "d1"))) 3)
+;; list-dir is the var babashka.fs leaves to the host on a :bb reader (jolt.bb.fs
+;; fills it), so both spellings and both arities are gated, along with the two
+;; callers that broke when the root was empty: list-dirs and modified-since.
+(check "list-dir glob" (mapv fs/file-name (fs/list-dir (fs/path root "d1") "*.clj"))
+       ["one.clj"])
+(check "list-dir accept fn"
+       (count (fs/list-dir (fs/path root "d1") (fn [p] (fs/directory? p)))) 1)
+(check "babashka.fs/list-dir is bound"
+       (count (babashka.fs/list-dir (fs/path root "d1"))) 3)
+(check "list-dirs across roots"
+       (sort (mapv fs/file-name (fs/list-dirs [(fs/path root "d1") (fs/path root "d1" "d2")] "*.clj")))
+       ["one.clj" "two.clj"])
+(check "modified-since" (>= (count (fs/modified-since root [(fs/path root "d1")])) 0) true)
 (check "glob *" (mapv fs/file-name (sort-by str (fs/glob (fs/path root "d1") "*.clj")))
        ["one.clj"])
 (check "glob **" (sort (mapv fs/file-name (fs/glob root "**.clj")))

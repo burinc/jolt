@@ -51,6 +51,7 @@ grenadine.lock
 grenadine.repo
 grenadine.runtime
 grenadine.source
+jolt.bb.fs
 jolt.continuations
 jolt.fibers
 jolt.fs

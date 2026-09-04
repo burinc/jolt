@@ -65,6 +65,42 @@
     (fold-left (lambda (s r) (string-append s " \"" r "\"")) "" ldr-install-roots)
     ")"))
 
+;; --- namespaces Jolt provides the way babashka provides a built-in ----------
+;; Jolt's reader matches :bb (reader.ss rdr-features), which a .cljc library
+;; reads as "this host defines that itself". Two things follow, and jolt owes
+;; both.
+;;
+;; It has to DEFINE what the :bb branch skips. babashka.fs writes list-dir as
+;; #?(:bb nil :default (defn list-dir …)) because babashka supplies it natively,
+;; so on jolt the var stayed declared and unbound and list-dirs / modified-since
+;; / path-seq failed at the call. A supplement is an ordinary install-root
+;; namespace loaded immediately after the one it completes — where babashka's
+;; built-in would already be. It is the namespace-level counterpart of
+;; :jolt/provides for classes.
+;;
+;; And a copy of one of these on a project's roots must not shadow jolt's. Such
+;; a copy is source written to be INERT here: babashka.fs 0.4.18 has no forward
+;; declaration, so its list-dirs fails to compile at all. A built binary already
+;; resolves jolt's copy first (install sources are embedded, and resolve-on-roots
+;; probes those before any root), so resolving these from the install roots is
+;; what keeps source mode answering the same file as the binary. babashka does
+;; not let a classpath copy shadow a built-in either.
+(define ldr-ns-supplements '(("babashka.fs" . "jolt.bb.fs")))
+(define (ldr-supplement-of name)
+  (cond ((assoc name ldr-ns-supplements) => cdr) (else #f)))
+;; Matched as a namespace PREFIX so a child (babashka/process/pprint) travels
+;; with its parent.
+(define ldr-builtin-ns-rels '("babashka/fs" "babashka/process"))
+(define (ldr-builtin-ns-rel? rel)
+  (let loop ((bs ldr-builtin-ns-rels))
+    (and (pair? bs)
+         (let* ((b (car bs)) (bn (string-length b)))
+           (or (and (>= (string-length rel) bn)
+                    (string=? (substring rel 0 bn) b)
+                    (or (fx=? (string-length rel) bn)
+                        (char=? (string-ref rel bn) #\/)))
+               (loop (cdr bs)))))))
+
 ;; --- data readers (#tag literals) -------------------------------------------
 ;; A project's data_readers.{jolt,clj,cljc} at a source root maps a tag symbol to a
 ;; qualified reader fn (e.g. {time/date time-literals.data-readers/date}). We
@@ -290,17 +326,22 @@
   (define (embedded-key? k)
     (let ((v (hashtable-ref embedded-resources k #f)))
       (or (string? v) (bytevector? v))))
+  (define (on-roots roots)
+    (let loop ((roots roots))
+      (and (pair? roots)
+           (or (let ext ((es ldr-source-exts))
+                 (and (pair? es)
+                      (let ((f (string-append (car roots) "/" rel (car es))))
+                        (if (file-exists? f) f (ext (cdr es))))))
+               (loop (cdr roots))))))
   (or (let loop ((es ldr-source-exts))
         (and (pair? es)
              (let ((k (string-append rel (car es))))
                (if (embedded-key? k) k (loop (cdr es))))))
-      (let loop ((roots source-roots))
-        (and (pair? roots)
-             (or (let ext ((es ldr-source-exts))
-                   (and (pair? es)
-                        (let ((f (string-append (car roots) "/" rel (car es))))
-                          (if (file-exists? f) f (ext (cdr es))))))
-                 (loop (cdr roots)))))))
+      ;; a namespace jolt provides as a host built-in resolves to jolt's copy
+      ;; before a project root's — see ldr-builtin-ns-rels
+      (and (ldr-builtin-ns-rel? rel) (on-roots ldr-install-roots))
+      (on-roots source-roots)))
 
 ;; Read a namespace source. An embedded key (resolve-on-roots above, or the
 ;; build driver's app-order entries) reads its baked string; everything else is
@@ -1859,7 +1900,12 @@
            (lambda () (set-chez-ns! saved)))   ; the current ns is thread-local
          ;; the hook feeds `jolt build`, which needs the SOURCE path; an
          ;; artifact-only namespace has none to give.
-         (ns-loaded-hook name (or file art))))
+         (ns-loaded-hook name (or file art))
+         ;; then the built-in supplement, if this namespace has one. It runs
+         ;; AFTER the load and after the mark, so its own require of the
+         ;; namespace it completes is the no-op a cycle would otherwise be.
+         (cond ((ldr-supplement-of name)
+                => (lambda (sup) (load-namespace sup))))))
       ;; No source file but the namespace exists in memory (AOT'd into a built
       ;; binary): it's already defined — mark loaded and move on.
       ((ns-has-vars? name)
