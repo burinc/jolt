@@ -4735,6 +4735,51 @@
   {:suite "protocols / interface dispatch" :label "extend-protocol to an interface a builtin implements dispatches (instance? and protocol dispatch agree)" :expected "[:assoc :ifn :seqable]" :actual "(do (defprotocol PA (ma [_])) (extend-protocol PA clojure.lang.Associative (ma [_] :assoc)) (defprotocol PF (mf [_])) (extend-protocol PF clojure.lang.IFn (mf [_] :ifn)) (defprotocol PS (ms [_])) (extend-protocol PS clojure.lang.Seqable (ms [_] :seqable)) [(ma [1 2]) (mf :k) (ms (map inc [1 2]))])" :portability :jvm}
   {:suite "protocols / instance? matches dispatch" :label "instance? agrees with what a value's class implements" :expected "[true true false true true]" :actual "[(instance? clojure.lang.Associative [1 2]) (instance? clojure.lang.IFn :k) (instance? java.util.Map [1 2]) (instance? clojure.lang.Seqable (map inc [1 2])) (instance? clojure.lang.IPersistentVector [1 2])]" :portability :jvm}
   {:suite "class / hierarchy views agree" :label "isa?/supers see the modeled exception + collection hierarchy" :expected "[true true true true]" :actual "[(isa? clojure.lang.ExceptionInfo java.lang.RuntimeException) (contains? (supers java.lang.NumberFormatException) java.lang.RuntimeException) (isa? clojure.lang.Keyword clojure.lang.IFn) (contains? (ancestors clojure.lang.PersistentVector) java.util.List)]" :portability :jvm}
+  ;; Util.compare answers 0 for two IDENTICAL references before it ever asks for
+  ;; Comparable, so a value that cannot be ordered at all still compares to
+  ;; itself — and a vector holding one sorts. jolt went straight to the type
+  ;; table and raised, which is what broke sorting typed.clojure's type records
+  ;; (they hold a thunk field, and comparing a record to itself compares it).
+  {:suite "compare / identity" :label "a value compares to itself even when it is not Comparable" :expected "[0 0 0]" :actual "(let [f (fn [] 1) a (atom 1) r (java.util.Random. 1)] [(compare f f) (compare a a) (compare r r)])" :portability :jvm}
+  {:suite "compare / identity" :label "identity answers through a containing collection" :expected "0" :actual "(let [f (fn [] 1)] (compare [f] [f]))" :portability :jvm}
+  {:suite "compare / identity" :label "sorting tolerates an identical incomparable element" :expected "[1 2]" :actual "(let [f (fn [] 1)] (mapv second (sort [[f 2] [f 1]])))" :portability :jvm}
+  {:suite "compare / identity" :label "two DISTINCT incomparable values still raise" :expected ":cce" :actual "(try (compare (fn [] 1) (fn [] 2)) (catch ClassCastException e :cce))" :portability :jvm}
+  {:suite "compare / identity" :label "identity does not swallow the nil ordering" :expected "[0 -1 1]" :actual "(let [f (fn [] 1)] [(compare nil nil) (compare nil f) (compare f nil)])" :portability :jvm}
+  {:suite "compare / identity" :label "NaN and the ordinary orderings are unchanged" :expected "[0 0 0 0]" :actual "[(compare ##NaN ##NaN) (compare :a :a) (compare [1 2] [1 2]) (compare \"a\" \"a\")]" :portability :common}
+  ;; A primitive class is a Class like any other — Long/TYPE is the class `long`,
+  ;; not its name — and it is the one thing Class.toString does not prefix. The
+  ;; wrapper's TYPE static held a bare string, so .isPrimitive and every other
+  ;; Class method missed it, and toString/str disagreed about interfaces.
+  {:suite "class / primitive Class values" :label "isPrimitive tells a primitive from its wrapper" :expected "[false true true false false]" :actual "[(.isPrimitive Long) (.isPrimitive Long/TYPE) (.isPrimitive Integer/TYPE) (.isPrimitive String) (.isPrimitive java.util.List)]" :portability :jvm}
+  {:suite "class / primitive Class values" :label "toString names the kind, and a primitive has no prefix" :expected "[\"long\" \"class java.lang.String\" \"interface java.util.List\" \"void\"]" :actual "[(.toString Long/TYPE) (.toString String) (.toString java.util.List) (str Void/TYPE)]" :portability :jvm}
+  {:suite "class / primitive Class values" :label "str and .toString agree on every kind of class" :expected "[true true true]" :actual "[(= (str Long/TYPE) (.toString Long/TYPE)) (= (str String) (.toString String)) (= (str java.util.List) (.toString java.util.List))]" :portability :jvm}
+  {:suite "class / primitive Class values" :label "a primitive class answers the rest of the Class surface" :expected "[\"long\" \"long\" false false true]" :actual "[(.getName Long/TYPE) (.getSimpleName Long/TYPE) (.isArray Long/TYPE) (.isInterface Long/TYPE) (nil? (.getSuperclass Long/TYPE))]" :portability :jvm}
+  {:suite "class / primitive Class values" :label "TYPE is a Class, interned, and distinct per primitive" :expected "[true true true false]" :actual "[(class? Long/TYPE) (identical? Long/TYPE Long/TYPE) (= Long/TYPE Long/TYPE) (identical? Long/TYPE Integer/TYPE)]" :portability :jvm}
+  {:suite "class / primitive Class values" :label "into-array still reads a TYPE as its element kind" :expected "[\"[J\" \"[I\" \"[D\" \"[B\"]" :actual "[(.getName (class (into-array Long/TYPE [1 2]))) (.getName (class (into-array Integer/TYPE [1 2]))) (.getName (class (into-array Double/TYPE [1.0]))) (.getName (class (into-array Byte/TYPE [1])))]" :portability :jvm}
+  ;; A java.lang.Class is one object per class: the JVM hands back the same
+  ;; instance for every (class x) / .getClass / class-name token, so identical?
+  ;; on two of them is a class equality test. Library code relies on it —
+  ;; typedclojure's subtype dispatch is (identical? (.getClass s) (.getClass t)),
+  ;; and answering false there skipped its whole RClass-vs-RClass rule.
+  {:suite "class / one Class object per class" :label "two values of a class report the identical Class" :expected "[true true true true]" :actual "[(identical? (class 1) (class 2)) (identical? (class \"a\") (class \"b\")) (identical? (class [1]) (class [2 3])) (identical? (class {:a 1}) (class {:b 2}))]" :portability :jvm}
+  {:suite "class / one Class object per class" :label "a class token is identical to (class x) of its values" :expected "[true true true]" :actual "[(identical? (class 1) Long) (identical? (class 1.5) Double) (identical? (class \"a\") String)]" :portability :jvm}
+  {:suite "class / one Class object per class" :label ".getClass agrees with class, and a Class is a java.lang.Class" :expected "[true true]" :actual "[(identical? (.getClass \"a\") (class \"b\")) (identical? (.getClass String) Class)]" :portability :jvm}
+  {:suite "class / one Class object per class" :label "a host object's class interns like a scalar's" :expected "true" :actual "(identical? (class (java.util.Date. 0)) (class (java.util.Date. 1)))" :portability :jvm}
+  {:suite "class / one Class object per class" :label "a record's class is one object across instances" :expected "[true false]" :actual "(do (ns cid.ns) (clojure.core/defrecord Ci [a]) [(clojure.core/identical? (clojure.core/class (cid.ns/->Ci 1)) (clojure.core/class (cid.ns/->Ci 2))) (clojure.core/identical? (clojure.core/class 1) (clojure.core/class 1.5))])" :portability :jvm}
+
+  ;; instance? and the class graph are one answer: a scalar's ancestry comes from
+  ;; the same table isa?/supers read, so an interface a value's class declares
+  ;; holds for the value. Numbers, strings and ratios used to answer from a flat
+  ;; name list that stopped at Number/CharSequence.
+  {:suite "class / scalars carry their whole ancestry" :label "instance? sees Comparable on the scalar classes" :expected "[true true true true true]" :actual "[(instance? Comparable 1) (instance? Comparable 1.5) (instance? Comparable \"a\") (instance? Comparable (/ 1 2)) (instance? Comparable true)]" :portability :jvm}
+  {:suite "class / scalars carry their whole ancestry" :label "instance? and isa? agree about a scalar's interfaces" :expected "[true true]" :actual "[(= (instance? Comparable 1) (isa? (class 1) Comparable)) (= (instance? java.io.Serializable \"a\") (isa? (class \"a\") java.io.Serializable))]" :portability :jvm}
+  {:suite "class / scalars carry their whole ancestry" :label "a protocol extended to an interface dispatches on a number" :expected "[:cmp :cmp]" :actual "(do (ns pcm.ns) (clojure.core/defprotocol Pc (mc [_])) (clojure.core/extend-protocol Pc java.lang.Comparable (mc [_] :cmp)) [(pcm.ns/mc 1) (pcm.ns/mc 1.5)])" :portability :jvm}
+
+  ;; java.io.Serializable sits where the JVM declares it: on Number, on the
+  ;; scalar wrappers that are not Numbers, and on the abstract Clojure
+  ;; collection classes — so it is inherited, not restated per class.
+  {:suite "class / scalars carry their whole ancestry" :label "instance? Serializable on scalars and collections" :expected "[true true true true true]" :actual "[(instance? java.io.Serializable 1) (instance? java.io.Serializable \"a\") (instance? java.io.Serializable [1 2]) (instance? java.io.Serializable {:a 1}) (instance? java.io.Serializable :k)]" :portability :jvm}
+  {:suite "class / scalars carry their whole ancestry" :label "supers and bases place Serializable where the JVM does" :expected "[true true false true]" :actual "[(contains? (supers Long) java.io.Serializable) (contains? (set (bases Number)) java.io.Serializable) (contains? (set (bases Long)) java.io.Serializable) (contains? (supers String) java.io.Serializable)]" :portability :jvm}
   {:suite "host-interop / getClass" :label ".getClass is a universal Object method, reached on every value type" :expected "[\"java.util.Date\" \"java.io.File\"]" :actual "[(.getName (.getClass (java.util.Date.))) (.getName (.getClass (java.io.File. \"x\")))]" :portability :jvm}
   {:suite "reduce / IReduceInit" :label "reduce drives a deftype's own reduce method (init arity)" :expected "110" :actual "(do (deftype Rng [n] clojure.lang.IReduceInit (reduce [_ f init] (loop [i 0 acc init] (if (< i n) (recur (inc i) (f acc i)) acc)))) (reduce + 100 (->Rng 5)))" :portability :jvm}
   {:suite "reduce / IReduceInit" :label "a deftype reduce honors reduced short-circuit" :expected "3" :actual "(do (deftype Rng [n] clojure.lang.IReduceInit (reduce [_ f init] (loop [i 0 acc init] (if (< i n) (let [a (f acc i)] (if (reduced? a) @a (recur (inc i) a))) acc)))) (reduce (fn [acc x] (if (= x 3) (reduced acc) (+ acc x))) 0 (->Rng 10)))" :portability :jvm}

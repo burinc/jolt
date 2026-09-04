@@ -260,6 +260,16 @@
   (set! jolt-compare-arms (cons (cons pred handler) jolt-compare-arms)))
 (define (jolt-compare a b)
   (cond
+    ;; Util.compare answers 0 for two identical references FIRST, before it asks
+    ;; for Comparable at all — so a value with no ordering still compares to
+    ;; itself, and a collection holding one sorts. Ordering is only ever
+    ;; consulted for two DISTINCT values, and comparing a value to itself under
+    ;; any ordering is 0 anyway, so this decides nothing the arms below would
+    ;; have decided differently. Numbers are not excluded the way jolt=2's
+    ;; identity clause excludes them: 0 is the right answer for a number
+    ;; compared to itself, NaN included (Double.compareTo says NaN equals
+    ;; itself), so interning cannot make it wrong.
+    ((eq? a b) 0)
     ((and (jolt-nil? a) (jolt-nil? b)) 0)
     ((jolt-nil? a) -1)
     ((jolt-nil? b) 1)
