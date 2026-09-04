@@ -1547,6 +1547,13 @@
       ;; declared host-class providers (RFC 0014), the project's own first: a
       ;; project may supply a class itself rather than take a library's.
       :provides (host-class-providers (concat (provides-entries edn nil) dep-provides))
+      ;; :jolt/replaces — namespaces jolt provides as a host built-in
+      ;; (babashka.fs, babashka.process) that THIS project supplies itself, so
+      ;; its copy resolves ahead of jolt's and no supplement loads over it.
+      ;; The PROJECT's only: a library that took a built-in over would decide
+      ;; what the namespace means for every other library in the program, which
+      ;; is what host-class-providers already refuses for classes.
+      :replaces (mapv str (:jolt/replaces edn))
       ;; the expansion trace, when it was asked for (-Stree renders it)
       :trace dep-trace
       ;; nREPL middleware a library contributes (jolt.nrepl composes them over its

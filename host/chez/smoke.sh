@@ -1025,6 +1025,19 @@ else
   echo "    want \`[true true]\` got \`$bbs_out\`"
   fails=$((fails + 1))
 fi
+
+# ...and the escape hatch: a project that DECLARES it supplies the namespace
+# itself gets its own copy, with no supplement interned over it. Without one,
+# "jolt always wins" would be a thing a project could not get out of.
+printf '{:paths ["src"] :jolt/replaces [babashka.fs]}\n' > "$bbshadow/deps.edn"
+bbr_out="$(cd "$bbshadow" && JOLT_NO_DEVCACHE=1 "$bbs_jolt" -e '(do (require (quote babashka.fs)) [(= :decoy @(resolve (quote babashka.fs/marker))) (nil? (resolve (quote babashka.fs/list-dir)))])' 2>&1 | tail -1)"
+if [ "$bbr_out" = '[true true]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: :jolt/replaces did not reach the project's own babashka.fs"
+  echo "    want \`[true true]\` got \`$bbr_out\`"
+  fails=$((fails + 1))
+fi
 rm -rf "$bbshadow"
 
 # jolt.fs — the stdlib file-system API against a scratch temp dir (glob, copy-tree,
