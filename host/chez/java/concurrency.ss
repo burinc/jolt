@@ -1895,11 +1895,17 @@
                     (cons "newVirtualThreadPerTaskExecutor" cached)
                     (cons "newCachedThreadPool" cached) (cons "newWorkStealingPool" stealing))))
             '("Executors" "java.util.concurrent.Executors")))
+;; submit, as a named procedure: invokeAll and invokeAny below are defined in
+;; terms of it, exactly as the JVM's AbstractExecutorService defines them.
+(define (executor-submit self thunk*)
+  (let ((fut (make-j-future)) (snap (dyn-binding-stack)) (thunk (runnable->thunk thunk*)))
+    (executor-enqueue! self (lambda () (dyn-binding-stack snap) (j-future-complete! fut thunk)))
+    fut))
+(define (executor-task-list tasks)
+  (let ((s (jolt-seq tasks))) (if (jolt-nil? s) '() (seq->list s))))
+
 (register-host-methods! "executor-service"
-  (list (cons "submit" (lambda (self thunk)
-          (let ((fut (make-j-future)) (snap (dyn-binding-stack)) (thunk (runnable->thunk thunk)))
-            (executor-enqueue! self (lambda () (dyn-binding-stack snap) (j-future-complete! fut thunk)))
-            fut)))
+  (list (cons "submit" executor-submit)
         (cons "execute" (lambda (self thunk*)
           (let ((thunk (runnable->thunk thunk*)))
           (let ((snap (dyn-binding-stack)))
@@ -1915,6 +1921,31 @@
         ;; whichever one a signal would pick), term-cond because a pool with no
         ;; live worker is already terminated and awaitTermination has to re-read
         ;; the flag to find out.
+        ;; invokeAll submits every task and BLOCKS until each has finished, then
+        ;; answers their futures — so a caller that maps .get over the result is
+        ;; waiting on work that has already run, and one that does not still gets
+        ;; the JVM's guarantee that the tasks are done when it returns. A task
+        ;; that threw is DONE with its failure held in its own future (.get raises
+        ;; ExecutionException); invokeAll itself does not raise. The timeout arity
+        ;; is accepted and waits the same way: these futures are all enqueued on
+        ;; this executor, so there is no deadline to enforce beyond their finishing.
+        (cons "invokeAll" (lambda (self tasks . _timeout)
+          (let ((futs (map (lambda (t) (executor-submit self t)) (executor-task-list tasks))))
+            (for-each (lambda (f) (guard (e (#t #f)) (j-future-get f))) futs)
+            (apply jolt-vector futs))))
+        ;; invokeAny answers the first task that succeeded, skipping the ones that
+        ;; threw, and raises only when every one of them failed (the JVM re-raises
+        ;; the last failure as an ExecutionException, which is what j-future-get
+        ;; already builds). An empty task list is IllegalArgumentException there.
+        (cons "invokeAny" (lambda (self tasks . _timeout)
+          (let ((ts (executor-task-list tasks)))
+            (when (null? ts)
+              (throw-jvm (quote IllegalArgumentException) "tasks is empty"))
+            (let loop ((futs (map (lambda (t) (executor-submit self t)) ts)) (err #f))
+              (if (null? futs)
+                  (raise err)
+                  (let ((r (guard (e (#t (cons 'err e))) (cons 'ok (j-future-get (car futs))))))
+                    (if (eq? (car r) 'ok) (cdr r) (loop (cdr futs) (cdr r)))))))))
         (cons "shutdown" (lambda (self) (executor-shutdown! (jhost-state self)) jolt-nil))
         (cons "shutdownNow" (lambda (self) (executor-shutdown-now! (jhost-state self))))
         ;; close is shutdown plus an unbounded awaitTermination, and it BLOCKS —

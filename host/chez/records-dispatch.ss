@@ -123,6 +123,16 @@
     "removeLast" "removeIf" "replaceAll" "retainAll" "set" "sort"))
 (define (rd-java-util-mutator? m) (and (member m rd-java-util-mutator-names) #t))
 
+;; clojure.lang.Var meta reads for the instance arm below. A cell's meta is a
+;; pmap, or #f / nil before anything attached one (state-image rebuilds a cell with
+;; #f), so both empty shapes read as "no such key".
+(define (rd-var-meta obj)
+  (let ((m (var-cell-meta obj))) (and m (not (jolt-nil? m)) m)))
+(define (rd-var-meta-get obj key)
+  (let ((m (rd-var-meta obj))) (if m (jolt-get m (keyword #f key) jolt-nil) jolt-nil)))
+(define (rd-var-meta-flag? obj key) (jolt-truthy? (rd-var-meta-get obj key)))
+(define (rd-args->list x) (let ((s (jolt-seq x))) (if (jolt-nil? s) '() (seq->list s))))
+
 (define (record-method-dispatch-base obj method-name rest-args)
   (let ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args))))
     (cond
@@ -290,6 +300,37 @@
              ;; clojure.core/*loaded-libs* rather than whatever a load has bound
              ;; over it. deref would answer the binding.
              ((string=? method-name "getRawRoot") (var-cell-root obj))
+             ;; The rest of Var's surface, each reading the state the clojure.core
+             ;; fn of the same meaning reads: isMacro the cell's macro flag (which
+             ;; alter-meta! keeps in step with meta :macro), isBound hasRoot OR a
+             ;; thread binding (bound?), hasRoot the root alone, isDynamic /
+             ;; isPublic / getTag the meta, deref / get the thread binding then
+             ;; the root — an unbound root answers its Unbound object rather than
+             ;; throwing, as Var.deref does. These used to fall to "No matching
+             ;; field", and typedclojure reads (.isMacro v) at every def it checks.
+             ((string=? method-name "isMacro") (var-cell-macro? obj))
+             ((string=? method-name "isBound") (jolt-var-bound-one? obj))
+             ((string=? method-name "hasRoot") (not (jolt-var-unbound? (var-cell-root obj))))
+             ((string=? method-name "isDynamic") (rd-var-meta-flag? obj "dynamic"))
+             ((string=? method-name "isPublic") (not (rd-var-meta-flag? obj "private")))
+             ((string=? method-name "getTag") (rd-var-meta-get obj "tag"))
+             ((or (string=? method-name "deref") (string=? method-name "get")) (var-cell-deref obj))
+             ;; setMacro sets the flag AND meta :macro, the pair alter-meta! keeps
+             ;; together. bindRoot / alterRoot go through alter-var-root so the
+             ;; validator and watches see the change; bindRoot also clears the
+             ;; macro flag, as Var.bindRoot does (a def over a macro un-macros it).
+             ((string=? method-name "setMacro")
+              (var-cell-macro?-set! obj #t)
+              (var-cell-meta-set! obj (jolt-assoc (or (rd-var-meta obj) (jolt-hash-map)) jolt-kw-var-macro #t))
+              jolt-nil)
+             ((string=? method-name "bindRoot")
+              (jolt-alter-var-root obj (lambda (_) (car rest)))
+              (var-cell-macro?-set! obj #f)
+              (let ((m (rd-var-meta obj)))
+                (when m (var-cell-meta-set! obj (jolt-dissoc2 m jolt-kw-var-macro))))
+              jolt-nil)
+             ((string=? method-name "alterRoot")
+              (apply jolt-alter-var-root obj (car rest) (rd-args->list (cadr rest))))
              (else (dispatch-miss obj method-name rest))))
       ;; java.lang.Throwable interop over a Chez condition. A jolt host error
       ;; (`error`/`assertion-violationf`) raises a Chez condition; Clojure code
