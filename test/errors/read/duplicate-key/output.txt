@@ -1,0 +1,10 @@
+Unhandled exception (IllegalArgumentException): Duplicate key: :a
+  at ./test/errors/read/duplicate-key/input.clj:1:1
+  trace:
+    rdr-make-map
+    rdr-read-form
+    rdr-read-seq
+    rdr-read-form
+    rdr-read-top
+    cmd-run
+exit: 1
