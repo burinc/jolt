@@ -456,8 +456,8 @@
 ;; defmacro arm derives them); this static mirror is for the image/build path,
 ;; which lowers the form via ce-defmacro->fn instead and used to drop the meta
 ;; entirely — every image-baked macro's (meta #'when) came back {:ns :name}.
-;; Merge order matches the analyzer arm (and the JVM):
-;; name ^meta < derived :arglists < attr-map < docstring.
+;; Merge order matches the analyzer arm (and the JVM, where a defmacro IS a defn):
+;; name ^meta < derived :arglists < docstring < leading attr-map < trailing one.
 (define ce-kw-arglists (keyword #f "arglists"))
 (define ce-kw-doc (keyword #f "doc"))
 
@@ -504,14 +504,15 @@
         (else #f)))
 
 ;; The var meta pmap for a defmacro form's pieces, or #f when there is nothing.
-(define (ce-defmacro-meta name-sym after-meta attr doc)
+(define (ce-defmacro-meta name-sym after-meta attr doc trail)
   (let* ((arglists (ce-derive-arglists after-meta))
          (nm-meta (hc-sym-meta name-sym))
          (m (jolt-hash-map))
          (m (if (pmap? nm-meta) (ce-attr-onto m nm-meta) m))
          (m (if arglists (jolt-assoc m ce-kw-arglists arglists) m))
+         (m (if doc (jolt-assoc m ce-kw-doc doc) m))
          (m (if (pmap? attr) (ce-attr-onto m attr) m))
-         (m (if doc (jolt-assoc m ce-kw-doc doc) m)))
+         (m (if (pmap? trail) (ce-attr-onto m trail) m)))
     (and (> (jolt-count m) 0) m)))
 
 ;; (defmacro NAME [docstring] [attr-map] params body...)
@@ -534,12 +535,30 @@
          (v (apply jolt-vector (cons ce-amp-form-sym (cons ce-amp-env-sym items)))))
     (if (jolt-nil? m) v (jolt-with-meta v m))))
 (define (ce-macro-arities after)
-  (if (pvec? (car after))
-      (cons (ce-macro-params (car after)) (cdr after))     ; (params body …)
-      (map (lambda (clause)                                 ; ((params body …) …)
-             (let ((es (seq->list clause)))
-               (apply jolt-list (cons (ce-macro-params (car es)) (cdr es)))))
-           after)))
+  (cond ((null? after) after)                               ; (defmacro m) declares none
+        ((pvec? (car after))                                 ; a lone (params body …)
+         ;; normalized into ONE clause, as the reference does before it prepends
+         ;; anything, so the shape matches analyzer.clj macro-fn-arities exactly.
+         (list (apply jolt-list (cons (ce-macro-params (car after)) (cdr after)))))
+        (else
+         (map (lambda (clause)                               ; ((params body …) …)
+                (let ((es (seq->list clause)))
+                  (apply jolt-list (cons (ce-macro-params (car es)) (cdr es)))))
+              after))))
+;; The forms after the docstring and leading attr-map, split into
+;; [arity-forms . trailing-attr-map]. defmacro takes a trailing attr-map exactly
+;; as defn does; running it through the arity lowering made it a bogus
+;; ([&form &env]) clause. Only a MULTI-arity body can carry one — a single
+;; `[params] body` is one clause already, so its last form is a map-returning
+;; body. Matches analyzer.clj macro-trail-attr, which is the runtime path's
+;; spelling of this same split.
+(define (ce-macro-trail-attr after)
+  (if (and (pair? after) (not (pvec? (car after))) (pair? (cdr after)))
+      (let loop ((xs after) (acc '()))
+        (if (null? (cdr xs))
+            (if (pmap? (car xs)) (cons (reverse acc) (car xs)) (cons after #f))
+            (loop (cdr xs) (cons (car xs) acc))))
+      (cons after #f)))
 
 (define (ce-defmacro->fn f)
   (let* ((items (seq->list f))
@@ -548,11 +567,14 @@
          (doc (and (pair? after-name) (string? (car after-name)) (car after-name)))
          (a1 (if doc (cdr after-name) after-name))
          (attr (and (pair? a1) (pmap? (car a1)) (car a1)))
-         (after-meta (if attr (cdr a1) a1))
+         (a2 (if attr (cdr a1) a1))
+         (split (ce-macro-trail-attr a2))
+         (after-meta (car split))
+         (trail (cdr split))
          (fn-sym (jolt-symbol "clojure.core" "fn")))
     (values (symbol-t-name name-sym)
             (apply jolt-list (cons fn-sym (ce-macro-arities after-meta)))
-            (ce-defmacro-meta name-sym after-meta attr doc))))
+            (ce-defmacro-meta name-sym after-meta attr doc trail))))
 
 ;; A bare top-level (do ...) form — head is the unqualified `do` symbol.
 (define (ce-top-do? form)
