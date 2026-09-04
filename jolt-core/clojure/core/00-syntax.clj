@@ -559,11 +559,22 @@
         ;; (def ^{:arglists (quote ([x]))} f …): def-meta-expr strips one quote
         ;; layer either way, but a consumer that EVALUATES the def-name meta
         ;; (tools.analyzer, typedclojure) read the bare ([x]) as a call of [x].
+        ;; A macro's two implicit params are elided, as the JVM's `sigs` elides
+        ;; them: a defmacro expands to a defn whose params are
+        ;; [&form &env & declared], and the var still reports the declared ones —
+        ;; what `doc` and every arglists-driven tool show. The trigger is &form in
+        ;; FIRST position, which is what the reference keys on. Guarded on length:
+        ;; a lone [&form] is an IndexOutOfBoundsException there (subvec 2..1), a
+        ;; crash rather than a shape worth reproducing.
+        declared-params (fn [pv]
+                          (if (and (vector? pv) (> (count pv) 1) (= (first pv) '&form))
+                            (subvec pv 2)
+                            pv))
         arglists (if (vector? (first body))
-                   (list (first body))
+                   (list (declared-params (first body)))
                    (loop [cs body acc []]
                      (if (seq cs)
-                       (recur (rest cs) (conj acc (first (first cs))))
+                       (recur (rest cs) (conj acc (declared-params (first (first cs)))))
                        (seq acc))))
         ;; precedence, matching the JVM's conj order: name metadata < the derived
         ;; :arglists < docstring < leading attr-map < trailing attr-map. So an
