@@ -104,6 +104,23 @@
 ;; drop every type a case defined; pruning the tree alone would leave this index
 ;; answering for types that no longer exist, so the two are pruned through one
 ;; entry point rather than by remembering to do both.
+;; Forget everything registered against ONE type tag: its protocols, its methods,
+;; the by-method index, the class-answer memo and any devirt clone. A deftype
+;; redefinition is a new class on the JVM — neither the previous definition's
+;; own methods nor an extend-type made against it carries over — and jolt kept
+;; them, so a method the new definition does not declare still answered
+;; (jolt-lnwq). make-deftype-ctor calls this when a fresh descriptor replaces an
+;; existing one, before the new definition's registrations run.
+;; The epoch bump is what retires the per-site inline caches that resolved an
+;; impl this drops.
+(define (forget-type-methods! type-tag)
+  (jolt-with-mutex rec-tbl-mu
+    (set! jolt-proto-epoch (fx+ jolt-proto-epoch 1))
+    (hashtable-delete! type-registry type-tag)
+    (hashtable-delete! type-method-index type-tag)
+    (hashtable-delete! type-class-memo type-tag)
+    (hashtable-delete! clone-registry type-tag)))
+
 (define (prune-type-registry! keep?)
   (vector-for-each
     (lambda (k)
@@ -502,6 +519,9 @@
           ;; the same tag can install its desc between this read and this write
           ;; and have its ptable invalidated by us right after, leaving the live
           ;; desc permanently on the slow path.
+          ;; a redefinition drops what the previous definition registered, so the
+          ;; new one starts from nothing — see forget-type-methods!
+          (_ (when (hashtable-ref chez-tag-desc tag #f) (forget-type-methods! tag)))
           (_ (jolt-with-mutex rec-tbl-mu
                (let ((old-desc (hashtable-ref chez-tag-desc tag #f)))
                  (when old-desc (jrdesc-ptable-set! old-desc #f)))
