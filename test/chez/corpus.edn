@@ -5951,4 +5951,20 @@
   {:suite "defn / implicit macro params" :label "every arity of a multi-arity fn" :expected "\"([a] [a b])\"" :actual "(do (defn zz2 ([&form &env a] a) ([&form &env a b] b)) (pr-str (:arglists (meta (var zz2)))))" :portability :common}
   {:suite "defn / implicit macro params" :label "&env alone is not the trigger" :expected "\"([&env a])\"" :actual "(do (defn zz3 [&env a] a) (pr-str (:arglists (meta (var zz3)))))" :portability :common}
   {:suite "defn / implicit macro params" :label "so evaluating a defmacro's expansion interns the declared arglists" :expected "[\"([a])\" true 42]" :actual "(do (eval (macroexpand-1 (quote (defmacro mq1 [a] (list (quote inc) a))))) [(pr-str (:arglists (meta (resolve (quote mq1))))) (:macro (meta (resolve (quote mq1)))) (eval (quote (mq1 41)))])" :portability :common}
+  ;; The timeout arities of invokeAll / invokeAny were accepted and DISCARDED, so
+  ;; a caller that used one as its bound waited for the tasks anyway. The JVM
+  ;; cancels what has not finished by the deadline (invokeAll) and raises
+  ;; TimeoutException when nothing has (invokeAny). And invokeAny cancels the
+  ;; losers once one task has succeeded, which jolt did not do either.
+  {:suite "concurrency / invokeAll deadlines" :label "invokeAll cancels what missed the deadline" :expected "[[true true \"CancellationException\"] [true false :fast]]" :actual "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 2) fs (.invokeAll ex [(fn [] (Thread/sleep 400) :slow) (fn [] :fast)] 1 java.util.concurrent.TimeUnit/MILLISECONDS)] (try (mapv (fn [f] [(.isDone f) (.isCancelled f) (try (.get f) (catch Throwable e (.getSimpleName (class e))))]) fs) (finally (.shutdown ex))))" :portability :jvm}
+  {:suite "concurrency / invokeAll deadlines" :label "invokeAny raises TimeoutException at its deadline" :expected "\"TimeoutException\"" :actual "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 2)] (try (try (.invokeAny ex [(fn [] (Thread/sleep 400) :slow)] 1 java.util.concurrent.TimeUnit/MILLISECONDS) (catch Throwable e (.getSimpleName (class e)))) (finally (.shutdown ex))))" :portability :jvm}
+  ;; One worker, so the ordering is decided rather than raced: the winner runs
+  ;; first, loser1's second-long sleep then holds the only worker, and loser2 is
+  ;; provably still QUEUED when invokeAny cancels it — so it must never run.
+  {:suite "concurrency / invokeAll deadlines" :label "invokeAny cancels the tasks that lost" :expected "[:won true nil]" :actual "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) ran (atom nil) r (.invokeAny ex [(fn [] :won) (fn [] (Thread/sleep 1000) :loser1) (fn [] (reset! ran :loser2-ran) :loser2)])] (.shutdown ex) [r (.awaitTermination ex 5 java.util.concurrent.TimeUnit/SECONDS) (deref ran)])" :portability :jvm}
+  ;; A one-worker pool runs invokeAll's tasks in LIST order. jolt submitted them
+  ;; with Scheme's `map`, whose element order is unspecified — the compiled
+  ;; runtime evaluated it right-to-left, so these reached the queue as (c a b)
+  ;; while .submit and .execute, which enqueue one at a time, were FIFO.
+  {:suite "concurrency / invokeAll deadlines" :label "invokeAll submits in list order" :expected "[:a :b :c]" :actual "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) log (atom [])] (try (.invokeAll ex (mapv (fn [n] (fn [] (swap! log conj n) n)) [:a :b :c])) (deref log) (finally (.shutdown ex))))" :portability :jvm}
 ]

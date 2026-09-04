@@ -1535,15 +1535,45 @@
 ;; catching ExecutionException (what the JVM makes them catch) caught nothing and
 ;; .getCause had nothing to read. task-execution-exception (above) is the wrap,
 ;; the same one a clojure `future` already did on deref; the two now agree.
-;; j-future state: #(done? result error mutex condition)
-(define (make-j-future) (make-jhost "j-future" (vector #f jolt-nil #f (make-mutex) (make-condition))))
+;; j-future state: #(status result error mutex condition); status is one of
+;; new/running/done/cancelled, the same four a FutureTask carries (further down)
+;; and for the same reason — cancel has to win over a task that has not started
+;; and lose to one that has. It used to be a done? boolean with .cancel answering
+;; #f unconditionally, which left invokeAll's deadline and invokeAny's losers with
+;; nothing to cancel WITH.
+;;
+;; Cancelling a task that is already RUNNING does not stop it: an executor worker
+;; carries no interrupt flag for a cancel to set (the same limit shutdownNow
+;; documents below). The future still finalizes as cancelled, so .get raises and
+;; the late result is dropped, exactly as a cancel that lands during the JVM's
+;; own window does.
+(define (make-j-future) (make-jhost "j-future" (vector 'new jolt-nil #f (make-mutex) (make-condition))))
+(define (j-future-settled? status) (and (memq status '(done cancelled)) #t))
+;; A missed deadline, as a value the waiter can test: eq?-unique, so no task
+;; result can be mistaken for one.
+(define j-future-timed-out (list 'j-future-timed-out))
 (define (j-future-complete! self thunk)
   (let ((st (jhost-state self)))
-    (let ((r (guard (e (#t (vector-set! st 2 e) #f)) (jolt-invoke thunk))))
-      (jolt-with-mutex (vector-ref st 3)
-        (unless (vector-ref st 2) (vector-set! st 1 r))
-        (vector-set! st 0 #t)
-        (jolt-cv-wake! (vector-ref st 4))))))
+    ;; claim the task, or leave it alone: a cancelled future's thunk never runs.
+    (when (jolt-with-mutex (vector-ref st 3)
+            (and (eq? (vector-ref st 0) 'new)
+                 (begin (vector-set! st 0 'running) #t)))
+      (let ((r (guard (e (#t (vector-set! st 2 e) #f)) (jolt-invoke thunk))))
+        (jolt-with-mutex (vector-ref st 3)
+          ;; a cancel that landed while this ran keeps the future cancelled
+          (unless (eq? (vector-ref st 0) 'cancelled)
+            (unless (vector-ref st 2) (vector-set! st 1 r))
+            (vector-set! st 0 'done))
+          (jolt-cv-wake! (vector-ref st 4)))))))
+;; Answers #t iff THIS call cancelled it, as Future.cancel does.
+(define (j-future-cancel! self)
+  (let ((st (jhost-state self)))
+    (jolt-with-mutex (vector-ref st 3)
+      (if (j-future-settled? (vector-ref st 0))
+          #f
+          (begin (vector-set! st 0 'cancelled)
+                 (jolt-cv-wake! (vector-ref st 4))
+                 #t)))))
 (define (j-future? x) (and (jhost? x) (string=? (jhost-tag x) "j-future")))
 ;; get() waits for the task; get(timeout, unit) gives up at the deadline and throws
 ;; TimeoutException, like the JVM. The timeout used to be discarded, so the bounded
@@ -1553,18 +1583,25 @@
 ;; `deref` with a timeout value returns it instead (Clojure's deref-future
 ;; swallows exactly TimeoutException), so both spellings share one wait rather
 ;; than one of them catching what the other just threw.
-(define (j-future-get* self ms on-timeout)
+;; The wait, against an ABSOLUTE deadline (or #f for none): invokeAll shares one
+;; deadline across every future it waits on, so the bound is the whole call's, not
+;; each task's in turn.
+(define (j-future-get-until self deadline on-timeout)
   (let* ((st (jhost-state self))
-         (done (jolt-cv-wait-interruptibly "Future.get"
-                             (vector-ref st 3) (vector-ref st 4)
-                             (and ms (ms->deadline-millis ms))
-                 (lambda (timed-out?)
-                   (cond ((vector-ref st 0) #t)
-                         (timed-out? #f)
-                         (else jolt-cv-again))))))
-    (cond ((not done) (on-timeout))
+         (status (jolt-cv-wait-interruptibly "Future.get"
+                             (vector-ref st 3) (vector-ref st 4) deadline
+                   (lambda (timed-out?)
+                     (cond ((j-future-settled? (vector-ref st 0)) (vector-ref st 0))
+                           (timed-out? #f)
+                           (else jolt-cv-again))))))
+    (cond ((not status) (on-timeout))
+          ((eq? status 'cancelled)
+           (jolt-throw (jolt-host-throwable "java.util.concurrent.CancellationException"
+                                            "task was cancelled")))
           ((vector-ref st 2) (jolt-throw (task-execution-exception (vector-ref st 2))))
           (else (vector-ref st 1)))))
+(define (j-future-get* self ms on-timeout)
+  (j-future-get-until self (and ms (ms->deadline-millis ms)) on-timeout))
 (define (future-timeout-throw)
   (jolt-throw (jolt-host-throwable "java.util.concurrent.TimeoutException"
                                    "timed out waiting for the task")))
@@ -1572,9 +1609,9 @@
   (j-future-get* self (tu-args->ms args) future-timeout-throw))
 (register-host-methods! "j-future"
   (list (cons "get" j-future-get)
-        (cons "isDone" (lambda (self) (vector-ref (jhost-state self) 0)))
-        (cons "isCancelled" (lambda (self) #f))
-        (cons "cancel" (lambda (self . _) #f))))
+        (cons "isDone" (lambda (self) (j-future-settled? (vector-ref (jhost-state self) 0))))
+        (cons "isCancelled" (lambda (self) (eq? (vector-ref (jhost-state self) 0) 'cancelled)))
+        (cons "cancel" (lambda (self . _) (j-future-cancel! self)))))
 ;; executor-service state: #(shutdown? queue-box queue-mutex task-cond
 ;; live-workers advisory-queue-capacity core-workers max-workers keep-alive-ms
 ;; idle-workers queue-depth term-cond) — the capacity is #f except for a
@@ -1903,6 +1940,18 @@
     fut))
 (define (executor-task-list tasks)
   (let ((s (jolt-seq tasks))) (if (jolt-nil? s) '() (seq->list s))))
+;; Submit every task, IN LIST ORDER, and answer the futures in that order. Not
+;; `map`: its element order is unspecified, and the compiled runtime evaluated it
+;; right-to-left, so a three-task invokeAll reached the queue as (c a b) and a
+;; single-worker pool ran it that way — while .submit and .execute, which enqueue
+;; one at a time, were FIFO. Submission order is observable (it is the order a
+;; serial executor runs them in), so it has to be spelled out.
+(define (executor-submit-all self ts)
+  (let loop ((ts ts) (acc '()))
+    (if (null? ts)
+        (reverse acc)
+        (let ((f (executor-submit self (car ts))))     ; forced: bound before the recursion
+          (loop (cdr ts) (cons f acc))))))
 
 (register-host-methods! "executor-service"
   (list (cons "submit" executor-submit)
@@ -1926,26 +1975,53 @@
         ;; waiting on work that has already run, and one that does not still gets
         ;; the JVM's guarantee that the tasks are done when it returns. A task
         ;; that threw is DONE with its failure held in its own future (.get raises
-        ;; ExecutionException); invokeAll itself does not raise. The timeout arity
-        ;; is accepted and waits the same way: these futures are all enqueued on
-        ;; this executor, so there is no deadline to enforce beyond their finishing.
-        (cons "invokeAll" (lambda (self tasks . _timeout)
-          (let ((futs (map (lambda (t) (executor-submit self t)) (executor-task-list tasks))))
-            (for-each (lambda (f) (guard (e (#t #f)) (j-future-get f))) futs)
+        ;; ExecutionException); invokeAll itself does not raise.
+        (cons "invokeAll" (lambda (self tasks . timeout)
+          (let ((futs (executor-submit-all self (executor-task-list tasks)))
+                (deadline (let ((ms (tu-args->ms timeout))) (and ms (ms->deadline-millis ms)))))
+            ;; ONE deadline for the whole call, not one per task, and a miss
+            ;; cancels the rest rather than waiting them out — a caller that gave
+            ;; a bound gets it. The deadline used to be discarded entirely.
+            ;; A task that THREW is finished, so its ExecutionException is
+            ;; swallowed here (it stays in its own future, where .get raises it);
+            ;; only a missed deadline stops the wait.
+            (let loop ((fs futs))
+              (unless (null? fs)
+                (if (eq? j-future-timed-out
+                         (guard (e (#t #f))
+                           (j-future-get-until (car fs) deadline (lambda () j-future-timed-out))))
+                    (for-each j-future-cancel! fs)
+                    (loop (cdr fs)))))
             (apply jolt-vector futs))))
         ;; invokeAny answers the first task that succeeded, skipping the ones that
         ;; threw, and raises only when every one of them failed (the JVM re-raises
         ;; the last failure as an ExecutionException, which is what j-future-get
         ;; already builds). An empty task list is IllegalArgumentException there.
-        (cons "invokeAny" (lambda (self tasks . _timeout)
-          (let ((ts (executor-task-list tasks)))
+        ;; Every OTHER task is CANCELLED once one has succeeded, as the JVM does:
+        ;; a caller relies on that to stop work whose answer it no longer needs,
+        ;; and jolt used to leave them all running. The deadline (when given) is
+        ;; the whole call's — nothing having succeeded by then is TimeoutException,
+        ;; not a late answer.
+        (cons "invokeAny" (lambda (self tasks . timeout)
+          (let ((ts (executor-task-list tasks))
+                (deadline (let ((ms (tu-args->ms timeout))) (and ms (ms->deadline-millis ms)))))
             (when (null? ts)
               (throw-jvm (quote IllegalArgumentException) "tasks is empty"))
-            (let loop ((futs (map (lambda (t) (executor-submit self t)) ts)) (err #f))
-              (if (null? futs)
-                  (raise err)
-                  (let ((r (guard (e (#t (cons 'err e))) (cons 'ok (j-future-get (car futs))))))
-                    (if (eq? (car r) 'ok) (cdr r) (loop (cdr futs) (cdr r)))))))))
+            (let* ((all (executor-submit-all self ts))
+                   (cancel-rest! (lambda (fs) (for-each j-future-cancel! fs))))
+              (let loop ((futs all) (err #f))
+                (if (null? futs)
+                    (raise err)                       ; every task failed
+                    (let ((r (guard (e (#t (cons 'err e)))
+                               (cons 'ok (j-future-get-until (car futs) deadline
+                                                             (lambda () j-future-timed-out))))))
+                      (cond ((and (eq? (car r) 'ok) (eq? (cdr r) j-future-timed-out))
+                             (cancel-rest! all)
+                             (jolt-throw (jolt-host-throwable
+                                          "java.util.concurrent.TimeoutException"
+                                          "timed out waiting for a task")))
+                            ((eq? (car r) 'ok) (cancel-rest! (cdr futs)) (cdr r))
+                            (else (loop (cdr futs) (cdr r)))))))))))
         (cons "shutdown" (lambda (self) (executor-shutdown! (jhost-state self)) jolt-nil))
         (cons "shutdownNow" (lambda (self) (executor-shutdown-now! (jhost-state self))))
         ;; close is shutdown plus an unbounded awaitTermination, and it BLOCKS —
