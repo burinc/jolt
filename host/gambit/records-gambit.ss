@@ -569,7 +569,21 @@
     out))
 
 (define (jrec-field-index r k)
-  (hashtable-ref (jrdesc-index (jrec-desc r)) k #f))
+  (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
+    (and i (if (fx<? i 0) (fx- -1 i) i))))
+
+(define (jrec-get-index r k)
+  (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
+    (and i (fx>=? i 0) i)))
+
+(define (jrdesc-mask-fields! desc)
+  (let ((idx (jrdesc-index desc)))
+    (vector-for-each
+      (lambda (k)
+        (let ((i (hashtable-ref idx k #f)))
+          (when (and i (fx>=? i 0))
+            (hashtable-set! idx k (fx- -1 i)))))
+      (jrdesc-fkeys desc))))
 
 (define (jrec-vec-copy v)
   (let* ((n (vector-length v)) (out (make-vector n)))
@@ -607,26 +621,41 @@
              (and (not (jolt-nil? ext))
                   (not (eq? jrec-absent (jolt-get ext k jrec-absent))))))))
 
+(define (jrec-declared-valat r)
+  (vector-ref (jrdesc-ifc-of r) 6))
+
+(define (jrec-call-valat va coll k d)
+  (let ((m3 (car va)) (m2 (cdr va)))
+    (if (and m2 (jolt-nil? d))
+        (jolt-invoke m2 coll k)
+        (if m3 (jolt-invoke m3 coll k d) (jolt-invoke m2 coll k)))))
+
 (define (jrec-ref coll k d)
   (if (eq? k jolt-deftype-kw)
       (jrec-tag coll)
-      (let ((i (jrec-field-index coll k)))
-        (if i
-            (jrec-field-ref coll i)
-            (let* ((ext (jrec-ext coll))
-                   (v (if (jolt-nil? ext)
-                          jrec-absent
-                          (jolt-get ext k jrec-absent))))
-              (if (eq? v jrec-absent)
-                  (cond
-                    ((find-method-any-protocol (jrec-tag coll) "valAt") =>
-                     (lambda (m) (jolt-invoke m coll k d)))
-                    ((find-method-any-protocol (jrec-tag coll) "get") =>
-                     (lambda (m)
-                       (let ((r (jolt-invoke m coll k)))
-                         (if (jolt-nil? r) d r))))
-                    (else d))
-                  v))))))
+      (let ((i (jrec-get-index coll k)))
+        (if i (jrec-field-ref coll i) (jrec-ref-slow coll k d)))))
+
+(define (jrec-ref-slow coll k d)
+  (let* ((ext (jrec-ext coll))
+         (v (if (jolt-nil? ext)
+                jrec-absent
+                (jolt-get ext k jrec-absent))))
+    (if (eq? v jrec-absent)
+        (cond
+          ((jrec-declared-valat coll) =>
+           (lambda (va) (jrec-call-valat va coll k d)))
+          ((find-method-any-protocol (jrec-tag coll) "valAt") =>
+           (lambda (m) (jolt-invoke m coll k d)))
+          ((find-method-any-protocol (jrec-tag coll) "get") =>
+           (lambda (m)
+             (let ((r (jolt-invoke m coll k))) (if (jolt-nil? r) d r))))
+          (else d))
+        v)))
+
+(define (jrec-field r k) (jrec-lookup r k jolt-nil))
+
+(def-var! "clojure.core" "__deftype-field" jrec-field)
 
 (define (jolt-set-field! inst k v)
   (if (jrec? inst)
@@ -853,7 +882,13 @@
              (else #f)))
       (jch-isa? tag "java.lang.CharSequence") record?
       (and (not record?) (tag-declares-coll-iface? tag))
-      (and (not record?) (tag-declares-sequential? tag)))))
+      (and (not record?) (tag-declares-sequential? tag))
+      (and (not record?)
+           (let ((m3 (find-method-any-protocol-arity tag "valAt" 3))
+                 (m2 (find-method-any-protocol-arity tag "valAt" 2)))
+             (let ((m3 (and m3 (proc-accepts? m3 3) m3))
+                   (m2 (and m2 (proc-accepts? m2 2) m2)))
+               (and (or m3 m2) (cons m3 m2))))))))
 
 (define (jrdesc-ifc-of x)
   (let* ((d (jrec-desc x)) (c (jrdesc-ifc d)))
@@ -1384,7 +1419,10 @@
                         (let ((h (make-eq-hashtable)))
                           (jrdesc-ptable-set! desc h)
                           h))))
-            (hashtable-set! pt k fn))))))
+            (hashtable-set! pt k fn))))
+      (when (and (string=? method "valAt")
+                 (not (hashtable-ref chez-record-type-tbl type-tag #f)))
+        (jrdesc-mask-fields! desc))))
   (remove-clone! type-tag proto method)
   (if #f #f))
 
@@ -1612,6 +1650,9 @@
               (let ((old-desc (hashtable-ref chez-tag-desc tag #f)))
                 (when old-desc (jrdesc-ptable-set! old-desc #f)))
               (hashtable-set! chez-tag-desc tag desc)))
+         (_ (when (and (find-method-any-protocol tag "valAt")
+                       (not (hashtable-ref chez-record-type-tbl tag #f)))
+              (jrdesc-mask-fields! desc)))
          (nf (length kws))
          (ctor-name (string-append
                       (chez-current-ns)
