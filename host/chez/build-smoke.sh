@@ -983,8 +983,8 @@ if grep -q 'set-chez-ns! "app.other"' "$aaout.build/flat.ss"; then
   echo "  FAIL: :as-alias pulled app.other into the binary"; exit 1
 fi
 got_aa="$(cd / && "$aaout" 2>&1)"
-if [ "$got_aa" != ":kw :app.other/x :aliased true" ]; then
-  echo "  FAIL: as-alias-app — want ':kw :app.other/x :aliased true', got \`$got_aa\`"; exit 1
+if [ "$got_aa" != ":kw :app.other/x :map 1 :aliased true" ]; then
+  echo "  FAIL: as-alias-app — want ':kw :app.other/x :map 1 :aliased true', got \`$got_aa\`"; exit 1
 fi
 
 # --- split flat source + cached runtime fasl ---------------------------------

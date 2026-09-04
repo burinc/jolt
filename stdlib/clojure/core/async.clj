@@ -452,10 +452,15 @@
   [ports opts]
   (assert (pos? (count ports)) "alts must have at least one channel operation")
   (let [ports (vec ports)
+        n (count ports)
         has-default (contains? opts :default)]
+    ;; Validate every put before the readiness scan can mutate any channel.
+    (dotimes [i n]
+      (let [port (nth ports i)]
+        (when (vector? port)
+          (assert (some? (nth port 1)) "Can't put nil on channel"))))
     ;; one fast non-blocking scan for :default support
-    (let [start (if (:priority opts) 0 (rand-int (count ports)))
-          n (count ports)
+    (let [start (if (:priority opts) 0 (rand-int n))
           hit (loop [k 0]
                 (when (< k n)
                   (let [j (+ start k) i (if (< j n) j (- j n))]

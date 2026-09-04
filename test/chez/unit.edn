@@ -1482,6 +1482,10 @@
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) f (future (a/alts!! [[c :v]]))] (Thread/sleep 50) (a/close! c) (let [[v p] @f] [v (= p c)])))" :expected "[false true]"}
   ;; 9. transducer chan works through alts put
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1 (map inc))] (a/alts!! [[c 1]]) (a/<!! c)))" :expected "2"}
+  ;; Validate every put before any ready operation can mutate channel state.
+  ;; JVM core.async throws while leaving :kept available; validating only as
+  ;; each candidate is attempted consumes the earlier ready take first.
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [ready (a/chan 1) other (a/chan) _ (a/>!! ready :kept)] (try (a/alts!! [ready [other nil]] :priority true) [:no-throw (a/poll! ready)] (catch AssertionError _ [:threw (a/poll! ready)]))))" :expected "[:threw :kept]"}
   ;; 10. mult/tap smoke — proves the dataflow layer still works
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) m (a/mult c) t1 (a/chan) t2 (a/chan)] (a/tap m t1) (a/tap m t2) (a/>!! c :x) [(a/<!! t1) (a/<!! t2)]))" :expected "[:x :x]"}
   ;; clojure.test — instance? in is still reports correctly (instance? is a fn)
@@ -1505,6 +1509,10 @@
   {:suite "io" :expr "(do (require '[clojure.java.io :as io]) (let [d (doto (java.io.File/createTempFile \"jtd\" \".d\") (.delete) (.mkdir)) child (java.io.File. d \"child.txt\")] (spit child \"x\") (let [deleted (.delete d)] (.delete child) (.delete d) deleted)))" :expected "false"}
   ;; Stage B — fixed-buffer transducer puts block when full
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1 (map inc)) p (future (a/>!! c 1) (a/>!! c 2) (a/>!! c 3) :done)] (Thread/sleep 100) (let [parked (not (realized? p)) v1 (a/<!! c) v2 (a/<!! c) v3 (a/<!! c) result @p] [parked v1 v2 v3 result])))" :expected "[true 2 3 4 :done]"}
+  ;; nil is not a value a channel can carry, and the message is the reference's:
+  ;; channels.clj raises IllegalArgumentException "Can't put nil on channel".
+  ;; jolt said "on a channel".
+  {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan 1)] (try (a/>!! c nil) :no-throw (catch IllegalArgumentException e (ex-message e)))))" :expected "\"Can't put nil on channel\""}
   ;; Stage B — pending rendezvous put parks until consumed (does NOT complete on close)
   {:suite "core.async" :expr "(do (require '[clojure.core.async :as a]) (let [c (a/chan) p (future (a/>!! c :v))] (Thread/sleep 50) (a/close! c) [(a/<!! c) @p]))" :expected "[:v true]"}
   ;; io-thread is the FIBER carrier (jolt-579): the three names pick the three
@@ -1762,6 +1770,10 @@
   {:suite "atomics" :label "reset-vals! returns [old new]" :expected "[5 9]" :expr "(let [a (atom 5)] (reset-vals! a 9))"}
   {:suite "atomics" :label "compare-and-set! true on match and sets" :expected "[true 6]" :expr "(let [a (atom 5)] [(compare-and-set! a 5 6) (deref a)])"}
   {:suite "atomics" :label "compare-and-set! false on mismatch and no set" :expected "[false 5]" :expr "(let [a (atom 5)] [(compare-and-set! a 0 6) (deref a)])"}
+  {:suite "atomics" :label "compare-and-set! rejects an equal distinct expectation" :expected "[false true]" :expr "(let [initial (list :value) equal (list :value) a (atom initial)] [(compare-and-set! a equal :bad) (identical? initial (deref a))])"}
+  {:suite "atomics" :label "compare-and-set! accepts the identical expectation" :expected "[true :ok]" :expr "(let [v (list :value) a (atom v)] [(compare-and-set! a v :ok) (deref a)])"}
+  {:suite "atomics" :label "compare-and-set! identity check does not realize equal lazy values" :expected "[false 0 true]" :expr "(let [calls (atom 0) actual (lazy-seq (swap! calls inc) (list :x)) expected (lazy-seq (swap! calls inc) (list :x)) a (atom actual)] [(compare-and-set! a expected :changed) (deref calls) (identical? actual (deref a))])"}
+  {:suite "atomics" :label "compare-and-set! notifies watches once only after an identity match" :expected "[false true [[:watch true true :ok]]]" :expr "(let [v (list :value) a (atom v) events (atom [])] (add-watch a :watch (fn [k ref old new] (swap! events conj [k (identical? ref a) (identical? old v) new]))) [(compare-and-set! a (list :value) :bad) (compare-and-set! a v :ok) (deref events)])"}
   ;; The receiver check. swap!/reset! run jolt-need-atom and report the JVM's cast
   ;; failure; the other three reached a record accessor directly, so a non-atom got
   ;; a condition naming jolt's own record type ("... is not of type #<record type

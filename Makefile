@@ -365,8 +365,7 @@ unit:
 # and an entry with no :check fails. certify.clj runs the JVM half against
 # reference Clojure; this half needs no JVM, so it lives in `ci`.
 # `make documented-record` prints what jolt currently answers, for recording a
-# new entry (the JVM side comes from
-# `clojure -M test/conformance/certify.clj --record-documented`).
+# new entry. Run `make certify` for the JVM side through the pinned oracle.
 documented:
 	@$(CHEZ) --script host/chez/run-documented.ss
 
@@ -949,10 +948,16 @@ versionsmoke:
 	@bash test/version-smoke.sh
 
 # JVM oracle: certify the corpus against reference Clojure. Skips if clojure absent.
+# The oracle version is READ from the committed profile, which certify.clj also
+# checks the running Clojure against — so the pin has one source, and bumping the
+# oracle is a profile edit rather than two edits that can drift apart.
 certify:
 	@if command -v clojure >/dev/null 2>&1; then \
-		clojure -M test/conformance/certify.clj --self-test && \
-		clojure -M test/conformance/certify.clj; \
+		v=$$(sed -n 's/^ :clojure-version "\([^"]*\)".*/\1/p' test/conformance/profile.edn); \
+		if [ -z "$$v" ]; then echo "certify: no :clojure-version in test/conformance/profile.edn"; exit 1; fi; \
+		deps="{:deps {org.clojure/clojure {:mvn/version \"$$v\"}}}"; \
+		clojure -Sdeps "$$deps" -M test/conformance/certify.clj --self-test && \
+		clojure -Sdeps "$$deps" -M test/conformance/certify.clj; \
 	else \
 		echo "certify: clojure not on PATH — skipped"; \
 	fi
