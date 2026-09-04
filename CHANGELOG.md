@@ -60,6 +60,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`core.async/alts!` and `alts!!` validate every put before trying any
   operation.** An invalid later `[channel nil]` put can no longer throw after
   an earlier ready operation has already consumed or published a value.
+- **`compare-and-set!` compares the expected value by identity.** It compared
+  with `=`, so an equal but distinct object authorized a replacement of a value
+  the caller had never observed, and the comparison could realize a lazy value
+  on its way to saying no. It is `identical?` now — what `swap!`'s own CAS loop
+  and the `AtomicReference` shim already used, and what the JVM's atom does.
+  Code that relied on an equal-but-distinct expectation succeeding will see it
+  fail, which is what it does on the JVM. Chez immediates (a fixnum, a
+  character) have no distinct boxes, so a CAS between two equal ones still
+  succeeds where the JVM's boxing can tell them apart; that narrower case is
+  the `:concurrency-model` divergence now, recorded with an oracle.
 - **The default time zone is the machine's.** `TimeZone/getDefault`,
   `Calendar/getInstance`, a `SimpleDateFormat` with no zone set, the deprecated
   `Date` constructor and getters, `java.sql.Date.valueOf` and `toLocalDate` all

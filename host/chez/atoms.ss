@@ -111,12 +111,14 @@
     (jolt-atom-notify a old v)
     v))
 
-;; compare-and-set! keeps jolt= (value) semantics, done atomically under the lock.
+;; compare-and-set! uses the same identity comparison as the swap! CAS helper,
+;; but keeps this hot public path inline rather than adding another procedure
+;; call around the mutex transition.
 (define (jolt-compare-and-set! a oldv newv)
   (jolt-need-atom a)
   (jolt-atom-validate a newv)
   (let ((swapped (jolt-with-mutex (jolt-atom-lock a)
-                   (if (jolt= (jolt-atom-val a) oldv)
+                   (if (eq? (jolt-atom-val a) oldv)
                        (begin (jolt-atom-val-set! a newv) #t)
                        #f))))
     (when swapped (jolt-atom-notify a oldv newv))

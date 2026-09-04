@@ -1770,6 +1770,10 @@
   {:suite "atomics" :label "reset-vals! returns [old new]" :expected "[5 9]" :expr "(let [a (atom 5)] (reset-vals! a 9))"}
   {:suite "atomics" :label "compare-and-set! true on match and sets" :expected "[true 6]" :expr "(let [a (atom 5)] [(compare-and-set! a 5 6) (deref a)])"}
   {:suite "atomics" :label "compare-and-set! false on mismatch and no set" :expected "[false 5]" :expr "(let [a (atom 5)] [(compare-and-set! a 0 6) (deref a)])"}
+  {:suite "atomics" :label "compare-and-set! rejects an equal distinct expectation" :expected "[false true]" :expr "(let [initial (list :value) equal (list :value) a (atom initial)] [(compare-and-set! a equal :bad) (identical? initial (deref a))])"}
+  {:suite "atomics" :label "compare-and-set! accepts the identical expectation" :expected "[true :ok]" :expr "(let [v (list :value) a (atom v)] [(compare-and-set! a v :ok) (deref a)])"}
+  {:suite "atomics" :label "compare-and-set! identity check does not realize equal lazy values" :expected "[false 0 true]" :expr "(let [calls (atom 0) actual (lazy-seq (swap! calls inc) (list :x)) expected (lazy-seq (swap! calls inc) (list :x)) a (atom actual)] [(compare-and-set! a expected :changed) (deref calls) (identical? actual (deref a))])"}
+  {:suite "atomics" :label "compare-and-set! notifies watches once only after an identity match" :expected "[false true [[:watch true true :ok]]]" :expr "(let [v (list :value) a (atom v) events (atom [])] (add-watch a :watch (fn [k ref old new] (swap! events conj [k (identical? ref a) (identical? old v) new]))) [(compare-and-set! a (list :value) :bad) (compare-and-set! a v :ok) (deref events)])"}
   ;; The receiver check. swap!/reset! run jolt-need-atom and report the JVM's cast
   ;; failure; the other three reached a record accessor directly, so a non-atom got
   ;; a condition naming jolt's own record type ("... is not of type #<record type
