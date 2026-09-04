@@ -306,6 +306,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prompt that said `user`, and `-main` under `run -m` ran in `jolt.main`.
   `clojure.main` starts every entry in `user`; jolt does too now, and the REPL
   prompt names whatever namespace is current, as `clojure.main`'s does.
+
 ## [0.8.1] - 2026-09-02
 
 Host classes are provided by declaration now. The runtime no longer carries the
