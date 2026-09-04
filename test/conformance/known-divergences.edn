@@ -908,6 +908,21 @@
            :jvm ":threw"
            :jolt "true"}
    :note "A defrecord is a map and answers contains? on both."}
+  ;; A leading &form is what `sigs` keys on to elide a macro's two implicit params
+  ;; from the :arglists defn derives, and the reference reads the second element
+  ;; without checking there is one: (defn f [&form] 1) is (subvec [&form] 2 1)
+  ;; there, an IndexOutOfBoundsException the compiler reports as "Unexpected error
+  ;; macroexpanding defn". jolt elides only when a second param exists, so the
+  ;; degenerate arity keeps the vector it was written with. A crash is not a shape
+  ;; worth reproducing, and no program means (defn f [&form] …) to fail.
+  {:category :permissive
+   :behavior "(defn f [&form] 1) — a lone &form param, the arity `sigs` cannot subvec"
+   :jvm "throws while macroexpanding defn (IndexOutOfBoundsException inside sigs)"
+   :jolt "defines f; :arglists is ([&form]), the vector as written"
+   :check {:expr "(try (eval (quote (do (defn zdf1 [&form] 1) (pr-str (:arglists (meta (var zdf1))))))) (catch Throwable _ :threw))"
+           :jvm ":threw"
+           :jolt "\"([&form])\""}
+   :note "[&form &env] and longer elide on both; that is pinned in the corpus (defn / implicit macro params)."}
 ]
  :entries
  [;; Wherever a syntax-quote's CONSTRUCTION CODE becomes a value rather than
