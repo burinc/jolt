@@ -5930,4 +5930,14 @@
   {:suite "macros / defmacro expands like the JVM" :label "docstring and attr-map keep their place, a rest param survives" :expected "\"(do (clojure.core/defn mm \\\"d\\\" {:k 1} ([&form &env a & r] a)) (. (var mm) (setMacro)) (var mm))\"" :actual "(pr-str (macroexpand-1 (quote (defmacro mm \"d\" {:k 1} [a & r] a))))" :portability :common}
   {:suite "macros / defmacro expands like the JVM" :label "a nullary macro still declares the two implicit params" :expected "\"(do (clojure.core/defn mm ([&form &env] 1)) (. (var mm) (setMacro)) (var mm))\"" :actual "(pr-str (macroexpand-1 (quote (defmacro mm [] 1))))" :portability :common}
   {:suite "macros / defmacro expands like the JVM" :label "and defining one still marks the var and works" :expected "[42 true]" :actual "(do (defmacro mw [a] (list (quote inc) a)) [(mw 41) (:macro (meta (var mw)))])" :portability :common}
+  ;; The JVM hides a macro's two implicit params from an arity error:
+  ;; Compiler.macroexpand1 catches the expander's ArityException and rethrows it
+  ;; with actual - 2. jolt's expander takes [&form &env & declared] as of #837, so
+  ;; without that the count came back two too high — (m 1 2) on a one-param macro
+  ;; reported (4). eval, because a direct call raises while the try form is being
+  ;; compiled, which is outside the try.
+  {:suite "macros / arity error hides the implicit params" :label "too many args reports the declared count" :expected "\"Wrong number of args (2) passed to: user/mac1\"" :actual "(do (defmacro mac1 [a] a) (try (eval (quote (mac1 1 2))) (catch clojure.lang.ArityException e (ex-message e))))" :portability :jvm}
+  {:suite "macros / arity error hides the implicit params" :label "too few args too" :expected "\"Wrong number of args (1) passed to: user/mac2\"" :actual "(do (defmacro mac2 [a b] a) (try (eval (quote (mac2 1))) (catch clojure.lang.ArityException e (ex-message e))))" :portability :jvm}
+  {:suite "macros / arity error hides the implicit params" :label "a variadic macro still takes any count" :expected "[0 3]" :actual "(do (defmacro mac3 [& xs] (count xs)) [(mac3) (mac3 1 2 3)])" :portability :common}
+  {:suite "macros / arity error hides the implicit params" :label "and every arity of a multi-arity macro still resolves" :expected "[:one :two]" :actual "(do (defmacro mac4 ([a] :one) ([a b] :two)) [(mac4 1) (mac4 1 2)])" :portability :common}
 ]
