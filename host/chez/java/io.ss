@@ -495,6 +495,19 @@
                 ((char=? (string-ref rest j) #\/) (substring rest j (string-length rest)))
                 (else (loop (+ j 1)))))
         rest)))
+;; The filesystem path a URL names for WRITING. Reading a URL is broad — a stream
+;; handler decides, and url-content knows several protocols — but there is nowhere
+;; to write anything except a file: one, so every other protocol is the JVM's
+;; IllegalArgumentException. Without this a URL reached the path coercions as its
+;; SPEC, and (spit (.toURL f) …) created a file literally named "file:/…/f" under
+;; the working directory instead of writing f.
+(define (url-write-path u)
+  (let ((spec (url-spec u)))
+    (if (string=? (url-protocol spec) "file")
+        (url-strip-scheme spec)
+        (throw-jvm (quote IllegalArgumentException)
+                   (string-append "Can not write to non-file URL <" spec ">")))))
+
 (define (url-authority spec)
   (let* ((i (let loop ((j 0)) (cond ((>= j (string-length spec)) #f)
                                     ((char=? (string-ref spec j) #\:) j)
@@ -1040,7 +1053,7 @@
   (unless (or (string? path) (jfile? path) (jhost? path))
     (throw-jvm (quote IllegalArgumentException)
                (string-append "Cannot open <" (jolt-pr-str path) "> as a Writer.")))
-  (let* ((p (project-relative (file-path-of path)))
+  (let* ((p (project-relative (if (url-jhost? path) (url-write-path path) (file-path-of path))))
          (text (jolt-str-render-one content)))
     (if (spit-append? opts)
         (with-port (open-output-file p 'append)
@@ -1175,6 +1188,7 @@
     ((and (jhost? x) (string=? (jhost-tag x) "writer")) x)
     ((and (jhost? x) (string=? (jhost-tag x) "file-writer")) x)
     ((jfile? x) (make-jhost "file-writer" (vector (jfile-path x) "")))
+    ((url-jhost? x) (make-jhost "file-writer" (vector (url-write-path x) "")))
     ((string? x) (make-jhost "file-writer" (vector x "")))
     (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str x) "> as a Writer.")))))
 
