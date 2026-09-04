@@ -428,8 +428,35 @@
         ks vs))
     out))
 
+;; A type that declares its own clojure.lang.ILookup has its fields MASKED from
+;; the get path: on the JVM a bare deftype has no key lookup but the one it
+;; declares, so its valAt answers for a field-named key too, and reading the slot
+;; first handed back whatever the slot held where valAt was there to transform it.
+;; The slot stays in the index, biased negative, because every OTHER read still
+;; wants it — .-field, the deftype macro's own field bindings, (set! (.-f x) v).
+;; Encoding the mask in the value the get path already reads is what keeps
+;; (:field r) on a defrecord at exactly the cost it had: a per-type flag
+;; consulted ahead of the index measured 1.27x on that path.
+;;
 ;; index of a declared field key, or #f (only an interned keyword can be one).
-(define (jrec-field-index r k) (hashtable-ref (jrdesc-index (jrec-desc r)) k #f))
+(define (jrec-field-index r k)
+  (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
+    (and i (if (fx<? i 0) (fx- -1 i) i))))
+;; the slot the GET path may read — #f for a masked type, so get falls through to
+;; the valAt that type declares.
+(define (jrec-get-index r k)
+  (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
+    (and i (fx>=? i 0) i)))
+;; Bias every field of DESC negative. Driven by register-protocol-method the
+;; moment a non-record type registers a valAt; fkeys is walked (not the table's
+;; keys) so nothing scans a hashtable another thread may be writing.
+(define (jrdesc-mask-fields! desc)
+  (let ((idx (jrdesc-index desc)))
+    (vector-for-each
+      (lambda (k)
+        (let ((i (hashtable-ref idx k #f)))
+          (when (and i (fx>=? i 0)) (hashtable-set! idx k (fx- -1 i)))))
+      (jrdesc-fkeys desc))))
 ;; a vector-copy that doesn't depend on the optional rnrs vector-copy being present.
 (define (jrec-vec-copy v)
   (let* ((n (vector-length v)) (out (make-vector n)))
@@ -459,25 +486,77 @@
            (let ((ext (jrec-ext r)))
              (and (not (jolt-nil? ext))
                   (not (eq? jrec-absent (jolt-get ext k jrec-absent))))))))
-;; The get path: like jrec-lookup, but a deftype's ILookup valAt runs when a key
-;; is genuinely missing from both the fields and the extension map.
+;; The get path. A bare deftype that DECLARES clojure.lang.ILookup answers every
+;; key through its own valAt, field-named keys included: the JVM gives such a
+;; type no key lookup at all, so a declared valAt is the only lookup there is and
+;; cannot lose to a slot. Reading the slot first handed back whatever the slot
+;; held where valAt was there to transform it — typed.clojure keeps a lazy thunk
+;; in one and forces it in valAt, so (:variances tfn) came back as the raw thunk.
+;; A defrecord is unaffected (its generated field-first lookup stands; the JVM
+;; will not compile one declaring another valAt), and so is a deftype with no
+;; valAt — for both, slot 6 of the per-type cache is #f and this costs the
+;; vector-ref that cache already answers the other flags with.
+;;
+;; Which arity: the JVM's RT.get calls valAt(k) for (get x k) and valAt(k, nf)
+;; for (get x k nf), but jolt's get seam hands 2-arg get a nil default and cannot
+;; tell the two apart. A nil default picks the 2-arity when the type declares
+;; one, which is right for every (get x k) and for (:k x); only an explicit
+;; (get x k nil) reaches the 3-arity where the JVM would have called the 2-arity,
+;; and a valAt pair that answers those two differently for a nil not-found is
+;; answering the same question twice.
+;;
+;; jrec-lookup, NOT this, is the declared-slot read: it is what .-field and the
+;; deftype macro's own field bindings go through, so a valAt body reading its
+;; fields does not re-enter itself.
+(define (jrec-declared-valat r) (vector-ref (jrdesc-ifc-of r) 6))
+;; Which arity: the JVM's RT.get calls valAt(k) for (get x k) and valAt(k, nf)
+;; for (get x k nf), but jolt's get seam hands 2-arg get a nil default and cannot
+;; tell the two apart. A nil default picks the 2-arity when the type declares one,
+;; which is right for every (get x k) and for (:k x); only an explicit
+;; (get x k nil) reaches the 3-arity where the JVM would have called the 2-arity,
+;; and a valAt pair answering those two differently for a nil not-found is
+;; answering the same question twice.
+(define (jrec-call-valat va coll k d)
+  (let ((m3 (car va)) (m2 (cdr va)))
+    (if (and m2 (jolt-nil? d))
+        (jolt-invoke m2 coll k)
+        (if m3 (jolt-invoke m3 coll k d) (jolt-invoke m2 coll k)))))
 (define (jrec-ref coll k d)
   (if (eq? k jolt-deftype-kw)
       (jrec-tag coll)
-      (let ((i (jrec-field-index coll k)))
-        (if i (jrec-field-ref coll i)
-            (let* ((ext (jrec-ext coll))
-                   (v (if (jolt-nil? ext) jrec-absent (jolt-get ext k jrec-absent))))
-              (if (eq? v jrec-absent)
-                  (cond ((find-method-any-protocol (jrec-tag coll) "valAt")
-                          => (lambda (m) (jolt-invoke m coll k d)))
-                        ;; a deftype implementing clojure.lang.IPersistentSet.get
-                        ;; (get returns the element when present, else nil) — a
-                        ;; membership lookup, so (get an-ordered-set k) works.
-                        ((find-method-any-protocol (jrec-tag coll) "get")
-                          => (lambda (m) (let ((r (jolt-invoke m coll k))) (if (jolt-nil? r) d r))))
-                         (else d))
-                   v))))))
+      (let ((i (jrec-get-index coll k)))
+        (if i (jrec-field-ref coll i) (jrec-ref-slow coll k d)))))
+;; Everything the field slots did not answer: the extension map, then the type's
+;; own lookup. A masked type arrives here for its OWN field keys too, which is
+;; the point.
+(define (jrec-ref-slow coll k d)
+  (let* ((ext (jrec-ext coll))
+         (v (if (jolt-nil? ext) jrec-absent (jolt-get ext k jrec-absent))))
+    (if (eq? v jrec-absent)
+        (cond ((jrec-declared-valat coll)
+                => (lambda (va) (jrec-call-valat va coll k d)))
+              ;; a defrecord that declares a valAt anyway (the JVM refuses to
+              ;; compile one, but jolt has always allowed it): its fields are not
+              ;; masked, so this only answers keys they miss.
+              ((find-method-any-protocol (jrec-tag coll) "valAt")
+                => (lambda (m) (jolt-invoke m coll k d)))
+              ;; a deftype implementing clojure.lang.IPersistentSet.get
+              ;; (get returns the element when present, else nil) — a
+              ;; membership lookup, so (get an-ordered-set k) works.
+              ((find-method-any-protocol (jrec-tag coll) "get")
+                => (lambda (m) (let ((r (jolt-invoke m coll k))) (if (jolt-nil? r) d r))))
+              (else d))
+        v)))
+
+;; The declared-slot read the deftype macro binds each immutable field with, and
+;; the clojure.core/__deftype-field op the backend lowers that to. It is
+;; jrec-lookup, i.e. deliberately NOT the get path: a method body reading its own
+;; fields must not go through a valAt the same type declares, or every method
+;; entry re-enters that valAt and allocates without bound. Reaching the slot
+;; directly is also cheaper than the (get inst :field) it replaces, which walked
+;; jolt-get's type cascade to arrive at the same place.
+(define (jrec-field r k) (jrec-lookup r k jolt-nil))
+(def-var! "clojure.core" "__deftype-field" jrec-field)
 
 ;; mutate a deftype's mutable field in place: fields are mutable slots, so
 ;; jrec-field-set! updates the field. (set! field v) inside a method lowers to

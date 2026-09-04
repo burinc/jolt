@@ -170,7 +170,15 @@
         (jolt-with-mutex rec-tbl-mu
           (let ((pt (or (jrdesc-ptable desc)
                         (let ((h (make-eq-hashtable))) (jrdesc-ptable-set! desc h) h))))
-            (hashtable-set! pt k fn))))))
+            (hashtable-set! pt k fn))))
+      ;; A type declaring its own clojure.lang.ILookup masks its fields from the
+      ;; get path (records.ss jrdesc-mask-fields!) — that valAt is the only key
+      ;; lookup the JVM gives a bare deftype, so it answers for a field-named key
+      ;; too. A defrecord keeps its generated field-first lookup, and its
+      ;; register-record-type! has already run by the time its methods register.
+      (when (and (string=? method "valAt")
+                 (not (hashtable-ref chez-record-type-tbl type-tag #f)))
+        (jrdesc-mask-fields! desc))))
   ;; a (re)registration of this impl invalidates any contagion clone built for it —
   ;; the clone captured the prior body. Keyed exactly (type/proto/method) so a
   ;; sibling type's clone survives; devirt-resolve-fl then falls back to devirt-resolve.
@@ -498,6 +506,13 @@
                (let ((old-desc (hashtable-ref chez-tag-desc tag #f)))
                  (when old-desc (jrdesc-ptable-set! old-desc #f)))
                (hashtable-set! chez-tag-desc tag desc)))
+          ;; A redefinition, or an extend-type that named this tag before the
+          ;; type existed, may already have registered a valAt for it: the fresh
+          ;; descriptor has to arrive masked, since register-protocol-method's
+          ;; mask ran against the descriptor that is now gone.
+          (_ (when (and (find-method-any-protocol tag "valAt")
+                        (not (hashtable-ref chez-record-type-tbl tag #f)))
+               (jrdesc-mask-fields! desc)))
          (nf (length kws))
          ;; the ctor var's name, baked at definition (the JVM ArityException
          ;; names the positional ctor: "… passed to: ns/->Name").
