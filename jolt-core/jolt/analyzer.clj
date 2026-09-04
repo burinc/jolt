@@ -285,13 +285,36 @@
         v (vec (concat [(symbol "&form") (symbol "&env")] (form-vec-items pvec)))]
     (if m (with-meta v m) v)))
 
+;; Split a defmacro's forms after the docstring and leading attr-map into
+;; [arity-forms trailing-attr-map]. defmacro takes a trailing attr-map exactly as
+;; defn does (the JVM's hands the whole fdecl, that map included, straight to
+;; defn); jolt used to run it through the arity lowering, which made it a bogus
+;; ([&form &env]) clause and lost it from the var's metadata. Only a MULTI-arity
+;; body can carry one — a single `[params] body` is one clause already, so its
+;; last form is a map-returning body, not an attr-map (the same rule defn states).
+(defn- macro-trail-attr [after]
+  (if (and (form-list? (first after)) (> (count after) 1))
+    (let [lst (last after)]
+      (if (form-map? lst) [(butlast after) lst] [after nil]))
+    [after nil]))
+
+;; The arity CLAUSES, each with the two implicit params in front. `after` here is
+;; already past the docstring, the leading attr-map and the trailing one.
+;; Always a list of clauses, never a spliced single arity — the reference
+;; normalizes a lone `[params] body` into one clause before it prepends anything
+;; ((if (vector? (first fdecl)) (list fdecl) fdecl)), and both readers of this
+;; want that shape: `fn` accepts either, and the macroexpand-1 answer has to BE
+;; the JVM's. Empty when the form declares no arity at all: (defmacro m) is a defn
+;; with no body, not one taking [&form &env].
 (defn- macro-fn-arities [after]
-  (if (form-list? (first after))
+  (cond
+    (empty? after) after
+    (form-list? (first after))
     (map (fn [clause]
            (let [es (vec (form-elements clause))]
              (cons (macro-arity-params (first es)) (rest es))))
          after)
-    (cons (macro-arity-params (first after)) (rest after))))
+    :else (list (cons (macro-arity-params (first after)) (rest after)))))
 
 ;; What macroexpand-1 answers for a defmacro form. defmacro is a special form
 ;; here, so this never runs during compilation — but a tools.analyzer-style
@@ -306,18 +329,17 @@
         after (drop 2 items)
         [after doc] (if (string? (first after)) [(rest after) (first after)] [after nil])
         [after attr] (if (form-map? (first after)) [(rest after) (first after)] [after nil])
-        clauses (if (form-list? (first after))
-                  (map (fn [clause]
-                         (let [es (vec (form-elements clause))]
-                           (cons (macro-arity-params (first es)) (rest es))))
-                       after)
-                  (list (cons (macro-arity-params (first after)) (rest after))))
+        [after trail] (macro-trail-attr after)
         vform (list 'var name-sym)]
     (list 'do
+          ;; the arity lowering is macro-fn-arities, the SAME one the special-form
+          ;; arm compiles through — a second copy here is a shape that can drift
+          ;; from the one the compiler actually uses.
           (concat (list (symbol "clojure.core" "defn") name-sym)
                   (when doc (list doc))
                   (when attr (list attr))
-                  clauses)
+                  (macro-fn-arities after)
+                  (when trail (list trail)))
           (list '. vform (list 'setMacro))
           vform)))
 
@@ -851,6 +873,11 @@
                      after (drop 2 items)
                      [after doc] (if (string? (first after)) [(rest after) (first after)] [after nil])
                      [after attr] (if (form-map? (first after)) [(rest after) (first after)] [after nil])
+                     ;; …and a TRAILING attr-map, which defn takes too (the JVM's
+                     ;; defmacro hands it the whole fdecl, that map included). It
+                     ;; used to run through the arity lowering, becoming a bogus
+                     ;; ([&form &env]) clause and a [:k 1] entry in :arglists.
+                     [after trail] (macro-trail-attr after)
                      ;; build (fn params body…) and analyze it through the fn MACRO
                      ;; so a destructuring macro arglist desugars (the fn* primitive
                      ;; would not), then def it and mark the var a macro. Head with
@@ -859,21 +886,24 @@
                      ;; or the ns excluded it.
                      fn-form (cons (symbol "clojure.core" "fn") (macro-fn-arities after))
                      ;; var meta like defn: ^meta on the name, docstring, attr-map, arglists
-                     arglists (if (form-list? (first after))
-                                (map first after)
-                                (list (first after)))
+                     arglists (cond (empty? after) nil          ; (defmacro m) declares none
+                                    (form-list? (first after)) (map first after)
+                                    :else (list (first after)))
                      ;; the derived arglists is a DEFAULT: an explicit :arglists in
                      ;; the attr-map (or on the name) overrides it, as defn allows.
                      ;; Merging it last instead silently discarded the user's value.
-                     ;; precedence, matching the JVM for both defn and defmacro:
-                     ;; name metadata < the derived arglists < attr-map < docstring.
-                     ;; So ^{:arglists …} on the NAME does not override (the JVM
-                     ;; ignores it there) but {:arglists …} in the attr-map does.
-                     ;; Merging the derived value last discarded the attr-map's.
+                     ;; Precedence is DEFN'S, because on the JVM this form becomes a
+                     ;; defn: name metadata < the derived arglists < docstring <
+                     ;; leading attr-map < trailing attr-map. So ^{:arglists …} on
+                     ;; the NAME does not override (the JVM ignores it there),
+                     ;; {:arglists …} in an attr-map does, and an attr-map's :doc
+                     ;; beats the docstring — which is what jolt's own defn already
+                     ;; did while this arm had the docstring winning.
                      base (merge (or (form-sym-meta name-sym) {})
-                                 {:arglists arglists}
+                                 (if arglists {:arglists arglists} {})
+                                 (if doc {:doc doc} {})
                                  (or attr {})
-                                 (if doc {:doc doc} {}))
+                                 (or trail {}))
                      meta-expr (def-meta-expr ctx base env)]
                  (host-intern! ctx cur nm)
                  (merge {:op :defmacro :ns cur :name nm

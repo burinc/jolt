@@ -559,11 +559,22 @@
         ;; (def ^{:arglists (quote ([x]))} f …): def-meta-expr strips one quote
         ;; layer either way, but a consumer that EVALUATES the def-name meta
         ;; (tools.analyzer, typedclojure) read the bare ([x]) as a call of [x].
+        ;; A macro's two implicit params are elided, as the JVM's `sigs` elides
+        ;; them: a defmacro expands to a defn whose params are
+        ;; [&form &env & declared], and the var still reports the declared ones —
+        ;; what `doc` and every arglists-driven tool show. The trigger is &form in
+        ;; FIRST position, which is what the reference keys on. Guarded on length:
+        ;; a lone [&form] is an IndexOutOfBoundsException there (subvec 2..1), a
+        ;; crash rather than a shape worth reproducing.
+        declared-params (fn [pv]
+                          (if (and (vector? pv) (> (count pv) 1) (= (first pv) '&form))
+                            (subvec pv 2)
+                            pv))
         arglists (if (vector? (first body))
-                   (list (first body))
+                   (list (declared-params (first body)))
                    (loop [cs body acc []]
                      (if (seq cs)
-                       (recur (rest cs) (conj acc (first (first cs))))
+                       (recur (rest cs) (conj acc (declared-params (first (first cs)))))
                        (seq acc))))
         ;; precedence, matching the JVM's conj order: name metadata < the derived
         ;; :arglists < docstring < leading attr-map < trailing attr-map. So an
@@ -596,18 +607,31 @@
 (defn- fresh-sym [] (symbol (str (gensym))))
 
 ;; cond->: thread expr through each (test form) pair, only when the test is truthy.
-;; Linear nested let*, a distinct fresh symbol per step.
+;; ONE let with g rebound per step, each step delegating to -> rather than
+;; building the call itself — the reference's shape, and cond->>'s (30-macros).
+;; It used to be a nest of let* forms with a fresh symbol per step, threading by
+;; hand, so a consumer reading a single macroexpand-1 saw neither shape nor the
+;; per-step position -> now carries. It stays in this tier, not beside cond->>,
+;; because jolt.analyzer uses it and compiles while 10-seq loads.
+;; loop/conj/nth only: partition, butlast and interleave are later tiers, and
+;; this body runs at expansion time (like `ns` above), so `let` and `loop` from
+;; earlier in this file are what it has.
 (defmacro cond-> [expr & clauses]
-  (let [step (fn step [prev cls]
-               (if (empty? cls)
-                 prev
-                 (let [t (first cls)
-                       f (nth cls 1)
-                       gn (fresh-sym)
-                       call (if (seq? f) `(~(first f) ~prev ~@(rest f)) `(~f ~prev))]
-                   `(let* [~gn (if ~t ~call ~prev)] ~(step gn (drop 2 cls))))))
-        g0 (fresh-sym)]
-    `(let* [~g0 ~expr] ~(step g0 clauses))))
+  (let [g (fresh-sym)
+        steps (loop [cs (seq clauses) acc []]
+                (if cs
+                  (recur (next (next cs))
+                         (conj acc `(if ~(first cs) (-> ~g ~(nth cs 1)) ~g)))
+                  acc))
+        n (count steps)]
+    (if (zero? n)
+      `(let [~g ~expr] ~g)
+      ;; g is rebound by every step but the last; the last IS the body.
+      (let [binds (loop [i 0 acc [g expr]]
+                    (if (< i (dec n))
+                      (recur (inc i) (conj (conj acc g) (nth steps i)))
+                      acc))]
+        `(let ~binds ~(nth steps (dec n)))))))
 
 ;; case: nested =/or tests (no jump table). Test constants are NOT evaluated —
 ;; symbols, lists, and composite literals (vectors/maps/sets) are quoted so their

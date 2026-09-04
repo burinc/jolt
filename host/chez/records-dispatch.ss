@@ -311,7 +311,7 @@
              ((string=? method-name "isMacro") (var-cell-macro? obj))
              ((string=? method-name "isBound") (jolt-var-bound-one? obj))
              ((string=? method-name "hasRoot") (not (jolt-var-unbound? (var-cell-root obj))))
-             ((string=? method-name "isDynamic") (rd-var-meta-flag? obj "dynamic"))
+             ((string=? method-name "isDynamic") (var-cell-dynamic? obj))
              ((string=? method-name "isPublic") (not (rd-var-meta-flag? obj "private")))
              ((string=? method-name "getTag") (rd-var-meta-get obj "tag"))
              ((or (string=? method-name "deref") (string=? method-name "get")) (var-cell-deref obj))
@@ -319,6 +319,13 @@
              ;; together. bindRoot / alterRoot go through alter-var-root so the
              ;; validator and watches see the change; bindRoot also clears the
              ;; macro flag, as Var.bindRoot does (a def over a macro un-macros it).
+             ;; setDynamic writes the FLAG and leaves the metadata alone, as the
+             ;; JVM does — the two are separate there, and (:dynamic (meta v))
+             ;; after a bare .setDynamic is nil on both now. It answers the var,
+             ;; and the boolean overload turns the flag off.
+             ((string=? method-name "setDynamic")
+              (var-cell-dynamic?-set! obj (if (pair? rest) (jolt-truthy? (car rest)) #t))
+              obj)
              ((string=? method-name "setMacro")
               (var-cell-macro?-set! obj #t)
               (var-cell-meta-set! obj (jolt-assoc (or (rd-var-meta obj) (jolt-hash-map)) jolt-kw-var-macro #t))

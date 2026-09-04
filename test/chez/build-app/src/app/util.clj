@@ -118,3 +118,22 @@
 (defmulti image-mm (fn [x] x))
 (defmethod image-mm :a [_] :got-a)
 (defmethod image-mm :default [_] :dflt)
+
+;; A bare deftype that DECLARES clojure.lang.ILookup. On the JVM such a type has
+;; no key lookup but the one it declares, so its valAt answers for a field-named
+;; key too — that is the whole point when the slot holds something valAt is there
+;; to transform (typed.clojure keeps a lazy thunk in one). The runtime honours
+;; that; the BUILD used to fold past it, because every deftype is registered as a
+;; record shape and nothing told the passes this one has a lookup of its own
+;; (jolt-fpp3.1). Three doors, each a different pass:
+;;   (:a (->Lk 1))        — scalar replacement's (:k <ctor>) fold
+;;   (lk-read (->Lk n))   — whole-program inference proving the param a struct,
+;;                          which drops the guard and reads the slot
+;;   (:a @lk-box)         — opaque, the control: it was right all along
+(deftype Lk [a]
+  clojure.lang.ILookup
+  (valAt [this k] (.valAt this k nil))
+  (valAt [_ k d] (if (= k :a) :from-valat d)))
+
+(defn lk-read [t] (:a t))
+(def lk-box (atom nil))
