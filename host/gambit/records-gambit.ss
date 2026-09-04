@@ -2196,6 +2196,8 @@
 (define (rd-var-meta-flag? obj key)
   (jolt-truthy? (rd-var-meta-get obj key)))
 
+(define rd-kw-var-dynamic (keyword #f "dynamic"))
+
 (define (rd-args->list x)
   (let ((s (jolt-seq x)))
     (if (jolt-nil? s) '() (seq->list s))))
@@ -2397,6 +2399,20 @@
          ((or (string=? method-name "deref")
               (string=? method-name "get"))
           (var-cell-deref obj))
+         ((string=? method-name "setDynamic")
+          (let ((on (if (pair? rest) (jolt-truthy? (car rest)) #t)))
+            (var-cell-meta-set!
+              obj
+              (if on
+                  (jolt-assoc
+                    (or (rd-var-meta obj) (jolt-hash-map))
+                    rd-kw-var-dynamic
+                    #t)
+                  (let ((m (rd-var-meta obj)))
+                    (if m
+                        (jolt-dissoc2 m rd-kw-var-dynamic)
+                        (jolt-hash-map))))))
+          obj)
          ((string=? method-name "setMacro")
           (var-cell-macro?-set! obj #t)
           (var-cell-meta-set!
