@@ -57,6 +57,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implementation uses `:as-alias flow` and `#::flow{...}`. Namespaced maps now
   use the same scan-only placeholder rule as auto-resolved keywords; ordinary
   reads remain strict.
+- **`core.async/alts!` and `alts!!` validate every put before trying any
+  operation.** An invalid later `[channel nil]` put can no longer throw after
+  an earlier ready operation has already consumed or published a value.
 - **The default time zone is the machine's.** `TimeZone/getDefault`,
   `Calendar/getInstance`, a `SimpleDateFormat` with no zone set, the deprecated
   `Date` constructor and getters, `java.sql.Date.valueOf` and `toLocalDate` all
