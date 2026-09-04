@@ -2116,6 +2116,21 @@
 (define (rd-java-util-mutator? m)
   (and (member m rd-java-util-mutator-names) #t))
 
+(define (rd-var-meta obj)
+  (let ((m (var-cell-meta obj)))
+    (and m (not (jolt-nil? m)) m)))
+
+(define (rd-var-meta-get obj key)
+  (let ((m (rd-var-meta obj)))
+    (if m (jolt-get m (keyword #f key) jolt-nil) jolt-nil)))
+
+(define (rd-var-meta-flag? obj key)
+  (jolt-truthy? (rd-var-meta-get obj key)))
+
+(define (rd-args->list x)
+  (let ((s (jolt-seq x)))
+    (if (jolt-nil? s) '() (seq->list s))))
+
 (define (record-method-dispatch-base obj method-name
          rest-args)
   (let ((rest (if (jolt-nil? rest-args)
@@ -2300,6 +2315,43 @@
             "/"
             (var-cell-name obj)))
          ((string=? method-name "getRawRoot") (var-cell-root obj))
+         ((string=? method-name "isMacro") (var-cell-macro? obj))
+         ((string=? method-name "isBound") (jolt-var-bound-one? obj))
+         ((string=? method-name "hasRoot")
+          (not (jolt-var-unbound? (var-cell-root obj))))
+         ((string=? method-name "isDynamic")
+          (rd-var-meta-flag? obj "dynamic"))
+         ((string=? method-name "isPublic")
+          (not (rd-var-meta-flag? obj "private")))
+         ((string=? method-name "getTag")
+          (rd-var-meta-get obj "tag"))
+         ((or (string=? method-name "deref")
+              (string=? method-name "get"))
+          (var-cell-deref obj))
+         ((string=? method-name "setMacro")
+          (var-cell-macro?-set! obj #t)
+          (var-cell-meta-set!
+            obj
+            (jolt-assoc
+              (or (rd-var-meta obj) (jolt-hash-map))
+              jolt-kw-var-macro
+              #t))
+          jolt-nil)
+         ((string=? method-name "bindRoot")
+          (jolt-alter-var-root obj (lambda (_) (car rest)))
+          (var-cell-macro?-set! obj #f)
+          (let ((m (rd-var-meta obj)))
+            (when m
+              (var-cell-meta-set!
+                obj
+                (jolt-dissoc2 m jolt-kw-var-macro))))
+          jolt-nil)
+         ((string=? method-name "alterRoot")
+          (apply
+            jolt-alter-var-root
+            obj
+            (car rest)
+            (rd-args->list (cadr rest))))
          (else (dispatch-miss obj method-name rest))))
       ((condition? obj)
        (cond
