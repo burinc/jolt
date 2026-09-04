@@ -1634,20 +1634,111 @@
 (def-var! "clojure.core" "__register-class-methods!"
   (lambda (tag members) (register-tagged-methods! tag (jmap->static-alist members)) jolt-nil))
 
-;; java.lang.ThreadLocal via a Chez thread-parameter: real per-thread storage with
-;; a lazy initialValue (the proxy macro lowers (proxy [ThreadLocal] …) to this).
-;; .get returns the thread's value, computing initialValue once; .set / .remove.
+;; java.lang.ThreadLocal / java.lang.InheritableThreadLocal.
+;;
+;; The two classes differ in exactly one thing — what a FORKED thread sees — and
+;; that one thing is the contract, so each gets the storage that expresses it:
+;;
+;;   ThreadLocal             a per-thread table in a virtual register. A freshly
+;;                           forked thread starts every vreg at fixnum 0, so it
+;;                           builds its own table and re-runs initialValue: the
+;;                           JVM's "each thread has its own, independently
+;;                           initialized copy".
+;;   InheritableThreadLocal  one thread parameter per instance. Chez hands a
+;;                           forked thread the creating thread's parameter
+;;                           values, which IS childValue(parentValue) — including
+;;                           the case where the parent never read it, since the
+;;                           parameter then still holds tl-unset and the child
+;;                           runs its own initialValue like the JVM.
+;;
+;; A thread parameter for BOTH is what this was, which made the plain class the
+;; inheritable one and left jolt unable to tell them apart at all (the proxy macro
+;; lowered both to one call). It is not a cosmetic divergence: three workers
+;; sharing a ThreadLocal<Process> each got the parent's already-drained subprocess
+;; instead of spawning one, and test.check's per-thread RNG handed a forked thread
+;; the parent's generator (jolt-uecg). CONTRACT.txt recorded it as accepted; it
+;; isn't — "each thread has its own" is the entire content of the class.
+;;
+;; The table holds its entries for the life of the THREAD, where the JVM's
+;; ThreadLocalMap holds weak keys and drops an unreachable ThreadLocal early. The
+;; usual shape (a top-level defonce) is live for the process either way, and
+;; .remove — the JVM's own answer for releasing a value — deletes the entry here
+;; too. A weak table would cost every collection a scan of entries whose keys are
+;; long-lived by construction (the per-thread-cache reasoning in hasheq.ss).
 (define tl-unset (list 'tl-unset))
-(define (jolt-make-thread-local init-thunk)
-  (make-jhost "threadlocal" (vector (make-thread-parameter tl-unset) init-thunk)))
+
+;; slot 10: see the vreg registry in rt.ss. Per-thread, and NOT a thread
+;; parameter, for the same reason as slot 9's interrupt box: a parameter is
+;; inherited by a forked thread and this table must not be — a shared table would
+;; also be two threads mutating one hashtable, which faults inside the collector.
+(define jolt-vreg-threadlocals 10)
+(define (tl-table)
+  (let ((t (virtual-register jolt-vreg-threadlocals)))
+    (if (eq? t 0)
+        (let ((nt (make-eq-hashtable)))
+          (set-virtual-register! jolt-vreg-threadlocals nt)
+          nt)
+        t)))
+
+;; state: #(param init) — param is the instance's thread parameter for an
+;; InheritableThreadLocal and #f for a plain one, which is also the discriminator
+;; the three accessors branch on. init is the initialValue source: a thunk (the
+;; proxy lowering), a java.util.function.Supplier (withInitial), or nil (the bare
+;; constructor, whose initialValue returns null).
+(define (tl-param self) (vector-ref (jhost-state self) 0))
+(define (tl-initial self)
+  (let ((f (vector-ref (jhost-state self) 1)))
+    (cond ((jolt-nil? f) jolt-nil)
+          ;; a reified Supplier, the argument withInitial takes on the JVM. A
+          ;; plain fn is accepted too: jolt has no functional-interface coercion,
+          ;; so requiring the reify would only make the shim harder to call than
+          ;; the class it models.
+          ((iface-method f "get" 1) (record-method-dispatch f "get" jolt-nil))
+          (else (jolt-invoke f)))))
+(define (tl-ref self)
+  (let ((p (tl-param self)))
+    (if p (p) (hashtable-ref (tl-table) self tl-unset))))
+(define (tl-set! self v)
+  (let ((p (tl-param self)))
+    (if p (p v) (hashtable-set! (tl-table) self v))))
+(define (tl-clear! self)
+  (let ((p (tl-param self)))
+    (if p (p tl-unset) (hashtable-delete! (tl-table) self))))
+
+;; init: a thunk / Supplier / nil. inheritable?: build the InheritableThreadLocal.
+(define jolt-make-thread-local
+  (case-lambda
+    ;; the one-argument shape the pre-jolt-uecg seed's proxy lowering calls, kept
+    ;; so a bootstrap pass driven by an older seed still mints (it means the plain
+    ;; class, which is what that lowering produced for `proxy [ThreadLocal]`).
+    ((init) (jolt-make-thread-local init jolt-nil))
+    ((init inheritable?)
+     (if (jolt-truthy? inheritable?)
+         (make-jhost "inheritable-threadlocal" (vector (make-thread-parameter tl-unset) init))
+         (make-jhost "threadlocal" (vector #f init))))))
+
+;; .get computes initialValue on the first read and REMEMBERS it, so a fn with a
+;; side effect (test.check's split, a spawned process) runs once per thread and
+;; not once per read.
 (register-host-methods! "threadlocal"
   (list (cons "get" (lambda (self)
-                      (let* ((st (jhost-state self)) (tp (vector-ref st 0)) (v (tp)))
+                      (let ((v (tl-ref self)))
                         (if (eq? v tl-unset)
-                            (let ((nv (jolt-invoke (vector-ref st 1)))) (tp nv) nv)
+                            (let ((nv (tl-initial self))) (tl-set! self nv) nv)
                             v))))
-        (cons "set" (lambda (self v) ((vector-ref (jhost-state self) 0) v) jolt-nil))
-        (cons "remove" (lambda (self) ((vector-ref (jhost-state self) 0) tl-unset) jolt-nil))))
+        (cons "set" (lambda (self v) (tl-set! self v) jolt-nil))
+        (cons "remove" (lambda (self) (tl-clear! self) jolt-nil))))
+;; ALIAS, not a second registration: the two tags differ only in the class they
+;; report and in the storage the state vector selects, so they must never grow
+;; separate method tables that can drift.
+(alias-host-methods! "inheritable-threadlocal" "threadlocal")
+
+(for-each (lambda (nm) (register-class-ctor! nm (lambda args (jolt-make-thread-local jolt-nil jolt-nil))))
+          '("ThreadLocal" "java.lang.ThreadLocal"))
+(for-each (lambda (nm) (register-class-ctor! nm (lambda args (jolt-make-thread-local jolt-nil #t))))
+          '("InheritableThreadLocal" "java.lang.InheritableThreadLocal"))
+(register-class-statics! "java.lang.ThreadLocal"
+  (list (cons "withInitial" (lambda (supplier) (jolt-make-thread-local supplier jolt-nil)))))
 (def-var! "jolt.host" "make-thread-local" jolt-make-thread-local)
 
 ;; Pluggable instance? — a library registers (fn [class-name-string val] -> true

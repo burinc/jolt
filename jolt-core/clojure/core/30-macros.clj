@@ -772,8 +772,25 @@
 (defmacro proxy [supers ctor-args & methods]
   (if (and (vector? supers) (= 1 (count supers))
            (let [s (name (first supers))] (or (= s "ThreadLocal") (= s "InheritableThreadLocal"))))
-    (let [init (some (fn [m] (when (= "initialValue" (name (first m))) m)) methods)]
-      `(jolt.host/make-thread-local (fn [] ~@(when init (nnext init)))))
+    ;; WHICH of the two is load-bearing: they differ only in what a forked thread
+    ;; sees, and that is the entire difference between the classes. Lowering both
+    ;; to one object made whichever storage was chosen wrong for the other.
+    ;;
+    ;; initialValue is the only override this lowering can honour — the object it
+    ;; builds is a host storage shim, not a subclass, so a get/set/remove/
+    ;; toString/childValue body has nowhere to go. It used to be dropped in
+    ;; silence, which is a method that looks defined and never runs; say so at
+    ;; the call site instead.
+    (let [extra (remove (fn [m] (= "initialValue" (name (first m)))) methods)
+          init  (some (fn [m] (when (= "initialValue" (name (first m))) m)) methods)]
+      (when (seq extra)
+        (throw (ex-info (str "proxy over " (name (first supers))
+                             " can only override initialValue, not "
+                             (apply str (interpose ", " (map (fn [m] (name (first m))) extra))))
+                        {:class (name (first supers))
+                         :unsupported (mapv (fn [m] (name (first m))) extra)})))
+      `(jolt.host/make-thread-local (fn [] ~@(when init (nnext init)))
+                                    ~(= (name (first supers)) "InheritableThreadLocal")))
     ;; group the flattened specs by method name, so several arities of one method
     ;; become one multi-arity fn — the same shape reify builds.
     (loop [specs (seq (apply concat (map proxy-arity-specs methods)))

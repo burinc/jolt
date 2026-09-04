@@ -1069,7 +1069,14 @@
     ("weak-ref" . "java.lang.ref.WeakReference")
     ("ref-queue" . "java.lang.ref.ReferenceQueue")
     ;; String.CASE_INSENSITIVE_ORDER (host-static-methods.ss)
-    ("string-ci-comparator" . "java.lang.String$CaseInsensitiveComparator")))
+    ("string-ci-comparator" . "java.lang.String$CaseInsensitiveComparator")
+    ;; the two java.lang.ThreadLocal storage shims (host-static-classes.ss). Two
+    ;; tags because the classes are two: a caller asks which one it holds with
+    ;; instance?, and (proxy [InheritableThreadLocal] …) has to lower to the
+    ;; inheriting one. Without these rows both reported (class x) => :object and
+    ;; answered false to (instance? ThreadLocal x).
+    ("threadlocal" . "java.lang.ThreadLocal")
+    ("inheritable-threadlocal" . "java.lang.InheritableThreadLocal")))
 ;; FQN for a jhost tag, or #f if the tag names no modeled class (e.g. "class",
 ;; "in-stream", "jolt-comparator") — callers fall through on #f.
 (define (jhost-fqn tag) (hashtable-ref jhost-tag->fqn tag #f))
