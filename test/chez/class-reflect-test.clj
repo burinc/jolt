@@ -38,9 +38,11 @@
           (.getSuperclass clojure.lang.PersistentVector) clojure.lang.APersistentVector)
 
 ;; getInterfaces: the direct super-interfaces (order is the graph's; compare as a set)
+;; Three of the JVM's five: it also lists java.lang.constant.Constable and
+;; ConstantDesc, which jolt does not model.
 (check-eq "String's direct interfaces"
           (set (map #(.getName %) (.getInterfaces String)))
-          #{"java.lang.CharSequence" "java.lang.Comparable"})
+          #{"java.lang.CharSequence" "java.lang.Comparable" "java.io.Serializable"})
 (check-eq "Object has no interfaces" (seq (.getInterfaces Object)) nil)
 
 ;; isInterface

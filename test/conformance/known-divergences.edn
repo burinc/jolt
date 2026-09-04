@@ -165,6 +165,21 @@
            :jvm "throws IllegalArgumentException"
            :jolt "41"}
    :note "A key the map does not have throws on both. jolt's own values (deftype/defrecord slots) follow the JVM exactly: an undeclared slot is an error, not nil."}
+  ;; The same map-as-object reading, from the other side: a bare deftype has no
+  ;; key lookup at all on the JVM — only defrecord and a DECLARED ILookup give it
+  ;; one — so (:field t) is nil there and the field's value here. jolt reads the
+  ;; field FIRST, ahead of a declared valAt, so a type that computes a field's
+  ;; value in valAt is read off the slot instead (jolt-5wbh.12 tracks the fix:
+  ;; it needs the deftype macro to bind its fields through the slot rather than
+  ;; through get, which is a seed change).
+  {:category :permissive
+   :behavior "(:a t) / (get t :a) on a bare deftype with a field named a"
+   :jvm "nil with no ILookup; the declared valAt's answer when one is declared"
+   :jolt "the field's value either way — the map-as-object read, ahead of valAt"
+   :check {:expr "(do (ns dtl3.ns) (clojure.core/deftype T3 [a]) [(:a (dtl3.ns/->T3 1)) (clojure.core/get (dtl3.ns/->T3 1) :a)])"
+           :jvm "[nil nil]"
+           :jolt "[1 1]"}
+   :note "A key that names no field does reach a declared valAt, and reading a slot that was never declared raises, as on the JVM."}
   ;; A char reaches the reference's INTEGER casts through RT.intCast/longCast's
   ;; char overload — (int \\a) and (long \\a) are 97 on both — but `double` and
   ;; `float` are declared ^Number, so a Character is a ClassCastException there.
