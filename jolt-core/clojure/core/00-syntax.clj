@@ -545,7 +545,10 @@
         ;; :arglists — the parameter vectors as written (single arity: the one
         ;; vector; multi-arity: each clause's), attached to the var like Clojure so
         ;; doc/spec/expound tools can read it. tier-0 primitives only (loop, not
-        ;; map/reduce, which load later). def-meta-expr quotes it (data, not code).
+        ;; map/reduce, which load later). QUOTED in the expansion like the JVM's
+        ;; (def ^{:arglists (quote ([x]))} f …): def-meta-expr strips one quote
+        ;; layer either way, but a consumer that EVALUATES the def-name meta
+        ;; (tools.analyzer, typedclojure) read the bare ([x]) as a call of [x].
         arglists (if (vector? (first body))
                    (list (first body))
                    (loop [cs body acc []]
@@ -559,7 +562,7 @@
         ;; attr-map overrides the docstring (the JVM conj'es the attr-maps onto
         ;; {:doc docstring}, so they are what wins).
         m1 name-meta
-        m2 (if arglists (assoc (if m1 m1 {}) :arglists arglists) m1)
+        m2 (if arglists (assoc (if m1 m1 {}) :arglists (list 'quote arglists)) m1)
         m3 (if docstring (assoc (if m2 m2 {}) :doc docstring) m2)
         m4 (if attr-map (conj (if m3 m3 {}) attr-map) m3)
         meta-map (if trail-attr (conj (if m4 m4 {}) trail-attr) m4)]
