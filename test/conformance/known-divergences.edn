@@ -97,6 +97,20 @@
    :check :prose
    :why "the JVM's answer is the machine's default time zone"
    :note "Core reads no system file for this by design; a library brings the machine's zone."}
+  ;; One iterator representation where the JVM has an inner class per collection
+  ;; (PersistentVector$2, PersistentHashMap$2, …). jolt's is a seq walked by
+  ;; hasNext/next, which is what clojure.lang.SeqIterator is, so that is the
+  ;; class it reports — a real class with the JVM's ancestry (Object, Iterator)
+  ;; rather than a name jolt invented. instance?, supers and iteration all
+  ;; agree with the JVM; only the leaf class name differs. jolt-jwxr
+  {:category :host-model
+   :behavior "(class (.iterator [1 2 3]))"
+   :jvm "clojure.lang.PersistentVector$2"
+   :jolt "clojure.lang.SeqIterator"
+   :check {:expr "(.getName (class (.iterator [1 2 3])))"
+           :jvm "\"clojure.lang.PersistentVector$2\""
+           :jolt "\"clojure.lang.SeqIterator\""}
+   :note "(class (clojure.lang.SeqIterator. s)) agrees exactly; only the collection-specific inner classes have no counterpart."}
   ;; (str lazy-seq) renders the realized seq "(2 3)" rather than the JVM's opaque
   ;; "clojure.lang.LazySeq@<hash>". Deliberately friendlier; left as is.
   {:category :seq-type-model
