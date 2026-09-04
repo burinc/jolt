@@ -1006,6 +1006,27 @@ else
   fails=$((fails + 1))
 fi
 
+# A project root must not shadow a namespace Jolt provides as a host built-in.
+# Jolt's reader matches :bb, so a copy of babashka.fs pulled in as a dependency
+# is source written to be inert here (0.4.18 guards list-dir behind
+# `#?(:bb nil …)` and its list-dirs then fails to compile). A built binary
+# already resolves Jolt's copy first because install sources are embedded; this
+# asserts source mode answers the same file. The decoy would load fine on its
+# own — it is Jolt's copy winning that makes list-dir resolve.
+bbs_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+bbshadow="$(mktemp -d)"; mkdir -p "$bbshadow/src/babashka"
+printf '(ns babashka.fs)\n(def marker :decoy)\n' > "$bbshadow/src/babashka/fs.cljc"
+printf '{:paths ["src"]}\n' > "$bbshadow/deps.edn"
+bbs_out="$(cd "$bbshadow" && JOLT_NO_DEVCACHE=1 "$bbs_jolt" -e '(do (require (quote babashka.fs)) [(nil? (resolve (quote babashka.fs/marker))) (boolean (some-> (resolve (quote babashka.fs/list-dir)) deref fn?))])' 2>&1 | tail -1)"
+if [ "$bbs_out" = '[true true]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a project root shadowed babashka.fs"
+  echo "    want \`[true true]\` got \`$bbs_out\`"
+  fails=$((fails + 1))
+fi
+rm -rf "$bbshadow"
+
 # jolt.fs — the stdlib file-system API against a scratch temp dir (glob, copy-tree,
 # move, mtime round-trip, which). The file self-checks and prints one marker.
 fs_out="$($jolt run test/chez/fs-test.clj 2>/dev/null)"
