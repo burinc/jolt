@@ -5956,7 +5956,14 @@
   ;; cancels what has not finished by the deadline (invokeAll) and raises
   ;; TimeoutException when nothing has (invokeAny). And invokeAny cancels the
   ;; losers once one task has succeeded, which jolt did not do either.
-  {:suite "concurrency / invokeAll deadlines" :label "invokeAll cancels what missed the deadline" :expected "[[true true \"CancellationException\"] [true false :fast]]" :actual "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 2) fs (.invokeAll ex [(fn [] (Thread/sleep 400) :slow) (fn [] :fast)] 1 java.util.concurrent.TimeUnit/MILLISECONDS)] (try (mapv (fn [f] [(.isDone f) (.isCancelled f) (try (.get f) (catch Throwable e (.getSimpleName (class e))))]) fs) (finally (.shutdown ex))))" :portability :jvm}
+  ;;
+  ;; ONE worker and the finishing task FIRST, so which task the deadline catches
+  ;; is decided by the queue rather than by a race: the worker runs :fast to
+  ;; completion, starts the sleeper, and the caller is still waiting on that one
+  ;; when the deadline lands. A two-worker pool with a 1ms bound looked simpler
+  ;; and was flaky in the other direction -- under load the JVM did not reach
+  ;; even the first get before the deadline, and cancelled BOTH.
+  {:suite "concurrency / invokeAll deadlines" :label "invokeAll cancels what missed the deadline" :expected "[[true false :fast] [true true \"CancellationException\"]]" :actual "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 1) fs (.invokeAll ex [(fn [] :fast) (fn [] (Thread/sleep 3000) :slow)] 1000 java.util.concurrent.TimeUnit/MILLISECONDS)] (try (mapv (fn [f] [(.isDone f) (.isCancelled f) (try (.get f) (catch Throwable e (.getSimpleName (class e))))]) fs) (finally (.shutdownNow ex))))" :portability :jvm}
   {:suite "concurrency / invokeAll deadlines" :label "invokeAny raises TimeoutException at its deadline" :expected "\"TimeoutException\"" :actual "(let [ex (java.util.concurrent.Executors/newFixedThreadPool 2)] (try (try (.invokeAny ex [(fn [] (Thread/sleep 400) :slow)] 1 java.util.concurrent.TimeUnit/MILLISECONDS) (catch Throwable e (.getSimpleName (class e)))) (finally (.shutdown ex))))" :portability :jvm}
   ;; One worker, so the ordering is decided rather than raced: the winner runs
   ;; first, loser1's second-long sleep then holds the only worker, and loser2 is
