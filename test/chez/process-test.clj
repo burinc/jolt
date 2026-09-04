@@ -411,6 +411,40 @@
 (check-eq "a child does not inherit jolt's blocked SIGINT"
           (:exit @(process ["sh" "-c" "kill -INT $$"] {:out :string :err :inherit})) 130)
 
+;; A per-thread subprocess — ThreadLocal<Process>, the shape a worker pool uses to
+;; give each thread its own long-lived helper program. It only works if the child
+;; threads run initialValue themselves: jolt's ThreadLocal was a Chez thread
+;; parameter, which a forked thread inherits, so every worker got the PARENT's
+;; already-drained process and read an empty string off it (jolt-uecg).
+(let [tl   (proxy [ThreadLocal] []
+             (initialValue [] (.start (ProcessBuilder. ["sh" "-c" "echo $$"]))))
+      ;; each caller reaps the process it owns, on its own thread — the child
+      ;; threads are the only holders of theirs once .join returns
+      pid  (fn [] (let [p (.get tl) s (str/trim (slurp (.getInputStream p)))]
+                    (.waitFor p)
+                    s))
+      main (pid)
+      seen (atom [])
+      ts   (mapv (fn [_] (Thread. (fn [] (swap! seen conj (pid))))) (range 3))]
+  (doseq [t ts] (.start t))
+  (doseq [t ts] (.join t))
+  (check-eq "each thread's ThreadLocal<Process> is its own subprocess"
+            (count (distinct (cons main @seen))) 4)
+  (check-eq "and every worker actually read a pid"
+            (every? (fn [s] (and (seq s) (parse-long s))) @seen) true))
+
+;; The inheritable variant is the opposite contract and must keep working: the
+;; child shares the parent's process rather than spawning a second one.
+(let [tl   (proxy [InheritableThreadLocal] []
+             (initialValue [] (.start (ProcessBuilder. ["sh" "-c" "echo $$"]))))
+      main (.get tl)
+      got  (promise)]
+  (.start (Thread. (fn [] (deliver got (identical? (.get tl) main)))))
+  (check-eq "an InheritableThreadLocal<Process> child shares the parent's process"
+            (deref got 5000 :TIMED-OUT) true)
+  (slurp (.getInputStream main))
+  (.waitFor main))
+
 (if (empty? @failures)
   (println "PROCESS-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))

@@ -47,6 +47,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`java.lang.ThreadLocal` is per-thread again, and the class exists.** The
+  value lived in a Chez thread parameter, which a forked thread inherits, so a
+  child observed the parent's stored value instead of running its own
+  `initialValue` — every worker in a pool shared one `ThreadLocal<Process>`,
+  one `SimpleDateFormat`, one `test.check` generator. It is now a per-thread
+  table that a fresh thread starts empty, matching the JVM under either fork
+  model, and `.remove` releases the entry. `java.lang.InheritableThreadLocal`,
+  whose contract is the opposite, keeps the inheriting storage and is now a
+  distinct class: `proxy` lowered both to the same object, so whichever
+  behaviour was implemented, the other name was a lie. Along with it,
+  `(ThreadLocal.)` and `(InheritableThreadLocal.)` (no constructor existed —
+  `core.async`'s `impl.dispatch` does `(defonce in-go-dispatch (ThreadLocal.))`),
+  `ThreadLocal/withInitial` over a `java.util.function.Supplier` or a plain fn,
+  and `(class tl)` / `instance?`, which answered `:object` and `false`. A
+  `proxy` over either class now refuses an override it cannot honour —
+  `get`/`set`/`remove`/`toString`/`childValue` were accepted and then dropped,
+  which reads as a method that is defined and never runs. `initialValue`, the
+  one every real use overrides, is unchanged.
+
 - **`jolt build` accepts an alias-qualified namespaced map before the namespace
   has loaded.** The dependency scanner reads every top-level form before it
   evaluates the file's `ns` declaration. Scan mode already preserved an

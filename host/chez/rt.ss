@@ -411,6 +411,12 @@
 ;;   owning thread's id and be re-checked on every read; a vreg starts at
 ;;   fixnum 0 in a fresh thread, which is the property that workaround was
 ;;   buying.
+;; slot 10: java/host-static-classes.ss jolt-vreg-threadlocals — this thread's
+;;   java.lang.ThreadLocal -> value table. Same reason as slot 9, and one step
+;;   stronger: a thread parameter here does not merely leak a flag, it hands a
+;;   child the parent's stored VALUE, which is the one thing ThreadLocal promises
+;;   it will not do (jolt-uecg). InheritableThreadLocal, whose contract is the
+;;   opposite, keeps a per-instance thread parameter and its inheritance.
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
 ;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic
