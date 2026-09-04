@@ -1492,18 +1492,31 @@
                       acc
                       (cons t acc)))))))))
 
+(define (jch-tags-plus name extra)
+  (let ((ts (jch-tags name)))
+    (if (or (null? ts) (null? (cdr ts)))
+        (append ts extra)
+        (cons (car ts) (cons (cadr ts) (append extra (cddr ts)))))))
+
 (define (value-host-tags obj)
   (cond
-    ((flonum? obj) '("Double" "Float" "Number" "Object"))
+    ((flonum? obj)
+     (jch-tags-plus
+       "java.lang.Double"
+       '("java.lang.Float" "Float")))
     ((and (number? obj) (exact? obj) (not (integer? obj)))
-     '("Ratio" "Number" "Object"))
+     (jch-tags "clojure.lang.Ratio"))
     ((and (number? obj) (exact? obj) (integer? obj))
      (if (jolt-bigint-print? obj)
-         '("BigInt" "BigInteger" "Number" "Object")
-         '("Long" "Integer" "Number" "Object")))
-    ((number? obj) '("Number" "Object"))
-    ((string? obj) '("String" "CharSequence" "Object"))
-    ((boolean? obj) '("Boolean" "Object"))
+         (jch-tags-plus
+           "clojure.lang.BigInt"
+           '("java.math.BigInteger" "BigInteger"))
+         (jch-tags-plus
+           "java.lang.Long"
+           '("java.lang.Integer" "Integer"))))
+    ((number? obj) (jch-tags "java.lang.Number"))
+    ((string? obj) (jch-tags "java.lang.String"))
+    ((boolean? obj) (jch-tags "java.lang.Boolean"))
     ((char? obj) (jch-tags "java.lang.Character"))
     ((keyword? obj) (jch-tags "clojure.lang.Keyword"))
     ((jolt-symbol? obj) (jch-tags "clojure.lang.Symbol"))

@@ -522,6 +522,25 @@
 ;; interning NAME would make require skip the real macro. The head is the QUALIFIED
 ;; clojure.core/fn, not a bare `fn`, so it resolves to the real fn macro even when
 ;; the macro being defined IS `fn` (schema's s/fn) or the ns excluded it.
+;; The same [&form &env & declared] prefix the analyzer's defmacro arm applies
+;; (analyzer.clj macro-fn-arities) — this is the build/image path's lowering of
+;; the same form, so the two must agree or an image-baked macro would answer a
+;; different calling convention than a runtime-defined one.
+(define ce-amp-form-sym (jolt-symbol #f "&form"))
+(define ce-amp-env-sym (jolt-symbol #f "&env"))
+(define (ce-macro-params pvec)
+  (let* ((m (jolt-meta pvec))
+         (items (let ((s (jolt-seq pvec))) (if (jolt-nil? s) '() (seq->list s))))
+         (v (apply jolt-vector (cons ce-amp-form-sym (cons ce-amp-env-sym items)))))
+    (if (jolt-nil? m) v (jolt-with-meta v m))))
+(define (ce-macro-arities after)
+  (if (pvec? (car after))
+      (cons (ce-macro-params (car after)) (cdr after))     ; (params body …)
+      (map (lambda (clause)                                 ; ((params body …) …)
+             (let ((es (seq->list clause)))
+               (apply jolt-list (cons (ce-macro-params (car es)) (cdr es)))))
+           after)))
+
 (define (ce-defmacro->fn f)
   (let* ((items (seq->list f))
          (name-sym (cadr items))
@@ -532,7 +551,7 @@
          (after-meta (if attr (cdr a1) a1))
          (fn-sym (jolt-symbol "clojure.core" "fn")))
     (values (symbol-t-name name-sym)
-            (apply jolt-list (cons fn-sym after-meta))
+            (apply jolt-list (cons fn-sym (ce-macro-arities after-meta)))
             (ce-defmacro-meta name-sym after-meta attr doc))))
 
 ;; A bare top-level (do ...) form — head is the unqualified `do` symbol.
