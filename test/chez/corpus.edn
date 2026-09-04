@@ -5940,4 +5940,15 @@
   {:suite "macros / arity error hides the implicit params" :label "too few args too" :expected "\"Wrong number of args (1) passed to: user/mac2\"" :actual "(do (defmacro mac2 [a b] a) (try (eval (quote (mac2 1))) (catch clojure.lang.ArityException e (ex-message e))))" :portability :jvm}
   {:suite "macros / arity error hides the implicit params" :label "a variadic macro still takes any count" :expected "[0 3]" :actual "(do (defmacro mac3 [& xs] (count xs)) [(mac3) (mac3 1 2 3)])" :portability :common}
   {:suite "macros / arity error hides the implicit params" :label "and every arity of a multi-arity macro still resolves" :expected "[:one :two]" :actual "(do (defmacro mac4 ([a] :one) ([a b] :two)) [(mac4 1) (mac4 1 2)])" :portability :common}
+  ;; The JVM's `sigs` elides a macro's implicit params from the :arglists defn
+  ;; derives: a defmacro expands to a defn whose params are [&form &env & declared]
+  ;; and the var still reports the declared ones, which is what doc and every
+  ;; arglists-driven tool show. That is load-bearing here as of #843, whose
+  ;; macroexpand-1 answer is a real defn — a tools.analyzer-style consumer
+  ;; evaluates it, and used to intern a macro reporting ([&form &env a]).
+  ;; The trigger is &form in FIRST position, exactly what the reference keys on.
+  {:suite "defn / implicit macro params" :label "a leading &form &env is elided from the derived arglists" :expected "\"([a])\"" :actual "(do (defn zz1 [&form &env a] a) (pr-str (:arglists (meta (var zz1)))))" :portability :common}
+  {:suite "defn / implicit macro params" :label "every arity of a multi-arity fn" :expected "\"([a] [a b])\"" :actual "(do (defn zz2 ([&form &env a] a) ([&form &env a b] b)) (pr-str (:arglists (meta (var zz2)))))" :portability :common}
+  {:suite "defn / implicit macro params" :label "&env alone is not the trigger" :expected "\"([&env a])\"" :actual "(do (defn zz3 [&env a] a) (pr-str (:arglists (meta (var zz3)))))" :portability :common}
+  {:suite "defn / implicit macro params" :label "so evaluating a defmacro's expansion interns the declared arglists" :expected "[\"([a])\" true 42]" :actual "(do (eval (macroexpand-1 (quote (defmacro mq1 [a] (list (quote inc) a))))) [(pr-str (:arglists (meta (resolve (quote mq1))))) (:macro (meta (resolve (quote mq1)))) (eval (quote (mq1 41)))])" :portability :common}
 ]
