@@ -47,6 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Modeled Java collections return and fill object arrays from `toArray`.**
+  `ArrayList`, `LinkedList`, and `ArrayDeque` share these methods. The
+  no-argument and destination-array overloads both ignored their Java contracts
+  and returned a persistent vector. The no-argument form now allocates an exact
+  `Object[]`;
+  the destination overload reuses a large-enough array, writes a null logical
+  terminator when it has spare capacity, preserves later cells, and allocates a
+  replacement when the supplied array is too short.
+
 - **`java.lang.ThreadLocal` is per-thread again, and the class exists.** The
   value lived in a Chez thread parameter, which a forked thread inherits, so a
   child observed the parent's stored value instead of running its own
