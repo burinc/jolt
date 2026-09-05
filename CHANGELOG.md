@@ -62,6 +62,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implementation, which is written against a collection's element list rather
   than against `ArrayList`'s backing vector, so whatever is modeled next needs
   only its own list.
+- **Unicode-aware `String.equalsIgnoreCase` and JVM-compatible
+  `compareToIgnoreCase` results.** The instance methods used a separate ASCII
+  lowercase path and reduced every nonzero comparison to `-1` or `1`, even
+  though `String/CASE_INSENSITIVE_ORDER` already modeled Java's character-wise
+  upper-then-lower fold and returned the differing character values. They now
+  share that implementation, so non-ASCII pairs such as `"É"` / `"é"`, null
+  equality, and comparison magnitudes agree with the JVM.
+
+  `compareTo` and `regionMatches` are the same two contracts and are now on the
+  same footing. `compareTo` still answered a sign, so `(.compareTo "a" "c")` was
+  `-1` where the JVM says `-2` and `(.compareTo "abcd" "ab")` was `1` where the
+  JVM says `2` — a magnitude beside `compareToIgnoreCase`'s and a sign from its
+  case-sensitive twin. And `equalsIgnoreCase` IS
+  `regionMatches(true, 0, other, 0, length)` on the JVM, but `regionMatches`
+  folded with Scheme's `string-ci=?` — the full Unicode folding, which is not
+  Java's per-character upper-then-lower one: `"I"` and `"ı"` compared equal
+  through `equalsIgnoreCase` and unequal through `regionMatches`, one JVM
+  operation with two answers. All four now go through one fold, so a new
+  ignore-case method has one place to reach for.
 
 - **A jolt binary carries its own lz4 and zlib, and needs neither at runtime.**
   They are the Chez kernel's fasl compressors, so every binary — jolt itself and
@@ -94,6 +113,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `libz.a` join ncurses on the `--exclude-libs` list, which already existed for
   the same reason. A `:jolt/native`'s own symbols are still exported, so
   `(load-shared-object #f)` resolution is unchanged.
+
+- **Windows absolute paths survive both project and dependency resolution.** A
+  drive-rooted `JOLT_PWD` such as `D:\work\app` was treated as relative by the
+  host file layer, producing paths such as
+  `D:\work\app/D:\work\app/deps.edn` before any program could run. The File
+  shim now recognizes drive-rooted and UNC spellings consistently for file
+  access, `getAbsolutePath`, and `isAbsolute`; a single-leading-separator path
+  remains non-absolute but resolves against `user.dir`'s drive. Dependency
+  roots independently preserve drive, UNC, and device paths with either
+  separator and resolve root-relative paths against the declaring base's drive;
+  ambiguous drive-relative forms such as `C:project` fail with a targeted
+  error that asks for a drive-absolute path.
 
 - **`java.lang.ThreadLocal` is per-thread again, and the class exists.** The
   value lived in a Chez thread parameter, which a forked thread inherits, so a

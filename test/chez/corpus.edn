@@ -1075,6 +1075,9 @@
   {:suite "interop / String methods" :label ".setLastModified round-trip" :expected "1600000000000" :actual "(let [f (java.io.File/createTempFile \"slm\" \".t\")] (.setLastModified f 1600000000000) (let [r (.lastModified f)] (.delete f) r))" :portability :jvm}
   {:suite "interop / String methods" :label ".codePointAt astral" :expected "128512" :actual "(.codePointAt \"😀\" 0)" :portability :jvm}
   {:suite "interop / String methods" :label ".equalsIgnoreCase" :expected "true" :actual "(.equalsIgnoreCase \"AbC\" \"aBc\")" :portability :jvm}
+  {:suite "interop / String methods" :label "case-insensitive methods use Java character folding and comparison magnitude" :expected "[true false -2 25]" :actual "[(.equalsIgnoreCase \"É\" \"é\") (.equalsIgnoreCase \"É\" nil) (.compareToIgnoreCase \"a\" \"c\") (.compareToIgnoreCase \"Z\" \"a\")]" :portability :jvm}
+  {:suite "interop / String methods" :label "compareTo reports the character difference, not a sign" :expected "[-2 2 -2 0 -7]" :actual "[(.compareTo \"a\" \"c\") (.compareTo \"abcd\" \"ab\") (.compareTo \"ab\" \"abcd\") (.compareTo \"a\" \"a\") (.compareTo \"Z\" \"a\")]" :portability :jvm}
+  {:suite "interop / String methods" :label "regionMatches ignore-case folds the way equalsIgnoreCase does" :expected "[true true true false]" :actual "[(.regionMatches \"I\" true 0 \"ı\" 0 1) (.equalsIgnoreCase \"I\" \"ı\") (.regionMatches \"aÉc\" true 1 \"é\" 0 1) (.regionMatches \"aÉc\" false 1 \"é\" 0 1)]" :portability :jvm}
   {:suite "interop / String methods" :label "Long/MAX_VALUE" :expected "true" :actual "(pos? Long/MAX_VALUE)" :portability :jvm}
   {:suite "interop / String methods" :label "String/valueOf num" :expected "\"42\"" :actual "(String/valueOf 42)" :portability :jvm}
   {:suite "interop / String methods" :label "String/valueOf str" :expected "\"hi\"" :actual "(String/valueOf \"hi\")" :portability :jvm}
