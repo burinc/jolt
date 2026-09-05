@@ -1604,6 +1604,9 @@
   {:suite "binding-no-autoderef" :expr "(do (def ^:dynamic *bd11* 10) (def bd11v 20) (.getName (class (binding [*bd11* (var bd11v)] *bd11*))))" :expected "\"clojure.lang.Var\""}
   ;; Stage B — getAbsoluteFile/getCanonicalFile share getAbsolutePath's JOLT_PWD base
   {:suite "io-file-base" :expr "(= (.getAbsolutePath (java.io.File. \"rel.txt\")) (.getPath (.getAbsoluteFile (java.io.File. \"rel.txt\"))))" :expected "true"}
+  {:suite "io-file-base"
+   :expr "(let [windows? (.contains (.toLowerCase (System/getProperty \"os.name\")) \"win\")] (and (= windows? (.isAbsolute (java.io.File. \"C:\\\\work\\\\report.edn\"))) (= windows? (.isAbsolute (java.io.File. \"C:/work/report.edn\"))) (= windows? (.isAbsolute (java.io.File. \"\\\\\\\\server\\\\share\\\\report.edn\"))) (false? (.isAbsolute (java.io.File. \"C:report.edn\"))) (false? (.isAbsolute (java.io.File. \"\\\\work\\\\report.edn\"))) (= (not windows?) (.isAbsolute (java.io.File. \"/work/report.edn\")))))"
+   :expected "true"}
   {:suite "io-file-base" :expr "(.exists (.getCanonicalFile (java.io.File. \".\")))" :expected "true"}
   ;; Stage C — getenv single-key matches map lookup
   {:suite "getenv" :expr "(= (get (System/getenv) \"HOME\") (System/getenv \"HOME\"))" :expected "true"}
