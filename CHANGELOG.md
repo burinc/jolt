@@ -47,6 +47,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A jolt binary no longer needs Homebrew's lz4 to start (macOS).** lz4 is the
+  Chez kernel's fasl compressor, so every binary — jolt itself and anything
+  `jolt build` produces — links it. The macOS link line took it from
+  `$(brew --prefix lz4)/lib`, and a directory holding both a `.dylib` and a `.a`
+  gives `-llz4` the dylib, so the released binary demanded
+  `/opt/homebrew/opt/lz4/lib/liblz4.1.dylib` off every machine that ran it: on a
+  Mac that never ran `brew install lz4` — which is most of them — `curl … | bash`
+  died in the install script's own `jolt --version` check with a dyld error.
+  Both platforms now name the static `liblz4.a` that Chez installs next to
+  `libkernel.a`, which is what forces the static choice (Apple's ld has no
+  `-Bstatic`); on macOS the brew keg and pkg-config stay as fallbacks for a Chez
+  that installed without one. Linux already resolved that same archive, but
+  through `-L` and search order rather than by name, so a Chez installed without
+  it silently produced a binary with a runtime lz4 dependency; that case now
+  warns. The release workflow asserts the binary it built needs no library a
+  stock machine lacks, and the install script names the missing library when one
+  fails to load.
+
 - **`java.lang.ThreadLocal` is per-thread again, and the class exists.** The
   value lived in a Chez thread parameter, which a forked thread inherits, so a
   child observed the parent's stored value instead of running its own
