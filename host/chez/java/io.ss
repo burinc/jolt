@@ -297,9 +297,20 @@
     ;; select the wrong drive after the launcher changes directory.
     ((windows-root-relative? p)
      (let ((base (jolt-user-dir)))
-       (if (windows-drive-prefix? base)
-           (string-append (substring base 0 2) p)
-           (string-append (trim-trailing-path-separator base) p))))
+       (cond
+         ;; The base names a drive, so the current-drive-rooted path takes it.
+         ((windows-drive-prefix? base) (string-append (substring base 0 2) p))
+         ;; A UNC base has no drive letter; its \\server\share IS the root.
+         ((jfile-path-absolute? base)
+          (string-append (trim-trailing-path-separator base) p))
+         ;; Nothing to root against: JOLT_PWD is unset, so jolt-user-dir is ".".
+         ;; Prefixing that turns a ROOTED path into a relative one, which is
+         ;; strictly worse than leaving the OS to resolve it against the process
+         ;; drive — the drive is at least a plausible answer, "./\x" is not.
+         ;; jolt.deps/root-relative-for keeps the same arm for the same reason,
+         ;; and its (absolute true "." "\project") case pins it; without this
+         ;; the two classifiers disagree on the one input neither can resolve.
+         (else p))))
     (else
      (let ((base (jolt-user-dir)))
        ;; "." adds nothing the OS won't do itself when it resolves a relative
@@ -351,10 +362,11 @@
 ;; (current-directory) here instead reported paths under the jolt repo root the
 ;; launcher cd'd into, diverging from the JVM where io/file and getAbsolutePath
 ;; are user.dir-relative.
+;; project-relative answers an absolute path with itself, so asking it twice —
+;; once here to decide, once inside — only pays the host-specific classification
+;; twice per call. The empty path is the one case it does not cover.
 (define (jfile-abs p)
-  (cond ((= (string-length p) 0) (jolt-user-dir))
-        ((jfile-path-absolute? p) p)
-        (else (project-relative p))))
+  (if (= (string-length p) 0) (jolt-user-dir) (project-relative p)))
 
 ;; --- canonical paths --------------------------------------------------------
 ;; getCanonicalPath is realpath(3), not "make it absolute": it resolves
