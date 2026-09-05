@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Type hints reach codegen.** jolt has always parsed a broad Java-type-hint
+  vocabulary, but only three narrow bridges carried it into emission; everything
+  else was parsed and discarded. A hint the compiler already understood now
+  specializes the code it emits — no new inference, just consuming what was
+  known:
+
+  ```clojure
+  (defrecord P [^long x ^String nm ^double d])
+
+  (fn [^P p] (.length (:nm p)))      ; a type test and a dispatch fallback
+                                     ; => (string-length (jrec3-f1 p))
+  (fn [^String s] (count s))         ; => (string-length s)
+  (fn [^String s ^String t] (str s t))  ; => (string-append s t)
+  (fn [^long x] (Math/abs x))        ; => (jolt-l-abs x)
+  (fn [^objects a ^long i] (aget a i))  ; => (jolt-vaget a i)
+  ```
+
+  `^int` on a parameter joins `^long`: reference Clojure has only `long` and
+  `double` primitive parameters and refuses any other primitive hint outright, so
+  an `^int`-hinted fn does not compile there at all. jolt accepts it as the
+  fixnum promise `^long` already is — an int and a long are the same value here —
+  and coerces at entry, so ported JVM code written in `^int` indices compiles and
+  takes the fx path. A value that was never an integer is refused at the
+  boundary rather than travelling on untyped. Recorded and machine-checked in
+  `test/conformance/known-divergences.edn`.
+
 - **A compile error names its kind, points at the code, and can be caught.**
   A report used to be a message, a line number, and thirty frames of the
   analyzer's own recursion. It is now a framed diagnostic:
