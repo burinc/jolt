@@ -263,6 +263,12 @@
        (or (= (string-length p) 1)
            (not (path-separator-char? (string-ref p 1))))))
 
+(define (trim-trailing-path-separator p)
+  (let ((n (string-length p)))
+    (if (and (> n 2) (path-separator-char? (string-ref p (- n 1))))
+        (substring p 0 (- n 1))
+        p)))
+
 ;; java.io.File.isAbsolute is host-platform-specific. POSIX has one absolute
 ;; prefix (/). Windows has drive-rooted paths (C:\x or C:/x) and UNC paths
 ;; (\\server\share); drive-relative C:x and current-drive-rooted \x are not
@@ -293,7 +299,7 @@
      (let ((base (jolt-user-dir)))
        (if (windows-drive-prefix? base)
            (string-append (substring base 0 2) p)
-           (string-append base p))))
+           (string-append (trim-trailing-path-separator base) p))))
     (else
      (let ((base (jolt-user-dir)))
        ;; "." adds nothing the OS won't do itself when it resolves a relative
