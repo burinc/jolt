@@ -74,13 +74,19 @@
   (is= "Windows relative path joins its declaring root" "D:/base/../lib"
        (absolute true "D:/base" "../lib"))
 
-  ;; A leading separator is relative to the current drive, but prefixing the
-  ;; project directory would change its meaning. Preserve both accepted Windows
-  ;; separator spellings, matching the old leading-slash behavior.
+  ;; A leading separator is rooted on the declaring project's drive. Resolve
+  ;; the drive explicitly so later raw filesystem checks cannot accidentally
+  ;; use the runtime checkout's drive instead.
   (doseq [p ["/project" "\\project"]]
     (is= (str "Windows root-relative path kind " (pr-str p)) :root-relative (kind true p))
-    (is= (str "Windows root-relative path spelling " (pr-str p)) p
+    (is= (str "Windows root-relative path drive " (pr-str p)) (str "D:" p)
          (absolute true "D:/base" p)))
+  (is= "Windows root-relative path under UNC base"
+       "\\\\server\\share\\base\\project"
+       (absolute true "\\\\server\\share\\base" "\\project"))
+  (is= "Windows root-relative path without a rooted base stays rooted"
+       "\\project"
+       (absolute true "." "\\project"))
 
   ;; C:path resolves against Windows' per-drive current directory, not the
   ;; declaring project's directory. The launcher changes cwd before resolution,

@@ -79,6 +79,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same reason. A `:jolt/native`'s own symbols are still exported, so
   `(load-shared-object #f)` resolution is unchanged.
 
+- **Windows absolute paths survive both project and dependency resolution.** A
+  drive-rooted `JOLT_PWD` such as `D:\work\app` was treated as relative by the
+  host file layer, producing paths such as
+  `D:\work\app/D:\work\app/deps.edn` before any program could run. The File
+  shim now recognizes drive-rooted and UNC spellings consistently for file
+  access, `getAbsolutePath`, and `isAbsolute`; a single-leading-separator path
+  remains non-absolute but resolves against `user.dir`'s drive. Dependency
+  roots independently preserve drive, UNC, and device paths with either
+  separator and resolve root-relative paths against the declaring base's drive;
+  ambiguous drive-relative forms such as `C:project` fail with a targeted
+  error that asks for a drive-absolute path.
+
 - **`java.lang.ThreadLocal` is per-thread again, and the class exists.** The
   value lived in a Chez thread parameter, which a forked thread inherits, so a
   child observed the parent's stored value instead of running its own
@@ -2787,12 +2799,6 @@ call. Memoizing the probe by `(zone, instant)` undoes it: a repeated
 `jolt-lang/time`'s zone-aware `now` speeds up by roughly 100x.
 
 ### Fixed
-
-- **Dependency roots preserve absolute Windows paths.** `:local/root` and cache
-  paths with drive, UNC, device, or root-relative spellings are no longer
-  prefixed with Jolt's launch directory, and both `/` and `\` are accepted as
-  Windows separators. Ambiguous drive-relative paths such as `C:project` now
-  fail with a targeted error that asks for a drive-absolute path.
 
 - **`jolt.ffi` `:string` carries NULL in both directions.** Chez's `string`
   foreign type already spells NULL as `#f`, but jolt's own nil is a separate

@@ -204,9 +204,21 @@
 (defn- windows? []
   (str/includes? (str/lower-case (or (System/getProperty "os.name") "")) "win"))
 
+(defn- windows-drive-prefix? [p]
+  (and (>= (count p) 2)
+       (ascii-alpha? (nth p 0))
+       (= \: (nth p 1))))
+
+(defn- root-relative-for [dir p]
+  (cond
+    (windows-drive-prefix? dir) (str (subs dir 0 2) p)
+    (= :absolute (native-path-kind-for true dir)) (str dir p)
+    :else p))
+
 (defn- abspath-for [windows? dir p]
   (case (native-path-kind-for windows? p)
-    (:absolute :root-relative) p
+    :absolute p
+    :root-relative (root-relative-for dir p)
     :drive-relative
     (throw (ex-info (str "drive-relative path " (pr-str p)
                          " is ambiguous; use a drive-absolute path such as C:/path")
