@@ -56,6 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminator when it has spare capacity, preserves later cells, and allocates a
   replacement when the supplied array is too short.
 
+  `HashSet` answers both overloads too. `toArray` is a `Collection` method, not
+  a `List` one, and the set had none at all — `(.toArray h)` was `No matching
+  field found: toArray for class java.util.HashSet`. It shares the one
+  implementation, which is written against a collection's element list rather
+  than against `ArrayList`'s backing vector, so whatever is modeled next needs
+  only its own list.
+
 - **`java.lang.ThreadLocal` is per-thread again, and the class exists.** The
   value lived in a Chez thread parameter, which a forked thread inherits, so a
   child observed the parent's stored value instead of running its own
