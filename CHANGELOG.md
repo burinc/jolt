@@ -61,9 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that installed without one. Linux already resolved that same archive, but
   through `-L` and search order rather than by name, so a Chez installed without
   it silently produced a binary with a runtime lz4 dependency; that case now
-  warns. The release workflow asserts the binary it built needs no library a
-  stock machine lacks, and the install script names the missing library when one
-  fails to load.
+  warns. The self-contained jolt carries that archive alongside the Chez kernel
+  it already bundles, so the one link it performs itself — the relink that bakes
+  a `:jolt/native` `:static` archive into an app — takes lz4 from the bundle
+  rather than from the machine the app happens to be built on, and the app it
+  writes has no lz4 dependency either. The release workflow asserts the binary it
+  built needs no library a stock machine lacks, and the install script names the
+  missing library when one fails to load.
 
 - **`java.lang.ThreadLocal` is per-thread again, and the class exists.** The
   value lived in a Chez thread parameter, which a forked thread inherits, so a

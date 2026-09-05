@@ -166,15 +166,20 @@
   (let ((memcpy (sa-foreign-procedure \"memcpy\" (u8* uptr uptr) void*)))
     (for-each
       (lambda (spec)
-        (let* ((len (sa-foreign-ref 'unsigned-int (sa-foreign-entry-address (caddr spec)) 0))
-               (bv (make-bytevector len)))
-          (memcpy bv (sa-foreign-entry-address (cadr spec)) len)
-          (register-embedded-bytes! (car spec) bv)))
+        ;; A zero length means the file was absent at jolt-build time — only the
+        ;; lz4 archive can be — so register nothing and let the reader's #f
+        ;; branch handle it. Every other bundle here is always non-empty.
+        (let ((len (sa-foreign-ref 'unsigned-int (sa-foreign-entry-address (caddr spec)) 0)))
+          (when (> len 0)
+            (let ((bv (make-bytevector len)))
+              (memcpy bv (sa-foreign-entry-address (cadr spec)) len)
+              (register-embedded-bytes! (car spec) bv)))))
       '((\"csv/petite.boot\" \"jolt_petite_boot\" \"jolt_petite_boot_len\")
         (\"csv/scheme.boot\" \"jolt_scheme_boot\" \"jolt_scheme_boot_len\")
         (\"stub/launcher\" \"jolt_stub\" \"jolt_stub_len\")
         (\"csv/scheme.h\" \"jolt_scheme_h\" \"jolt_scheme_h_len\")
         (\"csv/libkernel.a\" \"jolt_libkernel_a\" \"jolt_libkernel_a_len\")
+        (\"csv/liblz4.a\" \"jolt_liblz4_a\" \"jolt_liblz4_a_len\")
         (\"stub/launcher.c\" \"jolt_launcher_c\" \"jolt_launcher_c_len\")))))
 
 (suppress-greeting #t)
@@ -642,6 +647,17 @@
     "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/unsigned char " name "[]/; "
     "s/unsigned int [A-Za-z0-9_]+_len/unsigned int " name "_len/' '" h "'")))
 
+;; The same header for a file that is not there: main.c's #include and the symbol
+;; still have to exist, and a zero length is how jolt-materialize-bundles! tells
+;; an absent bundle from a real one (it registers nothing, so the reader sees #f
+;; and falls back). Only the lz4 archive is ever optional.
+(define (jb-empty-c-array h name)
+  (let ((p (open-output-file h 'replace)))
+    (put-string p (string-append
+      "unsigned char " name "[] = { 0x00 };\n"
+      "unsigned int " name "_len = 0;\n"))
+    (close-port p)))
+
 (display "build-jolt: embedding boots + stub, linking\n")
 (jb-c-array jb-boot (string-append jb-build "/boot_data.h") "jolt_boot")
 (jb-c-array (string-append (bld-csv-dir) "/petite.boot") (string-append jb-build "/petite_data.h") "jolt_petite_boot")
@@ -653,6 +669,18 @@
 ;; stub, so it relinks (build.ss bld-relink-stub). Needs the system cc at build.
 (jb-c-array (string-append (bld-csv-dir) "/scheme.h") (string-append jb-build "/schemeh_data.h") "jolt_scheme_h")
 (jb-c-array (string-append (bld-csv-dir) "/libkernel.a") (string-append jb-build "/libkernel_data.h") "jolt_libkernel_a")
+;; ...and the static liblz4.a that kernel was built against. That relink is the
+;; one link the distributed jolt performs, and it runs where there is no Chez
+;; install to take an archive from — without this it resolves lz4 off the user's
+;; machine, so an app with a :static native would carry a runtime lz4 dependency
+;; that no other `jolt build` output has. The archive is a couple of hundred KB
+;; next to a ~27M binary.
+(let ((lz4 (bld-lz4-archive)))
+  (if lz4
+      (jb-c-array lz4 (string-append jb-build "/lz4_data.h") "jolt_liblz4_a")
+      ;; Nothing to embed: this jolt was built against a Chez with no archive
+      ;; (bld-link-libs warned then), and the relink degrades to -llz4 as before.
+      (jb-empty-c-array (string-append jb-build "/lz4_data.h") "jolt_liblz4_a")))
 (jb-c-array "host/chez/stub/launcher.c" (string-append jb-build "/launcherc_data.h") "jolt_launcher_c")
 ;; The embedded stdlib fasl blob (one concatenated .so per install-owned ns).
 ;; jb-emit-stdlib-fasls! wrote it during flat.ss emission; it is absent only when
@@ -673,6 +701,7 @@
       "#include \"stub_data.h\"\n"
       "#include \"schemeh_data.h\"\n"
       "#include \"libkernel_data.h\"\n"
+      "#include \"lz4_data.h\"\n"
       "#include \"launcherc_data.h\"\n"
       "#include \"stdlib_fasls_data.h\"\n"
       "int main(int argc, char *argv[]) {\n"

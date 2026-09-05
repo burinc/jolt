@@ -265,14 +265,24 @@
 ;; Mac with no Homebrew lz4, which is most of them. lz4 is not a system library
 ;; on either platform, so it has to be baked in: a jolt binary is meant to run
 ;; with nothing else installed.
+
+;; An archive that outranks the search below. The self-contained jolt has no Chez
+;; install to look in, so it carries the archive its own kernel was linked
+;; against and spills it for the one link it still performs (bld-relink-stub).
+(define bld-lz4-override (make-parameter #f))
+
 (define (bld-lz4-archive)
   (let loop ((thunks
-               (cons
+               (cons*
+                 (lambda () (bld-lz4-override))
                  ;; The csv dir the kernel itself comes from. (bld-csv-dir), not
-                 ;; bld-host-csv-dir, for the reason the Linux branch gives below
-                 ;; — though a cross build never reaches here (the pack supplies
-                 ;; its own static lz4 under lib/).
+                 ;; bld-host-csv-dir, for the reason the Linux branch gives below.
+                 ;; A cross build's link never asks (the pack's link-libs carries
+                 ;; its own -llz4, resolved against the static archive under
+                 ;; lib/), but build-jolt does, to embed it — hence the pack path.
                  (lambda () (string-append (bld-csv-dir) "/liblz4.a"))
+                 (lambda () (and (bld-cross?)
+                                 (string-append (bld-target-pack) "/lib/liblz4.a")))
                  ;; macOS only. A distro's static liblz4.a is deliberately NOT
                  ;; searched on Linux: it may well be non-PIC, which would turn
                  ;; today's working `jolt build --library` into a link error
@@ -2022,17 +2032,28 @@
 ;; (native-link) and, on Linux, -rdynamic so the baked-in symbols stay dlsym-
 ;; visible for (load-shared-object #f) + foreign-procedure at startup.
 (define (bld-relink-stub builddir native-link out-path)
-  (let ((h  (string-append builddir "/scheme.h"))
-        (lk (string-append builddir "/libkernel.a"))
-        (lc (string-append builddir "/launcher.c")))
+  (let* ((h  (string-append builddir "/scheme.h"))
+         (lk (string-append builddir "/libkernel.a"))
+         (lc (string-append builddir "/launcher.c"))
+         ;; The bundled lz4 archive, spilled like the kernel: this link runs on a
+         ;; machine with no Chez install, so bld-lz4-archive has nowhere to look
+         ;; and the app would otherwise take whatever lz4 the machine happens to
+         ;; have — a runtime dependency the appended-stub path (the other 99% of
+         ;; builds) does not have, on a binary the user is about to ship. Absent
+         ;; only when the jolt running this was itself built against a Chez that
+         ;; had no archive; then the link falls back to -llz4 as it always did.
+         (lz4 (and (jolt-embedded-bytes "csv/liblz4.a")
+                   (string-append builddir "/liblz4.a"))))
     (jolt-spill-embedded! "csv/scheme.h" h)
     (jolt-spill-embedded! "csv/libkernel.a" lk)
     (jolt-spill-embedded! "stub/launcher.c" lc)
+    (when lz4 (jolt-spill-embedded! "csv/liblz4.a" lz4))
     (display "jolt build: relinking launcher stub with static native libraries\n")
-    (bld-system (string-append
-      "cc -O2 " (bld-export-symbols-flag)
-      "-I'" builddir "' '" lc "' '" lk "' -o '" out-path "' "
-      native-link " " (bld-link-libs)))))
+    (parameterize ((bld-lz4-override lz4))
+      (bld-system (string-append
+        "cc -O2 " (bld-export-symbols-flag)
+        "-I'" builddir "' '" lc "' '" lk "' -o '" out-path "' "
+        native-link " " (bld-link-libs))))))
 
 ;; --- legacy cc link (dev bin/jolt): fresh Chez compile + xxd + cc ------------
 (define (build-with-cc entry-ns out-path mode builddir flat-ss flat-so boot boot-h main-c native-link petite-only?)
