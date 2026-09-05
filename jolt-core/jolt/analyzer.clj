@@ -114,7 +114,11 @@
 ;; A recur target carries its name (the compiled self-call) and its ARITY (the
 ;; binding count) so a recur with the wrong number of args is a compile error,
 ;; like the JVM, instead of failing only at runtime on the branch that runs.
-(defn- with-recur [env name arity] (assoc env :recur name :recur-arity arity))
+;; Establishing a target also lifts any `try` boundary crossed to get here: the
+;; boundary is about reaching an OUTER target, and a fn or loop written inside a
+;; try recurs to itself normally, exactly as it does on the JVM.
+(defn- with-recur [env name arity]
+  (-> env (assoc :recur name :recur-arity arity) (dissoc :recur-blocked)))
 
 ;; Type hints. The reader keeps ^hint metadata on the binding symbol.
 ;; Two hints resolve to the :struct fast path (a constant-keyword lookup skips
@@ -592,7 +596,21 @@
     ;; everything; this gives real per-class dispatch.) :catch-sym/:catch-body/
     ;; :finally are added only when present — an absent key must stay absent (a
     ;; nil-valued key would make the node a phm and force back-end densification).
-    (let [n {:op :try :body (analyze-seq ctx @body env)}
+    ;; `recur` may not cross a try. On the JVM that is a bytecode limit; here the
+    ;; lowering re-enters the handler scope each iteration without leaving the
+    ;; previous one, so a recur that crossed one leaked ~400 bytes an iteration and
+    ;; ran `finally` bodies LIFO at loop exit rather than per iteration — and with
+    ;; no loop condition it simply hung. The target stays VISIBLE (with-recur in an
+    ;; inner fn/loop lifts this again); marking the boundary rather than dropping
+    ;; :recur is what lets the recur arm tell "no target at all" from "a target it
+    ;; may not reach", which are different diagnostics.
+    ;;
+    ;; Body and catch/finally are marked differently because the reference reports
+    ;; them differently: the body is "Cannot recur across try", while a catch or
+    ;; finally is not a tail position in the first place and reports as such.
+    (let [benv (assoc env :recur-blocked :try)
+          tenv (assoc env :recur-blocked :non-tail)
+          n {:op :try :body (analyze-seq ctx @body benv)}
           n (if (seq @catches)
               (let [evar-name (gen-name "catch")
                     raw-name (gen-name "catch-raw")
@@ -618,10 +636,10 @@
                 (assoc n :catch-sym evar-name
                          :catch-raw-sym raw-name
                          :catch-body (analyze-seq ctx (list dispatch)
-                                                  (add-locals env [evar-name]))))
+                                                  (add-locals tenv [evar-name]))))
               n)
           n (if @finally-body
-              (assoc n :finally (analyze-seq ctx @finally-body env))
+              (assoc n :finally (analyze-seq ctx @finally-body tenv))
               n)]
       n)))
 
@@ -832,6 +850,15 @@
                   arity (:recur-arity env)
                   n (dec (count items))]
               (when-not rt (uncompilable "recur outside loop/fn"))
+              ;; A target exists but a `try` stands between here and it. Reported
+              ;; before the arity check because the arity is beside the point when
+              ;; the recur cannot happen at all, and with the reference's own two
+              ;; messages: a try body may not be recurred ACROSS, while a catch or
+              ;; finally is not a tail position to begin with.
+              (case (:recur-blocked env)
+                :try (throw "Cannot recur across try")
+                :non-tail (throw "Can only recur from tail position")
+                nil)
               (when (and arity (not= n arity))
                 (throw (str "Mismatched argument count to recur, expected: " arity
                             " args, got: " n)))
