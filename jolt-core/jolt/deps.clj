@@ -212,7 +212,12 @@
 (defn- root-relative-for [dir p]
   (cond
     (windows-drive-prefix? dir) (str (subs dir 0 2) p)
-    (= :absolute (native-path-kind-for true dir)) (str dir p)
+    (= :absolute (native-path-kind-for true dir))
+    (str (if (and (> (count dir) 2)
+                  (path-separator? (nth dir (dec (count dir)))))
+           (subs dir 0 (dec (count dir)))
+           dir)
+         p)
     :else p))
 
 (defn- abspath-for [windows? dir p]

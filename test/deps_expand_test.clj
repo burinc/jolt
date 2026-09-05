@@ -84,6 +84,9 @@
   (is= "Windows root-relative path under UNC base"
        "\\\\server\\share\\base\\project"
        (absolute true "\\\\server\\share\\base" "\\project"))
+  (is= "Windows root-relative path under trailing-separator UNC base"
+       "\\\\server\\share\\project"
+       (absolute true "\\\\server\\share\\" "\\project"))
   (is= "Windows root-relative path without a rooted base stays rooted"
        "\\project"
        (absolute true "." "\\project"))
