@@ -179,7 +179,8 @@ jobs:
           if (-not $resolved.Contains('marker-src')) {
             throw "resolved path did not contain the fixture's declared marker root"
           }
-          $probe = '(let [u (System/getProperty "user.dir") p "\\rooted.txt" f (java.io.File. p)] (and (false? (.isAbsolute f)) (= (str (subs u 0 2) p) (.getAbsolutePath f))))'
+          $env:JOLT_EXPECTED_ROOTED = $env:JOLT_PWD.Substring(0, 2) + '\rooted.txt'
+          $probe = '(let [p "\\rooted.txt" f (java.io.File. p)] (and (false? (.isAbsolute f)) (= (System/getenv "JOLT_EXPECTED_ROOTED") (.getAbsolutePath f))))'
           $rooted = (& $scheme --script host\chez\cli.ss -e $probe 2>&1 | Out-String).Trim()
           Write-Host $rooted
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
