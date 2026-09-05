@@ -850,6 +850,14 @@
   {:suite "str" :expr "(.compareToIgnoreCase \"ABC\" \"abc\")" :expected "0"}
   {:suite "str" :expr "(.contentEquals \"ab\" (StringBuilder. \"ab\"))" :expected "true"}
   {:suite "str" :expr "[(.equalsIgnoreCase \"É\" \"é\") (.equalsIgnoreCase \"É\" nil) (.compareToIgnoreCase \"a\" \"c\") (.compareToIgnoreCase \"Z\" \"a\") (.compare String/CASE_INSENSITIVE_ORDER \"É\" \"é\")]" :expected "[true false -2 25 0]"}
+  ;; compareTo answers the same CHARACTER DIFFERENCE its ignore-case twin does,
+  ;; and the length difference when one string prefixes the other — a sign beside
+  ;; a magnitude was two contracts for one pair of methods.
+  {:suite "str" :expr "[(.compareTo \"a\" \"c\") (.compareTo \"abcd\" \"ab\") (.compareTo \"ab\" \"abcd\") (.compareTo \"a\" \"a\") (.compareTo \"Z\" \"a\")]" :expected "[-2 2 -2 0 -7]"}
+  ;; equalsIgnoreCase IS regionMatches(true, 0, other, 0, length) on the JVM, so
+  ;; the two share one fold. Scheme's string-ci=? is the full Unicode folding and
+  ;; disagrees on dotless i, which Java calls equal (both upper-case to I).
+  {:suite "str" :expr "[(.regionMatches \"I\" true 0 \"ı\" 0 1) (.equalsIgnoreCase \"I\" \"ı\") (.regionMatches \"aÉc\" true 1 \"é\" 0 1)]" :expected "[true true true]"}
   {:suite "str" :expr "[(.regionMatches \"abcd\" 1 \"bc\" 0 2) (.regionMatches \"abcd\" 1 \"xy\" 0 2)]" :expected "[true false]"}
   ;; the leading-boolean ignore-case overload, and an out-of-range region (false, not a throw)
   {:suite "str" :expr "[(.regionMatches \"abcd\" true 1 \"BC\" 0 2) (.regionMatches \"abcd\" false 1 \"BC\" 0 2)]" :expected "[true false]"}

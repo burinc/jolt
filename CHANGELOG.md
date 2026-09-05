@@ -55,6 +55,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   share that implementation, so non-ASCII pairs such as `"É"` / `"é"`, null
   equality, and comparison magnitudes agree with the JVM.
 
+  `compareTo` and `regionMatches` are the same two contracts and are now on the
+  same footing. `compareTo` still answered a sign, so `(.compareTo "a" "c")` was
+  `-1` where the JVM says `-2` and `(.compareTo "abcd" "ab")` was `1` where the
+  JVM says `2` — a magnitude beside `compareToIgnoreCase`'s and a sign from its
+  case-sensitive twin. And `equalsIgnoreCase` IS
+  `regionMatches(true, 0, other, 0, length)` on the JVM, but `regionMatches`
+  folded with Scheme's `string-ci=?` — the full Unicode folding, which is not
+  Java's per-character upper-then-lower one: `"I"` and `"ı"` compared equal
+  through `equalsIgnoreCase` and unequal through `regionMatches`, one JVM
+  operation with two answers. All four now go through one fold, so a new
+  ignore-case method has one place to reach for.
+
 - **`java.lang.ThreadLocal` is per-thread again, and the class exists.** The
   value lived in a Chez thread parameter, which a forked thread inherits, so a
   child observed the parent's stored value instead of running its own
