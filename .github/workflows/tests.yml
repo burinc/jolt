@@ -159,10 +159,16 @@ jobs:
       # Use PowerShell so JOLT_PWD retains its native drive-rooted spelling.
       # The MSYS shell can translate it before the runtime sees the value,
       # which would make this regression check vacuous.
-      - name: Resolve from a native absolute project directory
+      - name: Resolve a fixture from a native absolute project directory
         shell: powershell
         run: |
-          $env:JOLT_PWD = (Resolve-Path '.').Path
+          $project = Join-Path $env:RUNNER_TEMP 'absolute-path-project'
+          $marker = Join-Path $project 'marker-src'
+          New-Item -ItemType Directory -Force -Path $marker | Out-Null
+          Set-Content -NoNewline -Encoding ascii `
+            -Path (Join-Path $project 'deps.edn') `
+            -Value '{:paths ["marker-src"]}'
+          $env:JOLT_PWD = (Resolve-Path $project).Path
           if ($env:JOLT_PWD -notmatch '^[A-Za-z]:[\\/]') {
             throw "expected a drive-absolute JOLT_PWD, got: $env:JOLT_PWD"
           }
@@ -170,8 +176,8 @@ jobs:
           $resolved = (& $scheme --script host\chez\cli.ss -Spath 2>&1 | Out-String)
           Write-Host $resolved
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (-not $resolved.Contains('jolt-core')) {
-            throw "resolved path did not contain the project's jolt-core root"
+          if (-not $resolved.Contains('marker-src')) {
+            throw "resolved path did not contain the fixture's declared marker root"
           }
           $probe = '(let [u (System/getProperty "user.dir") p "\\rooted.txt" f (java.io.File. p)] (and (false? (.isAbsolute f)) (= (str (subs u 0 2) p) (.getAbsolutePath f))))'
           $rooted = (& $scheme --script host\chez\cli.ss -e $probe 2>&1 | Out-String).Trim()
