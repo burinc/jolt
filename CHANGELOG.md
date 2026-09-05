@@ -47,27 +47,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A jolt binary no longer needs Homebrew's lz4 to start (macOS).** lz4 is the
-  Chez kernel's fasl compressor, so every binary — jolt itself and anything
-  `jolt build` produces — links it. The macOS link line took it from
+- **A jolt binary carries its own lz4 and zlib, and needs neither at runtime.**
+  They are the Chez kernel's fasl compressors, so every binary — jolt itself and
+  anything `jolt build` produces — links them. The macOS link line took lz4 from
   `$(brew --prefix lz4)/lib`, and a directory holding both a `.dylib` and a `.a`
   gives `-llz4` the dylib, so the released binary demanded
   `/opt/homebrew/opt/lz4/lib/liblz4.1.dylib` off every machine that ran it: on a
   Mac that never ran `brew install lz4` — which is most of them — `curl … | bash`
   died in the install script's own `jolt --version` check with a dyld error.
-  Both platforms now name the static `liblz4.a` that Chez installs next to
-  `libkernel.a`, which is what forces the static choice (Apple's ld has no
+  Every link now names the static `liblz4.a` and `libz.a` that Chez installs next
+  to `libkernel.a`, which is what forces the static choice (Apple's ld has no
   `-Bstatic`); on macOS the brew keg and pkg-config stay as fallbacks for a Chez
-  that installed without one. Linux already resolved that same archive, but
+  that installed without one. Linux already resolved those same archives, but
   through `-L` and search order rather than by name, so a Chez installed without
-  it silently produced a binary with a runtime lz4 dependency; that case now
-  warns. The self-contained jolt carries that archive alongside the Chez kernel
-  it already bundles, so the one link it performs itself — the relink that bakes
-  a `:jolt/native` `:static` archive into an app — takes lz4 from the bundle
-  rather than from the machine the app happens to be built on, and the app it
-  writes has no lz4 dependency either. The release workflow asserts the binary it
-  built needs no library a stock machine lacks, and the install script names the
-  missing library when one fails to load.
+  them silently produced a binary with runtime compression dependencies; that
+  case now warns. The self-contained jolt carries both archives alongside the
+  Chez kernel it already bundles, so the one link it performs itself — the relink
+  that bakes a `:jolt/native` `:static` archive into an app — takes them from the
+  bundle rather than from the machine the app happens to be built on. A built app
+  carries no compression dependency at all: on Linux the smoke's apps come out
+  needing libc and libm and nothing else. The release workflow asserts the binary it built needs no
+  library a stock machine lacks, and the install script names the missing library
+  when one fails to load.
+
+- **A built binary no longer exports the compression symbols it baked in
+  (Linux).** `-rdynamic` puts the executable's symbols in the dynamic table, and
+  the executable is searched before any `dlopen`'d library, so a baked-in
+  `deflate` or `LZ4_decompress_safe` was answering for an FFI-loaded libpng,
+  libssl or libsqlite3 instead of the zlib each was built against. `liblz4.a` and
+  `libz.a` join ncurses on the `--exclude-libs` list, which already existed for
+  the same reason. A `:jolt/native`'s own symbols are still exported, so
+  `(load-shared-object #f)` resolution is unchanged.
 
 - **`java.lang.ThreadLocal` is per-thread again, and the class exists.** The
   value lived in a Chez thread parameter, which a forked thread inherits, so a

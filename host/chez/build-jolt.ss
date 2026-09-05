@@ -167,8 +167,8 @@
     (for-each
       (lambda (spec)
         ;; A zero length means the file was absent at jolt-build time — only the
-        ;; lz4 archive can be — so register nothing and let the reader's #f
-        ;; branch handle it. Every other bundle here is always non-empty.
+        ;; compression archives can be — so register nothing and let the reader's
+        ;; #f branch handle it. Every other bundle here is always non-empty.
         (let ((len (sa-foreign-ref 'unsigned-int (sa-foreign-entry-address (caddr spec)) 0)))
           (when (> len 0)
             (let ((bv (make-bytevector len)))
@@ -180,6 +180,7 @@
         (\"csv/scheme.h\" \"jolt_scheme_h\" \"jolt_scheme_h_len\")
         (\"csv/libkernel.a\" \"jolt_libkernel_a\" \"jolt_libkernel_a_len\")
         (\"csv/liblz4.a\" \"jolt_liblz4_a\" \"jolt_liblz4_a_len\")
+        (\"csv/libz.a\" \"jolt_libz_a\" \"jolt_libz_a_len\")
         (\"stub/launcher.c\" \"jolt_launcher_c\" \"jolt_launcher_c_len\")))))
 
 (suppress-greeting #t)
@@ -650,7 +651,7 @@
 ;; The same header for a file that is not there: main.c's #include and the symbol
 ;; still have to exist, and a zero length is how jolt-materialize-bundles! tells
 ;; an absent bundle from a real one (it registers nothing, so the reader sees #f
-;; and falls back). Only the lz4 archive is ever optional.
+;; and falls back). Only the compression archives are ever optional.
 (define (jb-empty-c-array h name)
   (let ((p (open-output-file h 'replace)))
     (put-string p (string-append
@@ -669,18 +670,24 @@
 ;; stub, so it relinks (build.ss bld-relink-stub). Needs the system cc at build.
 (jb-c-array (string-append (bld-csv-dir) "/scheme.h") (string-append jb-build "/schemeh_data.h") "jolt_scheme_h")
 (jb-c-array (string-append (bld-csv-dir) "/libkernel.a") (string-append jb-build "/libkernel_data.h") "jolt_libkernel_a")
-;; ...and the static liblz4.a that kernel was built against. That relink is the
-;; one link the distributed jolt performs, and it runs where there is no Chez
-;; install to take an archive from — without this it resolves lz4 off the user's
-;; machine, so an app with a :static native would carry a runtime lz4 dependency
-;; that no other `jolt build` output has. The archive is a couple of hundred KB
-;; next to a ~27M binary.
-(let ((lz4 (bld-lz4-archive)))
-  (if lz4
-      (jb-c-array lz4 (string-append jb-build "/lz4_data.h") "jolt_liblz4_a")
-      ;; Nothing to embed: this jolt was built against a Chez with no archive
-      ;; (bld-link-libs warned then), and the relink degrades to -llz4 as before.
-      (jb-empty-c-array (string-append jb-build "/lz4_data.h") "jolt_liblz4_a")))
+;; ...and the static liblz4.a / libz.a that kernel was built against. That relink
+;; is the one link the distributed jolt performs, and it runs where there is no
+;; Chez install to take an archive from — without these it resolves lz4 and zlib
+;; off the user's machine, so an app with a :static native would carry runtime
+;; compression dependencies that no other `jolt build` output has. Together they
+;; are ~300K on a ~27M binary.
+(for-each
+  (lambda (lib)
+    (let ((archive (bld-static-archive lib))
+          (header (string-append jb-build "/" lib "_data.h"))
+          (sym (string-append "jolt_lib" lib "_a")))
+      (if archive
+          (jb-c-array archive header sym)
+          ;; Nothing to embed: this jolt was built against a Chez with no such
+          ;; archive (bld-link-libs warned then), and the relink degrades to -l
+          ;; as before.
+          (jb-empty-c-array header sym))))
+  '("lz4" "z"))
 (jb-c-array "host/chez/stub/launcher.c" (string-append jb-build "/launcherc_data.h") "jolt_launcher_c")
 ;; The embedded stdlib fasl blob (one concatenated .so per install-owned ns).
 ;; jb-emit-stdlib-fasls! wrote it during flat.ss emission; it is absent only when
@@ -702,6 +709,7 @@
       "#include \"schemeh_data.h\"\n"
       "#include \"libkernel_data.h\"\n"
       "#include \"lz4_data.h\"\n"
+      "#include \"z_data.h\"\n"
       "#include \"launcherc_data.h\"\n"
       "#include \"stdlib_fasls_data.h\"\n"
       "int main(int argc, char *argv[]) {\n"

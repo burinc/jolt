@@ -317,10 +317,10 @@ jobs:
           echo "exit=$?"
 
       # The prebuilt's whole promise is that it runs with nothing else installed,
-      # and lz4 (the Chez kernel's fasl compressor) is not a system library on
-      # either platform. The macOS binary shipped demanding
-      # /opt/homebrew/opt/lz4/lib/liblz4.1.dylib, which is present only on a Mac
-      # whose owner ran `brew install lz4`: the install script's own
+      # and the Chez kernel's compressors (lz4, zlib) are jolt's to bake in --
+      # lz4 is not a system library on either platform. The macOS binary shipped
+      # demanding /opt/homebrew/opt/lz4/lib/liblz4.1.dylib, which is present only
+      # on a Mac whose owner ran `brew install lz4`: the install script's own
       # `jolt --version` check died with a dyld error for everyone else, and
       # nothing in this workflow noticed. Now it would.
       - name: Assert the binary needs no library the target machine may not have
@@ -335,9 +335,10 @@ jobs:
           else
             readelf -d "$bin" | grep NEEDED || true
             # ncurses/tinfo/uuid are the Linux build's own story (STATIC_DEPS,
-            # and libuuid on top of glibc); lz4 is the one asserted here.
+            # and libuuid on top of glibc); the compression libraries are the
+            # ones jolt bakes in itself, on every platform, so assert those.
             bad="$(readelf -d "$bin" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' \
-                   | grep -i lz4 || true)"
+                   | grep -Ei 'lz4|libz\.' || true)"
           fi
           if [ -n "$bad" ]; then
             echo "::error::$bin needs libraries that are not on a stock machine:"
