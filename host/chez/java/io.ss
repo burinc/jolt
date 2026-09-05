@@ -251,21 +251,31 @@
   (or (and (char>=? c #\A) (char<=? c #\Z))
       (and (char>=? c #\a) (char<=? c #\z))))
 
+(define (windows-drive-prefix? p)
+  (and (>= (string-length p) 2)
+       (ascii-drive-letter? (string-ref p 0))
+       (char=? (string-ref p 1) #\:)))
+
+(define (windows-root-relative? p)
+  (and (eq? (sa-os-family) 'windows)
+       (> (string-length p) 0)
+       (path-separator-char? (string-ref p 0))
+       (or (= (string-length p) 1)
+           (not (path-separator-char? (string-ref p 1))))))
+
 ;; java.io.File.isAbsolute is host-platform-specific. POSIX has one absolute
 ;; prefix (/). Windows has drive-rooted paths (C:\x or C:/x) and UNC paths
 ;; (\\server\share); drive-relative C:x and current-drive-rooted \x are not
-;; absolute in the JVM sense. Keep absolute recognition shared with filesystem
-;; resolution and getAbsolutePath so introspection/build commands cannot
-;; disagree about drive-rooted or UNC inputs. This deliberately does not claim
-;; full emulation of Windows' two special *relative* forms (`C:child` uses that
-;; drive's process-local current directory and `\child` uses the current drive);
-;; their resolution remains an older File-shim compatibility gap.
+;; absolute in the JVM sense. Drive-rooted and UNC recognition is shared by
+;; filesystem resolution, getAbsolutePath, and isAbsolute. The rooted-but-
+;; relative case is resolved separately by project-relative below. `C:child`
+;; still depends on Windows' process-local current directory for that drive and
+;; remains an older File-shim compatibility gap.
 (define (jfile-path-absolute? p)
   (let ((n (string-length p)))
     (if (eq? (sa-os-family) 'windows)
         (or (and (>= n 3)
-                 (ascii-drive-letter? (string-ref p 0))
-                 (char=? (string-ref p 1) #\:)
+                 (windows-drive-prefix? p)
                  (path-separator-char? (string-ref p 2)))
             (and (>= n 2)
                  (path-separator-char? (string-ref p 0))
@@ -273,12 +283,22 @@
         (and (> n 0) (char=? (string-ref p 0) #\/)))))
 
 (define (project-relative p)
-  (if (or (= (string-length p) 0) (jfile-path-absolute? p))
-      p
-      (let ((base (jolt-user-dir)))
-        ;; "." adds nothing the OS won't do itself when it resolves a relative
-        ;; path — leave it alone rather than prefixing "./".
-        (if (string=? base ".") p (string-append base "/" p)))))
+  (cond
+    ((or (= (string-length p) 0) (jfile-path-absolute? p)) p)
+    ;; A single leading separator is rooted on the current drive but is not an
+    ;; absolute File pathname on Windows. The JVM resolves it against user.dir's
+    ;; drive; the process cwd is Jolt's source tree, so leaving it to the OS can
+    ;; select the wrong drive after the launcher changes directory.
+    ((windows-root-relative? p)
+     (let ((base (jolt-user-dir)))
+       (if (windows-drive-prefix? base)
+           (string-append (substring base 0 2) p)
+           (string-append base p))))
+    (else
+     (let ((base (jolt-user-dir)))
+       ;; "." adds nothing the OS won't do itself when it resolves a relative
+       ;; path — leave it alone rather than prefixing "./".
+       (if (string=? base ".") p (string-append base "/" p))))))
 
 ;; (io/file path) / (io/file parent child) — join children with "/". The File
 ;; keeps the path AS GIVEN (like the JVM: new File("rel").getPath() is "rel");

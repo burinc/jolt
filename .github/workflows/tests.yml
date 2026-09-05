@@ -155,3 +155,28 @@ jobs:
 
       - name: Gate native dependency paths
         run: make CHEZ=./chez-install/bin/chez depsunit
+
+      # Use PowerShell so JOLT_PWD retains its native drive-rooted spelling.
+      # The MSYS shell can translate it before the runtime sees the value,
+      # which would make this regression check vacuous.
+      - name: Resolve from a native absolute project directory
+        shell: powershell
+        run: |
+          $env:JOLT_PWD = (Resolve-Path '.').Path
+          if ($env:JOLT_PWD -notmatch '^[A-Za-z]:[\\/]') {
+            throw "expected a drive-absolute JOLT_PWD, got: $env:JOLT_PWD"
+          }
+          $scheme = Join-Path $env:GITHUB_WORKSPACE 'chez-install\bin\scheme.exe'
+          $resolved = (& $scheme --script host\chez\cli.ss -Spath 2>&1 | Out-String)
+          Write-Host $resolved
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not $resolved.Contains('jolt-core')) {
+            throw "resolved path did not contain the project's jolt-core root"
+          }
+          $probe = '(let [u (System/getProperty "user.dir") p "\\rooted.txt" f (java.io.File. p)] (and (false? (.isAbsolute f)) (= (str (subs u 0 2) p) (.getAbsolutePath f))))'
+          $rooted = (& $scheme --script host\chez\cli.ss -e $probe 2>&1 | Out-String).Trim()
+          Write-Host $rooted
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($rooted -ne 'true') {
+            throw "current-drive-rooted File resolution did not match user.dir's drive"
+          }
