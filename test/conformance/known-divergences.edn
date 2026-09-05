@@ -32,7 +32,7 @@
   :deps-model
   "jolt resolves deps.edn itself (grenadine, no JVM toolchain) and jolt IS Clojure, so a host-supplied coordinate is TERMINAL: it contributes neither an artifact nor children. Not a superset — the JVM's org.clojure/clojure carries dependencies of its own, and those do not arrive here.",
   :type-hint-model
-  "jolt reads a type hint as a compile-time contract wherever it can act on one. ^int is the visible case: reference Clojure supports only long and double primitive parameters, so ^int on a parameter is inert documentation there, while jolt — which has no 32-bit integer, an int and a long being the same value — treats it as the fixnum promise ^long is and coerces at entry. The coercion is RT.longCast(Object): it accepts any 64-bit integer and refuses a value that was never an integer. So the two agree on every int, and disagree exactly where the JVM was silently carrying a non-integer through a parameter it had been told was an int.",
+  "jolt reads a type hint as a compile-time contract wherever it can act on one, which is what makes a hint worth writing: it is what turns a generic call into a specialized one. ^int is the visible case. Reference Clojure has long and double primitive parameters and nothing else, and REFUSES any other primitive hint on one (\"Only long and double primitives are supported\"), so an ^int-hinted fn does not compile there at all. jolt — which has no 32-bit integer, an int and a long being the same value — accepts it as the fixnum promise ^long already is and coerces at entry through RT.longCast(Object)'s rule. A deliberate superset in the direction that matters: ported JVM code written in ^int indices compiles here and takes the fx path. The coercion refuses a value that was never an integer, so a char or a nil reaches a cast error at the boundary rather than travelling on untyped.",
   :reflection-member-model
   "Class reflection (getMethods / getDeclaredFields / getMethod …) answers from jolt's registries — the protocol/type registry, the host shim tables, class-statics — not from JVM class files, which jolt does not have. A member in none of them is absent rather than guessed at; every parameter type is Object and getMethod selects by parameter count, since jolt carries no signatures. Substrate-inherent; the per-registry model is pinned jolt-side in unit.edn (reflect-member-model)."},
  :documented
@@ -56,20 +56,24 @@
   ;; arrive unverified. Rendering is pr-str for a value, "throws <SimpleName>" for
   ;; a raise (the ROOT cause's simple name). :jvm/:jolt outside :check are prose
   ;; for a reader; the :check pair is what the gate holds to.
-  ;; ^int on a parameter. Reference Clojure supports long and double primitive
-  ;; parameters only, so ^int there is an inert tag and the value passes through
-  ;; untouched — including a value that is not an integer at all. jolt honours it as
-  ;; the fixnum hint ^long is (there is no 32-bit integer here; an int and a long are
-  ;; the same value), which lights up ported JVM code written in ^int indices, and
-  ;; coerces at entry through RT.longCast(Object). Every actual integer agrees; a
-  ;; char, nil or non-number is refused here and carried there.
+  ;; ^int on a parameter. Reference Clojure has long and double primitive
+  ;; parameters and nothing else, and refuses any other primitive hint on one
+  ;; outright — the fn does not compile there, whatever it is called with. jolt
+  ;; accepts it as the fixnum promise ^long already is (there is no 32-bit integer
+  ;; here; an int and a long are the same value), which is what lets ported JVM
+  ;; code written in ^int indices compile and take the fx path. Deliberate: the
+  ;; point of a hint is that the compiler acts on it.
+  ;;
+  ;; The entry coercion follows RT.longCast(Object): every actual integer passes,
+  ;; and a value that was never an integer is refused at the boundary — \\a is a
+  ;; ClassCastException, nil an NPE — rather than travelling on untyped.
   {:category :type-hint-model
-   :behavior "((fn [^int x] x) \\a)"
-   :jvm "\\a — the tag is inert, so a Character passes through an ^int parameter"
-   :jolt "throws ClassCastException — the entry coercion refuses a non-number"
-   :check {:expr "((fn [^int x] x) \\a)"
-           :jvm "\\a"
-           :jolt "throws ClassCastException"}
+   :behavior "(fn [^int x] x)"
+   :jvm "throws IllegalArgumentException — only long and double primitive parameters exist"
+   :jolt "compiles; ^int is the fixnum promise ^long is, coerced at entry"
+   :check {:expr "((fn [^int x] x) 5)"
+           :jvm "throws IllegalArgumentException"
+           :jolt "5"}
    :note "^long has always behaved this way; ^int now joins it. Arithmetic over an ^int parameter takes the fx path instead of the generic ops."}
   ;; (NumberFormat/getCurrencyInstance) with no argument resolves the JVM's DEFAULT
   ;; locale, which is a property of the machine — en_CA gives "$123.45", en_US
