@@ -5,7 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.2] - 2026-09-05
+
+Errors say what went wrong, where, and can be caught. A compile error is a framed
+diagnostic now — a kind you can grep and key tooling on, the offending line with a
+caret under the form that failed, and the name of the macro that generated the
+code when the code was generated — and it is a real throwable rather than a Scheme
+string, so a program can handle its own errors. `JOLT_DIAG=edn` emits the same
+diagnostic as one line of EDN for an editor. Read errors join it, and a read that
+fails while a program runs keeps its backtrace and reports the position of the
+code that called it.
+
+The other half is that type hints reach codegen. jolt has always parsed a broad
+Java-type-hint vocabulary; only three narrow bridges carried it into emission, and
+everything else was parsed and discarded. A hint now specializes the code that
+comes out.
+
+**`recur` outside tail position no longer compiles.** It never should have: the
+enclosing expression was silently discarded, so `(loop [i 0] (+ 1 (recur (inc i))))`
+looped forever and never applied the `(+ 1 …)`. The reference refuses it and so
+does jolt now. Code that relied on the old behaviour was not doing what it read
+as, but it did compile — **`jolt-lang/http-client` before `v0.0.7` is the case in
+point** and needs its pin bumped, along with `jolt-lang/glimmer-uikit` before
+`v0.1.1`, which had been writing a callback pointer past the end of its allocation
+since the `ffi/write` argument order changed in 0.8.0.
 
 ### Added
 
