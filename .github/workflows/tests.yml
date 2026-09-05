@@ -180,7 +180,9 @@ jobs:
             throw "resolved path did not contain the fixture's declared marker root"
           }
           $env:JOLT_EXPECTED_ROOTED = $env:JOLT_PWD.Substring(0, 2) + '\rooted.txt'
-          $probe = '(let [p "\\rooted.txt" f (java.io.File. p)] (and (false? (.isAbsolute f)) (= (System/getenv "JOLT_EXPECTED_ROOTED") (.getAbsolutePath f))))'
+          # Avoid string literals in the native `-e` argument: Windows
+          # PowerShell 5.1 removes their quotes while constructing argv.
+          $probe = '(let [p (str (char 92) (name (quote rooted.txt))) f (java.io.File. p)] (and (false? (.isAbsolute f)) (= (System/getenv (name (quote JOLT_EXPECTED_ROOTED))) (.getAbsolutePath f))))'
           $rooted = (& $scheme --script host\chez\cli.ss -e $probe 2>&1 | Out-String).Trim()
           Write-Host $rooted
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
