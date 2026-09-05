@@ -249,8 +249,75 @@
               (error 'jolt-build (string-append "target pack file missing: " p hint)))))
         '("xpatch" "link-libs")))))
 
-;; Link flags. macOS Homebrew layout for the kernel's lz4/zlib/ncurses deps. The
-;; host branches double as the target flags for a non-cross build (host = target).
+;; The kernel's lz4, as an absolute path to a STATIC archive, or #f when none is
+;; reachable. Chez compiles its bundled lz4 as part of its own build and installs
+;; liblz4.a next to libkernel.a, so the archive matching the kernel this link
+;; bakes in is normally already in the csv dir — on every platform, Homebrew's
+;; chezscheme included (it vendors lz4 too; it does not depend on the lz4
+;; formula). The keg and pkg-config are macOS fallbacks for a Chez that somehow
+;; installed without it.
+;;
+;; Naming the archive by path is what forces the static choice: Apple's ld has no
+;; -Bstatic, and a bare -llz4 pointed at a directory holding both a .dylib and a
+;; .a always takes the .dylib. That is how the released macOS binary came to
+;; demand /opt/homebrew/opt/lz4/lib/liblz4.1.dylib off every machine that ran it
+;; — the install script's own `jolt --version` check died with a dyld error on a
+;; Mac with no Homebrew lz4, which is most of them. lz4 is not a system library
+;; on either platform, so it has to be baked in: a jolt binary is meant to run
+;; with nothing else installed.
+(define (bld-lz4-archive)
+  (let loop ((thunks
+               (cons
+                 ;; The csv dir the kernel itself comes from. (bld-csv-dir), not
+                 ;; bld-host-csv-dir, for the reason the Linux branch gives below
+                 ;; — though a cross build never reaches here (the pack supplies
+                 ;; its own static lz4 under lib/).
+                 (lambda () (string-append (bld-csv-dir) "/liblz4.a"))
+                 ;; macOS only. A distro's static liblz4.a is deliberately NOT
+                 ;; searched on Linux: it may well be non-PIC, which would turn
+                 ;; today's working `jolt build --library` into a link error
+                 ;; ("recompile with -fPIC"). Chez's own archive is built
+                 ;; alongside libkernel.a, which that link already folds into a
+                 ;; shared object, so it carries the same guarantee. Darwin
+                 ;; compiles PIC throughout, so neither fallback has the problem.
+                 (if bld-osx?
+                     (list
+                       (lambda ()
+                         (let ((prefix (bld-sh-capture "brew --prefix lz4 2>/dev/null")))
+                           (and (> (string-length prefix) 0)
+                                (string-append prefix "/lib/liblz4.a"))))
+                       (lambda ()
+                         (let ((libdir (bld-sh-capture "pkg-config --variable=libdir liblz4 2>/dev/null")))
+                           (and (> (string-length libdir) 0)
+                                (string-append libdir "/liblz4.a")))))
+                     '()))))
+    (if (null? thunks)
+        #f
+        (let ((path ((car thunks))))
+          (if (and path (file-exists? path)) path (loop (cdr thunks)))))))
+
+;; No archive anywhere: the link still has to find SOMETHING, and a binary that
+;; needs a dylib beats one that does not link at all. Say so — the result runs
+;; here and nowhere else, which is not what a `jolt build` output is for.
+(define (bld-warn-dynamic-lz4!)
+  (display "jolt build: warning: no static liblz4.a found next to the Chez kernel\n")
+  (display "  — linking lz4 dynamically; the binary will need it on every machine that runs it\n"))
+
+;; The macOS -llz4 fallback: the keg (or pkg-config) at least tells the linker
+;; where the dylib is, which a bare -llz4 on a Mac with no lz4 in /usr/lib cannot.
+(define (bld-osx-lz4-dynamic)
+  (bld-warn-dynamic-lz4!)
+  (let ((prefix (bld-sh-capture "brew --prefix lz4 2>/dev/null")))
+    (if (> (string-length prefix) 0)
+        (string-append "-L" (bld-sh-quote (string-append prefix "/lib")) " -llz4")
+        (let ((pc (bld-sh-capture "pkg-config --libs-only-L liblz4 2>/dev/null")))
+          (if (> (string-length pc) 0)
+              (string-append pc " -llz4")
+              "-llz4")))))
+
+;; Link flags. The kernel's lz4/zlib/ncurses deps, lz4 statically (see above).
+;; The host branches double as the target flags for a non-cross build
+;; (host = target).
 (define (bld-link-libs)
   (cond
     ;; cross: the static lz4/zlib live in the pack (lib/), and the pack's
@@ -261,17 +328,12 @@
      (or (getenv "JOLT_TARGET_LINK_LIBS")
          (string-append "-L" (bld-sh-quote (string-append (bld-target-pack) "/lib")) " "
            (bld-sh-capture (string-append "cat " (bld-sh-quote (string-append (bld-target-pack) "/link-libs")))))))
+    ;; macOS: libz, libncurses, libiconv and Foundation ship with the OS, so they
+    ;; stay dynamic; lz4 does not, so it is named as an archive and baked in.
     (bld-osx?
-     (let ((lz4 (bld-sh-capture "brew --prefix lz4 2>/dev/null")))
-       (if (> (string-length lz4) 0)
-           (string-append "-L" lz4 "/lib -llz4 -lz -lncurses -framework Foundation -liconv -lm")
-           (let ((pc (bld-sh-capture "pkg-config --libs-only-L liblz4 2>/dev/null")))
-             (if (> (string-length pc) 0)
-                 (string-append pc " -llz4 -lz -lncurses -framework Foundation -liconv -lm")
-                 (begin
-                   (display "jolt build: warning: lz4 library path not found via brew or pkg-config")
-                   (display " — linker may not find -llz4\n")
-                   "-llz4 -lz -lncurses -framework Foundation -liconv -lm"))))))
+     (let ((lz4 (bld-lz4-archive)))
+       (string-append (if lz4 (bld-sh-quote lz4) (bld-osx-lz4-dynamic))
+         " -lz -lncurses -framework Foundation -liconv -lm")))
     ;; Windows (ta6nt, MinGW-w64 under MSYS2): the Chez kernel pulls in
     ;; compression, winsock, COM/UUID, and the registry.
     (bld-nt?
@@ -301,7 +363,17 @@
        ;; place, which for a cross build is the TARGET pack, not this host.
        "-L" (bld-sh-quote (bld-csv-dir)) " "
        "-Wl,--exclude-libs,libncurses.a:libncursesw.a:libtinfo.a "
-       "-llz4 -lz -lncurses -ltinfo -ldl -lm -lpthread -luuid -lrt"))))
+       ;; lz4 by archive path rather than -llz4: the -L above already preferred
+       ;; the csv archive over any system liblz4.so, but only as a side effect of
+       ;; search order, so a Chez installed without it silently produced a binary
+       ;; with a runtime lz4 dependency. Naming it says so, and its absence is
+       ;; now a warning rather than silence. Falls back to -llz4 (the -L above,
+       ;; then LIBRARY_PATH, then the system dirs) when there is no archive.
+       (let ((lz4 (bld-lz4-archive)))
+         (if lz4
+             (string-append (bld-sh-quote lz4) " ")
+             (begin (bld-warn-dynamic-lz4!) "-llz4 ")))
+       "-lz -lncurses -ltinfo -ldl -lm -lpthread -luuid -lrt"))))
 
 ;; --- optional built-binary startup profile ----------------------------------
 ;; JOLT_STARTUP_PROFILE=1 reports wall time, process CPU, collections,
