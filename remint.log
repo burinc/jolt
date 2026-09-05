@@ -1,0 +1,13 @@
+re-minted seed (converged after 3 pass(es))
+REMINT=0
+/opt/homebrew/bin/chez --script host/gambit/gen-seed.ss
+gen-seed: backend target -> :gambit
+gen-seed: prelude #3% occurrences: 0 (all inside string data, none as op uses)
+gen-seed: image #3% occurrences: 1 (all inside string data, none as op uses)
+gen-seed: prelude grep-verified (no #3% / (foreign-procedure op uses)
+gen-seed: image  grep-verified (no #3% / (foreign-procedure op uses)
+gen-seed: wrote host/gambit/seed/prelude.ss (1998755 bytes)
+gen-seed: wrote host/gambit/seed/image.ss (1188994 bytes)
+mint: 0 form(s) skipped
+gen-seed: gambit seed minted on Chez
+GAMBIT=0
