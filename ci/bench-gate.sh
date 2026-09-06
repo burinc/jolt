@@ -4,7 +4,7 @@
 #   ci/bench-gate.sh <baseline-jolt> <candidate-jolt> [max-ratio] [bench...]
 #
 # Naming benches runs only those — how a flagged row gets re-checked on its own,
-# and how this script is exercised without paying for all 22.
+# and how this script is exercised without paying for the whole suite.
 #
 # Both compilers build the SAME bench sources (this checkout's), so what is being
 # compared is codegen, not the benchmarks. Every measurement is a RATIO between
