@@ -5,21 +5,104 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.3] - 2026-09-06
+
+A primitive array holds its elements unboxed, and a type hint costs nothing it
+did not buy. `^longs`/`^ints`/`^bytes` arrays move onto backings that know what
+they hold, so a byte array is 8x smaller, the collector stops walking a large
+numeric one, and every raw-byte crossing is a block move. Separately, declaring
+a `^double`/`^long` return made a function's inlined copies about half as fast as
+leaving it undeclared — type inference stopped at the coercion the inliner wraps
+them in and annotated nothing inside.
+
+### Performance
+
+- **`^longs`, `^ints` and `^bytes` arrays hold their elements unboxed.** A jolt
+  array is a Chez vector plus an element-kind tag, and only `double`/`float`
+  arrays had a backing that knew what it held (an flvector). Now `int`, `long`
+  and `short` arrays are backed by an **fxvector** and `byte` arrays by a
+  **bytevector**:
+
+  - a `byte-array` is 8x smaller — one byte per element rather than one machine
+    word — so a megabyte of bytes read off a stream costs a megabyte;
+  - the collector walks neither an fxvector nor a bytevector, so a large numeric
+    array stops being traced work on every collection: a major collection with a
+    live 20-million-element `long-array` costs 0.19ms where the boxed vector cost
+    29ms, and a `byte-array` of the same length 0.67ms. An `object-array` of the
+    same length is the control and is unchanged at ~40ms;
+  - the raw-byte seam is now a block move rather than an element loop with a
+    sign fold per byte. `(.getBytes s)`, `(String. bytes)`, `InputStream/read`
+    into a buffer, `readNBytes`, `ByteBuffer` bulk `get`/`put`, `slice`,
+    `SecureRandom/nextBytes`, `jolt.ffi/read-into!` / `write-array` and
+    `System/arraycopy` between two byte arrays all reach `bytevector-copy!`.
+    A 1MB `System/arraycopy` between two byte arrays went from 11.4ms to 0.02ms,
+    2000 8KB `InputStream/read`s into a buffer from 169ms to 11ms, and 2000
+    `(String. (.getBytes s))` round trips over a 5KB string from 104ms to 26ms.
+
+  What it costs: a hinted `(aget ^longs a i)` pays one tag test asking which
+  backing it is holding — 4.94ns to 5.36ns per read over 40M reads. `^objects`
+  pays that plus its new bounds pre-check (below), 4.94ns to 5.83ns. `^doubles`
+  asks nothing and is unchanged at 3.52ns: its flvector is a promise that kind
+  can keep. End to end, `bench/arrays` — which is nothing but hinted array reads
+  and writes — is 1.10x slower (538ms to 592ms), of which the pre-check is 0.03
+  and the tag test the rest; `bench/arrays-unhinted` is unchanged.
+
+  Nothing changes at the jolt level. jolt's integers promote to bignums past
+  Chez's 2^60 fixnum ceiling — that is the numeric model, not an array rule — so
+  an `int`/`long`/`short` array handed a value an fxvector cannot hold widens its
+  own backing once and goes on behaving exactly as it did:
+
+  ```clojure
+  (let [a (long-array 3)]
+    (aset a 0 Long/MAX_VALUE)   ; past the fixnum range: the array widens
+    (aget a 0))                 ; => 9223372036854775807
+  ```
+
+  Every accessor dispatches on the backing rather than on the element kind, so a
+  widened array — and an array restored from an image written before this
+  change — reads and writes through the same path.
+
+- **Declaring a return type made a function's inlined copies about half as
+  fast.** The inline pass wraps a spliced body in a `:coerce` node to preserve
+  the `^double`/`^long` return coercion the callee's own arity would have
+  applied, and the type pass had no arm for `:coerce` — so it answered `:any`
+  and handed the node back **unwalked**. Nothing inside an inlined copy of a
+  return-hinted fn was annotated: record field reads fell back from a direct
+  slot read to `jolt-get`, and arithmetic from the fl ops to the generic ones.
+  `bench/typed-records` went from 23.1ms to 10.7ms, against an unhinted twin
+  that measures 19.7ms and 20.0ms — so the hint went from 1.17x SLOWER than no
+  hint to 1.87x faster. The fallback walks its children now whatever the op, so
+  `(set! x expr)`, a field assignment's value and a constructor's arguments —
+  all of which land there today — are annotated too.
 
 ### Changed
 
-- Confined FFI arenas avoid the shared-arena compare-and-swap LOOP on their
+- Confined FFI arenas skip the shared-arena compare-and-swap LOOP on their
   owner-only attach and close paths, publishing with one compare-and-set!
-  instead. Empty and single-allocation lexical arenas also skip cleanup work
-  they do not need, without changing arena lifetime or release-order semantics.
+  instead, and an empty or single-allocation lexical arena skips cleanup work
+  it does not need. Arena lifetime, ownership and release order are unchanged.
 
 ### Fixed
 
-- A confined FFI arena shared between fibers on one carrier no longer loses
-  allocations. Fibers share their carrier's thread id, so they all pass the
-  arena's owner check; the attach and close paths publish atomically rather
-  than assuming one mutator.
+- **`java.util.Arrays/copyOf` padded with `0`, whatever the array held.** A
+  reference array's spare tail came back `0` rather than `nil`, a `char[]`'s `0`
+  rather than `\u0000`, a `boolean[]`'s `0` rather than `false` — so
+  `(vec (Arrays/copyOf (object-array [1]) 3))` read `[1 0 0]` where the JVM says
+  `[1 nil nil]`. The pad is the element kind's own zero now, which is the same
+  value the array's constructor fills with. `copyOfRange` had it too.
+
+- **An out-of-bounds `(aget ^longs a i)` raised the wrong exception class.** The
+  hinted read skips the generic path's bounds pre-check and lets the backing's
+  own range check raise, and that condition was classified as a bare
+  `IndexOutOfBoundsException` — so a `catch ArrayIndexOutOfBoundsException`
+  around it never matched, where it does on the JVM and does for the same read
+  through untyped `aget`. Every hinted read and write answers the array
+  exception now. `^longs`, `^ints`, `^bytes` and `^doubles` get it from their
+  own backing's condition; `^objects` cannot — a plain Chez vector is what the
+  runtime uses for everything, so `vector-ref`'s range error carries nothing to
+  tell an array apart by — and pre-checks instead, one fixnum compare on the
+  boxed arm only. A hint must not decide which exception class a program
+  catches.
 
 ## [0.8.2] - 2026-09-05
 
@@ -156,69 +239,7 @@ since the `ffi/write` argument order changed in 0.8.0.
   for one explicitly, as on the JVM. A `:main-opts` form jolt does not take
   says which it does: `-m NS`, `-e EXPR`, `-r`, or a script file.
 
-### Performance
-
-- **`^longs`, `^ints` and `^bytes` arrays hold their elements unboxed.** A jolt
-  array is a Chez vector plus an element-kind tag, and only `double`/`float`
-  arrays had a backing that knew what it held (an flvector). Now `int`, `long`
-  and `short` arrays are backed by an **fxvector** and `byte` arrays by a
-  **bytevector**:
-
-  - a `byte-array` is 8x smaller — one byte per element rather than one machine
-    word — so a megabyte of bytes read off a stream costs a megabyte;
-  - the collector walks neither an fxvector nor a bytevector, so a large numeric
-    array stops being traced work on every collection: a major collection with a
-    live 20-million-element `long-array` costs 0.4ms where the boxed vector cost
-    45ms, and a `byte-array` of the same length 0.06ms;
-  - the raw-byte seam is now a block move rather than an element loop with a
-    sign fold per byte. `(.getBytes s)`, `(String. bytes)`, `InputStream/read`
-    into a buffer, `readNBytes`, `ByteBuffer` bulk `get`/`put`, `slice`,
-    `SecureRandom/nextBytes`, `jolt.ffi/read-into!` / `write-array` and
-    `System/arraycopy` between two byte arrays all reach `bytevector-copy!`.
-    A 1MB `System/arraycopy` between two byte arrays went from 20.8ms to 0.06ms,
-    2000 8KB `InputStream/read`s into a buffer from 238ms to 8ms, and 2000
-    `(String. (.getBytes s))` round trips over a 5KB string from 188ms to 50ms.
-
-  What it costs: a hinted `(aget ^longs a i)` or `(aget ^objects a i)` pays about
-  a nanosecond more per access, for the one tag test that asks which backing it
-  is holding. `^doubles` asks nothing and is unchanged.
-
-  Nothing changes at the jolt level. jolt's integers promote to bignums past
-  Chez's 2^60 fixnum ceiling — that is the numeric model, not an array rule — so
-  an `int`/`long`/`short` array handed a value an fxvector cannot hold widens its
-  own backing once and goes on behaving exactly as it did:
-
-  ```clojure
-  (let [a (long-array 3)]
-    (aset a 0 Long/MAX_VALUE)   ; past the fixnum range: the array widens
-    (aget a 0))                 ; => 9223372036854775807
-  ```
-
-  Every accessor dispatches on the backing rather than on the element kind, so a
-  widened array — and an array restored from an image written before this
-  change — reads and writes through the same path.
-
 ### Fixed
-
-- **`java.util.Arrays/copyOf` padded with `0`, whatever the array held.** A
-  reference array's spare tail came back `0` rather than `nil`, a `char[]`'s `0`
-  rather than `\u0000`, a `boolean[]`'s `0` rather than `false` — so
-  `(vec (Arrays/copyOf (object-array [1]) 3))` read `[1 0 0]` where the JVM says
-  `[1 nil nil]`. The pad is the element kind's own zero now, which is the same
-  value the array's constructor fills with. `copyOfRange` had it too.
-
-- **An out-of-bounds `(aget ^longs a i)` raised the wrong exception class.** The
-  hinted read skips the generic path's bounds pre-check and lets the backing's
-  own range check raise, and that condition was classified as a bare
-  `IndexOutOfBoundsException` — so a `catch ArrayIndexOutOfBoundsException`
-  around it never matched, where it does on the JVM and does for the same read
-  through untyped `aget`. Every hinted read and write answers the array
-  exception now. `^longs`, `^ints`, `^bytes` and `^doubles` get it from their
-  own backing's condition; `^objects` cannot — a plain Chez vector is what the
-  runtime uses for everything, so `vector-ref`'s range error carries nothing to
-  tell an array apart by — and pre-checks instead, one fixnum compare on the
-  boxed arm only. A hint must not decide which exception class a program
-  catches.
 
 - **`recur` across `try` compiled, and leaked.** The reference refuses it; jolt
   compiled it — Chez has no bytecode-size limit to stop it — at about 400 bytes
