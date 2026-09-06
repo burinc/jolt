@@ -534,7 +534,7 @@
 ;; from disk (running from a source checkout). build-jolt embeds every runtime
 ;; .ss the manifest inlines, so `build` never touches the filesystem for them.
 (define (bld-source-string path)
-  (let ((emb (hashtable-ref embedded-resources path #f)))
+  (let ((emb (embedded-resource-ref path)))
     (cond ((string? emb) emb)
           ;; source embeds are UTF-8 bytevectors since the heap-size work —
           ;; missing this arm sent the standalone binary's `build` to disk for
