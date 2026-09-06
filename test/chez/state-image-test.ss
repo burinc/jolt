@@ -168,6 +168,15 @@
 (rtu "byte-array"   "(byte-array [1 2 3])"      "(vec $rt)"  "[1 2 3]")
 (rtu "double-array" "(double-array [1.0 2.5])"  "(vec $rt)"  "[1.0 2.5]")
 (rtu "object-array" "(object-array [1 :a])"     "(vec $rt)"  "[1 :a]")
+;; one per BACKING: a byte array is a bytevector, an int/long array an fxvector,
+;; and a long array that outgrew the fixnum range a boxed vector — each is a
+;; different fasl object, and each has to come back both readable and writable.
+(rtu "int-array"    "(int-array [1 2 3])"       "(do (aset $rt 0 9) (vec $rt))" "[9 2 3]")
+(rtu "long-array"   "(long-array [1 2])"        "(do (aset $rt 1 7) (vec $rt))" "[1 7]")
+(rtu "widened long-array" "(doto (long-array 2) (aset 0 Long/MAX_VALUE))"
+     "(do (aset $rt 1 3) (vec $rt))"                         "[9223372036854775807 3]")
+(rtu "byte-array is writable" "(byte-array 2)"
+     "(do (aset $rt 0 200) (vec $rt))"                       "[-56 0]")
 (rtu "StringBuilder" "(StringBuilder. \"ab\")"
      "(do (.append $rt \"c\") (str $rt))"                    "\"abc\"")
 
