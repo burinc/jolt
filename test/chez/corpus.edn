@@ -74,6 +74,19 @@
   {:suite "interop / Float statics" :label "Float carries the float bounds and specials, not double's" :expected "[true true true true true true true]" :actual "[(Float/isNaN Float/NaN) (Float/isInfinite Float/POSITIVE_INFINITY) (Float/isInfinite Float/NEGATIVE_INFINITY) (pos? Float/POSITIVE_INFINITY) (neg? Float/NEGATIVE_INFINITY) (> Float/MAX_VALUE 3.0E38) (< Float/MAX_VALUE Double/MAX_VALUE)]" :portability :jvm}
   {:suite "interop / Double statics" :label "isNaN / isInfinite / the specials / parseDouble" :expected "[true true false true true 1.5]" :actual "[(Double/isNaN (/ 0.0 0.0)) (Double/isInfinite (/ 1.0 0.0)) (Double/isNaN 1.0) (Double/isNaN Double/NaN) (Double/isInfinite Double/POSITIVE_INFINITY) (Double/parseDouble \"1.5\")]" :portability :jvm}
   {:suite "interop / exception constructors" :label "the common java.lang / java.io exception ctors carry their message" :expected "[\"a\" \"b\" \"c\" \"d\"]" :actual "[(.getMessage (NullPointerException. \"a\")) (.getMessage (IllegalStateException. \"b\")) (.getMessage (IndexOutOfBoundsException. \"c\")) (.getMessage (java.io.IOException. \"d\"))]" :portability :jvm}
+  ;; An instance method call on nil is a NullPointerException whatever the
+  ;; member: the JVM's reflector reads the target's class before it looks for
+  ;; anything, so no member name changes the answer. The row under "errors /
+  ;; host operations carry a JVM class" covers a call WITH arguments; these
+  ;; cover the no-arg member reads, which reach a different arm and where jolt
+  ;; used to answer for the nil rather than refuse it — (.iterator nil) handed
+  ;; back an empty iterator through v0.8.1 and (.toString nil) the empty string.
+  ;; That is what let a zero-input (m/latest f) run at all in jlt-commons/ebb
+  ;; (issue #4): its (.iterator (seq fs)) is a null target whenever fs is empty,
+  ;; which the JVM refuses too. Every member named here is real on SOME class,
+  ;; so nothing passes by being an unknown name.
+  {:suite "interop / method call on nil" :label "an instance method call on nil is a NullPointerException, whatever the member" :expected "[\"NullPointerException\" \"NullPointerException\" \"NullPointerException\" \"NullPointerException\" \"NullPointerException\"]" :actual "[(try (.iterator nil) (catch Throwable e (.getSimpleName (class e)))) (try (.toString nil) (catch Throwable e (.getSimpleName (class e)))) (try (.hasNext nil) (catch Throwable e (.getSimpleName (class e)))) (try (.length nil) (catch Throwable e (.getSimpleName (class e)))) (try (.getName nil) (catch Throwable e (.getSimpleName (class e))))]" :portability :jvm}
+  {:suite "interop / method call on nil" :label "the empty seq is a null target, so iterating one raises" :expected "[\"NullPointerException\" \"NullPointerException\"]" :actual "[(try (.iterator (seq [])) (catch Throwable e (.getSimpleName (class e)))) (try ((fn [& xs] (.iterator (seq xs)))) (catch Throwable e (.getSimpleName (class e))))]" :portability :jvm}
   {:suite "interop / exception constructors" :label "each is catchable as itself and as Throwable" :expected "[:npe :thr]" :actual "[(try (throw (NullPointerException. \"x\")) (catch NullPointerException _ :npe)) (try (throw (java.io.IOException. \"x\")) (catch Throwable _ :thr))]" :portability :jvm}
   {:suite "interop / File" :label "a File wraps its path and getName is the last segment" :expected "[\"/tmp/a/b.txt\" \"b.txt\"]" :actual "(let [f (java.io.File. \"/tmp/a/b.txt\")] [(.getPath f) (.getName f)])" :portability :jvm}
   {:suite "interop / Integer statics" :label "the int bounds" :expected "[2147483647 -2147483648]" :actual "[Integer/MAX_VALUE Integer/MIN_VALUE]" :portability :jvm}
