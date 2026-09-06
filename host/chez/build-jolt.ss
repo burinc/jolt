@@ -685,6 +685,9 @@
 ;; jolt building (non-eval) apps, where no Chez is available.
 (define jb-flat-so (string-append jb-build "/flat.so"))
 (define jb-boot (string-append jb-build "/jolt.boot"))
+;; the vfasl form of jb-boot — what actually gets embedded (see the conversion
+;; in the compile script below for why).
+(define jb-vboot (string-append jb-build "/jolt.vboot"))
 (display (string-append "build-jolt: compiling (" jb-profile " profile)\n"))
 (let ((cs (string-append jb-build "/compile.ss")))
   (let ((p (open-output-file cs 'replace)))
@@ -704,7 +707,24 @@
         "(make-boot-file " (ei-str-lit jb-boot) " '()\n  "
         (ei-str-lit (string-append (bld-csv-dir) "/petite.boot")) "\n  "
         (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "
-        (ei-str-lit jb-flat-so) ")\n"))
+        (ei-str-lit jb-flat-so) ")\n"
+        ;; --- vfasl --------------------------------------------------------
+        ;; Convert the boot to Chez's "very fast load" format. An ordinary boot
+        ;; is a fasl stream the kernel walks object by object, allocating as it
+        ;; goes; a vfasl boot is a prebuilt image of what that walk would have
+        ;; produced, laid out per space and loaded DIRECTLY INTO THE STATIC
+        ;; GENERATION (ChezScheme c/vfasl.c). Both halves of that matter here:
+        ;; the load stops allocating, and the Scompact_heap at the end of
+        ;; Sbuild_heap has far less to compact, which was 66ms of a 240ms start.
+        ;;
+        ;; Measured on this boot, `scheme -b <boot> -- --version`, best of 7:
+        ;;   fasl    0.25s   14,932,209 bytes
+        ;;   vfasl   0.16s   11,593,854 bytes
+        ;;
+        ;; It runs in THIS script rather than the parent so a cross build gets
+        ;; the xpatch's retargeted constants, the same way make-boot-file above
+        ;; does — $fasl-to-vfasl lays the image out for a specific machine.
+        "(vfasl-convert-file " (ei-str-lit jb-boot) " " (ei-str-lit jb-vboot) " '())\n"))
     (close-port p))
   (bld-system (string-append bld-chez " --script '" cs "'")))
 
@@ -728,7 +748,7 @@
     (close-port p)))
 
 (display "build-jolt: embedding boots + stub, linking\n")
-(jb-c-array jb-boot (string-append jb-build "/boot_data.h") "jolt_boot")
+(jb-c-array jb-vboot (string-append jb-build "/boot_data.h") "jolt_boot")
 (jb-c-array (string-append (bld-csv-dir) "/petite.boot") (string-append jb-build "/petite_data.h") "jolt_petite_boot")
 (jb-c-array (string-append (bld-csv-dir) "/scheme.boot") (string-append jb-build "/scheme_data.h") "jolt_scheme_boot")
 (jb-c-array jb-stub (string-append jb-build "/stub_data.h") "jolt_stub")
