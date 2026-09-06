@@ -33,6 +33,7 @@ Read it before assuming a JVM behaviour holds.
 - [Install](#install) — prebuilt binaries, Homebrew, install script
 - [Run](#run) — `-e`, project deps, `clj`-compatible options
 - [Differences from Clojure](#differences-from-clojure) — what actually diverges
+- [Scripts](#scripts) — a file, a shebang line, `*command-line-args*`
 - [Runtime dependencies](#runtime-dependencies) — acquiring libraries in code
 - [Diagnostics](#diagnostics) — error suggestions, EDN errors, the lint pass
 - [REPL and editor integration](#repl-and-editor-integration) — nREPL, CIDER/Calva/Cursive
@@ -98,10 +99,6 @@ finally searches `PATH` for `chez` or `chezscheme`. `make` provisions its own
 10.4.1 when `PATH` has a different version and exports `JOLT_CHEZ` so both halves
 of a build agree.
 
-Note that GitHub's auto-generated "Source code (zip/tar.gz)" archives on the
-releases page do **not** contain submodules, so they can't run or build —
-clone the repo instead (or grab a prebuilt binary from the same page).
-
 After changing a compiler source — the reader (`host/chez/reader.ss`), the
 analyzer/IR/backend (`jolt-core/jolt/*.clj`), or the `clojure.core` overlay
 (`jolt-core/clojure/core/*.clj`) — re-mint the seed:
@@ -130,6 +127,9 @@ $ jolt -e '(->> (range 10) (filter even?) (map (fn [x] (* x x))) (reduce +))'
 $ jolt -e '(/ 1 2)'
 1/2
 ```
+
+A file runs too — `jolt script.clj`, or an executable `#!/usr/bin/env jolt`
+script: see [Scripts](#scripts).
 
 When the current directory has a `deps.edn`, `-e` resolves it first, so the
 expression can require the project's own namespaces and its dependencies.
@@ -231,6 +231,47 @@ The tracked, gated list of value-level divergences is
 [test/conformance/known-divergences.edn](test/conformance/known-divergences.edn);
 the prose version is [Differences from Clojure](https://jolt-lang.github.io/docs/differences.html)
 on the docs site.
+
+## Scripts
+
+A file runs with `run` or without it, and needs no extension and no build step:
+
+```bash
+jolt script.clj              # load a file (`jolt run script.clj` is identical)
+jolt -f build                # ...when the file's name is a command or a task
+jolt - < script.clj          # read the program from stdin
+```
+
+So a first line of `#!/usr/bin/env jolt` makes the file an executable script, the
+way a `bb` one is:
+
+```bash
+$ cat hello
+#!/usr/bin/env jolt
+(println "hello" (first *command-line-args*))
+$ chmod +x hello
+$ ./hello world
+hello world
+```
+
+`#!` is a comment to end of line in Clojure's reader, so the line costs the
+program nothing. All it needs is a `jolt` on `PATH` — an installed binary, or a
+symlink to a checkout's `bin/jolt`. (Windows has no kernel shebang, so there
+`jolt script` is how a script runs.) Arguments after the script are `*command-line-args*` — the first
+standalone `--` ends option parsing — `*file*` is the script, stdin is left for
+the program to read, and `(System/exit n)` sets the process's exit status (an
+uncaught exception exits 1). An `(ns …)` form with `:require`s is fine, and when
+the directory has a `deps.edn` the script sees the project's paths and
+dependencies, like any other run.
+
+A built-in command wins a name it shares with a file — `jolt build` is always the
+compiler — which is what `-f` is for. A task loses to one: a file on disk is what
+`jolt greet` means when the project also has a `greet` task.
+
+Startup is jolt's boot floor — the runtime and compiler image are instantiated on
+every run, which measures ~0.17s against babashka's ~0.01s on the same machine. A
+script called in a loop is better compiled once: give it an `(ns …)` with a
+`-main` and `jolt build -m` it into a binary.
 
 ## Runtime dependencies
 

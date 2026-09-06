@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A file whose first line is `#!/usr/bin/env jolt` runs as an executable
+  script**, the babashka shape: `chmod +x` it and `./tool arg` works, with no
+  extension, no build step, and nothing in the file but the program. `#!` was
+  already a comment to end of line in the reader and a bare `jolt FILE` already
+  loaded a file, so what was missing was smaller than it looked — see Fixed. The
+  arguments after the script are `*command-line-args*`, `*file*` is the script,
+  stdin is left for the program to read, and `(System/exit n)` is the process
+  status. `host/chez/script-smoke.sh` (`make scriptsmoke`) runs the whole surface,
+  including the shebang line as the kernel executes it.
+- **`-f FILE` / `--file FILE`** — babashka's spelling for "this argument is a
+  file", and the only way to run a script whose name a command also answers to:
+  `jolt -f build` runs the `build` script in the project root, where `jolt build`
+  is always the compiler. `jolt run -f FILE` is the same thing.
+
+### Fixed
+
+- **`bin/jolt` did not work through a symlink**, which is how a checkout's launcher
+  gets onto `PATH` in the first place — and therefore how `#!/usr/bin/env jolt`
+  finds it. The launcher derives its checkout root from `$0`, so through a symlink
+  it looked for `tools/version.sh` and `host/chez/cli.ss` in the symlink's own
+  directory and died (`no such file or directory`). It now follows the symlink
+  chain to the real file first; `bin/joltc`, which execs the launcher beside it,
+  had the same bug and the same fix.
+- **A script with no extension was invisible to any launcher that cd's away from
+  the caller's directory.** Whether an argv token named a file was asked of the
+  PROCESS directory, while the loader read that same relative path against the
+  PROJECT directory (`JOLT_PWD`) — so under `bin/jolt` (and anything else that
+  carries the caller's cwd) `jolt script.clj` ran, because the `.clj` arm never
+  touches the filesystem, and `jolt script` reported `unknown command or task`.
+  Both arms now ask about the path `load-file` will actually read.
+
 ## [0.8.3] - 2026-09-06
 
 A primitive array holds its elements unboxed, and a type hint costs nothing it
@@ -8979,7 +9014,9 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/jolt-lang/jolt/compare/v0.8.2...v0.8.3
+[0.8.2]: https://github.com/jolt-lang/jolt/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/jolt-lang/jolt/compare/v0.8.0...v0.8.1
 [0.7.28]: https://github.com/jolt-lang/jolt/compare/v0.7.27...v0.7.28
 [0.7.16]: https://github.com/jolt-lang/jolt/compare/v0.7.15...v0.7.16
