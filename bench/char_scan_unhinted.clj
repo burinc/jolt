@@ -1,32 +1,25 @@
-;; char-scan — the CHARACTER-LOOP workload: walking a string one code point at a
-;; time through `.charAt`, with the numeric casts that hinted Clojure puts around
-;; it. Per-iteration work is one host method call and two or three coercions, so
-;; the cast primitives and interop dispatch dominate rather than any algorithm.
+;; char-scan-unhinted — the twin of `char-scan` with the declared tags removed.
+;; Same four shapes, same string, same sizes; no `^String` on a target and no
+;; `^long` on a parameter or return.
 ;;
-;; This is the regime `mathfns` and `arrays` miss. They exercise arithmetic on
-;; values that are already the right type; here every character crosses the
-;; char->int->long boundary, which is a different set of primitives. Two of them
-;; used to be startlingly expensive on jolt:
+;; The casts written INSIDE the loops stay, because they are the code under
+;; measurement: honeysql's `alphanumeric?` is written that way, and what the
+;; original benchmark exists to price is what those casts cost. What goes is every
+;; tag that let the compiler prove the receiver or the index ahead of them, so
+;; `.charAt` and `.length` reach the generic dispatcher.
 ;;
-;;   - `unchecked-int` and `unchecked-long` fell through a generic cond to a
-;;     `truncate` call plus generic bitwise masking, 44.7 ns for what the JVM does
-;;     in 2.7. `long` was worse in a way that is easy to miss: Chez fixnums are
-;;     61-bit, so the +-2^63 bounds `long` range-checks against are BIGNUMS, and
-;;     every (long x) on an ordinary integer paid two fixnum-vs-bignum compares.
-;;   - a `case` over small integer states, which is how a hand-rolled scanner
-;;     dispatches, and which pays a cast per branch.
+;; Kept as its own suite entry because ci/bench-gate.sh compares a ratio PER
+;; BENCHMARK: with one row, a round that speeds the proven path while slowing the
+;; generic one nets out to roughly nothing and is invisible.
 ;;
-;; The shape is honeysql's. honey.sql/alphanumeric? is a regex rewritten as a
-;; character state machine, called once per entity part inside format-entity, and
-;; it ran at 30x the JVM — almost entirely in the casts, not the loop.
-;;
-;; `count-digits-hinted` adds the fourth shape: the SAME walk with the index
-;; declared on the parameter rather than cast at each use, which is how ported JVM
-;; code is actually written.
+;; A transcription of char_scan.clj — edit the two together; what differs is
+;; exactly the tags. The phase names are kept verbatim so a row here is obviously
+;; comparable to the row there, which is why `count-digits-hinted` still carries
+;; that name with nothing declared on it.
 ;;
 ;; Portable Clojure (jolt + JVM Clojure).
-;;   bench/run.sh char-scan 40000
-(ns char-scan)
+;;   bench/run.sh char-scan-unhinted 40000
+(ns char-scan-unhinted)
 
 (def entities ["table" "some_column" "a" "x1" "SELECT" "order_by_2" "_leading" "42"])
 (def sentence "the quick brown fox jumps over the lazy dog 0123456789")
@@ -34,7 +27,7 @@
 ;; --- honeysql's alphanumeric?, verbatim in shape ------------------------------
 ;; `^(?:[0-9_]+|[A-Za-z_][A-Za-z0-9_]*)$` as a state machine. The three casts per
 ;; character — the index, the char, and the widening — are the point.
-(defn alphanumeric? [^String s]
+(defn alphanumeric? [s]
   (let [leading-underscore 1
         numeric 2
         identifier 3
@@ -68,7 +61,7 @@
             (recur ni dead)))))))
 
 ;; --- the same walk with no state machine: casts and .charAt only --------------
-(defn sum-code-points ^long [^String s]
+(defn sum-code-points [s]
   (let [n (long (.length s))]
     (loop [i 0 acc 0]
       (if (>= i n)
@@ -77,7 +70,7 @@
                (unchecked-add acc (unchecked-long (unchecked-int (.charAt s (unchecked-int i))))))))))
 
 ;; --- the checked casts, which are the ones ordinary code writes ---------------
-(defn count-digits ^long [^String s]
+(defn count-digits [s]
   (let [n (int (.length s))]
     (loop [i 0 acc 0]
       (if (>= i n)
@@ -85,21 +78,10 @@
         (let [c (long (int (.charAt s (int i))))]
           (recur (inc i) (if (and (>= c 48) (<= c 57)) (inc acc) acc)))))))
 
-;; --- the same walk with the index DECLARED on the parameter, not cast per use --
-;; The axis is a declared index tag versus a cast at every use: without it the
-;; whole body is generic arithmetic over a parameter the source has already
-;; described. Same work as `count-digits`, with the casts moved to the signature.
-;;
-;; Declared ^long, not ^int, so this stays portable. Reference Clojure has long
-;; and double primitive parameters and REFUSES any other primitive hint outright
-;; ("Only long and double primitives are supported"), so an ^int here does not
-;; compile there at all and the benchmark loses the JVM column the suite exists to
-;; compare against — it did, briefly. jolt accepts ^int as the fixnum promise
-;; ^long already is (an int and a long are the same value here), so the two spell
-;; the same code on this side and nothing is lost by writing the portable one.
-;; That acceptance is a correctness property, covered by unit.edn and
-;; test/conformance/known-divergences.edn, not something a benchmark measures.
-(defn count-digits-hinted ^long [^String s ^long from]
+;; --- the same walk with the index passed, not cast per use -------------------
+;; Nothing is declared, so the parameter carries no promise and the body is
+;; generic arithmetic over it — the contrast the hinted twin's row measures.
+(defn count-digits-hinted [s from]
   (let [n (.length s)]
     (loop [i from acc 0]
       (if (>= i n)
