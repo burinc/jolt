@@ -196,10 +196,13 @@ since the `ffi/write` argument order changed in 0.8.0.
   own range check raise, and that condition was classified as a bare
   `IndexOutOfBoundsException` — so a `catch ArrayIndexOutOfBoundsException`
   around it never matched, where it does on the JVM and does for the same read
-  through untyped `aget`. `^longs`, `^ints` and `^bytes` now classify as the
-  array exception, like `^doubles` already did. `^objects` stays the
-  parent class: its backing is a plain Chez vector, which the runtime uses for
-  everything, so its range error carries nothing to tell an array apart by.
+  through untyped `aget`. Every hinted read and write answers the array
+  exception now. `^longs`, `^ints`, `^bytes` and `^doubles` get it from their
+  own backing's condition; `^objects` cannot — a plain Chez vector is what the
+  runtime uses for everything, so `vector-ref`'s range error carries nothing to
+  tell an array apart by — and pre-checks instead, one fixnum compare on the
+  boxed arm only. A hint must not decide which exception class a program
+  catches.
 
 - **`recur` across `try` compiled, and leaked.** The reference refuses it; jolt
   compiled it — Chez has no bytecode-size limit to stop it — at about 400 bytes
