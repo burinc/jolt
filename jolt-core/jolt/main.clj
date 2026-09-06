@@ -10,6 +10,9 @@
 
 (defn- version [] (jolt.host/jolt-version))
 
+;; The key a :jolt/native spec's candidates are read under. These three
+;; spellings are the whole set — jolt.deps/native-platform-keys, which builds a
+;; spec's dedup identity, must list the same ones.
 (defn- current-platform []
   (let [os (str/lower-case (or (System/getProperty "os.name") ""))]
     (cond (str/includes? os "mac") :darwin
