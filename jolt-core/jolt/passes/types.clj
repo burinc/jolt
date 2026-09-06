@@ -984,7 +984,30 @@
                       :else n))
             rt (interop-ret-type (get n :target-type) (get n :method))]
         [(if rt rt :any) n])
-      :else [:any node])))
+
+      ;; The inline pass wraps a spliced body in :coerce to preserve the callee's
+      ;; ^double/^long return coercion (passes/inline.clj, `rbody`). Without an arm
+      ;; here that wrapper fell to :else, which answers :any and returns the node
+      ;; UNWALKED — so nothing inside a spliced return-hinted fn was ever
+      ;; annotated. Every record field read in such a body degraded from a slot
+      ;; read to jolt-get and its arithmetic from the fl ops to the generic ones,
+      ;; which made declaring ^double on a fn's return roughly halve the speed of
+      ;; its inlined copies. A hint must never cost, so the body is inferred and
+      ;; the node rebuilt around it; the coercion's own kind is what it answers.
+      (= op :coerce)
+      (let [r (infer (get node :expr) tenv env)]
+        [(if (= :double (get node :kind)) :double :num)
+         (assoc node :expr (nth r 1))])
+
+      ;; Anything with no arm above. Answering :any is right — this pass has no
+      ;; opinion on the node's own type — but the node must still be WALKED, or
+      ;; nothing inside it is annotated and every record read and every numeric op
+      ;; in the subtree silently degrades to the generic path. That is not
+      ;; hypothetical: it is what :coerce did before the arm above existed, and
+      ;; :set-var, :set-field, :defmacro, :ffi-callable and :host-new all carry
+      ;; child nodes and still land here. A missing arm should cost this pass its
+      ;; opinion about one node, never the annotation of a whole subtree.
+      :else [:any (map-ir-children (fn [c] (nth (infer c tenv env) 1)) node)])))
 
 (defn- infer-top [node env] (nth (infer node {} env) 1))
 
