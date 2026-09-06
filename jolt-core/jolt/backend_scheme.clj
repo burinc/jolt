@@ -2362,6 +2362,13 @@
   (let [tail? *tail?*]           ; capture: children below emit non-tail
    (binding [*tail?* false]
     (let [fnode (:fn node)
+        ;; TWO parallel vectors, same length, same order, one character apart in
+        ;; name: arg-nodes are the IR NODES, args are their EMITTED STRINGS.
+        ;; Anything that needs to ask a question about an argument — its type, its
+        ;; :num-kind, whether it is a constant — has to read arg-nodes; args can
+        ;; only be spliced into output. Reaching for `args` and calling (:op …) on
+        ;; it yields nil for every argument and fails silently, which is a real bug
+        ;; this file has already shipped once.
         arg-nodes (:args node)
         args (mapv emit arg-nodes)
         tl (or (node-line node) 0)
@@ -2663,8 +2670,39 @@
              ;; paid the slow ctor: jolt-invoke, var-deref, rest-list, ctor call,
              ;; hashtable lookup and a field vector.
              tags (vec (get s :tags))
-             coerce-arg (fn [i a]
-                          (if (= "double" (nth tags i nil)) (str "(jolt-rec-dbl " a ")") a))
+             ;; ...but only over an argument that is not ALREADY a flonum.
+             ;; jolt-rec-dbl is a runtime guard — (number? a) and (not (flonum? a))
+             ;; before exact->inexact — so wrapping it around a proven double makes
+             ;; the ^double DECLARATION cost two type tests per field per
+             ;; construction that the same record without the tag does not pay.
+             ;; Measured: (->Vec3 i (+ i 1) 2.5) in a loop ran 2.3x SLOWER declared
+             ;; ^double than undeclared, all of it here. Extra static type
+             ;; information must never make the emitted code slower than its
+             ;; absence; where it cannot help it has to cost nothing.
+             ;;
+             ;; Proven means: a literal flonum (double? is exact here — a bigdec
+             ;; and a ratio both answer false, and both still need the coercion),
+             ;; or a node the numeric pass typed :double, whose emission is an fl
+             ;; op and so yields a flonum by construction. Anything else keeps the
+             ;; guard: a :long is 64-bit and may be a bignum at runtime, which is
+             ;; exactly what jolt-rec-dbl's exact->inexact handles.
+             proven-double? (fn [nd]
+                              (and (map? nd)
+                                   (or (and (= :const (:op nd)) (double? (:val nd)))
+                                       (= :double (:num-kind nd)))))
+             ;; One tag per ARGUMENT (a record may declare fewer tags than the
+             ;; ctor takes), so the three vectors below are the same length and
+             ;; map together. Mapping rather than indexing three vectors apart is
+             ;; the point: it is what makes pairing a field's tag with another
+             ;; field's argument impossible to write.
+             arg-tags (mapv (fn [i] (nth tags i nil)) (range (count arg-nodes)))
+             ;; field-tag: what the FIELD declares. nd: the IR node being passed
+             ;; into it. a: that node already emitted. Only nd can answer a
+             ;; question about the value. Named field-tag, not tag, because `tag`
+             ;; in this scope is the record's TYPE tag two lines below.
+             coerce-arg (fn [field-tag nd a]
+                          (if (and (= "double" field-tag) (not (proven-double? nd)))
+                            (str "(jolt-rec-dbl " a ")") a))
              desc-lookup (str "(hashtable-ref chez-tag-desc " (chez-str-lit tag) " #f)")
              cached-desc (if cells
                            (let [c (fresh-label "_cdesc$")]
@@ -2673,7 +2711,7 @@
                            desc-lookup)]
          (order-args (fn [as]
                        (let [n (count as)
-                             as (vec (map-indexed coerce-arg as))]
+                             as (vec (map coerce-arg arg-tags arg-nodes as))]
                          (if (<= n 8)
                            (str "(make-jrec" n " " cached-desc " jolt-nil 0"
                                 (when (pos? n) (str " " (str/join " " as))) ")")
