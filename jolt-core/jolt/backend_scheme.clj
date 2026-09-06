@@ -2663,8 +2663,30 @@
              ;; paid the slow ctor: jolt-invoke, var-deref, rest-list, ctor call,
              ;; hashtable lookup and a field vector.
              tags (vec (get s :tags))
+             ;; ...but only over an argument that is not ALREADY a flonum.
+             ;; jolt-rec-dbl is a runtime guard — (number? a) and (not (flonum? a))
+             ;; before exact->inexact — so wrapping it around a proven double makes
+             ;; the ^double DECLARATION cost two type tests per field per
+             ;; construction that the same record without the tag does not pay.
+             ;; Measured: (->Vec3 i (+ i 1) 2.5) in a loop ran 2.3x SLOWER declared
+             ;; ^double than undeclared, all of it here. Extra static type
+             ;; information must never make the emitted code slower than its
+             ;; absence; where it cannot help it has to cost nothing.
+             ;;
+             ;; Proven means: a literal flonum (double? is exact here — a bigdec
+             ;; and a ratio both answer false, and both still need the coercion),
+             ;; or a node the numeric pass typed :double, whose emission is an fl
+             ;; op and so yields a flonum by construction. Anything else keeps the
+             ;; guard: a :long is 64-bit and may be a bignum at runtime, which is
+             ;; exactly what jolt-rec-dbl's exact->inexact handles.
+             proven-double? (fn [nd]
+                              (and (map? nd)
+                                   (or (and (= :const (:op nd)) (double? (:val nd)))
+                                       (= :double (:num-kind nd)))))
              coerce-arg (fn [i a]
-                          (if (= "double" (nth tags i nil)) (str "(jolt-rec-dbl " a ")") a))
+                          (if (and (= "double" (nth tags i nil))
+                                   (not (proven-double? (nth arg-nodes i nil))))
+                            (str "(jolt-rec-dbl " a ")") a))
              desc-lookup (str "(hashtable-ref chez-tag-desc " (chez-str-lit tag) " #f)")
              cached-desc (if cells
                            (let [c (fresh-label "_cdesc$")]
