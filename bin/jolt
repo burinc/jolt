@@ -12,7 +12,22 @@
 # The launcher cd's to the jolt repo root so the runtime's relative loads work;
 # the user's original cwd (the project dir, where deps.edn lives) is passed in
 # JOLT_PWD.
-root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+#
+# $0 may be a SYMLINK. That is the natural way to put a checkout's jolt on PATH,
+# and it is what `#!/usr/bin/env jolt` executes, so follow the chain to the real
+# file before deriving the root from it: without this the root came out as the
+# symlink's own directory and the launcher died there looking for tools/version.sh
+# and host/chez/cli.ss. Hand-rolled rather than `readlink -f`, which is neither
+# POSIX nor present on older macOS.
+target="$0"
+while [ -L "$target" ]; do
+  link="$(readlink "$target")"
+  case "$link" in
+    /*) target="$link" ;;
+    *)  target="$(CDPATH= cd -- "$(dirname -- "$target")" && pwd)/$link" ;;
+  esac
+done
+root="$(CDPATH= cd -- "$(dirname -- "$target")/.." && pwd)"
 export JOLT_PWD="${JOLT_PWD:-$PWD}"
 # How jolt re-invokes itself (babashka.tasks/clojure in a task). An installed
 # jolt is on PATH and needs no help; this checkout is not.
