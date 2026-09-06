@@ -25,6 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child process still never inherits the mask, so `^C` on the foreground process
   group kills subprocesses outright.
 
+- **A cached pool no longer forks a worker per task under CPU contention.**
+  `Executors/newCachedThreadPool` grows when a task arrives that no idle worker is
+  waiting to accept. It counted only the workers parked in the idle wait, so a
+  worker that had been forked but had not yet reached the queue was invisible —
+  and on a contended machine every submit inside that window forked another
+  worker, each one lengthening the window by contending for the queue mutex. A
+  **strictly sequential** submit/`.get` loop, concurrency one throughout, could
+  reach ~20 threads where it needs one, with every task running on the first of
+  them and the other 19 sitting out the 60s keep-alive. Over 200 trials under CPU
+  oversubscription the pool size for a 20-task loop went from
+  `{1 172, 2 2, 3 3, 5 3, 6 4, 7 5, 8 3, 9 2, 20 6}` to `{1 166, 2 33, 3 1}`.
+
+  A worker already on its way to the queue is a taker, so the growth rule counts
+  it now. That costs no legitimate growth: a burst that really does need *n*
+  workers keeps the queue ahead of idle-plus-starting and still grows to *n* — the
+  64-task blocking fan-out still reaches exactly 64, and the nested fan-out that
+  used to deadlock on a fixed pool still resolves.
+
 ### Changed
 
 - **`defonce` takes a docstring**, so it has the same `(sym doc-string? init)`
