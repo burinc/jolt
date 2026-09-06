@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Confined FFI arenas avoid shared-arena compare-and-swap bookkeeping on their
+  owner-only attach and close paths. Empty and single-allocation lexical arenas
+  also skip cleanup work they do not need, without changing arena lifetime or
+  release-order semantics.
+
 ## [0.8.2] - 2026-09-05
 
 Errors say what went wrong, where, and can be caught. A compile error is a framed
