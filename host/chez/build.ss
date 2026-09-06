@@ -560,12 +560,23 @@
 
 (define (bld-file-lines path) (bld-string-lines (bld-source-string path)))
 
+;; Build-time diagnostic. The runtime manifest carries one startup-profile mark
+;; per ENTRY, so "host/chez/rt.ss" is a single 64ms line hiding the ~40 files it
+;; transitively loads — enough to say the runtime is expensive, not enough to say
+;; which part. JOLT_PROFILE_INLINE=1 at BUILD time emits a mark after each inlined
+;; file, turning that one line into a per-file breakdown. Off by default: a
+;; shipped binary carries the coarse set, and each mark costs a statistics call.
+(define bld-profile-inline? (and (getenv "JOLT_PROFILE_INLINE") #t))
+
 ;; Emit one line to OUT, recursively inlining a `(load ...)` of a repo file.
 (define (bld-inline-line line out depth)
   (when (> depth 50) (error 'jolt-build "load nesting too deep"))
   (let ((p (bld-load-path line)))
     (if p
-        (for-each (lambda (l) (bld-inline-line l out (+ depth 1))) (bld-file-lines p))
+        (begin
+          (for-each (lambda (l) (bld-inline-line l out (+ depth 1))) (bld-file-lines p))
+          (when bld-profile-inline?
+            (bld-emit-startup-profile-mark! out (string-append "inlined " p))))
         (begin (put-string out line) (put-string out "\n")))))
 
 ;; Inline the runtime manifest, dispatching on the manifest tags. core-strs (the
