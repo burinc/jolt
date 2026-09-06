@@ -27,6 +27,13 @@ and the [Computer Language Benchmarks Game](https://benchmarksgame-team.pages.de
 The benchmarks are portable Clojure, so they also run on JVM Clojure for an
 absolute reference.
 
+`ffi_arenas.clj` is a separate Jolt-only diagnostic because the JVM has no
+`jolt.ffi` reference implementation. Run it from this directory with
+`../bin/jolt -Srepro -Sdeps '{:paths ["."]}' -m ffi-arenas`. It retains all five
+monotonic-clock samples and alternates scenario order; compare exact base and
+candidate runs on the same host rather than treating one absolute timing as a
+portable threshold.
+
 ## Benchmarks
 
 | Benchmark | Axis | Pass it exercises | Source |
