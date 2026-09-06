@@ -45,6 +45,8 @@ portable threshold.
 | `vecops` | vector-of-vectors: pairwise `into` concatenation, `subvec` windows + reduce, split-at/rejoin loop | vector concat + slice (the RRB axis; `into`/`subvec` are wired through the RRB ops, so concat is O(log n) here and linear in core Clojure) | RRB workload |
 | `mandelbrot` | pure float compute (tight arith loops, no alloc/dispatch) | native arith, loop codegen | CLBG |
 | `arrays` | primitive `double-array` throughput (unboxed `aget`/`aset`, no boxing/collections) | unboxed primitive-array codegen (flvector read/write) | CLBG-style |
+| `byte-arrays` | RAW BYTES in bulk: block copies between byte arrays, a stream drained into a reusable buffer, the `String`↔`byte[]` round trip, and hinted `^bytes` element access | the byte array's BACKING — a bytevector, so every crossing is a block move — and, on the access side, `aget`'s direct backing read against `aset`'s narrowing store | — |
+| `gc-arrays` | major-collection PAUSE with a large primitive array live: a `long-array`, a `byte-array`, and a boxed `object-array` of the same length as the control | the heap SHAPE those backings give a typed array (an fxvector and a bytevector are leaves, so the collector has nothing to trace through them) | — |
 | `mathfns` | transcendental math (`java.lang.Math` sqrt/sin/cos/log/pow/atan2 over doubles) | native `Math` op lowering (`flsqrt`/`flsin`/… vs generic host-static dispatch) | CLBG-style |
 | `fib` | recursion: function-call + integer-arith overhead | native arith, small-fn inlining | CLBG |
 | `tak` | deep three-way self-recursion + integer arith | direct-linked self-calls, proven fixnum arith | CLBG/AWFY |
@@ -63,13 +65,26 @@ portable threshold.
 | `nth-access` | `nth` on a vector, small and large, and with a default — the constant cost of an indexed read | `Indexed`-first ordering in `jolt-nth` ahead of the extension-type probes | — |
 | `executors` | `java.util.concurrent` dispatch: fire-and-forget at a cached pool faster than it can drain, submit/get round trips, growth to 64 blocking tasks, and four producers on one pool | the RUNTIME rather than a pass — the executor's queue, its wake rule and its growth rule (`host/chez/java/concurrency.ss`) | — |
 
-`executors` is the one row that is not about a compiler pass. It is here because
-nothing else in the suite measures concurrency throughput, and the cost it watches
-is real: an enqueue that woke every idle worker instead of one took a no-op task
+`executors` and `gc-arrays` are the two rows that are not about a compiler pass.
+`executors` is here because nothing else in the suite measures concurrency
+throughput, and the cost it watches is real: an enqueue that woke every idle worker instead of one took a no-op task
 from 8.9µs to 152µs and the pool from 7 threads to 134, with every correctness
 gate still green. Concurrency numbers are noisier than the rest — the four-producer
 phase is a fight over one mutex on however many cores the machine has — so read a
 move here with more suspicion than usual, and re-run it alone on both sides.
+
+`gc-arrays` measures the collector rather than any code jolt emits: its timed
+region contains nothing but full collections with one array rooted across them.
+It is here because the backing a typed array holds is a heap-shape decision that
+every other row is blind to — they allocate arrays and drop them, so they see a
+small part of a change that makes a live 8-million-element array traced work
+again. Read its `mean:` against jolt only. Its vs-JVM column is an
+order-of-magnitude reading and no more: `System/gc` is a hint on the JVM and a
+full collection here, and a JVM full GC's own floor (11.5ms on the machine below)
+is 750× a Chez major collection's (15µs), which is most of what that ratio
+reports. The row's own `boxed` control is the comparison that
+means something, because it is measured in the same process as the two phases it
+is a control for.
 
 ## Scorecard
 
@@ -106,7 +121,8 @@ than a jolt-side change.
 > codegen round changed the SOURCE of `mathfns`, `arrays`, `string-ops` and
 > `char-scan` (each grew a phase for an axis it did not previously cover), so
 > their absolute ms and their vs-JVM ratios no longer describe what the benchmark
-> now runs, and `typed-records` is new and has no row at all. They are marked
+> now runs, and `typed-records`, `byte-arrays` and `gc-arrays` are new and have no
+> row at all (the last two are measured in their own section below). They are marked
 > rather than patched on purpose: this table is one same-sitting run on one
 > machine, and dropping four freshly-measured numbers from a different machine
 > into it is precisely how the stale-scorecard incident below happened. The
@@ -191,6 +207,98 @@ showed the standalone `osum` with `jolt-vaget` and all three spliced copies — 
 call on the hot path — with `jolt-nth`. The A/B read 1.02×, i.e. the entire win
 cancelled. Restoring the refusal took the same benchmark to 0.32×. A ratio near
 1.00 on a change you expected to matter is worth reading the emitted code over.
+
+### The unboxed array backings (v0.8.3) — and the two rows that were missing
+
+0.8.3 moved `^longs`/`^ints`/`^bytes` arrays onto backings that know what they
+hold (an fxvector and a bytevector; see that release's CHANGELOG entry), and the
+suite could not see any of it. `arrays` is hinted element access on `^doubles`,
+`^objects` and `^longs`; nothing here touched a byte array at all, and nothing
+measured a collection pause. Every figure the release claimed — a 1MB
+`System/arraycopy`, an 8KB `InputStream/read` loop, the `String`↔`byte[]` round
+trip, the pause with a live numeric array — was measured outside the suite and not
+kept, so nothing guarded any of them afterwards. `byte-arrays` and `gc-arrays` are
+those two rows, added after the fact and wired into the release gate, so the next
+release is measured against 0.8.3 on them like every other row.
+
+Both were measured with `ci/bench-gate.sh <v0.8.2 binary> <this tree's jolt>` —
+the last release WITHOUT the backings against the tree that has them, building
+this checkout's bench sources with both compilers and alternating timed runs, min
+of 3 per side. Apple Silicon host (MacBook Pro, M1 Pro, macOS 26.3, Chez 10.4.1,
+OpenJDK 20.0.1), one sitting. Everything else that landed between the two tags is
+in these ratios too; they are quoted as what the gate prints, not as an attribution
+to the backings alone.
+
+| Benchmark | v0.8.2 (ms) | this tree (ms) | ratio |
+|---|---:|---:|---:|
+| `byte-arrays` | 13150.9 | 270.6 | **0.02×** |
+| `gc-arrays` | 1900.0 | 26.8 | **0.01×** |
+
+Two further runs of the same pair read 13020.9 / 267.9 and 1908.7 / 27.1, then
+13100.5 / 270.3 and 1907.7 / 27.9 — the same ratios each time, which is the only
+reason to quote any of them. The gate's verdict in this direction is `passed — 2
+benchmark(s) within 1.40x`: the threshold is one-sided, so a row that got 49x
+faster passes, as it should.
+
+The direction that matters for a NEW row is the other one. With the arguments
+swapped — this tree as the baseline, v0.8.2 as the candidate, which is what a
+change undoing the backings would look like — the same two rows read:
+
+```
+byte-arrays           270.3    13100.5   48.47x  <-- REGRESSED
+gc-arrays              27.9     1907.7   68.38x  <-- REGRESSED
+
+bench gate: FAILED — 2 of 2 benchmark(s) over 1.40x
+```
+
+and the script exits 1, which is what holds `publish` in the release workflow. A
+benchmark that cannot be shown to fail the gate is not a gate, so that run is
+worth doing once per row added.
+
+Per phase, same machine and sitting, 400 passes each — jolt is an `--opt` binary
+off this tree, the JVM column is the same source on OpenJDK 20.0.1. These are the
+figures the release claimed, restated at the size the suite runs:
+
+| phase | one pass | jolt (ms) | JVM (ms) | vs JVM |
+|---|---|---:|---:|---:|
+| `copy-full` | a 1MB `System/arraycopy`, whole array | 7.8 | 12.3 | **0.63×** |
+| `copy-region` | the same bytes at unequal offsets | 7.7 | 12.2 | **0.63×** |
+| `drain` | 1MB through an 8KB `InputStream/read` loop (128 reads) | 80.3 | 11.6 | 6.9× |
+| `round-trip` | 4 × `(String. (.getBytes s))` over a 5KB string | 21.0 | 9.9 | 2.1× |
+| `bfill` | 8192 `(aset ^bytes a i v)` | 95.2 | 0.6 | 159× |
+| `bsum` | 8192 `(aget ^bytes a i)` | 19.4 | 2.1 | 9.2× |
+
+The block copies **beat the JVM** — 19.5µs per megabyte against its 30.8µs — which
+is the backing change arriving: both sides of that seam are bytevectors, so the
+copy is one `bytevector-copy!` rather than an element loop with a sign fold per
+byte. Two gaps came out of writing the row, and it now watches both:
+
+- **`(aset ^bytes a i v)` costs 29ns an element**, where the matching
+  `(aget ^bytes a i)` costs 5.9ns. The read takes the direct backing read; the
+  hinted STORE is deliberately left on the generic path
+  (`jolt-core/jolt/passes/numeric.clj`) because a byte array narrows its value to
+  signed 8 bits at the store and that narrowing lives there, so `^bytes` is absent
+  from the `:v-aset` fast path `^longs`/`^ints`/`^objects` take. It is the largest
+  single ratio in the row.
+- **an 8KB `InputStream/read` costs 1.57µs**, against the JVM's 0.23µs. The
+  transfer itself is a block move now; what is left is per-call overhead on the way
+  to it.
+
+`gc-arrays`, per collection, 8-million-element arrays, same sitting:
+
+| live set | jolt (µs/collect) | JVM (µs/collect) |
+|---|---:|---:|
+| nothing large (floor) | 15.4 | 11551 |
+| `long-array` (fxvector) | 71.1 | 11507 |
+| `byte-array` (bytevector) | 299.4 | 11653 |
+| `object-array`, one shared value (control) | 25230 | 47225 |
+
+On jolt a boxed backing costs **355×** what the fxvector does for the same element
+count, which is the property the row exists to hold. The JVM's own full-GC floor
+is 750× jolt's, so its control only reads 4.1× — the reason to read this row
+against jolt and not across the columns. Scaled to the 20-million-element arrays
+the CHANGELOG quoted, the row reads 0.18ms and 0.75ms against the 0.19ms and
+0.67ms quoted there — the same measurement on a different machine.
 
 ### A stale scorecard hid a 1.7× regression for three weeks (now fixed)
 
