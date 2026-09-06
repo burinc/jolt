@@ -1025,7 +1025,17 @@
                                 (map #(abspath root %) (or (:paths edn) ["src"]))
                                 [root]))
                             infos))
-        :natives (vec (mapcat (fn [{:keys [edn]}] (:jolt/native edn)) infos))
+        ;; Each spec carries the ROOT of the deps.edn that declared it. A
+        ;; :jolt/native path is written relative to its own project ("native/
+        ;; libfoo.so" is what a build task produces beside the sources), and
+        ;; without the root there is nothing to resolve it against: a dependency's
+        ;; relative path was being resolved against the APP's directory, and a
+        ;; :static archive not at all — it went to `cc` verbatim and resolved
+        ;; against whatever the build's cwd happened to be (jolt-9a8).
+        :natives (vec (mapcat (fn [{:keys [edn root]}]
+                                (map #(assoc % :jolt.deps/root root)
+                                     (:jolt/native edn)))
+                              infos))
         ;; Each dep's declared jolt floor, as [lib version] — checked by
         ;; resolve-project against the running runtime. A LIBRARY is the common
         ;; declarer: it knows which jolt its FFI bindings or host shims need, and
@@ -1600,7 +1610,14 @@
       ;; :tasks from both files, bb.edn last — a name in both is babashka's.
       ;; (When bb.edn IS the project config the second merge is a no-op.)
       :tasks (not-empty (merge (:tasks edn) (:tasks bb-edn)))
-      :natives (dedup-by native-key (concat (:jolt/native edn) dep-natives))
+      ;; the project's own specs are rooted at the project, the deps' at their own
+      ;; deps.edn's directory (resolve-deps attached those). Deduped by
+      ;; native-key, which does not read the root — two deps naming the same lib
+      ;; still reconcile to one load, keeping the first one's root.
+      :natives (dedup-by native-key
+                         (concat (map #(assoc % :jolt.deps/root project-dir)
+                                      (:jolt/native edn))
+                                 dep-natives))
       ;; declared host-class providers (RFC 0014), the project's own first: a
       ;; project may supply a class itself rather than take a library's.
       :provides (host-class-providers (concat (provides-entries edn nil) dep-provides))
@@ -1684,7 +1701,8 @@
        (jolt.host/set-source-roots! (into current added)))
      (when (seq natives)
        (info "added deps declare :jolt/native libraries (not auto-loaded): "
-             (pr-str (dedup-by native-key natives))))
+             (pr-str (mapv #(dissoc % :jolt.deps/root)
+                           (dedup-by native-key natives)))))
      added)))
 
 (defn- required-host

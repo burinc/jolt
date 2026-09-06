@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`jolt build` says which `:jolt/native` libraries stay dynamic.** Everything
+  else a build produces is inside the binary, so a library that is loaded at
+  runtime is the one reason the result is not the dependency-free artifact a
+  static build is taken to be — and nothing said so. The build now names them and
+  points at the `:static` key that would link one in. A system library the OS
+  resolves by soname is the normal case and this is not a warning; a fully static
+  build prints nothing.
+
+### Changed
+
+- **`defonce` takes a docstring**, so it has the same `(sym doc-string? init)`
+  shape `def` has: `(defonce cache "the memo table" (atom {}))` defines the var
+  with that `:doc`. `clojure.core`'s `defonce` is `[name expr]` and raises
+  `ArityException` on the three-form call, so this widens only — nothing that
+  compiles on the JVM changes here (recorded as a `:permissive` divergence). The
+  parse is `def`'s, not `defn`'s: a LONE string is the init, and `def` takes no
+  attr-map so neither does this. `^meta` on the name worked before and still
+  does; only the docstring position was missing. A shape that is neither now
+  names itself as an `IllegalArgumentException` rather than an arity error.
+
 ### Fixed
 
 - **Shutdown hooks run on `^C`.** `Runtime.addShutdownHook` and
@@ -43,17 +65,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   64-task blocking fan-out still reaches exactly 64, and the nested fan-out that
   used to deadlock on a fixed pool still resolves.
 
-### Changed
+- **A relative `:jolt/native` path resolves against the deps.edn that declared
+  it.** A project ships its shared object or archive beside its own sources —
+  `native/libfoo.so`, which is what a build task produces — and a dependency does
+  the same in its own tree. Two of the three places that read those paths got the
+  base wrong:
 
-- **`defonce` takes a docstring**, so it has the same `(sym doc-string? init)`
-  shape `def` has: `(defonce cache "the memo table" (atom {}))` defines the var
-  with that `:doc`. `clojure.core`'s `defonce` is `[name expr]` and raises
-  `ArityException` on the three-form call, so this widens only — nothing that
-  compiles on the JVM changes here (recorded as a `:permissive` divergence). The
-  parse is `def`'s, not `defn`'s: a LONE string is the init, and `def` takes no
-  attr-map so neither does this. `^meta` on the name worked before and still
-  does; only the docstring position was missing. A shape that is neither now
-  names itself as an `IllegalArgumentException` rather than an arity error.
+  - a **`:static` archive** was handed to `cc` verbatim, so it resolved against
+    the build's working directory. A dependency's could never work, and a
+    project's own only worked when the build happened to run from the project
+    dir — which `bin/jolt`, which `cd`s to the jolt tree, never does. The failure
+    was `ld: cannot find native/libfoo.a`;
+  - a **dependency's** runtime candidate resolved against the *application's*
+    directory rather than the dependency's, because the collected specs dropped
+    the root of the deps.edn they came from.
+
+  Each spec now carries that root and both paths resolve against it. `dlopen`'s
+  own rule is unchanged: a candidate with no separator is still a soname for the
+  loader to search for, not a file to look up. A `:static` `:archive` or
+  `:libdir` is a linker path, so a bare filename there resolves against the root
+  too — `ld` reads `libfoo.a` as a file in the current directory, not a name to
+  search for.
 
 ## [0.8.3] - 2026-09-06
 
