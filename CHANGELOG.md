@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Confined FFI arenas avoid the shared-arena compare-and-swap LOOP on their
+  owner-only attach and close paths, publishing with one compare-and-set!
+  instead. Empty and single-allocation lexical arenas also skip cleanup work
+  they do not need, without changing arena lifetime or release-order semantics.
+
+### Fixed
+
+- A confined FFI arena shared between fibers on one carrier no longer loses
+  allocations. Fibers share their carrier's thread id, so they all pass the
+  arena's owner check; the attach and close paths publish atomically rather
+  than assuming one mutator.
+
 ## [0.8.2] - 2026-09-05
 
 Errors say what went wrong, where, and can be caught. A compile error is a framed
