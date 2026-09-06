@@ -17,6 +17,21 @@
   {:suite "uuid" :expr "(every? (fn [_] (re-matches #\"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\" (str (random-uuid)))) (range 200))" :expected "true"}
   {:suite "uuid" :expr "(let [us (repeatedly 400 #(str (random-uuid)))] (every? #(> (count (distinct (map (fn [u] (nth u %)) us))) 8) [0 1 2 7 9 35]))" :expected "true"}
   {:suite "uuid" :expr "(= (str (random-uuid)) (str (random-uuid)))" :expected "false"}
+  ;; defonce takes (name doc-string? init), the shape `def` takes. The docstring
+  ;; position is a jolt superset (see :permissive in known-divergences.edn — the
+  ;; JVM's defonce is [name expr] and raises ArityException there), so it cannot be
+  ;; a corpus row. The rest of the parse is def's to the letter.
+  {:suite "defonce-shape" :expr "(do (defonce du-a \"the doc\" 42) [du-a (:doc (meta #'du-a))])" :expected "[42 \"the doc\"]"}
+  ;; a LONE string is the init, not a docstring — (def x \"s\") means the same
+  {:suite "defonce-shape" :expr "(do (defonce du-b \"just a value\") [du-b (:doc (meta #'du-b))])" :expected "[\"just a value\" nil]"}
+  ;; ^meta on the name rides along beside the docstring; an explicit docstring
+  ;; wins over ^{:doc ...}, exactly as it does for def
+  {:suite "defonce-shape" :expr "(do (defonce ^:private ^{:doc \"from meta\"} du-c \"from docstring\" 1) [(:private (meta #'du-c)) (:doc (meta #'du-c))])" :expected "[true \"from docstring\"]"}
+  ;; the init is still evaluated at most once
+  {:suite "defonce-shape" :expr "(do (def du-d-runs (atom 0)) (defonce du-d \"doc\" (do (swap! du-d-runs inc) 1)) (defonce du-d \"doc\" (do (swap! du-d-runs inc) 2)) [du-d @du-d-runs])" :expected "[1 1]"}
+  ;; and a shape that is neither gets a named error rather than a silent mis-parse
+  {:suite "defonce-shape" :expr "(try (eval '(defonce du-e)) (catch Throwable e (class e)))" :expected "java.lang.IllegalArgumentException"}
+  {:suite "defonce-shape" :expr "(try (eval '(defonce du-f 1 2 3)) (catch Throwable e (class e)))" :expected "java.lang.IllegalArgumentException"}
   ;; The reflection member model: jolt reports what its registries KNOW a class
   ;; declares, not what the JVM ships. Three registries answer: the protocol/type
   ;; registry (a deftype's methods), the host shim tables (an ArrayList's), and
