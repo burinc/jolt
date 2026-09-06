@@ -162,7 +162,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
-  protoret pic narrow directlink directcall arraymap unitcontext numeric oparity mathfl flarr \
+  protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke versionsmoke \
@@ -784,6 +784,12 @@ directcall:
 # transients a slot buffer, their seq views vector-backed (test/chez/arraymap-test.ss).
 arraymap:
 	@$(CHEZ) --script test/chez/arraymap-test.ss
+
+# Array backings: which Chez vector type each element kind stores its elements
+# in (fxvector / bytevector / flvector / boxed vector), the fixnum-range
+# widening, and that a boxed array of a typed kind still behaves.
+arraybacking:
+	@$(CHEZ) --script test/chez/array-backing-test.ss
 
 # Direct-linking emission: a closed-world build binds top-level app defs to jv$
 # Scheme bindings and routes app->app calls/refs to them, skipping var-deref +

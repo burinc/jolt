@@ -47,10 +47,14 @@
   '(string-ref substring string-copy string-set! string-fill! substring-fill! string-copy!))
 ;; The proven ^doubles path (jolt-flaget / jolt-flaset, natives-array.ss) relies
 ;; on flvector-ref's own range check — a pre-check there costs ~1ns per access —
-;; so its escaping condition IS the array bounds error. Nothing else in the
-;; runtime reaches these two primitives: the generic array path pre-checks and
-;; throws typed.
-(define array-index-whos '(flvector-ref flvector-set!))
+;; so its escaping condition IS the array bounds error, and the unboxed
+;; ^longs/^ints/^bytes reads (jolt-vaget / jolt-vaset) work the same way over
+;; their own backings. Nothing else in the runtime reaches these primitives: an
+;; fxvector, a flvector and a bytevector-s8 accessor exist HERE only as an
+;; array's backing, and the generic array path pre-checks and throws typed.
+(define array-index-whos
+  '(flvector-ref flvector-set! fxvector-ref fxvector-set!
+    bytevector-s8-ref bytevector-s8-set!))
 
 (define (fault-class c)
   (let* ((m (if (message-condition? c) (condition-message c) ""))

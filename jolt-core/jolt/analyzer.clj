@@ -278,8 +278,8 @@
 ;;             is a Chez flvector, so an element reads back a proven :double.
 ;;             floats share the flvector kind.
 ;;   :longs :ints :bytes :objects
-;;             a boxed Chez vector backing, so no unboxing and no result type — but
-;;             the read still skips jolt-nth's whole dispatch walk (jolt-vaget).
+;;             the kind's own backing (fxvector/bytevector/vector) read direct, but
+;;             no result type (it can widen past a fixnum) and no jolt-nth walk.
 (defn- tag->akind [t]
   (let [s (cond (form-sym? t) (form-sym-name t) (string? t) t :else nil)]
     (cond (= s "doubles") :doubles (= s "floats") :doubles

@@ -5,14 +5,15 @@
 ;; it tracks that codegen directly and guards it against regression. mandelbrot
 ;; covers scalar double arith; this covers indexed array reads/writes.
 ;;
-;; The REFERENCE-array half is a different path and is timed separately. Only a
-;; double/float array has an unboxed backing here; ^longs, ^ints, ^bytes and
-;; ^objects all keep a boxed Chez vector, so there is no flvector to read. What
-;; they can still skip is the DISPATCH: an untyped (aget a i) lowers to the generic
-;; nth, which nil-checks the index, coerces it, and then walks vector/string/seq/
-;; record before it reaches the array arm. ^objects is the shape that matters most
-;; in practice — it is what a hand-written trie node holds, and what clojure.core's
-;; own gvec is written in.
+;; The REFERENCE-array half is a different path and is timed separately. Every
+;; element kind has an unboxed backing of its own now — an fxvector for
+;; ^longs/^ints, a bytevector for ^bytes — but only the flvector reads back a
+;; PROVEN type, so those three still carry no result kind and their arithmetic
+;; stays generic. What they skip is the DISPATCH: an untyped (aget a i) lowers to
+;; the generic nth, which nil-checks the index, coerces it, and then walks
+;; vector/string/seq/record before it reaches the array arm. ^objects is the shape
+;; that matters most in practice — it is what a hand-written trie node holds, and
+;; what clojure.core's own gvec is written in.
 ;;
 ;; Portable Clojure (jolt + JVM Clojure) — ^doubles/aget/aset hit primitive arrays
 ;; on both.

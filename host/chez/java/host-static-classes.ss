@@ -95,8 +95,7 @@
          (unless (and (jolt-array? dst)
                       (eq? (jolt-array-kind dst) 'object))
            (jolt-cast-throw dst "[Ljava.lang.Object;"))
-         (let* ((dv (jolt-array-vec dst))
-                (cap (vector-length dv)))
+         (let ((cap (ja-len dst)))
            (if (fx<? cap n)
                ;; Jolt models reference arrays with one object kind, so the
                ;; replacement retains the strongest component type available.
@@ -104,11 +103,11 @@
                (begin
                  (let fill ((i 0) (es elems))
                    (unless (null? es)
-                     (vector-set! dv i (car es))
+                     (ja-set! dst i (car es))
                      (fill (fx+ i 1) (cdr es))))
                  ;; The Java overload marks the logical end when the caller's
                  ;; destination has spare capacity; later cells stay untouched.
-                 (when (fx>? cap n) (vector-set! dv n jolt-nil))
+                 (when (fx>? cap n) (ja-set! dst n jolt-nil))
                  dst)))))
       (else
        (throw-jvm 'IllegalArgumentException
@@ -331,7 +330,7 @@
 (define (byte-array-arg? x) (and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)))
 (define (char-array->string x)
   (list->string (map (lambda (c) (if (char? c) c (integer->char (jnum->exact c))))
-                     (vector->list (jolt-array-vec x)))))
+                     (ja->list x))))
 (define (writer-piece x)
   (cond ((number? x) (string (integer->char (jnum->exact x))))
         ((char-array-arg? x) (char-array->string x))
@@ -1083,8 +1082,8 @@
                             (let ((slen (string-length s)))
                               (if (>= p slen) -1
                                   (let ((cbuf (car rest)) (off (jnum->exact (cadr rest))) (len (jnum->exact (caddr rest))))
-                                    (let ((n (min len (- slen p))) (dv (jolt-array-vec cbuf)))
-                                      (let loop ((i 0)) (when (< i n) (vector-set! dv (+ off i) (string-ref s (+ p i))) (loop (+ i 1))))
+                                    (let ((n (min len (- slen p))))
+                                      (let loop ((i 0)) (when (< i n) (ja-set! cbuf (+ off i) (string-ref s (+ p i))) (loop (+ i 1))))
                                       (sr-pos! self (+ p n)) (->num n))))))))))
         (cons "mark" (lambda (self . _) (vector-set! (jhost-state self) 2 (sr-pos self)) jolt-nil))
         (cons "reset" (lambda (self) (sr-pos! self (vector-ref (jhost-state self) 2)) jolt-nil))
@@ -1161,12 +1160,12 @@
                 (read1)
                 ;; .read(cbuf, off, len) -> read one code unit at a time into cbuf,
                 ;; return count or -1 at immediate EOF.
-                (let ((off (jnum->exact (cadr rest))) (len (jnum->exact (caddr rest))) (dv (jolt-array-vec (car rest))))
+                (let ((off (jnum->exact (cadr rest))) (len (jnum->exact (caddr rest))) (cbuf (car rest)))
                   (let loop ((i 0))
                     (if (>= i len) (->num i)
                         (let ((c (jnum->exact (read1))))
                           (if (= c -1) (if (= i 0) -1 (->num i))
-                              (begin (vector-set! dv (+ off i) (integer->char c)) (loop (+ i 1)))))))))))
+                              (begin (ja-set! cbuf (+ off i) (integer->char c)) (loop (+ i 1)))))))))))
         (cons "unread"
           (lambda (self ch . rest)
             (if (null? rest)
@@ -1175,11 +1174,11 @@
                   (cons (if (char? ch) (->num (char->integer ch)) ch) (vector-ref (jhost-state self) 1)))
                 ;; unread(char[] cbuf, off, len) — push cbuf[off,off+len) so cbuf[off]
                 ;; reads back first (the list head).
-                (let ((dv (jolt-array-vec ch)) (off (jnum->exact (car rest))) (len (jnum->exact (cadr rest))))
+                (let ((off (jnum->exact (car rest))) (len (jnum->exact (cadr rest))))
                   (let loop ((i (- (+ off len) 1)) (acc (vector-ref (jhost-state self) 1)))
                     (if (< i off)
                         (vector-set! (jhost-state self) 1 acc)
-                        (loop (- i 1) (cons (->num (char->integer (vector-ref dv i))) acc))))))
+                        (loop (- i 1) (cons (->num (char->integer (ja-ref ch i))) acc))))))
             jolt-nil))
         (cons "close" (lambda (self) jolt-nil))
         ;; 1-based, like clojure.lang.LineNumberingPushbackReader's own +1 over the
@@ -1294,12 +1293,11 @@
           ;; (String. char[] [offset count]) — the whole array or a slice. Buffered
           ;; readers (data.json) build a string from a fill buffer this way.
           ((and (jolt-array? x) (eq? (jolt-array-kind x) 'char))
-           (let ((v (jolt-array-vec x)))
-             (if (pair? rest)
-                 (let* ((off (jnum->exact (car rest))) (cnt (jnum->exact (cadr rest))) (out (make-string cnt)))
-                   (let loop ((i 0)) (when (fx<? i cnt) (string-set! out i (vector-ref v (fx+ off i))) (loop (fx+ i 1))))
-                   out)
-                 (list->string (vector->list v)))))
+           (if (pair? rest)
+               (let* ((off (jnum->exact (car rest))) (cnt (jnum->exact (cadr rest))) (out (make-string cnt)))
+                 (let loop ((i 0)) (when (fx<? i cnt) (string-set! out i (ja-ref x (fx+ off i))) (loop (fx+ i 1))))
+                 out)
+               (list->string (ja->list x))))
           ((string? x) x)
           (else (jolt-str-render-one x)))))
 ;; (BigInteger. s) | (BigInteger. s radix) — parse a string in the given radix
@@ -1310,13 +1308,12 @@
 ;; (format "%032x" (BigInteger. 1 bs))). Each byte contributes its UNSIGNED value,
 ;; so the sign of jolt's signed byte array does not leak into the result.
 (define (bigint-from-magnitude signum bytes)
-  (let* ((v (jolt-array-vec bytes))
-         (n (ja-len v)))
+  (let ((n (ja-len bytes)))
     (let loop ((i 0) (acc 0))
       (if (fx>=? i n)
           (* (jnum->exact signum) acc)
           (loop (fx+ i 1)
-                (+ (* acc 256) (bitwise-and (jnum->exact (ja-ref v i)) #xFF)))))))
+                (+ (* acc 256) (bitwise-and (jnum->exact (ja-ref bytes i)) #xFF)))))))
 (define (bigint-ctor v . r)
   (if (and (pair? r) (jolt-array? (car r)))
       (bigint-from-magnitude v (car r))
@@ -2303,8 +2300,8 @@
 
 ;; --- java.util.Arrays -------------------------------------------------------
 ;; Arrays/sort sorts IN PLACE and returns void, so it writes back through the
-;; array's own backing (a Chez vector, or an flvector for the double/float element
-;; kinds) rather than building a new array — orchard.profile relies on
+;; array's own backing (whichever of the four natives-array.ss picks for the
+;; element kind) rather than building a new array — orchard.profile relies on
 ;; (doto (Arrays/copyOfRange …) Arrays/sort). list-sort is a stable merge sort,
 ;; matching Arrays.sort over objects. The comparator goes through cmp->less, the
 ;; shared comparator seam, so a reify/deftype Comparator works here exactly as it
@@ -2312,15 +2309,14 @@
 ;; JVM overloads: sort(a), sort(a, cmp), sort(a, from, to), sort(a, from, to, cmp).
 ;; Two args means a comparator — sort(a, from) is not an overload.
 (define (arrays-sort! a from to cmp)
-  (let* ((bv (jolt-array-vec a))
-         (f (jnum->exact from))
-         (t (if to (jnum->exact to) (ja-len bv)))
+  (let* ((f (jnum->exact from))
+         (t (if to (jnum->exact to) (ja-len a)))
          (less? (cmp->less cmp))
          (items (let loop ((i f) (acc '()))
-                  (if (fx>=? i t) (reverse acc) (loop (fx+ i 1) (cons (ja-ref bv i) acc))))))
+                  (if (fx>=? i t) (reverse acc) (loop (fx+ i 1) (cons (ja-ref a i) acc))))))
     (let loop ((i f) (xs (list-sort less? items)))
       (if (null? xs) jolt-nil
-          (begin (ja-set! bv i (car xs)) (loop (fx+ i 1) (cdr xs)))))))
+          (begin (ja-set! a i (car xs)) (loop (fx+ i 1) (cdr xs)))))))
 (define arrays-sort
   (case-lambda
     ((a) (arrays-sort! a 0 #f jolt-compare))
@@ -2332,24 +2328,24 @@
          (cons "equals" (lambda (a b)
                           (cond ((and (jolt-nil? a) (jolt-nil? b)) #t)
                                 ((or (jolt-nil? a) (jolt-nil? b)) #f)
-                                (else (equal? (jolt-array-vec a) (jolt-array-vec b))))))
+                                (else (ja-equal? a b)))))
          (cons "fill" (lambda (a v)
-                        (let* ((bv (jolt-array-vec a)) (n (ja-len bv))
-                               (v (na-elem-of (jolt-array-kind a) v)))
-                          (do ((i 0 (fx+ i 1))) ((fx=? i n) jolt-nil) (ja-set! bv i v)))))
+                        (let ((n (ja-len a)) (v (na-elem-of (jolt-array-kind a) v)))
+                          (do ((i 0 (fx+ i 1))) ((fx=? i n) jolt-nil) (ja-set! a i v)))))
+         ;; The tail past the source is the element kind's ZERO — nil in a
+         ;; reference array, #\nul in a char[], false in a boolean[] — not the 0
+         ;; every kind used to get regardless.
          (cons "copyOf" (lambda (a n)
-                          (let* ((src (jolt-array-vec a)) (len (jnum->exact n)) (kind (jolt-array-kind a))
-                                 (out (na-make-backing len kind (if (na-fl-kind? kind) 0.0 0))))
-                            (do ((i 0 (fx+ i 1))) ((fx=? i (min len (ja-len src))))
-                              (ja-set! out i (ja-ref src i)))
-                            (make-jolt-array out kind))))
+                          (let* ((len (jnum->exact n)) (kind (jolt-array-kind a))
+                                 (out (make-jolt-array (na-make-backing len kind (na-zero-of kind)) kind)))
+                            (do ((i 0 (fx+ i 1))) ((fx=? i (min len (ja-len a))) out)
+                              (ja-set! out i (ja-ref a i))))))
          (cons "copyOfRange" (lambda (a from to)
-                               (let* ((src (jolt-array-vec a)) (f (jnum->exact from)) (tt (jnum->exact to))
+                               (let* ((f (jnum->exact from)) (tt (jnum->exact to))
                                       (len (- tt f)) (kind (jolt-array-kind a))
-                                      (out (na-make-backing len kind (if (na-fl-kind? kind) 0.0 0))))
-                                 (do ((i 0 (fx+ i 1))) ((fx=? i len))
-                                   (ja-set! out i (ja-ref src (+ f i))))
-                                 (make-jolt-array out kind))))
+                                      (out (make-jolt-array (na-make-backing len kind (na-zero-of kind)) kind)))
+                                 (do ((i 0 (fx+ i 1))) ((fx=? i len) out)
+                                   (ja-set! out i (ja-ref a (+ f i)))))))
          (cons "sort" arrays-sort)
          ;; Arrays.toString is "[a, b]" — comma-separated element toString, "null"
          ;; for a nil array. It used to print the elements as a jolt VECTOR, which
@@ -2357,7 +2353,7 @@
          (cons "toString" (lambda (a)
                             (if (jolt-nil? a) "null"
                                 (let ((parts (map (lambda (x) (if (jolt-nil? x) "null" (jolt-str-render-one x)))
-                                                  (ja->list (jolt-array-vec a)))))
+                                                  (ja->list a))))
                                   (string-append
                                     "[" (if (null? parts) ""
                                             (fold-left (lambda (acc s) (string-append acc ", " s))
@@ -2415,14 +2411,13 @@
     ;; produced a different stream from the JVM's for the same seed. Elements are
     ;; signed bytes (the JVM's (byte)rnd cast).
     (cons "nextBytes" (lambda (self ba)
-                        (let* ((v (jolt-array-vec ba)) (n (vector-length v))
-                               (st (jhost-state self)))
+                        (let* ((n (ja-len ba)) (st (jhost-state self)))
                           (let loop ((i 0))
                             (when (fx<? i n)
                               (let inner ((rnd (random-u32->s32 (random-next 32 st)))
                                           (k (min (fx- n i) 4)) (i i))
                                 (if (fx=? k 0) (loop i)
-                                    (begin (vector-set! v i (na-byte-of (bitwise-and rnd #xff)))
+                                    (begin (ja-set! ba i (na-byte-of (bitwise-and rnd #xff)))
                                            (inner (bitwise-arithmetic-shift-right rnd 8)
                                                   (fx- k 1) (fx+ i 1)))))))
                           jolt-nil)))
@@ -2498,13 +2493,8 @@
 (register-host-methods! "securerandom"
   (list
     (cons "nextBytes" (lambda (self ba)
-                        (let* ((v (jolt-array-vec ba))
-                               (n (vector-length v))
-                               (bv (jolt-random-bytes n)))
-                          (let loop ((i 0))
-                            (when (fx<? i n)
-                              (vector-set! v i (na-byte-of (bytevector-u8-ref bv i)))
-                              (loop (fx+ i 1))))
+                        (let ((n (ja-len ba)))
+                          (ja-bv->bytes! (jolt-random-bytes n) 0 ba 0 n)
                           jolt-nil)))
     (cons "nextInt" (lambda (self . a)
                       (if (pair? a)

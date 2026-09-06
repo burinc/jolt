@@ -1151,10 +1151,12 @@
    {:suite "core / extenders", :label "extends? on inline defrecord impl", :category :host-model}
    {:suite "clojure.core / leaf batch (complement fnil munge etc.)", :label "supers empty set", :category :host-model}
 
-   ;; Array and JVM-shape stubs: jolt has no primitive arrays, no proxies and no
-   ;; Iterator/Enumeration, so to-array yields a vector, the aset-<prim> family
-   ;; writes into it, the coercion views are identity, and the proxy fns answer
-   ;; for the nil proxy the JVM dereferences. Whole suites of documented stubs.
+   ;; Array and JVM-shape stubs: jolt's arrays carry an element KIND but no
+   ;; per-element type check, so the aset-<prim> family writes into any array
+   ;; (the JVM refuses aset-int on an Object[]) and the coercion views are
+   ;; identity; there are no proxies and no Iterator/Enumeration either, so the
+   ;; proxy fns answer for the nil proxy the JVM dereferences. Whole suites of
+   ;; documented stubs.
    {:suite "untested / array stubs (vectors + host buffers)", :label "aset-boolean", :category :host-model}
    {:suite "untested / array stubs (vectors + host buffers)", :label "aset-byte", :category :host-model}
    {:suite "untested / array stubs (vectors + host buffers)", :label "aset-char", :category :host-model}
