@@ -712,7 +712,11 @@
       "#include \"z_data.h\"\n"
       "#include \"launcherc_data.h\"\n"
       "#include \"stdlib_fasls_data.h\"\n"
+      (bld-boot-prefetch-defn)
       "int main(int argc, char *argv[]) {\n"
+      ;; before Sscheme_init: the 18MB boot's readahead then overlaps kernel
+      ;; init and the runtime image top levels instead of stalling behind them.
+      (bld-boot-prefetch-call)
       "  Sscheme_init(0);\n"
       "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, jolt_boot_len);\n"
       "  Sbuild_heap(0, 0);\n"
