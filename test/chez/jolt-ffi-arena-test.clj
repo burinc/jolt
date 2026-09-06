@@ -10,6 +10,7 @@
 ;; failure names the claim rather than the mechanism.
 
 (require '[jolt.ffi :as ffi])
+(require '[jolt.fibers])
 
 (def failures (atom []))
 (defmacro check [label expr]
@@ -138,6 +139,73 @@
            (.start t)
            (.join t)
            (= true @outcome))))
+
+;; One owner THREAD is not one mutator. jolt.host/thread-id is the CARRIER's id,
+;; so every fiber on one carrier passes a confined arena's owner check, and
+;; preemption is polled at procedure entries — a switch lands between the read
+;; and the publish of the arena's state as readily as anywhere else. That is why
+;; the confined fast paths publish with compare-and-set! rather than reset!:
+;; a blind read-modify-write drops a sibling's block on the floor (allocated,
+;; attached to a group that no longer exists, never freed) or re-opens an arena
+;; a sibling has already closed and released.
+;;
+;; Both rows are exact counts, not timing thresholds: a correct publish frees
+;; every block exactly once whatever the interleaving, so neither can flake.
+(defn- on-one-carrier [f]
+  (let [carriers (jolt.fibers/carrier-count)
+        ticks (jolt.fibers/preempt-ticks)]
+    (jolt.fibers/set-carrier-count! 1)
+    (jolt.fibers/set-preempt-ticks! 100)   ; the floor: switch as often as allowed
+    (try (f)
+         (finally (jolt.fibers/set-preempt-ticks! ticks)
+                  (jolt.fibers/set-carrier-count! carriers)))))
+(defn- fibers-doing [n f]
+  (let [fs (doall (map (fn [i] (jolt.fibers/spawn (fn [] (f i) :ok))) (range n)))]
+    (doseq [fb fs] (jolt.fibers/join fb))))
+;; The arena has to be MADE on the carrier too — it belongs to whichever thread
+;; called confined-arena, and that is the carrier, not the spawning thread.
+(defn- carrier-confined-arena []
+  (let [held (atom nil)]
+    (jolt.fibers/join (jolt.fibers/spawn (fn [] (reset! held (ffi/confined-arena)) :ok)))
+    @held))
+
+(check "sibling fibers on one carrier lose no allocation"
+       (let [real-free ffi/__free
+             frees (atom 0)
+             blocks 200]
+         (with-redefs [ffi/__free (fn [p] (swap! frees inc) (real-free p))]
+           (on-one-carrier
+            (fn []
+              (let [a (carrier-confined-arena)]
+                (fibers-doing blocks (fn [_] (ffi/alloc a 8)))
+                (jolt.fibers/join (jolt.fibers/spawn (fn [] (ffi/close-arena a) :ok)))))))
+         (= blocks @frees)))
+;; The close side is the same hazard the other way round, and its window — the
+;; read, then the publish — is a few instructions wide, so racing it with real
+;; fibers is not something a gate can rely on landing. A validator runs on the
+;; atom AFTER the close has read the state and BEFORE it publishes, which is
+;; exactly where the switch goes, so the row drives the interleaving instead of
+;; waiting for it. A sibling's block attached in that window must still be
+;; released: two allocations, two frees.
+(check "a sibling allocation between a close's read and its publish is not dropped"
+       (let [real-free ffi/__free
+             frees (atom 0)
+             a (ffi/confined-arena)
+             state (:jolt.ffi/state a)
+             ;; armed AFTER the install: set-validator! validates the value it
+             ;; finds, so arming first would fire the sibling there instead
+             armed (atom false)]
+         (ffi/alloc a 8)
+         (with-redefs [ffi/__free (fn [p] (swap! frees inc) (real-free p))]
+           (set-validator! state (fn [_]
+                                   (when @armed          ; the sibling allocates once
+                                     (reset! armed false)
+                                     (ffi/alloc a 8))
+                                   true))
+           (reset! armed true)
+           (try (ffi/close-arena a)
+                (finally (set-validator! state nil))))
+         (and (not (ffi/arena-open? a)) (= 2 @frees))))
 
 ;; -- with-open and with-arena -------------------------------------------------
 
