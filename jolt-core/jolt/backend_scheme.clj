@@ -2362,6 +2362,13 @@
   (let [tail? *tail?*]           ; capture: children below emit non-tail
    (binding [*tail?* false]
     (let [fnode (:fn node)
+        ;; TWO parallel vectors, same length, same order, one character apart in
+        ;; name: arg-nodes are the IR NODES, args are their EMITTED STRINGS.
+        ;; Anything that needs to ask a question about an argument — its type, its
+        ;; :num-kind, whether it is a constant — has to read arg-nodes; args can
+        ;; only be spliced into output. Reaching for `args` and calling (:op …) on
+        ;; it yields nil for every argument and fails silently, which is a real bug
+        ;; this file has already shipped once.
         arg-nodes (:args node)
         args (mapv emit arg-nodes)
         tl (or (node-line node) 0)
@@ -2683,9 +2690,18 @@
                               (and (map? nd)
                                    (or (and (= :const (:op nd)) (double? (:val nd)))
                                        (= :double (:num-kind nd)))))
-             coerce-arg (fn [i a]
-                          (if (and (= "double" (nth tags i nil))
-                                   (not (proven-double? (nth arg-nodes i nil))))
+             ;; One tag per ARGUMENT (a record may declare fewer tags than the
+             ;; ctor takes), so the three vectors below are the same length and
+             ;; map together. Mapping rather than indexing three vectors apart is
+             ;; the point: it is what makes pairing a field's tag with another
+             ;; field's argument impossible to write.
+             arg-tags (mapv (fn [i] (nth tags i nil)) (range (count arg-nodes)))
+             ;; field-tag: what the FIELD declares. nd: the IR node being passed
+             ;; into it. a: that node already emitted. Only nd can answer a
+             ;; question about the value. Named field-tag, not tag, because `tag`
+             ;; in this scope is the record's TYPE tag two lines below.
+             coerce-arg (fn [field-tag nd a]
+                          (if (and (= "double" field-tag) (not (proven-double? nd)))
                             (str "(jolt-rec-dbl " a ")") a))
              desc-lookup (str "(hashtable-ref chez-tag-desc " (chez-str-lit tag) " #f)")
              cached-desc (if cells
@@ -2695,7 +2711,7 @@
                            desc-lookup)]
          (order-args (fn [as]
                        (let [n (count as)
-                             as (vec (map-indexed coerce-arg as))]
+                             as (vec (map coerce-arg arg-tags arg-nodes as))]
                          (if (<= n 8)
                            (str "(make-jrec" n " " cached-desc " jolt-nil 0"
                                 (when (pos? n) (str " " (str/join " " as))) ")")
