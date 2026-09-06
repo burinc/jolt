@@ -984,6 +984,21 @@
                       :else n))
             rt (interop-ret-type (get n :target-type) (get n :method))]
         [(if rt rt :any) n])
+
+      ;; The inline pass wraps a spliced body in :coerce to preserve the callee's
+      ;; ^double/^long return coercion (passes/inline.clj, `rbody`). Without an arm
+      ;; here that wrapper fell to :else, which answers :any and returns the node
+      ;; UNWALKED — so nothing inside a spliced return-hinted fn was ever
+      ;; annotated. Every record field read in such a body degraded from a slot
+      ;; read to jolt-get and its arithmetic from the fl ops to the generic ones,
+      ;; which made declaring ^double on a fn's return roughly halve the speed of
+      ;; its inlined copies. A hint must never cost, so the body is inferred and
+      ;; the node rebuilt around it; the coercion's own kind is what it answers.
+      (= op :coerce)
+      (let [r (infer (get node :expr) tenv env)]
+        [(if (= :double (get node :kind)) :double :num)
+         (assoc node :expr (nth r 1))])
+
       :else [:any node])))
 
 (defn- infer-top [node env] (nth (infer node {} env) 1))
