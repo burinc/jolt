@@ -295,7 +295,7 @@
 ;; with trailing args). The user-supplied extra args are appended, so an alias's
 ;; :main-opts and the command line combine exactly like the clj CLI, which
 ;; prepends the alias's :main-opts to the argv.
-(declare repl-session)
+(declare repl-session run-script!)
 
 (defn- apply-main-opts [main-opts extra-args]
   (let [opts (concat main-opts extra-args)]
@@ -313,10 +313,7 @@
       (and (string? (first opts))
            (seq (first opts))
            (not (str/starts-with? (first opts) "-")))
-      (do (push-thread-bindings
-            {#'clojure.core/*command-line-args* (seq (drop-end-of-options (rest opts)))})
-          (load-file (file-arg (first opts)))
-          nil)
+      (run-script! (first opts) (rest opts))
       :else (throw (ex-info (str "unsupported :main-opts " (pr-str (vec opts))
                                  " (accepted: -m NS, -e EXPR, -r, or a script FILE)")
                             {:main-opts (vec opts)})))))
@@ -325,20 +322,41 @@
   (let [s (if (str/starts-with? s "-") (subs s 2) s)]
     (->> (str/split s #":") (remove str/blank?) (map keyword) vec)))
 
+;; Load a FILE as a script: the arguments after it are *command-line-args* (nil
+;; when there are none), and the first standalone -- is consumed as POSIX
+;; end-of-options. Every entry that runs a file goes through here — `jolt FILE`,
+;; `jolt run FILE`, `jolt -f FILE`, and an alias's :main-opts naming a script — so
+;; the four cannot drift apart. The file may open with a `#!/usr/bin/env jolt`
+;; line: the reader takes `#!` as a comment to end of line, the way Clojure's does,
+;; so an executable script needs nothing else to be readable as a program.
+(defn- run-script! [path args]
+  (push-thread-bindings
+    {#'clojure.core/*command-line-args* (seq (drop-end-of-options args))})
+  (load-file (file-arg path))
+  nil)
+
 ;; Does a bare argv token name a file to run (rather than a deps.edn task)? A "-"
 ;; (stdin), an existing file, or a *.jolt/*.clj/*.cljc/*.cljs path. .jolt is the
 ;; same language as .clj and only marks a file as using jolt-specific interop
 ;; rather than portable Clojure.
+;; Asked of the path load-file will actually read (file-arg's, i.e. relative to
+;; the PROJECT directory), never of the raw token: a launcher that cd's away
+;; carries the user's directory in JOLT_PWD, and testing the token against the
+;; process directory made a script with no extension invisible there — `jolt
+;; script.clj` worked, because the extension arm never touches the filesystem,
+;; while `jolt script` fell through to the task lookup and reported an unknown
+;; task. The two arms have to agree about which file they mean.
 ;; A directory is never a file to run, however much it looks like one: `test` is a
 ;; :tasks entry AND a directory in every jolt project, and file-exists? answers #t
 ;; for a directory, so `jolt test` used to be dispatched here and die in
 ;; load-file's decoder ("failed on #<binary input port test>: is a directory")
 ;; rather than running the task.
 (defn- run-file-arg? [x]
-  (and (not (jolt.host/directory? x))
-       (or (= "-" x)
-           (some #(str/ends-with? x %) [".jolt" ".clj" ".cljc" ".cljs"])
-           (jolt.host/file-exists? x))))
+  (or (= "-" x)
+      (let [p (file-arg x)]
+        (and (not (jolt.host/directory? p))
+             (or (some #(str/ends-with? x %) [".jolt" ".clj" ".cljc" ".cljs"])
+                 (jolt.host/file-exists? p))))))
 
 (declare run-task)
 
@@ -353,14 +371,23 @@
       (= "-m" (first more))
       (do (apply-project! (resolve-current)) (run-ns (second more) (drop 2 more)))
 
+      ;; -f/--file FILE — bb's spelling for "this argument is a file", and the only
+      ;; way to run a script whose name a command or a task also answers to: a
+      ;; `build` script in the project root is otherwise the compiler, and a
+      ;; `greet` one that a :tasks entry also names is ambiguous by eye.
+      (#{"-f" "--file"} (first more))
+      (let [path (second more)]
+        (when (nil? path)
+          (throw (ex-info (str (first more) " needs a FILE argument") {})))
+        (apply-project! (resolve-current))
+        (run-script! path (drop 2 more)))
+
       (and (seq more) (not (run-file-arg? (first more))))
       (run-task (first more) (rest more) parallel?)
 
       (seq more)
       (do (apply-project! (resolve-current))
-          (push-thread-bindings
-            {#'clojure.core/*command-line-args* (seq (drop-end-of-options (rest more)))})
-          (load-file (file-arg (first more))) nil)
+          (run-script! (first more) (rest more)))
 
       :else (throw (ex-info "run needs -m NS, a FILE, or a task name" {})))))
 
@@ -805,6 +832,9 @@
   (println "  nrepl-server [port]    start an nREPL server (default 7888) for editors")
   (println "  run -m NS [args]       resolve deps.edn, load NS, call its -main")
   (println "  run FILE [args]        load a Clojure file")
+  (println "  FILE [args]            the same, with `run` left out — so a file whose")
+  (println "                         first line is `#!/usr/bin/env jolt` runs as an")
+  (println "                         executable script, with or without an extension")
   (println "  build -m NS [-o OUT] [--opt|--dev] [--direct-link] [--tree-shake] [--dynamic]")
   (println "              [--library] [--target MACHINE --target-pack DIR]")
   (println "                         compile a standalone binary, or with --library a")
@@ -824,6 +854,7 @@
   (println "  -e - [args]            evaluate an EXPR read from stdin")
   (println "  - [args]               run a program read from stdin (as a script)")
   (println "  -m NS [args]           shorthand for run -m")
+  (println "  -f FILE [args]         load FILE, whose name may be a command or a task")
   (println "  -M[:alias] [main-opts] run the alias's :main-opts, then the ones given")
   (println "                         here (-m NS [args] or -e EXPR [args]); with no")
   (println "                         :main-opts the command line supplies them")
@@ -954,6 +985,7 @@
       (str/starts-with? cmd "-X")        (cmd-X cmd more)
       (str/starts-with? cmd "-T")        (cmd-T cmd more)
       (= cmd "-m")                       (cmd-run (cons "-m" more))
+      (#{"-f" "--file"} cmd)             (cmd-run (cons cmd more))
       (= cmd "build")                    (cmd-build more)
       ;; An -S option jolt doesn't have. Falling through would report it as an
       ;; unknown task, which reads like a typo in the deps.edn rather than an
