@@ -413,17 +413,16 @@
   (unless (eq? (jolt-array-kind src) (jolt-array-kind dst))
     (throw-jvm 'ArrayStoreException "arraycopy between arrays of different types"))
   (let ((sp (na-idx src-pos)) (dp (na-idx dst-pos)) (n (na-idx len))
-        (slen (ja-len (jolt-array-vec src))) (dlen (ja-len (jolt-array-vec dst))))
+        (slen (ja-len src)) (dlen (ja-len dst)))
     (when (or (negative? sp) (negative? dp) (negative? n)
               (> (+ sp n) slen) (> (+ dp n) dlen))
       (jolt-throw (jolt-host-throwable "java.lang.ArrayIndexOutOfBoundsException"
                                        "arraycopy: last source index out of bounds")))
-    (let ((sv (jolt-array-vec src)) (dv (jolt-array-vec dst)))
-      (if (and (eq? sv dv) (< sp dp))
-          (let loop ((i (- n 1)))
-            (when (>= i 0) (ja-set! dv (+ dp i) (ja-ref sv (+ sp i))) (loop (- i 1))))
-          (let loop ((i 0))
-            (when (< i n) (ja-set! dv (+ dp i) (ja-ref sv (+ sp i))) (loop (+ i 1))))))
+    ;; ja-copy-range! (natives-array.ss) owns the move: a block copy between two
+    ;; bytevector backings, and the descending walk when the regions overlap
+    ;; forwards inside one array — which is what gives the JVM's "as if the source
+    ;; were copied to a temporary first" without the temporary.
+    (ja-copy-range! src sp dst dp n)
     jolt-nil))
 
 ;; java.lang.Long.bitCount: the population count of the value's 64-bit two's-
@@ -639,7 +638,7 @@
                 (let ((idx (jnum->exact i)))
                   (->num (char->integer
                           (if (jolt-array? s)
-                              (vector-ref (jolt-array-vec s) idx)
+                              (ja-ref s idx)
                               (string-ref (jolt-str-render-one s) idx)))))))
         ;; Character.codePointOf(name) is deliberately absent: it is a lookup in the
         ;; Unicode character-name database, which this host does not carry, and a
@@ -680,7 +679,7 @@
         (cons "valueOf" (lambda (x . _)
                           (cond ((jolt-nil? x) "null")
                                 ((and (jolt-array? x) (eq? (jolt-array-kind x) 'char))
-                                 (list->string (vector->list (jolt-array-vec x))))
+                                 (list->string (ja->list x)))
                                 (else (jolt-str-render-one x)))))
         ;; String.join(delim, elems) — elems as a collection or spread as varargs,
         ;; the two shapes the JVM overloads on.
@@ -710,7 +709,7 @@
                                 ;; loaded after this file — resolved at call time.
                                 (args (if (and (pair? args) (null? (cdr args))
                                                (jolt-array? (car args)))
-                                          (ja->list (jolt-array-vec (car args)))
+                                          (ja->list (car args))
                                           args)))
                            ;; The locale drives the decimal separator: the JVM
                            ;; renders %.3f of 123.04455 as "123,045" under de.
