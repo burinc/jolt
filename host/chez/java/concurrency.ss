@@ -2462,9 +2462,12 @@
         (unless enq (jolt-invoke thunk))
         jolt-nil)))
 
-;; (exit 0) rather than calling _exit: the exit handler runs the hooks, so ^C
+;; (exit …) rather than calling _exit: the exit handler runs the hooks, so ^C
 ;; while parked reaches exactly the same cleanup every other exit path does.
-(define jolt-pump-kih (lambda () (exit 0)))
+;; 130 = 128+SIGINT, the status a shell reports for a process killed by ^C and
+;; what the shutdown watcher exits with — the two ^C paths must not disagree on
+;; the status just because of which one got there first.
+(define jolt-pump-kih (lambda () (exit 130)))
 
 ;; Park the calling thread until a keyboard interrupt (^C), running the shutdown
 ;; hooks and exiting when it arrives — AND own the main-thread pump while parked.
@@ -2494,7 +2497,14 @@
 (define jolt-park-poll-ms 50)
 (define (jolt-park-until-interrupt)
   (keyboard-interrupt-handler jolt-pump-kih)
-  (jolt-set-sigint-blocked #f)
+  ;; …unless the shutdown watcher already owns SIGINT (it does whenever a hook was
+  ;; registered, which is the nREPL server's own case). Unblocking here would let
+  ;; the kernel deliver ^C to this thread instead of leaving it pending for
+  ;; sigwait, and then the two paths race for the same shutdown. The watcher's is
+  ;; the one that works from a foreign call, so leave the signal to it; the
+  ;; handler above stays installed for the unarmed case.
+  (unless (jolt-shutdown-watcher-running?)
+    (jolt-set-sigint-blocked #f))
   (jolt-with-mutex jolt-main-queue-mu (set-box! jolt-main-pump-active #t))
   (dynamic-wind
     (lambda () #f)
@@ -2629,8 +2639,9 @@
 ;;   - on every (exit n), via the exit handler the arming below installs — a
 ;;     -main that returns, an explicit (System/exit n), and an uncaught throw all
 ;;     end there;
-;;   - on ^C while parked in park-until-interrupt (jolt-pump-kih exits);
-;;   - on SIGTERM / SIGHUP, through the watcher thread further down.
+;;   - on SIGINT (^C), SIGTERM and SIGHUP, through the watcher thread further down;
+;;   - on ^C while parked in park-until-interrupt without the watcher armed
+;;     (jolt-pump-kih exits) — the fallback for a hook-free park.
 ;; Once per process, in registration order, each hook isolated so one that
 ;; throws cannot keep the rest from running.
 ;;
@@ -2708,14 +2719,29 @@
           (apply base args)))))
   jolt-nil)
 
-;; --- SIGTERM / SIGHUP --------------------------------------------------------
+;; --- SIGTERM / SIGHUP / SIGINT -----------------------------------------------
 ;; The signals a JVM runs shutdown hooks for and jolt can take over: SIGTERM (the
-;; default `kill`, what a supervisor sends) and SIGHUP. Same numbers on Linux and
-;; macOS. SIGINT is deliberately NOT here — Chez owns it through
-;; keyboard-interrupt-handler, and ^C reaches a child through the foreground
-;; process group anyway.
-(define jolt-shutdown-signals '(15 1))
+;; default `kill`, what a supervisor sends), SIGHUP, and SIGINT (^C). Same numbers
+;; on Linux and macOS.
+;;
+;; SIGINT used to be left out on the grounds that Chez owns it through
+;; keyboard-interrupt-handler. It does — and that is exactly the problem: Chez's
+;; handler unwinds to its own top level, which under a script means exiting 255
+;; without ever reaching the exit handler. So a program with a registered hook
+;; ^C'd ran no hook at all, while the same program `kill`ed ran every one of them
+;; (jolt-na7). A JVM makes no such distinction: ^C runs the hooks and exits 130.
+;; Taking SIGINT here makes the two agree.
+;;
+;; This only ever applies to a program that registered a shutdown hook — arming is
+;; what installs the mask, and it happens on the first registration (see below).
+;; A program with nothing to clean up keeps Chez's ^C behavior untouched, and a
+;; CHILD process never inherits the mask (jolt-with-empty-sigmask, further down),
+;; so ^C on the foreground process group still kills subprocesses outright.
+(define jolt-shutdown-signals '(15 1 2))
 (define jolt-shutdown-sigset #f)
+;; #t once the sigwait watcher owns the signals above — park-until-interrupt reads
+;; it to decide whether SIGINT is still Chez's to deliver.
+(define (jolt-shutdown-watcher-running?) (and jolt-shutdown-sigset #t))
 (define c-sigwait (jolt-foreign-proc-blocking "sigwait" '(void* void*) 'int))
 ;; The watcher cannot leave through Chez's (exit): called off the main thread it
 ;; never returns. It has already run the hooks and flushed by then, so _exit is
@@ -2769,9 +2795,9 @@
 ;; Both spawn paths hand the calling thread's mask straight to the child —
 ;; posix_spawn with a NULL attrp, and Chez's own fork — and jolt blocks signals
 ;; in threads for its own reasons: SIGINT so ^C reaches the thread parked in
-;; park-until-interrupt rather than an nREPL worker sitting in a foreign call,
-;; SIGTERM/SIGHUP so the watcher above can take them. Either one inherited is
-;; wrong in a way that bites at once: a child with SIGTERM blocked survives the
+;; park-until-interrupt rather than an nREPL worker sitting in a foreign call, and
+;; SIGINT/SIGTERM/SIGHUP so the watcher above can take them. Either one inherited
+;; is wrong in a way that bites at once: a child with SIGTERM blocked survives the
 ;; very destroy the shutdown hook exists to call, and a child with SIGINT blocked
 ;; ignores ^C (jolt-e5sb). A JVM gives its children a default mask; so does this.
 ;;

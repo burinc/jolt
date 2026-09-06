@@ -718,9 +718,11 @@
       ;; accept-loop future — and the conn-handler futures it spawns — inherit a
       ;; blocked SIGINT mask. Without this, ^C lands on the accept loop blocked in
       ;; c-accept (a foreign call), where Chez can't fire the keyboard-interrupt
-      ;; handler, and the server hangs. park-until-interrupt unblocks SIGINT here
-      ;; once its own ^C handler is installed, so ^C reaches this thread and the
-      ;; shutdown hooks run cleanly.
+      ;; handler, and the server hangs. Registering the stop hook below then arms
+      ;; the shutdown watcher, which takes SIGINT along with SIGTERM/SIGHUP, so ^C
+      ;; is picked up by sigwait and the hooks run cleanly wherever this thread is.
+      ;; (park-until-interrupt keeps SIGINT blocked while that watcher is running,
+      ;; and only unblocks it for its own ^C handler when nothing armed one.)
       (jolt.host/block-sigint)
       (let [stop ((resolve 'jolt.nrepl/start) port (:nrepl-middleware resolved))]
         ;; register stop so ^C (handled by park-until-interrupt) closes the socket
