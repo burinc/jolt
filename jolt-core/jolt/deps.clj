@@ -1360,6 +1360,25 @@
       (catch :default _
          (rm-f stage)))))
 
+(defn- resolution-empty?
+  "True when a resolution found nothing at all — no roots, no libs, no natives,
+  nothing to prep. Worth its own predicate because that is the common case for
+  `jolt -e` outside a project, and it is the one case the cache must NOT write.
+
+  Two reasons. The entry would buy nothing: what it stores is the empty map, and
+  recomputing that is the 2ms `bench/startup-phases.sh` attributes to dispatch,
+  with no graph to expand and no network to touch. And writing it has a cost that
+  is not jolt's to impose — cpcache-write! mkdirs its directory, so a one-off
+  `jolt -e` left a .jolt/ behind in whatever directory it was run from, project
+  or not. A real project resolves something and still caches."
+  [r]
+  (and (empty? (:roots r))
+       (empty? (:libs r))
+       (empty? (:natives r))
+       (empty? (:provides r))
+       (empty? (:prep r))
+       (empty? (:min-versions r))))
+
 (declare user-deps-path)   ; defined below with the deps.edn readers
 
 (defn- resolve-deps-cached
@@ -1387,7 +1406,9 @@
         (do (info "cpcache hit") cached)
         (let [r (resolve-deps deps project-dir opts)]
           (info "cpcache miss")
-          (cpcache-write! project-dir k material r)
+          (if (resolution-empty? r)
+            (info "cpcache not written (nothing resolved)")
+            (cpcache-write! project-dir k material r))
           r)))
     (resolve-deps deps project-dir opts)))
 
