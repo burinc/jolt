@@ -5,6 +5,42 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A relative `:jolt/native` path resolves against the deps.edn that declared
+  it.** A project ships its shared object or archive beside its own sources —
+  `native/libfoo.so`, which is what a build task produces — and a dependency does
+  the same in its own tree. Two of the three places that read those paths got the
+  base wrong:
+
+  - a **`:static` archive** was handed to `cc` verbatim, so it resolved against
+    the build's working directory. A dependency's could never work, and a
+    project's own only worked when the build happened to run from the project
+    dir — which `bin/jolt`, which `cd`s to the jolt tree, never does. The failure
+    was `ld: cannot find native/libfoo.a`;
+  - a **dependency's** runtime candidate resolved against the *application's*
+    directory rather than the dependency's, because the collected specs dropped
+    the root of the deps.edn they came from.
+
+  Each spec now carries that root and both paths resolve against it. `dlopen`'s
+  own rule is unchanged: a candidate with no separator is still a soname for the
+  loader to search for, not a file to look up. A `:static` `:archive` or
+  `:libdir` is a linker path, so a bare filename there resolves against the root
+  too — `ld` reads `libfoo.a` as a file in the current directory, not a name to
+  search for.
+
+### Added
+
+- **`jolt build` says which `:jolt/native` libraries stay dynamic.** Everything
+  else a build produces is inside the binary, so a library that is loaded at
+  runtime is the one reason the result is not the dependency-free artifact a
+  static build is taken to be — and nothing said so. The build now names them and
+  points at the `:static` key that would link one in. A system library the OS
+  resolves by soname is the normal case and this is not a warning; a fully static
+  build prints nothing.
+
 ## [0.8.3] - 2026-09-06
 
 A primitive array holds its elements unboxed, and a type hint costs nothing it
