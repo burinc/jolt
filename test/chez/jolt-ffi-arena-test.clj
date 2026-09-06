@@ -40,6 +40,15 @@
            (ffi/close-arena a)
            (ffi/close-arena a))
          (= 1 @frees)))
+(check "a single-block release failure still forgets its size"
+       (let [a (ffi/confined-arena)
+             p (ffi/alloc a 8)
+             real-free ffi/__free]
+         (with-redefs [ffi/__free (fn [addr]
+                                    (real-free addr)
+                                    (throw (ex-info "free reported failure" {})))]
+           (rejects? #(ffi/close-arena a)))
+         (zero? (ffi/size p))))
 ;; The check and the attach are one step. If they were not, an alloc that passed
 ;; the check just before another thread's close would conj its block onto the
 ;; state close had already reset — attached to a group nothing will ever release.
@@ -57,6 +66,22 @@
                                         p))]
            (and (rejects? #(ffi/alloc a 8))
                 ;; the block the alloc had already taken was handed back
+                (= 1 @frees)))))
+(check "a confined block cannot attach after reentrant owner close"
+       (let [a (ffi/confined-arena)
+             real-free ffi/__free
+             real-calloc ffi/__calloc
+             frees (atom 0)]
+         (with-redefs [ffi/__free (fn [p] (swap! frees inc) (real-free p))
+                       ffi/__calloc (fn [n]
+                                      (let [p (real-calloc n)]
+                                        ;; Simulate an allocator boundary that
+                                        ;; re-enters owner-thread code and closes
+                                        ;; between the open check and attachment.
+                                        (ffi/close-arena a)
+                                        p))]
+           (and (rejects? #(ffi/alloc a 8))
+                (not (ffi/arena-open? a))
                 (= 1 @frees)))))
 (check "a lost allocation is not left recorded in the size table"
        (let [a (ffi/shared-arena)
@@ -96,6 +121,16 @@
          (.join t)
          (ffi/close-arena a)
          (= true @outcome)))
+(check "a confined arena refuses a close from another thread"
+       (let [a (ffi/confined-arena)
+             outcome (atom nil)
+             t (Thread. (fn []
+                          (reset! outcome [(rejects? #(ffi/close-arena a))
+                                           (ffi/arena-open? a)])))]
+         (.start t)
+         (.join t)
+         (ffi/close-arena a)
+         (= [true true] @outcome)))
 (check "a shared arena accepts another thread"
        (with-open [a (ffi/shared-arena)]
          (let [outcome (atom nil)
@@ -576,6 +611,16 @@
              (ffi/callback a compare-int32 [:pointer :pointer] :int)
              (ffi/close-arena a)))
          (= [3 1] [@frees @callables])))
+(check "close releases multiple blocks in reverse allocation order"
+       (let [a (ffi/confined-arena)
+             blocks [(ffi/alloc a 8) (ffi/alloc a 8) (ffi/alloc a 8)]
+             real-free ffi/__free
+             released (atom [])]
+         (with-redefs [ffi/__free (fn [p]
+                                    (swap! released conj p)
+                                    (real-free p))]
+           (ffi/close-arena a))
+         (= (vec (reverse blocks)) @released)))
 (check "a cleanup that raises does not strand the rest of the group"
        (let [real-free ffi/__free
              frees (atom 0)]
