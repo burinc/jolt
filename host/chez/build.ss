@@ -2053,6 +2053,23 @@
               (if petite-only? '() (list scheme))
               (map cadr units)))
     (ei-mark! "make-boot-file")
+    ;; vfasl: the same win jolt's own boot gets (build-jolt.ss) — the kernel loads
+    ;; a prebuilt image straight into the static generation instead of walking a
+    ;; fasl stream and allocating, and Sbuild_heap's Scompact_heap then has far
+    ;; less to compact. Best effort: sa-vfasl-convert-file answers #f rather than
+    ;; raising, and the plain boot that is already on disk stays the payload.
+    ;;
+    ;; NOT when cross-compiling. Unlike build-with-cc and build-shared, which run
+    ;; their conversion inside the fresh-Chez compile script and so inherit the
+    ;; xpatch's retargeted constants, this one runs in THIS process — the host's.
+    ;; $fasl-to-vfasl lays the image out for a specific machine, so converting a
+    ;; target's boot with host constants would produce a broken binary. A cross
+    ;; build keeps the plain boot.
+    (unless (bld-cross?)
+      (let ((vboot (string-append boot ".vfasl")))
+        (when (sa-vfasl-convert-file boot vboot)
+          (set! boot vboot)
+          (ei-mark! "vfasl-convert"))))
     ;; The stub is the native launcher the boot is appended to. With no :static
     ;; natives it's the prebuilt one bundled in jolt (no cc needed); with :static
     ;; natives it's re-linked here from the bundled kernel + launcher source so the
@@ -2180,9 +2197,15 @@
           (if petite-only?
               ""
               (string-append (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "))
-          (ei-str-lit flat-so) ")\n"))
+          (ei-str-lit flat-so) ")\n"
+          ;; vfasl, in THIS script so a cross build gets the xpatch's retargeted
+          ;; constants the way make-boot-file above does — see build-jolt.ss.
+          "(vfasl-convert-file " (ei-str-lit boot) " "
+          (ei-str-lit (string-append boot ".vfasl")) " '())\n"))
       (close-port p))
     (bld-system (string-append bld-chez " --script '" cs "'")))
+  ;; the converted boot is what gets embedded
+  (set! boot (string-append boot ".vfasl"))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   ;; The xxd symbol is derived from the path; normalize to jolt_boot.
   (bld-system (string-append
@@ -2275,9 +2298,13 @@
           "(make-boot-file " (ei-str-lit boot) " '()\n  "
           (ei-str-lit (string-append (bld-csv-dir) "/petite.boot")) "\n  "
           (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "
-          (ei-str-lit flat-so) ")\n"))
+          (ei-str-lit flat-so) ")\n"
+          ;; vfasl, as in build-with-cc and build-jolt.ss
+          "(vfasl-convert-file " (ei-str-lit boot) " "
+          (ei-str-lit (string-append boot ".vfasl")) " '())\n"))
       (close-port p))
     (bld-system (string-append bld-chez " --script '" cs "'")))
+  (set! boot (string-append boot ".vfasl"))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   (bld-system (string-append
     "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/unsigned char jolt_boot[]/; "

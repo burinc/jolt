@@ -683,6 +683,19 @@
 (define (sa-make-boot-file out base-boots)
   (apply make-boot-file out '() base-boots))
 
+;; (sa-vfasl-convert-file in out) -> boolean
+;; Rewrite the boot file IN to OUT in Chez's vfasl format: a prebuilt image of
+;; what loading the fasl would have produced, laid out per space and loaded
+;; straight into the static generation, which is worth roughly a third of jolt's
+;; own startup (see build-jolt.ss). Contract: produce a boot the target's runtime
+;; can boot from, or answer #f. Degradation: #f rather than raise — an app that
+;; boots slower is strictly better than an app that fails to build, and the
+;; caller keeps the plain boot it already has.
+(define (sa-vfasl-convert-file in out)
+  (guard (e (#t #f))
+    (vfasl-convert-file in out '())
+    #t))
+
 ;; (sa-fasl-write obj port [externals-pred]) -> void
 ;; fasl-serialize OBJ to PORT, optionally under the externals predicate
 ;; state-image.ss passes so refused objects are COLLECTED as externals instead
