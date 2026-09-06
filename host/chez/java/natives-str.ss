@@ -537,10 +537,10 @@
     ;; char-array dst at dstBegin (used by buffered readers, e.g. data.json).
     ((string=? method "getChars")
      (let ((src-begin (jolt->idx (arg 0))) (src-end (jolt->idx (arg 1)))
-           (dv (jolt-array-vec (arg 2))) (dst-begin (jolt->idx (arg 3))))
+           (dst (arg 2)) (dst-begin (jolt->idx (arg 3))))
        (let loop ((i src-begin) (j dst-begin))
          (when (fx<? i src-end)
-           (vector-set! dv j (string-ref s i))
+           (ja-set! dst j (string-ref s i))
            (loop (fx+ i 1) (fx+ j 1)))))
      jolt-nil)
     ((string=? method "subSequence") (jolt-str-sub-sequence s (arg 0) (arg 1)))

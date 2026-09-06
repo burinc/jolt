@@ -57,7 +57,7 @@
 ;; Paths.get(first, more...) — join with the separator, no normalization. The
 ;; varargs `more` arrives as a jolt String[] (from into-array); spread it.
 (define (npath-spread-args args)
-  (apply append (map (lambda (x) (if (jolt-array? x) (vector->list (jolt-array-vec x)) (list x))) args)))
+  (apply append (map (lambda (x) (if (jolt-array? x) (ja->list x) (list x))) args)))
 (define (npath-get first . more)
   (let ((s (fold-left (lambda (acc x)
                         (let ((p (npath-string-of x)))

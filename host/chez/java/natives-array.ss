@@ -53,12 +53,56 @@
 
 (define (na-idx i) (if (and (number? i) (not (exact? i))) (exact (floor i)) (jolt-need-num i)))
 
-;; A double/float jolt-array is backed by a Chez FLVECTOR (unboxed flonums); every
-;; other kind keeps a boxed Chez vector. These helpers let the collection
-;; dispatchers (count/seq/nth/ref-put!/aset/aclone) and java.util.Arrays work over
-;; either backing. Chez has flvector? / make-flvector / flvector-ref / -set! / -length.
+;; --- backings ---------------------------------------------------------------
+;; An element kind picks the Chez vector type that holds its elements UNBOXED:
+;;
+;;   double / float      flvector     (unboxed flonums)
+;;   int / long / short   fxvector     (unboxed fixnums)
+;;   byte                bytevector   (one signed byte per element)
+;;   char / boolean / object          a boxed Chez vector
+;;
+;; The unboxed backings are not a memory saving alone — a bytevector is 8x
+;; smaller than a vector of the same bytes, and the GC walks neither an fxvector
+;; nor a bytevector at all, so a large numeric array stops being traced work on
+;; every collection.
+;;
+;; EVERY accessor below dispatches on the BACKING, never on the kind, and a boxed
+;; vector is a valid backing for any kind. That is what makes two things work:
+;; the WIDENING below (ja-promote! — an int/long array handed a bignum swaps its
+;; fxvector for a boxed vector and keeps going), and an array restored from an
+;; image written before this change (a vector-backed byte array reads and writes
+;; exactly as it did).
 (define (na-fl-kind? k) (or (eq? k 'double) (eq? k 'float)))
-(define (ja-len v)     (if (flvector? v) (flvector-length v) (vector-length v)))
+;; int/long/short — the kinds whose elements are JVM integers, so a fixnum holds
+;; one whenever jolt's own numeric tower keeps it a fixnum.
+(define (na-fx-kind? k) (or (eq? k 'int) (eq? k 'long) (eq? k 'short)))
+
+;; --- element access ---------------------------------------------------------
+;; ja-ref / ja-set! / ja-len and the rest take the ARRAY, not the backing:
+;; ja-set! may REPLACE the backing (the widening below), which needs the record
+;; to write through. The two ja-backing-* here take the backing their caller
+;; already read.
+;;
+;; MACROS, not procedures: these two are the innermost thing an element access
+;; does, and at optimize-level 2 a call does not inline — a procedure here cost
+;; ~2ns of an 8ns proven-^longs aget, which is the whole point of that path.
+;;
+;; The remaining tag test is what transparent widening costs: an int/long array is
+;; an fxvector until a bignum store swaps in a boxed vector, so the read has to
+;; ask which it is holding — about 1ns on a hinted aget, against a major
+;; collection over a live 20M-element array falling from 45ms to 0.4ms because
+;; the collector no longer walks it. (A ^doubles read still asks nothing: its
+;; flvector is a promise that kind can keep.) fxvector is tested FIRST because
+;; the hinted numeric read is the one that exists to be in a tight loop —
+;; ^objects, whose backing is always a vector, pays the extra test instead.
+(define-syntax ja-backing-len
+  (syntax-rules ()
+    ((_ b) (let ((v b))
+             (cond ((fxvector? v) (fxvector-length v))
+                   ((vector? v) (vector-length v))
+                   ((bytevector? v) (bytevector-length v))
+                   (else (flvector-length v)))))))
+(define (ja-len a) (ja-backing-len (jolt-array-vec a)))
 ;; alength in call position (op registry): the count of any array-like, but nil
 ;; is the NullPointerException the JVM raises rather than 0.
 ;; The message names what was read, as the reference's helpful NPE does
@@ -72,52 +116,157 @@
       (jolt-count a)))
 ;; An out-of-range index on the generic aget/aset path throws the typed JVM
 ;; exception with the JVM message. The proven ^doubles fast path (jolt-flaget/
-;; jolt-flaset below) skips this pre-check — it relies on flvector-ref's own
-;; range check and its condition classifies at inspection time instead.
+;; jolt-flaset below) and the unboxed jolt-vaget/jolt-vaset skip this pre-check —
+;; they rely on the backing primitive's own range check, and its condition
+;; classifies at inspection time instead (host-faults.ss array-index-whos).
 (define (na-oob-throw i n)
   (jolt-throw (jolt-host-throwable "java.lang.ArrayIndexOutOfBoundsException"
                                    (format "Index ~a out of bounds for length ~a" i n))))
+;; The bounds test takes the BACKING its caller already read: jolt-array-vec is a
+;; checked record accessor (a type test per call), and reading it once per access
+;; rather than once per helper is worth ~10% of an untyped aget.
 (define (ja-check v i)
-  (unless (and (fixnum? i) (fx>=? i 0) (fx<? i (ja-len v)))
+  (unless (and (fixnum? i) (fx>=? i 0) (fx<? i (ja-backing-len v)))
     (if (jolt-nil? i)
         (throw-jvm 'NullPointerException "array index is nil")
-        (na-oob-throw i (ja-len v)))))
-(define (ja-ref v i)
-  (ja-check v i)
-  (if (flvector? v) (flvector-ref v i) (vector-ref v i)))
-(define (ja-set! v i x)
-  (ja-check v i)
-  (if (flvector? v)
-      (flvector-set! v i (if (flonum? x) x (exact->inexact x)))
-      (vector-set! v i x)))
-(define (ja->list v)
-  (if (flvector? v)
-      (let loop ((i (- (flvector-length v) 1)) (acc '()))
-        (if (< i 0) acc (loop (- i 1) (cons (flvector-ref v i) acc))))
-      (vector->list v)))
-(define (ja-copy v)
-  (if (flvector? v)
-      (let* ((n (flvector-length v)) (r (make-flvector n 0.0)))
-        (do ((i 0 (+ i 1))) ((= i n) r) (flvector-set! r i (flvector-ref v i))))
-      (vector-copy v)))
+        (na-oob-throw i (ja-backing-len v)))))
+(define-syntax ja-backing-ref
+  (syntax-rules ()
+    ((_ b k) (let ((v b) (i k))
+               (cond ((fxvector? v) (fxvector-ref v i))
+                     ((vector? v) (vector-ref v i))
+                     ((bytevector? v) (bytevector-s8-ref v i))
+                     (else (flvector-ref v i)))))))
+(define (ja-ref a i)
+  (let ((v (jolt-array-vec a)))
+    (ja-check v i)
+    (ja-backing-ref v i)))
+;; Widen an fxvector backing to a boxed vector, in place, and answer the new one.
+;; THE one place an array's representation changes after construction: jolt's
+;; integers promote to bignums past Chez's 2^60 fixnum ceiling (that is the whole
+;; numeric model — see test/conformance/known-divergences.edn), so a long array
+;; handed Long/MAX_VALUE has to keep it. Rather than refuse the store or lose the
+;; value, the array widens once and behaves exactly as it did before this change.
+;; Rare by construction: nothing that fits in a JVM int can trigger it.
+(define (ja-promote! a)
+  (let* ((v (jolt-array-vec a)) (n (fxvector-length v)) (w (make-vector n 0)))
+    (do ((i 0 (fx+ i 1))) ((fx=? i n)) (vector-set! w i (fxvector-ref v i)))
+    (jolt-array-vec-set! a w)
+    w))
+(define (ja-set! a i x)
+  (let ((v (jolt-array-vec a)))
+    (ja-check v i)
+    (cond ((vector? v) (vector-set! v i x))
+          ((fxvector? v)
+           (if (fixnum? x) (fxvector-set! v i x) (vector-set! (ja-promote! a) i x)))
+          ;; -128..127, whatever magnitude the caller spelled: na-byte-of is the
+          ;; one narrowing seam and bytevector-s8-set! would refuse anything else.
+          ;; A value already in range is stored as it is — the common case, and
+          ;; na-byte-of's truncate/mask/fold is three operations to answer itself.
+          ((bytevector? v)
+           (bytevector-s8-set! v i (if (and (fixnum? x) (fx<=? -128 x 127)) x (na-byte-of x))))
+          (else (flvector-set! v i (if (flonum? x) x (exact->inexact x)))))))
+;; Element-wise equality over two arrays — java.util.Arrays/equals. Same backing
+;; type on both sides is one `equal?` over the backing (a bytevector or fxvector
+;; comparison is a block compare); a promoted array meeting an unpromoted one is
+;; the mixed case, and takes the element walk rather than answering #f on a
+;; representation difference the caller cannot see.
+(define (ja-equal? a b)
+  (let ((va (jolt-array-vec a)) (vb (jolt-array-vec b)))
+    (if (or (and (vector? va) (vector? vb))
+            (and (fxvector? va) (fxvector? vb))
+            (and (bytevector? va) (bytevector? vb))
+            (and (flvector? va) (flvector? vb)))
+        (equal? va vb)
+        (let ((n (ja-backing-len va)))
+          (and (fx=? n (ja-backing-len vb))
+               (let loop ((i 0))
+                 (or (fx=? i n)
+                     (and (equal? (ja-backing-ref va i) (ja-backing-ref vb i))
+                          (loop (fx+ i 1))))))))))
+(define (ja->list a)
+  (let ((v (jolt-array-vec a)))
+    (cond ((vector? v) (vector->list v))
+          ((fxvector? v) (fxvector->list v))
+          (else (let loop ((i (fx- (ja-backing-len v) 1)) (acc '()))
+                  (if (fx<? i 0) acc (loop (fx- i 1) (cons (ja-backing-ref v i) acc))))))))
+;; A fresh backing holding the same elements — aclone's copy, and the one
+;; java.util.Arrays hands its copyOf results.
+(define (ja-copy a)
+  (let ((v (jolt-array-vec a)))
+    (cond ((vector? v) (vector-copy v))
+          ((fxvector? v) (fxvector-copy v))
+          ((bytevector? v) (bytevector-copy v))
+          (else (let* ((n (flvector-length v)) (r (make-flvector n 0.0)))
+                  (do ((i 0 (fx+ i 1))) ((fx=? i n) r) (flvector-set! r i (flvector-ref v i))))))))
+;; --- building a backing -----------------------------------------------------
+;; An init value the kind's unboxed backing cannot hold — a bignum for an
+;; fxvector, anything non-numeric — starts the array boxed rather than raising:
+;; same rule as promotion, decided once at construction.
 (define (na-make-backing n kind init)
-  (if (na-fl-kind? kind)
-      (make-flvector (exact n) (if (flonum? init) init (exact->inexact init)))
-      (make-vector (exact n) init)))
+  (let ((n (exact n)))
+    (cond ((na-fl-kind? kind) (make-flvector n (if (flonum? init) init (exact->inexact init))))
+          ((na-fx-kind? kind) (if (fixnum? init) (make-fxvector n init) (make-vector n init)))
+          ((eq? kind 'byte) (make-bytevector n (na-byte-of init)))
+          (else (make-vector n init)))))
 (define (na-list->backing lst kind)
-  (if (na-fl-kind? kind)
-      (let* ((n (length lst)) (fv (make-flvector n 0.0)))
-        (let loop ((i 0) (l lst))
-          (if (null? l) fv (begin (flvector-set! fv i (exact->inexact (car l))) (loop (+ i 1) (cdr l))))))
-      (list->vector lst)))
+  (cond ((na-fl-kind? kind)
+         (let* ((n (length lst)) (fv (make-flvector n 0.0)))
+           (let loop ((i 0) (l lst))
+             (if (null? l) fv (begin (flvector-set! fv i (exact->inexact (car l))) (loop (+ i 1) (cdr l)))))))
+        ((and (na-fx-kind? kind) (for-all fixnum? lst)) (list->fxvector lst))
+        ;; every element narrowed on the way in, so the seq of a byte array
+        ;; agrees with what a raw-byte consumer reads out of it
+        ((eq? kind 'byte)
+         (let* ((n (length lst)) (bv (make-bytevector n)))
+           (let loop ((i 0) (l lst))
+             (if (null? l) bv (begin (bytevector-s8-set! bv i (na-byte-of (car l))) (loop (+ i 1) (cdr l)))))))
+        (else (list->vector lst))))
 
-;; A byte array's elements are signed-byte-folded, the same coercion aset applies
-;; through na-elem-of — so (into-array Byte/TYPE …) stores bytes rather than whatever
-;; magnitude it was handed. Only that kind needs the pass, so the common path keeps
-;; building the backing straight off the seq.
+;; Copy n elements from SRC at soff into DST at doff — the region move behind
+;; System/arraycopy, a ByteBuffer bulk get/put and a heap slice. Two bytevector
+;; backings are one block move (memmove-shaped, so an overlapping region inside
+;; one byte array is correct without the backwards walk); everything else steps,
+;; descending when the regions overlap forwards in the SAME backing, which is
+;; what gives arraycopy's "as if through a temporary" without the temporary.
+(define (ja-copy-range! src soff dst doff n)
+  (let ((sv (jolt-array-vec src)) (dv (jolt-array-vec dst)))
+    (cond
+      ((and (bytevector? sv) (bytevector? dv)) (bytevector-copy! sv soff dv doff n))
+      ((and (eq? sv dv) (< soff doff))
+       (let loop ((i (- n 1)))
+         (when (>= i 0) (ja-set! dst (+ doff i) (ja-ref src (+ soff i))) (loop (- i 1)))))
+      (else
+       (let loop ((i 0))
+         (when (< i n) (ja-set! dst (+ doff i) (ja-ref src (+ soff i))) (loop (+ i 1))))))))
+
+;; --- the raw-bytes seam ------------------------------------------------------
+;; A byte array and a Chez bytevector now hold their bytes the same way, so the
+;; bridge in both directions is a block copy where it used to be an element loop
+;; with a sign fold per byte. Both directions COPY: a bytevector handed to
+;; na-bv->bytearray usually belongs to the caller (a port read buffer), and
+;; na-bytearray->bv's result travels to decoders that must not see later writes.
+;;
+;; A boxed backing (a promoted array, or one restored from an older image) still
+;; takes the loop — hence the pair of arms rather than a bare bytevector-copy.
+(define (ja-bytes->bv! a off bv bvoff n)   ; byte array -> bytevector
+  (let ((v (jolt-array-vec a)))
+    (if (bytevector? v)
+        (bytevector-copy! v off bv bvoff n)
+        (do ((i 0 (fx+ i 1))) ((fx=? i n))
+          (bytevector-s8-set! bv (fx+ bvoff i) (na-byte-of (ja-backing-ref v (fx+ off i))))))))
+(define (ja-bv->bytes! bv bvoff a off n)   ; bytevector -> byte array
+  (let ((v (jolt-array-vec a)))
+    (if (bytevector? v)
+        (bytevector-copy! bv bvoff v off n)
+        (do ((i 0 (fx+ i 1))) ((fx=? i n))
+          (vector-set! v (fx+ off i) (na-u8->byte (bytevector-u8-ref bv (fx+ bvoff i))))))))
+
+;; A byte array's elements are signed-byte-folded by na-list->backing, the same
+;; coercion aset applies through na-elem-of — so (into-array Byte/TYPE …) stores
+;; bytes rather than whatever magnitude it was handed.
 (define (na-from-seq x kind)
-  (let ((xs (seq->list (jolt-seq x))))
-    (make-jolt-array (na-list->backing (if (eq? kind 'byte) (map na-byte-of xs) xs) kind) kind)))
+  (make-jolt-array (na-list->backing (seq->list (jolt-seq x)) kind) kind))
 ;; (T-array size) | (T-array size init) | (T-array seq)
 (define (na-num-array a rest init kind)
   (if (number? a)
@@ -159,27 +308,26 @@
     (else (make-jolt-array
            (list->vector (map (lambda (c) (if (char? c) c (integer->char (exact (truncate c)))))
                               (seq->list (jolt-seq a)))) 'char))))
-;; Chez bytevector (unsigned 0..255) -> jolt byte-array (signed -128..127). The
-;; inbound half of the raw-bytes seam: every producer of a byte-array from raw bytes
-;; — .getBytes, stream reads, Files/readAllBytes, Base64, FFI — funnels through here.
-(define (na-bv->bytearray bv)
-  (let* ((n (bytevector-length bv)) (v (make-vector n 0)))
-    (do ((i 0 (+ i 1))) ((= i n)) (vector-set! v i (na-u8->byte (bytevector-u8-ref bv i))))
-    (make-jolt-array v 'byte)))
+;; Chez bytevector -> jolt byte-array. The inbound half of the raw-bytes seam:
+;; every producer of a byte-array from raw bytes — .getBytes, stream reads,
+;; Files/readAllBytes, Base64, FFI — funnels through here. One block copy now
+;; that the two carriers agree on representation; the copy stays because the
+;; caller's bytevector is usually a buffer it goes on writing into.
+(define (na-bv->bytearray bv) (make-jolt-array (bytevector-copy bv) 'byte))
 ;; (byte-array n [init]) | (byte-array coll). Also coerces the host's OTHER byte
 ;; carrier — a Chez bytevector (what the charset encoders produce) — and a string's
 ;; UTF-8 bytes, so bytevector and byte-array interconvert across interop seams.
 (define (na-byte-array a . rest)
   (cond
-    ((number? a) (make-jolt-array (make-vector (exact (na-idx a)) (na-byte-of (if (pair? rest) (car rest) 0))) 'byte))
+    ((number? a) (make-jolt-array (na-make-backing (na-idx a) 'byte (if (pair? rest) (car rest) 0)) 'byte))
     ((bytevector? a) (na-bv->bytearray a))
     ((string? a) (na-bv->bytearray (string->utf8 a)))
-    (else (make-jolt-array (list->vector (map na-byte-of (seq->list (jolt-seq a)))) 'byte))))
-;; jolt byte-array -> Chez bytevector (for String decode / utf8->string). The
-;; outbound half: the #xff mask folds a signed element back to its raw byte.
+    (else (na-from-seq a 'byte))))
+;; jolt byte-array -> Chez bytevector (for String decode / utf8->string), the
+;; outbound half of the same seam.
 (define (na-bytearray->bv arr)
-  (let* ((v (jolt-array-vec arr)) (n (vector-length v)) (bv (make-bytevector n)))
-    (do ((i 0 (+ i 1))) ((= i n)) (bytevector-u8-set! bv i (bitwise-and (exact (vector-ref v i)) #xff)))
+  (let* ((n (ja-len arr)) (bv (make-bytevector n)))
+    (ja-bytes->bv! arr 0 bv 0 n)
     bv))
 (define (na-make-array a . rest)    ; (make-array len) | (make-array type len ...)
   (let* ((typed? (not (number? a)))
@@ -199,7 +347,7 @@
 (define (na-to-array coll)          (na-from-seq coll 'object))
 (define (na-aclone arr)
   (if (jolt-array? arr)
-      (make-jolt-array (ja-copy (jolt-array-vec arr)) (jolt-array-kind arr))
+      (make-jolt-array (ja-copy arr) (jolt-array-kind arr))
       (na-from-seq arr 'object)))
 
 ;; --- typed aset (return the stored value) -----------------------------------
@@ -218,9 +366,8 @@
 (define (na-aset-char arr i v)    (na-aset! arr i v))
 (define (na-aset-boolean arr i v) (na-aset! arr i v))
 (define (na-aset-byte arr i v)
-  (let ((bv (jolt-array-vec arr)) (j (exact (na-idx i))) (b (na-byte-of v)))
-    (ja-check bv j)
-    (vector-set! bv j b) b))
+  (let ((b (na-byte-of v)))
+    (ja-set! arr (exact (na-idx i)) b) b))
 
 ;; --- coercions (identity on arrays; byte/short are masked scalar casts) ------
 (define (na-bytes x) (if (and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)) x (na-byte-array x)))
@@ -268,9 +415,9 @@
 (register-count-arm! jolt-chunkbuf? (lambda (b) (jolt-chunkbuf-cnt b)))
 
 ;; --- extend the collection dispatchers to see a jolt-array ------------------
-(register-count-arm! jolt-array? (lambda (c) (ja-len (jolt-array-vec c))))
+(register-count-arm! jolt-array? (lambda (c) (ja-len c)))
 (register-seq-arm! jolt-array?
-  (lambda (c) (list->cseq/k (ja->list (jolt-array-vec c)) (na-seq-kind c))))
+  (lambda (c) (list->cseq/k (ja->list c) (na-seq-kind c))))
 (define %na-nth jolt-nth)
 ;; RT.nth tests Indexed first and returns; this is the OUTERMOST jolt-nth
 ;; wrapper (natives-array loads last of the set! chain), so a pvec receiver
@@ -284,12 +431,12 @@
   (case-lambda
     ((c i)   (if (pvec? c)
                  (pvec-nth! c i)
-                 (if (jolt-array? c) (ja-ref (jolt-array-vec c) (exact (na-idx i))) (%na-nth c i))))
+                 (if (jolt-array? c) (ja-ref c (exact (na-idx i))) (%na-nth c i))))
     ((c i d) (if (pvec? c)
                  (begin (jolt-nth-nil-idx! i) (pvec-nth-d c i d))
                  (if (jolt-array? c)
-                     (let ((v (jolt-array-vec c)) (j (exact (na-idx i))))
-                       (if (and (>= j 0) (< j (ja-len v))) (ja-ref v j) d))
+                     (let ((j (exact (na-idx i))))
+                       (if (and (>= j 0) (< j (ja-len c))) (ja-ref c j) d))
                      (%na-nth c i d))))))
 (def-var! "jolt.host" "array-value?" (lambda (x) (if (jolt-array? x) #t jolt-nil)))
 ;; jolt-get on arrays stays as a set!-wrap rather than register-get-arm! because
@@ -312,7 +459,7 @@
 ;; answers what was actually stored, so aset's return agrees with a following aget.
 (define (na-array-set! a k v)
   (let ((sv (na-elem-of (jolt-array-kind a) v)))
-    (ja-set! (jolt-array-vec a) (exact (na-idx k)) sv) sv))
+    (ja-set! a (exact (na-idx k)) sv) sv))
 (define %na-ref-put! jolt-ref-put!)
 (set! jolt-ref-put!
   (lambda (t k v)
@@ -351,24 +498,34 @@
   (let ((fv (if (flonum? v) v (exact->inexact v))))
     (flvector-set! (jolt-array-vec a) (if (fixnum? i) i (exact (na-idx i))) fv) fv))
 
-;; The BOXED-backing counterparts, for (aget ^longs a i) / (aset ^ints a i v) /
-;; (aget ^objects a i). Every kind but double/float keeps a Chez vector backing, so
-;; these cannot unbox — what they skip is the DISPATCH: an untyped (aget a i)
-;; lowers to jolt-nth, which nil-checks the index, coerces it, and then walks
-;; pvec?/string?/cseq?/rec-coll-method before it reaches the array arm.
+;; The NON-flvector counterparts, for (aget ^longs a i) / (aset ^ints a i v) /
+;; (aget ^bytes a i) / (aget ^objects a i). What they skip is the DISPATCH: an
+;; untyped (aget a i) lowers to jolt-nth, which nil-checks the index, coerces it,
+;; and then walks pvec?/string?/cseq?/rec-coll-method before it reaches the array
+;; arm. What they cannot skip is the backing test — a long array is an fxvector
+;; until a bignum store promotes it (ja-promote!), so the read has to ask.
 ;;
-;; No result-type promise, unlike the flvector pair: an int/long array's backing
-;; holds whatever exact integer was stored (nothing narrows on the way in), so an
-;; element is not provably a fixnum and the numeric pass must not type it :long.
+;; No result-type promise, unlike the flvector pair: an fxvector element IS a
+;; fixnum, but a promoted array's is whatever integer was stored, so an element
+;; is still not provably one and the numeric pass must not type it :long.
 ;;
 ;; 'byte is deliberately NOT a write target here. A byte array's elements are
 ;; signed 8-bit and na-elem-of is the one place a value entering one is narrowed;
-;; routing a write around it would let a byte array hold 200. Reads are fine — the
-;; narrowing already happened at the store.
+;; routing a write around it would let a byte array hold 200 — and the bytevector
+;; backing would refuse it outright. Reads are fine — the narrowing already
+;; happened at the store.
+;;
+;; Neither pre-checks the index: the backing primitive's own range check is the
+;; array bounds contract here, exactly as on the ^doubles path, and host-faults.ss
+;; classifies its condition as an ArrayIndexOutOfBoundsException.
 (define (jolt-vaget a i)
-  (vector-ref (jolt-array-vec a) (if (fixnum? i) i (exact (na-idx i)))))
+  (ja-backing-ref (jolt-array-vec a) (if (fixnum? i) i (exact (na-idx i)))))
 (define (jolt-vaset a i v)
-  (vector-set! (jolt-array-vec a) (if (fixnum? i) i (exact (na-idx i))) v) v)
+  (let ((bk (jolt-array-vec a)) (j (if (fixnum? i) i (exact (na-idx i)))))
+    (if (fxvector? bk)
+        (if (fixnum? v) (fxvector-set! bk j v) (vector-set! (ja-promote! a) j v))
+        (vector-set! bk j v))
+    v))
 
 ;; A range condition escaping jolt-flaget/jolt-flaset IS the array bounds error
 ;; on the proven ^doubles path (a typed pre-check there costs ~1ns/access, ~11%
@@ -437,7 +594,7 @@
 ;; their layout. Lives here (not io.ss) because io.ss loads before byte-array.
 (define (jolt-io-copy src dst . _opts)
   (define (write-all! bytes)
-    (record-method-dispatch dst "write" (list->cseq (list bytes 0 (vector-length (jolt-array-vec bytes))))))
+    (record-method-dispatch dst "write" (list->cseq (list bytes 0 (ja-len bytes)))))
   (cond
     ((or (bytevector? src) (string? src)
          (and (jolt-array? src) (eq? (jolt-array-kind src) 'byte)))
@@ -474,8 +631,8 @@
                                   (throw-jvm (quote IllegalArgumentException)
                                     "Array/newInstance: multi-dimensional arrays are not supported")
                                   (na-make-array component len))))
-        (cons "getLength" (lambda (arr) (->num (ja-len (jolt-array-vec (na-need-array arr))))))
-        (cons "get" (lambda (arr i) (ja-ref (jolt-array-vec (na-need-array arr)) (na-idx i))))
+        (cons "getLength" (lambda (arr) (->num (ja-len (na-need-array arr)))))
+        (cons "get" (lambda (arr i) (ja-ref (na-need-array arr) (na-idx i))))
         (cons "set" (lambda (arr i v) (na-array-set! (na-need-array arr) (na-idx i) v) jolt-nil)))))
   (register-class-statics! "Array" statics)
   (register-class-statics! "java.lang.reflect.Array" statics))
@@ -686,13 +843,13 @@
   (cond ((null? params) 0)
         ((and (null? (cdr params)) (jolt-nil? (car params))) 0)
         ((and (null? (cdr params)) (jolt-array? (car params)))
-         (ja-len (jolt-array-vec (car params))))
+         (ja-len (car params)))
         ((and (null? (cdr params)) (or (pvec? (car params)) (cseq? (car params))))
          (length (seq->list (jolt-seq (car params)))))
         (else (length params))))
 (define (class-find-method cls name params)
   (let* ((want (jreflect-arity params))
-         (ms (vector->list (jolt-array-vec (class-method-array cls))))
+         (ms (ja->list (class-method-array cls)))
          (named (filter (lambda (m) (string=? (reflect-method-name m) name)) ms)))
     (or (find (lambda (m) (fx=? want (reflect-method-arity m))) named)
         ;; Parameter counts are a FLOOR, not a signature: most registered statics
@@ -760,7 +917,7 @@
         (cons "invoke"
               (lambda (self target . args)
                 (let ((as (if (and (= 1 (length args)) (jolt-array? (car args)))
-                              (vector->list (jolt-array-vec (car args)))
+                              (ja->list (car args))
                               args)))
                   (if (reflect-method-static? self)
                       (apply (reflect-method-fn self) as)
