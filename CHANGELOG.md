@@ -5,7 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.4] - 2026-09-06
+
+A jolt file with `#!/usr/bin/env jolt` on its first line is an executable script:
+`chmod +x` it and `./tool arg` works, with no extension, no build step, and
+nothing in the file but the program — the babashka shape. Most of what was
+missing turned out to be launcher bugs that a script exposes, so `bin/jolt` works
+through a symlink now (which is how it gets onto `PATH` at all) and an
+extensionless file is found by the launcher that runs it. `-f FILE` names a file
+explicitly, for a script whose name a jolt command also answers to.
+
+The rest is fixes with a common shape — something read the wrong base or the
+wrong key. Shutdown hooks now run on `^C` rather than only on `SIGTERM`, so a
+`:shutdown destroy-tree` cleans up in the case the option exists for; a cached
+thread pool stops forking a worker per task under CPU contention; a relative
+`:jolt/native` path resolves against the deps.edn that declared it; and on
+Windows two different `:jolt/native` libraries no longer dedup to one.
 
 ### Added
 
@@ -9104,7 +9119,8 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.8.4...HEAD
+[0.8.4]: https://github.com/jolt-lang/jolt/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/jolt-lang/jolt/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/jolt-lang/jolt/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/jolt-lang/jolt/compare/v0.8.0...v0.8.1
