@@ -92,16 +92,69 @@
   (let ((n (string-length s)) (m (string-length suf)))
     (and (>= n m) (string=? (substring s (- n m) n) suf))))
 
-;; Bake every jolt-core/stdlib source file as an in-heap string literal keyed by
-;; its root-relative path ("jolt/main.clj", "clojure/string.clj") — exactly what
-;; resolve-on-roots probes. Literals (not read-file-string at startup) because
-;; flat.ss top-level forms run at every startup, with no source on disk.
+;; Embed every jolt-core/stdlib source file keyed by its root-relative path
+;; ("jolt/main.clj", "clojure/string.clj") — exactly what resolve-on-roots probes
+;; — so a built binary can load a namespace with no source on disk.
+;;
+;; The bytes go into ONE blob (xxd'd into the binary as the C array
+;; jolt_source_blob), each file its own bytevector-compress frame, and flat.ss
+;; gets only the index. Compressed because the blob is read lazily — a namespace
+;; that loads from source, which the boot path never does — so the ratio is free
+;; here in a way it is NOT for the boot image, where unpacking outruns readahead
+;; and serializes a read that used to overlap the parse. They used to be one
+;; (register-embedded-resource! "<path>" (string->utf8 "…")) per file, and a
+;; flat.ss top-level form runs at EVERY startup: each start rebuilt ~1.8MB of
+;; string literals and allocated a fresh utf8 bytevector from each one, measured
+;; at 59ms and +47MB of heap on `jolt --version`, with that heap then paid for
+;; again by the Scompact_heap at the end of Sbuild_heap. Nothing on the boot path
+;; reads them — they are the fallback for a namespace that is neither in the
+;; runtime image nor carries an embedded fasl — so the whole cost was for a table
+;; most runs never touch. This is the same move jb-emit-stdlib-fasls! makes for
+;; the fasl bytes and the build subsystem makes for its .ss embeds; java/io.ss
+;; embedded-source-index is the reading end.
 ;;
 ;; FIRST ROOT WINS, because that is what resolve-on-roots does on disk. Two roots
 ;; can hold the same namespace — a vendored library shipping a host adapter under
-;; a jolt name — and register-embedded-resource! is a plain hashtable-set!, so
-;; emitting both would hand the binary the LAST one and silently disagree with
-;; the source tree it was built from.
+;; a jolt name — and the index is a plain hashtable-set! like the old registry
+;; was, so emitting both would hand the binary the LAST one and silently disagree
+;; with the source tree it was built from.
+;; Every producer of embedded text writes through here, so there is one blob and
+;; one index: the jolt-core/stdlib .clj source below, the runtime .ss closure the
+;; build subsystem reads (jb-emit-runtime-embeds), and the subsystem's own inlined
+;; source. Each entry is its own bytevector-compress frame, decompressed by
+;; java/io.ss jolt-source-blob-fetch when something actually asks for it.
+(define jb-source-blob-path #f)
+(define jb-blob-port #f)
+(define jb-blob-index '())
+(define jb-blob-offset 0)
+(define (jb-blob-open!)
+  (set! jb-source-blob-path (string-append jb-build "/source_blob.bin"))
+  (set! jb-blob-port
+        (open-file-output-port jb-source-blob-path (file-options replace) (buffer-mode block)))
+  (set! jb-blob-index '())
+  (set! jb-blob-offset 0))
+(define (jb-blob-add! key text)
+  (let* ((bv (parameterize ((compress-format 'gzip))
+               (bytevector-compress (string->utf8 text))))
+         (n (bytevector-length bv)))
+    (put-bytevector jb-blob-port bv)
+    (set! jb-blob-index (cons (list key jb-blob-offset n) jb-blob-index))
+    (set! jb-blob-offset (+ jb-blob-offset n))))
+;; Close the blob and bake the index. The attach form is the ONLY thing about all
+;; this that lands in flat.ss, and it has to precede any reader — every reader is
+;; at runtime, so emitting it at the end of the assembly is early enough.
+(define (jb-blob-close! out)
+  (close-port jb-blob-port)
+  (put-string out
+    (string-append "(jolt-source-blob-attach! '("
+      (apply string-append
+        (map (lambda (e)
+               (string-append "(" (ei-str-lit (car e)) " "
+                              (number->string (cadr e)) " "
+                              (number->string (caddr e)) ")"))
+             (reverse jb-blob-index)))
+      "))\n")))
+
 (define (jb-emit-source-embeds out)
   (let ((baked (make-hashtable string-hash string=?)))
     (for-each
@@ -112,9 +165,7 @@
               (when (and (ldr-source-path? rel)
                          (not (hashtable-ref baked rel #f)))
                 (hashtable-set! baked rel #t)
-                (put-string out (string-append
-                  "(register-embedded-resource! " (ei-str-lit rel) " "
-                  (ei-bytes-lit (read-file-string abs)) ")\n")))))
+                (jb-blob-add! rel (read-file-string abs)))))
           (bld-walk-files root "" '())))
       ldr-install-roots)))
 
@@ -137,12 +188,8 @@
     (reverse order)))
 
 (define (jb-emit-runtime-embeds out)
-  (for-each
-    (lambda (path)
-      (put-string out (string-append
-        "(register-embedded-resource! " (ei-str-lit path) " "
-        (ei-bytes-lit (read-file-string path)) ")\n")))
-    (jb-collect-load-paths)))
+  (for-each (lambda (path) (jb-blob-add! path (read-file-string path)))
+            (jb-collect-load-paths)))
 
 ;; The launcher (Chez scheme-start): replicates host/chez/cli.ss but reads argv
 ;; from the scheme-start lambda and has no repo root to cd into (all source is
@@ -192,15 +239,19 @@
     (if trip (or (string->number trip) default) default)))
 (scheme-start
   (lambda args
+    (jolt-startup-profile-mark! \"heap built (scheme-start entered)\")
     (set-source-roots! " (ldr-install-roots-str) ")
+    (jolt-startup-profile-mark! \"source roots + data readers\")
     ;; JOLT_TRACE at RUNTIME (the env is unset at heap-build), before any app ns
     ;; compiles, so a `-M:run` traces the app's own code.
     (jolt-trace-init-from-env!)
     (jolt-stdlib-fasls-attach! '" (jb-stdlib-index-str) ")
+    (jolt-startup-profile-mark! \"trace init + fasl index attach\")
     ;; shared dispatch (cli-core.ss, inlined via the runtime manifest): the -e
     ;; arm, end-of-options, and uncaught reporting are the same code the script
     ;; driver runs — the launcher once carried a stale fork of the -e arm.
     (jolt-cli-run args (lambda () (jolt-materialize-bundles!) (jb-load-build-subsystem!)))
+    (jolt-startup-profile-mark! \"cli dispatch\")
     (exit 0)))
 ")))
 
@@ -531,6 +582,7 @@
   ;; Bake the version FIRST: rt.ss's jolt-version-string probes this binding via
   ;; top-level-bound?, and load-time consumers (*jolt-version* in
   ;; dynamic-var-defaults.ss) read it while the runtime below loads.
+  (jb-blob-open!)
   (put-string out (string-append ";; === baked version ===\n(define jolt-baked-version-early "
                                  (ei-str-lit jb-version) ")\n"))
   ;; full runtime + compiler image: keep the compiler (jolt evals at runtime).
@@ -544,22 +596,26 @@
   ;; code references bld-*/ei-*/dce-*: the runtime eval path uses jolt-compile-eval-
   ;; form, not the emit-image cross-compiler, and .clj namespace loads read the
   ;; embedded-resources table directly (not via build.ss's bld-source-string).
-  (put-string out "\n;; === build subsystem (deferred: loaded on first `jolt build`) ===\n")
+  (put-string out "\n;; === build subsystem (in the source blob: read on first `jolt build`) ===\n")
+  ;; Into the blob, not a literal. A thunk used to defer the utf8 allocation and
+  ;; the hashtable insert, but it could not defer the string literals themselves:
+  ;; loading flat.so materializes every literal in a code object whether or not
+  ;; the code ever runs. The blob defers the bytes, which is what was wanted.
   (let ((build-src (let ((sp (open-output-string)))
                      (bld-inline-line "(load \"host/chez/build.ss\")" sp 0)
                      (get-output-string sp))))
-    (put-string out (string-append "(define jb-build-subsystem-src " (ei-str-lit build-src) ")\n")))
-  ;; Register the .ss embeds inside a thunk: the string literals stay compiled into
-  ;; the heap but the utf8 allocation + hashtable insert only run when called.
-  (put-string out "(define (jb-register-build-embeds!)\n")
+    (jb-blob-add! "@build-subsystem" build-src))
   (jb-emit-runtime-embeds out)
-  (put-string out "  (if #f #f))\n")
   (put-string out "(define jb-build-subsystem-loaded #f)\n")
   (put-string out
     (string-append
       "(define (jb-load-build-subsystem!)\n"
       "  (unless jb-build-subsystem-loaded\n"
       "    (set! jb-build-subsystem-loaded #t)\n"
+      ;; the subsystem source is a blob entry; everything it then reads (the
+      ;; runtime .ss closure) is in the same blob, found through the same index.
+      "    (let ((jb-build-subsystem-src\n"
+      "            (utf8->string (embedded-resource-ref \"@build-subsystem\"))))\n"
       ;; eval the inlined subsystem source form-by-form into the top-level env, so
       ;; build.ss's defines (bld-*, ei-*, dce-*) and its def-var! of jolt.host/
       ;; build-binary land exactly as an eager (load) would have. It has no (load)
@@ -569,21 +625,33 @@
       "        (let ((form (read p)))\n"
       "          (unless (eof-object? form)\n"
       "            (eval form (interaction-environment))\n"
-      "            (loop)))))\n"
-      "    (jb-register-build-embeds!)))\n"))
+      "            (loop))))))\n"
+      "    ))\n"))
   (put-string out "\n;; === embedded jolt-core + stdlib source ===\n")
   (jb-emit-source-embeds out)
+  ;; The four marks from here to the launcher close the gap the profile used to
+  ;; have. Everything in flat.ss after the runtime manifest still EXECUTES on
+  ;; every start — Chez runs a boot file's top level each time the heap is built,
+  ;; and there is no saved-heap escape in Chez 10 — so the CLI AOT section and the
+  ;; fasl registrations are startup cost, not build cost, and were invisible.
+  ;; last producer done: close the blob and bake the index here, so it is in place
+  ;; before the CLI AOT section below runs its top levels — the same order the
+  ;; eager register-embedded-resource! forms had.
+  (jb-blob-close! out)
+  (bld-emit-startup-profile-mark! out "source embeds")
   ;; AOT jolt.main + jolt.deps (and their on-demand Clojure closure) as emitted
   ;; Scheme so CLI dispatch never recompiles them from source at startup. Shared
   ;; with make-devboot.ss via bld-emit-cli-aot (build.ss) — one artifact shape;
   ;; the section marker + per-ns emission live there. This replaces the old
   ;; (load-namespace …) calls that paid the ~380ms analyze/emit cost on EVERY start.
   (bld-emit-cli-aot out)
+  (bld-emit-startup-profile-mark! out "cli aot (jolt.main + jolt.deps top levels)")
   ;; Embedded stdlib fasls: load+emit+compile each remaining install-owned ns and
   ;; bake its fasl as register-embedded-fasl!, so a require loads compiled code
   ;; instead of recompiling from source. MUST run before flat.ss is written (it
   ;; emits into out) and before the fingerprint step (bytes are part of the hash).
   (jb-emit-stdlib-fasls! out)
+  (bld-emit-startup-profile-mark! out "stdlib fasl registrations")
   (put-string out "\n;; === jolt launcher ===\n")
   (jb-emit-launcher out)
   (close-port out))
@@ -696,6 +764,9 @@
 ;; so nothing derefs it).
 (when (and jb-stdlib-blob-path (file-exists? jb-stdlib-blob-path))
   (jb-c-array jb-stdlib-blob-path (string-append jb-build "/stdlib_fasls_data.h") "jolt_stdlib_fasls"))
+;; The embedded jolt-core/stdlib source, as one blob rather than boot literals
+;; (jb-emit-source-embeds). Always written by that step, so no absent-file arm.
+(jb-c-array jb-source-blob-path (string-append jb-build "/source_blob_data.h") "jolt_source_blob")
 
 (define jb-main-c (string-append jb-build "/main.c"))
 (let ((mc (open-output-file jb-main-c 'replace)))
@@ -712,6 +783,7 @@
       "#include \"z_data.h\"\n"
       "#include \"launcherc_data.h\"\n"
       "#include \"stdlib_fasls_data.h\"\n"
+      "#include \"source_blob_data.h\"\n"
       (bld-boot-prefetch-defn)
       "int main(int argc, char *argv[]) {\n"
       ;; before Sscheme_init: the 18MB boot's readahead then overlaps kernel
