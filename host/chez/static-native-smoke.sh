@@ -122,6 +122,125 @@ if [ "$rc" -eq 0 ]; then
   echo "  FAIL: --dynamic binary still ran with its shared object removed"; exit 1
 fi
 
+# --- a relative :static archive resolves against the DECLARING deps.edn -----
+# A project ships its archive beside its own sources ("native/libfoo.a", which is
+# what a build task produces), and a DEPENDENCY does the same in its own tree.
+# Both paths went to cc verbatim, so they resolved against the build's cwd: a
+# dependency's could never work, and the project's own only worked when the build
+# happened to run from the project dir — which bin/jolt, which cd's to the jolt
+# tree, never does (jolt-9a8). Built from / here so a cwd-relative resolution
+# cannot pass by accident.
+cc -c "$work/greet.c" -o "$work/greet.o"
+
+# 1. the PROJECT's own, relative.
+mkdir -p "$app/native"
+ar rcs "$app/native/libgreet.a" "$work/greet.o"
+cat > "$app/deps.edn" <<'EOF'
+{:paths ["src"]
+ :jolt/native [{:name "greet" :static {:archive "native/libgreet.a"}}]}
+EOF
+echo "static-native smoke: building (project-relative archive, foreign cwd)"
+if ! (cd / && JOLT_PWD="$app" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+  echo "  FAIL: jolt build with a project-relative archive exited non-zero"
+  cat "$work/build.log"; exit 1
+fi
+got="$(cd / && "$out" 2>&1)"
+if [ "$got" != "answer: 42" ]; then
+  echo "  FAIL: project-relative archive binary output mismatch"
+  echo "--- got ----"; echo "$got"; exit 1
+fi
+
+# 2. a TRANSITIVE dependency's, relative to that dependency's own root. app -> mid
+#    -> leaf, and only leaf declares the native: nothing on the app's side names
+#    the archive, so the root has to travel with the spec.
+dep="$work/leaf"
+mkdir -p "$dep/native" "$dep/src/leaf" "$work/mid/src/mid"
+ar rcs "$dep/native/libgreet.a" "$work/greet.o"
+cat > "$dep/deps.edn" <<'EOF'
+{:paths ["src"]
+ :jolt/native [{:name "greet" :static {:archive "native/libgreet.a"}}]}
+EOF
+cat > "$dep/src/leaf/core.clj" <<'EOF'
+(ns leaf.core (:require [jolt.ffi :as ffi]))
+(ffi/defcfn answer "jolt_static_answer" [] :int)
+EOF
+cat > "$work/mid/deps.edn" <<EOF
+{:paths ["src"]
+ :deps {org.example/leaf {:local/root "$dep"}}}
+EOF
+cat > "$work/mid/src/mid/core.clj" <<'EOF'
+(ns mid.core (:require [leaf.core :as l]))
+(defn go [] (l/answer))
+EOF
+rm -rf "$app/native" "$app/.jolt"
+cat > "$app/deps.edn" <<EOF
+{:paths ["src"]
+ :deps {org.example/mid {:local/root "$work/mid"}}}
+EOF
+cat > "$app/src/app/core.clj" <<'EOF'
+(ns app.core (:require [mid.core :as m]))
+(defn -main [& _] (println "answer:" (m/go)))
+EOF
+echo "static-native smoke: building (transitive dep's relative archive)"
+if ! (cd / && JOLT_PWD="$app" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+  echo "  FAIL: jolt build with a transitive dep's relative archive exited non-zero"
+  cat "$work/build.log"; exit 1
+fi
+# the archive is linked in, so the binary runs with the dep tree gone
+rm -rf "$dep/native"
+got="$(cd / && "$out" 2>&1)"
+if [ "$got" != "answer: 42" ]; then
+  echo "  FAIL: transitive-dep archive binary output mismatch"
+  echo "--- got ----"; echo "$got"; exit 1
+fi
+
+# --- a build says which natives stay dynamic --------------------------------
+# Everything else a `jolt build` produces is IN the binary, so a lib that stayed
+# dynamic is the one reason it is not the dependency-free artifact a static build
+# is taken to be. The build names those rather than leaving it to be discovered
+# on the target host; a fully static build says nothing.
+# a PATH (it has a separator), so it resolves against the declaring dep's root —
+# a bare name would be a soname for the loader to search for, which is dlopen's
+# rule and deliberately left alone.
+mkdir -p "$dep/native"
+cc $shared "$work/greet.c" -o "$dep/native/libgreet.$soext"
+cat > "$dep/deps.edn" <<EOF
+{:paths ["src"]
+ :jolt/native [{:name "greet" $plat ["native/libgreet.$soext"]}]}
+EOF
+rm -rf "$app/.jolt"
+if ! (cd / && JOLT_PWD="$app" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+  echo "  FAIL: jolt build with a dynamic dep native exited non-zero"
+  cat "$work/build.log"; exit 1
+fi
+if ! grep -q "loaded at runtime" "$work/build.log"; then
+  echo "  FAIL: a build with a runtime-loaded native said nothing about it"
+  cat "$work/build.log"; exit 1
+fi
+# The interpreted path resolves the same spec the same way: a DEPENDENCY's
+# relative candidate is relative to that dependency, not to the app that pulled
+# it in. It was resolved against the app's dir, where it is not.
+echo "static-native smoke: running (transitive dep's relative shared object)"
+got="$(cd / && JOLT_PWD="$app" "$joltabs" run -m app.core 2>&1)"
+if [ "$got" != "answer: 42" ]; then
+  echo "  FAIL: jolt run did not resolve a dep's relative shared object"
+  echo "--- got ----"; echo "$got"; exit 1
+fi
+# and the fully static build above must NOT have said it
+rm -rf "$app/.jolt"
+cat > "$dep/deps.edn" <<'EOF'
+{:paths ["src"]
+ :jolt/native [{:name "greet" :static {:archive "native/libgreet.a"}}]}
+EOF
+mkdir -p "$dep/native"; ar rcs "$dep/native/libgreet.a" "$work/greet.o"
+if ! (cd / && JOLT_PWD="$app" "$joltabs" build -m app.core -o "$out") >"$work/build.log" 2>&1; then
+  echo "  FAIL: jolt build (static, re-check) exited non-zero"; cat "$work/build.log"; exit 1
+fi
+if grep -q "loaded at runtime" "$work/build.log"; then
+  echo "  FAIL: a fully static build claimed a native is loaded at runtime"
+  cat "$work/build.log"; exit 1
+fi
+
 # --- structural: link order (GNU ld left-to-right) --------------------------
 # Static archives that reference system symbols (libm, libpthread) must appear
 # BEFORE the -l flags for those libraries. grep build.ss for the pattern that
@@ -131,4 +250,4 @@ if grep -qn 'bld-link-libs.*native-link' host/chez/build.ss; then
   exit 1
 fi
 
-echo "static-native smoke: passed (static default + --dynamic runtime load + link order)"
+echo "static-native smoke: passed (static default + --dynamic runtime load + project-relative archive + transitive-dep relative archive + runtime-native report + link order)"
