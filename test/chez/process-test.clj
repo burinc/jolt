@@ -367,6 +367,52 @@
   (fs/delete-if-exists readyf)
   (fs/delete-if-exists hookf))
 
+;; ^C must run the shutdown hooks too, and exit 130 (128+SIGINT) the way the JVM
+;; and the shell both report it. SIGINT used to be left to Chez's
+;; keyboard-interrupt-handler, which unwinds to Chez's top level and exits 255
+;; without ever reaching the exit handler — so a `:shutdown destroy-tree` cleaned
+;; up on `kill` and cleaned up nothing on ^C (jolt-na7). The shutdown watcher takes
+;; SIGINT along with SIGTERM/SIGHUP now.
+(let [readyf (str (fs/create-temp-file {:prefix "jp-sigint-" :suffix ".txt"}))
+      hookf  (str (fs/create-temp-file {:prefix "jp-sigint-hook-" :suffix ".txt"}))
+      nested (str "(.addShutdownHook (Runtime/getRuntime)"
+                  "  (Thread. (fn [] (spit \"" hookf "\" \"RAN\"))))"
+                  " (spit \"" readyf "\" \"ready\") (Thread/sleep 30000)")
+      proc (process [jolt-bin "-e" nested] {:out :string :err :string})]
+  (loop [n 0]
+    (when (and (< n 200) (str/blank? (slurp readyf)))
+      (Thread/sleep 50)
+      (recur (inc n))))
+  (sh ["sh" "-c" (str "kill -INT " (.pid (:proc proc)))])
+  (loop [n 0] (when (and (< n 60) (p/alive? proc)) (Thread/sleep 50) (recur (inc n))))
+  (check-eq "SIGINT kills a jolt that registered a shutdown hook" (p/alive? proc) false)
+  (when (p/alive? proc) (.destroyForcibly (:proc proc)) (Thread/sleep 200))
+  (check-eq "SIGINT runs the shutdown hooks" (slurp hookf) "RAN")
+  (check-eq "and exits 128+SIGINT" (:exit @proc) 130)
+  (fs/delete-if-exists readyf)
+  (fs/delete-if-exists hookf))
+
+;; The stdin-prompt case from the SIGTERM test above, for ^C: a jolt blocked
+;; INSIDE Chez's read holds the whole Scheme world, so the hooks can only run
+;; from the watcher thread parked in sigwait.
+(let [readyf (str (fs/create-temp-file {:prefix "jp-sigint-in-" :suffix ".txt"}))
+      hookf  (str (fs/create-temp-file {:prefix "jp-sigint-in-hook-" :suffix ".txt"}))
+      nested (str "(.addShutdownHook (Runtime/getRuntime)"
+                  "  (Thread. (fn [] (spit \"" hookf "\" \"RAN\"))))"
+                  " (spit \"" readyf "\" \"ready\") (read-line)")
+      proc (process [jolt-bin "-e" nested])]
+  (loop [n 0]
+    (when (and (< n 200) (str/blank? (slurp readyf)))
+      (Thread/sleep 50)
+      (recur (inc n))))
+  (sh ["sh" "-c" (str "kill -INT " (.pid (:proc proc)))])
+  (loop [n 0] (when (and (< n 60) (p/alive? proc)) (Thread/sleep 50) (recur (inc n))))
+  (check-eq "SIGINT reaches a jolt parked at a stdin prompt" (p/alive? proc) false)
+  (when (p/alive? proc) (.destroyForcibly (:proc proc)) (Thread/sleep 200))
+  (check-eq "and its shutdown hooks run there too (SIGINT)" (slurp hookf) "RAN")
+  (fs/delete-if-exists readyf)
+  (fs/delete-if-exists hookf))
+
 ;; Same root cause from the other side: while the main thread waits on stdin the
 ;; rest of the program has to keep running. A future stopped ticking the moment a
 ;; prompt was reached, which is not what a JVM does with a thread in
