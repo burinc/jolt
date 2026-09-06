@@ -37,6 +37,26 @@
     (str base "/" c)
     c))
 
+;; The base a spec's relative paths resolve against: the deps.edn that DECLARED
+;; it (jolt.deps attaches the root), falling back to the project for a spec that
+;; carries none — a stale cpcache entry, or a caller that built the map itself.
+;; Without this a dependency's "native/libfoo.so" resolved against the APP's
+;; directory, where it is not.
+(defn- native-root [spec base] (or (:jolt.deps/root spec) base))
+
+;; A BUILD-TIME path (a :static archive, a -L directory) relative to that root.
+;; Unlike native-candidate this prefixes a bare filename too: those paths are
+;; handed to the linker, which reads "libfoo.a" as a file in the current
+;; directory rather than a name to search for — dlopen's rule, which
+;; native-candidate implements, is the opposite and must not change.
+(defn- native-build-path [base p]
+  (if (and base
+           (not (str/blank? p))
+           (not (str/starts-with? p "/"))
+           (not (re-find #"^[A-Za-z]:" p)))
+    (str base "/" p)
+    p))
+
 ;; strict? false lets a MISSING required library through with a warning instead of
 ;; an error. A task is the one command that may be what PRODUCES the library it
 ;; is declared alongside: a project whose native/ holds C sources and whose
@@ -54,7 +74,7 @@
         (if (:process spec)
           (jolt.ffi/load-library)
           (let [c (get spec plat)
-                cands (mapv #(native-candidate base %)
+                cands (mapv #(native-candidate (native-root spec base) %)
                             (if (string? c) [c] (vec c)))
                 ;; Load the native RTLD_LOCAL and register its handle, so the
                 ;; spec's defcfns resolve from the handle (isolated from the
@@ -593,13 +613,21 @@
 ;; :static may be flat ({:archive "…"} / {:lib "z" :libdir "…"}) or per-platform
 ;; ({:darwin {…} :linux {…}}). Returns a vector build.ss reads and wraps in the
 ;; platform's force-load flags: ["archive" abspath] or ["lib" name libdir].
-(defn- static-link-spec [spec plat]
+(defn- static-link-spec [spec plat base]
   (when-let [s (:static spec)]
     (let [p (get s plat)
-          s (if (map? p) p s)]
+          s (if (map? p) p s)
+          ;; relative to the deps.edn that declared it, not to the build's cwd:
+          ;; a dependency ships its archive beside its own sources, and even the
+          ;; project's own "native/libfoo.a" only worked when the build happened
+          ;; to run from the project dir — which bin/jolt, which cd's to the jolt
+          ;; tree, never does (jolt-9a8).
+          root (native-root spec base)]
       (cond
-        (:archive s) ["archive" (:archive s)]
-        (:lib s)     ["lib" (:lib s) (or (:libdir s) "")]
+        (:archive s) ["archive" (native-build-path root (:archive s))]
+        (:lib s)     ["lib" (:lib s) (if-let [d (:libdir s)]
+                                       (native-build-path root d)
+                                       "")]
         :else        nil))))
 
 ;; Encode a deps.edn :jolt/native spec for the build launcher, resolving the
@@ -611,16 +639,46 @@
 ;;                            is present and --dynamic wasn't passed)
 ;;   ["req"|"opt" cand…]    — load a shared object at runtime, trying each in turn
 ;; dynamic? forces the runtime path for every lib (the --dynamic build flag).
-(defn- encode-natives [natives dynamic?]
+(defn- encode-natives [natives dynamic? base]
   (let [plat (current-platform)]
     (vec (for [spec natives]
-           (let [static (and (not dynamic?) (static-link-spec spec plat))]
+           (let [static (and (not dynamic?) (static-link-spec spec plat base))]
              (cond
                (:process spec) ["process"]
                static          (into ["static"] static)
                :else           (let [c (get spec plat)
-                                     cands (if (string? c) [c] (vec c))]
+                                     cands (mapv #(native-candidate (native-root spec base) %)
+                                                 (if (string? c) [c] (vec c)))]
                                  (into [(if (:optional spec) "opt" "req")] cands))))))))
+
+;; Say which :jolt/native libraries the built binary will still dlopen. A
+;; `jolt build` is otherwise self-contained — the Clojure, the runtime and every
+;; :static archive are IN the file — so a lib that stayed dynamic is the one
+;; reason the binary is not the single dependency-free artifact a static build
+;; is taken to be, and nothing said so (jolt-9a8). Silence here read as "there is
+;; nothing left to ship", which was wrong exactly when it mattered.
+;;
+;; Not a warning: a system lib the OS resolves by soname (libc, libcrypto) is the
+;; normal case and there is nothing to fix. It names what the binary needs so the
+;; person shipping it knows, and points at the key that would link it in.
+(defn- report-runtime-natives! [encoded natives dynamic?]
+  (let [dyn (->> (map vector encoded natives)
+                 (filter (fn [[e _]] (#{"req" "opt"} (first e))))
+                 vec)]
+    (when (seq dyn)
+      (binding [*out* *err*]
+        (println (str "jolt build: " (count dyn) " :jolt/native "
+                      (if (= 1 (count dyn)) "library is" "libraries are")
+                      " loaded at runtime — the binary needs "
+                      (if (= 1 (count dyn)) "it" "them")
+                      " on the host"
+                      (if dynamic?
+                        " (--dynamic was passed):"
+                        "; declare :static {:archive \"…\"} to link one in:")))
+        (doseq [[e spec] dyn]
+          (println (str "  " (or (:name spec) "?")
+                        (when (= "opt" (first e)) " (optional)")
+                        " — " (str/join ", " (rest e)))))))))
 
 (defn- cmd-build [more]
   (let [{:keys [project-paths embed-dirs build] :as resolved}
@@ -666,7 +724,9 @@
             ;; binary by default; --dynamic (or deps.edn :jolt/build {:dynamic-natives
             ;; true}) keeps the old behavior — load a shared object at runtime.
             dynamic-natives? (boolean (or (some #{"--dynamic"} flag-args) (:dynamic-natives build)))
-            natives (encode-natives (:natives resolved) dynamic-natives?)
+            natives (encode-natives (:natives resolved) dynamic-natives?
+                                    (or (:project-dir resolved) pdir))
+            _ (report-runtime-natives! natives (:natives resolved) dynamic-natives?)
             ;; closed-world direct-linking is the release default: ON for release and
             ;; optimized (the throughput lever), OFF for --dev. --no-direct-link (or
             ;; deps.edn :jolt/build {:direct-link false}) opts back out; --direct-link
