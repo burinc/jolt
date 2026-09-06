@@ -999,7 +999,15 @@
         [(if (= :double (get node :kind)) :double :num)
          (assoc node :expr (nth r 1))])
 
-      :else [:any node])))
+      ;; Anything with no arm above. Answering :any is right — this pass has no
+      ;; opinion on the node's own type — but the node must still be WALKED, or
+      ;; nothing inside it is annotated and every record read and every numeric op
+      ;; in the subtree silently degrades to the generic path. That is not
+      ;; hypothetical: it is what :coerce did before the arm above existed, and
+      ;; :set-var, :set-field, :defmacro, :ffi-callable and :host-new all carry
+      ;; child nodes and still land here. A missing arm should cost this pass its
+      ;; opinion about one node, never the annotation of a whole subtree.
+      :else [:any (map-ir-children (fn [c] (nth (infer c tenv env) 1)) node)])))
 
 (defn- infer-top [node env] (nth (infer node {} env) 1))
 
