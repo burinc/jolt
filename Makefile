@@ -158,7 +158,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke scriptsmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
@@ -532,6 +532,14 @@ depssmoke: testbin
 # Offline fixture projects in test/chez/tasks/.
 taskssmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/tasks-smoke.sh
+
+# Running a FILE as a script through the real CLI, including a
+# `#!/usr/bin/env jolt` shebang executed by the kernel: the shebang line as a
+# comment, *command-line-args*, *file*, stdin, exit-code propagation, a project's
+# roots, -f/--file, and which of a file, a command and a task wins a name.
+# Offline, throwaway projects in a temp dir.
+scriptsmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/script-smoke.sh
 
 # The resolved-roots cache (.jolt/cpcache): a warm run reuses a project's final
 # dependency resolution instead of re-expanding the graph. Offline throwaway

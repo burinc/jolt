@@ -6133,4 +6133,10 @@
   {:suite "vars / dynamic is a field" :label "and dropping the metadata does not un-bind it" :expected "[true nil 2]" :actual "(do (def ^:dynamic *dy4* 1) (alter-meta! (var *dy4*) dissoc :dynamic) [(.isDynamic (var *dy4*)) (:dynamic (meta (var *dy4*))) (eval (quote (binding [*dy4* 2] *dy4*)))])" :portability :jvm}
   {:suite "vars / dynamic is a field" :label "a plain re-def clears the flag" :expected "[true false]" :actual "(do (def ^:dynamic *dy5* 1) (let [was (.isDynamic (var *dy5*))] (eval (quote (def *dy5* 2))) [was (.isDynamic (var *dy5*))]))" :portability :jvm}
   {:suite "vars / dynamic is a field" :label "intern carries the metadata but not the flag" :expected "[false true]" :actual "(do (intern (quote user) (with-meta (quote dy6) {:dynamic true}) 1) [(.isDynamic (resolve (quote dy6))) (:dynamic (meta (resolve (quote dy6))))])" :portability :jvm}
+  ;; #! is a comment to end of line, the way Clojure's reader takes it, which is
+  ;; what lets a file open with `#!/usr/bin/env jolt` and still read as a program:
+  ;; the shebang support in the CLI is this one reader arm plus argv dispatch
+  ;; (host/chez/script-smoke.sh runs the executable-script end of it).
+  {:suite "reader / shebang line" :label "a #! line reads as nothing, so a script's first line is a comment" :expected "42" :actual "(read-string \"#!/usr/bin/env jolt\\n42\")" :portability :common}
+  {:suite "reader / shebang line" :label "and it comments to end of line anywhere, not only at the start of input" :expected "[1 3]" :actual "(read-string \"[1 #! two\\n 3]\")" :portability :common}
 ]

@@ -64,6 +64,9 @@ and on a stale entry.
 ## Commands
 
 - `bin/jolt -e EXPR`: evaluate an expression from a clone.
+- `jolt FILE [args]`: run a file; with a `#!/usr/bin/env jolt` first line and an
+  exec bit it is a script (`./tool arg`). `-f FILE` when the name is also a
+  command or a task. `make scriptsmoke` gates it.
 - `make test`: the full gate. Individual gates: `corpus`, `unit`, `selfhost`,
   `smoke`, `sci`, `ffi`, `transient`, `certify`, `libconformance`.
 - `make remint`: re-mint the bootstrap seed to a byte-fixpoint. Required after
