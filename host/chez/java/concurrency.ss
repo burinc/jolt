@@ -1614,9 +1614,10 @@
         (cons "cancel" (lambda (self . _) (j-future-cancel! self)))))
 ;; executor-service state: #(shutdown? queue-box queue-mutex task-cond
 ;; live-workers advisory-queue-capacity core-workers max-workers keep-alive-ms
-;; idle-workers queue-depth term-cond) — the capacity is #f except for a
-;; ThreadPoolExecutor built with an ArrayBlockingQueue; .getQueue's view subtracts
-;; the live depth from it.
+;; idle-workers queue-depth term-cond starting-workers) — the capacity is #f
+;; except for a ThreadPoolExecutor built with an ArrayBlockingQueue; .getQueue's
+;; view subtracts the live depth from it. starting-workers is the forked-but-not-
+;; yet-arrived count the growth rule adds to idle-workers; see it for why.
 ;;
 ;; TWO CONDITIONS, one mutex. task-cond carries "a task is queued, or the pool is
 ;; shutting down" to the WORKERS, which are threads; term-cond carries "shut down
@@ -1673,7 +1674,7 @@
 (define (make-executor* core-n max-n keep-alive-ms cap)
   (let ((self (make-jhost "executor-service"
                           (vector #f (box (cons '() '())) (make-mutex) (make-condition) 0
-                                  cap core-n max-n keep-alive-ms 0 0 (make-condition)))))
+                                  cap core-n max-n keep-alive-ms 0 0 (make-condition) 0))))
     (let ((st (jhost-state self)))
       ;; The core workers, eagerly. Above core, a worker appears when a task
       ;; arrives with nobody idle to take it, and not before: a cached pool that
@@ -1699,9 +1700,16 @@
 ;; thread's first instruction would report a pool terminated while a task it
 ;; accepted was still on its way to a worker. It is also what keeps two
 ;; concurrent enqueues from both spawning past max.
+;;
+;; STARTING (st 12) is claimed here too, and dropped on the new worker's first trip
+;; through executor-take-job!. It is what keeps the growth rule below from counting
+;; a worker that is on its way as a worker that is not coming — see the rule for
+;; what that costs when it is missing.
 (define (executor-claim-worker! st)
   (and (fx<? (vector-ref st 4) (vector-ref st 7))
-       (begin (vector-set! st 4 (fx+ (vector-ref st 4) 1)) #t)))
+       (begin (vector-set! st 4 (fx+ (vector-ref st 4) 1))
+              (vector-set! st 12 (fx+ (vector-ref st 12) 1))
+              #t)))
 ;; Fork the thread for a slot already claimed, OUTSIDE the mutex. A fork that
 ;; fails gives the slot back; whether that is the caller's problem depends on
 ;; whether anything is left to run the task — with other workers live it waits
@@ -1711,6 +1719,7 @@
 (define (executor-spawn-worker! st)
   (guard (e (#t (let ((none-left? (jolt-with-mutex (vector-ref st 2)
                                     (vector-set! st 4 (fx- (vector-ref st 4) 1))
+                                    (vector-set! st 12 (fx- (vector-ref st 12) 1))
                                     (jolt-cv-wake! (vector-ref st 11))
                                     (fx=? 0 (vector-ref st 4)))))
                   (when none-left? (raise e)))))
@@ -1791,13 +1800,30 @@
 ;; what the growth rule starts one on (the JVM replaces an abruptly-dead worker
 ;; too, for the same reason).
 (define (executor-worker-loop st)
-  (guard (e (#t (jolt-with-mutex (vector-ref st 2) (executor-worker-exit! st))
-                (guard (_ (#t #f))
-                  (display "Exception in executor worker:\n" (current-error-port))
-                  (jolt-report-throwable e (current-error-port)))))
-    (let loop ()
-      (let ((job (jolt-with-mutex (vector-ref st 2) (executor-take-job! st))))
-        (when job (job) (loop))))))
+  ;; STARTING (st 12) is this worker's from the claim until it first reaches the
+  ;; queue. The flag lives out here so the guard can give the count back for a
+  ;; worker that dies before it ever arrives: a LEAKED start is worse than the
+  ;; over-spawn it prevents, because the growth rule would then read a taker that
+  ;; is never coming and decline to grow for good — a pool that strands the task
+  ;; instead of one that runs it on a thread too many.
+  (let ((arriving? #t))
+    (define (arrived!)
+      (when arriving?
+        (set! arriving? #f)
+        (vector-set! st 12 (fx- (vector-ref st 12) 1))))
+    (guard (e (#t (jolt-with-mutex (vector-ref st 2) (arrived!) (executor-worker-exit! st))
+                  (guard (_ (#t #f))
+                    (display "Exception in executor worker:\n" (current-error-port))
+                    (jolt-report-throwable e (current-error-port)))))
+      (let loop ()
+        (let ((job (jolt-with-mutex (vector-ref st 2)
+                     ;; Out of STARTING and into whatever executor-take-job! decides,
+                     ;; under that ONE hold: this worker leaves it either running the
+                     ;; job it dequeues or counted in idle-workers by
+                     ;; executor-idle-wait!, and is never absent from all three.
+                     (arrived!)
+                     (executor-take-job! st))))
+          (when job (job) (loop)))))))
 
 ;; shutdown: stop accepting, let what is queued drain.
 (define (executor-shutdown! st)
@@ -1886,8 +1912,46 @@
                       ;; miss.
                       (when (fx>? (vector-ref st 9) 0)
                         (jolt-cv-signal-one! (vector-ref st 3)))
-                      ;; Grow if this task has no idle worker waiting to take it.
-                      (if (and (fx>? (vector-ref st 10) (vector-ref st 9))
+                      ;; Grow if this task has no worker to take it — one parked in
+                      ;; idle-wait, or one already forked and on its way to the queue.
+                      ;;
+                      ;; STARTING (st 12) belongs in that count for the reason the herd
+                      ;; did (see the two conditions, above): a worker slow to ARRIVE
+                      ;; also looks like a worker that is not coming. Counting only the
+                      ;; parked ones, a fork that has not landed yet is invisible, so on
+                      ;; a contended machine every submit inside that window forked
+                      ;; another worker — and each one lengthened the window by
+                      ;; contending for this mutex, which forked more still. A
+                      ;; SEQUENTIAL submit/get loop, concurrency one throughout, took
+                      ;; ~20 threads that way (one per task, all the work on the first
+                      ;; of them) where it needs one; jolt-jml has the measurements.
+                      ;; A starting worker is a taker, so counting it costs no
+                      ;; legitimate growth: a burst that really does need n workers
+                      ;; keeps depth ahead of idle+starting and still grows to n.
+                      ;;
+                      ;; This is Go's rule. Its scheduler counts the threads that are
+                      ;; on their way to look for work (sched.nmspinning) and wakep()
+                      ;; declines to start another while one exists — added there for
+                      ;; the same symptom, "lots of unnecessary thread wake ups". The
+                      ;; JVM does NOT do this: a SynchronousQueue offer succeeds only
+                      ;; against a worker already parked in take, so a cached pool
+                      ;; there counts parked workers exactly as this rule used to, and
+                      ;; ThreadPoolExecutor's own javadoc grants that direct handoffs
+                      ;; "admit the possibility of unbounded thread growth". So this
+                      ;; is jolt being tighter than the JVM, not catching up to it.
+                      ;;
+                      ;; Go carries one more rule that this does not need: the last
+                      ;; spinner to find work must wake a replacement. Go compares
+                      ;; against "is there ANY spinner", because a spinner scans every
+                      ;; queue and can absorb arbitrary work, so the invariant needs
+                      ;; re-establishing by hand. The comparison here is against the
+                      ;; COUNT of takers and each queued task needs its own, so it
+                      ;; maintains itself: idle+starting >= depth already means one
+                      ;; taker per queued task, and a worker cannot park while work is
+                      ;; queued (executor-take-job! re-reads the depth under this same
+                      ;; mutex before it waits).
+                      (if (and (fx>? (vector-ref st 10)
+                                     (fx+ (vector-ref st 9) (vector-ref st 12)))
                                (executor-claim-worker! st))
                           'spawn
                           #f))))))
@@ -2462,9 +2526,12 @@
         (unless enq (jolt-invoke thunk))
         jolt-nil)))
 
-;; (exit 0) rather than calling _exit: the exit handler runs the hooks, so ^C
+;; (exit …) rather than calling _exit: the exit handler runs the hooks, so ^C
 ;; while parked reaches exactly the same cleanup every other exit path does.
-(define jolt-pump-kih (lambda () (exit 0)))
+;; 130 = 128+SIGINT, the status a shell reports for a process killed by ^C and
+;; what the shutdown watcher exits with — the two ^C paths must not disagree on
+;; the status just because of which one got there first.
+(define jolt-pump-kih (lambda () (exit 130)))
 
 ;; Park the calling thread until a keyboard interrupt (^C), running the shutdown
 ;; hooks and exiting when it arrives — AND own the main-thread pump while parked.
@@ -2494,7 +2561,14 @@
 (define jolt-park-poll-ms 50)
 (define (jolt-park-until-interrupt)
   (keyboard-interrupt-handler jolt-pump-kih)
-  (jolt-set-sigint-blocked #f)
+  ;; …unless the shutdown watcher already owns SIGINT (it does whenever a hook was
+  ;; registered, which is the nREPL server's own case). Unblocking here would let
+  ;; the kernel deliver ^C to this thread instead of leaving it pending for
+  ;; sigwait, and then the two paths race for the same shutdown. The watcher's is
+  ;; the one that works from a foreign call, so leave the signal to it; the
+  ;; handler above stays installed for the unarmed case.
+  (unless (jolt-shutdown-watcher-running?)
+    (jolt-set-sigint-blocked #f))
   (jolt-with-mutex jolt-main-queue-mu (set-box! jolt-main-pump-active #t))
   (dynamic-wind
     (lambda () #f)
@@ -2629,8 +2703,9 @@
 ;;   - on every (exit n), via the exit handler the arming below installs — a
 ;;     -main that returns, an explicit (System/exit n), and an uncaught throw all
 ;;     end there;
-;;   - on ^C while parked in park-until-interrupt (jolt-pump-kih exits);
-;;   - on SIGTERM / SIGHUP, through the watcher thread further down.
+;;   - on SIGINT (^C), SIGTERM and SIGHUP, through the watcher thread further down;
+;;   - on ^C while parked in park-until-interrupt without the watcher armed
+;;     (jolt-pump-kih exits) — the fallback for a hook-free park.
 ;; Once per process, in registration order, each hook isolated so one that
 ;; throws cannot keep the rest from running.
 ;;
@@ -2708,14 +2783,29 @@
           (apply base args)))))
   jolt-nil)
 
-;; --- SIGTERM / SIGHUP --------------------------------------------------------
+;; --- SIGTERM / SIGHUP / SIGINT -----------------------------------------------
 ;; The signals a JVM runs shutdown hooks for and jolt can take over: SIGTERM (the
-;; default `kill`, what a supervisor sends) and SIGHUP. Same numbers on Linux and
-;; macOS. SIGINT is deliberately NOT here — Chez owns it through
-;; keyboard-interrupt-handler, and ^C reaches a child through the foreground
-;; process group anyway.
-(define jolt-shutdown-signals '(15 1))
+;; default `kill`, what a supervisor sends), SIGHUP, and SIGINT (^C). Same numbers
+;; on Linux and macOS.
+;;
+;; SIGINT used to be left out on the grounds that Chez owns it through
+;; keyboard-interrupt-handler. It does — and that is exactly the problem: Chez's
+;; handler unwinds to its own top level, which under a script means exiting 255
+;; without ever reaching the exit handler. So a program with a registered hook
+;; ^C'd ran no hook at all, while the same program `kill`ed ran every one of them
+;; (jolt-na7). A JVM makes no such distinction: ^C runs the hooks and exits 130.
+;; Taking SIGINT here makes the two agree.
+;;
+;; This only ever applies to a program that registered a shutdown hook — arming is
+;; what installs the mask, and it happens on the first registration (see below).
+;; A program with nothing to clean up keeps Chez's ^C behavior untouched, and a
+;; CHILD process never inherits the mask (jolt-with-empty-sigmask, further down),
+;; so ^C on the foreground process group still kills subprocesses outright.
+(define jolt-shutdown-signals '(15 1 2))
 (define jolt-shutdown-sigset #f)
+;; #t once the sigwait watcher owns the signals above — park-until-interrupt reads
+;; it to decide whether SIGINT is still Chez's to deliver.
+(define (jolt-shutdown-watcher-running?) (and jolt-shutdown-sigset #t))
 (define c-sigwait (jolt-foreign-proc-blocking "sigwait" '(void* void*) 'int))
 ;; The watcher cannot leave through Chez's (exit): called off the main thread it
 ;; never returns. It has already run the hooks and flushed by then, so _exit is
@@ -2769,9 +2859,9 @@
 ;; Both spawn paths hand the calling thread's mask straight to the child —
 ;; posix_spawn with a NULL attrp, and Chez's own fork — and jolt blocks signals
 ;; in threads for its own reasons: SIGINT so ^C reaches the thread parked in
-;; park-until-interrupt rather than an nREPL worker sitting in a foreign call,
-;; SIGTERM/SIGHUP so the watcher above can take them. Either one inherited is
-;; wrong in a way that bites at once: a child with SIGTERM blocked survives the
+;; park-until-interrupt rather than an nREPL worker sitting in a foreign call, and
+;; SIGINT/SIGTERM/SIGHUP so the watcher above can take them. Either one inherited
+;; is wrong in a way that bites at once: a child with SIGTERM blocked survives the
 ;; very destroy the shutdown hook exists to call, and a child with SIGINT blocked
 ;; ignores ^C (jolt-e5sb). A JVM gives its children a default mask; so does this.
 ;;
