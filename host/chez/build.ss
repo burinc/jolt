@@ -2104,6 +2104,50 @@
         "-I'" builddir "' '" lc "' '" lk "' -o '" out-path "' "
         native-link " " (bld-link-libs))))))
 
+;; --- boot-image prefetch (cold start) ---------------------------------------
+;; A binary that embeds its boot as a C array hands Chez a pointer into .data — a
+;; private, file-backed mapping the kernel demand-pages 4KB at a time as
+;; Sbuild_heap walks it — and nothing tells the kernel that the whole multi-MB
+;; range is about to be read in order. A cold jolt run reads 19.1MB of its 27.8MB
+;; binary before it prints anything, nearly all of it this boot. MADV_WILLNEED
+;; over the range, issued BEFORE Sscheme_init, lets that read overlap kernel init
+;; and the runtime image's top levels instead of being scheduled fault by fault
+;; behind them.
+;;
+;; It is a hint, and it buys nothing measurable on storage that is already
+;; bandwidth-bound — the A/B is in the commit that added this. What it targets is
+;; the opposite regime, a page-in bound by latency rather than throughput.
+;; Advisory in every sense: nothing checks the result, no platform has to
+;; implement it, and a failure costs the speedup and nothing else. Shared by the
+;; three C-array boot sites — jolt's own main (build-jolt.ss), `jolt build`'s cc
+;; executable, and --library. The appended-boot stub reads its boot through an fd
+;; rather than a mapping and carries the fadvise-shaped equivalent itself
+;; (stub/launcher.c).
+(define (bld-boot-prefetch-defn)
+  (string-append
+    "#include <stddef.h>\n"
+    "#if defined(__linux__) || defined(__APPLE__)\n"
+    "#include <stdint.h>\n"
+    "#include <sys/mman.h>\n"
+    "#include <unistd.h>\n"
+    "static void jolt_prefetch_boot(const void *p, size_t n) {\n"
+    "  long pagesize = sysconf(_SC_PAGESIZE);\n"
+    "  uintptr_t start, base;\n"
+    "  if (pagesize <= 0 || n == 0) return;\n"
+    "  /* madvise wants a page boundary; the array rarely starts on one. */\n"
+    "  start = (uintptr_t)p;\n"
+    "  base = start & ~(uintptr_t)(pagesize - 1);\n"
+    "  madvise((void *)base, n + (size_t)(start - base), MADV_WILLNEED);\n"
+    "}\n"
+    "#else\n"
+    "static void jolt_prefetch_boot(const void *p, size_t n) { (void)p; (void)n; }\n"
+    "#endif\n"))
+
+;; The call: the first statement of main / jolt_library_init, so the readahead is
+;; already in flight for everything that follows it.
+(define (bld-boot-prefetch-call)
+  "  jolt_prefetch_boot(jolt_boot, (size_t)jolt_boot_len);\n")
+
 ;; --- legacy cc link (dev bin/jolt): fresh Chez compile + xxd + cc ------------
 (define (build-with-cc entry-ns out-path mode builddir flat-ss flat-so boot boot-h main-c native-link petite-only?)
   (display (string-append "jolt build: compiling " entry-ns " (" mode " mode)\n"))
@@ -2137,7 +2181,9 @@
     (put-string mc
       (string-append
         "#include \"scheme.h\"\n#include \"boot_data.h\"\n"
+        (bld-boot-prefetch-defn)
         "int main(int argc, char *argv[]) {\n"
+        (bld-boot-prefetch-call)
         "  Sscheme_init(0);\n"
         "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, jolt_boot_len);\n"
         "  Sbuild_heap(0, 0);\n"
@@ -2173,6 +2219,7 @@
     "#include \"scheme.h\"\n"
     "#include <string.h>\n"
     "#include \"boot_data.h\"\n"
+    (bld-boot-prefetch-defn)
     "/* jolt_set_lookup_addr is called from the built library's scheme-start\n"
     "   handler (registered via Sforeign_symbol after Sbuild_heap) to hand the\n"
     "   stub the Scheme lookup callable's address. */\n"
@@ -2181,6 +2228,7 @@
     "void* jolt_lookup(const char* name) { return jolt_lookup_fn ? jolt_lookup_fn(name) : 0; }\n"
     "int jolt_library_init(int argc, char** argv) {\n"
     "  if (!argv) argc = 0;  /* Sscheme_start reads argv[0..argc-1]; a NULL argv means no args */\n"
+    (bld-boot-prefetch-call)
     "  Sscheme_init(0);\n"
     "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, (iptr)jolt_boot_len);\n"
     "  Sbuild_heap(0, 0);\n"

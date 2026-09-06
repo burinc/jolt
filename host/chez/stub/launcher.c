@@ -18,6 +18,7 @@
  * machine-type), like a native compiler.
  */
 #include "scheme.h"
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +54,31 @@ static int self_path(char *buf, uint32_t size) {
 }
 static int open_self(const char *path) { return open(path, O_RDONLY); }
 #endif
+
+/* Best-effort readahead of the boot region. The Chez kernel reads the boot
+   through this fd during Sbuild_heap; on a cold page cache those reads block one
+   after another, and nothing has told the kernel that the whole multi-MB region
+   is about to be read in order. Issued before Sscheme_init so the I/O overlaps
+   kernel init and the runtime image's top levels. Advisory: the result is not
+   checked and a platform without an equivalent simply keeps the old timing.
+   (The C-array boot sites use madvise instead — see bld-boot-prefetch-defn in
+   host/chez/build.ss.) */
+static void prefetch_boot_region(int fd, long off, uint64_t len) {
+#if defined(__linux__)
+  posix_fadvise(fd, (off_t)off, (off_t)len, POSIX_FADV_WILLNEED);
+#elif defined(__APPLE__)
+  /* Darwin has no posix_fadvise; F_RDADVISE is the read-ahead request, and its
+     count is an int, so a boot larger than INT_MAX prefetches its first 2GB. */
+  struct radvisory ra;
+  ra.ra_offset = (off_t)off;
+  ra.ra_count = (int)(len > (uint64_t)INT_MAX ? (uint64_t)INT_MAX : len);
+  fcntl(fd, F_RDADVISE, &ra);
+#else
+  (void)fd;
+  (void)off;
+  (void)len;
+#endif
+}
 
 #define JOLT_MAGIC "JOLTBOOT"
 #define JOLT_MAGIC_LEN 8
@@ -136,6 +162,10 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "jolt: cannot reopen self for boot\n");
     return 1;
   }
+
+  prefetch_boot_region(fd, boot_off, boot_len);
+  startup_profile_mark(startup_profile, startup_started, &startup_last,
+                       "prefetch boot payload");
 
   Sscheme_init(0);
   startup_profile_mark(startup_profile, startup_started, &startup_last,
