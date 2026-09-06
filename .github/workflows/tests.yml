@@ -29,7 +29,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/chez
-          key: chez-${{ runner.os }}-${{ env.ImageOS }}-v10.4.1-x11off
+          key: chez-${{ runner.os }}-${{ env.ImageOS }}-v10.4.1-x11off-pic
 
       - name: Build Chez Scheme from source
         if: steps.cache-chez.outputs.cache-hit != 'true'
@@ -38,7 +38,13 @@ jobs:
           cd /tmp/chez-src
           # --disable-x11: the expression editor's X11 clipboard isn't needed and
           # would pull an X11 build/link dep.
-          ./configure --installprefix=/opt/chez --threads --disable-x11
+          #
+          # CFLAGS+=-fPIC: `jolt build --library` links Chez's libkernel.a into a
+          # shared object, which a kernel built without -fPIC cannot do — the
+          # -shared link fails with a relocation error. build-lib-smoke.sh treats
+          # that as an environment limitation and SKIPS, so without this flag the
+          # buildlibsmoke gate passes without testing anything.
+          ./configure --installprefix=/opt/chez --threads --disable-x11 CFLAGS+=-fPIC
           make -j"$(nproc)"
           sudo make install
           sudo chown -R "$USER" /opt/chez
@@ -80,6 +86,11 @@ jobs:
         # build ships the kernel dev files).
         # -j overlaps the independent gates (ci is a plain dependency list);
         # -Oline keeps per-recipe output contiguous for failure reading.
+        env:
+          # The Chez built above is PIC, so `jolt build --library` links here and
+          # buildlibsmoke must actually run. This makes its skip paths fatal, so
+          # the gate cannot go back to reporting green without testing.
+          JOLT_REQUIRE_BUILDLIB: "1"
         run: make CHEZ=/opt/chez/bin/chez -j"$(nproc)" -Oline test
 
   windows-deps:
