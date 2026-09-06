@@ -219,15 +219,35 @@
 (defmacro bound-fn [& fntail]
   `(bound-fn* (fn ~@fntail)))
 
-(defmacro defonce [name expr]
+(defmacro defonce [name & body]
   ;; Must NOT reference clojure.core/resolve (a tree-shake bail ref).
   ;; Use jolt.host/find-var — a bare var-cell lookup with no alias resolution.
   ;; The ns/name strings are computed at expansion time.
+  ;;
+  ;; A leading docstring is accepted, so defonce takes the same
+  ;; (sym doc-string? init) shape `def` does. clojure.core's defonce is [name expr]
+  ;; only, which makes (defonce x "doc" 42) an arity error there rather than a
+  ;; different meaning — so accepting it is a superset, not a divergence. ^meta on
+  ;; the name rides along either way, since the expansion hands the symbol to `def`
+  ;; untouched.
   (let [ns-str (str (clojure.core/ns-name clojure.core/*ns*))
-        n-str (clojure.core/name name)]
+        n-str (clojure.core/name name)
+        n (clojure.core/count body)
+        ;; Two forms with a string first is the docstring shape; one form is the
+        ;; init — and a lone string IS the init, exactly as (def x "s") means.
+        doc (clojure.core/when (clojure.core/and (clojure.core/= 2 n)
+                                                 (clojure.core/string? (clojure.core/first body)))
+              (clojure.core/first body))
+        expr (clojure.core/if doc (clojure.core/second body) (clojure.core/first body))]
+    (clojure.core/when-not (clojure.core/or (clojure.core/= 1 n) doc)
+      (throw (new IllegalArgumentException
+                  (str "defonce takes a name, an optional docstring and an init: "
+                       "(defonce " n-str " doc-string? init)"))))
     `(if-let [v# (jolt.host/find-var ~ns-str ~n-str)]
        v#
-       (def ~name ~expr))))
+       ~(clojure.core/if doc
+          `(def ~name ~doc ~expr)
+          `(def ~name ~expr)))))
 
 ;; Single arglist (Jolt defmacro is single-arity); the optional else defaults nil
 ;; via rest-destructuring.

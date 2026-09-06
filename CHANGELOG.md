@@ -7,7 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`jolt build` says which `:jolt/native` libraries stay dynamic.** Everything
+  else a build produces is inside the binary, so a library that is loaded at
+  runtime is the one reason the result is not the dependency-free artifact a
+  static build is taken to be — and nothing said so. The build now names them and
+  points at the `:static` key that would link one in. A system library the OS
+  resolves by soname is the normal case and this is not a warning; a fully static
+  build prints nothing.
+
+### Changed
+
+- **`defonce` takes a docstring**, so it has the same `(sym doc-string? init)`
+  shape `def` has: `(defonce cache "the memo table" (atom {}))` defines the var
+  with that `:doc`. `clojure.core`'s `defonce` is `[name expr]` and raises
+  `ArityException` on the three-form call, so this widens only — nothing that
+  compiles on the JVM changes here (recorded as a `:permissive` divergence). The
+  parse is `def`'s, not `defn`'s: a LONE string is the init, and `def` takes no
+  attr-map so neither does this. `^meta` on the name worked before and still
+  does; only the docstring position was missing. A shape that is neither now
+  names itself as an `IllegalArgumentException` rather than an arity error.
+
 ### Fixed
+
+- **Shutdown hooks run on `^C`.** `Runtime.addShutdownHook` and
+  `jolt.host/add-shutdown-hook` fired on a normal exit, on `System/exit`, and on
+  `SIGTERM`/`SIGHUP`, but not on `SIGINT`: Chez owns that signal through
+  `keyboard-interrupt-handler`, which unwinds to Chez's own top level and, under a
+  script, exits **255** without ever reaching the exit handler. So a
+  `babashka.process` `:shutdown destroy-tree` cleaned up when a supervisor
+  `kill`ed the process and cleaned up nothing when a person pressed `^C` — the
+  case the option exists for. The shutdown watcher takes `SIGINT` alongside
+  `SIGTERM`/`SIGHUP` now, so `^C` runs every hook and exits **130** (128+SIGINT),
+  which is what the JVM and the shell both report.
+
+  As before, the watcher is armed by the FIRST registered hook and never sooner:
+  a program with nothing to clean up keeps Chez's `^C` behavior untouched, and a
+  child process still never inherits the mask, so `^C` on the foreground process
+  group kills subprocesses outright.
+
+- **A cached pool no longer forks a worker per task under CPU contention.**
+  `Executors/newCachedThreadPool` grows when a task arrives that no idle worker is
+  waiting to accept. It counted only the workers parked in the idle wait, so a
+  worker that had been forked but had not yet reached the queue was invisible —
+  and on a contended machine every submit inside that window forked another
+  worker, each one lengthening the window by contending for the queue mutex. A
+  **strictly sequential** submit/`.get` loop, concurrency one throughout, could
+  reach ~20 threads where it needs one, with every task running on the first of
+  them and the other 19 sitting out the 60s keep-alive. Over 200 trials under CPU
+  oversubscription the pool size for a 20-task loop went from
+  `{1 172, 2 2, 3 3, 5 3, 6 4, 7 5, 8 3, 9 2, 20 6}` to `{1 166, 2 33, 3 1}`.
+
+  A worker already on its way to the queue is a taker, so the growth rule counts
+  it now. That costs no legitimate growth: a burst that really does need *n*
+  workers keeps the queue ahead of idle-plus-starting and still grows to *n* — the
+  64-task blocking fan-out still reaches exactly 64, and the nested fan-out that
+  used to deadlock on a fixed pool still resolves.
 
 - **A relative `:jolt/native` path resolves against the deps.edn that declared
   it.** A project ships its shared object or archive beside its own sources —
@@ -30,16 +86,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:libdir` is a linker path, so a bare filename there resolves against the root
   too — `ld` reads `libfoo.a` as a file in the current directory, not a name to
   search for.
-
-### Added
-
-- **`jolt build` says which `:jolt/native` libraries stay dynamic.** Everything
-  else a build produces is inside the binary, so a library that is loaded at
-  runtime is the one reason the result is not the dependency-free artifact a
-  static build is taken to be — and nothing said so. The build now names them and
-  points at the `:static` key that would link one in. A system library the OS
-  resolves by soname is the normal case and this is not a warning; a fully static
-  build prints nothing.
 
 ## [0.8.3] - 2026-09-06
 
@@ -9015,7 +9061,9 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/jolt-lang/jolt/compare/v0.8.2...v0.8.3
+[0.8.2]: https://github.com/jolt-lang/jolt/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/jolt-lang/jolt/compare/v0.8.0...v0.8.1
 [0.7.28]: https://github.com/jolt-lang/jolt/compare/v0.7.27...v0.7.28
 [0.7.16]: https://github.com/jolt-lang/jolt/compare/v0.7.15...v0.7.16

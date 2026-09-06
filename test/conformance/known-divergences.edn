@@ -443,6 +443,15 @@
            :jvm "throws ArityException"
            :jolt "0"}
    :note "The overlay is variadic where the JVM's is fixed-arity. At arity 2 — every arity the JVM accepts — the wrapping result is identical, 64-bit edges included, so portable code is unaffected. Costs nothing on the hot path either: proven-long operands lower straight to jolt-uncadd2 (a left fold past 2 operands) and never reach the variadic overlay, which only serves value position."}
+  ;; defonce takes a docstring, as def does; the JVM's defonce is [name expr] only.
+  {:category :permissive
+   :behavior "(defonce name \"doc\" init) — the (def sym doc-string? init) shape, on defonce"
+   :jvm "throws ArityException — clojure.core/defonce is [name expr]"
+   :jolt "defines the var with :doc \"doc\" in its metadata"
+   :check {:expr "(do (defonce dv-defonce-doc \"d\" 1) (= \"d\" (:doc (meta #'dv-defonce-doc))))"
+           :jvm "throws ArityException"
+           :jolt "true"}
+   :note "Widening only, and in a direction no portable code can depend on: the three-form call is an arity error on the JVM, not a different meaning, so nothing that compiles there changes here. The parse is def's, not defn's — a lone string is the INIT ((defonce x \"s\") defs x to \"s\"), a string followed by one more form is the docstring. clojure.core's def takes no attr-map, so neither does this. ^meta on the name works either way and always did; only the docstring position was missing."}
   ;; distinct accepts any seqable, not just what nth can index.
   {:category :permissive
    :behavior "(distinct #{1 2 3}) or (distinct {:a 1}) — a coll that seqs but has no nth"

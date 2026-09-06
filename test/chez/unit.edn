@@ -17,6 +17,21 @@
   {:suite "uuid" :expr "(every? (fn [_] (re-matches #\"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\" (str (random-uuid)))) (range 200))" :expected "true"}
   {:suite "uuid" :expr "(let [us (repeatedly 400 #(str (random-uuid)))] (every? #(> (count (distinct (map (fn [u] (nth u %)) us))) 8) [0 1 2 7 9 35]))" :expected "true"}
   {:suite "uuid" :expr "(= (str (random-uuid)) (str (random-uuid)))" :expected "false"}
+  ;; defonce takes (name doc-string? init), the shape `def` takes. The docstring
+  ;; position is a jolt superset (see :permissive in known-divergences.edn — the
+  ;; JVM's defonce is [name expr] and raises ArityException there), so it cannot be
+  ;; a corpus row. The rest of the parse is def's to the letter.
+  {:suite "defonce-shape" :expr "(do (defonce du-a \"the doc\" 42) [du-a (:doc (meta #'du-a))])" :expected "[42 \"the doc\"]"}
+  ;; a LONE string is the init, not a docstring — (def x \"s\") means the same
+  {:suite "defonce-shape" :expr "(do (defonce du-b \"just a value\") [du-b (:doc (meta #'du-b))])" :expected "[\"just a value\" nil]"}
+  ;; ^meta on the name rides along beside the docstring; an explicit docstring
+  ;; wins over ^{:doc ...}, exactly as it does for def
+  {:suite "defonce-shape" :expr "(do (defonce ^:private ^{:doc \"from meta\"} du-c \"from docstring\" 1) [(:private (meta #'du-c)) (:doc (meta #'du-c))])" :expected "[true \"from docstring\"]"}
+  ;; the init is still evaluated at most once
+  {:suite "defonce-shape" :expr "(do (def du-d-runs (atom 0)) (defonce du-d \"doc\" (do (swap! du-d-runs inc) 1)) (defonce du-d \"doc\" (do (swap! du-d-runs inc) 2)) [du-d @du-d-runs])" :expected "[1 1]"}
+  ;; and a shape that is neither gets a named error rather than a silent mis-parse
+  {:suite "defonce-shape" :expr "(try (eval '(defonce du-e)) (catch Throwable e (class e)))" :expected "java.lang.IllegalArgumentException"}
+  {:suite "defonce-shape" :expr "(try (eval '(defonce du-f 1 2 3)) (catch Throwable e (class e)))" :expected "java.lang.IllegalArgumentException"}
   ;; The reflection member model: jolt reports what its registries KNOW a class
   ;; declares, not what the JVM ships. Three registries answer: the protocol/type
   ;; registry (a deftype's methods), the host shim tables (an ArrayList's), and
@@ -1285,6 +1300,29 @@
   ;; idle worker; reference Clojure answers 3 to this same expression, for the same
   ;; race against its SynchronousQueue handoff.
   {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool)] (dotimes [_ 20] (.get (.submit ex (fn [] 1)))) (< (.getPoolSize ex) 5))" :expected "true"}
+  ;; The same claim at a scale where the failure it guards is unmistakable rather
+  ;; than arguable. It is NOT a more reliable detector than the row above — the
+  ;; cascade below needs a contended machine to trigger at all, and it did so in
+  ;; roughly one run in five at 20, 100 and 400 tasks alike, so this is a second
+  ;; sample and not a sharper one. What it adds is the statement of the invariant:
+  ;; concurrency here is ONE — the .get means task k+1 is not submitted until task k has
+  ;; returned — so the pool needs exactly one worker and the count must not track
+  ;; the task count at all. It used to: a worker that had been forked but had not
+  ;; yet parked was counted by neither idle-workers nor anything else the growth
+  ;; rule read, so on a contended machine every submit inside that window forked
+  ;; another worker (each one lengthening the window by contending for the queue
+  ;; mutex), and 200 sequential tasks could reach ~20 threads with all 200 tasks
+  ;; running on the first of them. Counting starting workers as takers bounds it:
+  ;; at most one extra worker can be in flight at a time, so 2-3 rather than 20.
+  ;; Measured over 200 trials under 2x CPU oversubscription, the row above went
+  ;; from {1 172, 2 2, 3 3, 5 3, 6 4, 7 5, 8 3, 9 2, 20 6} to {1 166, 2 33, 3 1}.
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool)] (dotimes [_ 200] (.get (.submit ex (fn [] 1)))) (< (.getPoolSize ex) 5))" :expected "true"}
+  ;; and the workers that DID get forked are real workers, not a leaked count: the
+  ;; pool still serves work and terminates, so a starting worker that was counted
+  ;; as a taker actually arrived to take one. (A leaked start would be the worse
+  ;; failure — the growth rule would read a taker that is never coming and decline
+  ;; to grow for good, stranding the task instead of over-forking for it.)
+  {:suite "cached-pool" :expr "(let [ex (java.util.concurrent.Executors/newCachedThreadPool) c (atom 0)] (dotimes [_ 200] (.get (.submit ex (fn [] (swap! c inc))))) (.shutdown ex) [@c (.awaitTermination ex 30 java.util.concurrent.TimeUnit/SECONDS)])" :expected "[200 true]"}
   ;; A burst of 2000 short tasks: every one runs, the pool drains and terminates,
   ;; and it is served by the workers that keep up with the burst rather than by one
   ;; thread per task. The bound on the peak is deliberately loose — the growth test
