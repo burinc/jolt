@@ -123,6 +123,13 @@
 (is "the hinted reads classify their own range error"
     "[(try ((fn [^longs a ^long i] (aget a i)) (long-array 2) 9) (catch ArrayIndexOutOfBoundsException e :aioobe)) (try ((fn [^bytes a ^long i] (aget a i)) (byte-array 2) 9) (catch ArrayIndexOutOfBoundsException e :aioobe)) (try ((fn [^doubles a ^long i] (aget a i)) (double-array 2) 9) (catch ArrayIndexOutOfBoundsException e :aioobe))]"
     "[:aioobe :aioobe :aioobe]")
+;; ...including the BOXED ones, which pre-check because vector-ref's condition
+;; cannot be told from any other vector in the runtime. The hint must not decide
+;; which exception class a program catches: the same reads without it, and a
+;; widened long array, answer the same way.
+(is "a boxed hinted read/write classifies too"
+    "[(try ((fn [^objects a ^long i] (aget a i)) (object-array 2) 9) (catch ArrayIndexOutOfBoundsException e :aioobe)) (try ((fn [^objects a ^long i] (aset a i 1)) (object-array 2) 9) (catch ArrayIndexOutOfBoundsException e :aioobe)) (try (aget (object-array 2) 9) (catch ArrayIndexOutOfBoundsException e :aioobe)) (try (let [a (long-array 2)] (aset a 0 Long/MAX_VALUE) ((fn [^longs x ^long i] (aget x i)) a 9)) (catch ArrayIndexOutOfBoundsException e :aioobe))]"
+    "[:aioobe :aioobe :aioobe :aioobe]")
 
 (printf "array-backing-test: ~a/~a passed\n" (- total fails) total)
 (exit (if (= fails 0) 0 1))

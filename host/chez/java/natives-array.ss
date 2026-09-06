@@ -515,16 +515,35 @@
 ;; backing would refuse it outright. Reads are fine — the narrowing already
 ;; happened at the store.
 ;;
-;; Neither pre-checks the index: the backing primitive's own range check is the
+;; The unboxed backings need no index pre-check: their own range check IS the
 ;; array bounds contract here, exactly as on the ^doubles path, and host-faults.ss
-;; classifies its condition as an ArrayIndexOutOfBoundsException.
+;; classifies an fxvector/bytevector-s8 condition as an
+;; ArrayIndexOutOfBoundsException.
+;;
+;; A BOXED backing is the exception, and it has to pre-check. A plain Chez vector
+;; is what the runtime uses for everything, so vector-ref's range condition
+;; carries nothing to tell an array apart by and cannot join that list — which
+;; left (aget ^objects a oob) raising the PARENT IndexOutOfBoundsException while
+;; the same read without the hint raised the array class. A hint must not decide
+;; which exception a program catches. The pre-check is one fixnum compare, ~0.4ns
+;; of a 5.6ns read: 4% of what the hint buys (an untyped read of the same loop is
+;; 2.4x slower than the checked hinted one), which is the right side of that
+;; trade. It is on the boxed arm only, so ^longs/^bytes/^doubles pay nothing.
 (define (jolt-vaget a i)
-  (ja-backing-ref (jolt-array-vec a) (if (fixnum? i) i (exact (na-idx i)))))
+  (let ((v (jolt-array-vec a)) (j (if (fixnum? i) i (exact (na-idx i)))))
+    (cond ((fxvector? v) (fxvector-ref v j))
+          ((vector? v) (if (and (fixnum? j) (fx<? -1 j (vector-length v)))
+                           (vector-ref v j)
+                           (na-oob-throw j (vector-length v))))
+          ((bytevector? v) (bytevector-s8-ref v j))
+          (else (flvector-ref v j)))))
 (define (jolt-vaset a i v)
   (let ((bk (jolt-array-vec a)) (j (if (fixnum? i) i (exact (na-idx i)))))
     (if (fxvector? bk)
         (if (fixnum? v) (fxvector-set! bk j v) (vector-set! (ja-promote! a) j v))
-        (vector-set! bk j v))
+        (if (and (fixnum? j) (fx<? -1 j (vector-length bk)))
+            (vector-set! bk j v)
+            (na-oob-throw j (vector-length bk))))
     v))
 
 ;; A range condition escaping jolt-flaget/jolt-flaset IS the array bounds error
