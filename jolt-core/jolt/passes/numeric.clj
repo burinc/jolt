@@ -82,9 +82,9 @@
             (and (= :kw tt) (= "hashCode" m)))
     :long))
 
-;; Array kinds with a BOXED Chez vector backing — everything but double/float,
-;; whose flvector the :fl-aget/:fl-aset path unboxes. :bytes reads but does not
-;; write here (see the aset clause in an-invoke).
+;; Array kinds read through jolt-vaget/jolt-vaset — everything but double/float,
+;; whose flvector the :fl-aget/:fl-aset path unboxes AND types. :bytes reads but
+;; does not write here (see the aset clause in an-invoke).
 (def ^:private boxed-akinds #{:longs :ints :bytes :objects})
 (def ^:private boxed-aset-kinds #{:longs :ints :objects})
 
@@ -267,14 +267,14 @@
                    (or (= ikind :long)
                        (and (int-lit? inode) (fixnum-lit? (get inode :val))))
                    (assoc :fl-idx-long true))])
-      ;; (aget ^longs/^ints/^bytes/^objects a i) -> the boxed-vector read
+      ;; (aget ^longs/^ints/^bytes/^objects a i) -> the direct backing read
       ;; (jolt-vaget), skipping jolt-nth's index nil-check, coercion and
-      ;; pvec/string/cseq/record dispatch walk. NO result kind: nothing narrows a
-      ;; value entering an int/long array, so an element is not provably a fixnum.
+      ;; pvec/string/cseq/record dispatch walk. NO result kind: an int/long array
+      ;; widens past the fixnum range, so an element is not provably a fixnum.
       (and (= nm "aget") (= n 2) (contains? boxed-akinds (nth (nth ars 0) 0)))
       [nil (assoc node1 :v-aget true)]
-      ;; (aset ^longs/^ints/^objects a i v) -> the boxed-vector write, returning the
-      ;; stored value (JVM contract). ^bytes is absent on purpose: a byte array
+      ;; (aset ^longs/^ints/^objects a i v) -> the direct backing write, returning
+      ;; the stored value (JVM contract). ^bytes is absent on purpose: a byte array
       ;; narrows its elements to signed 8 bits at the store (na-elem-of), and that
       ;; narrowing lives on the generic path.
       (and (= nm "aset") (= n 3) (contains? boxed-aset-kinds (nth (nth ars 0) 0)))

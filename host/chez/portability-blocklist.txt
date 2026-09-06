@@ -92,10 +92,15 @@ collect-trip-bytes
 file-modification-time
 #
 # tier: misc
+# (fxvector / make-fxvector left this tier when int/long/short arrays moved onto
+# an fxvector backing — java/natives-array.ss. They are the fixnum sibling of the
+# flvector backing double/float arrays have always used and that the back end
+# EMITS into compiled code, so the array representation is one Chez-typed-vector
+# decision, not a Chez-ism a call site can route around. A port replaces the
+# backing table there — a plain vector is a valid backing for every kind by
+# construction — rather than shimming these two names.)
 add1
 sub1
-fxvector
-make-fxvector
 last-pair
 list-copy
 sort!
