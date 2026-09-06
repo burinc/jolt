@@ -522,11 +522,19 @@
   ([state] (release-group! state false))
   ([state exclusive?]
    (let [closed {:open? false :blocks [] :callables [] :views []}
-         ;; A confined arena has one legal mutator, so it does not need a CAS
-         ;; loop to exchange its group. Keep the state in an atom nevertheless:
-         ;; arena-open? is public and may be observed from another thread.
+         ;; A confined arena has one legal owner, so its exchange is a
+         ;; compare-and-set! rather than the CAS LOOP reset-vals! runs — one
+         ;; mutex acquisition and no [old new] pair allocated. Not a bare
+         ;; reset!: one owner thread is not one mutator, because fibers share
+         ;; their carrier's thread-id and a sibling fiber can allocate into the
+         ;; arena between the read and the publish, which a reset! would drop on
+         ;; the floor unfreed. The state stays an atom either way: arena-open?
+         ;; is public and may be observed from another thread.
          group (if exclusive?
-                 (let [before @state] (reset! state closed) before)
+                 (let [before @state]
+                   (if (compare-and-set! state before closed)
+                     before
+                     (first (reset-vals! state closed))))
                  (first (reset-vals! state closed)))]
      (when (:open? group)
        ;; The overwhelmingly common empty arena needs only the atomic close
@@ -653,6 +661,12 @@
 ;; adds only while :open? holds; when it did not, the caller undoes whatever it
 ;; had already allocated and the call raises rather than returning a pointer the
 ;; arena is not going to free.
+;; The CAS-loop attach, and the only place that allocates the update closure —
+;; the confined path below builds no closure at all, and calls this only on the
+;; rare loss.
+(defn- arena-swap-add! [state key value]
+  (first (swap-vals! state (fn [m] (if (:open? m) (update m key conj value) m)))))
+
 (defn- arena-add!
   ([a key value] (arena-add! a key value nil))
   ([a key value on-lost]
@@ -662,11 +676,20 @@
                   ;; Re-read here because native allocation may re-enter user
                   ;; code and close the arena before attachment.
                   (let [before @state]
-                    (when (:open? before)
-                      (reset! state (update before key conj value)))
-                    before)
-                  (first (swap-vals! state
-                                     (fn [m] (if (:open? m) (update m key conj value) m)))))]
+                    (if (and (:open? before)
+                             (not (compare-and-set! state before (update before key conj value))))
+                      ;; The publish is a compare-and-set!, not a reset!, because
+                      ;; "one owner THREAD" is not "one mutator": fibers share
+                      ;; their carrier's thread-id (jolt.host/thread-id is
+                      ;; get-thread-id), so two fibers on one carrier both pass
+                      ;; the owner check, and preemption is polled at procedure
+                      ;; entries. A blind read-modify-write between them loses
+                      ;; allocations, or re-opens an arena a sibling has closed
+                      ;; and freed. The CAS is the same one mutex acquisition the
+                      ;; reset! was; only the rare loss pays the loop.
+                      (arena-swap-add! state key value)
+                      before))
+                  (arena-swap-add! state key value))]
      (when-not (:open? before)
        (when on-lost (on-lost))
        (throw (ex-info "jolt.ffi: the arena closed while this allocation was in flight"
