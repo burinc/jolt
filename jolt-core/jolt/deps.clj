@@ -956,15 +956,28 @@
                       (if (contains? seen k) [seen acc] [(conj seen k) (conj acc x)])))
                   [#{} []] xs)))
 
+;; The platform keys a :jolt/native spec declares its candidates under: exactly
+;; the values main.clj's current-platform selects with, so the identity below
+;; reads the same keys the loader does. It listed :win, which current-platform
+;; never produces, so on Windows a spec that declared candidates only under
+;; :windows keyed on nothing at all (jolt-ajd).
+(def ^:private native-platform-keys [:darwin :linux :windows])
+
 (defn- native-key
   "Identity of a :jolt/native spec. A :process lib (the running process's own
   symbols, e.g. libc) keys on that flag; a file lib on its :name, else on its
-  platform candidate paths — two deps naming the same lib reconcile to one load."
+  platform candidate paths — two deps naming the same lib reconcile to one load.
+  A spec with neither a :name nor a candidate under any platform key (it declares
+  only :static, or only a key no platform selects) keys on its own shape, minus
+  the declaring root: distinct specs stay distinct instead of collapsing to one
+  under dedup-by, and two deps declaring the same lib still reconcile."
   [spec]
   (letfn [(cands [k] (let [v (get spec k)] (cond (string? v) [v] (sequential? v) (vec v) :else [])))]
     (if (:process spec)
       [:process (:name spec)]
-      [:native (or (:name spec) (vec (sort (concat (cands :darwin) (cands :linux) (cands :win)))))])))
+      [:native (or (:name spec)
+                   (let [paths (vec (sort (mapcat cands native-platform-keys)))]
+                     (if (seq paths) paths (dissoc spec :jolt.deps/root))))])))
 
 (defn- provides-entries
   "A deps.edn :jolt/provides map as provider-table rows: [install-ns lib class ...].

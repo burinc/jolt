@@ -45,6 +45,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **On Windows, two different `:jolt/native` libraries no longer reconcile to
+  one.** A resolved project dedups its native declarations so that an app pulling
+  two dependencies that name the same shared object loads it once. The identity a
+  spec dedups on is its `:name`, or — when it has none — the candidate paths it
+  declares for each platform, and it read those from `:darwin`, `:linux` and
+  `:win`. The key the loader selects with is `:windows`, the spelling everything
+  else documents and reads, so a Windows-only spec with no `:name` contributed no
+  candidates at all: every such spec keyed on the same empty vector and all but
+  the first were dropped before anything tried to load them. Specs that also
+  declared `:darwin`/`:linux` candidates keyed correctly by accident. The identity
+  reads `:windows` now, and a spec that carries neither a `:name` nor a candidate
+  under any platform key (one declaring only `:static`) keys on its own shape, so
+  that shape cannot collapse this way either.
+
 - **Shutdown hooks run on `^C`.** `Runtime.addShutdownHook` and
   `jolt.host/add-shutdown-hook` fired on a normal exit, on `System/exit`, and on
   `SIGTERM`/`SIGHUP`, but not on `SIGINT`: Chez owns that signal through

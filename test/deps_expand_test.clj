@@ -302,6 +302,50 @@
          (and (str/includes? (str msg) "a/one 1.0")
               (str/includes? (str msg) "b/two 2.0")))))
 
+;;;; :jolt/native dedup identity
+
+(let [native-key (var jolt.deps/native-key)
+      dedup-by (var jolt.deps/dedup-by)]
+  ;; The keys a spec's candidates are declared under are the ones
+  ;; current-platform selects with. native-key read :win, which it never
+  ;; produces, so two Windows-only specs with no :name both keyed on an empty
+  ;; vector and dedup-by dropped the second (jolt-ajd).
+  (let [a {:windows ["sqlite3.dll"]}
+        b {:windows ["libcrypto-3-x64.dll"]}]
+    (is= "Windows-only specs key distinctly" true
+         (not= (native-key a) (native-key b)))
+    (is= "Windows-only specs both survive dedup" [a b] (dedup-by native-key [a b])))
+  (is= "a Windows candidate is part of the identity"
+       (native-key {:windows ["sqlite3.dll"]})
+       (native-key {:windows "sqlite3.dll"}))
+  (is= "the same Windows lib from two deps reconciles to one"
+       [{:windows ["sqlite3.dll"] :jolt.deps/root "/a"}]
+       (dedup-by native-key [{:windows ["sqlite3.dll"] :jolt.deps/root "/a"}
+                             {:windows ["sqlite3.dll"] :jolt.deps/root "/b"}]))
+
+  ;; Every platform key contributes, and :name still overrides all of them.
+  (is= "each platform key contributes to the identity" 3
+       (count (dedup-by native-key [{:darwin ["libz.dylib"]}
+                                    {:linux ["libz.so.1"]}
+                                    {:windows ["zlib1.dll"]}])))
+  (is= "a :name reconciles specs whose candidates differ" 1
+       (count (dedup-by native-key [{:name "z" :linux ["libz.so.1"]}
+                                    {:name "z" :windows ["zlib1.dll"]}])))
+  (is= "a :process lib keys on the flag, not on candidates" 1
+       (count (dedup-by native-key [{:process true :name "c"}
+                                    {:process true :name "c" :linux ["libc.so.6"]}])))
+
+  ;; A spec with no :name and no candidate under any platform key — a
+  ;; :static-only lib, or a key no platform selects — falls back to its own
+  ;; shape rather than to one shared empty identity.
+  (is= "static-only specs stay distinct" 2
+       (count (dedup-by native-key [{:static {:archive "native/libfoo.a"}}
+                                    {:static {:archive "native/libbar.a"}}])))
+  (is= "an identical static-only spec from two roots reconciles" 1
+       (count (dedup-by native-key
+                        [{:static {:archive "native/libfoo.a"} :jolt.deps/root "/a"}
+                         {:static {:archive "native/libfoo.a"} :jolt.deps/root "/b"}]))))
+
 (println (str "deps-expand: " (- @checks @failures) "/" @checks " passed"))
 (when (pos? @failures)
   (System/exit 1))
