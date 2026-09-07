@@ -617,6 +617,20 @@
 (defn- cmd-tasks []
   ((requiring-resolve 'jolt.tasks/list-tasks!) (deps/project-tasks (project-dir))))
 
+;; `jolt completions <shell>` prints the function to source; `completions tasks`
+;; prints the name/doc lines that function asks for when a project's config
+;; changes. Both read the config files only, like cmd-tasks and for the same
+;; reason: a completing shell must not be the thing that discovers your deps
+;; don't resolve.
+(defn- cmd-completions [more]
+  (let [what (first more)]
+    (case what
+      nil (throw (ex-info "completions needs a shell: zsh, bash, fish, or tasks" {}))
+      "tasks" (run! println
+                    ((requiring-resolve 'jolt.completions/task-lines)
+                     (deps/project-tasks (project-dir))))
+      (print ((requiring-resolve 'jolt.completions/snippet) what "jolt")))))
+
 ;; babashka's :override-builtin — a task only displaces the jolt command of the
 ;; same name when it says so. Checked from the :tasks maps directly, so it costs
 ;; a small file read rather than loading the task runner on every command.
@@ -847,6 +861,9 @@
   (println "                         (see tools/cross-compile)")
   (println "  path                   print the resolved source roots")
   (println "  tasks                  list the project's bb.edn/deps.edn :tasks")
+  (println "  completions SHELL      print a completion function to source, for")
+  (println "                         zsh, bash or fish; `completions tasks` prints")
+  (println "                         the name/doc lines that function asks for")
   (println "  <task> [args]          run a task (`run <task>` and `run --parallel")
   (println "                         <task>` do the same)")
   (println "  help, --help, -h       print this message")
@@ -955,7 +972,7 @@
       ;; (babashka's :override-builtin). Checked here, after the two commands
       ;; that read no project at all, so it costs nothing a command doesn't
       ;; already pay: everything below resolves the project anyway.
-      (and (#{"run" "repl" "nrepl-server" "path" "build" "tasks"} cmd)
+      (and (#{"run" "repl" "nrepl-server" "path" "build" "tasks" "completions"} cmd)
            (builtin-overridden? cmd))
       (run-task cmd more false)
 
@@ -964,6 +981,7 @@
       (= cmd "nrepl-server")             (nrepl more)
       (= cmd "path")                     (cmd-path)
       (= cmd "tasks")                    (cmd-tasks)
+      (= cmd "completions")              (cmd-completions more)
       ;; -Sdeps '<edn>' — an extra deps.edn map merged last into the chain,
       ;; bound around the re-dispatch of the remaining argv.
       (= cmd "-Sdeps")
