@@ -166,6 +166,32 @@
 (define (dce-app-refs ir str)
   (append (dce-collect-refs '() ir) (dce-sexp-refs-str str)))
 
+;; The (def-var! "ns" "name" …) / (def-var-with-meta! …) form a prelude record
+;; defines, or #f for a non-def form. A def whose value holds an anonymous fn
+;; literal is minted as (begin (let* <quote pool> (image-register-fn-form! …)…)
+;; (def-var…)) — the source registration first, then the def — so look through
+;; exactly that shape. Read as a non-def form, every such def (138 of the 685
+;; prelude defs) was an unprunable root, and two of them, clojure.repl/find-doc
+;; and apropos, reference all-ns, ns-interns and ns-publics: every --tree-shake
+;; build bailed from the commit that made core's literals register (7d11cfed,
+;; 0.7.29), whatever the app did.
+;; Any other begin (a defrecord's several defs, a def-var-plain! group) stays a
+;; keep form as before: a record carries one fqn, and pruning several defs
+;; under one of their names is unsound.
+(define (dce-def-var-form b)
+  (define (def-var-form? x)
+    (and (pair? x) (memq (car x) '(def-var! def-var-with-meta!))
+         (pair? (cdr x)) (string? (cadr x))
+         (pair? (cddr x)) (string? (caddr x))))
+  (cond
+    ((def-var-form? b) b)
+    ((and (pair? b) (eq? (car b) 'begin)
+          (pair? (cdr b)) (pair? (cadr b)) (eq? (car (cadr b)) 'let*)
+          (pair? (cddr b)) (null? (cdddr b))
+          (def-var-form? (caddr b)))
+     (caddr b))
+    (else #f)))
+
 ;; str re-serializes the read form (compiled identically; comments/whitespace are
 ;; irrelevant).
 (define (dce-blob-records path)
@@ -190,12 +216,10 @@
                          "tree-shake: a prelude form does not round-trip through write/read"
                          (if (pair? form) (car form) form)))
                 (loop (cons
-                         (if (or (and (pair? b) (eq? (car b) 'def-var!) (pair? (cdr b)) (string? (cadr b))
-                                      (pair? (cddr b)) (string? (caddr b)))
-                                 (and (pair? b) (eq? (car b) 'def-var-with-meta!) (pair? (cdr b)) (string? (cadr b))
-                                      (pair? (cddr b)) (string? (caddr b))))
-                            (dce-rec #f (string-append (cadr b) "/" (caddr b)) refs str)
-                            (dce-rec #t #f refs str))
+                         (let ((d (dce-def-var-form b)))
+                           (if d
+                               (dce-rec #f (string-append (cadr d) "/" (caddr d)) refs str)
+                               (dce-rec #t #f refs str)))
                         acc)))))))))
 
 ;; A reader fn reached ONLY via runtime (read-string "#my/tag ..") resolves through
