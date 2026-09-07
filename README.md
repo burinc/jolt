@@ -303,7 +303,10 @@ A snippet holds jolt's own commands directly, since those change only when the
 binary does. The project's tasks it fetches with `jolt completions tasks` and
 caches against the mtimes of `deps.edn` and `bb.edn`, so a press costs nothing
 until one of those files moves. Under zsh that path forks no process at all and
-measures 0.4ms. Set `JOLT_COMPLETION_NO_CACHE=1` to bypass it.
+measures 0.4ms. Set `JOLT_COMPLETION_NO_CACHE=1` to bypass it. Fish is the
+exception: its completion function stays loaded for the session, so the tasks
+are cached in the shell's own variables, keyed on the directory they were read
+in, and a task added mid-session wants a new shell.
 
 `jolt completions tasks` is worth knowing on its own: one line per listable
 task, `name<TAB>doc`, which is the machine-readable form of what `jolt tasks`
