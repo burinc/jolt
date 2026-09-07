@@ -5,7 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.5] - 2026-09-07
+
+A `fn` with no captured values returned the SAME object every time it was
+evaluated, where Clojure allocates a fresh one. That is a Chez optimization jolt
+was inheriting, it is observable, and real libraries depend on the Clojure
+answer — malli's regex schemas silently answered `false` for a schema the JVM
+accepts, and `with-meta` on one such fn leaked its metadata onto every other one.
+Fixed, with the seed re-minted.
+
+Startup is also about half what it was: `jolt --version` went 0.32s to 0.16s on
+the development machine, a binary built by `jolt build` 0.49s to 0.24s, and the
+jolt binary is 4.2MB smaller with a third less peak memory. That came from two
+changes — the boot image ships in Chez's vfasl format, and ~1.8MB of embedded
+source stopped being rebuilt into the heap on every start.
+
+Two things to know before upgrading. `jolt <TAB>` completes jolt's commands and
+your project's tasks now, in zsh, bash or fish — `jolt completions zsh` prints
+the function to source. And jolt bounds its heap at 25% of the machine the way
+the JVM does, raising `OutOfMemoryError` instead of growing until the kernel
+kills the process; that changes behaviour for a program that legitimately wants
+more, and `JOLT_MAX_HEAP` is the way to give it more.
 
 ### Added
 
@@ -15,35 +35,171 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `source <(jolt completions zsh)` in `~/.zshrc` after `compinit`, or save the
   output as `_jolt` on `$fpath`; both work.
 
-  The split from babashka is deliberate and is about latency. babashka calls its
-  binary back on every TAB press to compute the candidates for the line so far,
-  which it can afford. Jolt cannot: its floor is the Chez runtime coming up,
-  about 0.22s whatever it is asked for, and `jolt version` costs the same as
-  `jolt tasks`. So the two halves are split by how often they change. jolt's own
-  commands and options change when the binary does, so they are baked into the
-  snippet when it is generated and cost a completing shell nothing afterwards. A
-  project's tasks change when its `deps.edn` or `bb.edn` changes, so the snippet
-  caches them against those two mtimes and calls back only when one moves. The
-  zsh path uses `zsh/stat` and `$(<file)` and so forks nothing at all: a warm
-  press measures 0.4ms, against 97ms for the `bb tasks` that babashka's own
-  documented completion runs every time.
+  The departure from babashka is deliberate and is about latency. babashka calls
+  its binary back on every TAB press to compute the candidates for the line so
+  far, which it can afford. Jolt cannot: its floor is the Chez runtime coming
+  up, and `jolt version` costs what `jolt tasks` costs. So the two halves are
+  split by how often they change. jolt's own commands and options change when
+  the binary does, so they are baked into the snippet when it is generated and
+  cost a completing shell nothing afterwards. A project's tasks change when its
+  `deps.edn` or `bb.edn` changes, so the zsh and bash snippets cache them
+  against those two mtimes and call back only when one moves — the zsh path via
+  `zsh/stat` and `$(<file)`, forking nothing at all, at 0.4ms a warm press.
+  Fish, whose completion function stays loaded for the session, instead caches
+  in the shell's own variables keyed on the directory it read them in.
+  `JOLT_COMPLETION_NO_CACHE=1` bypasses all of it.
 
-  `jolt completions tasks` is the callback, and is useful on its own: one line
-  per listable task, `name<TAB>doc`, which is the machine-readable form of the
-  listing that `jolt tasks` writes for a person. Both go through
+  `jolt completions tasks` is the callback, and is useful alone: one line per
+  listable task, `name<TAB>doc`, the machine-readable form of the listing that
+  `jolt tasks` writes for a person. Anything scripting over a project's tasks
+  should read that rather than parse the listing. Both go through
   `jolt.tasks/listable`, so what TAB offers and what `jolt tasks` shows cannot
   drift apart on which tasks exist. They differ deliberately on one point: a
   task sharing a built-in's name is offered only when it wins that name with
-  `:override-builtin`, since a description says what the word will do and for a
-  task that loses to a command the answer is the command.
+  `:override-builtin`, since a description says what the word will do, and for
+  a task that loses to a command the answer is the command.
 
-  `make completionssmoke` gates the lines, all three snippets (parsed by their
-  own shells), the bash function run against a project, and the zsh function's
-  candidates read back through a stubbed `_describe` — that last one because
-  bash has no description column, so a candidate carrying the WRONG description
-  is invisible to every other check here.
+  `make completionssmoke` gates the lines, all three snippets parsed by their
+  own shells, the bash function run against a project, the zsh function's
+  candidates read back through a stubbed `_describe` — bash has no description
+  column, so a candidate carrying the WRONG description is invisible to every
+  other check — and the spawn count across repeated presses, which is the only
+  thing that can tell a working cache from one that merely returns right
+  answers slowly.
+
+  Contributed by @burinc in #876, design included.
+
+- **`COLD=1 bench/startup.sh`** measures the FIRST run, which nothing in the tree
+  did. Every startup benchmark timed a warm binary, so between them they
+  described the second run and after. The cold mode drops the binary from the
+  page cache before each rep (`bench/pagecache.py`, `posix_fadvise`, no root) and
+  reports how much of it one run reads back (`mincore`). It prints the first rep
+  as well as the best of N, and says why: eviction clears the guest page cache
+  but not the drive's, so later cold reps drift downward and the first is the
+  honest one.
+
+- **`JOLT_PROFILE_INLINE=1` at build time** breaks the startup profile down per
+  inlined file. The runtime manifest carries one mark per entry, so
+  `host/chez/rt.ss` was a single line covering the ~40 files it transitively
+  loads — enough to say the runtime cost 64ms, not enough to say which part did.
+
+### Changed
+
+- **Jolt bounds its heap, the way the JVM always has.** The ceiling defaults to
+  25% of physical memory — the share `MaxRAMPercentage` uses — reads a
+  container's limit in preference to the host's, and raises
+  `java.lang.OutOfMemoryError` rather than exceed it. On a 7.63GB machine that
+  is 1954MB, within 1.5MB of what the JVM's own ergonomics choose there.
+  `(.maxMemory (Runtime/getRuntime))` reports it instead of `Long/MAX_VALUE`.
+
+  Chez has no `-Xmx` and grows its heap on demand, so before this a program that
+  outgrew the machine was killed by the kernel: SIGKILL, no diagnostic, no
+  stack, and an empty log, because the kill gives the process no chance to
+  flush. Diagnosing one instance of that took a full session. It is an error you
+  can catch now.
+
+  It also collects harder before giving up. Chez defers a maximum-generation
+  collection until the live set has doubled
+  (`collect-maximum-generation-threshold-factor`), which is the wrong instinct
+  under memory pressure, so above three quarters of the ceiling jolt forces the
+  collection that would otherwise have been deferred.
+
+  THIS CHANGES BEHAVIOUR for a program that legitimately wants more than a
+  quarter of the machine: it now gets an error where it previously kept growing.
+  `JOLT_MAX_HEAP` raises or removes the bound the way `-Xmx` does — an integer
+  of bytes with an optional `k`/`m`/`g`, or `off` for the unbounded behaviour
+  every release before this one had. `test/conformance/libs/run.clj` sets `off`
+  for itself: a stress harness measuring tallies is exactly the case that wants
+  no bound.
+
+- **The boot image ships in Chez's vfasl format**, in jolt and in everything
+  `jolt build` produces. An ordinary boot is a fasl stream the kernel walks
+  object by object, allocating as it goes; a vfasl boot is a prebuilt image
+  loaded straight into the static generation, so the load stops allocating and
+  the `Scompact_heap` that ends `Sbuild_heap` has far less to compact. Measured:
+  the runtime's top levels 66ms to 11ms, the prelude 35ms to 16ms, the runtime
+  image 19ms to 9ms, compaction 66ms to 22ms. Which also settles what that time
+  had been — nearly all of it was fasl loading, not top-level forms computing.
+  A cross build keeps the plain boot: `$fasl-to-vfasl` lays an image out for one
+  machine, and the toolchain-free path would convert against the host's.
+
+- **Embedded jolt-core and stdlib source is fetched from a blob on demand**
+  rather than baked into the boot as literals. A boot file's top level runs on
+  every start, so every run was rebuilding ~1.8MB of string literals and
+  allocating a fresh UTF-8 bytevector from each — to populate a table most runs
+  never read. Each blob entry is compressed, which pays here (read only when a
+  namespace loads from source) in a way it does not for the boot image (read
+  start to finish every time), and is why the binary got smaller rather than
+  larger.
+
+- **The boot region is prefetched before `Sbuild_heap`.** Advisory; it measures
+  as no change on storage already saturating its sequential bandwidth, which is
+  the only kind available to test it on.
 
 ### Fixed
+
+- **A `fn` with no captured values is now a fresh object on every evaluation.**
+  jolt compiles a Clojure `fn` to a Chez `lambda`, and Chez deliberately returns
+  one shared closure for a lambda with no free variables — it needs no
+  environment, so it needs no allocation. R5RS permits that (`eqv?` on two
+  identically-behaving procedures is implementation-defined); Clojure does not,
+  and code depends on the Clojure answer:
+
+  - `malli.impl.regex` keys its parked-continuation cache on validator closures.
+    `?-validator` builds its epsilon branch with `(cat-validator)`, whose body
+    captures nothing, so every `:?` in a schema shared one object. Two distinct
+    parked states collided, the fallback was never parked, backtracking died,
+    and `(m/validate [:cat [:? [:= :a]] [:? [:= :a]] [:= :a] [:= :a]] [:a :a])`
+    answered `false` where the JVM answers `true`. One `:?` was fine; two were
+    not. Downstream that made malli's generative suites fail, and test.check
+    shrinking on every failure took the run to 6.4GB and a 900s stall.
+  - `with-meta` on such a fn leaked: jolt keys fn metadata on the procedure, so
+    tagging one instance tagged every other one with the same body.
+
+  The back end now gives such a lambda one free variable to capture. The capture
+  has to stay live — every semantically neutral form (a dead reference, a value
+  used through `begin`, an assigned variable, a captured fresh pair) is removed
+  by Chez as dead code and the sharing returns — so it is kept live by a branch
+  on an assigned top-level, which cannot be constant-folded. The branch is never
+  taken, so no arity's behaviour changes, and Chez's procedure naming survives
+  the wrapper, so native backtrace frames still resolve.
+
+  Cost, measured with `ci/bench-gate.sh` against 0.8.4: nothing above the
+  suite's ~1.07x noise floor. The worst rows are `mono-dispatch` and `dispatch`
+  at 1.05x; most are 1.00-1.02x and several improve. In isolation the guard is
+  ~0.6ns per call and ~5.6ns per closure creation, which real fn bodies dwarf.
+
+  `test/chez/corpus.edn` pins the observable behaviour against reference JVM
+  Clojure, including a capturing-fn control so a fix that only papered over the
+  non-capturing case still fails; `host/chez/build-smoke.sh` asserts it inside a
+  BUILT binary on both the direct-linked release default and `--no-direct-link`,
+  because whole-program inference is where a guard the interpreter keeps could
+  still be optimized away.
+
+  The seed is re-minted (`host/chez/seed/`, `host/gambit/seed/`): the seed IS the
+  compiler that compiles jolt-core, so a back-end change is inert until it is.
+
+- **`jolt -e` no longer leaves a `.jolt/` directory behind.** Running jolt
+  anywhere created `./.jolt/cpcache/<key>.edn` in the current directory,
+  including a directory with no project and nothing to resolve, where the entry
+  cached was the empty resolution and writing it is what created the directory.
+  An empty resolution is no longer written. A project that resolves something
+  still caches.
+
+- **CI runs the `--library` gate instead of skipping it.** `buildlibsmoke` had
+  been in the gate list and passing without building a shared library:
+  `jolt build --library` folds Chez's `libkernel.a` into a shared object, which a
+  kernel built without `-fPIC` cannot do, and the smoke read that as an
+  environment limitation and exited 0 — right for a developer's machine, silent
+  for CI, whose Chez came from a stock `./configure`. That Chez is built `-fPIC`
+  now, and every skip is fatal under `JOLT_REQUIRE_BUILDLIB=1`, which the gate
+  step sets.
+
+- **`data.zip`'s conformance entry reads the xml library's `deps.edn`.** It pulled
+  the library in as a source path, so the `:jolt/native` spec declaring libxml2
+  was never read and `jolt.xml`'s `defcfn` for `xmlReaderForMemory` failed at
+  namespace load. Every other first-party sibling was already a `:local-deps`
+  entry.
 
 - **`jolt tasks` hides a task whose name starts with `-`.** `list-tasks!` is
   babashka's listing, and babashka treats a leading dash the way it treats
@@ -52,13 +208,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dash convention had its helpers listed. That file is one jolt reads directly,
   so the convention arrives whether or not a jolt project would have chosen it.
   Hiding is display only, here as in babashka: `jolt -dash` still runs the task.
+  Contributed by @burinc in #875.
 
 - **`jolt tasks` prints only the first line of a `:doc`.** The listing puts one
   task on one line and aligns the docs into a column, so a docstring that spans
   lines broke the shape it was being formatted into: the second line started at
   column zero, in the name column, and read as a task of its own. Anything
-  parsing the listing for names picked it up as one. Babashka truncates for the
-  same reason.
+  parsing the listing for names picked it up as one — a shell completion being
+  exactly that. Babashka truncates for the same reason. Contributed by
+  @burinc in #875.
 
 ## [0.8.4] - 2026-09-06
 
@@ -9174,7 +9332,7 @@ Clojure-compatible standard library.
 - **Distribution**: a self-contained `joltc` binary, a Homebrew tap, and an
   install script.
 
-[Unreleased]: https://github.com/jolt-lang/jolt/compare/v0.8.4...HEAD
+[0.8.5]: https://github.com/jolt-lang/jolt/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/jolt-lang/jolt/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/jolt-lang/jolt/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/jolt-lang/jolt/compare/v0.8.1...v0.8.2
