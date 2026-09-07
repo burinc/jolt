@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **A hinted `(aset ^bytes a i v)` stores into the bytevector, and `(byte x)` is
+  a direct call.** `bench/byte-arrays`' `bfill` phase was the largest single
+  jolt/JVM ratio in the suite, and both halves of its one hot line were paying to
+  get to work that costs a few nanoseconds.
+
+  `^bytes` was absent from the `:v-aset` fast path `^longs`/`^ints`/`^objects`
+  take, because a byte array narrows its value to signed 8 bits at the store and
+  that narrowing lived on the generic path — so the hint bought a byte store
+  nothing at all, and it emitted the same `jolt-aset3` an unhinted one does. Per
+  element: the array test, the kind read and an `eq?` on it, `na-byte-of`'s
+  `truncate`/`exact`/`bitwise-and` over the generic (bignum-capable) tower,
+  `(exact (na-idx i))` to coerce an index that was already a fixnum, then
+  `ja-set!`'s *second* read of the backing, a bounds pre-check and a four-way
+  `cond` — **34.7ns** to reach a `bytevector-s8-set!`, against 5.9ns for the
+  matching `(aget ^bytes a i)`.
+
+  `jolt-baset` is the byte kind's own store target, split from `jolt-vaset`
+  rather than folded into it because `jolt-vaset` answers its argument and a byte
+  store has to answer what was stored. A fixnum already inside -128..127 — what a
+  byte-filling loop hands it — is by construction what `na-byte-of` would answer
+  for it, so it goes straight into the bytevector; a flonum, a bignum, an
+  out-of-range value, a non-fixnum index, a byte array whose backing an older
+  image left boxed, and a lying `^bytes` hint on an array of any other kind all
+  fall through to the generic seam. That fallback is not a slow path added for
+  the helper, it is the path every unhinted `aset` takes, which is why the
+  narrowing contract is unchanged — checked by differential test over 600+ value
+  shapes, every index shape and all five backing kinds. **34.7ns → 7.1ns.**
+
+  The other half was `(byte x)`. `double`, `long`, `int` and `float` lower to a
+  `:coerce` node carrying their checked runtime helper; `byte` and `short` were
+  the two casts missing from that table, so `(byte v)` stayed a var-deref plus a
+  `jolt-invoke1` around `jolt-byte-cast`'s two fixnum compares — 17.9ns an
+  element, *more than the store it fed*. They join it with kind `:long`, sound for
+  the reason `int` takes it: `jolt-checked-cast` answers a value inside
+  `[lo, hi]` or throws, and both ranges are fixnums on every tower jolt has. The
+  checked semantics are untouched — `(byte 200)` is still an
+  `IllegalArgumentException`, not a wrap to -56; `(byte 127.000001)` still throws
+  where `(byte 1.9)` is 1; `byte` in value position is still the var.
+
+  Together, on `bench/byte-arrays` at 400 passes: `bfill` **185.0ms → 41.0ms
+  (4.5×)**, or 66× the JVM down to 14.6×. Every other phase is flat to within 1%
+  — `copy-full` 24.6/24.6, `copy-region` 25.3/25.4, `drain` 221.1/226.5,
+  `round-trip` 38.7/38.7, `bsum` 38.1/37.5 — which is what says the change is
+  where it claims to be.
+
+  `na-byte-of` and `na-array-set!` took the same fixnum-first shape while they
+  were open, so the generic seam is faster too: an unhinted `aset`, and every
+  other door into a byte array (`into-array`, `Arrays/fill`, `na-list->backing`).
+
 ### Fixed
 
 - **The tree-shake gate asserts how MUCH was shaken, and covers the

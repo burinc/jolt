@@ -83,8 +83,9 @@
     :long))
 
 ;; Array kinds read through jolt-vaget/jolt-vaset — everything but double/float,
-;; whose flvector the :fl-aget/:fl-aset path unboxes AND types. :bytes reads but
-;; does not write here (see the aset clause in an-invoke).
+;; whose flvector the :fl-aget/:fl-aset path unboxes AND types. :bytes reads here
+;; but writes through jolt-baset, which owns the signed-8-bit narrowing (see the
+;; aset clauses in an-invoke).
 (def ^:private boxed-akinds #{:longs :ints :bytes :objects})
 (def ^:private boxed-aset-kinds #{:longs :ints :objects})
 
@@ -274,11 +275,23 @@
       (and (= nm "aget") (= n 2) (contains? boxed-akinds (nth (nth ars 0) 0)))
       [nil (assoc node1 :v-aget true)]
       ;; (aset ^longs/^ints/^objects a i v) -> the direct backing write, returning
-      ;; the stored value (JVM contract). ^bytes is absent on purpose: a byte array
-      ;; narrows its elements to signed 8 bits at the store (na-elem-of), and that
-      ;; narrowing lives on the generic path.
+      ;; the stored value (JVM contract). ^bytes has its own clause below rather
+      ;; than joining this one: it is the one kind that NARROWS at the store, and
+      ;; jolt-vaset answers its argument, not what was stored.
       (and (= nm "aset") (= n 3) (contains? boxed-aset-kinds (nth (nth ars 0) 0)))
       [nil (assoc node1 :v-aset true)]
+      ;; (aset ^bytes a i v) -> jolt-baset, which stores an in-range fixnum into
+      ;; the bytevector directly and hands everything else (a flonum, a bignum, an
+      ;; out-of-range value, a boxed backing, a lying hint) to the generic seam
+      ;; that narrows it.
+      ;;
+      ;; NO result kind, for the reason :v-aget has none: the stored byte IS a
+      ;; fixnum when the array really is one, but a lying ^bytes hint reaches the
+      ;; generic seam, which answers whatever that array's kind holds — so an
+      ;; element is not provably a fixnum and the surrounding arithmetic must not
+      ;; be told it is.
+      (and (= nm "aset") (= n 3) (= :bytes (nth (nth ars 0) 0)))
+      [nil (assoc node1 :b-aset true)]
       ;; (aset ^doubles-array i v) -> unboxed flvector-set!; returns the stored value
       ;; (:double), so an accumulator over the aset result types too. A proven-:long
       ;; (or fixnum-literal) index tags :fl-idx-long and a proven-:double value tags
