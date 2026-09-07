@@ -22,6 +22,34 @@
     ((_ (else e ...) c ...) (begin e ...))
     ((_ (req e ...) c ...) (cond-expand c ...))
     ((_) (if #f #f))))
+;; --- Clojure fn identity ----------------------------------------------------
+;; Chez returns THE SAME closure object for every evaluation of a lambda with no
+;; free variables — deliberate and documented ("avoiding even the cost of a cons";
+;; display closures carry one slot per free variable, so zero free variables means
+;; zero allocation and one shared static instance). R5RS allows it: eqv? on two
+;; procedures that behave identically is implementation-defined.
+;;
+;; Clojure does not allow it. (fn [x] x) evaluated twice yields two objects there,
+;; and real code depends on that: malli.impl.regex keys its parked-continuation
+;; cache on validator closures, so sharing made two distinct states collide, the
+;; :? fallback was never parked, backtracking died and m/validate answered false.
+;; jolt's own fn metadata is keyed on the procedure too, so with-meta on one
+;; non-capturing fn leaked its meta onto every other one.
+;;
+;; So the back end gives such a lambda one free variable to capture (emit-fn), and
+;; these are what it captures and tests. The capture has to stay LIVE or Chez
+;; removes it as dead and the sharing returns — every semantically-neutral form
+;; was measured doing exactly that — hence the branch on a probe rather than an
+;; unused binding.
+;;
+;; Both are ASSIGNED below, and that is load-bearing: Chez cannot constant-fold an
+;; assigned top-level, and folding either one would silently restore the bug.
+;; test/chez/corpus.edn pins the observable behaviour so it cannot regress quietly.
+(define jolt-fn-identity-seed 0)
+(define jolt-fn-identity-probe #f)
+(set! jolt-fn-identity-seed 1)
+(set! jolt-fn-identity-probe #f)
+
 (define %chez-error error)
 (define (error . args)
   (if (and (pair? args) (string? (car args)))

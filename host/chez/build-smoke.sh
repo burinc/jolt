@@ -179,6 +179,30 @@ if grep -q 'set-chez-ns! "jolt\.crypto"' "$out.build/flat.ss"; then
   echo "  FAIL: unreferenced lib provider jolt.crypto leaked into flat.ss"; exit 1
 fi
 
+# Closure identity in a BUILT binary, on the direct-linked release default.
+# Chez shares one closure object across every evaluation of a lambda with no free
+# variables; Clojure allocates a fresh fn each time, and malli.impl.regex depends
+# on the Clojure answer (its parked-continuation cache keys on validator
+# closures, so a shared :? epsilon branch collided two states, killed
+# backtracking and made m/validate answer false). The interpreter is not enough
+# evidence: the release default is --direct-link with whole-program inference,
+# which is where a capture the interpreter keeps could still be folded away.
+# The last line is the control — a CAPTURING fn always allocated, so a fix that
+# only papered over the non-capturing case would still show here.
+check_fnid() {  # check_fnid <binary> <label>
+  # announces itself: a check that is silent on success cannot be distinguished
+  # from one that never ran, and this one was briefly BOTH (defined below its
+  # first call site, which sh reports on stderr and then carries on past).
+  echo "build smoke: closure identity in $2"
+  got_fn="$(cd / && "$1" --fnid 2>&1)"
+  for line in 'fnid-same: false' 'fnid-set: 2' 'fnid-meta: [{:t 1} nil]' \
+              'fnid-call: 7' 'fnid-cap: false'; do
+    if ! printf '%s\n' "$got_fn" | grep -qxF "$line"; then
+      echo "  FAIL: closure identity in $2 — missing: $line"
+      echo "--- got ----"; echo "$got_fn"; exit 1
+    fi
+  done
+}
 # --no-direct-link opts back out of the release default: the app->app call must
 # NOT lower to a jv$ binding (stays var-routed, dynamically linked).
 if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out.nodl" --no-direct-link >/dev/null 2>&1; then
@@ -187,6 +211,7 @@ fi
 if grep -q 'define jv\$app.util\$shout' "$out.nodl.build/flat.ss"; then
   echo "  FAIL: --no-direct-link still direct-linked the app->app call"; exit 1
 fi
+check_fnid "$out.nodl" "the --no-direct-link build"
 # and it IS var-routed there -- without this the check above would pass on a
 # build that emitted no reference to shout at all.
 if ! grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")' "$out.nodl.build/flat.ss"; then
@@ -213,6 +238,8 @@ if ! printf '%s' "$got_rd" | grep -q '^redef: :patched$'    || ! printf '%s' "$g
   echo "  FAIL: ^:redef/:dynamic opt-out — want 'redef: :patched' and 'dyn: :bound' lines"
   echo "--- got ----"; echo "$got_rd"; exit 1
 fi
+
+check_fnid "$out" "the direct-linked release build"
 
 # A NAMED inner fn inside a spliced callee (jolt-pzos). Two claims:
 #  - the alpha-rename the splicer applies for hygiene (step-boom -> step-boom__ilN)

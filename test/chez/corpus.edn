@@ -51,6 +51,26 @@
   {:suite "destructure / :or" :label ":keys :or default uses sibling binding (lazy eval order)" :expected "2" :actual "(let [{:keys [a b] :or {b (inc a)}} {:a 1}] b)" :portability :common}
   {:suite "destructure / for :let" :label "a for/doseq :let binding may itself destructure" :expected "[10 20]" :actual "(vec (for [x [1 2] :let [{:keys [y]} {:y (* x 10)}]] y))" :portability :common}
   {:suite "deftype / method param shadows field" :label "a method param named like a field shadows it (Clojure scope)" :expected "9" :actual "(do (defprotocol P (setm [this q])) (defrecord R [k m] P (setm [this m] (assoc this :m m))) (:m (setm (->R 1 nil) 9)))" :portability :common}
+  ;; Chez returns THE SAME closure for every evaluation of a lambda with no free
+  ;; variables — deliberate, documented, and permitted by R5RS (eqv? on two
+  ;; identically-behaving procedures is implementation-defined). Clojure allocates
+  ;; a fresh fn per evaluation, and real code depends on it: malli.impl.regex keys
+  ;; its parked-continuation cache on validator closures, so the shared :? epsilon
+  ;; branch made two distinct states collide, the fallback was never parked,
+  ;; backtracking died and m/validate answered false on a schema the JVM accepts.
+  ;; These pin the Clojure answer. Every expected value here was read off
+  ;; reference JVM Clojure 1.12.
+  {:suite "fn identity / non-capturing fn" :label "two evaluations of one fn form are two objects" :expected "false" :actual "(let [mk (fn [] (fn [x] x))] (identical? (mk) (mk)))" :portability :common}
+  {:suite "fn identity / non-capturing fn" :label "so they are two distinct set members" :expected "2" :actual "(let [mk (fn [] (fn [x] x))] (count (set [(mk) (mk)])))" :portability :common}
+  {:suite "fn identity / non-capturing fn" :label "and two distinct map keys" :expected "2" :actual "(let [mk (fn [] (fn [x] x)) m (into {} (map (fn [f] [f 1]) [(mk) (mk)]))] (count m))" :portability :common}
+  {:suite "fn identity / non-capturing fn" :label "distinct keeps all three" :expected "[7 3]" :actual "(let [mk (fn [] (fn [x] x))] [((mk) 7) (count (distinct [(mk) (mk) (mk)]))])" :portability :common}
+  {:suite "fn identity / non-capturing fn" :label "one per loop iteration, not one shared" :expected "false" :actual "(let [v (vec (for [_ (range 2)] (fn [x] x)))] (identical? (v 0) (v 1)))" :portability :common}
+  ;; with-meta on a fn returns a NEW fn; jolt keys fn meta on the procedure, so a
+  ;; shared closure leaked the meta onto every other instance of the same body.
+  {:suite "fn identity / non-capturing fn" :label "with-meta on one instance does not leak to another" :expected "[{:t 1} nil]" :actual "(let [mk (fn [] (fn [x] x)) f1 (mk) f2 (mk)] [(meta (with-meta f1 {:t 1})) (meta f2)])" :portability :common}
+  ;; a capturing fn always allocated, so it was never affected — kept as the
+  ;; control, so a fix that only papers over the non-capturing case still shows.
+  {:suite "fn identity / capturing fn" :label "captures are distinct whether or not the captured values match" :expected "[false false]" :actual "(let [c (fn [n] (fn [] n))] [(identical? (c 1) (c 1)) (identical? (c 1) (c 2))])" :portability :common}
   {:suite "interop / Thread identity" :label "Thread/currentThread is identity-stable within a thread" :expected "[true true]" :actual "[(identical? (Thread/currentThread) (Thread/currentThread)) (= (Thread/currentThread) (Thread/currentThread))]" :portability :jvm}
   {:suite "interop / Thread identity" :label "the current thread works as a map key" :expected ":me" :actual "(let [t (Thread/currentThread)] (get {t :me} (Thread/currentThread)))" :portability :jvm}
   {:suite "interop / Thread identity" :label "a dosync body runs on the calling thread" :expected "true" :actual "(let [t (Thread/currentThread)] (dosync (identical? t (Thread/currentThread))))" :portability :jvm}
