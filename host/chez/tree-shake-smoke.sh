@@ -65,21 +65,46 @@ run_case() {
   echo "  - $1: ok (output identical; $((s0/1024))K -> $((s1/1024))K)"
 }
 
-# Same as run_case but looked up under the local test/chez/ directory, with
-# an optional flat.ss def-pruning assertion: if ASSERT_MISSING is set, grep
-# the --tree-shake .build dir for a "ns/def" string and fail if found.
+# Same as run_case but looked up under the local test/chez/ directory, with two
+# further checks. ASSERT_MISSING ($4): grep the --tree-shake .build dir for a
+# string and fail if found — a def the shake must have pruned. EXPECT ($5):
+# "shake" (the default) requires the shaken build to report `tree-shake kept`
+# and fails on `tree-shake skipped`, printing the offenders jolt named; "bail"
+# is for a fixture that resolves vars at runtime on purpose (ns-publics-app),
+# whose point is that the keep-everything fallback still answers identically.
+# Without the EXPECT check a bail passes this gate silently: it keeps every def,
+# so the outputs match by construction — which is how a prelude change that
+# bailed every --tree-shake build (0.7.29 to 0.8.4) went unnoticed here.
 # (The .build dir is the binary's build artifacts, kept alongside the binary.)
 run_local_case() {
-  app="$root/test/chez/$1"; ns="$2"; args="$3"; assert_missing="$4"
+  app="$root/test/chez/$1"; ns="$2"; args="$3"; assert_missing="$4"; expect="${5:-shake}"
   [ -d "$app" ] || { echo "  - $1: skipped (not present)"; return; }
   b0="$tmp/$1-plain"; b1="$tmp/$1-shake"
   bdir="$tmp/$1-shake.build"
   if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b0" >/dev/null 2>&1; then
     echo "  - $1: FAIL (default build)"; fail=1; return; fi
-  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b1" --tree-shake 2>"$tmp/$1-shake-err"; then
+  if ! JOLT_PWD="$app" "$jolt" build -m "$ns" -o "$b1" --tree-shake >"$tmp/$1-shake-out" 2>"$tmp/$1-shake-err"; then
     echo "  - $1: FAIL (--tree-shake build)"
     cat "$tmp/$1-shake-err" | head -5
     fail=1; return; fi
+  case "$expect" in
+    shake)
+      if grep -q '^jolt build: tree-shake skipped' "$tmp/$1-shake-out"; then
+        echo "  - $1: FAIL (tree-shake skipped; the fixture must shake)"
+        sed -n '/^jolt build: tree-shake skipped/,/^jolt build: compiling/p' "$tmp/$1-shake-out" | grep -v '^jolt build: compiling' | head -8
+        fail=1; return
+      fi
+      if ! grep -q '^jolt build: tree-shake kept ' "$tmp/$1-shake-out"; then
+        echo "  - $1: FAIL (no 'tree-shake kept' report in the --tree-shake build output)"
+        fail=1; return
+      fi ;;
+    bail)
+      if ! grep -q '^jolt build: tree-shake skipped' "$tmp/$1-shake-out"; then
+        echo "  - $1: FAIL (expected the keep-everything bail; the shake ran)"
+        fail=1; return
+      fi ;;
+    *) echo "  - $1: FAIL (unknown EXPECT '$expect')"; fail=1; return ;;
+  esac
   o0="$(cd "$app" && "$b0" $args 2>&1)"
   o1="$(cd "$app" && "$b1" $args 2>&1)"
   if [ "$o0" != "$o1" ]; then
@@ -113,10 +138,15 @@ fi
 
 # Tree-shake correctness fixtures: apps whose output IDENTICAL default vs --tree-shake
 # verifies the fixes in jolt-2f87. The defonce-app additionally asserts a never-referenced
-# def ("app.core/dead") is absent from the shaken output.
+# def ("app.core/dead") is absent from the shaken output. The pattern names the var
+# without its def form: app defs are emitted as def-var-with-meta!, and a pattern
+# pinned to def-var! matched nothing, so the assertion passed against an unshaken
+# flat.ss for as long as the emitter has carried metadata.
+# ns-publics-app is the one fixture that must BAIL: it enumerates its namespace at
+# runtime, which the static graph cannot follow.
 echo "shake smoke: correctness fixtures (ns-publics, defonce, data-readers)"
-run_local_case ns-publics-app   app.core  ""   ""
-run_local_case defonce-app      app.core  ""   "def-var! \"app.core\" \"dead\""
+run_local_case ns-publics-app   app.core  ""   ""   bail
+run_local_case defonce-app      app.core  ""   "\"app.core\" \"dead\""
 run_local_case datareader-app   app.core  ""   ""
 # data-reader literal rewriting: a #tag whose reader returns a FORM must splice
 # identically under a plain and a --tree-shake build (the tree-shake path once
