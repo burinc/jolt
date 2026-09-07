@@ -123,6 +123,10 @@
   {"from" (fn [i] (java.util.Date. (u/floor-div (inst-nanos i) 1000000)))})
 
 ;; make the #inst/Date layer's Date.toInstant etc. yield THIS instant, so a Date
-;; and a library instant compare and print as one representation.
-(when-let [set-ctor (resolve 'jolt.host/set-instant-ctor!)]
-  ((deref set-ctor) (fn [nanos] (instant nanos))))
+;; and a library instant compare and print as one representation. The hook is
+;; a static reference: jolt.host/set-instant-ctor! is defined by the host that
+;; autoloads this namespace (inst-time.ss), and looking it up with `resolve` at
+;; load time made every app that reaches java.time resolve a var by name — the
+;; one thing `jolt build --tree-shake` cannot follow, so each kept every def and
+;; the compiler image for this one form.
+(jolt.host/set-instant-ctor! (fn [nanos] (instant nanos)))
