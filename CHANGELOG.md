@@ -62,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   start-of-day landed five hours from the `Instant` it round-tripped through. The
   fix is in jolt-lang/time, the half that knows how to find the zone: loading
   `jolt.time.zones` now hands that lookup to
-  `jolt.host/set-default-zone-provider!`. Core is unchanged — `TZ` still wins,
+  `jolt.host/set-default-zone-provider!` (jolt-lang/time#16). Core is unchanged — `TZ` still wins,
   and a program without the library still gets UTC — but the recorded baselines
   live here, and they are reproducible off UTC now.
 
