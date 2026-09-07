@@ -5,6 +5,67 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The tree-shake gate asserts how MUCH was shaken, and covers the
+  spliced-callee bail class.** `make shakelocal` asked only for the string
+  `tree-shake kept` in the build's report, so a regression that shook but kept
+  nearly every def, or that stopped dropping the compiler image, still passed —
+  and the plain-vs-shaken output comparison matches by construction whenever the
+  shake keeps everything, which is how the 0.7.29 bail stayed green for six
+  releases. Each shaking fixture now asserts a kept fraction (at most half the
+  defs; they measure 239-242 of ~683, about 35%) and that the binary dropped the
+  compiler image, and the one fixture that must bail asserts it kept the compiler
+  — a shake that does not bail always drops it, because every `dce-compile-refs`
+  entry is also a `dce-bail-refs` entry.
+
+  `test/chez/spliced-resolve-app` is the build-level gate for the class #882
+  fixed, and it is dependency-free so it runs in CI where the real `core.async`
+  apps cannot: a private helper that calls `resolve` and is reachable only
+  through the copies the inline pass made of it. That helper is kept — an inlined
+  frame still has to name its `ns` and `file:line` — but it is not reachable
+  code, and rooting it in the bail scan is what kept every def and the compiler
+  image in any app that merely loaded `core.async`. Verified by mutation: against
+  the pre-#882 `dce.ss` the same fixture reports `tree-shake skipped (reachable
+  code resolves vars at runtime): app.core/park-kind -> clojure.core/resolve`.
+  Its only coverage before this was the synthetic record graph in
+  `run-dce-refs.ss`, which pins `dce-shake`'s logic but not the inline pass
+  feeding it.
+
+- **`make libconformance` reports an improvement it can see, and `:tolerance`
+  documents what it suppresses.** The manifest header promised `BETTER` whenever
+  `pass` rises; test.check came back `pass=245` against a recorded 236 and
+  printed `ok`. Two causes. Only `pass` was compared, so a fix that turns failing
+  assertions into absent ones — a `load-fail` that starts loading, an error the
+  suite stops reaching — moved `fail`/`error`/`load-fail` down with `pass`
+  unchanged and read as plain `ok`; all four are mirrored now. And `:tolerance`
+  is a symmetric noise band, so it suppresses `BETTER` exactly as it suppresses
+  `WORSE`: test.check's `:tolerance 40` puts +9 inside the band, where a move is
+  a different draw rather than a result, and re-recording it would only re-centre
+  the band on whatever the last run generated. That much was the right answer
+  reported by the wrong documentation, so the manifest header and the README now
+  say it.
+
+- **One default time zone per process, so the conformance baselines hold off
+  UTC.** `make libconformance` failed out of the box on any machine not on UTC —
+  `data.json` 320/4 against a recorded 322/2, Selmer 503/23 against 526/0 — and
+  every extra failure was one bug: jolt had two default zones at once.
+  `java.util.TimeZone/getDefault` answered UTC, which is core's design (it reads
+  `TZ`, and otherwise defers the machine's own zone to a registered provider
+  rather than reading `/etc/localtime` itself), while
+  `java.time.ZoneId/systemDefault` read `/etc/localtime` and answered the
+  machine's zone. Nothing ever registered the provider, so inside one process a
+  `SimpleDateFormat` rendered an instant four hours from what a
+  `DateTimeFormatter` rendered for the same instant, and a `Calendar`
+  start-of-day landed five hours from the `Instant` it round-tripped through. The
+  fix is in jolt-lang/time, the half that knows how to find the zone: loading
+  `jolt.time.zones` now hands that lookup to
+  `jolt.host/set-default-zone-provider!` (jolt-lang/time#16). Core is unchanged — `TZ` still wins,
+  and a program without the library still gets UTC — but the recorded baselines
+  live here, and they are reproducible off UTC now.
+
 ## [0.8.5] - 2026-09-07
 
 A `fn` with no captured values returned the SAME object every time it was
