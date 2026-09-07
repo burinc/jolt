@@ -440,6 +440,12 @@ library responsible — when reachable code resolves vars by name at runtime
 (`eval`/`resolve`/`ns-resolve`/…). See
 [RFC 0007](https://jolt-lang.github.io/docs/rfc/0007-compilation-modes-and-binary-output.html).
 
+`--no-vfasl` trades the other way. The boot image ships as a prebuilt heap image,
+which starts faster and takes more room; `--no-vfasl` (or `JOLT_NO_VFASL=1`, or
+`:jolt/build {:no-vfasl true}`) keeps the plain boot instead, for an app —
+typically a mobile one — whose download size matters more than its startup.
+Measure both on your target: which way the trade falls depends on the app.
+
 Built executables carry an optional startup profiler: launch one with
 `JOLT_STARTUP_PROFILE=1` to get per-stage wall time, process CPU time,
 collection counts, reclaimed bytes, and heap size on stderr, marked at the

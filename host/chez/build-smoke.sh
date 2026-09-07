@@ -1108,4 +1108,35 @@ if [ "$got_split" != "$want" ] || [ "$got_split2" != "$want" ] || [ "$got_nospli
   exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache)"
+# --no-vfasl / JOLT_NO_VFASL keeps the plain boot (jolt-lang/jolt#886): a vfasl
+# boot starts faster and takes more room, and an app whose download size matters
+# more can decline it. Both spellings, because the env var is the one a CI job
+# reaches for and it travels through a different path than the flag. Checked by
+# the artifact rather than by a message — a build that quietly converted anyway
+# is exactly the failure this flag exists to prevent — and then by RUNNING the
+# binary, since a plain-boot binary that does not boot is the other one.
+echo "build smoke: --no-vfasl keeps the plain boot"
+novfaslout="$(dirname "$out")/novfasl-bin"
+if ! JOLT_PWD="$app" "$joltabs" build -m app.core --no-vfasl -o "$novfaslout" >/dev/null 2>&1; then
+  echo "  FAIL: --no-vfasl build exited non-zero"; exit 1
+fi
+[ -f "$novfaslout.build/jolt.boot.vfasl" ] && { echo "  FAIL: --no-vfasl still converted the boot"; exit 1; }
+envvfaslout="$(dirname "$out")/envnovfasl-bin"
+if ! JOLT_PWD="$app" JOLT_NO_VFASL=1 "$joltabs" build -m app.core -o "$envvfaslout" >/dev/null 2>&1; then
+  echo "  FAIL: JOLT_NO_VFASL build exited non-zero"; exit 1
+fi
+[ -f "$envvfaslout.build/jolt.boot.vfasl" ] && { echo "  FAIL: JOLT_NO_VFASL still converted the boot"; exit 1; }
+# and the default still does convert, or the two checks above pass for the wrong
+# reason the day something else stops emitting a vfasl boot at all.
+[ -f "$splitout.build/jolt.boot.vfasl" ] || { echo "  FAIL: the default build produced no vfasl boot"; exit 1; }
+got_novfasl="$(cd / && "$novfaslout" alpha bb ccc 2>&1)"
+got_envnovfasl="$(cd / && "$envvfaslout" alpha bb ccc 2>&1)"
+if [ "$got_novfasl" != "$want" ] || [ "$got_envnovfasl" != "$want" ]; then
+  echo "  FAIL: plain-boot binaries disagree with the reference output"
+  echo "--- want ---";     echo "$want"
+  echo "--- --no-vfasl ---";   echo "$got_novfasl"
+  echo "--- JOLT_NO_VFASL ---";echo "$got_envnovfasl"
+  exit 1
+fi
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + no-vfasl)"

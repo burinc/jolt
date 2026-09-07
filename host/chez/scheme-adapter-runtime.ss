@@ -683,7 +683,7 @@
 (define (sa-make-boot-file out base-boots)
   (apply make-boot-file out '() base-boots))
 
-;; (sa-vfasl-convert-file in out) -> boolean
+;; (sa-vfasl-convert-file in out [codec]) -> boolean
 ;; Rewrite the boot file IN to OUT in Chez's vfasl format: a prebuilt image of
 ;; what loading the fasl would have produced, laid out per space and loaded
 ;; straight into the static generation, which is worth roughly a third of jolt's
@@ -691,9 +691,17 @@
 ;; can boot from, or answer #f. Degradation: #f rather than raise — an app that
 ;; boots slower is strictly better than an app that fails to build, and the
 ;; caller keeps the plain boot it already has.
-(define (sa-vfasl-convert-file in out)
+;;
+;; CODEC is 'default, or 'wide for an image the target's default entry codec
+;; cannot carry — the caller has measured the image and found it over a limit
+;; (build.ss bld-lz4-image-ceiling). A target with one codec ignores the
+;; argument; Chez has two, and 'wide picks gzip over LZ4, which is the whole
+;; point: gzip has no 256MiB ceiling and LZ4 does.
+(define (sa-vfasl-convert-file in out . codec)
   (guard (e (#t #f))
-    (vfasl-convert-file in out '())
+    (if (and (pair? codec) (eq? (car codec) 'wide))
+        (parameterize ((compress-format 'gzip)) (vfasl-convert-file in out '()))
+        (vfasl-convert-file in out '()))
     #t))
 
 ;; (sa-gc-install-ceiling! soft hard on-exceeded) -> boolean
