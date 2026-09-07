@@ -161,5 +161,85 @@ if command -v zsh >/dev/null 2>&1; then
        && echo yes || echo no)"
 fi
 
+# --- the cache actually caching ----------------------------------------------
+#
+# The whole design is "do not spawn jolt on a TAB press", so the thing to assert
+# is the spawn count, not the snippet's text. A shim on PATH counts the calls.
+#
+# This is what catches the mtime spelling: `stat -c %Y` is GNU's mtime, and `-f`
+# there is a filesystem query that prints a block table and exits 1, so trying
+# BSD's `-f %m` first puts free-block counts in the stamp. Free blocks move on a
+# live disk, so the stamp differs from the one on disk and the cache never hits
+# -- on every Linux, invisibly, since the completion still returns right answers.
+if command -v bash >/dev/null 2>&1; then
+  shim="$tmp/shim"; mkdir -p "$shim"
+  cat > "$shim/jolt" <<EOF
+#!/bin/sh
+echo call >> "$tmp/calls"
+exec "$JOLT_ABS" "\$@"
+EOF
+  chmod +x "$shim/jolt"
+  : > "$tmp/calls"
+  cachedir="$tmp/xdg"
+  # JOLT_COMPLETION_NO_CACHE is exported empty here on purpose: the gate sets it
+  # to 1 so no check touches the developer's real cache, and this is the one
+  # group that has to let the cache work.
+  presses() { # count
+    n=0
+    while [ "$n" -lt "$1" ]; do
+      ( cd "$proj" && PATH="$shim:$PATH" XDG_CACHE_HOME="$cachedir" \
+        JOLT_COMPLETION_NO_CACHE= bash --noprofile --norc -c '
+          set -u
+          . "$1"
+          _jolt_cached_tasks
+        ' _ "$tmp/snip.bash" 2>/dev/null )
+      n=$((n+1))
+    done
+  }
+  out2="$(presses 2)"
+  check "two presses spawn jolt once" "1" "$(grep -c . "$tmp/calls")"
+  check "...and the cached press answers with the tasks" "yes" \
+    "$(printf '%s\n' "$out2" | grep -q '^beta	first line$' && echo yes || echo no)"
+  key="$(find "$cachedir/jolt/completion" -type f 2>/dev/null | head -n 1)"
+  check "the stamp is the two mtimes and nothing else" "yes" \
+    "$(head -n 1 "$key" 2>/dev/null | grep -Eq '^[0-9]*/[0-9]*$' && echo yes || echo no)"
+  # A whole second, because the stamp is mtime in seconds.
+  sleep 1
+  touch "$proj/bb.edn"
+  presses 1 >/dev/null
+  check "editing bb.edn invalidates the cache" "2" "$(grep -c . "$tmp/calls")"
+fi
+
+# --- the fish snippet --------------------------------------------------------
+#
+# fish has no per-press file cache: its completion function stays loaded for the
+# session, so the cache lives in shell variables and has to be keyed on the
+# directory it was filled from, or the next project you cd into is offered the
+# first one's tasks.
+if command -v fish >/dev/null 2>&1; then
+  fish -n "$tmp/snip.fish" 2>/dev/null
+  check "the fish snippet parses" "0" "$?"
+fi
+grep -q '__jolt_tasks_dir' "$tmp/snip.fish"
+check "the fish cache is keyed on the directory" "0" "$?"
+grep -q 'test -f deps.edn' "$tmp/snip.fish"
+check "fish asks jolt only inside a project" "0" "$?"
+grep -q "a '\-Sdeps'" "$tmp/snip.fish"
+check "the fish snippet offers jolt's options too" "0" "$?"
+
+# --- the one list that is written twice --------------------------------------
+#
+# Which commands a task may take the name of is spelled out in jolt.main, which
+# dispatches on it, and again in jolt.completions, which filters on it. A name
+# in main's set but not the completion's hides a task that actually runs; a name
+# in the completion's but not main's offers a task that the command wins. Source
+# check, because neither list is reachable from outside its namespace.
+ov_words() { grep -o '"[a-zA-Z-]*"' | tr -d '"' | sort -u | tr '\n' ' '; }
+check "main and the completion agree on which commands a task can override" \
+  "$(grep -B1 'builtin-overridden? cmd)' jolt-core/jolt/main.clj \
+     | grep -o '#{[^}]*}' | ov_words)" \
+  "$(sed -n '/def ^:private overridable/,/}/p' jolt-core/jolt/completions.clj \
+     | grep -o '#{[^}]*}' | ov_words)"
+
 echo "completions-smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
