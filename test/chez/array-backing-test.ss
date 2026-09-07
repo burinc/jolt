@@ -108,6 +108,37 @@
     "(let [bs (byte-array [-1 0 127 -128 65])] (vec (.getBytes (String. bs \"ISO-8859-1\") \"ISO-8859-1\")))"
     "[-1 0 127 -128 65]")
 
+;; --- the HINTED byte store narrows exactly as the generic one does -------------
+;; (aset ^bytes a i v) has its own store target (jolt-baset): an in-range fixnum
+;; goes straight into the bytevector, and everything else falls back to the
+;; generic seam that narrows it. These rows are the contract that fast path has
+;; to keep — a hint may not change a value, only how fast it is stored.
+(is "the hinted store narrows and ANSWERS what it stored"
+    "(let [a (byte-array 2) f (fn [^bytes x ^long i v] (aset x i v))] [(f a 0 200) (f a 1 -5) (vec a)])"
+    "[-56 -5 [-56 -5]]")
+(is "...for every value shape the generic seam accepts"
+    "(let [f (fn [^bytes x ^long i v] (aset x i v)) g (fn [v] (let [a (byte-array 1)] [(f a 0 v) (aget ^bytes a 0)]))] [(g 300) (g -1.9) (g 129.7) (g (*' Long/MAX_VALUE 2))])"
+    "[[44 44] [-1 -1] [-127 -127] [-2 -2]]")
+(is "...and agrees with the UNHINTED store on each of them"
+    "(let [h (fn [^bytes x ^long i v] (aset x i v)) g (fn [f v] (let [a (byte-array 1)] (f a 0 v) (aget ^bytes a 0)))] (mapv (fn [v] [(g h v) (g (fn [a i x] (aset a i x)) v)]) [200 300 -5 -1.9 129.7 -128 127]))"
+    "[[-56 -56] [44 44] [-5 -5] [-1 -1] [-127 -127] [-128 -128] [127 127]]")
+(is "a flonum INDEX still floors on the hinted store"
+    "(let [a (byte-array 3)] ((fn [^bytes x i] (aset x i 9)) a 2.7) (vec a))"
+    "[0 0 9]")
+(is "a LYING ^bytes hint stores through the kind the array really has"
+    "(let [l (long-array 2) o (object-array 2) f (fn [^bytes x ^long i v] (aset x i v))] [(f l 0 1000) (vec l) (f o 0 :k) (vec o)])"
+    "[1000 [1000 0] :k [:k nil]]")
+(is "an out-of-range hinted store is the ARRAY exception, either direction"
+    "[(try ((fn [^bytes x ^long i] (aset x i 1)) (byte-array 2) 9) (catch ArrayIndexOutOfBoundsException e :aioobe)) (try ((fn [^bytes x ^long i] (aset x i 1)) (byte-array 2) -1) (catch ArrayIndexOutOfBoundsException e :aioobe))]"
+    "[:aioobe :aioobe]")
+;; a byte array whose backing is BOXED — an older image's shape — cannot take the
+;; bytevector store, and must still narrow through the seam it falls back to.
+(let ((boxed (make-jolt-array (vector 0 0 0) 'byte)))
+  (ok "a boxed byte backing narrows through the store helper"
+      (and (eqv? -56 (jolt-baset boxed 0 200))
+           (eqv? 7 (jolt-baset boxed 1 7))
+           (equal? '(-56 7 0) (ja->list boxed)))))
+
 ;; --- the block moves ----------------------------------------------------------
 (is "an overlapping arraycopy reads pre-copy values, both directions and both backings"
     "(let [f (fn [a] (System/arraycopy a 0 a 1 4) (vec a)) b (fn [a] (System/arraycopy a 1 a 0 4) (vec a))] [(f (byte-array [1 2 3 4 5])) (b (byte-array [1 2 3 4 5])) (f (long-array [1 2 3 4 5])) (b (long-array [1 2 3 4 5]))])"

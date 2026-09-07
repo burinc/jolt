@@ -176,8 +176,9 @@
 ;;                           proven :double/:long arithmetic kind, and a field
 ;;                           read's numeric kind.
 ;;   :fl-aget :fl-aset       an aget/aset over a ^doubles array, lowered to the
-;;   :v-aget :v-aset         unboxed flvector path / to the boxed-vector path for
-;;                           the other array kinds (jolt.passes.numeric).
+;;   :v-aget :v-aset         unboxed flvector path / to the direct backing path for
+;;   :b-aset                 the other array kinds / to the byte store, which owns
+;;                           the signed-8-bit narrowing (jolt.passes.numeric).
 ;;   :prim-op                a clojure.core call lowered to a Chez primitive over
 ;;                           operands the collection lattice proved
 ;;                           (jolt.passes.types str-prim-op).

@@ -325,6 +325,25 @@
 ;; a clojure.core-qualified cast (from syntax-quote) also specializes.
 (let ((e (emitf "u" "(fn* ([x] (* (clojure.core/double x) 2.0)))")))
   (ok "clojure.core/double operand lowers * to fl*" (has? e "(#3%fl*")))
+;; (byte x)/(short x) are casts to a RANGE, so their answer is a fixnum on every
+;; tower jolt has and they take the same :long kind `int` does. They were the two
+;; left out of the table, which cost a var-deref + jolt-invoke1 per call in the
+;; code that reaches for them most — a byte-filling loop.
+(let ((e (emitf "u" "(fn* ([x] (+ (byte x) 1)))")))
+  (ok "(byte x) operand lowers + to jolt-l+" (has? e "(jolt-l+"))
+  (ok "(byte x) lowers to jolt-byte-cast helper" (has? e "(jolt-byte-cast"))
+  (ok "(byte x) is NOT a var-deref call any more" (not (has? e "jolt-invoke1"))))
+(let ((e (emitf "u" "(fn* ([x] (+ (short x) 1)))")))
+  (ok "(short x) operand lowers + to jolt-l+" (has? e "(jolt-l+"))
+  (ok "(short x) lowers to jolt-short-cast helper" (has? e "(jolt-short-cast")))
+;; the bfill shape: the cast feeds the hinted byte store directly, no invoke between
+(let ((e (emitf "u" "(fn* ([^bytes a ^long i] (aset a i (byte (bit-and i 127)))))")))
+  (ok "(aset ^bytes a i (byte v)) is jolt-baset over jolt-byte-cast"
+      (has? e "(jolt-baset a i (jolt-byte-cast"))
+  (ok "...with no jolt-invoke1 left in the loop body" (not (has? e "jolt-invoke1"))))
+;; a shadowing local named `byte` does NOT trigger the cast, as for `double`.
+(let ((e (emitf "u" "(fn* ([byte] (+ (byte 5) 1)))")))
+  (ok "shadowing local `byte` does NOT lower to jolt-byte-cast" (not (has? e "(jolt-byte-cast"))))
 
 ;; --- cast runtime semantics (JVM-certified corpus rows) ---
 (ok "(double 5) => 5.0 flonum" (let ((r (ev "(double 5)"))) (and (flonum? r) (fl= r 5.0))))
@@ -340,6 +359,26 @@
 (ok "(long \"s\") throws" (guard (e (#t #t)) (ev "(long \"s\")") #f))
 (ok "(int 5.7) => 5" (= (ev "(int 5.7)") 5))
 (ok "(int -5.7) => -5" (= (ev "(int -5.7)") -5))
+;; byte/short keep clojure.core's checked-narrow semantics through the lowering:
+;; in range is the value, out of range is IllegalArgumentException (NOT a wrap),
+;; a flonum truncates toward zero and range-checks BEFORE truncating, and a char
+;; casts by code point. Each row is what JVM Clojure answers.
+(ok "(byte 7) => 7" (= (ev "(byte 7)") 7))
+(ok "(byte -128) / (byte 127) => the bounds"
+    (and (= (ev "(byte -128)") -128) (= (ev "(byte 127)") 127)))
+(ok "(byte 200) throws (out of range, not a wrap to -56)"
+    (guard (e (#t #t)) (ev "(byte 200)") #f))
+(ok "(byte 1.9) => 1 / (byte -1.9) => -1 (truncate toward zero)"
+    (and (= (ev "(byte 1.9)") 1) (= (ev "(byte -1.9)") -1)))
+(ok "(byte 127.000001) throws (range-checked before truncation)"
+    (guard (e (#t #t)) (ev "(byte 127.000001)") #f))
+(ok "(byte \\A) => 65 (code point)" (= (ev "(byte \\A)") 65))
+(ok "(byte :k) throws" (guard (e (#t #t)) (ev "(byte :k)") #f))
+(ok "(short 32767) => 32767" (= (ev "(short 32767)") 32767))
+(ok "(short 32768) throws" (guard (e (#t #t)) (ev "(short 32768)") #f))
+(ok "(+ (byte 5) 1) => 6" (= (ev "(+ (byte 5) 1)") 6))
+;; value position is still the var — only the CALL form lowers.
+(ok "byte in value position is still callable" (= (ev "(reduce + (mapv byte [1 2 3]))") 6))
 ;; a cast result composes with arithmetic at runtime.
 (ok "(* (double 3) 2.0) => 6.0" (fl= (ev "(* (double 3) 2.0)") 6.0))
 (ok "(+ (long 7.9) 1) => 8" (= (ev "(+ (long 7.9) 1)") 8))

@@ -265,24 +265,32 @@ figures the release claimed, restated at the size the suite runs:
 | `copy-region` | the same bytes at unequal offsets | 7.7 | 12.2 | **0.63×** |
 | `drain` | 1MB through an 8KB `InputStream/read` loop (128 reads) | 80.3 | 11.6 | 6.9× |
 | `round-trip` | 4 × `(String. (.getBytes s))` over a 5KB string | 21.0 | 9.9 | 2.1× |
-| `bfill` | 8192 `(aset ^bytes a i v)` | 95.2 | 0.6 | 159× |
+| `bfill` † | 8192 `(aset ^bytes a i v)` | 95.2 | 0.6 | 159× |
 | `bsum` | 8192 `(aget ^bytes a i)` | 19.4 | 2.1 | 9.2× |
+
+† `bfill` predates the `^bytes` store fast path and is the one row this sitting no
+longer describes; the bullet below has the current figures.
 
 The block copies **beat the JVM** — 19.5µs per megabyte against its 30.8µs — which
 is the backing change arriving: both sides of that seam are bytevectors, so the
 copy is one `bytevector-copy!` rather than an element loop with a sign fold per
-byte. Two gaps came out of writing the row, and it now watches both:
+byte. Two gaps came out of writing the row. The store one is closed:
 
-- **`(aset ^bytes a i v)` costs 29ns an element**, where the matching
-  `(aget ^bytes a i)` costs 5.9ns. The read takes the direct backing read; the
-  hinted STORE is deliberately left on the generic path
-  (`jolt-core/jolt/passes/numeric.clj`) because a byte array narrows its value to
-  signed 8 bits at the store and that narrowing lives there, so `^bytes` is absent
-  from the `:v-aset` fast path `^longs`/`^ints`/`^objects` take. It is the largest
-  single ratio in the row.
-- **an 8KB `InputStream/read` costs 1.57µs**, against the JVM's 0.23µs. The
-  transfer itself is a block move now; what is left is per-call overhead on the way
-  to it.
+- **`(aset ^bytes a i v)` stores into the bytevector directly.** The byte kind is
+  the one whose store narrows — to signed 8 bits, answering what it stored — so it
+  has its own target (`jolt-baset`) rather than joining the `:v-aset` fast path
+  `^longs`/`^ints`/`^objects` take: an in-range fixnum goes straight to
+  `bytevector-s8-set!`, anything else falls through to the generic seam that
+  narrows it. `(byte x)`, the other half of the `bfill` line, lowers to
+  `jolt-byte-cast` through the same checked-cast table `double`/`long`/`int`/
+  `float` use. On a dev box rather than the release machine above, same binary
+  shape and 400 passes either side: `bfill` **185.0ms → 41.0ms (4.5×)**, and 66×
+  the JVM → 14.6×. The store alone is 34.7ns → 7.1ns an element, against the
+  matching `(aget ^bytes a i)` at 5.9ns. Every other phase is flat to within 1%,
+  which is what says the change is where it claims to be.
+- **an 8KB `InputStream/read` costs 1.57µs**, against the JVM's 0.23µs — still
+  open. The transfer itself is a block move; what is left is per-call overhead on
+  the way to it.
 
 `gc-arrays`, per collection, 8-million-element arrays, same sitting:
 

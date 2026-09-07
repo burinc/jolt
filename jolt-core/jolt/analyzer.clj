@@ -1718,7 +1718,7 @@
     (= hname "dec") "unchecked-dec"
     :else nil))
 
-;; A non-shadowed clojure.core numeric cast (double/long/int/float of one arg)
+;; A non-shadowed clojure.core numeric cast (double/long/int/float/byte/short of one arg)
 ;; becomes a :coerce node carrying the checked runtime helper, so it feeds the
 ;; numeric lattice like a ^double/^long hint: (* (double x) 2.0) emits fl*. The
 ;; helper preserves clojure.core's full JVM semantics (checked, not bare
@@ -1732,6 +1732,15 @@
           (= hname "long")   {:kind :long   :cast-fn "jolt-long-cast"}
           (= hname "int")    {:kind :long   :cast-fn "jolt-int-cast"}
           (= hname "float")  {:kind :double :cast-fn "jolt-float"}
+          ;; byte/short narrow to a RANGE, so their answer is a fixnum on every
+          ;; tower jolt has (jolt-checked-cast returns a value inside [lo,hi] or
+          ;; throws) — :long, the same kind `int` takes, and for the same reason.
+          ;; Being in this table is what keeps (byte v) from costing more than the
+          ;; store it feeds: outside it, a var-deref + jolt-invoke1 wrap
+          ;; jolt-byte-cast's two fixnum compares for 17.9ns an element, in exactly
+          ;; the shape every byte-filling loop is written in.
+          (= hname "byte")   {:kind :long   :cast-fn "jolt-byte-cast"}
+          (= hname "short")  {:kind :long   :cast-fn "jolt-short-cast"}
           ;; the unchecked casts are casts too: a primitive long/int on the JVM,
           ;; so the result feeds the :long lattice the same way. Their wrap
           ;; result can be a bignum past the 61-bit fixnum, which is the case
