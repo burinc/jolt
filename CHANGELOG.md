@@ -20,6 +20,10 @@ jolt binary is 4.2MB smaller with a third less peak memory. That came from two
 changes — the boot image ships in Chez's vfasl format, and ~1.8MB of embedded
 source stopped being rebuilt into the heap on every start.
 
+`jolt build --tree-shake` also works again — it had bailed on every app since
+0.7.29, keeping every def and the compiler image, and a bare hello world now
+builds 9.7MB smaller.
+
 Two things to know before upgrading. `jolt <TAB>` completes jolt's commands and
 your project's tasks now, in zsh, bash or fish — `jolt completions zsh` prints
 the function to source. And jolt bounds its heap at 25% of the machine the way
@@ -178,6 +182,64 @@ more, and `JOLT_MAX_HEAP` is the way to give it more.
 
   The seed is re-minted (`host/chez/seed/`, `host/gambit/seed/`): the seed IS the
   compiler that compiles jolt-core, so a back-end change is inert until it is.
+
+- **`jolt build --tree-shake` prunes again.** Every `--tree-shake` build had
+  bailed since 0.7.29, whatever the app: a bare `(ns hello.core)` with a
+  `println` `-main` printed `tree-shake skipped (reachable code resolves vars at
+  runtime)` and kept every def and the compiler image with it. A def whose value
+  holds an anonymous fn literal is minted as its source registration followed by
+  the def — `(begin (let* …(image-register-fn-form! …)) (def-var…))` — and the
+  shake recognised only a record whose body IS a def form, so 138 prelude defs
+  were unprunable roots. Two of them, `clojure.repl/find-doc` and
+  `apropos`, reference `all-ns`, `ns-interns` and `ns-publics`, so the bail set
+  was reached before the app's own graph was ever consulted. The shake looks
+  through exactly that shape now, and nothing else: a defrecord's several defs
+  under one `begin`, or a `def-var-plain!` group, stay unprunable, because a
+  record carries one fqn and pruning several defs under one of their names is
+  unsound.
+
+  The gate that should have caught this was green throughout. It compares the
+  plain and the shaken binary's output, and a bail keeps every def, so the two
+  matched by construction — for five releases. `shakelocal` now requires the
+  shaken build to report `tree-shake kept` and prints the offenders jolt named
+  when it does not, and the one fixture that resolves vars at runtime on purpose
+  is declared as the one that must bail. A second assertion in it had been
+  matching nothing at all: it grepped for `def-var! "app.core" "dead"` while app
+  defs are emitted as `def-var-with-meta!`, so it passed against an unshaken
+  flat.ss for as long as the emitter has carried metadata. Contributed by
+  @sundbp in #881.
+
+- **A callee the inline pass spliced no longer bails the shake.** Since 0.7.29
+  every spliced callee is kept even when nothing calls it any more, so an
+  inlined frame still maps back to ns/name — but it was kept by being made a
+  ROOT, which also made its body reachable code for the bail scan. A spliced
+  callee that no remaining reference reaches never runs: its call sites are all
+  copies. `clojure.core.async`'s go-macro state-machine walkers resolve symbols
+  against `&env` while expanding a `go` body, and the inline pass splices them
+  into one another, so any app that merely loaded core.async — a ring-chez
+  adapter, say — kept the compiler image without ever expanding a `go` form. The
+  spliced set now travels beside the roots rather than in them: roots alone
+  decide what is reachable, and so what the bail scan and the compiler-drop
+  decision read; roots plus the spliced set decide what the binary keeps, so a
+  kept callee's load-time var lookups still find every def it names. A spliced
+  callee that IS still reachable bails as before, which is the case the new
+  gate check pins. Contributed by @sundbp in #882.
+
+- **Two load-time var lookups that cost every app its shake.**
+  `jolt.bb.fs` supplied the `list-dir` that `babashka.fs` leaves to a `:bb` host
+  with a top-level `(intern 'babashka.fs …)`, and `jolt.time.instant` installed
+  its epoch-nanos constructor through `(resolve 'jolt.host/set-instant-ctor!)`.
+  Both are var lookups by name at runtime, the one thing the shake's static
+  graph cannot follow, and both sit on a load path a great many apps reach —
+  anything requiring `jolt.fs`, and anything touching `java.time` at all,
+  including `babashka.fs` through `FileTime` and a bare `#inst` literal. Each
+  now goes through a reference the graph sees: `babashka.fs` already
+  `(declare list-dir)`s, so `alter-var-root` fills the root that declaration
+  left empty, and the instant hook is a plain qualified call, the way
+  `rrb_vector.clj` calls `jolt.host/catvec`. Neither guard was guarding
+  anything: `rt.ss` loads `inst-time.ss` unconditionally, so the var it looked
+  for is always already there, and the Gambit host that lacks it never loads the
+  java.time base at all. Contributed by @sundbp in #883 and #884.
 
 - **`jolt -e` no longer leaves a `.jolt/` directory behind.** Running jolt
   anywhere created `./.jolt/cpcache/<key>.edn` in the current directory,
