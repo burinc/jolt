@@ -1718,7 +1718,7 @@
     (= hname "dec") "unchecked-dec"
     :else nil))
 
-;; A non-shadowed clojure.core numeric cast (double/long/int/float/byte/short of one arg)
+;; A clojure.core numeric cast (double/long/int/float/byte/short of one arg)
 ;; becomes a :coerce node carrying the checked runtime helper, so it feeds the
 ;; numeric lattice like a ^double/^long hint: (* (double x) 2.0) emits fl*. The
 ;; helper preserves clojure.core's full JVM semantics (checked, not bare
@@ -1767,6 +1767,27 @@
                                    (contains? handled (form-sym-name head)))
                           (form-sym-name head)))
             shadowed (and hname (local? env hname))
+            ;; Does this head actually resolve to the clojure.core var it is named
+            ;; after? `shadowed` sees only LOCALS, so it cannot answer that: a
+            ;; namespace-level (defn byte …) or (defn + …) owns the name in call
+            ;; position, with or without :refer-clojure :exclude, and rewriting
+            ;; such a call to a cast or an unchecked op calls the wrong function.
+            ;;
+            ;; This is the test backend_scheme/native-op already makes on the
+            ;; resolved :var node before lowering first/aset/+ to a primitive, so
+            ;; the two lowering layers now agree about who owns a name — and a
+            ;; user-defined `first` and a user-defined `double` behave alike. A
+            ;; head written clojure.core/-qualified (syntax-quote emits those)
+            ;; names its ns outright and needs no lookup.
+            ;;
+            ;; Called only once unchecked-arith / num-cast have matched a name AND
+            ;; an arity, so an ordinary call — every other list head in the
+            ;; program — never pays for the resolution.
+            core-head?
+            (fn []
+              (or (and (form-sym? head) (= "clojure.core" (form-sym-ns head)))
+                  (let [r (resolve-global ctx head)]
+                    (and (= :var (:kind r)) (= "clojure.core" (:ns r))))))
             ;; under *unchecked-math*, a core +/-/*/inc/dec becomes its wrapping
             ;; unchecked-* (computed once; nil when off or not such an op). The op
             ;; may arrive bare (+) or clojure.core-qualified (clojure.core/*), the
@@ -1774,15 +1795,17 @@
             unm (when (unchecked-math?)
                   (let [opn (cond (and hname (not shadowed)) hname
                                   (and (form-sym? head) (= "clojure.core" (form-sym-ns head)))
-                                  (form-sym-name head))]
-                    (when opn (unchecked-arith opn (count items)))))
-            ;; a non-shadowed clojure.core numeric cast (bare or clojure.core/-
-            ;; qualified, the latter from syntax-quote) becomes a checked :coerce
-            ;; node. qn mirrors unm's opn so (clojure.core/double x) specializes too.
+                                  (form-sym-name head))
+                        u (when opn (unchecked-arith opn (count items)))]
+                    (when (and u (core-head?)) u)))
+            ;; a clojure.core numeric cast (bare or clojure.core/-qualified, the
+            ;; latter from syntax-quote) becomes a checked :coerce node. qn mirrors
+            ;; unm's opn so (clojure.core/double x) specializes too.
             cast (let [qn (cond (and hname (not shadowed)) hname
                                 (and (form-sym? head) (= "clojure.core" (form-sym-ns head)))
-                                (form-sym-name head))]
-                   (when qn (num-cast qn (count items))))]
+                                (form-sym-name head))
+                       c (when qn (num-cast qn (count items)))]
+                   (when (and c (core-head?)) c))]
         (cond
           ;; *unchecked-math* rewrite, before macro/special dispatch (these are
           ;; ordinary core fns). The unchecked-* form re-analyzes normally.

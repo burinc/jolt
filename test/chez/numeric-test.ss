@@ -402,5 +402,56 @@
 (ok "(+ 1.5M x) with x untyped => 4.5M bigdec"
     (let ((r ((ev "(fn* ([x] (+ 1.5M x)))") 3))) (and (jbigdec? r) (jolt= r (ev "4.5M")))))
 
+;; --- who owns a name: a NAMESPACE-LEVEL def, not just a local -----------------
+;; `shadowed` in the analyzer sees only LOCALS, so it cannot answer this: a
+;; (defn double …) at the top of a namespace owns `double` in call position, with
+;; or without :refer-clojure :exclude, and rewriting such a call to a cast calls
+;; the wrong function. The op-registry lowering one layer down already resolves
+;; the head and tests the var's ns (backend_scheme/native-op), which is why a
+;; user-defined `first` always worked where a user-defined `double` did not.
+;; Both layers ask the same question now, and every row here is what JVM Clojure
+;; answers. Last in the file: it defs into its own ns, and *unchecked-math* is a
+;; process-wide compile-time read.
+(define (evns s ns) (jolt-compile-eval s ns))
+(define (emit-in ns str) (emitf ns str))
+(evns "(defn double [x] :mine)" "shadow-cast-ns")
+(evns "(defn byte [x] :mine)"   "shadow-cast-ns")
+(evns "(defn + [a b] :mine)"    "shadow-cast-ns")
+(let ((e (emit-in "shadow-cast-ns" "(fn* ([x] (* (double x) 2.0)))")))
+  (ok "an ns-level `double` does NOT lower to jolt-double" (not (has? e "(jolt-double")))
+  (ok "...so its operand does NOT lower * to fl* either" (not (has? e "(#3%fl*"))))
+(let ((e (emit-in "shadow-cast-ns" "(fn* ([x] (+ (byte x) 1)))")))
+  (ok "an ns-level `byte` does NOT lower to jolt-byte-cast" (not (has? e "(jolt-byte-cast"))))
+;; the same head written clojure.core-QUALIFIED names core's var outright and
+;; still lowers, in the very ns that redefined the bare name.
+(let ((e (emit-in "shadow-cast-ns" "(fn* ([x] (* (clojure.core/double x) 2.0)))")))
+  (ok "clojure.core/double still lowers where `double` was redefined" (has? e "(jolt-double")))
+;; and a ns that did NOT redefine it is untouched — the fast path is still there
+(let ((e (emit-in "u" "(fn* ([x] (* (double x) 2.0)))")))
+  (ok "core's `double` still lowers in an ordinary ns" (has? e "(jolt-double")))
+;; runtime: the ns-level def is the fn that actually runs
+(ok "an ns-level `double` is the fn that runs"
+    (jolt= (evns "(double 5)" "shadow-cast-ns") (keyword #f "mine")))
+(ok "an ns-level `byte` is the fn that runs"
+    (jolt= (evns "(byte 5)" "shadow-cast-ns") (keyword #f "mine")))
+(ok "core's cast still runs in an ordinary ns" (= 5.0 (ev "(double 5)")))
+;; The *unchecked-math* rewrite asks the same question — it turns (+ a b) into
+;; unchecked-add, just as wrong when `+` is the user's fn. Set the compile-time
+;; var directly (hc-unchecked-math? var-derefs it) and put it back after.
+(def-var! "clojure.core" "*unchecked-math*" #t)
+(let ((e (emit-in "shadow-cast-ns" "(fn* ([a b] (+ a b)))")))
+  ;; the rewrite's target is the unchecked-add native op (jolt-uncadd2); the
+  ;; user's `+` must stay an ordinary var call instead
+  (ok "an ns-level `+` is NOT rewritten to unchecked-add under *unchecked-math*"
+      (not (has? e "jolt-uncadd2")))
+  (ok "...it calls the ns's own + through its var"
+      (has? e "(var-deref \"shadow-cast-ns\" \"+\")")))
+(let ((e (emit-in "u" "(fn* ([a b] (+ a b)))")))
+  (ok "...while core's `+` still is" (has? e "jolt-uncadd2")))
+(def-var! "clojure.core" "*unchecked-math*" jolt-nil)
+(ok "an ns-level `+` is the fn that runs"
+    (jolt= (evns "(+ 1 2)" "shadow-cast-ns") (keyword #f "mine")))
+(ok "core's + still runs in an ordinary ns" (= 3 (ev "(+ 1 2)")))
+
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))
