@@ -780,6 +780,15 @@
             ;; tree-shaking (drop library code not reachable from -main): --tree-shake
             ;; or deps.edn :jolt/build {:tree-shake true}.
             tree-shake? (boolean (or (some #{"--tree-shake"} flag-args) (:tree-shake build)))
+            ;; keep the plain boot instead of converting it to vfasl: --no-vfasl,
+            ;; deps.edn :jolt/build {:no-vfasl true} or JOLT_NO_VFASL=1. A vfasl
+            ;; boot is an image of the loaded heap, so it starts faster and takes
+            ;; more room; an app whose download size matters more than its startup
+            ;; can decline it (jolt-lang/jolt#886). The env var is the CI-friendly
+            ;; spelling — it needs no edit to the build command.
+            no-vfasl? (boolean (or (some #{"--no-vfasl"} flag-args)
+                                   (:no-vfasl build)
+                                   (System/getenv "JOLT_NO_VFASL")))
             ;; a shared library (callable from C/C++/Rust via jolt_library_init +
             ;; jolt_lookup) instead of an executable: --library.
             library? (some #{"--library"} flag-args)
@@ -793,8 +802,8 @@
         ;; embed-dirs (absolute) are walked + baked into the binary by the driver;
         ;; project-paths (relative) become runtime io/resource roots (ship-alongside).
         (if library?
-          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack)
-          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack))))))
+          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack no-vfasl?)
+          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack no-vfasl?))))))
 
 (defn- nrepl [more]
   ;; resolve the project (deps on the roots, native libs loaded), then start the
@@ -852,7 +861,7 @@
   (println "  FILE [args]            the same, with `run` left out — so a file whose")
   (println "                         first line is `#!/usr/bin/env jolt` runs as an")
   (println "                         executable script, with or without an extension")
-  (println "  build -m NS [-o OUT] [--opt|--dev] [--direct-link] [--tree-shake] [--dynamic]")
+  (println "  build -m NS [-o OUT] [--opt|--dev] [--direct-link] [--tree-shake] [--dynamic] [--no-vfasl]")
   (println "              [--library] [--target MACHINE --target-pack DIR]")
   (println "                         compile a standalone binary, or with --library a")
   (println "                         shared object an embedder dlopens and calls through")

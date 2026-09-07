@@ -58,7 +58,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were open, so the generic seam is faster too: an unhinted `aset`, and every
   other door into a byte array (`into-array`, `Arrays/fill`, `na-list->backing`).
 
+### Added
+
+- **`jolt build --no-vfasl` keeps the plain boot.** 0.8.5 converts the boot image
+  to vfasl in every build, and a vfasl boot is an image of the loaded heap — it
+  starts faster and takes more room. For an app whose download size is the number
+  that matters that is the wrong trade, and there was no way to decline it: an
+  iOS `--target tpb64l` build grew 7.6MB in the binary and about 5MB in the
+  compressed IPA (jolt-lang/jolt#886, reported with before/after numbers for both
+  simulator and device targets). `--no-vfasl`, `:jolt/build {:no-vfasl true}` in
+  `deps.edn`, or `JOLT_NO_VFASL=1` — the spelling a CI job can set without
+  editing the build command — all keep the boot 0.8.4 produced. It covers the
+  self-contained, cc-linked and `--library` paths; jolt's own boot is not a
+  `jolt build` and is unaffected.
+
+  Measure before reaching for it, because on the host build the size cost turns
+  out to be the *codec's*, not vfasl's. One image from the build smoke's app,
+  three boots:
+
+  | boot | binary | warm start |
+  |---|---|---|
+  | vfasl + LZ4 (the default) | 27.6MB | 0.26s |
+  | vfasl + gzip | 16.8MB | 0.44s |
+  | plain (`--no-vfasl`) | 26.0MB | 0.50s |
+
+  A gzip-encoded vfasl boot is smaller than the plain boot *and* faster to load,
+  so on this app `--no-vfasl` is beaten on both axes by a codec jolt does not yet
+  let you ask for. The reporter's `tpb64l` build saw a far larger vfasl delta
+  than this one does, which is exactly why the flag ships as asked rather than
+  being argued out of; exposing the codec is tracked separately.
+
 ### Fixed
+
+- **A large binary's boot image loads again.** A program big enough for its boot
+  image to reach 256MiB built fine and then died on every run, inside
+  `Sbuild_heap`, before a line of its own code had executed:
+
+  ```
+  fasl-read: uncompressed size -222298112 for #vu8(…) is smaller than
+             expected size 314572800
+  ```
+
+  The negative number is the tell. Chez's kernel decompresses a fasl entry and
+  compares the result against the size the entry declares; on the LZ4 arm
+  (`c/new-io.c`, `S_bytevector_uncompress`) it returns that result as
+  `Sfixnum(r)` with `int r`, and `Sfixnum` is `((ptr)(uptr)((x)*8))` — the
+  multiply happens in the argument's own type. At 2^28 bytes it overflows `int`,
+  the length comes back negative, and the comparison can never succeed. The gzip
+  arm of the same function hands zlib a `uLong` and has no ceiling: measured
+  against Chez 10.4.1, LZ4 round-trips at 2^28-1 and fails at 2^28, and gzip
+  round-trips at both.
+
+  Nothing before 0.8.5 could reach it. A plain boot is one compressed entry per
+  top-level form and its entries are kilobytes; the vfasl boot 0.8.5 introduced
+  combines each input boot file into ONE entry, so a program's whole compiled
+  half became a single image — 83MB for the build smoke's hello-world-plus, 43MB
+  for jolt itself, and past 256MiB an executable that cannot start. The failure
+  scaled with the program, which is the worst shape for it: every app that had
+  been built with 0.8.5 worked, right up to the one that didn't.
+
+  jolt links against whatever Chez the machine has, so it cannot fix the kernel;
+  it keeps the image off the ceiling instead. `jolt build` now reads back the
+  entry headers of the boot it just converted, and when an LZ4 entry declares an
+  uncompressed size at or over 2^28 it re-encodes the image with gzip and says
+  so. Only a build that was previously broken changes — every image under the
+  ceiling is byte-for-byte what it was — and it keeps the vfasl format, so what
+  it gives up is decompression speed, not the load. Measured on the build
+  smoke's app, whose image is 83MB, with both codecs forced: **0.26s and a
+  27.6MB binary on LZ4, 0.44s and a 16.8MB binary on gzip.** Slower to start and
+  a third smaller, which is the shape of the trade at any size; at 256MiB and up
+  the alternative is a binary that does not start. The same check covers
+  `--library` and jolt's own boot.
+
+  `make vfaslceiling` pins all three legs — that the ceiling is real and is
+  exactly 2^28, that gzip has none, and that the scanner and the fallback do what
+  they claim, by lowering the ceiling under a boot small enough to build in a
+  second. The check for LZ4 *failing* at 2^28 is deliberately a check on the
+  kernel: when a future Chez fixes the overflow it turns red, and that is the
+  signal to delete the workaround rather than a regression.
 
 - **A namespace-level `(defn double …)` owns the name, as it already did for
   `(defn first …)`.** jolt has two layers that rewrite a `clojure.core` call into

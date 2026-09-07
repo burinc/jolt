@@ -731,7 +731,12 @@
         ;; does — $fasl-to-vfasl lays the image out for a specific machine.
         "(vfasl-convert-file " (ei-str-lit jb-boot) " " (ei-str-lit jb-vboot) " '())\n"))
     (close-port p))
-  (bld-system (string-append bld-chez " --script '" cs "'")))
+  (bld-system (string-append bld-chez " --script '" cs "'"))
+  ;; …and re-run just that conversion under gzip if the image it produced is over
+  ;; Chez's LZ4 fasl ceiling (build.ss). jolt's own image is nowhere near it, but
+  ;; nothing here bounds it, and the failure mode is a binary that dies in
+  ;; Sbuild_heap rather than one that boots slowly.
+  (bld-vfasl-regzip! jb-build jb-boot jb-vboot))
 
 ;; --- 3. embed boots/stub as C arrays + cc-link ------------------------------
 ;; xxd a file into header H and rename its symbol to NAME / NAME_len.
