@@ -238,12 +238,25 @@
 
 ;; --- the listing -------------------------------------------------------------
 
+(defn- first-line
+  "Everything before the first newline. A listing is one task per line, so a
+  docstring that spans lines has to be cut to fit it — see list-tasks!."
+  [s]
+  (apply str (take-while #(not= \newline %) s)))
+
 (defn list-tasks!
   "`jolt tasks` — the project's task names and their :doc, babashka's listing.
-  :private tasks are helpers for other tasks and stay out of it."
+  Two kinds of task stay out of it, both of them helpers for other tasks:
+  a :private one, and one whose name starts with `-`, which is babashka's
+  spelling of the same intent and reaches us through the bb.edn files we read.
+  Only the first line of a :doc is printed, because the listing's whole shape is
+  one task per line: a docstring's second line would otherwise sit in the name
+  column and read as a task of its own."
   [tasks]
   (let [entries (->> (tasks-of tasks)
-                     (remove (fn [[_ v]] (and (map? v) (:private v))))
+                     (remove (fn [[k v]]
+                               (or (and (map? v) (:private v))
+                                   (= \- (first (str k))))))
                      (sort-by (comp str key)))]
     (if (empty? entries)
       (println "No tasks found. Add a :tasks map to bb.edn or deps.edn.")
@@ -253,5 +266,6 @@
         (doseq [[k v] entries]
           (let [doc (when (map? v) (:doc v))]
             (println (if doc
-                       (str (apply str k (repeat (- w (count (str k))) \space)) "  " doc)
+                       (str (apply str k (repeat (- w (count (str k))) \space))
+                            "  " (first-line doc))
                        (str k)))))))))
