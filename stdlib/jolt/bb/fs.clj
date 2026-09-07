@@ -37,9 +37,11 @@
      (vec stream))))
 
 ;; babashka.fs already declares the var (its own list-dirs and path-seq refer to
-;; it), so this fills the root the :bb branch left empty.
-(intern 'babashka.fs
-        (with-meta 'list-dir
-          {:doc (:doc (meta #'list-dir))
-           :arglists '([dir] [dir glob-or-accept])})
-        list-dir)
+;; it), so this fills the root the :bb branch left empty. Through the var, not
+;; `intern`: a top-level intern is a runtime var lookup by name, which is the one
+;; thing `jolt build --tree-shake` cannot follow, so every app that requires
+;; jolt.fs kept every def and the compiler image because of this one form.
+(alter-var-root #'babashka.fs/list-dir (constantly list-dir))
+(alter-meta! #'babashka.fs/list-dir assoc
+             :doc (:doc (meta #'list-dir))
+             :arglists '([dir] [dir glob-or-accept]))
