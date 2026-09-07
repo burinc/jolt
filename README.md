@@ -273,6 +273,51 @@ every run, which measures ~0.17s against babashka's ~0.01s on the same machine. 
 script called in a loop is better compiled once: give it an `(ns …)` with a
 `-main` and `jolt build -m` it into a binary.
 
+`jolt completions zsh` gives a shell the project's task names, so a script or a
+task is a TAB away: see [Shell completion](#shell-completion).
+
+## Shell completion
+
+`jolt completions SHELL` prints a completion function for zsh, bash or fish.
+`jolt <TAB>` then offers jolt's commands and the project's tasks, and under zsh
+each task carries its `:doc`:
+
+```
+$ jolt build<TAB>
+build             -- compile a standalone binary or shared library
+build:linux       -- Compile native/libtsj.so for AWS Lambda (AL2023 arm64) via Docker
+build:linux:host  -- Compile native/libtsj.so natively for THIS Linux host (no Docker)
+```
+
+For zsh, in `~/.zshrc` after `compinit`:
+
+```bash
+source <(jolt completions zsh)
+```
+
+Or save it as `_jolt` somewhere on `$fpath`, which works too. For bash, source
+`jolt completions bash` from `~/.bashrc`. For fish, save `jolt completions fish`
+as `~/.config/fish/completions/jolt.fish`.
+
+A snippet holds jolt's own commands directly, since those change only when the
+binary does. The project's tasks it fetches with `jolt completions tasks` and
+caches against the mtimes of `deps.edn` and `bb.edn`, so a press costs nothing
+until one of those files moves. Under zsh that path forks no process at all and
+measures 0.4ms. Set `JOLT_COMPLETION_NO_CACHE=1` to bypass it.
+
+`jolt completions tasks` is worth knowing on its own: one line per listable
+task, `name<TAB>doc`, which is the machine-readable form of what `jolt tasks`
+prints for a person. Anything scripting over a project's tasks should read that
+rather than parse the listing.
+
+A `:private` task and one whose name starts with `-` are left out, the same two
+`jolt tasks` hides. One case differs on purpose: a task sharing a built-in
+command's name is offered only when it wins that name with `:override-builtin`,
+because a completion's description says what the word will do, and for a task
+that loses to a command the answer is the command. `jolt tasks` lists it either
+way, being a list of what the project defines rather than of what typing the
+word gets you.
+
 ## Runtime dependencies
 
 Jolt supplies `org.clojure/clojure` and `org.clojure/clojurescript` itself, so
