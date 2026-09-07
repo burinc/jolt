@@ -6,10 +6,13 @@
 ;; library checked out beside this repo, "/x" = absolute.
 ;;
 ;; :expect is the tally last observed. The gate fails when pass drops or
-;; fail/error/load-fail rise; it reports BETTER (not a failure) when pass rises,
-;; so improving a library is a manifest edit away. :note records why a non-zero
-;; fail/error count is expected — a host-model divergence, a missing JVM-only
-;; dependency, or a tracked bug.
+;; fail/error/load-fail rise; it reports BETTER (not a failure) when any of the
+;; four moves the other way, so improving a library is a manifest edit away.
+;; :tolerance is a SYMMETRIC noise band for a suite that generates its cases, and
+;; it suppresses BETTER exactly as it suppresses WORSE — inside the band a move is
+;; a different draw rather than a result, and reads as ok. :note records why a
+;; non-zero fail/error count is expected — a host-model divergence, a missing
+;; JVM-only dependency, or a tracked bug.
 {:libs
  [;; ---------------------------------------------------------- collections/util
   {:name "medley"

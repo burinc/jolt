@@ -178,6 +178,29 @@
       (> error (+ (:error exp 0) (or tolerance 0)))
       (> load-fail (:load-fail exp 0))))
 
+;; worse?'s mirror: a counter that moved the GOOD way by more than the tolerance.
+;; Reported as BETTER rather than as a failure, so recording the improvement is a
+;; one-line manifest edit.
+;;
+;; Two things were wrong here (jolt-8a8). Only `pass` was consulted, so a fix that
+;; turns failing assertions into absent ones — a load-fail that starts loading, an
+;; error the suite stops reaching — moved fail/error/load-fail down without moving
+;; pass up and read as plain `ok`. All four are mirrored now.
+;;
+;; And :tolerance is a SYMMETRIC noise band, which means it suppresses BETTER
+;; exactly as it suppresses WORSE. That is deliberate, not the leftover: inside the
+;; band a move is a different draw and not a result, so re-recording it would only
+;; re-centre the band on whatever the last run happened to generate. test.check
+;; (:tolerance 40) came back pass=245 against a recorded 236 and reports ok for
+;; that reason. Above the band the move is real and says so; a library without a
+;; :tolerance is pinned exactly, so any rise there is BETTER.
+(defn- better? [{:keys [pass fail error load-fail]} exp tolerance]
+  (let [t (or tolerance 0)]
+    (or (> pass (+ (:pass exp 0) t))
+        (< fail (- (:fail exp 0) t))
+        (< error (- (:error exp 0) t))
+        (< load-fail (:load-fail exp 0)))))
+
 (defn- tally-str [{:keys [tests pass fail error load-fail]}]
   (str "tests=" tests " pass=" pass " fail=" fail " error=" error
        (when (and load-fail (pos? load-fail)) (str " load-fail=" load-fail))))
@@ -214,7 +237,7 @@
                                               name (:exit r) logdir name))
                              {:name name :verdict :fail})
                          (let [bad (and expect (worse? r expect tolerance))
-                               better (and expect (> (:pass r) (+ (:pass expect 0) (or tolerance 0))))]
+                               better (and expect (better? r expect tolerance))]
                            (println (format "%-20s %-6s %s%s"
                                             name
                                             (cond bad "WORSE" better "BETTER" :else "ok")
