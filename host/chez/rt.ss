@@ -377,30 +377,34 @@
     ;; maximum heap" for `java -Xmx1m`), so say so plainly and name a floor.
     ;; Deliberately NOT worded "out of memory": this is a configuration error,
     ;; and host-faults.ss would otherwise classify it as OutOfMemoryError.
-    (when (and ceiling (<= ceiling (bytes-allocated)))
+    (when (and ceiling (<= ceiling (sa-bytes-allocated)))
       (error 'jolt
              (string-append
                "JOLT_MAX_HEAP is smaller than the runtime's own live heap: asked for "
                (number->string ceiling) " bytes, already using "
-               (number->string (bytes-allocated))
+               (number->string (sa-bytes-allocated))
                ". Give it at least twice that, or JOLT_MAX_HEAP=off for no ceiling.")))
     (set! jolt-heap-ceiling-bytes ceiling)
+    ;; The hook itself is target-specific, so it goes through the adapter
+    ;; (sa-gc-install-ceiling!): this file is portable and the natives that hook
+    ;; collection are blocklisted here for exactly that reason. A target that
+    ;; cannot hook collection answers #f, and then jolt is unbounded as it was
+    ;; before 0.8.5 — so the ceiling is forgotten rather than reported, keeping
+    ;; Runtime.maxMemory honest.
     (when ceiling
-      (let ((soft (exact (floor (* ceiling 3/4)))))
-        (collect-request-handler
-          (lambda ()
-            (collect)
-            (when (> (bytes-allocated) soft)
-              (collect (collect-maximum-generation))
-              (when (> (bytes-allocated) ceiling)
-                (error 'jolt
-                       (string-append
-                         "out of memory: the heap ceiling of "
-                         (number->string ceiling)
-                         " bytes was exceeded (live "
-                         (number->string (bytes-allocated))
-                         "). Raise or disable it with JOLT_MAX_HEAP=<n>[k|m|g] or "
-                         "JOLT_MAX_HEAP=off."))))))))))
+      (unless (sa-gc-install-ceiling!
+                (exact (floor (* ceiling 3/4)))
+                ceiling
+                (lambda (live)
+                  (error 'jolt
+                         (string-append
+                           "out of memory: the heap ceiling of "
+                           (number->string ceiling)
+                           " bytes was exceeded (live "
+                           (number->string live)
+                           "). Raise or disable it with JOLT_MAX_HEAP=<n>[k|m|g] or "
+                           "JOLT_MAX_HEAP=off."))))
+        (set! jolt-heap-ceiling-bytes #f)))))
 
 (load "host/chez/collections.ss")
 (load "host/chez/seq.ss")

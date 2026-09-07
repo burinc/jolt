@@ -696,6 +696,32 @@
     (vfasl-convert-file in out '())
     #t))
 
+;; (sa-gc-install-ceiling! soft hard on-exceeded) -> boolean
+;; Install a collection hook enforcing a heap ceiling, and answer whether the
+;; target could. On each collection the target performs its normal collection,
+;; then: above SOFT live bytes it forces a FULL collection — the one a
+;; generational collector defers, and the whole point under memory pressure —
+;; and if live bytes still exceed HARD it calls ON-EXCEEDED with that count.
+;;
+;; The policy lives in the caller (rt.ss jolt-install-heap-ceiling!): the
+;; thresholds, the message, and what ON-EXCEEDED does. This is only the seam
+;; that hooks collection, because doing that needs a target-specific native.
+;;
+;; Contract: ON-EXCEEDED is called only when the heap genuinely cannot be
+;; brought under HARD, so raising from it is the expected use.
+;; Degradation: answer #f without installing anything. The ceiling is then
+;; unenforced, which is what every jolt before 0.8.5 did, and the caller
+;; reports maxMemory accordingly rather than promising a bound it lacks.
+(define (sa-gc-install-ceiling! soft hard on-exceeded)
+  (collect-request-handler
+    (lambda ()
+      (collect)
+      (when (> (bytes-allocated) soft)
+        (collect (collect-maximum-generation))
+        (when (> (bytes-allocated) hard)
+          (on-exceeded (bytes-allocated))))))
+  #t)
+
 ;; (sa-fasl-write obj port [externals-pred]) -> void
 ;; fasl-serialize OBJ to PORT, optionally under the externals predicate
 ;; state-image.ss passes so refused objects are COLLECTED as externals instead

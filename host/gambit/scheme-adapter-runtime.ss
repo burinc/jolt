@@ -82,6 +82,15 @@
 (define (sa-max-memory-bytes)
   9223372036854775807)
 
+;; (sa-gc-install-ceiling! soft hard on-exceeded) -> boolean
+;; Permitted degradation: Gambit exposes no hook equivalent to Chez's
+;; collect-request-handler, so answer #f and install nothing. The heap is then
+;; unbounded, which is what every jolt before 0.8.5 did on every target, and
+;; the caller reports maxMemory as unbounded rather than promising a bound it
+;; cannot enforce.
+(define (sa-gc-install-ceiling! soft hard on-exceeded)
+  #f)
+
 ;; (sa-real-time-ms) -> exact integer
 ;; Wall-clock milliseconds, monotonic within a process — used for elapsed
 ;; deltas (build profiling) and unique temp-file stamps. Contract: an
