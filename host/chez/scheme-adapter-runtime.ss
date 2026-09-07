@@ -683,6 +683,45 @@
 (define (sa-make-boot-file out base-boots)
   (apply make-boot-file out '() base-boots))
 
+;; (sa-vfasl-convert-file in out) -> boolean
+;; Rewrite the boot file IN to OUT in Chez's vfasl format: a prebuilt image of
+;; what loading the fasl would have produced, laid out per space and loaded
+;; straight into the static generation, which is worth roughly a third of jolt's
+;; own startup (see build-jolt.ss). Contract: produce a boot the target's runtime
+;; can boot from, or answer #f. Degradation: #f rather than raise — an app that
+;; boots slower is strictly better than an app that fails to build, and the
+;; caller keeps the plain boot it already has.
+(define (sa-vfasl-convert-file in out)
+  (guard (e (#t #f))
+    (vfasl-convert-file in out '())
+    #t))
+
+;; (sa-gc-install-ceiling! soft hard on-exceeded) -> boolean
+;; Install a collection hook enforcing a heap ceiling, and answer whether the
+;; target could. On each collection the target performs its normal collection,
+;; then: above SOFT live bytes it forces a FULL collection — the one a
+;; generational collector defers, and the whole point under memory pressure —
+;; and if live bytes still exceed HARD it calls ON-EXCEEDED with that count.
+;;
+;; The policy lives in the caller (rt.ss jolt-install-heap-ceiling!): the
+;; thresholds, the message, and what ON-EXCEEDED does. This is only the seam
+;; that hooks collection, because doing that needs a target-specific native.
+;;
+;; Contract: ON-EXCEEDED is called only when the heap genuinely cannot be
+;; brought under HARD, so raising from it is the expected use.
+;; Degradation: answer #f without installing anything. The ceiling is then
+;; unenforced, which is what every jolt before 0.8.5 did, and the caller
+;; reports maxMemory accordingly rather than promising a bound it lacks.
+(define (sa-gc-install-ceiling! soft hard on-exceeded)
+  (collect-request-handler
+    (lambda ()
+      (collect)
+      (when (> (bytes-allocated) soft)
+        (collect (collect-maximum-generation))
+        (when (> (bytes-allocated) hard)
+          (on-exceeded (bytes-allocated))))))
+  #t)
+
 ;; (sa-fasl-write obj port [externals-pred]) -> void
 ;; fasl-serialize OBJ to PORT, optionally under the externals predicate
 ;; state-image.ss passes so refused objects are COLLECTED as externals instead

@@ -146,9 +146,18 @@
             ;; working directory its own build uses — in a multi-module repo that
             ;; is the MODULE root, not the repo root (ring-core reads
             ;; test/ring/assets/…, which only resolves from ring/ring-core).
+            ;; JOLT_MAX_HEAP=off: this is a stress harness, not a user
+            ;; workload. 0.8.5 gave jolt a heap ceiling defaulting to 25% of
+            ;; RAM (the share the JVM's MaxRAMPercentage uses), which is the
+            ;; right default for a program but wrong here — malli's suite alone
+            ;; has a live set around 2.5GB, so on any machine with under ~10GB
+            ;; the ceiling would fail the suite before it could report a tally,
+            ;; and the tally is the whole output. A library that needs a bound
+            ;; can ask for one; the harness does not impose one.
             r (apply p/sh {:out :string :err :string
                            :dir (if dir (resolve-path lib-root dir) lib-root)
-                           :extra-env {"JOLT_NO_USER_DEPS" "1"}}
+                           :extra-env {"JOLT_NO_USER_DEPS" "1"
+                                       "JOLT_MAX_HEAP" "off"}}
                      cmd)
             out (str (:out r) (:err r))]
         (merge {:status :ran :exit (:exit r) :out out :nses (vec nses)}

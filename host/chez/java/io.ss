@@ -107,7 +107,7 @@
 ;; only on the dev machine.
 (define (register-embedded-bytes! name bv) (hashtable-set! embedded-resources name bv))
 (define (jolt-embedded-bytes name)
-  (let ((v (hashtable-ref embedded-resources name #f)))
+  (let ((v (embedded-resource-ref name)))
     (and (bytevector? v) v)))
 
 ;; Embedded compiled fasls for install-owned stdlib namespaces. build-jolt bakes
@@ -166,6 +166,68 @@
       (else
        (let ((ol (hashtable-ref embedded-fasl-index name #f)))
          (and ol (jolt-stdlib-fasl-fetch (car ol) (cdr ol))))))))
+
+;; --- embedded SOURCE, the same treatment as the fasls above -----------------
+;; jolt-core/ and stdlib/ source is embedded so a built binary can load a
+;; namespace that is neither in the runtime image nor carries a fasl. It used to
+;; be emitted as one (register-embedded-resource! "<path>" (string->utf8 "…"))
+;; per file, which is precisely the boot-image-literal shape the comment above
+;; warns about: every start re-materialized each string literal AND allocated a
+;; fresh utf8 bytevector from it. Measured on `jolt --version` at 59ms and +47MB
+;; of heap, and that heap was then paid for a second time by the Scompact_heap
+;; at the end of Sbuild_heap.
+;;
+;; The same answer applies, and build-jolt.ss had already reached it twice —
+;; once for the stdlib fasls above, once for the build subsystem's own .ss
+;; embeds (deferred into a thunk). So the bytes go into one concatenated C array
+;; (jolt_source_blob) and only the index is baked. Same locking discipline as
+;; the fasl index: written once by the launcher before scheme-start, read
+;; afterwards by single-key hashtable-ref.
+;;
+;; Empty in every path that carries no such array — dev bin/jolt, devcache, and
+;; `jolt build` app binaries, which register their own embeds eagerly — so the
+;; fetch returning #f is a normal answer there, not a failure. Written once while
+;; the heap is built, single-threaded, and read afterwards by single-key
+;; hashtable-ref, which is the same discipline the fasl index above keeps.
+(define embedded-source-index (make-hashtable equal-hash equal?))
+(define (jolt-source-blob-attach! index)
+  (for-each (lambda (entry)
+              (hashtable-set! embedded-source-index (car entry)
+                              (cons (cadr entry) (caddr entry))))
+            index))
+(define (jolt-source-blob-fetch offset length)
+  (guard (e (else #f))
+    (let* ((base (sa-foreign-entry-address "jolt_source_blob"))
+           (bv (make-bytevector length))
+           (memcpy (sa-foreign-procedure "memcpy" (u8* uptr uptr) void*)))
+      (memcpy bv (+ base offset) length)
+      ;; Each slice is one bytevector-compress frame. Compressing pays here in a
+      ;; way it does not for the boot image: the boot is read start to finish on
+      ;; every single start, where unpacking outruns readahead and serializes a
+      ;; read that overlapped the parse, but this is read only when a namespace
+      ;; loads from source — never on the boot path — so the bytes come off the
+      ;; binary lazily and one small inflate costs nothing measurable. The frame
+      ;; records its own format and size, so nothing here has to agree with the
+      ;; build about either.
+      (bytevector-uncompress bv))))
+
+;; The lookup every reader of embedded-resources goes through: the eager table
+;; first — `jolt build`'s embed dirs, the runtime .ss thunk and the materialized
+;; bundles all still register directly — then the blob index. Readers already
+;; accepted a bytevector here (the old literals were string->utf8), so what comes
+;; back has the same shape it always did.
+(define (embedded-resource-ref name)
+  (or (hashtable-ref embedded-resources name #f)
+      (let ((ol (hashtable-ref embedded-source-index name #f)))
+        (and ol (jolt-source-blob-fetch (car ol) (cdr ol))))))
+
+;; Presence WITHOUT the bytes. resolve-on-roots probes several candidate paths on
+;; every require and ldr-install-file? asks about one on every load; when the
+;; answer lives in the blob, fetching it to test existence would memcpy a whole
+;; file to throw it away. Those callers ask this instead.
+(define (embedded-resource-has? name)
+  (or (and (hashtable-ref embedded-resources name #f) #t)
+      (and (hashtable-ref embedded-source-index name #f) #t)))
 
 ;; --- with-port: open a port, do work, close on success or throw ----------------
 (define (with-port port proc)
@@ -1368,7 +1430,7 @@
 ;; contributes nothing here.
 (define (resolve-resource name)
   (let* ((nm (resource-name-arg name))
-         (emb (hashtable-ref embedded-resources nm #f)))
+         (emb (embedded-resource-ref nm)))
     (if emb (make-embedded-res nm emb)
         (let loop ((roots (get-source-roots)))
           (if (null? roots)
@@ -1434,7 +1496,7 @@
 ;; and every candidate is announced for the reason resolve-resource announces.
 (define (cl-get-resources self name)
   (let* ((nm (resource-name-arg name))
-         (emb (hashtable-ref embedded-resources nm #f)))
+         (emb (embedded-resource-ref nm)))
     (let loop ((roots (get-source-roots))
                (acc (if emb (list (make-embedded-res nm emb)) '())))
       (cond ((null? roots) (list->cseq (reverse acc)))

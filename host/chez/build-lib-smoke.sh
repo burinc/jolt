@@ -56,9 +56,22 @@ if [ -z "$csv" ]; then
     done
   fi
 fi
-if ! command -v cc >/dev/null 2>&1 || [ -z "$csv" ] || [ ! -f "$csv/scheme.h" ] || [ ! -f "$csv/libkernel.a" ]; then
-  echo "build-lib smoke: skipped (Chez kernel dev files or C compiler not available)"
+# A skip here is an environment limitation, not a pass — but it exits 0, so a CI
+# job whose Chez cannot build a shared library would report this gate green while
+# testing nothing. JOLT_REQUIRE_BUILDLIB=1 (set by .github/workflows/tests.yml)
+# turns every skip below into a failure, so the gate is either run or loud.
+skip_or_fail() {
+  if [ -n "${JOLT_REQUIRE_BUILDLIB:-}" ]; then
+    echo "  FAIL: $1" >&2
+    echo "  (JOLT_REQUIRE_BUILDLIB is set, so this environment was expected to run the gate)" >&2
+    exit 1
+  fi
+  echo "build-lib smoke: skipped ($1)"
   exit 0
+}
+
+if ! command -v cc >/dev/null 2>&1 || [ -z "$csv" ] || [ ! -f "$csv/scheme.h" ] || [ ! -f "$csv/libkernel.a" ]; then
+  skip_or_fail "Chez kernel dev files or C compiler not available"
 fi
 export JOLT_CHEZ_CSV="$csv"
 
@@ -75,8 +88,7 @@ if [ ! -f "$lib" ]; then
   # fails the -shared link with a relocation error — an environment limitation,
   # not a jolt bug, so skip like the missing-toolchain case above.
   if printf '%s' "$build_out" | grep -qiE 'recompile with .*-fPIC|can not be used when making a shared object|relocation R_'; then
-    echo "build-lib smoke: skipped (Chez libkernel.a is not position-independent; a shared library needs a PIC kernel)"
-    exit 0
+    skip_or_fail "Chez libkernel.a is not position-independent; a shared library needs a PIC kernel (configure Chez with CFLAGS+=-fPIC)"
   fi
   echo "  FAIL: jolt build --library produced no shared library"
   printf '%s\n' "$build_out"

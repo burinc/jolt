@@ -121,7 +121,11 @@ system
 # a constant (callers stamp temp files with it); sa-total-memory-bytes may
 # approximate — callers only display it or subtract sa-bytes-allocated from
 # it; sa-max-memory-bytes may return a large constant (the JVM arm already
-# falls back to Long.MAX_VALUE semantics).
+# falls back to Long.MAX_VALUE semantics); sa-gc-install-ceiling! may answer
+# #f without installing anything, which leaves the heap unbounded as it was
+# before 0.8.5 — a target with no collection hook cannot enforce a ceiling,
+# and the caller then reports maxMemory as unbounded rather than promising a
+# bound it does not have.
 sa-run-process
 sa-gc-collect
 sa-gc-max-generation
@@ -131,6 +135,7 @@ sa-max-memory-bytes
 sa-real-time-ms
 sa-file-mtime-ms
 sa-gc-trip-bytes!
+sa-gc-install-ceiling!
 #
 # tier: capability-introspect
 # OUR definitions in host/chez/scheme-adapter-runtime.ss for the blocklist's
