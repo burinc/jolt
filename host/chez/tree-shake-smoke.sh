@@ -22,6 +22,13 @@ case "$jolt" in /*) joltabs="$jolt" ;; *) joltabs="$root/$jolt" ;; esac
 # don't need the examples repo, so they're wired into `make shakelocal` / ci. The
 # git-dep apps (markdown/malli/…) stay in the manual `make shakesmoke`.
 scope="${SHAKESMOKE_SCOPE:-all}"
+# Ceiling, in percent, on how much of the program a fixture's shake may KEEP.
+# Every local fixture is a hello-world-sized app whose reachable set is a thin
+# slice of the prelude — measured 239-242 of ~683 defs, ~35% — so 50% catches a
+# shake that ran but kept nearly everything while leaving room for the handful
+# of defs a fixture's own source adds. Per-case override: run_local_case's 6th
+# argument.
+shake_max_kept="${SHAKE_MAX_KEPT_PCT:-50}"
 examples="$root/../examples"
 [ -d "$examples" ] || examples="$HOME/src/jolt-lang/examples"
 if [ "$scope" != "local" ] && [ ! -d "$examples" ]; then echo "shake smoke: skipped (examples repo not found)"; exit 0; fi
@@ -76,8 +83,19 @@ run_case() {
 # so the outputs match by construction — which is how a prelude change that
 # bailed every --tree-shake build (0.7.29 to 0.8.4) went unnoticed here.
 # (The .build dir is the binary's build artifacts, kept alongside the binary.)
+#
+# EXPECT also decides two quantitative checks, because "it shook" is not the same
+# claim as "it shook anything". A regression that shakes but keeps nearly every
+# def, or that stops dropping the compiler image, still prints `tree-shake kept`
+# and still matches the plain build's output:
+#   - kept fraction: at most $shake_max_kept percent of the defs, or the 6th
+#     argument when a fixture legitimately keeps more.
+#   - the compiler image: a shake that does NOT bail always drops it (every
+#     dce-compile-ref is also a dce-bail-ref, so reaching no bail ref means
+#     reaching no compile ref either — see dce.ss), and a bail always keeps it.
 run_local_case() {
   app="$root/test/chez/$1"; ns="$2"; args="$3"; assert_missing="$4"; expect="${5:-shake}"
+  max_kept="${6:-$shake_max_kept}"
   [ -d "$app" ] || { echo "  - $1: skipped (not present)"; return; }
   b0="$tmp/$1-plain"; b1="$tmp/$1-shake"
   bdir="$tmp/$1-shake.build"
@@ -97,10 +115,29 @@ run_local_case() {
       if ! grep -q '^jolt build: tree-shake kept ' "$tmp/$1-shake-out"; then
         echo "  - $1: FAIL (no 'tree-shake kept' report in the --tree-shake build output)"
         fail=1; return
+      fi
+      counts="$(sed -n 's/^jolt build: tree-shake kept \([0-9]*\) of \([0-9]*\) defs.*/\1 \2/p' "$tmp/$1-shake-out" | head -1)"
+      kept_n="${counts%% *}"; kept_m="${counts##* }"
+      if [ -z "$kept_n" ] || [ -z "$kept_m" ] || [ "$kept_m" = 0 ]; then
+        echo "  - $1: FAIL (could not read the kept/total counts off the tree-shake report)"
+        fail=1; return
+      fi
+      kept_pct=$(( kept_n * 100 / kept_m ))
+      if [ "$kept_pct" -gt "$max_kept" ]; then
+        echo "  - $1: FAIL (tree-shake kept $kept_n of $kept_m defs, ${kept_pct}% > the ${max_kept}% ceiling)"
+        fail=1; return
+      fi
+      if ! grep -q '^jolt build: dropping compiler image' "$tmp/$1-shake-out"; then
+        echo "  - $1: FAIL (the shake ran but the binary kept the compiler image)"
+        fail=1; return
       fi ;;
     bail)
       if ! grep -q '^jolt build: tree-shake skipped' "$tmp/$1-shake-out"; then
         echo "  - $1: FAIL (expected the keep-everything bail; the shake ran)"
+        fail=1; return
+      fi
+      if grep -q '^jolt build: dropping compiler image' "$tmp/$1-shake-out"; then
+        echo "  - $1: FAIL (a bailed build must keep the compiler image)"
         fail=1; return
       fi ;;
     *) echo "  - $1: FAIL (unknown EXPECT '$expect')"; fail=1; return ;;
@@ -163,6 +200,14 @@ run_local_case multipath-app    app.core  "alt"  ""
 # duplicate-fqn regression: a twice-defined var whose first def references a
 # helper referenced nowhere else — the union (not overwrite) keeps the helper alive.
 run_local_case dupfqn-app      app.core  ""     ""
+# spliced-callee regression (#882): a private helper that calls `resolve` and is
+# reachable only through the copies the inline pass made of it. It is KEPT (an
+# inlined frame still names ns/file:line) but is not reachable code, so it must
+# not bail the shake — core.async's go-macro walkers have exactly this shape, and
+# rooting them kept every def and the compiler image in any app that merely
+# loaded core.async. Bails against the pre-#882 dce.ss. app.core/walk-body is the
+# unreachable caller the helpers were spliced into, so it must be pruned.
+run_local_case spliced-resolve-app app.core "" "\"app.core\" \"walk-body\""
 
 [ "$fail" = 0 ] && echo "shake smoke: passed" || echo "shake smoke: FAILED"
 exit $fail
