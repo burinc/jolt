@@ -207,4 +207,34 @@
   (for-each (lambda (n) (gate-check (string-append "compile-ref exists: " n) #f #t))
             (missing dce-compile-refs "compile-refs")))
 
+;; --- spliced callees: kept for frame identity, not roots of the bail scan ----
+;; The inline pass records every callee it spliced (hc-mark-spliced!), and the
+;; shake keeps those defs so an inlined frame still maps back to ns/name. They are
+;; not reachable code — every call site is a copy — so a spliced helper that
+;; resolves a var by name must not bail the shake, while a def nothing reaches
+;; is still pruned and everything a kept callee names stays defined.
+(let* ((rec (lambda (fqn refs) (dce-rec #f fqn refs (string-append "(" fqn ")"))))
+       (app (list (rec "gate.app/-main" '("gate.app/live"))
+                  (rec "gate.app/live" '())
+                  ;; spliced everywhere it was called, so no record references it
+                  (rec "gate.app/walker" '("clojure.core/resolve" "gate.app/named-by-walker"))
+                  (rec "gate.app/named-by-walker" '())
+                  (rec "gate.app/dead" '()))))
+  (hc-mark-spliced! #f "gate.app" "walker")
+  (let-values (((core-strs app-strs drop-compiler?) (dce-shake '() app "gate.app/-main")))
+    (gate-check "spliced: a spliced resolve caller does not bail the shake" (and core-strs #t) #t)
+    (gate-check "spliced: the compiler image is dropped" drop-compiler? #t)
+    (gate-check "spliced: the entry and what it reaches are kept"
+                (and (member "(gate.app/-main)" app-strs) (member "(gate.app/live)" app-strs) #t) #t)
+    (gate-check "spliced: the spliced callee is kept for frame identity"
+                (and (member "(gate.app/walker)" app-strs) #t) #t)
+    (gate-check "spliced: what the kept callee names stays defined"
+                (and (member "(gate.app/named-by-walker)" app-strs) #t) #t)
+    (gate-check "spliced: an unreferenced def is still pruned"
+                (and (member "(gate.app/dead)" app-strs) #t) #f))
+  ;; the same graph with the walker genuinely reachable bails as before
+  (let-values (((core-strs app-strs drop-compiler?)
+                (dce-shake '() (cons (rec "gate.app/-main" '("gate.app/walker")) (cdr app)) "gate.app/-main")))
+    (gate-check "spliced: a reachable resolve caller still bails" core-strs #f)))
+
 (gate-summary "dce-refs")
