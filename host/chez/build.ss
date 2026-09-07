@@ -534,7 +534,7 @@
 ;; from disk (running from a source checkout). build-jolt embeds every runtime
 ;; .ss the manifest inlines, so `build` never touches the filesystem for them.
 (define (bld-source-string path)
-  (let ((emb (hashtable-ref embedded-resources path #f)))
+  (let ((emb (embedded-resource-ref path)))
     (cond ((string? emb) emb)
           ;; source embeds are UTF-8 bytevectors since the heap-size work —
           ;; missing this arm sent the standalone binary's `build` to disk for
@@ -560,12 +560,23 @@
 
 (define (bld-file-lines path) (bld-string-lines (bld-source-string path)))
 
+;; Build-time diagnostic. The runtime manifest carries one startup-profile mark
+;; per ENTRY, so "host/chez/rt.ss" is a single 64ms line hiding the ~40 files it
+;; transitively loads — enough to say the runtime is expensive, not enough to say
+;; which part. JOLT_PROFILE_INLINE=1 at BUILD time emits a mark after each inlined
+;; file, turning that one line into a per-file breakdown. Off by default: a
+;; shipped binary carries the coarse set, and each mark costs a statistics call.
+(define bld-profile-inline? (and (getenv "JOLT_PROFILE_INLINE") #t))
+
 ;; Emit one line to OUT, recursively inlining a `(load ...)` of a repo file.
 (define (bld-inline-line line out depth)
   (when (> depth 50) (error 'jolt-build "load nesting too deep"))
   (let ((p (bld-load-path line)))
     (if p
-        (for-each (lambda (l) (bld-inline-line l out (+ depth 1))) (bld-file-lines p))
+        (begin
+          (for-each (lambda (l) (bld-inline-line l out (+ depth 1))) (bld-file-lines p))
+          (when bld-profile-inline?
+            (bld-emit-startup-profile-mark! out (string-append "inlined " p))))
         (begin (put-string out line) (put-string out "\n")))))
 
 ;; Inline the runtime manifest, dispatching on the manifest tags. core-strs (the
@@ -1699,7 +1710,12 @@
               "(sa-gc-trip-bytes!\n"
               "  (let ((trip (getenv \"JOLT_GC_TRIP_BYTES\"))\n"
               "        (default (* 16 1024 1024)))\n"
-              "    (if trip (or (string->number trip) default) default)))\n"))
+              "    (if trip (or (string->number trip) default) default)))\n"
+              ;; and a heap ceiling, so a built app fails with an
+              ;; OutOfMemoryError carrying a stack rather than being SIGKILLed
+              ;; by the kernel with nothing to read. Same contract as jolt's own
+              ;; launcher and as the JVM's MaxRAMPercentage default.
+              "(jolt-install-heap-ceiling!)\n"))
           (put-string out "(scheme-start\n  (lambda args\n")
           (bld-emit-startup-profile-mark! out "scheme-start begin")
           ;; Shutdown hooks (`:shutdown` on a jolt.process, jolt.host/
@@ -2042,6 +2058,23 @@
               (if petite-only? '() (list scheme))
               (map cadr units)))
     (ei-mark! "make-boot-file")
+    ;; vfasl: the same win jolt's own boot gets (build-jolt.ss) — the kernel loads
+    ;; a prebuilt image straight into the static generation instead of walking a
+    ;; fasl stream and allocating, and Sbuild_heap's Scompact_heap then has far
+    ;; less to compact. Best effort: sa-vfasl-convert-file answers #f rather than
+    ;; raising, and the plain boot that is already on disk stays the payload.
+    ;;
+    ;; NOT when cross-compiling. Unlike build-with-cc and build-shared, which run
+    ;; their conversion inside the fresh-Chez compile script and so inherit the
+    ;; xpatch's retargeted constants, this one runs in THIS process — the host's.
+    ;; $fasl-to-vfasl lays the image out for a specific machine, so converting a
+    ;; target's boot with host constants would produce a broken binary. A cross
+    ;; build keeps the plain boot.
+    (unless (bld-cross?)
+      (let ((vboot (string-append boot ".vfasl")))
+        (when (sa-vfasl-convert-file boot vboot)
+          (set! boot vboot)
+          (ei-mark! "vfasl-convert"))))
     ;; The stub is the native launcher the boot is appended to. With no :static
     ;; natives it's the prebuilt one bundled in jolt (no cc needed); with :static
     ;; natives it's re-linked here from the bundled kernel + launcher source so the
@@ -2104,6 +2137,50 @@
         "-I'" builddir "' '" lc "' '" lk "' -o '" out-path "' "
         native-link " " (bld-link-libs))))))
 
+;; --- boot-image prefetch (cold start) ---------------------------------------
+;; A binary that embeds its boot as a C array hands Chez a pointer into .data — a
+;; private, file-backed mapping the kernel demand-pages 4KB at a time as
+;; Sbuild_heap walks it — and nothing tells the kernel that the whole multi-MB
+;; range is about to be read in order. A cold jolt run reads 19.1MB of its 27.8MB
+;; binary before it prints anything, nearly all of it this boot. MADV_WILLNEED
+;; over the range, issued BEFORE Sscheme_init, lets that read overlap kernel init
+;; and the runtime image's top levels instead of being scheduled fault by fault
+;; behind them.
+;;
+;; It is a hint, and it buys nothing measurable on storage that is already
+;; bandwidth-bound — the A/B is in the commit that added this. What it targets is
+;; the opposite regime, a page-in bound by latency rather than throughput.
+;; Advisory in every sense: nothing checks the result, no platform has to
+;; implement it, and a failure costs the speedup and nothing else. Shared by the
+;; three C-array boot sites — jolt's own main (build-jolt.ss), `jolt build`'s cc
+;; executable, and --library. The appended-boot stub reads its boot through an fd
+;; rather than a mapping and carries the fadvise-shaped equivalent itself
+;; (stub/launcher.c).
+(define (bld-boot-prefetch-defn)
+  (string-append
+    "#include <stddef.h>\n"
+    "#if defined(__linux__) || defined(__APPLE__)\n"
+    "#include <stdint.h>\n"
+    "#include <sys/mman.h>\n"
+    "#include <unistd.h>\n"
+    "static void jolt_prefetch_boot(const void *p, size_t n) {\n"
+    "  long pagesize = sysconf(_SC_PAGESIZE);\n"
+    "  uintptr_t start, base;\n"
+    "  if (pagesize <= 0 || n == 0) return;\n"
+    "  /* madvise wants a page boundary; the array rarely starts on one. */\n"
+    "  start = (uintptr_t)p;\n"
+    "  base = start & ~(uintptr_t)(pagesize - 1);\n"
+    "  madvise((void *)base, n + (size_t)(start - base), MADV_WILLNEED);\n"
+    "}\n"
+    "#else\n"
+    "static void jolt_prefetch_boot(const void *p, size_t n) { (void)p; (void)n; }\n"
+    "#endif\n"))
+
+;; The call: the first statement of main / jolt_library_init, so the readahead is
+;; already in flight for everything that follows it.
+(define (bld-boot-prefetch-call)
+  "  jolt_prefetch_boot(jolt_boot, (size_t)jolt_boot_len);\n")
+
 ;; --- legacy cc link (dev bin/jolt): fresh Chez compile + xxd + cc ------------
 (define (build-with-cc entry-ns out-path mode builddir flat-ss flat-so boot boot-h main-c native-link petite-only?)
   (display (string-append "jolt build: compiling " entry-ns " (" mode " mode)\n"))
@@ -2125,9 +2202,15 @@
           (if petite-only?
               ""
               (string-append (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "))
-          (ei-str-lit flat-so) ")\n"))
+          (ei-str-lit flat-so) ")\n"
+          ;; vfasl, in THIS script so a cross build gets the xpatch's retargeted
+          ;; constants the way make-boot-file above does — see build-jolt.ss.
+          "(vfasl-convert-file " (ei-str-lit boot) " "
+          (ei-str-lit (string-append boot ".vfasl")) " '())\n"))
       (close-port p))
     (bld-system (string-append bld-chez " --script '" cs "'")))
+  ;; the converted boot is what gets embedded
+  (set! boot (string-append boot ".vfasl"))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   ;; The xxd symbol is derived from the path; normalize to jolt_boot.
   (bld-system (string-append
@@ -2137,7 +2220,9 @@
     (put-string mc
       (string-append
         "#include \"scheme.h\"\n#include \"boot_data.h\"\n"
+        (bld-boot-prefetch-defn)
         "int main(int argc, char *argv[]) {\n"
+        (bld-boot-prefetch-call)
         "  Sscheme_init(0);\n"
         "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, jolt_boot_len);\n"
         "  Sbuild_heap(0, 0);\n"
@@ -2173,6 +2258,7 @@
     "#include \"scheme.h\"\n"
     "#include <string.h>\n"
     "#include \"boot_data.h\"\n"
+    (bld-boot-prefetch-defn)
     "/* jolt_set_lookup_addr is called from the built library's scheme-start\n"
     "   handler (registered via Sforeign_symbol after Sbuild_heap) to hand the\n"
     "   stub the Scheme lookup callable's address. */\n"
@@ -2181,6 +2267,7 @@
     "void* jolt_lookup(const char* name) { return jolt_lookup_fn ? jolt_lookup_fn(name) : 0; }\n"
     "int jolt_library_init(int argc, char** argv) {\n"
     "  if (!argv) argc = 0;  /* Sscheme_start reads argv[0..argc-1]; a NULL argv means no args */\n"
+    (bld-boot-prefetch-call)
     "  Sscheme_init(0);\n"
     "  Sregister_boot_file_bytes(\"jolt\", jolt_boot, (iptr)jolt_boot_len);\n"
     "  Sbuild_heap(0, 0);\n"
@@ -2216,9 +2303,13 @@
           "(make-boot-file " (ei-str-lit boot) " '()\n  "
           (ei-str-lit (string-append (bld-csv-dir) "/petite.boot")) "\n  "
           (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "
-          (ei-str-lit flat-so) ")\n"))
+          (ei-str-lit flat-so) ")\n"
+          ;; vfasl, as in build-with-cc and build-jolt.ss
+          "(vfasl-convert-file " (ei-str-lit boot) " "
+          (ei-str-lit (string-append boot ".vfasl")) " '())\n"))
       (close-port p))
     (bld-system (string-append bld-chez " --script '" cs "'")))
+  (set! boot (string-append boot ".vfasl"))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   (bld-system (string-append
     "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/unsigned char jolt_boot[]/; "

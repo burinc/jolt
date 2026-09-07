@@ -2027,6 +2027,25 @@
                      (str (munge-name (:name node)) "$jf" (let [n @*fnsrc-counter*]
                                                             (swap! *fnsrc-counter* inc) n))
                      (fnsrc-name)))
+        ;; --- fn identity -------------------------------------------------
+        ;; Chez shares ONE closure object across every evaluation of a lambda
+        ;; with no free variables, where Clojure allocates a fresh fn each time.
+        ;; Observable, and real code depends on the Clojure answer: malli keys a
+        ;; cache on validator closures (two :? branches collided, backtracking
+        ;; died, m/validate returned false), and jolt's own fn meta is keyed on
+        ;; the procedure, so with-meta leaked between unrelated fns.
+        ;;
+        ;; So such a lambda is given something to capture. Only a literal that is
+        ;; EVALUATED REPEATEDLY needs it: a def's direct init runs once, so its
+        ;; single shared instance is already the only one there will ever be, and
+        ;; two distinct fn forms never share with each other.
+        ;;
+        ;; :free-names absent means the analyzer did not compute it (a node a pass
+        ;; built), not that there are none — so absent is treated as "might be
+        ;; shared" and gets the capture. Wrong only in costing a fn that already
+        ;; allocated.
+        force-id? (and (not def-init?) (empty? (:free-names node)))
+        id-nm (when force-id? (fresh-label "_fnid$"))
         clauses (binding [*known-procs* (if self (conj *known-procs* self) *known-procs*)
                           *trace-site* (or qname self)
                           *trace-self* (cond-> #{} self (conj self) qname (conj qname))
@@ -2039,11 +2058,29 @@
                           *letrec-binders* #{}
                           *fnsrc-def-init?* false]
                   (mapv emit-arity-clause arities))
+        ;; The capture must stay LIVE. Chez removes a dead one and the sharing
+        ;; comes back — measured for a dead reference, a captured value used
+        ;; through begin, an assigned variable and a captured fresh pair, all of
+        ;; which went back to eq?. A branch on an assigned top-level cannot be
+        ;; folded, so the reference survives; jolt-fn-identity-probe is never
+        ;; true, so no arity's behaviour changes. Body stays in tail position.
+        clauses (if force-id?
+                  (mapv (fn [c]
+                          [(nth c 0)
+                           (str "(if jolt-fn-identity-probe " id-nm " " (nth c 1) ")")])
+                        clauses)
+                  clauses)
         lambda (if (= 1 (count clauses))
                  (let [c (first clauses)] (str "(lambda " (nth c 0) " " (nth c 1) ")"))
                  (str "(case-lambda "
                       (str/join " " (map (fn [c] (str "(" (nth c 0) " " (nth c 1) ")")) clauses))
                       ")"))
+        ;; Wrapping in a let keeps Chez's procedure naming — it looks through the
+        ;; let, so `#<procedure inner>` still reports, which the source registry
+        ;; and native backtrace frames depend on. Verified before relying on it.
+        lambda (if force-id?
+                 (str "(let ((" id-nm " jolt-fn-identity-seed)) " lambda ")")
+                 lambda)
         ;; A fn with a variadic arity records that arity's FIXED param count, so
         ;; jolt-apply can hand it a lazy rest instead of realizing the tail. The
         ;; count is recorded rather than read back from procedure-arity-mask,

@@ -45,18 +45,17 @@
     "vendor/grenadine-generated"))
 
 ;; True when `f` is a file owned by the Jolt runtime (compiler + stdlib) — either
-;; an embedded-resource key (string or bytevector value) or a path under one of
-;; ldr-install-roots.
+;; an embedded-resource key — eagerly registered, or carried by the source blob's
+;; index — or a path under one of ldr-install-roots.
 (define (ldr-install-file? f)
-  (let ((v (hashtable-ref embedded-resources f #f)))
-    (or (string? v) (bytevector? v)
-        (let loop ((roots ldr-install-roots))
-          (and (pair? roots)
-               (or (let ((root (car roots)))
-                     (and (>= (string-length f) (+ (string-length root) 1))
-                          (string=? (substring f 0 (string-length root)) root)
-                          (char=? (string-ref f (string-length root)) #\/)))
-                   (loop (cdr roots))))))))
+  (or (embedded-resource-has? f)
+      (let loop ((roots ldr-install-roots))
+        (and (pair? roots)
+             (or (let ((root (car roots)))
+                   (and (>= (string-length f) (+ (string-length root) 1))
+                        (string=? (substring f 0 (string-length root)) root)
+                        (char=? (string-ref f (string-length root)) #\/)))
+                 (loop (cdr roots)))))))
 
 ;; A Chez source string for the install roots list — "(list \"jolt-core\" \"stdlib\" \"vendor/fs/src\")".
 ;; Used by build templates so the literal stays in one place.
@@ -354,9 +353,7 @@
 ;; `require` resolves with no source on disk. The dev bin/jolt has an empty
 ;; source store, so the hashtable probes miss and it falls straight to disk.
 (define (resolve-on-roots rel)
-  (define (embedded-key? k)
-    (let ((v (hashtable-ref embedded-resources k #f)))
-      (or (string? v) (bytevector? v))))
+  (define (embedded-key? k) (embedded-resource-has? k))
   (define (on-roots roots)
     (let loop ((roots roots))
       (and (pair? roots)
@@ -386,7 +383,7 @@
 ;; a real path read off disk. Bytevector entries (the bundled boots/stub, and
 ;; source embeds stored as bytevectors to save heap) decode via utf8->string.
 (define (ldr-read-source path)
-  (let ((emb (hashtable-ref embedded-resources path #f)))
+  (let ((emb (embedded-resource-ref path)))
     (cond ((string? emb) emb)
           ((bytevector? emb) (utf8->string emb))
           (else (read-file-string path)))))

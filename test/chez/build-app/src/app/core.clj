@@ -51,6 +51,38 @@
                         (util/redef-fn)))
     (println "dyn:" (binding [util/*config* :bound]
                       util/*config*)))
+  ;; --fnid: closure identity in a BUILT binary. Chez returns ONE closure object
+  ;; for every evaluation of a lambda with no free variables, where Clojure
+  ;; allocates a fresh fn each time, so the back end gives such a lambda
+  ;; something to capture. This has to be asserted HERE and not only under
+  ;; `jolt -e`: the release default is --direct-link plus whole-program
+  ;; inference, which is exactly where a guard that survives the interpreter
+  ;; could still be optimized away. build-smoke runs it on the direct-linked
+  ;; build and on --no-direct-link.
+  (when (= (first args) "--fnid")
+    (let [mk (fn [] (fn [x] x))
+          f1 (mk)
+          f2 (mk)
+          cap (fn [n] (fn [] n))]
+      (println "fnid-same:" (identical? f1 f2))
+      (println "fnid-set:" (count (set [(mk) (mk)])))
+      (println "fnid-meta:" (pr-str [(meta (with-meta f1 {:t 1})) (meta f2)]))
+      (println "fnid-call:" ((mk) 7))
+      (println "fnid-cap:" (identical? (cap 1) (cap 1)))))
+  ;; --heap: the heap ceiling, in a BUILT binary. The install is emitted code in
+  ;; the app launcher (build.ss), which is a different site from jolt's own
+  ;; launcher, and only a built binary runs it — `jolt -e` proves nothing about
+  ;; this one. Reports the ceiling, and separately whether exceeding a low one
+  ;; arrives as a catchable OutOfMemoryError rather than a kernel SIGKILL.
+  (when (= (first args) "--heap")
+    (println "heap-max:" (.maxMemory (Runtime/getRuntime))))
+  (when (= (first args) "--heap-oom")
+    (println "heap-oom:"
+             (try
+               (loop [acc [] i 0]
+                 (if (> i 100000000) :never-tripped (recur (conj acc (object-array 256)) (inc i))))
+               (catch OutOfMemoryError _ :caught-oom)
+               (catch Throwable t (str "other:" (type t))))))
   ;; --doubledef: a var defined twice must answer the same through every call
   ;; path in the built binary, and the same as `jolt run` (jolt-rtjm). apply
   ;; defeats any direct-call folding, so the two lines exercise different doors

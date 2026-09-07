@@ -22,6 +22,34 @@
     ((_ (else e ...) c ...) (begin e ...))
     ((_ (req e ...) c ...) (cond-expand c ...))
     ((_) (if #f #f))))
+;; --- Clojure fn identity ----------------------------------------------------
+;; Chez returns THE SAME closure object for every evaluation of a lambda with no
+;; free variables — deliberate and documented ("avoiding even the cost of a cons";
+;; display closures carry one slot per free variable, so zero free variables means
+;; zero allocation and one shared static instance). R5RS allows it: eqv? on two
+;; procedures that behave identically is implementation-defined.
+;;
+;; Clojure does not allow it. (fn [x] x) evaluated twice yields two objects there,
+;; and real code depends on that: malli.impl.regex keys its parked-continuation
+;; cache on validator closures, so sharing made two distinct states collide, the
+;; :? fallback was never parked, backtracking died and m/validate answered false.
+;; jolt's own fn metadata is keyed on the procedure too, so with-meta on one
+;; non-capturing fn leaked its meta onto every other one.
+;;
+;; So the back end gives such a lambda one free variable to capture (emit-fn), and
+;; these are what it captures and tests. The capture has to stay LIVE or Chez
+;; removes it as dead and the sharing returns — every semantically-neutral form
+;; was measured doing exactly that — hence the branch on a probe rather than an
+;; unused binding.
+;;
+;; Both are ASSIGNED below, and that is load-bearing: Chez cannot constant-fold an
+;; assigned top-level, and folding either one would silently restore the bug.
+;; test/chez/corpus.edn pins the observable behaviour so it cannot regress quietly.
+(define jolt-fn-identity-seed 0)
+(define jolt-fn-identity-probe #f)
+(set! jolt-fn-identity-seed 1)
+(set! jolt-fn-identity-probe #f)
+
 (define %chez-error error)
 (define (error . args)
   (if (and (pair? args) (string? (car args)))
@@ -240,6 +268,143 @@
                    1)))                      ; never 0: callers size windows with it
         (set! cpu-count-cached n)
         n)))
+
+;; --- heap ceiling -----------------------------------------------------------
+;; The JVM always has one. MaxHeapSize defaults to 25% of physical RAM
+;; (MaxRAMPercentage), reads a container's limit rather than the host's
+;; (UseContainerSupport), and throws OutOfMemoryError rather than exceed it —
+;; measured on a 7.63GB machine: MaxHeapSize 1.91GB, InitialHeapSize 124MB.
+;;
+;; Chez has no equivalent. Nothing bounds the heap, so a workload that outgrows
+;; the machine is killed by the kernel: SIGKILL, no diagnostic, no stack, and an
+;; empty log because the kill denies the process a flush. That is the worst
+;; failure mode available, and diagnosing one instance of it (malli's conformance
+;; suite reaching 6.9GB on a 7GB machine) took a full session.
+;;
+;; So jolt takes the JVM's contract. collect-request-handler is where it lands:
+;; Chez calls it when it wants a collection, and its default is
+;; (lambda () (collect)), which chooses a generation on its own schedule and
+;; SKIPS the maximum generation unless live has doubled since the last one
+;; (collect-maximum-generation-threshold-factor, default 2). Under memory
+;; pressure that deferral is precisely wrong, so:
+;;   - below the soft mark: delegate to (collect), behaviour and cost unchanged
+;;   - above it: force the max-generation collection the schedule would defer
+;;   - still above the ceiling after that: raise
+;;
+;; The message opens with "out of memory" deliberately: host-faults.ss maps that
+;; to java.lang.OutOfMemoryError, so (catch OutOfMemoryError e …) works the way
+;; it does on the JVM instead of the error arriving as something unrecognised.
+;;
+;; JOLT_MAX_HEAP overrides the default the way -Xmx does: an integer of bytes
+;; with an optional k/m/g suffix, or 0/off/none for unbounded, which is the
+;; behaviour every release before 0.8.5 had.
+(define heap-sysconf (jolt-foreign-proc-safe "sysconf" '(int) 'long))
+;; A plausible physical-memory reading: at least 128MB, under 16TB. Anything
+;; outside that is a failed syscall or a constant that means something else on
+;; this platform, and the caller falls through to the next source.
+(define (heap-bytes-sane n)
+  (and n (exact? n) (> n (* 128 1024 1024)) (< n (* 16 1024 1024 1024 1024)) n))
+;; (_SC_PAGESIZE . _SC_PHYS_PAGES) per platform — 30/85 on glibc, 29/200 on
+;; Darwin. Tried in turn and sanity-checked, exactly as cpu-count-from-sysconf
+;; does for _SC_NPROCESSORS_ONLN.
+(define (heap-phys-from-sysconf)
+  (and heap-sysconf
+       (guard (e (#t #f))
+         (let try ((pairs '((30 . 85) (29 . 200))))
+           (and (pair? pairs)
+                (let ((ps (heap-sysconf (caar pairs)))
+                      (np (heap-sysconf (cdar pairs))))
+                  (or (and (exact? ps) (exact? np) (> ps 0) (> np 0)
+                           (heap-bytes-sane (* ps np)))
+                      (try (cdr pairs)))))))))
+;; A cgroup memory limit, which is what the JVM's container support reads: v2
+;; first, then v1. "max" (v2) or an absurd sentinel (v1 uses a near-word-max
+;; value for "unlimited") both fall through as no limit.
+(define (heap-cgroup-limit)
+  (guard (e (#t #f))
+    (let loop ((fs '("/sys/fs/cgroup/memory.max"
+                     "/sys/fs/cgroup/memory/memory.limit_in_bytes")))
+      (and (pair? fs)
+           (or (and (file-exists? (car fs))
+                    (let ((n (string->number
+                               (let* ((s (read-file-string (car fs)))
+                                      (t (if (string? s) s "")))
+                                 (let strip ((i 0))
+                                   (cond ((>= i (string-length t)) "")
+                                         ((char-numeric? (string-ref t i))
+                                          (let scan ((j i))
+                                            (if (and (< j (string-length t))
+                                                     (char-numeric? (string-ref t j)))
+                                                (scan (+ j 1))
+                                                (substring t i j))))
+                                         (else (strip (+ i 1))))))))) 
+                      (heap-bytes-sane n)))
+               (loop (cdr fs)))))))
+;; JOLT_MAX_HEAP: "2g", "512m", "1048576", "0"/"off"/"none". Returns bytes, the
+;; symbol 'off, or #f when unset/unparseable (fall back to the default).
+(define (heap-from-env)
+  (let ((v (getenv "JOLT_MAX_HEAP")))
+    (and v (> (string-length v) 0)
+         (let* ((t (string-downcase v))
+                (n (string-length t))
+                (last (string-ref t (- n 1)))
+                (mult (case last ((#\k) 1024) ((#\m) 1048576) ((#\g) 1073741824) (else 1)))
+                (digits (if (= mult 1) t (substring t 0 (- n 1))))
+                (num (string->number digits)))
+           (cond
+             ((member t '("0" "off" "none")) 'off)
+             ((and num (exact? num) (> num 0)) (* num mult))
+             (else #f))))))
+;; 25% of the smaller of physical RAM and any cgroup limit, matching
+;; MaxRAMPercentage. #f when neither can be read, which leaves jolt unbounded
+;; rather than guessing a ceiling that could break a working program.
+(define (heap-default-ceiling)
+  (let* ((phys (heap-phys-from-sysconf))
+         (cg (heap-cgroup-limit))
+         (base (cond ((and phys cg) (min phys cg)) (phys phys) (cg cg) (else #f))))
+    (and base (exact (floor (/ base 4))))))
+(define jolt-heap-ceiling-bytes #f)      ; #f until installed; #f = unbounded
+(define (jolt-heap-max-bytes) jolt-heap-ceiling-bytes)
+(define (jolt-install-heap-ceiling!)
+  (let* ((env (heap-from-env))
+         (ceiling (cond ((eq? env 'off) #f)
+                        ((and env (number? env)) env)
+                        (else (heap-default-ceiling)))))
+    ;; A ceiling under the runtime's own live heap cannot be satisfied: the
+    ;; program would raise before reaching its entry point, from inside
+    ;; namespace initialization, which reads as a mysterious failure rather
+    ;; than a bad setting. The JVM refuses the equivalent outright ("Too small
+    ;; maximum heap" for `java -Xmx1m`), so say so plainly and name a floor.
+    ;; Deliberately NOT worded "out of memory": this is a configuration error,
+    ;; and host-faults.ss would otherwise classify it as OutOfMemoryError.
+    (when (and ceiling (<= ceiling (sa-bytes-allocated)))
+      (error 'jolt
+             (string-append
+               "JOLT_MAX_HEAP is smaller than the runtime's own live heap: asked for "
+               (number->string ceiling) " bytes, already using "
+               (number->string (sa-bytes-allocated))
+               ". Give it at least twice that, or JOLT_MAX_HEAP=off for no ceiling.")))
+    (set! jolt-heap-ceiling-bytes ceiling)
+    ;; The hook itself is target-specific, so it goes through the adapter
+    ;; (sa-gc-install-ceiling!): this file is portable and the natives that hook
+    ;; collection are blocklisted here for exactly that reason. A target that
+    ;; cannot hook collection answers #f, and then jolt is unbounded as it was
+    ;; before 0.8.5 — so the ceiling is forgotten rather than reported, keeping
+    ;; Runtime.maxMemory honest.
+    (when ceiling
+      (unless (sa-gc-install-ceiling!
+                (exact (floor (* ceiling 3/4)))
+                ceiling
+                (lambda (live)
+                  (error 'jolt
+                         (string-append
+                           "out of memory: the heap ceiling of "
+                           (number->string ceiling)
+                           " bytes was exceeded (live "
+                           (number->string live)
+                           "). Raise or disable it with JOLT_MAX_HEAP=<n>[k|m|g] or "
+                           "JOLT_MAX_HEAP=off."))))
+        (set! jolt-heap-ceiling-bytes #f)))))
 
 (load "host/chez/collections.ss")
 (load "host/chez/seq.ss")
