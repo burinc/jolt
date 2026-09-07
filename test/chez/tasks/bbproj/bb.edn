@@ -15,6 +15,12 @@
   boom   {:doc "fail with 7" :task (shell "sh" "-c" "exit 7")}
   nested {:task (do (println "before") (run 'clean) (println "after"))}
   secret {:private true :task (println "secret")}
+  ;; babashka's other spelling of "helper, not an entry point": a leading dash.
+  ;; Hidden from the listing like :private, and runnable like it too.
+  -dash  {:doc "a dash-named helper" :task (println "dash ran")}
+  ;; a :doc that spans lines. The listing is one task per line, so only the
+  ;; first may reach it.
+  multi  {:doc "first line\nsecond line of the doc" :task (println "multi")}
   needs  {:requires ([bbproj.core :as c]) :task (println (c/hello))}
   helper {:requires ([helper]) :task (println (helper/help))}
   echo   {:task (shell "echo" "from-shell")}
