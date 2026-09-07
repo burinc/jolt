@@ -260,7 +260,7 @@
 ;; --- the shake: graph -> reachable -> bail check -> partition ----------------
 ;; edges: fqn -> refs (prunable defs only). roots: -main + the runtime-core roots +
 ;; every non-def form's refs.
-;; A callee the inline pass spliced is a ROOT even when nothing calls it any more.
+;; A callee the inline pass spliced is KEPT even when nothing calls it any more.
 ;; Splicing removes the last reference to a fn whose every call site was inlined,
 ;; so the graph walk below would prune its def -- and the def's record carries the
 ;; (jolt-register-source! …) that maps an inlined frame back to ns/name
@@ -268,11 +268,20 @@
 ;; unshaken build printed three (jolt-o13s). The kept def is bounded by the inline
 ;; budget, so the size this costs is small and the alternative is a trace that
 ;; silently loses frames the same build shows without --tree-shake.
+;;
+;; Kept, but not a ROOT of the bail scan. A spliced callee that no remaining
+;; reference reaches is code that never runs: its call sites are all copies now.
+;; Rooting it treated its references as reachable code, so a helper the inline
+;; pass had spliced — core.async's go-macro walkers, which call `resolve` while
+;; expanding a go body — bailed the shake of a program that never expands a go
+;; form. dce-build-graph therefore returns the spliced set apart from the roots:
+;; dce-shake closes over roots alone for the bail scan, and over roots plus the
+;; spliced set for what the binary keeps, so a kept callee's load-time var
+;; lookups still find every def they name.
 ;; inline-spliced-fqns is host-contract.ss; loaded well before build.ss loads this.
 (define (dce-build-graph records entry-main)
   (let ((edges (make-hashtable string-hash string=?))
-        (roots (append (inline-spliced-fqns)
-                       (dce-data-reader-roots)
+        (roots (append (dce-data-reader-roots)
                        (cons entry-main dce-runtime-core-roots))))
     (for-each (lambda (r)
                 (if (dce-rec-keep? r)
@@ -281,7 +290,7 @@
                       (lambda (old) (append (dce-rec-refs r) old))
                       '())))
               records)
-    (values edges roots)))
+    (values edges roots (inline-spliced-fqns))))
 
 ;; Closure of roots over edges -> a reached set (hashtable fqn -> #t). The append
 ;; copies only the visited node's OWN edge list and shares (cdr work) — append
@@ -339,8 +348,14 @@
 ;; Returns (values core-strs app-strs drop-compiler?). core-strs is #f on a bail,
 ;; signalling "inline prelude.ss unshaken" + keep the compiler.
 (define (dce-shake core-records app-records entry-main)
-  (let-values (((edges roots) (dce-build-graph (append core-records app-records) entry-main)))
-    (let* ((reached (dce-reachable edges roots)))
+  (let-values (((edges roots spliced)
+                (dce-build-graph (append core-records app-records) entry-main)))
+    (let* ((reached (dce-reachable edges roots))
+           ;; what the binary keeps: the reachable code, plus the spliced
+           ;; callees kept for frame identity closed over what they reference
+           (kept (if (null? spliced)
+                     reached
+                     (dce-reachable edges (append spliced roots)))))
       (let-values (((bail why needs-compiler) (dce-bail-scan (append core-records app-records) reached)))
         (let ((drop-compiler? (and (not bail) (not needs-compiler))))
           (if bail
@@ -348,8 +363,8 @@
                 (display "jolt build: tree-shake skipped (reachable code resolves vars at runtime):\n")
                 (for-each (lambda (w) (display (string-append "  " (car w) " -> " (cdr w) "\n"))) why)
                 (values #f (map dce-rec-str app-records) drop-compiler?))
-              (let-values (((core-strs cn ck) (dce-partition core-records reached))
-                           ((app-strs an ak) (dce-partition app-records reached)))
+              (let-values (((core-strs cn ck) (dce-partition core-records kept))
+                           ((app-strs an ak) (dce-partition app-records kept)))
                 (display (string-append "jolt build: tree-shake kept " (number->string (+ ck ak))
                                         " of " (number->string (+ cn an)) " defs (core "
                                         (number->string ck) "/" (number->string cn) ")\n"))
