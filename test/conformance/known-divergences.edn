@@ -974,6 +974,40 @@
            :jvm ":threw"
            :jolt "\"([&form])\""}
    :note "[&form &env] and longer elide on both; that is pinned in the corpus (defn / implicit macro params)."}
+  ;; A byte array's store narrows an out-of-range integer the way Byte.byteValue()
+  ;; does. On the JVM only the CONSTRUCTOR narrows — (byte-array [200]) is -56 on
+  ;; both runtimes, Numbers.byte_array calls byteValue — while aset goes through
+  ;; RT.aset(byte[], int, byte), whose byte parameter the Reflector only accepts a
+  ;; Byte for; a Long, hinted or not, is "No matching method aset found taking 3
+  ;; args". jolt has one exact-integer type (:integer-box-model) and so cannot tell
+  ;; a Byte from a Long at the store; it applies the byteValue narrowing there too,
+  ;; in na-byte-of, the one place a value entering a byte array is narrowed. Every
+  ;; door in agrees — into-array, Arrays/fill, the untyped aset, and the hinted
+  ;; (aset ^bytes …) store jolt-baset, which falls back to that seam for anything
+  ;; but an in-range fixnum. test/chez/array-backing-test.ss pins the contract
+  ;; value for value; this entry records that the JVM does not share it. jolt-8eef.
+  {:category :permissive
+   :behavior "(aset (byte-array 2) 0 200) — an integer outside -128..127 stored into a byte array"
+   :jvm "throws IllegalArgumentException (No matching method aset found taking 3 args); same for (aset ^bytes a i (long 200))"
+   :jolt "stores the low 8 bits sign-folded, as Byte.byteValue() and (byte-array [200]) do: 200 -> -56, -129 -> 127"
+   :check {:expr "(let [a (byte-array 2)] (aset a 0 200) (aset a 1 -129) (vec a))"
+           :jvm "throws IllegalArgumentException"
+           :jolt "[-56 127]"}
+   :note "(byte 200) still throws on both — the CAST is checked, the byte-array STORE narrows. Portable code passes (byte v) or (unchecked-byte v) to aset and behaves identically here."}
+  ;; A flonum reaching an array store: jolt floors a non-integer INDEX (na-idx, for
+  ;; every array kind) and, for a byte array, truncates the VALUE toward zero before
+  ;; narrowing it (na-byte-of, the JVM's d2i then byteValue). The JVM's Reflector
+  ;; matches neither: int and byte parameters take no Double. Same seam and same
+  ;; reason as the row above; listed separately because the index half is not
+  ;; byte-specific.
+  {:category :permissive
+   :behavior "(aset (byte-array 3) 1.7 -1.9) — a flonum index and a flonum value at a byte-array store"
+   :jvm "throws IllegalArgumentException (No matching method aset found taking 3 args)"
+   :jolt "index floors to 1, value truncates toward zero to -1 and narrows: [0 -1 0]"
+   :check {:expr "(let [a (byte-array 3)] (aset a 1.7 -1.9) (vec a))"
+           :jvm "throws IllegalArgumentException"
+           :jolt "[0 -1 0]"}
+   :note "(aget a 1.7) floors the same way on jolt. The truncation is toward zero, not floor: (aset a 0 -1.9) stores -1, matching what (byte-array [-1.9]) builds on both runtimes."}
 ]
  :entries
  [;; Wherever a syntax-quote's CONSTRUCTION CODE becomes a value rather than
