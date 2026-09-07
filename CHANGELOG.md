@@ -60,6 +60,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A namespace-level `(defn double …)` owns the name, as it already did for
+  `(defn first …)`.** jolt has two layers that rewrite a `clojure.core` call into
+  something cheaper, and they disagreed about who owns a name. The op-registry
+  lowering resolves the head and checks the resolved var's namespace
+  (`backend_scheme/native-op`), so a user-defined `first` was always called. The
+  analyzer's numeric-cast and `*unchecked-math*` rewrites matched on the bare
+  source name behind a `shadowed` guard that only sees **locals** — so a
+  namespace-level definition, `:refer-clojure :exclude` or not, was silently
+  ignored in call position:
+
+  ```clojure
+  (ns shadow (:refer-clojure :exclude [double first]))
+  (defn double [x] :my-double)
+  (defn first  [x] :my-first)
+  (double 5)   ; jolt: 5.0        JVM Clojure: :my-double
+  (first [1 2]); jolt: :my-first  JVM Clojure: :my-first
+  ```
+
+  The same held for `long`/`int`/`float` (and `byte`/`short`, new above), and for
+  every name `*unchecked-math*` rewrites — a user's `+` became `unchecked-add`.
+  Both rewrites now ask the question the op-registry layer already asked, so the
+  two agree and all of it matches the reference. A `clojure.core/`-qualified head
+  names its namespace outright and still lowers, in the very namespace that
+  redefined the bare name.
+
+  Resolution happens only after a name AND arity have matched, so an ordinary
+  call — every other list head in the program — pays nothing for it, and the
+  numbers above are unchanged with the check in place.
+
 - **The tree-shake gate asserts how MUCH was shaken, and covers the
   spliced-callee bail class.** `make shakelocal` asked only for the string
   `tree-shake kept` in the build's report, so a regression that shook but kept
