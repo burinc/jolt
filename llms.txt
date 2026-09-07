@@ -67,6 +67,10 @@ and on a stale entry.
 - `jolt FILE [args]`: run a file; with a `#!/usr/bin/env jolt` first line and an
   exec bit it is a script (`./tool arg`). `-f FILE` when the name is also a
   command or a task. `make scriptsmoke` gates it.
+- `jolt completions zsh|bash|fish`: a shell completion function to source, so
+  `jolt <TAB>` offers jolt's commands and the project's tasks.
+  `jolt completions tasks` is the machine-readable listing it calls back for,
+  one `name<TAB>doc` per listable task. `make completionssmoke` gates it.
 - `make test`: the full gate. Individual gates: `corpus`, `unit`, `selfhost`,
   `smoke`, `sci`, `ffi`, `transient`, `certify`, `libconformance`.
 - `make remint`: re-mint the bootstrap seed to a byte-fixpoint. Required after
