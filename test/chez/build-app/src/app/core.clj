@@ -69,6 +69,20 @@
       (println "fnid-meta:" (pr-str [(meta (with-meta f1 {:t 1})) (meta f2)]))
       (println "fnid-call:" ((mk) 7))
       (println "fnid-cap:" (identical? (cap 1) (cap 1)))))
+  ;; --heap: the heap ceiling, in a BUILT binary. The install is emitted code in
+  ;; the app launcher (build.ss), which is a different site from jolt's own
+  ;; launcher, and only a built binary runs it — `jolt -e` proves nothing about
+  ;; this one. Reports the ceiling, and separately whether exceeding a low one
+  ;; arrives as a catchable OutOfMemoryError rather than a kernel SIGKILL.
+  (when (= (first args) "--heap")
+    (println "heap-max:" (.maxMemory (Runtime/getRuntime))))
+  (when (= (first args) "--heap-oom")
+    (println "heap-oom:"
+             (try
+               (loop [acc [] i 0]
+                 (if (> i 100000000) :never-tripped (recur (conj acc (object-array 256)) (inc i))))
+               (catch OutOfMemoryError _ :caught-oom)
+               (catch Throwable t (str "other:" (type t))))))
   ;; --doubledef: a var defined twice must answer the same through every call
   ;; path in the built binary, and the same as `jolt run` (jolt-rtjm). apply
   ;; defeats any direct-call folding, so the two lines exercise different doors

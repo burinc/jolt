@@ -237,6 +237,11 @@
   (let ((trip (getenv \"JOLT_GC_TRIP_BYTES\"))
         (default (* 16 1024 1024)))
     (if trip (or (string->number trip) default) default)))
+;; A heap ceiling, matching the JVM's MaxRAMPercentage default. Installed HERE
+;; and not at heap-build: it reads syscalls and the environment, both of which
+;; belong to the running process rather than the build.
+(jolt-install-heap-ceiling!)
+
 (scheme-start
   (lambda args
     (jolt-startup-profile-mark! \"heap built (scheme-start entered)\")
