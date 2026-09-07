@@ -284,7 +284,16 @@
 ;; the low 8 bits, fold the sign bit. na-bytearray->bv masks back to 0..255 at the
 ;; raw-byte seam, so the two carriers round-trip byte-exactly.
 (define (na-u8->byte b) (if (fx<? b 128) b (fx- b 256)))
-(define (na-byte-of v) (na-u8->byte (bitwise-and (exact (truncate v)) #xff)))
+;; The fixnum arm is the same answer by a shorter route, not a second rule: a
+;; fixnum IS its own (exact (truncate v)), so all that is left of the general
+;; case is the mask and the fold. Worth splitting because the general case spends
+;; three GENERIC (bignum-capable) operations to discover that — 14.5ns — and every
+;; door into a byte array comes through here: into-array, Arrays/fill,
+;; na-list->backing, and the untyped aset.
+(define (na-byte-of v)
+  (if (fixnum? v)
+      (na-u8->byte (fxand v #xff))
+      (na-u8->byte (bitwise-and (exact (truncate v)) #xff))))
 ;; Narrow a value being STORED into an array to its element kind. Only 'byte has a
 ;; range jolt must maintain (the u8 <-> s8 bridge above depends on it); the other
 ;; kinds hold whatever integer/flonum they are given, as they always have.
@@ -457,9 +466,12 @@
 ;; THE array write seam: the aset overlay, jolt-aset3, and any jolt.host/ref-put!
 ;; on an array all land here. Narrows the value to the element kind (na-elem-of) and
 ;; answers what was actually stored, so aset's return agrees with a following aget.
+;; The index takes the fixnum-first route jolt-vaget/jolt-flaget take: (exact
+;; (na-idx k)) on a fixnum is two procedure calls to answer k itself, 9ns of an
+;; untyped store.
 (define (na-array-set! a k v)
   (let ((sv (na-elem-of (jolt-array-kind a) v)))
-    (ja-set! a (exact (na-idx k)) sv) sv))
+    (ja-set! a (if (fixnum? k) k (exact (na-idx k))) sv) sv))
 (define %na-ref-put! jolt-ref-put!)
 (set! jolt-ref-put!
   (lambda (t k v)
@@ -509,10 +521,9 @@
 ;; fixnum, but a promoted array's is whatever integer was stored, so an element
 ;; is still not provably one and the numeric pass must not type it :long.
 ;;
-;; 'byte is deliberately NOT a write target here. A byte array's elements are
-;; signed 8-bit and na-elem-of is the one place a value entering one is narrowed;
-;; routing a write around it would let a byte array hold 200 — and the bytevector
-;; backing would refuse it outright. Reads are fine — the narrowing already
+;; 'byte reads here but writes through jolt-baset below: its elements are signed
+;; 8-bit, and a store has to narrow to that range and answer what it stored,
+;; neither of which this pair does. Reads need neither — the narrowing already
 ;; happened at the store.
 ;;
 ;; The unboxed backings need no index pre-check: their own range check IS the
@@ -545,6 +556,38 @@
             (vector-set! bk j v)
             (na-oob-throw j (vector-length bk))))
     v))
+
+;; (aset ^bytes a i v) — the byte kind's own store target, split from jolt-vaset
+;; rather than folded into it because a byte array is the one kind whose store
+;; NARROWS: na-elem-of folds the value to signed 8 bits and na-array-set! answers
+;; what was actually stored, so a helper that returned its argument the way
+;; jolt-vaset does would disagree with the following aget.
+;;
+;; What it skips is the generic seam's walk to the same bytevector-s8-set!:
+;; jolt-aset3's array test, the kind read and the eq? on it, na-byte-of's
+;; truncate/exact/bitwise-and over the numeric tower, the index coercion, then
+;; ja-set!'s SECOND read of the backing, ja-check, and a four-way cond — ~34ns of
+;; a 40ns store, against 7ns here.
+;;
+;; The guard is the whole contract. A fixnum already inside -128..127 is what
+;; na-byte-of answers for it (mask to 0..255, fold the high half back), so storing
+;; it directly is the same value by a shorter route. Everything else — a flonum, a
+;; bignum, a value out of range, a non-fixnum index, a byte array whose backing an
+;; older image left boxed, and a LYING ^bytes hint on an array of any other kind —
+;; falls to na-array-set!. That fallback is not a slow path bolted on for this
+;; helper; it is the generic seam every unhinted aset takes, which is why the
+;; narrowing contract here is exactly the one it has always had.
+;;
+;; No index pre-check: bytevector-s8-set!'s own range check IS the array bounds
+;; contract here, as on the ^longs and ^doubles paths, and host-faults.ss already
+;; classifies a bytevector-s8-set! condition as an ArrayIndexOutOfBoundsException.
+;; A non-array receiver raises out of jolt-array-vec, exactly as it does for
+;; jolt-vaget/jolt-vaset.
+(define (jolt-baset a i v)
+  (let ((bk (jolt-array-vec a)))
+    (if (and (bytevector? bk) (fixnum? i) (fixnum? v) (fx<=? -128 v 127))
+        (begin (bytevector-s8-set! bk i v) v)
+        (na-array-set! a i v))))
 
 ;; A range condition escaping jolt-flaget/jolt-flaset IS the array bounds error
 ;; on the proven ^doubles path (a typed pre-check there costs ~1ns/access, ~11%

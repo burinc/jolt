@@ -2551,6 +2551,10 @@
       ;; skipping jolt-nth's dispatch walk, which the call already gets.
       (:v-aget node) (order-args (fn [as] (str "(jolt-vaget " (str/join " " as) ")")))
       (:v-aset node) (order-args (fn [as] (str "(jolt-vaset " (str/join " " as) ")")))
+      ;; (aset ^bytes a i v): the store's own helper, because the byte kind narrows
+      ;; to signed 8 bits and must answer what it stored — jolt-vaset answers its
+      ;; argument. No inline form: there is nothing to unbox on the way out.
+      (:b-aset node) (order-args (fn [as] (str "(jolt-baset " (str/join " " as) ")")))
       (:fl-op node) (order-args (fn [as] (str "(" (:fl-op node) " " (str/join " " as) ")")))
       ;; the integer twin of :fl-op — a java.lang.Math member over proven fixnum
       ;; operands, lowered to its jolt-l-* macro (jolt.passes.numeric math-lng-ops).

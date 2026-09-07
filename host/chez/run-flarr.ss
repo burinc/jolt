@@ -6,6 +6,10 @@
 ;; mirrors it: a proven index AND a :double value inline (flvector-set! ... v),
 ;; returning the stored value (JVM contract); an int value keeps (jolt-flaset ...)
 ;; (it owns exact->inexact). Covers both ^doubles PARAMS and ^doubles LET bindings.
+;;
+;; The tail of the file gates the OTHER primitive kinds' accesses: the direct
+;; backing read (jolt-vaget) they share, and the byte store's own helper
+;; (jolt-baset), which exists because that kind narrows at the store.
 (import (chezscheme))
 (load "host/chez/run-gate-harness.ss")
 (define analyze (var-deref "jolt.analyzer" "analyze"))
@@ -65,6 +69,33 @@
   (gate-check "(5a-let) aset on a ^doubles LET binding keeps the accessor" (gate-sub? e "(flvector-set! (jolt-array-vec") #t))
 (let ((e (emit-num "(def _ (fn [^doubles a ^long i] (aset a i 4)))")))
   (gate-check "(5b) aset ^doubles,int val keeps jolt-flaset (exact->inexact)" (gate-sub? e "jolt-flaset") #t))
+
+;; --- the other primitive kinds: the direct backing read, and the byte STORE ----
+;; ^longs/^ints/^bytes/^objects have no flvector to unbox, so their win is
+;; skipping jolt-nth's dispatch walk (jolt-vaget) and jolt-aset3's generic seam.
+;; The byte kind is the one that stores through its OWN helper: it narrows to
+;; signed 8 bits and must answer what it stored, which jolt-vaset (answering its
+;; argument) cannot do. Before jolt-baset existed the hint bought a byte store
+;; nothing — it emitted the same jolt-aset3 an unhinted one does.
+(let ((e (emit-num "(def _ (fn [^bytes a ^long i] (aset a i 7)))")))
+  (gate-check "(7) aset ^bytes -> jolt-baset" (gate-sub? e "(jolt-baset a i") #t)
+  (gate-check "(7) ...NOT the generic jolt-aset3" (gate-sub? e "jolt-aset3") #f)
+  (gate-check "(7) ...NOT jolt-vaset, which would answer the un-narrowed value" (gate-sub? e "jolt-vaset") #f))
+(let ((e (emit-num "(def _ (fn [^bytes a ^long i] (aget a i)))")))
+  (gate-check "(7a) aget ^bytes stays the direct backing read" (gate-sub? e "jolt-vaget") #t))
+(let ((e (emit-num "(def _ (fn [^longs a ^long i] (aset a i 7)))")))
+  (gate-check "(7b) aset ^longs keeps jolt-vaset" (gate-sub? e "jolt-vaset") #t)
+  (gate-check "(7b) ...and does not take the byte helper" (gate-sub? e "jolt-baset") #f))
+(let ((e (emit-num "(def _ (fn [^objects a ^long i] (aset a i 7)))")))
+  (gate-check "(7c) aset ^objects keeps jolt-vaset" (gate-sub? e "jolt-vaset") #t))
+(let ((e (emit-num "(def _ (fn [a i] (aset a i 7)))")))
+  (gate-check "(7d) an UNHINTED aset is untouched — still jolt-aset3" (gate-sub? e "jolt-aset3") #t)
+  (gate-check "(7d) ...and never the byte helper" (gate-sub? e "jolt-baset") #f))
+;; the bfill loop as it is actually written: the cast and the store are both
+;; direct calls now, so nothing in the body goes through a var.
+(let ((e (emit-num "(def _ (fn [^bytes a ^long n] (loop [i 0] (when (< i n) (aset a i (byte (bit-and i 127))) (recur (inc i))))))")))
+  (gate-check "(7e) a byte-fill loop is jolt-baset over jolt-byte-cast" (gate-sub? e "(jolt-baset a i (jolt-byte-cast") #t)
+  (gate-check "(7e) ...with no var-deref invoke left in it" (gate-sub? e "jolt-invoke1") #f))
 
 ;; --- runtime value semantics of jolt-flaget/jolt-flaset ---------------------------
 ;; Pin both index paths: the fixnum fast path (the hot case — loop counters are
