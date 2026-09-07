@@ -288,7 +288,14 @@
   {:name "data.zip"
    :paths ["src/main/clojure" "src/test/clojure"]
    :test-paths ["src/test/clojure"]
-   :deps ["~xml/src"]
+   ;; :local-deps, not :deps ["~xml/src"] — the xml library needs its OWN
+   ;; deps.edn read, not just its source on the path. That deps.edn is where the
+   ;; :jolt/native spec for libxml2 lives, and jolt.xml's defcfns bind
+   ;; xmlReaderForMemory at namespace load, so with only the source path the
+   ;; suite died with `foreign-procedure: no entry for "xmlReaderForMemory"` —
+   ;; the library was never dlopen'd because nothing had declared it. Every
+   ;; other first-party sibling here is pulled in this way for the same reason.
+   :local-deps ["~xml"]
    :expect {:tests 9 :pass 12 :fail 0 :error 0}}
 
   {:name "yamlstar"
