@@ -14,12 +14,12 @@
 ;; boxed vector of small integers, this whole bench runs 49x faster (13150.9ms ->
 ;; 270.6ms through ci/bench-gate.sh; the per-phase split is in README.md).
 ;;
-;; The element-access phase is here for the two halves of a hinted ^bytes access,
-;; which pull in opposite directions: (aget ^bytes a i) lowers to the direct
-;; backing read (jolt-vaget, skipping the generic nth dispatch walk), while
-;; (aset ^bytes a i v) deliberately stays on the generic path, because the store
-;; has to narrow its value to signed 8 bits. A codegen round that moves either one
-;; lands here.
+;; The element-access phase is here for the two halves of a hinted ^bytes access:
+;; (aget ^bytes a i) lowers to the direct backing read (jolt-vaget, skipping the
+;; generic nth dispatch walk) and (aset ^bytes a i v) to jolt-baset, which owns
+;; the narrowing to signed 8 bits that a byte store has to do. The fill line also
+;; carries (byte v), a checked cast that lowers to jolt-byte-cast rather than
+;; going through a var. A codegen round that moves any of the three lands here.
 ;;
 ;; No unhinted twin: the generic (aget a i) / (aset a i v) dispatch walk is already
 ;; covered by `arrays-unhinted`, and it is the same walk for every element kind.

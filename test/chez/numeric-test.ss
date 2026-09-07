@@ -325,6 +325,25 @@
 ;; a clojure.core-qualified cast (from syntax-quote) also specializes.
 (let ((e (emitf "u" "(fn* ([x] (* (clojure.core/double x) 2.0)))")))
   (ok "clojure.core/double operand lowers * to fl*" (has? e "(#3%fl*")))
+;; (byte x)/(short x) are casts to a RANGE, so their answer is a fixnum on every
+;; tower jolt has and they take the same :long kind `int` does. They were the two
+;; left out of the table, which cost a var-deref + jolt-invoke1 per call in the
+;; code that reaches for them most — a byte-filling loop.
+(let ((e (emitf "u" "(fn* ([x] (+ (byte x) 1)))")))
+  (ok "(byte x) operand lowers + to jolt-l+" (has? e "(jolt-l+"))
+  (ok "(byte x) lowers to jolt-byte-cast helper" (has? e "(jolt-byte-cast"))
+  (ok "(byte x) is NOT a var-deref call any more" (not (has? e "jolt-invoke1"))))
+(let ((e (emitf "u" "(fn* ([x] (+ (short x) 1)))")))
+  (ok "(short x) operand lowers + to jolt-l+" (has? e "(jolt-l+"))
+  (ok "(short x) lowers to jolt-short-cast helper" (has? e "(jolt-short-cast")))
+;; the bfill shape: the cast feeds the hinted byte store directly, no invoke between
+(let ((e (emitf "u" "(fn* ([^bytes a ^long i] (aset a i (byte (bit-and i 127)))))")))
+  (ok "(aset ^bytes a i (byte v)) is jolt-baset over jolt-byte-cast"
+      (has? e "(jolt-baset a i (jolt-byte-cast"))
+  (ok "...with no jolt-invoke1 left in the loop body" (not (has? e "jolt-invoke1"))))
+;; a shadowing local named `byte` does NOT trigger the cast, as for `double`.
+(let ((e (emitf "u" "(fn* ([byte] (+ (byte 5) 1)))")))
+  (ok "shadowing local `byte` does NOT lower to jolt-byte-cast" (not (has? e "(jolt-byte-cast"))))
 
 ;; --- cast runtime semantics (JVM-certified corpus rows) ---
 (ok "(double 5) => 5.0 flonum" (let ((r (ev "(double 5)"))) (and (flonum? r) (fl= r 5.0))))
@@ -340,6 +359,26 @@
 (ok "(long \"s\") throws" (guard (e (#t #t)) (ev "(long \"s\")") #f))
 (ok "(int 5.7) => 5" (= (ev "(int 5.7)") 5))
 (ok "(int -5.7) => -5" (= (ev "(int -5.7)") -5))
+;; byte/short keep clojure.core's checked-narrow semantics through the lowering:
+;; in range is the value, out of range is IllegalArgumentException (NOT a wrap),
+;; a flonum truncates toward zero and range-checks BEFORE truncating, and a char
+;; casts by code point. Each row is what JVM Clojure answers.
+(ok "(byte 7) => 7" (= (ev "(byte 7)") 7))
+(ok "(byte -128) / (byte 127) => the bounds"
+    (and (= (ev "(byte -128)") -128) (= (ev "(byte 127)") 127)))
+(ok "(byte 200) throws (out of range, not a wrap to -56)"
+    (guard (e (#t #t)) (ev "(byte 200)") #f))
+(ok "(byte 1.9) => 1 / (byte -1.9) => -1 (truncate toward zero)"
+    (and (= (ev "(byte 1.9)") 1) (= (ev "(byte -1.9)") -1)))
+(ok "(byte 127.000001) throws (range-checked before truncation)"
+    (guard (e (#t #t)) (ev "(byte 127.000001)") #f))
+(ok "(byte \\A) => 65 (code point)" (= (ev "(byte \\A)") 65))
+(ok "(byte :k) throws" (guard (e (#t #t)) (ev "(byte :k)") #f))
+(ok "(short 32767) => 32767" (= (ev "(short 32767)") 32767))
+(ok "(short 32768) throws" (guard (e (#t #t)) (ev "(short 32768)") #f))
+(ok "(+ (byte 5) 1) => 6" (= (ev "(+ (byte 5) 1)") 6))
+;; value position is still the var — only the CALL form lowers.
+(ok "byte in value position is still callable" (= (ev "(reduce + (mapv byte [1 2 3]))") 6))
 ;; a cast result composes with arithmetic at runtime.
 (ok "(* (double 3) 2.0) => 6.0" (fl= (ev "(* (double 3) 2.0)") 6.0))
 (ok "(+ (long 7.9) 1) => 8" (= (ev "(+ (long 7.9) 1)") 8))
@@ -362,6 +401,57 @@
 ;; the generic bigdec-aware jolt op, not the raw Chez op (de-opt to correct).
 (ok "(+ 1.5M x) with x untyped => 4.5M bigdec"
     (let ((r ((ev "(fn* ([x] (+ 1.5M x)))") 3))) (and (jbigdec? r) (jolt= r (ev "4.5M")))))
+
+;; --- who owns a name: a NAMESPACE-LEVEL def, not just a local -----------------
+;; `shadowed` in the analyzer sees only LOCALS, so it cannot answer this: a
+;; (defn double …) at the top of a namespace owns `double` in call position, with
+;; or without :refer-clojure :exclude, and rewriting such a call to a cast calls
+;; the wrong function. The op-registry lowering one layer down already resolves
+;; the head and tests the var's ns (backend_scheme/native-op), which is why a
+;; user-defined `first` always worked where a user-defined `double` did not.
+;; Both layers ask the same question now, and every row here is what JVM Clojure
+;; answers. Last in the file: it defs into its own ns, and *unchecked-math* is a
+;; process-wide compile-time read.
+(define (evns s ns) (jolt-compile-eval s ns))
+(define (emit-in ns str) (emitf ns str))
+(evns "(defn double [x] :mine)" "shadow-cast-ns")
+(evns "(defn byte [x] :mine)"   "shadow-cast-ns")
+(evns "(defn + [a b] :mine)"    "shadow-cast-ns")
+(let ((e (emit-in "shadow-cast-ns" "(fn* ([x] (* (double x) 2.0)))")))
+  (ok "an ns-level `double` does NOT lower to jolt-double" (not (has? e "(jolt-double")))
+  (ok "...so its operand does NOT lower * to fl* either" (not (has? e "(#3%fl*"))))
+(let ((e (emit-in "shadow-cast-ns" "(fn* ([x] (+ (byte x) 1)))")))
+  (ok "an ns-level `byte` does NOT lower to jolt-byte-cast" (not (has? e "(jolt-byte-cast"))))
+;; the same head written clojure.core-QUALIFIED names core's var outright and
+;; still lowers, in the very ns that redefined the bare name.
+(let ((e (emit-in "shadow-cast-ns" "(fn* ([x] (* (clojure.core/double x) 2.0)))")))
+  (ok "clojure.core/double still lowers where `double` was redefined" (has? e "(jolt-double")))
+;; and a ns that did NOT redefine it is untouched — the fast path is still there
+(let ((e (emit-in "u" "(fn* ([x] (* (double x) 2.0)))")))
+  (ok "core's `double` still lowers in an ordinary ns" (has? e "(jolt-double")))
+;; runtime: the ns-level def is the fn that actually runs
+(ok "an ns-level `double` is the fn that runs"
+    (jolt= (evns "(double 5)" "shadow-cast-ns") (keyword #f "mine")))
+(ok "an ns-level `byte` is the fn that runs"
+    (jolt= (evns "(byte 5)" "shadow-cast-ns") (keyword #f "mine")))
+(ok "core's cast still runs in an ordinary ns" (= 5.0 (ev "(double 5)")))
+;; The *unchecked-math* rewrite asks the same question — it turns (+ a b) into
+;; unchecked-add, just as wrong when `+` is the user's fn. Set the compile-time
+;; var directly (hc-unchecked-math? var-derefs it) and put it back after.
+(def-var! "clojure.core" "*unchecked-math*" #t)
+(let ((e (emit-in "shadow-cast-ns" "(fn* ([a b] (+ a b)))")))
+  ;; the rewrite's target is the unchecked-add native op (jolt-uncadd2); the
+  ;; user's `+` must stay an ordinary var call instead
+  (ok "an ns-level `+` is NOT rewritten to unchecked-add under *unchecked-math*"
+      (not (has? e "jolt-uncadd2")))
+  (ok "...it calls the ns's own + through its var"
+      (has? e "(var-deref \"shadow-cast-ns\" \"+\")")))
+(let ((e (emit-in "u" "(fn* ([a b] (+ a b)))")))
+  (ok "...while core's `+` still is" (has? e "jolt-uncadd2")))
+(def-var! "clojure.core" "*unchecked-math*" jolt-nil)
+(ok "an ns-level `+` is the fn that runs"
+    (jolt= (evns "(+ 1 2)" "shadow-cast-ns") (keyword #f "mine")))
+(ok "core's + still runs in an ordinary ns" (= 3 (ev "(+ 1 2)")))
 
 (printf "~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))
