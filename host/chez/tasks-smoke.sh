@@ -165,6 +165,19 @@ echo "$out" | grep -q "secret" \
   && check "tasks hides :private" "hidden" "shown" || check "tasks hides :private" "hidden" "hidden"
 echo "$out" | grep -q "^bare$" \
   && check "tasks lists a doc-less task" "yes" "yes" || check "tasks lists a doc-less task" "yes" "no"
+# A leading dash is babashka's other spelling of :private, and a bb.edn we read
+# may well use it. Hidden from the listing, but still runnable.
+echo "$out" | grep -q -- "-dash" \
+  && check "tasks hides a -dash name" "hidden" "shown" || check "tasks hides a -dash name" "hidden" "hidden"
+check "a -dash task still runs" "enter -dash
+dash ran
+leave -dash" "$(inbb "$BB" -dash)"
+# One task per line is the listing's whole shape: the second line of a docstring
+# would land in the name column and read as a task of its own.
+echo "$out" | grep -q "^multi *first line$" \
+  && check "tasks prints a doc's first line" "yes" "yes" || check "tasks prints a doc's first line" "yes" "no"
+echo "$out" | grep -q "second line of the doc" \
+  && check "tasks drops a doc's later lines" "dropped" "printed" || check "tasks drops a doc's later lines" "dropped" "dropped"
 
 # --- run <task> --------------------------------------------------------------
 

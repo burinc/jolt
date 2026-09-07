@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`jolt tasks` hides a task whose name starts with `-`.** `list-tasks!` is
+  babashka's listing, and babashka treats a leading dash the way it treats
+  `:private`: a helper another task calls, not an entry point someone picks off
+  a list. Jolt read the `:private` key and not the name, so a `bb.edn` using the
+  dash convention had its helpers listed. That file is one jolt reads directly,
+  so the convention arrives whether or not a jolt project would have chosen it.
+  Hiding is display only, here as in babashka: `jolt -dash` still runs the task.
+
+- **`jolt tasks` prints only the first line of a `:doc`.** The listing puts one
+  task on one line and aligns the docs into a column, so a docstring that spans
+  lines broke the shape it was being formatted into: the second line started at
+  column zero, in the name column, and read as a task of its own. Anything
+  parsing the listing for names picked it up as one. Babashka truncates for the
+  same reason.
+
 ## [0.8.4] - 2026-09-06
 
 A jolt file with `#!/usr/bin/env jolt` on its first line is an executable script:
