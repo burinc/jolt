@@ -1183,14 +1183,18 @@
         ;; The memory trio, over Chez's own heap accounting: current-memory-bytes
         ;; is what the collector has reserved from the OS (the JVM's totalMemory)
         ;; and bytes-allocated is what is live inside it, so free is the
-        ;; difference. maxMemory is unbounded here — Chez grows the heap on demand
-        ;; with no configured ceiling — and Long/MAX_VALUE is what the JVM reports
-        ;; for exactly that case. criterium reads all four for its report, and
-        ;; without them a benchmark namespace crashes rather than running.
+        ;; difference. criterium reads all four for its report, and without them a
+        ;; benchmark namespace crashes rather than running.
         (cons "totalMemory" (lambda (self) (->num (sa-total-memory-bytes))))
         (cons "freeMemory"
           (lambda (self) (->num (max 0 (- (sa-total-memory-bytes) (sa-bytes-allocated))))))
-        (cons "maxMemory" (lambda (self) (->num 9223372036854775807)))
+        ;; maxMemory is -Xmx on the JVM. jolt has a ceiling of its own now
+        ;; (rt.ss jolt-install-heap-ceiling!, 25% of RAM by default, the same
+        ;; share MaxRAMPercentage uses), so report that. Long/MAX_VALUE is still
+        ;; the answer under JOLT_MAX_HEAP=off, which is what unbounded means and
+        ;; what every release before 0.8.5 reported unconditionally.
+        (cons "maxMemory" (lambda (self)
+                            (->num (or (jolt-heap-max-bytes) 9223372036854775807))))
         ;; Runtime.gc routes to System/gc on the JVM, so it gets the same guarded
         ;; hint semantics — Chez's collect refuses while multiple threads are live,
         ;; and neither of these ever throws on the JVM.

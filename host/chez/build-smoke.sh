@@ -241,6 +241,47 @@ fi
 
 check_fnid "$out" "the direct-linked release build"
 
+# The heap ceiling, in a BUILT binary. jolt bounds its heap at 25% of RAM by
+# default, the share the JVM's MaxRAMPercentage uses, because Chez has no -Xmx
+# and an unbounded heap means the kernel kills the process with no diagnostic at
+# all. Asserted here and not only under `jolt -e`: the install is emitted into
+# the APP launcher (build.ss), a separate site from jolt's own, and only a built
+# binary runs it.
+echo "build smoke: heap ceiling (default / override / off / OutOfMemoryError)"
+heap_max() { cd / && "$out" --heap 2>&1 | sed -n 's/^heap-max: //p'; }
+# default: a real ceiling was computed, i.e. RAM detection worked in the binary
+hm_def="$(heap_max)"
+case "$hm_def" in
+  ''|*[!0-9]*) echo "  FAIL: default ceiling not numeric: '$hm_def'"; exit 1 ;;
+esac
+if [ "$hm_def" = "9223372036854775807" ] || [ "$hm_def" -le 0 ] 2>/dev/null; then
+  echo "  FAIL: no default heap ceiling in a built binary (got $hm_def)"; exit 1
+fi
+# an explicit override is honoured exactly
+hm_512="$(JOLT_MAX_HEAP=512m heap_max)"
+if [ "$hm_512" != "536870912" ]; then
+  echo "  FAIL: JOLT_MAX_HEAP=512m gave $hm_512, want 536870912"; exit 1
+fi
+# off restores the pre-0.8.5 unbounded contract
+hm_off="$(JOLT_MAX_HEAP=off heap_max)"
+if [ "$hm_off" != "9223372036854775807" ]; then
+  echo "  FAIL: JOLT_MAX_HEAP=off gave $hm_off, want Long/MAX_VALUE"; exit 1
+fi
+# and exceeding one is an error the program can catch, not a SIGKILL. 256m, not
+# something smaller: a built binary's own baseline live heap is ~83MB here, and a
+# ceiling under that cannot be satisfied at all (checked separately below).
+hm_oom="$(cd / && JOLT_MAX_HEAP=256m "$out" --heap-oom 2>&1 | sed -n 's/^heap-oom: //p')"
+if [ "$hm_oom" != ":caught-oom" ]; then
+  echo "  FAIL: exceeding a 256m ceiling gave '$hm_oom', want :caught-oom"; exit 1
+fi
+# a ceiling below the runtime's own live heap is rejected AS a bad setting, named
+# as such, rather than failing somewhere inside namespace initialization
+hm_low="$(cd / && JOLT_MAX_HEAP=16m "$out" --heap 2>&1 | head -2)"
+case "$hm_low" in
+  *"smaller than the runtime's own live heap"*) : ;;
+  *) echo "  FAIL: a 16m ceiling should be refused with a clear message, got: $hm_low"; exit 1 ;;
+esac
+
 # A NAMED inner fn inside a spliced callee (jolt-pzos). Two claims:
 #  - the alpha-rename the splicer applies for hygiene (step-boom -> step-boom__ilN)
 #    is a compiler artifact and must not reach the user;

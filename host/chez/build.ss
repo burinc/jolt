@@ -1710,7 +1710,12 @@
               "(sa-gc-trip-bytes!\n"
               "  (let ((trip (getenv \"JOLT_GC_TRIP_BYTES\"))\n"
               "        (default (* 16 1024 1024)))\n"
-              "    (if trip (or (string->number trip) default) default)))\n"))
+              "    (if trip (or (string->number trip) default) default)))\n"
+              ;; and a heap ceiling, so a built app fails with an
+              ;; OutOfMemoryError carrying a stack rather than being SIGKILLed
+              ;; by the kernel with nothing to read. Same contract as jolt's own
+              ;; launcher and as the JVM's MaxRAMPercentage default.
+              "(jolt-install-heap-ceiling!)\n"))
           (put-string out "(scheme-start\n  (lambda args\n")
           (bld-emit-startup-profile-mark! out "scheme-start begin")
           ;; Shutdown hooks (`:shutdown` on a jolt.process, jolt.host/
