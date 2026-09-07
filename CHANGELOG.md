@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`jolt completions SHELL` prints a shell completion function**, for zsh, bash
+  or fish. `jolt <TAB>` then offers jolt's own commands and the project's tasks,
+  and under zsh each task carries its `:doc` as the description. Install it with
+  `source <(jolt completions zsh)` in `~/.zshrc` after `compinit`, or save the
+  output as `_jolt` on `$fpath`; both work.
+
+  The split from babashka is deliberate and is about latency. babashka calls its
+  binary back on every TAB press to compute the candidates for the line so far,
+  which it can afford. Jolt cannot: its floor is the Chez runtime coming up,
+  about 0.22s whatever it is asked for, and `jolt version` costs the same as
+  `jolt tasks`. So the two halves are split by how often they change. jolt's own
+  commands and options change when the binary does, so they are baked into the
+  snippet when it is generated and cost a completing shell nothing afterwards. A
+  project's tasks change when its `deps.edn` or `bb.edn` changes, so the snippet
+  caches them against those two mtimes and calls back only when one moves. The
+  zsh path uses `zsh/stat` and `$(<file)` and so forks nothing at all: a warm
+  press measures 0.4ms, against 97ms for the `bb tasks` that babashka's own
+  documented completion runs every time.
+
+  `jolt completions tasks` is the callback, and is useful on its own: one line
+  per listable task, `name<TAB>doc`, which is the machine-readable form of the
+  listing that `jolt tasks` writes for a person. Both go through
+  `jolt.tasks/listable`, so what TAB offers and what `jolt tasks` shows cannot
+  drift apart on which tasks exist. They differ deliberately on one point: a
+  task sharing a built-in's name is offered only when it wins that name with
+  `:override-builtin`, since a description says what the word will do and for a
+  task that loses to a command the answer is the command.
+
+  `make completionssmoke` gates the lines, all three snippets (parsed by their
+  own shells), the bash function run against a project, and the zsh function's
+  candidates read back through a stubbed `_describe` — that last one because
+  bash has no description column, so a candidate carrying the WRONG description
+  is invisible to every other check here.
+
 ### Fixed
 
 - **`jolt tasks` hides a task whose name starts with `-`.** `list-tasks!` is
