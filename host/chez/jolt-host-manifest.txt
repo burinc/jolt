@@ -122,6 +122,7 @@ gc-real-nanos
 getenv
 host-class-name?
 host-intern!
+identity-hash
 image-add-after-restore-hook!
 image-add-before-dump-hook!
 image-dump-world!
