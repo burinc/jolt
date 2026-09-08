@@ -1108,35 +1108,57 @@ if [ "$got_split" != "$want" ] || [ "$got_split2" != "$want" ] || [ "$got_nospli
   exit 1
 fi
 
-# --no-vfasl / JOLT_NO_VFASL keeps the plain boot (jolt-lang/jolt#886): a vfasl
-# boot starts faster and takes more room, and an app whose download size matters
-# more can decline it. Both spellings, because the env var is the one a CI job
-# reaches for and it travels through a different path than the flag. Checked by
-# the artifact rather than by a message — a build that quietly converted anyway
-# is exactly the failure this flag exists to prevent — and then by RUNNING the
-# binary, since a plain-boot binary that does not boot is the other one.
-echo "build smoke: --no-vfasl keeps the plain boot"
-novfaslout="$(dirname "$out")/novfasl-bin"
-if ! JOLT_PWD="$app" "$joltabs" build -m app.core --no-vfasl -o "$novfaslout" >/dev/null 2>&1; then
-  echo "  FAIL: --no-vfasl build exited non-zero"; exit 1
+# --boot picks how the boot image is encoded (jolt-lang/jolt#886): `fast` (the
+# default) is vfasl+LZ4, `small` is vfasl+gzip, `plain` skips vfasl entirely.
+# --no-vfasl is the spelling the issue asked for and aliases `--boot plain`.
+#
+# Checked by the ARTIFACT, not by a message — a build that quietly converted
+# anyway is exactly the failure `plain` exists to prevent — then by the ordering
+# of the three binaries' sizes, which is what says the codec really changed and
+# not just the filename, and finally by RUNNING each, since a binary that does
+# not boot is the other failure.
+echo "build smoke: --boot fast|small|plain"
+smallout="$(dirname "$out")/small-boot-bin"
+plainout="$(dirname "$out")/plain-boot-bin"
+envplainout="$(dirname "$out")/envplain-boot-bin"
+if ! JOLT_PWD="$app" "$joltabs" build -m app.core --boot small -o "$smallout" >/dev/null 2>&1; then
+  echo "  FAIL: --boot small build exited non-zero"; exit 1
 fi
-[ -f "$novfaslout.build/jolt.boot.vfasl" ] && { echo "  FAIL: --no-vfasl still converted the boot"; exit 1; }
-envvfaslout="$(dirname "$out")/envnovfasl-bin"
-if ! JOLT_PWD="$app" JOLT_NO_VFASL=1 "$joltabs" build -m app.core -o "$envvfaslout" >/dev/null 2>&1; then
+[ -f "$smallout.build/jolt.boot.vfasl" ] || { echo "  FAIL: --boot small produced no vfasl boot"; exit 1; }
+if ! JOLT_PWD="$app" "$joltabs" build -m app.core --boot plain -o "$plainout" >/dev/null 2>&1; then
+  echo "  FAIL: --boot plain build exited non-zero"; exit 1
+fi
+[ -f "$plainout.build/jolt.boot.vfasl" ] && { echo "  FAIL: --boot plain still converted the boot"; exit 1; }
+# --no-vfasl and JOLT_NO_VFASL are aliases for `--boot plain`; the env var
+# travels a different path than the flag, so it gets its own build.
+if ! JOLT_PWD="$app" JOLT_NO_VFASL=1 "$joltabs" build -m app.core -o "$envplainout" >/dev/null 2>&1; then
   echo "  FAIL: JOLT_NO_VFASL build exited non-zero"; exit 1
 fi
-[ -f "$envvfaslout.build/jolt.boot.vfasl" ] && { echo "  FAIL: JOLT_NO_VFASL still converted the boot"; exit 1; }
-# and the default still does convert, or the two checks above pass for the wrong
-# reason the day something else stops emitting a vfasl boot at all.
+[ -f "$envplainout.build/jolt.boot.vfasl" ] && { echo "  FAIL: JOLT_NO_VFASL still converted the boot"; exit 1; }
+# the default still converts, or the `plain` checks above pass for the wrong
+# reason the day something stops emitting a vfasl boot at all.
 [ -f "$splitout.build/jolt.boot.vfasl" ] || { echo "  FAIL: the default build produced no vfasl boot"; exit 1; }
-got_novfasl="$(cd / && "$novfaslout" alpha bb ccc 2>&1)"
-got_envnovfasl="$(cd / && "$envvfaslout" alpha bb ccc 2>&1)"
-if [ "$got_novfasl" != "$want" ] || [ "$got_envnovfasl" != "$want" ]; then
-  echo "  FAIL: plain-boot binaries disagree with the reference output"
-  echo "--- want ---";     echo "$want"
-  echo "--- --no-vfasl ---";   echo "$got_novfasl"
-  echo "--- JOLT_NO_VFASL ---";echo "$got_envnovfasl"
+# A gzip image is a third smaller than either of the others; if `small` merely
+# fell back to the LZ4 default this ordering is what catches it.
+sz_small=$(wc -c < "$smallout"); sz_fast=$(wc -c < "$splitout"); sz_plain=$(wc -c < "$plainout")
+if [ "$sz_small" -ge "$sz_fast" ] || [ "$sz_small" -ge "$sz_plain" ]; then
+  echo "  FAIL: --boot small ($sz_small) is not smaller than fast ($sz_fast) and plain ($sz_plain)"
+  exit 1
+fi
+# a bad value is rejected rather than silently building the default
+if JOLT_PWD="$app" "$joltabs" build -m app.core --boot nope -o "$plainout.bad" >/dev/null 2>&1; then
+  echo "  FAIL: --boot nope was accepted"; exit 1
+fi
+got_small="$(cd / && "$smallout" alpha bb ccc 2>&1)"
+got_plain="$(cd / && "$plainout" alpha bb ccc 2>&1)"
+got_envplain="$(cd / && "$envplainout" alpha bb ccc 2>&1)"
+if [ "$got_small" != "$want" ] || [ "$got_plain" != "$want" ] || [ "$got_envplain" != "$want" ]; then
+  echo "  FAIL: --boot binaries disagree with the reference output"
+  echo "--- want ---";        echo "$want"
+  echo "--- small ---";       echo "$got_small"
+  echo "--- plain ---";       echo "$got_plain"
+  echo "--- JOLT_NO_VFASL ---"; echo "$got_envplain"
   exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + no-vfasl)"
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes)"

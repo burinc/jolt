@@ -60,33 +60,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`jolt build --no-vfasl` keeps the plain boot.** 0.8.5 converts the boot image
-  to vfasl in every build, and a vfasl boot is an image of the loaded heap — it
-  starts faster and takes more room. For an app whose download size is the number
-  that matters that is the wrong trade, and there was no way to decline it: an
-  iOS `--target tpb64l` build grew 7.6MB in the binary and about 5MB in the
-  compressed IPA (jolt-lang/jolt#886, reported with before/after numbers for both
-  simulator and device targets). `--no-vfasl`, `:jolt/build {:no-vfasl true}` in
-  `deps.edn`, or `JOLT_NO_VFASL=1` — the spelling a CI job can set without
-  editing the build command — all keep the boot 0.8.4 produced. It covers the
-  self-contained, cc-linked and `--library` paths; jolt's own boot is not a
-  `jolt build` and is unaffected.
+- **`jolt build --boot fast|small|plain` picks how the boot image is encoded.**
+  0.8.5 converts the boot to vfasl — an image of the loaded heap, which starts
+  fast and takes room — with no way to decline. For an app whose download size is
+  the number that matters that is the wrong trade: an iOS `--target tpb64l` build
+  grew 7.6MB in the binary and about 5MB in the compressed IPA
+  (jolt-lang/jolt#886, reported with before/after numbers for both simulator and
+  device targets).
 
-  Measure before reaching for it, because on the host build the size cost turns
-  out to be the *codec's*, not vfasl's. One image from the build smoke's app,
-  three boots:
+  The flag is ordered along the one curve those numbers sit on:
 
-  | boot | binary | warm start |
+  | `--boot` | boot image | for |
   |---|---|---|
-  | vfasl + LZ4 (the default) | 27.6MB | 0.26s |
-  | vfasl + gzip | 16.8MB | 0.44s |
-  | plain (`--no-vfasl`) | 26.0MB | 0.50s |
+  | `fast` (default) | vfasl, LZ4-compressed | the fastest start; today's behaviour, unchanged |
+  | `small` | vfasl, gzip-compressed | the smallest binary that still loads as an image |
+  | `plain` | no vfasl | the boot 0.8.4 produced |
 
-  A gzip-encoded vfasl boot is smaller than the plain boot *and* faster to load,
-  so on this app `--no-vfasl` is beaten on both axes by a codec jolt does not yet
-  let you ask for. The reporter's `tpb64l` build saw a far larger vfasl delta
-  than this one does, which is exactly why the flag ships as asked rather than
-  being argued out of; exposing the codec is tracked separately.
+  `:jolt/build {:boot :small}` in `deps.edn` and `JOLT_BOOT=small` do the same
+  thing — the environment variable being the spelling a CI job can set without
+  editing the build command. `--no-vfasl`, `:no-vfasl true` and `JOLT_NO_VFASL=1`
+  are the spelling #886 asked for and are kept as aliases for `--boot plain`.
+  Precedence is resolved in one place: flag, then `deps.edn`, then environment.
+  It covers the self-contained, cc-linked and `--library` paths; jolt's own boot
+  is not a `jolt build` and is unaffected.
+
+  **Reach for `small` before `plain`.** The size cost turns out to be mostly the
+  *codec's* rather than vfasl's, so for a jolt app `small` beats `plain` on both
+  axes at once — measured over two apps and two machine types, binary size and
+  warm start, against the plain boot as the baseline:
+
+  | app / target | `plain` | `fast` | `small` |
+  |---|---|---|---|
+  | hello, host `ta6le` | 25,919,203 · 495ms | +5.5% · 249ms | **−35.7% · 429ms** |
+  | build-app, host `ta6le` | 26,062,746 · 502ms | +5.8% · 250ms | **−35.5% · 434ms** |
+  | hello, target `tpb64l` | 24,873,035 | +5.8% | **−38.1%** |
+
+  On `tpb64l` — the target in #886 — `small` is 9.5MB *below* the plain boot the
+  report asked for, where the complaint was the default costing 7.6MB. `plain`
+  stays because a target that cannot vfasl at all still needs it, not because it
+  is the size answer.
+
+  Measure your own app rather than quoting those ratios: they are a property of
+  what is in the image, not of the machine. The same three encodings over Chez's
+  own boots, which carry no jolt runtime, cost `fast` +37% and gain `small` only
+  3–4%, with `small` there *slower* than `plain` — which is also why the #886
+  reporter saw +24% where a jolt app sees +6%.
+
+  (Portable-bytecode notes found on the way: plain `pb` cannot vfasl at all —
+  "cannot vfasl with unknown endianness" — so an endianness-pinned machine such
+  as `tpb64l` is required; and a `tpb64l` target pack whose kernel was built
+  without libffi produces a binary that aborts at startup, since jolt's runtime
+  uses `foreign-procedure`.)
 
 ### Fixed
 
