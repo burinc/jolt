@@ -56,7 +56,7 @@ portable threshold.
 | `transients` | bulk map/set building through the transient write path (`into`, `assoc!`/`conj!`, `dissoc!`/`disj!`, `zipmap`/`frequencies`/`group-by`), with a transient vector build as the control | editable-HAMT transient nodes, `persistent!` spine freeze | — |
 | `keyed-lookup` | scalar KEYS: hashing/comparing keywords, symbols and strings, and looking them up in SMALL maps; a symbol built per lookup, and a collection or keyword-local in head position | hash engine fast paths (`jolt-hasheq`/`jolt=2`), `symbol-t` khash, `jolt-invokeN` lookup shapes | honeysql `format-dsl` |
 | `hash-eq` | composite KEYS AND VALUES: repeat-hashing vectors/maps/sets/records/seqs, vector- record- and fn-keyed map and set lookups, and `=` on equal and unequal collections | per-instance hasheq caches, collection/record probes ahead of the eq and hash arm walks, hash fast-reject in `jolt-coll=?`, procedure identity hash | instaparse GLL msg-cache, honeysql |
-| `literals` | fixed per-call overhead in a library's inner fn: constant map/vector/set literals in the body (incl. quoted symbols), and `true?`/`false?`/`boolean?`/`identical?` | per-site constant hoisting (`hoist-const-per-site`), identity-based boolean predicates, inlined `identical?` | honeysql `format` loop |
+| `literals` | fixed per-call overhead in a library's inner fn: constant map/vector/set literals in the body (incl. quoted symbols), and `true?`/`false?`/`boolean?`/`identical?` | constant hoisting — per site for a collection literal, per source FORM for a quoted one (`hoist-const-for`, keyed like `Compiler.registerConstant`'s `IdentityHashMap`) — identity-based boolean predicates, inlined `identical?` | honeysql `format` loop |
 | `string-build` | `StringBuilder` appended to in a loop, and the transducer-over-`join` shape libraries render text with | proven-StringBuilder direct emission vs jhost method-table dispatch | honeysql `format-entity` |
 | `string-ops` | the ordinary String surface — `.indexOf`/`.startsWith`/`.substring`/`.toLowerCase` on hinted and inference-proven targets, `clojure.string` over already-string arguments, `.getName`/`.getNamespace` on a keyword | direct emission for proven-string and proven-keyword interop targets, `clojure.string/to-str` string fast path | honeysql, clojure.string |
 | `char-scan` | walking a string one code point at a time via `.charAt`, with the `int`/`long`/`unchecked-*` casts hinted Clojure puts around it, incl. a `case`-dispatched character state machine | numeric cast fast paths, `.charAt` on a proven string, `case` over small ints | honeysql `alphanumeric?` |
@@ -804,6 +804,43 @@ Linux, Intel i5-4278U): boot ~274ms, dispatch ~2ms, compile ~971ms for 400
 defns, run ~62ms for a 30M-iter loop — compilation is the dominant per-program
 cost, more so than on the previous M-series host (boot ~110ms, dispatch ~1ms,
 compile ~400ms, run ~120ms), which is not directly comparable to this row.
+
+## Compile throughput
+
+The rows above measure a program RUNNING. This one is jolt compiling, which is
+its own axis and had no numbers until 2026-09 — which is how a 14x per-form
+regression shipped through a green `make test` (see `test/compile_scaling_test.clj`).
+
+Two shapes, because they fail independently. Many small top-level forms is what
+an ordinary namespace is; many forms inside ONE top-level form is what a large
+`deftest` is, and it is where the cost concentrates: Chez's compile is quadratic
+in the size of one lexical scope, and jolt hands it a def's whole constant pool
+as one wrapping `let*`.
+
+| shape | jolt | Clojure 1.12.4 |
+|---|---|---|
+| 1000 small top-level forms (6001 lines) | 107.5s | 0.96s |
+| 500 `deftest` + `is`, separate forms | 1.7s | — |
+| 800 `is` inside ONE `deftest` | 4.9s | 0.19s |
+| `malli.core-test` (3699 lines, one 1837-line `deftest`) | 16.9s / 1.5GB | 1.3s |
+
+Measured 2026-09-08, aarch64 macOS, cold (`JOLT_AOT_CACHE=0`). `malli.core-test`
+was **154s / 5.3GB** before the constant pool was keyed by form identity the way
+`Compiler.registerConstant` keys its `IdentityHashMap`; halving a pool quarters a
+quadratic term. jolt's own phases are linear and are not the cost — for the
+800-`is` form they total 0.95s of the 10s that shape used to take, and the rest is
+Chez compiling one 1.2MB top-level form.
+
+What is left is jolt-wt6v: moving that def's 3214 constant bindings out of the
+`let*` and into top-level defines takes Chez from 3.95s to 0.12s on the same
+emitted file. That is what the reference compiler does — a constant there is a
+static field (`ObjExpr.emitConstant` → `getstatic`), with no lexical scope and no
+live range.
+
+`make compilescaling` guards both halves as ratios inside one process: 1x vs 4x
+input for the complexity class, and quoted-vs-constructed for the per-form
+constant. A ratio does not care how fast the machine is, which an absolute
+ms/form ceiling would.
 
 ## A/B against a change
 
