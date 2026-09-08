@@ -656,6 +656,8 @@
 (jch-register-supers! "java.nio.file.FileAlreadyExistsException" '("java.nio.file.FileSystemException"))
 (jch-register-supers! "java.nio.file.NoSuchFileException" '("java.nio.file.FileSystemException"))
 (jch-register-supers! "java.nio.file.AccessDeniedException" '("java.nio.file.FileSystemException"))
+(jch-register-supers! "java.nio.file.NotDirectoryException" '("java.nio.file.FileSystemException"))
+(jch-register-supers! "java.nio.file.NotLinkException" '("java.nio.file.FileSystemException"))
 (jch-register-supers! "java.nio.file.DirectoryNotEmptyException" '("java.nio.file.FileSystemException"))
 (jch-register-supers! "java.net.UnknownHostException" '("java.io.IOException"))
 (jch-register-supers! "java.net.SocketException" '("java.io.IOException"))
