@@ -35,11 +35,13 @@ condition-message
 cpu-nanos
 current-memory-bytes
 current-fiber
+ctx-for-ns
 deftype-ctor-class
 delete-file!
 delete-tree!
 directory?
 dispatch-macros
+embed-plan
 enable-trace!
 entry-at
 escape-fn?

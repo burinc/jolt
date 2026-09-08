@@ -894,6 +894,39 @@ if [ "$got_ord" != "ord: 42" ]; then
   echo "  FAIL: install-owned dep emitted after its caller — want 'ord: 42', got \`$got_ord\`"; exit 1
 fi
 
+# A live VALUE a macro put in its expansion has to reach the BINARY. jolt rebuilds
+# one as code rather than stashing it in a process-local table (jolt-l7tq), and
+# only a built binary proves that: a table would satisfy every in-process check
+# and then be empty in the app's own image. Both shapes here — a named fn, read
+# back through the var that roots it, and an anonymous literal with a real
+# capture, rebuilt from the source form and the captured value the fn-form
+# registry recorded.
+echo "build smoke: a macro-embedded live value reaches the binary"
+emb_app="$(mktemp -d)/emb-app"
+mkdir -p "$emb_app/src/ea"
+printf '{:paths ["src"]}\n' > "$emb_app/deps.edn"
+cat > "$emb_app/src/ea/lib.clj" <<'EMB_LIB_EOF'
+(ns ea.lib)
+(defmacro named-fn [] (deref #'clojure.core/memfn))
+(defn mk-adder [n] (fn [x] (+ x n)))
+(defmacro anon-fn [] (mk-adder 7))
+(def a (named-fn))
+(def b (anon-fn))
+EMB_LIB_EOF
+cat > "$emb_app/src/ea/core.clj" <<'EMB_EOF'
+(ns ea.core (:require [ea.lib :as lib]))
+(defn -main [& _] (println "emb:" (fn? lib/a) (lib/b 35)))
+EMB_EOF
+emb_out="$(dirname "$out")/emb-bin"
+if ! JOLT_PWD="$emb_app" "$jolt" build -m ea.core -o "$emb_out" >/dev/null 2>&1; then
+  echo "  FAIL: macro-embedded-value app build exited non-zero"; exit 1
+fi
+got_emb="$(cd / && "$emb_out" 2>&1)"
+rm -rf "$(dirname "$emb_app")"
+if [ "$got_emb" != "emb: true 42" ]; then
+  echo "  FAIL: embedded value did not reach the binary — want 'emb: true 42', got \`$got_emb\`"; exit 1
+fi
+
 # `build` behind a global option that re-dispatches the rest of the argv through
 # -main (-Sdeps '<edn>', -A:alias). The launcher has to load the build driver
 # before jolt.main runs and used to look for "build" at argv[0] only, so this
@@ -1184,4 +1217,4 @@ if [ "$got_small" != "$want" ] || [ "$got_plain" != "$want" ] || [ "$got_envplai
   exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes)"
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes)"

@@ -641,6 +641,23 @@
   ;; name is nil here where the symbol itself still evaluates syntactically.
   {:suite "ns" :expr "(nil? (resolve 'java.lang.module.ModuleFinder))" :expected "true"}
   {:suite "ns" :expr "(nil? (ns-resolve *ns* 'no.such.ClassXyz))" :expected "true"}
+  ;; A live value a macro puts in the form it returns is a CONSTANT, not a syntax
+  ;; error — Clojure falls through to ConstantExpr and jolt rebuilds it as code
+  ;; (jolt-l7tq). A named fn is read back through its var; an anonymous literal
+  ;; is rebuilt from the source form and captures the fn-form registry recorded.
+  {:suite "embedded-value" :expr "(do (defmacro ev-a [] (deref (var when))) (fn? (ev-a)))" :expected "true"}
+  {:suite "embedded-value" :expr "(do (defmacro ev-b [] (list (quote vector) inc 1)) (let [[f n] (ev-b)] [(fn? f) (f n)]))" :expected "[true 2]"}
+  {:suite "embedded-value" :expr "(do (defmacro ev-c [] `(vector ~(deref (var memfn)) :tag)) (count (ev-c)))" :expected "2"}
+  {:suite "embedded-value" :expr "(do (defn ev-mk [] (fn [x] (+ x 100))) (defmacro ev-d [] (ev-mk)) ((ev-d) 5))" :expected "105"}
+  {:suite "embedded-value" :expr "(do (defn ev-clo [n] (fn [x] (+ x n))) (defmacro ev-e [] (ev-clo 7)) ((ev-e) 5))" :expected "12"}
+  {:suite "embedded-value" :expr "(do (defmacro ev-f [] (list (quote quote) inc)) (fn? (ev-f)))" :expected "true"}
+  ;; ...and a value nothing can rebuild reports what it is, rather than
+  ;; \"Unsupported form\" at a line the user never wrote.
+  {:suite "embedded-value" :expr "(do (defmacro ev-g [] (java.lang.StringBuilder.)) (try (eval (quote (ev-g))) :no-throw (catch Throwable t (boolean (re-find #\"Cannot compile this value into code\" (or (.getMessage t) \"\"))))))" :expected "true"}
+  ;; ...and a capture cp0 folded away is a DIFFERENT refusal, named as such: the
+  ;; fn's source IS recorded, so \"no recorded source\" would be a lie about it.
+  {:suite "embedded-value" :expr "(do (defmacro ev-h [] (let [n 7] (fn [x] (+ x n)))) (try (eval (quote (ev-h))) :no-throw (catch Throwable t (boolean (re-find #\"folded into the code\" (or (.getMessage t) \"\"))))))" :expected "true"}
+
   ;; the feature set is {:jolt :clj :default}. :bb is NOT in it: a library's :bb
   ;; branch is written for babashka's host model, not jolt's, and taking it sent
   ;; jolt at namespaces babashka supplies natively and jolt does not. :jolt wins

@@ -585,6 +585,61 @@
     ((proc-name-of x) 'fn-ref)
     (else (or (image-fnsrc-probe x) 'refuse))))
 
+;; --- the EMIT-side consumer of the verdict above -----------------------------
+;; A macro may put a live VALUE in the form it returns. Clojure's compiler falls
+;; through to ConstantExpr for anything it does not recognize, so this works
+;; there — verified on the 1.12.5 oracle, AOT included — and sci's copy-var does
+;; exactly it with a macro var's root, which is what jolt-l7tq is.
+;;
+;; jolt compiles to Scheme TEXT, so the value cannot simply be spelled: it has to
+;; be rendered as an expression that rebuilds it. That is the same problem the
+;; image writer solves, and this reads the same verdict rather than a second copy
+;; of the rules — the image scan side, the image dump side and the back end now
+;; agree by construction about which fns can be rebuilt from source.
+;;
+;;   {:kind :var, :ns, :name}                  a named var-root fn or code value
+;;   {:kind :fnsrc, :form, :ns, :frees, :vals} a registered anon literal
+;;   nil                                       nothing to rebuild it from
+;;
+;; The free values come back LIVE (the identity walk), because the back end
+;; renders them itself — each one re-enters the analyzer and lands back here if
+;; it is opaque too. A capture the compiler const-folded away is unrecoverable
+;; and reported as nil, exactly as it is refused at dump.
+(define (image-embed-plan x)
+  (let ((v (image-proc-verdict x)))
+    (cond
+      ((eq? v 'refuse) jolt-nil)
+      ((eq? v 'fn-ref)
+       (let ((p (proc-name-of x)))
+         (if p
+             (jolt-hash-map (keyword #f "kind") (keyword #f "var")
+                            (keyword #f "ns") (car p)
+                            (keyword #f "name") (cdr p))
+             jolt-nil)))
+      ((pair? v)
+       (let* ((reg (cdr v))
+              (frees (vector-ref reg 2))
+              (fvs (image-recover-free-values x reg frees (vector-ref reg 3)
+                                              (lambda (val path) val) '())))
+         (cond
+           ((vector? fvs)
+            (jolt-hash-map (keyword #f "kind") (keyword #f "fnsrc")
+                           (keyword #f "form") (vector-ref reg 0)
+                           (keyword #f "ns") (vector-ref reg 1)
+                           (keyword #f "frees") frees
+                           (keyword #f "vals") (apply jolt-vector (vector->list fvs))))
+           ;; The source form still names a capture the compiled closure does not
+           ;; carry, because cp0 folded its value into the code. Say WHICH — the
+           ;; caller's message is the only place a reader learns that the fix is
+           ;; to stop closing over a constant, and "no recorded source" would be
+           ;; a plain lie about a fn whose source is recorded.
+           ((and (pair? fvs) (eq? (car fvs) 'image-folded))
+            (jolt-hash-map (keyword #f "kind") (keyword #f "folded")
+                           (keyword #f "name") (cdr fvs)))
+           (else jolt-nil))))
+      (else jolt-nil))))
+(def-var! "jolt.host" "embed-plan" image-embed-plan)
+
 ;; Recover the LIVE captured values, in REGISTERED free-name order, by munging
 ;; each original name and matching it against the inspector's munged names. A
 ;; registered name the inspector does not report (cp0 dropped a dead capture)

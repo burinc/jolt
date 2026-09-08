@@ -907,6 +907,12 @@
   (def-var! "jolt.host" "chez-number-literal" (lambda (n) (number->string n)))
   (def-var! "jolt.host" "form-special?" hc-special?)
   (def-var! "jolt.host" "compile-ns" hc-current-ns)
+  ;; A ctx for a DIFFERENT namespace than the one being compiled. The analyzer
+  ;; needs one to re-analyze a registered fn literal's SOURCE form in the ns it
+  ;; was compiled in (jolt-5n2p): its free symbols resolve there and not at the
+  ;; site the value was spliced into, which is the same reason the image restore
+  ;; path compiles its wrapper in (image-fnsrc-ns x).
+  (def-var! "jolt.host" "ctx-for-ns" (lambda (ns) (make-analyze-ctx ns)))
   (def-var! "jolt.host" "late-bind?" hc-late-bind?)
   (def-var! "jolt.host" "form-macro?" hc-macro?)
   (def-var! "jolt.host" "form-expand-1" hc-expand-1)
