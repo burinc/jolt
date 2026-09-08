@@ -819,7 +819,7 @@ as one wrapping `let*`.
 
 | shape | jolt | Clojure 1.12.4 |
 |---|---|---|
-| 1000 small top-level forms (6001 lines) | 107.5s | 0.96s |
+| 1000 small top-level forms (6001 lines) | 10.9s | 0.96s |
 | 500 `deftest` + `is`, separate forms | 1.7s | — |
 | 800 `is` inside ONE `deftest` | 4.9s | 0.19s |
 | `malli.core-test` (3699 lines, one 1837-line `deftest`) | 16.9s / 1.5GB | 1.3s |
@@ -827,9 +827,32 @@ as one wrapping `let*`.
 Measured 2026-09-08, aarch64 macOS, cold (`JOLT_AOT_CACHE=0`). `malli.core-test`
 was **154s / 5.3GB** before the constant pool was keyed by form identity the way
 `Compiler.registerConstant` keys its `IdentityHashMap`; halving a pool quarters a
-quadratic term. jolt's own phases are linear and are not the cost — for the
-800-`is` form they total 0.95s of the 10s that shape used to take, and the rest is
-Chez compiling one 1.2MB top-level form.
+quadratic term.
+
+Where the time goes, for the 1000-small-forms row (cumulative over the run):
+
+| | | |
+|---|---|---|
+| Chez generating native code | 5.7s | 51% |
+| jolt emit | 2.2s | 20% |
+| jolt analyze | 1.3s | 12% |
+| jolt passes | 0.5s | 4% |
+| require pre-scan | 0.006s | — |
+
+**The largest single difference from the reference is that Clojure does not
+generate native code here.** `Compiler.eval` builds bytecode with ASM and hands
+it to the JVM, which interprets it and JITs only what turns out to be hot; jolt
+asks Chez for optimized native code for every form at load. Chez's
+`optimize-level 0` does not help (5.87s against 5.82s), so it is code generation
+itself and not the optimizer.
+
+Two suspects that measurement RULES OUT. The text round trip is not the problem —
+reading the whole 8.5MB back is 0.12s of the 5.7s. And the require pre-scan, which
+has no counterpart in the reference, is 6ms.
+
+What is left is that jolt's own front end — 4.0s for these 1000 forms — is
+roughly four times Clojure's entire pipeline for the same file (0.96s). So even
+with Chez's half free, this row would still be ~4x.
 
 What is left is jolt-wt6v: moving that def's 3214 constant bindings out of the
 `let*` and into top-level defines takes Chez from 3.95s to 0.12s on the same
