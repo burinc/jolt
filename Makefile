@@ -164,7 +164,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   hasheq narrowhash \
   protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
@@ -419,6 +419,18 @@ errorkinds:
 # The IR schema validator (JOLT_IR_VALIDATE) reports no problems on real code.
 irvalidate:
 	@sh host/chez/ir-validate-smoke.sh
+
+# Every var the checked-in seed defines exists after the seed loads. The seed's
+# forms are emitted guard-wrapped so the MINT can skip one that fails to compile
+# (remint.sh fails on a nonzero skip count); the same guard is in the emitted
+# text, so it equally swallows a form that raises when the seed LOADS, and that
+# half went unchecked -- the var never appears and every read of the name gets
+# the truthy unbound sentinel (jolt#879). Run twice: the two compiler trace flags
+# are read in such defs, and each run pins them against its own environment, so
+# neither "always on" nor "always off" passes both arms.
+seeddefs:
+	@$(CHEZ) --script host/chez/run-seed-defs.ss
+	@JOLT_WP_TRACE=1 JOLT_IR_VALIDATE=1 $(CHEZ) --script host/chez/run-seed-defs.ss
 
 # The build-driving gates take testbin for the same reason smoke and cts do,
 # only more so: a `jolt build` costs ~2.5s through the prebuilt binary and
