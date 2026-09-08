@@ -738,6 +738,9 @@
                      ;; cross-compilation: --target <machine> [--target-pack <dir>]
                      (and (not end-opts?) (= "--target" cur))      (recur (drop 2 a) entry out (second a) tpack false)
                      (and (not end-opts?) (= "--target-pack" cur)) (recur (drop 2 a) entry out target (second a) false)
+                     ;; --boot takes a value; skip both so a bare `build --boot small`
+                     ;; does not read `small` as the entry namespace.
+                     (and (not end-opts?) (= "--boot" cur))        (recur (drop 2 a) entry out target tpack false)
                      (and (not end-opts?) (str/starts-with? cur "-")) (recur (rest a) entry out target tpack false)
                      :else                                   (recur (rest a) (or entry cur) out target tpack end-opts?))))
           entry (:entry opts)
@@ -780,6 +783,32 @@
             ;; tree-shaking (drop library code not reachable from -main): --tree-shake
             ;; or deps.edn :jolt/build {:tree-shake true}.
             tree-shake? (boolean (or (some #{"--tree-shake"} flag-args) (:tree-shake build)))
+            ;; how the boot image is encoded (jolt-lang/jolt#886), ordered from
+            ;; fastest-to-start to smallest-on-disk:
+            ;;   fast   vfasl + LZ4   the default
+            ;;   small  vfasl + gzip  ~a third smaller than a plain boot, and
+            ;;                        still faster to start than one
+            ;;   plain  no vfasl      the boot 0.8.4 produced
+            ;; --no-vfasl is the spelling #886 asked for and stays as an alias for
+            ;; `--boot plain`. Precedence, resolved here and nowhere else so there
+            ;; is one rule: CLI flag > deps.edn > environment > default.
+            boot-mode (let [tail (drop-while #(not= "--boot" %) flag-args)
+                            cli (when (seq tail)
+                                  (let [v (second tail)]
+                                    (when (or (nil? v) (str/starts-with? v "-"))
+                                      (throw (ex-info "--boot needs a value: fast, small or plain" {})))
+                                    v))
+                            v (or (when (some #{"--no-vfasl"} flag-args) "plain")
+                                  cli
+                                  (when (:no-vfasl build) "plain")
+                                  (some-> (:boot build) name)
+                                  (when (System/getenv "JOLT_NO_VFASL") "plain")
+                                  (System/getenv "JOLT_BOOT")
+                                  "fast")]
+                        (when-not (#{"fast" "small" "plain"} v)
+                          (throw (ex-info (str "--boot must be fast, small or plain (got " v ")")
+                                          {:boot v})))
+                        v)
             ;; a shared library (callable from C/C++/Rust via jolt_library_init +
             ;; jolt_lookup) instead of an executable: --library.
             library? (some #{"--library"} flag-args)
@@ -793,8 +822,8 @@
         ;; embed-dirs (absolute) are walked + baked into the binary by the driver;
         ;; project-paths (relative) become runtime io/resource roots (ship-alongside).
         (if library?
-          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack)
-          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack))))))
+          (jolt.host/build-library entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode)
+          (jolt.host/build-binary entry out mode natives embed-dirs project-paths direct-link? tree-shake? target target-pack boot-mode))))))
 
 (defn- nrepl [more]
   ;; resolve the project (deps on the roots, native libs loaded), then start the
@@ -853,7 +882,7 @@
   (println "                         first line is `#!/usr/bin/env jolt` runs as an")
   (println "                         executable script, with or without an extension")
   (println "  build -m NS [-o OUT] [--opt|--dev] [--direct-link] [--tree-shake] [--dynamic]")
-  (println "              [--library] [--target MACHINE --target-pack DIR]")
+  (println "              [--boot fast|small|plain] [--library] [--target MACHINE --target-pack DIR]")
   (println "                         compile a standalone binary, or with --library a")
   (println "                         shared object an embedder dlopens and calls through")
   (println "                         jolt_library_init + jolt_lookup; --target")
