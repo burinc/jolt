@@ -927,14 +927,15 @@ adaptercheck:
 hostprops:
 	@$(CHEZ) --script test/chez/host-derived-props-test.ss
 
-# The boot image's LZ4 ceiling (jolt-23z). Chez cannot read back an LZ4 fasl
-# entry of 2^28 uncompressed bytes or more, and 0.8.5's vfasl boot is one entry
-# per input boot file rather than one per top-level form — so a large enough app
-# built a binary that died in Sbuild_heap. build.ss re-encodes such an image with
-# gzip; this pins the kernel fact behind that, the entry scanner that detects it,
-# and the fallback itself. JOLT_MAX_HEAP=off because two of the checks have to
-# allocate 256MiB to ask the question at all, and the runtime's own heap bound
-# would otherwise answer first.
+# The boot image's LZ4 ceiling (jolt-lang/jolt#886). Chez cannot read back a big
+# enough LZ4 fasl entry, and 0.8.5's vfasl boot is one entry per input boot file
+# rather than one per top-level form — so a large enough app built a binary that
+# died in Sbuild_heap. build.ss re-encodes such an image with gzip; this measures
+# the ceiling of the kernel in front of it (undefined behaviour, so 2^28 on some
+# platforms and 2^29 on others), then pins that jolt's constant sits safely under
+# it, plus the entry scanner and both fallbacks. JOLT_MAX_HEAP=off because some
+# of the checks have to allocate at the ceiling to ask the question at all, and
+# the runtime's own heap bound would otherwise answer first.
 vfaslceiling:
 	@JOLT_MAX_HEAP=off $(CHEZ) --script test/chez/vfasl-ceiling-test.ss
 

@@ -1149,6 +1149,29 @@ fi
 if JOLT_PWD="$app" "$joltabs" build -m app.core --boot nope -o "$plainout.bad" >/dev/null 2>&1; then
   echo "  FAIL: --boot nope was accepted"; exit 1
 fi
+# An empty environment variable reads as UNSET. `bin/jolt` already treats
+# JOLT_NO_DEVCACHE that way, and a CI matrix leg that does not fill a value in
+# exports an empty one — which must not fail the build (JOLT_BOOT= used to, with
+# "must be fast, small or plain (got )") nor silently change it (JOLT_NO_VFASL=
+# used to force plain).
+emptybootout="$(dirname "$out")/emptyboot-bin"
+emptynvout="$(dirname "$out")/emptynv-bin"
+if ! JOLT_PWD="$app" JOLT_BOOT= "$joltabs" build -m app.core -o "$emptybootout" >/dev/null 2>&1; then
+  echo "  FAIL: an empty JOLT_BOOT failed the build"; exit 1
+fi
+[ -f "$emptybootout.build/jolt.boot.vfasl" ] || { echo "  FAIL: an empty JOLT_BOOT did not build the default"; exit 1; }
+if ! JOLT_PWD="$app" JOLT_NO_VFASL= "$joltabs" build -m app.core -o "$emptynvout" >/dev/null 2>&1; then
+  echo "  FAIL: an empty JOLT_NO_VFASL failed the build"; exit 1
+fi
+[ -f "$emptynvout.build/jolt.boot.vfasl" ] || { echo "  FAIL: an empty JOLT_NO_VFASL forced plain"; exit 1; }
+# Within one source the explicit --boot spelling beats the --no-vfasl alias, in
+# either order: a script that adds --boot small without dropping its old
+# --no-vfasl is the migration #886 is on, and it used to silently get `plain`.
+precout="$(dirname "$out")/prec-boot-bin"
+if ! JOLT_PWD="$app" "$joltabs" build -m app.core --no-vfasl --boot small -o "$precout" >/dev/null 2>&1; then
+  echo "  FAIL: --no-vfasl --boot small build exited non-zero"; exit 1
+fi
+[ -f "$precout.build/jolt.boot.vfasl" ] || { echo "  FAIL: --boot small lost to the --no-vfasl alias"; exit 1; }
 got_small="$(cd / && "$smallout" alpha bb ccc 2>&1)"
 got_plain="$(cd / && "$plainout" alpha bb ccc 2>&1)"
 got_envplain="$(cd / && "$envplainout" alpha bb ccc 2>&1)"
