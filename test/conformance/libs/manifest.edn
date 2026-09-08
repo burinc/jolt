@@ -427,7 +427,7 @@
    ;; not reach it, so it is preloaded.
    :preload ["jolt.time"]
    ;; 900 was sized when jolt read :bb branches, which gated roughly half the
-   ;; assertions away and stubbed out m/eval; the full suite runs ~12k
+   ;; assertions away and stubbed out m/eval; the full suite runs ~13k
    ;; assertions with sci live and needs the room.
    :timeout 2400
    ;; Keying protocol dispatch by defining namespace (jolt-ewmt) is what moved
@@ -443,30 +443,36 @@
    ;; grew the 3-arg DateTimeFormatter.parse with a strict pattern walk, the
    ;; X/from statics and OffsetTime — 13 failures and 2 errors' worth.
    ;;
-   ;; Two things shape the tally below. The suite :bb-gates roughly half its
-   ;; assertions (babashka runs the reduced set, and jolt reads :bb branches
-   ;; now) — that is where the old 12059 passes went, with fail and error
-   ;; shrinking proportionally. And the one load failure is malli.util-test's
-   ;; cheshire, i.e. Jackson. The native-backed clojure.core.rrb-vector
-   ;; replaced the jar here, which is what brought the fipp/virhe chain (ten
-   ;; namespaces) back from the old mk-am load-fail wall.
+   ;; The one load failure is malli.util-test's cheshire, i.e. Jackson. The
+   ;; native-backed clojure.core.rrb-vector replaced the jar here, which is what
+   ;; brought the fipp/virhe chain (ten namespaces) back from the old mk-am
+   ;; load-fail wall.
    ;;
-   ;; Where the residue sits, per target/libconformance/malli.log: 25 of the 34
-   ;; errors and 11 of the 36 failures are malli.transform-test; the rest of the
-   ;; errors are generator-test (7), experimental-test (1) and instrument-test
-   ;; (1); the rest of the failures are core-test (12, the :every schema over an
-   ;; eduction), error-test (3), instrument-test (3), generator-test (2),
-   ;; provider-test (2), swagger-test (2) and registry-test (1). parser-test,
-   ;; which an earlier recording called out as the bulk of the failures, is
-   ;; green (1754 assertions) — it draws from (mg/sample s {:seed 0}), and a
-   ;; fixed seed drawing different values here than on the JVM is the same
-   ;; family as test.check's :tolerance, not a malli bug.
+   ;; 6757/36/34 -> 13261/28/10 in #893, three effects and no regression on any
+   ;; counter:
+   ;;   - the suite :bb-gated roughly half its assertions and jolt was reading
+   ;;     those branches, so the pass count roughly doubles. malli.parser-test
+   ;;     alone goes from 1754 to 8224: its ensure-parser-type helper is
+   ;;     #?(:bb nil :default …), which made every call vacuous.
+   ;;   - sci is on the classpath now (see :local-deps), so the 72
+   ;;     ::sci-not-available errors that m/eval raised are gone.
+   ;;   - seqable? answers for a declared Seqable/Iterable, so :every over an
+   ;;     eduction validates and parses; that is the 104 identical? failures in
+   ;;     parser-test and the 12 in core-test.
    ;;
-   ;; Refreshed from 6751/42 to 6757/36 (identical over three runs, and on a
-   ;; main binary): six assertions moved from fail to pass somewhere in the ~500
-   ;; commits since the 0.7.23-era recording. Not bisected — the point of
-   ;; re-recording is that BETTER never fails the gate, so leaving it is slack.
-   :expect {:tests 219 :pass 6757 :fail 36 :error 34 :load-fail 1}}
+   ;; Where the residue sits, per target/libconformance/malli.log: 11 of the 28
+   ;; failures are malli.transform-test, then core-test (4), error-test (3),
+   ;; instrument-test (3), generator-test (2), provider-test (2), swagger-test
+   ;; (2) and registry-test (1). The 10 errors are generator-test (7),
+   ;; experimental-test (1), instrument-test (1) and parser-test (1). Several
+   ;; draw from (mg/sample s {:seed 0}), and a fixed seed drawing different
+   ;; values here than on the JVM is the same family as test.check's :tolerance,
+   ;; not a malli bug.
+   ;;
+   ;; This is the heaviest row in the gate by a wide margin — ~15GB RSS and ~30
+   ;; CPU-minutes now that it runs the whole assertion set with m/eval live,
+   ;; which is why :timeout is 2400 and why the runner passes JOLT_MAX_HEAP=off.
+   :expect {:tests 219 :pass 13261 :fail 28 :error 10 :load-fail 1}}
 
   ;; ---------------------------------------------------------- web
   {:name "ring-codec"

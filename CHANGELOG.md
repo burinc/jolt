@@ -150,8 +150,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skips — babashka.fs defines it off its own `:clj` branch now — and `vendor/`
   `process` goes back to upstream babashka/process, whose only jolt patch was a
   `:jolt` arm working around the empty `:bb` splice. A project that wants `:bb`
-  read asks for it with `:jolt/features` (above). Reported by @markokocic in
-  #893.
+  read asks for it with `:jolt/features` (above). malli's suite doubles as a
+  result — 6757 passing assertions to 13261, failures 36 to 28 and errors 34 to
+  10 — because half of it was `:bb`-gated and `malli.sci`'s `:bb` branch had
+  been standing in for sci. Reported by @markokocic in #893.
 
 ### Fixed
 
