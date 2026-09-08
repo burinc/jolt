@@ -112,8 +112,23 @@
     (and lz4-ceiling (<= (bld-lz4-image-ceiling) lz4-ceiling)))
 ;; The other half of that invariant: jolt's constant must not be so HIGH that a
 ;; doomed image slips under it. Everything below it has to load.
-(ok "lz4 loads one byte under jolt's ceiling"
-    (fasl-round-trips? 'lz4 (- (bld-lz4-image-ceiling) 1)))
+;;
+;; A KILOBYTE under, not a byte. These probes are sized by PAYLOAD, while the
+;; ceiling is compared against the size the ENTRY declares, and an entry declares
+;; its payload plus a few bytes of fasl framing — so a payload one byte under the
+;; ceiling makes an entry a few bytes OVER it, and this check failed on ta6le
+;; (ceiling 2^28) while passing on tarm64osx (ceiling 2^29) for that reason
+;; alone. The margin cannot hide a real ceiling: the boundary comes from a 32-bit
+;; multiply overflowing, so it lands on a power of two, never a kilobyte below
+;; one.
+(ok "lz4 loads comfortably under jolt's ceiling"
+    (fasl-round-trips? 'lz4 (- (bld-lz4-image-ceiling) 1024)))
+;; The same probe against the MEASURED ceiling rather than jolt's constant. On a
+;; platform where the two are equal this is the same check twice; where they are
+;; not, it is the only one that exercises the tight boundary, which is what makes
+;; the framing mistake above visible on tarm64osx instead of only in CI.
+(ok "lz4 loads comfortably under the measured ceiling"
+    (and lz4-ceiling (fasl-round-trips? 'lz4 (- lz4-ceiling 1024))))
 ;; gzip is what the fallback re-encodes to, so it has to clear the size that
 ;; defeated LZ4.
 (ok "gzip loads at the measured ceiling"
