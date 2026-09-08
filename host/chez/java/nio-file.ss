@@ -309,9 +309,6 @@
                             "" (seq->list (jolt-seq data)))))
        (string->utf8 body)))))
 
-(define (nio-write! fp data)
-  (nio-write-bv! fp (nio-output-data->bv data)))
-
 (define (nio-delete1 fp missing-ok?)
   (cond ((nio-is-symlink? fp) (delete-file fp) #t)   ; the link itself, even if dangling
         ((not (file-exists? fp))
@@ -701,7 +698,7 @@
            (create? (or defaults? create-new? (memq 'create syms))))
       (when (and append? truncate?)
         (throw-jvm (quote IllegalArgumentException)
-                   "APPEND and TRUNCATE_EXISTING cannot be used together"))
+                   "APPEND + TRUNCATE_EXISTING not allowed"))
       (cond
         ;; No `no-fail`: Chez creates the entry and atomically fails if any
         ;; entry (including a symlink) already occupies the path.
@@ -731,9 +728,11 @@
 (let ((files-opt
        (list (cons "write" (lambda (p data . opts)
                              (let* ((fp (nfp p))
-                                    (file-options (nio-output-file-options opts))
+                                    ;; not named `file-options`: that is the Chez
+                                    ;; macro this scope still needs to mean itself
+                                    (fopts (nio-output-file-options opts))
                                     (bytes (nio-output-data->bv data))
-                                    (port (nio-open-output-port fp file-options)))
+                                    (port (nio-open-output-port fp fopts)))
                                (put-bytevector port bytes)
                                (close-port port)
                                (->path p))))
