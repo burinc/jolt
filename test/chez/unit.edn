@@ -645,6 +645,18 @@
   ;; still wins when :clj is listed first.
   {:suite "reader-features" :expr "#?(:bb :bb-branch :clj :clj-branch)" :expected ":bb-branch"}
   {:suite "reader-features" :expr "#?(:clj :clj-first :bb :bb-second)" :expected ":clj-first"}
+  ;; seqable? is an instance? test over Seqable / ISeq / Iterable on the JVM, so a
+  ;; bare deftype or reify declaring one answers true even though it is not coll?.
+  ;; It has to agree with whether `seq` actually works on the value — the seq arms
+  ;; already accept exactly these, and clojure.core.Eduction is the one in core.
+  {:suite "seqable" :expr "(seqable? (eduction (map identity) [1 2 3]))" :expected "true"}
+  {:suite "seqable" :expr "(do (deftype SqA [xs] clojure.lang.Seqable (seq [_] (seq xs))) [(seqable? (->SqA [1 2])) (coll? (->SqA [1 2])) (vec (seq (->SqA [1 2])))])" :expected "[true false [1 2]]"}
+  {:suite "seqable" :expr "(seqable? (reify Iterable (iterator [_] (.iterator [1 2]))))" :expected "true"}
+  {:suite "seqable" :expr "(do (deftype SqB [x]) (seqable? (->SqB 1)))" :expected "false"}
+  ;; ...and the collection-BEHAVIOUR interfaces are not Seqable on the JVM: an
+  ;; ILookup-only deftype answers false (corpus has the same row).
+  {:suite "seqable" :expr "(do (deftype SqC [x] clojure.lang.ILookup (valAt [_ k] nil) (valAt [_ k nf] nf)) [(coll? (->SqC 1)) (seqable? (->SqC 1))])" :expected "[false false]"}
+  {:suite "reader-features" :expr "(pr-str (clojure.core/__reader-features))" :expected "\"(\\\"jolt\\\" \\\"clj\\\" \\\"default\\\")\""}
   ;; jolt.reader — the # dispatch table is open for punctuation. #$ is jolt's own
   ;; reader macro (clojure.core.strint's ~{}/~() grammar over a string literal),
   ;; registered through the same table a program registers into.
