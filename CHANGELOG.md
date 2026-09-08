@@ -120,6 +120,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed `Files.newOutputStream`/`Files.write` open reports the NIO class the
+  JVM reports.** Only ENOENT and EEXIST were translated; every other errno let
+  the underlying Chez condition escape, so opening a directory for output — or
+  hitting ENOTDIR, ELOOP, ENOSPC — surfaced as a bare `java.io.IOException`
+  whose message named `open-file-output-port`. These now follow
+  `UnixException.translateToIOException`: EACCES is an `AccessDeniedException`,
+  and anything without a class of its own is a `FileSystemException` reading
+  `<path>: <reason>`.
+
 - **`Files.newOutputStream` now honors Java open options atomically.**
   `CREATE_NEW` previously behaved like the default create-or-truncate mode, so
   opening an existing path could overwrite it instead of throwing
