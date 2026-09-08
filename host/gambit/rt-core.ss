@@ -510,6 +510,12 @@
 ;; JVM spelling of the same question, Runtime.availableProcessors, is mapped in
 ;; the java layer (java/process.ss); clojure.core reaches it through here.
 (def-var! "jolt.host" "available-processors" (lambda () (jolt-available-processors)))
+;; jolt.host/getenv — the process environment. Mirrors rt.ss, and for the reason
+;; given there: the compiler image reads it in a top-level def as it LOADS, so it
+;; has to exist before the seed (jolt#879). Gambit's getenv RAISES on an unset
+;; name unless a default is passed; Chez's returns #f, so pass #f and share the
+;; rest of the shape.
+(def-var! "jolt.host" "getenv" (lambda (n) (let ((v (getenv n #f))) (if v v jolt-nil))))
 
 ;; SKIPPED on the gambit target: the telemetry primitives region (wall/mono
 ;; clocks, sa-stats counters, thread-id, machine-type/scheme-version) — Chez
