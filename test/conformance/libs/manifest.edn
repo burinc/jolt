@@ -243,9 +243,15 @@
    ;; database jolt does not carry, a generated case reaches a lone surrogate (jolt
    ;; chars are scalar values — :string-model), and the clojure-test-output and
    ;; exception-handling namespaces compare printed #error maps whose :trace is
-   ;; empty because tail calls leave no frames to report. The load-fail is clj-time,
-   ;; which needs joda-time.
-   :expect {:tests 39 :pass 110 :fail 17 :error 2 :load-fail 1}}
+   ;; empty because tail calls leave no frames to report.
+   ;;
+   ;; No load failure: the recorded one was generators.clj-time-test, and it is
+   ;; not clj-time reaching for joda-time after all — the namespace is written
+   ;; #?@(:bb [] :clj [[clj-time.core …]]), so jolt reading :bb branches takes
+   ;; the empty arm and it loads with no tests. pass/fail/error are unchanged
+   ;; and stay inside :tolerance; only the load-fail moved, and :load-fail is
+   ;; pinned exactly whatever the tolerance is, which is what surfaced it.
+   :expect {:tests 39 :pass 110 :fail 17 :error 2}}
 
   ;; ---------------------------------------------------------- data formats
   {:name "data.csv"
@@ -423,17 +429,9 @@
    ;; private #'clojure.core/mk-am through core.rrb-vector (7), and jsonista, i.e.
    ;; Jackson (1).
    ;;
-   ;; Of what runs: 72 errors are the sci chain above. 104 of the failures are
-   ;; parser-info-test alone, which round-trips values drawn by (mg/sample s
-   ;; {:seed 0}) — a fixed seed draws DIFFERENT values here than on the JVM, so
-   ;; the test runs over different data. :every parsing and registry references
-   ;; themselves agree with 1.12.5 exactly on literal inputs, checked directly.
-   ;; That is the same family as test.check's :tolerance, not a malli bug.
-   ;;
    ;; The four malli.experimental.time suites went green when jolt-lang/time
    ;; grew the 3-arg DateTimeFormatter.parse with a strict pattern walk, the
-   ;; X/from statics and OffsetTime — 13 failures and 2 errors' worth. That is
-   ;; where the +14/-13/-1 against the previous recording came from.
+   ;; X/from statics and OffsetTime — 13 failures and 2 errors' worth.
    ;;
    ;; Two things shape the tally below. The suite :bb-gates roughly half its
    ;; assertions (babashka runs the reduced set, and jolt reads :bb branches
@@ -442,7 +440,23 @@
    ;; cheshire, i.e. Jackson. The native-backed clojure.core.rrb-vector
    ;; replaced the jar here, which is what brought the fipp/virhe chain (ten
    ;; namespaces) back from the old mk-am load-fail wall.
-   :expect {:tests 219 :pass 6751 :fail 42 :error 34 :load-fail 1}}
+   ;;
+   ;; Where the residue sits, per target/libconformance/malli.log: 25 of the 34
+   ;; errors and 11 of the 36 failures are malli.transform-test; the rest of the
+   ;; errors are generator-test (7), experimental-test (1) and instrument-test
+   ;; (1); the rest of the failures are core-test (12, the :every schema over an
+   ;; eduction), error-test (3), instrument-test (3), generator-test (2),
+   ;; provider-test (2), swagger-test (2) and registry-test (1). parser-test,
+   ;; which an earlier recording called out as the bulk of the failures, is
+   ;; green (1754 assertions) — it draws from (mg/sample s {:seed 0}), and a
+   ;; fixed seed drawing different values here than on the JVM is the same
+   ;; family as test.check's :tolerance, not a malli bug.
+   ;;
+   ;; Refreshed from 6751/42 to 6757/36 (identical over three runs, and on a
+   ;; main binary): six assertions moved from fail to pass somewhere in the ~500
+   ;; commits since the 0.7.23-era recording. Not bisected — the point of
+   ;; re-recording is that BETTER never fails the gate, so leaving it is slack.
+   :expect {:tests 219 :pass 6757 :fail 36 :error 34 :load-fail 1}}
 
   ;; ---------------------------------------------------------- web
   {:name "ring-codec"
