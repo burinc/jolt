@@ -161,6 +161,11 @@
   {:suite "exinfo" :expr "(instance? RuntimeException (InterruptedException. \"x\"))" :expected "false"}
   {:suite "exinfo" :expr "(.getMessage (RuntimeException. \"boom\"))" :expected "\"boom\""}
   {:suite "exinfo" :expr "(ex-message (RuntimeException. \"boom\"))" :expected "\"boom\""}
+  ;; The namespace is LOADED and only the var is missing, so this stays late-bound
+  ;; (see :analyze/unknown-namespace in error-kinds.edn for why that arm has to
+  ;; stay) and reports at the call, through static-miss-message's live-namespace
+  ;; arm. An ns that is not loaded at all is a compile error instead —
+  ;; test/errors/analyze/unknown-namespace.
   {:suite "errors" :expr "(try (clojure.string/no-such-fn 1) (catch Throwable e (ex-message e)))" :expected "\"No such var: clojure.string/no-such-fn\""}
   {:suite "errors" :expr "(do (require (quote [clojure.string :as s])) (try (s/no-such-fn 1) (catch Throwable e (ex-message e))))" :expected "\"No such var: s/no-such-fn\""}
   {:suite "errors" :expr "(try (Nope/whatever 1) (catch Throwable e (ex-message e)))" :expected "\"Unknown class Nope\""}
