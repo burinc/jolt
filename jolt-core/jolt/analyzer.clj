@@ -37,9 +37,12 @@
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
                                form-syntax-quote-expand
                                record-type? record-ctor-key deftype-ctor-class form-position form-line late-bind?
-                               resolve-class-hint host-class-name? jolt-class-for]]))
+                               resolve-class-hint host-class-name? jolt-class-for
+                               embed-plan ctx-for-ns]]))
 
 (declare analyze)
+;; the quote arm reaches it well before its definition (it needs analyze itself)
+(declare embedded-plan-node)
 
 ;; Special forms analyze-special has a dispatch arm for — the subset of the host
 ;; contract's reserved words (jolt.host/form-special?) the analyzer lowers itself.
@@ -1027,9 +1030,18 @@
                   m (when (map? m)
                       (let [u (if (form-list? qf) (dissoc m :line :column :file) m)]
                         (when (seq u) u)))]
-              (if (nil? m)
-                (quote-node qf)
-                (invoke (var-ref "clojure.core" "with-meta") [(quote-node qf) (quote-node m)])))
+              ;; Quoting a live VALUE a macro spliced is the value — (quote 5) is
+              ;; 5, and (quote <fn>) is that fn — so it rebuilds the same way an
+              ;; unquoted one does rather than going to the quoted-data emitter,
+              ;; which can only render what has reader syntax. embed-plan answers
+              ;; nil for every ordinary form, so this asks one question instead of
+              ;; restating the list of shapes analyze already recognizes.
+              (if-let [plan (embed-plan qf)]
+                (embedded-plan-node ctx plan env)
+                (if (nil? m)
+                  (quote-node qf)
+                  (invoke (var-ref "clojure.core" "with-meta")
+                          [(quote-node qf) (quote-node m)]))))
     "if" (do
            ;; 2 or 3 argument forms only (spec 03-special-forms X1)
            (when (or (< (count items) 3) (> (count items) 4))
@@ -1994,6 +2006,55 @@
                      (diagnostic-data :analyze/internal-failure pos
                                       (when (map? orig) orig))))))
 
+;; A live value a macro put in its expansion, rendered as code that rebuilds it.
+;; embed-plan (state-image.ss) answers with the image writer's verdict:
+;;
+;;   :var   — the value is some var's root, so read that var. A named fn, a
+;;            multimethod, a reify: the restoring code already has it. Note this
+;;            tracks the var rather than freezing the object, which is the same
+;;            choice the image's fn-ref arm makes and the only one that can be
+;;            written as code at all.
+;;   :fnsrc — a registered anonymous literal. Its source form and the names it
+;;            closed over were recorded at load (fn-form-registry.ss), and the
+;;            captured values come back live, so it rebuilds as
+;;            ((fn* [free…] <source>) <captured…>) — the wrapper parameters
+;;            shadow the outer names the body reads, which is what reconstructs
+;;            the lexical environment it was compiled in. Analyzed in the ns it
+;;            was compiled in, because that is where its free symbols resolve.
+;;            Each captured value is analyzed normally and so lands back here if
+;;            it is opaque too.
+;;
+;; nil means there is nothing to rebuild it from — a closure the runtime built
+;; rather than one analyzed from a literal, or a host object with no reader
+;; syntax. That is the same line the image draws, and it is a real boundary
+;; rather than a missing case, so it reports instead of guessing.
+(defn- embedded-plan-node [ctx plan env]
+  (if (= (:kind plan) :var)
+    (var-ref (:ns plan) (:name plan))
+    (invoke (analyze (ctx-for-ns (:ns plan))
+                     (list 'fn* (apply vector (map symbol (:frees plan))) (:form plan))
+                     (empty-env))
+            (mapv #(analyze ctx % env) (:vals plan)))))
+
+(defn- embedded-value [ctx form env]
+  (let [plan (embed-plan form)]
+    (if (and plan (not= (:kind plan) :folded))
+      (embedded-plan-node ctx plan env)
+      (analysis-error
+        :analyze/unsupported-form
+        (str "Cannot compile this value into code: " (pr-str form) ". "
+             "A macro put a live value in the form it returned, and this one "
+             "cannot be rebuilt as code. "
+             (if plan
+               (str "Its source closes over `" (:name plan) "`, whose value the "
+                    "compiler folded into the code, so there is no capture left "
+                    "to read it back from. Take the constant out of the closure "
+                    "— refer to it through a var, or make it a parameter.")
+               (str "It is a fn the runtime built rather than one written as a "
+                    "literal in a namespace, or a host object with no reader "
+                    "syntax. Return a form that BUILDS the value instead of the "
+                    "value itself, or store it in a var and splice the var.")))))))
+
 (defn analyze
   ([ctx form]
    ;; One position box per compilation, over the catch too — as-analysis-diagnostic
@@ -2066,5 +2127,19 @@
      (form-tagged? form) (analysis-error :read/invalid-data-reader
                                          (str "No reader function for tag "
                                               (form-tag-name form)))
-     :else (analysis-error :analyze/unsupported-form
-                           "Unsupported form"))))
+     ;; ...and anything else is a live VALUE a macro put in the form it returned,
+     ;; not a syntax error: every shape the reader can produce is handled above,
+     ;; so what is left came from evaluation. Clojure's compiler falls through to
+     ;; ConstantExpr here and the value simply IS the constant — verified on the
+     ;; 1.12.5 oracle, AOT included. jolt compiles to Scheme TEXT, so it cannot
+     ;; spell the value and has to rebuild it instead. sci's copy-var reaches
+     ;; this with a macro var's root (jolt-l7tq).
+     ;;
+     ;; How to rebuild it is exactly the question the image writer answers, so
+     ;; this reads that same verdict (state-image.ss image-proc-verdict) through
+     ;; embed-plan rather than a second copy of the rules: the image scan side,
+     ;; the image dump side and the compiler now agree by construction about
+     ;; which fns can be rebuilt from source. Both shapes it can return emit as
+     ;; ordinary self-contained code, so an embedded value travels into an AOT
+     ;; fasl and a built binary and does not need a process-local side table.
+     :else (embedded-value ctx form env))))
