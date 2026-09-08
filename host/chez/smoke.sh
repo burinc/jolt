@@ -1066,6 +1066,31 @@ else
   echo "    want \`[true true]\` got \`$bbr_out\`"
   fails=$((fails + 1))
 fi
+
+# :jolt/features widens the reader-conditional set for the PROJECT's own source.
+# jolt does not match :bb (#893); a script ported from babashka whose :bb
+# branches are the ones its author wants asks for them here. Additive only, so
+# :clj still reads and the project's own :jolt branch still wins over both.
+printf '{:paths ["src"] :jolt/features [:bb]}\n' > "$bbshadow/deps.edn"
+rm -f "$bbshadow/src/babashka/fs.cljc"; rmdir "$bbshadow/src/babashka" 2>/dev/null
+feat_out="$(cd "$bbshadow" && JOLT_NO_DEVCACHE=1 "$bbs_jolt" -e '[#?(:bb :bb-branch :clj :clj-branch) #?(:jolt :jolt-first :bb :bb-second) (vec (sort (clojure.core/__reader-features)))]' 2>&1 | tail -1)"
+if [ "$feat_out" = '[:bb-branch :jolt-first ["bb" "clj" "default" "jolt"]]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: :jolt/features did not widen the reader feature set"
+  echo "    want \`[:bb-branch :jolt-first [\"bb\" \"clj\" \"default\" \"jolt\"]]\` got \`$feat_out\`"
+  fails=$((fails + 1))
+fi
+# ...and without the key, the same expression reads :clj.
+printf '{:paths ["src"]}\n' > "$bbshadow/deps.edn"
+nofeat_out="$(cd "$bbshadow" && JOLT_NO_DEVCACHE=1 "$bbs_jolt" -e '[#?(:bb :bb-branch :clj :clj-branch) (vec (sort (clojure.core/__reader-features)))]' 2>&1 | tail -1)"
+if [ "$nofeat_out" = '[:clj-branch ["clj" "default" "jolt"]]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: the default reader feature set is not {:jolt :clj :default}"
+  echo "    want \`[:clj-branch [\"clj\" \"default\" \"jolt\"]]\` got \`$nofeat_out\`"
+  fails=$((fails + 1))
+fi
 rm -rf "$bbshadow"
 
 # jolt.fs — the stdlib file-system API against a scratch temp dir (glob, copy-tree,

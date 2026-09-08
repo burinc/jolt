@@ -118,6 +118,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without libffi produces a binary that aborts at startup, since jolt's runtime
   uses `foreign-procedure`.)
 
+- **`:jolt/features` in a project's `deps.edn` widens the reader-conditional
+  set.** `{:jolt/features [:bb]}` is how a script ported from babashka keeps
+  reading its `:bb` branches now that jolt does not match `:bb` itself. Additive
+  only — it can add a key jolt does not carry, never remove one, so `:clj` still
+  reads and a `:jolt` clause still wins over both. The project's alone, for the
+  same reason `:jolt/provides` refuses two claims on one class: the feature set
+  decides which branch every library in the program is read through, so a
+  dependency must not change it under the project. Installed before the first
+  form is read, which is earlier than either of the other two project-level
+  declarations needs to be.
+
 ### Changed
 
 - **Reader conditionals no longer match `:bb`.** The feature set is

@@ -111,13 +111,22 @@
 (defn- register-ns-replacements! [replaces]
   (doseq [n replaces] (jolt.host/replace-builtin-ns! n)))
 
+;; ...and the project's :jolt/features: reader-conditional keys to read on top of
+;; jolt's own. Earlier still than the two above — the first form READ consults
+;; the feature set, and reading precedes every class reference and every require.
+(defn- register-reader-features! [features]
+  (when (seq features) (jolt.host/add-reader-features! features)))
+
 ;; Apply a resolved project's roots on top of the current (jolt-core) roots so app
 ;; namespaces resolve while jolt.* stays loadable, then register its declared host
 ;; class providers and load its native deps.
 (defn- apply-project!
   ([resolved] (apply-project! resolved true))
-  ([{:keys [roots natives provides replaces project-dir]} strict?]
+  ([{:keys [roots natives provides replaces features project-dir]} strict?]
    (jolt.host/set-source-roots! (vec (distinct (concat roots (jolt.host/source-roots)))))
+   ;; Before the providers: those matter at the first class REFERENCE, this one
+   ;; at the first form read, and reading comes first.
+   (register-reader-features! features)
    ;; Providers go in BEFORE anything of the project compiles (RFC 0014): the
    ;; table has to be complete before the first class reference can miss, which
    ;; is the whole reason the mapping is declared rather than registered by the
