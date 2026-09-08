@@ -791,19 +791,32 @@
             ;;   plain  no vfasl      the boot 0.8.4 produced
             ;; --no-vfasl is the spelling #886 asked for and stays as an alias for
             ;; `--boot plain`. Precedence, resolved here and nowhere else so there
-            ;; is one rule: CLI flag > deps.edn > environment > default.
-            boot-mode (let [tail (drop-while #(not= "--boot" %) flag-args)
+            ;; is one rule: CLI > deps.edn > environment > default, and WITHIN
+            ;; each of those the explicit --boot spelling beats the alias. The
+            ;; other order looks harmless and is not: a script that adds
+            ;; `--boot small` without dropping the `--no-vfasl` it already had is
+            ;; exactly the migration #886 is on, and it would silently keep the
+            ;; larger, slower `plain` boot it was trying to leave.
+            ;;
+            ;; A BLANK environment variable reads as unset, the way bin/jolt
+            ;; already treats JOLT_NO_DEVCACHE. CI exports an empty value for a
+            ;; matrix leg that did not fill one in, and that must neither fail the
+            ;; build (JOLT_BOOT= hit the validation below with an empty string)
+            ;; nor quietly change it (JOLT_NO_VFASL= forced plain).
+            boot-mode (let [env (fn [k] (let [v (System/getenv k)]
+                                          (when-not (str/blank? v) v)))
+                            tail (drop-while #(not= "--boot" %) flag-args)
                             cli (when (seq tail)
                                   (let [v (second tail)]
                                     (when (or (nil? v) (str/starts-with? v "-"))
                                       (throw (ex-info "--boot needs a value: fast, small or plain" {})))
                                     v))
-                            v (or (when (some #{"--no-vfasl"} flag-args) "plain")
-                                  cli
-                                  (when (:no-vfasl build) "plain")
+                            v (or cli
+                                  (when (some #{"--no-vfasl"} flag-args) "plain")
                                   (some-> (:boot build) name)
-                                  (when (System/getenv "JOLT_NO_VFASL") "plain")
-                                  (System/getenv "JOLT_BOOT")
+                                  (when (:no-vfasl build) "plain")
+                                  (env "JOLT_BOOT")
+                                  (when (env "JOLT_NO_VFASL") "plain")
                                   "fast")]
                         (when-not (#{"fast" "small" "plain"} v)
                           (throw (ex-info (str "--boot must be fast, small or plain (got " v ")")

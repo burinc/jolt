@@ -1,31 +1,41 @@
-;; vfasl-ceiling-test.ss — the boot image's LZ4 ceiling (jolt-23z).
+;; vfasl-ceiling-test.ss — the boot image's LZ4 ceiling (jolt-lang/jolt#886).
 ;;
-;; A compressed fasl entry whose UNCOMPRESSED size reaches 2^28 bytes cannot be
-;; read back when the entry is LZ4: c/new-io.c's S_bytevector_uncompress returns
-;; the length as `Sfixnum(r)` with `int r`, and Sfixnum multiplies by 8 in the
-;; argument's own type, so 2^28 and up wrap to a negative fixnum and c/fasl.c's
-;; length check can never match. A binary whose boot image is over the line dies
-;; inside Sbuild_heap before a line of its own code runs. gzip's arm of the same
-;; function hands zlib a uLong and has no ceiling.
+;; A compressed fasl entry big enough cannot be read back when the entry is LZ4:
+;; c/new-io.c's S_bytevector_uncompress returns the length as `Sfixnum(r)` with
+;; `int r`, and Sfixnum multiplies by 8 in the argument's own type, so the
+;; product leaves 32 bits and c/fasl.c's length check can never match. A binary
+;; whose boot image is over the line dies inside Sbuild_heap before a line of its
+;; own code runs. gzip's arm of the same function hands zlib a uLong and has no
+;; ceiling.
+;;
+;; WHERE the line falls is undefined behaviour and differs by platform: 2^28
+;; where the widened product keeps its sign (the reporter's ta6le), 2^29 where
+;; it does not (tarm64osx). jolt re-encodes at 2^28, at or below both, so this
+;; gate measures the kernel in front of it rather than asserting one number.
 ;;
 ;; That only became reachable in 0.8.5, which ships the boot as vfasl: a plain
 ;; boot is one compressed entry per top-level form and its entries are kilobytes,
 ;; while vfasl-convert-file combines each input boot file into ONE entry — so the
-;; app half of a large program is a single image, and past 256MiB it stops
-;; loading rather than merely loading slowly.
+;; app half of a large program is a single image that stops loading rather than
+;; merely loading slowly.
 ;;
 ;; jolt cannot patch the kernel it links against, so build.ss measures the
 ;; converted boot and re-encodes over-ceiling images with gzip. This gate pins
-;; the three things that fix rests on:
+;; what that fix rests on:
 ;;
-;;   a. the ceiling is real, and it is exactly 2^28 — case (b) failing means a
-;;      newer Chez fixed the overflow and the workaround can go
-;;   b. gzip has no ceiling, so it is a valid answer for an oversized image
+;;   a. a ceiling still exists, and jolt's constant sits at or below it while
+;;      staying high enough that everything under it loads — no ceiling found at
+;;      all means a newer Chez fixed the overflow and the workaround can go
+;;   b. gzip clears the size that defeated LZ4, so it is a valid answer
 ;;   c. the entry scanner reads real converted boots correctly, answers 0 for a
-;;      boot with no LZ4 entries at all, and trips at exactly the ceiling
+;;      boot with no LZ4 entries at all, and trips at exactly jolt's constant
+;;   d. both fallbacks run: bld-vfasl-convert! in process, and bld-vfasl-ensure!
+;;      for the paths that convert in a spawned Chez (build-with-cc,
+;;      build-shared, and every cross build)
 ;;
-;; (a) and (b) allocate 256MiB bytevectors; the Makefile target runs this with
-;; JOLT_MAX_HEAP=off so the runtime's own heap bound does not fire first.
+;; (a) and (b) allocate bytevectors of the measured ceiling; the Makefile target
+;; runs this with JOLT_MAX_HEAP=off so the runtime's own heap bound does not fire
+;; first.
 ;;
 ;;   chez --script test/chez/vfasl-ceiling-test.ss
 (import (chezscheme))
@@ -47,24 +57,82 @@
 (define (at name) (string-append tmp "/" name))
 
 ;; --- a/b: the kernel fact the workaround exists for -------------------------
-;; All-zero bytes so the compressor is fast and the compressed form is ~1MB:
-;; what is under test is the LENGTH the kernel reports back, not the codec.
-(define (round-trips? fmt n)
-  (parameterize ((compress-format fmt) (compress-level 'minimum))
+;; Drive the REAL site: a compressed fasl ENTRY, written and read back through
+;; c/fasl.c's fasl_entry, which is where the length comparison that gives out
+;; lives. All-zero bytes so the compressor is fast and the file stays ~1MB: what
+;; is under test is the LENGTH the kernel reports back, not the codec's ratio.
+(define (fasl-round-trips? fmt n)
+  (let ((path (at (format "probe-~a-~a.fasl" fmt n))))
     (guard (e (#t #f))
-      (let* ((bv (make-bytevector n 0))
-             (back (bytevector-uncompress (bytevector-compress bv))))
-        (= n (bytevector-length back))))))
+      (parameterize ((fasl-compressed #t) (compress-format fmt) (compress-level 'minimum))
+        (let ((p (open-file-output-port path (file-options no-fail))))
+          (fasl-write (make-bytevector n 0) p)
+          (close-port p)))
+      (let* ((p (open-file-input-port path))
+             (v (fasl-read p)))
+        (close-port p)
+        (= n (bytevector-length v))))))
 
-(ok "lz4 entry round-trips one byte under the ceiling"
-    (round-trips? 'lz4 (- (bld-lz4-image-ceiling) 1)))
-;; The one that must keep failing. If it starts passing, the Chez being built
-;; against has fixed S_bytevector_uncompress and bld-vfasl-convert! can drop the
-;; gzip arm — so this is a "delete the workaround" signal, not a regression.
-(ok "lz4 entry does NOT round-trip at the ceiling"
-    (not (round-trips? 'lz4 (bld-lz4-image-ceiling))))
-(ok "gzip entry round-trips at the ceiling"
-    (round-trips? 'gzip (bld-lz4-image-ceiling)))
+;; The ceiling is UNDEFINED BEHAVIOUR, and it does not land in the same place on
+;; every platform. Sfixnum(x) is ((ptr)(uptr)((x)*8)) over an `int`: the product
+;; leaves 32 bits at x = 2^28, and what the widening cast then does with the top
+;; bit is the C compiler's business. Both manifestations are real, on Chez 10.4.1:
+;;
+;;   sign-extended   length comes back NEGATIVE at 2^28     ceiling 2^28
+;;                   (ta6le, and the platform in jolt-lang/jolt#886 — its
+;;                    -222298112 is exactly 314572800*8 wrapped to signed
+;;                    32-bit and divided back by 8)
+;;   zero-extended   length comes back 0 at 2^29            ceiling 2^29
+;;                   (tarm64osx)
+;;
+;; So this MEASURES the ceiling of the kernel in front of it rather than
+;; asserting one platform's number — an equality on 2^28 is red on tarm64osx,
+;; where it reads as "Chez fixed the overflow" when Chez has done nothing of the
+;; kind. What gets asserted instead is the property that keeps binaries working.
+(define (measured-lz4-ceiling)
+  (let loop ((cands (list (expt 2 28) (expt 2 29))))
+    (cond ((null? cands) #f)
+          ((not (fasl-round-trips? 'lz4 (car cands))) (car cands))
+          (else (loop (cdr cands))))))
+(define lz4-ceiling (measured-lz4-ceiling))
+(printf "  measured LZ4 fasl ceiling on ~a: ~a (jolt re-encodes at ~a)\n"
+        (machine-type) (or lz4-ceiling "none at or below 2^29") (bld-lz4-image-ceiling))
+
+;; The check that must keep FINDING a ceiling. If no probe fails, the Chez being
+;; built against has fixed S_bytevector_uncompress, and the whole workaround —
+;; the gzip arms of bld-vfasl-convert! and bld-vfasl-ensure!, the entry scanner,
+;; this gate — can be deleted. That is a "drop the workaround" signal, not a
+;; regression.
+(ok "the LZ4 fasl ceiling is still there"
+    (and lz4-ceiling #t))
+;; The safety invariant the fix rests on: jolt re-encodes at or before the point
+;; where the kernel gives out, so no image it leaves on LZ4 is one that cannot
+;; be read back.
+(ok "jolt's ceiling is at or below the kernel's"
+    (and lz4-ceiling (<= (bld-lz4-image-ceiling) lz4-ceiling)))
+;; The other half of that invariant: jolt's constant must not be so HIGH that a
+;; doomed image slips under it. Everything below it has to load.
+;;
+;; A KILOBYTE under, not a byte. These probes are sized by PAYLOAD, while the
+;; ceiling is compared against the size the ENTRY declares, and an entry declares
+;; its payload plus a few bytes of fasl framing — so a payload one byte under the
+;; ceiling makes an entry a few bytes OVER it, and this check failed on ta6le
+;; (ceiling 2^28) while passing on tarm64osx (ceiling 2^29) for that reason
+;; alone. The margin cannot hide a real ceiling: the boundary comes from a 32-bit
+;; multiply overflowing, so it lands on a power of two, never a kilobyte below
+;; one.
+(ok "lz4 loads comfortably under jolt's ceiling"
+    (fasl-round-trips? 'lz4 (- (bld-lz4-image-ceiling) 1024)))
+;; The same probe against the MEASURED ceiling rather than jolt's constant. On a
+;; platform where the two are equal this is the same check twice; where they are
+;; not, it is the only one that exercises the tight boundary, which is what makes
+;; the framing mistake above visible on tarm64osx instead of only in CI.
+(ok "lz4 loads comfortably under the measured ceiling"
+    (and lz4-ceiling (fasl-round-trips? 'lz4 (- lz4-ceiling 1024))))
+;; gzip is what the fallback re-encodes to, so it has to clear the size that
+;; defeated LZ4.
+(ok "gzip loads at the measured ceiling"
+    (and lz4-ceiling (fasl-round-trips? 'gzip lz4-ceiling)))
 
 ;; --- c: the scanner, over boots it actually produced -------------------------
 ;; A compiled object with a body big enough to clear the 100-byte floor under
@@ -101,7 +169,7 @@
     (and (not (bld-boot-over-lz4-ceiling? lz4-boot))
          (not (bld-boot-over-lz4-ceiling? gzip-boot))))
 
-;; --- c: the ceiling branch, without building a 256MiB app --------------------
+;; --- c: the ceiling branch, without building an over-ceiling app ------------
 ;; Boot framing, from ChezScheme s/strip.ss (read-entry): a header entry, then
 ;; one LZ4 object entry declaring DECLARED as its uncompressed size. Only the
 ;; declared size is read, so the payload can be anything.
@@ -165,6 +233,62 @@
     (parameterize ((bld-lz4-image-ceiling 1024))
       (and (bld-vfasl-convert! probe-so fallback-boot)
            (= (bld-boot-max-lz4-entry fallback-boot) 0))))
+
+;; --- d: the spawned-script path (build-with-cc, build-shared, every cross) ----
+;; Those paths convert inside a compile script run under bld-system, which turns
+;; a non-zero exit into a dead build. So what they hand the codec decision is a
+;; STRING, and the only thing between a conversion that raises and a failed build
+;; is that the form is guarded. Nothing else pins this: build-smoke drives the
+;; self-contained binary, which takes the in-process path instead.
+(define (substring? needle hay)
+  (let ((n (string-length needle)) (h (string-length hay)))
+    (let loop ((i 0))
+      (cond ((> (+ i n) h) #f)
+            ((string=? needle (substring hay i (+ i n))) #t)
+            (else (loop (+ i 1)))))))
+(define (script-form-for mode)
+  (parameterize ((bld-boot-mode mode))
+    (bld-vfasl-script-form "/tmp/in.boot" "/tmp/out.vfasl")))
+
+(ok "'plain emits no conversion at all"
+    (string=? (script-form-for 'plain) ""))
+(ok "'fast emits a conversion on the default codec"
+    (let ((s (script-form-for 'fast)))
+      (and (substring? "vfasl-convert-file" s)
+           (not (substring? "compress-format" s)))))
+(ok "'small emits the gzip codec"
+    (let ((s (script-form-for 'small)))
+      (and (substring? "vfasl-convert-file" s)
+           (substring? "(compress-format 'gzip)" s))))
+;; the guard is the whole point: without it a target that cannot vfasl takes the
+;; build down instead of falling back to the plain boot.
+(ok "a conversion that raises cannot kill the build"
+    (let ((s (script-form-for 'fast)))
+      (and (substring? "guard" s) (substring? "delete-file" s))))
+
+;; bld-vfasl-ensure! for real, in a spawned Chez, over all three of its arms.
+(define ensure-over (at "ensure-over.vfasl"))
+(ok "ensure! re-encodes an over-ceiling image the script produced"
+    (parameterize ((bld-lz4-image-ceiling 1024))
+      (and (sa-vfasl-convert-file probe-so ensure-over)     ; stand in for the script's LZ4 result
+           (bld-vfasl-ensure! tmp probe-so ensure-over)
+           (= (bld-boot-max-lz4-entry ensure-over) 0))))
+(define ensure-under (at "ensure-under.vfasl"))
+(ok "ensure! leaves an under-ceiling image alone"
+    (and (sa-vfasl-convert-file probe-so ensure-under)
+         (bld-vfasl-ensure! tmp probe-so ensure-under)
+         (> (bld-boot-max-lz4-entry ensure-under) 0)))
+;; The arm the cc path had no answer for: the script's conversion raised, so
+;; there is no image at all. It retries under gzip rather than dying.
+(define ensure-missing (at "ensure-missing.vfasl"))
+(when (file-exists? ensure-missing) (delete-file ensure-missing))
+(ok "ensure! retries a conversion that produced nothing"
+    (and (bld-vfasl-ensure! tmp probe-so ensure-missing)
+         (file-exists? ensure-missing)))
+;; …and when even that cannot produce one, it answers #f so the caller keeps the
+;; plain boot, instead of raising and taking the build with it.
+(ok "ensure! answers #f rather than raising when no image is possible"
+    (not (bld-vfasl-ensure! tmp (at "no-such-input.so") (at "no-such-output.vfasl"))))
 
 (printf "\nvfasl ceiling gate: ~a/~a passed~a\n"
         (- total fails) total (if (= fails 0) "" (format " (~a failed)" fails)))

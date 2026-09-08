@@ -2054,17 +2054,30 @@
 (define (bld-vfasl-disabled?) (eq? (bld-boot-mode) 'plain))
 
 ;; --- the boot image's LZ4 ceiling -------------------------------------------
-;; A compressed fasl entry whose UNCOMPRESSED size reaches 2^28 bytes cannot be
-;; read back by the Chez kernel when the entry is LZ4. c/new-io.c's
-;; S_bytevector_uncompress returns the decompressed length as `Sfixnum(r)` with
-;; `int r`, and Sfixnum is `((ptr)(uptr)((x)*8))` — the multiply happens in the
-;; argument's own type, so 2^28 and up overflow `int` to a NEGATIVE fixnum. The
-;; length check in c/fasl.c then cannot match and the load dies inside
-;; Sbuild_heap with "uncompressed size -N ... is smaller than expected size M",
-;; before a line of the binary's own code has run. The gzip arm of the same
-;; function hands zlib a uLong and has no such ceiling. Measured against Chez
-;; 10.4.1 (test/chez/vfasl-ceiling-test.ss): 2^28-1 round-trips, 2^28 does not,
-;; and gzip round-trips at both.
+;; A big enough compressed fasl entry cannot be read back by the Chez kernel when
+;; the entry is LZ4. c/new-io.c's S_bytevector_uncompress returns the
+;; decompressed length as `Sfixnum(r)` with `int r`, and Sfixnum is
+;; `((ptr)(uptr)((x)*8))` — the multiply happens in the argument's own type, so
+;; the product leaves 32 bits and the length check in c/fasl.c can never match.
+;; The load then dies inside Sbuild_heap with "uncompressed size N ... is smaller
+;; than expected size M", before a line of the binary's own code has run. The
+;; gzip arm of the same function hands zlib a uLong and has no such ceiling.
+;;
+;; WHERE the line falls is undefined behaviour, and it is not the same on every
+;; platform, because what the widening cast does with the top bit of an overflowed
+;; `int` is the C compiler's business. Both of these are Chez 10.4.1
+;; (test/chez/vfasl-ceiling-test.ss measures whichever one is in front of it):
+;;
+;;   sign-extended   a NEGATIVE length at 2^28    ceiling 2^28   ta6le, and the
+;;                   platform in jolt-lang/jolt#886 — its -222298112 is exactly
+;;                   314572800*8 wrapped to signed 32-bit and divided back by 8
+;;   zero-extended   a length of 0 at 2^29        ceiling 2^29   tarm64osx
+;;
+;; 2^28 is therefore jolt's FLOOR, not a measurement of the machine: at or below
+;; every ceiling seen, so nothing it leaves on LZ4 can fail to load. On a
+;; zero-extending platform an image between 2^28 and 2^29 is re-encoded when it
+;; did not have to be, which costs decompression speed and nothing else. That is
+;; the direction to be wrong in, and it is why nothing user-facing quotes a size.
 ;;
 ;; It is 0.8.5's vfasl boot that can reach the ceiling at all. A plain boot is
 ;; one compressed entry per top-level form and its entries are kilobytes;
@@ -2144,16 +2157,41 @@
 
 ;; Does BOOT hold an LZ4 entry the kernel could not read back? #f for a boot that
 ;; does not parse: the status quo already works for every image under the
-;; ceiling, and re-encoding on a guess would be the riskier answer.
+;; ceiling, and re-encoding on a guess would be the riskier answer. It says so
+;; out loud, though — a silent "could not check" is how this bug would come back
+;; wearing the same unreadable Sbuild_heap death it wore the first time.
 (define (bld-boot-over-lz4-ceiling? boot)
   (let ((biggest (bld-boot-max-lz4-entry boot)))
-    (and biggest (>= biggest (bld-lz4-image-ceiling)))))
+    (cond ((not biggest) (bld-note-unscannable-boot! boot) #f)
+          (else (>= biggest (bld-lz4-image-ceiling))))))
 
+;; "at or over" rather than a size: where the kernel actually gives out is
+;; undefined behaviour and moves by platform (2^28 or 2^29 — see
+;; bld-lz4-image-ceiling), so the number jolt acts on is its own floor, not a
+;; property of the machine, and quoting it as one would be wrong.
 (define (bld-note-wide-boot!)
   (display (string-append
              "jolt build: note — the boot image is at or over Chez's "
-             "256MiB LZ4 fasl ceiling;\n"
+             "LZ4 fasl ceiling;\n"
              "  re-encoding it with gzip (slower to decompress, but it loads)\n")))
+
+(define (bld-note-retry-wide!)
+  (display (string-append
+             "jolt build: note — the boot image could not be written as an LZ4 "
+             "vfasl entry;\n  retrying with gzip\n")))
+
+(define (bld-note-no-vfasl!)
+  (display (string-append
+             "jolt build: note — the boot could not be converted to a vfasl "
+             "image;\n  keeping the plain boot (slower to start, same "
+             "behaviour)\n")))
+
+(define (bld-note-unscannable-boot! boot)
+  (display (string-append
+             "jolt build: note — could not read the fasl entry headers of "
+             boot ";\n  leaving its codec alone. If a large binary dies in "
+             "Sbuild_heap reporting an\n  \"uncompressed size\", this is the "
+             "check that stopped covering it.\n")))
 
 ;; Convert BOOT to vfasl at VBOOT in this process, answering whether VBOOT is
 ;; usable. LZ4 first — it is the fast default and what every normal image wants —
@@ -2174,31 +2212,75 @@
 ;; The conversion as a form for the fresh-Chez compile scripts, empty under
 ;; 'plain. 'small sets the codec in that process the way sa-vfasl-convert-file's
 ;; 'wide does in this one.
+;;
+;; GUARDED, and it removes a half-written VBOOT on the way out. Those scripts run
+;; under bld-system, which turns a non-zero exit into a dead build — so an
+;; unguarded conversion means a target that cannot vfasl, or an image too big to
+;; write as one entry, takes the whole build down instead of degrading to the
+;; plain boot the way the in-process path does. bld-vfasl-ensure! reads the
+;; presence of VBOOT as the verdict.
 (define (bld-vfasl-script-form boot vboot)
   (if (bld-vfasl-disabled?)
       ""
       (string-append
         (if (eq? (bld-boot-mode) 'small) "(compress-format 'gzip)\n" "")
-        "(vfasl-convert-file " (ei-str-lit boot) " " (ei-str-lit vboot) " '())\n")))
+        "(guard (e (#t (when (file-exists? " (ei-str-lit vboot) ")\n"
+        "                (delete-file " (ei-str-lit vboot) "))))\n"
+        "  (vfasl-convert-file " (ei-str-lit boot) " " (ei-str-lit vboot) " '()))\n")))
 
-;; The fresh-Chez counterpart. The paths that convert inside their compile script
-;; (build-with-cc, build-shared, build-jolt.ss) have to: $fasl-to-vfasl lays an
-;; image out for one machine, and a cross build needs the xpatch's constants. So
-;; the conversion has already happened by the time we get here, and this only
-;; re-runs it under gzip when what it produced is over the ceiling.
+;; One conversion in a fresh Chez, guarded the same way, leaving VBOOT present
+;; only if it worked. CODEC is 'wide for gzip, anything else for the default.
+(define (bld-vfasl-run-convert! builddir boot vboot codec)
+  (when (file-exists? vboot) (delete-file vboot))
+  (let ((cs (string-append builddir "/vfasl-convert.ss")))
+    (let ((p (open-output-file cs 'replace)))
+      (put-string p
+        (string-append
+          "(import (chezscheme))\n"
+          (if (bld-cross?) (string-append "(load " (ei-str-lit (bld-xpatch)) ")\n") "")
+          (if (eq? codec 'wide) "(compress-format 'gzip)\n" "")
+          "(guard (e (#t (when (file-exists? " (ei-str-lit vboot) ")\n"
+          "                (delete-file " (ei-str-lit vboot) "))))\n"
+          "  (vfasl-convert-file " (ei-str-lit boot) " " (ei-str-lit vboot) " '()))\n"))
+      (close-port p))
+    (bld-system (string-append bld-chez " --script '" cs "'"))))
+
+;; The fresh-Chez counterpart of bld-vfasl-convert!, and the same contract:
+;; answer whether VBOOT is usable, never raise for a boot that simply could not
+;; be imaged. The paths that convert inside their compile script (build-with-cc,
+;; build-shared, and so every cross build) have to convert there — $fasl-to-vfasl
+;; lays an image out for one machine, and a cross build needs the xpatch's
+;; constants — so by the time we get here the attempt has already been made and
+;; this only has to grade it:
+;;
+;;   nothing produced   the script's conversion raised. Retry under gzip, which
+;;                      is also the arm for an image whose COMPRESSED half
+;;                      clears the ceiling. Still nothing: keep the plain boot.
+;;   over the ceiling   re-encode with gzip, as bld-vfasl-convert! does.
+;;   otherwise          the LZ4 image stands.
+(define (bld-vfasl-ensure! builddir boot vboot)
+  (cond
+    ((not (file-exists? vboot))
+     (bld-note-retry-wide!)
+     (bld-vfasl-run-convert! builddir boot vboot 'wide)
+     (cond ((file-exists? vboot) #t)
+           (else (bld-note-no-vfasl!) #f)))
+    ((bld-boot-over-lz4-ceiling? vboot)
+     (bld-note-wide-boot!)
+     (bld-vfasl-run-convert! builddir boot vboot 'wide)
+     (cond ((file-exists? vboot) #t)
+           (else (bld-note-no-vfasl!) #f)))
+    (else #t)))
+
+;; jolt's OWN boot (build-jolt.ss), whose conversion is not guarded: a jolt build
+;; that cannot image its boot is a broken toolchain, not a user's app degrading,
+;; so this raises rather than quietly shipping a plain boot.
 (define (bld-vfasl-regzip! builddir boot vboot)
   (when (bld-boot-over-lz4-ceiling? vboot)
     (bld-note-wide-boot!)
-    (let ((cs (string-append builddir "/vfasl-gzip.ss")))
-      (let ((p (open-output-file cs 'replace)))
-        (put-string p
-          (string-append
-            "(import (chezscheme))\n"
-            (if (bld-cross?) (string-append "(load " (ei-str-lit (bld-xpatch)) ")\n") "")
-            "(compress-format 'gzip)\n"
-            "(vfasl-convert-file " (ei-str-lit boot) " " (ei-str-lit vboot) " '())\n"))
-        (close-port p))
-      (bld-system (string-append bld-chez " --script '" cs "'")))))
+    (bld-vfasl-run-convert! builddir boot vboot 'wide)
+    (unless (file-exists? vboot)
+      (error 'jolt-build "gzip re-encode of the boot image failed" vboot))))
 
 ;; units: a list of (src so kind) compiled in order and loaded into the boot in
 ;; that order, so the runtime half's defines precede the app half's reads.
@@ -2390,9 +2472,12 @@
       (close-port p))
     (bld-system (string-append bld-chez " --script '" cs "'")))
   ;; the converted boot is what gets embedded
+  ;; …and only switch to it if one actually exists: bld-vfasl-ensure! answers #f
+  ;; for a target that could not be imaged at all, and the plain boot is then
+  ;; what gets embedded.
   (unless (bld-vfasl-disabled?)
-    (bld-vfasl-regzip! builddir boot (string-append boot ".vfasl"))
-    (set! boot (string-append boot ".vfasl")))
+    (when (bld-vfasl-ensure! builddir boot (string-append boot ".vfasl"))
+      (set! boot (string-append boot ".vfasl"))))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   ;; The xxd symbol is derived from the path; normalize to jolt_boot.
   (bld-system (string-append
@@ -2490,9 +2575,12 @@
           (bld-vfasl-script-form boot (string-append boot ".vfasl"))))
       (close-port p))
     (bld-system (string-append bld-chez " --script '" cs "'")))
+  ;; …and only switch to it if one actually exists: bld-vfasl-ensure! answers #f
+  ;; for a target that could not be imaged at all, and the plain boot is then
+  ;; what gets embedded.
   (unless (bld-vfasl-disabled?)
-    (bld-vfasl-regzip! builddir boot (string-append boot ".vfasl"))
-    (set! boot (string-append boot ".vfasl")))
+    (when (bld-vfasl-ensure! builddir boot (string-append boot ".vfasl"))
+      (set! boot (string-append boot ".vfasl"))))
   (bld-system (string-append "xxd -i '" boot "' > '" boot-h "'"))
   (bld-system (string-append
     "sed -i.bak -E 's/unsigned char [A-Za-z0-9_]+\\[\\]/unsigned char jolt_boot[]/; "

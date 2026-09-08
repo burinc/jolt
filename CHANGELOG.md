@@ -80,9 +80,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thing — the environment variable being the spelling a CI job can set without
   editing the build command. `--no-vfasl`, `:no-vfasl true` and `JOLT_NO_VFASL=1`
   are the spelling #886 asked for and are kept as aliases for `--boot plain`.
-  Precedence is resolved in one place: flag, then `deps.edn`, then environment.
-  It covers the self-contained, cc-linked and `--library` paths; jolt's own boot
-  is not a `jolt build` and is unaffected.
+  Precedence is resolved in one place: CLI, then `deps.edn`, then environment,
+  and within each of those the explicit `--boot` spelling beats the alias — a
+  script that adds `--boot small` without dropping the `--no-vfasl` it already
+  had is exactly the migration #886 is on, and the other order would silently
+  keep the boot it was trying to leave. A blank environment variable reads as
+  unset, the way `bin/jolt` already treats `JOLT_NO_DEVCACHE`, because CI exports
+  an empty value for a matrix leg nothing filled in. It covers the
+  self-contained, cc-linked and `--library` paths; jolt's own boot is not a
+  `jolt build` and is unaffected.
 
   **Reach for `small` before `plain`.** The size cost turns out to be mostly the
   *codec's* rather than vfasl's, so for a jolt app `small` beats `plain` on both
@@ -115,29 +121,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **A large binary's boot image loads again.** A program big enough for its boot
-  image to reach 256MiB built fine and then died on every run, inside
-  `Sbuild_heap`, before a line of its own code had executed:
+  image to cross Chez's LZ4 fasl ceiling built fine and then died on every run,
+  inside `Sbuild_heap`, before a line of its own code had executed:
 
   ```
   fasl-read: uncompressed size -222298112 for #vu8(…) is smaller than
              expected size 314572800
   ```
 
-  The negative number is the tell. Chez's kernel decompresses a fasl entry and
+  The nonsense number is the tell. Chez's kernel decompresses a fasl entry and
   compares the result against the size the entry declares; on the LZ4 arm
   (`c/new-io.c`, `S_bytevector_uncompress`) it returns that result as
   `Sfixnum(r)` with `int r`, and `Sfixnum` is `((ptr)(uptr)((x)*8))` — the
-  multiply happens in the argument's own type. At 2^28 bytes it overflows `int`,
-  the length comes back negative, and the comparison can never succeed. The gzip
-  arm of the same function hands zlib a `uLong` and has no ceiling: measured
-  against Chez 10.4.1, LZ4 round-trips at 2^28-1 and fails at 2^28, and gzip
-  round-trips at both.
+  multiply happens in the argument's own type, so the product leaves 32 bits and
+  the comparison can never succeed. The gzip arm of the same function hands zlib
+  a `uLong` and has no ceiling.
+
+  Where the line falls is undefined behaviour, and it is not the same on every
+  platform, because what the widening cast does with the top bit of an overflowed
+  `int` is the C compiler's business. Both of these are Chez 10.4.1: the product
+  keeps its sign on `ta6le`, so the length comes back negative at 2^28 and the
+  ceiling is 2^28 (the `-222298112` above is exactly `314572800 * 8` wrapped to
+  signed 32-bit and divided back by 8); it does not on `tarm64osx`, where the
+  length comes back `0` at 2^29 and the ceiling is 2^29.
 
   Nothing before 0.8.5 could reach it. A plain boot is one compressed entry per
   top-level form and its entries are kilobytes; the vfasl boot 0.8.5 introduced
   combines each input boot file into ONE entry, so a program's whole compiled
   half became a single image — 83MB for the build smoke's hello-world-plus, 43MB
-  for jolt itself, and past 256MiB an executable that cannot start. The failure
+  for jolt itself, and past the ceiling an executable that cannot start. The failure
   scaled with the program, which is the worst shape for it: every app that had
   been built with 0.8.5 worked, right up to the one that didn't.
 
@@ -145,21 +157,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it keeps the image off the ceiling instead. `jolt build` now reads back the
   entry headers of the boot it just converted, and when an LZ4 entry declares an
   uncompressed size at or over 2^28 it re-encodes the image with gzip and says
-  so. Only a build that was previously broken changes — every image under the
-  ceiling is byte-for-byte what it was — and it keeps the vfasl format, so what
-  it gives up is decompression speed, not the load. Measured on the build
+  so. 2^28 is jolt's floor rather than a measurement of the machine: at or below
+  every ceiling seen, so nothing it leaves on LZ4 can fail to load, and on a
+  platform whose real ceiling is 2^29 an image in between is re-encoded when it
+  did not have to be, which costs decompression speed and nothing else. Only a
+  build that was previously broken changes — every image under the ceiling is
+  byte-for-byte what it was — and it keeps the vfasl format, so what it gives up
+  is decompression speed, not the load. Measured on the build
   smoke's app, whose image is 83MB, with both codecs forced: **0.26s and a
   27.6MB binary on LZ4, 0.44s and a 16.8MB binary on gzip.** Slower to start and
-  a third smaller, which is the shape of the trade at any size; at 256MiB and up
+  a third smaller, which is the shape of the trade at any size; over the ceiling
   the alternative is a binary that does not start. The same check covers
   `--library` and jolt's own boot.
 
-  `make vfaslceiling` pins all three legs — that the ceiling is real and is
-  exactly 2^28, that gzip has none, and that the scanner and the fallback do what
-  they claim, by lowering the ceiling under a boot small enough to build in a
-  second. The check for LZ4 *failing* at 2^28 is deliberately a check on the
-  kernel: when a future Chez fixes the overflow it turns red, and that is the
-  signal to delete the workaround rather than a regression.
+  The paths that convert in a spawned Chez — `build-with-cc`, `build-shared`, and
+  so every cross build, which is the configuration #886 reports from — now
+  degrade the way the in-process path already did. Their conversion is guarded,
+  and a boot that could not be imaged at all leaves the plain boot in place with
+  a note, instead of taking the build down through the spawned script's exit
+  status.
+
+  `make vfaslceiling` measures the ceiling of the kernel in front of it, by
+  writing and reading real compressed fasl entries, and then pins the properties
+  the fix rests on: that a ceiling still exists, that jolt's constant sits at or
+  below it while staying high enough that everything under it loads, that gzip
+  clears the size which defeated LZ4, and that the scanner and both fallbacks do
+  what they claim — the last by lowering the ceiling under a boot small enough to
+  build in a second. Finding no ceiling at all is the signal that a future Chez
+  fixed the overflow and the workaround can go, rather than a regression. It
+  measures rather than asserting one number because an equality on 2^28 is red on
+  `tarm64osx`, where it would read as "Chez fixed this" when Chez has done
+  nothing of the kind.
 
 - **A namespace-level `(defn double …)` owns the name, as it already did for
   `(defn first …)`.** jolt has two layers that rewrite a `clojure.core` call into
