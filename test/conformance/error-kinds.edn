@@ -86,6 +86,19 @@
  "A symbol that names neither a local, an interned var, nor an imported class.
   Carries :symbol, :suggestions and :ns alongside the position."
 
+ :analyze/unknown-namespace
+ "A qualified symbol whose namespace half is namespace-shaped — dotted, with a
+  lowercase segment after the last dot — and names no loaded namespace at all: a
+  missing `require`, or a typo in the namespace part. The JVM reports the same
+  thing, as `No such namespace`. Two neighbouring cases are deliberately NOT
+  this error, and both report at the call instead. A LOADED namespace missing
+  only the var stays late-bound, because that is how jolt-core reaches its host
+  contract (`jolt.host/…`) across boots that load different host files; its
+  compile-time guard is the static one in `host/chez/jolt-host-manifest.txt`, and
+  the miss reads `No such var: ns/name`. And a name with no dot (`str/join`) may
+  be an `:import`-ed class short name whose provider has not autoloaded yet.
+  Carries :symbol, :namespace and :ns alongside the position."
+
  :analyze/invalid-member-access
  "A host interop form that does not parse: (. target member ...), (.method
   target ...) or (.-field target) with a missing or non-symbol member."

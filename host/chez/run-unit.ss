@@ -18,6 +18,13 @@
 ;; whose NATIVE vars exist (e.g. clojure.core.async) silently no-ops via the
 ;; ns-has-vars? arm and the overlay fns are missing at analysis.
 (load "host/chez/loader.ss")
+;; jolt.ffi's HOST half, in cli.ss's position (after the loader, per its note
+;; there). Without it the gate booted a world holding jolt.ffi's Clojure half and
+;; not its host half, so stdlib/jolt/ffi.clj's fully-qualified reaches for the
+;; primitives (jolt.ffi/__cfn, __remember-size!) resolved to nothing — and the
+;; ffi row, which asserts only :throws, passed on "Unknown class jolt.ffi"
+;; instead of on the bad-type error it is written to provoke.
+(load "host/chez/java/ffi.ss")
 (set-source-roots! ldr-install-roots)
 ;; The base java.time API (stdlib/jolt/time) autoloads on first java.time.* use at
 ;; runtime; here we load it once BEFORE the per-case snapshot below so its

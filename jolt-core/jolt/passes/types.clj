@@ -1446,8 +1446,9 @@
 ;; [converged? ptypes rets] so the caller can chain one phase into the next.
 ;; JOLT_WP_TRACE=1 prints one line per fixpoint iteration and field round, so a
 ;; build's whole-program cost can be read as walk counts rather than guessed.
-;; jolt.host/getenv is referenced fully-qualified (late-bound) for the same
-;; reason passes.clj does: the seed mint compiles this ns before it resolves.
+;; jolt.host/getenv is referenced fully-qualified rather than :refer'd, and is
+;; defined in rt.ss so that it resolves here: this def runs as the seed image
+;; loads, ahead of loader.ss. See the note on jolt.passes/ir-validate?.
 (def ^:private wp-trace? (jolt.host/getenv "JOLT_WP_TRACE"))
 (defn- wp-iterate [unit nodes spec ks ptypes0 rets0 self-rec?]
   (loop [iter 0 ptypes ptypes0 rets rets0]
