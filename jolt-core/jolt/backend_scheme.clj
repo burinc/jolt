@@ -618,6 +618,47 @@
         nm)
       expr)))
 
+;; ...and the same hoist keyed by the SOURCE OBJECT, which is what the reference
+;; compiler does: Compiler.registerConstant keys its pool on an IdentityHashMap,
+;; so one form object is one constant however many times it appears in the code
+;; being compiled, while two forms that merely READ alike stay two constants.
+;;
+;; Both halves matter and per-site had only the second. A macro that mentions its
+;; argument more than once — clojure.test/is names the tested form five times,
+;; across :form, :expected and three :actual arms — splices the SAME object into
+;; every one, and per-site emitted a fresh construction for each. Measured on one
+;; deftest holding 800 (is (= n n)): 6410 hoisted bindings of which 812 were
+;; distinct, 87% redundant. They all land in one let*, and Chez's compile is
+;; quadratic in that, so the waste is squared rather than added.
+;;
+;; The distinction per-site exists to protect is preserved exactly, because it is
+;; a distinction between OBJECTS: (defn f [] [\a ##NaN]) and a second literal
+;; written elsewhere read as two forms, so they stay two constants and
+;; (= (f) (f)) keeps answering true while two separate sites answer false. That
+;; is clojure.core-test/not-eq's row, and it passes on identity keying for the
+;; same reason it passes on the JVM.
+;;
+;; Keyed through jolt.host/identity-hash with an identical? check rather than a
+;; map with identity semantics: java.util.IdentityHashMap is value-keyed here (a
+;; recorded divergence), and a jolt seq does not cache its hash, so an
+;; equality-keyed map would walk the subtree this exists to avoid walking.
+;;
+;; The index is its OWN atom and not another key shape in the pool: the pool is
+;; flushed to let* bindings by position, so anything else living there would have
+;; to be filtered back out at that seam.
+(def ^:dynamic *const-ids* nil)
+
+(defn- hoist-const-for [obj expr]
+  (let [pool *const-pool* ids *const-ids*]
+    (if (or (nil? pool) (nil? ids) (nil? obj))
+      (hoist-const-per-site expr)
+      (let [k (jolt.host/identity-hash obj)]
+        (or (first (keep (fn [r] (when (identical? (nth r 0) obj) (nth r 1)))
+                         (get @ids k)))
+            (let [nm (hoist-const-per-site expr)]
+              (swap! ids update k (fnil conj []) [obj nm])
+              nm))))))
+
 ;; Is this literal a CONSTANT construction — one whose value is fully determined at
 ;; emit time, so building it once per def and sharing it is indistinguishable from
 ;; building it per evaluation? True for a scalar :const and for a collection literal
@@ -652,8 +693,10 @@
 (defn- emit-with-cells [emit-thunk]
   (let [cells (atom [])
         pool (atom {})
+        ids (atom {})
         raw (binding [*cache-cells* cells
-                      *const-pool* pool]
+                      *const-pool* pool
+                      *const-ids* ids]
               (emit-thunk))
         ;; constants bind eagerly (value first); lazy cache cells start #f. Ordered
         ;; by INSERTION so a constant that references an earlier one (a hoisted
@@ -3039,14 +3082,18 @@
     ;; A quoted scalar (form-char?/form-literal?) emits as an immediate constant
     ;; via emit-const — nothing to hoist. Every other quoted form (symbol, list,
     ;; vector, map, set, regex/inst/uuid/tagged) is a CONSTRUCTION rebuilt per
-    ;; evaluation, so hoist it to a per-site constant: built once per def, one
-    ;; object across calls of the same site, distinct objects across sites —
-    ;; the reference compiler's ConstantExpr behavior for quoted data.
+    ;; evaluation, so hoist it: built once per def, one object per source form,
+    ;; distinct objects for distinct forms — the reference compiler's
+    ;; ConstantExpr behavior for quoted data.
+    ;;
+    ;; Keyed by the FORM, so a macro that splices one form into several places in
+    ;; its expansion gets one constant rather than one per mention. See
+    ;; hoist-const-for.
     :quote (let [f (:form node)
                  s (emit-quoted f)]
              (if (or (form-char? f) (form-literal? f))
                s
-               (hoist-const-per-site s)))
+               (hoist-const-for f s)))
     ;; the thrown value is an operand (emitted non-tail); the throw itself goes
     ;; through emit-call with marks?=#f, so a TAIL throw gets the site-vreg pair
     ;; (sited-tail-call — stored after the operand is bound, so the operand's own
