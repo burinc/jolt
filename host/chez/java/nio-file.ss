@@ -674,7 +674,43 @@
   (register-class-statics! "PosixFilePermission" pfp-perms)
   (register-class-statics! "java.nio.file.attribute.PosixFilePermission" pfp-perms))
 
-;; copy / move honor REPLACE_EXISTING; write / newOutputStream honor APPEND.
+;; copy / move honor REPLACE_EXISTING; write honors APPEND. newOutputStream's
+;; options need a fuller mapping because CREATE_NEW is an atomic filesystem
+;; operation, not a pre-open existence check: the port returned by
+;; open-file-output-port with no `no-fail` option owns the O_EXCL-style create
+;; handle itself.
+(define (nio-output-file-options args)
+  (let* ((opts (npath-spread-args args))
+         (syms (map oopt-sym opts)))
+    (for-each
+     (lambda (sym)
+       (unless (memq sym '(write append create create-new truncate-existing))
+         (throw-jvm (quote UnsupportedOperationException)
+                    "unsupported option for Files.newOutputStream")))
+     syms)
+    (let* ((defaults? (null? syms))
+           (append? (memq 'append syms))
+           (truncate? (or defaults? (memq 'truncate-existing syms)))
+           (create-new? (memq 'create-new syms))
+           (create? (or defaults? create-new? (memq 'create syms))))
+      (when (and append? truncate?)
+        (throw-jvm (quote IllegalArgumentException)
+                   "APPEND and TRUNCATE_EXISTING cannot be used together"))
+      (cond
+        ;; No `no-fail`: Chez creates the entry and atomically fails if any
+        ;; entry (including a symlink) already occupies the path.
+        (create-new? (if append?
+                         (file-options no-truncate append)
+                         (file-options)))
+        (append? (if create?
+                     (file-options no-fail no-truncate append)
+                     (file-options no-create no-fail no-truncate append)))
+        (create? (if truncate?
+                     (file-options no-fail)
+                     (file-options no-fail no-truncate)))
+        (truncate? (file-options no-create no-fail))
+        (else (file-options no-create no-fail no-truncate))))))
+
 (define (nio-append! fp data)
   (let ((port (open-file-output-port fp (file-options no-fail no-truncate append))))
     (put-bytevector port (cond ((jolt-array? data) (na-bytearray->bv data))
@@ -689,9 +725,7 @@
              (cons "newOutputStream" (lambda (p . opts)
                                       (make-out-stream
                                        (open-file-output-port
-                                        (nfp p) (if (nio-opts-have? opts oopt-sym 'append)
-                                                    (file-options no-fail no-truncate append)
-                                                    (file-options no-fail)))))))))
+                                        (nfp p) (nio-output-file-options opts))))))))
   (set! files-accum (append files-accum files-opt)))
 
 ;; ---- stat-backed perms + real path (increment: what the fs suite exercises) --
