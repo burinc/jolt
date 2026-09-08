@@ -309,9 +309,6 @@
                             "" (seq->list (jolt-seq data)))))
        (string->utf8 body)))))
 
-(define (nio-write! fp data)
-  (nio-write-bv! fp (nio-output-data->bv data)))
-
 (define (nio-delete1 fp missing-ok?)
   (cond ((nio-is-symlink? fp) (delete-file fp) #t)   ; the link itself, even if dangling
         ((not (file-exists? fp))
@@ -701,7 +698,7 @@
            (create? (or defaults? create-new? (memq 'create syms))))
       (when (and append? truncate?)
         (throw-jvm (quote IllegalArgumentException)
-                   "APPEND and TRUNCATE_EXISTING cannot be used together"))
+                   "APPEND + TRUNCATE_EXISTING not allowed"))
       (cond
         ;; No `no-fail`: Chez creates the entry and atomically fails if any
         ;; entry (including a symlink) already occupies the path.
@@ -717,23 +714,47 @@
         (truncate? (file-options no-create no-fail))
         (else (file-options no-create no-fail no-truncate))))))
 
+;; A failed open raises a Chez &i/o-filename condition whose second irritant is
+;; the errno's strerror text; the JDK renders that text after the path for the
+;; errnos it has no dedicated class for. Match on the string rather than the
+;; position so an unexpected irritant list degrades to the bare path.
+(define (nio-open-error-reason e fp)
+  (and (irritants-condition? e)
+       (let loop ((xs (condition-irritants e)))
+         (cond ((null? xs) #f)
+               ((and (string? (car xs)) (not (string=? (car xs) fp))) (car xs))
+               (else (loop (cdr xs)))))))
+
+;; UnixException.translateToIOException is the contract here: ENOENT, EEXIST and
+;; EACCES each get a class and carry only the path as their message, and every
+;; other errno -- EISDIR, ELOOP, ENOTDIR, ENOSPC -- arrives as a plain
+;; FileSystemException reading "<path>: <reason>". The last arm used to re-raise,
+;; which let the Chez condition escape to be rendered as a bare java.io.
+;; IOException whose message named open-file-output-port.
 (define (nio-open-output-port fp options)
+  (define (throw-nio cls msg) (jolt-throw (jolt-host-throwable cls msg)))
   (guard (e
           ((i/o-file-already-exists-error? e)
-           (jolt-throw (jolt-host-throwable
-                        "java.nio.file.FileAlreadyExistsException" fp)))
+           (throw-nio "java.nio.file.FileAlreadyExistsException" fp))
           ((i/o-file-does-not-exist-error? e)
-           (jolt-throw (jolt-host-throwable
-                        "java.nio.file.NoSuchFileException" fp)))
+           (throw-nio "java.nio.file.NoSuchFileException" fp))
+          ((i/o-file-protection-error? e)
+           (throw-nio "java.nio.file.AccessDeniedException" fp))
+          ((i/o-filename-error? e)
+           (let ((reason (nio-open-error-reason e fp)))
+             (throw-nio "java.nio.file.FileSystemException"
+                        (if reason (string-append fp ": " reason) fp))))
           (else (raise e)))
     (open-file-output-port fp options)))
 
 (let ((files-opt
        (list (cons "write" (lambda (p data . opts)
                              (let* ((fp (nfp p))
-                                    (file-options (nio-output-file-options opts))
+                                    ;; not named `file-options`: that is the Chez
+                                    ;; macro this scope still needs to mean itself
+                                    (fopts (nio-output-file-options opts))
                                     (bytes (nio-output-data->bv data))
-                                    (port (nio-open-output-port fp file-options)))
+                                    (port (nio-open-output-port fp fopts)))
                                (put-bytevector port bytes)
                                (close-port port)
                                (->path p))))
