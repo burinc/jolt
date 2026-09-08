@@ -58,7 +58,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were open, so the generic seam is faster too: an unhinted `aset`, and every
   other door into a byte array (`into-array`, `Arrays/fill`, `na-list->backing`).
 
+### Added
+
+- **`jolt build --boot fast|small|plain` picks how the boot image is encoded.**
+  0.8.5 converts the boot to vfasl — an image of the loaded heap, which starts
+  fast and takes room — with no way to decline. For an app whose download size is
+  the number that matters that is the wrong trade: an iOS `--target tpb64l` build
+  grew 7.6MB in the binary and about 5MB in the compressed IPA
+  (jolt-lang/jolt#886, reported with before/after numbers for both simulator and
+  device targets).
+
+  The flag is ordered along the one curve those numbers sit on:
+
+  | `--boot` | boot image | for |
+  |---|---|---|
+  | `fast` (default) | vfasl, LZ4-compressed | the fastest start; today's behaviour, unchanged |
+  | `small` | vfasl, gzip-compressed | the smallest binary that still loads as an image |
+  | `plain` | no vfasl | the boot 0.8.4 produced |
+
+  `:jolt/build {:boot :small}` in `deps.edn` and `JOLT_BOOT=small` do the same
+  thing — the environment variable being the spelling a CI job can set without
+  editing the build command. `--no-vfasl`, `:no-vfasl true` and `JOLT_NO_VFASL=1`
+  are the spelling #886 asked for and are kept as aliases for `--boot plain`.
+  Precedence is resolved in one place: flag, then `deps.edn`, then environment.
+  It covers the self-contained, cc-linked and `--library` paths; jolt's own boot
+  is not a `jolt build` and is unaffected.
+
+  **Reach for `small` before `plain`.** The size cost turns out to be mostly the
+  *codec's* rather than vfasl's, so for a jolt app `small` beats `plain` on both
+  axes at once — measured over two apps and two machine types, binary size and
+  warm start, against the plain boot as the baseline:
+
+  | app / target | `plain` | `fast` | `small` |
+  |---|---|---|---|
+  | hello, host `ta6le` | 25,919,203 · 495ms | +5.5% · 249ms | **−35.7% · 429ms** |
+  | build-app, host `ta6le` | 26,062,746 · 502ms | +5.8% · 250ms | **−35.5% · 434ms** |
+  | hello, target `tpb64l` | 24,873,035 | +5.8% | **−38.1%** |
+
+  On `tpb64l` — the target in #886 — `small` is 9.5MB *below* the plain boot the
+  report asked for, where the complaint was the default costing 7.6MB. `plain`
+  stays because a target that cannot vfasl at all still needs it, not because it
+  is the size answer.
+
+  Measure your own app rather than quoting those ratios: they are a property of
+  what is in the image, not of the machine. The same three encodings over Chez's
+  own boots, which carry no jolt runtime, cost `fast` +37% and gain `small` only
+  3–4%, with `small` there *slower* than `plain` — which is also why the #886
+  reporter saw +24% where a jolt app sees +6%.
+
+  (Portable-bytecode notes found on the way: plain `pb` cannot vfasl at all —
+  "cannot vfasl with unknown endianness" — so an endianness-pinned machine such
+  as `tpb64l` is required; and a `tpb64l` target pack whose kernel was built
+  without libffi produces a binary that aborts at startup, since jolt's runtime
+  uses `foreign-procedure`.)
+
 ### Fixed
+
+- **A large binary's boot image loads again.** A program big enough for its boot
+  image to reach 256MiB built fine and then died on every run, inside
+  `Sbuild_heap`, before a line of its own code had executed:
+
+  ```
+  fasl-read: uncompressed size -222298112 for #vu8(…) is smaller than
+             expected size 314572800
+  ```
+
+  The negative number is the tell. Chez's kernel decompresses a fasl entry and
+  compares the result against the size the entry declares; on the LZ4 arm
+  (`c/new-io.c`, `S_bytevector_uncompress`) it returns that result as
+  `Sfixnum(r)` with `int r`, and `Sfixnum` is `((ptr)(uptr)((x)*8))` — the
+  multiply happens in the argument's own type. At 2^28 bytes it overflows `int`,
+  the length comes back negative, and the comparison can never succeed. The gzip
+  arm of the same function hands zlib a `uLong` and has no ceiling: measured
+  against Chez 10.4.1, LZ4 round-trips at 2^28-1 and fails at 2^28, and gzip
+  round-trips at both.
+
+  Nothing before 0.8.5 could reach it. A plain boot is one compressed entry per
+  top-level form and its entries are kilobytes; the vfasl boot 0.8.5 introduced
+  combines each input boot file into ONE entry, so a program's whole compiled
+  half became a single image — 83MB for the build smoke's hello-world-plus, 43MB
+  for jolt itself, and past 256MiB an executable that cannot start. The failure
+  scaled with the program, which is the worst shape for it: every app that had
+  been built with 0.8.5 worked, right up to the one that didn't.
+
+  jolt links against whatever Chez the machine has, so it cannot fix the kernel;
+  it keeps the image off the ceiling instead. `jolt build` now reads back the
+  entry headers of the boot it just converted, and when an LZ4 entry declares an
+  uncompressed size at or over 2^28 it re-encodes the image with gzip and says
+  so. Only a build that was previously broken changes — every image under the
+  ceiling is byte-for-byte what it was — and it keeps the vfasl format, so what
+  it gives up is decompression speed, not the load. Measured on the build
+  smoke's app, whose image is 83MB, with both codecs forced: **0.26s and a
+  27.6MB binary on LZ4, 0.44s and a 16.8MB binary on gzip.** Slower to start and
+  a third smaller, which is the shape of the trade at any size; at 256MiB and up
+  the alternative is a binary that does not start. The same check covers
+  `--library` and jolt's own boot.
+
+  `make vfaslceiling` pins all three legs — that the ceiling is real and is
+  exactly 2^28, that gzip has none, and that the scanner and the fallback do what
+  they claim, by lowering the ceiling under a boot small enough to build in a
+  second. The check for LZ4 *failing* at 2^28 is deliberately a check on the
+  kernel: when a future Chez fixes the overflow it turns red, and that is the
+  signal to delete the workaround rather than a regression.
 
 - **A namespace-level `(defn double …)` owns the name, as it already did for
   `(defn first …)`.** jolt has two layers that rewrite a `clojure.core` call into

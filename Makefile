@@ -103,7 +103,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
   narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
-  traceemit \
+  traceemit vfaslceiling \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
   threadsafety values wp ci
 
@@ -165,7 +165,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint compilepathsmoke makefilesmoke versionsmoke \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
 TEST-GATES := submodules selfhost ci
@@ -926,6 +926,17 @@ adaptercheck:
 # not build on, so the table is pinned per tag rather than per running machine.
 hostprops:
 	@$(CHEZ) --script test/chez/host-derived-props-test.ss
+
+# The boot image's LZ4 ceiling (jolt-23z). Chez cannot read back an LZ4 fasl
+# entry of 2^28 uncompressed bytes or more, and 0.8.5's vfasl boot is one entry
+# per input boot file rather than one per top-level form — so a large enough app
+# built a binary that died in Sbuild_heap. build.ss re-encodes such an image with
+# gzip; this pins the kernel fact behind that, the entry scanner that detects it,
+# and the fallback itself. JOLT_MAX_HEAP=off because two of the checks have to
+# allocate 256MiB to ask the question at all, and the runtime's own heap bound
+# would otherwise answer first.
+vfaslceiling:
+	@JOLT_MAX_HEAP=off $(CHEZ) --script test/chez/vfasl-ceiling-test.ss
 
 # The other half of the same rule: knowing the platform is only useful if the
 # struct stat offsets it selects are the ones this machine actually uses. The
