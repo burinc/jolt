@@ -714,14 +714,36 @@
         (truncate? (file-options no-create no-fail))
         (else (file-options no-create no-fail no-truncate))))))
 
+;; A failed open raises a Chez &i/o-filename condition whose second irritant is
+;; the errno's strerror text; the JDK renders that text after the path for the
+;; errnos it has no dedicated class for. Match on the string rather than the
+;; position so an unexpected irritant list degrades to the bare path.
+(define (nio-open-error-reason e fp)
+  (and (irritants-condition? e)
+       (let loop ((xs (condition-irritants e)))
+         (cond ((null? xs) #f)
+               ((and (string? (car xs)) (not (string=? (car xs) fp))) (car xs))
+               (else (loop (cdr xs)))))))
+
+;; UnixException.translateToIOException is the contract here: ENOENT, EEXIST and
+;; EACCES each get a class and carry only the path as their message, and every
+;; other errno -- EISDIR, ELOOP, ENOTDIR, ENOSPC -- arrives as a plain
+;; FileSystemException reading "<path>: <reason>". The last arm used to re-raise,
+;; which let the Chez condition escape to be rendered as a bare java.io.
+;; IOException whose message named open-file-output-port.
 (define (nio-open-output-port fp options)
+  (define (throw-nio cls msg) (jolt-throw (jolt-host-throwable cls msg)))
   (guard (e
           ((i/o-file-already-exists-error? e)
-           (jolt-throw (jolt-host-throwable
-                        "java.nio.file.FileAlreadyExistsException" fp)))
+           (throw-nio "java.nio.file.FileAlreadyExistsException" fp))
           ((i/o-file-does-not-exist-error? e)
-           (jolt-throw (jolt-host-throwable
-                        "java.nio.file.NoSuchFileException" fp)))
+           (throw-nio "java.nio.file.NoSuchFileException" fp))
+          ((i/o-file-protection-error? e)
+           (throw-nio "java.nio.file.AccessDeniedException" fp))
+          ((i/o-filename-error? e)
+           (let ((reason (nio-open-error-reason e fp)))
+             (throw-nio "java.nio.file.FileSystemException"
+                        (if reason (string-append fp ": " reason) fp))))
           (else (raise e)))
     (open-file-output-port fp options)))
 
