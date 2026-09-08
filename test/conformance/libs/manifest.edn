@@ -446,11 +446,14 @@
    ;; errors are generator-test (7), experimental-test (1) and instrument-test
    ;; (1); the rest of the failures are core-test (12, the :every schema over an
    ;; eduction), error-test (3), instrument-test (3), generator-test (2),
-   ;; provider-test (2), swagger-test (2) and registry-test (1). parser-test,
-   ;; which an earlier recording called out as the bulk of the failures, is
-   ;; green (1754 assertions) — it draws from (mg/sample s {:seed 0}), and a
-   ;; fixed seed drawing different values here than on the JVM is the same
-   ;; family as test.check's :tolerance, not a malli bug.
+   ;; provider-test (2), swagger-test (2) and registry-test (1).
+   ;; malli.parser-test is green at 1754 assertions — an earlier recording
+   ;; called out parser-info-test as the bulk of the failures, but that is a
+   ;; deftest INSIDE malli.parser-test rather than a namespace of its own, and
+   ;; the count it quoted came from a much older tally. If it does drift: it
+   ;; draws from (mg/sample s {:seed 0}), and a fixed seed drawing different
+   ;; values here than on the JVM is the same family as test.check's
+   ;; :tolerance, not a malli bug.
    ;;
    ;; Refreshed from 6751/42 to 6757/36 (identical over three runs, and on a
    ;; main binary): six assertions moved from fail to pass somewhere in the ~500

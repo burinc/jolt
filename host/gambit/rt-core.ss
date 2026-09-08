@@ -512,9 +512,13 @@
 (def-var! "jolt.host" "available-processors" (lambda () (jolt-available-processors)))
 ;; jolt.host/getenv — the process environment. Mirrors rt.ss, and for the reason
 ;; given there: the compiler image reads it in a top-level def as it LOADS, so it
-;; has to exist before the seed (jolt#879). Gambit's getenv RAISES on an unset
-;; name unless a default is passed; Chez's returns #f, so pass #f and share the
-;; rest of the shape.
+;; has to exist before the seed (jolt#879). Gambit's NATIVE getenv raises on an
+;; unset name where Chez's returns #f, but prelude-shims.ss already Chez-shapes
+;; the bare one-argument form (its getenv CONTRACT note) by catching that raise,
+;; which is why the bare (getenv "JOLT_VERSION") above works — so either spelling
+;; would do here. The default is passed explicitly rather than leaning on the
+;; shim's guard, which catches EVERY error and so cannot tell "unset" from a real
+;; failure; that is the one distinction a var handed to user code should keep.
 (def-var! "jolt.host" "getenv" (lambda (n) (let ((v (getenv n #f))) (if v v jolt-nil))))
 
 ;; SKIPPED on the gambit target: the telemetry primitives region (wall/mono
