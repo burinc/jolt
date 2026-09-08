@@ -2691,6 +2691,12 @@
   (lambda (x)
     (jolt-seq (record-method-dispatch x "iterator" jolt-nil))))
 
+(define (iface-seqable? v)
+  (and (or (jrec? v) (jreify? v))
+       (or (and (iface-method v "seq" #f) #t)
+           (and (iface-method v "iterator" #f) #t)
+           (and (iface-method v "hasNext" #f) #t))))
+
 (define (jolt-satisfies? proto obj)
   (if (jclass? proto)
       (if (instance-check proto obj) #t #f)
