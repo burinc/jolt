@@ -120,6 +120,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`seqable?` answers for a `deftype` or `reify` that declares `Seqable` or
+  `Iterable`.** On the JVM `seqable?` is an `instance?` test over `Seqable` /
+  `ISeq` / `Iterable` (plus arrays, `CharSequence` and `Map`); jolt built it out
+  of `coll?`, which a bare deftype is not, so it said false for values `seq`
+  works on perfectly well — including `clojure.core.Eduction`, the one in core.
+  malli's `:every` schema tests seqability before it walks, so
+  `(m/validate [:every :int] (eduction (map identity) [1 2 3]))` was false and
+  `(m/parser [:every :any])` answered `::invalid` on an eduction. The predicate
+  now reads the same per-method probes the `seq` arms read, so the two answers
+  cannot drift apart again; the collection-BEHAVIOUR interfaces stay out of it,
+  because `ILookup` and `Counted` are not `Seqable` on the JVM either.
+
 - **A large binary's boot image loads again.** A program big enough for its boot
   image to cross Chez's LZ4 fasl ceiling built fine and then died on every run,
   inside `Sbuild_heap`, before a line of its own code had executed:

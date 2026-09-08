@@ -605,6 +605,27 @@
 (register-seq-arm! (lambda (x) (and (iface-iterator-obj x) (not (iface-iterator-cursor x))))
                    (lambda (x) (jolt-seq (record-method-dispatch x "iterator" jolt-nil))))
 
+;; ...and the PREDICATE half of the same question, which has to answer for
+;; exactly the values the arms above accept. seqable? on the JVM is an instance?
+;; test over Seqable / ISeq / Iterable (plus arrays, CharSequence and Map, which
+;; jhost-seqable-shim? covers), so a bare deftype or reify declaring one is
+;; seqable even though it is not coll?. jolt's seqable? is built out of coll?,
+;; so it said false for every such value while `seq` worked on it — including
+;; clojure.core.Eduction, the one in core: malli's :every schema tests
+;; seqability before it walks, so (m/validate [:every :int] (eduction …)) was
+;; false. Reading the same iface-method probes the arms read is what keeps the
+;; two answers from drifting apart again.
+;; The probe is per METHOD, not jrec-declares-coll-iface?: that name list is the
+;; collection-behaviour set (ILookup, Counted, Associative are in it) and none of
+;; those is Seqable on the JVM — an ILookup-only deftype is not seqable there.
+;; A type declaring Seqable or ISeq has a `seq` method by construction, and a
+;; type that is coll? here is already seqable through the predicate this wraps.
+(define (iface-seqable? v)
+  (and (or (jrec? v) (jreify? v))
+       (or (and (iface-method v "seq" #f) #t)
+           (and (iface-method v "iterator" #f) #t)
+           (and (iface-method v "hasNext" #f) #t))))
+
 
 ;; satisfies?: does obj's type implement the protocol? proto is a defprotocol
 ;; value (a map with a :name). A host Class or interface answers instance?: jolt
