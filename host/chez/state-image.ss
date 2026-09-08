@@ -606,6 +606,17 @@
 ;; it is opaque too. A capture the compiler const-folded away is unrecoverable
 ;; and reported as nil, exactly as it is refused at dump.
 (define (image-embed-plan x)
+  ;; The cheap test FIRST. The analyzer asks this about every quoted form, and
+  ;; image-proc-verdict's second arm probes the inspector inside a guard —
+  ;; sa-procedure-info raises on anything that is not a procedure, so letting an
+  ;; ordinary quoted list reach it costs an exception per form. Measured: five
+  ;; quoted forms per (is …) took compiling 500 of them from 0.6s to 10.4s.
+  ;; This is exactly the test the image walk applies before its own procedure
+  ;; arm (a code value some var roots is not a `procedure?` but is nameable).
+  (if (not (or (procedure? x) (proc-name-of x)))
+      jolt-nil
+      (image-embed-plan* x)))
+(define (image-embed-plan* x)
   (let ((v (image-proc-verdict x)))
     (cond
       ((eq? v 'refuse) jolt-nil)
