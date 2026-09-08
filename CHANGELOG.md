@@ -118,6 +118,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without libffi produces a binary that aborts at startup, since jolt's runtime
   uses `foreign-procedure`.)
 
+### Changed
+
+- **Reader conditionals no longer match `:bb`.** The feature set is
+  `{:jolt :clj :default}` again; 0.7.10 added `:bb` on the theory that a `:bb`
+  branch solves the same non-JVM problems jolt has. It does not. A `:bb` branch
+  is written for babashka's host model, and where that model differs from jolt's
+  the branch is simply wrong here — the branch a library writes for a host that
+  has no `java.nio` and no reflection is not the branch for a host that has
+  both. Measured on the library checkouts this repo gates: claxon and aws-api
+  write `#?(:bb [cheshire.core] :clj [clojure.data.json])`, so matching `:bb`
+  sent jolt at Jackson and turned a working library into a load failure;
+  lasertag's `:bb` branches assert `sci.impl.fns` class names and babashka's
+  class-as-symbol hierarchies (2 failures, now gone); tick's assert babashka's
+  English-only locale rendering where jolt renders the French through
+  jolt-lang/time (1 failure, now gone); markdown-clj's skip two assertions jolt
+  passes; and the clojure-test-suite's hid 89 assertions along with two ##NaN
+  divergences, now recorded. `jolt.bb.fs` and the loader's namespace-supplement
+  seam existed only to fill the `babashka.fs/list-dir` that a `:bb` branch
+  skips — babashka.fs defines it off its own `:clj` branch now — and `vendor/`
+  `process` goes back to upstream babashka/process, whose only jolt patch was a
+  `:jolt` arm working around the empty `:bb` splice. A project that wants `:bb`
+  read asks for it with `:jolt/features` (above). Reported by @markokocic in
+  #893.
+
 ### Fixed
 
 - **`seqable?` answers for a `deftype` or `reify` that declares `Seqable` or

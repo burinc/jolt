@@ -641,10 +641,15 @@
   ;; name is nil here where the symbol itself still evaluates syntactically.
   {:suite "ns" :expr "(nil? (resolve 'java.lang.module.ModuleFinder))" :expected "true"}
   {:suite "ns" :expr "(nil? (ns-resolve *ns* 'no.such.ClassXyz))" :expected "true"}
-  ;; reader conditionals match :bb (ahead of :clj, like babashka); clause order
-  ;; still wins when :clj is listed first.
-  {:suite "reader-features" :expr "#?(:bb :bb-branch :clj :clj-branch)" :expected ":bb-branch"}
+  ;; the feature set is {:jolt :clj :default}. :bb is NOT in it: a library's :bb
+  ;; branch is written for babashka's host model, not jolt's, and taking it sent
+  ;; jolt at namespaces babashka supplies natively and jolt does not. :jolt wins
+  ;; over :clj wherever a library gives jolt its own branch; otherwise jolt reads
+  ;; the :clj branch its clojure.lang.*/java.* shims target.
+  {:suite "reader-features" :expr "#?(:bb :bb-branch :clj :clj-branch)" :expected ":clj-branch"}
   {:suite "reader-features" :expr "#?(:clj :clj-first :bb :bb-second)" :expected ":clj-first"}
+  {:suite "reader-features" :expr "#?(:jolt :jolt-branch :clj :clj-branch)" :expected ":jolt-branch"}
+  {:suite "reader-features" :expr "[1 #?(:bb :bb-only) 2]" :expected "[1 2]"}
   ;; seqable? is an instance? test over Seqable / ISeq / Iterable on the JVM, so a
   ;; bare deftype or reify declaring one answers true even though it is not coll?.
   ;; It has to agree with whether `seq` actually works on the value — the seq arms

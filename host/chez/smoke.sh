@@ -160,9 +160,11 @@ check '(->> (range 10) (filter even?) (map (fn [x] (* x x))) (reduce +))' '120'
 check '(let [{:keys [a b] :or {b 99}} {:a 1}] [a b])' '[1 99]'
 check '(map inc [1 2 3])' '(2 3 4)'
 check '(require [clojure.string :as s]) (s/upper-case "hello")' '"HELLO"'
-# reader conditionals match :bb ahead of :clj (like babashka); clause order wins
-check '#?(:bb :bb-branch :clj :clj-branch)' ':bb-branch'
+# the feature set is {:jolt :clj :default}; :bb is not in it, and a :jolt branch
+# placed before :clj is how a library overrides the JVM one. Clause order wins.
+check '#?(:bb :bb-branch :clj :clj-branch)' ':clj-branch'
 check '#?(:clj :clj-first :bb :bb-second)' ':clj-first'
+check '#?(:jolt :jolt-branch :clj :clj-branch)' ':jolt-branch'
 # -M with a bare script path runs it the way clojure.main does: the file loads,
 # the remaining args become *command-line-args* (jolt-s9zc).
 mfile_dir="$(mktemp -d)"
@@ -1033,12 +1035,12 @@ else
 fi
 
 # A project root must not shadow a namespace Jolt provides as a host built-in.
-# Jolt's reader matches :bb, so a copy of babashka.fs pulled in as a dependency
-# is source written to be inert here (0.4.18 guards list-dir behind
-# `#?(:bb nil …)` and its list-dirs then fails to compile). A built binary
-# already resolves Jolt's copy first because install sources are embedded; this
-# asserts source mode answers the same file. The decoy would load fine on its
-# own — it is Jolt's copy winning that makes list-dir resolve.
+# A built binary already resolves Jolt's copy first because install sources are
+# embedded; this asserts source mode answers the same file, so a project that
+# happens to pull babashka.fs in as a dependency gets one babashka.fs and not
+# two. babashka does not let a classpath copy shadow a built-in either. The
+# decoy would load fine on its own — it is Jolt's copy winning that makes
+# list-dir resolve.
 bbs_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
 bbshadow="$(mktemp -d)"; mkdir -p "$bbshadow/src/babashka"
 printf '(ns babashka.fs)\n(def marker :decoy)\n' > "$bbshadow/src/babashka/fs.cljc"
