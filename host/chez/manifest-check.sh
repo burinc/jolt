@@ -146,6 +146,26 @@ if [ -n "$missing" ]; then
   fail=1
 fi
 
+# ...and that those references actually compiled as late-bound var reads. A
+# qualified ns/name the compiling runtime has not loaded yet is not late-bound:
+# resolve-global cannot see the var, so the analyzer reads it as a CLASS static
+# (analyze-symbol's non-var arm), and the emitted host-static-call raises on
+# every call, since no such class exists and the static registry never consults
+# a namespace. In the seed that raise lands inside the emitted guard, so the def
+# it sat in silently never ran (jolt#879). Nothing else emits a lowercase dotted
+# class name -- hc-fq-class-name? requires a capitalized final segment -- so any
+# in the minted seed is exactly this mistake. The fix is to define the host fn
+# before the load point that reads it, not to move the reference.
+bad_static=$(grep -ohE 'host-static-(call|ref) "[a-z][a-z0-9]*(\.[a-z0-9-]+)+" "[^"]+"' \
+  host/chez/seed/image.ss host/chez/seed/prelude.ss host/gambit/seed/image.ss 2>/dev/null \
+  | LC_ALL=C sort -u)
+if [ -n "$bad_static" ]; then
+  echo "  FAIL: the seed reads a namespace-qualified var as a class static —"
+  echo "        it was not loaded when the mint compiled the reference:"
+  echo "$bad_static" | sed 's/^/    /'
+  fail=1
+fi
+
 # --- host-contract primitive declares vs backend native-ops -----------------
 # host-contract.ss declares the hot clojure.core primitives so the analyzer's
 # resolve-global classifies them (the emitter lowers each inline, so the declared

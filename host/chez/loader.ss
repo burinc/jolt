@@ -2135,7 +2135,8 @@
 ;; run-file-arg?), so `jolt test` in any project with a test/ dir — which is every
 ;; jolt library — took the file path and died decoding a directory.
 (def-var! "jolt.host" "directory?" (lambda (p) (if (file-directory? p) #t #f)))
-(def-var! "jolt.host" "getenv" (lambda (n) (let ((v (getenv n))) (if v v jolt-nil))))
+;; jolt.host/getenv is defined in rt.ss, not here — the compiler image reads it
+;; as it loads, which is before this file (see the comment there).
 
 ;; --- filesystem primitives (jolt.host) --------------------------------------
 ;; jolt.deps did its filesystem work by shelling out: `mkdir -p`, `mv`, `rm -f`,

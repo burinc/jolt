@@ -1170,6 +1170,18 @@
 (def-var! "jolt.host" "scheme-version" (lambda () (scheme-version)))
 (def-var! "jolt.host" "machine-type" (lambda () (sa-host-tag)))
 
+;; The process environment. This lives HERE, in the first runtime file, rather
+;; than beside the loader's other process-level primitives, because the compiler
+;; image reads it as it LOADS: jolt.passes / jolt.passes.types read their trace
+;; flags in top-level defs, and the runtime manifest loads the seed image well
+;; before loader.ss. A def whose initializer raises is swallowed by the seed's
+;; emitted guard, so the var simply never appeared and every later read got the
+;; unbound sentinel — an object, hence truthy, so both traces printed on every
+;; release build (jolt#879). Unfiltered on purpose: System/getenv applies
+;; JOLT_BAKE_ENV_ALLOWLIST, which is a sandbox for the program being run, not for
+;; the compiler reading its own flags.
+(def-var! "jolt.host" "getenv" (lambda (n) (let ((v (getenv n))) (if v v jolt-nil))))
+
 ;; var def-time metadata: the :def emit passes the def's reader meta
 ;; (^:private / ^Type tag / docstring -> {:doc}) here, stored in an eq side-table
 ;; keyed by the cell. jolt-meta (natives-meta.ss) merges it onto {:ns :name},

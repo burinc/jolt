@@ -122,10 +122,13 @@
 ;; prints any problem (unknown :op, missing required key) — a fast way to catch a
 ;; pass or analyzer producing malformed IR, which the TOTAL child-walk would
 ;; otherwise turn into a silent no-op. Off, and free, otherwise (read once at load).
-;; jolt.host/getenv (defined in the runtime loader, absent during the seed mint)
-;; and jolt.ir/tree-problems (new on jolt.ir) are referenced fully-qualified, not
-;; :refer'd — a qualified ref to a loaded ns is late-bound, so the mint compiles
-;; this before those vars resolve.
+;; jolt.host/getenv and jolt.ir/tree-problems (new on jolt.ir) are referenced
+;; fully-qualified, not :refer'd. A qualified ref resolves against what the
+;; compiling runtime has ALREADY loaded: a name it cannot see is not late-bound,
+;; it is read as a class static (analyzer, analyze-symbol), which then raises at
+;; every call. That is why jolt.host/getenv is defined in rt.ss and not beside
+;; the loader's other process primitives — these defs run as the seed image
+;; loads, which the runtime manifest does well before loader.ss (jolt#879).
 (def ^:private ir-validate? (jolt.host/getenv "JOLT_IR_VALIDATE"))
 ;; JOLT_WP_TRACE=1 also reports each def whose inline fixpoint ran more than one
 ;; round (see jolt.passes.types wp-trace?).
