@@ -300,14 +300,17 @@
          (loop (+ i 1) (+ i 1) (cons (substring s start i) acc)))
         (else (loop (+ i 1) start acc))))))
 
-(define (nio-write! fp data)
+(define (nio-output-data->bv data)
   (cond
-    ((jolt-array? data) (nio-write-bv! fp (na-bytearray->bv data)))
-    ((string? data) (nio-write-bv! fp (string->utf8 data)))
+    ((jolt-array? data) (na-bytearray->bv data))
+    ((string? data) (string->utf8 data))
     (else                                    ; Iterable<CharSequence>: line + separator each
      (let ((body (fold-left (lambda (acc ln) (string-append acc (jolt-str-render-one ln) "\n"))
                             "" (seq->list (jolt-seq data)))))
-       (nio-write-bv! fp (string->utf8 body))))))
+       (string->utf8 body)))))
+
+(define (nio-write! fp data)
+  (nio-write-bv! fp (nio-output-data->bv data)))
 
 (define (nio-delete1 fp missing-ok?)
   (cond ((nio-is-symlink? fp) (delete-file fp) #t)   ; the link itself, even if dangling
@@ -684,9 +687,12 @@
          (syms (map oopt-sym opts)))
     (for-each
      (lambda (sym)
-       (unless (memq sym '(write append create create-new truncate-existing))
-         (throw-jvm (quote UnsupportedOperationException)
-                    "unsupported option for Files.newOutputStream")))
+       (cond
+         ((eq? sym 'read)
+          (throw-jvm (quote IllegalArgumentException) "READ not allowed"))
+         ((not (memq sym '(write append create create-new truncate-existing)))
+          (throw-jvm (quote UnsupportedOperationException)
+                     "unsupported output option"))))
      syms)
     (let* ((defaults? (null? syms))
            (append? (memq 'append syms))
@@ -711,20 +717,29 @@
         (truncate? (file-options no-create no-fail))
         (else (file-options no-create no-fail no-truncate))))))
 
-(define (nio-append! fp data)
-  (let ((port (open-file-output-port fp (file-options no-fail no-truncate append))))
-    (put-bytevector port (cond ((jolt-array? data) (na-bytearray->bv data))
-                               ((string? data) (string->utf8 data))
-                               (else (string->utf8 (fold-left (lambda (a ln) (string-append a (jolt-str-render-one ln) "\n")) "" (seq->list (jolt-seq data)))))))
-    (close-port port)))
+(define (nio-open-output-port fp options)
+  (guard (e
+          ((i/o-file-already-exists-error? e)
+           (jolt-throw (jolt-host-throwable
+                        "java.nio.file.FileAlreadyExistsException" fp)))
+          ((i/o-file-does-not-exist-error? e)
+           (jolt-throw (jolt-host-throwable
+                        "java.nio.file.NoSuchFileException" fp)))
+          (else (raise e)))
+    (open-file-output-port fp options)))
+
 (let ((files-opt
        (list (cons "write" (lambda (p data . opts)
-                             (if (nio-opts-have? opts oopt-sym 'append)
-                                 (nio-append! (nfp p) data) (nio-write! (nfp p) data))
-                             (->path p)))
+                             (let* ((fp (nfp p))
+                                    (file-options (nio-output-file-options opts))
+                                    (bytes (nio-output-data->bv data))
+                                    (port (nio-open-output-port fp file-options)))
+                               (put-bytevector port bytes)
+                               (close-port port)
+                               (->path p))))
              (cons "newOutputStream" (lambda (p . opts)
                                       (make-out-stream
-                                       (open-file-output-port
+                                       (nio-open-output-port
                                         (nfp p) (nio-output-file-options opts))))))))
   (set! files-accum (append files-accum files-opt)))
 
