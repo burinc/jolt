@@ -120,6 +120,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Files.newOutputStream` now honors Java open options atomically.**
+  `CREATE_NEW` previously behaved like the default create-or-truncate mode, so
+  opening an existing path could overwrite it instead of throwing
+  `FileAlreadyExistsException`. `CREATE_NEW` now uses Chez's exclusive-create
+  open and returns that same handle, while `CREATE`, `TRUNCATE_EXISTING`,
+  `APPEND`, `WRITE`, and invalid combinations follow their JVM contracts.
+  `Files.write` shares the same option handling, including rejecting
+  APPEND-only writes to a missing path with `NoSuchFileException`.
+
 - **`JOLT_WP_TRACE` and `JOLT_IR_VALIDATE` are read again.** Both flags were
   ignored: the `[wp]` and `[inline]` traces printed on every release build, set,
   unset or explicitly removed from the environment (jolt-lang/jolt#879, reported
