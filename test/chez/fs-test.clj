@@ -42,9 +42,9 @@
 
 ;; listing + glob (Path results)
 (check "list-dir count" (count (fs/list-dir (fs/path root "d1"))) 3)
-;; list-dir is the var babashka.fs leaves to the host on a :bb reader (jolt.bb.fs
-;; fills it), so both spellings and both arities are gated, along with the two
-;; callers that broke when the root was empty: list-dirs and modified-since.
+;; list-dir goes through java.nio's DirectoryStream, the one babashka.fs
+;; operation that has no fallback: both spellings and both arities are gated,
+;; along with the two callers that read it — list-dirs and modified-since.
 (check "list-dir glob" (mapv fs/file-name (fs/list-dir (fs/path root "d1") "*.clj"))
        ["one.clj"])
 (check "list-dir accept fn"

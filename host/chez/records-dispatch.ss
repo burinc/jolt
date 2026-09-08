@@ -628,11 +628,10 @@
 
 
 ;; satisfies?: does obj's type implement the protocol? proto is a defprotocol
-;; value (a map with a :name). A host Class or interface answers instance?: jolt
-;; takes :bb reader branches, and code written for babashka asks
-;; (satisfies? clojure.lang.IObj x) where its JVM branch asks instance? — the
-;; JVM raises on the class form, babashka answers false for everything, jolt
-;; answers the question the code means. Any other non-protocol throws, with a
+;; value (a map with a :name). A host Class or interface answers instance?:
+;; ported code asks (satisfies? clojure.lang.IObj x) where the shape it means is
+;; instance? — the JVM raises on the class form, so jolt answers the question the
+;; code means rather than the error. Any other non-protocol throws, with a
 ;; message naming what was passed.
 (define (jolt-satisfies? proto obj)
   (if (jclass? proto)

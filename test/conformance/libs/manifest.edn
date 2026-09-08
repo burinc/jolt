@@ -245,13 +245,12 @@
    ;; exception-handling namespaces compare printed #error maps whose :trace is
    ;; empty because tail calls leave no frames to report.
    ;;
-   ;; No load failure: the recorded one was generators.clj-time-test, and it is
-   ;; not clj-time reaching for joda-time after all — the namespace is written
-   ;; #?@(:bb [] :clj [[clj-time.core …]]), so jolt reading :bb branches takes
-   ;; the empty arm and it loads with no tests. pass/fail/error are unchanged
-   ;; and stay inside :tolerance; only the load-fail moved, and :load-fail is
-   ;; pinned exactly whatever the tolerance is, which is what surfaced it.
-   :expect {:tests 39 :pass 110 :fail 17 :error 2}}
+   ;; The one load failure is generators.clj-time-test, which is written
+   ;; #?@(:bb [] :clj [[clj-time.core …]]) and so requires clj-time, i.e.
+   ;; joda-time. It briefly read as loading-with-no-tests while jolt matched :bb
+   ;; and took the empty arm (#894 re-recorded it that way); #893 dropped :bb, so
+   ;; the :clj arm and its load failure are back. pass/fail/error are unchanged.
+   :expect {:tests 39 :pass 110 :fail 17 :error 2 :load-fail 1}}
 
   ;; ---------------------------------------------------------- data formats
   {:name "data.csv"
@@ -334,9 +333,7 @@
    ;; org.apache.commons.lang.StringEscapeUtils, supplied by the preloaded
    ;; jolt.shim.commons-lang shim. No residue.
    :preload ["jolt.shim.commons-lang"]
-   ;; two assertions exist only on the suite's :clj branches; the :bb branches
-   ;; jolt now reads skip them. Same test count, nothing fails.
-   :expect {:tests 94 :pass 180 :fail 0 :error 0}}
+   :expect {:tests 94 :pass 182 :fail 0 :error 0}}
 
   {:name "Selmer"
    :paths ["src" "test" "resources"]
@@ -409,7 +406,17 @@
    :deps ["@spec.alpha/src/main/clojure"
           "@test.check/src/main/clojure" "@spec-tools/src"
           "@test.chuck/src" "@ordered/src"]
-   :local-deps ["~time"]
+   ;; sci is what malli.core/eval runs on: malli's own :test alias carries it,
+   ;; and malli.sci's evaluator dynaloads sci.core/eval-string* and fails with
+   ;; ::sci-not-available when it is absent — 72 errors' worth across
+   ;; core/error/transform/generator-test. It went unnoticed while jolt matched
+   ;; :bb, because malli.sci's :bb branch swaps the whole evaluator for
+   ;; load-string. This is jolt's own vendored sci, the copy `make sci` and
+   ;; `make scifunctional` gate, rather than the Maven artifact malli names:
+   ;; sci 0.12.51 does not load here (jolt-l7tq) — its copy-var splices the
+   ;; dereffed value of a MACRO var straight into the emitted form, and a raw
+   ;; procedure is not a form jolt's analyzer takes.
+   :local-deps ["~time" "!vendor/sci"]
    ;; malli's own deps, from the upstream deps.edn; jolt resolves the source out
    ;; of the Maven jars.
    :extra-deps {borkdude/dynaload {:mvn/version "0.3.5"}
@@ -419,7 +426,10 @@
    ;; jolt.time installs the java.time.* class seams; malli's own requires do
    ;; not reach it, so it is preloaded.
    :preload ["jolt.time"]
-   :timeout 900
+   ;; 900 was sized when jolt read :bb branches, which gated roughly half the
+   ;; assertions away and stubbed out m/eval; the full suite runs ~12k
+   ;; assertions with sci live and needs the room.
+   :timeout 2400
    ;; Keying protocol dispatch by defining namespace (jolt-ewmt) is what moved
    ;; this: malli.generator-ast evals a textually-renamed copy of
    ;; malli.generator, so a SECOND protocol also named Generator was extended to
@@ -542,17 +552,18 @@
    :local-deps ["~time"]
    ;; lasertag classifies a value by its class, so every failure here is jolt's class
    ;; model rather than a behavioral difference, all recorded in
-   ;; known-divergences.edn. The 9 that remain: six narrow numeric classes collapsing
-   ;; to Long/Double (:integer-box-model), one seq class still collapsing to LazySeq
-   ;; where the JVM says Repeat (:seq-type-model), and two the suite's :bb branches
-   ;; asserting babashka's host model (sci.impl.fns classnames, a :lambda-free tag
-   ;; set), where jolt answers with the real defining class.
+   ;; known-divergences.edn. The 7 that remain: six narrow numeric classes collapsing
+   ;; to Long/Double (:integer-box-model) and one seq class still collapsing to
+   ;; LazySeq where the JVM says Repeat (:seq-type-model). The two that used to sit
+   ;; beside them were the suite's :bb branches asserting babashka's host model
+   ;; (sci.impl.fns classnames, a :lambda-free tag set); jolt stopped reading :bb
+   ;; in #893 and answers with the real defining class.
    ;; (subvec answers the real SubVector class since #629, which is the 44 -> 46.)
    ;; 46 -> 49 is the seq classes: #648 gave a seq the class its producer gives it
    ;; and #659 picked the range flavor from the argument types. The row had not been
    ;; re-recorded since before #648, so part of that 3 was slack this gate had been
    ;; carrying — a regression in those rows would have read as "ok".
-   :expect {:tests 58 :pass 49 :fail 9 :error 0}}
+   :expect {:tests 58 :pass 51 :fail 7 :error 0}}
 
   {:name "tools.logging"
    :paths ["src/main/clojure" "src/test/clojure"]
@@ -576,10 +587,11 @@
    :paths ["src" "test"]
    :deps ["@spec.alpha/src/main/clojure"]
    :local-deps ["~time"]
-   ;; the one failure is the suite's :bb branch asserting babashka's
-   ;; English-only locale rendering ("3030-May-03" under Locale/FRENCH); jolt
-   ;; renders the correct French "mai" through the time library.
-   :expect {:tests 67 :pass 722 :fail 1 :error 0}}
+   ;; green since #893: the one failure that used to sit here was the suite's :bb
+   ;; branch asserting babashka's English-only locale rendering ("3030-May-03"
+   ;; under Locale/FRENCH), where jolt renders the correct French "mai" through
+   ;; the time library.
+   :expect {:tests 67 :pass 723 :fail 0 :error 0}}
 
   ;; ---------------------------------------------------------- skipped
   {:name "process"

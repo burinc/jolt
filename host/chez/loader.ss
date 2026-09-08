@@ -64,39 +64,29 @@
     (fold-left (lambda (s r) (string-append s " \"" r "\"")) "" ldr-install-roots)
     ")"))
 
-;; --- namespaces Jolt provides the way babashka provides a built-in ----------
-;; Jolt's reader matches :bb (reader.ss rdr-features), which a .cljc library
-;; reads as "this host defines that itself". Two things follow, and jolt owes
-;; both.
+;; --- namespaces Jolt vendors and owns ---------------------------------------
+;; A copy of one of these on a project's roots must not shadow jolt's. A built
+;; binary already resolves jolt's copy first (install sources are embedded, and
+;; resolve-on-roots probes those before any root), so resolving these from the
+;; install roots is what keeps source mode answering the same file as the
+;; binary — a project that pulls babashka.fs in as a transitive dependency gets
+;; one babashka.fs, not two. babashka does not let a classpath copy shadow a
+;; built-in either.
 ;;
-;; It has to DEFINE what the :bb branch skips. babashka.fs writes list-dir as
-;; #?(:bb nil :default (defn list-dir …)) because babashka supplies it natively,
-;; so on jolt the var stayed declared and unbound and list-dirs / modified-since
-;; / path-seq failed at the call. A supplement is an ordinary install-root
-;; namespace loaded immediately after the one it completes — where babashka's
-;; built-in would already be. It is the namespace-level counterpart of
-;; :jolt/provides for classes.
+;; There is no per-namespace "supplement" seam any more. There used to be one
+;; (babashka.fs -> jolt.bb.fs), because jolt's reader matched :bb and babashka.fs
+;; writes list-dir as #?(:bb nil :default (defn list-dir …)) — so on jolt the var
+;; stayed declared and unbound and jolt had to fill it. Dropping :bb (issue #893,
+;; reader.ss rdr-features) means babashka.fs defines its own list-dir off the
+;; :clj branch, which is the one jolt's java.nio shims target.
 ;;
-;; And a copy of one of these on a project's roots must not shadow jolt's. Such
-;; a copy is source written to be INERT here: babashka.fs 0.4.18 has no forward
-;; declaration, so its list-dirs fails to compile at all. A built binary already
-;; resolves jolt's copy first (install sources are embedded, and resolve-on-roots
-;; probes those before any root), so resolving these from the install roots is
-;; what keeps source mode answering the same file as the binary. babashka does
-;; not let a classpath copy shadow a built-in either.
-(define ldr-ns-supplements '(("babashka.fs" . "jolt.bb.fs")))
-(define (ldr-supplement-of name)
-  (and (not (ldr-ns-replaced? name))
-       (cond ((assoc name ldr-ns-supplements) => cdr) (else #f))))
-
-;; ...and the escape hatch, because "jolt always wins" is not a thing a project
+;; The escape hatch stays, because "jolt always wins" is not a thing a project
 ;; can be stuck with. A project declares (deps.edn) which of these it supplies
 ;; itself:
 ;;
 ;;   :jolt/replaces [babashka.fs]
 ;;
-;; and its own copy resolves, with no supplement loaded over it — it is claiming
-;; the whole namespace, completing it included. jolt.deps collects the key and
+;; and its own copy resolves ahead of jolt's. jolt.deps collects the key and
 ;; jolt.main hands it here through jolt.host/replace-builtin-ns! before any of
 ;; the project compiles, which is the same ordering :jolt/provides needs.
 ;;
@@ -1935,12 +1925,7 @@
            (lambda () (set-chez-ns! saved)))   ; the current ns is thread-local
          ;; the hook feeds `jolt build`, which needs the SOURCE path; an
          ;; artifact-only namespace has none to give.
-         (ns-loaded-hook name (or file art))
-         ;; then the built-in supplement, if this namespace has one. It runs
-         ;; AFTER the load and after the mark, so its own require of the
-         ;; namespace it completes is the no-op a cycle would otherwise be.
-         (cond ((ldr-supplement-of name)
-                => (lambda (sup) (load-namespace sup))))))
+         (ns-loaded-hook name (or file art))))
       ;; No source file but the namespace exists in memory (AOT'd into a built
       ;; binary): it's already defined — mark loaded and move on.
       ((ns-has-vars? name)

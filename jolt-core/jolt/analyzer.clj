@@ -1185,10 +1185,11 @@
     :str))
 
 ;; Same seam for keywords. Sources mirror str-target-type: the ^Keyword tag, a
-;; :kw-hinted binding, or a keyword literal. Note jolt does NOT reach honeysql's
-;; (.sym ^clojure.lang.Keyword k) despite that being the shape this was written
-;; for — jolt's reader advertises :bb and honeysql orders its conditional with :bb
-;; first, so the pure-Clojure branch wins. See keyword-direct-emit.
+;; :kw-hinted binding, or a keyword literal. honeysql's
+;; (.sym ^clojure.lang.Keyword k) is the shape this was written for and jolt
+;; reaches it: honeysql orders its conditional #?(:bb … :clj (.sym …)) with :bb
+;; first at all three sites, and jolt stopped matching :bb in #893. See
+;; keyword-direct-emit.
 (defn- kw-target-type [raw target]
   (when (or (and (form-sym? raw) (kw-tag? (get (form-sym-meta raw) :tag)))
             (= :kw (:hint target))
