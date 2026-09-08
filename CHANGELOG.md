@@ -120,6 +120,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Files.newOutputStream` now honors Java open options atomically.**
+  `CREATE_NEW` previously behaved like the default create-or-truncate mode, so
+  opening an existing path could overwrite it instead of throwing
+  `FileAlreadyExistsException`. `CREATE_NEW` now uses Chez's exclusive-create
+  open and returns that same handle, while `CREATE`, `TRUNCATE_EXISTING`,
+  `APPEND`, `WRITE`, and invalid combinations follow their JVM contracts.
+  `Files.write` shares the same option handling, including rejecting
+  APPEND-only writes to a missing path with `NoSuchFileException`.
+
 - **A large binary's boot image loads again.** A program big enough for its boot
   image to cross Chez's LZ4 fasl ceiling built fine and then died on every run,
   inside `Sbuild_heap`, before a line of its own code had executed:
