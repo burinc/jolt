@@ -7,6 +7,7 @@
 # in jolt-core, so any drift fails CI. Regenerate after an intended change:
 #   grep -rhoE --include='*.ss' 'def-var! "jolt.host" "[^"]+"' host/ \
 #     | sed -E 's/.*"jolt.host" "([^"]+)".*/\1/' | LC_ALL=C sort -u
+add-reader-features!
 add-shutdown-hook
 allow-unresolved-vars?
 as-subvec
