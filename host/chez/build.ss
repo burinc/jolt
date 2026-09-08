@@ -2020,6 +2020,39 @@
               (bld-copy-file! so cache)
               (bld-prune-runtime-cache!)))))))
 
+;; --- how the boot image is encoded: --boot (jolt-lang/jolt#886) -------------
+;; Three points on one curve, and the flag is ordered along it:
+;;
+;;   'fast    vfasl + LZ4   the default — the fastest start, the largest binary
+;;   'small   vfasl + gzip  still an image, but a third smaller than a PLAIN boot
+;;                          and still faster to start than one
+;;   'plain   no vfasl      the fasl stream 0.8.4 produced (`--no-vfasl`)
+;;
+;; A vfasl boot is an image of the loaded heap, so it starts fast and takes room;
+;; that cost is what jolt#886 hit, an iOS `--target tpb64l` build growing 7.6MB in
+;; the binary and ~5MB in the IPA. But the cost turns out to be mostly the
+;; CODEC's, not vfasl's. Measured over two apps and two machine types, binary
+;; size and warm start against the plain boot as the baseline:
+;;
+;;   hello, host ta6le        plain 25,919,203/495ms  lz4 +5.5%/249ms  gzip -35.7%/429ms
+;;   build-app, host ta6le    plain 26,062,746/502ms  lz4 +5.8%/250ms  gzip -35.5%/434ms
+;;   hello, target tpb64l     plain 24,873,035        lz4 +5.8%        gzip -38.1%
+;;
+;; So for a jolt app 'small beats 'plain on BOTH axes and 'plain is a floor
+;; nobody should want — which is why it stays available (a target that cannot
+;; vfasl at all still needs it) but is not what the size-conscious build should
+;; reach for. The ratios are a property of what is in the image, not of the
+;; machine: the same three encodings over Chez's own boots, which carry no jolt
+;; runtime, cost lz4 +37% and gain gzip only 3-4%, with gzip SLOWER than plain.
+;; Anything user-facing has to say measure your own app, not quote one ratio.
+;;
+;; The mode is resolved once, in jolt.main (CLI flag > deps.edn > JOLT_BOOT /
+;; JOLT_NO_VFASL > default) and passed down; nothing here re-reads the
+;; environment, so there is one precedence rule rather than two.
+(define bld-boot-mode (make-parameter 'fast))
+
+(define (bld-vfasl-disabled?) (eq? (bld-boot-mode) 'plain))
+
 ;; --- the boot image's LZ4 ceiling -------------------------------------------
 ;; A compressed fasl entry whose UNCOMPRESSED size reaches 2^28 bytes cannot be
 ;; read back by the Chez kernel when the entry is LZ4. c/new-io.c's
@@ -2130,32 +2163,23 @@
 ;; same overflowing Sfixnum, so the write end raises long before the read end
 ;; would have.
 (define (bld-vfasl-convert! boot vboot)
-  (if (and (sa-vfasl-convert-file boot vboot)
-           (not (bld-boot-over-lz4-ceiling? vboot)))
-      #t
-      (and (sa-vfasl-convert-file boot vboot 'wide)
-           (begin (bld-note-wide-boot!) #t))))
+  (if (eq? (bld-boot-mode) 'small)
+      (sa-vfasl-convert-file boot vboot 'wide)   ; asked for gzip; no ceiling to hit
+      (if (and (sa-vfasl-convert-file boot vboot)
+               (not (bld-boot-over-lz4-ceiling? vboot)))
+          #t
+          (and (sa-vfasl-convert-file boot vboot 'wide)
+               (begin (bld-note-wide-boot!) #t)))))
 
-;; --- opting out of vfasl entirely (jolt-lang/jolt#886) -----------------------
-;; A vfasl boot is an IMAGE — the heap laid out as the kernel wants it — so it is
-;; larger on disk than the fasl stream it replaces, and it buys startup time with
-;; binary size. That is the right default and the wrong one for a store app,
-;; where the download is the number that matters: on an iOS `--target tpb64l`
-;; build it added 7.6MB to the binary and ~5MB to the compressed IPA, with no way
-;; to decline. `--no-vfasl`, `:jolt/build {:no-vfasl true}` or JOLT_NO_VFASL=1
-;; declines, and the build keeps the plain boot 0.8.4 produced.
-;;
-;; Worth knowing before reaching for it: the size cost is LZ4's, not vfasl's.
-;; Measured on the build smoke's app, one image, three boots — plain 25.0MB,
-;; vfasl+LZ4 26.5MB, vfasl+gzip 15.7MB. A gzip vfasl boot is smaller than the
-;; plain boot AND still loads as an image, so an app that wants the download
-;; small and the start fast wants the codec, not the opt-out. Today gzip is
-;; reached only by the ceiling fallback above; exposing it as a build choice is
-;; jolt-pv1, which wants numbers from a cross target first.
-(define bld-no-vfasl (make-parameter #f))
-
-(define (bld-vfasl-disabled?)
-  (or (bld-no-vfasl) (and (getenv "JOLT_NO_VFASL") #t)))
+;; The conversion as a form for the fresh-Chez compile scripts, empty under
+;; 'plain. 'small sets the codec in that process the way sa-vfasl-convert-file's
+;; 'wide does in this one.
+(define (bld-vfasl-script-form boot vboot)
+  (if (bld-vfasl-disabled?)
+      ""
+      (string-append
+        (if (eq? (bld-boot-mode) 'small) "(compress-format 'gzip)\n" "")
+        "(vfasl-convert-file " (ei-str-lit boot) " " (ei-str-lit vboot) " '())\n")))
 
 ;; The fresh-Chez counterpart. The paths that convert inside their compile script
 ;; (build-with-cc, build-shared, build-jolt.ss) have to: $fasl-to-vfasl lays an
@@ -2361,12 +2385,8 @@
           (ei-str-lit flat-so) ")\n"
           ;; vfasl, in THIS script so a cross build gets the xpatch's retargeted
           ;; constants the way make-boot-file above does — see build-jolt.ss.
-          ;; --no-vfasl / JOLT_NO_VFASL keeps the plain boot (jolt#886).
-          (if (bld-vfasl-disabled?)
-              ""
-              (string-append
-                "(vfasl-convert-file " (ei-str-lit boot) " "
-                (ei-str-lit (string-append boot ".vfasl")) " '())\n"))))
+          ;; --boot decides the codec, or omits the conversion (jolt#886).
+          (bld-vfasl-script-form boot (string-append boot ".vfasl"))))
       (close-port p))
     (bld-system (string-append bld-chez " --script '" cs "'")))
   ;; the converted boot is what gets embedded
@@ -2467,11 +2487,7 @@
           (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "
           (ei-str-lit flat-so) ")\n"
           ;; vfasl, as in build-with-cc and build-jolt.ss
-          (if (bld-vfasl-disabled?)
-              ""
-              (string-append
-                "(vfasl-convert-file " (ei-str-lit boot) " "
-                (ei-str-lit (string-append boot ".vfasl")) " '())\n"))))
+          (bld-vfasl-script-form boot (string-append boot ".vfasl"))))
       (close-port p))
     (bld-system (string-append bld-chez " --script '" cs "'")))
   (unless (bld-vfasl-disabled?)
@@ -2504,17 +2520,18 @@
     (cond ((or (null? o) (< i 0)) #f)
           ((= i 0) (and (not (jolt-nil? (car o))) (jolt-str-render-one (car o))))
           (else (loop (cdr o) (- i 1))))))
-;; The same positional read for a flag: absent (an older caller passing only the
-;; cross pair) reads as false, like nil and false do.
-(define (bld-opt-bool opt i)
-  (let loop ((o opt) (i i))
-    (cond ((or (null? o) (< i 0)) #f)
-          ((= i 0) (jolt-truthy? (car o)))
-          (else (loop (cdr o) (- i 1))))))
+;; The boot mode as a symbol. Absent (a caller passing only the cross pair) or
+;; unrecognized reads as the default, so a bad value degrades to today's build
+;; rather than failing one; jolt.main is what rejects a typo, with a message.
+(define (bld-opt-boot-mode opt i)
+  (let ((s (bld-opt-str opt i)))
+    (cond ((equal? s "small") 'small)
+          ((equal? s "plain") 'plain)
+          (else 'fast))))
 (def-var! "jolt.host" "build-binary"
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
     (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1))
-                   (bld-no-vfasl (bld-opt-bool opt 2)))
+                   (bld-boot-mode (bld-opt-boot-mode opt 2)))
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
@@ -2523,7 +2540,7 @@
 (def-var! "jolt.host" "build-library"
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
     (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1))
-                   (bld-no-vfasl (bld-opt-bool opt 2)))
+                   (bld-boot-mode (bld-opt-boot-mode opt 2)))
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)

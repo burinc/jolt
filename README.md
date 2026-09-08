@@ -440,11 +440,20 @@ library responsible — when reachable code resolves vars by name at runtime
 (`eval`/`resolve`/`ns-resolve`/…). See
 [RFC 0007](https://jolt-lang.github.io/docs/rfc/0007-compilation-modes-and-binary-output.html).
 
-`--no-vfasl` trades the other way. The boot image ships as a prebuilt heap image,
-which starts faster and takes more room; `--no-vfasl` (or `JOLT_NO_VFASL=1`, or
-`:jolt/build {:no-vfasl true}`) keeps the plain boot instead, for an app —
-typically a mobile one — whose download size matters more than its startup.
-Measure both on your target: which way the trade falls depends on the app.
+`--boot` trades the other way. The boot image ships as a prebuilt heap image
+(*vfasl*), which starts faster and takes more room — `--boot small` keeps the
+image but compresses it with gzip, and `--boot plain` drops it altogether:
+
+```bash
+jolt build -m myapp.core --boot small    # smallest binary that still loads as an image
+jolt build -m myapp.core --boot plain    # the pre-0.8.5 boot  (alias: --no-vfasl)
+```
+
+For a mobile app, where the download is the number that matters, `small` is
+usually the one: on the apps measured it is about a third smaller than `plain`
+*and* still faster to start. `JOLT_BOOT=small` and `:jolt/build {:boot :small}`
+do the same. Measure on your own target — the ratios depend on what your image
+holds.
 
 Built executables carry an optional startup profiler: launch one with
 `JOLT_STARTUP_PROFILE=1` to get per-stage wall time, process CPU time,
