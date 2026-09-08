@@ -1070,7 +1070,16 @@
 ;; An operand whose evaluation has no observable effect: constants, locals,
 ;; var/the-var reads, quoted literals.
 (defn- side-effect-free? [n]
-  (contains? #{:const :local :var :the-var :quote} (:op n)))
+  (or (contains? #{:const :local :var :the-var :quote} (:op n))
+      ;; ...and a CONSTANT collection literal, whose value is fully determined at
+      ;; emit time and which is hoisted rather than built here. Without this every
+      ;; nested constant map/vector/set read as effectful, so needs-order? wrapped
+      ;; its own construction in a let* of temporaries — and it is nested constants
+      ;; that a macro-heavy expansion is made of. Measured on 1000 deftest forms:
+      ;; 98000 ordering temporaries, one hoisted constant in every form wrapped in
+      ;; an ordering let* it cannot need. The reference emits no ordering
+      ;; temporaries for constants at all; they are constant-pool loads.
+      (const-coll-node? n)))
 
 ;; A var VALUE read is effect-free but order-SENSITIVE: a mutating sibling
 ;; (def/alter-var-root/set!) changes what it yields, so it must not move across
