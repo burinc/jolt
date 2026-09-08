@@ -37,7 +37,8 @@
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
                                form-syntax-quote-expand
                                record-type? record-ctor-key deftype-ctor-class form-position form-line late-bind?
-                               resolve-class-hint host-class-name? jolt-class-for]]))
+                               resolve-class-hint host-class-name? ns-shaped-name? ns-loaded?
+                               jolt-class-for]]))
 
 (declare analyze)
 
@@ -1675,7 +1676,41 @@
              ;; A non-var qualified ref `Class/member` is a host class static
              ;; (Math/sqrt, Long/MAX_VALUE, System/getenv). The Chez back end
              ;; lowers it to a runtime static dispatch.
-             (host-static ns nm)))
+             ;;
+             ;; ...but a namespace-shaped ns that is not loaded AT ALL cannot be a
+             ;; class either, and reporting it as one is how `(no.such.ns/foo 1)`
+             ;; came back "Unknown class no.such.ns" from inside the call, naming a
+             ;; class the program never mentioned. resolve-global cannot draw the
+             ;; line itself: it answers :unresolved for `Math/sqrt` and for
+             ;; `no.such.ns/foo` alike, because looking the name up and finding
+             ;; nothing is all it can say. So check the shape, and report the JVM's
+             ;; "No such namespace" (Compiler.resolveIn) at COMPILE time — which is
+             ;; where a forgotten `require` or a typo in the ns half belongs.
+             ;;
+             ;; A LOADED namespace merely missing the var stays on the host-static
+             ;; arm, and deliberately. jolt-core and stdlib reach their host contract
+             ;; this way on purpose — several hundred `jolt.host/…` references, and
+             ;; jolt.ffi's and jolt.time's — and which vars exist depends on which host
+             ;; files the current boot loaded: jolt.main names jolt.host/build-library
+             ;; in a world where build.ss may not be loaded and the call cannot run.
+             ;; Late binding is the point there, so the compile-time guard for that
+             ;; namespace is a STATIC one (jolt-host-manifest.txt, pinned against
+             ;; both the def-var! sites and every jolt-core reference by
+             ;; manifestcheck), and the miss reports at the call, correctly, through
+             ;; static-miss-message's live-namespace arm: "No such var: ns/name",
+             ;; not "Unknown class".
+             ;;
+             ;; jolt#879 was in this second group — jolt.host loaded, `getenv` not
+             ;; yet — so it is the seed's own gates that hold it: manifestcheck
+             ;; rejects a namespace-shaped host-static in the minted seed, and
+             ;; `make seeddefs` asserts every var the seed defines survives the load.
+             (if (and (ns-shaped-name? ns) (not (ns-loaded? ns)))
+               (analysis-error :analyze/unknown-namespace
+                (str "No such namespace: " ns)
+                {:jolt.error/symbol (str ns "/" nm)
+                 :jolt.error/namespace ns
+                 :jolt.error/ns (compile-ns ctx)})
+               (host-static ns nm))))
       :else (let [r (resolve-global ctx form)]
               (case (:kind r)
                 ;; :num-ret (a ^double/^long declared return) rides on the var node so
