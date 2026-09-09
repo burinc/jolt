@@ -854,11 +854,26 @@ What is left is that jolt's own front end — 4.0s for these 1000 forms — is
 roughly four times Clojure's entire pipeline for the same file (0.96s). So even
 with Chez's half free, this row would still be ~4x.
 
-What is left is jolt-wt6v: moving that def's 3214 constant bindings out of the
-`let*` and into top-level defines takes Chez from 3.95s to 0.12s on the same
-emitted file. That is what the reference compiler does — a constant there is a
-static field (`ObjExpr.emitConstant` → `getstatic`), with no lexical scope and no
-live range.
+What is left is jolt-wt6v, and it is not the easy win it first looked like.
+Moving that def's 3214 constant bindings out of the `let*` and into top-level
+defines — what the reference does, since a constant there is a static field
+(`ObjExpr.emitConstant` → `getstatic`) with no lexical scope and no live range —
+was implemented and measured:
+
+| | `let*` (today) | top-level defines |
+|---|---|---|
+| `malli.core-test` | 16.9s | 12.8s |
+| 800 `is` in one `deftest` | 4.9s | 3.9s |
+| 1000 small top-level forms | 10.9s | **14.2s** |
+
+So it is 1.25–1.3x on a big constant pool and a ~30% REGRESSION on ordinary
+namespaces, which have small ones — Chez handles a small lexical scope better
+than the equivalent top-level defines, and only the large scope is quadratic
+(measured directly: 1500 bindings is 0.27s as a `let*` against 0.33s as defines,
+and 12000 is 6.72s against 3.00s). Shipping it needs a size threshold, and the
+threshold has to be decided BEFORE the constants are named, because a hoisted
+name has to be unique across namespaces and that salt is what the small-pool
+case is paying for.
 
 `make compilescaling` guards both halves as ratios inside one process: 1x vs 4x
 input for the complexity class, and quoted-vs-constructed for the per-form
