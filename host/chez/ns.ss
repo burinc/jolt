@@ -648,24 +648,39 @@
 (define (var-meta-sync-macro! cell m)
   (when (jolt-truthy? (jolt-get m jolt-kw-var-macro))
     (var-cell-macro?-set! cell #t)))
+;; A deftype/reify declaring clojure.lang.IReference keeps its metadata in its
+;; OWN field — its IMeta arm reads that field, never jolt's identity side table —
+;; so writing the side table for such a value puts the metadata somewhere `meta`
+;; will never look, and the write is silently lost. clojure.core/alter-meta! and
+;; reset-meta! ARE .alterMeta / .resetMeta on the JVM, so dispatch to the declared
+;; method whenever the value has one. sci.lang.Var is what surfaced this: every
+;; def evaluated inside sci lost its metadata, which un-marked every macro sci
+;; defined and made a macro call arrive at its expander as an ordinary call.
+;; .alterMeta takes (f args-seq), matching the JVM's two-argument method.
 (define (jolt-alter-meta! ref f . args)
-  (if (var-cell? ref)
-      (let* ((cur (or (var-cell-meta ref) (jolt-hash-map)))
-             (new (apply jolt-invoke f cur args)))
-        (var-cell-meta-set! ref new)
-        (var-meta-sync-macro! ref new)
-        new)
-      (let* ((cur (let ((m (jolt-meta ref))) (if (jolt-nil? m) (jolt-hash-map) m)))
-             (new (apply jolt-invoke f cur args)))
-        (meta-table-set! ref new)
-        new)))
+  (cond
+    ((var-cell? ref)
+     (let* ((cur (or (var-cell-meta ref) (jolt-hash-map)))
+            (new (apply jolt-invoke f cur args)))
+       (var-cell-meta-set! ref new)
+       (var-meta-sync-macro! ref new)
+       new))
+    ((iface-method ref "alterMeta" 3)
+     => (lambda (m) (jolt-invoke m ref f (list->cseq args))))
+    (else
+     (let* ((cur (let ((m (jolt-meta ref))) (if (jolt-nil? m) (jolt-hash-map) m)))
+            (new (apply jolt-invoke f cur args)))
+       (meta-table-set! ref new)
+       new))))
 (define (jolt-reset-meta! ref m)
-  (if (var-cell? ref)
-      (begin
-        (var-cell-meta-set! ref m)
-        (var-meta-sync-macro! ref m))
-      (meta-table-set! ref m))
-  m)
+  (cond
+    ((var-cell? ref)
+     (var-cell-meta-set! ref m)
+     (var-meta-sync-macro! ref m)
+     m)
+    ((iface-method ref "resetMeta" 2)
+     => (lambda (impl) (jolt-invoke impl ref m) m))
+    (else (meta-table-set! ref m) m)))
 
 ;; --- RESOLVE FRICTION: native-op cells -------------------------------------
 ;; Native-op primitives (+ map reduce …) are INLINED at emit, so they have no

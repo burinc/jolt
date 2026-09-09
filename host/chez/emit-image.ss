@@ -112,6 +112,19 @@
 ;; top-level entry: in direct-link mode it binds jv$<fqn> for a top-level def; off
 ;; that mode (the minter, runtime eval) it is exactly emit, so output is unchanged.
 (define jolt-ce-emit-top (var-deref "jolt.backend-scheme" "emit-top-form"))
+;; emit-top-form grew a second arity naming the enclosing def for a form that
+;; does not carry it (a macro's bare expander fn). The SEED that mints the next
+;; one is the previous release's, whose emit-top-form is still single-arity, so
+;; ask before passing it: pass 1 of a remint falls back and pass 2 — now running
+;; the reminted seed — uses it. Without this the mint dies with "incorrect number
+;; of arguments 2" before it can produce the seed that would accept them.
+(define (ei-emit-top-2? )
+  (and (procedure? jolt-ce-emit-top)
+       (bitwise-bit-set? (procedure-arity-mask jolt-ce-emit-top) 2)))
+(define (ei-emit-top ir fnsrc-def)
+  (if (and fnsrc-def (ei-emit-top-2?))
+      (jolt-ce-emit-top ir fnsrc-def)
+      (jolt-ce-emit-top ir)))
 ;; Hoist the var cell behind every late-bound reference in the minted seed, so a
 ;; clojure.core fn that calls another core fn resolves the callee's cell once per
 ;; def instead of once per call. This was OFF, on the theory that the gensym-
@@ -194,16 +207,22 @@
   (hashtable-clear! ei-cached-ir)
   (hashtable-clear! ei-cached-ir-idx))
 
-(define (ei-compile-form ctx f optimize?)
-  (let* ((ns (chez-actx-cns ctx))
-         (cached (and optimize? (ei-next-cached ns)))
-         (ir (or cached
-                 (ei-timed "emit: analyze" (lambda () (jolt-ce-analyze ctx f))))))
-    (when optimize? (ei-publish-unit!))
-    (let ((ir* (if optimize?
-                   (ei-timed "emit: run-passes" (lambda () (jolt-ce-run-passes ir ctx (ei-unit))))
-                   ir)))
-      (ei-timed "emit: emit-top" (lambda () (jolt-ce-emit-top ir*))))))
+;; FNSRC-DEF (optional) names the enclosing def for a form that does not carry
+;; the name — a macro's expander arrives here as a bare fn. See emit-top-form.
+(define ei-compile-form
+  (case-lambda
+    ((ctx f optimize?) (ei-compile-form ctx f optimize? #f))
+    ((ctx f optimize? fnsrc-def)
+     (let* ((ns (chez-actx-cns ctx))
+            (cached (and optimize? (ei-next-cached ns)))
+            (ir (or cached
+                    (ei-timed "emit: analyze" (lambda () (jolt-ce-analyze ctx f))))))
+       (when optimize? (ei-publish-unit!))
+       (let ((ir* (if optimize?
+                      (ei-timed "emit: run-passes" (lambda () (jolt-ce-run-passes ir ctx (ei-unit))))
+                      ir)))
+         (ei-timed "emit: emit-top"
+                   (lambda () (ei-emit-top ir* fnsrc-def))))))))
 
 ;; The emitted `(def-var! …)(mark-macro! …)` pair for a defmacro, guard-wrapped
 ;; (tolerant) or bare (strict) to match guard?. With meta-scm (the derived
@@ -310,9 +329,12 @@
     (ei-for-each-form ns-name src
       (lambda (ns kind nm f)
         (let* ((form (if (eq? kind 'macro) (car f) f))
+               ;; a macro's expander is a bare fn form here, so hand the emitter
+               ;; the macro's name for fn-form registration (see emit-top-form)
+               (fnsrc-def (and (eq? kind 'macro) nm))
                (scm (if guard?
-                        (guard (e (#t #f)) (ei-compile-form (make-analyze-ctx ns) form optimize?))
-                        (ei-compile-form (make-analyze-ctx ns) form optimize?))))
+                        (guard (e (#t #f)) (ei-compile-form (make-analyze-ctx ns) form optimize? fnsrc-def))
+                        (ei-compile-form (make-analyze-ctx ns) form optimize? fnsrc-def))))
           (if (and guard? (not scm))
               ;; a form the guard swallowed — report it so the drop isn't silent
               (begin
@@ -347,7 +369,7 @@
                (cached (ei-next-cached ns))
                (ir (jolt-ce-run-passes (or cached (jolt-ce-analyze ctx form)) ctx (ei-unit)))
                (str (if (eq? kind 'macro)
-                        (ei-macro-string ns nm (jolt-ce-emit-top ir) (ei-emit-meta ns (cdr f) #f) #f)
+                        (ei-macro-string ns nm (ei-emit-top ir nm) (ei-emit-meta ns (cdr f) #f) #f)
                         (jolt-ce-emit-top ir)))
                (fqn (if (eq? kind 'macro) (string-append ns "/" nm) (dce-def-fqn ir)))
                (refs (dce-app-refs ir str)))

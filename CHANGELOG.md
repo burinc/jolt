@@ -157,6 +157,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`alter-meta!` and `reset-meta!` reach a `deftype` or `reify` that declares
+  `clojure.lang.IReference`.** Both wrote jolt's identity metadata side table
+  for anything that is not a var, and a type declaring `IReference` keeps its
+  metadata in its own field — its `IMeta` arm reads that field, never the side
+  table — so the write landed where `meta` never looks and was silently lost.
+  They dispatch to the declared `alterMeta` / `resetMeta` now, as the JVM's do.
+  `sci.lang.Var` is such a type, so every `def` evaluated inside sci lost its
+  metadata; that un-marked every macro sci defined, and a macro call then
+  reached its expander as an ordinary call ("Wrong number of args (1) passed
+  to: fn"). `defmacro` inside sci works, on the vendored copy and on Maven
+  0.12.51 alike. Vars and atoms keep the paths they had.
+
+- **`clojure.lang.PersistentHashMap/createWithCheck` exists.** sci builds every
+  map literal through one of the two `createWithCheck` constructors, choosing by
+  size, and only the `PersistentArrayMap` one was here, so a map literal of more
+  than eight pairs holding any non-constant value died with "No dependency
+  provides clojure.lang.PersistentHashMap". It shares the array-map
+  implementation, duplicate-key check included.
+
+- **Sibling macros in one namespace no longer share fn-form ids.** The
+  registration name `jfn$<ns>$<def>$<n>` restarts its counter per top-level
+  form and was only given the def's name for a `def`, so every `defmacro` fell
+  to `jfn$<ns>$$<n>` and siblings all claimed the same ids — last registration
+  won, and an image dump of a closure over an earlier macro's expander restored
+  a different macro's source form.
+
 - **A live value a macro puts in the form it returns compiles.** Clojure's
   compiler falls through to `ConstantExpr` for anything it does not recognize,
   so `(defmacro m [] (fn [x] (inc x)))` works there — AOT included, verified on
