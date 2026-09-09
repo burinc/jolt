@@ -10,6 +10,7 @@
 #   bench/run.sh                 # full suite + JVM scorecard
 #   bench/run.sh fib             # one benchmark, default size
 #   bench/run.sh fib 32          # one benchmark, custom size
+#   bench/run.sh startup         # the startup row alone (whole-process wall clock)
 #   NO_JVM=1 bench/run.sh        # jolt only (skip the JVM reference)
 #   MODE_A=1 bench/run.sh        # also time a plain-release build (no
 #                                # --direct-link --opt) per bench — the default
@@ -61,7 +62,7 @@ bindir="$(mktemp -d)"
 trap 'rm -rf "$bindir"' EXIT
 
 # name:default-arg, each sized to run in a few seconds. Axes: see README.md.
-BENCHES="fib:30 tak:24 loop-recur:20000 mandelbrot:200 arrays:40000 arrays-unhinted:1000 byte-arrays:400 gc-arrays:150 mathfns:1000000 mathfns-unhinted:1000000 collections:30000 vecops:60000 seqs:20000 sorted-access:40000 nth-access:1000000 transducers:20000 transients:50000 keyed-lookup:3000 hash-eq:2000 literals:100000 string-build:60000 string-ops:100000 string-ops-unhinted:100000 char-scan:40000 char-scan-unhinted:40000 mono-dispatch:2000 dispatch:2000 binary-trees:14 typed-records:100000 typed-records-unhinted:100000 executors:60000"
+BENCHES="fib:30 tak:24 loop-recur:20000 mandelbrot:200 arrays:40000 arrays-unhinted:1000 byte-arrays:400 gc-arrays:150 mathfns:1000000 mathfns-unhinted:1000000 collections:30000 vecops:60000 seqs:20000 lazy-threads:100000 apply-rest:1000000 sorted-access:40000 sorted-build:20000 nth-access:1000000 transducers:20000 transients:50000 keyed-lookup:3000 hash-eq:2000 literals:100000 string-build:60000 string-ops:100000 string-ops-unhinted:100000 char-scan:40000 char-scan-unhinted:40000 printing:300 mono-dispatch:2000 dispatch:2000 binary-trees:14 typed-records:100000 typed-records-unhinted:100000 stm:200000 executors:60000 compile-forms:200"
 
 run_one() {
   ns="${1%%:*}"; arg="${2:-${1##*:}}"
@@ -94,12 +95,48 @@ run_one() {
   fi
 }
 
-if [ -n "$1" ]; then
+# The startup row: every bench above times the compute INSIDE a running binary,
+# so none of them sees what a built program costs from exec to exit — the boot
+# image's decode and the runtime's init. This builds bench/hello.clj and times
+# the whole process, best of REPS (noise only ever adds time), against the JVM
+# starting the same program: `java` on the classpath the clojure CLI resolves,
+# not the CLI itself, whose own JVM would be most of the number.
+STARTUP_REPS="${STARTUP_REPS:-7}"
+best_ms() {   # best-of-N whole-process wall clock, in ms, for a command
+  best=""; i=0
+  while [ "$i" -lt "$STARTUP_REPS" ]; do
+    t0=$(perl -MTime::HiRes=time -e 'printf "%d", time()*1000')
+    "$@" >/dev/null 2>&1
+    t1=$(perl -MTime::HiRes=time -e 'printf "%d", time()*1000')
+    d=$((t1 - t0)); i=$((i + 1))
+    if [ -z "$best" ] || [ "$d" -lt "$best" ]; then best="$d"; fi
+  done
+  echo "$best"
+}
+run_startup() {
+  if ! "$jolt" build -m hello -o "$bindir/hello" --direct-link --opt >/dev/null 2>&1; then
+    printf '%-16s  jolt build FAILED\n' startup; return
+  fi
+  jms=$(best_ms "$bindir/hello")
+  if [ -z "$NO_JVM" ]; then
+    cp=$(clojure -Sdeps '{:paths ["."]}' -Spath 2>/dev/null)
+    vms=$(best_ms java -cp "$cp" clojure.main -m hello)
+    ratio=$(awk "BEGIN{ if (\"$vms\"+0>0 && \"$jms\"+0>0) printf \"%.2fx\", (\"$jms\"+0)/(\"$vms\"+0); else printf \"-\" }")
+    printf '%-16s jolt %9s ms   jvm %8s ms   %s\n' startup "$jms" "${vms:--}" "$ratio"
+  else
+    printf '%-16s jolt %9s ms\n' startup "$jms"
+  fi
+}
+
+if [ "${1:-}" = "startup" ]; then
+  run_startup
+elif [ -n "$1" ]; then
   spec=""
   for s in $BENCHES; do [ "${s%%:*}" = "$1" ] && spec="$s"; done
-  [ -n "$spec" ] || { echo "unknown benchmark: $1 (have: ${BENCHES})" >&2; exit 1; }
+  [ -n "$spec" ] || { echo "unknown benchmark: $1 (have: ${BENCHES} startup)" >&2; exit 1; }
   run_one "$spec" "$2"
 else
   echo "jolt benchmark suite — optimized AOT binaries${NO_JVM:+ }${NO_JVM:-, vs JVM Clojure}"
   for spec in $BENCHES; do run_one "$spec"; done
+  run_startup
 fi
