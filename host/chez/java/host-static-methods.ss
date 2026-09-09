@@ -202,6 +202,19 @@
                     (loop (cddr xs) (jolt-assoc m k (cadr xs))))))))))
 (register-class-statics! "PersistentArrayMap" (list (cons "createWithCheck" pam-create-with-check)))
 (register-class-statics! "clojure.lang.PersistentArrayMap" (list (cons "createWithCheck" pam-create-with-check)))
+;; clojure.lang.PersistentHashMap/createWithCheck: the same duplicate-checking
+;; k/v constructor the JVM reaches for once a map is too big for an array map.
+;; sci builds EVERY map literal through one of the two, choosing by size, so
+;; without this a map of more than eight pairs holding any non-constant value
+;; died with "No dependency provides clojure.lang.PersistentHashMap" — a map
+;; that size is ordinary in a sci program.
+;;
+;; Shares pam-create-with-check: it already seqs its argument, which is what
+;; makes the two interchangeable here, since the JVM hands this one an ISeq and
+;; the array-map one an Object[]. jolt has a single map representation, so the
+;; array-vs-hash split is a size optimization the value semantics do not carry.
+(register-class-statics! "PersistentHashMap" (list (cons "createWithCheck" pam-create-with-check)))
+(register-class-statics! "clojure.lang.PersistentHashMap" (list (cons "createWithCheck" pam-create-with-check)))
 
 ;; clojure.lang.APersistentMap/mapHash + mapHasheq: what a custom map type
 ;; (flatland's OrderedMap) delegates to for .hashCode / .hasheq. mapHash is the
