@@ -1,3 +1,8 @@
-Unhandled exception (IllegalArgumentException): Unknown class no.such.ns
-  at ./test/errors/analyze/unknown-namespace/input.clj:3:1
+error[analyze/unknown-namespace]: No such namespace: no.such.ns
+  --> ./test/errors/analyze/unknown-namespace/input.clj:3:1
+   |
+ 1 | (ns input)
+ 2 | 
+ 3 | (no.such.ns/foo 1)
+   | ^^^^^^^^^^^^^^^^^^
 exit: 1
