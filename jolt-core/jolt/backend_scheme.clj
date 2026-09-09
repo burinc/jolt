@@ -137,12 +137,10 @@
 ;; has to bind t to a temporary first, or these three arms silently evaluate it
 ;; two and three times.
 ;;
-;; Note this path is NOT what honeysql's kw->sym reaches, despite being the shape
-;; that motivated it. jolt's reader advertises :bb (reader.ss rdr-features), and
+;; honeysql's kw->sym is the shape that motivated this, and jolt reaches it:
 ;; honeysql orders its conditional #?(:bb … :clj (.sym ^Keyword k)) with :bb
-;; first at all three of its .sym sites, so jolt takes the pure-Clojure branch
-;; and never sees the interop. It fires for code that writes .sym unconditionally
-;; or puts :clj first.
+;; first at all three of its .sym sites, and jolt stopped matching :bb in #893.
+;; Also fires for code that writes .sym unconditionally or puts :clj first.
 (defn- keyword-direct-emit [m argc t args]
   (let [a0 (first args)]
     (cond
