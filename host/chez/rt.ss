@@ -985,6 +985,35 @@
 ;; non-creating lookup (resolve / find-var / ns-unmap): #f when absent, so a
 ;; probe never interns an empty cell.
 (define (var-cell-lookup ns name) (hashtable-ref var-table (string-append ns "/" name) #f))
+
+;; A file path the way a report shows it: relative to the directory the program
+;; was started from as ./…, under the home directory as ~/…, else as it is --
+;; jank's rule. The started-from directory is JOLT_PWD when the launcher cd'd
+;; away from it (bin/jolt) and the process directory otherwise. A path that
+;; already starts with ./ is only tidied (a project-relative argument used to
+;; arrive as ././x.clj).
+(define (jolt-display-path p)
+  (define (under? p dir)
+    (and (string? dir) (> (string-length dir) 0)
+         (> (string-length p) (string-length dir))
+         (string=? (substring p 0 (string-length dir)) dir)
+         (char=? (string-ref p (string-length dir)) #\/)))
+  (define (strip-dot p)
+    (let loop ((p p))
+      (if (and (> (string-length p) 2) (string=? (substring p 0 2) "./"))
+          (loop (substring p 2 (string-length p)))
+          p)))
+  (cond
+    ((not (string? p)) p)
+    ((and (> (string-length p) 0) (char=? (string-ref p 0) #\/))
+     (let ((cwd (or (getenv "JOLT_PWD") (guard (_ (#t #f)) (current-directory))))
+           (home (getenv "HOME")))
+       (cond ((under? p cwd) (string-append "./" (substring p (+ 1 (string-length cwd)) (string-length p))))
+             ((under? p home) (string-append "~/" (substring p (+ 1 (string-length home)) (string-length p))))
+             (else p))))
+    ((and (> (string-length p) 1) (string=? (substring p 0 2) "./"))
+     (string-append "./" (strip-dot p)))
+    (else p)))
 ;; A direct-linked call to a seed var binds the var's root ONCE, when the def
 ;; that holds the site loads (backend emit-invoke, jolt.host/seed-callable?).
 ;; The compile-time check proved the root a procedure in the same seed, so

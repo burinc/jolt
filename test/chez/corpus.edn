@@ -948,7 +948,7 @@
   {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "bigdec" :expected "3M" :actual "(bigdec 3)" :portability :common}
   {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "numerator throws" :expected :throws :actual "(numerator 1)" :portability :common}
   {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "denominator throws" :expected :throws :actual "(denominator 1)" :portability :common}
-  {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "supers empty set" :expected "#{}" :actual "(supers 1)" :portability :common}
+  {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "supers empty set" :expected "nil" :actual "(supers 1)" :portability :common}
   {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "munge dashes" :expected "\"a_b\"" :actual "(munge \"a-b\")" :portability :common}
   {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "munge symbol" :expected "(quote x_y)" :actual "(munge (quote x-y))" :portability :common}
   {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "test no-test" :expected ":no-test" :actual "(test (quote foo))" :portability :common}
@@ -4039,6 +4039,37 @@
   ;; so it pins both the walk count and the balancing algorithm to the reference.
   {:suite "sorted / one walk per insert" :label "1024 ascending keys into a sorted-map-by count comparator calls like the reference" :expected "12301" :actual "(let [c (atom 0) cmp (fn [a b] (swap! c inc) (compare a b))] (into (sorted-map-by cmp) (map (fn [i] [i i]) (range 1024))) @c)" :portability :common}
   {:suite "sorted / one walk per insert" :label "replacing values in a sorted-map-by counts like the reference" :expected "29414" :actual "(let [c (atom 0) cmp (fn [a b] (swap! c inc) (compare a b))] (into (sorted-map-by cmp) (map (fn [i] [(mod (* i 7919) 1024) i]) (range 2048))) @c)" :portability :common}
+  ;; --- a core fn in value position IS its var's root, as on the JVM: the
+  ;; comparison chains, min/max and the integer division trio used to compile
+  ;; to seq.ss's procedures while ns.ss bound the var roots to raw Scheme ops.
+  {:suite "vars / value position is the root" :label "> in value position is identical to its var root" :expected "true" :actual "(identical? > (var-get (var clojure.core/>)))" :portability :common}
+  {:suite "vars / value position is the root" :label "< in value position is identical to its var root" :expected "true" :actual "(identical? < (var-get (var clojure.core/<)))" :portability :common}
+  {:suite "vars / value position is the root" :label "max in value position is identical to its var root" :expected "true" :actual "(identical? max (var-get (var clojure.core/max)))" :portability :common}
+  ;; defmulti has defonce semantics: a reload keeps the registered methods.
+  {:suite "multimethods / defmulti is defonce" :label "re-evaluating a defmulti keeps its methods" :expected ":hit" :actual "(do (defmulti dmx2 identity) (defmethod dmx2 :a [_] :hit) (defmulti dmx2 identity) (dmx2 :a))" :portability :common}
+  ;; %e and %g, java.util.Formatter's rules: %e is d.dddddde+xx with the
+  ;; precision as fraction digits (6 by default); %g is precision significant
+  ;; digits, fixed when the rounded value is in [10^-4, 10^precision), else %e
+  ;; style; both take only floating-point arguments.
+  {:suite "format / scientific" :label "%e default precision" :expected "\"5.000000e+00\"" :actual "(format \"%e\" 5.0)" :portability :common}
+  {:suite "format / scientific" :label "%g default precision" :expected "\"5.00000\"" :actual "(format \"%g\" 5.0)" :portability :common}
+  {:suite "format / scientific" :label "%.2e rounds to the precision" :expected "\"1.23e+04\"" :actual "(format \"%.2e\" 12345.678)" :portability :common}
+  {:suite "format / scientific" :label "%g below 1e-4 is scientific" :expected "\"1.23400e-05\"" :actual "(format \"%g\" 0.00001234)" :portability :common}
+  {:suite "format / scientific" :label "%.3g at 10^precision is scientific" :expected "\"1.23e+03\"" :actual "(format \"%.3g\" 1234.5)" :portability :common}
+  {:suite "format / scientific" :label "%e of a negative" :expected "\"-5.000000e-01\"" :actual "(format \"%e\" -0.5)" :portability :common}
+  {:suite "format / scientific" :label "%e honours width" :expected "\"  5.00e+00|\"" :actual "(format \"%10.2e|\" 5.0)" :portability :common}
+  {:suite "format / scientific" :label "%e of an integer is refused" :expected "java.util.IllegalFormatConversionException" :actual "(try (format \"%e\" 5) (catch Exception e (class e)))" :portability :common}
+  ;; supers of a root class is nil, not #{}; declare marks the var :declared.
+  {:suite "reflection / supers" :label "supers of Object is nil" :expected "nil" :actual "(supers Object)" :portability :common}
+  {:suite "vars / declare" :label "declare sets :declared on the var" :expected "true" :actual "(do (declare dq3) (:declared (meta (var dq3))))" :portability :common}
+  ;; a heap ByteBuffer slice shares the backing array, as java.nio's does: writes
+  ;; through either side are visible to the other, and the slice reports the
+  ;; offset it starts at.
+  {:suite "interop / ByteBuffer slice" :label "a write to the source shows in the slice" :expected "9" :actual "(let [b (java.nio.ByteBuffer/wrap (byte-array [1 2 3 4]))] (.position b 1) (let [s (.slice b)] (.put b 1 (byte 9)) (.get s 0)))" :portability :jvm}
+  {:suite "interop / ByteBuffer slice" :label "arrayOffset of a slice is its start" :expected "2" :actual "(let [b (java.nio.ByteBuffer/wrap (byte-array [1 2 3 4]))] (.position b 2) (.arrayOffset (.slice b)))" :portability :jvm}
+  {:suite "interop / ByteBuffer slice" :label "a write through the slice shows in the source" :expected "7" :actual "(let [b (java.nio.ByteBuffer/wrap (byte-array [1 2 3 4]))] (.position b 1) (let [s (.slice b)] (.put s 0 (byte 7)) (.get b 1)))" :portability :jvm}
+  {:suite "interop / ByteBuffer slice" :label "capacity of a slice is the remaining count" :expected "4" :actual "(.capacity (.slice (doto (java.nio.ByteBuffer/wrap (byte-array 6)) (.position 2))))" :portability :jvm}
+  {:suite "interop / ByteBuffer slice" :label "a slice of a slice reads through both offsets" :expected "1029" :actual "(let [b (java.nio.ByteBuffer/wrap (byte-array [1 2 3 4 5 6]))] (.position b 2) (let [s (.slice b)] (.position s 1) (.getShort (.slice s) 0)))" :portability :jvm}
   ;; mapcat/dedupe stay lazier than the JVM at construction: jolt's (apply concat …)
   ;; and sequence transformer don't force the first chunk just to build the seq
   ;; (the JVM forces 5 here). Allowlisted in known-divergences.edn (jolt-mm6v).

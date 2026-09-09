@@ -156,17 +156,11 @@
   ([f] (let [ret (f)] (if (fn? ret) (trampoline ret) ret)))
   ([f & args] (trampoline (fn [] (apply f args)))))
 
-;; Canonical pairwise max/min: > / < throw on non-numbers, and the NaN
-;; behavior is Clojure's by construction.
-(defn max
-  ([x] x)
-  ([x y] (if (> x y) x y))
-  ([x y & more] (reduce max (max x y) more)))
 
-(defn min
-  ([x] x)
-  ([x y] (if (< x y) x y))
-  ([x y & more] (reduce min (min x y) more)))
+;; max / min are the host's registered variadics (seq.ss jolt-max / jolt-min),
+;; bound as the var roots in ns.ss: the same procedures a value-position
+;; reference compiles to, so (identical? max (var-get #'max)) holds. An overlay
+;; definition here replaced the root with a second, different fn.
 
 (defn reverse [coll] (reduce conj (list) coll))
 

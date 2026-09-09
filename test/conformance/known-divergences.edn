@@ -628,15 +628,6 @@
            :jvm "\"#inst \\\"2020-01-01T13:14:15.123000000-00:00\\\"\""
            :jolt "\"#inst \\\"2020-01-01T13:14:15.123-00:00\\\"\""}
    :note "One instant type, millisecond-based. read-instant-date and read-instant-calendar are exact."}
-  ;; ByteBuffer.slice() copies where the JVM shares the backing array.
-  {:category :host-model
-   :behavior "(.array (.slice buf)) after (.position buf 1)"
-   :jvm "the WHOLE shared backing array (slice is a view; .array ignores the offset)"
-   :jolt "just the sliced bytes (slice copies)"
-   :check {:expr "(let [b (java.nio.ByteBuffer/wrap (byte-array [1 2 3 4]))] (.position b 1) (count (.array (.slice b))))"
-           :jvm "4"
-           :jolt "3"}
-   :note "A HEAP buffer's state is #(backing position limit) with no array offset, so its slice cannot express \"0-based view into a shared backing\" and copies instead. Read paths — hexdumps, decoders — are unaffected; a write through such a slice does not propagate back. A DIRECT buffer (jolt.ffi/byte-buffer) does share, there being a real address to offset, and .array raises on it as it does on the JVM. Tracked as jolt-93c9."}
   ;; No classloaders. This is not a shim gap that could be filled — a classloader
   ;; is a JVM linkage concept, and jolt compiles ahead of time to native code with
   ;; no class-loading step to intercept. Surfaced running kaocha, whose dynapath

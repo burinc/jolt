@@ -1841,8 +1841,8 @@
   ;; re-defmulti currently CLOBBERS methods (jolt-mw44.30; JVM keeps them —
   ;; jolt-mw44.51 stays an open bead). Pinned AS-IS so a cache change can't
   ;; quietly alter it: after re-defmulti the prior method is gone (default used).
-  {:suite "mm-cache" :label "re-defmulti clobbers prior methods (.30 behavior pin; .51 is open)" :expected "[:DEF :DEF]" :expr "(do (defmulti f (fn [x] x)) (defmethod f :a [x] :got-a) (defmulti f (fn [x] x) :default :d) (defmethod f :d [x] :DEF) [(f :a) (f :anything)])"}
-  {:suite "multimethods / re-defmulti (jolt-mw44.51 pin)" :expr "(do (defmulti mmr identity) (defmethod mmr :a [_] :hit) (defmulti mmr identity) (mmr :a))" :expected :throws}
+  {:suite "mm-cache" :label "re-defmulti is a no-op: the first definition and its methods stand, so a later :default option never applies" :expected :throws :expr "(do (defmulti f (fn [x] x)) (defmethod f :a [x] :got-a) (defmulti f (fn [x] x) :default :d) (defmethod f :d [x] :DEF) [(f :a) (f :anything)])"}
+  {:suite "multimethods / re-defmulti keeps methods" :expr "(do (defmulti mmr identity) (defmethod mmr :a [_] :hit) (defmulti mmr identity) (mmr :a))" :expected ":hit"}
   ;; clojure.math / java.lang.Math: Chez extends several real-domain ops onto the
   ;; complex plane for out-of-domain real inputs, but Java returns NaN there. The
   ;; run-unit harness compares the PRINTED form, so :expected "##NaN" is a string

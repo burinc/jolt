@@ -658,6 +658,56 @@ else
 fi
 rm -rf "$dm_dir"
 
+# A report names a file the way jank does: ./ relative to the directory the
+# program was started from, ~/ under the home directory, else in full. A
+# ./-prefixed argument used to come back as ././x.clj, and an absolute path
+# under the current directory was printed whole.
+pp_dir="$(mktemp -d)"
+pp_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+printf '(throw (ex-info "boom" {}))\n' > "$pp_dir/x.clj"
+pp_out="$(cd "$pp_dir" && JOLT_PWD="$pp_dir" "$pp_jolt" run ./x.clj 2>&1)"
+if printf '%s' "$pp_out" | grep -q 'at \./x\.clj:1:1'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a ./-prefixed script should be reported as ./x.clj"
+  echo "    $(printf '%s' "$pp_out" | grep 'at ' | head -1)"
+  fails=$((fails + 1))
+fi
+pp_out="$(cd "$pp_dir" && JOLT_PWD="$pp_dir" "$pp_jolt" run "$pp_dir/x.clj" 2>&1)"
+if printf '%s' "$pp_out" | grep -q 'at \./x\.clj:1:1'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: an absolute script path under the current directory should be reported as ./x.clj"
+  echo "    $(printf '%s' "$pp_out" | grep 'at ' | head -1)"
+  fails=$((fails + 1))
+fi
+pp_home="$(mktemp -d "$HOME/.jolt-smoke-XXXXXX")"
+printf '(throw (ex-info "boom" {}))\n' > "$pp_home/y.clj"
+pp_out="$(cd "$pp_dir" && JOLT_PWD="$pp_dir" "$pp_jolt" run "$pp_home/y.clj" 2>&1)"
+if printf '%s' "$pp_out" | grep -q "at ~/$(basename "$pp_home")/y\.clj:1:1"; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a script under the home directory should be reported as ~/…"
+  echo "    $(printf '%s' "$pp_out" | grep 'at ' | head -1)"
+  fails=$((fails + 1))
+fi
+rm -rf "$pp_dir" "$pp_home"
+
+# Starting jolt where there is no project and naming a namespace it cannot find
+# says so: the old report was only "Could not locate app/core", which reads as a
+# missing namespace when the real problem is the directory.
+np_dir="$(mktemp -d)"
+np_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+np_out="$(cd "$np_dir" && JOLT_PWD="$np_dir" "$np_jolt" run -m app.core 2>&1)"
+if printf '%s' "$np_out" | grep -q 'No project found in .* (no deps.edn or bb.edn)'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: run -m outside a project should say no project was found"
+  echo "    $(printf '%s' "$np_out" | head -1)"
+  fails=$((fails + 1))
+fi
+rm -rf "$np_dir"
+
 # A readiness registration must never be lost. jolt.io-poller drained its pending
 # registrations in two critical sections, so one landing in between was erased
 # before reaching the kqueue/epoll set and the fiber waiting on that fd never

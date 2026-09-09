@@ -49,6 +49,50 @@
 ;; the JVM formats 123.045 as "123,045" under de. Bound rather than passed so
 ;; every directive path picks it up without threading an argument through.
 (define format-decimal-sep (make-parameter "."))
+;; %e: d.dddddde+xx, prec fraction digits (6 by default), the exponent at least
+;; two digits with a sign, like java.util.Formatter. Rounding is decimal: scale
+;; to prec+1 significant digits as an exact integer, so 9.9999995 carries into
+;; the next power of ten instead of printing 10.000000e+00.
+(define (fmt-sci x prec)
+  (let* ((neg (or (< x 0) (and (flonum? x) (eqv? x -0.0)))) (ax (abs (inexact x))))
+    (if (= ax 0.0)
+        (string-append (if neg "-" "") "0" (if (fx>? prec 0) (string-append (format-decimal-sep) (make-string prec #\0)) "") "e+00")
+        (let* ((e0 (exact (floor (log ax 10))))
+               ;; digits = round(ax / 10^(e0-prec)) as an exact integer; a carry past
+               ;; prec+1 digits bumps the exponent
+               (scale (lambda (e) (round (* (exact ax) (expt 10 (- prec e))))))
+               (d (scale e0))
+               (e (if (>= d (expt 10 (fx+ prec 1))) (+ e0 1) e0))
+               (d (if (eqv? e e0) d (scale e)))
+               (ds (number->string d))
+               (mant (if (fx>? prec 0)
+                         (string-append (substring ds 0 1) (format-decimal-sep) (substring ds 1 (string-length ds)))
+                         ds))
+               (es (number->string (abs e))))
+          (string-append (if neg "-" "") mant "e" (if (< e 0) "-" "+")
+                         (if (fx<? (string-length es) 2) (string-append "0" es) es))))))
+;; %g: prec significant digits (6 by default, a 0 reads as 1); fixed notation
+;; when the ROUNDED value is in [10^-4, 10^prec), scientific otherwise -- Java's
+;; rule, which is why (format "%.3g" 1234.5) is 1.23e+03 and 0.00001234 is
+;; 1.23400e-05. Fixed notation keeps prec significant digits, so the fraction
+;; width is prec minus the digits before the point.
+(define (fmt-general x prec)
+  (let* ((prec (if (fx=? prec 0) 1 prec)) (ax (abs (inexact x))))
+    (if (= ax 0.0)
+        (fmt-float x (fx- prec 1))
+        (let* ((sci (fmt-sci x (fx- prec 1)))
+               (epos (let loop ((i (fx- (string-length sci) 1))) (if (char=? (string-ref sci i) #\e) i (loop (fx- i 1)))))
+               (e (string->number (substring sci (fx+ epos 1) (string-length sci)))))
+          (if (and (>= e -4) (< e prec))
+              (fmt-float x (max 0 (fx- prec (fx+ e 1))))
+              sci)))))
+;; %e / %g take only a floating-point argument; an integer is
+;; IllegalFormatConversionException, as on the JVM.
+(define (fmt-floating d a f)
+  (cond ((jolt-nil? a) "null")
+        ((flonum? a) (f a))
+        (else (jolt-throw (jolt-host-throwable "java.util.IllegalFormatConversionException"
+                (string-append (string d) " != " (jolt-class-name a)))))))
 (define (fmt-float x prec)
   (let* ((neg (< x 0)) (ax (abs x))
          (scale (expt 10 prec))
@@ -93,6 +137,10 @@
                                        ((#\s) (if (jolt-nil? a) "null" (jolt-str-render-one a)))
                                        ((#\S) (string-upcase (if (jolt-nil? a) "null" (jolt-str-render-one a))))
                                        ((#\f) (fmt-numeric d a (lambda (n) (fmt-float n (or prec 6)))))
+                                       ((#\e) (fmt-floating d a (lambda (n) (fmt-sci n (or prec 6)))))
+                                       ((#\E) (fmt-floating d a (lambda (n) (string-upcase (fmt-sci n (or prec 6))))))
+                                       ((#\g) (fmt-floating d a (lambda (n) (fmt-general n (or prec 6)))))
+                                       ((#\G) (fmt-floating d a (lambda (n) (string-upcase (fmt-general n (or prec 6))))))
                                        ((#\x) (fmt-numeric d a (lambda (n) (string-downcase (fmt-radix n 16)))))
                                        ((#\X) (fmt-numeric d a (lambda (n) (string-upcase (fmt-radix n 16)))))
                                        ((#\o) (fmt-numeric d a (lambda (n) (fmt-radix n 8))))

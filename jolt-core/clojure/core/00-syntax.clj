@@ -178,7 +178,7 @@
 ;; compile time: without the var, a declared name that collides with a host root
 ;; binding (parse, hash, …) would compile to the host fn instead of the var.
 (defmacro declare [& syms]
-  `(do ~@(map (fn* [s] `(def ~s)) syms)))
+  `(do ~@(map (fn* [s] `(def ~(with-meta s (assoc (meta s) :declared true)))) syms)))
 
 ;; letfn is a macro over the letfn* special form, matching Clojure: each
 ;; (name [params] body*) spec becomes a name + a (fn name [params] body*) binding.

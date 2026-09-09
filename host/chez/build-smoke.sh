@@ -323,7 +323,7 @@ for frame in 'app\.util/deep-boom .*util\.clj:[0-9]' 'app\.util/mid-boom .*util\
 done
 # ...and in that order, innermost first — a backwards chain contains every frame
 # and would pass the per-frame loop above.
-if ! printf '%s' "$got_ts" | tr '\n' '~' | grep -qE 'deep-boom[^~]*~[^~]*mid-boom[^~]*~[^~]*-main'; then
+if ! printf '%s' "$got_ts" | tr '\n' '%' | grep -qE 'deep-boom[^%]*%[^%]*mid-boom[^%]*%[^%]*-main'; then
   echo "  FAIL: --tree-shake trace frames out of order"
   echo "--- got ----"; echo "$got_ts"; exit 1
 fi
@@ -434,6 +434,23 @@ if ! printf '%s' "$got_rl" | grep -q '^resloader: true true 1 true true$'; then
   echo "  FAIL: ClassLoader resource surface — want 'resloader: true true 1 true true'"
   echo "--- got ----"; echo "$got_rl"; exit 1
 fi
+
+# With no -o and JOLT_PWD unset -- the built jolt started in the project -- the
+# binary is named after the project DIRECTORY, not the entry namespace: "." is
+# resolved to the directory it stands for.
+echo "build smoke: default binary name from the project directory"
+nm_root="$(mktemp -d)"
+nm_app="$nm_root/named-app"
+cp -R "$app" "$nm_app"
+if ! (cd "$nm_app" && env -u JOLT_PWD "$joltabs" build -m app.core --dev >/dev/null 2>&1); then
+  echo "  FAIL: build with no -o and no JOLT_PWD exited non-zero"; exit 1
+fi
+if [ -x "$nm_app/target/debug/named-app" ]; then
+  echo "  - default name: ok (target/debug/named-app)"
+else
+  echo "  FAIL: expected target/debug/named-app, found: $(ls "$nm_app/target/debug" 2>/dev/null | tr '\n' ' ')"; exit 1
+fi
+rm -rf "$nm_root"
 
 # Portable embed: remove the build-time source tree and run from / — the
 # embedded resource must still resolve (contents baked as literals, not

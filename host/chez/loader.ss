@@ -2108,6 +2108,15 @@
 (def-var! "jolt.host" "set-source-roots!"
   (lambda (roots) (set-source-roots! (seq->list roots)) jolt-nil))
 (def-var! "jolt.host" "source-roots" (lambda () (list->cseq source-roots)))
+;; The file a namespace would load from, or nil: the same search a require
+;; does, without loading. jolt.main asks before requiring an entry namespace
+;; so it can say "no project here" instead of "could not locate" -- a catch
+;; around the require would re-raise a propagating load error from the wrong
+;; place and lose its location.
+(def-var! "jolt.host" "ns-source"
+  (lambda (nm)
+    (let ((f (find-ns-file (if (string? nm) nm (jolt-str-render-one nm)))))
+      (if f f jolt-nil))))
 (def-var! "jolt.host" "load-namespace" (lambda (n) (load-namespace n) jolt-nil))
 ;; The Clojure-facing seam for :jolt/replaces (see ldr-ns-replacements above).
 ;; jolt.deps collects the key and jolt.main calls this once per namespace after

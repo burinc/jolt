@@ -388,8 +388,8 @@
 ;; ancestry (jolt.host/class-supers) so reflective checks like
 ;; (ancestors (class f)) answer like the JVM.
 (defn supers [x]
-  (let [s (jolt.host/class-supers x)]
-    (if s (set s) #{})))
+  (let [s (set (jolt.host/class-supers x))]
+    (if (seq s) s nil)))
 
 ;; munge: the name as the compiler would spell it in a class or method name,
 ;; preserving the argument's type — a symbol munges to a symbol, anything else to
