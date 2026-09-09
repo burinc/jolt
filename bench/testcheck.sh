@@ -12,7 +12,8 @@
 set -e
 cd "$(dirname "$0")"
 root="$(cd .. && pwd)"
-jolt="$root/bin/jolt"
+# $JOLT_BIN points the run at another jolt (a built binary), as run.sh does.
+jolt="${JOLT_BIN:-$root/bin/jolt}"
 TC_VERSION="1.1.3"
 
 work="$(mktemp -d)"

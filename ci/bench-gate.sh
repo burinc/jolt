@@ -4,7 +4,8 @@
 #   ci/bench-gate.sh <baseline-jolt> <candidate-jolt> [max-ratio] [bench...]
 #
 # Naming benches runs only those — how a flagged row gets re-checked on its own,
-# and how this script is exercised without paying for the whole suite.
+# and how this script is exercised without paying for the whole suite. `startup`
+# names the whole-process row at the end.
 #
 # Both compilers build the SAME bench sources (this checkout's), so what is being
 # compared is codegen, not the benchmarks. Every measurement is a RATIO between
@@ -88,8 +89,17 @@ for spec in $(sh "$root/bench/run.sh" --list); do
     bmin="$(awk "BEGIN{m=\"$bmin\"+0; v=\"$b\"+0; if (v>0 && (m==0 || v<m)) m=v; print m}")"
     cmin="$(awk "BEGIN{m=\"$cmin\"+0; v=\"$c\"+0; if (v>0 && (m==0 || v<m)) m=v; print m}")"
   done
-  if [ "$(awk "BEGIN{print (\"$bmin\"+0 <= 0 || \"$cmin\"+0 <= 0)}")" = 1 ]; then
-    echo "  FAIL $ns: a side produced no timing (the bench printed no mean:)"
+  # A baseline that builds a bench but cannot RUN it — a bench that exercises
+  # something the older release lacks, `printing`'s format flags on 0.8.5 —
+  # is not a regression; the candidate failing to run one is.
+  if [ "$(awk "BEGIN{print (\"$bmin\"+0 <= 0)}")" = 1 ]; then
+    echo "  SKIP $ns: the BASELINE jolt built it but printed no mean: (a bench that"
+    echo "       needs something the release being compared against lacks)"
+    skipped=$((skipped + 1)); continue
+  fi
+  if [ "$(awk "BEGIN{print (\"$cmin\"+0 <= 0)}")" = 1 ]; then
+    echo "  FAIL $ns: the candidate produced no timing (the bench printed no mean:)"
+    "$work/$ns.cand" "$arg" 2>&1 | sed -n '1,10p'
     fails=$((fails + 1)); continue
   fi
   ratio="$(awk "BEGIN{printf \"%.2f\", (\"$cmin\"+0)/(\"$bmin\"+0)}")"
@@ -99,6 +109,47 @@ for spec in $(sh "$root/bench/run.sh" --list); do
     "$([ "$over" = 1 ] && echo '  <-- REGRESSED' || true)"
   [ "$over" = 1 ] && fails=$((fails + 1)) || true
 done
+
+# The startup row. Every bench above times the compute inside a running binary,
+# so none of them sees a regression in what a built program costs from exec to
+# exit — the boot image's decode and the runtime's init, which is exactly what a
+# boot-format change moves (0.8.5's vfasl boot, 0.8.6's --boot codecs). Both
+# compilers build bench/hello.clj; best of $rounds whole-process wall clocks per
+# side, alternating, same ratio and same ceiling as the rows above.
+if [ -z "$only" ] || { for o in $only; do [ "$o" = startup ] && break; done; [ "$o" = startup ]; }; then
+  wall_ms() {   # best-of-N whole-process wall clock in ms; noise only ever adds time
+    best=""; i=0
+    while [ "$i" -lt "$rounds" ]; do
+      t0=$(perl -MTime::HiRes=time -e 'printf "%d", time()*1000')
+      "$1" >/dev/null 2>&1
+      t1=$(perl -MTime::HiRes=time -e 'printf "%d", time()*1000')
+      d=$((t1 - t0)); i=$((i + 1))
+      if [ -z "$best" ] || [ "$d" -lt "$best" ]; then best="$d"; fi
+    done
+    echo "$best"
+  }
+  if ! build "$base" hello "$work/hello.base"; then
+    echo "  SKIP startup: the BASELINE jolt could not build bench/hello.clj"
+    skipped=$((skipped + 1))
+  elif ! build "$cand" hello "$work/hello.cand"; then
+    echo "  FAIL startup: the candidate jolt could not build bench/hello.clj"
+    sed -n '1,20p' "$work/build.log"
+    fails=$((fails + 1))
+  else
+    "$work/hello.base" >/dev/null 2>&1 || true; "$work/hello.cand" >/dev/null 2>&1 || true
+    bmin="$(wall_ms "$work/hello.base")"; cmin="$(wall_ms "$work/hello.cand")"
+    if [ "$bmin" -le 0 ] || [ "$cmin" -le 0 ]; then
+      echo "  FAIL startup: a side took no measurable time"; fails=$((fails + 1))
+    else
+      ratio="$(awk "BEGIN{printf \"%.2f\", $cmin/$bmin}")"
+      over="$(awk "BEGIN{print ($ratio > \"$max\"+0)}")"
+      rows=$((rows + 1))
+      printf '%-16s %10.1f %10.1f %7sx%s\n' startup "$bmin" "$cmin" "$ratio" \
+        "$([ "$over" = 1 ] && echo '  <-- REGRESSED' || true)"
+      [ "$over" = 1 ] && fails=$((fails + 1)) || true
+    fi
+  fi
+fi
 
 echo
 if [ "$rows" -eq 0 ]; then
