@@ -507,9 +507,9 @@ applyscaling: testbin
 # cell publishes its forced tail through one word and reads it lock-free, and the
 # once-only mutex is borrowed for the force, never kept per cell. The ratio of one
 # workload timed before and after a thread has existed, in ONE process, is the
-# judge; a per-cell mutex reads ~3-5 there (every collection visits a million
-# finalized objects), the pooled design ~1. Also races eight walkers over shared
-# unrealized seqs and checks every producer ran exactly once.
+# judge; a per-cell mutex reads ~5 there (every collection visits a million
+# finalized objects), the claim design ~1.5. Also races eight walkers over
+# shared unrealized seqs and checks every producer ran exactly once.
 lazyscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/lazyseq_mt_scaling_test.clj
 
