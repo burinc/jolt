@@ -14,6 +14,7 @@
                                form-map-pairs form-set-items form-char-code
                                form-regex? form-regex-source
                                form-inst? form-inst-source form-uuid? form-uuid-source
+                               form-bigdec? form-bigdec-source
                                form-class-value? form-class-value-name]]
             [jolt.passes.types :as types]
             [jolt.passes.numeric :as numeric]
@@ -1241,6 +1242,11 @@
     ;; a quote) reconstructs through the interner, like #inst/#uuid.
     (form-class-value? form) (str "(jolt-class-for " (chez-str-lit (form-class-value-name form)) ")")
     (form-uuid? form) (str "(jolt-uuid-from-string " (chez-str-lit (form-uuid-source form)) ")")
+    ;; ...and a quoted 1.5M builds its BigDecimal the same way (the :bigdec IR
+    ;; leaf's emit). Without this arm the raw reader form went out as the datum:
+    ;; (first '[1.5M]) was an opaque object printing as #bigdec "1.5", = to
+    ;; nothing, and (eval '(+ 1.5M 1)) could not compile it.
+    (form-bigdec? form) (str "(jolt-bigdec-from-string " (chez-str-lit (form-bigdec-source form)) ")")
     ;; a quoted custom #tag with no registered reader -> a tagged-literal value
     ;; (Clojure's reader builds a TaggedLiteral), not the raw reader map. The tag is
     ;; stored as a :#name keyword; strip the leading # to the bare symbol.

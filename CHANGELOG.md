@@ -249,13 +249,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `defonce` and keeps them. A `defmulti` whose var already holds a multifn is a
   no-op now, options included (jolt-mw44.51).
 
+- **A `1.5M` literal inside quoted data is a `BigDecimal`.** The quoted-data
+  emitter had arms for `#"…"`, `#inst` and `#uuid` but none for the `M`
+  suffix, so `(first '[1.5M])` was an opaque reader object that printed as
+  `#bigdec "1.5"` and was `=` to nothing, and `(eval '(+ 1.5M 1))` could not
+  compile.
+
 - **`format` knows `%e` and `%g`** (and `%E`/`%G`), with `java.util.Formatter`'s
   rules: `%e` is `d.dddddde+xx` with the precision as fraction digits, `%g` is
   the precision in significant digits, fixed when the rounded value is in
   `[10^-4, 10^precision)` and scientific otherwise — so `(format "%.3g" 1234.5)`
   is `1.23e+03` and `(format "%g" 0.00001234)` is `1.23400e-05` — and both refuse
   an integer with `IllegalFormatConversionException`. They used to throw
-  `UnknownFormatConversionException` (jolt-mw44.46).
+  `UnknownFormatConversionException` (jolt-mw44.46). Measuring them against the
+  JVM turned up the rest of the formatter's number handling, fixed alongside:
+
+  - **Rounding is the JVM's**: half up on the value's shortest decimal digits,
+    for `%f` as much as `%e`/`%g`. `(format "%.2f" 1.005)` is `1.01` and
+    `(format "%.0f" 2.5)` is `3`; both used to round the binary value half to
+    even (`1.00`, `2`). `(format "%.20f" 0.1)` pads zeros past the digits, as
+    the JVM does, instead of printing the binary expansion.
+  - **The flags `+`, space, `,` and `(`** are read (`%+d`, `% d`, `%,d`,
+    `%,.2f`, `%(e`); each used to be `UnknownFormatConversionException`. A `0`
+    pads after the sign: `(format "%08.2f" -3.0)` is `-0003.00`, not `000-3.00`.
+  - **`NaN` and the infinities print** as `NaN`, `Infinity` and `-Infinity`
+    (`+Infinity` under `+`) where every float conversion threw.
+  - **A `BigDecimal` argument formats**, exactly from its own digits, where it
+    was refused.
+  - **Argument types are the JVM's**: `%d`, `%x`, `%X` and `%o` take an integer
+    and `%f`, `%e` and `%g` a float or a `BigDecimal`; anything else is
+    `IllegalFormatConversionException`, so `(format "%.3f" 1/3)`, which printed
+    `0.333` here and threw there, throws on both.
 
 - **`(supers Object)` is `nil`, not `#{}`**, as the reference's `(not-empty …)`
   answers (jolt-xp7e). **`declare` marks its vars `:declared`** (jolt-qmkd).
