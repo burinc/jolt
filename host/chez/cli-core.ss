@@ -410,6 +410,9 @@
         (when (serious-condition? c) (jolt-capture-fault! c))
         (raise-continuable c))
       (lambda () (jolt-cli-dispatch cli-args prepare-build!)))
+    ;; The JVM does not end while a non-daemon thread the program started is
+    ;; still running; the shutdown hooks run after the last one finishes.
+    (guard (_ (#t #f)) (jolt-await-user-threads!))
     ;; normal-return twin of the exit-handler above. A `chez --script` that
     ;; returns instead of calling (exit) ends the process without ever running
     ;; the exit handler, so the shutdown hooks have to be run from here as well —

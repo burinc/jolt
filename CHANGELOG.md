@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **A sorted-map or sorted-set insert walks the tree once.** `sm-assoc-1` and
+  `ss-conj-1` looked the key up and then inserted it, two walks for every fresh
+  key, where `PersistentTreeMap.add` walks once and reports a found key through
+  a box. A counting comparator made it exact: 1024 ascending keys into a
+  `sorted-map-by` cost 24602 calls here against the reference's 12301. `tree-ins`
+  now answers `nil` for a present key and leaves the node in a `volatile!`, so an
+  insert is one walk and a replace two, both as on the JVM — two corpus rows pin
+  the counts (12301 for the inserts, 29414 for a replace-heavy mix), which pins
+  the balancing algorithm to the reference as well. `(into (sorted-map) …)` over
+  40k entries: **326ms → 280ms**. The sorted set walks once too, where
+  `PersistentTreeSet.cons` walks twice (`contains`, then `add`), so it is not
+  pinned. The rest of the 17x that remains against the JVM's 16ms is the tree
+  itself — small fns, `nth` on five-vectors, node allocation — which is
+  jolt-r8tz.4/.9's territory, not the wrapper: measured per insert, the wrapper
+  is 1.4x over the bare tree, not the 4.6x the bead recorded before the seq-tier
+  rounds (jolt-r8tz.7).
+
+- **Lazy realization costs the same whether or not a thread has ever existed.**
+  The first `fork-thread` — a future, an agent, a core.async op, a spawned
+  process, an nREPL session — flipped the runtime into its multi-threaded mode
+  for good, and in that mode every lazy cell and every lazy-seq node took a
+  per-cell mutex on *every* access, reads included, allocating that mutex under
+  a global one. A Chez mutex is a finalized object the collector has to visit:
+  500k of them cost a collection 6.2ms against 0.33ms for the same count of
+  vectors. So once any thread had existed, `(vec (range 3))` a million times went
+  480ms → 1558ms and a collection 0.031ms → 3.756ms; a fixed foreground workload
+  went 1.24s → 4.91s with a background thread that only *slept* and 13.35s with
+  one that allocated, where the JVM shows no effect at all. malli's
+  `function-schema-test` after `validation-test` (which abandons a thread on
+  purpose) was 43.8s → 342.8s (jolt-ugdf, the remainder of jolt-5j99).
+
+  A cell's tail is now ONE published word: the thunk (a procedure or a producer
+  descriptor) until it is forced, and whatever the thunk answered after it.
+  Realized is a type test on that word, so a reader on any thread loads it and is
+  done — a single aligned store cannot tear, and everything it points to is
+  reached by a dependent load, with the writer publishing behind a release
+  fence. Once-only forcing is a CLAIM, not a lock: the forcing thread swaps the
+  cell's lock field from `#f` to a claim by compare-and-swap (Chez's
+  `$record-cas!`, behind the adapter as `sa-record-cas!`), runs the thunk under
+  the lock count so it cannot park, publishes, and swaps back. Two CAS
+  instructions, no mutex, nothing for the collector. A thread that finds a cell
+  claimed by another spins briefly then sleeps in growing steps; a thread that
+  reaches its own claim recurses, as the reference's reentrant monitor does. A
+  claim is `(token . thread-id)` with a process-unique token, so a cell restored
+  from an image — with a mutex from a runtime that kept one per cell, or the
+  claim of the process that wrote it mid-force — is recognized as stale and
+  cleared.
+
+  Gated by `make lazyscaling`: one workload timed before any thread exists and
+  again after one has, in one process. The old binary measures **5.18**, the
+  new one **1.47** (ceiling 1.6), with collector time in the second arm down
+  from dominant to 1ms; eight walkers racing over shared unrealized seqs see
+  every producer run exactly once, a failing body included. The thread-safety
+  gate checks the claim itself: racing forcers, stale lock values, a raising
+  thunk releasing its claim.
+
 - **A hinted `(aset ^bytes a i v)` stores into the bytevector, and `(byte x)` is
   a direct call.** `bench/byte-arrays`' `bfill` phase was the largest single
   jolt/JVM ratio in the suite, and both halves of its one hot line were paying to
@@ -59,6 +115,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other door into a byte array (`into-array`, `Arrays/fill`, `na-list->backing`).
 
 ### Added
+
+- **`jolt.host/reset-maximum-memory-bytes!` and `jolt.host/gc-trip-bytes`.** The
+  collector's high-water mark can be started over, so the peak growth of one
+  stretch of work reads as `maximum-memory-bytes` minus the total at the reset,
+  and the allocation threshold that triggers a trip collection is readable; the
+  apply-scaling gate measures with them instead of sampling the live heap from
+  a watcher thread, which read collector timing and failed a CI run at 3.00.
 
 - **`jolt build --boot fast|small|plain` picks how the boot image is encoded.**
   0.8.5 converts the boot to vfasl — an image of the loaded heap, which starts
@@ -156,6 +219,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   been standing in for sci. Reported by @markokocic in #893.
 
 ### Fixed
+
+- **A non-daemon `Thread` keeps the process alive, and `.setDaemon` means it.**
+  The process ended the moment `-main` returned, whatever threads were still
+  running, and `.setDaemon` was accepted and ignored — so work handed to a
+  started `Thread` was lost at exit, silently. As on the JVM, the process now
+  ends when `-main` has returned *and* every non-daemon thread the program
+  started has finished, and the shutdown hooks run after that; a daemon thread
+  holds nothing open. `.isDaemon` answers the flag, `.setDaemon` after `.start`
+  is an `IllegalThreadStateException`, and so is a second `.start`.
+  `System/exit` still ends the process at once from any thread. Futures, agents
+  and the runtime's own service threads are unchanged (jolt-g3jh).
+
+- **The Gambit host's virtual registers are per thread.** The shim backed each
+  slot with a parameter, which fork-inherits into a SRFI-18 thread, so a child
+  started with its parent's value in a slot the runtime relies on being fresh —
+  an interrupt box, a per-thread cache — while the shim's own comment claimed
+  Chez's "a fresh thread starts every slot at 0". Slots now live in each
+  thread's `thread-specific` vector, the contract is pinned by a gambitcheck
+  row, and the two lock-count shims the new lazy-seq force path needs on that
+  host exist (jolt-c684).
 
 - **`alter-meta!` and `reset-meta!` reach a `deftype` or `reify` that declares
   `clojure.lang.IReference`.** Both wrote jolt's identity metadata side table

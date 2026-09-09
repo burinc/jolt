@@ -98,7 +98,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling \
+  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling lazyscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
@@ -158,7 +158,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
@@ -502,6 +502,16 @@ compilescaling: testbin
 # an unbounded seq until the process dies.
 applyscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/apply_scaling_test.clj
+
+# Lazy realization costs the same whether or not a thread has ever existed: a
+# cell publishes its forced tail through one word and reads it lock-free, and the
+# once-only mutex is borrowed for the force, never kept per cell. The ratio of one
+# workload timed before and after a thread has existed, in ONE process, is the
+# judge; a per-cell mutex reads ~5 there (every collection visits a million
+# finalized objects), the claim design ~1.5. Also races eight walkers over
+# shared unrealized seqs and checks every producer ran exactly once.
+lazyscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/lazyseq_mt_scaling_test.clj
 
 # (into vec vec) and subvec stay O(log n) through core — the raw pvec ops have
 # rrbscaling; this catches core falling back to an element-by-element rebuild.

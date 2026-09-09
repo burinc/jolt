@@ -172,10 +172,15 @@
     (eval (list 'define pred-name (list 'make-jolt-record-pred id)) env)
     (let loop ((j 0) (fs fields))
       (if (pair? fs)
-          (let* ((spec (car fs))               ; (kind . name), kind ∈ mutable|immutable
-                 (f (cdr spec))
-                 (acc (string->symbol (string-append nstr "-" (symbol->string f))))
-                 (setn (string->symbol (string-append (symbol->string acc) "-set!"))))
+          (let* ((spec (car fs))               ; (kind . name) or (kind name acc [set])
+                 (named? (pair? (cdr spec)))
+                 (f (if named? (cadr spec) (cdr spec)))
+                 (acc (if named?
+                          (caddr spec)
+                          (string->symbol (string-append nstr "-" (symbol->string f)))))
+                 (setn (if (and named? (pair? (cdddr spec)))
+                           (cadddr spec)
+                           (string->symbol (string-append (symbol->string acc) "-set!")))))
             (eval (list 'define acc (list 'make-jolt-record-accessor
                                           id parent-n j))
                   env)
@@ -202,11 +207,15 @@
         (make-jolt-record-ctor id n))
       (error 'record-constructor "not a jolt record descriptor" rtd)))
 
-;; field-spec extraction: (kind . name) pairs. R6RS semantics: a PLAIN spec is
-;; IMMUTABLE — only (mutable f) fields get a setter binding.
+;; field-spec extraction: (kind . name) pairs, or (kind name accessor [mutator])
+;; when the spec names its accessor and mutator itself, as R6RS allows and
+;; seq.ss uses. R6RS semantics: a PLAIN spec is IMMUTABLE — only (mutable f)
+;; fields get a setter binding.
 (define-syntax jolt-record-field-names
   (syntax-rules (mutable immutable)
     ((_ ()) '())
+    ((_ ((mutable f acc set) rest ...)) (cons (list 'mutable 'f 'acc 'set) (jolt-record-field-names (rest ...))))
+    ((_ ((immutable f acc) rest ...)) (cons (list 'immutable 'f 'acc) (jolt-record-field-names (rest ...))))
     ((_ ((mutable f) rest ...)) (cons (cons 'mutable 'f) (jolt-record-field-names (rest ...))))
     ((_ ((immutable f) rest ...)) (cons (cons 'immutable 'f) (jolt-record-field-names (rest ...))))
     ((_ (f rest ...)) (cons (cons 'immutable 'f) (jolt-record-field-names (rest ...))))))
@@ -499,6 +508,12 @@ eturn)) (loop (- n 1)))
 
 (define (make-thread-parameter init) (make-parameter init))
 
+;; Chez's fences, which seq.ss and lazy-bridge.ss issue before publishing a
+;; forced tail on the multi-threaded path. Gambit's Scheme-level threads are
+;; green threads on one OS thread, so ordering across them is program order.
+(define (memory-order-release) #!void)
+(define (memory-order-acquire) #!void)
+
 ;; SRFI-18 spellings: make-condition-variable / condition-variable-signal! /
 ;; condition-variable-broadcast.
 (define (make-condition) (make-condition-variable))
@@ -677,19 +692,30 @@ eturn)) (loop (- n 1)))
 (define (make-thread-parameter v) (make-parameter v))
 
 ;; virtual-register / set-virtual-register!: Chez's fixed per-thread slot
-;; array (rt-core claims slots 2/3/4). Gambit has no equivalent; one parameter
-;; per claimed slot, created lazily, reproduces the per-thread semantics and
-;; the "fresh thread starts every slot at fixnum 0" contract. converters.ss's
-;; jolt-print-one stashes a print-readably override in slot jolt-vreg-print-
-;; readably through these.
-(define %vreg-table (make-table test: eqv?))  ;; slot fixnum -> parameter
-(define (virtual-register n)
-  (let ((p (table-ref %vreg-table n #f)))
-    (if p (p) 0)))
-(define (set-virtual-register! n v)
-  (let ((p (or (table-ref %vreg-table n #f)
-               (let ((q (make-parameter 0))) (table-set! %vreg-table n q) q))))
-    (p v)))
+;; array (rt-core claims slots 2/3/4; seq.ss's claim path counts into 7).
+;; Gambit has no equivalent, so each thread carries its own vector of slots in
+;; its thread-specific field, made on first touch. That gives Chez's two
+;; properties: a slot is this thread's alone, and a FRESH THREAD STARTS EVERY
+;; SLOT AT FIXNUM 0 -- nothing is inherited. A parameter per slot, which this
+;; used to be, has neither: a parameter fork-inherits into a SRFI-18 thread
+;; (the G0 pin, and the reason make-thread-parameter above is an alias), so a
+;; child started with its parent's value, which is the one thing a per-thread
+;; interrupt box or cache must never do. gambitcheck.ss pins the contract.
+(define (%vreg-slots)
+  (let* ((t (current-thread)) (v (thread-specific t)))
+    (if (vector? v)
+        v
+        (let ((v (make-vector 16 0))) (thread-specific-set! t v) v))))
+(define (virtual-register n) (vector-ref (%vreg-slots) n))
+(define (set-virtual-register! n v) (vector-set! (%vreg-slots) n v))
+(define (virtual-register-count) 16)
+
+;; locks.ss's lock count, which seq.ss's force-claimed! keeps while a tail
+;; thunk runs. On Chez the scheduler reads it to refuse preempting a fiber that
+;; holds a lock; this host has no fibers, so the count is kept and nothing
+;; consults it.
+(define (jolt-locks-enter!) (set-virtual-register! 7 (+ 1 (virtual-register 7))))
+(define (jolt-locks-exit!) (set-virtual-register! 7 (- (virtual-register 7) 1)))
 
 ;; parse-int-str / parse-int-or-throw — ported from java/host-static.ss (G2
 ;; EXCLUDES the java/ tree; natives-misc.ss's jolt-bigint calls them). String
