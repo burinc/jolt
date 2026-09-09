@@ -98,7 +98,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
   aotcachepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling \
+  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
@@ -158,7 +158,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
+CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
@@ -488,6 +488,20 @@ mvnhttp:
 # Takes the built binary: script mode would measure the same ratio far slower.
 readscaling: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/read_scaling_test.clj
+
+# Compiling a namespace stays linear in its source, and a quoted form does not
+# cost dramatically more than the construction it is. The second half is not
+# implied by the first: a per-form cost regression is linear, just linear and
+# slow, and one shipped green through the whole gate (see the file).
+compilescaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/compile_scaling_test.clj
+
+# apply must stream a variadic's rest, not materialize it: guards the
+# jolt-register-variadic! registration on the native + - * / min max and the
+# comparison chains (host/chez/seq.ss). Without it (apply max (range)) realizes
+# an unbounded seq until the process dies.
+applyscaling: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/apply_scaling_test.clj
 
 # (into vec vec) and subvec stay O(log n) through core — the raw pvec ops have
 # rrbscaling; this catches core falling back to an element-by-element rebuild.
