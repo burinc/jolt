@@ -165,6 +165,8 @@ monitor-enter
 monitor-exit
 mono-nanos
 munge-name
+ns-loaded?
+ns-shaped-name?
 park-until-interrupt
 pop
 protocol-key-of
