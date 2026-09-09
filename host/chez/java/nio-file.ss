@@ -266,14 +266,83 @@
       (let ((s (npath-string-of x))) (project-relative (if (string=? s "") "." s)))))
 (define (->path x) (if (nio-path? x) x (make-nio-path (npath-string-of x))))
 
+;; ---- error reporting: java.nio.file's exception family, not java.io's -------
+;; Chez's filesystem primitives raise &i/o-filename conditions. Left to escape,
+;; they reach jolt through host-faults' generic fallback, which names them with
+;; java.io classes -- FileNotFoundException for a missing path -- and renders the
+;; Chez primitive's own message. java.nio.file.Files answers a different family,
+;; per UnixException.translateToIOException, so every Files entry point that
+;; touches the filesystem translates its own failure here.
+;;
+;; Two facts about the raise shape this:
+;;
+;;   - Only open-file-input-port / open-file-output-port attach the R6RS
+;;     subconditions (&i/o-file-already-exists, &i/o-file-does-not-exist,
+;;     &i/o-file-protection). mkdir, rename-file and directory-list raise a bare
+;;     &i/o-filename whose only clue to the errno is the strerror text sitting in
+;;     the irritants.
+;;   - Reading a class off that text would tie it to libc's wording, and to the
+;;     locale the process happens to run under.
+;;
+;; So the entry points needing a class Chez does not type stat first and name the
+;; error themselves. That is a race for the error's NAME only, never for
+;; correctness: no pre-check here gates a mutation. createFile -- the one place
+;; where losing the race would cost data -- takes the O_EXCL open instead, which
+;; does raise a typed condition, and stats nothing.
+(define (nio-fs-throw cls fp) (jolt-throw (jolt-host-throwable cls fp)))
+(define (nio-no-such-file fp)   (nio-fs-throw "java.nio.file.NoSuchFileException" fp))
+(define (nio-already-exists fp) (nio-fs-throw "java.nio.file.FileAlreadyExistsException" fp))
+;; "<path>: <reason>" is the JDK's rendering for every errno without a class.
+(define (nio-fs-detail fp reason)
+  (nio-fs-throw "java.nio.file.FileSystemException"
+                (if reason (string-append fp ": " reason) fp)))
+
+;; The strerror text is the LAST string irritant: an open raises (path reason),
+;; rename-file raises (src dst reason). Any other shape degrades to a bare path
+;; rather than promoting some other irritant into the reason slot.
+(define (nio-fs-error-reason e fp)
+  (and (irritants-condition? e)
+       (let loop ((xs (condition-irritants e)) (last #f))
+         (cond ((null? xs) (and (string? last) (not (string=? last fp)) last))
+               ((string? (car xs)) (loop (cdr xs) (car xs)))
+               (else (loop (cdr xs) last))))))
+
+;; Run a Chez filesystem primitive, translating whatever it raises.
+(define (nio-fs-call fp thunk)
+  (guard (e
+          ((i/o-file-already-exists-error? e) (nio-already-exists fp))
+          ((i/o-file-does-not-exist-error? e) (nio-no-such-file fp))
+          ((i/o-file-protection-error? e)
+           (nio-fs-throw "java.nio.file.AccessDeniedException" fp))
+          ((i/o-filename-error? e) (nio-fs-detail fp (nio-fs-error-reason e fp)))
+          (else (raise e)))
+    (thunk)))
+
+;; A directory opens for reading on Linux and only fails at the first read, so
+;; newInputStream handed back a stream that threw later. The JVM checks at open
+;; and reports exactly this message.
+(define (nio-open-input-port fp)
+  (when (file-directory? fp) (nio-fs-detail fp "Is a directory"))
+  (nio-fs-call fp (lambda () (open-file-input-port fp))))
+
 (define (nio-size fp)
-  (if (or (not (file-exists? fp)) (file-directory? fp)) 0
-      (let ((port (open-file-input-port fp)))
+  (if (not (or (file-exists? fp) (nio-is-symlink? fp)))
+      (nio-no-such-file fp)
+      ;; A directory opens for reading and fstats fine even though READING one
+      ;; fails, and Files.size reports a directory's st_size like any other
+      ;; entry -- so open it directly here rather than through
+      ;; nio-open-input-port, which is the read path and refuses a directory
+      ;; exactly as the JVM's newInputStream does.
+      ;;
+      ;; Chez's file-length is fstat(2).st_size (S_get_fd_length in new-io.c),
+      ;; which is the number the JVM answers, so this needs none of the struct
+      ;; stat offsets below -- the fd carries the layout question for us.
+      (let ((port (nio-fs-call fp (lambda () (open-file-input-port fp)))))
         (let ((n (file-length port))) (close-port port) n))))
 
 (define (nio-read-bv fp)
   (io-note-file-read! fp)          ; a compile-time read belongs in the AOT key (io.ss)
-  (let ((port (open-file-input-port fp)))
+  (let ((port (nio-open-input-port fp)))
     (let ((bv (get-bytevector-all port)))
       (close-port port)
       (if (eof-object? bv) (make-bytevector 0) bv))))
@@ -300,19 +369,19 @@
          (loop (+ i 1) (+ i 1) (cons (substring s start i) acc)))
         (else (loop (+ i 1) start acc))))))
 
-(define (nio-write! fp data)
+(define (nio-output-data->bv data)
   (cond
-    ((jolt-array? data) (nio-write-bv! fp (na-bytearray->bv data)))
-    ((string? data) (nio-write-bv! fp (string->utf8 data)))
+    ((jolt-array? data) (na-bytearray->bv data))
+    ((string? data) (string->utf8 data))
     (else                                    ; Iterable<CharSequence>: line + separator each
      (let ((body (fold-left (lambda (acc ln) (string-append acc (jolt-str-render-one ln) "\n"))
                             "" (seq->list (jolt-seq data)))))
-       (nio-write-bv! fp (string->utf8 body))))))
+       (string->utf8 body)))))
 
 (define (nio-delete1 fp missing-ok?)
   (cond ((nio-is-symlink? fp) (delete-file fp) #t)   ; the link itself, even if dangling
         ((not (file-exists? fp))
-         (if missing-ok? #f (jolt-throw (jolt-ex-info fp empty-pmap))))
+         (if missing-ok? #f (nio-no-such-file fp)))
         ((file-directory? fp) (if (delete-directory fp) #t
                                 (jolt-throw (jolt-host-throwable "java.nio.file.DirectoryNotEmptyException"
                                                                  (npath-string-of fp)))))
@@ -357,7 +426,7 @@
         (cons "readAllLines"  (lambda (p . _) (nio-read-lines (nfp p))))
         (cons "newInputStream"(lambda (p . _) (let ((fp (nfp p)))
                                                 (io-note-file-read! fp)
-                                                (make-in-stream (open-file-input-port fp)))))
+                                                (make-in-stream (nio-open-input-port fp)))))
         (cons "createTempFile"      (lambda args (nio-files-create-temp args #f)))
         (cons "createTempDirectory" (lambda args (nio-files-create-temp args #t))))))
   (set! files-accum (append files-accum files-statics)))
@@ -457,7 +526,10 @@
 (define (nio-new-directory-stream dir . rest)
   (let* ((base (npath-string-of dir))
          (fp (project-relative base))
-         (names (sort string<? (directory-list fp)))
+         (_ (cond ((not (file-exists? fp)) (nio-no-such-file fp))
+                  ((not (file-directory? fp))
+                   (nio-fs-throw "java.nio.file.NotDirectoryException" fp))))
+         (names (sort string<? (nio-fs-call fp (lambda () (directory-list fp)))))
          (arg (and (pair? rest) (car rest)))
          (paths (map (lambda (nm) (make-nio-path (nio-path-join base nm))) names)))
     (make-dir-stream
@@ -637,9 +709,10 @@
                                           (->path link)))
              (cons "createLink" (lambda (link existing . _)
                                   (when c-link (c-link (nfp existing) (nfp link))) (->path link)))
-             (cons "readSymbolicLink" (lambda (p) (let ((t (nio-readlink (nfp p))))
-                                                    (if t (make-nio-path t)
-                                                        (jolt-throw (jolt-ex-info (npath-string-of p) empty-pmap))))))
+             (cons "readSymbolicLink" (lambda (p) (let* ((fp (nfp p)) (t (nio-readlink fp)))
+                                                    (cond (t (make-nio-path t))
+                                                          ((not (file-exists? fp)) (nio-no-such-file fp))
+                                                          (else (nio-fs-throw "java.nio.file.NotLinkException" fp))))))
              (cons "setPosixFilePermissions" (lambda (p perms . _)
                                                (when c-chmod (c-chmod (nfp p) (posix-set->mode perms))) (->path p))))))
   (set! files-accum (append files-accum files-attr)))
@@ -674,24 +747,64 @@
   (register-class-statics! "PosixFilePermission" pfp-perms)
   (register-class-statics! "java.nio.file.attribute.PosixFilePermission" pfp-perms))
 
-;; copy / move honor REPLACE_EXISTING; write / newOutputStream honor APPEND.
-(define (nio-append! fp data)
-  (let ((port (open-file-output-port fp (file-options no-fail no-truncate append))))
-    (put-bytevector port (cond ((jolt-array? data) (na-bytearray->bv data))
-                               ((string? data) (string->utf8 data))
-                               (else (string->utf8 (fold-left (lambda (a ln) (string-append a (jolt-str-render-one ln) "\n")) "" (seq->list (jolt-seq data)))))))
-    (close-port port)))
+;; copy / move honor REPLACE_EXISTING; write honors APPEND. newOutputStream's
+;; options need a fuller mapping because CREATE_NEW is an atomic filesystem
+;; operation, not a pre-open existence check: the port returned by
+;; open-file-output-port with no `no-fail` option owns the O_EXCL-style create
+;; handle itself.
+(define (nio-output-file-options args)
+  (let* ((opts (npath-spread-args args))
+         (syms (map oopt-sym opts)))
+    (for-each
+     (lambda (sym)
+       (cond
+         ((eq? sym 'read)
+          (throw-jvm (quote IllegalArgumentException) "READ not allowed"))
+         ((not (memq sym '(write append create create-new truncate-existing)))
+          (throw-jvm (quote UnsupportedOperationException)
+                     "unsupported output option"))))
+     syms)
+    (let* ((defaults? (null? syms))
+           (append? (memq 'append syms))
+           (truncate? (or defaults? (memq 'truncate-existing syms)))
+           (create-new? (memq 'create-new syms))
+           (create? (or defaults? create-new? (memq 'create syms))))
+      (when (and append? truncate?)
+        (throw-jvm (quote IllegalArgumentException)
+                   "APPEND + TRUNCATE_EXISTING not allowed"))
+      (cond
+        ;; No `no-fail`: Chez creates the entry and atomically fails if any
+        ;; entry (including a symlink) already occupies the path.
+        (create-new? (if append?
+                         (file-options no-truncate append)
+                         (file-options)))
+        (append? (if create?
+                     (file-options no-fail no-truncate append)
+                     (file-options no-create no-fail no-truncate append)))
+        (create? (if truncate?
+                     (file-options no-fail)
+                     (file-options no-fail no-truncate)))
+        (truncate? (file-options no-create no-fail))
+        (else (file-options no-create no-fail no-truncate))))))
+
+(define (nio-open-output-port fp options)
+  (nio-fs-call fp (lambda () (open-file-output-port fp options))))
+
 (let ((files-opt
        (list (cons "write" (lambda (p data . opts)
-                             (if (nio-opts-have? opts oopt-sym 'append)
-                                 (nio-append! (nfp p) data) (nio-write! (nfp p) data))
-                             (->path p)))
+                             (let* ((fp (nfp p))
+                                    ;; not named `file-options`: that is the Chez
+                                    ;; macro this scope still needs to mean itself
+                                    (fopts (nio-output-file-options opts))
+                                    (bytes (nio-output-data->bv data))
+                                    (port (nio-open-output-port fp fopts)))
+                               (put-bytevector port bytes)
+                               (close-port port)
+                               (->path p))))
              (cons "newOutputStream" (lambda (p . opts)
                                       (make-out-stream
-                                       (open-file-output-port
-                                        (nfp p) (if (nio-opts-have? opts oopt-sym 'append)
-                                                    (file-options no-fail no-truncate append)
-                                                    (file-options no-fail)))))))))
+                                       (nio-open-output-port
+                                        (nfp p) (nio-output-file-options opts))))))))
   (set! files-accum (append files-accum files-opt)))
 
 ;; ---- stat-backed perms + real path (increment: what the fs suite exercises) --
@@ -886,6 +999,11 @@
 (define (nio-parent-of fp)
   (let loop ((i (- (string-length fp) 1)))
     (cond ((< i 0) "") ((char=? (string-ref fp i) #\/) (substring fp 0 i)) (else (loop (- i 1))))))
+(define (nio-blocking-ancestor fp)   ; nearest existing ancestor that is not a directory
+  (let loop ((p (nio-parent-of fp)))
+    (cond ((or (string=? p "") (string=? p "/")) #f)
+          ((file-exists? p) (and (not (file-directory? p)) p))
+          (else (loop (nio-parent-of p))))))
 (define (nio-missing-ancestors fp)   ; the not-yet-existing path chain, shallowest first
   (let loop ((p fp) (acc '()))
     (cond ((or (string=? p "") (string=? p "/") (file-exists? p)) acc)
@@ -894,23 +1012,46 @@
 (define (nio-dest-present? d) (or (file-exists? d) (nio-is-symlink? d)))
 (let ((files-create+move
        (list
-        (cons "createDirectory" (lambda (p . attrs) (mkdir (nfp p)) (nio-apply-attrs-umask! (nfp p) attrs) (->path p)))
+        (cons "createDirectory" (lambda (p . attrs)
+                                  (let ((fp (nfp p)))
+                                    ;; mkdir's EEXIST and ENOENT come back untyped, so name them
+                                    ;; here. A non-directory in the way is neither: that is
+                                    ;; ENOTDIR, which nio-fs-call renders as a FileSystemException
+                                    ;; exactly as the JVM does.
+                                    (when (nio-dest-present? fp) (nio-already-exists fp))
+                                    (let ((parent (nio-parent-of fp)))
+                                      (when (and (not (string=? parent "")) (not (file-exists? parent)))
+                                        (nio-no-such-file fp)))
+                                    (nio-fs-call fp (lambda () (mkdir fp)))
+                                    (nio-apply-attrs-umask! fp attrs) (->path p))))
+        ;; CREATE_NEW's open, for the same reason Files/newOutputStream takes it:
+        ;; `no-fail` here made createFile TRUNCATE an existing file and return it.
         (cons "createFile" (lambda (p . attrs)
-                             (close-port (open-file-output-port (nfp p) (file-options no-fail)))
-                             (nio-apply-attrs-umask! (nfp p) attrs) (->path p)))
+                             (let ((fp (nfp p)))
+                               (close-port (nio-fs-call fp (lambda () (open-file-output-port fp (file-options)))))
+                               (nio-apply-attrs-umask! fp attrs) (->path p))))
         (cons "createDirectories" (lambda (p . attrs)
-                                    (let ((missing (nio-missing-ancestors (nfp p))))
-                                      (mkdirs! (nfp p))
-                                      (for-each (lambda (d) (nio-apply-attrs-umask! d attrs)) missing))
+                                    (let ((fp (nfp p)))
+                                      ;; an existing directory is a no-op; anything else in the
+                                      ;; way -- at the target or above it -- is the JVM's
+                                      ;; FileAlreadyExistsException, named for what blocks
+                                      (when (and (file-exists? fp) (not (file-directory? fp)))
+                                        (nio-already-exists fp))
+                                      (let ((blocked (nio-blocking-ancestor fp)))
+                                        (when blocked (nio-already-exists blocked)))
+                                      (let ((missing (nio-missing-ancestors fp)))
+                                        (nio-fs-call fp (lambda () (mkdirs! fp)))
+                                        (for-each (lambda (d) (nio-apply-attrs-umask! d attrs)) missing)))
                                     (->path p)))
         (cons "move" (lambda (src dst . opts)
                        (let ((s (nfp src)) (d (nfp dst)))
                          (cond
                            ((string=? s d) (->path dst))
+                           ((not (nio-dest-present? s)) (nio-no-such-file s))
                            ((and (nio-dest-present? d) (not (nio-opts-have? opts copt-sym 'replace-existing)))
-                            (jolt-throw (jolt-ex-info (string-append d " already exists") empty-pmap)))
+                            (nio-already-exists d))
                            (else (when (nio-dest-present? d) (nio-delete1 d #t))
-                                 (rename-file s d) (->path dst)))))))))
+                                 (nio-fs-call s (lambda () (rename-file s d))) (->path dst)))))))))
   (set! files-accum (append files-accum files-create+move)))
 
 ;; ---- nofollow timestamps (the link's own mtime, via lstat/lutimes) ----------
@@ -935,7 +1076,10 @@
       (file-mtime-millis fp)))
 (let ((files-nofollow-time
        (list
-        (cons "getLastModifiedTime" (lambda (p . opts) (make-file-time (nio-lmtime-millis (nfp p) opts))))
+        (cons "getLastModifiedTime" (lambda (p . opts)
+                                      (let ((fp (nfp p)))
+                                        (unless (or (file-exists? fp) (nio-is-symlink? fp)) (nio-no-such-file fp))
+                                        (make-file-time (nio-lmtime-millis fp opts)))))
         (cons "getAttribute" (lambda (path attr . opts)
                                (let ((fp (nfp path)) (nm (nio-attr-name (npath-string-of attr))))
                                  (if (member nm '("lastModifiedTime" "creationTime" "lastAccessTime"))
@@ -992,8 +1136,9 @@
                        (let ((s (nfp src)) (d (nfp dst)))
                          (cond
                            ((string=? s d) (->path dst))
+                           ((not (nio-dest-present? s)) (nio-no-such-file s))
                            ((and (nio-dest-present? d) (not (nio-opts-have? opts copt-sym 'replace-existing)))
-                            (jolt-throw (jolt-ex-info (string-append d " already exists") empty-pmap)))
+                            (nio-already-exists d))
                            (else
                             (when (nio-dest-present? d) (nio-delete1 d #t))
                             (cond
