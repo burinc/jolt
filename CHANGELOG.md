@@ -48,8 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fence. Once-only forcing is a CLAIM, not a lock: the forcing thread swaps the
   cell's lock field from `#f` to a claim by compare-and-swap (Chez's
   `$record-cas!`, behind the adapter as `sa-record-cas!`), runs the thunk under
-  the lock count so it cannot park, publishes, and swaps back. Two CAS
-  instructions, no mutex, nothing for the collector. A thread that finds a cell
+  the lock count so it cannot park, publishes, and swaps back — with a release
+  fence between the published tail and the cleared claim and an acquire fence
+  after a claim, because a CAS orders nothing but its own word: without them the
+  once-only gate saw a cell's thunk run twice in ~8% of racing forces. Two CAS
+  instructions, two fences, no mutex, nothing for the collector. A thread that finds a cell
   claimed by another spins briefly then sleeps in growing steps; a thread that
   reaches its own claim recurses, as the reference's reentrant monitor does. A
   claim is `(token . thread-id)` with a process-unique token, so a cell restored
@@ -219,6 +222,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   been standing in for sci. Reported by @markokocic in #893.
 
 ### Fixed
+
+- **Starting jolt where there is no project says so.** `jolt run -m app.core`
+  from a subdirectory of a project, or from anywhere with no `deps.edn`, reported
+  "Could not locate app/core" — a missing namespace, when the problem was the
+  directory. When the entry namespace is not on the roots and the directory has
+  no `deps.edn` or `bb.edn`, the report now names that directory and says the
+  namespace was looked for on the built-in roots only (jolt-s8gj).
+
+- **`jolt build` names the binary after the project directory** even when
+  `JOLT_PWD` is unset, as it is for the built jolt started inside the project:
+  the "." that stood for the directory resolves to its name, instead of falling
+  back to the entry namespace's first segment (jolt-42ov).
+
+- **A core fn in value position is its var's root.** `(identical? > (var-get
+  #'>))` was false: a value-position `>`, `<`, `<=`, `>=`, `min`, `max`, `mod`,
+  `rem` or `quot` compiled to the runtime's own procedure while `ns.ss` bound the
+  var root to the raw Scheme operator (and `max`/`min` to a second definition in
+  the overlay). The roots are those procedures now, so identity holds as on the
+  JVM — and a root taken through the var streams `apply`'s rest the way the
+  compiled reference does, where the raw operator materialized it (jolt-obtq).
+
+- **`defmulti` has `defonce` semantics.** Re-evaluating a `defmulti` — a file
+  reloaded in a REPL, a namespace required twice — replaced the multifn with an
+  empty one and every registered method was gone; the JVM's expands through
+  `defonce` and keeps them. A `defmulti` whose var already holds a multifn is a
+  no-op now, options included (jolt-mw44.51).
+
+- **A `1.5M` literal inside quoted data is a `BigDecimal`.** The quoted-data
+  emitter had arms for `#"…"`, `#inst` and `#uuid` but none for the `M`
+  suffix, so `(first '[1.5M])` was an opaque reader object that printed as
+  `#bigdec "1.5"` and was `=` to nothing, and `(eval '(+ 1.5M 1))` could not
+  compile.
+
+- **`format` knows `%e` and `%g`** (and `%E`/`%G`), with `java.util.Formatter`'s
+  rules: `%e` is `d.dddddde+xx` with the precision as fraction digits, `%g` is
+  the precision in significant digits, fixed when the rounded value is in
+  `[10^-4, 10^precision)` and scientific otherwise — so `(format "%.3g" 1234.5)`
+  is `1.23e+03` and `(format "%g" 0.00001234)` is `1.23400e-05` — and both refuse
+  an integer with `IllegalFormatConversionException`. They used to throw
+  `UnknownFormatConversionException` (jolt-mw44.46). Measuring them against the
+  JVM turned up the rest of the formatter's number handling, fixed alongside:
+
+  - **Rounding is the JVM's**: half up on the value's shortest decimal digits,
+    for `%f` as much as `%e`/`%g`. `(format "%.2f" 1.005)` is `1.01` and
+    `(format "%.0f" 2.5)` is `3`; both used to round the binary value half to
+    even (`1.00`, `2`). `(format "%.20f" 0.1)` pads zeros past the digits, as
+    the JVM does, instead of printing the binary expansion.
+  - **The flags `+`, space, `,` and `(`** are read (`%+d`, `% d`, `%,d`,
+    `%,.2f`, `%(e`); each used to be `UnknownFormatConversionException`. A `0`
+    pads after the sign: `(format "%08.2f" -3.0)` is `-0003.00`, not `000-3.00`.
+  - **`NaN` and the infinities print** as `NaN`, `Infinity` and `-Infinity`
+    (`+Infinity` under `+`) where every float conversion threw.
+  - **A `BigDecimal` argument formats**, exactly from its own digits, where it
+    was refused.
+  - **Argument types are the JVM's**: `%d`, `%x`, `%X` and `%o` take an integer
+    and `%f`, `%e` and `%g` a float or a `BigDecimal`; anything else is
+    `IllegalFormatConversionException`, so `(format "%.3f" 1/3)`, which printed
+    `0.333` here and threw there, throws on both.
+
+- **`(supers Object)` is `nil`, not `#{}`**, as the reference's `(not-empty …)`
+  answers (jolt-xp7e). **`declare` marks its vars `:declared`** (jolt-qmkd).
+
+- **A heap `ByteBuffer` slice shares its backing array.** `.slice` copied the
+  remaining bytes, so a write through either side was invisible to the other; a
+  buffer carries an array offset now, `.slice` is a view at the current position
+  and `.arrayOffset` reports it, like java.nio. `.put` gained the absolute
+  `(index, byte)` and ranged `(byte[], offset, length)` overloads while it was
+  open — the absolute form used to be read as a relative put of the index
+  (jolt-93c9).
+
+- **Reports name files the way jank does.** `jolt run ./x.clj` reported
+  `././x.clj`, and an absolute path was printed whole. A path is shown relative
+  to the directory the program was started from as `./…`, under the home
+  directory as `~/…`, else as it is — in the location line and in every trace
+  frame (jolt-8lzv).
 
 - **A non-daemon `Thread` keeps the process alive, and `.setDaemon` means it.**
   The process ended the moment `-main` returned, whatever threads were still

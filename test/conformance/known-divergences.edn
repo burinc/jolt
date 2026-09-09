@@ -197,6 +197,19 @@
            :jvm "\"true\""
            :jolt "\"false\""}
    :note "Same root as the row above, seen through a collection. Util.equiv tests reference identity before value, and the JVM compiler hands both lists the SAME boxed Double for the ##NaN constant, so the elements are identical and the lists compare equal — clojure.org/guides/equality documents this as a surprise rather than a rule, and the clojure-test-suite calls it undefined behavior. jolt compares element values, so it answers false, which is what (= ##NaN ##NaN) already says."}
+  ;; The shortest decimal digits of Double/MIN_VALUE. Java's FloatingDecimal
+  ;; prints the smallest denormal as 4.9E-324; Chez's free-format printer, which
+  ;; is what format and str read a flonum's digits from, prints 5e-324 -- both
+  ;; round-trip to the same double, so both are shortest, and only this one
+  ;; value (one significant bit) has two shortest spellings.
+  {:category :numeric-model
+   :behavior "(format \"%.2e\" 4.9e-324)"
+   :jvm "\"4.90e-324\""
+   :jolt "\"5.00e-324\""
+   :check {:expr "(format \"%.2e\" 4.9e-324)"
+           :jvm "\"4.90e-324\""
+           :jolt "\"5.00e-324\""}
+   :note "Only Double/MIN_VALUE: every other double has one shortest digit string and the two printers agree on it. format's %e/%f/%g round those digits half up exactly as java.util.Formatter does."}
   ;; ex-info's data map is unchecked here. ExceptionInfo's constructor takes an
   ;; IPersistentMap, so a non-map is a ClassCastException on the JVM; jolt stores
   ;; whatever it is handed and ex-data reads it back. A superset: portable code
@@ -628,15 +641,6 @@
            :jvm "\"#inst \\\"2020-01-01T13:14:15.123000000-00:00\\\"\""
            :jolt "\"#inst \\\"2020-01-01T13:14:15.123-00:00\\\"\""}
    :note "One instant type, millisecond-based. read-instant-date and read-instant-calendar are exact."}
-  ;; ByteBuffer.slice() copies where the JVM shares the backing array.
-  {:category :host-model
-   :behavior "(.array (.slice buf)) after (.position buf 1)"
-   :jvm "the WHOLE shared backing array (slice is a view; .array ignores the offset)"
-   :jolt "just the sliced bytes (slice copies)"
-   :check {:expr "(let [b (java.nio.ByteBuffer/wrap (byte-array [1 2 3 4]))] (.position b 1) (count (.array (.slice b))))"
-           :jvm "4"
-           :jolt "3"}
-   :note "A HEAP buffer's state is #(backing position limit) with no array offset, so its slice cannot express \"0-based view into a shared backing\" and copies instead. Read paths — hexdumps, decoders — are unaffected; a write through such a slice does not propagate back. A DIRECT buffer (jolt.ffi/byte-buffer) does share, there being a real address to offset, and .array raises on it as it does on the JVM. Tracked as jolt-93c9."}
   ;; No classloaders. This is not a shim gap that could be filled — a classloader
   ;; is a JVM linkage concept, and jolt compiles ahead of time to native code with
   ;; no class-loading step to intercept. Surfaced running kaocha, whose dynapath

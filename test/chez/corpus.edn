@@ -948,7 +948,7 @@
   {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "bigdec" :expected "3M" :actual "(bigdec 3)" :portability :common}
   {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "numerator throws" :expected :throws :actual "(numerator 1)" :portability :common}
   {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "denominator throws" :expected :throws :actual "(denominator 1)" :portability :common}
-  {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "supers empty set" :expected "#{}" :actual "(supers 1)" :portability :common}
+  {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "supers empty set" :expected "nil" :actual "(supers 1)" :portability :common}
   {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "munge dashes" :expected "\"a_b\"" :actual "(munge \"a-b\")" :portability :common}
   {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "munge symbol" :expected "(quote x_y)" :actual "(munge (quote x-y))" :portability :common}
   {:suite "clojure.core / leaf batch (complement fnil munge etc.)" :label "test no-test" :expected ":no-test" :actual "(test (quote foo))" :portability :common}
@@ -4039,6 +4039,90 @@
   ;; so it pins both the walk count and the balancing algorithm to the reference.
   {:suite "sorted / one walk per insert" :label "1024 ascending keys into a sorted-map-by count comparator calls like the reference" :expected "12301" :actual "(let [c (atom 0) cmp (fn [a b] (swap! c inc) (compare a b))] (into (sorted-map-by cmp) (map (fn [i] [i i]) (range 1024))) @c)" :portability :common}
   {:suite "sorted / one walk per insert" :label "replacing values in a sorted-map-by counts like the reference" :expected "29414" :actual "(let [c (atom 0) cmp (fn [a b] (swap! c inc) (compare a b))] (into (sorted-map-by cmp) (map (fn [i] [(mod (* i 7919) 1024) i]) (range 2048))) @c)" :portability :common}
+  ;; --- a core fn in value position IS its var's root, as on the JVM: the
+  ;; comparison chains, min/max and the integer division trio used to compile
+  ;; to seq.ss's procedures while ns.ss bound the var roots to raw Scheme ops.
+  {:suite "vars / value position is the root" :label "> in value position is identical to its var root" :expected "true" :actual "(identical? > (var-get (var clojure.core/>)))" :portability :common}
+  {:suite "vars / value position is the root" :label "< in value position is identical to its var root" :expected "true" :actual "(identical? < (var-get (var clojure.core/<)))" :portability :common}
+  {:suite "vars / value position is the root" :label "max in value position is identical to its var root" :expected "true" :actual "(identical? max (var-get (var clojure.core/max)))" :portability :common}
+  ;; defmulti has defonce semantics: a reload keeps the registered methods.
+  {:suite "multimethods / defmulti is defonce" :label "re-evaluating a defmulti keeps its methods" :expected ":hit" :actual "(do (defmulti dmx2 identity) (defmethod dmx2 :a [_] :hit) (defmulti dmx2 identity) (dmx2 :a))" :portability :common}
+  ;; %e and %g, java.util.Formatter's rules: %e is d.dddddde+xx with the
+  ;; precision as fraction digits (6 by default); %g is precision significant
+  ;; digits, fixed when the rounded value is in [10^-4, 10^precision), else %e
+  ;; style; both take only floating-point arguments.
+  {:suite "format / scientific" :label "%e default precision" :expected "\"5.000000e+00\"" :actual "(format \"%e\" 5.0)" :portability :common}
+  {:suite "format / scientific" :label "%g default precision" :expected "\"5.00000\"" :actual "(format \"%g\" 5.0)" :portability :common}
+  {:suite "format / scientific" :label "%.2e rounds to the precision" :expected "\"1.23e+04\"" :actual "(format \"%.2e\" 12345.678)" :portability :common}
+  {:suite "format / scientific" :label "%g below 1e-4 is scientific" :expected "\"1.23400e-05\"" :actual "(format \"%g\" 0.00001234)" :portability :common}
+  {:suite "format / scientific" :label "%.3g at 10^precision is scientific" :expected "\"1.23e+03\"" :actual "(format \"%.3g\" 1234.5)" :portability :common}
+  {:suite "format / scientific" :label "%e of a negative" :expected "\"-5.000000e-01\"" :actual "(format \"%e\" -0.5)" :portability :common}
+  {:suite "format / scientific" :label "%e honours width" :expected "\"  5.00e+00|\"" :actual "(format \"%10.2e|\" 5.0)" :portability :common}
+  {:suite "format / scientific" :label "%e of an integer is refused" :expected "java.util.IllegalFormatConversionException" :actual "(try (format \"%e\" 5) (catch Exception e (class e)))" :portability :common}
+  ;; java.util.Formatter rounds the SHORTEST decimal digits of a value half up,
+  ;; not the binary value half to even: 1.005 is "1.005" to it, so two places
+  ;; give 1.01 (the binary value 1.00499... would give 1.00), and 2.5 at zero
+  ;; places is 3. Zeros pad past the digits rather than the binary expansion.
+  {:suite "format / rounding and flags" :label "%.0e rounds half up" :expected "\"3e+00\"" :actual "(format \"%.0e\" 2.5)" :portability :common}
+  {:suite "format / rounding and flags" :label "%.1e rounds half up" :expected "\"1.3e+00\"" :actual "(format \"%.1e\" 1.25)" :portability :common}
+  {:suite "format / rounding and flags" :label "%.2e rounds the shortest digits" :expected "\"1.01e+00\"" :actual "(format \"%.2e\" 1.005)" :portability :common}
+  {:suite "format / rounding and flags" :label "%.3e carries into the exponent" :expected "\"1.000e+01\"" :actual "(format \"%.3e\" 9.9995)" :portability :common}
+  {:suite "format / rounding and flags" :label "%.1f rounds half up" :expected "\"0.3\"" :actual "(format \"%.1f\" 0.25)" :portability :common}
+  {:suite "format / rounding and flags" :label "%.2f rounds the shortest digits" :expected "\"1.01\"" :actual "(format \"%.2f\" 1.005)" :portability :common}
+  {:suite "format / rounding and flags" :label "%.0f rounds half up" :expected "\"3\"" :actual "(format \"%.0f\" 2.5)" :portability :common}
+  {:suite "format / rounding and flags" :label "%.3f rounds the shortest digits" :expected "\"2.001\"" :actual "(format \"%.3f\" 2.0005)" :portability :common}
+  {:suite "format / rounding and flags" :label "%.20f pads zeros past the digits" :expected "\"0.10000000000000000000\"" :actual "(format \"%.20f\" 0.1)" :portability :common}
+  {:suite "format / rounding and flags" :label "%f of a large value" :expected "\"100000000000000000000.000000\"" :actual "(format \"%f\" 1e20)" :portability :common}
+  {:suite "format / rounding and flags" :label "%.2f of a tiny value" :expected "\"0.00\"" :actual "(format \"%.2f\" 1e-10)" :portability :common}
+  {:suite "format / rounding and flags" :label "%g rounds then chooses fixed" :expected "\"10.0000\"" :actual "(format \"%g\" 9.999995)" :portability :common}
+  {:suite "format / rounding and flags" :label "%.2g carries then stays fixed" :expected "\"0.0010\"" :actual "(format \"%.2g\" 0.000999)" :portability :common}
+  {:suite "format / rounding and flags" :label "%e of a denormal" :expected "\"1.000000e-320\"" :actual "(format \"%e\" 1e-320)" :portability :common}
+  {:suite "format / rounding and flags" :label "%g of a denormal" :expected "\"1.00000e-320\"" :actual "(format \"%g\" 1e-320)" :portability :common}
+  {:suite "format / rounding and flags" :label "%e of Double/MAX_VALUE" :expected "\"1.797693e+308\"" :actual "(format \"%e\" 1.7976931348623157e308)" :portability :common}
+  {:suite "format / rounding and flags" :label "%e of a three-digit exponent" :expected "\"1.000000e+100\"" :actual "(format \"%e\" 1e100)" :portability :common}
+  {:suite "format / rounding and flags" :label "%.1e half cases" :expected "[\"5.0e-02\" \"1.5e-01\" \"2.5e-01\"]" :actual "[(format \"%.1e\" 0.05) (format \"%.1e\" 0.15) (format \"%.1e\" 0.25)]" :portability :common}
+  {:suite "format / rounding and flags" :label "%e of negative zero" :expected "\"-0.000000e+00\"" :actual "(format \"%e\" -0.0)" :portability :common}
+  ;; NaN and the infinities print, with the sign flags and never zero padding
+  {:suite "format / rounding and flags" :label "%f of NaN" :expected "\"NaN\"" :actual "(format \"%f\" ##NaN)" :portability :common}
+  {:suite "format / rounding and flags" :label "%e of Infinity" :expected "\"Infinity\"" :actual "(format \"%e\" ##Inf)" :portability :common}
+  {:suite "format / rounding and flags" :label "%.1f of -Infinity" :expected "\"-Infinity\"" :actual "(format \"%.1f\" ##-Inf)" :portability :common}
+  {:suite "format / rounding and flags" :label "%+e of Infinity" :expected "\"+Infinity\"" :actual "(format \"%+e\" ##Inf)" :portability :common}
+  {:suite "format / rounding and flags" :label "%010e of NaN pads with spaces" :expected "\"       NaN\"" :actual "(format \"%010e\" ##NaN)" :portability :common}
+  ;; the flags + space , ( and 0 after the sign
+  {:suite "format / rounding and flags" :label "%+d" :expected "[\"+5\" \"-5\"]" :actual "[(format \"%+d\" 5) (format \"%+d\" -5)]" :portability :common}
+  {:suite "format / rounding and flags" :label "% d" :expected "\" 5\"" :actual "(format \"% d\" 5)" :portability :common}
+  {:suite "format / rounding and flags" :label "%+f" :expected "\"+1.000000\"" :actual "(format \"%+f\" 1.0)" :portability :common}
+  {:suite "format / rounding and flags" :label "%+g" :expected "\"+1.50000\"" :actual "(format \"%+g\" 1.5)" :portability :common}
+  {:suite "format / rounding and flags" :label "%08.2f pads zeros after the sign" :expected "\"-0003.00\"" :actual "(format \"%08.2f\" -3.0)" :portability :common}
+  {:suite "format / rounding and flags" :label "%08d pads zeros after the sign" :expected "\"-0000042\"" :actual "(format \"%08d\" -42)" :portability :common}
+  {:suite "format / rounding and flags" :label "%012.2e pads zeros after the sign" :expected "\"-0003.00e+00\"" :actual "(format \"%012.2e\" -3.0)" :portability :common}
+  {:suite "format / rounding and flags" :label "%(e parenthesizes a negative" :expected "\"(1.000000e+00)\"" :actual "(format \"%(e\" -1.0)" :portability :common}
+  {:suite "format / rounding and flags" :label "%,d groups" :expected "\"1,234,567\"" :actual "(format \"%,d\" 1234567)" :portability :common}
+  {:suite "format / rounding and flags" :label "%,.2f groups the integer part" :expected "\"1,234.50\"" :actual "(format \"%,.2f\" 1234.5)" :portability :common}
+  ;; a BigDecimal formats from its own digits; the argument types are the JVM's
+  {:suite "format / rounding and flags" :label "%f of a BigDecimal" :expected "\"1.500000\"" :actual "(format \"%f\" 1.5M)" :portability :common}
+  {:suite "format / rounding and flags" :label "%.2f of a BigDecimal rounds half up" :expected "\"1.01\"" :actual "(format \"%.2f\" 1.005M)" :portability :common}
+  {:suite "format / rounding and flags" :label "%e of a BigDecimal" :expected "\"1.500000e+00\"" :actual "(format \"%e\" 1.5M)" :portability :common}
+  {:suite "format / rounding and flags" :label "%g of a BigDecimal" :expected "\"1.50000\"" :actual "(format \"%g\" 1.5M)" :portability :common}
+  {:suite "format / rounding and flags" :label "%f of a ratio is refused" :expected "java.util.IllegalFormatConversionException" :actual "(try (format \"%.3f\" 1/3) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / rounding and flags" :label "%f of an integer is refused" :expected "java.util.IllegalFormatConversionException" :actual "(try (format \"%f\" 5) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / rounding and flags" :label "%g of a ratio is refused" :expected "java.util.IllegalFormatConversionException" :actual "(try (format \"%g\" 1/2) (catch Exception e (class e)))" :portability :common}
+  {:suite "format / rounding and flags" :label "%d of a double is refused" :expected "java.util.IllegalFormatConversionException" :actual "(try (format \"%d\" 3.7) (catch Exception e (class e)))" :portability :common}
+  ;; a bigdec literal inside QUOTED data is a BigDecimal, like #inst and #uuid
+  ;; there: emit-quoted had no arm for it, so (first '[1.5M]) was an opaque
+  ;; reader object that was = to nothing.
+  {:suite "format / rounding and flags" :label "a quoted 1.5M is a BigDecimal" :expected "[java.math.BigDecimal true]" :actual "[(class (first (quote [1.5M]))) (= 1.5M (first (quote [1.5M])))]" :portability :common}
+  ;; supers of a root class is nil, not #{}; declare marks the var :declared.
+  {:suite "reflection / supers" :label "supers of Object is nil" :expected "nil" :actual "(supers Object)" :portability :common}
+  {:suite "vars / declare" :label "declare sets :declared on the var" :expected "true" :actual "(do (declare dq3) (:declared (meta (var dq3))))" :portability :common}
+  ;; a heap ByteBuffer slice shares the backing array, as java.nio's does: writes
+  ;; through either side are visible to the other, and the slice reports the
+  ;; offset it starts at.
+  {:suite "interop / ByteBuffer slice" :label "a write to the source shows in the slice" :expected "9" :actual "(let [b (java.nio.ByteBuffer/wrap (byte-array [1 2 3 4]))] (.position b 1) (let [s (.slice b)] (.put b 1 (byte 9)) (.get s 0)))" :portability :jvm}
+  {:suite "interop / ByteBuffer slice" :label "arrayOffset of a slice is its start" :expected "2" :actual "(let [b (java.nio.ByteBuffer/wrap (byte-array [1 2 3 4]))] (.position b 2) (.arrayOffset (.slice b)))" :portability :jvm}
+  {:suite "interop / ByteBuffer slice" :label "a write through the slice shows in the source" :expected "7" :actual "(let [b (java.nio.ByteBuffer/wrap (byte-array [1 2 3 4]))] (.position b 1) (let [s (.slice b)] (.put s 0 (byte 7)) (.get b 1)))" :portability :jvm}
+  {:suite "interop / ByteBuffer slice" :label "capacity of a slice is the remaining count" :expected "4" :actual "(.capacity (.slice (doto (java.nio.ByteBuffer/wrap (byte-array 6)) (.position 2))))" :portability :jvm}
+  {:suite "interop / ByteBuffer slice" :label "a slice of a slice reads through both offsets" :expected "1029" :actual "(let [b (java.nio.ByteBuffer/wrap (byte-array [1 2 3 4 5 6]))] (.position b 2) (let [s (.slice b)] (.position s 1) (.getShort (.slice s) 0)))" :portability :jvm}
   ;; mapcat/dedupe stay lazier than the JVM at construction: jolt's (apply concat …)
   ;; and sequence transformer don't force the first chunk just to build the seq
   ;; (the JVM forces 5 here). Allowlisted in known-divergences.edn (jolt-mm6v).

@@ -354,10 +354,16 @@
         ((not c)
          (let ((claim (cons force-claim-token (get-thread-id))))
            (if (sa-record-cas! cell L #f claim)
+               ;; A compare-and-swap orders nothing but its own word: the acquire
+               ;; makes every store the previous holder released visible to this
+               ;; thread's re-read of the tail, and the release orders the
+               ;; published tail before the claim clears -- without them the
+               ;; cleared claim can be seen ahead of the tail, a second forcer
+               ;; claims a cell that only looks pending, and its thunk runs twice.
                (dynamic-wind
-                 (lambda () (jolt-locks-enter!))
+                 (lambda () (jolt-locks-enter!) (memory-order-acquire))
                  body
-                 (lambda () (jolt-locks-exit!) (sa-record-cas! cell L claim #f)))
+                 (lambda () (jolt-locks-exit!) (memory-order-release) (sa-record-cas! cell L claim #f)))
                (retry spins))))
         ((and (pair? c) (eq? (car c) force-claim-token))
          (if (eqv? (cdr c) (get-thread-id))

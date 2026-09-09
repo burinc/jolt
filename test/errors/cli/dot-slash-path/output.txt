@@ -1,5 +1,5 @@
 error[analyze/invalid-def]: First argument to def must be a Symbol
-  --> ././test/errors/cli/dot-slash-path/program.clj:3:1
+  --> ./test/errors/cli/dot-slash-path/program.clj:3:1
    |
  1 | (ns input)
  2 | 
