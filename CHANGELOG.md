@@ -120,6 +120,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Files.size` reports a directory's own size.** It answered a hardcoded `0`
+  for any directory, and so did the `size` attribute behind `readAttributes` and
+  `BasicFileAttributes`. All three now report `st_size`, as the JVM does. The
+  number comes from `file-length` on the open handle — `fstat(2).st_size` inside
+  Chez — so it needs none of the `struct stat` field offsets the permission
+  readers carry.
+
 - **`Files.createFile` no longer truncates an existing file.** It opened with
   create-or-truncate and returned the path, so calling it on a path that already
   held data silently emptied it — the same failure #895 reported for
