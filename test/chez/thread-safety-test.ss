@@ -581,6 +581,56 @@
 (jolt-reset! ts11-w 9)
 (ok "11. and stops firing once removed" (= 2 (length ts11-seen)))
 
+;; --- 12. forcing a lazy cell: the claim, and what a state image leaves behind --
+;; A lazy cell is claimed for forcing by a CAS on its lock field (seq.ss
+;; force-claimed!): no mutex per cell, so the collector has nothing extra to
+;; visit. Three things the protocol promises, checked with threads racing on the
+;; same unforced cells:
+;;   - a thunk runs ONCE however many threads reach the cell together;
+;;   - a cell whose lock field holds something that is not this process's claim
+;;     is still forcible -- a cell restored from an image written by a runtime
+;;     that kept a mutex per cell arrives with a fresh mutex there, and one
+;;     written mid-force arrives with the writer's token; both are stale;
+;;   - the claim is released when the thunk raises, so the next forcer runs it.
+(printf "\n== 12. forcing a lazy cell under racing threads ==\n")
+(jolt-mark-mt!)
+(define (ts12-count-cell counter)
+  (cseq-lazy 0 (lambda () (set! counter (+ counter 1)) jolt-nil)))
+(define ts12-runs 0)
+(define ts12-cell (cseq-lazy 0 (lambda () (set! ts12-runs (+ ts12-runs 1)) (cseq-realized 1 jolt-nil))))
+(ok "12. eight racing forcers finished"
+    (run-threads 8 (lambda (i) (seq-more ts12-cell)) 30.0 "12. racing seq-more"))
+(ok "12. the tail thunk ran exactly once" (= 1 ts12-runs))
+(ok "12. and every reader sees the published tail" (= 1 (seq-first (seq-more ts12-cell))))
+(ok "12. the claim is released after the run" (not (cseq-lock ts12-cell)))
+;; stale values in the lock field
+(define ts12-runs2 0)
+(define ts12-stale
+  (make-cseq 0 (lambda () (set! ts12-runs2 (+ ts12-runs2 1)) (cseq-realized 2 jolt-nil)) #f sk-cons #f 0 #f (make-mutex)))
+(ok "12. a cell restored with a mutex in its lock field still forces"
+    (run-threads 4 (lambda (i) (seq-more ts12-stale)) 30.0 "12. stale mutex"))
+(ok "12. ...once" (and (= 1 ts12-runs2) (= 2 (seq-first (seq-more ts12-stale)))))
+(define ts12-runs3 0)
+(define ts12-foreign
+  (make-cseq 0 (lambda () (set! ts12-runs3 (+ ts12-runs3 1)) (cseq-realized 3 jolt-nil)) #f sk-cons #f 0 #f (list 'forcing)))
+(ok "12. a cell restored with another process's claim token still forces"
+    (run-threads 4 (lambda (i) (seq-more ts12-foreign)) 30.0 "12. foreign token"))
+(ok "12. ...once" (and (= 1 ts12-runs3) (= 3 (seq-first (seq-more ts12-foreign)))))
+;; a raising thunk releases the claim
+(define ts12-raises 0)
+(define ts12-bad (cseq-lazy 0 (lambda () (set! ts12-raises (+ ts12-raises 1)) (error 'ts12 "boom"))))
+(define (ts12-try) (guard (e (#t 'raised)) (seq-more ts12-bad)))
+(ok "12. a raising tail thunk raises to its forcer" (eq? 'raised (ts12-try)))
+(ok "12. and leaves no claim behind" (not (cseq-lock ts12-bad)))
+(ok "12. so the next forcer runs it again" (and (eq? 'raised (ts12-try)) (= 2 ts12-raises)))
+;; the same for a lazy node
+(define ts12-lruns 0)
+(define ts12-node (jolt-make-lazy-seq (lambda () (set! ts12-lruns (+ ts12-lruns 1)) (cseq-realized 4 jolt-nil))))
+(ok "12. eight racing forcers of a lazy node finished"
+    (run-threads 8 (lambda (i) (force-lazyseq ts12-node)) 30.0 "12. racing force-lazyseq"))
+(ok "12. its body ran exactly once" (and (= 1 ts12-lruns) (= 4 (seq-first (force-lazyseq ts12-node)))))
+(ok "12. and its claim is released" (not (jolt-lazyseq-lock ts12-node)))
+
 (printf "\nthread-safety-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "thread-safety-test: PASS — shared side-tables under concurrency\n") (exit 0))

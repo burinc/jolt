@@ -92,6 +92,12 @@ condition-signal
 condition-broadcast
 make-thread-parameter
 get-thread-id
+# Fences. seq.ss publishes a forced tail behind memory-order-release so the
+# seq's own fields are visible before the word that points to it on a weakly
+# ordered machine; a target whose threads share no memory (green threads on
+# one OS thread) provides both as no-ops.
+memory-order-acquire
+memory-order-release
 #
 # tier: system
 # getenv: R7RS get-environment-variable shape — (getenv "NAME") -> string or #f.

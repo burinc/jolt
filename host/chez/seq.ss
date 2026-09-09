@@ -96,7 +96,36 @@
 ;; so adding a flavor above needs no second edit to keep them in step.
 (define sk-count        24)
 
-(define-record-type cseq (fields head (mutable tail) (mutable forced?) kind cvec ci crest (mutable lock)) (nongenerative chez-cseq-v6))
+(define-record-type cseq
+  (fields head (mutable tail) (mutable forced? cseq-forced-flag cseq-forced-flag-set!) kind cvec ci crest (mutable lock))
+  (nongenerative chez-cseq-v6))
+;; A cell's tail is ONE published word: the thunk (a procedure or a lazy-src
+;; descriptor) until it is forced, #f for a vector-backed cell whose tail follows
+;; from its own fields, and whatever the thunk answered after -- a cseq, jolt-nil,
+;; or () from a producer whose result is empty (filter's, say; jolt-seq coerces
+;; it at every use). Pending is therefore a type test on that word and realized
+;; is its complement, so a reader that finds an answer there is done without a
+;; lock on any thread: a single aligned word store cannot tear, and every read
+;; of what it points to is a dependent load. The forced? field mirrors the answer
+;; for the image (the layout is frozen) and is written after the tail; nothing
+;; decides from it. Macros, not procedures: this test is on the path of every
+;; element of every lazy chain, and a cseq -- the common answer -- is one check.
+(define-syntax seq-tail-pending?
+  (syntax-rules () ((_ t) (let ((st t)) (or (procedure? st) (lazy-src? st) (not st))))))
+(define-syntax seq-tail-realized?
+  (syntax-rules () ((_ t) (let ((st t)) (or (cseq? st) (not (seq-tail-pending? st)))))))
+(define-syntax cseq-forced?
+  (syntax-rules () ((_ s) (seq-tail-realized? (cseq-tail s)))))
+;; the lock field's position, for the compare-and-swap that claims a cell
+;; (force-claimed!, below). Checked at load: a wrong index would corrupt a
+;; neighbouring field silently.
+(define cseq-lock-index 7)
+(let ((c (make-cseq 'h 't #t 0 #f 0 #f #f)))
+  (unless (and (sa-record-cas! c cseq-lock-index #f 'probe)
+               (eq? (cseq-lock c) 'probe)
+               (not (sa-record-cas! c cseq-lock-index #f 'again))
+               (eq? (cseq-head c) 'h) (eq? (cseq-tail c) 't) (eq? (cseq-crest c) #f))
+    (error 'seq.ss "cseq-lock-index does not address the lock field")))
 ;; tail already a seq. The /k variants take the flavor; the bare ones are the
 ;; generic cell, which is the overwhelming majority of call sites.
 (define (cseq-realized head tail) (make-cseq head tail #t sk-cons #f 0 #f #f))
@@ -277,40 +306,103 @@
             jolt-nil
             (make-cseq (pvec-nth-d v i1 jolt-nil) #f #f (cseq-kind s) v i1 #f #f)))))
 (define (seq-first s) (cseq-head s))
-;; guards lazy creation of a cell's tail mutex on the multi-threaded path (mirrors
-;; force-lazyseq's lock-init). A cseq cell is shared across threads once its owning
-;; lazyseq node is realized (every future/agent walking the same seq reads the SAME
-;; cell), so without serialization two threads can both see forced?#f, both run the
-;; tail thunk, and publish tail/forced? non-atomically — a third reader can then see
-;; forced?#t with tail still the thunk-procedure, leaking a closure out as a seq.
-;; Like force-lazyseq this stays lock-free until jolt-mt? flips (fork-thread shadow).
-(define cseq-lock-init (make-mutex))
-(define (cseq-ensure-lock! s)
-  (jolt-with-mutex cseq-lock-init
-    (or (cseq-lock s)
-        (let ((m (make-mutex))) (cseq-lock-set! s m) m))))
+;; --- forcing once, without a mutex per cell -----------------------------------
+;; Reading a cell needs no lock (seq-tail-realized?, above). What still needs
+;; exclusion is running a tail thunk exactly once when two threads reach the
+;; same unforced cell together, and that is a CLAIM, not a lock: the forcing
+;; thread swaps the cell's lock field from #f to a claim, runs the thunk,
+;; publishes the tail, and swaps it back. Two compare-and-swaps and no mutex,
+;; so a program with a million lazy cells and a thread allocates nothing for
+;; them but the claim pair -- where a mutex per cell made every collection
+;; ~120x dearer the moment any thread had been forked, for the rest of the
+;; process (a Chez mutex is a finalized object the collector visits: measured,
+;; ~20x the cost of a vector its size).
+;;
+;; A thread that finds a cell claimed by ANOTHER thread waits for the tail to
+;; appear: it spins a little, since a tail thunk is usually a few dozen
+;; nanoseconds of work, and then sleeps in growing steps up to a millisecond.
+;; Not a mutex, because a mutex can only make a thread wait if the runner held
+;; it across the thunk, and that acquire/release pair is what this design
+;; exists to avoid; not a condition variable, because waiting on one from a
+;; fiber is refused (locks.ss) and forcing a seq must never park. The runner
+;; counts the run as a held lock (jolt-locks-enter!) for exactly that reason:
+;; a fiber cannot park inside a tail thunk and cannot be preempted there, so a
+;; runner and a waiter are never fibers on the same carrier, and a waiter that
+;; sleeps only ever waits on a thread that is making progress. A thunk that
+;; reaches its OWN cell -- the claim is this thread's -- runs it again, which
+;; is the reference's reentrant monitor: an infinite recursion there, not a
+;; wait on itself. A thunk that raises leaves the tail pending and the claim
+;; released; the next forcer runs it again, as before.
+;;
+;; The claim is (token . thread-id), with a token unique to THIS process: a
+;; cell that arrives from a state image carries whatever its lock field held
+;; when it was written -- a mutex, from a runtime that kept one per cell, or a
+;; claim of the process that was mid-force -- and neither is live. Anything in
+;; the field that is not this process's claim is stale and is cleared on the
+;; way to claiming.
+;;
+;; (force-claimed! cell get-lock L get-tail body): body re-reads the cell and
+;; either delivers its published tail or, holding the claim, runs the thunk and
+;; publishes. L is the lock field's index (sa-record-cas!).
+(define (force-pending? t) (or (procedure? t) (lazy-src? t)))
+(define force-claim-token (list 'forcing))
+(define (force-claimed! cell get-lock L get-tail body)
+  (let retry ((spins 0))
+    (let ((c (get-lock cell)))
+      (cond
+        ((not (force-pending? (get-tail cell))) (body))
+        ((not c)
+         (let ((claim (cons force-claim-token (get-thread-id))))
+           (if (sa-record-cas! cell L #f claim)
+               (dynamic-wind
+                 (lambda () (jolt-locks-enter!))
+                 body
+                 (lambda () (jolt-locks-exit!) (sa-record-cas! cell L claim #f)))
+               (retry spins))))
+        ((and (pair? c) (eq? (car c) force-claim-token))
+         (if (eqv? (cdr c) (get-thread-id))
+             (body)                                     ; this thread's own claim: recursion
+             (begin (force-wait! spins) (retry (fx+ spins 1)))))
+        (else (sa-record-cas! cell L c #f) (retry spins))))))
+;; spin for the first hundred looks, then sleep 1us doubling to 1ms
+(define (force-wait! spins)
+  (when (fx>? spins 100)
+    (let ((k (fx- spins 100)))
+      (sleep (make-time 'time-duration (fxmin 1000000 (fxsll 1000 (fxmin k 10))) 0)))))
+;; Publish a forced tail on the multi-threaded path: the seq's own fields must be
+;; visible before the word that points to it is, on a weakly ordered machine
+;; (ARM64). The mirror flag follows the word.
+(define (cseq-publish-tail! s r)
+  (memory-order-release)
+  (cseq-tail-set! s r)
+  (cseq-forced-flag-set! s #t))
+
 (define (seq-more s)                  ; force the tail; returns a seq (cseq | jolt-nil)
-  ;; Single-threaded: the fast forced? read is safe. Multi-threaded: it is NOT — the
-  ;; tail/forced? stores below are unordered, so a lock-free reader on ARM64 can see
-  ;; forced?#t with tail still the thunk-procedure. So once jolt-mt? flips, every
-  ;; access goes through the per-cell mutex, reads included (mirrors force-lazyseq).
-  ;; A cvec cell has no thunk: its tail follows from its own fields, so it is
-  ;; COMPUTED here rather than run. It is still memoized, which is where this
-  ;; beats the reference implementation — Clojure's ChunkedCons.next() rebuilds a
-  ;; ChunkedCons + an ArrayChunk on every traversal, so re-walking a retained seq
-  ;; costs it the same as the first walk. Dropping the closure without dropping
-  ;; the memo gets the first walk's saving AND keeps re-walks cheap: measured
-  ;; over 100k, first walk 80 -> 58 ns/elem, re-walk unchanged at ~23 (going
-  ;; memo-free the way Clojure does took re-walks to ~42).
+  (let ((t (cseq-tail s)))
+    (if (seq-tail-realized? t) t (seq-more-force s t))))
+;; The tail is a thunk, a descriptor, or #f. A cvec cell (#f) has no thunk: its
+;; tail follows from its own fields, so it is COMPUTED rather than run, and needs
+;; no exclusion -- two threads racing here build two equal cells and the later
+;; store wins, which is what the reference does on EVERY step. It is still
+;; memoized, which is where this beats the reference implementation -- Clojure's
+;; ChunkedCons.next() rebuilds a ChunkedCons + an ArrayChunk on every traversal,
+;; so re-walking a retained seq costs it the same as the first walk. Dropping the
+;; closure without dropping the memo gets the first walk's saving AND keeps
+;; re-walks cheap: measured over 100k, first walk 80 -> 58 ns/elem, re-walk
+;; unchanged at ~23 (going memo-free the way Clojure does took re-walks to ~42).
+(define (seq-more-force s t)
   (cond
     ((not jolt-mt?)
-     (if (cseq-forced? s) (cseq-tail s)
-         (let ((t (if (cseq-cvec s) (cseq-cvec-more s #t) (cseq-run-tail (cseq-tail s)))))
-           (cseq-tail-set! s t) (cseq-forced?-set! s #t) t)))
-    (else (jolt-with-mutex (cseq-ensure-lock! s)     ; multi-threaded: always lock
-            (if (cseq-forced? s) (cseq-tail s)
-                (let ((t (if (cseq-cvec s) (cseq-cvec-more s #t) (cseq-run-tail (cseq-tail s)))))
-                  (cseq-tail-set! s t) (cseq-forced?-set! s #t) t))))))
+     (let ((r (if t (cseq-run-tail t) (cseq-cvec-more s #t))))
+       (cseq-tail-set! s r) (cseq-forced-flag-set! s #t) r))
+    ((not t)
+     (let ((r (cseq-cvec-more s #t))) (cseq-publish-tail! s r) r))
+    (else
+     (force-claimed! s cseq-lock cseq-lock-index cseq-tail
+       (lambda ()
+         (let ((t (cseq-tail s)))
+           (if (seq-tail-realized? t) t
+               (let ((r (cseq-run-tail t))) (cseq-publish-tail! s r) r))))))))
 
 ;; The empty seq (Clojure's empty list ()), distinct from nil. The (unused) field
 ;; defeats Chez's interning of fieldless records, so an empty list carrying

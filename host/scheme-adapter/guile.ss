@@ -28,6 +28,10 @@
 ;;                                        current values); Guile's SRFI-39 parameters
 ;;                                        default fresh per thread — inheritance must be
 ;;                                        reproduced explicitly, like the host relies on.
+;;   memory-order-acquire   UNIMPLEMENTED  Guile: no-op when threads share no memory,
+;;                                        else a fence; seq.ss publishes a forced
+;;                                        tail behind memory-order-release.
+;;   memory-order-release   UNIMPLEMENTED  (see memory-order-acquire)
 ;;   make-mutex             UNIMPLEMENTED  Guile: SRFI-18 make-mutex.
 ;;   mutex-acquire          UNIMPLEMENTED  Guile: (rnrs) mutex-acquire (SRFI-18 mutex-lock!).
 ;;                                        must verify: contract pins NON-RECURSIVE mutexes
