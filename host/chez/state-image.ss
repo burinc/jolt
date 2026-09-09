@@ -543,9 +543,6 @@
 
 (define (image-munge s) (jolt-invoke1 (var-deref "jolt.host" "munge-name") s))
 
-(define (image-string-prefix? s pre)
-  (let ((n (string-length s)) (m (string-length pre)))
-    (and (fx>=? n m) (string=? (substring s 0 m) pre))))
 
 ;; Carry the meta side-table entry from a rebuilt object's original (the weak
 ;; table in natives-meta.ss), so image-collect-meta keys the SUBSTITUTED
@@ -865,16 +862,14 @@
 ;; modes share every container arm; only report diverges.
 (define (image-rebuild-mode? mode)
   (or (eq? mode 'rebuild) (eq? mode 'rebuild-stub) (eq? mode 'restore)))
-;; Stub mode: a refusal builds an image-stub instead of throwing. 'rebuild-stub
-;; substitutes stubs in; 'report-stub reports them with a :would-stub finding
-;; instead of :unwritable.
-(define (image-stub-mode? mode)
-  (or (eq? mode 'rebuild-stub) (eq? mode 'report-stub)))
 (define (image-report-disposition mode)
   (if (eq? mode 'report-stub)
       (jolt-keyword "would-stub")
       (jolt-keyword "unwritable")))
 
+;; Stub mode: a refusal builds an image-stub instead of throwing. 'rebuild-stub
+;; substitutes stubs in; 'report-stub reports them with a :would-stub finding
+;; instead of :unwritable.
 (define (image-graph-process root mode report!)
   (let ((memo (make-eq-hashtable))
         (stub-acc '()))
@@ -1733,13 +1728,6 @@
       (let ((g (walk root '())))
         (values g (reverse stub-acc))))))
 
-;; The write path's substitution entry: a copy of the graph where every anon
-;; closure became an image-fnsrc record and every handler-claimed resource an
-;; image-handled payload; throws (with the object's route) on the first thing
-;; the write path cannot encode.
-(define (image-substitute v)
-  (let-values (((g stubs) (image-graph-process v 'rebuild #f)))
-    g))
 
 ;; --- scan ----------------------------------------------------------------------
 ;; Dry run: every object that cannot be encoded, with the route to it. Returns a

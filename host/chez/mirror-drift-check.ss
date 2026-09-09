@@ -29,6 +29,7 @@
 ;; A file that fails to READ is a hole, not a skip: it is reported by name and
 ;; the gate exits non-zero.
 (import (chezscheme))
+(include "host/chez/gate-scan-lib.ss")
 
 (define allowlist-path "host/chez/mirror-drift-allowlist.txt")
 
@@ -37,52 +38,6 @@
 (define mirror-pairs
   '(("host/chez/rt.ss" . "host/gambit/rt-core.ss")
     ("host/chez/hasheq.ss" . "host/gambit/hasheq.ss")))
-
-;; Gambit spells its primitives ##name, which Chez's reader rejects outright.
-;; Rewriting the prefix to a plain symbol prefix at TOKEN START (after an open
-;; paren, whitespace or a quote) lets the file read as data; a #\# character
-;; literal is left alone because it is not at a token start. The rewrite only
-;; ever makes the Gambit side differ from the Chez side, so its failure mode is
-;; a spurious DIVERGED — which the allowlist absorbs — never a spurious match.
-(define (normalize-gambit-sharps text)
-  (let ((n (string-length text)) (out (open-output-string)))
-    (let loop ((i 0) (prev #\space))
-      (if (>= i n)
-          (get-output-string out)
-          (let ((c (string-ref text i)))
-            (if (and (char=? c #\#)
-                     (< (+ i 1) n)
-                     (char=? (string-ref text (+ i 1)) #\#)
-                     (memv prev '(#\space #\newline #\tab #\( #\' #\` #\,)))
-                (begin (display "gambit-ns:" out)
-                       (loop (+ i 2) #\:))
-                (begin (write-char c out) (loop (+ i 1) c))))))))
-
-(define (read-forms path)
-  (let* ((text (call-with-input-file path
-                 (lambda (p)
-                   (let ((o (open-output-string)))
-                     (let loop ()
-                       (let ((c (read-char p)))
-                         (if (eof-object? c) (get-output-string o)
-                             (begin (write-char c o) (loop)))))))))
-         (p (open-input-string (normalize-gambit-sharps text))))
-    (let loop ((acc '()))
-      (let ((d (read p)))
-        (if (eof-object? d) (reverse acc) (loop (cons d acc)))))))
-
-;; name -> datum for every (define (name . args) . body) at top level. A
-;; (define name value) binding is not compared: the two hosts legitimately bind
-;; different values (tables, parameters) under shared names.
-(define (top-procs path)
-  (let ((h (make-hashtable string-hash string=?)))
-    (for-each
-      (lambda (d)
-        (when (and (pair? d) (eq? (car d) 'define)
-                   (pair? (cdr d)) (pair? (cadr d)) (symbol? (car (cadr d))))
-          (hashtable-set! h (symbol->string (car (cadr d))) d)))
-      (read-forms path))
-    h))
 
 ;; "chez-file::name" — one allowlist key, so the same procedure name in two
 ;; different pairs is two separate decisions.
@@ -93,7 +48,7 @@
     (if (null? ps)
         (values (list-sort string<? acc) shared same)
         (let* ((a (caar ps)) (b (cdar ps))
-               (ha (top-procs a)) (hb (top-procs b)))
+               (ha (gs-top-procs a)) (hb (gs-top-procs b)))
           (let-values (((ks vs) (hashtable-entries ha)))
             (let ((n-shared 0) (n-same 0) (found '()))
               (vector-for-each
