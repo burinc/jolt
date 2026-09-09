@@ -1657,11 +1657,17 @@
       :provides (host-class-providers (concat (provides-entries edn nil) dep-provides))
       ;; :jolt/replaces — namespaces jolt provides as a host built-in
       ;; (babashka.fs, babashka.process) that THIS project supplies itself, so
-      ;; its copy resolves ahead of jolt's and no supplement loads over it.
+      ;; its copy resolves ahead of jolt's.
       ;; The PROJECT's only: a library that took a built-in over would decide
       ;; what the namespace means for every other library in the program, which
       ;; is what host-class-providers already refuses for classes.
       :replaces (mapv str (:jolt/replaces edn))
+      ;; :jolt/features — extra reader-conditional keys this project wants read,
+      ;; on top of jolt's own {:jolt :clj :default}. Additive: it cannot remove
+      ;; one. The PROJECT's only, for the same reason :jolt/replaces is — the
+      ;; feature set decides which branch EVERY library in the program is read
+      ;; through, so a dependency must not get to change it under the project.
+      :features (mapv #(if (keyword? %) (name %) (str %)) (:jolt/features edn))
       ;; the expansion trace, when it was asked for (-Stree renders it)
       :trace dep-trace
       ;; nREPL middleware a library contributes (jolt.nrepl composes them over its

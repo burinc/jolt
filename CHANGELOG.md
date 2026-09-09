@@ -118,8 +118,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without libffi produces a binary that aborts at startup, since jolt's runtime
   uses `foreign-procedure`.)
 
+- **`:jolt/features` in a project's `deps.edn` widens the reader-conditional
+  set.** `{:jolt/features [:bb]}` is how a script ported from babashka keeps
+  reading its `:bb` branches now that jolt does not match `:bb` itself. Additive
+  only — it can add a key jolt does not carry, never remove one, so `:clj` still
+  reads and a `:jolt` clause still wins over both. The project's alone, for the
+  same reason `:jolt/provides` refuses two claims on one class: the feature set
+  decides which branch every library in the program is read through, so a
+  dependency must not change it under the project. Installed before the first
+  form is read, which is earlier than either of the other two project-level
+  declarations needs to be.
+
+### Changed
+
+- **Reader conditionals no longer match `:bb`.** The feature set is
+  `{:jolt :clj :default}` again; 0.7.10 added `:bb` on the theory that a `:bb`
+  branch solves the same non-JVM problems jolt has. It does not. A `:bb` branch
+  is written for babashka's host model, and where that model differs from jolt's
+  the branch is simply wrong here — the branch a library writes for a host that
+  has no `java.nio` and no reflection is not the branch for a host that has
+  both. Measured on the library checkouts this repo gates: claxon and aws-api
+  write `#?(:bb [cheshire.core] :clj [clojure.data.json])`, so matching `:bb`
+  sent jolt at Jackson and turned a working library into a load failure;
+  lasertag's `:bb` branches assert `sci.impl.fns` class names and babashka's
+  class-as-symbol hierarchies (2 failures, now gone); tick's assert babashka's
+  English-only locale rendering where jolt renders the French through
+  jolt-lang/time (1 failure, now gone); markdown-clj's skip two assertions jolt
+  passes; and the clojure-test-suite's hid 89 assertions along with two ##NaN
+  divergences, now recorded. `jolt.bb.fs` and the loader's namespace-supplement
+  seam existed only to fill the `babashka.fs/list-dir` that a `:bb` branch
+  skips — babashka.fs defines it off its own `:clj` branch now — and `vendor/`
+  `process` goes back to upstream babashka/process, whose only jolt patch was a
+  `:jolt` arm working around the empty `:bb` splice. A project that wants `:bb`
+  read asks for it with `:jolt/features` (above). malli's suite doubles as a
+  result — 6757 passing assertions to 13261, failures 36 to 28 and errors 34 to
+  10 — because half of it was `:bb`-gated and `malli.sci`'s `:bb` branch had
+  been standing in for sci. Reported by @markokocic in #893.
+
 ### Fixed
 
+- **`seqable?` answers for a `deftype` or `reify` that declares `Seqable` or
+  `Iterable`.** On the JVM `seqable?` is an `instance?` test over `Seqable` /
+  `ISeq` / `Iterable` (plus arrays, `CharSequence` and `Map`); jolt built it out
+  of `coll?`, which a bare deftype is not, so it said false for values `seq`
+  works on perfectly well — including `clojure.core.Eduction`, the one in core.
+  malli's `:every` schema tests seqability before it walks, so
+  `(m/validate [:every :int] (eduction (map identity) [1 2 3]))` was false and
+  `(m/parser [:every :any])` answered `::invalid` on an eduction. The predicate
+  now reads the same per-method probes the `seq` arms read, so the two answers
+  cannot drift apart again; the collection-BEHAVIOUR interfaces stay out of it,
+  because `ILookup` and `Counted` are not `Seqable` on the JVM either.
 - **`Files.size` reports a directory's own size.** It answered a hardcoded `0`
   for any directory, and so did the `size` attribute behind `readAttributes` and
   `BasicFileAttributes`. All three now report `st_size`, as the JVM does. The

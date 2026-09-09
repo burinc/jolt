@@ -10,10 +10,26 @@
 ;; from reader.ss so that __reader-features and __reader-features-set! directly
 ;; affect #? reads.
 (define (nr-reader-features-get) (list->cseq rdr-features))
+(define (nr-feature-name n)
+  (cond ((keyword-t? n) (keyword-t-name n)) ((string? n) n) (else (jolt-pr-str n))))
 (define (nr-reader-features-set! names)
-  (set! rdr-features
-        (map (lambda (n) (cond ((keyword-t? n) (keyword-t-name n)) ((string? n) n) (else (jolt-pr-str n))))
-             (seq->list (jolt-seq names))))
+  (set! rdr-features (map nr-feature-name (seq->list (jolt-seq names))))
+  jolt-nil)
+;; ...and the additive half, which is what a project's deps.edn reaches:
+;;
+;;   :jolt/features [:bb]
+;;
+;; Widening only — a project can teach jolt to read a key its host set does not
+;; carry, but cannot take :jolt/:clj/:default away, so it can never make jolt
+;; stop reading the branches its own stdlib is written against. The use this
+;; exists for is a script ported from babashka whose :bb branches are the ones
+;; the author wants; jolt does not match :bb on its own (see reader.ss).
+(define (nr-reader-features-add! names)
+  (for-each (lambda (n)
+              (let ((f (nr-feature-name n)))
+                (unless (member f rdr-features)
+                  (set! rdr-features (append rdr-features (list f))))))
+            (seq->list (jolt-seq names)))
   jolt-nil)
 
 ;; --- reader-conditional record type -----------------------------------------
@@ -112,6 +128,11 @@
 
 (def-var! "clojure.core" "__reader-features" nr-reader-features-get)
 (def-var! "clojure.core" "__reader-features-set!" nr-reader-features-set!)
+;; The Clojure-facing seam for :jolt/features (see nr-reader-features-add!).
+;; jolt.deps collects the key and jolt.main calls this once after it resolves the
+;; project and before any of the project compiles — the same ordering
+;; :jolt/provides needs, because the first form READ is what consults it.
+(def-var! "jolt.host" "add-reader-features!" nr-reader-features-add!)
 (def-var! "clojure.core" "reader-conditional" nr-reader-conditional)
 (def-var! "clojure.core" "macroexpand-1" nr-macroexpand-1)
 (def-var! "clojure.core" "__macroexpand-env" nr-macroexpand-env)

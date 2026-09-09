@@ -677,8 +677,8 @@
 ;; java.lang.reflect.Array — allocation and element access over an array whose
 ;; component type is named rather than written literally. This is not the
 ;; reflection API in any deep sense: newInstance with a concrete component type
-;; is what make-array already does, and malli's own :bb and :cljs branches spell
-;; the same call (object-array capacity). Like make-array, the component type
+;; is what make-array already does, and malli's own :cljs branch spells the same
+;; call (object-array capacity). Like make-array, the component type
 ;; selects nothing here — jolt's arrays are object-kinded unless built by a typed
 ;; constructor — so a primitive component gives an object array of that length.
 (define (na-need-array x)

@@ -65,8 +65,11 @@
   (check-eq "deref exit" (:exit res) 0))
 
 ;; timed deref honours the timeout BOTH ways (jolt-go9n): a live process answers
-;; the timeout value, a finished one its map — and neither throws a cast error
-;; (jolt takes the vendored :jolt splice arm, not bb's empty one).
+;; the timeout value, a finished one its map — and neither throws a cast error.
+;; This is what the jolt-lang/process fork existed for: upstream guards its
+;; IBlockingDeref arm behind #?@(:bb [] :clj […]), so while jolt matched :bb it
+;; took the empty splice. It reads the :clj arm now (#893), and vendor/process is
+;; upstream babashka/process again — which is exactly what this row pins.
 (let [slow (process ["sleep" "30"])]
   (check-eq "timed deref times out" (deref slow 150 :timed-out) :timed-out)
   (p/destroy slow))

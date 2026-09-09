@@ -898,16 +898,27 @@
                                (if rest-sym (list (jolt-symbol #f "&") rest-sym) '()))))
           (values (jolt-list (jolt-symbol #f "fn*") (apply jolt-vector params) body) j))))))
 
-;; reader conditionals: jolt's feature set is {:jolt :bb :clj :default};
-;; the FIRST clause whose feature key is in the set wins (clause order, like
-;; Clojure). jolt is a Clojure/JVM-compatible host — it emulates clojure.lang.*
-;; and java.* interop — so it reads the :clj branch of a .cljc library (the JVM
-;; code path its host shims target), not the :cljs one. :bb is also in the set,
-;; like babashka itself: a library's :bb branch solves the same non-JVM problems
-;; jolt has (no reflection, no JVM-only classes), and libraries list it ahead of
-;; :clj precisely so a bb-like host takes it. A library can still override with
-;; a :jolt-specific branch (place it before :bb/:clj).
-(define rdr-features '("jolt" "bb" "clj" "default"))
+;; reader conditionals: jolt's feature set is {:jolt :clj :default}; the FIRST
+;; clause whose feature key is in the set wins (clause order, like Clojure).
+;; jolt is a Clojure/JVM-compatible host — it emulates clojure.lang.* and java.*
+;; interop — so it reads the :clj branch of a .cljc library (the JVM code path
+;; its host shims target), not the :cljs one. A library overrides that with a
+;; :jolt branch placed before :clj.
+;;
+;; :bb is deliberately NOT in the set (issue #893). 0.7.10 through 0.8.5 had it,
+;; on the theory that a :bb branch solves the same non-JVM problems jolt has.
+;; It does not: a :bb branch is written for babashka's host model, and where
+;; that model differs from jolt's the branch is simply wrong here. Measured on
+;; the checkouts this repo gates: claxon and aws-api write
+;; #?(:bb [cheshire.core] :clj [clojure.data.json]) and jolt has no cheshire, so
+;; matching :bb turned a working library into a load failure; lasertag's :bb
+;; branches assert sci.impl.fns classnames and babashka's class-as-symbol
+;; hierarchies; tick's assert babashka's English-only locale rendering; malli
+;; and markdown-clj gate assertions away that jolt passes; the cts suite's :bb
+;; branches hid 89 assertions and two ##NaN divergences. Everything a :bb branch
+;; avoids on babashka — LazilyPersistentVector, PersistentArrayMap/createWithCheck,
+;; Util/hashCombine, java.nio's DirectoryStream, reflection — jolt shims.
+(define rdr-features '("jolt" "clj" "default"))
 (define (rdr-feature? kw)
   (and (keyword? kw) (jolt-nil? (let ((n (keyword-t-ns kw))) (if n n jolt-nil)))
        (and (member (keyword-t-name kw) rdr-features) #t)))
