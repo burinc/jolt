@@ -692,19 +692,23 @@ eturn)) (loop (- n 1)))
 (define (make-thread-parameter v) (make-parameter v))
 
 ;; virtual-register / set-virtual-register!: Chez's fixed per-thread slot
-;; array (rt-core claims slots 2/3/4). Gambit has no equivalent; one parameter
-;; per claimed slot, created lazily, reproduces the per-thread semantics and
-;; the "fresh thread starts every slot at fixnum 0" contract. converters.ss's
-;; jolt-print-one stashes a print-readably override in slot jolt-vreg-print-
-;; readably through these.
-(define %vreg-table (make-table test: eqv?))  ;; slot fixnum -> parameter
-(define (virtual-register n)
-  (let ((p (table-ref %vreg-table n #f)))
-    (if p (p) 0)))
-(define (set-virtual-register! n v)
-  (let ((p (or (table-ref %vreg-table n #f)
-               (let ((q (make-parameter 0))) (table-set! %vreg-table n q) q))))
-    (p v)))
+;; array (rt-core claims slots 2/3/4; seq.ss's claim path counts into 7).
+;; Gambit has no equivalent, so each thread carries its own vector of slots in
+;; its thread-specific field, made on first touch. That gives Chez's two
+;; properties: a slot is this thread's alone, and a FRESH THREAD STARTS EVERY
+;; SLOT AT FIXNUM 0 -- nothing is inherited. A parameter per slot, which this
+;; used to be, has neither: a parameter fork-inherits into a SRFI-18 thread
+;; (the G0 pin, and the reason make-thread-parameter above is an alias), so a
+;; child started with its parent's value, which is the one thing a per-thread
+;; interrupt box or cache must never do. gambitcheck.ss pins the contract.
+(define (%vreg-slots)
+  (let* ((t (current-thread)) (v (thread-specific t)))
+    (if (vector? v)
+        v
+        (let ((v (make-vector 16 0))) (thread-specific-set! t v) v))))
+(define (virtual-register n) (vector-ref (%vreg-slots) n))
+(define (set-virtual-register! n v) (vector-set! (%vreg-slots) n v))
+(define (virtual-register-count) 16)
 
 ;; locks.ss's lock count, which seq.ss's force-claimed! keeps while a tail
 ;; thunk runs. On Chez the scheduler reads it to refuse preempting a fiber that

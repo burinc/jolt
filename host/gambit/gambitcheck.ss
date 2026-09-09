@@ -296,6 +296,21 @@
     (let ((t (fork-thread (lambda () (result (p))))))
       (thread-join! t)
       (check "parameter fork-inheritance: child sees parent's current value" (result) 2)))
+  ;; virtual registers are PER THREAD and a fresh thread starts every slot at
+  ;; fixnum 0 -- Chez's contract, which the runtime leans on for anything a
+  ;; child must not inherit (an interrupt box, a per-thread cache). Probed on
+  ;; Chez 10.x: the child of a thread that wrote slot 12 reads 0 there.
+  (let ((seen (vector 'unset 'unset)))
+    (set-virtual-register! 12 'parent)
+    (let ((t (fork-thread (lambda ()
+                            (vector-set! seen 0 (virtual-register 12))
+                            (set-virtual-register! 12 'child)
+                            (vector-set! seen 1 (virtual-register 12))))))
+      (thread-join! t)
+      (check "virtual-register: a fresh thread starts a written slot at 0" (vector-ref seen 0) 0)
+      (check "virtual-register: the child's write is its own" (vector-ref seen 1) 'child)
+      (check "virtual-register: the parent's slot is untouched" (virtual-register 12) 'parent)
+      (set-virtual-register! 12 0)))
   ;; get-thread-id: distinct numbers for live threads
   (let ((ids (make-table test: eq?)))
     (let ((id1 (get-thread-id))
