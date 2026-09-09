@@ -1396,10 +1396,38 @@
 (define (make-jthread thunk name)
   (make-jhost "user-thread"
               (vector thunk #f (make-mutex) (make-condition) (box #f) #f
-                      (box (or name (next-jthread-name))) #f)))
+                      (box (or name (next-jthread-name))) #f #f)))
 ;; slot 7: the id of the thread the start forked, #f until then. A rename needs
 ;; it to reach the id-keyed name table the handles read.
 (define (jthread-id st) (vector-ref st 7))
+;; slot 8: daemon. The JVM keeps the process alive until every non-daemon thread
+;; has finished, and exits regardless of the daemon ones; a thread is what its
+;; flag said when it STARTED, and setDaemon on a live thread is an
+;; IllegalThreadStateException. jolt used to exit the moment -main returned,
+;; live threads or not, and accept setDaemon silently, so a program whose work
+;; ran on a Thread it started lost that work at exit. Each non-daemon start
+;; counts itself in and its completion counts itself out; the CLI's normal-
+;; return path and a built binary's launcher wait for zero before the shutdown
+;; hooks run (jolt-await-user-threads!). System/exit does not wait -- neither
+;; does the JVM's.
+(define (jthread-daemon? st) (vector-ref st 8))
+(define user-threads-mu (make-mutex))
+(define user-threads-cv (make-condition))
+(define user-threads-live 0)
+(define (user-thread-started!)
+  (jolt-with-mutex user-threads-mu (set! user-threads-live (+ user-threads-live 1))))
+(define (user-thread-finished!)
+  (jolt-with-mutex user-threads-mu
+    (set! user-threads-live (- user-threads-live 1))
+    (when (<= user-threads-live 0) (jolt-cv-wake! user-threads-cv))))
+;; Blocks the calling THREAD until every started non-daemon Thread has finished.
+;; Called at process end on the main thread, never from a fiber.
+(define (jolt-await-user-threads!)
+  (jolt-with-mutex user-threads-mu
+    (let loop ()
+      (when (> user-threads-live 0)
+        (jolt-condition-wait user-threads-cv user-threads-mu)
+        (loop)))))
 ;; alive = started and not yet completed. join waits on exactly this, so a thread
 ;; that was never started is not waited for at all (JVM: isAlive is false before
 ;; .start, so join returns at once).
@@ -1419,7 +1447,11 @@
 (register-host-methods! "user-thread"
   (list (cons "start" (lambda (self)
           (let ((st (jhost-state self)) (snap (dyn-binding-stack)))
+            (when (vector-ref st 5)
+              (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException"
+                                               "Thread already started")))
             (vector-set! st 5 #t)  ; mark started before forking
+            (unless (jthread-daemon? st) (user-thread-started!))
             (fork-thread (lambda ()
                (*txn* #f)                          ; child thread must not inherit parent's txn
                ;; Adopt the Thread object's own interrupt flag, so .interrupt from
@@ -1447,7 +1479,8 @@
                 (let ((th (vector-ref st 0))) (when th (jolt-invoke (runnable->thunk th)))))
               (jolt-with-mutex (vector-ref st 2)
                  (vector-set! st 1 #t)
-                 (jolt-cv-wake! (vector-ref st 3)))))
+                 (jolt-cv-wake! (vector-ref st 3)))
+              (unless (jthread-daemon? st) (user-thread-finished!))))
             jolt-nil)))
         (cons "run" (lambda (self) (let ((th (vector-ref (jhost-state self) 0))) (when th (jolt-invoke th))) jolt-nil))
         ;; join() and join(0) wait indefinitely; join(ms) waits at most ms and
@@ -1492,7 +1525,16 @@
             (set-box! (vector-ref st 6) s)
             (when (jthread-id st) (jolt-thread-name-set! (jthread-id st) s)))
           jolt-nil))
-        (cons "setDaemon" (lambda (self . _) jolt-nil))))
+        ;; refused while the thread is ALIVE, as Thread.setDaemon checks isAlive():
+        ;; before start and after it has finished the flag can still be set.
+        (cons "setDaemon" (lambda (self flag)
+          (let ((st (jhost-state self)))
+            (when (jthread-alive? st)
+              (jolt-throw (jolt-host-throwable "java.lang.IllegalThreadStateException"
+                                               "Thread is alive")))
+            (vector-set! st 8 (and (jolt-truthy? flag) #t)))
+          jolt-nil))
+        (cons "isDaemon" (lambda (self) (and (jthread-daemon? (jhost-state self)) #t)))))
 
 (define (make-jlatch n) (make-jhost "count-down-latch" (vector n (make-mutex) (make-condition))))
 (for-each (lambda (nm) (register-class-ctor! nm (lambda (n . _) (make-jlatch (jnum->exact n)))))
