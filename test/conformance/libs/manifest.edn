@@ -471,13 +471,18 @@
    ;; values here than on the JVM is the same family as test.check's :tolerance,
    ;; not a malli bug.
    ;;
-   ;; This is the heaviest row in the gate by a wide margin — ~15GB RSS and ~30
-   ;; CPU-minutes — and the reason is jolt-5j99, not the assertion count. ONE test
-   ;; (function-schema-test) costs 42.6s / 164MB run by itself and 404s / 24GB when
-   ;; malli.core-test's validation-test has run before it in the same process:
-   ;; protocol dispatch and record construction degrade ~5x once a workload has
-   ;; created many types. That is what :timeout 2400 and JOLT_MAX_HEAP=off are
-   ;; really paying for, and fixing jolt-5j99 should let both come back down.
+   ;; The heaviest row in the gate, and the cost is jolt's, not the assertion
+   ;; count. malli.core-test's validation-test deliberately abandons a
+   ;; non-terminating (apply max (range)) after a 100ms timeout; interrupt does
+   ;; not stop a compute loop on the JVM either, so the thread runs on in both.
+   ;; Two jolt problems came out of that:
+   ;;   - apply materialized an unbounded rest instead of streaming it, so the
+   ;;     abandoned thread grew the heap without bound. FIXED — peak RSS for this
+   ;;     row went 27.9GB -> 1.74GB, which is what JOLT_MAX_HEAP=off was covering.
+   ;;   - one extra live thread makes every collection ~166x more expensive
+   ;;     (jolt-ugdf), so the abandoned thread still costs ~8x wall time here.
+   ;;     That is what :timeout 2400 is paying for now, and it should come down
+   ;;     when jolt-ugdf does.
    :expect {:tests 219 :pass 13261 :fail 28 :error 10 :load-fail 1}}
 
   ;; ---------------------------------------------------------- web

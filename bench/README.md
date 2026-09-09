@@ -825,9 +825,23 @@ as one wrapping `let*`.
 | `malli.core-test` (3699 lines, one 1837-line `deftest`) | 16.9s / 1.5GB | 1.3s |
 
 Those are LOAD times. malli's *run* phase is a different problem and not a
-compile one: one test costs 42.6s / 164MB by itself and 404s / 24GB after
-`validation-test` has run in the same process, because protocol dispatch and
-record construction degrade ~5x once many types exist (jolt-5j99).
+compile one. `validation-test` abandons a non-terminating `(apply max (range))`
+after a 100ms timeout, and that exposed two things:
+
+| | before | after |
+|---|---|---|
+| peak RSS, `malli.core-test` | 27.9 GB | **1.74 GB** |
+| `(apply max (range))`, 12s | 2553 MB climbing | flat (JVM: 58-318 MB sawtooth) |
+
+`apply` handed a registered variadic a lazy rest but fell back to `seq->list`
+for the natives behind `+ - * / min max` and the comparison chains, so an
+unbounded argument seq was realized until the process died. Fixed, and gated by
+`make applyscaling`.
+
+The *time* is still ~8x, and that is a separate and more general problem
+(jolt-ugdf): one extra live thread — even one that only sleeps — takes a
+collection from 0.032 ms to 5.327 ms, so any background allocation collapses
+throughput. The JVM shows no such effect.
 
 Measured 2026-09-08, aarch64 macOS, cold (`JOLT_AOT_CACHE=0`). `malli.core-test`
 was **154s / 5.3GB** before the constant pool was keyed by form identity the way
