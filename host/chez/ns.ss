@@ -694,10 +694,14 @@
   (lambda (p) (def-var! "clojure.core" (car p) (cdr p)))
   (list
     (cons "+" jolt-add) (cons "-" jolt-sub) (cons "*" jolt-mul) (cons "/" jolt-div)
-    (cons "<" <) (cons ">" >) (cons "<=" <=) (cons ">=" >=)
+    ;; the same procedures a value-position reference compiles to (op_registry
+    ;; :value), so (identical? > (var-get #'>)) holds as on the JVM and a root
+    ;; taken through the var streams apply's rest like the compiled reference
+    ;; does -- a raw Scheme > here was neither
+    (cons "<" jolt-lt) (cons ">" jolt-gt) (cons "<=" jolt-le) (cons ">=" jolt-ge)
     (cons "=" jolt=) (cons "inc" jolt-inc) (cons "dec" jolt-dec) (cons "not" jolt-not-fn)
-    (cons "min" min) (cons "max" max)
-    (cons "mod" modulo) (cons "rem" remainder) (cons "quot" quotient)
+    (cons "min" jolt-min) (cons "max" jolt-max)
+    (cons "mod" jolt-mod) (cons "rem" jolt-rem) (cons "quot" jolt-quot)
     (cons "vector" jolt-vector) (cons "hash-map" jolt-hash-map) (cons "hash-set" jolt-hash-set)
     (cons "conj" jolt-conj) (cons "imap-cons" jolt-conj)
     (cons "get" jolt-get) (cons "nth" jolt-nth) (cons "count" jolt-count)

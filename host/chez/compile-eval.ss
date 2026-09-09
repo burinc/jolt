@@ -160,9 +160,9 @@
              (col  (jolt-get p hc-kw-column jolt-nil))
              (file (jolt-get p hc-kw-file jolt-nil)))
          (if (jolt-nil? line)
-             (and (string? file) file)
+             (and (string? file) (jolt-display-path file))
              (string-append
-               (if (jolt-nil? file) "" (string-append file ":"))
+               (if (jolt-nil? file) "" (string-append (jolt-display-path file) ":"))
                (number->string line) ":"
                (if (jolt-nil? col) "?" (number->string col)))))))
 (define (jolt-current-source-string)

@@ -275,6 +275,21 @@
   [ns-name app-args]
   (let [app-args (drop-end-of-options app-args)]
     (push-thread-bindings {#'clojure.core/*command-line-args* (seq app-args)})
+    ;; The entry namespace not being on the roots usually means there is no
+    ;; project here at all -- jolt was started in a subdirectory, or somewhere
+    ;; else entirely -- and "could not locate app/core" hides that. Asked
+    ;; BEFORE the require, not caught around it: a catch re-raises a load error
+    ;; that propagates through the require from here, and the report then names
+    ;; run-ns instead of the form that failed.
+    (let [dir (project-dir)]
+      (when (and (not (.exists (java.io.File. (str dir "/deps.edn"))))
+                 (not (.exists (java.io.File. (str dir "/bb.edn"))))
+                 (nil? (jolt.host/ns-source ns-name)))
+        (let [here (.getCanonicalPath (java.io.File. dir))]
+          (throw (ex-info (str "No project found in " here " (no deps.edn or bb.edn), so "
+                               ns-name " was looked for on the built-in source roots only. "
+                               "Run from the project directory, or pass -Sdeps.")
+                          {:ns ns-name :dir here})))))
     (require (symbol ns-name))
     (if-let [mainv (ns-resolve (symbol ns-name) (symbol "-main"))]
       (apply (deref mainv) app-args)
@@ -301,6 +316,9 @@
   (cond
     (= "-" x) "/dev/stdin"
     (str/starts-with? x "/") x
+    ;; a ./-prefixed argument is already project-relative: joining it as is
+    ;; reported the file as ././x.clj
+    (str/starts-with? x "./") (str (project-dir) "/" (subs x 2))
     :else (str (project-dir) "/" x)))
 
 ;; main-opts is a vector like ["-m" "app.core"] or ["-e" "(prn :hi)"] (optionally
@@ -769,8 +787,13 @@
       ;; the driver creates sits next to it, so it lands under the same target dir.
       ;; An explicit -o is honored: absolute as-is, relative against the project.
       (let [pdir (project-dir)
-            proj (let [seg (last (str/split pdir #"/"))]
-                   (if (or (str/blank? seg) (= "." seg)) (first (str/split entry #"\.")) seg))
+            ;; the project dir's own name; "." (JOLT_PWD unset, the built binary
+            ;; started in the project) resolves to the directory it stands for
+            proj (let [seg (last (str/split pdir #"/"))
+                       seg (if (or (str/blank? seg) (= "." seg))
+                             (.getName (.getCanonicalFile (java.io.File. pdir)))
+                             seg)]
+                   (if (str/blank? seg) (first (str/split entry #"\.")) seg))
             out (let [o (:out opts)]
                   (cond
                     (nil? o) (str pdir "/target/" (if (= mode "dev") "debug" "release") "/" proj)

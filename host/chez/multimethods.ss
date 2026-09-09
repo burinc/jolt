@@ -119,10 +119,17 @@
            ;; deferred inside a fn (a deftest body) still defines in the ns it
            ;; was written in, not whatever ns is current when it finally runs.
            (ns (if (string? sns) sns (chez-current-ns)))
-           (mf (make-jolt-multifn (symbol-t-name name-sym) dispatch
-                                  (new-mm-table) dk h (new-mm-table) (new-mm-table) -1 #f)))
-      (def-var! ns (symbol-t-name name-sym) mf)
-      mf)))
+           (cell (var-cell-lookup ns (symbol-t-name name-sym)))
+           (have (and cell (var-cell-defined? cell) (var-cell-root cell))))
+      ;; defmulti expands through defonce on the JVM: re-evaluating it -- a file
+      ;; reloaded in a REPL, a namespace required twice -- keeps the multifn and
+      ;; every method registered on it, instead of starting an empty one
+      (if (jolt-multifn? have)
+          have
+          (let ((mf (make-jolt-multifn (symbol-t-name name-sym) dispatch
+                                       (new-mm-table) dk h (new-mm-table) (new-mm-table) -1 #f)))
+            (def-var! ns (symbol-t-name name-sym) mf)
+            mf)))))
 
 ;; (defmethod-setup 'mm dispatch-val impl) — add a method. Auto-creates the multifn
 ;; if absent (defmethod before defmulti — rare; identity dispatch as a fallback).

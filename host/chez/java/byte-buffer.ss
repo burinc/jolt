@@ -18,11 +18,18 @@
 ;; them because there is a real address to offset. The buffer does not keep the
 ;; memory alive: using one after the pointer is released reads freed memory.
 
-(define (make-byte-buffer backing pos limit) (make-jhost "byte-buffer" (vector backing pos limit)))
+;; slot 3 is the ARRAY OFFSET of a heap buffer: index 0 of the buffer is that
+;; element of the backing array. A slice is a fresh buffer over the SAME array
+;; with its offset advanced -- which is what makes a write through either side
+;; visible to the other, as java.nio's heap slice shares the array. A direct
+;; buffer offsets its address instead and keeps 0 here.
+(define (make-byte-buffer backing pos limit) (make-jhost "byte-buffer" (vector backing pos limit 0)))
+(define (make-byte-buffer/off backing pos limit off) (make-jhost "byte-buffer" (vector backing pos limit off)))
 (define (bb? x) (and (jhost? x) (string=? (jhost-tag x) "byte-buffer")))
 (define (bb-backing b) (vector-ref (jhost-state b) 0))
 (define (bb-pos b) (vector-ref (jhost-state b) 1))
 (define (bb-limit b) (vector-ref (jhost-state b) 2))
+(define (bb-off b) (vector-ref (jhost-state b) 3))
 (define (bb-pos! b n) (vector-set! (jhost-state b) 1 n))
 (define (bb-limit! b n) (vector-set! (jhost-state b) 2 n))
 
@@ -38,7 +45,7 @@
 
 (define (bb-capacity b)
   (let ((bk (bb-backing b)))
-    (if (bb-direct-backing? bk) (vector-ref bk 2) (ja-len bk))))
+    (if (bb-direct-backing? bk) (vector-ref bk 2) (- (ja-len bk) (bb-off b)))))
 
 ;; --- one byte, whichever backing --------------------------------------------
 ;; SIGNED, as a JVM byte[] element is: the heap backing already stores it that
@@ -48,13 +55,13 @@
   (let ((bk (bb-backing b)))
     (if (bb-direct-backing? bk)
         (na-u8->byte (sa-foreign-ref 'unsigned-8 (vector-ref bk 1) i))
-        (ja-ref bk i))))
+        (ja-ref bk (+ (bb-off b) i)))))
 
 (define (bb-byte-set! b i v)
   (let ((bk (bb-backing b)))
     (if (bb-direct-backing? bk)
         (sa-foreign-set! 'unsigned-8 (vector-ref bk 1) i (bitwise-and v #xff))
-        (ja-set! bk i v))))
+        (ja-set! bk (+ (bb-off b) i) v))))
 
 ;; --- bulk moves --------------------------------------------------------------
 ;; A byte at a time across the foreign boundary costs ~30ns; through a bytevector
@@ -69,7 +76,7 @@
         (let ((bv (make-bytevector n)))
           (sa-foreign-bytes-ref! (+ (vector-ref bk 1) idx) bv n)
           (ja-bv->bytes! bv 0 dst doff n))
-        (ja-copy-range! bk idx dst doff n))))
+        (ja-copy-range! bk (+ (bb-off b) idx) dst doff n))))
 
 (define (bb-bulk-set! b idx src soff n)          ; jolt byte-array -> buffer
   (let ((bk (bb-backing b)))
@@ -77,7 +84,7 @@
         (let ((bv (make-bytevector n)))
           (ja-bytes->bv! src soff bv 0 n)
           (sa-foreign-bytes-set! (+ (vector-ref bk 1) idx) bv n))
-        (ja-copy-range! src soff bk idx n))))
+        (ja-copy-range! src soff bk (+ (bb-off b) idx) n))))
 
 ;; Buffer to buffer. Two heap buffers move backing to backing; anything touching
 ;; foreign memory goes through the block move above.
@@ -86,7 +93,7 @@
       (let ((tmp (na-byte-array n)))
         (bb-bulk-ref! src sidx tmp 0 n)
         (bb-bulk-set! dst didx tmp 0 n))
-      (ja-copy-range! (bb-backing src) sidx (bb-backing dst) didx n)))
+      (ja-copy-range! (bb-backing src) (+ (bb-off src) sidx) (bb-backing dst) (+ (bb-off dst) didx) n)))
 
 ;; (ByteBuffer/wrap ba) | (ByteBuffer/wrap ba off len) | (ByteBuffer/allocate n)
 (register-class-statics! "ByteBuffer"
@@ -122,19 +129,21 @@
                         (throw-jvm 'UnsupportedOperationException
                                    "java.nio.ByteBuffer/array: a direct buffer has no backing array")
                         (bb-backing self))))
-    (cons "duplicate" (lambda (self) (make-byte-buffer (bb-backing self) (bb-pos self) (bb-limit self))))
-    (cons "asReadOnlyBuffer" (lambda (self) (make-byte-buffer (bb-backing self) (bb-pos self) (bb-limit self))))
-    ;; slice(): a 0-based buffer over the remaining bytes [position, limit). A
-    ;; DIRECT slice shares the bytes, as the JVM's does — there is a real address
-    ;; to offset. A heap slice is a copy, so writes don't propagate back (read
-    ;; paths — hexdumps, decoders — are unaffected).
+    (cons "arrayOffset" (lambda (self)
+                          (if (bb-direct? self)
+                              (throw-jvm 'UnsupportedOperationException
+                                         "java.nio.ByteBuffer/arrayOffset: a direct buffer has no backing array")
+                              (->num (bb-off self)))))
+    (cons "duplicate" (lambda (self) (make-byte-buffer/off (bb-backing self) (bb-pos self) (bb-limit self) (bb-off self))))
+    (cons "asReadOnlyBuffer" (lambda (self) (make-byte-buffer/off (bb-backing self) (bb-pos self) (bb-limit self) (bb-off self))))
+    ;; slice(): a 0-based buffer over the remaining bytes [position, limit) that
+    ;; SHARES them with this buffer, as the JVM's does: a direct slice offsets
+    ;; the address, a heap slice offsets into the same backing array.
     (cons "slice" (lambda (self)
                     (let* ((p (bb-pos self)) (n (- (bb-limit self) p)))
                       (if (bb-direct? self)
                           (make-direct-byte-buffer (+ (bb-addr self) p) n)
-                          (let ((nb (na-byte-array n)))
-                            (ja-copy-range! (bb-backing self) p nb 0 n)
-                            (make-byte-buffer nb 0 n))))))
+                          (make-byte-buffer/off (bb-backing self) 0 n (+ (bb-off self) p))))))
     (cons "rewind" (lambda (self) (bb-pos! self 0) self))
     (cons "flip" (lambda (self) (bb-limit! self (bb-pos self)) (bb-pos! self 0) self))
     (cons "clear" (lambda (self) (bb-pos! self 0) (bb-limit! self (bb-capacity self)) self))
@@ -142,6 +151,9 @@
     ;; advancing position. Returns the buffer like the JVM.
     ;; (.put src): copy bytes into the buffer at position, advancing it. src is
     ;; another ByteBuffer (its remaining bytes), a byte-array, or a single byte.
+    ;; put(byte): relative, advancing. put(int index, byte): absolute, position
+    ;; unchanged. put(ByteBuffer): the source's remaining bytes. put(byte[] src
+    ;; [off len]): bulk from the array, advancing.
     (cons "put" (lambda (self src . rest)
                   (let ((dp (bb-pos self)))
                     (cond
@@ -150,9 +162,12 @@
                          (bb-copy-between! src sp self dp n)
                          (bb-pos! src (bb-limit src)) (bb-pos! self (+ dp n))))
                       ((jolt-array? src)
-                       (let ((n (ja-len src)))
-                         (bb-bulk-set! self dp src 0 n)
+                       (let* ((off (if (pair? rest) (jnum->exact (car rest)) 0))
+                              (n (if (and (pair? rest) (pair? (cdr rest))) (jnum->exact (cadr rest)) (ja-len src))))
+                         (bb-bulk-set! self dp src off n)
                          (bb-pos! self (+ dp n))))
+                      ((pair? rest)
+                       (bb-byte-set! self (jnum->exact src) (na-byte-of (car rest))))
                       ;; a lone byte: narrowed like any byte-array store, so the
                       ;; backing stays in -128..127 whichever form the caller used.
                       (else (bb-byte-set! self dp (na-byte-of src)) (bb-pos! self (+ dp 1))))
