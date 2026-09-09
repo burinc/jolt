@@ -432,6 +432,11 @@
   {:suite "interop / MapEntry" :label "MapEntry/create makes an entry" :expected "[:a 1]" :actual "(clojure.lang.MapEntry/create :a 1)" :portability :jvm}
   {:suite "interop / Thread" :label "Thread with no target" :expected "[false nil nil]" :actual "(let [t (Thread.)] [(.isAlive t) (.run t) (do (.start t) (.join t) nil)])" :portability :jvm}
   {:suite "interop / Thread" :label "class of a Thread instance" :expected "java.lang.Thread" :actual "(class (Thread.))" :portability :jvm}
+  {:suite "interop / Thread" :label "a new Thread is not a daemon" :expected "false" :actual "(.isDaemon (Thread. (fn [])))" :portability :jvm}
+  {:suite "interop / Thread" :label "setDaemon before start is honoured" :expected "true" :actual "(let [t (Thread. (fn []))] (.setDaemon t true) (.isDaemon t))" :portability :jvm}
+  {:suite "interop / Thread" :label "setDaemon on a live thread is refused" :expected "java.lang.IllegalThreadStateException" :actual "(let [p (promise) t (Thread. (fn [] @p))] (.start t) (try (.setDaemon t true) (catch Exception e (class e)) (finally (deliver p 1))))" :portability :jvm}
+  {:suite "interop / Thread" :label "setDaemon on a finished thread is allowed" :expected "true" :actual "(let [t (Thread. (fn []))] (.start t) (.join t) (.setDaemon t true) (.isDaemon t))" :portability :jvm}
+  {:suite "interop / Thread" :label "a second start is refused" :expected "java.lang.IllegalThreadStateException" :actual "(let [t (Thread. (fn []))] (.start t) (.join t) (try (.start t) (catch Exception e (class e))))" :portability :jvm}
   {:suite "interop / Thread" :label "a Thread is a Runnable" :expected "true" :actual "(instance? java.lang.Runnable (Thread.))" :portability :jvm}
   ;; java.lang.ThreadLocal is per-thread storage, and the per-thread half is the
   ;; whole point: a value one thread stores must not be visible to another. jolt

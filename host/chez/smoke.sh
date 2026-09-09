@@ -631,6 +631,33 @@ else
 fi
 rm -rf "$ex_dir"
 
+# The process ends when -main returns AND every non-daemon Thread the program
+# started has finished, as on the JVM; a daemon thread does not hold it open.
+# .setDaemon used to be accepted and ignored, and the process ended the moment
+# -main returned, so work handed to a started Thread was lost at exit.
+dm_dir="$(mktemp -d)"
+printf '(.start (Thread. (fn [] (Thread/sleep 300) (println "worker done"))))\n(println "main done")\n' > "$dm_dir/nd.clj"
+dm_out="$($jolt run "$dm_dir/nd.clj" 2>&1)"
+if [ "$dm_out" = "main done
+worker done" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a non-daemon thread should keep the process alive after -main returns"
+  echo "    got \`$(printf '%s' "$dm_out" | tr '\n' '|')\`"
+  fails=$((fails + 1))
+fi
+printf '(doto (Thread. (fn [] (Thread/sleep 5000) (println "DAEMON STILL ALIVE"))) (.setDaemon true) (.start))\n(println "main done")\n' > "$dm_dir/d.clj"
+dm_t0=$(date +%s)
+dm_out="$($jolt run "$dm_dir/d.clj" 2>&1)"
+dm_dt=$(( $(date +%s) - dm_t0 ))
+if [ "$dm_out" = "main done" ] && [ "$dm_dt" -lt 4 ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a daemon thread should not keep the process alive (took ${dm_dt}s, got \`$(printf '%s' "$dm_out" | tr '\n' '|')\`)"
+  fails=$((fails + 1))
+fi
+rm -rf "$dm_dir"
+
 # A readiness registration must never be lost. jolt.io-poller drained its pending
 # registrations in two critical sections, so one landing in between was erased
 # before reaching the kqueue/epoll set and the fiber waiting on that fd never
