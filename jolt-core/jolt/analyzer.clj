@@ -2068,7 +2068,12 @@
     (invoke (analyze (ctx-for-ns (:ns plan))
                      (list 'fn* (apply vector (map symbol (:frees plan))) (:form plan))
                      (empty-env))
-            (mapv #(analyze ctx % env) (:vals plan)))))
+            ;; Each captured value is a VALUE, so it is analyzed QUOTED: a captured
+            ;; symbol or list analyzed bare would resolve or invoke instead of
+            ;; being the datum it is (a closure over 'foo read back as the var foo;
+            ;; one over (1 2) as a call). The quote arm hands a live fn straight
+            ;; back here, so a captured closure still rebuilds the same way.
+            (mapv #(analyze ctx (list 'quote %) env) (:vals plan)))))
 
 (defn- embedded-value [ctx form env]
   (let [plan (embed-plan form)]
