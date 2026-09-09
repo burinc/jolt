@@ -90,12 +90,22 @@
   (current-memory-bytes))
 
 ;; (sa-max-memory-bytes) -> exact integer
-;; Upper bound on the heap the runtime may use — the JVM's maxMemory, which
-;; jolt maps to Long/MAX_VALUE when the heap is unbounded. Contract: an upper
-;; bound on heap bytes. Degradation: a large constant is acceptable — the JVM
-;; arm already falls back to Long.MAX_VALUE semantics.
+;; Peak heap bytes: the most the collector has held from the OS since the last
+;; sa-reset-max-memory-bytes! (or since boot) -- the high-water mark behind
+;; jolt.host/maximum-memory-bytes. Not the JVM's maxMemory: that is the heap
+;; ceiling (rt.ss jolt-heap-max-bytes), and Runtime.maxMemory reads it there.
+;; Contract: never below sa-total-memory-bytes. Degradation: the current total
+;; is acceptable -- a target that keeps no high-water mark answers "now".
 (define (sa-max-memory-bytes)
   (maximum-memory-bytes))
+
+;; (sa-reset-max-memory-bytes!) -> void
+;; Start the high-water mark over from the current total, so a caller can read
+;; the peak growth of one stretch of work (the apply-scaling gate). Contract:
+;; right after it, sa-max-memory-bytes answers the current total. Degradation:
+;; may no-op where sa-max-memory-bytes already answers the current total.
+(define (sa-reset-max-memory-bytes!)
+  (reset-maximum-memory-bytes!))
 
 ;; (sa-real-time-ms) -> exact integer
 ;; Wall-clock milliseconds, monotonic within a process — used for elapsed
@@ -124,6 +134,15 @@
 ;; only; collection still happens on its own schedule.
 (define (sa-gc-trip-bytes! n)
   (collect-trip-bytes n))
+
+;; (sa-gc-trip-bytes) -> exact integer
+;; The allocation threshold at which a trip collection triggers: between two
+;; collections at most this much is allocated, which bounds how far work that
+;; holds nothing can raise the heap footprint (the apply-scaling gate's floor).
+;; Contract: the threshold in bytes. Degradation: 0 -- the target has no such
+;; threshold, so nothing is invisible by construction.
+(define (sa-gc-trip-bytes)
+  (collect-trip-bytes))
 
 ;; ---- R6: introspection tier (capability: introspect) -------------------------
 

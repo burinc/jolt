@@ -116,6 +116,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`jolt.host/reset-maximum-memory-bytes!` and `jolt.host/gc-trip-bytes`.** The
+  collector's high-water mark can be started over, so the peak growth of one
+  stretch of work reads as `maximum-memory-bytes` minus the total at the reset,
+  and the allocation threshold that triggers a trip collection is readable; the
+  apply-scaling gate measures with them instead of sampling the live heap from
+  a watcher thread, which read collector timing and failed a CI run at 3.00.
+
 - **`jolt build --boot fast|small|plain` picks how the boot image is encoded.**
   0.8.5 converts the boot to vfasl — an image of the loaded heap, which starts
   fast and takes room — with no way to decline. For an app whose download size is

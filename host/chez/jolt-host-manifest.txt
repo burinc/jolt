@@ -158,6 +158,8 @@ make-thread-local
 map-entry
 mark-spliced!
 maximum-memory-bytes
+reset-maximum-memory-bytes!
+gc-trip-bytes
 mkdirs!
 monitor-enter
 monitor-exit
