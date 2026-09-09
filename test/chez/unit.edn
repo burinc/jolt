@@ -657,6 +657,13 @@
   ;; ...and a capture cp0 folded away is a DIFFERENT refusal, named as such: the
   ;; fn's source IS recorded, so \"no recorded source\" would be a lie about it.
   {:suite "embedded-value" :expr "(do (defmacro ev-h [] (let [n 7] (fn [x] (+ x n)))) (try (eval (quote (ev-h))) :no-throw (catch Throwable t (boolean (re-find #\"folded into the code\" (or (.getMessage t) \"\"))))))" :expected "true"}
+  ;; ...and a captured value is a VALUE: a closure over a symbol, a list or a
+  ;; vector holding a symbol rebuilds with that datum, not with what the datum
+  ;; would mean as code (a closure over 'clojure.core/inc used to read back the fn).
+  {:suite "embedded-value" :expr "(do (defn ev-cs [k] (fn [m] (get m k))) (defmacro ev-i [] (ev-cs (quote foo))) ((ev-i) {(quote foo) 1}))" :expected "1"}
+  {:suite "embedded-value" :expr "(do (defn ev-cl [k] (fn [] k)) (defmacro ev-j [] (ev-cl (list 1 2))) ((ev-j)))" :expected "(1 2)"}
+  {:suite "embedded-value" :expr "(do (defn ev-cq [k] (fn [] k)) (defmacro ev-o [] (ev-cq (quote clojure.core/inc))) [(symbol? ((ev-o))) ((ev-o))])" :expected "[true clojure.core/inc]"}
+  {:suite "embedded-value" :expr "(do (defn ev-cv [k] (fn [] k)) (defmacro ev-l [] (ev-cv [1 (quote x)])) ((ev-l)))" :expected "[1 x]"}
 
   ;; the feature set is {:jolt :clj :default}. :bb is NOT in it: a library's :bb
   ;; branch is written for babashka's host model, not jolt's, and taking it sent
