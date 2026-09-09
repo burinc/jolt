@@ -472,8 +472,12 @@
    ;; not a malli bug.
    ;;
    ;; This is the heaviest row in the gate by a wide margin — ~15GB RSS and ~30
-   ;; CPU-minutes now that it runs the whole assertion set with m/eval live,
-   ;; which is why :timeout is 2400 and why the runner passes JOLT_MAX_HEAP=off.
+   ;; CPU-minutes — and the reason is jolt-5j99, not the assertion count. ONE test
+   ;; (function-schema-test) costs 42.6s / 164MB run by itself and 404s / 24GB when
+   ;; malli.core-test's validation-test has run before it in the same process:
+   ;; protocol dispatch and record construction degrade ~5x once a workload has
+   ;; created many types. That is what :timeout 2400 and JOLT_MAX_HEAP=off are
+   ;; really paying for, and fixing jolt-5j99 should let both come back down.
    :expect {:tests 219 :pass 13261 :fail 28 :error 10 :load-fail 1}}
 
   ;; ---------------------------------------------------------- web

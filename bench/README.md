@@ -824,6 +824,11 @@ as one wrapping `let*`.
 | 800 `is` inside ONE `deftest` | 4.9s | 0.19s |
 | `malli.core-test` (3699 lines, one 1837-line `deftest`) | 16.9s / 1.5GB | 1.3s |
 
+Those are LOAD times. malli's *run* phase is a different problem and not a
+compile one: one test costs 42.6s / 164MB by itself and 404s / 24GB after
+`validation-test` has run in the same process, because protocol dispatch and
+record construction degrade ~5x once many types exist (jolt-5j99).
+
 Measured 2026-09-08, aarch64 macOS, cold (`JOLT_AOT_CACHE=0`). `malli.core-test`
 was **154s / 5.3GB** before the constant pool was keyed by form identity the way
 `Compiler.registerConstant` keys its `IdentityHashMap`; halving a pool quarters a
