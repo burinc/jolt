@@ -17,56 +17,14 @@ and which compiler pass or runtime seam it exists to watch.
 
 ## Scorecard
 
-Measured 2026-09-09 on an Apple Silicon MacBook Pro (M1 Pro, macOS 26.3): jolt 0.8.6 (the tree of
-commit 871ef34c) built as `target/release/jolt`, OpenJDK 20.0.1, Chez 10.4.1. Sorted by
-ratio; the AOT rows first, then `startup`, then the run-mode rows.
+{{measured}}
 
 | Benchmark | vs JVM | jolt (ms) | JVM (ms) | What it measures |
 |---|---:|---:|---:|---|
-| `arrays-unhinted` | **0.01×** | 59.9 | 10831.2 | the same array code without type hints |
-| `char-scan-unhinted` | **0.01×** | 113 | 7764 | the same scan without type hints |
-| `gc-arrays` | **0.02×** | 29.7 | 1725.7 | major-collection pause with a large typed array live (read jolt ms only, see below) |
-| `typed-records` | **0.03×** | 10.7 | 310.3 | records with `^double`/`^long`/`^String` field types at construction and every read |
-| `typed-records-unhinted` | **0.07×** | 19.9 | 292.6 | the same records without field types |
-| `string-ops-unhinted` | **0.10×** | 302 | 2958 | the same string interop without type hints |
-| `vecops` | **0.26×** | 4.1 | 15.9 | vector concat (`into`), `subvec` windows, split/rejoin (the RRB axis) |
-| `tak` | **0.36×** | 6.7 | 18.7 | deep three-way self-recursion + integer arith |
-| `stm` | **0.81×** | 122.0 | 151.5 | ref creation, `dosync` `ref-set`/`alter`, `deref` in a loop |
-| `dispatch` | **1.2×** | 65.6 | 56.6 | megamorphic protocol dispatch |
-| `fib` | **1.4×** | 9.3 | 6.8 | recursion: call overhead + integer arith |
-| `loop-recur` | **1.5×** | 28.5 | 18.8 | tight `loop`/`recur` with `mod`/`quot`/`bit-xor` per iteration |
-| `collections` | **1.5×** | 16.6 | 10.9 | persistent map/vector churn + map/filter/take/reduce over the result |
-| `mandelbrot` | **1.5×** | 21.9 | 14.2 | pure float compute, no allocation or dispatch |
-| `mathfns-unhinted` | **1.9×** | 41.9 | 22.2 | the same math without type hints |
-| `binary-trees` | **1.9×** | 75.3 | 39.4 | escaping short-lived records: allocation / GC pressure |
-| `literals` | **2.2×** | 55 | 25 | constant map/vector/set literals and quoted forms in a fn body, boolean predicates (per-form constant pool) |
-| `mathfns` | **2.3×** | 41.3 | 17.8 | `java.lang.Math` sqrt/sin/cos/log/pow/atan2 over doubles |
-| `sorted-access` | **2.4×** | 31.0 | 13.1 | shape-answered reads: `count`/`drop` on a vector seq, `rseq`, `first` of a sorted map/set |
-| `seqs` | **2.4×** | 346.7 | 144.9 | lazy-seq + HOF pipelines: `map`/`filter`/`reduce`, `every?`, `iterate`/`take`, `mapcat` |
-| `transients` | **2.5×** | 154 | 61 | bulk map/set building through `into`, `assoc!`/`conj!`, `zipmap`/`frequencies`/`group-by` |
-| `hash-eq` | **2.6×** | 480 | 186 | hashing vectors/maps/sets/records/seqs, collection-keyed lookups, `=` on equal and unequal collections |
-| `printing` | **2.7×** | 752.4 | 282.2 | `pr-str` over scalars and namespaced maps, `print` into a rebound `*out*`, `format` with numeric directives and flags |
-| `mono-dispatch` | **2.7×** | 37.0 | 13.8 | monomorphic protocol dispatch (devirt / inline cache can fire) |
-| `nth-access` | **2.7×** | 62.3 | 23.2 | `nth` on a vector, small and large, with and without a default |
-| `string-ops` | **3.0×** | 298 | 98 | `.indexOf`/`.startsWith`/`.substring`/`.toLowerCase` on hinted strings, `clojure.string`, keyword `.getName` |
-| `executors` | **3.2×** | 1328.8 | 421.7 | `java.util.concurrent`: fire-and-forget enqueue, submit/get, growth to 64 blocking tasks, four producers on one pool |
-| `keyed-lookup` | **3.6×** | 91 | 25 | hashing keywords/symbols/strings and looking them up in small maps |
-| `lazy-threads` | **3.7×** | 237.4 | 64.8 | lazy pipelines after a `Thread` has existed (cells claimed by CAS, no mutex per cell) |
-| `arrays` | **3.7×** | 592.8 | 160.0 | primitive `double-array` throughput (hinted `aget`/`aset`) |
-| `apply-rest` | **3.8×** | 222.1 | 58.3 | `apply` of `+ max min < <=` and a user variadic over a million-element rest (streamed, not materialized) |
-| `transducers` | **4.0×** | 124.6 | 30.8 | transducer pipelines (`comp` of `map`/`filter`/`take`) |
-| `byte-arrays` | **4.5×** | 167.0 | 37.5 | raw bytes in bulk: block copies, a drained stream, `String`↔`byte[]`, hinted `^bytes` access |
-| `string-build` | **4.5×** | 183 | 41 | `StringBuilder` in a loop and transducer-over-`join` |
-| `char-scan` | **6.0×** | 108 | 18 | `.charAt` per code point with the `int`/`long`/`unchecked-*` casts, a `case` state machine |
-| `compile-forms` | **8.3×** | 817.1 | 98.5 | **compiling**, not running: `load-string` of 200 top-level defns and of one `deftest` holding 200 `is` forms |
-| `sorted-build` | **13.3×** | 701.3 | 52.6 | `into` a sorted-map/sorted-set in and out of key order, `sorted-map-by`, replace-every-key (one tree walk per insert) |
-| `startup` | **0.19×** | 84 | 443 | a built hello-world, whole process from exec to exit, best of 7 (JVM: `java -cp … clojure.main -m hello`) |
-| `mix-64` ×100000 (run mode) | **5.8×** | 30.5 | 5.3 | SplitMix `mix-64`: 64-bit integer arithmetic (heap bignums past the 61-bit fixnum) |
-| `deftype+protocol` ×100000 (run mode) | **3.5×** | 23.0 | 6.5 | open-world deftype allocation + protocol dispatch |
-| `split + rand-long` ×20000 (run mode) | **12.1×** | 43.7 | 3.6 | the PRNG: bignum 64-bit arithmetic + dispatch |
-| `gen/large-integer` ×2000 (run mode) | **4.9×** | 41.5 | 8.5 | `gen/large-integer`: arithmetic + rose-tree generator machinery |
-| `(gen/vector gen/large-integer)` ×500 (run mode) | **12.2×** | 461.9 | 38.0 | element generation + generator machinery |
-
+{% for r in rows %}| `{{r.name}}` | **{{r.ratio}}×** | {{r.jolt}} | {{r.jvm}} | {{r.what}} |
+{% endfor %}| `startup` | **{{startup.ratio}}×** | {{startup.jolt}} | {{startup.jvm}} | {{startup.what}} |
+{% for r in run-rows %}| `{{r.label}}` ×{{r.n}} (run mode) | **{{r.ratio}}×** | {{r.jolt}} | {{r.jvm}} | {{r.what}} |
+{% endfor %}
 **vs JVM** is jolt ÷ JVM Clojure on the same source: lower is better, and
 under 1.0× jolt is faster. Every row is from one `bench/run.sh` followed by one
 `bench/testcheck.sh` on one machine in one sitting, which is the only way the

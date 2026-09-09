@@ -905,29 +905,37 @@ jobs:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: tap
 
+      # The formula is rewritten by tools/bump-formula.clj, run with the jolt this
+      # workflow just released (the x86_64-linux asset), so the tap bump exercises
+      # the release binary once more and the repo carries no other scripting
+      # language for it.
+      - name: Checkout jolt (for tools/)
+        if: steps.tok.outputs.ok == 'true'
+        uses: actions/checkout@v5
+        with:
+          path: jolt
+      - name: Fetch the released jolt
+        if: steps.tok.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y liblz4-1 zlib1g libtinfo6
+          gh release download "$VER" --repo "${{ github.repository }}" -p "jolt-${VER}-x86_64-linux.tar.gz" --dir rel-dl
+          mkdir -p unpacked-rel
+          tar -xzf rel-dl/*x86_64-linux.tar.gz -C unpacked-rel
+          bin="$(find unpacked-rel -type f -name jolt -perm -u+x -print -quit)"
+          [ -n "$bin" ] || { echo "no jolt binary in the release tarball"; exit 1; }
+          mv "$bin" ./jolt-rel
+          ./jolt-rel --version
+
       - name: Bump + push formula
         if: steps.tok.outputs.ok == 'true'
         run: |
           set -euo pipefail
           base="https://github.com/${{ github.repository }}/releases/download/${VER}"
-          python3 - tap/Formula/jolt.rb "$base" "$VER" "$MAC_SHA" "$LIN_SHA" <<'PY'
-          import re, sys
-          path, base, ver, mac, lin = sys.argv[1:6]
-          s = open(path).read()
-          # one-time transition off the pre-rename formula: rewrite every joltc
-          # token (bin.install, test stanza, old asset urls) to jolt. Idempotent —
-          # a formula already on the new name has no joltc tokens left.
-          s = s.replace('joltc', 'jolt')
-          def bump(s, target, sha):
-              url = f'{base}/jolt-{ver}-{target}.tar.gz'
-              s = re.sub(r'url "[^"]*' + re.escape(target) + r'\.tar\.gz"', f'url "{url}"', s)
-              s = re.sub(r'(jolt-' + re.escape(ver) + '-' + re.escape(target) + r'\.tar\.gz"\s*\n\s*sha256 ")[0-9a-f]{64}',
-                         r'\g<1>' + sha, s)
-              return s
-          s = bump(s, 'aarch64-macos', mac)
-          s = bump(s, 'x86_64-linux', lin)
-          open(path, 'w').write(s)
-          PY
+          ./jolt-rel run jolt/tools/bump-formula.clj tap/Formula/jolt.rb "$base" "$VER" "$MAC_SHA" "$LIN_SHA"
           cd tap
           git config user.name "jolt-release[bot]"
           git config user.email "jolt-release@users.noreply.github.com"
