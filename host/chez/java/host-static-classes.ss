@@ -831,8 +831,22 @@
 ;; compare their unboxed values. Keep that closed distinction in the cell
 ;; instead of making the shared CAS path guess from the values it contains (or
 ;; calling a stored, potentially generic comparator while the mutex is held).
+;; One jhost SHAPE serves all four, but each reports its own JVM class, so the
+;; tag has to carry the kind: (class (AtomicLong. 1)) is AtomicLong, not a
+;; placeholder, and only the two numeric ones answer true to (instance? Number x).
+;; Same reason the two ThreadLocal storage shims carry separate tags — a caller
+;; asks which one it holds with instance?. The kind stays in the state as well:
+;; the CAS and conversion paths switch on it, and reading a symbol beats parsing
+;; the tag string back.
+(define (atomic-tag-for kind)
+  (case kind
+    ((integer) "atomic-integer")
+    ((long) "atomic-long")
+    ((boolean) "atomic-boolean")
+    (else "atomic-reference")))
+(define atomic-tags '("atomic-integer" "atomic-long" "atomic-boolean" "atomic-reference"))
 (define (make-atomic init kind)
-  (make-jhost "atomic" (vector (box init) (make-mutex) kind)))
+  (make-jhost (atomic-tag-for kind) (vector (box init) (make-mutex) kind)))
 (define (atomic-box self) (vector-ref (jhost-state self) 0))
 (define (atomic-lock self) (vector-ref (jhost-state self) 1))
 (define (atomic-kind self) (vector-ref (jhost-state self) 2))
@@ -892,7 +906,9 @@
             '("AtomicLong" "java.util.concurrent.atomic.AtomicLong"))
   (for-each (lambda (n) (register-class-ctor! n bool-ctor))
             '("AtomicBoolean" "java.util.concurrent.atomic.AtomicBoolean")))
-(register-host-methods! "atomic"
+;; The four tags share ONE method table — the methods read the kind out of the
+;; state, so nothing here is per-class.
+(let ((atomic-methods
   (list (cons "get" (lambda (self) (unbox (atomic-box self))))
         ;; Serialization of the plain set method against read-modify-write
         ;; methods is a separate concern. Preserve its current write boundary
@@ -937,7 +953,8 @@
               (jolt-unchecked-int (unbox (atomic-box self)))
               (jnum->exact (unbox (atomic-box self))))))
         (cons "longValue" (lambda (self) (jnum->exact (unbox (atomic-box self)))))
-        (cons "toString" (lambda (self) (jolt-str-render-one (unbox (atomic-box self)))))))
+        (cons "toString" (lambda (self) (jolt-str-render-one (unbox (atomic-box self))))))))
+  (for-each (lambda (t) (register-host-methods! t atomic-methods)) atomic-tags))
 ;; java.util.Collections/synchronizedMap|List|Set wrap a collection for
 ;; thread-safe access. The shared-heap HashMap/ArrayList shims already serialize
 ;; individual ops adequately for these uses, so the wrapper returns its argument.

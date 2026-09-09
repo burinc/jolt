@@ -6260,6 +6260,25 @@
   ;; identityHashCode of nil is 0 on the JVM — it is the one input with no object
   ;; to identify. jolt answered the nil sentinel's own id.
   {:suite "host-interop / identity hash" :label "identityHashCode of nil is 0" :expected "0" :actual "(System/identityHashCode nil)" :portability :jvm}
+  ;; A shim value reports its JVM class through ONE registry: the jhost tag -> FQN
+  ;; map in class-hierarchy.ss, whose supers the class graph then walks for
+  ;; instance?. A shim with methods and no row answers the :object placeholder to
+  ;; (class x) and false to every instance? question, which is silent — the value
+  ;; still works, it just is not the class it claims to be. These rows pin the
+  ;; classes that had methods and no row.
+  {:suite "host-interop / class of a shim value" :label "Thread/currentThread reports java.lang.Thread" :expected "[\"java.lang.Thread\" true true]" :actual "(let [t (Thread/currentThread)] [(.getName (class t)) (instance? java.lang.Thread t) (instance? java.lang.Runnable t)])" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "the four atomics report their own classes" :expected "[\"java.util.concurrent.atomic.AtomicLong\" \"java.util.concurrent.atomic.AtomicInteger\" \"java.util.concurrent.atomic.AtomicBoolean\" \"java.util.concurrent.atomic.AtomicReference\"]" :actual "(mapv (fn [x] (.getName (class x))) [(java.util.concurrent.atomic.AtomicLong. 1) (java.util.concurrent.atomic.AtomicInteger. 1) (java.util.concurrent.atomic.AtomicBoolean. true) (java.util.concurrent.atomic.AtomicReference. nil)])" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "only the numeric atomics are Numbers" :expected "[true true false false]" :actual "(mapv (fn [x] (instance? java.lang.Number x)) [(java.util.concurrent.atomic.AtomicLong. 1) (java.util.concurrent.atomic.AtomicInteger. 1) (java.util.concurrent.atomic.AtomicBoolean. true) (java.util.concurrent.atomic.AtomicReference. nil)])" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "a ReentrantLock is a Lock" :expected "[\"java.util.concurrent.locks.ReentrantLock\" true]" :actual "(let [l (java.util.concurrent.locks.ReentrantLock.)] [(.getName (class l)) (instance? java.util.concurrent.locks.Lock l)])" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "a CountDownLatch reports its class" :expected "\"java.util.concurrent.CountDownLatch\"" :actual "(.getName (class (java.util.concurrent.CountDownLatch. 1)))" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "a SecureRandom is a Random" :expected "[\"java.security.SecureRandom\" \"java.util.Random\" true]" :actual "(let [r (java.security.SecureRandom.) p (java.util.Random. 1)] [(.getName (class r)) (.getName (class p)) (instance? java.util.Random r)])" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "Optional and StringTokenizer report their classes" :expected "[\"java.util.Optional\" \"java.util.StringTokenizer\" true]" :actual "(let [s (java.util.StringTokenizer. \"a b\")] [(.getName (class (java.util.Optional/of 1))) (.getName (class s)) (instance? java.util.Enumeration s)])" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "Base64's encoder and decoder report their nested classes" :expected "[\"java.util.Base64$Encoder\" \"java.util.Base64$Decoder\"]" :actual "[(.getName (class (java.util.Base64/getEncoder))) (.getName (class (java.util.Base64/getDecoder)))]" :portability :jvm}
+  {:suite "host-interop / class of a shim value" :label "Runtime reports java.lang.Runtime" :expected "\"java.lang.Runtime\"" :actual "(.getName (class (Runtime/getRuntime)))" :portability :jvm}
+  ;; NumberFormat/getInstance hands back a DecimalFormat on the JVM, and jolt's one
+  ;; numberformat shim is only ever built by those statics, so it reports the class
+  ;; a caller actually receives rather than the abstract one it was asked for.
+  {:suite "host-interop / class of a shim value" :label "NumberFormat/getInstance is a DecimalFormat and a NumberFormat" :expected "[\"java.text.DecimalFormat\" true true]" :actual "(let [n (java.text.NumberFormat/getInstance)] [(.getName (class n)) (instance? java.text.NumberFormat n) (instance? java.text.Format n)])" :portability :jvm}
   ;; cond-> expands to the reference's shape: ONE let with g rebound per step,
   ;; each step delegating to -> rather than inlining the call itself. jolt built a
   ;; nest of let* forms with a fresh symbol per step and threaded by hand, so a
