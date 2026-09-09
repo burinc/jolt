@@ -204,6 +204,7 @@ set-default-zone-provider!
 set-dispatch-macro!
 set-field!
 set-instant-ctor!
+ns-source
 set-source-roots!
 set-static-field!
 set-var!

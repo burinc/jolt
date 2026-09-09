@@ -608,7 +608,7 @@
                                (line (or (srcreg-frame-line f) (vector-ref r 3))))
                           (put-string port ns) (put-string port "/") (put-string port nm)
                           (when (string? file)
-                            (put-string port " (") (put-string port file)
+                            (put-string port " (") (put-string port (jolt-display-path file))
                             (put-string port ":") (put-string port (number->string line))
                             (put-string port ")")))
                         (put-string port (srcreg-display-name frame-name)))   ; 'ambiguous / unmapped: bare name
