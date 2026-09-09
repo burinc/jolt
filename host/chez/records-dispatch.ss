@@ -620,11 +620,14 @@
 ;; those is Seqable on the JVM — an ILookup-only deftype is not seqable there.
 ;; A type declaring Seqable or ISeq has a `seq` method by construction, and a
 ;; type that is coll? here is already seqable through the predicate this wraps.
+;; A bare Iterator (hasNext/next, no iterator method) is NOT in the JVM's set --
+;; RT.canSeq names Iterable, never Iterator -- so it stays out here too, even
+;; though the cursor arm above lets `seq` walk one; that arm is a jolt superset,
+;; and the predicate answers the JVM's question.
 (define (iface-seqable? v)
   (and (or (jrec? v) (jreify? v))
        (or (and (iface-method v "seq" #f) #t)
-           (and (iface-method v "iterator" #f) #t)
-           (and (iface-method v "hasNext" #f) #t))))
+           (and (iface-method v "iterator" #f) #t))))
 
 
 ;; satisfies?: does obj's type implement the protocol? proto is a defprotocol

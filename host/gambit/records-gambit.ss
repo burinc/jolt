@@ -2694,8 +2694,7 @@
 (define (iface-seqable? v)
   (and (or (jrec? v) (jreify? v))
        (or (and (iface-method v "seq" #f) #t)
-           (and (iface-method v "iterator" #f) #t)
-           (and (iface-method v "hasNext" #f) #t))))
+           (and (iface-method v "iterator" #f) #t))))
 
 (define (jolt-satisfies? proto obj)
   (if (jclass? proto)
