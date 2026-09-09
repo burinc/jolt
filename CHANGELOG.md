@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Internal
+
+- **The repository's tooling is jolt, not Python.** `bench/pagecache.clj`
+  (page-cache eviction and residency through `jolt.ffi`: `posix_fadvise` on
+  Linux, `mmap`+`msync` on macOS, `mincore` on both — the Python version was
+  Linux-only and assumed 4K pages), `tools/spec_coverage.clj` (the spec
+  coverage dashboard, measuring the jolt that runs it instead of shelling out),
+  `tools/mkjar.clj` (a stored-zip jar writer the cpcache smoke uses in place of
+  Python's `zipfile`, so that case no longer skips where Python is absent),
+  `tools/bump-formula.clj` (the Homebrew formula bump, run by the release
+  workflow with the jolt it just released), and `bench/scorecard.clj`, which
+  renders `bench/README.md` from a Selmer template and one sitting's logs.
+  `bench/build-phases.sh` reads its clock through perl, as `startup.sh` does.
+
 ## [0.8.6] - 2026-09-09
 
 Reader conditionals no longer match `:bb`. 0.7.10 added it on the theory that a
