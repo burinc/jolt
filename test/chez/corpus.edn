@@ -2998,6 +2998,28 @@
   {:suite "regex / \\p property classes" :label "p{Lu}/p{Ll}" :expected "\"aB\"" :actual "(re-matches #\"^\\p{Ll}\\p{Lu}$\" \"aB\")" :portability :common}
   {:suite "regex / \\p property classes" :label "p{Z} space" :expected "\"  \"" :actual "(re-matches #\"(?u)^[\\s\\p{Z}]+$\" \"  \")" :portability :common}
   {:suite "regex / \\p property classes" :label "p{Ps}/p{Pe}" :expected "\"(x)\"" :actual "(re-matches #\"^\\p{Ps}x\\p{Pe}$\" \"(x)\")" :portability :common}
+  ;; An escape means the same thing in a bare pattern and inside a character class
+  ;; unless Java says otherwise, and there are exactly three places it does: \b is
+  ;; a word boundary outside a class and a COMPILE ERROR inside one, \R is a
+  ;; linebreak outside and an error inside, and back-references are legal only
+  ;; outside. Everything else — \a \e \t \n \r \f, \cX, octal, \x, \u, \p — is one
+  ;; decoder's job. It used to be two hand-kept copies and they had drifted: \a was
+  ;; in the bare-pattern copy only, so [\a] matched the letter a instead of BEL.
+  {:suite "regex / escapes in and out of a character class" :label "\\a is BEL in both contexts" :expected "[true false true false]" :actual "[(boolean (re-find #\"[\\a]\" (str (char 7)))) (boolean (re-find #\"[\\a]\" \"a\")) (boolean (re-find #\"\\a\" (str (char 7)))) (boolean (re-find #\"\\a\" \"a\"))]" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "\\e is ESC in both contexts" :expected "[true false true false]" :actual "[(boolean (re-find #\"[\\e]\" (str (char 27)))) (boolean (re-find #\"[\\e]\" \"e\")) (boolean (re-find #\"\\e\" (str (char 27)))) (boolean (re-find #\"\\e\" \"e\"))]" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "\\cX is the control character in both contexts" :expected "[true false true false]" :actual "[(boolean (re-find #\"[\\cA]\" (str (char 1)))) (boolean (re-find #\"[\\cA]\" \"c\")) (boolean (re-find #\"\\cA\" (str (char 1)))) (boolean (re-find #\"\\cA\" \"c\"))]" :portability :common}
+  ;; \cX is x XOR 64 applied to the RAW next character, so a lowercase letter is
+  ;; not folded first: \ca is 97 xor 64 = 33, not \cA's 1.
+  {:suite "regex / escapes in and out of a character class" :label "\\c@ \\cZ \\ca are xor-64 of the raw char" :expected "[true true true]" :actual "[(boolean (re-find #\"\\c@\" (str (char 0)))) (boolean (re-find #\"\\cZ\" (str (char 26)))) (boolean (re-find #\"\\ca\" (str (char 33))))]" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "a dangling \\c is a pattern error" :expected :throws :actual "(re-find (re-pattern \"a\\\\c\") \"x\")" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "\\t \\n \\r \\f inside a class" :expected "[true true false]" :actual "[(boolean (re-find #\"[\\t\\n\\r\\f]\" (str (char 9)))) (boolean (re-find #\"[\\t\\n\\r\\f]\" (str (char 12)))) (boolean (re-find #\"[\\t\\n\\r\\f]\" \"t\"))]" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "octal, \\x and \\u inside a class" :expected "[true false true false true false]" :actual "[(boolean (re-find #\"[\\0101]\" \"A\")) (boolean (re-find #\"[\\0101]\" \"0\")) (boolean (re-find #\"[\\x41]\" \"A\")) (boolean (re-find #\"[\\x41]\" \"x\")) (boolean (re-find #\"[\\u0041]\" \"A\")) (boolean (re-find #\"[\\u0041]\" \"u\"))]" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "a class unions its escaped members" :expected "[true true true false]" :actual "(mapv (fn [s] (boolean (re-find #\"[\\a\\e\\f]\" s))) [(str (char 7)) (str (char 27)) (str (char 12)) \"a\"])" :portability :common}
+  ;; The three deliberate differences. \b as a backspace inside a class is PERL,
+  ;; not Java: java.util.regex rejects the pattern outright.
+  {:suite "regex / escapes in and out of a character class" :label "\\b is a word boundary outside a class" :expected "[true false]" :actual "[(boolean (re-find #\"\\bcd\" \"ab cd\")) (boolean (re-find #\"\\bcd\" \"abcd\"))]" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "\\b inside a class is a pattern error" :expected :throws :actual "(re-find (re-pattern \"[\\\\b]\") \"x\")" :portability :common}
+  {:suite "regex / escapes in and out of a character class" :label "\\R is a linebreak outside a class and an error inside" :expected "[true :threw]" :actual "[(boolean (re-find #\"\\R\" \"\\n\")) (try (re-find (re-pattern \"[\\\\R]\") \"x\") :no-throw (catch java.util.regex.PatternSyntaxException e :threw))]" :portability :common}
   {:suite "regex / \\p property classes" :label "(?u) accepted" :expected "\"hi\"" :actual "(re-matches #\"(?u)^hi$\" \"hi\")" :portability :common}
   {:suite "regex / \\p property classes" :label "unknown class throws" :expected :throws :actual "(re-pattern \"\\p{Greek}\")" :portability :common}
   {:suite "regex / Pattern statics & String regex methods" :label "Pattern/compile is a regex" :expected "true" :actual "(regex? (Pattern/compile \"a.c\"))" :portability :jvm}
