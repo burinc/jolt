@@ -197,6 +197,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now reads the same per-method probes the `seq` arms read, so the two answers
   cannot drift apart again; the collection-BEHAVIOUR interfaces stay out of it,
   because `ILookup` and `Counted` are not `Seqable` on the JVM either.
+- **`Files.size` reports a directory's own size.** It answered a hardcoded `0`
+  for any directory, and so did the `size` attribute behind `readAttributes` and
+  `BasicFileAttributes`. All three now report `st_size`, as the JVM does. The
+  number comes from `file-length` on the open handle — `fstat(2).st_size` inside
+  Chez — so it needs none of the `struct stat` field offsets the permission
+  readers carry.
+
+- **`Files.createFile` no longer truncates an existing file.** It opened with
+  create-or-truncate and returned the path, so calling it on a path that already
+  held data silently emptied it — the same failure #895 reported for
+  `Files.newOutputStream`, at a different entry point. It now takes the same
+  exclusive-create open and throws `FileAlreadyExistsException`.
+
+- **The rest of the `java.nio.file.Files` surface reports NIO exceptions.**
+  Only the output-open path had been translated. Elsewhere a Chez condition
+  escaped to jolt's generic fallback, which names failures with `java.io`
+  classes, or the operation answered without failing at all:
+  `Files.size` returned `0` for a missing path, `newInputStream` handed back a
+  stream for a directory that only threw on first read, and `createDirectories`
+  reported success when a plain file blocked the path. Reads, `size`,
+  `createDirectory`/`createDirectories`, `move`, `copy`, `delete`,
+  `newDirectoryStream`, `readSymbolicLink` and `getLastModifiedTime` now answer
+  `NoSuchFileException`, `FileAlreadyExistsException`, `NotDirectoryException`,
+  `NotLinkException`, `AccessDeniedException` or a `FileSystemException` reading
+  `<path>: <reason>`, matching `UnixException.translateToIOException`.
+
+- **A failed `Files.newOutputStream`/`Files.write` open reports the NIO class the
+  JVM reports.** Only ENOENT and EEXIST were translated; every other errno let
+  the underlying Chez condition escape, so opening a directory for output — or
+  hitting ENOTDIR, ELOOP, ENOSPC — surfaced as a bare `java.io.IOException`
+  whose message named `open-file-output-port`. These now follow
+  `UnixException.translateToIOException`: EACCES is an `AccessDeniedException`,
+  and anything without a class of its own is a `FileSystemException` reading
+  `<path>: <reason>`.
+
+- **`Files.newOutputStream` now honors Java open options atomically.**
+  `CREATE_NEW` previously behaved like the default create-or-truncate mode, so
+  opening an existing path could overwrite it instead of throwing
+  `FileAlreadyExistsException`. `CREATE_NEW` now uses Chez's exclusive-create
+  open and returns that same handle, while `CREATE`, `TRUNCATE_EXISTING`,
+  `APPEND`, `WRITE`, and invalid combinations follow their JVM contracts.
+  `Files.write` shares the same option handling, including rejecting
+  APPEND-only writes to a missing path with `NoSuchFileException`.
+
+- **`JOLT_WP_TRACE` and `JOLT_IR_VALIDATE` are read again.** Both flags were
+  ignored: the `[wp]` and `[inline]` traces printed on every release build, set,
+  unset or explicitly removed from the environment (jolt-lang/jolt#879, reported
+  with a five-line repro and byte-identical captures either way).
+
+  Each flag is read in a top-level `def` in a compiler namespace, so its
+  initializer runs while the seed image loads. `jolt.host/getenv` lived in
+  `loader.ss`, which `bld-runtime-manifest` loads well after the image — and
+  which the seed mint never loads at all. A qualified name resolves against what
+  the compiling runtime has ALREADY loaded, so `resolve-global` could not see the
+  var and the analyzer read `jolt.host/getenv` as a class static. The emitted
+  `host-static-call "jolt.host" "getenv"` raises on every call: there is no such
+  class, and the static registry never consults a namespace. The seed emits its
+  forms guard-wrapped, so the raise was swallowed and the three vars were never
+  defined at all; every later read got the unbound sentinel, which is an object
+  and therefore truthy. Hence both traces always on — and the `jolt.ir` schema
+  walk quietly running twice per form on every build.
+
+  The fix is the load order, not the spelling: the def moves to `rt.ss`, beside
+  the other process-level host primitives, so it exists both before the image
+  loads and before the mint compiles the reference.
+
+  Two gates, since neither half of this was covered. `make seeddefs` asserts that
+  every var the checked-in seed defines exists after the seed loads, and pins the
+  two trace flags against the environment over two runs, so neither "always on"
+  nor "always off" passes both arms — the mint's guard already fails `remint.sh`
+  on a form that will not *compile*, and nothing checked forms that raise when
+  the seed *loads*. And `manifestcheck` now rejects a namespace-shaped
+  host-static in the minted seed.
+
+- **A qualified name in a namespace that is not loaded is a compile error, not a
+  missing class at run time.** `(no.such.ns/foo 1)` reported `Unknown class
+  no.such.ns` from inside the call, naming a class the program never mentioned —
+  and a forgotten `require`, or a typo in the namespace half, read exactly the
+  same way. It now says so where the mistake is:
+
+  ```
+  error[analyze/unknown-namespace]: No such namespace: no.such.ns
+    --> src/probe.clj:3:1
+     |
+   3 | (no.such.ns/foo 1)
+     | ^^^^^^^^^^^^^^^^^^
+  ```
+
+  `resolve-global` cannot draw this line on its own: it answers `:unresolved` for
+  `Math/sqrt` and for `no.such.ns/foo` alike, since looking the name up and
+  finding nothing is all it can say. The analyzer now asks the shape of the
+  namespace half first — dotted, with a lowercase segment after the last dot,
+  which is what a namespace looks like and what no class jolt models looks like.
+
+  Two neighbouring cases deliberately still report at the call. An undotted
+  `str/join` may be an `:import`-ed class short name whose provider has not
+  autoloaded yet. And a namespace that IS loaded and is merely missing the var
+  stays late-bound, which is how jolt reaches its own host contract — the miss
+  there already reads `No such var: clojure.string/no-such-fn` rather than naming
+  a class.
 
 - **A large binary's boot image loads again.** A program big enough for its boot
   image to cross Chez's LZ4 fasl ceiling built fine and then died on every run,
