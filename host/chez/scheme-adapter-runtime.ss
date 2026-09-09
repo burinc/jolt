@@ -799,6 +799,13 @@
 (define (sa-current-winders) (#%$current-winders))
 (define (sa-current-winders-set! w) (#%$current-winders w))
 
+;; (sa-record-cas! r i old new): compare-and-swap field i (0-based) of record r,
+;; answering whether it swapped. What lets a lazy cell be claimed for forcing
+;; with no lock in the way and nothing allocated (seq.ss force-claimed!). A
+;; system primitive here; a target whose records are vectors swaps the slot
+;; under whatever makes that atomic for its threads.
+(define (sa-record-cas! r i old new) (#%$record-cas! r i old new))
+
 ;; (sa-disable-count) -> how many nested disable-interrupts this thread is
 ;; inside; 0 when interrupts are on. Chez keeps it in the thread context, and
 ;; swish reads it from there (erlang.ss:792, current-disable-count) rather than
