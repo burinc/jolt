@@ -4034,6 +4034,11 @@
   {:suite "chunking-model / realization granularity" :label "first over keep of a chunked vector realizes the whole 32-block" :expected "32" :actual "(let [a (atom 0)] (first (keep (fn [x] (swap! a inc) x) (vec (range 100)))) @a)" :portability :common}
   {:suite "chunking-model / realization granularity" :label "first over map-indexed of a chunked vector realizes the whole 32-block" :expected "32" :actual "(let [a (atom 0)] (first (map-indexed (fn [i x] (swap! a inc) x) (vec (range 100)))) @a)" :portability :common}
   {:suite "chunking-model / realization granularity" :label "first over keep-indexed of a chunked vector realizes the whole 32-block" :expected "32" :actual "(let [a (atom 0)] (first (keep-indexed (fn [i x] (swap! a inc) x) (vec (range 100)))) @a)" :portability :common}
+  ;; --- sorted collections: one tree walk per insert, like PersistentTreeMap.add.
+  ;; The comparator call count is exact and deterministic for a given key order,
+  ;; so it pins both the walk count and the balancing algorithm to the reference.
+  {:suite "sorted / one walk per insert" :label "1024 ascending keys into a sorted-map-by count comparator calls like the reference" :expected "12301" :actual "(let [c (atom 0) cmp (fn [a b] (swap! c inc) (compare a b))] (into (sorted-map-by cmp) (map (fn [i] [i i]) (range 1024))) @c)" :portability :common}
+  {:suite "sorted / one walk per insert" :label "replacing values in a sorted-map-by counts like the reference" :expected "29414" :actual "(let [c (atom 0) cmp (fn [a b] (swap! c inc) (compare a b))] (into (sorted-map-by cmp) (map (fn [i] [(mod (* i 7919) 1024) i]) (range 2048))) @c)" :portability :common}
   ;; mapcat/dedupe stay lazier than the JVM at construction: jolt's (apply concat …)
   ;; and sequence transformer don't force the first chunk just to build the seq
   ;; (the JVM forces 5 here). Allowlisted in known-divergences.edn (jolt-mm6v).
