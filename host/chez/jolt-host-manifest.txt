@@ -35,11 +35,13 @@ condition-message
 cpu-nanos
 current-memory-bytes
 current-fiber
+ctx-for-ns
 deftype-ctor-class
 delete-file!
 delete-tree!
 directory?
 dispatch-macros
+embed-plan
 enable-trace!
 entry-at
 escape-fn?
@@ -120,6 +122,7 @@ gc-real-nanos
 getenv
 host-class-name?
 host-intern!
+identity-hash
 image-add-after-restore-hook!
 image-add-before-dump-hook!
 image-dump-world!

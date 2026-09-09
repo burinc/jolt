@@ -377,6 +377,23 @@
   (if (and (pair? xs) (null? (cdr xs)) (lazy-rest? (car xs)))
       (lazy-rest-seq (car xs))
       (list->cseq xs)))
+;; The same question jolt-rest-seq answers, but for a native that wants to keep
+;; its eager path: the seq when jolt-apply handed a boxed lazy rest, #f when the
+;; rest is an ordinary argument list.
+(define (boxed-rest-seq xs)
+  (and (pair? xs) (null? (cdr xs)) (lazy-rest? (car xs)) (lazy-rest-seq (car xs))))
+;; Fold OP2 across a seq without holding its head. A native variadic that folds
+;; its arguments (+ - * / min max, the comparison chains) needs no more than one
+;; element at a time, so registering it with jolt-register-variadic! and walking
+;; the boxed rest through here makes (apply max (range)) run in constant space —
+;; the reference's behaviour. Unregistered, jolt-apply must seq->list the whole
+;; argument seq first, which on an unbounded one allocates until the process dies.
+(define (fold-rest-seq op2 acc s)
+  (let loop ((acc acc) (s (jolt-seq s)))
+    (if (jolt-nil? s) acc (loop (op2 acc (seq-first s)) (jolt-seq (seq-more s))))))
+;; Is this seq's tail empty? One element of lookahead, so it is safe on an
+;; unbounded seq — used only to tell the 1-argument arities apart.
+(define (rest-seq-empty? s) (jolt-nil? (jolt-seq (seq-more s))))
 (define (vec->seq v i)                 ; chunked index seq over a persistent vector
   (vec->seq/k v i sk-chunked-seq))
 ;; …as some other flavor that is nonetheless vector-backed (a sorted coll's seq,
@@ -756,35 +773,84 @@
 ;; the lone operand to Number, and null passes any cast.
 (define (jolt-num-check1 x)
   (if (or (number? x) (jolt-nil? x) (jolt-num-slow? x)) x (jolt-num-cast-throw x)))
-(define (jolt-add . xs)
-  (cond ((null? xs) 0)
-        ((null? (cdr xs)) (jolt-num-check1 (car xs)))
-        (else (fold-left jolt-add2 (car xs) (cdr xs)))))
+(define jolt-add
+  (jolt-register-variadic! 0
+    (lambda xs
+      (let ((bs (boxed-rest-seq xs)))
+        (if bs
+            (let ((s (jolt-seq bs)))
+              (cond ((jolt-nil? s) 0)
+                    ((rest-seq-empty? s) (jolt-num-check1 (seq-first s)))
+                    (else (fold-rest-seq jolt-add2 (seq-first s) (seq-more s)))))
+            (cond ((null? xs) 0)
+                  ((null? (cdr xs)) (jolt-num-check1 (car xs)))
+                  (else (fold-left jolt-add2 (car xs) (cdr xs)))))))))
 (define (jolt-arity0-throw name)
   (jolt-throw (jolt-host-throwable
                "clojure.lang.ArityException"
                (string-append "Wrong number of args (0) passed to: clojure.core/" name))))
-(define (jolt-sub . xs)
-  (cond ((null? xs) (jolt-arity0-throw "-"))
-        ((null? (cdr xs)) (jolt-sub2 0 (car xs)))
-        (else (fold-left jolt-sub2 (car xs) (cdr xs)))))
-(define (jolt-mul . xs)
-  (cond ((null? xs) 1)
-        ((null? (cdr xs)) (jolt-num-check1 (car xs)))
-        (else (fold-left jolt-mul2 (car xs) (cdr xs)))))
-(define (jolt-div . xs)
-  (cond ((null? xs) (jolt-arity0-throw "/"))
-        ((null? (cdr xs)) (jolt-div2 1 (car xs)))
-        (else (fold-left jolt-div2 (car xs) (cdr xs)))))
-(define (jolt-min x . xs) (fold-left jolt-min2 x xs))
-(define (jolt-max x . xs) (fold-left jolt-max2 x xs))
+(define jolt-sub
+  (jolt-register-variadic! 0
+    (lambda xs
+      (let ((bs (boxed-rest-seq xs)))
+        (if bs
+            (let ((s (jolt-seq bs)))
+              (cond ((jolt-nil? s) (jolt-arity0-throw "-"))
+                    ((rest-seq-empty? s) (jolt-sub2 0 (seq-first s)))
+                    (else (fold-rest-seq jolt-sub2 (seq-first s) (seq-more s)))))
+            (cond ((null? xs) (jolt-arity0-throw "-"))
+                  ((null? (cdr xs)) (jolt-sub2 0 (car xs)))
+                  (else (fold-left jolt-sub2 (car xs) (cdr xs)))))))))
+(define jolt-mul
+  (jolt-register-variadic! 0
+    (lambda xs
+      (let ((bs (boxed-rest-seq xs)))
+        (if bs
+            (let ((s (jolt-seq bs)))
+              (cond ((jolt-nil? s) 1)
+                    ((rest-seq-empty? s) (jolt-num-check1 (seq-first s)))
+                    (else (fold-rest-seq jolt-mul2 (seq-first s) (seq-more s)))))
+            (cond ((null? xs) 1)
+                  ((null? (cdr xs)) (jolt-num-check1 (car xs)))
+                  (else (fold-left jolt-mul2 (car xs) (cdr xs)))))))))
+(define jolt-div
+  (jolt-register-variadic! 0
+    (lambda xs
+      (let ((bs (boxed-rest-seq xs)))
+        (if bs
+            (let ((s (jolt-seq bs)))
+              (cond ((jolt-nil? s) (jolt-arity0-throw "/"))
+                    ((rest-seq-empty? s) (jolt-div2 1 (seq-first s)))
+                    (else (fold-rest-seq jolt-div2 (seq-first s) (seq-more s)))))
+            (cond ((null? xs) (jolt-arity0-throw "/"))
+                  ((null? (cdr xs)) (jolt-div2 1 (car xs)))
+                  (else (fold-left jolt-div2 (car xs) (cdr xs)))))))))
+(define jolt-min
+  (jolt-register-variadic! 1
+    (lambda (x . xs)
+      (let ((bs (boxed-rest-seq xs)))
+        (if bs (fold-rest-seq jolt-min2 x bs) (fold-left jolt-min2 x xs))))))
+(define jolt-max
+  (jolt-register-variadic! 1
+    (lambda (x . xs)
+      (let ((bs (boxed-rest-seq xs)))
+        (if bs (fold-rest-seq jolt-max2 x bs) (fold-left jolt-max2 x xs))))))
 ;; variadic comparison chains for value position ((apply < xs)).
 (define (jolt-cmp-chain op2)
-  (lambda (x . xs)
-    (let loop ((a x) (rest xs))
-      (cond ((null? rest) #t)
-            ((op2 a (car rest)) (loop (car rest) (cdr rest)))
-            (else #f)))))
+  (jolt-register-variadic! 1
+    (lambda (x . xs)
+      (let ((bs (boxed-rest-seq xs)))
+        (if bs
+            ;; short-circuits on the first false, so an unbounded seq that stops
+            ;; comparing stops walking — and one that never does still runs flat.
+            (let loop ((a x) (s (jolt-seq bs)))
+              (cond ((jolt-nil? s) #t)
+                    ((op2 a (seq-first s)) (loop (seq-first s) (jolt-seq (seq-more s))))
+                    (else #f)))
+            (let loop ((a x) (rest xs))
+              (cond ((null? rest) #t)
+                    ((op2 a (car rest)) (loop (car rest) (cdr rest)))
+                    (else #f))))))))
 (define jolt-lt (jolt-cmp-chain jolt-lt2))
 (define jolt-gt (jolt-cmp-chain jolt-gt2))
 (define jolt-le (jolt-cmp-chain jolt-le2))

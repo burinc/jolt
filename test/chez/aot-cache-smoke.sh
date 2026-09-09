@@ -651,6 +651,43 @@ else
 fi
 rm -rf "$cache_v"
 
+# (w) A live VALUE a macro put in its expansion has to survive the fasl. jolt
+# rebuilds one as CODE rather than stashing it in a process-local table
+# (jolt-l7tq), and a table would be invisible here — the cold run would work and
+# the warm one would load a .so referring to an index nothing filled. So this
+# asserts the WARM run, off the fasl, still answers: a named fn read back
+# through its var, and an anonymous literal rebuilt from its source form and its
+# captured value.
+elib="$(mktemp -d)"; mkdir -p "$elib/src/elib"
+printf '{:paths ["src"]}\n' > "$elib/deps.edn"
+cat > "$elib/src/elib/core.clj" <<'CLJ'
+(ns elib.core)
+(defmacro named-fn [] (deref #'clojure.core/memfn))
+(defn mk-adder [n] (fn [x] (+ x n)))
+(defmacro anon-fn [] (mk-adder 7))
+(def a (named-fn))
+(def b (anon-fn))
+CLJ
+erun() {
+  JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_e" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'elib/elib {:local/root \"$elib\"}}})
+    (require 'elib.core)
+    (println :embedded (fn? elib.core/a) (elib.core/b 35))" 2>&1
+}
+cache_e="$(mktemp -d)"
+e_cold="$(erun || true)"
+e_warm="$(erun || true)"
+if echo "$e_cold" | grep -q ':embedded true 42' \
+   && echo "$e_warm" | grep -q ':embedded true 42' \
+   && echo "$e_warm" | grep -q 'hit elib.core'; then
+  echo "PASS: (w) an embedded live value round-trips through the fasl"; pass=$((pass+1))
+else
+  echo "FAIL: (w) cold=$(echo "$e_cold" | grep -c ':embedded true 42') warm=$(echo "$e_warm" | grep -c ':embedded true 42') hit=$(echo "$e_warm" | grep -c 'hit elib.core')"
+  echo "$e_warm" | tail -4 | sed 's/^/    /'
+  fails=$((fails+1))
+fi
+rm -rf "$cache_e" "$elib"
+
 # Phase 4 (cold-vs-warm speedup) lives in aot-cache-perf.sh — a timing
 # measurement doesn't belong in this deterministic correctness gate.
 

@@ -56,7 +56,7 @@ portable threshold.
 | `transients` | bulk map/set building through the transient write path (`into`, `assoc!`/`conj!`, `dissoc!`/`disj!`, `zipmap`/`frequencies`/`group-by`), with a transient vector build as the control | editable-HAMT transient nodes, `persistent!` spine freeze | — |
 | `keyed-lookup` | scalar KEYS: hashing/comparing keywords, symbols and strings, and looking them up in SMALL maps; a symbol built per lookup, and a collection or keyword-local in head position | hash engine fast paths (`jolt-hasheq`/`jolt=2`), `symbol-t` khash, `jolt-invokeN` lookup shapes | honeysql `format-dsl` |
 | `hash-eq` | composite KEYS AND VALUES: repeat-hashing vectors/maps/sets/records/seqs, vector- record- and fn-keyed map and set lookups, and `=` on equal and unequal collections | per-instance hasheq caches, collection/record probes ahead of the eq and hash arm walks, hash fast-reject in `jolt-coll=?`, procedure identity hash | instaparse GLL msg-cache, honeysql |
-| `literals` | fixed per-call overhead in a library's inner fn: constant map/vector/set literals in the body (incl. quoted symbols), and `true?`/`false?`/`boolean?`/`identical?` | per-site constant hoisting (`hoist-const-per-site`), identity-based boolean predicates, inlined `identical?` | honeysql `format` loop |
+| `literals` | fixed per-call overhead in a library's inner fn: constant map/vector/set literals in the body (incl. quoted symbols), and `true?`/`false?`/`boolean?`/`identical?` | constant hoisting — per site for a collection literal, per source FORM for a quoted one (`hoist-const-for`, keyed like `Compiler.registerConstant`'s `IdentityHashMap`) — identity-based boolean predicates, inlined `identical?` | honeysql `format` loop |
 | `string-build` | `StringBuilder` appended to in a loop, and the transducer-over-`join` shape libraries render text with | proven-StringBuilder direct emission vs jhost method-table dispatch | honeysql `format-entity` |
 | `string-ops` | the ordinary String surface — `.indexOf`/`.startsWith`/`.substring`/`.toLowerCase` on hinted and inference-proven targets, `clojure.string` over already-string arguments, `.getName`/`.getNamespace` on a keyword | direct emission for proven-string and proven-keyword interop targets, `clojure.string/to-str` string fast path | honeysql, clojure.string |
 | `char-scan` | walking a string one code point at a time via `.charAt`, with the `int`/`long`/`unchecked-*` casts hinted Clojure puts around it, incl. a `case`-dispatched character state machine | numeric cast fast paths, `.charAt` on a proven string, `case` over small ints | honeysql `alphanumeric?` |
@@ -804,6 +804,100 @@ Linux, Intel i5-4278U): boot ~274ms, dispatch ~2ms, compile ~971ms for 400
 defns, run ~62ms for a 30M-iter loop — compilation is the dominant per-program
 cost, more so than on the previous M-series host (boot ~110ms, dispatch ~1ms,
 compile ~400ms, run ~120ms), which is not directly comparable to this row.
+
+## Compile throughput
+
+The rows above measure a program RUNNING. This one is jolt compiling, which is
+its own axis and had no numbers until 2026-09 — which is how a 14x per-form
+regression shipped through a green `make test` (see `test/compile_scaling_test.clj`).
+
+Two shapes, because they fail independently. Many small top-level forms is what
+an ordinary namespace is; many forms inside ONE top-level form is what a large
+`deftest` is, and it is where the cost concentrates: Chez's compile is quadratic
+in the size of one lexical scope, and jolt hands it a def's whole constant pool
+as one wrapping `let*`.
+
+| shape | jolt | Clojure 1.12.4 |
+|---|---|---|
+| 1000 small top-level forms (6001 lines) | 10.9s | 0.96s |
+| 500 `deftest` + `is`, separate forms | 1.7s | — |
+| 800 `is` inside ONE `deftest` | 4.9s | 0.19s |
+| `malli.core-test` (3699 lines, one 1837-line `deftest`) | 16.9s / 1.5GB | 1.3s |
+
+Those are LOAD times. malli's *run* phase is a different problem and not a
+compile one. `validation-test` abandons a non-terminating `(apply max (range))`
+after a 100ms timeout, and that exposed two things:
+
+| | before | after |
+|---|---|---|
+| peak RSS, `malli.core-test` | 27.9 GB | **1.74 GB** |
+| `(apply max (range))`, 12s | 2553 MB climbing | flat (JVM: 58-318 MB sawtooth) |
+
+`apply` handed a registered variadic a lazy rest but fell back to `seq->list`
+for the natives behind `+ - * / min max` and the comparison chains, so an
+unbounded argument seq was realized until the process died. Fixed, and gated by
+`make applyscaling`.
+
+The *time* is still ~8x, and that is a separate and more general problem
+(jolt-ugdf): one extra live thread — even one that only sleeps — takes a
+collection from 0.032 ms to 5.327 ms, so any background allocation collapses
+throughput. The JVM shows no such effect.
+
+Measured 2026-09-08, aarch64 macOS, cold (`JOLT_AOT_CACHE=0`). `malli.core-test`
+was **154s / 5.3GB** before the constant pool was keyed by form identity the way
+`Compiler.registerConstant` keys its `IdentityHashMap`; halving a pool quarters a
+quadratic term.
+
+Where the time goes, for the 1000-small-forms row (cumulative over the run):
+
+| | | |
+|---|---|---|
+| Chez generating native code | 5.7s | 51% |
+| jolt emit | 2.2s | 20% |
+| jolt analyze | 1.3s | 12% |
+| jolt passes | 0.5s | 4% |
+| require pre-scan | 0.006s | — |
+
+**The largest single difference from the reference is that Clojure does not
+generate native code here.** `Compiler.eval` builds bytecode with ASM and hands
+it to the JVM, which interprets it and JITs only what turns out to be hot; jolt
+asks Chez for optimized native code for every form at load. Chez's
+`optimize-level 0` does not help (5.87s against 5.82s), so it is code generation
+itself and not the optimizer.
+
+Two suspects that measurement RULES OUT. The text round trip is not the problem —
+reading the whole 8.5MB back is 0.12s of the 5.7s. And the require pre-scan, which
+has no counterpart in the reference, is 6ms.
+
+What is left is that jolt's own front end — 4.0s for these 1000 forms — is
+roughly four times Clojure's entire pipeline for the same file (0.96s). So even
+with Chez's half free, this row would still be ~4x.
+
+What is left is jolt-wt6v, and it is not the easy win it first looked like.
+Moving that def's 3214 constant bindings out of the `let*` and into top-level
+defines — what the reference does, since a constant there is a static field
+(`ObjExpr.emitConstant` → `getstatic`) with no lexical scope and no live range —
+was implemented and measured:
+
+| | `let*` (today) | top-level defines |
+|---|---|---|
+| `malli.core-test` | 16.9s | 12.8s |
+| 800 `is` in one `deftest` | 4.9s | 3.9s |
+| 1000 small top-level forms | 10.9s | **14.2s** |
+
+So it is 1.25–1.3x on a big constant pool and a ~30% REGRESSION on ordinary
+namespaces, which have small ones — Chez handles a small lexical scope better
+than the equivalent top-level defines, and only the large scope is quadratic
+(measured directly: 1500 bindings is 0.27s as a `let*` against 0.33s as defines,
+and 12000 is 6.72s against 3.00s). Shipping it needs a size threshold, and the
+threshold has to be decided BEFORE the constants are named, because a hoisted
+name has to be unique across namespaces and that salt is what the small-pool
+case is paying for.
+
+`make compilescaling` guards both halves as ratios inside one process: 1x vs 4x
+input for the complexity class, and quoted-vs-constructed for the per-form
+constant. A ratio does not care how fast the machine is, which an absolute
+ms/form ceiling would.
 
 ## A/B against a change
 

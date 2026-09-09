@@ -412,10 +412,12 @@
    ;; core/error/transform/generator-test. It went unnoticed while jolt matched
    ;; :bb, because malli.sci's :bb branch swaps the whole evaluator for
    ;; load-string. This is jolt's own vendored sci, the copy `make sci` and
-   ;; `make scifunctional` gate, rather than the Maven artifact malli names:
-   ;; sci 0.12.51 does not load here (jolt-l7tq) — its copy-var splices the
-   ;; dereffed value of a MACRO var straight into the emitted form, and a raw
-   ;; procedure is not a form jolt's analyzer takes.
+   ;; `make scifunctional` gate, rather than the 0.12.51 malli's deps.edn names.
+   ;; That version did not load here at all until jolt-l7tq (its copy-var splices
+   ;; a macro var's dereffed value into the emitted form; sci changed this
+   ;; upstream in #1028, and the vendored copy postdates that). It loads now —
+   ;; the reason to keep the vendored one is runtime, not correctness: this row
+   ;; already needs 2400s, and 0.12.51 ran past it.
    :local-deps ["~time" "!vendor/sci"]
    ;; malli's own deps, from the upstream deps.edn; jolt resolves the source out
    ;; of the Maven jars.
@@ -469,9 +471,18 @@
    ;; values here than on the JVM is the same family as test.check's :tolerance,
    ;; not a malli bug.
    ;;
-   ;; This is the heaviest row in the gate by a wide margin — ~15GB RSS and ~30
-   ;; CPU-minutes now that it runs the whole assertion set with m/eval live,
-   ;; which is why :timeout is 2400 and why the runner passes JOLT_MAX_HEAP=off.
+   ;; The heaviest row in the gate, and the cost is jolt's, not the assertion
+   ;; count. malli.core-test's validation-test deliberately abandons a
+   ;; non-terminating (apply max (range)) after a 100ms timeout; interrupt does
+   ;; not stop a compute loop on the JVM either, so the thread runs on in both.
+   ;; Two jolt problems came out of that:
+   ;;   - apply materialized an unbounded rest instead of streaming it, so the
+   ;;     abandoned thread grew the heap without bound. FIXED — peak RSS for this
+   ;;     row went 27.9GB -> 1.74GB, which is what JOLT_MAX_HEAP=off was covering.
+   ;;   - one extra live thread makes every collection ~166x more expensive
+   ;;     (jolt-ugdf), so the abandoned thread still costs ~8x wall time here.
+   ;;     That is what :timeout 2400 is paying for now, and it should come down
+   ;;     when jolt-ugdf does.
    :expect {:tests 219 :pass 13261 :fail 28 :error 10 :load-fail 1}}
 
   ;; ---------------------------------------------------------- web

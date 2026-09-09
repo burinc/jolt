@@ -157,6 +157,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A live value a macro puts in the form it returns compiles.** Clojure's
+  compiler falls through to `ConstantExpr` for anything it does not recognize,
+  so `(defmacro m [] (fn [x] (inc x)))` works there — AOT included, verified on
+  the 1.12.5 oracle — and jolt answered `Unsupported form` at a line the user
+  never wrote. sci is where it turned up: its `copy-var` used to splice a macro
+  var's root, so `org.babashka/sci` 0.12.51 — the version malli's own `deps.edn`
+  names — would not load here at all. sci changed that upstream in #1028, so
+  current versions are unaffected and older pins were the ones stuck.
+
+  jolt compiles to Scheme text, so it cannot spell the value — it has to rebuild
+  it. Which is the question the image writer already answers, so the compiler
+  reads that same verdict (`image-proc-verdict`) rather than a second copy of
+  the rules: the image scan side, the image dump side and the compiler now agree
+  by construction about which fns can be rebuilt from source. A value that is
+  some var's root reads back through the var; a registered anonymous literal
+  rebuilds as `((fn* [free…] <recorded source>) <captured…>)`, the wrapper
+  parameters shadowing the outer names its body reads, analyzed in the namespace
+  it was compiled in because that is where its free symbols resolve. Both are
+  ordinary self-contained code, so an embedded value travels through the AOT
+  fasl and into a built binary — gated in both places, because a process-local
+  side table would satisfy every in-process check and then be empty in the app's
+  own image.
+
+  Two things still cannot be rebuilt, and they now say which they are instead of
+  sharing one message: a fn the runtime built rather than one written as a
+  literal in a namespace, and a fn whose source closes over a constant the
+  compiler folded into the code, leaving no capture to read it back from. That
+  is the same line the image draws.
+
 - **`seqable?` answers for a `deftype` or `reify` that declares `Seqable` or
   `Iterable`.** On the JVM `seqable?` is an `instance?` test over `Seqable` /
   `ISeq` / `Iterable` (plus arrays, `CharSequence` and `Map`); jolt built it out

@@ -1721,6 +1721,12 @@
 (load "host/chez/records-coll.ss")
 (load "host/chez/protocols.ss")
 (load "host/chez/records-dispatch.ss")
+;; Per-object identity, for the back end's constant pool. Here rather than in
+;; java/host-static-methods.ss (where System/identityHashCode lives) because the
+;; MINT compiles jolt-core before that file loads — the same load-order rule
+;; jolt.host/getenv follows, and the same failure if it is broken: the reference
+;; reads as a class static and the seed form raises where it is used.
+(def-var! "jolt.host" "identity-hash" (lambda (x) (->num (jolt-identity-hasheq x))))
 (load "host/chez/java/records-interop.ss")   ; exception hierarchy + instance-check taxonomy
 (load "host/chez/java/host-faults.ss")       ; a raw host fault caught = a typed throwable
 
