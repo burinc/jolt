@@ -479,10 +479,14 @@
    ;;   - apply materialized an unbounded rest instead of streaming it, so the
    ;;     abandoned thread grew the heap without bound. FIXED — peak RSS for this
    ;;     row went 27.9GB -> 1.74GB, which is what JOLT_MAX_HEAP=off was covering.
-   ;;   - one extra live thread makes every collection ~166x more expensive
-   ;;     (jolt-ugdf), so the abandoned thread still costs ~8x wall time here.
-   ;;     That is what :timeout 2400 is paying for now, and it should come down
-   ;;     when jolt-ugdf does.
+   ;;   - every lazy cell took a mutex once any thread had been forked, and a
+   ;;     Chez mutex is a finalized object the collector visits, so the abandoned
+   ;;     thread cost ~8x wall time here (jolt-ugdf). FIXED -- cells are claimed
+   ;;     by CAS now, and function-schema-test after validation-test is 2.3x
+   ;;     its solo time instead of 7.8x. The remainder is the thread's own
+   ;;     allocation (4.6x the collections, each stopping the world); the row
+   ;;     runs in ~4 minutes, and :timeout 2400 is headroom for a loaded CI
+   ;;     runner, not the expected cost.
    :expect {:tests 219 :pass 13261 :fail 28 :error 10 :load-fail 1}}
 
   ;; ---------------------------------------------------------- web
