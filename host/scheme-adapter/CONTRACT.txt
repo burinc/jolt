@@ -126,8 +126,12 @@ system
 # tolerates a fake); sa-real-time-ms may use any monotonic ms clock but never
 # a constant (callers stamp temp files with it); sa-total-memory-bytes may
 # approximate — callers only display it or subtract sa-bytes-allocated from
-# it; sa-max-memory-bytes may return a large constant (the JVM arm already
-# falls back to Long.MAX_VALUE semantics); sa-gc-install-ceiling! may answer
+# it; sa-max-memory-bytes is the heap's high-water mark since the last
+# sa-reset-max-memory-bytes! and may answer the current total (a target that
+# keeps no peak answers "now"), in which case sa-reset-max-memory-bytes! may
+# no-op; sa-gc-trip-bytes may answer 0 where no trip threshold exists (the
+# apply-scaling gate floors a footprint reading at it, and 0 is no floor);
+# sa-gc-install-ceiling! may answer
 # #f without installing anything, which leaves the heap unbounded as it was
 # before 0.8.5 — a target with no collection hook cannot enforce a ceiling,
 # and the caller then reports maxMemory as unbounded rather than promising a
@@ -141,6 +145,8 @@ sa-max-memory-bytes
 sa-real-time-ms
 sa-file-mtime-ms
 sa-gc-trip-bytes!
+sa-gc-trip-bytes
+sa-reset-max-memory-bytes!
 sa-gc-install-ceiling!
 #
 # tier: capability-introspect

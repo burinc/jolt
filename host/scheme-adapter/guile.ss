@@ -78,13 +78,15 @@
 ;;   sa-gc-max-generation   UNIMPLEMENTED  ?? Guile uses Boehm GC — no generations.
 ;;   sa-bytes-allocated     UNIMPLEMENTED  ?? (gc-stats) candidate; must verify field/shape.
 ;;   sa-total-memory-bytes  UNIMPLEMENTED  ?? (gc-stats) candidate; must verify.
-;;   sa-max-memory-bytes    UNIMPLEMENTED  Large constant permitted by contract.
+;;   sa-max-memory-bytes    UNIMPLEMENTED  The current total permitted by contract.
+;;   sa-reset-max-memory-bytes! UNIMPLEMENTED  No-op permitted when the above answers "now".
 ;;   sa-real-time-ms        UNIMPLEMENTED  ?? (get-internal-real-time) — must verify units;
 ;;                                        may use any monotonic ms clock, never a constant.
 ;;   sa-file-mtime-ms       UNIMPLEMENTED  Guile: (stat:mtim (stat path)) — posix; must
 ;;                                        verify unit (time object -> ms conversion).
 ;;   sa-gc-trip-bytes!      UNIMPLEMENTED  ?? Guile exposes no GC trip threshold; no-op
 ;;                                        candidate — must verify callers tolerate it.
+;;   sa-gc-trip-bytes       UNIMPLEMENTED  0 permitted by contract (no trip threshold).
 
 ;; ---------------------------------------------------------------------------
 ;; tier: capability-introspect
