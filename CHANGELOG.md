@@ -5,7 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.6] - 2026-09-09
+
+Reader conditionals no longer match `:bb`. 0.7.10 added it on the theory that a
+`:bb` branch solves the same non-JVM problems jolt has; measured across the
+libraries this repo gates it did the opposite — claxon would not load at all,
+malli ran with half its assertions gated away and `m/eval` stubbed — so the
+feature set is `{:jolt :clj :default}` again, and a project that wants its `:bb`
+branches read asks with `:jolt/features` (#893). Most of the rest came out of
+running real libraries under that: a live value a macro splices into its
+expansion compiles (sci 0.12.51 loads), `alter-meta!` reaches an `IReference`
+deftype (`defmacro` inside sci works), and lazy cells are claimed by
+compare-and-swap instead of a mutex per cell, which had made every collection
+~120x dearer the moment any thread existed. Also in this release: a non-daemon
+`Thread` keeps the process alive as on the JVM, `jolt build --boot small` for a
+binary a third smaller (#886), a boot image past Chez's LZ4 ceiling loads again
+(#889), the `java.nio.file.Files` surface reports NIO exceptions, and `format`
+rounds and reads flags the way `java.util.Formatter` does.
 
 ### Performance
 
@@ -639,6 +655,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `jolt.host/set-default-zone-provider!` (jolt-lang/time#16). Core is unchanged — `TZ` still wins,
   and a program without the library still gets UTC — but the recorded baselines
   live here, and they are reproducible off UTC now.
+
+### Internal
+
+- **The benchmark suite covers this release's performance changes and gates
+  startup.** New rows: `sorted-build`, `lazy-threads`, `apply-rest`,
+  `compile-forms`, a `format` phase in `printing`, and `startup` (a built
+  hello-world, whole process). `ci/bench-gate.sh` now times `startup` against
+  the previous release beside the AOT rows, so a boot-image change that slows
+  every program's start fails the release the way a codegen change would.
+  `bench/README.md` is one current-state table against the JVM.
 
 ## [0.8.5] - 2026-09-07
 
