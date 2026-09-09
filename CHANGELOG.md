@@ -120,6 +120,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Files.createFile` no longer truncates an existing file.** It opened with
+  create-or-truncate and returned the path, so calling it on a path that already
+  held data silently emptied it — the same failure #895 reported for
+  `Files.newOutputStream`, at a different entry point. It now takes the same
+  exclusive-create open and throws `FileAlreadyExistsException`.
+
+- **The rest of the `java.nio.file.Files` surface reports NIO exceptions.**
+  Only the output-open path had been translated. Elsewhere a Chez condition
+  escaped to jolt's generic fallback, which names failures with `java.io`
+  classes, or the operation answered without failing at all:
+  `Files.size` returned `0` for a missing path, `newInputStream` handed back a
+  stream for a directory that only threw on first read, and `createDirectories`
+  reported success when a plain file blocked the path. Reads, `size`,
+  `createDirectory`/`createDirectories`, `move`, `copy`, `delete`,
+  `newDirectoryStream`, `readSymbolicLink` and `getLastModifiedTime` now answer
+  `NoSuchFileException`, `FileAlreadyExistsException`, `NotDirectoryException`,
+  `NotLinkException`, `AccessDeniedException` or a `FileSystemException` reading
+  `<path>: <reason>`, matching `UnixException.translateToIOException`.
+
 - **A failed `Files.newOutputStream`/`Files.write` open reports the NIO class the
   JVM reports.** Only ENOENT and EEXIST were translated; every other errno let
   the underlying Chez condition escape, so opening a directory for output — or
