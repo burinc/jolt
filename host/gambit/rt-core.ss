@@ -229,17 +229,6 @@
 ;; Consumers therefore read the THROW-TIME snapshot (jolt-throw-sitep), and the
 ;; reporter validates it against the callsite table before splicing.
 (define (jolt-site! p) (set-virtual-register! jolt-vreg-site p))
-;; The line to report for the INNERMOST frame. Inside a catch clause that is the
-;; line the throw came from, snapshotted on the way in; else the pair stashed at
-;; the raise. Never the live vreg — it can be stale between throws.
-(define (jolt-throw-line)
-  (let ((c (virtual-register jolt-vreg-catch-line)))
-    (if (pair? c)
-        (let ((l (cdr c))) (and (fixnum? l) (fx>? l 0) l))
-        (let ((s (jolt-throw-sitep)))
-          (if (pair? s)
-              (let ((l (cdr s))) (and (fixnum? l) (fx>? l 0) l))
-              #f)))))
 ;; The site pair ('ns/fn' . line) of the innermost call at the throw — the
 ;; catch-line snapshot when a handler is running, else the raise-time stash.
 ;; #f when unset. The reporter must validate this against the callsite table
@@ -851,10 +840,6 @@
           (readable? (string-append "#object[" cls " \"" (jolt-str-escape content) "\"]"))
           (else (string-append "#object[" cls " " content "]")))))
 
-;; readable? reaches only the #object[…] fallback: every other branch renders the
-;; same either way, and the readable printer handles the types that differ (string
-;; quoting, ##Inf) before it delegates here.
-(define (jolt-pr-str-base x) (jolt-pr-str-base/readable x #f))
 (define (jolt-pr-str-base/readable x readable?)
   (cond
     ((jolt-nil? x) "nil")
