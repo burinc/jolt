@@ -3349,9 +3349,24 @@
         (let [v (fresh-label "_dv$")]
           (str "(begin" freg " (let ((" v " (def-var-plain! " (chez-str-lit ns) " " (chez-str-lit nm) " " init ")))" creg " " v "))"))))))
 
-(defn emit-top-form [node]
+;; FNSRC-DEF names the enclosing top-level def for a node that does not carry the
+;; name itself. A macro's expander reaches the image emitter as a BARE fn form —
+;; ce-defmacro->fn has already split the name off — so the caller supplies it
+;; here; otherwise every macro in a namespace registers its anon fns under
+;; jfn$<ns>$$<n> with the counter restarting per form, and siblings collide.
+(defn emit-top-form
+  ([node] (emit-top-form node nil))
+  ([node fnsrc-def]
   (binding [*fnsrc-ns* (or (:ns node) (:fnsrc-ns node))
-            *fnsrc-def* (when (= :def (:op node)) (:name node))
+            ;; :defmacro too, not just :def. Without it every defmacro in a
+            ;; namespace emits its expander under jfn$<ns>$$<n> with the counter
+            ;; restarting per top-level form, so sibling macros all claim
+            ;; jfn$<ns>$$0 — last registration wins, and an image dump of a
+            ;; closure over an earlier macro's expander restores a different
+            ;; macro's source. A defmacro node carries :name exactly as :def
+            ;; does, so naming it is all that is needed.
+            *fnsrc-def* (or (when (#{:def :defmacro} (:op node)) (:name node))
+                            fnsrc-def)
             *fnsrc-counter* (atom 0)
             *fnsrc-regs* (atom [])]
     (let [scm (cond
@@ -3376,4 +3391,4 @@
           ;; dependency on the form's evaluation, and the form itself may dump a
           ;; closure it just created — the registration must already be there.
           ;; begin keeps the form's value as the result.
-        :else (str "(begin" freg " " scm ")")))))
+        :else (str "(begin" freg " " scm ")"))))))
