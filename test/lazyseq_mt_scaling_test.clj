@@ -19,16 +19,17 @@
 ;;
 ;;   SCALING — one workload, timed before any thread exists and again after one
 ;;   has existed, in ONE process. The ratio is the judge: the per-cell mutex
-;;   design measures ~3 (the second arm is all collector), the pooled design ~1.
+;;   design measures ~5 (the second arm is mostly collector), the claim ~1.5.
 ;;   Only the ratio is read, so machine speed and load do not matter.
 
 (ns lazyseq-mt-scaling-test)
 
 (def ^:private walkers 8)
 (def ^:private n 20000)
-;; Pooled measures near 1 and per-cell mutexes near 3; the line sits between
-;; them with room for collector noise on a loaded machine.
-(def ^:private max-ratio 1.6)
+;; The claim design measures ~1.5 (the release fence and the counted claim on
+;; every first force) and a mutex per cell ~5; the line sits well above the
+;; first with room for a loaded CI runner, and well below the failure it guards.
+(def ^:private max-ratio 2.5)
 
 (defn- fail [msg]
   (println (str "FAIL lazyseq-mt-scaling: " msg))
