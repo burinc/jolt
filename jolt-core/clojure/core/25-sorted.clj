@@ -95,13 +95,22 @@
     (mk-red (nd-key parent) (nd-val parent) (nd-left parent) ins)
     (ins-balance-right ins parent)))
 
-;; insert k/v into tree, assuming k is NOT already present (the caller checks).
-(defn- tree-ins [cmp tree k v]
+;; insert k/v into tree in ONE walk: the new tree, or nil when k is already
+;; present, with that node left in the `found` volatile (PersistentTreeMap.add
+;; answers null and fills its found box the same way). The callers used to look
+;; the key up first and then insert, which walked the tree twice for every fresh
+;; key -- twice the comparator calls of the reference, measured exactly (24602
+;; against 12301 for 1024 ascending keys); the corpus pins the count now.
+(defn- tree-ins [cmp tree k v found]
   (if (nil? tree)
     (mk-red k v nil nil)
-    (if (neg? (cmp k (nd-key tree)))
-      (add-left tree (tree-ins cmp (nd-left tree) k v))
-      (add-right tree (tree-ins cmp (nd-right tree) k v)))))
+    (let [c (cmp k (nd-key tree))]
+      (cond
+        (zero? c) (do (vreset! found tree) nil)
+        (neg? c) (let [ins (tree-ins cmp (nd-left tree) k v found)]
+                   (if (nil? ins) nil (add-left tree ins)))
+        :else (let [ins (tree-ins cmp (nd-right tree) k v found)]
+                (if (nil? ins) nil (add-right tree ins)))))))
 
 ;; replace the value at an existing key, keeping the tree structure (and the
 ;; first-inserted key, like Clojure's PersistentTreeMap).
@@ -257,11 +266,14 @@
 
 (defn- sm-assoc-1 [sm k v]
   (let [cmp (the-cmp sm) tree (sfield sm :tree)
-        node (tree-lookup tree cmp k)]
-    (cond
-      (and node (= v (nd-val node))) sm
-      node (make-sorted :jolt/sorted-map (tree-replace cmp tree k v) (sfield sm :cnt) (sfield sm :cmp) (sfield sm :cmp-fn) (sfield sm :ops))
-      :else (make-sorted :jolt/sorted-map (blacken (tree-ins cmp tree k v)) (inc (sfield sm :cnt)) (sfield sm :cmp) (sfield sm :cmp-fn) (sfield sm :ops)))))
+        found (volatile! nil)
+        t (tree-ins cmp tree k v found)]
+    (if (nil? t)
+      ;; the key is present: keep its first-inserted key, replace the value
+      (if (= v (nd-val @found))
+        sm
+        (make-sorted :jolt/sorted-map (tree-replace cmp tree k v) (sfield sm :cnt) (sfield sm :cmp) (sfield sm :cmp-fn) (sfield sm :ops)))
+      (make-sorted :jolt/sorted-map (blacken t) (inc (sfield sm :cnt)) (sfield sm :cmp) (sfield sm :cmp-fn) (sfield sm :ops)))))
 
 (defn- sm-assoc-many [sm kvs]
   (let [n (count kvs)]
@@ -297,11 +309,15 @@
   (let [n (tree-lookup (sfield ss :tree) (the-cmp ss) x)]
     (if (nil? n) not-found (nd-key n))))
 
+;; One walk. PersistentTreeSet.cons walks twice (contains, then add), so a
+;; counting comparator sees fewer calls here than on the JVM; the set is not
+;; pinned in the corpus for that reason, the map is.
 (defn- ss-conj-1 [ss x]
-  (let [cmp (the-cmp ss) tree (sfield ss :tree)]
-    (if (tree-lookup tree cmp x)
+  (let [cmp (the-cmp ss) tree (sfield ss :tree)
+        t (tree-ins cmp tree x nil (volatile! nil))]
+    (if (nil? t)
       ss
-      (make-sorted :jolt/sorted-set (blacken (tree-ins cmp tree x nil)) (inc (sfield ss :cnt)) (sfield ss :cmp) (sfield ss :cmp-fn) (sfield ss :ops)))))
+      (make-sorted :jolt/sorted-set (blacken t) (inc (sfield ss :cnt)) (sfield ss :cmp) (sfield ss :cmp-fn) (sfield ss :ops)))))
 
 (defn- ss-conj-many [ss xs] (reduce ss-conj-1 ss xs))
 

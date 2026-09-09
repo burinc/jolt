@@ -28,6 +28,10 @@
 ;;                                        current values); Guile's SRFI-39 parameters
 ;;                                        default fresh per thread — inheritance must be
 ;;                                        reproduced explicitly, like the host relies on.
+;;   memory-order-acquire   UNIMPLEMENTED  Guile: no-op when threads share no memory,
+;;                                        else a fence; seq.ss publishes a forced
+;;                                        tail behind memory-order-release.
+;;   memory-order-release   UNIMPLEMENTED  (see memory-order-acquire)
 ;;   make-mutex             UNIMPLEMENTED  Guile: SRFI-18 make-mutex.
 ;;   mutex-acquire          UNIMPLEMENTED  Guile: (rnrs) mutex-acquire (SRFI-18 mutex-lock!).
 ;;                                        must verify: contract pins NON-RECURSIVE mutexes
@@ -74,13 +78,15 @@
 ;;   sa-gc-max-generation   UNIMPLEMENTED  ?? Guile uses Boehm GC — no generations.
 ;;   sa-bytes-allocated     UNIMPLEMENTED  ?? (gc-stats) candidate; must verify field/shape.
 ;;   sa-total-memory-bytes  UNIMPLEMENTED  ?? (gc-stats) candidate; must verify.
-;;   sa-max-memory-bytes    UNIMPLEMENTED  Large constant permitted by contract.
+;;   sa-max-memory-bytes    UNIMPLEMENTED  The current total permitted by contract.
+;;   sa-reset-max-memory-bytes! UNIMPLEMENTED  No-op permitted when the above answers "now".
 ;;   sa-real-time-ms        UNIMPLEMENTED  ?? (get-internal-real-time) — must verify units;
 ;;                                        may use any monotonic ms clock, never a constant.
 ;;   sa-file-mtime-ms       UNIMPLEMENTED  Guile: (stat:mtim (stat path)) — posix; must
 ;;                                        verify unit (time object -> ms conversion).
 ;;   sa-gc-trip-bytes!      UNIMPLEMENTED  ?? Guile exposes no GC trip threshold; no-op
 ;;                                        candidate — must verify callers tolerate it.
+;;   sa-gc-trip-bytes       UNIMPLEMENTED  0 permitted by contract (no trip threshold).
 
 ;; ---------------------------------------------------------------------------
 ;; tier: capability-introspect

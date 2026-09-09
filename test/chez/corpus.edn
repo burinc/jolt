@@ -432,6 +432,11 @@
   {:suite "interop / MapEntry" :label "MapEntry/create makes an entry" :expected "[:a 1]" :actual "(clojure.lang.MapEntry/create :a 1)" :portability :jvm}
   {:suite "interop / Thread" :label "Thread with no target" :expected "[false nil nil]" :actual "(let [t (Thread.)] [(.isAlive t) (.run t) (do (.start t) (.join t) nil)])" :portability :jvm}
   {:suite "interop / Thread" :label "class of a Thread instance" :expected "java.lang.Thread" :actual "(class (Thread.))" :portability :jvm}
+  {:suite "interop / Thread" :label "a new Thread is not a daemon" :expected "false" :actual "(.isDaemon (Thread. (fn [])))" :portability :jvm}
+  {:suite "interop / Thread" :label "setDaemon before start is honoured" :expected "true" :actual "(let [t (Thread. (fn []))] (.setDaemon t true) (.isDaemon t))" :portability :jvm}
+  {:suite "interop / Thread" :label "setDaemon on a live thread is refused" :expected "java.lang.IllegalThreadStateException" :actual "(let [p (promise) t (Thread. (fn [] @p))] (.start t) (try (.setDaemon t true) (catch Exception e (class e)) (finally (deliver p 1))))" :portability :jvm}
+  {:suite "interop / Thread" :label "setDaemon on a finished thread is allowed" :expected "true" :actual "(let [t (Thread. (fn []))] (.start t) (.join t) (.setDaemon t true) (.isDaemon t))" :portability :jvm}
+  {:suite "interop / Thread" :label "a second start is refused" :expected "java.lang.IllegalThreadStateException" :actual "(let [t (Thread. (fn []))] (.start t) (.join t) (try (.start t) (catch Exception e (class e))))" :portability :jvm}
   {:suite "interop / Thread" :label "a Thread is a Runnable" :expected "true" :actual "(instance? java.lang.Runnable (Thread.))" :portability :jvm}
   ;; java.lang.ThreadLocal is per-thread storage, and the per-thread half is the
   ;; whole point: a value one thread stores must not be visible to another. jolt
@@ -4024,6 +4029,16 @@
   ;; 32-block, like the JVM.
   {:suite "chunking-model / realization granularity" :label "first over a chunked vector realizes the whole 32-block" :expected "32" :actual "(let [a (atom 0)] (first (map (fn [x] (swap! a inc) x) (vec (range 100)))) @a)" :portability :common}
   {:suite "chunking-model / realization granularity" :label "nth 0 over a chunked vector realizes the whole 32-block" :expected "32" :actual "(let [a (atom 0)] (nth (map (fn [x] (swap! a inc) x) (vec (range 100))) 0) @a)" :portability :common}
+  ;; keep / map-indexed / keep-indexed consume a chunk like their siblings map
+  ;; and filter: forcing the first element realizes the whole first 32-block.
+  {:suite "chunking-model / realization granularity" :label "first over keep of a chunked vector realizes the whole 32-block" :expected "32" :actual "(let [a (atom 0)] (first (keep (fn [x] (swap! a inc) x) (vec (range 100)))) @a)" :portability :common}
+  {:suite "chunking-model / realization granularity" :label "first over map-indexed of a chunked vector realizes the whole 32-block" :expected "32" :actual "(let [a (atom 0)] (first (map-indexed (fn [i x] (swap! a inc) x) (vec (range 100)))) @a)" :portability :common}
+  {:suite "chunking-model / realization granularity" :label "first over keep-indexed of a chunked vector realizes the whole 32-block" :expected "32" :actual "(let [a (atom 0)] (first (keep-indexed (fn [i x] (swap! a inc) x) (vec (range 100)))) @a)" :portability :common}
+  ;; --- sorted collections: one tree walk per insert, like PersistentTreeMap.add.
+  ;; The comparator call count is exact and deterministic for a given key order,
+  ;; so it pins both the walk count and the balancing algorithm to the reference.
+  {:suite "sorted / one walk per insert" :label "1024 ascending keys into a sorted-map-by count comparator calls like the reference" :expected "12301" :actual "(let [c (atom 0) cmp (fn [a b] (swap! c inc) (compare a b))] (into (sorted-map-by cmp) (map (fn [i] [i i]) (range 1024))) @c)" :portability :common}
+  {:suite "sorted / one walk per insert" :label "replacing values in a sorted-map-by counts like the reference" :expected "29414" :actual "(let [c (atom 0) cmp (fn [a b] (swap! c inc) (compare a b))] (into (sorted-map-by cmp) (map (fn [i] [(mod (* i 7919) 1024) i]) (range 2048))) @c)" :portability :common}
   ;; mapcat/dedupe stay lazier than the JVM at construction: jolt's (apply concat …)
   ;; and sequence transformer don't force the first chunk just to build the seq
   ;; (the JVM forces 5 here). Allowlisted in known-divergences.edn (jolt-mm6v).

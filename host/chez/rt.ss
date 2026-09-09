@@ -1157,6 +1157,11 @@
 (def-var! "jolt.host" "bytes-allocated"      (lambda () (sa-bytes-allocated)))
 (def-var! "jolt.host" "current-memory-bytes" (lambda () (sa-total-memory-bytes)))
 (def-var! "jolt.host" "maximum-memory-bytes" (lambda () (sa-max-memory-bytes)))
+;; Start the peak over from now, so the growth of one stretch of work reads as
+;; maximum minus the total at the reset; and the collector's trip threshold,
+;; which bounds how far work that holds nothing can raise the footprint.
+(def-var! "jolt.host" "reset-maximum-memory-bytes!" (lambda () (sa-reset-max-memory-bytes!) jolt-nil))
+(def-var! "jolt.host" "gc-trip-bytes" (lambda () (sa-gc-trip-bytes)))
 ;; The calling thread's id, so telemetry can be read per-thread. Wrapped in a lambda
 ;; so the get-thread-id reference resolves at CALL time: a non-threaded Chez build
 ;; lacks the binding, and only a caller that actually asks for a thread id should

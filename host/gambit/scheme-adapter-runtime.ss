@@ -44,6 +44,18 @@
 ;; Contract: perform a full collection. Degradation: may no-op — callers
 ;; already guard the call and the JVM semantic is only a hint. Gambit's
 ;; collector runs on its own schedule; no-op.
+;; sa-record-cas!: a record here is a vector with the type id in slot 0, so
+;; field i is slot i+1; the swap runs under one mutex because a green thread
+;; can be preempted between the read and the write.
+(define sa-record-cas-mu (make-mutex))
+(define (sa-record-cas! r i old new)
+  (jwm-call sa-record-cas-mu
+    (lambda ()
+      (let ((k (+ i 1)))
+        (if (eq? (vector-ref r k) old)
+            (begin (vector-set! r k new) #t)
+            #f)))))
+
 (define (sa-gc-collect)
   #f)
 
@@ -75,12 +87,20 @@
   9223372036854775807)
 
 ;; (sa-max-memory-bytes) -> exact integer
-;; Upper bound on the heap the runtime may use — the JVM's maxMemory, which
-;; jolt maps to Long/MAX_VALUE when the heap is unbounded. Contract: an upper
-;; bound on heap bytes. Degradation: a large constant is acceptable — the JVM
-;; arm already falls back to Long.MAX_VALUE semantics.
+;; Peak heap bytes since the last sa-reset-max-memory-bytes! -- the high-water
+;; mark behind jolt.host/maximum-memory-bytes (not the JVM's maxMemory, which
+;; is the heap ceiling). Contract: never below sa-total-memory-bytes.
+;; Degradation: the current total -- Gambit keeps no high-water mark, so this
+;; answers "now", which here is the same constant as the total.
 (define (sa-max-memory-bytes)
-  9223372036854775807)
+  (sa-total-memory-bytes))
+
+;; (sa-reset-max-memory-bytes!) -> void
+;; Start the high-water mark over. Contract: right after it, sa-max-memory-bytes
+;; answers the current total. Degradation: a no-op, which is exact here since
+;; sa-max-memory-bytes already answers the current total.
+(define (sa-reset-max-memory-bytes!)
+  #f)
 
 ;; (sa-gc-install-ceiling! soft hard on-exceeded) -> boolean
 ;; Permitted degradation: Gambit exposes no hook equivalent to Chez's
@@ -123,6 +143,13 @@
 ;; still happens on its own schedule.
 (define (sa-gc-trip-bytes! n)
   #f)
+
+;; (sa-gc-trip-bytes) -> exact integer
+;; The allocation threshold at which a trip collection triggers. Contract: the
+;; threshold in bytes. Degradation: 0 -- Gambit exposes no such threshold, so
+;; nothing is invisible by construction and a floor built on it is no floor.
+(define (sa-gc-trip-bytes)
+  0)
 
 ;; ---- R6: introspection tier (capability: introspect) -------------------------
 

@@ -83,11 +83,14 @@
     ;; immutable — (with-meta a-list m) returns a NEW list). Keying meta on the
     ;; original mutated it, so (with-meta xs {:k xs}) built a self-referential
     ;; cycle that loops *print-meta* printing.
-    ((cseq? x) (make-cseq (cseq-head x) (cseq-tail x) (cseq-forced? x)
-                          (cseq-kind x) (cseq-cvec x) (cseq-ci x) (cseq-crest x) (cseq-lock x)))
+    ;; The lock field is #f: it holds a mutex only while a force is in progress,
+    ;; borrowed for that cell alone (seq.ss force-claimed!), and the copy
+    ;; is a different cell.
+    ((cseq? x) (make-cseq (cseq-head x) (cseq-tail x) (cseq-forced-flag x)
+                          (cseq-kind x) (cseq-cvec x) (cseq-ci x) (cseq-crest x) #f))
     ((jolt-lazyseq? x) (make-jolt-lazyseq (jolt-lazyseq-thunk x) (jolt-lazyseq-val x)
-                                          (jolt-lazyseq-realized? x) (jolt-lazyseq-error? x)
-                                          (make-mutex)))
+                                          (jolt-lazyseq-realized-flag x) (jolt-lazyseq-error-flag x)
+                                          #f))
     (else x)))                          ; procedure
 
 ;; Obj.withMeta returns `this` when the metadata is unchanged, and the JVM

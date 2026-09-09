@@ -838,10 +838,17 @@ for the natives behind `+ - * / min max` and the comparison chains, so an
 unbounded argument seq was realized until the process died. Fixed, and gated by
 `make applyscaling`.
 
-The *time* is still ~8x, and that is a separate and more general problem
-(jolt-ugdf): one extra live thread — even one that only sleeps — takes a
-collection from 0.032 ms to 5.327 ms, so any background allocation collapses
-throughput. The JVM shows no such effect.
+The *time* was still ~8x, and that was a separate and more general problem
+(jolt-ugdf, since fixed): once any thread had been forked, every lazy cell took
+a per-cell mutex on every access, and a Chez mutex is a finalized object the
+collector visits, so one extra live thread — even one that only slept — took a
+collection from 0.032 ms to 5.327 ms. Lazy cells now publish one word and are
+claimed by compare-and-swap (`make lazyscaling`); on the same binary,
+`function-schema-test` after the abandoned thread is 44.9s → 101.5s where it was
+43.8s → 342.8s. What remains is that thread's own allocation: it runs
+`(apply max (range))` flat out on another core and forces 4.6x the collections
+(11564 against 2511), each of which stops the world. The JVM's collector
+absorbs that; Chez's does not.
 
 Measured 2026-09-08, aarch64 macOS, cold (`JOLT_AOT_CACHE=0`). `malli.core-test`
 was **154s / 5.3GB** before the constant pool was keyed by form identity the way

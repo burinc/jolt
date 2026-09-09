@@ -1293,6 +1293,8 @@
   {:suite "telemetry" :expr "(pos? (jolt.host/bytes-allocated))" :expected "true"}
   {:suite "telemetry" :expr "(pos? (jolt.host/current-memory-bytes))" :expected "true"}
   {:suite "telemetry" :expr "(>= (jolt.host/maximum-memory-bytes) (jolt.host/current-memory-bytes))" :expected "true"}
+  {:suite "telemetry" :label "reset starts the peak over from the current total (a stale high-water mark from the dropped vector would exceed it)" :expr "(do (count (vec (range 4000000))) (System/gc) (let [c (jolt.host/current-memory-bytes) _ (jolt.host/reset-maximum-memory-bytes!) m (jolt.host/maximum-memory-bytes)] (<= m (+ c (jolt.host/gc-trip-bytes)))))" :expected "true"}
+  {:suite "telemetry" :expr "(pos? (jolt.host/gc-trip-bytes))" :expected "true"}
   {:suite "telemetry" :expr "(>= (jolt.host/thread-id) 0)" :expected "true"}
   ;; Thread/join must honour its timeout: joining a thread that outlives the
   ;; timeout has to return, not block until the thread happens to finish.

@@ -1779,6 +1779,9 @@
                             "              (let ((jolt-main-result (apply jolt-invoke (var-cell-root maincell) args)))\n"
                             "                " (bld-startup-profile-form "entry -main") "\n"
                             "                jolt-main-result))))))\n"
+                            ;; as the CLI: a non-daemon Thread the program started
+                            ;; keeps the process alive until it finishes
+                            "    (jolt-await-user-threads!)\n"
                             "    (exit 0)))\n")))
           (close-port out))
         (ei-mark! "write flat.ss")
