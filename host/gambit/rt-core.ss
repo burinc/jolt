@@ -278,10 +278,23 @@
 (define jolt-fn-callees-table (make-hashtable string-hash string=?))
 (define (jolt-callsite-key fqn line)
   (string-append fqn ":" (number->string line)))
+;; Membership is answered by a companion index, not by scanning the list being
+;; built. jolt-tail-entries is keyed by CALLEE, so its list is every tail site
+;; that reaches one function: (member entry cur) made registering n of them cost
+;; O(n^2). Small today — a release build emits 5 registrations — but the cost is
+;; in the number of tail sites in the program, which is not a number to leave
+;; quadratic. The stored value stays a plain list; readers are unchanged.
+(define jolt-table-seen (make-eq-hashtable))          ; tbl -> {(key . entry) -> #t}
+(define (jolt-table-seen-for tbl)
+  (or (hashtable-ref jolt-table-seen tbl #f)
+      (let ((h (make-hashtable equal-hash equal?)))
+        (hashtable-set! jolt-table-seen tbl h)
+        h)))
 (define (jolt-table-add! tbl key entry)
-  (let ((cur (hashtable-ref tbl key '())))
-    (unless (member entry cur)
-      (hashtable-set! tbl key (cons entry cur)))))
+  (let ((seen (jolt-table-seen-for tbl)) (k (cons key entry)))
+    (unless (hashtable-ref seen k #f)
+      (hashtable-set! seen k #t)
+      (hashtable-set! tbl key (cons entry (hashtable-ref tbl key '()))))))
 (define (jolt-register-callsite! fqn line callee tail?)
   (jolt-table-add! jolt-callsite-table (jolt-callsite-key fqn line) callee)
   (jolt-table-add! jolt-fn-callees-table fqn callee)
