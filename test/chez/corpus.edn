@@ -4029,6 +4029,11 @@
   ;; 32-block, like the JVM.
   {:suite "chunking-model / realization granularity" :label "first over a chunked vector realizes the whole 32-block" :expected "32" :actual "(let [a (atom 0)] (first (map (fn [x] (swap! a inc) x) (vec (range 100)))) @a)" :portability :common}
   {:suite "chunking-model / realization granularity" :label "nth 0 over a chunked vector realizes the whole 32-block" :expected "32" :actual "(let [a (atom 0)] (nth (map (fn [x] (swap! a inc) x) (vec (range 100))) 0) @a)" :portability :common}
+  ;; keep / map-indexed / keep-indexed consume a chunk like their siblings map
+  ;; and filter: forcing the first element realizes the whole first 32-block.
+  {:suite "chunking-model / realization granularity" :label "first over keep of a chunked vector realizes the whole 32-block" :expected "32" :actual "(let [a (atom 0)] (first (keep (fn [x] (swap! a inc) x) (vec (range 100)))) @a)" :portability :common}
+  {:suite "chunking-model / realization granularity" :label "first over map-indexed of a chunked vector realizes the whole 32-block" :expected "32" :actual "(let [a (atom 0)] (first (map-indexed (fn [i x] (swap! a inc) x) (vec (range 100)))) @a)" :portability :common}
+  {:suite "chunking-model / realization granularity" :label "first over keep-indexed of a chunked vector realizes the whole 32-block" :expected "32" :actual "(let [a (atom 0)] (first (keep-indexed (fn [i x] (swap! a inc) x) (vec (range 100)))) @a)" :portability :common}
   ;; mapcat/dedupe stay lazier than the JVM at construction: jolt's (apply concat …)
   ;; and sequence transformer don't force the first chunk just to build the seq
   ;; (the JVM forces 5 here). Allowlisted in known-divergences.edn (jolt-mm6v).
