@@ -326,10 +326,19 @@
   (nio-fs-call fp (lambda () (open-file-input-port fp))))
 
 (define (nio-size fp)
-  (cond ((not (or (file-exists? fp) (nio-is-symlink? fp))) (nio-no-such-file fp))
-        ((file-directory? fp) 0)
-        (else (let ((port (nio-open-input-port fp)))
-                (let ((n (file-length port))) (close-port port) n)))))
+  (if (not (or (file-exists? fp) (nio-is-symlink? fp)))
+      (nio-no-such-file fp)
+      ;; A directory opens for reading and fstats fine even though READING one
+      ;; fails, and Files.size reports a directory's st_size like any other
+      ;; entry -- so open it directly here rather than through
+      ;; nio-open-input-port, which is the read path and refuses a directory
+      ;; exactly as the JVM's newInputStream does.
+      ;;
+      ;; Chez's file-length is fstat(2).st_size (S_get_fd_length in new-io.c),
+      ;; which is the number the JVM answers, so this needs none of the struct
+      ;; stat offsets below -- the fd carries the layout question for us.
+      (let ((port (nio-fs-call fp (lambda () (open-file-input-port fp)))))
+        (let ((n (file-length port))) (close-port port) n))))
 
 (define (nio-read-bv fp)
   (io-note-file-read! fp)          ; a compile-time read belongs in the AOT key (io.ss)
