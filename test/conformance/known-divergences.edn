@@ -197,6 +197,19 @@
            :jvm "\"true\""
            :jolt "\"false\""}
    :note "Same root as the row above, seen through a collection. Util.equiv tests reference identity before value, and the JVM compiler hands both lists the SAME boxed Double for the ##NaN constant, so the elements are identical and the lists compare equal — clojure.org/guides/equality documents this as a surprise rather than a rule, and the clojure-test-suite calls it undefined behavior. jolt compares element values, so it answers false, which is what (= ##NaN ##NaN) already says."}
+  ;; The shortest decimal digits of Double/MIN_VALUE. Java's FloatingDecimal
+  ;; prints the smallest denormal as 4.9E-324; Chez's free-format printer, which
+  ;; is what format and str read a flonum's digits from, prints 5e-324 -- both
+  ;; round-trip to the same double, so both are shortest, and only this one
+  ;; value (one significant bit) has two shortest spellings.
+  {:category :numeric-model
+   :behavior "(format \"%.2e\" 4.9e-324)"
+   :jvm "\"4.90e-324\""
+   :jolt "\"5.00e-324\""
+   :check {:expr "(format \"%.2e\" 4.9e-324)"
+           :jvm "\"4.90e-324\""
+           :jolt "\"5.00e-324\""}
+   :note "Only Double/MIN_VALUE: every other double has one shortest digit string and the two printers agree on it. format's %e/%f/%g round those digits half up exactly as java.util.Formatter does."}
   ;; ex-info's data map is unchecked here. ExceptionInfo's constructor takes an
   ;; IPersistentMap, so a non-map is a ClassCastException on the JVM; jolt stores
   ;; whatever it is handed and ex-data reads it back. A superset: portable code

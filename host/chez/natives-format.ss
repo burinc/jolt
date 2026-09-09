@@ -49,61 +49,183 @@
 ;; the JVM formats 123.045 as "123,045" under de. Bound rather than passed so
 ;; every directive path picks it up without threading an argument through.
 (define format-decimal-sep (make-parameter "."))
-;; %e: d.dddddde+xx, prec fraction digits (6 by default), the exponent at least
-;; two digits with a sign, like java.util.Formatter. Rounding is decimal: scale
-;; to prec+1 significant digits as an exact integer, so 9.9999995 carries into
-;; the next power of ten instead of printing 10.000000e+00.
-(define (fmt-sci x prec)
-  (let* ((neg (or (< x 0) (and (flonum? x) (eqv? x -0.0)))) (ax (abs (inexact x))))
-    (if (= ax 0.0)
-        (string-append (if neg "-" "") "0" (if (fx>? prec 0) (string-append (format-decimal-sep) (make-string prec #\0)) "") "e+00")
-        (let* ((e0 (exact (floor (log ax 10))))
-               ;; digits = round(ax / 10^(e0-prec)) as an exact integer; a carry past
-               ;; prec+1 digits bumps the exponent
-               (scale (lambda (e) (round (* (exact ax) (expt 10 (- prec e))))))
-               (d (scale e0))
-               (e (if (>= d (expt 10 (fx+ prec 1))) (+ e0 1) e0))
-               (d (if (eqv? e e0) d (scale e)))
-               (ds (number->string d))
-               (mant (if (fx>? prec 0)
-                         (string-append (substring ds 0 1) (format-decimal-sep) (substring ds 1 (string-length ds)))
-                         ds))
-               (es (number->string (abs e))))
-          (string-append (if neg "-" "") mant "e" (if (< e 0) "-" "+")
-                         (if (fx<? (string-length es) 2) (string-append "0" es) es))))))
-;; %g: prec significant digits (6 by default, a 0 reads as 1); fixed notation
-;; when the ROUNDED value is in [10^-4, 10^prec), scientific otherwise -- Java's
-;; rule, which is why (format "%.3g" 1234.5) is 1.23e+03 and 0.00001234 is
-;; 1.23400e-05. Fixed notation keeps prec significant digits, so the fraction
-;; width is prec minus the digits before the point.
-(define (fmt-general x prec)
-  (let* ((prec (if (fx=? prec 0) 1 prec)) (ax (abs (inexact x))))
-    (if (= ax 0.0)
-        (fmt-float x (fx- prec 1))
-        (let* ((sci (fmt-sci x (fx- prec 1)))
-               (epos (let loop ((i (fx- (string-length sci) 1))) (if (char=? (string-ref sci i) #\e) i (loop (fx- i 1)))))
-               (e (string->number (substring sci (fx+ epos 1) (string-length sci)))))
-          (if (and (>= e -4) (< e prec))
-              (fmt-float x (max 0 (fx- prec (fx+ e 1))))
-              sci)))))
-;; %e / %g take only a floating-point argument; an integer is
-;; IllegalFormatConversionException, as on the JVM.
-(define (fmt-floating d a f)
-  (cond ((jolt-nil? a) "null")
-        ((flonum? a) (f a))
-        (else (jolt-throw (jolt-host-throwable "java.util.IllegalFormatConversionException"
-                (string-append (string d) " != " (jolt-class-name a)))))))
-(define (fmt-float x prec)
-  (let* ((neg (< x 0)) (ax (abs x))
-         (scale (expt 10 prec))
-         (scaled (round (* (inexact ax) scale)))
-         (i (exact (truncate (/ scaled scale))))
-         (frac (exact (truncate (- scaled (* i scale))))))
-    (string-append (if neg "-" "")
-                   (number->string i)
-                   (if (fx>? prec 0)
-                       (string-append (format-decimal-sep) (pad-left (number->string frac) prec #\0))
-                       ""))))
+;; --- the decimal digits of a number ---------------------------------------------
+;; (num-digits x) -> (values digits expo) for a finite x >= 0: digits are the
+;; significant decimal digits with no leading or trailing zeros ("0" for zero),
+;; and x = 0.DIGITS x 10^expo. A flonum's digits are Chez's shortest round-trip
+;; print, which is the digit string java.util.Formatter rounds too: it formats
+;; from FloatingDecimal's digits, not from the binary value, so 1.005 rounds to
+;; 1.01 at two places where the binary value 1.00499… would round down, and
+;; (format "%.20f" 0.1) pads zeros rather than printing the expansion. A
+;; BigDecimal's digits are its unscaled value against its scale, exact.
+(define (str-index s c)
+  (let loop ((i 0))
+    (cond ((fx=? i (string-length s)) #f) ((char=? (string-ref s i) c) i) (else (loop (fx+ i 1))))))
+(define (digits-normalize raw expo)      ; drop leading zeros (each lowers expo) and trailing ones
+  (let lead ((i 0))
+    (if (and (fx<? i (string-length raw)) (char=? (string-ref raw i) #\0))
+        (lead (fx+ i 1))
+        (let trail ((j (string-length raw)))
+          (cond ((fx=? j i) (values "0" 1))
+                ((char=? (string-ref raw (fx- j 1)) #\0) (trail (fx- j 1)))
+                (else (values (substring raw i j) (- expo i))))))))
+(define (num-digits x)
+  (if (jbigdec? x)
+      (let ((u (number->string (abs (jbigdec-unscaled x)))))
+        (digits-normalize u (- (string-length u) (jbigdec-scale x))))
+      (let* ((s (number->string (inexact x)))   ; "123.45" | "1e100" | "1.5e-7" | "123456789.0"
+             ;; a denormal prints with its bit count after a bar ("1e-320|11"):
+             ;; cut there before splitting the exponent off
+             (bar (or (str-index s #\|) (string-length s)))
+             (s (substring s 0 bar))
+             (epos (or (str-index s #\e) (string-length s)))
+             (mant (substring s 0 epos))
+             (e10 (if (fx<? epos (string-length s))
+                      (string->number (substring s (fx+ epos 1) (string-length s)))
+                      0))
+             (dot (str-index mant #\.))
+             (int-part (if dot (substring mant 0 dot) mant))
+             (frac-part (if dot (substring mant (fx+ dot 1) (string-length mant)) "")))
+        (digits-normalize (string-append int-part frac-part) (+ e10 (string-length int-part))))))
+;; (digits-round digits n) -> (cons digits* carry?): the first n digits, rounded
+;; half up on the one after them -- java.util.Formatter's applyPrecision looks
+;; at exactly that one digit. carry? says the round went past the top digit
+;; (99.5 -> 100): digits* is then "1" and the caller's exponent grows by one.
+(define (digits-round digits n)
+  (let ((len (string-length digits)))
+    (cond
+      ((< n 0) (cons "" #f))
+      ((>= n len) (cons digits #f))
+      ((char<? (string-ref digits n) #\5) (cons (substring digits 0 n) #f))
+      (else
+       (let ((s (number->string (+ 1 (if (fx=? n 0) 0 (string->number (substring digits 0 n)))))))
+         (if (fx>? (string-length s) n) (cons "1" #t) (cons s #f)))))))
+;; the k-th digit (0-based from the top) of a digit string, 0 past either end
+(define (digit-at d k)
+  (if (and (fx>=? k 0) (fx<? k (string-length d))) (string-ref d k) #\0))
+;; %f: prec fraction digits. The digits kept are the expo integer ones plus prec.
+(define (fmt-fixed digits expo prec)
+  (let* ((r (digits-round digits (+ expo prec)))
+         (d (car r)) (expo (if (cdr r) (+ expo 1) expo))
+         (int (if (<= expo 0)
+                  "0"
+                  (let ((s (make-string expo)))
+                    (do ((k 0 (fx+ k 1))) ((fx=? k expo) s) (string-set! s k (digit-at d k))))))
+         (frac (let ((s (make-string prec)))
+                 (do ((i 0 (fx+ i 1))) ((fx=? i prec) s) (string-set! s i (digit-at d (+ expo i)))))))
+    (if (fx>? prec 0) (string-append int (format-decimal-sep) frac) int)))
+;; %e: d.dddddde+xx, prec fraction digits, the exponent at least two digits with
+;; a sign. prec+1 significant digits are kept.
+(define (fmt-sci digits expo prec)
+  (let* ((r (digits-round digits (fx+ prec 1)))
+         (d (car r)) (expo (if (cdr r) (+ expo 1) expo))
+         (e (- expo 1))
+         (frac (let ((s (make-string prec)))
+                 (do ((i 0 (fx+ i 1))) ((fx=? i prec) s) (string-set! s i (digit-at d (fx+ i 1))))))
+         (es (number->string (abs e))))
+    (string-append (string (digit-at d 0))
+                   (if (fx>? prec 0) (string-append (format-decimal-sep) frac) "")
+                   "e" (if (< e 0) "-" "+")
+                   (if (fx<? (string-length es) 2) (string-append "0" es) es))))
+;; %g: prec significant digits (a 0 reads as 1); fixed notation when the ROUNDED
+;; value is in [10^-4, 10^prec), scientific otherwise -- Java's rule, which is
+;; why (format "%.3g" 1234.5) is 1.23e+03 and 0.00001234 is 1.23400e-05. The
+;; digits are rounded once, here; the notation only lays them out.
+(define (fmt-general digits expo prec)
+  (let* ((prec (if (fx=? prec 0) 1 prec))
+         (r (digits-round digits prec))
+         (d (car r)) (expo (if (cdr r) (+ expo 1) expo))
+         (e (- expo 1)))
+    (if (and (>= e -4) (< e prec))
+        (fmt-fixed d expo (fx- prec (fx+ e 1)))
+        (fmt-sci d expo (fx- prec 1)))))
+;; digit grouping for the , flag: the integer part in threes, the fraction as is
+(define (fmt-group s)
+  (let* ((sep (format-decimal-sep))
+         (dot (str-index s (string-ref sep 0)))
+         (int (if dot (substring s 0 dot) s))
+         (rest (if dot (substring s dot (string-length s)) "")))
+    (let loop ((i (string-length int)) (acc '()))
+      (if (fx<=? i 3)
+          (apply string-append (substring int 0 i) (append acc (list rest)))
+          (loop (fx- i 3) (cons (string-append "," (substring int (fx- i 3) i)) acc))))))
+
+;; --- one conversion --------------------------------------------------------------
+;; A signed numeric conversion renders (vector neg? magnitude zero-pad?) and then
+;; shares the sign, the grouping and the padding with every other one: the sign
+;; is "-" (or "(…)" under the ( flag), "+" under +, " " under space; a 0 flag
+;; pads with zeros AFTER the sign, as the JVM does ("-0003.00", not "000-3.00");
+;; NaN and Infinity take the sign but never the zeros.
+(define (fmt-flag? flags c) (and (memv c flags) #t))
+(define (fmt-sign-pad neg? body flags width zero-ok?)
+  (let* ((prefix (cond (neg? (if (fmt-flag? flags #\() "(" "-"))
+                       ((fmt-flag? flags #\+) "+")
+                       ((fmt-flag? flags #\space) " ")
+                       (else "")))
+         (suffix (if (and neg? (fmt-flag? flags #\()) ")" ""))
+         (n (fx+ (string-length prefix) (fx+ (string-length body) (string-length suffix)))))
+    (cond ((or (not width) (fx>=? n width)) (string-append prefix body suffix))
+          ((fmt-flag? flags #\-) (string-append prefix body suffix (make-string (fx- width n) #\space)))
+          ((and zero-ok? (fmt-flag? flags #\0)) (string-append prefix (make-string (fx- width n) #\0) body suffix))
+          (else (string-append (make-string (fx- width n) #\space) prefix body suffix)))))
+;; pad to width: left-justify with spaces, else right-justify (zero-pad only
+;; where the caller says the conversion takes it)
+(define (fmt-pad s flags width zero-ok?)
+  (if (and width (fx<? (string-length s) width))
+      (let ((p (fx- width (string-length s))))
+        (cond ((fmt-flag? flags #\-) (string-append s (make-string p #\space)))
+              (else (string-append (make-string p (if (and zero-ok? (fmt-flag? flags #\0)) #\0 #\space)) s))))
+      s))
+(define (fmt-conversion-throw d a)
+  (jolt-throw (jolt-host-throwable "java.util.IllegalFormatConversionException"
+                                   (string-append (string d) " != " (jolt-class-name a)))))
+;; %d %x %X %o take an integer -- Byte through BigInteger on the JVM, never a
+;; Double or a Ratio (IllegalFormatConversionException there, so here too).
+(define (fmt-integer? a) (and (number? a) (exact? a) (integer? a)))
+;; %f %e %g take a Float, a Double or a BigDecimal; an integer or a ratio is the
+;; same refusal. NaN and the infinities print as the JVM prints them.
+(define (fmt-real d a flags width render)
+  (cond
+    ((jolt-nil? a) (fmt-pad "null" flags width #f))
+    ((flonum? a)
+     (cond ((nan? a) (fmt-sign-pad #f "NaN" flags width #f))
+           ((infinite? a) (fmt-sign-pad (< a 0) "Infinity" flags width #f))
+           (else (let-values (((ds ex) (num-digits (abs a))))
+                   (fmt-sign-pad (or (< a 0) (eqv? a -0.0)) (render ds ex) flags width #t)))))
+    ((jbigdec? a)
+     (let-values (((ds ex) (num-digits a)))
+       (fmt-sign-pad (< (jbigdec-unscaled a) 0) (render ds ex) flags width #t)))
+    (else (fmt-conversion-throw d a))))
+(define (fmt-directive d a flags width prec)
+  (let ((grouped (lambda (s) (if (fmt-flag? flags #\,) (fmt-group s) s)))
+        (up (lambda (f) (lambda (ds ex) (string-upcase (f ds ex))))))
+    (case d
+      ((#\d) (cond ((jolt-nil? a) (fmt-pad "null" flags width #f))
+                   ((fmt-integer? a) (fmt-sign-pad (< a 0) (grouped (number->string (abs a))) flags width #t))
+                   (else (fmt-conversion-throw d a))))
+      ((#\f) (fmt-real d a flags width (lambda (ds ex) (grouped (fmt-fixed ds ex (or prec 6))))))
+      ((#\e) (fmt-real d a flags width (lambda (ds ex) (fmt-sci ds ex (or prec 6)))))
+      ((#\E) (fmt-real d a flags width (up (lambda (ds ex) (fmt-sci ds ex (or prec 6))))))
+      ((#\g) (fmt-real d a flags width (lambda (ds ex) (grouped (fmt-general ds ex (or prec 6))))))
+      ((#\G) (fmt-real d a flags width (up (lambda (ds ex) (grouped (fmt-general ds ex (or prec 6)))))))
+      ((#\x #\X #\o)
+       (cond ((jolt-nil? a) (fmt-pad "null" flags width #f))
+             ((fmt-integer? a)
+              ;; Chez spells hex digits in upper case; %x is the lower-case conversion
+              (let ((s (fmt-radix a (if (char=? d #\o) 8 16))))
+                (fmt-pad (cond ((char=? d #\X) (string-upcase s))
+                               ((char=? d #\x) (string-downcase s))
+                               (else s))
+                         flags width #t)))
+             (else (fmt-conversion-throw d a))))
+      ((#\s) (fmt-pad (if (jolt-nil? a) "null" (jolt-str-render-one a)) flags width #f))
+      ((#\S) (fmt-pad (string-upcase (if (jolt-nil? a) "null" (jolt-str-render-one a))) flags width #f))
+      ((#\b) (fmt-pad (if (jolt-truthy? a) "true" "false") flags width #f))
+      ((#\c) (fmt-pad (fmt-numeric d a (lambda (n) (if (char? n) (string n) (string (integer->char (->long n))))))
+                      flags width #f))
+      (else (jolt-throw (jolt-host-throwable "java.util.UnknownFormatConversionException"
+                                             (string-append "Conversion = '" (string d) "'")))))))
+
 (define (jolt-format fmt . args)
   (let ((fmt (jolt-need-string fmt))
         (out (open-output-string)))
@@ -112,51 +234,25 @@
           (get-output-string out)
           (let ((c (string-ref fmt i)))
             (if (char=? c #\%)
-                ;; parse a directive: %[-][0][width][.prec]conv
-                (let scan ((j (fx+ i 1)) (left #f) (zero #f) (width #f) (prec #f) (seen-dot #f))
+                ;; parse a directive: %[flags][width][.prec]conv, the flags any of
+                ;; - # + space 0 , ( in any order (a 0 is a flag only ahead of the width)
+                (let scan ((j (fx+ i 1)) (flags '()) (width #f) (prec #f) (seen-dot #f))
                   (let ((d (string-ref fmt j)))
                     (cond
                       ((char=? d #\%) (write-char #\% out) (loop (fx+ j 1) as))
-                      ((and (not seen-dot) (not width) (char=? d #\-))
-                       (scan (fx+ j 1) #t zero width prec seen-dot))
-                      ((and (not seen-dot) (not width) (char=? d #\0))
-                       (scan (fx+ j 1) left #t width prec seen-dot))
-                      ((char=? d #\.) (scan (fx+ j 1) left zero width 0 #t))
+                      ((and (not seen-dot) (not width) (memv d '(#\- #\# #\+ #\space #\0 #\, #\()))
+                       (scan (fx+ j 1) (cons d flags) width prec seen-dot))
+                      ((char=? d #\.) (scan (fx+ j 1) flags width 0 #t))
                       ((and (char>=? d #\0) (char<=? d #\9))
                        (if seen-dot
-                           (scan (fx+ j 1) left zero width (fx+ (fx* (or prec 0) 10) (fx- (char->integer d) 48)) seen-dot)
-                           (scan (fx+ j 1) left zero (fx+ (fx* (or width 0) 10) (fx- (char->integer d) 48)) prec seen-dot)))
+                           (scan (fx+ j 1) flags width (fx+ (fx* (or prec 0) 10) (fx- (char->integer d) 48)) seen-dot)
+                           (scan (fx+ j 1) flags (fx+ (fx* (or width 0) 10) (fx- (char->integer d) 48)) prec seen-dot)))
+                      ;; %n: literal newline, consumes no argument
+                      ((char=? d #\n) (write-char #\newline out) (loop (fx+ j 1) as))
                       (else
-                       ;; %n: literal newline, consumes no argument
-                       (if (char=? d #\n)
-                           (begin (write-char #\newline out) (loop (fx+ j 1) as))
-                           (let* ((a (if (null? as) jolt-nil (car as)))
-                                  (rest (if (null? as) '() (cdr as)))
-                                  (s (case d
-                                       ((#\d) (fmt-numeric d a (lambda (n) (number->string (->long n)))))
-                                       ((#\s) (if (jolt-nil? a) "null" (jolt-str-render-one a)))
-                                       ((#\S) (string-upcase (if (jolt-nil? a) "null" (jolt-str-render-one a))))
-                                       ((#\f) (fmt-numeric d a (lambda (n) (fmt-float n (or prec 6)))))
-                                       ((#\e) (fmt-floating d a (lambda (n) (fmt-sci n (or prec 6)))))
-                                       ((#\E) (fmt-floating d a (lambda (n) (string-upcase (fmt-sci n (or prec 6))))))
-                                       ((#\g) (fmt-floating d a (lambda (n) (fmt-general n (or prec 6)))))
-                                       ((#\G) (fmt-floating d a (lambda (n) (string-upcase (fmt-general n (or prec 6))))))
-                                       ((#\x) (fmt-numeric d a (lambda (n) (string-downcase (fmt-radix n 16)))))
-                                       ((#\X) (fmt-numeric d a (lambda (n) (string-upcase (fmt-radix n 16)))))
-                                       ((#\o) (fmt-numeric d a (lambda (n) (fmt-radix n 8))))
-                                       ((#\b) (if (jolt-truthy? a) "true" "false"))
-                                       ((#\c) (fmt-numeric d a (lambda (n) (if (char? n) (string n)
-                                                                               (string (integer->char (->long n)))))))
-                                       (else (jolt-throw (jolt-host-throwable "java.util.UnknownFormatConversionException"
-                                                        (string-append "Conversion = '" (string d) "'"))))))
-                                  ;; pad to width: left-justify with spaces, else right-justify
-                                  ;; (zero-pad only a right-justified number).
-                                  (s (if (and width (fx<? (string-length s) width))
-                                         (let ((p (fx- width (string-length s))))
-                                           (if left (string-append s (make-string p #\space))
-                                               (string-append (make-string p (if (and zero (memv d '(#\d #\f #\x #\X #\o))) #\0 #\space)) s)))
-                                         s)))
-                             (display s out)
-                             (loop (fx+ j 1) rest)))))))
+                       (let ((a (if (null? as) jolt-nil (car as)))
+                             (rest (if (null? as) '() (cdr as))))
+                         (display (fmt-directive d a flags width prec) out)
+                         (loop (fx+ j 1) rest))))))
                 (begin (write-char c out) (loop (fx+ i 1) as))))))))
 (def-var! "clojure.core" "format" jolt-format)
