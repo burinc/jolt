@@ -1879,5 +1879,23 @@ check '(do (load-string "(set! *unchecked-math* true) :x") *unchecked-math*)' 'f
 check '(do (load-string "(set! *warn-on-reflection* true) :x") *warn-on-reflection*)' 'false'
 check '(do (load-string "(set! *assert* false) :x") *assert*)' 'true'
 
+# The runtime's own boot must not read as registry drift. A class registered
+# under BOTH its qualified and its simple name shares one member table, so a
+# fresh closure per spelling re-registers the member with a different value and
+# JOLT_DEBUG reports two sources fighting over one static — the diagnostic that
+# is supposed to find a library squatting on a host class. java.security.
+# SecureRandom, clojure.lang.RT/iter and a dead short-name java.nio.charset.
+# Charset block all did, so five such lines were there to be scrolled past in
+# every debug session (jolt#926). Nothing but the runtime is loaded here, so any
+# such line is the host disagreeing with itself.
+dbg_err="$(JOLT_DEBUG=1 $jolt -e '(do (Charset/forName "UTF-8") (java.security.SecureRandom/getInstance) (clojure.lang.RT/iter [1]) :ok)' 2>&1 >/dev/null)"
+if printf '%s' "$dbg_err" | grep -q 'registered twice with different values'; then
+  echo "  FAIL (no): the runtime's own boot reports registry drift"
+  echo "    got \`$(printf '%s' "$dbg_err" | grep 'registered twice with different values')\`"
+  fails=$((fails + 1))
+else
+  pass=$((pass + 1))
+fi
+
 echo "cli smoke: $pass passed, $fails failed"
 [ "$fails" -eq 0 ]
