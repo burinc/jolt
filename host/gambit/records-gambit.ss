@@ -2193,6 +2193,22 @@
   (let ((s (jolt-seq x)))
     (if (jolt-nil? s) '() (seq->list s))))
 
+(define (rd-iref-method name argc)
+  (cond
+    ((string=? name "addWatch")
+     (and (fx=? argc 2) jolt-add-watch))
+    ((string=? name "removeWatch")
+     (and (fx=? argc 1) jolt-remove-watch))
+    ((string=? name "getWatches")
+     (and (fx=? argc 0) jolt-get-watches))
+    ((string=? name "notifyWatches")
+     (and (fx=? argc 2) jolt-notify-watches))
+    ((string=? name "setValidator")
+     (and (fx=? argc 1) jolt-set-validator!))
+    ((string=? name "getValidator")
+     (and (fx=? argc 0) jolt-get-validator))
+    (else #f)))
+
 (define (record-method-dispatch-base obj method-name
          rest-args)
   (let ((rest (if (jolt-nil? rest-args)
@@ -2362,6 +2378,9 @@
           (jolt-symbol #f (jns-name obj)))
          ((string=? method-name "toString") (jns-name obj))
          (else (dispatch-miss obj method-name rest))))
+      ((and (jolt-iref-watchable? obj)
+            (rd-iref-method method-name (length rest))) =>
+       (lambda (f) (apply f obj rest)))
       ((var-cell? obj)
        (cond
          ((string=? method-name "ns") (intern-ns! (var-cell-ns obj)))
