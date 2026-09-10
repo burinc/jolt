@@ -1168,8 +1168,8 @@
 ;; the shared expand-spec + parse-libspec (loader.ss / ns.ss), matching the
 ;; loader's semantics exactly.
 ;; A libspec that only establishes an alias pulls nothing into the build. At
-;; runtime `require` interns the namespace without loading it (loader.ss
-;; ldr-load+register), so counting it as a dependency would emit the target into
+;; runtime `require` interns the namespace without loading it (ns.ss
+;; ns-load+register), so counting it as a dependency would emit the target into
 ;; the binary and run its top level — the opposite of what :as-alias asks for. The
 ;; alias itself is still replayed, by bld-scan-spec!. Mirrors clojure.core's
 ;; load-lib, which picks its loader with `need-ns (or as use)`.

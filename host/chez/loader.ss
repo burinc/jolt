@@ -804,12 +804,12 @@
 ;;
 ;; The requires are learned by RECORDING them during the compile that produced the
 ;; fasl, not by re-parsing ns forms: the loader funnels every require/use through
-;; ldr-load+register, so the record covers a top-level (require …) and a :require
-;; clause alike. They are written beside the fasl, in a sidecar named by the
-;; namespace's own hash alone — the one key derivable before its deps are known.
+;; ns-load+register (ns.ss), so the record covers a top-level (require …) and a
+;; :require clause alike. They are written beside the fasl, in a sidecar named by
+;; the namespace's own hash alone — the one key derivable before its deps are known.
 (define aot-dep-sink (make-thread-parameter #f))
 (define (aot-new-dep-sink) (vector '()))
-;; Called from ldr-load+register for every require target, whether or not the
+;; Called from the require/use load step for every target, whether or not the
 ;; target was already loaded — a dedup'd require is still a dependency.
 (define (aot-record-dep! name)
   (let ((sink (aot-dep-sink)))
@@ -1967,95 +1967,31 @@
 ;; kept under its old name for the build driver's callers.
 (define (expand-spec s) (expand-libspec s))
 
-;; --- require/use that LOAD ---------------------------------------------------
-;; Override the alias-only versions from natives-str.ss. Load each spec's target
-;; (no-op if baked/already loaded), THEN register its :as/:refer under the caller
-;; ns (chez-register-spec! reads the current ns, restored by load-namespace).
+;; --- the load step of require/use --------------------------------------------
+;; ns.ss owns `require`/`use`; what it cannot own is reading a namespace off the
+;; source roots, because it is loaded by runtimes that have no loader. So the
+;; body is there and the two steps only a loader can take are installed here.
 ;;
-;; keyword flags (clojure.core load-libs) are collected from the arg list before
-;; the libspecs: :reload forces the named libs past the dedup, :reload-all forces
-;; it off for the whole load (so transitively-required libs reload too), :verbose
-;; prints each load.
-(define (ldr-flag-names specs)
-  (let loop ((xs specs) (acc '()))
-    (cond ((null? xs) (reverse acc))
-          ((keyword? (car xs)) (loop (cdr xs) (cons (keyword-t-name (car xs)) acc)))
-          (else (loop (cdr xs) acc)))))
+;; ns-load-target! reads and initializes one already-expanded target. The dep is
+;; recorded BEFORE the load: a target already loaded is still a dependency of
+;; whoever is being compiled, and load-namespace* would dedup it away.
+(set-ns-load-target!
+  (lambda (target force-named?)
+    (aot-record-dep! target)
+    (load-namespace* target force-named?)))
 
-;; Load each expanded libspec's target (no-op if baked/already loaded), register
-;; its :as/:refer under the caller ns, and — for `use` (use? #t) — refer every
-;; public var when the spec has no :only/:refer filter. Target + opts both come
-;; from the shared parse-libspec (ns.ss): the single spec->target+opts parser
-;; routed through by loader-require / loader-use / chez-register-spec! /
-;; ce-scan-requires!.
-(define (ldr-load+register specs force-named? use?)
-  (for-each
-    (lambda (s0)
-      (for-each
-        (lambda (s)
-          (let* ((parsed (parse-libspec s))
-                 (target (and parsed (car parsed)))
-                 (opt-names (if parsed (map car (cdr parsed)) '()))
-                 ;; :as-alias establishes the alias WITHOUT loading the target — for
-                 ;; a namespace that may not exist yet, or exists only to qualify
-                 ;; keywords. clojure.core's load-lib picks the loader with
-                 ;; `need-ns (or as use)`, falling to (create-ns lib) when the spec
-                 ;; is :as-alias and neither — so a spec that also carries :as, or
-                 ;; that arrives through `use`, still loads.
-                 (alias-only? (and target
-                                   (member "as-alias" opt-names)
-                                   (not (member "as" opt-names))
-                                   (not use?))))
-            ;; record BEFORE loading: a target already loaded is still a
-            ;; dependency of whoever is being compiled, and load-namespace*
-            ;; would dedup it away. An alias-only spec loads nothing, so it is
-            ;; a dependency of nothing.
-            (when (and target (not alias-only?)) (aot-record-dep! target))
-            (cond
-              ((not target) #f)
-              (alias-only? (intern-ns! target))   ; create-ns, without loading
-              (else (load-namespace* target force-named?)))
-            (chez-register-spec! (chez-current-ns) s)
-            (when (and use? target
-                       (not (or (member "only" opt-names) (member "refer" opt-names))))
-              (chez-register-refer-all! (chez-current-ns) target)
-              ;; [ns :exclude [names]] — the excluded names stay OUT of the
-              ;; refer-all set (load-lib applies the same filter to its refer).
-              (let ((excl (assoc "exclude" (cdr parsed))))
-                (when excl
-                  (chez-register-refer-all-excludes!
-                    (chez-current-ns) target
-                    (map symbol-t-name (filter symbol-t? (seq->list (cdr excl))))))))))
-        (expand-spec s0)))
-    specs))
-
-(define (loader-require . specs)
-  (let* ((flags (ldr-flag-names specs))
-         (real (filter (lambda (s) (not (keyword? s))) specs))
-         (reload-all? (member "reload-all" flags))
-         (reload? (and (not reload-all?) (member "reload" flags)))
-         (verbose? (member "verbose" flags)))
-    (if reload-all?
-        (parameterize ((ldr-reload-all? #t) (ldr-verbose? verbose?))
-          (ldr-load+register real #f #f))
-        (parameterize ((ldr-verbose? verbose?))
-          (ldr-load+register real (and reload? #t) #f))))
-  jolt-nil)
-(def-var! "clojure.core" "require" loader-require)
-
-(define (loader-use . specs0)
-  (let* ((flags (ldr-flag-names specs0))
-         (real (filter (lambda (s) (not (keyword? s))) specs0))
-         (reload-all? (member "reload-all" flags))
-         (reload? (and (not reload-all?) (member "reload" flags)))
-         (verbose? (member "verbose" flags)))
-    (if reload-all?
-        (parameterize ((ldr-reload-all? #t) (ldr-verbose? verbose?))
-          (ldr-load+register real #f #t))
-        (parameterize ((ldr-verbose? verbose?))
-          (ldr-load+register real (and reload? #t) #t))))
-  jolt-nil)
-(def-var! "clojure.core" "use" loader-use)
+;; ns-with-load-opts interprets the keyword flags clojure.core's load-libs
+;; collects, once for the whole call: :reload forces the NAMED libs past the
+;; dedup, :reload-all forces it off for the whole load (so transitively-required
+;; libs reload too), :verbose prints each load.
+(set-ns-with-load-opts!
+  (lambda (flags k)
+    (let ((reload-all? (and (member "reload-all" flags) #t))
+          (verbose? (and (member "verbose" flags) #t)))
+      (if reload-all?
+          (parameterize ((ldr-reload-all? #t) (ldr-verbose? verbose?)) (k #f))
+          (parameterize ((ldr-verbose? verbose?))
+            (k (and (member "reload" flags) #t)))))))
 
 (def-var! "clojure.core" "load-file" jolt-load-file)
 
