@@ -1324,6 +1324,10 @@
 ;; this boot reads them back — no host interop), so definitions succeed.
 (define class-ctors-tbl (make-hashtable string-hash string=?))
 (define (register-class-ctor! tag ctor) (hashtable-set! class-ctors-tbl tag ctor))
+;; On Chez the two differ in whether the class is also recorded as one the host
+;; provides (java/host-static.ss); there is no such registry here, so a deftype's
+;; ctor takes the same write under the name protocols.ss calls.
+(define (class-ctor-set! tag ctor) (register-class-ctor! tag ctor))
 ;; register-class-methods! is what host-vars.ss binds clojure.core/__register-class-methods!
 ;; to. Without that binding the var is UNBOUND on this host, and jolt.socket and
 ;; the eight jolt.time namespaces call it at load — they could not load at all.

@@ -23,11 +23,24 @@
 (__register-class-statics! "java.security.KeyPairGenerator"
                            {"getInstance" (fn [algo] (str "squatter-kpg:" algo))})
 
-;; ...and two undeclared registrations that read differently to the diagnostic
+;; ...and undeclared registrations that read differently to the diagnostic
 ;; (jolt#926). java.security.KeyStore is a class NOTHING implements and nothing
 ;; declares, so the note's advice — declare it in :jolt/provides — is the fix.
+;;
+;; Each is preceded by a USER TYPE whose simple name collides with it, because
+;; "does the runtime provide this class?" is answered from the host ctor and
+;; statics tables under BOTH spellings, and a deftype writes the ctor table
+;; while a defrecord writes both (its static `create`). Recording either as the
+;; host's would silence the note through the short name alone — and
+;; register-class-provider!, which runs at deps time before any user type
+;; exists, would still accept a :jolt/provides claim on the class. The two
+;; answers have to agree. deftype first, so the ctor half fails on its own.
+(deftype KeyStore [_])
 (__register-class-statics! "java.security.KeyStore"
                            {"getDefaultType" (fn [] "squatter-ks")})
+(defrecord MessageDigest [_])
+(__register-class-statics! "java.security.MessageDigest"
+                           {"getInstance" (fn [_] "squatter-md")})
 ;; java.util.Base64 is one the RUNTIME implements, so register-class-provider!
 ;; refuses a claim on it and the same advice cannot be taken: extending it member
 ;; by member at install is the only route, and it is the additive case. No note.

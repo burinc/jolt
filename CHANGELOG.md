@@ -177,6 +177,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `java.security.SecureRandom`. The note stays for what it is for: a class
   nothing implements and nothing declares (#926).
 
+- **A user `deftype` is not a host class.** Every `deftype` and `defrecord`
+  registers its constructor — and a record its static `create` — through the
+  same tables the host's own classes use, under its `ns.Name` tag *and* its bare
+  name. Those tables are what "does the runtime provide this class?" is answered
+  from, so a `(deftype Widget …)` anywhere in a process made an unrelated
+  `com.example.Widget` read as the runtime's: the note above went silent for it,
+  while `register-class-provider!` — which runs at deps time, before any user
+  type exists — would still have accepted a `:jolt/provides` claim on it. The
+  two answers have to agree, so a user type takes a plain table write and only
+  the host's boot-time registrations record a class as the runtime's.
+
 - **`JOLT_DEBUG` no longer reports the runtime's own boot as registry drift.**
   A class registered under both its qualified and its simple name shares ONE
   member table, so a fresh closure per spelling re-registers the member with a

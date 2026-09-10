@@ -1703,7 +1703,7 @@
                           (number->string n)
                           ") passed to: "
                           ctor-name))))))))
-    (register-class-ctor! tag ctor)
+    (class-ctor-set! tag ctor)
     (when (or (not (hashtable-ref
                      class-ctors-tbl
                      (symbol-t-name name-sym)
@@ -1712,7 +1712,7 @@
                 chez-simple-name-tag
                 (symbol-t-name name-sym)
                 #f))
-      (register-class-ctor! (symbol-t-name name-sym) ctor))
+      (class-ctor-set! (symbol-t-name name-sym) ctor))
     (jolt-with-mutex
       rec-tbl-mu
       (hashtable-set! chez-deftype-tag-set tag #t)
@@ -2798,7 +2798,7 @@
                      (symbol-t-name name-sym))
                    #f)))
       (when (and ctor shape)
-        (register-class-statics!
+        (class-statics-merge!
           tag
           (list
             (cons

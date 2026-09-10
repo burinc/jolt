@@ -439,12 +439,25 @@ esac
 
 # The undeclared-registration note is advice: declare the class in :jolt/provides.
 # It fires for a class nothing implements and nothing declares...
+# ...even when a user type in the same process happens to share its simple name:
+# a deftype writes the host ctor table, a defrecord that table AND the statics
+# one (its `create`), and both are keyed under the bare name as well as the
+# qualified one, so recording either as the RUNTIME's would silence the note for
+# an unrelated class. KeyStore is preceded by a deftype and MessageDigest by a
+# defrecord, so the ctor half of that fails on its own.
 out="$(rundebug -A:prov run -m appprovsquat)"
 case "$out" in
   *"registers java.security.KeyStore without declaring it"*)
     check "an undeclared registration is reported" ok ok ;;
   *) check "an undeclared registration is reported" "a note naming java.security.KeyStore" \
            "$(printf '%s' "$out" | grep 'without declaring it' | head -1)" ;;
+esac
+case "$out" in
+  *"registers java.security.MessageDigest without declaring it"*)
+    check "a user type of the same simple name does not silence the note" ok ok ;;
+  *) check "a user type of the same simple name does not silence the note" \
+           "a note naming java.security.MessageDigest" \
+           "$(printf '%s' "$out" | grep 'MessageDigest' | head -1)" ;;
 esac
 # ...and not for one the RUNTIME implements, where register-class-provider! refuses
 # the claim the note asks for and extending the class member by member at install
