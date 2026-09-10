@@ -766,6 +766,11 @@ eturn)) (loop (- n 1)))
     (unless (string=? name (short-class-name name))
       (hashtable-set! class-statics-tbl (short-class-name name) h))
     (for-each (lambda (p) (hashtable-set! h (car p) (cdr p))) members)))
+;; The two are one procedure here. On Chez they differ only in whether the class
+;; is also recorded as one the RUNTIME provides (host-static.ss), and the gambit
+;; boot has no provider registry to ask — records-dispatch.ss's defrecord
+;; `create` takes the merge, so the name has to exist.
+(define (class-statics-merge! name members) (register-class-statics! name members))
 
 ;; Chez gensym accepts a STRING prefix; Gambit only a symbol. Normalize.
 (define %gambit-gensym gensym)
