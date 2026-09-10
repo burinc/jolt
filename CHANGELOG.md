@@ -153,6 +153,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the registry-miss path, so a static reference and a `(Class. …)` cost
   exactly what they did before.
 
+- **A provider reached from another provider's install namespace is still its
+  own.** RFC 0014 marked the whole load with the provider being autoloaded, so a
+  second declared provider that its install namespace reaches with a plain
+  `require` — kmet's provider requires jolt.crypto — had every class it
+  registered attributed to the OUTER one. Those classes then belonged to nobody,
+  so a later registration for a member the inner provider answers was accepted
+  instead of dropped: #914's nondeterminism, one level down. Under `JOLT_DEBUG`
+  the undeclared-registration note named the outer namespace for a class the
+  inner one declares. The mark now comes from whoever LOADS an install namespace
+  rather than from the autoload alone, so a provider's registrations are its own
+  however it was reached; a helper namespace a provider requires still registers
+  on the provider's behalf (#926).
+
+- **The undeclared-registration note no longer advises a declaration jolt
+  refuses.** For a class the runtime itself implements, `register-class-provider!`
+  refuses the claim ("which the runtime already provides"), so `JOLT_DEBUG`'s
+  advice to declare it in `:jolt/provides` could not be taken — registering the
+  members at install is the route, and it is the additive case `extend-class!`
+  exists for. Nothing autoloads for a class that is already there, so there was
+  no order dependence left to warn about either. It fired for kmet's
+  `java.util.Base64`, jolt-lang/time's `java.util.Date` and jolt.crypto's
+  `java.security.SecureRandom`. The note stays for what it is for: a class
+  nothing implements and nothing declares (#926).
+
+- **`JOLT_DEBUG` no longer reports the runtime's own boot as registry drift.**
+  A class registered under both its qualified and its simple name shares ONE
+  member table, so a fresh closure per spelling re-registers the member with a
+  different value — "static member java.security.SecureRandom/getInstance
+  registered twice with different values", and the same for `clojure.lang.RT/iter`.
+  Both now register one procedure under both names. `java.nio.charset.Charset`
+  was a real duplicate: a short-name registration answering `forName` with the
+  canonical name string, dead since the qualified one started answering with the
+  charset object and overwriting it member for member.
+
 - **`java.net.URI`'s constructor validates.** `(java.net.URI. "https://not a
   url")` answered a URI whose `.getHost` was `"not a url"`; the JVM's
   single-argument constructor parses per RFC 2396 and throws

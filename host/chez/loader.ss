@@ -1880,9 +1880,16 @@
       ;; (a continuation escaping the load for good) never reached ldr-load-body's
       ;; guard, so the mark is rolled back here instead. Idempotent against the
       ;; guard's own rollback on the throw path.
+      ;;
+      ;; RFC 0014: an install namespace's registrations belong to the provider
+      ;; that DECLARES it, whichever way the load was reached — the class-miss
+      ;; autoload, or a plain require from another provider's install namespace
+      ;; (host-static.ss lib-with-install-ns-mark, jolt#926).
       (dynamic-wind
         (lambda () (ldr-assert-claim! name))
-        (lambda () (ldr-load-body name force? was-loaded?) (set! finished? #t))
+        (lambda ()
+          (lib-with-install-ns-mark name (lambda () (ldr-load-body name force? was-loaded?)))
+          (set! finished? #t))
         (lambda ()
           (unless (jolt-park-unwinding?)
             (unless (or finished? was-loaded?) (ldr-unmark-loaded! name))

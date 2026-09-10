@@ -28,6 +28,10 @@
   :prov   {:extra-deps {local/provclaim {:local/root "../provclaim"}
                         local/provsquat {:local/root "../provsquat"}
                         local/provgone  {:local/root "../provgone"}}}
+  ;; A provider whose install namespace requires ANOTHER provider's (jolt#926):
+  ;; provnest declares javax.crypto.Cipher and requires provinner.install, which
+  ;; declares java.security.KeyFactory.
+  :prov2  {:extra-deps {local/provnest {:local/root "../provnest"}}}
   ;; a dep directory with NO deps.edn defaults to its src path
   :noedn  {:extra-deps {local/libnoedn {:local/root "../libnoedn"}}}
   ;; -X / -T exec fixtures

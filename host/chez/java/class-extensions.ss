@@ -242,9 +242,11 @@
              (class-ext-table-put! class-ext-extend-tbl name ms)
              (class-ext-install-fallback!)))))
       (unless (jolt-nil? statics)
-        ;; register-class-statics! already merges into the class's existing member
-        ;; table and reports a differing re-registration under JOLT_DEBUG.
-        (register-class-statics! name (class-ext-members "statics" name statics #f)))
+        ;; class-statics-merge! already merges into the class's existing member
+        ;; table and reports a differing re-registration under JOLT_DEBUG. The
+        ;; merge and not register-class-statics!: extending a class is not the
+        ;; runtime coming to provide it (host-static.ss host-class-statics-tbl).
+        (class-statics-merge! name (class-ext-members "statics" name statics #f)))
       (unless (jolt-nil? ctor)
         (unless (procedure? ctor)
           (class-ext-bad! (string-append "extend-class!: :ctor for " name
