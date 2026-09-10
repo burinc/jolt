@@ -717,11 +717,8 @@ eturn)) (loop (- n 1)))
 (define (jolt-locks-enter!) (set-virtual-register! 7 (+ 1 (virtual-register 7))))
 (define (jolt-locks-exit!) (set-virtual-register! 7 (- (virtual-register 7) 1)))
 
-;; parse-int-str / parse-int-or-throw — ported from java/host-static.ss (G2
-;; EXCLUDES the java/ tree; natives-misc.ss's jolt-bigint calls them). String
-;; -> integer in RADIX, #f on failure; parse-int-or-throw raises a jolt
-;; NumberFormatException. str-trim is String.trim (java/natives-str.ss): chars
-;; at or below space.
+;; str-trim — String.trim (java/natives-str.ss, which G2 excludes): chars at or
+;; below space. rt-core.ss binds clojure.core/trim to it.
 (define (str-trim s)
   (let ((len (string-length s)))
     (let scan-l ((i 0))
@@ -731,14 +728,20 @@ eturn)) (loop (- n 1)))
                     (if (char<=? (string-ref s j) #\space)
                         (scan-r (fx- j 1))
                         (substring s i (fx+ j 1)))))))))
-(define (parse-int-str s radix)
-  (let ((n (string->number (str-trim (if (string? s) s (jolt-str-render-one s))) radix)))
-    (and n (integer? n) n)))
-(define (parse-int-or-throw s radix what)
-  (or (parse-int-str s radix)
-      (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
-                    (string-append "For input string: \""
-                                   (if (string? s) s (jolt-str-render-one s)) "\"")))))
+
+;; parse-int-or-throw — natives-misc.ss's jolt-bigint is the only caller here (G2
+;; EXCLUDES the java/ tree, so none of the java.lang parsers exist on this host).
+;; The GRAMMAR is not copied: java-int-parse is in natives-num.ss, which both
+;; hosts include, so the one place jolt reads a Java integer cannot drift between
+;; them. bigint is the unbounded parse, so there is no width to name and only the
+;; ordinary "For input string:" message can come out.
+(define (parse-int-or-throw s radix type)
+  (let* ((str (if (string? s) s (jolt-str-render-one s)))
+         (v (java-int-parse str radix #f #f)))
+    (if (symbol? v)
+        (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
+                      (string-append "For input string: \"" str "\"")))
+        v)))
 
 ;; make-thread-parameter — a Chez PRIMITIVE (no .ss definition), absent on Gambit.
 ;; compile-eval.ss's jolt-current-source / jolt-aot-capture* are thread parameters;

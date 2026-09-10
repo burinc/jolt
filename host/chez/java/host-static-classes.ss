@@ -1344,7 +1344,7 @@
 (define (bigint-ctor v . r)
   (if (and (pair? r) (jolt-array? (car r)))
       (bigint-from-magnitude v (car r))
-      (parse-int-or-throw v (if (null? r) 10 (jnum->exact (car r))) "BigInteger")))
+      (parse-int-or-throw v (if (null? r) 10 (jnum->exact (car r))) "big")))
 (register-class-ctor! "BigInteger" bigint-ctor)
 (register-class-ctor! "java.math.BigInteger" bigint-ctor)
 (register-class-ctor! "MapEntry" (lambda (k v) (make-map-entry k v)))

@@ -102,6 +102,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which jolt already matched. 11 corpus rows, certified against reference
   Clojure (#927).
 
+- **Every `java.lang` integer parser reads Java's grammar, at its own width.**
+  The overflow above was one symptom of a shared helper that checked no width
+  and, worse, handed the string to Scheme's reader — so the java.lang parsers
+  spoke Scheme rather than Java. `(Long/parseLong "1e3")` read the **double**
+  `1000.0` out of a method whose return type is `long`, `"5.0"` read `5.0`,
+  `"#xff"` / `"#b101"` / `"#o17"` read Scheme radix prefixes whatever radix was
+  asked for, `" 5"` parsed because the string was trimmed first, a value past
+  the type's range came back as a wider number instead of failing, a radix
+  outside 2..36 escaped as a raw Chez condition, and the message never named a
+  radix other than 10. `Long/decode` and its three siblings were missing
+  outright.
+
+  There is now one Java integer grammar — optional sign, digits of the radix,
+  nothing else — and the target type is what a caller passes, so a width check
+  is possible at all and a new parser cannot be wired without saying which type
+  it parses. `Long/parseLong`, `Integer/parseInt`, `Short/parseShort`,
+  `Byte/parseByte`, each one's `valueOf` and `decode`, `(Long. s)`,
+  `(Integer. s)`, `BigInteger` and `bigint` unbounded, and
+  `clojure.core/parse-long` — which is `Long/valueOf` with the throw caught —
+  are all that one function now. Both of the JVM's out-of-range messages come
+  out on the right classes (`For input string:` for long and int,
+  `Value out of range.` for short and byte), with the radix clause. The grammar
+  lives in a file both hosts include rather than being hand-mirrored on Gambit,
+  so it cannot drift. 50 corpus rows, every one certified against reference
+  Clojure; the parse path also got about 7% faster, since it no longer allocates
+  a trimmed string per call.
+
 - **`format` speaks the rest of `java.util.Formatter`.** `%.3s` truncates a
   string where the precision used to be ignored (`(format "%.3s" "abcdef")` was
   `"abcdef"`), `%#x` / `%#X` / `%#o` prefix the radix (`0x`, `0X`, `0`) with the
