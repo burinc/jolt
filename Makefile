@@ -647,8 +647,12 @@ cts: testbin
 # per context, isolation, delegation policy, unload). Baselined like certify —
 # a case that regresses fails, and a case that starts passing fails until the
 # baseline records it, so nothing green quietly goes red again.
-loaderconf:
-	@sh host/chez/loaderconf.sh
+#
+# Through the BUILT binary, like cts and the other CLI gates: a loader that only
+# works against the source tree is not a loader, and jolt.loader ships in the
+# stdlib fasl, so the binary is the arrangement the cases have to hold under.
+loaderconf: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/loaderconf.sh
 
 # FFI: bind native functions (typed foreign-procedure), memory, and that a
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).
