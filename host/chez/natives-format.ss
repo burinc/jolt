@@ -135,13 +135,19 @@
 ;; value is in [10^-4, 10^prec), scientific otherwise -- Java's rule, which is
 ;; why (format "%.3g" 1234.5) is 1.23e+03 and 0.00001234 is 1.23400e-05. The
 ;; digits are rounded once, here; the notation only lays them out.
-(define (fmt-general digits expo prec)
+;;
+;; GROUP is the , flag's separator pass, and it belongs INSIDE this choice: the
+;; JVM groups the mantissa and appends the exponent after, so the , flag is a
+;; no-op on the scientific branch (its mantissa has one integer digit). Applying
+;; it to the finished rendering instead put a separator in the exponent --
+;; (format "%,.1g" 1234.5) was "1e,+03" against the JVM's "1e+03".
+(define (fmt-general digits expo prec group)
   (let* ((prec (if (fx=? prec 0) 1 prec))
          (r (digits-round digits prec))
          (d (car r)) (expo (if (cdr r) (+ expo 1) expo))
          (e (- expo 1)))
     (if (and (>= e -4) (< e prec))
-        (fmt-fixed d expo (fx- prec (fx+ e 1)))
+        (group (fmt-fixed d expo (fx- prec (fx+ e 1))))
         (fmt-sci d expo (fx- prec 1)))))
 ;; digit grouping for the , flag: the integer part in threes, the fraction as is
 (define (fmt-group s)
@@ -390,8 +396,8 @@
       ((#\f) (fmt-real d a flags width (lambda (ds ex) (grouped (fmt-fixed ds ex (or prec 6))))))
       ((#\e) (fmt-real d a flags width (lambda (ds ex) (fmt-sci ds ex (or prec 6)))))
       ((#\E) (fmt-real d a flags width (up (lambda (ds ex) (fmt-sci ds ex (or prec 6))))))
-      ((#\g) (fmt-real d a flags width (lambda (ds ex) (grouped (fmt-general ds ex (or prec 6))))))
-      ((#\G) (fmt-real d a flags width (up (lambda (ds ex) (grouped (fmt-general ds ex (or prec 6)))))))
+      ((#\g) (fmt-real d a flags width (lambda (ds ex) (fmt-general ds ex (or prec 6) grouped))))
+      ((#\G) (fmt-real d a flags width (up (lambda (ds ex) (fmt-general ds ex (or prec 6) grouped)))))
       ((#\a #\A) (fmt-hex-real d a flags width prec))
       ((#\x #\X #\o)
        (cond ((jolt-nil? a) (fmt-pad "null" flags width #f))

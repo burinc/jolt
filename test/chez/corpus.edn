@@ -4133,6 +4133,7 @@
   {:suite "format / scientific" :label "%.2e rounds to the precision" :expected "\"1.23e+04\"" :actual "(format \"%.2e\" 12345.678)" :portability :common}
   {:suite "format / scientific" :label "%g below 1e-4 is scientific" :expected "\"1.23400e-05\"" :actual "(format \"%g\" 0.00001234)" :portability :common}
   {:suite "format / scientific" :label "%.3g at 10^precision is scientific" :expected "\"1.23e+03\"" :actual "(format \"%.3g\" 1234.5)" :portability :common}
+  {:suite "format / scientific" :label "%.4g below 10^precision is fixed (#903)" :expected "\"12.21\"" :actual "(format \"%.4g\" 12.21)" :portability :common}
   {:suite "format / scientific" :label "%e of a negative" :expected "\"-5.000000e-01\"" :actual "(format \"%e\" -0.5)" :portability :common}
   {:suite "format / scientific" :label "%e honours width" :expected "\"  5.00e+00|\"" :actual "(format \"%10.2e|\" 5.0)" :portability :common}
   {:suite "format / scientific" :label "%e of an integer is refused" :expected "java.util.IllegalFormatConversionException" :actual "(try (format \"%e\" 5) (catch Exception e (class e)))" :portability :common}
@@ -4176,6 +4177,11 @@
   {:suite "format / rounding and flags" :label "%(e parenthesizes a negative" :expected "\"(1.000000e+00)\"" :actual "(format \"%(e\" -1.0)" :portability :common}
   {:suite "format / rounding and flags" :label "%,d groups" :expected "\"1,234,567\"" :actual "(format \"%,d\" 1234567)" :portability :common}
   {:suite "format / rounding and flags" :label "%,.2f groups the integer part" :expected "\"1,234.50\"" :actual "(format \"%,.2f\" 1234.5)" :portability :common}
+  ;; the , flag on %g groups the MANTISSA, so it is a no-op once %g picks
+  ;; scientific notation -- the JVM appends the exponent after the grouping pass
+  ;; and "%,.1g" of 1234.5 is "1e+03", never "1e,+03".
+  {:suite "format / rounding and flags" :label "%,g groups the fixed branch" :expected "\"1,234,567.000\"" :actual "(format \"%,.10g\" 1234567.0)" :portability :common}
+  {:suite "format / rounding and flags" :label "%,g leaves the scientific exponent alone" :expected "[\"1e+03\" \"1E+06\"]" :actual "[(format \"%,.1g\" 1234.5) (format \"%,.1G\" 1000000.0)]" :portability :common}
   ;; a BigDecimal formats from its own digits; the argument types are the JVM's
   {:suite "format / rounding and flags" :label "%f of a BigDecimal" :expected "\"1.500000\"" :actual "(format \"%f\" 1.5M)" :portability :common}
   {:suite "format / rounding and flags" :label "%.2f of a BigDecimal rounds half up" :expected "\"1.01\"" :actual "(format \"%.2f\" 1.005M)" :portability :common}
