@@ -1703,7 +1703,7 @@
                           (number->string n)
                           ") passed to: "
                           ctor-name))))))))
-    (register-class-ctor! tag ctor)
+    (class-ctor-set! tag ctor)
     (when (or (not (hashtable-ref
                      class-ctors-tbl
                      (symbol-t-name name-sym)
@@ -1712,7 +1712,7 @@
                 chez-simple-name-tag
                 (symbol-t-name name-sym)
                 #f))
-      (register-class-ctor! (symbol-t-name name-sym) ctor))
+      (class-ctor-set! (symbol-t-name name-sym) ctor))
     (jolt-with-mutex
       rec-tbl-mu
       (hashtable-set! chez-deftype-tag-set tag #t)
@@ -2156,12 +2156,17 @@
 (define (set-rd-class-method-hook! f)
   (set! rd-class-method-hook f))
 
-(define (rd-persistent-coll? obj)
+(define (rd-java-list? obj)
   (or (pvec? obj)
-      (pset? obj)
       (cseq? obj)
       (empty-list-t? obj)
       (jolt-lazyseq? obj)))
+
+(define (rd-java-set? obj)
+  (or (pset? obj) (htable-sorted-set? obj)))
+
+(define (rd-persistent-coll? obj)
+  (or (rd-java-list? obj) (rd-java-set? obj)))
 
 (define (rd-coll-last obj)
   (if (pvec? obj)
@@ -2170,13 +2175,27 @@
         (let ((n (jolt-seq (seq-more s))))
           (if (jolt-nil? n) (seq-first s) (loop n))))))
 
-(define rd-java-util-mutator-names
-  '("add" "addAll" "addFirst" "addLast" "clear" "remove" "removeAll"
-     "removeFirst" "removeLast" "removeIf" "replaceAll"
-     "retainAll" "set" "sort"))
+(define rd-collection-mutators
+  '(("add" 1) ("addAll" 1) ("clear" 0) ("remove" 1)
+     ("removeAll" 1) ("removeIf" 1) ("retainAll" 1)))
 
-(define (rd-java-util-mutator? m)
-  (and (member m rd-java-util-mutator-names) #t))
+(define rd-list-mutators
+  '(("add" 2) ("addAll" 2) ("set" 2) ("addFirst" 1) ("addLast" 1)
+     ("removeFirst" 0) ("removeLast" 0) ("replaceAll" 1)
+     ("sort" 1)))
+
+(define (rd-mutator-in? table name argc)
+  (let loop ((t table))
+    (cond
+      ((null? t) #f)
+      ((and (string=? (caar t) name) (fx=? (cadar t) argc)) #t)
+      (else (loop (cdr t))))))
+
+(define (rd-coll-mutator? obj name argc)
+  (or (and (rd-persistent-coll? obj)
+           (rd-mutator-in? rd-collection-mutators name argc))
+      (and (rd-java-list? obj)
+           (rd-mutator-in? rd-list-mutators name argc))))
 
 (define (rd-var-meta obj)
   (let ((m (var-cell-meta obj)))
@@ -2192,6 +2211,128 @@
 (define (rd-args->list x)
   (let ((s (jolt-seq x)))
     (if (jolt-nil? s) '() (seq->list s))))
+
+(define (rd-iref-method name argc)
+  (cond
+    ((string=? name "addWatch")
+     (and (fx=? argc 2) jolt-add-watch))
+    ((string=? name "removeWatch")
+     (and (fx=? argc 1) jolt-remove-watch))
+    ((string=? name "getWatches")
+     (and (fx=? argc 0) jolt-get-watches))
+    ((string=? name "notifyWatches")
+     (and (fx=? argc 2) jolt-notify-watches))
+    ((string=? name "setValidator")
+     (and (fx=? argc 1) jolt-set-validator!))
+    ((string=? name "getValidator")
+     (and (fx=? argc 0) jolt-get-validator))
+    (else #f)))
+
+(define rd-extra-deref-hook #f)
+
+(define (set-rd-extra-deref-hook! f)
+  (set! rd-extra-deref-hook f))
+
+(define (rd-deref-kind x)
+  (cond
+    ((or (jolt-atom? x)
+         (jolt-ref? x)
+         (jvol? x)
+         (jolt-reduced? x))
+     'ideref)
+    (rd-extra-deref-hook (rd-extra-deref-hook x))
+    (else #f)))
+
+(define (rd-derefable? x) (and (rd-deref-kind x) #t))
+
+(define (rd-blocking-derefable? x)
+  (eq? 'iblocking (rd-deref-kind x)))
+
+(define (rd-ideref-method x name argc)
+  (cond
+    ((string=? name "deref")
+     (and (or (fx=? argc 0)
+              (and (fx=? argc 2) (rd-blocking-derefable? x)))
+          jolt-deref))
+    ((string=? name "get") (and (fx=? argc 0) jolt-deref))
+    ((string=? name "getAsBoolean")
+     (and (fx=? argc 0) rd-deref-as-boolean))
+    ((string=? name "getAsInt")
+     (and (fx=? argc 0) rd-deref-as-int))
+    ((string=? name "getAsLong")
+     (and (fx=? argc 0) rd-deref-as-long))
+    ((string=? name "getAsDouble")
+     (and (fx=? argc 0) rd-deref-as-double))
+    (else #f)))
+
+(define (rd-deref-as-boolean x)
+  (jolt-boolean (jolt-deref x)))
+
+(define (rd-deref-as-int x) (jolt-int-cast (jolt-deref x)))
+
+(define (rd-deref-as-long x)
+  (jolt-long-cast (jolt-deref x)))
+
+(define (rd-deref-as-double x) (jolt-double (jolt-deref x)))
+
+(define (rd-atom-method name argc)
+  (cond
+    ((string=? name "swap")
+     (and (memv argc '(1 2 3 4)) rd-atom-swap))
+    ((string=? name "swapVals")
+     (and (memv argc '(1 2 3 4)) rd-atom-swap-vals))
+    ((string=? name "reset") (and (fx=? argc 1) jolt-reset!))
+    ((string=? name "resetVals")
+     (and (fx=? argc 1) jolt-reset-vals!))
+    ((string=? name "compareAndSet")
+     (and (fx=? argc 2) jolt-compare-and-set!))
+    (else #f)))
+
+(define (rd-spread-tail args)
+  (if (fx=? (length args) 4)
+      (cons
+        (car args)
+        (cons
+          (cadr args)
+          (cons (caddr args) (rd-args->list (cadddr args)))))
+      args))
+
+(define (rd-atom-swap a . args)
+  (apply jolt-swap! a (rd-spread-tail args)))
+
+(define (rd-atom-swap-vals a . args)
+  (apply jolt-swap-vals! a (rd-spread-tail args)))
+
+(define (rd-ref-method name argc)
+  (cond
+    ((string=? name "set") (and (fx=? argc 1) jolt-ref-set))
+    ((string=? name "alter") (and (fx=? argc 2) rd-ref-alter))
+    ((string=? name "commute")
+     (and (fx=? argc 2) rd-ref-commute))
+    ((string=? name "touch") (and (fx=? argc 0) rd-ref-touch))
+    ((string=? name "getMinHistory")
+     (and (fx=? argc 0) jolt-ref-min-history))
+    ((string=? name "setMinHistory")
+     (and (fx=? argc 1) jolt-ref-min-history))
+    ((string=? name "getMaxHistory")
+     (and (fx=? argc 0) jolt-ref-max-history))
+    ((string=? name "setMaxHistory")
+     (and (fx=? argc 1) jolt-ref-max-history))
+    ((string=? name "getHistoryCount")
+     (and (fx=? argc 0) jolt-ref-history-count))
+    ((string=? name "trimHistory")
+     (and (fx=? argc 0) rd-ref-trim-history))
+    (else #f)))
+
+(define (rd-ref-alter r f args)
+  (apply jolt-alter r f (rd-args->list args)))
+
+(define (rd-ref-commute r f args)
+  (apply jolt-commute r f (rd-args->list args)))
+
+(define (rd-ref-touch r) (jolt-ensure r) jolt-nil)
+
+(define (rd-ref-trim-history r) jolt-nil)
 
 (define (record-method-dispatch-base obj method-name
          rest-args)
@@ -2362,6 +2503,18 @@
           (jolt-symbol #f (jns-name obj)))
          ((string=? method-name "toString") (jns-name obj))
          (else (dispatch-miss obj method-name rest))))
+      ((and (jolt-iref-watchable? obj)
+            (rd-iref-method method-name (length rest))) =>
+       (lambda (f) (apply f obj rest)))
+      ((and (jolt-atom? obj)
+            (rd-atom-method method-name (length rest))) =>
+       (lambda (f) (apply f obj rest)))
+      ((and (jolt-ref? obj)
+            (rd-ref-method method-name (length rest))) =>
+       (lambda (f) (apply f obj rest)))
+      ((and (rd-derefable? obj)
+            (rd-ideref-method obj method-name (length rest))) =>
+       (lambda (f) (apply f obj rest)))
       ((var-cell? obj)
        (cond
          ((string=? method-name "ns") (intern-ns! (var-cell-ns obj)))
@@ -2436,26 +2589,32 @@
           (let ((o (car rest)))
             (cond ((char<? obj o) -1) ((char>? obj o) 1) (else 0))))
          (else (dispatch-miss obj method-name rest))))
-      ((and (string=? method-name "getFirst")
-            (rd-persistent-coll? obj))
+      ((and (string=? method-name "getFirst") (rd-java-list? obj))
        (let ((s (jolt-seq obj)))
          (if (jolt-nil? s)
              (throw-jvm 'NoSuchElementException "")
              (seq-first s))))
-      ((and (string=? method-name "getLast")
-            (rd-persistent-coll? obj))
+      ((and (string=? method-name "getLast") (rd-java-list? obj))
        (if (jolt-nil? (jolt-seq obj))
            (throw-jvm 'NoSuchElementException "")
            (rd-coll-last obj)))
-      ((and (string=? method-name "reversed")
-            (rd-persistent-coll? obj))
+      ((and (string=? method-name "reversed") (rd-java-list? obj))
        (let ((items (reverse (seq->list (jolt-seq obj)))))
          (if (pvec? obj)
              (apply jolt-vector items)
              (list->cseq items))))
-      ((and (rd-java-util-mutator? method-name)
-            (rd-persistent-coll? obj))
-       (throw-jvm 'UnsupportedOperationException ""))
+      ((rd-coll-mutator? obj method-name (length rest))
+       (let ((empty? (jolt-nil? (jolt-seq obj))))
+         (cond
+           ((not empty?) (throw-jvm 'UnsupportedOperationException ""))
+           ((or (string=? method-name "removeFirst")
+                (string=? method-name "removeLast"))
+            (throw-jvm 'NoSuchElementException ""))
+           ((string=? method-name "removeIf") #f)
+           ((or (string=? method-name "replaceAll")
+                (string=? method-name "sort"))
+            jolt-nil)
+           (else (throw-jvm 'UnsupportedOperationException "")))))
       ((or (string=? method-name "indexOf")
            (string=? method-name "lastIndexOf"))
        (let ((target (car rest))
@@ -2557,6 +2716,8 @@
 (define arm-priority-htable 43)
 
 (define arm-priority-host-type 44)
+
+(define arm-priority-agent 45)
 
 (define (record-method-dispatch obj method-name rest-args)
   (when (jolt-nil? obj)
@@ -2798,7 +2959,7 @@
                      (symbol-t-name name-sym))
                    #f)))
       (when (and ctor shape)
-        (register-class-statics!
+        (class-statics-merge!
           tag
           (list
             (cons

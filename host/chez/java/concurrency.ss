@@ -338,6 +338,9 @@
     (let ((out (vector-ref q 0))) (vector-set! q 0 (cdr out)) (car out))))
 (define (jagent-q-clear! a)
   (jolt-agent-queue-set! a (vector '() '())))
+(define (jagent-q-count a)
+  (let ((q (jolt-agent-queue a)))
+    (fx+ (length (vector-ref q 0)) (length (vector-ref q 1)))))
 
 ;; Each action runs with *agent* bound to its agent, like the JVM's action
 ;; binding frame — (send a (fn [s] (send *agent* …))) works. The cell resolves
@@ -505,10 +508,70 @@
 (define (jolt-agent-error a) (jolt-agent-err a))
 (define (jolt-agent-get-error-mode a)
   (keyword #f (symbol->string (jolt-agent-err-mode a))))
+
+;; Agent.setErrorMode and setErrorHandler are VOID, so set-error-mode! and
+;; set-error-handler! answer nil rather than the agent — these used to hand the
+;; agent back, which threads but is not what (set-error-mode! a :continue)
+;; evaluates to on the JVM.
 (define (jolt-agent-set-error-mode! a k)
-  (jolt-agent-err-mode-set! a (kw->mode k)) a)
+  (jolt-agent-err-mode-set! a (kw->mode k)) jolt-nil)
 (define (jolt-agent-get-error-handler a) (jolt-agent-err-handler a))
-(define (jolt-agent-set-error-handler! a f) (jolt-agent-err-handler-set! a f) a)
+(define (jolt-agent-set-error-handler! a f)
+  (jolt-agent-err-handler-set! a f) jolt-nil)
+
+;; --- clojure.lang.Agent's own method surface --------------------------------
+;; The watch/validator half an agent shares with atom/ref/var is answered in
+;; records-dispatch.ss's base; these are the methods only an Agent has. They are
+;; registered as a method ARM rather than written into that base because the
+;; natives are here, this file loads long after it, and the Gambit host does not
+;; include this file at all — an agent does not exist there to have methods.
+;;
+;; Two of them are not just the native under another name:
+;;   restart(newState, clearActions) is positional where restart-agent takes
+;;   :clear-actions. Both answer the new state.
+;;   dispatch(fn, args, exec) is the send/send-off kernel with the pool named
+;;   explicitly. jolt runs ONE serialized worker per agent — send and send-off
+;;   are already the same call here — so the executor is unobservable and the
+;;   third argument is accepted and ignored. This is the one method here that is
+;;   a superset: the JVM refuses a null executor by never running the action.
+;; getQueueCount reads the pending queue under the agent mutex: it is two list
+;; traversals over a structure a worker mutates, so unlike getError (a field
+;; read) it cannot be taken unsynchronized.
+(define (jolt-agent-queue-count a)
+  (jolt-with-mutex (jolt-agent-mu a) (jagent-q-count a)))
+(define (jagent-restart-2 a new-state clear?)
+  (jolt-agent-restart a new-state (keyword #f "clear-actions") (jolt-truthy? clear?)))
+(define (jagent-dispatch-3 a f args _exec)
+  (apply jolt-agent-send a f (rd-args->list args)))
+(define (jagent-method name argc)
+  (cond ((string=? name "getError")        (and (fx=? argc 0) jolt-agent-error))
+        ((string=? name "getErrorMode")    (and (fx=? argc 0) jolt-agent-get-error-mode))
+        ((string=? name "getErrorHandler") (and (fx=? argc 0) jolt-agent-get-error-handler))
+        ((string=? name "setErrorMode")    (and (fx=? argc 1) jolt-agent-set-error-mode!))
+        ((string=? name "setErrorHandler") (and (fx=? argc 1) jolt-agent-set-error-handler!))
+        ((string=? name "getQueueCount")   (and (fx=? argc 0) jolt-agent-queue-count))
+        ((string=? name "restart")         (and (fx=? argc 2) jagent-restart-2))
+        ((string=? name "dispatch")        (and (fx=? argc 3) jagent-dispatch-3))
+        (else #f)))
+(register-method-arm! arm-priority-agent
+  (lambda (obj method-name rest-args)
+    (if (jolt-agent? obj)
+        (let* ((rest (if (jolt-nil? rest-args) (quote ()) (seq->list rest-args)))
+               (f (jagent-method method-name (length rest))))
+          (if f (apply f obj rest) (quote pass)))
+        (quote pass))))
+
+;; The other four IDeref types: records-dispatch.ss answers .deref / .get and the
+;; getAs* bridges for every deref-able reference, but it can only SEE the ones
+;; defined before it. These four are defined here, so this is where they join —
+;; and the split it asks for is the JVM's: a promise and a future are
+;; IBlockingDeref, so they carry the two-argument (ms, timeout-val) deref, while
+;; an agent and a delay are plain IDeref and have no such method to reflect onto.
+(set-rd-extra-deref-hook!
+  (lambda (x)
+    (cond ((or (jolt-future? x) (jolt-promise? x)) (quote iblocking))
+          ((or (jolt-agent? x) (jolt-delay? x)) (quote ideref))
+          (else #f))))
 ;; Deprecated JVM helpers: agent-errors is a seq of the error or nil; clear-agent
 ;; -errors restarts with the current state (so it throws on a healthy agent, as on
 ;; the JVM).
@@ -560,7 +623,9 @@
                 ((and (not (jagent-q-empty? a)) (not (jolt-agent-running? a)))
                  (jolt-agent-running?-set! a #t)
                  (fork-thread (lambda () (*txn* #f) (jolt-agent-worker a)))))))))
-  a)
+  ;; Agent.restart answers the NEW STATE, not the agent (and clear-agent-errors,
+  ;; which is restart-agent over the current state, answers that state in turn).
+  new-state)
 
 ;; --- taps (tap>/add-tap/remove-tap) -----------------------------------------
 ;; Mirrors the JVM tap system: a bounded (1024) FIFO of queued values plus a

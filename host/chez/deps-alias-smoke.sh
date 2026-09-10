@@ -50,6 +50,10 @@ runfull() { JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" "$@" 2>&1; }
 # be able to displace. runall keeps every line (a tree, a describe map).
 runout() { JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" "$@" 2>/dev/null | tail -1; }
 runall() { JOLT_PWD="$APP" JOLT_QUIET=1 "$JOLT" "$@" 2>/dev/null; }
+# stdout+stderr with the registry diagnostics on — the RFC 0014 notes are
+# JOLT_DEBUG-only, and a note that fires where its advice cannot be taken is as
+# much a defect as a missing one.
+rundebug() { JOLT_PWD="$APP" JOLT_QUIET=1 JOLT_DEBUG=1 "$JOLT" "$@" 2>&1; }
 
 # baseline: project deps only
 check "project dep resolves (liba)" "liba A" "$(run run -m appver)"
@@ -415,6 +419,56 @@ check "a library registers over the base tier" \
 check "a provider that never loads releases what it held" \
       "squatter-mac:HmacSHA256 squatter-kpg:RSA" \
       "$(runall -A:prov run -m appprovgone | tr '\n' ' ' | sed 's/ $//')"
+
+# A provider reached from ANOTHER provider's install namespace is still its own
+# (jolt#926). provnest declares javax.crypto.Cipher and requires provinner.install,
+# which declares and registers java.security.KeyFactory. Marking the whole load
+# with the OUTER provider left KeyFactory owned by nobody, so the app's squatting
+# registration was accepted instead of dropped — jolt#914 one level down.
+check "a nested provider owns the class it declares" \
+      "outer-cipher:AES inner-kf:RSA" \
+      "$(runall -A:prov2 run -m appprovnest | tr '\n' ' ' | sed 's/ $//')"
+out="$(rundebug -A:prov2 run -m appprovnest)"
+case "$out" in
+  *"provnest.install registers java.security.KeyFactory"*)
+    check "the nested registration is not blamed on the outer provider" \
+          "no note naming provnest.install" \
+          "$(printf '%s' "$out" | grep 'without declaring it' | head -1)" ;;
+  *) check "the nested registration is not blamed on the outer provider" ok ok ;;
+esac
+
+# The undeclared-registration note is advice: declare the class in :jolt/provides.
+# It fires for a class nothing implements and nothing declares...
+# ...even when a user type in the same process happens to share its simple name:
+# a deftype writes the host ctor table, a defrecord that table AND the statics
+# one (its `create`), and both are keyed under the bare name as well as the
+# qualified one, so recording either as the RUNTIME's would silence the note for
+# an unrelated class. KeyStore is preceded by a deftype and MessageDigest by a
+# defrecord, so the ctor half of that fails on its own.
+out="$(rundebug -A:prov run -m appprovsquat)"
+case "$out" in
+  *"registers java.security.KeyStore without declaring it"*)
+    check "an undeclared registration is reported" ok ok ;;
+  *) check "an undeclared registration is reported" "a note naming java.security.KeyStore" \
+           "$(printf '%s' "$out" | grep 'without declaring it' | head -1)" ;;
+esac
+case "$out" in
+  *"registers java.security.MessageDigest without declaring it"*)
+    check "a user type of the same simple name does not silence the note" ok ok ;;
+  *) check "a user type of the same simple name does not silence the note" \
+           "a note naming java.security.MessageDigest" \
+           "$(printf '%s' "$out" | grep 'MessageDigest' | head -1)" ;;
+esac
+# ...and not for one the RUNTIME implements, where register-class-provider! refuses
+# the claim the note asks for and extending the class member by member at install
+# is the only route there is (jolt#926).
+case "$out" in
+  *"java.util.Base64 without declaring it"*)
+    check "no note where the declaration would be refused" \
+          "no note naming java.util.Base64" \
+          "$(printf '%s' "$out" | grep 'without declaring it' | head -1)" ;;
+  *) check "no note where the declaration would be refused" ok ok ;;
+esac
 
 # io/resource answers an ABSOLUTE file: URL for a file on a source root, like the
 # JVM classloader. The roots here are relative ("./src"), and "file:./src/x" is
