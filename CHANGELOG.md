@@ -56,6 +56,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`clojure.lang.ARef`'s watch and validator METHODS work through interop.**
+  Every watchable reference type was already an `IRef` by class — `(instance?
+  clojure.lang.IRef (atom 1))` is true and `(supers clojure.lang.Atom)` lists
+  `ARef` — but the methods that interface declares were not answered, so a
+  library that reaches the seam through interop rather than
+  `clojure.core/add-watch` got `No matching method addWatch found taking 2 args
+  for class clojure.lang.Atom`, and `.getWatches` the field spelling of the
+  same miss. `.addWatch`, `.removeWatch`, `.getWatches`, `.notifyWatches`,
+  `.setValidator` and `.getValidator` now answer on all four of atom, ref, var
+  and agent, off the same watch list `add-watch` writes: a watch registered
+  either way is one list, and one registered through interop fires on a real
+  `swap!`, `ref-set` at commit, root `def` and `send` alike. `.getWatches` is an
+  `IPersistentMap` whose values are the callbacks themselves, so an unwatched
+  reference reads `{}` and not `nil`, and `.notifyWatches` fires the watches
+  without touching the value, as a subclass driving its own notification does on
+  the JVM. A wrong-arity call and a receiver that is not one of the four (a
+  `Volatile` is an `IDeref`, not an `IRef`) still report the JVM's `No matching
+  method`, and a `deftype` that declares these methods itself keeps its own.
+  There is no `clojure.lang.IWatchable` to implement — the JVM declares
+  `getWatches`/`addWatch`/`removeWatch` on `IRef` and implements them in `ARef`
+  — which is why one arm serves all four types. 21 corpus rows, all certified
+  against reference Clojure.
+
 - **`format` speaks the rest of `java.util.Formatter`.** `%.3s` truncates a
   string where the precision used to be ignored (`(format "%.3s" "abcdef")` was
   `"abcdef"`), `%#x` / `%#X` / `%#o` prefix the radix (`0x`, `0X`, `0`) with the
