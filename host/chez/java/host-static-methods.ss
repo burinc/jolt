@@ -267,8 +267,13 @@
 ;; clojure.lang.RT/iter: an Iterator over any seqable — the same jiterator
 ;; (.iterator coll) dispatches to. orchard/inspect.analytics walks collections
 ;; through it.
-(register-class-statics! "RT" (list (cons "iter" (lambda (coll) (make-jiterator (jolt-seq coll))))))
-(register-class-statics! "clojure.lang.RT" (list (cons "iter" (lambda (coll) (make-jiterator (jolt-seq coll))))))
+;; One procedure for both spellings, like nextID below: the two names share ONE
+;; member table (register-class-statics! mirrors the FQN to the short name), so a
+;; fresh closure per spelling re-registers the member with a different value and
+;; JOLT_DEBUG reports the runtime's own boot as registry drift.
+(define (rt-iter coll) (make-jiterator (jolt-seq coll)))
+(register-class-statics! "RT" (list (cons "iter" rt-iter)))
+(register-class-statics! "clojure.lang.RT" (list (cons "iter" rt-iter)))
 
 ;; clojure.lang.RT/REQUIRE_LOCK — the JVM's `static final Object REQUIRE_LOCK`.
 ;; Nothing inside require takes it; it is the AGREED lock a caller holds around a

@@ -1,0 +1,8 @@
+{:paths ["src"]
+
+ ;; A second declared provider, reached by a plain `require` from ANOTHER
+ ;; provider's install namespace rather than by the autoload (jolt#926). The
+ ;; class it declares is its own however it was loaded — the mark the registration
+ ;; guard reads has to name the namespace that is loading, not the one that
+ ;; started the load.
+ :jolt/provides {provinner.install ["java.security.KeyFactory"]}}

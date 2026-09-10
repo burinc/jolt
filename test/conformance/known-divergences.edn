@@ -23,6 +23,8 @@
   "jolt strings are Chez strings: codepoint-indexed, no UTF-16 surrogate pairs. count/seq/subs/nth index codepoints, so an astral character counts 1 where the JVM counts 2 surrogate units. Substrate-inherent.",
   :concurrency-model
   "compare-and-set! uses Jolt identical?/Chez eq? identity. Reference values match the JVM, but Chez immediates such as fixnums and characters have no distinct boxes, so their CAS identity cannot reproduce JVM boxing allocation/cache boundaries",
+  :upstream-quirk
+  "reference Clojure's own inconsistency, not a substrate limit. LazySeq.reify() returns a MUTABLE (new ArrayList(this)) where ASeq.reify() wraps it in Collections.unmodifiableList, so java.util.List's DEFAULT sort and replaceAll — both of which go through listIterator() — mutate a throwaway copy and silently succeed on a lazy seq while refusing on every other seq. jolt refuses on all of them. Reproducing it would mean reproducing a missing wrapper whose only observable is that nothing happens.",
   :restrictive
   "the JVM supports something jolt does not: mark/reset replay over a non-seekable stream. The narrow direction, so it is NOT a superset — code relying on the JVM capability has no counterpart here",
   :permissive
@@ -1121,6 +1123,16 @@
   {:suite "numbers / unsigned string conversions",
    :label "a negative long takes the narrowest width holding it",
    :category :integer-box-model}
+  ;; The one place jolt's java.util mutator model (jolt-8oa) deliberately parts
+  ;; from the JVM: List's default sort / replaceAll silently succeed on a LAZY seq
+  ;; because LazySeq.reify hands them a mutable copy, and refuse on every other
+  ;; seq because ASeq.reify wraps its copy unmodifiable. jolt refuses uniformly.
+  {:suite "interop / java.util mutator arity",
+   :label "sort on a lazy seq is refused, not silently discarded",
+   :category :upstream-quirk}
+  {:suite "interop / java.util mutator arity",
+   :label "replaceAll on a lazy seq is refused, not silently discarded",
+   :category :upstream-quirk}
   {:suite "forms / fn",
    :label "no param vector",
    :category :strictness}
