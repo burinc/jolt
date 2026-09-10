@@ -797,44 +797,6 @@
 (def-var! "clojure.core" "str-replace" str-replace)
 (def-var! "clojure.core" "str-replace-all" str-replace-all)
 
-;; (require ...) / (use ...) at runtime: register each spec's :as alias + :refer
-;; names into the runtime ns tables (chez-register-spec!, ns.ss), keyed by the
-;; current ns. The spine also pre-registers these at analyze time (idempotent),
-;; so ns-aliases/ns-resolve over an :as alias resolve. Specs arrive evaluated
-;; (quoted).
-(define (chez-runtime-require . specs)
-  (for-each (lambda (s) (chez-register-spec! (chez-current-ns) s)) specs)
-  jolt-nil)
-(def-var! "clojure.core" "require" chez-runtime-require)
-;; use = require + refer ALL of the target's public vars (unless an explicit
-;; :only/:refer filter is given, which chez-register-spec! handles per-name).
-(define (chez-runtime-use . specs)
-  (for-each
-    (lambda (spec)
-      (chez-register-spec! (chez-current-ns) spec)
-      (let* ((items (cond ((pvec? spec) (seq->list spec))
-                          ((or (cseq? spec) (empty-list-t? spec)) (seq->list spec))
-                          ((symbol-t? spec) (list spec))
-                          (else '())))
-             (target (and (pair? items) (symbol-t? (car items)) (symbol-t-name (car items))))
-             (filtered (let scan ((xs (if (pair? items) (cdr items) '())))
-                         (cond ((null? xs) #f)
-                               ((and (keyword? (car xs))
-                                     (member (keyword-t-name (car xs)) '("only" "refer"))) #t)
-                               (else (scan (cdr xs))))))
-             (excluded (let scan ((xs (if (pair? items) (cdr items) '())))
-                         (cond ((null? xs) '())
-                               ((and (keyword? (car xs))
-                                     (string=? (keyword-t-name (car xs)) "exclude")
-                                     (pair? (cdr xs)))
-                                (map symbol-t-name (filter symbol-t? (seq->list (cadr xs)))))
-                               (else (scan (cdr xs)))))))
-        (when (and target (not filtered))
-          (chez-register-refer-all! (chez-current-ns) target)
-          (chez-register-refer-all-excludes! (chez-current-ns) target excluded))))
-    specs)
-  jolt-nil)
-(def-var! "clojure.core" "use" chez-runtime-use)
 ;; import: bring a deftype/defrecord from another ns into the current one. A spec
 ;; [from-ns Type ...] binds each Type's ctor closure under the current ns, so its
 ;; (Type. ...) constructor (host-new resolves it as a var) works after :import.
