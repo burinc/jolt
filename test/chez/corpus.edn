@@ -2514,6 +2514,17 @@
   {:suite "numbers / parse fns (1.11)" :label "parse-long empty nil" :expected "nil" :actual "(parse-long \"\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-long junk nil" :expected "nil" :actual "(parse-long \"12ab\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-long throws" :expected :throws :actual "(parse-long 42)" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long max long" :expected "9223372036854775807" :actual "(parse-long \"9223372036854775807\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long min long" :expected "-9223372036854775808" :actual "(parse-long \"-9223372036854775808\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long over max nil" :expected "nil" :actual "(parse-long \"9223372036854775808\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long under min nil" :expected "nil" :actual "(parse-long \"-9223372036854775809\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long +over max nil" :expected "nil" :actual "(parse-long \"+9223372036854775808\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long far over nil" :expected "nil" :actual "(parse-long \"99999999999999999999999999\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long zero-padded max" :expected "9223372036854775807" :actual "(parse-long \"0009223372036854775807\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long zero-padded over nil" :expected "nil" :actual "(parse-long \"018446744073709551616\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long overflow is not some?" :expected "false" :actual "(some? (parse-long \"9223372036854775808\"))" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long overflow has no class" :expected "nil" :actual "(class (parse-long \"9223372036854775808\"))" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long in range is a Long" :expected "java.lang.Long" :actual "(class (parse-long \"9223372036854775807\"))" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-double" :expected "1.5" :actual "(parse-double \"1.5\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-double int" :expected "4.0" :actual "(parse-double \"4\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-double sci" :expected "1500.0" :actual "(parse-double \"1.5e3\")" :portability :common}
