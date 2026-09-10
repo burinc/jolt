@@ -566,14 +566,14 @@
     ;; (Name. …) in the DEFINING ns is qualified to this by the analyzer, so a
     ;; deftype whose simple name collides with a built-in host class (tools.reader's
     ;; PushbackReader vs java.io.PushbackReader) still resolves correctly there.
-    (register-class-ctor! tag ctor)
+    (class-ctor-set! tag ctor)
     ;; Also register the simple name so (Name. …) resolves ns-agnostically across
     ;; files — BUT never clobber a built-in host class of the same simple name (an
     ;; unrelated ns's bare (Name. …) must still reach the built-in). A prior deftype
     ;; (tracked in chez-simple-name-tag) is fine to overwrite (last def wins / redef).
     (when (or (not (hashtable-ref class-ctors-tbl (symbol-t-name name-sym) #f))
               (hashtable-ref chez-simple-name-tag (symbol-t-name name-sym) #f))
-      (register-class-ctor! (symbol-t-name name-sym) ctor))
+      (class-ctor-set! (symbol-t-name name-sym) ctor))
     ;; index the tag so a cross-ns extend-protocol resolves the bare type name.
     (jolt-with-mutex rec-tbl-mu
       (hashtable-set! chez-deftype-tag-set tag #t)

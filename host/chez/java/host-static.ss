@@ -109,7 +109,15 @@
 
 (define (register-class-ctor! name proc)
   (hashtable-set! host-class-ctors-tbl name #t)
-  (hashtable-set! class-ctors-tbl name proc))
+  (class-ctor-set! name proc))
+
+;; The plain table write, for a ctor that is NOT the runtime coming to provide a
+;; host class: every deftype and defrecord binds (Name. …) through this table
+;; (protocols.ss), under its "ns.Name" tag AND its simple name. Recording those
+;; as the host's would make host-class-ctors-tbl — which is what
+;; runtime-provides-class? and the constructor-override warning read — answer
+;; yes for any class whose simple name a user type happens to share.
+(define (class-ctor-set! name proc) (hashtable-set! class-ctors-tbl name proc))
 
 ;; clojure.core/__register-class-ctor! lands here. Registering a class jolt does
 ;; not model is the intended use; REPLACING one it does is a process-wide

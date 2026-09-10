@@ -730,11 +730,20 @@
                                      "clojure.lang.IHashEq" "java.io.Serializable"))))
     ;; every defrecord gets a static create(map) on the JVM — it is what the
     ;; #ns.Rec{…} literal is read through, positionally or by key.
+    ;;
+    ;; class-statics-merge! and not register-class-statics!: this runs when USER
+    ;; code defines a record, not at boot, and register-class-statics! also
+    ;; records the class in host-class-statics-tbl — "the runtime provides this
+    ;; class", the table runtime-provides-class? answers from. A record's tag is
+    ;; not the runtime's: register-class-provider! runs at deps time, before any
+    ;; defrecord exists, so it would happily accept a :jolt/provides claim on
+    ;; that name, and the predicate has to agree. Both spellings would be marked
+    ;; too, so a bare `Widget` record shadowed every com.acme.Widget.
     (let ((ctor (hashtable-ref class-ctors-tbl tag #f))
           (shape (hashtable-ref chez-record-shapes-tbl
                                 (string-append (chez-current-ns) "/->" (symbol-t-name name-sym)) #f)))
       (when (and ctor shape)
-        (register-class-statics! tag
+        (class-statics-merge! tag
           (list (cons "create"
                       (lambda (m)
                         ;; declared fields positionally, anything else assoc'd on —
