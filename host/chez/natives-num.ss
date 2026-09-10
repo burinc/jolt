@@ -98,9 +98,19 @@
   (let* ((n (string-length s)) (i0 (if (sign-at? s 0 n) 1 0)))
     (and (> n i0) (= (skip-digits s i0 n) n))))
 
+;; parse-long is Long/parseLong with NumberFormatException caught to nil, so a
+;; non-nil result is always a LONG: a decimal outside signed 64-bit range is nil,
+;; not a wider number. The shape check alone would hand back what string->number
+;; makes of the digits, which on jolt's unified integer model is a bignum past
+;; the bounds -- (parse-long "9223372036854775808") reading 9223372036854775808N
+;; where the JVM and bb read nil, so a caller branching on the nil to catch the
+;; overflow takes the wrong arm. Range-check the value, not just the shape.
 (define (jolt-parse-long s)
   (if (not (string? s)) (throw-jvm (quote IllegalArgumentException) (string-append "parse-long requires a string: " (jolt-final-str s)))
-      (if (parse-long-shape? s) (string->number s) jolt-nil)))   ; exact long
+      (if (parse-long-shape? s)
+          (let ((v (string->number s)))                          ; exact integer
+            (if (and (>= v ->int-long-min) (<= v ->int-long-max)) v jolt-nil))
+          jolt-nil)))
 
 ;; strict float shape: [+-]? ( D+ (. D*)? | . D+ ) ([eE][+-]? D+)?  fully anchored.
 (define (parse-double-shape? s)
