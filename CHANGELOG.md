@@ -129,6 +129,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Clojure; the parse path also got about 7% faster, since it no longer allocates
   a trimmed string per call.
 
+- **`Double/parseDouble` and friends read Java's grammar too.** The same
+  helper-hands-the-string-to-Scheme mistake in the floating half:
+  `(Double/parseDouble "#xff")` was `255.0`, `"1/2"` was `0.5`, `"#b101"` was
+  `5.0` — none of them a double on the JVM — for `Double/parseDouble`,
+  `Float/parseFloat`, `Double/valueOf` and `(Double. s)` alike. In the other
+  direction both doors were missing Java forms a Scheme reader has no spelling
+  for: the hexadecimal significand (`(parse-double "0x1fp0")` is `31.0`,
+  `"0x1.8p1"` is `3.0`), a signed `NaN`, and `+Infinity`. `clojure.core/parse-double`
+  and the `java.lang` methods are now one grammar, the way `parse-long` and
+  `Long/parseLong` are, so the pair cannot answer differently again. 22 corpus
+  rows, certified.
+
 - **`format` speaks the rest of `java.util.Formatter`.** `%.3s` truncates a
   string where the precision used to be ignored (`(format "%.3s" "abcdef")` was
   `"abcdef"`), `%#x` / `%#X` / `%#o` prefix the radix (`0x`, `0X`, `0`) with the

@@ -2575,6 +2575,28 @@
   {:suite "interop / java.lang integer parsing" :label "narrow decode range message quotes the input" :expected "\"Value 128 out of range from input 0x80\"" :actual "(try (Byte/decode \"0x80\") (catch NumberFormatException e (.getMessage e)))" :portability :common}
   {:suite "interop / java.lang integer parsing" :label "bigint is not width-checked" :expected "9223372036854775808N" :actual "(bigint \"9223372036854775808\")" :portability :common}
   {:suite "interop / java.lang integer parsing" :label "BigInteger takes the same grammar" :expected :throws :actual "(java.math.BigInteger. \"1e3\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble rejects a #x radix prefix" :expected :throws :actual "(Double/parseDouble \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble rejects a ratio" :expected :throws :actual "(Double/parseDouble \"1/2\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble rejects a #b radix prefix" :expected :throws :actual "(Double/parseDouble \"#b101\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseFloat rejects a #x radix prefix" :expected :throws :actual "(Float/parseFloat \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "Double/valueOf rejects a #x radix prefix" :expected :throws :actual "(Double/valueOf \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "(Double. s) rejects a #x radix prefix" :expected :throws :actual "(Double. \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double rejects a #x radix prefix" :expected "nil" :actual "(parse-double \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble takes a hex significand" :expected "31.0" :actual "(Double/parseDouble \"0x1fp0\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble hex with a fraction" :expected "3.0" :actual "(Double/parseDouble \"0x1.8p1\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble signs a hex significand" :expected "-31.0" :actual "(Double/parseDouble \"-0x1fp0\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double takes a hex significand" :expected "31.0" :actual "(parse-double \"0x1fp0\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double hex with a fraction" :expected "3.0" :actual "(parse-double \"0x1.8p1\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "a hex integer is not a double" :expected "nil" :actual "(parse-double \"0x1f\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double signed NaN is NaN" :expected "true" :actual "(Double/isNaN (parse-double \"-NaN\"))" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double takes +Infinity" :expected "##Inf" :actual "(parse-double \"+Infinity\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double keeps -Infinity" :expected "##-Inf" :actual "(parse-double \"-Infinity\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble trims, unlike the integers" :expected "1.5" :actual "(Double/parseDouble \" 1.5 \")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble takes a d suffix" :expected "1.5" :actual "(Double/parseDouble \"1.5d\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble takes an f suffix" :expected "1.5" :actual "(Double/parseDouble \"1.5f\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double takes an exponent and a suffix" :expected "150.0" :actual "(parse-double \"1.5e2d\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble saturates rather than failing" :expected "##Inf" :actual "(Double/parseDouble \"1e400\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "lowercase infinity is not a double" :expected "nil" :actual "(parse-double \"infinity\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-double" :expected "1.5" :actual "(parse-double \"1.5\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-double int" :expected "4.0" :actual "(parse-double \"4\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-double sci" :expected "1500.0" :actual "(parse-double \"1.5e3\")" :portability :common}
