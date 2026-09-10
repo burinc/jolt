@@ -100,7 +100,7 @@ run_case() {
 # non-allowed one is neither let through nor re-suggested.
 run_local_case() {
   app="$root/test/chez/$1"; ns="$2"; args="$3"; assert_missing="$4"; expect="${5:-shake}"
-  max_kept="${6:-$shake_max_kept}"; expect_out="$7"
+  max_kept="${6:-$shake_max_kept}"; expect_out="${7:-}"
   [ -d "$app" ] || { echo "  - $1: skipped (not present)"; return; }
   b0="$tmp/$1-plain"; b1="$tmp/$1-shake"
   bdir="$tmp/$1-shake.build"
