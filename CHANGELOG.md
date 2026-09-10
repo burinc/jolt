@@ -85,6 +85,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`parse-long` answers `nil` past the long bounds, not a bignum.**
+  `clojure.core/parse-long` is `Long/parseLong` with `NumberFormatException`
+  caught to `nil`, so every non-`nil` result is a `Long` and a decimal outside
+  signed 64-bit range is `nil` — never a larger number. jolt checked only the
+  string *shape* and then returned whatever the digits parsed to, which on
+  jolt's unified integer model is a bignum past the bounds: `(parse-long
+  "9223372036854775808")` read `9223372036854775808N` where the JVM and bb read
+  `nil`, and `(some? (parse-long "9223372036854775808"))` was `true` on jolt and
+  `false` everywhere else — so a caller branching on the `nil` to catch the
+  overflow took the wrong arm and got a `clojure.lang.BigInt` out of a fn
+  documented to return a `Long`. The value is now range-checked against the same
+  bounds the bit family's operand cast already enforces. In-range values,
+  including both boundaries, are unchanged, and `parse-double` was never
+  affected — `Double.parseDouble` saturates to `##Inf` rather than failing,
+  which jolt already matched. 11 corpus rows, certified against reference
+  Clojure (#927).
+
 - **`format` speaks the rest of `java.util.Formatter`.** `%.3s` truncates a
   string where the precision used to be ignored (`(format "%.3s" "abcdef")` was
   `"abcdef"`), `%#x` / `%#X` / `%#o` prefix the radix (`0x`, `0X`, `0`) with the
