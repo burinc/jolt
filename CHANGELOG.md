@@ -19,7 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the app's `deps.edn` or any library's names the defs the author vouches for,
   read where `:jolt/native` is read and unioned, so a library ships its list
   once for every app that uses it. Nothing is kept on an allowed def's behalf.
-  With no declaration the shake bails exactly as before.
+  With no declaration the shake bails exactly as before. Vouching wrongly moves
+  the failure into the binary rather than failing the build: a `resolve` of a
+  dropped def answers `nil` there, silently, and an `eval` raises because the
+  compiler image went with the same vouch.
 
   An allowed def is skipped by the compiler-needed scan as well as the bail
   scan, on purpose: a site vouched never to run needs no compiler, and skipping

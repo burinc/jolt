@@ -458,6 +458,12 @@ after inlining, which may be the caller of the fn that wrote it. An allowed
 def is skipped by the compiler-image check too: a lookup vouched never to run
 needs no compiler.
 
+Vouching wrongly does not fail the build — it moves the failure into the
+binary, where the lookup sees only what the shake kept. A `resolve` of a def
+the shake dropped answers `nil` where the unshaken binary answers the var, and
+that one is silent; an `eval` raises, because the compiler image it needed was
+dropped on the same vouch. Name a site only when you can say why it is dead.
+
 `--boot` trades the other way. The boot image ships as a prebuilt heap image
 (*vfasl*), which starts faster and takes more room — `--boot small` keeps the
 image but compresses it with gzip, and `--boot plain` drops it altogether:
