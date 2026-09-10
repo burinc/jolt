@@ -2155,6 +2155,22 @@
         (cons "isAssignableFrom" (lambda (self other)
                                    (let ((ka (class-key self)) (kb (class-key other)))
                                      (if (and ka kb (jch-isa? kb ka)) #t #f))))
+        ;; Class.cast: the JVM's checked narrowing — the value back when it is
+        ;; already an instance, a ClassCastException otherwise. A reflective
+        ;; interpreter casts every argument to its parameter type before the
+        ;; call (SCI's box-arg does), and jolt reports every parameter as
+        ;; Object, where the cast IS the identity. Without an arm the lookup fell
+        ;; through to resolving the class by name, which raised for a name no
+        ;; provider supplies (java.lang.Object) — every interpreted call failed
+        ;; there before reaching the method.
+        (cons "cast" (lambda (self o)
+                       (if (instance-check self o)
+                           o
+                           (throw-jvm
+                            'ClassCastException
+                            (string-append "class " (jclass-jvm-name (jolt-class o))
+                                           " cannot be cast to class "
+                                           (jclass-jvm-name self))))))
         (cons "getConstructors" (lambda (self) (class-constructors self)))
         (cons "getDeclaredConstructors" (lambda (self) (class-constructors self)))
         ;; getModifiers: the JVM bitmask, derived from the class graph (jolt has
@@ -2320,7 +2336,15 @@
         (cons "invokeInstanceMethod"
               (lambda (target method args)
                 (record-method-dispatch target (jolt-str-render-one method)
-                                        (list->cseq (reflect-args args)))))))
+                                        (list->cseq (reflect-args args)))))
+        ;; The two companions a reflective caller reaching a member through
+        ;; getMethods (java/natives-array.ss) needs. prepRet unboxes a primitive
+        ;; return on the JVM; jolt reports Object for every return type, so the
+        ;; value passes through. getAsMethodOfAccessibleBase opens a member
+        ;; declared by a non-public class; jolt's members carry no accessibility
+        ;; state to open, and its classes are public, so the member stands.
+        (cons "prepRet" (lambda (c ret) ret))
+        (cons "getAsMethodOfAccessibleBase" (lambda (c m target) m))))
 ;; A deftype/defrecord type token answers every java.lang.Class method, through
 ;; the SAME table (class inst) uses — records-dispatch.ss owns the token arm and
 ;; loads before this file, so it calls back through here. Returns a one-element
