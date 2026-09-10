@@ -5266,6 +5266,59 @@
   {:suite "iref / ARef interop methods" :label "a volatile is not watchable" :expected ":iae" :actual "(try (.addWatch (volatile! 1) :k (fn [k r o n] nil)) :no-throw (catch IllegalArgumentException _ :iae))" :portability :jvm}
   {:suite "iref / ARef interop methods" :label "a wrong-arity call is not a method" :expected ":iae" :actual "(try (.addWatch (atom 0) :k) :no-throw (catch IllegalArgumentException _ :iae))" :portability :jvm}
   {:suite "iref / ARef interop methods" :label "a deftype's own IRef methods win over the reference arm" :expected "[true {:mine true} :mine-validator true]" :actual "(do (deftype AW1 [] clojure.lang.IRef (addWatch [this k f] this) (removeWatch [this k] this) (getWatches [this] {:mine true}) (setValidator [this f] nil) (getValidator [this] :mine-validator) (deref [this] 1)) (let [t (AW1.)] [(identical? t (.addWatch t :k nil)) (.getWatches t) (.getValidator t) (identical? t (.removeWatch t :k))]))" :portability :jvm}
+  ;; The interface each reference type declares BELOW ARef, reached as METHODS.
+  ;; IDeref is the shared root (get() and the four getAs* bridges are DEFAULT
+  ;; methods on it, so every deref-able reference carries them, and the
+  ;; two-argument deref belongs to IBlockingDeref alone -- a promise and a future
+  ;; have it, an agent and a delay do not); then IAtom/IAtom2 for an atom, the
+  ;; transaction and history surface for a ref, and the error/queue/restart
+  ;; surface for an agent. Each bottoms out in the same native the clojure.core
+  ;; fn of that meaning is bound to, so a mutation through interop validates and
+  ;; notifies watches exactly as swap! and ref-set do.
+  {:suite "iref / IAtom interop methods" :label "atom .deref" :expected "41" :actual "(.deref (atom 41))" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .get" :expected "41" :actual "(.get (atom 41))" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swap/1" :expected "[2 2]" :actual "(let [a (atom 1)] [(.swap a inc) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swap/2" :expected "[11 11]" :actual "(let [a (atom 1)] [(.swap a + 10) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swap/3" :expected "[111 111]" :actual "(let [a (atom 1)] [(.swap a + 10 100) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swap/4-with-seq" :expected "[11111 11111]" :actual "(let [a (atom 1)] [(.swap a + 10 100 (seq [1000 10000])) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .reset" :expected "[9 9]" :actual "(let [a (atom 1)] [(.reset a 9) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .compareAndSet" :expected "[true false 2]" :actual "(let [a (atom 1)] [(.compareAndSet a 1 2) (.compareAndSet a 1 3) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swapVals/1" :expected "[[1 2] 2]" :actual "(let [a (atom 1)] [(vec (.swapVals a inc)) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swapVals/2" :expected "[[1 11] 11]" :actual "(let [a (atom 1)] [(vec (.swapVals a + 10)) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swapVals/4" :expected "[[1 1111] 1111]" :actual "(let [a (atom 1)] [(vec (.swapVals a + 10 100 (seq [1000]))) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .resetVals" :expected "[[1 9] 9]" :actual "(let [a (atom 1)] [(vec (.resetVals a 9)) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom .swap validator" :expected "[:ise 2]" :actual "(let [a (atom 2 :validator even?)] [(try (.swap a inc) (catch IllegalStateException _ :ise)) (deref a)])" :portability :jvm}
+  {:suite "iref / IAtom interop methods" :label "atom mutators notify" :expected "[[1 2] [2 9] [9 10] [10 11] [11 0]]" :actual "(let [a (atom 1) log (atom [])] (add-watch a :k (fn [k r o n] (swap! log conj [o n]))) (.swap a inc) (.reset a 9) (.compareAndSet a 9 10) (.swapVals a inc) (.resetVals a 0) (deref log))" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "get on every IDeref" :expected "[1 2 3 4 5 6 7 8]" :actual "(mapv (fn [x] (.get x)) [(atom 1) (ref 2) (agent 3) (volatile! 4) (delay 5) (doto (promise) (deliver 6)) (future 7) (reduced 8)])" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "deref on every IDeref" :expected "[1 2 3 4 5 6 7 8]" :actual "(mapv (fn [x] (.deref x)) [(atom 1) (ref 2) (agent 3) (volatile! 4) (delay 5) (doto (promise) (deliver 6)) (future 7) (reduced 8)])" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "getAs bridges" :expected "[7 7 7.0 true false]" :actual "(let [a (atom 7)] [(.getAsInt a) (.getAsLong a) (.getAsDouble a) (.getAsBoolean a) (.getAsBoolean (atom nil))])" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "getAsInt truncates" :expected "3" :actual "(.getAsInt (atom 3.9))" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "blocking .deref timeout" :expected ":to" :actual "(.deref (promise) 50 :to)" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "blocking .deref on a delay" :expected ":iae" :actual "(try (.deref (delay 1) 50 :to) :no-throw (catch IllegalArgumentException _ :iae))" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .deref" :expected "41" :actual "(.deref (ref 41))" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .set in a txn" :expected "[5 5]" :actual "(let [r (ref 1)] [(dosync (.set r 5)) (deref r)])" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .set outside a txn" :expected ":ise" :actual "(try (.set (ref 1) 5) :no-throw (catch IllegalStateException _ :ise))" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .alter" :expected "[111 111]" :actual "(let [r (ref 1)] [(dosync (.alter r + (seq [10 100]))) (deref r)])" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .commute" :expected "[11 11]" :actual "(let [r (ref 1)] [(dosync (.commute r + (seq [10]))) (deref r)])" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .touch is void" :expected "nil" :actual "(let [r (ref 1)] (dosync (.touch r)))" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref history knobs" :expected "[0 10 0 2 7]" :actual "(let [r (ref 1)] [(.getMinHistory r) (.getMaxHistory r) (.getHistoryCount r) (do (.setMinHistory r 2) (.getMinHistory r)) (do (.setMaxHistory r 7) (.getMaxHistory r))])" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .setMinHistory returns the ref" :expected "true" :actual "(let [r (ref 1)] (identical? r (.setMinHistory r 3)))" :portability :jvm}
+  {:suite "iref / Ref interop methods" :label "ref .trimHistory is void" :expected "nil" :actual "(.trimHistory (ref 1))" :portability :jvm}
+  {:suite "iref / Agent interop methods" :label "agent .deref" :expected "41" :actual "(.deref (agent 41))" :portability :jvm}
+  {:suite "iref / Agent interop methods" :label "agent .getQueueCount" :expected "0" :actual "(let [ag (agent 0)] (await ag) (.getQueueCount ag))" :portability :jvm}
+  {:suite "iref / Agent interop methods" :label "agent .getError" :expected "nil" :actual "(.getError (agent 1))" :portability :jvm}
+  {:suite "iref / Agent interop methods" :label "agent error mode/handler are void" :expected "[nil :continue nil true]" :actual "(let [ag (agent 1)] [(.setErrorMode ag :continue) (.getErrorMode ag) (.setErrorHandler ag (fn [a e] nil)) (fn? (.getErrorHandler ag))])" :portability :jvm}
+  {:suite "iref / Agent interop methods" :label "agent .restart answers the state" :expected "[true 5 5 true]" :actual "(let [ag (agent 1)] (send ag (fn [_] (throw (Exception. \"boom\")))) (Thread/sleep 400) [(some? (.getError ag)) (.restart ag 5 true) (deref ag) (nil? (.getError ag))])" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "var .deref and .get" :expected "[3 3]" :actual "(do (def pv 3) [(.deref (var pv)) (.get (var pv))])" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "a wrong arity is not a method" :expected "[:iae :iae :iae :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch IllegalArgumentException _ :iae))) [(fn [] (.swap (atom 1))) (fn [] (.reset (atom 1) 1 2)) (fn [] (.set (ref 1) 1 2)) (fn [] (.touch (ref 1) 1))])" :portability :jvm}
+  {:suite "iref / IDeref interop methods" :label "a non-reference has none of them" :expected "[:iae :iae :iae :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch IllegalArgumentException _ :iae))) [(fn [] (.swap [1] inc)) (fn [] (.getQueueCount [1])) (fn [] (.deref [1])) (fn [] (.resetVals [1] 2))])" :portability :jvm}
+  ;; ...and the same three natives seen through their clojure.core door: these
+  ;; answered the AGENT, which threads but is not what the JVM evaluates to --
+  ;; Agent.setErrorMode/setErrorHandler are void and restart answers the new
+  ;; state, so clear-agent-errors (restart-agent over the current state) does too.
+  {:suite "conformance / agents" :label "restart-agent answers the new state, not the agent" :expected "5" :actual "(let [ag (agent 1)] (send ag (fn [_] (throw (Exception. \"boom\")))) (Thread/sleep 400) (restart-agent ag 5))" :portability :jvm}
+  {:suite "conformance / agents" :label "clear-agent-errors answers the state it restarted with" :expected "1" :actual "(let [ag (agent 1)] (send ag (fn [_] (throw (Exception. \"boom\")))) (Thread/sleep 400) (clear-agent-errors ag))" :portability :jvm}
+  {:suite "conformance / agents" :label "set-error-mode! and set-error-handler! are void" :expected "[nil nil]" :actual "(let [ag (agent 1)] [(set-error-mode! ag :continue) (set-error-handler! ag (fn [a e] nil))])" :portability :jvm}
   {:suite "iref / meta" :label "alter-meta! works on atoms" :expected "{:x 1 :y 2}" :actual "(let [a (atom 1 :meta {:x 1})] (alter-meta! a assoc :y 2))" :portability :common}
   {:suite "casts / checked narrow" :label "doubles range-check themselves, then truncate" :expected "[1 1 3 1 \\a 0]" :actual "[(byte 1.1) (short 1.9) (int 3.7) (long 1.5) (char 97.5) (long ##NaN)]" :portability :common}
   {:suite "casts / checked narrow" :label "out-of-range values throw IllegalArgumentException" :expected "[:iae :iae :iae :iae :iae :iae :iae]" :actual "[(try (byte 128) (catch IllegalArgumentException _ :iae)) (try (byte 127.000001) (catch IllegalArgumentException _ :iae)) (try (short 40000) (catch IllegalArgumentException _ :iae)) (try (int 2147483647.000001) (catch IllegalArgumentException _ :iae)) (try (char -1) (catch IllegalArgumentException _ :iae)) (try (char 1114112) (catch IllegalArgumentException _ :iae)) (try (long 1e300) (catch IllegalArgumentException _ :iae))]" :portability :common}

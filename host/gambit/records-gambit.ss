@@ -2209,6 +2209,112 @@
      (and (fx=? argc 0) jolt-get-validator))
     (else #f)))
 
+(define rd-extra-deref-hook #f)
+
+(define (set-rd-extra-deref-hook! f)
+  (set! rd-extra-deref-hook f))
+
+(define (rd-deref-kind x)
+  (cond
+    ((or (jolt-atom? x)
+         (jolt-ref? x)
+         (jvol? x)
+         (jolt-reduced? x))
+     'ideref)
+    (rd-extra-deref-hook (rd-extra-deref-hook x))
+    (else #f)))
+
+(define (rd-derefable? x) (and (rd-deref-kind x) #t))
+
+(define (rd-blocking-derefable? x)
+  (eq? 'iblocking (rd-deref-kind x)))
+
+(define (rd-ideref-method x name argc)
+  (cond
+    ((string=? name "deref")
+     (and (or (fx=? argc 0)
+              (and (fx=? argc 2) (rd-blocking-derefable? x)))
+          jolt-deref))
+    ((string=? name "get") (and (fx=? argc 0) jolt-deref))
+    ((string=? name "getAsBoolean")
+     (and (fx=? argc 0) rd-deref-as-boolean))
+    ((string=? name "getAsInt")
+     (and (fx=? argc 0) rd-deref-as-int))
+    ((string=? name "getAsLong")
+     (and (fx=? argc 0) rd-deref-as-long))
+    ((string=? name "getAsDouble")
+     (and (fx=? argc 0) rd-deref-as-double))
+    (else #f)))
+
+(define (rd-deref-as-boolean x)
+  (jolt-boolean (jolt-deref x)))
+
+(define (rd-deref-as-int x) (jolt-int-cast (jolt-deref x)))
+
+(define (rd-deref-as-long x)
+  (jolt-long-cast (jolt-deref x)))
+
+(define (rd-deref-as-double x) (jolt-double (jolt-deref x)))
+
+(define (rd-atom-method name argc)
+  (cond
+    ((string=? name "swap")
+     (and (memv argc '(1 2 3 4)) rd-atom-swap))
+    ((string=? name "swapVals")
+     (and (memv argc '(1 2 3 4)) rd-atom-swap-vals))
+    ((string=? name "reset") (and (fx=? argc 1) jolt-reset!))
+    ((string=? name "resetVals")
+     (and (fx=? argc 1) jolt-reset-vals!))
+    ((string=? name "compareAndSet")
+     (and (fx=? argc 2) jolt-compare-and-set!))
+    (else #f)))
+
+(define (rd-spread-tail args)
+  (if (fx=? (length args) 4)
+      (cons
+        (car args)
+        (cons
+          (cadr args)
+          (cons (caddr args) (rd-args->list (cadddr args)))))
+      args))
+
+(define (rd-atom-swap a . args)
+  (apply jolt-swap! a (rd-spread-tail args)))
+
+(define (rd-atom-swap-vals a . args)
+  (apply jolt-swap-vals! a (rd-spread-tail args)))
+
+(define (rd-ref-method name argc)
+  (cond
+    ((string=? name "set") (and (fx=? argc 1) jolt-ref-set))
+    ((string=? name "alter") (and (fx=? argc 2) rd-ref-alter))
+    ((string=? name "commute")
+     (and (fx=? argc 2) rd-ref-commute))
+    ((string=? name "touch") (and (fx=? argc 0) rd-ref-touch))
+    ((string=? name "getMinHistory")
+     (and (fx=? argc 0) jolt-ref-min-history))
+    ((string=? name "setMinHistory")
+     (and (fx=? argc 1) jolt-ref-min-history))
+    ((string=? name "getMaxHistory")
+     (and (fx=? argc 0) jolt-ref-max-history))
+    ((string=? name "setMaxHistory")
+     (and (fx=? argc 1) jolt-ref-max-history))
+    ((string=? name "getHistoryCount")
+     (and (fx=? argc 0) jolt-ref-history-count))
+    ((string=? name "trimHistory")
+     (and (fx=? argc 0) rd-ref-trim-history))
+    (else #f)))
+
+(define (rd-ref-alter r f args)
+  (apply jolt-alter r f (rd-args->list args)))
+
+(define (rd-ref-commute r f args)
+  (apply jolt-commute r f (rd-args->list args)))
+
+(define (rd-ref-touch r) (jolt-ensure r) jolt-nil)
+
+(define (rd-ref-trim-history r) jolt-nil)
+
 (define (record-method-dispatch-base obj method-name
          rest-args)
   (let ((rest (if (jolt-nil? rest-args)
@@ -2380,6 +2486,15 @@
          (else (dispatch-miss obj method-name rest))))
       ((and (jolt-iref-watchable? obj)
             (rd-iref-method method-name (length rest))) =>
+       (lambda (f) (apply f obj rest)))
+      ((and (jolt-atom? obj)
+            (rd-atom-method method-name (length rest))) =>
+       (lambda (f) (apply f obj rest)))
+      ((and (jolt-ref? obj)
+            (rd-ref-method method-name (length rest))) =>
+       (lambda (f) (apply f obj rest)))
+      ((and (rd-derefable? obj)
+            (rd-ideref-method obj method-name (length rest))) =>
        (lambda (f) (apply f obj rest)))
       ((var-cell? obj)
        (cond
@@ -2576,6 +2691,8 @@
 (define arm-priority-htable 43)
 
 (define arm-priority-host-type 44)
+
+(define arm-priority-agent 45)
 
 (define (record-method-dispatch obj method-name rest-args)
   (when (jolt-nil? obj)

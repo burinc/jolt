@@ -148,6 +148,98 @@
         ((string=? name "getValidator")  (and (fx=? argc 0) jolt-get-validator))
         (else #f)))
 
+;; clojure.lang.IDeref, the root every reference shares. On the JVM it is one
+;; real method plus five DEFAULT ones: get() is deref(), and getAsBoolean /
+;; getAsInt / getAsLong / getAsDouble are the java.util.function bridges, each
+;; the matching RT cast of deref(). The casts here are the same natives
+;; clojure.core/boolean, int, long and double are bound to, so (.getAsInt (atom
+;; 3.9)) truncates to 3 exactly as (int 3.9) does.
+;;
+;; The two-argument deref is IBlockingDeref's (ms, timeout-val), and only a
+;; promise and a future declare it. That arity has to be screened HERE rather than
+;; left to jolt-deref, which refuses it with the ClassCastException @ raises: the
+;; JVM never gets that far, because there is no two-argument deref on a Delay to
+;; reflect onto in the first place, so (.deref (delay 1) 50 :to) is "No matching
+;; method deref found taking 2 args" there. Hence a KIND rather than a predicate.
+;;
+;; rd-deref-kind knows the deref-able types THIS file can see. future / promise /
+;; agent / delay live in java/concurrency.ss, which loads long after this file and
+;; is no part of the Gambit host at all, so it classifies its own four through the
+;; hook — the same shape as rd-class-method-hook above. A var is deliberately
+;; absent: the Var arm below answers deref/get off var-cell-deref, which hands
+;; back the Unbound object where jolt-deref would throw, and it keeps that.
+(define rd-extra-deref-hook #f)
+(define (set-rd-extra-deref-hook! f) (set! rd-extra-deref-hook f))
+(define (rd-deref-kind x)
+  (cond ((or (jolt-atom? x) (jolt-ref? x) (jvol? x) (jolt-reduced? x)) (quote ideref))
+        (rd-extra-deref-hook (rd-extra-deref-hook x))
+        (else #f)))
+(define (rd-derefable? x) (and (rd-deref-kind x) #t))
+(define (rd-blocking-derefable? x) (eq? (quote iblocking) (rd-deref-kind x)))
+(define (rd-ideref-method x name argc)
+  (cond ((string=? name "deref")
+         (and (or (fx=? argc 0)
+                  (and (fx=? argc 2) (rd-blocking-derefable? x)))
+              jolt-deref))
+        ((string=? name "get")          (and (fx=? argc 0) jolt-deref))
+        ((string=? name "getAsBoolean") (and (fx=? argc 0) rd-deref-as-boolean))
+        ((string=? name "getAsInt")     (and (fx=? argc 0) rd-deref-as-int))
+        ((string=? name "getAsLong")    (and (fx=? argc 0) rd-deref-as-long))
+        ((string=? name "getAsDouble")  (and (fx=? argc 0) rd-deref-as-double))
+        (else #f)))
+(define (rd-deref-as-boolean x) (jolt-boolean (jolt-deref x)))
+(define (rd-deref-as-int x) (jolt-int-cast (jolt-deref x)))
+(define (rd-deref-as-long x) (jolt-long-cast (jolt-deref x)))
+(define (rd-deref-as-double x) (jolt-double (jolt-deref x)))
+
+;; clojure.lang.IAtom / IAtom2 — the five mutators, each the native the
+;; clojure.core fn of the same meaning is bound to, so the CAS retry, the
+;; validator and the watch notification are the ones swap!/reset! already do.
+;;
+;; swap and swapVals have a fourth arity that is the JVM's (f, x, y, ISeq args)
+;; spread form — RT.listStar there, the trailing seq spliced onto the tail here.
+;; Every shorter arity is already flat, which is why the spread only fires at 4.
+(define (rd-atom-method name argc)
+  (cond ((string=? name "swap")          (and (memv argc (quote (1 2 3 4))) rd-atom-swap))
+        ((string=? name "swapVals")      (and (memv argc (quote (1 2 3 4))) rd-atom-swap-vals))
+        ((string=? name "reset")         (and (fx=? argc 1) jolt-reset!))
+        ((string=? name "resetVals")     (and (fx=? argc 1) jolt-reset-vals!))
+        ((string=? name "compareAndSet") (and (fx=? argc 2) jolt-compare-and-set!))
+        (else #f)))
+(define (rd-spread-tail args)
+  (if (fx=? (length args) 4)
+      (cons (car args) (cons (cadr args) (cons (caddr args) (rd-args->list (cadddr args)))))
+      args))
+(define (rd-atom-swap a . args) (apply jolt-swap! a (rd-spread-tail args)))
+(define (rd-atom-swap-vals a . args) (apply jolt-swap-vals! a (rd-spread-tail args)))
+
+;; clojure.lang.Ref. set / alter / commute are the transaction mutators, and the
+;; natives raise IllegalStateException off a transaction exactly as Ref does;
+;; alter and commute take the JVM's (fn, ISeq args) rather than a spread arglist.
+;; touch is what clojure.core/ensure calls and is VOID there, so the value ensure
+;; answers is dropped. jolt keeps no ref history — ref-history-count is 0 by
+;; construction — so getHistoryCount answers 0 and trimHistory is the no-op it
+;; already is, while the min/max knobs are the same side tables ref-min-history
+;; and ref-max-history read (each native is getter and setter by arity, and the
+;; setter answers the ref, as Ref.setMinHistory does). deref is not here: a ref
+;; is rd-derefable?, so the IDeref table above claims it.
+(define (rd-ref-method name argc)
+  (cond ((string=? name "set")             (and (fx=? argc 1) jolt-ref-set))
+        ((string=? name "alter")           (and (fx=? argc 2) rd-ref-alter))
+        ((string=? name "commute")         (and (fx=? argc 2) rd-ref-commute))
+        ((string=? name "touch")           (and (fx=? argc 0) rd-ref-touch))
+        ((string=? name "getMinHistory")   (and (fx=? argc 0) jolt-ref-min-history))
+        ((string=? name "setMinHistory")   (and (fx=? argc 1) jolt-ref-min-history))
+        ((string=? name "getMaxHistory")   (and (fx=? argc 0) jolt-ref-max-history))
+        ((string=? name "setMaxHistory")   (and (fx=? argc 1) jolt-ref-max-history))
+        ((string=? name "getHistoryCount") (and (fx=? argc 0) jolt-ref-history-count))
+        ((string=? name "trimHistory")     (and (fx=? argc 0) rd-ref-trim-history))
+        (else #f)))
+(define (rd-ref-alter r f args) (apply jolt-alter r f (rd-args->list args)))
+(define (rd-ref-commute r f args) (apply jolt-commute r f (rd-args->list args)))
+(define (rd-ref-touch r) (jolt-ensure r) jolt-nil)
+(define (rd-ref-trim-history r) jolt-nil)
+
 (define (record-method-dispatch-base obj method-name rest-args)
   (let ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args))))
     (cond
@@ -314,6 +406,19 @@
       ;; not watchable, so it never gets here (its own methods answered in the
       ;; dot-form arm anyway), and a plain value falls through to dispatch-miss.
       ((and (jolt-iref-watchable? obj) (rd-iref-method method-name (length rest)))
+       => (lambda (f) (apply f obj rest)))
+      ;; ...and the interface each reference type declares BELOW ARef: IDeref for
+      ;; every one of them, IAtom/IAtom2 for an atom, Ref's transaction and
+      ;; history surface for a ref. Agent's own half is a registered arm in
+      ;; java/concurrency.ss, where its natives live. Same shape as the watch arm
+      ;; above — receiver first, then name and arity — so a wrong arity or a
+      ;; receiver of the wrong kind falls through to dispatch-miss and reports the
+      ;; JVM's "No matching method" rather than faulting inside a native.
+      ((and (jolt-atom? obj) (rd-atom-method method-name (length rest)))
+       => (lambda (f) (apply f obj rest)))
+      ((and (jolt-ref? obj) (rd-ref-method method-name (length rest)))
+       => (lambda (f) (apply f obj rest)))
+      ((and (rd-derefable? obj) (rd-ideref-method obj method-name (length rest)))
        => (lambda (f) (apply f obj rest)))
       ;; clojure.lang.Var: ns -> its Namespace, sym -> the simple-name Symbol.
       ;; clojure.spec.alpha's ->sym reads (.name (.ns v)) and (.sym v).
@@ -532,6 +637,11 @@
 (define arm-priority-nio-path 42)     ; java.nio.file.Path methods (above jfile)
 (define arm-priority-htable 43)       ; tagged htable method registry
 (define arm-priority-host-type 44)    ; jhost/number/string per-type dispatch
+;; java/concurrency.ss registers clojure.lang.Agent's own methods here rather
+;; than in the base above: the agent natives are in that file, it loads long
+;; after this one, and the Gambit host does not include it at all. Nothing else
+;; claims those names, so the tier is only about where the code can live.
+(define arm-priority-agent 45)      ; clojure.lang.Agent's own method surface
 ;; A nil receiver is a NullPointerException before any arm looks: the JVM
 ;; cannot invoke anything on null. (.toString nil) used to answer "" and
 ;; (.equals nil 1) false through the universal Object arm.

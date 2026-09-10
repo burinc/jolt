@@ -88,6 +88,15 @@
   {:suite "repl-demunge" :expr "(do (require 'clojure.repl) (ifn? (requiring-resolve 'clojure.repl/demunge)))" :expected "true"}
   {:suite "special-form precedence" :expr "(do (ns sftest (:refer-clojure :exclude [def])) (defmacro def [n v] :shadowed) (clojure.core/defn ff [] 99) (ff))" :expected "99"}
   {:suite "special-form precedence" :expr "(do (set! (. clojure.lang.RT checkSpecAsserts) true) clojure.lang.RT/checkSpecAsserts)" :expected "true"}
+  ;; Agent.dispatch(fn, args, exec) is the one method on the reference types that
+  ;; is a jolt SUPERSET rather than a match, so it is a unit row and not a corpus
+  ;; one: jolt runs one serialized worker per agent, so the executor argument has
+  ;; nothing to select and is accepted and ignored, where the JVM needs a real
+  ;; Executor (given null it answers the agent and silently never runs the
+  ;; action). jolt has no Agent/pooledExecutor to name, so no common row exists.
+  {:suite "agent-interop" :label "dispatch enqueues the action and answers the agent" :expr "(let [ag (agent 1)] [(identical? ag (.dispatch ag + (seq [10 100]) nil)) (do (await ag) @ag)])" :expected "[true 111]"}
+  {:suite "agent-interop" :label "dispatch with no args is a plain send" :expr "(let [ag (agent 1)] (.dispatch ag inc (seq []) nil) (await ag) @ag)" :expected "2"}
+  {:suite "agent-interop" :label "getQueueCount counts the actions still pending" :expr "(let [ag (agent 0)] (await ag) (.getQueueCount ag))" :expected "0"}
   {:suite "atomwatch" :expr "(let [a (atom 0) seen (atom 0)] (add-watch a :k (fn [k r o n] (reset! seen 1))) (reset! a 5) @seen)" :expected "1"}
   {:suite "atomwatch" :expr "(let [a (atom 0) seen (atom 0)] (add-watch a :k (fn [k r o n] (swap! seen inc))) (remove-watch a :k) (reset! a 5) @seen)" :expected "0"}
   {:suite "atomwatch" :expr "(let [a (atom 0) log (atom [])] (add-watch a :k (fn [k r o n] (swap! log conj [o n]))) (reset! a 1) (reset! a 2) @log)" :expected "[[0 1] [1 2]]"}
