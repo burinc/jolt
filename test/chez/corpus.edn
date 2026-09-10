@@ -4874,6 +4874,41 @@
   {:suite "interop / instance? on host interfaces" :label "getFirst/getLast on an empty collection raise NoSuchElementException" :expected "[:nse :nse]" :actual "[(try (.getFirst []) (catch java.util.NoSuchElementException e :nse)) (try (.getLast (list)) (catch java.util.NoSuchElementException e :nse))]" :portability :jvm}
   {:suite "interop / instance? on host interfaces" :label "a persistent collection refuses the java.util mutators with UnsupportedOperationException" :expected "[:uoe :uoe :uoe :uoe :uoe :uoe :uoe]" :actual "(let [f (fn [t] (try (t) (catch UnsupportedOperationException e :uoe)))] [(f (fn [] (.add [1] 2))) (f (fn [] (.addFirst [1] 0))) (f (fn [] (.removeLast [1]))) (f (fn [] (.add (list 1) 2))) (f (fn [] (.set [1] 0 2))) (f (fn [] (.add #{} 1))) (f (fn [] (.remove (map inc [1]) 0)))])" :portability :jvm}
   {:suite "interop / instance? on host interfaces" :label "ArrayList has the SequencedCollection methods" :expected "[1 2 [0 1] [2 [1]]]" :actual "(let [a (doto (java.util.ArrayList.) (.add 1) (.add 2)) b (doto (java.util.ArrayList.) (.add 1)) c (doto (java.util.ArrayList.) (.add 1) (.add 2))] [(.getFirst a) (.getLast a) (do (.addFirst b 0) (vec b)) [(.removeLast c) (vec c)]])" :portability :jvm}
+  ;; A java.util mutator name is not a method until its ARITY matches: List/set
+  ;; is set(int,E), so a one-argument (.set [1 2] 9) matches nothing on the JVM
+  ;; and is its "No matching method" IllegalArgumentException, not the
+  ;; UnsupportedOperationException an immutable collection answers to a mutator it
+  ;; really has. jolt refused every one it merely SPELLED, at any arity, which put
+  ;; those calls out of reach of a (catch IllegalArgumentException ...). And the
+  ;; interfaces differ by receiver: a vector / list / seq is a java.util.List and
+  ;; a SequencedCollection, a set (sorted or not) is a plain java.util.Set, so the
+  ;; positional overloads, the four ends and List's bulk ops exist on the first
+  ;; and are a miss on the second -- for the accessors getFirst / getLast /
+  ;; reversed as much as for the mutators. jolt-8oa
+  {:suite "interop / java.util mutator arity" :label "set(int,E) has no one-argument arity" :expected ":iae" :actual "(try (.set [1 2] 9) :no-throw (catch IllegalArgumentException _ :iae))" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "set(int,E) at two arguments is refused" :expected ":uoe" :actual "(try (.set [1 2] 0 9) :no-throw (catch UnsupportedOperationException _ :uoe))" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "add has no zero-argument arity" :expected ":iae" :actual "(try (.add [1 2]) :no-throw (catch IllegalArgumentException _ :iae))" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "add(E) and add(int,E) are both refused" :expected "[:uoe :uoe]" :actual "(mapv (fn [t] (try (t) :no-throw (catch UnsupportedOperationException _ :uoe))) [(fn [] (.add [1 2] 9)) (fn [] (.add [1 2] 0 9))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "addAll(Collection) and addAll(int,Collection) are both refused" :expected "[:uoe :uoe]" :actual "(mapv (fn [t] (try (t) :no-throw (catch UnsupportedOperationException _ :uoe))) [(fn [] (.addAll [1 2] [9])) (fn [] (.addAll [1 2] 0 [9]))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "clear takes no argument" :expected "[:uoe :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch UnsupportedOperationException _ :uoe) (catch IllegalArgumentException _ :iae))) [(fn [] (.clear [1 2])) (fn [] (.clear [1 2] 9))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "the SequencedCollection ends take one and none" :expected "[:uoe :iae :uoe :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch UnsupportedOperationException _ :uoe) (catch IllegalArgumentException _ :iae))) [(fn [] (.addFirst [1 2] 9)) (fn [] (.addFirst [1 2] 0 9)) (fn [] (.removeLast [1 2])) (fn [] (.removeLast [1 2] 9))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "removeFirst on an empty list is NoSuchElement, not a refusal" :expected "[:nsee :nsee :uoe]" :actual "(mapv (fn [t] (try (t) :no-throw (catch java.util.NoSuchElementException _ :nsee) (catch UnsupportedOperationException _ :uoe))) [(fn [] (.removeFirst [])) (fn [] (.removeLast (list))) (fn [] (.removeFirst [1 2]))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "removeIf on an empty collection removed nothing" :expected "[false false :uoe]" :actual "[(.removeIf [] odd?) (.removeIf #{} odd?) (try (.removeIf [1 2] odd?) :no-throw (catch UnsupportedOperationException _ :uoe))]" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "sort and replaceAll on an empty list do nothing" :expected "[nil nil :uoe]" :actual "[(.sort [] compare) (.replaceAll [] inc) (try (.sort [1 2] compare) :no-throw (catch UnsupportedOperationException _ :uoe))]" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "a set is a java.util.Set and no more: the List-only names miss" :expected "[:iae :iae :iae :iae :iae :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch IllegalArgumentException _ :iae))) [(fn [] (.set #{1 2} 0 9)) (fn [] (.sort #{1 2} compare)) (fn [] (.replaceAll #{1 2} inc)) (fn [] (.addFirst #{1 2} 9)) (fn [] (.removeLast #{1 2})) (fn [] (.add #{1 2} 0 9))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "a set still refuses Collection's own mutators" :expected "[:uoe :uoe :uoe :uoe :uoe :uoe :uoe]" :actual "(mapv (fn [t] (try (t) :no-throw (catch UnsupportedOperationException _ :uoe))) [(fn [] (.add #{1 2} 9)) (fn [] (.addAll #{1 2} [9])) (fn [] (.clear #{1 2})) (fn [] (.remove #{1 2} 1)) (fn [] (.removeAll #{1 2} [1])) (fn [] (.retainAll #{1 2} [1])) (fn [] (.removeIf #{1 2} odd?))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "a sorted set answers exactly as a hash set does" :expected "[:uoe :uoe :iae :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch UnsupportedOperationException _ :uoe) (catch IllegalArgumentException _ :iae))) [(fn [] (.add (sorted-set 1 2) 9)) (fn [] (.clear (sorted-set 1 2))) (fn [] (.sort (sorted-set 1 2) compare)) (fn [] (.removeFirst (sorted-set 1 2)))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "a seq and a lazy seq are java.util.List too" :expected "[:uoe :uoe :iae :uoe :uoe]" :actual "(mapv (fn [t] (try (t) :no-throw (catch UnsupportedOperationException _ :uoe) (catch IllegalArgumentException _ :iae))) [(fn [] (.add (seq [1 2]) 9)) (fn [] (.set (seq [1 2]) 0 9)) (fn [] (.set (seq [1 2]) 9)) (fn [] (.add (cons 1 [2]) 9)) (fn [] (.removeFirst (range 2)))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "SequencedCollection accessors are List-only" :expected "[:iae :iae :iae :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch IllegalArgumentException _ :iae))) [(fn [] (.getFirst #{1 2})) (fn [] (.getLast #{1 2})) (fn [] (.reversed #{1 2})) (fn [] (.getFirst (sorted-set 1 2)))])" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "...and still answer on a list" :expected "[1 2 [2 1] 3]" :actual "[(.getFirst [1 2]) (.getLast [1 2]) (vec (.reversed [1 2])) (.getFirst (list 3 4))]" :portability :jvm}
+  ;; The two cells jolt does NOT match, and deliberately: LazySeq.reify() returns
+  ;; a MUTABLE (new ArrayList(this)) where ASeq.reify() wraps it in
+  ;; Collections.unmodifiableList, so List's default sort and replaceAll -- both
+  ;; of which go through listIterator() -- mutate a throwaway copy and silently
+  ;; succeed on a LAZY seq while refusing on every other seq. jolt refuses on all
+  ;; of them; see the :upstream-quirk entry in known-divergences.edn.
+  {:suite "interop / java.util mutator arity" :label "sort on a lazy seq is refused, not silently discarded" :expected ":uoe" :actual "(try (.sort (map identity [3 1 2]) compare) :no-throw (catch UnsupportedOperationException _ :uoe))" :portability :jvm}
+  {:suite "interop / java.util mutator arity" :label "replaceAll on a lazy seq is refused, not silently discarded" :expected ":uoe" :actual "(try (.replaceAll (map identity [3 1 2]) inc) :no-throw (catch UnsupportedOperationException _ :uoe))" :portability :jvm}
   {:suite "interop / String & StringBuilder char ops" :label "String from char-array slice" :expected "\"abc\"" :actual "(String. (char-array [\\a \\b \\c \\d]) 0 3)" :portability :jvm}
   {:suite "interop / String & StringBuilder char ops" :label "str of StringBuilder" :expected "\"hi\"" :actual "(let [sb (StringBuilder.)] (.append sb \"hi\") (str sb))" :portability :jvm}
   {:suite "interop / String & StringBuilder char ops" :label "append subsequence" :expected "\"bcd\"" :actual "(let [sb (StringBuilder.)] (.append sb \"abcde\" 1 4) (.toString sb))" :portability :jvm}
@@ -5305,10 +5340,17 @@
   {:suite "iref / Ref interop methods" :label "ref .setMinHistory returns the ref" :expected "true" :actual "(let [r (ref 1)] (identical? r (.setMinHistory r 3)))" :portability :jvm}
   {:suite "iref / Ref interop methods" :label "ref .trimHistory is void" :expected "nil" :actual "(.trimHistory (ref 1))" :portability :jvm}
   {:suite "iref / Agent interop methods" :label "agent .deref" :expected "41" :actual "(.deref (agent 41))" :portability :jvm}
-  {:suite "iref / Agent interop methods" :label "agent .getQueueCount" :expected "0" :actual "(let [ag (agent 0)] (await ag) (.getQueueCount ag))" :portability :jvm}
+  ;; A fresh agent, never sent to: the only queue depth that is not a race to
+  ;; observe. (await ag) then .getQueueCount is NOT -- await can return with its
+  ;; own wait action still on the queue, so the JVM answers 1 under load where it
+  ;; answers 0 idle, which is what CI caught. jolt's await drains the queue AND
+  ;; clears running? before it returns, so the awaited form is deterministic
+  ;; there and is a unit row instead.
+  {:suite "iref / Agent interop methods" :label "agent .getQueueCount on a fresh agent" :expected "0" :actual "(.getQueueCount (agent 0))" :portability :jvm}
+  {:suite "iref / Agent interop methods" :label "agent .getQueueCount answers an integer" :expected "true" :actual "(int? (.getQueueCount (agent 0)))" :portability :jvm}
   {:suite "iref / Agent interop methods" :label "agent .getError" :expected "nil" :actual "(.getError (agent 1))" :portability :jvm}
   {:suite "iref / Agent interop methods" :label "agent error mode/handler are void" :expected "[nil :continue nil true]" :actual "(let [ag (agent 1)] [(.setErrorMode ag :continue) (.getErrorMode ag) (.setErrorHandler ag (fn [a e] nil)) (fn? (.getErrorHandler ag))])" :portability :jvm}
-  {:suite "iref / Agent interop methods" :label "agent .restart answers the state" :expected "[true 5 5 true]" :actual "(let [ag (agent 1)] (send ag (fn [_] (throw (Exception. \"boom\")))) (Thread/sleep 400) [(some? (.getError ag)) (.restart ag 5 true) (deref ag) (nil? (.getError ag))])" :portability :jvm}
+  {:suite "iref / Agent interop methods" :label "agent .restart answers the state" :expected "[true 5 5 true]" :actual "(let [ag (agent 1)] (send ag (fn [_] (throw (Exception. \"boom\")))) (loop [i 0] (when (and (nil? (agent-error ag)) (< i 500)) (Thread/sleep 10) (recur (inc i)))) [(some? (.getError ag)) (.restart ag 5 true) (deref ag) (nil? (.getError ag))])" :portability :jvm}
   {:suite "iref / IDeref interop methods" :label "var .deref and .get" :expected "[3 3]" :actual "(do (def pv 3) [(.deref (var pv)) (.get (var pv))])" :portability :jvm}
   {:suite "iref / IDeref interop methods" :label "a wrong arity is not a method" :expected "[:iae :iae :iae :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch IllegalArgumentException _ :iae))) [(fn [] (.swap (atom 1))) (fn [] (.reset (atom 1) 1 2)) (fn [] (.set (ref 1) 1 2)) (fn [] (.touch (ref 1) 1))])" :portability :jvm}
   {:suite "iref / IDeref interop methods" :label "a non-reference has none of them" :expected "[:iae :iae :iae :iae]" :actual "(mapv (fn [t] (try (t) :no-throw (catch IllegalArgumentException _ :iae))) [(fn [] (.swap [1] inc)) (fn [] (.getQueueCount [1])) (fn [] (.deref [1])) (fn [] (.resetVals [1] 2))])" :portability :jvm}
@@ -5316,8 +5358,8 @@
   ;; answered the AGENT, which threads but is not what the JVM evaluates to --
   ;; Agent.setErrorMode/setErrorHandler are void and restart answers the new
   ;; state, so clear-agent-errors (restart-agent over the current state) does too.
-  {:suite "conformance / agents" :label "restart-agent answers the new state, not the agent" :expected "5" :actual "(let [ag (agent 1)] (send ag (fn [_] (throw (Exception. \"boom\")))) (Thread/sleep 400) (restart-agent ag 5))" :portability :jvm}
-  {:suite "conformance / agents" :label "clear-agent-errors answers the state it restarted with" :expected "1" :actual "(let [ag (agent 1)] (send ag (fn [_] (throw (Exception. \"boom\")))) (Thread/sleep 400) (clear-agent-errors ag))" :portability :jvm}
+  {:suite "conformance / agents" :label "restart-agent answers the new state, not the agent" :expected "5" :actual "(let [ag (agent 1)] (send ag (fn [_] (throw (Exception. \"boom\")))) (loop [i 0] (when (and (nil? (agent-error ag)) (< i 500)) (Thread/sleep 10) (recur (inc i)))) (restart-agent ag 5))" :portability :jvm}
+  {:suite "conformance / agents" :label "clear-agent-errors answers the state it restarted with" :expected "1" :actual "(let [ag (agent 1)] (send ag (fn [_] (throw (Exception. \"boom\")))) (loop [i 0] (when (and (nil? (agent-error ag)) (< i 500)) (Thread/sleep 10) (recur (inc i)))) (clear-agent-errors ag))" :portability :jvm}
   {:suite "conformance / agents" :label "set-error-mode! and set-error-handler! are void" :expected "[nil nil]" :actual "(let [ag (agent 1)] [(set-error-mode! ag :continue) (set-error-handler! ag (fn [a e] nil))])" :portability :jvm}
   {:suite "iref / meta" :label "alter-meta! works on atoms" :expected "{:x 1 :y 2}" :actual "(let [a (atom 1 :meta {:x 1})] (alter-meta! a assoc :y 2))" :portability :common}
   {:suite "casts / checked narrow" :label "doubles range-check themselves, then truncate" :expected "[1 1 3 1 \\a 0]" :actual "[(byte 1.1) (short 1.9) (int 3.7) (long 1.5) (char 97.5) (long ##NaN)]" :portability :common}
