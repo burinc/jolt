@@ -1904,14 +1904,11 @@
   (jolt-int-cast (if (string? x) (parse-int-or-throw x 10 "int") x)))
 (register-class-ctor! "Integer" integer-ctor)
 (register-class-ctor! "java.lang.Integer" integer-ctor)
-;; (Double. x) / (Double. "x"): jolt's double.
+;; (Double. x) / (Double. "x"): jolt's double. The string arity is
+;; Double.parseDouble, so it takes that grammar rather than a string->number of
+;; its own — which read (Double. "#xff") as 255.0 and (Double. "1/2") as 0.5.
 (define (double-ctor x)
-  (if (string? x)
-      (let ((n (string->number x)))
-        (if n (exact->inexact n)
-            (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
-                                             (string-append "For input string: \"" x "\"")))))
-      (jolt-double x)))
+  (if (string? x) (parse-double-or-throw x) (jolt-double x)))
 (register-class-ctor! "Double" double-ctor)
 (register-class-ctor! "java.lang.Double" double-ctor)
 

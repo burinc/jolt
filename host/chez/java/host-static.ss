@@ -913,15 +913,16 @@
                              (java-int-input-msg digits radix))))))))))
 (define (char-code c) (if (char? c) (char->integer c) (jnum->exact c)))
 
-;; parse a double string (Double/parseDouble, (Double. s)); JVM accepts NaN /
-;; Infinity / decimal / scientific. #f on failure.
+;; Double/parseDouble, Float/parseFloat, Double/valueOf, (Double. s) — the
+;; floating half of parse-int-or-throw, and the same story: the grammar is
+;; java-double-parse (natives-num.ss), shared with clojure.core/parse-double,
+;; which is this method with the throw caught. It used to hand the string
+;; straight to string->number and so spoke Scheme, reading "#xff" as 255.0 and
+;; "1/2" as 0.5 — neither one a double on the JVM — while missing the hex
+;; significand form ("0x1fp0" is 31.0 there) that a Scheme reader has no
+;; spelling for. #f on failure.
 (define (parse-double-str s)
-  (let ((t (str-trim (if (string? s) s (jolt-str-render-one s)))))
-    (cond
-      ((or (string=? t "NaN") (string=? t "+NaN") (string=? t "-NaN")) +nan.0)
-      ((or (string=? t "Infinity") (string=? t "+Infinity")) +inf.0)
-      ((string=? t "-Infinity") -inf.0)
-      (else (let ((n (string->number t))) (and n (real? n) (exact->inexact n)))))))
+  (java-double-parse (if (string? s) s (jolt-str-render-one s))))
 (define (parse-double-or-throw s)
   (or (parse-double-str s)
       (jolt-throw (jolt-host-throwable "java.lang.NumberFormatException"
