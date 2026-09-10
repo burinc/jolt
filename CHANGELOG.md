@@ -79,6 +79,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — which is why one arm serves all four types. 21 corpus rows, all certified
   against reference Clojure.
 
+- **The reference types answer the rest of their interfaces through interop
+  too.** `IDeref` is the root every reference shares, and none of it was
+  reachable as a method: `(.deref (atom 1))` and `(.get (atom 1))` both read
+  `No matching field found: deref for class clojure.lang.Atom`. `.deref` and
+  `.get` now answer on atom, ref, agent, volatile, delay, promise, future and
+  `reduced` — `get()` is a default method on `IDeref`, so every one of them
+  carries it — along with the `.getAsBoolean` / `.getAsInt` / `.getAsLong` /
+  `.getAsDouble` bridges, each the same cast `boolean`, `int`, `long` and
+  `double` apply, so `(.getAsInt (atom 3.9))` truncates to `3`. The
+  two-argument `(.deref p 50 :timeout)` is `IBlockingDeref`'s and stays limited
+  to a promise and a future: an agent and a delay have no such method to
+  reflect onto, so that call is `No matching method` there as on the JVM.
+
+  Then each type's own interface. An atom answers `IAtom`/`IAtom2` —
+  `.swap` and `.swapVals` at all four arities including the JVM's
+  `(f x y args)` spread form, `.reset`, `.resetVals`, `.compareAndSet` — off
+  the natives `swap!` and `reset!` already use, so the CAS retry, the validator
+  and the watch notification are the same ones. A ref answers `.set`, `.alter`,
+  `.commute` (the JVM's `(fn, args-seq)` shape, and `IllegalStateException`
+  outside a transaction), `.touch`, and the history surface `.getMinHistory` /
+  `.setMinHistory` / `.getMaxHistory` / `.setMaxHistory` / `.getHistoryCount` /
+  `.trimHistory`. An agent answers `.getError`, `.getErrorMode`,
+  `.setErrorMode`, `.getErrorHandler`, `.setErrorHandler`, `.getQueueCount`,
+  `.restart` and `.dispatch`. 37 corpus rows and 3 unit rows.
+
+  `.dispatch(fn, args, exec)` is the one method here that is a jolt superset:
+  one serialized worker runs per agent, so there is no pool for the executor
+  argument to select and it is accepted and ignored.
+
+- **`restart-agent`, `clear-agent-errors`, `set-error-mode!` and
+  `set-error-handler!` answer what the JVM answers.** All four handed back the
+  agent, which threads but is not the value: `Agent.setErrorMode` and
+  `setErrorHandler` are void, so the two setters are `nil`, and
+  `Agent.restart` answers the NEW STATE, so `(restart-agent a 5)` is `5` and
+  `clear-agent-errors` — `restart-agent` over the current state — is that
+  state. Found while wiring the same natives to their interop methods, which
+  would otherwise have disagreed with the `clojure.core` door.
+
 - **`format` speaks the rest of `java.util.Formatter`.** `%.3s` truncates a
   string where the precision used to be ignored (`(format "%.3s" "abcdef")` was
   `"abcdef"`), `%#x` / `%#X` / `%#o` prefix the radix (`0x`, `0X`, `0`) with the
