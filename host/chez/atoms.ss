@@ -259,6 +259,48 @@
         ((iref? a) (iref-validator-of a))
         (else jolt-nil)))
 
+;; The rest of the ARef surface, which only the java interop layer reaches:
+;; records-dispatch.ss's rd-iref-method answers .getWatches and .notifyWatches
+;; with these. clojure.core has no fn for either — add-watch/remove-watch are the
+;; only public door — so they exist for the METHOD arm alone, and they live here
+;; beside the seam they read rather than in the java layer because both hosts
+;; share this file and neither shares that one.
+;;
+;; jolt-iref-watchable? is that arm's receiver guard: the four watchable
+;; reference types (atom / var / ref / agent) and nothing else, so a receiver
+;; that merely spells a method the same way keeps its own dispatch. It has to
+;; ASK on every call rather than close over a fixed answer: iref? walks the arm
+;; registry, and the agent arm is not registered until java/concurrency.ss loads,
+;; long after this file.
+(define (jolt-iref-watchable? r) (or (jolt-atom? r) (iref? r)))
+
+;; ARef.getWatches is an IPersistentMap, so an unwatched reference reads {} and
+;; not nil. Both alists are reverse-built (jolt-watch-add conses), and this walk
+;; front-to-back prepending key and fn undoes that — a seq over the map is not
+;; ordered anyway, but the flat kv list going in matches add order, which is the
+;; order notifyWatches uses.
+(define (jolt-get-watches r)
+  (let ((alist (cond ((jolt-atom? r) (jolt-atom-watches r))
+                     ((iref? r) (iref-watches-of r))
+                     (else (throw-jvm (quote ClassCastException)
+                                      "getWatches: not a watchable reference")))))
+    (let loop ((as alist) (kvs (quote ())))
+      (if (null? as)
+          (jolt-hash-map-build kvs)
+          (loop (cdr as) (cons (caar as) (cons (cdar as) kvs)))))))
+
+;; ARef.notifyWatches(old, new) is void and fires the watches WITHOUT touching
+;; the value — the JVM lets a subclass drive notification at its own mutation
+;; points, and jolt's ref types do exactly that (refs at commit, vars at root
+;; set). An atom keeps its watches in a record slot, every other reference type
+;; in the side table, so the two notifiers stay separate here as they do there.
+(define (jolt-notify-watches r old new)
+  (cond ((jolt-atom? r) (jolt-atom-notify r old new))
+        ((iref? r) (iref-notify r old new))
+        (else (throw-jvm (quote ClassCastException)
+                         "notifyWatches: not a watchable reference")))
+  jolt-nil)
+
 ;; vars are watchable IRefs: a root change (def / var-set on the root /
 ;; alter-var-root) validates and notifies like Var.bindRoot. The def-var! wrap
 ;; pays two weak-table probes per def and only does IRef work on a watched var.

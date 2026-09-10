@@ -133,6 +133,21 @@
 (define (rd-var-meta-flag? obj key) (jolt-truthy? (rd-var-meta-get obj key)))
 (define (rd-args->list x) (let ((s (jolt-seq x))) (if (jolt-nil? s) '() (seq->list s))))
 
+;; clojure.lang.ARef's watch and validator methods, for the base's reference arm
+;; below. Keyed by name AND arity so a wrong-arity call falls through to
+;; dispatch-miss and reports the JVM's "No matching method" instead of faulting
+;; inside the native on a short `rest`. Each body is the same procedure the
+;; clojure.core fn of that name is def-var!'d to (atoms.ss), so a watch
+;; registered through interop and one registered through add-watch are one list.
+(define (rd-iref-method name argc)
+  (cond ((string=? name "addWatch")      (and (fx=? argc 2) jolt-add-watch))
+        ((string=? name "removeWatch")   (and (fx=? argc 1) jolt-remove-watch))
+        ((string=? name "getWatches")    (and (fx=? argc 0) jolt-get-watches))
+        ((string=? name "notifyWatches") (and (fx=? argc 2) jolt-notify-watches))
+        ((string=? name "setValidator")  (and (fx=? argc 1) jolt-set-validator!))
+        ((string=? name "getValidator")  (and (fx=? argc 0) jolt-get-validator))
+        (else #f)))
+
 (define (record-method-dispatch-base obj method-name rest-args)
   (let ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args))))
     (cond
@@ -286,6 +301,20 @@
               (jolt-symbol #f (jns-name obj)))
              ((string=? method-name "toString") (jns-name obj))
              (else (dispatch-miss obj method-name rest))))
+      ;; clojure.lang.ARef's watch/validator surface, answered for all four
+      ;; watchable reference types at once — atom, var, ref, agent. Each already
+      ;; IS an IRef by class ((instance? clojure.lang.IRef a) is true and
+      ;; (supers clojure.lang.Atom) lists ARef), but the METHODS were missing, so
+      ;; a library reaching the seam through interop rather than
+      ;; clojure.core/add-watch got "No matching method addWatch found taking 2
+      ;; args for class clojure.lang.Atom".
+      ;;
+      ;; It sits above the Var arm because a Var answers these too, and the
+      ;; receiver guard runs FIRST: a deftype spelling a method the same way is
+      ;; not watchable, so it never gets here (its own methods answered in the
+      ;; dot-form arm anyway), and a plain value falls through to dispatch-miss.
+      ((and (jolt-iref-watchable? obj) (rd-iref-method method-name (length rest)))
+       => (lambda (f) (apply f obj rest)))
       ;; clojure.lang.Var: ns -> its Namespace, sym -> the simple-name Symbol.
       ;; clojure.spec.alpha's ->sym reads (.name (.ns v)) and (.sym v).
       ((var-cell? obj)
