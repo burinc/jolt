@@ -9,8 +9,8 @@
 # Without the second rule a case that went green could go red again unnoticed.
 #
 # JOLT_LOADERCONF_WRITE_BASELINE=1 regenerates the baseline from the current run.
-# JOLT_BIN runs the suite through another jolt — a built binary rather than the
-# source tree — since the loader has to work in both.
+# JOLT_BIN names the jolt to run the suite through; `make loaderconf` points it
+# at the built binary, and the bin/jolt default is for running this by hand.
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 jolt="${JOLT_BIN:-bin/jolt}"
@@ -83,6 +83,7 @@ if [ -n "$stale" ]; then
 fi
 
 if [ "$fail" -eq 0 ]; then
-  echo "loaderconf: $(grep -c 'PASS' "$tmp/lines")/$expected passing, $(wc -l < "$tmp/base" | tr -d ' ') baselined"
+  passing=$(awk -F'\t' '$2 == "PASS"' "$tmp/verdicts" | wc -l | tr -d ' ')
+  echo "loaderconf: $passing/$expected passing, $(wc -l < "$tmp/base" | tr -d ' ') baselined"
 fi
 exit "$fail"
