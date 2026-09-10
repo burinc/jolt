@@ -1897,11 +1897,11 @@
                      (if (jolt-nil? rest-args) '() (seq->list rest-args)))
         'pass)))
 ;; (Long. n) / (Long. "n"): a Long is just jolt's integer; return it (parse a string).
-(register-class-ctor! "Long" (lambda (x) (if (string? x) (parse-int-or-throw x 10 "Long") (->num (jnum->exact x)))))
-(register-class-ctor! "java.lang.Long" (lambda (x) (if (string? x) (parse-int-or-throw x 10 "Long") (->num (jnum->exact x)))))
+(register-class-ctor! "Long" (lambda (x) (if (string? x) (parse-int-or-throw x 10 "long") (->num (jnum->exact x)))))
+(register-class-ctor! "java.lang.Long" (lambda (x) (if (string? x) (parse-int-or-throw x 10 "long") (->num (jnum->exact x)))))
 ;; (Integer. n) / (Integer. "n"): jolt's integer, range-checked like intCast.
 (define (integer-ctor x)
-  (jolt-int-cast (if (string? x) (parse-int-or-throw x 10 "Integer") x)))
+  (jolt-int-cast (if (string? x) (parse-int-or-throw x 10 "int") x)))
 (register-class-ctor! "Integer" integer-ctor)
 (register-class-ctor! "java.lang.Integer" integer-ctor)
 ;; (Double. x) / (Double. "x"): jolt's double.
