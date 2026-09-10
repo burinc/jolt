@@ -22,3 +22,14 @@
 ;; registers that a DIFFERENT library declares, where that library never loads.
 (__register-class-statics! "java.security.KeyPairGenerator"
                            {"getInstance" (fn [algo] (str "squatter-kpg:" algo))})
+
+;; ...and two undeclared registrations that read differently to the diagnostic
+;; (jolt#926). java.security.KeyStore is a class NOTHING implements and nothing
+;; declares, so the note's advice — declare it in :jolt/provides — is the fix.
+(__register-class-statics! "java.security.KeyStore"
+                           {"getDefaultType" (fn [] "squatter-ks")})
+;; java.util.Base64 is one the RUNTIME implements, so register-class-provider!
+;; refuses a claim on it and the same advice cannot be taken: extending it member
+;; by member at install is the only route, and it is the additive case. No note.
+(__register-class-statics! "java.util.Base64"
+                           {"getMimeDecoder" (fn [] "squatter-b64")})

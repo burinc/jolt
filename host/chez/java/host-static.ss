@@ -57,7 +57,34 @@
              "warning: ~a member ~a/~a registered twice with different values\n"
              kind class member)))
 
-(define (register-class-statics! name members)  ; members: list of (str . val/proc)
+;; The host's own boot-time registrations (io.ss, host-static-classes.ss, …), the
+;; statics counterpart of host-class-ctors-tbl. Together they are what "the
+;; runtime provides this class" means: register-class-provider! refuses a claim on
+;; a class already in the tables, and at declaration time — jolt.deps, before any
+;; library code runs — the only entries there are these. Both spellings, because a
+;; claim is tested under both (class-spellings).
+(define host-class-statics-tbl (make-hashtable string-hash string=?))
+
+(define (register-class-statics! name members)
+  (hashtable-set! host-class-statics-tbl name #t)
+  (hashtable-set! host-class-statics-tbl (short-class-name name) #t)
+  (class-statics-merge! name members))
+
+;; Would register-class-provider! refuse a :jolt/provides claim on this class?
+;; Answered from the HOST tables and not the live ones: a class ANOTHER library
+;; registered is still free to be declared — nothing has claimed it — and a
+;; registration that just landed must not make itself the reason.
+(define (runtime-provides-class? name)
+  (let ((short (short-class-name name)))
+    (and (or (hashtable-ref host-class-statics-tbl name #f)
+             (hashtable-ref host-class-statics-tbl short #f)
+             (hashtable-ref host-class-ctors-tbl name #f)
+             (hashtable-ref host-class-ctors-tbl short #f))
+         #t)))
+
+;; The merge itself: also the LIBRARY path (register-class-statics-owned!,
+;; extend-class!), which adds members without making the class the runtime's.
+(define (class-statics-merge! name members)  ; members: list of (str . val/proc)
   (let* ((short (short-class-name name))
          (h (or (hashtable-ref class-statics-tbl name #f)
                 (hashtable-ref class-statics-tbl short #f)
@@ -141,11 +168,11 @@
                (taken (if h (filter (lambda (m) (hashtable-contains? h (car m))) members) '()))
                (fresh (if h (filter (lambda (m) (not (hashtable-contains? h (car m)))) members) members)))
           (when (pair? taken) (provider-claim-drop! name owner (map car taken)))
-          (when (pair? fresh) (register-class-statics! name fresh)))
+          (when (pair? fresh) (class-statics-merge! name fresh)))
         (begin
           (provider-claim-note! name)
           (lib-note-provider-registration! name)
-          (register-class-statics! name members)))))
+          (class-statics-merge! name members)))))
 
 (define (register-host-methods! tag members)
   (let ((h (or (hashtable-ref host-methods-tbl tag #f)
@@ -443,7 +470,31 @@
 ;; provider registers its classes as its install namespace loads, and the
 ;; registration guard (lib-provider-owner-elsewhere) has to tell that registration
 ;; apart from another library squatting on the same class.
+;;
+;; Whoever LOADS an install namespace sets the mark (loader.ss load-namespace*,
+;; through lib-with-install-ns-mark) — not the autoload alone. A provider whose
+;; install namespace requires a SECOND provider's, which is how kmet reached
+;; jolt.crypto, registers that second provider's classes under a plain require;
+;; marking the whole load with the outer provider left the inner one's classes
+;; owned by nobody, so a later registration for a member it answers was accepted
+;; instead of dropped — jolt#914 one level down — and JOLT_DEBUG named the wrong
+;; namespace (jolt#926).
 (define lib-loading-provider (make-thread-parameter #f))
+
+(define (lib-provider-by-install-ns ns)
+  (let loop ((ps lib-class-providers))
+    (cond ((null? ps) #f)
+          ((string=? ns (vector-ref (car ps) 0)) (car ps))
+          (else (loop (cdr ps))))))
+
+;; Run `thunk` marked with the provider `ns` installs, if it installs one. A
+;; namespace that is NOT an install namespace leaves the mark alone rather than
+;; clearing it: a provider whose install! calls a helper namespace of its own is
+;; still that provider registering, and only another DECLARED provider is a
+;; different registrant.
+(define (lib-with-install-ns-mark ns thunk)
+  (let ((p (lib-provider-by-install-ns ns)))
+    (if p (parameterize ((lib-loading-provider p)) (thunk)) (thunk))))
 
 ;; Classes a declared provider actually registered as its install namespace
 ;; loaded. This is what the registration guard protects: a class whose provider
@@ -545,8 +596,11 @@
                            (begin (guard (c (#t (set-box! (vector-ref p 3) 'failed)
                                                 (lib-replay-deferred! p)
                                                 (raise c)))
-                                    (parameterize ((lib-loading-provider p))
-                                      (load-namespace (vector-ref p 0))))
+                                    ;; the mark comes from load-namespace* itself
+                                    ;; (lib-with-install-ns-mark), which is the
+                                    ;; only way it can also cover an install
+                                    ;; namespace reached by a plain require.
+                                    (load-namespace (vector-ref p 0)))
                                   #t)))
               (replayed (lib-replay-deferred! p)))
          (or loaded replayed))))
@@ -660,6 +714,14 @@
   (when (getenv "JOLT_DEBUG")
     (let ((self (lib-loading-provider)))
       (when (and self (not (member name (vector-ref self 2)))
+                 ;; ...but not for a class the RUNTIME implements. There the
+                 ;; declaration the note asks for is refused ("which the runtime
+                 ;; already provides"), so the advice cannot be taken: registering
+                 ;; the members at install IS the route, and it is the additive
+                 ;; case class-extensions.ss exists for. Nothing autoloads for a
+                 ;; class that is already there either, so there is no order
+                 ;; dependence left to warn about (jolt#926).
+                 (not (runtime-provides-class? name))
                  (claim-warn-once? "note" name))
         (fprintf (current-error-port)
                  "warning: ~a registers ~a without declaring it in :jolt/provides (RFC 0014); nothing autoloads ~a for a class it does not declare, so whether ~a resolves depends on what else pulls that namespace in\n"

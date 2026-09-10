@@ -1495,13 +1495,12 @@
     (let loop ((l lst) (i 0)) (if (null? l) bv (begin (bytevector-u8-set! bv i (car l)) (loop (cdr l) (+ i 1)))))))
 (register-class-statics! "URLEncoder" (list (cons "encode" url-encode)))
 (register-class-statics! "URLDecoder" (list (cons "decode" url-decode)))
-;; Charset/forName yields the canonical name STRING (not an opaque object) so it
-;; threads straight into (.getBytes s cs) / (String. bytes cs), which take a name.
-;; defaultCharset is likewise the canonical name string ("UTF-8" — jolt's I/O is
-;; UTF-8 throughout), so it threads into the same name-taking APIs as forName.
-(register-class-statics! "Charset"
-  (list (cons "forName" (lambda (nm) (jolt-str-render-one nm)))
-        (cons "defaultCharset" (lambda () "UTF-8"))))
+;; Charset is registered further down, under the qualified name — which mirrors
+;; to the short one — and answers with a charset OBJECT (charset-for-name, which
+;; validates the name and carries the encoding). A second short-name registration
+;; stood here answering with the canonical name string, and was overwritten member
+;; for member by that one: dead, and JOLT_DEBUG reported the overwrite as drift
+;; between two host files.
 
 ;; ---- Base64 (RFC 4648) ------------------------------------------------------
 ;; One codec, two alphabets: basic (+/) and URL-safe (-_), section 5 of the RFC.
@@ -2520,16 +2519,20 @@
                (r (modulo u bound)))
           (if (<= (- u r) (- 2147483648 bound)) (->num r) (loop))))))
 
+;; (SecureRandom. seed) is accepted and the seed ignored: the JVM's seeded ctor
+;; SUPPLEMENTS entropy rather than replacing it, so ignoring it cannot make the
+;; output weaker than the caller asked for. There is no state either way, so one
+;; procedure serves the constructor and both getInstance forms — and both
+;; spellings, which share one member table: a fresh closure per spelling
+;; re-registers the member with a different value, and JOLT_DEBUG then reports the
+;; runtime's own boot as registry drift.
+(define (sr-new . args) (make-jhost "securerandom" #f))
 (for-each
   (lambda (nm)
-    (register-class-ctor! nm
-      ;; (SecureRandom. seed) is accepted and the seed ignored: the JVM's seeded
-      ;; ctor SUPPLEMENTS entropy rather than replacing it, so ignoring it cannot
-      ;; make the output weaker than the caller asked for.
-      (lambda args (make-jhost "securerandom" #f)))
+    (register-class-ctor! nm sr-new)
     (register-class-statics! nm
-      (list (cons "getInstance" (lambda args (make-jhost "securerandom" #f)))
-            (cons "getInstanceStrong" (lambda args (make-jhost "securerandom" #f))))))
+      (list (cons "getInstance" sr-new)
+            (cons "getInstanceStrong" sr-new))))
   '("SecureRandom" "java.security.SecureRandom"))
 
 (register-host-methods! "securerandom"
