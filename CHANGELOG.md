@@ -56,6 +56,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A declared `:jolt/provides` provider resolves a class whatever loaded
+  first.** RFC 0014 autoloaded a provider's install namespace only when the
+  referenced class was still UNREGISTERED, so a library whose `install!`
+  registers classes it does not declare pre-empted the library that does declare
+  them: jolt.crypto registers an EC-only `java.security.Signature` while
+  declaring only the symmetric classes, and once that side-effect registration
+  landed the registry hit meant the declared provider never loaded. Same
+  deps.edn, two outcomes — whichever namespace compiled first won, silently
+  (#914). A claim is now an authority over WHO implements a class, not a
+  fallback for an absent one, and the registry can no longer answer for a
+  claimed class before its claimer has spoken. A registration from anywhere else
+  is HELD while the claim is outstanding and replayed once it settles, so the
+  autoload still happens; a registration that arrives after the provider has
+  claimed a member is dropped rather than allowed to win by being last. A member
+  the provider's shim does NOT answer still registers, in either order — a claim
+  is authority over what the provider implements, not a reservation on the name,
+  and filling a gap in a shim is what `extend-class!` is for. A provider that
+  cannot deliver, its install namespace off the source roots or raising,
+  releases what it held rather than taking it down with it. The drop is reported
+  on stderr, because the library asked for something it did not get; under
+  `JOLT_DEBUG` so are the two cases that are merely the contract being bent — a
+  registration held for a provider that has not loaded, and an install namespace
+  registering a class it never declared, which is why a reference to
+  `java.security.KeyPairGenerator` could report "No dependency provides" in one
+  namespace and answer an EC-only shim in the next. A provider's own declared
+  classes are untouched, and so are registrations for classes nobody declares.
+  What jolt itself ships claims a NAME, not the implementation of every member
+  under it: `jolt.time.base` and `jolt.socket` are the runtime's base tier, and a
+  base tier exists to be extended — jolt-lang/time declares only the formatting
+  classes and adds a `DateTimeFormatter` arm to `java.time.LocalDate/from` — so
+  the guard is between two DEPENDENCIES, which is what #914 is. Resolution stays
+  on the registry-miss path, so a static reference and a `(Class. …)` cost
+  exactly what they did before.
+
 - **`java.net.URI`'s constructor validates.** `(java.net.URI. "https://not a
   url")` answered a URI whose `.getHost` was `"not a url"`; the JVM's
   single-argument constructor parses per RFC 2396 and throws
