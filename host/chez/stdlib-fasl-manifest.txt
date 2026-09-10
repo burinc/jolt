@@ -66,6 +66,7 @@ jolt.infix.math.constants
 jolt.infix.math.core
 jolt.infix.math.trig
 jolt.io-poller
+jolt.loader
 jolt.nrepl
 jolt.parser
 jolt.parser.basic

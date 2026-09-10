@@ -160,7 +160,7 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscaling compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling depssmoke taskssmoke scriptsmoke completionssmoke depscpcache depsunit \
-  smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts ffi ffidupsym continuations stdlibfasl \
+  smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke sci scifunctional cts loaderconf ffi ffidupsym continuations stdlibfasl \
   transient rrbprop rrbscaling stateimage infer wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
   protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
@@ -642,6 +642,17 @@ scifunctional: testbin
 # (test/chez/cts-known-failures.txt).
 cts: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" bash host/chez/cts.sh
+
+# The loader conformance suite: the twelve cases that specify jolt.loader (roots
+# per context, isolation, delegation policy, unload). Baselined like certify —
+# a case that regresses fails, and a case that starts passing fails until the
+# baseline records it, so nothing green quietly goes red again.
+#
+# Through the BUILT binary, like cts and the other CLI gates: a loader that only
+# works against the source tree is not a loader, and jolt.loader ships in the
+# stdlib fasl, so the binary is the arrangement the cases have to hold under.
+loaderconf: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/loaderconf.sh
 
 # FFI: bind native functions (typed foreign-procedure), memory, and that a
 # :blocking call is collect-safe (a parked thread doesn't pin the collector).

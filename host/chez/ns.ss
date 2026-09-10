@@ -121,8 +121,8 @@
 ;; parse-libspec returns (target-name . opts) where opts is an alist of
 ;; (keyword-name-string . value-form), or #f if `spec` isn't a recognizable
 ;; libspec. This is the single spec->target+opts parser routed through by
-;; loader-require / loader-use (loader.ss), chez-register-spec!, and — via it —
-;; ce-scan-requires! (compile-eval.ss).
+;; ns-load+register (the one require/use body below), chez-register-spec!, and —
+;; via it — ce-scan-requires! (compile-eval.ss).
 ;;
 ;; JOLT SUPERSET: a bare LIST libspec — (ns :only [x]) or (ns :as a) — is
 ;; accepted here. On reference Clojure this shape is FATAL: the list is treated
@@ -174,7 +174,8 @@
 ;; single libspec only when its second element is a keyword or absent. The old
 ;; single-libspec read of the vector form required the PREFIX itself — for
 ;; clj-uuid, a silent self-require mid-load — and dropped every sub-spec.
-;; Shared by the loader's expand-spec and the compile-env alias pre-scan.
+;; Shared by ns-load+register, the build driver's expand-spec (loader.ss) and the
+;; compile-env alias pre-scan.
 (define (expand-libspec s)
   (cond
     ((or (cseq? s) (empty-list-t? s) (pvec? s))
@@ -195,7 +196,7 @@
               (cond
                 ;; :as-alias aliases exactly like :as (clojure.core load-lib does
                 ;; the same `alias` call for both); what differs is that it does not
-                ;; load the target — see ldr-load+register.
+                ;; load the target — see ns-load+register.
                 ((or (string=? k "as") (string=? k "as-alias"))
                  (when (symbol-t? v) (chez-register-alias! cns (symbol-t-name v) target)))
                 ;; :refer (require) and :only (use) both bring unqualified names
@@ -211,6 +212,89 @@
                                 (when (symbol-t? n) (chez-register-refer! cns (symbol-t-name n) target)))
                               (seq->list v))))))))
           (cdr parsed))))))
+
+;; --- require / use ----------------------------------------------------------
+;; ONE implementation, here, beside the spec parser it shares. Loading a target
+;; is a SEAM rather than a second copy of require, because not every runtime
+;; with namespaces has a loader: the seed mint (bootstrap.ss), the gambit seed
+;; generator and the .ss unit harnesses load rt.ss without loader.ss, and there
+;; `require` registers the specs and loads nothing. loader.ss installs the load
+;; step, and the same body then loads. Either way `require` means one thing.
+;;
+;; Two install-once seams:
+;;   ns-load-target!   (target force-named?)  read + initialize the namespace
+;;   ns-with-load-opts (flags k)              bind the loader's :reload /
+;;                                            :reload-all / :verbose options
+;;                                            around the whole call, then
+;;                                            (k force-named?)
+(define ns-load-target! #f)
+(define (set-ns-load-target! f) (set! ns-load-target! f))
+(define ns-with-load-opts #f)
+(define (set-ns-with-load-opts! f) (set! ns-with-load-opts f))
+
+;; The keyword flags clojure.core's load-libs collects out of the arg list before
+;; the libspecs. Their meaning belongs to the load step, so the names travel to
+;; ns-with-load-opts rather than being interpreted here.
+(define (ns-flag-names specs)
+  (let loop ((xs specs) (acc '()))
+    (cond ((null? xs) (reverse acc))
+          ((keyword? (car xs)) (loop (cdr xs) (cons (keyword-t-name (car xs)) acc)))
+          (else (loop (cdr xs) acc)))))
+
+;; Load each expanded libspec's target (no-op if baked, already loaded, or there
+;; is no loader), register its :as/:refer under the caller ns, and — for `use`
+;; (use? #t) — refer every public var when the spec has no :only/:refer filter.
+;; Target + opts both come from parse-libspec above, the single spec->target+opts
+;; parser this, chez-register-spec! and ce-scan-requires! (compile-eval.ss) all
+;; route through.
+(define (ns-load+register specs force-named? use?)
+  (for-each
+    (lambda (s0)
+      (for-each
+        (lambda (s)
+          (let* ((parsed (parse-libspec s))
+                 (target (and parsed (car parsed)))
+                 (opt-names (if parsed (map car (cdr parsed)) '()))
+                 ;; :as-alias establishes the alias WITHOUT loading the target — for
+                 ;; a namespace that may not exist yet, or exists only to qualify
+                 ;; keywords. clojure.core's load-lib picks the loader with
+                 ;; `need-ns (or as use)`, falling to (create-ns lib) when the spec
+                 ;; is :as-alias and neither — so a spec that also carries :as, or
+                 ;; that arrives through `use`, still loads.
+                 (alias-only? (and target
+                                   (member "as-alias" opt-names)
+                                   (not (member "as" opt-names))
+                                   (not use?))))
+            (cond
+              ((not target) #f)
+              (alias-only? (intern-ns! target))   ; create-ns, without loading
+              ((not ns-load-target!) #f)          ; no loader here — aliases only
+              (else (ns-load-target! target force-named?)))
+            (chez-register-spec! (chez-current-ns) s)
+            (when (and use? target
+                       (not (or (member "only" opt-names) (member "refer" opt-names))))
+              (chez-register-refer-all! (chez-current-ns) target)
+              ;; [ns :exclude [names]] — the excluded names stay OUT of the
+              ;; refer-all set (load-lib applies the same filter to its refer).
+              (let ((excl (assoc "exclude" (cdr parsed))))
+                (when excl
+                  (chez-register-refer-all-excludes!
+                    (chez-current-ns) target
+                    (map symbol-t-name (filter symbol-t? (seq->list (cdr excl))))))))))
+        (expand-libspec s0)))
+    specs))
+
+(define (ns-require+use specs use?)
+  (let* ((flags (ns-flag-names specs))
+         (real (filter (lambda (s) (not (keyword? s))) specs))
+         (k (lambda (force-named?) (ns-load+register real force-named? use?))))
+    (if ns-with-load-opts (ns-with-load-opts flags k) (k #f)))
+  jolt-nil)
+
+(define (jolt-require . specs) (ns-require+use specs #f))
+;; use = require + refer ALL of the target's public vars, unless an explicit
+;; :only/:refer filter is given (which chez-register-spec! handles per-name).
+(define (jolt-use . specs) (ns-require+use specs #t))
 
 ;; a namespace designator -> its name string (a jns or a symbol; the corpus never
 ;; passes a bare string). Anything else is refused HERE, with the throw the JVM
@@ -719,6 +803,8 @@
     (cons "ex-info" jolt-ex-info)))
 
 ;; --- bindings + *ns* --------------------------------------------------------
+(def-var! "clojure.core" "require" jolt-require)
+(def-var! "clojure.core" "use" jolt-use)
 (def-var! "clojure.core" "find-ns" jolt-find-ns)
 (def-var! "clojure.core" "the-ns" jolt-the-ns)
 (def-var! "clojure.core" "create-ns" jolt-create-ns)
