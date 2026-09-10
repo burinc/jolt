@@ -96,6 +96,11 @@
   ;; action). jolt has no Agent/pooledExecutor to name, so no common row exists.
   {:suite "agent-interop" :label "dispatch enqueues the action and answers the agent" :expr "(let [ag (agent 1)] [(identical? ag (.dispatch ag + (seq [10 100]) nil)) (do (await ag) @ag)])" :expected "[true 111]"}
   {:suite "agent-interop" :label "dispatch with no args is a plain send" :expr "(let [ag (agent 1)] (.dispatch ag inc (seq []) nil) (await ag) @ag)" :expected "2"}
+  ;; This is a unit row rather than a corpus one because it is deterministic on
+  ;; jolt alone: jolt's await drains the queue AND clears running? before it
+  ;; returns, so the count is exactly 0 after it, while the JVM's await can
+  ;; return with its own wait action still queued and answer 1 under load. The
+  ;; portable half — a fresh agent, never sent to — is a corpus row.
   {:suite "agent-interop" :label "getQueueCount counts the actions still pending" :expr "(let [ag (agent 0)] (await ag) (.getQueueCount ag))" :expected "0"}
   {:suite "atomwatch" :expr "(let [a (atom 0) seen (atom 0)] (add-watch a :k (fn [k r o n] (reset! seen 1))) (reset! a 5) @seen)" :expected "1"}
   {:suite "atomwatch" :expr "(let [a (atom 0) seen (atom 0)] (add-watch a :k (fn [k r o n] (swap! seen inc))) (remove-watch a :k) (reset! a 5) @seen)" :expected "0"}

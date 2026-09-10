@@ -2156,12 +2156,17 @@
 (define (set-rd-class-method-hook! f)
   (set! rd-class-method-hook f))
 
-(define (rd-persistent-coll? obj)
+(define (rd-java-list? obj)
   (or (pvec? obj)
-      (pset? obj)
       (cseq? obj)
       (empty-list-t? obj)
       (jolt-lazyseq? obj)))
+
+(define (rd-java-set? obj)
+  (or (pset? obj) (htable-sorted-set? obj)))
+
+(define (rd-persistent-coll? obj)
+  (or (rd-java-list? obj) (rd-java-set? obj)))
 
 (define (rd-coll-last obj)
   (if (pvec? obj)
@@ -2170,13 +2175,27 @@
         (let ((n (jolt-seq (seq-more s))))
           (if (jolt-nil? n) (seq-first s) (loop n))))))
 
-(define rd-java-util-mutator-names
-  '("add" "addAll" "addFirst" "addLast" "clear" "remove" "removeAll"
-     "removeFirst" "removeLast" "removeIf" "replaceAll"
-     "retainAll" "set" "sort"))
+(define rd-collection-mutators
+  '(("add" 1) ("addAll" 1) ("clear" 0) ("remove" 1)
+     ("removeAll" 1) ("removeIf" 1) ("retainAll" 1)))
 
-(define (rd-java-util-mutator? m)
-  (and (member m rd-java-util-mutator-names) #t))
+(define rd-list-mutators
+  '(("add" 2) ("addAll" 2) ("set" 2) ("addFirst" 1) ("addLast" 1)
+     ("removeFirst" 0) ("removeLast" 0) ("replaceAll" 1)
+     ("sort" 1)))
+
+(define (rd-mutator-in? table name argc)
+  (let loop ((t table))
+    (cond
+      ((null? t) #f)
+      ((and (string=? (caar t) name) (fx=? (cadar t) argc)) #t)
+      (else (loop (cdr t))))))
+
+(define (rd-coll-mutator? obj name argc)
+  (or (and (rd-persistent-coll? obj)
+           (rd-mutator-in? rd-collection-mutators name argc))
+      (and (rd-java-list? obj)
+           (rd-mutator-in? rd-list-mutators name argc))))
 
 (define (rd-var-meta obj)
   (let ((m (var-cell-meta obj)))
@@ -2570,26 +2589,32 @@
           (let ((o (car rest)))
             (cond ((char<? obj o) -1) ((char>? obj o) 1) (else 0))))
          (else (dispatch-miss obj method-name rest))))
-      ((and (string=? method-name "getFirst")
-            (rd-persistent-coll? obj))
+      ((and (string=? method-name "getFirst") (rd-java-list? obj))
        (let ((s (jolt-seq obj)))
          (if (jolt-nil? s)
              (throw-jvm 'NoSuchElementException "")
              (seq-first s))))
-      ((and (string=? method-name "getLast")
-            (rd-persistent-coll? obj))
+      ((and (string=? method-name "getLast") (rd-java-list? obj))
        (if (jolt-nil? (jolt-seq obj))
            (throw-jvm 'NoSuchElementException "")
            (rd-coll-last obj)))
-      ((and (string=? method-name "reversed")
-            (rd-persistent-coll? obj))
+      ((and (string=? method-name "reversed") (rd-java-list? obj))
        (let ((items (reverse (seq->list (jolt-seq obj)))))
          (if (pvec? obj)
              (apply jolt-vector items)
              (list->cseq items))))
-      ((and (rd-java-util-mutator? method-name)
-            (rd-persistent-coll? obj))
-       (throw-jvm 'UnsupportedOperationException ""))
+      ((rd-coll-mutator? obj method-name (length rest))
+       (let ((empty? (jolt-nil? (jolt-seq obj))))
+         (cond
+           ((not empty?) (throw-jvm 'UnsupportedOperationException ""))
+           ((or (string=? method-name "removeFirst")
+                (string=? method-name "removeLast"))
+            (throw-jvm 'NoSuchElementException ""))
+           ((string=? method-name "removeIf") #f)
+           ((or (string=? method-name "replaceAll")
+                (string=? method-name "sort"))
+            jolt-nil)
+           (else (throw-jvm 'UnsupportedOperationException "")))))
       ((or (string=? method-name "indexOf")
            (string=? method-name "lastIndexOf"))
        (let ((target (car rest))

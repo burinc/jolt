@@ -110,18 +110,59 @@
 ;; the receivers of the SequencedCollection accessors and the mutator refusal in
 ;; the base below. A map is not here — its `.name` reads stay the documented
 ;; map-as-object superset — and neither is a deftype.
+;;
+;; List and Set are kept APART, because the two carry different methods and a
+;; single predicate for both answered List's on a set: (.getFirst #{1 2}) read 1
+;; and (.reversed #{1 2}) a reversed seq, where the JVM has neither — a
+;; PersistentHashSet is a java.util.Set, which is not a SequencedCollection, so
+;; both are "No matching method" there. A SORTED set is the same answer for a
+;; different reason: it is a PersistentTreeSet, which is not a SequencedSet
+;; either. It is an htable rather than a pset in jolt, which is why it needs
+;; naming here at all — without it every Collection mutator on a sorted set fell
+;; through to a miss instead of being refused.
+(define (rd-java-list? obj)
+  (or (pvec? obj) (cseq? obj) (empty-list-t? obj) (jolt-lazyseq? obj)))
+(define (rd-java-set? obj)
+  (or (pset? obj) (htable-sorted-set? obj)))
 (define (rd-persistent-coll? obj)
-  (or (pvec? obj) (pset? obj) (cseq? obj) (empty-list-t? obj) (jolt-lazyseq? obj)))
+  (or (rd-java-list? obj) (rd-java-set? obj)))
 (define (rd-coll-last obj)
   (if (pvec? obj)
       (jolt-nth obj (fx- (jolt-count obj) 1))
       (let loop ((s (jolt-seq obj)))
         (let ((n (jolt-seq (seq-more s))))
           (if (jolt-nil? n) (seq-first s) (loop n))))))
-(define rd-java-util-mutator-names
-  '("add" "addAll" "addFirst" "addLast" "clear" "remove" "removeAll" "removeFirst"
-    "removeLast" "removeIf" "replaceAll" "retainAll" "set" "sort"))
-(define (rd-java-util-mutator? m) (and (member m rd-java-util-mutator-names) #t))
+;; The java.util mutators an immutable collection refuses, keyed by name AND
+;; ARITY — because a name on its own is not a method. java.util.List/set is
+;; set(int,E), so a one-argument (.set [1] 2) matches nothing on the JVM and is
+;; its IllegalArgumentException "No matching method set found taking 1 args".
+;; Refusing it with UnsupportedOperationException, as a bare list of names did,
+;; both named a method the class does not have and put the call out of reach of
+;; the (catch IllegalArgumentException …) a caller writes; a no-argument .add and
+;; a one-argument .clear were the same mistake (jolt-8oa).
+;;
+;; Two surfaces, because a set carries fewer of them. A vector / list / seq is a
+;; java.util.List AND, on JDK 21, a SequencedCollection: it has the positional
+;; overloads (add/2, addAll/2, set/2), the four ends (addFirst, addLast,
+;; removeFirst, removeLast) and List's bulk ops (replaceAll, sort). jolt's set is
+;; a plain java.util.Set — a SORTED set too, which is PersistentTreeSet and not a
+;; SequencedSet on the JVM, checked — so it has Collection's surface and nothing
+;; more, and every List-only name above is "No matching method" on one rather
+;; than a refusal.
+(define rd-collection-mutators
+  '(("add" 1) ("addAll" 1) ("clear" 0) ("remove" 1) ("removeAll" 1)
+    ("removeIf" 1) ("retainAll" 1)))
+(define rd-list-mutators
+  '(("add" 2) ("addAll" 2) ("set" 2) ("addFirst" 1) ("addLast" 1)
+    ("removeFirst" 0) ("removeLast" 0) ("replaceAll" 1) ("sort" 1)))
+(define (rd-mutator-in? table name argc)
+  (let loop ((t table))
+    (cond ((null? t) #f)
+          ((and (string=? (caar t) name) (fx=? (cadar t) argc)) #t)
+          (else (loop (cdr t))))))
+(define (rd-coll-mutator? obj name argc)
+  (or (and (rd-persistent-coll? obj) (rd-mutator-in? rd-collection-mutators name argc))
+      (and (rd-java-list? obj) (rd-mutator-in? rd-list-mutators name argc))))
 
 ;; clojure.lang.Var meta reads for the instance arm below. A cell's meta is a
 ;; pmap, or #f / nil before anything attached one (state-image rebuilds a cell with
@@ -492,26 +533,43 @@
               (let ((o (car rest))) (cond ((char<? obj o) -1) ((char>? obj o) 1) (else 0))))
              (else (dispatch-miss obj method-name rest))))
       ;; java.util.SequencedCollection (JDK 21) over jolt's own persistent
-      ;; collections — vector / list / seq / set are java.util.List or Set on the
-      ;; JVM and carry these. getFirst / getLast raise NoSuchElementException on
-      ;; an empty one; reversed() is a reverse-order VIEW there, and for an
+      ;; collections — a vector / list / seq is a java.util.List, which is one.
+      ;; A SET is not, sorted or otherwise (see rd-java-list? above), so these
+      ;; three stay off it. getFirst / getLast raise NoSuchElementException on an
+      ;; empty one; reversed() is a reverse-order VIEW there, and for an
       ;; immutable collection a copy is that view.
-      ((and (string=? method-name "getFirst") (rd-persistent-coll? obj))
+      ((and (string=? method-name "getFirst") (rd-java-list? obj))
        (let ((s (jolt-seq obj)))
          (if (jolt-nil? s) (throw-jvm 'NoSuchElementException "") (seq-first s))))
-      ((and (string=? method-name "getLast") (rd-persistent-coll? obj))
+      ((and (string=? method-name "getLast") (rd-java-list? obj))
        (if (jolt-nil? (jolt-seq obj)) (throw-jvm 'NoSuchElementException "") (rd-coll-last obj)))
-      ((and (string=? method-name "reversed") (rd-persistent-coll? obj))
+      ((and (string=? method-name "reversed") (rd-java-list? obj))
        (let ((items (reverse (seq->list (jolt-seq obj)))))
          (if (pvec? obj) (apply jolt-vector items) (list->cseq items))))
       ;; The java.util.Collection / List / Set mutators: an immutable collection
-      ;; refuses every one with UnsupportedOperationException, as on the JVM. It
-      ;; used to fall to dispatch-miss — an IllegalArgumentException "no matching
-      ;; method" that a (catch UnsupportedOperationException …) does not see. A
-      ;; deftype is not a persistent collection here: its own methods answered
-      ;; above, and an interface method it does not declare stays its own miss.
-      ((and (rd-java-util-mutator? method-name) (rd-persistent-coll? obj))
-       (throw-jvm 'UnsupportedOperationException ""))
+      ;; refuses every one it HAS with UnsupportedOperationException, as on the
+      ;; JVM — these used to fall to dispatch-miss, an IllegalArgumentException
+      ;; "no matching method" that a (catch UnsupportedOperationException …) does
+      ;; not see. Which ones it has is rd-coll-mutator? above; one it merely
+      ;; SPELLS goes back to being that miss. A deftype is not a persistent
+      ;; collection here: its own methods answered above, and an interface method
+      ;; it does not declare stays its own miss.
+      ;;
+      ;; On an EMPTY collection three of them never reach a mutation to refuse,
+      ;; because they are DEFAULT methods that walk the elements first and so the
+      ;; JVM has answered before it can throw: removeFirst / removeLast raise
+      ;; NoSuchElementException (the same empty check getFirst / getLast make
+      ;; above), removeIf answers false — it removed nothing — and replaceAll and
+      ;; sort are void and do nothing at all.
+      ((rd-coll-mutator? obj method-name (length rest))
+       (let ((empty? (jolt-nil? (jolt-seq obj))))
+         (cond
+           ((not empty?) (throw-jvm 'UnsupportedOperationException ""))
+           ((or (string=? method-name "removeFirst") (string=? method-name "removeLast"))
+            (throw-jvm 'NoSuchElementException ""))
+           ((string=? method-name "removeIf") #f)
+           ((or (string=? method-name "replaceAll") (string=? method-name "sort")) jolt-nil)
+           (else (throw-jvm 'UnsupportedOperationException "")))))
       ;; java.util.List .indexOf / .lastIndexOf over any seqable (vector / list /
       ;; seq) — -1 when absent, like the JVM (medley/index-of reads this).
       ((or (string=? method-name "indexOf") (string=? method-name "lastIndexOf"))
