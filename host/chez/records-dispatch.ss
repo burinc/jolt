@@ -110,18 +110,59 @@
 ;; the receivers of the SequencedCollection accessors and the mutator refusal in
 ;; the base below. A map is not here — its `.name` reads stay the documented
 ;; map-as-object superset — and neither is a deftype.
+;;
+;; List and Set are kept APART, because the two carry different methods and a
+;; single predicate for both answered List's on a set: (.getFirst #{1 2}) read 1
+;; and (.reversed #{1 2}) a reversed seq, where the JVM has neither — a
+;; PersistentHashSet is a java.util.Set, which is not a SequencedCollection, so
+;; both are "No matching method" there. A SORTED set is the same answer for a
+;; different reason: it is a PersistentTreeSet, which is not a SequencedSet
+;; either. It is an htable rather than a pset in jolt, which is why it needs
+;; naming here at all — without it every Collection mutator on a sorted set fell
+;; through to a miss instead of being refused.
+(define (rd-java-list? obj)
+  (or (pvec? obj) (cseq? obj) (empty-list-t? obj) (jolt-lazyseq? obj)))
+(define (rd-java-set? obj)
+  (or (pset? obj) (htable-sorted-set? obj)))
 (define (rd-persistent-coll? obj)
-  (or (pvec? obj) (pset? obj) (cseq? obj) (empty-list-t? obj) (jolt-lazyseq? obj)))
+  (or (rd-java-list? obj) (rd-java-set? obj)))
 (define (rd-coll-last obj)
   (if (pvec? obj)
       (jolt-nth obj (fx- (jolt-count obj) 1))
       (let loop ((s (jolt-seq obj)))
         (let ((n (jolt-seq (seq-more s))))
           (if (jolt-nil? n) (seq-first s) (loop n))))))
-(define rd-java-util-mutator-names
-  '("add" "addAll" "addFirst" "addLast" "clear" "remove" "removeAll" "removeFirst"
-    "removeLast" "removeIf" "replaceAll" "retainAll" "set" "sort"))
-(define (rd-java-util-mutator? m) (and (member m rd-java-util-mutator-names) #t))
+;; The java.util mutators an immutable collection refuses, keyed by name AND
+;; ARITY — because a name on its own is not a method. java.util.List/set is
+;; set(int,E), so a one-argument (.set [1] 2) matches nothing on the JVM and is
+;; its IllegalArgumentException "No matching method set found taking 1 args".
+;; Refusing it with UnsupportedOperationException, as a bare list of names did,
+;; both named a method the class does not have and put the call out of reach of
+;; the (catch IllegalArgumentException …) a caller writes; a no-argument .add and
+;; a one-argument .clear were the same mistake (jolt-8oa).
+;;
+;; Two surfaces, because a set carries fewer of them. A vector / list / seq is a
+;; java.util.List AND, on JDK 21, a SequencedCollection: it has the positional
+;; overloads (add/2, addAll/2, set/2), the four ends (addFirst, addLast,
+;; removeFirst, removeLast) and List's bulk ops (replaceAll, sort). jolt's set is
+;; a plain java.util.Set — a SORTED set too, which is PersistentTreeSet and not a
+;; SequencedSet on the JVM, checked — so it has Collection's surface and nothing
+;; more, and every List-only name above is "No matching method" on one rather
+;; than a refusal.
+(define rd-collection-mutators
+  '(("add" 1) ("addAll" 1) ("clear" 0) ("remove" 1) ("removeAll" 1)
+    ("removeIf" 1) ("retainAll" 1)))
+(define rd-list-mutators
+  '(("add" 2) ("addAll" 2) ("set" 2) ("addFirst" 1) ("addLast" 1)
+    ("removeFirst" 0) ("removeLast" 0) ("replaceAll" 1) ("sort" 1)))
+(define (rd-mutator-in? table name argc)
+  (let loop ((t table))
+    (cond ((null? t) #f)
+          ((and (string=? (caar t) name) (fx=? (cadar t) argc)) #t)
+          (else (loop (cdr t))))))
+(define (rd-coll-mutator? obj name argc)
+  (or (and (rd-persistent-coll? obj) (rd-mutator-in? rd-collection-mutators name argc))
+      (and (rd-java-list? obj) (rd-mutator-in? rd-list-mutators name argc))))
 
 ;; clojure.lang.Var meta reads for the instance arm below. A cell's meta is a
 ;; pmap, or #f / nil before anything attached one (state-image rebuilds a cell with
@@ -132,6 +173,113 @@
   (let ((m (rd-var-meta obj))) (if m (jolt-get m (keyword #f key) jolt-nil) jolt-nil)))
 (define (rd-var-meta-flag? obj key) (jolt-truthy? (rd-var-meta-get obj key)))
 (define (rd-args->list x) (let ((s (jolt-seq x))) (if (jolt-nil? s) '() (seq->list s))))
+
+;; clojure.lang.ARef's watch and validator methods, for the base's reference arm
+;; below. Keyed by name AND arity so a wrong-arity call falls through to
+;; dispatch-miss and reports the JVM's "No matching method" instead of faulting
+;; inside the native on a short `rest`. Each body is the same procedure the
+;; clojure.core fn of that name is def-var!'d to (atoms.ss), so a watch
+;; registered through interop and one registered through add-watch are one list.
+(define (rd-iref-method name argc)
+  (cond ((string=? name "addWatch")      (and (fx=? argc 2) jolt-add-watch))
+        ((string=? name "removeWatch")   (and (fx=? argc 1) jolt-remove-watch))
+        ((string=? name "getWatches")    (and (fx=? argc 0) jolt-get-watches))
+        ((string=? name "notifyWatches") (and (fx=? argc 2) jolt-notify-watches))
+        ((string=? name "setValidator")  (and (fx=? argc 1) jolt-set-validator!))
+        ((string=? name "getValidator")  (and (fx=? argc 0) jolt-get-validator))
+        (else #f)))
+
+;; clojure.lang.IDeref, the root every reference shares. On the JVM it is one
+;; real method plus five DEFAULT ones: get() is deref(), and getAsBoolean /
+;; getAsInt / getAsLong / getAsDouble are the java.util.function bridges, each
+;; the matching RT cast of deref(). The casts here are the same natives
+;; clojure.core/boolean, int, long and double are bound to, so (.getAsInt (atom
+;; 3.9)) truncates to 3 exactly as (int 3.9) does.
+;;
+;; The two-argument deref is IBlockingDeref's (ms, timeout-val), and only a
+;; promise and a future declare it. That arity has to be screened HERE rather than
+;; left to jolt-deref, which refuses it with the ClassCastException @ raises: the
+;; JVM never gets that far, because there is no two-argument deref on a Delay to
+;; reflect onto in the first place, so (.deref (delay 1) 50 :to) is "No matching
+;; method deref found taking 2 args" there. Hence a KIND rather than a predicate.
+;;
+;; rd-deref-kind knows the deref-able types THIS file can see. future / promise /
+;; agent / delay live in java/concurrency.ss, which loads long after this file and
+;; is no part of the Gambit host at all, so it classifies its own four through the
+;; hook — the same shape as rd-class-method-hook above. A var is deliberately
+;; absent: the Var arm below answers deref/get off var-cell-deref, which hands
+;; back the Unbound object where jolt-deref would throw, and it keeps that.
+(define rd-extra-deref-hook #f)
+(define (set-rd-extra-deref-hook! f) (set! rd-extra-deref-hook f))
+(define (rd-deref-kind x)
+  (cond ((or (jolt-atom? x) (jolt-ref? x) (jvol? x) (jolt-reduced? x)) (quote ideref))
+        (rd-extra-deref-hook (rd-extra-deref-hook x))
+        (else #f)))
+(define (rd-derefable? x) (and (rd-deref-kind x) #t))
+(define (rd-blocking-derefable? x) (eq? (quote iblocking) (rd-deref-kind x)))
+(define (rd-ideref-method x name argc)
+  (cond ((string=? name "deref")
+         (and (or (fx=? argc 0)
+                  (and (fx=? argc 2) (rd-blocking-derefable? x)))
+              jolt-deref))
+        ((string=? name "get")          (and (fx=? argc 0) jolt-deref))
+        ((string=? name "getAsBoolean") (and (fx=? argc 0) rd-deref-as-boolean))
+        ((string=? name "getAsInt")     (and (fx=? argc 0) rd-deref-as-int))
+        ((string=? name "getAsLong")    (and (fx=? argc 0) rd-deref-as-long))
+        ((string=? name "getAsDouble")  (and (fx=? argc 0) rd-deref-as-double))
+        (else #f)))
+(define (rd-deref-as-boolean x) (jolt-boolean (jolt-deref x)))
+(define (rd-deref-as-int x) (jolt-int-cast (jolt-deref x)))
+(define (rd-deref-as-long x) (jolt-long-cast (jolt-deref x)))
+(define (rd-deref-as-double x) (jolt-double (jolt-deref x)))
+
+;; clojure.lang.IAtom / IAtom2 — the five mutators, each the native the
+;; clojure.core fn of the same meaning is bound to, so the CAS retry, the
+;; validator and the watch notification are the ones swap!/reset! already do.
+;;
+;; swap and swapVals have a fourth arity that is the JVM's (f, x, y, ISeq args)
+;; spread form — RT.listStar there, the trailing seq spliced onto the tail here.
+;; Every shorter arity is already flat, which is why the spread only fires at 4.
+(define (rd-atom-method name argc)
+  (cond ((string=? name "swap")          (and (memv argc (quote (1 2 3 4))) rd-atom-swap))
+        ((string=? name "swapVals")      (and (memv argc (quote (1 2 3 4))) rd-atom-swap-vals))
+        ((string=? name "reset")         (and (fx=? argc 1) jolt-reset!))
+        ((string=? name "resetVals")     (and (fx=? argc 1) jolt-reset-vals!))
+        ((string=? name "compareAndSet") (and (fx=? argc 2) jolt-compare-and-set!))
+        (else #f)))
+(define (rd-spread-tail args)
+  (if (fx=? (length args) 4)
+      (cons (car args) (cons (cadr args) (cons (caddr args) (rd-args->list (cadddr args)))))
+      args))
+(define (rd-atom-swap a . args) (apply jolt-swap! a (rd-spread-tail args)))
+(define (rd-atom-swap-vals a . args) (apply jolt-swap-vals! a (rd-spread-tail args)))
+
+;; clojure.lang.Ref. set / alter / commute are the transaction mutators, and the
+;; natives raise IllegalStateException off a transaction exactly as Ref does;
+;; alter and commute take the JVM's (fn, ISeq args) rather than a spread arglist.
+;; touch is what clojure.core/ensure calls and is VOID there, so the value ensure
+;; answers is dropped. jolt keeps no ref history — ref-history-count is 0 by
+;; construction — so getHistoryCount answers 0 and trimHistory is the no-op it
+;; already is, while the min/max knobs are the same side tables ref-min-history
+;; and ref-max-history read (each native is getter and setter by arity, and the
+;; setter answers the ref, as Ref.setMinHistory does). deref is not here: a ref
+;; is rd-derefable?, so the IDeref table above claims it.
+(define (rd-ref-method name argc)
+  (cond ((string=? name "set")             (and (fx=? argc 1) jolt-ref-set))
+        ((string=? name "alter")           (and (fx=? argc 2) rd-ref-alter))
+        ((string=? name "commute")         (and (fx=? argc 2) rd-ref-commute))
+        ((string=? name "touch")           (and (fx=? argc 0) rd-ref-touch))
+        ((string=? name "getMinHistory")   (and (fx=? argc 0) jolt-ref-min-history))
+        ((string=? name "setMinHistory")   (and (fx=? argc 1) jolt-ref-min-history))
+        ((string=? name "getMaxHistory")   (and (fx=? argc 0) jolt-ref-max-history))
+        ((string=? name "setMaxHistory")   (and (fx=? argc 1) jolt-ref-max-history))
+        ((string=? name "getHistoryCount") (and (fx=? argc 0) jolt-ref-history-count))
+        ((string=? name "trimHistory")     (and (fx=? argc 0) rd-ref-trim-history))
+        (else #f)))
+(define (rd-ref-alter r f args) (apply jolt-alter r f (rd-args->list args)))
+(define (rd-ref-commute r f args) (apply jolt-commute r f (rd-args->list args)))
+(define (rd-ref-touch r) (jolt-ensure r) jolt-nil)
+(define (rd-ref-trim-history r) jolt-nil)
 
 (define (record-method-dispatch-base obj method-name rest-args)
   (let ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args))))
@@ -286,6 +434,33 @@
               (jolt-symbol #f (jns-name obj)))
              ((string=? method-name "toString") (jns-name obj))
              (else (dispatch-miss obj method-name rest))))
+      ;; clojure.lang.ARef's watch/validator surface, answered for all four
+      ;; watchable reference types at once — atom, var, ref, agent. Each already
+      ;; IS an IRef by class ((instance? clojure.lang.IRef a) is true and
+      ;; (supers clojure.lang.Atom) lists ARef), but the METHODS were missing, so
+      ;; a library reaching the seam through interop rather than
+      ;; clojure.core/add-watch got "No matching method addWatch found taking 2
+      ;; args for class clojure.lang.Atom".
+      ;;
+      ;; It sits above the Var arm because a Var answers these too, and the
+      ;; receiver guard runs FIRST: a deftype spelling a method the same way is
+      ;; not watchable, so it never gets here (its own methods answered in the
+      ;; dot-form arm anyway), and a plain value falls through to dispatch-miss.
+      ((and (jolt-iref-watchable? obj) (rd-iref-method method-name (length rest)))
+       => (lambda (f) (apply f obj rest)))
+      ;; ...and the interface each reference type declares BELOW ARef: IDeref for
+      ;; every one of them, IAtom/IAtom2 for an atom, Ref's transaction and
+      ;; history surface for a ref. Agent's own half is a registered arm in
+      ;; java/concurrency.ss, where its natives live. Same shape as the watch arm
+      ;; above — receiver first, then name and arity — so a wrong arity or a
+      ;; receiver of the wrong kind falls through to dispatch-miss and reports the
+      ;; JVM's "No matching method" rather than faulting inside a native.
+      ((and (jolt-atom? obj) (rd-atom-method method-name (length rest)))
+       => (lambda (f) (apply f obj rest)))
+      ((and (jolt-ref? obj) (rd-ref-method method-name (length rest)))
+       => (lambda (f) (apply f obj rest)))
+      ((and (rd-derefable? obj) (rd-ideref-method obj method-name (length rest)))
+       => (lambda (f) (apply f obj rest)))
       ;; clojure.lang.Var: ns -> its Namespace, sym -> the simple-name Symbol.
       ;; clojure.spec.alpha's ->sym reads (.name (.ns v)) and (.sym v).
       ((var-cell? obj)
@@ -358,26 +533,43 @@
               (let ((o (car rest))) (cond ((char<? obj o) -1) ((char>? obj o) 1) (else 0))))
              (else (dispatch-miss obj method-name rest))))
       ;; java.util.SequencedCollection (JDK 21) over jolt's own persistent
-      ;; collections — vector / list / seq / set are java.util.List or Set on the
-      ;; JVM and carry these. getFirst / getLast raise NoSuchElementException on
-      ;; an empty one; reversed() is a reverse-order VIEW there, and for an
+      ;; collections — a vector / list / seq is a java.util.List, which is one.
+      ;; A SET is not, sorted or otherwise (see rd-java-list? above), so these
+      ;; three stay off it. getFirst / getLast raise NoSuchElementException on an
+      ;; empty one; reversed() is a reverse-order VIEW there, and for an
       ;; immutable collection a copy is that view.
-      ((and (string=? method-name "getFirst") (rd-persistent-coll? obj))
+      ((and (string=? method-name "getFirst") (rd-java-list? obj))
        (let ((s (jolt-seq obj)))
          (if (jolt-nil? s) (throw-jvm 'NoSuchElementException "") (seq-first s))))
-      ((and (string=? method-name "getLast") (rd-persistent-coll? obj))
+      ((and (string=? method-name "getLast") (rd-java-list? obj))
        (if (jolt-nil? (jolt-seq obj)) (throw-jvm 'NoSuchElementException "") (rd-coll-last obj)))
-      ((and (string=? method-name "reversed") (rd-persistent-coll? obj))
+      ((and (string=? method-name "reversed") (rd-java-list? obj))
        (let ((items (reverse (seq->list (jolt-seq obj)))))
          (if (pvec? obj) (apply jolt-vector items) (list->cseq items))))
       ;; The java.util.Collection / List / Set mutators: an immutable collection
-      ;; refuses every one with UnsupportedOperationException, as on the JVM. It
-      ;; used to fall to dispatch-miss — an IllegalArgumentException "no matching
-      ;; method" that a (catch UnsupportedOperationException …) does not see. A
-      ;; deftype is not a persistent collection here: its own methods answered
-      ;; above, and an interface method it does not declare stays its own miss.
-      ((and (rd-java-util-mutator? method-name) (rd-persistent-coll? obj))
-       (throw-jvm 'UnsupportedOperationException ""))
+      ;; refuses every one it HAS with UnsupportedOperationException, as on the
+      ;; JVM — these used to fall to dispatch-miss, an IllegalArgumentException
+      ;; "no matching method" that a (catch UnsupportedOperationException …) does
+      ;; not see. Which ones it has is rd-coll-mutator? above; one it merely
+      ;; SPELLS goes back to being that miss. A deftype is not a persistent
+      ;; collection here: its own methods answered above, and an interface method
+      ;; it does not declare stays its own miss.
+      ;;
+      ;; On an EMPTY collection three of them never reach a mutation to refuse,
+      ;; because they are DEFAULT methods that walk the elements first and so the
+      ;; JVM has answered before it can throw: removeFirst / removeLast raise
+      ;; NoSuchElementException (the same empty check getFirst / getLast make
+      ;; above), removeIf answers false — it removed nothing — and replaceAll and
+      ;; sort are void and do nothing at all.
+      ((rd-coll-mutator? obj method-name (length rest))
+       (let ((empty? (jolt-nil? (jolt-seq obj))))
+         (cond
+           ((not empty?) (throw-jvm 'UnsupportedOperationException ""))
+           ((or (string=? method-name "removeFirst") (string=? method-name "removeLast"))
+            (throw-jvm 'NoSuchElementException ""))
+           ((string=? method-name "removeIf") #f)
+           ((or (string=? method-name "replaceAll") (string=? method-name "sort")) jolt-nil)
+           (else (throw-jvm 'UnsupportedOperationException "")))))
       ;; java.util.List .indexOf / .lastIndexOf over any seqable (vector / list /
       ;; seq) — -1 when absent, like the JVM (medley/index-of reads this).
       ((or (string=? method-name "indexOf") (string=? method-name "lastIndexOf"))
@@ -503,6 +695,11 @@
 (define arm-priority-nio-path 42)     ; java.nio.file.Path methods (above jfile)
 (define arm-priority-htable 43)       ; tagged htable method registry
 (define arm-priority-host-type 44)    ; jhost/number/string per-type dispatch
+;; java/concurrency.ss registers clojure.lang.Agent's own methods here rather
+;; than in the base above: the agent natives are in that file, it loads long
+;; after this one, and the Gambit host does not include it at all. Nothing else
+;; claims those names, so the tier is only about where the code can live.
+(define arm-priority-agent 45)      ; clojure.lang.Agent's own method surface
 ;; A nil receiver is a NullPointerException before any arm looks: the JVM
 ;; cannot invoke anything on null. (.toString nil) used to answer "" and
 ;; (.equals nil 1) false through the universal Object arm.
