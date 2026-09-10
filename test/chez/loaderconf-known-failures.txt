@@ -1,0 +1,16 @@
+# Loader conformance cases that do not pass yet, by case number.
+# Regenerate: JOLT_LOADERCONF_WRITE_BASELINE=1 make loaderconf
+#
+# A case leaves this file in the same change that makes it pass.
+01	v1/v2 isolation: two contexts hold one library at two versions
+02	hermetic: an isolated context cannot see what the root has
+03	shared by reference: a delegated var is the same cell
+04	deny is not a miss: a denied name raises and never falls through
+05	self-first: own roots shadow the delegate, for the declared prefix only
+06	composed delegates: a host plus a pool, and parent walks the graph
+07	unload: no new loads, resolved definitions stay live, idempotent
+08	resources: find/open-hit and the classloader facade stay in the context
+09	defining context: a fn requires where it was defined, not where it is called
+10	dispatch follows the value: a context-2 value dispatches in context 2
+11	hits are data: find opens nothing and a hit round-trips into load
+12	eager construction, lazy load: the constructor validates, load reads
