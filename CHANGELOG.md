@@ -85,6 +85,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`clojure.lang.ARef`'s watch and validator METHODS work through interop.**
+  Every watchable reference type was already an `IRef` by class — `(instance?
+  clojure.lang.IRef (atom 1))` is true and `(supers clojure.lang.Atom)` lists
+  `ARef` — but the methods that interface declares were not answered, so a
+  library that reaches the seam through interop rather than
+  `clojure.core/add-watch` got `No matching method addWatch found taking 2 args
+  for class clojure.lang.Atom`, and `.getWatches` the field spelling of the
+  same miss. `.addWatch`, `.removeWatch`, `.getWatches`, `.notifyWatches`,
+  `.setValidator` and `.getValidator` now answer on all four of atom, ref, var
+  and agent, off the same watch list `add-watch` writes: a watch registered
+  either way is one list, and one registered through interop fires on a real
+  `swap!`, `ref-set` at commit, root `def` and `send` alike. `.getWatches` is an
+  `IPersistentMap` whose values are the callbacks themselves, so an unwatched
+  reference reads `{}` and not `nil`, and `.notifyWatches` fires the watches
+  without touching the value, as a subclass driving its own notification does on
+  the JVM. A wrong-arity call and a receiver that is not one of the four (a
+  `Volatile` is an `IDeref`, not an `IRef`) still report the JVM's `No matching
+  method`, and a `deftype` that declares these methods itself keeps its own.
+  There is no `clojure.lang.IWatchable` to implement — the JVM declares
+  `getWatches`/`addWatch`/`removeWatch` on `IRef` and implements them in `ARef`
+  — which is why one arm serves all four types. 21 corpus rows, all certified
+  against reference Clojure.
+
+- **The reference types answer the rest of their interfaces through interop
+  too.** `IDeref` is the root every reference shares, and none of it was
+  reachable as a method: `(.deref (atom 1))` and `(.get (atom 1))` both read
+  `No matching field found: deref for class clojure.lang.Atom`. `.deref` and
+  `.get` now answer on atom, ref, agent, volatile, delay, promise, future and
+  `reduced` — `get()` is a default method on `IDeref`, so every one of them
+  carries it — along with the `.getAsBoolean` / `.getAsInt` / `.getAsLong` /
+  `.getAsDouble` bridges, each the same cast `boolean`, `int`, `long` and
+  `double` apply, so `(.getAsInt (atom 3.9))` truncates to `3`. The
+  two-argument `(.deref p 50 :timeout)` is `IBlockingDeref`'s and stays limited
+  to a promise and a future: an agent and a delay have no such method to
+  reflect onto, so that call is `No matching method` there as on the JVM.
+
+  Then each type's own interface. An atom answers `IAtom`/`IAtom2` —
+  `.swap` and `.swapVals` at all four arities including the JVM's
+  `(f x y args)` spread form, `.reset`, `.resetVals`, `.compareAndSet` — off
+  the natives `swap!` and `reset!` already use, so the CAS retry, the validator
+  and the watch notification are the same ones. A ref answers `.set`, `.alter`,
+  `.commute` (the JVM's `(fn, args-seq)` shape, and `IllegalStateException`
+  outside a transaction), `.touch`, and the history surface `.getMinHistory` /
+  `.setMinHistory` / `.getMaxHistory` / `.setMaxHistory` / `.getHistoryCount` /
+  `.trimHistory`. An agent answers `.getError`, `.getErrorMode`,
+  `.setErrorMode`, `.getErrorHandler`, `.setErrorHandler`, `.getQueueCount`,
+  `.restart` and `.dispatch`. 37 corpus rows and 3 unit rows.
+
+  `.dispatch(fn, args, exec)` is the one method here that is a jolt superset:
+  one serialized worker runs per agent, so there is no pool for the executor
+  argument to select and it is accepted and ignored.
+
+- **`restart-agent`, `clear-agent-errors`, `set-error-mode!` and
+  `set-error-handler!` answer what the JVM answers.** All four handed back the
+  agent, which threads but is not the value: `Agent.setErrorMode` and
+  `setErrorHandler` are void, so the two setters are `nil`, and
+  `Agent.restart` answers the NEW STATE, so `(restart-agent a 5)` is `5` and
+  `clear-agent-errors` — `restart-agent` over the current state — is that
+  state. Found while wiring the same natives to their interop methods, which
+  would otherwise have disagreed with the `clojure.core` door.
+
+- **A `java.util` mutator name is not a method until its arity matches.** An
+  immutable collection is right to refuse a mutator it really has with
+  `UnsupportedOperationException`, but jolt refused every name it merely
+  *spelled*, at any arity. `java.util.List/set` is `set(int,E)`, so a
+  one-argument `(.set [1 2] 9)` matches nothing on the JVM and is its
+  `IllegalArgumentException` `No matching method set found taking 1 args for
+  class clojure.lang.PersistentVector` — refusing it instead both named a
+  method the class does not have and put the call out of reach of the
+  `(catch IllegalArgumentException …)` a caller writes. A no-argument `.add`
+  and a one-argument `.clear` were the same mistake. Each name now carries the
+  arities it actually has.
+
+  The interfaces also differ by receiver, and one predicate for both was
+  answering `List`'s methods on a set: `(.getFirst #{1 2})` read `1` and
+  `(.reversed #{1 2})` a reversed seq, where a `PersistentHashSet` is a
+  `java.util.Set` — not a `SequencedCollection` — and the JVM has neither. A
+  vector, list or seq keeps the positional overloads (`add/2`, `addAll/2`,
+  `set/2`), the four ends (`.addFirst`, `.addLast`, `.removeFirst`,
+  `.removeLast`) and `List`'s bulk ops (`.replaceAll`, `.sort`); a set, sorted
+  or not, has `Collection`'s surface and nothing more. A **sorted** set is an
+  htable rather than a set record inside jolt, so it was reaching none of this
+  and every `Collection` mutator on one fell through to a miss instead of being
+  refused; it now answers exactly as a hash set does.
+
+  And on an *empty* collection three of them never reach a mutation to refuse,
+  because they are default methods that walk the elements first:
+  `.removeFirst` / `.removeLast` raise `NoSuchElementException` (the check
+  `.getFirst` / `.getLast` already made), `.removeIf` answers `false`, and
+  `.sort` / `.replaceAll` are void and do nothing. 280 name × arity × receiver
+  cells checked against reference Clojure, 18 corpus rows.
+
+  Two of those cells jolt deliberately does not match: `LazySeq.reify()`
+  returns a *mutable* `new ArrayList(this)` where `ASeq.reify()` wraps it in
+  `Collections.unmodifiableList`, so `List`'s default `sort` and `replaceAll`
+  silently mutate a throwaway copy and succeed on a lazy seq while refusing on
+  every other seq. jolt refuses on all of them, recorded as
+  `:upstream-quirk` in `known-divergences.edn`.
+
 - **`format` speaks the rest of `java.util.Formatter`.** `%.3s` truncates a
   string where the precision used to be ignored (`(format "%.3s" "abcdef")` was
   `"abcdef"`), `%#x` / `%#X` / `%#o` prefix the radix (`0x`, `0X`, `0`) with the
