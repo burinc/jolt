@@ -9,13 +9,16 @@
 # Without the second rule a case that went green could go red again unnoticed.
 #
 # JOLT_LOADERCONF_WRITE_BASELINE=1 regenerates the baseline from the current run.
+# JOLT_BIN runs the suite through another jolt — a built binary rather than the
+# source tree — since the loader has to work in both.
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
+jolt="${JOLT_BIN:-bin/jolt}"
 suite=test/chez/loaderconf-test.clj
 baseline=test/chez/loaderconf-known-failures.txt
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 
-bin/jolt run "$suite" > "$tmp/out" 2>&1
+"$jolt" run "$suite" > "$tmp/out" 2>&1
 status=$?
 if [ "$status" -ne 0 ]; then
   echo "FAIL: the loader conformance suite exited $status"
