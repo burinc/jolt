@@ -117,6 +117,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state. Found while wiring the same natives to their interop methods, which
   would otherwise have disagreed with the `clojure.core` door.
 
+- **A `java.util` mutator name is not a method until its arity matches.** An
+  immutable collection is right to refuse a mutator it really has with
+  `UnsupportedOperationException`, but jolt refused every name it merely
+  *spelled*, at any arity. `java.util.List/set` is `set(int,E)`, so a
+  one-argument `(.set [1 2] 9)` matches nothing on the JVM and is its
+  `IllegalArgumentException` `No matching method set found taking 1 args for
+  class clojure.lang.PersistentVector` — refusing it instead both named a
+  method the class does not have and put the call out of reach of the
+  `(catch IllegalArgumentException …)` a caller writes. A no-argument `.add`
+  and a one-argument `.clear` were the same mistake. Each name now carries the
+  arities it actually has.
+
+  The interfaces also differ by receiver, and one predicate for both was
+  answering `List`'s methods on a set: `(.getFirst #{1 2})` read `1` and
+  `(.reversed #{1 2})` a reversed seq, where a `PersistentHashSet` is a
+  `java.util.Set` — not a `SequencedCollection` — and the JVM has neither. A
+  vector, list or seq keeps the positional overloads (`add/2`, `addAll/2`,
+  `set/2`), the four ends (`.addFirst`, `.addLast`, `.removeFirst`,
+  `.removeLast`) and `List`'s bulk ops (`.replaceAll`, `.sort`); a set, sorted
+  or not, has `Collection`'s surface and nothing more. A **sorted** set is an
+  htable rather than a set record inside jolt, so it was reaching none of this
+  and every `Collection` mutator on one fell through to a miss instead of being
+  refused; it now answers exactly as a hash set does.
+
+  And on an *empty* collection three of them never reach a mutation to refuse,
+  because they are default methods that walk the elements first:
+  `.removeFirst` / `.removeLast` raise `NoSuchElementException` (the check
+  `.getFirst` / `.getLast` already made), `.removeIf` answers `false`, and
+  `.sort` / `.replaceAll` are void and do nothing. 280 name × arity × receiver
+  cells checked against reference Clojure, 18 corpus rows.
+
+  Two of those cells jolt deliberately does not match: `LazySeq.reify()`
+  returns a *mutable* `new ArrayList(this)` where `ASeq.reify()` wraps it in
+  `Collections.unmodifiableList`, so `List`'s default `sort` and `replaceAll`
+  silently mutate a throwaway copy and succeed on a lazy seq while refusing on
+  every other seq. jolt refuses on all of them, recorded as
+  `:upstream-quirk` in `known-divergences.edn`.
+
 - **`format` speaks the rest of `java.util.Formatter`.** `%.3s` truncates a
   string where the precision used to be ignored (`(format "%.3s" "abcdef")` was
   `"abcdef"`), `%#x` / `%#X` / `%#o` prefix the radix (`0x`, `0X`, `0`) with the
