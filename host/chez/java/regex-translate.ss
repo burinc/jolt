@@ -153,19 +153,32 @@
          ((and (not in?) start) (loop (+ cp 1) #f (close-at cp ranges)))
          (else (loop (+ cp 1) start ranges))))))))
 
-(define sre-unicode-L (delay (unicode-category-ranges '(Lu Ll Lt Lm Lo))))
-(define sre-unicode-N (delay (unicode-category-ranges '(Nd Nl No))))
+;; The JVM's rule, which these follow: a Unicode CATEGORY name (\p{L}, \p{Lu},
+;; \p{N}, \p{Nd}, \p{P} ...) is the real category over every codepoint, while a
+;; POSIX name (\p{Alpha}, \p{Digit}, \p{Upper}, \p{Punct} ...) is ASCII unless
+;; UNICODE_CHARACTER_CLASS is on -- so \p{Alpha} matches "a" and not "é", and
+;; \p{Nd} matches an Arabic-Indic digit but not a Roman numeral (that is \p{N}).
+;; javaLowerCase/javaUpperCase are Character.isLowerCase/isUpperCase, which
+;; Ll/Lu approximate far better than ASCII did.
+(define sre-unicode-L  (delay (unicode-category-ranges '(Lu Ll Lt Lm Lo))))
+(define sre-unicode-Lu (delay (unicode-category-ranges '(Lu))))
+(define sre-unicode-Ll (delay (unicode-category-ranges '(Ll))))
+(define sre-unicode-N  (delay (unicode-category-ranges '(Nd Nl No))))
+(define sre-unicode-Nd (delay (unicode-category-ranges '(Nd))))
+(define sre-unicode-P  (delay (unicode-category-ranges '(Pc Pd Ps Pe Pi Pf Po))))
+(define sre-unicode-Ps (delay (unicode-category-ranges '(Ps))))
+(define sre-unicode-Pe (delay (unicode-category-ranges '(Pe))))
 
 (define (prop-class-sre name)
   (cond
-   ((or (string=? name "L") (string=? name "Alpha"))
-    (force sre-unicode-L))
-   ((string=? name "Lu")
-    '(or upper (/ #\xC0 #\xD6) (/ #\xD8 #\xDE)))
-   ((string=? name "Ll")
-    '(or lower (/ #\xDF #\xF6) (/ #\xF8 #\xFF)))
-   ((or (string=? name "N") (string=? name "Nd") (string=? name "Digit"))
-    (force sre-unicode-N))
+   ((string=? name "L") (force sre-unicode-L))
+   ((string=? name "Lu") (force sre-unicode-Lu))
+   ((string=? name "Ll") (force sre-unicode-Ll))
+   ((string=? name "N") (force sre-unicode-N))
+   ((string=? name "Nd") (force sre-unicode-Nd))
+   ;; POSIX names: ASCII, as on the JVM
+   ((string=? name "Alpha") 'alpha)
+   ((string=? name "Digit") 'numeric)
    ;; The Unicode separator categories are a short fixed list, so spell them out
    ;; rather than settling for irregex's ASCII `blank`. Zs is the space separators
    ;; (the non-breaking ones included — \p{Z} is a category, not Java's
@@ -174,10 +187,10 @@
    ((string=? name "Zl") #\x2028)
    ((string=? name "Zp") #\x2029)
    ((string=? name "Z") sre-Z)
-   ((string=? name "P") 'punct)
-    ((string=? name "Ps") '(or #\( #\[ #\{))
-    ((string=? name "Pe") '(or #\) #\] #\}))
-    ((string=? name "Lower") 'lower)
+   ((string=? name "P") (force sre-unicode-P))
+   ((string=? name "Ps") (force sre-unicode-Ps))
+   ((string=? name "Pe") (force sre-unicode-Pe))
+   ((string=? name "Lower") 'lower)
    ((string=? name "Upper") 'upper)
    ((string=? name "ASCII") 'ascii)
    ((string=? name "Alnum") 'alphanumeric)
@@ -188,8 +201,8 @@
    ((string=? name "Cntrl") 'cntrl)
    ((string=? name "XDigit") 'xdigit)
    ((string=? name "Space") 'whitespace)
-   ((string=? name "javaLowerCase") 'lower)
-   ((string=? name "javaUpperCase") 'upper)
+   ((string=? name "javaLowerCase") (force sre-unicode-Ll))
+   ((string=? name "javaUpperCase") (force sre-unicode-Lu))
    ((string=? name "javaWhitespace") 'whitespace)
    (else #f)))
 

@@ -85,6 +85,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`\p{…}` classes follow the JVM's rule, and a zero-width split resumes
+  after its match.** `\p{L}` approximated with nearly the whole BMP above
+  ASCII, so it matched every symbol and punctuation character there too —
+  `(clojure.string/replace "a → b" #"[^\p{L}\p{N}\s_-]" "")` kept the arrow
+  (#941). The Unicode CATEGORY names (`\p{L}`, `\p{Lu}`, `\p{Ll}`, `\p{N}`,
+  `\p{Nd}`, `\p{P}`, `\p{Ps}`, `\p{Pe}`, `javaUpperCase`/`javaLowerCase`) are
+  the real categories now, built once and lazily from Chez's own
+  `char-general-category`; the POSIX names (`\p{Alpha}`, `\p{Digit}`,
+  `\p{Upper}`, `\p{Punct}` …) stay ASCII, as on the JVM — `\p{Lu}` used to
+  stop at Latin-1, and `\p{Digit}`/`\p{Nd}` were one class. And
+  `clojure.string/split` on a zero-width lookahead resumed one past where it
+  had started LOOKING rather than after the match it found, re-finding the
+  same match and emitting an empty segment: `(split "aXbXXcXd" #"(?=X)")` gave
+  8 parts for the JVM's 5 (#940).
+
 - **A method call in interpreted code resolves through `Reflector/getMethods`.**
   SCI resolves a host method call by asking `clojure.lang.Reflector/getMethods`
   for the members matching (name, arity, static?) and invoking the one it
