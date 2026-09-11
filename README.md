@@ -458,15 +458,17 @@ The key is read from the app's `deps.edn` and from every library's, and
 unioned, so a library ships its list once for every app that uses it. The bail
 message ends with the exact line to paste for the sites that remain; paste
 what it prints, because the def to name is the one the lookup ended up in
-after inlining, which may be the caller of the fn that wrote it. An allowed
-def is skipped by the compiler-image check too: a lookup vouched never to run
-needs no compiler.
+after inlining, which may be the caller of the fn that wrote it. A vouch
+covers a RESOLUTION the graph cannot follow — `resolve`, `ns-publics`,
+`requiring-resolve` — and only that: a def that runs the compiler (`eval`,
+`load-string`, an image restore, a `require` of a computed name) bails
+whatever the list says, because the compiler image is direct-linked against
+the whole of `clojure.core` and cannot run over a pruned one.
 
 Vouching wrongly does not fail the build — it moves the failure into the
-binary, where the lookup sees only what the shake kept. A `resolve` of a def
-the shake dropped answers `nil` where the unshaken binary answers the var, and
-that one is silent; an `eval` raises, because the compiler image it needed was
-dropped on the same vouch. Name a site only when you can say why it is dead.
+binary, where the lookup sees only what the shake kept: a `resolve` of a def
+the shake dropped answers `nil` where the unshaken binary answers the var,
+silently. Name a site only when you can say why it is dead.
 
 `--boot` trades the other way. The boot image ships as a prebuilt heap image
 (*vfasl*), which starts faster and takes more room — `--boot small` keeps the
