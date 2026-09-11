@@ -239,6 +239,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A built binary no longer dies before `-main` on a provider split across the
+  app's dependencies and jolt's embedded stdlib.** With `io.github.jolt-lang/time`
+  in `deps.edn` and an entry namespace whose top level touched a class the
+  embedded stdlib already serves (`java.time.LocalDateTime/now`), `jolt build`
+  succeeded and the binary raised `Attempting to call unbound fn:
+  #'jolt.time.impl/register-type!` at startup (#944). The build loads the entry
+  namespace from source and records the loader's order, then pulls in every
+  namespace the class scan finds a `:jolt/provides` provider for — the formatter
+  half of jolt.time, from the git dependency — and those were emitted in the
+  static require graph's order, in FRONT of everything the loader had run. The
+  formatter half calls `jolt.time.impl/register-type!` at its top level, and
+  `jolt.time.impl` had been loaded in step one, so the caller was emitted before
+  its callee. Whether a binary worked flipped with unrelated changes to the
+  require graph: a reference to a gitlib-only class (`DateTimeFormatter`) or an
+  explicit `(:require [jolt.time])` happened to load the provider in-process
+  first and hid it. The class-scan and data-reader namespaces now load under
+  the same hook, so the emit order is the loader's order for every namespace in
+  the binary, whichever root a provider's halves came from. A build-smoke
+  fixture builds a `:local/root` provider of the same shape, so the case is
+  gated offline.
+
 - **The first match on a large alternation no longer takes seconds (or never
   finishes).** A 50-branch union with two unbounded `.*` branches — a retry
   classifier's 873-character pattern — stalled ~5s on its first `re-find` on
@@ -455,18 +476,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The spawn now closes everything above the stdio fds in the child:
   `posix_spawn_file_actions_addclosefrom_np` where that entry resolves (glibc
-  2.34+ lowers it to one `close_range(2)`), and elsewhere — macOS, and every
-  older glibc, which is most of the range the released Linux binary targets —
-  by enumerating this process's own open descriptors (`/proc/self/fd`,
-  `/dev/fd`) and adding one close action each, every one of them confirmed open
-  with `fcntl` first, since a file action that fails leaves the child exiting
-  127 instead of exec'ing. The `closefrom` form has no window at all, because
-  the set it closes is decided in the child; the enumerated form takes its
-  snapshot in the parent, so a descriptor another thread opens between the
-  listing and the spawn is still inherited. An INHERIT redirect is untouched —
-  fds 0, 1 and 2 are below the cut and still carry the parent's own
-  descriptors, tty answers and all. `JOLT_NO_SPAWN_CLOSEFROM=1` forces the
-  fallback, so one machine's gate can exercise both paths.
+  2.34+ lowers it to one `close_range(2)`), `POSIX_SPAWN_CLOEXEC_DEFAULT` on
+  macOS — the kernel starts the child with everything closed except what a
+  file action names, and an inherited stdio stream is named with
+  `addinherit_np` — and elsewhere, every older glibc, which is most of the
+  range the released Linux binary targets, by enumerating this process's own
+  open descriptors (`/proc/self/fd`) and adding one close action each, every
+  one of them confirmed open with `fcntl` first, since a file action that fails
+  leaves the child exiting 127 instead of exec'ing. The first two forms have no
+  window at all, because the set they close is decided in the child; the
+  enumerated form takes its snapshot in the parent, so a descriptor another
+  thread opens between the listing and the spawn is still inherited, and one
+  another thread CLOSES in that window leaves a close action on a dead fd —
+  glibc skips it, the Darwin kernel fails the whole spawn with `EBADF`, which
+  is why macOS does not take that tier. An INHERIT redirect is untouched — fds
+  0, 1 and 2 are below the cut and still carry the parent's own descriptors,
+  tty answers and all. `JOLT_NO_SPAWN_CLOSEFROM=1` forces the enumeration
+  fallback, so one machine's gate can exercise every path.
 
 - **A task that shares a built-in command's name now says so, instead of
   letting the command answer as if the task were not there.** babashka's

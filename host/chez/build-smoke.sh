@@ -988,6 +988,50 @@ if [ "$got_ord" != "ord: 42" ]; then
   echo "  FAIL: install-owned dep emitted after its caller — want 'ord: 42', got \`$got_ord\`"; exit 1
 fi
 
+# A provider the CLASS scan pulls in — never reached by the entry's own requires —
+# whose install namespace calls, at load time, into a namespace the entry DID
+# load. jolt.time is that shape once a project depends on the git library: the
+# formatter half arrives from the dep root and registers its types with
+# jolt.time.impl, which the embedded stdlib half already served when the entry's
+# def touched LocalDateTime. Ordering the never-loaded set by the static graph
+# alone put the caller first, and the binary died before -main with "Attempting
+# to call unbound fn: #'jolt.time.impl/register-type!" (#944). Offline stand-in:
+# a :local/root provider declaring com.example.Split, split the same way — the
+# entry requires impl, only -main names the class, so only the scan sees install.
+echo "build smoke: class-scan provider ordered after the dependency the entry loaded"
+psp_app="$(mktemp -d)/psp-app"
+mkdir -p "$psp_app/src/psp" "$psp_app/lib/src/provsplit"
+cat > "$psp_app/deps.edn" <<'PSP_EOF'
+{:paths ["src"] :deps {local/provsplit {:local/root "lib"}}}
+PSP_EOF
+cat > "$psp_app/lib/deps.edn" <<'PSP_EOF'
+{:paths ["src"] :jolt/provides {provsplit.install ["com.example.Split"]}}
+PSP_EOF
+cat > "$psp_app/lib/src/provsplit/impl.clj" <<'PSP_EOF'
+(ns provsplit.impl)
+(def registry (atom {}))
+(defn register! [k v] (swap! registry assoc k v) nil)
+PSP_EOF
+cat > "$psp_app/lib/src/provsplit/install.clj" <<'PSP_EOF'
+(ns provsplit.install (:require [provsplit.impl :as impl]))
+(impl/register! :split 42)
+(__register-class-statics! "com.example.Split"
+                           {"answer" (fn [] (get @impl/registry :split))})
+PSP_EOF
+cat > "$psp_app/src/psp/core.clj" <<'PSP_EOF'
+(ns psp.core (:require [provsplit.impl :as impl]))
+(defn -main [& _] (println "split:" (com.example.Split/answer)))
+PSP_EOF
+psp_out="$(dirname "$out")/psp-bin"
+if ! JOLT_PWD="$psp_app" "$jolt" build -m psp.core -o "$psp_out" >"$psp_out.log" 2>&1; then
+  echo "  FAIL: split-provider app build exited non-zero"; tail -5 "$psp_out.log"; exit 1
+fi
+got_psp="$(cd / && "$psp_out" 2>&1)"
+rm -rf "$(dirname "$psp_app")"
+if [ "$got_psp" != "split: 42" ]; then
+  echo "  FAIL: class-scan provider emitted before the dependency the entry loaded — want 'split: 42', got \`$got_psp\`"; exit 1
+fi
+
 # A live VALUE a macro put in its expansion has to reach the BINARY. jolt rebuilds
 # one as code rather than stashing it in a process-local table (jolt-l7tq), and
 # only a built binary proves that: a table would satisfy every in-process check
@@ -1342,4 +1386,4 @@ verdict_case varargs verdict.varargs "VERDICT-VARARGS ok" keep
 verdict_case sproc   verdict.sproc   "VERDICT-SPROC 42"   drop
 verdict_case seval   verdict.seval   "VERDICT-SEVAL 42"   keep
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes + compiler-verdict)"
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes + compiler-verdict)"
