@@ -133,17 +133,52 @@
 (define sre-Z
   '(or #\space #\xA0 #\x1680 (/ #\x2000 #\x200A) #\x2028 #\x2029 #\x202F #\x205F #\x3000))
 
+;; \p{L}/\p{N} used to approximate with a hand-picked range ((/ #\x80
+;; #\xD7FF) for L), which is nearly the whole BMP above ASCII and so
+;; wrongly matched symbols/punctuation too, e.g. U+2192 → (#941). Build
+;; the real Unicode General Category ranges from Chez's own
+;; char-general-category instead. ~10ms over the full codepoint space,
+;; paid once and lazily, only if a pattern actually uses \p{L}/\p{N}.
+(define (unicode-category-ranges categories)
+  (let loop ((cp 0) (start #f) (ranges '()))
+    (define (close-at cp ranges)
+      (if start (cons `(/ ,(integer->char start) ,(integer->char (- cp 1))) ranges) ranges))
+    (cond
+     ((> cp #x10FFFF) (cons 'or (reverse (close-at cp ranges))))
+     ((and (>= cp #xD800) (<= cp #xDFFF)) (loop (+ cp 1) start ranges)) ; surrogates
+     (else
+      (let ((in? (memq (char-general-category (integer->char cp)) categories)))
+        (cond
+         ((and in? (not start)) (loop (+ cp 1) cp ranges))
+         ((and (not in?) start) (loop (+ cp 1) #f (close-at cp ranges)))
+         (else (loop (+ cp 1) start ranges))))))))
+
+;; The JVM's rule, which these follow: a Unicode CATEGORY name (\p{L}, \p{Lu},
+;; \p{N}, \p{Nd}, \p{P} ...) is the real category over every codepoint, while a
+;; POSIX name (\p{Alpha}, \p{Digit}, \p{Upper}, \p{Punct} ...) is ASCII unless
+;; UNICODE_CHARACTER_CLASS is on -- so \p{Alpha} matches "a" and not "é", and
+;; \p{Nd} matches an Arabic-Indic digit but not a Roman numeral (that is \p{N}).
+;; javaLowerCase/javaUpperCase are Character.isLowerCase/isUpperCase, which
+;; Ll/Lu approximate far better than ASCII did.
+(define sre-unicode-L  (delay (unicode-category-ranges '(Lu Ll Lt Lm Lo))))
+(define sre-unicode-Lu (delay (unicode-category-ranges '(Lu))))
+(define sre-unicode-Ll (delay (unicode-category-ranges '(Ll))))
+(define sre-unicode-N  (delay (unicode-category-ranges '(Nd Nl No))))
+(define sre-unicode-Nd (delay (unicode-category-ranges '(Nd))))
+(define sre-unicode-P  (delay (unicode-category-ranges '(Pc Pd Ps Pe Pi Pf Po))))
+(define sre-unicode-Ps (delay (unicode-category-ranges '(Ps))))
+(define sre-unicode-Pe (delay (unicode-category-ranges '(Pe))))
+
 (define (prop-class-sre name)
   (cond
-   ;; Letters — BMP + supplementary
-   ((or (string=? name "L") (string=? name "Alpha"))
-    '(or alpha (/ #\x80 #\xD7FF) (/ #\x10000 #\x10FFFF)))
-   ((string=? name "Lu")
-    '(or upper (/ #\xC0 #\xD6) (/ #\xD8 #\xDE)))
-   ((string=? name "Ll")
-    '(or lower (/ #\xDF #\xF6) (/ #\xF8 #\xFF)))
-   ((or (string=? name "N") (string=? name "Nd") (string=? name "Digit"))
-    'numeric)
+   ((string=? name "L") (force sre-unicode-L))
+   ((string=? name "Lu") (force sre-unicode-Lu))
+   ((string=? name "Ll") (force sre-unicode-Ll))
+   ((string=? name "N") (force sre-unicode-N))
+   ((string=? name "Nd") (force sre-unicode-Nd))
+   ;; POSIX names: ASCII, as on the JVM
+   ((string=? name "Alpha") 'alpha)
+   ((string=? name "Digit") 'numeric)
    ;; The Unicode separator categories are a short fixed list, so spell them out
    ;; rather than settling for irregex's ASCII `blank`. Zs is the space separators
    ;; (the non-breaking ones included — \p{Z} is a category, not Java's
@@ -152,10 +187,10 @@
    ((string=? name "Zl") #\x2028)
    ((string=? name "Zp") #\x2029)
    ((string=? name "Z") sre-Z)
-   ((string=? name "P") 'punct)
-    ((string=? name "Ps") '(or #\( #\[ #\{))
-    ((string=? name "Pe") '(or #\) #\] #\}))
-    ((string=? name "Lower") 'lower)
+   ((string=? name "P") (force sre-unicode-P))
+   ((string=? name "Ps") (force sre-unicode-Ps))
+   ((string=? name "Pe") (force sre-unicode-Pe))
+   ((string=? name "Lower") 'lower)
    ((string=? name "Upper") 'upper)
    ((string=? name "ASCII") 'ascii)
    ((string=? name "Alnum") 'alphanumeric)
@@ -166,8 +201,8 @@
    ((string=? name "Cntrl") 'cntrl)
    ((string=? name "XDigit") 'xdigit)
    ((string=? name "Space") 'whitespace)
-   ((string=? name "javaLowerCase") 'lower)
-   ((string=? name "javaUpperCase") 'upper)
+   ((string=? name "javaLowerCase") (force sre-unicode-Ll))
+   ((string=? name "javaUpperCase") (force sre-unicode-Lu))
    ((string=? name "javaWhitespace") 'whitespace)
    (else #f)))
 
