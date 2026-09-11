@@ -1576,21 +1576,25 @@
 (defcfn c-strerror "strerror" [:int] :string)
 
 (def ^:private errno-loc
+  ;; What is cached is the ACCESSOR, never its result. Each call answers the
+  ;; calling thread's slot, and a pointer taken once would read the first
+  ;; caller's errno from every thread after it (the thread row in
+  ;; test/chez/jolt-ffi-errno-test.clj is what catches that).
   (delay
     (case (System/getProperty "os.name")
-      "Mac OS X" (c-error-location)
-      "Windows"  (c-errno-msvc)
-      (try (c-errno-location)
+      "Mac OS X" c-error-location
+      "Windows"  c-errno-msvc
+      (try (c-errno-location) c-errno-location
            (catch Throwable _
              ;; no entry on bionic (Android/Termux)
-             (c-errno-bionic))))))
+             c-errno-bionic)))))
 
 (defn errno
   "The calling thread's errno, read through the platform's thread-local
   accessor. Read it immediately after the failing foreign call — any
   intervening call into the runtime can overwrite the slot."
   []
-  (jolt.ffi/__read @errno-loc :int 0))
+  (jolt.ffi/__read ((force errno-loc)) :int 0))
 
 (defn errno-message
   "strerror's description of errno code e; with no argument, of the current
