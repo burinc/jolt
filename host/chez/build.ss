@@ -2041,7 +2041,7 @@
 ;; with different bundled kernels share this directory. Identical source text
 ;; under a newer kernel must miss.
 (define (bld-runtime-cache-path body)
-  (let ((keyed (string-append (scheme-version) " " (symbol->string (sa-host-tag)) "\n"
+  (let ((keyed (string-append (scheme-version) " " (sa-host-tag) "\n"
                               (bld-params-bindings bld-runtime-chez-params "\n") body)))
     (string-append (bld-runtime-cache-dir) "/runtime-"
                    (number->string (string-length body) 16) "-"
