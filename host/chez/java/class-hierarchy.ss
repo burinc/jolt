@@ -785,6 +785,15 @@
 (jch-register-supers! "java.net.URI" '())
 (jch-register-supers! "java.util.ArrayList" '("java.util.List" "java.util.RandomAccess"))
 (jch-register-supers! "java.util.Queue" '("java.util.Collection"))
+;; the two blocking queues concurrency.ss models: without a row here they were
+;; no BlockingQueue, Queue or Collection to instance?, so a (satisfies-ish) check
+;; a port makes before .put/.take refused the real thing
+(jch-register-supers! "java.util.concurrent.BlockingQueue" '("java.util.Queue"))
+(jch-register-supers! "java.util.AbstractQueue" '("java.util.AbstractCollection" "java.util.Queue"))
+(jch-register-supers! "java.util.concurrent.ArrayBlockingQueue"
+  '("java.util.AbstractQueue" "java.util.concurrent.BlockingQueue" "java.io.Serializable"))
+(jch-register-supers! "java.util.concurrent.LinkedBlockingQueue"
+  '("java.util.AbstractQueue" "java.util.concurrent.BlockingQueue" "java.io.Serializable"))
 (jch-register-supers! "java.util.Deque" '("java.util.Queue" "java.util.SequencedCollection"))
 (jch-register-supers! "java.util.LinkedList" '("java.util.List" "java.util.Deque"))
 (jch-register-supers! "java.util.ArrayDeque" '("java.util.Deque"))

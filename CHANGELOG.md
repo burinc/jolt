@@ -276,6 +276,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   info, scheme-specific part — leave escapes there alone, where path, query and
   fragment decode them.
 
+- **`java.net.URI` resolves, normalizes and relativizes.** `resolve` (against
+  a `URI` or a string), `normalize`, `relativize`, `isOpaque` and `compareTo`
+  were missing — `(.resolve base "c%20d")` was "No matching method resolve",
+  and every HTTP client's redirect-following goes through it. They follow RFC
+  2396 §5.2 the way `java.net.URI` does: a lone fragment is the base with that
+  fragment, a child with an authority replaces everything but the scheme, a
+  relative path merges onto the base path's directory and normalizes — where
+  "." goes, ".." takes the segment before it unless that is a ".." or there is
+  none, and a kept segment keeps the slash that followed it, so
+  `/a/b/..` is `/a/` and `/a/b/../../..` is `/..` — and a base with an
+  authority and no path merges as `/` (RFC 3986's rule, the JDK's since 20:
+  `"a"` against `https://h.com` is `https://h.com/a`). Every URI jolt hands
+  back is still built from raw components and run through the one parser. A
+  URI is `Comparable`, so `compare` and `sort` order them by string form.
+
+- **The blocking queues have their `Collection` half.** `add` (offer, or
+  `IllegalStateException: Queue full`), `contains`, `iterator`, `toArray`,
+  `seq` and `count` over a snapshot taken under the queue's mutex, and a
+  hierarchy row, so `(instance? java.util.concurrent.BlockingQueue q)` is true
+  where it was false and `(seq q)` seqs where it threw.
+
 - **A blocking queue refuses a capacity below 1.** `(ArrayBlockingQueue. 0)` and
   `(LinkedBlockingQueue. 0)` built a queue whose `put` then blocked forever and
   whose `offer` always answered `false` — a hang with nothing pointing at the

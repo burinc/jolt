@@ -2264,6 +2264,12 @@
     (when (and (null? (car q)) (pair? (cdr q)))
       (set-car! q (reverse (cdr q)))
       (set-cdr! q '()))))
+;; the elements head-first, copied out under the mutex
+(define (abq-snapshot self)
+  (let ((st (jhost-state self)))
+    (jolt-with-mutex (vector-ref st 1)
+      (abq-norm! st)
+      (let ((q (vector-ref st 3))) (append (car q) (reverse (cdr q)))))))
 (define (abq-deq! st)
   (abq-norm! st)
   (let* ((q (vector-ref st 3)) (out (car q)) (v (car out)))
@@ -2348,12 +2354,30 @@
                 (vector-set! st 4 0)
                 (jolt-cv-wake! (vector-ref st 2)))))
           jolt-nil))
+        ;; Collection's half: add is offer-or-throw (Queue.add on a full bounded
+        ;; queue is IllegalStateException "Queue full"), and the read-only walks
+        ;; take a SNAPSHOT under the mutex — the JVM's iterators are weakly
+        ;; consistent too, so a walk never sees a half-moved element.
+        (cons "add" (lambda (self v)
+          (let ((st (jhost-state self)))
+            (jolt-with-mutex (vector-ref st 1)
+              (if (fx<? (vector-ref st 4) (vector-ref st 0))
+                  (begin (abq-enq! st v) #t)
+                  (throw-jvm (quote IllegalStateException) "Queue full"))))))
+        (cons "contains" (lambda (self v)
+          (and (memp (lambda (a) (jolt=2 a v)) (abq-snapshot self)) #t)))
+        (cons "iterator" (lambda (self) (make-jiterator (list->cseq (abq-snapshot self)))))
+        (cons "toArray" (lambda (self . _) (na-to-array (list->cseq (abq-snapshot self)))))
         ;; the tag, not a literal: "lbq" shares this table and must not print as
         ;; an ArrayBlockingQueue.
         (cons "toString" (lambda (self)
           (string-append (if (string=? (jhost-tag self) "lbq") "LinkedBlockingQueue" "ArrayBlockingQueue")
                          "(" (number->string (vector-ref (jhost-state self) 4)) ")")))))
 (alias-host-methods! "lbq" "abq")
+;; (seq q), (vec q) over a queue: the same snapshot, head first; (count q) is
+;; the size, without one.
+(register-seq-arm! abq? (lambda (q) (list->cseq (abq-snapshot q))))
+(register-count-arm! abq? (lambda (q) (vector-ref (jhost-state q) 4)))
 
 ;; FutureTask — a run-once task with a blocking get. State:
 ;; #(status override-flag override value error mutex cond thunk); status is one
