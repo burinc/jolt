@@ -2514,6 +2514,89 @@
   {:suite "numbers / parse fns (1.11)" :label "parse-long empty nil" :expected "nil" :actual "(parse-long \"\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-long junk nil" :expected "nil" :actual "(parse-long \"12ab\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-long throws" :expected :throws :actual "(parse-long 42)" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long max long" :expected "9223372036854775807" :actual "(parse-long \"9223372036854775807\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long min long" :expected "-9223372036854775808" :actual "(parse-long \"-9223372036854775808\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long over max nil" :expected "nil" :actual "(parse-long \"9223372036854775808\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long under min nil" :expected "nil" :actual "(parse-long \"-9223372036854775809\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long +over max nil" :expected "nil" :actual "(parse-long \"+9223372036854775808\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long far over nil" :expected "nil" :actual "(parse-long \"99999999999999999999999999\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long zero-padded max" :expected "9223372036854775807" :actual "(parse-long \"0009223372036854775807\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long zero-padded over nil" :expected "nil" :actual "(parse-long \"018446744073709551616\")" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long overflow is not some?" :expected "false" :actual "(some? (parse-long \"9223372036854775808\"))" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long overflow has no class" :expected "nil" :actual "(class (parse-long \"9223372036854775808\"))" :portability :common}
+  {:suite "numbers / parse fns (1.11)" :label "parse-long in range is a Long" :expected "java.lang.Long" :actual "(class (parse-long \"9223372036854775807\"))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong rejects an exponent" :expected "nil" :actual "(try (Long/parseLong \"1e3\") (catch NumberFormatException _ nil))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong rejects a decimal point" :expected "nil" :actual "(try (Long/parseLong \"5.0\") (catch NumberFormatException _ nil))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong rejects a #x radix prefix" :expected "nil" :actual "(try (Long/parseLong \"#xff\") (catch NumberFormatException _ nil))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseInt rejects a #o radix prefix" :expected "nil" :actual "(try (Integer/parseInt \"#o17\") (catch NumberFormatException _ nil))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong rejects leading space" :expected "nil" :actual "(try (Long/parseLong \" 5\") (catch NumberFormatException _ nil))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong rejects trailing space" :expected "nil" :actual "(try (Long/parseLong \"5 \") (catch NumberFormatException _ nil))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong takes a leading plus" :expected "5" :actual "(Long/parseLong \"+5\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong max long" :expected "9223372036854775807" :actual "(Long/parseLong \"9223372036854775807\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong past max throws" :expected :throws :actual "(Long/parseLong \"9223372036854775808\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "Long/valueOf past max throws" :expected :throws :actual "(Long/valueOf \"9223372036854775808\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseInt max int" :expected "2147483647" :actual "(Integer/parseInt \"2147483647\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseInt past max throws" :expected :throws :actual "(Integer/parseInt \"2147483648\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "Integer/valueOf past max throws" :expected :throws :actual "(Integer/valueOf \"2147483648\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseShort max short" :expected "32767" :actual "(Short/parseShort \"32767\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseShort past max throws" :expected :throws :actual "(Short/parseShort \"32768\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseByte min byte" :expected "-128" :actual "(Byte/parseByte \"-128\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseByte past min throws" :expected :throws :actual "(Byte/parseByte \"-129\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "Byte/valueOf past max throws" :expected :throws :actual "(Byte/valueOf \"128\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "(Long. s) past max throws" :expected :throws :actual "(Long. \"9223372036854775808\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "(Integer. s) past max throws" :expected :throws :actual "(Integer. \"2147483648\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong radix 16" :expected "255" :actual "(Long/parseLong \"ff\" 16)" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong radix 36 is case-blind" :expected "1295" :actual "(Long/parseLong \"ZZ\" 36)" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong radix 16 past max throws" :expected :throws :actual "(Long/parseLong \"8000000000000000\" 16)" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseInt radix 16 past max throws" :expected :throws :actual "(Integer/parseInt \"80000000\" 16)" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong radix below MIN_RADIX throws" :expected :throws :actual "(Long/parseLong \"5\" 1)" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "parseLong radix above MAX_RADIX throws" :expected :throws :actual "(Long/parseLong \"5\" 37)" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "long range message is the input-string one" :expected "\"For input string: \\\"9223372036854775808\\\"\"" :actual "(try (Long/parseLong \"9223372036854775808\") (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "short range message names the value" :expected "\"Value out of range. Value:\\\"32768\\\" Radix:10\"" :actual "(try (Short/parseShort \"32768\") (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "byte range message names the value" :expected "\"Value out of range. Value:\\\"128\\\" Radix:10\"" :actual "(try (Byte/parseByte \"128\") (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "a non-ten radix is named in the message" :expected "\"For input string: \\\"zz\\\" under radix 16\"" :actual "(try (Long/parseLong \"zz\" 16) (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "radix 1 is named as below MIN_RADIX" :expected "\"radix 1 less than Character.MIN_RADIX\"" :actual "(try (Long/parseLong \"5\" 1) (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode hex 0x" :expected "31" :actual "(Integer/decode \"0x1f\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode hex 0X" :expected "31" :actual "(Integer/decode \"0X1F\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode hex #" :expected "31" :actual "(Integer/decode \"#1f\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode octal" :expected "15" :actual "(Integer/decode \"017\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode decimal" :expected "10" :actual "(Integer/decode \"10\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode zero" :expected "0" :actual "(Integer/decode \"0\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode signs the prefixed value" :expected "-31" :actual "(Integer/decode \"-0x1f\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode takes a leading plus" :expected "31" :actual "(Integer/decode \"+0x1f\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "Long/decode max long" :expected "9223372036854775807" :actual "(Long/decode \"0x7fffffffffffffff\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "Long/decode past max throws" :expected :throws :actual "(Long/decode \"0x8000000000000000\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "Short/decode max short" :expected "32767" :actual "(Short/decode \"#7fff\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "Byte/decode past max throws" :expected :throws :actual "(Byte/decode \"0x80\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode rejects a bad octal digit" :expected :throws :actual "(Integer/decode \"08\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode rejects leading space" :expected :throws :actual "(Integer/decode \" 5\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode names the post-prefix digits and radix" :expected "\"For input string: \\\"8\\\" under radix 8\"" :actual "(try (Integer/decode \"08\") (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "decode of the empty string says so" :expected "\"Zero length string\"" :actual "(try (Integer/decode \"\") (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "narrow decode range message quotes the input" :expected "\"Value 128 out of range from input 0x80\"" :actual "(try (Byte/decode \"0x80\") (catch NumberFormatException e (.getMessage e)))" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "bigint is not width-checked" :expected "9223372036854775808N" :actual "(bigint \"9223372036854775808\")" :portability :common}
+  {:suite "interop / java.lang integer parsing" :label "BigInteger takes the same grammar" :expected :throws :actual "(java.math.BigInteger. \"1e3\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble rejects a #x radix prefix" :expected :throws :actual "(Double/parseDouble \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble rejects a ratio" :expected :throws :actual "(Double/parseDouble \"1/2\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble rejects a #b radix prefix" :expected :throws :actual "(Double/parseDouble \"#b101\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseFloat rejects a #x radix prefix" :expected :throws :actual "(Float/parseFloat \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "Double/valueOf rejects a #x radix prefix" :expected :throws :actual "(Double/valueOf \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "(Double. s) rejects a #x radix prefix" :expected :throws :actual "(Double. \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double rejects a #x radix prefix" :expected "nil" :actual "(parse-double \"#xff\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble takes a hex significand" :expected "31.0" :actual "(Double/parseDouble \"0x1fp0\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble hex with a fraction" :expected "3.0" :actual "(Double/parseDouble \"0x1.8p1\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble signs a hex significand" :expected "-31.0" :actual "(Double/parseDouble \"-0x1fp0\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double takes a hex significand" :expected "31.0" :actual "(parse-double \"0x1fp0\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double hex with a fraction" :expected "3.0" :actual "(parse-double \"0x1.8p1\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "a hex integer is not a double" :expected "nil" :actual "(parse-double \"0x1f\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double signed NaN is NaN" :expected "true" :actual "(Double/isNaN (parse-double \"-NaN\"))" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double takes +Infinity" :expected "##Inf" :actual "(parse-double \"+Infinity\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double keeps -Infinity" :expected "##-Inf" :actual "(parse-double \"-Infinity\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble trims, unlike the integers" :expected "1.5" :actual "(Double/parseDouble \" 1.5 \")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble takes a d suffix" :expected "1.5" :actual "(Double/parseDouble \"1.5d\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble takes an f suffix" :expected "1.5" :actual "(Double/parseDouble \"1.5f\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parse-double takes an exponent and a suffix" :expected "150.0" :actual "(parse-double \"1.5e2d\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "parseDouble saturates rather than failing" :expected "##Inf" :actual "(Double/parseDouble \"1e400\")" :portability :common}
+  {:suite "interop / java.lang double parsing" :label "lowercase infinity is not a double" :expected "nil" :actual "(parse-double \"infinity\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-double" :expected "1.5" :actual "(parse-double \"1.5\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-double int" :expected "4.0" :actual "(parse-double \"4\")" :portability :common}
   {:suite "numbers / parse fns (1.11)" :label "parse-double sci" :expected "1500.0" :actual "(parse-double \"1.5e3\")" :portability :common}

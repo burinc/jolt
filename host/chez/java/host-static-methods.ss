@@ -469,8 +469,9 @@
         (cons "bitCount" (lambda (n) (->num (bitwise-bit-count (bitwise-and (jnum->exact n) long-mask64)))))
         (cons "numberOfLeadingZeros" (lambda (n) (->num (long-nlz n))))
         (cons "reverse" (lambda (n) (->num (long-reverse n))))
-        (cons "parseLong" (lambda (s . r) (parse-int-or-throw s (if (null? r) 10 (jnum->exact (car r))) "parseLong")))
-        (cons "valueOf" (lambda (s . r) (parse-int-or-throw s (if (null? r) 10 (jnum->exact (car r))) "valueOf")))
+        (cons "parseLong" (lambda (s . r) (parse-int-or-throw s (if (null? r) 10 (jnum->exact (car r))) "long")))
+        (cons "decode" (lambda (s) (decode-or-throw s "long")))
+        (cons "valueOf" (lambda (s . r) (parse-int-or-throw s (if (null? r) 10 (jnum->exact (car r))) "long")))
         (cons "compare" (lambda (x y) (let ((a (jnum->exact x)) (b (jnum->exact y)))
                                         (->num (cond ((< a b) -1) ((> a b) 1) (else 0))))))
         ;; toHexString/toOctalString/toBinaryString are UNSIGNED (the value's 64-bit
@@ -490,8 +491,9 @@
         (cons "TYPE" "int")
         (cons "valueOf" (lambda (x . r)
                           (if (number? x) (->num x)
-                              (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "valueOf"))))
-        (cons "parseInt" (lambda (x . r) (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "parseInt")))
+                              (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "int"))))
+        (cons "parseInt" (lambda (x . r) (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "int")))
+        (cons "decode" (lambda (x) (decode-or-throw x "int")))
         ;; Integer.compare(int, int): -1/0/1 exactly, not an arbitrary sign value.
         (cons "compare" (lambda (x y) (let ((a (jnum->exact x)) (b (jnum->exact y)))
                                         (->num (cond ((< a b) -1) ((> a b) 1) (else 0))))))
@@ -514,8 +516,9 @@
 (register-class-statics! "Byte"
   (list (cons "TYPE" "byte")
         (cons "MAX_VALUE" (->num 127)) (cons "MIN_VALUE" (->num -128))
-        (cons "valueOf" (lambda (x . r) (->num (if (number? x) x (parse-int-or-throw x 10 "valueOf")))))
-        (cons "parseByte" (lambda (x . r) (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "parseByte")))
+        (cons "valueOf" (lambda (x . r) (->num (if (number? x) x (parse-int-or-throw x 10 "byte")))))
+        (cons "parseByte" (lambda (x . r) (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "byte")))
+        (cons "decode" (lambda (x) (decode-or-throw x "byte")))
         ;; interpret the low 8 bits as unsigned (0..255): a signed byte -1 -> 255.
         (cons "toUnsignedLong" (lambda (x) (->num (bitwise-and (jnum->exact x) #xFF))))
         (cons "toUnsignedInt" (lambda (x) (->num (bitwise-and (jnum->exact x) #xFF))))
@@ -523,8 +526,9 @@
 (register-class-statics! "Short"
   (list (cons "TYPE" "short")
         (cons "MAX_VALUE" (->num 32767)) (cons "MIN_VALUE" (->num -32768))
-        (cons "valueOf" (lambda (x . r) (->num (if (number? x) x (parse-int-or-throw x 10 "valueOf")))))
-        (cons "parseShort" (lambda (x . r) (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "parseShort")))
+        (cons "valueOf" (lambda (x . r) (->num (if (number? x) x (parse-int-or-throw x 10 "short")))))
+        (cons "parseShort" (lambda (x . r) (parse-int-or-throw x (if (null? r) 10 (jnum->exact (car r))) "short")))
+        (cons "decode" (lambda (x) (decode-or-throw x "short")))
         (cons "toString" (lambda (x . r) (number->string (jnum->exact x))))))
 
 

@@ -94,13 +94,62 @@
 (define (skip-digits s i n) (let loop ((i i)) (if (and (< i n) (ascii-digit? (string-ref s i))) (loop (+ i 1)) i)))
 (define (sign-at? s i n) (and (< i n) (let ((c (string-ref s i))) (or (char=? c #\+) (char=? c #\-)))))
 
-(define (parse-long-shape? s)
-  (let* ((n (string-length s)) (i0 (if (sign-at? s 0 n) 1 0)))
-    (and (> n i0) (= (skip-digits s i0 n) n))))
+;; ---- the Java integer grammar ------------------------------------------------
+;; THE one place jolt reads a Java integer out of a string. Every java.lang
+;; integer parser is this function at a different width -- Long/parseLong,
+;; Integer/parseInt, Short/parseShort, Byte/parseByte, each one's valueOf, the
+;; (Long. s) and (Integer. s) constructors, BigInteger unbounded -- and
+;; clojure.core/parse-long is Long/valueOf with the throw caught to nil, so it is
+;; this function too.
+;;
+;; It exists because the grammar is NOT Scheme's, and handing the string to
+;; string->number spoke Scheme: (Long/parseLong "1e3") read the FLOAT 1000.0 out
+;; of a method whose return type is long, "5.0" read 5.0, "#xff" / "#b101" /
+;; "#o17" read Scheme radix prefixes whatever radix was asked for, " 5" parsed
+;; because the string had been trimmed first, an out-of-range value came back as
+;; a wider number instead of failing, and a radix outside 2..36 escaped as a Chez
+;; "not a valid radix" condition. Java's grammar is only this: an optional + or
+;; -, then one or more digits of RADIX, and nothing else.
+;;
+;; Answers the integer, or one of three SYMBOLS the caller renders as its own
+;; failure -- 'radix (outside Character.MIN_RADIX..MAX_RADIX), 'shape (not a Java
+;; integer in this radix), 'range (one that does not fit MN..MX). A parsed value
+;; is never a symbol, so the two are told apart by symbol?. MN #f is the
+;; unbounded parse.
+(define (java-digit-value c radix)
+  (let* ((i (char->integer c))
+         (v (cond ((and (fx>=? i 48) (fx<=? i 57))  (fx- i 48))        ; 0-9
+                  ((and (fx>=? i 97) (fx<=? i 122)) (fx+ 10 (fx- i 97)))  ; a-z
+                  ((and (fx>=? i 65) (fx<=? i 90))  (fx+ 10 (fx- i 65)))  ; A-Z
+                  (else #f))))
+    (and v (fx<? v radix) v)))
 
+(define (java-int-parse s radix mn mx)
+  (if (or (fx<? radix 2) (fx>? radix 36))
+      (quote radix)
+      (let* ((n (string-length s))
+             (c0 (and (fx>? n 0) (string-ref s 0)))
+             (neg? (eqv? c0 #\-))
+             (i0 (if (or neg? (eqv? c0 #\+)) 1 0)))
+        (if (fx=? i0 n)
+            (quote shape)                       ; "", "+", "-" -- no digits
+            (let loop ((i i0) (acc 0))
+              (if (fx=? i n)
+                  (let ((v (if neg? (- acc) acc)))
+                    (if (or (not mn) (and (>= v mn) (<= v mx))) v (quote range)))
+                  (let ((d (java-digit-value (string-ref s i) radix)))
+                    (if d (loop (fx+ i 1) (+ (* acc radix) d)) (quote shape)))))))))
+
+;; clojure.core/parse-long: Long/valueOf with NumberFormatException caught to
+;; nil, so a non-nil result is always a LONG and every failure -- bad shape or a
+;; decimal outside signed 64-bit range -- is nil rather than a wider number.
+;; (parse-long "9223372036854775808") read 9223372036854775808N before the range
+;; half existed, so a caller branching on the nil to catch the overflow took the
+;; wrong arm and got a clojure.lang.BigInt out of a fn documented to return Long.
 (define (jolt-parse-long s)
   (if (not (string? s)) (throw-jvm (quote IllegalArgumentException) (string-append "parse-long requires a string: " (jolt-final-str s)))
-      (if (parse-long-shape? s) (string->number s) jolt-nil)))   ; exact long
+      (let ((v (java-int-parse s 10 ->int-long-min ->int-long-max)))
+        (if (symbol? v) jolt-nil v))))
 
 ;; strict float shape: [+-]? ( D+ (. D*)? | . D+ ) ([eE][+-]? D+)?  fully anchored.
 (define (parse-double-shape? s)
@@ -144,15 +193,72 @@
              (char-numeric? (string-ref t (- tn 2))))
         (substring t 0 (- tn 1))
         t)))
+;; Java's HEXADECIMAL floating-point form, the one shape of Double.parseDouble
+;; that is not a decimal: 0x HexDigits . HexDigitsopt p Signopt Digits. The
+;; binary exponent is REQUIRED, which is what tells (Double/parseDouble "0x1fp0")
+;; -- 31.0 -- from "0x1f", which is not a double on the JVM either. #f when the
+;; string is not one.
+(define (hex-digit-value c)
+  (let ((i (char->integer c)))
+    (cond ((and (fx>=? i 48) (fx<=? i 57))  (fx- i 48))
+          ((and (fx>=? i 97) (fx<=? i 102)) (fx+ 10 (fx- i 97)))
+          ((and (fx>=? i 65) (fx<=? i 70))  (fx+ 10 (fx- i 65)))
+          (else #f))))
+(define (skip-hex-digits s i n)
+  (let loop ((i i)) (if (and (< i n) (hex-digit-value (string-ref s i))) (loop (+ i 1)) i)))
+(define (hex-digits-value s i j)
+  (let loop ((i i) (acc 0))
+    (if (= i j) acc (loop (+ i 1) (+ (* acc 16) (hex-digit-value (string-ref s i)))))))
+
+(define (java-hex-double s)
+  (let* ((n (string-length s))
+         (neg? (and (> n 0) (char=? (string-ref s 0) #\-)))
+         (i0 (if (or neg? (and (> n 0) (char=? (string-ref s 0) #\+))) 1 0)))
+    (and (<= (+ i0 2) n)
+         (char=? (string-ref s i0) #\0)
+         (memv (string-ref s (+ i0 1)) (quote (#\x #\X)))
+         (let* ((ds (+ i0 2))
+                (ip (skip-hex-digits s ds n))
+                (dot? (and (< ip n) (char=? (string-ref s ip) #\.)))
+                (fs (if dot? (+ ip 1) ip))
+                (fp (if dot? (skip-hex-digits s fs n) fs)))
+           (and (> fp ds)                       ; at least one hex digit overall
+                (< fp n)
+                (memv (string-ref s fp) (quote (#\p #\P)))
+                (let* ((es (if (sign-at? s (+ fp 1) n) (+ fp 2) (+ fp 1)))
+                       (ee (skip-digits s es n)))
+                  (and (> ee es) (= ee n)
+                       (let* ((mant (+ (hex-digits-value s ds ip)
+                                       (if (> fp fs)
+                                           (/ (hex-digits-value s fs fp) (expt 16 (- fp fs)))
+                                           0)))
+                              (ex (string->number (substring s (+ fp 1) n)))
+                              (v (exact->inexact (* mant (expt 2 ex)))))
+                         (if neg? (- v) v)))))))))
+
+;; THE one place jolt reads a Java double out of a string, the floating half of
+;; java-int-parse. clojure.core/parse-double is Double/parseDouble with the throw
+;; caught to nil, so both doors are this function -- the Java one used to hand
+;; the string to string->number instead and so spoke SCHEME, reading
+;; (Double/parseDouble "#xff") as 255.0 and "1/2" as 0.5, neither of which is a
+;; double on the JVM; and both doors were missing the hex form, "-NaN" and
+;; "+Infinity". #f when the string is not a Java double.
+(define (java-double-parse s0)
+  (let* ((s (pd-normalize s0))
+         (n (string-length s))
+         (neg? (and (> n 0) (char=? (string-ref s 0) #\-)))
+         (body (if (and (> n 0) (memv (string-ref s 0) (quote (#\- #\+)))) (substring s 1 n) s)))
+    (cond
+      ;; the sign is accepted and IGNORED on NaN, as the JVM does: "-NaN" is NaN
+      ((string=? body "NaN") +nan.0)
+      ((string=? body "Infinity") (if neg? -inf.0 +inf.0))
+      ((java-hex-double s))
+      ((parse-double-shape? s) (exact->inexact (string->number s)))
+      (else #f))))
+
 (define (jolt-parse-double s)
   (if (not (string? s)) (throw-jvm (quote IllegalArgumentException) (string-append "parse-double requires a string: " (jolt-final-str s)))
-      (let ((s (pd-normalize s)))
-        (cond
-          ((string=? s "Infinity") +inf.0)
-          ((string=? s "-Infinity") -inf.0)
-          ((string=? s "NaN") +nan.0)
-          ((parse-double-shape? s) (exact->inexact (string->number s)))
-          (else jolt-nil)))))
+      (or (java-double-parse s) jolt-nil)))
 
 (def-var! "clojure.core" "__bit-and" jolt-bit-and)
 (def-var! "clojure.core" "__bit-or" jolt-bit-or)

@@ -106,7 +106,7 @@
 ;; JVM bigint/biginteger coerce: string → parsed integer, double/float →
 ;; truncated integer, ratio → quotient, integer → exact integer.
 (define (jolt-bigint x)
-  (cond ((string? x) (parse-int-or-throw x 10 "bigint"))
+  (cond ((string? x) (parse-int-or-throw x 10 "big"))
         ((flonum? x)
          (if (or (finite? x) (zero? x))
              (inexact->exact (truncate x))

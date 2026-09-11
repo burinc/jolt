@@ -268,6 +268,20 @@
            :jvm "throws ClassCastException"
            :jolt "5"}
    :note "Unchecked data argument; a map behaves identically. Verified against Clojure 1.12.5."}
+  ;; jolt has no distinct byte or short VALUE — every integer is one type — so
+  ;; Byte/valueOf(byte), which the JVM has, and Byte/valueOf(int), which it does
+  ;; not, are the same call here and there is nothing to refuse with. Found while
+  ;; putting every java.lang integer PARSER on one grammar: the string arities
+  ;; now match the JVM exactly, and this is the one cell left, which is about
+  ;; overload arity rather than parsing. Substrate-inherent and a superset.
+  {:category :permissive
+   :behavior "(Byte/valueOf (int 200))"
+   :jvm "throws IllegalArgumentException (no Byte/valueOf taking an int)"
+   :jolt "200"
+   :check {:expr "(Byte/valueOf (int 200))"
+           :jvm "throws IllegalArgumentException"
+           :jolt "200"}
+   :note "jolt models one integer type, so a byte-typed overload cannot be told from an int-typed one. Verified against Clojure 1.12.5."}
   ;; A bignum-literal operand (9223372036854775807 = Long/MAX_VALUE, past jolt's
   ;; 2^60-1 fixnum ceiling) BLOCKS :long specialization, so the loop var stays
   ;; generic and jolt computes the EXACT bignum sum — where the JVM keeps `i` a
