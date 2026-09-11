@@ -83,7 +83,197 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the shaking fixture. `run-dce-refs.ss` pins the semantics on a synthetic
   graph, including that an unreachable allowed def is still pruned. (#890)
 
+### Performance
+
+- **A release build is half the size and starts a third faster: the runtime
+  half no longer carries Chez inspector information.** `jolt build` compiled
+  rt.ss, the `clojure.core` prelude, the compiler image and the loader under
+  the release row's parameters — `generate-inspector-information` and
+  `generate-procedure-source-information` on — the same as the app. Nothing
+  in the runtime half reads them: a core frame prints by its code name, which
+  Chez keeps either way (`na-chunk-map-first`, `map-seq`, `dorun` appear in an
+  `--opt` trace exactly as in a release one); core is minted without splicing,
+  so it has no inline chains for the reporter to recover; and the image
+  writer learns a core closure's capture layout from its maker rather than
+  from inspector names. What they cost was the whole of burinc/jolt#3: on a
+  hello-world binary 27.25MB → 11.68MB on disk, 110ms → 70ms to start, 225MB
+  → 132MB resident, and the profile's `Sbuild_heap` line — the kernel
+  reading, relocating and compacting the image before any jolt code runs —
+  106ms → 44ms, because that phase scales with the image (90MB → 48MB of heap
+  once decompressed). The runtime half now compiles under one fixed profile in
+  every link path (self-contained, cc, cross, `--library`, and under
+  `--tree-shake`, whose shaken core is its own unit now rather than one file
+  with the app), and the same profile for every mode, so release, `--opt` and
+  `--dev` share one runtime-fasl cache entry.
+
+  The APP half keeps the release row: Chez records a frame's return-point
+  source only as inspector information, and that offset is how the reporter
+  finds the spliced chain a frame sits in and its exact line — without it the
+  build smoke's inner-fn case lost `step-boom` and `app.util/inner-boom` and
+  placed `-main` on its `defn` line. `--opt` still turns it off for the app
+  half, as before. The runtime-fasl cache is keyed on the parameters as well
+  as the source now: keyed on the mode's name alone, a build on a machine that
+  had built before kept serving the old fasl under the new policy, and the
+  binary did not shrink until the cache was cleared by hand.
+
+- **A binary that never compiles at runtime ships without the compiler, by
+  default.** The analyzer and back end (1.2MB of fasl, plus the `scheme.boot`
+  compiler kernel and its load at every start) were dropped only under
+  `--tree-shake`; every other build carried them whether or not a line of
+  the program could reach `eval`. The reachability walk the shake already ran
+  now runs for every build and takes just its compiler verdict — the graph
+  is kept whole — so a program that reaches none of `eval`, `load-string`,
+  `load-file`, `load`, `load-reader` or an image API boots from `petite.boot`
+  alone (on POSIX — a Windows build keeps `scheme.boot` resident, since its
+  foreign-procedure forms are evaluated at start), and one that does keeps the
+  compiler exactly as before. "Reaches" counts every def whose init runs code
+  at load, not only what `-main` calls: nothing is pruned in a default build,
+  so an unreferenced `(def x (eval …))` keeps the compiler too (a `defn` only
+  binds, so a library that defines an eval-calling fn nobody reaches does not). Two
+  more things keep it: a bare `:&` FFI binding, which compiles a
+  foreign-procedure per tail shape at the call (petite cannot), and
+  `jolt.scheme/eval-string`; `jolt.scheme/proc` is a top-level lookup and
+  answers from the runtime half without it. `:allow-dynamic` is read by every
+  build now and vouches for a RESOLUTION the graph cannot follow — a vouched
+  `resolve` no longer keeps the compiler resident; a vouched `eval` still
+  bails, since the compiler image is direct-linked against the whole core and
+  cannot run over a shaken one. And a kept def that only NAMES a var of the
+  dropped half — `jolt.scheme/eval-string` in a program that calls `proc`
+  alone — loads: the direct-link hoist binds a stub that raises at the call
+  instead of failing the namespace load. Hello-world,
+  measured with the runtime half's parameters above: 11.68MB → 9.15MB, 70ms →
+  60ms, 132MB → 111MB resident; against 0.8.6's 27.25MB / 110ms / 225MB that
+  is a third of the bytes, a little over half the start, and half the memory,
+  with no flag passed.
+
+  Images are the case the verdict has to get right. Writing one goes through
+  the fasl writer, which lives in `scheme.boot`, so `jolt.image/dump!` and
+  `dump-world!` keep the compiler kernel. Restoring one COMPILES the fn
+  sources it carries, and a source can name any core var — including one the
+  compiled program never reached because the inline pass spliced it away at
+  every call site: a shaken build restored a closure that called `update` and
+  died on the unbound var its own `-main` had used without a trace. So
+  `read-image` and `restore-world!` are bail references like `eval`: a
+  `--tree-shake` build of such a program keeps everything and says why
+  (`app.core/-main -> jolt.host/image-read`), and the build smoke pins that
+  the bailed binary restores what the unshaken one did. The references are
+  the HOST entry points as well as the `jolt.image` wrappers, because the
+  wrappers are one-line defns the inline pass splices into their callers,
+  after which only the host call is left to see.
+
+- **`clojure.core` is direct-linked, and still redefinable.** The seed was
+  minted with every core->core call routed through the var: a hoisted cell
+  read, then `jolt-invokeN` — `filterv` reached `vec` that way, `frequencies`
+  reached `assoc!`, and so on for the 258 core vars that call another. The
+  mint now runs with direct-linking on (`bootstrap.ss`): a core def binds a
+  top-level `jv$clojure.core$name` and a core->core call applies it, one
+  load in place of the deref and the dispatch, which is what JVM Clojure has
+  done for its own core since 1.8. What the JVM gives up for it — a
+  redefinition of a core fn is invisible to core's own callers — jolt does
+  not: the def is bound with `def-var-linked!`, which records a setter over
+  the binding, and every write of a var root (`def`, `alter-var-root`,
+  `with-redefs`, `ns-unmap`, a world-image restore) goes through
+  `var-root-set!`, which writes a linked var's new root through to it. So
+  `(with-redefs [clojure.core/slurp …] …)` still reaches a core fn that
+  calls `slurp`, at the cost of one hashtable probe per root WRITE and none
+  per call. Nothing is spliced into core — the inline pass reads the host
+  contract's direct-link flag, which the mint leaves off — so there is no
+  copy a redefinition could miss.
+
+  An app's direct call into core changes shape to match: where a release
+  build hoisted a seed var's root once at load (`jolt-seed-root`), it now
+  applies the same `jv$` binding, so an app-side `with-redefs` of a core fn
+  is seen by the app's own direct calls too; a seed var the runtime defined
+  itself in Scheme keeps the hoisted root. The three build modes are then:
+  `--dev` / `--no-direct-link`, every app var routed and redefinable; the
+  default, app defs direct-linked and spliced (`^:redef` / `^:dynamic` opt
+  out) over a direct-linked core; and `--closed-world` (the flag
+  `--tree-shake` was first named, kept as an alias, `:jolt/build
+  {:closed-world true}` in deps.edn), which also prunes every def `-main`
+  cannot reach. `jolt.host/seed-callable?` answers a linked var's binding
+  name rather than `true`; `run-directcall.ss` pins the shape and the
+  write-through end to end. Measured A/B/A against the binary before the
+  mint, on the bench's core-heavy rows: `fib`, `collections`, `seqs`,
+  `transducers`, `keyed-lookup`, `apply-rest`, `string-ops`, `dispatch`,
+  `printing`, `lazy-threads` and `literals` all within their own run-to-run
+  noise, and `sorted-build` 728 → 510 ms — the tree code calls its own
+  helpers on every step, and those are the calls that stopped going
+  through a var. The prelude is 4% smaller (2.04 → 1.96 MB), a direct call
+  being shorter to emit than a hoisted cell read plus a dispatch.
+
+- **An anonymous fn's source registration is text the registry parses on
+  demand, not a structure built at every start.** Since 0.7.29 each fn
+  literal registers its source form at load (`image-register-fn-form!`, what
+  lets a state image write a closure as code), and the form was emitted as a
+  `let*` of `jolt-symbol` / `jolt-list` / `jolt-vector` calls: a quoted
+  construction compiled into the runtime as code and run at every process
+  start, for 262 literals in core and 146 in the compiler, though nothing
+  reads a registration until an image dumps that closure. The back end now
+  renders the form as Clojure source and emits `(image-fn-form-src "…")`, a
+  macro that expands to a UTF-8 bytevector constant — one byte per character
+  in the compiled runtime, nothing run at load — and `image-fn-form-lookup`
+  parses the text the first time it is asked, positions off, and caches the
+  form in the registration. Every rendering is checked at emit time against
+  that same parse: it must read back to the construction it replaces, symbol
+  metadata and set ordering included, or the literal keeps the construction
+  as before (a class value a macro spliced into a body has no reader syntax);
+  a spliced copy's capture list is unchanged. On the hello-world binary from
+  the entry above: 9.15 → 8.84 MB on disk, the prelude's load allocates
+  4.3 MB where it allocated 8.6 and takes 5 ms where it took 7, 102.5 →
+  95.4 MB resident; the seed prelude is 1.96 → 1.70 MB and its image 1.20 →
+  1.10 MB. The tree-shake reader admits the sibling-registration shape
+  (`run-dce-refs.ss`), and `fnform-test.ss` pins the round trip per literal
+  kind, the lazy parse, the fallback and the seed.
+
+- **`JOLT_STARTUP_PROFILE` accounts for the time before `main`.** The native
+  marks began at the launcher's first line, so exec, the dynamic linker binding
+  the kernel and any `:static` natives, and C constructors — the phase a bigger
+  binary costs first — were invisible, and a profile whose lines summed to
+  190ms could sit inside a 1s cold start with nothing to say about the rest.
+  The launcher now reads the process start time (`/proc/self/stat` on Linux,
+  `proc_pidinfo` on macOS, `GetProcessTimes` on Windows) and prints it as
+  `native pre-main (exec+ld)`, folded into the clock so every cumulative
+  figure is time since the process started and the last line is the whole
+  run. A platform that cannot report it says so on that line rather than
+  printing zero.
+
 ### Fixed
+
+- **A fn literal in a top-level `do`'s non-def statement keeps its name and its
+  source registration in a direct-linked build, and non-def literals no longer
+  share one name per namespace.** Under direct-link — every `jolt build` since
+  it landed, and clojure.core's own mint as of this release — the back end
+  emits each statement of a top-level `do` as a top-level form of its own, and
+  it rebound the form's namespace to nil for each, so every fn literal in a
+  deftype method body or a `defmethod`'s fn (the shapes those expand to) was
+  emitted unnamed and unregistered: an image that reached one refused to
+  write it ("this fn has no recorded source"), and its frames printed no name. The
+  statements inherit the namespace now. Separately, the counter behind
+  `jfn$<ns>$$<n>` — the name of a literal outside any def — restarted per
+  top-level form, so every such literal in a namespace was `$$0` and the
+  registrations (keyed by name) overwrote each other: an image restore of one
+  came back with the LAST form's source. The counter is per namespace now.
+
+- **The reader's mode switches are per-thread.** `rdr-edn-mode`,
+  `rdr-discard-cb`, `rdr-scan-mode` and `rdr-suppress-pos` were plain Chez
+  parameters, which every thread shares: a `clojure.edn/read-string` on one
+  thread put every other thread's reader into edn mode for its duration
+  (auto-resolved keywords rejected, `#_` discards handed to the edn callback),
+  and a `#$` interpolation dropped the positions off the lists another thread
+  was loading just then. Namespaces load in parallel, so both were live. They
+  are thread parameters now, as `rdr-source-file` already was;
+  `thread-safety-test.ss` holds one thread inside the `parameterize` while
+  another reads. A thread jolt forks — a future, an agent worker, a fiber
+  carrier — starts from the default switches rather than inheriting the read
+  in progress on the forking thread, which a pooled thread kept for life.
+
+- **A quoted qualified tagged literal keeps its namespace.** `'#foo/bar [1]`
+  — a `#tag` with no reader registered, inside quoted data — came back as a
+  tagged literal whose tag was the bare symbol named `"foo/bar"`; a tag
+  symbol the JVM reader reads is `foo/bar` with namespace `foo`, and
+  `tagged-literal` builds the same. The quoting back end built the
+  tag symbol from the whole text with no namespace; it splits a qualified tag
+  now.
 
 - **A method call in interpreted code resolves through `Reflector/getMethods`.**
   SCI resolves a host method call by asking `clojure.lang.Reflector/getMethods`
@@ -99,6 +289,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty one, `Class.cast` is the identity over jolt's Object parameters, and
   `Util/sneakyThrow` rethrows, so a method that threw reports its own
   exception rather than a missing static.
+
 - **`jolt.ffi/errno` and the process runtime read errno on Android.** Both
   chose the accessor by name — `__error` on macOS, `_errno` on Windows, glibc's
   `__errno_location` everywhere else — and bionic, which reports `os.name`
@@ -139,6 +330,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fds 0, 1 and 2 are below the cut and still carry the parent's own
   descriptors, tty answers and all. `JOLT_NO_SPAWN_CLOSEFROM=1` forces the
   fallback, so one machine's gate can exercise both paths.
+
 - **A task that shares a built-in command's name now says so, instead of
   letting the command answer as if the task were not there.** babashka's
   `:override-builtin` is what gives a task a command's name, and a task that
@@ -150,6 +342,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   task whatever it is called, or `:override-builtin true` on the task, which
   takes the name for good. The warning goes to stderr, so `jolt path` in such a
   project still pipes.
+
 - **The `,` flag on `%g` no longer puts a separator in the exponent.** `%g`
   picks between fixed and scientific notation, and the grouping pass ran over
   whichever one it produced — so `(format "%,.1g" 1234.5)`, which lands in the

@@ -58,7 +58,7 @@
                      (hashtable-keys var-table)))
   (rebuild-ns-cells-index!)   ; the prune bypassed the ns->cells buckets (rt.ss)
   (for-each (lambda (cr) (unless (eq? (var-cell-root (car cr)) (cdr cr))
-                           (var-cell-root-set! (car cr) (cdr cr)))) zj-roots)
+                           (var-root-set! (car cr) (cdr cr)))) zj-roots)   ; through the linked setter (rt.ss), or a core fn a case altered stays patched for direct callers
   (jolt-with-mutex ns-registry-mu (zj-prune! ns-registry zj-ns-base))  ; same rule as var-table (ns.ss)
   ; the protocol tree AND its by-method index, through the one entry
   ; point that keeps them in step (protocols.ss)

@@ -13,6 +13,10 @@
 (load "host/chez/dce.ss")
 ;; load the full stdlib so var-cell-lookup resolves every bail/compile-ref
 (load "host/chez/loader.ss")
+;; java/ffi.ss is not in the gate boot: the bare-varargs compile entry it defines
+;; (jolt.host/ffi-varargs-compile) is a dce-compile-ref the existence gate must
+;; find, as every other jolt driver that has ffi does.
+(load "host/chez/java/ffi.ss")
 
 (define analyze (var-deref "jolt.analyzer" "analyze"))
 
@@ -201,6 +205,27 @@
               (dce-def-var-form (dce-unwrap (list 'guard '(e (#t #f)) registered)))
               (caddr registered)))
 
+;; Registrations are emitted as sibling calls ahead of the def -- one per
+;; literal, no let* header -- in both the var-routed and the linked mint; a
+;; literal with no source rendering keeps the let* construction next to them.
+(let ((flat '(begin (image-register-fn-form! "jfn$app$f$0" (image-fn-form-src "(fn* [x] x)") "app" (jolt-vector))
+                    (image-register-fn-form! "jfn$app$f$1" (image-fn-form-src "(fn* [y] y)") "app" (jolt-vector))
+                    (def-var-with-meta! "app" "f" (lambda (x) x) (jolt-hash-map))))
+      (linked '(begin (image-register-fn-form! "jfn$app$g$0" (image-fn-form-src "(fn* [x] x)") "app" (jolt-vector))
+                      (define jv$app$g (lambda (x) x))
+                      (def-var-linked! "app" "g" (quote jv$app$g) jv$app$g (lambda (v) (set! jv$app$g v)) (jolt-hash-map))
+                      (jolt-register-variadic! 1 jv$app$g)))
+      (mixed '(begin (image-register-fn-form! "jfn$app$h$0" (image-fn-form-src "(fn* [x] x)") "app" (jolt-vector))
+                     (let* ((_q$0 (jolt-symbol #f "fn*")))
+                       (image-register-fn-form! "jfn$app$h$1" _q$0 "app" (jolt-vector)))
+                     (def-var-with-meta! "app" "h" (lambda (x) x) (jolt-hash-map)))))
+  (gate-check "def-var-form: sibling registrations then def is the def"
+              (dce-def-var-form flat) (list-ref flat 3))
+  (gate-check "def-var-form: sibling registration then linked def is the def"
+              (dce-def-var-form linked) (list-ref linked 3))
+  (gate-check "def-var-form: text and constructed registrations mix"
+              (dce-def-var-form mixed) (list-ref mixed 3)))
+
 ;; --- dce-bail-refs / dce-compile-refs existence gate -------------------------
 ;; Every name in the hand-maintained bail/compile lists must resolve to a runtime
 ;; binding. A stale entry (one that no longer exists in the runtime) fails here
@@ -326,13 +351,24 @@
                             "gate.app/-main" '())))))
     (gate-check "allow: the hint names every bailing def, space-joined in record order"
                 (gate-sub? out "  :jolt/tree-shake {:allow-dynamic [gate.app/a gate.app/b]}\n") #t))
-  ;; an allowed caller of a compile-ref (eval) is skipped by the compile scan too
-  (let-values (((core-strs app-strs drop-compiler?)
-                (dce-shake '() (list (rec "gate.app/-main" '("gate.app/ev"))
-                                     (rec "gate.app/ev" '("clojure.core/eval")))
-                           "gate.app/-main" '("gate.app/ev"))))
-    (gate-check "allow: an allowed eval caller does not bail" (and core-strs #t) #t)
-    (gate-check "allow: an allowed eval caller drops the compiler image" drop-compiler? #t))
+  ;; an allowed caller of a ref that RUNS the compiler (eval) still bails: the
+  ;; key vouches for a resolution the graph cannot follow, and the compiler
+  ;; image is direct-linked against the whole core, so it cannot run over a
+  ;; shaken one (an allowed eval used to shake, and its eval died on a pruned
+  ;; core def inside the compiler). The hint offers no entry for it either.
+  (let* ((got-core 'unset) (got-drop 'unset)
+         (out (with-output-to-string
+                (lambda ()
+                  (let-values (((core-strs app-strs drop-compiler?)
+                                (dce-shake '() (list (rec "gate.app/-main" '("gate.app/ev"))
+                                                     (rec "gate.app/ev" '("clojure.core/eval")))
+                                           "gate.app/-main" '("gate.app/ev"))))
+                    (set! got-core core-strs)
+                    (set! got-drop drop-compiler?))))))
+    (gate-check "allow: an allowed eval caller still bails" got-core #f)
+    (gate-check "allow: ...and keeps the compiler image" got-drop #f)
+    (gate-check "allow: the bail names the eval" (gate-sub? out "  gate.app/ev -> clojure.core/eval\n") #t)
+    (gate-check "allow: ...and offers no allow entry for it" (gate-sub? out ":allow-dynamic [") #f))
   ;; a top-level non-def form has no fqn and cannot be allowed by name: no hint
   (let ((out (with-output-to-string
                (lambda ()
@@ -342,4 +378,42 @@
     (gate-check "allow: a <form> bail lists the form" (gate-sub? out "  <form> -> clojure.core/resolve\n") #t)
     (gate-check "allow: a <form> bail prints no hint" (gate-sub? out ":jolt/tree-shake") #f)))
 
+;; --- a bare varargs FFI binding names its compile entry ----------------------
+;; jolt.ffi/foreign-fn with a BARE :& lowers to direct Scheme calls that no :var
+;; names, so dce-collect-refs reads the :ffi-fn node itself: the host entry that
+;; compiles a foreign-procedure at the call goes into the record's refs, and the
+;; verdict keeps the compiler for it (petite cannot compile one). A declared
+;; tail compiles ahead of time and must not be flagged.
+(let ((refs-of (lambda (src)
+                 (dce-collect-refs '() (analyze (make-analyze-ctx "user") (jolt-ce-read src))))))
+  (gate-check "ffi: a bare :& binding refs jolt.host/ffi-varargs-compile"
+              (and (member "jolt.host/ffi-varargs-compile"
+                           (refs-of "(jolt.ffi/__cfn \"open\" [:string :int :&] :int)"))
+                   #t)
+              #t)
+  (gate-check "ffi: a declared tail is compiled ahead and is not flagged"
+              (and (member "jolt.host/ffi-varargs-compile"
+                           (refs-of "(jolt.ffi/__cfn \"printf\" [:string :& :int] :int)"))
+                   #t)
+              #f))
+
+;; --- the default build's verdict roots every def whose init RUNS at load -----
+;; Nothing is pruned there, so (def x (eval …)) needs the compiler whether or
+;; not -main reaches x; a defn's init is a fn literal and only binds, so an
+;; unreached defn that evals in its BODY does not keep it -- reached, it does.
+(let ((needs? (lambda (recs) (dce-needs-compiler? '() recs "gate.app/-main" '()))))
+  (gate-check "verdict: an unreached def whose init evals keeps the compiler"
+              (needs? (list (dce-rec #f "gate.app/-main" '() "" #f)
+                            (dce-rec #f "gate.app/compiled" '("clojure.core/eval") "" #t)))
+              #t)
+  (gate-check "verdict: an unreached defn that evals in its body does not"
+              (needs? (list (dce-rec #f "gate.app/-main" '() "" #f)
+                            (dce-rec #f "gate.app/helper" '("clojure.core/eval") "" #f)))
+              #f)
+  (gate-check "verdict: ...reached from -main, it does"
+              (needs? (list (dce-rec #f "gate.app/-main" '("gate.app/helper") "" #f)
+                            (dce-rec #f "gate.app/helper" '("clojure.core/eval") "" #f)))
+              #t))
+
 (gate-summary "dce-refs")
+

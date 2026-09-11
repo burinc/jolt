@@ -114,5 +114,124 @@
     (let ((nm (closure-name spl-f)))
       (or (not nm) (not (image-fn-form-lookup nm)))))
 
+;; --- registrations are SOURCE TEXT, parsed on the first lookup -------------
+;; The emitted registration carries the literal's source as text, wrapped in
+;; (image-fn-form-src "…"): a UTF-8 bytevector constant in the compiled runtime
+;; -- one byte per character, where a Chez string is four and the quoted
+;; construction this replaces was a let* of allocations run at every process
+;; start. The registry parses the text the first time a lookup asks for it.
+(define (emit-src ns str)   ; the emitted Scheme text of one top-level form
+  (let-values (((f j) (rdr-read-form str 0 (string-length str))))
+    (let ((ctx (make-analyze-ctx ns)))
+      (jolt-ce-emit (jolt-ce-run-passes (jolt-ce-analyze ctx f) ctx)))))
+(define (has? s sub)
+  (let ((ns (string-length s)) (nsub (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i nsub) ns) #f)
+            ((string=? (substring s i (+ i nsub)) sub) #t)
+            (else (loop (+ i 1)))))))
+;; the raw table slot, untouched by any lookup
+(define (raw-form name)
+  (let ((e (hashtable-ref fn-form-tbl name #f))) (and e (vector-ref e 0))))
+
+(let ((e (emit-src "app" "(def lazy1 {:f (fn [x] (* x 2))})")))
+  (ok "a registration is emitted as source text"
+      (has? e "(image-register-fn-form! \"jfn$app$lazy1$0\" (image-fn-form-src \"(fn* [x] (* x 2))\") \"app\" (jolt-vector ))"))
+  (ok "...and builds no quoted structure at load" (not (has? e "(jolt-symbol "))))
+(let ((e (emit-src "app" "(def lazy2 {:a (fn [x] x) :b (fn [y] y)})")))
+  (ok "several literals register as sibling calls, no let* header"
+      (and (has? e "(begin (image-register-fn-form! \"jfn$app$lazy2$0\"")
+           (has? e " (image-register-fn-form! \"jfn$app$lazy2$1\"")
+           (not (has? e "(let* ((_q$")))))
+(jolt-eval "(def lazy1 {:f (fn [x] (* x 2))})" "app")
+(ok "before the first lookup the slot holds the bytes" (bytevector? (raw-form "jfn$app$lazy1$0")))
+(ok "the first lookup parses the form" (string=? (reg-form-head "jfn$app$lazy1$0") "fn*"))
+(ok "...and caches it in the slot" (not (bytevector? (raw-form "jfn$app$lazy1$0"))))
+(ok "the parsed form carries no reader position"
+    (let ((form (vector-ref (image-fn-form-lookup "jfn$app$lazy1$0") 0)))
+      (jolt-nil? (jolt-get (jolt-meta form) (keyword #f "line") jolt-nil))))
+
+;; Round-trip fidelity: the text reads back to the SAME construction the
+;; registration used to carry (emit-quoted, the image writer's view of a form),
+;; for every literal kind a fn body can hold. The back end checks exactly this
+;; before it emits text, so a form that fails here would fall back instead; the
+;; rows pin that the common kinds never do.
+(define emit-quoted (var-deref "jolt.backend-scheme" "emit-quoted"))
+(define fnsrc-src (var-deref "jolt.backend-scheme" "fnsrc-src"))
+(define (quoted-text f) (jolt-invoke1 emit-quoted f))
+(define (round-trips? src)
+  (let* ((f (jolt-ce-read src))
+         (t (jolt-invoke1 fnsrc-src f))
+         (back (image-fn-form-parse t)))
+    (string=? (quoted-text back) (quoted-text f))))
+(for-each
+  (lambda (src) (ok (string-append "source round-trips: " src) (round-trips? src)))
+  (list "(fn* [^long n ^String s] (/ (+ n 1/2) 2))"
+        "(fn* [] [##Inf ##-Inf ##NaN 1.5 -2 12345678901234567890 1.0E10 -0.0 0])"
+        "(fn* [] [\\a \\newline \\space \\tab \\( \\\\ \\u00e9])"
+        "(fn* [] [\"a\\\"b\\nc\\\\d\\t\\u00e9\" :k :ns/k nil true false])"
+        "(fn* [] [#{3 1 2} {:b 2 :a 1} (quote sym) (quote ns/sym) () (1 2) [1 [2]]])"
+        "(fn* [] {:a 1 :b 2 :c 3 :d 4 :e 5 :f 6 :g 7 :h 8 :i 9 :j 10})"
+        "(fn* [] [#\"a\\\\d\\\"\" #inst \"2020-01-02T00:00:00Z\" #uuid \"3b241101-e2bb-4255-8caf-4136c566a962\" 1.5M #foo/bar [1 2]])"
+        "(fn* [x] (fn* [y] (fn* [z] (+ x y z))))"
+        "(fn* [^{:tag long :foo true} n] (let [x (quote ^:kw q)] n))"
+        "(fn* [] (clojure.core// 1 2))"
+        "(fn* [] (.foo Foo. a.b/c))"))
+
+;; A form with no source rendering (a macro spliced a live class value into the
+;; body) still registers, through the quoted construction it always used -- as
+;; a form, never as text.
+(jolt-eval "(defmacro cls-fn [] (list 'fn '[x] (list 'instance? String 'x)))" "app")
+(let ((e (emit-src "app" "(def clsf {:f (cls-fn)})")))
+  (ok "an unrenderable literal falls back to the quoted construction"
+      (and (has? e "(let* ((_q$0") (has? e "(jolt-class-for "))))
+(jolt-eval "(def clsf {:f (cls-fn)})" "app")
+(ok "...and registers a form, not text"
+    (and (vector? (image-fn-form-lookup "jfn$app$clsf$0"))
+         (not (bytevector? (raw-form "jfn$app$clsf$0")))))
+
+;; The minted seed carries every core literal as text: no quoted construction
+;; is left in it.
+(define (file-has? path sub)
+  (has? (call-with-port (open-input-file path) get-string-all) sub))
+(ok "the seed prelude registers every literal as source text"
+    (not (file-has? "host/chez/seed/prelude.ss" "(let* ((_q$0")))
+(ok "the seed image registers every literal as source text"
+    (not (file-has? "host/chez/seed/image.ss" "(let* ((_q$0")))
+
+
+;; --- direct-link: a top-level do splices per statement, and each statement
+;; inherits the namespace. The direct-link arm re-enters emit-top-form per
+;; statement, and a statement carries no :ns of its own -- rebound to nil,
+;; every fn literal in a non-def statement (a deftype method body, a defmethod's
+;; fn) was emitted unnamed and unregistered, and a reify instance holding one
+;; refused to dump.
+(jolt-eval "(def dl-holder (atom nil))" "app")
+((var-deref "jolt.backend-scheme" "set-direct-link!") #t)
+(define dl-closure
+  (guard (e (#t ((var-deref "jolt.backend-scheme" "set-direct-link!") #f) (raise e)))
+    (jolt-eval "(do (reset! dl-holder (fn [x] (+ x 1))) @dl-holder)" "app")))
+((var-deref "jolt.backend-scheme" "set-direct-link!") #f)
+(ok "do-spliced literal is named under direct-link"
+    (string-prefix? (or (closure-name dl-closure) "") "jfn$app$$"))
+(ok "do-spliced literal is registered"
+    (and (closure-name dl-closure) (image-fn-form-lookup (closure-name dl-closure)) #t))
+
+;; --- non-def literals: the counter is per NAMESPACE, not per top-level form.
+;; Per form, every deftype method body and every defmethod in a namespace was
+;; jfn$<ns>$$0 and the registrations overwrote each other -- an image restore
+;; of one such closure came back with the LAST form's source.
+(define anon-a (jolt-eval "(let [f (fn [x] (* x 2))] f)" "app2"))
+(define anon-b (jolt-eval "(let [f (fn [x] (* x 3))] f)" "app2"))
+(ok "two top-level forms' literals have distinct names"
+    (and (closure-name anon-a) (closure-name anon-b)
+         (not (string=? (closure-name anon-a) (closure-name anon-b)))))
+(ok "...and both registrations survive"
+    (and (closure-name anon-a) (closure-name anon-b)
+         (image-fn-form-lookup (closure-name anon-a))
+         (image-fn-form-lookup (closure-name anon-b))
+         (string=? (reg-form-head (closure-name anon-a)) "fn*")
+         #t))
+
 (printf "\nfnform gate: ~a/~a passed\n" (- total fails) total)
 (exit (if (> fails 0) 1 0))

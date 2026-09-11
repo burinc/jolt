@@ -215,6 +215,20 @@
 (defn set-direct-link! [on] (reset! (:direct-link? (cur)) (boolean on)))
 (defn- direct-link? [] @(:direct-link? (cur)))
 
+;; SEED-MINT MODE. bootstrap.ss mints clojure.core and the compiler with
+;; direct-link ON — a core->core call applies the callee's jv$ binding, one
+;; top-level load in place of var-cell-deref + jolt-invokeN — and this flag says
+;; the emission is the SEED, which differs from a `jolt build` in two ways:
+;; a top-level def is bound with def-var-linked! (rt.ss), which keeps the var's
+;; root and the jv$ binding one value under redefinition, and the seed-callable
+;; arm of emit-invoke is off, because the seed vars that arm would hoist are the
+;; ones being emitted. Nothing is spliced: the inline pass reads the host
+;; contract's direct-link flag, which the mint leaves off, so a minted core is
+;; direct-called and still redefinable, as JVM Clojure's direct-linked core is
+;; not.
+(defn set-seed-mint! [on] (reset! (:seed-mint? (cur)) (boolean on)))
+(defn- seed-mint? [] @(:seed-mint? (cur)))
+
 ;; Fully-qualified app var names ("ns/name") already emitted with a direct-link
 ;; binding in the current unit; and, of those, the ones whose init is a fn literal
 ;; (safe to call as a raw Scheme application — a non-fn value is invokable in Clojure
@@ -1250,11 +1264,16 @@
     ;; a quoted custom #tag with no registered reader -> a tagged-literal value
     ;; (Clojure's reader builds a TaggedLiteral), not the raw reader map. The tag is
     ;; stored as a :#name keyword; strip the leading # to the bare symbol.
+    ;; stored as a :#name / :#ns/name keyword; form-tag-name is the tag as written,
+    ;; and a qualified one is a QUALIFIED symbol (a quoted #foo/bar used to come
+    ;; back as the bare symbol named "foo/bar").
     (and (map? form) (= :jolt/tagged (get form :jolt/type)))
-    (let [nm (name (get form :tag))
-          tsym (if (= \# (first nm)) (subs nm 1) nm)]
-      (q-intern (str "(jolt-tagged-literal (jolt-symbol #f " (chez-str-lit tsym) ") "
-                     (emit-quoted (get form :form)) ")")))
+    (let [tag (jolt.host/form-tag-name form)
+          i (str/index-of tag "/")
+          tns (when i (subs tag 0 i))
+          tn (if i (subs tag (inc i)) tag)]
+      (q-intern (str "(jolt-tagged-literal (jolt-symbol " (if tns (chez-str-lit tns) "#f") " "
+                     (chez-str-lit tn) ") " (emit-quoted (get form :form)) ")")))
     ;; plain jolt VALUES (metadata maps and anything nested in them)
     (map? form) (emit-quoted-map-value form)
     (vector? form) (q-intern (str "(jolt-vector " (str/join " " (map emit-quoted form)) ")"))
@@ -1930,25 +1949,39 @@
 
 ;; The globally unique letrec name for the next anon literal:
 ;; jfn$<munged-ns>$<munged-def>$<counter> (counter per top-level def);
-;; literals outside any def use jfn$<munged-ns>$$<counter> (counter per
-;; top-level form). Deterministic: same source emits the same names.
+;; literals outside any def use jfn$<munged-ns>$$<counter>, with the counter
+;; per NAMESPACE for the life of the process. Per top-level form, every
+;; deftype method body and every defmethod in a namespace started at $$0 and
+;; their registrations (keyed by name) overwrote each other, so an image
+;; restore of one such closure came back with the LAST form's source.
+;; Deterministic still: one mint or build emits a namespace's forms in source
+;; order, so the same source emits the same names.
+(def ^:private fnsrc-ns-counters (atom {}))
 (defn- fnsrc-name []
   (str "jfn$" (munge-name *fnsrc-ns*)
        (if *fnsrc-def* (str "$" (munge-name *fnsrc-def*) "$") "$$")
-       (let [n @*fnsrc-counter*] (swap! *fnsrc-counter* inc) n)))
+       (if *fnsrc-def*
+         (let [n @*fnsrc-counter*] (swap! *fnsrc-counter* inc) n)
+         (let [k (str *fnsrc-ns*)
+               n (get @fnsrc-ns-counters k 0)]
+           (swap! fnsrc-ns-counters assoc k (inc n))
+           n))))
 
 ;; A top-level form's collected anon-fn registrations as Scheme siblings:
-;;   (image-register-fn-form! "jfn$…" <quoted fn* form> "ns" <quoted free names>)
-;; "" when the namespace is system or nothing was collected, so the seed mint
-;; and any fn-free def emit byte-identically.
+;;   (image-register-fn-form! "jfn$..." (image-fn-form-src "<source text>") "ns" <quoted free names>)
+;; "" when the namespace is system or nothing was collected, so any fn-free def
+;; emits byte-identically.
 ;;
-;; Emitted under a *quote-pool*, which is what keeps this linear. The rows are in
-;; innermost-first order (emit-fn conjes after emitting the body), so a nested
-;; literal's construction is already interned by the time its enclosing literal is
-;; assembled, and the enclosing one costs its own arity instead of its whole
-;; subtree. Without it a chain of N nested literals emitted O(N^2) text — see the
-;; pool comment at emit-quoted. The bindings come out in dependency order for the
-;; same reason, so let* binds them in one pass.
+;; The form travels as SOURCE TEXT, not as a quoted construction. A construction
+;; is a let* of jolt-symbol/jolt-list/jolt-vector calls that runs at every
+;; process start and sits in the compiled runtime as code; the text is a
+;; bytevector constant the registry parses on the first lookup, which only the
+;; image writer ever makes (fn-form-registry.ss image-fn-form-src). Rendered by
+;; fnsrc-src and CHECKED, per row, to read back to the construction it replaces;
+;; a form that does not (a live class value a macro spliced in has no reader
+;; syntax) keeps the construction, emitted under the *quote-pool* as before --
+;; interned so a chain of N nested literals costs O(N) text, bound by one let*
+;; header around the row calls (see the pool comment at emit-quoted).
 ;;
 ;; A row that throws leaves whatever it interned before throwing in the pool, so
 ;; the let* can carry a binding nothing references. Dead, valid, and confined to a
@@ -1990,42 +2023,101 @@
          "(image-fn-form-maker! " (chez-str-lit nm) " " v "))) "
          "(" v args "))")))
 
+;; The SOURCE TEXT of a registration's form: the syntax the raw reader
+;; (jolt.host/fn-form-parse, positions off) reads back to the form emit-quoted
+;; would have constructed. Mirrors emit-quoted branch for branch, so everything
+;; it can render has a rendering here except a live class value, which has no
+;; reader syntax. Sets and metadata maps sort by rendered text for the reason
+;; emit-quoted sorts them (the seed must not depend on host hash order); a
+;; reader-built map keeps its source order, which the reader records again.
+(declare fnsrc-src)
+(defn- fnsrc-src-items [items] (str/join " " (map fnsrc-src items)))
+(defn- fnsrc-src-map-value [m]
+  (str "{" (str/join " " (sort (map (fn [k] (str (fnsrc-src k) " " (fnsrc-src (get m k)))) (keys m)))) "}"))
+(defn- fnsrc-src [form]
+  (cond
+    (form-char? form) (pr-str form)
+    (form-literal? form) (pr-str form)
+    (form-sym? form)
+    (let [m (form-sym-meta form) sns (form-sym-ns form) nm (form-sym-name form)
+          s (if sns (str sns "/" nm) nm)]
+      ;; the meta map renders like any map: a reader-built one in source order
+      ;; (which is how emit-quoted carries it), a plain value sorted
+      (if (and m (pos? (count m)))
+        (str "^" (fnsrc-src m) " " s)
+        s))
+    (form-set? form) (str "#{" (str/join " " (sort (map fnsrc-src (form-set-items form)))) "}")
+    (form-list? form) (str "(" (fnsrc-src-items (form-elements form)) ")")
+    (form-vec? form) (str "[" (fnsrc-src-items (form-vec-items form)) "]")
+    (form-map? form)
+    (str "{" (str/join " " (map (fn [p] (str (fnsrc-src (nth p 0)) " " (fnsrc-src (nth p 1))))
+                                (form-map-pairs form))) "}")
+    (form-regex? form) (str "#\"" (form-regex-source form) "\"")
+    (form-inst? form) (str "#inst " (pr-str (form-inst-source form)))
+    (form-class-value? form) (throw (ex-info "fnsrc-src: a class value has no reader syntax" {}))
+    (form-uuid? form) (str "#uuid " (pr-str (form-uuid-source form)))
+    (form-bigdec? form) (str (form-bigdec-source form) "M")
+    (and (map? form) (= :jolt/tagged (get form :jolt/type)))
+    (str "#" (jolt.host/form-tag-name form) " " (fnsrc-src (get form :form)))
+    (map? form) (fnsrc-src-map-value form)
+    (vector? form) (str "[" (fnsrc-src-items form) "]")
+    (set? form) (str "#{" (str/join " " (sort (map fnsrc-src form))) "}")
+    (seq? form) (str "(" (fnsrc-src-items form) ")")
+    :else (throw (ex-info (str "fnsrc-src: no source rendering for " (pr-str form)) {}))))
+
+;; A registration's form argument as text, (image-fn-form-src "..."), or nil when
+;; the form has no rendering that reads back to the same construction -- checked
+;; here against the very parse the registry runs, so a mismatch falls back to
+;; the construction instead of registering a different form.
+(defn- fnsrc-row-src [form]
+  (try
+    (let [s (fnsrc-src form)
+          same? (binding [*quote-pool* nil *quote-shared* nil]
+                  (= (emit-quoted (jolt.host/fn-form-parse s)) (emit-quoted form)))]
+      (when same? (str "(image-fn-form-src " (chez-str-lit s) ")")))
+    (catch Exception _ nil)))
+
 (defn- fnsrc-flush []
   (if (or (fnsrc-system-ns? *fnsrc-ns*) (empty? @*fnsrc-regs*))
     ""
     ;; best-effort: a macro can splice a LIVE value (a namespace, a var's
     ;; value) into a fn body, and emit-quoted has no rendering for those.
-    ;; Such a literal just goes unregistered — its closure refuses at dump
-    ;; like any other unregistered fn — rather than failing the whole
+    ;; Such a literal just goes unregistered -- its closure refuses at dump
+    ;; like any other unregistered fn -- rather than failing the whole
     ;; compilation of code that never dumps anything.
     (let [pool (atom {:by-expr {} :order []})
-          ;; the rows in order, each emitted with every EARLIER row available to
-          ;; stop the walk at (see *quote-shared*). Innermost first, so a nested
-          ;; literal is always already there by the time its parent is emitted.
-          ;; reduce and not map: each row's emission depends on the ones before it.
+          call (fn [nm f ns frees lives]
+                 (str "(image-register-fn-form! " (chez-str-lit nm) " " f " " (chez-str-lit ns) " "
+                      (emit-quoted frees)
+                      ;; the optional 5th argument, emitted only when the copy's
+                      ;; captures differ from the source names -- so every
+                      ;; un-spliced registration stays byte-identical.
+                      (if lives (str " " (emit-quoted lives)) "")
+                      ")"))
+          ;; the rows in order. A text row touches no pool; a constructed one is
+          ;; emitted with every EARLIER constructed row available to stop the walk
+          ;; at (see *quote-shared*). Innermost first, so a nested literal is
+          ;; already there by the time its parent is emitted. reduce and not map:
+          ;; each row's emission depends on the ones before it.
           out (binding [*quote-pool* pool]
                 (reduce
                  (fn [acc row]
                    (let [nm (nth row 0) form (nth row 1) ns (nth row 2) frees (nth row 3)
-                         ;; the optional 5th argument, emitted only when the copy's
-                         ;; captures differ from the source names — so every
-                         ;; un-spliced registration stays byte-identical.
                          lives (nth row 4)
                          lives (when (and lives (not= lives frees)) lives)
-                         q (try
-                             (binding [*quote-shared* (:shared acc)]
-                               (let [f (emit-quoted form)]
-                                 [f (str "(image-register-fn-form! " (chez-str-lit nm) " "
-                                         f " " (chez-str-lit ns) " "
-                                         (emit-quoted frees)
-                                         (if lives (str " " (emit-quoted lives)) "")
-                                         ")")]))
-                             (catch Exception _ nil))]
-                     (if (nil? q)
-                       acc
-                       (-> acc
-                           (update :calls conj (nth q 1))
-                           (update :shared conj [form (nth q 0)])))))
+                         src (fnsrc-row-src form)
+                         q (if src
+                             [nil (binding [*quote-pool* nil] (call nm src ns frees lives))]
+                             (try
+                               (binding [*quote-shared* (:shared acc)]
+                                 (let [f (emit-quoted form)] [f (call nm f ns frees lives)]))
+                               (catch Exception _ nil)))]
+                     (cond
+                       (nil? q) acc
+                       (nil? (nth q 0)) (update acc :calls conj (nth q 1))
+                       :else (-> acc
+                                 (update :calls conj (nth q 1))
+                                 (update :shared conj [form (nth q 0)])))))
                  {:calls [] :shared []}
                  @*fnsrc-regs*))
           calls (:calls out)
@@ -2740,12 +2832,21 @@
       ;; jolt.host/seed-callable? applies the same closed-world rule an app def
       ;; gets (not ^:dynamic/^:redef, not redefined by the app) plus "root is a
       ;; procedure whose arity mask admits this arity", so a keyword/map/multi-
-      ;; method-valued var and a wrong-arity call keep jolt-invoke below. A later
-      ;; alter-var-root / with-redefs of such a var is invisible to this site,
-      ;; exactly as under the JVM's direct linking; `jolt run` never direct-links.
-      (and (= :var (:op fnode)) (direct-link?)
+      ;; method-valued var and a wrong-arity call keep jolt-invoke below.
+      ;; seed-callable? answers the callee's jv$ binding name for a var the seed
+      ;; minted direct-linked (def-var-linked!), and the site applies that
+      ;; top-level variable: the same one load, and a later def / alter-var-root
+      ;; / with-redefs of the var writes through to it (rt.ss var-root-set!), so
+      ;; the site follows a redefinition. A seed var the runtime defined itself
+      ;; (a Scheme def-var!) has no binding to name; its root is hoisted once at
+      ;; load, and a redefinition is invisible to that site, as under the JVM's
+      ;; direct linking. `jolt run` never direct-links. Off while MINTING the
+      ;; seed: the vars this arm would bind are the ones being emitted.
+      (and (= :var (:op fnode)) (direct-link?) (not (seed-mint?))
            (seed-callable? nil (:ns fnode) (:name fnode) (count args)))
-      (order-args (fn [as] (emit-call tail? (hoist-seed-root (:ns fnode) (:name fnode)) as tl ich)))
+      (let [sc (seed-callable? nil (:ns fnode) (:name fnode) (count args))
+            head (if (string? sc) sc (hoist-seed-root (:ns fnode) (:name fnode)))]
+        (order-args (fn [as] (emit-call tail? head as tl ich))))
        ;; record ctor with matching arity: inline the native per-arity ctor
        ;; (make-jrecN) directly — desc + ext + one inline slot per field —
        ;; eliminating jolt-invoke / var-deref / rest-list / ctor call / hashtable
@@ -3296,7 +3397,9 @@
         ;; takes that name. Register under whichever Chez will report.
         pos (:pos node)
         frame-name (when fn? (if-let [fnm (:name (:init node))] (munge-name fnm) b))
-        reg (when (and dl? fn? pos)
+        ;; Not in the seed mint: a registration carries the def's file, and the
+        ;; seed must not bake this machine's paths (a core frame prints by name).
+        reg (when (and dl? fn? pos (not (seed-mint?)))
               (str " (jolt-register-source! " (chez-str-lit frame-name) " "
                    (chez-str-lit ns) " " (chez-str-lit nm) " "
                    (if (get pos :file) (chez-str-lit (get pos :file)) "jolt-nil") " "
@@ -3336,6 +3439,17 @@
     ;; init (or a form evaluated right after in the same top-level do) may dump a
     ;; closure the init just created.
     (cond
+      ;; the seed mint: a LINKED def. def-var-linked! binds the var the way
+      ;; def-var-with-meta!/def-var-plain! do and records the jv$ symbol with a
+      ;; setter over it, so a later def / alter-var-root of the var writes the
+      ;; new root through to the binding every direct call site applies (rt.ss
+      ;; var-root-set!). That is what keeps a direct-linked core redefinable.
+      (and dl? (seed-mint?))
+      (str "(begin" freg " (define " b " " init ") (def-var-linked! "
+           (chez-str-lit ns) " " (chez-str-lit nm) " '" b " " b
+           " (lambda (v) (set! " b " v)) "
+           (if (jmeta-nonempty? (:meta node)) (emit-def-meta node) "#f") ")"
+           (or vreg "") creg ")")
       dl?
       (if (jmeta-nonempty? (:meta node))
         (str "(begin" freg " (define " b " " init ") (def-var-with-meta! "
@@ -3363,7 +3477,13 @@
 (defn emit-top-form
   ([node] (emit-top-form node nil))
   ([node fnsrc-def]
-  (binding [*fnsrc-ns* (or (:ns node) (:fnsrc-ns node))
+  ;; A statement of a top-level do (the direct-link arm below re-enters here
+  ;; per statement) carries no :ns and no :fnsrc-ns of its own -- the analyzer
+  ;; stamps only the top-level node -- so it inherits the enclosing binding.
+  ;; Rebound to nil, every fn literal in a non-def statement (a deftype method
+  ;; body, a defmethod's fn) was emitted unnamed and unregistered, and a reify
+  ;; instance holding one refused to dump.
+  (binding [*fnsrc-ns* (or (:ns node) (:fnsrc-ns node) *fnsrc-ns*)
             ;; :defmacro too, not just :def. Without it every defmacro in a
             ;; namespace emits its expander under jfn$<ns>$$<n> with the counter
             ;; restarting per top-level form, so sibling macros all claim

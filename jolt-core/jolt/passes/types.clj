@@ -94,6 +94,7 @@
    ;; whole compilation context is one value and nothing is process-global.
    :prelude-mode? (atom false)
    :direct-link? (atom false)
+   :seed-mint? (atom false)
    :var-cache? (atom false)
    :target (atom :chez)
    :trace-frames? (atom false)

@@ -73,14 +73,18 @@
 ;; EDN strict mode (clojure.edn): auto-resolved keywords are invalid, and each
 ;; discarded (#_) form is handed to rdr-discard-cb so the edn layer validates
 ;; its tagged elements through :readers/:default like the JVM.
-(define rdr-edn-mode (make-parameter #f))
-(define rdr-discard-cb (make-parameter #f))
+;; Thread parameters, these and the two below: a plain parameter is one value
+;; shared by every thread, so an edn read on one thread put every other
+;; thread's reader into edn mode for its duration, and a #$ interpolation
+;; dropped the positions off the lists another thread was loading just then.
+(define rdr-edn-mode (make-thread-parameter #f))
+(define rdr-discard-cb (make-thread-parameter #f))
 ;; Scan mode: reading source BEFORE any namespace is loaded (the build's
 ;; require scanner). An auto keyword whose alias isn't registered yet can't
 ;; resolve — in scan mode keep the alias text as the keyword's ns instead of
 ;; erroring; the scanner only extracts require clauses and discards every
 ;; other form, so the placeholder value is never observed.
-(define rdr-scan-mode (make-parameter #f))
+(define rdr-scan-mode (make-thread-parameter #f))
 ;; Suppress the :line/:column/:file metadata a list form carries. Set while
 ;; reading a form out of a string that is NOT the source being read — the
 ;; ~(…) inside a #$ interpolation, whose offsets are into the string literal.
@@ -88,7 +92,15 @@
 ;; interpolated form, and would thrash rdr-line-col-at's per-string cursor back
 ;; and forth between the two strings. With no position of its own the form
 ;; inherits the enclosing form's, which is the right answer.
-(define rdr-suppress-pos (make-parameter #f))
+(define rdr-suppress-pos (make-thread-parameter #f))
+;; Chez copies thread parameters at fork, so a thread forked from inside a read
+;; -- an edn :readers fn that sends to an agent, spawns the first fiber, starts
+;; a future -- inherits the switches of a read it is not part of, and a pooled
+;; thread (an agent worker, a fiber carrier) keeps them for the rest of its
+;; life. Every thread jolt forks resets them first (java/concurrency.ss,
+;; fibers.ss): the switches describe the read in progress on the FORKING thread.
+(define (rdr-default-modes!)
+  (rdr-edn-mode #f) (rdr-discard-cb #f) (rdr-scan-mode #f) (rdr-suppress-pos #f))
 
 (define (rdr-skip-ws s i end)
   (let loop ((i i))

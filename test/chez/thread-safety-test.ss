@@ -631,6 +631,75 @@
 (ok "12. its body ran exactly once" (and (= 1 ts12-lruns) (= 4 (seq-first (force-lazyseq ts12-node)))))
 (ok "12. and its claim is released" (not (jolt-lazyseq-lock ts12-node)))
 
+;; 13. The reader's mode switches are per-thread. rdr-edn-mode, rdr-discard-cb,
+;; rdr-scan-mode and rdr-suppress-pos were plain parameters, which Chez shares
+;; across threads: an edn read on one thread put every other thread's reader
+;; into edn mode for its duration, and a #$ interpolation dropped the positions
+;; off the lists another thread was loading at that moment. The holder thread
+;; sits inside its parameterize while this thread reads.
+(define ts13-mu (make-mutex))
+(define ts13-cv (make-condition))
+(define ts13-state 'start)
+(fork-thread
+  (lambda ()
+    (parameterize ((rdr-edn-mode #t) (rdr-suppress-pos #t) (rdr-scan-mode #t))
+      (with-mutex ts13-mu
+        (set! ts13-state 'held)
+        (condition-broadcast ts13-cv)
+        (let wait () (unless (eq? ts13-state 'release) (condition-wait ts13-cv ts13-mu) (wait)))))))
+(with-mutex ts13-mu
+  (let wait () (unless (eq? ts13-state 'held) (condition-wait ts13-cv ts13-mu) (wait))))
+(ok "13. another thread's edn-mode read leaves this thread's reader alone"
+    (not (or (rdr-edn-mode) (rdr-scan-mode) (rdr-suppress-pos))))
+(ok "13. ...so a list read here still carries its position"
+    (let-values (((form j) (rdr-read-top "(f x)" 0 5)))
+      (not (jolt-nil? (jolt-get (jolt-meta form) (keyword #f "line") jolt-nil)))))
+(with-mutex ts13-mu (set! ts13-state 'release) (condition-broadcast ts13-cv))
+
+;; 14. A linked var's root and its jv$ binding are ONE value (rt.ss
+;; var-root-set!). The cell is written and then the value handed to the setter;
+;; without the two writes being one critical section a writer racing a writer
+;; of the same var interleaves into root=f2 / binding=f1 -- direct callers on
+;; one fn, var-routed callers on the other, for good. The reader holds
+;; var-linked-mu, so it sees a consistent pair when and only when the writers
+;; hold it too.
+(define ts14-binding 'init)
+(define ts14-cell
+  (def-var-linked! "thread-safety-test" "ts14" 'jv$thread-safety-test$ts14 'init
+                   (lambda (v) (set! ts14-binding v)) #f))
+(define ts14-mismatches
+  (let* ((writers 3) (iters 30000)
+         (done (make-mutex)) (cv (make-condition)) (left writers))
+    (do ((t 0 (fx+ t 1))) ((fx=? t writers))
+      (fork-thread
+        (lambda ()
+          (do ((i 0 (fx+ i 1))) ((fx=? i iters))
+            (var-root-set! ts14-cell (cons t i)))
+          (with-mutex done (set! left (fx- left 1)) (condition-broadcast cv)))))
+    (let loop ((i 0) (bad 0))
+      (if (fx=? i iters)
+          (begin
+            (with-mutex done
+              (let wait () (unless (fx=? left 0) (condition-wait cv done) (wait))))
+            bad)
+          (loop (fx+ i 1)
+                (if (with-mutex var-linked-mu
+                      (eq? (var-cell-root ts14-cell) ts14-binding))
+                    bad
+                    (fx+ bad 1)))))))
+(ok "14. a linked var's root and its binding are one value under concurrent writers"
+    (fx=? ts14-mismatches 0))
+
+;; 15. A thread jolt forks starts from the DEFAULT reader modes, whatever read
+;; the forking thread is inside. Chez copies thread parameters at fork, so a
+;; future (or an agent worker, or a fiber carrier) that an edn :readers fn
+;; started inherited edn mode -- for the rest of its life, for a pooled thread.
+(define ts15-inherited
+  (parameterize ((rdr-edn-mode #t) (rdr-scan-mode #t))
+    (jolt-future-deref
+      (jolt-future-call (lambda () (or (rdr-edn-mode) (rdr-scan-mode)))))))
+(ok "15. a thread jolt forks reads in the default modes" (not ts15-inherited))
+
 (printf "\nthread-safety-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "thread-safety-test: PASS — shared side-tables under concurrency\n") (exit 0))

@@ -422,22 +422,22 @@ jolt build -m myapp.core -o myapp   # compile myapp.core's -main into ./myapp
 ./myapp arg1 arg2                   # runs anywhere; args reach -main
 ```
 
-Modes trade dynamism for speed: the default (release) build uses the proven code
-generator; `--opt` also runs the inference + inlining + scalar-replacement passes
-over the closed-world program; `--dev` is unoptimized. Numeric code unboxes to
-raw flonum/fixnum machine ops when types are proven — by whole-program inference,
-by JVM-style `^double`/`^long` hints, or by `(double x)`/`(long x)` casts where
-inference can't see. See
+Three modes trade dynamism for speed. The default (release) build direct-links
+and inlines your app's defs over a direct-linked `clojure.core`, runs
+whole-program inference, and drops the compiler when nothing in the program
+can reach `eval`; `--dev` (or `--no-direct-link`) keeps every app var
+redefinable; `--closed-world` also prunes every def `-main` cannot reach.
+Numeric code unboxes to raw flonum/fixnum machine ops when types are proven —
+by whole-program inference, by JVM-style `^double`/`^long` hints, or by
+`(double x)`/`(long x)` casts where inference can't see. See
 [Building & Running](https://jolt-lang.github.io/docs/building-and-deps.html#typed-arithmetic-and-inference).
 
-Two opt-in closed-world flags cut dispatch cost and binary size:
-
 ```bash
-jolt build -m myapp.core --direct-link   # app->app calls bind directly (no var lookup)
-jolt build -m myapp.core --tree-shake    # ship only code reachable from -main
+jolt build -m myapp.core --closed-world  # ship only code reachable from -main
 ```
 
-`--tree-shake` walks the call graph across your app, its libraries, and
+`--closed-world` (`--tree-shake` is the older spelling, still accepted) walks
+the call graph across your app, its libraries, and
 `clojure.core`, drops everything unreachable from `-main`, and typically removes
 1–2 MB. It stays sound by bailing out — keeping everything, and naming the
 library responsible — when reachable code resolves vars by name at runtime
@@ -520,7 +520,7 @@ The C side `dlopen`s it, calls `jolt_library_init` once, then resolves each
 entry by name with `jolt_lookup` and casts to its type;
 [Native Interop](https://jolt-lang.github.io/docs/native-interop.html) has the
 full example, the type keywords (the same ones `foreign-fn` uses), and the
-threading limits. The same `--opt`/`--dev`/`--direct-link`/`--tree-shake` flags
+threading limits. The same `--opt`/`--dev`/`--direct-link`/`--closed-world` flags
 apply, and the same Chez kernel development files + C compiler are required to
 link.
 

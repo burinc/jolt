@@ -90,9 +90,11 @@ run_case() {
 # and still matches the plain build's output:
 #   - kept fraction: at most $shake_max_kept percent of the defs, or the 6th
 #     argument when a fixture legitimately keeps more.
-#   - the compiler image: a shake that does NOT bail always drops it (every
-#     dce-compile-ref is also a dce-bail-ref, so reaching no bail ref means
-#     reaching no compile ref either — see dce.ss), and a bail always keeps it.
+#   - the compiler image: a shake that does NOT bail drops it, unless a compile
+#     ref outside the bail set keeps it (an image write, a bare :& binding --
+#     see dce.ss dce-compile-refs; no fixture here has one), and a bail always
+#     keeps it. An allowed def that evals still BAILS: the compiler image is
+#     direct-linked against the whole core and cannot run over a shaken one.
 #
 # EXPECT_OUT ($7): a fixed string the --tree-shake build's stdout must contain —
 # for a bailing fixture, the paste-ready :allow-dynamic hint naming exactly the
@@ -160,13 +162,18 @@ run_local_case() {
     echo "    --- shake -----"; echo "$o1" | head -5
     fail=1; return
   fi
-  # Check that a def that should be pruned is indeed absent from the shaken flat.ss
+  # Check that a def that should be pruned is indeed absent from the shaken
+  # build. A core def lives in the runtime unit (runtime.ss) and an app def in
+  # flat.ss, so look in both — a grep over flat.ss alone passes for a core def
+  # whatever the shake did.
   if [ -n "$assert_missing" ]; then
     blddir="$tmp/$1-shake.build"
-    if [ -f "$blddir/flat.ss" ] && grep -q "$assert_missing" "$blddir/flat.ss" 2>/dev/null; then
-      echo "  - $1: FAIL (pruned def '$assert_missing' found in shaken flat.ss)"
-      fail=1; return
-    fi
+    for f in "$blddir/flat.ss" "$blddir/runtime.ss"; do
+      if [ -f "$f" ] && grep -q "$assert_missing" "$f" 2>/dev/null; then
+        echo "  - $1: FAIL (pruned def '$assert_missing' found in shaken $(basename "$f"))"
+        fail=1; return
+      fi
+    done
   fi
   s0="$(wc -c < "$b0")"; s1="$(wc -c < "$b1")"
   echo "  - $1: ok (output identical; $((s0/1024))K -> $((s1/1024))K)"
@@ -231,6 +238,12 @@ run_local_case allow-dynamic-app app.core "" "\"app.core\" \"dead\""
 # were honoured (neither is listed) and the non-allowed one was not let through.
 run_local_case allow-dynamic-partial-app app.core "" "" bail "" \
   ':jolt/tree-shake {:allow-dynamic [app.core/lookup]}'
+# …and :allow-dynamic vouches for a RESOLUTION only: an allowed def that EVALS
+# still bails, naming the eval and offering no allow entry for it, because the
+# compiler image is direct-linked against the whole core and cannot run over a
+# shaken one. It used to shake (and drop the compiler), and the eval died.
+run_local_case allow-dynamic-eval-app app.core "" "" bail "" \
+  "  app.core/compute -> clojure.core/eval"
 
 [ "$fail" = 0 ] && echo "shake smoke: passed" || echo "shake smoke: FAILED"
 exit $fail
