@@ -391,23 +391,35 @@
           (throw (java.io.IOException. "Broken pipe")))
         (recur (+ off s))))))
 
+(defn- write-bytes! [self bytes off len]
+  (when (pos? len)
+    (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc len)]
+      (try
+        (dotimes [i len]
+          (ffi/write buf :uint8 (bit-and (aget bytes (+ off i)) 0xff) i))
+        (send-fully! fd buf len)
+        (finally (ffi/free buf))))))
+
 (def ^:private socket-output-stream-methods
   {"write"
    (fn
+     ;; OutputStream.write has TWO one-argument overloads on the JVM: write(int)
+     ;; writes a byte, and write(byte[]) — the convenience method the abstract
+     ;; class defines as write(b, 0, b.length) — writes the array. Dispatching on
+     ;; the argument is the only way to tell them apart here, and without it a
+     ;; byte array reached (int b) and reported "class [B cannot be cast to class
+     ;; java.lang.Number", which named neither the socket nor the overload
+     ;; (jolt#954). This is the same argument-shaped dispatch io-streams.ss's
+     ;; out-stream/write does.
      ([self b]
-      (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc 1)]
-        (try
-          (ffi/write buf :uint8 (bit-and (int b) 0xff))
-          (send-fully! fd buf 1)
-          (finally (ffi/free buf)))))
-     ([self bytes off len]
-      (when (pos? len)
-        (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc len)]
+      (if (bytes? b)
+        (write-bytes! self b 0 (alength b))
+        (let [fd (jolt.host/ref-get self :fd) buf (ffi/alloc 1)]
           (try
-            (dotimes [i len]
-              (ffi/write buf :uint8 (bit-and (aget bytes (+ off i)) 0xff) i))
-            (send-fully! fd buf len)
-            (finally (ffi/free buf)))))))
+            (ffi/write buf :uint8 (bit-and (int b) 0xff))
+            (send-fully! fd buf 1)
+            (finally (ffi/free buf))))))
+     ([self bytes off len] (write-bytes! self bytes off len)))
    "flush" (fn [self] nil)
    "close" (fn [self] (socket-close! (jolt.host/ref-get self :socket)))})
 

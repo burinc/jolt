@@ -199,6 +199,49 @@
             [(= (.redirectOutput pb) java.lang.ProcessBuilder$Redirect/PIPE)
              (= (.redirectInput pb) java.lang.ProcessBuilder$Redirect/INHERIT)] [true true]))
 
+;; --- the JDK 9 File overloads (jolt-947) --------------------------------------
+;; redirectInput(File) is defined as redirectInput(Redirect.from(file)), and
+;; redirectOutput/redirectError(File) as Redirect.to(file). jolt used to STORE
+;; the File and then ignore it — proc-redir-fragment only understood a Redirect
+;; jhost — so fd 0 stayed jolt's own and a child like `cat` read the terminal
+;; forever instead of seeing EOF. That is the whole repro below: with the
+;; redirect honoured the child finishes, without it the waitFor times out.
+(check-eq "redirectInput(File) gives the child the file, not jolt's stdin"
+          (let [pb (doto (java.lang.ProcessBuilder. ["sh" "-c" "cat; echo FINISHED"])
+                     (.redirectInput (java.io.File. "/dev/null"))
+                     (.redirectErrorStream true))
+                proc (.start pb)]
+            [(.waitFor proc 10 java.util.concurrent.TimeUnit/SECONDS)
+             (.exitValue proc)
+             (str/trim (slurp (.getInputStream proc)))])
+          [true 0 "FINISHED"])
+;; the same through babashka.process's File :in, which is how the issue was hit
+(check-eq "a File :in reaches the child through babashka.process"
+          (:exit (deref (process ["sh" "-c" "cat; echo FINISHED"]
+                                 {:in (fs/file "/dev/null") :out :pipe :err :pipe})
+                        10000 {:exit :timeout}))
+          0)
+;; redirectOutput(File) truncates into the file, redirectError(File) likewise
+(let [out (fs/file (str (fs/create-temp-dir) "/out.txt"))
+      err (fs/file (str (fs/create-temp-dir) "/err.txt"))]
+  (.waitFor (.start (doto (java.lang.ProcessBuilder. ["sh" "-c" "echo TO-OUT; echo TO-ERR 1>&2"])
+                      (.redirectOutput out)
+                      (.redirectError err))))
+  (check-eq "redirectOutput(File) / redirectError(File) write the files"
+            [(str/trim (slurp out)) (str/trim (slurp err))] ["TO-OUT" "TO-ERR"]))
+;; a File setter reads back as a Redirect, not as the File — the JDK's getter
+;; answers Redirect.from/to(file), so .type is what distinguishes them
+(let [pb (doto (java.lang.ProcessBuilder. ["true"])
+           (.redirectInput (java.io.File. "/dev/null"))
+           (.redirectOutput (java.io.File. "/dev/null")))]
+  (check-eq "a File setter reads back as a Redirect"
+            [(.type (.redirectInput pb)) (.type (.redirectOutput pb))] ["read" "write"]))
+;; anything that is neither says so, instead of being stored and ignored
+(check-eq "a non-file, non-Redirect argument is named"
+          (try (.redirectInput (java.lang.ProcessBuilder. ["true"]) 42) :no-throw
+               (catch IllegalArgumentException e (str/includes? (ex-message e) "redirectInput")))
+          true)
+
 ;; --- fd-level INHERIT ---------------------------------------------------------
 ;; Redirect.INHERIT hands the child jolt's REAL fds (posix_spawn leaves 0/1/2
 ;; untouched), not a pump-fed pipe. Two things only real inheritance can do:

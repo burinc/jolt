@@ -674,6 +674,13 @@
 (jch-register-supers! "java.net.MalformedURLException" '("java.io.IOException"))
 (jch-register-supers! "java.net.URISyntaxException" '("java.lang.Exception"))
 (jch-register-supers! "javax.net.ssl.SSLException" '("java.io.IOException"))
+;; java.net.http: the two exceptions a java.net.http caller raises or matches on.
+;; Both are plain IOException subclasses on the JDK, and host-static-classes.ss's
+;; ctor sweep derives (HttpTimeoutException. "msg") from these rows — the class
+;; token already resolved and catch already matched, so only construction was
+;; missing (jolt#950).
+(jch-register-supers! "java.net.http.HttpTimeoutException" '("java.io.IOException"))
+(jch-register-supers! "java.net.http.HttpConnectTimeoutException" '("java.net.http.HttpTimeoutException"))
 (jch-register-supers! "java.nio.charset.UnsupportedCharsetException" '("java.lang.IllegalArgumentException"))
 (jch-register-supers! "java.nio.charset.IllegalCharsetNameException" '("java.lang.IllegalArgumentException"))
 (jch-register-supers! "java.io.CharConversionException" '("java.io.IOException"))
@@ -790,6 +797,15 @@
 (jch-register-supers! "java.net.URI" '())
 (jch-register-supers! "java.util.ArrayList" '("java.util.List" "java.util.RandomAccess"))
 (jch-register-supers! "java.util.Queue" '("java.util.Collection"))
+;; the two blocking queues concurrency.ss models: without a row here they were
+;; no BlockingQueue, Queue or Collection to instance?, so a (satisfies-ish) check
+;; a port makes before .put/.take refused the real thing
+(jch-register-supers! "java.util.concurrent.BlockingQueue" '("java.util.Queue"))
+(jch-register-supers! "java.util.AbstractQueue" '("java.util.AbstractCollection" "java.util.Queue"))
+(jch-register-supers! "java.util.concurrent.ArrayBlockingQueue"
+  '("java.util.AbstractQueue" "java.util.concurrent.BlockingQueue" "java.io.Serializable"))
+(jch-register-supers! "java.util.concurrent.LinkedBlockingQueue"
+  '("java.util.AbstractQueue" "java.util.concurrent.BlockingQueue" "java.io.Serializable"))
 (jch-register-supers! "java.util.Deque" '("java.util.Queue" "java.util.SequencedCollection"))
 (jch-register-supers! "java.util.LinkedList" '("java.util.List" "java.util.Deque"))
 (jch-register-supers! "java.util.ArrayDeque" '("java.util.Deque"))
@@ -1052,6 +1068,7 @@
 (for-each (lambda (p) (hashtable-set! jhost-tag->fqn (car p) (cdr p)))
   '(("user-thread" . "java.lang.Thread")
     ("abq" . "java.util.concurrent.ArrayBlockingQueue")
+    ("lbq" . "java.util.concurrent.LinkedBlockingQueue")
     ("future-task" . "java.util.concurrent.FutureTask")
     ;; Executors' pools are ThreadPoolExecutors on the JVM too, and what their
     ;; submit returns is a FutureTask — the same class the "future-task" tag

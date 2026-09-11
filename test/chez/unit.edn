@@ -247,6 +247,29 @@
   {:suite "hostctor" :expr "(nil? (.getHost (java.net.URI. \"/rel/path\")))" :expected "true"}
   {:suite "hostctor" :expr "(str (java.net.URI. \"http://x/y\"))" :expected "\"http://x/y\""}
   {:suite "hostctor" :expr "(instance? java.net.URI (java.net.URI. \"/x\"))" :expected "true"}
+  ;; An arity java.net.URI has no constructor for. JVM Clojure's reflector says
+  ;; exactly this, but it says it at COMPILE time, so the case cannot be a corpus
+  ;; row. jolt used to let the call reach the registered 1-arg ctor and report
+  ;; Chez's "incorrect number of arguments 5 to #object[clojure.lang.AFunction...]",
+  ;; which named an anonymous function instead of the class (jolt#949).
+  {:suite "hostctor" :expr "(try (java.net.URI. \"https\" \"//x.example/a\") :no-throw (catch IllegalArgumentException e (ex-message e)))" :expected "\"No matching ctor found for class java.net.URI\""}
+  {:suite "hostctor" :expr "(try (java.net.URI. \"a\" \"b\" \"c\" \"d\" \"e\" \"f\") :no-throw (catch IllegalArgumentException e (ex-message e)))" :expected "\"No matching ctor found for class java.net.URI\""}
+  ;; java.net.URI.resolve / normalize / relativize — RFC 2396 §5.2 as the JDK does
+  ;; it (a base with an authority and no path merges as "/", the JDK-20 rule), a
+  ;; kept segment keeps the slash that followed it, and a URI is Comparable.
+  ;; Every expected value is the JVM's (OpenJDK 20).
+  {:suite "uri / resolve" :expr "(let [b (java.net.URI. \"https://u@h.com:8080/a/b/c?q=1#f\")] (mapv #(str (.resolve b %)) [\"d\" \"../d\" \"../../../d\" \"/x\" \"//other.com/p\" \"http://z/p\" \"?q2\" \"#g\" \"\" \"d/\" \".\" \"..\" \"mailto:a@b\" \"g;x=1/../y\"]))"
+   :expected "[\"https://u@h.com:8080/a/b/d\" \"https://u@h.com:8080/a/d\" \"https://u@h.com:8080/../d\" \"https://u@h.com:8080/x\" \"https://other.com/p\" \"http://z/p\" \"https://u@h.com:8080/a/b/?q2\" \"https://u@h.com:8080/a/b/c?q=1#g\" \"https://u@h.com:8080/a/b/\" \"https://u@h.com:8080/a/b/d/\" \"https://u@h.com:8080/a/b/\" \"https://u@h.com:8080/a/\" \"mailto:a@b\" \"https://u@h.com:8080/a/b/y\"]"}
+  {:suite "uri / resolve" :expr "[(mapv #(str (.resolve (java.net.URI. \"https://h.com\") %)) [\"a\" \"?q\" \"\"]) (mapv #(str (.resolve (java.net.URI. \"a/b/c\") %)) [\"d\" \"../../../d\" \"x:y\"]) (str (.resolve (java.net.URI. \"mailto:a@b\") \"x\")) (str (.resolve (java.net.URI. \"https://h.com/a/b/c#f\") \"#f\"))]"
+   :expected "[[\"https://h.com/a\" \"https://h.com?q\" \"https://h.com\"] [\"a/b/d\" \"../d\" \"x:y\"] \"x\" \"https://h.com/a/b/c#f\"]"}
+  {:suite "uri / resolve" :expr "(mapv #(str (.normalize (java.net.URI. %))) [\"https://h.com/a/./b/../c\" \"https://h.com/a/b/..\" \"https://h.com/a/b/.\" \"/../a\" \"a/../b\" \"x:y/../z\" \"./a:b\" \"https://h.com/a//b/./c\" \"/a/b/../../..\" \"a/..\" \"..\"])"
+   :expected "[\"https://h.com/a/c\" \"https://h.com/a/\" \"https://h.com/a/b/\" \"/../a\" \"b\" \"x:y/../z\" \"./a:b\" \"https://h.com/a/b/c\" \"/..\" \"\" \"..\"]"}
+  {:suite "uri / resolve" :expr "(let [b (java.net.URI. \"https://h.com/a/b/\")] [(mapv #(str (.relativize b (java.net.URI. %))) [\"https://h.com/a/b/c/d\" \"https://h.com/a/b/\" \"https://h.com/a/x\" \"http://h.com/a/b/c\" \"https://h.com/a/b/c?q#f\" \"https://h.com/a/bc/d\"]) (str (.relativize (java.net.URI. \"HTTPS://h.com/a/\") (java.net.URI. \"https://h.com/a/z\"))) (mapv #(.isOpaque (java.net.URI. %)) [\"mailto:a@b\" \"https://h.com/p\" \"/rel\"]) (mapv #(compare (java.net.URI. \"https://a\") (java.net.URI. %)) [\"https://a\" \"https://b\"]) (mapv str (sort [(java.net.URI. \"https://c\") (java.net.URI. \"https://a\")]))])"
+   :expected "[[\"c/d\" \"\" \"https://h.com/a/x\" \"http://h.com/a/b/c\" \"c?q#f\" \"https://h.com/a/bc/d\"] \"z\" [true false false] [0 -1] [\"https://a\" \"https://c\"]]"}
+  ;; the blocking queues' Collection half: add is offer-or-throw, and contains /
+  ;; iterator / seq / toArray walk a snapshot; and they ARE BlockingQueues.
+  {:suite "hostctor" :expr "(let [q (java.util.concurrent.LinkedBlockingQueue. [1 2 3])] [(.add q 4) (.contains q 2) (.contains q 9) (vec (iterator-seq (.iterator q))) (vec (seq q)) (count q) (vec (.toArray q)) (instance? java.util.concurrent.BlockingQueue q) (instance? java.util.Collection q) (try (.add (doto (java.util.concurrent.ArrayBlockingQueue. 1) (.add 1)) 2) :no-throw (catch IllegalStateException e (ex-message e)))])"
+   :expected "[true true false [1 2 3 4] [1 2 3 4] 4 [1 2 3 4] true true \"Queue full\"]"}
   {:suite "hostctor" :expr "(let [a (java.util.ArrayList.)] (.add a 1) (.add a 2) (.add a 3) (.remove a 0) [(.size a) (vec (.toArray a))])" :expected "[2 [2 3]]"}
   {:suite "hostctor" :expr "(let [a (java.util.ArrayList. [1 2]) out (.toArray a)] [(instance? (Class/forName \"[Ljava.lang.Object;\") out) (vec out)])" :expected "[true [1 2]]"}
   {:suite "hostctor" :expr "(let [a (java.util.ArrayList. [1 2]) dst (object-array [:old :old :keep :tail]) out (.toArray a dst)] [(identical? dst out) (vec out)])" :expected "[true [1 2 nil :tail]]"}
