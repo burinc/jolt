@@ -854,6 +854,12 @@
 ;; reader sees either the old list or the new one. The COMPILE is serialized and
 ;; re-checks the cache under the lock, so two threads meeting the same new shape
 ;; compile it once instead of racing to drop one of the two entries.
+;; The name the build's compiler verdict knows this path by (dce.ss
+;; dce-compile-refs): a program with a bare :& binding compiles here at run
+;; time, which petite cannot, so the build keeps the compiler for it. The
+;; dispatcher reaches the procedure directly; the var is its name.
+(def-var! "jolt.host" "ffi-varargs-compile" ffi-varargs-compile)
+
 (define (ffi-varargs-hit vc key)
   (let ((e (assv key (ffi-vc-entries vc)))) (and e (cdr e))))
 

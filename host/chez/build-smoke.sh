@@ -66,11 +66,21 @@ if [ "$got" != "$want" ]; then
   exit 1
 fi
 
+# The compiler verdict is taken by EVERY build now, not only a shaken one
+# (dce-needs-compiler?): this app reads images back (jolt.image/read-image
+# restores fn sources by compiling them), so its default build keeps the
+# analyzer/back end resident. The negative half — a program that reaches none
+# of that ships without them — is asserted on the data-reader app below.
+if ! grep -Eq 'def-var[a-z!-]*! "jolt.analyzer"' "$out.build/runtime.ss"; then
+  echo "  FAIL: the default build of an image-reading app dropped the compiler"; exit 1
+fi
+
 # Startup profiling is one opt-in switch on the same binary. The ordinary run
 # above is exact-output proof that it stays silent by default; an enabled run
 # spans the native heap loader, app namespace initialization, and -main.
 profiled="$(cd / && JOLT_STARTUP_PROFILE=1 "$out" alpha bb ccc 2>&1)"
 for marker in \
+  'jolt startup: [profile] native pre-main (exec+ld)' \
   'jolt startup: [profile] native Sbuild_heap' \
   'jolt startup: [profile] scheme namespace app.core' \
   'jolt startup: [profile] scheme entry -main'
@@ -472,13 +482,37 @@ fi
 
 # Optimized mode (inference + flatten + scalar-replace) must produce the same
 # result — a sanity check that the passes don't miscompile this app.
-if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out" --opt >/dev/null 2>&1; then
-  echo "  FAIL: jolt build --opt exited non-zero"; exit 1
+#
+# And release and --opt compile the runtime half IDENTICALLY (build.ss
+# bld-runtime-chez-params). The runtime-fasl cache is keyed on the Chez
+# parameters and the runtime source, so the two modes share ONE entry when
+# and only when they select the same parameters — the release row growing
+# inspector/procedure-source information back (the 2.3x-binary, 1.6x-startup
+# cost burinc/jolt#3 was about) shows up here as a second entry. Asked of a
+# fresh cache directory rather than by comparing the two build dirs' fasls:
+# with the default cache both dirs are copies of one entry, so cmp could not
+# tell the modes apart, and a fresh Chez compile is not byte-reproducible, so
+# it could not with the cache off either. $out is still the plain release build.
+modecache="$(dirname "$out")/modecache"
+if ! JOLT_PWD="$app" JOLT_RUNTIME_CACHE_DIR="$modecache" "$jolt" build -m app.core -o "$out.rel" >/dev/null 2>&1; then
+  echo "  FAIL: release build into a fresh runtime cache exited non-zero"; exit 1
 fi
-got_opt="$(cd / && "$out" alpha bb ccc 2>&1)"
+if ! JOLT_PWD="$app" JOLT_RUNTIME_CACHE_DIR="$modecache" JOLT_BUILD_PROFILE=1 "$jolt" build -m app.core -o "$out.opt" --opt 2>"$modecache/prof.log" >/dev/null; then
+  echo "  FAIL: jolt build --opt exited non-zero"
+  sed -n 's/^jolt build: \[profile\]/    /p' "$modecache/prof.log"
+  exit 1
+fi
+got_opt="$(cd / && "$out.opt" alpha bb ccc 2>&1)"
 if [ "$got_opt" != "$want" ]; then
   echo "  FAIL: --opt binary output mismatch"
   echo "--- got ----"; echo "$got_opt"
+  exit 1
+fi
+n_rt="$(ls "$modecache"/*.so 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$n_rt" != "1" ] || ! grep -q 'runtime fasl (cached)' "$modecache/prof.log"; then
+  echo "  FAIL: release and --opt compiled the runtime half differently"
+  echo "        $n_rt runtime fasl(s) in a cache both modes wrote to; --opt $(grep -q 'runtime fasl (cached)' "$modecache/prof.log" && echo reused || echo did not reuse) the release entry"
+  sed -n 's/^jolt build: \[profile\]/    /p' "$modecache/prof.log"
   exit 1
 fi
 
@@ -623,10 +657,20 @@ if ! printf '%s' "$nsp_out" | grep -q 'ns: user' \
   echo "--- got ----"; echo "$nsp_out"
   exit 1
 fi
-# Tree-shaking (opt-in): same result, and an unreachable def (the `twice` macro,
-# expanded at AOT and never called at runtime) is dropped.
-if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out" --tree-shake >/dev/null 2>&1; then
-  echo "  FAIL: jolt build --tree-shake exited non-zero"; exit 1
+# Tree-shaking (opt-in) on THIS app bails: it restores images, and a restore
+# compiles the fn sources an image carries, which can name any core var — one
+# the compiled program never reached because the inline pass spliced it away
+# at every site (a shaken build once restored a closure that called `update`
+# and died on the unbound var its own -main had used without a trace). So
+# jolt.host/image-read is a bail reference like eval: everything is kept, the
+# compiler with it, the diagnostic names the reason, and the binary restores
+# exactly what the unshaken one did.
+if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out" --tree-shake >"$out.ts.log" 2>&1; then
+  echo "  FAIL: jolt build --tree-shake exited non-zero"; cat "$out.ts.log"; exit 1
+fi
+if ! grep -q 'tree-shake skipped' "$out.ts.log" || ! grep -q 'image-read' "$out.ts.log"; then
+  echo "  FAIL: --tree-shake of an image-restoring app must bail, naming image-read"
+  cat "$out.ts.log"; exit 1
 fi
 got_ts="$(cd / && "$out" alpha bb ccc 2>&1)"
 if [ "$got_ts" != "$want" ]; then
@@ -634,16 +678,40 @@ if [ "$got_ts" != "$want" ]; then
   echo "--- got ----"; echo "$got_ts"
   exit 1
 fi
-if grep -q 'def-var! "app.util" "twice"' "$out.build/flat.ss"; then
-  echo "  FAIL: --tree-shake did not drop the unreachable twice macro"; exit 1
+if ! grep -Eq 'def-var[a-z!-]*! "jolt.analyzer"' "$out.build/runtime.ss"; then
+  echo "  FAIL: the bailed --tree-shake build dropped the compiler an image restore needs"; exit 1
 fi
-# The app never evals, so the compiler image (analyzer/back end) is dropped.
-if grep -q 'def-var! "jolt.analyzer"' "$out.build/flat.ss"; then
-  echo "  FAIL: --tree-shake kept the compiler image in a no-eval app"; exit 1
+got_ts_cl="$(cd / && "$out" --closure "$fasl" 2>&1)"
+for line in 'closure-folded: 115 115' 'closure-live: 110 110' 'img-lazy: [1 2 3 4]'; do
+  if ! printf '%s' "$got_ts_cl" | grep -qF "$line"; then
+    echo "  FAIL: the bailed --tree-shake binary could not restore an image — want '$line'"
+    echo "--- got ----"; echo "$got_ts_cl"; exit 1
+  fi
+done
+# ...and on an app that never restores one, the shake prunes: same output, the
+# unreferenced def is gone from the app half, a clojure.core overlay fn the app
+# never uses is gone from the shaken core — which is the runtime unit
+# (runtime.ss), compiled apart from the app half so it takes the runtime's
+# no-inspector parameters; flat.ss never held it — and the compiler is dropped.
+doapp="$root/test/chez/defonce-app"
+doout="$(dirname "$out")/defonce-bin"
+if ! JOLT_PWD="$doapp" "$jolt" build -m app.core -o "$doout" --tree-shake >/dev/null 2>&1; then
+  echo "  FAIL: jolt build --tree-shake of the defonce app exited non-zero"; exit 1
 fi
-# Core is shaken: a clojure.core overlay fn this app never uses is dropped.
-if grep -q 'def-var! "clojure.core" "group-by"' "$out.build/flat.ss"; then
+got_do="$(cd / && "$doout" 2>&1)"
+if [ "$got_do" != "$(printf '1\nalive')" ]; then
+  echo "  FAIL: --tree-shake defonce binary output mismatch"
+  echo "--- got ----"; echo "$got_do"; exit 1
+fi
+if grep -q '"app.core" "dead"' "$doout.build/flat.ss"; then
+  echo "  FAIL: --tree-shake did not drop the unreferenced def app.core/dead"; exit 1
+fi
+[ -f "$doout.build/runtime.ss" ] || { echo "  FAIL: --tree-shake did not emit the shaken core as its own runtime unit"; exit 1; }
+if grep -q 'def-var! "clojure.core" "group-by"' "$doout.build/runtime.ss"; then
   echo "  FAIL: --tree-shake kept an unreachable clojure.core fn (group-by)"; exit 1
+fi
+if grep -Eq 'def-var[a-z!-]*! "jolt.analyzer"' "$doout.build/runtime.ss"; then
+  echo "  FAIL: --tree-shake kept the compiler image in a no-eval app"; exit 1
 fi
 # A registered data reader that returns a CODE form must be compiled into the
 # binary (the emit path applies it too, not just the interpreted loader): the
@@ -656,6 +724,12 @@ drapp="$root/test/chez/datareader-app"
 drout="$(dirname "$out")/dr-bin"
 if ! JOLT_PWD="$drapp" "$jolt" build -m drtest.main -o "$drout" >/dev/null 2>&1; then
   echo "  FAIL: jolt build of a data-reader app exited non-zero"; exit 1
+fi
+# A program that reaches no eval, load-string or image restore ships without
+# the compiler by DEFAULT — no --tree-shake asked for. runtime.ss is where it
+# would be; the scheme.boot compiler kernel goes with it (petite-only boot).
+if grep -Eq 'def-var[a-z!-]*! "jolt.analyzer"' "$drout.build/runtime.ss"; then
+  echo "  FAIL: the default build of a no-eval app kept the compiler image"; exit 1
 fi
 got_dr="$(cd / && "$drout" 2>&1)"
 dr_want='42
@@ -782,12 +856,15 @@ fi
 # (no scheme.boot), so its libc calls through jolt-foreign-proc-safe (stat &co
 # under jolt.fs) must resolve as compiled foreign-procedures — an eval'd form
 # would silently return #f under the interpreter and the output would change.
+# Petite-only is asserted off the build's own verdict line: the self-contained
+# link path writes no compile.ss, so a grep of that file passed whatever the
+# build embedded.
 fsshake="$(dirname "$out")/fs-app-shake-bin"
-if ! JOLT_PWD="$fsapp" "$jolt" build -m fsapp.main -o "$fsshake" --tree-shake >/dev/null 2>&1; then
+if ! JOLT_PWD="$fsapp" "$jolt" build -m fsapp.main -o "$fsshake" --tree-shake >"$fsshake.log" 2>&1; then
   echo "  FAIL: jolt build --tree-shake of the jolt.fs app exited non-zero"; exit 1
 fi
-if grep -q 'scheme.boot' "$fsshake.build/compile.ss" 2>/dev/null; then
-  echo "  FAIL: tree-shaken fs app still bundles scheme.boot (petite-only boot expected)"; exit 1
+if ! grep -q '^jolt build: dropping compiler image' "$fsshake.log"; then
+  echo "  FAIL: tree-shaken fs app kept the compiler image (petite-only boot expected)"; exit 1
 fi
 got_fss="$(cd / && "$fsshake" 2>&1 | tail -1)"
 if [ "$got_fss" != "FS-APP a/b true true rw-------" ]; then
@@ -811,11 +888,11 @@ fi
 # jolt.process) must resolve as compiled foreign-procedures — an eval'd form would
 # silently return #f under the interpreter and the exit codes would be lost.
 procshake="$(dirname "$out")/process-app-shake-bin"
-if ! JOLT_PWD="$procapp" "$jolt" build -m procapp.main -o "$procshake" --tree-shake >/dev/null 2>&1; then
+if ! JOLT_PWD="$procapp" "$jolt" build -m procapp.main -o "$procshake" --tree-shake >"$procshake.log" 2>&1; then
   echo "  FAIL: jolt build --tree-shake of the jolt.process app exited non-zero"; exit 1
 fi
-if grep -q 'scheme.boot' "$procshake.build/compile.ss" 2>/dev/null; then
-  echo "  FAIL: tree-shaken process app still bundles scheme.boot (petite-only boot expected)"; exit 1
+if ! grep -q '^jolt build: dropping compiler image' "$procshake.log"; then
+  echo "  FAIL: tree-shaken process app kept the compiler image (petite-only boot expected)"; exit 1
 fi
 got_procs="$(cd / && "$procshake" 2>&1 | tail -1)"
 if [ "$got_procs" != "PROC-APP hi 0 143" ]; then
@@ -841,11 +918,11 @@ fi
 # The same ffi app tree-shaken: a petite-only boot has no compiler, so
 # errno-message's strerror defcfn must resolve as a compiled foreign-procedure.
 ffishake="$(dirname "$out")/ffi-app-shake-bin"
-if ! JOLT_PWD="$ffiapp" "$jolt" build -m ffiapp.main -o "$ffishake" --tree-shake >/dev/null 2>&1; then
+if ! JOLT_PWD="$ffiapp" "$jolt" build -m ffiapp.main -o "$ffishake" --tree-shake >"$ffishake.log" 2>&1; then
   echo "  FAIL: jolt build --tree-shake of the jolt.ffi app exited non-zero"; exit 1
 fi
-if grep -q 'scheme.boot' "$ffishake.build/compile.ss" 2>/dev/null; then
-  echo "  FAIL: tree-shaken ffi app still bundles scheme.boot (petite-only boot expected)"; exit 1
+if ! grep -q '^jolt build: dropping compiler image' "$ffishake.log"; then
+  echo "  FAIL: tree-shaken ffi app kept the compiler image (petite-only boot expected)"; exit 1
 fi
 got_ffis="$(cd / && "$ffishake" 2>&1 | tail -1)"
 if [ "$got_ffis" != "FFI-APP 8 4 4 2.5 true" ]; then
@@ -1234,4 +1311,35 @@ if [ "$got_small" != "$want" ] || [ "$got_plain" != "$want" ] || [ "$got_envplai
   exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes)"
+
+# --- the compiler verdict, per program shape ---------------------------------
+# Every build (not only --tree-shake) drops the compiler when nothing reaches
+# it. Four shapes pin the edges of "reaches": an eval in a def -main never
+# references (its init still RUNS at start, so the verdict roots every def, not
+# only -main's reach); a bare :& FFI binding, which compiles a foreign-procedure
+# per tail shape at the call and petite cannot; jolt.scheme/proc, a top-level
+# lookup that needs no compiler and so must answer from the runtime half; and
+# jolt.scheme/eval-string, which does compile. Each is its own entry namespace
+# of one fixture, so no shape masks another.
+echo "build smoke: compiler verdict (unreached eval def, bare :& ffi, jolt.scheme)"
+verdictapp="$root/test/chez/verdict-app"
+verdict_case() { # name entry-ns want-output keep|drop
+  vout="$(dirname "$out")/verdict-$1"
+  if ! JOLT_PWD="$verdictapp" "$jolt" build -m "$2" -o "$vout" >"$vout.log" 2>&1; then
+    echo "  FAIL: verdict fixture $1 ($2) did not build"; tail -5 "$vout.log"; exit 1
+  fi
+  vgot="$(cd / && "$vout" 2>&1 | tail -1)"
+  if [ "$vgot" != "$3" ]; then
+    echo "  FAIL: verdict fixture $1 — want '$3', got \`$vgot\`"; exit 1
+  fi
+  if grep -q '^jolt build: dropping compiler image' "$vout.log"; then vhad=drop; else vhad=keep; fi
+  if [ "$vhad" != "$4" ]; then
+    echo "  FAIL: verdict fixture $1 — the build should $4 the compiler, it chose $vhad"; exit 1
+  fi
+}
+verdict_case evaldef verdict.evaldef "VERDICT-EVALDEF ok" keep
+verdict_case varargs verdict.varargs "VERDICT-VARARGS ok" keep
+verdict_case sproc   verdict.sproc   "VERDICT-SPROC 42"   drop
+verdict_case seval   verdict.seval   "VERDICT-SEVAL 42"   keep
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes + compiler-verdict)"

@@ -288,7 +288,7 @@
       (let* ((old (var-cell-root v))
              (new (apply jolt-invoke f old args)))
         (iref-validate v new)
-        (var-cell-root-set! v new)
+        (var-root-set! v new)
         (var-cell-defined?-set! v #t)
         (iref-notify v old new)
         new))))

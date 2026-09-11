@@ -486,7 +486,22 @@
     ;; so a forward declaration is not a redefinition.
     (when (not (jolt-var-unbound? (var-cell-root c)))
       (hashtable-set! var-redefined-set (string-append ns "/" name) #t))
-    (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
+    (var-root-set! c v) (var-cell-defined?-set! c #t) c))
+;; Linked vars — see host/chez/rt.ss var-root-set!. The Gambit seed is minted
+;; var-routed (gen-seed.ss sets no mint flags), so nothing links here yet; the
+;; funnel is mirrored so a def-var-linked! form loads if one ever arrives.
+(define var-linked-tbl (make-eq-hashtable))
+(define (var-root-set! c v)
+  (var-cell-root-set! c v)
+  (let ((l (hashtable-ref var-linked-tbl c #f)))
+    (when l ((cdr l) v))))
+(define (var-linked-symbol c)
+  (let ((l (hashtable-ref var-linked-tbl c #f)))
+    (and l (car l))))
+(define (def-var-linked! ns name sym v setter m)
+  (let ((c (if m (def-var-with-meta! ns name v m) (def-var-plain! ns name v))))
+    (hashtable-set! var-linked-tbl c (cons sym setter))
+    c))
 ;; A def whose form declared NO metadata — see host/chez/rt.ss def-var-plain!.
 (define (def-var-plain! ns name v)
   (let ((c (def-var! ns name v))) (var-cell-dynamic?-set! c #f) c))
@@ -1284,6 +1299,9 @@
 ;; the anon-fn emission registers source forms for image closure capture — a
 ;; no-op keeps those calls inert, matching the image-off degradation.
 (define (image-register-fn-form! . _) #f)
+;; the source text a registration carries is (image-fn-form-src "..."): a
+;; bytevector constant on chez, an inert argument here
+(define (image-fn-form-src s) s)
 ;; chez's def-var! records the var name of a code value (a multimethod, a reify)
 ;; so a state image can write it as a reference. Gambit has no image, so the
 ;; registration is a no-op and nothing is ever a named code value.

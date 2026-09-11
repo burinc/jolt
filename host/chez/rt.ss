@@ -1025,9 +1025,17 @@
   (let ((r (var-cell-root cell)))
     (if (procedure? r)
         r
-        (error 'jolt-seed-root
-               (string-append "direct-linked seed var " (var-cell-ns cell) "/" (var-cell-name cell)
-                              " is not bound to a procedure in this runtime")))))
+        ;; Not bound to a procedure HERE: a var of a file this binary left out
+        ;; (jolt.host/scheme-eval-string in a build that dropped the compiler
+        ;; half), or a root some other runtime gave a value. The hoist runs when
+        ;; the REFERENCING namespace loads, and a kept def that names such a var
+        ;; without calling it has to load -- a default build prunes nothing, so
+        ;; jolt.scheme's eval-string is present in a program that only ever
+        ;; calls proc. The error moves to the call, naming the var.
+        (lambda args
+          (error 'jolt-seed-root
+                 (string-append "direct-linked seed var " (var-cell-ns cell) "/" (var-cell-name cell)
+                                " is not bound to a procedure in this runtime"))))))
 (define (var-deref ns name) (var-cell-root (jolt-var ns name)))
 ;; def-var! / declare-var! return the VAR CELL, not the value — Clojure's `def`
 ;; evaluates to #'ns/name (a first-class var), so (var? (def x 1)) is true and
@@ -1064,6 +1072,50 @@
 (define (var-redefined? ns name)
   (jolt-with-mutex var-table-mu
     (hashtable-contains? var-redefined-set (string-append ns "/" name))))
+;; --- linked vars: a root that is also a top-level Scheme binding --------------
+;; The seed is minted direct-linked (bootstrap.ss): a core def is emitted as
+;;   (define jv$ns$name <init>)
+;;   (def-var-linked! "ns" "name" 'jv$ns$name jv$ns$name (lambda (v) (set! jv$ns$name v)) meta)
+;; and a core->core call applies jv$ns$name — one top-level load, no
+;; var-cell-deref, no jolt-invokeN. The binding and the var's root have to stay
+;; ONE value, or a redefinition splits the world: direct callers on the old
+;; root, var-routed callers (an app's, the REPL's) on the new. So every write of
+;; a var root goes through var-root-set!, which hands a linked var's new root to
+;; the setter its def registered. A (def …) in clojure.core, alter-var-root,
+;; with-redefs, ns-unmap and a world-image restore are then visible to core's
+;; own direct calls — more than JVM Clojure's direct-linked core offers — for
+;; one hashtable probe per ROOT WRITE, never per call or per read.
+;;
+;; Writes take the mutex (namespaces load in parallel, and concurrent inserts
+;; into a strong hashtable lose each other — see var-table above); the
+;; single-key reads are unlocked for the reasons set out there.
+(define var-linked-tbl (make-eq-hashtable))
+(define var-linked-mu (make-mutex))
+(define (var-root-set! c v)
+  (let ((l (hashtable-ref var-linked-tbl c #f)))
+    (if l
+        ;; The cell and the binding are ONE value, so the two writes are one
+        ;; critical section: two writers of the same linked var (a def racing an
+        ;; alter-var-root, two sessions interning the same name) would otherwise
+        ;; interleave into root=f2 / binding=f1 for good. thread-safety-test.ss
+        ;; row 14 reads the pair under the same mutex.
+        (jolt-with-mutex var-linked-mu
+          (var-cell-root-set! c v)
+          ((cdr l) v))
+        (var-cell-root-set! c v))))
+;; The jv$ symbol a linked var is bound under, or #f. jolt.host/seed-callable?
+;; answers it so an app's direct call site applies the binding itself (backend
+;; emit-invoke) rather than a root hoisted once at load.
+(define (var-linked-symbol c)
+  (let ((l (hashtable-ref var-linked-tbl c #f)))
+    (and l (car l))))
+;; The linked def: bind the var as def-var-with-meta! / def-var-plain! would (M
+;; is the declared meta or #f), then record SYM and SETTER against the cell.
+(define (def-var-linked! ns name sym v setter m)
+  (let ((c (if m (def-var-with-meta! ns name v m) (def-var-plain! ns name v))))
+    (jolt-with-mutex var-linked-mu
+      (hashtable-set! var-linked-tbl c (cons sym setter)))
+    c))
 ;; A var root that is CODE rather than data. A procedure always is; a multimethod
 ;; and a reify are code too, but they are RECORDS, so `procedure?` misses them and
 ;; nothing recorded their name -- which is why a state image walked a multimethod's
@@ -1105,7 +1157,7 @@
     (when (not (jolt-var-unbound? (var-cell-root c)))
       (jolt-with-mutex var-table-mu
         (hashtable-set! var-redefined-set (string-append ns "/" name) #t)))
-    (var-cell-root-set! c v) (var-cell-defined?-set! c #t) c))
+    (var-root-set! c v) (var-cell-defined?-set! c #t) c))
 ;; A def whose form declared NO metadata. Same as def-var!, plus the half of the
 ;; :dynamic assignment def-var-with-meta! does from the other side: a def ASSIGNS
 ;; the flag from what it declared, so a plain (def *x* 2) over a
