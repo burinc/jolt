@@ -2487,9 +2487,134 @@
                                     (if ctor (ctor (uri-field u 'string))
                                         (make-url (uri-field u 'string))))))
         (cons "isAbsolute" (lambda (u) (not (jolt-nil? (uri-field u 'scheme)))))
+        (cons "isOpaque" (lambda (u) (uri-opaque? u)))
+        (cons "resolve" (lambda (u x) (uri-resolve u (uri-arg->uri x))))
+        (cons "normalize" (lambda (u) (uri-normalize u)))
+        (cons "relativize" (lambda (u x) (uri-relativize u (uri-arg->uri x))))
+        (cons "compareTo" (lambda (u o) (let ((a (uri-field u 'string)) (b (uri-field o 'string)))
+                                          (cond ((string<? a b) -1) ((string=? a b) 0) (else 1)))))
         (cons "hashCode" (lambda (u) (string-hash (uri-field u 'string))))
         (cons "equals" (lambda (u o) (and (jhost? o) (string=? (jhost-tag o) "uri")
                                           (string=? (uri-field u 'string) (uri-field o 'string)))))))
+
+;; --- resolve / normalize / relativize: RFC 2396 §5.2, as java.net.URI does it --
+;; A URI is rebuilt from its RAW components — the substrings the parse produced,
+;; escapes intact — as scheme ":" ["//" authority] path ["?" query] ["#" fragment]
+;; and parsed again, which is what java.net.URI.toString does for a URI it
+;; constructed itself (defineString), and which keeps every URI jolt hands back
+;; the product of the one parser.
+(define (uri-opaque? u)
+  (and (not (jolt-nil? (uri-field u 'scheme)))
+       (let ((ssp (uri-field u 'ssp)))
+         (or (= (string-length ssp) 0) (not (char=? (string-ref ssp 0) #\/))))))
+(define (uri-nil->f x) (if (jolt-nil? x) #f x))
+(define (uri-arg->uri x) (if (uri-jhost? x) x (uri-create (jolt-str-render-one x))))
+(define (uri-from-parts scheme authority path query fragment)
+  (uri-parse (string-append (if scheme (string-append scheme ":") "")
+                            (if authority (string-append "//" authority) "")
+                            (or path "")
+                            (if query (string-append "?" query) "")
+                            (if fragment (string-append "#" fragment) ""))))
+;; RFC 2396 §5.2 (6c-f), java.net.URI.normalize(String): "." segments go, a ".."
+;; removes the segment before it unless that is itself a ".." or there is none
+;; (a leading ".." stays — 6g leaves the path as it is), and a kept segment
+;; keeps the slash that FOLLOWED it in the original, which is how "/a/b/.."
+;; normalizes to "/a/" while "/a/b/../../.." is "/.." and "a/.." is "" (the
+;; JDK's join step). A RELATIVE path whose first segment holds a ":" gains a
+;; "./" so it cannot be read back as a scheme.
+(define (uri-normalize-path path)
+  (if (or (not path) (= (string-length path) 0))
+      path
+      (let* ((n (string-length path))
+             (absolute? (char=? (string-ref path 0) #\/))
+             ;; (segment . followed-by-slash?) in order, empty segments dropped
+             (segs (let loop ((i 0) (start 0) (acc '()))
+                     (cond ((= i n) (reverse (if (> i start) (cons (cons (substring path start i) #f) acc) acc)))
+                           ((char=? (string-ref path i) #\/)
+                            (loop (+ i 1) (+ i 1) (if (> i start) (cons (cons (substring path start i) #t) acc) acc)))
+                           (else (loop (+ i 1) start acc)))))
+             (kept (let loop ((ss segs) (acc '()))
+                     (cond ((null? ss) (reverse acc))
+                           ((string=? (car (car ss)) ".") (loop (cdr ss) acc))
+                           ((and (string=? (car (car ss)) "..") (pair? acc) (not (string=? (car (car acc)) "..")))
+                            (loop (cdr ss) (cdr acc)))
+                           (else (loop (cdr ss) (cons (car ss) acc))))))
+             (body (apply string-append
+                          (map (lambda (sg) (string-append (car sg) (if (cdr sg) "/" ""))) kept)))
+             (body (if (and (not absolute?) (pair? kept) (uri-index-of (car (car kept)) #\: 0))
+                       (string-append "./" body)
+                       body)))
+        (string-append (if absolute? "/" "") body))))
+(define (uri-normalize u)
+  (if (uri-opaque? u)
+      u
+      (let* ((path (uri-nil->f (uri-field u 'path)))
+             (np (uri-normalize-path path)))
+        (if (equal? np path)
+            u
+            (uri-from-parts (uri-nil->f (uri-field u 'scheme)) (uri-nil->f (uri-field u 'authority))
+                            np (uri-nil->f (uri-field u 'query)) (uri-nil->f (uri-field u 'fragment)))))))
+;; java.net.URI.resolve(URI base, URI child): an opaque side answers the child;
+;; a lone fragment is the base with that fragment (5.2 (2)); an absolute child
+;; is itself (3); a child with an authority replaces everything but the scheme
+;; (4); a child path from "/" replaces the base's (5); anything else is merged
+;; onto the base path's directory and normalized (6).
+(define (uri-resolve base child)
+  (let ((c-scheme (uri-nil->f (uri-field child 'scheme)))
+        (c-auth (uri-nil->f (uri-field child 'authority)))
+        (c-path (or (uri-nil->f (uri-field child 'path)) ""))
+        (c-query (uri-nil->f (uri-field child 'query)))
+        (c-frag (uri-nil->f (uri-field child 'fragment)))
+        (b-scheme (uri-nil->f (uri-field base 'scheme)))
+        (b-auth (uri-nil->f (uri-field base 'authority)))
+        (b-path (or (uri-nil->f (uri-field base 'path)) ""))
+        (b-query (uri-nil->f (uri-field base 'query)))
+        (b-frag (uri-nil->f (uri-field base 'fragment))))
+    (cond
+      ((or (uri-opaque? child) (uri-opaque? base)) child)
+      ((and (not c-scheme) (not c-auth) (= (string-length c-path) 0) c-frag (not c-query))
+       (if (and b-frag (string=? b-frag c-frag))
+           base
+           (uri-from-parts b-scheme b-auth b-path b-query c-frag)))
+      (c-scheme child)
+      (c-auth (uri-from-parts b-scheme c-auth c-path c-query c-frag))
+      ((and (> (string-length c-path) 0) (char=? (string-ref c-path 0) #\/))
+       (uri-from-parts b-scheme b-auth c-path c-query c-frag))
+      (else
+       ;; the base path's directory, then the child; a base with an authority and
+       ;; no path merges as "/" (RFC 3986 §5.2.3, and the JDK since 20), so
+       ;; "a" against "https://h.com" is "https://h.com/a", not "https://h.coma"
+       (let* ((i (let loop ((k (- (string-length b-path) 1)))
+                   (cond ((< k 0) #f) ((char=? (string-ref b-path k) #\/) k) (else (loop (- k 1))))))
+              (dir (cond (i (substring b-path 0 (+ i 1)))
+                         ((and b-auth (= (string-length b-path) 0) (> (string-length c-path) 0)) "/")
+                         (else "")))
+              (merged (string-append dir c-path)))
+         (uri-from-parts b-scheme b-auth (uri-normalize-path merged) c-query c-frag))))))
+;; java.net.URI.relativize: the child, unless both are hierarchical with the same
+;; scheme and authority and the base's normalized path is a prefix of the
+;; child's at a segment boundary — then the remainder, with the child's query
+;; and fragment.
+(define (uri-relativize base child)
+  (let ((same? (lambda (a b ci?) (or (and (not a) (not b))
+                                     (and a b (if ci? (string-ci=? a b) (string=? a b)))))))
+    (if (or (uri-opaque? base) (uri-opaque? child)
+            (not (same? (uri-nil->f (uri-field base 'scheme)) (uri-nil->f (uri-field child 'scheme)) #t))
+            (not (same? (uri-nil->f (uri-field base 'authority)) (uri-nil->f (uri-field child 'authority)) #f)))
+        child
+        (let* ((bp (uri-normalize-path (or (uri-nil->f (uri-field base 'path)) "")))
+               (cp (uri-normalize-path (or (uri-nil->f (uri-field child 'path)) "")))
+               ;; equal paths relativize to the empty path; otherwise the base
+               ;; must be a whole-segment prefix
+               (bp (cond ((string=? bp cp) bp)
+                         ((and (> (string-length bp) 0)
+                               (char=? (string-ref bp (- (string-length bp) 1)) #\/)) bp)
+                         (else (string-append bp "/")))))
+          (if (and (>= (string-length cp) (string-length bp))
+                   (string=? (substring cp 0 (string-length bp)) bp))
+              (uri-from-parts #f #f (substring cp (string-length bp) (string-length cp))
+                              (uri-nil->f (uri-field child 'query)) (uri-nil->f (uri-field child 'fragment)))
+              child)))))
 ;; (= f1 f2) is value equality by pathname, like java.io.File.equals — .equals
 ;; and hash already agreed, so two Files built from the same path compared equal
 ;; through the method and unequal through =, which is how ring's resource tests
@@ -2506,6 +2631,12 @@
                   (lambda (a b) (and (uri-jhost? a) (uri-jhost? b)
                                      (string=? (uri-field a 'string) (uri-field b 'string)))))
 (register-hash-arm! uri-jhost? (lambda (x) (string-hash (uri-field x 'string))))
+;; (compare u1 u2) / (sort uris): URI is Comparable on the JVM, by string form
+;; (its compareTo compares component-wise, which for two well-formed URIs is the
+;; same order as the strings up to the first differing component).
+(register-compare-arm! (lambda (a b) (and (uri-jhost? a) (uri-jhost? b)))
+                       (lambda (a b) (let ((x (uri-field a 'string)) (y (uri-field b 'string)))
+                                       (cond ((string<? x y) -1) ((string=? x y) 0) (else 1)))))
 ;; str / pr-str of a uri -> its string form.
 (register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "uri")))
                       (lambda (x) (uri-field x 'string)))
