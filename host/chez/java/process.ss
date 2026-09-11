@@ -43,10 +43,13 @@
 (define proc-libc-signal (jolt-foreign-proc-safe "signal" '(int void*) 'void*))
 ;; errno, to tell a waitpid that was merely interrupted (EINTR — retry) from one
 ;; that can never succeed (ECHILD — the child is gone, retrying is an infinite
-;; loop). Both spellings of the location accessor: Darwin/BSD, then glibc/musl.
+;; loop). All three spellings of the location accessor: Darwin/BSD, glibc/musl,
+;; then bionic (Android — __errno_location does not exist there, and leaving it
+;; out reads every error as 0, so an EINTR retry never fires).
 (define proc-errno-loc
   (or (jolt-foreign-proc-safe "__error" '() 'void*)
-      (jolt-foreign-proc-safe "__errno_location" '() 'void*)))
+      (jolt-foreign-proc-safe "__errno_location" '() 'void*)
+      (jolt-foreign-proc-safe "__errno" '() 'void*)))
 (define (proc-errno)
   (if proc-errno-loc (guard (e (#t 0)) (sa-foreign-ref 'int (proc-errno-loc) 0)) 0))
 
