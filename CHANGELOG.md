@@ -96,6 +96,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   task whatever it is called, or `:override-builtin true` on the task, which
   takes the name for good. The warning goes to stderr, so `jolt path` in such a
   project still pipes.
+- **The `,` flag on `%g` no longer puts a separator in the exponent.** `%g`
+  picks between fixed and scientific notation, and the grouping pass ran over
+  whichever one it produced — so `(format "%,.1g" 1234.5)`, which lands in the
+  scientific branch, rendered `1e,+03` where the JVM gives `1e+03`. The JVM
+  groups the MANTISSA and appends the exponent afterwards, which makes `,` a
+  no-op on the scientific branch (a scientific mantissa has one integer digit);
+  grouping now happens inside that choice, on the fixed branch only. The fixed
+  branch is unchanged: `(format "%,.10g" 1234567.0)` is still `1,234,567.000`.
+  Found while confirming that `%g` itself, which landed in 0.8.6, matches
+  `java.util.Formatter` across the flag combinations; #903's own
+  `(format "%.4g" 12.21)` is pinned in the corpus alongside these.
 
 - **`clojure.lang.ARef`'s watch and validator METHODS work through interop.**
   Every watchable reference type was already an `IRef` by class — `(instance?
