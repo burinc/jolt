@@ -93,6 +93,14 @@
 ;; and forth between the two strings. With no position of its own the form
 ;; inherits the enclosing form's, which is the right answer.
 (define rdr-suppress-pos (make-thread-parameter #f))
+;; Chez copies thread parameters at fork, so a thread forked from inside a read
+;; -- an edn :readers fn that sends to an agent, spawns the first fiber, starts
+;; a future -- inherits the switches of a read it is not part of, and a pooled
+;; thread (an agent worker, a fiber carrier) keeps them for the rest of its
+;; life. Every thread jolt forks resets them first (java/concurrency.ss,
+;; fibers.ss): the switches describe the read in progress on the FORKING thread.
+(define (rdr-default-modes!)
+  (rdr-edn-mode #f) (rdr-discard-cb #f) (rdr-scan-mode #f) (rdr-suppress-pos #f))
 
 (define (rdr-skip-ws s i end)
   (let loop ((i i))

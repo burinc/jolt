@@ -1266,7 +1266,7 @@
       (do ((i 0 (fx+ i 1))) ((fx=? i n))
         (let ((c (vector-ref v i)))
           (jolt-carrier-thread-set! c
-            (fork-thread (lambda () (jolt-fiber-carrier-loop c))))))))
+            (fork-thread (lambda () (rdr-default-modes!) (jolt-fiber-carrier-loop c))))))))
   (jolt-unlock! jolt-fiber-pool-mu))
 
 ;; (jolt-fiber-pool-reset!) -> void. Stop every carrier thread (each finishes

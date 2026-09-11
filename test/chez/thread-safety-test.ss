@@ -690,6 +690,16 @@
 (ok "14. a linked var's root and its binding are one value under concurrent writers"
     (fx=? ts14-mismatches 0))
 
+;; 15. A thread jolt forks starts from the DEFAULT reader modes, whatever read
+;; the forking thread is inside. Chez copies thread parameters at fork, so a
+;; future (or an agent worker, or a fiber carrier) that an edn :readers fn
+;; started inherited edn mode -- for the rest of its life, for a pooled thread.
+(define ts15-inherited
+  (parameterize ((rdr-edn-mode #t) (rdr-scan-mode #t))
+    (jolt-future-deref
+      (jolt-future-call (lambda () (or (rdr-edn-mode) (rdr-scan-mode)))))))
+(ok "15. a thread jolt forks reads in the default modes" (not ts15-inherited))
+
 (printf "\nthread-safety-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "thread-safety-test: PASS — shared side-tables under concurrency\n") (exit 0))

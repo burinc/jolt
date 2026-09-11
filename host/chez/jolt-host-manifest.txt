@@ -66,6 +66,7 @@ fiber-yield
 fiber?
 file-exists?
 file-mtime
+ffi-varargs-compile
 find-var
 fn-form-parse
 form-bigdec-source

@@ -27,8 +27,13 @@
 ;; for carried none. The back end checks every rendering against this same
 ;; parse before it emits text (backend fnsrc-row-src), through the jolt.host
 ;; seam, so a form that would read back differently is emitted constructed.
+;; Every mode switch is pinned, not only the two positions need: the first
+;; lookup runs on whichever thread dumps, and one inside an edn read would
+;; otherwise parse (fn* [x] 'x) as an edn error -- which image-fnsrc-probe's
+;; guard turns into "unregistered", refusing a closure that was registered.
 (define (image-fn-form-parse s)
-  (parameterize ((rdr-source-file #f) (rdr-suppress-pos #t))
+  (parameterize ((rdr-source-file #f) (rdr-suppress-pos #t)
+                 (rdr-edn-mode #f) (rdr-scan-mode #f) (rdr-discard-cb #f))
     (let-values (((form j) (rdr-read-top s 0 (string-length s))))
       form)))
 (def-var! "jolt.host" "fn-form-parse" image-fn-form-parse)

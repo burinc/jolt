@@ -90,9 +90,11 @@ run_case() {
 # and still matches the plain build's output:
 #   - kept fraction: at most $shake_max_kept percent of the defs, or the 6th
 #     argument when a fixture legitimately keeps more.
-#   - the compiler image: a shake that does NOT bail always drops it (every
-#     dce-compile-ref is also a dce-bail-ref, so reaching no bail ref means
-#     reaching no compile ref either — see dce.ss), and a bail always keeps it.
+#   - the compiler image: a shake that does NOT bail drops it, unless a compile
+#     ref outside the bail set keeps it (an image write, a bare :& binding --
+#     see dce.ss dce-compile-refs; no fixture here has one), and a bail always
+#     keeps it. An allowed def that evals still BAILS: the compiler image is
+#     direct-linked against the whole core and cannot run over a shaken one.
 #
 # EXPECT_OUT ($7): a fixed string the --tree-shake build's stdout must contain —
 # for a bailing fixture, the paste-ready :allow-dynamic hint naming exactly the
@@ -236,6 +238,12 @@ run_local_case allow-dynamic-app app.core "" "\"app.core\" \"dead\""
 # were honoured (neither is listed) and the non-allowed one was not let through.
 run_local_case allow-dynamic-partial-app app.core "" "" bail "" \
   ':jolt/tree-shake {:allow-dynamic [app.core/lookup]}'
+# …and :allow-dynamic vouches for a RESOLUTION only: an allowed def that EVALS
+# still bails, naming the eval and offering no allow entry for it, because the
+# compiler image is direct-linked against the whole core and cannot run over a
+# shaken one. It used to shake (and drop the compiler), and the eval died.
+run_local_case allow-dynamic-eval-app app.core "" "" bail "" \
+  "  app.core/compute -> clojure.core/eval"
 
 [ "$fail" = 0 ] && echo "shake smoke: passed" || echo "shake smoke: FAILED"
 exit $fail

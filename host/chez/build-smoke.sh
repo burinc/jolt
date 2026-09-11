@@ -856,12 +856,15 @@ fi
 # (no scheme.boot), so its libc calls through jolt-foreign-proc-safe (stat &co
 # under jolt.fs) must resolve as compiled foreign-procedures — an eval'd form
 # would silently return #f under the interpreter and the output would change.
+# Petite-only is asserted off the build's own verdict line: the self-contained
+# link path writes no compile.ss, so a grep of that file passed whatever the
+# build embedded.
 fsshake="$(dirname "$out")/fs-app-shake-bin"
-if ! JOLT_PWD="$fsapp" "$jolt" build -m fsapp.main -o "$fsshake" --tree-shake >/dev/null 2>&1; then
+if ! JOLT_PWD="$fsapp" "$jolt" build -m fsapp.main -o "$fsshake" --tree-shake >"$fsshake.log" 2>&1; then
   echo "  FAIL: jolt build --tree-shake of the jolt.fs app exited non-zero"; exit 1
 fi
-if grep -q 'scheme.boot' "$fsshake.build/compile.ss" 2>/dev/null; then
-  echo "  FAIL: tree-shaken fs app still bundles scheme.boot (petite-only boot expected)"; exit 1
+if ! grep -q '^jolt build: dropping compiler image' "$fsshake.log"; then
+  echo "  FAIL: tree-shaken fs app kept the compiler image (petite-only boot expected)"; exit 1
 fi
 got_fss="$(cd / && "$fsshake" 2>&1 | tail -1)"
 if [ "$got_fss" != "FS-APP a/b true true rw-------" ]; then
@@ -885,11 +888,11 @@ fi
 # jolt.process) must resolve as compiled foreign-procedures — an eval'd form would
 # silently return #f under the interpreter and the exit codes would be lost.
 procshake="$(dirname "$out")/process-app-shake-bin"
-if ! JOLT_PWD="$procapp" "$jolt" build -m procapp.main -o "$procshake" --tree-shake >/dev/null 2>&1; then
+if ! JOLT_PWD="$procapp" "$jolt" build -m procapp.main -o "$procshake" --tree-shake >"$procshake.log" 2>&1; then
   echo "  FAIL: jolt build --tree-shake of the jolt.process app exited non-zero"; exit 1
 fi
-if grep -q 'scheme.boot' "$procshake.build/compile.ss" 2>/dev/null; then
-  echo "  FAIL: tree-shaken process app still bundles scheme.boot (petite-only boot expected)"; exit 1
+if ! grep -q '^jolt build: dropping compiler image' "$procshake.log"; then
+  echo "  FAIL: tree-shaken process app kept the compiler image (petite-only boot expected)"; exit 1
 fi
 got_procs="$(cd / && "$procshake" 2>&1 | tail -1)"
 if [ "$got_procs" != "PROC-APP hi 0 143" ]; then
@@ -915,11 +918,11 @@ fi
 # The same ffi app tree-shaken: a petite-only boot has no compiler, so
 # errno-message's strerror defcfn must resolve as a compiled foreign-procedure.
 ffishake="$(dirname "$out")/ffi-app-shake-bin"
-if ! JOLT_PWD="$ffiapp" "$jolt" build -m ffiapp.main -o "$ffishake" --tree-shake >/dev/null 2>&1; then
+if ! JOLT_PWD="$ffiapp" "$jolt" build -m ffiapp.main -o "$ffishake" --tree-shake >"$ffishake.log" 2>&1; then
   echo "  FAIL: jolt build --tree-shake of the jolt.ffi app exited non-zero"; exit 1
 fi
-if grep -q 'scheme.boot' "$ffishake.build/compile.ss" 2>/dev/null; then
-  echo "  FAIL: tree-shaken ffi app still bundles scheme.boot (petite-only boot expected)"; exit 1
+if ! grep -q '^jolt build: dropping compiler image' "$ffishake.log"; then
+  echo "  FAIL: tree-shaken ffi app kept the compiler image (petite-only boot expected)"; exit 1
 fi
 got_ffis="$(cd / && "$ffishake" 2>&1 | tail -1)"
 if [ "$got_ffis" != "FFI-APP 8 4 4 2.5 true" ]; then
@@ -1308,4 +1311,35 @@ if [ "$got_small" != "$want" ] || [ "$got_plain" != "$want" ] || [ "$got_envplai
   exit 1
 fi
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes)"
+
+# --- the compiler verdict, per program shape ---------------------------------
+# Every build (not only --tree-shake) drops the compiler when nothing reaches
+# it. Four shapes pin the edges of "reaches": an eval in a def -main never
+# references (its init still RUNS at start, so the verdict roots every def, not
+# only -main's reach); a bare :& FFI binding, which compiles a foreign-procedure
+# per tail shape at the call and petite cannot; jolt.scheme/proc, a top-level
+# lookup that needs no compiler and so must answer from the runtime half; and
+# jolt.scheme/eval-string, which does compile. Each is its own entry namespace
+# of one fixture, so no shape masks another.
+echo "build smoke: compiler verdict (unreached eval def, bare :& ffi, jolt.scheme)"
+verdictapp="$root/test/chez/verdict-app"
+verdict_case() { # name entry-ns want-output keep|drop
+  vout="$(dirname "$out")/verdict-$1"
+  if ! JOLT_PWD="$verdictapp" "$jolt" build -m "$2" -o "$vout" >"$vout.log" 2>&1; then
+    echo "  FAIL: verdict fixture $1 ($2) did not build"; tail -5 "$vout.log"; exit 1
+  fi
+  vgot="$(cd / && "$vout" 2>&1 | tail -1)"
+  if [ "$vgot" != "$3" ]; then
+    echo "  FAIL: verdict fixture $1 — want '$3', got \`$vgot\`"; exit 1
+  fi
+  if grep -q '^jolt build: dropping compiler image' "$vout.log"; then vhad=drop; else vhad=keep; fi
+  if [ "$vhad" != "$4" ]; then
+    echo "  FAIL: verdict fixture $1 — the build should $4 the compiler, it chose $vhad"; exit 1
+  fi
+}
+verdict_case evaldef verdict.evaldef "VERDICT-EVALDEF ok" keep
+verdict_case varargs verdict.varargs "VERDICT-VARARGS ok" keep
+verdict_case sproc   verdict.sproc   "VERDICT-SPROC 42"   drop
+verdict_case seval   verdict.seval   "VERDICT-SEVAL 42"   keep
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes + compiler-verdict)"

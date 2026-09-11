@@ -111,6 +111,7 @@
     (fork-thread
      (lambda ()
        (*txn* #f)                          ; child thread must not inherit parent's txn
+       (rdr-default-modes!)                ; and not the reader modes of a read it forked from
        ;; The worker's flag is the future's flag: future-cancel sets it, and
        ;; (Thread/currentThread) inside the body hands back a handle onto the same
        ;; box, so .isInterrupted / Thread/interrupted inside the worker and the
@@ -362,7 +363,7 @@
     (jagent-q-push! a (cons f args))
     (unless (jolt-agent-running? a)
       (jolt-agent-running?-set! a #t)
-      (fork-thread (lambda () (*txn* #f) (jolt-agent-worker a)))))
+      (fork-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))
   a)
 
 ;; Dispatch the held nested sends accumulated on this thread, returning the count
@@ -622,7 +623,7 @@
           (cond (clear? (jagent-q-clear! a))
                 ((and (not (jagent-q-empty? a)) (not (jolt-agent-running? a)))
                  (jolt-agent-running?-set! a #t)
-                 (fork-thread (lambda () (*txn* #f) (jolt-agent-worker a)))))))))
+                 (fork-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))))))
   ;; Agent.restart answers the NEW STATE, not the agent (and clear-agent-errors,
   ;; which is restart-agent over the current state, answers that state in turn).
   new-state)
@@ -690,6 +691,7 @@
     (fork-thread
      (lambda ()
        (*txn* #f)
+       (rdr-default-modes!)                ; and not the reader modes of a read it forked from
        (let loop ()
          (let* ((t (tapq-take!))
                 (x (if (eq? t tapq-sentinel) jolt-nil t))
@@ -1519,6 +1521,7 @@
             (unless (jthread-daemon? st) (user-thread-started!))
             (fork-thread (lambda ()
                (*txn* #f)                          ; child thread must not inherit parent's txn
+               (rdr-default-modes!)                ; and not the reader modes of a read it forked from
                ;; Adopt the Thread object's own interrupt flag, so .interrupt from
                ;; outside and this thread's Thread/currentThread view are ONE flag.
                (adopt-interrupt-box! (vector-ref st 4))
@@ -1831,6 +1834,7 @@
                   (when none-left? (raise e)))))
     (fork-thread (lambda ()
       (*txn* #f)      ; worker must not inherit the creating thread's txn
+      (rdr-default-modes!)                ; and not the reader modes of a read it forked from
       (executor-worker-loop st)))))
 
 ;; Dequeue, with the mutex held. Callers test queue-depth first.
