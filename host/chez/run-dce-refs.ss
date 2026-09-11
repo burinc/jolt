@@ -415,6 +415,12 @@
               (and (member dyn (refs-of "(fn [nm] (use (symbol nm)))")) #t) #t)
   (gate-check "dynamic load: (compile 'a.b) is one whatever its argument"
               (and (member dyn (refs-of "(fn [] (compile 'a.b))")) #t) #t)
+  (gate-check "dynamic load: require handed on as a value -- (apply require specs) -- is one"
+              (and (member dyn (refs-of "(fn [specs] (apply require specs))")) #t) #t)
+  (gate-check "dynamic load: (run! require nss) is one"
+              (and (member dyn (refs-of "(fn [nss] (run! require nss))")) #t) #t)
+  (gate-check "dynamic load: a static require's callee is still counted as itself"
+              (and (member "clojure.core/require" (refs-of "(fn [] (require 'a.b))")) #t) #t)
   (gate-check "dynamic load: (require 'a.b) is baked, not flagged"
               (and (member dyn (refs-of "(fn [] (require 'a.b))")) #t) #f)
   (gate-check "dynamic load: an ns form's clauses are baked, not flagged"

@@ -83,22 +83,38 @@
     (and (not (jolt-nil? f))
          (eq? (jolt-get f dce-kw-op) dce-kw-var)
          (string-append (jolt-get f dce-kw-ns) "/" (jolt-get f dce-kw-name)))))
+(define (dce-loader-fqn? fqn)
+  (or (string=? fqn "clojure.core/compile") (and (member fqn dce-load-by-name-fns) #t)))
+;; An INVOKE of one of them is static when every argument is a constant (and
+;; compile never is); the var in any other position -- (apply require specs),
+;; (run! require nss), a value handed on -- is a load by a name the graph
+;; cannot read, so it is dynamic wherever it is used.
 (define (dce-dynamic-load? node)
   (let ((fqn (dce-invoke-fqn node)))
     (and fqn
+         (dce-loader-fqn? fqn)
          (or (string=? fqn "clojure.core/compile")
-             (and (member fqn dce-load-by-name-fns)
-                  (let ((args (jolt-seq (jolt-get node dce-kw-args))))
-                    (and (not (jolt-nil? args))
-                         (not (for-all dce-static-arg? (seq->list args))))))))))
+             (let ((args (jolt-seq (jolt-get node dce-kw-args))))
+               (and (not (jolt-nil? args))
+                    (not (for-all dce-static-arg? (seq->list args)))))))))
 (define (dce-collect-refs acc node)
   (let ((op (jolt-get node dce-kw-op)))
     (cond ((or (eq? op dce-kw-var) (eq? op dce-kw-the-var))
-           (cons (string-append (jolt-get node dce-kw-ns) "/" (jolt-get node dce-kw-name)) acc))
+           (let ((fqn (string-append (jolt-get node dce-kw-ns) "/" (jolt-get node dce-kw-name))))
+             (if (dce-loader-fqn? fqn)
+                 (cons dce-dynamic-load-ref (cons fqn acc))
+                 (cons fqn acc))))
           ((and (eq? op dce-kw-ffi-fn) (dce-ffi-bare-varargs? node))
            (dce-reduce-children dce-collect-refs (cons dce-ffi-varargs-ref acc) node))
-          ((and (eq? op dce-kw-invoke) (dce-dynamic-load? node))
-           (dce-reduce-children dce-collect-refs (cons dce-dynamic-load-ref acc) node))
+          ((and (eq? op dce-kw-invoke) (dce-invoke-fqn node) (dce-loader-fqn? (dce-invoke-fqn node)))
+           ;; the callee var is counted as itself, never as a dynamic load; the
+           ;; arguments decide that, and are walked for what they reference
+           (let ((acc (cons (dce-invoke-fqn node)
+                            (if (dce-dynamic-load? node) (cons dce-dynamic-load-ref acc) acc))))
+             (let ((args (jolt-seq (jolt-get node dce-kw-args))))
+               (if (jolt-nil? args)
+                   acc
+                   (fold-left dce-collect-refs acc (seq->list args))))))
           (else (dce-reduce-children dce-collect-refs acc node)))))
 
 ;; The fqn of a bare top-level def (the only prunable IR form), else #f.
