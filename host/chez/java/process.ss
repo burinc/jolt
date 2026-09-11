@@ -325,6 +325,25 @@
   (list (cons "type" (lambda (self) (symbol->string (proc-redirect-kind self))))
         (cons "toString" (lambda (self) (string-append "Redirect." (symbol->string (proc-redirect-kind self)))))))
 
+;; JDK 9 gave every redirect setter a File overload — redirectInput(File) is
+;; defined as redirectInput(Redirect.from(file)), redirectOutput/redirectError as
+;; Redirect.to(file). Without them the File was STORED as the redirect and then
+;; ignored by proc-redir-fragment, which only understands a Redirect jhost: the
+;; child silently kept jolt's own fd, so `:in (fs/file "/dev/null")` through
+;; babashka.process left the child reading the terminal forever (jolt#947).
+;; `kind` is the one Redirect.from/to would build for this stream.
+(define (proc-redirect-arg who kind x)
+  (cond ((proc-redirect? x) x)
+        ((jfile? x) (make-proc-redirect kind (jfile-path x)))
+        ;; a Path (nio-file.ss) or a plain path string: not JDK overloads, but
+        ;; .directory already takes either through file-path-of, and refusing
+        ;; them here would make the redirect setters the odd ones out.
+        ((string? x) (make-proc-redirect kind x))
+        ((nio-path? x) (make-proc-redirect kind (nio-path-str x)))
+        (else (throw-jvm (quote IllegalArgumentException)
+                (string-append "ProcessBuilder." who ": expected a ProcessBuilder$Redirect or a File, got "
+                               (jolt-str-render-one x))))))
+
 ;; --- environment map (ProcessBuilder.environment()) --------------------------
 ;; A live mutable Map<String,String>, seeded from the parent environment. jolt's
 ;; babashka.process only calls clear/putAll, but put/get/remove are provided too.
@@ -403,13 +422,13 @@
         ;; documented default rather than nil.
         (cons "redirectInput"  (lambda (self . r)
           (if (null? r) (or (proc-pb-redir-in self) proc-redirect-pipe)
-              (begin (proc-pb-set! self 3 (car r)) self))))
+              (begin (proc-pb-set! self 3 (proc-redirect-arg "redirectInput" 'read (car r))) self))))
         (cons "redirectOutput" (lambda (self . r)
           (if (null? r) (or (proc-pb-redir-out self) proc-redirect-pipe)
-              (begin (proc-pb-set! self 4 (car r)) self))))
+              (begin (proc-pb-set! self 4 (proc-redirect-arg "redirectOutput" 'write (car r))) self))))
         (cons "redirectError"  (lambda (self . r)
           (if (null? r) (or (proc-pb-redir-err self) proc-redirect-pipe)
-              (begin (proc-pb-set! self 5 (car r)) self))))
+              (begin (proc-pb-set! self 5 (proc-redirect-arg "redirectError" 'write (car r))) self))))
         (cons "redirectErrorStream" (lambda (self . b)
           (if (null? b) (and (proc-pb-merge-err? self) #t)
               (begin (proc-pb-set! self 6 (jolt-truthy? (car b))) self))))

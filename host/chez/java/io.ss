@@ -1999,9 +1999,15 @@
 ;; the constructor a URISyntaxException, URI/create an IllegalArgumentException —
 ;; and parse-authority itself RETRIES a failed server parse as a registry-based
 ;; authority, which needs the failure as a value.
-(define (uri-parse-1 s bail)
+(define (uri-parse-1 s bail . opt)
+  ;; opt: require-server? — the JDK's requireServerAuthority, set by the component
+  ;; constructors that take a host (see uri-of-host). With it a failed
+  ;; server-authority parse RAISES instead of falling back to a registry-based
+  ;; authority, which is why (URI. "https" nil "h_c.com" -1 "/p" nil nil) is an
+  ;; error on the JVM while the 5-arg authority form accepts the same string.
   (let ((n (string-length s))
         (cur-bail bail)
+        (require-server? (and (pair? opt) (car opt)))
         (scheme jolt-nil) (ssp-start 0) (authority jolt-nil) (user-info jolt-nil)
         (host jolt-nil) (port -1) (path jolt-nil) (query jolt-nil) (fragment jolt-nil)
         (v6bytes 0))
@@ -2184,7 +2190,7 @@
              (set! cur-bail outer)
              (cond ((not err) (set! authority (substring s start e)))
                    (else (set! user-info jolt-nil) (set! host jolt-nil) (set! port -1)
-                         (if reg-ok
+                         (if (and reg-ok (not require-server?))
                              (set! authority (substring s start e))
                              (fail (car err) (cdr err)))))))
           (else (fail "Illegal character in authority" reg-stop)))
@@ -2241,14 +2247,15 @@
               (cons 'path path)
               (cons 'query query)
               (cons 'fragment fragment))))))
-(define (uri-parse-either s)
-  (call/cc (lambda (k) (uri-parse-1 s (lambda (reason idx) (k (list 'uri-error reason idx)))))))
+(define (uri-parse-either s . opt)
+  (call/cc (lambda (k)
+             (apply uri-parse-1 s (lambda (reason idx) (k (list 'uri-error reason idx))) opt))))
 (define (uri-error? r) (and (pair? r) (eq? (car r) 'uri-error)))
 (define (uri-error-message s r)
   (let ((idx (caddr r)))
     (string-append (cadr r) (if (< idx 0) "" (string-append " at index " (number->string idx))) ": " s)))
-(define (uri-parse s)
-  (let ((r (uri-parse-either s)))
+(define (uri-parse s . opt)
+  (let ((r (apply uri-parse-either s opt)))
     (if (uri-error? r)
         (jolt-throw (jolt-host-throwable "java.net.URISyntaxException" (uri-error-message s r)))
         r)))
@@ -2265,22 +2272,114 @@
       (if (>= i (bytevector-length bv))
           acc
           (loop (+ i 1) (string-append acc "%" (uri-hex2 (bytevector-u8-ref bv i))))))))
-(define (uri-quote-path p)
-  (let ((n (string-length p)))
+(define (uri-quote s ok?)
+  (let ((n (string-length s)))
     (let loop ((i 0) (acc '()))
       (if (>= i n)
           (apply string-append (reverse acc))
-          (let ((c (string-ref p i)))
+          (let ((c (string-ref s i)))
             (loop (+ i 1)
-                  (cons (if (or (uri-path-char? c)
+                  (cons (if (or (ok? c)
                                 (and (> (char->integer c) 128)
                                      (not (uri-space-char? c)) (not (uri-iso-control? c))))
                             (string c)
                             (uri-percent-encode c))
                         acc)))))))
+(define (uri-quote-path p) (uri-quote p uri-path-char?))
 (define (uri-field u k) (let ((p (assq k (jhost-state u)))) (if p (cdr p) jolt-nil)))
-(register-class-ctor! "URI" (lambda (s) (uri-parse (jolt-str-render-one s))))
-(register-class-ctor! "java.net.URI" (lambda (s) (uri-parse (jolt-str-render-one s))))
+
+;; --- the component constructors (URI. scheme host path fragment) & kin -------
+;; The JDK builds these the long way round: compose a URI STRING out of the
+;; pieces, quoting each one against the character set its component allows, then
+;; run the ordinary parser over the result. That is why they QUOTE where the
+;; single-string ctor REJECTS — (URI. "https" "x.example" "/a b" nil) is
+;; https://x.example/a%20b, while (URI. "https://x.example/a b") is a
+;; URISyntaxException — and why the exception a bad component raises reports an
+;; index into the composed string. Composing rather than filling the fields in
+;; directly is what keeps the two paths from drifting: every URI jolt hands back
+;; came out of one parser.
+;;
+;; Arities are the JDK's five: (s), (scheme ssp fragment),
+;; (scheme host path fragment), (scheme authority path query fragment),
+;; (scheme userInfo host port path query fragment). Anything else is
+;; "No matching ctor found for class java.net.URI", which is the message JVM
+;; Clojure's reflector gives for the same call (jolt#949).
+(define (uri-authority-char? c) (or (uri-reg-name-char? c) (uri-server-char? c)))
+;; A bracketed IPv6 literal is already in its own syntax and must not be quoted;
+;; only what follows the "]" is.
+(define (uri-quote-authority a)
+  (if (and (> (string-length a) 0) (char=? (string-ref a 0) #\[))
+      (let ((end (uri-index-of a #\] 0)))
+        (if (and end (uri-index-of a #\: 0))
+            (string-append (substring a 0 (+ end 1))
+                           (uri-quote (substring a (+ end 1) (string-length a)) uri-authority-char?))
+            (uri-quote a uri-authority-char?)))
+      (uri-quote a uri-authority-char?)))
+;; new URI(...)'s appendAuthority: a host wins over an authority, a host holding
+;; a ":" is bracketed as an IPv6 literal, and a port of -1 is "no port".
+(define (uri-compose scheme opaque authority user-info host port path query fragment)
+  (let ((out '()))
+    (define (emit! . xs) (for-each (lambda (x) (set! out (cons x out))) xs))
+    (when scheme (emit! scheme ":"))
+    (if opaque
+        (emit! (uri-quote opaque uri-uric?))
+        (begin
+          (cond
+            (host
+             (emit! "//")
+             (when user-info (emit! (uri-quote user-info uri-userinfo-char?) "@"))
+             (let ((brackets (and (> (string-length host) 0)
+                                  (uri-index-of host #\: 0)
+                                  (not (char=? (string-ref host 0) #\[))
+                                  (not (char=? (string-ref host (- (string-length host) 1)) #\])))))
+               (when brackets (emit! "["))
+               (emit! host)
+               (when brackets (emit! "]")))
+             (when (and port (not (= port -1))) (emit! ":" (number->string port))))
+            (authority (emit! "//" (uri-quote-authority authority))))
+          (when path (emit! (uri-quote path uri-path-char?)))
+          (when query (emit! "?" (uri-quote query uri-uric?)))))
+    (when fragment (emit! "#" (uri-quote fragment uri-uric?)))
+    (apply string-append (reverse out))))
+;; A scheme makes the URI absolute, and an absolute URI's path must be rooted —
+;; the JDK's checkPath, which catches (URI. "https" "x.example" "a" nil) before
+;; the parser turns the missing "/" into a nonsense authority.
+(define (uri-check-path! composed scheme path)
+  (when (and scheme path (> (string-length path) 0) (not (char=? (string-ref path 0) #\/)))
+    (jolt-throw (jolt-host-throwable "java.net.URISyntaxException"
+                  (string-append "Relative path in absolute URI: " composed)))))
+;; a nil component is absent, not the string "nil"
+(define (uri-arg x) (if (or (jolt-nil? x) (not x)) #f (jolt-str-render-one x)))
+(define (uri-port-arg x) (if (jolt-nil? x) -1 (jnum->exact x)))
+;; (scheme ssp fragment)
+(define (uri-of-ssp scheme ssp fragment)
+  (uri-parse (uri-compose scheme ssp #f #f #f -1 #f #f fragment) #f))
+;; (scheme userInfo host port path query fragment) — and (scheme host path
+;; fragment), which the JDK defines as this one with the other three nil. Both
+;; name a host, so both require a server authority.
+(define (uri-of-host scheme user-info host port path query fragment)
+  (let ((composed (uri-compose scheme #f #f user-info host port path query fragment)))
+    (uri-check-path! composed scheme path)
+    (uri-parse composed #t)))
+;; (scheme authority path query fragment) — the authority is taken as given, so a
+;; registry-based one ("h_c.com") is legal here where it is not in uri-of-host.
+(define (uri-of-authority scheme authority path query fragment)
+  (let ((composed (uri-compose scheme #f authority #f #f -1 path query fragment)))
+    (uri-check-path! composed scheme path)
+    (uri-parse composed #f)))
+(define (uri-ctor . args)
+  (let ((a (lambda (i) (uri-arg (list-ref args i)))))
+    (case (length args)
+      ((1) (uri-parse (jolt-str-render-one (car args))))
+      ((3) (uri-of-ssp (a 0) (a 1) (a 2)))
+      ((4) (uri-of-host (a 0) #f (a 1) -1 (a 2) #f (a 3)))
+      ((5) (uri-of-authority (a 0) (a 1) (a 2) (a 3) (a 4)))
+      ((7) (uri-of-host (a 0) (a 1) (a 2) (uri-port-arg (list-ref args 3))
+                        (a 4) (a 5) (a 6)))
+      (else (throw-jvm (quote IllegalArgumentException)
+              "No matching ctor found for class java.net.URI")))))
+(register-class-ctor! "URI" uri-ctor)
+(register-class-ctor! "java.net.URI" uri-ctor)
 ;; URI/create — the (URI. s) constructor with the checked URISyntaxException
 ;; rewrapped as an unchecked IllegalArgumentException, as the JVM's does.
 (define (uri-create s)
