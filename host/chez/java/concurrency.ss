@@ -2244,6 +2244,12 @@
 ;; jhost TAG is what names the class — "abq" or "lbq" (see LinkedBlockingQueue
 ;; below) — so everything from here down is written against the tag it is given.
 (define (make-abq* tag cap)
+  ;; Both classes reject a capacity below 1 at CONSTRUCTION on the JVM, with a
+  ;; bare IllegalArgumentException (no message — the JDK's ctor throws the
+  ;; no-arg one). jolt used to build the queue: its put then blocked forever and
+  ;; its offer always answered false, so a bad argument surfaced as a hang with
+  ;; nothing pointing at the ctor that caused it (jolt-eyi).
+  (when (< cap 1) (throw-jvm (quote IllegalArgumentException) jolt-nil))
   (make-jhost tag (vector cap (make-mutex) (make-condition) (cons '() '()) 0)))
 (define (make-abq cap) (make-abq* "abq" cap))
 (define (abq? x) (and (jhost? x) (member (jhost-tag x) '("abq" "lbq")) #t))

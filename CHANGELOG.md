@@ -258,6 +258,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports `No matching ctor found for class java.net.URI`, which is what JVM
   Clojure's reflector says for the same call.
 
+- **`java.net.URI`'s non-raw accessors percent-decode.** `getPath` and
+  `getRawPath` answered the same string — the substring the parse produced — so
+  `(.getPath (java.net.URI. "https://h.com/a%20b"))` was `"/a%20b"` where the JVM
+  answers `"/a b"`, and likewise for `getAuthority`, `getUserInfo`, `getQuery`,
+  `getFragment` and `getSchemeSpecificPart`. This was the last divergence the
+  java.net.URI differential run behind #904 had left. Each escapable component is
+  stored twice now, raw and decoded, and the two families of accessor answer the
+  two forms; `getRawAuthority` and `getRawFragment`, which had no implementation
+  at all, answer alongside their siblings. A run of consecutive escapes decodes as
+  one UTF-8 sequence (`%C3%A4` is `ä`, not two characters) and a byte sequence
+  that is not valid UTF-8 becomes U+FFFD rather than raising — both the host
+  decoder's doing, matching the JVM's byte for byte. `+` stays a plus: that is
+  form encoding, and `URLDecoder`'s job. The one carve-out is the JVM's
+  (JDK-8037396): inside a bracketed IPv6 literal a `%` is the scope-id separator
+  rather than an escape, so the components that can hold one — authority, user
+  info, scheme-specific part — leave escapes there alone, where path, query and
+  fragment decode them.
+
+- **A blocking queue refuses a capacity below 1.** `(ArrayBlockingQueue. 0)` and
+  `(LinkedBlockingQueue. 0)` built a queue whose `put` then blocked forever and
+  whose `offer` always answered `false` — a hang with nothing pointing at the
+  constructor that caused it. Both reject it at construction now with the JDK
+  constructor's own bare (message-less) `IllegalArgumentException`.
+
 - **`ProcessBuilder.redirectInput(File)` reaches the child.** The redirect
   setters stored whatever they were handed, and the spawn path understands only
   a `ProcessBuilder$Redirect`, so a `java.io.File` fell through as "no redirect"
