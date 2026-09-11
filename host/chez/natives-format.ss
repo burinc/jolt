@@ -310,14 +310,40 @@
   (for-each (lambda (c) (when (fmt-flag? flags c) (fmt-flag-mismatch sub c)))
             '(#\# #\+ #\space #\0 #\, #\())
   (when prec (fmt-precision-throw prec)))
+;; 0 pads a NUMBER: the general, character and %% conversions refuse it.
+(define (fmt-zero-ok? d) (and (memv d '(#\d #\o #\x #\X #\e #\E #\f #\g #\G #\a #\A)) #t))
+;; Flags that make no sense together (+ with space, - with 0), the JVM's
+;; IllegalFormatFlagsException; and a flag that needs a width to mean anything
+;; (- and 0) with none given, its MissingFormatWidthException, whose message is
+;; the specifier.
+(define (fmt-flags-throw flags)
+  (fmt-jvm-throw "java.util.IllegalFormatFlagsException"
+                 (string-append "Flags = '" (list->string (reverse flags)) "'")))
+(define (fmt-missing-width d flags)
+  (fmt-jvm-throw "java.util.MissingFormatWidthException"
+                 (string-append "%" (list->string (reverse flags)) (string d))))
 (define (fmt-check-flags d flags width prec)
+  ;; %n takes no flag at all, and says so with the flags exception
+  (when (and (char=? d #\n) (pair? flags)) (fmt-flags-throw flags))
   (when (and (fmt-flag? flags #\#) (not (fmt-alt-ok? d))) (fmt-flag-mismatch d #\#))
   (when (and (fmt-flag? flags #\,) (not (fmt-group-ok? d))) (fmt-flag-mismatch d #\,))
   (when (and (fmt-flag? flags #\() (not (fmt-paren-ok? d))) (fmt-flag-mismatch d #\())
   (when (and (fmt-flag? flags #\+) (not (fmt-sign-ok? d))) (fmt-flag-mismatch d #\+))
   (when (and (fmt-flag? flags #\space) (not (fmt-sign-ok? d))) (fmt-flag-mismatch d #\space))
+  (when (and (fmt-flag? flags #\0) (not (fmt-zero-ok? d))) (fmt-flag-mismatch d #\0))
+  (when (and (not width) (or (fmt-flag? flags #\-) (fmt-flag? flags #\0))) (fmt-missing-width d flags))
+  (when (or (and (fmt-flag? flags #\+) (fmt-flag? flags #\space))
+            (and (fmt-flag? flags #\-) (fmt-flag? flags #\0)))
+    (fmt-flags-throw flags))
   (when (and prec (not (fmt-prec-ok? d))) (fmt-precision-throw prec))
   (when (and width (memv d '(#\n))) (fmt-width-throw width)))
+;; ( + and space on a RADIX conversion are for a BigInteger argument only: the
+;; JVM formats a long as its two's-complement bit pattern there, which has no
+;; sign to show, and refuses the flags with the mismatch exception.
+(define (fmt-check-radix-sign-flags d a flags)
+  (unless (bignum? a)
+    (for-each (lambda (c) (when (fmt-flag? flags c) (fmt-flag-mismatch d c)))
+              '(#\( #\+ #\space))))
 ;; the # flag's radix prefix, empty when the flag is absent
 (define (fmt-alt-prefix d flags)
   (if (fmt-flag? flags #\#)
@@ -385,6 +411,18 @@
                                       (if (char=? d #\A) (string-upcase s) s))
                                     flags width))))
     (else (fmt-conversion-throw d a))))
+;; %c of a number is Character.isValidCodePoint: past U+10FFFF is the JVM's
+;; IllegalFormatCodePointException — not the raw Chez condition integer->char
+;; would raise, which no catch clause could select. A lone surrogate is a valid
+;; code point there and renders as itself; a Chez string holds code points, not
+;; UTF-16 units, so it has no representation here and renders as U+FFFD.
+(define (fmt-code-point n)
+  (let ((cp (->long n)))
+    (cond ((or (< cp 0) (> cp #x10FFFF))
+           (fmt-jvm-throw "java.util.IllegalFormatCodePointException"
+                          (string-append "Code point = 0x" (number->string (if (< cp 0) (- cp) cp) 16))))
+          ((and (>= cp #xD800) (<= cp #xDFFF)) (integer->char #xFFFD))
+          (else (integer->char cp)))))
 (define (fmt-directive d a flags width prec)
   (fmt-check-flags d flags width prec)
   (let ((grouped (lambda (s) (if (fmt-flag? flags #\,) (fmt-group s) s)))
@@ -402,6 +440,7 @@
       ((#\x #\X #\o)
        (cond ((jolt-nil? a) (fmt-pad "null" flags width #f))
              ((fmt-integer? a)
+              (fmt-check-radix-sign-flags d a flags)
               ;; Chez spells hex digits in upper case; %x is the lower-case conversion
               (let* ((s (fmt-radix a (if (char=? d #\o) 8 16)))
                      (s (cond ((char=? d #\X) (string-upcase s))
@@ -421,7 +460,7 @@
       ((#\B) (fmt-pad (string-upcase (fmt-truncate (if (jolt-truthy? a) "true" "false") prec)) flags width #f))
       ((#\h) (fmt-pad (fmt-truncate (fmt-hash a) prec) flags width #f))
       ((#\H) (fmt-pad (string-upcase (fmt-truncate (fmt-hash a) prec)) flags width #f))
-      ((#\c) (fmt-pad (fmt-numeric d a (lambda (n) (if (char? n) (string n) (string (integer->char (->long n))))))
+      ((#\c) (fmt-pad (fmt-numeric d a (lambda (n) (if (char? n) (string n) (string (fmt-code-point n)))))
                       flags width #f))
       (else (fmt-unknown-conversion (string d))))))
 
@@ -462,10 +501,15 @@
         (and ds (fx<? (cdr ds) n) (char=? (string-ref fmt (cdr ds)) #\$)
              (cons (car ds) (fx+ (cdr ds) 1)))))
     ;; the flags, in any order; a 0 is a flag only ahead of the width
+    ;; A flag given twice is the JVM's DuplicateFormatFlagsException, not a no-op.
     (define (scan-flags i)
       (let loop ((j i) (acc '()))
         (if (and (fx<? j n) (memv (string-ref fmt j) '(#\- #\# #\+ #\space #\0 #\, #\( #\<)))
-            (loop (fx+ j 1) (cons (string-ref fmt j) acc))
+            (let ((c (string-ref fmt j)))
+              (when (memv c acc)
+                (fmt-jvm-throw "java.util.DuplicateFormatFlagsException"
+                               (string-append "Flags = '" (string c) "'")))
+              (loop (fx+ j 1) (cons c acc)))
             (cons acc j))))
     ;; '.' DIGITS from i -> (cons precision next-index); a bare '.' is precision 0
     (define (scan-prec i)
@@ -499,7 +543,7 @@
                     (cond
                       ;; %%: a literal percent, taking a width but no argument
                       ((char=? d #\%)
-                       (fmt-check-flags d flags #f prec)
+                       (fmt-check-flags d flags width prec)
                        (display (fmt-pad "%" flags width #f) out)
                        (loop (fx+ j 1) ordinary last))
                       ;; %n: the line separator, taking neither width nor argument

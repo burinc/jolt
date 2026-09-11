@@ -185,11 +185,42 @@
            (list s))))
     (else (list s))))
 
-;; Register a parsed libspec's :as alias + :refer/:only names under `cns`.
-(define (chez-register-spec! cns spec)
-  (let ((parsed (parse-libspec spec)))
+;; An alias may be registered twice for the SAME target (a namespace re-loaded,
+;; two specs agreeing); pointing an existing alias at a different namespace is
+;; the JVM's Namespace.addAlias IllegalStateException. One check for `alias` and
+;; for a libspec's :as / :as-alias, which load-lib routes through `alias` too.
+(define (ns-alias-check! cns alias target)
+  (let ((existing (chez-resolve-alias cns alias)))
+    (when (and existing (not (string=? existing target)))
+      (throw-jvm (quote IllegalStateException)
+                 (string-append "Alias " alias " already exists in namespace " cns
+                                ", aliasing " existing)))))
+;; The symbol names of a libspec option's name list, or '() when it is not one.
+(define (libspec-names v)
+  (if (or (pvec? v) (cseq? v) (empty-list-t? v))
+      (map symbol-t-name (filter symbol-t? (seq->list v)))
+      '()))
+;; Register a parsed libspec's :as alias + :refer/:only names under `cns`, with
+;; the :exclude and :rename that qualify them: load-lib hands refer every one of
+;; :only/:exclude/:rename, so (require '[a.b :refer [x] :rename {x y}]) binds y
+;; and not x, and (require '[a.b :refer :all :exclude [x]]) leaves x out. Both
+;; used to be dropped here — :rename was honoured only by a bare (refer …), and
+;; :exclude only by a `use` that spelled no :refer key at all.
+;; check-alias? is #f for compile-eval.ss's pre-analysis scan, which registers
+;; a form's aliases speculatively before the form runs; the collision is the
+;; runtime require's to raise, where the JVM raises it and a catch can see it.
+(define (chez-register-spec! cns spec . more)
+  (let ((parsed (parse-libspec spec))
+        (check-alias? (or (null? more) (car more))))
     (when parsed
-      (let ((target (car parsed)))
+      (let* ((target (car parsed))
+             (opts (cdr parsed))
+             (excl (let ((e (assoc "exclude" opts))) (if e (libspec-names (cdr e)) '())))
+             (rename (let ((r (assoc "rename" opts))) (and r (pmap? (cdr r)) (cdr r))))
+             ;; the local name a source name is referred under
+             (local (lambda (nm)
+                      (let ((renamed (and rename (jolt-get rename (jolt-symbol #f nm)))))
+                        (if (symbol-t? renamed) (symbol-t-name renamed) nm)))))
         (for-each
           (lambda (opt)
             (let ((k (car opt)) (v (cdr opt)))
@@ -198,20 +229,32 @@
                 ;; the same `alias` call for both); what differs is that it does not
                 ;; load the target — see ns-load+register.
                 ((or (string=? k "as") (string=? k "as-alias"))
-                 (when (symbol-t? v) (chez-register-alias! cns (symbol-t-name v) target)))
+                 (when (symbol-t? v)
+                   (when check-alias? (ns-alias-check! cns (symbol-t-name v) target))
+                   (chez-register-alias! cns (symbol-t-name v) target)))
                 ;; :refer (require) and :only (use) both bring unqualified names
                 ;; into cns resolving to target/name.
                 ((or (string=? k "refer") (string=? k "only"))
                  (cond
-                   ;; :refer :all — bring in every public var (require :refer :all)
+                   ;; :refer :all — every public var, minus :exclude; a :rename'd
+                   ;; name is excluded from the walk and referred per-name under
+                   ;; its local name, since the per-name table is consulted first.
                    ((and (keyword? v) (string=? (keyword-t-name v) "all"))
-                    (chez-register-refer-all! cns target))
+                    (chez-register-refer-all! cns target)
+                    (let ((renamed (if rename
+                                       (map symbol-t-name
+                                            (filter symbol-t? (seq->list (jolt-keys rename))))
+                                       '())))
+                      (chez-register-refer-all-excludes! cns target (append excl renamed))
+                      (for-each (lambda (nm) (chez-register-refer! cns (local nm) target nm))
+                                renamed)))
                    ;; :refer [a b] or :refer (a b) — both forms list names to bring in.
                    ((or (pvec? v) (cseq? v) (empty-list-t? v))
-                    (for-each (lambda (n)
-                                (when (symbol-t? n) (chez-register-refer! cns (symbol-t-name n) target)))
-                              (seq->list v))))))))
-          (cdr parsed))))))
+                    (for-each (lambda (nm)
+                                (unless (member nm excl)
+                                  (chez-register-refer! cns (local nm) target nm)))
+                              (libspec-names v))))))))
+          opts)))))
 
 ;; --- require / use ----------------------------------------------------------
 ;; ONE implementation, here, beside the spec parser it shares. Loading a target
@@ -625,14 +668,10 @@
          ;; the-ns throws "No namespace: X found" if the target doesn't exist —
          ;; JVM aliases the resolved Namespace, so aliasing a missing ns fails now
          ;; instead of leaving a dangling alias that later dies with "Unknown class".
-         (target (jns-name (jolt-the-ns ns-sym)))
-         (existing (chez-resolve-alias cns alias)))
+         (target (jns-name (jolt-the-ns ns-sym))))
     ;; re-aliasing an existing alias to a DIFFERENT ns is an error (JVM
     ;; Namespace.addAlias); re-aliasing to the same target is a silent no-op.
-    (when (and existing (not (string=? existing target)))
-      (throw-jvm (quote IllegalStateException)
-                 (string-append "Alias " alias " already exists in namespace " cns
-                                ", aliasing " existing)))
+    (ns-alias-check! cns alias target)
     (chez-register-alias! cns alias target)
     jolt-nil))
 (define (jolt-ns-unalias ns-desig alias-sym)

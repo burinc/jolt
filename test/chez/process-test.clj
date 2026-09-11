@@ -553,6 +553,33 @@
             (:out (sh [exe "-e" expr] {:extra-env {"JOLT_NO_SPAWN_CLOSEFROM" "1"}}))
             "FREE"))
 
+;; Spawning while another thread closes descriptors. The enumeration fallback
+;; snapshots the parent's table between pipe() and posix_spawn, and a descriptor
+;; closed in that window — a sibling's drained pipe, a file, a port a finalizer
+;; released — leaves a close action on a dead fd. glibc skips it in the child; the
+;; Darwin kernel fails the whole spawn with EBADF, and three workers sharing a
+;; ThreadLocal<Process> (below) lost one subprocess to "posix_spawn failed
+;; (errno 9)". macOS spawns under POSIX_SPAWN_CLOEXEC_DEFAULT now, where the
+;; kernel decides the set at spawn time and nothing is snapshotted.
+(when (fs/exists? "/etc/hosts")
+  (let [errs   (atom []) pids (atom []) stop (atom false)
+        closer (Thread. (fn [] (while (not @stop)
+                                 (.close (java.io.FileInputStream. "/etc/hosts")))))
+        work   (fn [] (dotimes [_ 16]
+                        (try (let [p (.start (ProcessBuilder. ["sh" "-c" "echo $$"]))
+                                   s (str/trim (slurp (.getInputStream p)))]
+                               (.waitFor p)
+                               (swap! pids conj s))
+                             (catch Exception e (swap! errs conj (.getMessage e))))))
+        ts     (mapv (fn [_] (Thread. work)) (range 4))]
+    (.start closer)
+    (doseq [t ts] (.start t))
+    (doseq [t ts] (.join t))
+    (reset! stop true)
+    (.join closer)
+    (check-eq "spawning from four threads while a fifth closes descriptors" @errs [])
+    (check-eq "and every one of those spawns was its own child" (count (distinct @pids)) 64)))
+
 ;; A per-thread subprocess — ThreadLocal<Process>, the shape a worker pool uses to
 ;; give each thread its own long-lived helper program. It only works if the child
 ;; threads run initialValue themselves: jolt's ThreadLocal was a Chez thread

@@ -376,7 +376,7 @@
             ;; (require spec...) / (use spec...) — specs are quoted
             ((and hn (or (string=? hn "require") (string=? hn "use")))
              (for-each (lambda (a)
-                         (for-each (lambda (x) (chez-register-spec! ns x))
+                         (for-each (lambda (x) (chez-register-spec! ns x #f))
                                    (expand-libspec (ce-unquote a))))
                        (cdr items)))
             ;; (ns name (:require [a :as x]) ...) — clause specs are literal. Register
@@ -394,7 +394,7 @@
                              (let ((cl (seq->list clause)))
                                (when (ce-clause-require? cl)
                                  (for-each (lambda (spec)
-                                             (for-each (lambda (x) (chez-register-spec! ns-name x))
+                                             (for-each (lambda (x) (chez-register-spec! ns-name x #f))
                                                        (expand-libspec spec)))
                                            (cdr cl))))))
                          (if (pair? (cdr items)) (cddr items) '()))))

@@ -529,6 +529,20 @@
 (define proc-fa-closefrom
   (jolt-foreign-proc-safe "posix_spawn_file_actions_addclosefrom_np" '(void* int) 'int))
 
+;; macOS has no closefrom action, but it has the flag the question was asked
+;; for: POSIX_SPAWN_CLOEXEC_DEFAULT starts the child with EVERY descriptor
+;; closed except the ones a file action names — a dup2 target, an open, or an
+;; explicit posix_spawn_file_actions_addinherit_np. The set is decided by the
+;; kernel at spawn time, so there is no parent-side snapshot to go stale (the
+;; enumeration fallback's race, below). Both entries are Darwin-only; where they
+;; do not resolve the flag is not used.
+(define proc-attr-init     (jolt-foreign-proc-safe "posix_spawnattr_init"     '(void*) 'int))
+(define proc-attr-setflags (jolt-foreign-proc-safe "posix_spawnattr_setflags" '(void* short) 'int))
+(define proc-attr-destroy  (jolt-foreign-proc-safe "posix_spawnattr_destroy"  '(void*) 'int))
+(define proc-fa-inherit
+  (jolt-foreign-proc-safe "posix_spawn_file_actions_addinherit_np" '(void* int) 'int))
+(define proc-POSIX-SPAWN-CLOEXEC-DEFAULT #x4000)   ; <sys/spawn.h>, Darwin
+
 ;; What posix_spawn-with-pipes needs, and nothing more. The R8 fiber-parking
 ;; extension's own bindings (fcntl, errno) are gated separately by
 ;; proc-nonblock-ok? above: losing parking is a performance story, losing this
@@ -738,31 +752,40 @@
 ;; holds it for as long as IT lives, so the next run cannot bind the port at all
 ;; (jolt-fhv, #910: "bind failed on port 54603" behind curl children aged hours).
 ;;
-;; Two ways to say "and close the rest", in preference order:
+;; Three ways to say "and close the rest", in preference order:
 ;;
 ;;   1. posix_spawn_file_actions_addclosefrom_np(fa, 3), added LAST so it runs
 ;;      after the dup2s have put the pipes on 0/1/2. One action, one
 ;;      close_range(2) in the child, and no window at all: the set it closes is
 ;;      decided in the child, after this process can no longer add to it.
-;;   2. Where that entry does not resolve — macOS, and every glibc below 2.34,
-;;      which is most of the range jolt's released Linux binary targets —
-;;      enumerate this process's own open descriptors (/proc/self/fd on Linux,
-;;      /dev/fd on macOS/BSD) and add one addclose per fd. The snapshot is taken
-;;      in the PARENT, so a descriptor another thread opens between the listing
-;;      and the spawn is still inherited; proc-spawn-fd-mutex serialises spawns
-;;      against each other, not against the rest of the program. That residual
-;;      window is one this file cannot close without the syscall in 1, and it is
-;;      a far smaller one than inheriting the whole table.
+;;   2. POSIX_SPAWN_CLOEXEC_DEFAULT on macOS (proc-cloexec-default?): the kernel
+;;      starts the child with everything closed except what a file action names,
+;;      so the dup2'd pipes survive and an INHERITED stdio stream is named with
+;;      addinherit_np. Decided at spawn time like 1; no snapshot.
+;;   3. Where neither resolves — every glibc below 2.34, which is most of the
+;;      range jolt's released Linux binary targets — enumerate this process's
+;;      own open descriptors (/proc/self/fd on Linux, /dev/fd on BSD) and add one
+;;      addclose per fd. The snapshot is taken in the PARENT, so a descriptor
+;;      another thread opens between the listing and the spawn is still
+;;      inherited; proc-spawn-fd-mutex serialises spawns against each other, not
+;;      against the rest of the program. That residual window is one this file
+;;      cannot close without the syscall in 1, and it is a far smaller one than
+;;      inheriting the whole table.
 ;;
 ;; Each enumerated fd is confirmed open with fcntl(F_GETFD) before its action is
 ;; added, because an addclose of an already-closed fd is a file action that
-;; FAILS, and a failed file action means the child exits 127 instead of exec'ing
-;; (glibc forgives one below the fd limit; POSIX does not require it to). The
-;; listing is itself served by an open directory descriptor which is gone again
-;; by the time directory-list returns, so the snapshot always contains at least
-;; one such fd. Without a working fcntl there is nothing to confirm with and the
-;; fallback declines rather than risk a spawn that cannot exec — that is today's
-;; inheritance, which is the honest degradation here.
+;; FAILS. The check does not close the window either: a descriptor another
+;; thread closes between it and posix_spawn — a sibling's drained pipe, a file, a
+;; port a finalizer released — leaves a close action on a dead fd. glibc and musl
+;; ignore that in the child (a close below the fd limit that fails is skipped);
+;; the Darwin kernel fails the WHOLE spawn with EBADF, which is how three worker
+;; threads sharing a ThreadLocal<Process> lost one subprocess to "posix_spawn
+;; failed (errno 9)" — and why macOS takes tier 2, where nothing is snapshotted.
+;; The listing is itself served by an open directory descriptor which is gone
+;; again by the time directory-list returns, so the snapshot always contains at
+;; least one such fd. Without a working fcntl there is nothing to confirm with and
+;; the fallback declines rather than risk a spawn that cannot exec — that is
+;; today's inheritance, which is the honest degradation here.
 (define proc-F-GETFD 1)        ; macOS + Linux
 (define (proc-fd-live? fd)
   (and proc-fcntl-get (>= (proc-fcntl-get fd proc-F-GETFD) 0)))
@@ -778,6 +801,15 @@
 ;; inheritance case in a child jolt with it set.
 (define (proc-closefrom-disabled?)
   (let ((v (getenv "JOLT_NO_SPAWN_CLOSEFROM"))) (and v (not (string=? v "")) #t)))
+
+;; Tier 2: Darwin, with the attribute and inherit entries resolved. The same
+;; switch turns it off, so the enumeration fallback stays reachable from a Mac
+;; for the gate that exercises it.
+(define (proc-cloexec-default?)
+  (and (eq? (sa-os-family) 'macos)
+       proc-attr-init proc-attr-setflags proc-attr-destroy proc-fa-inherit
+       (not (proc-closefrom-disabled?))
+       #t))
 
 ;; `keep` names the fds that already have a close action of their own (the
 ;; pipe ends), so the fallback does not add a second one and fail it.
@@ -848,8 +880,19 @@
              (out-p (and (not inherit-out?) (mk-pipe #t #f)))
              (err-p (and (not inherit-err?) (mk-pipe #t #f)))
              (fa (sa-foreign-alloc 128))
+             ;; posix_spawnattr_t is one pointer on Darwin, the only place this
+             ;; is allocated; 64 bytes leaves room for a wider layout regardless.
+             (attr (and (proc-cloexec-default?) (sa-foreign-alloc 64)))
              (pidbuf (sa-foreign-alloc 8)))
         (proc-fa-init fa)
+        (when attr
+          (proc-attr-init attr)
+          (proc-attr-setflags attr proc-POSIX-SPAWN-CLOEXEC-DEFAULT)
+          ;; An inherited stream has no dup2 naming it, so under the flag it
+          ;; would be closed with everything else: name it.
+          (when inherit-in?  (proc-fa-inherit fa 0))
+          (when inherit-out? (proc-fa-inherit fa 1))
+          (when inherit-err? (proc-fa-inherit fa 2)))
         (when in-p  (proc-fa-dup2 fa (car in-p) 0)
                     (proc-fa-close fa (car in-p)) (proc-fa-close fa (cdr in-p)))
         (when out-p (proc-fa-dup2 fa (cdr out-p) 1)
@@ -857,21 +900,25 @@
         (when err-p (proc-fa-dup2 fa (cdr err-p) 2)
                     (proc-fa-close fa (cdr err-p)) (proc-fa-close fa (car err-p)))
         ;; LAST of the file actions, so the dup2s above have already moved the
-        ;; child's ends onto 0/1/2 by the time everything else goes.
-        (proc-close-inherited-fds!
-          fa (append (if in-p  (list (car in-p)  (cdr in-p))  '())
-                     (if out-p (list (car out-p) (cdr out-p)) '())
-                     (if err-p (list (car err-p) (cdr err-p)) '())))
+        ;; child's ends onto 0/1/2 by the time everything else goes. Under
+        ;; CLOEXEC_DEFAULT the kernel does this part.
+        (unless attr
+          (proc-close-inherited-fds!
+            fa (append (if in-p  (list (car in-p)  (cdr in-p))  '())
+                       (if out-p (list (car out-p) (cdr out-p)) '())
+                       (if err-p (list (car err-p) (cdr err-p)) '()))))
         (let* ((argv (proc-marshal-argv (list "/bin/sh" "-c" sh-cmd)))
                (envp (proc-marshal-argv
                       (map (lambda (p) (string-append (car p) "=" (cdr p)))
                            (proc-child-env-pairs))))
-               ;; attrp is NULL, so the child inherits this thread's signal mask —
+               ;; attrp is NULL — or carries only the CLOEXEC_DEFAULT flag, never
+               ;; SETSIGMASK — so the child inherits this thread's signal mask,
                ;; which must carry none of jolt's own blocking (concurrency.ss).
                (rc (jolt-with-empty-sigmask
-                     (lambda () (proc-c-spawn pidbuf "/bin/sh" fa 0 (car argv) (car envp)))))
+                     (lambda () (proc-c-spawn pidbuf "/bin/sh" fa (or attr 0) (car argv) (car envp)))))
                (pid (sa-foreign-ref 'int pidbuf 0)))
           (proc-fa-destroy fa)
+          (when attr (proc-attr-destroy attr) (sa-foreign-free attr))
           (sa-foreign-free fa) (sa-foreign-free pidbuf)
           (proc-free-argv argv) (proc-free-argv envp)
           ;; parent side: the child's pipe ends close unconditionally; on a failed
