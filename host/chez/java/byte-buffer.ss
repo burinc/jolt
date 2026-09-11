@@ -147,6 +147,16 @@
     (cons "rewind" (lambda (self) (bb-pos! self 0) self))
     (cons "flip" (lambda (self) (bb-limit! self (bb-pos self)) (bb-pos! self 0) self))
     (cons "clear" (lambda (self) (bb-pos! self 0) (bb-limit! self (bb-capacity self)) self))
+    ;; compact(): the remaining bytes move to the front and the buffer is left
+    ;; ready to be refilled — position after them, limit at capacity. This is the
+    ;; operation a chunked decode loop runs between reads to keep the trailing
+    ;; partial character a CharsetDecoder left behind (java/charset-coding.ss).
+    (cons "compact" (lambda (self)
+                      (let* ((p (bb-pos self)) (n (- (bb-limit self) p)))
+                        (when (> p 0) (bb-copy-between! self p self 0 n))
+                        (bb-pos! self n)
+                        (bb-limit! self (bb-capacity self))
+                        self)))
     ;; (.get dst) | (.get dst off len): bulk copy from position into a byte-array,
     ;; advancing position. Returns the buffer like the JVM.
     ;; (.put src): copy bytes into the buffer at position, advancing it. src is

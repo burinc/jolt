@@ -239,6 +239,128 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The first match on a large alternation no longer takes seconds (or never
+  finishes).** A 50-branch union with two unbounded `.*` branches — a retry
+  classifier's 873-character pattern — stalled ~5s on its first `re-find` on
+  x86_64 and did not terminate at all on aarch64 (#945). The cost was irregex's
+  tagged NFA→DFA conversion, which jolt uses for group-free patterns: nothing
+  bounded the WORK it would spend. A union of unbounded branches explodes
+  multiplicatively — that pattern's DFA has 4113 states over 2208 NFA states
+  and it does complete, after ~5.6s of building — and a pattern one step
+  larger would have reached the state cap only to give up and fall back to the
+  backtracker anyway, with the whole cost already paid (ten `a.*b` branches
+  spent 78ms to fail that way; twenty spent 750ms).
+
+  `host/chez/regex-dfa.ss` now replaces that one vendored procedure with a copy
+  that runs the conversion on a deterministic work budget. Over the budget is
+  the same answer as over the state cap — compile the pattern with the
+  backtracking matcher, which is `java.util.regex`'s own engine, so it is the
+  semantics jolt matches anyway. The pattern above now answers in ~50ms in a
+  release build, and a pattern whose DFA is affordable still gets one. Because
+  the budget counts work rather than time, a pattern compiles to the same engine
+  on every machine. (The copy also buckets the "have I built this state?" test
+  by the hash a multi-state already carries instead of a linear `assoc` over
+  every state; on this pattern that is worth about a tenth — 5.6s to 5.1s with
+  the budget lifted — so the budget is the fix and the bucket a tidy-up.)
+  `make regexdfacheck` pins irregex's original so bumping the submodule cannot
+  leave jolt shadowing a stale copy, and `make regexdfa` gates the budget by
+  which engine a pattern gets, not by a clock.
+
+- **`.`, `^` and `$` use Java's line-terminator set, and `(?d)` means what it
+  says.** Java ends a line at `\n`, `\r`, `\r\n`, NEL (U+0085), LS (U+2028) or
+  PS (U+2029), and the UNIX_LINES flag `(?d)` is what narrows that to `\n`
+  alone. jolt mapped `.` onto irregex's `nonl` and the anchors onto its
+  `bol`/`eol`, whose terminator is `\n` and nothing else, and accepted `(?d)`
+  as a no-op — so every pattern behaved as if UNIX_LINES were on (#956). `.`
+  matched across a `\r`, `(?m)^` did not match after one, `a$` did not match
+  in `"a\r"`, and `(?m)^(.*)$` over CRLF input captured the `\r`, which is how
+  it was found: an HTTP header parser where every value came back with one
+  attached. All four constructs now read the wide set, `(?d)` selects the
+  narrow one, and a CRLF counts as ONE terminator — no anchor matches between
+  its `\r` and its `\n`, so `$` on `"ab\r\n"` matches at 2 and 4 and not at 3.
+  Two edges of the same rule are Java's too and were not jolt's before, under
+  either terminator set: multiline `^` never matches at the very end of input
+  (`(re-seq #"(?m)^" "a\n")` is one match, and `(re-matches #"(?m)^$" "")` is
+  nil), and the JVM agrees.
+
+  Getting the anchors right also meant separating two positions irregex had
+  conflated. `irregex-search`'s start argument is both where the scan begins
+  and what the pattern treats as the beginning of input, so a resumed scan
+  re-anchored `^` at its cursor and look-behind could not see the character
+  before it. jolt passes the origin and the cursor separately now
+  (`irregex-search/matches`), which also retires a documented residual: a
+  `bos` nested in an alternation (`#"^a|b"`) no longer re-anchors at the
+  resume offset.
+
+- **`java.util.Base64/getMimeEncoder` and `getMimeDecoder` exist.** Four of the
+  JDK's six Base64 statics were here and the MIME pair was not, and the basic
+  decoder is no substitute: a MIME or PEM body carries line breaks, which it
+  rejects outright — so PEM/PKCS#8 parsing failed at the first decode on every
+  JWT, crypto and service-account login path (#955). The MIME encoder wraps at
+  76 characters with CRLF (`getMimeEncoder(len, sep)` takes its own, rounding
+  the length down to a multiple of 4 and refusing a separator that contains an
+  alphabet character, as the JDK does), and the MIME decoder discards every
+  character outside the alphabet. The basic and URL codecs are unchanged, and
+  the basic decoder still refuses a line break.
+
+- **Line reads strip a CRLF's carriage return.** `BufferedReader.readLine`,
+  `.lines`, `line-seq`, `read-line` over a decoded `*in*`, and `with-in-str`
+  all returned `"x\r"` for a line the JVM reads as `"x"` (#948). Two code paths
+  split on `\n` alone — the byte-decoding readers delegated to Chez's
+  `get-line`, and the string reader behind `with-in-str` searched for `"\n"` —
+  while the CRLF-aware logic already existed a few dozen lines away in
+  `System/in`'s own loop. All of them now end a line on `\n`, on `\r`, or on
+  `\r\n`, and a lone `\r` terminates for `StringReader` too. This broke an
+  OAuth callback server: the end-of-headers blank line arrived as `"\r"`, which
+  is truthy, so the reader blocked one line past the headers. The `\n` owed by
+  a `\r` is left for the next read rather than peeked for, so a reader over a
+  pipe still returns a line as soon as it has one.
+
+- **`io/reader` accepts a `reify`/`proxy` `Reader`, and `BufferedReader` wraps
+  one.** A `java.io.Reader` the caller wrote was refused by `io/reader`
+  outright, and `(BufferedReader. r)` handed it straight back — the constructor
+  was registered as the identity, which is right for jolt's own readers (a Chez
+  port is already buffered and already carries the method table) and wrong for
+  every other implementation: the result had no `.readLine`, no `.lines` and no
+  `.close`, and `(instance? BufferedReader …)` was false (#952). Both now go
+  through a delegating jhost that drives the wrapped object's `.read` — the one
+  method `java.io.Reader` leaves abstract — and supplies the rest on top, so a
+  library API whose contract is "any Reader" (an SSE body, a decorating
+  wrapper) can be ported as written.
+
+- **`java.text.Normalizer` works.** The class symbol resolved while
+  `Normalizer/normalize` and every `Normalizer$Form` constant threw "No
+  dependency provides java.text.Normalizer", so path matching and text
+  normalization degraded silently inside the `try`/`catch` a caller wraps them
+  in (#953). Chez implements all four Unicode normalization forms, so NFC, NFD,
+  NFKC and NFKD are now direct; `isNormalized` comes with them, and `Form` is
+  an enum constant that prints as its name like jolt's other modeled enums.
+
+- **`io/reader` over a `byte[]` decodes it.** `clojure.java.io/reader` took
+  every array for the JVM's `char[]` branch, so a byte array — a
+  `ByteArrayInputStream` read as UTF-8 on the JVM — came back as a reader over
+  the TEXT of its element values: `(line-seq (io/reader (.getBytes "a\nb")))`
+  was `("971098")`. Only a `char[]` takes that branch now; a `byte[]` decodes.
+  And `BufferedReader` over jolt's own `StringReader` is the `StringReader`, so
+  it answers `.lines` and `.ready` itself — `(.lines (BufferedReader.
+  (StringReader. s)))` used to be "No matching field found: lines".
+
+- **`CharsetDecoder` can decode.** `java.nio.charset.CodingErrorAction` had no
+  provider and the decoder's method table held only `.charset`, so the
+  documented way to decode a stream — a decoder with `CodingErrorAction/REPLACE`
+  fed a chunk at a time with `endOfInput` false — could not be expressed, and a
+  ported app had to hand-roll a byte-carry UTF-8 reassembler instead (#946).
+  `java.nio.CharBuffer`, `CodingErrorAction` and `CoderResult` are modeled, and
+  the decoder has `decode` in both overloads plus `onMalformedInput`,
+  `onUnmappableCharacter`, `replaceWith`, `flush` and `reset` (a fresh decoder
+  reports `REPORT` for both actions, as the JVM's does). What makes the
+  chunked idiom work is that `decode(in, out, endOfInput)` leaves a trailing
+  PARTIAL sequence in the input buffer and reports `UNDERFLOW`, so a multi-byte
+  character split across two reads survives the split; `ByteBuffer.compact` is
+  the other half of that loop and is now there too. UTF-8, ISO-8859-1 and
+  US-ASCII decode incrementally; any other charset decodes its whole remaining
+  input in one step, so only the whole-input form is faithful for those.
+
 - **`\p{…}` classes follow the JVM's rule, and a zero-width split resumes
   after its match.** `\p{L}` approximated with nearly the whole BMP above
   ASCII, so it matched every symbol and punctuation character there too —

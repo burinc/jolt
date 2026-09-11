@@ -20,6 +20,10 @@
 ;; the top of rt.ss (expression-position cond-expand, lone-string `error`),
 ;; which every load path runs before this file.
 (load "vendor/irregex/irregex.scm")
+;; …and jolt's replacement for its NFA->DFA conversion: the vendored one is
+;; quadratic in the DFA size and unbounded in work, which made a large
+;; alternation take seconds (or never finish) on its first match. See the file.
+(load "host/chez/regex-dfa.ss")
 
 
 ;; A jolt regex value: the source string (for printing / str) + the LAZILY
@@ -344,27 +348,34 @@
 ;; flag; jolt's scanning loops (re-seq, replace-all, split, matcher find) hand-roll
 ;; their own loop, so they have to honor it here.
 ;;
-;; Without this, irregex-search treats its start argument as the string ORIGIN and
-;; re-anchors ^ there: (str/replace "abcabc" #"^abc" "-") replaced twice, and
-;; (re-seq #"^abc" "abcabc") returned two matches, where the JVM does one. Selmer's
-;; include-tag parser strips its tag with ^.+?include\s*, so a nested
-;; {% include "a/include/head.html" %} lost everything up to the LAST "include"
-;; and resolved to "/head.html".
+;; The resume index is NOT the origin. irregex-search's start argument is both
+;; where the scan begins and what the pattern treats as the beginning of input:
+;; it re-anchored ^ there, so (str/replace "abcabc" #"^abc" "-") replaced twice
+;; and (re-seq #"^abc" "abcabc") returned two matches where the JVM does one
+;; (Selmer's include-tag parser strips its tag with ^.+?include\s*, so a nested
+;; {% include "a/include/head.html" %} lost everything up to the LAST "include"),
+;; and look-behind could not see the character before the resume point, which is
+;; what the wide line-terminator anchors need to tell a CRLF's \n from a lone one.
 ;;
-;; Residual: a bos nested inside an alternation (#"^a|b") is not flagged a
-;; consumer — it can legitimately match elsewhere — so scanning continues and its
-;; ^ branch can still re-anchor at the resume offset. irregex's own fold has the
-;; same limit.
+;; irregex-search/matches takes the two separately — `init` is the origin every
+;; assertion is measured from, `i` is where to start looking — so pass the origin
+;; as init and the cursor as i. That origin is index 0 for a whole-string scan and
+;; the REGION START for a matcher confined to one; the four-argument form takes
+;; both it and the region end.
 ;;
-;; The ORIGIN a bos anchors at is index 0 for a whole-string scan and the REGION
-;; START for a matcher confined to one, so the guard is against that origin
-;; rather than against 0; the four-argument form takes both it and the region end.
+;; The ~consumer? guard in front is now an optimization rather than a correction:
+;; a pattern anchored at the start of input cannot match past the origin, and
+;; irregex answers #f there on its own — this just saves it the scan.
 (define irx-search-from
   (case-lambda
     ((irx s i) (irx-search-from irx s i 0 (string-length s)))
     ((irx s i origin end)
      (and (or (= i origin) (not (flag-set? (irregex-flags irx) ~consumer?)))
-          (irregex-search irx s i end)))))
+          (let ((src (list s origin end))
+                (matches (irregex-new-matches irx)))
+            (irregex-match-chunker-set! matches irregex-basic-string-chunker)
+            (irregex-search/matches irx irregex-basic-string-chunker
+                                    (cons src origin) src i matches))))))
 
 ;; All non-overlapping matches, left to right. Advance past each match end (or by
 ;; one on a zero-width match). nil when there are no matches (Clojure: seq-able as
