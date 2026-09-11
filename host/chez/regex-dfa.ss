@@ -3,24 +3,28 @@
 ;; irregex compiles a group-free pattern to a DFA (regex.ss says why capturing
 ;; patterns keep the backtracker instead). The conversion is Laurikari's tagged
 ;; NFA->DFA: each DFA state is a MULTI-STATE, a vector with one slot per NFA
-;; state. Two things in the vendored version make a large pattern pathological,
-;; and one real pattern hit both — a 50-alternative union with two unbounded
-;; `.*` branches, 873 characters, from a retry classifier (#945). It took ~5s to
-;; match the first time on x86_64 and did not terminate at all on aarch64:
+;; state. The vendored version makes a large pattern pathological, and one real
+;; pattern did — a 50-alternative union with two unbounded `.*` branches, 873
+;; characters, from a retry classifier (#945). It took ~5s to match the first
+;; time on x86_64 and did not terminate at all on aarch64:
 ;;
-;;   1. The "have I already built this state?" test was (assoc st marked-states)
+;;   1. Nothing bounded the WORK. The state count is capped (10x the NFA's), but
+;;      a union of unbounded branches explodes multiplicatively: that pattern's
+;;      DFA has 4113 states over 2208 NFA states and COMPLETES, after ~5.6s of
+;;      closure and reach computations, and a pattern one step larger reaches
+;;      the cap — only to give up and fall back to the backtracker — with the
+;;      whole cost already paid. Ten `a.*b` branches spent 78ms to fail that
+;;      way; twenty spent 750ms. This is the fix.
+;;
+;;   2. The "have I already built this state?" test was (assoc st marked-states)
 ;;      — a linear scan of every state built so far, each comparison an equal?
-;;      over a vector with one slot per NFA state. 2208 NFA states and 4113 DFA
-;;      states made that ~8M whole-vector comparisons, and it is QUADRATIC, so it
-;;      is the part that turns a large pattern into a hang. A multi-state already
-;;      carries a hash of its contents (slot 2, maintained by every mutator), and
-;;      equal? multi-states necessarily have equal hashes, so bucketing by it is
-;;      exact: the scan within a bucket is the same assoc as before.
-;;
-;;   2. Nothing bounded the WORK. The state count is capped (10x the NFA's), but
-;;      a union of unbounded branches explodes multiplicatively and reaching that
-;;      cap — only to give up and fall back to the backtracker — is itself the
-;;      cost. Ten `a.*b` branches spent 78ms to fail; twenty spent 750ms.
+;;      over a vector with one slot per NFA state. A multi-state already carries
+;;      a hash of its contents (slot 2, maintained by every mutator), and equal?
+;;      multi-states necessarily have equal hashes, so bucketing by it is exact:
+;;      the scan within a bucket is the same assoc as before. Measured on the
+;;      #945 pattern with the budget lifted it is worth about a tenth (5.6s to
+;;      5.1s) — the closures dominate, not the seen-set — so this is a tidy-up
+;;      that rides along, not the reason the pattern is fast.
 ;;
 ;; So the conversion now carries a work budget, and going over it is the same
 ;; answer as going over the state cap: #f, which is irregex's signal to compile

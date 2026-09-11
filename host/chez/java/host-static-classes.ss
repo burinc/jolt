@@ -1137,6 +1137,14 @@
                                          (+ i 1)))
                        (substring s p i))
                       (else (scan (+ i 1)))))))))
+        ;; lines: the rest of the input one readLine at a time — what
+        ;; (BufferedReader. (StringReader. s)) hands back on the JVM, and
+        ;; BufferedReader over jolt's own readers IS the wrapped reader.
+        (cons "lines" (lambda (self)
+                        (let loop ((acc '()))
+                          (let ((l (record-method-dispatch self "readLine" jolt-nil)))
+                            (if (jolt-nil? l) (list->cseq (reverse acc)) (loop (cons l acc)))))))
+        (cons "ready" (lambda (self) #t))
         (cons "close" (lambda (self) jolt-nil))))
 
 ;; ---- PushbackReader ---------------------------------------------------------
