@@ -1994,6 +1994,63 @@
           ((and (> (char->integer c) 128) (not (uri-space-char? c)) (not (uri-iso-control? c))) (+ p 1))
           (else p))))
 
+;; java.net.URI.decode: percent-decode a component, as the NON-raw accessors
+;; answer it (getPath vs getRawPath). Three details make this more than a loop
+;; over "%hh":
+;;   - a run of consecutive escapes is one UTF-8 sequence — "%C3%A4" is "ä", not
+;;     two characters — so the run is collected and decoded together;
+;;   - a byte sequence that is not valid UTF-8 becomes U+FFFD rather than
+;;     raising, since the string already parsed as a URI and the accessor has no
+;;     way to report an error. Chez's utf8->string replaces malformed input
+;;     exactly as the JVM's UTF-8 decoder does (one U+FFFD for "%FF", one for the
+;;     truncated "%E2%82", one for a surrogate's "%ED%A0%80"), so the
+;;     substitution is the host's, not a rule reimplemented here;
+;;   - inside a BRACKETED IPv6 literal a "%" is the scope-id separator, not an
+;;     escape, so "[fe80::1%25eth0]" must not decode to "[fe80::1%eth0]" — a
+;;     scope id is written with the "%" escaped and stays that way. The JVM has
+;;     this as a flag per accessor (JDK-8037396): the components that can hold an
+;;     IPv6 literal — authority, userInfo, schemeSpecificPart — decode with it,
+;;     and path/query/fragment without, which is why "?q=[%25]" reads back from
+;;     getQuery as "q=[%]" but from getSchemeSpecificPart with the "%25" intact.
+;; "+" is NOT a space: that is form encoding, and URLDecoder's job, not this
+;; one's. A component with no "%" is returned as it is.
+(define (uri-decode* x keep-scope-id?)
+  (if (or (jolt-nil? x) (not (uri-index-of x #\% 0)))
+      x
+      (let ((n (string-length x)) (out '()))
+        ;; a "[" opens the literal region and the next "]" closes it; an
+        ;; unbalanced "]" outside one means nothing, as on the JVM.
+        (define (bracket-state c in?)
+          (cond ((char=? c #\[) #t) ((and in? (char=? c #\])) #f) (else in?)))
+        (define (escape-at? i in?)
+          (and (char=? (string-ref x i) #\%) (not (and in? keep-scope-id?))))
+        (let loop ((i 0) (in? #f))
+          (cond
+            ((>= i n) (apply string-append (reverse out)))
+            ;; a RUN of escapes is one UTF-8 sequence, so it decodes as one
+            ((escape-at? i in?)
+             (let run ((j i) (bytes '()))
+               (if (and (< j n) (escape-at? j in?))
+                   (run (+ j 3) (cons (+ (* 16 (hexv (string-ref x (+ j 1))))
+                                         (hexv (string-ref x (+ j 2))))
+                                      bytes))
+                   (begin (set! out (cons (utf8->string (u8-list->bytevector (reverse bytes))) out))
+                          (loop j in?)))))
+            ;; everything up to the next escape passes through unchanged — but
+            ;; the bracket state has to be tracked across it to know what an
+            ;; escape THERE means
+            (else
+             (let plain ((j i) (b in?))
+               (if (and (< j n) (not (escape-at? j b)))
+                   (plain (+ j 1) (bracket-state (string-ref x j) b))
+                   (begin (set! out (cons (substring x i j) out))
+                          (loop j b))))))))))
+;; The authority, the user info and the scheme-specific part can hold a bracketed
+;; IPv6 literal, so they keep a scope id's escaped "%"; the path, the query and
+;; the fragment cannot, so they decode every escape.
+(define (uri-decode-keeping-scope-id x) (uri-decode* x #t))
+(define (uri-decode x) (uri-decode* x #f))
+
 ;; The parse proper. Every failure goes to `bail` with a reason and an index
 ;; rather than raising, because two callers want two different exceptions —
 ;; the constructor a URISyntaxException, URI/create an IllegalArgumentException —
@@ -2236,17 +2293,29 @@
                            n)
                     body-end)))
       (when (< end n) (failx "end of URI" end))
-      (make-jhost "uri"
-        (list (cons 'string s)
-              (cons 'scheme scheme)
-              (cons 'ssp (substring s ssp-start body-end))
-              (cons 'authority authority)
-              (cons 'host host)
-              (cons 'user-info user-info)
-              (cons 'port (->num port))
-              (cons 'path path)
-              (cons 'query query)
-              (cons 'fragment fragment))))))
+      ;; Each escapable component is stored TWICE: the raw substring the parse
+      ;; produced, and its percent-decoded form, because java.net.URI answers both
+      ;; (getPath vs getRawPath) and they are different strings. The scheme, the
+      ;; host and the port have no decoded half on the JVM either — a scheme
+      ;; cannot hold an escape, and there is no getRawHost.
+      (let ((ssp (substring s ssp-start body-end)))
+        (make-jhost "uri"
+          (list (cons 'string s)
+                (cons 'scheme scheme)
+                (cons 'ssp ssp)
+                (cons 'dec-ssp (uri-decode-keeping-scope-id ssp))
+                (cons 'authority authority)
+                (cons 'dec-authority (uri-decode-keeping-scope-id authority))
+                (cons 'host host)
+                (cons 'user-info user-info)
+                (cons 'dec-user-info (uri-decode-keeping-scope-id user-info))
+                (cons 'port (->num port))
+                (cons 'path path)
+                (cons 'dec-path (uri-decode path))
+                (cons 'query query)
+                (cons 'dec-query (uri-decode query))
+                (cons 'fragment fragment)
+                (cons 'dec-fragment (uri-decode fragment))))))))
 (define (uri-parse-either s . opt)
   (call/cc (lambda (k)
              (apply uri-parse-1 s (lambda (reason idx) (k (list 'uri-error reason idx))) opt))))
@@ -2389,21 +2458,29 @@
         r)))
 (register-class-statics! "java.net.URI" (list (cons "create" (lambda (s) (uri-create (jolt-str-render-one s))))))
 (register-host-methods! "uri"
+  ;; The getX / getRawX pairs answer DIFFERENT strings: raw is the substring the
+  ;; parse produced, getX is that percent-decoded. They used to share one field,
+  ;; so getPath on "https://h.com/a%20b" answered "/a%20b" where the JVM answers
+  ;; "/a b" — the last divergence the java.net.URI differential run found
+  ;; (jolt-6i6). getScheme, getHost and getPort have no raw counterpart on the
+  ;; JVM and are unchanged.
   (list (cons "toString" (lambda (u) (uri-field u 'string)))
         (cons "toASCIIString" (lambda (u) (uri-field u 'string)))
         (cons "getScheme" (lambda (u) (uri-field u 'scheme)))
-        (cons "getSchemeSpecificPart" (lambda (u) (uri-field u 'ssp)))
+        (cons "getSchemeSpecificPart" (lambda (u) (uri-field u 'dec-ssp)))
         (cons "getRawSchemeSpecificPart" (lambda (u) (uri-field u 'ssp)))
-        (cons "getAuthority" (lambda (u) (uri-field u 'authority)))
+        (cons "getAuthority" (lambda (u) (uri-field u 'dec-authority)))
+        (cons "getRawAuthority" (lambda (u) (uri-field u 'authority)))
         (cons "getHost" (lambda (u) (uri-field u 'host)))
-        (cons "getUserInfo" (lambda (u) (uri-field u 'user-info)))
+        (cons "getUserInfo" (lambda (u) (uri-field u 'dec-user-info)))
         (cons "getRawUserInfo" (lambda (u) (uri-field u 'user-info)))
         (cons "getPort" (lambda (u) (uri-field u 'port)))
-        (cons "getPath" (lambda (u) (uri-field u 'path)))
+        (cons "getPath" (lambda (u) (uri-field u 'dec-path)))
         (cons "getRawPath" (lambda (u) (uri-field u 'path)))
-        (cons "getQuery" (lambda (u) (uri-field u 'query)))
+        (cons "getQuery" (lambda (u) (uri-field u 'dec-query)))
         (cons "getRawQuery" (lambda (u) (uri-field u 'query)))
-        (cons "getFragment" (lambda (u) (uri-field u 'fragment)))
+        (cons "getFragment" (lambda (u) (uri-field u 'dec-fragment)))
+        (cons "getRawFragment" (lambda (u) (uri-field u 'fragment)))
         ;; URI.toURL = new URL(toString()) (JVM); honors a library-registered
         ;; URL shim like io/as-url does.
         (cons "toURL" (lambda (u) (let ((ctor (lookup-class class-ctors-tbl "URL")))
