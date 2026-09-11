@@ -665,10 +665,12 @@
                           (reverse (cons (substring s last len) out))
                           ;; Emit the segment from last to this match point, skip
                           ;; leading empty (JVM semantics for zero-width splits).
+                          ;; Resume at me+1, not start+1 — start+1 can still sit at
+                          ;; or before ms and re-find this same match (#940).
                           (let ((seg (substring s last ms)))
                             (if (and (string=? seg "") (null? out))
-                                (loop (fx+ start 1) me out nout)
-                                (loop (fx+ start 1) me (cons seg out) (fx+ nout 1)))))
+                                (loop (fx+ me 1) me out nout)
+                                (loop (fx+ me 1) me (cons seg out) (fx+ nout 1)))))
                       (loop me me (cons (substring s last ms) out) (fx+ nout 1))))))))))
 
 ;; JVM split semantics over re-split, shared by String.split and Pattern.split:

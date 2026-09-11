@@ -133,17 +133,39 @@
 (define sre-Z
   '(or #\space #\xA0 #\x1680 (/ #\x2000 #\x200A) #\x2028 #\x2029 #\x202F #\x205F #\x3000))
 
+;; \p{L}/\p{N} used to approximate with a hand-picked range ((/ #\x80
+;; #\xD7FF) for L), which is nearly the whole BMP above ASCII and so
+;; wrongly matched symbols/punctuation too, e.g. U+2192 → (#941). Build
+;; the real Unicode General Category ranges from Chez's own
+;; char-general-category instead. ~10ms over the full codepoint space,
+;; paid once and lazily, only if a pattern actually uses \p{L}/\p{N}.
+(define (unicode-category-ranges categories)
+  (let loop ((cp 0) (start #f) (ranges '()))
+    (define (close-at cp ranges)
+      (if start (cons `(/ ,(integer->char start) ,(integer->char (- cp 1))) ranges) ranges))
+    (cond
+     ((> cp #x10FFFF) (cons 'or (reverse (close-at cp ranges))))
+     ((and (>= cp #xD800) (<= cp #xDFFF)) (loop (+ cp 1) start ranges)) ; surrogates
+     (else
+      (let ((in? (memq (char-general-category (integer->char cp)) categories)))
+        (cond
+         ((and in? (not start)) (loop (+ cp 1) cp ranges))
+         ((and (not in?) start) (loop (+ cp 1) #f (close-at cp ranges)))
+         (else (loop (+ cp 1) start ranges))))))))
+
+(define sre-unicode-L (delay (unicode-category-ranges '(Lu Ll Lt Lm Lo))))
+(define sre-unicode-N (delay (unicode-category-ranges '(Nd Nl No))))
+
 (define (prop-class-sre name)
   (cond
-   ;; Letters — BMP + supplementary
    ((or (string=? name "L") (string=? name "Alpha"))
-    '(or alpha (/ #\x80 #\xD7FF) (/ #\x10000 #\x10FFFF)))
+    (force sre-unicode-L))
    ((string=? name "Lu")
     '(or upper (/ #\xC0 #\xD6) (/ #\xD8 #\xDE)))
    ((string=? name "Ll")
     '(or lower (/ #\xDF #\xF6) (/ #\xF8 #\xFF)))
    ((or (string=? name "N") (string=? name "Nd") (string=? name "Digit"))
-    'numeric)
+    (force sre-unicode-N))
    ;; The Unicode separator categories are a short fixed list, so spell them out
    ;; rather than settling for irregex's ASCII `blank`. Zs is the space separators
    ;; (the non-breaking ones included — \p{Z} is a category, not Java's
