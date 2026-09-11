@@ -1553,12 +1553,18 @@
 
 ;; -- errno --------------------------------------------------------------------
 ;; errno is a PER-THREAD slot behind a libc function on every platform jolt
-;; runs on: __error on macOS, __errno_location on Linux, _errno on Windows
-;; (ucrt). Each returns the calling thread's &errno, so reading through it is
-;; correct under threads — and under fibers, whose syscall and errno read both
-;; run on the fiber's carrier thread. A global cell would be wrong the moment
-;; two threads made syscalls. The foreign-procedure form is created lazily on
-;; first call, so declaring all three is safe; errno calls the live one.
+;; runs on: __error on macOS, __errno_location on glibc/musl, __errno on
+;; bionic (Android), _errno on Windows (ucrt). Each returns the calling
+;; thread's &errno, so reading through it is correct under threads — and under
+;; fibers, whose syscall and errno read both run on the fiber's carrier thread.
+;; A global cell would be wrong the moment two threads made syscalls. The
+;; foreign-procedure form is created lazily on first call, so declaring all of
+;; them is safe; errno resolves and caches the live one.
+;;
+;; Bionic cannot be told apart by name — it reports os.name "Linux" while the
+;; glibc spelling has no entry there — so the Linux arm RESOLVES the accessor
+;; on first use: the glibc foreign-procedure raises its no-entry error on
+;; bionic, and __errno is taken instead.
 ;;
 ;; Read it IMMEDIATELY after the failing call: anything that can enter the
 ;; runtime between the call and the read — an allocation, a park, another FFI
@@ -1566,20 +1572,25 @@
 (defcfn c-errno-location "__errno_location" [] :pointer)
 (defcfn c-error-location "__error" [] :pointer)
 (defcfn c-errno-msvc "_errno" [] :pointer)
+(defcfn c-errno-bionic "__errno" [] :pointer)
 (defcfn c-strerror "strerror" [:int] :string)
 
 (def ^:private errno-loc
-  (case (System/getProperty "os.name")
-    "Mac OS X" c-error-location
-    "Windows"  c-errno-msvc
-    c-errno-location))
+  (delay
+    (case (System/getProperty "os.name")
+      "Mac OS X" (c-error-location)
+      "Windows"  (c-errno-msvc)
+      (try (c-errno-location)
+           (catch Throwable _
+             ;; no entry on bionic (Android/Termux)
+             (c-errno-bionic))))))
 
 (defn errno
   "The calling thread's errno, read through the platform's thread-local
   accessor. Read it immediately after the failing foreign call — any
   intervening call into the runtime can overwrite the slot."
   []
-  (jolt.ffi/__read (errno-loc) :int 0))
+  (jolt.ffi/__read @errno-loc :int 0))
 
 (defn errno-message
   "strerror's description of errno code e; with no argument, of the current
