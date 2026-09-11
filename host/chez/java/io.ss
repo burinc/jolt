@@ -1592,7 +1592,14 @@
              ;; the boost-style mixer Symbol/Keyword hash with, and that a
              ;; library folding several hashes into one calls directly
              (cons "hashCombine"
-                   (lambda (seed h) (hash-combine (jolt->fx seed) (jolt->fx h)))))))
+                   (lambda (seed h) (hash-combine (jolt->fx seed) (jolt->fx h))))
+             ;; Clojure's throw-without-a-checked-signature. A caller uses it to
+             ;; rethrow a caught exception and keep its type, which is exactly
+             ;; what jolt-throw does — SCI's reflective invoke ends every method
+             ;; call here, so without it a method that throws reports
+             ;; "No matching field or method: clojure.lang.Util/sneakyThrow"
+             ;; instead of the exception the method raised.
+             (cons "sneakyThrow" (lambda (t) (jolt-throw t))))))
   (register-class-statics! "Util" util-statics)
   (register-class-statics! "clojure.lang.Util" util-statics))
 ;; Thread/currentThread -> a fresh thread jhost wrapping THIS thread's interrupt
