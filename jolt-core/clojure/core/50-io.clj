@@ -36,12 +36,13 @@
   (let [pos (atom 0)]
     (reify IReader
       (-read-line [_]
-        (let [p @pos]
-          (when (< p (count s))
-            (let [i (str-find "\n" s p)]
-              (if (nil? i)
-                (do (reset! pos (count s)) (subs s p))
-                (do (reset! pos (inc i)) (subs s p i)))))))
+        ;; \n, \r and \r\n all end a line, and none of them is part of it —
+        ;; java.io.BufferedReader's rule, which the host seam owns so this
+        ;; reader and the port-backed ones cannot disagree about CRLF input.
+        (let [r (__string-line-from s @pos)]
+          (when-not (nil? r)
+            (reset! pos (nth r 1))
+            (nth r 0))))
       (-read-form [_]
         (let [r (__parse-next-from s @pos)]
           (if (nil? r)
