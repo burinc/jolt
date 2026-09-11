@@ -124,7 +124,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now runs for every build and takes just its compiler verdict — the graph
   is kept whole — so a program that reaches none of `eval`, `load-string`,
   `load-file`, `load`, `load-reader` or an image API boots from `petite.boot`
-  alone, and one that does keeps the compiler exactly as before. Hello-world,
+  alone (on POSIX — a Windows build keeps `scheme.boot` resident, since its
+  foreign-procedure forms are evaluated at start), and one that does keeps the
+  compiler exactly as before. Hello-world,
   measured with the runtime half's parameters above: 11.68MB → 9.15MB, 70ms →
   60ms, 132MB → 111MB resident; against 0.8.6's 27.25MB / 110ms / 225MB that
   is a third of the bytes, a little over half the start, and half the memory,
@@ -202,7 +204,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata and set ordering included, or the literal keeps the construction
   as before (a class value a macro spliced into a body has no reader syntax);
   a spliced copy's capture list is unchanged. On the hello-world binary from
-  the entry above: 9.14 → 8.84 MB on disk, the prelude's load allocates
+  the entry above: 9.15 → 8.84 MB on disk, the prelude's load allocates
   4.3 MB where it allocated 8.6 and takes 5 ms where it took 7, 102.5 →
   95.4 MB resident; the seed prelude is 1.96 → 1.70 MB and its image 1.20 →
   1.10 MB. The tree-shake reader admits the sibling-registration shape

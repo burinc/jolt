@@ -656,6 +656,40 @@
       (not (jolt-nil? (jolt-get (jolt-meta form) (keyword #f "line") jolt-nil)))))
 (with-mutex ts13-mu (set! ts13-state 'release) (condition-broadcast ts13-cv))
 
+;; 14. A linked var's root and its jv$ binding are ONE value (rt.ss
+;; var-root-set!). The cell is written and then the value handed to the setter;
+;; without the two writes being one critical section a writer racing a writer
+;; of the same var interleaves into root=f2 / binding=f1 -- direct callers on
+;; one fn, var-routed callers on the other, for good. The reader holds
+;; var-linked-mu, so it sees a consistent pair when and only when the writers
+;; hold it too.
+(define ts14-binding 'init)
+(define ts14-cell
+  (def-var-linked! "thread-safety-test" "ts14" 'jv$thread-safety-test$ts14 'init
+                   (lambda (v) (set! ts14-binding v)) #f))
+(define ts14-mismatches
+  (let* ((writers 3) (iters 30000)
+         (done (make-mutex)) (cv (make-condition)) (left writers))
+    (do ((t 0 (fx+ t 1))) ((fx=? t writers))
+      (fork-thread
+        (lambda ()
+          (do ((i 0 (fx+ i 1))) ((fx=? i iters))
+            (var-root-set! ts14-cell (cons t i)))
+          (with-mutex done (set! left (fx- left 1)) (condition-broadcast cv)))))
+    (let loop ((i 0) (bad 0))
+      (if (fx=? i iters)
+          (begin
+            (with-mutex done
+              (let wait () (unless (fx=? left 0) (condition-wait cv done) (wait))))
+            bad)
+          (loop (fx+ i 1)
+                (if (with-mutex var-linked-mu
+                      (eq? (var-cell-root ts14-cell) ts14-binding))
+                    bad
+                    (fx+ bad 1)))))))
+(ok "14. a linked var's root and its binding are one value under concurrent writers"
+    (fx=? ts14-mismatches 0))
+
 (printf "\nthread-safety-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "thread-safety-test: PASS — shared side-tables under concurrency\n") (exit 0))

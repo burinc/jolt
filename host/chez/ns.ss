@@ -593,7 +593,11 @@
       (hashtable-delete! ns-cells-index nm)   ; and the ns->cells bucket with it
       (vector-for-each
         (lambda (k) (let ((c (hashtable-ref var-table k #f)))
-                      (when (and c (string=? (var-cell-ns c) nm)) (hashtable-delete! var-table k))))
+                      (when (and c (string=? (var-cell-ns c) nm))
+                        (hashtable-delete! var-table k)
+                        ;; a seed var's linked setter goes with its cell: the
+                        ;; table is strong (rt.ss), and a re-def makes a new cell
+                        (jolt-with-mutex var-linked-mu (hashtable-delete! var-linked-tbl c)))))
         (hashtable-keys var-table)))
     n))
 

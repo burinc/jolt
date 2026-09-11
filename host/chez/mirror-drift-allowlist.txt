@@ -43,3 +43,4 @@ host/chez/rt.ss::jolt-var
 host/chez/rt.ss::register-code-value!
 host/chez/rt.ss::register-proc-name!
 host/chez/rt.ss::var-redefined?
+host/chez/rt.ss::var-root-set!
