@@ -85,6 +85,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A spawned child gets its own stdio and nothing else.** `posix_spawn` hands
+  the child every descriptor the parent has open unless the spawn says
+  otherwise, and jolt's spawn described only the three stdio streams — so a
+  subprocess inherited jolt's open source files, its nREPL listener, and
+  whatever socket a library was serving on. The JVM's `ProcessBuilder` gives a
+  child the three standard streams and nothing more, and the difference is
+  load-bearing rather than cosmetic: a child holding a copy of a listening
+  socket keeps that port BOUND after the parent closes it, for as long as the
+  child runs. An ORPHANED child — the parent killed by a test runner's
+  per-namespace timeout, say — holds it for as long as the orphan lives, which
+  is how a suite on fixed callback ports came to fail with `bind failed on port
+  54603` behind `curl` children aged hours (#910).
+
+  The spawn now closes everything above the stdio fds in the child:
+  `posix_spawn_file_actions_addclosefrom_np` where that entry resolves (glibc
+  2.34+ lowers it to one `close_range(2)`), and elsewhere — macOS, and every
+  older glibc, which is most of the range the released Linux binary targets —
+  by enumerating this process's own open descriptors (`/proc/self/fd`,
+  `/dev/fd`) and adding one close action each, every one of them confirmed open
+  with `fcntl` first, since a file action that fails leaves the child exiting
+  127 instead of exec'ing. The `closefrom` form has no window at all, because
+  the set it closes is decided in the child; the enumerated form takes its
+  snapshot in the parent, so a descriptor another thread opens between the
+  listing and the spawn is still inherited. An INHERIT redirect is untouched —
+  fds 0, 1 and 2 are below the cut and still carry the parent's own
+  descriptors, tty answers and all. `JOLT_NO_SPAWN_CLOSEFROM=1` forces the
+  fallback, so one machine's gate can exercise both paths.
 - **A task that shares a built-in command's name now says so, instead of
   letting the command answer as if the task were not there.** babashka's
   `:override-builtin` is what gives a task a command's name, and a task that
