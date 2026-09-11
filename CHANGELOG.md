@@ -185,6 +185,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through a var. The prelude is 4% smaller (2.04 → 1.96 MB), a direct call
   being shorter to emit than a hoisted cell read plus a dispatch.
 
+- **An anonymous fn's source registration is text the registry parses on
+  demand, not a structure built at every start.** Since 0.7.29 each fn
+  literal registers its source form at load (`image-register-fn-form!`, what
+  lets a state image write a closure as code), and the form was emitted as a
+  `let*` of `jolt-symbol` / `jolt-list` / `jolt-vector` calls: a quoted
+  construction compiled into the runtime as code and run at every process
+  start, for 262 literals in core and 146 in the compiler, though nothing
+  reads a registration until an image dumps that closure. The back end now
+  renders the form as Clojure source and emits `(image-fn-form-src "…")`, a
+  macro that expands to a UTF-8 bytevector constant — one byte per character
+  in the compiled runtime, nothing run at load — and `image-fn-form-lookup`
+  parses the text the first time it is asked, positions off, and caches the
+  form in the registration. Every rendering is checked at emit time against
+  that same parse: it must read back to the construction it replaces, symbol
+  metadata and set ordering included, or the literal keeps the construction
+  as before (a class value a macro spliced into a body has no reader syntax);
+  a spliced copy's capture list is unchanged. On the hello-world binary from
+  the entry above: 9.14 → 8.84 MB on disk, the prelude's load allocates
+  4.3 MB where it allocated 8.6 and takes 5 ms where it took 7, 102.5 →
+  95.4 MB resident; the seed prelude is 1.96 → 1.70 MB and its image 1.20 →
+  1.10 MB. The tree-shake reader admits the sibling-registration shape
+  (`run-dce-refs.ss`), and `fnform-test.ss` pins the round trip per literal
+  kind, the lazy parse, the fallback and the seed.
+
 - **`JOLT_STARTUP_PROFILE` accounts for the time before `main`.** The native
   marks began at the launcher's first line, so exec, the dynamic linker binding
   the kernel and any `:static` natives, and C constructors — the phase a bigger
@@ -198,6 +222,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   printing zero.
 
 ### Fixed
+
+- **The reader's mode switches are per-thread.** `rdr-edn-mode`,
+  `rdr-discard-cb`, `rdr-scan-mode` and `rdr-suppress-pos` were plain Chez
+  parameters, which every thread shares: a `clojure.edn/read-string` on one
+  thread put every other thread's reader into edn mode for its duration
+  (auto-resolved keywords rejected, `#_` discards handed to the edn callback),
+  and a `#$` interpolation dropped the positions off the lists another thread
+  was loading just then. Namespaces load in parallel, so both were live. They
+  are thread parameters now, as `rdr-source-file` already was;
+  `thread-safety-test.ss` holds one thread inside the `parameterize` while
+  another reads.
+
+- **A quoted qualified tagged literal keeps its namespace.** `'#foo/bar [1]`
+  — a `#tag` with no reader registered, inside quoted data — came back as a
+  tagged literal whose tag was the bare symbol named `"foo/bar"`; a tag
+  symbol the JVM reader reads is `foo/bar` with namespace `foo`, and
+  `tagged-literal` builds the same. The quoting back end built the
+  tag symbol from the whole text with no namespace; it splits a qualified tag
+  now.
 
 - **`clojure.lang.ARef`'s watch and validator METHODS work through interop.**
   Every watchable reference type was already an `IRef` by class — `(instance?
