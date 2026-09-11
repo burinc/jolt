@@ -29,6 +29,7 @@ host/chez/hasheq.ss::symbol-hasheq
 host/chez/rt.ss::code-value?
 host/chez/rt.ss::declare-var!
 host/chez/rt.ss::def-var!
+host/chez/rt.ss::def-var-linked!
 host/chez/rt.ss::jolt->fx
 host/chez/rt.ss::jolt-available-processors
 host/chez/rt.ss::jolt-capture-fault!
@@ -42,3 +43,4 @@ host/chez/rt.ss::jolt-var
 host/chez/rt.ss::register-code-value!
 host/chez/rt.ss::register-proc-name!
 host/chez/rt.ss::var-redefined?
+host/chez/rt.ss::var-root-set!

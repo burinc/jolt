@@ -1448,10 +1448,11 @@
              (parameterize ((ldr-source-only? #t))
                (load-namespace (car p)))))
          ordered)
-      ;; 2. emit each app namespace. Release and optimized modes enable the
-      ;; inference + record-shape setup passes (inference-enabled?); optimized
-      ;; mode additionally runs the inline + flatten + scalar-replace fixpoint
-      ;; (inline-enabled?). Dev mode gets const-fold + numeric-annotate only.
+      ;; 2. emit each app namespace. Every mode but dev runs the inference +
+      ;; record-shape setup passes and the inline + flatten + scalar-replace
+      ;; fixpoint (set-optimize! below; inlining follows direct-link); release
+      ;; and optimized differ only in the Chez compile parameters. Dev mode
+      ;; gets const-fold + numeric-annotate only.
       ;; direct-link? commits to a closed world: app->app calls bind directly, a
       ;; plain def is frozen in the binary (^:redef/^:dynamic stay var-routed).
       ;; The caller (jolt.main) turns it ON for release and optimized and OFF for
@@ -1528,77 +1529,59 @@
                 ;; form too (no-op unless the app registered data readers).
                 (parameterize ((ei-emit-form-hook
                                 (lambda (form) (if data-readers-active (ldr-apply-readers form) form))))
-                  (if tree-shake?
-                      (dce-shake
-                        (dce-blob-records "host/chez/seed/prelude.ss")
-                        ;; EAGER per-ns accumulation (see the non-shake branch):
-                        ;; the emit lambdas carry side effects — cell/gensym
-                        ;; allocation and direct-link-defined registration — and
-                        ;; jolt's lazy `map` realizes them in a non-list order,
-                        ;; which can emit the entry ns before its dependencies
-                        ;; (var-routed calls, out-of-order cells). The named let
-                        ;; runs strictly in `ordered` order (deps first).
-                        (let ((per-ns '()))
-                          (let loopfe ((rest ordered))
-                            (unless (null? rest)
-                              (let* ((nf (car rest))
-                                     (src (ldr-read-source (cdr nf)))
-                                     (profile-form
-                                       (bld-startup-profile-form
-                                         (string-append "namespace " (car nf)))))
-                                (jolt-enter-file! (cdr nf))   ; name the file on a failure
-                                (parameterize ((rdr-source-file (cdr nf)))
-                                  ;; RT.load-parity bracket (dyn-binding.ss): the
-                                  ;; ns's replayed forms run under fresh
-                                  ;; *warn-on-reflection*/*assert* bindings.
-                                  (set! per-ns
-                                    (cons (append
-                                            (list (dce-rec #t #f '() "(jolt-ns-load-vars-push!)"))
-                                            (map (lambda (s) (dce-rec #t #f '() s))
-                                                 (bld-ns-prelude (car nf) src))
-                                            (ei-emit-ns-records (car nf) src)
-                                            (list
-                                              (dce-rec #t #f '() "(jolt-ns-load-vars-pop!)")
-                                              (dce-rec #t #f '() profile-form)))
-                                          per-ns)))
-                              (loopfe (cdr rest))))
-                          (apply append (reverse per-ns))))
-                        (string-append entry-ns "/-main")
-                        allow-dynamic)
-                      (values
-                        #f
-                        ;; EAGER per-ns accumulation, NOT (apply append (map …)):
-                        ;; `map` here is jolt's LAZY map, and the per-ns emit lambdas carry side
-                        ;; effects (analysis, cell/gensym allocation, direct-link-defined
-                        ;; registration). Their realization order under apply/append is not the
-                        ;; list order, so an entry-ns lambda could run before a dependency's —
-                        ;; leaving cross-ns calls var-routed instead of direct-linked (and cell
-                        ;; names allocated out of order). for-each runs strictly in `ordered`
-                        ;; order (deps first), matching the loader.
-                        (let ((per-ns '()))
-                          (let loopfe ((rest ordered))
-                            (unless (null? rest)
-                              (let* ((nf (car rest))
-                                     (src (ei-timed "emit: read source"
-                                            (lambda () (ldr-read-source (cdr nf))))))
-                                (jolt-enter-file! (cdr nf))   ; name the file on a failure
-                                (parameterize ((rdr-source-file (cdr nf)))
-                                  ;; RT.load-parity bracket, matching the tree-shake path.
-                                  (set! per-ns
-                                    (cons (append
-                                            (list "(jolt-ns-load-vars-push!)")
-                                            (ei-timed "emit: ns-prelude"
-                                              (lambda () (bld-ns-prelude (car nf) src)))
-                                            (ei-timed "emit: per-ns total"
-                                              (lambda () (bld-emit-ns (car nf) src)))
-                                            (list
-                                              "(jolt-ns-load-vars-pop!)"
-                                              (bld-startup-profile-form
-                                                (string-append "namespace " (car nf)))))
-                                          per-ns)))
-                              (loopfe (cdr rest))))
-                          (apply append (reverse per-ns))))
-                        #f))))
+                  ;; Every build emits its app namespaces as DCE records — the
+                  ;; emitted Scheme plus the vars it references — and reads the
+                  ;; prelude as records too, so the same reachability walk that
+                  ;; drives --tree-shake also answers, for every build, whether
+                  ;; the program can reach the compiler. A shake prunes on that
+                  ;; graph; the default keeps every record and takes only the
+                  ;; compiler verdict (dce-needs-compiler?).
+                  ;;
+                  ;; EAGER per-ns accumulation, NOT (apply append (map …)):
+                  ;; `map` here is jolt's LAZY map, and the per-ns emit lambdas
+                  ;; carry side effects — analysis, cell/gensym allocation,
+                  ;; direct-link-defined registration — whose realization order
+                  ;; under apply/append is not the list order, so an entry-ns
+                  ;; lambda could run before a dependency's (var-routed calls,
+                  ;; out-of-order cells). The named let runs strictly in
+                  ;; `ordered` order (deps first), matching the loader.
+                  (let ((core-records (dce-blob-records "host/chez/seed/prelude.ss"))
+                        (app-records
+                          (let ((per-ns '()))
+                            (let loopfe ((rest ordered))
+                              (unless (null? rest)
+                                (let* ((nf (car rest))
+                                       (src (ei-timed "emit: read source"
+                                              (lambda () (ldr-read-source (cdr nf)))))
+                                       (profile-form
+                                         (bld-startup-profile-form
+                                           (string-append "namespace " (car nf)))))
+                                  (jolt-enter-file! (cdr nf))   ; name the file on a failure
+                                  (parameterize ((rdr-source-file (cdr nf)))
+                                    ;; RT.load-parity bracket (dyn-binding.ss): the
+                                    ;; ns's replayed forms run under fresh
+                                    ;; *warn-on-reflection*/*assert* bindings.
+                                    (set! per-ns
+                                      (cons (append
+                                              (list (dce-rec #t #f '() "(jolt-ns-load-vars-push!)"))
+                                              (map (lambda (s) (dce-rec #t #f '() s))
+                                                   (ei-timed "emit: ns-prelude"
+                                                     (lambda () (bld-ns-prelude (car nf) src))))
+                                              (ei-timed "emit: per-ns total"
+                                                (lambda () (ei-emit-ns-records (car nf) src)))
+                                              (list
+                                                (dce-rec #t #f '() "(jolt-ns-load-vars-pop!)")
+                                                (dce-rec #t #f '() profile-form)))
+                                            per-ns)))
+                                (loopfe (cdr rest))))
+                            (apply append (reverse per-ns)))))
+                        (entry-main (string-append entry-ns "/-main")))
+                    (if tree-shake?
+                        (dce-shake core-records app-records entry-main allow-dynamic)
+                        (values #f
+                                (map dce-rec-str app-records)
+                                (not (dce-needs-compiler? core-records app-records
+                                                          entry-main allow-dynamic)))))))
               (lambda ()
                 (set-optimize! #f)
                 (set-direct-link-flag! #f)
@@ -1633,26 +1616,33 @@
              (boot     (string-append builddir "/jolt.boot"))
              (boot-h   (string-append builddir "/boot_data.h"))
              (main-c   (string-append builddir "/main.c"))
-             ;; Emit the runtime half to its own file when it is app-independent,
-             ;; so its compile can be cached (bld-compile-runtime!). Tree-shaking
-             ;; rewrites the prelude per app (core-strs), and the cc / cross /
-             ;; library paths compile a single file in a spawned Chez, so all of
-             ;; those keep the one-file form. JOLT_NO_FLAT_SPLIT=1 forces the
-             ;; one-file form everywhere — an escape hatch for telling a build
-             ;; problem caused by the split apart from one merely revealed by it.
-             (split? (and (jolt-embedded-bytes "stub/launcher")
-                          (not library?) (not (bld-cross?)) (not core-strs)
-                          (not (getenv "JOLT_NO_FLAT_SPLIT")))))
+             ;; Emit the runtime half to its own file, always: it compiles under
+             ;; its own Chez parameters (bld-runtime-chez-params — no inspector
+             ;; information, which is 57% of a release binary and nothing the
+             ;; runtime's frames ever read), and when it is app-independent its
+             ;; fasl is cached (bld-compile-runtime!). A shaken core (core-strs)
+             ;; is per-app, so that unit skips the cache but is still the runtime
+             ;; unit; the cc / cross / library paths compile both files in their
+             ;; spawned Chez. JOLT_NO_FLAT_SPLIT=1 forces the one-file form
+             ;; everywhere — an escape hatch for telling a build problem caused
+             ;; by the split apart from one merely revealed by it — and the one
+             ;; file then compiles under the app half's parameters.
+             (split? (not (getenv "JOLT_NO_FLAT_SPLIT")))
+             (units (cond ((not split?) (list (list flat-ss flat-so 'whole)))
+                          (core-strs (list (list rt-ss rt-so 'runtime-shaken)
+                                           (list flat-ss flat-so 'app)))
+                          (else (list (list rt-ss rt-so 'runtime)
+                                      (list flat-ss flat-so 'app))))))
         (bld-mkdir-p builddir)
         ;; 3. flat source = runtime + app + launcher. When split, runtime.ss holds
         ;; the runtime half and flat.ss holds everything the app contributes; the
         ;; two are compiled separately and loaded into the boot in that order.
         (when split?
           (let ((out (open-output-file rt-ss 'replace)))
-            ;; The mode rides in the content so each mode keys its own cache entry:
-            ;; the text is mode-independent but the fasl is NOT — the Chez compile
-            ;; parameters (inspector info, fasl compression) differ by mode.
-            (put-string out (string-append ";; jolt runtime half — mode: " mode "\n"))
+            ;; No mode in the content: the runtime half compiles under ONE fixed
+            ;; parameter profile whatever the mode (bld-runtime-chez-params), so
+            ;; release, --opt and --dev share a single cache entry.
+            (put-string out ";; jolt runtime half\n")
             (bld-emit-runtime out drop-compiler? core-strs)
             (close-port out)))
         (let ((out (open-output-file flat-ss 'replace)))
@@ -1804,27 +1794,22 @@
           ;; self-contained in-process compile can't load a target xpatch, and the
           ;; xpatch retargets make-boot-file for the whole spawned process.
           ((and (bld-cross?) library?)
-           (build-shared entry-ns out-path mode builddir flat-ss flat-so boot boot-h ""))
+           (build-shared entry-ns out-path mode builddir units boot boot-h ""))
           ((bld-cross?)
-           (build-with-cc entry-ns out-path mode builddir flat-ss flat-so boot boot-h main-c
+           (build-with-cc entry-ns out-path mode builddir units boot boot-h main-c
                           "" (and drop-compiler? (not (bld-tgt-nt?)))))
           (library?
-           (build-shared entry-ns out-path mode builddir flat-ss flat-so boot boot-h
+           (build-shared entry-ns out-path mode builddir units boot boot-h
                          (bld-native-link-flags natives)))
           ;; petite-only is POSIX-only: on Windows jolt-foreign-proc-safe still
           ;; evals its foreign-procedure forms (fasl relocations abort the boot
           ;; there), and eval needs the compiler boot resident.
           ((jolt-embedded-bytes "stub/launcher")
-           (build-self-contained entry-ns out-path mode builddir
-                                 (if split?
-                                     (list (list rt-ss rt-so 'runtime)
-                                           (list flat-ss flat-so 'app))
-                                     (list (list flat-ss flat-so 'whole)))
-                                 boot
+           (build-self-contained entry-ns out-path mode builddir units boot
                                  (bld-native-link-flags natives)
                                  (and drop-compiler? (not bld-nt?))))
           (else
-           (build-with-cc entry-ns out-path mode builddir flat-ss flat-so boot boot-h main-c
+           (build-with-cc entry-ns out-path mode builddir units boot boot-h main-c
                           (bld-native-link-flags natives)
                           (and drop-compiler? (not bld-nt?)))))))))))
 
@@ -1896,13 +1881,19 @@
                       "(define jolt-baked-runtime-fingerprint " (ei-str-lit fp) ")\n"))
     (close-port out)))
 
-;; Per-mode Chez compile parameters for app binaries. Mirrors the pattern in
-;; build-jolt.ss (optimize-level 2, fasl-compressed #t for release/optimized).
-;; "release" keeps inspector + proc-source ON so Clojure backtraces (via
-;; inspect/object walking the continuation) survive. "optimized" turns them OFF
-;; for max speed. "dev" has no entry (Chez defaults: optimize-level 2, inspector
-;; ON, proc-source ON, fasl uncompressed — full debuggability). Single table
-;; referenced by both the prologue-string builder and the parameterize block.
+;; Per-mode Chez compile parameters for the APP half of a binary (the app and
+;; its libraries). "release" keeps inspector + proc-source information ON:
+;; Chez records a frame's return-point source only as inspector information,
+;; and the reporter resolves that offset through the marker table to recover
+;; the spliced chain a frame sits in and the exact line — the `step-boom` /
+;; `app.util/inner-boom` frames the build smoke's --innerfn case pins vanish
+;; without it (both parameters off, AND proc-source alone: it does not cover
+;; return points). "optimized" turns them OFF for the smallest, fastest app
+;; half; "dev" has no entry (Chez defaults: optimize-level 2, inspector ON,
+;; proc-source ON, fasl uncompressed — full debuggability). Single table
+;; referenced by both the script-string builder and the in-process compile.
+;;
+;; The RUNTIME half never uses this table — see bld-runtime-chez-params.
 ;;
 ;; optimize-level 2, not 3: level 3 is Chez's UNSAFE mode — fx/fl/car/vector
 ;; ops skip their type checks, and jolt's error semantics depend on those
@@ -1918,32 +1909,83 @@
                  (generate-procedure-source-information #t)
                  (fasl-compressed #t))))
 
-(define (bld-chez-param-forms mode)
-  (let ((params (assoc mode bld-chez-params)))
-    (if params
-        (fold-left
-          (lambda (s p) (string-append s "(" (symbol->string (car p)) " "
-                                      (let ((v (cadr p)))
-                                        (cond ((boolean? v) (if v "#t" "#f"))
-                                              ((number? v) (number->string v))
-                                              (else (format "~s" v))))
-                                      ")\n"))
-          "" (cdr params))
-        "")))
+;; The RUNTIME half's parameters — rt.ss, the clojure.core prelude, the
+;; compiler image, the loader — one profile whatever the mode, and the same
+;; one jolt's own binary is built with (build-jolt.ss, release): no inspector
+;; information, no procedure-source information. Nothing reads them there: a
+;; runtime frame prints by its code name (na-chunk-map-first, map-seq, dorun),
+;; which Chez keeps either way; core is minted without splicing, so it has no
+;; inline chains to recover; and the image writer learns a core closure's
+;; capture layout from its maker, not from inspector names. What they cost
+;; was the whole of burinc/jolt#3: with the release row's parameters over the
+;; runtime half too, a hello-world binary measured 27.25MB, 110ms to start and
+;; 225MB resident, against 11.68MB / 70ms / 132MB with them off — inspector
+;; information was 57% of the bytes, and the `Sbuild_heap` phase that scales
+;; with the image (90MB → 48MB of heap once decompressed) 106ms → 44ms.
+;; build-smoke pins the runtime half byte-identical across release and --opt,
+;; so the profile cannot quietly drift back to per-mode.
+(define bld-runtime-chez-params
+  '((optimize-level 2)
+    (generate-inspector-information #f)
+    (generate-procedure-source-information #f)
+    (fasl-compressed #t)))
 
-;; Compile one flat source file under the mode's Chez parameters. The mode->params
-;; table stays as jolt build policy; this is a thin translation of those params
-;; into the target-neutral profile sa-compile-file consumes.
-(define (bld-chez-compile-file mode src so)
-  (let ((params (assoc mode bld-chez-params)))
+;; PARAMS as `(name value)` binding text — the body of a parameterize, or one
+;; form per line when SEP is a newline.
+(define (bld-params-bindings params sep)
+  (fold-left
+    (lambda (acc p)
+      (string-append acc (if (string=? acc "") "" sep)
+                     "(" (symbol->string (car p)) " "
+                     (let ((v (cadr p)))
+                       (cond ((boolean? v) (if v "#t" "#f"))
+                             ((number? v) (number->string v))
+                             (else (format "~s" v))))
+                     ")"))
+    "" params))
+
+;; The app half's parameters for MODE, or #f for a mode with no row (dev).
+(define (bld-mode-params mode)
+  (let ((row (assoc mode bld-chez-params))) (and row (cdr row))))
+
+;; A `(compile-file SRC SO)` form for a spawned Chez, under PARAMS when given.
+(define (bld-compile-file-form params src so)
+  (let ((cf (string-append "(compile-file " (ei-str-lit src) " " (ei-str-lit so) ")")))
     (if params
-        (let ((pv (lambda (k) (cadr (assq k (cdr params))))))
-          (sa-compile-file src so
-            `((optimize . ,(pv 'optimize-level))
-              (inspector-info . ,(pv 'generate-inspector-information))
-              (source-info . ,(pv 'generate-procedure-source-information))
-              (compressed . ,(pv 'fasl-compressed)))))
-        (sa-compile-file src so #f))))
+        (string-append "(parameterize (" (bld-params-bindings params " ") ")\n  " cf ")\n")
+        (string-append cf "\n"))))
+
+;; The compile forms for UNITS in a spawned Chez: the runtime unit under the
+;; runtime profile, the app (or one-file) unit under the mode's row.
+(define (bld-units-compile-forms units mode)
+  (fold-left
+    (lambda (acc u)
+      (string-append acc
+        (bld-compile-file-form
+          (if (memq (caddr u) '(runtime runtime-shaken)) bld-runtime-chez-params (bld-mode-params mode))
+          (car u) (cadr u))))
+    "" units))
+
+;; Every unit's object file, quoted, in load order — the make-boot-file tail.
+(define (bld-units-so-args units)
+  (fold-left (lambda (acc u) (string-append acc "  " (ei-str-lit (cadr u)) "\n")) "" units))
+
+;; Compile SRC to SO in this process under PARAMS (an alist as above), by
+;; translating the parameter names into the target-neutral profile
+;; sa-compile-file consumes; #f = the target's defaults.
+(define (bld-chez-compile-params! params src so)
+  (if params
+      (let ((pv (lambda (k) (cadr (assq k params)))))
+        (sa-compile-file src so
+          `((optimize . ,(pv 'optimize-level))
+            (inspector-info . ,(pv 'generate-inspector-information))
+            (source-info . ,(pv 'generate-procedure-source-information))
+            (compressed . ,(pv 'fasl-compressed)))))
+      (sa-compile-file src so #f)))
+
+;; Compile one app-half (or one-file) source under MODE's row.
+(define (bld-chez-compile-file mode src so)
+  (bld-chez-compile-params! (bld-mode-params mode) src so))
 
 ;; --- runtime-half fasl cache -------------------------------------------------
 ;; The runtime half of the flat source (rt.ss + the clojure.core prelude +
@@ -1972,10 +2014,18 @@
         (not (or (string=? e "0") (string-ci=? e "false")
                  (string-ci=? e "no") (string-ci=? e "off")))
         #t)))
-(define (bld-runtime-cache-path body mode)
-  (string-append (bld-runtime-cache-dir) "/runtime-" mode "-"
-                 (number->string (string-length body) 16) "-"
-                 (number->string (aot-content-hash body) 16) ".so"))
+;; Keyed on the source AND the Chez parameters it compiles under
+;; (bld-runtime-chez-params): the parameters are what decide the fasl's
+;; bytes. Keyed on the mode's name alone, as this was, the day the runtime
+;; half stopped generating inspector information every build on a machine
+;; that had built before kept serving the old 22MB fasl under the new policy
+;; — the same source, the same word "release", a different compile — and the
+;; binary did not shrink until the cache was cleared by hand.
+(define (bld-runtime-cache-path body)
+  (let ((keyed (string-append (bld-params-bindings bld-runtime-chez-params "\n") body)))
+    (string-append (bld-runtime-cache-dir) "/runtime-"
+                   (number->string (string-length body) 16) "-"
+                   (number->string (aot-content-hash keyed) 16) ".so")))
 ;; Keep the newest few entries. One accumulates per jolt build × mode, so a
 ;; developer re-minting often would otherwise grow this without bound.
 (define bld-runtime-cache-keep 8)
@@ -2009,10 +2059,12 @@
       (put-bytevector out bs)
       (close-port out))))
 
-;; Compile the runtime half, reusing a cached fasl when one matches.
-(define (bld-compile-runtime! mode src so)
+;; Compile the runtime half under the runtime profile, reusing a cached fasl
+;; when one matches. CACHE? is #f for a shaken core: its text is per-app, so a
+;; hit is impossible and a store would only churn the cache.
+(define (bld-compile-runtime! src so cache?)
   (let* ((body (read-file-string src))
-         (cache (and (bld-runtime-cache-enabled?) (bld-runtime-cache-path body mode))))
+         (cache (and cache? (bld-runtime-cache-enabled?) (bld-runtime-cache-path body))))
     (if (and cache (file-exists? cache))
         (begin
           (bld-copy-file! cache so)
@@ -2020,7 +2072,7 @@
         (begin
           (bld-prepend-prologue! src)
           (ei-mark! "kernel prologue + hash")
-          (bld-chez-compile-file mode src so)
+          (bld-chez-compile-params! bld-runtime-chez-params src so)
           (ei-mark! "compile runtime half")
           (when cache
             (guard (e (#t #f))          ; an unwritable cache must not fail the build
@@ -2294,6 +2346,7 @@
 ;; that order, so the runtime half's defines precede the app half's reads.
 ;;   'whole   — one unsplit flat file: kernel prologue + baked fingerprint, no cache
 ;;   'runtime — the app-independent half: same, plus the fasl cache
+;;   'runtime-shaken — the same half with a tree-shaken core: per-app, no cache
 ;;   'app     — the app half: compiled plain. It needs no kernel prologue (its
 ;;              defines are jv$-munged and so cannot shadow a Chez name) and no
 ;;              fingerprint (the runtime unit carries the one that identifies it).
@@ -2307,7 +2360,8 @@
       (lambda (u)
         (let ((src (car u)) (so (cadr u)) (kind (caddr u)))
           (case kind
-            ((runtime) (bld-compile-runtime! mode src so))
+            ((runtime) (bld-compile-runtime! src so #t))
+            ((runtime-shaken) (bld-compile-runtime! src so #f))
             ((app)
              (bld-chez-compile-file mode src so)
              (ei-mark! "compile app half"))
@@ -2452,7 +2506,7 @@
   "  jolt_prefetch_boot(jolt_boot, (size_t)jolt_boot_len);\n")
 
 ;; --- legacy cc link (dev bin/jolt): fresh Chez compile + xxd + cc ------------
-(define (build-with-cc entry-ns out-path mode builddir flat-ss flat-so boot boot-h main-c native-link petite-only?)
+(define (build-with-cc entry-ns out-path mode builddir units boot boot-h main-c native-link petite-only?)
   (display (string-append "jolt build: compiling " entry-ns " (" mode " mode)\n"))
   (let ((cs (string-append builddir "/compile.ss")))
     (let ((p (open-output-file cs 'replace)))
@@ -2463,16 +2517,20 @@
           ;; target machine (ChezScheme/BUILDING, "CROSS COMPILING SCHEME
           ;; PROGRAMS"); the boots below come from the target pack.
           (if (bld-cross?) (string-append "(load " (ei-str-lit (bld-xpatch)) ")\n") "")
-          (bld-chez-param-forms mode)
-          "(compile-file " (ei-str-lit flat-ss) " " (ei-str-lit flat-so) ")\n"
+          ;; each unit under its own parameters (see build-self-contained): the
+          ;; runtime half without inspector information, the app half under the
+          ;; mode's row. No kernel prologue here — a fresh Chez has nothing of
+          ;; jolt's in its interaction environment to shadow a kernel name.
+          (bld-units-compile-forms units mode)
           ;; petite-only boot when the compiler image was dropped (see
-          ;; build-self-contained).
+          ;; build-self-contained). The unit fasls follow the Chez boots in the
+          ;; order they were compiled.
           "(make-boot-file " (ei-str-lit boot) " '()\n  "
-          (ei-str-lit (string-append (bld-csv-dir) "/petite.boot")) "\n  "
+          (ei-str-lit (string-append (bld-csv-dir) "/petite.boot")) "\n"
           (if petite-only?
               ""
-              (string-append (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "))
-          (ei-str-lit flat-so) ")\n"
+              (string-append "  " (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n"))
+          (bld-units-so-args units) ")\n"
           ;; vfasl, in THIS script so a cross build gets the xpatch's retargeted
           ;; constants the way make-boot-file above does — see build-jolt.ss.
           ;; --boot decides the codec, or omits the conversion (jolt#886).
@@ -2563,7 +2621,7 @@
     "        ((foreign-procedure \"jolt_set_lookup_addr\" (void*) void) lk-addr))\n"
     "      0)))\n"))
 
-(define (build-shared entry-ns out-path mode builddir flat-ss flat-so boot boot-h native-link)
+(define (build-shared entry-ns out-path mode builddir units boot boot-h native-link)
   (display (string-append "jolt build: compiling " entry-ns " (" mode " mode, shared library)\n"))
   (let ((cs (string-append builddir "/compile.ss")))
     (let ((p (open-output-file cs 'replace)))
@@ -2573,12 +2631,11 @@
           ;; As in build-with-cc, loading the xpatch retargets compile-file and
           ;; make-boot-file for the lifetime of this fresh Chez process.
           (if (bld-cross?) (string-append "(load " (ei-str-lit (bld-xpatch)) ")\n") "")
-          (bld-chez-param-forms mode)
-          "(compile-file " (ei-str-lit flat-ss) " " (ei-str-lit flat-so) ")\n"
+          (bld-units-compile-forms units mode)
           "(make-boot-file " (ei-str-lit boot) " '()\n  "
           (ei-str-lit (string-append (bld-csv-dir) "/petite.boot")) "\n  "
-          (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n  "
-          (ei-str-lit flat-so) ")\n"
+          (ei-str-lit (string-append (bld-csv-dir) "/scheme.boot")) "\n"
+          (bld-units-so-args units) ")\n"
           ;; vfasl, as in build-with-cc and build-jolt.ss
           (bld-vfasl-script-form boot (string-append boot ".vfasl"))))
       (close-port p))

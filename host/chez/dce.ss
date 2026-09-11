@@ -17,7 +17,12 @@
 ;; refs are reachability roots. #f = a prunable def emitted only if fqn is reached.
 ;; fqn: "ns/name" of a prunable def, else #f. refs: "ns/name" strings it references.
 ;; str: the Scheme source to emit.
-(define (dce-rec keep? fqn refs str) (vector keep? fqn refs str))
+;; INIT-RUNS?: the def's init executes code at load (anything but a fn literal
+;; or a constant) -- see dce-def-init-runs?. Optional, #f when not given: keep
+;; records are roots anyway and prelude records are never rooted by it.
+(define (dce-rec keep? fqn refs str . init-runs)
+  (vector keep? fqn refs str (and (pair? init-runs) (car init-runs) #t)))
+(define (dce-rec-init-runs? r) (vector-ref r 4))
 (define (dce-rec-keep? r) (vector-ref r 0))
 (define (dce-rec-fqn r)   (vector-ref r 1))
 (define (dce-rec-refs r)  (vector-ref r 2))
@@ -35,16 +40,51 @@
 ;; "ns/name" of every var reference anywhere in an IR node, prepended to acc. Counts
 ;; a :var (call head or value) and a :the-var (#'x). Arg order (acc node) matches
 ;; reduce-ir-children's fold fn so it nests directly.
+;; A BARE varargs binding -- [:string :int :&], babashka.ffi's form where each
+;; call infers its own tail -- compiles a foreign-procedure for every new tail
+;; shape at the CALL (java/ffi.ss ffi-varargs-compile), and petite cannot
+;; compile one ("cannot compile foreign-procedure: compiler is not loaded").
+;; The back end lowers the binding to direct Scheme calls, so no :var names
+;; what it reaches; the ref is the host entry that does the compiling,
+;; jolt.host/ffi-varargs-compile, which dce-compile-refs lists.
+(define dce-kw-ffi-fn   (keyword #f "ffi-fn"))
+(define dce-kw-argtypes (keyword #f "argtypes"))
+(define dce-ffi-varargs-ref "jolt.host/ffi-varargs-compile")
+(define (dce-ffi-bare-varargs? node)
+  (let ((at (jolt-get node dce-kw-argtypes)))
+    (and (not (jolt-nil? at))
+         (> (jolt-count at) 0)
+         (let ((last (jolt-peek at)))
+           (and (string? last) (or (string=? last "&") (string=? last "varargs")))))))
 (define (dce-collect-refs acc node)
   (let ((op (jolt-get node dce-kw-op)))
-    (if (or (eq? op dce-kw-var) (eq? op dce-kw-the-var))
-        (cons (string-append (jolt-get node dce-kw-ns) "/" (jolt-get node dce-kw-name)) acc)
-        (dce-reduce-children dce-collect-refs acc node))))
+    (cond ((or (eq? op dce-kw-var) (eq? op dce-kw-the-var))
+           (cons (string-append (jolt-get node dce-kw-ns) "/" (jolt-get node dce-kw-name)) acc))
+          ((and (eq? op dce-kw-ffi-fn) (dce-ffi-bare-varargs? node))
+           (dce-reduce-children dce-collect-refs (cons dce-ffi-varargs-ref acc) node))
+          (else (dce-reduce-children dce-collect-refs acc node)))))
 
 ;; The fqn of a bare top-level def (the only prunable IR form), else #f.
 (define (dce-def-fqn node)
   (and (eq? (jolt-get node dce-kw-op) dce-kw-def)
        (string-append (jolt-get node dce-kw-ns) "/" (jolt-get node dce-kw-name))))
+
+;; Does this top-level def's init RUN code at load? A fn literal (every defn)
+;; or a constant only binds; any other init -- a call, a let, an atom around a
+;; fn -- executes when the namespace loads, so in a build that prunes nothing
+;; it is a root of the compiler verdict (dce-needs-compiler?): what it calls,
+;; and what it creates and may call later, are scanned. A defn whose BODY
+;; evals is not one -- nothing runs until it is called, and the graph answers
+;; whether it is.
+(define dce-kw-init  (keyword #f "init"))
+(define dce-kw-fn    (keyword #f "fn"))
+(define dce-kw-const (keyword #f "const"))
+(define (dce-def-init-runs? node)
+  (and (eq? (jolt-get node dce-kw-op) dce-kw-def)
+       (let ((init (jolt-get node dce-kw-init)))
+         (and (not (jolt-nil? init))
+              (let ((op (jolt-get init dce-kw-op)))
+                (not (or (eq? op dce-kw-fn) (eq? op dce-kw-const))))))))
 
 ;; --- reference sets that gate the analysis ----------------------------------
 ;; A reference whose presence in reachable code forces keep-everything (the static
@@ -58,24 +98,57 @@
     ;; runtime via ns-publics/ns-interns/&c finds vars invisible to the static
     ;; IR graph, so any such reference bails the shake.
     "clojure.core/ns-publics" "clojure.core/ns-interns" "clojure.core/ns-map"
-    "clojure.core/ns-refers" "clojure.core/all-ns" "clojure.core/ns-aliases"))
+    "clojure.core/ns-refers" "clojure.core/all-ns" "clojure.core/ns-aliases"
+    ;; Restoring an image COMPILES the fn sources it carries, and a source can
+    ;; name any core var — one the compiled program never reached, because the
+    ;; inline pass spliced it away at every site. A shaken build restored an
+    ;; image whose closure source called `update` and died on an unbound var
+    ;; that its own compiled -main had used without a trace. So an image
+    ;; restore is a bail, for the same reason eval is: the static graph cannot
+    ;; see what the restored code will reference. (Writing an image is not —
+    ;; see dce-compile-refs.) Named by the HOST entry points: jolt.image's
+    ;; wrappers are one-line defns the inline pass splices into their callers,
+    ;; after which only the host call is left in the caller's refs — and an
+    ;; unspliced wrapper still reaches the host call through its own record.
+    "jolt.host/image-read" "jolt.host/image-restore-world!"))
 
 ;; A reference that needs the analyzer/back end at runtime (compile-from-source). If
 ;; reachable code uses none of these, the compiler image is dropped from the binary —
 ;; an AOT app is fully compiled. (resolve/require don't need it: resolve is a
 ;; var-table lookup; a require of a baked ns no-ops.)
 ;;
-;; NOTE: dce-compile-refs is a SUBSET of dce-bail-refs — every form needing the
-;; compiler at runtime (eval, load-string/…) also bails the tree-shake because the
-;; static graph can't track what the compiler will compile. So a successful shake
-;; (no bail) always drops the compiler, and ANY bail keeps it (drop-compiler? is
-;; (and (not bail) (not needs-compiler)) in dce-shake) — conservative on purpose:
-;; a requiring-resolve bail may load and compile source at runtime. The subset
-;; relationship is load-bearing: eval'd code might reference any core def, and a
-;; shaken prelude would be missing some — bail keeps everything and the compiler.
+;; NOTE: every CORE entry in dce-compile-refs (eval, load-string, …) is also a
+;; dce-bail-ref -- the static graph cannot track what the compiler will compile,
+;; and eval'd code may reference any core def a shaken prelude would be
+;; missing -- so reaching one keeps the compiler AND everything else. The
+;; converse does not hold: the two lists answer two questions. Bail is "can the
+;; shake trust the graph"; compile is "does this program compile at run time".
+;; Writing an image needs the fasl writer in scheme.boot and shakes fine; a bare
+;; varargs FFI binding compiles a foreign-procedure per tail shape and shakes
+;; fine. A def :allow-dynamic vouches for is spared the bail for a RESOLUTION
+;; ref only: a ref that runs the compiler bails regardless, because the
+;; compiler image is direct-linked against the whole core and cannot run over
+;; a shaken one (dce-bail-scan). drop-compiler? is (and (not bail) (not
+;; needs-compiler)): a bail keeps the compiler too, since a requiring-resolve
+;; may load and compile source at runtime.
 (define dce-compile-refs
   '("clojure.core/eval" "clojure.core/load-string" "clojure.core/load-file"
-    "clojure.core/load-reader" "clojure.core/load"))
+    "clojure.core/load-reader" "clojure.core/load"
+    ;; Images. Restoring one compiles the fn SOURCES it carries (state-image.ss
+    ;; image-compile-eval-seam), so a program that reads one back needs the
+    ;; compiler as surely as one that evals; and WRITING one goes through the
+    ;; fasl writer ($write-fasl-bytevectors), which lives in scheme.boot — the
+    ;; compiler kernel a dropped build boots without. Named by the HOST entry
+    ;; points (see the image note in dce-bail-refs for why not the wrappers).
+    ;; Every build decides now, not only a shaken one, so these are what keep
+    ;; the compiler resident for an image-using program.
+    "jolt.host/image-read" "jolt.host/image-write!"
+    "jolt.host/image-dump-world!" "jolt.host/image-restore-world!"
+    ;; Scheme text evaluated at run time (jolt.scheme/eval-string); proc is a
+    ;; top-level lookup and lives in the runtime half, so it is not one.
+    "jolt.host/scheme-eval-string"
+    ;; the bare varargs FFI binding, see dce-collect-refs
+    "jolt.host/ffi-varargs-compile"))
 
 ;; clojure.core fns the runtime .ss shims reference by name (via var-deref) — they
 ;; aren't visible in the IR call graph, so seed them as roots. (Found by grepping the
@@ -126,8 +199,28 @@
 (define (dce-unwrap form)
   (if (and (pair? form) (eq? (car form) 'guard) (pair? (cddr form))) (caddr form) form))
 
+;; The seed is minted direct-linked: a core def binds jv$<fqn> and a core->core
+;; call is that SYMBOL, not a (var-deref "ns" "nm") literal. This maps each
+;; such symbol to its "ns/name", filled by dce-blob-records from the
+;; (def-var-linked! "ns" "nm" 'jv$… …) forms before any record's refs are
+;; read, so a direct call is an edge exactly as a var-routed one is. Process
+;; global, like the records it describes; refilled on every read of the blob.
+(define dce-linked-syms (make-eq-hashtable))
+(define (dce-linked-fqn x)
+  (and (symbol? x) (hashtable-ref dce-linked-syms x #f)))
+(define (dce-note-linked! form)
+  (when (and (pair? form) (eq? (car form) 'def-var-linked!)
+             (pair? (cdr form)) (string? (cadr form))
+             (pair? (cddr form)) (string? (caddr form))
+             (pair? (cdddr form)) (pair? (cadddr form))
+             (eq? (car (cadddr form)) 'quote) (pair? (cdr (cadddr form)))
+             (symbol? (cadr (cadddr form))))
+    (hashtable-set! dce-linked-syms (cadr (cadddr form))
+                    (string-append (cadr form) "/" (caddr form)))))
+
 ;; "ns/name" of every (var-deref "ns" "nm"), (jolt-var "ns" "nm"), or
-;; (var-cell-lookup "ns" "nm") literal in a read form, inserted into ht.
+;; (var-cell-lookup "ns" "nm") literal in a read form, and of every linked jv$
+;; symbol, inserted into ht.
 (define (dce-sexp-refs-into! form ht)
   (cond
     ((and (pair? form) (memq (car form) '(var-deref jolt-var var-cell-lookup))
@@ -135,7 +228,8 @@
      (hashtable-set! ht (string-append (cadr form) "/" (caddr form)) #t))
     ((pair? form)
      (dce-sexp-refs-into! (car form) ht)
-     (dce-sexp-refs-into! (cdr form) ht))))
+     (dce-sexp-refs-into! (cdr form) ht))
+    ((dce-linked-fqn form) => (lambda (fqn) (hashtable-set! ht fqn #t)))))
 
 ;; List-accumulating variant, still live: the round-trip scan below (and the
 ;; run-dce-refs gate) consume it. dce-sexp-refs-into! is the hash-set fast path.
@@ -145,6 +239,7 @@
           (pair? (cdr form)) (string? (cadr form)) (pair? (cddr form)) (string? (caddr form)))
      (cons (string-append (cadr form) "/" (caddr form)) acc))
     ((pair? form) (dce-sexp-refs (cdr form) (dce-sexp-refs (car form) acc)))
+    ((dce-linked-fqn form) => (lambda (fqn) (cons fqn acc)))
     (else acc)))
 
 ;; All "ns/name" refs a text scan of an emitted Scheme string carries, deduped via
@@ -168,10 +263,11 @@
   (append (dce-collect-refs '() ir) (dce-sexp-refs-str str)))
 
 ;; The (def-var! "ns" "name" …) / (def-var-with-meta! …) form a prelude record
-;; defines, or #f for a non-def form. A def whose value holds an anonymous fn
-;; literal is minted as (begin (let* <quote pool> (image-register-fn-form! …)…)
-;; (def-var…)) — the source registration first, then the def — so look through
-;; exactly that shape. Read as a non-def form, every such def (138 of the 685
+;; defines, or #f for a non-def form. A def whose value holds anonymous fn
+;; literals is minted as (begin (image-register-fn-form! ...)... (def-var...)) --
+;; one source registration per literal first, then the def; a literal with no
+;; source rendering keeps its quoted construction, a (let* <quote pool> ...)
+;; around the registrations -- so look through exactly those shapes. Read as a non-def form, every such def (138 of the 685
 ;; prelude defs) was an unprunable root, and two of them, clojure.repl/find-doc
 ;; and apropos, reference all-ns, ns-interns and ns-publics: every --tree-shake
 ;; build bailed from the commit that made core's literals register (7d11cfed,
@@ -179,18 +275,39 @@
 ;; Any other begin (a defrecord's several defs, a def-var-plain! group) stays a
 ;; keep form as before: a record carries one fqn, and pruning several defs
 ;; under one of their names is unsound.
+;; A direct-linked seed def (bootstrap.ss) is minted as
+;;   (begin [(image-register-fn-form! ...)... | (let* <quote pool> (image-register-fn-form! ...)...)]
+;;          (define jv$ns$name <init>)
+;;          (def-var-linked! "ns" "name" 'jv$ns$name jv$ns$name (lambda (v) (set! jv$ns$name v)) meta)
+;;          [(jolt-register-variadic! n jv$ns$name)])
+;; — the same single-fqn def, so it prunes under that name too. The walk below
+;; admits exactly these siblings, in this order; any other begin stays a keep form.
 (define (dce-def-var-form b)
   (define (def-var-form? x)
-    (and (pair? x) (memq (car x) '(def-var! def-var-with-meta!))
+    (and (pair? x) (memq (car x) '(def-var! def-var-with-meta! def-var-plain! def-var-linked!))
          (pair? (cdr x)) (string? (cadr x))
          (pair? (cddr x)) (string? (caddr x))))
+  (define (headed? x head) (and (pair? x) (eq? (car x) head)))
+  (define (linked-define? x)
+    (and (headed? x 'define) (pair? (cdr x)) (symbol? (cadr x))
+         (let ((s (symbol->string (cadr x))))
+           (and (fx>= (string-length s) 3) (string=? (substring s 0 3) "jv$")))))
+  (define (trailing-ok? xs)
+    (or (null? xs)
+        (and (headed? (car xs) 'jolt-register-variadic!) (trailing-ok? (cdr xs)))))
   (cond
     ((def-var-form? b) b)
-    ((and (pair? b) (eq? (car b) 'begin)
-          (pair? (cdr b)) (pair? (cadr b)) (eq? (car (cadr b)) 'let*)
-          (pair? (cddr b)) (null? (cdddr b))
-          (def-var-form? (caddr b)))
-     (caddr b))
+    ((headed? b 'begin)
+     (let* ((xs (cdr b))
+            (xs (let skip ((xs xs))
+                  (if (and (pair? xs)
+                           (or (headed? (car xs) 'image-register-fn-form!)
+                               (headed? (car xs) 'let*)))
+                      (skip (cdr xs))
+                      xs)))
+            (xs (if (and (pair? xs) (linked-define? (car xs))) (cdr xs) xs)))
+       (and (pair? xs) (def-var-form? (car xs)) (trailing-ok? (cdr xs))
+            (car xs))))
     (else #f)))
 
 ;; str re-serializes the read form (compiled identically; comments/whitespace are
@@ -201,8 +318,18 @@
   ;; jolt checkout present. Forward ref: build.ss loads after this file.
   (call-with-port (open-input-string (bld-source-string path))
     (lambda (p)
-      (let loop ((acc '()))
-        (let ((form (read p)))
+      ;; two passes: every linked symbol is known before any record's refs are
+      ;; read, or a call to a def minted LATER in the blob would be no edge
+      (let ((forms (let rd ((acc '()))
+                     (let ((form (read p)))
+                       (if (eof-object? form) (reverse acc) (rd (cons form acc)))))))
+        (hashtable-clear! dce-linked-syms)
+        (for-each (lambda (form)
+                    (let ((b (dce-unwrap form)))
+                      (when (pair? b) (for-each dce-note-linked! (if (eq? (car b) 'begin) (cdr b) (list b))))))
+                  forms)
+      (let loop ((acc '()) (forms forms))
+        (let ((form (if (null? forms) (eof-object) (car forms))))
           (if (eof-object? form)
               (reverse acc)
               (let ((b (dce-unwrap form))
@@ -221,7 +348,8 @@
                            (if d
                                (dce-rec #f (string-append (cadr d) "/" (caddr d)) refs str)
                                (dce-rec #t #f refs str)))
-                        acc)))))))))
+                        acc)
+                      (cdr forms))))))))))
 
 ;; A reader fn reached ONLY via runtime (read-string "#my/tag ..") resolves through
 ;; *data-readers* var-deref — invisible to the IR graph. The baked *data-readers* map
@@ -342,17 +470,27 @@
     (for-each
       (lambda (r)
         (let ((fqn (dce-rec-fqn r)))
-          (when (and (dce-rec-reached? r reached)
-                     (not (and fqn (hashtable-ref allow-ht fqn #f))))
+          (when (dce-rec-reached? r reached)
+            ;; :allow-dynamic vouches for a RESOLUTION the graph cannot follow
+            ;; (resolve, requiring-resolve, ns-publics ...). It cannot vouch for
+            ;; a ref that RUNS the compiler -- eval, load-string, an image
+            ;; restore -- because the compiler image is direct-linked against
+            ;; the whole core and cannot run over a shaken one (an allowed eval
+            ;; used to shake, and died on a pruned core def inside the
+            ;; compiler). So an allowed def bails on those still, and the hint
+            ;; does not offer to allow it: nothing the key says would help.
+            (let ((allowed? (and fqn (hashtable-ref allow-ht fqn #f))))
             (for-each (lambda (ref)
-                        (when (hashtable-ref bail-ht ref #f)
+                        (when (and (hashtable-ref bail-ht ref #f)
+                                   (or (not allowed?) (hashtable-ref compile-ht ref #f)))
                           (set! bail #t)
                           (let ((pair (cons (or fqn "<form>") ref)))
                             (when (and (< (length why) 6) (not (member pair why)))
                               (set! why (cons pair why))))
-                          (when (and fqn (not (member fqn hint)))
+                          (when (and fqn (not (member fqn hint))
+                                     (not (hashtable-ref compile-ht ref #f)))
                             (set! hint (cons fqn hint)))))
-                      (dce-rec-refs r))
+                      (dce-rec-refs r)))
             (when (ormap (lambda (ref) (and (hashtable-ref compile-ht ref #f) #t)) (dce-rec-refs r))
               (set! needs-compiler #t)))))
       records)
@@ -367,6 +505,31 @@
           (if (dce-rec-reached? r reached)
               (loop (cdr rs) (cons (dce-rec-str r) acc) (if isdef (+ n 1) n) (if isdef (+ k 1) k))
               (loop (cdr rs) acc (if isdef (+ n 1) n) k))))))
+
+;; The compiler verdict ALONE, for the build that keeps every def (the
+;; default — no --tree-shake): the same graph, the same reach and the same bail
+;; scan as dce-shake, and none of its partitioning. A program that never
+;; reaches eval, load-string or an image restore ships without the analyzer
+;; and back end (1.2MB of fasl, the scheme.boot compiler kernel and their
+;; load), and one that does keeps them; a bail keeps them too, for the reason
+;; dce-compile-refs gives. Nothing is printed: no shake was asked for, so a
+;; bail is not a skipped shake here, it is simply a program that needs its
+;; compiler.
+(define (dce-app-init-roots records)
+  (filter (lambda (x) x)
+          (map (lambda (r) (and (dce-rec-init-runs? r) (dce-rec-fqn r))) records)))
+(define (dce-needs-compiler? core-records app-records entry-main allow)
+  (let ((all (append core-records app-records)))
+    (let-values (((edges roots spliced) (dce-build-graph all entry-main)))
+      ;; Nothing is pruned in this build, so every app def whose init RUNS at
+      ;; load is a root, not only what -main reaches: an unreferenced
+      ;; (def x (eval ...)) needs the compiler as surely as -main calling it,
+      ;; and rooted at -main alone the binary booted from petite and died in
+      ;; that def's init. A defn only binds (dce-def-init-runs?), so a library
+      ;; that DEFINES an eval-calling fn nobody reaches drops it still.
+      (let ((reached (dce-reachable edges (append (dce-app-init-roots app-records) roots))))
+        (let-values (((bail why hint needs-compiler) (dce-bail-scan all reached allow)))
+          (or bail needs-compiler))))))
 
 ;; Returns (values core-strs app-strs drop-compiler?). core-strs is #f on a bail,
 ;; signalling "inline prelude.ss unshaken" + keep the compiler. allow: see

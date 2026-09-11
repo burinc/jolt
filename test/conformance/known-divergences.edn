@@ -294,6 +294,17 @@
   ;; crossing jolt's own 2^60 fixnum boundary. It does not: every shape promotes to
   ;; a bignum, exactly as this entry describes, so the two sides had converged and
   ;; the :check pair removed it.
+  ;;
+  ;; That is the DYNAMIC path — `jolt run`, `--dev`, `--no-direct-link` — which
+  ;; is what this file's :check pairs run. A release `jolt build` inlines and
+  ;; infers across defs, and an operand it PROVES long lowers to the checked
+  ;; jolt-l+ family, which raises ArithmeticException at 2^63 like the JVM: a
+  ;; literal-init loop var summing squares past 2^63 threw in the built binary
+  ;; and answered a bignum under `--no-direct-link` (jolt-5qca.5). The
+  ;; divergence is therefore one of the generic arithmetic, not of a shape: an
+  ;; add whose operands were never proven long promotes, one whose operands
+  ;; were raises, and which of the two a given form gets depends on what the
+  ;; optimizer could see.
   ;; jolt's dot form reads a plain map as an object: (. m member) calls a stored fn
   ;; with the map as self and otherwise reads the key, and (.-member m) reads the
   ;; key (dot-forms.ss's precedence note). The JVM has no fields on a
@@ -1349,7 +1360,9 @@
    ;; One integer type: an N suffix on a radix literal is a no-op rather than a
    ;; parse error, and %x formats a bignum instead of rejecting it for not being
    ;; a BigInteger. A loop var initialized from a literal promotes past 2^63
-   ;; where the JVM's primitive long raises.
+   ;; where the JVM's primitive long raises — on the dynamic path; a release
+   ;; build that proves the operands long raises too (see the :numeric-model
+   ;; note above, jolt-5qca.5).
    {:suite "reader / radix N suffix", :label "2r1010N reads as integer 10", :category :reader-model}
    {:suite "reader-model / nested fn literals", :label "nested #() reads", :category :reader-model}
    {:suite "numbers / unsigned string conversions", :label "past 64 bits it is a signed magnitude, not a wrap", :category :integer-box-model}

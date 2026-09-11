@@ -860,7 +860,11 @@
                    (and (not (jolt-truthy? (jolt-get m hc-kw-dynamic jolt-nil)))
                         (not (jolt-truthy? (jolt-get m hc-kw-redef jolt-nil))))))
              (not (var-redefined? ns-name nm)))
-        #t
+        ;; a var the seed minted direct-linked answers its jv$ binding name, so
+        ;; the site applies the binding (rt.ss var-linked-symbol); any other
+        ;; seed var answers #t and the site hoists its root at load
+        (let ((sym (var-linked-symbol cell)))
+          (if sym (symbol->string sym) #t))
         jolt-nil)))
 
 ;; --- declare the hot clojure.core primitives so resolve-global sees them ------
@@ -970,3 +974,27 @@
   (def-var! "jolt.host" "mark-spliced!" hc-mark-spliced!))
 
 (hc-install!)
+
+;; --- jolt.scheme's lookup half -----------------------------------------------
+;; scheme-proc resolves a top-level Scheme binding at CALL time, through the
+;; adapter's global-reflection seam (sa-baked-global — portcheck pins the raw
+;; top-level-value/bound? primitives to scheme-adapter-runtime.ss). Its #f
+;; sentinel conflates "unbound" with "bound to #f", which is fine here: this
+;; fetches PROCEDURES, and a procedure is never #f. An unbound name answers a
+;; catchable ex-info rather than Chez's raw error, because "you typo'd the
+;; primitive" is the hatch's everyday failure — and in a tree-shaken binary it
+;; is also how a shaken-out primitive reports itself. It lives HERE, in the
+;; runtime half, because it needs no compiler: a build that drops the compiler
+;; image (build.ss drop-compiler?) leaves compile-eval.ss out, and a program
+;; whose only hatch use is jolt.scheme/proc must still answer. Its sibling
+;; scheme-eval-string, which does compile, stays in compile-eval.ss.
+(def-var! "jolt.host" "scheme-proc"
+  (lambda (name)
+    (let ((sym (string->symbol (jolt-need-string name))))
+      (let ((v (sa-baked-global sym)))
+        (or v
+            (jolt-throw (jolt-ex-info
+                         (string-append "no top-level Scheme binding: "
+                                        (symbol->string sym))
+                         (jolt-hash-map (jolt-keyword "name")
+                                        (symbol->string sym)))))))))

@@ -10,9 +10,13 @@
 (import (chezscheme))
 (load "host/chez/gate-boot.ss")
 ;; gate-boot's optimized profile compiles with generate-inspector-information off,
-;; which suppresses the closure free-var info free-value recovery needs
-;; ((io 'ref i) reports nothing); the release runtime has it ON, so turn it back
-;; on here — only code compiled after this point (the fixture evals) is affected.
+;; which suppresses the closure free-var NAMES ((io 'ref i) reports nothing).
+;; The runtime half of a built binary never generates it either (build.ss
+;; bld-runtime-chez-params) — a closure's capture layout comes from its maker
+;; (image-fn-form-maker!), which is what the fnsrc rows below exercise. A
+;; release build's APP half still has it on, and it is turned on here so the
+;; fixture evals that read names directly through the inspector see what that
+;; half sees; only code compiled after this point is affected.
 (generate-inspector-information #t)
 
 (define total 0) (define fails 0)

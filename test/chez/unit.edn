@@ -894,6 +894,9 @@
   {:suite "reader" :expr "(do (require (quote [clojure.edn :as e0])) (= :end (e0/read-string {:eof :end} \"\")))" :expected "true"}
   {:suite "reader" :expr "(do (require (quote [clojure.edn :as e0])) (= [:custom 5] (e0/read-string {:readers {(quote custom) (fn [v] [:custom v])}} \"#custom 5\")))" :expected "true"}
   {:suite "reader" :expr "(do (require (quote clojure.edn)) (= {:a 1 :b 2} (clojure.edn/read-string \"{:a 1\\n :b 2}\")))" :expected "true"}
+  ;; a QUOTED tagged literal keeps its tag's namespace: emit-quoted rendered the
+  ;; tag as one bare symbol "foo/bar" (backend_scheme.clj), so (namespace (:tag ..)) was nil
+  {:suite "reader" :expr "(let [t '#foo/bar {:a 1}] [(namespace (:tag t)) (name (:tag t)) (:form t)])" :expected "[\"foo\" \"bar\" {:a 1}]"}
   ;; atomic spit: a throwing render (or failed write) leaves the original file
   ;; intact — deliberately STRONGER than the JVM, whose spit truncates first.
   {:suite "atomic-spit" :expr "(let [f (java.io.File/createTempFile \"spt\" \".t\")] (spit f \"ok\") (try (spit f (reify Object (toString [_] (throw (ex-info \"b\" {}))))) (catch Exception _ nil)) (let [r (slurp f)] (.delete f) r))" :expected "\"ok\""}
