@@ -557,7 +557,7 @@
          (nm  (symbol-t-name sym))
          (c   (var-cell-lookup cns nm)))
     (when c (var-cell-defined?-set! c #f)
-            (var-cell-root-set! c (make-jolt-var-unbound (var-cell-ns c) (var-cell-name c))))
+            (var-root-set! c (make-jolt-var-unbound (var-cell-ns c) (var-cell-name c))))
     ;; tombstone: block resolution of this name in this ns via refers/all
     (jolt-with-mutex ns-map-mu (hashtable-set! ns-refer-table (cons cns nm) 'unmapped)))
   jolt-nil)

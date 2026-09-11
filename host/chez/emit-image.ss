@@ -324,6 +324,22 @@
 (define ei-skipped-count 0)
 (define (ei-reset-skipped!) (set! ei-skipped-count 0))
 
+;; Does SCM bind a top-level jv$ variable — a direct-linked def from
+;; emit-def-cached? Such a form cannot be load-guarded: `define` inside a
+;; guard's body is an internal definition, invisible at the top level, so the
+;; mint emits it bare. A def whose init raises at load then aborts the boot
+;; instead of vanishing quietly — the failure run-seed-defs.ss exists to catch.
+(define (ei-top-level-define? scm)
+  (let* ((pat "(define jv$") (m (string-length pat)) (n (string-length scm)))
+    (let loop ((i 0))
+      (cond ((fx> (fx+ i m) n) #f)
+            ((let cmp ((k 0))
+               (or (fx= k m)
+                   (and (char=? (string-ref scm (fx+ i k)) (string-ref pat k))
+                        (cmp (fx+ k 1)))))
+             #t)
+            (else (loop (fx+ i 1)))))))
+
 (define (ei-emit-ns* ns-name src optimize? guard?)
   (let ((acc '()))
     (ei-for-each-form ns-name src
@@ -344,7 +360,9 @@
               (set! acc
                     (cons (if (eq? kind 'macro)
                               (ei-macro-string ns nm scm (ei-emit-meta ns (cdr f) guard?) guard?)
-                              (if guard? (string-append "(guard (e (#t #f))\n  " scm ")") scm))
+                              (if (and guard? (not (ei-top-level-define? scm)))
+                                  (string-append "(guard (e (#t #f))\n  " scm ")")
+                                  scm))
                           acc))))))
     (reverse acc)))
 

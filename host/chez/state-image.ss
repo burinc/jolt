@@ -2059,7 +2059,7 @@
                               (when (image-stub? o)
                                 (hashtable-set! image-restore-stub-tbl
                                                 (image-stub-id o) (cons o k)))))
-              (var-cell-root-set! cell v)
+              (var-root-set! cell v)
               (var-cell-defined?-set! cell #t)
               (set! n (fx+ n 1)))))
         (vector-ref w 1))
@@ -2184,7 +2184,7 @@
            (cell (jolt-var (substring k 0 slash)
                            (substring k (fx+ slash 1) (string-length k)))))
       (let-values (((nr cnt) (image-replace-stub (var-cell-root cell) (car e) value)))
-        (var-cell-root-set! cell nr)
+        (var-root-set! cell nr)
         (hashtable-delete! image-restore-stub-tbl id)
         cnt))))
 

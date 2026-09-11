@@ -28,6 +28,9 @@
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <fcntl.h>
+#include <libproc.h>
+#include <sys/time.h>
+#include <unistd.h>
 static int self_path(char *buf, uint32_t size) {
   /* _NSGetExecutablePath fills buf and reports the needed size on overflow. */
   return _NSGetExecutablePath(buf, &size);
@@ -110,10 +113,88 @@ static void startup_profile_mark(int enabled, double started, double *last,
 }
 
 
+/* Milliseconds from process creation to now: exec, the dynamic linker binding
+   the kernel and any :static natives, C constructors — everything that runs
+   before main(), which no mark placed inside the program can see. This was the
+   blind spot in burinc/jolt#3: a vfasl boot made every Scheme-side phase 10x
+   faster while the measured cold start did not move, and the profile had
+   nothing to say about where the rest went. Each platform reads its own
+   process start time; -1.0 when it cannot be read, and the mark then says so
+   rather than printing a made-up 0. */
+static double pre_main_ms(void) {
+#if defined(__linux__)
+  /* /proc/self/stat field 22, starttime, in clock ticks since boot. The comm
+     field (2) can hold spaces and parentheses, so parse from its closing ')'. */
+  FILE *st = fopen("/proc/self/stat", "r");
+  if (!st) return -1.0;
+  char line[1024];
+  size_t n = fread(line, 1, sizeof(line) - 1, st);
+  fclose(st);
+  line[n] = '\0';
+  const char *p = strrchr(line, ')');
+  if (!p) return -1.0;
+  p++;
+  unsigned long long start_ticks = 0;
+  /* fields 3..21 are 19 fields after the comm; the 20th is starttime */
+  for (int field = 3; field <= 22; field++) {
+    while (*p == ' ') p++;
+    if (field == 22) {
+      if (sscanf(p, "%llu", &start_ticks) != 1) return -1.0;
+      break;
+    }
+    while (*p && *p != ' ') p++;
+  }
+  long hz = sysconf(_SC_CLK_TCK);
+  struct timespec now;
+  if (hz <= 0 || clock_gettime(CLOCK_BOOTTIME, &now) != 0) return -1.0;
+  double now_ms = (double)now.tv_sec * 1000.0 + (double)now.tv_nsec / 1000000.0;
+  double start_ms = (double)start_ticks * 1000.0 / (double)hz;
+  return now_ms - start_ms;
+#elif defined(__APPLE__)
+  struct proc_taskallinfo ti;
+  if (proc_pidinfo(getpid(), PROC_PIDTASKALLINFO, 0, &ti, sizeof(ti)) != (int)sizeof(ti))
+    return -1.0;
+  struct timeval now;
+  gettimeofday(&now, NULL);
+  double now_ms = (double)now.tv_sec * 1000.0 + (double)now.tv_usec / 1000.0;
+  double start_ms = (double)ti.pbsd.pbi_start_tvsec * 1000.0 +
+                    (double)ti.pbsd.pbi_start_tvusec / 1000.0;
+  return now_ms - start_ms;
+#elif defined(_WIN32)
+  FILETIME creation, exit_t, kernel_t, user_t, now;
+  if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit_t, &kernel_t, &user_t))
+    return -1.0;
+  GetSystemTimeAsFileTime(&now);
+  ULARGE_INTEGER c, n;
+  c.LowPart = creation.dwLowDateTime; c.HighPart = creation.dwHighDateTime;
+  n.LowPart = now.dwLowDateTime;      n.HighPart = now.dwHighDateTime;
+  return (double)(n.QuadPart - c.QuadPart) / 10000.0; /* 100ns units */
+#else
+  return -1.0;
+#endif
+}
+
 int main(int argc, char *argv[]) {
   int startup_profile = getenv("JOLT_STARTUP_PROFILE") != NULL;
   double startup_started = startup_profile ? monotonic_ms() : 0.0;
   double startup_last = startup_started;
+  if (startup_profile) {
+    /* Fold the pre-main phase into the clock, so every cumulative figure below
+       is time since the PROCESS started and the last one is the whole run. The
+       clock is moved back BEFORE the first mark, so that mark's own column
+       reads the phase (now - last) rather than the 0 of a clock read twice. */
+    double pre = pre_main_ms();
+    if (pre >= 0.0) {
+      startup_started -= pre;
+      startup_last = startup_started;
+      startup_profile_mark(startup_profile, startup_started, &startup_last,
+                           "pre-main (exec+ld)");
+    } else {
+      fprintf(stderr, "jolt startup: [profile] native %-22s %9s"
+                      "   (not readable on this platform)\n",
+              "pre-main (exec+ld)", "n/a");
+    }
+  }
   char path[4096];
   if (self_path(path, (uint32_t)sizeof(path)) != 0) {
     fprintf(stderr, "jolt: cannot resolve own executable path\n");

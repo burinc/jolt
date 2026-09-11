@@ -860,7 +860,11 @@
                    (and (not (jolt-truthy? (jolt-get m hc-kw-dynamic jolt-nil)))
                         (not (jolt-truthy? (jolt-get m hc-kw-redef jolt-nil))))))
              (not (var-redefined? ns-name nm)))
-        #t
+        ;; a var the seed minted direct-linked answers its jv$ binding name, so
+        ;; the site applies the binding (rt.ss var-linked-symbol); any other
+        ;; seed var answers #t and the site hoists its root at load
+        (let ((sym (var-linked-symbol cell)))
+          (if sym (symbol->string sym) #t))
         jolt-nil)))
 
 ;; --- declare the hot clojure.core primitives so resolve-global sees them ------
