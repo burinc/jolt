@@ -85,6 +85,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A method call in interpreted code resolves through `Reflector/getMethods`.**
+  SCI resolves a host method call by asking `clojure.lang.Reflector/getMethods`
+  for the members matching (name, arity, static?) and invoking the one it
+  gets, and jolt answered the three invokers and the constructor path but not
+  that lookup — so every interpreted method call, `(System/currentTimeMillis)`
+  or `(.indexOf "abcdef" "cd")`, died before reaching the method. `getMethods`
+  now answers from the registries `Class.getMethods` reads; a class whose
+  methods are a cond over the receiver (String, the collections) answers a
+  member carrying the dispatch rule with its parameter count pinned, and an
+  unknown name earns the same member so the failure surfaces at the call with
+  the method named. `Method.invoke` reads a lone nil argument array as the
+  empty one, `Class.cast` is the identity over jolt's Object parameters, and
+  `Util/sneakyThrow` rethrows, so a method that threw reports its own
+  exception rather than a missing static.
+
 - **A spawned child gets its own stdio and nothing else.** `posix_spawn` hands
   the child every descriptor the parent has open unless the spawn says
   otherwise, and jolt's spawn described only the three stdio streams — so a
