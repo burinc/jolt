@@ -1385,5 +1385,19 @@ verdict_case evaldef verdict.evaldef "VERDICT-EVALDEF ok" keep
 verdict_case varargs verdict.varargs "VERDICT-VARARGS ok" keep
 verdict_case sproc   verdict.sproc   "VERDICT-SPROC 42"   drop
 verdict_case seval   verdict.seval   "VERDICT-SEVAL 42"   keep
+# A require by a COMPUTED name loads source at run time, so the verdict must
+# keep the compiler; the binary runs from the project dir, where its source
+# root is, since the namespace it loads is deliberately not in the binary.
+vout="$(dirname "$out")/verdict-dynreq"
+if ! JOLT_PWD="$verdictapp" "$jolt" build -m verdict.dynreq -o "$vout" >"$vout.log" 2>&1; then
+  echo "  FAIL: verdict fixture dynreq did not build"; tail -5 "$vout.log"; exit 1
+fi
+if grep -q '^jolt build: dropping compiler image' "$vout.log"; then
+  echo "  FAIL: verdict fixture dynreq — a require by a computed name must keep the compiler"; exit 1
+fi
+vgot="$(cd "$verdictapp" && "$vout" 2>&1 | tail -1)"
+if [ "$vgot" != "VERDICT-DYNREQ true" ]; then
+  echo "  FAIL: verdict fixture dynreq — want 'VERDICT-DYNREQ true', got \`$vgot\`"; exit 1
+fi
 
 echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + boot-modes + compiler-verdict)"

@@ -276,6 +276,21 @@
   {:suite "format-datetime" :expr "(format \"%tB\" (doto (java.util.GregorianCalendar.) (.setTimeInMillis 0) (.setTimeZone (java.util.TimeZone/getTimeZone \"UTC\"))))" :expected "\"Jan\""}
   {:suite "format-datetime" :expr "(let [d (java.util.Date. 1234567890123)] (= (format \"%tF %tT\" d d) (.format (java.text.SimpleDateFormat. \"yyyy-MM-dd HH:mm:ss\") d)))" :expected "true"}
   {:suite "format-datetime" :expr "(let [d (java.util.Date. 1234567890123)] (= (format \"%tz\" d) (.format (java.text.SimpleDateFormat. \"Z\") d)))" :expected "true"}
+  ;; The rest of java.util.Formatter's flag validation: a flag given twice, + with
+  ;; space or - with 0 together, - or 0 with no width to pad to, 0 on a
+  ;; non-numeric conversion, and ( + space on a radix conversion of a long
+  ;; (legal only for a BigInteger there). Each is its own exception class, with
+  ;; the JVM's message; every one of these format strings used to render.
+  {:suite "format-flags" :expr "(mapv (fn [[f & a]] (try (apply format f a) (catch java.util.IllegalFormatException e (str (.getSimpleName (class e)) \": \" (.getMessage e))))) [[\"%--5d\" 5] [\"%-05d\" 5] [\"%+ d\" 5] [\"%-d\" 5] [\"%0c\" (int 97)] [\"%0s\" \"a\"] [\"%(x\" -5] [\"%-n\"] [\"%-%\"]])"
+   :expected "[\"DuplicateFormatFlagsException: Flags = '-'\" \"IllegalFormatFlagsException: Flags = '-0'\" \"IllegalFormatFlagsException: Flags = '+ '\" \"MissingFormatWidthException: %-d\" \"FormatFlagsConversionMismatchException: Conversion = c, Flags = 0\" \"FormatFlagsConversionMismatchException: Conversion = s, Flags = 0\" \"FormatFlagsConversionMismatchException: Conversion = x, Flags = (\" \"IllegalFormatFlagsException: Flags = '-'\" \"MissingFormatWidthException: %-%\"]"}
+  {:suite "format-flags" :expr "[(format \"%05d|%-5d|%+d|% d|%(d|%,d\" 5 5 5 5 -5 12345) (format \"%-5%|\") (format \"%08.3f|%-8.3e|%#x|%#o\" 3.14159 314.159 255 8)]" :expected "[\"00005|5    |+5| 5|(5)|12,345\" \"%    |\" \"0003.142|3.142e+02|0xff|010\"]"}
+  ;; %c past U+10FFFF is IllegalFormatCodePointException, not the raw Chez
+  ;; condition integer->char raises; a lone surrogate has no code-point string
+  ;; representation here and renders as U+FFFD.
+  {:suite "format-flags" :expr "[(try (format \"%c\" (int 0x110000)) (catch java.util.IllegalFormatException e (str (.getSimpleName (class e)) \": \" (.getMessage e)))) (format \"%c\" (int 0x1F600)) (= (str (char 0xFFFD)) (format \"%c\" (int 0xD800)))]" :expected "[\"IllegalFormatCodePointException: Code point = 0x110000\" \"😀\" true]"}
+  ;; Double.parseDouble: String.trim strips every char at or below U+0020, the
+  ;; type suffix may follow a point, and a hex float needs a hex digit somewhere.
+  {:suite "parse-double" :expr "[(Double/parseDouble \"1.f\") (Double/parseDouble (str (char 12) \"1.5\")) (parse-double \"0x.p0\") (Double/parseDouble \"0x.8p1\") (parse-double \".f\")]" :expected "[1.0 1.5 nil 1.0 nil]"}
   {:suite "reader" :expr "(let [r (-> \"foo bar baz\" java.io.StringReader. java.io.PushbackReader.)] [(read r) (slurp r)])" :expected "[foo \" bar baz\"]"}
   {:suite "reader" :expr "(let [r (-> \"(+ 1 2) 99\" java.io.StringReader. java.io.PushbackReader.)] [(read r) (read r)])" :expected "[(+ 1 2) 99]"}
   ;; A namespaced-map prefix ends at the namespace token.  Ordinary reader
@@ -1943,6 +1958,34 @@
    :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-asalias-unit\")] (jolt.host/sh (str \"rm -rf \" d)) (jolt.host/sh (str \"mkdir -p \" d \"/src/aa\")) (spit (str d \"/deps.edn\") \"{}\") (spit (str d \"/src/aa/other.clj\") \"(ns aa.other) (def marker :loaded)\") (jolt.deps/add-deps {:deps {'aa/aa {:local/root d}}}) (require '[aa.other :as-alias o]) [(some? (get (ns-aliases *ns*) 'o)) (some? (resolve 'aa.other/marker)) (some? (find-ns 'aa.other))]))"}
   {:suite "require / as-alias" :label ":as still loads" :expected ":loaded"
    :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-asalias-unit2\")] (jolt.host/sh (str \"rm -rf \" d)) (jolt.host/sh (str \"mkdir -p \" d \"/src/ab\")) (spit (str d \"/deps.edn\") \"{}\") (spit (str d \"/src/ab/other.clj\") \"(ns ab.other) (def marker :loaded)\") (jolt.deps/add-deps {:deps {'ab/ab {:local/root d}}}) (require '[ab.other :as o]) @(resolve 'ab.other/marker)))"}
+  ;; A libspec's :rename and :exclude qualify its :refer, and its :as goes
+  ;; through the same collision rule as `alias` — load-lib hands refer every one
+  ;; of :only/:exclude/:rename and calls alias for :as. :rename used to be
+  ;; dropped (the referred name arrived under its source name), :exclude was
+  ;; honoured only by a `use` that spelled no :refer key, and a second :as on
+  ;; the same alias silently pointed it elsewhere.
+  {:suite "require / libspec" :label ":rename binds the local name, not the source" :expected "[#{1 2} false]"
+   :expr "(do (ns unit.rn1) (require '[clojure.set :refer [union] :rename {union my-union}]) [(my-union #{1} #{2}) (contains? (ns-refers 'unit.rn1) 'union)])"}
+  {:suite "require / libspec" :label ":refer :all :rename excludes the source name" :expected "[#{1 2} false]"
+   :expr "(do (ns unit.rn2) (require '[clojure.set :refer :all :rename {union u+}]) [(u+ #{1} #{2}) (contains? (ns-refers 'unit.rn2) 'union)])"}
+  {:suite "require / libspec" :label ":refer :all :exclude leaves the name out" :expected "[\"A\" (2 1)]"
+   :expr "(do (ns unit.ex1) (require '[clojure.string :refer :all :exclude [reverse]]) [(upper-case \"a\") (reverse [1 2])])"}
+  {:suite "require / libspec" :label ":refer [names] :exclude drops the excluded one" :expected "[#{1 2} false]"
+   :expr "(do (ns unit.ex2) (require '[clojure.set :refer [union intersection] :exclude [intersection]]) [(union #{1} #{2}) (contains? (ns-refers 'unit.ex2) 'intersection)])"}
+  {:suite "require / libspec" :label ":as of an alias already aliasing another namespace throws" :expected "[\"java.lang.IllegalStateException\" :same-target-ok]"
+   :expr "(do (ns unit.al1) (require '[clojure.set :as x]) [(try (require '[clojure.walk :as x]) :no-throw (catch IllegalStateException e (.getName (class e)))) (do (require '[clojure.set :as x]) :same-target-ok)])"}
+  ;; Class.cast(null) is null for every target class on the JVM; it raised a
+  ;; raw record-accessor fault here, from the arm that builds the failure message.
+  {:suite "class" :expr "[(.cast Object nil) (.cast String nil) (.cast String \"x\") (try (.cast String 1) :no-throw (catch ClassCastException e :cce))]" :expected "[nil nil \"x\" :cce]"}
+  ;; Collection.removeIf's default calls remove() only for an element the
+  ;; predicate MATCHES, so on a non-empty immutable collection the predicate
+  ;; decides: no match is false, a match is the refusal. It refused every
+  ;; non-empty call before, predicate unread.
+  {:suite "class" :expr "[(.removeIf [1 2] (constantly false)) (.removeIf [] (constantly true)) (try (.removeIf [1 2] odd?) :no-throw (catch UnsupportedOperationException e :uoe))]" :expected "[false false :uoe]"}
+  ;; File.toURI of (File. "") is the working directory, a directory, so it ends
+  ;; in a slash like every other existing directory's; the check used to read the
+  ;; raw "" instead of the resolved path. Path.toUri answers the same URI object.
+  {:suite "class" :expr "(let [u (.toURI (java.io.File. \"\")) p (.toUri (java.nio.file.Paths/get \"\" (into-array String [])))] [(.endsWith (str u) \"/\") (instance? java.net.URI p) (= (str u) (str p))])" :expected "[true true true]"}
   {:suite "jolt-version" :label "*jolt-version* is a non-blank string" :expected "true" :expr "(and (string? *jolt-version*) (pos? (count *jolt-version*)))"}
   {:suite "jolt-version" :label "property and host fn match the var" :expected "true" :expr "(= *jolt-version* (System/getProperty \"jolt.version\") (jolt.host/jolt-version))"}
   {:suite "add-deps" :label "inline :local/root dep becomes requirable" :expected ":pong" :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-adddep-unit\")] (jolt.host/sh (str \"rm -rf \" d)) (jolt.host/sh (str \"mkdir -p \" d \"/src/adddep\")) (spit (str d \"/deps.edn\") \"{}\") (spit (str d \"/src/adddep/core.clj\") \"(ns adddep.core) (defn ping [] :pong)\") (jolt.deps/add-deps {:deps {'adddep/adddep {:local/root d}}}) (require 'adddep.core) ((resolve 'adddep.core/ping))))"}

@@ -56,12 +56,49 @@
          (> (jolt-count at) 0)
          (let ((last (jolt-peek at)))
            (and (string? last) (or (string=? last "&") (string=? last "varargs")))))))
+;; A require the graph can READ is baked: every (require 'a.b) and every ns
+;; form's clauses name their namespaces as constants, bld-require-closure walks
+;; them into the binary, and the call no-ops at startup because the namespace
+;; is already defined. A require whose argument is COMPUTED -- (require (symbol
+;; nm)), a plugin loaded by name, (require ns :reload) over shipped source --
+;; names a namespace the build never saw, so at run time it is a load from
+;; source: the compiler, and code the static graph cannot follow. Same for
+;; `use` and `load-libs`, and for `compile`, which recompiles unconditionally.
+;; A built binary that did this worked in 0.8.6 because every binary carried
+;; the compiler; with the verdict dropping it by default such a program died
+;; at the require on "variable jolt-aot-capture-file is not bound". The ref is
+;; the host entry that does the loading, jolt.host/load-namespace, which both
+;; lists carry.
+(define dce-kw-invoke (keyword #f "invoke"))
+(define dce-kw-args   (keyword #f "args"))
+(define dce-kw-quote  (keyword #f "quote"))
+(define dce-dynamic-load-ref "jolt.host/load-namespace")
+(define dce-load-by-name-fns
+  '("clojure.core/require" "clojure.core/use" "clojure.core/load-libs"))
+(define (dce-static-arg? a)
+  (let ((op (jolt-get a dce-kw-op)))
+    (or (eq? op dce-kw-const) (eq? op dce-kw-quote))))
+(define (dce-invoke-fqn node)
+  (let ((f (jolt-get node dce-kw-fn)))
+    (and (not (jolt-nil? f))
+         (eq? (jolt-get f dce-kw-op) dce-kw-var)
+         (string-append (jolt-get f dce-kw-ns) "/" (jolt-get f dce-kw-name)))))
+(define (dce-dynamic-load? node)
+  (let ((fqn (dce-invoke-fqn node)))
+    (and fqn
+         (or (string=? fqn "clojure.core/compile")
+             (and (member fqn dce-load-by-name-fns)
+                  (let ((args (jolt-seq (jolt-get node dce-kw-args))))
+                    (and (not (jolt-nil? args))
+                         (not (for-all dce-static-arg? (seq->list args))))))))))
 (define (dce-collect-refs acc node)
   (let ((op (jolt-get node dce-kw-op)))
     (cond ((or (eq? op dce-kw-var) (eq? op dce-kw-the-var))
            (cons (string-append (jolt-get node dce-kw-ns) "/" (jolt-get node dce-kw-name)) acc))
           ((and (eq? op dce-kw-ffi-fn) (dce-ffi-bare-varargs? node))
            (dce-reduce-children dce-collect-refs (cons dce-ffi-varargs-ref acc) node))
+          ((and (eq? op dce-kw-invoke) (dce-dynamic-load? node))
+           (dce-reduce-children dce-collect-refs (cons dce-dynamic-load-ref acc) node))
           (else (dce-reduce-children dce-collect-refs acc node)))))
 
 ;; The fqn of a bare top-level def (the only prunable IR form), else #f.
@@ -110,12 +147,16 @@
     ;; wrappers are one-line defns the inline pass splices into their callers,
     ;; after which only the host call is left in the caller's refs — and an
     ;; unspliced wrapper still reaches the host call through its own record.
-    "jolt.host/image-read" "jolt.host/image-restore-world!"))
+    "jolt.host/image-read" "jolt.host/image-restore-world!"
+    ;; A require/use/load-libs by a COMPUTED name, or `compile`: a load of source
+    ;; the graph never saw (dce-dynamic-load?, above).
+    "jolt.host/load-namespace"))
 
 ;; A reference that needs the analyzer/back end at runtime (compile-from-source). If
 ;; reachable code uses none of these, the compiler image is dropped from the binary —
-;; an AOT app is fully compiled. (resolve/require don't need it: resolve is a
-;; var-table lookup; a require of a baked ns no-ops.)
+;; an AOT app is fully compiled. (resolve doesn't need it: it is a var-table
+;; lookup; a require of a baked ns no-ops, and a require the build could not
+;; bake is a dce-dynamic-load ref.)
 ;;
 ;; NOTE: every CORE entry in dce-compile-refs (eval, load-string, …) is also a
 ;; dce-bail-ref -- the static graph cannot track what the compiler will compile,
@@ -148,7 +189,10 @@
     ;; top-level lookup and lives in the runtime half, so it is not one.
     "jolt.host/scheme-eval-string"
     ;; the bare varargs FFI binding, see dce-collect-refs
-    "jolt.host/ffi-varargs-compile"))
+    "jolt.host/ffi-varargs-compile"
+    ;; a require/use/load-libs by a computed name, or `compile` -- a load from
+    ;; source at run time, see dce-collect-refs
+    "jolt.host/load-namespace"))
 
 ;; clojure.core fns the runtime .ss shims reference by name (via var-deref) — they
 ;; aren't visible in the IR call graph, so seed them as roots. (Found by grepping the

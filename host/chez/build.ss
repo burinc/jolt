@@ -2036,8 +2036,12 @@
 ;; that had built before kept serving the old 22MB fasl under the new policy
 ;; — the same source, the same word "release", a different compile — and the
 ;; binary did not shrink until the cache was cleared by hand.
+;; …and on the Chez that compiles it: a fasl is specific to the kernel's version
+;; and machine type, and two jolt binaries with different bundled kernels share
+;; this directory. Identical source text under a newer kernel must miss.
 (define (bld-runtime-cache-path body)
-  (let ((keyed (string-append (bld-params-bindings bld-runtime-chez-params "\n") body)))
+  (let ((keyed (string-append (scheme-version) " " (symbol->string (machine-type)) "\n"
+                              (bld-params-bindings bld-runtime-chez-params "\n") body)))
     (string-append (bld-runtime-cache-dir) "/runtime-"
                    (number->string (string-length body) 16) "-"
                    (number->string (aot-content-hash keyed) 16) ".so")))

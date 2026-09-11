@@ -639,6 +639,7 @@
 (jch-register-supers! "java.util.IllegalFormatFlagsException" '("java.util.IllegalFormatException"))
 (jch-register-supers! "java.util.IllegalFormatArgumentIndexException" '("java.util.IllegalFormatException"))
 (jch-register-supers! "java.util.DuplicateFormatFlagsException" '("java.util.IllegalFormatException"))
+(jch-register-supers! "java.util.IllegalFormatCodePointException" '("java.util.IllegalFormatException"))
 (jch-register-supers! "java.util.FormatFlagsConversionMismatchException" '("java.util.IllegalFormatException"))
 (jch-register-supers! "java.lang.IllegalStateException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.lang.UnsupportedOperationException" '("java.lang.RuntimeException"))
