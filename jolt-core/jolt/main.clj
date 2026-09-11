@@ -817,9 +817,11 @@
             ;; is a now-redundant alias. ^:redef/^:dynamic defs always stay var-routed.
             no-dl?       (or (some #{"--no-direct-link"} flag-args) (false? (:direct-link build)))
             direct-link? (and (not (= mode "dev")) (not no-dl?))
-            ;; tree-shaking (drop library code not reachable from -main): --tree-shake
-            ;; or deps.edn :jolt/build {:tree-shake true}.
-            tree-shake? (boolean (or (some #{"--tree-shake"} flag-args) (:tree-shake build)))
+            ;; closed world (drop every def not reachable from -main, core included):
+            ;; --closed-world, or --tree-shake as it was first named, or deps.edn
+            ;; :jolt/build {:closed-world true} / {:tree-shake true}.
+            tree-shake? (boolean (or (some #{"--closed-world" "--tree-shake"} flag-args)
+                                     (:closed-world build) (:tree-shake build)))
             ;; how the boot image is encoded (jolt-lang/jolt#886), ordered from
             ;; fastest-to-start to smallest-on-disk:
             ;;   fast   vfasl + LZ4   the default
@@ -937,7 +939,7 @@
   (println "  FILE [args]            the same, with `run` left out — so a file whose")
   (println "                         first line is `#!/usr/bin/env jolt` runs as an")
   (println "                         executable script, with or without an extension")
-  (println "  build -m NS [-o OUT] [--opt|--dev] [--direct-link] [--tree-shake] [--dynamic]")
+  (println "  build -m NS [-o OUT] [--opt|--dev] [--direct-link] [--closed-world] [--dynamic]")
   (println "              [--boot fast|small|plain] [--library] [--target MACHINE --target-pack DIR]")
   (println "                         compile a standalone binary, or with --library a")
   (println "                         shared object an embedder dlopens and calls through")

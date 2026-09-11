@@ -215,6 +215,20 @@
 (defn set-direct-link! [on] (reset! (:direct-link? (cur)) (boolean on)))
 (defn- direct-link? [] @(:direct-link? (cur)))
 
+;; SEED-MINT MODE. bootstrap.ss mints clojure.core and the compiler with
+;; direct-link ON — a core->core call applies the callee's jv$ binding, one
+;; top-level load in place of var-cell-deref + jolt-invokeN — and this flag says
+;; the emission is the SEED, which differs from a `jolt build` in two ways:
+;; a top-level def is bound with def-var-linked! (rt.ss), which keeps the var's
+;; root and the jv$ binding one value under redefinition, and the seed-callable
+;; arm of emit-invoke is off, because the seed vars that arm would hoist are the
+;; ones being emitted. Nothing is spliced: the inline pass reads the host
+;; contract's direct-link flag, which the mint leaves off, so a minted core is
+;; direct-called and still redefinable, as JVM Clojure's direct-linked core is
+;; not.
+(defn set-seed-mint! [on] (reset! (:seed-mint? (cur)) (boolean on)))
+(defn- seed-mint? [] @(:seed-mint? (cur)))
+
 ;; Fully-qualified app var names ("ns/name") already emitted with a direct-link
 ;; binding in the current unit; and, of those, the ones whose init is a fn literal
 ;; (safe to call as a raw Scheme application — a non-fn value is invokable in Clojure
@@ -2740,12 +2754,21 @@
       ;; jolt.host/seed-callable? applies the same closed-world rule an app def
       ;; gets (not ^:dynamic/^:redef, not redefined by the app) plus "root is a
       ;; procedure whose arity mask admits this arity", so a keyword/map/multi-
-      ;; method-valued var and a wrong-arity call keep jolt-invoke below. A later
-      ;; alter-var-root / with-redefs of such a var is invisible to this site,
-      ;; exactly as under the JVM's direct linking; `jolt run` never direct-links.
-      (and (= :var (:op fnode)) (direct-link?)
+      ;; method-valued var and a wrong-arity call keep jolt-invoke below.
+      ;; seed-callable? answers the callee's jv$ binding name for a var the seed
+      ;; minted direct-linked (def-var-linked!), and the site applies that
+      ;; top-level variable: the same one load, and a later def / alter-var-root
+      ;; / with-redefs of the var writes through to it (rt.ss var-root-set!), so
+      ;; the site follows a redefinition. A seed var the runtime defined itself
+      ;; (a Scheme def-var!) has no binding to name; its root is hoisted once at
+      ;; load, and a redefinition is invisible to that site, as under the JVM's
+      ;; direct linking. `jolt run` never direct-links. Off while MINTING the
+      ;; seed: the vars this arm would bind are the ones being emitted.
+      (and (= :var (:op fnode)) (direct-link?) (not (seed-mint?))
            (seed-callable? nil (:ns fnode) (:name fnode) (count args)))
-      (order-args (fn [as] (emit-call tail? (hoist-seed-root (:ns fnode) (:name fnode)) as tl ich)))
+      (let [sc (seed-callable? nil (:ns fnode) (:name fnode) (count args))
+            head (if (string? sc) sc (hoist-seed-root (:ns fnode) (:name fnode)))]
+        (order-args (fn [as] (emit-call tail? head as tl ich))))
        ;; record ctor with matching arity: inline the native per-arity ctor
        ;; (make-jrecN) directly — desc + ext + one inline slot per field —
        ;; eliminating jolt-invoke / var-deref / rest-list / ctor call / hashtable
@@ -3296,7 +3319,9 @@
         ;; takes that name. Register under whichever Chez will report.
         pos (:pos node)
         frame-name (when fn? (if-let [fnm (:name (:init node))] (munge-name fnm) b))
-        reg (when (and dl? fn? pos)
+        ;; Not in the seed mint: a registration carries the def's file, and the
+        ;; seed must not bake this machine's paths (a core frame prints by name).
+        reg (when (and dl? fn? pos (not (seed-mint?)))
               (str " (jolt-register-source! " (chez-str-lit frame-name) " "
                    (chez-str-lit ns) " " (chez-str-lit nm) " "
                    (if (get pos :file) (chez-str-lit (get pos :file)) "jolt-nil") " "
@@ -3336,6 +3361,17 @@
     ;; init (or a form evaluated right after in the same top-level do) may dump a
     ;; closure the init just created.
     (cond
+      ;; the seed mint: a LINKED def. def-var-linked! binds the var the way
+      ;; def-var-with-meta!/def-var-plain! do and records the jv$ symbol with a
+      ;; setter over it, so a later def / alter-var-root of the var writes the
+      ;; new root through to the binding every direct call site applies (rt.ss
+      ;; var-root-set!). That is what keeps a direct-linked core redefinable.
+      (and dl? (seed-mint?))
+      (str "(begin" freg " (define " b " " init ") (def-var-linked! "
+           (chez-str-lit ns) " " (chez-str-lit nm) " '" b " " b
+           " (lambda (v) (set! " b " v)) "
+           (if (jmeta-nonempty? (:meta node)) (emit-def-meta node) "#f") ")"
+           (or vreg "") creg ")")
       dl?
       (if (jmeta-nonempty? (:meta node))
         (str "(begin" freg " (define " b " " init ") (def-var-with-meta! "

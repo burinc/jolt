@@ -397,7 +397,7 @@
   (guard (e (#t #f))
     (let ((cell (var-cell-lookup "clojure.core.async" "*fiber-carrier-count*")))
       (when (and cell (var-cell-defined? cell))
-        (var-cell-root-set! cell (or n jolt-nil))))))
+        (var-root-set! cell (or n jolt-nil))))))
 
 ;; Build the carrier vector at the current count, exactly once. Double-build
 ;; is guarded under rr-mu (double-checked): two threads spawning for the first
@@ -784,7 +784,7 @@
   (guard (e (#t #f))
     (let ((cell (var-cell-lookup "clojure.core.async" "*fiber-preempt-ticks*")))
       (when (and cell (var-cell-defined? cell))
-        (var-cell-root-set! cell (or n jolt-nil))))))
+        (var-root-set! cell (or n jolt-nil))))))
 
 ;; How many times the pool has preempted a fiber. Like the park counters this
 ;; is per carrier so no two threads touch one field; summed by

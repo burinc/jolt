@@ -66,11 +66,21 @@ if [ "$got" != "$want" ]; then
   exit 1
 fi
 
+# The compiler verdict is taken by EVERY build now, not only a shaken one
+# (dce-needs-compiler?): this app reads images back (jolt.image/read-image
+# restores fn sources by compiling them), so its default build keeps the
+# analyzer/back end resident. The negative half — a program that reaches none
+# of that ships without them — is asserted on the data-reader app below.
+if ! grep -Eq 'def-var[a-z!-]*! "jolt.analyzer"' "$out.build/runtime.ss"; then
+  echo "  FAIL: the default build of an image-reading app dropped the compiler"; exit 1
+fi
+
 # Startup profiling is one opt-in switch on the same binary. The ordinary run
 # above is exact-output proof that it stays silent by default; an enabled run
 # spans the native heap loader, app namespace initialization, and -main.
 profiled="$(cd / && JOLT_STARTUP_PROFILE=1 "$out" alpha bb ccc 2>&1)"
 for marker in \
+  'jolt startup: [profile] native pre-main (exec+ld)' \
   'jolt startup: [profile] native Sbuild_heap' \
   'jolt startup: [profile] scheme namespace app.core' \
   'jolt startup: [profile] scheme entry -main'
@@ -472,13 +482,24 @@ fi
 
 # Optimized mode (inference + flatten + scalar-replace) must produce the same
 # result — a sanity check that the passes don't miscompile this app.
-if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out" --opt >/dev/null 2>&1; then
+if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out.opt" --opt >/dev/null 2>&1; then
   echo "  FAIL: jolt build --opt exited non-zero"; exit 1
 fi
-got_opt="$(cd / && "$out" alpha bb ccc 2>&1)"
+got_opt="$(cd / && "$out.opt" alpha bb ccc 2>&1)"
 if [ "$got_opt" != "$want" ]; then
   echo "  FAIL: --opt binary output mismatch"
   echo "--- got ----"; echo "$got_opt"
+  exit 1
+fi
+# Release and --opt compile the runtime half IDENTICALLY (build.ss
+# bld-chez-params). The runtime half is app-independent, so the two build dirs
+# hold the same fasl when and only when the two modes select the same Chez
+# parameters — the release row growing inspector/procedure-source information
+# back (the 2.3x-binary, 1.6x-startup cost burinc/jolt#3 was about) shows up
+# here as a byte difference. $out is still the plain release build.
+if ! cmp -s "$out.build/runtime.so" "$out.opt.build/runtime.so"; then
+  echo "  FAIL: release and --opt compiled the runtime half differently"
+  echo "        release: $(wc -c < "$out.build/runtime.so") bytes, --opt: $(wc -c < "$out.opt.build/runtime.so") bytes"
   exit 1
 fi
 
@@ -623,10 +644,20 @@ if ! printf '%s' "$nsp_out" | grep -q 'ns: user' \
   echo "--- got ----"; echo "$nsp_out"
   exit 1
 fi
-# Tree-shaking (opt-in): same result, and an unreachable def (the `twice` macro,
-# expanded at AOT and never called at runtime) is dropped.
-if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out" --tree-shake >/dev/null 2>&1; then
-  echo "  FAIL: jolt build --tree-shake exited non-zero"; exit 1
+# Tree-shaking (opt-in) on THIS app bails: it restores images, and a restore
+# compiles the fn sources an image carries, which can name any core var — one
+# the compiled program never reached because the inline pass spliced it away
+# at every site (a shaken build once restored a closure that called `update`
+# and died on the unbound var its own -main had used without a trace). So
+# jolt.host/image-read is a bail reference like eval: everything is kept, the
+# compiler with it, the diagnostic names the reason, and the binary restores
+# exactly what the unshaken one did.
+if ! JOLT_PWD="$app" "$jolt" build -m app.core -o "$out" --tree-shake >"$out.ts.log" 2>&1; then
+  echo "  FAIL: jolt build --tree-shake exited non-zero"; cat "$out.ts.log"; exit 1
+fi
+if ! grep -q 'tree-shake skipped' "$out.ts.log" || ! grep -q 'image-read' "$out.ts.log"; then
+  echo "  FAIL: --tree-shake of an image-restoring app must bail, naming image-read"
+  cat "$out.ts.log"; exit 1
 fi
 got_ts="$(cd / && "$out" alpha bb ccc 2>&1)"
 if [ "$got_ts" != "$want" ]; then
@@ -634,16 +665,40 @@ if [ "$got_ts" != "$want" ]; then
   echo "--- got ----"; echo "$got_ts"
   exit 1
 fi
-if grep -q 'def-var! "app.util" "twice"' "$out.build/flat.ss"; then
-  echo "  FAIL: --tree-shake did not drop the unreachable twice macro"; exit 1
+if ! grep -Eq 'def-var[a-z!-]*! "jolt.analyzer"' "$out.build/runtime.ss"; then
+  echo "  FAIL: the bailed --tree-shake build dropped the compiler an image restore needs"; exit 1
 fi
-# The app never evals, so the compiler image (analyzer/back end) is dropped.
-if grep -q 'def-var! "jolt.analyzer"' "$out.build/flat.ss"; then
-  echo "  FAIL: --tree-shake kept the compiler image in a no-eval app"; exit 1
+got_ts_cl="$(cd / && "$out" --closure "$fasl" 2>&1)"
+for line in 'closure-folded: 115 115' 'closure-live: 110 110' 'img-lazy: [1 2 3 4]'; do
+  if ! printf '%s' "$got_ts_cl" | grep -qF "$line"; then
+    echo "  FAIL: the bailed --tree-shake binary could not restore an image — want '$line'"
+    echo "--- got ----"; echo "$got_ts_cl"; exit 1
+  fi
+done
+# ...and on an app that never restores one, the shake prunes: same output, the
+# unreferenced def is gone from the app half, a clojure.core overlay fn the app
+# never uses is gone from the shaken core — which is the runtime unit
+# (runtime.ss), compiled apart from the app half so it takes the runtime's
+# no-inspector parameters; flat.ss never held it — and the compiler is dropped.
+doapp="$root/test/chez/defonce-app"
+doout="$(dirname "$out")/defonce-bin"
+if ! JOLT_PWD="$doapp" "$jolt" build -m app.core -o "$doout" --tree-shake >/dev/null 2>&1; then
+  echo "  FAIL: jolt build --tree-shake of the defonce app exited non-zero"; exit 1
 fi
-# Core is shaken: a clojure.core overlay fn this app never uses is dropped.
-if grep -q 'def-var! "clojure.core" "group-by"' "$out.build/flat.ss"; then
+got_do="$(cd / && "$doout" 2>&1)"
+if [ "$got_do" != "$(printf '1\nalive')" ]; then
+  echo "  FAIL: --tree-shake defonce binary output mismatch"
+  echo "--- got ----"; echo "$got_do"; exit 1
+fi
+if grep -q '"app.core" "dead"' "$doout.build/flat.ss"; then
+  echo "  FAIL: --tree-shake did not drop the unreferenced def app.core/dead"; exit 1
+fi
+[ -f "$doout.build/runtime.ss" ] || { echo "  FAIL: --tree-shake did not emit the shaken core as its own runtime unit"; exit 1; }
+if grep -q 'def-var! "clojure.core" "group-by"' "$doout.build/runtime.ss"; then
   echo "  FAIL: --tree-shake kept an unreachable clojure.core fn (group-by)"; exit 1
+fi
+if grep -Eq 'def-var[a-z!-]*! "jolt.analyzer"' "$doout.build/runtime.ss"; then
+  echo "  FAIL: --tree-shake kept the compiler image in a no-eval app"; exit 1
 fi
 # A registered data reader that returns a CODE form must be compiled into the
 # binary (the emit path applies it too, not just the interpreted loader): the
@@ -656,6 +711,12 @@ drapp="$root/test/chez/datareader-app"
 drout="$(dirname "$out")/dr-bin"
 if ! JOLT_PWD="$drapp" "$jolt" build -m drtest.main -o "$drout" >/dev/null 2>&1; then
   echo "  FAIL: jolt build of a data-reader app exited non-zero"; exit 1
+fi
+# A program that reaches no eval, load-string or image restore ships without
+# the compiler by DEFAULT — no --tree-shake asked for. runtime.ss is where it
+# would be; the scheme.boot compiler kernel goes with it (petite-only boot).
+if grep -Eq 'def-var[a-z!-]*! "jolt.analyzer"' "$drout.build/runtime.ss"; then
+  echo "  FAIL: the default build of a no-eval app kept the compiler image"; exit 1
 fi
 got_dr="$(cd / && "$drout" 2>&1)"
 dr_want='42

@@ -41,13 +41,29 @@
 (define (raises? thunk) (guard (e (#t #t)) (thunk) #f))
 
 ;; ---- seed direct-link ------------------------------------------------------
+;; A var the seed minted direct-linked (bootstrap.ss): the site applies its jv$
+;; binding, and a redefinition writes through to that binding (rt.ss
+;; var-root-set!), so the site follows it.
 (let ((e (emit-dl "(def usetrue (fn [x] (true? x)))")))
-  (gate-check "seed call binds the root at load" (gate-sub? e "(jolt-seed-root (jolt-var \"clojure.core\" \"true?\"))") #t)
+  (gate-check "seed call applies the linked jv$ binding" (gate-sub? e "(jv$clojure.core$true? ") #t)
+  (gate-check "seed call hoists no root" (gate-sub? e "jolt-seed-root") #f)
   (gate-check "seed call is a direct application, not jolt-invoke1" (gate-sub? e "jolt-invoke1") #f)
   (gate-check "seed call does not deref the var cell" (gate-sub? e "var-cell-deref") #f)
   (run-emit e)
   (gate-check "direct seed call answers true" (call "usetrue" #t) #t)
-  (gate-check "direct seed call answers false" (call "usetrue" 1) #f))
+  (gate-check "direct seed call answers false" (call "usetrue" 1) #f)
+  (let ((cell (jolt-var "clojure.core" "true?")) (orig (var-deref "clojure.core" "true?")))
+    (jolt-alter-var-root cell (lambda (old) (lambda (x) 'patched)))
+    (gate-check "a redefined linked seed var is seen by a direct site" (call "usetrue" #t) 'patched)
+    (jolt-alter-var-root cell (lambda (old) orig))
+    (gate-check "...and so is the restore" (call "usetrue" #t) #t)))
+;; A seed var the runtime defined itself (a Scheme def-var!, no jv$ binding):
+;; its root is hoisted once at load, as before.
+(let ((e (emit-dl "(def usearraymap (fn [k v] (array-map k v)))")))
+  (gate-check "an unlinked seed var hoists its root at load" (gate-sub? e "(jolt-seed-root (jolt-var \"clojure.core\" \"array-map\"))") #t)
+  (gate-check "an unlinked seed call is not jolt-invoke2" (gate-sub? e "jolt-invoke2") #f)
+  (run-emit e)
+  (gate-check "the hoisted seed call answers" (jolt-get (call "usearraymap" (keyword #f "a") 1) (keyword #f "a") jolt-nil) 1))
 (let ((e (emit-nodl "(def usetrue2 (fn [x] (true? x)))")))
   (gate-check "off direct-link the site stays var-routed" (gate-sub? e "jolt-invoke1") #t)
   (gate-check "off direct-link no root is bound" (gate-sub? e "jolt-seed-root") #f))
@@ -60,7 +76,8 @@
 (ev "(defn helper [x] (+ x 1))")
 (let ((e (emit-dl "(def useapp (fn [] (helper 1)))")))
   (gate-check "an app var is not a seed var" (gate-sub? e "jolt-seed-root") #f))
-(gate-check "seed-callable?: clojure.core/true? at 1 arg" (seed-callable? jolt-nil "clojure.core" "true?" 1) #t)
+(gate-check "seed-callable?: clojure.core/true? at 1 arg names its binding" (seed-callable? jolt-nil "clojure.core" "true?" 1) "jv$clojure.core$true?")
+(gate-check "seed-callable?: a runtime-defined seed var answers #t" (seed-callable? jolt-nil "clojure.core" "array-map" 2) #t)
 (gate-check "seed-callable?: wrong arity refused" (jolt-nil? (seed-callable? jolt-nil "clojure.core" "true?" 3)) #t)
 (gate-check "seed-callable?: a dynamic var refused" (jolt-nil? (seed-callable? jolt-nil "clojure.core" "*print-length*" 0)) #t)
 (gate-check "seed-callable?: an app var refused" (jolt-nil? (seed-callable? jolt-nil "user" "helper" 1)) #t)
