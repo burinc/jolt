@@ -1082,13 +1082,25 @@
                (if (reader-jhost? reader) (drain-reader reader) (jolt-str-render-one reader))))
 
 ;; line-seq: an io/reader is a jhost StringReader. Drain it (or take a string)
-;; and split on newline; a trailing newline does NOT yield a final empty line
-;; (like readLine -> nil at EOF). Re-asserted in post-prelude.ss.
+;; and split on a line terminator; a trailing terminator does NOT yield a final
+;; empty line (like readLine -> nil at EOF). Re-asserted in post-prelude.ss.
+;;
+;; \n, \r and \r\n all terminate, because on the JVM line-seq is a (.readLine …)
+;; loop over a BufferedReader and that is the rule readLine follows. Splitting on
+;; \n alone left the \r of every CRLF line attached to it.
 (define (chez-lines s)
-  (let loop ((cs (string->list s)) (cur '()) (acc '()))
-    (cond ((null? cs) (reverse (if (null? cur) acc (cons (list->string (reverse cur)) acc))))
-          ((char=? (car cs) #\newline) (loop (cdr cs) '() (cons (list->string (reverse cur)) acc)))
-          (else (loop (cdr cs) (cons (car cs) cur) acc)))))
+  (let ((n (string-length s)))
+    (let loop ((i 0) (start 0) (acc '()))
+      (cond
+        ((fx=? i n) (reverse (if (fx=? start i) acc (cons (substring s start i) acc))))
+        ((char=? (string-ref s i) #\newline)
+         (loop (fx+ i 1) (fx+ i 1) (cons (substring s start i) acc)))
+        ((char=? (string-ref s i) #\return)
+         (let ((next (if (and (fx<? (fx+ i 1) n) (char=? (string-ref s (fx+ i 1)) #\newline))
+                         (fx+ i 2)
+                         (fx+ i 1))))
+           (loop next next (cons (substring s start i) acc))))
+        (else (loop (fx+ i 1) start acc))))))
 (define (chez-line-seq rdr)
   (list->cseq (chez-lines (cond ((string? rdr) rdr)
                                 ((reader-jhost? rdr) (drain-reader rdr))
