@@ -674,6 +674,13 @@
 (jch-register-supers! "java.net.MalformedURLException" '("java.io.IOException"))
 (jch-register-supers! "java.net.URISyntaxException" '("java.lang.Exception"))
 (jch-register-supers! "javax.net.ssl.SSLException" '("java.io.IOException"))
+;; java.net.http: the two exceptions a java.net.http caller raises or matches on.
+;; Both are plain IOException subclasses on the JDK, and host-static-classes.ss's
+;; ctor sweep derives (HttpTimeoutException. "msg") from these rows — the class
+;; token already resolved and catch already matched, so only construction was
+;; missing (jolt#950).
+(jch-register-supers! "java.net.http.HttpTimeoutException" '("java.io.IOException"))
+(jch-register-supers! "java.net.http.HttpConnectTimeoutException" '("java.net.http.HttpTimeoutException"))
 (jch-register-supers! "java.nio.charset.UnsupportedCharsetException" '("java.lang.IllegalArgumentException"))
 (jch-register-supers! "java.nio.charset.IllegalCharsetNameException" '("java.lang.IllegalArgumentException"))
 (jch-register-supers! "java.lang.Error" '("java.lang.Throwable"))
@@ -1036,6 +1043,7 @@
 (for-each (lambda (p) (hashtable-set! jhost-tag->fqn (car p) (cdr p)))
   '(("user-thread" . "java.lang.Thread")
     ("abq" . "java.util.concurrent.ArrayBlockingQueue")
+    ("lbq" . "java.util.concurrent.LinkedBlockingQueue")
     ("future-task" . "java.util.concurrent.FutureTask")
     ;; Executors' pools are ThreadPoolExecutors on the JVM too, and what their
     ;; submit returns is a FutureTask — the same class the "future-task" tag

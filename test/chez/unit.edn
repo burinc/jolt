@@ -247,6 +247,13 @@
   {:suite "hostctor" :expr "(nil? (.getHost (java.net.URI. \"/rel/path\")))" :expected "true"}
   {:suite "hostctor" :expr "(str (java.net.URI. \"http://x/y\"))" :expected "\"http://x/y\""}
   {:suite "hostctor" :expr "(instance? java.net.URI (java.net.URI. \"/x\"))" :expected "true"}
+  ;; An arity java.net.URI has no constructor for. JVM Clojure's reflector says
+  ;; exactly this, but it says it at COMPILE time, so the case cannot be a corpus
+  ;; row. jolt used to let the call reach the registered 1-arg ctor and report
+  ;; Chez's "incorrect number of arguments 5 to #object[clojure.lang.AFunction...]",
+  ;; which named an anonymous function instead of the class (jolt#949).
+  {:suite "hostctor" :expr "(try (java.net.URI. \"https\" \"//x.example/a\") :no-throw (catch IllegalArgumentException e (ex-message e)))" :expected "\"No matching ctor found for class java.net.URI\""}
+  {:suite "hostctor" :expr "(try (java.net.URI. \"a\" \"b\" \"c\" \"d\" \"e\" \"f\") :no-throw (catch IllegalArgumentException e (ex-message e)))" :expected "\"No matching ctor found for class java.net.URI\""}
   {:suite "hostctor" :expr "(let [a (java.util.ArrayList.)] (.add a 1) (.add a 2) (.add a 3) (.remove a 0) [(.size a) (vec (.toArray a))])" :expected "[2 [2 3]]"}
   {:suite "hostctor" :expr "(let [a (java.util.ArrayList. [1 2]) out (.toArray a)] [(instance? (Class/forName \"[Ljava.lang.Object;\") out) (vec out)])" :expected "[true [1 2]]"}
   {:suite "hostctor" :expr "(let [a (java.util.ArrayList. [1 2]) dst (object-array [:old :old :keep :tail]) out (.toArray a dst)] [(identical? dst out) (vec out)])" :expected "[true [1 2 nil :tail]]"}

@@ -2240,10 +2240,13 @@
 ;; queue is full, jolt queues it; that is the deliberate divergence here.
 ;;
 ;; abq state: #(capacity mutex cond queue-pair count); queue-pair is (out . in)
-;; like the executor's. One condition serves takers and putters (broadcast).
-(define (make-abq cap)
-  (make-jhost "abq" (vector cap (make-mutex) (make-condition) (cons '() '()) 0)))
-(define (abq? x) (and (jhost? x) (string=? (jhost-tag x) "abq")))
+;; like the executor's. One condition serves takers and putters (broadcast). The
+;; jhost TAG is what names the class — "abq" or "lbq" (see LinkedBlockingQueue
+;; below) — so everything from here down is written against the tag it is given.
+(define (make-abq* tag cap)
+  (make-jhost tag (vector cap (make-mutex) (make-condition) (cons '() '()) 0)))
+(define (make-abq cap) (make-abq* "abq" cap))
+(define (abq? x) (and (jhost? x) (member (jhost-tag x) '("abq" "lbq")) #t))
 ;; the mutators run under the mutex (jolt-cv-wait's decide, or jolt-with-mutex)
 (define (abq-enq! st v)
   (let ((q (vector-ref st 3)))
@@ -2284,6 +2287,25 @@
             ;; (cap) / (cap fair) — fairness is accepted and ignored
             (lambda (cap . _) (make-abq (jnum->exact cap)))))
           '("ArrayBlockingQueue" "java.util.concurrent.ArrayBlockingQueue"))
+;; LinkedBlockingQueue is the same queue with a different bound: its no-arg ctor
+;; is unbounded (Integer.MAX_VALUE capacity, which is literally what the JDK
+;; stores and what .remainingCapacity answers), (int) is the bounded form, and
+;; (Collection) fills an unbounded one. It gets its OWN tag rather than a second
+;; ctor onto "abq" because jhost-tag->fqn is the single value -> class map:
+;; sharing the tag would make (class (LinkedBlockingQueue.)) answer
+;; ArrayBlockingQueue. The methods themselves are identical, so the tag aliases
+;; abq's table instead of copying it (jolt#951).
+(define lbq-unbounded-capacity 2147483647)   ; Integer.MAX_VALUE, as the JDK stores it
+(define (lbq-fill! q xs) (for-each (lambda (v) (abq-enq! (jhost-state q) v)) xs) q)
+(for-each (lambda (nm) (register-class-ctor! nm
+            (lambda args
+              (cond ((null? args) (make-abq* "lbq" lbq-unbounded-capacity))
+                    ((number? (car args)) (make-abq* "lbq" (jnum->exact (car args))))
+                    ;; (LinkedBlockingQueue. coll) — seeded and unbounded
+                    (else (lbq-fill! (make-abq* "lbq" lbq-unbounded-capacity)
+                                     (let ((s (jolt-seq (car args))))
+                                       (if (jolt-nil? s) '() (seq->list s)))))))))
+          '("LinkedBlockingQueue" "java.util.concurrent.LinkedBlockingQueue"))
 (register-host-methods! "abq"
   (list (cons "offer" (lambda (self v . args)
           (if (null? args)
@@ -2320,8 +2342,12 @@
                 (vector-set! st 4 0)
                 (jolt-cv-wake! (vector-ref st 2)))))
           jolt-nil))
+        ;; the tag, not a literal: "lbq" shares this table and must not print as
+        ;; an ArrayBlockingQueue.
         (cons "toString" (lambda (self)
-          (string-append "ArrayBlockingQueue(" (number->string (vector-ref (jhost-state self) 4)) ")")))))
+          (string-append (if (string=? (jhost-tag self) "lbq") "LinkedBlockingQueue" "ArrayBlockingQueue")
+                         "(" (number->string (vector-ref (jhost-state self) 4)) ")")))))
+(alias-host-methods! "lbq" "abq")
 
 ;; FutureTask — a run-once task with a blocking get. State:
 ;; #(status override-flag override value error mutex cond thunk); status is one
