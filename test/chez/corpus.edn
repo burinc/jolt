@@ -3134,6 +3134,20 @@
   {:suite "regex / \\p property classes" :label "P{N} negation" :expected "\"abc\"" :actual "(re-matches #\"^\\P{N}+$\" \"abc\")" :portability :common}
   {:suite "regex / \\p property classes" :label "inside class" :expected "\"a-1_b\"" :actual "(re-matches #\"^[\\p{N}\\p{L}_-]+$\" \"a-1_b\")" :portability :common}
   {:suite "regex / \\p property classes" :label "p{Lu}/p{Ll}" :expected "\"aB\"" :actual "(re-matches #\"^\\p{Ll}\\p{Lu}$\" \"aB\")" :portability :common}
+  ;; the JVM's rule: a Unicode CATEGORY name is the real category over every
+  ;; codepoint, a POSIX name (Alpha, Digit, Upper, Punct, Alnum) is ASCII
+  {:suite "regex / \\p property classes" :label "p{L} is letters, not every non-ASCII char (#941)" :expected "[\"a\" \"é\" \"漢\"]" :actual "(re-seq #\"\\p{L}\" \"aé漢→\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "a class over p{L}p{N} drops an arrow (#941)" :expected "\"a  b\"" :actual "(clojure.string/replace \"a → b\" #\"[^\\p{L}\\p{N}\\s_-]\" \"\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Alpha} is ASCII" :expected "[\"a\"]" :actual "(re-seq #\"\\p{Alpha}\" \"aé\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Digit} is ASCII" :expected "[\"1\"]" :actual "(re-seq #\"\\p{Digit}\" \"1٣\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Lu} beyond Latin-1" :expected "[\"É\" \"Ω\" \"B\"]" :actual "(re-seq #\"\\p{Lu}\" \"aÉΩB\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Ll} beyond Latin-1" :expected "\"ω\"" :actual "(re-find #\"\\p{Ll}\" \"ω\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Upper} stays ASCII" :expected "nil" :actual "(re-find #\"\\p{Upper}\" \"Ω\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Alnum} stays ASCII" :expected "nil" :actual "(re-find #\"\\p{Alnum}\" \"é\")" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Nd} is decimal digits, p{N} every number" :expected "[\"٣\" nil \"Ⅻ\"]" :actual "[(re-find #\"\\p{Nd}\" \"٣\") (re-find #\"\\p{Nd}\" \"Ⅻ\") (re-find #\"\\p{N}\" \"Ⅻ\")]" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{P} is Unicode punctuation, p{Punct} ASCII" :expected "[\"¿\" nil nil]" :actual "[(re-find #\"\\p{P}\" \"¿\") (re-find #\"\\p{Punct}\" \"¿\") (re-find #\"\\p{P}\" \"→\")]" :portability :common}
+  {:suite "regex / \\p property classes" :label "p{Ps}/p{Pe} are the open/close categories" :expected "[nil \"«\" \"」\"]" :actual "[(re-find #\"\\p{Ps}\" \"«\") (re-find #\"\\p{P}\" \"«\") (re-find #\"\\p{Pe}\" \"」\")]" :portability :common}
+  {:suite "regex / \\p property classes" :label "javaUpperCase/javaLowerCase are Unicode" :expected "[\"Ω\" \"ω\"]" :actual "[(re-find #\"\\p{javaUpperCase}\" \"Ω\") (re-find #\"\\p{javaLowerCase}\" \"ω\")]" :portability :common}
   {:suite "regex / \\p property classes" :label "p{Z} space" :expected "\"  \"" :actual "(re-matches #\"(?u)^[\\s\\p{Z}]+$\" \"  \")" :portability :common}
   {:suite "regex / \\p property classes" :label "p{Ps}/p{Pe}" :expected "\"(x)\"" :actual "(re-matches #\"^\\p{Ps}x\\p{Pe}$\" \"(x)\")" :portability :common}
   ;; An escape means the same thing in a bare pattern and inside a character class
@@ -5110,6 +5124,10 @@
   {:suite "interop / uri equality" :label "URIs are value-equal and usable as set members" :expected "[true true]" :actual "[(= (java.net.URI. \"/\") (java.net.URI. \"/\")) (= #{(java.net.URI. \"/\")} #{(java.net.URI. \"/\")})]" :portability :jvm}
   {:suite "stdlib / clojure.walk" :label "macroexpand-all expands a form" :expected "true" :actual "(do (require (quote clojure.walk)) (seq? (clojure.walk/macroexpand-all (quote (when true 1)))))" :portability :common}
   {:suite "regex / re-seq zero-width" :label "a zero-width match advances by one without repeating" :expected "[\"a\" \"\" \"a\" \"\"]" :actual "(vec (re-seq #\"a*\" \"aba\"))" :portability :common}
+  ;; split resumes after the match it found, not one past where it started
+  ;; looking: a lookahead match ahead of the search start was re-found and
+  ;; emitted a spurious empty segment (#940)
+  {:suite "regex / re-seq zero-width" :label "a zero-width lookahead split resumes after the match (#940)" :expected "[\"a\" \"Xb\" \"X\" \"Xc\" \"Xd\"]" :actual "(clojure.string/split \"aXbXXcXd\" #\"(?=X)\")" :portability :common}
   {:suite "seqs / lazy-seq interop" :label "conj onto a rest-derived seq prepends" :expected "true" :actual "(= [9 2 3] (vec (conj (rest [1 2 3]) 9)))" :portability :common}
   {:suite "seqs / lazy-seq interop" :label "conj onto a lazy-seq prepends" :expected "true" :actual "(= [9 1 2] (vec (conj (lazy-seq (list 1 2)) 9)))" :portability :common}
   {:suite "seqs / lazy-seq interop" :label "into over a conj'd rest-seq" :expected "true" :actual "(= [0 2 3] (into [] (conj (rest [1 2 3]) 0)))" :portability :common}
