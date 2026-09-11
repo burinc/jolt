@@ -332,6 +332,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fork-thread` every spawn goes through does it now, so the next spawn site
   cannot miss it either.
 
+- **`java.net.URI`'s component constructors exist.** Only `(URI. String)` was
+  registered, so every other JVM arity reached that one-argument procedure and
+  died with Chez's `incorrect number of arguments 5 to
+  #object[clojure.lang.AFunction$fn__0 …]` — an anonymous function where the
+  class should have been named (#949). The JDK's other four are here now:
+  `(scheme ssp fragment)`, `(scheme host path fragment)`,
+  `(scheme authority path query fragment)` and
+  `(scheme userInfo host port path query fragment)`. They work the way the JDK's
+  do — compose a URI string out of the components, quoting each against the
+  character set its own component allows, then parse that — so they QUOTE where
+  the single-string constructor REJECTS (`(URI. "https" "x.example" "/a b" nil)`
+  is `https://x.example/a%20b`, while `(URI. "https://x.example/a b")` is still a
+  `URISyntaxException`), a host holding a `:` is bracketed as an IPv6 literal, a
+  relative path under a scheme is `Relative path in absolute URI`, and the
+  host-taking arities insist on a server authority where the authority-taking
+  one accepts a registry-based name. An arity the JDK has no constructor for now
+  reports `No matching ctor found for class java.net.URI`, which is what JVM
+  Clojure's reflector says for the same call.
+
+- **`java.net.URI`'s non-raw accessors percent-decode.** `getPath` and
+  `getRawPath` answered the same string — the substring the parse produced — so
+  `(.getPath (java.net.URI. "https://h.com/a%20b"))` was `"/a%20b"` where the JVM
+  answers `"/a b"`, and likewise for `getAuthority`, `getUserInfo`, `getQuery`,
+  `getFragment` and `getSchemeSpecificPart`. This was the last divergence the
+  java.net.URI differential run behind #904 had left. Each escapable component is
+  stored twice now, raw and decoded, and the two families of accessor answer the
+  two forms; `getRawAuthority` and `getRawFragment`, which had no implementation
+  at all, answer alongside their siblings. A run of consecutive escapes decodes as
+  one UTF-8 sequence (`%C3%A4` is `ä`, not two characters) and a byte sequence
+  that is not valid UTF-8 becomes U+FFFD rather than raising — both the host
+  decoder's doing, matching the JVM's byte for byte. `+` stays a plus: that is
+  form encoding, and `URLDecoder`'s job. The one carve-out is the JVM's
+  (JDK-8037396): inside a bracketed IPv6 literal a `%` is the scope-id separator
+  rather than an escape, so the components that can hold one — authority, user
+  info, scheme-specific part — leave escapes there alone, where path, query and
+  fragment decode them.
+
+- **`java.net.URI` resolves, normalizes and relativizes.** `resolve` (against
+  a `URI` or a string), `normalize`, `relativize`, `isOpaque` and `compareTo`
+  were missing — `(.resolve base "c%20d")` was "No matching method resolve",
+  and every HTTP client's redirect-following goes through it. They follow RFC
+  2396 §5.2 the way `java.net.URI` does: a lone fragment is the base with that
+  fragment, a child with an authority replaces everything but the scheme, a
+  relative path merges onto the base path's directory and normalizes — where
+  "." goes, ".." takes the segment before it unless that is a ".." or there is
+  none, and a kept segment keeps the slash that followed it, so
+  `/a/b/..` is `/a/` and `/a/b/../../..` is `/..` — and a base with an
+  authority and no path merges as `/` (RFC 3986's rule, the JDK's since 20:
+  `"a"` against `https://h.com` is `https://h.com/a`). Every URI jolt hands
+  back is still built from raw components and run through the one parser. A
+  URI is `Comparable`, so `compare` and `sort` order them by string form.
+
+- **The blocking queues have their `Collection` half.** `add` (offer, or
+  `IllegalStateException: Queue full`), `contains`, `iterator`, `toArray`,
+  `seq` and `count` over a snapshot taken under the queue's mutex, and a
+  hierarchy row, so `(instance? java.util.concurrent.BlockingQueue q)` is true
+  where it was false and `(seq q)` seqs where it threw.
+
+- **A blocking queue refuses a capacity below 1.** `(ArrayBlockingQueue. 0)` and
+  `(LinkedBlockingQueue. 0)` built a queue whose `put` then blocked forever and
+  whose `offer` always answered `false` — a hang with nothing pointing at the
+  constructor that caused it. Both reject it at construction now with the JDK
+  constructor's own bare (message-less) `IllegalArgumentException`.
+
+- **`ProcessBuilder.redirectInput(File)` reaches the child.** The redirect
+  setters stored whatever they were handed, and the spawn path understands only
+  a `ProcessBuilder$Redirect`, so a `java.io.File` fell through as "no redirect"
+  and fd 0 stayed jolt's own stdin: a child like `cat` read the terminal and
+  never saw EOF, stealing TTY input until it was killed (#947). The JDK 9 `File`
+  overloads are what was missing — `redirectInput(File)` is
+  `redirectInput(Redirect.from(file))`, `redirectOutput`/`redirectError(File)`
+  are `Redirect.to(file)` — and the setters coerce one now (a `Path` or a path
+  string too, which `.directory` already took). This is also the
+  `babashka.process` path: `{:in (fs/file "/dev/null")}` translates to exactly
+  that overload, so every `babashka.process` caller needed the `:in :pipe`
+  workaround. An argument that is neither a `Redirect` nor a file is named in an
+  `IllegalArgumentException` rather than stored and ignored.
+
+- **`SocketOutputStream.write(byte[])` writes the array.** `OutputStream` has
+  two one-argument `write` overloads — `write(int)` and the abstract class's
+  `write(byte[])` convenience method — and jolt's socket stream read the lone
+  argument as a byte count, so `(.write out (.getBytes "hi"))` reported `class
+  [B cannot be cast to class java.lang.Number`, naming neither the socket nor
+  the overload (#954). It dispatches on the argument now, the way
+  `io-streams.ss`'s `out-stream` already did; the three-argument form is
+  unchanged.
+
+- **`java.util.concurrent.LinkedBlockingQueue` constructs.** The class name
+  resolved but had no constructor, so the default choice for a producer/consumer
+  handoff had to become a fixed-capacity `ArrayBlockingQueue` — a semantic
+  downgrade — and the error was indistinguishable from a typo'd class (#951). It
+  is the blocking queue jolt already had, with the JDK's capacities: unbounded
+  (`Integer/MAX_VALUE`) with no argument, bounded with an `int`, unbounded and
+  filled from a collection. It carries its own class, so
+  `(class (LinkedBlockingQueue.))` is not `ArrayBlockingQueue`.
+
+- **`java.net.http.HttpTimeoutException` constructs.** The class token resolved
+  and `(catch HttpTimeoutException …)` already matched, but constructing one
+  threw — which is what exception-mapping code and test doubles do with a
+  request timeout (#950). jolt derives every exception constructor from the one
+  class hierarchy, so the class was simply missing its row; it and its JDK
+  subclass `HttpConnectTimeoutException` have one now, both plain `IOException`
+  subclasses as on the JDK.
+
 - **The first match on a large alternation no longer takes seconds (or never
   finishes).** A 50-branch union with two unbounded `.*` branches — a retry
   classifier's 873-character pattern — stalled ~5s on its first `re-find` on
