@@ -97,6 +97,10 @@
         ((char=? c #\i) 'case-insensitive)
         ((char=? c #\m) 'multi-line)
         ((char=? c #\x) 'ignore-space)
+        ;; d (UNIX_LINES) narrows the terminator set DOT / ^ / $ read — see
+        ;; java-nel below. It used to be accepted and dropped, which was harmless
+        ;; only because the narrow set was all jolt ever applied.
+        ((char=? c #\d) 'unix-lines)
         (else #f)))
 
 (define (parse-leading-flags src i end)
@@ -111,7 +115,7 @@
                     (values (reverse opts) i)
                     (let ((c (string-ref src j)))
                       (cond
-                       ((memv c '(#\u #\U #\d)) (scan (+ j 1) fs))
+                       ((memv c '(#\u #\U)) (scan (+ j 1) fs))
                        ((regex-flag->opt c) =>
                         (lambda (opt) (scan (+ j 1) (cons opt fs))))
                        ((char=? c #\))
@@ -268,15 +272,13 @@
                          (maybe-quantifier cc src i end flags depth)))
      ((char=? c #\()  (let-values (((grp i) (parse-group src i end flags depth)))
                          (maybe-quantifier grp src i end flags depth)))
-     ((char=? c #\.)  (maybe-quantifier (if (jr-flag? flags 'single-line) 'any 'nonl)
+     ((char=? c #\.)  (maybe-quantifier (if (jr-flag? flags 'single-line) 'any (jr-dot-sre flags))
                                         src (+ i 1) end flags depth))
-     ((char=? c #\^)  (maybe-quantifier (if (jr-flag? flags 'multi-line) 'bol 'bos)
+     ((char=? c #\^)  (maybe-quantifier (if (jr-flag? flags 'multi-line) (jr-bol-sre flags) 'bos)
                                         src (+ i 1) end flags depth))
      ((char=? c #\$)
       (maybe-quantifier
-       (if (jr-flag? flags 'multi-line)
-           '(or eol eos)
-           '(look-ahead (or eos (seq (? #\return) #\newline eos))))
+       (if (jr-flag? flags 'multi-line) (jr-eol-sre flags) (jr-final-eol-sre flags))
        src (+ i 1) end flags depth))
       ((char=? c #\{)
        ;; A {n,m} with no preceding atom: Java still validates it and rejects
@@ -445,6 +447,46 @@
        #\newline ,(integer->char #x0B) ,(integer->char #x0C) #\return
        ,(integer->char #x85) ,(integer->char #x2028) ,(integer->char #x2029)))
 
+;; ── Line terminators for DOT / ^ / $ ──────────────────────────────────────────
+;; Java's terminator set is \n, \r, \r\n, NEL (U+0085), LS (U+2028) and PS
+;; (U+2029); the UNIX_LINES flag ((?d)) narrows it to \n alone. irregex's own
+;; `nonl`, `bol` and `eol` carry the NARROW set and nothing else, so mapping onto
+;; them applied UNIX_LINES unconditionally (#956): `.` matched across a \r, (?m)^
+;; did not match after one, and `(?m)^(.*)$` over CRLF input captured the \r —
+;; found in an HTTP header parser, where every value came back with one attached.
+;;
+;; The wide forms are assertions rather than irregex ops, which costs the
+;; backtracking matcher for a pattern that anchors (non-multiline `$` already
+;; cost it — it has always been a look-ahead). Two rules shape them, and both are
+;; Java's: a CRLF is ONE terminator, so neither anchor may sit between the \r and
+;; the \n; and multiline ^ does not match at the very end of input, which is what
+;; its look-ahead for one more character says.
+(define java-nel (integer->char #x85))
+(define java-ls (integer->char #x2028))
+(define java-ps (integer->char #x2029))
+
+(define dot-sre-wide `(~ #\newline #\return ,java-nel ,java-ls ,java-ps))
+(define bol-sre-wide
+  `(or bos
+       (seq (look-behind (or #\newline ,java-nel ,java-ls ,java-ps)) (look-ahead any))
+       (seq (look-behind #\return) (look-ahead (~ #\newline)))))
+(define eol-sre-wide
+  `(or eos
+       (look-ahead (or #\return ,java-nel ,java-ls ,java-ps))
+       (seq (or bos (look-behind (~ #\return))) (look-ahead #\newline))))
+;; `$` outside MULTILINE, and \Z: end of input, or just before a FINAL terminator.
+(define final-eol-sre-wide
+  `(look-ahead (or eos
+                   (seq #\return (? #\newline) eos)
+                   (seq (or #\newline ,java-nel ,java-ls ,java-ps) eos))))
+(define final-eol-sre-unix `(look-ahead (or eos (seq #\newline eos))))
+
+(define (jr-dot-sre flags) (if (jr-flag? flags 'unix-lines) 'nonl dot-sre-wide))
+(define (jr-bol-sre flags) (if (jr-flag? flags 'unix-lines) 'bol bol-sre-wide))
+(define (jr-eol-sre flags) (if (jr-flag? flags 'unix-lines) '(or eol eos) eol-sre-wide))
+(define (jr-final-eol-sre flags)
+  (if (jr-flag? flags 'unix-lines) final-eol-sre-unix final-eol-sre-wide))
+
 (define (parse-escape src i end flags)
   (if (>= i end)
       (values #\\ i)
@@ -453,8 +495,7 @@
           ((#\b) (values '(or bow eow) (+ i 1)))
           ((#\B) (values 'nwb (+ i 1)))
           ((#\A) (values 'bos (+ i 1)))
-          ((#\Z)
-           (values '(look-ahead (or eos (seq (? #\return) #\newline eos))) (+ i 1)))
+          ((#\Z) (values (jr-final-eol-sre flags) (+ i 1)))
           ((#\z) (values 'eos (+ i 1)))
           ((#\R) (values linebreak-sre (+ i 1)))
           ((#\Q)
@@ -717,9 +758,12 @@
            ((char=? c #\x)
             (scan (+ j 1)
                   (cons (if neg 'not-ignore-space 'ignore-space) fs) neg))
-            ;; u (UNICODE_CASE), U (UNICODE_CHARACTER_CLASS), d (UNIX_LINES):
-            ;; accept and ignore — they don't change matching for our engine.
-            ((memv c '(#\c #\u #\U #\d))
+           ((char=? c #\d)
+            (scan (+ j 1)
+                  (cons (if neg 'not-unix-lines 'unix-lines) fs) neg))
+            ;; u (UNICODE_CASE) and U (UNICODE_CHARACTER_CLASS): accept and
+            ;; ignore — they don't change matching for our engine.
+            ((memv c '(#\c #\u #\U))
              (scan (+ j 1) fs neg))
            ((char=? c #\:)
             (let ((new-flags (apply-inline-flags flags fs)))
@@ -754,6 +798,7 @@
            ((eq? f 'not-single-line) (loop (cdr fs) (remq 'single-line flags)))
            ((eq? f 'not-multi-line) (loop (cdr fs) (remq 'multi-line flags)))
            ((eq? f 'not-ignore-space) (loop (cdr fs) (remq 'ignore-space flags)))
+           ((eq? f 'not-unix-lines) (loop (cdr fs) (remq 'unix-lines flags)))
            (else (loop (cdr fs) (cons f flags))))))))
 
 (define (wrap-case-flag sre fs)
@@ -769,6 +814,6 @@
           (cond
            ((eq? f 'case-insensitive) (loop (cdr fs) `(w/nocase ,sre)))
            ((eq? f 'case-sensitive)   (loop (cdr fs) `(w/case ,sre)))
-           ((memq f '(not-single-line not-multi-line not-ignore-space))
+           ((memq f '(not-single-line not-multi-line not-ignore-space not-unix-lines))
             (loop (cdr fs) sre))
            (else (loop (cdr fs) sre)))))))

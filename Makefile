@@ -102,7 +102,7 @@ JOLT-TARGETS-NEEDING-DEPS := \
   devbootsmoke devirt directlink ffi fibers fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance mandelbrot-num mathfl mvnhttp \
-  deadhost mirrordrift mirrordrift-regen \
+  deadhost mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen \
   narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke staticnativesmoke stateimage test testbin transient unit unitcontext \
@@ -165,7 +165,7 @@ CI-GATES := submodules values corpus unit documented grenadine mvnhttp readscali
   hasheq narrowhash \
   protoret pic narrow directlink directcall arraymap arraybacking unitcontext numeric oparity mathfl flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift deadhost adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck deadhost adaptercheck hostprops statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotfingerprint vfaslceiling compilepathsmoke makefilesmoke versionsmoke \
   systemstreams \
   certify gambitcheck gambitgencheck gambitseedcheck gambitboot grenadinecheck fibers gosm asynctimer interruptnest threadsafety flow
@@ -969,6 +969,15 @@ mirrordrift:
 
 mirrordrift-regen:
 	@sh host/chez/mirror-drift-check.sh --regen
+
+# host/chez/regex-dfa.ss is a COPY of one vendored irregex procedure with two
+# deliberate changes. Fails when the submodule's original has moved on, so a
+# vendor bump cannot leave jolt shadowing a stale copy in silence.
+regexdfacheck:
+	@sh host/chez/regex-dfa-check.sh
+
+regexdfacheck-regen:
+	@sh host/chez/regex-dfa-check.sh --regen
 
 # Top-level host procedures nothing calls. A definition whose last caller went
 # away is still compiled into every binary and still copied forward into the

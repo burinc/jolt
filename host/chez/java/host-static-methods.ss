@@ -847,6 +847,48 @@
   (register-class-statics! "NumberFormat" nf-statics)
   (register-class-statics! "java.text.NumberFormat" nf-statics))
 
+;; ---- java.text.Normalizer ----------------------------------------------------
+;; Unicode normalization: identifier comparison, path equality on filesystems
+;; that store decomposed accents, and search/fuzzy matching all go through it.
+;; Chez implements all four Unicode normalization forms natively, so this is a
+;; direct dispatch on the Form constant rather than a table of its own.
+;;
+;; Form is an enum, and jolt models an enum constant the way TimeUnit does: a
+;; jhost carrying its name, so (str Normalizer$Form/NFC) is "NFC" as on the JVM
+;; and (= f Normalizer$Form/NFC) compares the one interned constant. The
+;; constants are registered under the binary name (Normalizer$Form), which is
+;; how the analyzer spells a nested class; registering the FQN registers the
+;; short name with it.
+(define (normalizer-form? x) (and (jhost? x) (string=? (jhost-tag x) "normalizer-form")))
+(define (normalizer-form-name f) (vector-ref (jhost-state f) 0))
+(define normalizer-form-constants
+  (map (lambda (nm) (cons nm (make-jhost "normalizer-form" (vector nm))))
+       '("NFC" "NFD" "NFKC" "NFKD")))
+(register-str-render! normalizer-form? normalizer-form-name)
+(register-host-methods! "normalizer-form"
+  (list (cons "name" normalizer-form-name)
+        (cons "toString" normalizer-form-name)))
+;; The JVM's normalize(CharSequence, Form) rejects a null form with an NPE and
+;; has no other failure mode. A form that is not one of the four constants can
+;; only come from jolt code that built one by hand, so it names itself in the
+;; message rather than reading as a missing method.
+(define (normalizer-normalize s form)
+  (let ((str (jolt-str-render-one s))
+        (nm (if (normalizer-form? form) (normalizer-form-name form) (jolt-str-render-one form))))
+    (cond ((string=? nm "NFC")  (string-normalize-nfc str))
+          ((string=? nm "NFD")  (string-normalize-nfd str))
+          ((string=? nm "NFKC") (string-normalize-nfkc str))
+          ((string=? nm "NFKD") (string-normalize-nfkd str))
+          (else (throw-jvm (quote IllegalArgumentException)
+                           (string-append "Normalizer/normalize: not a Normalizer.Form: " nm))))))
+(register-class-statics! "java.text.Normalizer"
+  (list (cons "normalize" normalizer-normalize)
+        (cons "isNormalized"
+              (lambda (s form)
+                (let ((str (jolt-str-render-one s)))
+                  (string=? str (normalizer-normalize str form)))))))
+(register-class-statics! "java.text.Normalizer$Form" normalizer-form-constants)
+
 ;; Class.forName: an array descriptor ("[C") is its own class token; a class Jolt
 ;; can back (registered statics/ctor, or a java.*/clojure.* core class) yields a
 ;; class object; anything else throws a catchable ClassNotFoundException, like the

@@ -1895,6 +1895,7 @@
 (load "host/chez/java/host-static-methods.ss")  ; Class/member static methods + fields
 (load "host/chez/java/host-static-classes.ss")  ; instantiable host object classes
 (load "host/chez/java/byte-buffer.ss")          ; java.nio.ByteBuffer over a byte-array
+(load "host/chez/java/charset-coding.ss")       ; CharBuffer + the CharsetDecoder decode loop
 
 ;; generic dot-form dispatch: field access + map/vector member access
 ;; for the `.` / `.-field` desugar. Loads after host-static.ss so it wraps every
