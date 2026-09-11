@@ -615,6 +615,98 @@
   {:suite "ioreader" :expr "(let [log (atom [])] (with-open [a {:close (fn [] (swap! log conj :outer))} b {:close (fn [] (swap! log conj :inner))}] :r) (deref log))" :expected "[:inner :outer]"}
   {:suite "ioreader" :expr "(with-open [c {:close (fn [] nil) :v 5}] (:v c))" :expected "5"}
   {:suite "ioreader" :expr "(do (defrecord RC [log] java.io.Closeable (close [_] (swap! log conj :closed))) (let [log (atom [])] (with-open [r (->RC log)] :body) @log))" :expected "[:closed]"}
+
+  ;; --- line terminators (gh-948) ----------------------------------------------
+  ;; readLine / lines / read-line / with-in-str / line-seq all end a line on a
+  ;; newline, a carriage return, or the pair, and none of the three is part of the
+  ;; line. The byte-decoding readers used Chez get-line, which splits on newline
+  ;; alone, so every CRLF line came back with its CR still on it and an HTTP
+  ;; header loop never recognized its own blank terminator line.
+  {:suite "crlf" :expr "(let [r (java.io.BufferedReader. (java.io.InputStreamReader. (java.io.ByteArrayInputStream. (.getBytes \"a\\r\\nb\\nc\\rd\" \"UTF-8\"))))] [(.readLine r) (.readLine r) (.readLine r) (.readLine r) (.readLine r)])" :expected "[\"a\" \"b\" \"c\" \"d\" nil]"}
+  {:suite "crlf" :expr "(vec (iterator-seq (.iterator (.lines (java.io.BufferedReader. (java.io.InputStreamReader. (java.io.ByteArrayInputStream. (.getBytes \"a\\r\\nb\\r\\n\" \"UTF-8\"))))))))" :expected "[\"a\" \"b\"]"}
+  {:suite "crlf" :expr "(binding [*in* (java.io.BufferedReader. (java.io.InputStreamReader. (java.io.ByteArrayInputStream. (.getBytes \"x\\r\\n\" \"UTF-8\"))))] (read-line))" :expected "\"x\""}
+  {:suite "crlf" :expr "(with-in-str \"x\\r\\n\" (read-line))" :expected "\"x\""}
+  {:suite "crlf" :expr "(with-in-str \"a\\r\\nb\\nc\\rd\" [(read-line) (read-line) (read-line) (read-line) (read-line)])" :expected "[\"a\" \"b\" \"c\" \"d\" nil]"}
+  {:suite "crlf" :expr "(line-seq (java.io.BufferedReader. (java.io.InputStreamReader. (java.io.ByteArrayInputStream. (.getBytes \"a\\r\\nb\\nc\\rd\" \"UTF-8\")))))" :expected "(\"a\" \"b\" \"c\" \"d\")"}
+  {:suite "crlf" :expr "(let [r (java.io.BufferedReader. (java.io.StringReader. \"a\\r\\nb\\rc\\nd\"))] [(.readLine r) (.readLine r) (.readLine r) (.readLine r)])" :expected "[\"a\" \"b\" \"c\" \"d\"]"}
+  ;; the newline of a CRLF is owed to the NEXT read, never peeked for: a reader
+  ;; over a pipe must not block waiting to find out whether one follows.
+  {:suite "crlf" :expr "(let [r (java.io.InputStreamReader. (java.io.ByteArrayInputStream. (.getBytes \"ab\\r\\ncd\" \"UTF-8\")))] [(.readLine r) (char (.read r)) (char (.read r)) (.read r)])" :expected "[\"ab\" \\c \\d -1]"}
+
+  ;; --- a Reader jolt did not build (gh-952) -----------------------------------
+  ;; io/reader refused a reify/proxy java.io.Reader outright, and the
+  ;; BufferedReader constructor handed one straight back, so the result had no
+  ;; readLine and no close. Both now go through a delegating adapter.
+  {:suite "ioreader / user Reader" :expr "(do (require (quote [clojure.java.io :as io])) (slurp (io/reader (let [p (atom 0) s \"hi\\r\\nthere\"] (reify java.io.Reader (read [_ cbuf off len] (let [i @p] (if (>= i (count s)) -1 (do (aset cbuf off (.charAt s i)) (reset! p (inc i)) 1)))))))))" :expected "\"hi\\r\\nthere\""}
+  {:suite "ioreader / user Reader" :expr "(let [src (let [p (atom 0) s \"hi\\r\\nthere\"] (reify java.io.Reader (read [_ cbuf off len] (let [i @p] (if (>= i (count s)) -1 (do (aset cbuf off (.charAt s i)) (reset! p (inc i)) 1)))))) b (java.io.BufferedReader. src)] [(identical? src b) (.getName (class b)) (instance? java.io.BufferedReader b) (.readLine b) (.readLine b) (.readLine b) (.close b)])" :expected "[false \"java.io.BufferedReader\" true \"hi\" \"there\" nil nil]"}
+  {:suite "ioreader / user Reader" :expr "(do (require (quote [clojure.java.io :as io])) (line-seq (io/reader (proxy [java.io.Reader] [] (read [cbuf off len] -1)))))" :expected ""}
+
+  ;; a byte[] is a ByteArrayInputStream read as UTF-8, as on the JVM; it used to
+  ;; fall through to the seq arm and read as the text of its element values.
+  {:suite "ioreader / user Reader" :expr "(do (require (quote [clojure.java.io :as io])) [(vec (line-seq (io/reader (.getBytes \"a\\r\\nb\" \"UTF-8\")))) (slurp (io/reader (.getBytes \"é\" \"UTF-8\")))])" :expected "[[\"a\" \"b\"] \"é\"]"}
+  ;; BufferedReader over jolt's own StringReader is the StringReader, so it has
+  ;; to answer .lines and .ready itself.
+  {:suite "ioreader / user Reader" :expr "(let [r (java.io.BufferedReader. (java.io.StringReader. \"l1\\r\\nl2\\r\\n\"))] [(.ready r) (vec (.lines r))])" :expected "[true [\"l1\" \"l2\"]]"}
+
+  ;; --- java.text.Normalizer (gh-953) ------------------------------------------
+  ;; The class symbol resolved while every member threw "no dependency provides".
+  ;; Chez implements all four Unicode normalization forms, so they are real here.
+  {:suite "normalizer" :expr "(java.text.Normalizer/normalize \"é\" java.text.Normalizer$Form/NFC)" :expected "\"é\""}
+  {:suite "normalizer" :expr "[(vec (map int (java.text.Normalizer/normalize \"é\" java.text.Normalizer$Form/NFD))) (vec (map int (java.text.Normalizer/normalize \"é\" java.text.Normalizer$Form/NFC)))]" :expected "[[101 769] [233]]"}
+  {:suite "normalizer" :expr "[(java.text.Normalizer/normalize \"ﬁ\" java.text.Normalizer$Form/NFKC) (str java.text.Normalizer$Form/NFKD) (.getName (class java.text.Normalizer$Form/NFC))]" :expected "[\"fi\" \"NFKD\" \"java.text.Normalizer$Form\"]"}
+  {:suite "normalizer" :expr "[(java.text.Normalizer/isNormalized \"é\" java.text.Normalizer$Form/NFC) (java.text.Normalizer/isNormalized \"é\" java.text.Normalizer$Form/NFC)]" :expected "[true false]"}
+
+  ;; --- CharsetDecoder / CodingErrorAction (gh-946) ----------------------------
+  ;; CodingErrorAction had no provider and the decoder's method table held only
+  ;; .charset, so the documented way to decode a stream a chunk at a time could
+  ;; not be written. The third row is that idiom: a 3-byte character split across
+  ;; two chunks must survive the split, which is what compact() carries over.
+  {:suite "charset-decoder" :expr "[(str java.nio.charset.CodingErrorAction/REPLACE) (.getName (class java.nio.charset.CodingErrorAction/REPORT)) (str java.nio.charset.CoderResult/UNDERFLOW)]" :expected "[\"REPLACE\" \"java.nio.charset.CodingErrorAction\" \"UNDERFLOW\"]"}
+  {:suite "charset-decoder" :expr "(str (.decode (.newDecoder (java.nio.charset.Charset/forName \"UTF-8\")) (java.nio.ByteBuffer/wrap (byte-array [104 105]))))" :expected "\"hi\""}
+  {:suite "charset-decoder" :expr "(let [d (.newDecoder (java.nio.charset.Charset/forName \"UTF-8\"))] [(str (.malformedInputAction d)) (str (.unmappableCharacterAction d)) (str (.malformedInputAction (.onMalformedInput d java.nio.charset.CodingErrorAction/IGNORE)))])" :expected "[\"REPORT\" \"REPORT\" \"IGNORE\"]"}
+  {:suite "charset-decoder" :expr "(let [d (.newDecoder (java.nio.charset.Charset/forName \"UTF-8\")) in (java.nio.ByteBuffer/allocate 16) out (java.nio.CharBuffer/allocate 16) sb (StringBuilder.)] (doseq [chunk [[97 -30] [-126 -84 98]]] (.put in (byte-array chunk)) (.flip in) (let [r (.decode d in out false)] (.append sb (str (.flip out))) (.clear out) (.compact in) (assert (.isUnderflow r)))) (.flip in) (.decode d in out true) (.append sb (str (.flip out))) (str sb))" :expected "\"a€b\""}
+  {:suite "charset-decoder" :expr "(let [d (doto (.newDecoder (java.nio.charset.Charset/forName \"UTF-8\")) (.onMalformedInput java.nio.charset.CodingErrorAction/REPLACE))] (str (.decode d (java.nio.ByteBuffer/wrap (byte-array [104 -1 105])))))" :expected "\"h�i\""}
+  {:suite "charset-decoder" :expr "(try (str (.decode (.newDecoder (java.nio.charset.Charset/forName \"UTF-8\")) (java.nio.ByteBuffer/wrap (byte-array [104 -1 105])))) (catch java.nio.charset.CharacterCodingException e (.getName (class e))))" :expected "\"java.nio.charset.MalformedInputException\""}
+  {:suite "charset-decoder" :expr "[(str (.decode (.newDecoder (java.nio.charset.Charset/forName \"ISO-8859-1\")) (java.nio.ByteBuffer/wrap (byte-array [-27 -28])))) (str (.decode (.newDecoder (java.nio.charset.Charset/forName \"UTF-16BE\")) (java.nio.ByteBuffer/wrap (.getBytes \"hé\" \"UTF-16BE\"))))]" :expected "[\"åä\" \"hé\"]"}
+  {:suite "charset-decoder" :expr "(let [b (java.nio.CharBuffer/allocate 8)] (.put b \"ab\") (.put b \\c) [(.position b) (str (.flip b)) (.remaining b) (.getName (class b))])" :expected "[3 \"abc\" 3 \"java.nio.CharBuffer\"]"}
+
+
+  ;; --- regex line terminators (gh-956) ----------------------------------------
+  ;; Java's terminator set for DOT, ^ and $ is \n, \r, \r\n, NEL, LS and PS, and
+  ;; (?d) UNIX_LINES is what narrows it to \n. jolt mapped those onto irregex ops
+  ;; whose set is \n only and accepted (?d) as a no-op, so it behaved as if
+  ;; UNIX_LINES were always on: DOT crossed a \r, (?m)^ did not match after one,
+  ;; and a CRLF header read with (.*) kept its \r. A CRLF is ONE terminator, so
+  ;; neither anchor may sit between the \r and the \n — the fourth row of each
+  ;; group is that case.
+  {:suite "regex / line terminators" :expr "(let [nel (str (char 0x85)) ls (str (char 0x2028)) ps (str (char 0x2029))] [(re-find #\"a.b\" \"a\\rb\") (re-find #\"a.b\" \"a\\nb\") (re-find #\"a.b\" (str \"a\" nel \"b\")) (re-find #\"a.b\" (str \"a\" ls \"b\")) (re-find #\"a.b\" (str \"a\" ps \"b\")) (re-find #\"a.b\" \"a\\tb\") (re-find #\"(?s)a.b\" \"a\\rb\")])" :expected "[nil nil nil nil nil \"a\\tb\" \"a\\rb\"]"}
+  {:suite "regex / line terminators" :expr "[(re-find #\"(?m)^b\" \"a\\rb\") (re-find #\"(?m)^b\" \"a\\r\\nb\") (re-find #\"(?m)^b\" (str \"a\" (char 0x85) \"b\")) (re-find #\"(?m)^\\nb\" \"a\\r\\nb\")]" :expected "[\"b\" \"b\" \"b\" nil]"}
+  {:suite "regex / line terminators" :expr "[(re-find #\"(?m)a$\" \"a\\rb\") (re-find #\"(?m)a$\" \"a\\r\\nb\") (re-find #\"(?m)\\r$\" \"a\\r\\nb\") (re-find #\"a$\" \"a\\r\") (re-find #\"a$\" \"a\\r\\n\") (re-find #\"a$\" \"a\\rb\") (re-find #\"a\\Z\" \"a\\r\") (re-find #\"a\\z\" \"a\\r\")]" :expected "[\"a\" \"a\" nil \"a\" \"a\" nil \"a\" nil]"}
+  {:suite "regex / line terminators" :expr "(re-find #\"(?m)^(.*)$\" \"GET / HTTP/1.1\\r\\nHost: x\\r\\n\")" :expected "[\"GET / HTTP/1.1\" \"GET / HTTP/1.1\"]"}
+  {:suite "regex / line terminators" :expr "(clojure.string/split \"a\\r\\nb\\r\\nc\" #\"(?m)$\")" :expected "[\"a\" \"\\r\\nb\" \"\\r\\nc\"]"}
+  ;; (?d) restores the narrow set, which is what it means on the JVM — every row
+  ;; above that differs from jolt's old answer agrees again under it.
+  {:suite "regex / line terminators" :expr "[(re-find #\"(?d)a.b\" \"a\\rb\") (re-find #\"(?d)(?m)^b\" \"a\\rb\") (re-find #\"(?d)(?m)a$\" \"a\\rb\") (re-find #\"(?d)a$\" \"a\\r\") (re-find #\"(?d)a$\" \"a\\n\")]" :expected "[\"a\\rb\" nil nil nil \"a\"]"}
+  ;; A resumed scan is not a fresh input: ^ anchors at the ORIGIN, not at the
+  ;; cursor, and (?m)^ does not match at the end of input. Both follow from
+  ;; irx-search-from passing the two positions separately (host/chez/regex.ss).
+  {:suite "regex / line terminators" :expr "[(re-seq #\"^abc\" \"abcabc\") (clojure.string/replace \"abcabc\" #\"^abc\" \"-\") (re-seq #\"(?m)^\" \"a\\nb\\n\")]" :expected "[(\"abc\") \"-abc\" (\"\" \"\")]"}
+  ;; The positions an anchor matches at, read off a Matcher — java.util.regex's
+  ;; own rules at the edges: a non-multiline $ (and \Z) does not match between
+  ;; the halves of a final CRLF; multiline ^ never matches at the end of input,
+  ;; so it matches nowhere on "" and once on "a\n"; and (?d) keeps both rules.
+  {:suite "regex / line terminators" :expr "(let [pos (fn [re s] (let [m (re-matcher re s)] (loop [acc []] (if (.find m) (recur (conj acc (.start m))) acc))))] [(pos #\"$\" \"ab\\r\\n\") (pos #\"\\Z\" \"ab\\r\\n\") (pos #\"$\" \"ab\\r\") (pos #\"$\" \"ab\\n\\n\") (pos #\"(?d)$\" \"ab\\n\")])" :expected "[[2 4] [2 4] [2 3] [3 4] [2 3]]"}
+  {:suite "regex / line terminators" :expr "(let [pos (fn [re s] (let [m (re-matcher re s)] (loop [acc []] (if (.find m) (recur (conj acc (.start m))) acc))))] [(pos #\"(?m)^\" \"\") (pos #\"(?m)^\" \"a\\n\") (pos #\"(?m)^\" \"a\\r\\nb\") (pos #\"(?md)^\" \"a\\n\\n\") (re-matches #\"(?m)^$\" \"\")])" :expected "[[] [0] [0 3] [0 2] nil]"}
+
+  ;; --- Base64 MIME encoder/decoder (gh-955) -----------------------------------
+  ;; Four of the JDK's six Base64 statics were here; the MIME pair was not, and
+  ;; the basic decoder is no substitute because it rejects the line breaks a
+  ;; MIME/PEM body carries. The MIME encoder wraps at 76 characters with CRLF and
+  ;; the MIME decoder discards every character outside the alphabet.
+  {:suite "base64 / mime" :expr "(let [p \"The quick brown fox jumps over the lazy dog. \" s (apply str (repeat 10 p)) e (.encodeToString (java.util.Base64/getMimeEncoder) (.getBytes s \"UTF-8\"))] [(every? #(<= (count %) 76) (clojure.string/split e #\"\\r\\n\")) (> (count (clojure.string/split e #\"\\r\\n\")) 1) (= s (String. (.decode (java.util.Base64/getMimeDecoder) e))) (= e (.encodeToString (java.util.Base64/getEncoder) (.getBytes s \"UTF-8\")))])" :expected "[true true true false]"}
+  {:suite "base64 / mime" :expr "[(String. (.decode (java.util.Base64/getMimeDecoder) \"aGVs\\r\\nbG8=\")) (String. (.decode (java.util.Base64/getMimeDecoder) \"aG Vs\\tbG8=\")) (try (String. (.decode (java.util.Base64/getDecoder) \"aGVs\\r\\nbG8=\")) (catch IllegalArgumentException e :threw))]" :expected "[\"hello\" \"hello\" :threw]"}
+  {:suite "base64 / mime" :expr "[(.encodeToString (java.util.Base64/getMimeEncoder 8 (.getBytes \"\\n\")) (.getBytes \"hello world\" \"UTF-8\")) (.encodeToString (java.util.Base64/getMimeEncoder 7 (.getBytes \"\\n\")) (.getBytes \"hello world\" \"UTF-8\")) (.encodeToString (java.util.Base64/getMimeEncoder 0 (.getBytes \"\\n\")) (.getBytes \"hello world\" \"UTF-8\"))]" :expected "[\"aGVsbG8g\\nd29ybGQ=\" \"aGVs\\nbG8g\\nd29y\\nbGQ=\" \"aGVsbG8gd29ybGQ=\"]"}
+  {:suite "base64 / mime" :expr "[(try (java.util.Base64/getMimeEncoder 8 (.getBytes \"A\")) :no-throw (catch IllegalArgumentException e :threw)) (.encodeToString (java.util.Base64/getMimeEncoder) (byte-array 0)) (.getName (class (java.util.Base64/getMimeDecoder))) (.encodeToString (.withoutPadding (java.util.Base64/getEncoder)) (.getBytes \"hi\" \"UTF-8\"))]" :expected "[:threw \"\" \"java.util.Base64$Decoder\" \"aGk\"]"}
   {:suite "javastatic" :expr "(Math/sqrt 16)" :expected "4.0"}
   {:suite "javastatic" :expr "(Math/abs -3)" :expected "3"}
   {:suite "javastatic" :expr "(Math/max 2 7)" :expected "7"}

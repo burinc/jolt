@@ -1116,8 +1116,11 @@
         (cons "reset" (lambda (self) (sr-pos! self (vector-ref (jhost-state self) 2)) jolt-nil))
         (cons "skip" (lambda (self n) (let ((n (jnum->exact n)))
                                         (sr-pos! self (min (string-length (sr-s self)) (+ (sr-pos self) n))) (->num n))))
-        ;; readLine: the next line without its terminator (\n or \r\n), nil at EOF —
-        ;; what line-seq drives over a BufferedReader.
+        ;; readLine: the next line without its terminator, nil at EOF — what
+        ;; line-seq drives over a BufferedReader. \n, \r and \r\n all end a line,
+        ;; which is java.io.BufferedReader's rule; a LONE \r used to be carried
+        ;; into the line, so text written by a classic-Mac-era tool read as one
+        ;; enormous line.
         (cons "readLine"
           (lambda (self)
             (let ((s (sr-s self)) (p (sr-pos self)) (len (string-length (sr-s self))))
@@ -1127,8 +1130,21 @@
                       ((>= i len) (sr-pos! self len) (substring s p len))
                       ((char=? (string-ref s i) #\newline)
                        (sr-pos! self (+ i 1))
-                       (substring s p (if (and (> i p) (char=? (string-ref s (- i 1)) #\return)) (- i 1) i)))
+                       (substring s p i))
+                      ((char=? (string-ref s i) #\return)
+                       (sr-pos! self (if (and (< (+ i 1) len) (char=? (string-ref s (+ i 1)) #\newline))
+                                         (+ i 2)
+                                         (+ i 1)))
+                       (substring s p i))
                       (else (scan (+ i 1)))))))))
+        ;; lines: the rest of the input one readLine at a time — what
+        ;; (BufferedReader. (StringReader. s)) hands back on the JVM, and
+        ;; BufferedReader over jolt's own readers IS the wrapped reader.
+        (cons "lines" (lambda (self)
+                        (let loop ((acc '()))
+                          (let ((l (record-method-dispatch self "readLine" jolt-nil)))
+                            (if (jolt-nil? l) (list->cseq (reverse acc)) (loop (cons l acc)))))))
+        (cons "ready" (lambda (self) #t))
         (cons "close" (lambda (self) jolt-nil))))
 
 ;; ---- PushbackReader ---------------------------------------------------------
@@ -1504,17 +1520,29 @@
 
 ;; ---- Base64 (RFC 4648) ------------------------------------------------------
 ;; One codec, two alphabets: basic (+/) and URL-safe (-_), section 5 of the RFC.
-;; An encoder/decoder jhost carries (vector alphabet pad?) as its state, so
-;; getUrlEncoder/getUrlDecoder and .withoutPadding are the SAME tags with
+;; An encoder jhost carries (vector alphabet pad? line-width line-sep) and a
+;; decoder (vector alphabet pad? mime?), so getUrlEncoder/getUrlDecoder,
+;; getMimeEncoder/getMimeDecoder and .withoutPadding are the SAME tags with
 ;; different state — .withoutPadding returns a fresh encoder, like the JDK's
 ;; (whose encoders are immutable), and each decoder rejects the other
 ;; alphabet's chars because b64-char-val searches only its own alphabet.
+;;
+;; The MIME pair is the other half of RFC 2045: the encoder breaks its output
+;; into lines and the decoder IGNORES every character outside the alphabet, which
+;; is what makes a PEM/PKCS#8 body — wrapped at 64 columns, newlines and all —
+;; decodable at all. The basic decoder refuses those line breaks, so it is no
+;; substitute, and every PEM-reading path (JWT, service-account login) failed on
+;; the first decode without them (#955).
 (define b64-alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
 (define b64url-alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
-(define (b64-self-alphabet self)
-  (let ((st (jhost-state self))) (if (vector? st) (vector-ref st 0) b64-alphabet)))
-(define (b64-self-pad? self)
-  (let ((st (jhost-state self))) (if (vector? st) (vector-ref st 1) #t)))
+(define (b64-state-ref self i dflt)
+  (let ((st (jhost-state self)))
+    (if (and (vector? st) (> (vector-length st) i)) (vector-ref st i) dflt)))
+(define (b64-self-alphabet self) (b64-state-ref self 0 b64-alphabet))
+(define (b64-self-pad? self) (b64-state-ref self 1 #t))
+(define (b64-self-width self) (b64-state-ref self 2 0))
+(define (b64-self-sep self) (b64-state-ref self 3 ""))
+(define (b64-self-mime? self) (b64-state-ref self 2 #f))
 (define (->bytevector x)
   (cond ((bytevector? x) x)
         ((and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)) (na-bytearray->bv x))
@@ -1536,9 +1564,29 @@
             (loop (+ i 3)))))))
 (define (b64-char-val c alphabet)
   (let loop ((i 0)) (cond ((= i 64) (throw-jvm 'IllegalArgumentException "Base64: illegal character")) ((char=? (string-ref alphabet i) c) i) (else (loop (+ i 1))))))
-(define (b64-decode x alphabet)
+(define (b64-in-alphabet? c alphabet)
+  (let loop ((i 0)) (cond ((= i 64) #f) ((char=? (string-ref alphabet i) c) #t) (else (loop (+ i 1))))))
+;; Break encoded output into lines of `width` characters joined by `sep`, with no
+;; separator after the last one — the JDK's MIME shape. A width of 0 (every
+;; non-MIME encoder, and getMimeEncoder with a non-positive length) wraps nothing.
+(define (b64-wrap-lines s width sep)
+  (let ((len (string-length s)))
+    (if (or (<= width 0) (= 0 (string-length sep)) (<= len width))
+        s
+        (let loop ((i 0) (out '()))
+          (if (>= i len)
+              (apply string-append (reverse out))
+              (let ((j (min len (+ i width))))
+                (loop j (cons (substring s i j) (if (null? out) out (cons sep out))))))))))
+(define (b64-decode x alphabet mime?)
   (let* ((str (let ((s (if (string? x) x (utf8->string (->bytevector x)))))
-                (list->string (filter (lambda (c) (not (char=? c #\=))) (string->list s)))))
+                (list->string (filter (lambda (c)
+                                        (and (not (char=? c #\=))
+                                             ;; a MIME decoder discards everything
+                                             ;; outside the alphabet; the basic one
+                                             ;; hands it to b64-char-val, which throws.
+                                             (or (not mime?) (b64-in-alphabet? c alphabet))))
+                                      (string->list s)))))
          (out '()) (acc 0) (bits 0))
     (for-each (lambda (c)
                 (set! acc (bitwise-ior (bitwise-arithmetic-shift-left acc 6) (b64-char-val c alphabet)))
@@ -1552,17 +1600,48 @@
 ;; (signed elements, seqable, bytes?) — they used to hand back a raw Chez bytevector,
 ;; which no collection dispatcher knows, so (vec (.decode dec s)) threw "Don't know
 ;; how to create ISeq from" and every caller had to route it through String. first.
+(define (b64-encoded self bs)
+  (b64-wrap-lines (b64-encode bs (b64-self-alphabet self) (b64-self-pad? self))
+                  (b64-self-width self) (b64-self-sep self)))
 (register-host-methods! "b64-encoder"
-  (list (cons "encode" (lambda (self bs) (na-bv->bytearray (string->utf8 (b64-encode bs (b64-self-alphabet self) (b64-self-pad? self))))))
-        (cons "encodeToString" (lambda (self bs) (b64-encode bs (b64-self-alphabet self) (b64-self-pad? self))))
-        (cons "withoutPadding" (lambda (self) (make-jhost "b64-encoder" (vector (b64-self-alphabet self) #f))))))
+  (list (cons "encode" (lambda (self bs) (na-bv->bytearray (string->utf8 (b64-encoded self bs)))))
+        (cons "encodeToString" b64-encoded)
+        (cons "withoutPadding"
+              (lambda (self) (make-jhost "b64-encoder"
+                               (vector (b64-self-alphabet self) #f
+                                       (b64-self-width self) (b64-self-sep self)))))))
 (register-host-methods! "b64-decoder"
-  (list (cons "decode" (lambda (self s) (na-bv->bytearray (b64-decode s (b64-self-alphabet self)))))))
+  (list (cons "decode" (lambda (self s)
+                         (na-bv->bytearray (b64-decode s (b64-self-alphabet self) (b64-self-mime? self)))))))
+;; getMimeEncoder(lineLength, lineSeparator): the JDK rounds the length DOWN to a
+;; multiple of 4 (so a line never splits a 4-character group), treats a
+;; non-positive length as "no line separator at all", and refuses a separator
+;; containing a character of the base64 alphabet — which would make the output
+;; undecodable by its own decoder.
+(define b64-mime-width 76)
+(define b64-mime-sep "\r\n")
+(define (b64-mime-encoder width sep)
+  (let ((w (* 4 (quotient (max 0 width) 4)))
+        (sep (if (string? sep) sep (utf8->string (->bytevector sep)))))
+    (let loop ((i 0))
+      (cond ((= i (string-length sep))
+             (make-jhost "b64-encoder" (vector b64-alphabet #t w sep)))
+            ((or (char=? (string-ref sep i) #\=) (b64-in-alphabet? (string-ref sep i) b64-alphabet))
+             (throw-jvm 'IllegalArgumentException
+                        (string-append "Illegal base64 line separator character 0x"
+                                       (number->string (char->integer (string-ref sep i)) 16))))
+            (else (loop (+ i 1)))))))
 (register-class-statics! "Base64"
-  (list (cons "getEncoder" (lambda () (make-jhost "b64-encoder" (vector b64-alphabet #t))))
-        (cons "getDecoder" (lambda () (make-jhost "b64-decoder" (vector b64-alphabet #t))))
-        (cons "getUrlEncoder" (lambda () (make-jhost "b64-encoder" (vector b64url-alphabet #t))))
-        (cons "getUrlDecoder" (lambda () (make-jhost "b64-decoder" (vector b64url-alphabet #t))))))
+  (list (cons "getEncoder" (lambda () (make-jhost "b64-encoder" (vector b64-alphabet #t 0 ""))))
+        (cons "getDecoder" (lambda () (make-jhost "b64-decoder" (vector b64-alphabet #t #f))))
+        (cons "getUrlEncoder" (lambda () (make-jhost "b64-encoder" (vector b64url-alphabet #t 0 ""))))
+        (cons "getUrlDecoder" (lambda () (make-jhost "b64-decoder" (vector b64url-alphabet #t #f))))
+        (cons "getMimeEncoder"
+              (lambda args
+                (if (null? args)
+                    (make-jhost "b64-encoder" (vector b64-alphabet #t b64-mime-width b64-mime-sep))
+                    (b64-mime-encoder (jnum->exact (car args)) (cadr args)))))
+        (cons "getMimeDecoder" (lambda () (make-jhost "b64-decoder" (vector b64-alphabet #t #t))))))
 
 ;; ---- java.util.regex.Pattern ------------------------------------------------
 ;; Pattern/compile returns a jolt-regex value (regex-t), so str/replace, re-find,
@@ -2964,7 +3043,11 @@
         (cons "displayName" (lambda (c) (charset-name c)))
         (cons "toString" (lambda (c) (charset-name c)))
         (cons "newEncoder" (lambda (c) (make-jhost "charset-encoder" (vector c))))
-        (cons "newDecoder" (lambda (c) (make-jhost "charset-decoder" (vector c))))
+        ;; #(charset malformed-action unmappable-action replacement) — the
+        ;; JVM's defaults are REPORT for both actions and U+FFFD for the
+        ;; replacement. The methods that read these live in charset-coding.ss,
+        ;; which loads after this file (it needs ByteBuffer).
+        (cons "newDecoder" (lambda (c) (make-jhost "charset-decoder" (vector c #f #f "\xFFFD;"))))
         (cons "canEncode" (lambda (c) #t))
         (cons "equals" (lambda (c o) (and (jhost? o) (string=? (jhost-tag o) "charset")
                                           (string=? (charset-name c) (charset-name o)))))))

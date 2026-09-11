@@ -676,6 +676,12 @@
 (jch-register-supers! "javax.net.ssl.SSLException" '("java.io.IOException"))
 (jch-register-supers! "java.nio.charset.UnsupportedCharsetException" '("java.lang.IllegalArgumentException"))
 (jch-register-supers! "java.nio.charset.IllegalCharsetNameException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.io.CharConversionException" '("java.io.IOException"))
+(jch-register-supers! "java.nio.charset.CharacterCodingException" '("java.io.IOException"))
+(jch-register-supers! "java.nio.charset.MalformedInputException" '("java.nio.charset.CharacterCodingException"))
+(jch-register-supers! "java.nio.charset.UnmappableCharacterException" '("java.nio.charset.CharacterCodingException"))
+(jch-register-supers! "java.nio.BufferOverflowException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.nio.BufferUnderflowException" '("java.lang.RuntimeException"))
 (jch-register-supers! "java.lang.Error" '("java.lang.Throwable"))
 (jch-register-supers! "java.lang.AssertionError" '("java.lang.Error"))
 (jch-register-supers! "java.lang.ArrayIndexOutOfBoundsException" '("java.lang.IndexOutOfBoundsException"))
@@ -753,6 +759,7 @@
 (jch-register-supers! "java.io.OutputStreamWriter" '("java.io.Writer"))
 (jch-register-supers! "java.io.FileWriter" '("java.io.OutputStreamWriter"))
 (jch-register-supers! "java.io.InputStreamReader" '("java.io.Reader"))
+(jch-register-supers! "java.io.BufferedReader" '("java.io.Reader"))
 (jch-register-supers! "java.io.StringWriter" '("java.io.Writer"))
 ;; StringBuilder is a CharSequence and an Appendable, which is what lets count/seq/
 ;; nth and the regex entry points take one the way they take a String.
@@ -760,6 +767,11 @@
 (jch-register-supers! "java.lang.Appendable" '())
 (jch-register-supers! "java.util.StringTokenizer" '())
 (jch-register-supers! "java.nio.charset.Charset" '())
+(jch-register-supers! "java.nio.CharBuffer" '("java.lang.CharSequence" "java.lang.Appendable"))
+(jch-register-supers! "java.nio.charset.CharsetDecoder" '())
+(jch-register-supers! "java.nio.charset.CharsetEncoder" '())
+(jch-register-supers! "java.nio.charset.CoderResult" '())
+(jch-register-supers! "java.nio.charset.CodingErrorAction" '())
 (jch-register-supers! "java.util.Base64" '())
 ;; MapEntry extends AMapEntry: an APersistentVector that is also an IMapEntry, the
 ;; clojure.lang view of java.util.Map.Entry — so the vector checks and
@@ -1006,6 +1018,10 @@
 (jch-register-supers! "java.text.Format" '("java.io.Serializable" "java.lang.Cloneable"))
 (jch-register-supers! "java.text.NumberFormat" '("java.text.Format"))
 (jch-register-supers! "java.text.DecimalFormat" '("java.text.NumberFormat"))
+(jch-register-supers! "java.text.Normalizer" '())
+;; Normalizer.Form is an enum, so it carries java.lang.Enum's supers the way the
+;; other modeled enums here do.
+(jch-register-supers! "java.text.Normalizer$Form" '("java.lang.Enum"))
 (jch-register-supers! "java.util.GregorianCalendar" '())
 (jch-register-supers! "java.util.Locale" '())
 (jch-register-supers! "java.util.TimeZone" '())
@@ -1074,6 +1090,9 @@
     ("nio-filesystem" . "java.nio.file.FileSystem")
     ("nio-path-matcher" . "java.nio.file.PathMatcher")
     ("byte-buffer" . "java.nio.ByteBuffer")
+    ("char-buffer" . "java.nio.CharBuffer")
+    ("coder-result" . "java.nio.charset.CoderResult")
+    ("coding-error-action" . "java.nio.charset.CodingErrorAction")
     ("arraylist" . "java.util.ArrayList")
     ("linkedlist" . "java.util.LinkedList")
     ("arraydeque" . "java.util.ArrayDeque")
@@ -1099,7 +1118,10 @@
     ("line-numbering-pushback-reader" . "clojure.lang.LineNumberingPushbackReader")
     ("char-writer" . "java.io.OutputStreamWriter")
     ("char-reader" . "java.io.InputStreamReader")
+    ;; the delegating wrapper over a Reader jolt did not build (io-streams.ss)
+    ("reader-adapter" . "java.io.BufferedReader")
     ("time-unit" . "java.util.concurrent.TimeUnit")
+    ("normalizer-form" . "java.text.Normalizer$Form")
     ;; subprocess shims (process.ss), backing vendored babashka.process
     ("process-builder" . "java.lang.ProcessBuilder")
     ("process" . "java.lang.Process")
