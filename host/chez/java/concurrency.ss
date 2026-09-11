@@ -2240,10 +2240,19 @@
 ;; queue is full, jolt queues it; that is the deliberate divergence here.
 ;;
 ;; abq state: #(capacity mutex cond queue-pair count); queue-pair is (out . in)
-;; like the executor's. One condition serves takers and putters (broadcast).
-(define (make-abq cap)
-  (make-jhost "abq" (vector cap (make-mutex) (make-condition) (cons '() '()) 0)))
-(define (abq? x) (and (jhost? x) (string=? (jhost-tag x) "abq")))
+;; like the executor's. One condition serves takers and putters (broadcast). The
+;; jhost TAG is what names the class — "abq" or "lbq" (see LinkedBlockingQueue
+;; below) — so everything from here down is written against the tag it is given.
+(define (make-abq* tag cap)
+  ;; Both classes reject a capacity below 1 at CONSTRUCTION on the JVM, with a
+  ;; bare IllegalArgumentException (no message — the JDK's ctor throws the
+  ;; no-arg one). jolt used to build the queue: its put then blocked forever and
+  ;; its offer always answered false, so a bad argument surfaced as a hang with
+  ;; nothing pointing at the ctor that caused it (jolt-eyi).
+  (when (< cap 1) (throw-jvm (quote IllegalArgumentException) jolt-nil))
+  (make-jhost tag (vector cap (make-mutex) (make-condition) (cons '() '()) 0)))
+(define (make-abq cap) (make-abq* "abq" cap))
+(define (abq? x) (and (jhost? x) (member (jhost-tag x) '("abq" "lbq")) #t))
 ;; the mutators run under the mutex (jolt-cv-wait's decide, or jolt-with-mutex)
 (define (abq-enq! st v)
   (let ((q (vector-ref st 3)))
@@ -2255,6 +2264,12 @@
     (when (and (null? (car q)) (pair? (cdr q)))
       (set-car! q (reverse (cdr q)))
       (set-cdr! q '()))))
+;; the elements head-first, copied out under the mutex
+(define (abq-snapshot self)
+  (let ((st (jhost-state self)))
+    (jolt-with-mutex (vector-ref st 1)
+      (abq-norm! st)
+      (let ((q (vector-ref st 3))) (append (car q) (reverse (cdr q)))))))
 (define (abq-deq! st)
   (abq-norm! st)
   (let* ((q (vector-ref st 3)) (out (car q)) (v (car out)))
@@ -2284,6 +2299,25 @@
             ;; (cap) / (cap fair) — fairness is accepted and ignored
             (lambda (cap . _) (make-abq (jnum->exact cap)))))
           '("ArrayBlockingQueue" "java.util.concurrent.ArrayBlockingQueue"))
+;; LinkedBlockingQueue is the same queue with a different bound: its no-arg ctor
+;; is unbounded (Integer.MAX_VALUE capacity, which is literally what the JDK
+;; stores and what .remainingCapacity answers), (int) is the bounded form, and
+;; (Collection) fills an unbounded one. It gets its OWN tag rather than a second
+;; ctor onto "abq" because jhost-tag->fqn is the single value -> class map:
+;; sharing the tag would make (class (LinkedBlockingQueue.)) answer
+;; ArrayBlockingQueue. The methods themselves are identical, so the tag aliases
+;; abq's table instead of copying it (jolt#951).
+(define lbq-unbounded-capacity 2147483647)   ; Integer.MAX_VALUE, as the JDK stores it
+(define (lbq-fill! q xs) (for-each (lambda (v) (abq-enq! (jhost-state q) v)) xs) q)
+(for-each (lambda (nm) (register-class-ctor! nm
+            (lambda args
+              (cond ((null? args) (make-abq* "lbq" lbq-unbounded-capacity))
+                    ((number? (car args)) (make-abq* "lbq" (jnum->exact (car args))))
+                    ;; (LinkedBlockingQueue. coll) — seeded and unbounded
+                    (else (lbq-fill! (make-abq* "lbq" lbq-unbounded-capacity)
+                                     (let ((s (jolt-seq (car args))))
+                                       (if (jolt-nil? s) '() (seq->list s)))))))))
+          '("LinkedBlockingQueue" "java.util.concurrent.LinkedBlockingQueue"))
 (register-host-methods! "abq"
   (list (cons "offer" (lambda (self v . args)
           (if (null? args)
@@ -2320,8 +2354,30 @@
                 (vector-set! st 4 0)
                 (jolt-cv-wake! (vector-ref st 2)))))
           jolt-nil))
+        ;; Collection's half: add is offer-or-throw (Queue.add on a full bounded
+        ;; queue is IllegalStateException "Queue full"), and the read-only walks
+        ;; take a SNAPSHOT under the mutex — the JVM's iterators are weakly
+        ;; consistent too, so a walk never sees a half-moved element.
+        (cons "add" (lambda (self v)
+          (let ((st (jhost-state self)))
+            (jolt-with-mutex (vector-ref st 1)
+              (if (fx<? (vector-ref st 4) (vector-ref st 0))
+                  (begin (abq-enq! st v) #t)
+                  (throw-jvm (quote IllegalStateException) "Queue full"))))))
+        (cons "contains" (lambda (self v)
+          (and (memp (lambda (a) (jolt=2 a v)) (abq-snapshot self)) #t)))
+        (cons "iterator" (lambda (self) (make-jiterator (list->cseq (abq-snapshot self)))))
+        (cons "toArray" (lambda (self . _) (na-to-array (list->cseq (abq-snapshot self)))))
+        ;; the tag, not a literal: "lbq" shares this table and must not print as
+        ;; an ArrayBlockingQueue.
         (cons "toString" (lambda (self)
-          (string-append "ArrayBlockingQueue(" (number->string (vector-ref (jhost-state self) 4)) ")")))))
+          (string-append (if (string=? (jhost-tag self) "lbq") "LinkedBlockingQueue" "ArrayBlockingQueue")
+                         "(" (number->string (vector-ref (jhost-state self) 4)) ")")))))
+(alias-host-methods! "lbq" "abq")
+;; (seq q), (vec q) over a queue: the same snapshot, head first; (count q) is
+;; the size, without one.
+(register-seq-arm! abq? (lambda (q) (list->cseq (abq-snapshot q))))
+(register-count-arm! abq? (lambda (q) (vector-ref (jhost-state q) 4)))
 
 ;; FutureTask — a run-once task with a blocking get. State:
 ;; #(status override-flag override value error mutex cond thunk); status is one
