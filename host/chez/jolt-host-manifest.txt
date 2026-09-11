@@ -67,6 +67,7 @@ fiber?
 file-exists?
 file-mtime
 find-var
+fn-form-parse
 form-bigdec-source
 form-bigdec-value-source
 form-bigdec-value?

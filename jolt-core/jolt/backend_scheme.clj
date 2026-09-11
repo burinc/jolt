@@ -1264,11 +1264,16 @@
     ;; a quoted custom #tag with no registered reader -> a tagged-literal value
     ;; (Clojure's reader builds a TaggedLiteral), not the raw reader map. The tag is
     ;; stored as a :#name keyword; strip the leading # to the bare symbol.
+    ;; stored as a :#name / :#ns/name keyword; form-tag-name is the tag as written,
+    ;; and a qualified one is a QUALIFIED symbol (a quoted #foo/bar used to come
+    ;; back as the bare symbol named "foo/bar").
     (and (map? form) (= :jolt/tagged (get form :jolt/type)))
-    (let [nm (name (get form :tag))
-          tsym (if (= \# (first nm)) (subs nm 1) nm)]
-      (q-intern (str "(jolt-tagged-literal (jolt-symbol #f " (chez-str-lit tsym) ") "
-                     (emit-quoted (get form :form)) ")")))
+    (let [tag (jolt.host/form-tag-name form)
+          i (str/index-of tag "/")
+          tns (when i (subs tag 0 i))
+          tn (if i (subs tag (inc i)) tag)]
+      (q-intern (str "(jolt-tagged-literal (jolt-symbol " (if tns (chez-str-lit tns) "#f") " "
+                     (chez-str-lit tn) ") " (emit-quoted (get form :form)) ")")))
     ;; plain jolt VALUES (metadata maps and anything nested in them)
     (map? form) (emit-quoted-map-value form)
     (vector? form) (q-intern (str "(jolt-vector " (str/join " " (map emit-quoted form)) ")"))
@@ -1952,17 +1957,20 @@
        (let [n @*fnsrc-counter*] (swap! *fnsrc-counter* inc) n)))
 
 ;; A top-level form's collected anon-fn registrations as Scheme siblings:
-;;   (image-register-fn-form! "jfn$…" <quoted fn* form> "ns" <quoted free names>)
-;; "" when the namespace is system or nothing was collected, so the seed mint
-;; and any fn-free def emit byte-identically.
+;;   (image-register-fn-form! "jfn$..." (image-fn-form-src "<source text>") "ns" <quoted free names>)
+;; "" when the namespace is system or nothing was collected, so any fn-free def
+;; emits byte-identically.
 ;;
-;; Emitted under a *quote-pool*, which is what keeps this linear. The rows are in
-;; innermost-first order (emit-fn conjes after emitting the body), so a nested
-;; literal's construction is already interned by the time its enclosing literal is
-;; assembled, and the enclosing one costs its own arity instead of its whole
-;; subtree. Without it a chain of N nested literals emitted O(N^2) text — see the
-;; pool comment at emit-quoted. The bindings come out in dependency order for the
-;; same reason, so let* binds them in one pass.
+;; The form travels as SOURCE TEXT, not as a quoted construction. A construction
+;; is a let* of jolt-symbol/jolt-list/jolt-vector calls that runs at every
+;; process start and sits in the compiled runtime as code; the text is a
+;; bytevector constant the registry parses on the first lookup, which only the
+;; image writer ever makes (fn-form-registry.ss image-fn-form-src). Rendered by
+;; fnsrc-src and CHECKED, per row, to read back to the construction it replaces;
+;; a form that does not (a live class value a macro spliced in has no reader
+;; syntax) keeps the construction, emitted under the *quote-pool* as before --
+;; interned so a chain of N nested literals costs O(N) text, bound by one let*
+;; header around the row calls (see the pool comment at emit-quoted).
 ;;
 ;; A row that throws leaves whatever it interned before throwing in the pool, so
 ;; the let* can carry a binding nothing references. Dead, valid, and confined to a
@@ -2004,42 +2012,101 @@
          "(image-fn-form-maker! " (chez-str-lit nm) " " v "))) "
          "(" v args "))")))
 
+;; The SOURCE TEXT of a registration's form: the syntax the raw reader
+;; (jolt.host/fn-form-parse, positions off) reads back to the form emit-quoted
+;; would have constructed. Mirrors emit-quoted branch for branch, so everything
+;; it can render has a rendering here except a live class value, which has no
+;; reader syntax. Sets and metadata maps sort by rendered text for the reason
+;; emit-quoted sorts them (the seed must not depend on host hash order); a
+;; reader-built map keeps its source order, which the reader records again.
+(declare fnsrc-src)
+(defn- fnsrc-src-items [items] (str/join " " (map fnsrc-src items)))
+(defn- fnsrc-src-map-value [m]
+  (str "{" (str/join " " (sort (map (fn [k] (str (fnsrc-src k) " " (fnsrc-src (get m k)))) (keys m)))) "}"))
+(defn- fnsrc-src [form]
+  (cond
+    (form-char? form) (pr-str form)
+    (form-literal? form) (pr-str form)
+    (form-sym? form)
+    (let [m (form-sym-meta form) sns (form-sym-ns form) nm (form-sym-name form)
+          s (if sns (str sns "/" nm) nm)]
+      ;; the meta map renders like any map: a reader-built one in source order
+      ;; (which is how emit-quoted carries it), a plain value sorted
+      (if (and m (pos? (count m)))
+        (str "^" (fnsrc-src m) " " s)
+        s))
+    (form-set? form) (str "#{" (str/join " " (sort (map fnsrc-src (form-set-items form)))) "}")
+    (form-list? form) (str "(" (fnsrc-src-items (form-elements form)) ")")
+    (form-vec? form) (str "[" (fnsrc-src-items (form-vec-items form)) "]")
+    (form-map? form)
+    (str "{" (str/join " " (map (fn [p] (str (fnsrc-src (nth p 0)) " " (fnsrc-src (nth p 1))))
+                                (form-map-pairs form))) "}")
+    (form-regex? form) (str "#\"" (form-regex-source form) "\"")
+    (form-inst? form) (str "#inst " (pr-str (form-inst-source form)))
+    (form-class-value? form) (throw (ex-info "fnsrc-src: a class value has no reader syntax" {}))
+    (form-uuid? form) (str "#uuid " (pr-str (form-uuid-source form)))
+    (form-bigdec? form) (str (form-bigdec-source form) "M")
+    (and (map? form) (= :jolt/tagged (get form :jolt/type)))
+    (str "#" (jolt.host/form-tag-name form) " " (fnsrc-src (get form :form)))
+    (map? form) (fnsrc-src-map-value form)
+    (vector? form) (str "[" (fnsrc-src-items form) "]")
+    (set? form) (str "#{" (str/join " " (sort (map fnsrc-src form))) "}")
+    (seq? form) (str "(" (fnsrc-src-items form) ")")
+    :else (throw (ex-info (str "fnsrc-src: no source rendering for " (pr-str form)) {}))))
+
+;; A registration's form argument as text, (image-fn-form-src "..."), or nil when
+;; the form has no rendering that reads back to the same construction -- checked
+;; here against the very parse the registry runs, so a mismatch falls back to
+;; the construction instead of registering a different form.
+(defn- fnsrc-row-src [form]
+  (try
+    (let [s (fnsrc-src form)
+          same? (binding [*quote-pool* nil *quote-shared* nil]
+                  (= (emit-quoted (jolt.host/fn-form-parse s)) (emit-quoted form)))]
+      (when same? (str "(image-fn-form-src " (chez-str-lit s) ")")))
+    (catch Exception _ nil)))
+
 (defn- fnsrc-flush []
   (if (or (fnsrc-system-ns? *fnsrc-ns*) (empty? @*fnsrc-regs*))
     ""
     ;; best-effort: a macro can splice a LIVE value (a namespace, a var's
     ;; value) into a fn body, and emit-quoted has no rendering for those.
-    ;; Such a literal just goes unregistered — its closure refuses at dump
-    ;; like any other unregistered fn — rather than failing the whole
+    ;; Such a literal just goes unregistered -- its closure refuses at dump
+    ;; like any other unregistered fn -- rather than failing the whole
     ;; compilation of code that never dumps anything.
     (let [pool (atom {:by-expr {} :order []})
-          ;; the rows in order, each emitted with every EARLIER row available to
-          ;; stop the walk at (see *quote-shared*). Innermost first, so a nested
-          ;; literal is always already there by the time its parent is emitted.
-          ;; reduce and not map: each row's emission depends on the ones before it.
+          call (fn [nm f ns frees lives]
+                 (str "(image-register-fn-form! " (chez-str-lit nm) " " f " " (chez-str-lit ns) " "
+                      (emit-quoted frees)
+                      ;; the optional 5th argument, emitted only when the copy's
+                      ;; captures differ from the source names -- so every
+                      ;; un-spliced registration stays byte-identical.
+                      (if lives (str " " (emit-quoted lives)) "")
+                      ")"))
+          ;; the rows in order. A text row touches no pool; a constructed one is
+          ;; emitted with every EARLIER constructed row available to stop the walk
+          ;; at (see *quote-shared*). Innermost first, so a nested literal is
+          ;; already there by the time its parent is emitted. reduce and not map:
+          ;; each row's emission depends on the ones before it.
           out (binding [*quote-pool* pool]
                 (reduce
                  (fn [acc row]
                    (let [nm (nth row 0) form (nth row 1) ns (nth row 2) frees (nth row 3)
-                         ;; the optional 5th argument, emitted only when the copy's
-                         ;; captures differ from the source names — so every
-                         ;; un-spliced registration stays byte-identical.
                          lives (nth row 4)
                          lives (when (and lives (not= lives frees)) lives)
-                         q (try
-                             (binding [*quote-shared* (:shared acc)]
-                               (let [f (emit-quoted form)]
-                                 [f (str "(image-register-fn-form! " (chez-str-lit nm) " "
-                                         f " " (chez-str-lit ns) " "
-                                         (emit-quoted frees)
-                                         (if lives (str " " (emit-quoted lives)) "")
-                                         ")")]))
-                             (catch Exception _ nil))]
-                     (if (nil? q)
-                       acc
-                       (-> acc
-                           (update :calls conj (nth q 1))
-                           (update :shared conj [form (nth q 0)])))))
+                         src (fnsrc-row-src form)
+                         q (if src
+                             [nil (binding [*quote-pool* nil] (call nm src ns frees lives))]
+                             (try
+                               (binding [*quote-shared* (:shared acc)]
+                                 (let [f (emit-quoted form)] [f (call nm f ns frees lives)]))
+                               (catch Exception _ nil)))]
+                     (cond
+                       (nil? q) acc
+                       (nil? (nth q 0)) (update acc :calls conj (nth q 1))
+                       :else (-> acc
+                                 (update :calls conj (nth q 1))
+                                 (update :shared conj [form (nth q 0)])))))
                  {:calls [] :shared []}
                  @*fnsrc-regs*))
           calls (:calls out)

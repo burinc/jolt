@@ -631,6 +631,31 @@
 (ok "12. its body ran exactly once" (and (= 1 ts12-lruns) (= 4 (seq-first (force-lazyseq ts12-node)))))
 (ok "12. and its claim is released" (not (jolt-lazyseq-lock ts12-node)))
 
+;; 13. The reader's mode switches are per-thread. rdr-edn-mode, rdr-discard-cb,
+;; rdr-scan-mode and rdr-suppress-pos were plain parameters, which Chez shares
+;; across threads: an edn read on one thread put every other thread's reader
+;; into edn mode for its duration, and a #$ interpolation dropped the positions
+;; off the lists another thread was loading at that moment. The holder thread
+;; sits inside its parameterize while this thread reads.
+(define ts13-mu (make-mutex))
+(define ts13-cv (make-condition))
+(define ts13-state 'start)
+(fork-thread
+  (lambda ()
+    (parameterize ((rdr-edn-mode #t) (rdr-suppress-pos #t) (rdr-scan-mode #t))
+      (with-mutex ts13-mu
+        (set! ts13-state 'held)
+        (condition-broadcast ts13-cv)
+        (let wait () (unless (eq? ts13-state 'release) (condition-wait ts13-cv ts13-mu) (wait)))))))
+(with-mutex ts13-mu
+  (let wait () (unless (eq? ts13-state 'held) (condition-wait ts13-cv ts13-mu) (wait))))
+(ok "13. another thread's edn-mode read leaves this thread's reader alone"
+    (not (or (rdr-edn-mode) (rdr-scan-mode) (rdr-suppress-pos))))
+(ok "13. ...so a list read here still carries its position"
+    (let-values (((form j) (rdr-read-top "(f x)" 0 5)))
+      (not (jolt-nil? (jolt-get (jolt-meta form) (keyword #f "line") jolt-nil)))))
+(with-mutex ts13-mu (set! ts13-state 'release) (condition-broadcast ts13-cv))
+
 (printf "\nthread-safety-test: ~a checks, ~a failure(s)\n" total fails)
 (if (= fails 0)
     (begin (printf "thread-safety-test: PASS — shared side-tables under concurrency\n") (exit 0))

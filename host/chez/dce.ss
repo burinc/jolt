@@ -212,10 +212,11 @@
   (append (dce-collect-refs '() ir) (dce-sexp-refs-str str)))
 
 ;; The (def-var! "ns" "name" …) / (def-var-with-meta! …) form a prelude record
-;; defines, or #f for a non-def form. A def whose value holds an anonymous fn
-;; literal is minted as (begin (let* <quote pool> (image-register-fn-form! …)…)
-;; (def-var…)) — the source registration first, then the def — so look through
-;; exactly that shape. Read as a non-def form, every such def (138 of the 685
+;; defines, or #f for a non-def form. A def whose value holds anonymous fn
+;; literals is minted as (begin (image-register-fn-form! ...)... (def-var...)) --
+;; one source registration per literal first, then the def; a literal with no
+;; source rendering keeps its quoted construction, a (let* <quote pool> ...)
+;; around the registrations -- so look through exactly those shapes. Read as a non-def form, every such def (138 of the 685
 ;; prelude defs) was an unprunable root, and two of them, clojure.repl/find-doc
 ;; and apropos, reference all-ns, ns-interns and ns-publics: every --tree-shake
 ;; build bailed from the commit that made core's literals register (7d11cfed,
@@ -224,7 +225,7 @@
 ;; keep form as before: a record carries one fqn, and pruning several defs
 ;; under one of their names is unsound.
 ;; A direct-linked seed def (bootstrap.ss) is minted as
-;;   (begin [(let* <quote pool> (image-register-fn-form! …))]
+;;   (begin [(image-register-fn-form! ...)... | (let* <quote pool> (image-register-fn-form! ...)...)]
 ;;          (define jv$ns$name <init>)
 ;;          (def-var-linked! "ns" "name" 'jv$ns$name jv$ns$name (lambda (v) (set! jv$ns$name v)) meta)
 ;;          [(jolt-register-variadic! n jv$ns$name)])
@@ -247,7 +248,12 @@
     ((def-var-form? b) b)
     ((headed? b 'begin)
      (let* ((xs (cdr b))
-            (xs (if (and (pair? xs) (headed? (car xs) 'let*)) (cdr xs) xs))
+            (xs (let skip ((xs xs))
+                  (if (and (pair? xs)
+                           (or (headed? (car xs) 'image-register-fn-form!)
+                               (headed? (car xs) 'let*)))
+                      (skip (cdr xs))
+                      xs)))
             (xs (if (and (pair? xs) (linked-define? (car xs))) (cdr xs) xs)))
        (and (pair? xs) (def-var-form? (car xs)) (trailing-ok? (cdr xs))
             (car xs))))
