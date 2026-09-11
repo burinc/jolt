@@ -85,6 +85,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`jolt.ffi/errno` and the process runtime read errno on Android.** Both
+  chose the accessor by name — `__error` on macOS, `_errno` on Windows, glibc's
+  `__errno_location` everywhere else — and bionic, which reports `os.name`
+  "Linux" and exports `__errno` alone, had none of them: every errno read on
+  Termux raised `foreign-procedure: no entry for "__errno_location"`, and the
+  process runtime's own errno read answered 0 for every failure, so its EINTR
+  retries around `waitpid` and the read/write loops never fired. The Linux arm
+  now resolves the accessor on first use (the glibc entry's absence is the
+  probe) and caches the ACCESSOR, not the pointer it returns — a pointer taken
+  once is the first caller's slot, read from every thread after it, which is
+  what the thread row in `jolt-ffi-errno-test.clj` catches. macOS and Windows
+  are untouched.
+
 - **A spawned child gets its own stdio and nothing else.** `posix_spawn` hands
   the child every descriptor the parent has open unless the spawn says
   otherwise, and jolt's spawn described only the three stdio streams — so a
