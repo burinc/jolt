@@ -26,7 +26,7 @@
 (define (sd-collect x acc)
   (cond
     ((pair? x)
-     (let ((acc (if (and (memq (car x) '(def-var! def-var-with-meta!))
+     (let ((acc (if (and (memq (car x) '(def-var! def-var-with-meta! def-var-plain! def-var-linked!))
                          (pair? (cdr x)) (string? (cadr x))
                          (pair? (cddr x)) (string? (caddr x)))
                     (cons (cons (cadr x) (caddr x)) acc)
