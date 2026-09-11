@@ -2012,14 +2012,77 @@
           ((and (> (char->integer c) 128) (not (uri-space-char? c)) (not (uri-iso-control? c))) (+ p 1))
           (else p))))
 
+;; java.net.URI.decode: percent-decode a component, as the NON-raw accessors
+;; answer it (getPath vs getRawPath). Three details make this more than a loop
+;; over "%hh":
+;;   - a run of consecutive escapes is one UTF-8 sequence — "%C3%A4" is "ä", not
+;;     two characters — so the run is collected and decoded together;
+;;   - a byte sequence that is not valid UTF-8 becomes U+FFFD rather than
+;;     raising, since the string already parsed as a URI and the accessor has no
+;;     way to report an error. Chez's utf8->string replaces malformed input
+;;     exactly as the JVM's UTF-8 decoder does (one U+FFFD for "%FF", one for the
+;;     truncated "%E2%82", one for a surrogate's "%ED%A0%80"), so the
+;;     substitution is the host's, not a rule reimplemented here;
+;;   - inside a BRACKETED IPv6 literal a "%" is the scope-id separator, not an
+;;     escape, so "[fe80::1%25eth0]" must not decode to "[fe80::1%eth0]" — a
+;;     scope id is written with the "%" escaped and stays that way. The JVM has
+;;     this as a flag per accessor (JDK-8037396): the components that can hold an
+;;     IPv6 literal — authority, userInfo, schemeSpecificPart — decode with it,
+;;     and path/query/fragment without, which is why "?q=[%25]" reads back from
+;;     getQuery as "q=[%]" but from getSchemeSpecificPart with the "%25" intact.
+;; "+" is NOT a space: that is form encoding, and URLDecoder's job, not this
+;; one's. A component with no "%" is returned as it is.
+(define (uri-decode* x keep-scope-id?)
+  (if (or (jolt-nil? x) (not (uri-index-of x #\% 0)))
+      x
+      (let ((n (string-length x)) (out '()))
+        ;; a "[" opens the literal region and the next "]" closes it; an
+        ;; unbalanced "]" outside one means nothing, as on the JVM.
+        (define (bracket-state c in?)
+          (cond ((char=? c #\[) #t) ((and in? (char=? c #\])) #f) (else in?)))
+        (define (escape-at? i in?)
+          (and (char=? (string-ref x i) #\%) (not (and in? keep-scope-id?))))
+        (let loop ((i 0) (in? #f))
+          (cond
+            ((>= i n) (apply string-append (reverse out)))
+            ;; a RUN of escapes is one UTF-8 sequence, so it decodes as one
+            ((escape-at? i in?)
+             (let run ((j i) (bytes '()))
+               (if (and (< j n) (escape-at? j in?))
+                   (run (+ j 3) (cons (+ (* 16 (hexv (string-ref x (+ j 1))))
+                                         (hexv (string-ref x (+ j 2))))
+                                      bytes))
+                   (begin (set! out (cons (utf8->string (u8-list->bytevector (reverse bytes))) out))
+                          (loop j in?)))))
+            ;; everything up to the next escape passes through unchanged — but
+            ;; the bracket state has to be tracked across it to know what an
+            ;; escape THERE means
+            (else
+             (let plain ((j i) (b in?))
+               (if (and (< j n) (not (escape-at? j b)))
+                   (plain (+ j 1) (bracket-state (string-ref x j) b))
+                   (begin (set! out (cons (substring x i j) out))
+                          (loop j b))))))))))
+;; The authority, the user info and the scheme-specific part can hold a bracketed
+;; IPv6 literal, so they keep a scope id's escaped "%"; the path, the query and
+;; the fragment cannot, so they decode every escape.
+(define (uri-decode-keeping-scope-id x) (uri-decode* x #t))
+(define (uri-decode x) (uri-decode* x #f))
+
 ;; The parse proper. Every failure goes to `bail` with a reason and an index
 ;; rather than raising, because two callers want two different exceptions —
 ;; the constructor a URISyntaxException, URI/create an IllegalArgumentException —
 ;; and parse-authority itself RETRIES a failed server parse as a registry-based
 ;; authority, which needs the failure as a value.
-(define (uri-parse-1 s bail)
+(define (uri-parse-1 s bail . opt)
+  ;; opt: require-server? — the JDK's requireServerAuthority, set by the component
+  ;; constructors that take a host (see uri-of-host). With it a failed
+  ;; server-authority parse RAISES instead of falling back to a registry-based
+  ;; authority, which is why (URI. "https" nil "h_c.com" -1 "/p" nil nil) is an
+  ;; error on the JVM while the 5-arg authority form accepts the same string.
   (let ((n (string-length s))
         (cur-bail bail)
+        (require-server? (and (pair? opt) (car opt)))
         (scheme jolt-nil) (ssp-start 0) (authority jolt-nil) (user-info jolt-nil)
         (host jolt-nil) (port -1) (path jolt-nil) (query jolt-nil) (fragment jolt-nil)
         (v6bytes 0))
@@ -2202,7 +2265,7 @@
              (set! cur-bail outer)
              (cond ((not err) (set! authority (substring s start e)))
                    (else (set! user-info jolt-nil) (set! host jolt-nil) (set! port -1)
-                         (if reg-ok
+                         (if (and reg-ok (not require-server?))
                              (set! authority (substring s start e))
                              (fail (car err) (cdr err)))))))
           (else (fail "Illegal character in authority" reg-stop)))
@@ -2248,25 +2311,38 @@
                            n)
                     body-end)))
       (when (< end n) (failx "end of URI" end))
-      (make-jhost "uri"
-        (list (cons 'string s)
-              (cons 'scheme scheme)
-              (cons 'ssp (substring s ssp-start body-end))
-              (cons 'authority authority)
-              (cons 'host host)
-              (cons 'user-info user-info)
-              (cons 'port (->num port))
-              (cons 'path path)
-              (cons 'query query)
-              (cons 'fragment fragment))))))
-(define (uri-parse-either s)
-  (call/cc (lambda (k) (uri-parse-1 s (lambda (reason idx) (k (list 'uri-error reason idx)))))))
+      ;; Each escapable component is stored TWICE: the raw substring the parse
+      ;; produced, and its percent-decoded form, because java.net.URI answers both
+      ;; (getPath vs getRawPath) and they are different strings. The scheme, the
+      ;; host and the port have no decoded half on the JVM either — a scheme
+      ;; cannot hold an escape, and there is no getRawHost.
+      (let ((ssp (substring s ssp-start body-end)))
+        (make-jhost "uri"
+          (list (cons 'string s)
+                (cons 'scheme scheme)
+                (cons 'ssp ssp)
+                (cons 'dec-ssp (uri-decode-keeping-scope-id ssp))
+                (cons 'authority authority)
+                (cons 'dec-authority (uri-decode-keeping-scope-id authority))
+                (cons 'host host)
+                (cons 'user-info user-info)
+                (cons 'dec-user-info (uri-decode-keeping-scope-id user-info))
+                (cons 'port (->num port))
+                (cons 'path path)
+                (cons 'dec-path (uri-decode path))
+                (cons 'query query)
+                (cons 'dec-query (uri-decode query))
+                (cons 'fragment fragment)
+                (cons 'dec-fragment (uri-decode fragment))))))))
+(define (uri-parse-either s . opt)
+  (call/cc (lambda (k)
+             (apply uri-parse-1 s (lambda (reason idx) (k (list 'uri-error reason idx))) opt))))
 (define (uri-error? r) (and (pair? r) (eq? (car r) 'uri-error)))
 (define (uri-error-message s r)
   (let ((idx (caddr r)))
     (string-append (cadr r) (if (< idx 0) "" (string-append " at index " (number->string idx))) ": " s)))
-(define (uri-parse s)
-  (let ((r (uri-parse-either s)))
+(define (uri-parse s . opt)
+  (let ((r (apply uri-parse-either s opt)))
     (if (uri-error? r)
         (jolt-throw (jolt-host-throwable "java.net.URISyntaxException" (uri-error-message s r)))
         r)))
@@ -2283,22 +2359,114 @@
       (if (>= i (bytevector-length bv))
           acc
           (loop (+ i 1) (string-append acc "%" (uri-hex2 (bytevector-u8-ref bv i))))))))
-(define (uri-quote-path p)
-  (let ((n (string-length p)))
+(define (uri-quote s ok?)
+  (let ((n (string-length s)))
     (let loop ((i 0) (acc '()))
       (if (>= i n)
           (apply string-append (reverse acc))
-          (let ((c (string-ref p i)))
+          (let ((c (string-ref s i)))
             (loop (+ i 1)
-                  (cons (if (or (uri-path-char? c)
+                  (cons (if (or (ok? c)
                                 (and (> (char->integer c) 128)
                                      (not (uri-space-char? c)) (not (uri-iso-control? c))))
                             (string c)
                             (uri-percent-encode c))
                         acc)))))))
+(define (uri-quote-path p) (uri-quote p uri-path-char?))
 (define (uri-field u k) (let ((p (assq k (jhost-state u)))) (if p (cdr p) jolt-nil)))
-(register-class-ctor! "URI" (lambda (s) (uri-parse (jolt-str-render-one s))))
-(register-class-ctor! "java.net.URI" (lambda (s) (uri-parse (jolt-str-render-one s))))
+
+;; --- the component constructors (URI. scheme host path fragment) & kin -------
+;; The JDK builds these the long way round: compose a URI STRING out of the
+;; pieces, quoting each one against the character set its component allows, then
+;; run the ordinary parser over the result. That is why they QUOTE where the
+;; single-string ctor REJECTS — (URI. "https" "x.example" "/a b" nil) is
+;; https://x.example/a%20b, while (URI. "https://x.example/a b") is a
+;; URISyntaxException — and why the exception a bad component raises reports an
+;; index into the composed string. Composing rather than filling the fields in
+;; directly is what keeps the two paths from drifting: every URI jolt hands back
+;; came out of one parser.
+;;
+;; Arities are the JDK's five: (s), (scheme ssp fragment),
+;; (scheme host path fragment), (scheme authority path query fragment),
+;; (scheme userInfo host port path query fragment). Anything else is
+;; "No matching ctor found for class java.net.URI", which is the message JVM
+;; Clojure's reflector gives for the same call (jolt#949).
+(define (uri-authority-char? c) (or (uri-reg-name-char? c) (uri-server-char? c)))
+;; A bracketed IPv6 literal is already in its own syntax and must not be quoted;
+;; only what follows the "]" is.
+(define (uri-quote-authority a)
+  (if (and (> (string-length a) 0) (char=? (string-ref a 0) #\[))
+      (let ((end (uri-index-of a #\] 0)))
+        (if (and end (uri-index-of a #\: 0))
+            (string-append (substring a 0 (+ end 1))
+                           (uri-quote (substring a (+ end 1) (string-length a)) uri-authority-char?))
+            (uri-quote a uri-authority-char?)))
+      (uri-quote a uri-authority-char?)))
+;; new URI(...)'s appendAuthority: a host wins over an authority, a host holding
+;; a ":" is bracketed as an IPv6 literal, and a port of -1 is "no port".
+(define (uri-compose scheme opaque authority user-info host port path query fragment)
+  (let ((out '()))
+    (define (emit! . xs) (for-each (lambda (x) (set! out (cons x out))) xs))
+    (when scheme (emit! scheme ":"))
+    (if opaque
+        (emit! (uri-quote opaque uri-uric?))
+        (begin
+          (cond
+            (host
+             (emit! "//")
+             (when user-info (emit! (uri-quote user-info uri-userinfo-char?) "@"))
+             (let ((brackets (and (> (string-length host) 0)
+                                  (uri-index-of host #\: 0)
+                                  (not (char=? (string-ref host 0) #\[))
+                                  (not (char=? (string-ref host (- (string-length host) 1)) #\])))))
+               (when brackets (emit! "["))
+               (emit! host)
+               (when brackets (emit! "]")))
+             (when (and port (not (= port -1))) (emit! ":" (number->string port))))
+            (authority (emit! "//" (uri-quote-authority authority))))
+          (when path (emit! (uri-quote path uri-path-char?)))
+          (when query (emit! "?" (uri-quote query uri-uric?)))))
+    (when fragment (emit! "#" (uri-quote fragment uri-uric?)))
+    (apply string-append (reverse out))))
+;; A scheme makes the URI absolute, and an absolute URI's path must be rooted —
+;; the JDK's checkPath, which catches (URI. "https" "x.example" "a" nil) before
+;; the parser turns the missing "/" into a nonsense authority.
+(define (uri-check-path! composed scheme path)
+  (when (and scheme path (> (string-length path) 0) (not (char=? (string-ref path 0) #\/)))
+    (jolt-throw (jolt-host-throwable "java.net.URISyntaxException"
+                  (string-append "Relative path in absolute URI: " composed)))))
+;; a nil component is absent, not the string "nil"
+(define (uri-arg x) (if (or (jolt-nil? x) (not x)) #f (jolt-str-render-one x)))
+(define (uri-port-arg x) (if (jolt-nil? x) -1 (jnum->exact x)))
+;; (scheme ssp fragment)
+(define (uri-of-ssp scheme ssp fragment)
+  (uri-parse (uri-compose scheme ssp #f #f #f -1 #f #f fragment) #f))
+;; (scheme userInfo host port path query fragment) — and (scheme host path
+;; fragment), which the JDK defines as this one with the other three nil. Both
+;; name a host, so both require a server authority.
+(define (uri-of-host scheme user-info host port path query fragment)
+  (let ((composed (uri-compose scheme #f #f user-info host port path query fragment)))
+    (uri-check-path! composed scheme path)
+    (uri-parse composed #t)))
+;; (scheme authority path query fragment) — the authority is taken as given, so a
+;; registry-based one ("h_c.com") is legal here where it is not in uri-of-host.
+(define (uri-of-authority scheme authority path query fragment)
+  (let ((composed (uri-compose scheme #f authority #f #f -1 path query fragment)))
+    (uri-check-path! composed scheme path)
+    (uri-parse composed #f)))
+(define (uri-ctor . args)
+  (let ((a (lambda (i) (uri-arg (list-ref args i)))))
+    (case (length args)
+      ((1) (uri-parse (jolt-str-render-one (car args))))
+      ((3) (uri-of-ssp (a 0) (a 1) (a 2)))
+      ((4) (uri-of-host (a 0) #f (a 1) -1 (a 2) #f (a 3)))
+      ((5) (uri-of-authority (a 0) (a 1) (a 2) (a 3) (a 4)))
+      ((7) (uri-of-host (a 0) (a 1) (a 2) (uri-port-arg (list-ref args 3))
+                        (a 4) (a 5) (a 6)))
+      (else (throw-jvm (quote IllegalArgumentException)
+              "No matching ctor found for class java.net.URI")))))
+(register-class-ctor! "URI" uri-ctor)
+(register-class-ctor! "java.net.URI" uri-ctor)
 ;; URI/create — the (URI. s) constructor with the checked URISyntaxException
 ;; rewrapped as an unchecked IllegalArgumentException, as the JVM's does.
 (define (uri-create s)
@@ -2308,30 +2476,163 @@
         r)))
 (register-class-statics! "java.net.URI" (list (cons "create" (lambda (s) (uri-create (jolt-str-render-one s))))))
 (register-host-methods! "uri"
+  ;; The getX / getRawX pairs answer DIFFERENT strings: raw is the substring the
+  ;; parse produced, getX is that percent-decoded. They used to share one field,
+  ;; so getPath on "https://h.com/a%20b" answered "/a%20b" where the JVM answers
+  ;; "/a b" — the last divergence the java.net.URI differential run found
+  ;; (jolt-6i6). getScheme, getHost and getPort have no raw counterpart on the
+  ;; JVM and are unchanged.
   (list (cons "toString" (lambda (u) (uri-field u 'string)))
         (cons "toASCIIString" (lambda (u) (uri-field u 'string)))
         (cons "getScheme" (lambda (u) (uri-field u 'scheme)))
-        (cons "getSchemeSpecificPart" (lambda (u) (uri-field u 'ssp)))
+        (cons "getSchemeSpecificPart" (lambda (u) (uri-field u 'dec-ssp)))
         (cons "getRawSchemeSpecificPart" (lambda (u) (uri-field u 'ssp)))
-        (cons "getAuthority" (lambda (u) (uri-field u 'authority)))
+        (cons "getAuthority" (lambda (u) (uri-field u 'dec-authority)))
+        (cons "getRawAuthority" (lambda (u) (uri-field u 'authority)))
         (cons "getHost" (lambda (u) (uri-field u 'host)))
-        (cons "getUserInfo" (lambda (u) (uri-field u 'user-info)))
+        (cons "getUserInfo" (lambda (u) (uri-field u 'dec-user-info)))
         (cons "getRawUserInfo" (lambda (u) (uri-field u 'user-info)))
         (cons "getPort" (lambda (u) (uri-field u 'port)))
-        (cons "getPath" (lambda (u) (uri-field u 'path)))
+        (cons "getPath" (lambda (u) (uri-field u 'dec-path)))
         (cons "getRawPath" (lambda (u) (uri-field u 'path)))
-        (cons "getQuery" (lambda (u) (uri-field u 'query)))
+        (cons "getQuery" (lambda (u) (uri-field u 'dec-query)))
         (cons "getRawQuery" (lambda (u) (uri-field u 'query)))
-        (cons "getFragment" (lambda (u) (uri-field u 'fragment)))
+        (cons "getFragment" (lambda (u) (uri-field u 'dec-fragment)))
+        (cons "getRawFragment" (lambda (u) (uri-field u 'fragment)))
         ;; URI.toURL = new URL(toString()) (JVM); honors a library-registered
         ;; URL shim like io/as-url does.
         (cons "toURL" (lambda (u) (let ((ctor (lookup-class class-ctors-tbl "URL")))
                                     (if ctor (ctor (uri-field u 'string))
                                         (make-url (uri-field u 'string))))))
         (cons "isAbsolute" (lambda (u) (not (jolt-nil? (uri-field u 'scheme)))))
+        (cons "isOpaque" (lambda (u) (uri-opaque? u)))
+        (cons "resolve" (lambda (u x) (uri-resolve u (uri-arg->uri x))))
+        (cons "normalize" (lambda (u) (uri-normalize u)))
+        (cons "relativize" (lambda (u x) (uri-relativize u (uri-arg->uri x))))
+        (cons "compareTo" (lambda (u o) (let ((a (uri-field u 'string)) (b (uri-field o 'string)))
+                                          (cond ((string<? a b) -1) ((string=? a b) 0) (else 1)))))
         (cons "hashCode" (lambda (u) (string-hash (uri-field u 'string))))
         (cons "equals" (lambda (u o) (and (jhost? o) (string=? (jhost-tag o) "uri")
                                           (string=? (uri-field u 'string) (uri-field o 'string)))))))
+
+;; --- resolve / normalize / relativize: RFC 2396 §5.2, as java.net.URI does it --
+;; A URI is rebuilt from its RAW components — the substrings the parse produced,
+;; escapes intact — as scheme ":" ["//" authority] path ["?" query] ["#" fragment]
+;; and parsed again, which is what java.net.URI.toString does for a URI it
+;; constructed itself (defineString), and which keeps every URI jolt hands back
+;; the product of the one parser.
+(define (uri-opaque? u)
+  (and (not (jolt-nil? (uri-field u 'scheme)))
+       (let ((ssp (uri-field u 'ssp)))
+         (or (= (string-length ssp) 0) (not (char=? (string-ref ssp 0) #\/))))))
+(define (uri-nil->f x) (if (jolt-nil? x) #f x))
+(define (uri-arg->uri x) (if (uri-jhost? x) x (uri-create (jolt-str-render-one x))))
+(define (uri-from-parts scheme authority path query fragment)
+  (uri-parse (string-append (if scheme (string-append scheme ":") "")
+                            (if authority (string-append "//" authority) "")
+                            (or path "")
+                            (if query (string-append "?" query) "")
+                            (if fragment (string-append "#" fragment) ""))))
+;; RFC 2396 §5.2 (6c-f), java.net.URI.normalize(String): "." segments go, a ".."
+;; removes the segment before it unless that is itself a ".." or there is none
+;; (a leading ".." stays — 6g leaves the path as it is), and a kept segment
+;; keeps the slash that FOLLOWED it in the original, which is how "/a/b/.."
+;; normalizes to "/a/" while "/a/b/../../.." is "/.." and "a/.." is "" (the
+;; JDK's join step). A RELATIVE path whose first segment holds a ":" gains a
+;; "./" so it cannot be read back as a scheme.
+(define (uri-normalize-path path)
+  (if (or (not path) (= (string-length path) 0))
+      path
+      (let* ((n (string-length path))
+             (absolute? (char=? (string-ref path 0) #\/))
+             ;; (segment . followed-by-slash?) in order, empty segments dropped
+             (segs (let loop ((i 0) (start 0) (acc '()))
+                     (cond ((= i n) (reverse (if (> i start) (cons (cons (substring path start i) #f) acc) acc)))
+                           ((char=? (string-ref path i) #\/)
+                            (loop (+ i 1) (+ i 1) (if (> i start) (cons (cons (substring path start i) #t) acc) acc)))
+                           (else (loop (+ i 1) start acc)))))
+             (kept (let loop ((ss segs) (acc '()))
+                     (cond ((null? ss) (reverse acc))
+                           ((string=? (car (car ss)) ".") (loop (cdr ss) acc))
+                           ((and (string=? (car (car ss)) "..") (pair? acc) (not (string=? (car (car acc)) "..")))
+                            (loop (cdr ss) (cdr acc)))
+                           (else (loop (cdr ss) (cons (car ss) acc))))))
+             (body (apply string-append
+                          (map (lambda (sg) (string-append (car sg) (if (cdr sg) "/" ""))) kept)))
+             (body (if (and (not absolute?) (pair? kept) (uri-index-of (car (car kept)) #\: 0))
+                       (string-append "./" body)
+                       body)))
+        (string-append (if absolute? "/" "") body))))
+(define (uri-normalize u)
+  (if (uri-opaque? u)
+      u
+      (let* ((path (uri-nil->f (uri-field u 'path)))
+             (np (uri-normalize-path path)))
+        (if (equal? np path)
+            u
+            (uri-from-parts (uri-nil->f (uri-field u 'scheme)) (uri-nil->f (uri-field u 'authority))
+                            np (uri-nil->f (uri-field u 'query)) (uri-nil->f (uri-field u 'fragment)))))))
+;; java.net.URI.resolve(URI base, URI child): an opaque side answers the child;
+;; a lone fragment is the base with that fragment (5.2 (2)); an absolute child
+;; is itself (3); a child with an authority replaces everything but the scheme
+;; (4); a child path from "/" replaces the base's (5); anything else is merged
+;; onto the base path's directory and normalized (6).
+(define (uri-resolve base child)
+  (let ((c-scheme (uri-nil->f (uri-field child 'scheme)))
+        (c-auth (uri-nil->f (uri-field child 'authority)))
+        (c-path (or (uri-nil->f (uri-field child 'path)) ""))
+        (c-query (uri-nil->f (uri-field child 'query)))
+        (c-frag (uri-nil->f (uri-field child 'fragment)))
+        (b-scheme (uri-nil->f (uri-field base 'scheme)))
+        (b-auth (uri-nil->f (uri-field base 'authority)))
+        (b-path (or (uri-nil->f (uri-field base 'path)) ""))
+        (b-query (uri-nil->f (uri-field base 'query)))
+        (b-frag (uri-nil->f (uri-field base 'fragment))))
+    (cond
+      ((or (uri-opaque? child) (uri-opaque? base)) child)
+      ((and (not c-scheme) (not c-auth) (= (string-length c-path) 0) c-frag (not c-query))
+       (if (and b-frag (string=? b-frag c-frag))
+           base
+           (uri-from-parts b-scheme b-auth b-path b-query c-frag)))
+      (c-scheme child)
+      (c-auth (uri-from-parts b-scheme c-auth c-path c-query c-frag))
+      ((and (> (string-length c-path) 0) (char=? (string-ref c-path 0) #\/))
+       (uri-from-parts b-scheme b-auth c-path c-query c-frag))
+      (else
+       ;; the base path's directory, then the child; a base with an authority and
+       ;; no path merges as "/" (RFC 3986 §5.2.3, and the JDK since 20), so
+       ;; "a" against "https://h.com" is "https://h.com/a", not "https://h.coma"
+       (let* ((i (let loop ((k (- (string-length b-path) 1)))
+                   (cond ((< k 0) #f) ((char=? (string-ref b-path k) #\/) k) (else (loop (- k 1))))))
+              (dir (cond (i (substring b-path 0 (+ i 1)))
+                         ((and b-auth (= (string-length b-path) 0) (> (string-length c-path) 0)) "/")
+                         (else "")))
+              (merged (string-append dir c-path)))
+         (uri-from-parts b-scheme b-auth (uri-normalize-path merged) c-query c-frag))))))
+;; java.net.URI.relativize: the child, unless both are hierarchical with the same
+;; scheme and authority and the base's normalized path is a prefix of the
+;; child's at a segment boundary — then the remainder, with the child's query
+;; and fragment.
+(define (uri-relativize base child)
+  (let ((same? (lambda (a b ci?) (or (and (not a) (not b))
+                                     (and a b (if ci? (string-ci=? a b) (string=? a b)))))))
+    (if (or (uri-opaque? base) (uri-opaque? child)
+            (not (same? (uri-nil->f (uri-field base 'scheme)) (uri-nil->f (uri-field child 'scheme)) #t))
+            (not (same? (uri-nil->f (uri-field base 'authority)) (uri-nil->f (uri-field child 'authority)) #f)))
+        child
+        (let* ((bp (uri-normalize-path (or (uri-nil->f (uri-field base 'path)) "")))
+               (cp (uri-normalize-path (or (uri-nil->f (uri-field child 'path)) "")))
+               ;; equal paths relativize to the empty path; otherwise the base
+               ;; must be a whole-segment prefix
+               (bp (cond ((string=? bp cp) bp)
+                         ((and (> (string-length bp) 0)
+                               (char=? (string-ref bp (- (string-length bp) 1)) #\/)) bp)
+                         (else (string-append bp "/")))))
+          (if (and (>= (string-length cp) (string-length bp))
+                   (string=? (substring cp 0 (string-length bp)) bp))
+              (uri-from-parts #f #f (substring cp (string-length bp) (string-length cp))
+                              (uri-nil->f (uri-field child 'query)) (uri-nil->f (uri-field child 'fragment)))
+              child)))))
 ;; (= f1 f2) is value equality by pathname, like java.io.File.equals — .equals
 ;; and hash already agreed, so two Files built from the same path compared equal
 ;; through the method and unequal through =, which is how ring's resource tests
@@ -2348,6 +2649,12 @@
                   (lambda (a b) (and (uri-jhost? a) (uri-jhost? b)
                                      (string=? (uri-field a 'string) (uri-field b 'string)))))
 (register-hash-arm! uri-jhost? (lambda (x) (string-hash (uri-field x 'string))))
+;; (compare u1 u2) / (sort uris): URI is Comparable on the JVM, by string form
+;; (its compareTo compares component-wise, which for two well-formed URIs is the
+;; same order as the strings up to the first differing component).
+(register-compare-arm! (lambda (a b) (and (uri-jhost? a) (uri-jhost? b)))
+                       (lambda (a b) (let ((x (uri-field a 'string)) (y (uri-field b 'string)))
+                                       (cond ((string<? x y) -1) ((string=? x y) 0) (else 1)))))
 ;; str / pr-str of a uri -> its string form.
 (register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "uri")))
                       (lambda (x) (uri-field x 'string)))
