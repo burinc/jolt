@@ -1949,12 +1949,23 @@
 
 ;; The globally unique letrec name for the next anon literal:
 ;; jfn$<munged-ns>$<munged-def>$<counter> (counter per top-level def);
-;; literals outside any def use jfn$<munged-ns>$$<counter> (counter per
-;; top-level form). Deterministic: same source emits the same names.
+;; literals outside any def use jfn$<munged-ns>$$<counter>, with the counter
+;; per NAMESPACE for the life of the process. Per top-level form, every
+;; deftype method body and every defmethod in a namespace started at $$0 and
+;; their registrations (keyed by name) overwrote each other, so an image
+;; restore of one such closure came back with the LAST form's source.
+;; Deterministic still: one mint or build emits a namespace's forms in source
+;; order, so the same source emits the same names.
+(def ^:private fnsrc-ns-counters (atom {}))
 (defn- fnsrc-name []
   (str "jfn$" (munge-name *fnsrc-ns*)
        (if *fnsrc-def* (str "$" (munge-name *fnsrc-def*) "$") "$$")
-       (let [n @*fnsrc-counter*] (swap! *fnsrc-counter* inc) n)))
+       (if *fnsrc-def*
+         (let [n @*fnsrc-counter*] (swap! *fnsrc-counter* inc) n)
+         (let [k (str *fnsrc-ns*)
+               n (get @fnsrc-ns-counters k 0)]
+           (swap! fnsrc-ns-counters assoc k (inc n))
+           n))))
 
 ;; A top-level form's collected anon-fn registrations as Scheme siblings:
 ;;   (image-register-fn-form! "jfn$..." (image-fn-form-src "<source text>") "ns" <quoted free names>)
@@ -3466,7 +3477,13 @@
 (defn emit-top-form
   ([node] (emit-top-form node nil))
   ([node fnsrc-def]
-  (binding [*fnsrc-ns* (or (:ns node) (:fnsrc-ns node))
+  ;; A statement of a top-level do (the direct-link arm below re-enters here
+  ;; per statement) carries no :ns and no :fnsrc-ns of its own -- the analyzer
+  ;; stamps only the top-level node -- so it inherits the enclosing binding.
+  ;; Rebound to nil, every fn literal in a non-def statement (a deftype method
+  ;; body, a defmethod's fn) was emitted unnamed and unregistered, and a reify
+  ;; instance holding one refused to dump.
+  (binding [*fnsrc-ns* (or (:ns node) (:fnsrc-ns node) *fnsrc-ns*)
             ;; :defmacro too, not just :def. Without it every defmacro in a
             ;; namespace emits its expander under jfn$<ns>$$<n> with the counter
             ;; restarting per top-level form, so sibling macros all claim

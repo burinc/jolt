@@ -762,24 +762,10 @@
 ;; chars are shared representations anyway; everything else crosses as whatever
 ;; it is on the other side, and the docs say so. Host-specific by design.
 ;;
-;; scheme-proc resolves a top-level Scheme binding at CALL time, through the
-;; adapter's global-reflection seam (sa-baked-global — portcheck pins the raw
-;; top-level-value/bound? primitives to scheme-adapter-runtime.ss). Its #f
-;; sentinel conflates "unbound" with "bound to #f", which is fine here: this
-;; fetches PROCEDURES, and a procedure is never #f. An unbound name answers a
-;; catchable ex-info rather than Chez's raw error, because "you typo'd the
-;; primitive" is the hatch's everyday failure — and in a tree-shaken binary it
-;; is also how a shaken-out primitive reports itself.
-(def-var! "jolt.host" "scheme-proc"
-  (lambda (name)
-    (let ((sym (string->symbol (jolt-need-string name))))
-      (let ((v (sa-baked-global sym)))
-        (or v
-            (jolt-throw (jolt-ex-info
-                         (string-append "no top-level Scheme binding: "
-                                        (symbol->string sym))
-                         (jolt-hash-map (jolt-keyword "name")
-                                        (symbol->string sym)))))))))
+;; scheme-proc, the other half of jolt.scheme, is a top-level lookup that needs
+;; no compiler and lives in host-contract.ss, so a compiler-dropped binary
+;; still answers it; this file is left out of such a binary (build.ss
+;; bld-emit-runtime), and scheme-eval-string is a dce-compile-ref for it.
 ;; scheme-eval-string reads SCHEME text with the Scheme reader (not jolt's) and
 ;; evaluates every form, returning the last value; definitions persist in the
 ;; interaction environment, where the runtime itself lives.

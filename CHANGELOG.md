@@ -126,7 +126,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `load-file`, `load`, `load-reader` or an image API boots from `petite.boot`
   alone (on POSIX — a Windows build keeps `scheme.boot` resident, since its
   foreign-procedure forms are evaluated at start), and one that does keeps the
-  compiler exactly as before. Hello-world,
+  compiler exactly as before. "Reaches" counts every def whose init runs code
+  at load, not only what `-main` calls: nothing is pruned in a default build,
+  so an unreferenced `(def x (eval …))` keeps the compiler too (a `defn` only
+  binds, so a library that defines an eval-calling fn nobody reaches does not). Two
+  more things keep it: a bare `:&` FFI binding, which compiles a
+  foreign-procedure per tail shape at the call (petite cannot), and
+  `jolt.scheme/eval-string`; `jolt.scheme/proc` is a top-level lookup and
+  answers from the runtime half without it. `:allow-dynamic` is read by every
+  build now and vouches for a RESOLUTION the graph cannot follow — a vouched
+  `resolve` no longer keeps the compiler resident; a vouched `eval` still
+  bails, since the compiler image is direct-linked against the whole core and
+  cannot run over a shaken one. And a kept def that only NAMES a var of the
+  dropped half — `jolt.scheme/eval-string` in a program that calls `proc`
+  alone — loads: the direct-link hoist binds a stub that raises at the call
+  instead of failing the namespace load. Hello-world,
   measured with the runtime half's parameters above: 11.68MB → 9.15MB, 70ms →
   60ms, 132MB → 111MB resident; against 0.8.6's 27.25MB / 110ms / 225MB that
   is a third of the bytes, a little over half the start, and half the memory,
@@ -225,6 +239,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A fn literal in a top-level `do`'s non-def statement keeps its name and its
+  source registration in a direct-linked build, and non-def literals no longer
+  share one name per namespace.** Under direct-link — every `jolt build` since
+  it landed, and clojure.core's own mint as of this release — the back end
+  emits each statement of a top-level `do` as a top-level form of its own, and
+  it rebound the form's namespace to nil for each, so every fn literal in a
+  deftype method body or a `defmethod`'s fn (the shapes those expand to) was
+  emitted unnamed and unregistered: an image that reached one refused to
+  write it ("this fn has no recorded source"), and its frames printed no name. The
+  statements inherit the namespace now. Separately, the counter behind
+  `jfn$<ns>$$<n>` — the name of a literal outside any def — restarted per
+  top-level form, so every such literal in a namespace was `$$0` and the
+  registrations (keyed by name) overwrote each other: an image restore of one
+  came back with the LAST form's source. The counter is per namespace now.
+
 - **The reader's mode switches are per-thread.** `rdr-edn-mode`,
   `rdr-discard-cb`, `rdr-scan-mode` and `rdr-suppress-pos` were plain Chez
   parameters, which every thread shares: a `clojure.edn/read-string` on one
@@ -234,7 +263,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was loading just then. Namespaces load in parallel, so both were live. They
   are thread parameters now, as `rdr-source-file` already was;
   `thread-safety-test.ss` holds one thread inside the `parameterize` while
-  another reads.
+  another reads. A thread jolt forks — a future, an agent worker, a fiber
+  carrier — starts from the default switches rather than inheriting the read
+  in progress on the forking thread, which a pooled thread kept for life.
 
 - **A quoted qualified tagged literal keeps its namespace.** `'#foo/bar [1]`
   — a `#tag` with no reader registered, inside quoted data — came back as a

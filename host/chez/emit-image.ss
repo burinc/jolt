@@ -391,7 +391,7 @@
                         (jolt-ce-emit-top ir)))
                (fqn (if (eq? kind 'macro) (string-append ns "/" nm) (dce-def-fqn ir)))
                (refs (dce-app-refs ir str)))
-          (set! acc (cons (if fqn (dce-rec #f fqn refs str) (dce-rec #t #f refs str)) acc)))))
+          (set! acc (cons (if fqn (dce-rec #f fqn refs str (dce-def-init-runs? ir)) (dce-rec #t #f refs str)) acc)))))
     (reverse acc)))
 
 ;; Scheme string literal for a ns/name — uses the runtime's own writer

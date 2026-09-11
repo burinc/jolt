@@ -1025,9 +1025,17 @@
   (let ((r (var-cell-root cell)))
     (if (procedure? r)
         r
-        (error 'jolt-seed-root
-               (string-append "direct-linked seed var " (var-cell-ns cell) "/" (var-cell-name cell)
-                              " is not bound to a procedure in this runtime")))))
+        ;; Not bound to a procedure HERE: a var of a file this binary left out
+        ;; (jolt.host/scheme-eval-string in a build that dropped the compiler
+        ;; half), or a root some other runtime gave a value. The hoist runs when
+        ;; the REFERENCING namespace loads, and a kept def that names such a var
+        ;; without calling it has to load -- a default build prunes nothing, so
+        ;; jolt.scheme's eval-string is present in a program that only ever
+        ;; calls proc. The error moves to the call, naming the var.
+        (lambda args
+          (error 'jolt-seed-root
+                 (string-append "direct-linked seed var " (var-cell-ns cell) "/" (var-cell-name cell)
+                                " is not bound to a procedure in this runtime"))))))
 (define (var-deref ns name) (var-cell-root (jolt-var ns name)))
 ;; def-var! / declare-var! return the VAR CELL, not the value — Clojure's `def`
 ;; evaluates to #'ns/name (a first-class var), so (var? (def x 1)) is true and

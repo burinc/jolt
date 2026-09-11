@@ -82,8 +82,10 @@
 (gate-check "seed-callable?: a dynamic var refused" (jolt-nil? (seed-callable? jolt-nil "clojure.core" "*print-length*" 0)) #t)
 (gate-check "seed-callable?: an app var refused" (jolt-nil? (seed-callable? jolt-nil "user" "helper" 1)) #t)
 (gate-check "seed-callable?: an unknown var refused" (jolt-nil? (seed-callable? jolt-nil "clojure.core" "no-such-fn-here" 1)) #t)
-(gate-check "jolt-seed-root raises on a non-procedure root"
-            (raises? (lambda () (jolt-seed-root (jolt-var "clojure.core" "*print-length*")))) #t)
+(gate-check "jolt-seed-root binds a stub on a non-procedure root (the raise is at the call)"
+            (and (not (raises? (lambda () (jolt-seed-root (jolt-var "clojure.core" "*print-length*")))))
+                 (raises? (lambda () ((jolt-seed-root (jolt-var "clojure.core" "*print-length*")) 1))))
+            #t)
 
 ;; ---- the unhinted interop guard --------------------------------------------
 (let ((e (emit-dl "(def uselen (fn [s] (.length s)))")))
@@ -145,4 +147,19 @@
   (gate-check "case hits a symbol" (call "scase" (jolt-symbol #f "q")) (keyword #f "sym"))
   (gate-check "case fed a keyword takes the default" (call "scase" (keyword #f "s")) (keyword #f "other")))
 
+;; --- a seed var this runtime lacks binds a stub that raises at the CALL -------
+;; The hoist runs when the referencing namespace loads. A kept def that names a
+;; var of a file the binary left out (jolt.host/scheme-eval-string in a build
+;; that dropped the compiler half) must still load -- a default build prunes
+;; nothing -- and fail only when called, naming the var.
+(let* ((cell (jolt-var "gate.seed" "absent"))
+       (stub (jolt-seed-root cell)))
+  (gate-check "an unbound seed root hoists a stub, not a load error" (procedure? stub) #t)
+  (gate-check "the stub raises at the call, naming the var"
+              (guard (e (#t (and (string? (condition-message e))
+                                 (gate-sub? (condition-message e) "gate.seed/absent"))))
+                (stub 1) #f)
+              #t))
+
 (gate-summary "directcall")
+

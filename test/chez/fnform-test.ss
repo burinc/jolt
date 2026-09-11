@@ -199,5 +199,39 @@
 (ok "the seed image registers every literal as source text"
     (not (file-has? "host/chez/seed/image.ss" "(let* ((_q$0")))
 
+
+;; --- direct-link: a top-level do splices per statement, and each statement
+;; inherits the namespace. The direct-link arm re-enters emit-top-form per
+;; statement, and a statement carries no :ns of its own -- rebound to nil,
+;; every fn literal in a non-def statement (a deftype method body, a defmethod's
+;; fn) was emitted unnamed and unregistered, and a reify instance holding one
+;; refused to dump.
+(jolt-eval "(def dl-holder (atom nil))" "app")
+((var-deref "jolt.backend-scheme" "set-direct-link!") #t)
+(define dl-closure
+  (guard (e (#t ((var-deref "jolt.backend-scheme" "set-direct-link!") #f) (raise e)))
+    (jolt-eval "(do (reset! dl-holder (fn [x] (+ x 1))) @dl-holder)" "app")))
+((var-deref "jolt.backend-scheme" "set-direct-link!") #f)
+(ok "do-spliced literal is named under direct-link"
+    (string-prefix? (or (closure-name dl-closure) "") "jfn$app$$"))
+(ok "do-spliced literal is registered"
+    (and (closure-name dl-closure) (image-fn-form-lookup (closure-name dl-closure)) #t))
+
+;; --- non-def literals: the counter is per NAMESPACE, not per top-level form.
+;; Per form, every deftype method body and every defmethod in a namespace was
+;; jfn$<ns>$$0 and the registrations overwrote each other -- an image restore
+;; of one such closure came back with the LAST form's source.
+(define anon-a (jolt-eval "(let [f (fn [x] (* x 2))] f)" "app2"))
+(define anon-b (jolt-eval "(let [f (fn [x] (* x 3))] f)" "app2"))
+(ok "two top-level forms' literals have distinct names"
+    (and (closure-name anon-a) (closure-name anon-b)
+         (not (string=? (closure-name anon-a) (closure-name anon-b)))))
+(ok "...and both registrations survive"
+    (and (closure-name anon-a) (closure-name anon-b)
+         (image-fn-form-lookup (closure-name anon-a))
+         (image-fn-form-lookup (closure-name anon-b))
+         (string=? (reg-form-head (closure-name anon-a)) "fn*")
+         #t))
+
 (printf "\nfnform gate: ~a/~a passed\n" (- total fails) total)
 (exit (if (> fails 0) 1 0))
